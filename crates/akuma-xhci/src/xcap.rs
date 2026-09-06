@@ -84,7 +84,7 @@ pub fn usblegctlsts_disable_all(current: u32) -> u32 {
 
 /// A Supported Protocol capability (xHCI §7.2), decoded from its first three
 /// dwords.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SupportedProtocol {
     /// Major USB revision (2 or 3).
     pub major: u8,
@@ -126,5 +126,81 @@ impl SupportedProtocol {
     #[must_use]
     pub fn is_superspeed(&self) -> bool {
         self.major >= 3
+    }
+}
+
+/// How many Supported Protocol capabilities a [`ProtocolMap`] will hold.
+///
+/// Real controllers publish two (USB 2.0 and USB 3.x), which is what the
+/// reference part here publishes. Eight is room for one that splits its ports
+/// across more blocks, and a bound so the map needs no allocator.
+pub const MAX_PROTOCOL_BLOCKS: usize = 8;
+
+/// Every Supported Protocol capability on one controller, answering "what
+/// protocol is root-hub port N?".
+///
+/// This exists because **a physical SuperSpeed connector is two root-hub
+/// ports** — a USB 2.0 one and a SuperSpeed one — and which of the two a
+/// device shows up on is decided by whether its SuperSpeed link trained. A
+/// driver that takes the first connected port therefore has no idea what it
+/// picked, and the two protocols do not accept the same reset: `PORTSC.WPR`
+/// (Warm Port Reset) is SuperSpeed-only and **reserved on a USB 2.0 port**, so
+/// writing it there is silently ignored and the port never enables.
+///
+/// That is not hypothetical — it is the bug this type was extracted to fix.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProtocolMap {
+    blocks: [SupportedProtocol; MAX_PROTOCOL_BLOCKS],
+    len: usize,
+}
+
+impl ProtocolMap {
+    /// Record one capability. Returns `false` once the map is full, so a
+    /// controller with more blocks than expected degrades to "unknown
+    /// protocol" rather than silently mis-answering.
+    pub fn push(&mut self, sp: SupportedProtocol) -> bool {
+        if self.len >= MAX_PROTOCOL_BLOCKS {
+            return false;
+        }
+        self.blocks[self.len] = sp;
+        self.len += 1;
+        true
+    }
+
+    /// The capabilities recorded, in the order the extended-capability list
+    /// presented them.
+    #[must_use]
+    pub fn blocks(&self) -> &[SupportedProtocol] {
+        &self.blocks[..self.len]
+    }
+
+    /// The capability covering 1-based root-hub port `port`, if any. A port
+    /// covered by none — port 15 on the reference part, between the USB 2.0
+    /// block (1..=14) and the SuperSpeed one (16..=21) — answers `None`.
+    #[must_use]
+    pub fn find(&self, port: u8) -> Option<SupportedProtocol> {
+        self.blocks().iter().copied().find(|b| b.covers_port(port))
+    }
+
+    /// True only when a capability covers `port` **and** says SuperSpeed. An
+    /// unmapped port answers `false`, which is the conservative direction: a
+    /// hot reset works on both protocols, a warm one only on SuperSpeed.
+    #[must_use]
+    pub fn is_superspeed(&self, port: u8) -> bool {
+        self.find(port).is_some_and(|b| b.is_superspeed())
+    }
+
+    /// The Protocol Slot Type to put in an Enable Slot command for a device on
+    /// `port`. 0 (the USB slot type) for an unmapped port.
+    #[must_use]
+    pub fn slot_type(&self, port: u8) -> u8 {
+        self.find(port).map_or(0, |b| b.slot_type)
+    }
+
+    /// Major USB revision of `port`, or 0 if no capability covers it — for
+    /// printing a port map, where "unmapped" must not read as "USB 0".
+    #[must_use]
+    pub fn major(&self, port: u8) -> u8 {
+        self.find(port).map_or(0, |b| b.major)
     }
 }

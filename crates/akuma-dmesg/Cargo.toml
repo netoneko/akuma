@@ -1,0 +1,10 @@
+[package]
+name = "akuma-dmesg"
+version = "0.1.0"
+edition = "2024"
+description = "The kernel console history ring behind dmesg(1), plus the syslog(2) action decode."
+
+[lints]
+workspace = true
+
+[dependencies]

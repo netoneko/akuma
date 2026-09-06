@@ -1,13 +1,15 @@
 # Akuma/amd64: a USB (xHCI) disk for persistence — build log
 
-**Grade: C** (active — the driver is written, host-tested, and **works
-end-to-end under `qemu-xhci`**, but still fails bring-up on the metal; which step
-is open). Written 2026-09-06, revised the same day — see the dated section at the
-end, which supersedes the "Where it stands" notes below.
+**Grade: B** (the driver works end-to-end **on the metal** and under
+`qemu-xhci`; `sda1` is a mountable persistent root. Verify behaviour rather than
+trusting it — one boot path's reset is unexplained, see the last section).
+Written 2026-09-06 and revised twice the same day — **the two dated sections at
+the end supersede everything above them**, in order.
 
-**The crash-loop is gone.** A failed bring-up now halts the controller and the
-boot carries on: 201 checks pass, the network comes up, sshd serves. Everything
-below about the box restarting describes what was, not what is.
+**The crash-loop is gone**, and so is the bring-up failure. A failed bring-up
+halts the controller and the boot carries on; a successful one mounts the disk.
+Everything below about the box restarting, and about which step fails on real
+hardware, describes what was, not what is.
 
 ## Why this exists
 
@@ -345,3 +347,107 @@ strictly more protection than the metal has.
 **Careful with device names.** On the box's Ubuntu, `/dev/sda` is the *internal*
 Toshiba boot disk and `sda2` is `/`. The USB drive is `/dev/sdb`. Akuma only
 sees the USB one and calls it `sda`.
+
+---
+
+# 2026-09-06 (later) — the metal enumerates, and `sda1` is the root
+
+`209 passed, 0 failed` on the HP box, `fs: ext2 mounted on sda1`, a file
+written from Akuma and read back from Ubuntu on the physical partition. The
+whole `[xhci]` trace, on the real Intel controller:
+
+```
+[xhci] v0100 slots=32 ports=21 ctx=32B scratch=16
+[xhci] proto USB2 ports 1..14 slot_type 0
+[xhci] proto USB3 ports 16..21 slot_type 0
+[xhci] BIOS handoff ok
+[xhci] reset ok
+[xhci] running
+[xhci] command ring ok
+[xhci] port  8 USB2 connected PORTSC=0x000206e1 PLS=7 not-enabled
+[xhci] port 20 USB3 connected PORTSC=0x00201203 PLS=0 enabled
+[xhci] port 20 enabled, speed 4
+[xhci] slot 1
+[xhci] addressed
+[xhci] BOT ep IN=0x81 OUT=0x02
+[xhci] endpoints configured
+[xhci] disk: 1953525168 x 512B = 953869 MiB
+fs:   ext2 mounted on sda1
+```
+
+## What was wrong: the port loop stopped one iteration too early
+
+`find_and_reset_port` took the **first connected port** and broke out of the
+scan. On this box that is root-hub port **8** — a USB 2.0 port sitting in
+`PLS=7` (Polling) with `PED=0`, which is to say connected to something that had
+never been enabled. The disk was on port **20**, already connected *and already
+enabled*, and the loop never got there.
+
+It then tried to rescue port 8 with `PORTSC.WPR` — a **Warm Port Reset**, which
+is a SuperSpeed-only bit and **reserved on a USB 2.0 port**. The write is
+ignored, the port stays in Polling, and a second later the bring-up gives up
+with `xHCI port reset timeout`. Two independent defects stacked into one
+symptom, and the log line that would have separated them — the *other*
+connected port — was the one the `break` threw away.
+
+This is also the answer to the loose end the previous section recorded: the
+`(i ^ 0x5a)` pattern already on the scratch LBA of the real disk. An earlier
+version of the loop did reach port 20 and did complete a `WRITE(10)`. The metal
+had been closer than the verdict said for some time.
+
+## The fixes
+
+1. **`akuma_xhci::xcap::ProtocolMap`** (host-tested) — every Supported Protocol
+   capability on the controller, answering "what protocol is root-hub port N?".
+   It exists because *a physical SuperSpeed socket is two root-hub ports*, a
+   USB 2.0 one and a SuperSpeed one, and which half a device appears on depends
+   on whether its SuperSpeed link trained. A driver that does not know which it
+   picked cannot know which reset that port accepts.
+2. **Print every connected port, not the chosen one.** The old loop printed one
+   line — `port 8 PORTSC=0x000206e1` — with no protocol on it and no indication
+   that ports 16..=21 had never been looked at. The map is the difference
+   between "the reset timed out" and "the reset timed out because that port is
+   USB 2.0, and by the way the disk is on 20".
+3. **Prefer a SuperSpeed port**, falling back to any connected one. A port whose
+   protocol is unknown loses to one known to be SuperSpeed and beats nothing
+   else, so a controller with an unreadable capability list behaves as before.
+4. **`reset_port` picks the reset the port accepts.** Hot reset (`PR`) first —
+   valid on both protocols. A warm reset is SuperSpeed link *recovery*, so it is
+   worth a second attempt only on a SuperSpeed port and is skipped outright on
+   USB 2.0 rather than spent as another second of timeout. `acknowledging_reset`
+   gained `WRC` for the warm case.
+5. **Enable Slot takes its Slot Type from the capability** rather than the
+   hardcoded 0. Every real part answers 0; taking it from the map costs nothing
+   and stops the value being a guess.
+
+## Persistence, as it stands
+
+`root=/dev/sda1` mounts the 64 GiB `sda1` (ext2, label `AKUMA`) as the root
+filesystem, with the RAM image as the fallback on any probe failure. Verified
+both directions across a reboot: a file Ubuntu wrote is read by Akuma, and a
+file Akuma wrote (`cp /AKUMA_DISK.txt /var/copy-test.txt`, 119 bytes) is on the
+physical partition when Ubuntu mounts it.
+
+Two userspace gaps remain, and **neither is a disk problem** — they fail
+identically on the RAM image:
+
+- **`echo x > file` fails with ENOSYS**, leaving a zero-length file. The shell
+  redirect needs `dup2(fd, 1)`, and fds 0/1/2 are handled by number below
+  `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them has nowhere to
+  land. This is the `cmd | cmd` entry in the runbook's known-broken table, met
+  from a different direction. `cp` writes fine, which is what proves the disk
+  path works.
+- **`mkdir` is ENOSYS** — the syscall is not implemented.
+
+Fixing `dup2` onto 0/1/2 is now the highest-value userspace change on this
+target: it is what stands between a working persistent root and a usable one.
+
+## A note on `root=/dev/sda1 skiptests`
+
+While the bring-up was still failing, that combination **reset the box** where
+plain `usb` failed gracefully. It has not recurred since the port fix, and the
+two were never A/B'd against the same binary, so what it was is unresolved. If
+it comes back, isolate it: `root=/dev/sda1` alone and `usb skiptests` alone,
+same kernel. Note that `usb` + `skiptests` does **not** exercise the driver at
+all — the smoke test lives inside the suite `skiptests` bypasses, and only
+`root=/dev/sda1` runs `xhci::init` on the `skiptests` path.

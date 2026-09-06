@@ -147,7 +147,7 @@ it reads identically on a dead NIC and a busy one.
 | every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. Since 2026-09-06 the kernel also defends itself: `xhci::quiesce_all` clears `BUS_MASTER` on every boot right after the PCI scan, and `xhci::shutdown` runs before the machine reset. Neither can save the boot whose image was *already* corrupted during load, so the power cycle stays the recovery |
 | a "disarmed" GRUB entry still drove the USB controller | until 2026-09-06 the xHCI self-test was gated only on the controller being *present*, so dropping `root=/dev/sda1` stopped the kernel mounting the disk but not bringing the controller up. There was no way to boot that kernel without driving it. **Fixed** — the bring-up now needs `usb` or `root=/dev/sda1` on the command line, and says so in the verdict when it skips |
 
-## The spare disk (persistence — USB/xHCI, in progress)
+## The spare disk (persistence — USB/xHCI, working)
 
 `/dev/sda` is a spare 1 TB drive (Seagate ST1000LM035) in a **USB-to-SATA
 enclosure** (ASMedia `174c:55aa`). The drive cannot move to SATA (screwed into a
@@ -201,26 +201,29 @@ The last one needs VT-d on and the controller unbound from `xhci_hcd`, and is
 the only rig that can reproduce a handoff or controller-quirk bug. It is also
 the only one where a runaway DMA is caught rather than landing in RAM.
 
-### Status on the metal (2026-09-06)
+### Status on the metal (2026-09-06) — working
 
-Bring-up **fails** on the real Intel controller — `201 passed, 1 FAILED`,
-`FAILED: xhci: controller + enumeration + BOT bring-up`. Which step is open.
-Under `qemu-xhci` the same driver passes all 11 checks, so this is a
-controller-specific difference, not a spec mistake.
+Bring-up **passes** on the real Intel controller: `209 passed, 0 failed`, and
+with `root=/dev/sda1` the boot says `fs: ext2 mounted on sda1`. Persistence is
+verified in both directions across a reboot — a file Ubuntu writes to
+`/dev/sdb1` is read by Akuma, and a file Akuma writes is on the physical
+partition when Ubuntu mounts it.
 
-Two things about this that are easy to get wrong:
+What had been wrong was the **port scan**, not the transport. `find_and_reset_port`
+took the first connected port and stopped: on this box that is USB 2.0 port 8,
+sitting in Polling with nothing usable on it, while the disk was on port 20,
+connected and already enabled. It then tried to rescue port 8 with a **warm**
+reset, a SuperSpeed-only bit that a USB 2.0 port ignores — hence a one-second
+timeout and `port reset timeout` as the only symptom. Full account:
+`docs/archive/AKUMA_AMD64_USB_XHCI.md`, last section.
 
-- **It no longer takes the box down.** The failure is contained: the controller
-  is halted, the boot continues, the network comes up, sshd serves. A failing
-  USB driver is a bad afternoon, not a power cycle.
-- **USB failures do not withhold `init`.** They are counted separately from the
-  verdict, because `run_shell = passed && have_fs` otherwise takes away the ssh
-  session that is the only way to read why USB failed.
+Two userspace gaps stand between a persistent root and a comfortable one, and
+**neither is a disk problem** — both fail the same way on the RAM image:
 
-There is unexplained evidence the metal once got further than this: the scratch
-LBA on `/dev/sdb` already holds the self-test's `(i ^ 0x5a)` pattern, which only
-`xhci::smoke_test` writes. A full BOT `WRITE(10)` completed on that hardware at
-some point.
+- `echo x > file` returns ENOSYS and leaves a zero-length file. The redirect
+  needs `dup2(fd, 1)`, which is the `cmd | cmd` row in the known-broken table
+  above. `cp` writes fine, which is what proved the disk path.
+- `mkdir` is ENOSYS — the syscall is not implemented.
 
 ### Reading a bring-up that died
 

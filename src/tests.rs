@@ -66,6 +66,10 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_vec_of_vecs, "vec_of_vecs");
     run_test!(test_adjacent_allocations, "adjacent_allocations");
 
+    // Console history: proves the `console::emit` tee into `akuma-dmesg` is
+    // wired, which no host test can show.
+    run_test!(test_dmesg_ring_captured_boot, "dmesg_ring_captured_boot");
+
     // Mmap allocator edge case tests (for userspace debugging)
     run_test!(test_mmap_single_page, "mmap_single_page");
     run_test!(test_mmap_multi_page, "mmap_multi_page");
@@ -507,6 +511,78 @@ pub fn run_all() -> bool {
 
 
 
+
+/// Test: the console history ring actually captured this boot.
+///
+/// `akuma-dmesg` is host-tested exhaustively; what a host test cannot show is
+/// that the tee in `console::emit` is *wired* — that real boot output reaches
+/// the ring rather than the capture being dead code nobody notices for a year.
+/// So this asserts on the ring's live contents: it prints a distinctive marker
+/// and then finds it in the history, which fails if the tee is missing, if the
+/// `try_lock` never succeeds, or if `snapshot_from`'s offsets are wrong against
+/// a ring that has already wrapped during a real boot.
+///
+/// Skipped as a pass on a build with the ring disabled (`extreme-size` selects
+/// `Ring<0>`); "no history" is that build's correct behaviour, not a failure.
+fn test_dmesg_ring_captured_boot() -> bool {
+    console::print("\n[TEST] dmesg console history\n");
+
+    if console::dmesg_len() == 0 && console::dmesg_total() == 0 {
+        console::print("  ring disabled (capacity 0) - skipping\n");
+        return true;
+    }
+
+    // A marker unlikely to occur in ordinary boot output.
+    const MARKER: &str = "dmesg-probe-8f3a1c\n";
+    let before = console::dmesg_total();
+    console::print(MARKER);
+    let after = console::dmesg_total();
+
+    if after < before + MARKER.len() as u64 {
+        console::print("  FAIL: total did not advance by the printed length\n");
+        return false;
+    }
+
+    // Drain the whole ring the way a `syslog(2)` reader would — a bounded
+    // staging buffer plus an advancing `skip` — and look for the marker. A
+    // single-pass read with a small buffer is exactly the bug this shape exists
+    // to prevent, so the test uses the correct shape rather than a convenient
+    // one.
+    let len = console::dmesg_len();
+    let mut stage = [0u8; 512];
+    let mut history: Vec<u8> = Vec::with_capacity(len);
+    let mut done = 0usize;
+    while done < len {
+        let n = console::dmesg_snapshot_from(done, &mut stage);
+        if n == 0 {
+            break;
+        }
+        history.extend_from_slice(&stage[..n]);
+        done += n;
+    }
+
+    if history.len() != len {
+        console::print("  FAIL: chunked drain returned ");
+        console::print_dec(history.len());
+        console::print(" of ");
+        console::print_dec(len);
+        console::print(" bytes\n");
+        return false;
+    }
+
+    let found = history.windows(MARKER.len()).any(|w| w == MARKER.as_bytes());
+    if !found {
+        console::print("  FAIL: marker not found in captured history\n");
+        return false;
+    }
+
+    console::print("  captured ");
+    console::print_dec(len);
+    console::print(" bytes, total ");
+    console::print_u64(after);
+    console::print(" - PASS\n");
+    true
+}
 
 /// Test: Vec allocation and basic operations
 fn test_allocator_vec() -> bool {

@@ -12,7 +12,7 @@
 use akuma_xhci::context::{dci, input_control_context, EndpointConfig, EpType, SlotConfig};
 use akuma_xhci::regs::{CapabilityRegisters, PortSc};
 use akuma_xhci::trb::{self, cc, ConsumerRing, ControlDir, Event, ProducerRing};
-use akuma_xhci::xcap::{self, SupportedProtocol, UsbLegSup};
+use akuma_xhci::xcap::{self, ProtocolMap, SupportedProtocol, UsbLegSup};
 use akuma_xhci::Speed;
 
 /// First 0x20 bytes of BAR0, little-endian:
@@ -463,4 +463,58 @@ fn configure_endpoint_add_flags_exclude_ep0() {
     let icc = input_control_context(add, 0, 1);
     assert_eq!(icc[1] & 0b11, 0b01, "A1 must still be clear in dword 1");
     assert_eq!(icc[0], 0, "Drop flags D0/D1 are reserved-zero");
+}
+
+/// The port map as the box actually publishes it: USB 2.0 covers 1..=14,
+/// SuperSpeed covers 16..=21, and port 15 is covered by neither.
+fn hp_500_502nj_protocol_map() -> ProtocolMap {
+    let name = u32::from_le_bytes(*b"USB ");
+    let mut m = ProtocolMap::default();
+    assert!(m.push(SupportedProtocol::parse(0x0200_0802, name, (14 << 8) | 1, 0)));
+    assert!(m.push(SupportedProtocol::parse(0x0300_0802, name, (6 << 8) | 16, 0)));
+    m
+}
+
+#[test]
+fn protocol_map_answers_which_reset_a_port_accepts() {
+    let m = hp_500_502nj_protocol_map();
+    assert_eq!(m.blocks().len(), 2);
+
+    // Port 8 — where the enclosure showed up on the metal, and the whole
+    // reason this map exists. It is USB 2.0, so `PORTSC.WPR` is reserved
+    // there: a driver that warm-resets it waits out its timeout and fails
+    // with nothing to say. Hot reset (`PR`) is the only one that works.
+    assert_eq!(m.major(8), 2);
+    assert!(!m.is_superspeed(8));
+
+    // Port 20 — the SuperSpeed half of the same kind of connector.
+    assert_eq!(m.major(20), 3);
+    assert!(m.is_superspeed(20));
+
+    // The boundaries of both blocks.
+    assert!(!m.is_superspeed(14));
+    assert!(m.is_superspeed(16));
+    assert!(m.is_superspeed(21));
+
+    // Port 15 is covered by no capability. It must answer "not SuperSpeed"
+    // (a hot reset is valid on either protocol; a warm one is not) and must
+    // not claim to be USB 0.
+    assert!(m.find(15).is_none());
+    assert!(!m.is_superspeed(15));
+    assert_eq!(m.major(15), 0);
+    assert_eq!(m.slot_type(15), 0);
+}
+
+#[test]
+fn protocol_map_is_bounded_and_refuses_to_overflow() {
+    let mut m = ProtocolMap::default();
+    let name = u32::from_le_bytes(*b"USB ");
+    for _ in 0..akuma_xhci::xcap::MAX_PROTOCOL_BLOCKS {
+        assert!(m.push(SupportedProtocol::parse(0x0200_0802, name, (1 << 8) | 1, 0)));
+    }
+    // Full: further blocks are dropped rather than written past the array, and
+    // the ports they would have covered read as unmapped.
+    assert!(!m.push(SupportedProtocol::parse(0x0300_0802, name, (6 << 8) | 16, 0)));
+    assert_eq!(m.blocks().len(), akuma_xhci::xcap::MAX_PROTOCOL_BLOCKS);
+    assert!(!m.is_superspeed(20));
 }

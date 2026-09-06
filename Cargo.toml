@@ -13,6 +13,7 @@ default-members = [
     "crates/akuma-psci",
     "crates/akuma-config",
     "crates/akuma-cpu",
+    "crates/akuma-dmesg",
     "crates/akuma-elf",
     "crates/akuma-ext2",
     "crates/akuma-isolation",

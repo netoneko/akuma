@@ -21,11 +21,101 @@
 //! stated once in the crate that owns the device instead of at each access.
 
 use crate::alloc::string::ToString;
+use akuma_dmesg::Ring;
 use alloc::vec::Vec;
 #[cfg(kernel_console_lock)]
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-#[cfg(kernel_console_lock)]
 use spinning_top::Spinlock;
+
+// ============================================================================
+// Console history (`dmesg`)
+// ============================================================================
+
+/// Bytes of console history kept for [`dmesg_snapshot_from`].
+///
+/// 64 KiB covers a whole boot comfortably and costs only `.bss` — it is not in
+/// the image, so the `extreme-size` 4 MB floor is unaffected by the *size*. It
+/// is the **RAM** that profile is also minimising, so it selects `0` instead,
+/// and `Ring<0>` is a genuinely zero-sized type whose `push` compiles to
+/// nothing. That is the whole "optional" mechanism: a type parameter, not a
+/// `cfg` threaded through every call site, so the disabled build still
+/// type-checks the code it is not keeping.
+#[cfg(not(kernel_profile_extreme))]
+const DMESG_CAP: usize = 64 * 1024;
+#[cfg(kernel_profile_extreme)]
+const DMESG_CAP: usize = 0;
+
+/// A copy of the last [`DMESG_CAP`] console bytes.
+///
+/// Until this existed (2026-09-06) the AArch64 kernel had **no console
+/// history at all**: anything printed before a serial capture was attached, or
+/// scrolled past it, was gone. The amd64 target grew a ring first because its
+/// reference machine's console is a write-only television, but the gap is the
+/// same on both — a boot diagnostic nobody was watching for is a diagnostic
+/// that did not happen. The ring arithmetic is `akuma-dmesg`, host-tested;
+/// what lives here is the `static` and the lock.
+///
+/// # Why `try_lock`, and why losing bytes is the right failure
+///
+/// [`emit`] runs inside `with_irqs_disabled` and, under
+/// `kernel_console_lock`, already inside a cross-core `Spinlock` with a
+/// reentrancy guard. A *blocking* acquire here would add a second lock to the
+/// one path that must work when everything else is broken: a panic, or a sync
+/// exception, landing while this core is inside `emit` would spin on a lock
+/// this core itself holds and wedge the kernel with no output — the exact
+/// failure `CONSOLE_OWNER` exists to prevent for the first lock.
+///
+/// So the acquire is a single non-blocking attempt and a failure drops the
+/// bytes. History is best-effort by construction: the console write itself
+/// always happens, and losing a few bytes of *replay* on a contended line is
+/// categorically better than losing the live output, or the machine.
+static DMESG: Spinlock<Ring<DMESG_CAP>> = Spinlock::new(Ring::new());
+
+/// Tee `bytes` into the history ring. Never blocks; see [`DMESG`].
+#[inline]
+fn dmesg_capture(bytes: &[u8]) {
+    if DMESG_CAP == 0 {
+        return;
+    }
+    if let Some(mut ring) = DMESG.try_lock() {
+        ring.push_bytes(bytes);
+    }
+}
+
+/// How many bytes of console history are currently retrievable.
+///
+/// `0` on a build with the ring disabled (`extreme-size`), which is the honest
+/// answer rather than an error: there is no history, not a broken reader.
+#[must_use]
+pub fn dmesg_len() -> usize {
+    DMESG.try_lock().map_or(0, |r| r.len())
+}
+
+/// Copy console history into `out`, starting `skip` bytes past the oldest byte
+/// still retrievable. Returns how many bytes were written.
+///
+/// Successive calls with an advancing `skip` walk forward through history, so a
+/// caller with a small staging buffer can still deliver the whole ring. That
+/// parameter is not decoration: its absence is what made amd64's `dmesg`
+/// silently return only its last staging buffer's worth
+/// (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4).
+#[must_use]
+pub fn dmesg_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
+    DMESG.try_lock().map_or(0, |r| r.snapshot_from(skip, out))
+}
+
+/// Discard the buffered console history.
+pub fn dmesg_clear() {
+    if let Some(mut ring) = DMESG.try_lock() {
+        ring.clear();
+    }
+}
+
+/// Total console bytes ever emitted, including those since evicted.
+#[must_use]
+pub fn dmesg_total() -> u64 {
+    DMESG.try_lock().map_or(0, |r| r.total())
+}
 
 // ============================================================================
 // Cross-core serialization (opt-in via `CONSOLE_LOCK=1`)
@@ -104,6 +194,11 @@ pub fn set_multicore() {}
 #[inline]
 fn emit(bytes: &[u8]) {
     crate::irq::with_irqs_disabled(|| {
+        // History first, and outside the cross-core console lock: the ring's
+        // own `try_lock` is what serialises it, and capturing before the UART
+        // write means a byte that a stalled or absent UART never accepts is
+        // still in `dmesg`.
+        dmesg_capture(bytes);
         #[cfg(kernel_console_lock)]
         if MULTICORE.load(Ordering::Acquire) {
             let me = akuma_exec::bkl::current_core_id() as u8 + 1;

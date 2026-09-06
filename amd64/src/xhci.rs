@@ -54,6 +54,7 @@ use akuma_usb_storage::{Cbw, Csw, CswStatus, Direction, cdb};
 use akuma_xhci::context::{self, EndpointConfig, EpType, SlotConfig};
 use akuma_xhci::regs::{self, CapabilityRegisters, PortSc, crcr, intr, op, rt, usbcmd, usbsts};
 use akuma_xhci::trb::{self, ConsumerRing, ControlDir, Event, ProducerRing, cc};
+use akuma_xhci::xcap::ProtocolMap;
 use akuma_xhci::{Speed, xcap};
 use spinning_top::Spinlock;
 
@@ -477,6 +478,13 @@ pub fn init() -> Result<(), &'static str> {
         return Err("xHCI wants more scratchpad than reserved");
     }
 
+    // Which ports are USB 2.0 and which are SuperSpeed. Read before anything
+    // is reset, because `find_and_reset_port` cannot choose a port — or the
+    // reset that port accepts — without it.
+    step("read supported protocols");
+    let protocols = scan_protocols(bar_va, caps.hcc_params1.ext_cap_offset());
+    report_protocols(&protocols);
+
     // Taking the controller from the firmware. On a box whose BIOS is still
     // using it for the USB keyboard this hands control through an SMI, and a
     // firmware that dislikes what it finds resets the machine from inside SMM —
@@ -632,9 +640,10 @@ pub fn init() -> Result<(), &'static str> {
         serial::puts("  [xhci] command ring ok\n");
 
         step("find + reset port");
-        x.port = find_and_reset_port(op, max_ports)?;
+        x.port = find_and_reset_port(op, max_ports, &protocols)?;
+        let slot_type = protocols.slot_type(x.port);
         step("enumerate device");
-        enumerate(&mut x)?;
+        enumerate(&mut x, slot_type)?;
         step("READ CAPACITY");
         read_capacity(&mut x)?;
         Ok(x)
@@ -782,39 +791,148 @@ fn bios_handoff(bar_va: usize, mut off: usize) {
     }
 }
 
-fn find_and_reset_port(op: usize, max_ports: u8) -> Result<u8, &'static str> {
-    let mut found = 0u8;
-    for p in 1..=max_ports {
-        let psc = PortSc(r32(op, op::portsc(p)));
-        if psc.connected() {
-            serial::puts("  [xhci] port ");
-            serial::put_dec(u64::from(p));
-            puthex(" PORTSC=", psc.0);
-            found = p;
+/// Walk the extended-capability list and collect every Supported Protocol
+/// block (xHCI §7.2), which is what says whether a given root-hub port is USB
+/// 2.0 or SuperSpeed.
+///
+/// Read-only — no writes, nothing that can enter SMM — so unlike the BIOS
+/// handoff it is safe to run early, and its answer is available to every step
+/// after it.
+fn scan_protocols(bar_va: usize, mut off: usize) -> ProtocolMap {
+    let mut map = ProtocolMap::default();
+    if off == 0 {
+        return map;
+    }
+    for _ in 0..32 {
+        let hdr = r32(bar_va, off);
+        if xcap::cap_id(hdr) == xcap::CAP_ID_SUPPORTED_PROTOCOL
+            && !map.push(xcap::SupportedProtocol::parse(
+                hdr,
+                r32(bar_va, off + 4),
+                r32(bar_va, off + 8),
+                r32(bar_va, off + 12),
+            ))
+        {
             break;
         }
+        match xcap::next_cap_offset(off, hdr) {
+            Some(n) => off = n,
+            None => break,
+        }
     }
-    if found == 0 {
-        return Err("no connected xHCI port");
-    }
+    map
+}
 
-    let psc = PortSc(r32(op, op::portsc(found)));
-    if !psc.enabled() {
-        w32(op, op::portsc(found), psc.with_warm_reset_asserted());
+fn report_protocols(map: &ProtocolMap) {
+    for b in map.blocks() {
+        serial::puts("  [xhci] proto USB");
+        serial::put_dec(u64::from(b.major));
+        serial::puts(" ports ");
+        serial::put_dec(u64::from(b.port_offset));
+        serial::puts("..");
+        serial::put_dec(u64::from(
+            b.port_offset.saturating_add(b.port_count.saturating_sub(1)),
+        ));
+        serial::puts(" slot_type ");
+        serial::put_dec(u64::from(b.slot_type));
+        serial::puts("\n");
+    }
+}
+
+/// Reset one root-hub port and wait for it to enable.
+///
+/// **Which reset a port accepts depends on its protocol**, and getting that
+/// wrong is where the metal bring-up died for a whole session. `PORTSC.WPR` —
+/// Warm Port Reset — is a SuperSpeed-only bit and **reserved on a USB 2.0
+/// port**: the write is ignored, the port stays in Polling, and the only
+/// symptom is the one-second timeout below. The enclosure attaches on USB 2.0
+/// port 8 on the reference box, so a driver that could only warm-reset was
+/// never going to enumerate it, and said nothing about why.
+///
+/// Hot reset (`PR`) is valid on both protocols, so it is what is tried first.
+/// A warm reset is SuperSpeed link *recovery*; it is worth a second attempt
+/// only on a SuperSpeed port whose link did not train, and is skipped outright
+/// on USB 2.0 rather than spent as another second of timeout.
+fn reset_port(op: usize, port: u8, superspeed: bool) -> Result<(), &'static str> {
+    for warm in [false, true] {
+        if warm && !superspeed {
+            break;
+        }
+        let psc = PortSc(r32(op, op::portsc(port)));
+        if psc.enabled() && !psc.resetting() {
+            return Ok(());
+        }
+        w32(
+            op,
+            op::portsc(port),
+            if warm { psc.with_warm_reset_asserted() } else { psc.with_reset_asserted() },
+        );
         let s = tsc();
         loop {
-            let now = PortSc(r32(op, op::portsc(found)));
+            let now = PortSc(r32(op, op::portsc(port)));
             if now.enabled() && !now.resetting() {
-                break;
+                w32(op, op::portsc(port), now.acknowledging_reset());
+                return Ok(());
             }
             if tsc().wrapping_sub(s) > BUDGET {
-                return Err("xHCI port reset timeout");
+                break;
             }
             spin_us(1000);
         }
-        let now = PortSc(r32(op, op::portsc(found)));
-        w32(op, op::portsc(found), now.acknowledging_reset());
+        serial::puts(if warm {
+            "  [xhci] warm reset timed out\n"
+        } else {
+            "  [xhci] hot reset timed out\n"
+        });
     }
+    Err("xHCI port reset timeout")
+}
+
+fn find_and_reset_port(
+    op: usize,
+    max_ports: u8,
+    protocols: &ProtocolMap,
+) -> Result<u8, &'static str> {
+    // Print **every** connected port, not just the one chosen.
+    //
+    // A physical SuperSpeed socket is two root-hub ports — a USB 2.0 one and a
+    // SuperSpeed one — and a device lands on whichever half its link trained
+    // for. The first version of this loop stopped at the first connected port
+    // and printed only that: on the metal, one line naming USB 2.0 port 8,
+    // with no protocol on it and no hint that ports 16..=21 had never been
+    // looked at. The map is the difference between "the reset timed out" and
+    // "the reset timed out because that port is USB 2.0".
+    let mut chosen: Option<u8> = None;
+    for p in 1..=max_ports {
+        let psc = PortSc(r32(op, op::portsc(p)));
+        if !psc.connected() {
+            continue;
+        }
+        let ss = protocols.is_superspeed(p);
+        serial::puts("  [xhci] port ");
+        serial::put_dec(u64::from(p));
+        serial::puts(" USB");
+        serial::put_dec(u64::from(protocols.major(p)));
+        serial::puts(" connected PORTSC=0x");
+        serial::put_hexn(u64::from(psc.0), 8);
+        serial::puts(" PLS=");
+        serial::put_dec(u64::from(psc.link_state()));
+        serial::puts(if psc.enabled() { " enabled\n" } else { " not-enabled\n" });
+        // Prefer SuperSpeed: the same disk over four times the link. A port
+        // whose protocol is unknown loses to one known to be SuperSpeed and
+        // beats nothing else, which keeps a controller with an unreadable
+        // capability list working exactly as before.
+        let better = match chosen {
+            None => true,
+            Some(c) => ss && !protocols.is_superspeed(c),
+        };
+        if better {
+            chosen = Some(p);
+        }
+    }
+    let found = chosen.ok_or("no connected xHCI port")?;
+
+    reset_port(op, found, protocols.is_superspeed(found))?;
     spin_us(20_000); // settle (USB 2.0 §7.1.7.3)
 
     let psc = PortSc(r32(op, op::portsc(found)));
@@ -826,13 +944,17 @@ fn find_and_reset_port(op: usize, max_ports: u8) -> Result<u8, &'static str> {
     Ok(found)
 }
 
-fn enumerate(x: &mut Xhci) -> Result<(), &'static str> {
+/// `slot_type` is the Protocol Slot Type from the Supported Protocol
+/// capability covering this port (0 for USB on every real part, but the field
+/// exists so a controller can define others — and taking it from the
+/// capability costs nothing over hardcoding the value it almost always has).
+fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
     let psc = PortSc(r32(x.op, op::portsc(x.port)));
     let speed = Speed::from_field(psc.speed_field()).ok_or("unknown port speed")?;
     let ep0_mps = speed.default_ep0_max_packet();
 
     // --- Enable Slot ---
-    let (code, slot) = x.command(trb::enable_slot(0), "enable slot")?;
+    let (code, slot) = x.command(trb::enable_slot(slot_type), "enable slot")?;
     if code != cc::SUCCESS || slot == 0 || u32::from(slot) >= 64 {
         return Err("Enable Slot failed");
     }

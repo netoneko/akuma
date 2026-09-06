@@ -342,12 +342,14 @@ impl PortSc {
         self.preserving_write() | Self::WPR
     }
 
-    /// Value to write to acknowledge the port-reset-change and
-    /// connect-status-change bits after a completed reset, leaving everything
-    /// else intact.
+    /// Value to write to acknowledge the change bits a completed reset leaves
+    /// set, leaving everything else intact. `WRC` is in the set because a
+    /// SuperSpeed port may have been *warm* reset, and a change bit left
+    /// asserted keeps the controller reporting a port-status change that has
+    /// already been handled.
     #[must_use]
     pub fn acknowledging_reset(&self) -> u32 {
-        self.preserving_write() | Self::PRC | Self::CSC | Self::PEC | Self::PLC
+        self.preserving_write() | Self::PRC | Self::WRC | Self::CSC | Self::PEC | Self::PLC
     }
 
     /// Value to write to turn port power on.

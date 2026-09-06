@@ -6,6 +6,9 @@ description = "Unsafe-free half of the bin crate: config/timer/irq/pmm/vfs-fs sh
 
 [dependencies]
 akuma-config = { path = "../akuma-config" }
+# The `dmesg` console-history ring. Pure, host-tested, dependency-free; this
+# crate supplies the `static` and the lock discipline around it (`console.rs`).
+akuma-dmesg = { path = "../akuma-dmesg" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-ext2 = { path = "../akuma-ext2" }
