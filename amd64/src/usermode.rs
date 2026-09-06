@@ -1008,14 +1008,25 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // the child is done, where `sys_waitpid` alone just returns 0.
         61 => {
             const WNOHANG: u64 = 0x0000_0001;
+            let me = crate::sched::current_task();
             loop {
+                // Arm, then join the waiter set, then ask. Both steps go before
+                // the question for the same reason: a child that exits between
+                // the answer and the park must leave something behind, and
+                // `wait4_wake_all` reaching an armed, registered task is that
+                // something. Registering *after* asking would reopen the window
+                // this ordering exists to close.
+                crate::sched::prepare_block();
+                wait4_register(me);
                 // 0 = a matching child exists but has not exited; anything else
                 // is a reaped pid or `-ESRCH`.
                 let r = sys_waitpid(a1, a2, a3);
                 if r != 0 || a3 & WNOHANG != 0 {
+                    wait4_unregister(me);
                     return r;
                 }
-                crate::sched::yield_now();
+                crate::sched::block_current();
+                wait4_unregister(me);
             }
         }
         // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
@@ -2978,6 +2989,49 @@ fn cleanup_spawn_slot(slot: usize, stdout_pipe: PipeId, stdin_pipe: PipeId) {
     }
 }
 
+/// Tasks parked inside `wait4`, as a bitmap over scheduler task slots.
+///
+/// A set rather than a per-child parent link, because `wait4(-1)` waits for
+/// *any* child and the waiter is frequently not in the spawn table at all
+/// (`sshd` is pid 1). Waking the whole set on any child's exit is a handful of
+/// spurious wakes at most — each parked task re-runs `sys_waitpid` and parks
+/// again if the exit was not its child — against the alternative of threading a
+/// parent task slot through every spawn, fork and vfork path.
+///
+/// Relaxed ordering throughout: every reader and writer runs under the BKL, and
+/// the atomics are here to make the `static` sound rather than to order
+/// anything.
+static WAIT4_PARKED: [AtomicU64; crate::sched::MAX_TASKS.div_ceil(64)] =
+    [const { AtomicU64::new(0) }; crate::sched::MAX_TASKS.div_ceil(64)];
+
+fn wait4_register(task: usize) {
+    if let Some(w) = WAIT4_PARKED.get(task / 64) {
+        w.fetch_or(1 << (task % 64), Ordering::Relaxed);
+    }
+}
+
+fn wait4_unregister(task: usize) {
+    if let Some(w) = WAIT4_PARKED.get(task / 64) {
+        w.fetch_and(!(1 << (task % 64)), Ordering::Relaxed);
+    }
+}
+
+/// Make every task parked in `wait4` runnable.
+///
+/// Called from [`spawn_record_exit`], which is the single place in this kernel
+/// where a child's exit status becomes visible — so this is the whole wake path
+/// for `wait4`, and it is one call site rather than a rule to remember.
+fn wait4_wake_all() {
+    for (word, bits) in WAIT4_PARKED.iter().enumerate() {
+        let mut set = bits.load(Ordering::Relaxed);
+        while set != 0 {
+            let bit = set.trailing_zeros() as usize;
+            set &= set - 1;
+            crate::sched::wake(word * 64 + bit);
+        }
+    }
+}
+
 /// Called from `run_process` when a spawned child leaves ring 3.
 pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     // SAFETY: raw-pointer access; single core.
@@ -2992,6 +3046,10 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
             }
         }
     }
+    // Outside the `unsafe` block and after the status is recorded, both
+    // deliberately: a woken parent re-runs `sys_waitpid` immediately, and it
+    // must find `exit` already set or it parks again for nothing.
+    wait4_wake_all();
 }
 
 /// The stdin/stdout pipe a task running `PROCS` slot `proc_slot` reads/writes as

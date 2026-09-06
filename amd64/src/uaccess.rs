@@ -89,17 +89,53 @@ pub struct SmapStatus {
 
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
+/// `CR0.WP` — **write protect**: make ring 0 honour the `R/W` bit of a page.
+///
+/// With `WP` clear (the reset state, and what this kernel booted with until
+/// 2026-09-07) a supervisor write succeeds against **any** mapped page whatever
+/// its `R/W` bit says. That is not a missing hardening, it is a live
+/// correctness hole, and copy-on-write is where it bites:
+///
+/// `copy_to_user` writes through the *user* virtual address with `rep movsb`
+/// from ring 0. After a `fork` the child's pages are mapped read-only and
+/// CoW-marked. With `WP` clear a `read(2)` into a buffer the child has not
+/// written since the fork takes **no fault at all** — so the CoW break never
+/// runs, and the bytes land in the frame the **parent** is still mapping. The
+/// parent's memory changes underneath it, silently, with no error anywhere.
+///
+/// `idt::page_fault_dispatch` had the arm for this and could never reach it: it
+/// required the fault to come from ring 3 (`PageFaultCode::is_user_mode`), and
+/// a `copy_to_user` fault comes from ring 0. Its own comment described the
+/// behaviour this bit is what actually produces — see the CoW arm there.
+///
+/// Architectural since the 486 and unconditional in long mode, so unlike
+/// SMAP/SMEP there is nothing to ask CPUID about.
+const CR0_WP: u64 = 1 << 16;
 /// `RFLAGS.AC`.
 const RFLAGS_AC: u64 = 1 << 18;
 
-/// Turn on `CR4.SMAP` and `CR4.SMEP` where CPUID advertises them.
+/// Turn on `CR4.SMAP`/`CR4.SMEP` where CPUID advertises them, and `CR0.WP`
+/// unconditionally.
+///
+/// The three belong together: each one makes a ring-0 access to a user page
+/// obey a rule it was previously exempt from. SMAP requires the access to be
+/// *declared* (`stac`), SMEP forbids *executing* one, and [`CR0_WP`] makes a
+/// *write* honour the page's `R/W` bit — which is what routes a `copy_to_user`
+/// onto a CoW page through the break instead of straight into a frame the
+/// parent still shares.
+///
+/// Called on **every** core (the BSP from `kmain`, each AP from `ap_entry64`),
+/// which is why this is the right home for `WP`: all three are per-core
+/// registers, and a secondary that missed any of them would enforce a different
+/// rule than the boot core.
 ///
 /// Call once, early — before the first syscall and before the self-tests, so
 /// everything after runs under the enforcement it will ship with. Safe to call
 /// with paging up: the bits change how *future* accesses are checked and
 /// nothing in this kernel touches a user page without [`read_bytes`] /
 /// [`write_bytes`] (the loader and the fork/exec page copies go through the
-/// physmap, which is supervisor-only).
+/// physmap, which is supervisor-only — and therefore writable regardless of
+/// `WP`, since `WP` only governs the `R/W` bit and those mappings are `R/W`).
 pub fn init_smap() -> SmapStatus {
     let ebx: u32;
     // SAFETY: `cpuid` is unprivileged and side-effect-free. `rbx` is
@@ -139,7 +175,30 @@ pub fn init_smap() -> SmapStatus {
     if cpuid_smap {
         SMAP_ACTIVE.store(1, Ordering::Release);
     }
+
+    let mut cr0: u64;
+    // SAFETY: reading CR0 has no side effect.
+    unsafe { core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags)) };
+    cr0 |= CR0_WP;
+    // SAFETY: one bit added, every other written back as read. From here a
+    // ring-0 write to a read-only page faults instead of succeeding — which the
+    // `#PF` handler services (a CoW page) or reports (anything else). Nothing
+    // in this kernel writes a user page except through `write_bytes` below, and
+    // its `rep movsb` is already fixup-covered.
+    unsafe { core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags)) };
+
     SmapStatus { cpuid_smap, cpuid_smep }
+}
+
+/// Is `CR0.WP` set right now? Read back from the register, never echoed from
+/// what was written — the same discipline as [`cr4_bits`], and the reason the
+/// self-test can tell "we set it" from "the CPU has it".
+#[must_use]
+pub fn write_protect_on() -> bool {
+    let cr0: u64;
+    // SAFETY: reading CR0 has no side effect.
+    unsafe { core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags)) };
+    cr0 & CR0_WP != 0
 }
 
 /// `(CR4.SMAP, CR4.SMEP)` as the CPU currently has them.
@@ -318,6 +377,107 @@ pub fn read_cstr(ptr: u64, max: usize) -> Option<Vec<u8>> {
     None
 }
 
+/// Prove `CR0.WP` is enforcing, and that a kernel write to a shared page breaks
+/// the sharing rather than corrupting the peer.
+///
+/// # What this is a regression test for
+///
+/// Until 2026-09-07 this kernel ran with `CR0.WP` clear, so a supervisor write
+/// ignored the `R/W` bit entirely. `copy_to_user` writes through the *user*
+/// virtual address, so after a `fork` a `read(2)` into a buffer the child had
+/// not yet written landed **in the frame the parent was still mapping**: no
+/// fault, no copy-on-write break, no error, and the parent's memory changed
+/// underneath it. The second check below is that exact scenario, built by hand:
+/// two user VAs onto one CoW-marked frame with a share count of 2, a kernel
+/// write through one of them, and then the question the bug got wrong — *did
+/// the other VA see it?*
+///
+/// The first check is the other half. A user page that is read-only **on
+/// purpose** (`Prot::USER_RX`, an ELF text segment, an `mprotect(PROT_READ)`
+/// range) must still refuse a kernel write: `akuma_cow` answers `Fault` for an
+/// unmarked read-only page, the fault falls through to the user-copy fixup, and
+/// [`write_bytes`] reports failure. Without that half, turning `WP` on would
+/// simply move the corruption rather than fix it.
+fn write_protect_check(t: &mut Suite) {
+    use crate::paging::{self, MemAttr, Prot};
+    use crate::phys::phys_ptr;
+    const RO_VA: u64 = 0x14_0000_0000;
+    const SHARED_A: u64 = 0x15_0000_0000;
+    const SHARED_B: u64 = 0x15_0000_1000;
+
+    t.check("wp: CR0.WP is set", write_protect_on());
+
+    // 1. A user page that is read-only on purpose refuses a kernel write.
+    let Some(ro_pa) = akuma_pmm::alloc_page() else {
+        t.check("wp: frame for the read-only page", false);
+        return;
+    };
+    // SAFETY: a fresh PMM frame, reached through the physmap (supervisor).
+    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(ro_pa as u64), 0xA5, 4096) };
+    if paging::map_page(RO_VA as usize, ro_pa as u64, Prot::USER_RX, MemAttr::WriteBack) {
+        let wrote = write_bytes(RO_VA, b"must not land");
+        // SAFETY: the same frame, through the physmap.
+        let untouched = unsafe { phys_ptr::<u8>(ro_pa as u64).read_volatile() == 0xA5 };
+        t.check("wp: a kernel write to a read-only user page is refused", !wrote);
+        t.check("wp: and the page is unchanged", untouched);
+        t.check("wp: AC is clear after the refused write", !ac_set());
+        if let Some(pa) = paging::unmap_page(RO_VA as usize) {
+            akuma_pmm::free_page(pa as usize, 0);
+        }
+    } else {
+        akuma_pmm::free_page(ro_pa, 0);
+        t.check("wp: map the read-only page", false);
+    }
+
+    // 2. Two VAs, one CoW-marked frame, share count 2 — a forked pair, by hand.
+    let Some(shared_pa) = akuma_pmm::alloc_page() else {
+        t.check("wp: frame for the shared page", false);
+        return;
+    };
+    // SAFETY: a fresh PMM frame, through the physmap.
+    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(shared_pa as u64), 0x5A, 4096) };
+    let cow = Prot::USER_RW.cow();
+    let mapped = paging::map_page(SHARED_A as usize, shared_pa as u64, cow, MemAttr::WriteBack)
+        && paging::map_page(SHARED_B as usize, shared_pa as u64, cow, MemAttr::WriteBack);
+    if !mapped {
+        t.check("wp: map the shared pair", false);
+        akuma_pmm::free_page(shared_pa, 0);
+        return;
+    }
+    // Two address spaces hold it. `cow_ref_inc` twice is what a `fork` leaves
+    // behind, and it is what makes `akuma_cow` answer `Copy` rather than
+    // `TakeInPlace` — the branch that has to allocate.
+    akuma_pmm::cow_ref_inc(shared_pa);
+    akuma_pmm::cow_ref_inc(shared_pa);
+
+    let wrote = write_bytes(SHARED_A, b"private");
+    t.check("wp: a kernel write to a CoW page succeeds", wrote);
+
+    // The write must be visible through the VA that was written...
+    let mut back = [0u8; 7];
+    let read_ok = read_bytes(SHARED_A, &mut back);
+    t.check("wp: and is visible through that mapping", read_ok && &back == b"private");
+
+    // ...and INVISIBLE through the peer. This is the whole bug: with `WP`
+    // clear both VAs saw it, because there was one frame and no break.
+    let mut peer = [0u8; 7];
+    let peer_ok = read_bytes(SHARED_B, &mut peer);
+    t.check("wp: and NOT through the peer mapping (the sharing broke)", peer_ok && peer == [0x5A; 7]);
+
+    // The two VAs must now be different frames, which is what "broke" means.
+    let pa_a = paging::translate(SHARED_A as usize).unwrap_or(0);
+    let pa_b = paging::translate(SHARED_B as usize).unwrap_or(0);
+    t.check("wp: the pair no longer shares a frame", pa_a != pa_b && pa_a != 0 && pa_b != 0);
+
+    for va in [SHARED_A, SHARED_B] {
+        if let Some(pa) = paging::unmap_page(va as usize)
+            && akuma_pmm::cow_ref_dec(pa as usize)
+        {
+            akuma_pmm::free_page(pa as usize, 0);
+        }
+    }
+}
+
 /// Prove SMAP is enforcing, not just enabled.
 ///
 /// Maps one **user-accessible** page (`Prot::USER_RW`), then:
@@ -402,4 +562,10 @@ pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
         (free_before - akuma_pmm::free_count()) as u64,
         2,
     );
+
+    // **After** the accounting check, not before. The `WP` checks map three more
+    // 1 GiB regions and `unmap_page` retains each one's directory and table, so
+    // running them first turns this into a five-frame "leak" that is nothing of
+    // the sort. Its own frame accounting is done per-page inside it instead.
+    write_protect_check(t);
 }

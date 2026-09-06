@@ -1,5 +1,5 @@
 //! The kernel-integration half of a pipe on amd64: the lock, the id cast, and
-//! the (currently empty) wake effect.
+//! the wake effect.
 //!
 //! The table itself — the buffer, the 64 KiB cap, **end reference counts**, the
 //! waiter set and every rule joining them — is
@@ -11,22 +11,33 @@
 //! last *reader* was not an event, so `busybox yes | busybox head -n 1` filled
 //! the buffer and never learnt the pipe had broken.
 //!
-//! # Wakes are still no-ops — for now
+//! # Wakes are real (2026-09-07)
 //!
-//! `PipeTable` hands back a [`Wakes`] set rather than firing it, and this kernel
-//! drops it: its scheduler has no blocked state (`Unused | Reserved | Runnable |
-//! Finished`), so a waiter is always runnable and learns of an event by polling
-//! — the same trade its futex and `wait4` already make. [`fire`] is the single
-//! place that changes when that scheduler grows a blocked state; nothing in the
-//! crate does.
+//! `PipeTable` hands back a [`Wakes`] set rather than firing it, and until the
+//! scheduler grew a blocked state this kernel dropped it: a waiter was always
+//! runnable and learnt of an event by polling. [`fire`] was an empty function,
+//! written as a real one and called on every path that produces wakes precisely
+//! so that this would be a change to one body. It was.
 //!
-//! # Reading and writing do not block here
+//! The token type is still `()`, and that is not an oversight: `Wakes<W>` yields
+//! `(tid, W)` pairs and this kernel's `tid` **is** the scheduler task slot, so
+//! the identity a wake needs is already the key. There is nothing for a token to
+//! carry.
 //!
-//! [`read`] returns `None` for "empty but a writer is still around" and the
-//! caller re-polls; [`write`] returns a short count when the buffer is full.
-//! `sshd`'s bridge loop polls every direction each tick, so a blocking pipe
-//! would only be a way to deadlock it against a child that is itself waiting on
-//! the other pipe.
+//! # Reading and writing block through the table, not by spinning
+//!
+//! [`read`] still returns `None` for "empty but a writer is still around" and
+//! [`write`] still returns a short count when the buffer is full — the table
+//! never blocks. What changed is what the *caller* does with that answer:
+//! `fd::read_pipe` and `fd::write_pipe` used to `yield_now` and re-poll, and now
+//! register through [`check_set_reader`]/[`check_set_writer`] and park.
+//!
+//! Registering is one step with the test on purpose. The two-step spelling
+//! (`read` → empty → `add_poller` → sleep) has a TOCTOU window: a write landing
+//! between them fires its wake with no waiter registered, and the caller sleeps
+//! through the event it was waiting for. The crate owns that rule; this module
+//! only has to not open a second window, which is why the caller arms with
+//! `sched::prepare_block` *before* asking.
 
 use akuma_pipes::{PipeTable, Wakes, WriteOutcome};
 use spinning_top::Spinlock;
@@ -49,12 +60,23 @@ fn with_table<R>(f: impl FnOnce(&mut PipeTable<()>) -> R) -> R {
     f(&mut PIPES.lock())
 }
 
-/// Make every returned waiter runnable — which on this kernel is nothing to do.
+/// Make every returned waiter runnable.
 ///
-/// Kept as a real function, and called on every path that produces wakes, so
-/// that giving the scheduler a blocked state is a change to this body and
-/// nowhere else.
-fn fire(_wakes: Wakes<()>) {}
+/// **Called with the table lock released**, which is the property `akuma_pipes`
+/// returning its wakes rather than firing them is there to make unavoidable:
+/// `sched::wake` takes no lock of its own, but it is reached from paths that
+/// hold others, and firing inside `PIPES` is how the AArch64 kernel
+/// self-deadlocked a core (`docs/archive/AKUMA_PIPES_EXTRACTION.md`).
+///
+/// A wake naming a task that has since exited is not an error: `sched::wake`
+/// answers `false` for a slot that is `Unused` or `Finished` and records
+/// nothing, so a poller entry that outlived its reader cannot arm a wake for
+/// whoever recycles the slot.
+fn fire(wakes: Wakes<()>) {
+    wakes.fire(|tid, ()| {
+        crate::sched::wake(tid);
+    });
+}
 
 /// How many pipes can exist at once.
 ///
@@ -160,6 +182,34 @@ pub fn readable(id: PipeId) -> bool {
 #[must_use]
 pub fn writable(id: PipeId) -> bool {
     with_table(|t| t.writable(id as akuma_pipes::PipeId))
+}
+
+/// "Is there anything to read, and if not, register me as a waiter" — one step.
+///
+/// Returns `true` when the caller must **not** park: there are bytes, or every
+/// writer is gone (EOF), or the pipe does not exist. `false` means the caller is
+/// registered and should park; the next [`write`], [`close_write`] or
+/// [`close_read`] on this pipe will [`fire`] a wake at it.
+///
+/// The single step is the point — see the module header for the window the
+/// two-step spelling leaves open.
+#[must_use]
+pub fn check_set_reader(id: PipeId) -> bool {
+    let me = crate::sched::current_task();
+    with_table(|t| t.check_set_reader(id as akuma_pipes::PipeId, me, ()))
+}
+
+/// The writer's half of [`check_set_reader`]: `true` when there is room, or
+/// when every reader is gone and the write is about to fail with `EPIPE`.
+///
+/// That second case is why this is not simply "is there room". A pipe with no
+/// readers never gains any, so a writer that parked on it would park forever;
+/// answering `true` sends the caller back to [`write`], which reports the broken
+/// pipe. It is the same rule [`writable`] states for `poll`.
+#[must_use]
+pub fn check_set_writer(id: PipeId) -> bool {
+    let me = crate::sched::current_task();
+    with_table(|t| t.check_set_writer(id as akuma_pipes::PipeId, me, ()))
 }
 
 /// Drop one writer. Losing the **last** one is EOF: a reader that has drained

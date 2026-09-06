@@ -283,6 +283,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         // tick to drive NEED_RESCHED.
         lapic::start_timer();
         sched::smoke_test(&mut t);
+        sched::block_smoke_test(&mut t);
         lapic::stop_timer();
     }
 
@@ -401,6 +402,18 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     lapic::clock_rate_check(&mut t);
 
     drop(user_ptr_bypass);
+
+    // What the suite's own workload did to the scheduler. Notes rather than
+    // checks: the numbers depend on timing and on how much work the boot found
+    // to do, so a threshold here would be a flake. What they are worth reading
+    // for is the *shape* — `parks` climbing well past the three the blocking
+    // self-test performs is the pipe and futex waits actually parking, which is
+    // the whole point of the change and is otherwise invisible from a green
+    // suite. `backstop releases` is the one to watch: see `sched::BACKSTOP_US`,
+    // a number that grows names a wait whose wake path is missing.
+    t.note("sched: parks over the whole suite", sched::blocks());
+    t.note("sched: wakes over the whole suite", sched::wakes());
+    t.note("sched: backstop releases (0 is the healthy value)", sched::backstop_wakes());
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.

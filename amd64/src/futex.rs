@@ -7,29 +7,35 @@
 //! the effects: reading and writing user memory, holding the table, and
 //! parking.
 //!
-//! # Why the wait is a poll and not a park
+//! # The wait is a park, and membership is still the signal
 //!
-//! The AArch64 kernel wakes a futex waiter by firing a `ThreadWaker` at a
-//! specific tid; this target has no such thing — `net::park_until`'s own
-//! comment says so, and `wait4` already spins on `yield_now` for the same
-//! reason. So `FUTEX_WAKE` here does exactly one thing: it takes the waiter off
-//! the table. The waiter notices on its next poll, because "am I still queued?"
-//! is the only wake signal it needs, and it is a signal the table already
-//! carries. That is not a lesser design so much as a smaller one: it cannot
-//! lose a wake (the removal is durable state, not an edge), and it costs a
-//! round of the round-robin per waiter per tick.
+//! It was a poll until 2026-09-07 — the scheduler had no blocked state, so
+//! `FUTEX_WAKE` did exactly one thing (take the waiter off the table) and the
+//! waiter noticed on its next round of the round-robin. That design was right
+//! about the *signal* and wrong about the *cost*: an untimed `FUTEX_WAIT` with
+//! nothing else runnable span at scheduler frequency, which on a machine
+//! expected to run a parallel build is most of a core per blocked thread.
 //!
-//! What it does cost is CPU: an untimed `FUTEX_WAIT` with nothing else runnable
-//! spins. On a cooperative single-core kernel that is survivable — something
-//! else is runnable, by construction, or the wake is never coming — and it is
-//! the same trade `wait4` and the block driver already make.
+//! **The signal has not changed.** "Am I still queued?" is still the whole test,
+//! and it is still durable state rather than an edge, so a wake cannot be lost
+//! by being delivered early. What is added is that the waiter now *parks*
+//! between tests and a waker now also calls `sched::wake` — belt and braces, in
+//! that order: the table decides, the scheduler is merely told to look again.
+//! Get the `sched::wake` wrong and the waiter is late (the scheduler's backstop
+//! releases it); get the table wrong and it is incorrect. Only one of those is
+//! a real bug, and it is the one the crate's host tests cover.
+//!
+//! The park is armed with `sched::prepare_block` **before** the membership test,
+//! which is what closes the window between them: a `FUTEX_WAKE` that dequeues
+//! this waiter and fires in that gap leaves `wake_pending` set, and the park
+//! returns immediately instead of sleeping through it.
 //!
 //! # Allocation
 //!
-//! The poll loop allocates **nothing**. Membership is checked through
+//! The wait loop allocates **nothing**. Membership is checked through
 //! [`WaiterTable::iter`], which borrows; the obvious spellings
 //! (`queue()`, `locate_and_take()`) each allocate or churn a `BTreeMap` entry
-//! per tick, which for a loop that runs at scheduler frequency is the
+//! per test, which for a loop that once ran at scheduler frequency was the
 //! difference between free and not. `enqueue` allocates once per wait, and
 //! `wake` returns a `Vec` sized by how many waiters it actually took.
 
@@ -162,15 +168,19 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
     unsafe { (*waiters()).enqueue(key, Waiter(me), bitset) };
 
     loop {
-        crate::sched::yield_now();
+        // Arm the park before the membership test. A `FUTEX_WAKE` that dequeues
+        // this waiter between the test and the park would otherwise be a lost
+        // wake: the table says "gone" a moment too late and the scheduler was
+        // never told. Armed first, that wake sets `wake_pending` and the park
+        // below returns at once.
+        crate::sched::prepare_block();
         // Without this the deadline below is unreachable whenever every other
         // runnable task is also spinning in the kernel: `uptime_us` is the
         // LAPIC tick counter, a syscall runs with `IF` clear, and only the idle
         // loop re-enables it. `allow_tick`'s own comment has the measurement.
         crate::sched::allow_tick();
         // Off the table is the wake. Checked with `iter` rather than `queue()`
-        // or `locate_and_take` because this runs once per scheduler round and
-        // those two allocate; this borrows.
+        // or `locate_and_take` because those two allocate; this borrows.
         // SAFETY: raw-pointer access under the BKL.
         let still = unsafe { queued_key(&*waiters(), tgid, me) };
         if still.is_none() {
@@ -198,6 +208,19 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
             let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
             return errno::ETIMEDOUT;
         }
+        // Park. `deadline_at` is an absolute *uptime* deadline in both arms —
+        // `deadline::deadline_us` normalises a relative `FUTEX_WAIT`, an
+        // absolute `FUTEX_WAIT_BITSET` and a `FUTEX_CLOCK_REALTIME` wait onto
+        // the one clock `net::uptime_us` reads, which is the clock the
+        // scheduler's own deadlines use. `NEVER` is `u64::MAX`, so handing it
+        // to `block_until_deadline` would work too; `block_current` is spelled
+        // out because it is the arm that carries the backstop, and an untimed
+        // futex wait is exactly where a missing wake must not become a hang.
+        if deadline_at == deadline::NEVER {
+            crate::sched::block_current();
+        } else {
+            crate::sched::block_until_deadline(deadline_at);
+        }
     }
 }
 
@@ -212,7 +235,20 @@ fn wake(uaddr: u64, val: u32, mask: u32, private: bool) -> u64 {
     let key: Key = (namespace(private), uaddr as usize);
     // SAFETY: raw-pointer access under the BKL.
     let woken = unsafe { (*waiters()).wake(key, val, mask) };
+    resume(&woken);
     woken.len() as u64
+}
+
+/// Tell the scheduler to look at every waiter the table just took off a queue.
+///
+/// The dequeue is the wake; this is what stops it costing a round of the
+/// round-robin to notice. A waiter that has been dequeued but has not parked yet
+/// is not missed — `sched::wake` records `wake_pending` for a task that is
+/// merely runnable, and the waiter's own `prepare_block` is what reads it.
+fn resume(woken: &[Waiter]) {
+    for w in woken {
+        crate::sched::wake(w.tid());
+    }
 }
 
 /// `FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`. `timeout` is reinterpreted as
@@ -243,6 +279,13 @@ fn requeue(
             val2.min(u64::from(u32::MAX)) as u32,
         )
     };
+    resume(&woken);
+    // The requeued waiters are deliberately **not** resumed: they were moved to
+    // another key, not woken, and they are still queued. Waking them would be
+    // harmless (each re-tests its own membership and parks again) but it would
+    // undo the whole point of a requeue, which is that a broadcast does not
+    // stampede every waiter onto one lock.
+    //
     // Linux reports woken + requeued for `CMP_REQUEUE`, and woken alone for the
     // deprecated `REQUEUE`. Both callers in practice (musl's
     // `pthread_cond_broadcast`, Rust's `Condvar::notify_all`) use `CMP_`.
@@ -264,11 +307,15 @@ fn wake_op(uaddr: u64, uaddr2: u64, val: u32, val2: u64, val3: u32, private: boo
     }
     let tgid = namespace(private);
     // SAFETY: raw-pointer access under the BKL.
-    let mut n = unsafe { (*waiters()).wake((tgid, uaddr as usize), val, MATCH_ANY).len() };
+    let first = unsafe { (*waiters()).wake((tgid, uaddr as usize), val, MATCH_ANY) };
+    resume(&first);
+    let mut n = first.len();
     if decoded.compare(oldval) {
         let cap = val2.min(u64::from(u32::MAX)) as u32;
         // SAFETY: raw-pointer access under the BKL.
-        n += unsafe { (*waiters()).wake((tgid, uaddr2 as usize), cap, MATCH_ANY).len() };
+        let second = unsafe { (*waiters()).wake((tgid, uaddr2 as usize), cap, MATCH_ANY) };
+        resume(&second);
+        n += second.len();
     }
     n as u64
 }

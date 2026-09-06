@@ -98,7 +98,7 @@ const STACK_SIZE: usize = 32 * 1024;
 /// **task-slot recycling is the real fix** — a `Finished` task that has been
 /// waited on has no live stack, so this is more tractable than the comment
 /// above once implied (`docs/archive/AKUMA_SELF_HEALING_PORT.md`).
-const MAX_TASKS: usize = 512;
+pub const MAX_TASKS: usize = 512;
 
 core::arch::global_asm!(
     r#"
@@ -250,9 +250,25 @@ enum State {
     /// Invisible to the picker, and not free to `spawn`'s scan either.
     Reserved,
     Runnable,
+    /// Parked, waiting for an event. **Invisible to the picker**, and that is
+    /// the entire mechanism: a blocked task cannot be chosen, so it burns no
+    /// CPU, and [`wake`] is simply the transition back to [`Self::Runnable`].
+    ///
+    /// Distinct from [`Self::Finished`] in the one place it matters —
+    /// [`all_user_tasks_finished`] counts a blocked task as *live*, or the boot
+    /// drive loop would declare the shell finished while it waited for a key.
+    /// And distinct from [`Self::Reserved`] in `spawn`'s recycle scan, which
+    /// must never hand out a slot whose stack has a parked frame on it.
+    Blocked,
     Finished,
 }
 
+// Five `bool`s, and clippy would rather they were a bitflag type. They are not:
+// each is an independent fact about a task that different code asks about at
+// different times (`daemon` for the drive loop, `on_cpu` for the picker,
+// `wake_pending` for the park), and packing them buys nothing here — this is a
+// `static` array read under one lock, not a wire format.
+#[allow(clippy::struct_excessive_bools)]
 struct Task {
     ctx: Context,
     state: State,
@@ -295,6 +311,29 @@ struct Task {
     trap_base: usize,
     /// This task's SSE/x87 registers while it is not running.
     fx: FxArea,
+    /// A [`wake`] arrived for this task. Read and cleared by [`prepare_block`].
+    ///
+    /// This flag is the whole lost-wakeup argument, and it is needed even though
+    /// every writer runs under the BKL. Consider a pipe reader: it registers
+    /// itself in the pipe's poller set, the pipe's own lock is released, and
+    /// only then does it park. If the wake lands in that gap it finds the task
+    /// Runnable, does nothing, and **drains the poller set** — so the waiter
+    /// then parks with no registration and nobody left to wake it. Recording
+    /// the wake as durable state instead of an edge is what closes that: the
+    /// caller arms with [`prepare_block`] *before* testing its condition, and a
+    /// wake that arrives any time after that makes the park a no-op.
+    wake_pending: bool,
+    /// When this task's block expires, in `uptime_us`, or [`u64::MAX`].
+    ///
+    /// Every block carries one, including the ones whose callers asked to wait
+    /// forever — see [`BACKSTOP_US`].
+    wake_at_us: u64,
+    /// This task's deadline is [`BACKSTOP_US`]'s, not one the caller asked for.
+    ///
+    /// Kept apart so [`backstop_wakes`] counts only the parks that were supposed
+    /// to be woken by an event and were not. Folding the two would make the
+    /// tripwire useless the moment anything used a real timeout.
+    backstopped: bool,
 }
 
 impl Task {
@@ -313,6 +352,9 @@ impl Task {
             trap_stack_top: 0,
             stack_base: 0,
             trap_base: 0,
+            wake_pending: false,
+            wake_at_us: u64::MAX,
+            backstopped: false,
         }
     }
 }
@@ -407,15 +449,245 @@ static TICK_YIELDS: AtomicU64 = AtomicU64::new(0);
 /// Daemon slots (the netpoll loop, the idle tasks) are Runnable for the whole
 /// run by design, so they are skipped — otherwise `run_init`'s drive loop would
 /// never see the shell exit.
+///
+/// Asked as "is this slot **dead**" rather than "is it not Runnable", which is
+/// the same question only while [`State::Blocked`] does not exist. It does now,
+/// and a task parked on a pipe read is as live as one spinning on it — spelling
+/// this `!= Runnable` would end the drive loop the moment the shell waited for
+/// a keystroke.
 #[must_use]
 pub fn all_user_tasks_finished() -> bool {
     // SAFETY: raw-pointer read of the table; under the BKL.
     unsafe {
         (1..MAX_TASKS).all(|s| {
             let t = &(*tasks())[s];
-            t.daemon || t.state != State::Runnable
+            t.daemon || matches!(t.state, State::Unused | State::Finished)
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking
+// ---------------------------------------------------------------------------
+
+/// How long a block with no deadline of its own waits before the scheduler
+/// makes it runnable anyway.
+///
+/// **This is a tripwire, not a design.** A correct wait has a wake path: the
+/// pipe that gains a byte, the futex that is signalled, the child that exits.
+/// If that path is missing, a park with no deadline is an unrecoverable hang
+/// with no output — the failure mode `thread::drain`'s own comment calls the
+/// one that costs the most to diagnose and says the least. With a backstop the
+/// same bug degrades to what this kernel did before blocking existed: a poll,
+/// at 1 Hz instead of at scheduler frequency. The machine stays usable and
+/// [`backstop_wakes`] says how often it happened.
+///
+/// One second, in `uptime_us` units. A legitimately long wait (a shell at an
+/// idle prompt) trips it repeatedly and costs one re-poll each time, which is
+/// why it is counted rather than printed.
+const BACKSTOP_US: u64 = 1_000_000;
+
+/// The soonest deadline any blocked task is waiting on, or [`u64::MAX`].
+///
+/// Exists so the expiry sweep is skipped outright on the common path. Every
+/// `yield_now` would otherwise walk 512 slots looking for a deadline that has
+/// passed; instead it compares one atomic against the clock. A value that is
+/// too *low* is safe — it costs one needless sweep, which then recomputes it —
+/// so [`AtomicU64::fetch_min`] is all the update a new block needs.
+static NEXT_DEADLINE_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Tasks parked by [`block_current`]/[`block_until`].
+static BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// Parked tasks made runnable by [`wake`].
+static WAKES: AtomicU64 = AtomicU64::new(0);
+/// Parked tasks made runnable by their deadline instead of by a wake.
+static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// Untimed parks released by [`BACKSTOP_US`] — see there. A number that climbs
+/// on a workload that should be event-driven names a missing wake path.
+static BACKSTOP_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a task has parked.
+#[must_use]
+pub fn blocks() -> u64 {
+    BLOCKS.load(Ordering::Relaxed)
+}
+
+/// How many parked tasks a [`wake`] has released.
+#[must_use]
+pub fn wakes() -> u64 {
+    WAKES.load(Ordering::Relaxed)
+}
+
+/// How many untimed parks the [`BACKSTOP_US`] tripwire has released. Nonzero
+/// means a wait somewhere is not being woken; see that constant.
+#[must_use]
+pub fn backstop_wakes() -> u64 {
+    BACKSTOP_WAKES.load(Ordering::Relaxed)
+}
+
+/// Arm the running task to block. **Call before testing the condition.**
+///
+/// The three-step shape this and [`block_current`] are halves of is the only
+/// correct one, and it is the shape Linux's `prepare_to_wait` has for the same
+/// reason:
+///
+/// ```text
+///   sched::prepare_block();            // arm
+///   if ready() { return }              // test — and register, in one step
+///   sched::block_current();            // park
+/// ```
+///
+/// Arming first is what makes the window between the test and the park
+/// harmless: a wake landing in it sets `wake_pending`, and the park then
+/// returns immediately instead of sleeping through the event it was waiting
+/// for. Test-then-arm has the window; arm-then-test does not.
+pub fn prepare_block() {
+    // SAFETY: raw-pointer access under the BKL, to this core's own task.
+    unsafe {
+        (*tasks())[current()].wake_pending = false;
+    }
+}
+
+/// Park the running task until [`wake`] names it.
+///
+/// Returns when the task is runnable again, which is **not** a promise that the
+/// condition it waited for holds: a caller must re-test in a loop. A wake can
+/// be spurious (the pipe table wakes every registered waiter on every event,
+/// each to re-test its own condition), and [`BACKSTOP_US`] can release the park
+/// with nothing having happened at all.
+///
+/// # Rules for callers
+///
+/// - **Hold the BKL and nothing else.** This switches away, and the task that
+///   runs next may want any lock this one is holding. The pipe shim releases
+///   `PIPES` before it parks, which is why `akuma_pipes` returns its wakes
+///   rather than firing them.
+/// - **Not from an interrupt handler, and not from an idle task.** An idle task
+///   is the fallback the switch itself uses; parking one has nowhere to go.
+pub fn block_current() {
+    block_until(crate::net::uptime_us().saturating_add(BACKSTOP_US), true);
+}
+
+/// Park the running task until [`wake`] names it or `deadline_us` passes.
+///
+/// `deadline_us` is absolute, on the same clock as `net::uptime_us`. Resolution
+/// is the LAPIC tick (10 ms), so a shorter timeout than that rounds up to one
+/// tick rather than returning instantly.
+pub fn block_until_deadline(deadline_us: u64) {
+    block_until(deadline_us, false);
+}
+
+/// `backstop` records which of the two entry points asked, so the tripwire
+/// counter only counts parks that did **not** name a deadline of their own.
+fn block_until(deadline_us: u64, backstop: bool) {
+    let cur = current();
+
+    // SAFETY: raw-pointer access under the BKL, to this core's own task.
+    unsafe {
+        let t = tasks();
+        // A wake between `prepare_block` and here. Not sleeping is the whole
+        // point of the flag — see `Task::wake_pending`.
+        if core::mem::take(&mut (*t)[cur].wake_pending) {
+            return;
+        }
+        (*t)[cur].wake_at_us = deadline_us;
+        (*t)[cur].backstopped = backstop;
+        (*t)[cur].state = State::Blocked;
+    }
+    NEXT_DEADLINE_US.fetch_min(deadline_us, Ordering::Relaxed);
+    BLOCKS.fetch_add(1, Ordering::Relaxed);
+
+    let switched = try_switch();
+
+    // SAFETY: raw-pointer access under the BKL, to this core's own task.
+    unsafe {
+        let t = tasks();
+        if !switched {
+            // Nothing runnable and this core could not reach its idle task,
+            // which means the caller **is** it. Undo the park and let the
+            // caller re-poll: the alternative is a core asleep with no one left
+            // to wake it. `allow_tick` so the clock — and therefore every
+            // deadline — still advances.
+            (*t)[cur].state = State::Runnable;
+            (*t)[cur].wake_at_us = u64::MAX;
+            allow_tick();
+            return;
+        }
+        (*t)[cur].wake_at_us = u64::MAX;
+        (*t)[cur].wake_pending = false;
+    }
+}
+
+/// Make task `slot` runnable if it is parked. Returns whether it was.
+///
+/// Safe to call for a task that is not parked, and that case is not a
+/// no-op — it records [`Task::wake_pending`], which is what stops a wake being
+/// lost to a task that has registered as a waiter but not yet parked.
+///
+/// Must be called under the BKL, like everything else that touches the table.
+pub fn wake(slot: usize) -> bool {
+    // SAFETY: raw-pointer access under the BKL.
+    unsafe {
+        let Some(task) = (*tasks()).get_mut(slot) else {
+            return false;
+        };
+        if matches!(task.state, State::Unused | State::Finished) {
+            // A stale token naming a slot whose task is gone — a pipe poller
+            // that outlived its reader, say. Recording `wake_pending` here
+            // would leave the flag armed for whoever recycles the slot.
+            return false;
+        }
+        task.wake_pending = true;
+        if task.state == State::Blocked {
+            task.state = State::Runnable;
+            task.wake_at_us = u64::MAX;
+            WAKES.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
+/// Is task `slot` parked? For the self-tests and for diagnostics.
+#[must_use]
+pub fn is_blocked(slot: usize) -> bool {
+    // SAFETY: raw-pointer read under the BKL.
+    unsafe { (*tasks()).get(slot).is_some_and(|t| t.state == State::Blocked) }
+}
+
+/// Release every parked task whose deadline has passed.
+///
+/// Called from [`try_switch`], so it runs on every yield on every core — which
+/// is also the only place it *can* run and still be under the BKL. The single
+/// atomic compare at the top is what keeps that affordable; see
+/// [`NEXT_DEADLINE_US`].
+fn expire_blocked_deadlines() {
+    if crate::net::uptime_us() < NEXT_DEADLINE_US.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = crate::net::uptime_us();
+    let mut soonest = u64::MAX;
+    // SAFETY: raw-pointer access to the table; under the BKL.
+    unsafe {
+        let t = tasks();
+        for slot in 0..MAX_TASKS {
+            let task = &mut (*t)[slot];
+            if task.state != State::Blocked {
+                continue;
+            }
+            if task.wake_at_us <= now {
+                task.state = State::Runnable;
+                task.wake_at_us = u64::MAX;
+                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                if task.backstopped {
+                    BACKSTOP_WAKES.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if task.wake_at_us < soonest {
+                soonest = task.wake_at_us;
+            }
+        }
+    }
+    NEXT_DEADLINE_US.store(soonest, Ordering::Relaxed);
 }
 
 /// The running task's slot on this core.
@@ -786,6 +1058,12 @@ fn spawn_unpublished(
         task.bkl_depth = 1;
         task.uctx = UserCtx::new();
         task.fx = FxArea::initial();
+        // A recycled slot must not inherit the previous task's wait state: an
+        // armed `wake_pending` would make this task's first park a no-op, and a
+        // stale deadline would release it early.
+        task.wake_pending = false;
+        task.wake_at_us = u64::MAX;
+        task.backstopped = false;
         task.state = State::Reserved;
     }
     Some(slot)
@@ -889,6 +1167,10 @@ pub fn yield_now() {
 /// task takes over; the boot task is the BSP's.
 fn try_switch() -> bool {
     smp::bkl_drop_window();
+    // Before the pick, not after: a task whose deadline just passed has to be
+    // a candidate for *this* scan, or a core with nothing else runnable parks
+    // in `hlt` and the timeout is served a tick late at best.
+    expire_blocked_deadlines();
     let cpu = smp::cpu_index() as u32;
     if smp::take_need_resched() {
         TICK_YIELDS.fetch_add(1, Ordering::Relaxed);
@@ -1131,4 +1413,139 @@ pub fn smoke_test(t: &mut Suite) {
     );
     t.note("sched: tick-driven yields", TICK_YIELDS.load(Ordering::Relaxed) - tick_yields_before);
     t.note("sched: preemptions", preemptions());
+}
+
+// ---------------------------------------------------------------------------
+// Blocking smoke test
+// ---------------------------------------------------------------------------
+
+/// The park worker reached its `block_current`.
+static BLOCK_ARMED: AtomicU64 = AtomicU64::new(0);
+/// The park worker ran again after being woken.
+static BLOCK_RESUMED: AtomicU64 = AtomicU64::new(0);
+/// The timeout worker reached its `block_until_deadline`.
+static TIMEOUT_ARMED: AtomicU64 = AtomicU64::new(0);
+/// The timeout worker's deadline released it.
+static TIMEOUT_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// How long the timeout worker asks to wait. Five LAPIC ticks: long enough that
+/// it cannot be satisfied by the tick already in flight, short enough that the
+/// boot pays 50 ms for the check.
+const TEST_TIMEOUT_US: u64 = 50_000;
+
+/// How many drive-loop laps a step gets before the test calls it a failure.
+///
+/// Bounded, like every other drive loop here. An unbounded wait would turn a
+/// missing wake into a boot that hangs with no output; a bounded one leaves a
+/// named `[FAIL]` and the rest of the suite still runs.
+const DRIVE_LAPS: u64 = 2_000_000;
+
+extern "C" fn park_worker() -> ! {
+    // Arm, *then* publish that we are about to park. The order matters even
+    // here: `prepare_block` after the store would leave a window in which the
+    // driver's `wake` is cleared by our own arming.
+    prepare_block();
+    BLOCK_ARMED.store(1, Ordering::Release);
+    block_current();
+    BLOCK_RESUMED.store(1, Ordering::Release);
+    finish();
+}
+
+extern "C" fn timeout_worker() -> ! {
+    prepare_block();
+    let deadline = crate::net::uptime_us().saturating_add(TEST_TIMEOUT_US);
+    TIMEOUT_ARMED.store(1, Ordering::Release);
+    block_until_deadline(deadline);
+    TIMEOUT_DONE.store(1, Ordering::Release);
+    finish();
+}
+
+/// Drive the round-robin until `done`, or until [`DRIVE_LAPS`] laps.
+///
+/// `allow_tick` on every lap because the deadline half of this test needs the
+/// clock to move: a syscall — and this drive loop — runs with `IF` clear, and
+/// the only other place the scheduler re-enables it is the idle loop, which is
+/// never reached while a worker is runnable. That is the measurement
+/// `allow_tick`'s own comment records.
+fn drive_until(done: &AtomicU64) -> bool {
+    let mut laps = 0;
+    while done.load(Ordering::Acquire) == 0 && laps < DRIVE_LAPS {
+        laps += 1;
+        yield_now();
+        allow_tick();
+    }
+    done.load(Ordering::Acquire) != 0
+}
+
+/// Prove a task can actually **park** — not spin — and that both ways out of a
+/// park work.
+///
+/// This is the property the whole blocking change exists for, and it is not
+/// observable from any of the tests above: before it, `State` was
+/// `Unused | Reserved | Runnable | Finished`, so a waiter was always runnable
+/// and every wait in this kernel was a poll. What is checked:
+///
+/// 1. A parked task is **invisible to the picker**. Two hundred yields go by
+///    and it does not run. That is the difference between a park and a yield.
+/// 2. It still counts as live to [`all_user_tasks_finished`], or the boot's own
+///    drive loop would declare a waiting shell finished.
+/// 3. [`wake`] releases it, exactly once.
+/// 4. A deadline releases it with **no** wake at all — the path every timed
+///    `futex` wait and every `poll` timeout takes.
+pub fn block_smoke_test(t: &mut Suite) {
+    let Some(worker) = spawn(park_worker) else {
+        t.check("block: park worker spawned", false);
+        return;
+    };
+
+    // SAFETY: IDT loaded, timer vector installed — the same window
+    // `smoke_test` opens, and for the same reason.
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+
+    if !t.check("block: the worker reached its park", drive_until(&BLOCK_ARMED)) {
+        // SAFETY: masking is the conservative direction.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+        return;
+    }
+    // The worker stores `BLOCK_ARMED` and parks under one BKL hold, so by the
+    // time this core runs again the park has happened. No race to wait out.
+    t.check("block: the worker is parked", is_blocked(worker));
+    t.check("block: a parked task is still live to the drive loop", !all_user_tasks_finished());
+
+    // The property that distinguishes a park from a yield: the picker never
+    // chooses it, however long the round-robin runs.
+    for _ in 0..200 {
+        yield_now();
+    }
+    t.check(
+        "block: a parked task is never picked",
+        BLOCK_RESUMED.load(Ordering::Acquire) == 0 && is_blocked(worker),
+    );
+
+    let wakes_before = wakes();
+    t.check("block: wake reports it released a parked task", wake(worker));
+    t.check("block: waking a task that is not parked reports false", !wake(0));
+    t.check("block: the woken task ran again", drive_until(&BLOCK_RESUMED));
+    t.check_eq("block: exactly one park was released", wakes() - wakes_before, 1);
+
+    // The other way out: a deadline, with nothing ever calling `wake`.
+    let wakes_before = wakes();
+    if let Some(_tw) = spawn(timeout_worker) {
+        t.check("block: the timeout worker reached its park", drive_until(&TIMEOUT_ARMED));
+        t.check("block: a deadline releases a park", drive_until(&TIMEOUT_DONE));
+        t.check_eq("block: and no wake was fired for it", wakes() - wakes_before, 0);
+    } else {
+        t.check("block: timeout worker spawned", false);
+    }
+
+    // SAFETY: masking interrupts is the conservative direction.
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+
+    t.note("block: parks", blocks());
+    t.note("block: wakes", wakes());
+    t.note("block: backstop releases", backstop_wakes());
 }

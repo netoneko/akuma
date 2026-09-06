@@ -43,7 +43,7 @@
 //! masked; `IF` has been 0 since `boot.s`, so nothing can arrive. A timer means
 //! LAPIC setup, and that is a later stage.
 
-use crate::paging::{self, MemAttr, Prot};
+use crate::paging::{self, MemAttr, PageFaultCode, Prot};
 use crate::phys::phys_ptr;
 use akuma_selftest::Suite;
 
@@ -385,15 +385,14 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
     // SAFETY: the stub passes a pointer into the current stack, to the frame
     // the CPU just pushed; it is live and exclusively ours until `iretq`.
     let pf = unsafe { &mut *frame };
-    let code = pf.error_code;
+    let code = PageFaultCode::new(pf.error_code);
     let addr = read_cr2();
     let base = LAZY_BASE.load(Ordering::Relaxed);
     let len = LAZY_LEN.load(Ordering::Relaxed);
 
     let in_lazy = base != 0 && addr >= base && addr < base + len;
-    let not_present = code & 1 == 0;
 
-    if in_lazy && not_present {
+    if in_lazy && code.not_present() {
         let page = addr & !0xfff;
         if let Some(frame_pa) = akuma_pmm::alloc_page() {
             // Zero before mapping: a recycled frame otherwise leaks whatever the
@@ -408,8 +407,7 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
         }
     }
 
-    // Copy-on-write. A write from ring 3 to a **present** page: bit 0 set
-    // (protection, not absence), bit 1 set (write), bit 2 set (user).
+    // Copy-on-write. A write to a **present** page, from either ring.
     //
     // Placed after demand paging and before the user-copy fixup, and both
     // orderings are deliberate. A lazy page must be *populated* before anyone
@@ -417,12 +415,15 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
     // a legitimate write the kernel should break the sharing for, not an
     // `EFAULT` to hand back — sending it to the fixup would make `read(2)` into
     // a forked child's buffer fail with no explanation.
-    const PF_PRESENT: u64 = 1 << 0;
-    const PF_WRITE: u64 = 1 << 1;
-    const PF_USER: u64 = 1 << 2;
-    if code & (PF_PRESENT | PF_WRITE | PF_USER) == (PF_PRESENT | PF_WRITE | PF_USER)
-        && cow_write_fault(addr)
-    {
+    //
+    // That last sentence was aspirational until 2026-09-07: this arm required
+    // the fault to come from ring 3, and a `copy_to_user` fault comes from ring
+    // 0, so the kernel's own writes could never reach the break. They could not
+    // reach *anything* — `CR0.WP` was clear too, so the write simply succeeded
+    // against a read-only page and the CoW sharing was never broken at all.
+    // Both halves are fixed together; `akuma_user_access`'s `CR0_WP` has the
+    // measurement.
+    if code.is_write_to_present_page() && cow_write_fault(addr) {
         return;
     }
 
@@ -432,10 +433,34 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
         return;
     }
 
+    describe_page_fault(code);
     if pf.frame.cs & 3 == 3 {
-        user_fault("#PF page fault", &pf.frame, Some(code));
+        user_fault("#PF page fault", &pf.frame, Some(code.raw()));
     }
-    fatal("#PF page fault", &pf.frame, Some(code));
+    fatal("#PF page fault", &pf.frame, Some(code.raw()));
+}
+
+/// Say in words what the error code says in bits, before the fatal printer's hex.
+///
+/// The bits are not memorable and the hex is not readable under pressure. The
+/// one that most repays naming is [`PageFaultCode::reserved_bit`]: it is
+/// **never** a userspace mistake — a reserved bit set in a paging-structure
+/// entry means this kernel's own walker wrote a malformed one, and the usual
+/// cause is setting `NX` with `EFER.NXE` clear. Reported as a generic
+/// protection fault it looks like a program bug and is searched for in the
+/// wrong file.
+fn describe_page_fault(code: PageFaultCode) {
+    serial::puts("  #PF: ");
+    serial::puts(if code.not_present() { "not-present" } else { "protection" });
+    serial::puts(if code.is_write() { " write" } else { " read" });
+    if code.instruction_fetch() {
+        serial::puts(" (instruction fetch)");
+    }
+    serial::puts(if code.is_user_mode() { " from ring 3" } else { " from ring 0" });
+    if code.reserved_bit() {
+        serial::puts(" RESERVED BIT SET — a malformed paging-structure entry, i.e. a kernel bug");
+    }
+    serial::puts("\n");
 }
 
 /// Break copy-on-write sharing for the page containing `addr`.

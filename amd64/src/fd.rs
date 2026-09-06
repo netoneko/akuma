@@ -289,9 +289,16 @@ pub fn pipe_write_id(fd: u64) -> Option<usize> {
     })?
 }
 
-/// Read from a pipe, honouring `nonblock`. A blocking read yields until data or
-/// EOF — which is safe on this target only because a pipe reader is never also
-/// the pipe's writer (spawn wires them to different tasks).
+/// Read from a pipe, honouring `nonblock`. A blocking read **parks** until data
+/// or EOF — which is safe on this target only because a pipe reader is never
+/// also the pipe's writer (spawn wires them to different tasks).
+///
+/// Parks rather than spins since 2026-09-07. The loop is the same shape it was;
+/// what replaced `yield_now` is the three-step wait `sched::prepare_block`
+/// documents — arm, then test-and-register in one step, then park. Every wake
+/// this can be waiting for is produced by the pipe table (`write`,
+/// `close_write`, `close_read`, `destroy`) and fired by `pipe::fire`, so the
+/// wake set is complete by construction rather than by inspection.
 pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
     let mut tmp = alloc::vec![0u8; len.min(MAX_IO as usize)];
     loop {
@@ -299,7 +306,15 @@ pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
             Some(0) => return 0, // EOF
             Some(n) => return copy_to_user(buf, &tmp[..n]),
             None if nonblock => return errno::EAGAIN,
-            None => crate::sched::yield_now(),
+            None => {
+                // Arm before asking. A write landing between the question and
+                // the park then finds `wake_pending` to set, and the park is a
+                // no-op instead of a missed event.
+                crate::sched::prepare_block();
+                if !crate::pipe::check_set_reader(pipe_id) {
+                    crate::sched::block_current();
+                }
+            }
         }
     }
 }
@@ -326,7 +341,14 @@ pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
         if nonblock {
             return errno::EAGAIN;
         }
-        crate::sched::yield_now();
+        // Full buffer: park until the reader drains it, or until the last
+        // reader goes away — `check_set_writer` reports that second case as
+        // "do not block", because a pipe with no readers never gains room and
+        // the retry above is what turns it into `EPIPE`.
+        crate::sched::prepare_block();
+        if !crate::pipe::check_set_writer(pipe_id) {
+            crate::sched::block_current();
+        }
     }
 }
 
@@ -1458,7 +1480,15 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
             match crate::pipe::read(pipe_id, &mut one) {
                 Some(0) => return 0, // EOF — the client closed the channel
                 Some(_) => return copy_to_user(buf, &one),
-                None => crate::sched::yield_now(),
+                None => {
+                    // A park, not a yield: an interactive shell waiting on a
+                    // keystroke is the longest wait in this kernel and used to
+                    // be its busiest loop.
+                    crate::sched::prepare_block();
+                    if !crate::pipe::check_set_reader(pipe_id) {
+                        crate::sched::block_current();
+                    }
+                }
             }
         }
     }

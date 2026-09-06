@@ -362,6 +362,7 @@ const FUTEX_WAKE_PRIVATE: u32 = 1 | 128;
 /// out in `AKUMA_AMD64_RUST_STD.md` as a known gap rather than papered over.
 pub fn drain(proc_slot: usize) {
     set_group_exiting(proc_slot);
+    wake_group(proc_slot);
     // Bounded, like every other drive loop in this kernel. An unbounded wait
     // here turns any bug in the leave path into a boot that hangs with no
     // output — the failure mode that costs the most to diagnose and says the
@@ -380,6 +381,29 @@ pub fn drain(proc_slot: usize) {
         serial::puts(" thread(s) still live in proc slot ");
         serial::put_dec(proc_slot as u64);
         serial::puts(" — the reaper may free a live address space\n");
+    }
+}
+
+/// Make every thread of `proc_slot` runnable, so each can see the exit flag.
+///
+/// The flag is only tested at syscall entry and inside the `futex` wait loop,
+/// and since 2026-09-07 that wait loop **parks** rather than spins. Without this
+/// an `exit_group` while a sibling holds an untimed `FUTEX_WAIT` would wait out
+/// the scheduler's one-second backstop before the sibling looked at anything —
+/// correct, because the backstop exists so a missing wake is slow rather than
+/// fatal, and far too slow to be the design. This is the wake path that stops it
+/// being the design.
+///
+/// Waking a thread that is not parked is a no-op with a recorded flag, so this
+/// cannot race the sibling into a park it will not come out of.
+fn wake_group(proc_slot: usize) {
+    // SAFETY: raw-pointer read under the BKL.
+    unsafe {
+        for t in (*threads()).iter().flatten() {
+            if t.proc_slot == proc_slot {
+                crate::sched::wake(t.task);
+            }
+        }
     }
 }
 
