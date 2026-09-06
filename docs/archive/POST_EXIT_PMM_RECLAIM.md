@@ -79,3 +79,126 @@ leak that isn't there.
 If `pinned` is ever observed staying high after a heap-heavy workload drains,
 *that* is the high-water bug and the lever is fragmentation (segregate
 process-lifetime heap allocations so freed spans become wholly free again).
+
+---
+
+# REOPENED 2026-09-07: `retired_reclaim_ab` fails on `main`, everywhere
+
+**Status: open, unowned, and NOT caused by the amd64 scheduler fold** — that is
+the whole point of the matrix below. It was found while establishing an aarch64
+control for `docs/archive/AKUMA_AMD64_BLOCKING.md`, i.e. by looking for a
+regression and finding a standing failure instead.
+
+## What fails
+
+```
+[FAIL] retired_reclaim_ab: parked 1024p, OFF recovered 0p (retired 1),
+       ON recovered 0p (retired 1)
+       — expected OFF to strand (<256p) and ON to recover (>=512p)
+```
+
+The A/B in `src/process_tests.rs` parks a 1024-page address space, then measures
+recovery with pressure-driven retired-process reclaim **off** (A) and **on** (B).
+A passing run wants A to strand the memory and B to recover it. Observed: **both
+sides recover 0p, and both leave one slot RETIRED.** The A side is behaving as
+designed. **The B side is the failure**: the mechanism it exists to demonstrate
+does not fire.
+
+## The matrix — this is the part that matters
+
+Every cell is one boot, `SMP=1`, same disk, same day.
+
+| kernel | accelerator | MEMORY | PASSED | `retired_reclaim_ab` |
+|---|---|---|---|---|
+| `main` @ b7c89d47 | HVF | 2048M | 307 | **FAIL** |
+| branch @ dbbbb986 (pre-fold) | HVF | 2048M | 307 | **FAIL** |
+| branch, post-fold | HVF | 2048M | 307 | **FAIL** |
+| `main` @ b7c89d47 | KVM (Lima) | 256M | 305 | **FAIL** |
+| branch, post-fold | KVM (Lima) | 256M | 305 | **FAIL** |
+
+Identical on `main`. Identical across two accelerators and an 8× memory range.
+So it is neither a branch regression nor an environment artifact, and the three
+kernels are otherwise **bit-for-bit equivalent in outcome** (307/307/307, same
+single failure) — which is also the evidence that the scheduler fold changed
+nothing on aarch64.
+
+## The clue worth starting from
+
+`retired_reclaim_pressure_rung` **passes immediately before it**, in the same
+boot, recovering real memory:
+
+```
+[PASS] retired_reclaim_pressure_rung: parked 512p,
+       free 392799 -> 392282 -> 392799 (517 recovered, 1 slot freed by the rung)
+```
+
+So the reclaim rung works. What does not work is the A/B's **B side** reaching
+it. Two hypotheses, in order of cheapness:
+
+1. **No pressure, so no pressure-reclaim.** The rung is pressure-gated, and at
+   2048M there are ~392 000 free pages — parking 1024 of them is 0.26% of RAM.
+   The `pressure_rung` test drives the rung directly; the A/B waits for it to
+   fire on its own. If that is it, the A/B is testing "does pressure occur",
+   not "does reclaim work", and the fix is to the test.
+   **Against this hypothesis:** it fails at 256M too, where 1024p is ~1.6% —
+   still possibly not enough. Worth measuring what the threshold actually is
+   before assuming.
+2. **The retired slot is not eligible.** Both sides report `retired 1`, so a
+   slot *is* retired and *is not* being taken. `reclaim_retired_processes_force`
+   is called in the teardown after sampling, so whatever holds it is held at
+   sampling time.
+
+## What the test already knows about itself
+
+The comment above the assertion is worth reading before touching anything: the
+bar was moved to `PARK / 2` after 12 boots showed the ON side is **strictly
+bimodal, 1029p or 745p, never between** — the ~284-page difference being
+`/bin/hello` sitting as an ACTIVE zombie awaiting a `wait4` the test never
+performs. **0p is a third mode, outside that recorded set**, so this is not the
+same sampling noise the bar was widened for. Something else changed, or the
+bimodality was never the whole story.
+
+Note also: waiting does not help. A 500 ms "wait for `free_count` to stabilise"
+loop was measured to change neither outcome.
+
+## Two other failures seen alongside, and their status
+
+Both also reproduce on `main`, so neither is a branch regression:
+
+- **`test_mmap_file_oom_survives`: "PMM not reclaimed after kill (500 polls)"**
+  — `before=33247 after=23680`. Only reachable at small RAM: at 2048M it
+  `[SKIP]`s ("no /models file larger than RAM"). So this is a *different memory
+  configuration*, not an accelerator artifact, and it is a second, independent
+  post-kill reclaim failure. It may share a cause with the above; it may not.
+- **`test_epoll_socket_waker`: "latency too high (10338–11370 us)"** — seen only
+  under Lima/KVM, on `main` too. ~10 ms is suspiciously exactly one timer tick,
+  which suggests a wake being served by the tick rather than by the waker in
+  that environment. Lowest priority of the three; likeliest to be the rig.
+
+## Reproducing
+
+```bash
+cargo build --release
+# on the laptop, under HVF — MEMORY=2048M is required, see below
+INSTANCE=8 MEMORY=2048M sh scripts/cargo_runner.sh \
+    target/aarch64-unknown-none/release/akuma
+# or in Lima under KVM (defaults to 256M, which also runs the mmap test)
+limactl shell fc sh scripts/lima_aarch64_run.sh
+```
+
+**`MEMORY=2048M` under HVF is not optional**: below 2048M this suite dies with
+`Assertion failed: (isv) ... hvf.c` and QEMU exit 134, which is the
+configuration and not a kernel bug (`scripts/cargo_runner.sh` prints a warning
+saying so; `docs/archive/QEMU_HVF_ISV_BUG.md` "Root cause 5"). That assertion is
+easy to mistake for a crash introduced by whatever you are testing — it is not.
+
+## Background
+
+- The body of this document (2026-06-05) answers the *original* question — the
+  single-process teardown path conserves memory exactly, and there is no
+  per-process leak. Nothing below contradicts that; the retired-slot reclaim
+  path is a different mechanism, added later.
+- `docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md` — the gap the A side exists to
+  demonstrate.
+- `docs/archive/BOOT_SUITE_PMM_DEFERRED_RECLAIM.md` — why these tests have to
+  force `cleanup_terminated_force` + `reclaim_retired_processes_force` by hand.
