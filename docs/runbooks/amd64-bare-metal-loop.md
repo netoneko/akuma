@@ -132,7 +132,8 @@ it reads identically on a dead NIC and a busy one.
 | `wget https://` : *socketpair* | busybox shells out to `ssl_client`. Use `/bin/hget` instead — TLS in-process |
 | `nslookup`: *Bad file descriptor* | `write()` on a connected UDP socket. DNS itself works (`wget http://…` resolves) |
 | pings to `192.168.1.220` time out | `.220` is only the **pre-DHCP fallback**; a lease overrides it. The probe line says the real address |
-| every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. |
+| every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. Since 2026-09-06 the kernel also defends itself: `xhci::quiesce_all` clears `BUS_MASTER` on every boot right after the PCI scan, and `xhci::shutdown` runs before the machine reset. Neither can save the boot whose image was *already* corrupted during load, so the power cycle stays the recovery |
+| a "disarmed" GRUB entry still drove the USB controller | until 2026-09-06 the xHCI self-test was gated only on the controller being *present*, so dropping `root=/dev/sda1` stopped the kernel mounting the disk but not bringing the controller up. There was no way to boot that kernel without driving it. **Fixed** — the bring-up now needs `usb` or `root=/dev/sda1` on the command line, and says so in the verdict when it skips |
 
 ## The spare disk (persistence — USB/xHCI, in progress)
 
@@ -144,9 +145,60 @@ is **ext2, label `AKUMA`** — formatted from Ubuntu 2026-09-06. Keep the enclos
 xHCI; behind the hub sustained writes drop it off the bus.
 
 Driver: `akuma-xhci` + `akuma-usb-storage` (pure, host-tested) + `amd64/src/xhci.rs`
-(MMIO/DMA). Boot with `root=/dev/sda1` on the kernel command line to mount `sda1`
-as the persistent root (falls back to the RAM image on any probe failure). Full
-plan: `docs/archive/AKUMA_SELF_HEALING_PORT.md` § "A proper disk".
+(MMIO/DMA). Two command-line tokens, and the difference matters on a machine
+that crash-loops when this goes wrong:
+
+| token | effect |
+|---|---|
+| `usb` | bring the controller up and run the self-test (READ CAPACITY, the MBR, the `sda1` superblock, a `WRITE(10)` round trip into `sda2`). Root stays the RAM image, so sshd comes up either way and you can read `dmesg`. **Start here** |
+| `root=/dev/sda1` | the above, plus mount `sda1` as the persistent root. Falls back to the RAM image on any probe failure |
+
+Neither token: the controller is not touched at all.
+
+Full plan: `docs/archive/AKUMA_SELF_HEALING_PORT.md` § "A proper disk".
+
+### Iterating the USB driver
+
+**Do not iterate this driver on the metal.** A wrong bring-up costs a cold
+reboot and a power cycle, and the failure it produces — a box that restarts
+before printing anything — carries no information. Use the QEMU rig:
+
+```sh
+amd64/run-xhci.sh                 # q35 + qemu-xhci + usb-storage, log in target/
+EXTRA=skiptests amd64/run-xhci.sh # straight to init
+```
+
+It builds its own fixture (`amd64/mkusbdisk.py`: MBR, ext2 `sda1` at LBA 2048,
+scratch `sda2` at LBA 134217728, sparse so 64 GiB costs ~256 MiB), so all four
+disk checks are live rather than skipped. It found the bug that had survived a
+whole session of metal reboots — a Configure Endpoint command that also claimed
+EP0, which the controller answers with `TRB Error` — on its first run.
+
+What it models is a *correct* controller, so it catches every way the driver is
+wrong about the spec and none of the ways a particular controller is wrong about
+it. Past that, in increasing fidelity and all runnable on the box under KVM
+without touching the metal's own boot:
+
+| rig | what it adds | contained by |
+|---|---|---|
+| `-device qemu-xhci -device usb-storage,drive=/dev/sdb` | the **real partition table and filesystem** | the VM |
+| `-device usb-host,vendorid=0x174c,productid=0x55aa` on `qemu-xhci` | the **real ASMedia enclosure** — its descriptors, stalls and quirks | the VM |
+| `-device vfio-pci,host=00:14.0` | the **real Intel controller**, including the BIOS/SMM handoff | the IOMMU — which is strictly *more* protection than the metal has |
+
+The last one needs VT-d on and the controller unbound from `xhci_hcd`, and is
+the only rig that can reproduce a handoff or controller-quirk bug. It is also
+the only one where a runaway DMA is caught rather than landing in RAM.
+
+### Reading a bring-up that died
+
+`init` announces each step *before* it runs it (`[xhci] .. <step>`), because
+several of them can take the machine down in a way that reaches no exception
+handler: a config-space write can reset the box, the BIOS handoff can enter SMM,
+and a wrong DMA address makes the controller scribble on the page tables. **The
+last line printed is the diagnosis.** It also prints the physical address of
+every DMA structure — all must be non-zero and below 4 GiB, and a value around
+550 GiB means `virt_to_phys` translated a `.bss` static through the physmap
+window instead of the kernel-image window.
 
 A process stuck in `D` state on the enclosure cannot be killed — reboot the box.
 
