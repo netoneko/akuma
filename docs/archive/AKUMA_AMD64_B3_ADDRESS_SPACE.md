@@ -21,9 +21,14 @@ passes. It was 41 errors, all in `akuma-exec`, before this work.
 | `akuma-mmu` host tests | 15 | **21** |
 | amd64 boot self-tests, QEMU `SMP=1` | 357/0 | **405/0** |
 | amd64 boot self-tests, QEMU `SMP=4` | 366/0 | **414/0** |
+| amd64 boot self-tests, **bare metal** (HP 500-502nj) | — | **407/0** |
 
-+48 checks on both core counts — one new suite, `crate::uas::smoke_test`, and
-nothing else moved. The AArch64 kernel's `.text`, `.rodata` and `.data` are
++48 checks on both QEMU core counts — one new suite, `crate::uas::smoke_test`,
+and nothing else moved. **All 48 pass on real hardware too**, with the whole
+suite at 407/0 (RAM image, `stage()`'s default cmdline, so the USB controller is
+never touched). No matched pre-B3 metal baseline exists at that exact boot
+config, so no delta is claimed for that row — what is claimed is 48/48 and zero
+failures anywhere in the suite. The AArch64 kernel's `.text`, `.rodata` and `.data` are
 **byte-for-byte identical** to `HEAD`'s (method below). 1355 host tests pass;
 clippy is clean on the AArch64 kernel, the amd64 kernel, `akuma-syscalls-glue`
 for x86_64, and `akuma-mmu`/`akuma-elf` on the host.
@@ -199,11 +204,13 @@ Each of these is in the source at the method that has it, not only here.
   running on the first — a mistake there is a triple fault with no console, on a
   box whose only recovery is a physical reset. The test checks that they decline
   when not installed, which is the branch that runs.
-- **Nothing here runs on bare metal yet.** QEMU/TCG only; the HP box was not
-  booted for this. The code under test allocates frames and edits page tables it
-  builds itself, with no device or firmware dependency, so the risk of a
-  metal-only divergence is lower than for anything in `docs/archive/
-  AKUMA_AMD64_ON_HP_500_502NJ.md` — but it is not zero and it is not claimed.
+- ~~**Nothing here runs on bare metal yet.**~~ **Ran on the HP box 2026-09-07,
+  same day: 48/48 `uas:` checks, suite 407/0.** The prediction below held — the
+  code under test allocates frames and edits page tables it builds itself, with
+  no device or firmware dependency, so there was nothing for the metal to
+  diverge on. Recorded rather than deleted because "lower risk of a metal-only
+  divergence" was a *guess* until it was checked, and the archive is where
+  guesses get their answers.
 - **`amd64/` still uses `paging::AddressSpace`.** B3's success criterion is that
   the shared crates build and the type works, not that this kernel uses it.
   That is C1.

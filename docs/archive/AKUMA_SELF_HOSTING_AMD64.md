@@ -105,9 +105,17 @@ as they stand one day after the survey
 > bug on this target found by a live probe, after B1's two.
 >
 > Verified QEMU **405/0** (`SMP=1`, was 357) and **414/0** (`SMP=4`, was 366) —
-> +48 both, one new suite (`amd64/src/uas.rs`) and nothing else moved. Bare metal
-> not booted for this. aarch64 proven unchanged by section compare against
-> `HEAD`: `.text`, `.rodata` and `.data` **byte-identical**.
+> +48 both, one new suite (`amd64/src/uas.rs`) and nothing else moved — and on
+> **bare metal, 407/0 with all 48 `uas:` checks passing** (HP 500-502nj, RAM
+> image). aarch64 proven unchanged by section compare against `HEAD`: `.text`,
+> `.rodata` and `.data` **byte-identical**.
+>
+> **C1 has a hand-off prompt:** `proposals/NEXT_AGENT_AMD64_C1_USERMODE_FOLD.md`.
+> It carries a blocker this chart does not show — `akuma-syscalls-glue`
+> dispatches on **asm-generic/AArch64** numbers (191 constants, zero
+> `#[cfg(target_arch)]`) and amd64 speaks **x86_64** ones. Handing glue an
+> x86_64 number is a wrong answer, not a compile error, and deciding that
+> vocabulary is C1 step 1.
 
 Measurements as of 2026-09-07:
 
