@@ -414,6 +414,12 @@ as they stand one day after the survey
 > metal **488/0**. AArch64 `.text` and `.data` byte-identical across the
 > signature change; `.rodata` differs by **one byte** — a panic `Location` line
 > number moving 1926 → 1944, exactly the comment lines added above it.
+>
+> **Step 5 proper has a hand-off prompt:**
+> `proposals/NEXT_AGENT_AMD64_STEP5_PROCESS_TABLE.md`, over
+> `proposals/AMD64_STEP5_PROCESS_TABLE.md` for the reasoning. Both prerequisites
+> are done; the work starts at 5a (`Process.space` → `ProcAddressSpace`, and
+> `paging.rs` loses its user half — 26 call sites across four files).
 
 Measurements as of 2026-09-07:
 
