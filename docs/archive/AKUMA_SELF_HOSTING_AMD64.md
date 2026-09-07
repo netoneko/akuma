@@ -12,8 +12,9 @@ as they stand one day after the survey
 > scheduler on both architectures, and what is left is the machine effects
 > (`CR3`, TSS trap stack, FS/GS bases, `fxsave`, BKL depth, per-core current
 > slot) registered as `X86ArchHooks`. Pipes, `futex` and `wait4` park instead of
-> polling. Verified QEMU 295/0, Firecracker 294/0 at `SMP=4`, bare metal, and
-> aarch64 proven unchanged against `main`.
+> polling. Verified QEMU 295/0 (`SMP=1`) and 304/0 (`SMP=4`), Firecracker 285/0
+> and 294/0, **bare metal 297/0 at `SMP=4`**, and aarch64 proven unchanged
+> against `main` (307/0 on the same accelerator).
 >
 > **Not done from the A1 box:** `thread.rs` (391 lines) and the `smp.rs`
 > ticket-lock BKL → `akuma-bkl`. Both still stand.
@@ -21,8 +22,9 @@ as they stand one day after the survey
 > A side effect worth knowing about: consolidating the two boot paths
 > (`boot::early_init` + `boot::self_tests`) found that the multiboot2 path had
 > **never run seven of the PVH path's tests**, including the whole
-> process-lifecycle suite. That is why bare metal reported 262 checks where QEMU
-> reported 295.
+> process-lifecycle suite. Bare metal went **262 → 297 checks** as a result.
+> Both paths also start `init` now whether or not the suite passed — one flaky
+> check used to leave the headless box with no sshd.
 
 Measurements as of 2026-09-07:
 
@@ -268,6 +270,67 @@ Two properties of the shape:
   --target x86_64-unknown-none` going clean is the objective mid-point.
   Everything above it is deletions from `amd64/src`; everything below it is
   parity with what the AArch64 self-host already has.
+
+## Open issues found by probing the bare-metal box (2026-09-07)
+
+Found by running the probes on the HP box after the A1 fold landed, not by
+looking for them. Neither is caused by the fold; both are on the path to D.
+
+### 1. `open(O_CREAT)` does not validate the parent directory — writes vanish silently
+
+```
+akuma:/# echo A > /nosuchdir/file ; echo $?
+0
+akuma:/# ls /nosuchdir
+ls: /nosuchdir: No such file or directory
+```
+
+**Exit 0, no error, and the data is gone.** On Linux that open is `ENOENT` and
+the shell says `cannot create`. Reproduced identically on QEMU and on bare
+metal, so it is the fd layer rather than anything machine-specific.
+
+The console shows where it surfaces:
+
+```
+[close] persist failed for "/nosuchdir/file": not found
+```
+
+`amd64/src/fd.rs` buffers a created file in memory and writes it through at
+`close`. That close path is *deliberately* report-and-return-0 — its comment
+explains why (the data is already unreachable and Linux's errno slots are
+taken), and it exists because a silent loss here once surfaced as `apk`'s
+rename finding no tmp file, an `ENOENT` pointing three layers from the real
+failure. **That is a symptom-catcher doing its job.** The defect is upstream:
+the `open` should have failed and never handed out a descriptor.
+
+Why it matters for self-hosting: a build writes constantly to paths under
+directories it assumes exist. Every such write reports success and produces
+nothing, and the first *visible* symptom is somewhere else entirely — a missing
+object file, a link error naming a file whose source is plainly present. It is
+the same shape as the stale-source trap in the deploy loop, one layer down.
+
+**Fix at `open`, not at `close`**: resolve the parent, `ENOENT` if it is not a
+directory that exists. Item **C1** deletes this code path wholesale by folding
+`usermode.rs`/`fd.rs` into `akuma-syscalls-glue`, which resolves paths through
+the VFS properly — so the cheap move is a targeted parent check now and the
+real fix is C1. Worth a boot self-test either way, because the current suite
+has no case for "create in a directory that is not there".
+
+### 2. There is no `/dev` at all
+
+`ls /dev` → `No such file or directory`, on both the RAM image and QEMU's
+generated disk. So `/dev/null`, `/dev/zero`, `/dev/urandom` and `/dev/tty` are
+all absent.
+
+Right now this is masked by issue 1 — `> /dev/null` "succeeds" — which is a bad
+pairing: fixing the open check without adding `/dev/null` turns a lot of
+currently-"working" shell into hard failures. **Do them together**, and expect
+the transition to be noisy: `/dev/null` in particular appears in almost every
+non-trivial script and in most build systems.
+
+The image builders are `amd64/mkdisk.sh` and the devbox rootfs; the kernel side
+is whether these want to be real device nodes (a VFS device table) or ordinary
+files, which is a decision this target has not had to make yet.
 
 ## What stays different forever, by design
 

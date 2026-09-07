@@ -353,17 +353,39 @@ Firecracker in parallel (see `docs/runbooks/amd64-bare-metal-loop.md`):
 | QEMU/TCG `SMP=4` | 304 | 0 | 18 | **0** |
 | Firecracker `SMP=1` (KVM, the box) | 285 | 0 | 15 | **0** |
 | Firecracker `SMP=4` (KVM, the box) | 294 | 0 | 27 | **0** |
-| **bare metal, the HP box** | **262** | **0** | — | — |
+| **bare metal, the HP box, `SMP=4`** | **297** | **0** | 16 | **0** |
+
+Bare metal is the row that moved: **262 → 297 checks**, which is the seven tests
+the multiboot2 path had never run now running there. All eleven park/wake checks
+pass on real silicon with four cores online.
 
 The park totals are the evidence: the blocking self-test performs 3 of its own,
 so the rest came from real pipe, `futex` and `wait4` waits — and **every one was
 released by a real wake**, none by the backstop.
 
-One flake, on QEMU/TCG at `SMP=4` only: `net: the netpoll daemon is being
-scheduled` wants >100 daemon laps per 4000 boot-task yields and got fewer, once,
-on a run that shared the laptop with a `cargo build`. Re-runs on an idle host
-measure 3977–3989 laps against a bar of 100. Timing, not mechanism — but it is
-the first thing to re-check if it recurs on an idle machine.
+### The netpoll flake, and what it cost
+
+`net: the netpoll daemon is being scheduled` failed once on QEMU/TCG at `SMP=4`,
+then reproduced **deterministically on bare metal** with `[BKL] stuck: cpu
+1/2/3 waiting on owner 0` printed alongside — the daemon was ready and starved,
+not unscheduled.
+
+The test was measuring the wrong thing. It yielded 4000 times and then counted
+daemon laps, which asks "does the boot task's own yielding hand the CPU to the
+daemon" — a fair question on one core and the wrong one on four, where the other
+cores are runnable and the daemon may be waiting on the lock this core keeps
+re-taking. It waits on the **clock** now, with a two-second budget, and exits as
+soon as it clears the bar (101 laps, rather than spinning out 4000 yields).
+
+**The cost of that flake was out of all proportion to it**, and fixing the
+second half matters more than the first. On the multiboot2 path a failed suite
+withheld `init`, so one slow check left a machine with DHCP, a synced clock and
+a running network stack and **no sshd** — no way in, on a box whose only other
+console is a television in another room. It had to be power-cycled by hand.
+
+Both entry points now start `init` regardless of the verdict. Withholding the
+shell protects nothing the log does not already record, and `dmesg` is exactly
+what you ssh in to read.
 
 **aarch64 must be unaffected**, since the crate change is `cfg`-gated. Measured
 rather than asserted, on one accelerator so there is no second variable:
