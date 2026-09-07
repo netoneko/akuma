@@ -42,7 +42,7 @@
 use akuma_selftest::Suite;
 
 use akuma_ryzen_amd64::MmioDevices;
-use crate::paging::{self, MemAttr, Prot};
+use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
 use crate::serial;
 
@@ -61,7 +61,7 @@ fn map_device(base: u64, len: u64) -> bool {
         if !paging::map_page(
             (DEVMAP_BASE + pa) as usize,
             pa,
-            Prot::KERNEL_RW,
+            PteProt::KERNEL_RW,
             MemAttr::Device,
         ) {
             return false;

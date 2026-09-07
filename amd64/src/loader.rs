@@ -44,7 +44,7 @@
 //!   `_start` to bring itself up — see "Static-PIE" below.
 //! * A segment outside the lower half. The upper half is the kernel's, and a
 //!   `p_vaddr` there would ask `map_page_in` to overwrite a shared PML4 entry.
-//! * A page that would end up **writable and executable**. `Prot` offers no
+//! * A page that would end up **writable and executable**. `PteProt` offers no
 //!   `USER_RWX` constructor for the same reason, and this is where that becomes
 //!   enforcement rather than convention: an unaligned link packs .text and .data
 //!   into one page, and the union of their permissions is W+X.
@@ -95,7 +95,7 @@ use elf::segment::SegmentTable;
 
 use akuma_mmap::PhysFrame;
 
-use crate::paging::{AddressSpace, MemAttr, Prot};
+use crate::paging::{AddressSpace, MemAttr, PteProt};
 use crate::phys::phys_ptr;
 
 const PAGE_SIZE: usize = 4096;
@@ -245,8 +245,8 @@ const fn align_up(v: u64, to: u64) -> u64 {
 /// There is no read bit: x86 page tables cannot express "not readable" for a
 /// present page, so `PF_R` is implied and a segment without it would be
 /// readable anyway. Saying so here is more honest than pretending to enforce it.
-const fn segment_prot(p_flags: u32) -> Prot {
-    Prot {
+const fn segment_prot(p_flags: u32) -> PteProt {
+    PteProt {
         write: p_flags & PF_W != 0,
         exec: p_flags & PF_X != 0,
         user: true,
@@ -262,8 +262,8 @@ const fn segment_prot(p_flags: u32) -> Prot {
 /// under-permitting is a fault at run time in code that looks correct, whereas
 /// the over-permitting case that actually matters — W+X — is refused outright by
 /// the caller.
-const fn widen(a: Prot, b: Prot) -> Prot {
-    Prot {
+const fn widen(a: PteProt, b: PteProt) -> PteProt {
+    PteProt {
         write: a.write || b.write,
         exec: a.exec || b.exec,
         user: a.user || b.user,
@@ -319,7 +319,7 @@ fn map_range(
     frames: &FrameSet,
     start: u64,
     end: u64,
-    prot: Prot,
+    prot: PteProt,
 ) -> Result<(), &'static str> {
     let mut va = start;
     while va < end {
@@ -702,7 +702,7 @@ pub fn build_stack(
     }
     let bytes = (pages as u64) * PAGE_SIZE as u64;
     let base = top.checked_sub(bytes).ok_or("stack underflows the address space")?;
-    map_range(space, frames, base, top, Prot::USER_RW)?;
+    map_range(space, frames, base, top, PteProt::USER_RW)?;
 
     // The argv then envp strings sit at the very top, NUL-terminated, packed
     // downward. `arg_va[i]` / `env_va[i]` is where each string's bytes land.

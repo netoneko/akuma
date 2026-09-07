@@ -16,7 +16,7 @@ use akuma_pci::{Address, Bar, Header, command};
 use akuma_selftest::Suite;
 use spinning_top::Spinlock;
 
-use crate::paging::{self, MemAttr, Prot};
+use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
 use crate::port::{inl, outl};
 use crate::serial;
@@ -243,7 +243,7 @@ pub fn map_bar(bar: Bar, len: u64) -> Option<*mut u8> {
     let last = (address + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
     let mut pa = first;
     while pa < last {
-        if !paging::map_page((DEVMAP_BASE + pa) as usize, pa, Prot::KERNEL_RW, MemAttr::Device) {
+        if !paging::map_page((DEVMAP_BASE + pa) as usize, pa, PteProt::KERNEL_RW, MemAttr::Device) {
             return None;
         }
         pa += PAGE_SIZE;

@@ -332,6 +332,35 @@ The image builders are `amd64/mkdisk.sh` and the devbox rootfs; the kernel side
 is whether these want to be real device nodes (a VFS device table) or ordinary
 files, which is a decision this target has not had to make yet.
 
+### 3. A one-shot `ssh` command never returns — it hangs *after* printing
+
+Reported 2026-09-07, on the bare-metal box:
+
+```
+$ ssh -i ~/.ssh/id_ed25519 root@192.168.1.123 -p 2222 "uname -a"
+Akuma akuma 0.1.0-amd64 Akuma/amd64 (x86_64 bring-up) x86_64 GNU/Linux
+<hangs here — no exit, no prompt>
+```
+
+The command **runs** and its output arrives in full. What never happens is the
+session teardown: the exit status, the channel close, the TCP close. So this is
+not a command-execution failure and not a networking-reachability failure — it
+is whatever is supposed to notice that the child has finished and propagate that
+through the pipe to the channel to the socket.
+
+Two candidates, and they are the two A2 items:
+
+- **Pipes.** `amd64/src/pipe.rs`'s `fire()` currently drops `Wake`s on the floor
+  (A2 names this explicitly). A reader blocked on the child's stdout after the
+  child exits gets no EOF wake, so `sshd` never learns the command finished.
+- **`wait4`.** It spins rather than blocking (A2 again), and the spin is what
+  the session thread would be doing while it should be reaping.
+
+Both are `A2` — "wakes become real" — which is scheduled *after* the A1 fold
+that landed 2026-09-07 and is not part of the B trunk. **Deliberately not
+investigated now.** Revisit after A2 lands; if the hang survives it, it is a
+real third bug and worth its own autopsy rather than a guess.
+
 ## What stays different forever, by design
 
 Not work items — pinned seams. The end state is not zero platform differences;

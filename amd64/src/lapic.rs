@@ -39,7 +39,7 @@
 //! run N times fast.
 
 use crate::idt;
-use crate::paging::{self, MemAttr, Prot};
+use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
 use crate::port::outb;
 use akuma_selftest::Suite;
@@ -253,7 +253,7 @@ pub fn init() -> bool {
     // mapping of a register page lets the CPU satisfy a read from cache and
     // never issue the access.
     let va = DEVMAP_BASE + base;
-    if !paging::map_page(va as usize, base, Prot::KERNEL_RW, MemAttr::Device) {
+    if !paging::map_page(va as usize, base, PteProt::KERNEL_RW, MemAttr::Device) {
         serial::puts("  [FATAL] could not map the LAPIC page\n");
         return false;
     }

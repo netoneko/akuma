@@ -45,7 +45,7 @@
 //! prerequisite the proposal always said it was. Until then the only thing this
 //! module gives up is `munmap`'s clip-and-split and lazy regions.
 
-use crate::paging::{self, MemAttr, Prot};
+use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::phys_ptr;
 use akuma_selftest::Suite;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -111,16 +111,16 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     }
     let _ = addr; // Without MAP_FIXED an address is a hint, and hints are advisory.
 
-    // W^X, enforced here as it is in the ELF loader: `Prot` offers no
+    // W^X, enforced here as it is in the ELF loader: `PteProt` offers no
     // writable-and-executable constructor, and a JIT is not something this
     // target supports.
     if prot32 & PROT_WRITE != 0 && prot32 & PROT_EXEC != 0 {
         return errno::EINVAL;
     }
     let page_prot = if prot32 & PROT_EXEC != 0 {
-        Prot::USER_RX
+        PteProt::USER_RX
     } else {
-        Prot::USER_RW
+        PteProt::USER_RW
     };
 
     let base = NEXT_VA.fetch_add(pages * PAGE_SIZE, Ordering::Relaxed);

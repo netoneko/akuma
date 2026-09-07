@@ -43,7 +43,7 @@
 //! masked; `IF` has been 0 since `boot.s`, so nothing can arrive. A timer means
 //! LAPIC setup, and that is a later stage.
 
-use crate::paging::{self, MemAttr, PageFaultCode, Prot};
+use crate::paging::{self, MemAttr, PageFaultCode, PteProt};
 use crate::phys::phys_ptr;
 use akuma_selftest::Suite;
 
@@ -399,7 +399,7 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
             // previous owner left in it to whoever faults next.
             // SAFETY: a PMM frame, reached through the physmap.
             unsafe { core::ptr::write_bytes(phys_ptr::<u8>(frame_pa as u64), 0, 4096) };
-            if paging::map_page(page as usize, frame_pa as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
+            if paging::map_page(page as usize, frame_pa as u64, PteProt::KERNEL_RW, MemAttr::WriteBack) {
                 DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -510,7 +510,7 @@ fn cow_write_fault(addr: u64) -> bool {
         // `fork` child usually `execve`s and leaves the parent alone with
         // everything.
         CowAction::TakeInPlace => {
-            let writable = Prot { write: true, cow: false, ..prot };
+            let writable = PteProt { write: true, cow: false, ..prot };
             if !paging::map_page_in(root, page, pa as u64, writable, MemAttr::WriteBack) {
                 return false;
             }
@@ -537,7 +537,7 @@ fn cow_write_fault(addr: u64) -> bool {
                     4096,
                 );
             }
-            let writable = Prot { write: true, cow: false, ..prot };
+            let writable = PteProt { write: true, cow: false, ..prot };
             if !paging::map_page_in(root, page, fresh as u64, writable, MemAttr::WriteBack) {
                 akuma_pmm::free_page(fresh, 0);
                 return false;
@@ -889,7 +889,7 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
                 p.add(i).write_volatile((i as u8) ^ 0x5C);
             }
         }
-        if paging::map_page(EDGE_VA as usize, pa as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
+        if paging::map_page(EDGE_VA as usize, pa as u64, PteProt::KERNEL_RW, MemAttr::WriteBack) {
             static mut BIG: [u8; 8192] = [0; 8192];
             // SAFETY: single-threaded boot test; private to this fn.
             let big = unsafe { &mut *core::ptr::addr_of_mut!(BIG) };

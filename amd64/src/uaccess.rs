@@ -393,13 +393,13 @@ pub fn read_cstr(ptr: u64, max: usize) -> Option<Vec<u8>> {
 /// the other VA see it?*
 ///
 /// The first check is the other half. A user page that is read-only **on
-/// purpose** (`Prot::USER_RX`, an ELF text segment, an `mprotect(PROT_READ)`
+/// purpose** (`PteProt::USER_RX`, an ELF text segment, an `mprotect(PROT_READ)`
 /// range) must still refuse a kernel write: `akuma_cow` answers `Fault` for an
 /// unmarked read-only page, the fault falls through to the user-copy fixup, and
 /// [`write_bytes`] reports failure. Without that half, turning `WP` on would
 /// simply move the corruption rather than fix it.
 fn write_protect_check(t: &mut Suite) {
-    use crate::paging::{self, MemAttr, Prot};
+    use crate::paging::{self, MemAttr, PteProt};
     use crate::phys::phys_ptr;
     const RO_VA: u64 = 0x14_0000_0000;
     const SHARED_A: u64 = 0x15_0000_0000;
@@ -414,7 +414,7 @@ fn write_protect_check(t: &mut Suite) {
     };
     // SAFETY: a fresh PMM frame, reached through the physmap (supervisor).
     unsafe { core::ptr::write_bytes(phys_ptr::<u8>(ro_pa as u64), 0xA5, 4096) };
-    if paging::map_page(RO_VA as usize, ro_pa as u64, Prot::USER_RX, MemAttr::WriteBack) {
+    if paging::map_page(RO_VA as usize, ro_pa as u64, PteProt::USER_RX, MemAttr::WriteBack) {
         let wrote = write_bytes(RO_VA, b"must not land");
         // SAFETY: the same frame, through the physmap.
         let untouched = unsafe { phys_ptr::<u8>(ro_pa as u64).read_volatile() == 0xA5 };
@@ -436,7 +436,7 @@ fn write_protect_check(t: &mut Suite) {
     };
     // SAFETY: a fresh PMM frame, through the physmap.
     unsafe { core::ptr::write_bytes(phys_ptr::<u8>(shared_pa as u64), 0x5A, 4096) };
-    let cow = Prot::USER_RW.cow();
+    let cow = PteProt::USER_RW.cow();
     let mapped = paging::map_page(SHARED_A as usize, shared_pa as u64, cow, MemAttr::WriteBack)
         && paging::map_page(SHARED_B as usize, shared_pa as u64, cow, MemAttr::WriteBack);
     if !mapped {
@@ -480,7 +480,7 @@ fn write_protect_check(t: &mut Suite) {
 
 /// Prove SMAP is enforcing, not just enabled.
 ///
-/// Maps one **user-accessible** page (`Prot::USER_RW`), then:
+/// Maps one **user-accessible** page (`PteProt::USER_RW`), then:
 ///
 /// 1. `CR4.SMAP`/`SMEP` are on exactly when CPUID advertises them.
 /// 2. The raw copy primitive — no `stac` — reading that page returns `EFAULT`
@@ -493,7 +493,7 @@ fn write_protect_check(t: &mut Suite) {
 /// 4. A bracketed copy that *faults* (unmapped source) also leaves `AC` clear:
 ///    the fixup path returns through `clac`, not around it.
 pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
-    use crate::paging::{self, MemAttr, Prot};
+    use crate::paging::{self, MemAttr, PteProt};
     use crate::phys::phys_ptr;
     const USER_PAGE_VA: u64 = 0x12_0000_0000;
     const UNMAPPED_VA: u64 = 0x13_0000_0000;
@@ -514,7 +514,7 @@ pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
             p.add(i).write_volatile((i as u8) ^ 0x3C);
         }
     }
-    if !paging::map_page(USER_PAGE_VA as usize, pa as u64, Prot::USER_RW, MemAttr::WriteBack) {
+    if !paging::map_page(USER_PAGE_VA as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
         akuma_pmm::free_page(pa, 0);
         t.check("smap: map the user page", false);
         return;

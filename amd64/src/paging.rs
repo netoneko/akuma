@@ -5,14 +5,17 @@
 //! code that can *change* a mapping, which is the prerequisite for anything that
 //! demand-pages, protects a region, or addresses memory beyond that window.
 //!
-//! # Relationship to `akuma-mmap` and proposal item 1
+//! # Two `Prot`s, and why they stay two
 //!
-//! [`Prot`] below is deliberately the shape
-//! `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §1 proposes for `akuma-mmap`: a
-//! small `Copy` struct of `{read, write, exec, user}` with named constructors,
-//! **not** a `u64` of architectural bits. It is defined here rather than reused
-//! from `akuma-mmap` because `MmapRegion.flags` is still a raw AArch64 `u64`
-//! today, and that `u64` cannot cross to x86 — the encodings share no field:
+//! [`PteProt`] below is the **page-table** vocabulary: what the hardware is
+//! told, including a [`COW`] marker bit that is not a permission at all.
+//! `akuma_mmap::Prot` is the **region** vocabulary: what a mapping is *supposed*
+//! to be. They were both called `Prot` until 2026-09-07 and the rename is what
+//! makes the difference visible at every call site.
+//!
+//! [`encode`] is now `akuma_mmap::Prot`'s x86 backend, reached through
+//! [`PteProt::from_region`]. The bits stay here — with the walker that writes
+//! them — because the two encodings share **no field**:
 //!
 //! | | AArch64 | x86_64 |
 //! |---|---|---|
@@ -24,12 +27,15 @@
 //!
 //! Note the last two rows especially: AArch64 has two execute-permission bits to
 //! x86's one, so `PXN` has no x86 counterpart and a straight bit-for-bit
-//! translation loses information in one direction. That asymmetry is the concrete
-//! argument for item 1 — the neutral vocabulary has to be *permissions*, and each
-//! architecture's encoder decides how to spell them.
+//! translation loses information in one direction. That asymmetry is why
+//! `akuma_mmap::Prot` is an opaque token rather than `{read, write, exec}` —
+//! `RO` and `RX` grant EL0 the same thing and differ only in `PXN`, which x86
+//! cannot spell, so x86 maps both to the same PTE and says so in
+//! [`PteProt::from_region`].
 //!
-//! When item 1 lands, this `Prot` should be deleted and `akuma_mmap::Prot`
-//! used instead, with [`encode`] becoming that crate's x86 backend.
+//! Do **not** try to make the region token carry the CoW marker: it is x86 PTE
+//! bit 9, meaningless to a region, and `akuma-cow` already takes decoded
+//! booleans precisely so it never sees a PTE.
 //!
 //! # Why the tables can be dereferenced directly
 //!
@@ -91,7 +97,7 @@ const ENTRIES: usize = 512;
 /// - The bits had no owner. They are the fault-side counterpart of the PTE bits
 ///   at the top of this module — `P`, `RW`, `US` — and a second, private
 ///   spelling of them in another file is exactly the drift this target already
-///   paid for once with `Prot` (see the module header).
+///   paid for once with `PteProt` (see the module header).
 /// - Two of the five were missing. Bit 3 (a reserved bit set in a paging
 ///   structure) and bit 4 (an instruction fetch) were simply not named, so the
 ///   handler could not distinguish "the walker built a malformed entry" — always
@@ -225,7 +231,7 @@ impl PageFaultCode {
 // gives up.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct Prot {
+pub struct PteProt {
     pub write: bool,
     pub exec: bool,
     pub user: bool,
@@ -234,12 +240,12 @@ pub struct Prot {
     ///
     /// Always accompanied by `write: false` — a page that is both writable and
     /// CoW would never fault, so the sharing would never break and two address
-    /// spaces would diverge silently. [`Prot::cow`] is the only constructor and
+    /// spaces would diverge silently. [`PteProt::cow`] is the only constructor and
     /// it enforces that.
     pub cow: bool,
 }
 
-impl Prot {
+impl PteProt {
     /// Kernel read-only, no execute.
     pub const KERNEL_RO: Self = Self { write: false, exec: false, user: false, cow: false };
     /// Kernel read/write, no execute. The default for data.
@@ -251,6 +257,58 @@ impl Prot {
     pub const USER_RW: Self = Self { write: true, exec: false, user: true, cow: false };
     /// User read + execute.
     pub const USER_RX: Self = Self { write: false, exec: true, user: true, cow: false };
+    /// User read only — no write, no execute. The `PROT_READ` shape
+    /// `akuma_mmap::Prot::RO_NO_EXEC` names.
+    pub const USER_RO: Self = Self { write: false, exec: false, user: true, cow: false };
+
+    /// The x86 page-table spelling of a region's [`akuma_mmap::Prot`].
+    ///
+    /// This is the crate's **x86 backend**: `akuma-mmap` records what a mapping
+    /// is supposed to be, and this decides what the hardware is told. Total by
+    /// construction — a `match` on [`akuma_mmap::Prot::ALL`], pinned page-by-page
+    /// by [`region_prot_roundtrip_check`].
+    ///
+    /// Two arms are **pinned divergences from the AArch64 encoding**, not
+    /// oversights, and each is here rather than in a doc because this is where
+    /// someone will look:
+    ///
+    /// * `RO` and `RX` collapse to the same PTE. They differ only in `PXN` —
+    ///   whether EL1 may fetch — and x86 has one execute bit, not two. Nothing
+    ///   is lost that x86 could have expressed.
+    /// * `RW` (writable **and** executable on AArch64) becomes `USER_RW`, i.e.
+    ///   non-executable. `sys_mmap` on this target refuses `PROT_WRITE |
+    ///   PROT_EXEC` with `EINVAL` and `Prot::from_prot` never yields `RW`, so no
+    ///   region here can carry it; if one ever does, dropping execute produces a
+    ///   fault at the fetch — visible, addressed, debuggable — where granting it
+    ///   would silently hand ring 3 a writable code page.
+    ///
+    /// `NONE` maps to a **kernel-only** present page ([`Self::KERNEL_RO`]): x86
+    /// has no "present and wholly inaccessible" encoding, and clearing `U/S` is
+    /// what makes a ring-3 touch fault. Note `mmap(PROT_NONE)` never reaches
+    /// this — `akuma_syscalls_mem::mmap::plan` calls it a lazy reservation, so
+    /// its pages are never populated at all. The reachable caller is
+    /// `mprotect(PROT_NONE)` over pages that are already present, which is the
+    /// guard-page idiom every allocator uses.
+    #[must_use]
+    pub const fn from_region(prot: akuma_mmap::Prot) -> Self {
+        match prot.tag() {
+            // NONE — present, kernel-only, so ring 3 faults on any access.
+            0 => Self::KERNEL_RO,
+            // RO / RX — collapse; see the divergence note above.
+            1 | 4 => Self::USER_RX,
+            // RW / RW_NO_EXEC — both non-executable here; see the note above.
+            2 | 3 => Self::USER_RW,
+            // RO_NO_EXEC.
+            5 => Self::USER_RO,
+            // Unreachable over `Prot::ALL` as it stands. A `const fn` cannot
+            // `panic!` its way out of a `u8` match, so the fallback is
+            // **fail-closed** — a seventh variant would map to a page ring 3
+            // cannot touch, which faults visibly instead of over-granting.
+            // `region_prot_roundtrip_check` asserts the arity, so the variant
+            // fails the boot suite before it can reach here.
+            _ => Self::KERNEL_RO,
+        }
+    }
 
     /// This protection, demoted to copy-on-write: read-only in the hardware,
     /// marked so the fault handler knows the write is legitimate.
@@ -278,10 +336,10 @@ pub enum MemAttr {
     Device,
 }
 
-/// Encode a [`Prot`] and [`MemAttr`] into x86_64 PTE bits.
+/// Encode a [`PteProt`] and [`MemAttr`] into x86_64 PTE bits.
 ///
 /// The x86 backend of what item 1 calls `encode(prot, attr)`.
-const fn encode(prot: Prot, attr: MemAttr) -> u64 {
+const fn encode(prot: PteProt, attr: MemAttr) -> u64 {
     let mut bits = P;
     if prot.write {
         bits |= RW;
@@ -406,7 +464,7 @@ unsafe fn next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> {
 }
 
 /// Map `va` to `pa` in the **active** address space.
-pub fn map_page(va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
+pub fn map_page(va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
     map_page_in(read_cr3(), va, pa, prot, attr)
 }
 
@@ -416,7 +474,7 @@ pub fn map_page(va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
 /// a process's tables be built *before* they are activated — the alternative is
 /// switching to a half-built address space, which cannot be done safely from
 /// code that is itself running out of memory those tables describe.
-pub fn map_page_in(root: u64, va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
+pub fn map_page_in(root: u64, va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
     assert_eq!(pa % PAGE_SIZE as u64, 0, "pa must be page aligned");
 
@@ -538,12 +596,12 @@ pub fn translate_in(root: u64, va: usize) -> Option<u64> {
 /// [`MemAttr`] is deliberately not returned: nothing needs it yet, and a decoder
 /// that guesses would have to invent an answer for `PCD` without `PWT`.
 #[must_use]
-pub fn prot_in(root: u64, va: usize) -> Option<Prot> {
+pub fn prot_in(root: u64, va: usize) -> Option<PteProt> {
     let entry = match walk_in(root, va) {
         Walk::Missing => return None,
         Walk::Large(entry, _) | Walk::Leaf(entry) => entry,
     };
-    Some(Prot {
+    Some(PteProt {
         write: entry & RW != 0,
         exec: entry & NX == 0,
         user: entry & US != 0,
@@ -563,9 +621,9 @@ pub fn prot_in(root: u64, va: usize) -> Option<Prot> {
 /// address space copy-on-write: each leaf is re-mapped read-only and marked in
 /// **both** spaces, and the write fault breaks the sharing a page at a time.
 ///
-/// The `Prot` reported includes [`Prot::cow`], which is what lets a fork of a
+/// The `PteProt` reported includes [`PteProt::cow`], which is what lets a fork of a
 /// forked process preserve the marking.
-pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, Prot)) {
+pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, PteProt)) {
     // SAFETY: every table is reached through the physmap; only the private lower
     // half is walked, so the kernel's shared tables are never touched.
     unsafe {
@@ -594,7 +652,7 @@ pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, Prot)) {
                         }
                         // Lower half: bit 47 is 0, so no sign extension needed.
                         let va = (l4 << 39) | (l3 << 30) | (l2 << 21) | (l1 << 12);
-                        let prot = Prot {
+                        let prot = PteProt {
                             write: e1 & RW != 0,
                             exec: e1 & NX == 0,
                             user: e1 & US != 0,
@@ -627,7 +685,7 @@ pub fn smoke_test(t: &mut Suite) {
 
     if !t.check(
         "paging: map_page",
-        map_page(TEST_VA, frame as u64, Prot::KERNEL_RW, MemAttr::WriteBack),
+        map_page(TEST_VA, frame as u64, PteProt::KERNEL_RW, MemAttr::WriteBack),
     ) {
         return;
     }
@@ -662,6 +720,68 @@ pub fn smoke_test(t: &mut Suite) {
     akuma_pmm::free_page(frame, 0);
     nx_encoding_check(t);
     page_fault_code_check(t);
+    region_prot_roundtrip_check(t);
+}
+
+/// Pin every `akuma_mmap::Prot` variant to the exact PTE bits it encodes to.
+///
+/// This is the x86 half of the pin `akuma-mmu` put on its own encoder
+/// (`prot_roundtrips_to_todays_bits`). `akuma_mmap::Prot` is the vocabulary two
+/// kernels' regions now speak; [`PteProt::from_region`] and [`encode`] are the
+/// only place a region's protection becomes hardware permission on this target,
+/// and a change there is invisible in every test that merely maps a page and
+/// reads it back — a page mapped one bit too permissively still works.
+///
+/// Literal `u64`s rather than expressions built from `P`/`RW`/`US`/`NX`: an
+/// expression re-derives the answer from the same constants the code under test
+/// uses, so it agrees with a typo. These are the bits, written out.
+fn region_prot_roundtrip_check(t: &mut Suite) {
+    use akuma_mmap::Prot;
+
+    // The named constants first — these are live today and every mapping in the
+    // kernel goes through one of them.
+    t.check_eq("prot: KERNEL_RO", encode(PteProt::KERNEL_RO, MemAttr::WriteBack), 0x8000_0000_0000_0001);
+    t.check_eq("prot: KERNEL_RW", encode(PteProt::KERNEL_RW, MemAttr::WriteBack), 0x8000_0000_0000_0003);
+    t.check_eq("prot: KERNEL_RX", encode(PteProt::KERNEL_RX, MemAttr::WriteBack), 0x0000_0000_0000_0001);
+    t.check_eq("prot: USER_RW", encode(PteProt::USER_RW, MemAttr::WriteBack), 0x8000_0000_0000_0007);
+    t.check_eq("prot: USER_RX", encode(PteProt::USER_RX, MemAttr::WriteBack), 0x0000_0000_0000_0005);
+    t.check_eq("prot: USER_RO", encode(PteProt::USER_RO, MemAttr::WriteBack), 0x8000_0000_0000_0005);
+    // The CoW demotion: writable cleared, bit 9 set. Both halves in one value,
+    // because a demotion that kept `RW` would never fault and the sharing would
+    // never break.
+    t.check_eq(
+        "prot: USER_RW demoted to CoW",
+        encode(PteProt::USER_RW.cow(), MemAttr::WriteBack),
+        0x8000_0000_0000_0205,
+    );
+    // `MemAttr::Device` is the other axis, and the LAPIC depends on it: a
+    // writeback-cached MMIO register can be answered from cache and the access
+    // never issued.
+    t.check_eq("prot: Device adds PCD|PWT", encode(PteProt::KERNEL_RW, MemAttr::Device), 0x8000_0000_0000_001b);
+
+    // Then the region vocabulary, variant by variant.
+    t.check_eq("prot: region NONE is kernel-only", encode(PteProt::from_region(Prot::NONE), MemAttr::WriteBack), 0x8000_0000_0000_0001);
+    t.check_eq("prot: region RO", encode(PteProt::from_region(Prot::RO), MemAttr::WriteBack), 0x0000_0000_0000_0005);
+    t.check_eq("prot: region RW", encode(PteProt::from_region(Prot::RW), MemAttr::WriteBack), 0x8000_0000_0000_0007);
+    t.check_eq("prot: region RW_NO_EXEC", encode(PteProt::from_region(Prot::RW_NO_EXEC), MemAttr::WriteBack), 0x8000_0000_0000_0007);
+    t.check_eq("prot: region RX", encode(PteProt::from_region(Prot::RX), MemAttr::WriteBack), 0x0000_0000_0000_0005);
+    t.check_eq("prot: region RO_NO_EXEC", encode(PteProt::from_region(Prot::RO_NO_EXEC), MemAttr::WriteBack), 0x8000_0000_0000_0005);
+
+    // The two pinned divergences, asserted as *equalities* so that "un-fixing"
+    // one shows up here rather than as a permission change nobody notices.
+    t.check(
+        "prot: RO and RX collapse on x86 (no PXN)",
+        PteProt::from_region(Prot::RO) == PteProt::from_region(Prot::RX),
+    );
+    t.check(
+        "prot: region RW is not executable here (W^X)",
+        !PteProt::from_region(Prot::RW).exec,
+    );
+
+    // Arity. `from_region` matches on the opaque tag and cannot be exhaustive,
+    // so this is what stops a seventh variant landing on the fail-closed arm
+    // unnoticed: add one to `Prot::ALL` and the boot suite says so.
+    t.check_eq("prot: six region variants, all pinned above", Prot::ALL.len() as u64, 6);
 }
 
 /// Pin every [`PageFaultCode`] bit position against a decoded value.
@@ -719,12 +839,12 @@ fn page_fault_code_check(t: &mut Suite) {
 /// which on the AArch64 side they currently are not
 /// (`user_flags::RO == user_flags::EXEC`).
 fn nx_encoding_check(t: &mut Suite) {
-    let rw = encode(Prot::KERNEL_RW, MemAttr::WriteBack);
-    let rx = encode(Prot::KERNEL_RX, MemAttr::WriteBack);
-    let ro = encode(Prot::KERNEL_RO, MemAttr::WriteBack);
-    let urw = encode(Prot::USER_RW, MemAttr::WriteBack);
-    let urx = encode(Prot::USER_RX, MemAttr::WriteBack);
-    let dev = encode(Prot::KERNEL_RW, MemAttr::Device);
+    let rw = encode(PteProt::KERNEL_RW, MemAttr::WriteBack);
+    let rx = encode(PteProt::KERNEL_RX, MemAttr::WriteBack);
+    let ro = encode(PteProt::KERNEL_RO, MemAttr::WriteBack);
+    let urw = encode(PteProt::USER_RW, MemAttr::WriteBack);
+    let urx = encode(PteProt::USER_RX, MemAttr::WriteBack);
+    let dev = encode(PteProt::KERNEL_RW, MemAttr::Device);
 
     t.check("W^X: kernel data is non-executable", rw & NX != 0 && rw & RW != 0);
     t.check("W^X: kernel code is exec and not writable", rx & NX == 0 && rx & RW == 0);
@@ -825,7 +945,7 @@ impl AddressSpace {
     }
 
     /// Map a page in this space.
-    pub fn map(&self, va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
+    pub fn map(&self, va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
         map_page_in(self.root, va, pa, prot, attr)
     }
 
@@ -837,7 +957,7 @@ impl AddressSpace {
 
     /// The permissions `va` carries in this space, or `None` if unmapped.
     #[must_use]
-    pub fn prot(&self, va: usize) -> Option<Prot> {
+    pub fn prot(&self, va: usize) -> Option<PteProt> {
         prot_in(self.root, va)
     }
 

@@ -1,7 +1,7 @@
 //! Ring 3, and the `syscall`/`sysret` transition.
 //!
 //! Stage F. This is the first code in the amd64 port that runs *unprivileged*,
-//! and the first use of `Prot::USER_RX` / `Prot::USER_RW` — which have existed
+//! and the first use of `PteProt::USER_RX` / `PteProt::USER_RW` — which have existed
 //! since Stage B and been unit-checked but never actually mapped.
 //!
 //! # The transition, and what the hardware does not do for you
@@ -30,10 +30,11 @@ use akuma_syscalls_abi::Syscall;
 use akuma_selftest::Suite;
 
 use crate::gdt;
-use akuma_mmap::PhysFrame;
+use akuma_mmap::{MmapRegion, PhysFrame};
+use alloc::vec::Vec;
 
 use crate::loader::{self, FrameSet};
-use crate::paging::{self, MemAttr, Prot};
+use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::phys_ptr;
 use crate::serial;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1879,6 +1880,25 @@ pub struct Process {
     /// `execve` replaces it with a plain `Process`, so only that first entry
     /// takes the forked path.
     forked: bool,
+    /// The `mmap` regions of this **address space**, and the lock over them.
+    ///
+    /// Here rather than beside the scheduler's per-slot `Machine` because a
+    /// region list belongs to an address space and threads share one: a
+    /// `clone(CLONE_VM)` thread runs on the caller's `proc_slot`
+    /// (`thread.rs`), so it finds — and must find — the same list.
+    ///
+    /// The lock is not ceremony. This target is *not* BKL-serialised at
+    /// `SMP=4` across the window `yield_now` opens, and the AArch64 race this
+    /// mirrors is exactly `CLONE_VM`
+    /// (`docs/archive/AKUMA_MMAP_REGIONS_RACE.md`), which amd64 now supports.
+    ///
+    /// `MmapRegion::frames` is left **empty** on this target and `pages`
+    /// carries the extent — the CoW-inherited shape the crate documents. Frame
+    /// ownership here is `akuma_user_space::FrameLedger`'s job
+    /// ([`Process::frames`]), which counts VAs per frame and is what teardown
+    /// walks; a second frame list in the region would be a second answer to
+    /// the same question.
+    regions: Spinlock<Vec<MmapRegion>>,
 }
 
 impl Process {
@@ -1918,8 +1938,8 @@ impl Process {
             build_user_program(page, USER_CODE_VA as u64, msg, rounds, delay, status);
         }
 
-        if !space.map(USER_CODE_VA, code as u64, Prot::USER_RX, MemAttr::WriteBack)
-            || !space.map(USER_STACK_VA, stack as u64, Prot::USER_RW, MemAttr::WriteBack)
+        if !space.map(USER_CODE_VA, code as u64, PteProt::USER_RX, MemAttr::WriteBack)
+            || !space.map(USER_STACK_VA, stack as u64, PteProt::USER_RW, MemAttr::WriteBack)
         {
             loader::free_all_frames(&frames);
             space.free();
@@ -1931,6 +1951,7 @@ impl Process {
             entry: USER_CODE_VA as u64,
             stack: (USER_STACK_VA + 4096 - 16) as u64,
             forked: false,
+            regions: Spinlock::new(Vec::new()),
         })
     }
 
@@ -1984,7 +2005,17 @@ impl Process {
         match built {
             Ok((img, stack)) => {
                 let entry = img.entry;
-                Ok((Self { space, frames, entry, stack, forked: false }, img))
+                Ok((
+                    Self {
+                        space,
+                        frames,
+                        entry,
+                        stack,
+                        forked: false,
+                        regions: Spinlock::new(Vec::new()),
+                    },
+                    img,
+                ))
             }
             Err(e) => {
                 loader::free_all_frames(&frames);
@@ -1994,18 +2025,27 @@ impl Process {
         }
     }
 
+    /// Release everything this process holds: user frames, then page tables.
+    ///
+    /// # This used to have two paths, and one of them leaked
+    ///
+    /// Until the region table landed, `mmap` did not record its frames in the
+    /// ledger at all, so teardown walked the global bump window
+    /// `[MMAP_BASE, NEXT_VA)` page by page and released whatever was still
+    /// mapped — but only for a process that was **not** a `fork` child, because
+    /// a child's ledger already held every page the fork shared and the walk
+    /// would have decremented each of those twice.
+    ///
+    /// The hole was a child that called `mmap` *after* forking: those frames
+    /// were in neither the ledger (mmap did not track) nor the walk (skipped
+    /// for `forked`), so every such page leaked until reboot. A shell is
+    /// exactly that shape — fork, then let musl's allocator mmap an arena.
+    ///
+    /// `sys_mmap` and the demand-paging fault now both `track_user_frame`, so
+    /// there is one path for every process and it is the same one the loader's
+    /// pages have always taken. Each distinct frame is released once, through
+    /// `cow_ref_dec`, and freed only by the last address space to let go.
     fn free(self) {
-        // A `fork` child's ledger already holds *every* mapped page, anonymous
-        // ones included (`fork_from` records each shared frame). A loader-built
-        // process's does not — its `mmap`/heap frames are untracked, so walk
-        // the mmap window and release them before the tables go. Running that
-        // walk for a `fork` child would decrement each shared frame twice.
-        //
-        // Both paths release through `cow_ref_dec` and free only on the last
-        // reference; freeing raw was correct only while `fork` copied eagerly.
-        if !self.forked {
-            crate::mm::release_anon_frames(&self.space);
-        }
         loader::free_all_frames(&self.frames);
         self.space.free();
     }
@@ -2094,7 +2134,19 @@ impl Process {
             space.free();
             return None;
         }
-        Some(Self { space, frames, entry, stack, forked: true })
+        // The child maps every page of every parent region — read-only and
+        // CoW-shared by the pass above — but *owns* none of them, which is
+        // exactly the shape `inherit_mmap_regions_for_cow_child` produces.
+        // Carrying the **extent** across is the part that matters and the part
+        // that has been dropped before: a grandchild whose parent's regions
+        // read as zero-length shares nothing and faults on its first touch
+        // (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
+        let regions = {
+            let _irq = akuma_primitives::irq::IrqGuard::new();
+            let parent_regions = parent.regions.lock();
+            akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions)
+        };
+        Some(Self { space, frames, entry, stack, forked: true, regions: Spinlock::new(regions) })
     }
 }
 
@@ -4028,12 +4080,12 @@ pub fn elf_test(t: &mut Suite) {
     let entry_prot = proc.space.prot(proc.entry as usize & !0xfff);
     t.check(
         "elf: entry page is user-executable and not writable",
-        entry_prot == Some(Prot::USER_RX),
+        entry_prot == Some(PteProt::USER_RX),
     );
     let stack_prot = proc.space.prot((proc.stack as usize) & !0xfff);
     t.check(
         "elf: stack page is user-writable and not executable",
-        stack_prot == Some(Prot::USER_RW),
+        stack_prot == Some(PteProt::USER_RW),
     );
 
     // The stack is a separate mapping from the image, not an extension of it.
