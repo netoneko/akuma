@@ -258,6 +258,140 @@ several reboot cycles, which is its own pass. What has changed is that it is now
 a `[FAIL]` with a number beside it on every boot instead of a hang on one rig
 and a coin-flip on another.
 
+> **[CLOSED 2026-09-07, and the paragraphs above are wrong where they are most
+> confident]** — `docs/archive/AKUMA_AMD64_NETPOLL_LAPS_ZERO.md`. The daemon
+> *was* picked; it was inside **one lap** for longer than the whole budget.
+> Three counters bumped at three points in the loop said so in a single boot,
+> with no picker instrumentation and no reboot cycles: `entered 1, drains
+> completed 1, ticks completed 0`. The lap was stuck in `clock::sync_tick`,
+> whose `RETRY_INTERVAL_US` rate limit was armed inside `sync_tick` itself — so
+> a **failed** boot-time `sync_via_sntp` left `NEXT_RETRY_US` at `0` and the
+> daemon's first lap re-attempted it for the full 2.5 s `RETRY_TIMEOUT_US`,
+> against a 2 s test budget.
+>
+> The "coin flip" was whether the boot SNTP happened to land first; the
+> reasoning above reached for the difference it could see (bare metal vs TCG)
+> rather than the one that mattered (a failed DNS lookup four lines earlier in
+> the same log). `report_outcome` arms the interval now, from whichever path
+> made the attempt.
+>
+> Read next to §4's own lesson — *a timeout expressed in a clock the caller can
+> stop is not a timeout* — this is its companion: **a counter at the end of a
+> loop cannot tell you the loop never started.** `NETPOLL_LAPS` was one number
+> answering four questions, and the check's name asserted the only one it could
+> not test.
+
+## C1 step 3, batch 3 — the leaf tier finished, and the two that needed a seam
+
+**Date:** 2026-09-07, same day.
+
+Batch 2 folded the credentials. What remained on the hand-off prompt's step-3
+list was `getrandom`, `sysinfo`, `syslog`, `arch_prctl` and the
+`read`/`write`/`readv`/`writev` group. Working through them found that the list
+was written from the *AArch64* kernel's shape, and only one of them was
+foldable as-is. Both of the two that landed needed something built first, and
+both closed a real defect on the way — which is the pattern batch 1 set and it
+has not broken yet.
+
+### `getrandom` — the source had to stop being a device
+
+Glue's body named `akuma_virtio::rng::fill_bytes` outright. That is the right
+answer on every machine this kernel had run on before 2026-09-05 — a VMM
+announces a virtio-rng device — and the wrong answer on **every rig of this
+target**, none of which has one; the bare-metal box takes its entropy from
+`RDRAND`. Folding it unchanged would have returned `EIO` to every ring-3
+caller, `sshd`'s key exchange included.
+
+So the source is named rather than the device: `akuma_primitives::rng`, the
+same shape as the `clock` hook beside it — a leaf crate that cannot name a
+driver, holding a `OnceCopy<fn(&mut [u8]) -> bool>`. `boot::install_shared_sinks`
+registers `net::rng_fill_checked` (both entries, which is what that function
+exists for), and glue falls back to the virtio device when nothing is
+registered, so the AArch64 kernel registers nothing and behaves exactly as
+before.
+
+`fill_bytes` returns `Option<bool>`, and the two negatives are deliberately
+different: `None` is "no source here, use the device" and `Some(false)` is "the
+registered source failed". Collapsing them would let a broken hardware RNG fall
+through to a device that is not present, and `getrandom` would return whatever
+was already in the caller's buffer.
+
+**Two divergences closed, both previously silent.** The amd64 arm capped at one
+256-byte chunk (a caller asking for 300 got 256 and had to loop; glue loops for
+it), and it returned the byte count *regardless of whether the fill succeeded* —
+so a `RDRAND` that ran out of entropy handed ring 3 a buffer whose tail was
+kernel stack and called it random. `rng_fill` could not report that: it returns
+`()` because it is registered as a `NetRuntime` hook whose signature is fixed,
+and the TCP initial-sequence-number caller genuinely has nothing to do with the
+answer. `rng_fill_checked` is the half that was being thrown away.
+
+### `prlimit64` — a `=> 0` that was a wrong answer, not a stub
+
+The arm was `Syscall::Prlimit64 => 0`. `prlimit64` returning success **without
+writing `old_rlim`** leaves the caller reading its own stack as its stack and
+file-descriptor limits. musl's `getrlimit` is this syscall. Glue fills the
+struct, so the fold is the fix.
+
+And the fold made a dormant placeholder load-bearing:
+`ExecConfig::user_stack_size` on this target was `sched::STACK_SIZE` — **32 KiB,
+the per-thread *kernel* stack** — which was harmless while nothing read the
+field and became a wrong answer to ring 3 the instant `RLIMIT_STACK` came from
+it. `busybox ulimit -s` printed `32`. The real user stack is
+`usermode::ELF_STACK_PAGES * 4096` = 512 KiB, and here that is an unusually
+literal limit: `loader::build_stack` maps exactly those pages eagerly, with no
+growth policy and no guard page, so a program that recurses past it takes a
+`#PF` nothing will service. It reports `512` now, and a boot check pins that it
+is not the kernel number.
+
+This is Caution 2 of the plan doc arriving from the direction nobody watches.
+The caution says to diff the *arms* while folding; this divergence was not in an
+arm at all — it was in a config field that had never been read, and the fold is
+what read it.
+
+### What does not fold, and why — because the list said it would
+
+| syscall | why not |
+|---|---|
+| `sysinfo` | glue's is **worse** than this target's: it hardcodes `procs: 1` and leaves `bufferram` zero, where `amd64` counts `PROCS` and reports `akuma_alloc::stats().allocated`. Folding would be a regression. Improving glue's means reading `akuma-exec`'s process table — C1 step 5. |
+| `syslog` | glue has no arm for it. The AArch64 kernel serves it from `src/`, and `akuma-dmesg` (which both kernels already share) holds the ring and the action decode but not the syscall. Whoever gives glue a `sys_syslog` folds both kernels at once. |
+| `arch_prctl` | x86-only. No asm-generic number, so glue has none and must not be given an invented one — the rule from step 1. Stays in the legacy list. |
+| `set_robust_list` | glue's needs `akuma_exec::process::with_current_process` and returns `ENOSYS` without it. Step 5. |
+| `read`/`write`/`readv`/`writev` | not leaves on this target: every one goes through `fd.rs`'s descriptor table and its socket/pipe routing. Step 4. |
+
+### Verification
+
+Eleven new boot checks, and unlike batch 2's these are **value** checks with a
+working negative control — both arms change their answer, so the arm each
+replaced fails them. `getrandom` is checked by drawing twice and requiring the
+draws to differ and neither to be zero, which is what separates a wired source
+from a loop that returns the byte count over an untouched buffer; and by asking
+for 300 bytes, which the old one-chunk arm truncated.
+
+And then **a real ring-3 caller**, because §1–§4 above is a list of what the
+suite cannot see — it runs inside a `BypassValidationGuard` and hands the bodies
+kernel-stack buffers, so every user-pointer check in it is vacuous:
+
+```
+$ ssh akuma "uname -a"        # the session exists at all => KEX => getrandom
+$ ssh akuma "ulimit -s"       # 512    (was 32, the kernel stack)
+$ ssh akuma "ulimit -n"       # 1024
+```
+
+| rig | before | after |
+|---|---|---|
+| local QEMU/TCG `SMP=4` | 441 / 0 | **453 / 0** |
+| HP box, bare metal `SMP=4` | 432 / 0 | see the plan doc |
+
+Host tests 1359 → **1360** (the `akuma-primitives::rng` degradation contract).
+amd64 and AArch64 clippy clean; the glue gate
+(`cargo check -p akuma-syscalls-glue --target x86_64-unknown-none`) green.
+
+**AArch64 is touched this time**, and deliberately: glue's `getrandom` gains a
+branch. It is behaviour-preserving by construction — the hook is unregistered
+there, so `fill_bytes` answers `None` and the virtio call is what runs — but it
+is not the byte-identical result the earlier batches could claim, and saying so
+is cheaper than a reader inferring it.
+
 ## Background
 
 - `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — the unlock tree; C1 is trunk C.

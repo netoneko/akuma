@@ -1477,6 +1477,17 @@ pub(super) fn sys_getgroups(size: i32, _list_ptr: u64) -> u64 {
     0
 }
 
+/// `getrandom(buf, len, flags)`.
+///
+/// The source is [`akuma_primitives::rng`] when a target has registered one,
+/// and the virtio-rng device otherwise — see that module for why the seam
+/// exists. A machine with no virtio at all (the amd64 bare-metal box, whose
+/// entropy is `RDRAND`) would otherwise get `EIO` from every caller, `sshd`'s
+/// key exchange included, which is what kept this syscall out of the C1 fold.
+///
+/// `flags` is not consulted, here or before this change: `GRND_NONBLOCK` and
+/// `GRND_RANDOM` distinguish two pools this kernel does not have, and both
+/// sources below always answer.
 pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(ptr, len) { return EFAULT; }
     let _drv_bkl = super::fs::DriverBklGuard::new();
@@ -1485,12 +1496,18 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     while remaining > 0 {
         let chunk = remaining.min(256);
         let mut kernel_buf = alloc::vec![0u8; chunk];
-        if akuma_virtio::rng::fill_bytes(&mut kernel_buf).is_ok() {
-            if copy_to_user(current_ptr, &kernel_buf).is_err() {
-                return EFAULT;
-            }
-        } else {
+        // `None` is "no source registered, use the device"; `Some(false)` is
+        // "the registered source failed" and must not fall through to a device
+        // that is not there — see `akuma_primitives::rng::fill_bytes`.
+        let filled = match akuma_primitives::rng::fill_bytes(&mut kernel_buf) {
+            Some(ok) => ok,
+            None => akuma_virtio::rng::fill_bytes(&mut kernel_buf).is_ok(),
+        };
+        if !filled {
             return EIO;
+        }
+        if copy_to_user(current_ptr, &kernel_buf).is_err() {
+            return EFAULT;
         }
         remaining -= chunk;
         current_ptr += chunk as u64;

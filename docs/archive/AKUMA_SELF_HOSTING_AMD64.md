@@ -225,6 +225,78 @@ as they stand one day after the survey
 > daemon running on every one. Left open; it gates nothing and wants the
 > scheduler picker instrumented. The gain is that it is a `[FAIL]` with a number
 > beside it rather than a hang on one rig and a coin-flip on another.
+>
+> **[CLOSED 2026-09-07, and the diagnosis above is wrong in its central
+> claim]** — `docs/archive/AKUMA_AMD64_NETPOLL_LAPS_ZERO.md`. The daemon *was*
+> picked; it was inside **one lap** for longer than the whole budget. Three
+> counters split what `NETPOLL_LAPS` alone could not (`entered 1, drains
+> completed 1, ticks completed 0`) and named `clock::sync_tick` in one boot,
+> with no picker instrumentation at all. The `RETRY_INTERVAL_US` rate limit was
+> armed inside `sync_tick`, so a **failed** boot-time `sync_via_sntp` left
+> `NEXT_RETRY_US` at `0` and the daemon's first lap re-attempted it for the
+> full 2.5 s `RETRY_TIMEOUT_US` — against a 2 s test budget. Deterministic on a
+> condition nobody was watching, not flaky: the "coin flip" was whether the
+> boot SNTP happened to land first. `report_outcome` arms the interval now, so
+> every attempt sets the clock for the next one.
+>
+> Two things fell out. A **duplicate netpoll daemon** on the multiboot2 path
+> only — `boot_to_init` spawned one unconditionally after the suite had already
+> spawned one, so every full-suite bare-metal boot ran two, each polling the
+> stack on its own core; `spawn_netpoll` is idempotent now. And the check is
+> **two checks**: "is being scheduled" now asks `NETPOLL_ENTERED`, which is the
+> question its name always claimed, and "completes laps" asks the throughput
+> question the budget actually bounds.
+>
+> Verified QEMU **441/0**, **bare metal 432/0** (laps 101 in 101 yields, from
+> `laps 0` in 410534), and — the strong result — the OVMF/GRUB rig at
+> **432/0**, which had *never* passed this check because its NIC is undrivable
+> and DNS can therefore never work there.
+
+> **C1 step 3, batch 3 — the leaf tier is finished (2026-09-07)** —
+> `docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md` § "batch 3".
+> `getrandom` and `prlimit64` fold; the rest of the hand-off prompt's step-3
+> list does not, and each reason is written down rather than left as a gap.
+>
+> Both needed something built first and both closed a real defect, which is now
+> the pattern for this step rather than a coincidence. **`getrandom`** could not
+> fold because glue's body named `akuma_virtio::rng::fill_bytes` outright and
+> **no rig of this target has a virtio-rng device** — the bare-metal box takes
+> its entropy from `RDRAND` — so the fold would have returned `EIO` to every
+> ring-3 caller, `sshd`'s key exchange included. The source is named rather than
+> the device now: `akuma_primitives::rng`, a `OnceCopy` hook in the same shape
+> as the `clock` beside it, registered from `boot::install_shared_sinks`. Glue
+> still falls back to the virtio device when nothing is registered, so the
+> AArch64 kernel registers nothing and behaves as before. Two silent divergences
+> closed with it: the amd64 arm capped at one 256-byte chunk, and it returned
+> the byte count **whether or not the fill succeeded** — a `RDRAND` out of
+> entropy handed ring 3 a buffer whose tail was kernel stack.
+>
+> **`prlimit64`** was `=> 0`, which is not a stub but a wrong answer: success
+> without writing `old_rlim` leaves the caller reading its own stack as its
+> limits, and musl's `getrlimit` is this syscall. The fold is the fix — and it
+> made a dormant placeholder load-bearing. `ExecConfig::user_stack_size` was
+> `sched::STACK_SIZE`, **the per-thread kernel stack**, correct only because
+> nothing read it; `busybox ulimit -s` printed `32`. It is the real 512 KiB now,
+> and on this target that is a literal edge rather than a policy hint —
+> `build_stack` maps exactly `ELF_STACK_PAGES` eagerly with no growth and no
+> guard page. This is **Caution 2 arriving from a direction it does not name**:
+> the divergence was not in an arm at all, it was in a config field, and the
+> fold is what read it.
+>
+> Eleven new checks, and unlike batch 2's these are **value** checks with a
+> working negative control — both arms change their answer. Then a real ring-3
+> caller on the metal, because the suite's own checks are vacuous under its
+> `BypassValidationGuard`: `ssh akuma "ulimit -s"` → `512` (was `32`),
+> `ulimit -n` → `1024`, and the session existing at all is the `getrandom` proof.
+>
+> QEMU/TCG **453/0** (`SMP=4`), OVMF/GRUB **444/0**, **bare metal 444/0**. Host
+> tests 1360. **AArch64 is touched this time** — glue's `getrandom` gains one
+> branch, behaviour-preserving because the hook is unregistered there — so this
+> batch cannot claim the byte-identical sections the earlier ones did, and does
+> not.
+>
+> Step 4 (the VFS surface) is next and is where the fold pays: glue's `fs.rs` is
+> 3,112 lines against `fd.rs`'s hand-rolled equivalents.
 
 Measurements as of 2026-09-07:
 

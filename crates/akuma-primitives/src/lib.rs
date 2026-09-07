@@ -41,6 +41,7 @@
 
 pub mod addr;
 pub mod clock;
+pub mod rng;
 pub mod cpu;
 pub mod console;
 pub mod errno;

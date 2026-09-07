@@ -178,9 +178,28 @@ fn weak_fill(buf: &mut [u8]) {
 /// `pub` since Stage R: ring 3's `getrandom(2)` routes here, which is what
 /// `sshd`'s key exchange rests on.
 pub fn rng_fill(buf: &mut [u8]) {
+    let _ = rng_fill_checked(buf);
+}
+
+/// [`rng_fill`], answering **whether the whole buffer was filled**.
+///
+/// The `bool` is the half `rng_fill` throws away, and it exists because the
+/// short-fill case above is only "a visible failure" to a caller that can see
+/// it. `getrandom(2)` is such a caller: served through
+/// [`akuma_primitives::rng`] since C1 step 3 batch 3, it must return `EIO`
+/// rather than hand ring 3 a buffer whose tail is whatever was on the kernel
+/// stack — `sshd`'s key exchange reads it.
+///
+/// `rng_fill` keeps the `-> ()` shape because it is registered as a
+/// `NetRuntime` hook, whose signature this cannot change; the TCP
+/// initial-sequence-number caller genuinely has nothing to do with the answer.
+pub fn rng_fill_checked(buf: &mut [u8]) -> bool {
     if !has_rdrand() {
         weak_fill(buf);
-        return;
+        // Weak, but complete, and the degradation is stated at `weak_fill`.
+        // Reporting `false` here would make `getrandom` fail outright on a CPU
+        // without `RDRAND`, which is a worse answer than a stated-weak one.
+        return true;
     }
     let mut i = 0;
     while i < buf.len() {
@@ -207,12 +226,13 @@ pub fn rng_fill(buf: &mut [u8]) {
             // Out of entropy after ten tries. Stop rather than continue with a
             // stale `value`: a short fill is a visible failure, a repeated
             // qword is not.
-            return;
+            return false;
         }
         let n = (buf.len() - i).min(8);
         buf[i..i + n].copy_from_slice(&value.to_le_bytes()[..n]);
         i += n;
     }
+    true
 }
 
 /// The twelve `NetRuntime` hooks this target fills — see the module header for
@@ -363,6 +383,33 @@ fn report_init(r: Result<(), &'static str>) -> bool {
 /// spawned task is actually being scheduled.
 static NETPOLL_LAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Where inside its loop the daemon has got to — three counters, bumped at
+/// three points, because "laps 0" alone has three completely different causes
+/// and they need opposite fixes.
+///
+/// Measured 2026-09-07: the bare-metal box reported `netpoll laps 0` after
+/// 410534 boot-thread yields, while the NIC layer printed `[rtl] STALL #1
+/// after 2000000 idle laps` in the same window — i.e. *something* was polling
+/// the device hard while the lap counter stood still. That pair is not
+/// diagnosable from one number: the daemon may never have been picked, may be
+/// looping inside [`drain_step`], or may be stuck in `clock::sync_tick` /
+/// [`mem_watch_tick`] past the drain. `laps` is bumped last, so it cannot tell
+/// those apart, and every one of them is a `[FAIL]` on the same line.
+///
+/// Cost is three relaxed increments per lap on a loop that already does a
+/// device poll, and they stay in the shipped kernel: the failure only appears
+/// on real hardware, where adding instrumentation costs a reboot cycle.
+static NETPOLL_ENTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Drains completed — the daemon reached the end of [`drain_step`].
+static NETPOLL_DRAINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Ticks completed — the daemon got past `clock::sync_tick` + [`mem_watch_tick`].
+static NETPOLL_TICKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The task slot [`spawn_netpoll`] last placed the daemon in, or
+/// [`usize::MAX`]. The self-test asks the scheduler about it by number.
+static NETPOLL_SLOT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
 /// One netpoll lap: drain `smoltcp_net::poll()` until it stops making progress
 /// or the safety cap is hit. Returns the productive-poll count.
 ///
@@ -438,8 +485,10 @@ fn drain_step() -> u32 {
 extern "C" fn netpoll_daemon() -> ! {
     let mut next_lap = 0u64;
     let mut next_us = 0u64;
+    NETPOLL_ENTERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     loop {
         drain_step();
+        NETPOLL_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Keep trying SNTP until the wall clock is set. `sync_tick` is a no-op
         // once synced and self-rate-limits otherwise, so this costs a relaxed
         // load per lap in the common case. It is here, not in a task of its own,
@@ -447,6 +496,7 @@ extern "C" fn netpoll_daemon() -> ! {
         // keep alive, and it runs exactly when the network is being driven.
         crate::clock::sync_tick();
         mem_watch_tick();
+        NETPOLL_TICKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let laps = NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if PROBE_ON.load(core::sync::atomic::Ordering::Relaxed) {
             let now = uptime_us();
@@ -695,14 +745,39 @@ pub fn settle_for_dhcp(budget_ms: u64) -> bool {
 
 /// Spawn the netpoll daemon. Returns false only if the task table is full, which
 /// is a bug (the table is sized for it) rather than a condition to handle.
+///
+/// **Idempotent, and it has to be.** Both boot paths want a daemon and they
+/// arrive at it differently: `boot::self_tests` spawns one to prove the
+/// scheduler runs it, and the multiboot2 path's `boot_to_init` spawned a second
+/// unconditionally afterwards — so bare metal ran **two** netpoll daemons for
+/// the life of the boot, each calling `smoltcp_net::poll()` on its own core.
+/// That is exactly the concurrent kernel-side stack access
+/// [`settle_for_dhcp`]'s doc records as having deadlocked on a spinlock the
+/// poll step takes, arranged permanently rather than for one window. The PVH
+/// path never had it (`kmain` relies on the suite's spawn), which is why it
+/// only ever showed up on the metal.
+///
+/// A live slot short-circuits: `true`, no second task. `x86_slot_is_live`
+/// rather than "did we spawn before", so a daemon that somehow died is
+/// replaced rather than assumed.
 pub fn spawn_netpoll() -> bool {
-    let ok = crate::sched::spawn_daemon(netpoll_daemon).is_some();
-    if ok {
-        serial::puts("  net:  netpoll daemon spawned\n");
-    } else {
-        serial::puts("  net:  [WARN] no task slot for the netpoll daemon\n");
+    use core::sync::atomic::Ordering;
+
+    let existing = NETPOLL_SLOT.load(Ordering::Relaxed);
+    if existing != usize::MAX && akuma_threading::x86_slot_is_live(existing) {
+        serial::puts("  net:  netpoll daemon already running\n");
+        return true;
     }
-    ok
+
+    let Some(n) = crate::sched::spawn_daemon(netpoll_daemon) else {
+        serial::puts("  net:  [WARN] no task slot for the netpoll daemon\n");
+        return false;
+    };
+    NETPOLL_SLOT.store(n, Ordering::Relaxed);
+    serial::puts("  net:  netpoll daemon spawned in slot ");
+    serial::put_dec(n as u64);
+    serial::puts("\n");
+    true
 }
 
 /// Bring networking up on the multiboot2 (bare-metal) path.
@@ -994,9 +1069,48 @@ pub fn netpoll_spawn_selftest(t: &mut Suite) {
         yields += 1;
     };
 
-    t.check("net: the netpoll daemon is being scheduled", laps > REQUIRED_LAPS);
+    // Two checks, not one, because the old single line answered four questions
+    // with one verdict and the answer that mattered was never the one it named.
+    //
+    // "Is the daemon being scheduled" is a question about the picker, and
+    // `NETPOLL_ENTERED` answers it directly: the counter is bumped by the
+    // daemon's own first instruction, so a non-zero value means the task got
+    // the CPU. `laps` cannot answer it — a daemon that is scheduled and simply
+    // slow reads identically to one that was never picked, and on 2026-09-07
+    // that is exactly what happened: a 2.5 s `clock::sync_tick` inside lap one
+    // reported as `netpoll laps 0` and was read as starvation for a day.
+    let entered = NETPOLL_ENTERED.load(Ordering::Relaxed);
+    t.check("net: the netpoll daemon is being scheduled", entered >= 1);
+    // And this is the throughput question the budget actually bounds: the loop
+    // goes round, repeatedly, within the time given. A failure here with the
+    // check above passing means one lap is slow — look at `drains`/`ticks`
+    // below for which half.
+    t.check("net: the netpoll daemon completes laps", laps > REQUIRED_LAPS);
     t.note("net: netpoll laps", laps);
     t.note("net: netpoll yields waited", yields);
+    // Where the daemon actually is, printed unconditionally rather than only on
+    // a failure: on a passing boot these are the shape of "healthy" to compare a
+    // failing one against, and they cost three notes.
+    //
+    // Read them as a ladder. `entered` 0 means the task was never given the CPU
+    // at all — a picker question, and `state`/`on_cpu` below say which of the
+    // picker's two skip conditions applied. `entered` 1 with `drained` 0 means
+    // it ran and is inside `drain_step`, i.e. the NIC layer. `drained` climbing
+    // with `ticked` flat means `clock::sync_tick` or `mem_watch_tick`. Only the
+    // last of those is a scheduler fault, and all four used to report as one
+    // `[FAIL]`.
+    let slot = NETPOLL_SLOT.load(Ordering::Relaxed);
+    t.note("net: netpoll daemon slot", slot as u64);
+    t.note("net: netpoll daemon entered", entered);
+    t.note("net: netpoll drains completed", NETPOLL_DRAINED.load(Ordering::Relaxed));
+    t.note("net: netpoll ticks completed", NETPOLL_TICKED.load(Ordering::Relaxed));
+    let (state, on_cpu) = akuma_threading::x86_slot_debug(slot);
+    // The two reasons `x86_pick_next` skips a candidate. `state` is
+    // `akuma_exec_core::thread::thread_state` (0 FREE, 1 READY, 2 RUNNING,
+    // 3 TERMINATED, 4 INITIALIZING, 5 WAITING); `on_cpu` non-zero means another
+    // core is on that stack and this one must not touch it.
+    t.note("net: netpoll daemon thread state", u64::from(state));
+    t.note("net: netpoll daemon on-cpu gate", u64::from(on_cpu));
     // Loud, because it means the verdict above was reached without the clock the
     // test bounds itself with — and a `[FAIL]` for that reason is a different
     // fact from a daemon that really is starved.

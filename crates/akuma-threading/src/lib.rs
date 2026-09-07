@@ -2936,6 +2936,26 @@ pub fn x86_slot_is_waiting(slot: usize) -> bool {
     slot < MAX_THREADS && THREAD_STATES[slot].load(Ordering::Acquire) == thread_state::WAITING
 }
 
+/// `(thread state, on-cpu gate)` for `slot`, for diagnostics only.
+///
+/// The pair, not either alone: [`x86_pick_next`] skips a candidate for two
+/// completely different reasons — a state that is neither `READY` nor
+/// `RUNNING`, or an `ON_CPU` gate another core still holds — and a starved
+/// thread looks identical from outside whichever one it is. Reporting the
+/// state without the gate is how "the daemon is ready and never picked" reads
+/// as a scheduler bug when it is really a second core sitting on its stack.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_slot_debug(slot: usize) -> (u8, u8) {
+    if slot >= MAX_THREADS {
+        return (thread_state::FREE, 0);
+    }
+    (
+        THREAD_STATES[slot].load(Ordering::Acquire),
+        ON_CPU[slot].load(Ordering::Acquire),
+    )
+}
+
 /// Hand this core to another runnable thread; `true` if a switch happened.
 ///
 /// The public face of the x86_64 cooperative switch, for the one caller that

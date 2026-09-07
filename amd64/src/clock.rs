@@ -189,11 +189,13 @@ pub fn sync_tick() {
     if is_synced() {
         return;
     }
-    let now = crate::net::uptime_us();
-    if now < NEXT_RETRY_US.load(Ordering::Relaxed) {
+    if crate::net::uptime_us() < NEXT_RETRY_US.load(Ordering::Relaxed) {
         return;
     }
-    NEXT_RETRY_US.store(now + RETRY_INTERVAL_US, Ordering::Relaxed);
+    // The interval is armed by `report_outcome`, i.e. *after* the attempt and
+    // from whichever path made it — see its doc. Arming it here instead is
+    // what let the daemon's first lap re-run a boot attempt that had just
+    // failed.
     let outcome = attempt_sntp(RETRY_TIMEOUT_US);
     report_outcome(outcome, "retry");
 }
@@ -209,11 +211,38 @@ pub fn sync_via_sntp() {
     report_outcome(outcome, "boot");
 }
 
-/// Store the outcome and print one line. `ctx` is `"boot"` or `"retry"` so a
-/// console reader can see which path spoke.
+/// Store the outcome, **arm the next retry**, and print one line. `ctx` is
+/// `"boot"` or `"retry"` so a console reader can see which path spoke.
+///
+/// # The rate limit belongs to the attempt, not to `sync_tick`
+///
+/// [`RETRY_INTERVAL_US`] used to be armed inside [`sync_tick`], so
+/// [`sync_via_sntp`] — the boot one-shot — did not participate in it. On a
+/// machine where the boot attempt *fails*, that left `NEXT_RETRY_US` at `0`,
+/// and the netpoll daemon's **very first lap** re-attempted the thing that had
+/// just failed microseconds earlier, blocking that lap for the whole
+/// [`RETRY_TIMEOUT_US`] budget of 2.5 s.
+///
+/// That is longer than the 2 s `net::netpoll_spawn_selftest` gives the daemon
+/// to reach 100 laps, so the check **could not pass on any machine whose boot
+/// SNTP failed**: it reported `netpoll laps 0` and read as a starved daemon.
+/// Measured on the OVMF/GRUB rig 2026-09-07, where the e1000 is undriven so
+/// DNS cannot work: `entered 1, drains completed 1, ticks completed 0` — the
+/// daemon had been scheduled, had polled the network once, and was sitting in
+/// here. Bare metal showed the same failure as a coin flip, because there it
+/// depends on whether the boot-time SNTP happened to land.
+///
+/// Arming here makes every attempt — boot or retry — set the clock for the
+/// next one, which is what the interval always meant.
 fn report_outcome(outcome: SyncOutcome, ctx: &str) {
     LAST_OUTCOME.store(outcome as u64, Ordering::Relaxed);
     ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if outcome != SyncOutcome::Ok {
+        NEXT_RETRY_US.store(
+            crate::net::uptime_us().saturating_add(RETRY_INTERVAL_US),
+            Ordering::Relaxed,
+        );
+    }
     match outcome {
         SyncOutcome::Ok => {
             serial::puts("  clock: synced via SNTP (");

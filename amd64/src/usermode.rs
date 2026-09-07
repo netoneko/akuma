@@ -74,7 +74,13 @@ const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 /// (512 KiB) clears it with room to spare. A small program pays 512 KiB of
 /// eagerly-zeroed frames it never touches — the cost of not having demand
 /// paging for the stack yet.
-const ELF_STACK_PAGES: usize = 128;
+///
+/// `pub` since C1 step 3 batch 3: this is `RLIMIT_STACK`. Folding
+/// `prlimit64` into glue made `ExecConfig::user_stack_size` the number ring 3
+/// reads, and it had been set to `sched::STACK_SIZE` — the *kernel* stack —
+/// because until then nothing on this target read it. See
+/// `exec_runtime.rs`'s `user_stack_size`.
+pub const ELF_STACK_PAGES: usize = 128;
 
 /// The guest program, linked at [`USER_CODE_VA`] and embedded in the kernel
 /// image.
@@ -1112,7 +1118,24 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         }
         Syscall::Getpid => 1,
         Syscall::Fcntl => crate::fd::sys_fcntl(a1, a2, a3),
-        Syscall::Getrandom => sys_getrandom(a1, a2),
+        // `getrandom(buf, len, flags)` — **served by glue** (C1 step 3, batch 3).
+        //
+        // A leaf by `akuma_syscalls::fast_path`'s reckoning and the last one on
+        // the C1 hand-off's step-3 list that could not be folded, because
+        // glue's body named `akuma_virtio::rng::fill_bytes` outright and this
+        // target has no virtio-rng on any rig — the answer would have been
+        // `EIO` to every caller, `sshd`'s key exchange included. The seam is
+        // `akuma_primitives::rng`, registered with `net::rng_fill_checked` in
+        // `boot::install_shared_sinks`; glue still falls back to the virtio
+        // device when nothing is registered, so the AArch64 kernel keeps the
+        // behaviour it had.
+        //
+        // Two divergences close on the way, and both were silent here:
+        // glue **loops** where this capped at one 256-byte chunk, and it
+        // returns `EIO` on a short fill where this returned the byte count
+        // regardless — so a `RDRAND` that ran out of entropy handed ring 3 a
+        // buffer whose tail was kernel stack and called it random.
+        Syscall::Getrandom => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `nanosleep(req, rem)`.
         //
         // This was a bare `yield_now()` — "no high-resolution sleep: this
@@ -1341,7 +1364,20 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         }
         // Best-effort robustness/rlimit hooks musl pokes on startup.
         Syscall::SetRobustList => 0,          // set_robust_list
-        Syscall::Prlimit64 => 0,          // prlimit64
+        // `prlimit64(pid, resource, new, old)` — **served by glue** (C1 step 3,
+        // batch 3). A leaf: it reads a fixed table and `ExecConfig`, never a
+        // `Process`.
+        //
+        // This arm was `=> 0`, which is not a stub but a **wrong answer**:
+        // `prlimit64` returning success without writing `old_rlim` leaves the
+        // caller reading whatever was on its stack as its own stack and
+        // file-descriptor limits. musl's `getrlimit` is this syscall, and a
+        // build system asking `RLIMIT_NOFILE` before sizing a poll set is
+        // exactly the shape that then fails somewhere else entirely.
+        // Glue fills it: `RLIMIT_STACK` from `ExecConfig::user_stack_size`
+        // (real on this target — `exec_runtime.rs`), `RLIMIT_NOFILE` 1024,
+        // everything else `RLIM_INFINITY`.
+        Syscall::Prlimit64 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         Syscall::Readlinkat => crate::fd::sys_readlinkat(a1, a2, a3, a4),
         // `symlinkat(target, newdirfd, link_path)` — x86_64 266. Package
         // contents are full of `.so.1` versioned-library symlinks; ENOSYS
@@ -1718,23 +1754,6 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         }
         _ => crate::fd::errno::EINVAL,
     }
-}
-
-/// `getrandom(buf, buflen, flags)` — bytes from `RDRAND` (or the loud
-/// non-cryptographic fallback on a CPU without it; see `net::rng_fill`).
-///
-/// `flags` is ignored: `GRND_NONBLOCK` never applies because `RDRAND` does not
-/// block, and `GRND_RANDOM` vs the urandom pool is a distinction this source
-/// does not have. Bounded per call — `sshd` asks for 32 at a time.
-fn sys_getrandom(buf: u64, len: u64) -> u64 {
-    use crate::fd::errno;
-    if buf == 0 {
-        return errno::EFAULT;
-    }
-    let n = (len as usize).min(256);
-    let mut tmp = [0u8; 256];
-    crate::net::rng_fill(&mut tmp[..n]);
-    crate::fd::copy_out(buf, &tmp[..n])
 }
 
 /// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
@@ -3974,6 +3993,62 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         syscall_dispatch(115, (-1i64) as u64, 0, 0, 0, 0, 0),
         (-22i64) as u64,
     );
+
+    // Batch 3. Unlike the credentials above, **both of these change their
+    // answer**, so these are value checks with a working negative control: the
+    // arm they replaced would fail each one.
+    t.check("dispatch: prlimit64 302 -> 261", hop(Syscall::Prlimit64, 302, nr::PRLIMIT64));
+    t.check("dispatch: getrandom 318 -> 278", hop(Syscall::Getrandom, 318, nr::GETRANDOM));
+
+    // `prlimit64(0, RLIMIT_STACK, NULL, &old)`. The old arm was `=> 0` and
+    // wrote nothing, so the sentinel is what catches it — a return-value check
+    // alone passes against the bug, exactly as it did for `symlink` below.
+    // `RLIM_INFINITY` is the sentinel because it is the one value the arm is
+    // *not* supposed to produce for this resource.
+    const RLIMIT_STACK: u64 = 3;
+    let mut rlim = [u64::MAX; 2];
+    let prlimit_rc = syscall_dispatch(302, 0, RLIMIT_STACK, 0, rlim.as_mut_ptr() as u64, 0, 0);
+    t.check_eq("dispatch: glue accepts prlimit64", prlimit_rc, 0);
+    t.check(
+        "dispatch: and writes a real RLIMIT_STACK (the old arm wrote nothing)",
+        rlim[0] == (ELF_STACK_PAGES * 4096) as u64 && rlim[1] == rlim[0],
+    );
+    // The limit reported must be the stack a program actually gets, and this is
+    // the check that says which one that is. `exec_runtime.rs` supplied the
+    // *kernel* stack here until the fold made anyone read it — a placeholder
+    // that was correct only because it was dead.
+    t.check(
+        "dispatch: RLIMIT_STACK is the user stack, not the kernel one",
+        rlim[0] != crate::sched::STACK_SIZE as u64,
+    );
+
+    // `getrandom(buf, len, 0)` through glue, which reaches `RDRAND` only via
+    // the `akuma_primitives::rng` hook `boot::install_shared_sinks` registers.
+    // Without that hook glue asks the virtio-rng device, which no rig of this
+    // target has, and every call is `EIO` — so this is the check that the seam
+    // is wired, not just that the number hops.
+    t.check("dispatch: an entropy source is registered", akuma_primitives::rng::is_registered());
+    let mut draw1 = [0u8; 32];
+    let mut draw2 = [0u8; 32];
+    let got1 = syscall_dispatch(318, draw1.as_mut_ptr() as u64, draw1.len() as u64, 0, 0, 0, 0);
+    let got2 = syscall_dispatch(318, draw2.as_mut_ptr() as u64, draw2.len() as u64, 0, 0, 0, 0);
+    t.check_eq("dispatch: glue getrandom returns the full length", got1, draw1.len() as u64);
+    t.check_eq("dispatch: and again", got2, draw2.len() as u64);
+    // Two draws differing is what separates a wired source from a loop that
+    // returned the byte count over an untouched buffer — which is what the old
+    // arm did whenever `RDRAND` gave up, and it reported success either way.
+    t.check("dispatch: two draws differ", draw1 != draw2);
+    t.check("dispatch: and neither is all-zero", draw1 != [0u8; 32] && draw2 != [0u8; 32]);
+    // Larger than glue's 256-byte chunk, because the arm this replaced capped
+    // at one chunk and returned `min(len, 256)`. A caller asking for 300 got
+    // 256 and had to loop; glue loops for it.
+    let mut big = [0u8; 300];
+    t.check_eq(
+        "dispatch: getrandom(300) is not truncated to one 256-byte chunk",
+        syscall_dispatch(318, big.as_mut_ptr() as u64, big.len() as u64, 0, 0, 0, 0),
+        big.len() as u64,
+    );
+    t.check("dispatch: and the tail past 256 was written", big[256..] != [0u8; 44]);
 
     if !have_fs {
         t.note("dispatch: no filesystem; symlink round trip skipped", 0);

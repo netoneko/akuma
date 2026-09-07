@@ -526,6 +526,12 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         } else {
             serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
         }
+        // A no-op when `boot::self_tests` already spawned one — `spawn_netpoll`
+        // is idempotent since 2026-09-07, and it had to become so: this call
+        // used to be unconditional, so the full-suite bare-metal boot ran two
+        // netpoll daemons while the PVH path ran one. Still called, because the
+        // `skiptests` path shares this function and there is no suite to have
+        // spawned it.
         crate::net::spawn_netpoll();
         if cmdline.split_ascii_whitespace().any(|t| t == "netprobe") {
             crate::net::enable_probe();

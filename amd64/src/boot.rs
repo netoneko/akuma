@@ -122,6 +122,18 @@ pub fn install_shared_sinks() {
     // device failed to initialise — is silently dropped.
     akuma_primitives::console::set_print_hook(crate::serial::puts);
     crate::exec_runtime::init();
+    // The entropy source `akuma-syscalls-glue`'s `getrandom(2)` reads. Glue's
+    // default is the virtio-rng device, which this target does not have on any
+    // rig and cannot have on the bare-metal box; without this, folding
+    // `getrandom` into glue would return `EIO` to every ring-3 caller —
+    // `sshd`'s key exchange included. See `akuma_primitives::rng`.
+    //
+    // Here rather than in `net::init` because it is not a network fact and
+    // both boot protocols need it: this function exists precisely because a
+    // step registered from one `kmain` and not the other is how the metal
+    // died at the first folded syscall (`AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`
+    // §4).
+    akuma_primitives::rng::set_rng_hook(crate::net::rng_fill_checked);
 }
 
 /// What the shared suite needs to know about the machine it is running on.
