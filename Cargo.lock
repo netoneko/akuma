@@ -120,6 +120,7 @@ dependencies = [
  "akuma-user-access",
  "akuma-user-space",
  "akuma-vfs",
+ "akuma-vfs-glue",
  "akuma-virtio",
  "akuma-xhci",
  "elf",

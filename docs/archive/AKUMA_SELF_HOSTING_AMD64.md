@@ -298,6 +298,52 @@ as they stand one day after the survey
 > Step 4 (the VFS surface) is next and is where the fold pays: glue's `fs.rs` is
 > 3,112 lines against `fd.rs`'s hand-rolled equivalents.
 
+> **C1 step 4a — the private mount table is gone (2026-09-07)** —
+> `docs/archive/AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md`. Reading glue's `fs.rs`
+> for what a folded VFS arm actually touches gives **two** dependencies, not
+> one: `current_process_shared` (41 times — that is step 5) and
+> `akuma_vfs_glue::…` (94 times — this). The second is the small half and the
+> one that fails *silently*: a folded `sys_openat` resolves through
+> `akuma-vfs-glue`'s `MOUNT_TABLE`, and a kernel whose root is mounted into its
+> own private table answers `ENOENT` for every path on the disk. No compile
+> error, no panic — the same shape as step 1's syscall numbers. So the two
+> tables become one before any arm moves.
+>
+> `amd64/src/fs.rs`'s `static MOUNTS`, its `with_fs` (which held the mount-table
+> spinlock **across disk I/O**) and twelve one-line wrappers are `pub use
+> akuma_vfs_glue::{…}` now. The non-test half of the file went **195 → 125 code
+> lines** and gained, none of it written here: a real path walk (`..`, `.`,
+> `//`, trailing slash), symlink following, the synthetic `/dev` and
+> `/etc/mtab`, `MS_RDONLY` actually enforced, and the lock dropped before the
+> filesystem call.
+>
+> **One live bug, and it was one-sided.** `readlinkat` called `read_symlink`
+> directly and worked; `open` handed the link's own path to `read_file`, which
+> on a link inode is `NotAFile`. `ln -s` succeeded, `readlink` printed the
+> target, and `cat` through the link said `ENOENT`. Fixed by the one
+> `resolve_symlinks` call the AArch64 `sys_openat` has always made —
+> **deliberately in `sys_openat` and not in `resolve_at`**, which also serves
+> `symlinkat`/`readlinkat`/`unlinkat`, where following would make `rm` delete
+> the target. The check pins both halves; checking only that the link
+> disappears would pass against that.
+>
+> `/dev` now **lists** and **stats** and still cannot be **opened** — the device
+> table is pure data by design and serving bytes is `sys_openat`'s job on both
+> kernels. That half-state is a boot check (`dev: reading a device node's bytes
+> is still unwired`), to be deleted by the change that wires it. `/proc`
+> deliberately did **not** come with the crate: `ProcFilesystem` compiles here
+> but renders from `akuma-exec`'s process table, so mounting it would replace a
+> working synthetic `/proc` with an empty machine.
+>
+> Verified QEMU/TCG **472/0** (was 453), Firecracker **459/0**, OVMF/GRUB
+> **463/0** (was 444) and **bare metal 463/0** (was 444) — +20 checks, -1
+> subsumed — plus ring 3 on the metal: `ls -la /dev`, `df`, `cat /etc/mtab`, and
+> `cat` through a symlink, with `rm` proving it removed the link and not the
+> target. Host tests **1360**, unchanged. The AArch64 kernel cannot be affected:
+> the diff is `amd64/`, `Cargo.lock` and one comment.
+>
+> **Step 5 is now the only thing between here and folding the VFS arms.**
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate
@@ -595,6 +641,28 @@ real fix is C1. Worth a boot self-test either way, because the current suite
 has no case for "create in a directory that is not there".
 
 ### 2. There is no `/dev` at all
+
+> **[HALF-CLOSED 2026-09-07 — C1 step 4a]**
+> `docs/archive/AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md`. Adopting
+> `akuma-vfs-glue` brought the tree's `/dev` table with it, so the nodes now
+> **exist**: `ls -la /dev` lists `null`, `zero`, `random`, `urandom`, `tty` (and
+> `vda` where virtio-blk is present) on the metal and in QEMU, and `stat
+> /dev/null` reports `crw-rw-rw-` with the right inode.
+>
+> **Opening one for its bytes is still unwired**, and that is not an oversight
+> in the crate: `akuma_vfs::dev` is pure data by design, because each device's
+> `open()` is genuinely different (a PRNG loop, a PCM sink, a socket-backed fd),
+> so the dispatch belongs to `sys_openat` on both kernels — see
+> `docs/archive/DEVFS_MISSING.md` §3. The boundary is now a boot check,
+> `dev: reading a device node's bytes is still unwired`, to be deleted by
+> whatever wires it.
+>
+> The paragraph below about doing this *together* with issue 1 still stands and
+> is now sharper: `> /dev/null` still buffers bytes into a file that then fails
+> to persist, and it will keep doing so until the `sys_openat` arm exists. The
+> `st_rdev` half is also outstanding — `fd.rs`'s `encode_stat` fills it from
+> `akuma_vfs::Metadata`, which carries no `rdev`, so `ls -l` prints `0, 0` for
+> every node.
 
 `ls /dev` → `No such file or directory`, on both the RAM image and QEMU's
 generated disk. So `/dev/null`, `/dev/zero`, `/dev/urandom` and `/dev/tty` are

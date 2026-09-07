@@ -584,7 +584,9 @@ fn try_usb_root() -> bool {
     }
     crate::fs::mount_root_on(
         crate::fs::RootDevice::Usb(crate::fs::UsbDisk::new(crate::xhci::SDA1_OFFSET)),
-        "sda1",
+        // `/dev/`-prefixed like the virtio root, so `device_is_mounted` can
+        // strip it and recognise the partition as one a filesystem is caching.
+        "/dev/sda1",
     )
 }
 

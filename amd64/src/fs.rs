@@ -1,9 +1,10 @@
-//! Stage N: a filesystem.
+//! Stage N: a filesystem — the block devices this target can boot from, and the
+//! mount that puts one of them behind [`akuma_vfs_glue`]'s path walk.
 //!
-//! `akuma-ext2` mounted on the virtio-blk device from Stage M, so the kernel can
-//! open a file by path. Like the block driver before it, the ext2 code is used
-//! **unmodified** — it already built for `x86_64-unknown-none`, it already
-//! forbids `unsafe`, and its whole interface to a disk is two methods:
+//! `akuma-ext2` mounted on a block device, so the kernel can open a file by
+//! path. Like the block driver before it, the ext2 code is used **unmodified**
+//! — it already built for `x86_64-unknown-none`, it already forbids `unsafe`,
+//! and its whole interface to a disk is two methods:
 //!
 //! ```ignore
 //! pub trait BlockDevice: Send + Sync {
@@ -17,47 +18,84 @@
 //! accident: the seam was drawn in the right place years before this target
 //! existed.
 //!
-//! # The mount table
+//! # The mount table is not here any more (C1 step 4a, 2026-09-07)
 //!
-//! Paths resolve through `akuma-vfs`'s [`MountTable`] (`MountSet<8>`), the same
-//! type the AArch64 kernel's VFS uses, rather than through a single hard-wired
-//! root. Today it holds exactly one mount — `/` — so the *resolution* it adds is
-//! not yet load-bearing. Three other things it gives are:
+//! This module used to carry its own `static MOUNTS: Spinlock<Option<MountTable>>`
+//! and a `with_fs` that resolved a path against it, plus twelve wrappers —
+//! `read_file`, `write_file`, `create_dir`, `remove`, `rename`,
+//! `create_symlink`, `read_symlink`, `set_times`, `metadata`, `read_dir`,
+//! `stats_for_path`, `render_mounts` — whose bodies were one `with_fs` call
+//! each. All of that is [`akuma_vfs_glue`] now, the same instance the AArch64
+//! kernel mounts into and, more to the point, **the instance
+//! `akuma-syscalls-glue::fs` resolves through**: a folded VFS syscall arm
+//! cannot see a mount table this target keeps to itself, so replacing the
+//! private one is step 4's prerequisite rather than a tidy-up
+//! (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` § C1).
 //!
-//! - **`/proc/mounts`**, rendered from the table in [`render_mounts`]. `busybox
-//!   df` reads that file first and prints nothing without it, so a mount this
-//!   kernel could not name was a mount `df` could not report.
-//! - **`statfs`/`fstatfs` per mount** rather than per kernel: the numbers come
-//!   from the `Filesystem` serving that path, so a second mount reports its own
-//!   free space instead of the root's.
-//! - **A second mount is now two lines**, at the point where there is one to
-//!   make — which is where a mount table stops being ceremony.
+//! What the swap *adds*, none of which was written here:
 //!
-//! What is still absent is a path *namespace*: no per-process root, no bind
-//! mounts, no container visibility rules. That is `akuma-isolation`'s
-//! `Namespace`, which the AArch64 kernel layers on top of the same table
-//! (`akuma-vfs-glue`), and this target has no boxes to need it.
+//! - **The lock is no longer held across disk I/O.** The old `with_fs` handed a
+//!   borrowed `&dyn Filesystem` out of the guard, so every read ran under the
+//!   mount-table spinlock — the hazard CLAUDE.md records for the AArch64
+//!   kernel. `resolve_mount` clones the `Arc` and drops the lock first.
+//! - **A real path walk**: `..`, `.`, a trailing slash and the process CWD are
+//!   normalised before resolution, and `resolve_symlinks` follows links in
+//!   *interior* components. The old table saw whatever string `fd.rs` handed it.
+//! - **Synthetic `/dev` and `/etc/mtab`**, resolve-time nodes rather than
+//!   mounted filesystems. `/dev` did not exist on this target at all
+//!   (`AKUMA_SELF_HOSTING_AMD64.md` open issue 2); it now *lists* and *stats*.
+//!   Opening one for its bytes is still `fd.rs`'s job and is not wired — see
+//!   [`smoke_test`]'s `dev:` checks, which pin exactly that boundary.
+//! - **Read-only mounts are enforced** at every write chokepoint (`MS_RDONLY`
+//!   → `FsError::ReadOnly` → `EROFS`), which the private table recorded and
+//!   never consulted.
 //!
-//! Writes are exercised now (2026-09-04, [`write_file`]) — `fd::sys_write` on a
-//! file opened `O_CREAT`/`O_WRONLY` buffers into the descriptor's own `Vec<u8>`
-//! and this is called once, at `close(2)`, to persist it. `fd::smoke_test`
-//! writes and reads one back as part of the boot self-tests: the old worry
-//! about a mutating self-test making the image stateful across boots does not
-//! apply here, because `run.sh` already rebuilds the image on every run (see
-//! this file's own module header, further up) — nothing depends on this image
-//! surviving to the next boot unchanged.
+//! What deliberately did **not** come with it is `/proc`. `akuma-vfs-glue`
+//! carries a `ProcFilesystem`, and it renders from `akuma-exec`'s process
+//! table — which this target does not populate, so mounting it would replace
+//! `fd.rs`'s synthetic `/proc` (which reads *this* kernel's tables and works)
+//! with one that reports an empty machine. It becomes the right move in the
+//! same step that gives this target `akuma-exec` processes, not before.
+//!
+//! # What is still absent
+//!
+//! A path *namespace*: no per-process root, no bind mounts, no container
+//! visibility rules. The machinery is present — `akuma_vfs_glue::resolve_mount`
+//! consults `current_process_shared()?.namespace` first — but this target
+//! registers no `akuma-exec` processes, so every resolution takes the
+//! no-process fallback (`resolve_path("/", path)` against the global table),
+//! which is exactly what the private table did. That fallback is the seam: the
+//! day processes exist here, CWD and namespaces start working with no change to
+//! this file.
+//!
+//! Writes are exercised (2026-09-04, `write_file`) — `fd::sys_write` on a file
+//! opened `O_CREAT`/`O_WRONLY` buffers into the descriptor's own `Vec<u8>` and
+//! flushes once, at `close(2)`. `fd::smoke_test` writes and reads one back as
+//! part of the boot self-tests: the old worry about a mutating self-test making
+//! the image stateful across boots does not apply here, because `run.sh`
+//! rebuilds the image on every run — nothing depends on this image surviving to
+//! the next boot unchanged.
 
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
 use akuma_selftest::Suite;
-use akuma_vfs::{
-    DirEntry, Filesystem, FsError, FsStats, Metadata, MountSnapshot, MountTable,
-};
-use alloc::string::String;
+use akuma_vfs::FsError;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use spinning_top::Spinlock;
 
 use crate::serial;
+
+/// The synchronous filesystem facade, re-exported so `crate::fs::read_file` and
+/// friends keep naming one thing.
+///
+/// The AArch64 binary does the same (`src/fs.rs` is `pub use
+/// akuma_vfs_glue::fs::*`), so the two kernels call the identical functions.
+/// These return `Result<_, FsError>` where this module's own wrappers returned
+/// `Option`; the callers converted rather than the crate being re-wrapped,
+/// because an `Option` throws away *which* error the VFS reported and
+/// `EROFS`-vs-`ENOENT` is now a distinction this layer can make.
+pub use akuma_vfs_glue::{
+    create_dir, create_symlink, exists, list_dir, metadata, read_at, read_file, read_symlink,
+    remove_dir, remove_file, rename, resolve_symlinks, set_times, stats_for_path, write_file,
+};
 
 /// The virtio-blk device, as something `akuma-ext2` can read.
 ///
@@ -138,16 +176,6 @@ impl BlockDevice for RootDevice {
     }
 }
 
-/// The kernel's mount table.
-///
-/// `Spinlock<Option<..>>` rather than a `OnceCell` for the reason the single
-/// root had before it: mounting can fail (no disk, not ext2, a corrupt
-/// superblock) and the kernel must boot anyway, so "nothing mounted" has to be
-/// a representable state rather than a panic. `Option` and not a bare
-/// `MountTable` because `MountSet::new` allocates its `Vec` and so cannot be a
-/// `const` initialiser for a `static`.
-static MOUNTS: Spinlock<Option<MountTable>> = Spinlock::new(None);
-
 /// Wall-clock source for inode timestamps, in seconds since the Unix epoch.
 ///
 /// `clock::now_us` is fed by the SNTP client that self-heals in the netpoll
@@ -160,6 +188,45 @@ fn wall_clock_secs() -> u64 {
     crate::clock::now_us() / 1_000_000
 }
 
+/// Point [`akuma_vfs_glue`] at this kernel's four facts and create the mount
+/// table.
+///
+/// Called from `boot::install_shared_sinks` — i.e. from **both** entry points,
+/// which is the arrangement C1 step 3 landed after the multiboot2 path was
+/// found to be missing `exec_runtime::init` and died at the first folded
+/// syscall (`AKUMA_SELF_HOSTING_AMD64.md` § "C1 step 3's first arm"). A
+/// per-entry copy of this call is precisely the drift that cost.
+///
+/// Deliberately separate from [`mount_root_on`]: the synthetic `/dev` and
+/// `/etc/mtab` nodes, and `list_dir` on an empty table, must answer on a
+/// `DISK=none` boot too, and they need the table to exist and the hooks to be
+/// installed even though nothing will ever be mounted into it.
+pub fn init_vfs() {
+    akuma_vfs_glue::set_hooks(akuma_vfs_glue::VfsGlueHooks {
+        // No sound device on either amd64 rig, so `/proc/audio` reports none.
+        // Not a `not_wired!`-style panic: the hook's whole contract is to
+        // answer a yes/no about hardware, and "no" is the true answer here.
+        audio_is_available: || false,
+        // The crate's own front door, which is what the AArch64 binary passes
+        // too (`crate::fs::exists` there *is* this function). The indirection
+        // exists so `/proc` can probe paths without `akuma-vfs-glue` depending
+        // on the binary; a self-reference is the degenerate case of that.
+        fs_exists: exists,
+        probed_core_count: crate::smp::online_cpus,
+        // Microseconds, and `None` rather than `Some(0)` before the first SNTP
+        // sync — `clock::now_us` returns 0 for "never synced", which as a
+        // timestamp would be 1970 dressed up as a reading.
+        utc_time_us: || crate::clock::is_synced().then(crate::clock::now_us),
+        // The shared file-page cache is not wired on this target: every file
+        // mapping still gets its own copy of every page
+        // (`AKUMA_AMD64_MEMORY_CLOSEOUT.md`). Sizing a cache nothing consults
+        // would reserve RAM for no reader, so this stays a no-op until
+        // `akuma-fpcache` is adopted here.
+        fpcache_init: |_total_ram_bytes| {},
+    });
+    akuma_vfs_glue::init();
+}
+
 /// Mount the first block device as the root filesystem.
 ///
 /// Returns false when there is no disk or it does not hold an ext2 image.
@@ -169,20 +236,28 @@ pub fn mount_root() -> bool {
     if !akuma_virtio::block::is_initialized() {
         return false;
     }
-    mount_root_on(RootDevice::Virtio(VirtioBlk), "vda")
+    mount_root_on(RootDevice::Virtio(VirtioBlk), "/dev/vda")
 }
 
 /// Mount `device` at `/`, naming it in the diagnostics and in `/proc/mounts`.
 ///
 /// `name` becomes the mount's **source** — the first column of `/proc/mounts`
 /// and what `df` prints under `Filesystem`. It is the device the image came
-/// from (`vda`, `sda1`, `module`), which is the only thing distinguishing the
-/// three ways this target acquires a root.
+/// from (`/dev/vda`, `/dev/sda1`, `module`), which is the only thing
+/// distinguishing the three ways this target acquires a root. The `/dev/`
+/// prefix matters beyond cosmetics: `akuma_vfs_glue::device_is_mounted` strips
+/// it to decide whether a raw block open would race the filesystem's own cache.
 ///
 /// The bare-metal path comes here with a [`RootDevice::Ram`]: an ext2 image the
 /// boot loader left in memory, since a machine with no storage driver still
 /// needs somewhere for `/bin/sh` to live.
 pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
+    // Idempotent (`akuma_vfs_glue::init` only fills an empty table, `set_hooks`
+    // is a `OnceCopy`), and here as well as in `install_shared_sinks` because a
+    // caller that reaches a mount without having booted through the shared
+    // sink would otherwise get `FsError::NotInitialized` rather than a mount.
+    init_vfs();
+
     // Not an error worth halting for: a raw disk with no filesystem is a
     // legitimate thing to be handed, and the message says which happened.
     let Ok(fs) = Ext2Filesystem::new(device, wall_clock_secs) else {
@@ -191,12 +266,10 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
         serial::puts(" holds no readable ext2 image\n");
         return false;
     };
-    let mut guard = MOUNTS.lock();
-    let table = guard.get_or_insert_with(MountTable::new);
     // `mount_with` rather than `mount`: without a source the mount has no name
     // to print, and `/proc/mounts` with a `none` in column one is what `df`
     // shows under `Filesystem`.
-    if let Err(e) = table.mount_with("/", Some(name), 0, Arc::new(fs)) {
+    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, Arc::new(fs)) {
         serial::puts("  fs:   could not mount ");
         serial::puts(name);
         serial::puts(" at /: ");
@@ -204,7 +277,6 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
         serial::puts("\n");
         return false;
     }
-    drop(guard);
     serial::puts("  fs:   ext2 mounted on ");
     serial::puts(name);
     serial::puts("\n");
@@ -219,203 +291,53 @@ const fn fs_error_name(e: FsError) -> &'static str {
         FsError::NoSpace => "mount table full",
         FsError::NotSupported => "not supported",
         FsError::NoFilesystem => "no filesystem",
+        FsError::NotInitialized => "mount table not initialised",
         _ => "error",
     }
 }
 
-/// Resolve `path` through the mount table and run `f` against the filesystem
-/// serving it, with the path rewritten relative to that mount point.
+/// Remove a file, or with `rmdir` an empty directory — `unlinkat(2)`'s two
+/// halves behind one flag, which is the shape the syscall passes.
 ///
-/// A closure rather than a returned reference for the reason `with_root` was
-/// one: the table lives behind a lock and `MountSet::resolve` hands out a
-/// borrow of an entry inside it, so a returned `&dyn Filesystem` would hand the
-/// guard's lifetime to callers with no reason to think about it.
-///
-/// **The lock is held across the filesystem call**, and therefore across disk
-/// I/O. That is deliberate and is exactly what the single `ROOT` lock this
-/// replaced already did, so it is not a new hazard here — but it is the hazard
-/// CLAUDE.md records for the AArch64 kernel (`MOUNT_TABLE` held across
-/// filesystem calls, so a reaper taking that lock inverts against them). The
-/// allocation-free alternative does not exist: `resolve_arc` clones the `Arc`
-/// and drops the lock, at the cost of a `String` per call on every read. If
-/// this target ever grows something that takes `MOUNTS` from a teardown path,
-/// that is the trade to revisit.
-fn with_fs<R>(path: &str, f: impl FnOnce(&dyn Filesystem, &str) -> R) -> Option<R> {
-    let guard = MOUNTS.lock();
-    let (fs, rel) = guard.as_ref()?.resolve(path)?;
-    Some(f(fs, rel))
-}
-
-/// Run `f` against every mount, in table order.
-///
-/// The rows borrow out of the table and the lock is held for the whole visit,
-/// so `f` must not allocate, block, or take another lock — the contract
-/// `MountSet::for_each_mount` states. [`render_mounts`] is the intended use.
-pub fn for_each_mount(f: impl FnMut(MountSnapshot<'_>)) {
-    if let Some(table) = MOUNTS.lock().as_ref() {
-        table.for_each_mount(f);
+/// The one wrapper that survived the fold, because the crate splits what the
+/// syscall joins and the alternative is an `if` at the single call site that
+/// says less than the name does.
+pub fn remove(path: &str, rmdir: bool) -> Result<(), FsError> {
+    if rmdir {
+        remove_dir(path)
+    } else {
+        remove_file(path)
     }
-}
-
-/// How many filesystems are mounted.
-#[must_use]
-pub fn mount_count() -> usize {
-    MOUNTS.lock().as_ref().map_or(0, MountTable::len)
-}
-
-/// `(filesystem name, statistics, mount flags)` for whichever mount serves
-/// `path` — the body of `statfs`/`fstatfs`.
-///
-/// The name is copied rather than borrowed because it comes from
-/// `Filesystem::name`, which borrows the filesystem, which borrows the table.
-pub fn stats_for_path(path: &str) -> Result<(String, FsStats, u64), FsError> {
-    let guard = MOUNTS.lock();
-    let table = guard.as_ref().ok_or(FsError::NoFilesystem)?;
-    let resolved = table.resolve_arc_full(path).ok_or(FsError::NotFound)?;
-    let stats = resolved.fs.stats()?;
-    Ok((String::from(resolved.fs.name()), stats, resolved.flags))
 }
 
 /// Render `/proc/mounts` into `buf`, returning the bytes written.
 ///
-/// Fixed buffer and no allocation: this runs inside [`for_each_mount`], which
-/// holds the table's spinlock. `busybox df` reads this file to learn what to
-/// call `statfs` on, and prints nothing at all when it is missing — which is
-/// what it did on this target until the mount table existed to render.
-///
-/// The format is Linux's: `source mountpoint fstype options 0 0`. Only the
-/// `ro`/`rw` option is real; `df` and `mount` parse the column and ignore the
-/// rest.
+/// The viewer is box 0 and there is no target process: this target registers no
+/// `akuma-exec` processes, so there is no namespace to render *through* and the
+/// global table is the whole answer. Both arguments become real in the step
+/// that gives this kernel processes; passing them explicitly here is what makes
+/// that a one-line change rather than a search.
 #[must_use]
 pub fn render_mounts(buf: &mut [u8]) -> usize {
-    use akuma_primitives::console::FmtBuf;
-    use core::fmt::Write as _;
-
-    let mut pos = 0usize;
-    let mut w = FmtBuf { buf, pos: &mut pos };
-    for_each_mount(|row| {
-        let opts = if row.flags & akuma_vfs::MS_RDONLY != 0 { "ro" } else { "rw" };
-        let _ = writeln!(
-            w,
-            "{} {} {} {},relatime 0 0",
-            row.source.unwrap_or("none"),
-            row.path,
-            row.fs_type,
-            opts
-        );
-    });
-    pos.min(buf.len())
+    akuma_vfs_glue::render_mounts(0, None, buf)
 }
 
-/// Read a whole file from the root filesystem.
+/// How many filesystems are mounted, counted the way `df` counts them: rows in
+/// `/proc/mounts`.
+///
+/// The mount table itself is `akuma-vfs-glue`'s private static and exposes no
+/// length, deliberately — every consumer wants the *visible* set, which is a
+/// function of the asking process's namespace rather than of the table. Reading
+/// the rendered rows asks the question the callers actually have and exercises
+/// the path `df` takes.
 #[must_use]
-pub fn read_file(path: &str) -> Option<Vec<u8>> {
-    with_fs(path, |fs, rel| fs.read_file(rel).ok())?
-}
-
-/// Write a whole file to the root filesystem, creating it if it does not
-/// exist. The first real write path on this target — `akuma-ext2`'s
-/// `write_file` (create-or-truncate-and-replace) was always here, unmodified
-/// and untouched since Stage N; nothing on amd64 called it before `fd`'s
-/// close-time flush (see that module's header for why the write is buffered
-/// in memory and only lands here once).
-///
-/// `false` covers "no filesystem mounted" and every `akuma-ext2` failure
-/// (most commonly: the parent directory does not exist — `write_file` does
-/// not create one, matching `open(2)`'s own contract).
-pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.write_file(rel, data)).unwrap_or(Err(FsError::NoFilesystem))
-}
-
-/// Create a directory. `mkdirat(2)`'s body — the parent must already exist,
-/// matching `akuma-ext2`'s (and `mkdir(2)`'s) own contract. First consumer:
-/// `apk`'s cache-directory setup.
-pub fn create_dir(path: &str) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.create_dir(rel)).unwrap_or(Err(FsError::NoFilesystem))
-}
-
-/// Remove a file (or, with `rmdir`, an empty directory). `unlinkat(2)`'s body.
-pub fn remove(path: &str, rmdir: bool) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| {
-        if rmdir {
-            fs.remove_dir(rel)
-        } else {
-            fs.remove_file(rel)
-        }
-    })
-    .unwrap_or(Err(FsError::NoFilesystem))
-}
-
-/// Rename (move) a path. `renameat(2)`'s body — the target is replaced if it
-/// exists, which is the atomic-tmpfile-swap shape `apk` names this syscall
-/// for. First consumer: `apk`'s `.tmp.<pid>` + rename cache write.
-pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
-    // Both paths must live on the same mount — a rename across filesystems is
-    // `EXDEV`, which is why `mv` falls back to copy-and-unlink. Resolving each
-    // separately and calling `rename` on the first would silently rename to a
-    // path relative to the wrong mount, so the second is resolved against the
-    // same table entry and refused when it lands elsewhere.
-    let guard = MOUNTS.lock();
-    let Some(table) = guard.as_ref() else {
-        return Err(FsError::NoFilesystem);
-    };
-    let Some((fs, old_rel)) = table.resolve(old_path) else {
-        return Err(FsError::NotFound);
-    };
-    let Some((new_fs, new_rel)) = table.resolve(new_path) else {
-        return Err(FsError::NotFound);
-    };
-    if !core::ptr::eq(fs, new_fs) {
-        return Err(FsError::NotSupported);
-    }
-    fs.rename(old_rel, new_rel)
-}
-
-/// Create a symlink. `symlinkat(2)`'s body. First consumer: `apk add` —
-/// package contents carry symlinks (`.so.1` versioned-library names), and
-/// every one of them failed with ENOSYS until this existed.
-pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
-    with_fs(link_path, |fs, rel| fs.create_symlink(rel, target))
-        .unwrap_or(Err(FsError::NoFilesystem))
-}
-
-/// Read a symlink's target. `readlink(2)`'s body.
-pub fn read_symlink(path: &str) -> Result<String, FsError> {
-    with_fs(path, |fs, rel| fs.read_symlink(rel)).unwrap_or(Err(FsError::NoFilesystem))
-}
-
-/// Set file timestamps. `utimensat(2)`'s body; `None` leaves a stamp alone
-/// (`UTIME_OMIT`), matching the VFS trait's contract. First consumer: `apk`'s
-/// "preserve owner mtime" pass over extracted files.
-pub fn set_times(path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.set_times(rel, atime_secs, mtime_secs))
-        .unwrap_or(Err(FsError::NoFilesystem))
-}
-
-/// Inode metadata for a path — the backing for the path-based `stat` syscalls.
-///
-/// `akuma-ext2`'s `type_perms` maps straight onto a Linux `st_mode`, so the
-/// caller gets the real file type and permission bits, not a fixed guess. The
-/// path walk does not follow symlinks (see [`sys_newfstatat`]'s note).
-///
-/// [`sys_newfstatat`]: crate::fd::sys_newfstatat
-#[must_use]
-pub fn metadata(path: &str) -> Option<Metadata> {
-    with_fs(path, |fs, rel| fs.metadata(rel).ok())?
-}
-
-/// List a directory's entries — the backing for `getdents64` (`ls`, `find`).
-///
-/// `akuma-ext2`'s `read_dir` already drops the synthetic `.`/`..` records (it
-/// filters them out of the raw directory block before returning), so this
-/// target's `getdents64` never has to invent them — the same shape the
-/// AArch64 kernel's `list_dir` hands its own `sys_getdents64`.
-///
-/// `None` covers both "no filesystem mounted" and "not a directory" — the
-/// caller (`fd::sys_getdents64`) only has one error to report either way.
-#[must_use]
-pub fn read_dir(path: &str) -> Option<Vec<DirEntry>> {
-    with_fs(path, |fs, rel| fs.read_dir(rel).ok())?
+pub fn mount_count() -> usize {
+    let mut buf = [0u8; 1024];
+    let n = render_mounts(&mut buf);
+    // Not `bytecount` (which clippy suggests): eight mounts is the table's
+    // ceiling, so this counts at most a few hundred bytes, once, at boot.
+    #[allow(clippy::naive_bytecount)]
+    buf[..n].iter().filter(|&&b| b == b'\n').count()
 }
 
 /// Mount, then prove the filesystem can be read.
@@ -428,33 +350,20 @@ pub fn smoke_test(t: &mut Suite, mounted: bool) {
     // inode table, the block groups and the directory-entry walk all agree — a
     // driver that could read a file by inode number but not resolve a name
     // would still fail here.
-    let names = with_fs("/", |fs, rel| {
-        fs.read_dir(rel).map(|entries| {
-            let mut has_bin = false;
-            let mut has_probe = false;
-            for e in &entries {
-                if e.name == "bin" {
-                    has_bin = true;
-                }
-                if e.name == "probe.txt" {
-                    has_probe = true;
-                }
-            }
-            (entries.len(), has_bin, has_probe)
-        })
-    });
-    let Some(Ok((n, has_bin, has_probe))) = names else {
+    let Ok(entries) = list_dir("/") else {
         t.check("fs: read_dir /", false);
         return;
     };
-    t.note("fs: entries in /", n as u64);
+    let has_bin = entries.iter().any(|e| e.name == "bin");
+    let has_probe = entries.iter().any(|e| e.name == "probe.txt");
+    t.note("fs: entries in /", entries.len() as u64);
     t.check("fs: / contains bin/", has_bin);
     t.check("fs: / contains probe.txt", has_probe);
 
     // A file with known contents, checked byte by byte. `mkdisk.sh` writes a
     // header line then 200 numbered lines; a short read or a wrong block would
     // survive a length check and fail this.
-    let Some(text) = read_file("/probe.txt") else {
+    let Ok(text) = read_file("/probe.txt") else {
         t.check("fs: read /probe.txt", false);
         return;
     };
@@ -474,16 +383,15 @@ pub fn smoke_test(t: &mut Suite, mounted: bool) {
 
     // A read at an offset, which is the operation the ELF loader will make.
     let mut mid = [0u8; 32];
-    let got =
-        with_fs("/probe.txt", |fs, rel| fs.read_at(rel, 23, &mut mid).ok()).flatten();
-    t.check_eq("fs: read_at returns the requested length", got.unwrap_or(0) as u64, 32);
+    let got = read_at("/probe.txt", 23, &mut mid).unwrap_or(0);
+    t.check_eq("fs: read_at returns the requested length", got as u64, 32);
     t.check(
         "fs: read_at lands at the right offset",
         mid.starts_with(b"line 000 padding"),
     );
 
     // The file the loader is about to run.
-    let Some(elf) = read_file("/bin/hello") else {
+    let Ok(elf) = read_file("/bin/hello") else {
         t.check("fs: read /bin/hello", false);
         return;
     };
@@ -492,12 +400,116 @@ pub fn smoke_test(t: &mut Suite, mounted: bool) {
     t.note("fs: /bin/hello size", elf.len() as u64);
 
     // A path that does not exist must fail rather than return something.
+    t.check("fs: a missing path is an error", read_file("/nope").is_err());
+
+    path_walk_smoke_test(t);
+    dev_smoke_test(t);
+    mount_table_smoke_test(t);
+}
+
+/// The path walk this target gained with `akuma-vfs-glue` (C1 step 4a).
+///
+/// The private mount table resolved whatever string it was handed. Every check
+/// here failed before the swap and none of them is a property of ext2 — they
+/// are the difference between a table lookup and a VFS, and each is something a
+/// shell produces without being asked: `cd ..`, a trailing slash from tab
+/// completion, `//` from string concatenation.
+fn path_walk_smoke_test(t: &mut Suite) {
+    // `..` and `.` collapse, so the same inode is reachable by more than one
+    // spelling. This is also the check that replaces the old
+    // "mount: / resolves a path unchanged": what mattered about that was that a
+    // `/` mount does not corrupt the path on its way through, and a walk that
+    // *rewrites* the path is a stronger version of the same question.
+    t.check("path: .. collapses", read_file("/bin/../probe.txt").is_ok());
+    t.check("path: . collapses", read_file("/./probe.txt").is_ok());
+    t.check("path: a repeated separator collapses", read_file("//probe.txt").is_ok());
+    // A trailing slash on a directory is legal and must not become a lookup of
+    // an empty final component. `busybox` produces these constantly.
+    t.check("path: a directory takes a trailing slash", list_dir("/bin/").is_ok());
+    // `..` at the root is the root, not an error and not an escape.
+    t.check("path: .. at the root stays at the root", read_file("/../probe.txt").is_ok());
+    // Interior symlinks. `resolve_symlinks` is what `apk`'s `.so.1` chains and
+    // every `/usr/bin -> bin` layout need; on an image with no symlink at all
+    // this is the identity, which is still the answer the caller wants.
     t.check(
-        "fs: a missing path is an error",
-        with_fs("/nope", |fs, rel| fs.read_file(rel).is_err()).unwrap_or(false),
+        "path: resolve_symlinks is the identity on a plain path",
+        resolve_symlinks("/probe.txt") == "/probe.txt",
     );
 
-    mount_table_smoke_test(t);
+    // A real link, made and removed here. `ln -s` worked on this target before
+    // the swap and `cat` through the link did not: `readlinkat` called
+    // `read_symlink` directly while `open` handed the link's own path to
+    // `read_file`, which is `NotAFile` on a link inode. Both halves are checked
+    // because the *first* is what already worked — a check that only proved the
+    // link exists would have passed against the bug.
+    //
+    // The image is rebuilt on every local run and lives in RAM on the
+    // bare-metal boot, but the USB root (`/dev/sda1`) persists, so the link is
+    // removed again below rather than left as debris that a later boot's
+    // `read_dir` count would trip over.
+    const LINK: &str = "/tmp/.selftest-link";
+    let _ = remove_file(LINK);
+    match create_symlink(LINK, "/probe.txt") {
+        Ok(()) => {
+            t.check("path: readlink reports the target", read_symlink(LINK).as_deref() == Some("/probe.txt"));
+            t.check(
+                "path: resolve_symlinks follows a real link",
+                resolve_symlinks(LINK) == "/probe.txt",
+            );
+            // The half that was broken: bytes through the link. `sys_openat`
+            // runs the same `resolve_symlinks` before it reads.
+            t.check(
+                "path: a link reads the target's bytes",
+                read_file(&resolve_symlinks(LINK))
+                    .is_ok_and(|b| b.starts_with(b"AKUMA/amd64 ext2 probe\n")),
+            );
+            t.check("path: the test link is removed again", remove_file(LINK).is_ok());
+        }
+        Err(_) => {
+            t.check("path: symlink creation succeeds", false);
+        }
+    }
+}
+
+/// The synthetic `/dev`, and exactly how far it goes.
+///
+/// `AKUMA_SELF_HOSTING_AMD64.md` open issue 2 is "`/dev` does not exist on this
+/// target at all". Half of it closes here: the nodes now *exist* — `ls` lists
+/// them and `stat` describes them — because that half is the VFS's and came
+/// with the crate. The other half, serving a device's **bytes** from `open(2)`,
+/// is `fd.rs`'s dispatch and is not wired, so the last check below asserts the
+/// failure rather than leaving it undiscovered. Delete that check in the change
+/// that wires `sys_openat`; if it starts failing on its own, something began
+/// answering and this comment is stale.
+fn dev_smoke_test(t: &mut Suite) {
+    let listed = akuma_vfs_glue::list_dir("/dev").unwrap_or_default();
+    let named = |n: &str| listed.iter().any(|e| e.name == n);
+    t.check("dev: /dev lists null", named("null"));
+    t.check("dev: /dev lists zero", named("zero"));
+    t.check("dev: /dev lists urandom", named("urandom"));
+    t.check("dev: /dev lists tty", named("tty"));
+
+    // `stat` agrees with `ls`, which is the drift `DEVFS_MISSING.md` was
+    // written about: on the AArch64 kernel these two answers came from
+    // different copy-pasted lists and disagreed for months.
+    match metadata("/dev/null") {
+        Ok(m) => {
+            t.check("dev: stat /dev/null is not a directory", !m.is_dir);
+            // `S_IFCHR | 0666`. A wrong file type here makes a shell treat the
+            // node as a regular file and try to truncate it.
+            t.check_eq("dev: stat /dev/null mode", u64::from(m.mode), 0o020_666);
+        }
+        Err(_) => {
+            t.check("dev: stat /dev/null succeeds", false);
+        }
+    }
+    t.check("dev: /dev itself stats as a directory", metadata("/dev").is_ok_and(|m| m.is_dir));
+
+    // The boundary, asserted so it cannot drift silently. Serving bytes is
+    // `sys_openat`'s job on both kernels — the device table is deliberately
+    // pure data (`akuma_vfs::dev`'s module header) — and this target has no
+    // such arm yet.
+    t.check("dev: reading a device node's bytes is still unwired", read_file("/dev/null").is_err());
 }
 
 /// The mount table, `/proc/mounts` and `statfs` — the three things that stopped
@@ -509,16 +521,6 @@ pub fn smoke_test(t: &mut Suite, mounted: bool) {
 /// vocabulary is wrong.
 fn mount_table_smoke_test(t: &mut Suite) {
     t.check_eq("mount: exactly one mount after boot", mount_count() as u64, 1);
-
-    // Resolution, at the root and one level down. `resolve` rewrites the path
-    // relative to the mount point, so a `/` mount must hand back the path
-    // unchanged — get that wrong and every open silently addresses the wrong
-    // name.
-    let root_rel = with_fs("/bin/hello", |_, rel| String::from(rel));
-    t.check(
-        "mount: / resolves a path unchanged",
-        root_rel.as_deref() == Some("/bin/hello"),
-    );
 
     // `/proc/mounts`, exactly as `busybox df` will read it.
     let mut buf = [0u8; 1024];
@@ -535,17 +537,33 @@ fn mount_table_smoke_test(t: &mut Suite) {
     // what `df` prints under `Filesystem`. `none` here means the mount was
     // recorded without one.
     t.check("mount: /proc/mounts names a source", !text.starts_with("none "));
+    // `/etc/mtab` is the same bytes through the file API — the shape `mount(8)`
+    // with no arguments reads, and a synthetic node rather than a file on the
+    // image. It arrived with the crate; nothing on this target rendered it.
+    t.check(
+        "mount: /etc/mtab renders the same rows",
+        read_file("/etc/mtab").is_ok_and(|rows| rows == buf[..n]),
+    );
 
     // `statfs`'s body. A filesystem reporting zero total blocks would give
     // `df` a 0-byte disk and a divide-by-zero Use%.
     match stats_for_path("/") {
-        Ok((name, stats, _)) => {
-            t.check("mount: statfs names the filesystem ext2", name == "ext2");
-            t.check("mount: statfs reports a non-empty filesystem", stats.total_blocks > 0);
-            t.check("mount: statfs block size is a power of two", stats.block_size.is_power_of_two());
-            t.check("mount: statfs free <= total", stats.free_blocks <= stats.total_blocks);
-            t.note("mount: total MiB", stats.total_bytes() / (1024 * 1024));
-            t.note("mount: free MiB", stats.free_bytes() / (1024 * 1024));
+        Ok(view) => {
+            t.check("mount: statfs names the filesystem ext2", view.fs_name == "ext2");
+            t.check("mount: statfs reports a non-empty filesystem", view.stats.total_blocks > 0);
+            t.check(
+                "mount: statfs block size is a power of two",
+                view.stats.block_size.is_power_of_two(),
+            );
+            t.check(
+                "mount: statfs free <= total",
+                view.stats.free_blocks <= view.stats.total_blocks,
+            );
+            // Mounted `flags = 0`, so the mount is writable and `f_flags` must
+            // not carry `ST_RDONLY` — the bit `with_fs_write` now refuses on.
+            t.check_eq("mount: statfs reports a writable mount", view.flags, 0);
+            t.note("mount: total MiB", view.stats.total_bytes() / (1024 * 1024));
+            t.note("mount: free MiB", view.stats.free_bytes() / (1024 * 1024));
         }
         Err(_) => {
             t.check("mount: statfs on / succeeds", false);

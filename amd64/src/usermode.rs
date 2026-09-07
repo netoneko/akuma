@@ -2866,7 +2866,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let Ok(path) = core::str::from_utf8(&path_bytes) else {
         return errno::EINVAL;
     };
-    let Some(image) = crate::fs::read_file(path) else {
+    let Ok(image) = crate::fs::read_file(path) else {
         return errno::ENOENT;
     };
 
@@ -3119,7 +3119,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         return errno::EINVAL;
     };
 
-    let Some(image) = crate::fs::read_file(path) else {
+    let Ok(image) = crate::fs::read_file(path) else {
         return errno::ENOENT;
     };
 
@@ -3536,7 +3536,7 @@ pub fn console_notify_test(t: &mut Suite) {
 pub fn busybox_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
-    if crate::fs::read_file("/bin/busybox").is_none() {
+    if crate::fs::read_file("/bin/busybox").is_err() {
         t.note("busybox: not on the disk; skipped", 0);
         return;
     }
@@ -3602,7 +3602,7 @@ pub fn busybox_test(t: &mut Suite) {
 pub fn execve_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
-    if crate::fs::read_file("/bin/busybox").is_none() || crate::fs::read_file("/bin/sh").is_none() {
+    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
         t.note("execve: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -3718,7 +3718,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
 /// filesystem**, not by trusting the shell's exit status: the pre-fix failure
 /// exited 0 and left an empty file, so a status check alone scores it green.
 pub fn redirect_test(t: &mut Suite) {
-    if crate::fs::read_file("/bin/busybox").is_none() || crate::fs::read_file("/bin/sh").is_none() {
+    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
         t.note("redirect: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -3731,10 +3731,10 @@ pub fn redirect_test(t: &mut Suite) {
     };
     t.check_eq("redirect: `echo … > file` exited 0", status, 0);
     let written = crate::fs::read_file("/tmp/redir.txt");
-    t.check("redirect: the redirected file exists", written.is_some());
+    t.check("redirect: the redirected file exists", written.is_ok());
     t.check(
         "redirect: the redirected bytes reached the file",
-        written.is_some_and(|d| d.windows(7).any(|w| w == b"REDIROK")),
+        written.is_ok_and(|d| d.windows(7).any(|w| w == b"REDIROK")),
     );
 
     // 2. `>>` — the same sequence with `O_APPEND`, which is a *different* open
@@ -3752,11 +3752,11 @@ pub fn redirect_test(t: &mut Suite) {
     let appended = crate::fs::read_file("/tmp/app.txt");
     t.check(
         "redirect: `>>` kept the first line",
-        appended.as_ref().is_some_and(|d| d.windows(3).any(|w| w == b"ONE")),
+        appended.as_ref().is_ok_and(|d| d.windows(3).any(|w| w == b"ONE")),
     );
     t.check(
         "redirect: `>>` added the second",
-        appended.as_ref().is_some_and(|d| d.windows(3).any(|w| w == b"TWO")),
+        appended.as_ref().is_ok_and(|d| d.windows(3).any(|w| w == b"TWO")),
     );
 
     // 3. `|` — `pipe(2)` plus a `dup2` on each side of a fork.
@@ -3821,7 +3821,7 @@ pub fn redirect_test(t: &mut Suite) {
 pub fn fork_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
-    if crate::fs::read_file("/bin/busybox").is_none() || crate::fs::read_file("/bin/sh").is_none() {
+    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
         t.note("fork: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -4389,7 +4389,7 @@ pub fn elf_test(t: &mut Suite) {
     // stage: the bytes came off a disk the kernel discovered, through a
     // filesystem it mounted, found by path — rather than out of its own `.rodata`.
     let from_disk = crate::fs::read_file("/bin/hello");
-    let image: &[u8] = if let Some(bytes) = from_disk.as_deref() {
+    let image: &[u8] = if let Ok(bytes) = from_disk.as_deref() {
         {
             // The embedded copy and the on-disk copy come from two different
             // build steps (`build.rs` into OUT_DIR, `mkdisk.sh` into the image).
@@ -4421,7 +4421,7 @@ pub fn elf_test(t: &mut Suite) {
         serial::puts("  elf:  no filesystem; loading the embedded image\n");
         HELLO_ELF
     };
-    t.check("elf: image came from the filesystem", from_disk.is_some());
+    t.check("elf: image came from the filesystem", from_disk.is_ok());
 
     let (proc, img) = match Process::from_elf(image) {
         Ok(p) => p,
@@ -4626,7 +4626,7 @@ pub fn fdprobe_test(t: &mut Suite) {
     /// what each one claims.
     const ALL_OK: u64 = 0xFFF;
 
-    let Some(image) = crate::fs::read_file("/bin/fdprobe") else {
+    let Ok(image) = crate::fs::read_file("/bin/fdprobe") else {
         t.note("fdprobe: not on the disk; skipped", 0);
         return;
     };
@@ -4715,7 +4715,7 @@ pub fn fdprobe_test(t: &mut Suite) {
 /// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
 /// `libakuma`.
 pub fn run_init(path: &str, args: &[&str]) -> bool {
-    let Some(image) = crate::fs::read_file(path) else {
+    let Ok(image) = crate::fs::read_file(path) else {
         serial::puts("  [init] not on the disk: ");
         serial::puts(path);
         serial::puts("\n");

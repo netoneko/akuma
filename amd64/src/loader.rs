@@ -605,7 +605,8 @@ pub fn load(
     };
 
     let interp_image =
-        crate::fs::read_file(interp_path).ok_or("PT_INTERP names a file that is not on the disk")?;
+        crate::fs::read_file(interp_path)
+            .map_err(|_| "PT_INTERP names a file that is not on the disk")?;
     let interp = place_image(&interp_image, space, frames, Some(INTERP_BASE))?;
     if interp.interp.is_some() {
         // An interpreter that names an interpreter is either a corrupt image or

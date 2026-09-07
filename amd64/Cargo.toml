@@ -86,9 +86,18 @@ akuma-ryzen-amd64 = { path = "../crates/akuma-ryzen-amd64" }
 # `BlockDevice` trait, which is exactly what `akuma-virtio` exposes — see
 # `src/fs.rs` for how short the adaptation is.
 akuma-ext2 = { path = "../crates/akuma-ext2" }
-# The `Filesystem` trait `Ext2Filesystem` implements. Only the trait is used;
-# there is no mount table yet.
+# The `Filesystem` trait `Ext2Filesystem` implements, plus `FsError`/`Metadata`
+# and the `MS_*` flag words a mount record carries.
 akuma-vfs = { path = "../crates/akuma-vfs" }
+# **C1 step 4a**: the kernel-side VFS *instance* — the global mount table, the
+# path walk (CWD, `..`, symlinks), the synthetic `/dev` and `/etc/mtab` nodes.
+# `src/fs.rs` carried its own `Spinlock<Option<MountTable>>` and a `with_fs`
+# that held that lock across disk I/O; the table is this crate's now, which is
+# the same instance `akuma-syscalls-glue::fs` resolves through — the
+# prerequisite for folding the VFS syscall arms
+# (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` § C1 step 4). Already in the link
+# graph through `akuma-syscalls-glue`; named here because this crate calls it.
+akuma-vfs-glue = { path = "../crates/akuma-vfs-glue" }
 spinning_top = "0.3"
 # The tree's tuning knobs, for `MMAP_EAGER_MAX_PAGES` — how many pages a mapping
 # may have before it is demand-paged instead of populated at `mmap` time. Read
@@ -114,10 +123,12 @@ akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
 # no scrollback. The ring is host-tested; what stays here is the lock.
 akuma-dmesg = { path = "../crates/akuma-dmesg" }
 # The `/proc/<pid>/{stat,status,cmdline}` byte formats, shared with the AArch64
-# kernel's `ProcFilesystem`. That filesystem cannot be reused here — it reaches
-# `akuma-exec`/`akuma-elf`, both written against `akuma-mmu` — but the formats
-# can, and the formats are where a divergence is invisible: `ps` finds `utime`
-# by counting to field 14 of a 44-field line.
+# kernel's `ProcFilesystem`. That filesystem *compiles* here since C1 step 4a
+# brought `akuma-vfs-glue` in, but it is not mounted: it renders from
+# `akuma-exec`'s process table and this target registers no processes there, so
+# mounting it would replace a working synthetic `/proc` with an empty machine.
+# The formats are shared either way, and the formats are where a divergence is
+# invisible: `ps` finds `utime` by counting to field 14 of a 44-field line.
 akuma-procfs = { path = "../crates/akuma-procfs" }
 # The per-process frame ledger — which physical frames a process holds and how
 # many VAs map each, with the two-counts rule and 14 host tests. Replaced this

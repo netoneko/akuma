@@ -134,6 +134,13 @@ pub fn install_shared_sinks() {
     // died at the first folded syscall (`AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`
     // §4).
     akuma_primitives::rng::set_rng_hook(crate::net::rng_fill_checked);
+    // The VFS instance: the global mount table plus the four facts
+    // `akuma-vfs-glue` cannot discover for itself. Before any mount, and on a
+    // `DISK=none` boot where there will never be one — the synthetic `/dev` and
+    // `/etc/mtab` nodes resolve against an empty table and still have to
+    // answer. Same reason as the two registrations above: one call site, both
+    // boot protocols. See `fs::init_vfs`.
+    crate::fs::init_vfs();
 }
 
 /// What the shared suite needs to know about the machine it is running on.

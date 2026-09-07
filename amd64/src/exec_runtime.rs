@@ -113,10 +113,15 @@ fn runtime() -> ExecRuntime {
         },
         is_memory_low: akuma_alloc::is_memory_low,
         print_str: crate::serial::puts,
-        // `fs::read_file` returns `Option`; the hook's error channel is an
-        // `i32` errno-ish code and `akuma-exec` only tests for `Err`.
-        read_file: |path| crate::fs::read_file(path).ok_or(-1),
-        file_size: |path| crate::fs::metadata(path).map(|m| m.size).ok_or("fs error"),
+        // Both discard *which* `FsError` the VFS reported: the hook's error
+        // channels are an `i32` errno-ish code and a `&'static str`, and
+        // `akuma-exec` only tests for `Err`.
+        read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
+        file_size: |path| {
+            crate::fs::metadata(path)
+                .map(|m| m.size)
+                .map_err(|_| "fs error")
+        },
         // This target resolves symlinks inside `fd.rs`'s path walk rather than
         // as a separate pass, so the honest answer for "the path with symlinks
         // resolved" is the path itself: every caller here hands the result

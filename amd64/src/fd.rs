@@ -743,6 +743,27 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     let Ok(normalised) = resolve_at(dirfd, path) else {
         return errno::ENOTDIR;
     };
+    // Follow symlinks, which `open(2)` does unless `O_NOFOLLOW` says otherwise
+    // and which this target could not do at all until `akuma-vfs-glue` arrived
+    // (C1 step 4a). `readlink` already worked — `readlinkat` calls
+    // `fs::read_symlink` directly — so the gap was one-sided and silent:
+    // `ln -s` created a link `readlink` could describe and `cat` reported
+    // `ENOENT` for, because `read_file` on the link inode is `NotAFile`.
+    //
+    // Deliberately here and not in `resolve_at`: that helper also serves
+    // `symlinkat`, `readlinkat` and `unlinkat`, and every one of those operates
+    // on the link itself. Following there would make `rm` delete the target.
+    //
+    // `O_NOFOLLOW` is honoured by skipping the walk rather than by failing with
+    // `ELOOP` on a link, which is the weaker half of the flag: this target has
+    // no `O_PATH` and nothing that opens a link to inspect it. Stated so the
+    // divergence is pinned rather than assumed absent.
+    const O_NOFOLLOW_X86: u64 = 0o400_000;
+    let normalised = if flags_ & O_NOFOLLOW_X86 == 0 {
+        fs::resolve_symlinks(&normalised)
+    } else {
+        normalised
+    };
     // `O_TMPFILE` (x86_64 encoding, `0o20200000`) is answered with `EINVAL`,
     // as Linux kernels without tmpfile support do. This used to be *missing*,
     // which repeated the aarch64 `APK_OTMPFILE_DIR_FD.md` bug bit for bit:
@@ -770,7 +791,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // Existing-directory check first: `O_CREAT` on a path that is already a
     // directory must fail, not silently start writing a same-named file.
     let creating = flags_ & u64::from(open_flags::O_CREAT) != 0;
-    if creating && fs::metadata(&normalised).is_some_and(|m| m.is_dir) {
+    if creating && fs::metadata(&normalised).is_ok_and(|m| m.is_dir) {
         return errno::EISDIR;
     }
 
@@ -783,7 +804,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // descriptor whose every meaningful write is a lie — the second half of
     // the `O_TMPFILE` lesson above, and the same guard the aarch64 kernel
     // shipped for it.
-    let is_dir = !creating && fs::metadata(&normalised).is_some_and(|m| m.is_dir);
+    let is_dir = !creating && fs::metadata(&normalised).is_ok_and(|m| m.is_dir);
     if is_dir && flags_ & u64::from(open_flags::O_ACCMODE) != 0 {
         return errno::EISDIR;
     }
@@ -802,11 +823,11 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         Vec::new()
     } else {
         match fs::read_file(&normalised) {
-            Some(d) => d,
+            Ok(d) => d,
             // A brand-new `O_CREAT` file: nothing to read, and that is not an
             // error. Without `O_CREAT` it is `ENOENT`.
-            None if creating => Vec::new(),
-            None => return errno::ENOENT,
+            Err(_) if creating => Vec::new(),
+            Err(_) => return errno::ENOENT,
         }
     };
     let start_pos = if appending { data.len() } else { 0 };
@@ -990,8 +1011,11 @@ pub fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> u64 {
     let Ok(path) = resolve_at(dirfd, raw) else {
         return errno::ENOTDIR;
     };
+    // `Option`, not `Result`: the crate reports "not a symlink" and "no such
+    // path" the same way, and `readlink(2)` distinguishes them as `EINVAL` vs
+    // `ENOENT`. Collapsing both to `ENOENT` is what this target already did.
     match fs::read_symlink(&path) {
-        Ok(target) => {
+        Some(target) => {
             let bytes = target.as_bytes();
             let n = (bytes.len() as u64).min(bufsiz);
             let r = copy_to_user(buf, &bytes[..n as usize]);
@@ -1000,7 +1024,7 @@ pub fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> u64 {
             }
             n
         }
-        Err(_) => errno::ENOENT,
+        None => errno::ENOENT,
     }
 }
 
@@ -1768,7 +1792,7 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
     let entries = if let Some(c) = cached {
         c
     } else {
-        let Some(dir_entries) = fs::read_dir(&path) else {
+        let Ok(dir_entries) = fs::list_dir(&path) else {
             return errno::ENOENT;
         };
         let cache: Vec<akuma_exec_core::process::DirCacheEntry> = dir_entries
@@ -1938,11 +1962,12 @@ const fn fs_magic(name_is_ext2: bool) -> i64 {
 /// re-declaration is exactly how the aarch64 side once shipped a 120 nothing
 /// could check.
 fn statfs_into(path: &str, buf: u64) -> u64 {
-    let (name, stats, flags) = match fs::stats_for_path(path) {
+    let view = match fs::stats_for_path(path) {
         Ok(v) => v,
         Err(akuma_vfs::FsError::NotFound) => return errno::ENOENT,
         Err(_) => return errno::ENOSYS,
     };
+    let (name, stats, flags) = (view.fs_name, view.stats, view.flags);
     let bs = i64::from(stats.block_size);
     // Saturating rather than `as`: `struct statfs` is signed and these are not,
     // and a wrapped block count would make `df` print a negative size instead
@@ -2070,7 +2095,7 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         return 0;
     }
 
-    let Some(meta) = fs::metadata(&normalised) else {
+    let Ok(meta) = fs::metadata(&normalised) else {
         return errno::ENOENT;
     };
     let st = encode_stat(
@@ -2369,7 +2394,7 @@ pub fn sys_access(path: u64) -> u64 {
     if let Some(rest) = proc_rest {
         return if proc_metadata(rest).is_some() { 0 } else { errno::ENOENT };
     }
-    if fs::metadata(&normalised).is_some() {
+    if fs::metadata(&normalised).is_ok() {
         0
     } else {
         errno::ENOENT
