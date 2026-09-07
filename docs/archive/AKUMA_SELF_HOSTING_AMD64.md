@@ -117,6 +117,41 @@ as they stand one day after the survey
 > x86_64 number is a wrong answer, not a compile error, and deciding that
 > vocabulary is C1 step 1.
 
+> **C1 steps 1 and 2 are DONE (2026-09-07, later still)** —
+> `docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`. The two syscall-number
+> vocabularies now meet in one place: `akuma-syscalls-abi::Syscall` went **36
+> variants to 80**, generated from a single `syscall_table!` row per call so the
+> enum, both decodes, both encodes and `ALL` cannot drift, and
+> `amd64/src/usermode.rs` decodes through it. **`akuma-syscalls-glue` was not
+> touched** — the AArch64 kernel's `.text`, `.rodata` and `.data` are proven
+> byte-identical against `HEAD`.
+>
+> The `cfg`-the-`nr`-table shape was rejected for a reason worth carrying:
+> **`cfg!(target_arch)` resolves to the *host* under `cargo test`**, so on an
+> x86_64 developer machine `nr::WRITE` would silently become `1` and every host
+> test of the AArch64 tables would be testing the other architecture.
+>
+> The dispatcher's two matches are now one neutral table (77 arms) plus a named
+> list of **21 x86-only legacy spellings** — `open`, `stat`, `poll`, `select`,
+> `fork`, `mkdir`, `arch_prctl`, `time` and friends — which have no asm-generic
+> number and must not be given invented ones. The set of numbers the kernel
+> answers is **identical**: 105 before, 105 after.
+>
+> **Caution 2 paid immediately.** Classifying the raw arms found that x86_64 88
+> is `symlink`, not the `futimens` its comment claimed — there is no `futimens`
+> syscall in Linux — so `ln -s` had been handing its link path to `utimensat` as
+> a `struct timespec[2]` pointer. `utimensat` returns 0 on that, so **`ln -s`
+> reported success and created nothing.** Fixed, and covered by a boot self-test
+> whose negative control confirms only the `readlink` round trip catches it: the
+> return value alone passes against the bug.
+>
+> Verified QEMU **413/0** (`SMP=1`, was 405) and **422/0** (`SMP=4`, was 414) —
+> +8 both, exactly the eight new checks — and Firecracker on the box **403/0**.
+> Host tests 1355 → **1359**. Bare metal not run: the change is a dispatch
+> table with no machine dependency, and the box was left on Ubuntu.
+>
+> Steps 3–6 (folding arms into glue, starting with the leaves) are unstarted.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate

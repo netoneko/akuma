@@ -113,6 +113,27 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `FileDescriptor::Socket` gate stay with each caller.
   Further families move out on the same model when a family has real
   pure logic worth testing.
+  `akuma-syscalls-abi` is the **vocabulary**: which syscall a number means, *on
+  which architecture*. `akuma-syscalls-linux::nr` is asm-generic/AArch64 and its
+  name says so; x86_64 has its own table, and `1` is `write` there and
+  `io_setup`-adjacent under asm-generic — the wrong *handler*, not a missing one.
+  Since 2026-09-07 the crate is **one `syscall_table!` row per call** (80 rows)
+  generating the enum, both decodes, both encodes and `ALL` together, so a
+  transposed digit can only be transposed once; the x86_64 number is a literal
+  and the aarch64 one is a **path into `akuma-syscalls-linux`**, which is what
+  stops the tables drifting. `amd64/src/usermode.rs` decodes through it and a
+  folded arm hands glue `to_aarch64()`; **glue's own `match syscall_num` is
+  untouched**, so the AArch64 `.text` stays byte-identical and the cost —
+  asm-generic numbers inside glue on an x86_64 kernel — is pinned rather than
+  hidden (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`). Two rules:
+  **never put x86_64 numbers in `nr`** (`cfg!(target_arch)` resolves to the
+  *host* under `cargo test`, so it would silently retarget every host test), and
+  **never invent an asm-generic number for an x86-only legacy spelling** —
+  `open`, `stat`, `poll`, `select`, `fork`, `mkdir`, `symlink`, `arch_prctl`,
+  `time` and 12 more have none, and stay as `AT_FDCWD` shims in `amd64/`. The
+  first pass over that list found x86_64 88 (`symlink`) dispatching to
+  `sys_utimensat`, which returns 0 — so `ln -s` reported success and created
+  nothing for months.
   `akuma-mmap` is virtual-memory **region bookkeeping**: `MmapRegion`,
   `PhysFrame`, CoW-fork inheritance, `munmap`'s clip-and-split, and the PTE
   permission vocabulary (`user_flags`, including `is_write`). Its

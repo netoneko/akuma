@@ -859,303 +859,112 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         };
     }
 
-    // Linux syscalls handled by raw x86_64 number rather than through the
-    // cross-architecture `Syscall` enum — either because they are x86-only
-    // (`arch_prctl`) or because their behaviour on a kernel with no users and no
-    // signals is a one-liner that does not earn an enum variant and four match
-    // arms. Where the AArch64 kernel does more (real signal masking, real
-    // credentials), that is noted at the site.
+    // The **x86-only legacy spellings**, and nothing else.
+    //
+    // Each of these numbers exists on x86_64 and has no `asm-generic` twin, so
+    // `akuma_syscalls_abi::Syscall` deliberately cannot name it (rule 2 in that
+    // crate's header): giving one an aarch64 number would mean inventing a fact
+    // about Linux. They are handled here, ahead of the neutral table, and every
+    // one of them narrows to a modern call the neutral table *does* name —
+    // usually by supplying the `AT_FDCWD` that the `*at` form wants.
+    //
+    // Not redundant with the `*at` arms below: musl issues whichever spelling
+    // the architecture has, and x86_64 has both, so which one arrives is a
+    // property of the *caller*. busybox `mkdir` uses 83 and got `ENOSYS` while
+    // `mkdirat` sat implemented and working — reported as `mkdir: can't create
+    // directory: Function not implemented`, which reads as a filesystem that
+    // cannot make directories rather than a dispatch table missing a number.
+    //
+    // **Adding an arm here is a claim that the call is x86-only.** Check
+    // `akuma_syscalls_abi`'s table first; if the call has an asm-generic number,
+    // it belongs in the `match call` below, where the AArch64 kernel's
+    // implementation can eventually serve it.
     match nr {
-        // x86_64 158: the TLS-base primitive. No aarch64 number.
+        // x86_64 158: the TLS-base primitive. No aarch64 number, and no
+        // equivalent either — `arch_prctl(ARCH_SET_FS)` is what `set_tpidr_el0`
+        // is on the other side, and that one is Akuma-private.
         158 => return sys_arch_prctl(a1, a2),
-        // `sysinfo(struct sysinfo *)` — x86_64 99. `busybox free`/`top` read
-        // total/free RAM from here, not from `/proc/meminfo`, and a missing one
-        // means `used = total - free - …` underflows to 18 quintillion.
-        99 => return sys_sysinfo(a1),
-        // `syslog(type, buf, len)` — x86_64 103 (`klogctl`). Backed by the
-        // console ring buffer in `serial.rs`, so `busybox dmesg` returns the
-        // kernel's own boot/diagnostic output over ssh — the only way to read
-        // it on the reference box, whose console is a write-only framebuffer.
-        103 => return sys_syslog(a1, a2, a3),
-        // `statfs(path, buf)` / `fstatfs(fd, buf)` — x86_64 137 / 138. `busybox
-        // df` reads `/proc/mounts` and then calls `statfs` once per line; with
-        // neither of them it printed a header and nothing else. Both report the
-        // mount that actually serves the path, out of `fs.rs`'s mount table,
-        // rather than one set of hardcoded numbers for the whole kernel.
-        137 => return crate::fd::sys_statfs(a1, a2),
-        138 => return crate::fd::sys_fstatfs(a1, a2),
-        // `reboot(magic1, magic2, cmd, arg)` — x86_64 169. The ABI decode is
-        // shared with the aarch64 kernel (`akuma-boot`); the x86 machine reset
-        // under it is `reboot.rs`. `busybox reboot`/`halt`/`poweroff` all land
-        // here.
-        169 => return crate::reboot::sys_reboot(a1, a2, a3, a4),
         // Path-based `struct stat`. `stat` (4) and `lstat` (6) are x86-only —
-        // `asm-generic` dropped them, so aarch64 has no number and they cannot
-        // go through the `Syscall` enum; `newfstatat` (262) exists on both but
-        // is grouped here with its siblings. `stat` follows a final symlink,
-        // `lstat` does not (`AT_SYMLINK_NOFOLLOW` == 0x100) — on this target
-        // that changes nothing (see `fd::sys_newfstatat`). `AT_FDCWD` is -100.
-        // busybox `sh` stats every PATH entry before it will run an applet —
-        // without this it saw `ENOSYS` and reported "Function not implemented"
-        // for a working builtin.
+        // `asm-generic` dropped them — and both narrow to `newfstatat`, which
+        // is in the neutral table. `stat` follows a final symlink, `lstat` does
+        // not (`AT_SYMLINK_NOFOLLOW` == 0x100); on this target that changes
+        // nothing (see `fd::sys_newfstatat`). `AT_FDCWD` is -100. busybox `sh`
+        // stats every PATH entry before it will run an applet — without this it
+        // saw `ENOSYS` and reported "Function not implemented" for a working
+        // builtin.
         4 => return crate::fd::sys_newfstatat(AT_FDCWD, a1, a2, 0),
         6 => return crate::fd::sys_newfstatat(AT_FDCWD, a1, a2, 0x100),
-        262 => return crate::fd::sys_newfstatat(a1, a2, a3, a4),
         // `open(path, flags, mode)` — x86_64 2. x86_64 musl issues this directly
         // (it only falls back to `openat` on architectures without `open`, like
         // aarch64), so `busybox cat` hit `ENOSYS` here until now. `openat`
         // ignores the dirfd for absolute paths and treats a relative one as
         // root-relative, which is what `AT_FDCWD` means on a target with no cwd.
-        2 => return crate::fd::sys_openat((-100i64) as u64, a1, a2, a3),
-        // `access`/`faccessat(dirfd, path, mode[, flags])` — existence only.
-        // This target has one user (root) and no per-file exec tracking worth
-        // trusting, so "the path resolves" is the honest answer; a real
-        // permission check would be a guess.
+        2 => return crate::fd::sys_openat(AT_FDCWD, a1, a2, a3),
+        // `access(path, mode)` — existence only. This target has one user (root)
+        // and no per-file exec tracking worth trusting, so "the path resolves"
+        // is the honest answer; a real permission check would be a guess. The
+        // `faccessat` spelling is in the neutral table and answers identically.
         21 => return crate::fd::sys_access(a1),
-        269 => return crate::fd::sys_access(a2),
-        // `poll(fds, nfds, timeout_ms)` — x86_64 7. An interactive `busybox sh`
-        // polls its stdin on every keystroke; `ENOSYS` here was a forever-loop
-        // of "sh: poll: Function not implemented".
+        // `poll(fds, nfds, timeout_ms)` — x86_64 7, narrowing to the same core
+        // `ppoll` uses. An interactive `busybox sh` polls its stdin on every
+        // keystroke; `ENOSYS` here was a forever-loop of "sh: poll: Function
+        // not implemented".
         7 => return crate::fd::sys_poll(a1, a2, a3),
         // `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23.
-        // `apk` waits for post-connect socket writability through this syscall;
-        // `ENOSYS` here wedged its TLS fetch mid-handshake (see `fd::sys_select`).
+        // asm-generic has only `pselect6`. `apk` waits for post-connect socket
+        // writability through this syscall; `ENOSYS` here wedged its TLS fetch
+        // mid-handshake (see `fd::sys_select`).
         23 => return crate::fd::sys_select(a1, a2, a3, a4, a5),
-        // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
-        // signature-verification I/O setup; `ENOSYS` here made it report
-        // `UNTRUSTED signature` over a fetch that was fine (see
-        // `fd::sys_dup`; the aarch64 twin is `APK_MISSING_SYSCALLS.md`).
-        32 => return crate::fd::sys_dup(a1),
-        // `pipe` (22) / `dup2` (33) / `dup3` (292) / `pipe2` (293) — the four
-        // that make a shell a shell. Every one of them was `ENOSYS` until
-        // 2026-09-06, which is why `cmd | cmd` reported *can't create pipe*
-        // and `echo x > file` left a zero-length file: a shell builds both out
-        // of `pipe` plus `dup2`, and neither existed. `mkdisk`'s busybox has
-        // been able to run pipelines all along; the kernel could not.
+        // `pipe` (22) and `dup2` (33) — the legacy halves of the four calls that
+        // make a shell a shell (`pipe2`/`dup3` are the neutral pair below).
+        // Every one of them was `ENOSYS` until 2026-09-06, which is why
+        // `cmd | cmd` reported *can't create pipe* and `echo x > file` left a
+        // zero-length file: a shell builds both out of `pipe` plus `dup2`, and
+        // neither existed.
         22 => return crate::fd::sys_pipe2(a1, 0),
         33 => return crate::fd::sys_dup2(a1, a2),
-        292 => return crate::fd::sys_dup3(a1, a2, a3),
-        293 => return crate::fd::sys_pipe2(a1, a2),
-        // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — `apk`'s
-        // cache write is a named `.tmp.<pid>` file plus a rename; without
-        // these the cache write fails and the index fetch is unusable (the
-        // aarch64 table in `APK_MISSING_SYSCALLS.md` lists all three).
-        258 => return crate::fd::sys_mkdirat(a1, a2, a3),
-        263 => return crate::fd::sys_unlinkat(a1, a2, a3),
-        264 => return crate::fd::sys_renameat(a1, a2, a3, a4),
-        // The **legacy, non-`at`** spellings of the same four — x86_64 82/83/
-        // 84/87 — as thin `AT_FDCWD` shims, exactly like `stat`/`lstat` above.
-        //
-        // Not redundant: musl issues whichever the architecture has, and
-        // x86_64 has both, so which one arrives is a property of the *caller*.
-        // busybox `mkdir` uses 83 and got `ENOSYS` while `mkdirat` sat
-        // implemented and working two lines up — reported as
-        // `mkdir: can't create directory: Function not implemented`, which
-        // reads as a filesystem that cannot make directories rather than a
-        // dispatch table missing a number. `rmdir` is `unlinkat` with
-        // `AT_REMOVEDIR` (0x200).
+        // The legacy, non-`at` path calls — x86_64 82/83/84/87/88/89 — as thin
+        // `AT_FDCWD` shims over the `*at` forms in the neutral table. `rmdir`
+        // (84) is `unlinkat` with `AT_REMOVEDIR` (0x200).
         82 => return crate::fd::sys_renameat(AT_FDCWD, a1, AT_FDCWD, a2),
         83 => return crate::fd::sys_mkdirat(AT_FDCWD, a1, a2),
         84 => return crate::fd::sys_unlinkat(AT_FDCWD, a1, 0x200),
         87 => return crate::fd::sys_unlinkat(AT_FDCWD, a1, 0),
-        // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
-        // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
-        // milliseconds (this target has no finer clock to honour anyway).
-        271 => {
-            let timeout_ms = if a3 == 0 {
-                (-1i64) as u64
-            } else {
-                // A user `struct timespec` { i64 tv_sec, i64 tv_nsec }.
-                let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(a3) else {
-                    return errno::EFAULT;
-                };
-                (sec.max(0) as u64)
-                    .saturating_mul(1000)
-                    .saturating_add((nsec.max(0) as u64) / 1_000_000)
-            };
-            return crate::fd::sys_poll(a1, a2, timeout_ms);
-        }
-        // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
-        // forked) task replaces its own image in place. See `sys_execve`.
-        59 => return sys_execve(a1, a2, a3),
+        // `symlink(target, linkpath)` — x86_64 88.
+        //
+        // **This arm used to call `sys_utimensat`.** Its comment read
+        // "`utimensat` (280) / `futimens` (88)", and there is no `futimens`
+        // syscall in Linux at all — libc implements it as `utimensat(fd, NULL,
+        // times, 0)`. x86_64 88 is `symlink`, sitting between `unlink` (87) and
+        // `readlink` (89), both of which are correct shims two lines up. So
+        // `ln -s` handed its *link path* to `utimensat` as a `struct
+        // timespec[2]` pointer. Found 2026-09-07 while widening
+        // `akuma-syscalls-abi` for C1 — exactly the wrong-answer-not-a-compile-
+        // error class that widening exists to prevent, one layer up from the
+        // aarch64/x86_64 crossing.
+        //
+        // `symlinkat(target, newdirfd, linkpath)` takes the dirfd *second*.
+        88 => return crate::fd::sys_symlinkat(a1, AT_FDCWD, a2),
+        // `readlink(path, buf, size)` — x86_64 89. Was a flat EINVAL while no
+        // symlink could exist; `symlinkat` made package symlinks real.
+        89 => return crate::fd::sys_readlinkat(AT_FDCWD, a1, a2, a3),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
-        // once the address space is copied). `clone` (56) is a fork only when
-        // `CLONE_VM` is clear; with it set it means threads, not done here.
+        // once the address space is copied). asm-generic has neither: `clone`
+        // with `CLONE_VM` clear is the only spelling there, and it is in the
+        // neutral table below.
         57 | 58 => return sys_fork(),
-        56 => {
-            // `CLONE_VM` is the fork/thread fork in the road, and the only one:
-            // with it the caller wants to share an address space
-            // (`crate::thread`), without it it wants a copy (`sys_fork`).
-            //
-            // x86_64's argument order is its own: `(flags, child_stack,
-            // parent_tid, child_tid, tls)` — `tls` **last**, after `child_tid`,
-            // where most architectures put it fourth.
-            if a1 & clone_flags::CLONE_VM != 0 {
-                return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
-            }
-            return sys_fork();
-        }
-        // `gettid` — x86_64 186. Its own tid for a thread, its pid for a main
-        // thread. Rust's `std` prints it in a panic message, which is how its
-        // absence announced itself: `thread 'main' (18446744073709551615)`.
-        186 => return u64::from(crate::thread::current_tid()),
-        // `futex` — x86_64 202. Six arguments, which is why `syscall_entry`
-        // now forwards `a6`.
-        202 => return crate::futex::sys_futex(a1, a2, a3, a4, a5, a6),
-        // `wait4(pid, wstatus, options, rusage)` — x86_64 61. Route into the
-        // Akuma-private `waitpid` table, but **block** (unless `WNOHANG`): a
-        // forked shell calls `wait4(pid, &st, 0, 0)` expecting to sleep until
-        // the child is done, where `sys_waitpid` alone just returns 0.
-        61 => {
-            const WNOHANG: u64 = 0x0000_0001;
-            let me = crate::sched::current_task();
-            loop {
-                // Arm, then join the waiter set, then ask. Both steps go before
-                // the question for the same reason: a child that exits between
-                // the answer and the park must leave something behind, and
-                // `wait4_wake_all` reaching an armed, registered task is that
-                // something. Registering *after* asking would reopen the window
-                // this ordering exists to close.
-                wait4_register(me);
-                // 0 = a matching child exists but has not exited; anything else
-                // is a reaped pid or `-ESRCH`.
-                let r = sys_waitpid(a1, a2, a3);
-                if r != 0 || a3 & WNOHANG != 0 {
-                    wait4_unregister(me);
-                    return r;
-                }
-                crate::sched::block_current();
-                wait4_unregister(me);
-            }
-        }
-        // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
-        // string aside — see `akuma_syscalls_glue::proc::sys_uname`.
-        63 => return sys_uname(a1),
-        // Credentials. One user, uid 0 — the same answer `src/syscall` gives.
-        102 | 104 | 107 | 108 => return 0, // get{uid,gid,euid,egid}
-        105 | 106 => return 0,             // set{uid,gid}: already root, accept
-        // Signals: this kernel has none, so "the mask is empty and stays empty"
-        // is the correct result, not a stub. `rt_sigprocmask` writes the old
-        // (empty) set back if asked.
-        13 => return 0, // rt_sigaction
-        14 => {
-            if a3 != 0 {
-                let n = (a4 as usize).min(8);
-                // The old set, empty, into a user `sigset_t` bounded by sigsetsize.
-                // This was the last raw user write in the kernel; SMAP found it
-                // (`memset` → `#PF err=3` at a user stack address) the first boot
-                // it was on.
-                if !crate::uaccess::write_bytes(a3, &[0u8; 8][..n]) {
-                    return errno::EFAULT;
-                }
-            }
-            return 0;
-        }
-        // Best-effort robustness/rlimit hooks musl pokes on startup.
-        273 => return 0,          // set_robust_list
-        302 => return 0,          // prlimit64
-        // `readlink` (89) / `readlinkat` (267). Was a flat EINVAL while no
-        // symlink could exist; `symlinkat` (below) made package symlinks real.
-        89 => return crate::fd::sys_readlinkat((-100i64) as u64, a1, a2, a3),
-        267 => return crate::fd::sys_readlinkat(a1, a2, a3, a4),
-        // `symlinkat(target, newdirfd, link_path)` — x86_64 266. Package
-        // contents are full of `.so.1` versioned-library symlinks; ENOSYS
-        // here turned each into a counted `apk add` error.
-        266 => return crate::fd::sys_symlinkat(a1, a2, a3),
-        // `utimensat` (280) / `futimens` (88) — timestamp preservation for
-        // `apk add`'s post-extract pass. NULL times = both set to now.
-        280 => return crate::fd::sys_utimensat(a1, a2, a3, a4),
-        88 => return crate::fd::sys_utimensat((-100i64) as u64, a1, a2, 0),
-        // Process-group / session ids. One process, so it is its own group and
-        // session leader; `setpgid`/`setsid` accept and report id 1.
-        110 => return 1,                  // getppid
-        111 | 121 | 124 => return 1,      // getpgrp / getpgid / getsid
-        109 | 112 => return 0,            // setpgid / setsid
-        // `getcwd(buf, size)` — this target has no per-process cwd; it is always
-        // root. Linux returns the length *including* the NUL.
-        79 => {
-            if a1 == 0 || a2 < 2 {
-                return errno::EINVAL;
-            }
-            // A user buffer of at least `a2` bytes, `a2 >= 2` checked.
-            if !crate::uaccess::write_bytes(a1, b"/\0") {
-                return errno::EFAULT;
-            }
-            return 2;
-        }
-        // `mprotect` — real since the region table landed (2026-09-07). It
-        // splits the regions the range crosses and re-permissions the pages
-        // that are present; see `mm::sys_mprotect` for why it was `return 0`
-        // for so long and what that cost.
-        10 => return crate::mm::sys_mprotect(a1, a2, a3),
-        // `flock(fd, op)` — x86_64 73. One user, one process at a time on
-        // this target (no fork-based package-manager concurrency exists to
-        // race against), so there is nothing an advisory lock could actually
-        // protect — accept and do nothing, the same stance `mprotect` above
-        // takes. Without this, `apk`'s database lock (`flock` on
-        // `/lib/apk/db/lock`) came back `ENOSYS` and it treated that as fatal:
-        // `apk update` printed "Unable to lock database: Function not
-        // implemented" and exited before ever reaching the network.
-        73 => return 0,
-        // `sendmsg`/`recvmsg` — x86_64 46/47. musl's DNS resolver on this
-        // build uses these, not `sendto`/`recvfrom`; without them `poll`
-        // correctly reported a UDP reply readable and `recvmsg` came back
-        // `ENOSYS`, so `apk`'s own name resolution spun forever. See
-        // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
-        46 => return crate::sock::sys_sendmsg(a1, a2, a3),
-        47 => return crate::sock::sys_recvmsg(a1, a2, a3),
-        // `clock_gettime(clockid, *timespec)` — x86_64 228. `CLOCK_REALTIME`
-        // (0) reads `clock::now_us()` — `0` until `clock::sync_via_sntp`
-        // succeeds, exactly the "every real TLS certificate looks not-yet-
-        // valid" bug this syscall existing at all closes
-        // (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.5/§3.30).
-        // `CLOCK_MONOTONIC` (1) and anything else read `net::uptime_us`
-        // instead: always available with no SNTP dependency, which is all a
-        // monotonic clock ever promised (an arbitrary epoch, not the Unix
-        // one) — busybox `sh`'s own `poll` timeout math and similar callers
-        // that just want *a* moving clock get one either way.
-        228 => {
-            const CLOCK_REALTIME: u64 = 0;
-            let us = if a1 == CLOCK_REALTIME { crate::clock::now_us() } else { crate::net::uptime_us() };
-            // A user `struct timespec { i64 tv_sec, i64 tv_nsec }`.
-            let ts = [(us / 1_000_000).cast_signed(), ((us % 1_000_000) * 1000).cast_signed()];
-            if !crate::uaccess::write_val(a2, ts) {
-                return errno::EFAULT;
-            }
-            return 0;
-        }
-        // The write side of the clock — x86_64 227 `clock_settime`, 164
-        // `settimeofday`, 159 `adjtimex`.
-        //
-        // This is how the machine gets a usable time when the kernel's own
-        // SNTP does not manage it: `busybox ntpd -q` fetches the time and
-        // steps the clock through these. Without them it fetches correctly and
-        // then fails to apply the answer, which looks exactly like a network
-        // problem and is not.
+        // `getpgrp()` — x86_64 111, x86-only; asm-generic callers use
+        // `getpgid(0)`. One process, so it is its own group leader.
+        111 => return 1,
+        // The x86-only halves of the clock. `clock_settime` (227) and
+        // `adjtimex` (159) are in the neutral table; these two are not, and
+        // `busybox ntpd -q` reaches for whichever musl offers.
         //
         // Why it matters beyond `date` being wrong: at the epoch **every TLS
         // certificate on earth is not-yet-valid**, and `apk` reports that as
         // `server certificate not trusted` — sending you to look at the CA
         // bundle, which is fine.
-        227 => {
-            const CLOCK_REALTIME: u64 = 0;
-            if a1 != CLOCK_REALTIME {
-                return errno::EINVAL;
-            }
-            let Some(ts) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timespec>(a2)
-            else {
-                return errno::EFAULT;
-            };
-            if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-                return errno::EINVAL;
-            }
-            crate::clock::set_unix_us(
-                (ts.tv_sec.cast_unsigned()).saturating_mul(1_000_000)
-                    + (ts.tv_nsec.cast_unsigned() / 1000),
-            );
-            return 0;
-        }
         164 => {
             // `settimeofday(tv, tz)`. `tz` is ignored: it has been meaningless
             // since the 1980s and Linux itself does nothing useful with it.
@@ -1173,42 +982,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 (tv.tv_sec.cast_unsigned()).saturating_mul(1_000_000) + tv.tv_usec.cast_unsigned(),
             );
             return 0;
-        }
-        159 => {
-            // `adjtimex(buf)`. This target has no frequency discipline — the
-            // tick comes from a PIT-calibrated LAPIC and nothing slews it — so
-            // the honest implementation reports the current time and an
-            // otherwise zeroed state, and accepts a step through `ADJ_SETOFFSET`
-            // because that is a real capability here.
-            //
-            // Returning `ENOSYS` instead is what makes `ntpd` give up before it
-            // ever sends a packet: it probes the clock's state on startup.
-            const ADJ_SETOFFSET: u32 = 0x0100;
-            const TIME_OK: u64 = 0;
-            let Some(mut tx) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timex>(a1)
-            else {
-                return errno::EFAULT;
-            };
-            if tx.modes & ADJ_SETOFFSET != 0 {
-                let now = crate::clock::now_us();
-                let delta = tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec);
-                let stepped = now.cast_signed().saturating_add(delta).max(0);
-                crate::clock::set_unix_us(stepped.cast_unsigned());
-            }
-            let now = crate::clock::now_us();
-            tx = akuma_syscalls_linux::time::Timex {
-                time_sec: (now / 1_000_000).cast_signed(),
-                time_usec: (now % 1_000_000).cast_signed(),
-                // A tick of exactly `US_PER_TICK_TARGET`: it is what the
-                // calibration makes true, and reporting the Linux default of
-                // 10000 by accident would be right only by coincidence.
-                tick: i64::from(crate::lapic::US_PER_TICK_TARGET),
-                ..akuma_syscalls_linux::time::Timex::default()
-            };
-            if !crate::uaccess::write_val(a1, tx) {
-                return errno::EFAULT;
-            }
-            return TIME_OK;
         }
         // `gettimeofday(*timeval, *timezone)` — x86_64 96. `timezone` (a2)
         // is always NULL from every real caller and is not consulted.
@@ -1235,6 +1008,15 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         _ => {}
     }
 
+    // Everything else goes through `akuma_syscalls_abi::Syscall` — the
+    // architecture-neutral name, decoded from the x86_64 number here and
+    // encodable back to the asm-generic one `akuma-syscalls-glue` dispatches on.
+    //
+    // That second half is the point: C1 folds these arms into glue one at a
+    // time (`proposals/NEXT_AGENT_AMD64_C1_USERMODE_FOLD.md`), and glue's table
+    // is asm-generic. Handing it `1` meaning `write` would find the *wrong*
+    // handler rather than none — so the vocabulary hop happens once, here,
+    // through a table whose two halves are round-trip tested against each other.
     let Some(call) = Syscall::from_x86_64(nr) else {
         return errno::ENOSYS;
     };
@@ -1387,6 +1169,272 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // syscall stack would clobber each other's saved frame here.
             crate::sched::yield_now();
             0
+        }
+        // `sysinfo(struct sysinfo *)` — x86_64 99. `busybox free`/`top` read
+        // total/free RAM from here, not from `/proc/meminfo`, and a missing one
+        // means `used = total - free - …` underflows to 18 quintillion.
+        Syscall::Sysinfo => sys_sysinfo(a1),
+        // `syslog(type, buf, len)` — x86_64 103 (`klogctl`). Backed by the
+        // console ring buffer in `serial.rs`, so `busybox dmesg` returns the
+        // kernel's own boot/diagnostic output over ssh — the only way to read
+        // it on the reference box, whose console is a write-only framebuffer.
+        Syscall::Syslog => sys_syslog(a1, a2, a3),
+        // `statfs(path, buf)` / `fstatfs(fd, buf)` — x86_64 137 / 138. `busybox
+        // df` reads `/proc/mounts` and then calls `statfs` once per line; with
+        // neither of them it printed a header and nothing else. Both report the
+        // mount that actually serves the path, out of `fs.rs`'s mount table,
+        // rather than one set of hardcoded numbers for the whole kernel.
+        Syscall::Statfs => crate::fd::sys_statfs(a1, a2),
+        Syscall::Fstatfs => crate::fd::sys_fstatfs(a1, a2),
+        // `reboot(magic1, magic2, cmd, arg)` — x86_64 169. The ABI decode is
+        // shared with the aarch64 kernel (`akuma-boot`); the x86 machine reset
+        // under it is `reboot.rs`. `busybox reboot`/`halt`/`poweroff` all land
+        // here.
+        Syscall::Reboot => crate::reboot::sys_reboot(a1, a2, a3, a4),
+        Syscall::Newfstatat => crate::fd::sys_newfstatat(a1, a2, a3, a4),
+        Syscall::Faccessat => crate::fd::sys_access(a2),
+        // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
+        // signature-verification I/O setup; `ENOSYS` here made it report
+        // `UNTRUSTED signature` over a fetch that was fine (see
+        // `fd::sys_dup`; the aarch64 twin is `APK_MISSING_SYSCALLS.md`).
+        Syscall::Dup => crate::fd::sys_dup(a1),
+        Syscall::Dup3 => crate::fd::sys_dup3(a1, a2, a3),
+        Syscall::Pipe2 => crate::fd::sys_pipe2(a1, a2),
+        // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — `apk`'s
+        // cache write is a named `.tmp.<pid>` file plus a rename; without
+        // these the cache write fails and the index fetch is unusable (the
+        // aarch64 table in `APK_MISSING_SYSCALLS.md` lists all three).
+        Syscall::Mkdirat => crate::fd::sys_mkdirat(a1, a2, a3),
+        Syscall::Unlinkat => crate::fd::sys_unlinkat(a1, a2, a3),
+        Syscall::Renameat => crate::fd::sys_renameat(a1, a2, a3, a4),
+        // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
+        // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
+        // milliseconds (this target has no finer clock to honour anyway).
+        Syscall::Ppoll => {
+            let timeout_ms = if a3 == 0 {
+                (-1i64) as u64
+            } else {
+                // A user `struct timespec` { i64 tv_sec, i64 tv_nsec }.
+                let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(a3) else {
+                    return errno::EFAULT;
+                };
+                (sec.max(0) as u64)
+                    .saturating_mul(1000)
+                    .saturating_add((nsec.max(0) as u64) / 1_000_000)
+            };
+            crate::fd::sys_poll(a1, a2, timeout_ms)
+        }
+        // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
+        // forked) task replaces its own image in place. See `sys_execve`.
+        Syscall::Execve => sys_execve(a1, a2, a3),
+        Syscall::Clone => {
+            // `CLONE_VM` is the fork/thread fork in the road, and the only one:
+            // with it the caller wants to share an address space
+            // (`crate::thread`), without it it wants a copy (`sys_fork`).
+            //
+            // x86_64's argument order is its own: `(flags, child_stack,
+            // parent_tid, child_tid, tls)` — `tls` **last**, after `child_tid`,
+            // where most architectures put it fourth.
+            if a1 & clone_flags::CLONE_VM != 0 {
+                return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
+            }
+            sys_fork()
+        }
+        // `gettid` — x86_64 186. Its own tid for a thread, its pid for a main
+        // thread. Rust's `std` prints it in a panic message, which is how its
+        // absence announced itself: `thread 'main' (18446744073709551615)`.
+        Syscall::Gettid => u64::from(crate::thread::current_tid()),
+        // `futex` — x86_64 202. Six arguments, which is why `syscall_entry`
+        // now forwards `a6`.
+        Syscall::Futex => crate::futex::sys_futex(a1, a2, a3, a4, a5, a6),
+        // `wait4(pid, wstatus, options, rusage)` — x86_64 61. Route into the
+        // Akuma-private `waitpid` table, but **block** (unless `WNOHANG`): a
+        // forked shell calls `wait4(pid, &st, 0, 0)` expecting to sleep until
+        // the child is done, where `sys_waitpid` alone just returns 0.
+        Syscall::Wait4 => {
+            const WNOHANG: u64 = 0x0000_0001;
+            let me = crate::sched::current_task();
+            loop {
+                // Arm, then join the waiter set, then ask. Both steps go before
+                // the question for the same reason: a child that exits between
+                // the answer and the park must leave something behind, and
+                // `wait4_wake_all` reaching an armed, registered task is that
+                // something. Registering *after* asking would reopen the window
+                // this ordering exists to close.
+                wait4_register(me);
+                // 0 = a matching child exists but has not exited; anything else
+                // is a reaped pid or `-ESRCH`.
+                let r = sys_waitpid(a1, a2, a3);
+                if r != 0 || a3 & WNOHANG != 0 {
+                    wait4_unregister(me);
+                    return r;
+                }
+                crate::sched::block_current();
+                wait4_unregister(me);
+            }
+        }
+        // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
+        // string aside — see `akuma_syscalls_glue::proc::sys_uname`.
+        Syscall::Uname => sys_uname(a1),
+        // Credentials. One user, uid 0 — the same answer `src/syscall` gives.
+        Syscall::Getuid | Syscall::Getgid | Syscall::Geteuid | Syscall::Getegid => 0, // get{uid,gid,euid,egid}
+        Syscall::Setuid | Syscall::Setgid => 0,             // set{uid,gid}: already root, accept
+        // Signals: this kernel has none, so "the mask is empty and stays empty"
+        // is the correct result, not a stub. `rt_sigprocmask` writes the old
+        // (empty) set back if asked.
+        Syscall::RtSigaction => 0, // rt_sigaction
+        Syscall::RtSigprocmask => {
+            if a3 != 0 {
+                let n = (a4 as usize).min(8);
+                // The old set, empty, into a user `sigset_t` bounded by sigsetsize.
+                // This was the last raw user write in the kernel; SMAP found it
+                // (`memset` → `#PF err=3` at a user stack address) the first boot
+                // it was on.
+                if !crate::uaccess::write_bytes(a3, &[0u8; 8][..n]) {
+                    return errno::EFAULT;
+                }
+            }
+            0
+        }
+        // Best-effort robustness/rlimit hooks musl pokes on startup.
+        Syscall::SetRobustList => 0,          // set_robust_list
+        Syscall::Prlimit64 => 0,          // prlimit64
+        Syscall::Readlinkat => crate::fd::sys_readlinkat(a1, a2, a3, a4),
+        // `symlinkat(target, newdirfd, link_path)` — x86_64 266. Package
+        // contents are full of `.so.1` versioned-library symlinks; ENOSYS
+        // here turned each into a counted `apk add` error.
+        Syscall::Symlinkat => crate::fd::sys_symlinkat(a1, a2, a3),
+        // `utimensat(dirfd, path, times, flags)` — timestamp preservation for
+        // `apk add`'s post-extract pass. NULL times = both set to now. There is
+        // no `futimens` syscall to pair it with — libc spells that
+        // `utimensat(fd, NULL, times, 0)` — which is what the x86_64 88 arm
+        // above used to be mistaken for.
+        Syscall::Utimensat => crate::fd::sys_utimensat(a1, a2, a3, a4),
+        // Process-group / session ids. One process, so it is its own group and
+        // session leader; `setpgid`/`setsid` accept and report id 1.
+        Syscall::Getppid => 1,
+        Syscall::Getpgid | Syscall::Getsid => 1,
+        // `setpgid`/`setsid` accept and report id 1.
+        Syscall::Setpgid | Syscall::Setsid => 0,
+        // `getcwd(buf, size)` — this target has no per-process cwd; it is always
+        // root. Linux returns the length *including* the NUL.
+        Syscall::Getcwd => {
+            if a1 == 0 || a2 < 2 {
+                return errno::EINVAL;
+            }
+            // A user buffer of at least `a2` bytes, `a2 >= 2` checked.
+            if !crate::uaccess::write_bytes(a1, b"/\0") {
+                return errno::EFAULT;
+            }
+            2
+        }
+        // `mprotect` — real since the region table landed (2026-09-07). It
+        // splits the regions the range crosses and re-permissions the pages
+        // that are present; see `mm::sys_mprotect` for why it was `return 0`
+        // for so long and what that cost.
+        Syscall::Mprotect => crate::mm::sys_mprotect(a1, a2, a3),
+        // `flock(fd, op)` — x86_64 73. One user, one process at a time on
+        // this target (no fork-based package-manager concurrency exists to
+        // race against), so there is nothing an advisory lock could actually
+        // protect — accept and do nothing, the same stance `mprotect` above
+        // takes. Without this, `apk`'s database lock (`flock` on
+        // `/lib/apk/db/lock`) came back `ENOSYS` and it treated that as fatal:
+        // `apk update` printed "Unable to lock database: Function not
+        // implemented" and exited before ever reaching the network.
+        Syscall::Flock => 0,
+        // `sendmsg`/`recvmsg` — x86_64 46/47. musl's DNS resolver on this
+        // build uses these, not `sendto`/`recvfrom`; without them `poll`
+        // correctly reported a UDP reply readable and `recvmsg` came back
+        // `ENOSYS`, so `apk`'s own name resolution spun forever. See
+        // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
+        Syscall::Sendmsg => crate::sock::sys_sendmsg(a1, a2, a3),
+        Syscall::Recvmsg => crate::sock::sys_recvmsg(a1, a2, a3),
+        // `clock_gettime(clockid, *timespec)` — x86_64 228. `CLOCK_REALTIME`
+        // (0) reads `clock::now_us()` — `0` until `clock::sync_via_sntp`
+        // succeeds, exactly the "every real TLS certificate looks not-yet-
+        // valid" bug this syscall existing at all closes
+        // (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.5/§3.30).
+        // `CLOCK_MONOTONIC` (1) and anything else read `net::uptime_us`
+        // instead: always available with no SNTP dependency, which is all a
+        // monotonic clock ever promised (an arbitrary epoch, not the Unix
+        // one) — busybox `sh`'s own `poll` timeout math and similar callers
+        // that just want *a* moving clock get one either way.
+        Syscall::ClockGettime => {
+            const CLOCK_REALTIME: u64 = 0;
+            let us = if a1 == CLOCK_REALTIME { crate::clock::now_us() } else { crate::net::uptime_us() };
+            // A user `struct timespec { i64 tv_sec, i64 tv_nsec }`.
+            let ts = [(us / 1_000_000).cast_signed(), ((us % 1_000_000) * 1000).cast_signed()];
+            if !crate::uaccess::write_val(a2, ts) {
+                return errno::EFAULT;
+            }
+            0
+        }
+        // The write side of the clock — x86_64 227 `clock_settime`, 164
+        // `settimeofday`, 159 `adjtimex`.
+        //
+        // This is how the machine gets a usable time when the kernel's own
+        // SNTP does not manage it: `busybox ntpd -q` fetches the time and
+        // steps the clock through these. Without them it fetches correctly and
+        // then fails to apply the answer, which looks exactly like a network
+        // problem and is not.
+        //
+        // Why it matters beyond `date` being wrong: at the epoch **every TLS
+        // certificate on earth is not-yet-valid**, and `apk` reports that as
+        // `server certificate not trusted` — sending you to look at the CA
+        // bundle, which is fine.
+        Syscall::ClockSettime => {
+            const CLOCK_REALTIME: u64 = 0;
+            if a1 != CLOCK_REALTIME {
+                return errno::EINVAL;
+            }
+            let Some(ts) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timespec>(a2)
+            else {
+                return errno::EFAULT;
+            };
+            if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+                return errno::EINVAL;
+            }
+            crate::clock::set_unix_us(
+                (ts.tv_sec.cast_unsigned()).saturating_mul(1_000_000)
+                    + (ts.tv_nsec.cast_unsigned() / 1000),
+            );
+            0
+        }
+        Syscall::Adjtimex => {
+            // `adjtimex(buf)`. This target has no frequency discipline — the
+            // tick comes from a PIT-calibrated LAPIC and nothing slews it — so
+            // the honest implementation reports the current time and an
+            // otherwise zeroed state, and accepts a step through `ADJ_SETOFFSET`
+            // because that is a real capability here.
+            //
+            // Returning `ENOSYS` instead is what makes `ntpd` give up before it
+            // ever sends a packet: it probes the clock's state on startup.
+            const ADJ_SETOFFSET: u32 = 0x0100;
+            const TIME_OK: u64 = 0;
+            let Some(mut tx) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timex>(a1)
+            else {
+                return errno::EFAULT;
+            };
+            if tx.modes & ADJ_SETOFFSET != 0 {
+                let now = crate::clock::now_us();
+                let delta = tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec);
+                let stepped = now.cast_signed().saturating_add(delta).max(0);
+                crate::clock::set_unix_us(stepped.cast_unsigned());
+            }
+            let now = crate::clock::now_us();
+            tx = akuma_syscalls_linux::time::Timex {
+                time_sec: (now / 1_000_000).cast_signed(),
+                time_usec: (now % 1_000_000).cast_signed(),
+                // A tick of exactly `US_PER_TICK_TARGET`: it is what the
+                // calibration makes true, and reporting the Linux default of
+                // 10000 by accident would be right only by coincidence.
+                tick: i64::from(crate::lapic::US_PER_TICK_TARGET),
+                ..akuma_syscalls_linux::time::Timex::default()
+            };
+            if !crate::uaccess::write_val(a1, tx) {
+                return errno::EFAULT;
+            }
+            TIME_OK
         }
         _ => errno::ENOSYS,
     }
@@ -3804,6 +3852,76 @@ pub fn fork_test(t: &mut Suite) {
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );
+}
+
+/// The dispatch **vocabulary**: two tables that must stay disjoint, and the
+/// number hop that must keep happening.
+///
+/// Added 2026-09-07 with C1 step 2, which split one 98-arm dispatcher into an
+/// x86-only legacy list and the architecture-neutral `Syscall` table. Both
+/// failures this guards against are silent:
+///
+/// - **A number in both tables.** Whichever match runs first wins, and which
+///   one that is becomes an accident of ordering rather than a decision.
+/// - **The two ABIs agreeing.** `akuma-syscalls-glue` dispatches on
+///   asm-generic numbers; this kernel is handed x86_64 ones. If `to_aarch64`
+///   ever starts returning the number that came in, the fold is feeding an
+///   x86_64 number to an asm-generic `match` — the wrong handler, not none.
+///
+/// The `symlink` case at the end is the concrete bug this test was written
+/// after: x86_64 88 dispatched to `sys_utimensat` for months because a comment
+/// called it `futimens`, which is not a syscall at all. `utimensat` on those
+/// arguments returns 0 and creates nothing, so only reading the link back tells
+/// the two apart — which is exactly why it went unnoticed.
+pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
+    // Every number the legacy `match nr` above claims to own. Each must be
+    // x86-only; a number that also decodes through `Syscall` is handled twice.
+    const X86_ONLY: [u64; 21] = [
+        2, 4, 6, 7, 21, 22, 23, 33, 57, 58, 82, 83, 84, 87, 88, 89, 96, 111, 158, 164, 201,
+    ];
+    let mut overlap = 0u64;
+    for n in X86_ONLY {
+        if Syscall::from_x86_64(n).is_some() {
+            overlap += 1;
+        }
+    }
+    t.check_eq("dispatch: no number is in both tables", overlap, 0);
+
+    // The hop. `write` arrives as 1 and reaches glue as 64.
+    t.check_eq("dispatch: write arrives as x86_64 1", Syscall::Write.to_x86_64(), 1);
+    t.check_eq("dispatch: write reaches glue as 64", Syscall::Write.to_aarch64(), 64);
+    // The crossing that would be loudest and least explicable: x86_64 63 is
+    // `uname`, asm-generic 63 is `read`.
+    t.check(
+        "dispatch: 63 decodes as uname, not read",
+        Syscall::from_x86_64(63) == Some(Syscall::Uname),
+    );
+    t.check_eq("dispatch: uname reaches glue as 160", Syscall::Uname.to_aarch64(), 160);
+
+    if !have_fs {
+        t.note("dispatch: no filesystem; symlink round trip skipped", 0);
+        return;
+    }
+
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    let target = b"/probe.txt\0";
+    let link = b"/dispatch-symlink-probe\0";
+    // The disk image survives a boot, so clear any leftover before creating it.
+    crate::fd::sys_unlinkat(AT_FDCWD, link.as_ptr() as u64, 0);
+
+    // Straight through the dispatcher, by number, the way userspace arrives.
+    let r = syscall_dispatch(88, target.as_ptr() as u64, link.as_ptr() as u64, 0, 0, 0, 0);
+    t.check_eq("dispatch: x86_64 88 is symlink(2) and succeeds", r, 0);
+    let mut buf = [0u8; 64];
+    let n = crate::fd::sys_readlinkat(
+        AT_FDCWD,
+        link.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    t.check_eq("dispatch: the link reads back its target length", n, 10);
+    t.check("dispatch: and the target itself", &buf[..10] == b"/probe.txt");
+    crate::fd::sys_unlinkat(AT_FDCWD, link.as_ptr() as u64, 0);
 }
 
 /// Run two isolated processes concurrently and prove they interleave.

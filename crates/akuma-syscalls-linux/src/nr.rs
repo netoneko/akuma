@@ -160,8 +160,21 @@ pub const GETGROUPS: u64 = 158;
 pub const KILL_LINUX: u64 = 129;
 pub const SETPGID: u64 = 154;
 pub const GETPGID: u64 = 155;
+/// `getsid(2)`.
+///
+/// Neither kernel dispatches it under this number yet — the amd64 kernel
+/// answers the x86_64 spelling (124) and the AArch64 one does not implement it
+/// at all — but `akuma-syscalls-abi` needs both halves of the pair to name the
+/// call, and the number is a fact about Linux either way.
+pub const GETSID: u64 = 156;
 pub const SETSID: u64 = 157;
 pub const UNAME: u64 = 160;
+/// `syslog(2)` / `klogctl(3)`.
+///
+/// The amd64 kernel serves it out of `akuma-dmesg` under the x86_64 number
+/// (103); the AArch64 console still has no syscall front end for the ring
+/// (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4).
+pub const SYSLOG: u64 = 116;
 pub const FLOCK: u64 = 32;
 pub const UMASK: u64 = 166;
 pub const UTIMENSAT: u64 = 88;

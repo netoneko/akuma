@@ -215,6 +215,10 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
 
     fd::init_console();
     usermode::init_syscall();
+    // The dispatch table itself, before anything runs through it: the
+    // legacy-x86 list and the neutral `Syscall` table must stay disjoint,
+    // and the x86_64 -> asm-generic hop C1 folds through must still happen.
+    usermode::dispatch_smoke_test(t, cx.have_fs);
     usermode::smoke_test(t);
     usermode::preempt_test(t);
 
