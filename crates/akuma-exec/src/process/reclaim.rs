@@ -169,23 +169,39 @@ pub fn drain_retired() -> usize {
         return 0;
     }
     // A TERMINATED thread can be reaped at any yield and will never resume, and
-    // this kernel does not unwind — so a sweep started here is abandoned where it
-    // stands, taking whatever it had already taken ownership of with it. Freeing
-    // one `Process` runs `UserAddressSpace::drop`, a multi-thousand-page loop; the
-    // measured residual after the pending-TTBR drain was gated the same way was
-    // ~1 abandoned drop per build, each stranding its `user_frames` map
-    // (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`).
+    // this kernel does not unwind — so a sweep started here would be abandoned
+    // where it stands, taking whatever it had already taken ownership of with
+    // it. Freeing one `Process` runs `UserAddressSpace::drop`, a
+    // multi-thousand-page loop; the measured residual after the pending-TTBR
+    // drain was gated the same way was ~1 abandoned drop per build, each
+    // stranding its `user_frames` map (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`).
     //
-    // Terminal sites keep *requesting* — `unregister_process` already called
-    // `request_retired_reclaim()`, and the flag stands until a collector runs. The
-    // OOM-kill-storm regime this site was added for
-    // (`docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md` §5 candidate 1) is still
-    // covered, and better: `drain_retired_under_pressure` runs on the *allocating*
-    // thread, which is non-terminal by construction, so the collector fires
-    // exactly when memory is short. An abandoned sweep returned nothing anyway.
-    if crate::threading::current_thread_is_terminated() {
-        request_retired_reclaim();
-        return 0;
+    // **That hazard used to be handled by refusing to drain at all**, and the
+    // refusal was worse than the disease. All three teardown drain sites call
+    // this immediately *after* marking their own thread terminated, so the
+    // condition was true there by construction and the sites were no-ops. The
+    // consolation — "terminal sites keep requesting" — is useless on its own: a
+    // request flag needs an eligible collector, and during the boot suite at
+    // SMP=1 there is none (netpoll_maint is not spawned, thread 0 is the test
+    // rather than idling, there are no secondaries, and the pressure ladder
+    // declines because parking 1024 pages out of 2 GB is not pressure). The
+    // symptom was `retired_reclaim_ab` failing on `main` with both sides
+    // recovering 0p — see `docs/archive/POST_EXIT_PMM_RECLAIM.md`.
+    //
+    // So: keep the hazard model, and **pin the drainer instead of skipping the
+    // drain**. With preemption disabled a dying thread cannot be switched away
+    // mid-sweep, and it never yields voluntarily, so the sweep is guaranteed to
+    // run to completion and `DRAINING[tid]` is guaranteed to clear. No
+    // abandonment, so no stranded map and no stale guard.
+    //
+    // The window is bounded by freeing the parked address spaces — a dying
+    // thread's last act — and the 100 ms preemption watchdog line it may print
+    // is diagnostic only. Before the gate existed this same site drained this
+    // same work while holding the BKL, which is strictly more exclusion than
+    // this.
+    let terminal = crate::threading::current_thread_is_terminated();
+    if terminal {
+        akuma_primitives::preempt::disable_preemption();
     }
     let tid = crate::threading::current_thread_id();
     let guarded = tid < MAX_THREADS;
@@ -193,6 +209,9 @@ pub fn drain_retired() -> usize {
         // Reentered from inside a drain (see the guard's docs) — the outer sweep owns
         // this; leave the request standing for it.
         request_retired_reclaim();
+        if terminal {
+            akuma_primitives::preempt::enable_preemption();
+        }
         return 0;
     }
 
@@ -213,7 +232,24 @@ pub fn drain_retired() -> usize {
     if guarded {
         DRAINING[tid].store(false, Ordering::Release);
     }
+    if terminal {
+        akuma_primitives::preempt::enable_preemption();
+    }
     freed
+}
+
+/// Is `tid` inside a [`drain_retired`] sweep right now?
+///
+/// Read by the reaper before it frees a terminated thread's stack. A dying
+/// thread's final sweep runs on that stack, and the sweep runs with preemption
+/// disabled — so the reaper can never actually observe this true for a slot it
+/// would otherwise take (the thread is on-CPU, which `ON_CPU` already excludes).
+/// It is the same belt-and-braces the `ON_CPU` check is: cheap, and it keeps the
+/// invariant local to the reaper rather than trusting every future drainer to
+/// remember the rule.
+#[must_use]
+pub(crate) fn drain_in_flight(tid: usize) -> bool {
+    tid < MAX_THREADS && DRAINING[tid].load(Ordering::Acquire)
 }
 
 /// Clear a recycled slot's re-entrancy guard.

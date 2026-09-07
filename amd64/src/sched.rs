@@ -366,6 +366,9 @@ fn register_hooks() {
     // `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` A2.
     threading::register_process_hooks(threading::ProcessHooks {
         clear_draining: |_| {},
+        // No retired-process reclaim on this target yet — `akuma-exec`'s
+        // process table is not built here — so no drain can ever be in flight.
+        drain_in_flight: |_| false,
         lifecycle_trace_on: || false,
         pid_for_thread: |_| None,
         find_pid_by_thread: |_| None,

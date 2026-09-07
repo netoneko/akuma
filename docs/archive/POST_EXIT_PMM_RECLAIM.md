@@ -84,7 +84,7 @@ process-lifetime heap allocations so freed spans become wholly free again).
 
 # REOPENED 2026-09-07: `retired_reclaim_ab` fails on `main`, everywhere
 
-**Status: open, unowned, and NOT caused by the amd64 scheduler fold** — that is
+**Status: FIXED 2026-09-07** — root cause and fix below. Was: open, unowned, and NOT caused by the amd64 scheduler fold — that is
 the whole point of the matrix below. It was found while establishing an aarch64
 control for `docs/archive/AKUMA_AMD64_BLOCKING.md`, i.e. by looking for a
 regression and finding a standing failure instead.
@@ -205,7 +205,7 @@ easy to mistake for a crash introduced by whatever you are testing — it is not
 
 ---
 
-# Root cause found 2026-09-07: 7ec02e91's TERMINATED gate disarmed every teardown drain site
+# Root cause found and FIXED 2026-09-07: 7ec02e91's TERMINATED gate disarmed every teardown drain site
 
 ## The mechanism, and where it broke
 
@@ -253,7 +253,29 @@ thread can be reaped at any yield and never resumes, so a sweep it started is
 abandoned mid-`Process::drop`, stranding that address space's `user_frames`
 map. **Do not simply delete the gate.** Replace it with a pin.
 
-## The fix: reap-safe drain (sketch)
+## FIXED 2026-09-07 — implemented as sketched below, and verified
+
+The sketch was implemented verbatim (three parts, four one-line hook edits) and
+`retired_reclaim_ab` passes:
+
+```
+[PASS] retired_reclaim_ab: parked 1024p, one /bin/hello exit ->
+       OFF recovered 0p (1 slot(s) still RETIRED), ON recovered 745p (0 left)
+```
+
+745p is inside the documented 745/1029 bimodal band, and the OFF side still
+strands — so the A/B is measuring the mechanism again rather than measuring
+nothing. Full suite on the same boot: **307 passed, 0 failed** (HVF,
+`MEMORY=2048M`), against 307 passed / 1 failed before, which is the matrix
+above's standing failure on `main` going away.
+
+One deviation from the sketch, and it is a simplification: `drain_retired`'s
+early-return arms were left in place with an explicit `enable_preemption()` on
+each rather than being restructured into a single exit. There are exactly two
+of them, both adjacent, and an RAII guard would have to live in
+`akuma-primitives` for one caller.
+
+## The fix: reap-safe drain (as implemented)
 
 Keep the gate's hazard model — a terminated drainer must never be reaped
 mid-sweep — but pin the reaper instead of skipping the drain. Three parts:

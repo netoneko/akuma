@@ -221,6 +221,7 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     );
     threading::register_process_hooks(threading::ProcessHooks {
         clear_draining: process::reclaim::clear_draining,
+        drain_in_flight: process::reclaim::drain_in_flight,
         lifecycle_trace_on: process::lifecycle_trace_on,
         pid_for_thread: process::table::pid_for_thread,
         find_pid_by_thread: process::find_pid_by_thread,

@@ -70,6 +70,7 @@ pub fn ensure_test_runtime() {
         );
         crate::register_process_hooks(ProcessHooks {
             clear_draining: hook_unit_usize,
+            drain_in_flight: |_| false,
             lifecycle_trace_on: hook_false,
             pid_for_thread: hook_none_u32,
             find_pid_by_thread: hook_none_u32,

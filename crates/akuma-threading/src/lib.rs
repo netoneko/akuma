@@ -183,6 +183,10 @@ pub struct ThreadConfig {
 #[derive(Clone, Copy)]
 pub struct ProcessHooks {
     pub clear_draining: fn(usize),
+    /// Is this thread inside a retired-process drain right now? The reaper asks
+    /// before freeing a terminated thread's stack — see
+    /// `cleanup_terminated_internal`.
+    pub drain_in_flight: fn(usize) -> bool,
     pub lifecycle_trace_on: fn() -> bool,
     pub pid_for_thread: fn(usize) -> Option<u32>,
     pub find_pid_by_thread: fn(usize) -> Option<u32>,
@@ -2122,6 +2126,19 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
         // — and above all don't free the stack — until the gate clears; the next
         // pass gets it. See ON_CPU's doc for the race.
         if ON_CPU[i].load(Ordering::SeqCst) != 0 {
+            continue;
+        }
+
+        // A terminated thread's *last* act can be a retired-process sweep
+        // (`akuma_exec::process::reclaim::drain_retired`), and that sweep runs
+        // on this stack. Don't free it underneath one.
+        //
+        // With the sweep pinned preempt-off this cannot actually fire — a
+        // drainer mid-sweep is on-CPU, which the gate above already excludes —
+        // so this is the same belt the `ON_CPU` check is. It is here so the
+        // invariant lives with the reaper rather than depending on every future
+        // drain site remembering to pin itself.
+        if (process().drain_in_flight)(i) {
             continue;
         }
 
