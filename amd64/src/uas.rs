@@ -175,6 +175,9 @@ pub fn smoke_test(t: &mut Suite) {
     // callers call it: to prove it exists and returns.
     uas.invalidate_icache_for_page_va(TEST_VA);
 
+    // ── the range walks ────────────────────────────────────────────────────
+    range_walk_test(t, &mut uas);
+
     // ── a shared view owns nothing ─────────────────────────────────────────
     let root = uas.l0_phys();
     let Some(shared) = UserAddressSpace::new_shared(root) else {
@@ -197,4 +200,156 @@ pub fn smoke_test(t: &mut Suite) {
     akuma_pmm::free_page(frame.addr, 0);
     akuma_pmm::free_page(frame2.addr, 0);
     t.note("uas: page-table frames deliberately leaked (no Drop on this target)", 3);
+}
+
+/// The three range walks C1 step 5a needs, on a private address space.
+///
+/// These are the one capability `akuma-mmu` did not have and `amd64/src/mm.rs`
+/// cannot be ported without: `munmap`, `mprotect`, `mremap`, `madvise`, `fork`'s
+/// CoW demote and `/proc/self/maps` are all written against a *table* walk here,
+/// where the AArch64 kernel iterates VAs from its region list
+/// (`proposals/AMD64_STEP5_PROCESS_TABLE.md` § 5a).
+///
+/// The walk cannot be host-tested: it dereferences page tables through the
+/// physmap and is `#[cfg(target_arch = "x86_64")]`, so on this repo's Apple
+/// Silicon host it does not exist. That is the same reason the rest of this
+/// module is a boot suite rather than a `#[test]`.
+///
+/// Three pages, placed to exercise the three things that distinguish this walk
+/// from `for va in range { translate(va) }`: a **hole** between two leaves in
+/// one page table, a third leaf under a *different* PD entry 2 MiB away, and a
+/// wholly empty range that must cost nothing and report nothing.
+fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
+    use akuma_mmu::{Leaf, LeafAction, PteProt};
+
+    /// Far enough from [`TEST_VA`] to land under a different PD entry, so the
+    /// walk has to descend twice rather than run along one page table.
+    const FAR: usize = TEST_VA + (2 << 20);
+    /// A gap of one page between the first two, so "visits present leaves"
+    /// is distinguishable from "visits every page in the range".
+    const MID: usize = TEST_VA + 2 * 4096;
+
+    let mut frames = [0usize; 3];
+    for (i, va) in [TEST_VA, MID, FAR].into_iter().enumerate() {
+        let Ok(f) = uas.alloc_and_map(va, user_flags::RW_NO_EXEC) else {
+            t.check("uas: range walk setup mapped three pages", false);
+            return;
+        };
+        frames[i] = f.addr;
+    }
+    t.check("uas: range walk setup mapped three pages", true);
+
+    // Everything, in ascending VA order, with the frames it was given.
+    let mut seen: [usize; 4] = [0; 4];
+    let mut pas: [usize; 4] = [0; 4];
+    let mut n = 0usize;
+    let mut ordered = true;
+    let mut all_rw_nx = true;
+    uas.for_each_leaf_in_range(TEST_VA, FAR + 4096, |leaf: Leaf| {
+        if n < seen.len() {
+            if n > 0 && leaf.va <= seen[n - 1] {
+                ordered = false;
+            }
+            seen[n] = leaf.va;
+            pas[n] = leaf.pa;
+        }
+        if !(leaf.prot.write && leaf.prot.user && !leaf.prot.exec) || leaf.cow {
+            all_rw_nx = false;
+        }
+        n += 1;
+    });
+    t.check_eq("uas: for_each_leaf_in_range visits every present leaf", n as u64, 3);
+    t.check("uas: leaves arrive in ascending VA order", ordered);
+    t.check("uas: leaves report the VAs that were mapped",
+        seen[0] == TEST_VA && seen[1] == MID && seen[2] == FAR);
+    t.check("uas: leaves report the frames that were mapped",
+        pas[0] == frames[0] && pas[1] == frames[1] && pas[2] == frames[2]);
+    t.check("uas: leaves decode RW_NO_EXEC and no CoW marker", all_rw_nx);
+
+    // A range that stops before the far page. The bound is exclusive: a leaf
+    // exactly at `end` must not be reported, which is the off-by-one that makes
+    // `munmap(addr, len)` free one page too many.
+    let mut n = 0usize;
+    uas.for_each_leaf_in_range(TEST_VA, MID + 4096, |_| n += 1);
+    t.check_eq("uas: the range end is exclusive", n as u64, 2);
+    let mut n = 0usize;
+    uas.for_each_leaf_in_range(TEST_VA, MID, |_| n += 1);
+    t.check_eq("uas: a range ending at a leaf excludes it", n as u64, 1);
+
+    // An empty range, and a range over an unmapped gigabyte. The second is the
+    // case the subtree skipping exists for — `rustc` reserves address space this
+    // size — and getting it wrong is a hang, not a wrong answer.
+    let mut n = 0usize;
+    uas.for_each_leaf_in_range(TEST_VA, TEST_VA, |_| n += 1);
+    t.check_eq("uas: an empty range reports nothing", n as u64, 0);
+    let mut n = 0usize;
+    uas.for_each_leaf_in_range(TEST_VA + (4 << 30), TEST_VA + (5 << 30), |_| n += 1);
+    t.check_eq("uas: an unmapped gigabyte reports nothing", n as u64, 0);
+
+    // The whole user half finds the same three and nothing else — in particular
+    // it must not wander into the kernel's shared upper half.
+    let mut n = 0usize;
+    let mut above_user = 0usize;
+    uas.for_each_user_leaf(|leaf: Leaf| {
+        n += 1;
+        if leaf.va >= akuma_mmu::USER_HALF_END {
+            above_user += 1;
+        }
+    });
+    t.check_eq("uas: for_each_user_leaf finds every mapping", n as u64, 3);
+    t.check_eq("uas: for_each_user_leaf stays in the user half", above_user as u64, 0);
+
+    // ── the mutating walk ──────────────────────────────────────────────────
+    // Reprotect: same frame, new permissions, CoW marker set. This is the
+    // `mprotect` shape and the `fork` demote shape at once.
+    let ro = PteProt { write: false, exec: false, user: true };
+    let rewritten = uas.rewrite_leaves_in_range(TEST_VA, FAR + 4096, |_| LeafAction::Reprotect(ro, true));
+    t.check_eq("uas: rewrite_leaves_in_range visited three", rewritten as u64, 3);
+    let mut demoted = 0usize;
+    let mut kept_frames = true;
+    let mut i = 0usize;
+    uas.for_each_leaf_in_range(TEST_VA, FAR + 4096, |leaf: Leaf| {
+        if !leaf.prot.write && leaf.cow && leaf.prot.user {
+            demoted += 1;
+        }
+        if i < frames.len() && leaf.pa != frames[i] {
+            kept_frames = false;
+        }
+        i += 1;
+    });
+    t.check_eq("uas: Reprotect demoted every leaf", demoted as u64, 3);
+    t.check("uas: Reprotect kept each frame", kept_frames);
+    // Read back through the crate's own accessor too, so this is not just the
+    // walk agreeing with itself.
+    let pte = uas.read_l3_page_entry(TEST_VA).unwrap_or(0);
+    t.check("uas: Reprotect is visible to read_l3_page_entry", pte & PTE_RW == 0 && pte & PTE_COW != 0);
+
+    // Unmap: clears the entries and does **not** free the frames or touch the
+    // ledger — the caller was handed each `pa` and owns that decision. Checking
+    // the ledger is what makes that contract testable rather than a comment.
+    let before = uas.user_frame_count();
+    let mut reported = [0usize; 3];
+    let mut i = 0usize;
+    let unmapped = uas.rewrite_leaves_in_range(TEST_VA, MID + 4096, |leaf: Leaf| {
+        if i < reported.len() {
+            reported[i] = leaf.pa;
+        }
+        i += 1;
+        LeafAction::Unmap
+    });
+    t.check_eq("uas: Unmap visited the two leaves in range", unmapped as u64, 2);
+    t.check("uas: Unmap reported each frame to the caller",
+        reported[0] == frames[0] && reported[1] == frames[1]);
+    t.check("uas: the unmapped VAs are gone", !uas.is_mapped(TEST_VA) && !uas.is_mapped(MID));
+    t.check("uas: the out-of-range leaf survived", uas.is_mapped(FAR));
+    t.check_eq("uas: Unmap left the ledger alone", uas.user_frame_count() as u64, before as u64);
+
+    // Hand the three frames back by hand, since `Unmap` deliberately did not.
+    for f in frames {
+        uas.remove_user_frame(akuma_mmap::PhysFrame::new(f));
+    }
+    let _ = uas.unmap_and_free_page(FAR);
+    for f in [frames[0], frames[1]] {
+        akuma_pmm::free_page(f, 0);
+    }
 }

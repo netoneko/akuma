@@ -2618,6 +2618,51 @@ pub struct PteProt {
     pub user: bool,
 }
 
+/// One present 4 KiB leaf, as [`UserAddressSpace::for_each_leaf_in_range`]
+/// reports it.
+///
+/// A struct rather than a `(usize, u64, PteProt)` tuple for one reason: `pa`
+/// and the raw entry are both integers of the same width, and the two range
+/// walks this replaces in `amd64/src/paging.rs` passed them adjacently. A
+/// transposition there compiles and produces a mapping of the flag word.
+#[cfg(any(target_arch = "x86_64", test))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Leaf {
+    /// Virtual address of the page, page-aligned.
+    pub va: usize,
+    /// Physical frame the leaf points at.
+    pub pa: usize,
+    /// Decoded permissions.
+    pub prot: PteProt,
+    /// The copy-on-write marker (PTE bit 9). Reported separately because
+    /// [`PteProt`] is the *hardware* permission triple and this bit is
+    /// software-defined — see [`X86_COW`] and `akuma-cow`, which takes the
+    /// marker as its own input for exactly this reason.
+    pub cow: bool,
+}
+
+/// What [`UserAddressSpace::rewrite_leaves_in_range`] should do with a leaf.
+///
+/// The walk descends once and the caller decides per page, so unmapping a
+/// range, re-permissioning it and inspecting it are one primitive rather than
+/// three. **Policy stays with the caller**: whether a writable region may
+/// become a writable *PTE* depends on the frame's CoW share count, which is a
+/// PMM question this crate deliberately does not ask
+/// (`amd64/src/mm.rs::pte_prot_for`).
+#[cfg(any(target_arch = "x86_64", test))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LeafAction {
+    /// Leave the entry exactly as it is.
+    Keep,
+    /// Clear the entry and `invlpg` it. The frame is **not** freed and its
+    /// refcount is not touched — the caller was handed the `pa` and owns that
+    /// decision.
+    Unmap,
+    /// Rewrite the entry in place with new permissions and CoW marker, keeping
+    /// the same frame. One store, no re-walk.
+    Reprotect(PteProt, bool),
+}
+
 #[cfg(any(target_arch = "x86_64", test))]
 impl PteProt {
     /// User read/write, no execute. The default for data.
@@ -2986,6 +3031,111 @@ fn x86_leaf_slot_in(root: u64, va: usize) -> Option<*mut u64> {
     }
     // SAFETY: `table` is the PT frame; the index is masked to 0..512.
     Some(unsafe { x86_table_mut(table).add(x86_index(va, 1)) })
+}
+
+/// One past the last user virtual address: the low half of a 4-level x86_64
+/// address space, `2^47`. PML4 slots 0..256 — everything at or above this is
+/// the kernel's shared upper half, which no user walk may touch.
+#[cfg(any(target_arch = "x86_64", test))]
+pub const USER_HALF_END: usize = 1 << 47;
+
+/// Bytes one page-table entry at `level` spans: 512 GiB, 1 GiB, 2 MiB, 4 KiB.
+///
+/// Narrower `cfg` than its neighbours on purpose: it is private and its only
+/// caller is [`x86_walk_leaves`], so compiling it under `test` on a non-x86 host
+/// would be dead code.
+#[cfg(target_arch = "x86_64")]
+const fn x86_entry_span(level: u32) -> usize {
+    1usize << (12 + 9 * (level - 1))
+}
+
+/// The one range walk behind [`UserAddressSpace::for_each_leaf_in_range`],
+/// [`UserAddressSpace::for_each_user_leaf`] and
+/// [`UserAddressSpace::rewrite_leaves_in_range`]. Returns the number of present
+/// leaves visited.
+///
+/// Descends once per entry and skips an absent subtree whole — see the public
+/// methods for why that matters. `f` decides what happens to each leaf; the
+/// slot pointer never escapes, so a caller cannot hold a page-table pointer
+/// across an operation that might free the table it lives in.
+///
+/// # Safety of editing under the walk
+///
+/// `Unmap` and `Reprotect` write the leaf slot this descent is standing on and
+/// nothing else. No page **table** is ever freed here, so every pointer the walk
+/// still holds stays live for the rest of the visit. Freeing an emptied table is
+/// deliberately not done: it would invalidate the parent entry the cursor is
+/// walking, and the frames are reclaimed at teardown by the ledger anyway.
+#[cfg(target_arch = "x86_64")]
+fn x86_walk_leaves(
+    root: u64,
+    start: usize,
+    end: usize,
+    mut f: impl FnMut(Leaf) -> LeafAction,
+) -> usize {
+    let mut va = start & !(PAGE_SIZE - 1);
+    let mut seen = 0usize;
+    while va < end {
+        // SAFETY: every table is reached through the physmap; `root` is a live
+        // PML4 and each descent is guarded by the entry's present bit.
+        let step = unsafe {
+            let mut table = root;
+            let mut missing = 0u32;
+            for level in (2..=4).rev() {
+                let entry = x86_table_mut(table).add(x86_index(va, level)).read_volatile();
+                if entry & X86_P == 0 || entry & X86_PS != 0 {
+                    missing = level;
+                    break;
+                }
+                table = entry & X86_ADDR_MASK;
+            }
+            if missing != 0 {
+                // Nothing present under this entry: jump to the next one at the
+                // level that was missing, so an empty gigabyte costs one read.
+                let span = x86_entry_span(missing);
+                span - (va & (span - 1))
+            } else {
+                let slot = x86_table_mut(table).add(x86_index(va, 1));
+                let entry = slot.read_volatile();
+                if entry & X86_P != 0 {
+                    seen += 1;
+                    let leaf = Leaf {
+                        va,
+                        pa: (entry & X86_ADDR_MASK) as usize,
+                        prot: PteProt {
+                            write: entry & X86_RW != 0,
+                            exec: entry & X86_NX == 0,
+                            user: entry & X86_US != 0,
+                        },
+                        cow: entry & X86_COW != 0,
+                    };
+                    match f(leaf) {
+                        LeafAction::Keep => {}
+                        LeafAction::Unmap => {
+                            slot.write_volatile(0);
+                            akuma_cpu::tlb::invlpg(va);
+                        }
+                        LeafAction::Reprotect(prot, cow) => {
+                            let rewritten = (entry & X86_ADDR_MASK)
+                                | x86_encode(prot, MemAttr::WriteBack)
+                                | if cow { X86_COW } else { 0 };
+                            slot.write_volatile(rewritten);
+                            akuma_cpu::tlb::invlpg(va);
+                        }
+                    }
+                }
+                PAGE_SIZE
+            }
+        };
+        // `checked_add` rather than `+`: a range ending at the top of the
+        // address space would otherwise wrap the cursor back to 0 and loop
+        // forever, and `end` comes from ring 3.
+        match va.checked_add(step) {
+            Some(next) => va = next,
+            None => break,
+        }
+    }
+    seen
 }
 
 /// The kernel's own boot PML4, captured the first time a `UserAddressSpace`
@@ -3488,6 +3638,82 @@ impl UserAddressSpace {
 
     pub fn unmap_page(&mut self, va: usize) {
         x86_unmap_page_in(self.root as u64, va);
+    }
+
+    // ── range walks ────────────────────────────────────────────────────────
+
+    /// Visit every **present 4 KiB leaf** in `[start, end)`.
+    ///
+    /// # Why a walk at all, when the AArch64 side has none
+    ///
+    /// The two kernels enumerate a mapping differently and always have. AArch64
+    /// iterates *virtual addresses from the region list* (`akuma-mmap`) and asks
+    /// the table about each; this target iterates *leaves from the table*. That
+    /// is not a gap on one side — it is what `munmap`, `mprotect`, `mremap`,
+    /// `madvise`, `fork`'s CoW demote and `/proc/self/maps` are all written
+    /// against here, and porting them to the other shape is C2's business, with
+    /// the syscall fold in front of it. So this is deliberately **x86-only**:
+    /// giving AArch64 a twin nothing calls would be a fake unification and would
+    /// move that kernel's `.text` for no reader.
+    ///
+    /// # It skips absent subtrees whole
+    ///
+    /// The naive shape — `for va in (start..end).step_by(4096)` with a
+    /// four-level walk each — costs a full descent per page whether or not
+    /// anything is mapped. A lazy `PROT_NONE` reservation of a gigabyte is
+    /// 262 144 pages of which zero are present, and `rustc` makes reservations
+    /// that size. This descends once per *entry*: a missing PML4 entry advances
+    /// the cursor 512 GiB, a missing PDPT entry 1 GiB, a missing PD entry 2 MiB.
+    /// An empty range costs a handful of reads however long it is.
+    ///
+    /// A 2 MiB page (`PS` at PD level) is **skipped, not reported**. This walker
+    /// never creates one for a user address space — `x86_map_page_in` always
+    /// builds down to a PT — and reporting one as a 4 KiB leaf would hand the
+    /// caller a frame 512 times the size it thinks.
+    pub fn for_each_leaf_in_range(&self, start: usize, end: usize, mut f: impl FnMut(Leaf)) {
+        x86_walk_leaves(self.root as u64, start, end, |leaf| {
+            f(leaf);
+            LeafAction::Keep
+        });
+    }
+
+    /// Visit every present leaf of the whole **user half** (`0 .. 2^47`).
+    ///
+    /// `fork`'s copy-on-write demote and `/proc/self/maps` want the address
+    /// space rather than a range. Expressed through
+    /// [`for_each_leaf_in_range`](Self::for_each_leaf_in_range) rather than as a
+    /// second walk: the subtree skipping makes the whole-space form cost 256
+    /// PML4 reads plus whatever is actually mapped, so there is nothing a
+    /// separate implementation would buy.
+    ///
+    /// Never touches the upper half, which is the kernel's shared tables.
+    pub fn for_each_user_leaf(&self, f: impl FnMut(Leaf)) {
+        self.for_each_leaf_in_range(0, USER_HALF_END, f);
+    }
+
+    /// Visit every present leaf in `[start, end)` and apply the caller's
+    /// [`LeafAction`] to each, in **one** descent. Returns how many leaves were
+    /// visited.
+    ///
+    /// This is the mutating half of
+    /// [`for_each_leaf_in_range`](Self::for_each_leaf_in_range), and it exists
+    /// so `munmap` allocates nothing. The two-phase alternative — walk into a
+    /// `Vec<Leaf>`, then call `unmap_page` per entry — costs a heap allocation
+    /// sized by *residency* on the one syscall that runs when memory is short,
+    /// plus a second four-level descent per page. Here the leaf slot is already
+    /// in hand.
+    ///
+    /// `Unmap` clears the entry and issues `invlpg`; it does **not** free the
+    /// frame or touch its refcount, because the caller was handed the `pa` and
+    /// that decision is the PMM's. `Reprotect` rewrites permissions and the CoW
+    /// marker onto the same frame.
+    pub fn rewrite_leaves_in_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        f: impl FnMut(Leaf) -> LeafAction,
+    ) -> usize {
+        x86_walk_leaves(self.root as u64, start, end, f)
     }
 
 

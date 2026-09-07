@@ -344,6 +344,41 @@ as they stand one day after the survey
 >
 > **Step 5 is now the only thing between here and folding the VFS arms.**
 
+> **Step 5 has started, and its first half is not what this chart says
+> (2026-09-07)** — `proposals/AMD64_STEP5_PROCESS_TABLE.md`. Working backwards
+> from `current_process_shared()`: it needs a registered `akuma_exec::Process`,
+> whose `address_space` field is a `ProcAddressSpace`, which wraps
+> `akuma_mmu::UserAddressSpace` **and nothing else**. So a `Process` cannot be
+> built around `amd64/src/paging.rs`'s `AddressSpace`, and the "two x86 walkers"
+> item — which C1's hand-off calls a parallel cleanup to do "as its own step" —
+> is step 5's *first half*, not a sibling of it. Everything else in the stack
+> (`akuma-elf`, `akuma-exec`, `akuma-user-space`) already builds for the target
+> and is already linked in.
+>
+> The one capability that swap was missing has landed: `UserAddressSpace` gained
+> `for_each_leaf_in_range`, `for_each_user_leaf` and `rewrite_leaves_in_range`,
+> **x86-only**. That is not a gap on the AArch64 side — the two kernels
+> genuinely enumerate a mapping differently, AArch64 from the region list and
+> this target from the page table, and `munmap`/`mprotect`/`mremap`/`madvise`/
+> `fork`'s CoW demote/`/proc/self/maps` are all written the second way here.
+> Giving AArch64 a twin nothing calls would be a fake unification. QEMU/TCG
+> 472 → **491/0** (19 new `uas:` checks, the only place a physmap-dereferencing
+> x86 walk *can* be tested), AArch64 sections proven byte-identical.
+>
+> **A finding that must land before anything is allowed to drop:** the
+> page-table free gate is **blind on this target**. `UserAddressSpace` is `Drop`
+> (`paging::AddressSpace::free()` deliberately is not), and that is safe only
+> because `any_core_on_l0` parks the frames when a core still holds the table —
+> but `ACTIVE_L0` is published by `publish_l0_begin`/`publish_l0_end`, whose only
+> caller is the `#[cfg(target_arch = "aarch64")]` `msr ttbr0_el1` block in
+> `akuma-threading`. amd64 writes `CR3` in its own `sched.rs`, so the gate always
+> answers "no core holds this" — for a table a peer core may be running on at
+> `SMP=4`. A few lines in `sched.rs`, invisible until something depends on it.
+>
+> Teardown checked and equivalent, which was the other worry: amd64's
+> `free_all_frames` gates on `cow_ref_dec`, and `akuma_pmm::free_page_at` — what
+> the crate calls — has that same gate as its first line.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate
@@ -680,6 +715,21 @@ files, which is a decision this target has not had to make yet.
 
 ### 3. A one-shot `ssh` command never returns — it hangs *after* printing
 
+> **[CLOSED — re-measured 2026-09-07, later the same day.]** A2 fixed it, as
+> the two candidates below predicted, and nobody went back to check. On the
+> bare-metal box, same shape as the report:
+>
+> ```
+> $ ssh akuma "uname -a"
+> Akuma akuma 0.1.0 e983c44c-release x86_64 GNU/Linux
+> # returned in 0.3 s, rc=0
+> ```
+>
+> The generalisable part is the process one, not the bug: an issue filed
+> *against* a landing that had not happened yet needs re-running once it has,
+> or it stays open on paper long after it is gone. Cost of the check: one ssh
+> round trip.
+
 Reported 2026-09-07, on the bare-metal box:
 
 ```
@@ -708,6 +758,15 @@ investigated now.** Revisit after A2 lands; if the hang survives it, it is a
 real third bug and worth its own autopsy rather than a guess.
 
 ### 4. **aarch64**, not amd64: `test_spawn_ext_passes_env` panics the boot suite
+
+> **[CLOSED — re-measured 2026-09-07, later the same day.]** `MEMORY=2048 cargo
+> run --release` reaches
+> `[Test] spawn_ext_passes_env PASSED (composed + default)` and the suite does
+> not panic. The failure belonged to a transient state of this branch, which is
+> what the original entry suspected ("belongs to the branch, not to that
+> work") without being able to say when it would go. No autopsy was ever
+> written and none is owed; recorded as closed so the next reader does not go
+> looking for a bug that is not there.
 
 Found 2026-09-07 while running `scripts/lima_aarch64_run.sh` to prove the amd64
 `mmap` work had not touched the other kernel. It had not — `git diff` over
