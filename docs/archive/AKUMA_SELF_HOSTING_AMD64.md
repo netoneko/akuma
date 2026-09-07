@@ -379,6 +379,42 @@ as they stand one day after the survey
 > `free_all_frames` gates on `cow_ref_dec`, and `akuma_pmm::free_page_at` — what
 > the crate calls — has that same gate as its first line.
 
+> **The free gate is fed now, and feeding it found a third case nobody had
+> (2026-09-07).** `paging::activate` brackets its `mov cr3` with the registry
+> publish. `publish_l0_begin` had been *reading* the core id via
+> `akuma_primitives::cpu::current_core_id`, whose doc reasons about two cases —
+> single-core, and the AArch64 multikernel where every caller wants `0` — and
+> **amd64 is a third: real SMP without `kernel_smp_shared`.** All four cores
+> would have published into slot 0, where the last writer erases the record of a
+> table a peer is still running: worse than no gate. It takes the core as an
+> argument now. Every other `current_core_id()` reader amd64 reaches is a trace
+> line, which is why nothing had surfaced.
+>
+> Two things checking cost, and both were worth it. A **false alarm**:
+> `commit_switch`'s `PER_CORE_OFFCPU` is indexed the same way and looked like a
+> live `SMP=4` corruption — it is not, every `current_core_id()` site in
+> `akuma-threading` is behind `cfg(aarch64)` or `cfg(kernel_smp_shared)`, and
+> amd64's `x86_yield_now` is a separate path. And a **real one**: `ap_entry64`
+> calls `activate` before `install_percpu`, so `cpu_index()`'s `gs:[0]` read
+> dereferenced address 0 on a core with no IDT — a triple fault whose symptom is
+> the *BSP* hanging in `start_secondaries`, and a boot with no tally at all.
+> `activate_unpublished` is that one caller's entry point.
+>
+> **And a measurement lesson that cost two hours.** Host wall time cannot A/B
+> this target: the same unchanged binary booted at `SMP=4` in 41 s, 42 s and
+> 68 s, and three "measurements" of the publish cost were taken against it
+> before that was noticed. The guest clock (`lapic::ticks()`, now stamped by
+> `boot::self_tests`) looks better and is also wrong for this — it is dominated
+> by the timeout-driven netpoll/DNS/SNTP tests, and read 2.43 M / 2.61 M /
+> 2.54 M µs on three consecutive boots of one binary (±3.5%, which is what made
+> it look like signal) and **6.82 M** on the fourth. Three agreeing samples are
+> not a benchmark.
+>
+> Verified QEMU/TCG **495/0**, Firecracker **484/0**, OVMF/GRUB **488/0**, bare
+> metal **488/0**. AArch64 `.text` and `.data` byte-identical across the
+> signature change; `.rodata` differs by **one byte** — a panic `Location` line
+> number moving 1926 → 1944, exactly the comment lines added above it.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate

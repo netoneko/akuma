@@ -178,6 +178,7 @@ pub fn smoke_test(t: &mut Suite) {
     // ── the range walks ────────────────────────────────────────────────────
     range_walk_test(t, &mut uas);
 
+
     // ── a shared view owns nothing ─────────────────────────────────────────
     let root = uas.l0_phys();
     let Some(shared) = UserAddressSpace::new_shared(root) else {
@@ -352,4 +353,76 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
     for f in [frames[0], frames[1]] {
         akuma_pmm::free_page(f, 0);
     }
+}
+
+/// The per-core live-L0 registry `UserAddressSpace::drop` gates on.
+///
+/// **This is the prerequisite for letting an address space drop at all on this
+/// target** (`proposals/AMD64_STEP5_PROCESS_TABLE.md` § "the free gate is
+/// blind"). `Drop` frees page tables, and it is safe only because
+/// `any_core_on_l0` parks the frames when a core is still running them. The
+/// registry is fed by `publish_l0_begin`/`publish_l0_end`, whose only caller
+/// was the `cfg(aarch64)` `msr ttbr0_el1` in `akuma-threading`; this target
+/// writes `CR3` in `paging::activate`, which now brackets itself.
+///
+/// Two properties, and the second is the one that was silently wrong:
+///
+/// 1. **The running root is published.** `any_core_on_l0(CR3)` must name a
+///    core, and a root nothing runs must name none. Without this the gate
+///    reports "free it" for every table in the system.
+/// 2. **Cores publish into distinct slots.** `publish_l0_begin` used to read
+///    `akuma_bkl::bkl::current_core_id()`, which is a literal `0` on every
+///    build without `kernel_smp_shared` — and this target is real SMP without
+///    it. Four cores all writing slot 0 is worse than no registry: the last
+///    writer erases the record of a table a peer is still executing on. Checked
+///    by publishing distinct fake roots into each core's slot and reading all
+///    of them back, which fails against the old single-slot behaviour.
+pub fn live_l0_registry_test(t: &mut Suite) {
+    // Called AFTER the process tests, not beside the rest of this module, and
+    // the ordering is the substance: `ACTIVE_L0` starts at 0 ("boot/kernel
+    // table, or never published" — safe, because neither is ever freed), so
+    // "the root this core runs is in the registry" is not true until a real
+    // address-space switch has gone through `paging::activate`. Placed early it
+    // fails, which is what it did on its first run — the check was right and its
+    // position was wrong.
+    let live = crate::paging::active_root();
+    t.check(
+        "l0reg: the running root is published once processes have switched",
+        akuma_mmu::any_core_on_l0(live as usize).is_some(),
+    );
+    // A plausible but unused frame address. Page-aligned and inside RAM, so a
+    // walker would accept it — the point is that nothing *runs* it.
+    const UNUSED_ROOT: usize = 0x0dea_d000;
+    t.check(
+        "l0reg: a root no core runs is not live",
+        akuma_mmu::any_core_on_l0(UNUSED_ROOT).is_none(),
+    );
+
+    // Distinct slots. `test_publish_core_l0` is the crate's own boot-suite hook
+    // — the cores cannot be made to genuinely park on a test table, so their
+    // slots are written directly and read back through the real query.
+    const CORES: usize = 4;
+    let fake = |i: usize| 0x0011_0000usize + i * 0x1000;
+    for i in 0..CORES {
+        akuma_mmu::test_publish_core_l0(i, fake(i));
+    }
+    let mut distinct = 0u64;
+    for i in 0..CORES {
+        if akuma_mmu::any_core_on_l0(fake(i)) == Some(i) {
+            distinct += 1;
+        }
+    }
+    t.check_eq("l0reg: four cores occupy four slots", distinct, CORES as u64);
+    // Put them back. Zero is the "boot/kernel table or never published" value,
+    // and the boot table is never freed, so it is the safe resting state — but
+    // core 0 is *this* core and must go back to what it is really running, or
+    // the next real switch reads a stale PREV.
+    for i in 1..CORES {
+        akuma_mmu::test_publish_core_l0(i, 0);
+    }
+    akuma_mmu::test_publish_core_l0(0, live as usize);
+    t.check(
+        "l0reg: the running root survives the probe",
+        akuma_mmu::any_core_on_l0(live as usize).is_some(),
+    );
 }

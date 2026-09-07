@@ -1024,13 +1024,31 @@ static ACTIVE_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_C
 /// few-instruction msr window of a TTBR0 write).
 static PREV_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_CORES];
 
-/// Begin a TTBR0 transition on this core: publish the new L0 while keeping
-/// the old one visible. Call immediately BEFORE the `msr ttbr0_el1` (IRQs
-/// must already be masked so the pair can't migrate cores). Returns the core
-/// index to pass to [`publish_l0_end`].
+/// Begin a TTBR0/`CR3` transition on `core`: publish the new L0 while keeping
+/// the old one visible. Call immediately BEFORE the `msr ttbr0_el1` / `mov cr3`
+/// (IRQs must already be masked so the pair cannot migrate cores). Returns the
+/// core index to pass to [`publish_l0_end`].
+///
+/// # Why the core is an argument
+///
+/// It used to read `akuma_bkl::bkl::current_core_id()` itself, which is
+/// `akuma_primitives::cpu::current_core_id` — an `mrs mpidr_el1` under
+/// `kernel_smp_shared`, and a **literal `0`** otherwise. That shim's doc reasons
+/// about two cases (single-core, and the AArch64 multikernel where every caller
+/// wants `0`) and there is now a third it did not anticipate: **amd64 is real
+/// SMP without `kernel_smp_shared`**, running four cores off its own ticket BKL
+/// in `amd64/src/smp.rs`. There every core would have published into slot 0,
+/// and the last writer would erase the record of a table a *peer* core is still
+/// running on — which is the precise thing this registry exists to prevent, so
+/// the gate would have been worse than absent.
+///
+/// Every other `current_core_id()` reader amd64 reaches is a trace line, which
+/// is why nothing has surfaced. This one is load-bearing, so it asks the caller
+/// — who knows (`bkl::current_core_id()` on AArch64,
+/// `amd64::smp::cpu_index()` on x86_64) — instead of guessing.
 #[inline]
-pub fn publish_l0_begin(new_ttbr0: u64) -> usize {
-    let core = (akuma_bkl::bkl::current_core_id() as usize) % TTBR_TRACK_CORES;
+pub fn publish_l0_begin(new_ttbr0: u64, core: usize) -> usize {
+    let core = core % TTBR_TRACK_CORES;
     let old = ACTIVE_L0[core].load(Ordering::Relaxed);
     PREV_L0[core].store(old, Ordering::SeqCst);
     ACTIVE_L0[core].store(new_ttbr0 & L0_BASE_MASK, Ordering::SeqCst);
@@ -2431,7 +2449,7 @@ impl UserAddressSpace {
         let _ = flush_tlb_all(TlbTarget::AllCores);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
-            let _core = publish_l0_begin(_ttbr0);
+            let _core = publish_l0_begin(_ttbr0, akuma_bkl::bkl::current_core_id() as usize);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
             publish_l0_end(_core);
         }
@@ -2446,7 +2464,7 @@ impl UserAddressSpace {
         let _ = flush_tlb_all(TlbTarget::AllCores);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
-            let _core = publish_l0_begin(_boot_ttbr0);
+            let _core = publish_l0_begin(_boot_ttbr0, akuma_bkl::bkl::current_core_id() as usize);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
             publish_l0_end(_core);
         }

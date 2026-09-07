@@ -376,7 +376,30 @@ pub fn active_root() -> u64 {
     read_cr3()
 }
 
-/// Switch the active address space.
+/// Switch the active address space, publishing the transition to
+/// `akuma-mmu`'s per-core live-L0 registry.
+///
+/// # The publish is not bookkeeping
+///
+/// `akuma_mmu::UserAddressSpace` frees its page tables in `Drop`, and that is
+/// only safe because `any_core_on_l0` first asks whether any core is still
+/// running them — parking the frames if so. That registry is fed by
+/// `publish_l0_begin`/`publish_l0_end`, whose only caller was the
+/// `#[cfg(target_arch = "aarch64")]` `msr ttbr0_el1` block in `akuma-threading`.
+/// This target writes `CR3` here, so until now the gate answered "no core holds
+/// this" for **every** table — and step 5a is where address spaces start
+/// dropping (`proposals/AMD64_STEP5_PROCESS_TABLE.md`). Publishing before there
+/// is a consumer is the right order: the registry has to be correct *for the
+/// whole run* before the first `Drop`, not from the moment one is added.
+///
+/// `smp::cpu_index()`, not `bkl::current_core_id()` — that one is a literal `0`
+/// on every build without `kernel_smp_shared`, which this target is while
+/// running four cores. See `publish_l0_begin`'s own note.
+///
+/// IRQs are masked across the pair, as the registry requires: it publishes into
+/// *this* core's slot, and a thread that migrated between the two calls would
+/// leave a stale ACTIVE entry naming a table this core no longer runs. Save and
+/// restore rather than `cli`/`sti`, because most callers already have them off.
 ///
 /// # Safety
 /// `root` must be a PML4 that maps every page this kernel is currently
@@ -385,10 +408,93 @@ pub fn active_root() -> u64 {
 /// address space missing any of those faults on the instruction after `mov cr3`,
 /// with no way to report it.
 pub unsafe fn activate(root: u64) {
+    // Published on every call, not only when the root changes — which is where
+    // the AArch64 caller puts its `if new_ttbr0 != current_ttbr0`. Deliberate,
+    // and matching this function's existing "write CR3 unconditionally" rule:
+    // the `mov cr3` here is a full TLB flush costing hundreds of cycles, next to
+    // which three uncontended `xchg` is a small constant. A publish-on-change
+    // refinement is available (compare against `ACTIVE_L0` rather than re-reading
+    // CR3) if a real scheduler probe ever shows it matters — the boot suite
+    // cannot answer that question in either direction, for the reasons
+    // `boot::self_tests`' guest-clock stamp records.
+    let flags = irq_save_mask();
+    let core = akuma_mmu::publish_l0_begin(root, crate::smp::cpu_index());
     // SAFETY: caller's obligation, stated above. Writing CR3 also flushes the
     // non-global TLB, which is what makes the switch take effect.
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    }
+    akuma_mmu::publish_l0_end(core);
+    // SAFETY: restores exactly the interrupt-enable state observed above.
+    unsafe { irq_restore(flags) };
+}
+
+
+/// [`activate`] **without** the registry publish, for the one caller that runs
+/// before this core can say which core it is.
+///
+/// `smp::ap_entry64`'s very first act — before `install_percpu`, before even
+/// `idt::load()` — is to get off the boot tables. `cpu_index()` reads `gs:[0]`
+/// and `IA32_GS_BASE` is still 0 there, so publishing would dereference address
+/// 0 on a core with no IDT: a triple fault whose symptom is the *BSP* hanging in
+/// `start_secondaries` waiting for a core that is already dead. Measured
+/// 2026-09-07 — the suite stopped after `preempt: teardown leaks nothing` and
+/// produced no tally at all. It is the trap `smp`'s own module header states for
+/// `percpu_installed`, arrived at from the other direction.
+///
+/// **A separate entry point rather than a `percpu_installed()` check inside
+/// [`activate`]**, because that check is an `rdmsr` and `activate` is on the
+/// context-switch path. One caller knows it is early; every other caller should
+/// not pay a serialising MSR read for it.
+///
+/// Skipping the publish here is not a hole: the only transition before per-CPU
+/// state exists is boot tables → kernel root, and neither is ever freed, so the
+/// gate has nothing to protect. Every switch that can name a *user* address
+/// space happens long after.
+///
+/// # Safety
+/// As [`activate`], plus: the caller must be on a path where per-CPU state does
+/// not yet exist. Anywhere else, use [`activate`] so the free gate sees the
+/// switch.
+pub unsafe fn activate_unpublished(root: u64) {
+    // SAFETY: caller's obligation, stated above.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    }
+}
+
+/// `RFLAGS.IF` mask — interrupts enabled.
+const RFLAGS_IF: u64 = 1 << 9;
+
+/// Read `RFLAGS` and mask interrupts, returning what to hand [`irq_restore`].
+///
+/// Not `akuma_cpu::daif::mask_irq()`: that is a **silent no-op on x86_64** (its
+/// `asm!` is `#[cfg(target_arch = "aarch64")]` and every other arm falls through
+/// to an empty body), the same trap `amd64/src/exec_runtime.rs` records against
+/// `akuma_primitives::irq::IrqGuard` on this target.
+#[inline]
+fn irq_save_mask() -> u64 {
+    let flags: u64;
+    // SAFETY: pushes and pops one word on the current stack, then masks — the
+    // conservative direction, with no memory effect.
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem));
+    }
+    flags
+}
+
+/// Re-enable interrupts only if [`irq_save_mask`] found them enabled.
+///
+/// # Safety
+/// `flags` must be a value returned by [`irq_save_mask`] on this core, with no
+/// intervening change of interrupt policy the caller meant to keep.
+#[inline]
+unsafe fn irq_restore(flags: u64) {
+    if flags & RFLAGS_IF != 0 {
+        // SAFETY: the caller observed interrupts enabled before masking them.
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 

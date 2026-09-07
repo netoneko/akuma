@@ -208,6 +208,30 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // runs a real program and its bad pointers must be `EFAULT`.
     let user_ptr_bypass = akuma_user_access::BypassValidationGuard::new();
 
+    // Guest-clock stamp for the whole suite, reported as a `note` at the end.
+    //
+    // **Read what this is before using it to compare anything.** Two facts,
+    // both measured 2026-09-07 on QEMU/TCG at `SMP=4`:
+    //
+    // 1. *Host wall time cannot A/B this target.* The same unchanged binary
+    //    booted in 41 s, 42 s and 68 s. A host-side stopwatch will confirm any
+    //    hypothesis you bring it, and it did — three "measurements" of a
+    //    context-switch change here were pure noise before this note existed.
+    // 2. *Neither can this number, and it is the more dangerous of the two
+    //    because it looks trustworthy.* It is dominated by the tests that wait
+    //    on a **timeout** — the netpoll/DNS/SNTP family — so whether the
+    //    boot-time clock sync happens to land moves it by seconds. One
+    //    unchanged binary measured 2.43 M, 2.61 M and 2.54 M µs in three
+    //    consecutive boots (a tidy ±3.5%, which is exactly what made it look
+    //    like a signal) and **6.82 M** on the fourth. Its host wall times over
+    //    the same four runs moved the opposite way.
+    //
+    // So: useful as a per-boot fact in the log, and as a tripwire for a change
+    // that alters how long the suite *waits*. Not a benchmark, and three
+    // agreeing samples do not make it one. A hot-path cost wants a probe that
+    // runs the path in a loop, the way `scripts/benchmarks/` does it.
+    let suite_start_us = crate::net::uptime_us();
+
     crate::mem::smoke_test(t);
     paging::smoke_test(t);
     // The *other* x86 walker: `akuma-mmu`'s, which the shared crates reach
@@ -266,6 +290,10 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::dispatch_smoke_test(t, cx.have_fs);
     usermode::smoke_test(t);
     usermode::preempt_test(t);
+    // The per-core live-L0 registry, here rather than with the rest of
+    // `uas::smoke_test` because it asks about switches that have actually
+    // happened — see the function's own note.
+    crate::uas::live_l0_registry_test(t);
 
     // The other cores. `nosmp` boots single-core: a bring-up lever, not policy —
     // on a machine whose only console is a framebuffer, `[BKL] stuck` chatter
@@ -365,5 +393,6 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     t.note("sched: wakes over the whole suite", sched::wakes());
     t.note("sched: backstop releases (0 is the healthy value)", sched::backstop_wakes());
 
+    t.note("suite: guest microseconds elapsed", crate::net::uptime_us().saturating_sub(suite_start_us));
     Verdict { passed: t.report() }
 }

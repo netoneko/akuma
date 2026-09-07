@@ -769,7 +769,7 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     // touches — the image, the physmap this stack is in, the device window.
     // SAFETY: the kernel root shares the upper half with the boot tables, so
     // the instruction after the write is mapped.
-    unsafe { paging::activate(sched::kernel_root()) };
+    unsafe { paging::activate_unpublished(sched::kernel_root()) };
     enable_sse();
     gdt::init_cpu(idx, PERCPU[idx].stack_top.load(Ordering::Relaxed));
     idt::load();

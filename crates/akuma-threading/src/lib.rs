@@ -4495,7 +4495,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 // page-table-UAF free gate, see mmu::any_core_on_l0): PREV covers the
                 // outgoing table across the msr window, ACTIVE covers the incoming one
                 // from before the hardware can walk it.
-                let pub_core = mmu::publish_l0_begin(new_ttbr0);
+                let pub_core = mmu::publish_l0_begin(new_ttbr0, bkl::current_core_id() as usize);
                 core::arch::asm!(
                     "dsb ish",
                     "msr ttbr0_el1, {ttbr0}",
