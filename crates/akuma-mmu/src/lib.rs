@@ -2597,11 +2597,21 @@ impl Drop for UserAddressSpace {
 // A minimal x86_64 body, ported directly from `amd64/src/paging.rs` (which
 // already built this exact vocabulary and encoding — see that file's own
 // header) rather than redesigned. Deliberately NOT the aarch64 struct's peer
-// in features: no ASID/PCID, no CoW sharing, no refcounted frames, no lazy
-// regions, no multi-core epoch tracking. `UserAddressSpace` on this target
-// is a different, much smaller type that happens to share a name — any
+// in features: no ASID/PCID, no lazy regions, no multi-core epoch tracking, and
+// no `SHARED_L0_TABLE` arbitration for a shared view. `UserAddressSpace` on this
+// target is a different, much smaller type that happens to share a name — any
 // caller reaching for a method only the aarch64 side has gets a compile
 // error here, which is the honest boundary of what this port proves.
+//
+// **It is the amd64 kernel's only user-space walker since step 5a.** That
+// sentence used to read "no runtime caller"; `amd64/src/paging.rs` lost its
+// `AddressSpace` and `mm.rs`/`idt.rs`/`loader.rs`/`usermode.rs`/`fd.rs` all map
+// through this (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`). Three things
+// arrived with those callers and are x86-only for stated reasons: the PTE-level
+// entry points (`map_page_pte`/`map_and_track_pte`/`pte_prot`), which carry the
+// copy-on-write marker a neutral `Prot` cannot; `LeafAction::Remap`; and a
+// `Drop` impl, which is safe here only because `amd64::paging::activate` now
+// feeds `any_core_on_l0`.
 
 /// x86_64 page permissions, as permissions rather than as an encoding.
 ///

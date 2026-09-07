@@ -670,8 +670,9 @@ pub fn idle_loop() -> ! {
 /// Finish with [`publish_task`].
 ///
 /// `space_root` is installed in `CR3` whenever this thread is scheduled. The
-/// address space must share the kernel's mappings — see `paging::AddressSpace` —
-/// or the switch faults on the instruction after `mov cr3`.
+/// address space must share the kernel's mappings — see
+/// `akuma_mmu::UserAddressSpace::SHARED_PML4_SLOTS` — or the switch faults on the
+/// instruction after `mov cr3`.
 ///
 /// **There is no publish-immediately variant, on purpose.** There was one until
 /// 2026-09-06, and the gap it leaves has bitten this target twice for the same
@@ -717,7 +718,7 @@ pub fn set_current_space_root(space_root: u64) {
         space_root
     };
     if want != paging::active_root() {
-        // SAFETY: `want` is either a live `AddressSpace` root (from `execve`'s
+        // SAFETY: `want` is either a live `UserAddressSpace` root (from `execve`'s
         // freshly-loaded image) or the kernel's own; both share the upper-half
         // mappings, so the kernel stack and code stay mapped across the write.
         unsafe {

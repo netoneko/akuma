@@ -139,12 +139,14 @@ akuma-procfs = { path = "../crates/akuma-procfs" }
 akuma-user-space = { path = "../crates/akuma-user-space" }
 # `PhysFrame`, the ledger's currency.
 akuma-mmap = { path = "../crates/akuma-mmap" }
-# The shared MMU crate. It already arrived transitively through
-# `akuma-user-access`; naming it directly is what lets `src/uas.rs` drive its
-# x86 `UserAddressSpace` at boot. That type is the one `akuma-exec`/`akuma-elf`
-# walk through and the one item C1 folds this kernel onto — `paging.rs` is still
-# what maps a page here today, and the two walkers are pinned to the same six
-# encodings by `x86_prot_matches_amd64_encoding`.
+# The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
+# table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
+# `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own
+# `AddressSpace` (it keeps the kernel's own mappings, which this crate does not
+# do on either architecture). It also owns the permission vocabulary and the
+# encoder both walkers share, so `x86_prot_matches_amd64_encoding` pins one
+# implementation rather than an agreement between two.
+# `docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`.
 akuma-mmu = { path = "../crates/akuma-mmu" }
 # The copy-on-write write-fault decision — four outcomes from (live PTE, CoW
 # marker, share count), host-tested. Shared with the AArch64 kernel so both

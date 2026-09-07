@@ -2004,10 +2004,10 @@ pub struct Process {
     ///
     /// `MmapRegion::frames` is left **empty** on this target and `pages`
     /// carries the extent — the CoW-inherited shape the crate documents. Frame
-    /// ownership here is `akuma_user_space::FrameLedger`'s job
-    /// ([`Process::frames`]), which counts VAs per frame and is what teardown
-    /// walks; a second frame list in the region would be a second answer to
-    /// the same question.
+    /// ownership here is `akuma_user_space::FrameLedger`'s job — since step 5a
+    /// the one **inside** [`Process::space`] — which counts VAs per frame and is
+    /// what teardown walks; a second frame list in the region would be a second
+    /// answer to the same question.
     regions: Spinlock<Vec<MmapRegion>>,
 }
 

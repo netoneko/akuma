@@ -1,21 +1,41 @@
-//! x86_64 4-level page tables: map, unmap, translate.
+//! x86_64 4-level page tables **for the kernel's own mappings**: map, unmap,
+//! translate.
 //!
 //! Stage B of the amd64 bring-up. `boot.s` leaves the machine on a fixed
 //! identity map of the first 1 GiB built from 2 MiB pages; this is the first
 //! code that can *change* a mapping, which is the prerequisite for anything that
 //! demand-pages, protects a region, or addresses memory beyond that window.
 //!
+//! # This file used to serve two roles; step 5a took one away
+//!
+//! Until then it owned **both** the kernel's own tables and every process's:
+//! `AddressSpace::{new,map,translate,prot,free}`, `for_each_user_leaf`,
+//! `for_each_leaf_in_range` and `prot_in` were a second, complete x86 walker
+//! beside `akuma_mmu::UserAddressSpace` — the one `akuma-exec`, `akuma-elf` and
+//! `akuma-syscalls-glue` reach through. `mm.rs`, `idt.rs`, `usermode.rs`,
+//! `loader.rs` and `fd.rs` all went through this one; they go through the crate
+//! now, and the user half of this file is gone
+//! (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`).
+//!
+//! What remains is role 1 and only role 1: the kernel image, the physmap, the
+//! device window and the MMIO pages `pci.rs`/`lapic.rs`/`blk.rs` map. `akuma-mmu`
+//! does not do kernel mappings on **either** architecture, so this is not a
+//! duplicate of anything.
+//!
+//! [`activate`] is the one function here that both roles need, which is why it
+//! publishes to `akuma-mmu`'s per-core live-L0 registry — see its own header.
+//!
 //! # Two `Prot`s, and why they stay two
 //!
-//! [`PteProt`] below is the **page-table** vocabulary: what the hardware is
-//! told, including a [`COW`] marker bit that is not a permission at all.
+//! [`PteProt`] is the **page-table** vocabulary: what the hardware is told.
 //! `akuma_mmap::Prot` is the **region** vocabulary: what a mapping is *supposed*
 //! to be. They were both called `Prot` until 2026-09-07 and the rename is what
 //! makes the difference visible at every call site.
 //!
-//! [`encode`] is now `akuma_mmap::Prot`'s x86 backend, reached through
-//! [`PteProt::from_region`]. The bits stay here — with the walker that writes
-//! them — because the two encodings share **no field**:
+//! Both the type and [`akuma_mmu::encode_pte`] behind [`encode`] are the shared
+//! crate's since step 5a; this file re-exports them (see [`PteProt`]'s note).
+//! The bits stay named here — with the walker that writes them — because the two
+//! architectures' encodings share **no field**:
 //!
 //! | | AArch64 | x86_64 |
 //! |---|---|---|
@@ -34,8 +54,10 @@
 //! [`PteProt::from_region`].
 //!
 //! Do **not** try to make the region token carry the CoW marker: it is x86 PTE
-//! bit 9, meaningless to a region, and `akuma-cow` already takes decoded
-//! booleans precisely so it never sees a PTE.
+//! bit 9 ([`COW`]), meaningless to a region, and `akuma-cow` already takes
+//! decoded booleans precisely so it never sees a PTE. It is not a field of
+//! [`PteProt`] either — it is `encode_pte`'s third argument, and the mappings
+//! *this* file makes are the kernel's own, which never carry it.
 //!
 //! # Why the tables can be dereferenced directly
 //!
@@ -72,6 +94,13 @@ const PCD: u64 = 1 << 4;
 /// Deciding from the share count alone promotes an `mprotect`ed page to
 /// writable the moment its frame happens to be shared, which is the trap
 /// `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` is about.
+///
+/// **Nothing in this file sets it** since step 5a — the mappings here are the
+/// kernel's own. It is kept because it is still this file's statement of *which*
+/// bit the marker is, and because `region_prot_roundtrip_check` asserts that
+/// `akuma_mmu::encode_pte`'s `cow` argument sets exactly this one and nothing
+/// else. `akuma-mmu`'s `X86_COW` is the same literal on the other side of that
+/// check, which is the point of checking it.
 const COW: u64 = 1 << 9;
 
 /// No-execute. **Requires `EFER.NXE`**, which `boot.s` sets alongside `LME`;

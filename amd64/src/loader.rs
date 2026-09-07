@@ -12,21 +12,32 @@
 //! Linux binary is linked, and a loader that can only place an image at an
 //! address chosen to dodge the kernel is a loader for one program.
 //!
-//! # Why this is not `akuma-elf`
+//! # Why this is not `akuma-elf` — **and why that reason has expired**
 //!
 //! The tree has an ELF loader — `crates/akuma-elf` — and it is arch-neutral in
-//! everything that matters here: `source.rs` parses through the vetted `elf`
-//! 0.7 crate and never names an architecture. It is unusable from this target
-//! anyway, for one structural reason: `load.rs`, `interp.rs` and `stack.rs` are
-//! all written against `akuma_mmu::UserAddressSpace`, and `akuma-mmu` is
-//! AArch64 page-table code. The dependency is real, not incidental — a loader
-//! that cannot name an address space cannot place a segment, which is the
-//! reasoning recorded in that crate's own manifest.
+//! everything that matters here. The reason this file existed beside it was
+//! structural: `load.rs`, `interp.rs` and `stack.rs` are written against
+//! `akuma_mmu::UserAddressSpace`, and that type was AArch64 page-table code. A
+//! loader that cannot name an address space cannot place a segment.
 //!
-//! So the split that would let the two share is a **parse/place split**: the
-//! `ElfSource` + `parse_headers` half is neutral and `pub(super)`, the mapping
-//! half is not. That is the shape a future extraction should take, and it is
-//! not this stage's work. What this file deliberately does *not* do is
+//! **That is no longer true.** B3 gave `akuma-mmu` an x86_64
+//! `UserAddressSpace`, `akuma-elf`'s `EM_NATIVE` is `cfg(target_arch)`-selected,
+//! `impl UserPages for UserAddressSpace` is arch-neutral, and since step 5a this
+//! file maps through that very type — every signature below already takes
+//! `&mut UserAddressSpace`. What is left between here and `akuma_elf::load_elf`
+//! is not a dependency, it is a **VA layout**: this file's `PIE_BASE`
+//! (`0x1000_0000`), `INTERP_BASE` (`0x4000_0000`) and `ELF_STACK_TOP` were
+//! chosen against `mm::MMAP_BASE`, and `akuma-elf` picks different ones. Moving
+//! to it moves where every program on this target lands, which is C1 **step 6**
+//! and wants its own A/B rather than a rider on somebody else's change
+//! (`proposals/NEXT_AGENT_AMD64_STEP5_PROCESS_TABLE.md`).
+//!
+//! One thing to fix on the way in: `akuma_elf::interp` still compares
+//! `e_machine` against a hardcoded `EM_AARCH64`, where `load.rs` uses the
+//! `cfg`-selected `EM_NATIVE`. Nothing has noticed because no x86 caller has
+//! reached the interpreter path yet.
+//!
+//! What this file deliberately does *not* do is
 //! re-implement the parsing: it calls the same `elf` 0.7 crate through the same
 //! `parse_ident` / `parse_tail` / `SegmentTable` path, so the tree still has one
 //! ELF parser and two consumers of it — not two parsers, which is the defect
@@ -43,7 +54,7 @@
 //!   fully self-contained image that only needs a base address and its own
 //!   `_start` to bring itself up — see "Static-PIE" below.
 //! * A segment outside the lower half. The upper half is the kernel's, and a
-//!   `p_vaddr` there would ask `map_page_in` to overwrite a shared PML4 entry.
+//!   `p_vaddr` there would ask the walker to overwrite a shared PML4 entry.
 //! * A page that would end up **writable and executable**. `PteProt` offers no
 //!   `USER_RWX` constructor for the same reason, and this is where that becomes
 //!   enforcement rather than convention: an unaligned link packs .text and .data

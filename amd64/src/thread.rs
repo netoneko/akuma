@@ -15,8 +15,8 @@
 //!
 //! | `fork` gives the child | a thread wants |
 //! |---|---|
-//! | a new `AddressSpace` (CoW-shared) | the parent's, unchanged |
-//! | its own `FrameSet` | none — it owns no frames |
+//! | a new `UserAddressSpace` (CoW-shared) | the parent's, unchanged |
+//! | its own frame ledger (inside that address space) | none — it owns no frames |
 //! | a `PROCS` slot and a `Spawn` record | the parent's, shared |
 //! | its own fd routing (`UserCtx::proc_slot`) | the parent's, shared |
 //! | its own `%fs` base, copied from the parent | its own, **from `CLONE_SETTLS`** |

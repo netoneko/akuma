@@ -421,6 +421,59 @@ as they stand one day after the survey
 > are done; the work starts at 5a (`Process.space` → `ProcAddressSpace`, and
 > `paging.rs` loses its user half — 26 call sites across four files).
 
+> **Step 5a landed — one x86 user-space walker (2026-09-08)** —
+> `docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`. `paging.rs` lost its user
+> half; `mm.rs`, `idt.rs`, `loader.rs`, `usermode.rs` and `fd.rs` map through
+> `akuma_mmu::UserAddressSpace`. `Process` lost `space: paging::AddressSpace`
+> **and** `frames: FrameSet` — two objects, one of them a second frame ledger
+> beside the page table — for one `ProcAddressSpace`, which is the field
+> `akuma_exec::Process` requires, so **5b could not have gone first**. Teardown
+> changed from an explicit `free_all_frames` + `space.free()` pair that six
+> bail-out arms each had to remember, to `Drop`.
+>
+> Four things came out of it, and three were not visible from reading:
+>
+> - **`cow_write_fault` had to keep reading `CR3`.** Resolving the faulting
+>   address space through the running process compiles, reads better, and
+>   silently deletes the only coverage the CoW break has that needs no live
+>   program: `uaccess.rs`'s `CR0.WP` test maps a marked pair into the *kernel's*
+>   root and drives `#PF` from ring 0, where there is no process to resolve.
+>   `UserAddressSpace::new_shared(active_root())` — a view that owns nothing and
+>   frees nothing — keeps both, and is the more honest reading anyway.
+> - **The mutating range walk now hands its closure the frame ledger.** Every
+>   real caller edits the ledger in the same step, and the amd64 spelling of that
+>   (`untrack_anon_frame`) takes the address-space lock the walk is already
+>   holding. The alternatives were a residency-sized `Vec` on the one syscall
+>   that runs when memory is short, or giving up the `&mut self` that documents
+>   the lock hold.
+> - **`have_address_space()` stopped being what prevents the bug.**
+>   `paging::active_root()` answered with `CR3` whoever asked, so a `munmap` on a
+>   kernel thread walked the kernel's own tables unless five call sites each
+>   remembered to guard. There is no root to pass now. The checks stay, because
+>   the **errno** is the point: no process must be `ESRCH`, not the `0` a
+>   silently-skipped unmap returns.
+> - **One `PteProt`, one encoder.** `paging.rs`'s copy of the type and of
+>   `encode` is gone; `akuma_mmu::encode_pte` is `pub` and both walkers use it,
+>   so `x86_prot_matches_amd64_encoding` pins one implementation instead of an
+>   agreement between two.
+>
+> Verified QEMU/TCG **508/0** (was 495), Firecracker **497/0** (was 484),
+> OVMF/GRUB **501/0** (was 488), bare metal **501/0** (was 488) — every arm
+> baseline + 13, zero failures — plus ring 3 on the metal: ~85 process lifetimes
+> (pipelines, `find /`, a 76 102-line `grep`) with `free` used going *down*,
+> which is the observation a boot tally cannot make about a teardown change.
+> `c_stress` memory probes held at **8/10, 0 unexpected**. Host tests **1360**.
+> AArch64 `.text`/`.rodata`/`.data` all **byte-identical**.
+>
+> **Next is step 6 or 5b.** Step 6's stated blocker has expired — `loader.rs`
+> already takes `&mut UserAddressSpace` throughout, `akuma-elf`'s `EM_NATIVE` is
+> `cfg`-selected and `impl UserPages` is arch-neutral — what is left is a **VA
+> layout** decision (`PIE_BASE`/`INTERP_BASE`/`ELF_STACK_TOP` vs
+> `mm::MMAP_BASE`), which wants its own A/B. Found on the way:
+> `akuma_elf::interp` still tests `e_machine` against a hardcoded `EM_AARCH64`
+> where `load.rs` uses `EM_NATIVE`, so it will refuse every dynamic binary the
+> moment an x86 caller reaches the interpreter path.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate

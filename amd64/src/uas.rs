@@ -1,16 +1,23 @@
 //! The shared [`akuma_mmu::UserAddressSpace`], exercised on real hardware.
 //!
-//! `amd64/src/paging.rs` drives this kernel's page tables today; the type this
-//! module tests is the *other* x86 walker — the one inside `akuma-mmu` that
-//! `akuma-exec`, `akuma-elf` and `akuma-syscalls-glue` reach through, and that
-//! item **C1** will fold this kernel onto. Until that fold it has no runtime
-//! caller here at all, which is exactly why it needs a test: B3 widened it from
-//! 6 methods to 30 (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`), and a
-//! compile-only proof of thirty methods is a proof that they *type-check*.
+//! This is now the **only** x86 user-space walker on this target: step 5a
+//! deleted `amd64/src/paging.rs`'s `AddressSpace` and pointed `mm.rs`, `idt.rs`,
+//! `loader.rs`, `usermode.rs` and `fd.rs` at this type
+//! (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`). It has real runtime
+//! callers now, which changes what this suite is *for* rather than making it
+//! redundant: the boot suite runs before any process exists, so it is the only
+//! place the methods can be driven on an address space nobody is standing on —
+//! which is exactly what `drop_returns_frames_test` needs.
+//!
+//! It was written when the type had no caller here at all, because B3 had
+//! widened it from 6 methods to 30 (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`)
+//! and a compile-only proof of thirty methods is a proof that they *type-check*.
 //!
 //! # What this cannot cover, and why
 //!
-//! The suite never writes `CR3`. Installing a second address space mid-boot to
+//! The suite never writes `CR3` — apart from `paging::activate`, which the
+//! process tests do for real before `live_l0_registry_test` runs. Installing a
+//! second address space mid-boot to
 //! reach the two `map_user_page_tracked*` methods would put the running kernel's
 //! stack and code behind a page table this test just built — a mistake there is
 //! a triple fault with no console, on a box whose only recovery is a walk to

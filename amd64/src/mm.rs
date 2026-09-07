@@ -55,16 +55,28 @@
 //! or eager, shared-writable, a `PROT_NONE` reservation — is
 //! [`akuma_syscalls_mem::mmap::plan`]. The region algebra (clip, split, inherit)
 //! is `akuma-mmap`. The protection vocabulary is `akuma_mmap::Prot`, which
-//! [`crate::paging::PteProt::from_region`] encodes into x86 PTE bits. All three
+//! [`akuma_mmu::PteProt::from_region`] encodes into x86 PTE bits. All three
 //! are host-tested and shared with the AArch64 kernel, so this target cannot
 //! drift from it on exactly the arguments where Linux compatibility is subtle.
 //!
 //! What stays here is the half that is genuinely per-architecture: allocating
 //! frames, writing page tables, and the fault that populates a lazy page.
 //!
-//! # Where the region list lives
+//! # Where the page tables live, and where the region list lives
 //!
-//! `Process::regions` in `usermode.rs`, behind its own lock, reached through
+//! The tables are `Process::space`, an `akuma_mmu::UserAddressSpace` behind
+//! `ProcAddressSpace`'s lock, reached through
+//! [`crate::usermode::with_current_address_space`]. Until step 5a every function
+//! here took a bare `root: u64` from `paging::active_root()` — which answers with
+//! **`CR3`** whoever asks, so a `munmap` on a kernel thread walked the kernel's
+//! own tables. That could only be guarded by remembering to call
+//! `have_address_space()` first; there is no root to pass now, and the accessor
+//! answers `None` instead.
+//!
+//! The lock order in this module is **regions → address space → PMM**, in that
+//! direction only. `fault_in` and `dontneed_range` are the two that hold both.
+//!
+//! The region list is `Process::regions`, behind its own lock, reached through
 //! [`crate::usermode::with_current_regions`]. `akuma-mmap` cannot hold it — the
 //! crate has an empty `[dependencies]` table and cannot lock, allocate a frame,
 //! edit a page table or name a process, which is precisely what makes it
@@ -76,10 +88,14 @@
 //!
 //! `MmapRegion::frames` is left **empty** here and `pages` carries the extent —
 //! the CoW-inherited shape the crate documents and explicitly supports. Frame
-//! ownership on this target is `akuma_user_space::FrameLedger`
-//! (`Process::frames`), which counts VAs per frame and is what teardown walks. A
-//! second frame list inside the region would be a second answer to the same
-//! question, and the two would drift the first time a CoW break swapped a frame.
+//! ownership on this target is `akuma_user_space::FrameLedger`, which counts VAs
+//! per frame and is what teardown walks. Since step 5a that ledger lives
+//! **inside** the address space rather than beside it as a second `Process`
+//! field, so the walk that clears a PTE and the ledger entry that stops claiming
+//! its frame are reached through one object and edited in one descent
+//! ([`unmap_range`]). A second frame list inside the region would be a second
+//! answer to the same question, and the two would drift the first time a CoW
+//! break swapped a frame.
 
 use akuma_mmu::{LeafAction, PteProt};
 
@@ -887,7 +903,7 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 ///
 /// # The walk is the range walker, not a per-page loop
 ///
-/// [`paging::for_each_leaf_in_range`] visits only pages that are actually
+/// `UserAddressSpace::rewrite_leaves_in_range` visits only pages that are actually
 /// **present**, and every absent page is `PageAction::Nothing` anyway — so the
 /// walker's skip-an-absent-subtree-whole behaviour is not an optimisation here,
 /// it is what bounds the work by what is mapped instead of by a length ring 3
