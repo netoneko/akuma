@@ -92,14 +92,23 @@ pub(crate) fn alloc_page<A: UserPages>(
 }
 
 // ============================================================================
-// The AArch64 implementation
+// The `akuma_mmu::UserAddressSpace` implementation — both architectures
 // ============================================================================
 //
 // In this crate rather than in `akuma-mmu` because the trait is local here and
 // the type is foreign there — either placement is allowed by the orphan rule,
 // and this one keeps `akuma-mmu` unaware that an ELF loader exists.
+//
+// **One body, not two.** `UserAddressSpace` is a `target_arch`-gated pair of
+// structs sharing a name, and this impl compiled for AArch64 only until B3 gave
+// the x86_64 half the same method surface
+// (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`). Nothing in these three methods
+// is architecture-specific once that surface matches — `to_user_flags`' `u64`
+// is decoded by whichever walker receives it (see `akuma_mmu::user_flags::from_pte`)
+// — so widening the gate is the whole of the port. A second `cfg`-ed impl here
+// would be difference-by-duplication with no difference in it.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 impl UserPages for akuma_mmu::UserAddressSpace {
     fn new_space() -> Option<Self> {
         Self::new()

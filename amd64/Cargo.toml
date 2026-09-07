@@ -128,6 +128,13 @@ akuma-procfs = { path = "../crates/akuma-procfs" }
 akuma-user-space = { path = "../crates/akuma-user-space" }
 # `PhysFrame`, the ledger's currency.
 akuma-mmap = { path = "../crates/akuma-mmap" }
+# The shared MMU crate. It already arrived transitively through
+# `akuma-user-access`; naming it directly is what lets `src/uas.rs` drive its
+# x86 `UserAddressSpace` at boot. That type is the one `akuma-exec`/`akuma-elf`
+# walk through and the one item C1 folds this kernel onto — `paging.rs` is still
+# what maps a page here today, and the two walkers are pinned to the same six
+# encodings by `x86_prot_matches_amd64_encoding`.
+akuma-mmu = { path = "../crates/akuma-mmu" }
 # The copy-on-write write-fault decision — four outcomes from (live PTE, CoW
 # marker, share count), host-tested. Shared with the AArch64 kernel so both
 # distinguish "already repaired", "read-only on purpose", "sole owner" and

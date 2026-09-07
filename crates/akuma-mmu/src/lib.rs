@@ -199,9 +199,9 @@ pub use types::*;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use akuma_mmap::PhysFrame;
-// Gated like `UserAddressSpace` itself, which is the only thing that holds one:
-// on x86_64 that struct is compiled out and an ungated import is an error.
-#[cfg(target_arch = "aarch64")]
+// Both architectures' `UserAddressSpace` carries one — the AArch64 struct since
+// `akuma-user-space` was split out, the x86_64 one since B3 widened it
+// (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`).
 use akuma_user_space::FrameLedger;
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 
@@ -2588,20 +2588,38 @@ impl Drop for UserAddressSpace {
 /// x86_64 page permissions, as permissions rather than as an encoding.
 ///
 /// The x86 half of the vocabulary `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`
-/// §1 proposes — `amd64/src/paging.rs::Prot` already built exactly this shape;
-/// see its header for why keeping this a struct (rather than a `u64`) is the
-/// point: `write`/`exec`/`user` cannot collide the way `akuma-mmap::user_flags`'
+/// §1 proposes — `amd64/src/paging.rs::PteProt` already built exactly this
+/// shape; see its header for why keeping this a struct (rather than a `u64`) is
+/// the point: `write`/`exec`/`user` cannot collide the way `user_flags`'
 /// `RO`/`EXEC` constants alias on the AArch64 side.
-#[cfg(target_arch = "x86_64")]
+///
+/// # Why `PteProt` and not `Prot`
+///
+/// It was `Prot` until B3 (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`), and the
+/// name was a **shadow**: this crate does `pub use types::*`, which re-exports
+/// the neutral `akuma_mmap::Prot`, so on x86_64 `akuma_mmu::Prot` silently
+/// resolved to *this* struct instead. That is invisible while nothing shared
+/// names the type — and `akuma-syscalls-glue` names it, calling
+/// `mmu::Prot::from_prot(prot)` to turn an `mmap` argument into a region's
+/// protection. On AArch64 that is `akuma_mmap::Prot::from_prot`; on x86_64 it
+/// resolved here and failed to compile, which is the lucky outcome. Had this
+/// struct happened to carry a `from_prot`, the same source line would have
+/// produced a page-table encoding on one architecture and a region record on
+/// the other.
+///
+/// So the two levels are named apart, matching the sibling walker: [`Prot`] is
+/// what a *region* records, `PteProt` is what the *hardware* is told, and
+/// [`PteProt::from_region`] is the only bridge.
+#[cfg(any(target_arch = "x86_64", test))]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct Prot {
+pub struct PteProt {
     pub write: bool,
     pub exec: bool,
     pub user: bool,
 }
 
-#[cfg(target_arch = "x86_64")]
-impl Prot {
+#[cfg(any(target_arch = "x86_64", test))]
+impl PteProt {
     /// User read/write, no execute. The default for data.
     pub const USER_RW: Self = Self { write: true, exec: false, user: true };
     /// User read + execute, not writable.
@@ -2611,7 +2629,7 @@ impl Prot {
 /// How an x86_64 mapping is cached — the other half of `encode(prot, attr)`.
 /// See `amd64/src/paging.rs::MemAttr`'s header for why no consumer should
 /// care whether this becomes an `AttrIndx` (AArch64) or two PTE bits (x86).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MemAttr {
     /// Normal RAM: writeback cached. The only attribute any user page in
@@ -2625,35 +2643,35 @@ pub enum MemAttr {
     Device,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_P: u64 = 1 << 0;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_RW: u64 = 1 << 1;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_US: u64 = 1 << 2;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_PWT: u64 = 1 << 3;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_PCD: u64 = 1 << 4;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_PS: u64 = 1 << 7;
 /// No-execute. Requires `EFER.NXE`, which `amd64/src/boot.s` sets alongside
 /// `LME` — without it this is a reserved bit and setting it faults. Any
 /// x86_64 kernel that links this crate without doing the same will fault the
 /// first time a non-executable page is touched, not the first time one is
 /// mapped; there is nothing this crate can check for that at map time.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_NX: u64 = 1 << 63;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const X86_ENTRIES: usize = 512;
 
-/// Encode a [`Prot`] and [`MemAttr`] into x86_64 PTE bits. The x86 backend of
+/// Encode a [`PteProt`] and [`MemAttr`] into x86_64 PTE bits. The x86 backend of
 /// `encode(prot, attr)` — this crate stays the only one naming `P`/`RW`/`US`/
 /// `NX`/`PCD`/`PWT`, same discipline as the AArch64 `flags` module.
-#[cfg(target_arch = "x86_64")]
-const fn x86_encode(prot: Prot, attr: MemAttr) -> u64 {
+#[cfg(any(target_arch = "x86_64", test))]
+const fn x86_encode(prot: PteProt, attr: MemAttr) -> u64 {
     let mut bits = X86_P;
     if prot.write {
         bits |= X86_RW;
@@ -2672,7 +2690,7 @@ const fn x86_encode(prot: Prot, attr: MemAttr) -> u64 {
 }
 
 /// Index into the level-`n` table for `va`. Level 4 = PML4 … level 1 = PT.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", test))]
 const fn x86_index(va: usize, level: u32) -> usize {
     (va >> (12 + 9 * (level - 1))) & (X86_ENTRIES - 1)
 }
@@ -2690,7 +2708,7 @@ unsafe fn x86_table_mut(pa: u64) -> *mut u64 {
 /// Returns `None` if a frame could not be allocated, or if the entry is a
 /// huge page rather than a table pointer — splitting is not implemented.
 #[cfg(target_arch = "x86_64")]
-unsafe fn x86_next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> { unsafe {
+unsafe fn x86_next_table(entry_ptr: *mut u64, user: bool) -> Option<(u64, bool)> { unsafe {
     let entry = entry_ptr.read_volatile();
     if entry & X86_P != 0 {
         if entry & X86_PS != 0 {
@@ -2704,16 +2722,40 @@ unsafe fn x86_next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> { unsaf
         if entry & want != want {
             entry_ptr.write_volatile((entry | want) & !X86_NX);
         }
-        return Some(entry & X86_ADDR_MASK);
+        return Some((entry & X86_ADDR_MASK, false));
     }
     let frame = akuma_pmm::alloc_page()? as u64;
     core::ptr::write_bytes(x86_table_mut(frame).cast::<u8>(), 0, PAGE_SIZE);
     entry_ptr.write_volatile(frame | X86_P | X86_RW | if user { X86_US } else { 0 });
-    Some(frame)
+    Some((frame, true))
 }}
 
+/// Map one 4 KiB page, recording every page-table frame the walk allocates in
+/// `ledger`.
+///
+/// **The ledger is not optional, and that is the whole point.** An untracked
+/// table frame is not a leak the PMM can see: it is reachable only from the page
+/// table that references it, so an address space torn down without this loses it
+/// permanently. The AArch64 `map_page` discharges the same obligation with
+/// `get_or_create_table`, which calls `track_page_table_frame` **and**
+/// `track_frame(.., UserPageTable)` on every allocation; this is that, inside
+/// the walk.
+///
+/// This took an `Option<&FrameLedger>` for about an hour, defaulting to `None`
+/// so `map_page` could stay a one-liner — and `map_page` is the walk that
+/// allocates the *first* three tables of every address space. The amd64 boot
+/// test caught it as `page_table_frame_count() == 0` where three frames had just
+/// been allocated (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, B3). A parameter
+/// that can be omitted will be.
 #[cfg(target_arch = "x86_64")]
-fn x86_map_page_in(root: u64, va: usize, pa: usize, prot: Prot, attr: MemAttr) -> bool {
+fn x86_map_page_in(
+    root: u64,
+    va: usize,
+    pa: usize,
+    prot: PteProt,
+    attr: MemAttr,
+    ledger: &FrameLedger,
+) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
     assert_eq!(pa % PAGE_SIZE, 0, "pa must be page aligned");
     let mut table = root;
@@ -2721,7 +2763,14 @@ fn x86_map_page_in(root: u64, va: usize, pa: usize, prot: Prot, attr: MemAttr) -
         // SAFETY: `table` is a live table frame reached through the physmap.
         let entry_ptr = unsafe { x86_table_mut(table).add(x86_index(va, level)) };
         match unsafe { x86_next_table(entry_ptr, prot.user) } {
-            Some(next) => table = next,
+            Some((next, allocated)) => {
+                if allocated {
+                    let frame = PhysFrame::new(next as usize);
+                    track_frame(frame, FrameSource::UserPageTable);
+                    ledger.track_page_table_frame(frame);
+                }
+                table = next;
+            }
             None => return false,
         }
     }
@@ -2811,6 +2860,72 @@ unsafe fn x86_write_cr3(root: u64) { unsafe {
     core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
 }}
 
+/// Copy-on-write marker. Bit 9 is one of three bits the hardware ignores in a
+/// present leaf, and `amd64/src/paging.rs` already uses exactly this one — the
+/// pinned divergence `akuma-cow` records, where AArch64 has no marker and is
+/// handed `refs > 0` instead. Kept identical to that file's `COW` so the two
+/// x86 walkers cannot disagree about what a demoted page looks like.
+#[cfg(any(target_arch = "x86_64", test))]
+const X86_COW: u64 = 1 << 9;
+
+#[cfg(any(target_arch = "x86_64", test))]
+impl PteProt {
+    /// Kernel read-only, no execute. What a `PROT_NONE` user page becomes —
+    /// x86 has no "present and wholly inaccessible" encoding, so clearing `U/S`
+    /// is what makes a ring-3 touch fault.
+    pub const KERNEL_RO: Self = Self { write: false, exec: false, user: false };
+    /// User read only — no write, no execute.
+    pub const USER_RO: Self = Self { write: false, exec: false, user: true };
+
+    /// The x86 page-table spelling of a neutral [`Prot`].
+    ///
+    /// **A byte-for-byte port of `amd64::paging::PteProt::from_region`**, whose
+    /// boot self-test pins every arm; `x86_prot_matches_amd64_encoding` pins the
+    /// same six results here as literals, so the two walkers cannot drift. The
+    /// two divergences from the AArch64 encoding are that file's, restated
+    /// because this is where someone will look:
+    ///
+    /// * `RO` and `RX` collapse. They differ only in `PXN` — whether EL1 may
+    ///   fetch — and x86 has one execute bit, not two.
+    /// * `RW` (writable **and** executable on AArch64) becomes non-executable.
+    ///   `sys_mmap` on this target refuses `PROT_WRITE | PROT_EXEC`, so no
+    ///   region can carry it; if one ever does, dropping execute faults at the
+    ///   fetch — visible and debuggable — where granting it would hand ring 3 a
+    ///   writable code page.
+    #[must_use]
+    pub const fn from_region(prot: akuma_mmap::Prot) -> Self {
+        match prot.tag() {
+            0 => Self::KERNEL_RO,
+            1 | 4 => Self::USER_RX,
+            2 | 3 => Self::USER_RW,
+            5 => Self::USER_RO,
+            // Unreachable over `Prot::ALL`. A `const fn` cannot panic out of a
+            // `u8` match, so the fallback is **fail-closed**: a seventh variant
+            // maps to a page ring 3 cannot touch, which faults visibly instead
+            // of over-granting.
+            _ => Self::KERNEL_RO,
+        }
+    }
+}
+
+/// Walk to the leaf slot for `va`, without allocating. `None` if any level is
+/// absent or a huge page (this walker never creates one, so a `PS` entry on the
+/// way down means the mapping is not a 4 KiB page and is not ours to edit).
+#[cfg(target_arch = "x86_64")]
+fn x86_leaf_slot_in(root: u64, va: usize) -> Option<*mut u64> {
+    let mut table = root;
+    for level in (2..=4).rev() {
+        // SAFETY: `table` is a live table frame reached through the physmap.
+        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
+        if entry & X86_P == 0 || entry & X86_PS != 0 {
+            return None;
+        }
+        table = entry & X86_ADDR_MASK;
+    }
+    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
+    Some(unsafe { x86_table_mut(table).add(x86_index(va, 1)) })
+}
+
 /// The kernel's own boot PML4, captured the first time a `UserAddressSpace`
 /// is created (at that point nothing but the boot root has ever been active).
 /// `deactivate()`'s x86_64 analogue of [`get_boot_ttbr0`] — that one reads a
@@ -2825,6 +2940,10 @@ static X86_BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "x86_64")]
 pub struct UserAddressSpace {
     root: usize,
+    /// Which physical frames this address space holds, and how many VAs map
+    /// each. The same arch-neutral, host-tested `akuma-user-space` ledger the
+    /// AArch64 struct carries — everything else here is the x86 walker.
+    ledger: FrameLedger,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2858,20 +2977,457 @@ impl UserAddressSpace {
                 root_ptr.add(slot).write_volatile(e);
             }
         }
-        Some(Self { root })
+        Some(Self { root, ledger: FrameLedger::new(false) })
     }
 
-    pub fn map_page(&mut self, va: usize, pa: usize, prot: Prot) -> Result<(), &'static str> {
-        if x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack) {
+    /// A borrowed view of an existing address space (`CLONE_VM` / `vfork`):
+    /// the same PML4, and a ledger that owns nothing.
+    ///
+    /// **Three pinned divergences from the AArch64 `new_shared`**, all of them
+    /// consequences of things this target does not have:
+    ///
+    /// * No ASID to allocate, so this cannot fail for ASID exhaustion — and
+    ///   therefore cannot fail at all. It still returns `Option` because the
+    ///   shared callers in `akuma-exec` are written against a fallible
+    ///   constructor; making it infallible here would fork the call sites.
+    /// * No `SHARED_L0_TABLE` refcount registry. That registry exists to defer
+    ///   a shared L0's user frames until the last viewer drops, and this target
+    ///   has no `Drop` impl at all (see the note below the impl) — there is no
+    ///   teardown for it to arbitrate. A registry with no consumer would be a
+    ///   second design, not a port.
+    /// * No TLB consequence. AArch64 gives the view its own ASID; here both
+    ///   views name the same `CR3` value, so a switch between them is not even
+    ///   observable to the MMU.
+    pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
+        Some(Self { root: parent_l0_phys, ledger: FrameLedger::new(true) })
+    }
+
+    // ── scalar identity ────────────────────────────────────────────────────
+
+    /// The AArch64 `TTBR0_EL1` value, ported: `(asid << 48) | l0_phys`.
+    ///
+    /// x86 has no ASID in this port (see [`Self::asid`]), so the high half is
+    /// zero and this is the PML4 physical base — which is exactly the `CR3`
+    /// value `activate` writes. `ProcAddressSpace`'s lock-free scalar mirror
+    /// packs and unpacks this word on both architectures, so the layout has to
+    /// match even where one field is always zero.
+    pub fn ttbr0(&self) -> u64 { self.root as u64 }
+
+    pub fn l0_phys(&self) -> usize { self.root }
+
+    pub fn is_shared(&self) -> bool { self.ledger.is_shared() }
+
+    /// Always `0` — a **pinned divergence**, not a stub.
+    ///
+    /// AArch64 tags every TLB entry with an ASID so a context switch need not
+    /// flush; this port rewrites `CR3`, which flushes non-global entries
+    /// wholesale (the seams table in `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`).
+    /// PCID is the x86 equivalent and is deliberately not used here — enabling
+    /// it without also porting the invalidation discipline (`invpcid`, and a
+    /// shootdown for the cores that are not doing the switch) would leave stale
+    /// translations live under a correct-looking ASID number.
+    ///
+    /// Callers use this for two things, and both stay correct at zero: naming a
+    /// TLB flush target (this target flushes by address or by `CR3`, never by
+    /// ASID) and diagnostics.
+    pub fn asid(&self) -> u16 { 0 }
+
+    // ── the frame ledger ───────────────────────────────────────────────────
+    //
+    // Straight forwards to `akuma-user-space`, identical to the AArch64 side's.
+    // They are `&self` because the ledger self-locks.
+
+    pub fn track_user_frame(&self, frame: PhysFrame) { self.ledger.track_user_frame(frame); }
+    pub fn adopt_user_frame(&self, frame: PhysFrame, caller_holds_ref: bool) -> bool {
+        self.ledger.adopt_user_frame(frame, caller_holds_ref)
+    }
+    pub fn tracks_user_frame(&self, pa: usize) -> bool { self.ledger.tracks_user_frame(pa) }
+    pub fn track_page_table_frame(&self, frame: PhysFrame) { self.ledger.track_page_table_frame(frame); }
+    pub fn remove_user_frame(&self, frame: PhysFrame) -> bool { self.ledger.remove_user_frame(frame) }
+    pub fn user_frame_count(&self) -> usize { self.ledger.user_frame_count() }
+    pub fn user_frame_total_refs(&self) -> usize { self.ledger.user_frame_total_refs() }
+    pub fn page_table_frame_count(&self) -> usize { self.ledger.page_table_frame_count() }
+    pub fn resident_pages(&self) -> usize { self.ledger.resident_pages() }
+
+    // ── mapping ────────────────────────────────────────────────────────────
+
+    /// Map `va` to `pa` with the protection `user_flags` names.
+    ///
+    /// `user_flags` is an AArch64 PTE flag word because that is what
+    /// `akuma-exec` holds — it is decoded to a neutral `Prot` by
+    /// [`user_flags::from_pte`] and re-encoded into x86 bits here. See that
+    /// function's header for why a `u64` crossing this call is not the
+    /// portability defect `akuma_mmap::types` warns about.
+    pub fn map_page(&mut self, va: usize, pa: usize, user_flags: u64) -> Result<(), &'static str> {
+        if va & (PAGE_SIZE - 1) != 0 || pa & (PAGE_SIZE - 1) != 0 {
+            return Err("Addresses must be page-aligned");
+        }
+        let prot = PteProt::from_region(user_flags::from_pte(user_flags));
+        if x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack, &self.ledger) {
             Ok(())
         } else {
             Err("x86_64 UserAddressSpace::map_page: page-table frame allocation failed")
         }
     }
 
+    /// Allocate a **zeroed** frame, map it at `va`, and record it in the
+    /// ledger. Zeroing is contractual — see `akuma_elf::UserPages`.
+    pub fn alloc_and_map(&mut self, va: usize, user_flags: u64) -> Result<PhysFrame, &'static str> {
+        let frame = akuma_pmm::alloc_page_zeroed()
+            .map(PhysFrame::new)
+            .ok_or("Out of memory for user page")?;
+        track_frame(frame, FrameSource::ElfLoader);
+        self.map_and_track(va, frame, user_flags)?;
+        Ok(frame)
+    }
+
+    /// Install an *already-allocated* frame at `va` and record it — the
+    /// "install" half of [`alloc_and_map`], split for the same reason it is
+    /// split on AArch64: a caller can allocate outside the per-AS lock and hold
+    /// it only across the PTE edit.
+    pub fn map_and_track(&mut self, va: usize, frame: PhysFrame, user_flags: u64) -> Result<(), &'static str> {
+        self.ledger.track_user_frame(frame);
+        self.map_page(va, frame.addr, user_flags)
+    }
+
+    /// Map `va` in the **currently installed** address space and track both the
+    /// data frame and any page-table frames the walk allocated.
+    ///
+    /// The x86 port of the AArch64 method's clause 2/clause 3 checks: the VA
+    /// must be a page-aligned lower-half address, and `CR3` must already hold
+    /// this address space's root — refusing rather than editing another
+    /// process's tables.
+    #[must_use = "`false` means the PTE was NOT installed"]
+    // `&mut self` is the safety argument, not a mutation requirement: it is what
+    // proves the caller holds the per-AS lock. Matches the AArch64 method.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub fn map_user_page_tracked(&mut self, va: usize, frame: PhysFrame, user_flags_val: u64) -> bool {
+        self.map_user_page_tracked_inner(va, frame, user_flags_val, true)
+    }
+
+    /// [`map_user_page_tracked`](Self::map_user_page_tracked) without the
+    /// per-page invalidation, for a batch install.
+    ///
+    /// On this target the per-page `invlpg` is issued by `x86_map_page_in`
+    /// unconditionally, so `flush` currently only documents caller intent —
+    /// a **pinned divergence**: the AArch64 `no_flush` form genuinely skips the
+    /// `tlbi` and requires the caller to issue a range flush, and skipping
+    /// `invlpg` here would need the same range flush to exist first. Suppressing
+    /// it without that would leave stale translations live, so the batch form
+    /// costs one `invlpg` per page here rather than being wrong.
+    #[must_use = "`false` means the PTE was NOT installed"]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub fn map_user_page_tracked_no_flush(
+        &mut self,
+        va: usize,
+        frame: PhysFrame,
+        user_flags_val: u64,
+    ) -> bool {
+        self.map_user_page_tracked_inner(va, frame, user_flags_val, false)
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn map_user_page_tracked_inner(
+        &mut self,
+        va: usize,
+        frame: PhysFrame,
+        user_flags_val: u64,
+        _flush: bool,
+    ) -> bool {
+        // Clause 2: the lower half is userspace and the walk indexes by page.
+        if va >> 47 != 0 || va & (PAGE_SIZE - 1) != 0 {
+            log::debug!("[MMU] map_and_track refused non-user/unaligned va=0x{va:x}");
+            debug_assert!(false, "map_and_track called with a non-user or unaligned va");
+            return false;
+        }
+        // Clause 3: refuse rather than edit somebody else's page tables.
+        let installed = x86_read_cr3();
+        if installed != (self.root as u64 & X86_ADDR_MASK) {
+            log::debug!(
+                "[MMU] map_and_track refused: this AS root=0x{:x} but CR3 has 0x{installed:x}",
+                self.root
+            );
+            debug_assert!(false, "map_and_track on an address space that is not installed");
+            return false;
+        }
+        // Unlike AArch64's `map_user_page_inner`, the x86 walk has no
+        // "another thread won the race" arm to report: it overwrites the leaf.
+        // Tracking the frame on both arms is therefore unconditional, which is
+        // what clause 4 of the AArch64 contract asks for.
+        let prot = PteProt::from_region(user_flags::from_pte(user_flags_val));
+        let mapped = x86_map_page_in(
+            self.root as u64, va, frame.addr, prot, MemAttr::WriteBack, &self.ledger,
+        );
+        if mapped {
+            self.ledger.track_user_frame(frame);
+        }
+        mapped
+    }
+
+    /// Write `bytes` at `offset` within the page mapped at `page_va`.
+    pub fn write_page_bytes(&mut self, page_va: usize, offset: usize, bytes: &[u8]) -> bool {
+        assert!(
+            offset + bytes.len() <= PAGE_SIZE,
+            "write_page_bytes {offset}+{} would leave the page",
+            bytes.len()
+        );
+        let page_base = page_va & !(PAGE_SIZE - 1);
+        let Some(pa) = self.translate(page_base) else {
+            return false;
+        };
+        // SAFETY: `translate` just confirmed `page_base` is mapped in *this*
+        // address space, so `pa` is a real frame reachable through the physmap.
+        // `&mut self` makes this borrow exclusive; the assert bounds the write
+        // to the single frame backing that page.
+        unsafe {
+            let dst = akuma_primitives::addr::phys_to_virt(pa + offset);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
+        true
+    }
+
+    // ── permission changes ─────────────────────────────────────────────────
+
+    /// Demote every writable user leaf in `[va_start, va_start + pages·4K)` to
+    /// read-only **and mark it copy-on-write**; returns the count demoted.
+    ///
+    /// The marker is not optional here, and this is the one place the two
+    /// architectures genuinely cannot share a body. AArch64 has no CoW bit: a
+    /// demoted page is indistinguishable from an `mprotect(PROT_READ)` one, and
+    /// `akuma-cow` is handed `refs > 0` in place of a marker. x86 has bit 9
+    /// free, `amd64/src/paging.rs` uses it, and `akuma_cow`'s pinned divergence
+    /// note names this target as the one that passes a real PTE bit. Demoting
+    /// without setting it would make every CoW fault here look like a genuine
+    /// protection violation.
+    pub fn demote_range_to_ro(&mut self, va_start: usize, pages: usize) -> usize {
+        let mut demoted = 0;
+        for i in 0..pages {
+            let va = (va_start & !(PAGE_SIZE - 1)) + i * PAGE_SIZE;
+            let Some(leaf) = x86_leaf_slot_in(self.root as u64, va) else { continue };
+            // SAFETY: `x86_leaf_slot_in` returned a pointer into a live PT frame
+            // reached through the physmap; `&mut self` is the exclusivity the
+            // write needs.
+            unsafe {
+                let entry = leaf.read_volatile();
+                // Only writable *user* leaves are candidates: a kernel leaf is
+                // not this process's to demote, and a read-only one is either
+                // already shared or genuinely `PROT_READ`.
+                if entry & X86_P == 0 || entry & X86_US == 0 || entry & X86_RW == 0 {
+                    continue;
+                }
+                leaf.write_volatile((entry & !X86_RW) | X86_COW);
+            }
+            akuma_cpu::tlb::invlpg(va);
+            demoted += 1;
+        }
+        demoted
+    }
+
+    /// Replace the permission bits of an existing leaf, preserving its physical
+    /// address and every non-permission bit. `new_flags` is an AArch64 flag
+    /// word, decoded as in [`map_page`](Self::map_page).
+    ///
+    /// Infallible, matching the AArch64 signature: an unmapped `va` is the
+    /// normal `MAP_FIXED`-over-a-lazy-range case, not an error.
+    pub fn update_page_flags(&mut self, va: usize, new_flags: u64) {
+        self.update_page_flags_inner(va, new_flags, true);
+    }
+
+    /// [`update_page_flags`](Self::update_page_flags) without the per-page
+    /// invalidation, for an `mprotect` over many pages. The caller issues one
+    /// flush over the whole range afterwards.
+    pub fn update_page_flags_no_flush(&mut self, va: usize, new_flags: u64) {
+        self.update_page_flags_inner(va, new_flags, false);
+    }
+
+    /// The body behind both `update_page_flags*` variants — same split, and the
+    /// same reason, as the AArch64 pair: `flush` is a literal at both call sites
+    /// so the branch folds away.
+    ///
+    /// `PERM_MASK` is the x86 spelling of the AArch64 body's: the bits that say
+    /// *what may be done* with the page, and nothing else. Everything outside it
+    /// survives — the frame address, `P`, the hardware's Accessed/Dirty bits,
+    /// the cacheability pair, and the [`X86_COW`] marker.
+    ///
+    /// Preserving `X86_COW` is deliberate. An `mprotect(PROT_WRITE)` over a
+    /// CoW-demoted page then yields writable-and-marked, which never faults and
+    /// so never breaks the sharing — but that is **exactly** what the AArch64
+    /// body produces from the same call (it has no marker; the page simply
+    /// becomes `AP_RW_ALL` while `refs > 0`). Clearing the bit here would make
+    /// the two architectures diverge under `mprotect`, which is a worse failure
+    /// than the shared one they already have.
+    #[inline]
+    fn update_page_flags_inner(&self, va: usize, new_flags: u64, flush: bool) {
+        let _irq_guard = IrqGuard::new();
+        const PERM_MASK: u64 = X86_RW | X86_US | X86_NX;
+        let va = va & !(PAGE_SIZE - 1);
+        let Some(leaf) = x86_leaf_slot_in(self.root as u64, va) else { return };
+        let prot = PteProt::from_region(user_flags::from_pte(new_flags));
+        // SAFETY: a live PT slot reached through the physmap. `&self` matches
+        // the AArch64 body, which also edits through a raw pointer; the public
+        // wrappers keep `&mut self`, which is the API callers hold.
+        unsafe {
+            let old_entry = leaf.read_volatile();
+            if old_entry & X86_P == 0 {
+                return;
+            }
+            // `x86_encode` re-asserts `P`, which is already set; `MemAttr` is
+            // outside `PERM_MASK`, so a `WriteBack` encode adds nothing and a
+            // device page keeps its `PCD`/`PWT`.
+            let entry = (old_entry & !PERM_MASK) | x86_encode(prot, MemAttr::WriteBack);
+            leaf.write_volatile(entry);
+        }
+        if flush {
+            akuma_cpu::tlb::invlpg(va);
+        }
+    }
+
+    /// Unmap a page and hand back its frame, dropping this address space's
+    /// reference to it. `None` when the page was not mapped **or** when another
+    /// VA still references the frame — see the AArch64 twin for why that second
+    /// case must not be a free.
+    pub fn unmap_and_free_page(&mut self, va: usize) -> Option<PhysFrame> {
+        let frame = self.unmap_and_free_page_no_flush(va);
+        akuma_cpu::tlb::invlpg(va & !(PAGE_SIZE - 1));
+        frame
+    }
+
+    /// [`unmap_and_free_page`](Self::unmap_and_free_page) without the per-page
+    /// invalidation — the hot path for a large `munmap`, where the caller
+    /// batches one flush over the whole region.
+    pub fn unmap_and_free_page_no_flush(&mut self, va: usize) -> Option<PhysFrame> {
+        let _irq_guard = IrqGuard::new();
+        let va = va & !(PAGE_SIZE - 1);
+        let leaf = x86_leaf_slot_in(self.root as u64, va)?;
+        // SAFETY: a live PT slot reached through the physmap.
+        let pa = unsafe {
+            let entry = leaf.read_volatile();
+            if entry & X86_P == 0 {
+                return None;
+            }
+            leaf.write_volatile(0);
+            (entry & X86_ADDR_MASK) as usize
+        };
+        // Only hand the frame back when this dropped its *last* reference. If
+        // it is still mapped at another VA, or belongs to the owner of a shared
+        // view, `remove_user_frame` says so and freeing it here would be a
+        // double free — the AArch64 twin's `EL1 EC=0x22` crashes under low
+        // memory. The PTE is cleared either way.
+        let frame = PhysFrame::new(pa);
+        if self.remove_user_frame(frame) { Some(frame) } else { None }
+    }
+
+    /// Clear the leaf PTE for `va` without freeing anything or flushing.
+    pub fn unmap_page_no_flush(&mut self, va: usize) {
+        let _irq_guard = IrqGuard::new();
+        let va = va & !(PAGE_SIZE - 1);
+        let Some(leaf) = x86_leaf_slot_in(self.root as u64, va) else { return };
+        // SAFETY: a live PT slot reached through the physmap. Unconditional:
+        // this copy has never read the leaf before clearing it.
+        unsafe { leaf.write_volatile(0) };
+    }
+
+    /// Unmap a clean read-only user page and hand its frame back, so the next
+    /// access re-faults and re-reads it from the backing file. The mechanism
+    /// that lets a file-backed mmap larger than RAM make progress under
+    /// pressure. The TLB entry is invalidated **before** the frame is released.
+    ///
+    /// The eligibility test is the exact port of AArch64's — `AP_RO_ALL` is
+    /// "present, reachable by the user, not writable", which on x86 is
+    /// `P | US | !RW`. The CoW marker is deliberately **not** consulted: the
+    /// AArch64 side has no marker to consult, so reading it here would be a
+    /// second design rather than a port, and a CoW page that has not been
+    /// written is clean by definition — which is the property this test is
+    /// actually asking about.
+    pub fn try_evict_ro_page(&mut self, va: usize) -> Option<PhysFrame> {
+        let _irq_guard = IrqGuard::new();
+        let va = va & !(PAGE_SIZE - 1);
+        let leaf = x86_leaf_slot_in(self.root as u64, va)?;
+        // SAFETY: a live PT slot reached through the physmap.
+        let pa = unsafe {
+            let entry = leaf.read_volatile();
+            if entry & X86_P == 0 || entry & X86_US == 0 || entry & X86_RW != 0 {
+                return None;
+            }
+            leaf.write_volatile(0);
+            (entry & X86_ADDR_MASK) as usize
+        };
+        akuma_cpu::tlb::invlpg(va);
+        let frame = PhysFrame::new(pa);
+        if self.remove_user_frame(frame) { Some(frame) } else { None }
+    }
+
+    /// Zero the physical page backing `va` without unmapping it.
+    pub fn zero_mapped_page(&self, va: usize) -> bool {
+        let _irq_guard = IrqGuard::new();
+        let Some(pa) = self.translate(va & !(PAGE_SIZE - 1)) else { return false };
+        // SAFETY: `translate` confirmed the mapping, so `pa` is a live frame
+        // reachable through the physmap, and a whole page of it is ours.
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, PAGE_SIZE);
+        }
+        true
+    }
+
+    // ── queries ────────────────────────────────────────────────────────────
+
+    /// Raw leaf page-table entry for `va`, if mapped at the final level.
+    ///
+    /// The name says `l3` because the AArch64 walker calls its last level L3;
+    /// on x86 this is the PT entry. Kept rather than renamed so the shared
+    /// callers in `akuma-exec` need no `cfg` — a **pinned naming divergence**,
+    /// and the bits it returns are x86 bits, so a caller that decodes them must
+    /// do so per-architecture.
+    pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
+        let va = va & !(PAGE_SIZE - 1);
+        let _irq_guard = IrqGuard::new();
+        let leaf = x86_leaf_slot_in(self.root as u64, va)?;
+        // SAFETY: a live PT slot reached through the physmap.
+        let entry = unsafe { leaf.read_volatile() };
+        if entry & X86_P == 0 { None } else { Some(entry) }
+    }
+
+    /// Physical address of the 4KiB frame backing `va`, if mapped.
+    pub fn phys_addr_for_page_va(&self, va: usize) -> Option<usize> {
+        Some((self.read_l3_page_entry(va)? & X86_ADDR_MASK) as usize)
+    }
+
+    /// A **no-op**, and a pinned divergence rather than an omission: x86
+    /// instruction caches are coherent with stores, so there is nothing for the
+    /// AArch64 `dc cvau`/`ic ivau` pair to correspond to. The method exists
+    /// because the shared callers (`akuma-exec`'s W^X flip and file-backed text
+    /// paging) call it unconditionally, and a `cfg` at each of those sites would
+    /// scatter the same fact across the tree.
+    #[allow(clippy::unused_self)]
+    pub fn invalidate_icache_for_page_va(&self, _va: usize) {}
+
+    /// Whether `va` has a live leaf in **this** address space.
+    pub fn is_mapped(&self, va: usize) -> bool {
+        x86_translate_in(self.root as u64, va).is_some()
+    }
+
+    /// Whether every page the byte range `[va_start, va_start + len)` touches is
+    /// mapped. An empty range is trivially mapped, matching AArch64.
+    pub fn is_range_mapped(&self, va_start: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let start_page = va_start & !(PAGE_SIZE - 1);
+        let end_page = (va_start + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let mut va = start_page;
+        while va < end_page {
+            if !self.is_mapped(va) {
+                return false;
+            }
+            va += PAGE_SIZE;
+        }
+        true
+    }
+
     pub fn unmap_page(&mut self, va: usize) {
         x86_unmap_page_in(self.root as u64, va);
     }
+
 
     pub fn translate(&self, va: usize) -> Option<usize> {
         x86_translate_in(self.root as u64, va)
@@ -3835,5 +4391,91 @@ mod icache_tests {
         sync_icache_range(0x4000_0000, 1); // sub-line: widened to the containing line
         sync_icache_range(0x4000_0007, 64); // unaligned start
         sync_icache_range(0x4000_0000, PAGE_SIZE); // whole page
+    }
+}
+
+
+/// The x86 permission encoding, pinned against the walker that already ships.
+///
+/// `amd64/src/paging.rs` has its own `PteProt`/`encode` pair driving the amd64
+/// kernel's page tables, and its boot self-test asserts each of these six
+/// values. This crate's copy is the one the *shared* crates reach through
+/// `UserAddressSpace`, so the two must agree exactly or a page mapped through
+/// `akuma-exec` and a page mapped through `amd64/src/mm.rs` get different
+/// permissions from the same region.
+///
+/// Spelled as hex literals for the same reason `prot_roundtrips_to_todays_bits`
+/// is: a test written against `x86_encode`'s own constants would pass even if
+/// they drifted. These were read off `amd64/src/paging.rs`'s
+/// `region_prot_roundtrip_check`.
+///
+/// Compiled on any host via the `cfg(test)` half of the gate on the encoding —
+/// the bits are portable data even where the walker that writes them is not,
+/// which is exactly how the AArch64 `user_flags` table is already treated.
+#[cfg(test)]
+mod x86_encoding_tests {
+    use super::{MemAttr, PteProt, Prot, user_flags, x86_encode, X86_COW};
+
+    #[test]
+    fn x86_prot_matches_amd64_encoding() {
+        let wb = |p| x86_encode(PteProt::from_region(p), MemAttr::WriteBack);
+        // NONE — present, kernel-only (NX set, U/S clear), so ring 3 faults.
+        assert_eq!(wb(Prot::NONE), 0x8000_0000_0000_0001);
+        // RO and RX collapse: one execute bit, no PXN to distinguish them.
+        assert_eq!(wb(Prot::RO), 0x0000_0000_0000_0005);
+        assert_eq!(wb(Prot::RX), 0x0000_0000_0000_0005);
+        // RW and RW_NO_EXEC are both non-executable here.
+        assert_eq!(wb(Prot::RW), 0x8000_0000_0000_0007);
+        assert_eq!(wb(Prot::RW_NO_EXEC), 0x8000_0000_0000_0007);
+        assert_eq!(wb(Prot::RO_NO_EXEC), 0x8000_0000_0000_0005);
+    }
+
+    /// `from_region` matches on an opaque tag and so cannot be exhaustive.
+    /// Prove the `_ =>` fallback is unreachable over `Prot::ALL`, and that the
+    /// two collapses above are the *only* ones.
+    #[test]
+    fn x86_from_region_covers_every_variant() {
+        let mut distinct = alloc::vec::Vec::new();
+        for p in Prot::ALL {
+            let e = PteProt::from_region(p);
+            if !distinct.contains(&e) {
+                distinct.push(e);
+            }
+        }
+        // Six variants, four distinct encodings: RO/RX collapse and
+        // RW/RW_NO_EXEC collapse, each for its own documented reason.
+        assert_eq!(distinct.len(), 4, "the set of x86 encodings changed");
+        // NONE must not have collapsed into a user-reachable one.
+        assert!(!PteProt::from_region(Prot::NONE).user);
+    }
+
+    /// The whole chain a shared caller actually travels: `akuma-exec` holds an
+    /// AArch64 flag word, the x86 walker decodes it and encodes x86 bits. Each
+    /// hop is pinned on its own above; this pins the composition, which is what
+    /// `UserAddressSpace::map_page` performs.
+    #[test]
+    fn aarch64_flag_word_reaches_the_right_x86_bits() {
+        let via_u64 = |f: u64| x86_encode(
+            PteProt::from_region(user_flags::from_pte(f)),
+            MemAttr::WriteBack,
+        );
+        assert_eq!(via_u64(user_flags::RW), 0x8000_0000_0000_0007);
+        assert_eq!(via_u64(user_flags::RW_NO_EXEC), 0x8000_0000_0000_0007);
+        assert_eq!(via_u64(user_flags::RX), 0x0000_0000_0000_0005);
+        assert_eq!(via_u64(user_flags::RO_NO_EXEC), 0x8000_0000_0000_0005);
+        assert_eq!(via_u64(user_flags::NONE), 0x8000_0000_0000_0001);
+    }
+
+    /// The CoW marker is bit 9 and is not one of the bits `x86_encode` writes —
+    /// `demote_range_to_ro` ORs it onto a live entry, and
+    /// `update_page_flags_inner` must not clear it. Both properties are one
+    /// fact: `X86_COW` is disjoint from every encoded permission.
+    #[test]
+    fn cow_marker_is_disjoint_from_every_encoding() {
+        assert_eq!(X86_COW, 1 << 9, "amd64/src/paging.rs::COW is bit 9");
+        for p in Prot::ALL {
+            let e = x86_encode(PteProt::from_region(p), MemAttr::WriteBack);
+            assert_eq!(e & X86_COW, 0, "{p:?} encodes into the CoW marker bit");
+        }
     }
 }

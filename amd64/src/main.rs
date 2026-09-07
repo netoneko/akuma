@@ -109,6 +109,10 @@ mod smp;
 mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
 mod thread;
+/// The shared `akuma_mmu::UserAddressSpace`, exercised at boot. It has no other
+/// runtime caller on this target until item C1 folds `usermode.rs` in — which
+/// is why B3's widening of it needs a test that is not a `cargo check`.
+mod uas;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod xhci;

@@ -85,6 +85,61 @@ pub mod user_flags {
         }
     }
 
+    /// The neutral [`Prot`] an AArch64 `user_flags` word denotes — [`to_pte`]
+    /// read backwards.
+    ///
+    /// # Why an inverse exists at all
+    ///
+    /// Because the `u64` is the currency `akuma-exec` still speaks. Its
+    /// `UserAddressSpace` calls — `map_page`, `alloc_and_map`, `map_and_track`,
+    /// `map_user_page_tracked` — take a PTE flag word, and `LazyRegion::flags`
+    /// stores one; that is AArch64 machinery living in a crate both kernels
+    /// compile. The x86 walker cannot consume those bits (the two permission
+    /// masks share exactly zero, and AArch64's `AP_MASK` lands on x86's Dirty
+    /// and PAT — `akuma_mmap::types` has the measurement), so it decodes them
+    /// here first and encodes x86 bits itself.
+    ///
+    /// **This is not "AArch64 bits crossing an architecture boundary".** The
+    /// word is produced by this module and consumed by this module; what
+    /// crosses is a `Prot`. That is the `akuma-cow` shape — decoded booleans,
+    /// never a raw PTE — which is exactly why that crate already serves both
+    /// kernels. The u64 hop disappears when the `REDUCING_PLATFORM_DEPENDENCY.md`
+    /// §1 migration moves `akuma-exec` and `LazyRegion` onto `Prot`; until then
+    /// it is a named, total, round-trip-pinned seam rather than an accident.
+    ///
+    /// # Total, by predicate rather than by table
+    ///
+    /// Every `u64` gets an answer, including words this module never emitted —
+    /// the three questions asked are the same three [`is_write`], [`is_exec`]
+    /// and the `AP` field already answer, so a caller cannot construct a value
+    /// that decodes to something the AArch64 walker would disagree with. The
+    /// six [`to_pte`] outputs come back exactly as they went in
+    /// (`from_pte_inverts_to_pte`).
+    ///
+    /// EL0-inaccessible words (`AP_RO_EL1`/`AP_RW_EL1`, which is what
+    /// [`NONE`] is) decode to [`Prot::NONE`] — fail-closed, and the same answer
+    /// `is_none` gives for the one such word this module emits.
+    #[must_use]
+    pub const fn from_pte(flags_val: u64) -> Prot {
+        // EL0 reachable at all? `AP` is a 2-bit field and only the two `*_ALL`
+        // encodings grant EL0 anything; everything else is EL1-only.
+        let ap = flags_val & flags::AP_MASK;
+        if ap != flags::AP_RW_ALL && ap != flags::AP_RO_ALL {
+            return Prot::NONE;
+        }
+        if is_write(flags_val) {
+            // RW is writable *and* executable; RW_NO_EXEC carries UXN.
+            if is_exec(flags_val) { Prot::RW } else { Prot::RW_NO_EXEC }
+        } else if is_exec(flags_val) {
+            // RO and RX differ only in PXN — whether EL1 may fetch. Nothing
+            // else separates them, which is why `Prot` is a token and not a
+            // `{read, write, exec}` triple.
+            if flags_val & flags::PXN == 0 { Prot::RO } else { Prot::RX }
+        } else {
+            Prot::RO_NO_EXEC
+        }
+    }
+
     /// Whether a mapping with these raw PTE flags lets EL0 **write**.
     ///
     /// Still takes a `u64` because its callers hold *page-table* flags —
@@ -254,6 +309,47 @@ mod tests {
         assert_eq!(to_pte(Prot::RX), 0x0020_0000_0000_00C0);
         // AP_RO_ALL|UXN|PXN
         assert_eq!(to_pte(Prot::RO_NO_EXEC), 0x0060_0000_0000_00C0);
+    }
+
+    /// [`user_flags::from_pte`] is the exact inverse of `to_pte` over its six
+    /// outputs. This is the property the x86 walker rests on: it decodes a
+    /// flag word `akuma-exec` handed it and must recover the protection the
+    /// AArch64 walker would have written, or the two kernels grant different
+    /// things from the same call.
+    #[test]
+    fn from_pte_inverts_to_pte() {
+        for p in Prot::ALL {
+            assert_eq!(user_flags::from_pte(user_flags::to_pte(p)), p, "{p:?}");
+        }
+        // `EXEC` is an alias of `RO`, so it round-trips to `RO` by identity
+        // rather than as a seventh variant.
+        assert_eq!(user_flags::from_pte(user_flags::to_pte(Prot::EXEC)), Prot::RO);
+    }
+
+    /// `from_pte` is **total**, and fails closed on anything EL0 cannot reach.
+    /// The words below are not ones `to_pte` emits — they are what a caller
+    /// composing raw `flags::` constants can produce, and each must decode to
+    /// something no more permissive than the bits say.
+    #[test]
+    fn from_pte_is_total_and_fails_closed() {
+        // EL1-only access permissions: no EL0 rights at all.
+        assert_eq!(user_flags::from_pte(flags::AP_RW_EL1), Prot::NONE);
+        assert_eq!(user_flags::from_pte(flags::AP_RO_EL1), Prot::NONE);
+        // Zero — `LazyRegion`'s "unrecorded" sentinel — has AP = AP_RW_EL1 (0),
+        // so it decodes to NONE rather than to a writable page. Callers that
+        // mean "not recorded" substitute a default *before* they get here
+        // (`akuma_exec::process::lazy_prefault`); this is the backstop.
+        assert_eq!(user_flags::from_pte(0), Prot::NONE);
+        // Bits outside AP/UXN/PXN are ignored, not smuggled through: a PTE with
+        // its address, VALID, AF and shareability bits set decodes on
+        // permissions alone.
+        let live_pte = 0x4_2000_0000
+            | flags::VALID
+            | flags::TABLE
+            | flags::AF
+            | flags::SH_INNER
+            | user_flags::RW_NO_EXEC;
+        assert_eq!(user_flags::from_pte(live_pte), Prot::RW_NO_EXEC);
     }
 
     /// `to_pte` has a `_ =>` arm it should never reach. Prove it: every variant

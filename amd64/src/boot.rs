@@ -165,6 +165,11 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
 
     crate::mem::smoke_test(t);
     paging::smoke_test(t);
+    // The *other* x86 walker: `akuma-mmu`'s, which the shared crates reach
+    // through and C1 folds this kernel onto. Right after `paging::smoke_test`
+    // because the two are the same job done twice, and a divergence between
+    // them is easiest to read when their results are adjacent.
+    crate::uas::smoke_test(t);
     idt::smoke_test(t);
     idt::user_copy_smoke_test(t);
     uaccess::smoke_test(t, cx.smap);

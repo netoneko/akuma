@@ -75,6 +75,40 @@ as they stand one day after the survey
 > Both paths also start `init` now whether or not the suite passed — one flaky
 > check used to leave the headless box with no sshd.
 
+> **B3 is DONE and THE GATE IS GREEN (2026-09-07, later still)** —
+> `docs/archive/AKUMA_AMD64_B3_ADDRESS_SPACE.md`.
+> `cargo check -p akuma-syscalls-glue --target x86_64-unknown-none` passes. The
+> x86 `UserAddressSpace` went **6 public methods to 38**: the `akuma-user-space`
+> ledger, the scalar identity (`ttbr0`/`l0_phys`/`asid`/`is_shared`), the
+> mapping and permission surface, and `impl UserPages`. Everything above the
+> gate in the tree below is now deletions from `amd64/src`.
+>
+> The `u64`-vs-`Prot` mismatch the box below does not mention was the substance:
+> `akuma-exec` passes AArch64 PTE flag words, and the x86 walker cannot read
+> them. `akuma_mmu::user_flags::from_pte` decodes them to a neutral `Prot`
+> first — total, fail-closed, and exactly invertible over `to_pte`. The full §1
+> `Prot` migration (59 call sites, plus `LazyRegion`'s `0_u64` sentinel) stays
+> undone.
+>
+> **A silent per-architecture type substitution, found by the gate:** the x86
+> block defined `pub struct Prot`, which **shadowed** the neutral
+> `akuma_mmap::Prot` that `pub use types::*` re-exports. `akuma_mmu::Prot` meant
+> a region record on one architecture and a page-table encoding on the other.
+> `akuma-syscalls-glue` is the first shared crate to name the type, and it
+> failed to compile — the lucky outcome. Renamed `PteProt`, matching
+> `amd64/src/paging.rs`'s own.
+>
+> **And a real leak, found by running rather than reading:** `map_page` — the
+> walk that allocates the first three tables of every address space — used the
+> untracked walker, so those frames were unreachable on teardown. The ledger
+> parameter was `Option<&FrameLedger>`; it is mandatory now. Third frame-ownership
+> bug on this target found by a live probe, after B1's two.
+>
+> Verified QEMU **405/0** (`SMP=1`, was 357) and **414/0** (`SMP=4`, was 366) —
+> +48 both, one new suite (`amd64/src/uas.rs`) and nothing else moved. Bare metal
+> not booted for this. aarch64 proven unchanged by section compare against
+> `HEAD`: `.text`, `.rodata` and `.data` **byte-identical**.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate
@@ -83,7 +117,10 @@ Measurements as of 2026-09-07:
   CR3 rewrite for full flushes, and its own x86 `Prot`/`MemAttr` encode
   (`crates/akuma-mmu/src/lib.rs`, the Phase-4 block,
   `proposals/AKUMA_MMU_ARCH_PORTABILITY.md`).
-- `cargo check -p akuma-syscalls-glue --target x86_64-unknown-none` **fails**,
+- **[Corrected 2026-09-07, same day — this is what B3 did.]**
+  `cargo check -p akuma-syscalls-glue --target x86_64-unknown-none` **passed**
+  as of the B3 landing above. It read, when this plan was written:
+  it **fails**,
   and the error list is the work: `UserAddressSpace` on x86 is the scoped-down
   six-method Phase-4 type, missing the AArch64 surface glue programs against —
   `ttbr0()`, `is_shared`, `map_user_page_tracked`, the `UserPages` impl,
@@ -208,8 +245,10 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    ▼
  [09-07] ═══ YOU ARE HERE ═══
    │
-   └──► the unlock tree below — A1/B1 start whenever; the gate is
-        `cargo check -p akuma-syscalls-glue --target x86_64-unknown-none`
+   └──► the unlock tree below — A1, A2, B1, B2, the six memory gaps and
+        B3 all landed this day; the gate
+        (`cargo check -p akuma-syscalls-glue --target x86_64-unknown-none`)
+        is GREEN, and C1 is next
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -278,6 +317,7 @@ parity with what the AArch64 self-host already proves.
                                  ▼
   ╔══════════════════════════════════════════════════════════════╗
   ║  THE GATE: akuma-syscalls-glue builds for x86_64-unknown-none ║
+  ║  ✔ PASSED 2026-09-07 — AKUMA_AMD64_B3_ADDRESS_SPACE.md        ║
   ╚══════════════════════════════┬═══════════════════════════════╝
                                  ▼
   ┌────────────────────────────────────────────────────────────────┐
@@ -465,6 +505,13 @@ divergence. Difference-by-duplication (the third category, most of
    the AArch64 contract, not invent a second design beside it — the
    `prot_roundtrips_to_todays_bits` pattern in `akuma-mmu` is how `Prot` was
    pinned; do the same for each new method.
+   **B3 followed this (2026-09-07)** and it paid twice: every divergence is
+   named at the method that has it (the table in
+   `AKUMA_AMD64_B3_ADDRESS_SPACE.md` §5), and pinning `PteProt::from_region`
+   against `amd64/src/paging.rs`'s six literals is what keeps the two x86
+   walkers from drifting before C1 deletes one of them. It also found the
+   sharper form of this caution: same type name, two `cfg` impls, **plus a glob
+   re-export** is a silent per-architecture type substitution — see §3.
 2. **Diff the dispatch arms against glue while folding (C1).** The arms have
    drifted: no signals, no `fcntl`, blocking-only sockets. Each divergence is
    either a pinned decision to carry over explicitly or a gap glue closes for

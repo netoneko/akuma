@@ -92,6 +92,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-fbcon",
  "akuma-mmap",
+ "akuma-mmu",
  "akuma-multiboot2",
  "akuma-net",
  "akuma-net-rtl8169",
