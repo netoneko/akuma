@@ -85,6 +85,31 @@ unsafe extern "C" {
     static __arch_copy_user_region_end: u8;
 }
 
+// The SMAP flag the x86_64 copy loop tests, defined by the asm block below.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    static __akuma_user_access_smap_active: core::sync::atomic::AtomicU8;
+}
+
+/// Tell this crate whether `CR4.SMAP` is set, so the user-copy loop brackets
+/// itself with `stac`/`clac`.
+///
+/// Must be called once, from the kernel that turned SMAP on and **after** it set
+/// the CR4 bit. Before it, the loop runs unbracketed — which is correct on a CPU
+/// or VMM without SMAP, and is why this is a runtime flag rather than a
+/// compile-time one: `stac`/`clac` are `#UD` where SMAP is absent.
+///
+/// Not calling it on a machine that *does* have SMAP set is not a silent wrong
+/// answer — every copy to a user page faults, is caught by the fixup, and comes
+/// back `EFAULT`. Loud, but wrong; hence this function.
+#[cfg(target_arch = "x86_64")]
+pub fn set_smap_active(on: bool) {
+    // SAFETY: the symbol is one byte in this crate's own `.data`, defined by the
+    // `global_asm!` block below and touched only through this atomic.
+    unsafe { &__akuma_user_access_smap_active }
+        .store(u8::from(on), core::sync::atomic::Ordering::Release);
+}
+
 #[cfg(target_arch = "aarch64")]
 global_asm!(
     r#"
@@ -256,14 +281,51 @@ global_asm!(
 .global __arch_copy_user_fault
 .global __arch_copy_user_region_start
 .global __arch_copy_user_region_end
+.global __akuma_user_access_smap_active
+
+    /* Whether `CR4.SMAP` is set, as one byte. Defined here rather than in Rust
+     * so the asm's `[rip + …]` and the Rust setter reach the same object under
+     * every platform's symbol convention — the same arrangement the region
+     * labels above already use. `amd64/src/uaccess.rs::init_smap` is what sets
+     * it, right after it sets the CR4 bit. */
+    .section .data
+__akuma_user_access_smap_active:
+    .byte 0
+    /* Back to code. A missing `.section` here puts everything below in .data
+     * and the link fails — see the note at the top of this block. */
+    .section .text
 
 __arch_copy_user_region_start:
 
 __arch_copy_user_memory:
     mov     rcx, rdx
     cld
-    rep movsb
-    xor     eax, eax
+    /* SMAP: with CR4.SMAP set, a ring-0 access to a user-accessible page
+     * faults unless EFLAGS.AC is set. `stac`/`clac` are the declaration, and
+     * they are `#UD` on a CPU (or a VMM) without SMAP — hence the flag test
+     * rather than an unconditional pair. Same shape, and the same reason, as
+     * the exception stubs in `amd64/src/idt.rs`.
+     *
+     * Absent until 2026-09-07. This crate's copy was the tree's *second* user
+     * copy on x86_64 and the only one without the brackets: `amd64/src/uaccess.rs`
+     * has had them since SMAP was turned on (2026-09-05), and the boot suite
+     * even asserts "an unbracketed kernel read of a user page is refused". It
+     * went unnoticed because nothing on this target called this function with a
+     * real ring-3 pointer until the first syscall was folded into
+     * `akuma-syscalls-glue` (C1 step 3) — the kernel's own probes all run
+     * inside `BypassValidationGuard` with kernel-stack buffers.
+     *
+     * Both `stac` and `clac` are inside the fixup region on purpose: a fault
+     * anywhere between them must land on `__arch_copy_user_fault`, which
+     * `clac`s before returning so AC never leaks out of a failed copy. */
+    cmp     byte ptr [rip + __akuma_user_access_smap_active], 0
+    je      1f
+    stac
+1:  rep movsb
+    cmp     byte ptr [rip + __akuma_user_access_smap_active], 0
+    je      2f
+    clac
+2:  xor     eax, eax
     ret
 
 /* Byte-at-a-time oracle for `copy_loop_differential_sweep` — the loop above is
@@ -271,7 +333,10 @@ __arch_copy_user_memory:
  * invariants: leaf, stackless, caller-saved registers only, inside the fixup
  * range. Not reachable from any copy path. */
 __arch_copy_user_memory_bytes:
-    test    rdx, rdx
+    cmp     byte ptr [rip + __akuma_user_access_smap_active], 0
+    je      4f
+    stac
+4:  test    rdx, rdx
     jz      2f
 1:  mov     al, byte ptr [rsi]
     mov     byte ptr [rdi], al
@@ -279,7 +344,10 @@ __arch_copy_user_memory_bytes:
     inc     rdi
     dec     rdx
     jnz     1b
-2:  xor     eax, eax
+2:  cmp     byte ptr [rip + __akuma_user_access_smap_active], 0
+    je      5f
+    clac
+5:  xor     eax, eax
     ret
 
 __arch_copy_user_region_end:
@@ -288,7 +356,13 @@ __arch_copy_user_region_end:
  * fault's rip was inside the range above. rsp is untouched by everything in
  * that range, so this `ret` lands in the Rust caller with EFAULT (14) in rax. */
 __arch_copy_user_fault:
-    mov     eax, 14
+    /* Clear AC on the way out: a fault mid-copy must not leave the kernel
+     * running with SMAP declared off. `clac` is `#UD` without SMAP, so it is
+     * gated the same way the entry is. */
+    cmp     byte ptr [rip + __akuma_user_access_smap_active], 0
+    je      3f
+    clac
+3:  mov     eax, 14
     ret
     "#
 );

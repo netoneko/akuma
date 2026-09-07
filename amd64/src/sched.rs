@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-thread kernel stack. Generous: these are `Vec` allocations from a large
 /// heap, and a stack overflow here has no guard page to catch it.
-const STACK_SIZE: usize = 32 * 1024;
+pub(crate) const STACK_SIZE: usize = 32 * 1024;
 
 /// Maximum threads, including the boot thread in slot 0.
 ///

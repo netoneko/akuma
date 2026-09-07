@@ -174,6 +174,12 @@ pub fn init_smap() -> SmapStatus {
     unsafe { core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags)) };
     if cpuid_smap {
         SMAP_ACTIVE.store(1, Ordering::Release);
+        // The shared user-copy crate has its own copy loop (`rep movsb`) and
+        // its own flag byte; it must be told too, or every copy through
+        // `akuma-syscalls-glue` faults on a legitimate user page. Two flags
+        // rather than one because the crate cannot name this kernel's static —
+        // set together, here, so they cannot disagree.
+        akuma_user_access::set_smap_active(true);
     }
 
     let mut cr0: u64;

@@ -50,6 +50,10 @@ mod boot;
 mod clock;
 #[cfg(target_arch = "x86_64")]
 mod dns;
+/// The `akuma-exec` runtime + config tables this target registers — the
+/// prerequisite for any syscall served by `akuma-syscalls-glue` (C1 step 3).
+#[cfg(target_arch = "x86_64")]
+mod exec_runtime;
 #[cfg(target_arch = "x86_64")]
 mod fd;
 #[cfg(target_arch = "x86_64")]
@@ -207,6 +211,20 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // and a driver that goes quiet.
     akuma_primitives::console::set_print_hook(serial::puts);
 
+    // Register the `akuma-exec` runtime + config. **This is what lets a syscall
+    // reach `akuma-syscalls-glue` at all** — glue's user-copy helpers read
+    // `akuma_exec::runtime::config()`, a `Registered` cell that panics when
+    // absent, so the first folded arm (`uname`, C1 step 3) died here before this
+    // call existed. See `exec_runtime.rs` for the three kinds of hook in it.
+    //
+    // Placed right after the console hook and before anything that could take a
+    // syscall: `register` installs the shared console and clock sinks itself, so
+    // every `safe_print!`/`tprint!` in a shared crate lights up from here, and
+    // `[T…]` stamps start being real rather than `[T0.00]`. It allocates
+    // nothing and reads no hardware — `lapic::ticks()` is an atomic that answers
+    // 0 before the timer runs — so it is safe this early.
+    exec_runtime::init();
+
     // PCI, on request only — the note above says why it is not automatic here.
     // `pci` on the command line is a promise from whoever booted this kernel
     // that the config ports are real, which under QEMU `-M q35` they are.
@@ -351,6 +369,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         } else {
             serial::puts("<no location>");
         }
+        // The message, which this handler discarded until 2026-09-07.
+        //
+        // A location alone is not a diagnosis, and the tree is full of panics
+        // whose whole value is the string: `akuma_primitives::Registered` exists
+        // to carry one ("… not registered — call akuma_exec::init() first"), and
+        // every one of those arrived here as a bare `lib.rs:208`. Found by
+        // hitting exactly that panic while folding the first syscall into
+        // `akuma-syscalls-glue` and having to bisect for a message the kernel
+        // already had in hand.
+        //
+        // `safe_print!` per the console rules: a fixed stack buffer, no
+        // allocation — the console is what survives when the allocator is what
+        // broke, and a panic handler is that path by definition.
+        serial::puts("\n        ");
+        akuma_primitives::safe_print!(256, "{}", info.message());
         serial::puts("\n");
     }
     #[cfg(not(target_arch = "x86_64"))]

@@ -200,6 +200,28 @@ const fn uts_field(mut buf: [u8; UTS_LEN], index: usize, value: &[u8]) -> [u8; U
 /// sethostname/setdomainname are not wired into the dispatch table, so there is
 /// no write path for them to track — which is also what makes baking the whole
 /// image into `.rodata` correct rather than merely cheaper.
+/// The `machine` field, derived from the architecture actually being compiled.
+///
+/// It was the literal `b"aarch64"` until 2026-09-07, which was true while this
+/// crate had one consumer. C1 gives it a second: the amd64 kernel folds its own
+/// `uname` arm into `handle_syscall` here, and a kernel reporting `aarch64` from
+/// `uname -m` on an x86_64 machine is a wrong answer that nothing would refuse —
+/// `busybox uname -a` prints it, build systems branch on it, and `./configure`
+/// picks a target triple from it.
+///
+/// `if cfg!` rather than `#[cfg]` on two items deliberately: both arms are
+/// type-checked in every build, so the one this target does not take cannot rot.
+const UTS_MACHINE: &[u8] = if cfg!(target_arch = "aarch64") {
+    b"aarch64"
+} else if cfg!(target_arch = "x86_64") {
+    b"x86_64"
+} else {
+    // A third architecture has no answer here yet. `unknown` is what Linux
+    // itself writes when it has none, and is at least not a lie about which
+    // machine this is.
+    b"unknown"
+};
+
 static UTSNAME: [u8; UTS_LEN] = {
     let b = [0u8; UTS_LEN];
     let b = uts_field(b, 0, b"Akuma");
@@ -210,7 +232,7 @@ static UTSNAME: [u8; UTS_LEN] = {
         3,
         concat!(env!("AKUMA_GIT_SHA"), "-", env!("AKUMA_BUILD_PROFILE")).as_bytes(),
     );
-    let b = uts_field(b, 4, b"aarch64");
+    let b = uts_field(b, 4, UTS_MACHINE);
     uts_field(b, 5, b"(none)")
 };
 

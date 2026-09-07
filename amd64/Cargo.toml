@@ -198,6 +198,19 @@ akuma-user-access = { path = "../crates/akuma-user-access" }
 # know about, registered as `X86ArchHooks`.
 # `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` calls this A1.
 akuma-threading = { path = "../crates/akuma-threading" }
+# **C1**: the shared syscall dispatcher and its per-family implementations —
+# the crate this target's `usermode.rs` is being folded into
+# (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`, step 3 onward).
+# `default-features = false` on principle, matching the AArch64 bin: glue's
+# `default` is `smoltcp` and a profile that does not want the stack must not
+# gain it by accident. This target does want it — `akuma-net` is already here
+# with smoltcp on — so it is named explicitly.
+# The process/thread/exec runtime glue dispatches through. Named directly
+# because `exec_runtime.rs` builds its `ExecRuntime`/`ExecConfig` tables —
+# without that registration the first syscall folded into glue panics in
+# `akuma_exec::runtime::config()`, which is a `Registered` cell.
+akuma-exec = { path = "../crates/akuma-exec" }
+akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp"] }
 
 [[bin]]
 name = "akuma-amd64"

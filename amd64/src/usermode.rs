@@ -1273,9 +1273,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 wait4_unregister(me);
             }
         }
-        // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
-        // string aside — see `akuma_syscalls_glue::proc::sys_uname`.
-        Syscall::Uname => sys_uname(a1),
+        // uname(2) — **the first arm folded into glue** (C1 step 3).
+        //
+        // It was already "the same answer the aarch64 kernel gives, machine
+        // string aside"; now it *is* that answer. The machine string was the
+        // one real difference and it moved into glue as `UTS_MACHINE`, derived
+        // from `target_arch` — a shared `uname` that reported `aarch64` on this
+        // box would be a wrong answer nothing refuses.
+        //
+        // Two fields change what they print here, deliberately: `release` and
+        // `version` now come from glue's build identity (`<git-sha>-<profile>`)
+        // instead of `banner::RELEASE`/`VERSION_DESC`. That is the fold working
+        // — one answer, not two — and it is a gain: `uname -a` on this target
+        // now names the commit it is running. `banner::print()` still uses the
+        // local strings for the boot banner, which is where the target name
+        // belongs.
+        Syscall::Uname => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // Credentials. One user, uid 0 — the same answer `src/syscall` gives.
         Syscall::Getuid | Syscall::Getgid | Syscall::Geteuid | Syscall::Getegid => 0, // get{uid,gid,euid,egid}
         Syscall::Setuid | Syscall::Setgid => 0,             // set{uid,gid}: already root, accept
@@ -1496,52 +1509,6 @@ fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
     total
 }
 
-/// `getrandom(buf, buflen, flags)` — bytes from `RDRAND` (or the loud
-/// non-cryptographic fallback on a CPU without it; see `net::rng_fill`).
-///
-/// `flags` is ignored: `GRND_NONBLOCK` never applies because `RDRAND` does not
-/// block, and `GRND_RANDOM` vs the urandom pool is a distinction this source
-/// does not have. Bounded per call — `sshd` asks for 32 at a time.
-/// `struct utsname`: six 65-byte NUL-padded fields, 390 bytes. The ABI's shape,
-/// not this kernel's — Linux copies the same 390 bytes out of `init_uts_ns`.
-const UTS_FIELD: usize = 65;
-const UTS_LEN: usize = UTS_FIELD * 6;
-
-const fn uts_set(mut b: [u8; UTS_LEN], field: usize, v: &[u8]) -> [u8; UTS_LEN] {
-    let start = field * UTS_FIELD;
-    let max = UTS_FIELD - 1;
-    let n = if v.len() < max { v.len() } else { max };
-    let mut i = 0;
-    while i < n {
-        b[start + i] = v[i];
-        i += 1;
-    }
-    b
-}
-
-/// The answer `uname(2)` gives, assembled once in `.rodata`. `machine` is
-/// `x86_64` here where the AArch64 kernel says `aarch64` — the one field that
-/// actually differs between the two.
-static UTSNAME: [u8; UTS_LEN] = {
-    let b = [0u8; UTS_LEN];
-    let b = uts_set(b, 0, b"Akuma"); // sysname
-    let b = uts_set(b, 1, b"akuma"); // nodename
-    let b = uts_set(b, 2, crate::banner::RELEASE.as_bytes()); // release
-    let b = uts_set(b, 3, crate::banner::VERSION_DESC.as_bytes()); // version
-    let b = uts_set(b, 4, b"x86_64"); // machine
-    uts_set(b, 5, b"(none)") // domainname
-};
-
-fn sys_uname(buf: u64) -> u64 {
-    if buf == 0 {
-        return crate::fd::errno::EFAULT;
-    }
-    if !crate::uaccess::write_bytes(buf, &UTSNAME) {
-        return crate::fd::errno::EFAULT;
-    }
-    0
-}
-
 /// `sysinfo(2)` — memory totals for `busybox free` / `top`. The struct layout
 /// is `akuma_syscalls_linux::proc::Sysinfo` (LP64, host-tested, shared with the
 /// AArch64 kernel). `mem_unit = 1` so every `*ram` field is already in bytes;
@@ -1723,6 +1690,12 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     }
 }
 
+/// `getrandom(buf, buflen, flags)` — bytes from `RDRAND` (or the loud
+/// non-cryptographic fallback on a CPU without it; see `net::rng_fill`).
+///
+/// `flags` is ignored: `GRND_NONBLOCK` never applies because `RDRAND` does not
+/// block, and `GRND_RANDOM` vs the urandom pool is a distinction this source
+/// does not have. Bounded per call — `sshd` asks for 32 at a time.
 fn sys_getrandom(buf: u64, len: u64) -> u64 {
     use crate::fd::errno;
     if buf == 0 {
@@ -3852,6 +3825,29 @@ pub fn fork_test(t: &mut Suite) {
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );
+}
+
+/// Hand a syscall to `akuma-syscalls-glue` — the implementation the AArch64
+/// kernel serves it from.
+///
+/// **This is the C1 seam**, and the one place the number vocabulary changes.
+/// Userspace passed an x86_64 number; glue's dispatch is a `match` over
+/// asm-generic constants, so `to_aarch64()` is not a formality — handing glue
+/// the number that arrived would find the *wrong* arm, not none
+/// (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`).
+///
+/// Taking a `Syscall` rather than a `u64` is what makes that unskippable: there
+/// is no way to call this with a raw number at all.
+///
+/// What glue's prologue touches before the arm runs — `CURRENT_SYSCALL_NR`, the
+/// excursion counters, `set_thread_current_syscall`, the delivered-signal clear,
+/// the identity cache — all reaches `akuma_exec::threading`, which **is**
+/// `akuma-threading`, the scheduler this target has run since A1. That is why a
+/// folded arm needs no shim: it is already the same thread table.
+fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
+    let r = akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
+    akuma_primitives::safe_print!(96, "[TMP] to_glue {:?} arg0={:#x} -> {:#x}\n", call, args[0], r);
+    r
 }
 
 /// The dispatch **vocabulary**: two tables that must stay disjoint, and the
