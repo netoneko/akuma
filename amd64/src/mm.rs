@@ -294,7 +294,16 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     }
     usermode::with_current_regions(|regions| regions.push(region));
 
-    if plan.use_lazy {
+    // **Pinned divergence: a `MAP_SHARED | MAP_ANONYMOUS` mapping is never lazy
+    // here**, whatever `plan` says. Such a region is shared with a `fork` child
+    // *by identity* — same frames, mapped writable in both — and `fork_from`
+    // does that by walking the parent's present leaves. A page that has not been
+    // faulted in yet is not a leaf, so each side would demand-page its own
+    // private frame and the mapping would silently behave like `MAP_PRIVATE`.
+    // Sharing a not-yet-existing page needs a backing object this target does
+    // not have; populating up front is the honest alternative, and a shared
+    // anonymous mapping is a coordination area rather than a big reservation.
+    if plan.use_lazy && !plan.shared_anon {
         // Nothing is allocated. The pages arrive through `fault_in` on first
         // touch, and a `PROT_NONE` reservation never gets any at all — which is
         // the whole point of reserving.

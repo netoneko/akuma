@@ -242,6 +242,94 @@ or to Ubuntu, and the screen says which.
 counters come from `/proc/net/dev`, which this kernel fills with literal zeros —
 it reads identically on a dead NIC and a busy one.
 
+## The userspace probes — and why they are the ones to reach for
+
+`userspace/forktest/c_stress/` holds ~40 small static C probes that have been
+**calibrated against real Linux**: each one's header says what a correct kernel
+prints, and most carry a `docker run --platform linux/arm64 … alpine /<probe>`
+line so the same binary can be run on Linux and on Akuma and the two answers
+compared. That is what makes them worth more than anything written fresh for a
+bug — they encode what "correct" is, they were each written because something
+here was silently wrong, and their verdicts are already known-good on two
+kernels.
+
+**They are architecture-neutral C.** Not one contains an `asm` block, a page-size
+constant or a syscall number, so the only aarch64-specific thing about them was
+the compiler name in the runner. Build them for this target with
+`x86_64-linux-musl-gcc`; `scripts/mem_suite.py --arch x86_64` does it for you and
+writes the binaries to `c_stress/x86_64/` (per-architecture subdirectories, so
+the two arches cannot silently run each other's build).
+
+Two transports, because this box has two rigs and they differ in what the guest
+can reach:
+
+```bash
+# ssh transport — the QEMU guest, and the aarch64 devbox
+SMP=1 SSH_PORT=2244 INIT=/bin/sshd sh amd64/run.sh &
+python3 scripts/mem_suite.py --port 2244 --arch x86_64 \
+    -i target/x86_64-unknown-none/release/amd64-ssh-test-key
+
+# console transport — QEMU **and** the box's Firecracker, in parallel
+python3 scripts/utils/amd64_mem_trials.py
+python3 scripts/utils/amd64_mem_trials.py --smp 4 --only mmap_stress,cowstale
+```
+
+`hpbox.firecracker` boots with `"network-interfaces": []`, so **there is nothing
+to ssh to on that arm** — the probes ride in on the disk image (`debugfs` writes
+them to `/probes/`) and report on the serial console.
+`scripts/utils/amd64_mem_trials.py` does that on both machines at once and
+imports `mem_suite.verdict` rather than re-deriving it, so "did this probe pass"
+has one definition across both transports. In particular a **silent probe is
+never a pass** — that rule was learned the hard way and a second copy of it is a
+second place to get it wrong.
+
+### Reading a result on this target
+
+The probes assume a Linux-complete guest, so several fail here for reasons that
+have nothing to do with what they test. `amd64_mem_trials.py` carries that list
+as `EXPECTED_FAIL` with a diagnosed reason for each, and reports a probe that
+starts *passing* as a surprise rather than silently accepting it — an entry that
+goes green means the gap it names has been closed and the entry should go.
+
+As of 2026-09-07, after the `akuma-mmap` region table landed (B1/B2):
+
+| probe | verdict | why |
+|---|---|---|
+| `mmap_stress` | **PASS** | |
+| `madvshared` | **PASS** | |
+| `shmanon` | **PASS** | was failing — `MAP_SHARED\|MAP_ANONYMOUS` now survives `fork` as one object |
+| `cowstale` | **PASS** | |
+| `mmapsum` | known | `pread64` (x86_64 17) is not implemented here |
+| `mmap_file` | known | file-backed `mmap` is `ENOSYS` by design — no page cache |
+| `mprotectlb` | known | needs a `SIGSEGV` handler; no signal delivery on this target |
+| `mremapmove` | known | `mremap` is not implemented |
+| `eager_mprotect_probe` | known | a killed child exits `128+SIGSEGV` instead of reporting a *signalled* status, so its `WIFSIGNALED` check never fires |
+| `smapsdirty` | known | no `/proc/self/smaps`, no `MADV_FREE` |
+
+The last two are worth reading twice, because both look like memory bugs and
+neither is. `mprotect` **does** work here — verified directly:
+`mmap` RW, touch, `mprotect(PROT_READ)`, write ⇒ the process dies with 139. What
+those two probes actually need is *signals*, which is trunk A2.
+
+### Two gaps in the guest shell that will bite any harness
+
+Found while porting the suite, and neither is a memory bug:
+
+- **`2>&1` fails.** Any command carrying it answers `/bin/sh: 1: Bad file
+  descriptor` and returns 1, so a harness that appends it — as `mem_suite.py`
+  used to — gets zero probes run and ten identical failures. The redirect was
+  redundant anyway (both streams reach the same place); it is gone.
+- **busybox here has no `base64` applet**, and the failure is silent in the worst
+  way: `base64 -d > /tmp/x` leaves a **zero-byte** file, because the shell
+  creates the redirect target before discovering the command does not exist.
+  Every probe then "runs" and prints nothing. `mem_suite.push` probes for the
+  applet once and sends raw bytes when it is missing — safe on both, since ssh
+  with no `-t` allocates no pty and the channel is 8-bit clean.
+
+There is also no `/dev` at all on this target, so `dd if=/dev/zero` cannot be
+used to stage a test file; `mem_suite.stage` writes the bytes over the ssh
+channel instead.
+
 ## Known-broken, so you do not rediscover them
 
 | symptom | cause |

@@ -7,6 +7,32 @@ as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** plan, with measurements taken 2026-09-07.
 
+> **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
+> `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
+> table (`Process::regions`, per address space, under its own lock),
+> `PteProt::from_region` is the crate's x86 backend with all six `Prot::ALL`
+> variants pinned bit-for-bit, and the `#PF` handler demand-pages out of the
+> region list. `MAX_MAPPING`, "never lazy", the global `NEXT_VA` bump and the
+> `MAP_FIXED`/`mprotect` refusals are all gone; file-backed `mmap` is the one
+> refusal left, and it needs a page cache.
+>
+> Two latent bugs fell out: a `fork` child leaked **every page it `mmap`ed after
+> forking** (in neither the ledger nor the bump-window walk), and `munmap` could
+> double-free a loader page against teardown. Both are fixed by giving every
+> anonymous frame one owner — the frame ledger — and deleting the second path.
+>
+> Verified QEMU 323/0 (`SMP=1`) and 332/0 (`SMP=4`), Firecracker 322/0
+> (`SMP=4`), and by the `c_stress` memory probes, which now build for x86_64:
+> `mmap_stress`, `cowstale`, `madvshared` and `shmanon` pass, and **no remaining
+> failure is a memory-mapping defect** — the six are `pread64`, `mremap`,
+> `MADV_FREE`, `/proc/self/smaps`, file-backed `mmap` and, twice, the absence of
+> signal delivery. `shmanon` was the one real find: `MAP_SHARED|MAP_ANONYMOUS`
+> was recorded and then ignored by `fork`.
+>
+> **Not done from the B1 box:** file-backed mappings. B3 (widen the x86
+> `UserAddressSpace`) is unblocked — its probes are region queries and the
+> regions exist now.
+
 > **A1 and A2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_BLOCKING.md`.
 > `amd64/src/sched.rs` no longer contains a scheduler: `akuma-threading` is the
 > scheduler on both architectures, and what is left is the machine effects
@@ -360,6 +386,36 @@ Both are `A2` — "wakes become real" — which is scheduled *after* the A1 fold
 that landed 2026-09-07 and is not part of the B trunk. **Deliberately not
 investigated now.** Revisit after A2 lands; if the hang survives it, it is a
 real third bug and worth its own autopsy rather than a guess.
+
+### 4. **aarch64**, not amd64: `test_spawn_ext_passes_env` panics the boot suite
+
+Found 2026-09-07 while running `scripts/lima_aarch64_run.sh` to prove the amd64
+`mmap` work had not touched the other kernel. It had not — `git diff` over
+`src/`, `crates/` and `Cargo.toml` between the session's start commit and its end
+is **empty**, so the aarch64 kernel binary is unchanged and this failure belongs
+to the branch, not to that work.
+
+```
+[Test] spawn_ext env FAILED, child saw:
+[Test] spawn_ext default env FAILED, child saw:
+[Test] spawn_ext_passes_env FAILED (2 of 2)
+!!! PANIC !!!  src/process_tests.rs:3411
+```
+
+Both cases fail the same way and the informative part is what is *missing*: the
+child's output is **empty**, not wrong. The test spawns `/bin/busybox env`
+through `SPAWN_EXT` and reads what came back on the spawn channel; an empty
+string means either the child produced nothing or the channel did not deliver it,
+and those need opposite fixes. `check_binary_exists` passed, so busybox is on
+the image.
+
+Worth holding next to issue 3 above — an amd64 `ssh` command whose output
+arrives and whose *completion* never does — because both are "a child ran and
+something about the end of it did not propagate". That is a resemblance, not a
+diagnosis: nobody has looked yet, and the two kernels do not share this code.
+
+Not investigated. It gates nothing in the B trunk and it is the aarch64 kernel's
+boot suite, so it wants its own pass.
 
 ## What stays different forever, by design
 

@@ -2068,12 +2068,59 @@ impl Process {
         let frames = FrameSet::new(false);
         let mut ok = true;
 
+        // The child's region list, and — separately — the VA ranges that must be
+        // shared **by identity** rather than copy-on-write. Both are read out of
+        // the parent's list in one hold, before the page walk below, because the
+        // walk maps pages and must not run under the region lock.
+        let (regions, shared_ranges) = {
+            let _irq = akuma_primitives::irq::IrqGuard::new();
+            let parent_regions = parent.regions.lock();
+            let shared: Vec<(usize, usize)> = parent_regions
+                .iter()
+                .filter(|r| r.shared_anon)
+                .map(|r| (r.start_va, r.start_va + r.len_bytes()))
+                .collect();
+            // The child maps every page of every parent region — read-only and
+            // CoW-shared by the pass below — but *owns* none of them, which is
+            // exactly the shape `inherit_mmap_regions_for_cow_child` produces.
+            // Carrying the **extent** across is the part that matters and the
+            // part that has been dropped before: a grandchild whose parent's
+            // regions read as zero-length shares nothing and faults on its first
+            // touch (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
+            (akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions), shared)
+        };
+
         let parent_root = parent.space.root();
         paging::for_each_user_leaf(parent_root, |va, pa, prot| {
             if !ok {
                 return;
             }
             let frame = PhysFrame::new(pa as usize);
+
+            // `MAP_SHARED | MAP_ANONYMOUS`: one object, not two copies.
+            //
+            // Everything else in an address space is private, so fork demotes it
+            // to read-only and lets the first write break the sharing. Doing that
+            // to a shared anonymous mapping gives parent and child separate pages
+            // — the child's write becomes invisible to the parent, which is the
+            // exact opposite of what the flag asks for, and it is how a process
+            // pool coordinating through shared memory silently measures nothing
+            // (`userspace/forktest/c_stress/shmanon.c`).
+            //
+            // So: same frame, writable in **both**, no CoW marker, and the
+            // parent's own PTE deliberately left alone.
+            if shared_ranges.iter().any(|(start, end)| va >= *start && va < *end) {
+                let shared_rw = PteProt { write: true, cow: false, ..prot };
+                akuma_pmm::cow_ref_inc(frame.addr);
+                frames.track_user_frame(frame);
+                if !space.map(va, pa, shared_rw, MemAttr::WriteBack) {
+                    if frames.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                        akuma_pmm::free_page(frame.addr, 0);
+                    }
+                    ok = false;
+                }
+                return;
+            }
 
             // A page that is already read-only and *not* CoW stays exactly as it
             // is in both spaces — `.rodata`, an `mprotect(PROT_READ)` region.
@@ -2132,18 +2179,6 @@ impl Process {
             space.free();
             return None;
         }
-        // The child maps every page of every parent region — read-only and
-        // CoW-shared by the pass above — but *owns* none of them, which is
-        // exactly the shape `inherit_mmap_regions_for_cow_child` produces.
-        // Carrying the **extent** across is the part that matters and the part
-        // that has been dropped before: a grandchild whose parent's regions
-        // read as zero-length shares nothing and faults on its first touch
-        // (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
-        let regions = {
-            let _irq = akuma_primitives::irq::IrqGuard::new();
-            let parent_regions = parent.regions.lock();
-            akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions)
-        };
         Some(Self { space, frames, entry, stack, forked: true, regions: Spinlock::new(regions) })
     }
 }

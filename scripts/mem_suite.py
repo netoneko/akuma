@@ -46,6 +46,13 @@ Usage:
   scripts/mem_suite.py --port 2322 --no-build      # reuse what is in the tree
   scripts/mem_suite.py --port 2322 --only mmapsum,cowstale
   scripts/mem_suite.py --port 2322 --json out.json # save digests for an A/B diff
+  scripts/mem_suite.py --port 2244 --arch x86_64   # the amd64 guest
+
+The probes are neutral C, so `--arch` picks only the cross compiler and the
+output subdirectory. For the amd64 kernel, boot a guest with sshd on the
+forwarded port first:
+
+  SMP=1 SSH_PORT=2244 INIT=/bin/sshd sh amd64/run.sh
 
 Exit status is 0 only if every selected probe passed, so it can gate an A/B arm.
 """
@@ -54,10 +61,31 @@ import base64
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "userspace/forktest/c_stress"
+
+# Which cross compiler builds the probes, and where the binary for that
+# architecture is written.
+#
+# The probes are **architecture-neutral C** — they call `mmap`, `mprotect`,
+# `madvise` and read `/proc/self/smaps`, and not one of them contains an `asm`
+# block, a page-size constant or a syscall number. So the only thing that was
+# aarch64-specific here was the compiler name, and the amd64 kernel gained an
+# `mmap` region table on 2026-09-07 that wants exactly this gate
+# (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` item B1/B2).
+#
+# The binaries land in per-architecture subdirectories rather than beside the
+# sources: two arches writing `c_stress/mmapsum` in turn is a stale-artifact
+# trap, and the shape of it — an arm silently running the *other* arch's binary,
+# or a build that "succeeded" because the previous one is still there — is one
+# this tree has paid for before (`docs/archive/AB_STALE_BAKED_ARTIFACTS.md`).
+ARCHES = {
+    "aarch64": "aarch64-linux-musl-gcc",
+    "x86_64": "x86_64-linux-musl-gcc",
+}
 
 # name -> (args in the guest, seconds). The arg-taking probes get a file staged
 # by `stage()`; the rest default their own parameters.
@@ -77,32 +105,98 @@ PROBES = {
 SSH_BASE = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
             "-o", "LogLevel=ERROR"]
 
+# Extra `ssh` arguments, filled in from `--identity`. The devbox accepts any key
+# the agent offers; the amd64 image stages exactly one public key into
+# `/etc/sshd/authorized_keys` (`amd64/mkdisk.sh`), so that guest needs to be told
+# which private key to present.
+SSH_EXTRA = []
+
 
 def ssh(port, cmd, timeout=900):
+    """Run `cmd` in the guest; returns its **merged** stdout and stderr.
+
+    The merge happens here rather than as a `2>&1` in the guest command, which
+    is what it used to be. That redirect was redundant — both streams are
+    concatenated below either way — and it excluded a guest whose shell cannot
+    do it: the amd64 image answers `/bin/sh: 1: Bad file descriptor` to any
+    `2>&1` and returns 1, so every probe failed before it started.
+    """
     try:
-        p = subprocess.run(SSH_BASE + ["-p", str(port), "root@localhost", cmd],
+        p = subprocess.run(SSH_BASE + SSH_EXTRA + ["-p", str(port), "root@localhost", cmd],
                            capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return "", 124
     return p.stdout.decode(errors="replace") + p.stderr.decode(errors="replace"), p.returncode
 
 
+# Does the guest have a `base64` applet? Probed once per run by `push`.
+_HAVE_BASE64 = {}
+
+
 def push(port, path, dest):
-    subprocess.run(SSH_BASE + ["-p", str(port), "root@localhost",
-                               f"base64 -d > {dest} && chmod +x {dest}"],
-                   input=base64.b64encode(path.read_bytes()),
-                   capture_output=True, timeout=600)
+    """Copy one probe binary into the guest and make it executable.
+
+    Base64 where the guest can decode it, raw bytes where it cannot. The amd64
+    image's busybox is built without the `base64` applet, and the failure was
+    silent in the worst way: `base64 -d > /tmp/x` left a **zero-byte** file
+    behind — the shell created the redirect target before discovering the
+    command did not exist — so every probe then "ran" and reported nothing.
+    A guest with no `base64` is a guest the suite should still work on.
+
+    Raw is safe on both: ssh with no `-t` allocates no pty, so the channel is
+    8-bit clean. Verified by md5 across the transfer on the amd64 guest.
+    """
+    if port not in _HAVE_BASE64:
+        out, _rc = ssh(port, "base64 --help >/dev/null 2>/dev/null && echo yes")
+        _HAVE_BASE64[port] = "yes" in out
+    if _HAVE_BASE64[port]:
+        payload, cmd = base64.b64encode(path.read_bytes()), f"base64 -d > {dest}"
+    else:
+        payload, cmd = path.read_bytes(), f"cat > {dest}"
+    subprocess.run(SSH_BASE + SSH_EXTRA + ["-p", str(port), "root@localhost",
+                               f"{cmd} && chmod +x {dest}"],
+                   input=payload, capture_output=True, timeout=600)
 
 
 def stage(port):
     """A deterministic file for the two probes that read one.
 
     Its content must be stable across arms or `mmapsum`'s digests are not
-    comparable, so it is generated in the guest from a fixed pattern rather than
-    copied from whatever the host happens to have.
+    comparable, so it is a fixed pattern rather than whatever the host happens
+    to have lying around.
+
+    **Written from here, not generated in the guest.** It used to be
+    `dd if=/dev/zero … | tr '\\0' 'A'`, which needs a `/dev/zero` — and the
+    amd64 image has no `/dev` at all
+    (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, open issue 2). The file was
+    therefore never created there and both probes failed with
+    `open/fstat(/tmp/mem_suite_data) failed`, which reads like an mmap defect and
+    is not one. Sending the bytes over the same channel the probes arrive on
+    depends on nothing in the guest but its shell's `>` redirect.
     """
-    ssh(port, "dd if=/dev/zero bs=4096 count=64 2>/dev/null | tr '\\0' 'A' "
-              "> /tmp/mem_suite_data; ls -l /tmp/mem_suite_data")
+    subprocess.run(SSH_BASE + SSH_EXTRA + ["-p", str(port), "root@localhost",
+                                           "cat > /tmp/mem_suite_data"],
+                   input=b"A" * (4096 * 64), capture_output=True, timeout=300)
+    ssh(port, "ls -l /tmp/mem_suite_data")
+
+
+def probe_binary(outdir, arch, name):
+    """Where this arch's build of `name` is.
+
+    Normally `c_stress/<arch>/<name>`. The fallback exists for `--no-build` on a
+    tree from before the per-arch split: aarch64 binaries used to be written
+    **beside their sources**, and several are committed there. Falling back for
+    aarch64 keeps those usable; not falling back for anything else is the point,
+    since running the flat file on another arch would silently push an aarch64
+    binary to an x86 guest and score the `Exec format error` as a probe failure.
+    """
+    per_arch = outdir / name
+    if per_arch.exists():
+        return per_arch
+    flat = SRC / name
+    if arch == "aarch64" and flat.exists():
+        return flat
+    return per_arch
 
 
 def verdict(name, out, rc):
@@ -137,7 +231,18 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--only", help="comma-separated subset of probe names")
     ap.add_argument("--json", help="write per-probe results and digests here")
+    ap.add_argument("--arch", default="aarch64", choices=sorted(ARCHES),
+                    help="which guest to build for (default aarch64). The probe "
+                         "sources are neutral; this only picks the compiler and "
+                         "the output subdirectory.")
+    ap.add_argument("-i", "--identity",
+                    help="ssh private key to present. Needed for the amd64 image, "
+                         "which authorises exactly one key "
+                         "(target/x86_64-unknown-none/release/amd64-ssh-test-key).")
     a = ap.parse_args()
+
+    if a.identity:
+        SSH_EXTRA.extend(["-i", a.identity, "-o", "IdentitiesOnly=yes"])
 
     selected = list(PROBES)
     if a.only:
@@ -147,19 +252,26 @@ def main():
             print(f"unknown probe(s): {', '.join(unknown)}", file=sys.stderr)
             return 2
 
+    cc = ARCHES[a.arch]
+    outdir = SRC / a.arch
     if not a.no_build:
+        if not shutil.which(cc):
+            print(f"{cc} not found — install it, or pass --no-build to reuse "
+                  f"what is already in {outdir}", file=sys.stderr)
+            return 2
+        outdir.mkdir(parents=True, exist_ok=True)
         for name in selected:
-            subprocess.run(["aarch64-linux-musl-gcc", "-O2", "-static",
-                            "-o", str(SRC / name), str(SRC / f"{name}.c")], check=True)
-        print(f"built {len(selected)} probe(s)")
+            subprocess.run([cc, "-O2", "-static",
+                            "-o", str(outdir / name), str(SRC / f"{name}.c")], check=True)
+        print(f"built {len(selected)} probe(s) for {a.arch} with {cc}")
 
     stage(a.port)
 
     results, failed, total_div = {}, [], 0
     for name in selected:
         args, timeout = PROBES[name]
-        push(a.port, SRC / name, f"/tmp/{name}")
-        out, rc = ssh(a.port, f"/tmp/{name} {args} 2>&1", timeout=timeout)
+        push(a.port, probe_binary(outdir, a.arch, name), f"/tmp/{name}")
+        out, rc = ssh(a.port, f"/tmp/{name} {args}", timeout=timeout)
         ok, why, div = verdict(name, out, rc)
         # Retry ONCE, and only on SILENT. A probe that printed nothing is either
         # dead or the ssh round-trip dropped its output, and those need opposite
@@ -170,7 +282,7 @@ def main():
         # and a FAIL or a bad exit code is never retried, so a probe cannot pass by
         # being run until it gets lucky.
         if not ok and why.startswith("SILENT"):
-            out, rc = ssh(a.port, f"/tmp/{name} {args} 2>&1", timeout=timeout)
+            out, rc = ssh(a.port, f"/tmp/{name} {args}", timeout=timeout)
             ok, why, div = verdict(name, out, rc)
             if ok:
                 why += " (first attempt returned nothing — transport, not the probe)"
@@ -184,7 +296,7 @@ def main():
         if not ok:
             print("\n".join("      | " + l for l in out.strip().splitlines()[-12:]))
 
-    print(f"\n===== mem_suite on guest :{a.port}: "
+    print(f"\n===== mem_suite ({a.arch}) on guest :{a.port}: "
           f"{'PASS' if not failed else 'FAIL'} "
           f"({len(selected) - len(failed)}/{len(selected)} probes, {total_div} DIVERGE) =====")
     if failed:
