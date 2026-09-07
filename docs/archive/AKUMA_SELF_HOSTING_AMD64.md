@@ -152,6 +152,80 @@ as they stand one day after the survey
 >
 > Steps 3–6 (folding arms into glue, starting with the leaves) are unstarted.
 
+> **C1 step 3's first arm landed, and it broke bare metal only** (2026-09-07,
+> verified the same day). `uname` is served by `akuma-syscalls-glue` now, which
+> needed `akuma_exec::runtime::register` to have run — and that call
+> (`exec_runtime::init`) was added to `kmain` and not to `kmain_mb2`. **QEMU and
+> Firecracker enter via PVH; GRUB enters via multiboot2**, so both VMM rigs were
+> green and the metal died at the first folded syscall with
+> `akuma-exec: ExecConfig not registered`. A boot-protocol-shaped failure
+> wearing a memory-shaped message.
+>
+> Reproduced without a reboot on the box's own OVMF/GRUB rig
+> (`/root/ovmf5.sh`), which is the multiboot2 path under KVM — the A arm
+> panicked at 10 s. Fixed by making the console hook and the runtime
+> registration **one shared function**, `boot::install_shared_sinks`, called
+> from both entries: the same remedy `boot::early_init` already is, applied to
+> the step that had drifted next. `set_print_hook` had been duplicated in both
+> `kmain`s and was the invitation.
+>
+> **A second, pre-existing defect surfaced behind it** — the netpoll
+> lap-wait in `net::netpoll_spawn_selftest` was unbounded. Its budget is
+> `uptime_us()`, which is `lapic::ticks()`, and `boot::self_tests` **stops the
+> LAPIC timer** before that test runs; so whenever the daemon also fails to lap,
+> the deadline is a promise nothing keeps. Both conditions hold on exactly one
+> rig — OVMF/GRUB q35, whose e1000 this kernel does not drive — and the
+> multiboot2 boot spun there forever, never printing a tally. That is the *hang*
+> version of the headless-box failure the loop's own comment was written to
+> prevent. A yield cap (`MAX_YIELDS`) restores the bound; it costs a healthy
+> boot nothing, because the lap condition breaks out in microseconds.
+>
+> Verified: local QEMU/TCG PVH **425/0** (`SMP=4`); OVMF/GRUB multiboot2 rig
+> reaches its tally at **415/1**, the one failure being that rig's undrivable
+> NIC (`netpoll laps 0`, 200000 yields); and **bare metal 416/0**, where the
+> real RTL8169 makes the same check pass (101 laps in 1408 yields) — with
+> `ssh akuma "uname -a"` answering `de169eed-release`, i.e. the folded glue arm
+> serving on the machine that could not boot before. Host tests green.
+
+> **C1 step 3, batch 2 (2026-09-07)** — `docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`.
+> The `FastPath::Leaf` tier folded: `getuid`/`getgid`/`geteuid`/`getegid`, with
+> `setuid`/`setgid` alongside. They take no arguments and consult no `Process`,
+> so glue's prologue skips the identity resolve — which is the point on a target
+> that does not populate `akuma-exec`'s process table. Deliberately **not**
+> folded: `getpid`/`gettid`/`getppid`/`getpgid`/`getsid`/`getcwd`, which *are*
+> identity and would have glue answering confidently and wrongly; they wait for
+> C1 step 5.
+>
+> Verifying it with a real ring-3 caller — which §4's lesson says is the only
+> thing that verifies a folded arm — found `getgroups`. `busybox id` printed
+> `uid=0 gid=0` and then `id: can't get groups`, exit 1: glue has had
+> `sys_getgroups` all along and `akuma-syscalls-abi` had no row for x86_64 115,
+> so the number decoded to nothing. One row, one arm, `id` exits 0. That row is
+> the pair that earns the two-number shape — asm-generic 158 is `getgroups`,
+> **x86_64 158 is `arch_prctl`**, and this kernel answers both.
+>
+> The fifteen new checks are about the **number hop**, not the value: every one
+> of these was `=> 0` before and is `=> 0` in glue, so a value check would pass
+> against a dispatcher that had lost the arms. x86_64 102-108 lands in
+> asm-generic's timer block, where `nr::SETITIMER` is 103 and reads two pointers
+> out of `args[1]`/`args[2]`.
+>
+> `akuma-syscalls-abi` is a workspace member no crate under `crates/` and not the
+> root kernel depends on — only `amd64/` links it — so the AArch64 kernel cannot
+> be affected by the new row.
+>
+> **One open failure, newly visible rather than newly caused.** With the netpoll
+> self-test fixed twice over (its own timer bracket, and a stalled-clock
+> backstop in place of the yield cap that pre-empted it), bare metal reports
+> `netpoll laps 0` after spending the whole 2 s budget across 410534 yields.
+> The daemon is healthy — its own `mem:` line reaches `dmesg` every 10 s once
+> the suite ends, and ssh answers throughout — so the fault is bounded to
+> "during `boot::self_tests`, on real hardware, the daemon does not get picked",
+> and it is boot-thread-relative: QEMU/TCG gives 101 laps in 101 yields, the
+> daemon running on every one. Left open; it gates nothing and wants the
+> scheduler picker instrumented. The gain is that it is a `[FAIL]` with a number
+> beside it rather than a hang on one rig and a coin-flip on another.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate

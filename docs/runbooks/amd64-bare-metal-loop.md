@@ -133,6 +133,17 @@ caller reading only stdout sees an empty success.
 
 ## Rules that cost time to learn
 
+- **The fast lane cannot see a multiboot2 bug.** QEMU and Firecracker both
+  enter via **PVH** (`kmain`); GRUB — the metal, and `/root/ovmf5.sh` — enters
+  via **multiboot2** (`kmain_mb2`). A step added to one entry point and not the
+  other is green on both fast-lane rigs and dead on the metal. Measured
+  2026-09-07: `exec_runtime::init()` went into `kmain` only, and the first
+  syscall folded into `akuma-syscalls-glue` panicked with
+  `akuma-exec: ExecConfig not registered` on the box alone. **When a change
+  touches boot order, run `ovmf5.sh` too** — it is the multiboot2 path under
+  KVM, costs no reboot, and reproduced that panic in ten seconds. The durable
+  fix is a shared function (`boot::early_init`, `boot::install_shared_sinks`),
+  never a second copy of the step.
 - **Never copy the whole tree.** Vendored submodules make it ~37 GB. Use
   `hpbox.deploy()`, which moves a commit id and a patch — bytes, not gigabytes.
 - **`pkill -f <pattern>` over ssh kills your own session** when the pattern

@@ -948,16 +948,59 @@ pub fn netpoll_spawn_selftest(t: &mut Suite) {
     // this loop — runs with `IF` clear; without it the deadline below is
     // unreachable whenever another kernel thread is also runnable, which is
     // exactly the situation being measured. See `sched::allow_tick`.
-    let deadline = uptime_us().saturating_add(BUDGET_US);
+    //
+    // **A second bound, because the clock can be stopped here.** `uptime_us` is
+    // `lapic::ticks()`, and `boot::self_tests` calls `lapic::stop_timer()`
+    // before this test — it restarts the timer only around the SNTP sync — so
+    // the deadline above is a promise nothing keeps whenever the daemon also
+    // fails to lap. Both conditions hold together on exactly one rig: the
+    // OVMF/GRUB q35 one, whose NIC is an e1000 this kernel does not drive, so
+    // there is nothing for the daemon to poll. Measured 2026-09-07 on
+    // `/root/ovmf5.sh`: the multiboot2 boot spun here forever and never printed
+    // a tally — the *hang* version of the headless-box failure the comment
+    // above describes, which is worse than the flake it replaced.
+    //
+    // `boot::self_tests` now runs this test inside its own `start_timer` /
+    // `stop_timer` bracket, which is the real fix — the clock is the bound that
+    // should fire. This is the backstop for a caller who forgets it.
+    //
+    // **It is written as a stalled-clock detector, not a yield cap**, and the
+    // difference was measured rather than reasoned. A plain
+    // `yields >= 200_000` shipped first and on the bare-metal box it fired at
+    // roughly 0.2 s — well inside the 2 s budget — so the backstop pre-empted
+    // the bound it exists to protect and the test stopped measuring what it
+    // says. Tripping only when the clock has **not moved at all** across that
+    // many yields cannot do that: if `uptime_us` is advancing, the deadline
+    // above governs and this branch is unreachable; if it is frozen, no number
+    // of yields will ever reach the deadline and this is the only way out.
+    const STALL_YIELDS: u64 = 200_000;
+
+    let start_us = uptime_us();
+    let deadline = start_us.saturating_add(BUDGET_US);
+    let mut yields = 0_u64;
+    let mut clock_stalled = false;
     let laps = loop {
         let laps = NETPOLL_LAPS.load(Ordering::Relaxed) - before;
-        if laps > REQUIRED_LAPS || uptime_us() >= deadline {
+        let now = uptime_us();
+        if laps > REQUIRED_LAPS || now >= deadline {
+            break laps;
+        }
+        if yields >= STALL_YIELDS && now == start_us {
+            clock_stalled = true;
             break laps;
         }
         crate::sched::yield_now();
         crate::sched::allow_tick();
+        yields += 1;
     };
 
     t.check("net: the netpoll daemon is being scheduled", laps > REQUIRED_LAPS);
     t.note("net: netpoll laps", laps);
+    t.note("net: netpoll yields waited", yields);
+    // Loud, because it means the verdict above was reached without the clock the
+    // test bounds itself with — and a `[FAIL]` for that reason is a different
+    // fact from a daemon that really is starved.
+    if clock_stalled {
+        t.check("net: (the clock was stopped; the lap budget never applied)", false);
+    }
 }

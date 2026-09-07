@@ -360,8 +360,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         crate::halt();
     }
 
-    // Give the shared crates a console, exactly as `kmain` does.
-    akuma_primitives::console::set_print_hook(serial::puts);
+    // The console hook and the `akuma-exec` runtime, exactly as `kmain` does —
+    // one call, because "exactly as `kmain` does" was two lines on that path and
+    // one on this one, and the missing one only ever showed up on the metal.
+    // See `boot::install_shared_sinks`.
+    crate::boot::install_shared_sinks();
 
     // The root filesystem. With `root=/dev/sda1` on the command line, bring up
     // the xHCI + USB mass-storage stack and mount the persistent partition; on

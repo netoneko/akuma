@@ -272,6 +272,12 @@ syscall_table! {
     Getegid    => GETEGID    = 108, nr::GETEGID;
     Setuid     => SETUID     = 105, nr::SETUID;
     Setgid     => SETGID     = 106, nr::SETGID;
+    /// x86_64 115 is `getgroups`; asm-generic 158 — where x86_64 158 is
+    /// `arch_prctl`, so this row is one of the pairs that makes the two-number
+    /// shape earn itself. Added 2026-09-07 because `busybox id` on amd64 printed
+    /// `uid=0 gid=0` and then `id: can't get groups`: the number had no variant,
+    /// so it could not reach the `sys_getgroups` glue has had all along.
+    Getgroups  => GETGROUPS  = 115, nr::GETGROUPS;
     Setpgid    => SETPGID    = 109, nr::SETPGID;
     Getpgid    => GETPGID    = 121, nr::GETPGID;
     Setsid     => SETSID     = 112, nr::SETSID;

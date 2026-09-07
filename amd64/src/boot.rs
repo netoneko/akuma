@@ -98,6 +98,32 @@ pub fn early_init() -> SmapStatus {
     smap
 }
 
+/// Point the shared crates at this kernel's sinks: the console hook and the
+/// `akuma-exec` runtime + config.
+///
+/// **Both entry points must call this, and that is why it is a function.**
+/// `set_print_hook` was already duplicated in the two `kmain`s; `exec_runtime`
+/// arrived (2026-09-07) on the PVH one only, and the result was a kernel that
+/// was green under QEMU and Firecracker and panicked on the metal the moment a
+/// syscall folded into `akuma-syscalls-glue` ran — glue's user-copy helpers
+/// read `akuma_exec::runtime::config()`, a `Registered` cell that panics when
+/// absent. A boot-protocol-shaped failure with a memory-shaped message, which
+/// is exactly the drift `early_init` above exists to stop.
+///
+/// Call it **after memory bring-up and before anything that can take a
+/// syscall**. It allocates nothing and reads no hardware — `register` only
+/// stores hooks, and `lapic::ticks()` is an atomic answering 0 before the timer
+/// runs — so the only ordering it really needs is "before the first excursion".
+/// `register` also installs the shared console and clock sinks, so `[T…]`
+/// stamps in shared crates start being real here rather than `[T0.00]`.
+pub fn install_shared_sinks() {
+    // `safe_print!` discards output until a hook is registered, so without this
+    // every diagnostic `akuma-virtio` emits — including the one naming why a
+    // device failed to initialise — is silently dropped.
+    akuma_primitives::console::set_print_hook(crate::serial::puts);
+    crate::exec_runtime::init();
+}
+
 /// What the shared suite needs to know about the machine it is running on.
 // Five `bool`s, and clippy would rather they were flags. They are not: each is a
 // separate question with a separate answer per boot protocol, and the whole
@@ -286,7 +312,22 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
             crate::clock::sync_via_sntp();
             lapic::stop_timer();
         }
+        // **The timer must run for this one**, and it is the same bracket the
+        // SNTP sync above already uses. The test asks whether the netpoll daemon
+        // gets scheduled; `lapic::stop_timer()` a few lines up means it is being
+        // asked under a condition the daemon never actually runs in, and its own
+        // budget — `net::uptime_us()`, i.e. `lapic::ticks()` — cannot advance
+        // either, so the timeout it thinks it has does not exist.
+        //
+        // Measured 2026-09-07 on bare metal across two boots of the same binary:
+        // `netpoll laps 101` on one and `laps 0` on the next, the second having
+        // spun to the crate's yield cap. Networking was healthy on both — the
+        // daemon starts lapping as soon as the timer is restarted at the end of
+        // the suite — so what varied was the measurement, not the machine. Run
+        // it with the clock on and both of its bounds mean what they say.
+        lapic::start_timer();
         net::netpoll_spawn_selftest(t);
+        lapic::stop_timer();
         if flag("netprobe") {
             net::enable_probe();
         }

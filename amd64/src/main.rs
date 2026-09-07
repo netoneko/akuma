@@ -204,26 +204,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         halt();
     }
 
-    // Give the shared crates a console. `safe_print!` discards output until a
-    // hook is registered, so without this every diagnostic `akuma-virtio` emits
-    // — including the one naming why a device failed to initialise — is silently
-    // dropped. One line, and it is the difference between a driver that reports
-    // and a driver that goes quiet.
-    akuma_primitives::console::set_print_hook(serial::puts);
-
-    // Register the `akuma-exec` runtime + config. **This is what lets a syscall
-    // reach `akuma-syscalls-glue` at all** — glue's user-copy helpers read
-    // `akuma_exec::runtime::config()`, a `Registered` cell that panics when
-    // absent, so the first folded arm (`uname`, C1 step 3) died here before this
-    // call existed. See `exec_runtime.rs` for the three kinds of hook in it.
-    //
-    // Placed right after the console hook and before anything that could take a
-    // syscall: `register` installs the shared console and clock sinks itself, so
-    // every `safe_print!`/`tprint!` in a shared crate lights up from here, and
-    // `[T…]` stamps start being real rather than `[T0.00]`. It allocates
-    // nothing and reads no hardware — `lapic::ticks()` is an atomic that answers
-    // 0 before the timer runs — so it is safe this early.
-    exec_runtime::init();
+    // The console hook and the `akuma-exec` runtime, shared with the multiboot2
+    // entry point. One call because the two used to be two, and the second of
+    // them reached only this path — see `boot::install_shared_sinks`.
+    boot::install_shared_sinks();
 
     // PCI, on request only — the note above says why it is not automatic here.
     // `pci` on the command line is a promise from whoever booted this kernel

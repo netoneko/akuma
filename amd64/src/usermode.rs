@@ -1288,9 +1288,40 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // commit it is running. `banner::print()` keeps the local strings for the
         // boot banner, which is where the target's name belongs.
         Syscall::Uname => to_glue(call, [a1, a2, a3, a4, a5, a6]),
-        // Credentials. One user, uid 0 — the same answer `src/syscall` gives.
-        Syscall::Getuid | Syscall::Getgid | Syscall::Geteuid | Syscall::Getegid => 0, // get{uid,gid,euid,egid}
-        Syscall::Setuid | Syscall::Setgid => 0,             // set{uid,gid}: already root, accept
+        // Credentials — **served by glue** (C1 step 3, second batch).
+        //
+        // Chosen next because they are the whole of `akuma_syscalls::fast_path`'s
+        // `Leaf` tier that this target dispatches: they take no arguments and
+        // consult no `Process`, so glue's prologue skips the identity resolve
+        // and there is nothing here for a process table this target does not
+        // populate to answer wrongly. Both kernels already returned a literal
+        // `0` (glue's `geteuid` is a function whose entire body is `0`), so this
+        // is the rare fold with no divergence to pin: the answer is identical
+        // and only the number of places it is written down changes.
+        //
+        // **Not folded, deliberately:** `getpid`/`gettid`/`getppid`/`getpgid`/
+        // `getsid`/`getcwd` below. Those *are* identity — glue reads them out of
+        // `akuma_exec`'s process table, which this target does not fill, so it
+        // would answer confidently and wrongly rather than not at all. They wait
+        // for C1 step 5, the same step `exec_runtime.rs`'s `futex_wake` stub
+        // names. See `docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`.
+        Syscall::Getuid
+        | Syscall::Getgid
+        | Syscall::Geteuid
+        | Syscall::Getegid
+        // `setuid`/`setgid`: already root, accept. Glue folds them in with
+        // `capset`/`setres[ug]id`/`setgroups` under one stated stance —
+        // "success" here means *not implemented*, not "privileges dropped".
+        | Syscall::Setuid
+        | Syscall::Setgid
+        // `getgroups(size, list)` — x86_64 115. Not a fold: this target had no
+        // arm for it at all, and glue's has been there all along. Found by the
+        // ring-3 check this batch was verified with — `busybox id` on the metal
+        // printed `uid=0 gid=0` (the folded arms answering) and then
+        // `id: can't get groups` and exited 1. No supplementary groups exist
+        // here, so the answer is the count `0`, and `size == 0` is the probe
+        // form every caller actually uses.
+        | Syscall::Getgroups => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // Signals: this kernel has none, so "the mask is empty and stays empty"
         // is the correct result, not a stub. `rt_sigprocmask` writes the old
         // (empty) set back if asked.
@@ -3890,6 +3921,59 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         Syscall::from_x86_64(63) == Some(Syscall::Uname),
     );
     t.check_eq("dispatch: uname reaches glue as 160", Syscall::Uname.to_aarch64(), 160);
+
+    // The arms folded into glue, driven **through the real dispatcher** by the
+    // x86_64 number userspace would send.
+    //
+    // Two properties, and the second is the one that needs a test. The answer
+    // is unchanged by the fold — every one of these was `=> 0` here and is `=> 0`
+    // in glue — so a regression check on the value alone would pass against a
+    // dispatcher that had lost the arms entirely. What it cannot pass against is
+    // the number hop being wrong, which is why each is asserted beside the
+    // asm-generic constant it must reach. x86_64 102-108 — the whole credential
+    // block — lands in asm-generic's timer/module block, where this build
+    // already answers one number for real: `nr::SETITIMER` is 103, and
+    // `sys_setitimer` reads two `struct itimerval` pointers out of `args[1]` and
+    // `args[2]`. A `getuid` arriving there would hand it whatever its unset
+    // argument registers held. So a missed hop is a *different arm*, not a
+    // missing one — the failure mode the `symlink` bug below already cost this
+    // target months.
+    //
+    // `akuma_syscalls_linux::nr` is the asm-generic table by name; writing 174
+    // here would test the transcription rather than the mapping.
+    //
+    // Unrolled rather than looped so a failure names the syscall it belongs to;
+    // six identically-labelled checks would report which *count* broke, not which
+    // arm.
+    use akuma_syscalls_linux::nr;
+    let hop = |call: Syscall, x86: u64, generic: u64| {
+        call.to_x86_64() == x86 && call.to_aarch64() == generic
+    };
+    t.check("dispatch: getuid 102 -> 174", hop(Syscall::Getuid, 102, nr::GETUID));
+    t.check("dispatch: getgid 104 -> 176", hop(Syscall::Getgid, 104, nr::GETGID));
+    t.check("dispatch: geteuid 107 -> 175", hop(Syscall::Geteuid, 107, nr::GETEUID));
+    t.check("dispatch: getegid 108 -> 177", hop(Syscall::Getegid, 108, nr::GETEGID));
+    t.check("dispatch: setuid 105 -> 146", hop(Syscall::Setuid, 105, nr::SETUID));
+    t.check("dispatch: setgid 106 -> 144", hop(Syscall::Setgid, 106, nr::SETGID));
+
+    let d = |nr_x86: u64| syscall_dispatch(nr_x86, 0, 0, 0, 0, 0, 0);
+    t.check_eq("dispatch: glue answers getuid 0", d(102), 0);
+    t.check_eq("dispatch: glue answers getgid 0", d(104), 0);
+    t.check_eq("dispatch: glue answers geteuid 0", d(107), 0);
+    t.check_eq("dispatch: glue answers getegid 0", d(108), 0);
+    t.check_eq("dispatch: glue accepts setuid", d(105), 0);
+    t.check_eq("dispatch: glue accepts setgid", d(106), 0);
+    // `getgroups` is the pair that makes the two-number shape earn itself:
+    // asm-generic 158 is `getgroups`, x86_64 158 is `arch_prctl`, and this
+    // kernel answers both. `size == 0` is the probe form and must report the
+    // count (zero here) without touching the buffer; a negative size is EINVAL.
+    t.check("dispatch: getgroups 115 -> 158", hop(Syscall::Getgroups, 115, nr::GETGROUPS));
+    t.check_eq("dispatch: glue reports 0 supplementary groups", d(115), 0);
+    t.check_eq(
+        "dispatch: getgroups(-1) is EINVAL",
+        syscall_dispatch(115, (-1i64) as u64, 0, 0, 0, 0, 0),
+        (-22i64) as u64,
+    );
 
     if !have_fs {
         t.note("dispatch: no filesystem; symlink round trip skipped", 0);
