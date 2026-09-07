@@ -2831,6 +2831,68 @@ fn x86_translate_in(root: u64, va: usize) -> Option<usize> {
     Some(((entry & X86_ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1))) as usize)
 }
 
+/// Is `va` mapped **and reachable from ring 3** in the table rooted at `root`?
+/// With `need_write`, also writable from ring 3.
+///
+/// The x86 counterpart of [`resolve_user_leaf`] + [`UserLeaf::user_accessible`],
+/// and it is not a transliteration of it. On AArch64 the AP field of the **leaf**
+/// decides on its own; on x86-64 the effective permission is the **AND of `U/S`
+/// (and `R/W`) at every level of the walk**, so a PML4E with `U/S` clear makes
+/// the whole 512 GiB region supervisor-only however the leaf is marked. Testing
+/// only the leaf would report a kernel page as user-accessible — which is exactly
+/// the hole `is_current_user_range_mapped`'s AP test was added to close on the
+/// other architecture (`docs/archive/USER_COPY_FOLD.md` §7).
+///
+/// Added 2026-09-07 for C1: `get_current_ttbr0` had no x86 arm and answered `0`,
+/// so `is_current_user_range_mapped` returned `false` for every pointer on this
+/// target and every syscall folded into `akuma-syscalls-glue` came back `EFAULT`
+/// from a real ring-3 caller. Silent, because the boot suite validates nothing —
+/// it runs inside `BypassValidationGuard`
+/// (`docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`).
+#[cfg(target_arch = "x86_64")]
+fn x86_user_page_ok(root: u64, va: usize, need_write: bool) -> bool {
+    let mut table = root;
+    // Accumulated across levels, never reset — that is the whole point.
+    let mut us = true;
+    let mut rw = true;
+    for level in (2..=4).rev() {
+        // SAFETY: `table` is a live table frame reached through the physmap;
+        // the index is masked to 0..512 by `x86_index`.
+        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
+        if entry & X86_P == 0 {
+            return false;
+        }
+        us &= entry & X86_US != 0;
+        rw &= entry & X86_RW != 0;
+        if entry & X86_PS != 0 {
+            // A large page ends the walk here.
+            return us && (!need_write || rw);
+        }
+        table = entry & X86_ADDR_MASK;
+    }
+    // SAFETY: as above; `table` is the PT frame.
+    let entry = unsafe { x86_table_mut(table).add(x86_index(va, 1)).read_volatile() };
+    if entry & X86_P == 0 {
+        return false;
+    }
+    us &= entry & X86_US != 0;
+    rw &= entry & X86_RW != 0;
+    us && (!need_write || rw)
+}
+
+/// Every page of `[va_start, va_start+len)`, checked with [`x86_user_page_ok`].
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn x86_user_range_ok(va_start: usize, len: usize, need_write: bool) -> bool {
+    let root = get_current_ttbr0() as u64;
+    if root == 0 {
+        return false;
+    }
+    let start_page = va_start & !(PAGE_SIZE - 1);
+    let end_page = (va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let num_pages = (end_page - start_page) / PAGE_SIZE;
+    (0..num_pages).all(|i| x86_user_page_ok(root, start_page + i * PAGE_SIZE, need_write))
+}
+
 /// The active PML4, from `CR3`.
 #[cfg(target_arch = "x86_64")]
 fn x86_read_cr3() -> u64 {
@@ -3938,7 +4000,13 @@ pub fn get_current_ttbr0() -> usize {
     akuma_cpu::sysreg::ttbr0_el1() as usize
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+/// x86_64: the active PML4 from `CR3`. The name is the AArch64 one because the
+/// callers are shared; what it returns is "the root of the current user address
+/// space", which is what they actually want.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn get_current_ttbr0() -> usize { x86_read_cr3() as usize }
+
+#[cfg(not(all(target_os = "none", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 pub fn get_current_ttbr0() -> usize { 0 }
 
 /// Is every page of `[va_start, va_start+len)` mapped **as user memory** in the
@@ -3963,6 +4031,13 @@ pub fn get_current_ttbr0() -> usize { 0 }
 /// It also, correctly, now rejects a `PROT_NONE` page (`user_flags::NONE` is
 /// `AP_RO_EL1`) as a syscall buffer — Linux returns `EFAULT` there too.
 pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
+    // The x86 arm returns above the AArch64 body rather than wrapping it, so
+    // that body stays textually identical and the AArch64 kernel's `.text` is
+    // provably unmoved. Wrapping it in a `#[cfg]` block did move it.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    return x86_user_range_ok(va_start, len, false);
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
     let ttbr0 = get_current_ttbr0();
     if ttbr0 == 0 { return false; }
     let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
@@ -3974,6 +4049,7 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
         if !is_page_user_accessible_ptr(l0_ptr, start_page + i * PAGE_SIZE) { return false; }
     }
     true
+    }
 }
 
 /// Read a `Copy` POD value of type `T` from `va` in the **current** address
@@ -4343,6 +4419,10 @@ fn is_page_user_writable_ptr(l0_ptr: *const u64, va: usize) -> bool {
 /// [`is_current_user_range_mapped`] — a `PROT_READ` page fails this.
 #[must_use]
 pub fn is_current_user_range_writable(va_start: usize, len: usize) -> bool {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    return x86_user_range_ok(va_start, len, true);
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
     let ttbr0 = get_current_ttbr0();
     if ttbr0 == 0 { return false; }
     let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
@@ -4351,6 +4431,7 @@ pub fn is_current_user_range_writable(va_start: usize, len: usize) -> bool {
     let num_pages = (end_page - start_page) / PAGE_SIZE;
     let l0_ptr = phys_to_virt(l0_addr) as *const u64;
     (0..num_pages).all(|i| is_page_user_writable_ptr(l0_ptr, start_page + i * PAGE_SIZE))
+    }
 }
 
 /// Write a `Copy` POD value to `va` in the **current** address space with a

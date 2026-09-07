@@ -492,8 +492,11 @@ fn write_protect_check(t: &mut Suite) {
 /// 2. The raw copy primitive — no `stac` — reading that page returns `EFAULT`
 ///    when SMAP is on: the CPU refused a supervisor access to a user page, the
 ///    `#PF` landed inside `rep movsb`, and the fixup turned it into an error.
-///    That is the whole point of SMAP, observed. (Without SMAP the same read
-///    succeeds, and the check says so rather than passing vacuously.)
+///    That is the whole point of SMAP, observed — and since 2026-09-07 it is
+///    observed by turning the *brackets* off at
+///    `akuma_user_access::set_smap_active` rather than by relying on the shared
+///    copy loop having none, which was itself the bug. (Without SMAP the probe
+///    is skipped and says so rather than passing vacuously.)
 /// 3. [`read_bytes`]/[`write_bytes`] — bracketed — read and write the page
 ///    correctly, and leave `AC` clear afterwards.
 /// 4. A bracketed copy that *faults* (unmapped source) also leaves `AC` clear:
@@ -527,17 +530,50 @@ pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
     }
 
     let mut dst = [0u8; 64];
-    // SAFETY: the source is a mapped USER page read from ring 0 WITHOUT `stac`
-    // — with SMAP on this must fault, and the fault is recovered.
+
+    // The **shared** copy loop (`akuma-user-access`), which is what every
+    // syscall served by `akuma-syscalls-glue` copies through.
+    //
+    // This block asserted the opposite until 2026-09-07: it read
+    // `copy_from_user_safe` as "the unbracketed copy" and checked that SMAP
+    // refused it. That was true and it was a *bug* — the shared crate was the
+    // tree's only x86 user copy without `stac`/`clac`, while
+    // `read_bytes`/`write_bytes` two checks below have had them since SMAP was
+    // turned on. It survived because nothing on this target called it with a
+    // real ring-3 pointer: the boot suite runs inside `BypassValidationGuard`
+    // and hands it kernel-stack buffers. Folding the first syscall into glue
+    // is what found it — as a hang, not an error
+    // (`docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`).
+    //
+    // So: it must now succeed and be byte-exact, like the local pair.
+    // SAFETY: a mapped, user-accessible page; a fault would be recovered.
     let raw = unsafe { copy_from_user_safe(dst.as_mut_ptr(), USER_PAGE_VA as *const u8, dst.len()) };
+    let exact = dst.iter().enumerate().all(|(i, &b)| b == (i as u8) ^ 0x3C);
+    t.check("smap: the shared copy loop reads a user page (it brackets itself)", raw.is_ok() && exact);
+    t.check("smap: AC is clear after the shared copy", !ac_set());
+
+    // And SMAP's own behaviour, still observed rather than assumed — by turning
+    // the bracketing *off* at the flag and watching the same copy be refused.
+    // That tests two things the old check could not: that an undeclared ring-0
+    // access to a user page really is refused, and that
+    // `akuma_user_access::set_smap_active` is actually what drives the
+    // brackets. Restored immediately; nothing else runs in between.
     if smap_on {
+        akuma_user_access::set_smap_active(false);
+        dst.fill(0);
+        // SAFETY: as above, and now deliberately undeclared — the fault is
+        // recovered by the copy loop's fixup, which is the point.
+        let unbracketed =
+            unsafe { copy_from_user_safe(dst.as_mut_ptr(), USER_PAGE_VA as *const u8, dst.len()) };
+        akuma_user_access::set_smap_active(true);
         t.check_eq(
-            "smap: an unbracketed kernel read of a user page is refused (EFAULT)",
-            raw.err().unwrap_or(0),
+            "smap: with the brackets off, the same read is refused (EFAULT)",
+            unbracketed.err().unwrap_or(0),
             14,
         );
+        t.check("smap: AC is clear after the refused read", !ac_set());
     } else {
-        t.check("smap: (CPUID lacks SMAP) an unbracketed kernel read of a user page succeeds", raw.is_ok());
+        t.note("smap: (CPUID lacks SMAP) bracket-off probe skipped", 0);
     }
 
     dst.fill(0);

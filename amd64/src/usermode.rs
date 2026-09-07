@@ -1273,21 +1273,20 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 wait4_unregister(me);
             }
         }
-        // uname(2) — **the first arm folded into glue** (C1 step 3).
+        // uname(2) — **the first arm served by `akuma-syscalls-glue`** (C1 step 3).
         //
         // It was already "the same answer the aarch64 kernel gives, machine
-        // string aside"; now it *is* that answer. The machine string was the
-        // one real difference and it moved into glue as `UTS_MACHINE`, derived
-        // from `target_arch` — a shared `uname` that reported `aarch64` on this
-        // box would be a wrong answer nothing refuses.
+        // string aside"; now it *is* that answer. The machine string was the one
+        // real difference and it moved into glue as `UTS_MACHINE`, derived from
+        // `target_arch` — a shared `uname` reporting `aarch64` on this box would
+        // be a wrong answer nothing refuses.
         //
-        // Two fields change what they print here, deliberately: `release` and
+        // Two fields change what they print, deliberately: `release` and
         // `version` now come from glue's build identity (`<git-sha>-<profile>`)
-        // instead of `banner::RELEASE`/`VERSION_DESC`. That is the fold working
-        // — one answer, not two — and it is a gain: `uname -a` on this target
-        // now names the commit it is running. `banner::print()` still uses the
-        // local strings for the boot banner, which is where the target name
-        // belongs.
+        // rather than `banner::RELEASE`/`VERSION_DESC`. That is the fold working
+        // — one answer, not two — and it is a gain: `uname -a` here now names the
+        // commit it is running. `banner::print()` keeps the local strings for the
+        // boot banner, which is where the target's name belongs.
         Syscall::Uname => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // Credentials. One user, uid 0 — the same answer `src/syscall` gives.
         Syscall::Getuid | Syscall::Getgid | Syscall::Geteuid | Syscall::Getegid => 0, // get{uid,gid,euid,egid}
@@ -3834,20 +3833,18 @@ pub fn fork_test(t: &mut Suite) {
 /// Userspace passed an x86_64 number; glue's dispatch is a `match` over
 /// asm-generic constants, so `to_aarch64()` is not a formality — handing glue
 /// the number that arrived would find the *wrong* arm, not none
-/// (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`).
+/// (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`). Taking a `Syscall`
+/// rather than a `u64` is what makes that unskippable.
 ///
-/// Taking a `Syscall` rather than a `u64` is what makes that unskippable: there
-/// is no way to call this with a raw number at all.
-///
-/// What glue's prologue touches before the arm runs — `CURRENT_SYSCALL_NR`, the
-/// excursion counters, `set_thread_current_syscall`, the delivered-signal clear,
-/// the identity cache — all reaches `akuma_exec::threading`, which **is**
-/// `akuma-threading`, the scheduler this target has run since A1. That is why a
-/// folded arm needs no shim: it is already the same thread table.
+/// Three things had to exist before the first arm could come through here, none
+/// of which the C1 hand-off prompt listed
+/// (`docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`):
+/// `akuma_exec::runtime::register` (`exec_runtime.rs`), `stac`/`clac` in the
+/// shared user-copy loop, and an x86 arm for `akuma_mmu::get_current_ttbr0`.
+/// The prologue itself needed nothing: it reaches `akuma_exec::threading`,
+/// which **is** `akuma-threading`, the scheduler this target has run since A1.
 fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
-    let r = akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
-    akuma_primitives::safe_print!(96, "[TMP] to_glue {:?} arg0={:#x} -> {:#x}\n", call, args[0], r);
-    r
+    akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args)
 }
 
 /// The dispatch **vocabulary**: two tables that must stay disjoint, and the
