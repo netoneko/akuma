@@ -47,6 +47,7 @@ Usage:
   scripts/mem_suite.py --port 2322 --only mmapsum,cowstale
   scripts/mem_suite.py --port 2322 --json out.json # save digests for an A/B diff
   scripts/mem_suite.py --port 2244 --arch x86_64   # the amd64 guest
+  scripts/mem_suite.py --docker --arch x86_64      # real Linux, the calibration arm
 
 The probes are neutral C, so `--arch` picks only the cross compiler and the
 output subdirectory. For the amd64 kernel, boot a guest with sshd on the
@@ -64,6 +65,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "userspace/forktest/c_stress"
 
@@ -180,6 +182,45 @@ def stage(port):
     ssh(port, "ls -l /tmp/mem_suite_data")
 
 
+# Docker platform per probe architecture, for the `--docker` calibration arm.
+DOCKER_PLATFORM = {"aarch64": "linux/arm64", "x86_64": "linux/amd64"}
+
+
+def docker_run(arch, outdir, name, args, timeout):
+    """Run one probe on **real Linux** in a container, same binary, same args.
+
+    This is the calibration arm, and it is the whole reason these probes are
+    worth more than something written fresh for a bug: nearly every one carries a
+    `docker run --platform … alpine /<probe>` line in its own header saying what
+    a correct kernel prints. Running it from here rather than by hand means the
+    Linux answer and the Akuma answer go through **one** `verdict`, so a
+    difference in the table is a difference in the kernel and not in how the two
+    were scored.
+
+    `alpine` because the probes are static musl binaries: nothing in the image is
+    linked against, it is only a filesystem to exec them from.
+    """
+    plat = DOCKER_PLATFORM[arch]
+    binary = probe_binary(outdir, arch, name)
+    cmd = ["docker", "run", "--rm", "--platform", plat,
+           "-v", f"{binary.resolve()}:/probe:ro"]
+    argv = ["/probe"]
+    if args.strip():
+        # The two file probes read a path; give the container its own copy at a
+        # fixed mount point rather than whatever the guest path happened to be.
+        data = pathlib.Path(tempfile.gettempdir()) / "mem_suite_data"
+        if not data.exists() or data.stat().st_size != 4096 * 64:
+            data.write_bytes(b"A" * (4096 * 64))
+        cmd += ["-v", f"{data}:/data:ro"]
+        argv.append("/data")
+    cmd += ["alpine", *argv]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", 124
+    return p.stdout.decode(errors="replace") + p.stderr.decode(errors="replace"), p.returncode
+
+
 def probe_binary(outdir, arch, name):
     """Where this arch's build of `name` is.
 
@@ -235,6 +276,9 @@ def main():
                     help="which guest to build for (default aarch64). The probe "
                          "sources are neutral; this only picks the compiler and "
                          "the output subdirectory.")
+    ap.add_argument("--docker", action="store_true",
+                    help="run the probes on real Linux in a container instead of "
+                         "against a guest — the calibration arm. Needs no --port.")
     ap.add_argument("-i", "--identity",
                     help="ssh private key to present. Needed for the amd64 image, "
                          "which authorises exactly one key "
@@ -265,13 +309,17 @@ def main():
                             "-o", str(outdir / name), str(SRC / f"{name}.c")], check=True)
         print(f"built {len(selected)} probe(s) for {a.arch} with {cc}")
 
-    stage(a.port)
+    if not a.docker:
+        stage(a.port)
 
     results, failed, total_div = {}, [], 0
     for name in selected:
         args, timeout = PROBES[name]
-        push(a.port, probe_binary(outdir, a.arch, name), f"/tmp/{name}")
-        out, rc = ssh(a.port, f"/tmp/{name} {args}", timeout=timeout)
+        if a.docker:
+            out, rc = docker_run(a.arch, outdir, name, args, timeout)
+        else:
+            push(a.port, probe_binary(outdir, a.arch, name), f"/tmp/{name}")
+            out, rc = ssh(a.port, f"/tmp/{name} {args}", timeout=timeout)
         ok, why, div = verdict(name, out, rc)
         # Retry ONCE, and only on SILENT. A probe that printed nothing is either
         # dead or the ssh round-trip dropped its output, and those need opposite
@@ -281,7 +329,7 @@ def main():
         # This does not weaken the no-silent-pass rule: silent twice still fails,
         # and a FAIL or a bad exit code is never retried, so a probe cannot pass by
         # being run until it gets lucky.
-        if not ok and why.startswith("SILENT"):
+        if not ok and why.startswith("SILENT") and not a.docker:
             out, rc = ssh(a.port, f"/tmp/{name} {args}", timeout=timeout)
             ok, why, div = verdict(name, out, rc)
             if ok:
@@ -296,7 +344,8 @@ def main():
         if not ok:
             print("\n".join("      | " + l for l in out.strip().splitlines()[-12:]))
 
-    print(f"\n===== mem_suite ({a.arch}) on guest :{a.port}: "
+    where = "docker/linux" if a.docker else f"guest :{a.port}"
+    print(f"\n===== mem_suite ({a.arch}) on {where}: "
           f"{'PASS' if not failed else 'FAIL'} "
           f"({len(selected) - len(failed)}/{len(selected)} probes, {total_div} DIVERGE) =====")
     if failed:
