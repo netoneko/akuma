@@ -214,7 +214,102 @@ pub fn smoke_test(t: &mut Suite) {
     drop(uas);
 
     pte_level_test(t);
+    upper_half_refusal_test(t);
     drop_returns_frames_test(t);
+}
+
+/// The walk refuses a virtual address in the kernel's half — on **both** map
+/// entry points, and without allocating a page table on the way to saying no.
+///
+/// # Why this is a boot check and not a host test
+///
+/// `x86_map_page_in` dereferences page tables through the physmap, so it does
+/// not exist on this repo's host; and the property is about the *aliasing* this
+/// target does in [`UserAddressSpace::new`], which copies the kernel's PML4
+/// slots 256/257/511 into every user root by reference. A walk that reaches
+/// slot 256 is a walk through the live kernel tables, and `x86_next_table`
+/// widens every intermediate entry it descends to `P|RW|US` — so one bad
+/// `p_vaddr` would hand ring 3 the physmap, in every address space at once,
+/// with no fault and no message.
+///
+/// Until C1 step 6 the only thing preventing that was `loader.rs` checking
+/// `USER_VA_LIMIT` before it mapped, one `if` in the one caller that
+/// remembered. `akuma-elf`, which replaced it, has no such check.
+///
+/// Two probes, because they fail differently:
+///
+/// * **slot 256** is the physmap and is *present* in this space's root, so an
+///   unguarded map would allocate nothing and simply write a leaf into a live
+///   kernel table — invisible to any free-count check.
+/// * **slot 300** is absent, so an unguarded map would allocate three table
+///   frames on the way down. The PMM free count is the discriminator there,
+///   which is why the refusal alone is not the whole check.
+fn upper_half_refusal_test(t: &mut Suite) {
+    use akuma_mmu::PteProt;
+
+    /// PML4 slot 256: the physmap. Present in every user root by aliasing.
+    const SHARED_SLOT_VA: usize = akuma_mmu::USER_HALF_END;
+    /// PML4 slot 300: mapped by nothing, so a walk here has to allocate.
+    /// Deliberately non-canonical — a corrupt `p_vaddr` need not be canonical,
+    /// and the walk indexes rather than validates.
+    const ABSENT_SLOT_VA: usize = 300usize << 39;
+
+    let Some(mut uas) = UserAddressSpace::new() else {
+        t.check("uas: upper-half test address space", false);
+        return;
+    };
+    let Some(frame) = akuma_pmm::alloc_page().map(akuma_mmap::PhysFrame::new) else {
+        t.check("uas: upper-half test frame", false);
+        return;
+    };
+
+    t.check(
+        "uas: alloc_and_map refuses the kernel's half",
+        uas.alloc_and_map(SHARED_SLOT_VA, user_flags::RW_NO_EXEC).is_err(),
+    );
+    // ...and keeps the frame it had already allocated. `alloc_and_map` takes
+    // the frame from the PMM *before* the map and, unlike `map_and_track_pte`
+    // below, neither untracks nor frees it when the map fails — on **both**
+    // architectures (`akuma-mmu`'s `map_and_track` is the shared half). Nothing
+    // is lost: the ledger holds it, so `Drop` returns it. But the address space
+    // is left owning a page nothing maps, and the two "install a frame" entry
+    // points disagree about what a failed install leaves behind.
+    //
+    // Asserted rather than tidied. This is a shared-crate asymmetry C1 step 6
+    // *found* — by being the first thing ever to take that error arm on purpose
+    // — and did not cause; fixing it changes the AArch64 kernel's OOM path and
+    // wants its own change and its own A/B.
+    t.check_eq(
+        "uas: a refused alloc_and_map still holds its frame (known asymmetry)",
+        uas.user_frame_count() as u64,
+        1,
+    );
+    t.check(
+        "uas: map_page_pte refuses the kernel's half",
+        !uas.map_page_pte(SHARED_SLOT_VA, frame.addr, PteProt::USER_RW, false),
+    );
+    t.check(
+        "uas: map_and_track_pte refuses an absent kernel slot",
+        !uas.map_and_track_pte(ABSENT_SLOT_VA, frame, PteProt::USER_RW, false),
+    );
+    // The discriminating check: slot 300 is mapped by nothing, so an unguarded
+    // walk would have allocated three page-table frames on the way down and
+    // tracked every one. Zero means the refusal happened at the top.
+    t.check_eq(
+        "uas: a refused walk allocated no page table",
+        uas.page_table_frame_count() as u64,
+        0,
+    );
+    // And `map_and_track_pte` put its own ledger entry back, so the count is
+    // still the one frame `alloc_and_map` left above rather than two.
+    t.check_eq(
+        "uas: map_and_track_pte untracked the frame it did not map",
+        uas.user_frame_count() as u64,
+        1,
+    );
+
+    drop(uas);
+    akuma_pmm::free_page(frame.addr, 0);
 }
 
 /// The PTE-level entry points step 5a added, and the CoW marker they carry.

@@ -2070,11 +2070,12 @@ impl Process {
 
     /// Build a process from a linked ELF image.
     ///
-    /// The failure path frees the frames the loader recorded before it gave up —
-    /// which is why [`loader::load`] records them as it goes and frees nothing
-    /// itself. A half-loaded image whose frames the loader had reclaimed would
-    /// leave this space's page tables pointing at memory the PMM has since
-    /// handed to someone else.
+    /// The address space comes back **from** the loader rather than going into
+    /// it: since C1 step 6 the loading is `akuma-elf`'s, and that crate builds
+    /// the space itself because the image's own headers decide what it needs.
+    /// A failed load therefore drops the space inside the crate, where its
+    /// destructor returns every frame the half-finished load had taken — the
+    /// property `elf: rejected loads leak nothing` checks.
     /// Returns the process and what the loader found, so a caller can check the
     /// placement as well as the outcome.
     fn from_elf(image: &[u8]) -> Result<(Self, loader::LoadedImage), &'static str> {
@@ -2099,33 +2100,24 @@ impl Process {
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
-        let mut space = UserAddressSpace::new().ok_or("no frame for a PML4")?;
+        let (mut space, img) = loader::load(image)?;
+        // `space` drops here on a stack failure, which frees the frames the
+        // loader placed along with the page tables it built. That is exactly
+        // the `free_all_frames` + `space.free()` pair this arm used to run by
+        // hand, and it can no longer be forgotten on a new arm.
+        let stack = loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)?;
 
-        let built = loader::load(image, &mut space).and_then(|img| {
-            loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)
-                .map(|rsp| (img, rsp))
-        });
-
-        match built {
-            Ok((img, stack)) => {
-                let entry = img.entry;
-                Ok((
-                    Self {
-                        space: ProcAddressSpace::new(space),
-                        entry,
-                        stack,
-                        forked: false,
-                        regions: Spinlock::new(Vec::new()),
-                    },
-                    img,
-                ))
-            }
-            // `space` drops here, which frees the frames the loader recorded
-            // before it gave up along with the page tables it built. That is
-            // exactly the `free_all_frames` + `space.free()` pair this arm used
-            // to run by hand, and it can no longer be forgotten on a new arm.
-            Err(e) => Err(e),
-        }
+        let entry = img.entry;
+        Ok((
+            Self {
+                space: ProcAddressSpace::new(space),
+                entry,
+                stack,
+                forked: false,
+                regions: Spinlock::new(Vec::new()),
+            },
+            img,
+        ))
     }
 
     // Teardown is `Drop`, not a `free(self)` method.
@@ -4363,31 +4355,52 @@ pub fn smp_parallel_test(t: &mut Suite) {
     );
 }
 
-/// Count `PT_LOAD` program headers in an ELF64 image.
+/// Call `f(p_vaddr, p_memsz)` for every non-empty `PT_LOAD` program header in
+/// an ELF64 image.
 ///
-/// Reads the four fields it needs at their architectural offsets rather than
-/// going through the `elf` crate, which is the point: the loader's segment
-/// count is checked against a number derived independently of the code that
-/// produced it. A parser bug that dropped a segment would otherwise agree with
-/// itself.
-fn count_pt_load(image: &[u8]) -> u64 {
+/// Reads the fields it needs at their architectural offsets rather than going
+/// through the `elf` crate, which is the point: what the loader did is checked
+/// against a segment list derived independently of the code that produced it.
+/// A parser bug that dropped a segment would otherwise agree with itself — and
+/// since C1 step 6 the loader *is* the `elf` crate, so an independent reader
+/// here is the only thing left that can disagree with it.
+///
+/// `p_memsz == 0` segments are skipped, because a segment that occupies no
+/// memory is mapped by neither loader and counting one would make the caller's
+/// comparison fail for a reason that is not about placement. No image in this
+/// tree carries one; the filter is so that the first that does fails loudly
+/// somewhere better than here.
+fn for_each_pt_load(image: &[u8], mut f: impl FnMut(u64, u64)) {
     const PT_LOAD: u32 = 1;
     let u16_at = |off: usize| u16::from_le_bytes([image[off], image[off + 1]]) as usize;
-    let phoff = u64::from_le_bytes([
-        image[32], image[33], image[34], image[35],
-        image[36], image[37], image[38], image[39],
-    ]) as usize;
+    let u64_at = |b: &[u8]| {
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    };
+    let phoff = u64_at(&image[32..40]) as usize;
     let phentsize = u16_at(54);
     let phnum = u16_at(56);
 
-    (0..phnum)
-        .filter(|i| {
-            let at = phoff + i * phentsize;
-            image
-                .get(at..at + 4)
-                .is_some_and(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == PT_LOAD)
-        })
-        .count() as u64
+    for i in 0..phnum {
+        let at = phoff + i * phentsize;
+        // An ELF64 phdr is 56 bytes: p_type(4) p_flags(4) p_offset(8)
+        // p_vaddr(8) p_paddr(8) p_filesz(8) p_memsz(8).
+        let Some(ph) = image.get(at..at + 56) else { continue };
+        if u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]) != PT_LOAD {
+            continue;
+        }
+        let vaddr = u64_at(&ph[16..24]);
+        let memsz = u64_at(&ph[40..48]);
+        if memsz != 0 {
+            f(vaddr, memsz);
+        }
+    }
+}
+
+/// Count non-empty `PT_LOAD` program headers. See [`for_each_pt_load`].
+fn count_pt_load(image: &[u8]) -> u64 {
+    let mut n = 0;
+    for_each_pt_load(image, |_, _| n += 1);
+    n
 }
 
 /// Load a linked ELF image and run it.
@@ -4482,18 +4495,37 @@ pub fn elf_test(t: &mut Suite) {
     };
     t.check("elf: image loaded", true);
 
-    // Every PT_LOAD in the file was placed. Counted out of the image rather
-    // than written as a literal: how many segments lld emits is its decision,
-    // not ours — `user.ld` names three output sections and the current link
-    // produces four LOADs, because `-z relro` splits .data from .bss. A literal
-    // here would turn any future linker flag into a test failure, while this
-    // catches the thing that matters: a loader that skipped one would produce a
-    // program that runs right up until it touches the segment that is missing.
-    t.check_eq(
-        "elf: every PT_LOAD was placed",
-        img.segments as u64,
-        count_pt_load(image),
-    );
+    // Every PT_LOAD in the file was placed — asked of the **page tables**, not
+    // of a count the loader reported about itself. Before C1 step 6 this was
+    // `img.segments == count_pt_load(image)`; `akuma_elf::LoadedElf` reports no
+    // segment count, and re-deriving one from the same headers the loader read
+    // would have made the check agree with itself. Both ends of each segment
+    // are probed, so a loader that mapped a segment's first page and stopped
+    // fails here rather than in ring 3.
+    //
+    // Counted out of the image rather than written as a literal: how many
+    // segments lld emits is its decision, not ours — `user.ld` names three
+    // output sections and the current link produces four LOADs, because `-z
+    // relro` splits .data from .bss. A literal here would turn any future
+    // linker flag into a test failure, while this catches the thing that
+    // matters: a loader that skipped one would produce a program that runs
+    // right up until it touches the segment that is missing.
+    //
+    // `hello` is `ET_EXEC`, so its `p_vaddr`s are its runtime addresses and
+    // there is no load bias to add. A PIE probe here would need the base.
+    let mapped_segments = {
+        let space = proc.space.lock();
+        let mut n = 0u64;
+        for_each_pt_load(image, |vaddr, memsz| {
+            let first = (vaddr & !0xfff) as usize;
+            let last = ((vaddr + memsz - 1) & !0xfff) as usize;
+            if space.is_mapped(first) && space.is_mapped(last) {
+                n += 1;
+            }
+        });
+        n
+    };
+    t.check_eq("elf: every PT_LOAD is mapped", mapped_segments, count_pt_load(image));
     t.check(
         "elf: image ends above its entry point",
         img.end_va > img.entry && img.end_va % 4096 == 0,
@@ -4630,24 +4662,16 @@ fn reject_test(t: &mut Suite) {
     for (name, at, bytes) in cases {
         let mut img = buf;
         img[at..at + bytes.len()].copy_from_slice(bytes);
-        let Some(mut space) = UserAddressSpace::new() else {
-            t.check(name, false);
-            continue;
-        };
-        // `space` drops at the end of the iteration and releases whatever the
-        // refused load had already placed — which is what the `free_count`
+        // The address space is the loader's to build and to drop since C1
+        // step 6, so a refused load releases whatever it had already placed
+        // without this loop naming it — which is what the `free_count`
         // assertion below is actually testing now.
-        let refused = loader::load(&img, &mut space).is_err();
+        let refused = loader::load(&img).is_err();
         t.check(name, refused);
     }
 
     // A truncated image: the header claims segments the file does not contain.
-    t.check("elf: rejects a truncated image", {
-        let Some(mut space) = UserAddressSpace::new() else {
-            return;
-        };
-        loader::load(&HELLO_ELF[..48], &mut space).is_err()
-    });
+    t.check("elf: rejects a truncated image", loader::load(&HELLO_ELF[..48]).is_err());
 
     t.check_eq(
         "elf: rejected loads leak nothing",

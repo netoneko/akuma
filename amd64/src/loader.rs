@@ -1,142 +1,124 @@
-//! Stage L: loading a real ELF image into a process address space.
+//! Stage L: giving a loaded ELF image its initial user stack.
 //!
-//! Everything before this stage ran a program the kernel assembled for itself,
-//! byte by byte, in `usermode::build_user_program`. That was honest about being
-//! a placeholder: it proved ring 3, syscalls and preemption without needing a
-//! loader, and it could only ever run code this file knows how to emit.
+//! # What this file is now — C1 step 6
 //!
-//! What runs now is `userspace/amd64/hello/hello.rs`, compiled by `rustc` and
-//! linked by `userspace/amd64/user.ld` at `0x40_0000`, embedded in the kernel
-//! image and **parsed at boot**. The blocker was Stage K, not this file: until the kernel
-//! left the lower half there was nowhere to put a program linked where a static
-//! Linux binary is linked, and a loader that can only place an image at an
-//! address chosen to dodge the kernel is a loader for one program.
+//! It used to be a second ELF loader. It parsed the headers, placed the
+//! `PT_LOAD` segments, read `PT_INTERP` and mapped the dynamic linker, and
+//! *then* built the stack — 740 lines beside `crates/akuma-elf`, which does the
+//! first three of those for the AArch64 kernel. The reason was structural and
+//! it expired in two steps: B3 gave `akuma-mmu` an x86_64 `UserAddressSpace`,
+//! and step 5a pointed this file at it, so by 2026-09-08 every signature here
+//! already took the very type `akuma-elf` is written against
+//! (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`).
 //!
-//! # Why this is not `akuma-elf` — **and why that reason has expired**
+//! The **loading** is `akuma-elf`'s now. What stayed is the **placing** of the
+//! initial stack, and the split is drawn exactly there for a measured reason —
+//! see "The layout, and why it did not move" below. `load` is a thin adapter:
+//! it calls [`akuma_elf::load_elf`], which builds the address space, maps every
+//! `PT_LOAD`, and loads the interpreter if the image names one, and it turns
+//! that crate's `LoadedElf` into the [`LoadedImage`] this target's `build_stack`
+//! and boot checks already read.
 //!
-//! The tree has an ELF loader — `crates/akuma-elf` — and it is arch-neutral in
-//! everything that matters here. The reason this file existed beside it was
-//! structural: `load.rs`, `interp.rs` and `stack.rs` are written against
-//! `akuma_mmu::UserAddressSpace`, and that type was AArch64 page-table code. A
-//! loader that cannot name an address space cannot place a segment.
+//! # The layout, and why it did not move
 //!
-//! **That is no longer true.** B3 gave `akuma-mmu` an x86_64
-//! `UserAddressSpace`, `akuma-elf`'s `EM_NATIVE` is `cfg(target_arch)`-selected,
-//! `impl UserPages for UserAddressSpace` is arch-neutral, and since step 5a this
-//! file maps through that very type — every signature below already takes
-//! `&mut UserAddressSpace`. What is left between here and `akuma_elf::load_elf`
-//! is not a dependency, it is a **VA layout**: this file's `PIE_BASE`
-//! (`0x1000_0000`), `INTERP_BASE` (`0x4000_0000`) and `ELF_STACK_TOP` were
-//! chosen against `mm::MMAP_BASE`, and `akuma-elf` picks different ones. Moving
-//! to it moves where every program on this target lands, which is C1 **step 6**
-//! and wants its own A/B rather than a rider on somebody else's change
-//! (`proposals/NEXT_AGENT_AMD64_STEP5_PROCESS_TABLE.md`).
+//! The two loaders place a program in *almost* the same places, and the one
+//! difference that matters is not the interpreter's:
 //!
-//! One thing to fix on the way in: `akuma_elf::interp` still compares
-//! `e_machine` against a hardcoded `EM_AARCH64`, where `load.rs` uses the
-//! `cfg`-selected `EM_NATIVE`. Nothing has noticed because no x86 caller has
-//! reached the interpreter path yet.
+//! | | this target, before | `akuma-elf` |
+//! |---|---|---|
+//! | `PIE_BASE` | `0x1000_0000` | `0x1000_0000` — the same |
+//! | `INTERP_BASE` | `0x4000_0000` | `0x3000_0000` |
+//! | stack top | [`crate::usermode::ELF_STACK_TOP`], fixed | `compute_stack_top(brk, has_interp)`, variable, capped at `0x40_0000_0000` |
+//! | mmap window | `mm::MMAP_BASE` … `mm::MMAP_TOP` (112 TiB) | `mmap_floor` = `0x3010_0000` |
 //!
-//! What this file deliberately does *not* do is
-//! re-implement the parsing: it calls the same `elf` 0.7 crate through the same
-//! `parse_ident` / `parse_tail` / `SegmentTable` path, so the tree still has one
-//! ELF parser and two consumers of it — not two parsers, which is the defect
-//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §3 spent a verification
-//! campaign removing.
+//! **The interpreter base moved and nothing else did.** `0x3000_0000` sits in
+//! the same hole `0x4000_0000` did — above a static-PIE program at `PIE_BASE`
+//! and 3.75 GiB below `mm::MMAP_BASE` (`0x1_0000_0000`) — so an image and its
+//! mappings still cannot meet. That is an explicitly carried decision, not an
+//! accident: taking `akuma-elf`'s loading means taking where it puts the linker,
+//! and a program would have to be 512 MiB to reach it from `PIE_BASE`.
 //!
-//! # What it refuses
+//! `akuma-elf`'s **stack** placement is the one that could not come along, and
+//! this is measured rather than predicted. `compute_stack_top` caps at
+//! `0x40_0000_0000` (256 GiB), which is *inside* `mm.rs`'s window
+//! `[0x1_0000_0000, 0x7000_0000_0000)`. The stack is not in the region list —
+//! it is placed here — and `MMAP_TOP` was chosen at 112 TiB precisely so the
+//! fixed [`crate::usermode::ELF_STACK_TOP`] sits outside the window "by
+//! construction rather than by collision test" (`mm.rs`'s own comment). An
+//! `akuma-elf`-placed stack breaks that construction: `find_free_va` would hand
+//! out the stack's own pages, and the failure is a `SIGSEGV` in ring 3 with no
+//! message. So `build_stack` below stays, and `attach_stack`/`compute_stack_top`
+//! are deliberately not called.
 //!
-//! * Anything but `ET_EXEC`/`ET_DYN` + `EM_X86_64` + ELF64 little-endian.
-//! * A `PT_INTERP` segment — a *dynamically*-linked binary (one that names
-//!   `/lib/ld-musl-x86_64.so.1` and expects the kernel or a separate loader
-//!   run to satisfy symbol imports against it) still has no home here. What
-//!   `ET_DYN` alone buys (since 2026-09-04, for `apk`) is **static-PIE**: a
-//!   fully self-contained image that only needs a base address and its own
-//!   `_start` to bring itself up — see "Static-PIE" below.
-//! * A segment outside the lower half. The upper half is the kernel's, and a
-//!   `p_vaddr` there would ask the walker to overwrite a shared PML4 entry.
-//! * A page that would end up **writable and executable**. `PteProt` offers no
-//!   `USER_RWX` constructor for the same reason, and this is where that becomes
-//!   enforcement rather than convention: an unaligned link packs .text and .data
-//!   into one page, and the union of their permissions is W+X.
-//!   `userspace/amd64/user.ld` aligns every segment to a page precisely so this
-//!   refusal never fires on our own image — a link that stops satisfying it
-//!   fails the boot instead of silently handing ring 3 a writable code page.
+//! # Divergences this fold carries, each one deliberate
 //!
-//! # Static-PIE (`ET_DYN`, no `PT_INTERP`)
+//! Refusals the old `place_image` made that `akuma-elf` does not:
 //!
-//! Still the simplest shape, and the one `apk.static` uses. A `PT_INTERP`
-//! segment is no longer refused — see [`load`] — but a static-PIE needs no
-//! interpreter at all, and the path below is what handles it.
+//! * **A segment outside the lower half** is no longer refused *here*. It is
+//!   refused one level down, in `akuma_mmu`'s x86 walk, which is where it
+//!   belonged all along: `UserAddressSpace::new` aliases the kernel's PML4
+//!   slots into every user root, so an upper-half `p_vaddr` was never one
+//!   process's problem — see `x86_map_page_in`'s header and
+//!   `uas::upper_half_refusal_test`.
+//! * **A writable+executable segment** was refused outright; `akuma-elf`
+//!   enforces W^X by construction instead (`SegProt` has two variants and
+//!   `PF_X` wins), so such a segment loads as read-execute and faults on its
+//!   first write rather than failing the load. Strictly safer, less legible.
+//!   `userspace/amd64/user.ld` page-aligns every segment so neither answer is
+//!   reachable from our own image.
+//! * **`p_filesz > p_memsz`** was refused; `akuma-elf` copies only what fits in
+//!   the `memsz` page span, silently truncating. Not dangerous — the bytes go
+//!   nowhere — but it is a refusal that became a shrug.
+//! * **The entry point** was checked for being a non-zero user address inside an
+//!   executable segment. That one is cheap to keep without a second parse and
+//!   [`load`] keeps it, reading the permission back out of the page tables.
 //!
-//! Alpine's `apk-tools-static` — the reason this exists — is compiled
-//! `-static-pie`: `ET_DYN`, no `PT_INTERP`, and its relocations are `DT_RELR`
-//! (a compact bitmap format, not a classic `SHT_RELA` array — confirmed by
-//! reading its own `.dynamic` section, `RELASZ` is 0 and `RELR`/`RELRSZ` carry
-//! everything). This loader does **not** process them. It does not need to:
-//! musl's own startup (`_dlstart_c`) walks its *own* program headers — found
-//! through `AT_PHDR` in the auxv this file now supplies — computes its load
-//! bias from where the kernel actually put them versus where they claim to be
-//! linked at (0, for a PIE), and self-relocates before calling `main`. The
-//! kernel's entire job is: pick a base (`PIE_BASE`), map every `PT_LOAD` at
-//! `base + p_vaddr` instead of `p_vaddr`, and report `AT_PHDR`/`AT_PHNUM`/
-//! `AT_PHENT` truthfully. Everything past that is the binary's own problem,
-//! by design — the same division of labor `userspace/apk-tools/docs/
-//! PIE_LOADER.md` documents for the AArch64 kernel, which this mirrors.
+//! Gaps `akuma-elf` closes for free, which would otherwise have vanished:
 //!
-//! One consequence worth stating: the data segment RELR relocations land in
-//! must be **writable** at load time for `_dlstart_c` to write into it, and
-//! this loader never re-protects it read-only afterward (`PT_GNU_RELRO` is
-//! parsed nowhere here) — a real security regression from what a hardened
-//! loader would do, accepted for the same reason the rest of this file's
-//! "what it does not do yet" list is accepted.
+//! * A `PT_INTERP` of one NUL byte — what a static-PIE emits — was read as an
+//!   empty path and turned into a failed `read_file`. `akuma-elf` skips any
+//!   `PT_INTERP` with `p_filesz <= 1`.
+//! * `PN_XNUM` and a bad `e_phentsize` are refused in `parse_headers` rather
+//!   than here, and every header field is read through the bounds-checked
+//!   `elf` 0.7 crate rather than by this file re-doing the same reads.
 //!
-//! # What it does not do yet
+//! What did **not** get closed, and stays a bound on this target: `build_stack`
+//! assembles the word block in a `[u8; STACK_WORDS_MAX * 8]` on the kernel
+//! stack, so [`MAX_ARGV`] and [`MAX_ENVP`] are still hard caps. `akuma-elf`'s
+//! `setup_linux_stack` builds on the heap and has no such limit — that is a gap
+//! it *would* close, and taking it means taking its auxv (fourteen entries
+//! against this target's seven) and its stack placement, which is the layout
+//! question above. Recorded as owed rather than quietly kept.
 //!
-//! No demand paging: every page of every `PT_LOAD` is allocated and copied up
-//! front. The `#PF` handler can already service a not-present fault
-//! (`idt.rs`), so the machinery exists; wiring segments to it needs a per-space
-//! region table, which is the next thing rather than part of this one. No real
-//! dynamic linker (`PT_INTERP` is refused outright), and no `PT_GNU_RELRO`.
-
-use elf::abi::{EM_X86_64, ET_DYN, ET_EXEC, PF_W, PF_X, PT_INTERP, PT_LOAD};
-use elf::endian::LittleEndian;
-use elf::file::{Class, FileHeader};
-use elf::segment::SegmentTable;
+//! # What ring 3 gets on its stack
+//!
+//! Unchanged by the fold. `_start` receives no arguments, so this block is how a
+//! program learns its own name, its environment and the page size — and how a
+//! static-PIE finds its own program headers to self-relocate against
+//! (`AT_PHDR`/`AT_PHNUM`/`AT_PHENT`), and how a dynamic linker finds its own
+//! (`AT_BASE`). Omit `AT_BASE` and `ld-musl` self-relocates against address 0
+//! and faults in the first page before it runs a line of the program.
 
 use akuma_mmap::PhysFrame;
 
+use akuma_elf::ElfError;
 use akuma_mmu::{PteProt, UserAddressSpace};
 
 use crate::phys::phys_ptr;
 
 const PAGE_SIZE: usize = 4096;
-/// Bytes of `e_ident`, and the offset the rest of the header starts at.
-const EI_NIDENT: usize = 16;
-/// Size of an ELF64 file header.
-const ELF64_EHDR_SIZE: usize = 64;
 
 /// First address that is not userspace: PML4 slot 256 and up is the kernel's.
+///
+/// Only [`load`]'s entry-point check reads it now. The *segment* check that
+/// used to is `akuma_mmu::USER_HALF_END`, enforced inside the walk.
 const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
-
-/// Where a static-PIE (`ET_DYN`) image's segments are placed. `p_vaddr`
-/// values in a PIE start near 0 (it is linked as if loaded at address 0), so
-/// this is added to every one of them — the same constant, and the same
-/// reasoning, as `akuma-elf`'s `PIE_BASE` for the AArch64 kernel: well above
-/// where an `ET_EXEC` image links (`0x40_0000`) and, on this target, well
-/// below `mm::MMAP_BASE` (`0x1_0000_0000`) — the AArch64 loader's own
-/// `PIE_BASE`-collides-with-its-mmap-region bug
-/// (`userspace/apk-tools/docs/PIE_LOADER.md` "Change 2") cannot recur here
-/// for the boring reason that the two were never close: an anonymous mmap
-/// from musl's TLS setup (`__copy_tls`) lands 3.75 GiB away from this base,
-/// not on top of it.
-const PIE_BASE: u64 = 0x1000_0000;
 
 /// Auxiliary-vector keys this kernel supplies.
 ///
 /// Spelled here rather than pulled from `akuma_elf::types::auxv`, which is
-/// private to that crate. When the parse/place split in the module header
-/// happens, these move with it.
+/// `pub` but names eleven keys this target does not supply — a `use` of the
+/// module would read as though it did.
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -145,29 +127,14 @@ const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 
-// The per-process frame ledger moved **into** the address space in amd64 step
-// 5a, and this module no longer names it.
-//
-// It was `pub type FrameSet = akuma_user_space::FrameLedger` plus a
-// `free_all_frames` that handed every tracked frame back through
-// `cow_ref_dec`, called by six bail-out arms that each also had to remember
-// `AddressSpace::free()`. `akuma_mmu::UserAddressSpace` owns one ledger and
-// releases it in `Drop`, alongside its page tables and through the same
-// `cow_ref_dec` gate — so the two halves cannot be run in the wrong order or
-// forgotten on a new arm, and the loader records frames by mapping them
-// ([`UserAddressSpace::map_and_track_pte`]) rather than by tracking them
-// separately and hoping the map agrees.
-//
-// The history worth keeping: `FrameSet` was a `Box<[usize; 2048]>` until
-// 2026-09-06 — 16 KiB of heap per process and a hard ceiling a shell could
-// reach (`sh: can't fork: Out of memory` on an idle 2 GiB machine, one entry
-// per mapped page per `fork`), with no refcount, so teardown freed a page a
-// CoW sibling was still reading. `akuma-user-space` replaced it with the
-// host-tested ledger the AArch64 kernel already used
-// (`docs/archive/AKUMA_USER_SPACE_LEDGER.md`), and 5a put it where the page
-// tables are.
-
 /// What a successful load produced.
+///
+/// `akuma_elf::LoadedElf` in this target's vocabulary. The two differ in three
+/// places and each is a real translation rather than a rename: [`Self::entry`]
+/// is where ring 3 is entered (the *linker's* entry for a dynamic image, which
+/// `LoadedElf` keeps in `interp`), [`Self::interp_base`] flattens
+/// `Option<InterpInfo>` to the `0` Linux reports for a static image, and
+/// [`Self::end_va`] is page-aligned where `brk` is not.
 pub struct LoadedImage {
     /// Where `enter_user_mode` jumps. `base + e_entry` for a static image, and
     /// the **dynamic linker's** entry for one with a `PT_INTERP` — the linker
@@ -186,29 +153,106 @@ pub struct LoadedImage {
     /// program.
     pub interp_base: u64,
     /// Page-aligned end of the highest `PT_LOAD`. Where a `brk` heap would
-    /// start; recorded now because it is free to compute here and impossible to
-    /// recover later.
+    /// start.
     pub end_va: u64,
-    /// How many `PT_LOAD` segments were placed.
-    pub segments: usize,
     /// Where the program header table ended up in the mapped image, for
-    /// `AT_PHDR` — found by locating the `PT_LOAD` segment whose file range
-    /// covers `e_phoff` and translating through *that* segment's own
-    /// `p_vaddr`/`p_offset`, **not** `base + e_phoff` (only correct when the
-    /// covering segment links `p_vaddr == p_offset`, which a traditional
-    /// `ET_EXEC` linked at a high base does not — see `load`'s own comment
-    /// at the computation for the crash that shortcut produced). No
-    /// `PT_PHDR` segment search: nothing here needs one to exist, and
-    /// `apk.static` (this feature's reason to exist) does not carry one.
-    /// `0` if no `PT_LOAD` segment covers `e_phoff` — the hand-linked
-    /// `userspace/amd64/hello`/`fdprobe` probes don't bother, and neither
-    /// reads its own auxv, so this is a fallback rather than a load failure.
+    /// `AT_PHDR`. `0` when the image carries no `PT_PHDR` and no `PT_LOAD`
+    /// beginning at file offset 0 — the hand-linked `userspace/amd64/hello`
+    /// and `fdprobe` probes are both in that shape and neither reads its own
+    /// auxv, so it is a fallback rather than a load failure.
     pub phdr_addr: u64,
     /// `e_phnum`, for `AT_PHNUM`.
     pub phnum: u16,
-    /// `e_phentsize`, for `AT_PHENT` — always 56 on ELF64 (checked at parse
-    /// time), but passed through rather than hard-coded a second place.
+    /// `e_phentsize`, for `AT_PHENT` — always 56 on ELF64 (checked in
+    /// `akuma_elf`'s `parse_headers`), but passed through rather than
+    /// hard-coded a second place.
     pub phent: u16,
+}
+
+/// Load `image` into a fresh address space through [`akuma_elf::load_elf`].
+///
+/// # Why this returns the address space rather than filling one
+///
+/// `load_elf` builds it: `A::new_space()` is the first thing it does, because
+/// the image's own headers decide how many page tables it needs and the loader
+/// is the only thing that has read them. The old signature took `&mut
+/// UserAddressSpace` because it was the *caller* that made one. On failure the
+/// space is dropped inside the crate and its destructor returns every frame the
+/// half-finished load had taken — which is what `elf: rejected loads leak
+/// nothing` checks on real hardware.
+///
+/// # The eager strategy, and why not the deferred one
+///
+/// [`akuma_elf::load_elf`] maps every page of every `PT_LOAD` up front.
+/// `load_elf_from_path` would register demand-paged lazy regions instead, and
+/// this target cannot use it: its two file-reading hooks (`read_at`,
+/// `resolve_file_id`) are `exec_runtime.rs` category-3 stubs that panic naming
+/// themselves, and its `#PF` handler pages from `Process::regions`
+/// (`akuma-mmap`) rather than from `akuma-exec`'s lazy-region table. Both are
+/// C2's to fold.
+pub fn load(image: &[u8]) -> Result<(UserAddressSpace, LoadedImage), &'static str> {
+    let loaded = akuma_elf::load_elf::<UserAddressSpace>(image, None).map_err(|e| elf_err(&e))?;
+
+    let entry = match loaded.interp {
+        // Ring 3 is entered in the linker, which brings the program up itself.
+        Some(ref interp) => interp.entry_point as u64,
+        None => loaded.entry_point as u64,
+    };
+    // `AT_ENTRY` stays the *program's* entry: it is what the linker jumps to
+    // once it is done, and reporting the linker's own would loop.
+    let prog_entry = loaded.entry_point as u64;
+
+    // The three refusals `place_image` made after placing an image, kept
+    // because they cost no second parse — the answers are read back out of the
+    // page tables the loader just wrote, which is what the hardware will do
+    // rather than what the loader believes it did.
+    if prog_entry == 0 || prog_entry >= USER_VA_LIMIT {
+        return Err("entry point is not a user address");
+    }
+    if entry == 0 || entry >= USER_VA_LIMIT {
+        return Err("interpreter entry point is not a user address");
+    }
+    if loaded
+        .address_space
+        .pte_prot(entry as usize & !(PAGE_SIZE - 1))
+        .is_none_or(|(p, _cow)| !p.exec)
+    {
+        return Err("entry point is not in an executable segment");
+    }
+
+    let img = LoadedImage {
+        entry,
+        prog_entry,
+        interp_base: loaded.interp.as_ref().map_or(0, |i| i.base_addr as u64),
+        // The heap starts past the program, not past the linker: `brk` grows up
+        // from the program image and the linker sits above it either way.
+        // `LoadedElf::brk` is the highest `p_vaddr + p_memsz`, unrounded.
+        end_va: align_up(loaded.brk as u64, PAGE_SIZE as u64),
+        phdr_addr: loaded.phdr_addr as u64,
+        phnum: loaded.phnum as u16,
+        phent: loaded.phent as u16,
+    };
+    Ok((loaded.address_space, img))
+}
+
+/// [`ElfError`] as one of this module's `&'static str`s.
+///
+/// A match rather than `Display`: the caller's error channel is a `&'static
+/// str` all the way up to the boot suite and `execve`'s errno mapping, and
+/// rendering through `format!` to get one would be a heap allocation on the
+/// path that is reporting a failure. The arms that carry their own `&'static
+/// str` pass it through, so a `MappingFailed("Out of memory for user page")`
+/// still says which resource ran out.
+fn elf_err(e: &ElfError) -> &'static str {
+    match *e {
+        ElfError::InvalidFormat(m) | ElfError::MappingFailed(m) => m,
+        ElfError::InvalidMagic(_) => "not an ELF image",
+        ElfError::WrongArchitecture => "not an x86-64 image",
+        ElfError::NotExecutable => "not ET_EXEC or ET_DYN",
+        ElfError::DynamicallyLinked => "dynamically linked and no interpreter could be loaded",
+        ElfError::OutOfMemory => "out of memory loading an image",
+        ElfError::AddressSpaceFailed => "no frame for a PML4",
+    }
 }
 
 /// Round `v` up to the next multiple of `to`.
@@ -216,22 +260,14 @@ const fn align_up(v: u64, to: u64) -> u64 {
     v.div_ceil(to) * to
 }
 
-/// Permissions for a `PT_LOAD`, from its `p_flags`.
-///
-/// There is no read bit: x86 page tables cannot express "not readable" for a
-/// present page, so `PF_R` is implied and a segment without it would be
-/// readable anyway. Saying so here is more honest than pretending to enforce it.
-const fn segment_prot(p_flags: u32) -> PteProt {
-    PteProt { write: p_flags & PF_W != 0, exec: p_flags & PF_X != 0, user: true }
-}
-
 /// The permissions a page needs to satisfy both `a` and `b`.
 ///
-/// Only reachable when two segments share a page, which a page-aligned link
-/// never does. It is the union rather than "first writer wins" because
-/// under-permitting is a fault at run time in code that looks correct, whereas
-/// the over-permitting case that actually matters — W+X — is refused outright by
-/// the caller.
+/// Reached only from [`map_range`]'s already-mapped arm, which since C1 step 6
+/// nothing can take: `map_range`'s one caller is [`build_stack`], and the stack
+/// sits at [`crate::usermode::ELF_STACK_TOP`] — 128 TiB above anything an image
+/// occupies. Kept, rather than deleted with the segment placer it was written
+/// for, because it is what makes `map_range` safe to point at a second range
+/// later; the W^X refusal below is the property worth keeping alive.
 const fn widen(a: PteProt, b: PteProt) -> PteProt {
     PteProt { write: a.write || b.write, exec: a.exec || b.exec, user: a.user || b.user }
 }
@@ -278,10 +314,13 @@ fn write_user(space: &UserAddressSpace, va: u64, src: &[u8]) -> bool {
 /// Make sure every page of `[start, end)` is mapped in `space` with at least
 /// `prot`, allocating and zeroing frames as needed.
 ///
-/// Zeroing on allocation is what implements `p_memsz > p_filesz`: the caller
-/// copies only the file-backed bytes and the rest is already zero. It is also
-/// what stops a recycled frame handing ring 3 whatever the previous owner left
-/// in it — the same rule the demand-paging handler follows.
+/// One caller since C1 step 6: [`build_stack`]. Zeroing on allocation is what
+/// stops a recycled frame handing ring 3 whatever the previous owner left in
+/// it — for a stack that is the whole of its job, and the same rule the
+/// demand-paging handler follows. (It used to also implement `p_memsz >
+/// p_filesz` for the segment placer; `akuma-elf` discharges that obligation
+/// through `UserPages::alloc_and_map`, whose contract says the page arrives
+/// zeroed for exactly this reason.)
 fn map_range(
     space: &mut UserAddressSpace,
     start: u64,
@@ -320,279 +359,6 @@ fn map_range(
         va += PAGE_SIZE as u64;
     }
     Ok(())
-}
-
-/// Parse `image` and place its `PT_LOAD` segments into `space`.
-///
-/// `force_base` overrides where a PIE lands; `None` uses [`PIE_BASE`] for an
-/// `ET_DYN` image and 0 for `ET_EXEC`. It exists for the dynamic linker, which
-/// is itself an `ET_DYN` image and must not land on top of the program.
-///
-/// On failure the frames allocated so far are still recorded in `frames`, so
-/// the caller can free them; nothing is freed here, because a half-loaded image
-/// whose frames were silently reclaimed would leave `space`'s page tables
-/// pointing at memory the PMM had handed to someone else.
-fn place_image(
-    image: &[u8],
-    space: &mut UserAddressSpace,
-    force_base: Option<u64>,
-) -> Result<Placed, &'static str> {
-    if image.len() < ELF64_EHDR_SIZE {
-        return Err("image is shorter than an ELF64 header");
-    }
-    let ident = elf::file::parse_ident::<LittleEndian>(&image[..EI_NIDENT])
-        .map_err(|_| "bad ELF identification")?;
-    if ident.1 != Class::ELF64 {
-        return Err("not ELF64");
-    }
-    let ehdr = FileHeader::parse_tail(ident, &image[EI_NIDENT..ELF64_EHDR_SIZE])
-        .map_err(|_| "bad ELF header")?;
-
-    if ehdr.e_machine != EM_X86_64 {
-        return Err("not an x86-64 image");
-    }
-    let is_pie = match ehdr.e_type {
-        ET_EXEC => false,
-        ET_DYN => true,
-        _ => return Err("not ET_EXEC or ET_DYN"),
-    };
-    // `p_vaddr` values in a PIE start near 0 (linked as if loaded at 0); an
-    // `ET_EXEC` image links at its real address, so `base` is 0 there and
-    // every `base + p_vaddr` below is unchanged from before this existed.
-    let base = match force_base {
-        Some(b) => b,
-        None if is_pie => PIE_BASE,
-        None => 0,
-    };
-    // PN_XNUM keeps the real count in shdr[0].sh_info. Nothing here comes near
-    // 65535 segments, so reject it rather than mis-read the table as that many.
-    if ehdr.e_phnum == elf::abi::PN_XNUM {
-        return Err("PN_XNUM segment count unsupported");
-    }
-
-    let entsize = usize::from(ehdr.e_phentsize);
-    if entsize != 56 {
-        return Err("bad e_phentsize for ELF64");
-    }
-    let table_size = entsize
-        .checked_mul(usize::from(ehdr.e_phnum))
-        .ok_or("program header table overflow")?;
-    let phoff = usize::try_from(ehdr.e_phoff).map_err(|_| "program header offset overflow")?;
-    let phend = phoff.checked_add(table_size).ok_or("program header table overflow")?;
-    let phdrs = image.get(phoff..phend).ok_or("program header table past end of image")?;
-    let segments = SegmentTable::new(ehdr.endianness, ehdr.class, phdrs);
-
-    // A `PT_INTERP` segment names the dynamic linker. Read the path out here
-    // and hand it to the caller; placing it is `load`'s job, because it needs a
-    // second image and this function only places one.
-    //
-    // The path is a NUL-terminated string in the file, not a segment to map —
-    // `p_filesz` includes the NUL, so trim it rather than carrying it into a
-    // `read_file` that would then miss.
-    let interp = segments
-        .iter()
-        .find(|ph| ph.p_type == PT_INTERP)
-        .map(|ph| -> Result<alloc::string::String, &'static str> {
-            let off = usize::try_from(ph.p_offset).map_err(|_| "interp offset overflow")?;
-            let len = usize::try_from(ph.p_filesz).map_err(|_| "interp size overflow")?;
-            if len == 0 || len > 256 {
-                return Err("implausible PT_INTERP length");
-            }
-            let end = off.checked_add(len).ok_or("interp range overflow")?;
-            let raw = image.get(off..end).ok_or("PT_INTERP past end of image")?;
-            let raw = raw.strip_suffix(b"\0").unwrap_or(raw);
-            core::str::from_utf8(raw)
-                .map(alloc::string::String::from)
-                .map_err(|_| "PT_INTERP path is not UTF-8")
-        })
-        .transpose()?;
-
-    let mut placed = 0usize;
-    let mut end_va = 0u64;
-
-    for ph in segments.iter() {
-        if ph.p_type != PT_LOAD {
-            continue;
-        }
-        if ph.p_memsz == 0 {
-            continue;
-        }
-        if ph.p_filesz > ph.p_memsz {
-            return Err("segment p_filesz exceeds p_memsz");
-        }
-
-        let seg_end = base
-            .checked_add(ph.p_vaddr)
-            .and_then(|v| v.checked_add(ph.p_memsz))
-            .ok_or("segment wraps the address space")?;
-        if seg_end > USER_VA_LIMIT {
-            return Err("segment is not in the lower half");
-        }
-
-        let prot = segment_prot(ph.p_flags);
-        if prot.write && prot.exec {
-            return Err("segment is both writable and executable");
-        }
-
-        let vaddr = base + ph.p_vaddr;
-        let start = vaddr & !(PAGE_SIZE as u64 - 1);
-        let end = align_up(seg_end, PAGE_SIZE as u64);
-        map_range(space, start, end, prot)?;
-
-        if ph.p_filesz > 0 {
-            let off = usize::try_from(ph.p_offset).map_err(|_| "segment file offset overflow")?;
-            let len = usize::try_from(ph.p_filesz).map_err(|_| "segment file size overflow")?;
-            let file_end = off.checked_add(len).ok_or("segment file range overflow")?;
-            let bytes = image.get(off..file_end).ok_or("segment data past end of image")?;
-            if !write_user(space, vaddr, bytes) {
-                return Err("segment page vanished between mapping and copying");
-            }
-        }
-
-        placed += 1;
-        end_va = end_va.max(end);
-    }
-
-    if placed == 0 {
-        return Err("image has no PT_LOAD segments");
-    }
-    let entry = base.checked_add(ehdr.e_entry).ok_or("entry point overflows the address space")?;
-    if entry == 0 || entry >= USER_VA_LIMIT {
-        return Err("entry point is not a user address");
-    }
-    if space.pte_prot(entry as usize & !(PAGE_SIZE - 1)).is_none_or(|(p, _cow)| !p.exec) {
-        return Err("entry point is not in an executable segment");
-    }
-
-    // `AT_PHDR`: the runtime address file offset `e_phoff` maps to — **not**
-    // simply `base + e_phoff`. That shortcut is only correct when the
-    // covering segment's `p_vaddr` equals its `p_offset`, true for a PIE
-    // linked near 0 (`apk.static`'s segment 0 is `p_vaddr=0, p_offset=0`) but
-    // false for a traditional `ET_EXEC` image linked at a high base — busybox
-    // links at `0x40_0000` with `p_offset=0` for the same segment, so
-    // `base + e_phoff` (`0x40`, `e_phoff`'s literal value — the ELF header is
-    // exactly 64 bytes) is not even a mapped address, and busybox faulted on
-    // it at `cr2=0x40` the first time this shipped with the shortcut. Found
-    // instead by locating the `PT_LOAD` segment whose *file* range covers
-    // `e_phoff` and translating through *that* segment's own
-    // `p_vaddr`/`p_offset` pair, which is correct for both shapes.
-    //
-    // Falls back to 0 rather than failing the whole load when no segment
-    // covers it — `userspace/amd64/hello`/`fdprobe`'s hand-rolled
-    // `user.ld` does not bother mapping the file's first few bytes into any
-    // `PT_LOAD` (nothing in either program reads its own program headers),
-    // and refusing to load them over an auxv entry neither one looks at
-    // would be exactly backwards. A real static-PIE binary's own toolchain
-    // always covers this in practice — `apk.static` does — so this fallback
-    // is never expected to be what a genuine `ET_DYN` load hits.
-    let phdr_addr = segments
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD)
-        .find_map(|ph| {
-            let seg_off_end = ph.p_offset.checked_add(ph.p_filesz)?;
-            if ehdr.e_phoff < ph.p_offset || ehdr.e_phoff >= seg_off_end {
-                return None;
-            }
-            base.checked_add(ph.p_vaddr)?.checked_add(ehdr.e_phoff - ph.p_offset)
-        })
-        .unwrap_or(0);
-
-    Ok(Placed {
-        entry,
-        end_va,
-        segments: placed,
-        phdr_addr,
-        phnum: ehdr.e_phnum,
-        phent: ehdr.e_phentsize,
-        interp,
-    })
-}
-
-/// One placed image. [`load`] turns one or two of these into a [`LoadedImage`].
-struct Placed {
-    entry: u64,
-    end_va: u64,
-    segments: usize,
-    phdr_addr: u64,
-    phnum: u16,
-    phent: u16,
-    /// The `PT_INTERP` path, if this image names a dynamic linker.
-    interp: Option<alloc::string::String>,
-}
-
-/// Where the dynamic linker is placed.
-///
-/// Between [`PIE_BASE`] (0x1000_0000) and `mm::MMAP_BASE` (0x1_0000_0000), so
-/// it collides with neither the program below it nor the mmap window above.
-/// An `ET_EXEC` program links lower still (busybox at 0x40_0000), so both
-/// program shapes clear it.
-const INTERP_BASE: u64 = 0x4000_0000;
-
-/// Parse `image`, place it, and place its dynamic linker if it names one.
-///
-/// # Dynamic linking
-///
-/// A `PT_INTERP` segment names an interpreter — `/lib/ld-musl-x86_64.so.1` for
-/// everything Alpine ships. The kernel's job is small and entirely mechanical:
-///
-/// 1. Place the program, as always.
-/// 2. Place the interpreter, an `ET_DYN` image, at [`INTERP_BASE`].
-/// 3. **Enter at the interpreter's** entry point, not the program's.
-/// 4. Tell the interpreter where it landed (`AT_BASE`) and where the program
-///    is (`AT_PHDR`/`AT_PHNUM`/`AT_PHENT`/`AT_ENTRY`).
-///
-/// Everything after that — mapping the shared libraries, resolving symbols,
-/// running initialisers, jumping to the program — happens in ring 3, in the
-/// interpreter, using syscalls this kernel already serves. There is no
-/// kernel-side symbol resolution and there never should be.
-///
-/// The auxv is the whole interface, which is why `AT_BASE` matters: a PIE
-/// interpreter linked at 0 has no other way to find its own relocations, and
-/// omitting it makes `ld-musl` self-relocate against address 0 and fault
-/// immediately with a `cr2` in the first page.
-pub fn load(image: &[u8], space: &mut UserAddressSpace) -> Result<LoadedImage, &'static str> {
-    let main = place_image(image, space, None)?;
-
-    let Some(interp_path) = main.interp.as_deref() else {
-        return Ok(LoadedImage {
-            entry: main.entry,
-            prog_entry: main.entry,
-            interp_base: 0,
-            end_va: main.end_va,
-            segments: main.segments,
-            phdr_addr: main.phdr_addr,
-            phnum: main.phnum,
-            phent: main.phent,
-        });
-    };
-
-    let interp_image =
-        crate::fs::read_file(interp_path)
-            .map_err(|_| "PT_INTERP names a file that is not on the disk")?;
-    let interp = place_image(&interp_image, space, Some(INTERP_BASE))?;
-    if interp.interp.is_some() {
-        // An interpreter that names an interpreter is either a corrupt image or
-        // a loop. Neither is worth chasing at load time.
-        return Err("the dynamic linker itself names a PT_INTERP");
-    }
-
-    Ok(LoadedImage {
-        // Ring 3 is entered in the linker, which brings the program up itself.
-        entry: interp.entry,
-        // `AT_ENTRY` stays the *program's* entry: it is what the linker jumps
-        // to once it is done, and reporting the linker's own would loop.
-        prog_entry: main.entry,
-        interp_base: INTERP_BASE,
-        // The heap starts past the program, not past the linker: `brk` grows up
-        // from the program image and the linker sits above it either way.
-        end_va: main.end_va,
-        segments: main.segments + interp.segments,
-        // The program's headers, not the linker's — the linker reads these to
-        // find what it is loading.
-        phdr_addr: main.phdr_addr,
-        phnum: main.phnum,
-        phent: main.phent,
-    })
 }
 
 /// Map a stack below `top` and lay out the System V initial frame on it.

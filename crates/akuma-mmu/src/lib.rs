@@ -2867,6 +2867,32 @@ unsafe fn x86_next_table(entry_ptr: *mut u64, user: bool) -> Option<(u64, bool)>
 /// test caught it as `page_table_frame_count() == 0` where three frames had just
 /// been allocated (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, B3). A parameter
 /// that can be omitted will be.
+///
+/// # Why the upper half is refused here rather than by each caller
+///
+/// [`UserAddressSpace::new`] **aliases** the kernel's PML4 slots 256, 257 and
+/// 511 into every user root rather than copying them — that is what makes one
+/// kernel mapping that cannot drift. The consequence is that a walk from slot
+/// 256 up is a walk through the *kernel's own* page tables, and
+/// [`x86_next_table`] widens every intermediate entry it descends through to
+/// `P|RW|US`. So a single `map_page(va >= 2^47, …)` does not corrupt one
+/// process: it makes a kernel table user-accessible for **every** address
+/// space, and installs a leaf in it. There is no fault, no message and no way
+/// to find it later.
+///
+/// Until C1 step 6 the only thing standing in the way of that was
+/// `amd64/src/loader.rs` refusing a `PT_LOAD` outside the lower half, one
+/// `if` in one caller, against `p_vaddr` read from a file ring 3 chose. Its
+/// replacement `akuma-elf` has no such check — and neither did any other
+/// caller, so the guard belonged to the walk all along rather than to the one
+/// caller that happened to remember it. [`akuma_syscalls_mem`]'s `MAP_FIXED`
+/// half-space check and `mm.rs`'s `USER_VA_LIMIT` stay where they are: they
+/// answer ring 3 with `EINVAL`, which is a different job from refusing to
+/// write the table at all.
+///
+/// AArch64 needs no counterpart. `map_page` there indexes `(va >> 39) & 0x1FF`,
+/// which folds an upper-half VA back into the process's *own* `TTBR0` L0 —
+/// wrong, but confined to the address space that asked for it.
 #[cfg(target_arch = "x86_64")]
 fn x86_map_page_in(
     root: u64,
@@ -2879,6 +2905,9 @@ fn x86_map_page_in(
 ) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
     assert_eq!(pa % PAGE_SIZE, 0, "pa must be page aligned");
+    if va >= USER_HALF_END {
+        return false;
+    }
     let mut table = root;
     for level in (2..=4).rev() {
         // SAFETY: `table` is a live table frame reached through the physmap.

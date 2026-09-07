@@ -88,6 +88,7 @@ dependencies = [
  "akuma-config",
  "akuma-cow",
  "akuma-dmesg",
+ "akuma-elf",
  "akuma-exec",
  "akuma-exec-core",
  "akuma-ext2",
@@ -123,7 +124,6 @@ dependencies = [
  "akuma-vfs-glue",
  "akuma-virtio",
  "akuma-xhci",
- "elf",
  "spinning_top",
 ]
 

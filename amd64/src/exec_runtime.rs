@@ -261,6 +261,33 @@ fn config() -> ExecConfig {
 /// Idempotent by `Registered`, but ordering is not: `akuma_exec::register` also
 /// installs the shared console and clock hooks, so anything printed by a shared
 /// crate before this point is stamped `[T0.00]`.
+///
+/// # Why this is not `akuma_exec::init`
+///
+/// That function registers seven upward surfaces at once — the BKL yield hook,
+/// `akuma-mmu`'s scheduler gates, the PMM's surviving-mapper walk, the prefault
+/// hook, `akuma-threading`'s whole table — against subsystems this target
+/// serves from `amd64/src` and in an order `boot.rs` has not reached yet. So
+/// this registers the two tables it needs, **and each further hook explicitly
+/// when a step starts depending on it**, rather than taking all seven and
+/// finding out which ones fire.
+///
+/// `akuma-elf`'s four VFS callbacks are the first of those, added by C1
+/// step 6. They are `require()`, not `get()`, on purpose (see that crate's
+/// module header): unregistered, the first dynamically-linked binary reaches
+/// `load_interp_for` and panics with "VfsHooks not registered" rather than
+/// reading zeros. Two of the four forward `ExecRuntime` fields that are
+/// themselves category-3 stubs — `read_at` and `resolve_file_id` are the C2
+/// VFS read surface — and that is the right shape: they are reached only by
+/// `ElfSource::Path`, which this target's profile never selects, and if one
+/// ever is the panic names itself.
 pub fn init() {
-    akuma_exec::runtime::register(runtime(), config());
+    let rt = runtime();
+    akuma_exec::runtime::register(rt, config());
+    akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
+        read_file: rt.read_file,
+        read_at: rt.read_at,
+        resolve_file_id: rt.resolve_file_id,
+        exec_bkl_drop_enabled: rt.exec_bkl_drop_enabled,
+    });
 }

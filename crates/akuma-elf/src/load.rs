@@ -116,10 +116,17 @@ pub fn load_elf_from_path<A: UserPages>(
 /// binaries a kernel can run is a property of the CPU it was compiled for, not
 /// of how it happens to allocate pages, and threading it through the trait
 /// would let the two disagree.
+///
+/// `pub(super)` since 2026-09-08 because [`super::interp`] had the *original*
+/// bug this constant was written to fix: it still compared `e_machine` against
+/// a literal `EM_AARCH64`, so the moment an x86 caller reached the interpreter
+/// path — which amd64 C1 step 6 is — every dynamically-linked binary would be
+/// refused, with an error naming the interpreter rather than the mismatch.
+/// One constant, one answer, both call sites.
 #[cfg(target_arch = "aarch64")]
-const EM_NATIVE: u16 = elf::abi::EM_AARCH64;
+pub(super) const EM_NATIVE: u16 = elf::abi::EM_AARCH64;
 #[cfg(target_arch = "x86_64")]
-const EM_NATIVE: u16 = elf::abi::EM_X86_64;
+pub(super) const EM_NATIVE: u16 = elf::abi::EM_X86_64;
 
 /// The single ELF load path, shared by every entry point above.
 fn load_image<A: UserPages>(

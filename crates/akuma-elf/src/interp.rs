@@ -9,11 +9,11 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 
-use elf::abi::{EM_AARCH64, PT_LOAD};
+use elf::abi::PT_LOAD;
 
 use crate::pages::UserPages;
 
-use super::load::{apply_relocations, map_segment_eager};
+use super::load::{EM_NATIVE, apply_relocations, map_segment_eager};
 use super::source::{ElfSource, parse_headers};
 use super::types::{DEBUG_ELF_LOADING, ElfError, INTERP_BASE, InterpInfo};
 
@@ -96,7 +96,12 @@ fn load_interpreter<A: UserPages>(
 ) -> Result<InterpInfo, ElfError> {
     let headers = parse_headers(src)?;
 
-    if headers.ehdr.e_machine != EM_AARCH64 {
+    // `EM_NATIVE`, not a literal `EM_AARCH64`: this comparison is the one
+    // `load.rs` already fixed and this file did not, and it fails in the
+    // direction that is hardest to read — an x86 kernel would refuse **every**
+    // dynamically-linked binary here, after loading the program successfully,
+    // with an error naming the interpreter.
+    if headers.ehdr.e_machine != EM_NATIVE {
         return Err(ElfError::WrongArchitecture);
     }
     if headers.segments().is_empty() {

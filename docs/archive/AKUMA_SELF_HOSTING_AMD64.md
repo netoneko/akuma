@@ -465,14 +465,43 @@ as they stand one day after the survey
 > `c_stress` memory probes held at **8/10, 0 unexpected**. Host tests **1360**.
 > AArch64 `.text`/`.rodata`/`.data` all **byte-identical**.
 >
-> **Next is step 6 or 5b.** Step 6's stated blocker has expired — `loader.rs`
-> already takes `&mut UserAddressSpace` throughout, `akuma-elf`'s `EM_NATIVE` is
-> `cfg`-selected and `impl UserPages` is arch-neutral — what is left is a **VA
-> layout** decision (`PIE_BASE`/`INTERP_BASE`/`ELF_STACK_TOP` vs
-> `mm::MMAP_BASE`), which wants its own A/B. Found on the way:
-> `akuma_elf::interp` still tests `e_machine` against a hardcoded `EM_AARCH64`
-> where `load.rs` uses `EM_NATIVE`, so it will refuse every dynamic binary the
-> moment an x86 caller reaches the interpreter path.
+> **Next was step 6, and it landed the same day (2026-09-08) —**
+> `docs/archive/AKUMA_AMD64_STEP6_ONE_LOADER.md`. `amd64/src/loader.rs` no
+> longer parses or places an ELF: `akuma-elf` does the loading and this file
+> keeps only `build_stack`, which is shape **(c)** of the hand-off's three. The
+> VA-layout question resolved cleanly — `INTERP_BASE` moving `0x4000_0000` ->
+> `0x3000_0000` is free (the same hole, 3.75 GiB below `mm::MMAP_BASE`), while
+> `akuma-elf`'s `compute_stack_top` caps at `0x40_0000_0000`, *inside* `mm.rs`'s
+> mmap window, which is why the stack placement could not come along. 740 -> 502
+> lines; the `elf` 0.7 direct dependency is gone.
+>
+> `akuma_elf::interp`'s hardcoded `EM_AARCH64` is fixed (`EM_NATIVE`), and
+> amd64 now registers the crate's four VFS hooks — it never did, so the first
+> dynamically-linked binary would have panicked on `vfs()`.
+>
+> **The finding**: the x86 walk had **no upper-half guard**. `loader.rs`'s
+> per-segment `USER_VA_LIMIT` check was the only one, and `akuma-elf` has none —
+> while `UserAddressSpace::new` *aliases* the kernel's PML4 slots 256/257/511
+> into every user root and `x86_next_table` widens what it descends to
+> `P|RW|US`. One upper-half `p_vaddr` would have made a live kernel table
+> user-accessible in every address space, silently. The guard is inside
+> `x86_map_page_in` now, where every map entry point passes through it.
+>
+> Verified QEMU/TCG **514/0**, Firecracker **503/0**, OVMF/GRUB **507/0**, bare
+> metal **507/0** — every arm baseline + 6 — plus ring 3 on **both** QEMU and the
+> metal: 149 process lifetimes with `free` unchanged, and stock Alpine
+> dynamically-linked busybox running through `ld-musl` at the new `INTERP_BASE`,
+> which no boot check reaches. Memory probes **8/10, 0 unexpected**, host tests
+> **1360**, AArch64 sections byte-identical.
+>
+> **Now: 5b**, `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md` § "Order" step 3.
+>
+> **Also found, and open**: writing a large file exhausts the kernel heap and
+> halts a core — `fd.rs` holds every open file's whole contents in the heap and
+> grows the buffer by doubling, and `alloc_error_handler` calls `halt()`. This
+> is the "unexplained" signature-B bare-metal ssh lockout; both hand-offs used to
+> say it was not caused by the kernel and have been corrected.
+> `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`.
 
 Measurements as of 2026-09-07:
 

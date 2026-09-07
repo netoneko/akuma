@@ -65,11 +65,14 @@ akuma-usb = { path = "../crates/akuma-usb" }
 # `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
 # own `system_reset` (a PSCI `smc`) cannot do here.
 akuma-boot = { path = "../crates/akuma-boot", default-features = false }
-# ELF parsing for the loader (`src/loader.rs`). The same vetted crate
-# `akuma-elf` parses through, at the same version, so the tree still has one ELF
-# parser — the aarch64 loader itself is unusable here because it is written
-# against `akuma-mmu`. See that module's header.
-elf = { version = "0.7", default-features = false }
+# **C1 step 6**: the tree's one ELF loader. `src/loader.rs` used to parse and
+# place images itself — through the same vetted `elf` 0.7 crate this one uses,
+# so there was one parser and two placers. There is one of each now: this crate
+# does the loading and `loader.rs` keeps only the initial-stack half (see that
+# module's header for why the layout stayed). Already in the link graph through
+# `akuma-syscalls-glue`; named here because this crate calls it, and because
+# `exec_runtime.rs` has to register its four VFS callbacks.
+akuma-elf = { path = "../crates/akuma-elf" }
 # The virtio-blk driver, used unmodified. What this target supplies is the three
 # machine facts it cannot discover — where the transport is, how the slots are
 # spaced, and how to translate an address — via `akuma-primitives::addr`.
