@@ -666,6 +666,89 @@ pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, PteProt)) {
     }
 }
 
+/// Visit every **present 4 KiB leaf** in `[start, end)` of `root`, with its
+/// virtual address, physical frame and permissions.
+///
+/// [`for_each_user_leaf`] walks the whole lower half; this walks a range, and
+/// the difference is not cosmetic. `munmap` and `mprotect` are given a range by
+/// ring 3, and the naive shape — `for va in (start..end).step_by(4096)` with a
+/// four-level walk each time — costs a full walk per page whether or not
+/// anything is mapped. A lazy `PROT_NONE` reservation of a gigabyte is 262144
+/// pages of which zero are present, and `rustc` makes reservations that size.
+///
+/// This descends once and **skips an absent subtree whole**: a missing PML4
+/// entry advances the cursor by 512 GiB, a missing PDPT entry by 1 GiB, a
+/// missing PD entry by 2 MiB. So an empty range costs a handful of reads
+/// regardless of its length.
+///
+/// `f` may edit the leaf it is handed — both callers do, one clearing it and one
+/// rewriting its permissions. That is safe here because neither ever frees a
+/// page **table**: the tables this walk holds pointers into stay live for the
+/// whole visit.
+///
+/// A 2 MiB page (`PS` at PD level) is skipped rather than reported. This kernel
+/// never creates one for a user address space — [`map_page_in`] always builds
+/// down to a PT — and reporting one as if it were a 4 KiB leaf would hand the
+/// caller a frame 512 times the size it thinks.
+pub fn for_each_leaf_in_range(
+    root: u64,
+    start: usize,
+    end: usize,
+    mut f: impl FnMut(usize, u64, PteProt),
+) {
+    /// Bytes one entry at `level` spans: 512 GiB, 1 GiB, 2 MiB, 4 KiB.
+    const fn span(level: u32) -> usize {
+        1usize << (12 + 9 * (level - 1))
+    }
+
+    let mut va = start;
+    while va < end {
+        // SAFETY: every table is reached through the physmap; `root` is a live
+        // PML4 and each descent is guarded by the entry's present bit.
+        let step = unsafe {
+            let mut table = root;
+            let mut missing = 0u32;
+            for level in (2..=4).rev() {
+                let entry = table_mut(table).add(index(va, level)).read_volatile();
+                if entry & P == 0 || entry & PS != 0 {
+                    missing = level;
+                    break;
+                }
+                table = entry & ADDR_MASK;
+            }
+            if missing != 0 {
+                // Nothing present under this entry: jump to the next one at the
+                // level that was missing, so an empty gigabyte costs one read.
+                let s = span(missing);
+                s - (va & (s - 1))
+            } else {
+                let leaf = table_mut(table).add(index(va, 1));
+                let entry = leaf.read_volatile();
+                if entry & P != 0 {
+                    f(
+                        va,
+                        entry & ADDR_MASK,
+                        PteProt {
+                            write: entry & RW != 0,
+                            exec: entry & NX == 0,
+                            user: entry & US != 0,
+                            cow: entry & COW != 0,
+                        },
+                    );
+                }
+                PAGE_SIZE
+            }
+        };
+        // `checked_add` rather than `+`: a range ending at the top of the
+        // address space would otherwise wrap the cursor back to 0 and loop
+        // forever, and `end` comes from ring 3.
+        match va.checked_add(step) {
+            Some(next) => va = next,
+            None => break,
+        }
+    }
+}
+
 /// Map a frame outside the identity map, write through it, read it back, unmap.
 ///
 /// Chosen VA is 1 GiB — the first address `boot.s` does *not* map, so the whole

@@ -267,6 +267,10 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::redirect_test(t);
     lapic::stop_timer();
 
+    // Deliberately here and not beside `mm::smoke_test`: this is the one check
+    // that needs real programs to have run first. See its own doc.
+    mm::demand_paging_report(t);
+
     if net::netpoll_drain_selftest(t, cx.have_net) {
         if cx.have_net {
             lapic::start_timer();

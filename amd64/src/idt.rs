@@ -133,6 +133,18 @@ static DEMAND_FAULTS: AtomicUsize = AtomicUsize::new(0);
 /// Page faults redirected to the user-copy fixup, for the smoke test.
 static COPY_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Not-present faults serviced from a **user** `mmap` region — demand paging
+/// proper, as opposed to [`DEMAND_FAULTS`]'s armed kernel test window.
+///
+/// A separate counter, not a shared one, for two reasons. The armed-window test
+/// asserts an *exact* equality (`demand_before + 1`), so a user fault landing on
+/// the same counter would break a check that has nothing to do with it. And this
+/// one is the evidence that the lazy path is live at all: it is asserted
+/// non-zero after the boot suite has run real programs
+/// (`mm::demand_paging_report`), which is what stops "lazy mmap" quietly
+/// regressing to "every mapping happened to be small".
+pub static USER_DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
+
 /// Base of the lazily-backed test region, or 0 if none is armed.
 static LAZY_BASE: AtomicU64 = AtomicU64::new(0);
 /// Length in bytes of the lazily-backed region.
@@ -405,6 +417,27 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
             }
             akuma_pmm::free_page(frame_pa, 0);
         }
+    }
+
+    // Demand paging for ring 3, from the per-address-space region table
+    // (`mm::fault_in`). A not-present fault inside a mapping this process has
+    // been given gets a zeroed frame at the region's own protection; anything
+    // outside every region falls through, which is what keeps a wild pointer a
+    // fault rather than a free page.
+    //
+    // Not gated on `is_user_mode`, deliberately. A `copy_to_user` into a lazily
+    // mapped buffer faults from **ring 0**, and requiring ring 3 here would send
+    // it to the fixup arm below and turn a `read(2)` into an unexplained
+    // `EFAULT`. `fault_in` resolves the address against the current process's
+    // regions, all of which are user addresses, so a genuine kernel fault still
+    // finds nothing and falls through.
+    //
+    // Placed after the armed test window (which is a kernel mapping and must not
+    // be confused with a user region) and before the CoW arm: a page has to be
+    // *populated* before anyone can ask whether it is shared.
+    if code.not_present() && crate::mm::fault_in(addr) {
+        USER_DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+        return;
     }
 
     // Copy-on-write. A write to a **present** page, from either ring.

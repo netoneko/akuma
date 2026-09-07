@@ -1084,13 +1084,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             }
             return 2;
         }
-        // `mprotect` — W^X is enforced at map time and there is no region table
-        // to re-permission against, so this accepts and does nothing. A caller
-        // asking for *more* access than it has still sees the original (never
-        // less permissive) mapping; one asking for less is not honoured. Real
-        // `mprotect` for spawned processes needs the per-space region table the
-        // loader also wants (§3.18.8 / §3.24.5).
-        10 => return 0,
+        // `mprotect` — real since the region table landed (2026-09-07). It
+        // splits the regions the range crosses and re-permissions the pages
+        // that are present; see `mm::sys_mprotect` for why it was `return 0`
+        // for so long and what that cost.
+        10 => return crate::mm::sys_mprotect(a1, a2, a3),
         // `flock(fd, op)` — x86_64 73. One user, one process at a time on
         // this target (no fork-based package-manager concurrency exists to
         // race against), so there is nothing an advisory lock could actually
@@ -2147,6 +2145,66 @@ impl Process {
             akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions)
         };
         Some(Self { space, frames, entry, stack, forked: true, regions: Spinlock::new(regions) })
+    }
+}
+
+/// Run `f` with the running process's `mmap` region list, under its lock.
+///
+/// `None` when the caller is not a slotted user task — a kernel thread, or the
+/// boot self-tests before any process exists. Every caller must handle that
+/// rather than defaulting to an empty list: "no process" and "a process with no
+/// regions" are different answers and only the second one may be served.
+///
+/// # The lock is held for the whole closure
+///
+/// So do nothing inside it that can fault or take the PMM. `sys_mmap` reserves
+/// its VA range here and then populates it *outside*, which is what makes a
+/// concurrent `mmap` on another core impossible to collide with while keeping
+/// the allocator out of the hold.
+pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Option<R> {
+    let slot = current_proc_slot();
+    // SAFETY: raw-pointer read of `PROCS`, the same discipline `cow_swap_frame`
+    // documents — this is the running task's own slot, and a process cannot be
+    // torn down underneath its own syscall or fault handler.
+    unsafe {
+        let procs = &raw const PROCS;
+        let p = (*procs).get(slot).and_then(Option::as_ref)?;
+        let _irq = akuma_primitives::irq::IrqGuard::new();
+        Some(f(&mut p.regions.lock()))
+    }
+}
+
+/// Record `pa` as one more user frame of the running process.
+///
+/// The obligation `mmap` and the demand-paging fault take on: a frame the
+/// ledger does not know about is a frame `Process::free` will not release.
+pub fn track_anon_frame(pa: usize) {
+    let slot = current_proc_slot();
+    // SAFETY: as `with_current_regions`.
+    unsafe {
+        let procs = &raw const PROCS;
+        if let Some(p) = (*procs).get(slot).and_then(Option::as_ref) {
+            p.frames.track_user_frame(PhysFrame::new(pa));
+        }
+    }
+}
+
+/// Drop the running process's claim on `pa`, and say whether the caller now owns
+/// the **global** release (the `cow_ref_dec` + `free_page` pair).
+///
+/// `false` for a frame this process's ledger does not track — a page mapped by
+/// the loader outside any region, say. Not this address space's obligation to
+/// release early, and `Process::free` will hand it back at exit; freeing it here
+/// would be a double free against that.
+pub fn untrack_anon_frame(pa: usize) -> bool {
+    let slot = current_proc_slot();
+    // SAFETY: as `with_current_regions`.
+    unsafe {
+        let procs = &raw const PROCS;
+        (*procs)
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_some_and(|p| p.frames.remove_user_frame(PhysFrame::new(pa)))
     }
 }
 
