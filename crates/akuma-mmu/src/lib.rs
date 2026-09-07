@@ -2679,6 +2679,17 @@ pub enum LeafAction {
     /// Rewrite the entry in place with new permissions and CoW marker, keeping
     /// the same frame. One store, no re-walk.
     Reprotect(PteProt, bool),
+    /// Point the entry at a **different** frame, with the given permissions and
+    /// CoW marker. One store, no re-walk, and no page-table allocation — the
+    /// leaf slot already exists, which is the whole reason this is an action
+    /// rather than a `map_page_pte` call the caller makes afterwards.
+    ///
+    /// The frame that was there is **not** freed and its refcount is not
+    /// touched, exactly as for [`Unmap`](Self::Unmap): the caller was handed the
+    /// old `pa` and owns that decision. `MADV_DONTNEED` over a CoW-shared page
+    /// is the reason this exists — the page must become a private zero frame
+    /// without disturbing whoever else maps the old one.
+    Remap(usize, PteProt, bool),
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -2687,6 +2698,42 @@ impl PteProt {
     pub const USER_RW: Self = Self { write: true, exec: false, user: true };
     /// User read + execute, not writable.
     pub const USER_RX: Self = Self { write: false, exec: true, user: true };
+    /// Kernel read/write, no execute. The default for the kernel's own data.
+    ///
+    /// The two `KERNEL_*` constants are here rather than only in
+    /// `amd64/src/paging.rs` because that file's `PteProt` **is** this one since
+    /// amd64 step 5a: the target had two structurally identical permission
+    /// types with two encoders, pinned against each other by
+    /// [`x86_prot_matches_amd64_encoding`], and one of the two is gone. Nothing
+    /// in this crate maps a kernel page — `paging.rs` still owns the kernel's
+    /// own tables — but the *vocabulary* has to cover what that walker says, or
+    /// the pin comes back.
+    pub const KERNEL_RW: Self = Self { write: true, exec: false, user: false };
+    /// Kernel read + execute, not writable. The only executable kernel shape
+    /// offered: there is deliberately no writable-and-executable constructor,
+    /// on either architecture.
+    pub const KERNEL_RX: Self = Self { write: false, exec: true, user: false };
+}
+
+/// Encode a permission triple, a cacheability and the copy-on-write marker into
+/// x86_64 PTE bits — **the** encoder for this architecture.
+///
+/// `pub` since amd64 step 5a, and that is the point of it. `amd64/src/paging.rs`
+/// carried a byte-for-byte second copy of this function beside a second
+/// `PteProt`, and the two were held together by a boot self-test comparing them
+/// arm by arm. The kernel's own mappings still go through that file's walker —
+/// this crate does not do kernel mappings on either architecture — but they now
+/// encode here, so there is one answer to "what bits does this protection mean"
+/// and the self-test pins one implementation instead of an agreement between
+/// two.
+///
+/// `cow` is a separate argument rather than a field of [`PteProt`] because it is
+/// not a permission: it is a software marker the hardware ignores, and the
+/// kernel-mapping callers never set it. See [`X86_COW`].
+#[cfg(any(target_arch = "x86_64", test))]
+#[must_use]
+pub const fn encode_pte(prot: PteProt, attr: MemAttr, cow: bool) -> u64 {
+    x86_encode(prot, attr) | if cow { X86_COW } else { 0 }
 }
 
 /// How an x86_64 mapping is cached — the other half of `encode(prot, attr)`.
@@ -2817,6 +2864,7 @@ fn x86_map_page_in(
     pa: usize,
     prot: PteProt,
     attr: MemAttr,
+    cow: bool,
     ledger: &FrameLedger,
 ) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
@@ -2841,7 +2889,7 @@ fn x86_map_page_in(
     unsafe {
         x86_table_mut(table)
             .add(x86_index(va, 1))
-            .write_volatile(pa as u64 | x86_encode(prot, attr));
+            .write_volatile(pa as u64 | x86_encode(prot, attr) | if cow { X86_COW } else { 0 });
     }
     akuma_cpu::tlb::invlpg(va);
     true
@@ -3087,9 +3135,10 @@ const fn x86_entry_span(level: u32) -> usize {
 #[cfg(target_arch = "x86_64")]
 fn x86_walk_leaves(
     root: u64,
+    ledger: &FrameLedger,
     start: usize,
     end: usize,
-    mut f: impl FnMut(Leaf) -> LeafAction,
+    mut f: impl FnMut(&FrameLedger, Leaf) -> LeafAction,
 ) -> usize {
     let mut va = start & !(PAGE_SIZE - 1);
     let mut seen = 0usize;
@@ -3127,7 +3176,7 @@ fn x86_walk_leaves(
                         },
                         cow: entry & X86_COW != 0,
                     };
-                    match f(leaf) {
+                    match f(ledger, leaf) {
                         LeafAction::Keep => {}
                         LeafAction::Unmap => {
                             slot.write_volatile(0);
@@ -3135,6 +3184,13 @@ fn x86_walk_leaves(
                         }
                         LeafAction::Reprotect(prot, cow) => {
                             let rewritten = (entry & X86_ADDR_MASK)
+                                | x86_encode(prot, MemAttr::WriteBack)
+                                | if cow { X86_COW } else { 0 };
+                            slot.write_volatile(rewritten);
+                            akuma_cpu::tlb::invlpg(va);
+                        }
+                        LeafAction::Remap(pa, prot, cow) => {
+                            let rewritten = (pa as u64 & X86_ADDR_MASK)
                                 | x86_encode(prot, MemAttr::WriteBack)
                                 | if cow { X86_COW } else { 0 };
                             slot.write_volatile(rewritten);
@@ -3207,6 +3263,12 @@ impl UserAddressSpace {
                 root_ptr.add(slot).write_volatile(e);
             }
         }
+        // This frame is an L0 again, so it is no longer a recently-freed one.
+        // The AArch64 `new` does the same at the same point, and the reason is
+        // the same: `l0_recently_freed` is a tripwire against installing a torn-
+        // down table, and a frame the PMM has re-issued *as an L0* is a live
+        // table, not a stale reference.
+        unnote_freed_l0(root as u64 & L0_BASE_MASK);
         Some(Self { root, ledger: FrameLedger::new(false) })
     }
 
@@ -3293,7 +3355,7 @@ impl UserAddressSpace {
             return Err("Addresses must be page-aligned");
         }
         let prot = PteProt::from_region(user_flags::from_pte(user_flags));
-        if x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack, &self.ledger) {
+        if x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack, false, &self.ledger) {
             Ok(())
         } else {
             Err("x86_64 UserAddressSpace::map_page: page-table frame allocation failed")
@@ -3318,6 +3380,84 @@ impl UserAddressSpace {
     pub fn map_and_track(&mut self, va: usize, frame: PhysFrame, user_flags: u64) -> Result<(), &'static str> {
         self.ledger.track_user_frame(frame);
         self.map_page(va, frame.addr, user_flags)
+    }
+
+    // ── the PTE-level entry points ─────────────────────────────────────────
+    //
+    // `map_page` above takes an **AArch64** flag word because that is what the
+    // shared callers in `akuma-exec`/`akuma-elf` hold, and it decodes down to a
+    // neutral `Prot`. Two things are lost on the way and both matter here:
+    //
+    // * The CoW marker. `akuma_mmap::Prot` is a region's protection and has no
+    //   business carrying a page-table software bit (`PteProt::from_region`'s
+    //   own header says so), so nothing that goes through `user_flags` can set
+    //   [`X86_COW`] — and `fork`, `mprotect` over a shared frame and `mremap`
+    //   all have to.
+    // * `RO`/`RX` collapse. `Prot` round-trips through six tags; a caller that
+    //   already knows the exact triple it wants should not have to find a tag
+    //   that decodes back to it.
+    //
+    // So this pair takes the x86 triple and the marker directly. Both are
+    // x86-only for the same reason the range walks are: the AArch64 side has no
+    // marker to pass and no caller that wants one.
+
+    /// Map `va` to `pa` with an explicit x86 permission triple and CoW marker.
+    ///
+    /// `false` means a page-table frame could not be allocated and **nothing was
+    /// mapped**. The frame at `pa` is not tracked — see
+    /// [`map_and_track_pte`](Self::map_and_track_pte) for the tracking form;
+    /// this one is for re-pointing a frame the ledger already counts
+    /// (`mremap`) or re-permissioning one (`mprotect`, the CoW break).
+    #[must_use = "`false` means the PTE was NOT installed"]
+    pub fn map_page_pte(&mut self, va: usize, pa: usize, prot: PteProt, cow: bool) -> bool {
+        x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack, cow, &self.ledger)
+    }
+
+    /// [`map_page_pte`](Self::map_page_pte) plus a ledger entry for the frame.
+    ///
+    /// Tracked **before** the map, as `map_range` in the amd64 loader learned to
+    /// do: a frame the ledger does not know about is a frame teardown will not
+    /// release, and the map is the half that can fail.
+    #[must_use = "`false` means the PTE was NOT installed"]
+    pub fn map_and_track_pte(
+        &mut self,
+        va: usize,
+        frame: PhysFrame,
+        prot: PteProt,
+        cow: bool,
+    ) -> bool {
+        self.ledger.track_user_frame(frame);
+        if self.map_page_pte(va, frame.addr, prot, cow) {
+            return true;
+        }
+        // Untrack what was never mapped, so the failure leaves the ledger where
+        // it started. The caller owns the frame either way — it allocated it —
+        // and a ledger entry for a page nothing maps is a frame this address
+        // space would free out from under whoever the PMM hands it to next.
+        let _ = self.ledger.remove_user_frame(frame);
+        false
+    }
+
+    /// Decode the leaf that maps `va`: its permission triple and CoW marker.
+    ///
+    /// The inverse of [`map_page_pte`](Self::map_page_pte), and the x86
+    /// counterpart of `read_l3_page_entry` for a caller that wants the meaning
+    /// rather than the bits. `None` when nothing maps `va` at a 4 KiB leaf.
+    ///
+    /// Reports what the **hardware** would do, walking rather than consulting a
+    /// shadow record — which is the only useful answer when the question is
+    /// "may this write proceed" (`akuma-cow`) or "what does this page already
+    /// grant" (the ELF loader's two-segments-in-one-page case).
+    pub fn pte_prot(&self, va: usize) -> Option<(PteProt, bool)> {
+        let entry = self.read_l3_page_entry(va)?;
+        Some((
+            PteProt {
+                write: entry & X86_RW != 0,
+                exec: entry & X86_NX == 0,
+                user: entry & X86_US != 0,
+            },
+            entry & X86_COW != 0,
+        ))
     }
 
     /// Map `va` in the **currently installed** address space and track both the
@@ -3386,7 +3526,7 @@ impl UserAddressSpace {
         // what clause 4 of the AArch64 contract asks for.
         let prot = PteProt::from_region(user_flags::from_pte(user_flags_val));
         let mapped = x86_map_page_in(
-            self.root as u64, va, frame.addr, prot, MemAttr::WriteBack, &self.ledger,
+            self.root as u64, va, frame.addr, prot, MemAttr::WriteBack, false, &self.ledger,
         );
         if mapped {
             self.ledger.track_user_frame(frame);
@@ -3689,7 +3829,7 @@ impl UserAddressSpace {
     /// builds down to a PT — and reporting one as a 4 KiB leaf would hand the
     /// caller a frame 512 times the size it thinks.
     pub fn for_each_leaf_in_range(&self, start: usize, end: usize, mut f: impl FnMut(Leaf)) {
-        x86_walk_leaves(self.root as u64, start, end, |leaf| {
+        x86_walk_leaves(self.root as u64, &self.ledger, start, end, |_ledger, leaf| {
             f(leaf);
             LeafAction::Keep
         });
@@ -3725,13 +3865,25 @@ impl UserAddressSpace {
     /// frame or touch its refcount, because the caller was handed the `pa` and
     /// that decision is the PMM's. `Reprotect` rewrites permissions and the CoW
     /// marker onto the same frame.
+    /// `f` is handed this address space's own [`FrameLedger`] alongside each
+    /// leaf, and that is not a convenience.
+    ///
+    /// Every real caller of the mutating walk has to touch the ledger in the
+    /// same step: `munmap` drops one VA's claim on each frame it clears,
+    /// `MADV_DONTNEED`'s break-sharing arm swaps one frame for another. Without
+    /// a handle here the caller would have to collect the leaves into a
+    /// residency-sized `Vec` and make a second pass — the exact allocation this
+    /// walk was written to avoid, on the one syscall that runs when memory is
+    /// short. `&mut self` cannot be re-borrowed inside the closure, so the
+    /// ledger is passed rather than reachable, which also states the boundary:
+    /// the closure may edit the **ledger** and its own leaf, and nothing else.
     pub fn rewrite_leaves_in_range(
         &mut self,
         start: usize,
         end: usize,
-        f: impl FnMut(Leaf) -> LeafAction,
+        f: impl FnMut(&FrameLedger, Leaf) -> LeafAction,
     ) -> usize {
-        x86_walk_leaves(self.root as u64, start, end, f)
+        x86_walk_leaves(self.root as u64, &self.ledger, start, end, f)
     }
 
 
@@ -3770,13 +3922,62 @@ impl UserAddressSpace {
     }
 }
 
-// Deliberately no `Drop` impl, matching `amd64::paging::AddressSpace`'s own
-// choice and its stated reason: freeing an address space that is still
-// installed in `CR3` unmaps the code doing the freeing. Dropping a
-// `UserAddressSpace` on this target leaks its page-table frames rather than
-// risk that — asking for the free explicitly is `amd64::paging::AddressSpace
-// ::free`'s job, not replicated here since nothing in this pass's scope
-// tears one down.
+/// Release this address space's frames — page tables, the L0, and every user
+/// frame the ledger still holds.
+///
+/// # This type had no `Drop` until amd64 step 5a, and the reason it now can
+///
+/// The comment that stood here said freeing an address space still installed in
+/// `CR3` unmaps the code doing the freeing, so the free had to be *asked for*
+/// (`amd64::paging::AddressSpace::free`). That danger has not gone away; what
+/// changed is that the gate against it is fed on this target. `paging::activate`
+/// brackets its `mov cr3` with [`publish_l0_begin`]/[`publish_l0_end`], so
+/// [`any_core_on_l0`] answers truthfully rather than "no core holds this" for
+/// every table — and [`free_or_defer_as_frames`], the one exit both
+/// architectures release page-table frames through, parks the frames instead of
+/// freeing them whenever that gate or the saved-context gate says the table is
+/// still referenced. Adding a destructor before those gates were live would have
+/// been strictly worse than the explicit `free()` it replaces.
+///
+/// # Three divergences from the AArch64 twin, all of things this target lacks
+///
+/// * **No ASID.** [`Self::asid`] is a pinned `0` here, so there is no
+///   `flush_tlb_asid` and no allocator to return a tag to. Every `CR3` write is
+///   a full non-global TLB flush, which is the invalidation.
+/// * **No `SHARED_L0_TABLE` arbitration.** [`Self::new_shared`] registers
+///   nothing (its own header says why), so a shared view frees nothing at all
+///   here rather than decrementing a refcount and possibly inheriting the
+///   owner's deferred frames. That is correct for what this target builds — the
+///   only `new_shared` callers are `uas.rs`'s boot checks — and it is
+///   **load-bearing to keep it that way**: the day `clone(CLONE_VM)` gives a
+///   thread its own shared `UserAddressSpace`, an owner dropping first would
+///   free page tables a live view is still walking, and the registry has to come
+///   with it.
+/// * **No lifecycle instrumentation.** `instr::as_drop_enter`/`as_drop_exit`
+///   bracket the AArch64 body; they are `leak-instr`-only accounting for a
+///   heap leak this target has never had, and pairing them correctly across two
+///   architectures is work with no reader today.
+#[cfg(target_arch = "x86_64")]
+impl Drop for UserAddressSpace {
+    fn drop(&mut self) {
+        if self.ledger.is_shared() {
+            // A borrowed view of somebody else's L0. It allocated no page table
+            // and owns no frame; the owner's drop releases both. Emptying the
+            // ledger is not needed — the maps die with the struct — but taking
+            // them keeps "what a shared ledger holds at teardown" answerable in
+            // one place if this ever grows a registry.
+            return;
+        }
+        // Opportunistic retry of earlier deferred frees, exactly as the AArch64
+        // drop does: address spaces die constantly under load, so this keeps the
+        // parked list near-empty without needing a dedicated collector.
+        drain_pending_ttbr_frees();
+        let l0_frame = PhysFrame::new(self.root);
+        let user_frames = self.ledger.take_user_frames();
+        let pt_frames = self.ledger.take_page_table_frames();
+        free_or_defer_as_frames(self.root, 0, l0_frame, user_frames, pt_frames, "owner");
+    }
+}
 
 /// Populate an L3 page table from a 2MB block descriptor, preserving the
 /// block's identity mapping as 512 individual 4KB page entries.

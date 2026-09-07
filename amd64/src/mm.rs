@@ -81,10 +81,11 @@
 //! second frame list inside the region would be a second answer to the same
 //! question, and the two would drift the first time a CoW break swapped a frame.
 
-use crate::paging::{self, MemAttr, PteProt};
+use akuma_mmu::{LeafAction, PteProt};
+
 use crate::phys::phys_ptr;
 use crate::usermode;
-use akuma_mmap::{MmapRegion, Prot};
+use akuma_mmap::{MmapRegion, PhysFrame, Prot};
 use akuma_selftest::Suite;
 use alloc::vec::Vec;
 
@@ -209,12 +210,12 @@ fn have_address_space() -> bool {
 /// processes a writable mapping of one frame and their memory would silently
 /// diverge — the exact failure copy-on-write exists to prevent, reintroduced
 /// through the one syscall that is allowed to *raise* a permission.
-fn pte_prot_for(prot: Prot, pa: usize) -> PteProt {
+fn pte_prot_for(prot: Prot, pa: usize) -> (PteProt, bool) {
     let p = PteProt::from_region(prot);
     if p.write && akuma_pmm::cow_ref_get(pa) > 0 {
-        p.cow()
+        (PteProt { write: false, ..p }, true)
     } else {
-        p
+        (p, false)
     }
 }
 
@@ -301,7 +302,6 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
 
     let fixed = flags32 & akuma_syscalls_linux::flags::map::MAP_FIXED != 0;
     let byte_len = pages * PAGE_SIZE as usize;
-    let root = paging::active_root();
 
     let base = if fixed {
         let want = addr as usize;
@@ -313,7 +313,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         // `MAP_FIXED` **replaces**: whatever is there goes away first, mappings
         // and region records alike. Doing this before reserving is what keeps
         // the new region from being clipped by the teardown of the old one.
-        unmap_range(root, want, want + byte_len);
+        unmap_range(want, want + byte_len);
         want
     } else {
         // Without `MAP_FIXED` an address is a hint, and hints are advisory.
@@ -362,15 +362,15 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         let va = base + i * PAGE_SIZE as usize;
         let filled = match file_source {
             Some((fd, off)) => {
-                populate_file_page(root, va, region_prot, fd, off + i * PAGE_SIZE as usize)
+                populate_file_page(va, region_prot, fd, off + i * PAGE_SIZE as usize)
             }
-            None => populate_page(root, va, region_prot),
+            None => populate_page(va, region_prot),
         };
         if !filled {
             // Out of memory partway through. Unlike the pre-region version,
             // which leaked the pages it had already mapped because it had no
             // record of them, this can undo exactly what it did.
-            unmap_range(root, base, base + byte_len);
+            unmap_range(base, base + byte_len);
             return errno::ENOMEM;
         }
     }
@@ -383,7 +383,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
 /// which is why the ledger update is here and not at the three call sites.
 /// A frame the ledger does not know about is a frame `Process::free` will not
 /// release — the leak that made every post-`fork` `mmap` permanent.
-fn populate_page(root: u64, va: usize, prot: Prot) -> bool {
+fn populate_page(va: usize, prot: Prot) -> bool {
     let Some(frame) = akuma_pmm::alloc_page() else {
         return false;
     };
@@ -394,11 +394,20 @@ fn populate_page(root: u64, va: usize, prot: Prot) -> bool {
     // A brand-new frame is unshared, so `pte_prot_for`'s CoW rule cannot fire;
     // it is used anyway so there is one answer to "what bits does this region
     // get" rather than two that could drift.
-    if !paging::map_page_in(root, va, frame as u64, pte_prot_for(prot, frame), MemAttr::WriteBack) {
+    let (pte, cow) = pte_prot_for(prot, frame);
+    // The allocation and the zeroing are outside the address-space hold; only
+    // the PTE edit and the ledger entry are inside it. `map_and_track_pte`
+    // records the frame before it maps and untracks it if the map fails, which
+    // is the `track_anon_frame` this used to do afterwards — and getting the
+    // order that way round is what stops a failed map leaving the ledger
+    // claiming a page nothing points at.
+    if usermode::with_current_address_space(|uas| {
+        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
+    }) != Some(true)
+    {
         akuma_pmm::free_page(frame, 0);
         return false;
     }
-    usermode::track_anon_frame(frame);
     true
 }
 
@@ -433,7 +442,7 @@ fn populate_page(root: u64, va: usize, prot: Prot) -> bool {
 /// `MAP_PRIVATE` cannot be seen by anyone — which is what `MAP_PRIVATE` means,
 /// so it is correct and merely expensive. `MAP_SHARED` writable is refused in
 /// `sys_mmap` precisely because *that* one needs the sharing to be real.
-fn populate_file_page(root: u64, va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
+fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
     let Some(frame) = akuma_pmm::alloc_page() else {
         return false;
     };
@@ -449,11 +458,17 @@ fn populate_file_page(root: u64, va: usize, prot: Prot, fd: u64, offset: usize) 
         akuma_pmm::free_page(frame, 0);
         return false;
     }
-    if !paging::map_page_in(root, va, frame as u64, pte_prot_for(prot, frame), MemAttr::WriteBack) {
+    let (pte, cow) = pte_prot_for(prot, frame);
+    // The file read is deliberately **outside** the address-space hold: it takes
+    // the descriptor table, and taking that lock underneath this one would be
+    // the only place in this module where the two are ordered that way.
+    if usermode::with_current_address_space(|uas| {
+        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
+    }) != Some(true)
+    {
         akuma_pmm::free_page(frame, 0);
         return false;
     }
-    usermode::track_anon_frame(frame);
     true
 }
 
@@ -483,7 +498,6 @@ fn populate_file_page(root: u64, va: usize, prot: Prot, fd: u64, offset: usize) 
 /// rather than refuses anyway, which is the direction that trap says to fail in.
 pub fn fault_in(addr: u64) -> bool {
     let page = (addr as usize) & !0xfff;
-    let root = paging::active_root();
     usermode::with_current_regions(|regions| {
         let Some(region) = regions.iter().find(|r| r.contains(page)) else {
             return false;
@@ -492,7 +506,7 @@ pub fn fault_in(addr: u64) -> bool {
         if prot.is_none() {
             return false; // a reservation, or a guard page: a real fault
         }
-        populate_page(root, page, prot)
+        populate_page(page, prot)
     })
     .unwrap_or(false)
 }
@@ -509,14 +523,16 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     let Some(end) = start.checked_add(byte_len).filter(|e| *e <= USER_VA_LIMIT) else {
         return errno::EINVAL;
     };
-    // Without a process there is no region list and no user address space —
-    // `paging::active_root()` would be the *kernel's* CR3, and walking a user
-    // range in it is at best a no-op and at worst an unmap of something the
-    // kernel put there.
+    // Without a process there is no region list and no user address space. This
+    // check is now belt-and-braces — [`unmap_range`] resolves the address space
+    // through `with_current_address_space`, which answers `None` rather than
+    // handing back the kernel's own `CR3` the way `paging::active_root()` did —
+    // but it is kept because the **errno** is the point: a caller with no
+    // process must see `ESRCH`, not the `0` a silently-skipped unmap would give.
     if !have_address_space() {
         return errno::ESRCH;
     }
-    unmap_range(paging::active_root(), start, end);
+    unmap_range(start, end);
     0
 }
 
@@ -537,26 +553,36 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
 /// last address space. A frame the ledger does not track is left alone —
 /// `Process::free` will release it — because freeing it here would be a double
 /// free against that.
-fn unmap_range(root: u64, start: usize, end: usize) {
+fn unmap_range(start: usize, end: usize) {
     if end <= start {
         return;
     }
-    // Records first, under the lock; the page walk below takes the PMM.
+    // Records first, under the region lock, which is released before the page
+    // walk below takes the address-space lock and the PMM. Lock order is
+    // regions -> address space everywhere in this module.
     let _ = usermode::with_current_regions(|regions| {
         let _pieces: Vec<_> = akuma_mmap::detach_eager_regions_in_range(regions, start, end);
     });
 
-    paging::for_each_leaf_in_range(root, start, end, |va, _pa, _prot| {
-        // Re-read through `unmap_page_in` rather than trusting the `pa` the walk
-        // reported: it is the call that clears the entry and issues the
-        // `invlpg`, and one source of truth for "what was there" is worth the
-        // second walk of four reads.
-        if let Some(frame) = paging::unmap_page_in(root, va) {
-            let frame = frame as usize;
-            if usermode::untrack_anon_frame(frame) && akuma_pmm::cow_ref_dec(frame) {
-                akuma_pmm::free_page(frame, 0);
+    // One descent, clearing each leaf and dropping this address space's claim on
+    // its frame in the same step. The ledger is reached through the walk's own
+    // parameter rather than `usermode::untrack_anon_frame`, which would take
+    // this very lock again and deadlock — and rather than a `Vec` of leaves,
+    // which would allocate proportionally to residency on the one syscall that
+    // runs when memory is short.
+    let _ = usermode::with_current_address_space(|uas| {
+        uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
+            // Ledger first, then the global share count, then the free. A frame
+            // this address space does not track is left alone — teardown will
+            // release it — because freeing it here would be a double free
+            // against that.
+            if ledger.remove_user_frame(PhysFrame::new(leaf.pa))
+                && akuma_pmm::cow_ref_dec(leaf.pa)
+            {
+                akuma_pmm::free_page(leaf.pa, 0);
             }
-        }
+            LeafAction::Unmap
+        });
     });
 }
 
@@ -609,16 +635,17 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     // Then the pages that are already present. A lazy page has no PTE to change
     // and does not need one — `fault_in` reads the region, which now says the
     // new thing.
-    let root = paging::active_root();
-    paging::for_each_leaf_in_range(root, start, end, |va, pa, old| {
-        // Kernel pages are not ring 3's to re-permission. Nothing should map one
-        // in a user range, and quietly rewriting it if something did is the
-        // dangerous half of the two mistakes.
-        if !old.user {
-            return;
-        }
-        let want = pte_prot_for(new_prot, pa as usize);
-        let _ = paging::map_page_in(root, va, pa, want, MemAttr::WriteBack);
+    let _ = usermode::with_current_address_space(|uas| {
+        uas.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
+            // Kernel pages are not ring 3's to re-permission. Nothing should map
+            // one in a user range, and quietly rewriting it if something did is
+            // the dangerous half of the two mistakes.
+            if !leaf.prot.user {
+                return LeafAction::Keep;
+            }
+            let (want, cow) = pte_prot_for(new_prot, leaf.pa);
+            LeafAction::Reprotect(want, cow)
+        });
     });
     0
 }
@@ -702,19 +729,18 @@ pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u6
         // (`EFAULT`) is both Linux's answer and more informative than `ESRCH`.
         // The AArch64 kernel arrives at the same answer by the same route — its
         // process lookup may yield `None` and `is_mapped` is then false.
-        let is_mapped = have_address_space()
-            && (paging::translate_in(paging::active_root(), old_addr).is_some()
-                || usermode::with_current_regions(|regions| {
-                    regions.iter().any(|r| r.contains(old_addr))
-                })
-                .unwrap_or(false));
+        let is_mapped = usermode::with_current_address_space(|uas| uas.is_mapped(old_addr))
+            .unwrap_or(false)
+            || usermode::with_current_regions(|regions| {
+                regions.iter().any(|r| r.contains(old_addr))
+            })
+            .unwrap_or(false);
         return no_move_errno(is_mapped);
     }
 
     if !have_address_space() {
         return errno::ESRCH;
     }
-    let root = paging::active_root();
 
     let old_pages = old_size.div_ceil(PAGE_SIZE as usize);
 
@@ -742,38 +768,47 @@ pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u6
         return errno::ENOMEM;
     };
 
-    // Re-point each present page. `for_each_leaf_in_range` skips an absent
-    // subtree whole, so a sparsely-touched 4 MiB source costs a walk of what is
-    // there rather than 1024 four-level lookups — and it reports the PTE bits,
-    // which are carried across unchanged so a CoW-marked page stays CoW-marked.
-    let mut moves: Vec<(usize, u64, PteProt)> = Vec::new();
-    paging::for_each_leaf_in_range(root, old_addr, old_addr + old_pages * PAGE_SIZE as usize,
-        |va, pa, prot| {
-            if prot.user {
-                moves.push((va, pa, prot));
+    // Re-point each present page. The range walk skips an absent subtree whole,
+    // so a sparsely-touched 4 MiB source costs a walk of what is there rather
+    // than 1024 four-level lookups — and it reports the PTE bits, which are
+    // carried across unchanged so a CoW-marked page stays CoW-marked.
+    //
+    // Clearing the source is the walk's own `Unmap` and the destination is
+    // mapped in a second pass over what it collected. That ordering is
+    // load-bearing: the frame is the same one, so mapping the destination first
+    // would leave it briefly at two VAs — which the ledger, whose count this
+    // call deliberately does not touch, would then be one short of. It is also
+    // why the collection cannot be avoided here the way `unmap_range` avoids
+    // it: the walk holds `&mut` on the address space, so the new mapping cannot
+    // be installed from inside it. The `Vec` is sized by the source's
+    // *residency*, and `mremap` is not the syscall that runs out of memory.
+    let mut moves: Vec<(usize, usize, PteProt, bool)> = Vec::new();
+    let old_end = old_addr + old_pages * PAGE_SIZE as usize;
+    let _ = usermode::with_current_address_space(|uas| {
+        uas.rewrite_leaves_in_range(old_addr, old_end, |_ledger, leaf| {
+            if !leaf.prot.user {
+                return LeafAction::Keep;
             }
+            moves.push((leaf.va, leaf.pa, leaf.prot, leaf.cow));
+            LeafAction::Unmap
         });
-    for (va, pa, prot) in moves {
-        let offset = va - old_addr;
-        // `unmap` first, then `map`: the frame is the same, so mapping the
-        // destination before clearing the source would leave it briefly at two
-        // VAs — which the ledger, whose count this call deliberately does not
-        // touch, would then be one short of.
-        paging::unmap_page_in(root, va);
-        if !paging::map_page_in(root, base + offset, pa, prot, MemAttr::WriteBack) {
-            // Out of page-table frames partway through. The pages already moved
-            // are reachable at the new address and the region record covers
-            // them, so nothing leaks and nothing is lost — the caller simply
-            // gets a mapping with a hole, which the next touch demand-pages.
-            // Reported rather than silent: a failure here means the PMM is out.
-            break;
+        for &(va, pa, prot, cow) in &moves {
+            let offset = va - old_addr;
+            if !uas.map_page_pte(base + offset, pa, prot, cow) {
+                // Out of page-table frames partway through. The pages already
+                // moved are reachable at the new address and the region record
+                // covers them, so nothing leaks and nothing is lost — the
+                // caller simply gets a mapping with a hole, which the next
+                // touch demand-pages.
+                break;
+            }
         }
-    }
+    });
 
     // Retire the source. Its present pages are gone from the page table already,
     // so the walk inside `unmap_range` finds only what was never moved, and the
     // region record is clipped by `detach_eager_regions_in_range`.
-    unmap_range(root, old_addr, old_addr + old_pages * PAGE_SIZE as usize);
+    unmap_range(old_addr, old_end);
     base as u64
 }
 
@@ -883,29 +918,30 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 fn dontneed_range(start: usize, end: usize) {
     use akuma_syscalls_mem::madvise::{PageAction, dontneed_page_action};
 
-    let root = paging::active_root();
-    // One hold for the whole walk. Lock order is regions -> PMM, the same
-    // direction `fault_in` takes, and nothing takes them the other way round.
+    // One hold for the whole walk. Lock order is regions -> address space ->
+    // PMM, the same direction `fault_in` takes, and nothing takes them the
+    // other way round.
     let _ = usermode::with_current_regions(|regions| {
-        paging::for_each_leaf_in_range(root, start, end, |va, pa, pte| {
+        let _ = usermode::with_current_address_space(|uas| {
+        uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
+            let (va, pa) = (leaf.va, leaf.pa);
             // A kernel page in a user range is not ring 3's to zero.
-            if !pte.user {
-                return;
+            if !leaf.prot.user {
+                return LeafAction::Keep;
             }
             let Some(region) = regions.iter().find(|r| r.contains(va)) else {
-                return;
+                return LeafAction::Keep;
             };
             let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
             if prot.is_none() {
-                return;
+                return LeafAction::Keep;
             }
-            let pa = pa as usize;
             match dontneed_page_action(true, akuma_pmm::cow_ref_get(pa)) {
                 // `for_each_leaf_in_range` only reports present pages, so the
                 // unmapped arm is unreachable from here. Kept as an arm rather
                 // than an `unwrap`: the decision belongs to the crate, and an
                 // arm that stops being unreachable should compile, not panic.
-                PageAction::Nothing => {}
+                PageAction::Nothing => LeafAction::Keep,
                 // This address space is the frame's only holder. Zeroing it is
                 // indistinguishable from Linux's drop-and-refault and costs no
                 // allocation.
@@ -915,9 +951,12 @@ fn dontneed_range(start: usize, end: usize) {
                 // physmap. Writing through the physmap rather than the user VA
                 // is deliberate — the PTE may be read-only (a `PROT_READ`
                 // region, or a CoW-demoted page whose peer has gone).
-                PageAction::ZeroInPlace => unsafe {
-                    core::ptr::write_bytes(phys_ptr::<u8>(pa as u64), 0, PAGE_SIZE as usize);
-                },
+                PageAction::ZeroInPlace => {
+                    unsafe {
+                        core::ptr::write_bytes(phys_ptr::<u8>(pa as u64), 0, PAGE_SIZE as usize);
+                    }
+                    LeafAction::Keep
+                }
                 // Someone else maps this frame. Give this address space a
                 // private zero frame and drop its share.
                 PageAction::BreakSharing => {
@@ -925,33 +964,34 @@ fn dontneed_range(start: usize, end: usize) {
                         // Advisory: out of memory means the page keeps its old
                         // contents, which is a worse answer than Linux's and a
                         // far better one than wiping a peer's live page.
-                        return;
+                        return LeafAction::Keep;
                     };
                     // SAFETY: a fresh PMM frame, reached through the physmap.
                     unsafe {
                         core::ptr::write_bytes(phys_ptr::<u8>(fresh as u64), 0, PAGE_SIZE as usize);
                     };
-                    if !paging::map_page_in(
-                        root,
-                        va,
-                        fresh as u64,
-                        pte_prot_for(prot, fresh),
-                        MemAttr::WriteBack,
-                    ) {
-                        akuma_pmm::free_page(fresh, 0);
-                        return;
-                    }
                     // The old frame loses this VA. Ledger first, then the
                     // global share count, then the free — the same order
                     // `unmap_range` uses, and for the same reason: a frame this
                     // address space no longer tracks is not this address
-                    // space's to hand back.
-                    if usermode::untrack_anon_frame(pa) && akuma_pmm::cow_ref_dec(pa) {
+                    // space's to hand back. Through the walk's own `ledger`
+                    // rather than `usermode::{un,}track_anon_frame`, which would
+                    // take the address-space lock this closure already runs
+                    // under.
+                    if ledger.remove_user_frame(PhysFrame::new(pa)) && akuma_pmm::cow_ref_dec(pa) {
                         akuma_pmm::free_page(pa, 0);
                     }
-                    usermode::track_anon_frame(fresh);
+                    ledger.track_user_frame(PhysFrame::new(fresh));
+                    let (pte, cow) = pte_prot_for(prot, fresh);
+                    // `Remap` rather than a `map_page_pte` after the walk: the
+                    // leaf slot is already in hand and the page tables above it
+                    // already exist, so pointing it at the new frame is one
+                    // store. It cannot fail, which is why the ledger edits above
+                    // it have no undo arm.
+                    LeafAction::Remap(fresh, pte, cow)
                 }
             }
+        });
         });
     });
 }

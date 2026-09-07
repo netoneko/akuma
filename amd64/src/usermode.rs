@@ -33,8 +33,10 @@ use crate::gdt;
 use akuma_mmap::{MmapRegion, PhysFrame};
 use alloc::vec::Vec;
 
-use crate::loader::{self, FrameSet};
-use crate::paging::{self, MemAttr, PteProt};
+use akuma_exec::process::ProcAddressSpace;
+use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
+
+use crate::loader;
 use crate::phys::phys_ptr;
 use crate::serial;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1947,10 +1949,35 @@ fn build_user_program(
 /// blob at the same address; an ELF decides its own entry point, and its stack
 /// has to go somewhere the image does not already occupy.
 pub struct Process {
-    space: paging::AddressSpace,
-    /// Every leaf frame this process owns. `AddressSpace::free` releases page
-    /// tables, not the pages they point at — this is the other half.
-    frames: FrameSet,
+    /// This process's user address space, and the lock that serialises page-table
+    /// mutation on it.
+    ///
+    /// # It was two fields and a third object until step 5a
+    ///
+    /// `space: paging::AddressSpace` (a bare `u64` PML4 root with no lock at
+    /// all, reached through `static mut PROCS` and a raw pointer) plus
+    /// `frames: FrameSet` — a second frame ledger beside the page table. They
+    /// are one thing now, and it is the same
+    /// [`akuma_mmu::UserAddressSpace`] the AArch64 kernel's `Process` carries,
+    /// wrapped in the same [`ProcAddressSpace`]: `Spinlock<UserAddressSpace>`
+    /// plus a lock-free atomic mirror of the root for the fault path.
+    ///
+    /// Two things fall out that were not true before. The **ledger lives inside
+    /// the address space**, so a frame cannot be tracked against one process and
+    /// mapped into another's tables — they are the same object. And teardown is
+    /// [`Drop`], not an explicit `free()`: `UserAddressSpace`'s destructor runs
+    /// the user frames, the page tables and the L0 through
+    /// `free_or_defer_as_frames`, which parks them if any core's `CR3` or any
+    /// preempted thread's saved context still names the table. `paging::activate`
+    /// feeds the first of those gates on this target, which is what makes a
+    /// destructor safe here at all.
+    ///
+    /// The lock does **not** mask IRQs on this target: `ProcAddressSpace::lock`
+    /// does that only under `kernel_smp_shared`, and amd64 is real SMP without
+    /// that feature. Every hold taken here is one PTE edit or one bounded walk,
+    /// which is why that is survivable rather than merely unnoticed — see
+    /// `proposals/AMD64_STEP5_PROCESS_TABLE.md` § "The IRQ-masking question".
+    space: ProcAddressSpace,
     /// Where ring 3 starts executing.
     entry: u64,
     /// Initial `rsp`.
@@ -1998,18 +2025,14 @@ impl Process {
     /// the timer, and a blob with no file format between it and the page table
     /// cannot fail for a loader's reasons.
     fn new(msg: &[u8], rounds: u32, delay: u32, status: u32) -> Option<Self> {
-        let space = paging::AddressSpace::new()?;
-        let frames = FrameSet::new(false);
+        let mut space = UserAddressSpace::new()?;
 
+        // Dropping `space` on either failure arm below releases its tables and
+        // whatever the ledger has taken on — the explicit `space.free()` +
+        // `free_all_frames` pair this replaces.
         let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
-            space.free();
             return None;
         };
-        // Recorded before anything can fail: a frame the ledger does not know
-        // about is a frame that leaks. There is no refusal arm — the ledger has
-        // no capacity to exhaust, which is what `MAX_PROC_FRAMES` used to be.
-        frames.track_user_frame(PhysFrame::new(code));
-        frames.track_user_frame(PhysFrame::new(stack));
 
         // SAFETY: PMM frames are reachable through the physmap, so the program
         // can be staged *before* the address space that will hold it is ever
@@ -2021,16 +2044,23 @@ impl Process {
             build_user_program(page, USER_CODE_VA as u64, msg, rounds, delay, status);
         }
 
-        if !space.map(USER_CODE_VA, code as u64, PteProt::USER_RX, MemAttr::WriteBack)
-            || !space.map(USER_STACK_VA, stack as u64, PteProt::USER_RW, MemAttr::WriteBack)
+        // Tracked as they are mapped: `map_and_track_pte` records the frame
+        // first and untracks it again if the map fails, so a refusal here leaves
+        // nothing behind for `Drop` to double-free.
+        if !space.map_and_track_pte(USER_CODE_VA, PhysFrame::new(code), PteProt::USER_RX, false)
+            || !space.map_and_track_pte(
+                USER_STACK_VA,
+                PhysFrame::new(stack),
+                PteProt::USER_RW,
+                false,
+            )
         {
-            loader::free_all_frames(&frames);
-            space.free();
+            akuma_pmm::free_page(code, 0);
+            akuma_pmm::free_page(stack, 0);
             return None;
         }
         Some(Self {
-            space,
-            frames,
+            space: ProcAddressSpace::new(space),
             entry: USER_CODE_VA as u64,
             stack: (USER_STACK_VA + 4096 - 16) as u64,
             forked: false,
@@ -2069,20 +2099,11 @@ impl Process {
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
-        let space = paging::AddressSpace::new().ok_or("no frame for a PML4")?;
-        let frames = FrameSet::new(false);
+        let mut space = UserAddressSpace::new().ok_or("no frame for a PML4")?;
 
-        let built = loader::load(image, &space, &frames).and_then(|img| {
-            loader::build_stack(
-                &space,
-                &frames,
-                ELF_STACK_TOP,
-                ELF_STACK_PAGES,
-                argv,
-                envp,
-                &img,
-            )
-            .map(|rsp| (img, rsp))
+        let built = loader::load(image, &mut space).and_then(|img| {
+            loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)
+                .map(|rsp| (img, rsp))
         });
 
         match built {
@@ -2090,8 +2111,7 @@ impl Process {
                 let entry = img.entry;
                 Ok((
                     Self {
-                        space,
-                        frames,
+                        space: ProcAddressSpace::new(space),
                         entry,
                         stack,
                         forked: false,
@@ -2100,38 +2120,39 @@ impl Process {
                     img,
                 ))
             }
-            Err(e) => {
-                loader::free_all_frames(&frames);
-                space.free();
-                Err(e)
-            }
+            // `space` drops here, which frees the frames the loader recorded
+            // before it gave up along with the page tables it built. That is
+            // exactly the `free_all_frames` + `space.free()` pair this arm used
+            // to run by hand, and it can no longer be forgotten on a new arm.
+            Err(e) => Err(e),
         }
     }
 
-    /// Release everything this process holds: user frames, then page tables.
-    ///
-    /// # This used to have two paths, and one of them leaked
-    ///
-    /// Until the region table landed, `mmap` did not record its frames in the
-    /// ledger at all, so teardown walked the global bump window
-    /// `[MMAP_BASE, NEXT_VA)` page by page and released whatever was still
-    /// mapped — but only for a process that was **not** a `fork` child, because
-    /// a child's ledger already held every page the fork shared and the walk
-    /// would have decremented each of those twice.
-    ///
-    /// The hole was a child that called `mmap` *after* forking: those frames
-    /// were in neither the ledger (mmap did not track) nor the walk (skipped
-    /// for `forked`), so every such page leaked until reboot. A shell is
-    /// exactly that shape — fork, then let musl's allocator mmap an arena.
-    ///
-    /// `sys_mmap` and the demand-paging fault now both `track_user_frame`, so
-    /// there is one path for every process and it is the same one the loader's
-    /// pages have always taken. Each distinct frame is released once, through
-    /// `cow_ref_dec`, and freed only by the last address space to let go.
-    fn free(self) {
-        loader::free_all_frames(&self.frames);
-        self.space.free();
-    }
+    // Teardown is `Drop`, not a `free(self)` method.
+    //
+    // # What replaced it, and why it is not merely a rename
+    //
+    // `Process::free` was `loader::free_all_frames(&self.frames)` followed by
+    // `self.space.free()` — two halves of one job, on two objects, that every
+    // bail-out arm had to remember to run in that order. There were six such
+    // arms. They are now the one `UserAddressSpace` destructor, which:
+    //
+    // * frees each **distinct** user frame once through `free_page_at`, whose
+    //   first line is the same `cow_ref_dec` gate `free_all_frames` applied — so
+    //   a page a `fork` sibling still maps is not released;
+    // * frees the page-table frames from the **ledger's tracked set** rather
+    //   than by re-walking the tables, which is the leak `map_and_track`'s
+    //   mandatory ledger closed;
+    // * and runs both through `free_or_defer_as_frames`, which parks everything
+    //   if `any_core_on_l0` or `any_saved_ctx_on_l0` says a core or a preempted
+    //   thread is still standing on this L0. `paging::activate` publishes into
+    //   the first of those, which is the prerequisite that made a destructor
+    //   safe on this target.
+    //
+    // The old two-paths-and-one-of-them-leaked history the removed doc comment
+    // recorded — a `fork` child's post-fork `mmap` pages tracked by neither the
+    // ledger nor the bump-window walk — is settled by the same change: there is
+    // one ledger, inside the address space, and nothing else to consult.
 
     /// A `fork` child: `parent`'s address space **shared copy-on-write**,
     /// resuming at `entry`/`stack`
@@ -2144,13 +2165,12 @@ impl Process {
     /// what made the scheduler's slot leak look like memory exhaustion for an
     /// afternoon (`docs/archive/AKUMA_AMD64_COW.md`).
     fn fork_from(parent: &Self, entry: u64, stack: u64) -> Option<Self> {
-        let Some(space) = paging::AddressSpace::new() else {
+        let Some(mut space) = UserAddressSpace::new() else {
             serial::puts("  [fork] no frame for a child PML4; pmm free=");
             serial::put_dec(akuma_pmm::free_count() as u64);
             serial::puts("\n");
             return None;
         };
-        let frames = FrameSet::new(false);
         let mut ok = true;
 
         // The child's region list, and — separately — the VA ranges that must be
@@ -2175,12 +2195,28 @@ impl Process {
             (akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions), shared)
         };
 
-        let parent_root = parent.space.root();
-        paging::for_each_user_leaf(parent_root, |va, pa, prot| {
+        // One walk of the parent's tables, with the parent's own PTE edited in
+        // place where it has to be demoted.
+        //
+        // `rewrite_leaves_in_range` replaces `for_each_user_leaf` + a second
+        // `map_page_in` per demoted page: the walk already has the leaf slot in
+        // hand, so a `Reprotect` is one store rather than a fresh four-level
+        // descent. The child's pages are mapped inside the closure into
+        // `space`, a **different** address space, so nothing here edits the
+        // table the walk is standing on.
+        //
+        // The parent's hold is taken for the whole walk. That is the longest
+        // `ProcAddressSpace` hold on this target and it is bounded by the
+        // parent's residency; it has to be one hold, because a demote that
+        // published halfway would leave the parent writable on pages the child
+        // already shares.
+        let mut parent_as = parent.space.lock();
+        parent_as.rewrite_leaves_in_range(0, akuma_mmu::USER_HALF_END, |_ledger, leaf| {
             if !ok {
-                return;
+                return LeafAction::Keep;
             }
-            let frame = PhysFrame::new(pa as usize);
+            let (va, pa) = (leaf.va, leaf.pa);
+            let frame = PhysFrame::new(pa);
 
             // `MAP_SHARED | MAP_ANONYMOUS`: one object, not two copies.
             //
@@ -2193,78 +2229,85 @@ impl Process {
             // (`userspace/forktest/c_stress/shmanon.c`).
             //
             // So: same frame, writable in **both**, no CoW marker, and the
-            // parent's own PTE deliberately left alone.
+            // parent's own PTE deliberately left alone (`LeafAction::Keep`).
             if shared_ranges.iter().any(|(start, end)| va >= *start && va < *end) {
-                let shared_rw = PteProt { write: true, cow: false, ..prot };
+                let shared_rw = PteProt { write: true, ..leaf.prot };
                 akuma_pmm::cow_ref_inc(frame.addr);
-                frames.track_user_frame(frame);
-                if !space.map(va, pa, shared_rw, MemAttr::WriteBack) {
-                    if frames.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                space.track_user_frame(frame);
+                if !space.map_page_pte(va, pa, shared_rw, false) {
+                    if space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
                         akuma_pmm::free_page(frame.addr, 0);
                     }
                     ok = false;
                 }
-                return;
+                return LeafAction::Keep;
             }
 
             // A page that is already read-only and *not* CoW stays exactly as it
             // is in both spaces — `.rodata`, an `mprotect(PROT_READ)` region.
             // Marking it would turn a legitimate `SIGSEGV` into a silent write.
-            let share_writable = prot.write || prot.cow;
+            let share_writable = leaf.prot.write || leaf.cow;
 
             if share_writable {
                 // Demote in **both** address spaces. Demoting only the child
                 // leaves the parent writing straight through to memory the
                 // child can see change — the entire point of CoW, missed.
                 //
-                // The parent's own PTE is edited here, in its live address
-                // space, so `map_page_in`'s `invlpg` is exactly the flush that
-                // is needed. At SMP>1 another core could hold a stale writable
+                // The parent's own PTE is rewritten by the `Reprotect` returned
+                // below, in its live address space, and the walk issues the
+                // `invlpg`. At SMP>1 another core could hold a stale writable
                 // translation and this would need a shootdown, which this
                 // target does not have (`smp.rs`: `invlpg` is core-local) —
                 // hence CoW is SMP=1 only for now.
-                let demoted = prot.cow();
-                if !paging::map_page_in(parent_root, va, pa, demoted, MemAttr::WriteBack) {
-                    ok = false;
-                    return;
-                }
-                // One reference per *address space*, taken once for the child.
-                // The parent's own claim is implicit: it already maps the page.
+                let demoted = PteProt { write: false, ..leaf.prot };
                 akuma_pmm::cow_ref_inc(frame.addr);
-                frames.track_user_frame(frame);
-                if !space.map(va, pa, demoted, MemAttr::WriteBack) {
-                    if frames.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                space.track_user_frame(frame);
+                if !space.map_page_pte(va, pa, demoted, true) {
+                    if space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
                         akuma_pmm::free_page(frame.addr, 0);
                     }
                     ok = false;
+                    // The parent keeps its writable mapping: the child does not
+                    // share this page, so demoting the parent would cost it a
+                    // fault for nothing.
+                    return LeafAction::Keep;
                 }
+                LeafAction::Reprotect(demoted, true)
             } else {
                 // Read-only and unshared-by-marker: the child maps the same
                 // frame at the same permissions. It still takes a reference,
                 // because teardown of either process must not free a page the
                 // other still maps.
                 akuma_pmm::cow_ref_inc(frame.addr);
-                frames.track_user_frame(frame);
-                if !space.map(va, pa, prot, MemAttr::WriteBack) {
-                    if frames.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                space.track_user_frame(frame);
+                if !space.map_page_pte(va, pa, leaf.prot, leaf.cow) {
+                    if space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
                         akuma_pmm::free_page(frame.addr, 0);
                     }
                     ok = false;
                 }
+                LeafAction::Keep
             }
         });
+        drop(parent_as);
 
         if !ok {
             serial::puts("  [fork] share pass failed; pmm free=");
             serial::put_dec(akuma_pmm::free_count() as u64);
             serial::puts(" pages=");
-            serial::put_dec(frames.user_frame_count() as u64);
+            serial::put_dec(space.user_frame_count() as u64);
             serial::puts("\n");
-            loader::free_all_frames(&frames);
-            space.free();
+            // `space` drops on return, releasing every frame the pass above
+            // managed to claim and every page table it built.
             return None;
         }
-        Some(Self { space, frames, entry, stack, forked: true, regions: Spinlock::new(regions) })
+        Some(Self {
+            space: ProcAddressSpace::new(space),
+            entry,
+            stack,
+            forked: true,
+            regions: Spinlock::new(regions),
+        })
     }
 }
 
@@ -2294,10 +2337,6 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
     }
 }
 
-/// Record `pa` as one more user frame of the running process.
-///
-/// The obligation `mmap` and the demand-paging fault take on: a frame the
-/// ledger does not know about is a frame `Process::free` will not release.
 /// How many physical frames the calling process's address space holds.
 ///
 /// The `resident` field of `/proc/self/statm`, straight out of the frame ledger
@@ -2310,37 +2349,44 @@ pub fn current_resident_pages() -> usize {
     // SAFETY: as `with_current_regions` — the running task's own slot.
     unsafe {
         let procs = &raw const PROCS;
-        (*procs).get(slot).and_then(Option::as_ref).map_or(0, |p| p.frames.resident_pages())
+        (*procs).get(slot).and_then(Option::as_ref).map_or(0, |p| p.space.resident_pages())
     }
 }
 
-pub fn track_anon_frame(pa: usize) {
-    let slot = current_proc_slot();
-    // SAFETY: as `with_current_regions`.
-    unsafe {
-        let procs = &raw const PROCS;
-        if let Some(p) = (*procs).get(slot).and_then(Option::as_ref) {
-            p.frames.track_user_frame(PhysFrame::new(pa));
-        }
-    }
-}
-
-/// Drop the running process's claim on `pa`, and say whether the caller now owns
-/// the **global** release (the `cow_ref_dec` + `free_page` pair).
+/// Run `f` with the running process's user address space, under its lock.
 ///
-/// `false` for a frame this process's ledger does not track — a page mapped by
-/// the loader outside any region, say. Not this address space's obligation to
-/// release early, and `Process::free` will hand it back at exit; freeing it here
-/// would be a double free against that.
-pub fn untrack_anon_frame(pa: usize) -> bool {
+/// The address-space counterpart of [`with_current_regions`], and the same
+/// contract: `None` means the caller is not a slotted user task — a kernel
+/// thread, or the boot self-tests before any process exists — and every caller
+/// must handle that rather than acting on the kernel's own tables. That
+/// distinction is new. Until step 5a this file's callers reached the page tables
+/// through `paging::active_root()`, which answers with **`CR3`** whoever asks:
+/// on a kernel thread that is the kernel's own root, so `munmap` walking a user
+/// range in it was at best a no-op and at worst an unmap of something the kernel
+/// put there. `mm.rs` guarded that with a separate `have_address_space()` probe;
+/// it cannot be forgotten now, because there is no root to pass.
+///
+/// # The hold
+///
+/// Short. `ProcAddressSpace::lock` does not mask IRQs on this target (that is
+/// `kernel_smp_shared`, which amd64 runs without), so a hold that spans a yield
+/// point can be re-entered by another thread of the same process on the same
+/// core. Every caller here holds it across one PTE edit or one bounded range
+/// walk and nothing that blocks.
+///
+/// Lock order is **regions → address space**: `fault_in` and `dontneed_range`
+/// take the region list first and reach the tables inside it. Nothing takes them
+/// the other way round, and nothing may start.
+pub fn with_current_address_space<R>(f: impl FnOnce(&mut akuma_mmu::UserAddressSpace) -> R) -> Option<R> {
     let slot = current_proc_slot();
-    // SAFETY: as `with_current_regions`.
+    // SAFETY: raw-pointer read of `PROCS`, the same discipline
+    // `with_current_regions` documents — this is the running task's own slot,
+    // and a process cannot be torn down underneath its own syscall or fault
+    // handler.
     unsafe {
         let procs = &raw const PROCS;
-        (*procs)
-            .get(slot)
-            .and_then(Option::as_ref)
-            .is_some_and(|p| p.frames.remove_user_frame(PhysFrame::new(pa)))
+        let p = (*procs).get(slot).and_then(Option::as_ref)?;
+        Some(f(&mut p.space.lock()))
     }
 }
 
@@ -2362,8 +2408,9 @@ pub fn cow_swap_frame(old: usize, new: usize) {
     unsafe {
         let procs = &raw const PROCS;
         if let Some(p) = (*procs).get(slot).and_then(Option::as_ref) {
-            let _ = p.frames.remove_user_frame(akuma_mmap::PhysFrame::new(old));
-            p.frames.track_user_frame(akuma_mmap::PhysFrame::new(new));
+            let ledger = p.space.lock();
+            let _ = ledger.remove_user_frame(akuma_mmap::PhysFrame::new(old));
+            ledger.track_user_frame(akuma_mmap::PhysFrame::new(new));
         }
     }
 }
@@ -2457,7 +2504,7 @@ fn run_process(idx: usize) -> ! {
             let Some(next) = take_pending_exec(idx) else {
                 break status;
             };
-            let new_root = next.space.root();
+            let new_root = next.space.ttbr0();
             (entry, stack) = (next.entry, next.stack);
             // SAFETY: raw-pointer access; single core. Replace before the CR3
             // switch so the slot always names the live image.
@@ -2473,7 +2520,7 @@ fn run_process(idx: usize) -> ! {
             // The old image (the `fork` copy, or a previous `execve`'s) is
             // unreferenced now that CR3 points at the new space — hand it back.
             if let Some(old) = old {
-                old.free();
+                drop(old);
             }
         };
         EXIT_STATUS.store(status, Ordering::Relaxed);
@@ -3044,7 +3091,7 @@ fn sys_fork() -> u64 {
             None => return errno::ENOMEM,
         }
     };
-    let child_root = child.space.root();
+    let child_root = child.space.ttbr0();
     // SAFETY: raw-pointer write; single core, slot just found free.
     unsafe {
         let procs = &raw mut PROCS;
@@ -3098,7 +3145,7 @@ fn take_proc_slot(slot: usize) {
     unsafe {
         let procs = &raw mut PROCS;
         if let Some(p) = (*procs)[slot].take() {
-            p.free();
+            drop(p);
         }
     }
 }
@@ -3162,7 +3209,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     };
 
     let (Some(stdout_pipe), Some(stdin_pipe)) = (pipe::alloc(), pipe::alloc()) else {
-        proc.free();
+        drop(proc);
         return errno::ENOMEM;
     };
 
@@ -3178,7 +3225,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         }
     }
 
-    let root = proc.space.root();
+    let root = proc.space.ttbr0();
     // A spawned process starts with an empty descriptor row: its stdio is the
     // pipes above, addressed by number, and it inherits nothing else. The
     // reset is defensive rather than expected — `close_owned_by` clears the row
@@ -3229,7 +3276,7 @@ fn cleanup_spawn_slot(slot: usize, stdout_pipe: PipeId, stdin_pipe: PipeId) {
     unsafe {
         let procs = &raw mut PROCS;
         if let Some(p) = (*procs)[slot].take() {
-            p.free();
+            drop(p);
         }
     }
 }
@@ -3421,7 +3468,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         (*spawn_table())[slot_off] = None;
         let procs = &raw mut PROCS;
         if let Some(p) = (*procs)[SPAWN_SLOT_BASE + slot_off].take() {
-            p.free();
+            drop(p);
         }
     }
     u64::from(child_pid)
@@ -4096,8 +4143,8 @@ pub fn smoke_test(t: &mut Suite) {
     // address resolves to different frames, and to nothing in the kernel's space.
     let pa_a = a.space.translate(USER_CODE_VA);
     let pa_b = b.space.translate(USER_CODE_VA);
-    let pa_k = paging::translate(USER_CODE_VA);
-    let (root_a, root_b) = (a.space.root(), b.space.root());
+    let pa_k = crate::paging::translate(USER_CODE_VA);
+    let (root_a, root_b) = (a.space.ttbr0(), b.space.ttbr0());
 
     // SAFETY: single core; written before the tasks that read them exist.
     unsafe {
@@ -4148,7 +4195,7 @@ pub fn smoke_test(t: &mut Suite) {
         let procs = &raw mut PROCS;
         for slot in 0..2 {
             if let Some(p) = (*procs)[slot].take() {
-                p.free();
+                drop(p);
             }
         }
     }
@@ -4182,7 +4229,7 @@ pub fn preempt_test(t: &mut Suite) {
         t.check("preempt: processes built", false);
         return;
     };
-    let (root_c, root_d) = (c.space.root(), d.space.root());
+    let (root_c, root_d) = (c.space.ttbr0(), d.space.ttbr0());
 
     // SAFETY: single core; written before the tasks that read them exist.
     unsafe {
@@ -4226,7 +4273,7 @@ pub fn preempt_test(t: &mut Suite) {
         let procs = &raw mut PROCS;
         for slot in 2..4 {
             if let Some(p) = (*procs)[slot].take() {
-                p.free();
+                drop(p);
             }
         }
     }
@@ -4266,7 +4313,7 @@ pub fn smp_parallel_test(t: &mut Suite) {
         t.check("smp ring3: processes built", false);
         return;
     };
-    let (root_c, root_d) = (c.space.root(), d.space.root());
+    let (root_c, root_d) = (c.space.ttbr0(), d.space.ttbr0());
 
     // SAFETY: under the BKL; written before the tasks that read them exist.
     // Slots 2 and 3 are free again: `preempt_test` took its processes back.
@@ -4305,7 +4352,7 @@ pub fn smp_parallel_test(t: &mut Suite) {
         let procs = &raw mut PROCS;
         for slot in 2..4 {
             if let Some(p) = (*procs)[slot].take() {
-                p.free();
+                drop(p);
             }
         }
     }
@@ -4455,7 +4502,7 @@ pub fn elf_test(t: &mut Suite) {
     // .rodata and two stack pages the total cannot be a single-page accident.
     t.check(
         "elf: frames owned covers image and stack",
-        proc.frames.user_frame_count() >= 12,
+        proc.space.user_frame_count() >= 12,
     );
 
     // The entry point is what the file said, not what the kernel assumed. Read
@@ -4471,12 +4518,12 @@ pub fn elf_test(t: &mut Suite) {
     // not what the loader believes it did. The entry page must be executable and
     // not writable; the stack must be the reverse. Both are W^X, from opposite
     // ends.
-    let entry_prot = proc.space.prot(proc.entry as usize & !0xfff);
+    let entry_prot = proc.space.lock().pte_prot(proc.entry as usize & !0xfff).map(|(p, _)| p);
     t.check(
         "elf: entry page is user-executable and not writable",
         entry_prot == Some(PteProt::USER_RX),
     );
-    let stack_prot = proc.space.prot((proc.stack as usize) & !0xfff);
+    let stack_prot = proc.space.lock().pte_prot((proc.stack as usize) & !0xfff).map(|(p, _)| p);
     t.check(
         "elf: stack page is user-writable and not executable",
         stack_prot == Some(PteProt::USER_RW),
@@ -4488,7 +4535,7 @@ pub fn elf_test(t: &mut Suite) {
         proc.stack < ELF_STACK_TOP && proc.stack >= ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096),
     );
 
-    let root = proc.space.root();
+    let root = proc.space.ttbr0();
     // SAFETY: single core; the slot is written before the task that reads it
     // exists.
     unsafe {
@@ -4529,7 +4576,7 @@ pub fn elf_test(t: &mut Suite) {
     unsafe {
         let procs = &raw mut PROCS;
         if let Some(p) = (*procs)[4].take() {
-            p.free();
+            drop(p);
         }
     }
     t.check_eq(
@@ -4583,27 +4630,23 @@ fn reject_test(t: &mut Suite) {
     for (name, at, bytes) in cases {
         let mut img = buf;
         img[at..at + bytes.len()].copy_from_slice(bytes);
-        let Some(space) = paging::AddressSpace::new() else {
+        let Some(mut space) = UserAddressSpace::new() else {
             t.check(name, false);
             continue;
         };
-        let frames = FrameSet::new(false);
-        let refused = loader::load(&img, &space, &frames).is_err();
-        loader::free_all_frames(&frames);
-        space.free();
+        // `space` drops at the end of the iteration and releases whatever the
+        // refused load had already placed — which is what the `free_count`
+        // assertion below is actually testing now.
+        let refused = loader::load(&img, &mut space).is_err();
         t.check(name, refused);
     }
 
     // A truncated image: the header claims segments the file does not contain.
     t.check("elf: rejects a truncated image", {
-        let Some(space) = paging::AddressSpace::new() else {
+        let Some(mut space) = UserAddressSpace::new() else {
             return;
         };
-        let frames = FrameSet::new(false);
-        let refused = loader::load(&HELLO_ELF[..48], &space, &frames).is_err();
-        loader::free_all_frames(&frames);
-        space.free();
-        refused
+        loader::load(&HELLO_ELF[..48], &mut space).is_err()
     });
 
     t.check_eq(
@@ -4642,7 +4685,7 @@ pub fn fdprobe_test(t: &mut Suite) {
             return;
         }
     };
-    let root = proc.space.root();
+    let root = proc.space.ttbr0();
     // SAFETY: single core; the slot is written before the task that reads it
     // exists.
     unsafe {
@@ -4691,7 +4734,7 @@ pub fn fdprobe_test(t: &mut Suite) {
     unsafe {
         let procs = &raw mut PROCS;
         if let Some(p) = (*procs)[5].take() {
-            p.free();
+            drop(p);
         }
     }
     // The probe mmaps and munmaps, so its frames must come back too — a leak
@@ -4740,7 +4783,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
             return false;
         }
     };
-    let root = proc.space.root();
+    let root = proc.space.ttbr0();
     // SAFETY: single core; the slot is written before the task that reads it
     // exists.
     unsafe {
@@ -4822,7 +4865,7 @@ pub fn thread_test(t: &mut Suite) {
         }
     };
     t.check("thread: probe loaded", true);
-    let root = proc.space.root();
+    let root = proc.space.ttbr0();
     // SAFETY: raw-pointer write; the slot is filled before the task that reads
     // it exists.
     unsafe {
@@ -4870,7 +4913,7 @@ pub fn thread_test(t: &mut Suite) {
     unsafe {
         let procs = &raw mut PROCS;
         if let Some(p) = (*procs)[5].take() {
-            p.free();
+            drop(p);
         }
     }
     t.check_eq(

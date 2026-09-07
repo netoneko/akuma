@@ -496,6 +496,40 @@ fn describe_page_fault(code: PageFaultCode) {
     serial::puts("\n");
 }
 
+/// A borrowed view of the address space the faulting access actually used.
+///
+/// # Why `CR3` and not the running process's `Process.space`
+///
+/// They are the same thing whenever there is a process: the scheduler installs a
+/// user task's root before it runs, in kernel mode as well as ring 3, so a
+/// `copy_to_user` fault and a ring-3 fault both name the same tables. Reading
+/// `CR3` says *which address space the fault happened in* directly, rather than
+/// deriving it and hoping the derivation agrees — which is the same discipline
+/// `translate`/`prot` follow by walking rather than consulting a shadow record.
+///
+/// It is also the only shape that keeps the one case with **no** process:
+/// `uaccess.rs`'s `CR0.WP` self-test maps a CoW-marked pair into the kernel's own
+/// root and drives this path from ring 0, and it is the sole coverage the break
+/// has that does not need a live user program. Resolving through the process
+/// table would make that test silently stop testing anything.
+///
+/// [`UserAddressSpace::new_shared`] is exactly the right constructor: a view
+/// that names an existing L0 and whose ledger **owns nothing**, so it frees
+/// nothing when it drops. Nothing here allocates a page table either — every
+/// arm rewrites a leaf that is already present — so the view's throwaway ledger
+/// never has anything to lose. The *real* ledger update is
+/// [`crate::usermode::cow_swap_frame`], against the running process, which is
+/// where a replaced frame has to be recorded.
+fn faulting_address_space() -> akuma_mmu::UserAddressSpace {
+    // `new_shared` cannot fail on this target — it allocates nothing — but it
+    // returns `Option` because the shared callers in `akuma-exec` are written
+    // against a fallible constructor. An `expect` here would be a panic in the
+    // page-fault handler; the empty view refuses every lookup instead, which
+    // falls through to the ordinary fatal path.
+    akuma_mmu::UserAddressSpace::new_shared(paging::active_root() as usize)
+        .unwrap_or_else(|| akuma_mmu::UserAddressSpace::new_shared(0).unwrap())
+}
+
 /// Break copy-on-write sharing for the page containing `addr`.
 ///
 /// Returns `true` when the faulting instruction can be re-executed. `false`
@@ -511,21 +545,20 @@ fn cow_write_fault(addr: u64) -> bool {
     use akuma_cow::{CowAction, CowFault};
 
     let page = (addr as usize) & !0xfff;
-    let root = paging::active_root();
-    let Some(prot) = paging::prot_in(root, page) else {
+    let mut faulted = faulting_address_space();
+    let Some((prot, marked)) = faulted.pte_prot(page) else {
         return false; // not mapped — not a CoW break
     };
     if !prot.user {
         return false; // a kernel page; ring 3 had no business writing it
     }
-    let Some(pa) = paging::translate_in(root, page) else {
+    let Some(pa) = faulted.translate(page).map(|pa| pa & !0xfff) else {
         return false;
     };
-    let pa = (pa & !0xfff) as usize;
 
     let action = CowFault {
         pte_writable: prot.write,
-        marked: prot.cow,
+        marked,
         refs: akuma_pmm::cow_ref_get(pa),
     }
     .decide();
@@ -543,8 +576,8 @@ fn cow_write_fault(addr: u64) -> bool {
         // `fork` child usually `execve`s and leaves the parent alone with
         // everything.
         CowAction::TakeInPlace => {
-            let writable = PteProt { write: true, cow: false, ..prot };
-            if !paging::map_page_in(root, page, pa as u64, writable, MemAttr::WriteBack) {
+            let writable = PteProt { write: true, ..prot };
+            if !faulted.map_page_pte(page, pa, writable, false) {
                 return false;
             }
             // The frame stops being shared, so drop this address space's claim
@@ -570,8 +603,8 @@ fn cow_write_fault(addr: u64) -> bool {
                     4096,
                 );
             }
-            let writable = PteProt { write: true, cow: false, ..prot };
-            if !paging::map_page_in(root, page, fresh as u64, writable, MemAttr::WriteBack) {
+            let writable = PteProt { write: true, ..prot };
+            if !faulted.map_page_pte(page, fresh, writable, false) {
                 akuma_pmm::free_page(fresh, 0);
                 return false;
             }

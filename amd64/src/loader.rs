@@ -95,7 +95,8 @@ use elf::segment::SegmentTable;
 
 use akuma_mmap::PhysFrame;
 
-use crate::paging::{AddressSpace, MemAttr, PteProt};
+use akuma_mmu::{PteProt, UserAddressSpace};
+
 use crate::phys::phys_ptr;
 
 const PAGE_SIZE: usize = 4096;
@@ -133,63 +134,27 @@ const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 
-/// Every physical frame a process owns, so teardown can give them all back.
-///
-/// `AddressSpace::free` releases page *tables*, not the pages they point at —
-/// deliberately, since the tables are its own and the leaves are the caller's.
-/// This is that caller's half of the bargain.
-///
-/// # This was a 2048-entry flat array until 2026-09-06
-///
-/// `FrameSet` was a `Box<[usize; 2048]>` — 16 KiB of heap per live
-/// process, a hard ceiling, and `free_all` calling `free_page` unconditionally
-/// on every entry. Three things were wrong with it and all three are gone:
-///
-/// 1. **The ceiling was reachable from a shell.** A `fork` needs one entry per
-///    mapped user page and busybox is ~400 pages, so a pipeline of a few
-///    children ran the array out and `fork` returned `ENOMEM` — `sh` printing
-///    `can't fork: Out of memory` on an otherwise idle 2 GiB machine. A
-///    `BTreeMap` has no ceiling.
-/// 2. **It could not count.** Every entry was freed exactly once at teardown,
-///    which is correct only while no two mappings share a frame — i.e. only
-///    while there is no CoW. A refcount per frame is the *prerequisite* for
-///    CoW, not a consequence of it: the fault handler can be written without
-///    one, and teardown then frees a page the sibling is still reading.
-/// 3. **It was a worse copy of something already host-tested.**
-///    `akuma_user_space::FrameLedger` is the same job with the two-counts rule
-///    and 14 tests behind it (`docs/archive/AKUMA_USER_SPACE_LEDGER.md`), and
-///    it builds for `x86_64-unknown-none`.
-///
-/// The AArch64 kernel's `UserAddressSpace` holds one of these too, so the two
-/// targets now account for user frames identically.
-pub type FrameSet = akuma_user_space::FrameLedger;
-
-/// Hand every frame in `ledger` back to the PMM, emptying it.
-///
-/// Freeing is the caller's job by design — `FrameLedger` deliberately cannot
-/// call the PMM to release a frame, so that the crate stays a ledger rather
-/// than an allocator. This is amd64's half.
-///
-/// **Each distinct frame is freed once, whatever its count.** The count is
-/// virtual addresses, not frames: a page mapped at two VAs is still one page to
-/// give back, and freeing per count is a double free.
-pub fn free_all_frames(ledger: &FrameSet) {
-    for (pa, _vas) in ledger.take_user_frames() {
-        // **Decrement, do not free.** Since `fork` shares pages copy-on-write,
-        // a frame in this ledger may still be mapped by a sibling. Only the
-        // last address space to let go owns the free, and that is exactly what
-        // `cow_ref_dec` reports — an untracked frame answers `true`, because
-        // the PMM defines untracked as a single owner, so an unshared process
-        // frees everything it holds exactly as before.
-        //
-        // Getting this wrong is a use-after-free that surfaces nowhere near the
-        // exit that caused it: the surviving process keeps reading a page the
-        // allocator has handed to someone else.
-        if akuma_pmm::cow_ref_dec(pa) {
-            akuma_pmm::free_page(pa, 0);
-        }
-    }
-}
+// The per-process frame ledger moved **into** the address space in amd64 step
+// 5a, and this module no longer names it.
+//
+// It was `pub type FrameSet = akuma_user_space::FrameLedger` plus a
+// `free_all_frames` that handed every tracked frame back through
+// `cow_ref_dec`, called by six bail-out arms that each also had to remember
+// `AddressSpace::free()`. `akuma_mmu::UserAddressSpace` owns one ledger and
+// releases it in `Drop`, alongside its page tables and through the same
+// `cow_ref_dec` gate — so the two halves cannot be run in the wrong order or
+// forgotten on a new arm, and the loader records frames by mapping them
+// ([`UserAddressSpace::map_and_track_pte`]) rather than by tracking them
+// separately and hoping the map agrees.
+//
+// The history worth keeping: `FrameSet` was a `Box<[usize; 2048]>` until
+// 2026-09-06 — 16 KiB of heap per process and a hard ceiling a shell could
+// reach (`sh: can't fork: Out of memory` on an idle 2 GiB machine, one entry
+// per mapped page per `fork`), with no refcount, so teardown freed a page a
+// CoW sibling was still reading. `akuma-user-space` replaced it with the
+// host-tested ledger the AArch64 kernel already used
+// (`docs/archive/AKUMA_USER_SPACE_LEDGER.md`), and 5a put it where the page
+// tables are.
 
 /// What a successful load produced.
 pub struct LoadedImage {
@@ -246,13 +211,7 @@ const fn align_up(v: u64, to: u64) -> u64 {
 /// present page, so `PF_R` is implied and a segment without it would be
 /// readable anyway. Saying so here is more honest than pretending to enforce it.
 const fn segment_prot(p_flags: u32) -> PteProt {
-    PteProt {
-        write: p_flags & PF_W != 0,
-        exec: p_flags & PF_X != 0,
-        user: true,
-        // A freshly loaded image shares nothing. `fork` is what marks pages.
-        cow: false,
-    }
+    PteProt { write: p_flags & PF_W != 0, exec: p_flags & PF_X != 0, user: true }
 }
 
 /// The permissions a page needs to satisfy both `a` and `b`.
@@ -263,18 +222,16 @@ const fn segment_prot(p_flags: u32) -> PteProt {
 /// the over-permitting case that actually matters — W+X — is refused outright by
 /// the caller.
 const fn widen(a: PteProt, b: PteProt) -> PteProt {
-    PteProt {
-        write: a.write || b.write,
-        exec: a.exec || b.exec,
-        user: a.user || b.user,
-        // Deliberately **not** the union: `cow` is a marker, not a permission,
-        // and `segment_prot` never sets it, so both inputs are always false
-        // here. Widening it would be meaningless — a CoW page is by definition
-        // not writable, so "the permissions needed to satisfy both" cannot
-        // include it.
-        cow: false,
-    }
+    PteProt { write: a.write || b.write, exec: a.exec || b.exec, user: a.user || b.user }
 }
+
+/// The CoW marker every mapping this module writes carries: **none**.
+///
+/// A freshly loaded image shares nothing — `fork` is what marks pages — so every
+/// `map_*_pte` call below passes `false`. Named rather than repeated as a bare
+/// literal at eight call sites, where a stray `true` would be a page that faults
+/// on its first write and gets silently copied.
+const NOT_COW: bool = false;
 
 /// Copy `src` into `space` at virtual address `va`, page by page.
 ///
@@ -282,7 +239,7 @@ const fn widen(a: PteProt, b: PteProt) -> PteProt {
 /// space being filled is not the active one — that is the whole point of
 /// building it before `CR3` ever names it — so its virtual addresses mean
 /// nothing to the CPU right now.
-fn write_user(space: &AddressSpace, va: u64, src: &[u8]) -> bool {
+fn write_user(space: &UserAddressSpace, va: u64, src: &[u8]) -> bool {
     let mut done = 0usize;
     while done < src.len() {
         let at = va + done as u64;
@@ -298,7 +255,7 @@ fn write_user(space: &AddressSpace, va: u64, src: &[u8]) -> bool {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(done),
-                phys_ptr::<u8>(pa).add(off),
+                phys_ptr::<u8>(pa as u64).add(off),
                 n,
             );
         }
@@ -315,15 +272,14 @@ fn write_user(space: &AddressSpace, va: u64, src: &[u8]) -> bool {
 /// what stops a recycled frame handing ring 3 whatever the previous owner left
 /// in it — the same rule the demand-paging handler follows.
 fn map_range(
-    space: &AddressSpace,
-    frames: &FrameSet,
+    space: &mut UserAddressSpace,
     start: u64,
     end: u64,
     prot: PteProt,
 ) -> Result<(), &'static str> {
     let mut va = start;
     while va < end {
-        if let Some(existing) = space.prot(va as usize) {
+        if let Some((existing, _cow)) = space.pte_prot(va as usize) {
             // A page a previous segment already placed. Only reachable from an
             // unaligned link; see `widen`.
             let want = widen(existing, prot);
@@ -332,7 +288,7 @@ fn map_range(
             }
             if want != existing {
                 let pa = space.translate(va as usize).ok_or("mapped page has no frame")?;
-                if !space.map(va as usize, pa, want, MemAttr::WriteBack) {
+                if !space.map_page_pte(va as usize, pa, want, NOT_COW) {
                     return Err("could not widen a shared page's permissions");
                 }
             }
@@ -340,13 +296,13 @@ fn map_range(
             let pa = akuma_pmm::alloc_page().ok_or("out of frames loading a segment")? as u64;
             // SAFETY: a fresh PMM frame, reached through the physmap.
             unsafe { core::ptr::write_bytes(phys_ptr::<u8>(pa), 0, PAGE_SIZE) };
-            // Recorded before it is mapped: a frame the ledger does not know
-            // about is a frame that leaks, and `map` can fail. The ledger has
-            // no capacity to run out of, so this no longer has a failure arm —
-            // the "image needs more frames than a process may own" error is
-            // gone with `MAX_PROC_FRAMES`.
-            frames.track_user_frame(PhysFrame::new(pa as usize));
-            if !space.map(va as usize, pa, prot, MemAttr::WriteBack) {
+            // `map_and_track_pte` records the frame **before** it maps, and
+            // untracks it again if the map fails — the obligation this used to
+            // discharge with a bare `track_user_frame` above the `map`. A frame
+            // the ledger does not know about is a frame teardown will not
+            // release; a frame it knows about but nothing maps is one this
+            // address space would free out from under its next owner.
+            if !space.map_and_track_pte(va as usize, PhysFrame::new(pa as usize), prot, NOT_COW) {
                 return Err("could not map a segment page");
             }
         }
@@ -367,8 +323,7 @@ fn map_range(
 /// pointing at memory the PMM had handed to someone else.
 fn place_image(
     image: &[u8],
-    space: &AddressSpace,
-    frames: &FrameSet,
+    space: &mut UserAddressSpace,
     force_base: Option<u64>,
 ) -> Result<Placed, &'static str> {
     if image.len() < ELF64_EHDR_SIZE {
@@ -471,7 +426,7 @@ fn place_image(
         let vaddr = base + ph.p_vaddr;
         let start = vaddr & !(PAGE_SIZE as u64 - 1);
         let end = align_up(seg_end, PAGE_SIZE as u64);
-        map_range(space, frames, start, end, prot)?;
+        map_range(space, start, end, prot)?;
 
         if ph.p_filesz > 0 {
             let off = usize::try_from(ph.p_offset).map_err(|_| "segment file offset overflow")?;
@@ -494,7 +449,7 @@ fn place_image(
     if entry == 0 || entry >= USER_VA_LIMIT {
         return Err("entry point is not a user address");
     }
-    if space.prot(entry as usize & !(PAGE_SIZE - 1)).is_none_or(|p| !p.exec) {
+    if space.pte_prot(entry as usize & !(PAGE_SIZE - 1)).is_none_or(|(p, _cow)| !p.exec) {
         return Err("entry point is not in an executable segment");
     }
 
@@ -584,12 +539,8 @@ const INTERP_BASE: u64 = 0x4000_0000;
 /// interpreter linked at 0 has no other way to find its own relocations, and
 /// omitting it makes `ld-musl` self-relocate against address 0 and fault
 /// immediately with a `cr2` in the first page.
-pub fn load(
-    image: &[u8],
-    space: &AddressSpace,
-    frames: &FrameSet,
-) -> Result<LoadedImage, &'static str> {
-    let main = place_image(image, space, frames, None)?;
+pub fn load(image: &[u8], space: &mut UserAddressSpace) -> Result<LoadedImage, &'static str> {
+    let main = place_image(image, space, None)?;
 
     let Some(interp_path) = main.interp.as_deref() else {
         return Ok(LoadedImage {
@@ -607,7 +558,7 @@ pub fn load(
     let interp_image =
         crate::fs::read_file(interp_path)
             .map_err(|_| "PT_INTERP names a file that is not on the disk")?;
-    let interp = place_image(&interp_image, space, frames, Some(INTERP_BASE))?;
+    let interp = place_image(&interp_image, space, Some(INTERP_BASE))?;
     if interp.interp.is_some() {
         // An interpreter that names an interpreter is either a corrupt image or
         // a loop. Neither is worth chasing at load time.
@@ -684,8 +635,7 @@ const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + AUXV_WORDS;
 /// other program on this target) ignores them; they cost three more auxv
 /// words and nothing else.
 pub fn build_stack(
-    space: &AddressSpace,
-    frames: &FrameSet,
+    space: &mut UserAddressSpace,
     top: u64,
     pages: usize,
     argv: &[&[u8]],
@@ -703,7 +653,7 @@ pub fn build_stack(
     }
     let bytes = (pages as u64) * PAGE_SIZE as u64;
     let base = top.checked_sub(bytes).ok_or("stack underflows the address space")?;
-    map_range(space, frames, base, top, PteProt::USER_RW)?;
+    map_range(space, base, top, PteProt::USER_RW)?;
 
     // The argv then envp strings sit at the very top, NUL-terminated, packed
     // downward. `arg_va[i]` / `env_va[i]` is where each string's bytes land.

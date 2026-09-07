@@ -2702,7 +2702,9 @@ fn self_map_rows() -> Vec<MapRow> {
     // visits in ascending VA order (it walks each level's indices upward), which
     // is what makes a single-pass coalesce correct rather than a sort-then-merge.
     let mut run: Option<Row> = None;
-    crate::paging::for_each_user_leaf(crate::paging::active_root(), |va, _pa, prot| {
+    let _ = crate::usermode::with_current_address_space(|uas| {
+    uas.for_each_user_leaf(|leaf| {
+        let (va, prot) = (leaf.va, leaf.prot);
         if !prot.user || extents.iter().any(|&(s, e)| va >= s && va < e) {
             // Flush across a gap the region list already covers, so a mapping
             // either side of it is not merged through it.
@@ -2725,6 +2727,7 @@ fn self_map_rows() -> Vec<MapRow> {
                 run = Some((va, va + 4096, true, w, x, true));
             }
         }
+    });
     });
     if let Some(r) = run.take() {
         rows.push(r);

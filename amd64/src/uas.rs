@@ -192,15 +192,157 @@ pub fn smoke_test(t: &mut Suite) {
     // It reads the owner's tables, though — that is what makes it a view.
     t.check("uas: a shared view sees the owner's unmapped VA", !shared.is_mapped(TEST_VA));
 
-    // Hand the data frames back. The three page-table frames stay: this target
-    // has no `Drop` for an address space (see `akuma-mmu`'s note on why), so a
-    // boot-time leak of 12 KiB is the cost of running this test at all, and it
-    // is bounded at one address space per boot.
+    // Hand the two data frames back by hand — they were mapped through
+    // `map_page`, which does not track, so the ledger never claimed them and
+    // `Drop` will not release them.
     // Boot: no thread owns these yet, so tid 0 — the same value the rest of
     // the pre-`init` allocation paths on this target pass.
     akuma_pmm::free_page(frame.addr, 0);
     akuma_pmm::free_page(frame2.addr, 0);
-    t.note("uas: page-table frames deliberately leaked (no Drop on this target)", 3);
+    // `uas` and `shared` drop here. Nothing leaks any more: the page-table
+    // frames the walks above allocated go back through the ledger. That used to
+    // be a deliberate 12 KiB per boot, noted rather than fixed, because this
+    // target had no `Drop` for an address space.
+    drop(shared);
+    drop(uas);
+
+    pte_level_test(t);
+    drop_returns_frames_test(t);
+}
+
+/// The PTE-level entry points step 5a added, and the CoW marker they carry.
+///
+/// `map_page`/`alloc_and_map` above take an **AArch64** flag word and decode it
+/// to a neutral `Prot`; nothing that goes through them can set the copy-on-write
+/// marker, because a region's protection has no business carrying a page-table
+/// software bit. `fork`, `mprotect` over a shared frame and `mremap` all have to,
+/// so `map_page_pte`/`map_and_track_pte`/`pte_prot` take the x86 triple and the
+/// marker directly. This is the only coverage they have — the walk dereferences
+/// page tables through the physmap and does not exist on this repo's host.
+fn pte_level_test(t: &mut Suite) {
+    use akuma_mmu::PteProt;
+
+    let Some(mut uas) = UserAddressSpace::new() else {
+        t.check("uas: pte-level address space", false);
+        return;
+    };
+    let Some(frame) = akuma_pmm::alloc_page().map(akuma_mmap::PhysFrame::new) else {
+        t.check("uas: pte-level frame", false);
+        return;
+    };
+
+    // Tracked as it maps, which is the difference from `map_page_pte`.
+    t.check(
+        "uas: map_and_track_pte maps and tracks",
+        uas.map_and_track_pte(TEST_VA, frame, PteProt::USER_RO, true)
+            && uas.user_frame_count() == 1,
+    );
+    // The round trip: what was asked for is what the hardware now says.
+    let read_back = uas.pte_prot(TEST_VA);
+    t.check(
+        "uas: pte_prot reports the triple back",
+        read_back.is_some_and(|(prot, _)| prot == PteProt::USER_RO),
+    );
+    t.check("uas: pte_prot reports the CoW marker", read_back.is_some_and(|(_, cow)| cow));
+    // ...and it is the same bit `paging::COW` names. Read raw, so this is not
+    // the decoder agreeing with the encoder.
+    let raw = uas.read_l3_page_entry(TEST_VA).unwrap_or(0);
+    t.check(
+        "uas: the marker is PTE bit 9, read raw",
+        raw & PTE_COW != 0 && raw & PTE_RW == 0 && raw & PTE_US != 0,
+    );
+
+    // `map_page_pte` re-points an existing leaf without touching the ledger —
+    // which is what `mremap` and the CoW break rely on.
+    let before = uas.user_frame_count();
+    t.check(
+        "uas: map_page_pte re-permissions in place",
+        uas.map_page_pte(TEST_VA, frame.addr, PteProt::USER_RW, false)
+            && uas.user_frame_count() == before,
+    );
+    t.check(
+        "uas: ...and the marker is gone",
+        uas.pte_prot(TEST_VA) == Some((PteProt::USER_RW, false)),
+    );
+
+    // `LeafAction::Remap` points the leaf at a *different* frame in one store,
+    // which is `MADV_DONTNEED`'s break-sharing arm.
+    let Some(fresh) = akuma_pmm::alloc_page() else {
+        t.check("uas: pte-level second frame", false);
+        return;
+    };
+    let rewritten = uas.rewrite_leaves_in_range(TEST_VA, TEST_VA + 4096, |_ledger, _leaf| {
+        akuma_mmu::LeafAction::Remap(fresh, PteProt::USER_RW, false)
+    });
+    t.check_eq("uas: Remap visited the leaf", rewritten as u64, 1);
+    t.check_eq(
+        "uas: Remap points the VA at the new frame",
+        uas.translate(TEST_VA).unwrap_or(0) as u64,
+        fresh as u64,
+    );
+    t.check_eq(
+        "uas: Remap left the ledger alone",
+        uas.user_frame_count() as u64,
+        before as u64,
+    );
+
+    // The ledger still claims the *old* frame, so `Drop` releases that one;
+    // `fresh` was never tracked and is ours to return.
+    drop(uas);
+    akuma_pmm::free_page(fresh, 0);
+}
+
+/// `UserAddressSpace::drop` hands every frame it holds back to the PMM.
+///
+/// The destructor is what step 5a replaced `Process::free`'s
+/// `free_all_frames` + `AddressSpace::free` pair with, and nothing else here
+/// asserts it *directly* — a leak is silent, and a double free surfaces
+/// somewhere else entirely. Measured as a PMM free-count round trip, which is
+/// the one observation that cannot be satisfied by the ledger agreeing with
+/// itself.
+///
+/// The address space under test is never activated, so `any_core_on_l0` and
+/// `any_saved_ctx_on_l0` both answer "nobody" and the free is immediate rather
+/// than parked. `drain_pending_ttbr_frees` is called anyway: if a future change
+/// makes this park, the check should still measure the frames coming back and
+/// not silently start passing for the wrong reason.
+fn drop_returns_frames_test(t: &mut Suite) {
+    /// Far enough apart to need two PTs under two PD entries, so the page-table
+    /// frames being released are more than the minimum three.
+    const A: usize = TEST_VA;
+    const B: usize = TEST_VA + (2 << 20);
+
+    let before = akuma_pmm::free_count();
+    let held = {
+        let Some(mut uas) = UserAddressSpace::new() else {
+            t.check("uas: drop test address space", false);
+            return;
+        };
+        for va in [A, B] {
+            if uas.alloc_and_map(va, user_flags::RW_NO_EXEC).is_err() {
+                t.check("uas: drop test mapped its pages", false);
+                return;
+            }
+        }
+        t.check("uas: drop test mapped its pages", true);
+        // + 1 for the L0 itself, which the ledger does not track.
+        uas.user_frame_count() + uas.page_table_frame_count() + 1
+    };
+    // Two data pages; four page tables — a PDPT, one PD (the two VAs are 2 MiB
+    // apart, so they are two *entries* of one PD, not two PDs) and a PT under
+    // each of those entries; and the L0, which the ledger does not track.
+    //
+    // Pinned as an equality rather than a lower bound: this is the count `Drop`
+    // has to return, and a walker that started tracking the shared PML4 slots'
+    // tables — the kernel's own — would show up here as a larger number before
+    // it showed up as a dead machine.
+    t.check_eq("uas: drop test held page tables and data", held as u64, 2 + 4 + 1);
+    akuma_mmu::drain_pending_ttbr_frees();
+    t.check_eq(
+        "uas: drop returns every frame the address space held",
+        akuma_pmm::free_count() as u64,
+        before as u64,
+    );
 }
 
 /// The three range walks C1 step 5a needs, on a private address space.
@@ -304,7 +446,7 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
     // Reprotect: same frame, new permissions, CoW marker set. This is the
     // `mprotect` shape and the `fork` demote shape at once.
     let ro = PteProt { write: false, exec: false, user: true };
-    let rewritten = uas.rewrite_leaves_in_range(TEST_VA, FAR + 4096, |_| LeafAction::Reprotect(ro, true));
+    let rewritten = uas.rewrite_leaves_in_range(TEST_VA, FAR + 4096, |_ledger, _leaf| LeafAction::Reprotect(ro, true));
     t.check_eq("uas: rewrite_leaves_in_range visited three", rewritten as u64, 3);
     let mut demoted = 0usize;
     let mut kept_frames = true;
@@ -331,7 +473,7 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
     let before = uas.user_frame_count();
     let mut reported = [0usize; 3];
     let mut i = 0usize;
-    let unmapped = uas.rewrite_leaves_in_range(TEST_VA, MID + 4096, |leaf: Leaf| {
+    let unmapped = uas.rewrite_leaves_in_range(TEST_VA, MID + 4096, |_ledger, leaf: Leaf| {
         if i < reported.len() {
             reported[i] = leaf.pa;
         }

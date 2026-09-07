@@ -442,9 +442,26 @@ fn write_protect_check(t: &mut Suite) {
     };
     // SAFETY: a fresh PMM frame, through the physmap.
     unsafe { core::ptr::write_bytes(phys_ptr::<u8>(shared_pa as u64), 0x5A, 4096) };
-    let cow = PteProt::USER_RW.cow();
-    let mapped = paging::map_page(SHARED_A as usize, shared_pa as u64, cow, MemAttr::WriteBack)
-        && paging::map_page(SHARED_B as usize, shared_pa as u64, cow, MemAttr::WriteBack);
+    // A CoW-demoted page: read-only in the hardware *and* marked, which is what
+    // `PteProt::USER_RW.cow()` used to produce. The marker is not a permission
+    // and so is not part of `PteProt` — it is `map_page_pte`'s fourth argument,
+    // and the demotion (`USER_RW` -> `USER_RO`) is stated here rather than
+    // hidden in a constructor. A pair that stayed writable would never fault and
+    // this test would pass while proving nothing.
+    //
+    // Mapped through a **borrowed view** of the kernel's own root, the same one
+    // `idt::faulting_address_space` builds — so the pages this test installs and
+    // the walk the fault handler does are one implementation. `new_shared`'s
+    // ledger owns nothing, so the view frees nothing when it drops; the unmap
+    // and the `cow_ref_dec` at the end of this function are still by hand.
+    let Some(mut kroot) = akuma_mmu::UserAddressSpace::new_shared(paging::active_root() as usize)
+    else {
+        t.check("wp: borrowed view of the kernel root", false);
+        akuma_pmm::free_page(shared_pa, 0);
+        return;
+    };
+    let mapped = kroot.map_page_pte(SHARED_A as usize, shared_pa, PteProt::USER_RO, true)
+        && kroot.map_page_pte(SHARED_B as usize, shared_pa, PteProt::USER_RO, true);
     if !mapped {
         t.check("wp: map the shared pair", false);
         akuma_pmm::free_page(shared_pa, 0);
