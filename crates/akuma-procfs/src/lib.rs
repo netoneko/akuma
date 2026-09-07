@@ -272,5 +272,87 @@ pub fn render_cmdline<'a>(
     pos
 }
 
+/// `/proc/<pid>/statm` — seven page counts on one line.
+///
+/// Linux's fields, in order: `size resident shared text lib data dt`. `lib` and
+/// `dt` have been hardcoded to 0 in Linux itself for many years, so they are 0
+/// here for the same reason rather than as a gap.
+///
+/// **Pages, not bytes.** Every reader divides `resident` by nothing and
+/// multiplies by its own `sysconf(_SC_PAGESIZE)`, so a byte count here reads as
+/// a process 4096 times too large. Named `pages` in the signature so a caller
+/// cannot pass bytes without noticing.
+pub fn render_statm(
+    size_pages: u64,
+    resident_pages: u64,
+    shared_pages: u64,
+    text_pages: u64,
+    data_pages: u64,
+    buf: &mut [u8],
+) -> usize {
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(w, "{size_pages} {resident_pages} {shared_pages} {text_pages} 0 {data_pages} 0");
+    pos
+}
+
+/// A buffer size [`render_statm`] can never overflow: seven `u64` decimals,
+/// six separators and a newline.
+pub const STATM_MAX: usize = 7 * 20 + 7;
+
+/// One `/proc/<pid>/maps` line, newline-terminated.
+///
+/// `<start>-<end> <perms> <offset> <dev> <inode> <path>` — the format every
+/// allocator, debugger and sanitiser parses, and the one `redis` reads through
+/// its `smaps` variant. Addresses are lower-case hex with **no** `0x`, which is
+/// what `sscanf("%lx-%lx", …)` expects; anything else makes a parser silently
+/// read zero.
+///
+/// `path` is the caller's, and empty is legitimate — an anonymous mapping has no
+/// name. Linux pads the pathname to column 74; nothing parses by column, so this
+/// emits a single separating space instead of the padding.
+///
+/// # Why the permission field takes four booleans
+///
+/// This crate must not know what a `Prot` is — it has one dependency and no
+/// concept of a page table (see its header). The caller decodes its own
+/// protection vocabulary and passes the four characters' worth of truth, which
+/// is also what stops an architecture's PTE bits leaking into a `/proc` format.
+// Four booleans, and they are deliberately not an enum. They are the four
+// *characters* of the `rwxp` field, which is a wire format rather than a
+// concept — an enum here would have sixteen variants named after the strings it
+// already builds. Allowed at the item so the crate keeps no crate-level allow.
+#[allow(clippy::fn_params_excessive_bools)]
+pub fn render_maps_line(
+    start: usize,
+    end: usize,
+    read: bool,
+    write: bool,
+    exec: bool,
+    private: bool,
+    path: &str,
+    buf: &mut [u8],
+) -> usize {
+    let perms = [
+        if read { b'r' } else { b'-' },
+        if write { b'w' } else { b'-' },
+        if exec { b'x' } else { b'-' },
+        if private { b'p' } else { b's' },
+    ];
+    // `from_utf8` on four ASCII bytes cannot fail; the fallback keeps this
+    // panic-free without an `unwrap` in a kernel path.
+    let perms = core::str::from_utf8(&perms).unwrap_or("----");
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    // `00:00 0` is the device and inode of an anonymous mapping, which is what
+    // every mapping on a kernel with no file-backed `mmap` is.
+    let _ = writeln!(w, "{start:08x}-{end:08x} {perms} 00000000 00:00 0 {path}");
+    pos
+}
+
+/// A buffer size [`render_maps_line`] can never overflow for a path of up to
+/// 128 bytes: two 16-digit addresses, the fixed text, and the path.
+pub const MAPS_LINE_MAX: usize = 192;
+
 #[cfg(test)]
 mod tests;

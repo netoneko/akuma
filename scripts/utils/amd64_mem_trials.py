@@ -61,14 +61,15 @@ CC = mem_suite.ARCHES[ARCH]
 # This list is a claim, not a mute button: a probe here that starts *passing* is
 # reported as a surprise, because that means the gap it names has been closed
 # and the entry should go.
+# Four entries left on 2026-09-07 when `pread64`, `madvise`, `/proc/<pid>/` and
+# `mremap` landed, and file-backed `MAP_PRIVATE` with them
+# (`docs/archive/AKUMA_AMD64_MEMORY_CLOSEOUT.md`). Both survivors need **signal
+# delivery**, which is trunk A2 — neither is a memory-mapping defect, and
+# `mprotect` itself is verified working.
 EXPECTED_FAIL = {
-    "mmapsum": "pread64 (x86_64 syscall 17) is not implemented on this target",
-    "mmap_file": "file-backed mmap is ENOSYS by design — no page cache here",
     "mprotectlb": "needs a SIGSEGV handler; this target has no signal delivery",
-    "mremapmove": "mremap is not implemented on this target",
     "eager_mprotect_probe": "a killed child exits 128+SIGSEGV rather than reporting "
                             "a signalled status, so WIFSIGNALED is never true",
-    "smapsdirty": "no /proc/self/smaps and no MADV_FREE on this target",
 }
 
 # The banner the in-guest runner prints around each probe. Chosen to survive a

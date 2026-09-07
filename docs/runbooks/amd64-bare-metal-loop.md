@@ -291,25 +291,48 @@ as `EXPECTED_FAIL` with a diagnosed reason for each, and reports a probe that
 starts *passing* as a surprise rather than silently accepting it — an entry that
 goes green means the gap it names has been closed and the entry should go.
 
-As of 2026-09-07, after the `akuma-mmap` region table landed (B1/B2):
+As of 2026-09-07, after the six memory gaps were closed
+(`docs/archive/AKUMA_AMD64_MEMORY_CLOSEOUT.md`) — **8/10, and 8 is the ceiling**:
 
 | probe | verdict | why |
 |---|---|---|
 | `mmap_stress` | **PASS** | |
-| `madvshared` | **PASS** | |
-| `shmanon` | **PASS** | was failing — `MAP_SHARED\|MAP_ANONYMOUS` now survives `fork` as one object |
+| `madvshared` | **PASS** | and no longer by *skipping* — `MADV_DONTNEED` is real, so all three sub-tests now run |
+| `shmanon` | **PASS** | `MAP_SHARED\|MAP_ANONYMOUS` survives `fork` as one object |
 | `cowstale` | **PASS** | |
-| `mmapsum` | known | `pread64` (x86_64 17) is not implemented here |
-| `mmap_file` | known | file-backed `mmap` is `ENOSYS` by design — no page cache |
+| `mmapsum` | **PASS** | needed `pread64` **and** file-backed `mmap`; all four digests agree |
+| `mmap_file` | **PASS** | `MAP_PRIVATE` file mappings are served from the file's bytes |
+| `mremapmove` | **PASS** | `mremap` moves pages rather than copying them, so the sparse phase passes too |
+| `smapsdirty` | **PASS** (2 DIVERGE) | one fewer divergence than aarch64 — `/proc/self/{maps,statm}` are served here |
 | `mprotectlb` | known | needs a `SIGSEGV` handler; no signal delivery on this target |
-| `mremapmove` | known | `mremap` is not implemented |
 | `eager_mprotect_probe` | known | a killed child exits `128+SIGSEGV` instead of reporting a *signalled* status, so its `WIFSIGNALED` check never fires |
-| `smapsdirty` | known | no `/proc/self/smaps`, no `MADV_FREE` |
 
 The last two are worth reading twice, because both look like memory bugs and
 neither is. `mprotect` **does** work here — verified directly:
 `mmap` RW, touch, `mprotect(PROT_READ)`, write ⇒ the process dies with 139. What
-those two probes actually need is *signals*, which is trunk A2.
+those two probes actually need is *signals*, which is trunk A2. They are the only
+two entries left in `amd64_mem_trials.py`'s `EXPECTED_FAIL`.
+
+Still refused on this target, and stated so rather than served wrong: a
+**writable `MAP_SHARED` file mapping** (`ENOSYS` — it needs a page cache, and a
+private copy would accept the write and silently drop it) and
+`/proc/<pid>/smaps` (absent on purpose: serving it badly makes `redis` report a
+CoW corruption bug and exit, where absent makes it skip the check).
+
+### Two port traps in this section's own commands
+
+- **`scripts/utils/amd64_trials.py` forwards ssh on 2244**, the same port the
+  `mem_suite` recipe above uses. Start a probe VM by hand on 2244 and the trials
+  harness cannot bind: it reports `NO TALLY — the boot produced no self-test
+  line` in about 6 seconds, which reads exactly like a kernel that died before
+  printing anything. Use a different port for hand-run VMs (2255 works), and note
+  the harness `pkill`s the forward on exit — so it will also kill a VM you left
+  sitting on 2244.
+- **`scripts/vm_ready.py` cannot reach this guest.** It takes no identity
+  argument and the amd64 image authorises exactly one key, so `vm_ready.py 2244`
+  never returns here however healthy the guest is. Poll with an
+  `ssh -i target/x86_64-unknown-none/release/amd64-ssh-test-key … "echo ok"`
+  loop instead.
 
 ### Two gaps in the guest shell that will bite any harness
 

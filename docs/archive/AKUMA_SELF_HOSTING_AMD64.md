@@ -33,6 +33,29 @@ as they stand one day after the survey
 > `UserAddressSpace`) is unblocked — its probes are region queries and the
 > regions exist now.
 
+> **The six memory gaps are CLOSED (2026-09-07, later the same day)** —
+> `docs/archive/AKUMA_AMD64_MEMORY_CLOSEOUT.md`. `pread64`, `madvise` (including a
+> real `MADV_DONTNEED`), `/proc/<pid>/{maps,statm}` plus the `access`-vs-`open`
+> bug behind them, `mremap`, and file-backed `MAP_PRIVATE` `mmap` all landed, in
+> that order, each verified before the next was started.
+>
+> **The probes went 4/10 → 8/10 on both rigs**, and 8/10 is the ceiling: the two
+> that remain (`mprotectlb`, `eager_mprotect_probe`) need signal delivery, which
+> is **A2**. Boot self-tests +34 on every rig and core count — qemu 323→**357**
+> (`SMP=1`) and 332→**366** (`SMP=4`), firecracker 313→**347** and 322→**356**.
+>
+> **The B trunk is unblocked, not finished.** What landed for file mappings is
+> not a page cache: every mapper gets its own copy of every page and a file
+> mapping is always eager, which is the state the AArch64 kernel was in before
+> `src/file_page_cache.rs`. Writable `MAP_SHARED` on a file is still `ENOSYS`,
+> because that is the half where the sharing *is* the semantics. `akuma-fpcache`
+> is the obvious thing to reach for next; item **D**'s "file-backed + lazy mmap"
+> row wants the lazy half too.
+>
+> `akuma-syscalls-abi` gained `Pread64`/`Madvise`/`Mremap` and `akuma-procfs`
+> gained `render_statm`/`render_maps_line` — both purely additive (190
+> insertions, 0 deletions), and `src/` was not touched.
+
 > **A1 and A2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_BLOCKING.md`.
 > `amd64/src/sched.rs` no longer contains a scheduler: `akuma-threading` is the
 > scheduler on both architectures, and what is left is the machine effects

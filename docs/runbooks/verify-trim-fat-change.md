@@ -13,6 +13,17 @@ their real output — see "Probes built since this runbook was last revised".
 > starts reporting network flakes as refactor regressions. Add them when you
 > have A/B'd their stability across arms, not before — the `cowstale` entry in
 > the known-benign table is what that mistake costs.
+>
+> **Partly closed 2026-09-07 — the memory family, on that rule rather than
+> around it.** `scripts/mem_suite.py` runs ten probes and `EXERCISES` ran seven
+> of them; the three missing (`mmap_stress`, `shmanon`, `smapsdirty`) are all
+> fork/CoW/fault-path, so they are the category this set is *for* rather than
+> the network case the paragraph above warns about. Each was A/B'd first: run on
+> an unmodified `main` (b7c89d47) devbox-smoltcp at `SMP=4`, all three passed,
+> and the same static binaries pass on real Linux under
+> `mem_suite.py --docker` on both architectures. Cost on that guest: 9.2 s,
+> 0.1 s, 0.0 s. The four **network** probes below are still out, for the reason
+> given.
 
 For deduplication / extraction work from
 [`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md).
@@ -356,6 +367,91 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `mmap_file <path>` | `mmap_file: touched all pages` |
 | `allocstress` | `allocstress: reached 2,000,000 allocations without failure!` |
 | `eager_mprotect_probe` | `RESULT: PASS`. **It was a known failure from 2026-08-15 (`24f7e1c1`) and passes as of 2026-09-01** — both phases now refuse the write (`[MPROTECT-DENY] … write refused by recorded protection`, `ap_rw=false`, probe SIGSEGVs), which is what `akuma-mmap`'s `prot_recorded` + `mprotect_eager_regions_in_range` were built to do (`../archive/GRANT_RECORDS_VS_DENY_RECORDS.md`). `KNOWN_FAIL_EXERCISES` is empty again; a `FAIL` here is now a real regression, not the expected state. Background on the original defect: `../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3, §6a |
+
+### The memory family's own gate, and its relationship to this one (2026-09-07)
+
+`scripts/mem_suite.py` is the gate for the `akuma-syscalls-mem` family. It and
+this runbook overlap by design and by seven probes — `madvshared`, `mremapmove`,
+`cowstale`, `mprotectlb`, `eager_mprotect_probe`, `mmapsum`, `mmap_file` — but
+they are not the same tool and neither replaces the other:
+
+| | `verify_trim.py` | `mem_suite.py` |
+|---|---|---|
+| question | did this refactor change behaviour? | is the memory family correct? |
+| verdict | **comparison against a baseline** | pass/fail, with `DIVERGE` counted separately |
+| scope | 20 probes across fork/CoW/fault/heap/stack, at two SMP levels, plus clippy + host tests | 10 memory probes |
+| transports | ssh to a devbox | ssh, `--docker` (real Linux), and `--arch x86_64` for the amd64 kernel |
+
+As of 2026-09-07 `EXERCISES` contains **all ten** of `mem_suite`'s probes, so a
+trim-the-fat change that breaks the memory family is caught by the gate you were
+already going to run. Use `mem_suite.py` directly when you want the Linux
+calibration (`--docker`) or the amd64 kernel (`--arch x86_64`), neither of which
+this gate can reach.
+
+The three added on 2026-09-07, with what each guards:
+
+| probe | guards | marker, and the trap in it |
+|---|---|---|
+| `mmap_stress` | repeated 70 MB anonymous map/touch/unmap cycles — the one exercise that reuses address space at scale, so it is what notices a VA allocator leaking ranges | `stress finished (` — **time-bounded**, so the iteration count varies between runs and between arms. The count is deliberately left out of the marker and must stay out |
+| `shmanon` | `MAP_SHARED\|MAP_ANONYMOUS` surviving `fork` as **one object**. Two-sided: it checks the `MAP_PRIVATE` case stays isolated in the same run, so a kernel that shares *everything* fails it too | `-> SHARED (correct)` |
+| `smapsdirty` | `/proc/self/smaps` + `MADV_FREE` — what redis inspects at startup | `0 failure(s)`. Self-calibrating like `mprotectlb`: it counts its own divergences from Linux and prints both totals. The marker is the **failure** count, not the divergence count — an unmodified tree reports `0 failure(s), 3 documented divergence(s)`, and folding that 3 into the marker would break the gate the next time procfs grows a file |
+
+### Every remaining probe joined the gate (2026-09-07)
+
+An inventory of `userspace/forktest/c_stress/` against all four runners found
+**17 probes that nothing ran at all** — each written for a real incident, each
+still in the tree, none of them executed since. `EXERCISES` went **17 → 35**.
+
+Every one was run on a booted VM first and its `healthy` string copied from that
+run's actual output, which is the rule the 2026-08-15 entries were added under.
+None is a network probe, so the caution at the top of this file is satisfied
+rather than waived: they are signal delivery, thread churn, TLS, the dynamic
+loader, pipes and compute — all things a fork/CoW/fault-path refactor can break.
+
+Final state on `disk.img` at `SMP=4`: **18 pass, 1 known-fail, 0 unexpected.**
+
+`dynchild` is the one exclusion, and by reason rather than omission: it is
+`dynspawn`'s spawnee, not a standalone probe. It **is** staged now (dynamically
+linked — a `-static` build of it would exit 42 while exercising none of the
+loader it exists to test), because `dynspawn` cannot work without it.
+
+`tidflags` is the one `KNOWN_FAIL_EXERCISES` entry; see that set's comment for
+what fails, the measurement, and what its flipping would mean.
+
+#### Two traps this turned up, both worth more than the wiring
+
+**A marker can pass vacuously, and a green gate is how you find out.**
+`dynspawn`'s summary is `=== DYNSPAWN DONE — 0 divergence(s) ===`, which is the
+obvious marker and is also true when **nothing ran**: it spawns `/tmp/dynchild`
+800 times, and with the spawnee absent every `posix_spawn` fails, no child runs,
+and nothing can diverge. Measured exactly that — `children reaching main : 0`
+beside `posix_spawn/wait errors: 800`, under a green marker. It is now
+`children reaching main : 800`, a count that cannot be reached by doing nothing.
+
+Only a flake exposed it: the probe passed vacuously twice, then a run where the
+launch itself failed reported `UNEXPECTED`, which is what prompted reading the
+output instead of the verdict. **When choosing a `healthy` string, prefer the
+line that counts work done over the line that summarises outcomes** — a summary
+of nothing is clean.
+
+**Binaries on `disk.img` go stale, and the gate cannot tell.** `smapsdirty`
+reported `3 failure(s)` where the current source reports `0 failure(s), 3
+documented divergence(s)`: the staged build predated its DIVERGE classification
+entirely. `cowstale` — an exercise **already in this list** — also differed from
+a fresh build. `userspace/build.sh` compiles and copies these, so a probe is only
+as new as the last time someone ran it, and the gate had been scoring an old
+binary against a new kernel.
+
+A third of the same class: `pattern2_parent` was built inside `build.sh`'s
+`WITH_FORKTEST` block despite being pure C with no Go in it, and had therefore
+never reached `disk.img` at all — `mmap_stress` from the same two-line block was
+there and it was not, meaning that block last ran before this line was added to
+it. Moved to the unconditional block.
+
+**So: `userspace/build.sh` && `scripts/populate_disk.sh` before an A/B**, not
+just before the first one. A stale probe is the baseline arm measuring a
+different binary from the change arm, which is the whole failure mode this
+runbook exists to prevent.
 
 ### Probes built since this runbook was last revised (added 2026-08-28)
 

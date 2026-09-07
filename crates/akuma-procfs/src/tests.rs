@@ -207,3 +207,84 @@ fn a_zero_length_buffer_writes_nothing_rather_than_panicking() {
     assert_eq!(render_pid_stat(&p, &mut []), 0);
     assert_eq!(render_status(&p, &mut []), 0);
 }
+
+// ---------------------------------------------------------------------------
+// `statm` and `maps` (2026-09-07, added for the amd64 port).
+// ---------------------------------------------------------------------------
+
+/// Seven fields, in Linux's order, with `lib` and `dt` hardcoded to 0 as Linux
+/// itself does. The field *count* is the part `ps`/`top` depend on.
+#[test]
+fn statm_has_seven_fields_in_linux_order() {
+    let mut buf = [0u8; STATM_MAX];
+    let n = render_statm(100, 42, 7, 9, 30, &mut buf);
+    let line = core::str::from_utf8(&buf[..n]).unwrap();
+    assert_eq!(line, "100 42 7 9 0 30 0\n");
+    assert_eq!(line.trim_end().split(' ').count(), 7);
+}
+
+#[test]
+fn statm_fits_its_advertised_maximum() {
+    let mut buf = [0u8; STATM_MAX];
+    let n = render_statm(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, &mut buf);
+    assert!(n <= STATM_MAX, "{n} > {STATM_MAX}");
+    // Not truncated: the last byte written is the newline.
+    assert_eq!(buf[n - 1], b'\n');
+}
+
+/// The exact shape `sscanf("%lx-%lx", …)` reads — lower-case hex, no `0x`, a
+/// hyphen between. Redis's `smaps_get_shared_dirty` is one such parser and it
+/// silently reads zero from anything else.
+#[test]
+fn maps_line_is_scannable_hex() {
+    let mut buf = [0u8; MAPS_LINE_MAX];
+    let n = render_maps_line(0x1_0000_0000, 0x1_0000_2000, true, true, false, true, "", &mut buf);
+    let line = core::str::from_utf8(&buf[..n]).unwrap();
+    assert_eq!(&line[..19], "100000000-100002000");
+    assert!(!line.contains("0x"), "addresses must not be 0x-prefixed: {line}");
+    assert!(line.contains(" rw-p "), "{line}");
+    assert!(line.ends_with('\n'));
+}
+
+/// All sixteen permission combinations render as four characters, and the
+/// fourth is the private/shared flag rather than a permission.
+#[test]
+fn maps_permission_field_covers_every_combination() {
+    for bits in 0u8..16 {
+        let read = bits & 1 != 0;
+        let write = bits & 2 != 0;
+        let exec = bits & 4 != 0;
+        let private = bits & 8 != 0;
+        let mut buf = [0u8; MAPS_LINE_MAX];
+        let n = render_maps_line(0x1000, 0x2000, read, write, exec, private, "", &mut buf);
+        let line = core::str::from_utf8(&buf[..n]).unwrap();
+        let perms = line.split(' ').nth(1).unwrap();
+        assert_eq!(perms.len(), 4, "{line}");
+        assert_eq!(&perms[0..1], if read { "r" } else { "-" });
+        assert_eq!(&perms[1..2], if write { "w" } else { "-" });
+        assert_eq!(&perms[2..3], if exec { "x" } else { "-" });
+        assert_eq!(&perms[3..4], if private { "p" } else { "s" }, "{line}");
+    }
+}
+
+/// A short buffer truncates rather than panicking — the property every
+/// renderer here shares, and the reason they all take `&mut [u8]`.
+#[test]
+fn maps_and_statm_truncate_rather_than_panicking() {
+    assert_eq!(render_statm(1, 2, 3, 4, 5, &mut []), 0);
+    assert_eq!(render_maps_line(1, 2, true, true, true, true, "x", &mut []), 0);
+    let mut small = [0u8; 4];
+    assert_eq!(render_maps_line(0x1000, 0x2000, true, false, false, true, "", &mut small), 4);
+}
+
+/// A path that would overrun the advertised maximum is truncated, not written
+/// past the buffer. `MAPS_LINE_MAX` is a promise about a *bounded* path.
+#[test]
+fn maps_line_fits_its_maximum_for_a_bounded_path() {
+    let path = "/a/reasonably/long/path/to/some/mapped/file/on/disk/with/more";
+    assert!(path.len() <= 128);
+    let mut buf = [0u8; MAPS_LINE_MAX];
+    let n = render_maps_line(usize::MAX, usize::MAX, true, true, true, false, path, &mut buf);
+    assert!(n <= MAPS_LINE_MAX);
+    assert_eq!(buf[n - 1], b'\n', "line was truncated: {:?}", core::str::from_utf8(&buf[..n]));
+}

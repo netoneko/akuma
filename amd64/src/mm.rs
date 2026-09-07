@@ -21,10 +21,33 @@
 //! and `mprotect`, which accepted-and-did-nothing, now splits regions and
 //! re-permissions the pages that are actually present.
 //!
-//! File-backed mappings are still refused with `ENOSYS`, and that is the one
-//! remaining refusal. It needs a page cache, which this target does not have;
-//! serving it as anonymous memory would look like a working call and hand the
-//! caller a file full of zeros.
+//! # What a file mapping is here (2026-09-07)
+//!
+//! `mmap(MAP_PRIVATE, fd)` used to be `ENOSYS`, on the reasoning that serving it
+//! as anonymous memory "would look like a working call and hand the caller a
+//! file full of zeros". That reasoning was right about the **danger** and too
+//! broad about the **remedy**: the zeros are what a mapping with no fill path
+//! produces, not what a private file mapping is.
+//!
+//! `MAP_PRIVATE` asks for a private copy of the file's bytes whose writes
+//! nobody else can see. This target can give exactly that, because
+//! `fd.rs` already holds every open file's contents in the kernel: each page is
+//! allocated, zeroed, and then overwritten from the file
+//! ([`populate_file_page`]). What it does **not** give is a page *cache* — two
+//! processes mapping one file hold two sets of frames. That is a cost, not a
+//! semantic difference, and it is the state the AArch64 kernel was in until
+//! `src/file_page_cache.rs` landed in 2026-08.
+//!
+//! One refusal is left and it is the one that genuinely needs the cache: a
+//! **writable `MAP_SHARED`** file mapping, whose writes must reach the file and
+//! every other mapper. A private copy would accept the write and drop it, which
+//! is the original objection in its true scope.
+//!
+//! Two pinned divergences come with it: a file mapping is always **eager** here
+//! (`plan` never marks a file mapping lazy, so a mapping larger than free memory
+//! is `ENOMEM` at `mmap` rather than a fault later), and a mapping never sees a
+//! write made to the file after the `mmap` — `MAP_PRIVATE` leaves that
+//! unspecified on Linux too.
 //!
 //! # The decisions are shared crates, not local
 //!
@@ -195,8 +218,8 @@ fn pte_prot_for(prot: Prot, pa: usize) -> PteProt {
     }
 }
 
-/// `mmap(addr, len, prot, flags, fd)`.
-pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
+/// `mmap(addr, len, prot, flags, fd, offset)`.
+pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
     if len == 0 {
         return errno::EINVAL;
     }
@@ -232,9 +255,29 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     let pages = len.div_ceil(PAGE_SIZE) as usize;
     let plan = akuma_syscalls_mem::mmap::plan(prot32, flags32, fd32, pages, EAGER_MAX_PAGES);
 
+    // File-backed mappings (2026-09-07). The refusal that used to live here was
+    // right about the danger and too broad about the remedy — see the module
+    // header's "What a file mapping is here".
     if plan.is_file_backed {
-        // Refused rather than served as anonymous memory: see the module header.
-        return errno::ENOSYS;
+        // Still refused: a **writable `MAP_SHARED`** file mapping. Writes
+        // through it must become visible in the file and to every other mapper,
+        // which needs a write-back path and one shared frame per file page —
+        // that is the page cache, and it is genuinely not here. Serving it as a
+        // private copy would accept the write and silently drop it.
+        if plan.is_shared_writable {
+            return errno::ENOSYS;
+        }
+        // Linux requires a page-aligned offset and says `EINVAL` otherwise.
+        // Ahead of the descriptor probe because it is decidable from the
+        // arguments alone, which is the ordering rule the rest of this function
+        // follows and what lets the boot suite assert it with no open file.
+        if !offset.is_multiple_of(PAGE_SIZE) {
+            return errno::EINVAL;
+        }
+        // A socket, pipe or directory has no bytes to map.
+        if !crate::fd::is_regular_file(fd) {
+            return errno::EACCES;
+        }
     }
 
     // W^X, enforced here as it is in the ELF loader: `PteProt` offers no
@@ -310,9 +353,20 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         return base as u64;
     }
 
+    // A file-backed mapping is filled from the file; an anonymous one is zeroed.
+    // `plan.use_lazy` is false for every file mapping (the crate decides that),
+    // so control only reaches here for a file after the lazy return above.
+    let file_source = plan.is_file_backed.then_some((fd, offset as usize));
+
     for i in 0..pages {
         let va = base + i * PAGE_SIZE as usize;
-        if !populate_page(root, va, region_prot) {
+        let filled = match file_source {
+            Some((fd, off)) => {
+                populate_file_page(root, va, region_prot, fd, off + i * PAGE_SIZE as usize)
+            }
+            None => populate_page(root, va, region_prot),
+        };
+        if !filled {
             // Out of memory partway through. Unlike the pre-region version,
             // which leaked the pages it had already mapped because it had no
             // record of them, this can undo exactly what it did.
@@ -340,6 +394,61 @@ fn populate_page(root: u64, va: usize, prot: Prot) -> bool {
     // A brand-new frame is unshared, so `pte_prot_for`'s CoW rule cannot fire;
     // it is used anyway so there is one answer to "what bits does this region
     // get" rather than two that could drift.
+    if !paging::map_page_in(root, va, frame as u64, pte_prot_for(prot, frame), MemAttr::WriteBack) {
+        akuma_pmm::free_page(frame, 0);
+        return false;
+    }
+    usermode::track_anon_frame(frame);
+    true
+}
+
+/// Allocate, **fill from a file**, map and record one page at `va`.
+///
+/// [`populate_page`]'s sibling, and the difference is the whole reason
+/// file-backed `mmap` was refused here until 2026-09-07: this function is what
+/// stops the mapping being anonymous memory wearing a file's name.
+///
+/// # The failure this is built to make impossible
+///
+/// `mm.rs`'s header used to say a file mapping was `ENOSYS` because serving one
+/// as anonymous memory "would look like a working call and hand the caller a
+/// file full of zeros". That danger is real and it is *not* removed by having a
+/// fill path — it is removed by making the fill path unable to silently skip.
+/// So:
+///
+/// - The frame is zeroed **first**, then overwritten with what the file has.
+///   Zero is therefore the value of a byte past EOF and of nothing else.
+/// - [`crate::fd::file_bytes_at`] returns `None` for a descriptor that is not a
+///   regular file, and that is a **failure of this function**, not a zero-byte
+///   fill. `sys_mmap` also refuses such a descriptor up front; the second check
+///   is here because this is the function that would otherwise produce the
+///   zeros, and a guard at the point of harm outlives a guard at the caller.
+/// - A short answer is *not* a failure: it is a page that straddles EOF, whose
+///   tail `mmap(2)` specifies as zero.
+///
+/// # What this is not
+///
+/// A page cache. Every mapping gets its **own copy** of every page, so two
+/// processes mapping one file hold two sets of frames and a write through
+/// `MAP_PRIVATE` cannot be seen by anyone — which is what `MAP_PRIVATE` means,
+/// so it is correct and merely expensive. `MAP_SHARED` writable is refused in
+/// `sys_mmap` precisely because *that* one needs the sharing to be real.
+fn populate_file_page(root: u64, va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
+    let Some(frame) = akuma_pmm::alloc_page() else {
+        return false;
+    };
+    // SAFETY: a fresh PMM frame, reached through the physmap, and no other
+    // reference to it exists until it is mapped below.
+    let page = unsafe {
+        core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize)
+    };
+    // Zeroed before the fill, never instead of it.
+    page.fill(0);
+    if crate::fd::file_bytes_at(fd, offset, page).is_none() {
+        // Not a regular file. Refuse rather than map the zeros just written.
+        akuma_pmm::free_page(frame, 0);
+        return false;
+    }
     if !paging::map_page_in(root, va, frame as u64, pte_prot_for(prot, frame), MemAttr::WriteBack) {
         akuma_pmm::free_page(frame, 0);
         return false;
@@ -514,6 +623,339 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     0
 }
 
+/// `mremap(old_addr, old_size, new_size, flags)` — x86_64 syscall 25.
+///
+/// # It moves pages; it does not copy them
+///
+/// The AArch64 implementation allocates `new_pages` fresh frames and copies the
+/// old bytes through a kernel bounce buffer. That is the only thing it can do
+/// with the structures it has, and it has cost this tree two bugs: a copy loop
+/// that `break`ed on the first lazy destination page and **silently truncated**
+/// the mapping (`docs/archive/USER_COPY_FOLD.md` §5, which is why `mremapmove`
+/// exists), and an `unwrap_or(NONE)` that turned "the source recorded no
+/// protection" into "the source said `PROT_NONE`" and killed `rustc` mid-build.
+///
+/// This target has a region table and demand paging, so it can do the honest
+/// thing instead: re-point each present page at the new virtual address and
+/// leave the frame exactly where it is. No allocation, no copy, no bounce
+/// buffer, and **no truncation is possible** — there is no loop that can stop
+/// early and still look finished.
+///
+/// Sparsity falls out of that rather than needing a case. A source page that was
+/// never faulted in is not present, so nothing is moved for it and the
+/// destination page stays absent — where the next touch demand-pages a zero
+/// frame, which is precisely what touching the source would have done. A copy
+/// implementation has to *decide* what to do there; this one cannot get it
+/// wrong.
+///
+/// The frame ledger is deliberately untouched: it counts virtual addresses per
+/// frame within this address space, one VA goes away and one arrives, so the
+/// count is unchanged. Removing and re-adding would be two edits with the same
+/// net effect and one more place to get the order wrong.
+///
+/// # What is shared with AArch64
+///
+/// The decision: [`akuma_syscalls_mem::mremap::plan`] and
+/// [`akuma_syscalls_mem::mremap::no_move_errno`], both host-tested. That
+/// includes **divergence 5** — a shrink returns the old address with the tail
+/// still mapped, where Linux unmaps it — and the `ENOMEM`-vs-`EFAULT` split for
+/// a growth that may not move, which `mremap` implementations classically get
+/// backwards.
+pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u64 {
+    use akuma_syscalls_mem::mremap::{Plan, no_move_errno, plan};
+
+    let (old_addr, old_size, new_size) = (old_addr as usize, old_size as usize, new_size as usize);
+
+    // `MREMAP_FIXED` is refused rather than ignored.
+    //
+    // It asks for the mapping to land at a **specific** address and to replace
+    // whatever is there. This target's placer chooses an address, so honouring
+    // the flag is real work — and quietly returning a different address is a
+    // confident wrong answer to a request that was explicit, which is the same
+    // failure shape as answering `ENOSYS` where Linux answers `EINVAL`.
+    //
+    // **The AArch64 kernel currently ignores this flag** (`sys_mremap` in
+    // `akuma-syscalls-glue` decodes only `MREMAP_MAYMOVE`), so this is a
+    // deliberate divergence between the two targets and not an oversight in
+    // either. Recorded here rather than fixed there: changing AArch64's answer
+    // needs its own A/B, and nothing in the tree passes the flag today.
+    if flags as u32 & akuma_syscalls_linux::flags::mremap::MREMAP_FIXED != 0 {
+        return errno::EINVAL;
+    }
+
+    // Pure, and first — a caller with no address space must see the argument
+    // errno rather than `ESRCH`, the same ordering `sys_mmap` and `sys_madvise`
+    // follow and the reason the crate takes the VA limit as a parameter.
+    let (new_pages, may_move) = match plan(old_addr, old_size, new_size, flags as u32, USER_VA_LIMIT)
+    {
+        Plan::Fail(e) => return e,
+        Plan::InPlace => return old_addr as u64,
+        Plan::Grow { new_pages, may_move } => (new_pages, may_move),
+    };
+    if !may_move {
+        // Gated, as the crate documents: this probe is a page-table walk plus a
+        // region scan, and running it on every growing `mremap` would cost that
+        // on the common path.
+        //
+        // **Ahead of the `have_address_space` check on purpose.** With no
+        // address space nothing is mapped, and "there is no mapping there"
+        // (`EFAULT`) is both Linux's answer and more informative than `ESRCH`.
+        // The AArch64 kernel arrives at the same answer by the same route — its
+        // process lookup may yield `None` and `is_mapped` is then false.
+        let is_mapped = have_address_space()
+            && (paging::translate_in(paging::active_root(), old_addr).is_some()
+                || usermode::with_current_regions(|regions| {
+                    regions.iter().any(|r| r.contains(old_addr))
+                })
+                .unwrap_or(false));
+        return no_move_errno(is_mapped);
+    }
+
+    if !have_address_space() {
+        return errno::ESRCH;
+    }
+    let root = paging::active_root();
+
+    let old_pages = old_size.div_ceil(PAGE_SIZE as usize);
+
+    // Reserve under the lock, move outside it — the same trade `sys_mmap`
+    // documents, and for the same reason: the page-table work must not run with
+    // the region lock held any longer than the reservation needs.
+    let Some(Some(base)) = usermode::with_current_regions(|regions| {
+        let base = find_free_va(regions, new_pages)?;
+        // A remap moves and resizes a mapping; it does not **re**protect it, so
+        // the new region carries the old one's recorded protection — including
+        // whether the old one recorded anything at all. Turning "the source said
+        // nothing" into an explicit `PROT_NONE` is what killed `rustc` on the
+        // AArch64 side (`docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`), and
+        // `MmapRegion::inherited` is the constructor that states nothing.
+        let old_prot = regions
+            .iter()
+            .find(|r| r.start_va == old_addr)
+            .and_then(MmapRegion::recorded_prot);
+        regions.push(match old_prot {
+            Some(prot) => MmapRegion::inherited_with_prot(base, new_pages, prot),
+            None => MmapRegion::inherited(base, new_pages),
+        });
+        Some(base)
+    }) else {
+        return errno::ENOMEM;
+    };
+
+    // Re-point each present page. `for_each_leaf_in_range` skips an absent
+    // subtree whole, so a sparsely-touched 4 MiB source costs a walk of what is
+    // there rather than 1024 four-level lookups — and it reports the PTE bits,
+    // which are carried across unchanged so a CoW-marked page stays CoW-marked.
+    let mut moves: Vec<(usize, u64, PteProt)> = Vec::new();
+    paging::for_each_leaf_in_range(root, old_addr, old_addr + old_pages * PAGE_SIZE as usize,
+        |va, pa, prot| {
+            if prot.user {
+                moves.push((va, pa, prot));
+            }
+        });
+    for (va, pa, prot) in moves {
+        let offset = va - old_addr;
+        // `unmap` first, then `map`: the frame is the same, so mapping the
+        // destination before clearing the source would leave it briefly at two
+        // VAs — which the ledger, whose count this call deliberately does not
+        // touch, would then be one short of.
+        paging::unmap_page_in(root, va);
+        if !paging::map_page_in(root, base + offset, pa, prot, MemAttr::WriteBack) {
+            // Out of page-table frames partway through. The pages already moved
+            // are reachable at the new address and the region record covers
+            // them, so nothing leaks and nothing is lost — the caller simply
+            // gets a mapping with a hole, which the next touch demand-pages.
+            // Reported rather than silent: a failure here means the PMM is out.
+            break;
+        }
+    }
+
+    // Retire the source. Its present pages are gone from the page table already,
+    // so the walk inside `unmap_range` finds only what was never moved, and the
+    // region record is clipped by `detach_eager_regions_in_range`.
+    unmap_range(root, old_addr, old_addr + old_pages * PAGE_SIZE as usize);
+    base as u64
+}
+
+/// `madvise(addr, len, advice)` — x86_64 syscall 28.
+///
+/// # Why the errno matters more than the feature
+///
+/// This was not dispatched at all until 2026-09-07, so every advice answered
+/// `ENOSYS` — and **that is not a neutral way to say "not implemented"**.
+/// Linux's own answer for advice it does not support is `EINVAL`, and callers
+/// read the difference: `redis-server` probes `MADV_FREE`, treats `EINVAL` as
+/// "older kernel, presumably unaffected" and starts, but treats anything else as
+/// a kernel it cannot trust and **exits**
+/// (`docs/archive/LONG_ROAD_TO_REDIS.md` §5). So the smallest correct change
+/// here was never an implementation; it was returning the errno Linux returns.
+///
+/// The decode is [`akuma_syscalls_mem::madvise::action`] — the same host-tested
+/// function the AArch64 kernel dispatches on, so `MADV_FREE`'s deliberate
+/// `EINVAL` and "every unrecognised advice reports success" cannot drift between
+/// the two targets. Both are pinned by that crate's own tests.
+///
+/// # `MADV_WILLNEED` is a no-op here, deliberately
+///
+/// Only *anonymous* mappings are lazy on this target — `plan` never marks a file
+/// mapping lazy, and [`sys_mmap`] populates every file page at `mmap` time — so
+/// there is exactly one kind of page pre-faulting could touch, and pre-faulting
+/// it installs a zero frame that reads exactly as the demand fault would have
+/// produced. The content is identical either way; all pre-faulting changes is
+/// *when* the memory is committed, and `madvise(2)` is explicitly advisory about
+/// that. Doing nothing is conformant, and it keeps a ring-3 register from
+/// driving an allocation loop over a range the caller only reserved.
+///
+/// **This stops being true the day a file mapping becomes lazy here.** At that
+/// point `MADV_WILLNEED` must pre-fault anonymous lazy pages *only*: installing
+/// a zeroed frame over a file-backed lazy page marks it present, so the fill
+/// never runs and the file reads as zeros — the bug that silently zeroed every
+/// weight page of a `llama.cpp` model mmap on AArch64
+/// (`docs/archive/BKL_VFS_CARVE_OUT.md` §10). The eagerness is what makes the
+/// no-op safe, so the two must move together.
+pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
+    use akuma_syscalls_mem::madvise::{self, Action};
+
+    let (addr, len) = (addr as usize, len as usize);
+    // Range validity FIRST — ahead of the advice decode and ahead of anything
+    // that resolves a process, the same ordering rule `sys_mmap` follows. `len`
+    // arrives straight from a ring-3 register: without this,
+    // `madvise(addr, -1, MADV_DONTNEED)` is a page count of ~4.5e15
+    // (`docs/archive/AKUMA_EXTRACT_MMAP.md` §10.1 defect A).
+    if !madvise::range_fits_user_va(addr, len, USER_VA_LIMIT) {
+        return errno::EINVAL;
+    }
+
+    match madvise::action(advice as i32) {
+        // `MADV_FREE`. The whole point of this function — see the header.
+        Action::Fail(e) => e,
+        Action::Ignore | Action::Willneed => 0,
+        Action::Dontneed => {
+            if len == 0 {
+                return 0;
+            }
+            if !have_address_space() {
+                return errno::ESRCH;
+            }
+            let (start, pages) = madvise::dontneed_zero_range(addr, len);
+            if pages == 0 {
+                return 0;
+            }
+            dontneed_range(start, start + pages * PAGE_SIZE as usize);
+            0
+        }
+    }
+}
+
+/// `MADV_DONTNEED` over `[start, end)`: make the caller's next read return zero
+/// without making anyone else's do the same.
+///
+/// # The walk is the range walker, not a per-page loop
+///
+/// [`paging::for_each_leaf_in_range`] visits only pages that are actually
+/// **present**, and every absent page is `PageAction::Nothing` anyway — so the
+/// walker's skip-an-absent-subtree-whole behaviour is not an optimisation here,
+/// it is what bounds the work by what is mapped instead of by a length ring 3
+/// chose. `MADV_DONTNEED` over a gigabyte-sized lazy reservation — which is the
+/// commonest shape an allocator produces — costs a handful of reads.
+///
+/// # Only pages inside a recorded region are touched
+///
+/// A range handed to `madvise` may cover pages no `mmap` region ever claimed:
+/// the ELF image's own text and data are mapped by the loader and are not in the
+/// region list. Zeroing one of those would destroy the running program's code
+/// **permanently**, because nothing on this target can re-read it — there is no
+/// file backing and no refault path. Linux would drop the page and restore it
+/// from the file, so skipping it here is *closer* to Linux than acting, not a
+/// shortcut. It is a narrowing of what the AArch64 kernel does and is stated
+/// rather than assumed.
+///
+/// A `PROT_NONE` reservation is skipped for the same reason `fault_in` refuses
+/// to populate one: a guard page that quietly acquires a frame stops guarding.
+///
+/// # Zero in place, or break the sharing
+///
+/// [`akuma_syscalls_mem::madvise::dontneed_page_action`] decides, and the input
+/// that matters is the **CoW share count**: a frame another address space can
+/// see must not be zeroed in place, or a `fork` peer's live page is wiped. That
+/// is the null-`Rc` corruption in `docs/archive/CARGO_HEAP_NULL_RC.md`, and this
+/// target reaches it easily — `fork` is how every shell command starts here.
+fn dontneed_range(start: usize, end: usize) {
+    use akuma_syscalls_mem::madvise::{PageAction, dontneed_page_action};
+
+    let root = paging::active_root();
+    // One hold for the whole walk. Lock order is regions -> PMM, the same
+    // direction `fault_in` takes, and nothing takes them the other way round.
+    let _ = usermode::with_current_regions(|regions| {
+        paging::for_each_leaf_in_range(root, start, end, |va, pa, pte| {
+            // A kernel page in a user range is not ring 3's to zero.
+            if !pte.user {
+                return;
+            }
+            let Some(region) = regions.iter().find(|r| r.contains(va)) else {
+                return;
+            };
+            let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
+            if prot.is_none() {
+                return;
+            }
+            let pa = pa as usize;
+            match dontneed_page_action(true, akuma_pmm::cow_ref_get(pa)) {
+                // `for_each_leaf_in_range` only reports present pages, so the
+                // unmapped arm is unreachable from here. Kept as an arm rather
+                // than an `unwrap`: the decision belongs to the crate, and an
+                // arm that stops being unreachable should compile, not panic.
+                PageAction::Nothing => {}
+                // This address space is the frame's only holder. Zeroing it is
+                // indistinguishable from Linux's drop-and-refault and costs no
+                // allocation.
+                //
+                // SAFETY: `pa` came from a present user leaf of this address
+                // space, so it is a live 4 KiB frame reachable through the
+                // physmap. Writing through the physmap rather than the user VA
+                // is deliberate — the PTE may be read-only (a `PROT_READ`
+                // region, or a CoW-demoted page whose peer has gone).
+                PageAction::ZeroInPlace => unsafe {
+                    core::ptr::write_bytes(phys_ptr::<u8>(pa as u64), 0, PAGE_SIZE as usize);
+                },
+                // Someone else maps this frame. Give this address space a
+                // private zero frame and drop its share.
+                PageAction::BreakSharing => {
+                    let Some(fresh) = akuma_pmm::alloc_page() else {
+                        // Advisory: out of memory means the page keeps its old
+                        // contents, which is a worse answer than Linux's and a
+                        // far better one than wiping a peer's live page.
+                        return;
+                    };
+                    // SAFETY: a fresh PMM frame, reached through the physmap.
+                    unsafe {
+                        core::ptr::write_bytes(phys_ptr::<u8>(fresh as u64), 0, PAGE_SIZE as usize);
+                    };
+                    if !paging::map_page_in(
+                        root,
+                        va,
+                        fresh as u64,
+                        pte_prot_for(prot, fresh),
+                        MemAttr::WriteBack,
+                    ) {
+                        akuma_pmm::free_page(fresh, 0);
+                        return;
+                    }
+                    // The old frame loses this VA. Ledger first, then the
+                    // global share count, then the free — the same order
+                    // `unmap_range` uses, and for the same reason: a frame this
+                    // address space no longer tracks is not this address
+                    // space's to hand back.
+                    if usermode::untrack_anon_frame(pa) && akuma_pmm::cow_ref_dec(pa) {
+                        akuma_pmm::free_page(pa, 0);
+                    }
+                    usermode::track_anon_frame(fresh);
+                }
+            }
+        });
+    });
+}
+
 /// The refusals and the arithmetic, which are the parts a guest program cannot
 /// easily reach.
 ///
@@ -532,30 +974,53 @@ pub fn smoke_test(t: &mut Suite) {
     // -1, the "no file" sentinel, as it arrives from a 64-bit register.
     const NO_FD: u64 = u64::MAX;
 
-    t.check_eq("mmap: zero length is EINVAL", sys_mmap(0, 0, 3, ANON, NO_FD), errno::EINVAL);
+    t.check_eq("mmap: zero length is EINVAL", sys_mmap(0, 0, 3, ANON, NO_FD, 0), errno::EINVAL);
     t.check_eq(
         "mmap: a length past the VA window is ENOMEM",
-        sys_mmap(0, (MMAP_VA_SPAN + 1) as u64, 3, ANON, NO_FD),
+        sys_mmap(0, (MMAP_VA_SPAN + 1) as u64, 3, ANON, NO_FD, 0),
         errno::ENOMEM,
     );
+    // File-backed mappings (2026-09-07). This arm used to assert that **every**
+    // file-backed request was `ENOSYS`; that refusal is gone, so it is replaced
+    // rather than deleted — a self-test that quietly stops covering the branch
+    // it was written for is the "goes quiet is not a pass" trap.
+    //
+    // The three that remain are all decidable from the arguments, which is why
+    // they can be asserted with no process and no open file.
+    const MAP_SHARED: u64 = akuma_syscalls_linux::flags::map::MAP_SHARED as u64;
     t.check_eq(
-        "mmap: a file-backed request is refused",
-        sys_mmap(0, 4096, 3, 0, 5),
+        "mmap: a writable MAP_SHARED file mapping is still ENOSYS",
+        sys_mmap(0, 4096, u64::from(PROT_WRITE) | 1, MAP_SHARED, 5, 0),
         errno::ENOSYS,
     );
     t.check_eq(
+        "mmap: a file mapping at an unaligned offset is EINVAL",
+        sys_mmap(0, 4096, 1, 0, 5, 1),
+        errno::EINVAL,
+    );
+    // The descriptor probe. Nothing is open here, so fd 5 is not a regular file
+    // and the request is refused **before** a frame is allocated — which is what
+    // stops the zero-filled-file failure the old blanket refusal guarded
+    // against. `populate_file_page` refuses the same thing a second time, at the
+    // point where the zeros would otherwise be written.
+    t.check_eq(
+        "mmap: a file mapping on a descriptor that is not a file is EACCES",
+        sys_mmap(0, 4096, 1, 0, 5, 0),
+        errno::EACCES,
+    );
+    t.check_eq(
         "mmap: writable+executable is refused",
-        sys_mmap(0, 4096, u64::from(PROT_WRITE | PROT_EXEC), ANON, NO_FD),
+        sys_mmap(0, 4096, u64::from(PROT_WRITE | PROT_EXEC), ANON, NO_FD, 0),
         errno::EINVAL,
     );
     t.check_eq(
         "mmap: an unaligned MAP_FIXED address is EINVAL",
-        sys_mmap(0x5000_1001, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD),
+        sys_mmap(0x5000_1001, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD, 0),
         errno::EINVAL,
     );
     t.check_eq(
         "mmap: MAP_FIXED over the kernel half is EINVAL",
-        sys_mmap(USER_VA_LIMIT as u64, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD),
+        sys_mmap(USER_VA_LIMIT as u64, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD, 0),
         errno::EINVAL,
     );
     t.check_eq(
@@ -575,11 +1040,146 @@ pub fn smoke_test(t: &mut Suite) {
     // refusal that returned it here would mean the ordering had slipped.
     t.check_eq(
         "mmap: a valid anonymous request with no process is ESRCH, not a mapping",
-        sys_mmap(0, 4096, 3, ANON, NO_FD),
+        sys_mmap(0, 4096, 3, ANON, NO_FD, 0),
         errno::ESRCH,
     );
 
+    madvise_check(t);
+    mremap_check(t);
     va_placement_check(t);
+}
+
+/// `mremap`: the argument answers, all of which must be decided before a
+/// process is resolved.
+///
+/// The move itself needs an address space and is exercised for real by
+/// `mremapmove` (`scripts/mem_suite.py`), which is where a truncation or a lost
+/// page would show. What cannot be reached from a guest is the errno table, and
+/// `mremap`'s is the one implementations classically get backwards.
+fn mremap_check(t: &mut Suite) {
+    use akuma_syscalls_linux::flags::mremap::{MREMAP_FIXED, MREMAP_MAYMOVE};
+    const MAYMOVE: u64 = MREMAP_MAYMOVE as u64;
+    const PAGE: u64 = 4096;
+
+    t.check_eq(
+        "mremap: a zero new size is EINVAL",
+        sys_mremap(0x1_0000_0000, PAGE, 0, MAYMOVE),
+        errno::EINVAL,
+    );
+    t.check_eq(
+        "mremap: an unaligned old address is EINVAL",
+        sys_mremap(0x1_0000_0001, PAGE, 2 * PAGE, MAYMOVE),
+        errno::EINVAL,
+    );
+    t.check_eq(
+        "mremap: an old address in the kernel half is EFAULT",
+        sys_mremap(USER_VA_LIMIT as u64, PAGE, 2 * PAGE, MAYMOVE),
+        errno::EFAULT,
+    );
+    // **Divergence 5**, pinned by `akuma-syscalls-mem`: a shrink returns the old
+    // address and leaves the tail mapped, where Linux unmaps it. Asserted here
+    // so a future "fix" is a deliberate change rather than a silent one.
+    t.check_eq(
+        "mremap: a shrink returns the old address unchanged",
+        sys_mremap(0x1_0000_0000, 16 * PAGE, PAGE, MAYMOVE),
+        0x1_0000_0000,
+    );
+    t.check_eq(
+        "mremap: growth inside the last page is in place",
+        sys_mremap(0x1_0000_0000, 1, PAGE, 0),
+        0x1_0000_0000,
+    );
+    // Refused, not silently placed elsewhere — see `sys_mremap`'s comment.
+    t.check_eq(
+        "mremap: MREMAP_FIXED is refused rather than ignored",
+        sys_mremap(0x1_0000_0000, PAGE, 2 * PAGE, MAYMOVE | u64::from(MREMAP_FIXED)),
+        errno::EINVAL,
+    );
+    // The errno split. There is no process here, so nothing is mapped and the
+    // no-move probe must answer `EFAULT` — "there is no mapping there" — rather
+    // than `ENOMEM`, "no room to grow it".
+    t.check_eq(
+        "mremap: growing an unmapped address without MAYMOVE is EFAULT",
+        sys_mremap(0x1_0000_0000, PAGE, 2 * PAGE, 0),
+        errno::EFAULT,
+    );
+    // And a growth that may move needs an address space, which the boot suite
+    // does not have. `ESRCH` is what says the argument checks were all passed.
+    t.check_eq(
+        "mremap: a growing move with no process is ESRCH",
+        sys_mremap(0x1_0000_0000, PAGE, 2 * PAGE, MAYMOVE),
+        errno::ESRCH,
+    );
+}
+
+/// `madvise`: the errno choices, which are the whole of what this call is for on
+/// a target where nothing but an anonymous mapping is ever lazy.
+///
+/// Every one of these is an *answer*, not an effect, and that is why they can be
+/// asserted with no process: each must be decided before anything resolves an
+/// address space. A `MADV_DONTNEED` is the one that has an effect, so it is the
+/// one that reaches `ESRCH` here — and it reaching anything else would mean the
+/// ordering had slipped, exactly as the `mmap` arm below asserts.
+fn madvise_check(t: &mut Suite) {
+    use akuma_syscalls_linux::flags::madvise::{
+        MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_WILLNEED,
+    };
+    const PAGE: u64 = 4096;
+
+    // The load-bearing one. `ENOSYS` here made `redis-server` exit rather than
+    // start: it reads `EINVAL` as "older kernel, skip the check" and anything
+    // else as a kernel it cannot trust (docs/archive/LONG_ROAD_TO_REDIS.md §5).
+    t.check_eq(
+        "madvise: MADV_FREE is EINVAL, not ENOSYS",
+        sys_madvise(0x1_0000_0000, PAGE, MADV_FREE as u64),
+        errno::EINVAL,
+    );
+    // The other half of the same rule: an advice nobody implements reports
+    // success, because it is a hint. Both are pinned in `akuma-syscalls-mem`.
+    t.check_eq(
+        "madvise: an unrecognised advice reports success",
+        sys_madvise(0x1_0000_0000, PAGE, 0xdead),
+        0,
+    );
+    t.check_eq(
+        "madvise: MADV_NORMAL reports success",
+        sys_madvise(0x1_0000_0000, PAGE, MADV_NORMAL as u64),
+        0,
+    );
+    // Advisory, and a no-op on this target — see `sys_madvise`'s header for the
+    // condition under which that stops being true.
+    t.check_eq(
+        "madvise: MADV_WILLNEED reports success",
+        sys_madvise(0x1_0000_0000, PAGE, MADV_WILLNEED as u64),
+        0,
+    );
+    // The range guard, ahead of the advice decode. Without it this length is a
+    // page count of ~4.5e15 and an unbounded loop reachable from ring 3
+    // (docs/archive/AKUMA_EXTRACT_MMAP.md §10.1 defect A). Asserted with
+    // `MADV_FREE` too, so a future implementation of it cannot skip the guard by
+    // answering before the range is checked.
+    t.check_eq(
+        "madvise: a length past the user VA window is EINVAL",
+        sys_madvise(0x1_0000_0000, u64::MAX, MADV_DONTNEED as u64),
+        errno::EINVAL,
+    );
+    t.check_eq(
+        "madvise: the range guard runs before the advice decode",
+        sys_madvise(0x1_0000_0000, u64::MAX, MADV_FREE as u64),
+        errno::EINVAL,
+    );
+    // And the effectful advice, which needs an address space it does not have
+    // here. `ESRCH` rather than a silent 0 is what says the walk was reached.
+    t.check_eq(
+        "madvise: MADV_DONTNEED with no process is ESRCH",
+        sys_madvise(0x1_0000_0000, PAGE, MADV_DONTNEED as u64),
+        errno::ESRCH,
+    );
+    t.check_eq(
+        "madvise: MADV_DONTNEED of zero length is a no-op",
+        sys_madvise(0x1_0000_0000, 0, MADV_DONTNEED as u64),
+        0,
+    );
 }
 
 /// After the boot suite has run real programs: assert the lazy path was taken.

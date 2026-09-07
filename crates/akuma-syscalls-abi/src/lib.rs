@@ -96,6 +96,17 @@ pub enum Syscall {
     SetTidAddress,
     Getrandom,
     Fcntl,
+    /// Positional read. Added 2026-09-07 for the amd64 port, which had no arm
+    /// for it at all — `mmapsum`'s `read()` reference arm aborted at offset 0
+    /// and every archive reader and `rustc` metadata load goes through it.
+    Pread64,
+    /// Added 2026-09-07 with [`Self::Pread64`]. The amd64 kernel answers the
+    /// advice decode out of `akuma_syscalls_mem::madvise::action`, which is
+    /// where `MADV_FREE`'s deliberate `EINVAL` lives.
+    Madvise,
+    /// Added 2026-09-07. `akuma_syscalls_mem::mremap` holds the
+    /// move-vs-expand decision both kernels build against.
+    Mremap,
 }
 
 /// x86_64 Linux numbers.
@@ -137,6 +148,9 @@ pub mod x86_64 {
     pub const OPENAT: u64 = 257;
     pub const FCNTL: u64 = 72;
     pub const GETRANDOM: u64 = 318;
+    pub const PREAD64: u64 = 17;
+    pub const MADVISE: u64 = 28;
+    pub const MREMAP: u64 = 25;
 }
 
 impl Syscall {
@@ -178,6 +192,9 @@ impl Syscall {
             n::OPENAT => Self::Openat,
             n::FCNTL => Self::Fcntl,
             n::GETRANDOM => Self::Getrandom,
+            n::PREAD64 => Self::Pread64,
+            n::MADVISE => Self::Madvise,
+            n::MREMAP => Self::Mremap,
             _ => return None,
         })
     }
@@ -208,6 +225,9 @@ impl Syscall {
             n::OPENAT => Self::Openat,
             n::FCNTL => Self::Fcntl,
             n::GETRANDOM => Self::Getrandom,
+            n::PREAD64 => Self::Pread64,
+            n::MADVISE => Self::Madvise,
+            n::MREMAP => Self::Mremap,
             _ => return None,
         })
     }
@@ -255,6 +275,9 @@ impl Syscall {
             Self::Openat => n::OPENAT,
             Self::Fcntl => n::FCNTL,
             Self::Getrandom => n::GETRANDOM,
+            Self::Pread64 => n::PREAD64,
+            Self::Madvise => n::MADVISE,
+            Self::Mremap => n::MREMAP,
         }
     }
 
@@ -297,6 +320,9 @@ impl Syscall {
             Self::Openat => n::OPENAT,
             Self::Fcntl => n::FCNTL,
             Self::Getrandom => n::GETRANDOM,
+            Self::Pread64 => n::PREAD64,
+            Self::Madvise => n::MADVISE,
+            Self::Mremap => n::MREMAP,
         }
     }
 }
@@ -333,6 +359,9 @@ mod tests {
         Syscall::SetTidAddress,
         Syscall::Getrandom,
         Syscall::Fcntl,
+        Syscall::Pread64,
+        Syscall::Madvise,
+        Syscall::Mremap,
     ];
 
     #[test]

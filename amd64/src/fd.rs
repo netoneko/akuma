@@ -134,6 +134,14 @@ pub mod errno {
     /// in the middle of, so the call fails rather than acting on a dying
     /// address space.
     pub const EINTR: u64 = (-4i64) as u64;
+    /// Not a seekable descriptor. `pread`/`pwrite` on a pipe, socket or the
+    /// console — an answer about the *kind* of descriptor, which is why it is
+    /// not `EBADF`: musl's `FILE` layer falls back to `read()` on `ESPIPE` and
+    /// gives up on `EBADF`.
+    pub const ESPIPE: u64 = (-29i64) as u64;
+    /// Permission denied. `mmap` on a descriptor that is not a regular file —
+    /// Linux's answer for a mapping request the descriptor cannot back.
+    pub const EACCES: u64 = (-13i64) as u64;
 
     /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
     /// returned as `(-errno) as u64` — the very top of the range. Anything below
@@ -1383,6 +1391,125 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     .unwrap_or(errno::EBADF)
 }
 
+/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17.
+///
+/// A read from an explicit offset that **does not move the descriptor's
+/// cursor**. That is the whole difference from [`sys_read`], and it is the
+/// reason the two cannot share a body: `sys_read` mutates `file.position` and
+/// every caller of `pread` is relying on it not to.
+///
+/// # Why this exists
+///
+/// It was not dispatched at all until 2026-09-07, so every `pread` on this
+/// target returned `ENOSYS`. `scripts/mem_suite.py`'s `mmapsum` is what found
+/// it — its `read()` reference arm is a `pread` loop and it aborted at offset 0
+/// before comparing anything (`docs/archive/AKUMA_AMD64_MEMORY_GAPS.md` §1) —
+/// but the probe is only the messenger. `pread` is how every archive reader,
+/// every `rustc` metadata load and every threaded reader of a shared
+/// description reaches into a file, precisely because it needs no lock around a
+/// seek-then-read pair.
+///
+/// # The errnos, and why `ESPIPE` is not `EBADF`
+///
+/// A pipe, socket or console descriptor has no offset to read from, and Linux
+/// says `ESPIPE` for that — a *seekability* answer, distinct from "no such
+/// descriptor". Answering `EBADF` instead would tell a caller its fd was closed
+/// when it is open and perfectly readable, which is the wrong-errno failure this
+/// document's §2 is about in a second place: musl's `FILE` layer falls back to
+/// `read()` on `ESPIPE` and gives up on `EBADF`.
+///
+/// A negative `offset` is `EINVAL`. It arrives as a `u64` from a ring-3
+/// register, so the sign has to be recovered before it is used as an index —
+/// `0xFFFF_FFFF_FFFF_FFFF` as a `usize` offset would otherwise sail past every
+/// bound check by being larger than any file.
+pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
+    // Signed on the wire. Recovered before anything indexes with it.
+    let off = offset.cast_signed();
+    if off < 0 {
+        return errno::EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    // Clamped, not refused — the same rule and the same reason as `sys_read`:
+    // an oversized count is ordinary POSIX and a short read is the contract.
+    let len = len.min(MAX_IO);
+
+    // Not seekable: a socket, a pipe, or an unbound 0/1/2 (the console).
+    // Checked ahead of the table lookup so the answer is about the *kind* of
+    // descriptor rather than about whether a file happens to sit behind it.
+    if socket_index(fd).is_some() || pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() {
+        return errno::ESPIPE;
+    }
+    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+        return errno::ESPIPE;
+    }
+
+    with_file(fd, |entry| {
+        if entry.is_dir {
+            return errno::EISDIR;
+        }
+        // Read-only descriptors are fine; what is not is a descriptor that is
+        // not a file at all. `entry.file()` is the same gate `sys_read` uses.
+        if entry.file().is_none() {
+            return errno::EBADF;
+        }
+        let total = entry.data.len();
+        let pos = off as usize;
+        // Past the end is 0, not an error — `read(2)`'s rule, and what a
+        // digest loop reading to EOF depends on to terminate.
+        let n = total.saturating_sub(pos).min(len as usize);
+        if n == 0 {
+            return 0;
+        }
+        // **`file.position` is deliberately not touched.** That is the entire
+        // contract of this call.
+        copy_to_user(buf, &entry.data[pos..pos + n])
+    })
+    .unwrap_or(errno::EBADF)
+}
+
+/// Copy `dst.len()` bytes of `fd`'s cached contents starting at byte `offset`
+/// into `dst`, returning how many were actually available.
+///
+/// The backing for `mmap(MAP_PRIVATE, fd)` — see `mm::sys_mmap`. `None` means
+/// `fd` is not a regular file, which is the one case a file mapping must refuse
+/// rather than serve.
+///
+/// Bytes past the end of the file are **not written**, so the caller's buffer
+/// keeps whatever it had there. Every caller hands in a freshly zeroed page,
+/// which is what makes that the right split: a mapping that extends past EOF
+/// reads as zeros, exactly as `mmap(2)` specifies for the partial last page.
+///
+/// This reads `Entry::data` — the whole-file buffer `sys_openat` fills. That is
+/// what makes a file mapping cheap to serve here and also what bounds it: a file
+/// that could not be read into the kernel cannot be mapped either, and both fail
+/// at `open`.
+pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
+    with_file(fd, |entry| {
+        if entry.is_dir || entry.file().is_none() {
+            return None;
+        }
+        let total = entry.data.len();
+        let n = total.saturating_sub(offset).min(dst.len());
+        if n > 0 {
+            dst[..n].copy_from_slice(&entry.data[offset..offset + n]);
+        }
+        Some(n)
+    })
+    .flatten()
+}
+
+/// Is `fd` a regular file — something `mmap` can back a mapping with?
+///
+/// Separate from [`file_bytes_at`] because `mmap` has to refuse a socket, a pipe
+/// or a directory **before** it places a region, and a zero-byte answer from the
+/// copy is not the same thing as "this cannot be mapped".
+#[must_use]
+pub fn is_regular_file(fd: u64) -> bool {
+    with_file(fd, |entry| !entry.is_dir && entry.file().is_some()).unwrap_or(false)
+}
+
 /// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
 /// `usermode.rs` does not itself handle (console, pipe, socket).
 ///
@@ -2224,6 +2351,24 @@ pub fn sys_access(path: u64) -> u64 {
         p.push_str(&path);
         p
     };
+    // `/proc` first, through the **same** `proc_metadata` `stat` uses.
+    //
+    // This was missing until 2026-09-07 and it made `access` and `open`
+    // disagree about what exists: `/proc/self/status` opened fine, `stat`ed
+    // fine, and `access(R_OK)` said `ENOENT`. `render_proc_file`'s own header
+    // says one function serves `open` and `stat` "so the two can never disagree
+    // about what exists" — and there was a third caller that never asked it.
+    // `smapsdirty`'s `proc-self-files` sub-probe reported `stat`, `status` and
+    // `cmdline` missing on a target that serves all three, which is what found
+    // it (`docs/archive/AKUMA_AMD64_MEMORY_GAPS.md` §3).
+    let proc_rest = if normalised == "/proc" {
+        Some("")
+    } else {
+        normalised.strip_prefix("/proc/")
+    };
+    if let Some(rest) = proc_rest {
+        return if proc_metadata(rest).is_some() { 0 } else { errno::ENOENT };
+    }
     if fs::metadata(&normalised).is_some() {
         0
     } else {
@@ -2353,8 +2498,36 @@ fn install_synthetic_dir(path: &str, names: Vec<(alloc::string::String, u8)>, fl
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 
-/// The per-process files this target serves under `/proc/<pid>/`.
+/// The per-process files this target serves under `/proc/<pid>/` for **any**
+/// pid. Rendered by `akuma-procfs` out of the spawn table, which is the only
+/// process state reachable by pid here.
 const PID_FILES: [&str; 3] = ["cmdline", "stat", "status"];
+
+/// The two more it serves for the **calling** process only.
+///
+/// `maps` and `statm` describe an *address space*, and the only address space
+/// this target can name is the running one: `PROCS` is keyed by scheduler slot,
+/// the spawn table is keyed by pid, and nothing joins them. Every real reader of
+/// these two files reads its own — an allocator sizing its arenas, a sanitiser
+/// finding the heap, `ps` reading `statm` for its own RSS — so serving `self`
+/// and nothing else is a narrowing rather than a fiction.
+///
+/// **It must be a narrowing of the listing too.** `open_proc`'s own comment
+/// spells out why: a name advertised in `/proc/<pid>` whose `stat` then says
+/// `ENOENT` is how `ls /proc/2` prints "No such file or directory" about its own
+/// listing. So [`pid_files`] returns these only for the pid that can serve them,
+/// and `render_pid_file` refuses them for any other — one rule, asserted in both
+/// directions by `proc_check`.
+const SELF_ONLY_PID_FILES: [&str; 2] = ["maps", "statm"];
+
+/// The per-process file names `/proc/<pid>` should list, for this pid.
+fn pid_files(pid: u32) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = PID_FILES.to_vec();
+    if pid == crate::usermode::current_pid() {
+        out.extend_from_slice(&SELF_ONLY_PID_FILES);
+    }
+    out
+}
 
 /// Normalise a path under `/proc`: drop trailing slashes, then rewrite a
 /// leading `self` to the calling process's own pid.
@@ -2414,8 +2587,161 @@ fn render_pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         // Already in the `/proc` wire form (NUL-separated) — `usermode` stores
         // it that way, so this is a copy rather than a render.
         "cmdline" => Some(entry.cmdline.clone()),
+        // The two address-space files, for the caller's own pid only — see
+        // `SELF_ONLY_PID_FILES` for why, and note the guard is here as well as
+        // in `pid_files` so `open`, `stat` and `access` all agree.
+        "maps" if pid == crate::usermode::current_pid() => Some(render_self_maps()),
+        "statm" if pid == crate::usermode::current_pid() => Some(render_self_statm()),
         _ => None,
     }
+}
+
+/// `/proc/self/maps` — the calling process's address space, ascending.
+///
+/// # Two sources, because neither alone is the address space
+///
+/// The **region list** holds what `mmap` recorded, including a lazy reservation
+/// no page of which exists yet — Linux reports a VMA, not its resident pages, so
+/// that is the authoritative extent wherever there is one. But the ELF image and
+/// the initial stack are placed by the loader and are deliberately *not*
+/// regions (`mm.rs`: the region table is `mmap`'s; frame ownership is the
+/// ledger's), so a walk of the regions alone produces an **empty** file for an
+/// ordinary program — which is what the first version of this function did.
+///
+/// That is worse than not serving the file at all, and it is the same mistake as
+/// answering `ENOSYS` where Linux answers `EINVAL`: a reader scanning `maps` for
+/// the mapping containing an address gets a confident "there is none" instead of
+/// "this kernel cannot tell you". So the present **page-table leaves** outside
+/// every region are coalesced into runs and reported too — the image, the stack,
+/// and anything else the loader mapped.
+///
+/// # What it still is not
+///
+/// A run of leaves is not a VMA: two adjacent loader mappings with identical
+/// permissions merge into one line, and a lazy region's unfaulted middle is one
+/// line rather than a hole. Both are what the hardware says, which is the only
+/// record this target keeps for loader pages.
+///
+/// # Ascending, because that is part of the format
+///
+/// The region list is not kept in address order — `detach_eager_regions_in_range`
+/// pushes survivors onto the end — and a parser that stops at the first line past
+/// the address it wants would miss on an unsorted file.
+fn render_self_maps() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut line = [0u8; akuma_procfs::MAPS_LINE_MAX];
+    for (start, end, read, write, exec, private) in self_map_rows() {
+        let n = akuma_procfs::render_maps_line(
+            start, end, read, write, exec, private, "", &mut line,
+        );
+        out.extend_from_slice(&line[..n]);
+    }
+    out
+}
+
+/// `(start, end, readable, write, exec, private)` — one mapping.
+type MapRow = (usize, usize, bool, bool, bool, bool);
+
+/// The calling process's mappings, ascending. See [`render_self_maps`] for why
+/// there are two sources; this is that walk, shared with [`render_self_statm`]
+/// so `maps` and `statm` cannot report different address spaces.
+fn self_map_rows() -> Vec<MapRow> {
+    type Row = MapRow;
+
+    let mut rows: Vec<Row> = crate::usermode::with_current_regions(|regions| {
+        regions
+            .iter()
+            .map(|r| {
+                let prot = r.recorded_prot().unwrap_or(akuma_mmap::Prot::RW_NO_EXEC);
+                (
+                    r.start_va,
+                    r.start_va.saturating_add(r.len_bytes()),
+                    // A `PROT_NONE` reservation is `---p` on Linux too: a
+                    // mapping that exists and grants nothing, which is exactly
+                    // what a guard region is and what a reader looks for.
+                    !prot.is_none(),
+                    prot.is_write(),
+                    prot.is_exec(),
+                    !r.shared_anon,
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // The region extents, so the leaf walk can skip what a region already
+    // describes. Taken as a snapshot rather than re-locking per page.
+    let extents: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.1)).collect();
+
+    // Present user leaves outside every region, coalesced. `for_each_user_leaf`
+    // visits in ascending VA order (it walks each level's indices upward), which
+    // is what makes a single-pass coalesce correct rather than a sort-then-merge.
+    let mut run: Option<Row> = None;
+    crate::paging::for_each_user_leaf(crate::paging::active_root(), |va, _pa, prot| {
+        if !prot.user || extents.iter().any(|&(s, e)| va >= s && va < e) {
+            // Flush across a gap the region list already covers, so a mapping
+            // either side of it is not merged through it.
+            if let Some(r) = run.take() {
+                rows.push(r);
+            }
+            return;
+        }
+        // Every present leaf is readable — x86 has no read-disable bit, so
+        // `r` is not a fact the PTE can carry differently.
+        let (w, x) = (prot.write, prot.exec);
+        match run {
+            Some(ref mut r) if r.1 == va && r.3 == w && r.4 == x => {
+                r.1 = va + 4096;
+            }
+            _ => {
+                if let Some(r) = run.take() {
+                    rows.push(r);
+                }
+                run = Some((va, va + 4096, true, w, x, true));
+            }
+        }
+    });
+    if let Some(r) = run.take() {
+        rows.push(r);
+    }
+
+    rows.sort_unstable_by_key(|r| r.0);
+    rows
+}
+
+/// `/proc/self/statm` — the seven page counts.
+///
+/// Built from the **same** [`self_map_rows`] walk `maps` renders, which is the
+/// point: the first version summed the region list alone and reported `size 0`
+/// for an ordinary program whose `maps` plainly listed three mappings. Two
+/// files disagreeing about one address space is the shape of bug this whole
+/// `/proc` section keeps producing (see `proc_consistency_check`), so they read
+/// from one function.
+///
+/// - `size` — every mapped page, including a lazy region's unfaulted middle.
+///   That is what Linux reports and it is much larger than the resident set.
+/// - `resident` — the frame ledger's count, the only real number this target
+///   has for physical pages held.
+/// - `text` — the executable rows. `data` is the rest, which is Linux's
+///   "data + stack" and is why the two sum to `size`.
+/// - `shared` and `lib` and `dt` are 0: nothing here tracks them per process,
+///   and a fabricated breakdown would be read as a real one.
+fn render_self_statm() -> Vec<u8> {
+    let rows = self_map_rows();
+    let pages = |(s, e, _, _, _, _): &MapRow| e.saturating_sub(*s) / 4096;
+    let size_pages: usize = rows.iter().map(pages).sum();
+    let text_pages: usize = rows.iter().filter(|r| r.4).map(pages).sum();
+    let resident = crate::usermode::current_resident_pages() as u64;
+    let mut buf = [0u8; akuma_procfs::STATM_MAX];
+    let n = akuma_procfs::render_statm(
+        size_pages as u64,
+        resident,
+        0,
+        text_pages as u64,
+        size_pages.saturating_sub(text_pages) as u64,
+        &mut buf,
+    );
+    buf[..n].to_vec()
 }
 
 /// Render any `/proc` file this target serves, system-wide or per-process.
@@ -2578,7 +2904,7 @@ fn open_proc(rest: &str, flags: u64) -> Option<u64> {
         if crate::usermode::proc_by_pid(pid).is_none() {
             return Some(errno::ENOENT);
         }
-        let mut names: Vec<(alloc::string::String, u8)> = PID_FILES
+        let mut names: Vec<(alloc::string::String, u8)> = pid_files(pid)
             .iter()
             .map(|f| (alloc::string::String::from(*f), DT_REG))
             .collect();
@@ -2587,6 +2913,70 @@ fn open_proc(rest: &str, flags: u64) -> Option<u64> {
     }
 
     render_proc_file(rest).map(|data| install_synthetic_file(rest, data, flags))
+}
+
+/// `open`, `stat` and `access` must agree about every `/proc` path.
+///
+/// # Why this is a self-test and not a comment
+///
+/// The three answers came from **two** functions. `sys_openat` and
+/// `sys_newfstatat` both went through `proc_metadata`/`render_proc_file` —
+/// `render_proc_file`'s header says in as many words that one function serves
+/// both "so the two can never disagree about what exists" — and `sys_access`
+/// went straight to the disk, so it said `ENOENT` for every `/proc` path this
+/// target serves. Nothing failed loudly: `busybox` mostly `open`s, and the one
+/// caller that probes with `access` first is a program deciding whether the
+/// kernel has a `/proc` at all.
+///
+/// Found 2026-09-07 by `smapsdirty`'s `proc-self-files` sub-probe, which
+/// reported `stat status cmdline` missing on a target that serves all three.
+/// The invariant is cheap to state and was expensive to notice, so it is
+/// asserted in both directions: a path that exists answers 0 from all three, and
+/// a path that does not answers `ENOENT` from all three.
+fn proc_consistency_check(t: &mut Suite) {
+    /// One path, checked three ways. `want` is whether it should exist.
+    fn agree(t: &mut Suite, label: &'static str, path: &[u8], want: bool) {
+        let p = path.as_ptr() as u64;
+        let mut st = [0u8; 160];
+        let acc = sys_access(p);
+        let sta = sys_newfstatat((-100i64) as u64, p, st.as_mut_ptr() as u64, 0);
+        let fd = sys_openat(0, p, 0, 0);
+        let opened = !errno::is_err(fd);
+        if opened {
+            sys_close(fd);
+        }
+        t.check(label, (acc == 0) == want && (sta == 0) == want && opened == want);
+    }
+
+    // The three served for any pid, reached through `self` — which is a string
+    // rewrite here, not a symlink, so it is worth asserting rather than assuming.
+    agree(t, "proc: open/stat/access agree on /proc/self/stat", b"/proc/self/stat\0", true);
+    agree(t, "proc: open/stat/access agree on /proc/self/status", b"/proc/self/status\0", true);
+    agree(t, "proc: open/stat/access agree on /proc/self/cmdline", b"/proc/self/cmdline\0", true);
+    // The two served for the calling process only (2026-09-07).
+    agree(t, "proc: open/stat/access agree on /proc/self/maps", b"/proc/self/maps\0", true);
+    agree(t, "proc: open/stat/access agree on /proc/self/statm", b"/proc/self/statm\0", true);
+    // And the negative direction, which is the half that catches an
+    // "everything under /proc exists" fix.
+    agree(t, "proc: all three refuse a file /proc does not serve", b"/proc/self/smaps\0", false);
+    agree(t, "proc: all three refuse a pid that is not running", b"/proc/4242/stat\0", false);
+
+    // `statm` must be seven page counts, and `resident` must not be the byte
+    // count: every reader multiplies by its own page size, so bytes here read
+    // as a process 4096 times too big.
+    let sp = b"/proc/self/statm\0";
+    let fd = sys_openat(0, sp.as_ptr() as u64, 0, 0);
+    if t.check("proc: /proc/self/statm opens", fd >= FIRST_FILE_FD as u64) {
+        let mut d = [0u8; akuma_procfs::STATM_MAX];
+        let n = sys_read(fd, d.as_mut_ptr() as u64, d.len() as u64);
+        let n = n.min(d.len() as u64) as usize;
+        let text = core::str::from_utf8(&d[..n]).unwrap_or("");
+        t.check(
+            "proc: /proc/self/statm has seven fields",
+            text.trim_end().split(' ').count() == 7,
+        );
+        sys_close(fd);
+    }
 }
 
 /// Install a read-only fd whose contents are `data` (a generated file like
@@ -2869,6 +3259,8 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             sys_close(devfd);
         }
 
+        proc_consistency_check(t);
+
         // `/proc/mounts` + `statfs`, the pair `busybox df` needs. `df` reads
         // the file to learn what to ask about, then calls `statfs` once per
         // line; either one missing and it prints a header and stops, which is
@@ -2979,7 +3371,45 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             let n = sys_read(rfd, rbuf.as_mut_ptr() as u64, rbuf.len() as u64);
             t.check_eq("fd: read back the written length", n, msg.len() as u64);
             t.check("fd: read back the written bytes", &rbuf[..msg.len()] == msg);
+
+            // `pread64` (2026-09-07). The descriptor is at EOF after the read
+            // above, which is what makes the first two checks worth anything:
+            // a `pread` implemented as seek-read-seek would return 0 here, and
+            // one implemented as a plain read would return 0 *and* leave the
+            // cursor somewhere else.
+            let mut pbuf = [0u8; 64];
+            t.check_eq(
+                "fd: pread reads from its own offset, not the cursor",
+                sys_pread64(rfd, pbuf.as_mut_ptr() as u64, 5, 6),
+                5,
+            );
+            t.check("fd: pread returns the bytes at that offset", pbuf[..5] == msg[6..11]);
+            t.check_eq(
+                "fd: pread leaves the cursor where it was",
+                sys_lseek(rfd, 0, 1),
+                msg.len() as u64,
+            );
+            t.check_eq(
+                "fd: pread past the end returns 0",
+                sys_pread64(rfd, pbuf.as_mut_ptr() as u64, 8, 1_000_000),
+                0,
+            );
+            t.check_eq(
+                "fd: pread at a negative offset is EINVAL",
+                sys_pread64(rfd, pbuf.as_mut_ptr() as u64, 8, u64::MAX),
+                errno::EINVAL,
+            );
+            t.check_eq(
+                "fd: pread on the console is ESPIPE, not EBADF",
+                sys_pread64(1, pbuf.as_mut_ptr() as u64, 8, 0),
+                errno::ESPIPE,
+            );
             sys_close(rfd);
+            t.check_eq(
+                "fd: pread on a closed fd is EBADF",
+                sys_pread64(rfd, pbuf.as_mut_ptr() as u64, 8, 0),
+                errno::EBADF,
+            );
         }
     }
 

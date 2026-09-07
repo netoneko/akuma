@@ -363,6 +363,54 @@ echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapm
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o fpcpoison fpcpoison.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o shmanon shmanon.c
 )
+# The eleven probes the gate could not run because they were never staged
+# (2026-09-07). Each one existed, was written for a real incident, and had **no
+# runner at all**: `scripts/verify_trim.py` invokes a probe by bare name, so a
+# probe that is not on `disk.img` reports `sh: <name>: not found` — a legible
+# result, but only if something is asking for it, and nothing was.
+#
+# All eleven pass on an unmodified tree (measured 2026-09-07 on a
+# devbox-smoltcp at SMP=4 before being added to `EXERCISES`), and none is a
+# network probe — which is the one category the gate's own rule excludes.
+#
+# `-pthread` on the ones that spawn threads, matching the `cowstale`/`bssfork`
+# lines above. `dynchild` is deliberately NOT here: it is `dynspawn`'s spawnee
+# and must be **dynamically** linked to test what it tests, so a `-static` build
+# of it would silently pass while exercising none of the loader.
+echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipewake + readback + segvchild + segvgroup + threadmax + tlsdirty (C, signal/compute/loader/pipe/thread probes)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o abortsig abortsig.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o computecheck computecheck.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o dynspawn dynspawn.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o md5probe md5probe.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o neonstate neonstate.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o pipewake pipewake.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o readback readback.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o segvchild segvchild.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o segvgroup segvgroup.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o threadmax threadmax.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o tlsdirty tlsdirty.c
+    # `dynchild`, **dynamically linked on purpose** — it is `dynspawn`'s spawnee
+    # and exists to exercise the whole ld-musl startup path (self-relocation,
+    # library mapping, PLT/GOT). A `-static` build of it would run and exit 42
+    # while testing none of that, so the missing `-static` here is the point.
+    # `/lib/ld-musl-aarch64.so.1` is on `disk.img`, so it resolves.
+    aarch64-linux-musl-gcc -O2 -Wall -Wextra -o dynchild dynchild.c
+    # Moved here 2026-09-07 from the `WITH_FORKTEST` block. It is pure C with no
+    # Go in it, and living behind that gate is why it was never actually staged:
+    # `mmap_stress` from the same two-line block IS on `disk.img` and this was
+    # not, so the block had run once and never again after this line was added
+    # to it. The symptom of the gate then being pointed at it would have been
+    # `sh: pattern2_parent: not found` — legible, but only after a boot.
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pattern2_parent pattern2_parent.c
+)
+for b in abortsig computecheck dynspawn dynchild md5probe neonstate pipewake readback \
+         segvchild segvgroup threadmax tlsdirty pattern2_parent; do
+    cp "forktest/c_stress/$b" ../bootstrap/bin/
+done
+echo "13 previously-unstaged c_stress probes copied to bootstrap/bin/"
+
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
 cp forktest/c_stress/cowstale ../bootstrap/bin/
@@ -490,11 +538,9 @@ if [ "$WITH_FORKTEST" = true ]; then
     (
         cd forktest/c_stress
         aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mmap_stress mmap_stress.c
-        aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pattern2_parent pattern2_parent.c
     )
     cp forktest/c_stress/mmap_stress ../bootstrap/bin/
-    cp forktest/c_stress/pattern2_parent ../bootstrap/bin/
-    echo "mmap_stress + pattern2_parent (C) copied to bootstrap/bin/"
+    echo "mmap_stress (C) copied to bootstrap/bin/"
 fi
 
 echo "Build process completed."

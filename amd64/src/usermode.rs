@@ -1242,6 +1242,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     match call {
         Syscall::Write => sys_write(a1, a2, a3),
         Syscall::Read => crate::fd::sys_read(a1, a2, a3),
+        // `pread64(fd, buf, count, offset)` — a read that does not move the
+        // cursor. Not dispatched at all until 2026-09-07: every `pread` on this
+        // target was `ENOSYS`, which `mmapsum`'s reference arm hit at offset 0.
+        Syscall::Pread64 => crate::fd::sys_pread64(a1, a2, a3, a4),
         // busybox prints through `writev`, not `write`. Walk the iovec array and
         // forward each segment; a short write on any segment stops the walk, as
         // `writev(2)` specifies.
@@ -1257,8 +1261,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `a5` is mmap's fd and is deliberately unused: only anonymous mappings
         // are supported, so a file-backed request must fail rather than quietly
         // return zeroed memory that the caller believes holds a file.
-        Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5),
+        // `a6` is the file offset. It was dropped until 2026-09-07 because only
+        // anonymous mappings were served and an anonymous `mmap`'s offset is
+        // ignored; a file mapping cannot ignore it.
+        Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5, a6),
         Syscall::Munmap => crate::mm::sys_munmap(a1, a2),
+        // `madvise(addr, len, advice)`. Answered `ENOSYS` for everything until
+        // 2026-09-07, which is the *wrong* way to say "not implemented": Linux
+        // says `EINVAL` for unsupported advice and redis exits on anything else.
+        Syscall::Madvise => crate::mm::sys_madvise(a1, a2, a3),
+        // `mremap(old, old_len, new_len, flags)`. `a5` is `MREMAP_FIXED`'s
+        // `new_address` and is deliberately not passed: this target does not
+        // support `MREMAP_FIXED`, and the decision crate does not decode it.
+        Syscall::Mremap => crate::mm::sys_mremap(a1, a2, a3, a4),
         Syscall::Socket => crate::sock::sys_socket(a1, a2, a3),
         Syscall::Bind => crate::sock::sys_bind(a1, a2, a3),
         Syscall::Listen => crate::sock::sys_listen(a1, a2),
@@ -2213,6 +2228,22 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
 ///
 /// The obligation `mmap` and the demand-paging fault take on: a frame the
 /// ledger does not know about is a frame `Process::free` will not release.
+/// How many physical frames the calling process's address space holds.
+///
+/// The `resident` field of `/proc/self/statm`, straight out of the frame ledger
+/// — which is the one structure on this target that knows. It counts *frames*,
+/// not VAs, so a page mapped twice in one address space is one resident page,
+/// which is what `statm` means by the word.
+#[must_use]
+pub fn current_resident_pages() -> usize {
+    let slot = current_proc_slot();
+    // SAFETY: as `with_current_regions` — the running task's own slot.
+    unsafe {
+        let procs = &raw const PROCS;
+        (*procs).get(slot).and_then(Option::as_ref).map_or(0, |p| p.frames.resident_pages())
+    }
+}
+
 pub fn track_anon_frame(pa: usize) {
     let slot = current_proc_slot();
     // SAFETY: as `with_current_regions`.

@@ -176,6 +176,22 @@ def digests_agree(out):
 #   `allocstress`   — 2M allocations; the only exercise that leans on the heap
 #                     rather than the fault path.
 #   `stackstress`   — 100 rounds of deep recursion against the exception stack.
+#   `mmap_stress`   — repeated 70 MB anonymous map/touch/unmap cycles. The one
+#                     exercise that reuses address space at scale, so it is what
+#                     notices a VA allocator that leaks ranges. Time-bounded, so
+#                     the ITERATION COUNT VARIES between runs and between arms —
+#                     the marker is deliberately `stress finished (` with the
+#                     count left out, and must stay that way.
+#   `shmanon`       — `MAP_SHARED|MAP_ANONYMOUS` surviving `fork` as ONE object.
+#                     Two-sided: it checks the MAP_PRIVATE case stays isolated in
+#                     the same run, so a kernel that shares everything fails too.
+#   `smapsdirty`    — `/proc/self/smaps` + `MADV_FREE`, i.e. what redis inspects
+#                     at startup. Self-calibrating like `mprotectlb`: it counts
+#                     its own divergences FROM LINUX and prints the total, so the
+#                     marker is the FAILURE count and not the DIVERGE count. On
+#                     an unmodified tree it reports `0 failure(s), 3 documented
+#                     divergence(s)` — do not "fix" the marker to include the 3,
+#                     which is a property of the kernel's procfs and moves.
 #
 # `/bin/busybox` is the file argument for all three mmap probes: it is ~1.1 MB
 # (272 faults, enough to be a real demand-paging workload), and it is the one
@@ -198,6 +214,66 @@ EXERCISES = [
     ("mmap_file", "mmap_file /bin/busybox", "touched all pages"),
     ("allocstress", "allocstress", "allocations without failure!"),
     ("stackstress", "stackstress", "stackstress: PASSED"),
+    # --- added 2026-09-07: the rest of `scripts/mem_suite.py`'s set ---
+    #
+    # The memory family's gate ran ten probes and this list ran seven of them.
+    # The three below were the gap, and all three are fork/CoW/fault-path work —
+    # the category this automated set is *for* — rather than the network probes
+    # the note at the top of the runbook warns against adding.
+    #
+    # A/B'd before adding, as that note requires: each was run on an unmodified
+    # `main` (b7c89d47) devbox-smoltcp at SMP=4 and passed, and the same static
+    # binary passes on real Linux under `mem_suite.py --docker` on both arches.
+    # Cost on that guest: 9.2 s, 0.1 s, 0.0 s — well inside the 420 s poll.
+    ("mmap_stress", "mmap_stress", "stress finished ("),
+    ("shmanon", "shmanon", "-> SHARED (correct)"),
+    ("smapsdirty", "smapsdirty", "0 failure(s)"),
+    # --- added 2026-09-07: every remaining c_stress probe with no runner ---
+    #
+    # An inventory of `userspace/forktest/c_stress/` against the four runners
+    # found **17 probes that nothing ran at all** — each written for a real
+    # incident, each still in the tree, none of them ever executed again. They
+    # are listed below with what they guard; eleven of them were not even staged
+    # on `disk.img`, which `userspace/build.sh` now fixes.
+    #
+    # Every one was run on an unmodified tree first (2026-09-07, devbox-smoltcp
+    # `SMP=4`, `main`-equivalent), and its `healthy` string copied from that
+    # run's ACTUAL output rather than from what the source looks like it prints.
+    # `tidflags` fails there and is in KNOWN_FAIL_EXERCISES below with the
+    # measurement; the other fifteen pass.
+    #
+    # None is a network probe, which is the one category the note at the top of
+    # `docs/runbooks/verify-trim-fat-change.md` excludes. They are signal
+    # delivery, thread churn, TLS, the dynamic loader, pipes and compute — all
+    # of them things a fork/CoW/fault-path refactor can break.
+    ("abortsig", "abortsig", "=== ABORTSIG DONE"),
+    ("clonearg_probe", "clonearg", "=== CLONEARG DONE — 0 divergence(s)"),
+    ("computecheck", "computecheck", "RESULT: PASS (compute is stable)"),
+    # `dynspawn` spawns `/tmp/dynchild` 800 times, so the marker is the **count
+    # that arrived**, not its "0 divergence(s)" summary line. That summary is
+    # true and useless when the spawnee is missing: every `posix_spawn` fails,
+    # no child runs, nothing can diverge, and the probe cheerfully prints
+    # `=== DYNSPAWN DONE — 0 divergence(s) ===` on a run that tested nothing.
+    # Measured exactly that way on 2026-09-07 before `dynchild` was staged —
+    # `children reaching main : 0` beside `posix_spawn/wait errors: 800`. A
+    # marker that can pass vacuously is worse than no marker, because it is the
+    # silent pass this whole file exists to refuse.
+    # The `cp` is part of the command because `dynspawn` hardcodes
+    # `/tmp/dynchild` (its source, line 49) and `/tmp` does not survive a boot.
+    ("dynspawn", "cp /bin/dynchild /tmp/dynchild; dynspawn",
+     "children reaching main : 800"),
+    ("fpcpoison", "fpcpoison /bin/busybox", "ALL PASS"),
+    ("md5probe", "md5probe mem", "RESULT: PASS"),
+    ("neonstate", "neonstate", "VERDICT: NEON state is preserved"),
+    ("pattern2_parent", "pattern2_parent", "pattern2_parent: done"),
+    ("pipewake", "pipewake", "=== PIPEWAKE DONE — all phases ok ==="),
+    ("readback", "readback", "RESULT: PASS (read, incremental hash and mmap all exact)"),
+    ("segvchild", "segvchild", "=== SEGVCHILD DONE — all reaped ==="),
+    ("segvgroup", "segvgroup", "segvgroup: PASS"),
+    ("spawnalias", "spawnalias", "[spawnalias] PASS — no divergence"),
+    ("threadmax", "threadmax", ", churn ok ==="),
+    ("tlsdirty", "tlsdirty", "=== TLSDIRTY DONE — dirty_hits=0 alias_hits=0 ==="),
+    ("tidflags", "tidflags", "[tidflags] PASS"),
 ]
 
 # Exercises that FAIL on an unmodified tree today. Reported as `KNOWN-FAIL` so a
@@ -230,7 +306,33 @@ EXERCISES = [
 # If an entry is ever added back, it must carry the same three things this one
 # did: what fails, the measurement that established it, and what its flipping
 # would mean.
-KNOWN_FAIL_EXERCISES: set[str] = set()
+#
+# **`tidflags` added 2026-09-07**, carrying those three:
+#
+#   WHAT FAILS. Seven of its eight cases pass — every one of `clone(2)`'s three
+#   tid flags behaves exactly as Linux documents, which is the part of the probe
+#   the kernel was written against. The eighth, `pthread churn survives`, fails:
+#
+#       pthread churn survives   FAIL — round 31: only 3/8 threads created
+#       [tidflags] FAIL (1 failure)
+#
+#   THE MEASUREMENT. Run on an unmodified tree (devbox-smoltcp, `SMP=4`,
+#   2026-09-07) twice: it failed both times, at **round 31 both times**, with a
+#   different thread count each time (1/8 then 3/8). So it is deterministic in
+#   where it happens and not in how badly — a capacity wall, not a race.
+#
+#   The corroboration is `threadmax`, which passes and says why in its own
+#   output: `spawn refused at iter 249: rc=11 (EAGAIN) — retrying after 100ms`
+#   / `retry succeeded — COOLDOWN WALL (transient), slots existed but were still
+#   cooling`. `threadmax` retries and therefore passes; `tidflags` does not
+#   retry and therefore reports it. Both are describing one thing: thread slots
+#   are not reusable immediately after a join.
+#
+#   WHAT ITS FLIPPING WOULD MEAN. Green here means slot reuse stopped having a
+#   cooldown — either it was fixed, or the churn loop stopped reaching the wall
+#   because something got slower. Check `threadmax`'s COOLDOWN WALL line in the
+#   same run before believing the first reading.
+KNOWN_FAIL_EXERCISES: set[str] = {"tidflags"}
 
 # Known-flaky, threshold-driven: fails on an unmodified tree, and passes on one
 # too. Compared separately so the failure SET stays meaningful.
