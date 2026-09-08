@@ -8,7 +8,16 @@ description = "amd64 (x86_64) boot target: PVH -> long mode -> the arch-neutral 
 workspace = true
 
 [features]
-default = ["console-notify"]
+# Real (shared-kernel) SMP is **required**, not optional: since 5b the kernel's
+# BKL is `akuma_bkl`'s (see `smp.rs`), whose entry points are no-ops without the
+# cfg — a build without it would run four cores with no lock at all. Enforced by
+# a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
+# rather than booting corrupt.
+default = ["console-notify", "smp-shared"]
+# Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
+# to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
+# `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
+smp-shared = ["akuma-exec/smp-shared"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a
@@ -23,11 +32,15 @@ console-notify = []
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on
 # x86_64. Both of these already built for `x86_64-unknown-none` before this
 # target existed — they are neutral code, and wiring them up is the test of that
-# claim. Note they reach `akuma-cpu` through `akuma-primitives`, and on x86 the
-# barrier/park wrappers are real while `daif`/`tlb`/`sysreg` are still stubs; see
-# `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §1.3 for what that costs.
+# claim. Note they reach `akuma-cpu` through `akuma-primitives`; since
+# 2026-09-08 `akuma-cpu` is also a direct dependency — `daif`'s x86 arms
+# (`cli`/`sti`/`pushfq`) are real, and `paging.rs`/`exec_runtime.rs` consume
+# them directly instead of private copies.
 akuma-alloc = { path = "../crates/akuma-alloc" }
 akuma-pmm = { path = "../crates/akuma-pmm" }
+akuma-cpu = { path = "../crates/akuma-cpu" }
+# The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
+akuma-bkl = { path = "../crates/akuma-bkl" }
 # Syscall identity across architectures. Proposal item 5's shape, and the amd64
 # port is why it exists: `akuma-syscalls-linux::nr` is asm-generic (aarch64)
 # numbering, and x86_64 Linux numbers everything differently.

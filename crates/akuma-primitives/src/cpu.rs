@@ -22,15 +22,34 @@
 /// Moved here from `akuma_bkl::bkl` on 2026-08-30: it was the crate's last
 /// `unsafe` site, and removing it let the BKL protocol carry
 /// `#![forbid(unsafe_code)]` (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §7.9).
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_smp_shared, target_os = "none", target_arch = "aarch64"))]
 #[inline]
 #[must_use]
 pub fn current_core_id() -> u32 {
     (akuma_cpu::sysreg::mpidr_el1() & 0xff) as u32
 }
 
+/// x86_64 bare-metal: the core's index, read through `%gs`.
+///
+/// `akuma_cpu::percpu::core_id()` — `gs:[24]`, the `index` field of amd64's
+/// `PerCpu`, installed before any caller can run and pinned by that file's
+/// `OFFSETS_PINNED` (which is the cross-crate enforcement; see that module's
+/// header). Before `install_percpu` a `gs:`-relative load would fault; the one
+/// early path that could ask (`ap_entry64` → `paging::activate_unpublished`)
+/// takes the core as an argument instead of calling this, which is exactly why.
+#[cfg(all(kernel_smp_shared, target_os = "none", target_arch = "x86_64"))]
+#[inline]
+#[must_use]
+pub fn current_core_id() -> u32 {
+    akuma_cpu::percpu::core_id()
+}
+
 /// Non-SMP / host shim: a single-core build is always core 0.
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(all(
+    not(all(kernel_smp_shared, target_os = "none")),
+    not(all(kernel_smp_shared, target_os = "none", target_arch = "aarch64")),
+    not(all(kernel_smp_shared, target_os = "none", target_arch = "x86_64"))
+))]
 #[inline(always)]
 #[must_use]
 pub fn current_core_id() -> u32 {

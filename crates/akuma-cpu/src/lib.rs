@@ -99,17 +99,23 @@
 //!
 //! # What x86_64 gets today
 //!
-//! The host stub, and that is a **placeholder, not a port.** A no-op `dsb_ish`
-//! and a `park::wfi` that does not park are wrong on real x86 hardware; they are
-//! survivable only because the amd64 target does not yet call this crate. The
-//! functions that could take an honest x86 body (`barrier`, `park`, `cache`) are
-//! a small job. The ones that cannot are the interesting half: `daif::read`
-//! returns a raw `DAIF` whose bit 7 means "masked", while the x86 equivalent is
-//! `RFLAGS.IF` where the *set* bit means "enabled" — opposite polarity in a
-//! `u64` that callers compare against AArch64 bit positions. `tlb`, `vtimer` and
-//! `sysreg` leak their encodings the same way. Those want the neutral vocabulary
-//! `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §3 describes, not an x86 arm
-//! bolted under an AArch64 mnemonic.
+//! The host stub plus three real x86 arms — [`barrier`], [`park`], [`daif`] —
+//! and a **placeholder, not a port**, everywhere else: a no-op `dsb_ish` and a
+//! `park::wfi` that does not park are wrong on real x86 hardware.
+//!
+//! [`daif`] went real on 2026-09-08 for the amd64 C1 process-table step
+//! (`proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`): `mask_irq`/`unmask_irq`/
+//! `restore`/`read` are `cli`/`sti`/`pushfq`-`popfq`, and making them real is
+//! what turns every `IrqGuard` in `akuma-primitives`' callers from a silent
+//! no-op into a working mask on this target. **The one thing the arm does not
+//! do is normalise polarity** — AArch64's `DAIF.I` (set = masked) and x86's
+//! `RFLAGS.IF` (set = enabled) disagree, and the module header records the
+//! divergence at [`daif::read`] rather than papering over it, because a
+//! normalised `read` could not carry enough state back through `restore`.
+//! Callers that only round-trip never see the difference. The rest — `tlb`,
+//! `vtimer`, `sysreg`, `cache` — still leak AArch64 encodings and want the
+//! neutral vocabulary `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §3
+//! describes.
 
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::inline_always, clippy::must_use_candidate)]
@@ -494,6 +500,71 @@ pub mod park {
     }
 }
 
+/// x86_64 per-CPU identity, read through `%gs`.
+///
+/// The counterpart of [`sysreg`]'s read-only `MPIDR_EL1`: the AArch64 core
+/// identity is a register read, the x86 one is a segment-relative load, and
+/// both answer "which core am I" without dereferencing anything the caller
+/// would have to vouch for.
+///
+/// # The contract, and who enforces it
+///
+/// The `%gs` base is `amd64/src/smp.rs`'s `PERCPU[idx]`, installed by that
+/// file's `install_percpu` **before any code that can reach these functions
+/// runs on that core** — the same precondition `this_cpu()` there documents.
+/// Before it, the base is 0 and a `gs:`-relative load faults; the one early
+/// path (`ap_entry64` → `activate_unpublished`) already takes the core as an
+/// argument precisely so it never has to ask.
+///
+/// The offsets are that file's fields — `index` at 24, `current_task` at 32 —
+/// and that file's `OFFSETS_PINNED` compile-time assert is what keeps the two
+/// sides honest. This crate reads fixed offsets it cannot see asserted; the
+/// writer's assert is the enforcement, and moving a field there without
+/// moving the offset here fails on the metal, not in review.
+pub mod percpu {
+    /// This core's index into the per-CPU table — `gs:[24]`, the `index` field.
+    /// 0 is the BSP. Valid only after `install_percpu` (see the module header).
+    #[inline(always)]
+    #[must_use]
+    pub fn core_id() -> u32 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u32;
+            // SAFETY: a scalar load at a fixed offset from %gs. The segment
+            // base is the installed per-CPU block per the module header; the
+            // load dereferences nothing else.
+            unsafe {
+                core::arch::asm!("mov {0:e}, dword ptr gs:[24]", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+
+    /// The task slot running on this core — `gs:[32]`, the `current_task`
+    /// field.
+    ///
+    /// This is amd64's per-thread identity: the sched/threading slot
+    /// namespace, one writer (the context switch) per core. Valid only after
+    /// `install_percpu` (see the module header).
+    #[inline(always)]
+    #[must_use]
+    pub fn current_task() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: as `core_id`, one word wide.
+            unsafe {
+                core::arch::asm!("mov {0}, qword ptr gs:[32]", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+}
+
 /// Reads of the two special-purpose general registers.
 ///
 /// Not `mrs` — `mov {}, sp` and `mov {}, x30` — but the same argument: copying a
@@ -557,7 +628,18 @@ pub mod reg {
 ///
 /// Callers should still reach for `IrqGuard` rather than these directly.
 pub mod daif {
-    /// Read `DAIF`. Bit 7 (`I`) set means IRQs are masked.
+    /// Read the IRQ-mask state register.
+    ///
+    /// **The two architectures answer in opposite polarity, and the bit that
+    /// carries it is not the same bit.** On AArch64 this is raw `DAIF`, whose
+    /// bit 7 (`I`) is **set when IRQs are masked**. On x86_64 it is raw
+    /// `RFLAGS` from `pushfq`, whose bit 9 (`IF`) is **set when IRQs are
+    /// enabled**. Neither function here normalises the two — that would be a
+    /// lossy encoding at a neutral seam (a `read` that kept only one bit could
+    /// not be `restore`n) — so a caller that *inspects* the value must know
+    /// which architecture it is on. A caller that only round-trips it through
+    /// [`restore`] — which is every `IrqGuard` — needs to know nothing: each
+    /// architecture's `restore` is the exact inverse of its own `read`.
     #[inline(always)]
     pub fn read() -> u64 {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -569,11 +651,24 @@ pub mod daif {
             };
             v
         }
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: reading flags has no memory effect and changes nothing
+            // (pushfq itself only writes the stack slot asm manages).
+            unsafe {
+                core::arch::asm!("pushfq", "pop {}", out(reg) v, options(nomem, nostack));
+            };
+            v
+        }
+        #[cfg(not(any(
+            all(target_os = "none", target_arch = "aarch64"),
+            all(target_os = "none", target_arch = "x86_64")
+        )))]
         0
     }
 
-    /// Write `DAIF` wholesale — restoring a value from [`read`].
+    /// Restore the IRQ-mask state register wholesale — a value from [`read`].
     #[inline(always)]
     pub fn restore(daif: u64) {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -582,11 +677,20 @@ pub mod daif {
         unsafe {
             core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
         };
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as the AArch64 arm. `popfq` restores every flag the
+        // `pushfq` captured, so a save/restore pair is a pure round-trip.
+        unsafe {
+            core::arch::asm!("push {0}", "popfq", in(reg) daif, options(nomem, nostack));
+        };
+        #[cfg(not(any(
+            all(target_os = "none", target_arch = "aarch64"),
+            all(target_os = "none", target_arch = "x86_64")
+        )))]
         let _ = daif;
     }
 
-    /// `msr daifset, #2` — mask IRQs.
+    /// `msr daifset, #2` / `cli` — mask IRQs.
     #[inline(always)]
     pub fn mask_irq() {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -594,9 +698,14 @@ pub mod daif {
         unsafe {
             core::arch::asm!("msr daifset, #2", options(nomem, nostack));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as the AArch64 arm.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        };
     }
 
-    /// `msr daifclr, #2` — unmask IRQs.
+    /// `msr daifclr, #2` / `sti` — unmask IRQs.
     #[inline(always)]
     pub fn unmask_irq() {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -604,12 +713,19 @@ pub mod daif {
         unsafe {
             core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as `restore`.
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        };
     }
 
-    /// Mask IRQs and `isb`, so the mask is in force for every instruction after.
+    /// Mask IRQs, with the mask in force for every instruction after.
     ///
-    /// Fused deliberately: `msr daifset` without the barrier leaves a window in
+    /// Fused on AArch64: `msr daifset` without the barrier leaves a window in
     /// which an already-fetched instruction can still take the interrupt.
+    /// x86_64 needs nothing added — `cli` blocks delivery from the instruction
+    /// after it, architecturally — so the x86 arm is the plain `cli`.
     #[inline(always)]
     pub fn mask_irq_sync() {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -617,15 +733,32 @@ pub mod daif {
         unsafe {
             core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as the AArch64 arm.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        };
     }
 
-    /// Unmask IRQs and `isb`. Fused for the same reason as [`mask_irq_sync`].
+    /// Unmask IRQs, with the unmask in force for every instruction after.
+    ///
+    /// Fused on AArch64 for the same reason as [`mask_irq_sync`]. On x86_64
+    /// the fused form is **load-bearing, not redundant**: bare `sti` has a
+    /// one-instruction window in which interrupts stay blocked — the interrupt
+    /// cannot be delivered until after the *next* instruction retires. That is
+    /// an `sti;ret` hazard (the classic interrupt-storm trick), and the `nop`
+    /// closes it, which is exactly what `isb` does for `msr daifclr`.
     #[inline(always)]
     pub fn unmask_irq_sync() {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `restore`.
         unsafe {
             core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
+        };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as `restore`.
+        unsafe {
+            core::arch::asm!("sti", "nop", options(nomem, nostack, preserves_flags));
         };
     }
 

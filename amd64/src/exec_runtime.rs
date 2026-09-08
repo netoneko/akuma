@@ -79,22 +79,19 @@ macro_rules! not_wired {
 
 /// Mask local IRQs on this core.
 ///
-/// Not `akuma_cpu::daif::mask_irq()`: **that is a silent no-op on x86_64** —
-/// its `asm!` is `#[cfg(target_arch = "aarch64")]` and every other arm falls
-/// through to an empty body. That is a real pre-existing defect on this target
-/// and a wider one than this file (`akuma_primitives::irq::irq_save_mask`,
-/// `IrqGuard` and `PreemptGuard` all route through it, so `akuma-bkl`'s ticket
-/// wait is not IRQ-atomic here), but it is **not** C1's to fix: it wants its own
-/// change and its own SMP=4 A/B. Recorded rather than ridden along with.
+/// `akuma_cpu::daif::mask_irq()` since 2026-09-08, when that grew real x86
+/// arms (`cli`/`sti`). The warning this function used to carry — that `daif`
+/// is a silent no-op on x86_64 and every `IrqGuard` with it — is retired by
+/// the same change; `paging.rs`'s private `pushfq`/`cli` copy migrated at the
+/// same time. Unconditional by the hook's contract: `with_irqs_disabled` pairs
+/// these, so nesting is a caller property it already manages.
 fn disable_irqs() {
-    // SAFETY: masking is the conservative direction; no memory effect.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+    akuma_cpu::daif::mask_irq();
 }
 
 /// Unmask local IRQs on this core. See [`disable_irqs`].
 fn enable_irqs() {
-    // SAFETY: the callers that unmask are the ones that masked.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+    akuma_cpu::daif::unmask_irq();
 }
 
 /// Build the runtime table. See the module header for the three categories.

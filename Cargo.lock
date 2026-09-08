@@ -84,9 +84,11 @@ name = "akuma-amd64"
 version = "0.0.7"
 dependencies = [
  "akuma-alloc",
+ "akuma-bkl",
  "akuma-boot",
  "akuma-config",
  "akuma-cow",
+ "akuma-cpu",
  "akuma-dmesg",
  "akuma-elf",
  "akuma-exec",

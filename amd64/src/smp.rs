@@ -25,13 +25,13 @@
 //! registers, so a task that migrates cores finds the right block on arrival
 //! without anyone doing anything.
 //!
-//! **The Big Kernel Lock.** A fair ticket spinlock with a per-core recursion
-//! depth. Held by every core while it executes kernel code; released on the way
+//! **The Big Kernel Lock** is `akuma_bkl`'s `KernelLock` (see the BKL section
+//! below for why the private ticket lock this file used to carry is gone).
+//! Held by every core while it executes kernel code; released on the way
 //! back to ring 3 and in the idle loop's `hlt` window. A context switch
-//! *transfers* the hold: the outgoing task's depth is saved in its `Task`, the
-//! incoming task's restored, and the lock itself never changes hands — the
-//! core keeps it, and the next task on that core is the one that eventually
-//! lets go. That is what makes every "single core" `SAFETY` comment in
+//! does not change hands: the core keeps the lock, and the next task on that
+//! core is the one that eventually lets go. That is what makes every
+//! "single core" `SAFETY` comment in
 //! `sched.rs`, `usermode.rs`, `fd.rs` and friends true again under a different
 //! reading: single *kernel* core.
 //!
@@ -116,8 +116,6 @@ pub struct PerCpu {
     /// The task slot that idles this core when nothing else is runnable. 0 (the
     /// boot task) on the BSP; a dedicated slot on every AP.
     idle_task: AtomicUsize,
-    /// How many times this core has entered the BKL without leaving.
-    bkl_depth: AtomicU32,
     /// Set by this core's timer tick, consumed by its next `yield_now`.
     need_resched: AtomicBool,
     /// Set by the AP once it can take interrupts; the BSP waits on it.
@@ -139,7 +137,6 @@ impl PerCpu {
             lapic_id: AtomicU32::new(0),
             current_task: AtomicUsize::new(0),
             idle_task: AtomicUsize::new(0),
-            bkl_depth: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
             online: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
@@ -149,10 +146,18 @@ impl PerCpu {
 }
 
 /// The assembly's view of [`PerCpu`], pinned at compile time.
+///
+/// `index` and `current_task` are also read cross-crate — `akuma_cpu::percpu`
+/// loads `gs:[24]`/`gs:[32]` for `current_core_id`/`current_tid` under
+/// `kernel_smp_shared` — so those two offsets are a cross-crate contract, not
+/// just an assembly one. Moving either field means moving the offset in
+/// `akuma-cpu`'s `percpu` module in the same change.
 const OFFSETS_PINNED: () = {
     assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
     assert!(core::mem::offset_of!(PerCpu, current_uctx) == 8);
     assert!(core::mem::offset_of!(PerCpu, scratch) == 16);
+    assert!(core::mem::offset_of!(PerCpu, index) == 24);
+    assert!(core::mem::offset_of!(PerCpu, current_task) == 32);
 };
 
 static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
@@ -300,31 +305,45 @@ pub fn need_resched() -> bool {
 // ---------------------------------------------------------------------------
 // The Big Kernel Lock
 // ---------------------------------------------------------------------------
+//
+// **`akuma_bkl`'s lock, not a private one, since 5b (2026-09-08).** This file
+// carried a hand-rolled ticket BKL from bring-up. Flipping `kernel_smp_shared`
+// for the process-table step would have activated `akuma_bkl`'s `KernelLock`
+// *alongside* it — two locks answering one question, with `idle_halt`,
+// `blocking_relax` and `akuma_elf::interp`'s loader taking the crate's while
+// every ring-3 boundary took this one — so the private lock is gone and the
+// crate's is *the* BKL. Same discipline, one implementation:
+//
+// - The ownership model differs in bookkeeping, not behaviour. The old lock
+//   tracked a per-core recursion depth and transferred it between tasks on a
+//   switch; `KernelLock` is reentrant by owner core, so a nested `enter_kernel`
+//   is a no-op and there is no depth to transfer (`sched.rs`'s
+//   `hook_transfer_lock_depth` is a no-op now, and `Machine::bkl_depth` is
+//   gone). Every `bkl_enter` on this target arrives *from ring 3* and every
+//   `bkl_leave` goes *to* it — verified site by site — so "depth > 1" never
+//   existed; what the depth simulated ("a task born in kernel code holds
+//   without entering") falls out of the owner model directly.
+// - AArch64's `reconcile_for_spsr` has **no amd64 counterpart and needs none**:
+//   the eret epilogue analyzes the SPSR because AArch64's boundary is one
+//   shared instruction; this target's boundaries are explicit calls
+//   (`usermode.rs`'s `bkl_enter`/`bkl_leave`), so there is nothing to infer.
+// - The old `[BKL] stuck: cpu N waiting on owner M` diagnostic is the crate's
+//   `log_kernel_lock_stuck` now (plus a lost-ticket self-heal the private lock
+//   never had). The message text differs — `[BKL] stuck: owner=N waiter=M tag=…`
+//   — so greps keyed on the old wording move to `stuck: owner=`; the
+//   `docs/runbooks/recover-wedged-vm.md` `[BKL] stuck` prefix is unchanged.
+//
+// The build without `kernel_smp_shared` refuses to compile below: the crate's
+// entry points are no-ops there, which would run four cores with no lock at all.
 
-/// A fair ticket lock. Fairness is not decoration: with a plain test-and-set,
-/// the core that just released — its cache line hot — wins the next acquire
-/// almost every time, and a peer spinning in its timer handler can wait for
-/// tens of milliseconds behind a busy syscall loop. The aarch64 kernel learned
-/// that the hard way (`docs/archive/BKL_VFS_CARVE_OUT.md` §8).
-struct Bkl {
-    next_ticket: AtomicU32,
-    now_serving: AtomicU32,
-    /// The core holding it, or [`NO_CPU`]. Written by the holder only, after
-    /// acquire and before release; read by the same core to detect recursion
-    /// and by anyone for the stuck diagnostic.
-    owner: AtomicU32,
-}
-
-static BKL: Bkl = Bkl {
-    next_ticket: AtomicU32::new(0),
-    now_serving: AtomicU32::new(0),
-    owner: AtomicU32::new(NO_CPU),
-};
-
-/// Spins before the stuck diagnostic prints. Big enough that a legitimate long
-/// hold (a whole-file ext2 read through polled virtio) does not trip it; small
-/// enough that a real deadlock is named within seconds under TCG.
-const STUCK_SPINS: u64 = 1 << 27;
+#[cfg(not(kernel_smp_shared))]
+const BKL_REQUIRES_SMP_SHARED: () = assert!(
+    false,
+    "amd64 requires the `smp-shared` feature: its Big Kernel Lock is akuma_bkl's, \
+     whose entry points are no-ops without it"
+);
+#[cfg(not(kernel_smp_shared))]
+const _: () = BKL_REQUIRES_SMP_SHARED;
 
 /// Spins a core waits with the lock dropped in [`bkl_drop_window`] before it
 /// takes the lock back. Small on purpose: the lock is FIFO, so a peer that was
@@ -334,95 +353,41 @@ const STUCK_SPINS: u64 = 1 << 27;
 /// hundreds of `pause`s here would be a visible tax on every wait loop.
 const DROP_WINDOW_SPINS: u32 = 4;
 
-fn pause() {
-    core::hint::spin_loop();
-}
-
-fn bkl_acquire(me: u32) {
-    let ticket = BKL.next_ticket.fetch_add(1, Ordering::AcqRel);
-    let mut spins = 0u64;
-    let mut reported = false;
-    while BKL.now_serving.load(Ordering::Acquire) != ticket {
-        pause();
-        spins += 1;
-        if spins == STUCK_SPINS && !reported {
-            reported = true;
-            serial::puts("[BKL] stuck: cpu ");
-            serial::put_dec(u64::from(me));
-            serial::puts(" waiting on owner ");
-            serial::put_dec(u64::from(BKL.owner.load(Ordering::Relaxed)));
-            serial::puts("\n");
-        }
-    }
-    BKL.owner.store(me, Ordering::Relaxed);
-}
-
-fn bkl_release() {
-    BKL.owner.store(NO_CPU, Ordering::Relaxed);
-    BKL.now_serving.fetch_add(1, Ordering::Release);
-}
-
-/// Enter the kernel: take the BKL, or deepen this core's hold on it.
-///
-/// Recursive per core, not per task — a timer tick that lands while this core
-/// already holds the lock (kernel task code with `IF` set) nests rather than
-/// deadlocks. The depth travels with the task across a context switch
-/// (`sched::yield_now`), so a task always leaves as many times as it entered.
+/// Enter the kernel: take the BKL. Reentrant by owner core — a timer tick that
+/// lands while this core already holds the lock (kernel task code with `IF`
+/// set) nests rather than deadlocks.
 pub fn bkl_enter() {
-    let cpu = this_cpu();
-    let me = cpu.index.load(Ordering::Relaxed);
-    if BKL.owner.load(Ordering::Relaxed) == me {
-        cpu.bkl_depth.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    bkl_acquire(me);
-    cpu.bkl_depth.store(1, Ordering::Relaxed);
+    akuma_bkl::bkl::enter_kernel();
 }
 
-/// Leave the kernel: undo one [`bkl_enter`]; release at depth zero.
+/// Leave the kernel: release the BKL. Idempotent if this core does not hold it.
 pub fn bkl_leave() {
-    let cpu = this_cpu();
-    let d = cpu.bkl_depth.load(Ordering::Relaxed);
-    debug_assert!(d > 0, "bkl_leave without a matching enter");
-    if d <= 1 {
-        cpu.bkl_depth.store(0, Ordering::Relaxed);
-        bkl_release();
-    } else {
-        cpu.bkl_depth.store(d - 1, Ordering::Relaxed);
-    }
+    akuma_bkl::bkl::leave_kernel();
 }
 
-/// This core's hold depth. Saved into the outgoing task on a switch.
+/// Does this core hold the BKL? For assertions and diagnostics.
+#[allow(dead_code)] // diagnostic surface for the debugger, like `percpu_installed`
 #[must_use]
-pub fn bkl_depth() -> u32 {
-    this_cpu().bkl_depth.load(Ordering::Relaxed)
-}
-
-/// Install the incoming task's hold depth on a switch. The lock itself stays
-/// with the core; only the count of pending `leave`s changes hands.
-pub fn set_bkl_depth(d: u32) {
-    this_cpu().bkl_depth.store(d, Ordering::Relaxed);
+pub fn bkl_held() -> bool {
+    akuma_bkl::bkl::held_by_current()
 }
 
 /// Give the lock up for good, if this core holds it — for a core that is about
 /// to stop executing kernel code forever (`halt`, the bare-metal colour cycle).
 ///
 /// Without this a BSP that finishes its boot holding the lock — a failed
-/// self-test verdict ends in `halt()`, which is `cli; hlt` at depth 1 — leaves
-/// every AP spinning in its tick handler for a lock that will never be
-/// released, printing `[BKL] stuck … owner 0` once each (measured 2026-09-05 in
-/// the OVMF rig). Nothing was wrong; the diagnostic was right. A core that
-/// stops should let go. Safe to call from a core that never held it.
+/// self-test verdict ends in `halt()`, which is `cli; hlt` with the lock held —
+/// leaves every AP spinning in its tick handler for a lock that will never be
+/// released, printing `[BKL] stuck …` once each (measured 2026-09-05 in the
+/// OVMF rig). Nothing was wrong; the diagnostic was right. A core that stops
+/// should let go. `leave_kernel` is exactly this: an owner-checked release that
+/// is a no-op from a core that never held it.
 pub fn bkl_abandon() {
-    let cpu = this_cpu();
-    if BKL.owner.load(Ordering::Relaxed) == cpu.index.load(Ordering::Relaxed) {
-        cpu.bkl_depth.store(0, Ordering::Relaxed);
-        bkl_release();
-    }
+    akuma_bkl::bkl::leave_kernel();
 }
 
 /// Let the other cores in: drop the lock completely, spin briefly, take it
-/// back at the same depth.
+/// back.
 ///
 /// Called by every `sched::yield_now` — the point every kernel wait loop in
 /// this kernel passes through (a pipe read, a socket, a child exit, the boot
@@ -430,36 +395,29 @@ pub fn bkl_abandon() {
 /// it is a livelock: the peer's syscall spins for the lock this core is
 /// spinning inside. A no-op when the lock is not held.
 pub fn bkl_drop_window() {
-    let cpu = this_cpu();
-    let d = cpu.bkl_depth.load(Ordering::Relaxed);
-    if d == 0 {
+    if !akuma_bkl::bkl::held_by_current() {
         return;
     }
-    cpu.bkl_depth.store(0, Ordering::Relaxed);
-    bkl_release();
+    akuma_bkl::bkl::leave_kernel();
     for _ in 0..DROP_WINDOW_SPINS {
-        pause();
+        core::hint::spin_loop();
     }
-    bkl_acquire(cpu.index.load(Ordering::Relaxed));
-    cpu.bkl_depth.store(d, Ordering::Relaxed);
+    akuma_bkl::bkl::enter_kernel();
 }
 
-/// Run `f` with the lock released, then take it back at the same depth.
+/// Run `f` with the lock released, then take it back.
 ///
 /// What ring 3 gets for free, offered to kernel code that wants to behave like
 /// it: the SMP self-test's workers spin inside this so two of them can really
 /// be executing at once.
 pub fn bkl_run_unlocked<R>(f: impl FnOnce() -> R) -> R {
-    let cpu = this_cpu();
-    let d = cpu.bkl_depth.load(Ordering::Relaxed);
-    if d > 0 {
-        cpu.bkl_depth.store(0, Ordering::Relaxed);
-        bkl_release();
+    let held = akuma_bkl::bkl::held_by_current();
+    if held {
+        akuma_bkl::bkl::leave_kernel();
     }
     let r = f();
-    if d > 0 {
-        bkl_acquire(cpu.index.load(Ordering::Relaxed));
-        cpu.bkl_depth.store(d, Ordering::Relaxed);
+    if held {
+        akuma_bkl::bkl::enter_kernel();
     }
     r
 }
@@ -728,7 +686,7 @@ fn wait_online(idx: usize) -> bool {
             return false;
         }
         spins += 1;
-        pause();
+        core::hint::spin_loop();
     }
     true
 }
@@ -817,7 +775,7 @@ fn worker_body(id: usize) -> ! {
             let now = IN_FLIGHT.fetch_add(1, Ordering::AcqRel) + 1;
             MAX_IN_FLIGHT.fetch_max(now, Ordering::AcqRel);
             for _ in 0..WORKER_SPINS {
-                pause();
+                core::hint::spin_loop();
             }
             IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
         });
@@ -880,7 +838,7 @@ pub fn smoke_test(t: &mut Suite, expected_aps: usize, started: usize) {
     bkl_run_unlocked(|| {
         while !all_ticked(&before) && spins < TICK_WAIT_BUDGET {
             spins += 1;
-            pause();
+            core::hint::spin_loop();
         }
     });
     t.note("smp: spins until every secondary had ticked", spins);

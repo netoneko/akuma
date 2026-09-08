@@ -118,14 +118,46 @@ pub fn current_tid() -> usize {
     tid
 }
 
-/// Current thread id on every target without a per-CPU register this crate
-/// knows how to read: host builds, and bare-metal targets other than AArch64.
+/// Current thread id on x86_64 bare metal.
 ///
-/// Zero, stated rather than inherited. The amd64 kernel has one kernel thread
-/// per core and no `TPIDRRO_EL0` equivalent wired up; when it grows per-thread
-/// kernel state it needs a real answer here (x86's is `GS`-relative, via
-/// `IA32_KERNEL_GS_BASE` and `swapgs`), and this arm is where that goes.
+/// Real only under `kernel_smp_shared`, where the per-thread statics this
+/// feeds (`PREEMPTION_DISABLED`, `akuma-bkl`'s dropped-window ledger) are
+/// consulted by shared code and a constant 0 would make four cores share one
+/// counter. The answer is `akuma_cpu::percpu::current_task()` — `gs:[32]`, the
+/// sched/threading slot amd64's context switch publishes per core. Off-feature
+/// the zero shim below stays: every per-thread table keyed by this today is
+/// inert on that build, and changing its answer is a behaviour change that
+/// wants its own A/B, not a ride-along.
+///
+/// The bounds check matches the AArch64 arm: a garbage slot must be named and
+/// halted, not indexed.
+#[cfg(all(target_os = "none", target_arch = "x86_64", kernel_smp_shared))]
+#[inline]
+#[must_use]
+pub fn current_tid() -> usize {
+    let tid = akuma_cpu::percpu::current_task() as usize;
+    if tid >= MAX_THREADS {
+        safe_print!(
+            256,
+            "[FATAL] gs:[32] CORRUPT: tid=0x{:x} >= MAX_THREADS ({})\nSystem halted - cannot determine current thread\n",
+            tid,
+            MAX_THREADS
+        );
+        loop {
+            akuma_cpu::park::wfi();
+        }
+    }
+    tid
+}
+
+/// Current thread id on every target without a per-CPU register this crate
+/// knows how to read: host builds, bare-metal targets other than AArch64, and
+/// x86_64 builds without `kernel_smp_shared` (see the arm above for why the
+/// gate is the conjunction).
+///
+/// Zero, stated rather than inherited.
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(not(all(target_os = "none", target_arch = "x86_64", kernel_smp_shared)))]
 #[inline]
 #[must_use]
 pub fn current_tid() -> usize {

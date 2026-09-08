@@ -10,6 +10,13 @@ fn main() {
     build_user_program(&dir, "hello");
     build_user_program(&dir, "fdprobe");
     build_user_program(&dir, "threadprobe");
+    // Forward the feature set as a cfg, so the bin can gate on it the way the
+    // shared crates do. `smp.rs` uses it to refuse a build without `smp-shared`
+    // (its BKL is `akuma_bkl`'s, whose entry points are no-ops without the cfg).
+    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
+    if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {
+        println!("cargo:rustc-cfg=kernel_smp_shared");
+    }
 }
 
 /// Pass the amd64 linker script to the bin only.

@@ -143,7 +143,6 @@ struct Machine {
     fx: FxArea,
     /// The Big Kernel Lock hold depth this thread was suspended at; reinstalled
     /// on the core that resumes it. The lock itself stays with the core.
-    bkl_depth: u32,
     /// Runs for the life of the kernel and never finishes — the netpoll loop,
     /// and every core's idle thread. [`all_user_tasks_finished`] ignores these
     /// so the boot's drive loop still ends when the *shell* exits rather than
@@ -167,7 +166,6 @@ impl Machine {
             stack_base: 0,
             trap_base: 0,
             fx: FxArea::initial(),
-            bkl_depth: 1,
             daemon: false,
             idle: false,
             pinned: NO_CPU,
@@ -274,14 +272,12 @@ fn hook_switch_to(from: usize, to: usize) {
 
 /// Hand the kernel lock's recursion depth from the outgoing thread to the
 /// incoming one. The lock itself stays with this core.
-fn hook_transfer_lock_depth(from: usize, to: usize) {
-    // SAFETY: raw-pointer access under the BKL.
-    unsafe {
-        let m = machines();
-        (*m)[from].bkl_depth = smp::bkl_depth();
-        smp::set_bkl_depth((*m)[to].bkl_depth);
-    }
-}
+///
+/// A no-op since 5b: the BKL is `akuma_bkl`'s, reentrant by owner core, so
+/// there is no depth to transfer — the lock stays with the core across the
+/// switch and the bookkeeping this hook used to move does not exist. The hook
+/// is kept because `akuma-threading`'s `X86ArchHooks` requires it.
+fn hook_transfer_lock_depth(_from: usize, _to: usize) {}
 
 /// May this core run `slot`?
 ///
@@ -604,7 +600,6 @@ pub fn init() {
     unsafe {
         let m = &mut (*machines())[0];
         m.pinned = 0;
-        m.bkl_depth = smp::bkl_depth();
         // The boot thread needs a live user context too: it is what the very
         // first `enter_user_mode` publishes its kernel stack into.
         smp::set_current_uctx(&raw mut m.uctx);
@@ -630,7 +625,6 @@ pub fn register_idle_task(cpu: usize) -> Option<usize> {
         m.daemon = true;
         m.idle = true;
         m.pinned = cpu as u32;
-        m.bkl_depth = 1;
         m.space_root = 0;
         m.trap_stack_top = 0;
     }
@@ -912,9 +906,6 @@ fn spawn_unpublished(
         m.daemon = daemon;
         m.idle = false;
         m.pinned = NO_CPU;
-        // A fresh thread begins in kernel code, and kernel code holds the lock:
-        // it is born at depth 1, as if it had just entered.
-        m.bkl_depth = 1;
         m.uctx = UserCtx::new();
         m.fx = FxArea::initial();
     }

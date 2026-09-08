@@ -338,7 +338,7 @@ pub unsafe fn activate(root: u64) {
     // CR3) if a real scheduler probe ever shows it matters — the boot suite
     // cannot answer that question in either direction, for the reasons
     // `boot::self_tests`' guest-clock stamp records.
-    let flags = irq_save_mask();
+    let flags = akuma_cpu::daif::save_and_mask_irq();
     let core = akuma_mmu::publish_l0_begin(root, crate::smp::cpu_index());
     // SAFETY: caller's obligation, stated above. Writing CR3 also flushes the
     // non-global TLB, which is what makes the switch take effect.
@@ -346,8 +346,8 @@ pub unsafe fn activate(root: u64) {
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
     }
     akuma_mmu::publish_l0_end(core);
-    // SAFETY: restores exactly the interrupt-enable state observed above.
-    unsafe { irq_restore(flags) };
+    // Restores exactly the interrupt-enable state observed above (`popfq`).
+    akuma_cpu::daif::restore(flags);
 }
 
 
@@ -384,40 +384,11 @@ pub unsafe fn activate_unpublished(root: u64) {
     }
 }
 
-/// `RFLAGS.IF` mask — interrupts enabled.
-const RFLAGS_IF: u64 = 1 << 9;
-
-/// Read `RFLAGS` and mask interrupts, returning what to hand [`irq_restore`].
-///
-/// Not `akuma_cpu::daif::mask_irq()`: that is a **silent no-op on x86_64** (its
-/// `asm!` is `#[cfg(target_arch = "aarch64")]` and every other arm falls through
-/// to an empty body), the same trap `amd64/src/exec_runtime.rs` records against
-/// `akuma_primitives::irq::IrqGuard` on this target.
-#[inline]
-fn irq_save_mask() -> u64 {
-    let flags: u64;
-    // SAFETY: pushes and pops one word on the current stack, then masks — the
-    // conservative direction, with no memory effect.
-    unsafe {
-        core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem));
-    }
-    flags
-}
-
-/// Re-enable interrupts only if [`irq_save_mask`] found them enabled.
-///
-/// # Safety
-/// `flags` must be a value returned by [`irq_save_mask`] on this core, with no
-/// intervening change of interrupt policy the caller meant to keep.
-#[inline]
-unsafe fn irq_restore(flags: u64) {
-    if flags & RFLAGS_IF != 0 {
-        // SAFETY: the caller observed interrupts enabled before masking them.
-        unsafe {
-            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
-        }
-    }
-}
+// `irq_save_mask`/`irq_restore` were here until 2026-09-08, when
+// `akuma_cpu::daif` grew real x86 arms (`save_and_mask_irq` = `pushfq`/`cli`,
+// `restore` = `popfq`) and this file's private copy became the crate's. The
+// comment that used to justify the copy — that `daif` is a silent no-op on
+// this target — retired with it.
 
 /// The active top-level table, from `CR3`.
 fn read_cr3() -> u64 {
