@@ -259,6 +259,12 @@ Then 5c (`fork`/`execve`/`wait4`/`clone` onto `children.rs`/`spawn.rs`/
 
 ## Open issue found while verifying: a two-exec subshell wedges the kernel
 
+> **[FIXED the same day — `docs/archive/AKUMA_AMD64_WAIT4_OWNERSHIP.md`.]**
+> `sys_waitpid` had no `ppid` filter, so a forked process's `wait4(-1)` saw its
+> own row in the global spawn table and parked forever, waiting on itself. The
+> account below is what the ring-3 check saw before it was root-caused; the
+> bisect it records is what led to the trace that found it.
+
 Found by the ring-3 workload check, on the metal and then reproduced on local
 QEMU. **Pre-existing** — `057ed0d3` (the commit *before* this slice, built in a
 throwaway worktree) reproduces it identically, so it is neither 5b's nor the

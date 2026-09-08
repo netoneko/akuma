@@ -115,6 +115,10 @@ pub mod errno {
     pub const ENODEV: u64 = (-19i64) as u64;
     pub const ENOSYS: u64 = (-38i64) as u64;
     pub const ESRCH: u64 = (-3i64) as u64;
+    /// No child to wait for. Distinct from [`ESRCH`] on purpose: a shell tests
+    /// for exactly this to stop reaping, and `sys_waitpid` returned `ESRCH`
+    /// until 2026-09-08.
+    pub const ECHILD: u64 = (-10i64) as u64;
     pub const EAGAIN: u64 = (-11i64) as u64;
     pub const ENOMEM: u64 = (-12i64) as u64;
     pub const ENOTDIR: u64 = (-20i64) as u64;

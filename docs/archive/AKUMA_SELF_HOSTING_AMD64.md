@@ -922,6 +922,20 @@ boot suite, so it wants its own pass.
 
 ### 5. A subshell with **two** execs hangs, and takes the machine with it
 
+> **[CLOSED — root-caused and fixed the same day, 2026-09-08]**
+> `docs/archive/AKUMA_AMD64_WAIT4_OWNERSHIP.md`. `sys_waitpid` scanned the
+> **global** spawn table with no parent filter, so `wait4(-1)` answered "does
+> any process exist?" instead of "do I have any children?". A subshell that had
+> just reaped its only child saw its **own** row and parked forever — waiting on
+> itself. Fixed by filtering on `ppid` (plus `ECHILD` instead of `ESRCH`, plus
+> orphan reparenting at exit, which the filter made necessary). Verified on the
+> metal with the exact command that had cost a power cycle.
+>
+> Two notes for whoever reads issue 3 above: this has the same *visible* shape —
+> output arrives, teardown never happens — and it is a different bug. Issue 3's
+> closure stands; it was re-measured. But the next report of that shape should
+> start here rather than at pipes and wakes.
+
 Found 2026-09-08 by the ring-3 workload check while landing 5b slice 1, on the
 bare-metal box and then reproduced on local QEMU. **Pre-existing** — `057ed0d3`,
 the commit before that slice, built in a throwaway worktree, reproduces it

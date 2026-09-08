@@ -3615,14 +3615,40 @@ fn wait4_wake_all() {
 /// Called from `run_process` when a spawned child leaves ring 3.
 pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     // SAFETY: raw-pointer access; single core.
-    unsafe {
+    let dying = unsafe {
+        let mut dying = 0;
         if let Some(Some(s)) = (*spawn_table()).get_mut(proc_slot - SPAWN_SLOT_BASE) {
             s.exit = Some(status);
+            dying = s.pid;
             // A `fork` child that shares its parent's stdio must not close the
             // parent's stdout — the parent (and every later command it runs)
             // still writes there.
             if !s.borrowed_io {
                 pipe::close_write(s.stdout_pipe);
+            }
+        }
+        dying
+    };
+
+    // Reparent this process's children onto init, the way Linux does at exit.
+    //
+    // This is the other half of `sys_waitpid`'s `ppid` filter and it landed
+    // with it: once a wait only considers *your own* children, a child whose
+    // parent died has nobody left who may reap it, and its row and its pipes
+    // sit in the table until the slots run out. Before the filter the global
+    // scan let anyone reap anything, so orphans were collected by accident.
+    //
+    // Init is pid 1 and is not itself a table row (`current_pid()` answers 1
+    // for anything below `SPAWN_SLOT_BASE`), so a reparented child is reapable
+    // by whatever runs as init — which on this target is the console shell or
+    // `sshd`, both of which do reap.
+    if dying != 0 {
+        // SAFETY: raw-pointer access; single core, and only `ppid` is written.
+        unsafe {
+            for row in (*spawn_table()).iter_mut().flatten() {
+                if row.ppid == dying {
+                    row.ppid = 1;
+                }
             }
         }
     }
@@ -3709,23 +3735,44 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     let want = pid as u32;
     // `wait4(-1)` / `waitpid(0)` — any child. `-1` arrives as `u32::MAX`.
     let any = want == u32::MAX || want == 0;
+    // **Whose** children. The spawn table is global — every live process on
+    // this target has a row in it, not just the caller's descendants — so a
+    // scan without this filter answers "are there any processes?" instead of
+    // "do I have any children?".
+    //
+    // That was a hang, and a bad one: a subshell (`( ls; true )`) forks `ls`,
+    // reaps it, and asks once more. Its own row is still in the table, owned by
+    // the shell above it, so the unfiltered scan said "a child exists, none has
+    // exited" — the process saw *itself* as its unexited child and the `Wait4`
+    // arm parked it forever. The shell above then waited on the subshell, the
+    // ssh session never tore down, and on the bare-metal box the machine needed
+    // a power cycle. `( ls )` alone was fine only because ash execs the last
+    // command of a subshell in place and so never waits at all.
+    //
+    // `ppid` is set from `current_pid()` by both of the two `Spawn`
+    // constructors (`sys_fork`, `sys_spawn`) and by nothing else, so it is safe
+    // to read here for a *refusal* — the rule that
+    // `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` exists for.
+    let me = current_pid();
+    let mine = |s: &Spawn| s.ppid == me && (any || s.pid == want);
 
     // SAFETY: raw-pointer read; single core.
     let table = unsafe { &*spawn_table() };
 
-    // Does any matching child exist at all? (For the `-ESRCH` vs `0` decision.)
-    let exists = table
-        .iter()
-        .any(|e| e.as_ref().is_some_and(|s| any || s.pid == want));
+    // Does any matching child exist at all? (For the `-ECHILD` vs `0` decision.)
+    let exists = table.iter().any(|e| e.as_ref().is_some_and(&mine));
     if !exists {
-        return errno::ESRCH;
+        // ECHILD, not ESRCH: POSIX gives "you have no such child" its own errno
+        // and a shell tests for exactly it to stop reaping. ESRCH here happened
+        // to end ash's loop too, but anything that checks — `wait`, `system()`,
+        // make's jobserver — reads a wrong answer from it.
+        return errno::ECHILD;
     }
 
     // A matching child that has exited — reap the first one found.
-    let exited = table.iter().position(|e| {
-        e.as_ref()
-            .is_some_and(|s| (any || s.pid == want) && s.exit.is_some())
-    });
+    let exited = table
+        .iter()
+        .position(|e| e.as_ref().is_some_and(|s| mine(s) && s.exit.is_some()));
     let Some(slot_off) = exited else {
         return 0; // matching child(ren) exist, none has exited yet
     };
@@ -4158,6 +4205,70 @@ pub fn redirect_test(t: &mut Suite) {
 /// the parent blocks in `wait4` until the child is done, then finishes the
 /// list. Output must carry both `Akuma` (from the forked `uname`) and `DONE`
 /// (from the parent shell), and nothing may leak.
+/// `wait4` must answer for **your own** children only, and say `ECHILD` when
+/// there are none.
+///
+/// Pins the 2026-09-08 subshell hang. The spawn table is global, so a scan
+/// without a `ppid` filter answers "does any process exist?" — and a forked
+/// process, whose own row is in that table, saw itself as an unexited child and
+/// parked in `wait4` forever. `( ls; true )` was enough to wedge the machine.
+///
+/// Both halves are checked here because either alone is still broken: a filter
+/// that returns the wrong errno leaves a shell reaping in a loop, and the right
+/// errno without the filter never gets asked.
+///
+/// The suite runs as init, whose `current_pid()` is 1, so a child spawned here
+/// is genuinely this caller's — the same relationship a shell has to its own.
+pub fn wait4_ownership_test(t: &mut Suite) {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+    use crate::fd::errno;
+
+    // No children yet: the answer must be ECHILD, not "block" and not ESRCH.
+    let mut st: i32 = -1;
+    let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
+    t.check_eq("wait4: no children -> ECHILD", r, errno::ECHILD);
+
+    if crate::fs::read_file("/bin/hello").is_err() {
+        t.note("wait4: /bin/hello not on the disk; ownership half skipped", 0);
+        return;
+    }
+
+    // One child of our own. While it is alive, `wait4(-1)` must report "exists,
+    // not exited" (0) rather than reaping something that is not ours.
+    let path = b"/bin/hello\0";
+    let arg0 = b"hello\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if !t.check("wait4: child spawned", r < ERRNO_FLOOR) {
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+
+    let mut spins = 0u64;
+    let reaped = loop {
+        spins += 1;
+        if spins > 4_000_000 {
+            break 0;
+        }
+        let mut st: i32 = -1;
+        let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
+        if r != 0 {
+            break r;
+        }
+        crate::sched::yield_now();
+    };
+    crate::fd::sys_close(stdout_fd);
+    t.check_eq("wait4: -1 reaps our own child by pid", reaped, u64::from(pid));
+
+    // And once it is reaped we are childless again. This is the assertion that
+    // fails on the pre-fix kernel: the caller's own row (or any other live
+    // process) kept `exists` true, so this returned 0 and the caller parked.
+    let mut st: i32 = -1;
+    let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
+    t.check_eq("wait4: after the last reap -> ECHILD again", r, errno::ECHILD);
+}
+
 pub fn fork_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
