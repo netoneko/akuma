@@ -647,6 +647,12 @@ pub fn register_idle_task(cpu: usize) -> Option<usize> {
 /// cannot slip between them and leave the core asleep past it.
 pub fn idle_loop() -> ! {
     loop {
+        // 5b slice 1: the idle loop is reclaim site 2 (`process::reclaim`'s
+        // vetted list). Every exit's terminal drain (`run_process`) and the
+        // boot drive loop's `yield_now` keep the RETIRED set near-empty while
+        // processes die; this is the collector that runs when nothing else
+        // does — the regime where the cooldown has always elapsed.
+        akuma_exec::process::reclaim::drain_retired_if_requested();
         if !threading::x86_yield() {
             smp::bkl_leave();
             // SAFETY: interrupts on for exactly the `hlt`, then off again. The

@@ -2533,6 +2533,15 @@ fn run_process(idx: usize) -> ! {
             spawn_record_exit(idx, status as i32);
         }
     }
+    // 5b slice 1: terminal teardown is a vetted drain site (`process::reclaim`
+    // site 1). On AArch64 `unregister_process`'s RETIRED slots are collected
+    // from the exit paths, the idle loop and the PMM pressure ladder; this
+    // target had none of the three, so before this line every reaped child's
+    // `Box<Process>` parked in the table forever and a long session would have
+    // panicked `register_process` at the 256-slot ceiling. The registered
+    // `Process`es here wrap non-owning shared views, so a reclaim's `drop` is
+    // trivial — but the table slots still need the sweep to come back.
+    akuma_exec::process::reclaim::drain_retired_if_requested();
     crate::sched::finish();
 }
 
@@ -2624,6 +2633,11 @@ struct Spawn {
     /// on the serial line, no `sshd` in front). The `stdin_pipe`/`stdout_pipe`
     /// fields are unused then.
     console_io: bool,
+    /// The scheduler task slot running this child, recorded at spawn so the
+    /// `waitpid` reap can remove the `THREAD_PID_MAP` entry it published
+    /// (`reap_exec_process`). A `usize` is wider than `sched::MAX_TASKS` needs,
+    /// but `usize::MAX` is not a sentinel here — every Spawn row has one.
+    exec_slot: usize,
 }
 
 const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
@@ -2830,6 +2844,204 @@ fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
     &raw mut SPAWN
 }
 
+// ===========================================================================
+// 5b slice 1: akuma-exec's process table, populated (2026-09-08)
+//
+// `PROCS`/`SPAWN` above are this target's *mechanism* — who runs, in which
+// address space, with which pipes. `akuma_exec`'s `PROCESS_TABLE` +
+// `THREAD_PID_MAP` are its *identity* — which pid is calling this syscall —
+// and until now nothing here populated them, so every
+// `akuma_exec::process::current_process_shared()` a folded glue arm reached
+// answered `None`. Each `sys_spawn`/`sys_fork`/`run_init` below now also
+// builds an `akuma_exec::Process` and registers it, and each reap unregisters.
+//
+// # The field decisions, each stated rather than defaulted
+//
+// The `Process` has 45 pub fields and the sanctioned constructor shape is
+// `image.rs::from_image`'s literal, copied here. Where this target has no
+// answer, the honest one is written down:
+//
+// * `channel: None`, empty stdio — `sshd`'s stdio bridge is `crate::pipe`, a
+//   different namespace; the `StdioBuffer`s stay empty and unread.
+// * `fds: SharedFdTable::with_stdio()` — empty. The live descriptor table is
+//   `fd.rs`'s own; folding it is C2.
+// * `namespace: global_namespace()` — there are no boxes here.
+// * `signal_actions` empty, `signal_mask` 0 — no signal delivery on this
+//   target; `rt_sigaction`/`rt_sigprocmask` are local arms that never consult
+//   this.
+// * `image.context: UserContext::new(0, 0)` — amd64 keeps ring-3 registers in
+//   its own `UserCtx` and `enter_user` is its own entry path; this context is
+//   never `eret`n from.
+// * `lazy_regions` empty — demand paging here comes from `Process::regions`
+//   (`akuma-mmap`), not a lazy-region map.
+// * `memory: ProcessMemory::new(end_va, stack_bottom, ELF_STACK_TOP,
+//   mm::MMAP_BASE)` — the same constants `loader.rs`/`mm.rs` place with, so
+//   the registered view and the real one cannot disagree about where the heap,
+//   the stack and the mmap window are.
+// * `thread_id: None` — deliberately. On AArch64 it names an `akuma-threading`
+//   thread slot `unregister_process` may mark TERMINATED; this target's task
+//   lifecycle is `sched.rs`'s, and identity comes from `THREAD_PID_MAP`
+//   (`thread_pid_map_insert(task_slot, pid)` below) exactly as the vfork
+//   fast-path resolves it. Leaving the field `None` also keeps
+//   `unregister_process`'s thread-termination arm out of this target's
+//   scheduler, which it does not model.
+// * `process_info_phys: 0` — the ProcessInfo page is **not mapped, not
+//   allocated, and not missed**. `read_current_pid`'s page-read tail is gated
+//   on `ttbr0_el1() != boot_ttbr0()`, and on x86_64 the register read is a
+//   `0`-returning stub against `get_boot_ttbr0() == 0`, so the tail returns
+//   `None` before any access; identity resolves through `THREAD_PID_MAP` and
+//   the identity cache alone. The only writer, `prepare_for_execution`, is not
+//   on this target's path — and `write_phys` range-checks against PMM RAM and
+//   no-ops on `0` regardless. Mapping + ledger-tracking a real page would leak
+//   4 KiB per process, which the ring-3 leak checks would catch.
+//
+// # What registration changes on a live syscall
+//
+// `to_glue`'s folded arms (uname, getrandom, getgroups, prlimit64) get a
+// resolved identity in glue's prologue: `last_syscall`/`current_syscall` and
+// the per-process syscall stats start being stamped. Every other consumer of
+// `current_process_shared()` in glue is behind an arm this target does not
+// dispatch yet, so slice 1 changes no visible answer — it is the foundation
+// slices 2–4 (`Spawn` deletion, the mounted `ProcFilesystem`) build on.
+//
+// # The smp-shared question, decided before this landed
+//
+// It stopped being open on 2026-09-08: `smp-shared` is a **required** default
+// feature of this target (`Cargo.toml`, const-asserted in `smp.rs`), so
+// `kernel_smp_shared` is on and `ProcAddressSpace::lock()` really masks IRQs
+// (`akuma-cpu`'s `daif` has real x86 arms now). The shared table behind that
+// lock is therefore exclusion-correct from day one, and this slice adds no
+// lock of its own — `register_process`'s `SlotTable` CAS and the IRQ-masked
+// `THREAD_PID_MAP` are akuma-exec's own.
+// ===========================================================================
+
+/// Build and register the `akuma_exec::Process` standing behind `pid`, and
+/// publish `task_slot → pid` in `THREAD_PID_MAP`.
+///
+/// `root` is the live CR3 (`Process::space.ttbr0()` on this target); the
+/// registered `Process` wraps a **non-owning** `new_shared` view of it — on
+/// x86_64 that constructor cannot fail, has no `Drop`, and owns no frame, so
+/// wrapping the live root cannot double-free and the view can never free the
+/// page tables out from under the `PROCS` slot that really owns them.
+///
+/// `image_top` is where the heap starts (`LoadedImage::end_va`), `name` the
+/// `argv[0]`-ish display name `/proc/<pid>/comm` will render once slice 4
+/// mounts the real `ProcFilesystem`.
+///
+/// Register order is **table, then map**: `thread_pid_map_insert` refreshes
+/// the identity cache, whose lazy re-stamp handles the reverse order, but this
+/// order is the one the cache resolves on the first try. The registering task
+/// runs under the BKL inside a syscall; the child is usually not scheduled
+/// yet, and if it is (it was published first), the window before registration
+/// resolves identity exactly as it did before this slice — `None`, and the
+/// same fallbacks as ever.
+fn register_exec_process(
+    pid: u32,
+    ppid: u32,
+    task_slot: usize,
+    root: u64,
+    image_top: u64,
+    name: &str,
+) {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{
+        AtomicBool, AtomicI32, AtomicUsize,
+    };
+
+    use akuma_exec::process::{
+        AtomicProcessState, LazyRegionMap, Process, ProcessImage, ProcessMemory,
+        ProcessState, ProcessSyscallStats, SharedFdTable, SharedSignalTable,
+        StdioBuffer, UserContext, register_process, thread_pid_map_insert,
+    };
+
+    let stack_bottom = ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096);
+    let proc = Box::new(Process {
+        pid,
+        pgid: pid,
+        tgid: pid, // group leader = self; no CLONE_THREAD groups in the table yet
+        state: AtomicProcessState::new(ProcessState::Ready),
+        address_space: ProcAddressSpace::new(
+            // Cannot fail on x86_64 (see the module header); an `expect` here
+            // would name a crate contract change, not a runtime condition.
+            UserAddressSpace::new_shared(root as usize)
+                .expect("new_shared is infallible on x86_64"),
+        ),
+        image: Spinlock::new(ProcessImage {
+            name: String::from(name),
+            args: Vec::new(),
+            context: UserContext::new(0, 0),
+        }),
+        parent_pid: ppid,
+        brk: AtomicUsize::new(image_top as usize),
+        initial_brk: AtomicUsize::new(image_top as usize),
+        entry_point: AtomicUsize::new(0),
+        memory: ProcessMemory::new(
+            image_top as usize,
+            stack_bottom as usize,
+            ELF_STACK_TOP as usize,
+            crate::mm::MMAP_BASE,
+        ),
+        // Stated decision, not a default: see the module header — the page is
+        // never read on this target and mapping it would leak 4 KiB/process.
+        process_info_phys: AtomicUsize::new(0),
+        cwd: String::from("/"),
+        stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
+        stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
+        exited: AtomicBool::new(false),
+        exit_code: AtomicI32::new(0),
+        dynamic_page_tables: Vec::new(),
+        mmap_regions: Spinlock::new(Vec::new()),
+        lazy_regions: Spinlock::new(LazyRegionMap::new()),
+        fds: Arc::new(SharedFdTable::with_stdio()),
+        thread_id: None,
+        spawner_pid: None,
+        terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
+        box_id: 0,
+        namespace: akuma_isolation::global_namespace(),
+        channel: None,
+        delegate_pid: None,
+        grabbed_by: None,
+        clear_child_tid: AtomicU64::new(0),
+        robust_list_head: 0,
+        robust_list_len: 0,
+        signal_actions: Arc::new(SharedSignalTable::new()),
+        signal_mask: 0,
+        fault_mutex: Spinlock::new(BTreeMap::new()),
+        sigaltstack_sp: AtomicU64::new(0),
+        sigaltstack_flags: AtomicI32::new(2), // SS_DISABLE
+        sigaltstack_size: AtomicU64::new(0),
+        start_time_us: (akuma_exec::runtime::runtime().uptime_us)(),
+        current_syscall: AtomicU64::new(!0),
+        last_syscall: AtomicU64::new(0),
+        syscall_stats: ProcessSyscallStats::new(),
+    });
+    register_process(pid, proc);
+    thread_pid_map_insert(task_slot, pid);
+}
+
+/// Tear a reaped child's registration down: retire the `Process` (the table's
+/// deferred reclaim frees it after its cooldown) and remove the
+/// `task_slot → pid` map entry **only if the slot still names this pid**.
+///
+/// That guard is load-bearing rather than tidy: task slots are recycled, and a
+/// zombie can sit in the `SPAWN` table long past the moment its finished task
+/// slot was handed to an unrelated process. Removing the entry unconditionally
+/// would strip a live process's identity — every syscall it makes would
+/// degrade to the pre-slice fallbacks until its own insert re-stamps, which is
+/// exactly the silent-wrongness this table exists to prevent. Compare, then
+/// remove; a stale entry is self-correcting (the new owner's insert overwrote
+/// it), a matching one is ours.
+fn reap_exec_process(pid: u32, task_slot: usize) {
+    use akuma_exec::process::{pid_for_thread, thread_pid_map_remove, unregister_process};
+    unregister_process(pid);
+    if pid_for_thread(task_slot) == Some(pid) {
+        thread_pid_map_remove(task_slot);
+    }
+}
+
 /// Read a NUL-terminated string from user memory, bounded.
 fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
     crate::uaccess::read_cstr(ptr, max)
@@ -2922,7 +3134,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let envp_refs: alloc::vec::Vec<&[u8]> =
         envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
 
-    let (proc, _img) = match Process::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
+    let (proc, img) = match Process::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [execve] load failed: ");
@@ -2944,6 +3156,52 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             if let Some(Some(sp)) = (*spawn_table()).get_mut(slot - SPAWN_SLOT_BASE) {
                 sp.cmdline = flatten_cmdline(argv_refs.iter().copied());
             }
+        }
+        // 5b slice 1: the registered `akuma-exec` `Process` follows the image
+        // too. Its `new_shared` address-space view names the *old* root — which
+        // `run_process`'s swap is about to free — so it is re-pointed at the
+        // pending image's root now, along with the heap/entry scalars and the
+        // display name. The old view has no `Drop` (x86 `new_shared` owns
+        // nothing) so replacing it frees nothing twice. Done here rather than
+        // in `run_process` because the pid is at hand and the swap below is
+        // unconditional: from this point the registered view names the root
+        // the task will run on, even for the few instructions before it does.
+        //
+        // `None` from `with_process` is the publish-to-register window: the
+        // task was published before its spawner got to `register_exec_process`
+        // and is already `execve`ing. Register here instead — under the BKL,
+        // so it cannot race the spawner's own registration — or the fresh
+        // registration would wrap the root this execve is about to free.
+        let pid = current_pid();
+        let new_root = proc.space.ttbr0();
+        let new_brk = img.end_va;
+        let new_entry = img.entry;
+        let new_name = alloc::string::String::from(
+            core::str::from_utf8(argv_refs[0]).unwrap_or("exec"),
+        );        let refreshed = {
+            let new_name = new_name.clone();
+            akuma_exec::process::with_process(pid, |p| {
+                p.address_space = ProcAddressSpace::new(
+                    UserAddressSpace::new_shared(new_root as usize)
+                        .expect("new_shared is infallible on x86_64"),
+                );
+                p.brk.store(new_brk as usize, core::sync::atomic::Ordering::Relaxed);
+                p.initial_brk.store(new_brk as usize, core::sync::atomic::Ordering::Relaxed);
+                p.entry_point.store(new_entry as usize, core::sync::atomic::Ordering::Relaxed);
+                p.image.lock().name = new_name;
+            })
+            .is_some()
+        };
+        if !refreshed {
+            let (ppid, exec_slot) = {
+                // SAFETY: raw-pointer read; single core, this task's own row.
+                unsafe {
+                    (*spawn_table())[slot - SPAWN_SLOT_BASE]
+                        .as_ref()
+                        .map_or((1, usize::MAX), |sp| (sp.ppid, sp.exec_slot))
+                }
+            };
+            register_exec_process(pid, ppid, exec_slot, new_root, new_brk, &new_name);
         }
     }
 
@@ -3124,8 +3382,31 @@ fn sys_fork() -> u64 {
             exit: None,
             borrowed_io: true,
             console_io,
+            exec_slot: task_slot,
         });
     }
+
+    // 5b slice 1: the child exists as an identity, not just a mechanism. The
+    // task is already published, so there is a window where the child's
+    // syscalls resolve identity as they did before this slice (`None`); the
+    // insert below closes it. `image_top` 0 is deliberate for a fork child:
+    // it has no heap of its own — it shares the parent's image CoW until the
+    // `execve` that virtually always follows refreshes the registered view
+    // (`sys_execve`), and a `brk` naming the parent's heap would let nothing
+    // (no folded arm touches `brk` yet) answer a grow request into a space the
+    // child does not own.
+    register_exec_process(
+        pid,
+        parent_pid,
+        task_slot,
+        child_root,
+        0,
+        proc_by_pid(parent_pid).map_or_else(
+            || alloc::string::String::from("fork"),
+            |p| alloc::string::String::from(p.name())
+            )
+            .as_str(),
+    );
 
     u64::from(pid)
 }
@@ -3190,7 +3471,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         return errno::ENOMEM;
     };
 
-    let (proc, _img) = match Process::from_elf_argv(&image, &argv_refs) {
+    let (proc, img) = match Process::from_elf_argv(&image, &argv_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [spawn] load failed: ");
@@ -3230,10 +3511,10 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         (*procs)[slot] = Some(proc);
     }
 
-    if spawn_process_task(slot, root).is_none() {
+    let Some(task_slot) = spawn_process_task(slot, root) else {
         cleanup_spawn_slot(slot, stdout_pipe, stdin_pipe);
         return errno::ENOMEM;
-    }
+    };
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
     // SAFETY: raw-pointer write; single core.
@@ -3247,8 +3528,23 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
             exit: None,
             borrowed_io: false,
             console_io: false,
+            exec_slot: task_slot,
         });
     }
+
+    // 5b slice 1: register the child with `akuma-exec`'s process table and
+    // publish `task_slot → pid`, so `current_process_shared()` resolves for
+    // this child from its first (post-registration) syscall. The heap starts
+    // where the loaded image ends — the same `LoadedImage::end_va` the loader
+    // reported and `mm.rs`'s placer agrees with.
+    register_exec_process(
+        pid,
+        spawner_pid,
+        task_slot,
+        root,
+        img.end_va,
+        core::str::from_utf8(argv_refs[0]).unwrap_or("spawn"),
+    );
 
     let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false);
     let Some(stdout_fd) = stdout_fd else {
@@ -3435,9 +3731,9 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     };
 
     // SAFETY: `slot_off` is in bounds and occupied with `exit == Some`.
-    let (code, stdin_pipe, child_pid, borrowed_io) = unsafe {
+    let (code, stdin_pipe, child_pid, borrowed_io, exec_slot) = unsafe {
         let s = (*spawn_table())[slot_off].as_ref().unwrap();
-        (s.exit.unwrap(), s.stdin_pipe, s.pid, s.borrowed_io)
+        (s.exit.unwrap(), s.stdin_pipe, s.pid, s.borrowed_io, s.exec_slot)
     };
 
     if status_ptr != 0 {
@@ -3463,6 +3759,11 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
             drop(p);
         }
     }
+    // 5b slice 1: the child is gone from this target's tables, so it goes from
+    // akuma-exec's too — the slot table's deferred reclaim frees the `Process`
+    // after its cooldown, and the `THREAD_PID_MAP` entry is removed only while
+    // the recorded task slot still names this pid (`reap_exec_process`).
+    reap_exec_process(child_pid, exec_slot);
     u64::from(child_pid)
 }
 
@@ -4807,6 +5108,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
             return false;
         }
     };
+    let init_image_top = _img.end_va;
     let root = proc.space.ttbr0();
     // SAFETY: single core; the slot is written before the task that reads it
     // exists.
@@ -4814,10 +5116,17 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         let procs = &raw mut PROCS;
         (*procs)[6] = Some(proc);
     }
-    if spawn_process_task(6, root).is_none() {
+    let Some(task_slot) = spawn_process_task(6, root) else {
         serial::puts("  [init] no task slot\n");
         return false;
-    }
+    };
+    // 5b slice 1: init is pid 1 on this target — `sshd`'s `getpid` says so, and
+    // every process not in the spawn table falls back to the same answer — so
+    // the registered identity names that pid. Registered *before* the first
+    // `yield_now` below hands the CPU to the task, so init's own first syscall
+    // already resolves. Nothing unregisters it: init runs until the machine
+    // stops, and the boot loop after this never returns while it lives.
+    register_exec_process(1, 0, task_slot, root, init_image_top, path);
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes
     // up.

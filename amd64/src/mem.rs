@@ -181,7 +181,10 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     });
     akuma_pmm::register_hooks(akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
-        drain_retired: || 0,
+        // 5b slice 1: the pressure ladder's retired-process rung. Same
+        // cooldown-honoring sweep the idle loop and the exit path run; reached
+        // from akuma-pmm's allocation pressure path.
+        drain_retired: || akuma_exec::process::reclaim::drain_retired(),
         evict_clean_file_pages: |_| 0,
         shrink_page_cache: |_| 0,
     });

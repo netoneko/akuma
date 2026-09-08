@@ -118,7 +118,11 @@ use akuma_syscalls_linux::flags::prot::{PROT_EXEC, PROT_WRITE};
 /// Well above where a static binary is linked (`0x40_0000`) and above the
 /// dynamic linker's `INTERP_BASE` (`0x4000_0000`), so an image and its mappings
 /// cannot meet.
-const MMAP_BASE: usize = 0x1_0000_0000;
+/// `pub` within a private module — the crate is the only reader. 5b slice 1:
+/// the akuma-exec `Process` registered per process carries the same mmap
+/// window in its `ProcessMemory`, so the two placers cannot drift
+/// (`usermode.rs::register_exec_process`).
+pub const MMAP_BASE: usize = 0x1_0000_0000;
 
 /// One past the last address the automatic placer will hand out.
 ///

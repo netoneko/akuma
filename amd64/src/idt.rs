@@ -661,7 +661,7 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     serial::puts(" task=");
     serial::put_dec(crate::smp::current_task() as u64);
     serial::puts(" pid=");
-    serial::put_dec(crate::usermode::current_pid() as u64);
+    serial::put_dec(u64::from(crate::usermode::current_pid()));
     serial::puts(" — killing the process\n");
     crate::usermode::kill_current_from_fault(128 + 11);
 }

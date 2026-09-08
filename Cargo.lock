@@ -95,6 +95,7 @@ dependencies = [
  "akuma-exec-core",
  "akuma-ext2",
  "akuma-fbcon",
+ "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-multiboot2",

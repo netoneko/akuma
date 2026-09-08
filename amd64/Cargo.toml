@@ -170,6 +170,10 @@ akuma-mmu = { path = "../crates/akuma-mmu" }
 # "genuinely shared" the same way; each of those four is a real incident in this
 # tree, and getting one wrong is silent in every direction.
 akuma-cow = { path = "../crates/akuma-cow" }
+# `global_namespace()` — the `Namespace` every `akuma_exec::Process` carries.
+# There are no boxes on this target, so every registered process names the one
+# global namespace, exactly as `Process::from_image` does on AArch64.
+akuma-isolation = { path = "../crates/akuma-isolation" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.
