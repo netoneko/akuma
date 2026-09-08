@@ -225,6 +225,26 @@ pub fn init_vfs() {
         fpcache_init: |_total_ram_bytes| {},
     });
     akuma_vfs_glue::init();
+
+    // 5b slice 3: mount the real `ProcFilesystem`.
+    //
+    // The reason it was not mounted is spent: it renders from `akuma-exec`'s
+    // process table, and until 5b slices 1-2 this target registered nothing
+    // there, so mounting it would have replaced a working synthetic `/proc`
+    // with a report of an empty machine. Every process is registered now, so
+    // it renders this kernel's real processes — and it renders them for **all**
+    // pids, where `fd.rs` could only ever describe the running one.
+    //
+    // Mounted here rather than beside the ext2 root because `/proc` does not
+    // depend on a disk: a `DISK=none` boot still has processes, and `ps` on it
+    // should still work.
+    //
+    // `fd.rs` keeps three paths that this filesystem does not serve — see its
+    // `/proc` comment — so the mount is additive rather than a swap.
+    let proc_fs = alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new());
+    if akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs).is_err() {
+        crate::serial::puts("[FS] WARN: /proc mount failed; falling back to fd.rs's synthetic view\n");
+    }
 }
 
 /// Mount the first block device as the root filesystem.
@@ -520,7 +540,20 @@ fn dev_smoke_test(t: &mut Suite) {
 /// read it. Each check below fails if the wiring is missing rather than if the
 /// vocabulary is wrong.
 fn mount_table_smoke_test(t: &mut Suite) {
-    t.check_eq("mount: exactly one mount after boot", mount_count() as u64, 1);
+    // Two since 5b slice 3: the ext2 root and `/proc`. The count is asserted
+    // rather than bounded because it is the cheapest statement of what this
+    // kernel mounts, and a *third* appearing unannounced is exactly what this
+    // check is for — it caught the `/proc` mount itself on the boot it landed.
+    t.check_eq("mount: exactly two mounts after boot", mount_count() as u64, 2);
+    // `/proc` must be one of them and must be a `proc`, not a second ext2: a
+    // mount recorded with the wrong type still resolves paths and still lists
+    // in `df`, and only the type column says which filesystem answered.
+    {
+        let mut b = [0u8; 1024];
+        let n = render_mounts(&mut b);
+        let rows = core::str::from_utf8(&b[..n]).unwrap_or("");
+        t.check("mount: /proc is mounted as proc", rows.contains(" /proc proc "));
+    }
 
     // `/proc/mounts`, exactly as `busybox df` will read it.
     let mut buf = [0u8; 1024];

@@ -734,14 +734,19 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
         }
         // Everything else under /proc: the live process table and the
-        // system-wide virtual files.
-        return open_proc(rest, flags_).unwrap_or(errno::ENOENT);
+        // system-wide virtual files. A path this view does not serve falls
+        // through to the mounted `ProcFilesystem` — see `sys_newfstatat`.
+        if let Some(r) = open_proc(rest, flags_) {
+            return r;
+        }
     }
     // `/proc` itself, with no trailing slash — the path `ps` and `top` open to
     // enumerate processes. The `strip_prefix("/proc/")` above cannot match it,
     // and without this it fell through to the real, empty ext2 directory.
-    if path == "/proc" {
-        return open_proc("", flags_).unwrap_or(errno::ENOENT);
+    if path == "/proc"
+        && let Some(r) = open_proc("", flags_)
+    {
+        return r;
     }
 
     let Ok(normalised) = resolve_at(dirfd, path) else {
@@ -2086,10 +2091,16 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
     } else {
         normalised.strip_prefix("/proc/")
     };
-    if let Some(rest) = proc_rest {
-        let Some((size, is_dir)) = proc_metadata(rest) else {
-            return errno::ENOENT;
-        };
+    // A `/proc` path this kernel's own synthetic view does not serve is no
+    // longer `ENOENT`: since 5b slice 3 the real `ProcFilesystem` is mounted
+    // at `/proc`, and it serves files this one never did (`uptime`,
+    // `loadavg`, the system-wide `stat`, per-pid `mounts`, the `fd`
+    // directory). Falling through to the normal path walk is what lets the
+    // union show through, and it keeps the three answers consistent by
+    // construction: open, stat and access all fall through at the same point.
+    if let Some(rest) = proc_rest
+        && let Some((size, is_dir)) = proc_metadata(rest)
+    {
         // 0o40555 / 0o100444: root-owned, world-readable, never writable.
         let mode = if is_dir { 0o040_555 } else { 0o100_444 };
         let st = encode_stat(mode, size, 1, if is_dir { 2 } else { 1 }, None, None, None);
@@ -2395,8 +2406,12 @@ pub fn sys_access(path: u64) -> u64 {
     } else {
         normalised.strip_prefix("/proc/")
     };
-    if let Some(rest) = proc_rest {
-        return if proc_metadata(rest).is_some() { 0 } else { errno::ENOENT };
+    // Served here, or fall through to the mounted `ProcFilesystem` below —
+    // see the matching comment in `sys_newfstatat`.
+    if let Some(rest) = proc_rest
+        && proc_metadata(rest).is_some()
+    {
+        return 0;
     }
     if fs::metadata(&normalised).is_ok() {
         0
@@ -2599,6 +2614,29 @@ fn normalise_proc(rest: &str) -> alloc::string::String {
 /// The bytes themselves are `akuma-procfs`, shared with the AArch64 kernel and
 /// host-tested there — this function is only the lookup and the buffer.
 fn render_pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
+    // `stat`, `status` and `cmdline` stay here rather than moving to the
+    // mounted `ProcFilesystem`, which serves all three and renders them from
+    // the same `akuma-exec` table through the same `akuma-procfs` formats.
+    // Moving them was tried during 5b slice 3 and reverted, for a reason worth
+    // recording:
+    //
+    // **The boot suite runs before `run_init`.** Its `proc: open/stat/access
+    // agree on /proc/self/{stat,status,cmdline}` checks execute on a task that
+    // is registered in no process table, and `current_pid()` answers 1 for it.
+    // This file can answer for that window (`proc_by_pid` has an explicit pid-1
+    // fallback); the mounted filesystem cannot, because it reads the table and
+    // the table is empty. Routing the three there made all three checks fail.
+    //
+    // Serving them from a table the mount also reads is duplication, but not
+    // *divergence*: one source, one format crate, two callers. Closing it means
+    // registering pid 1 before the self-tests run, which is its own change with
+    // its own hazards (`run_init` registers pid 1 too, and would then be
+    // re-registering rather than creating).
+    //
+    // `meminfo`, `mounts` and `net/dev` stay for a different and stronger
+    // reason: they read *this* target's PMM, mount table and interface list,
+    // where the crate's same-named files read the AArch64 kernel's. A shared
+    // format is not a shared source.
     let entry = crate::usermode::proc_by_pid(pid)?;
     let name_owned = alloc::string::String::from(entry.name());
     let stat = entry.stat(&name_owned);

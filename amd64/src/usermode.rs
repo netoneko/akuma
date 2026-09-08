@@ -2705,8 +2705,9 @@ fn flatten_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) -> alloc::vec::
 /// reasoning that makes touching it sound at all.
 pub struct ProcEntry {
     pub pid: u32,
+    /// The parent pid `/proc/<pid>/stat` reports. From `Process::parent_pid`.
     pub ppid: u32,
-    /// `Some(code)` for a process that has exited and not yet been reaped.
+    /// `Some` once the process has left ring 3 — a zombie until it is reaped.
     pub exit: Option<i32>,
     /// argv, NUL-separated. Never empty: falls back to the program name.
     pub cmdline: alloc::vec::Vec<u8>,
@@ -2720,7 +2721,8 @@ impl ProcEntry {
         core::str::from_utf8(first).unwrap_or("?")
     }
 
-    /// The state `/proc` should report.
+
+    /// `R` while live, `Z` once it has exited and not yet been reaped.
     #[must_use]
     pub fn state(&self) -> akuma_procfs::ProcState {
         match self.exit {
@@ -2780,7 +2782,6 @@ pub fn proc_list() -> alloc::vec::Vec<ProcEntry> {
 /// and that is the kind of drift a shared accessor makes impossible rather than
 /// unlikely.
 fn proc_entry_of(p: &akuma_exec::process::Process) -> ProcEntry {
-    use core::sync::atomic::Ordering;
     let img = p.image.lock();
     // `image.args` is `Vec<String>`; `/proc/<pid>/cmdline` is NUL-terminated
     // bytes. Rebuilt here rather than stored twice.
@@ -2800,10 +2801,9 @@ fn proc_entry_of(p: &akuma_exec::process::Process) -> ProcEntry {
         // exists to show it. `exited`/`exit_code` are the atomics `akuma-exec`
         // keeps for exactly this, and they carry the same meaning as the spawn
         // row's `Option<i32>`: `None` until it leaves ring 3.
-        exit: p
-            .exited
-            .load(Ordering::Acquire)
-            .then(|| p.exit_code.load(Ordering::Acquire)),
+        exit: p.exited.load(core::sync::atomic::Ordering::Acquire).then(|| {
+            p.exit_code.load(core::sync::atomic::Ordering::Acquire)
+        }),
         cmdline,
     }
 }
