@@ -503,6 +503,69 @@ as they stand one day after the survey
 > say it was not caused by the kernel and have been corrected.
 > `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`.
 
+> **5b landed in four slices, and `PROCS` is gone (2026-09-08 → 09-09)** —
+> `AKUMA_AMD64_STEP5B_SLICE1_REGISTRATION.md`, `..._SLICE2_LIFECYCLE.md`,
+> `..._SLICE3_PROCFS.md`, `..._SLICE4_PROCS.md`. The C1 box's
+> `Spawn/PROCS → akuma-exec` line is **half done, and the half that is left is
+> not effort**:
+>
+> 1. **registration** — every `sys_spawn`/`sys_fork`/`sys_execve`/`run_init`
+>    builds and registers a real `akuma_exec::Process`; all 45 fields decided
+>    explicitly, three reclaim sites wired. Found the `cpuid`/`rbx` clobber that
+>    had made SMAP detection read garbage since the function existed.
+> 2. **identity and lifecycle** — pid, parent, exit status, `/proc` listing and
+>    cmdline all answer from the registration. `Spawn` went 9 fields to 6.
+> 3. **`/proc` is a real mount** — `akuma-vfs-glue`'s `ProcFilesystem`, as a
+>    *union* with what `fd.rs` still serves from this target's own sources.
+> 4. **`PROCS` and `PENDING_EXEC` are deleted** — the address space, entry
+>    point, stack, region list and CoW-fork flag all moved onto the registered
+>    process (the flag onto `UserCtx`, beside the registers it refers to).
+>    `.data` lost exactly 32 768 bytes, `.text` 6 688.
+>
+> **The fault path changed shape and the cost was measured, on silicon**: the
+> lookup behind `with_current_regions` / `with_current_address_space` /
+> `cow_swap_frame` went from **1 cycle** (a per-CPU field read plus an array
+> index) to **15** — +14, ~4.4 ns on the i5-4460 — and every one is a hit in
+> `akuma-exec`'s per-thread identity cache, not the 256-slot table scan the
+> naive fold would have paid. The extra `UserCtx` pointer cache the hand-off
+> pre-authorised was **declined**: that cache already exists one level up, and a
+> second one would have to re-derive the slot-generation guard.
+>
+> That measurement is a **boot self-test**, because the obvious instrument does
+> not work here: `userspace/memprobe/c/mem_fault_cost` builds and runs on this
+> target and measures **nothing** — every arm is timed with `clock_gettime` and
+> this kernel's clock is 10 ms granular all the way down
+> (`net::uptime_us` = `lapic::ticks() * 10_000`), so every 512-fault bracket
+> reads `0 ns`. Anything timed from ring 3 on amd64 is subject to that.
+>
+> Three more bugs fell out, each silent: `execve` never refreshed
+> `/proc/<pid>/cmdline` (it set `ProcessImage::name`, which nothing reads — `ps`
+> renders `args[0]`, so every `execve`d process listed its spawner's argv);
+> `execve` would have leaked its predecessor's mmap extents once the process
+> outlived its image; and the **reap was not a reclaim site**, so a parent
+> collecting a child parked the child's whole address space until something else
+> happened to sweep.
+>
+> Verified at baseline + 3 on five rigs — QEMU/TCG 521→**524** (`SMP=4`) and
+> 512→**515** (`SMP=1`), Firecracker 508→**511**, **bare metal 512→515**, host
+> tests **1360/0** — plus ring-3 over ssh on QEMU (both SMP arms) and on the
+> metal: 79/80 sessions of `( ls /bin; ls /bin )` with `free` unmoved, `ps`
+> steady, and `grandfork` **ALL PASS**.
+>
+> **What `Spawn` is still waiting for is C2.** Its six remaining fields are a
+> pid key, the scheduler task slot, and four stdio fields that belong to
+> `crate::pipe`; `akuma-exec`'s equivalent is the exec-channel machinery, which
+> is where 12 of the 16 remaining `not_wired!` stubs point. `futex_wake`'s stub
+> — whose stated blocker was literally "C1 step 5: PROCS folds into akuma-exec"
+> — is wired.
+>
+> **Next in C1 is 5c**: `fork`/`execve`/`wait4`/`clone` onto `akuma-exec`'s own
+> `children.rs`/`spawn.rs`/`exec.rs`. Slice 4 is what makes it writable — those
+> four now read one process table instead of two — and it carries one known
+> divergence to close on the way: `replace_image` calls `kill_exec_siblings`
+> and this target's `execve` does not, so a `CLONE_VM` sibling keeps running in
+> a space that has just been replaced.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate
@@ -637,12 +700,39 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │                              AKUMA_SELF_HEALING_PORT.md,
    │                              AKUMA_AMD64_STREAMLINING.md (survey)
    ▼
- [09-07] ═══ YOU ARE HERE ═══
+ [09-07] ═══ THE GATE ═══
    │
-   └──► the unlock tree below — A1, A2, B1, B2, the six memory gaps and
-        B3 all landed this day; the gate
-        (`cargo check -p akuma-syscalls-glue --target x86_64-unknown-none`)
-        is GREEN, and C1 is next
+   ▼   the unlock tree below — A1, A2, B1, B2, the six memory gaps and
+   │   B3 all landed this day; the gate
+   │   (`cargo check -p akuma-syscalls-glue --target x86_64-unknown-none`)
+   │   is GREEN, and C1 begins: steps 1-2 (the dispatch vocabulary,
+   │   `akuma-syscalls-abi` 36 → 80 rows), step 3 (the leaf tier, three
+   │   batches), step 4a (the private mount table deleted)
+   │                        docs: AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md,
+   │                              AKUMA_AMD64_C1_STEP3_PREREQUISITES.md,
+   │                              AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md
+   ▼
+ [09-08] ═══ UNIFIED WALKER, LOADER, AND PROCESS TABLE ═══
+   │
+   ▼   step 5a: `paging::AddressSpace` deleted — one x86 user-space walker,
+   │   wrapped in the same `ProcAddressSpace` the AArch64 `Process` carries
+   ▼   step 6: one ELF loader (`akuma-elf`); the x86 walk had no upper-half
+   │   guard, which PML4 aliasing made a live kernel-table corruption
+   ▼   step 5b, slices 1-3: every process is a registered
+   │   `akuma_exec::Process`; identity, parent, exit status and `/proc` all
+   │   answer from it; `ProcFilesystem` mounted
+   │                        docs: AKUMA_AMD64_STEP5A_ONE_WALKER.md,
+   │                              AKUMA_AMD64_STEP6_ONE_LOADER.md,
+   │                              AKUMA_AMD64_STEP5B_SLICE{1,2,3}_*.md
+   ▼
+ [09-09] ═══ YOU ARE HERE ═══
+   │
+   └──► step 5b slice 4: `PROCS` and `PENDING_EXEC` deleted — the fault
+        path resolves through `akuma-exec`'s identity cache, measured at
+        +14 cycles on the metal. C1's remaining work is 5c
+        (fork/execve/wait4/clone onto akuma-exec) — `Spawn` itself cannot
+        go until C2 takes `fd.rs`
+                             docs: AKUMA_AMD64_STEP5B_SLICE4_PROCS.md
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -663,12 +753,12 @@ parity with what the AArch64 self-host already proves.
            parity with what the AArch64 self-host already has)
 
   ┌─────────────────────────────┬─────────────────────────────────┐
-  │  TRUNK A: scheduler         │  TRUNK B: memory                │
+  │  TRUNK A: scheduler   ✔DONE │  TRUNK B: memory          ✔DONE │
   │  (independent of B)         │  (independent of A)             │
   └──────────────┬──────────────┴──────────────┬──────────────────┘
                  ▼                             ▼
   ┌──────────────────────────┐   ┌────────────────────────────────┐
-  │ A1. sched.rs → akuma-    │   │ B1. ENABLE akuma-mmap          │
+  │ A1. sched.rs → akuma-  ✔ │   │ B1. ENABLE akuma-mmap       ✔  │
   │     threading            │   │     (Prot token landed,        │
   │                          │   │      2026-09-06 — blocker gone)│
   │  brings: park/wake,      │   │                                │
@@ -683,14 +773,14 @@ parity with what the AArch64 self-host already proves.
                  │               └───────────────┬────────────────┘
                  │                               ▼
                  │               ┌────────────────────────────────┐
-                 │               │ B2. #PF handler + uaccess      │
+                 │               │ B2. #PF handler + uaccess   ✔  │
                  │               │     demand paging (not-present │
                  │               │     fault + region table),     │
                  │               │     is-mapped/prefault walk    │
                  │               └───────────────┬────────────────┘
                  ▼                               ▼
   ┌────────────────────────────────────────────────────────────────┐
-  │ A2. wakes become real (pure wins, no port needed after A1)     │
+  │ A2. wakes become real (pure wins, no port needed after A1)  ✔  │
   │   futex.rs:  poll loop → park on tid          (ThreadWaker)    │
   │   pipe.rs:   fire() drops Wakes → fires them                   │
   │   net.rs:    park_until/waker/netpoll doorbell un-collapse     │
@@ -702,7 +792,7 @@ parity with what the AArch64 self-host already proves.
                  │  so B1 → B3; A and B only meet here)
                  ▼
   ┌────────────────────────────────────────────────────────────────┐
-  │ B3. WIDEN x86 UserAddressSpace (~12 methods, walker done)      │
+  │ B3. WIDEN x86 UserAddressSpace (~12 methods, walker done)   ✔  │
   │   ledger forwards ← akuma-user-space (exists, thin)            │
   │   ttbr0()→root getter, is_shared, map_user_page_tracked,       │
   │   UserPages impl, is_mapped/is_range_mapped/read_l3_page_entry │
@@ -715,11 +805,18 @@ parity with what the AArch64 self-host already proves.
   ╚══════════════════════════════┬═══════════════════════════════╝
                                  ▼
   ┌────────────────────────────────────────────────────────────────┐
-  │ C1. FOLD usermode.rs IN (4378 → entry seam)                    │
-  │   ~32 dispatch arms + bodies → glue   (diff for pinned         │
-  │                                        divergences while folding)│
-  │   Spawn/PROCS → akuma-exec: real fork/exec/lifecycle/reclaim   │
-  │   loader.rs placement → akuma-elf load half                    │
+  │ C1. FOLD usermode.rs IN (4378 → entry seam)   ◀── IN PROGRESS  │
+  │  ✔ 1-2  the dispatch vocabulary (akuma-syscalls-abi, 80 rows)  │
+  │  ✔ 3    the leaf tier folded, in three batches                 │
+  │  ✔ 4a   the private mount table deleted                        │
+  │  ✔ 5a   one x86 user-space walker                              │
+  │  ✔ 6    loader.rs placement → akuma-elf load half              │
+  │  ✔ 5b   PROCS → akuma-exec, in four slices: register /         │
+  │           identity+lifecycle / mount /proc / delete PROCS      │
+  │  ✖ 5c   fork/execve/wait4/clone → children.rs/spawn.rs/exec.rs │
+  │  ✖ 4b   the remaining VFS arms → glue                          │
+  │  ✖ Spawn itself: its four stdio fields ARE crate::pipe, so it  │
+  │           cannot go until C2. A wall, not a backlog.           │
   │   keeps: syscall/sysret asm, swapgs bracketing (= el0-entry    │
   │          shape on AArch64)                                     │
   └──────────────┬───────────────────┬─────────────────────────────┘
