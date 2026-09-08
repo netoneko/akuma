@@ -651,6 +651,17 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     serial::put_hex(frame.rsp);
     serial::puts(" cr2=0x");
     serial::put_hex(read_cr2());
+    // The wrong-root diagnostic for the `cowstale` race
+    // (`docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md` § "The open issue"):
+    // which root is actually active, which task slot is published on this
+    // core, and which process pid the slot maps to. A reader that sees bss as
+    // zeros names its root here — compare against the fork child's.
+    serial::puts(" cr3=0x");
+    serial::put_hex(crate::paging::active_root());
+    serial::puts(" task=");
+    serial::put_dec(crate::smp::current_task() as u64);
+    serial::puts(" pid=");
+    serial::put_dec(crate::usermode::current_pid() as u64);
     serial::puts(" — killing the process\n");
     crate::usermode::kill_current_from_fault(128 + 11);
 }

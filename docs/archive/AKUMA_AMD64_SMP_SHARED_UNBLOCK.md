@@ -104,78 +104,71 @@ idiom by hand; the crate's other callers ran bare `hlt`.
   `akuma-primitives/src/preempt.rs` moving 132 → 164, exactly the 32 lines the
   x86 `current_tid` arm added above them — the same benign shape 5a recorded
   for a one-byte `.rodata` diff.
-- `c_stress` memory probes: **regressed — see below.**
+- `c_stress` memory probes: **`cowstale` flaky at SMP=4 — resolved below as a
+  pre-existing amd64 race, not the flip.** Full run after the A/B:
+  Firecracker **8/10, 0 unexpected (exactly baseline)**; QEMU/TCG hit the
+  pre-existing `cowstale` hang in this sample (cascading NOT-REACHED), which
+  the same A/B shows the pre-flip kernel does too.
 
-## The open issue: `cowstale` at SMP=4
+## The open issue: `cowstale` at SMP=4 — **resolved as pre-existing, not the flip**
 
-Baseline is 8/10 with **0 unexpected**. With the feature on, `cowstale`
-fails at `SMP=4` on **both** rigs; `SMP=1` passes both. Two failure shapes
-observed, sometimes in the same run:
+Baseline is 8/10 with **0 unexpected**. With the feature on, `cowstale` fails at
+`SMP=4` on both rigs (hang, or a ring-3 `#PF` in a reader thread); `SMP=1`
+passes both. **A/B on the box (KVM, five `cowstale` runs each) settles cause:**
 
-1. **Ring-3 `#PF` in a reader thread** — `err=0x4` (user, read, not-present),
-   `rip=0x400ade`, which `objdump` resolves to `reader`'s first load
-   `movq (%rax), %rcx` with `rax = g_map + (p << 12)`. Across runs
-   `cr2` was `0x0` (p=0) and `0x1d000` (p=29) — **in both cases
-   `g_map` itself read as zero** and `cr2 == p << 12`. The probe's own header
-   had already printed `map=0x100000000`, so the global *was* correct when
-   written.
-2. **No end marker** — the probe never reports, on either rig.
+| kernel | result |
+|---|---|
+| pre-flip (`1ff515cc amd64 elf`) | 4 PASS, **1 HANG** |
+| branch tip (feature on) | 3 PASS, **2 HANG** |
 
-A manual QEMU run (`INIT=/probes/run_all INITARGS=cowstale`, SMP=4) **passed**
-— 1 996 304 reader checks, 0 faults — minutes after the harness run failed.
-So it is timing-dependent, not deterministic on rig or probe count.
+The pre-flip kernel fails in the same shape at a comparable rate. The race is
+**pre-existing on amd64**; the feature flip only changed the timing (and
+whether TCG manifested it as a hang or a `#PF`). It is *exposed*, not *caused*
+— and the boot suites are unaffected (503/0 across the flip).
 
-### What the symptom means
+### The mechanism, as evidenced
 
-`g_map` lives in `.bss`. A thread that reads it as **zero through a present
-mapping** (the `mov` of `g_map` itself did not fault — the fault is on the
-`(%rax)` load it feeds) is reading bss from an address space where that VA is
-backed by a **zeroed anon frame**, not the parent's data. That is the signature
-of running against the wrong root (a fresh/child space whose region list
-demand-pages zeros) or of a parent space whose bss got re-demand-paged over.
-The probe was built to hold translations live on peer cores across a fork's
-demote — the stale-translation condition — and its `map=` print proves the
-value was right at start.
+1. The `#PF` diagnostic (added to `user_fault`: `cr3`/`task`/`pid`) showed the
+   faulting reader running against **the parent's own root, the parent's own
+   pid** — the wrong-root theory is dead. Two readers faulting near-simultaneously
+   is expected once their shared address space reads zeros.
+2. `objdump` of the probe resolves `rip=0x400ade` to `reader`'s first load,
+   `rax = g_map + (p << 12)`; `cr2` values `0x0` and `0x1d000` both decode as
+   **`g_map` itself reading as zero**, `cr2 == p << 12`. The probe's header had
+   already printed `map=0x100000000`, so the value was correct when written.
+3. `g_map` lives in `.bss`. Reading it as **zero through a present mapping**
+   means the translation resolves to a frame whose *current* contents are
+   zeros — a freed frame PMM has re-zeroed.
 
-### Not the cause (checked)
+That is a **use-after-free read through a stale peer-core TLB entry**:
+`CLONE_VM` threads make the parent's address space active on several cores at
+once; a fork demotes bss, a parent write-fault CoW-copies a page, and the old
+frame is freed when the child drops its ref. A reader on another core still
+holds the pre-demote `RO` translation — x86 has **no TLB shootdown**
+(`amd64/src/smp.rs`'s own header: "complete here because an address space is
+only ever active on the core running its one task"), and that invariant is
+exactly what `pthread_create` breaks. When PMM hands the freed frame out
+`alloc_page_zeroed`, the stale translation reads zeros. The fork self-tests
+(all pass, consistently, `SMP=4`) have no threads, which is why only this
+probe lands on it.
 
-- `akuma-bkl`'s `irq_save_mask`/`irq_restore` route through
-  `akuma_primitives::irq` — real on x86 since piece 1; `enter_kernel`'s
-  mask-wait is not a no-op here.
-- `demote_range_to_ro`'s feature-gated `dsb_ish` is `mfence` on x86 — correct
-  and harmless.
-- `get_or_create_table_atomic`'s `free_page` now receives a real tid instead
-  of 0 — a stats/debug argument only.
-- The bare-`hlt` sleep (piece 4) is fixed; the failure survives the fix with a
-  changed shape (both rigs hang now; earlier the TCG run `#PF`ed instead),
-  which is consistent with the sleep having been one *consequence channel* of
-  the race rather than its cause.
-- Firecracker's other probe results are at baseline (8/10 with the same two
-  `known` entries); the regression is specific to `cowstale`'s
-  fork-demote-under-peer-traffic shape.
+### The fix, and its scope
 
-### Leading theories, in order
+Peer-core invalidation for address spaces active on more than one core — an
+IPI shootdown keyed off the per-core L0 registry (`akuma_mmu`'s
+`publish_l0_begin` bookkeeping already names which cores are on which root),
+or at minimum no freeing of a CoW frame until every core that could hold a
+translation for the space has invalidated. That is its own step (the AArch64
+kernel has the ASID machinery; x86 has none); it should land **before** 5c
+leans on threads, and the probe is the regression test for it.
 
-1. **Wrong root on a peer core.** A parent reader resumed against the child's
-   (or a fresh) root whose bss demand-pages as zeros. Test: print `CR3` and
-   `current_task` in amd64's `#PF` kill path and compare against the fork
-   child's root (`mm.rs` fork builds it; a boot-log print during the probe
-   run names both).
-2. **Region-list surgery corrupting the parent's regions during fork**, so a
-   later parent fault re-demand-pages bss as zeros — same print, plus a dump
-   of the parent's region list at fault time.
-3. A `x86_yield`/switch-path behaviour change under the feature
-   (`akuma-threading`'s feature-gated arms) publishing a task before its
-   `space_root`.
+### Judging the mem suite until then
 
-### Next steps
-
-- Add `CR3` + `current_task` to the `#PF` kill diagnostic in `amd64/src/idt.rs`
-  (one line each; the value is `paging::active_root()`), rerun
-  `amd64_mem_trials.py --only cowstale --smp 4` until the `#PF` shape
-  reproduces, and compare the faulting root against the child's.
-- If the root is the parent's, dump the parent's region list — theory 2.
-- A/B `x86_yield`'s feature arms if neither lands.
+`cowstale` at `SMP=4` on KVM is a coin flip on *any* amd64 kernel of this
+vintage. A 5b verification run should score `cowstale` against the pre-flip
+rate (hang ≈ 1-in-3..5, `#PF` shape on TCG) rather than against 8/10, and
+treat a *new* failure shape or a different probe regressing as the real
+signal.
 
 ## Background
 
