@@ -183,12 +183,18 @@ fn runtime() -> ExecRuntime {
         resolve_file_id: |_| not_wired!("resolve_file_id", "C2: the VFS read surface"),
         read_at_by_inode: |_, _, _, _| not_wired!("read_at_by_inode", "C2: the VFS read surface"),
 
-        // ── not wired: process lifecycle (C1 step 5) ──────────────────────
-        // `akuma-exec` calls this from `clear_child_tid` on process exit. This
-        // target's futex table is `crate::futex`, keyed by its own task ids —
-        // a different namespace from `akuma-exec`'s pids, so forwarding would
-        // wake the wrong waiter rather than none.
-        futex_wake: |_, _, _| not_wired!("futex_wake", "C1 step 5: PROCS folds into akuma-exec"),
+        // ── wired 5b slice 4 ──────────────────────────────────────────────
+        // `akuma-exec` calls this from `clear_child_tid` on process exit —
+        // the `pthread_join` wake. It was a `not_wired!` panic on the grounds
+        // that `crate::futex` is "keyed by its own task ids, a different
+        // namespace from `akuma-exec`'s pids"; that named the wrong half of the
+        // table. The waiter *identity* is a scheduler task slot, but the
+        // **key** is `(tgid, uaddr)`, and since 5b slice 2 that tgid is
+        // `current_pid()`, i.e. `akuma-exec`'s own pid. So the argument arrives
+        // in the namespace the table already uses and needs no translation.
+        futex_wake: |tgid, uaddr, count| {
+            let _ = crate::futex::wake_key(tgid, uaddr, count);
+        },
     }
 }
 

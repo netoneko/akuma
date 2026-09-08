@@ -288,6 +288,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // legacy-x86 list and the neutral `Syscall` table must stay disjoint,
     // and the x86_64 -> asm-generic hop C1 folds through must still happen.
     usermode::dispatch_smoke_test(t, cx.have_fs);
+    usermode::identity_cost_test(t);
     usermode::smoke_test(t);
     usermode::preempt_test(t);
     // The per-core live-L0 registry, here rather than with the rest of

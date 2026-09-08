@@ -186,31 +186,59 @@ int main(int argc, char **argv) {
     long long c_one   = best_of(passes, arm_cow, ONE, &bad);
     long long c_many  = best_of(passes, arm_cow, MANY, &bad);
 
-    if (m_lazy < 0 || m_eager < 0 || d_one < 0 || d_many < 0 ||
-        b_one < 0 || b_many < 0 || f_ctl < 0 || c_one < 0 || c_many < 0) {
-        printf("FAIL: an arm never completed; the numbers below mean nothing\n");
-        return 1;
+    /* Name the arm, do not just say "an arm". A probe that reports only that
+     * something failed sends the reader back to the source to bisect nine arms
+     * by hand — and on a kernel that is missing exactly one of them (this is
+     * how `brk` growth was found absent on amd64) the name IS the finding. */
+    const struct { const char *name; long long v; } arms[] = {
+        { "mmap_lazy", m_lazy }, { "mmap_eager", m_eager },
+        { "demand_1p", d_one },  { "demand_512p", d_many },
+        { "brk_grow_1p", b_one }, { "brk_grow_512p", b_many },
+        { "fork_exit", f_ctl },  { "cow_1p", c_one }, { "cow_512p", c_many },
+    };
+    int missing = 0;
+    for (unsigned i = 0; i < sizeof arms / sizeof arms[0]; i++) {
+        if (arms[i].v < 0) {
+            printf("FAIL: arm %s never completed\n", arms[i].name);
+            missing++;
+        }
+    }
+    if (missing) {
+        /* Report what DID measure rather than nothing at all. A kernel missing
+         * one syscall (amd64 has no `brk` growth) used to make this probe
+         * print a single FAIL line and discard eight working arms; the
+         * sections below are independent, so an absent one omits itself and
+         * the rest still answer. The exit status still says something failed. */
+        printf("FAIL: %d arm(s) never completed; those sections are omitted\n",
+               missing);
     }
 
     printf("mem_fault_cost: %d passes, cheapest wins, %ld-byte pages\n", passes, page);
 
+    if (m_lazy > 0 && m_eager >= 0) {
     printf("\n[allocation — plan()'s two outcomes, %d reps per sample]\n", MAP_REPS);
     printf("%-18s %8lld ns   (control: region record only)\n", "mmap_lazy", m_lazy);
     printf("%-18s %8lld ns   (ratio %.2f)\n", "mmap_eager", m_eager,
            (double)m_eager / (double)m_lazy);
     printf("  %-18s %8lld ns   eager premium: one frame allocated + mapped\n",
            "eager_extra", m_eager - m_lazy);
+    }
 
+    if (d_one >= 0 && d_many >= 0) {
     printf("\n[demand paging — translation faults]\n");
     printf("%-18s %8lld ns\n", "demand_1p", d_one);
     printf("%-18s %8lld ns\n", "demand_512p", d_many);
     bracket("per_demand_fault", d_one, d_many, MANY - ONE);
+    }
 
+    if (b_one >= 0 && b_many >= 0) {
     printf("\n[brk growth — allocate + map per page]\n");
     printf("%-18s %8lld ns\n", "brk_grow_1p", b_one);
     printf("%-18s %8lld ns\n", "brk_grow_512p", b_many);
     bracket("per_brk_page", b_one, b_many, MANY - ONE);
+    }
 
+    if (f_ctl > 0 && c_one >= 0 && c_many >= 0) {
     printf("\n[CoW — write-permission faults]\n");
     printf("%-18s %8lld ns   (control)\n", "fork_exit", f_ctl);
     printf("%-18s %8lld ns   (ratio %.2f)\n", "cow_1p", c_one,
@@ -218,7 +246,9 @@ int main(int argc, char **argv) {
     printf("%-18s %8lld ns   (ratio %.2f)\n", "cow_512p", c_many,
            (double)c_many / (double)f_ctl);
     bracket("per_cow_fault", c_one, c_many, MANY - ONE);
+    }
 
     if (bad) printf("\nnote: %d bad cycle(s) skipped\n", bad);
-    return 0;
+    printf("mem_fault_cost: END\n");
+    return missing ? 1 : 0;
 }

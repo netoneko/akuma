@@ -294,6 +294,37 @@ has one definition across both transports. In particular a **silent probe is
 never a pass** — that rule was learned the hard way and a second copy of it is a
 second place to get it wrong.
 
+### The ring-3 workload check
+
+The boot suite runs under `BypassValidationGuard` on init's own task, so it
+cannot prove a user-facing path. Every process-model change here has been signed
+off with a second step — log in over ssh many times, run something that forks
+and execs, read `free` either side — and that step is a program now:
+
+```bash
+python3 scripts/utils/amd64_ring3_check.py            # 40 sessions, SMP=1
+python3 scripts/utils/amd64_ring3_check.py --smp 4    # the known-racy arm
+python3 scripts/utils/amd64_ring3_check.py --keep     # leave the VM up to poke at
+```
+
+It runs `( ls /bin >/dev/null; ls /bin >/dev/null ); echo r$$` per session — the
+subshell with **two** execs, i.e. a grandchild, which is the shape that used to
+wedge this kernel — reads `free` and `ps | wc -l` either side, and finishes with
+`/probes/grandfork`. Run it against a **known-good** tree once as well as your
+own: a harness that has only ever seen the tree it was written for is not yet
+evidence (`docs/archive/AKUMA_AMD64_STEP5B_SLICE4_PROCS.md`).
+
+### Timing anything from ring 3 does not work here
+
+`userspace/memprobe/c/`'s two instruments build and run on this target and
+**measure nothing**: every arm is timed with `clock_gettime`, and this kernel's
+clock has 10 ms granularity all the way down (`net::uptime_us` is
+`lapic::ticks() * 10_000`). A 1000-iteration `mmap` control reads exactly one
+tick; every 512-fault bracket reads zero.
+`scripts/benchmarks/amd64_fault_cost.py` will show you that in one command, and
+is the thing to re-run if the clock ever gets finer. Until then, time it from
+the kernel with the TSC — `usermode::identity_cost_test` is the worked example.
+
 ### Reading a result on this target
 
 The probes assume a Linux-complete guest, so several fail here for reasons that

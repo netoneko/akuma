@@ -17,7 +17,7 @@
 //! |---|---|
 //! | a new `UserAddressSpace` (CoW-shared) | the parent's, unchanged |
 //! | its own frame ledger (inside that address space) | none — it owns no frames |
-//! | a `PROCS` slot and a `Spawn` record | the parent's, shared |
+//! | a process slot and a `Spawn` record | the parent's, shared |
 //! | its own fd routing (`UserCtx::proc_slot`) | the parent's, shared |
 //! | its own `%fs` base, copied from the parent | its own, **from `CLONE_SETTLS`** |
 //! | a `waitpid`-visible exit status | a `futex` wake on `clear_child_tid` |
@@ -75,7 +75,7 @@ pub const NO_THREAD: usize = usize::MAX;
 struct Thread {
     /// Scheduler task slot. The identity a futex wake reaches.
     task: usize,
-    /// The `PROCS` slot whose address space this thread runs in — shared with
+    /// The process slot whose address space this thread runs in — shared with
     /// its process, which is what makes fd 0/1/2 route the same way.
     proc_slot: usize,
     /// Linux tid. Drawn from the same counter as pids, as on Linux, so a tid
@@ -92,7 +92,8 @@ struct Thread {
     clear_child_tid: u64,
 }
 
-/// `static mut` under the BKL — `usermode::PROCS`'s discipline exactly.
+/// `static mut` under the BKL — the discipline `usermode::PROCS` had before 5b
+/// slice 4 deleted it: every writer is kernel code and kernel code holds the lock.
 static mut THREADS: [Option<Thread>; MAX_THREADS] = [const { None }; MAX_THREADS];
 
 fn threads() -> *mut [Option<Thread>; MAX_THREADS] {
@@ -102,7 +103,7 @@ fn threads() -> *mut [Option<Thread>; MAX_THREADS] {
 /// Set when any thread of a process calls `exit_group`, so its siblings leave
 /// ring 3 at their next syscall instead of running on into a torn-down space.
 ///
-/// Indexed by `PROCS` slot. An `AtomicU32` bitmap would be tighter; an array of
+/// Indexed by process slot. An `AtomicU32` bitmap would be tighter; an array of
 /// flags is what the rest of this file's tables look like.
 static GROUP_EXIT: [AtomicU32; crate::usermode::PROC_SLOTS] =
     [const { AtomicU32::new(0) }; crate::usermode::PROC_SLOTS];
@@ -320,7 +321,7 @@ fn cancel(slot: usize, task: usize) {
 /// Every thread task starts here.
 ///
 /// One entry function for all of them, unlike `usermode::proc_entry_for`'s
-/// sixteen hand-written trampolines: those bake a `PROCS` index into a `fn`
+/// sixteen hand-written trampolines: those bake a process index into a `fn`
 /// pointer because there was nowhere else to put it, and by the time a thread
 /// runs there *is* somewhere — `UserCtx::thread_slot`, seeded before
 /// publication.

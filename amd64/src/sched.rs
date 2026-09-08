@@ -685,7 +685,7 @@ pub fn idle_loop() -> ! {
 ///   unmapped. Measured 2026-09-04, intermittent by timer phase: one boot served
 ///   ssh, the next died on the first user instruction.
 /// - Every process thread now needs [`seed_proc_slot`] before it runs, because
-///   `usermode::proc_entry` reads its `PROCS` index out of its own `UserCtx`.
+///   `usermode::proc_entry` reads its process index out of its own `UserCtx`.
 ///
 /// With a second core the window is not a tick away but zero instructions away.
 pub fn spawn_in_space_unpublished(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
@@ -732,6 +732,13 @@ pub fn set_current_space_root(space_root: u64) {
 /// `usermode::enter_user_mode_forked`). The child inherits `%fs` because musl's
 /// post-fork fixups are `%fs`-relative, and the register set because a C
 /// compiler assumes r12-r15/rbx survive the `syscall`.
+///
+/// `forked` is set in the same call rather than by a separate one, and that is
+/// the point of it being here: the flag says "use the three values above", so a
+/// path that seeded the registers and forgot the flag — or set the flag with no
+/// registers behind it — cannot be written. Before 5b slice 4 the flag was a
+/// field on this target's own `Process`, one table away from the registers it
+/// refers to.
 pub fn seed_forked_task(task_slot: usize, fs_base: u64, gs_base: u64, saved_regs: &[u64; 12]) {
     // SAFETY: raw-pointer access; under the BKL, and the slot is unpublished so
     // no core can be running it.
@@ -740,6 +747,7 @@ pub fn seed_forked_task(task_slot: usize, fs_base: u64, gs_base: u64, saved_regs
             m.uctx.fs_base = fs_base;
             m.uctx.gs_base = gs_base;
             m.uctx.saved_regs = *saved_regs;
+            m.uctx.forked = 1;
         }
     }
 }
@@ -786,11 +794,11 @@ pub fn seed_thread_task(
     }
 }
 
-/// Seed a not-yet-running **process** thread with the `PROCS` slot it serves.
+/// Seed a not-yet-running **process** thread with the process slot it serves.
 ///
 /// The counterpart of [`seed_thread_task`]'s `proc_slot`/`thread_slot` pair, and
 /// the reason `usermode` needs only one process entry function. Until 2026-09-06
-/// a `PROCS` index had nowhere to live but the `fn` pointer itself, so
+/// a process index had nowhere to live but the `fn` pointer itself, so
 /// `usermode::proc_entry_for` baked one into each of sixteen hand-written
 /// trampolines — and since only nine of them were ever handed out, the machine
 /// could not run more than nine processes at once. `cargo -j4` is cargo plus

@@ -68,9 +68,9 @@ impl WaiterId for Waiter {
 /// The waiter table.
 ///
 /// `static mut` behind a raw pointer, reached only from syscall context under
-/// the BKL — the same discipline as `usermode::PROCS`, and for the same reason:
-/// every writer is kernel code, kernel code holds the lock, and a context
-/// switch keeps it held.
+/// the BKL — the discipline `usermode::PROCS` had before 5b slice 4 deleted it,
+/// and for the same reason: every writer is kernel code, kernel code holds the
+/// lock, and a context switch keeps it held.
 static mut WAITERS: WaiterTable<Waiter> = WaiterTable::new();
 
 fn waiters() -> *mut WaiterTable<Waiter> {
@@ -317,6 +317,29 @@ fn wake_op(uaddr: u64, uaddr2: u64, val: u32, val2: u64, val3: u32, private: boo
         n += second.len();
     }
     n as u64
+}
+
+/// Wake up to `count` waiters on `(tgid, uaddr)`, for `akuma-exec`'s
+/// `futex_wake` runtime hook.
+///
+/// The hook was a `not_wired!` panic until 5b slice 4, on the stated grounds
+/// that this table is "keyed by its own task ids — a different namespace from
+/// `akuma-exec`'s pids". Half of that was true and the wrong half: the *waiter
+/// identity* is a scheduler task slot, but the **key** is `(tgid, uaddr)`, and
+/// since 5b slice 2 that `tgid` comes from [`namespace`] → `current_pid()` →
+/// `akuma-exec`'s `THREAD_PID_MAP`. It is the same number `Process::tgid`
+/// carries, so the hook's argument needs no translation at all; what unblocked
+/// it was the identity fold, not this one.
+///
+/// `count` is `i32` because the caller passes `i32::MAX` for "all"
+/// (`clear_child_tid` at process exit); a negative value is treated as all,
+/// which is the only reading of it that is not a silent no-op.
+pub fn wake_key(tgid: u32, uaddr: usize, count: i32) -> usize {
+    let n = if count < 0 { u32::MAX } else { count.cast_unsigned() };
+    // SAFETY: raw-pointer access under the BKL; see `WAITERS`.
+    let woken = unsafe { (*waiters()).wake((tgid, uaddr), n, MATCH_ANY) };
+    resume(&woken);
+    woken.len()
 }
 
 /// Drop every queue entry naming task slot `task`.

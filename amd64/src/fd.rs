@@ -227,7 +227,7 @@ struct Entry {
     /// transition to zero runs [`release`] — which is what persists a written
     /// file, closes a socket and frees a pipe.
     ///
-    /// This field replaced an `owner: usize` (the `PROCS` slot that opened the
+    /// This field replaced an `owner: usize` (the process slot that opened the
     /// fd), which existed because the table used to be one flat array shared
     /// by every task: nothing reclaimed a task's fds when it exited, and
     /// `apk` installing 14 packages left the *next* `apk` starting from a
@@ -448,7 +448,7 @@ static FILES: Spinlock<[Option<Entry>; MAX_FILES]> =
 type FileIdx = u16;
 const NO_FILE: FileIdx = FileIdx::MAX;
 
-/// One row per `PROCS` slot, plus one on the end for the kernel.
+/// One row per process slot, plus one on the end for the kernel.
 ///
 /// The kernel row is not a courtesy: the boot self-tests open files, and
 /// `current_proc_slot()` answers `usize::MAX` when no user task is running.
@@ -2550,7 +2550,7 @@ const PID_FILES: [&str; 3] = ["cmdline", "stat", "status"];
 /// The two more it serves for the **calling** process only.
 ///
 /// `maps` and `statm` describe an *address space*, and the only address space
-/// this target can name is the running one: `PROCS` is keyed by scheduler slot,
+/// this target can name is the running one: the fd rows are keyed by process slot,
 /// the spawn table is keyed by pid, and nothing joins them. Every real reader of
 /// these two files reads its own — an allocator sizing its arenas, a sanitiser
 /// finding the heap, `ps` reading `statm` for its own RSS — so serving `self`

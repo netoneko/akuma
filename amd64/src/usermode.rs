@@ -125,8 +125,8 @@ pub struct UserCtx {
     pub user_rsp: u64,
     /// Non-zero when this task should leave ring 3. Offset 16.
     pub leave: u64,
-    /// The `PROCS` slot this task is running, or `usize::MAX` for a task that is
-    /// not an ELF process (the boot task). Offset 24 — past everything the
+    /// The process slot this task is running, or `usize::MAX` for a task that
+    /// is not an ELF process (the boot task). Offset 24 — past everything the
     /// assembly indexes, so it is free to be an ordinary field. `sys_read` /
     /// `sys_write` use it to route fd 0/1/2 to a spawned child's pipes instead
     /// of the console.
@@ -162,9 +162,39 @@ pub struct UserCtx {
     /// This is what lets every `clone` child share **one** entry function, and
     /// since 2026-09-06 `proc_slot` above does the same job for processes —
     /// `usermode::proc_entry` replaced sixteen hand-written trampolines that
-    /// existed only because a `PROCS` index had nowhere to live but the `fn`
+    /// existed only because a process index had nowhere to live but the `fn`
     /// pointer. Both indices are seeded before the task is published.
     pub thread_slot: usize,
+    /// Non-zero when this task's **first** ring-3 entry must resume with the
+    /// parent's full register set (`enter_user_mode_forked`) rather than at a
+    /// fresh `_start`. Offset 160 — not indexed by assembly.
+    ///
+    /// # Why it lives here and not on the process
+    ///
+    /// 5b slice 4 had to find this a home when `PROCS` was deleted, and this is
+    /// the one place where the rest of the same fact already lives:
+    /// [`crate::sched::seed_forked_task`] seeds `saved_regs`, `fs_base` and
+    /// `gs_base` into this very struct, and `forked` says nothing more than
+    /// "use them". Putting it on the registered `akuma_exec::Process` would
+    /// have split one decision across two structures — and it is not a property
+    /// of the *image* either: an `execve` in a `fork` child replaces the image
+    /// and the flag is already spent by then, because [`run_process`] clears it
+    /// on the first entry.
+    ///
+    /// On AArch64 there is no equivalent because there is nothing to say: that
+    /// kernel `eret`s from `ProcessImage::context`, which either *is* the
+    /// parent's register set or is not.
+    pub forked: u64,
+    /// Non-zero when `execve` has installed a new image on this task and
+    /// [`run_process`] must re-enter ring 3 instead of treating the ring-3 exit
+    /// as the process ending. Offset 168 — not indexed by assembly.
+    ///
+    /// This replaced `static mut PENDING_EXEC`, a second `PROC_SLOTS`-wide
+    /// array of half-built processes. There is at most one pending `execve` per
+    /// *task* — the task that called it, which is the same task that consumes
+    /// it — so per-task state is what it always was; the array was addressing
+    /// by process slot for want of anywhere else to put one bit.
+    pub exec_pending: u64,
 }
 
 impl UserCtx {
@@ -180,6 +210,8 @@ impl UserCtx {
             saved_regs: [0; 12],
             gs_base: 0,
             thread_slot: crate::thread::NO_THREAD,
+            forked: 0,
+            exec_pending: 0,
         }
     }
 }
@@ -1614,10 +1646,12 @@ fn sys_sysinfo(out: u64) -> u64 {
 /// A rough count of live processes, for `sysinfo`'s `procs`. Best-effort — the
 /// number is cosmetic in `free`/`top` on this target.
 fn proc_count() -> u16 {
-    // SAFETY: read-only scan of the process table; a torn count is acceptable
-    // for a cosmetic field.
-    let procs = unsafe { &*core::ptr::addr_of!(PROCS) };
-    procs.iter().filter(|p| p.is_some()).count().min(u16::MAX as usize) as u16
+    // `akuma-exec`'s table since 5b slice 4, which is the only process table
+    // there is now. It answers a slightly different question than the array it
+    // replaced — registered processes rather than occupied process slots — and
+    // for a cosmetic `sysinfo` field the registered count is the better one:
+    // it is what `ps` lists.
+    akuma_exec::process::process_count().min(u16::MAX as usize) as u16
 }
 
 /// `syslog(type, bufp, len)` — the `klogctl(2)` operations `busybox dmesg`
@@ -1942,77 +1976,60 @@ fn build_user_program(
     n
 }
 
-/// A process: its own address space, the frames backing it, and where to start.
+/// A freshly built program image: an address space, where ring 3 starts in it,
+/// and the `mmap` regions that come with it.
 ///
-/// `entry` and `stack_top` are fields rather than the two module constants they
-/// used to be. That was fine while every process was the same hand-assembled
-/// blob at the same address; an ELF decides its own entry point, and its stack
-/// has to go somewhere the image does not already occupy.
-pub struct Process {
-    /// This process's user address space, and the lock that serialises page-table
-    /// mutation on it.
+/// # It was `struct Process`, and the difference is that this is a *value*
+///
+/// Until 5b slice 4 this type was the process on this target, and it lived in
+/// `static mut PROCS: [Option<Process>; 128]` indexed by process slot. Every
+/// field of it now belongs to the registered [`akuma_exec::process::Process`]
+/// that slices 1-2 already put in `PROCESS_TABLE`:
+///
+/// | was | is |
+/// |---|---|
+/// | `space: ProcAddressSpace` | `Process::address_space` (**owning**, was a `new_shared` view) |
+/// | `entry: u64` | `Process::entry_point`, and `ProcessImage::context.pc` |
+/// | `stack: u64` | `ProcessImage::context.sp` |
+/// | `regions: Spinlock<Vec<MmapRegion>>` | `Process::mmap_regions` |
+/// | `forked: bool` | [`UserCtx::forked`] — per *task*, beside the registers it refers to |
+///
+/// What is left is the handful of things a loader produces and a registration
+/// consumes, so this is never stored in a table: [`register_exec_process`] takes
+/// it by value and moves each field into the registered process. A failed
+/// spawn simply drops it, which is what frees the half-built space —
+/// the same `Drop` contract the old type had, minus the array.
+struct Image {
+    /// The address space the loader built, with the program in it.
     ///
-    /// # It was two fields and a third object until step 5a
-    ///
-    /// `space: paging::AddressSpace` (a bare `u64` PML4 root with no lock at
-    /// all, reached through `static mut PROCS` and a raw pointer) plus
-    /// `frames: FrameSet` — a second frame ledger beside the page table. They
-    /// are one thing now, and it is the same
-    /// [`akuma_mmu::UserAddressSpace`] the AArch64 kernel's `Process` carries,
-    /// wrapped in the same [`ProcAddressSpace`]: `Spinlock<UserAddressSpace>`
-    /// plus a lock-free atomic mirror of the root for the fault path.
-    ///
-    /// Two things fall out that were not true before. The **ledger lives inside
-    /// the address space**, so a frame cannot be tracked against one process and
-    /// mapped into another's tables — they are the same object. And teardown is
-    /// [`Drop`], not an explicit `free()`: `UserAddressSpace`'s destructor runs
-    /// the user frames, the page tables and the L0 through
-    /// `free_or_defer_as_frames`, which parks them if any core's `CR3` or any
-    /// preempted thread's saved context still names the table. `paging::activate`
-    /// feeds the first of those gates on this target, which is what makes a
-    /// destructor safe here at all.
-    ///
-    /// The lock does **not** mask IRQs on this target: `ProcAddressSpace::lock`
-    /// does that only under `kernel_smp_shared`, and amd64 is real SMP without
-    /// that feature. Every hold taken here is one PTE edit or one bounded walk,
-    /// which is why that is survivable rather than merely unnoticed — see
-    /// `proposals/AMD64_STEP5_PROCESS_TABLE.md` § "The IRQ-masking question".
-    space: ProcAddressSpace,
+    /// A plain [`UserAddressSpace`], not a [`ProcAddressSpace`]: nothing can
+    /// reach this space concurrently until it is registered, and the lock and
+    /// the lock-free root mirror are exactly what registration adds.
+    space: UserAddressSpace,
     /// Where ring 3 starts executing.
     entry: u64,
     /// Initial `rsp`.
     stack: u64,
-    /// Resume this process's **first** ring-3 entry with the parent's full
-    /// register set (`enter_user_mode_forked`) rather than a fresh `_start`.
+    /// The `mmap` regions this image starts life with.
     ///
-    /// `true` for a `fork` child: it is a register- and memory-complete copy of
-    /// the parent and must continue from the parent's post-`fork` instruction.
-    /// `execve` replaces it with a plain `Process`, so only that first entry
-    /// takes the forked path.
-    forked: bool,
-    /// The `mmap` regions of this **address space**, and the lock over them.
-    ///
-    /// Here rather than beside the scheduler's per-slot `Machine` because a
-    /// region list belongs to an address space and threads share one: a
-    /// `clone(CLONE_VM)` thread runs on the caller's `proc_slot`
-    /// (`thread.rs`), so it finds — and must find — the same list.
-    ///
-    /// The lock is not ceremony. This target is *not* BKL-serialised at
-    /// `SMP=4` across the window `yield_now` opens, and the AArch64 race this
-    /// mirrors is exactly `CLONE_VM`
-    /// (`docs/archive/AKUMA_MMAP_REGIONS_RACE.md`), which amd64 now supports.
+    /// Empty for everything but a `fork` child, which inherits the parent's
+    /// extents (`akuma_mmap::inherit_mmap_regions_for_cow_child`). Carrying the
+    /// extent is the part that has been dropped before and the part that
+    /// matters: a grandchild whose parent's regions read as zero-length shares
+    /// nothing and faults on its first touch
+    /// (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
     ///
     /// `MmapRegion::frames` is left **empty** on this target and `pages`
     /// carries the extent — the CoW-inherited shape the crate documents. Frame
-    /// ownership here is `akuma_user_space::FrameLedger`'s job — since step 5a
-    /// the one **inside** [`Process::space`] — which counts VAs per frame and is
-    /// what teardown walks; a second frame list in the region would be a second
-    /// answer to the same question.
-    regions: Spinlock<Vec<MmapRegion>>,
+    /// ownership is `akuma_user_space::FrameLedger`'s job — the one **inside**
+    /// [`Image::space`] — which counts VAs per frame and is what teardown
+    /// walks; a second frame list in the region would be a second answer to the
+    /// same question.
+    regions: Vec<MmapRegion>,
 }
 
-impl Process {
-    /// Build a process that prints `msg` `rounds` times then exits with
+impl Image {
+    /// Build an image that prints `msg` `rounds` times then exits with
     /// `status`.
     ///
     /// `delay == 0` yields between rounds (cooperative); anything else spins
@@ -2060,11 +2077,10 @@ impl Process {
             return None;
         }
         Some(Self {
-            space: ProcAddressSpace::new(space),
+            space,
             entry: USER_CODE_VA as u64,
             stack: (USER_STACK_VA + 4096 - 16) as u64,
-            forked: false,
-            regions: Spinlock::new(Vec::new()),
+            regions: Vec::new(),
         })
     }
 
@@ -2108,16 +2124,7 @@ impl Process {
         let stack = loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)?;
 
         let entry = img.entry;
-        Ok((
-            Self {
-                space: ProcAddressSpace::new(space),
-                entry,
-                stack,
-                forked: false,
-                regions: Spinlock::new(Vec::new()),
-            },
-            img,
-        ))
+        Ok((Self { space, entry, stack, regions: Vec::new() }, img))
     }
 
     // Teardown is `Drop`, not a `free(self)` method.
@@ -2150,13 +2157,23 @@ impl Process {
     /// resuming at `entry`/`stack`
     /// (the parent's post-`fork` RIP/RSP) as a register-complete copy.
     ///
+    /// `parent` is the **registered** `akuma_exec::Process` since 5b slice 4 —
+    /// the only process there is now. The two things read out of it are the
+    /// same two this function always read, under the same lock order
+    /// (**regions → address space**): the region extents first, in one hold,
+    /// then one walk of the tables.
+    ///
     /// `None` if a frame for the child's PML4 or one of its page tables runs
     /// out — the shell then sees `fork` fail with `ENOMEM`, which is a
     /// survivable "can't fork" rather than a corrupt child. Both failure paths
     /// print which one they took: an `ENOMEM` that names the wrong resource is
     /// what made the scheduler's slot leak look like memory exhaustion for an
     /// afternoon (`docs/archive/AKUMA_AMD64_COW.md`).
-    fn fork_from(parent: &Self, entry: u64, stack: u64) -> Option<Self> {
+    fn fork_of(
+        parent: &akuma_exec::process::Process,
+        entry: u64,
+        stack: u64,
+    ) -> Option<Self> {
         let Some(mut space) = UserAddressSpace::new() else {
             serial::puts("  [fork] no frame for a child PML4; pmm free=");
             serial::put_dec(akuma_pmm::free_count() as u64);
@@ -2171,7 +2188,7 @@ impl Process {
         // walk maps pages and must not run under the region lock.
         let (regions, shared_ranges) = {
             let _irq = akuma_primitives::irq::IrqGuard::new();
-            let parent_regions = parent.regions.lock();
+            let parent_regions = parent.mmap_regions.lock();
             let shared: Vec<(usize, usize)> = parent_regions
                 .iter()
                 .filter(|r| r.shared_anon)
@@ -2202,7 +2219,7 @@ impl Process {
         // parent's residency; it has to be one hold, because a demote that
         // published halfway would leave the parent writable on pages the child
         // already shares.
-        let mut parent_as = parent.space.lock();
+        let mut parent_as = parent.address_space.lock();
         parent_as.rewrite_leaves_in_range(0, akuma_mmu::USER_HALF_END, |_ledger, leaf| {
             if !ok {
                 return LeafAction::Keep;
@@ -2293,22 +2310,45 @@ impl Process {
             // managed to claim and every page table it built.
             return None;
         }
-        Some(Self {
-            space: ProcAddressSpace::new(space),
-            entry,
-            stack,
-            forked: true,
-            regions: Spinlock::new(regions),
-        })
+        Some(Self { space, entry, stack, regions })
     }
 }
 
-/// Run `f` with the running process's `mmap` region list, under its lock.
+/// The registered process the running task belongs to, or `None`.
 ///
-/// `None` when the caller is not a slotted user task — a kernel thread, or the
-/// boot self-tests before any process exists. Every caller must handle that
-/// rather than defaulting to an empty list: "no process" and "a process with no
-/// regions" are different answers and only the second one may be served.
+/// **This is the fault path's lookup**, and the whole cost question of 5b
+/// slice 4 is in this one line. It used to be `current_proc_slot()` — a field
+/// read from the per-CPU `UserCtx` — followed by one index into `static mut
+/// PROCS`. It is now `akuma-exec`'s per-thread identity cache, which is the
+/// same shape one level along: a per-CPU read of the task slot, then
+/// `THREAD_IDENTITY[tid]`'s process-table slot and generation, then
+/// `SlotTable::ref_if_current`. Both are O(1); the new one is a few atomic
+/// loads rather than an array index.
+///
+/// The naive fold — `pid_for_thread` then a `find_process` scan of 256 slots —
+/// is what the hand-off warned about, and it is not what this is. That cache
+/// exists because the syscall boundary paid for it once already: 410 ns → 150 ns
+/// by resolving identity per *thread* instead of per call
+/// (`akuma_exec::process::table::THREAD_IDENTITY`, commit `c2a0e630`). Its key
+/// is the thread id, which on this target **is** the scheduler task slot
+/// (`X86ArchHooks::current_slot`), and that is the same key
+/// `register_exec_process` inserts under — so the cache resolves on the first
+/// try for every process this kernel starts.
+///
+/// `own`, not `tgid`: a `CLONE_VM` thread is published into the map under its
+/// *process's* pid (`crate::thread`), so the own half already answers "my
+/// process" for threads and costs one lookup instead of two.
+///
+/// `None` means the caller is not a registered user task — a kernel thread, or
+/// the boot task driving the self-tests. Every caller must handle that rather
+/// than defaulting: "no process" and "a process with no regions" are different
+/// answers and only the second one may be served.
+#[inline]
+fn current_process() -> Option<&'static akuma_exec::process::Process> {
+    akuma_exec::process::current_thread_own_process().map(|(_pid, p)| p)
+}
+
+/// Run `f` with the running process's `mmap` region list, under its lock.
 ///
 /// # The lock is held for the whole closure
 ///
@@ -2317,16 +2357,9 @@ impl Process {
 /// concurrent `mmap` on another core impossible to collide with while keeping
 /// the allocator out of the hold.
 pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Option<R> {
-    let slot = current_proc_slot();
-    // SAFETY: raw-pointer read of `PROCS`, the same discipline `cow_swap_frame`
-    // documents — this is the running task's own slot, and a process cannot be
-    // torn down underneath its own syscall or fault handler.
-    unsafe {
-        let procs = &raw const PROCS;
-        let p = (*procs).get(slot).and_then(Option::as_ref)?;
-        let _irq = akuma_primitives::irq::IrqGuard::new();
-        Some(f(&mut p.regions.lock()))
-    }
+    let p = current_process()?;
+    let _irq = akuma_primitives::irq::IrqGuard::new();
+    Some(f(&mut p.mmap_regions.lock()))
 }
 
 /// How many physical frames the calling process's address space holds.
@@ -2337,49 +2370,37 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
 /// which is what `statm` means by the word.
 #[must_use]
 pub fn current_resident_pages() -> usize {
-    let slot = current_proc_slot();
-    // SAFETY: as `with_current_regions` — the running task's own slot.
-    unsafe {
-        let procs = &raw const PROCS;
-        (*procs).get(slot).and_then(Option::as_ref).map_or(0, |p| p.space.resident_pages())
-    }
+    current_process().map_or(0, |p| p.address_space.resident_pages())
 }
 
 /// Run `f` with the running process's user address space, under its lock.
 ///
 /// The address-space counterpart of [`with_current_regions`], and the same
-/// contract: `None` means the caller is not a slotted user task — a kernel
-/// thread, or the boot self-tests before any process exists — and every caller
-/// must handle that rather than acting on the kernel's own tables. That
-/// distinction is new. Until step 5a this file's callers reached the page tables
-/// through `paging::active_root()`, which answers with **`CR3`** whoever asks:
-/// on a kernel thread that is the kernel's own root, so `munmap` walking a user
-/// range in it was at best a no-op and at worst an unmap of something the kernel
-/// put there. `mm.rs` guarded that with a separate `have_address_space()` probe;
-/// it cannot be forgotten now, because there is no root to pass.
+/// contract: `None` means the caller is not a registered user task — a kernel
+/// thread, or the boot task driving the self-tests — and every caller must
+/// handle that rather than acting on the kernel's own tables. That distinction
+/// is not new but it is worth restating: until step 5a this file's callers
+/// reached the page tables through `paging::active_root()`, which answers with
+/// **`CR3`** whoever asks: on a kernel thread that is the kernel's own root, so
+/// `munmap` walking a user range in it was at best a no-op and at worst an
+/// unmap of something the kernel put there. `mm.rs` guarded that with a
+/// separate `have_address_space()` probe; it cannot be forgotten now, because
+/// there is no root to pass.
 ///
 /// # The hold
 ///
-/// Short. `ProcAddressSpace::lock` does not mask IRQs on this target (that is
-/// `kernel_smp_shared`, which amd64 runs without), so a hold that spans a yield
-/// point can be re-entered by another thread of the same process on the same
-/// core. Every caller here holds it across one PTE edit or one bounded range
-/// walk and nothing that blocks.
+/// Short. Every caller here holds it across one PTE edit or one bounded range
+/// walk and nothing that blocks. `ProcAddressSpace::lock` **does** mask IRQs on
+/// this target — `kernel_smp_shared` is a required feature of it since the
+/// unblock (`docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md`) and `akuma-cpu`'s
+/// `daif` has real x86 arms.
 ///
 /// Lock order is **regions → address space**: `fault_in` and `dontneed_range`
 /// take the region list first and reach the tables inside it. Nothing takes them
 /// the other way round, and nothing may start.
 pub fn with_current_address_space<R>(f: impl FnOnce(&mut akuma_mmu::UserAddressSpace) -> R) -> Option<R> {
-    let slot = current_proc_slot();
-    // SAFETY: raw-pointer read of `PROCS`, the same discipline
-    // `with_current_regions` documents — this is the running task's own slot,
-    // and a process cannot be torn down underneath its own syscall or fault
-    // handler.
-    unsafe {
-        let procs = &raw const PROCS;
-        let p = (*procs).get(slot).and_then(Option::as_ref)?;
-        Some(f(&mut p.space.lock()))
-    }
+    let p = current_process()?;
+    Some(f(&mut p.address_space.lock()))
 }
 
 /// A copy-on-write break replaced `old` with `new` in the running process:
@@ -2394,23 +2415,21 @@ pub fn with_current_address_space<R>(f: impl FnOnce(&mut akuma_mmu::UserAddressS
 /// fault handler has already done the `cow_ref_dec` and freed the frame if that
 /// was its call to make. This only edits the per-process ledger.
 pub fn cow_swap_frame(old: usize, new: usize) {
-    let slot = current_proc_slot();
-    // SAFETY: raw-pointer read; single core, and this is the running task's own
-    // slot — the process cannot be torn down underneath its own fault handler.
-    unsafe {
-        let procs = &raw const PROCS;
-        if let Some(p) = (*procs).get(slot).and_then(Option::as_ref) {
-            let ledger = p.space.lock();
-            let _ = ledger.remove_user_frame(akuma_mmap::PhysFrame::new(old));
-            ledger.track_user_frame(akuma_mmap::PhysFrame::new(new));
-        }
+    if let Some(p) = current_process() {
+        let ledger = p.address_space.lock();
+        let _ = ledger.remove_user_frame(akuma_mmap::PhysFrame::new(old));
+        ledger.track_user_frame(akuma_mmap::PhysFrame::new(new));
     }
 }
 
-/// The processes the tests run, reachable from their task entry points.
+/// How many process slots this target has.
 ///
-/// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
-/// its process. A slot per process is the smallest thing that works on one core.
+/// A process slot is **not** a process any more — since 5b slice 4 the process
+/// itself is an `akuma_exec::Process` in `PROCESS_TABLE`. What is left keyed by
+/// slot is this target's own mechanism: the `SPAWN` row (stdio pipes and the
+/// scheduler task slot), `fd.rs`'s descriptor row, and `crate::thread`'s
+/// group-exit flag and thread list. `UserCtx::proc_slot` is how a running task
+/// names its own.
 ///
 /// Slots 0..=6 are the self-tests and `run_init`; slots [`SPAWN_SLOT_BASE`]..
 /// are for `sys_spawn`'d children (an `sshd` session's shell).
@@ -2420,127 +2439,143 @@ pub fn cow_swap_frame(old: usize, new: usize) {
 /// (`apk add`, then any command) exhausted it and `sshd` reported
 /// `failed to spawn '/bin/sh' for exec`. Slots *are* recycled on
 /// `waitpid`/exit, so this is headroom against leaks and bursts, not a true
-/// concurrency bound. `Process` is small enough that 128 is a few tens of KiB
-/// of `.bss`.
+/// concurrency bound.
 pub const PROC_SLOTS: usize = 128;
-static mut PROCS: [Option<Process>; PROC_SLOTS] = [const { None }; PROC_SLOTS];
 
-/// First `PROCS` slot `sys_spawn` may use; everything below is the self-tests
+/// First process slot `sys_spawn` may use; everything below is the self-tests
 /// and `run_init`.
 pub const SPAWN_SLOT_BASE: usize = 7;
 
-/// A fully-built replacement image parked by [`sys_execve`], keyed by `PROCS`
-/// slot. `run_process` picks it up after `enter_user_mode` returns and does the
-/// address-space swap on the kernel stack — outside the syscall asm, where a
-/// `mov cr3` and a frame free belong.
-static mut PENDING_EXEC: [Option<Process>; PROC_SLOTS] = [const { None }; PROC_SLOTS];
+/// Where ring 3 starts for the running task: `(entry, stack)` off its
+/// registered process, or `None` if it has none.
+///
+/// The pair is `ProcessImage::context`'s `pc`/`sp` — the field `akuma-exec`
+/// already calls "the register state the first entry to ring 3 uses", which is
+/// exactly what these two are. Slice 1 registered it zeroed with the note that
+/// amd64 "never `eret`s from it"; that stays true and is beside the point, since
+/// what is read here is the two scalars, not a register file.
+///
+/// Taken under `image`'s lock, which is also what makes an `execve` atomic
+/// against this read: `sys_execve` writes both halves in one hold, so a task
+/// re-entering ring 3 cannot pair a new entry point with an old stack.
+fn current_entry_stack() -> Option<(u64, u64)> {
+    let p = current_process()?;
+    let img = p.image.lock();
+    Some((img.context.pc, img.context.sp))
+}
 
-/// Take the replacement image for `idx`, if `execve` parked one.
-fn take_pending_exec(idx: usize) -> Option<Process> {
-    // SAFETY: raw-pointer access; single core, and only this task's own
-    // `run_process` reads its slot.
+/// Read and clear this task's [`UserCtx::forked`] / [`UserCtx::exec_pending`]
+/// flags. Both are one-shot and both are consumed by [`run_process`] only.
+fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
+    // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own
+    // slot, and only this task reads or clears these two fields.
     unsafe {
-        let pending = &raw mut PENDING_EXEC;
-        (*pending)[idx].take()
+        let uctx = crate::smp::current_uctx();
+        if uctx.is_null() {
+            return false;
+        }
+        let f = read(&mut *uctx);
+        let was = *f != 0;
+        *f = 0;
+        was
     }
 }
 
-/// Enter ring 3 for process `idx`, then mark the task finished.
+/// Enter ring 3 for process slot `idx`, then mark the task finished.
 ///
 /// The scheduler has already installed this task's address space by the time
-/// this runs — `spawn_in_space` recorded the root, and `yield_now` writes `CR3`
-/// before switching stacks.
+/// this runs — `spawn_in_space_unpublished` recorded the root, and `yield_now`
+/// writes `CR3` before switching stacks.
 ///
-/// The entry point and stack come from the slot rather than from module
-/// constants. They were constants while every process was the same blob at the
-/// same address; an ELF's entry is `e_entry` and its stack is wherever the
-/// loader could put one.
+/// The entry point and stack come from the registered process rather than from
+/// module constants. They were constants while every process was the same
+/// hand-assembled blob at the same address; an ELF's entry is `e_entry` and its
+/// stack is wherever the loader could put one.
 fn run_process(idx: usize) -> ! {
-    // SAFETY: single core; each slot is written once before its task is spawned
-    // and read only by that task.
-    let start = unsafe {
-        let procs = &raw const PROCS;
-        (*procs)[idx]
-            .as_ref()
-            .map(|p| (p.entry, p.stack, p.forked))
-    };
-    if let Some((entry, stack, forked)) = start {
-        // A `fork` child's first entry re-enters ring 3 at the parent's
-        // post-`fork` instruction with the parent's full register set; the
-        // `execve` it usually does next swaps in a plain image, and every later
-        // loop iteration uses the ordinary entry path.
-        let mut forked_child = forked;
-        // Tell the syscall path which process this is, so fd 0/1/2 route to
-        // this task's pipes (if it is a spawned child) rather than the console.
-        // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own slot.
-        unsafe {
-            let uctx = crate::smp::current_uctx();
-            if !uctx.is_null() {
-                (*uctx).proc_slot = idx;
-            }
+    // Tell the syscall path which process this is, so fd 0/1/2 route to this
+    // task's pipes (if it is a spawned child) rather than the console.
+    // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own slot.
+    unsafe {
+        let uctx = crate::smp::current_uctx();
+        if !uctx.is_null() {
+            (*uctx).proc_slot = idx;
         }
-        // SAFETY: both are addresses the loader (or `Process::new`) mapped
+    }
+    // A `fork` child's first entry re-enters ring 3 at the parent's post-`fork`
+    // instruction with the parent's full register set; the `execve` it usually
+    // does next installs a plain image, and every later loop iteration uses the
+    // ordinary entry path. Read once, here, because it is spent by the first
+    // entry whatever happens after it.
+    let mut forked_child = take_uctx_flag(|u| &mut u.forked);
+    let mut status = 0;
+    // Whether ring 3 was ever entered. The teardown below reports an exit —
+    // `spawn_record_exit` publishes a status a parent's `wait4` will believe —
+    // so a task that never ran a program must not run it. Unreachable by
+    // construction since 5b slice 4 (every process task is registered before it
+    // is published) and checked rather than assumed, because the old shape got
+    // this for free: it wrapped the whole teardown in `if let Some(start)`.
+    let mut ran = false;
+    // The loop is `execve`. `sys_execve` has already done the swap — it
+    // installs the new address space on the registered process, switches `CR3`
+    // and drops the old space, then asks the task to leave ring 3 — so all that
+    // is left here is to re-read where the new image starts and go back in.
+    //
+    // That is a change of *place*, not of order: the swap used to happen right
+    // here, out of `static mut PENDING_EXEC`, because a `mov cr3` and a frame
+    // free "do not belong inside the syscall asm". They still do not, and they
+    // still are not: `sys_execve` runs on the kernel stack in ordinary Rust,
+    // and `sched::set_current_space_root` is documented safe mid-flight
+    // precisely because every address space shares the kernel's upper half.
+    // What the old shape bought was an array; what it cost was a second copy of
+    // every image field.
+    while let Some((entry, stack)) = current_entry_stack() {
+        // SAFETY: both are addresses the loader (or `Image::new`) mapped
         // user-accessible in the address space the scheduler installed for this
         // task, and every program this kernel runs ends in exit_group.
-        //
-        // The loop is `execve`: when the last syscall parked a replacement
-        // image, swap it into this slot, switch `CR3`, free the old image, and
-        // re-enter ring 3 at the new entry — the same task, a new program.
-        let (mut entry, mut stack) = (entry, stack);
-        let status = loop {
-            let status = {
-                let forked = forked_child;
-                forked_child = false;
-                enter_user(entry, stack, forked)
-            };
-            let Some(next) = take_pending_exec(idx) else {
-                break status;
-            };
-            let new_root = next.space.ttbr0();
-            (entry, stack) = (next.entry, next.stack);
-            // SAFETY: raw-pointer access; single core. Replace before the CR3
-            // switch so the slot always names the live image.
-            let old = unsafe {
-                let procs = &raw mut PROCS;
-                (*procs)[idx].replace(next)
-            };
-            // A new program in an existing slot starts with a clean group:
-            // a stale `exit_group` flag from the image just replaced would kill
-            // its first thread at its first syscall.
-            crate::thread::clear_group_exiting(idx);
-            crate::sched::set_current_space_root(new_root);
-            // The old image (the `fork` copy, or a previous `execve`'s) is
-            // unreferenced now that CR3 points at the new space — hand it back.
-            if let Some(old) = old {
-                drop(old);
-            }
+        ran = true;
+        status = {
+            let forked = forked_child;
+            forked_child = false;
+            enter_user(entry, stack, forked)
         };
-        EXIT_STATUS.store(status, Ordering::Relaxed);
-        // Every thread of this process, gone, before anything downstream can
-        // reap. `sys_waitpid`/`cleanup_spawn_slot` free the `Process` — and
-        // with it the page tables — once this task is `Finished`, so a sibling
-        // still running in that space would be walking freed page tables. This
-        // is the only place that ordering can be enforced: the reaper is
-        // another process and has no idea threads exist.
-        crate::thread::drain(idx);
-        // Real Linux closes every fd a process still holds at exit; this
-        // target's fd table did not until now (see `close_owned_by`'s own
-        // header). Before `spawn_record_exit` so a parent's `waitpid` never
-        // observes the child as reaped while its fds are still charged
-        // against the shared table.
-        crate::fd::close_owned_by(idx);
-        if idx >= SPAWN_SLOT_BASE {
-            spawn_record_exit(idx, status as i32);
+        if !take_uctx_flag(|u| &mut u.exec_pending) {
+            break;
         }
+    }
+    if !ran {
+        serial::puts("  [proc] slot ");
+        serial::put_dec(idx as u64);
+        serial::puts(" has no registered process; not entering ring 3\n");
+        crate::sched::finish();
+    }
+    EXIT_STATUS.store(status, Ordering::Relaxed);
+    // Every thread of this process, gone, before anything downstream can reap.
+    // `sys_waitpid` retires the `Process` — and with it the page tables, which
+    // the reclaim then frees — once this task is `Finished`, so a sibling still
+    // running in that space would be walking freed page tables. This is the
+    // only place that ordering can be enforced: the reaper is another process
+    // and has no idea threads exist.
+    crate::thread::drain(idx);
+    // Real Linux closes every fd a process still holds at exit; this target's
+    // fd table did not until 2026-09 (see `close_owned_by`'s own header).
+    // Before `spawn_record_exit` so a parent's `waitpid` never observes the
+    // child as reaped while its fds are still charged against the shared table.
+    crate::fd::close_owned_by(idx);
+    if idx >= SPAWN_SLOT_BASE {
+        spawn_record_exit(idx, status as i32);
     }
     // 5b slice 1: terminal teardown is a vetted drain site (`process::reclaim`
     // site 1). On AArch64 `unregister_process`'s RETIRED slots are collected
     // from the exit paths, the idle loop and the PMM pressure ladder; this
     // target had none of the three, so before this line every reaped child's
     // `Box<Process>` parked in the table forever and a long session would have
-    // panicked `register_process` at the 256-slot ceiling. The registered
-    // `Process`es here wrap non-owning shared views, so a reclaim's `drop` is
-    // trivial — but the table slots still need the sweep to come back.
+    // panicked `register_process` at the 256-slot ceiling.
+    //
+    // Since 5b slice 4 the drain is also what returns a dead process's *memory*:
+    // the registered `Process` owns the address space now, so its `drop` is
+    // `UserAddressSpace::drop` — every user frame and every page table. This
+    // target configures `process_reclaim_cooldown_us: 0` (`exec_runtime.rs`),
+    // so an eligible slot is collected on the first sweep that reaches it.
     akuma_exec::process::reclaim::drain_retired_if_requested();
     crate::sched::finish();
 }
@@ -2549,7 +2584,7 @@ fn run_process(idx: usize) -> ! {
 ///
 /// **One entry function for all of them**, the same shape `thread::thread_entry`
 /// has used since threads existed. Until 2026-09-06 this was sixteen
-/// hand-written trampolines generated by a macro, each with a `PROCS` index
+/// hand-written trampolines generated by a macro, each with a process index
 /// baked into its `fn` pointer, behind a `proc_entry_for(idx)` that handed out
 /// only nine of them (7..=15). That was the machine's real process ceiling:
 /// `PROC_SLOTS` is 128, `sys_spawn` searched all of them, and `sys_fork`
@@ -2564,25 +2599,87 @@ extern "C" fn proc_entry() -> ! {
     let slot = current_proc_slot();
     if slot >= PROC_SLOTS {
         // Reached only if a task was published without being seeded. Say so:
-        // `run_process` would index `PROCS` out of bounds, and a panic here
-        // reads as a scheduler fault rather than a missing seed.
+        // `run_process` would name no process at all, and a panic here reads
+        // as a scheduler fault rather than a missing seed.
         serial::puts("  [proc] entry with no slot\n");
         crate::sched::finish();
     }
     run_process(slot);
 }
 
-/// Spawn a task to run `PROCS` slot `proc_slot`, in the address space `root`.
+/// Reserve and seed — but do **not** publish — a task to run process slot
+/// `proc_slot` in the address space `root`.
 ///
-/// Three steps in a fixed order, which is why it is a function rather than
-/// three lines at each call site: reserve the task, seed the slot it serves,
-/// and only then publish it. A task published before it is seeded can be
-/// scheduled, reach [`proc_entry`], and find `usize::MAX` there.
+/// Two steps in a fixed order, which is why it is a function rather than two
+/// lines at each call site: reserve the task, then seed the slot it serves. A
+/// task published before it is seeded can be scheduled, reach [`proc_entry`],
+/// and find `usize::MAX` there.
+///
+/// **It published, until 5b slice 4.** Every caller now registers the process
+/// with `akuma-exec` before calling [`crate::sched::publish_task`], because
+/// `run_process` reads its entry point and stack *out of* that registration:
+/// a task published first could reach ring 3 before it exists as a process and
+/// find nowhere to start. Slices 1-2 tolerated that window — an unregistered
+/// child's syscalls merely fell back to the pre-slice answers — and this is
+/// what closes it, for the reason `spawn_in_space_unpublished` has no
+/// publish-immediately variant at all.
 fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
     let task_slot = crate::sched::spawn_in_space_unpublished(proc_entry, root)?;
     crate::sched::seed_proc_slot(task_slot, proc_slot);
-    crate::sched::publish_task(task_slot);
     Some(task_slot)
+}
+
+/// Start a **self-test** process: register it, then publish its task.
+///
+/// The six boot self-tests that run ring-3 programs used to write an
+/// `Option<Process>` into `PROCS[slot]` and spawn a task over it. They register
+/// with `akuma-exec` now, like every other process — not for tidiness but
+/// because they must: `with_current_regions` and `with_current_address_space`
+/// resolve through the process table since 5b slice 4, and `fdprobe` and
+/// `threadprobe` both `mmap`. An unregistered self-test process would have got
+/// `None` from the accessors and failed with no explanation.
+///
+/// Registered before [`crate::sched::publish_task`], the same order every other
+/// caller uses, and returning the `(pid, task_slot)` pair the teardown needs.
+/// The parent is pid 1: these run before `run_init`, so there is no real
+/// parent, and 1 is what `current_pid()` answers for the boot task driving them.
+fn start_test_process(
+    slot: usize,
+    image: Image,
+    image_top: u64,
+    name: &str,
+) -> Option<(u32, usize)> {
+    let root = image.space.ttbr0();
+    let task_slot = spawn_process_task(slot, root)?;
+    let pid = alloc_pid();
+    let mut cmdline = alloc::vec::Vec::with_capacity(name.len() + 1);
+    cmdline.extend_from_slice(name.as_bytes());
+    cmdline.push(0);
+    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline);
+    crate::sched::publish_task(task_slot);
+    Some((pid, task_slot))
+}
+
+/// Tear a self-test process down and free its address space **before the next
+/// line runs**.
+///
+/// Every one of those tests ends by asserting that teardown leaked nothing —
+/// `akuma_pmm::free_count()` back where it started — and until 5b slice 4 that
+/// worked because the test dropped the `Process` itself. The address space
+/// belongs to the registered process now, and `unregister_process` only
+/// *retires* it; something has to collect. This target sets
+/// `process_reclaim_cooldown_us: 0` (`exec_runtime.rs`), so the drain here
+/// frees immediately, which is what keeps those assertions meaning what they
+/// said. A test that merely retired would report a leak of the whole image.
+///
+/// `drain_retired_if_requested`, not the `_force` variant: the cooldown is
+/// already zero, so forcing would only remove the guard, and the same call is
+/// what every production drain site uses. It also drains the TTBR-deferred
+/// frame list, which is where an address space's frames go if another core's
+/// `CR3` still stands on its L0.
+fn finish_test_process(pid: u32, task_slot: usize) {
+    reap_exec_process(pid, task_slot);
+    akuma_exec::process::reclaim::drain_retired_if_requested();
 }
 
 // ===========================================================================
@@ -2628,7 +2725,7 @@ struct Spawn {
 const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
 
 /// The spawn table. `static mut` reached through raw pointers on one core, same
-/// discipline as `PROCS`: the only writers run inside a syscall (non-preemptible
+/// discipline the deleted `PROCS` had: the only writers run inside a syscall (non-preemptible
 /// on this target) and none of them yield while touching it.
 static mut SPAWN: [Option<Spawn>; SPAWN_SLOTS] = [const { None }; SPAWN_SLOTS];
 
@@ -2671,7 +2768,7 @@ const CMDLINE_MAX: usize = 256;
 
 /// The init program's `/proc/1/cmdline`, recorded by [`run_init`].
 ///
-/// Init has no `Spawn` entry — it runs in `PROCS` slot 6, below
+/// Init has no `Spawn` entry — it runs in process slot 6, below
 /// [`SPAWN_SLOT_BASE`], and predates the spawn table entirely — so its name
 /// lives here. Without it `ps` listed every session's shell and not the thing
 /// that started them, which is the one line a person checks first.
@@ -2868,8 +2965,8 @@ fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
 // ===========================================================================
 // 5b slice 1: akuma-exec's process table, populated (2026-09-08)
 //
-// `PROCS`/`SPAWN` above are this target's *mechanism* — who runs, in which
-// address space, with which pipes. `akuma_exec`'s `PROCESS_TABLE` +
+// `SPAWN` above is what is left of this target's *mechanism* — which pipes a
+// process slot reads and writes, and which scheduler task serves it. `akuma_exec`'s `PROCESS_TABLE` +
 // `THREAD_PID_MAP` are its *identity* — which pid is calling this syscall —
 // and until now nothing here populated them, so every
 // `akuma_exec::process::current_process_shared()` a folded glue arm reached
@@ -2893,12 +2990,18 @@ fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
 // * `image.context: UserContext::new(0, 0)` — amd64 keeps ring-3 registers in
 //   its own `UserCtx` and `enter_user` is its own entry path; this context is
 //   never `eret`n from.
-// * `lazy_regions` empty — demand paging here comes from `Process::regions`
+// * `lazy_regions` empty — demand paging here comes from `mmap_regions`
 //   (`akuma-mmap`), not a lazy-region map.
 // * `memory: ProcessMemory::new(end_va, stack_bottom, ELF_STACK_TOP,
 //   mm::MMAP_BASE)` — the same constants `loader.rs`/`mm.rs` place with, so
 //   the registered view and the real one cannot disagree about where the heap,
 //   the stack and the mmap window are.
+//
+// Two of those decisions were **spent by 5b slice 4**, and the entries are
+// left here rather than deleted because the reasoning is what dates them:
+// `image.context` is no longer a zeroed placeholder (it is the `(entry, stack)`
+// pair `run_process` re-enters ring 3 with), and `address_space` is no longer a
+// non-owning `new_shared` view (it owns the space, because nothing else does).
 // * `thread_id: None` — deliberately. On AArch64 it names an `akuma-threading`
 //   thread slot `unregister_process` may mark TERMINATED; this target's task
 //   lifecycle is `sched.rs`'s, and identity comes from `THREAD_PID_MAP`
@@ -2939,15 +3042,14 @@ fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
 /// Build and register the `akuma_exec::Process` standing behind `pid`, and
 /// publish `task_slot → pid` in `THREAD_PID_MAP`.
 ///
-/// `root` is the live CR3 (`Process::space.ttbr0()` on this target); the
-/// registered `Process` wraps a **non-owning** `new_shared` view of it — on
-/// x86_64 that constructor cannot fail, has no `Drop`, and owns no frame, so
-/// wrapping the live root cannot double-free and the view can never free the
-/// page tables out from under the `PROCS` slot that really owns them.
+/// `image` is **consumed**: its address space, entry point, stack pointer and
+/// region list are moved onto the registered process, which owns them from here
+/// on. Slice 1 took a bare `root: u64` and wrapped a non-owning `new_shared`
+/// view of it, because `PROCS` still owned the real one; slice 4 deleted that
+/// array and this took over the ownership with it.
 ///
 /// `image_top` is where the heap starts (`LoadedImage::end_va`), `name` the
-/// `argv[0]`-ish display name `/proc/<pid>/comm` will render once slice 4
-/// mounts the real `ProcFilesystem`.
+/// `argv[0]`-ish display name `/proc/<pid>/comm` renders.
 ///
 /// Register order is **table, then map**: `thread_pid_map_insert` refreshes
 /// the identity cache, whose lazy re-stamp handles the reverse order, but this
@@ -2960,7 +3062,7 @@ fn register_exec_process(
     pid: u32,
     ppid: u32,
     task_slot: usize,
-    root: u64,
+    image: Image,
     image_top: u64,
     name: &str,
     cmdline: &[u8],
@@ -2985,12 +3087,15 @@ fn register_exec_process(
         pgid: pid,
         tgid: pid, // group leader = self; no CLONE_THREAD groups in the table yet
         state: AtomicProcessState::new(ProcessState::Ready),
-        address_space: ProcAddressSpace::new(
-            // Cannot fail on x86_64 (see the module header); an `expect` here
-            // would name a crate contract change, not a runtime condition.
-            UserAddressSpace::new_shared(root as usize)
-                .expect("new_shared is infallible on x86_64"),
-        ),
+        // 5b slice 4: the **owning** address space, moved in from the loader.
+        // Slice 1 registered a `new_shared` view here — non-owning, no `Drop`,
+        // pointed at a root `PROCS` really owned — because two structures
+        // claiming one L0 would double-free it. There is one structure now, so
+        // the registration owns what it names, and `Process::drop` is what
+        // frees a dead process's frames and page tables (through
+        // `free_or_defer_as_frames`, which parks them while any core's `CR3` or
+        // any preempted thread's saved context still stands on the L0).
+        address_space: ProcAddressSpace::new(image.space),
         image: Spinlock::new(ProcessImage {
             name: String::from(name),
             // 5b slice 2: the argument vector, so `/proc/<pid>/cmdline` can be
@@ -3012,12 +3117,20 @@ fn register_exec_process(
                 .filter(|a| !a.is_empty())
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect(),
-            context: UserContext::new(0, 0),
+            // 5b slice 4: **where ring 3 starts**, which is what this field
+            // has always meant — `UserContext::new(entry_point, stack_pointer)`
+            // writes exactly `pc`/`sp`. Slice 1 registered it zeroed and noted
+            // that amd64 "never `eret`s from it"; that stays true, and is
+            // beside the point. `run_process` reads these two scalars back
+            // (`current_entry_stack`) instead of indexing a second table, and
+            // an `execve` rewrites them in this same lock so a re-entry cannot
+            // pair a new entry point with an old stack.
+            context: UserContext::new(image.entry as usize, image.stack as usize),
         }),
         parent_pid: ppid,
         brk: AtomicUsize::new(image_top as usize),
         initial_brk: AtomicUsize::new(image_top as usize),
-        entry_point: AtomicUsize::new(0),
+        entry_point: AtomicUsize::new(image.entry as usize),
         memory: ProcessMemory::new(
             image_top as usize,
             stack_bottom as usize,
@@ -3033,7 +3146,10 @@ fn register_exec_process(
         exited: AtomicBool::new(false),
         exit_code: AtomicI32::new(0),
         dynamic_page_tables: Vec::new(),
-        mmap_regions: Spinlock::new(Vec::new()),
+        // 5b slice 4: the region list this target demand-pages from, moved in
+        // from the loader. Empty for everything but a `fork` child, which
+        // arrives carrying the parent's extents.
+        mmap_regions: Spinlock::new(image.regions),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::with_stdio()),
         thread_id: None,
@@ -3133,14 +3249,36 @@ fn user_strv(ptr: u64, max: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
 /// task: `sshd`/`run_init` start a shell with `sys_spawn`, and the shell running
 /// `sh -c "<cmd>"` `execve`s the command directly (ash does not fork for the
 /// single-command `-c` form — verified with `strace`). The running task keeps
-/// its `PROCS` slot, its pipes and its pid; only the image behind it changes.
+/// its process slot, its pipes and its pid; only the image behind it changes.
 ///
-/// The build happens here, on the syscall stack; the *swap* (replace the slot,
-/// `mov cr3`, free the old image) happens in [`run_process`] after this returns
-/// through the `leave` path, because a page-table switch and a frame free do not
-/// belong inside the syscall asm. On success this does not really "return" — it
-/// sets `leave` and the next thing the task does is re-enter ring 3 at the new
-/// entry. On failure it returns a negative errno and the caller runs on.
+/// # The swap happens here now
+///
+/// It used to be parked in `static mut PENDING_EXEC` and performed by
+/// [`run_process`] after the `leave` path returned, "because a page-table
+/// switch and a frame free do not belong inside the syscall asm". They still do
+/// not, and they still are not: this function runs on the kernel stack in
+/// ordinary Rust, well outside `syscall_entry`, and
+/// [`crate::sched::set_current_space_root`] is documented safe mid-flight —
+/// every address space shares the kernel's upper half, so the stack this runs
+/// on stays mapped across the `mov cr3`.
+///
+/// What the deferral actually bought was somewhere to *keep* the new image, and
+/// 5b slice 4 deleted the array it was kept in. The order below is the part
+/// that matters and is the same order `run_process` used:
+///
+/// 1. install the new address space on the registered process (which hands back
+///    the old one, rather than dropping it);
+/// 2. switch `CR3` off the old space;
+/// 3. **then** drop the old space, freeing its frames and page tables.
+///
+/// Nothing between (1) and (3) touches user memory — the syscall return path
+/// with `leave` set restores a kernel stack pointer and returns into kernel
+/// code — so there is no window in which a fault could reach a table that has
+/// been freed or a root that has been replaced.
+///
+/// On success this does not really "return": it sets `leave` and `exec_pending`
+/// and the next thing the task does is re-enter ring 3 at the new entry. On
+/// failure it returns a negative errno and the caller runs on.
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     use crate::fd::errno;
 
@@ -3174,7 +3312,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let envp_refs: alloc::vec::Vec<&[u8]> =
         envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
 
-    let (proc, img) = match Process::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
+    let (next, ld) = match Image::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [execve] load failed: ");
@@ -3186,89 +3324,105 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
-    // Recorded once and used twice: the spawn row below and, since 5b slice 2,
-    // the registered `Process`'s `image.args` — the two renderings of
-    // `/proc/<pid>/cmdline` must not be able to disagree about the same exec.
-    let exec_cmdline = flatten_cmdline(argv_refs.iter().copied());
-
     // `/proc/<pid>/cmdline` follows the new image. Without this, `ps` reported
     // every process under the name of whatever `fork`ed it — a shell session
     // showed a column of `sh`, which is the shape that makes `ps` useless
     // rather than merely incomplete.
     //
-    // 5b slice 2: the spawn row no longer carries a copy. `Spawn::cmdline`
-    // became write-only the moment the procfs readers moved onto `akuma-exec`,
-    // so the field is gone and this refreshes the registered `Process` only —
-    // one copy of argv per process instead of two, and no way for them to
-    // disagree about what a process is running.
-    if slot >= SPAWN_SLOT_BASE {
-        // 5b slice 1: the registered `akuma-exec` `Process` follows the image
-        // too. Its `new_shared` address-space view names the *old* root — which
-        // `run_process`'s swap is about to free — so it is re-pointed at the
-        // pending image's root now, along with the heap/entry scalars and the
-        // display name. The old view has no `Drop` (x86 `new_shared` owns
-        // nothing) so replacing it frees nothing twice. Done here rather than
-        // in `run_process` because the pid is at hand and the swap below is
-        // unconditional: from this point the registered view names the root
-        // the task will run on, even for the few instructions before it does.
-        //
-        // `None` from `with_process` is the publish-to-register window: the
-        // task was published before its spawner got to `register_exec_process`
-        // and is already `execve`ing. Register here instead — under the BKL,
-        // so it cannot race the spawner's own registration — or the fresh
-        // registration would wrap the root this execve is about to free.
-        let pid = current_pid();
-        let new_root = proc.space.ttbr0();
-        let new_brk = img.end_va;
-        let new_entry = img.entry;
-        let new_name = alloc::string::String::from(
-            core::str::from_utf8(argv_refs[0]).unwrap_or("exec"),
-        );        let refreshed = {
-            let new_name = new_name.clone();
-            akuma_exec::process::with_process(pid, |p| {
-                p.address_space = ProcAddressSpace::new(
-                    UserAddressSpace::new_shared(new_root as usize)
-                        .expect("new_shared is infallible on x86_64"),
-                );
-                p.brk.store(new_brk as usize, core::sync::atomic::Ordering::Relaxed);
-                p.initial_brk.store(new_brk as usize, core::sync::atomic::Ordering::Relaxed);
-                p.entry_point.store(new_entry as usize, core::sync::atomic::Ordering::Relaxed);
-                p.image.lock().name = new_name;
-            })
-            .is_some()
-        };
-        if !refreshed {
-            // 5b slice 2: the parent link comes from the registered process,
-            // which is now the only writer of it. The task slot still comes
-            // from the spawn row — that is this target's own bookkeeping and
-            // `akuma-exec` has no home for it until the fd surface folds.
-            let ppid = akuma_exec::process::find_process(|p| (p.pid == pid).then_some(p.parent_pid))
-                .unwrap_or(1);
-            let exec_slot = {
-                // SAFETY: raw-pointer read; single core, this task's own row.
-                unsafe {
-                    (*spawn_table())[slot - SPAWN_SLOT_BASE]
-                        .as_ref()
-                        .map_or(usize::MAX, |sp| sp.exec_slot)
-                }
-            };
-            register_exec_process(pid, ppid, exec_slot, new_root, new_brk, &new_name, &exec_cmdline);
-        }
-    }
+    // 5b slice 2 deleted `Spawn::cmdline`, the second copy, and refreshed the
+    // registered process's display `name` here. **It did not refresh `args`**,
+    // and `args` is what `/proc/<pid>/cmdline` — and therefore `ps`'s COMMAND
+    // column, through `ProcEntry::name`— is actually rendered from
+    // (`proc_entry_of`), so an `execve`d process still listed the argv of
+    // whatever spawned it. Slice 4 refreshes both, which is what that slice's
+    // note already claimed. Recorded once and used once, in the same lock as
+    // the entry point, so no reader can pair a new image with an old argv.
+    let exec_cmdline = flatten_cmdline(argv_refs.iter().copied());
+    let new_name =
+        alloc::string::String::from(core::str::from_utf8(argv_refs[0]).unwrap_or("exec"));
 
-    // Park the built image and ask the entry path to leave ring 3. `run_process`
-    // does the swap.
-    // SAFETY: raw-pointer access; single core, slot is this task's own.
-    unsafe {
-        let pending = &raw mut PENDING_EXEC;
-        (*pending)[slot] = Some(proc);
-    }
-    // SAFETY: under the BKL, interrupts off inside a syscall; the per-CPU `UserCtx` is
-    // this task's slot. Same `leave` mechanism `exit` uses.
+    let pid = current_pid();
+    let new_root = next.space.ttbr0();
+    let new_brk = ld.end_va;
+    let new_entry = next.entry;
+    let new_stack = next.stack;
+    let stack_bottom = (ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096)) as usize;
+
+    // Built **before** the hold below. `with_process` runs its closure with
+    // interrupts disabled and states that it must not allocate on the heap, so
+    // everything that allocates is done here and only moved in there.
+    let new_args: alloc::vec::Vec<alloc::string::String> = exec_cmdline
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| alloc::string::String::from_utf8_lossy(a).into_owned())
+        .collect();
+
+    // Step 1: install the new image on the registered process, taking the old
+    // address space and region list back out rather than letting them drop
+    // under that same hold — `UserAddressSpace::drop` frees every user frame and
+    // page table, which is not work for a closure that runs with interrupts off.
+    let taken = akuma_exec::process::with_process(pid, |p| {
+        {
+            let mut im = p.image.lock();
+            im.name = new_name;
+            im.args = new_args;
+            im.context = akuma_exec::process::UserContext::new(
+                new_entry as usize,
+                new_stack as usize,
+            );
+        }
+        p.brk.store(new_brk as usize, Ordering::Relaxed);
+        p.initial_brk.store(new_brk as usize, Ordering::Relaxed);
+        p.entry_point.store(new_entry as usize, Ordering::Relaxed);
+        // The heap, the stack and the mmap window all move with the image.
+        // Nothing on this target places through `ProcessMemory` yet — `mm.rs`
+        // has its own placer over the region list — but a registration that
+        // states the *previous* image's arena is a wrong answer waiting for the
+        // first folded arm that reads it.
+        p.memory.reset(new_brk as usize, stack_bottom, ELF_STACK_TOP as usize, crate::mm::MMAP_BASE);
+        // A new image inherits no mappings. This was implicit while `execve`
+        // replaced a whole `Process` — the new one simply had an empty list —
+        // and has to be explicit now that the process outlives its image: a
+        // `fork` child's inherited extents would otherwise survive into the
+        // program it `execve`s and reserve VA ranges nothing maps.
+        let old_regions = core::mem::take(&mut *p.mmap_regions.lock());
+        (p.address_space.replace(next.space), old_regions)
+    });
+    let Some((old_space, old_regions)) = taken else {
+        // Unreachable by construction since 5b slice 4: every process task is
+        // registered before it is published, so a task running `execve` has a
+        // registered process. Say so rather than proceeding — the new image
+        // would have nowhere to be recorded and the task would re-enter ring 3
+        // at the old entry point in the new space.
+        serial::puts("  [execve] no registered process for pid ");
+        serial::put_dec(u64::from(pid));
+        serial::puts("\n");
+        return errno::ESRCH;
+    };
+
+    // A new program in an existing slot starts with a clean group: a stale
+    // `exit_group` flag from the image just replaced would kill its first
+    // thread at its first syscall.
+    crate::thread::clear_group_exiting(slot);
+    // Step 2: `CR3` off the old space, onto the new one. After this the old
+    // tables are unreferenced by this core.
+    crate::sched::set_current_space_root(new_root);
+    // Step 3: and now the old image can go. `free_or_defer_as_frames` still
+    // parks it if another core's `CR3` or a preempted thread's saved context
+    // stands on that L0 — a `CLONE_VM` sibling, which this target does not
+    // terminate on `execve`.
+    drop(old_space);
+    drop(old_regions);
+
+    // Ask the entry path to leave ring 3, and tell `run_process` this is an
+    // `execve` rather than an exit.
+    // SAFETY: under the BKL, interrupts off inside a syscall; the per-CPU
+    // `UserCtx` is this task's slot. Same `leave` mechanism `exit` uses.
     unsafe {
         let uctx = crate::smp::current_uctx();
         if !uctx.is_null() {
             (*uctx).leave = 1;
+            (*uctx).exec_pending = 1;
         }
     }
     0
@@ -3329,47 +3483,44 @@ fn sys_fork() -> u64 {
         return errno::ENOSYS;
     }
 
-    // A free child slot (`PROCS` and `SPAWN` share the index).
+    // A free child slot. The `SPAWN` row is the whole answer since 5b slice 4:
+    // it used to be `PROCS[s].is_none() && SPAWN[s].is_none()`, and the
+    // diagnostic below used to count both halves because they could diverge —
+    // `fork` searched them together, `sys_spawn` searched only `PROCS`. There
+    // is one array left, so they cannot.
     // SAFETY: raw-pointer read; single core.
     let slot = unsafe {
-        let procs = &raw const PROCS;
         let spawn = spawn_table();
-        (SPAWN_SLOT_BASE..PROC_SLOTS)
-            .find(|&s| (*procs)[s].is_none() && (*spawn)[s - SPAWN_SLOT_BASE].is_none())
+        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| (*spawn)[s - SPAWN_SLOT_BASE].is_none())
     };
     let Some(slot) = slot else {
         // A bare `ENOMEM` here reaches the user as `sh: can't fork: Out of
         // memory`, which names the wrong resource: the table is full, and the
-        // machine may have gigabytes free. Say which, and how full — the two
-        // halves diverge (`PROCS` and `SPAWN` are searched together by `fork`
-        // but `sys_spawn` checks only `PROCS`), and a count of each is what
-        // distinguishes a leak in one from honest saturation of both.
+        // machine may have gigabytes free. Say which, and how full.
         // SAFETY: raw-pointer read; single core.
-        let (procs_used, spawn_used) = unsafe {
-            let procs = &raw const PROCS;
+        let spawn_used = unsafe {
             let spawn = spawn_table();
-            (
-                (SPAWN_SLOT_BASE..PROC_SLOTS).filter(|&s| (*procs)[s].is_some()).count(),
-                (0..SPAWN_SLOTS).filter(|&s| (*spawn)[s].is_some()).count(),
-            )
+            (0..SPAWN_SLOTS).filter(|&s| (*spawn)[s].is_some()).count()
         };
-        serial::puts("  [fork] no free process slot: PROCS ");
-        serial::put_dec(procs_used as u64);
-        serial::puts("/");
-        serial::put_dec((PROC_SLOTS - SPAWN_SLOT_BASE) as u64);
-        serial::puts(" SPAWN ");
+        serial::puts("  [fork] no free process slot: SPAWN ");
         serial::put_dec(spawn_used as u64);
         serial::puts("/");
         serial::put_dec(SPAWN_SLOTS as u64);
+        serial::puts(" registered ");
+        serial::put_dec(akuma_exec::process::process_count() as u64);
         serial::puts("\n");
         return errno::ENOMEM;
     };
 
     // The parent's pid and command line, for the child's `/proc` entry. Read
     // before the child exists, because `proc_by_pid` walks the same table the
-    // write below is about to touch.
+    // registration below is about to touch.
     let parent_pid = current_pid();
     let parent_cmdline = proc_by_pid(parent_pid).map_or_else(alloc::vec::Vec::new, |p| p.cmdline);
+    let parent_name = proc_by_pid(parent_pid).map_or_else(
+        || alloc::string::String::from("fork"),
+        |p| alloc::string::String::from(p.name()),
+    );
 
     // The child's fd 0/1/2 route wherever the parent's do.
     let (stdin_pipe, stdout_pipe, console_io) = match spawn_stdio(parent_slot) {
@@ -3377,27 +3528,15 @@ fn sys_fork() -> u64 {
         None => (0, 0, true),
     };
 
-    // Copy the parent's whole address space.
-    let child = {
-        // SAFETY: raw-pointer read; single core. The parent slot is occupied
-        // (this task is running it).
-        let maybe = unsafe {
-            let procs = &raw const PROCS;
-            (*procs)[parent_slot]
-                .as_ref()
-                .and_then(|parent| Process::fork_from(parent, user_rip, user_rsp))
-        };
-        match maybe {
-            Some(c) => c,
-            None => return errno::ENOMEM,
-        }
+    // Copy the parent's whole address space, off the parent's **registered**
+    // process — the only process there is since 5b slice 4.
+    let Some(parent) = current_process() else {
+        return errno::ESRCH;
+    };
+    let Some(child) = Image::fork_of(parent, user_rip, user_rsp) else {
+        return errno::ENOMEM;
     };
     let child_root = child.space.ttbr0();
-    // SAFETY: raw-pointer write; single core, slot just found free.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[slot] = Some(child);
-    }
 
     // The child gets its own descriptor *row*, naming the same open file
     // descriptions. Before per-process rows existed there was nothing to do
@@ -3408,40 +3547,36 @@ fn sys_fork() -> u64 {
     crate::fd::inherit_fds(parent_slot, slot);
 
     let Some(task_slot) = crate::sched::spawn_in_space_unpublished(proc_entry, child_root) else {
-        take_proc_slot(slot);
+        // `child` drops here, releasing every frame the CoW share pass claimed
+        // and every page table it built — what `take_proc_slot` used to do by
+        // taking the slot back out of `PROCS`.
         return errno::ENOMEM;
     };
     crate::sched::seed_proc_slot(task_slot, slot);
     crate::sched::seed_forked_task(task_slot, parent_fs_base, parent_gs_base, &parent_regs);
-    // Published last: the child's register/TLS snapshot must be in place before
-    // anything can schedule it — same ordering rule as `spawn_in_space`'s space
-    // root (a tick between spawn and seed used to run the child on garbage).
-    crate::sched::publish_task(task_slot);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
-    // 5b slice 1: the child exists as an identity, not just a mechanism. The
-    // task is already published, so there is a window where the child's
-    // syscalls resolve identity as they did before this slice (`None`); the
-    // insert below closes it. `image_top` 0 is deliberate for a fork child:
-    // it has no heap of its own — it shares the parent's image CoW until the
-    // `execve` that virtually always follows refreshes the registered view
-    // (`sys_execve`), and a `brk` naming the parent's heap would let nothing
-    // (no folded arm touches `brk` yet) answer a grow request into a space the
+    // 5b slice 4: registered **before** the task is published, which is the
+    // ordering rule this slice made mandatory — `run_process` reads the child's
+    // entry point and stack out of this registration, so a child scheduled
+    // first would have nowhere to start. Slices 1-2 registered after publishing
+    // and merely left a window where the child's identity did not resolve.
+    //
+    // `image_top` 0 is deliberate for a `fork` child: it has no heap of its own
+    // — it shares the parent's image CoW until the `execve` that virtually
+    // always follows refreshes the registered view (`sys_execve`) — and a `brk`
+    // naming the parent's heap would answer a grow request into a space the
     // child does not own.
     register_exec_process(
         pid,
         parent_pid,
         task_slot,
-        child_root,
+        child,
         0,
-        proc_by_pid(parent_pid).map_or_else(
-            || alloc::string::String::from("fork"),
-            |p| alloc::string::String::from(p.name())
-            )
-            .as_str(),
+        parent_name.as_str(),
         // A `fork` child runs the parent's image until it `execve`s, so it
-        // shows the parent's command line — the same rule the `Spawn` row's
-        // `cmdline` field states, and the reason `ps` briefly lists two `sh`s.
+        // shows the parent's command line — the reason `ps` briefly lists two
+        // `sh`s.
         &parent_cmdline,
     );
 
@@ -3457,19 +3592,13 @@ fn sys_fork() -> u64 {
         });
     }
 
-    u64::from(pid)
-}
+    // Published last: the child's register/TLS snapshot, its identity and its
+    // stdio row must all be in place before anything can schedule it — the same
+    // ordering rule `spawn_in_space_unpublished` exists to enforce (a tick
+    // between spawn and seed used to run the child on garbage).
+    crate::sched::publish_task(task_slot);
 
-/// Drop a `PROCS` slot on a `fork`/`spawn` bail-out. The child task was never
-/// scheduled, so nothing else touches it.
-fn take_proc_slot(slot: usize) {
-    // SAFETY: raw-pointer access; single core.
-    unsafe {
-        let procs = &raw mut PROCS;
-        if let Some(p) = (*procs)[slot].take() {
-            drop(p);
-        }
-    }
+    u64::from(pid)
 }
 
 /// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.
@@ -3507,20 +3636,20 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     let spawn_cmdline = flatten_cmdline(argv_refs.iter().copied());
     let spawner_pid = current_pid();
 
-    // A free PROCS slot in the spawn range.
+    // A free process slot in the spawn range. The `SPAWN` row is the oracle
+    // since 5b slice 4 — it was `PROCS`, and `fork` consulted both, which is
+    // the divergence that made this function and that one disagree about how
+    // full the machine was.
     let slot = {
         // SAFETY: raw-pointer read; single core.
-        let procs = unsafe {
-            let p = &raw const PROCS;
-            &*p
-        };
-        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| procs[s].is_none())
+        let spawn = unsafe { &*spawn_table() };
+        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| spawn[s - SPAWN_SLOT_BASE].is_none())
     };
     let Some(slot) = slot else {
         return errno::ENOMEM;
     };
 
-    let (proc, img) = match Process::from_elf_argv(&image, &argv_refs) {
+    let (child, img) = match Image::from_elf_argv(&image, &argv_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [spawn] load failed: ");
@@ -3531,7 +3660,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     };
 
     let (Some(stdout_pipe), Some(stdin_pipe)) = (pipe::alloc(), pipe::alloc()) else {
-        drop(proc);
+        drop(child);
         return errno::ENOMEM;
     };
 
@@ -3547,35 +3676,36 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         }
     }
 
-    let root = proc.space.ttbr0();
+    let root = child.space.ttbr0();
     // A spawned process starts with an empty descriptor row: its stdio is the
     // pipes above, addressed by number, and it inherits nothing else. The
     // reset is defensive rather than expected — `close_owned_by` clears the row
     // at exit — but a slot whose previous occupant died without running that
     // would otherwise hand this process working descriptors it never opened.
     crate::fd::close_owned_by(slot);
-    // SAFETY: raw-pointer write; single core, slot was just found free.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[slot] = Some(proc);
-    }
 
     let Some(task_slot) = spawn_process_task(slot, root) else {
-        cleanup_spawn_slot(slot, stdout_pipe, stdin_pipe);
+        // `child` drops here: the image is freed by the same destructor that
+        // would have freed it out of `PROCS`.
+        cleanup_spawn_slot(stdout_pipe, stdin_pipe);
         return errno::ENOMEM;
     };
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
     // 5b slice 1: register the child with `akuma-exec`'s process table and
     // publish `task_slot → pid`, so `current_process_shared()` resolves for
-    // this child from its first (post-registration) syscall. The heap starts
-    // where the loaded image ends — the same `LoadedImage::end_va` the loader
-    // reported and `mm.rs`'s placer agrees with.
+    // this child from its first syscall. The heap starts where the loaded image
+    // ends — the same `LoadedImage::end_va` the loader reported and `mm.rs`'s
+    // placer agrees with.
+    //
+    // 5b slice 4: the image itself is moved in here, and this happens **before**
+    // `publish_task` below, because `run_process` reads the child's entry point
+    // and stack back out of it.
     register_exec_process(
         pid,
         spawner_pid,
         task_slot,
-        root,
+        child,
         img.end_va,
         core::str::from_utf8(argv_refs[0]).unwrap_or("spawn"),
         &spawn_cmdline,
@@ -3593,6 +3723,10 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         });
     }
 
+    // Last, as in `sys_fork`: identity and stdio in place before anything can
+    // schedule the child.
+    crate::sched::publish_task(task_slot);
+
     let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false);
     let Some(stdout_fd) = stdout_fd else {
         // The child is already running; it will just write into a pipe nobody
@@ -3603,17 +3737,12 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     u64::from(pid) | (stdout_fd << 32)
 }
 
-fn cleanup_spawn_slot(slot: usize, stdout_pipe: PipeId, stdin_pipe: PipeId) {
+/// Release the pipes of a spawn that never got a task. The image itself is a
+/// local value now and drops on the way out of [`sys_spawn`], which is why this
+/// no longer takes a slot: there is nothing parked under one to take back.
+fn cleanup_spawn_slot(stdout_pipe: PipeId, stdin_pipe: PipeId) {
     pipe::free(stdout_pipe);
     pipe::free(stdin_pipe);
-    // SAFETY: raw-pointer access; single core. The task was never spawned (or
-    // failed to), so nothing else touches this slot.
-    unsafe {
-        let procs = &raw mut PROCS;
-        if let Some(p) = (*procs)[slot].take() {
-            drop(p);
-        }
-    }
 }
 
 /// Tasks parked inside `wait4`, as a bitmap over scheduler task slots.
@@ -3723,7 +3852,7 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     wait4_wake_all();
 }
 
-/// The stdin/stdout pipe a task running `PROCS` slot `proc_slot` reads/writes as
+/// The stdin/stdout pipe a task running process slot `proc_slot` reads/writes as
 /// fd 0 / fd 1. `None` for a task that is not a spawned child, or a `vfork`
 /// child of a console shell — in both cases fd 0/1/2 are the console.
 fn spawn_stdio(proc_slot: usize) -> Option<(PipeId, PipeId)> {
@@ -3870,20 +3999,40 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         pipe::free(stdin_pipe);
     }
     // SAFETY: raw-pointer access; single core. The child task is Finished — it
-    // called `sched::finish()` in `run_process` after recording its exit. A
-    // `vfork` child's `Process` is borrowed, so `free` is a no-op for it.
+    // called `sched::finish()` in `run_process` after recording its exit.
     unsafe {
         (*spawn_table())[slot_off] = None;
-        let procs = &raw mut PROCS;
-        if let Some(p) = (*procs)[SPAWN_SLOT_BASE + slot_off].take() {
-            drop(p);
-        }
     }
     // 5b slice 1: the child is gone from this target's tables, so it goes from
-    // akuma-exec's too — the slot table's deferred reclaim frees the `Process`
-    // after its cooldown, and the `THREAD_PID_MAP` entry is removed only while
-    // the recorded task slot still names this pid (`reap_exec_process`).
+    // akuma-exec's too. 5b slice 4 gave that line a second job: the registered
+    // `Process` **owns** the address space now, so retiring it is also what
+    // frees the child's frames and page tables — the `drop(p)` that used to
+    // happen here, out of `PROCS`, deferred by one reclaim sweep. This target
+    // configures `process_reclaim_cooldown_us: 0`, so the next drain site to
+    // run collects it; `run_process`'s own terminal drain, the idle loop and
+    // the PMM pressure ladder are all of them.
+    //
+    // The `THREAD_PID_MAP` entry is removed only while the recorded task slot
+    // still names this pid (`reap_exec_process`).
     reap_exec_process(child_pid, exec_slot);
+    // **The reap is a drain site on this target**, added by 5b slice 4 because
+    // that slice is what gave the registered process something worth freeing.
+    //
+    // `process::reclaim`'s vetted list has three entries here — the exit path's
+    // terminal drain, the idle loop, and the PMM pressure ladder — and none of
+    // them covers the moment a *parent* collects a child: the child's own
+    // terminal drain ran before this retire, the idle loop does not run while a
+    // busy shell reaps, and parking one image is not pressure. The boot suite
+    // is the extreme case that shows it, and did: at `SMP=1` thread 0 is the
+    // test rather than idling, so `spawn`/`busybox`/`fork`'s "teardown leaks
+    // nothing" checks each reported a whole image outstanding.
+    //
+    // The lock context is the one the module docs require: inside a syscall,
+    // holding the BKL and nothing else — no PMM lock, no VFS lock, no address
+    // space. The reaping thread is alive rather than terminated, so the sweep
+    // is not even the pinned variant. It is the same work `drop(p)` did here
+    // before the address space moved onto the registered process.
+    akuma_exec::process::reclaim::drain_retired_if_requested();
     u64::from(child_pid)
 }
 
@@ -4610,6 +4759,120 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     crate::fd::sys_unlinkat(AT_FDCWD, link.as_ptr() as u64, 0);
 }
 
+/// **The fault path's lookup, priced.**
+///
+/// 5b slice 4 moved `with_current_regions` / `with_current_address_space` /
+/// `cow_swap_frame` off a per-CPU field plus one array index and onto
+/// `akuma-exec`'s process table. Those three run on every demand-paging fault
+/// and every CoW break, so the honest question about that slice is not whether
+/// it is tidier but what it costs, and this is the instrument that answers it —
+/// permanently, in every boot, rather than once in a session.
+///
+/// # Why it is measured here and not with `mem_fault_cost`
+///
+/// It cannot be measured from ring 3 on this target. `userspace/memprobe/c/`
+/// exists and both its instruments build for `x86_64-linux-musl`, but every
+/// arm of them is timed with `clock_gettime(CLOCK_MONOTONIC)` and **this
+/// kernel's clock has 10 ms granularity**: `net::uptime_us` is
+/// `lapic::ticks() * US_PER_TICK`, `US_PER_TICK` is 10 000, and every clock on
+/// the target derives from it. Measured 2026-09-08 on QEMU/TCG: the
+/// 1000-iteration `mmap_lazy` control reads exactly 10 000 ns per rep (one
+/// tick) and every 512-fault bracket reads **0 ns**. A per-fault cost is
+/// nanoseconds; the finest thing userspace can see here is ten milliseconds.
+/// So the probe is not "not run", it is not *runnable*, and the difference
+/// matters — see `scripts/benchmarks/amd64_fault_cost.py`, which will show you.
+///
+/// TSC has the resolution the tick clock lacks, and the kernel is where the TSC
+/// is reachable.
+///
+/// # What the two numbers are
+///
+/// * `slot` — [`current_proc_slot`], the per-CPU `UserCtx` field read. This is
+///   what the **old** lookup was, plus one bounds-checked array index that no
+///   measurement here could separate from noise.
+/// * `process` — [`current_process`], the whole new lookup: the same per-CPU
+///   read of the task slot, then `THREAD_IDENTITY[tid]`'s cached process-table
+///   slot and generation, then `SlotTable::ref_if_current`.
+///
+/// Both are reported per call, in **TSC ticks**, uncalibrated — the comparison
+/// is the point and a frequency would add a second thing to get wrong. Under
+/// TCG they are emulation ticks and only the ratio means anything; on real
+/// silicon they are cycles.
+///
+/// # And the check that is not a timing
+///
+/// A number can drift; what must not is *which path* the lookup takes. The
+/// check asserts that `IDENTITY_FALLBACKS` does not move across the whole
+/// measured loop — every resolution was a cache hit, not the 256-slot table
+/// scan the naive fold would have paid. That is the property the hand-off
+/// warned about, and unlike a nanosecond count it cannot pass by luck.
+pub fn identity_cost_test(t: &mut Suite) {
+    /// Enough iterations that the loop dominates the two `rdtsc`s, and few
+    /// enough to cost nothing on a TCG boot.
+    const ITERS: u64 = 20_000;
+
+    fn tsc() -> u64 {
+        // SAFETY: `rdtsc` is unprivileged and baseline on x86_64.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    let free_before = akuma_pmm::free_count();
+    // The boot task is registered nowhere — that is the whole boot-suite window
+    // this target has tripped over three times — so measuring the cached path
+    // from it needs an identity to cache. Register one, measure, retire it.
+    // A real `UserAddressSpace`, because that is what a real process carries and
+    // `register_exec_process` takes ownership of one; it is never activated.
+    let Some(space) = UserAddressSpace::new() else {
+        t.check("identity: probe address space built", false);
+        return;
+    };
+    let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
+    let pid = alloc_pid();
+    let task = crate::sched::current_task();
+    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0");
+
+    if !t.check("identity: the running task resolves to its process", current_process().is_some()) {
+        finish_test_process(pid, task);
+        return;
+    }
+
+    let fallbacks_before =
+        akuma_exec::process::IDENTITY_FALLBACKS.load(Ordering::Relaxed);
+
+    let t0 = tsc();
+    for _ in 0..ITERS {
+        core::hint::black_box(current_proc_slot());
+    }
+    let t1 = tsc();
+    for _ in 0..ITERS {
+        core::hint::black_box(current_process().is_some());
+    }
+    let t2 = tsc();
+
+    let fallbacks = akuma_exec::process::IDENTITY_FALLBACKS
+        .load(Ordering::Relaxed)
+        .saturating_sub(fallbacks_before);
+
+    let slot_ticks = t1.saturating_sub(t0) / ITERS;
+    let proc_ticks = t2.saturating_sub(t1) / ITERS;
+    t.note("identity: per-call TSC ticks, per-CPU slot read (the old lookup)", slot_ticks);
+    t.note("identity: per-call TSC ticks, registered-process lookup", proc_ticks);
+    t.note("identity: added ticks per fault-path lookup", proc_ticks.saturating_sub(slot_ticks));
+    // The load-bearing assertion. A fallback is the slow path — a `THREAD_PID_MAP`
+    // walk and a scan of up to 256 process slots — and one per fault is exactly
+    // the regression this slice had to avoid. Zero, not "few": every iteration
+    // resolves the same live process from the same live thread, so any fallback
+    // at all means the cache is not being consulted.
+    t.check_eq("identity: every lookup was a cache hit, not a table scan", fallbacks, 0);
+
+    finish_test_process(pid, task);
+    t.check_eq(
+        "identity: probe teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
 /// Run two isolated processes concurrently and prove they interleave.
 pub fn smoke_test(t: &mut Suite) {
     const ROUNDS: u32 = 3;
@@ -4619,8 +4882,8 @@ pub fn smoke_test(t: &mut Suite) {
     let free_before = akuma_pmm::free_count();
 
     let (Some(a), Some(b)) = (
-        Process::new(MSG_A, ROUNDS, 0, 0x0A),
-        Process::new(MSG_B, ROUNDS, 0, 0x0B),
+        Image::new(MSG_A, ROUNDS, 0, 0x0A),
+        Image::new(MSG_B, ROUNDS, 0, 0x0B),
     ) else {
         t.check("ring3: processes built", false);
         return;
@@ -4631,19 +4894,15 @@ pub fn smoke_test(t: &mut Suite) {
     let pa_a = a.space.translate(USER_CODE_VA);
     let pa_b = b.space.translate(USER_CODE_VA);
     let pa_k = crate::paging::translate(USER_CODE_VA);
-    let (root_a, root_b) = (a.space.ttbr0(), b.space.ttbr0());
 
-    // SAFETY: single core; written before the tasks that read them exist.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[0] = Some(a);
-        (*procs)[1] = Some(b);
-    }
-
-    let spawned = spawn_process_task(0, root_a).is_some() && spawn_process_task(1, root_b).is_some();
-    if !t.check("ring3: processes spawned", spawned) {
+    let (Some(a), Some(b)) = (
+        start_test_process(0, a, 0, "ring3-a"),
+        start_test_process(1, b, 0, "ring3-b"),
+    ) else {
+        t.check("ring3: processes spawned", false);
         return;
-    }
+    };
+    t.check("ring3: processes spawned", true);
 
     serial::puts("  -- userspace output follows --\n");
     // Drive the round-robin from the boot task until both processes finish.
@@ -4677,15 +4936,9 @@ pub fn smoke_test(t: &mut Suite) {
         u64::from(ROUNDS) * 2 - 1,
     );
 
-    // SAFETY: both tasks have finished; nothing else touches these slots.
-    unsafe {
-        let procs = &raw mut PROCS;
-        for slot in 0..2 {
-            if let Some(p) = (*procs)[slot].take() {
-                drop(p);
-            }
-        }
-    }
+    // Both tasks have finished; nothing else names these processes.
+    finish_test_process(a.0, a.1);
+    finish_test_process(b.0, b.1);
     t.check_eq(
         "ring3: address-space teardown leaks nothing",
         akuma_pmm::free_count() as u64,
@@ -4710,25 +4963,21 @@ pub fn preempt_test(t: &mut Suite) {
     let free_before = akuma_pmm::free_count();
 
     let (Some(c), Some(d)) = (
-        Process::new(b"    [ring3 C] spinning, never yields\n", ROUNDS, DELAY, 0x0C),
-        Process::new(b"    [ring3 D] spinning, never yields\n", ROUNDS, DELAY, 0x0D),
+        Image::new(b"    [ring3 C] spinning, never yields\n", ROUNDS, DELAY, 0x0C),
+        Image::new(b"    [ring3 D] spinning, never yields\n", ROUNDS, DELAY, 0x0D),
     ) else {
         t.check("preempt: processes built", false);
         return;
     };
-    let (root_c, root_d) = (c.space.ttbr0(), d.space.ttbr0());
 
-    // SAFETY: single core; written before the tasks that read them exist.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[2] = Some(c);
-        (*procs)[3] = Some(d);
-    }
-
-    let spawned = spawn_process_task(2, root_c).is_some() && spawn_process_task(3, root_d).is_some();
-    if !t.check("preempt: processes spawned", spawned) {
+    let (Some(c), Some(d)) = (
+        start_test_process(2, c, 0, "ring3-c"),
+        start_test_process(3, d, 0, "ring3-d"),
+    ) else {
+        t.check("preempt: processes spawned", false);
         return;
-    }
+    };
+    t.check("preempt: processes spawned", true);
 
     serial::puts("  -- userspace output follows (no yields) --\n");
     crate::lapic::start_timer();
@@ -4755,15 +5004,9 @@ pub fn preempt_test(t: &mut Suite) {
     t.check("preempt: timer interleaved two non-yielding processes", switches >= 1);
     t.note("preempt: task switches observed between writes", switches as u64);
 
-    // SAFETY: both tasks have finished; nothing else touches these slots.
-    unsafe {
-        let procs = &raw mut PROCS;
-        for slot in 2..4 {
-            if let Some(p) = (*procs)[slot].take() {
-                drop(p);
-            }
-        }
-    }
+    // Both tasks have finished; nothing else names these processes.
+    finish_test_process(c.0, c.1);
+    finish_test_process(d.0, d.1);
     t.check_eq(
         "preempt: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
@@ -4794,26 +5037,22 @@ pub fn smp_parallel_test(t: &mut Suite) {
     let free_before = akuma_pmm::free_count();
 
     let (Some(c), Some(d)) = (
-        Process::new(b"    [ring3 E] spinning on some core\n", ROUNDS, DELAY, 0x0E),
-        Process::new(b"    [ring3 F] spinning on some core\n", ROUNDS, DELAY, 0x0F),
+        Image::new(b"    [ring3 E] spinning on some core\n", ROUNDS, DELAY, 0x0E),
+        Image::new(b"    [ring3 F] spinning on some core\n", ROUNDS, DELAY, 0x0F),
     ) else {
         t.check("smp ring3: processes built", false);
         return;
     };
-    let (root_c, root_d) = (c.space.ttbr0(), d.space.ttbr0());
 
-    // SAFETY: under the BKL; written before the tasks that read them exist.
-    // Slots 2 and 3 are free again: `preempt_test` took its processes back.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[2] = Some(c);
-        (*procs)[3] = Some(d);
-    }
-
-    let spawned = spawn_process_task(2, root_c).is_some() && spawn_process_task(3, root_d).is_some();
-    if !t.check("smp ring3: processes spawned", spawned) {
+    // Slots 2 and 3 are free again: `preempt_test` reaped its processes.
+    let (Some(c), Some(d)) = (
+        start_test_process(2, c, 0, "ring3-e"),
+        start_test_process(3, d, 0, "ring3-f"),
+    ) else {
+        t.check("smp ring3: processes spawned", false);
         return;
-    }
+    };
+    t.check("smp ring3: processes spawned", true);
 
     serial::puts("  -- userspace output follows (two cores) --\n");
     crate::lapic::start_timer();
@@ -4834,15 +5073,9 @@ pub fn smp_parallel_test(t: &mut Suite) {
     t.note("smp ring3: cpu mask the writes came from", cpus);
     t.check("smp ring3: two processes ran on two cores", cpus.count_ones() >= 2);
 
-    // SAFETY: both tasks have finished; nothing else touches these slots.
-    unsafe {
-        let procs = &raw mut PROCS;
-        for slot in 2..4 {
-            if let Some(p) = (*procs)[slot].take() {
-                drop(p);
-            }
-        }
-    }
+    // Both tasks have finished; nothing else names these processes.
+    finish_test_process(c.0, c.1);
+    finish_test_process(d.0, d.1);
     t.check_eq(
         "smp ring3: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
@@ -4978,7 +5211,7 @@ pub fn elf_test(t: &mut Suite) {
     };
     t.check("elf: image came from the filesystem", from_disk.is_ok());
 
-    let (proc, img) = match Process::from_elf(image) {
+    let (proc, img) = match Image::from_elf(image) {
         Ok(p) => p,
         Err(e) => {
             t.check("elf: image loaded", false);
@@ -5009,7 +5242,7 @@ pub fn elf_test(t: &mut Suite) {
     // `hello` is `ET_EXEC`, so its `p_vaddr`s are its runtime addresses and
     // there is no load bias to add. A PIE probe here would need the base.
     let mapped_segments = {
-        let space = proc.space.lock();
+        let space = &proc.space;
         let mut n = 0u64;
         for_each_pt_load(image, |vaddr, memsz| {
             let first = (vaddr & !0xfff) as usize;
@@ -5045,12 +5278,12 @@ pub fn elf_test(t: &mut Suite) {
     // not what the loader believes it did. The entry page must be executable and
     // not writable; the stack must be the reverse. Both are W^X, from opposite
     // ends.
-    let entry_prot = proc.space.lock().pte_prot(proc.entry as usize & !0xfff).map(|(p, _)| p);
+    let entry_prot = proc.space.pte_prot(proc.entry as usize & !0xfff).map(|(p, _)| p);
     t.check(
         "elf: entry page is user-executable and not writable",
         entry_prot == Some(PteProt::USER_RX),
     );
-    let stack_prot = proc.space.lock().pte_prot((proc.stack as usize) & !0xfff).map(|(p, _)| p);
+    let stack_prot = proc.space.pte_prot((proc.stack as usize) & !0xfff).map(|(p, _)| p);
     t.check(
         "elf: stack page is user-writable and not executable",
         stack_prot == Some(PteProt::USER_RW),
@@ -5062,20 +5295,11 @@ pub fn elf_test(t: &mut Suite) {
         proc.stack < ELF_STACK_TOP && proc.stack >= ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096),
     );
 
-    let root = proc.space.ttbr0();
-    // SAFETY: single core; the slot is written before the task that reads it
-    // exists.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[4] = Some(proc);
-    }
-
-    if !t.check(
-        "elf: process spawned",
-        spawn_process_task(4, root).is_some(),
-    ) {
+    let Some(started) = start_test_process(4, proc, img.end_va, "hello") else {
+        t.check("elf: process spawned", false);
         return;
-    }
+    };
+    t.check("elf: process spawned", true);
 
     EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
     serial::puts("  -- userspace output follows (from an ELF image) --\n");
@@ -5099,13 +5323,7 @@ pub fn elf_test(t: &mut Suite) {
         t.check("elf:   a syscall preserved the ABI's registers", status & REGS_OK != 0);
     }
 
-    // SAFETY: the task has finished; nothing else touches this slot.
-    unsafe {
-        let procs = &raw mut PROCS;
-        if let Some(p) = (*procs)[4].take() {
-            drop(p);
-        }
-    }
+    finish_test_process(started.0, started.1);
     t.check_eq(
         "elf: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
@@ -5194,7 +5412,7 @@ pub fn fdprobe_test(t: &mut Suite) {
     };
 
     let free_before = akuma_pmm::free_count();
-    let (proc, _img) = match Process::from_elf(&image) {
+    let (proc, _img) = match Image::from_elf(&image) {
         Ok(p) => p,
         Err(e) => {
             t.check("fdprobe: image loaded", false);
@@ -5204,19 +5422,11 @@ pub fn fdprobe_test(t: &mut Suite) {
             return;
         }
     };
-    let root = proc.space.ttbr0();
-    // SAFETY: single core; the slot is written before the task that reads it
-    // exists.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[5] = Some(proc);
-    }
-    if !t.check(
-        "fdprobe: spawned",
-        spawn_process_task(5, root).is_some(),
-    ) {
+    let Some(started) = start_test_process(5, proc, _img.end_va, "fdprobe") else {
+        t.check("fdprobe: spawned", false);
         return;
-    }
+    };
+    t.check("fdprobe: spawned", true);
 
     EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
     let mut spins = 0u64;
@@ -5249,13 +5459,7 @@ pub fn fdprobe_test(t: &mut Suite) {
         }
     }
 
-    // SAFETY: the task has finished; nothing else touches this slot.
-    unsafe {
-        let procs = &raw mut PROCS;
-        if let Some(p) = (*procs)[5].take() {
-            drop(p);
-        }
-    }
+    finish_test_process(started.0, started.1);
     // The probe mmaps and munmaps, so its frames must come back too — a leak
     // here is `mm::sys_munmap` failing to free rather than the loader.
     t.check_eq(
@@ -5293,7 +5497,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     }
     // Init has no `Spawn` entry, so `/proc/1` reads its argv from here.
     set_init_cmdline(argv_owned.iter().copied());
-    let (proc, _img) = match Process::from_elf_argv(&image, &argv_owned) {
+    let (proc, ld) = match Image::from_elf_argv(&image, &argv_owned) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [init] failed to load: ");
@@ -5302,25 +5506,24 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
             return false;
         }
     };
-    let init_image_top = _img.end_va;
+    let init_image_top = ld.end_va;
     let root = proc.space.ttbr0();
-    // SAFETY: single core; the slot is written before the task that reads it
-    // exists.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[6] = Some(proc);
-    }
     let Some(task_slot) = spawn_process_task(6, root) else {
         serial::puts("  [init] no task slot\n");
         return false;
     };
     // 5b slice 1: init is pid 1 on this target — `sshd`'s `getpid` says so, and
-    // every process not in the spawn table falls back to the same answer — so
-    // the registered identity names that pid. Registered *before* the first
-    // `yield_now` below hands the CPU to the task, so init's own first syscall
-    // already resolves. Nothing unregisters it: init runs until the machine
-    // stops, and the boot loop after this never returns while it lives.
-    register_exec_process(1, 0, task_slot, root, init_image_top, path, &INIT_CMDLINE.lock().clone());
+    // every process not in the process table falls back to the same answer — so
+    // the registered identity names that pid. Nothing unregisters it: init runs
+    // until the machine stops, and the boot loop after this never returns while
+    // it lives.
+    //
+    // 5b slice 4: the image goes in with it, and `publish_task` comes after —
+    // `run_process` reads init's entry point and stack out of this
+    // registration, so publishing first would race a task with nowhere to start
+    // against the register that gives it one.
+    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone());
+    crate::sched::publish_task(task_slot);
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes
     // up.
@@ -5381,7 +5584,7 @@ pub fn thread_test(t: &mut Suite) {
 
     let free_before = akuma_pmm::free_count();
 
-    let (proc, _img) = match Process::from_elf(THREADPROBE_ELF) {
+    let (proc, _img) = match Image::from_elf(THREADPROBE_ELF) {
         Ok(p) => p,
         Err(e) => {
             t.check("thread: probe loaded", false);
@@ -5392,20 +5595,11 @@ pub fn thread_test(t: &mut Suite) {
         }
     };
     t.check("thread: probe loaded", true);
-    let root = proc.space.ttbr0();
-    // SAFETY: raw-pointer write; the slot is filled before the task that reads
-    // it exists.
-    unsafe {
-        let procs = &raw mut PROCS;
-        (*procs)[5] = Some(proc);
-    }
-
-    if !t.check(
-        "thread: probe spawned",
-        spawn_process_task(5, root).is_some(),
-    ) {
+    let Some(started) = start_test_process(5, proc, _img.end_va, "threadprobe") else {
+        t.check("thread: probe spawned", false);
         return;
-    }
+    };
+    t.check("thread: probe spawned", true);
 
     EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
     let mut spins = 0u64;
@@ -5436,13 +5630,7 @@ pub fn thread_test(t: &mut Suite) {
     // lifetime rule exists to prevent, seen before it can happen.
     t.check_eq("thread: no thread outlived the process", crate::thread::live_count(5) as u64, 0);
 
-    // SAFETY: the task has finished; nothing else touches this slot.
-    unsafe {
-        let procs = &raw mut PROCS;
-        if let Some(p) = (*procs)[5].take() {
-            drop(p);
-        }
-    }
+    finish_test_process(started.0, started.1);
     t.check_eq(
         "thread: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
