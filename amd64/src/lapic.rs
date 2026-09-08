@@ -42,6 +42,7 @@ use crate::idt;
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
 use crate::port::outb;
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::serial;
@@ -546,6 +547,7 @@ const PIT_HZ: u32 = 1_193_182;
 /// The longest interval PIT channel 2's 16-bit count can express.
 const PIT_MAX_US: u32 = 54_000;
 
+#[cfg(not(feature = "no-tests"))]
 /// Check the clock's **rate**, not just that it moves — with interrupts on, and
 /// before any user process starts.
 ///
@@ -640,6 +642,7 @@ pub fn stop_timer() {
     write(REG_TIMER_INIT, 0);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Enable interrupts and confirm ticks actually arrive.
 ///
 /// Bounded by a spin budget rather than trusting the timer: if interrupts never

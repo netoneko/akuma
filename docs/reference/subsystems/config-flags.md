@@ -92,6 +92,27 @@ re-add what they need. `Cargo.toml:361-369`.
 [Networking stack](#networking-stack) above, alongside the other
 sshd-related features.
 
+### The `akuma-amd64` package
+
+A separate package (`amd64/Cargo.toml`), deliberately outside `default-members`,
+so none of the features above apply to it and none of these apply to the AArch64
+kernel.
+
+| Feature | Effect | Source |
+|---|---|---|
+| `smp-shared` | **Required, not optional.** Forwards to `akuma-exec/smp-shared`; the BKL's entry points are no-ops without the cfg, so a `--no-default-features` build would run four cores with no lock. A const assert in `amd64/src/smp.rs` fails the build rather than letting it boot corrupt. | `amd64/Cargo.toml` |
+| `console-notify` | Akuma-private syscall 322 (`/bin/wall`) — a userspace program writing a framed line straight to the console. **In `default` for this target only**: the bare-metal reference box has a display and no working keyboard, so this is the one channel to a person in front of it that is not the network. | `amd64/Cargo.toml` |
+| `no-tests` | Drops the boot self-test suite, as on AArch64. `boot::self_tests` and every `*_test`/`smoke_test` function in `amd64/src` disappear and `boot::late_init` performs the bring-up the suite otherwise does on the way past (the LAPIC, the secondaries, the console fd, the syscall MSRs, the timer, `sti`) — the same call the runtime `skiptests` command-line lever makes. Verified by booting, not only by compiling. | `amd64/Cargo.toml` |
+
+| Env knob | Effect | Source |
+|---|---|---|
+| `FEATURES=a,b` | Extra cargo features for `amd64/run.sh` — `FEATURES=no-tests sh amd64/run.sh`. Without it that feature could only be compiled, never booted, and a configuration nobody boots is one that rots. | `amd64/run.sh` |
+
+`no-tests` is also what makes `scripts/cloc_akuma.py` able to tell this target's
+kernel code from its test code: the script files an item under *tests* exactly
+when its `cfg` cannot hold in a `no-tests` world. Before the feature existed
+`amd64/src` measured **0.0% test** against ~3 300 lines of boot suite.
+
 #### build.rs-emitted cfgs for the above
 
 | cfg | Emitted when | Gates |

@@ -67,6 +67,7 @@
 //! the three slots, held at [`NO_FILE`].
 
 use akuma_exec_core::process::{FileDescriptor, KernelFile};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_terminal::TerminalState;
 use alloc::vec::Vec;
@@ -2985,6 +2986,7 @@ fn open_proc(rest: &str, flags: u64) -> Option<u64> {
     render_proc_file(rest).map(|data| install_synthetic_file(rest, data, flags))
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// `open`, `stat` and `access` must agree about every `/proc` path.
 ///
 /// # Why this is a self-test and not a comment
@@ -3004,6 +3006,7 @@ fn open_proc(rest: &str, flags: u64) -> Option<u64> {
 /// asserted in both directions: a path that exists answers 0 from all three, and
 /// a path that does not answers `ENOENT` from all three.
 fn proc_consistency_check(t: &mut Suite) {
+    #[cfg(not(feature = "no-tests"))]
     /// One path, checked three ways. `want` is whether it should exist.
     fn agree(t: &mut Suite, label: &'static str, path: &[u8], want: bool) {
         let p = path.as_ptr() as u64;
@@ -3139,6 +3142,7 @@ fn siocgif(cmd: u32, arg: u64) -> u64 {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Exercise the descriptor path from the kernel side.
 ///
 /// Ring 3 exercises it for real in `usermode`; this checks the parts that are

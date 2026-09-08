@@ -321,7 +321,10 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // PVH entry point, and now literally the same code. `boot::early_init` has
     // the reason for each; the ordering constraints between them are subtle
     // enough that keeping two copies was the hazard.
+    #[cfg(not(feature = "no-tests"))]
     let smap = crate::boot::early_init();
+    #[cfg(feature = "no-tests")]
+    let _ = crate::boot::early_init();
 
     // The machine, as multiboot2 describes it.
     let machine = machine_from(&info);
@@ -375,6 +378,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         info.cmdline().split_ascii_whitespace().any(|t| t == "root=/dev/sda1");
     // `usb` alone drives the controller without mounting from it — the shape a
     // bisect wants: prove the bring-up survives before trusting a root on it.
+    #[cfg(not(feature = "no-tests"))]
     let want_usb =
         want_usb_root || info.cmdline().split_ascii_whitespace().any(|t| t == "usb");
     let mount_ram = || {
@@ -405,25 +409,37 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // the handful of `init_*` calls the suite happens to also perform (the LAPIC,
     // the console fd, the syscall MSRs, the secondary cores): those are real
     // bring-up, not tests.
+    let mb2_keep_out = || {
+        [
+            (info_phys, info_phys + bytes.len() as u64),
+            info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
+        ]
+    };
+    let start_secondaries = || {
+        let nosmp = info.cmdline().split_ascii_whitespace().any(|t| t == "nosmp");
+        if !nosmp && crate::smp::trampoline_page_available(&machine, &mb2_keep_out()) {
+            crate::smp::start_secondaries(machine.madt.as_ref());
+        }
+    };
+
+    // No suite in this build: `boot::late_init` is the same bring-up the
+    // `skiptests` arm below performs, and this path is why it is a function.
+    // Both arms end in `cycle_forever` (see its note at the tail of the tested
+    // one) rather than falling through to a shared call, because the first arm
+    // diverges and the compiler is right to call anything after it unreachable.
+    #[cfg(feature = "no-tests")]
+    {
+        crate::boot::late_init(start_secondaries);
+        boot_to_init(&info, have_net, have_fs);
+        cycle_forever(have_net)
+    }
+
+    #[cfg(not(feature = "no-tests"))]
+    {
     let skiptests = info.cmdline().split_ascii_whitespace().any(|t| t == "skiptests");
     if skiptests {
         serial::puts("  boot: skiptests — self-test suite bypassed\n");
-        crate::lapic::init();
-        let nosmp = info.cmdline().split_ascii_whitespace().any(|t| t == "nosmp");
-        let keep_out = [
-            (info_phys, info_phys + bytes.len() as u64),
-            info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
-        ];
-        if !nosmp && crate::smp::trampoline_page_available(&machine, &keep_out) {
-            crate::smp::start_secondaries(machine.madt.as_ref());
-        }
-        crate::fd::init_console();
-        crate::usermode::init_syscall();
-        crate::lapic::start_timer();
-        // Every test path ends in `cli`; with the suite skipped, nothing else
-        // turns interrupts back on before the netpoll daemon and `run_init` need
-        // them. SAFETY: unconditionally safe at ring 0.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        crate::boot::late_init(start_secondaries);
         boot_to_init(&info, have_net, have_fs);
         cycle_forever(have_net)
     }
@@ -496,6 +512,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // pingable after `init` is done is the difference between diagnosable and
     // silent.
     cycle_forever(have_net)
+    } // end #[cfg(not(feature = "no-tests"))]
 }
 
 /// Bring the network up (DHCP, then the wall clock, then the netpoll daemon),

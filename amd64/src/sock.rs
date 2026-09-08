@@ -23,6 +23,7 @@
 
 use akuma_net::socket::socket_const::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
 use akuma_net::socket::{SockAddrIn, SocketAddrV4};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::fd::{self, errno};
@@ -438,6 +439,7 @@ pub fn close(idx: usize) {
     akuma_net::socket::remove_socket(idx);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Prove the socket table works without needing a peer.
 ///
 /// A loopback connection would be the better test and needs the netpoll loop to

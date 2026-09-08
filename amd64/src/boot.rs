@@ -50,14 +50,17 @@
 //! decisions with five different reasons, and a single function taking five
 //! callbacks would be a merge in name only.
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_ryzen_amd64::MachineDescription;
 use crate::uaccess::SmapStatus;
 
-use crate::{
-    blk, fd, fs, gdt, idt, lapic, mm, net, paging, pci, reboot, sched, smp, sock, uaccess,
-    usermode, xhci,
-};
+use crate::{fd, gdt, idt, lapic, paging, sched, smp, uaccess, usermode};
+// Reached only from `self_tests`, which `no-tests` compiles out. Split from the
+// list above rather than gated wholesale, because the other half of it is
+// `early_init`'s and `late_init`'s.
+#[cfg(not(feature = "no-tests"))]
+use crate::{blk, fs, mm, net, pci, reboot, sock, xhci};
 
 /// Bring the CPU to the state every later step assumes, and report SMAP/SMEP.
 ///
@@ -149,6 +152,7 @@ pub fn install_shared_sinks() {
 // point of this struct is that a reader can see *which* question each entry
 // point answered differently. A packed encoding is exactly what gives that up.
 #[allow(clippy::struct_excessive_bools)]
+#[cfg(not(feature = "no-tests"))]
 pub struct SuiteCtx<'a> {
     pub machine: &'a MachineDescription,
     /// The kernel command line, however this protocol obtained it. Every
@@ -170,7 +174,58 @@ pub struct SuiteCtx<'a> {
     pub keep_out: [(u64, u64); 2],
 }
 
+/// The initialisation the suite performs **inline**, spelled once.
+///
+/// `fd::init_console` and `usermode::init_syscall` are not tests: without them
+/// there is no console descriptor and no `IA32_LSTAR`, so ring 3 cannot make a
+/// syscall at all. They sit in the middle of [`self_tests`] because the
+/// userspace checks after them need both — and that is exactly why this
+/// function exists rather than two lines in each of two places.
+///
+/// **The rule:** anything added to `self_tests` that *initialises* rather than
+/// *checks* belongs here, and the `no-tests` build is what would notice if it
+/// did not.
+fn wire_console_and_syscalls() {
+    fd::init_console();
+    usermode::init_syscall();
+}
+
+/// Bring the machine up to `init` **without** running the suite: the LAPIC, the
+/// secondaries, the console fd, the syscall MSRs, the timer, and interrupts on.
+///
+/// Two callers, and they are the same situation reached two ways:
+///
+/// * `skiptests` on the command line — a runtime lever, so a trusted build on
+///   the bare-metal box does not re-prove demand paging and the ELF loader on
+///   every reboot while someone watches a television scroll;
+/// * a `no-tests` build, where there is no suite to skip.
+///
+/// This was the `skiptests` arm of `multiboot2::kmain_mb2`, written out inline,
+/// and it is a function because `no-tests` would otherwise have been a *second*
+/// copy of it. Every step here is real bring-up that [`self_tests`] happens to
+/// also perform on the way past — which is the thing about that function worth
+/// remembering, and why its header names the two interleaved init points.
+///
+/// `secondaries` is a hook rather than an argument list because the trampoline
+/// check needs a `keep_out` range that differs by boot protocol: what might be
+/// sitting on that page is a PVH start-info block on one path and GRUB's
+/// information block or root image on the other. Only the caller knows.
+///
+/// Interrupts are **on** when this returns. Every test path ends in `cli`; with
+/// no suite, nothing else turns them back on before the netpoll daemon and
+/// `run_init` need them.
+pub fn late_init(secondaries: impl FnOnce()) {
+    lapic::init();
+    secondaries();
+    wire_console_and_syscalls();
+    lapic::start_timer();
+    // SAFETY: unconditionally safe at ring 0; the IDT is installed and every
+    // vector's handler is in place by now.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+}
+
 /// What [`self_tests`] concluded.
+#[cfg(not(feature = "no-tests"))]
 pub struct Verdict {
     /// Every check passed.
     ///
@@ -193,11 +248,20 @@ pub struct Verdict {
 /// - The scheduler tests want a live tick, so the timer is started for them and
 ///   stopped again — every test in between ends with interrupts masked.
 /// - `fd::init_console` and `usermode::init_syscall` sit *inside* the suite
-///   because the userspace tests after them need both.
+///   because the userspace tests after them need both. They are spelled once,
+///   in [`wire_console_and_syscalls`], which [`late_init`] also calls — see
+///   there for the rule.
 /// - `lapic::clock_rate_check` is last and **before any user process**: it is
 ///   what leaves interrupts on for the rest of the boot, and it checks the tick
 ///   *rate*, not merely that ticks arrive — a clock that is only moving still
 ///   scales every network timeout by however wrong it is.
+///
+/// # Compiled out by `no-tests`
+///
+/// Which is why the two initialisation points above are called out: this
+/// function is not purely a suite, and a build without it still needs what it
+/// sets up. [`late_init`] is that subset, in this order.
+#[cfg(not(feature = "no-tests"))]
 pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     let flag = |name: &str| cx.cmdline.split_ascii_whitespace().any(|w| w == name);
 
@@ -282,8 +346,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     net::smoke_test(t, cx.have_net);
     sock::smoke_test(t, cx.have_net);
 
-    fd::init_console();
-    usermode::init_syscall();
+    wire_console_and_syscalls();
     // The dispatch table itself, before anything runs through it: the
     // legacy-x86 list and the neutral `Syscall` table must stay disjoint,
     // and the x86_64 -> asm-generic hop C1 folds through must still happen.

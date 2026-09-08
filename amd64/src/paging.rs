@@ -68,6 +68,7 @@
 //! page fault with no IDT installed — a triple-fault and a guest that vanishes
 //! with no output.
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::phys::{PHYSMAP_LIMIT, phys_ptr};
@@ -582,6 +583,7 @@ pub fn translate_in(root: u64, va: usize) -> Option<u64> {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Map a frame outside the identity map, write through it, read it back, unmap.
 ///
 /// Chosen VA is 1 GiB — the first address `boot.s` does *not* map, so the whole
@@ -639,6 +641,7 @@ pub fn smoke_test(t: &mut Suite) {
     region_prot_roundtrip_check(t);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Pin every `akuma_mmap::Prot` variant to the exact PTE bits it encodes to.
 ///
 /// This is the x86 half of the pin `akuma-mmu` put on its own encoder
@@ -722,6 +725,7 @@ fn region_prot_roundtrip_check(t: &mut Suite) {
     t.check_eq("prot: six region variants, all pinned above", Prot::ALL.len() as u64, 6);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Pin every [`PageFaultCode`] bit position against a decoded value.
 ///
 /// The point of the type is that these five bits stop being one-off `1 << n`
@@ -769,6 +773,7 @@ fn page_fault_code_check(t: &mut Suite) {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Check that the encoder cannot express write+execute, and that NX is set.
 ///
 /// A pure check on [`encode`], not on the hardware: the hardware half needs a

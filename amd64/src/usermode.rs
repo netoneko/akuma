@@ -27,6 +27,7 @@
 
 use akuma_syscalls_abi::Syscall;
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::gdt;
@@ -57,7 +58,9 @@ const EFER_SCE: u64 = 1 << 0;
 /// simply be mapped where it expects to be. Before that this had to be
 /// `0x5000_0000` — chosen to dodge the kernel's identity map — which is exactly
 /// the constraint the higher-half move removed.
+#[cfg(not(feature = "no-tests"))]
 const USER_CODE_VA: usize = 0x40_0000;
+#[cfg(not(feature = "no-tests"))]
 const USER_STACK_VA: usize = 0x41_0000;
 
 /// Top of the stack given to an ELF-loaded process.
@@ -99,9 +102,11 @@ pub const ELF_STACK_PAGES: usize = 128;
 /// what makes the fallback honest rather than a second, drifting program — and
 /// `elf_test` checks it, because "identical" is an assumption about two build
 /// steps agreeing.
+#[cfg(not(feature = "no-tests"))]
 const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 
 /// The `clone`/`futex` probe. See `usermode::thread_test`.
+#[cfg(not(feature = "no-tests"))]
 const THREADPROBE_ELF: &[u8] = include_bytes!(env!("USER_THREADPROBE_ELF"));
 
 /// Where a task's kernel stack and saved user stack live.
@@ -1900,6 +1905,7 @@ pub fn init_syscall() {
 ///   jmp $                               ; a guard, not a fallthrough
 ///   <message bytes>
 /// ```
+#[cfg(not(feature = "no-tests"))]
 fn build_user_program(
     out: &mut [u8],
     base_va: u64,
@@ -2041,6 +2047,7 @@ impl Image {
     /// [`Self::from_elf`] exists: these two tests are about the scheduler and
     /// the timer, and a blob with no file format between it and the page table
     /// cannot fail for a loader's reasons.
+    #[cfg(not(feature = "no-tests"))]
     fn new(msg: &[u8], rounds: u32, delay: u32, status: u32) -> Option<Self> {
         let mut space = UserAddressSpace::new()?;
 
@@ -2094,6 +2101,7 @@ impl Image {
     /// property `elf: rejected loads leak nothing` checks.
     /// Returns the process and what the loader found, so a caller can check the
     /// placement as well as the outcome.
+    #[cfg(not(feature = "no-tests"))]
     fn from_elf(image: &[u8]) -> Result<(Self, loader::LoadedImage), &'static str> {
         Self::from_elf_argv(image, &[b"hello"])
     }
@@ -2643,6 +2651,7 @@ fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
 /// caller uses, and returning the `(pid, task_slot)` pair the teardown needs.
 /// The parent is pid 1: these run before `run_init`, so there is no real
 /// parent, and 1 is what `current_pid()` answers for the boot task driving them.
+#[cfg(not(feature = "no-tests"))]
 fn start_test_process(
     slot: usize,
     image: Image,
@@ -2677,6 +2686,7 @@ fn start_test_process(
 /// what every production drain site uses. It also drains the TTBR-deferred
 /// frame list, which is where an address space's frames go if another core's
 /// `CR3` still stands on its L0.
+#[cfg(not(feature = "no-tests"))]
 fn finish_test_process(pid: u32, task_slot: usize) {
     reap_exec_process(pid, task_slot);
     akuma_exec::process::reclaim::drain_retired_if_requested();
@@ -4046,6 +4056,7 @@ fn spawn_row_of(pid: u32) -> Option<usize> {
     unsafe { (*spawn_table()).iter().position(|e| e.as_ref().is_some_and(|s| s.pid == pid)) }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Stage R: `sys_spawn` runs a child, its stdout comes back through a pipe, and
 /// `waitpid` reports its exit status.
 ///
@@ -4118,6 +4129,7 @@ pub fn spawn_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The `console_notify` syscall (Akuma-private 322), the kernel half of
 /// `/bin/wall`. Only the argument-validation edges are checkable from here — a
 /// success needs a mapped user page this context does not have — but those edges
@@ -4144,6 +4156,7 @@ pub fn console_notify_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Stage S: a real static musl **busybox** — a program the tree did not compile
 /// — runs an applet and its output comes back.
 ///
@@ -4211,6 +4224,7 @@ pub fn busybox_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Stage T: `execve` with no `fork`.
 ///
 /// `busybox sh -c "uname"` is spawned; ash resolves `uname` on `PATH`,
@@ -4281,6 +4295,7 @@ pub fn execve_test(t: &mut Suite) {
 /// The drive loop `fork_test` and `execve_test` each spell out longhand. Split
 /// out for [`redirect_test`], which needs it twice; the two older tests are
 /// deliberately left alone so a failure there still bisects to their own code.
+#[cfg(not(feature = "no-tests"))]
 fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
     let path = b"/bin/sh\0";
@@ -4318,6 +4333,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
     Some((status, out))
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Shell redirection and pipelines — `dup2` and `pipe(2)`, end to end.
 ///
 /// These are the two things a build system cannot do without, and until
@@ -4428,6 +4444,7 @@ pub fn redirect_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Stage T: `fork` (with `vfork` semantics) + `execve` + `wait4`.
 ///
 /// `busybox sh -c "uname; echo DONE"` — the `;` makes ash a command list, and
@@ -4501,6 +4518,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
     t.check_eq("wait4: after the last reap -> ECHILD again", r, errno::ECHILD);
 }
 
+#[cfg(not(feature = "no-tests"))]
 pub fn fork_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
@@ -4580,6 +4598,7 @@ fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
     akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args)
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The dispatch **vocabulary**: two tables that must stay disjoint, and the
 /// number hop that must keep happening.
 ///
@@ -4759,6 +4778,7 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     crate::fd::sys_unlinkat(AT_FDCWD, link.as_ptr() as u64, 0);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// **The fault path's lookup, priced.**
 ///
 /// 5b slice 4 moved `with_current_regions` / `with_current_address_space` /
@@ -4873,6 +4893,7 @@ pub fn identity_cost_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Run two isolated processes concurrently and prove they interleave.
 pub fn smoke_test(t: &mut Suite) {
     const ROUNDS: u32 = 3;
@@ -4946,6 +4967,7 @@ pub fn smoke_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Two processes that never yield, interleaved by the timer alone.
 ///
 /// The distinction from [`smoke_test`] is the whole point: those processes call
@@ -5014,6 +5036,7 @@ pub fn preempt_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Two spinning processes with every core running: do they end up on different
 /// cores?
 ///
@@ -5098,6 +5121,7 @@ pub fn smp_parallel_test(t: &mut Suite) {
 /// comparison fail for a reason that is not about placement. No image in this
 /// tree carries one; the filter is so that the first that does fails loudly
 /// somewhere better than here.
+#[cfg(not(feature = "no-tests"))]
 fn for_each_pt_load(image: &[u8], mut f: impl FnMut(u64, u64)) {
     const PT_LOAD: u32 = 1;
     let u16_at = |off: usize| u16::from_le_bytes([image[off], image[off + 1]]) as usize;
@@ -5125,12 +5149,14 @@ fn for_each_pt_load(image: &[u8], mut f: impl FnMut(u64, u64)) {
 }
 
 /// Count non-empty `PT_LOAD` program headers. See [`for_each_pt_load`].
+#[cfg(not(feature = "no-tests"))]
 fn count_pt_load(image: &[u8]) -> u64 {
     let mut n = 0;
     for_each_pt_load(image, |_, _| n += 1);
     n
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Load a linked ELF image and run it.
 ///
 /// The distinction from the two tests above is the same one Stage F drew
@@ -5331,6 +5357,7 @@ pub fn elf_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Images the loader must refuse, and the reason each one exists.
 ///
 /// Every case is a mutation of the *real* image rather than a hand-written
@@ -5393,6 +5420,7 @@ fn reject_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Run the file/memory syscall probe in ring 3.
 ///
 /// `fd::smoke_test` and `mm::smoke_test` call the same functions from ring 0,
@@ -5542,6 +5570,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
 }
 
 
+#[cfg(not(feature = "no-tests"))]
 /// `clone(CLONE_VM|CLONE_THREAD)` and `futex`, exercised from ring 3.
 ///
 /// Wired 2026-09-06 with the syscalls themselves

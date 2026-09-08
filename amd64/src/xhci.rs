@@ -48,6 +48,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 
 use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_usb::descriptor::{self, TransferType};
 use akuma_usb_storage::{Cbw, Csw, CswStatus, Direction, cdb};
@@ -1392,6 +1393,7 @@ pub fn mbr_looks_right(sector: &[u8]) -> bool {
         && u32::from_le_bytes([sector[454], sector[455], sector[456], sector[457]]) == 2048
 }
 
+#[cfg(not(feature = "no-tests"))]
 pub fn smoke_test(t: &mut Suite, present: bool) {
     if !present {
         t.note("xhci: no controller on this machine", 0);

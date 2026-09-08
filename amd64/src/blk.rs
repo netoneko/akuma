@@ -39,6 +39,7 @@
 //! rather than discarded, so the stage that does want it does not have to
 //! re-derive it.
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use akuma_ryzen_amd64::MmioDevices;
@@ -140,6 +141,7 @@ fn read_reg(slot_va: usize, off: usize) -> u32 {
     unsafe { ((slot_va + off) as *const u32).read_volatile() }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Prove the device is there, then read from it.
 ///
 /// The raw register reads come first and deliberately do not go through

@@ -34,6 +34,7 @@
 
 use akuma_net::NetRuntime;
 use akuma_net::smoltcp_net::StaticIpv4;
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::serial;
@@ -856,6 +857,7 @@ pub fn init_bare_metal(cmdline: &str) -> bool {
     init_loopback_only()
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Check the pieces that do not need a NIC, plus the NIC if there is one.
 pub fn smoke_test(t: &mut Suite, up: bool) {
     // `RDRAND` first, and independently of the stack: it is what `sshd`'s key
@@ -932,6 +934,7 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Stage Q: the netpoll daemon, the loop that was missing.
 ///
 /// Split in two 2026-09-05 (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.30)
@@ -978,6 +981,7 @@ pub fn netpoll_drain_selftest(t: &mut Suite, up: bool) -> bool {
     true
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The spawn half — see [`netpoll_drain_selftest`]'s doc. Only call this once
 /// the drain half has run (`netpoll_drain_selftest` returned `true`) — it
 /// does not check `up` itself.

@@ -24,6 +24,7 @@
 //!   \____________________ PMM `kernel_end` reservation ____________________/
 //! ```
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use akuma_ryzen_amd64::MachineDescription;
@@ -212,6 +213,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     true
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Exercise both allocators enough to prove they actually work.
 ///
 /// A boot that prints "ok" and never allocates has demonstrated that `init`

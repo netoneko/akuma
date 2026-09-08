@@ -27,7 +27,18 @@ KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 # DISK=none boots with no drive, which is the pre-Stage-M shape and still valid.
 DISK="${DISK:-}"
 
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release
+# FEATURES=a,b builds with extra cargo features. The one that matters today is
+# `no-tests`, which compiles the boot suite out — the same opt-in the AArch64
+# devbox and `extreme-size` targets build with. Without a way to boot it from
+# here, that feature could only ever be *compiled*, and a build configuration
+# nobody boots is a build configuration that rots.
+#
+#   FEATURES=no-tests sh amd64/run.sh
+FEATURES="${FEATURES:-}"
+
+# shellcheck disable=SC2086  # deliberately word-split (empty = no flag)
+cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+    ${FEATURES:+--features "$FEATURES"}
 
 # Fail loudly if the PVH note went missing. Without it both loaders silently
 # fall back to a protocol this kernel does not implement, and the symptom is a

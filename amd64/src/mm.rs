@@ -102,6 +102,7 @@ use akuma_mmu::{LeafAction, PteProt};
 use crate::phys::phys_ptr;
 use crate::usermode;
 use akuma_mmap::{MmapRegion, PhysFrame, Prot};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use alloc::vec::Vec;
 
@@ -1016,6 +1017,7 @@ fn dontneed_range(start: usize, end: usize) {
     });
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The refusals and the arithmetic, which are the parts a guest program cannot
 /// easily reach.
 ///
@@ -1109,6 +1111,7 @@ pub fn smoke_test(t: &mut Suite) {
     va_placement_check(t);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// `mremap`: the argument answers, all of which must be decided before a
 /// process is resolved.
 ///
@@ -1172,6 +1175,7 @@ fn mremap_check(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// `madvise`: the errno choices, which are the whole of what this call is for on
 /// a target where nothing but an anonymous mapping is ever lazy.
 ///
@@ -1242,6 +1246,7 @@ fn madvise_check(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// After the boot suite has run real programs: assert the lazy path was taken.
 ///
 /// # Why this check exists
@@ -1267,6 +1272,7 @@ pub fn demand_paging_report(t: &mut Suite) {
     t.check("mmap: the lazy path was actually taken", n > 0);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Pin the VA placer against the shapes that matter: first fit, skip an
 /// occupied range, reuse a hole, and refuse when the window cannot hold it.
 ///

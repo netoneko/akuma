@@ -27,6 +27,21 @@ smp-shared = ["akuma-exec/smp-shared"]
 # unconditional — a deployment that does not want userspace touching the console
 # builds `--no-default-features`.
 console-notify = []
+# Compile the boot self-test suite **out**.
+#
+# The same opt-in the AArch64 kernel has (root `Cargo.toml`), and it means the
+# same thing here: `boot::self_tests` and every `*_test`/`smoke_test` function
+# in `amd64/src` disappear, leaving a kernel that boots straight into `init`.
+# The devbox and `extreme-size` targets build with it on the other
+# architecture; on this one it is what makes the line count honest, because
+# `scripts/cloc_akuma.py` attributes an item to the *test* bucket exactly when
+# its `cfg` cannot hold in a `no-tests` world. Before this feature existed
+# `amd64/src` measured **0.0% test** against ~4 000 lines of boot suite.
+#
+# The initialisation the suite performs inline — the LAPIC, the console fd and
+# the syscall MSRs — is `boot::late_init`, which this build calls instead. See
+# `self_tests`' own header for the rule that keeps the two in step.
+no-tests = []
 
 [dependencies]
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on

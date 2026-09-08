@@ -57,9 +57,14 @@
 //! reaches it through a plain call. Both are in the crate; only one is used
 //! here.
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_threading as threading;
 
+// The scheduler itself does not touch the LAPIC — the timer is started and
+// stopped around `smoke_test`/`block_smoke_test` by `boot::self_tests`, and
+// only those two reach it from here.
+#[cfg(not(feature = "no-tests"))]
 use crate::lapic;
 use crate::paging;
 use crate::smp::{self, NO_CPU};
@@ -1080,6 +1085,7 @@ fn expected_checksum(id: u64) -> u64 {
     acc
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Spawn three tasks, run them to completion, verify.
 pub fn smoke_test(t: &mut Suite) {
     // `init()` is **not** called here any more — `kmain` does it, once, long
@@ -1208,6 +1214,7 @@ fn drive_until(done: &AtomicU64) -> bool {
     done.load(Ordering::Acquire) != 0
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Prove a task can actually **park** — not spin — and that both ways out of a
 /// park work.
 ///

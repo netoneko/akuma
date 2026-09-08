@@ -13,6 +13,7 @@
 //! machine.
 
 use akuma_pci::{Address, Bar, Header, command};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use spinning_top::Spinlock;
 
@@ -314,6 +315,7 @@ fn put_bdf(addr: Address) {
     serial::put_hexn(u64::from(addr.function), 1);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Verify the enumeration ran and parsed something coherent.
 ///
 /// On a VMM target there is no PCI bus and finding zero devices is a pass —

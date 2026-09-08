@@ -21,6 +21,7 @@
 //! GRUB entry that runs `busybox reboot`.
 
 use akuma_boot::{Action, decode};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::fd::errno;
@@ -111,6 +112,7 @@ pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> u64 {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Verify the decode and the syscall's rejection path without rebooting.
 pub fn smoke_test(t: &mut Suite) {
     use akuma_boot::{

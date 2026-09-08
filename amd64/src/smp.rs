@@ -68,6 +68,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use akuma_ryzen_amd64::acpi::Madt;
 use akuma_ryzen_amd64::MachineDescription;
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::phys::phys_ptr;
@@ -798,6 +799,7 @@ extern "C" fn worker3() -> ! {
     worker_body(3);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Prove the secondaries are up, ticking, and scheduling.
 ///
 /// Three properties, each of which fails independently:

@@ -306,8 +306,17 @@ FAIL   smapsdirty             NOT REACHED — the run stopped before this probe
 That is the pre-existing `CLONE_VM` TLB race
 (`docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md` § "The open issue"), the same
 `NO END MARKER` signature slice 1 recorded at 1-fail-in-2, and the hand-off says
-to score it against its own rate rather than against 8/10. 1-in-4 here is inside
-that. Worth stating separately because the *shape* misleads: a `cowstale` hang
+to score it against its own rate rather than against 8/10. So the rate was
+measured on both trees rather than assumed, in a worktree at `0f1b715a`:
+
+| tree | clean runs |
+|---|---|
+| baseline `0f1b715a` | **2 of 4** |
+| this tree | **3 of 4** |
+
+Same signature, same probe, same rig. The flake is pre-existing and this slice
+did not make it worse — which is what "score it against its own rate" means and
+is not something a single run of either arm could have said. Worth stating separately because the *shape* misleads: a `cowstale` hang
 takes the two probes after it down as `NOT REACHED`, so one flake reads as three
 failures.
 

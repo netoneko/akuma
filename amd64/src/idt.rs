@@ -45,6 +45,7 @@
 
 use crate::paging::{self, MemAttr, PageFaultCode, PteProt};
 use crate::phys::phys_ptr;
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 use crate::serial;
@@ -809,6 +810,7 @@ fn disarm_lazy() {
     LAZY_LEN.store(0, Ordering::Relaxed);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Take a fault on purpose and service it.
 ///
 /// Chosen VA is 2 GiB — outside the identity map *and* clear of the 1 GiB
@@ -881,6 +883,7 @@ pub fn smoke_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Exercise the user-copy fault recovery for real: take a page fault inside
 /// `__arch_copy_user_memory` on purpose and check the kernel gets `EFAULT` back
 /// instead of halting.

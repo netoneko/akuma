@@ -30,9 +30,12 @@
 //! property is itself worth pinning, and `translate`-after-`map` is what pins
 //! it.
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_mmu::{user_flags, UserAddressSpace};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
+#[cfg(not(feature = "no-tests"))]
 use crate::phys::phys_ptr;
 
 /// A VA in the lower half, clear of anything the kernel maps. The address space
@@ -53,6 +56,7 @@ const PTE_COW: u64 = 1 << 9;
 const PTE_NX: u64 = 1 << 63;
 const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
+#[cfg(not(feature = "no-tests"))]
 pub fn smoke_test(t: &mut Suite) {
     let Some(mut uas) = UserAddressSpace::new() else {
         t.check("uas: new", false);
@@ -218,6 +222,7 @@ pub fn smoke_test(t: &mut Suite) {
     drop_returns_frames_test(t);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The walk refuses a virtual address in the kernel's half — on **both** map
 /// entry points, and without allocating a page table on the way to saying no.
 ///
@@ -312,6 +317,7 @@ fn upper_half_refusal_test(t: &mut Suite) {
     akuma_pmm::free_page(frame.addr, 0);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The PTE-level entry points step 5a added, and the CoW marker they carry.
 ///
 /// `map_page`/`alloc_and_map` above take an **AArch64** flag word and decode it
@@ -394,6 +400,7 @@ fn pte_level_test(t: &mut Suite) {
     akuma_pmm::free_page(fresh, 0);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// `UserAddressSpace::drop` hands every frame it holds back to the PMM.
 ///
 /// The destructor is what step 5a replaced `Process::free`'s
@@ -447,6 +454,7 @@ fn drop_returns_frames_test(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The three range walks C1 step 5a needs, on a private address space.
 ///
 /// These are the one capability `akuma-mmu` did not have and `amd64/src/mm.rs`
@@ -599,6 +607,7 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The per-core live-L0 registry `UserAddressSpace::drop` gates on.
 ///
 /// **This is the prerequisite for letting an address space drop at all on this

@@ -70,6 +70,7 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
 /// Non-zero once [`init_smap`] has set `CR4.SMAP`. `#[no_mangle]` because the
@@ -403,6 +404,7 @@ pub fn read_cstr(ptr: u64, max: usize) -> Option<Vec<u8>> {
     None
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Prove `CR0.WP` is enforcing, and that a kernel write to a shared page breaks
 /// the sharing rather than corrupting the peer.
 ///
@@ -521,6 +523,7 @@ fn write_protect_check(t: &mut Suite) {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Prove SMAP is enforcing, not just enabled.
 ///
 /// Maps one **user-accessible** page (`PteProt::USER_RW`), then:

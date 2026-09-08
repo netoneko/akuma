@@ -17,6 +17,19 @@
 #![no_main]
 #![feature(alloc_error_handler)]
 #![feature(abi_x86_interrupt)]
+// A `no-tests` build has no boot suite, and the suite is the **only** caller of
+// a number of ordinary kernel accessors — `paging::translate`, `unmap_page`,
+// `lapic::stop_timer`, `sched::{preemptions, blocks, wakes, is_blocked}`,
+// `fs::mount_count` and friends. Those are the kernel's own surface, not test
+// code: gating them behind `not(feature = "no-tests")` would file them in the
+// test bucket, which is a lie about what they are, and deleting them would
+// throw away API the tested build exercises on every boot.
+//
+// So: allow them to be unreferenced in this configuration, and gate only what
+// exists *for* the suite (the hand-assembled user programs, the embedded probe
+// ELFs, the test-process helpers, the independent ELF re-reader). That split is
+// what makes `scripts/cloc_akuma.py` honest here rather than merely flattering.
+#![cfg_attr(feature = "no-tests", allow(dead_code, unused_imports))]
 
 extern crate alloc;
 
@@ -239,13 +252,37 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // dnsmasq on the Firecracker host (`amd64/net-setup.sh`).
     let have_net = net::init(true);
 
+    // No suite in this build: `boot::late_init` is the bring-up the suite would
+    // otherwise have performed on the way past, and the same call the
+    // multiboot2 path's `skiptests` lever makes. The secondaries' `keep_out` is
+    // the PVH start-info block and its command line — what might be sitting on
+    // the trampoline page differs by boot protocol, which is why it is a hook.
+    #[cfg(feature = "no-tests")]
+    {
+        let si = &machine.start_info;
+        boot::late_init(|| {
+            let keep_out = [
+                (si.addr, si.addr + 4096),
+                (si.cmdline_paddr, si.cmdline_paddr + 4096),
+            ];
+            if !cmdline.split_ascii_whitespace().any(|w| w == "nosmp")
+                && smp::trampoline_page_available(&machine, &keep_out)
+            {
+                smp::start_secondaries(machine.madt.as_ref());
+            }
+        });
+    }
+
+    #[cfg(not(feature = "no-tests"))]
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
     // The whole suite, shared with the multiboot2 entry point. It was written
     // out separately in both until 2026-09-07, and the two lists had drifted —
     // the bare-metal path was not running `fork`, `execve`, `spawn`, busybox,
     // `blk` or the scheduler's park tests at all. See `boot::self_tests`.
+    #[cfg(not(feature = "no-tests"))]
     let si = &machine.start_info;
+    #[cfg(not(feature = "no-tests"))]
     let verdict = boot::self_tests(
         &mut t,
         &boot::SuiteCtx {
@@ -265,8 +302,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             ],
         },
     );
-    let passed = verdict.passed;
-    if passed {
+    #[cfg(not(feature = "no-tests"))]
+    if verdict.passed {
         serial::puts("Akuma/amd64 — all self-tests passed\n");
     } else {
         serial::puts("Akuma/amd64 — SELF-TESTS FAILED\n");

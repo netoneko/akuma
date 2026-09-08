@@ -77,6 +77,7 @@
 //! the next boot unchanged.
 
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
+#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_vfs::FsError;
 use alloc::sync::Arc;
@@ -92,6 +93,12 @@ use crate::serial;
 /// `Option`; the callers converted rather than the crate being re-wrapped,
 /// because an `Option` throws away *which* error the VFS reported and
 /// `EROFS`-vs-`ENOENT` is now a distinction this layer can make.
+// `read_at` has only ever had one caller in this kernel — `fs::smoke_test` —
+// so a `no-tests` build re-exports something nothing names. It stays in the
+// list: this is the module's public VFS surface, and thinning it by which
+// arms happen to be wired today is how a re-export set drifts from the thing
+// it is re-exporting.
+#[allow(unused_imports)]
 pub use akuma_vfs_glue::{
     create_dir, create_symlink, exists, list_dir, metadata, read_at, read_file, read_symlink,
     remove_dir, remove_file, rename, resolve_symlinks, set_times, stats_for_path, write_file,
@@ -360,6 +367,7 @@ pub fn mount_count() -> usize {
     buf[..n].iter().filter(|&&b| b == b'\n').count()
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// Mount, then prove the filesystem can be read.
 pub fn smoke_test(t: &mut Suite, mounted: bool) {
     if !t.check("fs: ext2 mounted", mounted) {
@@ -427,6 +435,7 @@ pub fn smoke_test(t: &mut Suite, mounted: bool) {
     mount_table_smoke_test(t);
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The path walk this target gained with `akuma-vfs-glue` (C1 step 4a).
 ///
 /// The private mount table resolved whatever string it was handed. Every check
@@ -491,6 +500,7 @@ fn path_walk_smoke_test(t: &mut Suite) {
     }
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The synthetic `/dev`, and exactly how far it goes.
 ///
 /// `AKUMA_SELF_HOSTING_AMD64.md` open issue 2 is "`/dev` does not exist on this
@@ -532,6 +542,7 @@ fn dev_smoke_test(t: &mut Suite) {
     t.check("dev: reading a device node's bytes is still unwired", read_file("/dev/null").is_err());
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// The mount table, `/proc/mounts` and `statfs` — the three things that stopped
 /// being one hardcoded root.
 ///
