@@ -3358,6 +3358,37 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let new_stack = next.stack;
     let stack_bottom = (ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096)) as usize;
 
+    // **POSIX: `execve` destroys every other thread of the calling process.**
+    // This target did not, and slice 4 is what made the omission concrete: the
+    // address space the swap below replaces and frees is the one a `CLONE_VM`
+    // sibling is still executing in. `free_or_defer_as_frames` parks the frames
+    // while another core's `CR3` stands on that L0, so the sibling is not
+    // reading freed memory — it is running the *old program* in a process that
+    // has become a different one, and the parked frames come back only when it
+    // finally leaves. `akuma-exec`'s own `replace_image` calls
+    // `kill_exec_siblings` at exactly this point, and this is that.
+    //
+    // `drain` sets the group-exit flag, wakes every sibling so a parked
+    // `FUTEX_WAIT` does not have to wait out the scheduler backstop, and spins
+    // (bounded) until none is live. It is safe to yield here: the new image is
+    // built but nothing has been swapped, so a failure at this point leaves the
+    // caller's own image untouched. `clear_group_exiting` below is what lets
+    // the new program's first thread run.
+    //
+    // **Only from the main thread**, and the restriction is carried rather than
+    // hidden: `THREADS` holds non-main threads, so `live_count` includes a
+    // *non-leader* caller and `drain` would spin its full budget waiting for
+    // the thread that is calling it, then print `DRAIN INCOMPLETE`. POSIX says
+    // that caller becomes the group leader and the others die — leader transfer
+    // is a thing this target's thread model does not have, so the honest
+    // behaviour for that case is the one it has always had, said out loud.
+    if crate::thread::current_is_main() {
+        crate::thread::drain(slot);
+    } else if crate::thread::live_count(slot) > 1 {
+        serial::puts("  [execve] from a non-leader thread with live siblings; \
+                      they are not killed (no leader transfer on this target)\n");
+    }
+
     // Built **before** the hold below. `with_process` runs its closure with
     // interrupts disabled and states that it must not allocate on the heap, so
     // everything that allocates is done here and only moved in there.

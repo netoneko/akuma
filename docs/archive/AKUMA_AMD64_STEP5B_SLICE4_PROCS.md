@@ -287,6 +287,14 @@ having built it before this refactor: `sys_waitpid` has now been rewritten twice
 since it was fixed, and that probe is what says the rewrites preserved the fix
 (`AKUMA_AMD64_WAIT4_OWNERSHIP.md`).
 
+> **Follow-up, 2026-09-09** — the `CLONE_VM`-sibling divergence this slice
+> documented in `sys_execve`'s comment ("a sibling, which this target does not
+> terminate on `execve`") is **closed**: `execve` drains the thread group before
+> the swap now, the way `replace_image`'s `kill_exec_siblings` does. Found by
+> surveying 5c, which is where the rest of that survey lives —
+> `AKUMA_AMD64_C1_5C_SURVEY.md`, including why `fork` cannot be folded at all
+> until there is an x86 arm of the ring-3 entry path.
+
 Also checked by hand on a live guest: `ps` renders real commands, `/proc/1/cmdline`
 is `/bin/sshd`, `/proc/self/{statm,maps}`, `free`, `df`, `uptime` and
 `/proc/net/dev` all answer, and the stock dynamic busybox (`/bin/busybox.dyn`,

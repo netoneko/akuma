@@ -559,12 +559,40 @@ as they stand one day after the survey
 > — whose stated blocker was literally "C1 step 5: PROCS folds into akuma-exec"
 > — is wired.
 >
-> **Next in C1 is 5c**: `fork`/`execve`/`wait4`/`clone` onto `akuma-exec`'s own
-> `children.rs`/`spawn.rs`/`exec.rs`. Slice 4 is what makes it writable — those
-> four now read one process table instead of two — and it carries one known
-> divergence to close on the way: `replace_image` calls `kill_exec_siblings`
-> and this target's `execve` does not, so a `CLONE_VM` sibling keeps running in
-> a space that has just been replaced.
+> **5c was surveyed and is not a fold** (2026-09-09) —
+> `AKUMA_AMD64_C1_5C_SURVEY.md`. `fork_process`'s tail builds an AArch64
+> `UserContext` — `x0`, `spsr`, `ttbr0` — and hands it to
+> `spawn_child_thread_and_publish`, which enters userspace by `eret`ing from it.
+> amd64 has no `eret`: a `fork` child here is a scheduler task whose first entry
+> is `enter_user_mode_forked`, reading the **x86** register file out of its own
+> `UserCtx`. Folding `fork` therefore means giving that function an
+> architecture seam for "start this process's first ring-3 entry" — the entry
+> seam, sized like 5b rather than like a slice of it. `execve` is closer and
+> still not free (`replace_image` maps a mandatory ProcessInfo page and pushes
+> lazy regions, both of which this target deliberately does without). `wait4`
+> **does** have a fold target — `akuma_syscalls_glue::proc::sys_wait4`, and glue
+> is what C1 folds into — but every primitive it stands on
+> (`is_child_of_group`, `get_child_channel`, `has_children`,
+> `reap_child_channel`) reads `children.rs`'s `CHILD_CHANNELS`, which this
+> target never writes: it registers `channel: None` and calls
+> `register_child_channel` nowhere, so a folded `wait4` would answer `ECHILD` to
+> everything. amd64's own `sys_waitpid` reads `exited`/`exit_code`/`parent_pid`
+> off the registered `Process` instead — two different sources for one question,
+> so closing it is a design decision (populate the map, or teach glue to read
+> the process) rather than a move. C2 either way.
+>
+> One real divergence did close on the way: `replace_image` opens with
+> `kill_exec_siblings` and this target's `execve` did nothing, so a `CLONE_VM`
+> sibling kept running in the address space `execve` had just replaced and
+> freed. Not a use-after-free — `free_or_defer_as_frames` parks the frames while
+> another core's `CR3` stands on that L0, which is why it had gone unnoticed —
+> but the sibling runs the *old program* in a process that has become a
+> different one. `sys_execve` drains the group before the swap now. Verified on
+> all four rigs including the metal (515/0, 30/30 ring-3 sessions).
+>
+> **So C1's remaining work is two independent pieces, neither of them "5c":**
+> the **ring-3 entry seam** (unblocks `fork`, then `clone`), and **C2** (`fd.rs`
+> into glue, which unblocks `Spawn`'s four stdio fields and with them `wait4`).
 
 Measurements as of 2026-09-07:
 
@@ -813,10 +841,13 @@ parity with what the AArch64 self-host already proves.
   │  ✔ 6    loader.rs placement → akuma-elf load half              │
   │  ✔ 5b   PROCS → akuma-exec, in four slices: register /         │
   │           identity+lifecycle / mount /proc / delete PROCS      │
-  │  ✖ 5c   fork/execve/wait4/clone → children.rs/spawn.rs/exec.rs │
   │  ✖ 4b   the remaining VFS arms → glue                          │
-  │  ✖ Spawn itself: its four stdio fields ARE crate::pipe, so it  │
-  │           cannot go until C2. A wall, not a backlog.           │
+  │  ✖ THE RING-3 ENTRY SEAM — an x86 arm for "enter userspace     │
+  │           with this process's first context". fork_process     │
+  │           `eret`s from a UserContext; amd64 has no eret. This  │
+  │           is what "5c" turned out to be, and it is 5b-sized.   │
+  │  ✖ Spawn itself, and wait4 with it: those four stdio fields    │
+  │           ARE crate::pipe, so they cannot go until C2.         │
   │   keeps: syscall/sysret asm, swapgs bracketing (= el0-entry    │
   │          shape on AArch64)                                     │
   └──────────────┬───────────────────┬─────────────────────────────┘
