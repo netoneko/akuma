@@ -2606,25 +2606,10 @@ use crate::pipe::{self, PipeId};
 /// One spawned child. Indexed by `proc_slot - SPAWN_SLOT_BASE`.
 struct Spawn {
     pid: u32,
-    /// The pid of whoever called `spawn`/`fork`. `ps` prints this as PPID, and
-    /// without it every process looked like a child of init.
-    ppid: u32,
-    /// argv as `/proc/<pid>/cmdline` wants it: each element NUL-terminated.
-    ///
-    /// Kept because it is the **only** copy — `sys_spawn`/`sys_execve` parse
-    /// argv, hand it to the ELF loader, which writes it onto the child's
-    /// initial stack and drops the kernel-side vector. Reading it back out of
-    /// the child's stack later is not possible: the program is free to
-    /// overwrite it, and by the time `ps` asks, a shell has. Bounded at
-    /// [`CMDLINE_MAX`] so a pathological argv cannot grow the process table.
-    cmdline: alloc::vec::Vec<u8>,
     /// The child writes fd 1/2 here; the parent's `stdout_fd` reads it.
     stdout_pipe: PipeId,
     /// The child reads fd 0 here; `/proc/<pid>/fd/0` writes it.
     stdin_pipe: PipeId,
-    /// `Some` once the child has left ring 3. `waitpid` consumes it and frees
-    /// the slot and both pipes.
-    exit: Option<i32>,
     /// The pipes above belong to another `Spawn` (the `fork` parent's): this
     /// child shares its stdio and must not close or free them on teardown.
     borrowed_io: bool,
@@ -2769,57 +2754,89 @@ fn set_init_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) {
     *INIT_CMDLINE.lock() = flatten_cmdline(args);
 }
 
-/// Init, as a [`ProcEntry`]. Always present: pid 1 exists from the moment
-/// `run_init` succeeds until the machine stops.
-fn init_entry() -> ProcEntry {
-    let cmdline = INIT_CMDLINE.lock().clone();
-    ProcEntry {
-        pid: 1,
-        // Linux gives init ppid 0, and `ps` renders that as the tree root.
-        ppid: 0,
-        exit: None,
-        cmdline: if cmdline.is_empty() { alloc::vec![b'i', b'n', b'i', b't', 0] } else { cmdline },
-    }
-}
-
-/// Every live process, init first. What `getdents64("/proc")` enumerates.
+/// Every live process. What `getdents64("/proc")` enumerates.
 ///
-/// A *reaped* child is not here — `waitpid` clears its slot, and Linux drops the
+/// A *reaped* child is not here — `waitpid` unregisters it, and Linux drops the
 /// directory at the same point. A child that has exited but not been reaped is,
 /// as a zombie, which is exactly what `ps` is for.
 #[must_use]
 pub fn proc_list() -> alloc::vec::Vec<ProcEntry> {
     let mut out = alloc::vec::Vec::new();
-    out.push(init_entry());
-    // SAFETY: raw-pointer read; single core, and no entry is mutated here.
-    unsafe {
-        for slot in (*spawn_table()).iter().flatten() {
-            out.push(ProcEntry {
-                pid: slot.pid,
-                ppid: slot.ppid,
-                exit: slot.exit,
-                cmdline: slot.cmdline.clone(),
-            });
-        }
-    }
+    // 5b slice 2: rendered from `akuma-exec`'s process table, not from the
+    // spawn row. Init is in that table too (`run_init` registers pid 1), so
+    // unlike the spawn-table version this needs no synthetic first entry — the
+    // `init_entry()` special case existed only because init had no row.
+    akuma_exec::process::for_each_process(|p| {
+        out.push(proc_entry_of(p));
+    });
     out
+}
+
+/// One `akuma-exec` `Process` as this target's `/proc` reader wants it.
+///
+/// The two renderings this replaces (`proc_list`, `proc_by_pid`) read the same
+/// fields, so they read them through one function: they disagreed once already
+/// — `proc_by_pid` special-cased init and `proc_list` pushed it separately —
+/// and that is the kind of drift a shared accessor makes impossible rather than
+/// unlikely.
+fn proc_entry_of(p: &akuma_exec::process::Process) -> ProcEntry {
+    use core::sync::atomic::Ordering;
+    let img = p.image.lock();
+    // `image.args` is `Vec<String>`; `/proc/<pid>/cmdline` is NUL-terminated
+    // bytes. Rebuilt here rather than stored twice.
+    let mut cmdline = alloc::vec::Vec::new();
+    for a in &img.args {
+        cmdline.extend_from_slice(a.as_bytes());
+        cmdline.push(0);
+    }
+    if cmdline.is_empty() {
+        cmdline.extend_from_slice(img.name.as_bytes());
+        cmdline.push(0);
+    }
+    ProcEntry {
+        pid: p.pid,
+        ppid: p.parent_pid,
+        // A process that has exited but not been reaped is a zombie, and `ps`
+        // exists to show it. `exited`/`exit_code` are the atomics `akuma-exec`
+        // keeps for exactly this, and they carry the same meaning as the spawn
+        // row's `Option<i32>`: `None` until it leaves ring 3.
+        exit: p
+            .exited
+            .load(Ordering::Acquire)
+            .then(|| p.exit_code.load(Ordering::Acquire)),
+        cmdline,
+    }
 }
 
 /// One process by pid, or `None` if no such process is live.
 #[must_use]
 pub fn proc_by_pid(pid: u32) -> Option<ProcEntry> {
+    // 5b slice 2: one table, and init is in it — `run_init` registers pid 1,
+    // so no special case is needed *once the machine is running*.
+    if let Some(e) = akuma_exec::process::find_process(|p| (p.pid == pid).then(|| proc_entry_of(p)))
+    {
+        return Some(e);
+    }
+    // ...but the boot self-tests run **before** `run_init`, on a task that is
+    // registered nowhere, and `current_pid()` answers 1 for it. So every
+    // `/proc/self` check in the suite asks for a pid 1 that does not exist yet.
+    //
+    // This fallback is that window and nothing else, which is why it is here
+    // rather than a `pid == 1` arm ahead of the lookup: once init is registered
+    // the table answers first and this is dead. Removing it during slice 2
+    // failed three `proc: /proc/self/...` checks immediately — the synthetic
+    // entry it replaces was load-bearing for a reason nobody had written down.
     if pid == 1 {
-        return Some(init_entry());
+        let cmdline = INIT_CMDLINE.lock().clone();
+        return Some(ProcEntry {
+            pid: 1,
+            // Linux gives init ppid 0, and `ps` renders that as the tree root.
+            ppid: 0,
+            exit: None,
+            cmdline: if cmdline.is_empty() { alloc::vec![b'i', b'n', b'i', b't', 0] } else { cmdline },
+        });
     }
-    // SAFETY: raw-pointer read; single core.
-    unsafe {
-        (*spawn_table()).iter().flatten().find(|s| s.pid == pid).map(|s| ProcEntry {
-            pid: s.pid,
-            ppid: s.ppid,
-            exit: s.exit,
-            cmdline: s.cmdline.clone(),
-        })
-    }
+    None
 }
 
 /// The pid of the process making the current syscall — what `/proc/self`
@@ -2827,17 +2844,21 @@ pub fn proc_by_pid(pid: u32) -> Option<ProcEntry> {
 /// `getpid`, which returns 1 on this target for exactly the same reason.
 #[must_use]
 pub fn current_pid() -> u32 {
-    let slot = current_proc_slot();
-    if slot < SPAWN_SLOT_BASE || slot == usize::MAX {
-        return 1;
-    }
-    // SAFETY: raw-pointer read; single core.
-    unsafe {
-        (*spawn_table())
-            .get(slot - SPAWN_SLOT_BASE)
-            .and_then(|s| s.as_ref())
-            .map_or(1, |s| s.pid)
-    }
+    // 5b slice 2: through `akuma-exec`'s `THREAD_PID_MAP`, which slice 1
+    // populates at every fork/spawn/execve/`run_init` and slice 2 extended to
+    // `clone_thread`. This *is* the identity `current_process_shared()` uses,
+    // so the two can no longer disagree — before, the spawn table answered here
+    // and the map answered there, and nothing checked them against each other.
+    //
+    // The key is the scheduler task slot, because on this target the tid **is**
+    // that slot. A thread resolves to its process's pid, which is what makes
+    // this correct for `CLONE_VM` where the old slot walk was correct by a
+    // different route (the shared `proc_slot` in the per-CPU `UserCtx`).
+    //
+    // Unmapped means init: the self-tests run before `run_init` registers
+    // anything, and they are pid 1's work. That is the same answer the slot
+    // walk gave for `slot < SPAWN_SLOT_BASE`.
+    akuma_exec::process::pid_for_thread(crate::sched::current_task()).unwrap_or(1)
 }
 
 fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
@@ -2942,6 +2963,7 @@ fn register_exec_process(
     root: u64,
     image_top: u64,
     name: &str,
+    cmdline: &[u8],
 ) {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
@@ -2971,7 +2993,25 @@ fn register_exec_process(
         ),
         image: Spinlock::new(ProcessImage {
             name: String::from(name),
-            args: Vec::new(),
+            // 5b slice 2: the argument vector, so `/proc/<pid>/cmdline` can be
+            // rendered from the registered process rather than from the spawn
+            // row. Slice 1 left this empty, which was invisible only because
+            // nothing read it yet — moving the procfs readers over without
+            // filling it would have blanked every `ps` COMMAND column, the
+            // exact shape of silent divergence the fold is supposed to avoid.
+            //
+            // The wire format is the one `Spawn::cmdline` already carries and
+            // `/proc/<pid>/cmdline` wants: each argument NUL-terminated. A
+            // trailing NUL therefore yields an empty final element, which
+            // `split` produces and `filter` drops. Non-UTF-8 argv is possible
+            // on Linux and impossible in a `String`, so it is lossy-converted
+            // rather than dropped — a mangled argument still identifies the
+            // process; a missing one does not.
+            args: cmdline
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect(),
             context: UserContext::new(0, 0),
         }),
         parent_pid: ppid,
@@ -3146,17 +3186,22 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
+    // Recorded once and used twice: the spawn row below and, since 5b slice 2,
+    // the registered `Process`'s `image.args` — the two renderings of
+    // `/proc/<pid>/cmdline` must not be able to disagree about the same exec.
+    let exec_cmdline = flatten_cmdline(argv_refs.iter().copied());
+
     // `/proc/<pid>/cmdline` follows the new image. Without this, `ps` reported
     // every process under the name of whatever `fork`ed it — a shell session
     // showed a column of `sh`, which is the shape that makes `ps` useless
     // rather than merely incomplete.
+    //
+    // 5b slice 2: the spawn row no longer carries a copy. `Spawn::cmdline`
+    // became write-only the moment the procfs readers moved onto `akuma-exec`,
+    // so the field is gone and this refreshes the registered `Process` only —
+    // one copy of argv per process instead of two, and no way for them to
+    // disagree about what a process is running.
     if slot >= SPAWN_SLOT_BASE {
-        // SAFETY: raw-pointer access; single core, this task's own slot.
-        unsafe {
-            if let Some(Some(sp)) = (*spawn_table()).get_mut(slot - SPAWN_SLOT_BASE) {
-                sp.cmdline = flatten_cmdline(argv_refs.iter().copied());
-            }
-        }
         // 5b slice 1: the registered `akuma-exec` `Process` follows the image
         // too. Its `new_shared` address-space view names the *old* root — which
         // `run_process`'s swap is about to free — so it is re-pointed at the
@@ -3193,15 +3238,21 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             .is_some()
         };
         if !refreshed {
-            let (ppid, exec_slot) = {
+            // 5b slice 2: the parent link comes from the registered process,
+            // which is now the only writer of it. The task slot still comes
+            // from the spawn row — that is this target's own bookkeeping and
+            // `akuma-exec` has no home for it until the fd surface folds.
+            let ppid = akuma_exec::process::find_process(|p| (p.pid == pid).then_some(p.parent_pid))
+                .unwrap_or(1);
+            let exec_slot = {
                 // SAFETY: raw-pointer read; single core, this task's own row.
                 unsafe {
                     (*spawn_table())[slot - SPAWN_SLOT_BASE]
                         .as_ref()
-                        .map_or((1, usize::MAX), |sp| (sp.ppid, sp.exec_slot))
+                        .map_or(usize::MAX, |sp| sp.exec_slot)
                 }
             };
-            register_exec_process(pid, ppid, exec_slot, new_root, new_brk, &new_name);
+            register_exec_process(pid, ppid, exec_slot, new_root, new_brk, &new_name, &exec_cmdline);
         }
     }
 
@@ -3368,24 +3419,6 @@ fn sys_fork() -> u64 {
     crate::sched::publish_task(task_slot);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
-    // SAFETY: raw-pointer write; single core.
-    unsafe {
-        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
-            pid,
-            ppid: parent_pid,
-            // A `fork` child runs the parent's image until it `execve`s, so it
-            // shows the parent's command line — exactly as on Linux, and the
-            // reason `ps` briefly lists two `sh`s during a pipeline.
-            cmdline: parent_cmdline,
-            stdout_pipe,
-            stdin_pipe,
-            exit: None,
-            borrowed_io: true,
-            console_io,
-            exec_slot: task_slot,
-        });
-    }
-
     // 5b slice 1: the child exists as an identity, not just a mechanism. The
     // task is already published, so there is a window where the child's
     // syscalls resolve identity as they did before this slice (`None`); the
@@ -3406,7 +3439,23 @@ fn sys_fork() -> u64 {
             |p| alloc::string::String::from(p.name())
             )
             .as_str(),
+        // A `fork` child runs the parent's image until it `execve`s, so it
+        // shows the parent's command line — the same rule the `Spawn` row's
+        // `cmdline` field states, and the reason `ps` briefly lists two `sh`s.
+        &parent_cmdline,
     );
+
+    // SAFETY: raw-pointer write; single core.
+    unsafe {
+        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
+            pid,
+            stdout_pipe,
+            stdin_pipe,
+            borrowed_io: true,
+            console_io,
+            exec_slot: task_slot,
+        });
+    }
 
     u64::from(pid)
 }
@@ -3517,21 +3566,6 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     };
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
-    // SAFETY: raw-pointer write; single core.
-    unsafe {
-        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
-            pid,
-            ppid: spawner_pid,
-            cmdline: spawn_cmdline,
-            stdout_pipe,
-            stdin_pipe,
-            exit: None,
-            borrowed_io: false,
-            console_io: false,
-            exec_slot: task_slot,
-        });
-    }
-
     // 5b slice 1: register the child with `akuma-exec`'s process table and
     // publish `task_slot → pid`, so `current_process_shared()` resolves for
     // this child from its first (post-registration) syscall. The heap starts
@@ -3544,7 +3578,20 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         root,
         img.end_va,
         core::str::from_utf8(argv_refs[0]).unwrap_or("spawn"),
+        &spawn_cmdline,
     );
+
+    // SAFETY: raw-pointer write; single core.
+    unsafe {
+        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
+            pid,
+            stdout_pipe,
+            stdin_pipe,
+            borrowed_io: false,
+            console_io: false,
+            exec_slot: task_slot,
+        });
+    }
 
     let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false);
     let Some(stdout_fd) = stdout_fd else {
@@ -3618,7 +3665,11 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     let dying = unsafe {
         let mut dying = 0;
         if let Some(Some(s)) = (*spawn_table()).get_mut(proc_slot - SPAWN_SLOT_BASE) {
-            s.exit = Some(status);
+            // 5b slice 2: the status itself is published on the registered
+            // process below — the row carried a second copy of it until the
+            // wait moved off the spawn table, and two copies of an exit status
+            // is exactly the drift this slice exists to remove. The row is read
+            // here only for the pid that names the process.
             dying = s.pid;
             // A `fork` child that shares its parent's stdio must not close the
             // parent's stdout — the parent (and every later command it runs)
@@ -3643,13 +3694,27 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     // by whatever runs as init — which on this target is the console shell or
     // `sshd`, both of which do reap.
     if dying != 0 {
-        // SAFETY: raw-pointer access; single core, and only `ppid` is written.
-        unsafe {
-            for row in (*spawn_table()).iter_mut().flatten() {
-                if row.ppid == dying {
-                    row.ppid = 1;
-                }
-            }
+        // 5b slice 2: the exit status becomes visible on the **registered**
+        // process, which is what `sys_waitpid` now reads. Set before the wake
+        // for the same reason the row's was: a parent woken by `wait4_wake_all`
+        // re-runs `sys_waitpid` immediately and must find this already true.
+        akuma_exec::process::with_process(dying, |p| {
+            p.exit_code.store(status, core::sync::atomic::Ordering::Release);
+            p.exited.store(true, core::sync::atomic::Ordering::Release);
+        });
+        // Reparent this process's children onto init, the way Linux does at
+        // exit — on the same table that answers the wait, so a child cannot be
+        // reparented in one view and orphaned in the other.
+        //
+        // Two passes rather than a mutation inside `for_each_process`, which
+        // hands out `&Process`: writing through that reference would need a
+        // const-to-mut cast, and `with_process` is the accessor that exists so
+        // it does not have to be. The `Vec` is empty for a process with no
+        // children — which is nearly all of them — and `Vec::new` does not
+        // allocate until something is pushed, so the common exit path stays
+        // allocation-free.
+        for orphan in akuma_exec::process::collect_pids(|p| p.parent_pid == dying) {
+            akuma_exec::process::with_process(orphan, |p| p.parent_pid = 1);
         }
     }
     // Outside the `unsafe` block and after the status is recorded, both
@@ -3732,35 +3797,30 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
 /// while it is still running, `-ESRCH` for an unknown pid.
 pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     use crate::fd::errno;
+    use core::sync::atomic::Ordering;
     let want = pid as u32;
     // `wait4(-1)` / `waitpid(0)` — any child. `-1` arrives as `u32::MAX`.
     let any = want == u32::MAX || want == 0;
-    // **Whose** children. The spawn table is global — every live process on
-    // this target has a row in it, not just the caller's descendants — so a
-    // scan without this filter answers "are there any processes?" instead of
-    // "do I have any children?".
+    // **Whose** children. Answered by `akuma-exec`'s process table since 5b
+    // slice 2; it was the global spawn table, which has a row for every live
+    // process rather than for the caller's descendants — so a scan without a
+    // parent filter answered "are there any processes?" instead of "do I have
+    // any children?".
     //
     // That was a hang, and a bad one: a subshell (`( ls; true )`) forks `ls`,
-    // reaps it, and asks once more. Its own row is still in the table, owned by
-    // the shell above it, so the unfiltered scan said "a child exists, none has
-    // exited" — the process saw *itself* as its unexited child and the `Wait4`
-    // arm parked it forever. The shell above then waited on the subshell, the
-    // ssh session never tore down, and on the bare-metal box the machine needed
-    // a power cycle. `( ls )` alone was fine only because ash execs the last
-    // command of a subshell in place and so never waits at all.
-    //
-    // `ppid` is set from `current_pid()` by both of the two `Spawn`
-    // constructors (`sys_fork`, `sys_spawn`) and by nothing else, so it is safe
-    // to read here for a *refusal* — the rule that
-    // `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` exists for.
+    // reaps it, and asks once more. Its own row was still there, so the scan
+    // said "a child exists, none has exited" — the process saw *itself* as its
+    // unexited child and the `Wait4` arm parked it forever
+    // (`docs/archive/AKUMA_AMD64_WAIT4_OWNERSHIP.md`). Moving the question onto
+    // the registered process keeps the filter and drops the second copy of the
+    // parent link: `parent_pid` is now the only place it is written.
     let me = current_pid();
-    let mine = |s: &Spawn| s.ppid == me && (any || s.pid == want);
-
-    // SAFETY: raw-pointer read; single core.
-    let table = unsafe { &*spawn_table() };
 
     // Does any matching child exist at all? (For the `-ECHILD` vs `0` decision.)
-    let exists = table.iter().any(|e| e.as_ref().is_some_and(&mine));
+    let exists = akuma_exec::process::find_process(|p| {
+        (p.parent_pid == me && (any || p.pid == want)).then_some(())
+    })
+    .is_some();
     if !exists {
         // ECHILD, not ESRCH: POSIX gives "you have no such child" its own errno
         // and a shell tests for exactly it to stop reaping. ESRCH here happened
@@ -3769,18 +3829,31 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         return errno::ECHILD;
     }
 
-    // A matching child that has exited — reap the first one found.
-    let exited = table
-        .iter()
-        .position(|e| e.as_ref().is_some_and(|s| mine(s) && s.exit.is_some()));
-    let Some(slot_off) = exited else {
+    // A matching child that has exited — reap the first one found. `exited` is
+    // published by `spawn_record_exit` before it wakes the waiters, so a parent
+    // that gets here after a wake finds it set.
+    let Some((child_pid, code)) = akuma_exec::process::find_process(|p| {
+        (p.parent_pid == me && (any || p.pid == want) && p.exited.load(Ordering::Acquire))
+            .then(|| (p.pid, p.exit_code.load(Ordering::Acquire)))
+    }) else {
         return 0; // matching child(ren) exist, none has exited yet
     };
 
-    // SAFETY: `slot_off` is in bounds and occupied with `exit == Some`.
-    let (code, stdin_pipe, child_pid, borrowed_io, exec_slot) = unsafe {
+    // The spawn row is now consulted only for what `akuma-exec` has no home
+    // for: this target's stdio pipes and the task slot the identity map is
+    // keyed by. Everything else about the child is read above.
+    let Some(slot_off) = spawn_row_of(child_pid) else {
+        // A child known to the process table with no spawn row is not a
+        // condition this target has: every registration is paired with a row.
+        // Report the reap rather than wedging the parent — losing a pipe leaks
+        // a buffer; refusing here would hang a shell.
+        reap_exec_process(child_pid, usize::MAX);
+        return u64::from(child_pid);
+    };
+    // SAFETY: `slot_off` came from a live row and nothing yields between.
+    let (stdin_pipe, borrowed_io, exec_slot) = unsafe {
         let s = (*spawn_table())[slot_off].as_ref().unwrap();
-        (s.exit.unwrap(), s.stdin_pipe, s.pid, s.borrowed_io, s.exec_slot)
+        (s.stdin_pipe, s.borrowed_io, s.exec_slot)
     };
 
     if status_ptr != 0 {
@@ -3812,6 +3885,16 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     // the recorded task slot still names this pid (`reap_exec_process`).
     reap_exec_process(child_pid, exec_slot);
     u64::from(child_pid)
+}
+
+/// The spawn-row index for `pid`, or `None`.
+///
+/// The row is addressed by pid rather than by slot since 5b slice 2: the
+/// process table decides *which* child is being reaped, and this finds the
+/// stdio that goes with it.
+fn spawn_row_of(pid: u32) -> Option<usize> {
+    // SAFETY: raw-pointer read; single core, no row mutated.
+    unsafe { (*spawn_table()).iter().position(|e| e.as_ref().is_some_and(|s| s.pid == pid)) }
 }
 
 /// Stage R: `sys_spawn` runs a child, its stdout comes back through a pipe, and
@@ -5237,7 +5320,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // `yield_now` below hands the CPU to the task, so init's own first syscall
     // already resolves. Nothing unregisters it: init runs until the machine
     // stops, and the boot loop after this never returns while it lives.
-    register_exec_process(1, 0, task_slot, root, init_image_top, path);
+    register_exec_process(1, 0, task_slot, root, init_image_top, path, &INIT_CMDLINE.lock().clone());
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes
     // up.

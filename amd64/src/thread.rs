@@ -291,7 +291,21 @@ pub fn sys_clone_thread(
         return errno::EFAULT;
     }
 
+    // 5b slice 2: a thread resolves to its process's pid, so every
+    // `akuma-exec` identity lookup works from a thread too.
+    //
+    // Slice 1 registered only fork/spawn/execve/run_init, which was enough for
+    // `current_process_shared()` but leaves a `CLONE_VM` thread unmapped — and
+    // `current_pid()` cannot move onto `THREAD_PID_MAP` until it is mapped,
+    // because an unmapped tid answers "init" rather than "my process". Threads
+    // share the process, so the value is the *parent's* pid, not a new one:
+    // this is `tid -> tgid pid`, the same relation AArch64 publishes.
+    //
+    // Published after `publish_task` for the same reason the task's registers
+    // are: nothing may observe the thread before its identity is in place, and
+    // `publish_task` is the point at which something can.
     crate::sched::publish_task(task);
+    akuma_exec::process::thread_pid_map_insert(task, crate::usermode::current_pid());
     u64::from(tid)
 }
 
@@ -344,6 +358,9 @@ fn teardown(slot: usize) {
     // Anything of its still on the futex table would then name whoever inherits
     // it, and absorb a wake meant for them.
     crate::futex::purge_task(t.task);
+    // Same argument for the identity map: a stale `tid -> pid` row would hand
+    // the next occupant of this slot the dead thread's process.
+    akuma_exec::process::thread_pid_map_remove(t.task);
 }
 
 /// `FUTEX_WAKE | FUTEX_PRIVATE_FLAG`, the op `teardown`'s wake uses. Spelled
