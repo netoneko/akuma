@@ -439,6 +439,23 @@ pub mod tlb {
 /// corresponding write to the monitored line in the same change.
 pub mod park {
     /// `wfi` — wait for interrupt. Returns when one is taken (or spuriously).
+    ///
+    /// **The x86 arm returns with interrupts masked.** Callers running enabled
+    /// must save/restore around it; every kernel caller on this target runs
+    /// masked already, and the trailing `cli` is what keeps the post-state
+    /// honest rather than leaving `IF` set as a side effect of parking.
+    ///
+    /// The x86 body is **`sti; hlt; cli`, not bare `hlt`**, and that is a
+    /// semantics repair, not a style choice: AArch64 `wfi` wakes on a pending
+    /// interrupt *even when `DAIF.I` masks it*; `hlt` with `IF=0` sleeps until
+    /// an NMI and nothing else. Kernel code on this target runs with `IF`
+    /// clear (`amd64/src/sched.rs`: the idle loop is "the only place the
+    /// scheduler re-enables it"), so a bare `hlt` there is a permanent sleep —
+    /// measured as the `cowstale` probe never returning after
+    /// `blocking_relax_net` → `idle_halt` went live with `kernel_smp_shared`
+    /// (2026-09-08). `sti` takes effect after the *following* instruction, so
+    /// the three-instruction sequence is atomic with respect to the tick: an
+    /// interrupt arriving between `sti` and `hlt` is taken, never slept past.
     #[inline(always)]
     pub fn wfi() {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -448,9 +465,11 @@ pub mod park {
             core::arch::asm!("wfi", options(nostack, preserves_flags));
         };
         #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-        // SAFETY: halts until an interrupt. Whether it is *wise* to park here is a scheduling question, not a safety one.
+        // SAFETY: halts until an interrupt; `cli` afterwards restores the
+        // masked state kernel code runs under. Whether it is *wise* to park
+        // here is a scheduling question, not a safety one.
         unsafe {
-            core::arch::asm!("hlt", options(nostack, preserves_flags));
+            core::arch::asm!("sti", "hlt", "cli", options(nostack));
         };
     }
 
