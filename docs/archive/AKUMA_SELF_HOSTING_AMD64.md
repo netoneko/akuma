@@ -920,6 +920,43 @@ diagnosis: nobody has looked yet, and the two kernels do not share this code.
 Not investigated. It gates nothing in the B trunk and it is the aarch64 kernel's
 boot suite, so it wants its own pass.
 
+### 5. A subshell with **two** execs hangs, and takes the machine with it
+
+Found 2026-09-08 by the ring-3 workload check while landing 5b slice 1, on the
+bare-metal box and then reproduced on local QEMU. **Pre-existing** — `057ed0d3`,
+the commit before that slice, built in a throwaway worktree, reproduces it
+identically.
+
+Each rung on a freshly booted `SMP=4` QEMU with `INIT=/bin/sshd`, in this order,
+because the failure poisons the kernel for every later session:
+
+```
+echo hi                                       rc=0
+ls /bin | wc -l                               rc=0    # plain pipe, 2 processes
+( echo a ); echo done                         rc=0    # subshell, builtin only
+( ls /bin >/dev/null ); echo done             rc=0    # subshell, ONE exec
+( ls /bin >/dev/null; ls /bin >/dev/null )    HANGS   # subshell, TWO execs
+```
+
+Not the pipe and not the subshell: **the second exec inside a forked shell** — a
+grandchild fork/exec. The console prints the `[SSH] Exec:` line and then nothing
+— no fault, no panic, no `[Fault] #PF`. Afterwards sshd still accepts
+connections and still runs commands (their output arrives in full), but no
+session ever tears down.
+
+That last sentence is the same visible shape as issue 3 above, which is closed
+and was diagnosed from a `uname -a` that hung. Worth considering that issue 3's
+report may have been *this* bug reached by a different route, and that A2 fixed
+the easy half.
+
+Before assuming a lost scheduler wake, note the AArch64 rhyme: `( cmd; cmd ) &`
+segfaulting because a CoW fork lost mmap region extents, so grandchildren shared
+nothing (fixed 2026-07-30). The grandchild fork is the suspicious part of the
+ladder, and this target's CoW is newer than that fix.
+
+On the metal it needed a power cycle — the one-shot GRUB entry means the box
+comes back on Ubuntu, so recovery is a button press, not a reinstall.
+
 ## What stays different forever, by design
 
 Not work items — pinned seams. The end state is not zero platform differences;

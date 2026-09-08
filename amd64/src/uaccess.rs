@@ -137,42 +137,45 @@ const RFLAGS_AC: u64 = 1 << 18;
 /// physmap, which is supervisor-only — and therefore writable regardless of
 /// `WP`, since `WP` only governs the `R/W` bit and those mappings are `R/W`).
 pub fn init_smap() -> SmapStatus {
-    let tmp: u64;
-    // SAFETY: `cpuid` is unprivileged and side-effect-free. `rbx` is
-    // callee-saved and LLVM reserves it, so it is saved and restored by hand
-    // rather than named as a clobber — naming it is a compile error (same
-    // shape as `net::has_rdrand`). Leaf 7 needs `ecx` = 0 (subleaf).
+    // Leaf 7 subleaf 0's `EBX`: bit 7 SMEP, bit 20 SMAP.
     //
-    // The result is stashed in `tmp` *before* `rbx` is restored, not moved
-    // into an output operand that LLVM may allocate to `rbx` itself. The
-    // previous shape — `mov {ebx:e}, ebx` with `ebx = out(reg) ebx` — was a
-    // latent bug found while landing C1 step 5b: LLVM allocated the output to
-    // `rbx`, so the sequence read `mov ebx, ebx` (result intact) followed by
-    // `mov rbx, {tmp:r}` (result destroyed), and the function returned
-    // whatever the *caller's* `rbx` happened to hold. Whether SMAP was
-    // therefore "detected" depended on a register value decided by code
-    // layout — the same CPU always answered `on` on one build and `off` on
-    // another, and `CR4.SMAP follows CPUID` still passed because both sides
-    // read the same corrupted word. Stashing through `tmp` first makes the
-    // template correct whatever register LLVM picks: if `tmp` *is* `rbx`,
-    // every move is a self-move and the result still survives.
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp:r}, rbx",
-            "cpuid",
-            "mov {tmp:e}, ebx",
-            "mov rbx, {tmp:r}",
-            tmp = lateout(reg) tmp,
-            inout("eax") 7u32 => _,
-            inout("ecx") 0u32 => _,
-            out("edx") _,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    // Leaf 7's EBX: bit 7 SMEP, bit 20 SMAP. Read back through `tmp` — see
-    // the asm comment above for why the result cannot leave the template any
-    // other way.
-    let ebx = tmp as u32;
+    // Through `core::arch::x86_64::__cpuid_count`, **not** a hand-rolled `asm!`
+    // template, because getting `EBX` back out of `cpuid` is the one genuinely
+    // hard part of this: `rbx` is callee-saved and LLVM reserves it, so naming
+    // it as a clobber is a compile error and it has to be saved and restored
+    // inside the template — and both hand-written shapes this file carried were
+    // wrong, in opposite directions, with nothing red either time.
+    //
+    // 1. `mov {tmp:r}, rbx` / `cpuid` / `mov {ebx:e}, ebx` / `mov rbx, {tmp:r}`
+    //    with two `out(reg)` operands. LLVM may allocate the *result* operand
+    //    to `rbx` itself, and then the restore overwrites the result: the
+    //    function returned whatever the caller's `rbx` happened to hold.
+    // 2. The 2026-09-08 repair stashed the result into the save slot instead —
+    //    `mov {tmp:e}, ebx` / `mov rbx, {tmp:r}`. That reads the right value,
+    //    but it destroys the saved `rbx` on the way and then "restores" `rbx`
+    //    *from the result*. Verified in the shipped image: `init_smap` returned
+    //    with `rbx` = the CPUID feature word, while LLVM believed `rbx` had
+    //    survived the call — `ap_entry64` keeps the AP's cpu index there across
+    //    it and printed the feature word as the cpu number.
+    //
+    // The intrinsic uses the `xchg` form, which is correct for *every*
+    // allocation including the degenerate one where the operand is `rbx`: the
+    // result lands in `rbx` and LLVM knows it, because LLVM chose it.
+    //
+    // Whether SMAP was "detected" therefore used to depend on register
+    // allocation, i.e. on code layout — the same CPU answered `on` on one build
+    // and `off` on the next, and the `CR4.SMAP follows CPUID` self-test passed
+    // both times because both sides read the same corrupted word. A self-test
+    // that compares a register against the value that programmed it cannot see
+    // this class of bug; the check that would have is a CPUID word compared
+    // against a second source.
+    //
+    // The intrinsic is *safe* to call: `cpuid` is unprivileged,
+    // side-effect-free, and baseline on x86_64, so no feature detection is
+    // needed to run the feature detection — which is the second reason to
+    // prefer it here, in a file that is otherwise all `unsafe`.
+    let ebx = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+
     let cpuid_smep = ebx & (1 << 7) != 0;
     let cpuid_smap = ebx & (1 << 20) != 0;
 

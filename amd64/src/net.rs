@@ -107,22 +107,17 @@ fn noop_waker() -> core::task::Waker {
 /// "net: stack up" with an invalid-opcode exception that read like a compiler
 /// bug.
 fn has_rdrand() -> bool {
-    let ecx: u32;
-    // SAFETY: `cpuid` is unprivileged and side-effect-free. `rbx` is
-    // callee-saved and LLVM reserves it, so it is saved and restored by hand
-    // rather than named as a clobber — naming it is a compile error.
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp:r}, rbx",
-            "cpuid",
-            "mov rbx, {tmp:r}",
-            tmp = out(reg) _,
-            inout("eax") 1u32 => _,
-            out("ecx") ecx,
-            out("edx") _,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
+    // CPUID leaf 1, `ECX` bit 30, through the core intrinsic rather than a
+    // hand-rolled template. This function did not read `EBX`, so it never had
+    // the wrong-value bug `uaccess::init_smap` had — but it carried the same
+    // latent hazard: `mov {tmp:r}, rbx` / `cpuid` / `mov rbx, {tmp:r}` is a
+    // pair of self-moves when LLVM allocates `tmp` to `rbx`, and then `cpuid`'s
+    // clobber of `rbx` escapes the template undeclared. See `init_smap` for the
+    // full account.
+    //
+    // The intrinsic is safe to call — `cpuid` is unprivileged and baseline on
+    // x86_64 — so this drops the file's only `unsafe` in the RNG path.
+    let ecx = core::arch::x86_64::__cpuid(1).ecx;
     ecx & (1 << 30) != 0
 }
 
