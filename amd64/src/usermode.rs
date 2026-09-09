@@ -1834,10 +1834,12 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if fd != 1 && fd != 2 {
         return EBADF;
     }
-    // A spawned child's stdout/stderr is a pipe `sshd` drains, not the console.
-    if let Some(p) = current_stdout_pipe() {
-        return crate::fd::write_pipe(p, buf, len as usize, false);
-    }
+    // An unbound 1 or 2 is the console, full stop. It used to ask
+    // `current_stdout_pipe()` first — the `Spawn` row — because a spawned
+    // child's stdout was a pipe reached *by number*; since C2 slice 6 both are
+    // `PipeWrite` descriptors and `pipe_write_id` above has already routed
+    // them. Only a task with no stdout descriptor reaches here: init on the
+    // serial line, and the boot suite's kernel row.
     if len > MAX_WRITE {
         return EFAULT;
     }
@@ -2724,21 +2726,45 @@ fn finish_test_process(pid: u32, task_slot: usize) {
 
 use crate::pipe::{self, PipeId};
 
-/// One spawned child. Indexed by `proc_slot - SPAWN_SLOT_BASE`.
+/// One spawned child.
+///
+/// **C2 slice 6 deleted three of the four stdio fields.**
+/// `stdout_pipe`/`borrowed_io`/`console_io` existed because a spawned child's
+/// stdio was routed *by number*: every unbound fd 0/1/2 read or write asked
+/// the spawn row which pipe (or console) served it, and the exit path closed
+/// the child's stdout end by hand, guarded by `borrowed_io` so a `fork` child
+/// did not close its parent's. The child's stdio is now **bound descriptors**
+/// in its own row and registered table (`fd::bind_stdio`), so every one of
+/// those jobs is done by machinery that already existed:
+///
+/// - routing: `pipe_read_id`/`pipe_write_id` resolve fd 0/1/2 like any pipe;
+/// - `borrowed_io`: a `fork` child's `inherit_fds` bumps the shared ends'
+///   refcounts, and only the last name's close reaches the pipe;
+/// - `console_io`: a child of a console task inherits an empty row, so its
+///   0/1/2 are unbound and fall through to the console exactly as before;
+/// - exit EOF: `close_owned_by` unrefs the child's ends before
+///   `spawn_record_exit` runs — the parent's reader sees EOF with no
+///   per-spawn code (the manual `close_write` this replaced would now be a
+///   *double* close).
+///
+/// **`stdin_pipe` stays, and that is a carried decision rather than a
+/// leftover.** Its *read* end is the child's fd 0 and dies with the child's
+/// row; its **write** end is reached by *path* — `sshd` opens
+/// `/proc/<pid>/fd/0` — and a path is not a reference, so nothing refcounts
+/// it. Left to the counts alone, a spawn whose stdin nobody ever opened (every
+/// `run_sh_capture` in the boot suite) would keep one writer forever and the
+/// pipe would never be destroyed: a leak against a 64-pipe ceiling. The reap
+/// is the one place that knows the child is gone, so the reap drops it. What
+/// changed is *how*: `pipe::close_write`, not the old `pipe::free` —
+/// `free` destroyed the pipe under `sshd`'s still-open descriptor, and
+/// `close_write` lets the end counts decide, which is the rule everywhere else
+/// in this module. A `fork` child owns no pipe of its own and carries `None`.
 struct Spawn {
     pid: u32,
-    /// The child writes fd 1/2 here; the parent's `stdout_fd` reads it.
-    stdout_pipe: PipeId,
-    /// The child reads fd 0 here; `/proc/<pid>/fd/0` writes it.
-    stdin_pipe: PipeId,
-    /// The pipes above belong to another `Spawn` (the `fork` parent's): this
-    /// child shares its stdio and must not close or free them on teardown.
-    borrowed_io: bool,
-    /// fd 0/1/2 for this child are the **console**, not the pipes above — a
-    /// `fork` child of a shell that itself runs on the console (`INIT=/bin/sh`
-    /// on the serial line, no `sshd` in front). The `stdin_pipe`/`stdout_pipe`
-    /// fields are unused then.
-    console_io: bool,
+    /// The stdin pipe this spawn created and still owns the *write* end of;
+    /// `None` for a `fork` child, which shares its parent's by descriptor. See
+    /// the type's header for why this one field outlived the other three.
+    stdin_pipe: Option<PipeId>,
     /// The scheduler task slot running this child, recorded at spawn so the
     /// `waitpid` reap can remove the `THREAD_PID_MAP` entry it published
     /// (`reap_exec_process`). A `usize` is wider than `sched::MAX_TASKS` needs,
@@ -3602,12 +3628,6 @@ fn sys_fork() -> u64 {
         |p| alloc::string::String::from(p.name()),
     );
 
-    // The child's fd 0/1/2 route wherever the parent's do.
-    let (stdin_pipe, stdout_pipe, console_io) = match spawn_stdio(parent_slot) {
-        Some((si, so)) => (si, so, false),
-        None => (0, 0, true),
-    };
-
     // Copy the parent's whole address space, off the parent's **registered**
     // process — the only process there is since 5b slice 4.
     let Some(parent) = current_process() else {
@@ -3674,10 +3694,11 @@ fn sys_fork() -> u64 {
     unsafe {
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid,
-            stdout_pipe,
-            stdin_pipe,
-            borrowed_io: true,
-            console_io,
+            // Owns no pipe: the child's fd 0/1/2 are *names* for the parent's
+            // descriptions, copied by `inherit_fds` above and released by this
+            // child's own row sweep at exit. This `None` is what `borrowed_io`
+            // used to say.
+            stdin_pipe: None,
             exec_slot: task_slot,
         });
     }
@@ -3767,16 +3788,41 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     }
 
     let root = child.space.ttbr0();
-    // A spawned process starts with an empty descriptor row: its stdio is the
-    // pipes above, addressed by number, and it inherits nothing else. The
-    // reset is defensive rather than expected — `close_owned_by` clears the row
-    // at exit — but a slot whose previous occupant died without running that
-    // would otherwise hand this process working descriptors it never opened.
+    // The child's row starts empty; `bind_stdio` below gives it fd 0/1/2 as
+    // its stdio pipes. The reset is defensive rather than expected —
+    // `close_owned_by` clears the row at exit — but a slot whose previous
+    // occupant died without running that would otherwise hand this process
+    // working descriptors it never opened.
     crate::fd::close_owned_by(slot);
+
+    // **C2 slice 6:** the child's stdio becomes real descriptors — fd 0 = the
+    // read end of `stdin_pipe`, fd 1 **and fd 2** = the write end of
+    // `stdout_pipe` (one description, two names, which is what keeps stderr on
+    // the session after a `dup2(file, 1)`) — in its own row and its own
+    // registered table, replacing the by-number routing
+    // the `Spawn` row used to carry. See `fd::bind_stdio` for what this buys.
+    // Done before the child can be scheduled: the row is seeded before
+    // `publish_task`, and the table is handed to the registration below.
+    let child_fds = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new());
+    let bind = crate::fd::bind_stdio(slot, stdin_pipe, stdout_pipe, Some(&child_fds));
+    if bind != 0 {
+        drop(child);
+        cleanup_spawn_slot(stdout_pipe, stdin_pipe);
+        return bind;
+    }
 
     let Some(task_slot) = spawn_process_task(slot, root) else {
         // `child` drops here: the image is freed by the same destructor that
         // would have freed it out of `PROCS`.
+        //
+        // The row and the mirror are unwound **before** the pipes go. The row
+        // holds three real references now, and `child_fds` is about to drop
+        // unregistered — `SharedFdTable::drop` runs `close_all()`, which fires
+        // the `ExecRuntime` pipe hooks this target answers with `not_wired!`,
+        // i.e. a panic. That is the same trap `fd::clear_table_mirror` exists
+        // for on the exit path; this is the failure path's copy of it.
+        child_fds.table.lock().clear();
+        crate::fd::close_owned_by(slot);
         cleanup_spawn_slot(stdout_pipe, stdin_pipe);
         return errno::ENOMEM;
     };
@@ -3799,17 +3845,14 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         img.end_va,
         core::str::from_utf8(argv_refs[0]).unwrap_or("spawn"),
         &spawn_cmdline,
-        None,
+        Some(child_fds),
     );
 
     // SAFETY: raw-pointer write; single core.
     unsafe {
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid,
-            stdout_pipe,
-            stdin_pipe,
-            borrowed_io: false,
-            console_io: false,
+            stdin_pipe: Some(stdin_pipe),
             exec_slot: task_slot,
         });
     }
@@ -3882,23 +3925,20 @@ fn wait4_wake_all() {
 /// Called from `run_process` when a spawned child leaves ring 3.
 pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     // SAFETY: raw-pointer access; single core.
+    //
+    // The row is read only for the pid that names the process. It used to
+    // also carry the child's stdout write end, closed here by hand so the
+    // parent's reader saw EOF — **C2 slice 6 deleted that**, because the
+    // child's stdio is bound descriptors now: `close_owned_by` (which runs
+    // earlier in `run_process`'s exit path) already unref'd the child's ends,
+    // and the refcounts did the EOF. A manual `close_write` here would be a
+    // *second* decrement of a ref the child no longer holds — it would close
+    // a live parent-side end.
     let dying = unsafe {
-        let mut dying = 0;
-        if let Some(Some(s)) = (*spawn_table()).get_mut(proc_slot - SPAWN_SLOT_BASE) {
-            // 5b slice 2: the status itself is published on the registered
-            // process below — the row carried a second copy of it until the
-            // wait moved off the spawn table, and two copies of an exit status
-            // is exactly the drift this slice exists to remove. The row is read
-            // here only for the pid that names the process.
-            dying = s.pid;
-            // A `fork` child that shares its parent's stdio must not close the
-            // parent's stdout — the parent (and every later command it runs)
-            // still writes there.
-            if !s.borrowed_io {
-                pipe::close_write(s.stdout_pipe);
-            }
-        }
-        dying
+        (*spawn_table())
+            .get_mut(proc_slot - SPAWN_SLOT_BASE)
+            .and_then(|s| s.as_ref())
+            .map_or(0, |s| s.pid)
     };
 
     // Reparent this process's children onto init, the way Linux does at exit.
@@ -3943,34 +3983,19 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     wait4_wake_all();
 }
 
-/// The stdin/stdout pipe a task running process slot `proc_slot` reads/writes as
-/// fd 0 / fd 1. `None` for a task that is not a spawned child, or a `vfork`
-/// child of a console shell — in both cases fd 0/1/2 are the console.
-fn spawn_stdio(proc_slot: usize) -> Option<(PipeId, PipeId)> {
-    if proc_slot < SPAWN_SLOT_BASE {
-        return None;
-    }
-    // SAFETY: raw-pointer read; single core.
-    unsafe {
-        let s = (*spawn_table())
-            .get(proc_slot - SPAWN_SLOT_BASE)?
-            .as_ref()?;
-        if s.console_io {
-            return None;
-        }
-        Some((s.stdin_pipe, s.stdout_pipe))
-    }
-}
-
-/// fd 0 for the current task: its stdin pipe, if it is a spawned child.
-pub fn current_stdin_pipe() -> Option<PipeId> {
-    spawn_stdio(current_proc_slot()).map(|(stdin, _)| stdin)
-}
-
-/// fd 1/2 for the current task: its stdout pipe, if it is a spawned child.
-pub fn current_stdout_pipe() -> Option<PipeId> {
-    spawn_stdio(current_proc_slot()).map(|(_, stdout)| stdout)
-}
+// **C2 slice 6 deleted `spawn_stdio`, `current_stdin_pipe` and
+// `current_stdout_pipe`.** They answered "which pipe serves this task's fd
+// 0/1/2" out of the `Spawn` row, and every read, write and poll of an unbound
+// 0/1/2 called one of them. A spawned child's stdio is descriptors now, so
+// `fd::pipe_read_id`/`pipe_write_id` answer the same question from the table
+// the rest of the module already trusts, and an unbound 0/1/2 means exactly
+// one thing again: the console.
+//
+// Removing them is the point of the slice rather than tidying after it. The
+// row said "fd 1 and 2 are *this* pipe" **whatever fd 1 currently named**, so
+// it kept answering after a `dup2(file, 1)` — `prog > out.txt` sent stderr to
+// a pipe fd 1 no longer had — and the descriptor said something different. Two
+// sources, one of them ignoring redirection.
 
 pub fn current_proc_slot() -> usize {
     // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is the running task's slot.
@@ -3986,14 +4011,22 @@ pub fn current_proc_slot() -> usize {
 
 /// The stdin pipe write end for pid `pid`, for `fd::sys_openat`'s
 /// `/proc/<pid>/fd/0` handling.
+///
+/// Off the spawn row, not off the child's fd table, and the difference is the
+/// direction of the question. `sshd` is asking for the end **it** writes — the
+/// end no descriptor names — and the child's fd 0 is the *other* end. Reading
+/// the child's table for it would work only for as long as fd 0 still named
+/// that pipe: a shell that redirects its own stdin, or a child already past
+/// `clear_table_mirror` on the exit path, would silently answer `ENOENT` to a
+/// bridge that is still live. The row outlives both, up to the reap.
 pub fn stdin_pipe_for_pid(pid: u32) -> Option<PipeId> {
-    // SAFETY: raw-pointer read; single core.
+    // SAFETY: raw-pointer read; single core, no row mutated.
     unsafe {
         (*spawn_table())
             .iter()
             .flatten()
             .find(|s| s.pid == pid)
-            .map(|s| s.stdin_pipe)
+            .and_then(|s| s.stdin_pipe)
     }
 }
 
@@ -4059,9 +4092,13 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         return 0; // matching child(ren) exist, none has exited yet
     };
 
-    // The spawn row is now consulted only for what `akuma-exec` has no home
-    // for: this target's stdio pipes and the task slot the identity map is
-    // keyed by. Everything else about the child is read above.
+    // The spawn row is now consulted for the task slot the identity map is
+    // keyed by, and for the one pipe end no descriptor names. Everything else
+    // about the child is read above — since C2 slice 6 its stdout pipe is a
+    // refcounted descriptor whose ends died with the child's own `close` sweep
+    // (`close_owned_by` at exit), so the reap's old "spare the stdout pipe for
+    // `sshd`'s final drain, and mind `borrowed_io`" bookkeeping is exactly what
+    // the refcounts already do.
     let Some(slot_off) = spawn_row_of(child_pid) else {
         // A child known to the process table with no spawn row is not a
         // condition this target has: every registration is paired with a row.
@@ -4071,10 +4108,23 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         return u64::from(child_pid);
     };
     // SAFETY: `slot_off` came from a live row and nothing yields between.
-    let (stdin_pipe, borrowed_io, exec_slot) = unsafe {
+    let (exec_slot, stdin_pipe) = unsafe {
         let s = (*spawn_table())[slot_off].as_ref().unwrap();
-        (s.stdin_pipe, s.borrowed_io, s.exec_slot)
+        (s.exec_slot, s.stdin_pipe)
     };
+
+    // Drop the spawn's own writer reference on the child's stdin pipe — the
+    // one `sshd` reaches by path rather than by descriptor, so nothing else
+    // will. `close_write`, **not** the `pipe::free` this replaced: `free`
+    // destroys the pipe whatever the end counts say, and `sshd` may still hold
+    // an open `/proc/<pid>/fd/0` descriptor over it whose own close would then
+    // land on a stranger's pipe id. Letting the counts decide means the last
+    // end out destroys it, which is the rule every other pipe here follows. A
+    // `fork` child carries `None` and borrows its parent's, exactly as
+    // `borrowed_io` used to say.
+    if let Some(p) = stdin_pipe {
+        pipe::close_write(p);
+    }
 
     if status_ptr != 0 {
         let raw = ((u64::from((code as u32) & 0xff)) << 8) as i32;
@@ -4083,12 +4133,6 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         let _ = crate::uaccess::write_val::<i32>(status_ptr, raw);
     }
 
-    // A `vfork` child borrows the parent's stdio — leave those pipes alone.
-    // Otherwise free the **stdin** pipe (nobody reads it now); the **stdout**
-    // pipe outlives this call so `sshd`'s bridge can drain the last bytes.
-    if !borrowed_io {
-        pipe::free(stdin_pipe);
-    }
     // SAFETY: raw-pointer access; single core. The child task is Finished — it
     // called `sched::finish()` in `run_process` after recording its exit.
     unsafe {
@@ -4166,6 +4210,43 @@ pub fn spawn_test(t: &mut Suite) {
     let pid = (r & 0xFFFF_FFFF) as u32;
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
     t.check("spawn: pid is a real child pid", pid >= 2);
+
+    // **C2 slice 6's central claim, pinned.** The child's stdio is descriptors
+    // in its own registered table — fd 0 the read end of its stdin pipe, fd 1
+    // and fd 2 the write end of its stdout pipe — and *not* a `Spawn` row
+    // consulted by number. Everything slice 6 deleted (`spawn_stdio`,
+    // `current_stdin_pipe`, `current_stdout_pipe`, `Spawn::stdout_pipe`,
+    // `borrowed_io`, `console_io`) depends on this being true, and the
+    // observable failures if it stops being true are all indirect: a shell
+    // that reads the console instead of the channel, an `EBADF` from a
+    // `dup2` target, a lost stderr. Asked here, of the live child, before it
+    // is drained — the one moment the table is guaranteed populated and not
+    // yet cleared by `clear_table_mirror`.
+    {
+        use akuma_exec::process::FileDescriptor;
+        let stdio = akuma_exec::process::with_process(pid, |p| {
+            let t = p.fds.table.lock();
+            (
+                matches!(t.get(&0), Some(FileDescriptor::PipeRead(_))),
+                matches!(t.get(&1), Some(FileDescriptor::PipeWrite(_))),
+                matches!(t.get(&2), Some(FileDescriptor::PipeWrite(_))),
+            )
+        });
+        t.check(
+            "spawn: the child's registered table holds fd 0 as its stdin pipe",
+            stdio.is_some_and(|(r, _, _)| r),
+        );
+        t.check(
+            "spawn: fd 1 as its stdout pipe",
+            stdio.is_some_and(|(_, w, _)| w),
+        );
+        // fd 2 is a second *name* for fd 1's description, which is what keeps
+        // stderr on the session after a `dup2(file, 1)`.
+        t.check(
+            "spawn: and fd 2 as a second name for the same end",
+            stdio.is_some_and(|(_, _, e)| e),
+        );
+    }
 
     // Non-blocking reads so the driver keeps polling `waitpid` too.
     crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
@@ -4517,6 +4598,46 @@ pub fn redirect_test(t: &mut Suite) {
         return;
     };
     t.check_eq("redirect: `yes | head -n 1` terminates", ystatus, 0);
+
+    // 6. `>` over a file that is **longer than what replaces it**, and two
+    // redirects that write **no bytes at all**. Every case above only ever
+    // wrote to a path that did not exist yet, which is precisely why they all
+    // passed while `O_TRUNC` and `O_CREAT` did nothing (C2 slice 5's
+    // `write_at(path, 0, &[])`, short-circuited by `write_at`'s own
+    // `data.is_empty()` guard before it resolved anything — see `sys_openat`).
+    //
+    // The failures that hid behind that: `echo x >` over 31 bytes left
+    // `x\nAAAA…`, keeping the tail of the old file behind the new head; and
+    // `: > f` — the idiom for "make this empty", and what `2> err` does for a
+    // command that prints no errors — created nothing at all. Found from ring
+    // 3 over ssh, not by any check in this suite, which is the lesson the
+    // plan's § "The lesson C1 step 3 paid for" states: a redirect whose
+    // *exit status* is 0 proves nothing about the bytes.
+    let _ = run_sh_capture(b"echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > /tmp/tr.txt\0");
+    let _ = run_sh_capture(b"echo x > /tmp/tr.txt\0");
+    let truncated = crate::fs::read_file("/tmp/tr.txt");
+    t.check_eq(
+        "redirect: `>` truncates a longer file to just the new bytes",
+        truncated.as_ref().map_or(u64::MAX, |d| d.len() as u64),
+        2,
+    );
+    t.check(
+        "redirect: nothing of the old contents survives the truncate",
+        truncated.as_ref().is_ok_and(|d| !d.windows(2).any(|w| w == b"AA")),
+    );
+    let _ = run_sh_capture(b": > /tmp/empty.txt\0");
+    let empty = crate::fs::read_file("/tmp/empty.txt");
+    t.check("redirect: a zero-byte `>` still creates the file", empty.is_ok());
+    t.check_eq(
+        "redirect: and creates it empty",
+        empty.map_or(u64::MAX, |d| d.len() as u64),
+        0,
+    );
+    let _ = run_sh_capture(b"echo quiet 2> /tmp/noerr.txt\0");
+    t.check(
+        "redirect: `2>` creates its file even when nothing is written to it",
+        crate::fs::read_file("/tmp/noerr.txt").is_ok(),
+    );
 
     t.check_eq(
         "redirect: teardown leaks nothing",

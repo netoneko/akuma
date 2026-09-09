@@ -21,15 +21,25 @@
 //! is one filesystem and no mount table — so the shared type is used in the mode
 //! it already has for the case, rather than being extended for it.
 //!
-//! # Contents are cached, and that is the local part
+//! # Contents are **not** cached any more (C2 slice 5)
 //!
-//! `open` reads the whole file through `fs::read_file` and holds the bytes
-//! alongside the descriptor; `read` and `lseek` work on that buffer. The
-//! AArch64 kernel reads by inode on every call instead, backed by `akuma-ext2`'s
-//! own block cache. Doing that here needs the `VfsHooks` plumbing that lives in
-//! `akuma-exec`, which does not build for this target — so this is a stated
-//! divergence, not an oversight, and the cost is that a file occupies its own
-//! size in kernel heap while open.
+//! `open` used to read the whole file through `fs::read_file` and hold the
+//! bytes alongside the descriptor, so a file occupied its own size in kernel
+//! heap for as long as it was open and a write `resize`d that `Vec` — which
+//! doubles. Writing an N-byte file needed ~3N of heap at the last doubling, and
+//! `alloc_error_handler` calls `halt()`, so one large write permanently removed
+//! a core (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`).
+//!
+//! A descriptor now carries an **empty** buffer and every read and write goes
+//! to the VFS at the cursor in [`MAX_IO`]-bounded chunks (`fs::read_at`,
+//! `akuma_vfs_glue::write_at`), disk I/O outside the [`FILES`] lock. The heap
+//! cost of a write is one 64 KiB chunk rather than three times the file.
+//!
+//! [`Entry::data`] survives as the storage for **synthetic** `/proc` renders,
+//! which have no inode behind them to read from; `entry_is_synthetic` is the
+//! discriminator, and it is `data.is_empty()` — sound because every synthetic
+//! installer renders non-empty contents. A view that can render empty needs a
+//! flag instead.
 //!
 //! # Descriptors are per-process; descriptions are not
 //!
@@ -60,11 +70,28 @@
 //! file). `close_owned_by` survives as the exit hook, but it is now a row
 //! release rather than a search for an owner.
 //!
-//! **Descriptors 0/1/2 are still answered by number, above this layer.** They
-//! are not in a row, which is why `dup2(fd, 1)` still has nowhere to land and
-//! `cmd | cmd` and `echo x > file` still fail. Making them real entries is the
-//! next step and is now a fill-in rather than a redesign: the rows already have
-//! the three slots, held at [`NO_FILE`].
+//! # Descriptors 0/1/2 are real (C2 slice 6)
+//!
+//! They were "answered by number, above this layer" — not in a row at all,
+//! which is why `dup2(fd, 1)` had nowhere to land and `echo x > file` and
+//! `cmd | cmd` both failed. `dup2` learnt to land in slice 4; slice 6 finished
+//! the job at the other end, where the numbers came *from*: a spawned child
+//! now gets fd 0/1/2 as real `PipeRead`/`PipeWrite` entries at birth
+//! ([`bind_stdio`]), so the `Spawn`-row router that used to answer "which pipe
+//! serves this task's stdout" is gone, along with the three fields it read.
+//!
+//! Two rules survive the change and are the reason the guards below are
+//! spelled `fd < FIRST_FILE_FD && !is_bound(fd)` rather than `fd < 3`:
+//!
+//! - an **unbound** 0/1/2 is the console, and that is now its only meaning —
+//!   init on the serial line, and the boot suite's [`KERNEL_ROW`];
+//! - a **bound** one is whatever it names, so every operation has to ask the
+//!   row rather than assume. Getting that wrong is silent: `lseek` on a bound
+//!   1 answered `EBADF` for months because its guard did not ask.
+//!
+//! [`bind`] still starts at [`FIRST_FILE_FD`], which is the pinned "first free
+//! fd is 3" divergence — POSIX's "lowest available" includes a closed 0/1/2.
+//! [`bind_stdio`] writes the three slots directly for that reason.
 
 use akuma_exec_core::process::{FileDescriptor, KernelFile};
 #[cfg(not(feature = "no-tests"))]
@@ -191,7 +218,12 @@ pub mod errno {
     }
 }
 
-/// Descriptors 0, 1 and 2 are the console and are never in the table.
+/// The first descriptor number [`bind`] will hand out.
+///
+/// **Not** "0/1/2 are the console and are never in the table" any more — since
+/// C2 slice 6 a spawned child's are pipes in its row from birth. What this
+/// constant still means is the pinned allocation divergence: a new `open`
+/// starts looking at 3, so `close(1); open(f)` returns 3 here and 1 on Linux.
 pub const FIRST_FILE_FD: usize = 3;
 /// How many descriptors **one process** may hold.
 ///
@@ -327,6 +359,27 @@ pub fn pipe_read_id(fd: u64) -> Option<usize> {
     })?
 }
 
+/// The `/dev` node name behind `fd`, or `None` for anything else.
+///
+/// The four operations that must answer differently for a device node —
+/// [`sys_read`], [`sys_write_file`], [`sys_lseek`], [`sys_fstat`] — ask this
+/// rather than carrying a variant, because the descriptor already holds the
+/// only thing that identifies the node: its path. `dev_node` returns a
+/// `&'static` name out of the table, so there is no allocation and nothing to
+/// keep in sync.
+///
+/// The `starts_with` is the cheap gate: every other descriptor pays one string
+/// compare and no lookup.
+fn dev_node_of(fd: u64) -> Option<&'static str> {
+    with_file(fd, |e| match &e.desc {
+        FileDescriptor::File(f) if f.path.starts_with("/dev/") => {
+            akuma_vfs_glue::dev_node(&f.path).map(|n| n.name)
+        }
+        _ => None,
+    })
+    .flatten()
+}
+
 /// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
 #[must_use]
 pub fn pipe_write_id(fd: u64) -> Option<usize> {
@@ -403,16 +456,91 @@ pub fn is_nonblocking(fd: u64) -> bool {
     with_file(fd, |e| e.nonblocking).unwrap_or(false)
 }
 
-/// `fcntl(fd, cmd, arg)`. Only the two flag commands are implemented, and
-/// `F_SETFL` only inspects the `O_NONBLOCK` bit — `sshd` is the sole caller and
-/// that is all it sets. `F_GETFL` reports the same bit back and nothing else.
+/// Name the description `fi` with the lowest free descriptor **at or above**
+/// `min` — `fcntl(fd, F_DUPFD, min)`, and `F_DUPFD_CLOEXEC`, which is the same
+/// with the new name marked close-on-exec.
+///
+/// # Why this exists (C2 slice 6)
+///
+/// It did not, and nothing noticed while descriptors 0/1/2 were unbound: an
+/// `fcntl` on one of them resolved to nothing and answered `EBADF`, which is
+/// the *one* error `busybox ash`'s `savefd()` forgives —
+///
+/// ```c
+/// newfd = fcntl(from, F_DUPFD_CLOEXEC, 10);
+/// err = newfd < 0 ? errno : 0;
+/// if (err != EBADF) { if (err) ash_msg_and_raise_perror(...); close(ofd); }
+/// ```
+///
+/// — so `echo x > file` worked by accident: ash asked to save fd 1, was told
+/// there was no fd 1, recorded it as closed and carried on to the `open` and
+/// the `dup2`. The moment [`bind_stdio`] gave a spawned child a *real* fd 1,
+/// the same call resolved, fell through this function's absence to the `_ =>`
+/// arm's `EINVAL`, and ash raised — **before** `openredirect` ran, so the
+/// redirect exited non-zero and the file was never created at all. Six boot
+/// checks, and none of them named `fcntl`.
+///
+/// The lesson is the general one: **making a descriptor real makes every
+/// descriptor operation on it reachable.** `F_DUPFD` is not a slice-6 feature,
+/// it is a hole slice 6 stopped hiding.
+fn dup_from(fd: u64, min: u64, cloexec: bool) -> u64 {
+    let Some(fi) = file_index(fd) else {
+        return errno::EBADF;
+    };
+    // Linux answers `EINVAL` for a `min` past `RLIMIT_NOFILE`, not `EMFILE`:
+    // the argument is out of range, rather than the table being full.
+    let Some(min) = usize::try_from(min).ok().filter(|m| *m < MAX_FDS) else {
+        return errno::EINVAL;
+    };
+    // One hold on `FDS`, none on `FILES` — the two are never nested (see
+    // [`with_file`]), which is why this cannot live inside its closure.
+    let newfd = {
+        let mut fds = FDS.lock();
+        let row = &mut fds[current_row()];
+        let mut found = None;
+        for (n, slot) in row.iter_mut().enumerate().skip(min) {
+            if *slot == NO_FILE {
+                *slot = fi as FileIdx;
+                found = Some(n as u64);
+                break;
+            }
+        }
+        found
+    };
+    let Some(newfd) = newfd else {
+        return errno::EMFILE;
+    };
+    // Bumped only once the new name exists, as [`sys_dup`] does and for the
+    // same reason.
+    if let Some(entry) = FILES.lock()[fi].as_mut() {
+        entry.refs = entry.refs.saturating_add(1);
+    }
+    table_insert(newfd, fi);
+    if cloexec && let Some(table) = shared_table() {
+        table.cloexec.lock().insert(newfd as u32);
+    }
+    newfd
+}
+
+/// `fcntl(fd, cmd, arg)`. The flag commands, plus `F_DUPFD`/`F_DUPFD_CLOEXEC`
+/// (see [`dup_from`]). `F_SETFL` only inspects the `O_NONBLOCK` bit — `sshd`
+/// was long the sole caller and that is all it sets. `F_GETFL` reports the same
+/// bit back and nothing else.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    const F_DUPFD: u64 = 0;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
     const F_SETFD: u64 = 2;
     const F_GETFD: u64 = 1;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
     const O_NONBLOCK: u64 = 0x800;
     const FD_CLOEXEC: u64 = 1;
+
+    // Before the `with_file` resolution below, because duplicating takes the
+    // `FDS` lock and that one takes `FILES`.
+    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+        return dup_from(fd, arg, cmd == F_DUPFD_CLOEXEC);
+    }
 
     // Legacy authority for F_GETFL/F_SETFL: `Entry.nonblocking` is what the
     // socket layer reads. The registered table's `nonblock` set is kept in
@@ -537,9 +665,9 @@ const FD_ROWS: usize = crate::usermode::PROC_SLOTS + 1;
 /// Per-process descriptor tables: `FDS[row][fd]` is the description `fd` names.
 ///
 /// Indexed by descriptor *number*, so `FDS[row][7]` is that process's fd 7 and
-/// every process's fd 3 is its own. Entries below [`FIRST_FILE_FD`] are always
-/// [`NO_FILE`] — 0/1/2 are still answered by number above this layer, which is
-/// why `dup2` onto them cannot work yet (see the module header).
+/// every process's fd 3 is its own. Entries below [`FIRST_FILE_FD`] hold a
+/// spawned child's stdio ([`bind_stdio`]) or whatever a `dup2` put there, and
+/// [`NO_FILE`] otherwise — which is the console. See the module header.
 ///
 /// 129 rows × 256 × 2 bytes = 64 KiB of `.bss`, allocated once and never grown.
 /// A row of `u16` rather than a row of descriptions is the whole point: `fork`
@@ -676,7 +804,8 @@ pub fn fork_table_mirror(
 }
 
 /// Name the description `fi` with the lowest free descriptor in `row`,
-/// **starting at [`FIRST_FILE_FD`]**.///
+/// **starting at [`FIRST_FILE_FD`]**.
+///
 /// **Divergence, pinned.** POSIX's "lowest available" includes 0/1/2, so on
 /// Linux `close(1); open(f)` returns 1. Here it returns 3, because an *unbound*
 /// 0/1/2 is not "free" — it is the console, or a spawned child's pipe, routed
@@ -791,6 +920,86 @@ pub fn inherit_fds(parent_slot: usize, child_slot: usize) {
             entry.refs = entry.refs.saturating_add(1);
         }
     }
+}
+
+/// Give a not-yet-running spawned child its stdio as **real descriptors**:
+/// fd 0 = the read end of its stdin pipe, fd 1 **and fd 2** = the write end of
+/// its stdout pipe, in row `row` and, when `table` is given, mirrored there.
+///
+/// **C2 slice 6.** This replaces the by-number stdio routing the `Spawn` row
+/// used to carry (`Spawn::stdin_pipe`/`stdout_pipe`, consulted at every
+/// unbound fd 0/1/2 read and write). Bound descriptors mean every existing
+/// mechanism just works: `pipe_read_id`/`pipe_write_id` route the child's
+/// I/O, `fork`'s `inherit_fds` shares the ends with correct refcounts (which
+/// is what `borrowed_io` special-cased by hand), and the child's exit
+/// `close_owned_by` drops its ends — the EOF the parent's reader waits for —
+/// with no per-spawn teardown code at all.
+///
+/// **fd 2 is a second *name*, not a second description**, and that is the
+/// whole reason it is bound here rather than left to fall through to the
+/// console: the old router answered fd 1 *and* fd 2 from `Spawn::stdout_pipe`,
+/// so `prog > file` kept sending stderr to the session. Binding fd 2 to the
+/// same `FILES` entry (`refs = 2`, exactly what `dup2(1, 2)` would build)
+/// reproduces that: the `dup2(f, 1)` a shell emits for `>` drops one name and
+/// the pipe end stays open under the other. Leaving fd 2 unbound and answering
+/// it from fd 1 instead would put the second source of truth this slice exists
+/// to delete back in, one indirection further along — and it would break at
+/// exactly the redirect it was meant to survive.
+///
+/// Direct row writes rather than `install` + `bind`, deliberately: `bind`
+/// skips 0/1/2 (the pinned "first free fd is 3" divergence), and stdio is
+/// precisely the case that must land there. Called before the child is
+/// published, so no lock ordering question exists.
+pub fn bind_stdio(
+    row: usize,
+    stdin_pipe: usize,
+    stdout_pipe: usize,
+    table: Option<&alloc::sync::Arc<akuma_exec::process::SharedFdTable>>,
+) -> u64 {
+    let Some(fi_r) = intern(Entry {
+        desc: FileDescriptor::PipeRead(stdin_pipe as u32),
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: false,
+        refs: 1,
+    }) else {
+        return errno::ENFILE;
+    };
+    let Some(fi_w) = intern(Entry {
+        desc: FileDescriptor::PipeWrite(stdout_pipe as u32),
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: false,
+        // Two names from birth: fd 1 and fd 2.
+        refs: 2,
+    }) else {
+        // Un-intern the read end: it has no name, so no `close` can reach it.
+        FILES.lock()[fi_r] = None;
+        return errno::ENFILE;
+    };
+    let slots_free = {
+        let mut fds = FDS.lock();
+        if row >= FD_ROWS || fds[row][..FIRST_FILE_FD].iter().any(|&s| s != NO_FILE) {
+            false
+        } else {
+            fds[row][0] = fi_r as FileIdx;
+            fds[row][1] = fi_w as FileIdx;
+            fds[row][2] = fi_w as FileIdx;
+            true
+        }
+    };
+    if !slots_free {
+        FILES.lock()[fi_r] = None;
+        FILES.lock()[fi_w] = None;
+        return errno::EINVAL;
+    }
+    if let Some(t) = table {
+        let mut t = t.table.lock();
+        t.insert(0, FileDescriptor::PipeRead(stdin_pipe as u32));
+        t.insert(1, FileDescriptor::PipeWrite(stdout_pipe as u32));
+        t.insert(2, FileDescriptor::PipeWrite(stdout_pipe as u32));
+    }
+    0
 }
 
 /// Largest single `read`/`write` this kernel will accept.
@@ -1000,14 +1209,63 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     //
     // What replaced "read the bytes, and `ENOENT` if that fails" is a
     // **one-byte** `read_at` probe: it answers existence through the same
-    // byte path the descriptor will use, which `metadata` alone cannot —
-    // `metadata("/dev/null")` succeeds (the synthetic `/dev` stats) while
-    // nothing will ever serve its bytes, and today's open answers that with
-    // `ENOENT` because `read_file` refuses the node. The probe keeps that
-    // pinned answer exactly. One byte, not zero: a zero-length `read_at`
-    // succeeds before the path is ever resolved (a short-circuit that is
-    // correct for `read(2)` and fatal for a probe — the first Firecracker
-    // boot of this slice opened missing files and gave them fds).
+    // byte path the descriptor will use, which `metadata` alone cannot. One
+    // byte, not zero: a zero-length `read_at` succeeds before the path is ever
+    // resolved (a short-circuit that is correct for `read(2)` and fatal for a
+    // probe — the first Firecracker boot of this slice opened missing files
+    // and gave them fds).
+    //
+    // **The device arm below runs before it**, and that ordering is the whole
+    // reason it is written out here. A `/dev` node has no byte path at all, so
+    // the probe answers "absent" for every one of them; behind the probe,
+    // `open("/dev/zero")` was `ENOENT` and `open("/dev/null", O_CREAT)` — which
+    // skips the probe's guard — went on to try to *create* a node. Two
+    // different wrong answers to the same question, from one ordering.
+
+    // **The `/dev` character nodes.** `/dev` on this target is synthetic —
+    // `akuma_vfs_glue::dev_node` answers `ls -la /dev`, `stat` and `getdents`
+    // for it — but nothing had ever wired a *descriptor* to one, so every
+    // `open` under `/dev` fell through to the ext2 path below, where `/dev` is
+    // not a directory and the node is not a file.
+    //
+    // That fall-through was wrong in two different eras, and the second is the
+    // one that made this urgent. Measured over ssh against the committed
+    // kernel, not inferred:
+    //
+    // - **before C2 slice 5**, `> /dev/null` opened a descriptor with an empty
+    //   buffer, buffered every byte written to it, and dropped them at `close`
+    //   when the whole-file persist failed — a bit bucket by accident, with a
+    //   `[close] persist failed` console line per use;
+    // - **after slice 5** the writes go straight to `write_at`, which cannot
+    //   resolve `/dev`, so `echo hi > /dev/null` answers
+    //   `sh: write error: No such file or directory` and exits 1. `ls >
+    //   /dev/null` still *looks* fine only because busybox `ls` swallows its
+    //   write error — which is how a broken `/dev/null` survived a suite and a
+    //   ring-3 check that both run `>/dev/null` on every line.
+    //
+    // Reading has been broken longer than either: `cat /dev/null` is `ENOENT`,
+    // because the existence probe below asks for a byte a node has none of.
+    //
+    // None of these is `/dev/null`. It is the most-used special file in any shell
+    // script and this target reaches it on `ls > /dev/null` alone, so it is
+    // served here for real: the descriptor carries the node's path, and
+    // [`dev_node_of`] is what `read`, `write`, `lseek` and `fstat` ask instead
+    // of the VFS. A node this does not serve — the block devices — is
+    // `ENODEV` rather than a fall-through, which is the same "say so" answer
+    // the aarch64 kernel gives for `open("/dev/vda")`.
+    if let Some(node) = akuma_vfs_glue::dev_node(&normalised) {
+        if node.is_block {
+            return errno::ENODEV;
+        }
+        let file = KernelFile::new(normalised, flags_ as u32);
+        return install(Entry {
+            desc: FileDescriptor::File(file),
+            data: Vec::new(),
+            nonblocking: false,
+            is_dir: false,
+            refs: 1,
+        });
+    }
     let mut probe = [0u8; 1];
     let exists = fs::read_at(&normalised, 0, &mut probe).is_ok();
     if !creating && !is_dir && !exists {
@@ -1015,22 +1273,57 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     }
     let truncating = flags_ & u64::from(open_flags::O_TRUNC) != 0;
     let appending = flags_ & u64::from(open_flags::O_APPEND) != 0;
+    // `O_CREAT | O_EXCL` on a path that already exists is `EEXIST`, which is
+    // the *whole* contract of `O_EXCL`: it is how a caller claims a lock file
+    // or an atomic temp name, and succeeding anyway tells two of them they
+    // both won. Asked here rather than left out, because the probe above has
+    // already paid for the existence answer.
+    const O_EXCL_X86: u64 = 0o200;
+    if creating && flags_ & O_EXCL_X86 != 0 && (exists || is_dir) {
+        return errno::EEXIST;
+    }
+    // **`O_TRUNC` truncates and `O_CREAT` creates — here, once, through the
+    // VFS**, and both used to do neither.
+    //
+    // The line this replaces was `write_at(path, 0, &[])`, and `write_at`'s
+    // very first statement is `if data.is_empty() { return Ok(0) }` — *before*
+    // it resolves the path, creates a missing inode or touches a length. So it
+    // reported success and did nothing, twice over:
+    //
+    // - `echo x > f` over a 31-byte `f` left `x\nAAAAAAAA…` — 31 bytes, the
+    //   tail of the old contents behind the new head. Silent corruption, and
+    //   invisible to the boot suite, whose `redirect` checks only ever write
+    //   to a file that did not exist yet.
+    // - `: > f`, `2> err` for a command that prints no errors, and any other
+    //   zero-length create made **no file at all**: nothing wrote bytes, so
+    //   nothing ever reached the filesystem.
+    //
+    // This is the *same short-circuit* slice 5 already paid for in the other
+    // direction — its existence probe was zero-length and `read_at` answers
+    // `Ok` for that before resolving anything, so every missing file opened
+    // successfully. One byte fixed the read; the write needs an API that does
+    // not have the short-circuit at all. `write_file(path, &[])` is that:
+    // existing → `truncate_inode` then write nothing, missing → allocate the
+    // inode and add the directory entry. It is a whole-file write of **zero
+    // bytes**, so it costs the heap nothing and reintroduces no cache.
+    //
+    // A failure is a real refusal (a read-only mount, a missing parent) and
+    // fails the open, which is what Linux answers too.
+    if !is_dir
+        && (truncating || (creating && !exists))
+        && let Err(e) = fs::write_file(&normalised, &[])
+    {
+        return fs_err_errno(e);
+    }
     // `O_APPEND`'s starting cursor is the file's real size — one `metadata`,
-    // not "the length of what we happened to read".
+    // not "the length of what we happened to read". **After** the truncate
+    // above, not before: `O_APPEND | O_TRUNC` together must start at 0, and
+    // reading the size first would have started at the old end.
     let start_pos = if appending {
         fs::metadata(&normalised).map_or(0, |m| m.size)
     } else {
         0
     };
-    // `O_TRUNC` happens **now**, once, through the VFS — not "start from an
-    // empty buffer and replace the whole file at close". A zero-length
-    // `write_at` truncates; a failure here is a real refusal (a read-only
-    // mount) and fails the open, which is what Linux answers too.
-    if truncating && !is_dir
-        && let Err(e) = akuma_vfs_glue::write_at(&normalised, 0, &[])
-    {
-        return fs_err_errno(e);
-    }
 
     // `KernelFile::new` leaves the inode 0 — "read by path", which is what
     // this target does — and the position 0, which `O_APPEND` overrides.
@@ -1554,6 +1847,48 @@ pub fn close_owned_by(proc_slot: usize) {
     }
 }
 
+/// Serve a read from the `/dev` character node `node`.
+///
+/// Each of these is a *rule*, not a file: there is no inode behind the path,
+/// which is exactly why the ext2 read path answers `EIO` for all of them.
+/// Shared by [`sys_read`] and [`sys_pread64`] — the offset makes no difference
+/// to any of the four, which is the other half of why they are not files.
+fn dev_read(node: &str, buf: u64, len: u64) -> u64 {
+    match node {
+        // The bit bucket reads as an empty file — `read` returns 0, i.e. EOF.
+        "null" => 0,
+        "zero" => {
+            let zeros = alloc::vec![0u8; len as usize];
+            copy_to_user(buf, &zeros)
+        }
+        // The same entropy `getrandom(2)` gets (`net::rng_fill_checked`, via
+        // `akuma_primitives::rng`). Both `/dev/random` and `/dev/urandom`, and
+        // deliberately not distinguished: this target has one source and no
+        // entropy accounting to block on, so pretending `random` is the
+        // blocking one would be a fiction with a hang in it.
+        "random" | "urandom" => {
+            let mut bytes = alloc::vec![0u8; len as usize];
+            // `None` (no source registered) and `Some(false)` (the source
+            // failed) are both `EIO` here, and the distinction the crate keeps
+            // is not lost by that: it exists so `getrandom(2)` can fall back to
+            // a virtio device, and this target registers its source in
+            // `boot.rs` unconditionally. Handing ring 3 the zeroed buffer
+            // instead would be an entropy source that is not one.
+            if akuma_primitives::rng::fill_bytes(&mut bytes) != Some(true) {
+                return errno::EIO;
+            }
+            copy_to_user(buf, &bytes)
+        }
+        "tty" => read_console(buf, len as usize),
+        // Every node this target opens is one of the above: `sys_openat`
+        // refuses the block devices with `ENODEV` and there are no others in
+        // the table. A new one arriving there and not here would read as an
+        // empty file, so answer `EIO` instead — "this kernel cannot tell you"
+        // rather than a confident nothing.
+        _ => errno::EIO,
+    }
+}
+
 /// `read(fd, buf, len)`.
 ///
 /// fd 0 is the console and **blocks**: it spins on the UART until a byte
@@ -1600,14 +1935,20 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 
     if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         if fd == 0 {
-            // A spawned child's stdin is a pipe, not the console — `sshd`
-            // feeds it.
-            if let Some(pid) = crate::usermode::current_stdin_pipe() {
-                return read_pipe(pid, buf, len as usize, false);
-            }
+            // An unbound fd 0 is the console, full stop. It used to also ask
+            // `current_stdin_pipe()` — the `Spawn` row — because a spawned
+            // child's stdin was a pipe reached *by number*; since C2 slice 6 it
+            // is a `PipeRead` descriptor and the branch above has already
+            // routed it. Only a task with no stdin descriptor at all (init on
+            // the serial line, and the boot suite's kernel row) reaches here.
             return read_console(buf, len as usize);
         }
         return errno::EBADF;
+    }
+
+    // A `/dev` character node.
+    if let Some(node) = dev_node_of(fd) {
+        return dev_read(node, buf, len);
     }
 
     // Resolve under the lock; do the I/O outside it — the rule `release`
@@ -1717,6 +2058,12 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         return errno::ESPIPE;
     }
+    // A `/dev` character node **is** seekable — `pread` on `/dev/zero` is
+    // ordinary — and the offset changes nothing for any of the four, so this
+    // is the same answer `sys_read` gives.
+    if let Some(node) = dev_node_of(fd) {
+        return dev_read(node, buf, len);
+    }
 
     let resolved = with_file(fd, |entry| {
         if entry.is_dir {
@@ -1808,18 +2155,26 @@ pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
 /// copy is not the same thing as "this cannot be mapped".
 #[must_use]
 pub fn is_regular_file(fd: u64) -> bool {
+    // A `/dev` node is a `KernelFile` here too, and it is **not** mappable:
+    // `file_bytes_at` would ask `fs::read_at` for bytes the node has no inode
+    // to hold, and a file mapping served as zeros is the one failure
+    // `sys_mmap`'s file arm exists to refuse.
+    if dev_node_of(fd).is_some() {
+        return false;
+    }
     with_file(fd, |entry| !entry.is_dir && entry.file().is_some()).unwrap_or(false)
 }
 
 /// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
 /// `usermode.rs` does not itself handle (console, pipe, socket).
 ///
-/// Writes into the descriptor's own `data` buffer at its cursor, growing it as
-/// needed; nothing reaches the disk here. `akuma-ext2`'s `write_file` replaces
-/// a file's entire contents in one call, so writing back after every `write(2)`
-/// would mean re-writing everything already written on each subsequent call —
-/// quadratic, and pointless before the program is done. `sys_close` is the one
-/// place this buffer is ever persisted; see the module header.
+/// Writes through the VFS at the descriptor's cursor, in [`MAX_IO`]-bounded
+/// chunks, with the disk I/O outside the [`FILES`] lock (C2 slice 5). It used
+/// to write into the descriptor's own `data` buffer and persist the whole file
+/// at `close` — which is the whole-file heap bug, and also why a `close` could
+/// fail with the program's only copy of the data already gone. A **synthetic**
+/// `/proc` view still writes into its cached render: there is no inode behind
+/// the path to write through.
 pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
@@ -1832,6 +2187,31 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     // writes it to its cache file in one call. The EINVAL it got back was
     // reported as `updating and opening ...: Invalid argument` and killed
     // every fetch, 2026-09-04.
+
+    // A `/dev` character node, before any of the file machinery: none of these
+    // has an inode to write through, and the ext2 path would answer `EIO` for
+    // all of them. `/dev/null` accepting every byte and keeping none is the
+    // whole point of it; `zero` and the entropy nodes are sinks too, which is
+    // what Linux does. `tty` is the console this target already writes to.
+    match dev_node_of(fd) {
+        Some("null" | "zero" | "random" | "urandom") => return len,
+        Some("tty") => {
+            let mut chunk = [0u8; 256];
+            let mut done = 0u64;
+            while done < len {
+                let n = ((len - done) as usize).min(chunk.len());
+                if !crate::uaccess::read_bytes(buf + done, &mut chunk[..n]) {
+                    return if done == 0 { errno::EFAULT } else { done };
+                }
+                for &byte in &chunk[..n] {
+                    serial::putb(byte);
+                }
+                done += n as u64;
+            }
+            return len;
+        }
+        _ => {}
+    }
 
     let mut written: usize = 0;
     while written < len as usize {
@@ -1953,7 +2333,12 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
     // A spawned child (an interactive `sshd` shell) reads its keystrokes from
     // its stdin pipe, which `sshd` feeds from the SSH channel — not the UART.
     // Yield while waiting so `sshd` and the netpoll daemon keep running.
-    if let Some(pipe_id) = crate::usermode::current_stdin_pipe() {
+    //
+    // Asked of **fd 0's descriptor** since C2 slice 6, not of the `Spawn` row:
+    // this syscall is `read`-shaped and must follow the same redirection every
+    // other read does, so a `paws` whose stdin was replaced reads what it was
+    // given rather than what it was spawned with.
+    if let Some(pipe_id) = pipe_read_id(0) {
         let mut one = [0u8; 1];
         loop {
             match crate::pipe::read(pipe_id, &mut one) {
@@ -2042,12 +2427,40 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     const SEEK_CUR: u64 = 1;
     const SEEK_END: u64 = 2;
 
-    if fd < FIRST_FILE_FD as u64 {
+    // An *unbound* 0/1/2 is the console, which has no offset. A **bound** one
+    // has been redirected and is whatever it now names — since C2 slice 6 that
+    // includes a spawned child's stdio pipes, so the guard has to ask rather
+    // than assume, exactly as `sys_read` and `sys_write` do.
+    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         return errno::EBADF;
     }
     let Some(fi) = file_index(fd) else {
         return errno::EBADF;
     };
+    // A pipe or a socket is not seekable, and Linux says so with `ESPIPE`. It
+    // used to be `EBADF` here by accident of the bound-0/1/2 guard above, which
+    // tells a caller its descriptor is closed when it is open and perfectly
+    // writable — the same wrong-errno failure `sys_pread64`'s header describes,
+    // and one musl's `FILE` layer reads as fatal rather than as "unseekable".
+    if pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() || socket_index(fd).is_some() {
+        return errno::ESPIPE;
+    }
+    // A `/dev` character node **is** seekable on Linux and every seek lands at
+    // the offset asked for — `/dev/null` and `/dev/zero` are infinite and
+    // contentless, so no position is out of range and none of them means
+    // anything. Answered as a zero-length file (`SEEK_END` → 0) rather than
+    // sent through `metadata`, which has no size to give for a node with no
+    // inode and would fail the seek with `EIO`.
+    //
+    // The cursor stays at 0 for all three whences because nothing moves it:
+    // the read and write arms above never touch `file.position` for a node.
+    if dev_node_of(fd).is_some() {
+        if !matches!(whence, SEEK_SET | SEEK_CUR | SEEK_END) {
+            return errno::EINVAL;
+        }
+        let delta = offset.cast_signed();
+        return if delta < 0 { errno::EINVAL } else { delta as u64 };
+    }
     // `SEEK_END` needs the size: synthetic from the cache, real from the VFS.
     // One `metadata` outside the lock for the real case — the rule `release`
     // states about disk I/O under `FILES`.
@@ -2247,6 +2660,17 @@ const S_IFREG_0644: u32 = 0o100_644;
 const S_IFCHR_0620: u32 = 0o020_620;
 /// `S_IFDIR | 0755`, for a directory descriptor.
 const S_IFDIR_0755: u32 = 0o040_755;
+/// `S_IFIFO | 0600`, for a pipe descriptor.
+///
+/// Needed from C2 slice 6, which is when a spawned child first *had* one at
+/// fd 1: `entry.file()` is `None` for a pipe, so the size/path arm below fell
+/// straight through to `EBADF` — a program that `fstat`s its own stdout (musl's
+/// stdio does, and so does every `test -p`) would have been told the descriptor
+/// it is holding does not exist.
+const S_IFIFO_0600: u32 = 0o010_600;
+/// `S_IFSOCK | 0600`, for a socket descriptor. Same reason as [`S_IFIFO_0600`],
+/// one variant along.
+const S_IFSOCK_0600: u32 = 0o140_600;
 
 /// Serialise a `struct stat` at the x86_64 field offsets. The fields this target
 /// can answer are filled; the rest stay zero rather than invented — a caller
@@ -2293,6 +2717,17 @@ fn encode_stat(
 /// to be right, not just `openat` succeeding.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+        (S_IFCHR_0620, 0u64, 1u64)
+    } else if pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() {
+        // C2 slice 6: a spawned child's fd 0/1/2 are pipes, and a pipe has no
+        // `KernelFile` for the arm below to take a path out of.
+        (S_IFIFO_0600, 0u64, 1u64)
+    } else if socket_index(fd).is_some() {
+        (S_IFSOCK_0600, 0u64, 1u64)
+    } else if dev_node_of(fd).is_some() {
+        // A `/dev` character node: `S_IFCHR`, size 0 — the same answer
+        // `sys_newfstatat` already gives for the same path, which is what
+        // keeps `stat file` and `fstat(open(file))` agreeing.
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
         // Size: synthetic from the cache, real from the VFS — one `metadata`
@@ -2705,20 +3140,17 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
 
 /// `(readable, writable)` for one fd, for [`sys_poll`]. Non-destructive.
 fn poll_ready(fd: u64) -> (bool, bool) {
-    // Same rule as `sys_read`: an *unbound* 0/1/2 is the console (or a spawned
-    // child's pipe), a bound one has been redirected and is described by what
-    // it now names — so the console answers below are guarded, not first.
+    // Same rule as `sys_read`: an *unbound* 0/1/2 is the console, a bound one
+    // has been redirected and is described by what it now names — so the
+    // console answers here are guarded, not first. The `Spawn`-row questions
+    // this used to ask ("does this task have a stdin/stdout pipe?") are gone
+    // with C2 slice 6: a spawned child's 0/1/2 are descriptors and fall through
+    // to the pipe arms below.
     if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         if fd == 0 {
-            return match crate::usermode::current_stdin_pipe() {
-                Some(p) => (crate::pipe::readable(p), false),
-                None => (crate::input::has_byte(), false),
-            };
+            return (crate::input::has_byte(), false);
         }
-        return match crate::usermode::current_stdout_pipe() {
-            Some(p) => (false, crate::pipe::writable(p)),
-            None => (false, true),
-        };
+        return (false, true);
     }
     if let Some(p) = pipe_read_id(fd) {
         return (crate::pipe::readable(p), false);
@@ -3556,6 +3988,72 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         u64::from_le_bytes(st[48..56].try_into().unwrap_or([0; 8])),
         6623,
     );
+
+    // The `/dev` character nodes. `ls -la /dev` has listed these since devfs
+    // arrived, but nothing ever bound a **descriptor** to one: `open` fell
+    // through to the ext2 path, where `/dev` is not a directory, and the two
+    // eras of that fall-through failed differently and silently — see
+    // `sys_openat`'s device arm. `ls > /dev/null` is what reaches it, on a
+    // rootfs with no real `/dev`, which is every rootfs this target has.
+    {
+        let devnull = b"/dev/null\0";
+        // `O_WRONLY | O_CREAT | O_TRUNC` — exactly what a shell's `>` emits,
+        // and the combination that used to try to *create* the node.
+        let nfd = sys_openat(0, devnull.as_ptr() as u64, 0o1101, 0);
+        // `!is_err`, not `>= FIRST_FILE_FD`: an errno is a `u64` at the very
+        // top of the range, so the obvious bound check passes for **every**
+        // failure. The `/dev/zero` arm below was written that way first and
+        // scored a green open on an `ENOENT`.
+        if t.check("fd: open /dev/null for writing", !errno::is_err(nfd)) {
+            let payload = b"discarded";
+            t.check_eq(
+                "fd: writing to /dev/null accepts every byte",
+                sys_write_file(nfd, payload.as_ptr() as u64, payload.len() as u64),
+                payload.len() as u64,
+            );
+            t.check_eq(
+                "fd: reading /dev/null is immediate EOF",
+                sys_read(nfd, buf.as_mut_ptr() as u64, 16),
+                0,
+            );
+            let mut nst = [0u8; STAT_SIZE];
+            t.check_eq("fd: fstat on /dev/null succeeds", sys_fstat(nfd, nst.as_mut_ptr() as u64), 0);
+            t.check_eq(
+                "fd: and reports a character device",
+                u64::from(u32::from_le_bytes(nst[24..28].try_into().unwrap_or([0; 4])) & 0o170_000),
+                0o020_000,
+            );
+            t.check_eq("fd: close /dev/null", sys_close(nfd), 0);
+        }
+        // `/dev/zero` reads zeros forever — and it must actually *fill* the
+        // buffer, not leave whatever was there. Seeded non-zero first, which
+        // is the difference between this check and a no-op.
+        let devzero = b"/dev/zero\0";
+        let zfd = sys_openat(0, devzero.as_ptr() as u64, 0, 0);
+        if t.check("fd: open /dev/zero", !errno::is_err(zfd)) {
+            buf.fill(0xAA);
+            t.check_eq("fd: /dev/zero reads the length asked for", sys_read(zfd, buf.as_mut_ptr() as u64, 32), 32);
+            t.check("fd: and every byte of it is zero", buf[..32].iter().all(|&b| b == 0));
+            let _ = sys_close(zfd);
+        }
+        // A **block** node is refused rather than falling through — `ENODEV`,
+        // not the `ENOENT` an absent file would get, because it is present and
+        // this target will not serve it.
+        //
+        // Asked only when the node is actually there. `/dev/vda` exists when
+        // `dev_probe` finds a virtio-blk device, which is QEMU and Firecracker
+        // and **not** the bare-metal box, whose root is a USB disk — so an
+        // unconditional check here is a suite that fails on the one machine
+        // that matters most.
+        if akuma_vfs_glue::dev_node("/dev/vda").is_some() {
+            let devvda = b"/dev/vda\0";
+            t.check_eq(
+                "fd: open /dev/vda is ENODEV, not a fall-through",
+                sys_openat(0, devvda.as_ptr() as u64, 0, 0),
+                errno::ENODEV,
+            );
+        }
+    }
 
     // Path-based stat: `newfstatat(AT_FDCWD, "/probe.txt", &st, 0)`, the form
     // `stat(2)` decodes to. Size, regular-file type bit and link count must all

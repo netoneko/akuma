@@ -50,16 +50,40 @@
 //! syscall family asking for a subsystem that has not been folded yet, and the
 //! message names which one.
 //!
-//! # What is deliberately NOT here
+//! # The fd-lifecycle family, and how its argument aged
 //!
-//! The fd-lifecycle family — `pipe_*`, `eventfd_*`, `unix_sock_*`,
-//! `epoll_destroy`, `pidfd_close`, `remove_socket`, `socket_clone_ref`,
-//! `flock_release` — is called from `akuma_exec`'s **own** `FdTable` teardown.
-//! This target does not use that table; `fd.rs` has its own `FDS`/`FILES`. So
-//! none of them can fire, and wiring them to `crate::pipe` would be actively
-//! wrong: an `akuma-exec` pipe id and a `crate::pipe::PipeId` are different
-//! namespaces, and mapping one onto the other would close a pipe nobody asked
-//! about. They become real in **C2**, when the fd surface folds.
+//! This header used to say the whole family — `pipe_*`, `eventfd_*`,
+//! `unix_sock_*`, `epoll_destroy`, `pidfd_close`, `remove_socket`,
+//! `socket_clone_ref`, `flock_release` — could not fire, because it is called
+//! from `akuma_exec`'s **own** `FdTable` teardown and this target uses
+//! `fd.rs`'s `FDS`/`FILES` instead; and that wiring them to `crate::pipe`
+//! would be *actively wrong*, an `akuma-exec` pipe id and a
+//! `crate::pipe::PipeId` being different namespaces.
+//!
+//! **Both halves of that were true and are now not.** C2 slice 4 mirrors every
+//! descriptor this target opens into the process's registered
+//! `SharedFdTable`, and `SharedFdTable::drop` runs `close_all()` — so the
+//! family fires. And the namespace argument was about a world in which no
+//! `SharedFdTable` here ever held a pipe or a socket: the payload of the
+//! `FileDescriptor::PipeRead`/`PipeWrite`/`Socket` this target constructs *is*
+//! a `crate::pipe` id and an `akuma_net::socket` index, because those are the
+//! only allocators it has. The pipe hooks were wired in slice 4 and the socket
+//! hooks in slice 7, each at its own field with that argument restated.
+//!
+//! **Ten `not_wired!` stubs are left** — it was 16 when the C2 plan was
+//! written — and they divide cleanly, each saying which:
+//!
+//! - **not built for this target** — `rump_socket_clone_ref`, `eventfd_*`,
+//!   `unix_sock_*`, `epoll_destroy`, `pidfd_close`. Seven of these, and none
+//!   is C2's business.
+//! - **the subsystem does not exist here** — `flock_release` (nothing
+//!   dispatches `flock(2)`), `resolve_file_id` and `read_at_by_inode` (they
+//!   name a file by `(mount id, inode)`; this target has one filesystem and no
+//!   mount table).
+//!
+//! None of the ten still says "C2", and that is the point of having gone
+//! through them: a stub whose stated reason is a *step* stops being true when
+//! the step lands, and nothing in the type system notices.
 
 use akuma_exec::{ExecConfig, ExecRuntime};
 
@@ -154,12 +178,27 @@ fn runtime() -> ExecRuntime {
         set_spawn_namespace: |_ns| {},
         clear_spawn_namespace: || {},
 
-        // ── not wired: the fd-lifecycle family (C2) ───────────────────────
-        // Called only from `akuma_exec::FdTable` teardown, which this target
-        // does not use. See the module header on why pointing these at
-        // `crate::pipe` would be wrong rather than merely premature.
-        remove_socket: |_| not_wired!("remove_socket", "C2: fd.rs folds into glue"),
-        socket_clone_ref: |_| not_wired!("socket_clone_ref", "C2: fd.rs folds into glue"),
+        // ── wired C2 slice 7 ──────────────────────────────────────────────
+        // The socket hooks, for the reason the pipe hooks below already carry
+        // and by the same argument: `fd.rs`'s `alloc_socket_fd` builds a
+        // `FileDescriptor::Socket(idx)` whose payload **is** an
+        // `akuma_net::socket` index, and slice 4 mirrors that descriptor into
+        // the registered table, so a `SharedFdTable` on this target can hold
+        // one. The two namespaces do not meet; there is one socket table.
+        //
+        // They were `not_wired!` — i.e. `panic!` — and that is not a
+        // theoretical cost. `SharedFdTable::drop` runs `close_all()`, which
+        // fires these per entry, so the *only* thing standing between a
+        // socket in a mirror and a kernel panic was every caller remembering
+        // `fd::clear_table_mirror` first. Slice 6 found a path that did not
+        // (`sys_spawn`'s `spawn_process_task` failure, where an unregistered
+        // `Arc<SharedFdTable>` dropped with three descriptors in it), and a
+        // panic is a poor way to learn that. Wired, the forgotten case is a
+        // double close instead of a dead machine — still a bug, and one the
+        // refcounts can be made to catch, rather than one that takes the box
+        // down.
+        remove_socket: |idx| crate::sock::close(idx),
+        socket_clone_ref: akuma_net::socket::socket_clone_ref,
         rump_socket_clone_ref: |_, _| not_wired!("rump_socket_clone_ref", "rump is not built for this target"),
         // ── wired C2 slice 4 ──────────────────────────────────────────────
         // The pipe hooks. The module header's warning — that mapping an
@@ -181,18 +220,33 @@ fn runtime() -> ExecRuntime {
         unix_sock_clone_ref: |_| not_wired!("unix_sock_clone_ref", "AF_UNIX is not built for this target"),
         epoll_destroy: |_| not_wired!("epoll_destroy", "sc-epoll is not in this target's feature set"),
         pidfd_close: |_| not_wired!("pidfd_close", "sc-pidfd is not in this target's feature set"),
-        flock_release: |_, _, _| not_wired!("flock_release", "C2: fd.rs folds into glue"),
+        // Not `fd.rs` folding any more, and the reason is narrower than it
+        // was: **this target has no `flock`.** `sys_flock` is not dispatched,
+        // nothing takes a lock, so nothing can release one. Reaching here
+        // means a folded arm brought advisory locking with it, and the panic
+        // is the notice.
+        flock_release: |_, _, _| not_wired!("flock_release", "this target dispatches no flock(2)"),
 
-        // ── not wired: the VFS read surface (C2) ──────────────────────────
-        // `read_file` above is enough for what glue reaches today. These three
-        // are the lazy/prefault path, and a wrong answer here is the
-        // `[0,0,0,0]` zero-page class of bug — the one case in this tree where
-        // a stub returning `Err` was itself the defect
+        // ── wired C2 slice 7 ──────────────────────────────────────────────
+        // The **path-addressed** read. `fs::read_at` is what slice 5 rebuilt
+        // this target's whole `read`/`pread` path on top of, so it is the same
+        // byte surface ring 3 already gets, not a second one — and the two
+        // callers that reach it (`akuma-elf`'s `ElfSource::Path`, and glue's
+        // partial reads) then behave here as they do on AArch64.
+        read_at: |path, off, buf| crate::fs::read_at(path, off, buf).map_err(|_| -1),
+
+        // ── still not wired: the **inode**-addressed read surface (C2) ────
+        // These two are the lazy/prefault path and they are a different
+        // question from `read_at` above: they name a file by `(mount id,
+        // inode)`, and this target has no mount table to give an id from —
+        // `KernelFile::new` leaves the inode 0 ("read by path") precisely
+        // because there is one filesystem here. Answering with an invented
+        // pair would be the `[0,0,0,0]` zero-page class of bug, the one case
+        // in this tree where a stub returning `Err` was itself the defect
         // (`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`). So: panic, and
-        // wire them for real when file-backed mappings go through glue.
-        read_at: |_, _, _| not_wired!("read_at", "C2: the VFS read surface"),
-        resolve_file_id: |_| not_wired!("resolve_file_id", "C2: the VFS read surface"),
-        read_at_by_inode: |_, _, _, _| not_wired!("read_at_by_inode", "C2: the VFS read surface"),
+        // wire them for real when this target has a mount table to key on.
+        resolve_file_id: |_| not_wired!("resolve_file_id", "no mount table to give an id from"),
+        read_at_by_inode: |_, _, _, _| not_wired!("read_at_by_inode", "no mount table to give an id from"),
 
         // ── wired 5b slice 4 ──────────────────────────────────────────────
         // `akuma-exec` calls this from `clear_child_tid` on process exit —
@@ -290,11 +344,13 @@ fn config() -> ExecConfig {
 /// step 6. They are `require()`, not `get()`, on purpose (see that crate's
 /// module header): unregistered, the first dynamically-linked binary reaches
 /// `load_interp_for` and panics with "VfsHooks not registered" rather than
-/// reading zeros. Two of the four forward `ExecRuntime` fields that are
-/// themselves category-3 stubs — `read_at` and `resolve_file_id` are the C2
-/// VFS read surface — and that is the right shape: they are reached only by
-/// `ElfSource::Path`, which this target's profile never selects, and if one
-/// ever is the panic names itself.
+/// reading zeros. **One** of the four forwards an `ExecRuntime` field that is
+/// still a stub: `read_at` was wired for real in C2 slice 7 (it is
+/// `fs::read_at`, the surface every `read`/`pread` on this target already goes
+/// through), and `resolve_file_id` is not, because it wants a `(mount id,
+/// inode)` pair from a target with no mount table. That is the right shape:
+/// both are reached only by `ElfSource::Path`, which this target's profile
+/// never selects, and if the stub ever is, the panic names itself.
 pub fn init() {
     let rt = runtime();
     akuma_exec::runtime::register(rt, config());
