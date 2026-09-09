@@ -1590,6 +1590,17 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
             };
             let end = pos + incoming.len();
             if entry.data.len() < end {
+                // Exact growth by the chunk's size, not `resize`'s doubling: a
+                // doubling grow needs ~3N of heap at the last step (old buffer,
+                // new buffer, copy), which on a 512 MiB heap put the OOM one
+                // doubling past a 135 MB file — and `alloc_error_handler` used
+                // to halt the holding core
+                // (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`). `try_reserve` is
+                // the guard that takes the spike off the machine: failure
+                // returns `ENOMEM` to ring 3, which is what Linux does.
+                if entry.data.try_reserve(end - entry.data.len()).is_err() {
+                    return Err(errno::ENOMEM);
+                }
                 entry.data.resize(end, 0);
             }
             entry.data[pos..end].copy_from_slice(&incoming);

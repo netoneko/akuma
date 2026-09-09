@@ -150,14 +150,23 @@ static ALLOCATOR: akuma_alloc::KernelAllocator = akuma_alloc::KernelAllocator;
 
 /// Out of memory.
 ///
-/// The aarch64 kernel kills the faulting process here. This target has no
-/// processes, so there is nothing to kill and panicking is the honest response.
+/// The aarch64 kernel kills the faulting process here. This target cannot yet
+/// (its allocation failures come from `fd.rs`'s whole-file cache, which C2
+/// deletes), so the honest response is to stop this core — but never with the
+/// Big Kernel Lock held: `halt()`'s abandon is owner-checked behind the
+/// `percpu_installed` gate, so release first, unconditionally. The allocation
+/// that OOMs here ran while this core held the lock (every fd write path does),
+/// and a halted owner leaves every peer spinning in `[BKL] stuck` forever —
+/// the bare-metal signature-B ssh lockout
+/// (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`). Releasing it degrades the machine
+/// to N-1 cores instead of stopping it.
 #[cfg(target_arch = "x86_64")]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
     serial::puts("\n[OOM] allocation of ");
     serial::put_dec(layout.size() as u64);
     serial::puts(" bytes failed\n");
+    smp::bkl_abandon();
     halt();
 }
 
