@@ -1180,7 +1180,32 @@ pub struct VfsGlueHooks {
     /// takes the config, and duplicating it here would give `src/config.rs` a
     /// second copy.
     pub fpcache_init: fn(usize),
+    /// One process's mappings, ascending, for `/proc/<pid>/maps` and
+    /// `/proc/<pid>/statm` — or `None` from a kernel that cannot describe an
+    /// address space.
+    ///
+    /// **A hook rather than code in `proc.rs`, because the walk is not
+    /// portable.** Reporting a *mapping* means reporting more than the region
+    /// list: an ELF image and its initial stack are placed by the loader and
+    /// are deliberately not regions, so a walk of the regions alone renders an
+    /// **empty** `maps` for an ordinary program — worse than not serving the
+    /// file, because a reader scanning for the mapping that contains an address
+    /// gets a confident "there is none". The rest comes from the page-table
+    /// leaves, and that walk (`UserAddressSpace::for_each_user_leaf`) exists
+    /// only for x86_64 — it is `x86_walk_leaves` underneath, with no AArch64
+    /// counterpart.
+    ///
+    /// So the kernel that *can* walk registers this; the one that cannot
+    /// registers a function returning `None`, and procfs reports both files as
+    /// absent — exactly what it did before the hook existed.
+    pub pid_map_rows: fn(u32) -> Option<alloc::vec::Vec<MapRow>>,
 }
+
+/// One mapping: `(start, end, readable, writable, executable, private)`.
+///
+/// `end` is exclusive. `private` is `p` in the `maps` permission column; a
+/// shared anonymous mapping is `s`.
+pub type MapRow = (usize, usize, bool, bool, bool, bool);
 
 static HOOKS: akuma_primitives::OnceCopy<VfsGlueHooks> = akuma_primitives::OnceCopy::new();
 
@@ -1195,6 +1220,12 @@ fn audio_is_available() -> bool {
 
 fn fs_exists(path: &str) -> bool {
     HOOKS.get().is_some_and(|h| (h.fs_exists)(path))
+}
+
+/// See [`VfsGlueHooks::pid_map_rows`]. `None` when no kernel registered one, or
+/// when the one that did cannot describe this pid.
+pub(crate) fn pid_map_rows(pid: u32) -> Option<alloc::vec::Vec<MapRow>> {
+    HOOKS.get().and_then(|h| (h.pid_map_rows)(pid))
 }
 
 /// Gated exactly like its only caller, `proc::active_core_count`: without real

@@ -2411,17 +2411,6 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
     Some(f(&mut p.mmap_regions.lock()))
 }
 
-/// How many physical frames the calling process's address space holds.
-///
-/// The `resident` field of `/proc/self/statm`, straight out of the frame ledger
-/// — which is the one structure on this target that knows. It counts *frames*,
-/// not VAs, so a page mapped twice in one address space is one resident page,
-/// which is what `statm` means by the word.
-#[must_use]
-pub fn current_resident_pages() -> usize {
-    current_process().map_or(0, |p| p.address_space.resident_pages())
-}
-
 /// Run `f` with the running process's user address space, under its lock.
 ///
 /// The address-space counterpart of [`with_current_regions`], and the same
@@ -2883,12 +2872,14 @@ fn flatten_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) -> alloc::vec::
 /// pointers — handing out a reference into it would outlive the single-core
 /// reasoning that makes touching it sound at all.
 pub struct ProcEntry {
-    pub pid: u32,
-    /// The parent pid `/proc/<pid>/stat` reports. From `Process::parent_pid`.
-    pub ppid: u32,
-    /// `Some` once the process has left ring 3 — a zombie until it is reaped.
-    pub exit: Option<i32>,
     /// argv, NUL-separated. Never empty: falls back to the program name.
+    ///
+    /// The only field left. This type used to carry `pid`, `ppid` and `exit`
+    /// as well, and render `/proc/<pid>/stat` through them — that was this
+    /// target's own `/proc`, deleted in 4b batch 2c in favour of the mounted
+    /// `ProcFilesystem`, which reads the same facts off `Process` directly.
+    /// What survives is one question `fork` asks: what did my parent's command
+    /// line say.
     pub cmdline: alloc::vec::Vec<u8>,
 }
 
@@ -2899,35 +2890,6 @@ impl ProcEntry {
         let first = self.cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
         core::str::from_utf8(first).unwrap_or("?")
     }
-
-
-    /// `R` while live, `Z` once it has exited and not yet been reaped.
-    #[must_use]
-    pub fn state(&self) -> akuma_procfs::ProcState {
-        match self.exit {
-            Some(code) => akuma_procfs::ProcState::Zombie(code),
-            // This target keeps no per-process run state — a task is either in
-            // the table or gone — so a live process reads `R`. Reporting `S`
-            // for one blocked in a syscall would need the scheduler to record
-            // it, which is a real feature rather than a `/proc` detail.
-            None => akuma_procfs::ProcState::Running,
-        }
-    }
-
-    /// The value `/proc/<pid>/stat` renders through.
-    #[must_use]
-    pub fn stat<'a>(&'a self, name: &'a str) -> akuma_procfs::ProcStat<'a> {
-        akuma_procfs::ProcStat {
-            pid: self.pid,
-            ppid: self.ppid,
-            state: self.state(),
-            name,
-            // No per-process CPU accounting on this target. A zero is the
-            // honest answer — `ps` prints `0:00` — where a fabricated number
-            // would be worse than none.
-            cpu_time_us: 0,
-        }
-    }
 }
 
 /// Record init's argv so `/proc/1` can describe it. Called once by [`run_init`].
@@ -2935,31 +2897,12 @@ fn set_init_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) {
     *INIT_CMDLINE.lock() = flatten_cmdline(args);
 }
 
-/// Every live process. What `getdents64("/proc")` enumerates.
+/// One `akuma-exec` `Process`'s command line.
 ///
-/// A *reaped* child is not here — `waitpid` unregisters it, and Linux drops the
-/// directory at the same point. A child that has exited but not been reaped is,
-/// as a zombie, which is exactly what `ps` is for.
-#[must_use]
-pub fn proc_list() -> alloc::vec::Vec<ProcEntry> {
-    let mut out = alloc::vec::Vec::new();
-    // 5b slice 2: rendered from `akuma-exec`'s process table, not from the
-    // spawn row. Init is in that table too (`run_init` registers pid 1), so
-    // unlike the spawn-table version this needs no synthetic first entry — the
-    // `init_entry()` special case existed only because init had no row.
-    akuma_exec::process::for_each_process(|p| {
-        out.push(proc_entry_of(p));
-    });
-    out
-}
-
-/// One `akuma-exec` `Process` as this target's `/proc` reader wants it.
-///
-/// The two renderings this replaces (`proc_list`, `proc_by_pid`) read the same
-/// fields, so they read them through one function: they disagreed once already
-/// — `proc_by_pid` special-cased init and `proc_list` pushed it separately —
-/// and that is the kind of drift a shared accessor makes impossible rather than
-/// unlikely.
+/// This rendered a whole `/proc` entry — pid, ppid, exit status — until 4b
+/// batch 2c deleted this target's own `/proc`. The mounted `ProcFilesystem`
+/// reads those facts off `Process` directly; what is left is the one question
+/// `sys_fork` asks about a parent it is about to copy.
 fn proc_entry_of(p: &akuma_exec::process::Process) -> ProcEntry {
     let img = p.image.lock();
     // `image.args` is `Vec<String>`; `/proc/<pid>/cmdline` is NUL-terminated
@@ -2973,18 +2916,7 @@ fn proc_entry_of(p: &akuma_exec::process::Process) -> ProcEntry {
         cmdline.extend_from_slice(img.name.as_bytes());
         cmdline.push(0);
     }
-    ProcEntry {
-        pid: p.pid,
-        ppid: p.parent_pid,
-        // A process that has exited but not been reaped is a zombie, and `ps`
-        // exists to show it. `exited`/`exit_code` are the atomics `akuma-exec`
-        // keeps for exactly this, and they carry the same meaning as the spawn
-        // row's `Option<i32>`: `None` until it leaves ring 3.
-        exit: p.exited.load(core::sync::atomic::Ordering::Acquire).then(|| {
-            p.exit_code.load(core::sync::atomic::Ordering::Acquire)
-        }),
-        cmdline,
-    }
+    ProcEntry { cmdline }
 }
 
 /// One process by pid, or `None` if no such process is live.
@@ -3008,10 +2940,6 @@ pub fn proc_by_pid(pid: u32) -> Option<ProcEntry> {
     if pid == 1 {
         let cmdline = INIT_CMDLINE.lock().clone();
         return Some(ProcEntry {
-            pid: 1,
-            // Linux gives init ppid 0, and `ps` renders that as the tree root.
-            ppid: 0,
-            exit: None,
             cmdline: if cmdline.is_empty() { alloc::vec![b'i', b'n', b'i', b't', 0] } else { cmdline },
         });
     }

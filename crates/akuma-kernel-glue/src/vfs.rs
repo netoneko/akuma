@@ -25,6 +25,10 @@ pub fn register() {
         probed_core_count,
         utc_time_us: crate::timer::utc_time_us,
         fpcache_init: crate::file_page_cache::init,
+        // This kernel has no page-table leaf walk (`for_each_user_leaf` is
+        // x86-only), so it cannot describe an address space and `maps`/`statm`
+        // stay absent here — which is what they were before the hook existed.
+        pid_map_rows: |_pid| None,
     });
 }
 

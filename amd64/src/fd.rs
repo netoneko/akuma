@@ -174,40 +174,12 @@ fn fs_err_errno(e: akuma_vfs::FsError) -> u64 {
 /// refuses a write open of a directory at `open(2)` and otherwise lets the VFS
 /// answer, so this target grew the same shape ahead of the fold.
 ///
-/// `/proc` is asked of [`proc_metadata`] and everything else of the VFS, in
-/// that order, because a synthetic view has no inode for `fs::metadata` to
-/// find: `/proc/<pid>` is a directory that exists only in the process table,
-/// and asking the disk about it answers "no such file" rather than "not a
-/// directory". `/proc` itself is on the image as a real empty directory, so
-/// either source would do for that one; the ordering makes the answer come
-/// from the thing that renders it.
-///
-/// The prefix test is `== "/proc"` or `starts_with("/proc/")` rather than
-/// `strip_prefix("/proc")`, which would also claim a file named `/procfoo`.
+/// `/proc` used to be asked of a synthetic view here, ahead of the VFS, because
+/// this target rendered that namespace itself. It does not any more: the
+/// mounted `ProcFilesystem` answers `metadata` for `/proc` and everything under
+/// it, so one question suffices.
 fn path_is_dir(path: &str) -> bool {
-    if path == "/proc" || path.starts_with("/proc/") {
-        // [`proc_is_dir`], not [`proc_metadata`]: the latter answers the size
-        // too, and it gets it by **rendering the whole file**. Asking it here
-        // would re-render `/proc/meminfo` on every `fstat` of it purely to
-        // learn that it is not a directory.
-        let rest = path.strip_prefix("/proc").unwrap_or("");
-        return proc_is_dir(&normalise_proc(rest));
-    }
     fs::metadata(path).is_ok_and(|m| m.is_dir)
-}
-
-/// The `/proc`-relative rest of a synthetic descriptor's path, for
-/// `render_proc_file` — `None` for a real (ext2) path. The discriminator is
-/// the path prefix itself (`== "/proc"` or `starts_with("/proc/")`, never
-/// `strip_prefix("/proc")`, which would also claim a file named `/procfoo`):
-/// `sys_openat` intercepts every `/proc` open, so a descriptor whose path is
-/// `/proc`-prefixed was created by this module and has no inode behind it.
-fn proc_rest_of(path: &str) -> Option<&str> {
-    if path == "/proc" {
-        Some("")
-    } else {
-        path.strip_prefix("/proc/")
-    }
 }
 
 /// The console's line discipline.
@@ -1022,33 +994,34 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         return errno::EFAULT;
     };
 
-    // `/proc/<pid>/fd/0` — `sshd`'s bridge opens this to feed a spawned shell's
-    // stdin. It is the only procfs path this target answers; everything else
-    // under /proc is ENOENT.
-    if let Some(rest) = path.strip_prefix("/proc/") {
-        if let Some(pid_str) = rest.strip_suffix("/fd/0") {
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                return errno::ENOENT;
-            };
-            let Some(pipe_id) = crate::usermode::stdin_pipe_for_pid(pid) else {
-                return errno::ENOENT;
-            };
-            return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
-        }
-        // Everything else under /proc: the live process table and the
-        // system-wide virtual files. A path this view does not serve falls
-        // through to the mounted `ProcFilesystem` — see `sys_newfstatat`.
-        if let Some(r) = open_proc(rest, flags_) {
-            return r;
-        }
-    }
-    // `/proc` itself, with no trailing slash — the path `ps` and `top` open to
-    // enumerate processes. The `strip_prefix("/proc/")` above cannot match it,
-    // and without this it fell through to the real, empty ext2 directory.
-    if path == "/proc"
-        && let Some(r) = open_proc("", flags_)
+    // **The last path this kernel answers for itself.**
+    //
+    // `/proc/<pid>/fd/0` — `sshd`'s bridge opens it to feed a spawned shell's
+    // stdin, and gets back the **write end of that child's stdin pipe**, which
+    // is not what the name means anywhere else: on Linux, and in the shared
+    // `ProcFilesystem`, writing to a process's fd 0 delivers into *its* stdin,
+    // and the shared route (`write_to_process_stdin`) delivers into a
+    // `StdioBuffer`/`ProcessChannel` that this target's children — whose fd 0
+    // is a `PipeRead` since C2 slice 6 — never read.
+    //
+    // Everything else under `/proc` is the mounted filesystem's, through the
+    // ordinary path below. This kernel rendered that whole namespace itself
+    // until 4b batch 2c, from its own spawn table, falling through to the mount
+    // only for what its view did not serve — two implementations of one
+    // namespace. Closing this one means teaching the shared stdin sink to find
+    // the target's real stdin (its own `get_fd(0)`), which is a change to
+    // behaviour on **both** kernels and so waits for a working AArch64
+    // verification loop.
+    if let Some(rest) = path.strip_prefix("/proc/")
+        && let Some(pid_str) = rest.strip_suffix("/fd/0")
     {
-        return r;
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            return errno::ENOENT;
+        };
+        let Some(pipe_id) = crate::usermode::stdin_pipe_for_pid(pid) else {
+            return errno::ENOENT;
+        };
+        return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
     }
 
     let Ok(normalised) = resolve_at(dirfd, path) else {
@@ -1636,26 +1609,8 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         Some(Err(e)) => return e,
         None => return errno::EBADF,
     };
-    let proc_rest = proc_rest_of(&path);
-    if let Some(rest) = proc_rest {
-        let Some(data) = render_proc_file(rest) else {
-            return 0;
-        };
-        let n = data.len().saturating_sub(pos).min(len as usize);
-        if n == 0 {
-            return 0;
-        }
-        let r = copy_to_user(buf, &data[pos..pos + n]);
-        if !errno::is_err(r) {
-            table_with(fd, |d| {
-                if let FileDescriptor::File(f) = d {
-                    f.position = pos + n;
-                }
-            });
-        }
-        return r;
-    }
-    // Real path: one bounded VFS read, then the position moves.
+    // One bounded VFS read, then the position moves — for `/proc` too, which is
+    // a mount like any other now.
     let mut kbuf = alloc::vec![0u8; len as usize];
     // **The error is mapped, not flattened.** `Err(_) => EIO` stood here, and
     // it is what made `read` on a directory descriptor answer `EIO` the moment
@@ -1750,15 +1705,6 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
         Some(Err(e)) => return e,
         None => return errno::EBADF,
     };
-    let proc_rest = proc_rest_of(&path);
-    if let Some(rest) = proc_rest {
-        // A mapped synthetic view: rendered fresh at the offset asked for.
-        let Some(data) = render_proc_file(rest) else {
-            return 0;
-        };
-        let n = data.len().saturating_sub(off as usize).min(len as usize);
-        return copy_to_user(buf, &data[off as usize..off as usize + n]);
-    }
     let mut kbuf = alloc::vec![0u8; len as usize];
     let n = match fs::read_at(&path, off as usize, &mut kbuf) {
         Ok(n) => n,
@@ -1798,14 +1744,6 @@ pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
         FileDescriptor::File(f) => Some(f.path.clone()),
         _ => None,
     })??;
-    let proc_rest = proc_rest_of(&path);
-    if let Some(rest) = proc_rest {
-        // A mapped synthetic view: rendered fresh at the offset asked for.
-        let data = render_proc_file(rest)?;
-        let n = data.len().saturating_sub(offset).min(dst.len());
-        dst[..n].copy_from_slice(&data[offset..offset + n]);
-        return Some(n);
-    }
     // Real file: the page comes off the VFS. A read error fills nothing —
     // the caller's freshly zeroed page shows through, which is the same
     // answer "past EOF" gets, and the only kind thing a fault path can do
@@ -1936,11 +1874,13 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
         } else {
             pos
         };
-        let proc_rest = proc_rest_of(&path);
-        let step = if proc_rest.is_some() {
-            // Synthetic: accepted and dropped — see this function's header.
-            Ok(incoming.len())
-        } else {
+        // **`/proc` writes reach the filesystem now.** They used to be
+        // "accepted and dropped" here, because the paths under `/proc` were a
+        // synthetic view with nothing behind them. They are a mount like any
+        // other since the view was deleted, and `write_at` on one is how
+        // `/proc/<pid>/fd/0` — the channel `sshd`'s bridge writes a session's
+        // keystrokes into — is served at all.
+        let step = {
             match akuma_vfs_glue::write_at(&path, pos, &incoming) {
                 // Short/partial writes: `write_at` returns what it placed,
                 // and the cursor moves by that — the caller retries the rest,
@@ -2127,17 +2067,14 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     let FileDescriptor::File(f) = &desc else {
         return errno::EBADF;
     };
-    let (proc_rest, path, position) = (proc_rest_of(&f.path), f.path.clone(), f.position);
-    // `SEEK_END` needs the size: synthetic from a fresh render, real from the
-    // VFS. One `metadata` outside the lock for the real case — the rule
-    // `release_desc` states about disk I/O under the table lock. A directory
-    // descriptor takes the real branch rather than being excluded: Linux
-    // permits `lseek` on one, and `metadata` answers its size like any other
-    // inode. The old exclusion left `total` at 0, so `SEEK_END` on a directory
-    // silently meant `SEEK_SET(0)`.
-    let total = if let Some(rest) = proc_rest {
-        render_proc_file(rest).map_or(0, |d| d.len())
-    } else {
+    let (path, position) = (f.path.clone(), f.position);
+    // `SEEK_END` needs the size, and one `metadata` answers it — for `/proc`
+    // too, which renders its own sizes now. Outside the lock, per the rule
+    // about disk I/O under the table lock. A directory descriptor takes this
+    // branch rather than being excluded: Linux permits `lseek` on one, and the
+    // old exclusion left `total` at 0, so `SEEK_END` on a directory silently
+    // meant `SEEK_SET(0)`.
+    let total = {
         match fs::metadata(&path) {
             Ok(m) => m.size as usize,
             Err(e) => return fs_err_errno(e),
@@ -2300,13 +2237,6 @@ const S_IFREG_0644: u32 = 0o100_644;
 const S_IFCHR_0620: u32 = 0o020_620;
 /// `S_IFDIR | 0755`, for a directory descriptor.
 const S_IFDIR_0755: u32 = 0o040_755;
-/// `S_IFREG | 0444`, for a `/proc` render — read-only, which is what it is.
-///
-/// The same mode `sys_newfstatat` reports for the same path, so `stat` and
-/// `fstat` agree on a `/proc` file. Before the `is_dir` removal every
-/// synthetic view was reported as a zero-length **directory** by `fstat`,
-/// including `/proc/meminfo`.
-const S_IFREG_0444: u32 = 0o100_444;
 /// `S_IFIFO | 0600`, for a pipe descriptor.
 ///
 /// Needed from C2 slice 6, which is when a spawned child first *had* one at
@@ -2407,10 +2337,9 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         // and most every `openat`-based directory walker are built on, which
         // is the shape a self-hosting build reaches for.
         //
-        // Both halves are answered from the source that knows: a synthetic
-        // view asks [`proc_metadata`] (the same answer `newfstatat` gives for
-        // the same path, so `stat` and `fstat` agree), and a real file asks
-        // the VFS for `is_dir` alongside the size it was already fetching.
+        // Both halves come from the VFS — including `/proc`, whose sizes the
+        // mounted filesystem renders, so `stat` and `fstat` agree by asking one
+        // source rather than by two views being kept in step.
         let resolved = table_with(fd, |d| match d {
             FileDescriptor::File(f) => Some(f.path.clone()),
             _ => None,
@@ -2421,15 +2350,6 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         };
         if path_is_dir(&path) {
             (S_IFDIR_0755, 0u64, 2u64)
-        } else if let Some(rest) = proc_rest_of(&path) {
-            match proc_metadata(rest) {
-                // A `/proc` render: read-only, and its size is the bytes this
-                // descriptor will actually serve — the same answer
-                // `sys_newfstatat` gives for the same path, which is what
-                // keeps `stat` and `fstat` agreeing.
-                Some((size, false)) => (S_IFREG_0444, size, 1u64),
-                _ => (S_IFREG_0444, 0u64, 1u64),
-            }
         } else {
             match fs::metadata(&path) {
                 Ok(m) => (S_IFREG_0644, m.size, 1u64),
@@ -2580,29 +2500,10 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
     // `/proc` paths have no inode. `ps` calls `stat` on `/proc/<pid>` to read
     // the owning uid for its USER column, and `top` `stat`s `/proc` itself
     // before it will start.
-    let proc_rest = if normalised == "/proc" {
-        Some("")
-    } else {
-        normalised.strip_prefix("/proc/")
-    };
-    // A `/proc` path this kernel's own synthetic view does not serve is no
-    // longer `ENOENT`: since 5b slice 3 the real `ProcFilesystem` is mounted
-    // at `/proc`, and it serves files this one never did (`uptime`,
-    // `loadavg`, the system-wide `stat`, per-pid `mounts`, the `fd`
-    // directory). Falling through to the normal path walk is what lets the
-    // union show through, and it keeps the three answers consistent by
-    // construction: open, stat and access all fall through at the same point.
-    if let Some(rest) = proc_rest
-        && let Some((size, is_dir)) = proc_metadata(rest)
-    {
-        // 0o40555 / 0o100444: root-owned, world-readable, never writable.
-        let mode = if is_dir { 0o040_555 } else { 0o100_444 };
-        let st = encode_stat(mode, size, 1, if is_dir { 2 } else { 1 }, None, None, None);
-        if errno::is_err(copy_to_user(statbuf, &st)) {
-            return errno::EFAULT;
-        }
-        return 0;
-    }
+    // `/proc` is the mounted `ProcFilesystem`'s, answered by the same
+    // `fs::metadata` every other path uses — which is what makes `open`, `stat`
+    // and `access` agree by construction rather than by three views being kept
+    // in step. This kernel served that namespace itself until 4b batch 2c.
 
     let Ok(meta) = fs::metadata(&normalised) else {
         return errno::ENOENT;
@@ -2881,28 +2782,13 @@ pub fn sys_access(path: u64) -> u64 {
         p.push_str(&path);
         p
     };
-    // `/proc` first, through the **same** `proc_metadata` `stat` uses.
-    //
-    // This was missing until 2026-09-07 and it made `access` and `open`
-    // disagree about what exists: `/proc/self/status` opened fine, `stat`ed
-    // fine, and `access(R_OK)` said `ENOENT`. `render_proc_file`'s own header
-    // says one function serves `open` and `stat` "so the two can never disagree
-    // about what exists" — and there was a third caller that never asked it.
-    // `smapsdirty`'s `proc-self-files` sub-probe reported `stat`, `status` and
-    // `cmdline` missing on a target that serves all three, which is what found
-    // it (`docs/archive/AKUMA_AMD64_MEMORY_GAPS.md` §3).
-    let proc_rest = if normalised == "/proc" {
-        Some("")
-    } else {
-        normalised.strip_prefix("/proc/")
-    };
-    // Served here, or fall through to the mounted `ProcFilesystem` below —
-    // see the matching comment in `sys_newfstatat`.
-    if let Some(rest) = proc_rest
-        && proc_metadata(rest).is_some()
-    {
-        return 0;
-    }
+    // `/proc` needed a branch of its own here until 4b batch 2c, and its
+    // absence was a real bug: `access` and `open` disagreed about what exists —
+    // `/proc/self/status` opened fine, `stat`ed fine, and `access(R_OK)` said
+    // `ENOENT` (found by `smapsdirty`'s `proc-self-files` sub-probe,
+    // `AKUMA_AMD64_MEMORY_GAPS.md` §3). With one implementation of `/proc`
+    // there is nothing to keep in step: `fs::metadata` below answers for it
+    // like any other mount.
     if fs::metadata(&normalised).is_ok() {
         0
     } else {
@@ -3010,249 +2896,75 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     }
 }
 
-/// Install a read-only fd for a **synthetic directory**: one that exists only
-/// as a listing, with no ext2 inode behind it.
-///
-/// The listing is pre-seeded into the descriptor's `dir_cache`, which is the
-/// field [`sys_getdents64`] already consults before it would call
-/// `fs::read_dir`. So a synthetic directory needs no branch in `getdents64` at
-/// all — and it inherits the snapshot-on-open semantics for free, which is what
-/// a process table being walked while processes come and go requires anyway.
-fn install_synthetic_dir(path: &str, names: Vec<(alloc::string::String, u8)>, flags: u64) -> u64 {
-    let mut file = KernelFile::new(alloc::string::String::from(path), flags as u32);
-    file.dir_cache = Some(
-        names
-            .into_iter()
-            .map(|(name, d_type)| akuma_exec_core::process::DirCacheEntry { name, d_type })
-            .collect(),
-    );
-    install(FileDescriptor::File(file))
-}
-
-/// DT_DIR / DT_REG, as `getdents64` spells them.
-const DT_DIR: u8 = 4;
-const DT_REG: u8 = 8;
-
-/// The per-process files this target serves under `/proc/<pid>/` for **any**
-/// pid. Rendered by `akuma-procfs` out of the spawn table, which is the only
-/// process state reachable by pid here.
-const PID_FILES: [&str; 3] = ["cmdline", "stat", "status"];
-
-/// The two more it serves for the **calling** process only.
-///
-/// `maps` and `statm` describe an *address space*, and the only address space
-/// this target can name is the running one: the fd rows are keyed by process slot,
-/// the spawn table is keyed by pid, and nothing joins them. Every real reader of
-/// these two files reads its own — an allocator sizing its arenas, a sanitiser
-/// finding the heap, `ps` reading `statm` for its own RSS — so serving `self`
-/// and nothing else is a narrowing rather than a fiction.
-///
-/// **It must be a narrowing of the listing too.** `open_proc`'s own comment
-/// spells out why: a name advertised in `/proc/<pid>` whose `stat` then says
-/// `ENOENT` is how `ls /proc/2` prints "No such file or directory" about its own
-/// listing. So [`pid_files`] returns these only for the pid that can serve them,
-/// and `render_pid_file` refuses them for any other — one rule, asserted in both
-/// directions by `proc_check`.
-const SELF_ONLY_PID_FILES: [&str; 2] = ["maps", "statm"];
-
-/// The per-process file names `/proc/<pid>` should list, for this pid.
-fn pid_files(pid: u32) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = PID_FILES.to_vec();
-    if pid == crate::usermode::current_pid() {
-        out.extend_from_slice(&SELF_ONLY_PID_FILES);
-    }
-    out
-}
-
-/// Normalise a path under `/proc`: drop trailing slashes, then rewrite a
-/// leading `self` to the calling process's own pid.
-///
-/// # Both halves are load-bearing, and both were found the hard way
-///
-/// **Trailing slashes.** `busybox ps` stats `"/proc/1/"`, not `"/proc/1"` — it
-/// builds the directory prefix once and reuses it with the filename appended,
-/// so the bare-directory `stat` carries the separator. Without the trim,
-/// `"1/"` split into `("1", Some(""))` and matched no arm, `stat` answered
-/// `ENOENT`, and `procps_scan` did what it does for a process that exited
-/// between the `readdir` and the `stat`: `continue`. Every pid was skipped and
-/// `ps` printed its header and nothing else — with no error anywhere, because
-/// from `ps`'s point of view nothing had gone wrong.
-///
-/// **`self`.** `/proc/self` is a symlink on Linux and essentially every tool
-/// reaches `/proc` through it. This target has no symlink machinery for a
-/// synthetic path, so the rewrite happens here, on the string. The AArch64
-/// kernel has the identical helper for the identical reason
-/// (`akuma-vfs-glue`'s `resolve_self`), where its absence was what stopped
-/// `redis-server` starting at all.
-fn normalise_proc(rest: &str) -> alloc::string::String {
-    let rest = rest.trim_end_matches('/');
-    let pid = crate::usermode::current_pid();
-    let mut out = alloc::string::String::new();
-    use core::fmt::Write as _;
-    if rest == "self" {
-        let _ = write!(out, "{pid}");
-    } else if let Some(tail) = rest.strip_prefix("self/") {
-        let _ = write!(out, "{pid}/{tail}");
-    } else {
-        out.push_str(rest);
-    }
-    out
-}
-
-/// Render one `/proc/<pid>/<file>`, or `None` if the pid or the file is not one
-/// this target serves.
-///
-/// The bytes themselves are `akuma-procfs`, shared with the AArch64 kernel and
-/// host-tested there — this function is only the lookup and the buffer.
-fn render_pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
-    // `stat`, `status` and `cmdline` stay here rather than moving to the
-    // mounted `ProcFilesystem`, which serves all three and renders them from
-    // the same `akuma-exec` table through the same `akuma-procfs` formats.
-    // Moving them was tried during 5b slice 3 and reverted, for a reason worth
-    // recording:
-    //
-    // **The boot suite runs before `run_init`.** Its `proc: open/stat/access
-    // agree on /proc/self/{stat,status,cmdline}` checks execute on a task that
-    // is registered in no process table, and `current_pid()` answers 1 for it.
-    // This file can answer for that window (`proc_by_pid` has an explicit pid-1
-    // fallback); the mounted filesystem cannot, because it reads the table and
-    // the table is empty. Routing the three there made all three checks fail.
-    //
-    // Serving them from a table the mount also reads is duplication, but not
-    // *divergence*: one source, one format crate, two callers. Closing it means
-    // registering pid 1 before the self-tests run, which is its own change with
-    // its own hazards (`run_init` registers pid 1 too, and would then be
-    // re-registering rather than creating).
-    //
-    // `meminfo`, `mounts` and `net/dev` stay for a different and stronger
-    // reason: they read *this* target's PMM, mount table and interface list,
-    // where the crate's same-named files read the AArch64 kernel's. A shared
-    // format is not a shared source.
-    let entry = crate::usermode::proc_by_pid(pid)?;
-    let name_owned = alloc::string::String::from(entry.name());
-    let stat = entry.stat(&name_owned);
-    match file {
-        "stat" => {
-            let mut buf = [0u8; akuma_procfs::STAT_LINE_MAX];
-            let n = akuma_procfs::render_pid_stat(&stat, &mut buf);
-            Some(buf[..n].to_vec())
-        }
-        "status" => {
-            let mut buf = [0u8; akuma_procfs::STATUS_MAX];
-            let n = akuma_procfs::render_status(&stat, &mut buf);
-            Some(buf[..n].to_vec())
-        }
-        // Already in the `/proc` wire form (NUL-separated) — `usermode` stores
-        // it that way, so this is a copy rather than a render.
-        "cmdline" => Some(entry.cmdline.clone()),
-        // The two address-space files, for the caller's own pid only — see
-        // `SELF_ONLY_PID_FILES` for why, and note the guard is here as well as
-        // in `pid_files` so `open`, `stat` and `access` all agree.
-        "maps" if pid == crate::usermode::current_pid() => Some(render_self_maps()),
-        "statm" if pid == crate::usermode::current_pid() => Some(render_self_statm()),
-        _ => None,
-    }
-}
-
-/// `/proc/self/maps` — the calling process's address space, ascending.
-///
-/// # Two sources, because neither alone is the address space
-///
-/// The **region list** holds what `mmap` recorded, including a lazy reservation
-/// no page of which exists yet — Linux reports a VMA, not its resident pages, so
-/// that is the authoritative extent wherever there is one. But the ELF image and
-/// the initial stack are placed by the loader and are deliberately *not*
-/// regions (`mm.rs`: the region table is `mmap`'s; frame ownership is the
-/// ledger's), so a walk of the regions alone produces an **empty** file for an
-/// ordinary program — which is what the first version of this function did.
-///
-/// That is worse than not serving the file at all, and it is the same mistake as
-/// answering `ENOSYS` where Linux answers `EINVAL`: a reader scanning `maps` for
-/// the mapping containing an address gets a confident "there is none" instead of
-/// "this kernel cannot tell you". So the present **page-table leaves** outside
-/// every region are coalesced into runs and reported too — the image, the stack,
-/// and anything else the loader mapped.
-///
-/// # What it still is not
-///
-/// A run of leaves is not a VMA: two adjacent loader mappings with identical
-/// permissions merge into one line, and a lazy region's unfaulted middle is one
-/// line rather than a hole. Both are what the hardware says, which is the only
-/// record this target keeps for loader pages.
-///
-/// # Ascending, because that is part of the format
-///
-/// The region list is not kept in address order — `detach_eager_regions_in_range`
-/// pushes survivors onto the end — and a parser that stops at the first line past
-/// the address it wants would miss on an unsorted file.
-fn render_self_maps() -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut line = [0u8; akuma_procfs::MAPS_LINE_MAX];
-    for (start, end, read, write, exec, private) in self_map_rows() {
-        let n = akuma_procfs::render_maps_line(
-            start, end, read, write, exec, private, "", &mut line,
-        );
-        out.extend_from_slice(&line[..n]);
-    }
-    out
-}
-
 /// `(start, end, readable, write, exec, private)` — one mapping.
 type MapRow = (usize, usize, bool, bool, bool, bool);
 
-/// The calling process's mappings, ascending. See [`render_self_maps`] for why
-/// there are two sources; this is that walk, shared with [`render_self_statm`]
-/// so `maps` and `statm` cannot report different address spaces.
-fn self_map_rows() -> Vec<MapRow> {
-    type Row = MapRow;
-
-    let mut rows: Vec<Row> = crate::usermode::with_current_regions(|regions| {
-        regions
+/// **The `/proc/<pid>/maps` and `/proc/<pid>/statm` walk, for any pid** — this
+/// target's answer to `akuma_vfs_glue::VfsGlueHooks::pid_map_rows`.
+///
+/// Registered in `fs::init_vfs`, so the *shared* `ProcFilesystem` renders both
+/// files (through the same `akuma-procfs` formats this module used to call
+/// directly) and this kernel stops serving them from a view of its own. The
+/// hook exists because the leaf walk below is x86-only: `for_each_user_leaf`
+/// is `x86_walk_leaves` underneath, and the AArch64 kernel registers a
+/// function returning `None`.
+///
+/// `None` means "no such process", which procfs turns into an absent file.
+pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
+    let regions = akuma_exec::process::with_process(pid, |p| {
+        p.mmap_regions
+            .lock()
             .iter()
             .map(|r| {
                 let prot = r.recorded_prot().unwrap_or(akuma_mmap::Prot::RW_NO_EXEC);
                 (
                     r.start_va,
                     r.start_va.saturating_add(r.len_bytes()),
-                    // A `PROT_NONE` reservation is `---p` on Linux too: a
-                    // mapping that exists and grants nothing, which is exactly
-                    // what a guard region is and what a reader looks for.
                     !prot.is_none(),
                     prot.is_write(),
                     prot.is_exec(),
                     !r.shared_anon,
                 )
             })
-            .collect()
-    })
-    .unwrap_or_default();
-
-    // The region extents, so the leaf walk can skip what a region already
-    // describes. Taken as a snapshot rather than re-locking per page.
+            .collect::<Vec<MapRow>>()
+    })?;
+    let mut rows = regions;
     let extents: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.1)).collect();
+    let leaves = akuma_exec::process::with_process(pid, |p| {
+        collect_leaf_runs(&p.address_space.lock(), &extents)
+    })?;
+    rows.extend(leaves);
+    rows.sort_unstable_by_key(|r| r.0);
+    Some(rows)
+}
 
-    // Present user leaves outside every region, coalesced. `for_each_user_leaf`
-    // visits in ascending VA order (it walks each level's indices upward), which
-    // is what makes a single-pass coalesce correct rather than a sort-then-merge.
-    let mut run: Option<Row> = None;
-    let _ = crate::usermode::with_current_address_space(|uas| {
+/// Present user leaves outside every extent in `skip`, coalesced into runs.
+///
+/// `for_each_user_leaf` visits in ascending VA order (it walks each level's
+/// indices upward), which is what makes a single-pass coalesce correct rather
+/// than a sort-then-merge.
+///
+/// A run is not a VMA: two adjacent loader mappings with identical permissions
+/// merge into one line. That is what the hardware says, which is the only
+/// record this target keeps for pages the loader placed.
+fn collect_leaf_runs(uas: &akuma_mmu::UserAddressSpace, skip: &[(usize, usize)]) -> Vec<MapRow> {
+    let mut rows: Vec<MapRow> = Vec::new();
+    let mut run: Option<MapRow> = None;
     uas.for_each_user_leaf(|leaf| {
         let (va, prot) = (leaf.va, leaf.prot);
-        if !prot.user || extents.iter().any(|&(s, e)| va >= s && va < e) {
-            // Flush across a gap the region list already covers, so a mapping
-            // either side of it is not merged through it.
+        if !prot.user || skip.iter().any(|&(s, e)| va >= s && va < e) {
+            // Flush across a gap a region already covers, so a mapping either
+            // side of it is not merged through it.
             if let Some(r) = run.take() {
                 rows.push(r);
             }
             return;
         }
-        // Every present leaf is readable — x86 has no read-disable bit, so
-        // `r` is not a fact the PTE can carry differently.
+        // Every present leaf is readable — x86 has no read-disable bit, so `r`
+        // is not a fact the PTE can carry differently.
         let (w, x) = (prot.write, prot.exec);
         match run {
-            Some(ref mut r) if r.1 == va && r.3 == w && r.4 == x => {
-                r.1 = va + 4096;
-            }
+            Some(ref mut r) if r.1 == va && r.3 == w && r.4 == x => r.1 = va + 4096,
             _ => {
                 if let Some(r) = run.take() {
                     rows.push(r);
@@ -3261,225 +2973,10 @@ fn self_map_rows() -> Vec<MapRow> {
             }
         }
     });
-    });
     if let Some(r) = run.take() {
         rows.push(r);
     }
-
-    rows.sort_unstable_by_key(|r| r.0);
     rows
-}
-
-/// `/proc/self/statm` — the seven page counts.
-///
-/// Built from the **same** [`self_map_rows`] walk `maps` renders, which is the
-/// point: the first version summed the region list alone and reported `size 0`
-/// for an ordinary program whose `maps` plainly listed three mappings. Two
-/// files disagreeing about one address space is the shape of bug this whole
-/// `/proc` section keeps producing (see `proc_consistency_check`), so they read
-/// from one function.
-///
-/// - `size` — every mapped page, including a lazy region's unfaulted middle.
-///   That is what Linux reports and it is much larger than the resident set.
-/// - `resident` — the frame ledger's count, the only real number this target
-///   has for physical pages held.
-/// - `text` — the executable rows. `data` is the rest, which is Linux's
-///   "data + stack" and is why the two sum to `size`.
-/// - `shared` and `lib` and `dt` are 0: nothing here tracks them per process,
-///   and a fabricated breakdown would be read as a real one.
-fn render_self_statm() -> Vec<u8> {
-    let rows = self_map_rows();
-    let pages = |(s, e, _, _, _, _): &MapRow| e.saturating_sub(*s) / 4096;
-    let size_pages: usize = rows.iter().map(pages).sum();
-    let text_pages: usize = rows.iter().filter(|r| r.4).map(pages).sum();
-    let resident = crate::usermode::current_resident_pages() as u64;
-    let mut buf = [0u8; akuma_procfs::STATM_MAX];
-    let n = akuma_procfs::render_statm(
-        size_pages as u64,
-        resident,
-        0,
-        text_pages as u64,
-        size_pages.saturating_sub(text_pages) as u64,
-        &mut buf,
-    );
-    buf[..n].to_vec()
-}
-
-/// Render any `/proc` file this target serves, system-wide or per-process.
-///
-/// One function for `open` and for `stat`, so the two can never disagree about
-/// what exists — the failure that shape produces is `ls /proc` listing a name
-/// whose `stat` then says `No such file or directory`.
-fn render_proc_file(rest: &str) -> Option<Vec<u8>> {
-    match rest {
-        // `busybox ifconfig` with no interface name reads this to enumerate
-        // devices before it will print anything. Generated, not stored.
-        "net/dev" => {
-            let mut text = alloc::string::String::new();
-            let _ = akuma_syscalls_net::write_proc_net_dev(&interfaces(), &mut text);
-            Some(text.into_bytes())
-        }
-        // `busybox df` reads this **first** — it enumerates mounts here and
-        // then calls `statfs` on each one, so with no `/proc/mounts` it prints
-        // a header and nothing else no matter how well `statfs` works.
-        // Rendered from the mount table rather than stored.
-        "mounts" => {
-            // 8 mounts (`MountSet<8>`) x a line that cannot exceed ~120 bytes.
-            let mut buf = [0u8; 1024];
-            let n = fs::render_mounts(&mut buf);
-            Some(buf[..n].to_vec())
-        }
-        "meminfo" => Some(render_meminfo().into_bytes()),
-        _ => {
-            let (head, file) = rest.split_once('/')?;
-            render_pid_file(head.parse::<u32>().ok()?, file)
-        }
-    }
-}
-
-/// `/proc/meminfo`. `busybox free` / `top` read this.
-///
-/// Only the three fields `free` actually parses carry real numbers — physical
-/// RAM the PMM was handed, what it has free, and the kernel heap folded into
-/// `Cached` so the number moves when a file-cache leak (see
-/// `net::mem_watch_tick`) is eating it. Every other field is present and zero
-/// **on purpose**: `free` looks some up by the old name (`MemShared`) and some
-/// by the new (`Shmem`), and a name it does not find can be left as
-/// `ULONG_MAX` and underflow the `used = total - free - …` line into the
-/// 18-quintillion garbage that first showed up here.
-fn render_meminfo() -> alloc::string::String {
-    let page = 4096u64;
-    let total_kib = akuma_pmm::total_count() as u64 * page / 1024;
-    let free_kib = akuma_pmm::free_count() as u64 * page / 1024;
-    let heap = akuma_alloc::stats();
-    let heap_used_kib = (heap.allocated / 1024) as u64;
-    let mut text = alloc::string::String::new();
-    use core::fmt::Write as _;
-    let _ = write!(
-        text,
-        "MemTotal:       {total_kib:>10} kB\n\
-         MemFree:        {free_kib:>10} kB\n\
-         MemAvailable:   {free_kib:>10} kB\n\
-         MemShared:      {z:>10} kB\n\
-         Buffers:        {z:>10} kB\n\
-         Cached:         {heap_used_kib:>10} kB\n\
-         SwapCached:     {z:>10} kB\n\
-         Active:         {z:>10} kB\n\
-         Inactive:       {z:>10} kB\n\
-         SwapTotal:      {z:>10} kB\n\
-         SwapFree:       {z:>10} kB\n\
-         Dirty:          {z:>10} kB\n\
-         Writeback:      {z:>10} kB\n\
-         AnonPages:      {z:>10} kB\n\
-         Mapped:         {z:>10} kB\n\
-         Shmem:          {z:>10} kB\n\
-         Slab:           {z:>10} kB\n\
-         SReclaimable:   {z:>10} kB\n\
-         SUnreclaim:     {z:>10} kB\n",
-        z = 0,
-    );
-    text
-}
-
-/// Is `rest` a directory this target synthesises under `/proc`?
-///
-/// `stat` must answer yes for `/proc/<pid>` before `ps` will look inside it.
-fn proc_is_dir(rest: &str) -> bool {
-    if rest.is_empty() || rest == "net" {
-        return true;
-    }
-    match rest.split_once('/') {
-        None => rest.parse::<u32>().is_ok_and(|p| crate::usermode::proc_by_pid(p).is_some()),
-        Some((head, "fd")) => {
-            head.parse::<u32>().is_ok_and(|p| crate::usermode::proc_by_pid(p).is_some())
-        }
-        Some(_) => false,
-    }
-}
-
-/// The size `stat` should report for a `/proc` path, and whether it is a
-/// directory. `None` if this target does not serve it.
-///
-/// Rendering the file just to measure it is deliberate: a `/proc` file's length
-/// is a property of the moment, and reporting a stale or guessed size is how a
-/// reader that trusts `st_size` (rather than reading to EOF) truncates. The
-/// cost is one render per `stat`, on a path nothing calls in a loop.
-fn proc_metadata(rest: &str) -> Option<(u64, bool)> {
-    let rest = normalise_proc(rest);
-    if proc_is_dir(&rest) {
-        return Some((0, true));
-    }
-    render_proc_file(&rest).map(|d| (d.len() as u64, false))
-}
-
-/// Answer an `open` under `/proc`, or `None` to fall through to the disk.
-///
-/// `rest` is the path with the leading `/proc/` (or `/proc`) stripped: the empty
-/// string is `/proc` itself.
-///
-/// # Why `/proc` has to be intercepted at all
-///
-/// `/proc` is a **real, empty ext2 directory** on this target's image
-/// (`mkdisk.sh`, so that `busybox reboot` can find init). So `getdents64` on it
-/// succeeded and returned nothing, and `ps` printed its header and stopped —
-/// a failure with no error anywhere in it. Everything below replaces that empty
-/// listing with the live process table.
-fn open_proc(rest: &str, flags: u64) -> Option<u64> {
-    let rest = normalise_proc(rest);
-    let rest = rest.as_str();
-
-    // `/proc` itself: one directory entry per live process, plus the files
-    // already served here. `.`/`..` are omitted — `getdents64` on this target
-    // has never emitted them for a real directory either, and `ps` skips
-    // non-numeric names regardless.
-    //
-    // **Only names that also `stat`.** Advertising one that does not is how
-    // `ls /proc` ends up printing `No such file or directory` for its own
-    // listing, which is why `render_proc_file` serves both this and `stat`.
-    if rest.is_empty() {
-        let mut names: Vec<(alloc::string::String, u8)> = Vec::new();
-        for p in crate::usermode::proc_list() {
-            let mut n = alloc::string::String::new();
-            use core::fmt::Write as _;
-            let _ = write!(n, "{}", p.pid);
-            names.push((n, DT_DIR));
-        }
-        names.push((alloc::string::String::from("self"), DT_DIR));
-        names.push((alloc::string::String::from("net"), DT_DIR));
-        for f in ["meminfo", "mounts"] {
-            names.push((alloc::string::String::from(f), DT_REG));
-        }
-        return Some(install_synthetic_dir("/proc", names, flags));
-    }
-
-    if rest == "net" {
-        return Some(install_synthetic_dir(
-            "/proc/net",
-            alloc::vec![(alloc::string::String::from("dev"), DT_REG)],
-            flags,
-        ));
-    }
-
-    // `/proc/<pid>` — the per-process directory.
-    if let Ok(pid) = rest.parse::<u32>() {
-        if crate::usermode::proc_by_pid(pid).is_none() {
-            return Some(errno::ENOENT);
-        }
-        let mut names: Vec<(alloc::string::String, u8)> = pid_files(pid)
-            .iter()
-            .map(|f| (alloc::string::String::from(*f), DT_REG))
-            .collect();
-        names.push((alloc::string::String::from("fd"), DT_DIR));
-        return Some(install_synthetic_dir(&alloc::format!("/proc/{pid}"), names, flags));
-    }
-
-    // The render doubles as the existence check; the bytes themselves are
-    // produced per `read(2)` now, so they are dropped here. The descriptor's
-    // path is the **absolute** one — `proc_rest_of` classifies a synthetic
-    // descriptor by its `/proc/` prefix, and it used to be harmless that this
-    // stored the bare rest (`1/statm`) only because the old read path served
-    // cached bytes and never looked at the path.
-    render_proc_file(rest).map(|_| install_synthetic_file(&alloc::format!("/proc/{rest}"), flags))
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -3546,20 +3043,6 @@ fn proc_consistency_check(t: &mut Suite) {
         );
         sys_close(fd);
     }
-}
-
-/// Install a read-only fd for a generated `/proc` file (like `/proc/net/dev`).
-///
-/// Nothing is stored: since step 4b the render is produced per `read(2)` by
-/// [`render_proc_file`], and the bytes this function used to cache into the
-/// now-deleted `Entry` are gone. The caller still renders once as the
-/// **existence check** — a view that cannot render fails the open, so a
-/// descriptor from here always has something to re-render.
-fn install_synthetic_file(path: &str, flags: u64) -> u64 {
-    install(FileDescriptor::File(KernelFile::new(
-        alloc::string::String::from(path),
-        flags as u32,
-    )))
 }
 
 /// The two synthetic interfaces `ifconfig` sees: `lo` and the live smoltcp

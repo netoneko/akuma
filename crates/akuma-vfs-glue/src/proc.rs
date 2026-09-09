@@ -27,6 +27,70 @@ use akuma_exec::{process::{self, Pid, ProcessState}, threading};
 // /proc/<pid>/cmdline + status (Linux-style)
 // ============================================================================
 
+/// `/proc/<pid>/maps` — the process's mappings, ascending.
+///
+/// Rows come from the [`crate::VfsGlueHooks::pid_map_rows`] hook, because the
+/// walk behind them is not portable; the *format* is
+/// [`akuma_procfs::render_maps_line`], shared with everything else in this
+/// file. `None` when no kernel registered a walk, which is how the file stays
+/// absent rather than empty — an empty `maps` is a confident "this process has
+/// no mappings", which no process has.
+fn render_pid_maps(pid: Pid) -> Option<Vec<u8>> {
+    let rows = crate::pid_map_rows(pid)?;
+    let mut out = Vec::new();
+    let mut line = [0u8; akuma_procfs::MAPS_LINE_MAX];
+    for (start, end, read, write, exec, private) in rows {
+        let n = akuma_procfs::render_maps_line(start, end, read, write, exec, private, "", &mut line);
+        out.extend_from_slice(&line[..n]);
+    }
+    Some(out)
+}
+
+/// `/proc/<pid>/statm` — the seven page counts, from the **same** rows `maps`
+/// renders.
+///
+/// One source for both, deliberately: two files disagreeing about one address
+/// space is the failure this file keeps producing, and the amd64 kernel's own
+/// version of these two was written after exactly that (`statm` summed the
+/// region list alone and reported `size 0` for a program whose `maps` listed
+/// three mappings).
+///
+/// `resident` is the frame ledger's count — the only real number for physical
+/// pages held. `shared`, `lib` and `dt` are 0: nothing here tracks them per
+/// process, and a fabricated breakdown would be read as a real one.
+fn render_pid_statm(proc: &process::Process) -> Option<Vec<u8>> {
+    let rows = crate::pid_map_rows(proc.pid)?;
+    let pages = |(s, e, _, _, _, _): &crate::MapRow| e.saturating_sub(*s) / 4096;
+    let size_pages: usize = rows.iter().map(pages).sum();
+    let text_pages: usize = rows.iter().filter(|r| r.4).map(pages).sum();
+    let mut buf = [0u8; akuma_procfs::STATM_MAX];
+    let n = akuma_procfs::render_statm(
+        size_pages as u64,
+        proc.address_space.resident_pages() as u64,
+        0,
+        text_pages as u64,
+        size_pages.saturating_sub(text_pages) as u64,
+        &mut buf,
+    );
+    Some(buf[..n].to_vec())
+}
+
+/// The bytes of `<pid>/maps` or `<pid>/statm`, or `None` if this kernel cannot
+/// describe the address space (or the pid is not visible).
+fn pid_address_space_file(pid: Pid, name: &str) -> Option<Vec<u8>> {
+    if !ProcFilesystem::process_visible(pid, caller_box_id()) {
+        return None;
+    }
+    match name {
+        "maps" => render_pid_maps(pid),
+        "statm" => {
+            let proc = process::lookup_process_shared(pid)?;
+            render_pid_statm(proc)
+        }
+        _ => None,
+    }
+}
+
 /// Rewrite a leading `self/` to the calling process's own pid.
 ///
 /// `/proc/self` is a symlink on Linux, and everything under it resolves through
@@ -676,6 +740,20 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: true,
                     size: 0,
                 });
+                // **Only names that also `stat`.** Advertising one that does not
+                // is how `ls /proc/<pid>` ends up printing `No such file or
+                // directory` for its own listing, so these two appear exactly
+                // when the address-space hook can render them.
+                for name in ["maps", "statm"] {
+                    if pid_address_space_file(pid, name).is_some() {
+                        pid_entries.push(DirEntry {
+                            name: String::from(name),
+                            is_dir: false,
+                            is_symlink: false,
+                            size: 0,
+                        });
+                    }
+                }
             }
             if crate::cfg_proc_syscall_log_enabled()
                 && akuma_syscalls_log::get_formatted(pid, current_box_id).is_some()
@@ -824,6 +902,21 @@ impl Filesystem for ProcFilesystem {
                     }
                     let n = buf.len().min(len - offset);
                     buf[..n].copy_from_slice(&stat_buf[offset..offset + n]);
+                    return Ok(n);
+                }
+        }
+
+        // <pid>/maps and <pid>/statm — see `pid_address_space_file`.
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm")
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    let data = pid_address_space_file(pid, parts[1]).ok_or(FsError::NotFound)?;
+                    if offset >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(data.len() - offset);
+                    buf[..n].copy_from_slice(&data[offset..offset + n]);
                     return Ok(n);
                 }
         }
@@ -1207,6 +1300,12 @@ impl Filesystem for ProcFilesystem {
             {
                 return Self::process_visible(pid, current_box_id);
             }
+            // Only when a kernel registered a walk — the two files exist
+            // exactly when they can be rendered, which is what keeps `open`,
+            // `stat` and `access` agreeing about them.
+            if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm") {
+                return pid_address_space_file(pid, parts[1]).is_some();
+            }
             if parts.len() == 2 && parts[1] == "syscalls" && crate::cfg_proc_syscall_log_enabled() {
                 return akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
             }
@@ -1312,6 +1411,27 @@ impl Filesystem for ProcFilesystem {
                     return Ok(Metadata {
                         is_dir: false,
                         size,
+                        inode,
+                        mode: 0o100444,
+                        created: None,
+                        modified: None,
+                        accessed: None,
+                    });
+                }
+        }
+
+        // <pid>/maps and <pid>/statm — the size is a fresh render, for the same
+        // reason `<pid>/mounts` above measures itself: a `/proc` file's length
+        // is a property of the moment, and a reader that trusts `st_size`
+        // truncates on a stale one.
+        {
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm")
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    let data = pid_address_space_file(pid, parts[1]).ok_or(FsError::NotFound)?;
+                    return Ok(Metadata {
+                        is_dir: false,
+                        size: data.len() as u64,
                         inode,
                         mode: 0o100444,
                         created: None,

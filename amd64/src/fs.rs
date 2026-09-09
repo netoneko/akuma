@@ -230,6 +230,10 @@ pub fn init_vfs() {
         // would reserve RAM for no reader, so this stays a no-op until
         // `akuma-fpcache` is adopted here.
         fpcache_init: |_total_ram_bytes| {},
+        // `/proc/<pid>/maps` and `/proc/<pid>/statm`, which the shared
+        // `ProcFilesystem` renders and cannot walk for itself — the leaf walk
+        // is x86-only. See `fd::pid_map_rows`.
+        pid_map_rows: crate::fd::pid_map_rows,
     });
     akuma_vfs_glue::init();
 
