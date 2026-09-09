@@ -307,6 +307,14 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     serial::puts("  fs:   ext2 mounted on ");
     serial::puts(name);
     serial::puts("\n");
+    // The VFS answers now, so the `akuma_vfs_glue::fs` facade — the gate every
+    // folded glue fs arm sits behind — may say so. `fs::init` is the AArch64
+    // route to this state (virtio-blk check, its own mounts, the fpcache and
+    // reap-hook wiring); this target arrived by its own, so it sets the flag
+    // itself. Before this line, every folded `mkdirat`/`unlinkat`/`renameat`
+    // answered `NotInitialized`, flattened to `EIO` — a working filesystem
+    // reporting a hardware fault.
+    akuma_vfs_glue::fs::mark_initialized();
     true
 }
 
@@ -320,20 +328,6 @@ const fn fs_error_name(e: FsError) -> &'static str {
         FsError::NoFilesystem => "no filesystem",
         FsError::NotInitialized => "mount table not initialised",
         _ => "error",
-    }
-}
-
-/// Remove a file, or with `rmdir` an empty directory — `unlinkat(2)`'s two
-/// halves behind one flag, which is the shape the syscall passes.
-///
-/// The one wrapper that survived the fold, because the crate splits what the
-/// syscall joins and the alternative is an `if` at the single call site that
-/// says less than the name does.
-pub fn remove(path: &str, rmdir: bool) -> Result<(), FsError> {
-    if rmdir {
-        remove_dir(path)
-    } else {
-        remove_file(path)
     }
 }
 

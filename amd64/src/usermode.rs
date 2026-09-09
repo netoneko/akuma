@@ -969,12 +969,16 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         22 => return crate::fd::sys_pipe2(a1, 0),
         33 => return crate::fd::sys_dup2(a1, a2),
         // The legacy, non-`at` path calls — x86_64 82/83/84/87/88/89 — as thin
-        // `AT_FDCWD` shims over the `*at` forms in the neutral table. `rmdir`
-        // (84) is `unlinkat` with `AT_REMOVEDIR` (0x200).
-        82 => return crate::fd::sys_renameat(AT_FDCWD, a1, AT_FDCWD, a2),
-        83 => return crate::fd::sys_mkdirat(AT_FDCWD, a1, a2),
-        84 => return crate::fd::sys_unlinkat(AT_FDCWD, a1, 0x200),
-        87 => return crate::fd::sys_unlinkat(AT_FDCWD, a1, 0),
+        // `AT_FDCWD` shims. `rmdir` (84) is `unlinkat` with `AT_REMOVEDIR`
+        // (0x200). Since 4b step 2 batch 1 the `*at` arms live in glue, so the
+        // shims hand it the asm-generic number (`to_glue` owns the hop) with
+        // `AT_FDCWD` in the dirfd slots — `AT_FDCWD` is -100 in both ABIs.
+        // `AKUMA_AMD64_4B_FOLD_BATCH1.md` records the divergences the fold
+        // adopted.
+        82 => return to_glue(Syscall::Renameat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
+        83 => return to_glue(Syscall::Mkdirat, [AT_FDCWD, a1, a2, 0, 0, 0]),
+        84 => return to_glue(Syscall::Unlinkat, [AT_FDCWD, a1, 0x200, 0, 0, 0]),
+        87 => return to_glue(Syscall::Unlinkat, [AT_FDCWD, a1, 0, 0, 0, 0]),
         // `symlink(target, linkpath)` — x86_64 88.
         //
         // **This arm used to call `sys_utimensat`.** Its comment read
@@ -989,10 +993,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // aarch64/x86_64 crossing.
         //
         // `symlinkat(target, newdirfd, linkpath)` takes the dirfd *second*.
-        88 => return crate::fd::sys_symlinkat(a1, AT_FDCWD, a2),
+        88 => return to_glue(Syscall::Symlinkat, [a1, AT_FDCWD, a2, 0, 0, 0]),
         // `readlink(path, buf, size)` — x86_64 89. Was a flat EINVAL while no
         // symlink could exist; `symlinkat` made package symlinks real.
-        89 => return crate::fd::sys_readlinkat(AT_FDCWD, a1, a2, a3),
+        89 => return to_glue(Syscall::Readlinkat, [AT_FDCWD, a1, a2, a3, 0, 0]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`
@@ -1262,13 +1266,18 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Dup => crate::fd::sys_dup(a1),
         Syscall::Dup3 => crate::fd::sys_dup3(a1, a2, a3),
         Syscall::Pipe2 => crate::fd::sys_pipe2(a1, a2),
-        // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — `apk`'s
+        // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — **served by
+        // glue** (4b step 2, batch 1: the path-only `*at` family). `apk`'s
         // cache write is a named `.tmp.<pid>` file plus a rename; without
         // these the cache write fails and the index fetch is unusable (the
-        // aarch64 table in `APK_MISSING_SYSCALLS.md` lists all three).
-        Syscall::Mkdirat => crate::fd::sys_mkdirat(a1, a2, a3),
-        Syscall::Unlinkat => crate::fd::sys_unlinkat(a1, a2, a3),
-        Syscall::Renameat => crate::fd::sys_renameat(a1, a2, a3, a4),
+        // aarch64 table in `APK_MISSING_SYSCALLS.md` lists all three). The
+        // VFS underneath is the same `akuma_vfs_glue` mount walk both kernels
+        // share, so the arm answers identically; the dirfd resolution and
+        // errno-table divergences the fold adopted are stated in
+        // `AKUMA_AMD64_4B_FOLD_BATCH1.md`.
+        Syscall::Mkdirat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::Unlinkat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::Renameat => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
         // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
         // milliseconds (this target has no finer clock to honour anyway).
@@ -1417,11 +1426,17 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // (real on this target — `exec_runtime.rs`), `RLIMIT_NOFILE` 1024,
         // everything else `RLIM_INFINITY`.
         Syscall::Prlimit64 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
-        Syscall::Readlinkat => crate::fd::sys_readlinkat(a1, a2, a3, a4),
+        // `readlinkat` / `symlinkat` — **served by glue** (4b step 2, batch 1).
+        // Glue's readlinkat is strictly more than the arm it replaces: it
+        // distinguishes `EINVAL` (path exists, not a symlink) from `ENOENT`
+        // where the local arm collapsed both to `ENOENT`, serves
+        // `/proc/self/exe` from the registered image, and describes
+        // non-file fds under `/proc/<pid>/fd`.
+        Syscall::Readlinkat => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // `symlinkat(target, newdirfd, link_path)` — x86_64 266. Package
         // contents are full of `.so.1` versioned-library symlinks; ENOSYS
         // here turned each into a counted `apk add` error.
-        Syscall::Symlinkat => crate::fd::sys_symlinkat(a1, a2, a3),
+        Syscall::Symlinkat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `utimensat(dirfd, path, times, flags)` — timestamp preservation for
         // `apk add`'s post-extract pass. NULL times = both set to now. There is
         // no `futimens` syscall to pair it with — libc spells that
@@ -4961,25 +4976,44 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         return;
     }
 
-    const AT_FDCWD: u64 = (-100i64) as u64;
     let target = b"/probe.txt\0";
     let link = b"/dispatch-symlink-probe\0";
     // The disk image survives a boot, so clear any leftover before creating it.
-    crate::fd::sys_unlinkat(AT_FDCWD, link.as_ptr() as u64, 0);
+    let _ = syscall_dispatch(87, link.as_ptr() as u64, 0, 0, 0, 0, 0);
 
-    // Straight through the dispatcher, by number, the way userspace arrives.
-    let r = syscall_dispatch(88, target.as_ptr() as u64, link.as_ptr() as u64, 0, 0, 0, 0);
-    t.check_eq("dispatch: x86_64 88 is symlink(2) and succeeds", r, 0);
+    // Straight through the dispatcher, by number, the way userspace arrives —
+    // all four calls of the round trip. Since 4b step 2 batch 1 the `*at`
+    // family is glue's, so this now exercises glue's arms end to end from the
+    // boot task: `AT_FDCWD` with no registered process resolves against `/`
+    // (glue's own default), and the absolute paths never need an fd table.
+    let link_rc = syscall_dispatch(88, target.as_ptr() as u64, link.as_ptr() as u64, 0, 0, 0, 0);
+    t.check_eq("dispatch: x86_64 88 is symlink(2) and succeeds", link_rc, 0);
     let mut buf = [0u8; 64];
-    let n = crate::fd::sys_readlinkat(
-        AT_FDCWD,
-        link.as_ptr() as u64,
-        buf.as_mut_ptr() as u64,
-        buf.len() as u64,
-    );
+    let n = syscall_dispatch(89, link.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
     t.check_eq("dispatch: the link reads back its target length", n, 10);
     t.check("dispatch: and the target itself", &buf[..10] == b"/probe.txt");
-    crate::fd::sys_unlinkat(AT_FDCWD, link.as_ptr() as u64, 0);
+    // Cleanup through the real arm: x86_64 87 is unlink(2), unlinkat's shim.
+    let unlink_rc = syscall_dispatch(87, link.as_ptr() as u64, 0, 0, 0, 0, 0);
+    t.check_eq("dispatch: unlink removes the link", unlink_rc, 0);
+    // And it is gone: a second readlink is ENOENT (glue distinguishes it from
+    // the EINVAL a non-symlink gets — the answer the local arm never made).
+    let gone_rc = syscall_dispatch(89, link.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    t.check_eq(
+        "dispatch: readlink on a missing path is ENOENT",
+        gone_rc,
+        (-2i64) as u64,
+    );
+    // The half that only glue answers right: `/probe.txt` **exists** and is
+    // not a symlink, so readlink is `EINVAL` — the local arm collapsed both
+    // answers to `ENOENT`, so this check is red against the pre-fold kernel
+    // by construction. That is what makes it a differentiator and not a
+    // re-statement of the check above.
+    let notlink = syscall_dispatch(89, target.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    t.check_eq(
+        "dispatch: readlink on a non-symlink is EINVAL, not ENOENT",
+        notlink,
+        (-22i64) as u64,
+    );
 }
 
 #[cfg(not(feature = "no-tests"))]

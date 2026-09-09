@@ -421,8 +421,14 @@ pub fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen: u6
         return errno::ENOTSOCK;
     };
     let on = if optlen >= 4 && optval != 0 {
-        // SAFETY: a user pointer to an int, bounded by the length check.
-        unsafe { (optval as *const u32).read_volatile() != 0 }
+        // Through `uaccess`, like every other user read on this target. This
+        // was a raw `read_volatile` the same 2026-09-05 SMAP sweep that fixed
+        // `accept`'s `addrlen` (two functions up) missed, and `apk update`'s
+        // `setsockopt(TCP_NODELAY)` — the option value living on the caller's
+        // stack — faulted in ring 0 on it (`#PF err=1, cr2=0x7fffffffc58c`)
+        // the first time anyone ran apk against this rig since `CR4.SMAP` went
+        // on. A bad pointer is `EFAULT`, not a dead machine.
+        crate::uaccess::read_val::<u32>(optval).map_or(false, |v| v != 0)
     } else {
         false
     };

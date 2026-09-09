@@ -167,6 +167,23 @@ pub fn is_initialized() -> bool {
     *FS_INITIALIZED.lock()
 }
 
+/// Mark the facade ready for a kernel that brought its VFS up by another
+/// route.
+///
+/// [`init()`](crate::fs::init) is the AArch64 boot path: it checks the
+/// virtio-blk device, mounts ext2 at `/` and procfs at `/proc`, sizes the
+/// block cache and wires the orphaned-lock recovery hooks, and only then sets
+/// [`FS_INITIALIZED`]. A target whose boot reaches the same state by different
+/// means — amd64 mounts its root from virtio-blk *or* a USB disk *or* a
+/// RAM image, and registers its own reap hooks — cannot run that function, and
+/// before this existed every `sys_mkdirat`/`sys_unlinkat`/`sys_renameat` it
+/// folded into `akuma-syscalls-glue` answered `NotInitialized`, which the
+/// errno table flattens to `EIO`: a working VFS reporting a hardware fault.
+/// Call this once the target's own mounts are live.
+pub fn mark_initialized() {
+    *FS_INITIALIZED.lock() = true;
+}
+
 /// List directory contents
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
     if !is_initialized() {
