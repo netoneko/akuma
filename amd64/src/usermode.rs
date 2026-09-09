@@ -2577,6 +2577,12 @@ fn run_process(idx: usize) -> ! {
     // Before `spawn_record_exit` so a parent's `waitpid` never observes the
     // child as reaped while its fds are still charged against the shared table.
     crate::fd::close_owned_by(idx);
+    // C2 slice 4: empty the registered table's mirror while the legacy world
+    // has just accounted for everything — `SharedFdTable::drop`'s `close_all`
+    // would otherwise fire the pipe/socket close hooks on entries that own no
+    // references, and a forked child's exit closed its parent's pipes (the
+    // bare-metal wedge this fix post-dates). See `clear_table_mirror`.
+    crate::fd::clear_table_mirror();
     if idx >= SPAWN_SLOT_BASE {
         spawn_record_exit(idx, status as i32);
     }

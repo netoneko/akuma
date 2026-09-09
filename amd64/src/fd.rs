@@ -707,6 +707,27 @@ fn unref(fi: usize) {
     }
 }
 
+/// Empty the calling process's mirror before its `Process` drops.
+///
+/// Called from `run_process`'s exit path, right after [`close_owned_by`].
+/// While [`FILES`] owns the refcounts, every table entry is a mirror that
+/// owns nothing — but `SharedFdTable::drop` runs `close_all()`, which fires
+/// the `ExecRuntime` close hooks per entry. Left in place, a dying child
+/// closed its parent's pipes: under sshd every forked exit tore a hole in
+/// the session's own stdio bridge, and the `File` arm reached the
+/// `not_wired!` `flock_release`. The bare-metal wedge of 2026-09-09 (a full
+/// framebuffer of `[BKL] stuck` behind dying sessions) is that bug. Clearing
+/// here is exact: `close_owned_by` has already released every reference the
+/// legacy way, so there is nothing left for the hooks to do — and if this
+/// line is missed, the drop is the thing that says so.
+pub fn clear_table_mirror() {
+    if let Some(p) = crate::usermode::current_process() {
+        p.fds.table.lock().clear();
+        p.fds.cloexec.lock().clear();
+        p.fds.nonblock.lock().clear();
+    }
+}
+
 /// Give `child_slot` its own names for every description `parent_slot` holds.
 ///
 /// This is `fork`'s half of the descriptor table. The child gets an
