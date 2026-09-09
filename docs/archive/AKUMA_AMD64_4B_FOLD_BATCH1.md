@@ -2,10 +2,11 @@
 
 **Date:** 2026-09-09
 **Status:** landed. QEMU/TCG `SMP=1` **553/0**, `SMP=4` **563/0**;
-Firecracker/KVM `SMP=1` **540/0**, `SMP=4` **550/0**; ring-3 `-n 30` **OK**
-(`grandfork` ALL PASS); memory probes **8/10, 0 unexpected on both
-transports**; clippy (`akuma-amd64`) clean; **`apk add file` installs and runs
-end to end**.
+Firecracker/KVM `SMP=1` **540/0**, `SMP=4` **550/0**; **bare metal
+(HP 500-502nj, multiboot2) 553/0** with `apk update` + `apk add file`
+installing and running on the metal; ring-3 `-n 30` **OK** (`grandfork` ALL
+PASS); memory probes **8/10, 0 unexpected on both transports**; clippy
+(`akuma-amd64`) clean.
 **Parent:** `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, the C1 box's `4b` row.
 **Predecessor:** `docs/archive/AKUMA_AMD64_4B_FLIP.md` — the refcount flip;
 the per-fd-number `nonblock` and value-copy `dup` divergences it adopted are
@@ -87,10 +88,16 @@ is that caller, and it is now part of the per-batch ritual.
 | QEMU/TCG `SMP=4` | 560/0 | **563/0** |
 | Firecracker/KVM `SMP=1` | 537/0 | **540/0** |
 | Firecracker/KVM `SMP=4` | 547/0 | **550/0** |
+| **bare metal** (multiboot2, sda1) | not re-run at baseline | **553/0**, `apk add` OK |
 | `amd64_ring3_check --smp 1 -n 30` | OK | **OK** |
 | `amd64_mem_trials --smp 4` (both arms) | 8/10, 0 unexpected | **8/10, 0 unexpected** |
-| `apk update` + `apk add file` | not run at baseline | **installs; `file --version` = file-5.47** |
+| `apk update` + `apk add file` | not run at baseline | **installs; `file --version` = file-5.47** (QEMU and the metal) |
 | clippy (`akuma-amd64`) | clean | clean |
+
+On the metal, `/proc`'s real mount WARNs and falls back to the synthetic
+view — pre-existing on the persistent-root path (the RAM image boots mount
+it), benign, and every `/proc` consumer works through the union. Worth its
+own look some day; it is not this batch's.
 
 The suite's symlink round trip now drives all four calls (`symlink` 88,
 `readlink` 89, `unlink` 87) through the dispatcher by x86_64 number, so the
