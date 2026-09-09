@@ -21,6 +21,16 @@ What it checks, and why each part is there:
 * **`free` before and after** — the leak check. A process-model change that
   loses an address space shows up here and nowhere else; `used` should come back
   to roughly where it started and `free` should not move at all.
+* **`Cached:` from `/proc/meminfo`, before and after** — the **kernel-heap**
+  reading. `free` is blind to the entire kernel-heap bug class: across a
+  135 MB excursion into `fd.rs`'s whole-file cache, `free` reported the same
+  number before and after (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a
+  method correction"). `meminfo`'s `Cached:` column is
+  `akuma_alloc::stats().allocated` on this target, i.e. live kernel-heap bytes,
+  so it is the witness the fd-cache class needs: every ssh session's file
+  descriptors open and close, and the heap should come back. Drift beyond
+  `--heap-tolerance` KiB fails the run; the workload allocates nothing of that
+  scale deliberately.
 * **`ps | wc -l`** — the reap check. A row per unreaped zombie, so a steady
   count across the churn is what says the parent link and the reap still work.
 * **`/probes/grandfork`** — all five rungs, the probe that pins the `wait4`
@@ -112,6 +122,22 @@ def free_columns(text):
     return None, None
 
 
+def heap_used_kib(text):
+    """Live kernel-heap bytes off `/proc/meminfo`'s `Cached:` row, or `None`.
+
+    On this target `Cached:` is `akuma_alloc::stats().allocated` — the kernel
+    heap, not a page cache (`amd64/src/fd.rs` `render_meminfo`). This is the
+    reading `free` cannot give: busybox `free`'s numbers come from the PMM and
+    never moved across the 135 MB whole-file-cache excursion.
+    """
+    for line in text.splitlines():
+        if line.strip().startswith("Cached:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                return int(parts[1])
+    return None
+
+
 def boot(smp, ssh_port, http_port):
     env = dict(os.environ, SMP=str(smp), SSH_PORT=str(ssh_port),
                HTTP_PORT=str(http_port), DISK=IMG, INIT="/bin/sshd", INITARGS="")
@@ -139,6 +165,9 @@ def main(argv=None):
     ap.add_argument("--http-port", type=int, default=8047)
     ap.add_argument("--boot-timeout", type=int, default=300)
     ap.add_argument("--keep", action="store_true", help="leave the VM running")
+    ap.add_argument("--heap-tolerance", type=int, default=8192,
+                    help="max kernel-heap drift (KiB) across the sessions "
+                         "before the run fails")
     a = ap.parse_args(argv)
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -158,8 +187,9 @@ def main(argv=None):
             return 1
         print(f"guest up on port {a.ssh_port} (smp={a.smp})", flush=True)
 
-        _rc, before = ssh(a.ssh_port, "free")
+        _rc, before = ssh(a.ssh_port, "free; cat /proc/meminfo")
         u0, f0 = free_columns(before)
+        h0 = heap_used_kib(before)
         _rc, ps0 = ssh(a.ssh_port, "ps | wc -l")
 
         good = 0
@@ -172,14 +202,26 @@ def main(argv=None):
         print(f"sessions: {good}/{a.sessions} returned")
         ok = ok and good == a.sessions
 
-        _rc, after = ssh(a.ssh_port, "free")
+        _rc, after = ssh(a.ssh_port, "free; cat /proc/meminfo")
         u1, f1 = free_columns(after)
+        h1 = heap_used_kib(after)
         _rc, ps1 = ssh(a.ssh_port, "ps | wc -l")
         print(f"free:  used {u0} -> {u1}   free {f0} -> {f1}")
         print(f"ps rows: {ps0.strip()} -> {ps1.strip()}")
         if f0 is not None and f0 != f1:
             print("  NOTE: the `free` column moved; read it against the "
                   "workload before calling it a leak")
+        if h0 is not None and h1 is not None:
+            drift = h1 - h0
+            print(f"heap:  {h0} -> {h1} kB (drift {drift:+d} kB, "
+                  f"tolerance {a.heap_tolerance})")
+            if abs(drift) > a.heap_tolerance:
+                print("  HEAP DRIFT — the kernel heap did not come back; this "
+                      "is the class `free` cannot see "
+                      "(AMD64_FD_WHOLE_FILE_HEAP.md)")
+                ok = False
+        else:
+            print("heap:  NO READING — /proc/meminfo had no `Cached:` row")
 
         rc, gf = ssh(a.ssh_port, "/probes/grandfork", timeout=120)
         print(f"grandfork: rc={rc}")

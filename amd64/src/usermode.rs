@@ -2667,7 +2667,7 @@ fn start_test_process(
     let mut cmdline = alloc::vec::Vec::with_capacity(name.len() + 1);
     cmdline.extend_from_slice(name.as_bytes());
     cmdline.push(0);
-    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline);
+    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None);
     crate::sched::publish_task(task_slot);
     Some((pid, task_slot))
 }
@@ -3079,6 +3079,29 @@ fn register_exec_process(
     image_top: u64,
     name: &str,
     cmdline: &[u8],
+    // **C2 slice 3 (registration).** `None` builds the fresh `with_stdio()`
+    // table a spawned or self-test process starts with; `sys_fork` passes the
+    // parent's `clone_deep_for_fork()`, so the child's registered table is a
+    // real POSIX copy — its own `BTreeMap`, naming the same descriptions —
+    // rather than a second fresh stdio triple that merely *looks* inherited.
+    //
+    // Nothing reads this table yet: the fd syscalls still serve `fd.rs`'s
+    // `FDS`/`FILES`, so today the fork-side clone differs from a fresh
+    // `with_stdio()` only when the parent had opened something *through the
+    // crate's table*, which no path does yet. That is what makes this slice
+    // reversible — registration lands without any behaviour changing, and the
+    // slices that repoint `open`/`dup`/`close` at this table inherit a fork
+    // path that is already correct.
+    //
+    // One obligation recorded for those slices: `clone_deep_for_fork` runs
+    // `clone_fd_refs`, whose refcounted arms call the `ExecRuntime`
+    // pipe/socket/sock clone hooks — all `not_wired!` here until C2 slice 6.
+    // Innocent today because a table this target builds can only hold the
+    // `Stdin`/`Stdout`/`Stderr` arms (the `_ => {}` fall-through); the moment
+    // slice 5 starts landing `File` descriptors here it is still innocent
+    // (`KernelFile` is not hook-refcounted), and slice 6 is the one that has
+    // to wire the hooks before a `PipeRead`/`PipeWrite` can be cloned.
+    fds: Option<alloc::sync::Arc<akuma_exec::process::SharedFdTable>>,
 ) {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
@@ -3164,7 +3187,7 @@ fn register_exec_process(
         // arrives carrying the parent's extents.
         mmap_regions: Spinlock::new(image.regions),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
-        fds: Arc::new(SharedFdTable::with_stdio()),
+        fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio())),
         thread_id: None,
         spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
@@ -3624,6 +3647,11 @@ fn sys_fork() -> u64 {
         // shows the parent's command line — the reason `ps` briefly lists two
         // `sh`s.
         &parent_cmdline,
+        // C2 slice 3: the child's *registered* fd table is a real copy of the
+        // parent's, the crate-side twin of `inherit_fds` above (which copies
+        // the legacy `FDS` row). Innocent while every table holds only stdio;
+        // see `register_exec_process` for the hook obligation this incurs.
+        Some(alloc::sync::Arc::new(parent.fds.clone_deep_for_fork())),
     );
 
     // SAFETY: raw-pointer write; single core.
@@ -3755,6 +3783,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         img.end_va,
         core::str::from_utf8(argv_refs[0]).unwrap_or("spawn"),
         &spawn_cmdline,
+        None,
     );
 
     // SAFETY: raw-pointer write; single core.
@@ -4885,7 +4914,7 @@ pub fn identity_cost_test(t: &mut Suite) {
     let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
     let pid = alloc_pid();
     let task = crate::sched::current_task();
-    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0");
+    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None);
 
     if !t.check("identity: the running task resolves to its process", current_process().is_some()) {
         finish_test_process(pid, task);
@@ -5586,7 +5615,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // `run_process` reads init's entry point and stack out of this
     // registration, so publishing first would race a task with nowhere to start
     // against the register that gives it one.
-    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone());
+    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None);
     crate::sched::publish_task(task_slot);
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes
