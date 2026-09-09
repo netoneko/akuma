@@ -322,6 +322,149 @@ syscall_table! {
     Getrandom  => GETRANDOM  = 318, nr::GETRANDOM;
 }
 
+/// `openat(2)`'s flag word, **on which architecture** — the second vocabulary
+/// this crate translates, and the same failure mode as the first.
+///
+/// # The problem
+///
+/// [`Syscall`] above exists because a syscall *number* means different things on
+/// the two architectures. So does an `open(2)` *flag bit*, and for a reason that
+/// is easy to miss: aarch64 Linux keeps the **32-bit ARM** fcntl values rather
+/// than the asm-generic ones x86-64 uses, and the difference is not a shift or
+/// an offset — it is a **permutation of four bits**, so every one of them is a
+/// valid flag on both sides and none of them is ever rejected.
+///
+/// Taken from the musl headers this tree's own userspace is built against
+/// (`userspace/tcc/vendor/musl-dev-{aarch64,x86_64}.apk`, `bits/fcntl.h`),
+/// which is the right source for this question: what matters is not what a
+/// kernel header says but what the libc in the guest actually passes.
+///
+/// | bit | aarch64 | x86_64 |
+/// |---:|---|---|
+/// | `0o40000`  | `O_DIRECTORY` | `O_DIRECT` |
+/// | `0o100000` | `O_NOFOLLOW`  | `O_LARGEFILE` |
+/// | `0o200000` | `O_DIRECT`    | `O_DIRECTORY` |
+/// | `0o400000` | `O_LARGEFILE` | `O_NOFOLLOW` |
+///
+/// **Every other `O_*` bit is identical on the two architectures** —
+/// `O_CREAT`, `O_EXCL`, `O_NOCTTY`, `O_TRUNC`, `O_APPEND`, `O_NONBLOCK`,
+/// `O_DSYNC`, `O_ASYNC`, `O_NOATIME`, `O_CLOEXEC`, `O_PATH` and `__O_TMPFILE`
+/// — which is exactly what makes this dangerous. A reader who spot-checks
+/// `O_CREAT` and `O_CLOEXEC` concludes the encodings agree, and
+/// `amd64/src/fd.rs` said so in a comment for months
+/// ("on x86_64 they happen to share the same numeric encoding").
+///
+/// # Why it is a *silent* wrong answer, twice over
+///
+/// The permutation is two transpositions, and both of them turn one real flag
+/// into another real flag:
+///
+/// - **`O_DIRECTORY` ↔ `O_DIRECT`.** An x86_64 caller asking for
+///   `O_DIRECTORY` (`0o200000`) read with the aarch64 table is asking for
+///   `O_DIRECT` — a cache hint — so the "this had better be a directory"
+///   check never runs. In the other direction an `O_DIRECT` read becomes
+///   `O_DIRECTORY`, and an ordinary file open is refused as not-a-directory.
+/// - **`O_NOFOLLOW` ↔ `O_LARGEFILE`.** musl passes `O_LARGEFILE` on nothing
+///   and glibc passes it on almost everything, so this one reads as
+///   "don't follow symlinks" on a caller that never asked.
+///
+/// And the compound flag inherits it: `O_TMPFILE` is
+/// `__O_TMPFILE | O_DIRECTORY`, so it is `0o20040000` on aarch64 and
+/// `0o20200000` on x86_64. `akuma-syscalls-glue`'s `sys_openat` **refuses**
+/// `O_TMPFILE` on purpose — apk-tools 3 probes for it, and an open that
+/// succeeds and then silently discards the bytes surfaced as
+/// `UNTRUSTED signature` over a download that was fine
+/// (`docs/archive/APK_OTMPFILE_DIR_FD.md`). Fed an untranslated x86_64 flag
+/// word, that refusal **does not fire**: `0o20200000 & 0o20040000` is
+/// `0o20000000`, not the mask, so the guard tests false and the bug comes
+/// back — on the architecture that has never seen it.
+///
+/// # Where to apply it
+///
+/// Once, at the amd64 syscall boundary, exactly like [`Syscall::from_x86_64`]:
+/// what a `KernelFile` stores and what `akuma-syscalls-glue` reads is then the
+/// asm-generic encoding on both kernels, and no shared crate has to know which
+/// architecture it is serving.
+pub mod open_flags {
+    /// The x86_64 (asm-generic) values of the four permuted bits.
+    ///
+    /// Literals, because this crate owns the x86_64 table — the same split as
+    /// the syscall numbers above.
+    pub mod x86_64 {
+        pub const O_DIRECT: u32 = 0o40_000;
+        pub const O_LARGEFILE: u32 = 0o100_000;
+        pub const O_DIRECTORY: u32 = 0o200_000;
+        pub const O_NOFOLLOW: u32 = 0o400_000;
+        /// `__O_TMPFILE | O_DIRECTORY`, x86_64 encoding.
+        pub const O_TMPFILE: u32 = 0o20_200_000;
+    }
+
+    /// The aarch64 (32-bit ARM) values of the same four bits.
+    ///
+    /// `O_DIRECTORY` and `O_NOFOLLOW` are *paths into* `akuma-syscalls-linux`,
+    /// which owns the aarch64 table, so those two cannot drift. `O_DIRECT` and
+    /// `O_LARGEFILE` are literals because that crate does not name them: its
+    /// rule is that a constant appears when a caller needs it, and nothing in
+    /// the AArch64 kernel reads either flag. They are needed **here** even so —
+    /// a translation that passed them through unchanged would leave them
+    /// meaning the other flag, which is the whole defect.
+    pub mod aarch64 {
+        pub use akuma_syscalls_linux::flags::open::{O_DIRECTORY, O_NOFOLLOW, O_TMPFILE};
+        pub const O_DIRECT: u32 = 0o200_000;
+        pub const O_LARGEFILE: u32 = 0o400_000;
+    }
+
+    /// The four bits that differ. Everything outside this mask is shared.
+    const PERMUTED: u32 = 0o40_000 | 0o100_000 | 0o200_000 | 0o400_000;
+
+    /// Re-encode an x86_64 `open(2)` flag word in the aarch64 encoding — the
+    /// one every shared crate in this tree reads.
+    #[must_use]
+    pub const fn x86_64_to_aarch64(flags: u32) -> u32 {
+        let mut out = flags & !PERMUTED;
+        if flags & x86_64::O_DIRECT != 0 {
+            out |= aarch64::O_DIRECT;
+        }
+        if flags & x86_64::O_LARGEFILE != 0 {
+            out |= aarch64::O_LARGEFILE;
+        }
+        if flags & x86_64::O_DIRECTORY != 0 {
+            out |= aarch64::O_DIRECTORY;
+        }
+        if flags & x86_64::O_NOFOLLOW != 0 {
+            out |= aarch64::O_NOFOLLOW;
+        }
+        out
+    }
+
+    /// The inverse, for a value going back out to an x86_64 caller —
+    /// `fcntl(F_GETFL)` is the one that matters.
+    ///
+    /// Written out rather than aliased to [`x86_64_to_aarch64`]. The two
+    /// happen to be the same function today, because a permutation made of
+    /// transpositions is its own inverse, and `translation_is_an_involution`
+    /// pins that — but leaning on it silently would mean a future bit that is
+    /// *not* self-inverse (a genuine renumbering rather than a swap) breaking
+    /// one direction with nothing to say which.
+    #[must_use]
+    pub const fn aarch64_to_x86_64(flags: u32) -> u32 {
+        let mut out = flags & !PERMUTED;
+        if flags & aarch64::O_DIRECT != 0 {
+            out |= x86_64::O_DIRECT;
+        }
+        if flags & aarch64::O_LARGEFILE != 0 {
+            out |= x86_64::O_LARGEFILE;
+        }
+        if flags & aarch64::O_DIRECTORY != 0 {
+            out |= x86_64::O_DIRECTORY;
+        }
+        if flags & aarch64::O_NOFOLLOW != 0 {
+            out |= x86_64::O_NOFOLLOW;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +606,141 @@ mod tests {
     fn newly_named_asm_generic_numbers() {
         assert_eq!(Syscall::Syslog.to_aarch64(), 116);
         assert_eq!(Syscall::Getsid.to_aarch64(), 156);
+    }
+
+    // ── the open(2) flag vocabulary ──────────────────────────────────────
+
+    /// The four permuted bits round trip, and the translation is total.
+    ///
+    /// `PERMUTED` is private, so this walks every bit of the word instead:
+    /// a translation that dropped a bit, or invented one, fails here.
+    #[test]
+    fn every_bit_survives_a_round_trip() {
+        for bit in 0..32 {
+            let x = 1u32 << bit;
+            let a = open_flags::x86_64_to_aarch64(x);
+            assert_eq!(a.count_ones(), 1, "x86_64 bit {bit} did not map to one bit");
+            assert_eq!(
+                open_flags::aarch64_to_x86_64(a),
+                x,
+                "x86_64 bit {bit} did not round trip"
+            );
+        }
+    }
+
+    /// Only four bits move. This is the claim the module's table makes, and it
+    /// is the one a reader is most likely to assume without checking — the
+    /// comment in `amd64/src/fd.rs` asserted the *opposite* ("they happen to
+    /// share the same numeric encoding") for months.
+    #[test]
+    fn exactly_four_bits_are_permuted() {
+        let mut moved = [0u32; 32];
+        let mut n = 0;
+        for bit in 0..32u32 {
+            let x = 1u32 << bit;
+            if open_flags::x86_64_to_aarch64(x) != x {
+                moved[n] = x;
+                n += 1;
+            }
+        }
+        assert_eq!(
+            &moved[..n],
+            &[0o40_000, 0o100_000, 0o200_000, 0o400_000],
+            "the permuted set is not the four bits the table names"
+        );
+    }
+
+    /// A permutation made of transpositions is its own inverse. Pinned rather
+    /// than relied on — see [`open_flags::aarch64_to_x86_64`].
+    #[test]
+    fn translation_is_an_involution() {
+        for bit in 0..32u32 {
+            let x = 1u32 << bit;
+            assert_eq!(
+                open_flags::x86_64_to_aarch64(x),
+                open_flags::aarch64_to_x86_64(x),
+                "bit {bit}"
+            );
+        }
+    }
+
+    /// The aarch64 half must agree with the crate that owns the aarch64 table.
+    ///
+    /// Two of the four are re-exports and cannot drift; the other two are
+    /// literals here, so this is the check that they were read off the same
+    /// header as their neighbours.
+    #[test]
+    fn aarch64_values_match_the_asm_generic_crate() {
+        use akuma_syscalls_linux::flags::open as linux;
+        assert_eq!(open_flags::aarch64::O_DIRECTORY, linux::O_DIRECTORY);
+        assert_eq!(open_flags::aarch64::O_NOFOLLOW, linux::O_NOFOLLOW);
+        assert_eq!(open_flags::aarch64::O_TMPFILE, linux::O_TMPFILE);
+        // The two this crate declares itself, against the ARM fcntl block they
+        // came out of: `O_DIRECT` and `O_LARGEFILE` are the *other* halves of
+        // the two transpositions, so each must equal the x86_64 value of its
+        // partner.
+        assert_eq!(open_flags::aarch64::O_DIRECT, open_flags::x86_64::O_DIRECTORY);
+        assert_eq!(open_flags::aarch64::O_LARGEFILE, open_flags::x86_64::O_NOFOLLOW);
+    }
+
+    /// **The silent failure this module exists to prevent.**
+    ///
+    /// `akuma-syscalls-glue`'s `sys_openat` refuses `O_TMPFILE` on purpose:
+    /// apk-tools 3 probes for it, and an open that succeeds and then discards
+    /// the bytes surfaced as `UNTRUSTED signature` over a good download
+    /// (`docs/archive/APK_OTMPFILE_DIR_FD.md`). Fed the x86_64 encoding
+    /// untranslated, that guard tests false — so the assertion that matters is
+    /// the *negative* one.
+    #[test]
+    fn untranslated_o_tmpfile_defeats_the_guard() {
+        let asked = open_flags::x86_64::O_TMPFILE;
+        let guard = akuma_syscalls_linux::flags::open::O_TMPFILE;
+
+        // What the bug looks like: the flag is set, and the guard says no.
+        assert_ne!(asked & guard, guard, "this is the defect, not the fix");
+
+        // And what the translation restores.
+        assert_eq!(
+            open_flags::x86_64_to_aarch64(asked) & guard,
+            guard,
+            "translated, the refusal fires"
+        );
+    }
+
+    /// The other transposition, which is worse than a missed refusal because it
+    /// **invents** a flag the caller did not pass.
+    ///
+    /// An x86_64 `O_DIRECTORY` read with the aarch64 table is `O_DIRECT`, and
+    /// an x86_64 `O_DIRECT` is `O_DIRECTORY` — so a plain file open acquires a
+    /// "must be a directory" requirement it never asked for. Both directions
+    /// are real flags, which is why nothing rejects either one.
+    #[test]
+    fn o_directory_and_o_direct_are_each_other() {
+        use akuma_syscalls_linux::flags::open as linux;
+        assert_eq!(open_flags::x86_64::O_DIRECTORY, open_flags::aarch64::O_DIRECT);
+        assert_eq!(open_flags::x86_64::O_DIRECT, linux::O_DIRECTORY);
+        assert_eq!(
+            open_flags::x86_64_to_aarch64(open_flags::x86_64::O_DIRECTORY),
+            linux::O_DIRECTORY
+        );
+    }
+
+    /// The bits a spot-check would look at, which is why the permutation hides.
+    #[test]
+    fn the_common_bits_really_are_common() {
+        use akuma_syscalls_linux::flags::open as linux;
+        for f in [
+            linux::O_CREAT,
+            linux::O_EXCL,
+            linux::O_NOCTTY,
+            linux::O_TRUNC,
+            linux::O_APPEND,
+            linux::O_NONBLOCK,
+            linux::O_CLOEXEC,
+            linux::O_PATH,
+            linux::O_ACCMODE,
+        ] {
+            assert_eq!(open_flags::x86_64_to_aarch64(f), f, "0o{f:o} should not move");
+        }
     }
 }

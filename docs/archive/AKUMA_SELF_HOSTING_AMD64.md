@@ -5,7 +5,9 @@
 `akuma-mmap` adoption, the `akuma-mmu` x86 surface, and the `usermode.rs` fold —
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
-**Status:** plan, with measurements taken 2026-09-07.
+**Status:** plan, with measurements taken 2026-09-07 and the walk kept current
+in the dated boxes below (last updated 2026-09-09, after the TLB shootdown and
+C2's seven slices).
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
 > `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
@@ -608,6 +610,78 @@ as they stand one day after the survey
 > does not dispatch yet — which makes it a **deadline**: fold the mem arms
 > before the shootdown exists and the fold installs a silent no-op flush.
 
+> **The shootdown landed, and the deadline is met (2026-09-09)** —
+> `docs/archive/AKUMA_AMD64_TLB_SHOOTDOWN.md`. `TlbTarget::AllCores` is true on
+> this target: an IPI broadcast whose sender holds the BKL, with the page-fault
+> servicing path taking the BKL for its window so the wait cannot deadlock (the
+> argument lives beside `akuma_mmu::set_shootdown_hooks`). The premise both
+> comments rested on — "an address space is only ever active on one core" —
+> died with `clone(CLONE_VM)` on 2026-09-06, and from then on CoW `fork` demoted
+> the **parent's live PTEs** with a core-local `invlpg` while a peer core wrote
+> through a stale writable translation.
+>
+> It was never a model: `cowstale` was **1 of 4 clean on this rig** at baseline
+> and is 4 of 4 now. The flake read as three failures because `NO END MARKER`
+> takes the two probes after it down as `NOT REACHED`. Firecracker 512/0, bare
+> metal 516/0 (+1 check each, the new shootdown self-test), host 1360/0, AArch64
+> `.text`/`.data` byte-identical.
+>
+> **The mem arms may now be folded.** That was the one thing the deadline above
+> gated.
+
+> **C2 landed in seven slices — the whole-file heap cache is dead, and stdio are
+> descriptors (2026-09-09)** — `docs/archive/AKUMA_AMD64_C2_SLICES_1_TO_4.md`
+> (slices 1–5) and `docs/archive/AKUMA_AMD64_C2_SLICES_6_AND_7.md` (6–7).
+>
+> Slice 5 deleted the field this whole item existed for: `Entry.data: Vec<u8>`,
+> every open file's entire contents in the kernel heap, grown by doubling
+> against an `alloc_error_handler` that calls `halt()`. That was the
+> **signature-B bare-metal ssh lockout** — one large write permanently removing
+> a core — and `free` could never see it coming, because it is the kernel heap
+> and not PMM pages. Reads and writes go at `fs::read_at`/`write_at` now, which
+> is the same byte path `akuma-syscalls-glue` uses.
+>
+> Slice 6 gave a spawned child **real descriptors** at birth instead of routing
+> fd 0/1/2 by number below the table, which deleted three of `Spawn`'s four
+> stdio fields. Slice 7 wired the `ExecRuntime` socket and `read_at` hooks and
+> re-checked the `/proc` bullets, all four of which are still *cannot*.
+>
+> **Four bugs that only a ring-3 caller could find**, three of them introduced
+> by slice 5 and one pre-existing:
+>
+> - `O_TRUNC` **never truncated** — `akuma_ext2::write_at`'s first statement is
+>   `if data.is_empty() { return Ok(0) }`, so `echo x > f` left the old tail
+>   behind the new head. Silent data corruption in the commonest shell idiom
+>   there is. The mirror image of slice 5's own zero-length `read_at` probe bug.
+> - `O_CREAT` **never created a zero-length file** — `: > f` and `2> err` on a
+>   command that prints nothing both produced no file at all.
+> - `/dev/null` stopped being a bit bucket. `ls > /dev/null` still *looked*
+>   fine — busybox `ls` swallows its write error, which is how a broken
+>   `/dev/null` survived a 543-check suite and a harness that redirects almost
+>   every line. `echo` does not swallow it.
+> - `busybox ash` forgives exactly one error when saving a descriptor before a
+>   redirect (`fcntl(F_DUPFD_CLOEXEC)` → `EBADF`). While fd 1 was unbound that
+>   is what it got, so `echo x > file` had been working **by accident**; making
+>   the descriptor real made the call resolve, fall through to `EINVAL`, and
+>   raise. The general form is worth more than the fix: **making a descriptor
+>   real makes every descriptor operation on it reachable** — `fstat`, `lseek`
+>   and `F_DUPFD` all had to be implemented in the same pass.
+>
+> Baselines: QEMU/TCG `SMP=1` **533/0**, `SMP=4` **543/0**, Firecracker
+> **530/0**, bare metal **533/0**, host **1360/0** — +18 checks, every one
+> falsified against the unfixed code before being kept. Ring-3 witnesses on QEMU
+> *and* the metal, including a **45 MB / 68 MB heap ladder** through one held fd
+> with `Cached:` flat either side, and ~320 metal ssh sessions with `free`
+> unmoved.
+>
+> **`fd.rs` is not retired**, and what is left is three named things rather than
+> a slice order: flip the refcount authority from `FILES` to the registered
+> table (both socket hooks and all three pipe hooks are now wired, which was the
+> prerequisite), the `wait4` source decision, and the last three `Spawn` fields.
+> **C1 step 4b — the VFS arms into glue — is what actually retires the file**,
+> and it is unblocked: 4a killed the private mount table, 5b supplied
+> `current_process_shared`, and the shootdown lifted the mem-arm deadline.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate
@@ -767,14 +841,38 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │                              AKUMA_AMD64_STEP6_ONE_LOADER.md,
    │                              AKUMA_AMD64_STEP5B_SLICE{1,2,3}_*.md
    ▼
+ [09-09] ═══ THE HEAP CACHE AND THE STALE TRANSLATION ═══
+   │
+   ▼   step 5b slice 4: `PROCS` and `PENDING_EXEC` deleted — the fault
+   │   path resolves through `akuma-exec`'s identity cache, measured at
+   │   +14 cycles on the metal. 5c surveyed and found NOT to be a fold:
+   │   `fork_process` `eret`s from an AArch64 `UserContext`, so folding
+   │   `fork` means building the ring-3 entry seam
+   ▼   TLB shootdown: `TlbTarget::AllCores` becomes true — `clone(CLONE_VM)`
+   │   had made "one core per address space" false and CoW `fork` was
+   │   demoting live PTEs core-locally. `cowstale` 1/4 → 4/4
+   ▼   C2, seven slices: the whole-file kernel-heap cache is deleted (the
+   │   signature-B ssh lockout), a spawned child's stdio become real
+   │   descriptors, and four bugs surface that only ring 3 could find
+   │                        docs: AKUMA_AMD64_STEP5B_SLICE4_PROCS.md,
+   │                              AKUMA_AMD64_C1_5C_SURVEY.md,
+   │                              AKUMA_AMD64_TLB_SHOOTDOWN.md,
+   │                              AKUMA_AMD64_C2_SLICES_{1_TO_4,6_AND_7}.md
+   ▼
  [09-09] ═══ YOU ARE HERE ═══
    │
-   └──► step 5b slice 4: `PROCS` and `PENDING_EXEC` deleted — the fault
-        path resolves through `akuma-exec`'s identity cache, measured at
-        +14 cycles on the metal. C1's remaining work is 5c
-        (fork/execve/wait4/clone onto akuma-exec) — `Spawn` itself cannot
-        go until C2 takes `fd.rs`
-                             docs: AKUMA_AMD64_STEP5B_SLICE4_PROCS.md
+   └──► three pieces left below the gate, none blocked on another:
+        **4b** — the VFS arms into glue, which is what retires `fd.rs`
+                 (4 454 lines, 22 `fd::` arms still in the dispatcher);
+                 its prerequisite inside C2 is flipping the refcount
+                 authority from `FILES` to the registered table
+        **the ring-3 entry seam** — an x86 arm for "enter userspace with
+                 this process's first context"; unblocks `fork`, then
+                 `clone`. Sized like 5b, and the only one with no
+                 hand-off prompt written
+        **`Spawn` + `wait4`** — three fields and one source decision
+                 (populate `CHILD_CHANNELS`, or teach glue's `wait4` to
+                 read `Process::exited`)
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -847,7 +945,7 @@ parity with what the AArch64 self-host already proves.
   ╚══════════════════════════════┬═══════════════════════════════╝
                                  ▼
   ┌────────────────────────────────────────────────────────────────┐
-  │ C1. FOLD usermode.rs IN (4378 → entry seam)   ◀── IN PROGRESS  │
+  │ C1. FOLD usermode.rs IN (5871 → entry seam)   ◀── IN PROGRESS  │
   │  ✔ 1-2  the dispatch vocabulary (akuma-syscalls-abi, 80 rows)  │
   │  ✔ 3    the leaf tier folded, in three batches                 │
   │  ✔ 4a   the private mount table deleted                        │
@@ -855,22 +953,28 @@ parity with what the AArch64 self-host already proves.
   │  ✔ 6    loader.rs placement → akuma-elf load half              │
   │  ✔ 5b   PROCS → akuma-exec, in four slices: register /         │
   │           identity+lifecycle / mount /proc / delete PROCS      │
-  │  ✖ 4b   the remaining VFS arms → glue                          │
+  │  ✖ 4b   the remaining VFS arms → glue  ◀── UNBLOCKED, and it   │
+  │           is what retires fd.rs (4454 lines, 22 fd:: arms).    │
+  │           Needs C2's refcount flip under it first.             │
   │  ✖ THE RING-3 ENTRY SEAM — an x86 arm for "enter userspace     │
   │           with this process's first context". fork_process     │
   │           `eret`s from a UserContext; amd64 has no eret. This  │
   │           is what "5c" turned out to be, and it is 5b-sized.   │
-  │  ✖ Spawn itself, and wait4 with it: those four stdio fields    │
-  │           ARE crate::pipe, so they cannot go until C2.         │
+  │  ✖ Spawn (3 fields now) and wait4: the stdin write end is      │
+  │           reached by PATH, and wait4 needs a source decision.  │
   │   keeps: syscall/sysret asm, swapgs bracketing (= el0-entry    │
-  │          shape on AArch64)                                     │
+  │          shape on AArch64) — the floor, ~900 lines. usermode.rs│
+  │          never reaches zero; see § "usermode.rs's floor".      │
   └──────────────┬───────────────────┬─────────────────────────────┘
                  ▼                   ▼
   ┌────────────────────────┐ ┌─────────────────────────────────────┐
-  │ C2. fd.rs cache dies   │ │ C3. clock.rs dies                   │
-  │   VfsHooks inode reads │ │   akuma-syscalls-time builds here   │
-  │   (block cache comes   │ │   real clock: re-sync, drift,       │
-  │    back via ext2)      │ │   itimers, adjtimex                 │
+  │ C2. fd.rs cache dies ✔ │ │ C3. clock.rs dies                   │
+  │   seven slices, 09-09  │ │   akuma-syscalls-time builds here   │
+  │   the Vec<u8> per open │ │   real clock: re-sync, drift,       │
+  │   file is GONE; reads  │ │   itimers, adjtimex                 │
+  │   go at fs::read_at.   │ │                                     │
+  │   LEFT: refcount flip, │ │                                     │
+  │   Spawn, wait4         │ │                                     │
   └───────────┬────────────┘ └────────────────┬────────────────────┘
               └───────────────┬───────────────┘
                               ▼
@@ -896,12 +1000,60 @@ Two properties of the shape:
   Everything above it is deletions from `amd64/src`; everything below it is
   parity with what the AArch64 self-host already has.
 
+## `usermode.rs`'s floor (measured 2026-09-09)
+
+The C1 box says "5871 → entry seam", and the question that keeps coming back is
+what the seam actually weighs. Measured rather than estimated, on a file that is
+**5 871 lines**:
+
+| what | lines | where it goes |
+|---|---|---|
+| boot self-tests, behind `no-tests` | **~1 850 (31%)** | nowhere — they move to their own file at best |
+| the entry seam | **~700** | **stays forever**: `UserCtx`, `syscall_handler`, `enter_user`, `init_syscall`, `kill_current_from_fault`, the `syscall`/`sysret` and `swapgs` asm |
+| `syscall_dispatch` | **779** | shrinks per folded arm; a dispatcher remains |
+| process calls — `sys_fork` 164, `sys_execve` 202, `sys_spawn` 156, `sys_waitpid` 128, `register_exec_process` 155, `run_process` 110, `Image` 355, spawn table 100 | **~1 400** | the **ring-3 entry seam**, then `Spawn`/`wait4` |
+| ordinary syscall bodies — `sys_write`, `writev`, `readv`, `syslog`, `sysinfo` | **~220** | **4b** |
+| `sys_arch_prctl` | 67 | stays — x86-only, no asm-generic number |
+
+So **it never reaches zero, and it should not.** Its floor is the entry seam
+plus a dispatch table plus the x86-only arms — call it **900–1 000 lines**, the
+amd64 twin of `akuma-el0-entry` + `src/exceptions.rs`'s syscall path, which is
+exactly what the C1 box's "keeps:" line has always said. The path from 5 871 to
+that floor is three named pieces and nothing else: **4b** takes the ordinary
+syscall bodies and most of the dispatcher, **the ring-3 entry seam** takes the
+process calls, and **`Spawn` + `wait4`** take the spawn table with them.
+
+One cheap move is available at any time and is independent of all three:
+**the 1 850 test lines are 31% of the file and are not debt** — they are
+`no-tests`-gated and do not ship in the small profile. Splitting them into
+`amd64/src/usermode_tests.rs` is mechanical and takes the file to ~4 000 without
+folding anything. Worth doing when it stops being the thing that makes the file
+hard to read, not as an end in itself.
+
 ## Open issues found by probing the bare-metal box (2026-09-07)
 
 Found by running the probes on the HP box after the A1 fold landed, not by
 looking for them. Neither is caused by the fold; both are on the path to D.
 
 ### 1. `open(O_CREAT)` does not validate the parent directory — writes vanish silently
+
+> **[CLOSED by C2 slice 5 — re-measured from ring 3 2026-09-09.]** The
+> `close`-time whole-file persist this issue is about no longer exists: a
+> creating or truncating `open` calls `fs::write_file(&normalised, &[])` *at
+> open* and **returns the error**, so a missing parent fails the `open` instead
+> of handing out a descriptor that loses its bytes at `close`. Over ssh on
+> QEMU, against the reported shape:
+>
+> ```
+> $ echo A > /nosuchdir/file ; echo rc=$?
+> /bin/sh: can't create /nosuchdir/file: nonexistent directory
+> rc=1
+> ```
+>
+> Exactly Linux's answer, where the report was `rc 0` and silence. Measured
+> rather than read off the code path, because this section's own § 3 is the
+> standing reminder: an issue closed on paper by a landing nobody re-ran stays
+> open in fact.
 
 ```
 akuma:/# echo A > /nosuchdir/file ; echo $?
@@ -942,6 +1094,27 @@ real fix is C1. Worth a boot self-test either way, because the current suite
 has no case for "create in a directory that is not there".
 
 ### 2. There is no `/dev` at all
+
+> **[CLOSED 2026-09-09 — C2 slice 7]**
+> `docs/archive/AKUMA_AMD64_C2_SLICES_6_AND_7.md`. The other half is wired: a
+> descriptor onto a device node carries the node's path, and `read`, `write`,
+> `lseek` and `fstat` ask `dev_node_of` — a `&'static` name out of the table, no
+> allocation — instead of the VFS. `null` is a bit bucket, `zero` *fills* the
+> buffer (the check seeds it `0xAA` first, which is what separates that
+> assertion from a no-op), `random`/`urandom` read the same entropy
+> `getrandom(2)` does and are deliberately not distinguished, `tty` is the
+> console, and a **block** node is `ENODEV` rather than a fall-through.
+> Witnessed from ring 3 on QEMU and on the metal.
+>
+> **The ordering is the substance**: the device arm runs *before* the existence
+> probe, because a node has no byte path and the probe answers "absent" for
+> every one of them. Behind the probe, `open("/dev/zero")` was `ENOENT` while
+> `open("/dev/null", O_CREAT)` — which skips the probe's guard — went on to try
+> to *create* a node.
+>
+> The paragraph below predicted the pairing exactly and was right: fixing the
+> open check without `/dev/null` would have turned working shell into hard
+> failures. They landed in the same pass.
 
 > **[HALF-CLOSED 2026-09-07 — C1 step 4a]**
 > `docs/archive/AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md`. Adopting

@@ -105,19 +105,69 @@ use crate::serial;
 
 /// Map an `FsError` from the VFS byte paths onto a syscall errno.
 ///
-/// The write-through path's error vocabulary: what ring 3 sees when
-/// `read_at`/`write_at` refuse. `EIO` for the catch-all is deliberate — the
-/// specific strings land on the console through `fs_err_str` where they
-/// matter; inventing eight more errnos nobody distinguishes is not honesty,
-/// it is noise.
+/// **`akuma-syscalls-glue`'s `fs_error_to_errno`, arm for arm.** One table, so
+/// a folded arm answers what this file answers.
+///
+/// It used to be three arms and a catch-all, defended by a comment saying
+/// "inventing eight more errnos nobody distinguishes is not honesty, it is
+/// noise". The argument was sound and the premise was not: half of these are
+/// distinguished, by callers this target already runs. `EISDIR` is how a
+/// program learns to call `getdents64` instead of `read`; busybox `find` reads
+/// `ENOTDIR` to stop descending; `EROFS` is what tells a writer the mount is
+/// the problem rather than the disk. `EIO` reads as a *hardware* fault and
+/// sends whoever gets it looking at the wrong layer entirely.
+///
+/// The four `*at` calls below (`mkdirat`, `unlinkat`, `symlinkat`,
+/// `utimensat`) each carried their own two- or three-arm subset of this list
+/// ending in `EIO`, which is the drift `clone_fd_refs`'s header describes in
+/// the other half of the tree: several partial copies of one table, each
+/// correct for the cases its author happened to hit.
+///
+/// One divergence from glue's table, deliberate: `NotSupported` is `ENOSYS`
+/// here and falls through to `EIO` there. `utimensat` is the caller that
+/// wants it — "this filesystem does not keep times" is not an I/O error, and
+/// a build system reading `ENOSYS` stops asking.
 fn fs_err_errno(e: akuma_vfs::FsError) -> u64 {
     use akuma_vfs::FsError as E;
     match e {
         E::NotFound => errno::ENOENT,
-        E::ReadOnly => errno::EROFS,
+        E::PermissionDenied => errno::EACCES,
+        E::AlreadyExists => errno::EEXIST,
+        E::NotADirectory => errno::ENOTDIR,
+        E::NotAFile => errno::EISDIR,
+        E::DirectoryNotEmpty => errno::ENOTEMPTY,
         E::NoSpace => errno::ENOSPC,
+        E::ReadOnly => errno::EROFS,
+        E::InvalidPath => errno::EINVAL,
+        E::TooManyOpenFiles => errno::EMFILE,
+        E::NotSupported => errno::ENOSYS,
         _ => errno::EIO,
     }
+}
+
+/// Does the path this descriptor names a directory?
+///
+/// The replacement for `Entry::is_dir`, which was a bool five constructors had
+/// to set correctly and which `akuma-syscalls-glue` does not have — glue
+/// refuses a write open of a directory at `open(2)` and otherwise lets the VFS
+/// answer, so this target grew the same shape ahead of the fold.
+///
+/// `/proc` is asked of [`proc_metadata`] and everything else of the VFS, in
+/// that order, because a synthetic view has no inode for `fs::metadata` to
+/// find: `/proc/<pid>` is a directory that exists only in the process table,
+/// and asking the disk about it answers "no such file" rather than "not a
+/// directory". `/proc` itself is on the image as a real empty directory, so
+/// either source would do for that one; the ordering makes the answer come
+/// from the thing that renders it.
+///
+/// The prefix test is `== "/proc"` or `starts_with("/proc/")` rather than
+/// `strip_prefix("/proc")`, which would also claim a file named `/procfoo`.
+fn path_is_dir(path: &str) -> bool {
+    if path == "/proc" || path.starts_with("/proc/") {
+        let rest = path.strip_prefix("/proc").unwrap_or("");
+        return proc_metadata(rest).is_some_and(|(_, is_dir)| is_dir);
+    }
+    fs::metadata(path).is_ok_and(|m| m.is_dir)
 }
 
 /// C2 SLICE 5: the discriminator between a **real** file (ext2-backed, read
@@ -129,8 +179,12 @@ fn fs_err_errno(e: akuma_vfs::FsError) -> u64 {
 /// `open_proc`/`install_synthetic_file` always render **non-empty** contents —
 /// a synthetic view that cannot render fails the open — so an empty `data` on
 /// a `File` descriptor can only mean "real, uncached".
+///
+/// The `!entry.is_dir` half went with the field: an ext2 directory descriptor
+/// is constructed with an empty `data` and no installer ever gives one bytes,
+/// so the second test already implied the first.
 fn entry_is_synthetic(entry: &Entry) -> bool {
-    !entry.is_dir && !entry.data.is_empty()
+    !entry.data.is_empty()
 }
 
 /// The console's line discipline.
@@ -282,11 +336,6 @@ struct Entry {
     /// non-blocking so a session idling on its socket suspends instead of
     /// stalling its peers.
     nonblocking: bool,
-    /// Was this fd opened on a directory? Set once at `open`, from
-    /// `fs::metadata` — never a socket or pipe, so those constructors always
-    /// pass `false`. Only `getdents64` may read a directory descriptor;
-    /// `read`/`write` on one report `EISDIR`/`EBADF` per POSIX.
-    is_dir: bool,
     /// How many descriptors name this description.
     ///
     /// One at `open`. `dup` and `fork` add a name without adding a
@@ -316,7 +365,6 @@ pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
         desc: FileDescriptor::Socket(idx),
         data: Vec::new(),
         nonblocking: false,
-        is_dir: false,
         refs: 1,
     });
     (!errno::is_err(fd)).then_some(fd)
@@ -344,7 +392,6 @@ pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
         desc,
         data: Vec::new(),
         nonblocking: false,
-        is_dir: false,
         refs: 1,
     });
     (!errno::is_err(fd)).then_some(fd)
@@ -960,7 +1007,6 @@ pub fn bind_stdio(
         desc: FileDescriptor::PipeRead(stdin_pipe as u32),
         data: Vec::new(),
         nonblocking: false,
-        is_dir: false,
         refs: 1,
     }) else {
         return errno::ENFILE;
@@ -969,7 +1015,6 @@ pub fn bind_stdio(
         desc: FileDescriptor::PipeWrite(stdout_pipe as u32),
         data: Vec::new(),
         nonblocking: false,
-        is_dir: false,
         // Two names from birth: fd 1 and fd 2.
         refs: 2,
     }) else {
@@ -1070,16 +1115,20 @@ fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::
         p.push_str(&path);
         return Ok(p);
     }
-    let base = with_file(dirfd, |entry| {
-        if !entry.is_dir {
-            return None;
-        }
-        match &entry.desc {
-            FileDescriptor::File(f) => Some(f.path.clone()),
-            _ => None,
-        }
+    // The descriptor's *path*, then one `metadata` to say whether it names a
+    // directory. That question used to be a bool on the entry; it is asked of
+    // the filesystem now, for the reason the field's removal states — glue has
+    // no such field and this is where it would have to come from anyway.
+    //
+    // Cold path: a `dirfd` open is `apk` walking `/etc/apk/keys`, not a read
+    // loop, so one inode read per `openat` with a real `dirfd` is not a cost
+    // worth caching a bool for.
+    let base = with_file(dirfd, |entry| match &entry.desc {
+        FileDescriptor::File(f) => Some(f.path.clone()),
+        _ => None,
     })
-    .flatten();
+    .flatten()
+    .filter(|p| fs::metadata(p).is_ok_and(|m| m.is_dir));
     let Some(mut joined) = base else {
         return Err(errno::ENOTDIR);
     };
@@ -1100,6 +1149,23 @@ fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::
 /// exist — zero keys loaded, and every fetched index reported `UNTRUSTED
 /// signature` no matter how correct the fetch and the keys were.
 pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
+    // **The flag word arrives in the x86_64 encoding and is re-encoded here,
+    // once** — the same hop `Syscall::from_x86_64` makes for the syscall
+    // number, one argument along. aarch64 Linux keeps the 32-bit ARM fcntl
+    // values, so four bits are *permuted* between the two architectures
+    // (`O_DIRECTORY`↔`O_DIRECT`, `O_NOFOLLOW`↔`O_LARGEFILE`); every other `O_*`
+    // bit is identical, which is exactly why this file used to say the two
+    // encodings "happen to share the same numeric encoding" and carry three
+    // separate `_X86` constants for the ones that do not.
+    //
+    // Everything below this line — and everything a folded `akuma-syscalls-glue`
+    // arm will read out of `KernelFile::flags` — is therefore asm-generic, the
+    // one encoding every shared crate in this tree speaks. See
+    // `akuma_syscalls_abi::open_flags`, whose tests pin the trap this closes:
+    // an untranslated x86_64 `O_TMPFILE` slips straight through glue's refusal.
+    let flags_ = u64::from(akuma_syscalls_abi::open_flags::x86_64_to_aarch64(
+        flags_ as u32,
+    ));
     let Some(path) = path_from_user(path) else {
         return errno::EFAULT;
     };
@@ -1151,14 +1217,20 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // `ELOOP` on a link, which is the weaker half of the flag: this target has
     // no `O_PATH` and nothing that opens a link to inspect it. Stated so the
     // divergence is pinned rather than assumed absent.
-    const O_NOFOLLOW_X86: u64 = 0o400_000;
-    let normalised = if flags_ & O_NOFOLLOW_X86 == 0 {
+    let normalised = if flags_ & u64::from(open_flags::O_NOFOLLOW) == 0 {
         fs::resolve_symlinks(&normalised)
     } else {
         normalised
     };
-    // `O_TMPFILE` (x86_64 encoding, `0o20200000`) is answered with `EINVAL`,
-    // as Linux kernels without tmpfile support do. This used to be *missing*,
+    // `O_TMPFILE` is answered with `EINVAL`, as Linux kernels without tmpfile
+    // support do — and it is tested against the **asm-generic** mask, because
+    // the word was re-encoded at the top of this function. Read straight off
+    // the wire it would not have matched: x86_64 spells the flag `0o20200000`
+    // and aarch64 `0o20040000`, they share only `__O_TMPFILE`, and
+    // `flags & mask == mask` is therefore false for an x86_64 caller who
+    // asked for exactly this. That is the failure
+    // `akuma_syscalls_abi::open_flags`'s tests pin, and the reason a folded
+    // `sys_openat` could not have inherited this guard for free. This used to be *missing*,
     // which repeated the aarch64 `APK_OTMPFILE_DIR_FD.md` bug bit for bit:
     // apk-tools 3 opens its atomic-write temp file with
     // `openat(dfd, ".", O_RDWR|O_TMPFILE|O_CLOEXEC)`, the open succeeded as a
@@ -1169,8 +1241,8 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // Portable callers (apk-tools 3's `__apk_ostream_to_file`) treat any
     // failure here as "no tmpfiles" and fall back to `.tmp.<pid>` +
     // `renameat`, which works.
-    const O_TMPFILE_X86: u64 = 0o20200000;
-    if flags_ & O_TMPFILE_X86 == O_TMPFILE_X86 {
+    let tmpfile = u64::from(open_flags::O_TMPFILE);
+    if flags_ & tmpfile == tmpfile {
         return errno::EINVAL;
     }
 
@@ -1262,14 +1334,36 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             desc: FileDescriptor::File(file),
             data: Vec::new(),
             nonblocking: false,
-            is_dir: false,
-            refs: 1,
+                refs: 1,
         });
     }
     let mut probe = [0u8; 1];
     let exists = fs::read_at(&normalised, 0, &mut probe).is_ok();
     if !creating && !is_dir && !exists {
         return errno::ENOENT;
+    }
+    // `O_DIRECTORY` — the other half of the `is_dir` answer above, and the one
+    // this file could not express before the word was re-encoded at the top.
+    //
+    // The flag was **never read at all**: it had no entry in the local
+    // `open_flags` module, and `is_dir` is decided by `fs::metadata`, so
+    // `open("/bin/busybox", O_RDONLY|O_DIRECTORY)` handed back a working
+    // descriptor on a regular file. It could not simply have been added
+    // either — the bit ring 3 sets is `0o200000`, which in the encoding every
+    // shared crate here uses is `O_DIRECT`, so reading it with the tree's own
+    // constant would have tested the wrong bit, and reading it with a fourth
+    // inline `_X86` const would have deepened the split this pass removes.
+    //
+    // **Below the existence probe, not above it**, and the first draft had it
+    // above: `open("/no/such/path", O_DIRECTORY)` must be `ENOENT`, because
+    // "there is no such file" outranks "and it would not have been a
+    // directory". Placed early it answered `ENOTDIR` for every missing path
+    // that carried the flag — which is the sort of thing that sends a caller
+    // looking for a directory it never asked about. The check's own negative
+    // control is what found it, by returning `ENOENT` from the arm that was
+    // supposed to be the broken one.
+    if !is_dir && flags_ & u64::from(open_flags::O_DIRECTORY) != 0 {
+        return errno::ENOTDIR;
     }
     let truncating = flags_ & u64::from(open_flags::O_TRUNC) != 0;
     let appending = flags_ & u64::from(open_flags::O_APPEND) != 0;
@@ -1278,8 +1372,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // or an atomic temp name, and succeeding anyway tells two of them they
     // both won. Asked here rather than left out, because the probe above has
     // already paid for the existence answer.
-    const O_EXCL_X86: u64 = 0o200;
-    if creating && flags_ & O_EXCL_X86 != 0 && (exists || is_dir) {
+    if creating && flags_ & u64::from(open_flags::O_EXCL) != 0 && (exists || is_dir) {
         return errno::EEXIST;
     }
     // **`O_TRUNC` truncates and `O_CREAT` creates — here, once, through the
@@ -1343,32 +1436,30 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         desc: FileDescriptor::File(file),
         data: Vec::new(),
         nonblocking: false,
-        is_dir,
         refs: 1,
     })
 }
 
-/// `O_CREAT`, `O_WRONLY`, `O_RDWR`, `O_TRUNC` — the bits [`sys_openat`] and
-/// [`sys_write_file`] decode from the raw `flags` word. Spelled out locally
-/// rather than pulled from `akuma_syscalls_linux` because those are the
-/// AArch64/`asm-generic` values; on x86_64 they happen to share the same
-/// numeric encoding (`open(2)`'s flag bits are one of the few things the two
-/// architectures never diverged on), but naming that coincidence explicitly
-/// here is cheaper than a reader having to go check.
-pub mod open_flags {
-    pub const O_ACCMODE: u32 = 0o3;
-    pub const O_CREAT: u32 = 0o100;
-    /// Start from nothing. x86_64 `0o1000`.
-    pub const O_TRUNC: u32 = 0o1000;
-    /// Start at the end. x86_64 `0o2000`.
-    ///
-    /// Added 2026-09-06 with `O_TRUNC`, because until then neither was read at
-    /// all: **any** `O_CREAT` open began with an empty buffer, so `>>` behaved
-    /// exactly like `>`. That was invisible while `dup2` did not work — nothing
-    /// could redirect in the first place — and became a data-losing bug the
-    /// moment it did. `echo a > f; echo b >> f` left `f` holding only `b`.
-    pub const O_APPEND: u32 = 0o2000;
-}
+/// The `open(2)` flag bits, **asm-generic encoding** — the tree's own table,
+/// not a local copy.
+///
+/// This used to be five constants declared here, under a comment reasoning that
+/// pulling them from `akuma_syscalls_linux` would be wrong because "those are
+/// the AArch64/`asm-generic` values" and "on x86_64 they happen to share the
+/// same numeric encoding". The first half was right and the second was **false
+/// for four bits** — aarch64 keeps the 32-bit ARM fcntl values, so
+/// `O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT` and `O_LARGEFILE` are a permutation
+/// between the two architectures rather than a shared encoding. The file knew
+/// it in three places, as `O_NOFOLLOW_X86`, `O_TMPFILE_X86` and `O_EXCL_X86`
+/// declared inline where they were needed, which is how a coincidence survives
+/// as a stated fact: each of those sites was correct on its own and none of
+/// them contradicted the comment out loud.
+///
+/// [`sys_openat`] now re-encodes the whole word once at its own boundary
+/// (`akuma_syscalls_abi::open_flags::x86_64_to_aarch64`), so every reader below
+/// it — this module, `KernelFile::flags`, and whatever
+/// `akuma-syscalls-glue` arm folds next — speaks one encoding.
+pub use akuma_syscalls_linux::flags::open as open_flags;
 
 /// `mkdirat(dirfd, path, mode)` — x86_64 258. `mode` is not tracked (one
 /// user, like `access`). First consumer: `apk`'s cache-directory setup.
@@ -1381,9 +1472,7 @@ pub fn sys_mkdirat(dirfd: u64, path: u64, _mode: u64) -> u64 {
     };
     match fs::create_dir(&path) {
         Ok(()) => 0,
-        Err(akuma_vfs::FsError::AlreadyExists) => errno::EEXIST,
-        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
-        Err(_) => errno::EIO,
+        Err(e) => fs_err_errno(e),
     }
 }
 
@@ -1399,9 +1488,7 @@ pub fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> u64 {
     };
     match fs::remove(&path, flags & AT_REMOVEDIR != 0) {
         Ok(()) => 0,
-        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
-        Err(akuma_vfs::FsError::DirectoryNotEmpty) => errno::ENOTEMPTY,
-        Err(_) => errno::EIO,
+        Err(e) => fs_err_errno(e),
     }
 }
 
@@ -1490,9 +1577,7 @@ pub fn sys_symlinkat(target: u64, newdirfd: u64, link_path: u64) -> u64 {
     };
     match fs::create_symlink(&link, &target) {
         Ok(()) => 0,
-        Err(akuma_vfs::FsError::AlreadyExists) => errno::EEXIST,
-        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
-        Err(_) => errno::EIO,
+        Err(e) => fs_err_errno(e),
     }
 }
 
@@ -1573,9 +1658,7 @@ pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
 
     match fs::set_times(&path, atime, mtime) {
         Ok(()) => 0,
-        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
-        Err(akuma_vfs::FsError::NotSupported) => errno::ENOSYS,
-        Err(_) => errno::EIO,
+        Err(e) => fs_err_errno(e),
     }
 }
 
@@ -1690,7 +1773,6 @@ pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
         desc: FileDescriptor::PipeRead(id as u32),
         data: Vec::new(),
         nonblocking: false,
-        is_dir: false,
         refs: 1,
     });
     if errno::is_err(read_fd) {
@@ -1701,7 +1783,6 @@ pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
         desc: FileDescriptor::PipeWrite(id as u32),
         data: Vec::new(),
         nonblocking: false,
-        is_dir: false,
         refs: 1,
     });
     if errno::is_err(write_fd) {
@@ -1793,7 +1874,7 @@ fn release(entry: Entry) {
         // would truncate it — a close that destroys the file it claims to
         // save. A real close is now a no-op here, which is what POSIX says
         // too: `close(2)` does not truncate.
-        Entry { desc: FileDescriptor::File(file), data, is_dir: false, .. }
+        Entry { desc: FileDescriptor::File(file), data, .. }
             if file.flags & open_flags::O_ACCMODE != 0 && !data.is_empty() =>
         {
             // A failed persist is REPORTED, not discarded: this is the whole
@@ -1954,10 +2035,12 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // Resolve under the lock; do the I/O outside it — the rule `release`
     // states for the same reason. Synthetic (`/proc`) views still read their
     // cached bytes under the lock, because there is no second source.
+    // **No directory guard here.** A `read` on a directory descriptor reaches
+    // `fs::read_at`, which answers `NotAFile`, which [`fs_err_errno`] maps to
+    // `EISDIR` — the same errno by the same route `akuma-syscalls-glue` uses,
+    // and the reason the entry no longer carries an `is_dir` bool. The common
+    // path pays nothing: the check that went away only ever fired on the error.
     let resolved = with_file(fd, |entry| {
-        if entry.is_dir {
-            return Err(errno::EISDIR);
-        }
         if entry.file().is_none() {
             return Err(errno::EBADF);
         }
@@ -1990,9 +2073,14 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     // Real path: one bounded VFS read, then the position moves.
     let mut kbuf = alloc::vec![0u8; len as usize];
+    // **The error is mapped, not flattened.** `Err(_) => EIO` stood here, and
+    // it is what made `read` on a directory descriptor answer `EIO` the moment
+    // the entry stopped carrying an `is_dir` bool to refuse it earlier: ext2
+    // says `NotAFile`, [`fs_err_errno`] says `EISDIR`, and this line threw
+    // both away. Caught by a ring-3 probe, not by the suite.
     let n = match fs::read_at(&path, pos, &mut kbuf) {
         Ok(n) => n,
-        Err(_) => return errno::EIO,
+        Err(e) => return fs_err_errno(e),
     };
     if n == 0 {
         return 0;
@@ -2066,9 +2154,6 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     }
 
     let resolved = with_file(fd, |entry| {
-        if entry.is_dir {
-            return Err(errno::EISDIR);
-        }
         if entry.file().is_none() {
             return Err(errno::EBADF);
         }
@@ -2097,7 +2182,7 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
             let mut kbuf = alloc::vec![0u8; len as usize];
             let n = match fs::read_at(&path, pos, &mut kbuf) {
                 Ok(n) => n,
-                Err(_) => return errno::EIO,
+                Err(e) => return fs_err_errno(e),
             };
             copy_to_user(buf, &kbuf[..n])
         }
@@ -2121,13 +2206,12 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
 /// that could not be read into the kernel cannot be mapped either, and both fail
 /// at `open`.
 pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
+    // A directory needs no guard of its own: `fs::read_at` below refuses one
+    // (`NotAFile`), and this function's contract is already `None` for
+    // anything a `MAP_PRIVATE` file mapping must not be served from.
     let (synthetic, path) = with_file(fd, |entry| {
-        if entry.is_dir || entry.file().is_none() {
-            return None;
-        }
-        let synthetic = entry_is_synthetic(entry);
-        let path = entry.file().unwrap().path.clone();
-        Some((synthetic, path))
+        let path = entry.file()?.path.clone();
+        Some((entry_is_synthetic(entry), path))
     })??;
     if synthetic {
         // A mapped synthetic view: its bytes exist only in the cache.
@@ -2162,7 +2246,14 @@ pub fn is_regular_file(fd: u64) -> bool {
     if dev_node_of(fd).is_some() {
         return false;
     }
-    with_file(fd, |entry| !entry.is_dir && entry.file().is_some()).unwrap_or(false)
+    // "Not a directory", asked of the path rather than of a bool the entry
+    // carried. A synthetic `/proc` *file* stays mappable exactly as it was —
+    // [`file_bytes_at`] serves it from the render — and a synthetic `/proc`
+    // directory is refused, which the bool got right only because
+    // `install_synthetic_dir` remembered to pass `true`.
+    with_file(fd, |entry| entry.file().map(|f| f.path.clone()))
+        .flatten()
+        .is_some_and(|p| !path_is_dir(&p))
 }
 
 /// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
@@ -2226,10 +2317,11 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
         // never belongs under `FILES`), and only the cursor move comes back.
         // A **synthetic** entry is written into its cached render as before:
         // there is no inode behind the path to write through.
+        // The directory guard that stood here was unreachable and is gone: a
+        // write-mode open of a directory is refused at `open(2)`
+        // (`sys_openat`'s `EISDIR`), so a directory descriptor is always
+        // read-only and the `writable` test below is what turns it away.
         let resolved = with_file(fd, |entry| {
-            if entry.is_dir {
-                return Err(errno::EISDIR);
-            }
             let writable = match &entry.desc {
                 FileDescriptor::File(f) => f.flags & open_flags::O_ACCMODE != 0,
                 _ => false,
@@ -2471,7 +2563,12 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         };
         let synthetic = entry_is_synthetic(entry);
         let t = if synthetic { entry.data.len() } else { 0 };
-        (t, !synthetic && !entry.is_dir)
+        // A directory descriptor takes the real branch now rather than being
+        // excluded from both: Linux permits `lseek` on one, and `metadata`
+        // answers its size like any other inode. The old exclusion left
+        // `total` at 0, so `SEEK_END` on a directory silently meant
+        // `SEEK_SET(0)`.
+        (t, !synthetic)
     };
     let total = if was_real {
             let path = {
@@ -2486,7 +2583,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
             };
         match fs::metadata(&path) {
             Ok(m) => m.size as usize,
-            Err(_) => return errno::EIO,
+            Err(e) => return fs_err_errno(e),
         }
     } else {
         total
@@ -2560,9 +2657,6 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
         let Some(entry) = files[fi].as_mut() else {
             return errno::EBADF;
         };
-        if !entry.is_dir {
-            return errno::ENOTDIR;
-        }
         let Some(file) = entry.file() else {
             return errno::EBADF;
         };
@@ -2572,8 +2666,14 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
     let entries = if let Some(c) = cached {
         c
     } else {
-        let Ok(dir_entries) = fs::list_dir(&path) else {
-            return errno::ENOENT;
+        // `ENOTDIR` for a non-directory comes from here now, not from a bool
+        // on the entry: `list_dir` answers `NotADirectory` and
+        // [`fs_err_errno`] maps it. The blanket `ENOENT` this replaces was
+        // wrong for that case in the way that misdirects — "no such
+        // directory" for a path that plainly exists.
+        let dir_entries = match fs::list_dir(&path) {
+            Ok(e) => e,
+            Err(e) => return fs_err_errno(e),
         };
         let cache: Vec<akuma_exec_core::process::DirCacheEntry> = dir_entries
             .iter()
@@ -2660,6 +2760,13 @@ const S_IFREG_0644: u32 = 0o100_644;
 const S_IFCHR_0620: u32 = 0o020_620;
 /// `S_IFDIR | 0755`, for a directory descriptor.
 const S_IFDIR_0755: u32 = 0o040_755;
+/// `S_IFREG | 0444`, for a `/proc` render — read-only, which is what it is.
+///
+/// The same mode `sys_newfstatat` reports for the same path, so `stat` and
+/// `fstat` agree on a `/proc` file. Before the `is_dir` removal every
+/// synthetic view was reported as a zero-length **directory** by `fstat`,
+/// including `/proc/meminfo`.
+const S_IFREG_0444: u32 = 0o100_444;
 /// `S_IFIFO | 0600`, for a pipe descriptor.
 ///
 /// Needed from C2 slice 6, which is when a spawned child first *had* one at
@@ -2730,12 +2837,40 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         // keeps `stat file` and `fstat(open(file))` agreeing.
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
-        // Size: synthetic from the cache, real from the VFS — one `metadata`
-        // outside the lock, the rule `release` states about disk I/O.
+        // Size and shape: synthetic from the render, real from the VFS — one
+        // `metadata` outside the lock, the rule `release` states about disk
+        // I/O.
+        //
+        // # This arm answered `EBADF` for every real directory descriptor
+        //
+        // It opened `if entry.is_dir { return None }`, and `None` here is
+        // `EBADF`. The `S_IFDIR` arm below it was never reached by an ext2
+        // directory at all — its `true` is *synthetic*, not *directory*, so
+        // the only descriptors ever reported as directories were `/proc`
+        // views, **including `/proc/meminfo`**, which was told it was a
+        // zero-length directory.
+        //
+        // Measured from ring 3 (`/probes/dirprobe`, x86_64 musl) before the
+        // fix, which is the only reason it was found — this file's own header
+        // says the opposite in prose:
+        //
+        // ```
+        // open(/etc, O_DIRECTORY) = 3 (ok)
+        // fstat(dirfd) = -1 errno=9(Bad file descriptor) mode=00 S_ISDIR=0
+        // fdopendir(dirfd) = NULL (Bad file descriptor)
+        // ```
+        //
+        // busybox never noticed because it walks with `opendir(path)` and
+        // `lstat`, not `fdopendir` — so `ls`, `find` and `ls -R` all work over
+        // a path that this call cannot describe. `fdopendir` is what `nftw`
+        // and most every `openat`-based directory walker are built on, which
+        // is the shape a self-hosting build reaches for.
+        //
+        // Both halves are answered from the source that knows now: a synthetic
+        // view asks [`proc_metadata`] (the same answer `newfstatat` gives for
+        // the same path, so `stat` and `fstat` agree), and a real file asks
+        // the VFS for `is_dir` alongside the size it was already fetching.
         let resolved = with_file(fd, |entry| {
-            if entry.is_dir {
-                return None;
-            }
             let synthetic = entry_is_synthetic(entry);
             let size = if synthetic { entry.data.len() as u64 } else { 0 };
             let path = entry.file()?.path.clone();
@@ -2743,15 +2878,24 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         });
         match resolved.flatten() {
             None => return errno::EBADF,
-            Some((true, _, _)) => (S_IFDIR_0755, 0u64, 2u64),
-            Some((false, cached_size, path)) => {
-                let size = if cached_size == 0 {
-                    fs::metadata(&path).map_or(0, |m| m.size)
-                } else {
-                    cached_size
-                };
-                (S_IFREG_0644, size, 1u64)
+            Some((synthetic, cached_size, path)) if path_is_dir(&path) => {
+                let _ = (synthetic, cached_size);
+                (S_IFDIR_0755, 0u64, 2u64)
             }
+            // A `/proc` render: read-only, and its size is the bytes this
+            // descriptor will actually serve — the same answer
+            // `sys_newfstatat` gives for the same path, which is what keeps
+            // `stat` and `fstat` agreeing.
+            Some((true, cached_size, _)) => (S_IFREG_0444, cached_size, 1u64),
+            Some((false, _, path)) => match fs::metadata(&path) {
+                Ok(m) => (S_IFREG_0644, m.size, 1u64),
+                // The path resolved at `open` and does not now — an unlinked
+                // file, which this target has no inode pin for. Reported as
+                // the regular file it was rather than as a bad descriptor:
+                // the fd is perfectly valid, and `EBADF` would send a caller
+                // looking at its own bookkeeping.
+                Err(_) => (S_IFREG_0644, 0u64, 1u64),
+            },
         }
     };
     let st = encode_stat(mode, size, 0, nlink, None, None, None);
@@ -3336,7 +3480,6 @@ fn install_synthetic_dir(path: &str, names: Vec<(alloc::string::String, u8)>, fl
         desc: FileDescriptor::File(file),
         data: Vec::new(),
         nonblocking: false,
-        is_dir: true,
         refs: 1,
     })
 }
@@ -3865,7 +4008,6 @@ fn install_synthetic_file(path: &str, data: Vec<u8>, flags: u64) -> u64 {
         )),
         data,
         nonblocking: false,
-        is_dir: false,
         refs: 1,
     })
 }
@@ -4281,6 +4423,65 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("fd: close", sys_close(fd), 0);
     t.check_eq("fd: closing twice is EBADF", sys_close(fd), errno::EBADF);
     t.check_eq("fd: reading a closed fd is EBADF", sys_read(fd, buf.as_mut_ptr() as u64, 4), errno::EBADF);
+
+    // ── the open(2) flag encoding, as ring 3 actually spells it ──────────
+    //
+    // **Every constant in this block is the x86_64 value**, deliberately, and
+    // that is the whole point of the block: these are the bits a musl-linked
+    // guest binary sets, and aarch64 Linux keeps the 32-bit ARM fcntl values,
+    // so four of them are a *permutation* rather than a shared encoding
+    // (`akuma_syscalls_abi::open_flags`). `sys_openat` re-encodes the word
+    // once at its boundary; these checks are what says the hop happened.
+    //
+    // Each has a negative control that is a **different errno**, not a
+    // different success — an assertion that merely wanted "an error" would
+    // pass against the untranslated kernel for all three.
+    const O_DIRECTORY_X86: u64 = 0o200_000;
+    const O_TMPFILE_X86: u64 = 0o20_200_000;
+    const O_RDWR: u64 = 0o2;
+    let etc = b"/etc\0";
+    let missing_dir = b"/no-such-dir\0";
+    let dfd = sys_openat(0, etc.as_ptr() as u64, O_DIRECTORY_X86, 0);
+    // Untranslated, `0o200000` reads as `O_DIRECT` — a cache hint nothing here
+    // implements — so this open succeeds either way. It is here to prove the
+    // *next* check is not passing because `/etc` is unopenable.
+    if t.check("fd: O_DIRECTORY on a directory opens", dfd >= FIRST_FILE_FD as u64) {
+        t.check_eq("fd: ... and closes", sys_close(dfd), 0);
+    }
+    // The real assertion. Untranslated this is `O_DIRECT` on a regular file,
+    // which this kernel ignores, and the open **succeeds** — the answer before
+    // this pass, for every caller that ever passed the flag.
+    // `/bin/busybox`, not `/etc/passwd`: the image has no passwd file, and the
+    // first draft of this check used one. It passed — for the wrong reason,
+    // against an `O_DIRECTORY` refusal that ran *before* the existence probe
+    // and so answered `ENOTDIR` for a path that was simply absent. The
+    // negative control is what said so, by returning `ENOENT` from the arm
+    // that was meant to be broken.
+    let reg = b"/bin/busybox\0";
+    t.check_eq(
+        "fd: O_DIRECTORY on a regular file is ENOTDIR",
+        sys_openat(0, reg.as_ptr() as u64, O_DIRECTORY_X86, 0),
+        errno::ENOTDIR,
+    );
+    // And a missing path is `ENOENT` even with the flag set — the ordering the
+    // draft got wrong.
+    t.check_eq(
+        "fd: O_DIRECTORY on a missing path is ENOENT",
+        sys_openat(0, missing_dir.as_ptr() as u64, O_DIRECTORY_X86, 0),
+        errno::ENOENT,
+    );
+    // `O_TMPFILE` is the compound case — `__O_TMPFILE | O_DIRECTORY`, so it
+    // inherits the permutation. Untranslated, the mask test is false and the
+    // open falls through to the write-mode-on-a-directory guard, which answers
+    // `EISDIR`: an error, and the wrong one, from a check that never ran.
+    // (That fall-through is why this was never a *live* defect on this target
+    // — apk's probe was refused by the neighbouring guard. It becomes one the
+    // moment a folded `akuma-syscalls-glue` arm owns the refusal.)
+    t.check_eq(
+        "fd: O_TMPFILE is EINVAL, not EISDIR",
+        sys_openat(0, etc.as_ptr() as u64, O_RDWR | O_TMPFILE_X86, 0),
+        errno::EINVAL,
+    );
 
     // A missing file, and a path that is not a path.
     let missing = b"/does-not-exist\0";
