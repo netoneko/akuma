@@ -428,7 +428,7 @@ pub fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen: u6
         // stack — faulted in ring 0 on it (`#PF err=1, cr2=0x7fffffffc58c`)
         // the first time anyone ran apk against this rig since `CR4.SMAP` went
         // on. A bad pointer is `EFAULT`, not a dead machine.
-        crate::uaccess::read_val::<u32>(optval).map_or(false, |v| v != 0)
+        crate::uaccess::read_val::<u32>(optval).is_some_and(|v| v != 0)
     } else {
         false
     };

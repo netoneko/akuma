@@ -137,6 +137,13 @@ pub fn install_shared_sinks() {
     // died at the first folded syscall (`AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`
     // §4).
     akuma_primitives::rng::set_rng_hook(crate::net::rng_fill_checked);
+    // The wake effect for the **one** pipe table (4b batch 2b). This target
+    // shares `akuma-syscalls-glue`'s table rather than keeping a second
+    // instance of `akuma_pipes::PipeTable` — two instances meant two id
+    // spaces, which is what made a folded `close(2)` close the wrong pipe.
+    // Registered here for the same reason as the two hooks above: one call
+    // site, both boot protocols, before anything can create a pipe.
+    akuma_syscalls_glue::pipe::set_wake_sink(crate::pipe::wake_sink);
     // The VFS instance: the global mount table plus the four facts
     // `akuma-vfs-glue` cannot discover for itself. Before any mount, and on a
     // `DISK=none` boot where there will never be one — the synthetic `/dev` and
@@ -334,6 +341,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
         lapic::stop_timer();
     }
 
+    crate::pipe::smoke_test(t);
     reboot::smoke_test(t);
 
     // How many failures were xHCI's, reported rather than acted on: an

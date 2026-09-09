@@ -3658,6 +3658,7 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         return;
     }
 
+
     // A kernel-side buffer standing in for a user pointer. The copy helpers do
     // not care which side of the privilege boundary an address is on — they
     // dereference it — so this is a faithful exercise of the same path.
@@ -3692,17 +3693,17 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         if t.check("fd: append probe opens for create", !errno::is_err(seed)) {
             sys_write_file(seed, b"AAA".as_ptr() as u64, 3);
             sys_close(seed);
-            let a = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_APPEND, 0);
-            let b = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_APPEND, 0);
-            sys_write_file(a, b"B".as_ptr() as u64, 1);
+            let first = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_APPEND, 0);
+            let second = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_APPEND, 0);
+            sys_write_file(first, b"B".as_ptr() as u64, 1);
             // `b` was opened before `a` wrote, so its seeded cursor is stale;
             // only a per-write re-derivation puts this byte after the `B`.
-            sys_write_file(b, b"C".as_ptr() as u64, 1);
-            sys_close(a);
-            sys_close(b);
-            let r = sys_openat(0, ap.as_ptr() as u64, 0, 0);
-            let n = sys_read(r, buf.as_mut_ptr() as u64, 8);
-            sys_close(r);
+            sys_write_file(second, b"C".as_ptr() as u64, 1);
+            sys_close(first);
+            sys_close(second);
+            let back = sys_openat(0, ap.as_ptr() as u64, 0, 0);
+            let n = sys_read(back, buf.as_mut_ptr() as u64, 8);
+            sys_close(back);
             t.check_eq("fd: both appends landed", n, 5);
             t.check("fd: the second appender did not clobber the first", &buf[..5] == b"AAABC");
         }

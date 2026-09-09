@@ -87,12 +87,34 @@ negative-control build produced.
   the suite runs on the boot task, which is registered nowhere — so a folded
   `openat` answers `ESRCH` to every one of the ~50 kernel-side checks in
   `fd::smoke_test` and `proc_consistency_check`. Batch 1 slipped past this only
-  because its five arms are path-based and need no descriptor. Two ways out,
-  both real work: register a minimal process for the boot row (which would also
-  let the *mounted* `/proc` serve during the suite window — the wall recorded
-  in 5b slice 3), or move that coverage into a ring-3 probe binary of the
-  `userspace/amd64/hello` shape, which is where the plan says a folded arm's
-  verification belongs anyway.
+  because its five arms are path-based and need no descriptor.
+
+  **Prototyped and measured 2026-09-10, then reverted**, because the answer is
+  "a batch, not a line". The mechanism is available and cheap:
+  `akuma_exec::process::make_test_process(pid)` is a `pub fn` in the crate that
+  owns `Process` (unconditional, LTO drops it when unused), so the suite can do
+  what the AArch64 `register_at_syscall_process` helper does —
+  `register_process` + `register_thread_pid(current_thread_id(), 1)` around the
+  fd block, handing pid 1 back before `run_init` claims it. **pid 1 and not a
+  spare number**: `usermode::current_pid` already answers 1 for an unmapped
+  thread, and `/proc/self` resolves through it, so any other pid points
+  `/proc/self` at a process the synthetic view has never heard of.
+
+  With that in place the suite went `572 passed, 2 failed`, and both failures
+  are the batch's real content:
+
+  1. `proc: all three refuse a file /proc does not serve` — with pid 1
+     registered, the **mounted `ProcFilesystem`** starts answering for paths the
+     synthetic view deliberately refuses (`/proc/self/smaps`). Giving the boot
+     row an identity is exactly what wakes the mounted filesystem up, so the
+     `/proc` serving split has to be decided *with* the identity, not after it.
+  2. `identity: probe teardown leaks nothing` — one page. `make_test_process`
+     builds a real `UserAddressSpace`, and unregistering it does not return
+     every frame within the window that check measures.
+
+  The alternative — moving that coverage into a ring-3 probe binary of the
+  `userspace/amd64/hello` shape — remains open, and is where the plan says a
+  folded arm's verification belongs anyway.
 - **`/proc` interception must stay amd64's, as a pre-glue shim.** `fd.rs`
   answers `/proc` from this kernel's own spawn table, and one of its paths —
   `/proc/<pid>/fd/0`, which `sshd`'s bridge opens to feed a spawned shell's

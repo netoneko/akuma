@@ -65,9 +65,35 @@ fn with_table<R>(f: impl FnOnce(&mut PipeTable<WakeHandle>) -> R) -> R {
     akuma_primitives::irq::with_irqs_disabled(|| f(&mut PIPES.lock()))
 }
 
+/// The wake effect, if a kernel registered its own — see [`set_wake_sink`].
+static WAKE_SINK: akuma_primitives::OnceCopy<fn(usize, WakeHandle)> =
+    akuma_primitives::OnceCopy::new();
+
+/// Route this table's wakes through `f` instead of straight to
+/// [`wake_by_handle`].
+///
+/// **The seam that lets a second kernel share this table.** The state change a
+/// wake performs is the same on both — amd64's threads *are* `akuma-threading`
+/// slots, and its `sched::wake` is `wake_by_handle` underneath — but that
+/// kernel wraps it to keep the `[SCHED] wakes` counter its boot suite reports,
+/// which a direct call here would bypass. One `OnceCopy` load per fire buys
+/// one pipe table instead of two, and two pipe tables was not a duplicate
+/// implementation (both are [`akuma_pipes::PipeTable`]) but a duplicate
+/// **id space**: this arm closing pipe 3 while the caller's descriptor named
+/// the other table's pipe 3 is a wrong pipe, not an error.
+///
+/// Registered once at boot, before any pipe exists. Unregistered — every
+/// AArch64 build — the default below is what runs.
+pub fn set_wake_sink(f: fn(usize, WakeHandle)) {
+    WAKE_SINK.set(f);
+}
+
 /// Make every returned waiter runnable. **Call with no lock held.**
 fn fire(wakes: Wakes<WakeHandle>) {
-    wakes.fire(|_tid, handle| wake_by_handle(handle));
+    match WAKE_SINK.get() {
+        Some(sink) => wakes.fire(sink),
+        None => wakes.fire(|_tid, handle| wake_by_handle(handle)),
+    }
 }
 
 /// Dump every live pipe: buffered bytes, endpoint refcounts, and the tids parked on it.
@@ -164,6 +190,21 @@ pub fn pipe_poller_count(id: u32) -> usize {
 /// [`pipe_write_all_blocking`]; `sys_write` instead loops so it can honour O_NONBLOCK
 /// and report a partial count to userspace the way write(2) does.
 pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
+    write_inner(id, data, true)
+}
+
+/// [`pipe_write`] without the `SIGPIPE`.
+///
+/// For a kernel with no signal delivery: amd64 answers a broken pipe with
+/// `EPIPE` alone, which is "the whole of Linux's answer that applies" there
+/// (`amd64/src/fd.rs`, `write_pipe`). Spelled as a second entry point rather
+/// than as a global policy flag so the choice is visible at the call site that
+/// makes it, and so nothing can change it after boot.
+pub fn pipe_write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
+    write_inner(id, data, false)
+}
+
+fn write_inner(id: u32, data: &[u8], raise_sigpipe: bool) -> Result<usize, i32> {
     let (outcome, wakes) = with_table(|t| t.write(id, data));
     // Outside the lock, and before the SIGPIPE below: a wake is cheap and
     // cannot re-enter, where the signal can and does.
@@ -179,7 +220,9 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
             // lock, IRQs masked, still holding the BKL) and wedged every other
             // core in KernelLock::acquire. Root-caused live via lldb 2026-07-24
             // (aria2c `| head -1` → EPIPE storm at exit).
-            super::signal::send_sigpipe();
+            if raise_sigpipe {
+                super::signal::send_sigpipe();
+            }
             Err(libc_errno::EPIPE)
         }
         // No pipe at all: plain EPIPE, and explicitly *no* signal. A missing id
@@ -383,6 +426,52 @@ pub fn pipe_bytes_available(id: u32) -> usize {
 /// it is there.
 pub fn pipe_can_write(id: u32) -> bool {
     with_table(|t| t.counts(id).is_some_and(|(read_count, _)| read_count > 0) && t.writable(id))
+}
+
+/// Does this id name a live pipe?
+///
+/// For a caller that needs to tell "gone" from "not ready" — which is the one
+/// axis [`pipe_can_read`] folds away, and the axis amd64's `poll` answers
+/// differently (see that function's note).
+#[must_use]
+pub fn pipe_exists(id: u32) -> bool {
+    with_table(|t| t.exists(id))
+}
+
+/// `(read_count, write_count)` — open descriptions naming each end — or `None`
+/// for an id that names no pipe.
+///
+/// The honest accessor behind the readiness predicates: a caller whose `poll`
+/// rules differ from this module's builds them from the counts rather than
+/// getting a second predicate added here.
+#[must_use]
+pub fn pipe_counts(id: u32) -> Option<(u32, u32)> {
+    with_table(|t| t.counts(id))
+}
+
+/// How many pipes are live right now.
+///
+/// A machine-wide ceiling is a policy, not a table rule, so the crate does not
+/// impose one — amd64 caps at 64 so that a pipe leak announces itself instead
+/// of being absorbed (each pipe is up to `PIPE_CAPACITY` of kernel buffer,
+/// claimed on a userspace request), and asks this to enforce it.
+#[must_use]
+pub fn pipe_live_count() -> usize {
+    with_table(|t| t.live_count())
+}
+
+/// Remove a pipe outright, whatever its end counts say, waking anyone parked
+/// on it.
+///
+/// For a lifetime managed by hand rather than by reference counting: a spawned
+/// child's stdin pipe on amd64 is read by the child by number, so its read end
+/// never closes and refcounting alone would never free it — `waitpid` is what
+/// knows the child is gone. A `pipe(2)` pair must **not** come through here;
+/// it is destroyed by the last [`pipe_close_read`]/[`pipe_close_write`], and
+/// short-circuiting that frees the buffer under a live peer.
+pub fn pipe_destroy(id: u32) {
+    let (_, wakes) = with_table(|t| t.destroy(id));
+    fire(wakes);
 }
 
 pub(super) fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
