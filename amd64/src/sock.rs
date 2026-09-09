@@ -457,6 +457,12 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
         return;
     }
 
+    // A descriptor identity for the closes below: `close` is glue's arm since
+    // 4b batch 2b, and it answers `ESRCH` without a registered process. This
+    // check is what found that — `sock: close` returned `-ESRCH` where it
+    // wanted 0.
+    let boot_tid = crate::fd::boot_row_register();
+
     let fd = sys_socket(AF_INET as u64, SOCK_STREAM as u64, 0);
     if !t.check("sock: socket() returns a descriptor", fd < 0x8000_0000) {
         return;
@@ -489,4 +495,7 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     t.check_eq("sock: bind on a non-socket is ENOTSOCK", sys_bind(1, sa.as_ptr() as u64, 16), errno::ENOTSOCK);
 
     t.check_eq("sock: close", fd::sys_close(fd), 0);
+
+    let drained = crate::fd::boot_row_release(boot_tid);
+    t.check("sock: the borrowed identity was reclaimed", drained >= 1);
 }

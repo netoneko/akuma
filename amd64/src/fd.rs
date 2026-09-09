@@ -1489,35 +1489,25 @@ pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
-/// program that closes stdin should not then find the kernel refusing to print.
+/// `close(fd)` — **`akuma-syscalls-glue`'s arm**, by the name this module's
+/// callers already use.
+///
+/// A forward, not a second implementation: the dispatcher hands `close`
+/// straight to glue (`usermode.rs`), and this exists because ~40 kernel-side
+/// call sites — every self-test that opens something — spell it this way. It
+/// takes a `u64` because they do.
+///
+/// **The one divergence the fold adopted, stated where it changed:** an
+/// *unbound* 0/1/2 used to answer 0 here and do nothing, so "a program that
+/// closes stdin does not then find the kernel refusing to print". Glue answers
+/// `EBADF` for an fd its table does not hold, console number or not — which is
+/// Linux's answer, and is now reachable only by a task whose stdio is unbound
+/// (the boot row; every registered process has the triple, per
+/// `SharedFdTable::with_stdio`). The console itself is unaffected: it is
+/// answered by number in `read`/`write` through [`console_end`], not by a
+/// descriptor this could close.
 pub fn sys_close(fd: u64) -> u64 {
-    let t = cur_table();
-    // An *unbound* console descriptor: closing succeeds and does nothing, so a
-    // program that closes stdin does not then find the kernel refusing to
-    // print. A **bound** one has been redirected and is a real descriptor —
-    // `sh` does `dup2(f,1); close(f)` and later `close(1)`, and that last close
-    // has to reach the file or its buffered contents are never persisted.
-    if fd >= MAX_FDS as u64 {
-        return errno::EBADF;
-    }
-    // An *unbound* 0/1/2 is the console: `close` succeeds and does nothing, so
-    // a program that closes stdin does not then find the kernel refusing to
-    // print. Any other absent fd is a genuine `EBADF` — closing twice is one.
-    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
-        t.nonblock.lock().remove(&(fd as u32));
-        t.cloexec.lock().remove(&(fd as u32));
-        return 0;
-    }
-    let Some(desc) = t.table.lock().remove(&(fd as u32)) else {
-        return errno::EBADF;
-    };
-    t.nonblock.lock().remove(&(fd as u32));
-    t.cloexec.lock().remove(&(fd as u32));
-    // The name is gone; now give back the one reference this table entry held.
-    // Releasing reaches into the network stack and the pipe table, so it runs
-    // outside the table lock.
-    release_desc(&desc);
-    0
+    akuma_syscalls_glue::fs::sys_close(fd as u32)
 }
 
 /// Serve a read from the `/dev` character node `node`.
@@ -3647,6 +3637,48 @@ fn siocgif(cmd: u32, arg: u64) -> u64 {
 }
 
 #[cfg(not(feature = "no-tests"))]
+/// Give the boot row a process identity for the duration of a self-test, and
+/// return the thread id [`boot_row_release`] needs.
+///
+/// **Why any test that touches a descriptor needs this.** Every
+/// `akuma-syscalls-glue` arm that hands out or frees one ends in
+/// `if let Some(proc) = current_process_shared() { … } else { Err(ESRCH) }`,
+/// and this suite runs on the boot task, which is registered nowhere. Batch
+/// 1's five folded arms slipped past it only because they are path-based;
+/// `close` — folded in batch 2b — does not, and `sock::smoke_test` closing a
+/// socket was the check that said so (`ESRCH`, not 0).
+///
+/// **pid 1, not a spare number.** `usermode::current_pid` already answers 1 for
+/// an unmapped thread — "the self-tests run before `run_init` registers
+/// anything, and they are pid 1's work" — and `/proc/self` resolves through it,
+/// so any other pid would point `/proc/self` at a process the synthetic view
+/// has never heard of.
+///
+/// The AArch64 kernel has had this since long before: `register_at_syscall_process`,
+/// used 25 times in `src/process_tests.rs`.
+pub fn boot_row_register() -> usize {
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::process::register_process(1, akuma_exec::process::make_test_process(1));
+    akuma_exec::process::register_thread_pid(tid, 1);
+    tid
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// Hand pid 1 back, and return how many retired slots the drain reclaimed.
+///
+/// `unregister_process` **retires** the slot rather than dropping it — the
+/// deferred reclamation Phase 7e introduced — so the `Process`, and the address
+/// space `make_test_process` built for it, are still held when it returns. Left
+/// that way the identity costs a permanent page and `identity: probe teardown
+/// leaks nothing` reports it, correctly. Draining is what makes the
+/// registration a loan rather than a leak.
+pub fn boot_row_release(tid: usize) -> usize {
+    akuma_exec::process::unregister_thread_pid(tid);
+    akuma_exec::process::unregister_process(1);
+    akuma_exec::process::reclaim::drain_retired()
+}
+
+#[cfg(not(feature = "no-tests"))]
 /// Exercise the descriptor path from the kernel side.
 ///
 /// Ring 3 exercises it for real in `usermode`; this checks the parts that are
@@ -3658,6 +3690,13 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         return;
     }
 
+    // The boot row's identity, for every check below that opens or closes
+    // something — see [`boot_row_register`].
+    let boot_tid = boot_row_register();
+    t.check(
+        "fd: the boot row has a process identity (every glue fd arm needs one)",
+        akuma_exec::process::current_process_shared().is_some(),
+    );
 
     // A kernel-side buffer standing in for a user pointer. The copy helpers do
     // not care which side of the privilege boundary an address is on — they
@@ -4366,4 +4405,8 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         6623,
     );
     sys_close(fd);
+
+    // Hand pid 1 back before `run_init` claims it for the real init process.
+    let drained = boot_row_release(boot_tid);
+    t.check("fd: the boot row's identity was reclaimed, not parked", drained >= 1);
 }

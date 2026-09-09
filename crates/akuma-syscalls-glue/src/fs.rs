@@ -1863,15 +1863,15 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
         return Err(ENODEV);
     }
 
-    let path = if path == "/proc/self/exe" {
-        if let Some(proc) = akuma_exec::process::current_process_shared() {
-            proc.image_name()
-        } else {
-            return Err(ENOENT);
-        }
-    } else {
-        path
-    };
+    // `/proc/self/exe` used to be intercepted here, mapping the path to
+    // `image_name()` before the on-disk work below. It is a **symlink in
+    // procfs** now (`akuma_vfs_glue::proc`, `<pid>/exe`), so the
+    // `resolve_symlinks` call at the top of this function has already chased it
+    // to the binary's path by the time control reaches here — and it works for
+    // any pid the caller can see, where the interception only ever knew
+    // `self`. A kernel thread with no current process still gets `ENOENT`: the
+    // `self` rewrite has no pid to use, `<self>/exe` parses as no pid, and the
+    // existence check below refuses it.
 
     // From here on is the on-disk open work — existence probes, O_CREAT create /
     // O_TRUNC truncate (both `write_file`; truncating a large file frees its blocks
@@ -2945,20 +2945,13 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
     let path = resolve_path_at(dirfd, &raw_path)?;
 
-    if path == "/proc/self/exe" {
-        if !validate_user_ptr(buf_ptr, bufsize) { return Err(EFAULT); }
-        let exe = if let Some(proc) = akuma_exec::process::current_process_shared() {
-            proc.image_name()
-        } else {
-            String::from("/bin/unknown")
-        };
-        let bytes = exe.as_bytes();
-        let copy_len = bytes.len().min(bufsize);
-        if copy_to_user(buf_ptr, &bytes[..copy_len]).is_err() {
-            return Err(EFAULT);
-        }
-        return Ok(copy_len as u64);
-    }
+    // `/proc/self/exe` is served by the generic path below — procfs answers
+    // `<pid>/exe` as a symlink now. The interception that stood here had one
+    // behaviour worth naming as it goes: with no current process it answered
+    // the **fabricated** target `/bin/unknown`, where the generic path answers
+    // `ENOENT`. A made-up path a caller cannot distinguish from a real one is
+    // the failure mode this tree keeps paying for elsewhere; the honest refusal
+    // replaces it.
 
     // Try filesystem symlinks first (includes File fds in procfs)
     let target = akuma_vfs_glue::read_symlink(&path)

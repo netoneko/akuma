@@ -1083,7 +1083,15 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Writev => sys_writev(a1, a2, a3),
         Syscall::Readv => sys_readv(a1, a2, a3),
         Syscall::Openat => crate::fd::sys_openat(a1, a2, a3, a4),
-        Syscall::Close => crate::fd::sys_close(a1),
+        // `close(fd)` — **served by glue** (4b batch 2b). Two prerequisites had
+        // to land before this arm could move, and neither was in the plan:
+        // the two kernels had to share **one pipe table** (glue's `sys_close`
+        // closes a `PipeRead`/`PipeWrite` through `glue::pipe`, and this
+        // kernel's ids used to name a different table — a wrong pipe, not an
+        // error), and the boot suite had to have a **process identity**, since
+        // every descriptor-freeing arm in glue resolves
+        // `current_process_shared()` first.
+        Syscall::Close => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         Syscall::Lseek => crate::fd::sys_lseek(a1, a2, a3),
         Syscall::Fstat => crate::fd::sys_fstat(a1, a2),
         Syscall::Ioctl => crate::fd::sys_ioctl(a1, a2, a3),
@@ -3451,8 +3459,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // note already claimed. Recorded once and used once, in the same lock as
     // the entry point, so no reader can pair a new image with an old argv.
     let exec_cmdline = flatten_cmdline(argv_refs.iter().copied());
-    let new_name =
-        alloc::string::String::from(core::str::from_utf8(argv_refs[0]).unwrap_or("exec"));
+    // **The resolved path, not `argv[0]`** — same reason as `sys_spawn`'s
+    // registration: `image.name` is what `/proc/<pid>/exe` reports, and
+    // `argv[0]` is a name the caller chose rather than something that opens.
+    // `ps` is unaffected — `akuma_procfs::ProcStat::comm` takes the basename.
+    let new_name = alloc::string::String::from(path);
 
     let pid = current_pid();
     let new_root = next.space.ttbr0();
@@ -3876,7 +3887,15 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         task_slot,
         child,
         img.end_va,
-        core::str::from_utf8(argv_refs[0]).unwrap_or("spawn"),
+        // **The path, not `argv[0]`.** `Process::image_name` is what
+        // `/proc/<pid>/exe` reports — a symlink to the binary since the
+        // interception in `akuma-syscalls-glue` moved into procfs — and
+        // `argv[0]` is a *name a caller chose*, not a path: `readlink
+        // /proc/self/exe` answered `readlink`, and `ls -l` showed
+        // `/proc/self/exe -> ls`, neither of which opens anything. `comm`
+        // is unaffected: `akuma_procfs::ProcStat::comm` takes the basename,
+        // so `ps` still shows `ls` while `exe` names `/bin/ls`.
+        path,
         &spawn_cmdline,
         Some(child_fds),
     );
@@ -4553,6 +4572,41 @@ pub fn redirect_test(t: &mut Suite) {
         return;
     }
     let free_before = akuma_pmm::free_count();
+
+    // 0. `/proc/self/exe` — a **magic symlink served by procfs**, not by a
+    //    syscall-layer interception.
+    //
+    //    It was two `if path == "/proc/self/exe"` arms in
+    //    `akuma-syscalls-glue` (`sys_openat` and `sys_readlinkat`) patching a
+    //    gap in `akuma_vfs_glue::proc`, which is the same shape as this
+    //    target's own `/proc` view and the reason both are being deleted. The
+    //    gap is closed in procfs now, so the generic paths serve it — and the
+    //    answer generalised from *self only* to any visible pid.
+    //
+    //    Checked from ring 3 because that is the only place it can work: the
+    //    boot row is registered nowhere, and procfs renders from the process
+    //    table.
+    //
+    //    Two assertions, because the first one passed while the file was
+    //    useless. `readlink` answered `ls`, `ps`-style — `image.name` was
+    //    `argv[0]`, a name the caller chose rather than a path — so the
+    //    symlink existed and opened nothing. Reading four bytes through it and
+    //    finding `\x7fELF` is what says the link names the binary.
+    if let Some((status, out)) = run_sh_capture(b"readlink /proc/self/exe\0") {
+        t.check_eq("proc: `readlink /proc/self/exe` exited 0", status, 0);
+        t.check(
+            "proc: and it names an absolute path",
+            out.starts_with(b"/"),
+        );
+    } else {
+        t.check("proc: sh spawned for the exe symlink", false);
+    }
+    if let Some((_, out)) = run_sh_capture(b"head -c 4 /proc/self/exe\0") {
+        t.check(
+            "proc: opening through /proc/self/exe reads the ELF it names",
+            out.windows(4).any(|w| w == b"\x7fELF"),
+        );
+    }
 
     // 1. `>` — the shell's open/dup2/close sequence onto fd 1.
     let Some((status, _)) = run_sh_capture(b"echo REDIROK > /tmp/redir.txt\0") else {

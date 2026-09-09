@@ -249,8 +249,23 @@ pub fn init_vfs() {
     // `fd.rs` keeps three paths that this filesystem does not serve — see its
     // `/proc` comment — so the mount is additive rather than a swap.
     let proc_fs = alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new());
-    if akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs).is_err() {
-        crate::serial::puts("[FS] WARN: /proc mount failed; falling back to fd.rs's synthetic view\n");
+    // `AlreadyExists` is **not** a failure: this function runs twice on every
+    // boot — once from `boot::install_shared_sinks` and once from
+    // `mount_root_on`, which calls it to be safe on a path that may not have
+    // booted through the shared sink — and the second call finds `/proc`
+    // already mounted by the first.
+    //
+    // It printed `[FS] WARN: /proc mount failed; falling back to fd.rs's
+    // synthetic view` for that, on **every rig**, which is a line that says
+    // the opposite of what happened. It cost two wrong conclusions in one
+    // session (2026-09-10): first that the metal's persistent root could not
+    // mount procfs at all, then that the RAM-image rigs differed from it.
+    // `/proc` mounts everywhere, at the first call.
+    match akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs) {
+        Ok(()) | Err(akuma_vfs::FsError::AlreadyExists) => {}
+        Err(_) => {
+            crate::serial::puts("[FS] WARN: /proc mount failed; falling back to fd.rs's synthetic view\n");
+        }
     }
 }
 

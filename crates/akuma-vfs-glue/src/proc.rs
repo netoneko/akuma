@@ -668,6 +668,14 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: false,
                     size: 0,
                 });
+                // A symlink, like `fd/<n>`: `ls -l` prints the target and a
+                // reader that follows it opens the binary.
+                pid_entries.push(DirEntry {
+                    name: String::from("exe"),
+                    is_dir: false,
+                    is_symlink: true,
+                    size: 0,
+                });
             }
             if crate::cfg_proc_syscall_log_enabled()
                 && akuma_syscalls_log::get_formatted(pid, current_box_id).is_some()
@@ -1193,7 +1201,10 @@ impl Filesystem for ProcFilesystem {
             if parts.len() == 2 && parts[1] == "fd" {
                 return Self::process_visible(pid, current_box_id);
             }
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
+            if parts.len() == 2
+                && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat"
+                    || parts[1] == "exe")
+            {
                 return Self::process_visible(pid, current_box_id);
             }
             if parts.len() == 2 && parts[1] == "syscalls" && crate::cfg_proc_syscall_log_enabled() {
@@ -1303,6 +1314,29 @@ impl Filesystem for ProcFilesystem {
                         size,
                         inode,
                         mode: 0o100444,
+                        created: None,
+                        modified: None,
+                        accessed: None,
+                    });
+                }
+        }
+
+        // <pid>/exe — a symlink, and `lstat` is how `ls -l` learns that before
+        // it asks `readlink`. `size` is the target's length, which is what
+        // Linux reports for a symlink and what a caller sizing a buffer reads.
+        {
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() == 2 && parts[1] == "exe"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    if !Self::process_visible(pid, caller_box_id()) {
+                        return Err(FsError::NotFound);
+                    }
+                    let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+                    return Ok(Metadata {
+                        is_dir: false,
+                        size: proc.image_name().len() as u64,
+                        inode,
+                        mode: 0o120_777,
                         created: None,
                         modified: None,
                         accessed: None,
@@ -1430,15 +1464,32 @@ impl Filesystem for ProcFilesystem {
             if !pid_exists {
                 return Err(FsError::NotFound);
             }
-            return Ok(Metadata {
-                is_dir: true,
-                size: 0,
-                inode,
-                mode: 0o40555,
-                created: None,
-                modified: None,
-                accessed: None,
-            });
+            // **Only the two real directories.** `parse_pid_path` accepts
+            // anything whose first component parses as a pid, so this
+            // fall-through used to answer `Ok(is_dir: true)` for
+            // `<pid>/<anything>` — `stat("/proc/1/smaps")` reported a
+            // *directory* for a file this filesystem's own `exists` and
+            // `read_at` both deny. A confident wrong answer, and the exact
+            // shape the amd64 kernel's `proc_consistency_check` was written
+            // after: `open`, `stat` and `access` must agree about what exists,
+            // and here `stat` disagreed with both.
+            //
+            // Found 2026-09-10 from the other end: registering a process for
+            // amd64's boot row made `/proc/self/smaps` — a path nothing serves
+            // — pass all three checks, because `stat` said "directory" and the
+            // caller's `open` then took the directory branch.
+            if parts.len() == 1 || (parts.len() == 2 && parts[1] == "fd") {
+                return Ok(Metadata {
+                    is_dir: true,
+                    size: 0,
+                    inode,
+                    mode: 0o40555,
+                    created: None,
+                    modified: None,
+                    accessed: None,
+                });
+            }
+            return Err(FsError::NotFound);
         }
 
         Err(FsError::NotFound)
@@ -1469,6 +1520,25 @@ impl Filesystem for ProcFilesystem {
         // does NOT chase the virtual description string (e.g. "pipe:[5]" is not a real path).
         // readlinkat uses proc_fd_description() to get the description string instead.
         let parts: Vec<&str> = path.split('/').collect();
+
+        // `<pid>/exe` — the binary the process is running, as a magic symlink.
+        //
+        // It lived in `akuma-syscalls-glue` as two `if path == "/proc/self/exe"`
+        // interceptions, one in `sys_openat` and one in `sys_readlinkat`, ahead
+        // of the VFS: the syscall layer patching a gap in this filesystem. The
+        // gap is closed here instead, and closing it generalises the answer —
+        // the interceptions could only ever describe **self**, where this
+        // serves the path for any pid the caller can see, which is what
+        // `/proc/<pid>/exe` means on Linux.
+        if parts.len() == 2 && parts[1] == "exe" {
+            let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
+            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+            if !Self::process_visible(pid, caller_box_id()) {
+                return Err(FsError::NotFound);
+            }
+            return Ok(proc.image_name());
+        }
+
         if parts.len() == 3 && parts[1] == "fd" {
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
             let fd: u32 = parts[2].parse().map_err(|_| FsError::NotFound)?;
@@ -1506,6 +1576,10 @@ impl Filesystem for ProcFilesystem {
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() == 3 && parts[1] == "fd" {
             return parts[0].parse::<Pid>().is_ok() && parts[2].parse::<u32>().is_ok();
+        }
+        // `<pid>/exe`, and `self/exe` through the rewrite above.
+        if parts.len() == 2 && parts[1] == "exe" {
+            return parts[0].parse::<Pid>().is_ok();
         }
 
         false
