@@ -141,11 +141,11 @@ is the thing that says so — the hard way.
 ### Verification status
 
 - Firecracker SMP=4: 512/0 after the double-bump fix.
-- The metal wedge fix (**clear_table_mirror**) is built and clippy-clean but
-  **not yet re-verified on the metal** — the box went down mid-verification
-  and this was written while it was still coming back. The metal workload
-  that must pass: `ls /bin | grep … | wc -l`, a subshell, `sh -c`,
-  `echo x > /tmp/rdr; cat /tmp/rdr`, and the 30-grandchild loop that wedged.
+- The metal wedge fix (**clear_table_mirror**): verified 2026-09-09, same
+  day — Firecracker 512/0, metal suite 516/0, and the exact workload that
+  wedged the previous boot (pipeline, subshell, `sh -c`, file redirect, the
+  30-grandchild loop) passing with the box alive and `Cached:` back at
+  1611 kB after.
 - Local QEMU/TCG was skipped for these slices by explicit instruction; the
   suite it would run is the same one Firecracker runs.
 
