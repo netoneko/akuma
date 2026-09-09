@@ -32,16 +32,22 @@
 //!
 //! A descriptor now carries an **empty** buffer and every read and write goes
 //! to the VFS at the cursor in [`MAX_IO`]-bounded chunks (`fs::read_at`,
-//! `akuma_vfs_glue::write_at`), disk I/O outside the [`FILES`] lock. The heap
+//! `akuma_vfs_glue::write_at`), disk I/O outside the table lock. The heap
 //! cost of a write is one 64 KiB chunk rather than three times the file.
 //!
-//! [`Entry::data`] survives as the storage for **synthetic** `/proc` renders,
-//! which have no inode behind them to read from; `entry_is_synthetic` is the
-//! discriminator, and it is `data.is_empty()` — sound because every synthetic
-//! installer renders non-empty contents. A view that can render empty needs a
-//! flag instead.
+//! **Synthetic `/proc` renders are re-rendered per `read(2)`** (step 4b). The
+//! render used to be cached in the description at `open` — Linux `seq_file`'s
+//! snapshot semantics — and that cache was the last field only [`Entry`]
+//! carried. Re-rendering per read is what the mounted `ProcFilesystem` —
+//! the fold destination, and what `akuma-syscalls-glue` serves `/proc`
+//! through on AArch64 — already does, so the target converges on the tree's
+//! behaviour instead of carrying a second structure (a side table) or
+//! extending a shared type (`KernelFile`) for one architecture's sake. The
+//! cost is the snapshot: two reads of one `/proc` file can see two renders.
+//! A synthetic **directory** still snapshots into `KernelFile::dir_cache`
+//! and needs nothing.
 //!
-//! # Descriptors are per-process; descriptions are not
+//! # The descriptor table is the registered `SharedFdTable` (C2 step 4b)
 //!
 //! The table used to be one flat 64-entry array shared by every task, with an
 //! `owner` field on each entry and a sweep at exit to reclaim what a task had
@@ -56,19 +62,35 @@
 //! - **Descriptor numbers were machine-wide.** A program's first `open`
 //!   returned whatever slot happened to be free.
 //!
-//! It is now the POSIX split, which fixes all three at once:
+//! The 2026-09-06 fix was the POSIX split — one row per process (`FDS`), one
+//! refcounted machine-wide table of descriptions (`FILES`) — with the
+//! registered `SharedFdTable` as a mirror that owned nothing. That mirror era
+//! is over: **the registered table is the only name→description map**, and the
+//! refcount authority lives in it. `FDS`, `FILES` and `Entry` are deleted.
+//! `fork` copies the parent's table through `clone_deep_for_fork` (which bumps
+//! the pipe/socket refs); `close` removes the name and releases one
+//! reference; `SharedFdTable::close_all` — the same sweep its own `Drop` runs
+//! — is the exit teardown.
 //!
-//! - [`FDS`] is one **row per process** — `FDS[row][fd]` — so every process
-//!   has its own fd 3 and its own budget of [`MAX_FDS`].
-//! - [`FILES`] is the machine-wide table of open file **descriptions**: the
-//!   cursor, the cached contents, the socket or pipe identity. Reference
-//!   counted, because `dup` and `fork` add a *name* without adding a
-//!   description.
+//! The reference rule is one sentence: **every `PipeRead`/`PipeWrite`/`Socket`
+//! entry in a table is backed by one pipe-end/socket reference.** A copy
+//! (`dup`, `fork`) bumps through [`clone_refs`]; a removal releases through
+//! [`release_desc`]. The reference a pipe's `alloc` starts each end with is
+//! consumed by the *first* insert and bumped for every later one.
 //!
-//! `fork` copies a row and increments; `exit` drops a row and decrements; only
-//! the last name going away releases the description (and persists a written
-//! file). `close_owned_by` survives as the exit hook, but it is now a row
-//! release rather than a search for an owner.
+//! Two divergences are adopted with the flip, both of them
+//! `akuma-syscalls-glue`'s existing behaviour — which is the point: this
+//! target's file surface is becoming the tree's, and a model the AArch64
+//! kernel already self-hosts on is proven rather than speculative. They are
+//! pinned at the self-tests that used to assert the opposite:
+//!
+//! - **`dup` copies the `KernelFile` by value**, so two descriptors onto one
+//!   file get *independent cursors*. POSIX shares the open file description;
+//!   fixing that honestly is a change to `akuma-exec`'s `FileDescriptor`
+//!   (an `Arc` inside the variant), not to this file.
+//! - **`nonblocking` is keyed by fd number** (the table's `nonblock` set),
+//!   where [`Entry::nonblocking`] used to be keyed by description — so
+//!   `dup`ping a non-blocking socket loses the flag.
 //!
 //! # Descriptors 0/1/2 are real (C2 slice 6)
 //!
@@ -84,14 +106,14 @@
 //! spelled `fd < FIRST_FILE_FD && !is_bound(fd)` rather than `fd < 3`:
 //!
 //! - an **unbound** 0/1/2 is the console, and that is now its only meaning —
-//!   init on the serial line, and the boot suite's [`KERNEL_ROW`];
+//!   init on the serial line, and the boot suite's [`KERNEL_TABLE`];
 //! - a **bound** one is whatever it names, so every operation has to ask the
-//!   row rather than assume. Getting that wrong is silent: `lseek` on a bound
+//!   table rather than assume. Getting that wrong is silent: `lseek` on a bound
 //!   1 answered `EBADF` for months because its guard did not ask.
 //!
-//! [`bind`] still starts at [`FIRST_FILE_FD`], which is the pinned "first free
-//! fd is 3" divergence — POSIX's "lowest available" includes a closed 0/1/2.
-//! [`bind_stdio`] writes the three slots directly for that reason.
+//! Allocation still starts at [`FIRST_FILE_FD`], which is the pinned "first
+//! free fd is 3" divergence — POSIX's "lowest available" includes a closed
+//! 0/1/2. [`bind_stdio`] writes the three slots directly for that reason.
 
 use akuma_exec_core::process::{FileDescriptor, KernelFile};
 #[cfg(not(feature = "no-tests"))]
@@ -174,21 +196,18 @@ fn path_is_dir(path: &str) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_dir)
 }
 
-/// C2 SLICE 5: the discriminator between a **real** file (ext2-backed, read
-/// and written through the VFS at its cursor, `data` empty forever) and a
-/// **synthetic** one (`/proc`'s rendered views, whose bytes live only in
-/// `Entry.data` because there is no inode behind the path to read them from).
-///
-/// Every byte-path branch below splits on this. The rule that makes it sound:
-/// `open_proc`/`install_synthetic_file` always render **non-empty** contents —
-/// a synthetic view that cannot render fails the open — so an empty `data` on
-/// a `File` descriptor can only mean "real, uncached".
-///
-/// The `!entry.is_dir` half went with the field: an ext2 directory descriptor
-/// is constructed with an empty `data` and no installer ever gives one bytes,
-/// so the second test already implied the first.
-fn entry_is_synthetic(entry: &Entry) -> bool {
-    !entry.data.is_empty()
+/// The `/proc`-relative rest of a synthetic descriptor's path, for
+/// `render_proc_file` — `None` for a real (ext2) path. The discriminator is
+/// the path prefix itself (`== "/proc"` or `starts_with("/proc/")`, never
+/// `strip_prefix("/proc")`, which would also claim a file named `/procfoo`):
+/// `sys_openat` intercepts every `/proc` open, so a descriptor whose path is
+/// `/proc`-prefixed was created by this module and has no inode behind it.
+fn proc_rest_of(path: &str) -> Option<&str> {
+    if path == "/proc" {
+        Some("")
+    } else {
+        path.strip_prefix("/proc/")
+    }
 }
 
 /// The console's line discipline.
@@ -307,55 +326,164 @@ pub const FIRST_FILE_FD: usize = 3;
 /// them concurrently now costs 4 × its own budget rather than sharing one.
 pub const MAX_FDS: usize = 256;
 
-/// How many **open file descriptions** exist machine-wide.
-///
-/// The other half of the POSIX split: a descriptor is a per-process *name*, and
-/// what it names is one of these — the thing that carries the cursor, the
-/// cached contents and the socket or pipe identity. `dup` and `fork` make a
-/// second name for the same description, which is why this is reference
-/// counted and `MAX_FDS` is not.
-///
-/// Deliberately smaller than `MAX_FDS * PROC_SLOTS` (256 × 128 = 32768): that
-/// product is what the *names* can address, and sizing the descriptions to it
-/// would reserve for a machine where every process holds a full table at once.
-/// A description costs a `Vec` of the file's contents; 512 is the ceiling on
-/// concurrently-open *files*, and running into it is a real condition worth
-/// reporting rather than a limit worth pre-allocating past.
-const MAX_FILES: usize = 512;
 
-/// One entry: the tree's descriptor, plus this target's cached contents.
+/// The descriptor table the boot task (the self-tests, and anything that runs
+/// before a process is registered) resolves against.
 ///
-/// The cursor lives in the `KernelFile`'s own `position`, not beside it — so a
-/// future move to reading by inode changes where the *bytes* come from and
-/// nothing else.
-#[derive(Clone)]
-struct Entry {
-    desc: FileDescriptor,
-    /// The file's contents, cached at `open`. See the module header. Empty and
-    /// unused for a directory descriptor (`is_dir`) — `getdents64` reads
-    /// `desc`'s `KernelFile::dir_cache` instead, not this.
-    data: Vec<u8>,
-    /// `O_NONBLOCK`, set through `fcntl(F_SETFL)`. Only sockets consult it —
-    /// `sshd`'s cooperative loop makes its listener and every accepted stream
-    /// non-blocking so a session idling on its socket suspends instead of
-    /// stalling its peers.
-    nonblocking: bool,
-    /// How many descriptors name this description.
-    ///
-    /// One at `open`. `dup` and `fork` add a name without adding a
-    /// description, so both increment; `close` decrements and only the
-    /// transition to zero runs [`release`] — which is what persists a written
-    /// file, closes a socket and frees a pipe.
-    ///
-    /// This field replaced an `owner: usize` (the process slot that opened the
-    /// fd), which existed because the table used to be one flat array shared
-    /// by every task: nothing reclaimed a task's fds when it exited, and
-    /// `apk` installing 14 packages left the *next* `apk` starting from a
-    /// full table. Ownership is now expressed by which process's row holds the
-    /// name, so the sweep at exit is "clear this row" and the lifetime
-    /// question the `owner` field was answering badly is answered by this
-    /// count instead.
-    refs: u32,
+/// It is the [`KERNEL_ROW`] of the deleted `FDS` array under the new
+/// authority: [`cur_table`] answers the registered process's table for a user
+/// task and this one otherwise, so the suite's `sys_openat`/`sys_read` calls
+/// keep working unchanged. Nothing reaps it — the boot task never exits, and
+/// the suite closes what it opens — which is exactly the lifetime the kernel
+/// row had.
+static KERNEL_TABLE: akuma_exec::process::SharedFdTable = akuma_exec::process::SharedFdTable {
+    table: Spinlock::new(alloc::collections::BTreeMap::new()),
+    cloexec: Spinlock::new(alloc::collections::BTreeSet::new()),
+    nonblock: Spinlock::new(alloc::collections::BTreeSet::new()),
+};
+
+/// The table a syscall resolves its descriptors against.
+///
+/// The registered `SharedFdTable` — the one authority since step 4b. `None`
+/// from [`crate::usermode::current_process`] (a kernel thread, or the boot
+/// task driving the self-tests) falls to [`KERNEL_TABLE`], which is "no
+/// process" *and* "a table" in exactly the way the old kernel row was.
+#[inline]
+fn cur_table() -> &'static akuma_exec::process::SharedFdTable {
+    match crate::usermode::current_process() {
+        Some(p) => &p.fds,
+        None => &KERNEL_TABLE,
+    }
+}
+
+/// Clone `fd`'s description out of the calling table, or `None` if the fd
+/// names nothing — a closed descriptor, one out of range, or a console
+/// descriptor.
+fn table_get(fd: u64) -> Option<FileDescriptor> {
+    table_get_in(cur_table(), fd)
+}
+
+fn table_get_in(t: &akuma_exec::process::SharedFdTable, fd: u64) -> Option<FileDescriptor> {
+    if fd >= MAX_FDS as u64 {
+        return None;
+    }
+    t.table.lock().get(&(fd as u32)).cloned()
+}
+
+/// Borrow `fd`'s description in the calling table, for the duration of `f`.
+///
+/// The table lock is held only across the closure — no I/O, no user copy,
+/// no second lock. The old [`with_file`] could not promise that: it had to
+/// resolve through `FDS` and then take `FILES`, two holds that were never
+/// nested, and its header had to argue why that was safe. One table, one
+/// hold; the argument retired with the structure that needed it.
+fn table_with<R>(fd: u64, f: impl FnOnce(&mut FileDescriptor) -> R) -> Option<R> {
+    table_with_in(cur_table(), fd, f)
+}
+
+fn table_with_in<R>(
+    t: &akuma_exec::process::SharedFdTable,
+    fd: u64,
+    f: impl FnOnce(&mut FileDescriptor) -> R,
+) -> Option<R> {
+    if fd >= MAX_FDS as u64 {
+        return None;
+    }
+    t.table.lock().get_mut(&(fd as u32)).map(f)
+}
+
+/// Does `fd` name an open descriptor in the calling table?
+///
+/// The question `sys_write` asks before falling back to the console: a bound
+/// 1 or 2 has been redirected and must go where the table says, not to the
+/// serial port.
+#[must_use]
+pub fn is_bound(fd: u64) -> bool {
+    fd < MAX_FDS as u64 && cur_table().table.lock().contains_key(&(fd as u32))
+}
+
+/// Take one more reference to whatever `desc` names — the [`clone_fd_refs`]
+/// rule, local to the variants this target interns.
+///
+/// `PipeRead`/`PipeWrite`/`Socket` are the refcounted families here; a `File`
+/// is unrefcounted (its bytes live in the filesystem, its cursor is copied by
+/// value — see the module header for what that makes `dup`), and the other
+/// variants are never interned by this module. The match stays exhaustive
+/// rather than falling through a `_`, so a variant added to `FileDescriptor`
+/// is a compile error here and not a silently unreferenced copy — which is
+/// the property `akuma_exec::process::clone_fd_refs` exists for on AArch64.
+/// This target cannot call that function for its *own* tables without
+/// dragging the `ExecRuntime` hook machinery into paths (the boot suite's
+/// kernel-table ops) that never needed it.
+///
+/// [`clone_fd_refs`]: akuma_exec::process::clone_fd_refs
+fn clone_refs(desc: &FileDescriptor) {
+    match desc {
+        FileDescriptor::PipeWrite(id) => crate::pipe::clone_ref(*id as usize, true),
+        FileDescriptor::PipeRead(id) => crate::pipe::clone_ref(*id as usize, false),
+        FileDescriptor::Socket(s) => akuma_net::socket::socket_clone_ref(*s),
+        FileDescriptor::File(_)
+        | FileDescriptor::Stdin
+        | FileDescriptor::Stdout
+        | FileDescriptor::Stderr
+        | FileDescriptor::DevTty
+        | FileDescriptor::DevNull
+        | FileDescriptor::DevZero
+        | FileDescriptor::DevDsp
+        | FileDescriptor::DevUrandom
+        | FileDescriptor::ChildStdout(_)
+        | FileDescriptor::UnixSocket { .. }
+        | FileDescriptor::EventFd(_)
+        | FileDescriptor::EpollFd(_)
+        | FileDescriptor::PidFd(_)
+        | FileDescriptor::RumpSocket { .. }
+        | FileDescriptor::Tap { .. }
+        | FileDescriptor::TimerFd(_)
+        | FileDescriptor::BlockDev { .. } => {}
+    }
+}
+
+/// Release the reference `desc` holds, now that its last table entry is gone.
+///
+/// The [`release`] of the deleted `FILES` table, minus the reference count it
+/// used to consult — the count is the set of table entries now, and this runs
+/// only when one is removed. A `File` is a no-op: real files are unbuffered
+/// (the cache died in C2 slice 5) and a synthetic `/proc` render has no inode
+/// behind it to persist to — the old persist arm fired only for cached
+/// writes, and it wrote to a path with no inode, so what it produced was a
+/// console error line and no bytes.
+fn release_desc(desc: &FileDescriptor) {
+    match desc {
+        FileDescriptor::Socket(s) => crate::sock::close(*s),
+        FileDescriptor::PipeWrite(p) => crate::pipe::close_write(*p as usize),
+        FileDescriptor::PipeRead(p) => crate::pipe::close_read(*p as usize),
+        _ => {}
+    }
+}
+
+/// Insert `desc` into the calling table under the lowest free descriptor at
+/// or above [`FIRST_FILE_FD`], and hand the reference it holds to the table.
+///
+/// The two exhaustion cases keep their distinct errnos: `EMFILE` is *this
+/// process* out of descriptor numbers (checked against [`MAX_FDS`]); the old
+/// `ENFILE` — the machine out of open file descriptions — is gone with
+/// `FILES`, whose fixed 512 slots were what it counted. A `BTreeMap` is
+/// unbounded; the machine-wide ceilings that remain are real resources
+/// (`pipe::alloc`'s `MAX_PIPES`, which still answers `ENFILE` at its own
+/// call site).
+fn install(desc: FileDescriptor) -> u64 {
+    let t = cur_table();
+    if t.table.lock().len() >= MAX_FDS {
+        return errno::EMFILE;
+    }
+    let fd = t.alloc_fd_from(FIRST_FILE_FD as u32, desc);
+    if fd as usize >= MAX_FDS {
+        // `alloc_fd_from` found nothing under `u32::MAX`; unwind the entry it
+        // inserted so the caller's `EMFILE` does not leak a live descriptor.
+        t.table.lock().remove(&fd);
+        return errno::EMFILE;
+    }
+    u64::from(fd)
 }
 
 /// Allocate a descriptor for an already-created socket.
@@ -364,50 +492,58 @@ struct Entry {
 /// the same variant the AArch64 kernel uses, carrying the same index into the
 /// same `akuma_net::socket` table. Sharing the table is what makes `read` and
 /// `write` work on a socket without the caller knowing.
+///
+/// The socket table entry's initial reference is consumed by this first
+/// insert; every later copy bumps through [`clone_refs`].
 pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
-    let fd = install(Entry {
-        desc: FileDescriptor::Socket(idx),
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    });
+    let fd = install(FileDescriptor::Socket(idx));
     (!errno::is_err(fd)).then_some(fd)
 }
 
 /// The socket index behind `fd`, or `None` if it is not a socket.
 #[must_use]
 pub fn socket_index(fd: u64) -> Option<usize> {
-    with_file(fd, |e| match e.desc {
+    table_get(fd).and_then(|d| match d {
         FileDescriptor::Socket(s) => Some(s),
         _ => None,
-    })?
+    })
 }
 
 /// Give `pipe_id` a descriptor: `PipeRead` for a reader end, `PipeWrite` for a
 /// writer end. Used by `sys_spawn` (the parent's stdout reader) and
 /// `sys_openat`'s `/proc/<pid>/fd/0` (the parent's stdin writer).
+///
+/// **Both callers are always second names.** The pipe `alloc` started one
+/// reference per end, and the creating side's inserts consumed those (the
+/// child's stdio in [`bind_stdio`], or the `pipe(2)` pair itself) — so this
+/// descriptor's reference is a new one, bumped here and handed to `install`.
+/// On a failed install the bump is given straight back.
 pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
     let desc = if is_write {
         FileDescriptor::PipeWrite(pipe_id as u32)
     } else {
         FileDescriptor::PipeRead(pipe_id as u32)
     };
-    let fd = install(Entry {
-        desc,
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    });
-    (!errno::is_err(fd)).then_some(fd)
+    crate::pipe::clone_ref(pipe_id, is_write);
+    let fd = install(desc);
+    if errno::is_err(fd) {
+        if is_write {
+            crate::pipe::close_write(pipe_id);
+        } else {
+            crate::pipe::close_read(pipe_id);
+        }
+        return None;
+    }
+    Some(fd)
 }
 
 /// The pipe id behind `fd` if it is a `PipeRead` descriptor.
 #[must_use]
 pub fn pipe_read_id(fd: u64) -> Option<usize> {
-    with_file(fd, |e| match e.desc {
+    table_get(fd).and_then(|d| match d {
         FileDescriptor::PipeRead(p) => Some(p as usize),
         _ => None,
-    })?
+    })
 }
 
 /// The `/dev` node name behind `fd`, or `None` for anything else.
@@ -422,7 +558,7 @@ pub fn pipe_read_id(fd: u64) -> Option<usize> {
 /// The `starts_with` is the cheap gate: every other descriptor pays one string
 /// compare and no lookup.
 fn dev_node_of(fd: u64) -> Option<&'static str> {
-    with_file(fd, |e| match &e.desc {
+    table_with(fd, |d| match d {
         FileDescriptor::File(f) if f.path.starts_with("/dev/") => {
             akuma_vfs_glue::dev_node(&f.path).map(|n| n.name)
         }
@@ -434,10 +570,10 @@ fn dev_node_of(fd: u64) -> Option<&'static str> {
 /// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
 #[must_use]
 pub fn pipe_write_id(fd: u64) -> Option<usize> {
-    with_file(fd, |e| match e.desc {
+    table_get(fd).and_then(|d| match d {
         FileDescriptor::PipeWrite(p) => Some(p as usize),
         _ => None,
-    })?
+    })
 }
 
 /// Read from a pipe, honouring `nonblock`. A blocking read **parks** until data
@@ -502,9 +638,16 @@ pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
 }
 
 /// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
+///
+/// Read from the table's `nonblock` set — keyed by **fd number**, which is
+/// where `sys_fcntl`'s `F_SETFL` has always mirrored it. The per-description
+/// `Entry::nonblocking` this replaces meant `dup` *kept* the flag across the
+/// new name; the set means the dup **loses** it. That is
+/// `akuma-syscalls-glue`'s existing behaviour, adopted with the flip and
+/// pinned in the module header.
 #[must_use]
 pub fn is_nonblocking(fd: u64) -> bool {
-    with_file(fd, |e| e.nonblocking).unwrap_or(false)
+    fd < MAX_FDS as u64 && cur_table().nonblock.lock().contains(&(fd as u32))
 }
 
 /// Name the description `fi` with the lowest free descriptor **at or above**
@@ -535,42 +678,27 @@ pub fn is_nonblocking(fd: u64) -> bool {
 /// descriptor operation on it reachable.** `F_DUPFD` is not a slice-6 feature,
 /// it is a hole slice 6 stopped hiding.
 fn dup_from(fd: u64, min: u64, cloexec: bool) -> u64 {
-    let Some(fi) = file_index(fd) else {
+    let t = cur_table();
+    let Some(desc) = table_get(fd) else {
         return errno::EBADF;
     };
     // Linux answers `EINVAL` for a `min` past `RLIMIT_NOFILE`, not `EMFILE`:
     // the argument is out of range, rather than the table being full.
-    let Some(min) = usize::try_from(min).ok().filter(|m| *m < MAX_FDS) else {
+    let Some(min) = u32::try_from(min).ok().filter(|m| (*m as usize) < MAX_FDS) else {
         return errno::EINVAL;
     };
-    // One hold on `FDS`, none on `FILES` — the two are never nested (see
-    // [`with_file`]), which is why this cannot live inside its closure.
-    let newfd = {
-        let mut fds = FDS.lock();
-        let row = &mut fds[current_row()];
-        let mut found = None;
-        for (n, slot) in row.iter_mut().enumerate().skip(min) {
-            if *slot == NO_FILE {
-                *slot = fi as FileIdx;
-                found = Some(n as u64);
-                break;
-            }
-        }
-        found
-    };
-    let Some(newfd) = newfd else {
+    let newfd = t.alloc_fd_from(min, desc.clone());
+    if newfd as usize >= MAX_FDS {
+        t.table.lock().remove(&newfd);
         return errno::EMFILE;
-    };
+    }
     // Bumped only once the new name exists, as [`sys_dup`] does and for the
     // same reason.
-    if let Some(entry) = FILES.lock()[fi].as_mut() {
-        entry.refs = entry.refs.saturating_add(1);
+    clone_refs(&desc);
+    if cloexec {
+        t.cloexec.lock().insert(newfd);
     }
-    table_insert(newfd, fi);
-    if cloexec && let Some(table) = shared_table() {
-        table.cloexec.lock().insert(newfd as u32);
-    }
-    newfd
+    u64::from(newfd)
 }
 
 /// `fcntl(fd, cmd, arg)`. The flag commands, plus `F_DUPFD`/`F_DUPFD_CLOEXEC`
@@ -587,79 +715,61 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const O_NONBLOCK: u64 = 0x800;
     const FD_CLOEXEC: u64 = 1;
 
-    // Before the `with_file` resolution below, because duplicating takes the
-    // `FDS` lock and that one takes `FILES`.
+    // Before the resolution below, because duplicating allocates a new name.
     if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
         return dup_from(fd, arg, cmd == F_DUPFD_CLOEXEC);
     }
 
-    // Legacy authority for F_GETFL/F_SETFL: `Entry.nonblocking` is what the
-    // socket layer reads. The registered table's `nonblock` set is kept in
-    // lockstep so slice 5 cannot inherit a disagreement.
-    let with_table = |f: &dyn Fn(
-        &akuma_exec::process::SharedFdTable,
-    ) -> u64|
-     -> Option<u64> {
-        shared_table().map(|t| f(&t))
-    };
-
-    // Legacy resolution first: EBADF for anything the row does not name.
-    let result = with_file(fd, |entry| match cmd {
+    let t = cur_table();
+    // EBADF for anything the table does not name — the same resolution the
+    // old `with_file` performed against the `FDS` row, console descriptors
+    // included.
+    if table_get(fd).is_none() {
+        return errno::EBADF;
+    }
+    match cmd {
+        // The one authority since the flip: the table's `nonblock` set, keyed
+        // by fd number — the same set `is_nonblocking` reads and the one the
+        // old `F_SETFL` arm mirrored into. The `Entry.nonblocking` field it
+        // used to write first (and mirror from) is gone with `Entry`.
         F_SETFL => {
-            entry.nonblocking = arg & O_NONBLOCK != 0;
+            if arg & O_NONBLOCK != 0 {
+                t.nonblock.lock().insert(fd as u32);
+            } else {
+                t.nonblock.lock().remove(&(fd as u32));
+            }
             0
         }
         F_GETFL => {
-            if entry.nonblocking {
+            if t.nonblock.lock().contains(&(fd as u32)) {
                 O_NONBLOCK
             } else {
                 0
             }
         }
-        // **`FD_CLOEXEC` is stored in the registered table's `cloexec` set**
-        // and read back by `F_GETFD` — but it still does not *do* anything:
-        // this target's `execve` sweeps fds through its own path and does not
+        // **`FD_CLOEXEC` is stored in the table's `cloexec` set** and read
+        // back by `F_GETFD` — but it still does not *do* anything: this
+        // target's `execve` sweeps fds through its own path and does not
         // consult the set yet. That is the same "accepted, not enforced" shape
-        // as before this slice, with the storage now where slice 5's exec
-        // sweep will look. A descriptor marked close-on-exec still survives
+        // as before the flip. A descriptor marked close-on-exec still survives
         // one; the divergence stays pinned until that sweep folds.
         F_SETFD => {
-            let flag = arg & FD_CLOEXEC != 0;
-            with_table(&|t| {
-                if flag {
-                    t.cloexec.lock().insert(fd as u32);
-                } else {
-                    t.cloexec.lock().remove(&(fd as u32));
-                }
-                0
-            })
-            .unwrap_or(0)
+            if arg & FD_CLOEXEC != 0 {
+                t.cloexec.lock().insert(fd as u32);
+            } else {
+                t.cloexec.lock().remove(&(fd as u32));
+            }
+            0
         }
-        F_GETFD => with_table(&|t| {
+        F_GETFD => {
             if t.cloexec.lock().contains(&(fd as u32)) {
                 FD_CLOEXEC
             } else {
                 0
             }
-        })
-        .unwrap_or(0),
-        _ => errno::EINVAL,
-    })
-    .unwrap_or(errno::EBADF);
-
-    // C2 slice 4: F_SETFL's nonblock half mirrors even though the legacy
-    // answer already carried it — the table's set must not lag.
-    if result == 0 && cmd == F_SETFL {
-        let nb = arg & O_NONBLOCK != 0;
-        if let Some(table) = shared_table() {
-            if nb {
-                table.nonblock.lock().insert(fd as u32);
-            } else {
-                table.nonblock.lock().remove(&(fd as u32));
-            }
         }
+        _ => errno::EINVAL,
     }
-    result
 }
 
 /// Copy `len` bytes in from a user pointer. Public for `sock`.
@@ -679,375 +789,56 @@ pub fn copy_out(ptr: u64, src: &[u8]) -> u64 {
     copy_to_user(ptr, src)
 }
 
-impl Entry {
-    /// The `KernelFile` inside, which every operation here needs.
-    ///
-    /// Only `FileDescriptor::File` is ever stored in this table — the console
-    /// descriptors are 0/1/2 and never enter it — so a different variant is a
-    /// bug in this module rather than a case to handle.
-    fn file(&mut self) -> Option<&mut KernelFile> {
-        match &mut self.desc {
-            FileDescriptor::File(f) => Some(f),
-            _ => None,
-        }
-    }
-}
-
-/// The machine-wide table of open file **descriptions**.
-///
-/// One entry per `open`/`socket`/`pipe`, not per descriptor. Nothing outside
-/// this module indexes it: a description is reached only by resolving a
-/// descriptor through [`FDS`].
-static FILES: Spinlock<[Option<Entry>; MAX_FILES]> =
-    Spinlock::new([const { None }; MAX_FILES]);
-
-/// An index into [`FILES`], or [`NO_FILE`] for a closed descriptor.
-type FileIdx = u16;
-const NO_FILE: FileIdx = FileIdx::MAX;
-
-/// One row per process slot, plus one on the end for the kernel.
-///
-/// The kernel row is not a courtesy: the boot self-tests open files, and
-/// `current_proc_slot()` answers `usize::MAX` when no user task is running.
-/// Folding that onto row 0 would have the suite share a table with pid 1.
-const KERNEL_ROW: usize = crate::usermode::PROC_SLOTS;
-const FD_ROWS: usize = crate::usermode::PROC_SLOTS + 1;
-
-/// Per-process descriptor tables: `FDS[row][fd]` is the description `fd` names.
-///
-/// Indexed by descriptor *number*, so `FDS[row][7]` is that process's fd 7 and
-/// every process's fd 3 is its own. Entries below [`FIRST_FILE_FD`] hold a
-/// spawned child's stdio ([`bind_stdio`]) or whatever a `dup2` put there, and
-/// [`NO_FILE`] otherwise — which is the console. See the module header.
-///
-/// 129 rows × 256 × 2 bytes = 64 KiB of `.bss`, allocated once and never grown.
-/// A row of `u16` rather than a row of descriptions is the whole point: `fork`
-/// gives the child its own *names* for its parent's *descriptions*, which is a
-/// 512-byte copy and 256 increments, not a copy of any file's contents.
-static FDS: Spinlock<[[FileIdx; MAX_FDS]; FD_ROWS]> =
-    Spinlock::new([[NO_FILE; MAX_FDS]; FD_ROWS]);
-
-/// Which row the calling context's descriptors live in.
-fn current_row() -> usize {
-    let slot = crate::usermode::current_proc_slot();
-    if slot < crate::usermode::PROC_SLOTS { slot } else { KERNEL_ROW }
-}
-
-/// The description `fd` names in the calling process, or `None` if it names
-/// nothing — a closed descriptor, one out of range, or a console descriptor.
-fn file_index(fd: u64) -> Option<usize> {
-    let fd = usize::try_from(fd).ok()?;
-    if fd >= MAX_FDS {
-        return None;
-    }
-    let idx = FDS.lock()[current_row()][fd];
-    (idx != NO_FILE).then_some(idx as usize)
-}
-
-/// Does `fd` name an open file description in the calling process?
-///
-/// The question `sys_write` asks before falling back to the console: a bound
-/// 1 or 2 has been redirected and must go where the row says, not to the
-/// serial port.
-#[must_use]
-pub fn is_bound(fd: u64) -> bool {
-    file_index(fd).is_some()
-}
-
-/// Borrow the description `fd` names, for the duration of `f`.
-///
-/// The two locks are taken one at a time and are **never nested**: [`FILES`]
-/// and [`FDS`] have no ordering between them today and must not acquire one.
-/// Resolving the name and then operating on the description is two separate
-/// holds, which is safe here for the same reason the rest of this target is —
-/// one core, under the BKL — and would need a real hold across both the day
-/// `fork` runs at SMP > 1.
-fn with_file<R>(fd: u64, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
-    let fi = file_index(fd)?;
-    FILES.lock()[fi].as_mut().map(f)
-}
-
-/// Put `entry` in the description table with one reference.
-fn intern(entry: Entry) -> Option<usize> {
-    let mut files = FILES.lock();
-    for (i, slot) in files.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(entry);
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// The calling process's registered `SharedFdTable` — **C2 slice 4's mirror**.
-///
-/// From this slice every file, pipe and socket description this module interns
-/// is *also* inserted there under the same descriptor number, and every leaf
-/// operation (`dup`, `dup2`, `close`, `lseek`, `fcntl`) keeps the two in
-/// lockstep. [`FILES`] stays the authority for the data path (`read`/`write`
-/// and the cached contents) until C2 slice 5; the table is authoritative for
-/// nothing yet, which is what makes this slice reversible.
-///
-/// `None` means "no registered process" — the kernel row during the boot
-/// self-tests' setup. Everything below falls back to legacy-only there, which
-/// is byte-for-byte the pre-slice behaviour.
-fn shared_table() -> Option<alloc::sync::Arc<akuma_exec::process::SharedFdTable>> {
-    crate::usermode::current_process().map(|p| p.fds.clone())
-}
-
-/// The `FileDescriptor` a `FILES` entry mirrors as.
-///
-/// Deliberately narrow: only the variants this table actually interns. A
-/// `KernelFile` clones by value (`dir_cache` and all — the table's copy is
-/// slice 5's starting point, and its `position` is synced by `sys_lseek` until
-/// then). The mirror owns **no references**: `clone_fd_refs` is never called
-/// on these, and the pipe/socket refcounts stay with [`FILES`] alone — the
-/// day the authority flips (slice 5/6), the ref bumps move with it, explicitly
-/// and in one slice, not by half-owning them here.
-fn mirror_desc(entry: &Entry) -> Option<FileDescriptor> {
-    Some(match &entry.desc {
-        FileDescriptor::File(f) => FileDescriptor::File(f.clone()),
-        FileDescriptor::PipeRead(id) => FileDescriptor::PipeRead(*id),
-        FileDescriptor::PipeWrite(id) => FileDescriptor::PipeWrite(*id),
-        FileDescriptor::Socket(s) => FileDescriptor::Socket(*s),
-        _ => return None,
-    })
-}
-
-/// Insert (or overwrite) `fd`'s mirror from the description `fi`.
-fn table_insert(fd: u64, fi: usize) {
-    let Some(table) = shared_table() else { return };
-    let desc = FILES.lock()[fi].as_ref().and_then(mirror_desc);
-    if let Some(desc) = desc {
-        table.table.lock().insert(fd as u32, desc);
-    }
-}
-
-/// Drop `fd`'s mirror, if any.
-fn table_remove(fd: u64) {
-    if let Some(table) = shared_table() {
-        table.table.lock().remove(&(fd as u32));
-    }
-}
-
-/// The fork half of the mirror: a copy of `parent`'s table with **no
-/// reference bumps** — `clone_deep_for_fork` is deliberately not used here.
-///
-/// Every entry in the table while [`FILES`] is the refcount authority is a
-/// *mirror*: it names a description whose refs live in `FILES`, and
-/// `inherit_fds` (the legacy fork half) has already bumped each of them once.
-/// Running `clone_deep_for_fork`'s `clone_fd_refs` on top double-bumps every
-/// pipe, and `sys_close` releases only the legacy side — the orphaned bump
-/// meant a forked pipeline's write end never reached zero, `yes` blocked
-/// forever, and the suite's `redirect` test failed with a leaked pipe buffer
-/// (found by exactly that test, first boot of this slice).
-///
-/// When slice 5/6 flips refcount authority to the table, the bump moves here
-/// — one slice, explicitly — and this function becomes `clone_deep_for_fork`.
-pub fn fork_table_mirror(
-    parent: &akuma_exec::process::SharedFdTable,
-) -> akuma_exec::process::SharedFdTable {
-    akuma_exec::process::SharedFdTable {
-        table: Spinlock::new(parent.table.lock().clone()),
-        cloexec: Spinlock::new(parent.cloexec.lock().clone()),
-        nonblock: Spinlock::new(parent.nonblock.lock().clone()),
-    }
-}
-
-/// Name the description `fi` with the lowest free descriptor in `row`,
-/// **starting at [`FIRST_FILE_FD`]**.
-///
-/// **Divergence, pinned.** POSIX's "lowest available" includes 0/1/2, so on
-/// Linux `close(1); open(f)` returns 1. Here it returns 3, because an *unbound*
-/// 0/1/2 is not "free" — it is the console, or a spawned child's pipe, routed
-/// by number below this layer. Redirection through `dup2`, which is what every
-/// shell in practice emits (`open` → `dup2(fd,1)` → `close(fd)`), is exact;
-/// the close-then-open idiom is what would land somewhere else. Closing that
-/// gap means giving 0/1/2 real default descriptions at process creation, which
-/// is a bigger change than making `dup2` land.
-fn bind(row: usize, fi: usize) -> Option<u64> {
-    let mut fds = FDS.lock();
-    let row = &mut fds[row];
-    for (fd, slot) in row.iter_mut().enumerate().skip(FIRST_FILE_FD) {
-        if *slot == NO_FILE {
-            *slot = fi as FileIdx;
-            return Some(fd as u64);
-        }
-    }
-    None
-}
-
-/// Intern `entry` and give the calling process a descriptor for it.
-///
-/// The two exhaustion cases are different errnos and are worth keeping apart:
-/// `EMFILE` is *this process* out of descriptor numbers, `ENFILE` is the
-/// machine out of open file descriptions. Reporting the second as the first
-/// sends whoever reads it looking for a leak in the wrong program.
-fn install(entry: Entry) -> u64 {
-    let Some(fi) = intern(entry) else {
-        return errno::ENFILE;
-    };
-    let Some(fd) = bind(current_row(), fi) else {
-        // Un-intern rather than leak: the description has no name and so no
-        // `close` will ever reach it.
-        FILES.lock()[fi] = None;
-        return errno::EMFILE;
-    };
-    // C2 slice 4: the registered table sees every descriptor from birth.
-    table_insert(fd, fi);
-    fd
-}
-
-/// Drop one reference to description `fi`, releasing it if that was the last.
-///
-/// The description is taken out from under the lock before [`release`] runs:
-/// releasing reaches into `akuma_net` and `crate::pipe` and writes a file back
-/// to disk, and holding the description table across any of those is how a
-/// lock inversion starts.
-fn unref(fi: usize) {
-    let taken = {
-        let mut files = FILES.lock();
-        let Some(entry) = files[fi].as_mut() else {
-            return;
-        };
-        entry.refs = entry.refs.saturating_sub(1);
-        if entry.refs > 0 {
-            return;
-        }
-        files[fi].take()
-    };
-    if let Some(entry) = taken {
-        release(entry);
-    }
-}
-
-/// Empty the calling process's mirror before its `Process` drops.
-///
-/// Called from `run_process`'s exit path, right after [`close_owned_by`].
-/// While [`FILES`] owns the refcounts, every table entry is a mirror that
-/// owns nothing — but `SharedFdTable::drop` runs `close_all()`, which fires
-/// the `ExecRuntime` close hooks per entry. Left in place, a dying child
-/// closed its parent's pipes: under sshd every forked exit tore a hole in
-/// the session's own stdio bridge, and the `File` arm reached the
-/// `not_wired!` `flock_release`. The bare-metal wedge of 2026-09-09 (a full
-/// framebuffer of `[BKL] stuck` behind dying sessions) is that bug. Clearing
-/// here is exact: `close_owned_by` has already released every reference the
-/// legacy way, so there is nothing left for the hooks to do — and if this
-/// line is missed, the drop is the thing that says so.
-pub fn clear_table_mirror() {
-    if let Some(p) = crate::usermode::current_process() {
-        p.fds.table.lock().clear();
-        p.fds.cloexec.lock().clear();
-        p.fds.nonblock.lock().clear();
-    }
-}
-
-/// Give `child_slot` its own names for every description `parent_slot` holds.
-///
-/// This is `fork`'s half of the descriptor table. The child gets an
-/// independent *row* — so a `close` in the child no longer reaches into the
-/// parent, which is what the single shared table did and what made
-/// `sh -c 'prog > file'` unsurvivable — while both rows name the same
-/// descriptions, so the cursor and the socket really are shared, as POSIX
-/// requires.
-pub fn inherit_fds(parent_slot: usize, child_slot: usize) {
-    if parent_slot >= FD_ROWS || child_slot >= FD_ROWS {
-        return;
-    }
-    // Drop whatever the child's row held first. It should hold nothing — the
-    // slot was found free — but overwriting a stale row would strand every
-    // reference in it, and a description no `close` can reach is a leak the
-    // machine never recovers from.
-    close_owned_by(child_slot);
-    let inherited = {
-        let mut fds = FDS.lock();
-        let row = fds[parent_slot];
-        fds[child_slot] = row;
-        row
-    };
-    let mut files = FILES.lock();
-    for fi in inherited.iter().filter(|&&fi| fi != NO_FILE) {
-        if let Some(entry) = files[*fi as usize].as_mut() {
-            entry.refs = entry.refs.saturating_add(1);
-        }
-    }
-}
 
 /// Give a not-yet-running spawned child its stdio as **real descriptors**:
 /// fd 0 = the read end of its stdin pipe, fd 1 **and fd 2** = the write end of
-/// its stdout pipe, in row `row` and, when `table` is given, mirrored there.
+/// its stdout pipe, in the child's own table.
 ///
 /// **C2 slice 6.** This replaces the by-number stdio routing the `Spawn` row
 /// used to carry (`Spawn::stdin_pipe`/`stdout_pipe`, consulted at every
 /// unbound fd 0/1/2 read and write). Bound descriptors mean every existing
 /// mechanism just works: `pipe_read_id`/`pipe_write_id` route the child's
-/// I/O, `fork`'s `inherit_fds` shares the ends with correct refcounts (which
-/// is what `borrowed_io` special-cased by hand), and the child's exit
-/// `close_owned_by` drops its ends — the EOF the parent's reader waits for —
-/// with no per-spawn teardown code at all.
+/// I/O, `fork`'s `clone_deep_for_fork` shares the ends with correct
+/// refcounts, and the child's exit `close_all` drops its ends — the EOF the
+/// parent's reader waits for — with no per-spawn teardown code at all.
 ///
 /// **fd 2 is a second *name*, not a second description**, and that is the
 /// whole reason it is bound here rather than left to fall through to the
 /// console: the old router answered fd 1 *and* fd 2 from `Spawn::stdout_pipe`,
 /// so `prog > file` kept sending stderr to the session. Binding fd 2 to the
-/// same `FILES` entry (`refs = 2`, exactly what `dup2(1, 2)` would build)
-/// reproduces that: the `dup2(f, 1)` a shell emits for `>` drops one name and
-/// the pipe end stays open under the other. Leaving fd 2 unbound and answering
-/// it from fd 1 instead would put the second source of truth this slice exists
-/// to delete back in, one indirection further along — and it would break at
-/// exactly the redirect it was meant to survive.
+/// same write end — one more reference, exactly what `dup2(1, 2)` would build
+/// — reproduces that: the `dup2(f, 1)` a shell emits for `>` drops one name
+/// and the pipe end stays open under the other. Leaving fd 2 unbound and
+/// answering it from fd 1 instead would put the second source of truth this
+/// slice exists to delete back in, one indirection further along — and it
+/// would break at exactly the redirect it was meant to survive.
 ///
-/// Direct row writes rather than `install` + `bind`, deliberately: `bind`
-/// skips 0/1/2 (the pinned "first free fd is 3" divergence), and stdio is
-/// precisely the case that must land there. Called before the child is
-/// published, so no lock ordering question exists.
+/// Direct inserts rather than [`install`], deliberately: `install` starts at
+/// [`FIRST_FILE_FD`] (the pinned "first free fd is 3" divergence), and stdio
+/// is precisely the case that must land on 0/1/2. The reference rule: the
+/// inserts at 0 and 1 **consume** the references `pipe::alloc` started each
+/// end with; the insert at 2 is a second name for the write end and bumps one
+/// more through [`clone_refs`]. Called before the child is published, so no
+/// lock ordering question exists.
 pub fn bind_stdio(
-    row: usize,
+    table: &akuma_exec::process::SharedFdTable,
     stdin_pipe: usize,
     stdout_pipe: usize,
-    table: Option<&alloc::sync::Arc<akuma_exec::process::SharedFdTable>>,
 ) -> u64 {
-    let Some(fi_r) = intern(Entry {
-        desc: FileDescriptor::PipeRead(stdin_pipe as u32),
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    }) else {
-        return errno::ENFILE;
-    };
-    let Some(fi_w) = intern(Entry {
-        desc: FileDescriptor::PipeWrite(stdout_pipe as u32),
-        data: Vec::new(),
-        nonblocking: false,
-        // Two names from birth: fd 1 and fd 2.
-        refs: 2,
-    }) else {
-        // Un-intern the read end: it has no name, so no `close` can reach it.
-        FILES.lock()[fi_r] = None;
-        return errno::ENFILE;
-    };
-    let slots_free = {
-        let mut fds = FDS.lock();
-        if row >= FD_ROWS || fds[row][..FIRST_FILE_FD].iter().any(|&s| s != NO_FILE) {
-            false
-        } else {
-            fds[row][0] = fi_r as FileIdx;
-            fds[row][1] = fi_w as FileIdx;
-            fds[row][2] = fi_w as FileIdx;
-            true
+    {
+        let mut t = table.table.lock();
+        // The child's table is fresh (`SharedFdTable::new`), so 0/1/2 are free;
+        // a stale entry here would mean the caller reused a table, and stdio
+        // must not silently overwrite it.
+        if t.contains_key(&0) || t.contains_key(&1) || t.contains_key(&2) {
+            return errno::EINVAL;
         }
-    };
-    if !slots_free {
-        FILES.lock()[fi_r] = None;
-        FILES.lock()[fi_w] = None;
-        return errno::EINVAL;
-    }
-    if let Some(t) = table {
-        let mut t = t.table.lock();
         t.insert(0, FileDescriptor::PipeRead(stdin_pipe as u32));
         t.insert(1, FileDescriptor::PipeWrite(stdout_pipe as u32));
         t.insert(2, FileDescriptor::PipeWrite(stdout_pipe as u32));
     }
+    // fd 2: one more open description names the write end.
+    crate::pipe::clone_ref(stdout_pipe, true);
     0
 }
 
@@ -1127,7 +918,7 @@ fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::
     // Cold path: a `dirfd` open is `apk` walking `/etc/apk/keys`, not a read
     // loop, so one inode read per `openat` with a real `dirfd` is not a cost
     // worth caching a bool for.
-    let base = with_file(dirfd, |entry| match &entry.desc {
+    let base = table_with(dirfd, |d| match d {
         FileDescriptor::File(f) => Some(f.path.clone()),
         _ => None,
     })
@@ -1334,12 +1125,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             return errno::ENODEV;
         }
         let file = KernelFile::new(normalised, flags_ as u32);
-        return install(Entry {
-            desc: FileDescriptor::File(file),
-            data: Vec::new(),
-            nonblocking: false,
-                refs: 1,
-        });
+        return install(FileDescriptor::File(file));
     }
     let mut probe = [0u8; 1];
     let exists = fs::read_at(&normalised, 0, &mut probe).is_ok();
@@ -1436,12 +1222,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // they do not — never the whole-file clobber.
     let mut file = KernelFile::new(normalised, flags_ as u32);
     file.position = start_pos as usize;
-    install(Entry {
-        desc: FileDescriptor::File(file),
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    })
+    install(FileDescriptor::File(file))
 }
 
 /// The `open(2)` flag bits, **asm-generic encoding** — the tree's own table,
@@ -1541,7 +1322,7 @@ fn fd_path_debug(fd: u64) -> alloc::string::String {
     if fd < FIRST_FILE_FD as u64 {
         return alloc::format!("<console {fd}>");
     }
-    with_file(fd, |entry| match &entry.desc {
+    table_with(fd, |d| match d {
         FileDescriptor::File(f) => f.path.clone(),
         _ => alloc::format!("<non-file {fd}>"),
     })
@@ -1674,28 +1455,31 @@ pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
 /// apk gave up and reported `UNTRUSTED signature` over a fetch that was in
 /// fact fine). Same bug, different syscall number.
 ///
-/// **The pinned "value copy" divergence is gone.** This used to clone the
-/// whole entry, so the two descriptors shared nothing — separate cursors,
-/// separate cached contents, and a `close` on either releasing the underlying
-/// socket or pipe outright. It was right for the one shape apk uses (hold a
-/// reference across a close) and wrong for everything else. Now that a
-/// descriptor is a *name* and the description is refcounted, `dup` is the real
-/// thing: one more name for one description, a shared cursor, and a release
-/// only when the last name goes.
+/// **The flip re-pins the value-copy divergence.** Between C2 slice 4 and the
+/// step 4b flip this was the "real thing": one more name for one shared
+/// description, a shared cursor, a release only when the last name went. The
+/// description's state now lives in the table's own `KernelFile`, and a copy
+/// of a `KernelFile` clones by value — so the new descriptor carries a
+/// *snapshot* of the cursor, not a shared one. That is
+/// `akuma-syscalls-glue`'s `dup` on AArch64, bit for bit, and the AArch64
+/// kernel self-hosts on it; fixing it honestly means an `Arc` inside
+/// `FileDescriptor::File` in `akuma-exec-core`, which is a change to the
+/// shared type with its own pass behind it. Pinned by the self-test that
+/// used to assert the opposite.
 pub fn sys_dup(fd: u64) -> u64 {
-    let Some(fi) = file_index(fd) else {
+    let t = cur_table();
+    let Some(desc) = table_get(fd) else {
         return errno::EBADF;
     };
-    let Some(newfd) = bind(current_row(), fi) else {
+    let newfd = t.alloc_fd_from(FIRST_FILE_FD as u32, desc.clone());
+    if newfd as usize >= MAX_FDS {
+        t.table.lock().remove(&newfd);
         return errno::EMFILE;
-    };
-    // Bumped only once the new name exists: an increment before a failed
-    // `bind` would strand the description at a count no `close` can reach.
-    if let Some(entry) = FILES.lock()[fi].as_mut() {
-        entry.refs = entry.refs.saturating_add(1);
     }
-    table_insert(newfd, fi);
-    newfd
+    // Bumped only once the new name exists: a reference before a failed
+    // `alloc` would strand the pipe/socket at a count no `close` can reach.
+    clone_refs(&desc);
+    u64::from(newfd)
 }
 
 /// `dup2(oldfd, newfd)` — x86_64 33 — and `dup3`, which is the same with a
@@ -1726,32 +1510,27 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, _flags: u64) -> u64 {
 }
 
 fn dup_onto(oldfd: u64, newfd: u64, strict_same: bool) -> u64 {
-    let Some(fi) = file_index(oldfd) else {
+    let Some(desc) = table_get(oldfd) else {
         return errno::EBADF;
     };
     if oldfd == newfd {
         return if strict_same { errno::EINVAL } else { newfd };
     }
-    let Some(new_idx) = usize::try_from(newfd).ok().filter(|f| *f < MAX_FDS) else {
+    let Some(new_idx) = u32::try_from(newfd).ok().filter(|f| (*f as usize) < MAX_FDS) else {
         return errno::EBADF;
     };
 
     // Install the new name and take out whatever it displaced, in one hold, so
     // no window exists in which `newfd` names nothing. Then bump, then release
-    // the displaced description outside the lock.
+    // the displaced reference outside the lock.
     let displaced = {
-        let mut fds = FDS.lock();
-        core::mem::replace(&mut fds[current_row()][new_idx], fi as FileIdx)
+        let mut t = cur_table().table.lock();
+        t.insert(new_idx, desc.clone())
     };
-    if let Some(entry) = FILES.lock()[fi].as_mut() {
-        entry.refs = entry.refs.saturating_add(1);
+    clone_refs(&desc);
+    if let Some(old) = displaced {
+        release_desc(&old);
     }
-    if displaced != NO_FILE {
-        unref(displaced as usize);
-    }
-    // C2 slice 4: the insert overwrites whatever mirrored the displaced
-    // description — the table is a name map, and `newfd` now names `fi`.
-    table_insert(newfd, fi);
     newfd
 }
 
@@ -1773,22 +1552,14 @@ pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
     let Some(id) = crate::pipe::alloc() else {
         return errno::ENFILE;
     };
-    let read_fd = install(Entry {
-        desc: FileDescriptor::PipeRead(id as u32),
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    });
+    // The two installs **consume** the references `pipe::alloc` started each
+    // end with — the descriptor is the pipe's first name, not a copy of one.
+    let read_fd = install(FileDescriptor::PipeRead(id as u32));
     if errno::is_err(read_fd) {
         crate::pipe::free(id);
         return read_fd;
     }
-    let write_fd = install(Entry {
-        desc: FileDescriptor::PipeWrite(id as u32),
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    });
+    let write_fd = install(FileDescriptor::PipeWrite(id as u32));
     if errno::is_err(write_fd) {
         sys_close(read_fd);
         crate::pipe::free(id);
@@ -1811,125 +1582,33 @@ pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
 /// program that closes stdin should not then find the kernel refusing to print.
 pub fn sys_close(fd: u64) -> u64 {
+    let t = cur_table();
     // An *unbound* console descriptor: closing succeeds and does nothing, so a
     // program that closes stdin does not then find the kernel refusing to
     // print. A **bound** one has been redirected and is a real descriptor —
     // `sh` does `dup2(f,1); close(f)` and later `close(1)`, and that last close
     // has to reach the file or its buffered contents are never persisted.
+    if fd >= MAX_FDS as u64 {
+        return errno::EBADF;
+    }
+    // An *unbound* 0/1/2 is the console: `close` succeeds and does nothing, so
+    // a program that closes stdin does not then find the kernel refusing to
+    // print. Any other absent fd is a genuine `EBADF` — closing twice is one.
     if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
-        // C2 slice 4: an unbound 0/1/2 may still sit in the registered table
-        // as a `Stdin`/`Stdout`/`Stderr` entry — dropping it here is what lets
-        // `dup2` land a real description there later, exactly as closing any
-        // other descriptor frees its number.
-        table_remove(fd);
+        t.nonblock.lock().remove(&(fd as u32));
+        t.cloexec.lock().remove(&(fd as u32));
         return 0;
     }
-    // Unbind the *name* first, then drop the reference. Only the last name
-    // going away releases the description, which is why `close` on one of two
-    // dups no longer tears the socket down under the other one.
-    let Some(fd_idx) = usize::try_from(fd).ok().filter(|f| *f < MAX_FDS) else {
+    let Some(desc) = t.table.lock().remove(&(fd as u32)) else {
         return errno::EBADF;
     };
-    let fi = {
-        let mut fds = FDS.lock();
-        let slot = &mut fds[current_row()][fd_idx];
-        if *slot == NO_FILE {
-            return errno::EBADF;
-        }
-        core::mem::replace(slot, NO_FILE)
-    };
-    unref(fi as usize);
-    table_remove(fd);
+    t.nonblock.lock().remove(&(fd as u32));
+    t.cloexec.lock().remove(&(fd as u32));
+    // The name is gone; now give back the one reference this table entry held.
+    // Releasing reaches into the network stack and the pipe table, so it runs
+    // outside the table lock.
+    release_desc(&desc);
     0
-}
-
-/// Tear down an open file description whose last descriptor has gone.
-///
-/// Called only from [`unref`], which has already taken the entry out of
-/// [`FILES`]: releasing reaches into the network stack, the pipe table and the
-/// filesystem, and holding the description table across any of those is how a
-/// lock inversion starts.
-fn release(entry: Entry) {
-    match entry {
-        Entry { desc: FileDescriptor::Socket(s), .. } => crate::sock::close(s),
-        // Closing the write end (the `/proc/<pid>/fd/0` handle) signals EOF to
-        // the child. It frees the pipe only if this was the last end: the child
-        // may still be draining buffered input, and buffered bytes outlive
-        // their writer.
-        Entry { desc: FileDescriptor::PipeWrite(p), .. } => {
-            crate::pipe::close_write(p as usize);
-        }
-        // Closing the read end (`sshd`'s stdout reader) is the last *reader* of
-        // a spawned child's stdout pipe — `waitpid` deliberately left it alive
-        // for this final drain. Whether that also destroys the pipe is the end
-        // counts' decision now, not this arm's: a `pipe(2)` pair whose writer is
-        // still open keeps its buffer, and the child's own `close_write` at exit
-        // is what completes the pair.
-        Entry { desc: FileDescriptor::PipeRead(p), .. } => {
-            crate::pipe::close_read(p as usize);
-        }
-        // A **synthetic** file opened for writing: this is where its cached
-        // render reaches... nowhere on disk — the persist below is a whole-file
-        // `write_file`, and a synthetic path has no inode behind it, so it
-        // fails with the console line exactly as it always did. The guard is
-        // `!data.is_empty()`, and its real job is the **real** files: since
-        // C2 slice 5 a real file's buffer is empty forever (the bytes went
-        // through the VFS at each `write`), and persisting an empty buffer
-        // would truncate it — a close that destroys the file it claims to
-        // save. A real close is now a no-op here, which is what POSIX says
-        // too: `close(2)` does not truncate.
-        Entry { desc: FileDescriptor::File(file), data, .. }
-            if file.flags & open_flags::O_ACCMODE != 0 && !data.is_empty() =>
-        {
-            // A failed persist is REPORTED, not discarded: this is the whole
-            // file's worth of data, there is no second chance, and a silent
-            // loss here once surfaced as apk's rename finding no tmp file —
-            // an `ENOENT` pointing three layers away from the real failure.
-            // (`close(2)` still returns 0 — Linux's errno slots are taken and
-            // the data is already unreachable — so the console line is the
-            // caller's only signal.)
-            if let Err(e) = fs::write_file(&file.path, &data) {
-                serial::puts("[close] persist failed for \"");
-                serial::puts(&file.path);
-                serial::puts("\": ");
-                serial::puts(fs_err_str(e));
-                serial::puts("\n");
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Drop every descriptor `proc_slot` still holds. Real Linux does this
-/// implicitly at `exit`/`exit_group`.
-///
-/// It exists because the fd table used to be one array shared by every task
-/// and nothing swept it on exit — a leak that stayed invisible through every
-/// self-test (each opens a handful of fds and closes them itself) and only
-/// showed up 2026-09-04 running `apk` twice in a row: the second invocation
-/// started from a table the first had already filled and failed at the
-/// database write with `EMFILE` before doing any real work. With per-process
-/// rows the leak is gone by construction, and this is now what it always
-/// should have been — the row is released, not searched. Called once, from
-/// `run_process`, right after a task's last `enter_user_mode` returns.
-///
-/// **A row is dropped, not each fd closed.** Descriptions this row shares with
-/// a live process (through `fork` or `dup`) survive: only the reference goes.
-pub fn close_owned_by(proc_slot: usize) {
-    if proc_slot >= FD_ROWS {
-        return;
-    }
-    // Clear the whole row in one hold, then drop the references outside it.
-    // Going through `sys_close` per fd is no longer possible and no longer
-    // wanted: it resolves against the *calling* row, and this runs after the
-    // task it is cleaning up has stopped being the current one.
-    let row = {
-        let mut fds = FDS.lock();
-        core::mem::replace(&mut fds[proc_slot], [NO_FILE; MAX_FDS])
-    };
-    for fi in row.iter().filter(|&&fi| fi != NO_FILE) {
-        unref(*fi as usize);
-    }
 }
 
 /// Serve a read from the `/dev` character node `node`.
@@ -2036,44 +1715,47 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         return dev_read(node, buf, len);
     }
 
-    // Resolve under the lock; do the I/O outside it — the rule `release`
-    // states for the same reason. Synthetic (`/proc`) views still read their
-    // cached bytes under the lock, because there is no second source.
-    // **No directory guard here.** A `read` on a directory descriptor reaches
-    // `fs::read_at`, which answers `NotAFile`, which [`fs_err_errno`] maps to
-    // `EISDIR` — the same errno by the same route `akuma-syscalls-glue` uses,
-    // and the reason the entry no longer carries an `is_dir` bool. The common
-    // path pays nothing: the check that went away only ever fired on the error.
-    let resolved = with_file(fd, |entry| {
-        if entry.file().is_none() {
+    // Resolve under the lock; do the I/O outside it. **No directory guard
+    // here.** A `read` on a directory descriptor reaches `fs::read_at`, which
+    // answers `NotAFile`, which [`fs_err_errno`] maps to `EISDIR` — the same
+    // errno by the same route `akuma-syscalls-glue` uses, and the reason the
+    // entry no longer carries an `is_dir` bool. The common path pays nothing:
+    // the check that went away only ever fired on the error.
+    //
+    // A **synthetic** `/proc` view is re-rendered per read (step 4b) — the
+    // mounted `ProcFilesystem`'s semantics, which is what this target's file
+    // surface is converging on; the render-at-open snapshot the old
+    // `Entry::data` cache gave was that field's whole reason to exist, and it
+    // went with the field.
+    let resolved = table_with(fd, |d| {
+        let FileDescriptor::File(f) = d else {
             return Err(errno::EBADF);
-        }
-        let synthetic = entry_is_synthetic(entry);
-        let pos = entry.file().unwrap().position;
-        if synthetic {
-            let total = entry.data.len();
-            let n = total.saturating_sub(pos).min(len as usize);
-            let chunk = entry.data[pos..pos + n].to_vec();
-            Ok((None, alloc::string::String::new(), 0usize, chunk))
-        } else {
-            let path = entry.file().unwrap().path.clone();
-            Ok((Some(()), path, pos, Vec::new()))
-        }
+        };
+        Ok((f.path.clone(), f.position))
     });
-    let (real, path, pos, cached) = match resolved {
+    let (path, pos) = match resolved {
         Some(Ok(v)) => v,
         Some(Err(e)) => return e,
         None => return errno::EBADF,
     };
-    if real.is_none() {
-        // Synthetic path, under the original semantics.
-        if cached.is_empty() {
+    let proc_rest = proc_rest_of(&path);
+    if let Some(rest) = proc_rest {
+        let Some(data) = render_proc_file(rest) else {
+            return 0;
+        };
+        let n = data.len().saturating_sub(pos).min(len as usize);
+        if n == 0 {
             return 0;
         }
-        with_file(fd, |entry| {
-            entry.file().unwrap().position = pos + cached.len();
-        });
-        return copy_to_user(buf, &cached);
+        let r = copy_to_user(buf, &data[pos..pos + n]);
+        if !errno::is_err(r) {
+            table_with(fd, |d| {
+                if let FileDescriptor::File(f) = d {
+                    f.position = pos + n;
+                }
+            });
+        }
+        return r;
     }
     // Real path: one bounded VFS read, then the position moves.
     let mut kbuf = alloc::vec![0u8; len as usize];
@@ -2089,8 +1771,8 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if n == 0 {
         return 0;
     }
-    with_file(fd, |entry| {
-        if let Some(f) = entry.file() {
+    table_with(fd, |d| {
+        if let FileDescriptor::File(f) = d {
             f.position = pos + n;
         }
     });
@@ -2157,40 +1839,34 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
         return dev_read(node, buf, len);
     }
 
-    let resolved = with_file(fd, |entry| {
-        if entry.file().is_none() {
+    let resolved = table_with(fd, |d| {
+        let FileDescriptor::File(f) = d else {
             return Err(errno::EBADF);
-        }
+        };
         // **`position` is deliberately not touched.** That is the entire
         // contract of this call.
-        let synthetic = entry_is_synthetic(entry);
-        if synthetic {
-            let total = entry.data.len();
-            let pos = off as usize;
-            let n = total.saturating_sub(pos).min(len as usize);
-            let chunk = entry.data[pos..pos + n].to_vec();
-            Ok((None, alloc::string::String::new(), chunk))
-        } else {
-            let path = entry.file().unwrap().path.clone();
-            Ok((Some(off as usize), path, Vec::new()))
-        }
+        Ok(f.path.clone())
     });
-    let (vfs_off, path, cached) = match resolved {
+    let path = match resolved {
         Some(Ok(v)) => v,
         Some(Err(e)) => return e,
         None => return errno::EBADF,
     };
-    match vfs_off {
-        None => copy_to_user(buf, &cached),
-        Some(pos) => {
-            let mut kbuf = alloc::vec![0u8; len as usize];
-            let n = match fs::read_at(&path, pos, &mut kbuf) {
-                Ok(n) => n,
-                Err(e) => return fs_err_errno(e),
-            };
-            copy_to_user(buf, &kbuf[..n])
-        }
+    let proc_rest = proc_rest_of(&path);
+    if let Some(rest) = proc_rest {
+        // A mapped synthetic view: rendered fresh at the offset asked for.
+        let Some(data) = render_proc_file(rest) else {
+            return 0;
+        };
+        let n = data.len().saturating_sub(off as usize).min(len as usize);
+        return copy_to_user(buf, &data[off as usize..off as usize + n]);
     }
+    let mut kbuf = alloc::vec![0u8; len as usize];
+    let n = match fs::read_at(&path, off as usize, &mut kbuf) {
+        Ok(n) => n,
+        Err(e) => return fs_err_errno(e),
+    };
+    copy_to_user(buf, &kbuf[..n])
 }
 
 /// Copy `dst.len()` bytes of `fd`'s cached contents starting at byte `offset`
@@ -2205,29 +1881,32 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
 /// which is what makes that the right split: a mapping that extends past EOF
 /// reads as zeros, exactly as `mmap(2)` specifies for the partial last page.
 ///
-/// This reads `Entry::data` — the whole-file buffer `sys_openat` fills. That is
-/// what makes a file mapping cheap to serve here and also what bounds it: a file
-/// that could not be read into the kernel cannot be mapped either, and both fail
-/// at `open`.
+/// The descriptor's bytes at `offset`, for `mmap(MAP_PRIVATE, fd)` — see
+/// `mm::sys_mmap`. `None` means `fd` is not a regular file, which is the one
+/// case a file mapping must refuse rather than serve.
+///
+/// Bytes past the end of the file are **not written**, so the caller's buffer
+/// keeps whatever it had there. Every caller hands in a freshly zeroed page,
+/// which is what makes that the right split: a mapping that extends past EOF
+/// reads as zeros, exactly as `mmap(2)` specifies for the partial last page.
+///
+/// A synthetic `/proc` view is rendered fresh (step 4b); a real file's page
+/// comes off the VFS.
 pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
     // A directory needs no guard of its own: `fs::read_at` below refuses one
     // (`NotAFile`), and this function's contract is already `None` for
     // anything a `MAP_PRIVATE` file mapping must not be served from.
-    let (synthetic, path) = with_file(fd, |entry| {
-        let path = entry.file()?.path.clone();
-        Some((entry_is_synthetic(entry), path))
+    let path = table_with(fd, |d| match d {
+        FileDescriptor::File(f) => Some(f.path.clone()),
+        _ => None,
     })??;
-    if synthetic {
-        // A mapped synthetic view: its bytes exist only in the cache.
-        return with_file(fd, |entry| {
-            let total = entry.data.len();
-            let n = total.saturating_sub(offset).min(dst.len());
-            if n > 0 {
-                dst[..n].copy_from_slice(&entry.data[offset..offset + n]);
-            }
-            Some(n)
-        })
-        .flatten();
+    let proc_rest = proc_rest_of(&path);
+    if let Some(rest) = proc_rest {
+        // A mapped synthetic view: rendered fresh at the offset asked for.
+        let data = render_proc_file(rest)?;
+        let n = data.len().saturating_sub(offset).min(dst.len());
+        dst[..n].copy_from_slice(&data[offset..offset + n]);
+        return Some(n);
     }
     // Real file: the page comes off the VFS. A read error fills nothing —
     // the caller's freshly zeroed page shows through, which is the same
@@ -2250,26 +1929,27 @@ pub fn is_regular_file(fd: u64) -> bool {
     if dev_node_of(fd).is_some() {
         return false;
     }
-    // "Not a directory", asked of the path rather than of a bool the entry
-    // carried. A synthetic `/proc` *file* stays mappable exactly as it was —
-    // [`file_bytes_at`] serves it from the render — and a synthetic `/proc`
-    // directory is refused, which the bool got right only because
-    // `install_synthetic_dir` remembered to pass `true`.
-    with_file(fd, |entry| entry.file().map(|f| f.path.clone()))
-        .flatten()
-        .is_some_and(|p| !path_is_dir(&p))
+    // "Not a directory", asked of the path. A synthetic `/proc` *file* stays
+    // mappable exactly as it was — [`file_bytes_at`] serves it from a fresh
+    // render — and a synthetic `/proc` directory is refused.
+    table_with(fd, |d| match d {
+        FileDescriptor::File(f) => Some(f.path.clone()),
+        _ => None,
+    })
+    .flatten()
+    .is_some_and(|p| !path_is_dir(&p))
 }
 
 /// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
 /// `usermode.rs` does not itself handle (console, pipe, socket).
 ///
 /// Writes through the VFS at the descriptor's cursor, in [`MAX_IO`]-bounded
-/// chunks, with the disk I/O outside the [`FILES`] lock (C2 slice 5). It used
-/// to write into the descriptor's own `data` buffer and persist the whole file
-/// at `close` — which is the whole-file heap bug, and also why a `close` could
-/// fail with the program's only copy of the data already gone. A **synthetic**
-/// `/proc` view still writes into its cached render: there is no inode behind
-/// the path to write through.
+/// chunks, with the disk I/O outside the table lock (C2 slice 5). A
+/// **synthetic** `/proc` view has no inode behind the path to write through;
+/// since step 4b there is no cached render to write into either, so the write
+/// is accepted and dropped — the same observable answer the old
+/// write-the-cache-then-fail-the-persist path produced, minus the console
+/// error line. Nothing on this target writes a `/proc` file.
 pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
@@ -2311,83 +1991,51 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     let mut written: usize = 0;
     while written < len as usize {
         let chunk_len = ((len as usize) - written).min(MAX_IO as usize);
-        // Copied in before the lock: there is no reason to hold `FILES`
+        // Copied in before the lock: there is no reason to hold the table
         // across a user copy.
         let Some(incoming) = copy_in(buf + written as u64, chunk_len as u64) else {
             return if written == 0 { errno::EFAULT } else { written as u64 };
         };
-        // Resolve under the lock; for a **real** file the write itself goes
-        // through the VFS outside it (`write_at` at the cursor — the disk
-        // never belongs under `FILES`), and only the cursor move comes back.
-        // A **synthetic** entry is written into its cached render as before:
-        // there is no inode behind the path to write through.
+        // Resolve under the lock; the write itself goes through the VFS
+        // outside it (`write_at` at the cursor — the disk never belongs under
+        // the table lock), and only the cursor move comes back.
         // The directory guard that stood here was unreachable and is gone: a
         // write-mode open of a directory is refused at `open(2)`
         // (`sys_openat`'s `EISDIR`), so a directory descriptor is always
         // read-only and the `writable` test below is what turns it away.
-        let resolved = with_file(fd, |entry| {
-            let writable = match &entry.desc {
-                FileDescriptor::File(f) => f.flags & open_flags::O_ACCMODE != 0,
-                _ => false,
+        let resolved = table_with(fd, |d| {
+            let FileDescriptor::File(f) = d else {
+                return Err(errno::EBADF); // not a file
             };
-            if !writable {
-                return Err(errno::EBADF); // opened read-only, or not a file
+            if f.flags & open_flags::O_ACCMODE == 0 {
+                return Err(errno::EBADF); // opened read-only
             }
-            let synthetic = entry_is_synthetic(entry);
-            let f = entry.file().unwrap();
-            let pos = f.position;
-            if synthetic {
-                Ok((None, alloc::string::String::new(), pos))
-            } else {
-                Ok((Some(()), f.path.clone(), pos))
-            }
+            Ok((f.path.clone(), f.position))
         });
-        let (real, path, pos) = match resolved {
+        let (path, pos) = match resolved {
             Some(Ok(v)) => v,
             Some(Err(e)) => return e,
             None => return errno::EBADF,
         };
-        let step = match real {
-            None => {
-                // Synthetic: grow the cached render exactly as before.
-                let n = incoming.len();
-                match with_file(fd, |entry| {
-                    let end = pos + n;
-                    if entry.data.len() < end {
-                        // Exact growth by the chunk's size, not `resize`'s
-                        // doubling — the guard that took the ~3N heap spike
-                        // off the machine in slice 1
-                        // (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`).
-                        if entry.data.try_reserve(end - entry.data.len()).is_err() {
-                            return Err(errno::ENOMEM);
-                        }
-                        entry.data.resize(end, 0);
-                    }
-                    entry.data[pos..end].copy_from_slice(&incoming);
-                    if let FileDescriptor::File(f) = &mut entry.desc {
-                        f.position = end;
-                    }
-                    Ok(())
-                }) {
-                    Some(Ok(())) => Ok(n),
-                    Some(Err(e)) => Err(e),
-                    None => Err(errno::EBADF),
-                }
-            }
-            Some(()) => match akuma_vfs_glue::write_at(&path, pos, &incoming) {
+        let proc_rest = proc_rest_of(&path);
+        let step = if proc_rest.is_some() {
+            // Synthetic: accepted and dropped — see this function's header.
+            Ok(incoming.len())
+        } else {
+            match akuma_vfs_glue::write_at(&path, pos, &incoming) {
                 // Short/partial writes: `write_at` returns what it placed,
                 // and the cursor moves by that — the caller retries the rest,
                 // which is `write(2)`'s contract.
                 Ok(n) => {
-                    with_file(fd, |entry| {
-                        if let Some(f) = entry.file() {
+                    table_with(fd, |d| {
+                        if let FileDescriptor::File(f) = d {
                             f.position = pos + n;
                         }
                     });
                     Ok(n)
                 }
                 Err(e) => Err(fs_err_errno(e)),
-            },
+            }
         };
         match step {
             Ok(0) => {
@@ -2530,7 +2178,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         return errno::EBADF;
     }
-    let Some(fi) = file_index(fd) else {
+    let Some(desc) = table_get(fd) else {
         return errno::EBADF;
     };
     // A pipe or a socket is not seekable, and Linux says so with `ESPIPE`. It
@@ -2557,54 +2205,31 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         let delta = offset.cast_signed();
         return if delta < 0 { errno::EINVAL } else { delta as u64 };
     }
-    // `SEEK_END` needs the size: synthetic from the cache, real from the VFS.
-    // One `metadata` outside the lock for the real case — the rule `release`
-    // states about disk I/O under `FILES`.
-    let (total, was_real) = {
-        let files = FILES.lock();
-        let Some(entry) = files[fi].as_ref() else {
-            return errno::EBADF;
-        };
-        let synthetic = entry_is_synthetic(entry);
-        let t = if synthetic { entry.data.len() } else { 0 };
-        // A directory descriptor takes the real branch now rather than being
-        // excluded from both: Linux permits `lseek` on one, and `metadata`
-        // answers its size like any other inode. The old exclusion left
-        // `total` at 0, so `SEEK_END` on a directory silently meant
-        // `SEEK_SET(0)`.
-        (t, !synthetic)
+    let FileDescriptor::File(f) = &desc else {
+        return errno::EBADF;
     };
-    let total = if was_real {
-            let path = {
-                let files = FILES.lock();
-                match files[fi].as_ref().map(|e| match &e.desc {
-                    FileDescriptor::File(f) => Some(f.path.clone()),
-                    _ => None,
-                }) {
-                    Some(Some(p)) => p,
-                    _ => return errno::EBADF,
-                }
-            };
+    let (proc_rest, path, position) = (proc_rest_of(&f.path), f.path.clone(), f.position);
+    // `SEEK_END` needs the size: synthetic from a fresh render, real from the
+    // VFS. One `metadata` outside the lock for the real case — the rule
+    // `release_desc` states about disk I/O under the table lock. A directory
+    // descriptor takes the real branch rather than being excluded: Linux
+    // permits `lseek` on one, and `metadata` answers its size like any other
+    // inode. The old exclusion left `total` at 0, so `SEEK_END` on a directory
+    // silently meant `SEEK_SET(0)`.
+    let total = if let Some(rest) = proc_rest {
+        render_proc_file(rest).map_or(0, |d| d.len())
+    } else {
         match fs::metadata(&path) {
             Ok(m) => m.size as usize,
             Err(e) => return fs_err_errno(e),
         }
-    } else {
-        total
-    };
-    let mut files = FILES.lock();
-    let Some(entry) = files[fi].as_mut() else {
-        return errno::EBADF;
-    };
-    let Some(file) = entry.file() else {
-        return errno::EBADF;
     };
     // `offset` is signed on the wire; a negative seek from SEEK_CUR/SEEK_END is
     // legal and must not be read as an enormous unsigned value.
     let delta = offset.cast_signed();
     let base = match whence {
         SEEK_SET => 0i64,
-        SEEK_CUR => i64::try_from(file.position).unwrap_or(i64::MAX),
+        SEEK_CUR => i64::try_from(position).unwrap_or(i64::MAX),
         SEEK_END => i64::try_from(total).unwrap_or(i64::MAX),
         _ => return errno::EINVAL,
     };
@@ -2614,17 +2239,15 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     if target < 0 {
         return errno::EINVAL;
     }
-    // Seeking past the end is legal; reading there returns 0.
-    file.position = target as usize;
-    // C2 slice 4: the mirror's cursor moves with it, so slice 5 cannot inherit
-    // a stale one the day the table becomes authoritative.
-    if let Some(table) = shared_table() {
-        let mut fds = table.table.lock();
-        if let Some(FileDescriptor::File(f)) = fds.get_mut(&(fd as u32)) {
+    // Seeking past the end is legal; reading there returns 0. The table's
+    // cursor is the only cursor — the mirror-sync block the flip deleted wrote
+    // the same number into a second structure.
+    table_with(fd, |d| {
+        if let FileDescriptor::File(f) = d {
             f.position = target as usize;
         }
-    }
-    file.position as u64
+    });
+    target as u64
 }
 
 /// `getdents64(fd, dirp, count)` — x86_64 217. `ls` and `find` both need this;
@@ -2644,27 +2267,24 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 /// reports no real inode number through `getdents64` either, and nothing seeks
 /// a directory by `d_off`.
 ///
-/// Three separate `FILES` locks rather than one held across the call: the
-/// cache-miss path calls `fs::read_dir`, which takes the *other* lock
-/// (`fs::ROOT`), and nothing else in this module nests the two — see
-/// [`sys_openat`], which reads the file before ever touching `FILES`.
+/// Separate table holds rather than one held across the call: the cache-miss
+/// path calls `fs::list_dir`, which takes the *other* lock (`fs::ROOT`), and
+/// nothing else in this module nests the two — see [`sys_openat`], which
+/// reads the file before ever touching the table.
 pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
     if count == 0 {
         return 0;
     }
-    let Some(fi) = file_index(fd) else {
-        return errno::EBADF;
-    };
 
-    let (path, cached) = {
-        let mut files = FILES.lock();
-        let Some(entry) = files[fi].as_mut() else {
-            return errno::EBADF;
+    let resolved = table_with(fd, |d| {
+        let FileDescriptor::File(f) = d else {
+            return None;
         };
-        let Some(file) = entry.file() else {
-            return errno::EBADF;
-        };
-        (file.path.clone(), file.dir_cache.clone())
+        Some((f.path.clone(), f.dir_cache.clone()))
+    })
+    .flatten();
+    let Some((path, cached)) = resolved else {
+        return errno::EBADF;
     };
 
     let entries = if let Some(c) = cached {
@@ -2692,23 +2312,19 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
                 },
             })
             .collect();
-        let mut files = FILES.lock();
-        if let Some(entry) = files[fi].as_mut()
-            && let Some(file) = entry.file()
-        {
-            file.dir_cache = Some(cache.clone());
-        }
+        table_with(fd, |d| {
+            if let FileDescriptor::File(f) = d {
+                f.dir_cache = Some(cache.clone());
+            }
+        });
         cache
     };
 
-    let mut files = FILES.lock();
-    let Some(entry) = files[fi].as_mut() else {
-        return errno::EBADF;
-    };
-    let Some(file) = entry.file() else {
-        return errno::EBADF;
-    };
-    let position = file.position;
+    let position = table_with(fd, |d| match d {
+        FileDescriptor::File(f) => f.position,
+        _ => 0,
+    })
+    .unwrap_or(0);
     if position >= entries.len() {
         return 0;
     }
@@ -2736,10 +2352,11 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
         written += reclen;
         consumed += 1;
     }
-    file.position += consumed;
-    // Released before the user copy: `copy_to_user` can fault, and the fault
-    // handler has no business finding `FILES` held.
-    drop(files);
+    table_with(fd, |d| {
+        if let FileDescriptor::File(f) = d {
+            f.position += consumed;
+        }
+    });
 
     if written > 0 {
         let r = copy_to_user(dirp, &kernel_buf[..written]);
@@ -2820,12 +2437,13 @@ fn encode_stat(
 
 /// `fstat(fd, statbuf)` — `struct stat` for an already-open descriptor.
 ///
-/// The size comes from the cached contents (see the module header); the mode is
-/// a fixed `S_IFREG | 0644` because a `KernelFile` on this target carries no
-/// inode to read a real one from. A console descriptor reports `S_IFCHR`, a
-/// directory descriptor `S_IFDIR` — musl's `fdopendir` fstats the fd and
-/// refuses it with `ENOTDIR` unless `S_ISDIR` holds, so `ls`/`find` need this
-/// to be right, not just `openat` succeeding.
+/// The size comes from a fresh render for a synthetic view and from the VFS
+/// for a real file; the mode is a fixed `S_IFREG | 0644` because a
+/// `KernelFile` on this target carries no inode to read a real one from. A
+/// console descriptor reports `S_IFCHR`, a directory descriptor `S_IFDIR` —
+/// musl's `fdopendir` fstats the fd and refuses it with `ENOTDIR` unless
+/// `S_ISDIR` holds, so `ls`/`find` need this to be right, not just `openat`
+/// succeeding.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         (S_IFCHR_0620, 0u64, 1u64)
@@ -2841,9 +2459,9 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         // keeps `stat file` and `fstat(open(file))` agreeing.
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
-        // Size and shape: synthetic from the render, real from the VFS — one
-        // `metadata` outside the lock, the rule `release` states about disk
-        // I/O.
+        // Size and shape: synthetic from a fresh render, real from the VFS —
+        // one `metadata` outside the lock, the rule `release_desc` states
+        // about disk I/O under the table lock.
         //
         // # This arm answered `EBADF` for every real directory descriptor
         //
@@ -2870,28 +2488,31 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         // and most every `openat`-based directory walker are built on, which
         // is the shape a self-hosting build reaches for.
         //
-        // Both halves are answered from the source that knows now: a synthetic
+        // Both halves are answered from the source that knows: a synthetic
         // view asks [`proc_metadata`] (the same answer `newfstatat` gives for
         // the same path, so `stat` and `fstat` agree), and a real file asks
         // the VFS for `is_dir` alongside the size it was already fetching.
-        let resolved = with_file(fd, |entry| {
-            let synthetic = entry_is_synthetic(entry);
-            let size = if synthetic { entry.data.len() as u64 } else { 0 };
-            let path = entry.file()?.path.clone();
-            Some((synthetic, size, path))
-        });
-        match resolved.flatten() {
-            None => return errno::EBADF,
-            Some((synthetic, cached_size, path)) if path_is_dir(&path) => {
-                let _ = (synthetic, cached_size);
-                (S_IFDIR_0755, 0u64, 2u64)
+        let resolved = table_with(fd, |d| match d {
+            FileDescriptor::File(f) => Some(f.path.clone()),
+            _ => None,
+        })
+        .flatten();
+        let Some(path) = resolved else {
+            return errno::EBADF;
+        };
+        if path_is_dir(&path) {
+            (S_IFDIR_0755, 0u64, 2u64)
+        } else if let Some(rest) = proc_rest_of(&path) {
+            match proc_metadata(rest) {
+                // A `/proc` render: read-only, and its size is the bytes this
+                // descriptor will actually serve — the same answer
+                // `sys_newfstatat` gives for the same path, which is what
+                // keeps `stat` and `fstat` agreeing.
+                Some((size, false)) => (S_IFREG_0444, size, 1u64),
+                _ => (S_IFREG_0444, 0u64, 1u64),
             }
-            // A `/proc` render: read-only, and its size is the bytes this
-            // descriptor will actually serve — the same answer
-            // `sys_newfstatat` gives for the same path, which is what keeps
-            // `stat` and `fstat` agreeing.
-            Some((true, cached_size, _)) => (S_IFREG_0444, cached_size, 1u64),
-            Some((false, _, path)) => match fs::metadata(&path) {
+        } else {
+            match fs::metadata(&path) {
                 Ok(m) => (S_IFREG_0644, m.size, 1u64),
                 // The path resolved at `open` and does not now — an unlinked
                 // file, which this target has no inode pin for. Reported as
@@ -2899,7 +2520,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
                 // the fd is perfectly valid, and `EBADF` would send a caller
                 // looking at its own bookkeeping.
                 Err(_) => (S_IFREG_0644, 0u64, 1u64),
-            },
+            }
         }
     };
     let st = encode_stat(mode, size, 0, nlink, None, None, None);
@@ -2985,7 +2606,7 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
     let path = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         alloc::string::String::from("/")
     } else {
-        let Some(path) = with_file(fd, |entry| match &entry.desc {
+        let Some(path) = table_with(fd, |d| match d {
             FileDescriptor::File(f) => f.path.clone(),
             _ => alloc::string::String::from("/"),
         }) else {
@@ -3322,7 +2943,7 @@ fn poll_ready(fd: u64) -> (bool, bool) {
         return akuma_net::socket::socket_tcp_ready(idx);
     }
     // A regular file: always ready, per POSIX.
-    let in_table = file_index(fd).is_some();
+    let in_table = is_bound(fd);
     (in_table, in_table)
 }
 
@@ -3480,12 +3101,7 @@ fn install_synthetic_dir(path: &str, names: Vec<(alloc::string::String, u8)>, fl
             .map(|(name, d_type)| akuma_exec_core::process::DirCacheEntry { name, d_type })
             .collect(),
     );
-    install(Entry {
-        desc: FileDescriptor::File(file),
-        data: Vec::new(),
-        nonblocking: false,
-        refs: 1,
-    })
+    install(FileDescriptor::File(file))
 }
 
 /// DT_DIR / DT_REG, as `getdents64` spells them.
@@ -3929,10 +3545,16 @@ fn open_proc(rest: &str, flags: u64) -> Option<u64> {
             .map(|f| (alloc::string::String::from(*f), DT_REG))
             .collect();
         names.push((alloc::string::String::from("fd"), DT_DIR));
-        return Some(install_synthetic_dir(rest, names, flags));
+        return Some(install_synthetic_dir(&alloc::format!("/proc/{pid}"), names, flags));
     }
 
-    render_proc_file(rest).map(|data| install_synthetic_file(rest, data, flags))
+    // The render doubles as the existence check; the bytes themselves are
+    // produced per `read(2)` now, so they are dropped here. The descriptor's
+    // path is the **absolute** one — `proc_rest_of` classifies a synthetic
+    // descriptor by its `/proc/` prefix, and it used to be harmless that this
+    // stored the bare rest (`1/statm`) only because the old read path served
+    // cached bytes and never looked at the path.
+    render_proc_file(rest).map(|_| install_synthetic_file(&alloc::format!("/proc/{rest}"), flags))
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -4001,19 +3623,18 @@ fn proc_consistency_check(t: &mut Suite) {
     }
 }
 
-/// Install a read-only fd whose contents are `data` (a generated file like
-/// `/proc/net/dev`). Reads serve from `Entry::data` exactly as a cached real
-/// file does.
-fn install_synthetic_file(path: &str, data: Vec<u8>, flags: u64) -> u64 {
-    install(Entry {
-        desc: FileDescriptor::File(KernelFile::new(
-            alloc::string::String::from(path),
-            flags as u32,
-        )),
-        data,
-        nonblocking: false,
-        refs: 1,
-    })
+/// Install a read-only fd for a generated `/proc` file (like `/proc/net/dev`).
+///
+/// Nothing is stored: since step 4b the render is produced per `read(2)` by
+/// [`render_proc_file`], and the bytes this function used to cache into the
+/// now-deleted `Entry` are gone. The caller still renders once as the
+/// **existence check** — a view that cannot render fails the open, so a
+/// descriptor from here always has something to re-render.
+fn install_synthetic_file(path: &str, flags: u64) -> u64 {
+    install(FileDescriptor::File(KernelFile::new(
+        alloc::string::String::from(path),
+        flags as u32,
+    )))
 }
 
 /// The two synthetic interfaces `ifconfig` sees: `lo` and the live smoltcp
@@ -4619,24 +4240,35 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     );
     sys_close(rofd);
 
-    // `dup` is a second *name*, not a second description. Both halves matter
-    // and only the second one is new: closing one of two dups used to release
-    // the description outright, so the survivor read `EBADF` on a descriptor
-    // that was still open. That was pinned as a divergence for as long as the
-    // table stored descriptions directly.
+    // `dup` is a second name backed by its own reference: closing one of two
+    // dups must leave the survivor open, and the underlying socket/pipe must
+    // survive until the last name goes.
+    //
+    // **The cursor is NOT shared, and that is pinned here on purpose.** The
+    // step 4b flip adopted `akuma-syscalls-glue`'s `dup`, which copies the
+    // `KernelFile` by value — independent cursors, where POSIX (and this
+    // target's deleted `FILES` table) shared the open file description. See
+    // `sys_dup`'s header; this check fails if the divergence ever quietly
+    // becomes something else.
     {
         let a = sys_openat(0, path.as_ptr() as u64, 0, 0);
         let b = sys_dup(a);
         t.check("fd: dup returns a new descriptor", b != a && !errno::is_err(b));
         let mut one = [0u8; 16];
         t.check_eq(
-            "fd: reading through a dup advances the shared cursor",
+            "fd: reading through a dup advances that descriptor's cursor",
             sys_read(a, one.as_mut_ptr() as u64, 8),
             8,
         );
-        t.check_eq("fd: the dup sees the advanced cursor", sys_lseek(b, 0, 1), 8);
+        // The divergence, asserted: `b`'s cursor is a copy taken at `dup`
+        // time — 0 — not a window onto `a`'s.
+        t.check_eq(
+            "fd: a dup's cursor is independent (glue divergence, pinned)",
+            sys_lseek(b, 0, 1),
+            0,
+        );
         sys_close(a);
-        // The description is still named by `b`, so it must still be readable.
+        // The description's backing reference went with `b`, so it stays open.
         t.check_eq(
             "fd: closing one dup leaves the other open",
             sys_read(b, one.as_mut_ptr() as u64, 8),
@@ -4648,6 +4280,29 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             sys_read(b, one.as_mut_ptr() as u64, 8),
             errno::EBADF,
         );
+    }
+
+    // `nonblock` is keyed by fd number now (the table's set, where `F_SETFL`
+    // always mirrored it): a dup of a non-blocking descriptor **loses** the
+    // flag. Also pinned — it is the other half of glue's `dup` model, see
+    // `is_nonblocking`'s header.
+    {
+        let a = sys_openat(0, path.as_ptr() as u64, 0, 0);
+        t.check_eq("fd: F_SETFL nonblock succeeds", sys_fcntl(a, 4, 0x800), 0);
+        t.check_eq(
+            "fd: F_GETFL reads the flag back",
+            sys_fcntl(a, 3, 0),
+            0x800,
+        );
+        let b = sys_dup(a);
+        t.check_eq(
+            "fd: a dup loses nonblock (glue divergence, pinned)",
+            sys_fcntl(b, 3, 0),
+            0,
+        );
+        t.check_eq("fd: the original keeps it", sys_fcntl(a, 3, 0), 0x800);
+        sys_close(a);
+        sys_close(b);
     }
 
     // Fill this row's descriptors, then check the next open is refused rather
@@ -4678,9 +4333,9 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         sys_close(fd);
     }
 
-    // And it is empty again afterwards: a row that leaked would hand out a
+    // And it is empty again afterwards: a table that leaked would hand out a
     // descriptor above `FIRST_FILE_FD` here, which is exactly the shape of the
-    // `apk`-twice-in-a-row failure that `close_owned_by` was written for.
+    // `apk`-twice-in-a-row failure the exit sweep was written for.
     let reopened = sys_openat(0, path.as_ptr() as u64, 0, 0);
     t.check_eq(
         "fd: closing every descriptor frees the whole row",

@@ -2567,6 +2567,15 @@ fn run_process(idx: usize) -> ! {
         crate::sched::finish();
     }
     EXIT_STATUS.store(status, Ordering::Relaxed);
+    // Real Linux closes every fd a process still holds at exit. Since step 4b
+    // the registered table is the only descriptor authority and every entry in
+    // it owns a real pipe/socket reference, so the sweep is the table's own
+    // `close_all()` — the same walk its `Drop` would run later — captured
+    // **before** `thread::drain`, which may retire the identity the lookup
+    // below resolves through. Done before `spawn_record_exit` so a parent's
+    // `waitpid` never observes the child as reaped while its fds are still
+    // charged against the shared table.
+    let exit_fds = current_process().map(|p| p.fds.clone());
     // Every thread of this process, gone, before anything downstream can reap.
     // `sys_waitpid` retires the `Process` — and with it the page tables, which
     // the reclaim then frees — once this task is `Finished`, so a sibling still
@@ -2574,17 +2583,9 @@ fn run_process(idx: usize) -> ! {
     // only place that ordering can be enforced: the reaper is another process
     // and has no idea threads exist.
     crate::thread::drain(idx);
-    // Real Linux closes every fd a process still holds at exit; this target's
-    // fd table did not until 2026-09 (see `close_owned_by`'s own header).
-    // Before `spawn_record_exit` so a parent's `waitpid` never observes the
-    // child as reaped while its fds are still charged against the shared table.
-    crate::fd::close_owned_by(idx);
-    // C2 slice 4: empty the registered table's mirror while the legacy world
-    // has just accounted for everything — `SharedFdTable::drop`'s `close_all`
-    // would otherwise fire the pipe/socket close hooks on entries that own no
-    // references, and a forked child's exit closed its parent's pipes (the
-    // bare-metal wedge this fix post-dates). See `clear_table_mirror`.
-    crate::fd::clear_table_mirror();
+    if let Some(fds) = exit_fds {
+        fds.close_all();
+    }
     if idx >= SPAWN_SLOT_BASE {
         spawn_record_exit(idx, status as i32);
     }
@@ -2738,11 +2739,11 @@ use crate::pipe::{self, PipeId};
 /// those jobs is done by machinery that already existed:
 ///
 /// - routing: `pipe_read_id`/`pipe_write_id` resolve fd 0/1/2 like any pipe;
-/// - `borrowed_io`: a `fork` child's `inherit_fds` bumps the shared ends'
-///   refcounts, and only the last name's close reaches the pipe;
-/// - `console_io`: a child of a console task inherits an empty row, so its
+/// - `borrowed_io`: a `fork` child's `clone_deep_for_fork` bumps the shared
+///   ends' refcounts, and only the last reference's close reaches the pipe;
+/// - `console_io`: a child of a console task inherits an empty table, so its
 ///   0/1/2 are unbound and fall through to the console exactly as before;
-/// - exit EOF: `close_owned_by` unrefs the child's ends before
+/// - exit EOF: `close_all` releases the child's ends before
 ///   `spawn_record_exit` runs — the parent's reader sees EOF with no
 ///   per-spawn code (the manual `close_write` this replaced would now be a
 ///   *double* close).
@@ -3224,7 +3225,15 @@ fn register_exec_process(
         // arrives carrying the parent's extents.
         mmap_regions: Spinlock::new(image.regions),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
-        fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio())),
+        // **`new()`, not `with_stdio()`** — and the difference became real the
+        // day the registered table became the only descriptor authority (step
+        // 4b). An unbound 0/1/2 on this target *is* the console, answered by
+        // number; a table that holds `Stdin`/`Stdout`/`Stderr` entries makes
+        // `is_bound(1)` true and routes the write into `sys_write_file`, which
+        // refuses a non-`File` descriptor — every test process went silent.
+        // The AArch64 kernel wants the stdio triple because its glue reads
+        // descriptors for 0/1/2; this target's fd layer never has.
+        fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::new())),
         thread_id: None,
         spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
@@ -3638,13 +3647,14 @@ fn sys_fork() -> u64 {
     };
     let child_root = child.space.ttbr0();
 
-    // The child gets its own descriptor *row*, naming the same open file
-    // descriptions. Before per-process rows existed there was nothing to do
+    // The child gets its own descriptor table naming the same open
+    // descriptions. Before per-process tables existed there was nothing to do
     // here and that was the bug: parent and child shared one flat table, so a
     // child that closed fd 1 to redirect its own output closed the parent's
     // too. Done before the task is published — a child that runs with an empty
-    // row cannot open anything and does not say why.
-    crate::fd::inherit_fds(parent_slot, slot);
+    // table cannot open anything and does not say why. (Since step 4b the copy
+    // IS the registration's `clone_deep_for_fork` below; there is no second,
+    // legacy table to copy alongside it.)
 
     let Some(task_slot) = crate::sched::spawn_in_space_unpublished(proc_entry, child_root) else {
         // `child` drops here, releasing every frame the CoW share pass claimed
@@ -3678,16 +3688,15 @@ fn sys_fork() -> u64 {
         // shows the parent's command line — the reason `ps` briefly lists two
         // `sh`s.
         &parent_cmdline,
-        // C2 slice 3: the child's *registered* fd table is a real copy of the
-        // parent's — the crate-side twin of `inherit_fds` above, which copies
-        // the legacy `FDS` row. `fork_table_mirror`, not
-        // `clone_deep_for_fork`: while `FILES` owns the refcounts the mirror
-        // must copy without bumping, or every forked pipeline double-bumps
-        // its pipes and the write end never reaches zero (found by the
-        // suite's `redirect` test, first boot of slice 4).
-        Some(alloc::sync::Arc::new(crate::fd::fork_table_mirror(
-            &parent.fds,
-        ))),
+        // Step 4b: the child's registered fd table is the *only* table — a
+        // real POSIX copy of the parent's through `clone_deep_for_fork`, whose
+        // `clone_fd_refs` bumps one pipe-end/socket reference per inherited
+        // descriptor. The bump used to live in the deleted `inherit_fds` and
+        // the mirror copied **without** it (running both double-bumped every
+        // forked pipeline's pipes and `yes` blocked forever — found by the
+        // suite's `redirect` test, first boot of slice 4); with one authority
+        // there is one place for it.
+        Some(alloc::sync::Arc::new(parent.fds.clone_deep_for_fork())),
     );
 
     // SAFETY: raw-pointer write; single core.
@@ -3788,23 +3797,18 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     }
 
     let root = child.space.ttbr0();
-    // The child's row starts empty; `bind_stdio` below gives it fd 0/1/2 as
-    // its stdio pipes. The reset is defensive rather than expected —
-    // `close_owned_by` clears the row at exit — but a slot whose previous
-    // occupant died without running that would otherwise hand this process
-    // working descriptors it never opened.
-    crate::fd::close_owned_by(slot);
 
     // **C2 slice 6:** the child's stdio becomes real descriptors — fd 0 = the
     // read end of `stdin_pipe`, fd 1 **and fd 2** = the write end of
     // `stdout_pipe` (one description, two names, which is what keeps stderr on
-    // the session after a `dup2(file, 1)`) — in its own row and its own
-    // registered table, replacing the by-number routing
+    // the session after a `dup2(file, 1)`) — in its own registered table,
+    // which since step 4b is the only table, replacing the by-number routing
     // the `Spawn` row used to carry. See `fd::bind_stdio` for what this buys.
-    // Done before the child can be scheduled: the row is seeded before
-    // `publish_task`, and the table is handed to the registration below.
+    // Done before the child can be scheduled: the table is seeded before
+    // `publish_task` and handed to the registration below. There is no legacy
+    // row to reset defensively — a fresh `SharedFdTable` starts empty.
     let child_fds = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new());
-    let bind = crate::fd::bind_stdio(slot, stdin_pipe, stdout_pipe, Some(&child_fds));
+    let bind = crate::fd::bind_stdio(&child_fds, stdin_pipe, stdout_pipe);
     if bind != 0 {
         drop(child);
         cleanup_spawn_slot(stdout_pipe, stdin_pipe);
@@ -3815,14 +3819,12 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         // `child` drops here: the image is freed by the same destructor that
         // would have freed it out of `PROCS`.
         //
-        // The row and the mirror are unwound **before** the pipes go. The row
-        // holds three real references now, and `child_fds` is about to drop
-        // unregistered — `SharedFdTable::drop` runs `close_all()`, which fires
-        // the `ExecRuntime` pipe hooks this target answers with `not_wired!`,
-        // i.e. a panic. That is the same trap `fd::clear_table_mirror` exists
-        // for on the exit path; this is the failure path's copy of it.
-        child_fds.table.lock().clear();
-        crate::fd::close_owned_by(slot);
+        // The table is unwound **before** the pipes go: it holds three real
+        // references now, and `child_fds` is about to drop unregistered —
+        // `SharedFdTable::drop` runs `close_all()` anyway, but doing it
+        // explicitly keeps the release before `cleanup_spawn_slot` destroys
+        // the ends by id, the same ordering the exit path keeps.
+        child_fds.close_all();
         cleanup_spawn_slot(stdout_pipe, stdin_pipe);
         return errno::ENOMEM;
     };
@@ -3929,11 +3931,11 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     // The row is read only for the pid that names the process. It used to
     // also carry the child's stdout write end, closed here by hand so the
     // parent's reader saw EOF — **C2 slice 6 deleted that**, because the
-    // child's stdio is bound descriptors now: `close_owned_by` (which runs
-    // earlier in `run_process`'s exit path) already unref'd the child's ends,
-    // and the refcounts did the EOF. A manual `close_write` here would be a
-    // *second* decrement of a ref the child no longer holds — it would close
-    // a live parent-side end.
+    // child's stdio is bound descriptors now: `close_all` (which runs
+    // earlier in `run_process`'s exit path) already released the child's
+    // ends, and the refcounts did the EOF. A manual `close_write` here would
+    // be a *second* decrement of a ref the child no longer holds — it would
+    // close a live parent-side end.
     let dying = unsafe {
         (*spawn_table())
             .get_mut(proc_slot - SPAWN_SLOT_BASE)
@@ -4017,7 +4019,7 @@ pub fn current_proc_slot() -> usize {
 /// end no descriptor names — and the child's fd 0 is the *other* end. Reading
 /// the child's table for it would work only for as long as fd 0 still named
 /// that pipe: a shell that redirects its own stdin, or a child already past
-/// `clear_table_mirror` on the exit path, would silently answer `ENOENT` to a
+/// `close_all` on the exit path, would silently answer `ENOENT` to a
 /// bridge that is still live. The row outlives both, up to the reap.
 pub fn stdin_pipe_for_pid(pid: u32) -> Option<PipeId> {
     // SAFETY: raw-pointer read; single core, no row mutated.
@@ -4095,8 +4097,8 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     // The spawn row is now consulted for the task slot the identity map is
     // keyed by, and for the one pipe end no descriptor names. Everything else
     // about the child is read above — since C2 slice 6 its stdout pipe is a
-    // refcounted descriptor whose ends died with the child's own `close` sweep
-    // (`close_owned_by` at exit), so the reap's old "spare the stdout pipe for
+    // refcounted descriptor whose ends died with the child's own `close_all`
+    // at exit, so the reap's old "spare the stdout pipe for
     // `sshd`'s final drain, and mind `borrowed_io`" bookkeeping is exactly what
     // the refcounts already do.
     let Some(slot_off) = spawn_row_of(child_pid) else {
@@ -4221,7 +4223,7 @@ pub fn spawn_test(t: &mut Suite) {
     // that reads the console instead of the channel, an `EBADF` from a
     // `dup2` target, a lost stderr. Asked here, of the live child, before it
     // is drained — the one moment the table is guaranteed populated and not
-    // yet cleared by `clear_table_mirror`.
+    // yet swept by `close_all`.
     {
         use akuma_exec::process::FileDescriptor;
         let stdio = akuma_exec::process::with_process(pid, |p| {

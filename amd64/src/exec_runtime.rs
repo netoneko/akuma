@@ -198,15 +198,15 @@ fn runtime() -> ExecRuntime {
         //
         // They were `not_wired!` — i.e. `panic!` — and that is not a
         // theoretical cost. `SharedFdTable::drop` runs `close_all()`, which
-        // fires these per entry, so the *only* thing standing between a
-        // socket in a mirror and a kernel panic was every caller remembering
-        // `fd::clear_table_mirror` first. Slice 6 found a path that did not
-        // (`sys_spawn`'s `spawn_process_task` failure, where an unregistered
-        // `Arc<SharedFdTable>` dropped with three descriptors in it), and a
-        // panic is a poor way to learn that. Wired, the forgotten case is a
-        // double close instead of a dead machine — still a bug, and one the
-        // refcounts can be made to catch, rather than one that takes the box
-        // down.
+        // fires these per entry, so before the socket hooks were wired the
+        // only thing standing between a socket in a table and a kernel panic
+        // was every exit path emptying the table first. Slice 6 found a path
+        // that did not (`sys_spawn`'s `spawn_process_task` failure, where an
+        // unregistered `Arc<SharedFdTable>` dropped with three descriptors in
+        // it), and slice 7 wired them for exactly this argument: wired, the
+        // forgotten case is a double close instead of a dead machine — still
+        // a bug, and one the refcounts can be made to catch, rather than one
+        // that takes the box down.
         remove_socket: |idx| crate::sock::close(idx),
         socket_clone_ref: akuma_net::socket::socket_clone_ref,
         rump_socket_clone_ref: |_, _| not_wired!("rump_socket_clone_ref", "rump is not built for this target"),
@@ -237,14 +237,16 @@ fn runtime() -> ExecRuntime {
         // takes an advisory lock, so nothing can release one. What was wrong
         // was the *shape* of saying so. `SharedFdTable::close_all` fires this
         // hook for **every `File` entry it pops**, and since C2 slice 4 the
-        // registered tables on this target hold real `File` entries — so the
-        // only thing standing between an ordinary process teardown and a
-        // kernel panic was every exit path remembering `fd::clear_table_mirror`
-        // first. Slice 6 found a path that did not (`sys_spawn`'s
-        // `spawn_process_task` failure, dropping an unregistered `Arc` with
-        // three descriptors in it), and slice 7 wired the socket hooks for
-        // exactly this argument; the `File` arm was left behind because its
-        // stated reason ("no flock here") was true and read like a decision.
+        // registered tables on this target hold real `File` entries — so
+        // before the table's `Drop`-driven sweep replaced the mirror-clearing
+        // exit path, the only thing standing between an ordinary process
+        // teardown and a kernel panic was every exit path remembering to
+        // empty its table first. Slice 6 found a path that did not
+        // (`sys_spawn`'s `spawn_process_task` failure, dropping an
+        // unregistered `Arc` with three descriptors in it), and slice 7 wired
+        // the socket hooks for exactly this argument; the `File` arm was left
+        // behind because its stated reason ("no flock here") was true and
+        // read like a decision.
         //
         // It was not a decision, it was a landmine with a correct label. A
         // release of a lock that was never taken is a no-op in any
