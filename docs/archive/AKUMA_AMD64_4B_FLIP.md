@@ -1,7 +1,7 @@
 # amd64 C1 step 4b, the flip: the registered `SharedFdTable` is the only descriptor table
 
 **Date:** 2026-09-09
-**Status:** landed, uncommitted. QEMU/TCG `SMP=1` **550/0**, `SMP=4` **560/0**;
+**Status:** landed. QEMU/TCG `SMP=1` **550/0**, `SMP=4` **560/0**;
 Firecracker/KVM `SMP=1` **537/0**, `SMP=4` **547/0** (first run with the box's
 Firecracker arm live — the 4b baselines were set with it skipped); ring-3
 `-n 30` **OK** (`free` unmoved, `grandfork` ALL PASS); memory probes **8/10,
@@ -9,7 +9,9 @@ Firecracker arm live — the 4b baselines were set with it skipped); ring-3
 **Parent:** `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, the C1 box's `4b` row.
 **Predecessor:** `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md` — slices A, B
 and C; the open decisions it recorded are all closed below.
-**Next:** `proposals/NEXT_AGENT_AMD64_4B_VFS_FOLD.md` step 2 — the arms.
+**Next:** step 2, the arms — begun: the five path-only `*at` syscalls folded
+in `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH1.md`; the rest per
+`proposals/NEXT_AGENT_AMD64_4B_VFS_FOLD.md` step 2.
 
 `FDS`, `FILES`, `Entry`, `FileIdx`, `KERNEL_ROW`, `fork_table_mirror`,
 `inherit_fds`, `close_owned_by` and `clear_table_mirror` are deleted. Every

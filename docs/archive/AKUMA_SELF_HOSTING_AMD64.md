@@ -683,7 +683,12 @@ C2's seven slices).
 > `current_process_shared`, and the shootdown lifted the mem-arm deadline.
 
 > **4b's prerequisites landed, and two of the three closed live bugs
-> (2026-09-09)** — `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md`. Found by
+> (2026-09-09)** — `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md`. **The flip
+> landed the same day** (`AKUMA_AMD64_4B_FLIP.md`: `FDS`/`FILES`/`Entry`
+> deleted, the registered table is the only authority), **and the first fold
+> batch with it** (`AKUMA_AMD64_4B_FOLD_BATCH1.md`: `mkdirat`/`unlinkat`/
+> `renameat`/`symlinkat`/`readlinkat` are glue's; `fs::mark_initialized` and
+> the `sys_setsockopt` SMAP bug were what the first boot found). Found by
 > asking what a folded VFS arm would actually touch, which is how step 1's
 > blocker was found and is now the second time the answer was "a vocabulary":
 >
