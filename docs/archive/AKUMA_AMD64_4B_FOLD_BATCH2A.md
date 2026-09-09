@@ -115,14 +115,40 @@ negative-control build produced.
   The alternative — moving that coverage into a ring-3 probe binary of the
   `userspace/amd64/hello` shape — remains open, and is where the plan says a
   folded arm's verification belongs anyway.
-- **`/proc` interception must stay amd64's, as a pre-glue shim.** `fd.rs`
-  answers `/proc` from this kernel's own spawn table, and one of its paths —
-  `/proc/<pid>/fd/0`, which `sshd`'s bridge opens to feed a spawned shell's
-  stdin — hands back a **pipe** descriptor that no filesystem can produce. The
-  mounted `ProcFilesystem` is not a replacement today either: it renders from
-  `akuma-exec`'s table, and on the metal's persistent root its mount fails
-  outright (`[FS] WARN: /proc mount failed`, pre-existing). So the fold keeps
-  the interception ahead of `to_glue` rather than moving it.
+- **`/proc` interception: a decision, and one path that should go the other
+  way.** `fd.rs` answers `/proc` from this kernel's own spawn table. The
+  mounted `ProcFilesystem` renders from `akuma-exec`'s table instead, is asleep
+  during the suite window (no registered process — see the identity item above,
+  which is what wakes it), and on the metal's persistent root its mount fails
+  outright (`[FS] WARN: /proc mount failed`, pre-existing). So most of the
+  interception stays ahead of `to_glue` for now, per path.
+
+  **`/proc/<pid>/fd/0` is the exception, and this document first said the
+  opposite.** It claimed the path "hands back a pipe descriptor that no
+  filesystem can produce". That is wrong: `akuma-vfs-glue`'s `ProcFilesystem`
+  serves it already — its header names it in the first three lines, and
+  `write_fd_data` parses `<pid>/fd/0`, checks the caller is the target's
+  spawner, and calls `akuma_exec::process::write_to_process_stdin`. It is
+  ordinary bytes through `write_at`, and it is how the **AArch64** kernel
+  serves the identical `open("/proc/<pid>/fd/0", O_WRONLY)` in
+  `userspace/sshd/src/protocol.rs`.
+
+  What actually differs is the **stdin sink**, not the VFS.
+  `write_to_process_stdin` delivers into the target's
+  `StdioBuffer`/`ProcessChannel`; amd64's spawned children read fd 0 from a
+  **pipe** (`bind_stdio`, C2 slice 6), so bytes delivered that way land where
+  nobody reads. Hence the short-circuit that hands back the pipe's write end.
+
+  Lifting it is therefore work in `akuma-exec`, and it *deletes* code here:
+  teach the sink to find the target's real stdin — the target's own `get_fd(0)`
+  already names it, and a `PipeRead(id)` means "write into that pipe" — then
+  stop `sys_write_file` dropping `/proc` writes (`proc_rest_of` → "Synthetic:
+  accepted and dropped", which the `write` fold fixes anyway), and delete
+  `open_proc`'s `/fd/0` case with `stdin_pipe_for_pid`. amd64 gains three
+  things the shared path already carries and the interception has never had:
+  the spawner permission check, `delegate_pid` indirection, and the terminal
+  line discipline that turns an INTR byte into `SIGINT` on the foreground
+  process group instead of delivering it as data.
 - **Four `open` flags live here and nowhere else.** `O_DIRECTORY`, `O_EXCL`,
   `O_NOFOLLOW` and the `O_TMPFILE`-adjacent directory guard are enforced by
   amd64's `sys_openat`; glue's arm enforces none of the first three (it always

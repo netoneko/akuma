@@ -91,12 +91,22 @@ spaces are invisible to any test that only looks at one side.
 |---|---|---|
 | QEMU/TCG `SMP=1` | 563/0 | **573/0** (+10: the pipe block) |
 | QEMU/TCG `SMP=4` | 573/0 | **583/0** |
-| `amd64_ring3_check --smp 1 -n 30` | OK | PENDING |
-| Firecracker/KVM `SMP=1` / `SMP=4` | 550/0 / 560/0 | PENDING |
-| bare metal | 563/0 | PENDING |
+| `amd64_ring3_check --smp 1 -n 30` | OK | **OK** |
+| Firecracker/KVM `SMP=1` / `SMP=4` | 550/0 / 560/0 | **560/0 / 570/0** |
+| bare metal | 563/0 | **573/0**, pipelines included |
 | host tests (`akuma-pipes` 27, workspace) | pass | **pass** |
 | clippy (amd64 + AArch64 kernel) | clean | **clean** |
 | ring-3 pipelines over ssh | — | **`yes \| head -n 1` terminates; 11-stage `cat` chain; `( … ) \| wc -l`** |
+
+**An intermittent session teardown on the metal is unchanged and unexplained.**
+`ssh <box> "head -c 8 /dev/zero | wc -c"` sometimes ends with `Connection
+closed by remote host` — the command's output is correct every time and the
+exit status propagates, but the session is torn down rather than closed.
+Measured because the shape (a pipeline whose reader exits early) is exactly
+what this batch touches: **4/20 before, 6/20 after, 20/20 correct output in
+both**, which at n=20 is one sample of the same rate, not a change. It does not
+reproduce on QEMU (0/8). Pre-existing, metal-only, and still open; recorded
+here so the next person measuring it starts from two samples instead of none.
 
 AArch64 is unverified by boot on this machine and deliberately unchanged in
 substance: `fire` gains one `OnceCopy` load, `pipe_write` becomes

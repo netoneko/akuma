@@ -682,6 +682,14 @@ C2's seven slices).
 > and it is unblocked: 4a killed the private mount table, 5b supplied
 > `current_process_shared`, and the shootdown lifted the mem-arm deadline.
 
+> **4b is in progress: batch 1 folded, batch 2's prerequisites landed, and the
+> two pipe tables are one (2026-09-10)** —
+> `AKUMA_AMD64_4B_FOLD_BATCH2A.md` (console descriptors, `with_stdio()`, glue's
+> `/dev` variants, per-write `O_APPEND`) and
+> `AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md` (one `PipeTable`, which is what
+> unblocks folding `close`). What remains is the boot suite's process identity,
+> the `/proc` serving split, then the arms themselves.
+>
 > **4b's prerequisites landed, and two of the three closed live bugs
 > (2026-09-09)** — `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md`. **The flip
 > landed the same day** (`AKUMA_AMD64_4B_FLIP.md`: `FDS`/`FILES`/`Entry`
