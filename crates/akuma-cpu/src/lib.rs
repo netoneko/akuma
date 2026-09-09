@@ -399,10 +399,12 @@ pub mod tlb {
     /// The x86 counterpart of `vaae1`/`vaae1is` above, and the concrete gap
     /// `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §3 named: x86 has no
     /// broadcast invalidation instruction at all. A multi-core x86 kernel needs
-    /// an IPI-based shootdown to reach peer cores — deliberately not built here
-    /// (`akuma_mmu::TlbTarget` is the vocabulary that would carry that decision
-    /// when it exists; see `docs/archive/AKUMA_MMU_TLB_TARGET_VOCABULARY.md`).
-    /// This wrapper is therefore core-local only, exactly like `aside1`.
+    /// an IPI-based shootdown to reach peer cores, and on amd64 that now
+    /// exists — `akuma_mmu::flush_tlb_*`'s `AllCores` arms send it through the
+    /// hooks `set_shootdown_hooks` registers, with the acknowledgement wait in
+    /// `TlbFlush::drop`. This wrapper stays core-local only, exactly like
+    /// `aside1`: callers that need peers must go through the flush API, which
+    /// is what makes the target sayable at the call site.
     #[inline(always)]
     pub fn invlpg(va: usize) {
         #[cfg(all(target_os = "none", target_arch = "x86_64"))]

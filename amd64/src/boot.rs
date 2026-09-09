@@ -144,6 +144,23 @@ pub fn install_shared_sinks() {
     // answer. Same reason as the two registrations above: one call site, both
     // boot protocols. See `fs::init_vfs`.
     crate::fs::init_vfs();
+    // The TLB shootdown. Two registrations, both idempotent and both needed on
+    // **both** boot protocols — this function is exactly the remedy for the
+    // "registered in one kmain and not the other" failure, and a shootdown
+    // armed on PVH but not on multiboot2 would be green on both VMM rigs and
+    // silently stale on the metal.
+    //
+    // - `akuma_mmu::set_shootdown_hooks`: what `flush_tlb_*`'s `AllCores`
+    //   arms call. `shootdown::broadcast` answers `false` until the LAPIC is
+    //   mapped and a second core is online, so being registered this early —
+    //   `lapic::init` has not run yet on the self-test path — degrades to the
+    //   core-local flush rather than writing an ICR through a null base.
+    // - `akuma_bkl::sync::set_spin_assist`: the BKL ticket wait services pending
+    //   shootdowns inline, which is what keeps the sender's acknowledgement
+    //   wait bounded while a peer spins IRQ-masked for this very lock (the
+    //   deadlock argument lives beside `set_shootdown_hooks` in `akuma-mmu`).
+    akuma_mmu::set_shootdown_hooks(crate::shootdown::broadcast, crate::shootdown::wait_for_acks);
+    akuma_bkl::sync::set_spin_assist(crate::shootdown::bkl_spin_assist);
 }
 
 /// What the shared suite needs to know about the machine it is running on.
@@ -386,6 +403,11 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
         0
     };
     smp::smoke_test(t, expected_aps, started);
+    // Right after the secondaries come up: the shootdown's whole termination
+    // argument rests on the cores being able to take and acknowledge the IPI,
+    // and proving it before any user task exists keeps a later wedge
+    // unambiguous. Single core notes and skips rather than failing.
+    crate::shootdown::smoke_test(t);
     usermode::smp_parallel_test(t);
 
     lapic::start_timer();

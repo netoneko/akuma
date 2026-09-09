@@ -420,6 +420,21 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
         }
     }
 
+    // The two arms below service the fault, and servicing it can **flush** —
+    // a CoW break rewrites a live PTE and `akuma_mmu`'s `AllCores` flush then
+    // broadcasts a shootdown IPI whose acknowledgement wait assumes every
+    // sender holds the BKL (the deadlock argument on `set_shootdown_hooks` in
+    // `akuma-mmu`: the BKL is outermost, so no peer can be IRQ-masked on a
+    // lock the sender holds). A fault from ring 3 arrives without the BKL, so
+    // take it for the servicing window and drop it after — the same bracket
+    // the syscall path runs its own memory syscalls under. A fault from ring
+    // 0 already holds it; `enter_kernel` is reentrant by owner core and this
+    // leaves the hold alone.
+    let took_bkl = !crate::smp::bkl_held();
+    if took_bkl {
+        crate::smp::bkl_enter();
+    }
+
     // Demand paging for ring 3, from the per-address-space region table
     // (`mm::fault_in`). A not-present fault inside a mapping this process has
     // been given gets a zeroed frame at the region's own protection; anything
@@ -438,6 +453,9 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
     // *populated* before anyone can ask whether it is shared.
     if code.not_present() && crate::mm::fault_in(addr) {
         USER_DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+        if took_bkl {
+            crate::smp::bkl_leave();
+        }
         return;
     }
 
@@ -458,7 +476,14 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
     // Both halves are fixed together; `akuma_user_access`'s `CR0_WP` has the
     // measurement.
     if code.is_write_to_present_page() && cow_write_fault(addr) {
+        if took_bkl {
+            crate::smp::bkl_leave();
+        }
         return;
+    }
+
+    if took_bkl {
+        crate::smp::bkl_leave();
     }
 
     if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {

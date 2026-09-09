@@ -53,13 +53,10 @@
 //!
 //! # What is deliberately missing
 //!
-//! - **No TLB shootdown.** `invlpg` is core-local. It is complete here because
-//!   an address space is only ever active on the core running its one task
-//!   (processes are single-threaded — no `CLONE_VM`), and every switch between
-//!   different roots writes `CR3`, which flushes. Kernel-half mappings change
-//!   only at boot, before any AP runs. Both are properties of today's kernel,
-//!   not guarantees: the first `clone(CLONE_VM)` needs an IPI.
 //! - **No wake IPI.** A core in `hlt` learns of new work at its next timer tick.
+//!   (TLB shootdown is *not* on this list any more: `shootdown.rs` broadcasts
+//!   vector 33 through the LAPIC and `akuma_mmu::flush_tlb_*`'s `AllCores` arms
+//!   wait for the acknowledgements — same plumbing, wired 2026-09-09.)
 //! - **No kernel-mode preemption.** The tick preempts ring 3 and the idle loop;
 //!   a kernel task yields when it chooses (see `sched::preempt_if_needed` for
 //!   why the old behaviour was a latent deadlock, not a feature).
@@ -255,6 +252,14 @@ pub fn online_cpus() -> usize {
 #[must_use]
 pub fn ticks_on(idx: usize) -> u64 {
     PERCPU.get(idx).map_or(0, |c| c.ticks.load(Ordering::Relaxed))
+}
+
+/// Core `idx`'s LAPIC id — the destination a shootdown IPI to that core is
+/// addressed with. 0 for an index that never came up; a caller only asks for
+/// indices below `online_cpus()`, which the bring-up filled in.
+#[must_use]
+pub fn lapic_id_of(idx: usize) -> u32 {
+    PERCPU.get(idx).map_or(0, |c| c.lapic_id.load(Ordering::Relaxed))
 }
 
 /// Count one timer tick on this core. Called from the timer vector.

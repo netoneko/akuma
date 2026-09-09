@@ -137,6 +137,21 @@ fn write(offset: usize, val: u32) {
     unsafe { reg_ptr(offset).write_volatile(val) };
 }
 
+/// Send a fixed delivery-mode IPI (delivery mode 000, level clear, edge) with
+/// `vector` in bits 7:0 to one core. This is the TLB shootdown's transport;
+/// INIT/STARTUP above are the same ICR with different mode bits.
+pub fn send_fixed(dest_apic_id: u32, vector: u8) {
+    send_ipi(dest_apic_id, u32::from(vector));
+}
+
+/// Has [`init`] mapped and enabled this core's LAPIC? A shootdown broadcast
+/// before this would write the ICR through a null base; the sender-side hook
+/// consults this and degrades to a core-local flush instead.
+#[must_use]
+pub fn ready() -> bool {
+    LAPIC_BASE.load(Ordering::Relaxed) != 0
+}
+
 /// Signal end-of-interrupt. Every handler for a LAPIC-delivered vector must do
 /// this before returning, or the LAPIC will not deliver that priority again.
 pub fn eoi() {
@@ -265,6 +280,10 @@ pub fn init() -> bool {
     write(REG_SVR, (1 << 8) | u32::from(SPURIOUS_VECTOR));
 
     idt::set_handler(TIMER_VECTOR, idt::timer_interrupt_entry());
+    // The shootdown vector rides on the same shared IDT; registering it here
+    // puts it on both boot protocols (PVH and multiboot2 both reach `init`),
+    // which is the trap `install_shared_sinks` exists for.
+    crate::shootdown::install();
     crate::smp::set_bsp_lapic_id(read(REG_ID) >> 24);
 
     // Before the timer is armed for real: `calibrate` borrows it (masked,

@@ -757,18 +757,40 @@ pub enum TlbTarget {
 /// the `dsb ish` + `isb` pair this crate always emitted right after the
 /// `tlbi`; moving it into `Drop` costs nothing (the token is a drop-in
 /// replacement for a call that used to be inline in the same statement) and
-/// gives a future non-broadcast target — an IPI-based shootdown, should one
-/// ever be built — one place to wait for acknowledgement instead of a second
-/// vocabulary bolted on beside this one. See `akuma-psci`'s call functions for
-/// the same reasoning applied to a different silently-droppable return.
+/// gives a non-broadcast target — the x86 IPI-based shootdown — one place to
+/// wait for acknowledgement instead of a second vocabulary bolted on beside
+/// this one. See `akuma-psci`'s call functions for the same reasoning applied
+/// to a different silently-droppable return.
+///
+/// The second field is x86-only and records that this flush **broadcast a
+/// shootdown IPI**: `Drop` then waits for every peer's acknowledgement. The
+/// field does not exist on AArch64 (which broadcasts in the instruction) or on
+/// host builds, so their layout and codegen are unchanged.
 #[must_use = "a TLB invalidation is not complete until this token is dropped"]
-pub struct TlbFlush(bool);
+pub struct TlbFlush(
+    bool,
+    /// A peer IPI was sent; `Drop` must wait for the acknowledgements.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    bool,
+);
 
 impl TlbFlush {
     /// A real invalidation was issued; drop this at the point completion is needed.
     #[inline(always)]
     fn pending() -> Self {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        return Self(true, false);
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         Self(true)
+    }
+
+    /// A real invalidation was issued **and** a shootdown IPI was broadcast to
+    /// the peers; `Drop` waits for the acknowledgements. x86-only: every other
+    /// target's `AllCores` flush is complete when the instruction retires.
+    #[inline(always)]
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    fn pending_remote() -> Self {
+        Self(true, true)
     }
 
     /// Nothing was invalidated (e.g. a zero-length range) — `Drop` is a no-op.
@@ -776,6 +798,9 @@ impl TlbFlush {
     /// without buying a barrier pair they don't need.
     #[inline(always)]
     fn done() -> Self {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        return Self(false, false);
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         Self(false)
     }
 }
@@ -788,9 +813,93 @@ impl Drop for TlbFlush {
             akuma_cpu::barrier::dsb_ish();
             akuma_cpu::barrier::isb();
         }
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        if self.1 {
+            shootdown_wait_remote();
+        }
+        #[cfg(not(any(
+            all(target_os = "none", target_arch = "aarch64"),
+            all(target_os = "none", target_arch = "x86_64"),
+        )))]
         let _ = self.0;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The x86 shootdown seam.
+//
+// This crate is shared with the AArch64 kernel and cannot name the amd64
+// kernel's LAPIC, so the IPI send and the acknowledgement wait arrive here as
+// registered hooks — the same shape `akuma_primitives::{console,rng,clock}`
+// use. The amd64 kernel registers both in `boot::install_shared_sinks`, which
+// runs on **both** boot protocols (PVH and multiboot2); before that, and on a
+// one-core machine, the hooks are absent and `AllCores` degrades to the
+// core-local flush it always was.
+//
+// **The deadlock argument, which is why send and wait are separate steps.**
+// Every flush sender holds the BKL (all flush call sites are kernel code, and
+// on this target kernel code holds `akuma_bkl`'s lock; the fault path takes it
+// for exactly this reason). The BKL is the outermost lock, so while the sender
+// waits, no peer can be inside kernel code holding any other lock: a peer is
+// in ring 3 (interrupts on), `hlt` (interrupts on), an interrupt handler
+// (bounded, and the handlers take no lock), or spinning IRQ-masked in the BKL
+// ticket wait itself — which is precisely the one state that cannot make
+// progress, and why `akuma_bkl`'s acquire loop services pending shootdowns
+// inline. With those covered, every peer reaches the IPI and acknowledges; the
+// wait is bounded. A peer IRQ-masked on the *address-space* lock cannot
+// happen: taking that lock requires the BKL the sender holds.
+// ---------------------------------------------------------------------------
+
+/// Broadcast a shootdown to every peer that could hold a stale translation.
+/// Returns whether any peer was contacted (and therefore whether
+/// [`shootdown_wait_remote`] must be called when the flush completes).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+type ShootdownSend = fn() -> bool;
+
+/// Wait until every peer contacted by the matching send has acknowledged.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+type ShootdownWait = fn();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static SHOOTDOWN_SEND: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static SHOOTDOWN_WAIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the x86 shootdown hooks. Called once by the kernel, from **both**
+/// boot protocols, before any user task exists. Until then — and on a
+/// one-core machine, forever — `TlbTarget::AllCores` is core-local.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn set_shootdown_hooks(send: ShootdownSend, wait: ShootdownWait) {
+    SHOOTDOWN_SEND.store(send as usize, core::sync::atomic::Ordering::Release);
+    SHOOTDOWN_WAIT.store(wait as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Broadcast if the kernel armed the hooks; `true` means peers were IPI'd.
+#[inline]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn shootdown_send_if_armed() -> bool {
+    let send = SHOOTDOWN_SEND.load(core::sync::atomic::Ordering::Acquire);
+    if send == 0 {
+        return false;
+    }
+    // SAFETY: the value was stored from a `fn() -> bool` by `set_shootdown_hooks`
+    // and is never written again.
+    let send = unsafe { core::mem::transmute::<usize, ShootdownSend>(send) };
+    send()
+}
+
+/// Wait for the acknowledgements of the last broadcast. A no-op until the
+/// kernel arms the hooks (nothing was ever sent to wait for).
+#[inline]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn shootdown_wait_remote() {
+    let wait = SHOOTDOWN_WAIT.load(core::sync::atomic::Ordering::Acquire);
+    if wait == 0 {
+        return;
+    }
+    // SAFETY: as `shootdown_send_if_armed`.
+    let wait = unsafe { core::mem::transmute::<usize, ShootdownWait>(wait) };
+    wait();
 }
 
 // Real shared-kernel SMP: TLB maintenance that affects a shared/user address space must
@@ -817,15 +926,21 @@ pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
 }
 
 // x86_64 has no broadcast invalidation instruction (`REDUCING_PLATFORM_DEPENDENCY.md`
-// §3), so there is no `kernel_smp_shared` split to make here — a full `CR3` reload
-// is the only "flush everywhere this core knows about" this target has, and it is
-// what `invlpg`-per-page would degrade to past a threshold anyway (see
-// `flush_tlb_range_all_asid`'s `FULL_FLUSH_THRESHOLD`).
+// §3), so `AllCores` is *two* steps: the core-local `CR3` reload here, and a
+// shootdown IPI to every peer (`set_shootdown_hooks`) whose acknowledgement the
+// returned token's `Drop` waits for. Before the hooks are armed — early boot,
+// host builds — and on a one-core machine, the IPI half is absent and this is
+// the core-local flush it always was. It is what `invlpg`-per-page would
+// degrade to past a threshold anyway (see `flush_tlb_range_all_asid`'s
+// `FULL_FLUSH_THRESHOLD`).
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
+pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
     // SAFETY: reloading the CR3 already active changes no mapping — it only
     // forces every non-global TLB entry to be re-walked.
     unsafe { x86_write_cr3(x86_read_cr3()) };
+    if target == TlbTarget::AllCores && shootdown_send_if_armed() {
+        return TlbFlush::pending_remote();
+    }
     TlbFlush::pending()
 }
 
@@ -904,9 +1019,17 @@ pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
+// Same two-step shape as `flush_tlb_all`: the core-local `invlpg` here, and
+// one shootdown IPI (a full flush is a correct superset of a single-page one)
+// whose acknowledgement `Drop` waits for, when the caller asked for all cores
+// and the kernel armed the hooks. This is the CoW-fork demote's and the CoW
+// break's flush — the path `cowstale` measures.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
+pub fn flush_tlb_page(va: usize, target: TlbTarget) -> TlbFlush {
     akuma_cpu::tlb::invlpg(va);
+    if target == TlbTarget::AllCores && shootdown_send_if_armed() {
+        return TlbFlush::pending_remote();
+    }
     TlbFlush::pending()
 }
 
@@ -3181,6 +3304,11 @@ fn x86_walk_leaves(
 ) -> usize {
     let mut va = start & !(PAGE_SIZE - 1);
     let mut seen = 0usize;
+    // Whether any leaf was actually edited. The per-leaf `invlpg` in the arms
+    // below is core-local — it cannot reach a peer running this address
+    // space — so one ranged shootdown covers the whole walk when it edited
+    // anything (see `flush_tlb_range_all_asid`'s x86 arm).
+    let mut edited = false;
     while va < end {
         // SAFETY: every table is reached through the physmap; `root` is a live
         // PML4 and each descent is guarded by the entry's present bit.
@@ -3220,6 +3348,7 @@ fn x86_walk_leaves(
                         LeafAction::Unmap => {
                             slot.write_volatile(0);
                             akuma_cpu::tlb::invlpg(va);
+                            edited = true;
                         }
                         LeafAction::Reprotect(prot, cow) => {
                             let rewritten = (entry & X86_ADDR_MASK)
@@ -3227,6 +3356,7 @@ fn x86_walk_leaves(
                                 | if cow { X86_COW } else { 0 };
                             slot.write_volatile(rewritten);
                             akuma_cpu::tlb::invlpg(va);
+                            edited = true;
                         }
                         LeafAction::Remap(pa, prot, cow) => {
                             let rewritten = (pa as u64 & X86_ADDR_MASK)
@@ -3234,6 +3364,7 @@ fn x86_walk_leaves(
                                 | if cow { X86_COW } else { 0 };
                             slot.write_volatile(rewritten);
                             akuma_cpu::tlb::invlpg(va);
+                            edited = true;
                         }
                     }
                 }
@@ -3247,6 +3378,15 @@ fn x86_walk_leaves(
             Some(next) => va = next,
             None => break,
         }
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    if edited {
+        // One broadcast for the whole walk, not one per edited leaf. `start`
+        // is aligned down to the page it begins inside; the pages count
+        // covers the whole range the walk actually visited.
+        let first = start & !(PAGE_SIZE - 1);
+        let pages = (end - first).div_ceil(PAGE_SIZE);
+        let _ = flush_tlb_range_all_asid(first, pages, TlbTarget::AllCores);
     }
     seen
 }
@@ -4330,6 +4470,30 @@ pub fn flush_tlb_range(start_va: usize, pages: usize, target: TlbTarget) -> TlbF
 /// calls to avoid O(pages) barrier sequences during a large `munmap`/teardown.
 /// See docs/COW_OPTIMIZATIONS.md (cheap-win E).
 #[inline]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize, target: TlbTarget) -> TlbFlush {
+    const FULL_FLUSH_THRESHOLD: usize = 512;
+    if pages == 0 {
+        return TlbFlush::done();
+    }
+    if pages > FULL_FLUSH_THRESHOLD {
+        return flush_tlb_all(target);
+    }
+    let mut va = start_va;
+    for _ in 0..pages {
+        akuma_cpu::tlb::invlpg(va);
+        va += 0x1000;
+    }
+    // One IPI for the whole range: the peer's payload is "full flush", a
+    // correct superset of per-VA invalidations, so the number of pages does
+    // not change the number of interrupts the peers service.
+    if target == TlbTarget::AllCores && shootdown_send_if_armed() {
+        return TlbFlush::pending_remote();
+    }
+    TlbFlush::pending()
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize, target: TlbTarget) -> TlbFlush {
     // Above this many pages, one full-TLB flush (a single `tlbi vmalle1`) is
     // cheaper than issuing `tlbi` per page — the same trade-off Linux makes via

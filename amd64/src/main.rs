@@ -123,6 +123,8 @@ mod serial;
 #[cfg(target_arch = "x86_64")]
 mod smp;
 #[cfg(target_arch = "x86_64")]
+mod shootdown;
+#[cfg(target_arch = "x86_64")]
 mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
 mod thread;

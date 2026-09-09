@@ -408,8 +408,9 @@ fn read_cr3() -> u64 {
 /// item 3: `invlpg` is *core-local*, where AArch64's `tlbi ...is` broadcasts to
 /// the inner-shareable domain. On x86 a multi-core kernel must send an IPI to
 /// every other core that could hold the translation — there is no broadcast
-/// form. Single-core here, so this is complete; it will not stay that way, and
-/// item 3's `TlbTarget` is the vocabulary that would make the difference sayable.
+/// form. This file's own walker edits only the kernel's boot-time tables, so
+/// core-local is complete here; user address spaces go through
+/// `akuma_mmu::flush_tlb_*`, which owns the shootdown IPI.
 fn invlpg(va: usize) {
     // SAFETY: invalidation forces a re-walk; it cannot grant access, and it
     // does not dereference `va`.

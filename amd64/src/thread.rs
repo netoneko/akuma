@@ -38,10 +38,10 @@
 //! [`sys_clone_thread`] never constructs a `Process` and never calls
 //! `fork_from`. It reuses the parent's `space_root` as an opaque number.
 //!
-//! That also means threads inherit the target's `invlpg`-has-no-shootdown
-//! limit for free rather than adding to it: nothing here demotes a PTE, so
-//! there is no stale-translation window to shoot down. **CoW `fork` is still
-//! SMP=1 only** (`AKUMA_AMD64_COW.md`); threads do not change that either way.
+//! Nothing here demotes a PTE, so there is no stale-translation window of its
+//! own to shoot down — and since 2026-09-09 the target has a shootdown anyway
+//! (`shootdown.rs`), so CoW `fork` is no longer SMP=1 only either
+//! (`AKUMA_AMD64_COW.md`).
 //!
 //! # The lifetime rule
 //!

@@ -593,6 +593,20 @@ as they stand one day after the survey
 > **So C1's remaining work is two independent pieces, neither of them "5c":**
 > the **ring-3 entry seam** (unblocks `fork`, then `clone`), and **C2** (`fd.rs`
 > into glue, which unblocks `Spawn`'s four stdio fields and with them `wait4`).
+> Both have hand-off prompts: `proposals/NEXT_AGENT_AMD64_C2_FD.md`, and — ahead
+> of either, because it is what makes `fork` work at `SMP>1` at all —
+> `proposals/NEXT_AGENT_AMD64_TLB_SHOOTDOWN.md`.
+>
+> **A third thing came out of writing those, and it is not in this chart:** the
+> two comments authorising the absence of a TLB shootdown both state
+> "processes are single-threaded — no `CLONE_VM`" / "single-core here", and
+> `clone(CLONE_VM)` landed 2026-09-06. On x86 `flush_tlb_all` **ignores**
+> `TlbTarget` and reloads `CR3` on the calling core, and
+> `flush_tlb_range_all_asid` emits **nothing at all** below 512 pages (its
+> per-page `akuma_cpu::tlb::vaae1*` calls are AArch64-only bodies). The second
+> is latent — its only callers are `akuma-syscalls-glue::mem`, which this target
+> does not dispatch yet — which makes it a **deadline**: fold the mem arms
+> before the shootdown exists and the fold installs a silent no-op flush.
 
 Measurements as of 2026-09-07:
 

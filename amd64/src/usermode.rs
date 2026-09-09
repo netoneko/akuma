@@ -2272,10 +2272,13 @@ impl Image {
                 //
                 // The parent's own PTE is rewritten by the `Reprotect` returned
                 // below, in its live address space, and the walk issues the
-                // `invlpg`. At SMP>1 another core could hold a stale writable
-                // translation and this would need a shootdown, which this
-                // target does not have (`smp.rs`: `invlpg` is core-local) —
-                // hence CoW is SMP=1 only for now.
+                // `invlpg` plus the shootdown IPI (`TlbFlush::drop` waits for
+                // the peers' acknowledgements), so a peer holding a stale
+                // writable translation has it invalidated before `fork`
+                // returns. The deadlock argument is on `set_shootdown_hooks`
+                // in `akuma-mmu`: the sender holds the BKL, and the one
+                // IRQ-masked state a peer can be stranded in — the BKL ticket
+                // wait — services shootdowns inline.
                 let demoted = PteProt { write: false, ..leaf.prot };
                 akuma_pmm::cow_ref_inc(frame.addr);
                 space.track_user_frame(frame);
@@ -3483,10 +3486,12 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 /// so almost nothing is ever copied. Measured 2026-09-06: 2000 forks, zero
 /// memory drift, constant time — the eager copy this replaced died at ~500.
 ///
-/// **SMP=1 only, by construction.** The share pass demotes the *parent's* live
-/// PTEs, and `invlpg` is core-local with no shootdown on this target
-/// (`smp.rs`), so at SMP>1 another core could hold a stale writable
-/// translation. See `docs/archive/AKUMA_AMD64_COW.md`.
+/// **SMP-safe as of 2026-09-09.** The share pass demotes the *parent's* live
+/// PTEs, and that demote's flush (`x86_walk_leaves`'s ranged shootdown)
+/// invalidates every peer's stale writable translation before `fork` returns —
+/// which is what makes `cowstale` deterministic at `SMP=4`. Until then this was
+/// SMP=1 by construction: `invlpg` is core-local and there was no shootdown
+/// (`smp.rs`). See `docs/archive/AKUMA_AMD64_COW.md`.
 ///
 /// Returns the child pid in the parent; the child never returns from here.
 fn sys_fork() -> u64 {

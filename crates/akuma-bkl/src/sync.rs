@@ -491,6 +491,41 @@ impl Default for KernelLock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The x86 TLB-shootdown spin assist.
+//
+// A core spinning IRQ-masked in the ticket wait below cannot take a TLB
+// shootdown IPI — and on amd64 the sender of that IPI is holding the very BKL
+// this core waits for, so "wait for the interrupt" never terminates. The
+// sender therefore publishes the request in a per-CPU mailbox *before* sending,
+// and this wait loop services it inline: flush, acknowledge, keep spinning.
+// The hook is registered by the kernel (`shootdown::bkl_spin_assist`); when it
+// is absent — AArch64, which broadcasts in the `tlbi` instruction; host tests;
+// early boot — the call is compiled out and this loop is exactly what it was.
+// See `akuma_mmu::set_shootdown_hooks` for the full deadlock argument.
+// ---------------------------------------------------------------------------
+
+/// The registered assist, if any. `set_spin_assist` stores it once, at boot.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static SPIN_ASSIST: akuma_primitives::OnceCopy<fn()> = akuma_primitives::OnceCopy::new();
+
+/// Register the IRQ-masked-spin assist. x86 bare-metal only; called once,
+/// before any AP exists.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn set_spin_assist(f: fn()) {
+    SPIN_ASSIST.set(f);
+}
+
+/// Run the assist if one is armed. Inline in the wait loop on purpose: the
+/// common case is "nothing pending", one load.
+#[inline]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn spin_assist() {
+    if let Some(f) = SPIN_ASSIST.get() {
+        f();
+    }
+}
+
 impl KernelLock {
     /// A free lock.
     pub const fn new() -> Self {
@@ -512,6 +547,11 @@ impl KernelLock {
     /// nested exception frame → self-deadlock. Masking makes the per-core wait atomic; IRQs
     /// are restored to their prior state once we own the lock. On the IRQ/eret paths IRQs
     /// are already masked, so the mask/restore is a no-op there.
+    ///
+    /// While masked this core also cannot take a TLB shootdown IPI — the x86
+    /// wait loop services those through `spin_assist` above, which is what
+    /// keeps the shootdown sender's acknowledgement wait (see `akuma-mmu`)
+    /// bounded while this core spins here.
     #[inline]
     pub fn acquire(&self, core_id: u32) {
         let me = core_id + 1;
@@ -641,6 +681,8 @@ impl KernelLock {
                 spins = 0;
                 log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);
             }
+            #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+            spin_assist();
             core::hint::spin_loop();
         }
         // Accumulate this acquire's spin count once (a cross-core BKL-wait-time proxy; see
