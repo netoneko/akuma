@@ -2355,7 +2355,12 @@ impl Image {
 /// than defaulting: "no process" and "a process with no regions" are different
 /// answers and only the second one may be served.
 #[inline]
-fn current_process() -> Option<&'static akuma_exec::process::Process> {
+/// The registered `Process` behind the running task, if any.
+///
+/// `pub` since C2 slice 4: `fd.rs` resolves the registered `SharedFdTable`
+/// through it (its `shared_table()`), the same accessor the fork path uses to
+/// build the child's copy.
+pub fn current_process() -> Option<&'static akuma_exec::process::Process> {
     akuma_exec::process::current_thread_own_process().map(|(_pid, p)| p)
 }
 
@@ -3648,10 +3653,15 @@ fn sys_fork() -> u64 {
         // `sh`s.
         &parent_cmdline,
         // C2 slice 3: the child's *registered* fd table is a real copy of the
-        // parent's, the crate-side twin of `inherit_fds` above (which copies
-        // the legacy `FDS` row). Innocent while every table holds only stdio;
-        // see `register_exec_process` for the hook obligation this incurs.
-        Some(alloc::sync::Arc::new(parent.fds.clone_deep_for_fork())),
+        // parent's — the crate-side twin of `inherit_fds` above, which copies
+        // the legacy `FDS` row. `fork_table_mirror`, not
+        // `clone_deep_for_fork`: while `FILES` owns the refcounts the mirror
+        // must copy without bumping, or every forked pipeline double-bumps
+        // its pipes and the write end never reaches zero (found by the
+        // suite's `redirect` test, first boot of slice 4).
+        Some(alloc::sync::Arc::new(crate::fd::fork_table_mirror(
+            &parent.fds,
+        ))),
     );
 
     // SAFETY: raw-pointer write; single core.

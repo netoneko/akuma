@@ -378,8 +378,20 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_SETFD: u64 = 2;
     const F_GETFD: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
+    const FD_CLOEXEC: u64 = 1;
 
-    with_file(fd, |entry| match cmd {
+    // Legacy authority for F_GETFL/F_SETFL: `Entry.nonblocking` is what the
+    // socket layer reads. The registered table's `nonblock` set is kept in
+    // lockstep so slice 5 cannot inherit a disagreement.
+    let with_table = |f: &dyn Fn(
+        &akuma_exec::process::SharedFdTable,
+    ) -> u64|
+     -> Option<u64> {
+        shared_table().map(|t| f(&t))
+    };
+
+    // Legacy resolution first: EBADF for anything the row does not name.
+    let result = with_file(fd, |entry| match cmd {
         F_SETFL => {
             entry.nonblocking = arg & O_NONBLOCK != 0;
             0
@@ -391,19 +403,50 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 0
             }
         }
-        // **`FD_CLOEXEC` is accepted and ignored — a pinned divergence.** It
-        // used to be "meaningless without exec", and that stopped being true
-        // when this target grew a real `execve`: a descriptor a caller marked
-        // close-on-exec now survives one. Nothing here has been bitten by it
-        // yet because the flag is set defensively far more often than it is
-        // relied on, and the honest fix is a per-descriptor flag word in the
-        // row next to the `FileIdx` — cheap, but it belongs with the work that
-        // makes 0/1/2 real entries rather than bolted on ahead of it.
-        F_SETFD => 0,
-        F_GETFD => 0,
+        // **`FD_CLOEXEC` is stored in the registered table's `cloexec` set**
+        // and read back by `F_GETFD` — but it still does not *do* anything:
+        // this target's `execve` sweeps fds through its own path and does not
+        // consult the set yet. That is the same "accepted, not enforced" shape
+        // as before this slice, with the storage now where slice 5's exec
+        // sweep will look. A descriptor marked close-on-exec still survives
+        // one; the divergence stays pinned until that sweep folds.
+        F_SETFD => {
+            let flag = arg & FD_CLOEXEC != 0;
+            with_table(&|t| {
+                if flag {
+                    t.cloexec.lock().insert(fd as u32);
+                } else {
+                    t.cloexec.lock().remove(&(fd as u32));
+                }
+                0
+            })
+            .unwrap_or(0)
+        }
+        F_GETFD => with_table(&|t| {
+            if t.cloexec.lock().contains(&(fd as u32)) {
+                FD_CLOEXEC
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0),
         _ => errno::EINVAL,
     })
-    .unwrap_or(errno::EBADF)
+    .unwrap_or(errno::EBADF);
+
+    // C2 slice 4: F_SETFL's nonblock half mirrors even though the legacy
+    // answer already carried it — the table's set must not lag.
+    if result == 0 && cmd == F_SETFL {
+        let nb = arg & O_NONBLOCK != 0;
+        if let Some(table) = shared_table() {
+            if nb {
+                table.nonblock.lock().insert(fd as u32);
+            } else {
+                table.nonblock.lock().remove(&(fd as u32));
+            }
+        }
+    }
+    result
 }
 
 /// Copy `len` bytes in from a user pointer. Public for `sock`.
@@ -523,9 +566,83 @@ fn intern(entry: Entry) -> Option<usize> {
     None
 }
 
-/// Name the description `fi` with the lowest free descriptor in `row`,
-/// **starting at [`FIRST_FILE_FD`]**.
+/// The calling process's registered `SharedFdTable` — **C2 slice 4's mirror**.
 ///
+/// From this slice every file, pipe and socket description this module interns
+/// is *also* inserted there under the same descriptor number, and every leaf
+/// operation (`dup`, `dup2`, `close`, `lseek`, `fcntl`) keeps the two in
+/// lockstep. [`FILES`] stays the authority for the data path (`read`/`write`
+/// and the cached contents) until C2 slice 5; the table is authoritative for
+/// nothing yet, which is what makes this slice reversible.
+///
+/// `None` means "no registered process" — the kernel row during the boot
+/// self-tests' setup. Everything below falls back to legacy-only there, which
+/// is byte-for-byte the pre-slice behaviour.
+fn shared_table() -> Option<alloc::sync::Arc<akuma_exec::process::SharedFdTable>> {
+    crate::usermode::current_process().map(|p| p.fds.clone())
+}
+
+/// The `FileDescriptor` a `FILES` entry mirrors as.
+///
+/// Deliberately narrow: only the variants this table actually interns. A
+/// `KernelFile` clones by value (`dir_cache` and all — the table's copy is
+/// slice 5's starting point, and its `position` is synced by `sys_lseek` until
+/// then). The mirror owns **no references**: `clone_fd_refs` is never called
+/// on these, and the pipe/socket refcounts stay with [`FILES`] alone — the
+/// day the authority flips (slice 5/6), the ref bumps move with it, explicitly
+/// and in one slice, not by half-owning them here.
+fn mirror_desc(entry: &Entry) -> Option<FileDescriptor> {
+    Some(match &entry.desc {
+        FileDescriptor::File(f) => FileDescriptor::File(f.clone()),
+        FileDescriptor::PipeRead(id) => FileDescriptor::PipeRead(*id),
+        FileDescriptor::PipeWrite(id) => FileDescriptor::PipeWrite(*id),
+        FileDescriptor::Socket(s) => FileDescriptor::Socket(*s),
+        _ => return None,
+    })
+}
+
+/// Insert (or overwrite) `fd`'s mirror from the description `fi`.
+fn table_insert(fd: u64, fi: usize) {
+    let Some(table) = shared_table() else { return };
+    let desc = FILES.lock()[fi].as_ref().and_then(mirror_desc);
+    if let Some(desc) = desc {
+        table.table.lock().insert(fd as u32, desc);
+    }
+}
+
+/// Drop `fd`'s mirror, if any.
+fn table_remove(fd: u64) {
+    if let Some(table) = shared_table() {
+        table.table.lock().remove(&(fd as u32));
+    }
+}
+
+/// The fork half of the mirror: a copy of `parent`'s table with **no
+/// reference bumps** — `clone_deep_for_fork` is deliberately not used here.
+///
+/// Every entry in the table while [`FILES`] is the refcount authority is a
+/// *mirror*: it names a description whose refs live in `FILES`, and
+/// `inherit_fds` (the legacy fork half) has already bumped each of them once.
+/// Running `clone_deep_for_fork`'s `clone_fd_refs` on top double-bumps every
+/// pipe, and `sys_close` releases only the legacy side — the orphaned bump
+/// meant a forked pipeline's write end never reached zero, `yes` blocked
+/// forever, and the suite's `redirect` test failed with a leaked pipe buffer
+/// (found by exactly that test, first boot of this slice).
+///
+/// When slice 5/6 flips refcount authority to the table, the bump moves here
+/// — one slice, explicitly — and this function becomes `clone_deep_for_fork`.
+pub fn fork_table_mirror(
+    parent: &akuma_exec::process::SharedFdTable,
+) -> akuma_exec::process::SharedFdTable {
+    akuma_exec::process::SharedFdTable {
+        table: Spinlock::new(parent.table.lock().clone()),
+        cloexec: Spinlock::new(parent.cloexec.lock().clone()),
+        nonblock: Spinlock::new(parent.nonblock.lock().clone()),
+    }
+}
+
+/// Name the description `fi` with the lowest free descriptor in `row`,
+/// **starting at [`FIRST_FILE_FD`]**.///
 /// **Divergence, pinned.** POSIX's "lowest available" includes 0/1/2, so on
 /// Linux `close(1); open(f)` returns 1. Here it returns 3, because an *unbound*
 /// 0/1/2 is not "free" — it is the console, or a spawned child's pipe, routed
@@ -562,6 +679,8 @@ fn install(entry: Entry) -> u64 {
         FILES.lock()[fi] = None;
         return errno::EMFILE;
     };
+    // C2 slice 4: the registered table sees every descriptor from birth.
+    table_insert(fd, fi);
     fd
 }
 
@@ -1122,6 +1241,7 @@ pub fn sys_dup(fd: u64) -> u64 {
     if let Some(entry) = FILES.lock()[fi].as_mut() {
         entry.refs = entry.refs.saturating_add(1);
     }
+    table_insert(newfd, fi);
     newfd
 }
 
@@ -1176,6 +1296,9 @@ fn dup_onto(oldfd: u64, newfd: u64, strict_same: bool) -> u64 {
     if displaced != NO_FILE {
         unref(displaced as usize);
     }
+    // C2 slice 4: the insert overwrites whatever mirrored the displaced
+    // description — the table is a name map, and `newfd` now names `fi`.
+    table_insert(newfd, fi);
     newfd
 }
 
@@ -1243,6 +1366,11 @@ pub fn sys_close(fd: u64) -> u64 {
     // `sh` does `dup2(f,1); close(f)` and later `close(1)`, and that last close
     // has to reach the file or its buffered contents are never persisted.
     if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+        // C2 slice 4: an unbound 0/1/2 may still sit in the registered table
+        // as a `Stdin`/`Stdout`/`Stderr` entry — dropping it here is what lets
+        // `dup2` land a real description there later, exactly as closing any
+        // other descriptor frees its number.
+        table_remove(fd);
         return 0;
     }
     // Unbind the *name* first, then drop the reference. Only the last name
@@ -1260,6 +1388,7 @@ pub fn sys_close(fd: u64) -> u64 {
         core::mem::replace(slot, NO_FILE)
     };
     unref(fi as usize);
+    table_remove(fd);
     0
 }
 
@@ -1764,6 +1893,14 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     }
     // Seeking past the end is legal; reading there returns 0.
     file.position = target as usize;
+    // C2 slice 4: the mirror's cursor moves with it, so slice 5 cannot inherit
+    // a stale one the day the table becomes authoritative.
+    if let Some(table) = shared_table() {
+        let mut fds = table.table.lock();
+        if let Some(FileDescriptor::File(f)) = fds.get_mut(&(fd as u32)) {
+            f.position = target as usize;
+        }
+    }
     file.position as u64
 }
 

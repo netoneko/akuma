@@ -161,9 +161,20 @@ fn runtime() -> ExecRuntime {
         remove_socket: |_| not_wired!("remove_socket", "C2: fd.rs folds into glue"),
         socket_clone_ref: |_| not_wired!("socket_clone_ref", "C2: fd.rs folds into glue"),
         rump_socket_clone_ref: |_, _| not_wired!("rump_socket_clone_ref", "rump is not built for this target"),
-        pipe_close_write: |_| not_wired!("pipe_close_write", "C2: fd.rs folds into glue"),
-        pipe_close_read: |_| not_wired!("pipe_close_read", "C2: fd.rs folds into glue"),
-        pipe_clone_ref: |_, _| not_wired!("pipe_clone_ref", "C2: fd.rs folds into glue"),
+        // ── wired C2 slice 4 ──────────────────────────────────────────────
+        // The pipe hooks. The module header's warning — that mapping an
+        // `ExecRuntime` pipe id onto `crate::pipe` would be "actively wrong" —
+        // described the pre-C2 world, where no `SharedFdTable` on this target
+        // ever carried a pipe. Slice 4 mirrors descriptors into the registered
+        // tables, so `FileDescriptor::PipeRead/PipeWrite` now exist here — and
+        // every one of them carries a `crate::pipe::PipeId`, because
+        // `crate::pipe` is the only pipe allocator this target has. The two
+        // namespaces do not meet; on this target the variant's payload IS a
+        // `crate::pipe` id. (`akuma-pipes`, whose ids these hooks were shaped
+        // by, exists only inside AArch64's kernel.)
+        pipe_close_write: |id| crate::pipe::close_write(id as usize),
+        pipe_close_read: |id| crate::pipe::close_read(id as usize),
+        pipe_clone_ref: |id, is_write| crate::pipe::clone_ref(id as usize, is_write),
         eventfd_close: |_| not_wired!("eventfd_close", "sc-eventfd is not in this target's feature set"),
         eventfd_clone_ref: |_| not_wired!("eventfd_clone_ref", "sc-eventfd is not in this target's feature set"),
         unix_sock_close: |_| not_wired!("unix_sock_close", "AF_UNIX is not built for this target"),
