@@ -682,6 +682,51 @@ C2's seven slices).
 > and it is unblocked: 4a killed the private mount table, 5b supplied
 > `current_process_shared`, and the shootdown lifted the mem-arm deadline.
 
+> **4b's prerequisites landed, and two of the three closed live bugs
+> (2026-09-09)** — `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md`. Found by
+> asking what a folded VFS arm would actually touch, which is how step 1's
+> blocker was found and is now the second time the answer was "a vocabulary":
+>
+> - **`open(2)`'s flag word is permuted between the architectures.** aarch64
+>   Linux keeps the 32-bit ARM fcntl values, so `O_DIRECTORY`↔`O_DIRECT` and
+>   `O_NOFOLLOW`↔`O_LARGEFILE` are *swapped* while every other `O_*` bit is
+>   identical — which is why `fd.rs` claimed in a comment that the two
+>   encodings "happen to share the same numeric encoding" while carrying three
+>   inline `_X86` constants for the ones that do not. Consequence: glue's
+>   deliberate `O_TMPFILE` refusal, which exists because apk-tools 3's probe
+>   once surfaced as `UNTRUSTED signature` over a good download, **does not
+>   fire** on an untranslated x86_64 word. Not a live bug — it arrives, silently,
+>   with the fold. `akuma_syscalls_abi::open_flags` now translates once at the
+>   boundary, with 7 host tests, two of them asserting the defect.
+> - **`fstat` on a directory descriptor answered `EBADF`**, so `fdopendir`
+>   could not open a directory at all; the `S_IFDIR` arm was unreachable
+>   because its discriminator was *synthetic*, not *directory* — which also
+>   meant `/proc/meminfo` was reported as a zero-length directory. Invisible to
+>   busybox, which walks with `opendir(path)` and `lstat`; a self-hosting build
+>   walks with `openat`. Found with a musl probe, because a 538-check suite and
+>   a 30-session ring-3 harness had both had it in front of them.
+> - **Seven sites discarded the filesystem's error** as `Err(_) => EIO`, and
+>   four `*at` calls each carried a partial errno table of their own.
+>   `fs_err_errno` is glue's `fs_error_to_errno` arm for arm now.
+> - `flock_release` stopped being a `not_wired!` panic on the ordinary teardown
+>   path. Nine stubs left, from 16.
+>
+> QEMU/TCG **546/0** (`SMP=1`) and **556/0** (`SMP=4`), ring-3 30/30, memory
+> probes 8/10 with 0 unexpected, host tests 15 in the abi crate — 13 checks
+> added, every one falsified against the code it tests. AArch64 cannot be
+> affected: the diff is `amd64/` plus `akuma-syscalls-abi`, which the root
+> kernel does not depend on.
+>
+> **The flip itself is next and it is a decision, not effort:** `Entry` is down
+> to `{desc, data, nonblocking, refs}`, the mechanical part is 55 touch points
+> in one file, and three questions have to be answered deliberately — where the
+> synthetic `/proc` render lives, that `nonblock` is per fd *number* rather than
+> per description, and that **glue's `dup` gives two descriptors independent
+> file cursors where POSIX shares them, which amd64 currently gets right**. That
+> last one is a tree-wide divergence recorded nowhere; adopting it silently is
+> the thing to avoid. Hand-off:
+> `proposals/NEXT_AGENT_AMD64_4B_VFS_FOLD.md`.
+
 Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate

@@ -70,20 +70,30 @@
 //! only allocators it has. The pipe hooks were wired in slice 4 and the socket
 //! hooks in slice 7, each at its own field with that argument restated.
 //!
-//! **Ten `not_wired!` stubs are left** — it was 16 when the C2 plan was
+//! **Nine `not_wired!` stubs are left** — it was 16 when the C2 plan was
 //! written — and they divide cleanly, each saying which:
 //!
 //! - **not built for this target** — `rump_socket_clone_ref`, `eventfd_*`,
 //!   `unix_sock_*`, `epoll_destroy`, `pidfd_close`. Seven of these, and none
 //!   is C2's business.
-//! - **the subsystem does not exist here** — `flock_release` (nothing
-//!   dispatches `flock(2)`), `resolve_file_id` and `read_at_by_inode` (they
-//!   name a file by `(mount id, inode)`; this target has one filesystem and no
-//!   mount table).
+//! - **the subsystem does not exist here** — `resolve_file_id` and
+//!   `read_at_by_inode`, which name a file by `(mount id, inode)`; this target
+//!   has one filesystem and no mount table.
 //!
-//! None of the ten still says "C2", and that is the point of having gone
+//! None of the nine still says "C2", and that is the point of having gone
 //! through them: a stub whose stated reason is a *step* stops being true when
 //! the step lands, and nothing in the type system notices.
+//!
+//! **`flock_release` left the list 2026-09-09, and not by being implemented.**
+//! Its stated reason — this target dispatches no `flock(2)` — was true, and
+//! that is exactly what made it dangerous: it read like a decision while being
+//! a panic on a path `close_all()` takes for **every `File` entry**. A release
+//! of a lock nothing ever took is a no-op in any implementation; the panic
+//! could only fire on a bug somewhere else, and its effect was to take the
+//! machine down instead of letting that bug be found. The test for category 3
+//! is not "can this be served?" but **"if this fires, is the panic more useful
+//! than the no-op?"** — and for a teardown hook whose operation is vacuous,
+//! it never is.
 
 use akuma_exec::{ExecConfig, ExecRuntime};
 
@@ -220,12 +230,31 @@ fn runtime() -> ExecRuntime {
         unix_sock_clone_ref: |_| not_wired!("unix_sock_clone_ref", "AF_UNIX is not built for this target"),
         epoll_destroy: |_| not_wired!("epoll_destroy", "sc-epoll is not in this target's feature set"),
         pidfd_close: |_| not_wired!("pidfd_close", "sc-pidfd is not in this target's feature set"),
-        // Not `fd.rs` folding any more, and the reason is narrower than it
-        // was: **this target has no `flock`.** `sys_flock` is not dispatched,
-        // nothing takes a lock, so nothing can release one. Reaching here
-        // means a folded arm brought advisory locking with it, and the panic
-        // is the notice.
-        flock_release: |_, _, _| not_wired!("flock_release", "this target dispatches no flock(2)"),
+        // **A stated no-op, not a panic** — and the distinction is the whole
+        // reason this changed.
+        //
+        // The fact is unchanged: this target dispatches no `flock(2)`, nothing
+        // takes an advisory lock, so nothing can release one. What was wrong
+        // was the *shape* of saying so. `SharedFdTable::close_all` fires this
+        // hook for **every `File` entry it pops**, and since C2 slice 4 the
+        // registered tables on this target hold real `File` entries — so the
+        // only thing standing between an ordinary process teardown and a
+        // kernel panic was every exit path remembering `fd::clear_table_mirror`
+        // first. Slice 6 found a path that did not (`sys_spawn`'s
+        // `spawn_process_task` failure, dropping an unregistered `Arc` with
+        // three descriptors in it), and slice 7 wired the socket hooks for
+        // exactly this argument; the `File` arm was left behind because its
+        // stated reason ("no flock here") was true and read like a decision.
+        //
+        // It was not a decision, it was a landmine with a correct label. A
+        // release of a lock that was never taken is a no-op in any
+        // implementation; the panic only ever fired on a bug *elsewhere*, and
+        // took the machine down instead of letting the bug be found.
+        //
+        // This is the last hook `close_all` needs before the refcount
+        // authority can move to the table at all — see
+        // `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md` § "the flip".
+        flock_release: |_path, _holder, _fd| {},
 
         // ── wired C2 slice 7 ──────────────────────────────────────────────
         // The **path-addressed** read. `fs::read_at` is what slice 5 rebuilt

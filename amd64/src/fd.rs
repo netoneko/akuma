@@ -164,8 +164,12 @@ fn fs_err_errno(e: akuma_vfs::FsError) -> u64 {
 /// `strip_prefix("/proc")`, which would also claim a file named `/procfoo`.
 fn path_is_dir(path: &str) -> bool {
     if path == "/proc" || path.starts_with("/proc/") {
+        // [`proc_is_dir`], not [`proc_metadata`]: the latter answers the size
+        // too, and it gets it by **rendering the whole file**. Asking it here
+        // would re-render `/proc/meminfo` on every `fstat` of it purely to
+        // learn that it is not a directory.
         let rest = path.strip_prefix("/proc").unwrap_or("");
-        return proc_metadata(rest).is_some_and(|(_, is_dir)| is_dir);
+        return proc_is_dir(&normalise_proc(rest));
     }
     fs::metadata(path).is_ok_and(|m| m.is_dir)
 }
@@ -4441,6 +4445,7 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     const O_RDWR: u64 = 0o2;
     let etc = b"/etc\0";
     let missing_dir = b"/no-such-dir\0";
+    let reg = b"/bin/busybox\0";
     let dfd = sys_openat(0, etc.as_ptr() as u64, O_DIRECTORY_X86, 0);
     // Untranslated, `0o200000` reads as `O_DIRECT` — a cache hint nothing here
     // implements — so this open succeeds either way. It is here to prove the
@@ -4457,7 +4462,6 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     // and so answered `ENOTDIR` for a path that was simply absent. The
     // negative control is what said so, by returning `ENOENT` from the arm
     // that was meant to be broken.
-    let reg = b"/bin/busybox\0";
     t.check_eq(
         "fd: O_DIRECTORY on a regular file is ENOTDIR",
         sys_openat(0, reg.as_ptr() as u64, O_DIRECTORY_X86, 0),
@@ -4482,6 +4486,56 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         sys_openat(0, etc.as_ptr() as u64, O_RDWR | O_TMPFILE_X86, 0),
         errno::EINVAL,
     );
+
+    // ── a directory descriptor describes itself ──────────────────────────
+    //
+    // `fstat` on one answered **`EBADF`** until the `is_dir` field came off
+    // the entry, so `fdopendir` — which musl builds on exactly this call —
+    // could not open a directory at all. The `S_IFDIR` arm existed and was
+    // unreachable: its discriminator was *synthetic*, not *directory*, so the
+    // only descriptors ever reported as directories were `/proc` views, and
+    // `/proc/meminfo` was reported as a zero-length one.
+    //
+    // busybox never noticed, which is why a 538-check suite and a ring-3
+    // harness both missed it: it walks with `opendir(path)` and `lstat`.
+    // Measured with an x86_64 musl probe (`fdopendir(dirfd) = NULL (Bad file
+    // descriptor)`) before the fix.
+    let dstat = sys_openat(0, etc.as_ptr() as u64, 0, 0);
+    if t.check("fd: a directory opens", dstat >= FIRST_FILE_FD as u64) {
+        let mut st = [0u8; STAT_SIZE];
+        t.check_eq("fd: fstat(dirfd) succeeds", sys_fstat(dstat, st.as_mut_ptr() as u64), 0);
+        // `st_mode` is at offset 24 in the x86_64 `struct stat`.
+        let mode = u32::from_le_bytes(st[24..28].try_into().unwrap_or([0; 4]));
+        t.check_eq(
+            "fd: fstat(dirfd) reports S_IFDIR",
+            u64::from(mode & 0o170_000),
+            0o040_000,
+        );
+        // And the byte path refuses it *by errno*, not by accident: ext2 says
+        // `NotAFile`, `fs_err_errno` says `EISDIR`. The `Err(_) => EIO` this
+        // replaces is what the field's removal briefly turned this into.
+        let mut b = [0u8; 4];
+        t.check_eq(
+            "fd: read(dirfd) is EISDIR",
+            sys_read(dstat, b.as_mut_ptr() as u64, 4),
+            errno::EISDIR,
+        );
+        t.check_eq("fd: closing the dirfd", sys_close(dstat), 0);
+    }
+    // The mirror image, from `fs::list_dir` rather than from a bool: a
+    // `getdents64` on a regular file is `ENOTDIR`. The blanket `ENOENT` that
+    // used to come out of this path was wrong in the way that misdirects —
+    // "no such directory" for a path that plainly exists.
+    let rfd = sys_openat(0, reg.as_ptr() as u64, 0, 0);
+    if t.check("fd: a regular file opens", rfd >= FIRST_FILE_FD as u64) {
+        let mut d = [0u8; 64];
+        t.check_eq(
+            "fd: getdents64 on a regular file is ENOTDIR",
+            sys_getdents64(rfd, d.as_mut_ptr() as u64, 64),
+            errno::ENOTDIR,
+        );
+        t.check_eq("fd: closing it", sys_close(rfd), 0);
+    }
 
     // A missing file, and a path that is not a path.
     let missing = b"/does-not-exist\0";

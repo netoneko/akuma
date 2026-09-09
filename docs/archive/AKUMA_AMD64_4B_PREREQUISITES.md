@@ -1,8 +1,9 @@
 # amd64 C1 step 4b, prerequisites: the open-flag vocabulary
 
 **Date:** 2026-09-09
-**Status:** slice A landed, uncommitted. QEMU/TCG `SMP=1` **538/0**, `SMP=4`
-**548/0**, ring-3 30/30, host tests +7.
+**Status:** slices A, B and C landed, uncommitted. QEMU/TCG `SMP=1` **546/0**,
+`SMP=4` **556/0**, ring-3 30/30, memory probes 8/10 (0 unexpected), host tests
++7.
 **Parent:** `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, the C1 box's `4b` row.
 **Predecessor:** `docs/archive/AKUMA_AMD64_C2_SLICES_6_AND_7.md`.
 
@@ -180,6 +181,204 @@ behaviours, unchanged.
 answers `/bin/sh: can't create /nosuchdir/file: nonexistent directory`, rc 1.
 That is open issue 1 of `AKUMA_SELF_HOSTING_AMD64.md`, reported as `rc 0` and
 silence; C2 slice 5 closed it and nobody had re-run it.
+
+---
+
+## Slice B — the descriptor stops carrying `is_dir`, and two live bugs fall out
+
+`akuma-syscalls-glue` has **no `is_dir` field** on a descriptor. It refuses a
+write open of a directory at `open(2)`, and otherwise lets the VFS answer:
+`read` on a directory reaches ext2, which says `NotAFile`, which its errno table
+maps to `EISDIR`. amd64 carried a bool instead — set by five constructors, read
+by eight sites — so a folded arm would have had nowhere to get it from. The
+crate closes the gap for free; this slice takes the shape.
+
+What replaced it is one function, `path_is_dir`, asked of `proc_is_dir` for a
+`/proc` path and of the VFS for everything else. It is asked on the *cold* paths
+only — `openat` with a real `dirfd`, `fstat`, `mmap`'s regular-file test — and
+the hot paths lost their check entirely, because the guard they had only ever
+fired on the error they now get from the filesystem anyway.
+
+### 1. `fstat` on a directory descriptor answered `EBADF`
+
+The arm opened `if entry.is_dir { return None }`, and `None` there is `EBADF`.
+The `S_IFDIR` arm below it was **unreachable for every ext2 directory**: its
+discriminator was *synthetic*, not *directory*, so the only descriptors ever
+reported as directories were `/proc` views — which meant `/proc/meminfo` was
+reported as a zero-length directory in the same breath.
+
+The consequence is `fdopendir`, which musl builds on exactly this call.
+Measured with an x86_64 musl probe **before** the field was touched, because
+this file's own header claims the opposite in prose ("a directory descriptor
+`S_IFDIR` — musl's `fdopendir` fstats the fd and refuses it with `ENOTDIR`
+unless `S_ISDIR` holds, so `ls`/`find` need this to be right"):
+
+```
+                                       before                          after
+open(/etc, O_DIRECTORY)   3 (ok)                          3 (ok)
+fstat(dirfd)              -1 EBADF   mode=00  S_ISDIR=0   0  mode=040755 S_ISDIR=1
+fdopendir(dirfd)          NULL (Bad file descriptor)      ok — first entry: apk
+```
+
+**busybox never noticed, and that is the interesting half.** It walks with
+`opendir(path)` and `lstat`, so `ls`, `find`, `ls -R` and every ring-3 check
+this target has ever run went through a path that does not ask. `fdopendir` is
+what `nftw` and most `openat`-based directory walkers are built on — the shape a
+self-hosting build reaches for. A 538-check boot suite and a 30-session ring-3
+harness both had this in front of them the whole time.
+
+### 2. Seven call sites threw the filesystem's error away
+
+`Err(_) => return errno::EIO` stood on the `read`/`pread`/`lseek` paths, and
+that is what turned the `is_dir` removal into a *regression* the moment it
+landed: `read` on a directory went `EISDIR` → `EIO`, because ext2's `NotAFile`
+never reached the mapping. Caught by the ring-3 probe on the same run that
+confirmed the `fstat` fix, not by the suite.
+
+`fs_err_errno` is now `akuma-syscalls-glue`'s `fs_error_to_errno` arm for arm —
+eleven variants where it had three and a catch-all. Its old comment defended the
+catch-all:
+
+> inventing eight more errnos nobody distinguishes is not honesty, it is noise
+
+The argument was sound; the premise was not. Half of them are distinguished by
+callers this target already runs — `EISDIR` is how a program learns to call
+`getdents64`, busybox `find` reads `ENOTDIR` to stop descending, `EROFS` says
+the mount is the problem rather than the disk. And `mkdirat`, `unlinkat`,
+`symlinkat` and `utimensat` each carried their **own** two- or three-arm subset
+of the same table ending in `EIO` — the same drift `clone_fd_refs`'s header
+describes on the other side of the tree: several partial copies of one list,
+each correct for the cases its author happened to hit. All four route through
+the one table now.
+
+One divergence from glue's table, deliberate and stated: `NotSupported` is
+`ENOSYS` here and falls to `EIO` there. `utimensat` is the caller that wants it.
+
+### Also fixed, in passing
+
+- `getdents64` on a regular file answered a blanket `ENOENT` — "no such
+  directory" for a path that plainly exists. It is `ENOTDIR`, from `list_dir`.
+- `lseek(SEEK_END)` on a directory silently meant `SEEK_SET(0)`: the old
+  exclusion left `total` at 0. It takes the real branch now, which is what Linux
+  permits.
+- `fstat` on a `/proc` render reports `S_IFREG | 0444` and its true size, the
+  same answer `newfstatat` gives for the same path.
+
+### Verification
+
+| gate | baseline | now |
+|---|---|---|
+| QEMU/TCG `SMP=1` | 533/0 | **546/0** |
+| QEMU/TCG `SMP=4` | 543/0 | **556/0** |
+| `amd64_ring3_check --smp 1 -n 30` | OK | **OK** — 30/30, `free` unmoved, heap drift −23 kB, `grandfork` ALL PASS |
+| `amd64_mem_trials --smp 4` (local) | 8/10, 0 unexpected | **8/10, 0 unexpected** |
+| host tests, `akuma-syscalls-abi` | 8 | **15** |
+| clippy | clean | clean |
+
+Thirteen checks added across slices A and B, **every one falsified** against the
+code it tests: the flag translation removed (2 red), `path_is_dir` forced false
+(1 red — `got 0x8000 want 0x4000`, `S_IFREG` where `S_IFDIR` belongs), and the
+two shape errnos returned to the catch-all (2 red, both `EIO`).
+
+Firecracker and bare metal not run: the box is on its Ubuntu personality and
+rebooting it is a separate, slower step.
+
+### What slice B did *not* do
+
+`Entry` is down to three fields — `desc`, `data`, `nonblocking`, `refs` — and
+the flip proper is still ahead:
+
+- **`nonblocking`** has a home (`SharedFdTable::nonblock`) and moving it is not
+  a prerequisite for anything: the two are already kept in lockstep by `fcntl`.
+  It is worth doing with the flip rather than before it, and it carries a
+  divergence to state — the set is keyed per **fd number**, where `Entry` is per
+  **description**, so `dup`ping a non-blocking socket loses the flag. That is
+  glue's existing behaviour, not a new one.
+- **`data`** is the synthetic `/proc` render, and it needs a decision rather
+  than a move: re-render per read (what a real procfs does), or a side table.
+- **`refs`** is the flip itself — `FILES` stops owning lifetimes,
+  `fork_table_mirror` becomes `clone_deep_for_fork`, `clear_table_mirror` goes,
+  and `close_all()` becomes the teardown. `flock_release` has to be wired first
+  (as a stated no-op — this target dispatches no `flock`), because `close_all`
+  fires it for every `File` entry and it is a `not_wired!` panic today.
+
+**A tree-wide divergence found while reading for that, and not yet recorded
+anywhere:** `dup` in glue clones the `FileDescriptor` **by value**, so two
+descriptors onto one file get **independent cursors**. POSIX says a `dup` shares
+the open file description, offset included. amd64's `FILES` refcount gets this
+*right* today, so the flip would trade a correct behaviour for a matching one —
+which is the sort of thing that has to be a stated decision rather than a side
+effect. It is not a regression the flip introduces; it is one the flip would
+*adopt*, and it is worth fixing in the crate instead.
+
+---
+
+## Slice C — `flock_release` stops being a landmine with a correct label
+
+One field, and the reasoning is the deliverable. Its `not_wired!` said:
+
+> **this target has no `flock`.** `sys_flock` is not dispatched, nothing takes
+> a lock, so nothing can release one. Reaching here means a folded arm brought
+> advisory locking with it, and the panic is the notice.
+
+Every clause true. And it was a **panic on the path `SharedFdTable::close_all`
+takes for every `File` entry it pops** — which, since C2 slice 4 mirrored real
+descriptors into the registered tables, is an ordinary process teardown. The
+only thing between that and a dead machine was every exit path remembering
+`fd::clear_table_mirror` first; slice 6 found a path that did not, and slice 7
+wired the socket hooks for exactly this argument while leaving the `File` arm
+alone — because its reason read like a decision.
+
+It was not a decision. It was a landmine with a correct label. The test for a
+loud stub is not *"can this be served?"* but **"if this fires, is the panic more
+useful than the no-op?"** — and for a teardown hook whose operation is vacuous,
+it never is. A release of a lock nothing took is a no-op in any implementation;
+the panic could only ever fire on a bug *elsewhere*, and its effect was to
+destroy the evidence.
+
+Nine `not_wired!` stubs left, from 16 when the C2 plan was written. This is the
+last hook `close_all()` needs before the refcount authority can move at all.
+
+---
+
+## What the flip still needs, and why it is a decision rather than effort
+
+`Entry` is `{desc, data, nonblocking, refs}`. The mechanical part of the flip is
+55 touch points inside one file (`with_file` ×20, `FILES.lock` ×18, `FDS.lock`
+×8, `file_index` ×9) and no change to the module's external interface. That part
+is work. These three are not:
+
+**1. `data` — the synthetic `/proc` render.** There is no field for it in
+`FileDescriptor`, and the three candidates are not equivalent:
+
+- *Re-render per read.* Deletes the field, costs a render per `read(2)` on
+  `/proc`. Loses the snapshot: Linux's `seq_file` renders **at open** and holds
+  the buffer, so a two-read sequence there sees one consistent file and here
+  would see two.
+- *A side table keyed by (row, fd).* Keeps the semantics, reintroduces the
+  second structure the flip exists to remove.
+- *Serve `/proc` through the mounted `ProcFilesystem`* — what glue does, and the
+  real end state. 5b slice 3 mounted it already, and per-pid `stat`/`status`/
+  `cmdline` were **tried and reverted** there: the boot suite runs before
+  `run_init`, which is the wall that has now bitten three times.
+
+Note the existing asymmetry: a synthetic *directory* already snapshots into
+`KernelFile::dir_cache` and needs nothing. Only the file case is open.
+
+**2. `nonblocking` is per-description; `SharedFdTable::nonblock` is per fd
+number.** Moving it is not a prerequisite — `fcntl` already keeps the two in
+lockstep — and it *introduces* a divergence: `dup`ping a non-blocking socket
+would lose the flag. That is glue's existing behaviour, so the fold arrives
+there eventually; it should be a stated decision taken with the flip, not a
+tidy-up done before it.
+
+**3. `dup` in glue clones the `FileDescriptor` by value, so two descriptors onto
+one file get independent cursors.** POSIX shares the open file description,
+offset included. **amd64's `FILES` refcount gets this right today**, so the flip
+would trade a correct behaviour for a matching one. Found by reading
+`sys_dup`/`sys_dup3`/`clone_deep_for_fork` for the flip, and it appears to be
+recorded nowhere in the tree — worth fixing in `akuma-exec` rather than adopting
+here, which is a change to the AArch64 kernel and wants its own pass.
 
 ## Background
 
