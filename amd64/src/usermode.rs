@@ -1843,10 +1843,18 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     // `is_bound` is what makes `prog > file` work: `sh` does `dup2(f, 1)`, so
     // fd **1** now names a file and must be written to it rather than to the
     // serial port. An unbound 1 or 2 is still the console, below.
-    if fd >= crate::fd::FIRST_FILE_FD as u64 || crate::fd::is_bound(fd) {
-        return crate::fd::sys_write_file(fd, buf, len);
-    }
-    if fd != 1 && fd != 2 {
+    // **A console descriptor wins over both tests below**, and that ordering is
+    // the fix rather than a tidy-up: a registered process's table has
+    // `Stdout`/`Stderr` at 1/2 (`SharedFdTable::with_stdio`), so `is_bound(1)`
+    // is *true* for init and the write went to the file path, which has no arm
+    // for those variants and answered `EBADF`. `INIT=/bin/hello` printed
+    // nothing at all. See `fd::console_end` for the two spellings and why both
+    // have to be asked.
+    if crate::fd::console_end(fd) != Some(crate::fd::ConsoleEnd::Write) {
+        if fd >= crate::fd::FIRST_FILE_FD as u64 || crate::fd::is_bound(fd) {
+            return crate::fd::sys_write_file(fd, buf, len);
+        }
+        // An unbound fd 0 (the keyboard side) or any other unbound number.
         return EBADF;
     }
     // An unbound 1 or 2 is the console, full stop. It used to ask
@@ -3240,15 +3248,23 @@ fn register_exec_process(
         // arrives carrying the parent's extents.
         mmap_regions: Spinlock::new(image.regions),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
-        // **`new()`, not `with_stdio()`** — and the difference became real the
-        // day the registered table became the only descriptor authority (step
-        // 4b). An unbound 0/1/2 on this target *is* the console, answered by
-        // number; a table that holds `Stdin`/`Stdout`/`Stderr` entries makes
-        // `is_bound(1)` true and routes the write into `sys_write_file`, which
-        // refuses a non-`File` descriptor — every test process went silent.
-        // The AArch64 kernel wants the stdio triple because its glue reads
-        // descriptors for 0/1/2; this target's fd layer never has.
-        fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::new())),
+        // **`with_stdio()` since 4b batch 2a** — it was `new()`, and the
+        // comment here recorded why: a table holding `Stdin`/`Stdout`/`Stderr`
+        // made `is_bound(1)` true and routed the write into `sys_write_file`,
+        // which refuses a non-`File` descriptor, so every test process went
+        // silent. That was a missing *arm*, not a wrong table:
+        // `fd::console_end` now answers both spellings — the by-number one
+        // this target invented and the descriptor one the tree uses — so the
+        // triple routes to the console instead of to the file path.
+        //
+        // Flipping it is a **prerequisite for the `openat` fold**, not a
+        // tidy-up. Glue allocates with `alloc_fd`, which is
+        // `alloc_fd_from(0)`: with 0/1/2 absent, the first `open` in a process
+        // whose stdio is unbound returns **fd 0**, and every later write to
+        // fd 1 lands in whatever file the process opened next. Occupying the
+        // triple is what makes the tree's allocator safe here, and it is also
+        // what `SharedFdTable::with_stdio` exists for.
+        fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio())),
         thread_id: None,
         spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),

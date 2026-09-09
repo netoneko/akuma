@@ -402,6 +402,53 @@ pub fn is_bound(fd: u64) -> bool {
     fd < MAX_FDS as u64 && cur_table().table.lock().contains_key(&(fd as u32))
 }
 
+/// Which end of the console `fd` names, if it names one.
+///
+/// **Two spellings reach the same device, and both have to work.** The
+/// *by-number* one is this target's own: an **unbound** 0/1/2 is the console,
+/// which is what a task with no stdio descriptors at all has — the boot
+/// suite's kernel row. The *descriptor* one is the tree's:
+/// `SharedFdTable::with_stdio`, the table every registered process starts
+/// with, puts `Stdin`/`Stdout`/`Stderr` at 0/1/2, and
+/// `akuma-syscalls-glue`'s `openat` hands out the same variants for
+/// `/dev/tty`.
+///
+/// Only the first spelling existed here, asked for by every arm as
+/// `fd < FIRST_FILE_FD && !is_bound(fd)` — a test that is **false for a
+/// registered process**, because its 0/1/2 are bound to exactly those
+/// variants. So `init`'s `write(1)` skipped the console path, fell through to
+/// the file path, and answered `EBADF`: booted with `INIT=/bin/hello`, this
+/// kernel printed `-- running /bin/hello --`, then `-- init exited --`, and
+/// **not one byte of the program's output**. It survived because every other
+/// process here gets its stdio from [`bind_stdio`]'s pipes and init happens to
+/// be `sshd`, which writes to a socket.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum ConsoleEnd {
+    /// The keyboard side: `read(2)` reaches [`read_console`].
+    Read,
+    /// The screen side: `write(2)` reaches the serial port.
+    Write,
+}
+
+/// See [`ConsoleEnd`]. A descriptor that names something else answers `None`,
+/// which is what keeps the by-number rule below from claiming a redirected
+/// 0/1/2 — the property `is_bound` was introduced for.
+#[must_use]
+pub fn console_end(fd: u64) -> Option<ConsoleEnd> {
+    match table_get(fd) {
+        Some(FileDescriptor::Stdin) => return Some(ConsoleEnd::Read),
+        Some(FileDescriptor::Stdout | FileDescriptor::Stderr) => return Some(ConsoleEnd::Write),
+        // A bound descriptor naming anything else: a pipe, a socket, a file.
+        Some(_) => return None,
+        None => {}
+    }
+    match fd {
+        0 => Some(ConsoleEnd::Read),
+        1 | 2 => Some(ConsoleEnd::Write),
+        _ => None,
+    }
+}
+
 /// Take one more reference to whatever `desc` names — the [`clone_fd_refs`]
 /// rule, local to the variants this target interns.
 ///
@@ -562,6 +609,16 @@ fn dev_node_of(fd: u64) -> Option<&'static str> {
         FileDescriptor::File(f) if f.path.starts_with("/dev/") => {
             akuma_vfs_glue::dev_node(&f.path).map(|n| n.name)
         }
+        // The **other** spelling of the same node, and the one every folded
+        // `akuma-syscalls-glue` arm produces: glue's `openat` answers
+        // `/dev/null` and friends with a dedicated variant rather than with a
+        // `File` carrying the path. Mapping them back to the node name here is
+        // what lets `read`, `write`, `lseek` and `fstat` keep asking one
+        // question — see [`dev_read`], which is the rule for both spellings.
+        FileDescriptor::DevNull => Some("null"),
+        FileDescriptor::DevZero => Some("zero"),
+        FileDescriptor::DevUrandom => Some("urandom"),
+        FileDescriptor::DevTty => Some("tty"),
         _ => None,
     })
     .flatten()
@@ -1211,15 +1268,14 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // `KernelFile::new` leaves the inode 0 — "read by path", which is what
     // this target does — and the position 0, which `O_APPEND` overrides.
     //
-    // **Divergence, pinned, and now the only one left in append:** real
-    // `O_APPEND` re-seeks to the end before *every* write, so two processes
-    // appending to one file interleave whole records. Here it only sets the
-    // starting cursor. What changed with this slice is the *loss mode*: the
-    // old design already lost on concurrent appenders (each descriptor held
-    // its private copy and wrote the whole file back at close); now the
-    // writes go through the VFS as they happen, so appenders interleave at
-    // record granularity when they re-seek, and at cursor granularity when
-    // they do not — never the whole-file clobber.
+    // **That divergence is closed (4b batch 2a).** It read, until 2026-09-09,
+    // "real `O_APPEND` re-seeks to the end before *every* write … here it only
+    // sets the starting cursor", so two descriptors appending to one file both
+    // started at the same offset and the second clobbered the first.
+    // [`sys_write_file`] re-derives the position from the live file per write
+    // now — the semantics `akuma-syscalls-glue`'s `sys_write` already had —
+    // which makes this seed a fast path rather than the whole answer, and is
+    // what lets the `openat` fold proceed: glue's arm seeds no position at all.
     let mut file = KernelFile::new(normalised, flags_ as u32);
     file.position = start_pos as usize;
     install(FileDescriptor::File(file))
@@ -1550,17 +1606,16 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         return read_pipe(pid, buf, len as usize, is_nonblocking(fd));
     }
 
-    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
-        if fd == 0 {
-            // An unbound fd 0 is the console, full stop. It used to also ask
-            // `current_stdin_pipe()` — the `Spawn` row — because a spawned
-            // child's stdin was a pipe reached *by number*; since C2 slice 6 it
-            // is a `PipeRead` descriptor and the branch above has already
-            // routed it. Only a task with no stdin descriptor at all (init on
-            // the serial line, and the boot suite's kernel row) reaches here.
-            return read_console(buf, len as usize);
-        }
-        return errno::EBADF;
+    // The console, by either spelling — see [`console_end`]. It used to also
+    // ask `current_stdin_pipe()` — the `Spawn` row — because a spawned child's
+    // stdin was a pipe reached *by number*; since C2 slice 6 it is a
+    // `PipeRead` descriptor and the branch above has already routed it.
+    match console_end(fd) {
+        Some(ConsoleEnd::Read) => return read_console(buf, len as usize),
+        // The screen side is not readable, and `EBADF` is the answer this arm
+        // has always given for it.
+        Some(ConsoleEnd::Write) => return errno::EBADF,
+        None => {}
     }
 
     // A `/dev` character node.
@@ -1682,7 +1737,7 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     if socket_index(fd).is_some() || pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() {
         return errno::ESPIPE;
     }
-    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+    if console_end(fd).is_some() {
         return errno::ESPIPE;
     }
     // A `/dev` character node **is** seekable — `pread` on `/dev/zero` is
@@ -1863,12 +1918,33 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
             if f.flags & open_flags::O_ACCMODE == 0 {
                 return Err(errno::EBADF); // opened read-only
             }
-            Ok((f.path.clone(), f.position))
+            Ok((
+                f.path.clone(),
+                f.position,
+                f.flags & open_flags::O_APPEND != 0,
+            ))
         });
-        let (path, pos) = match resolved {
+        let (path, pos, appending) = match resolved {
             Some(Ok(v)) => v,
             Some(Err(e)) => return e,
             None => return errno::EBADF,
+        };
+        // **`O_APPEND` re-derives the cursor from the live file, per write** —
+        // outside the table lock, because it is a `metadata` and the disk does
+        // not belong under that lock (the rule the resolve above states).
+        //
+        // The starting cursor `sys_openat` sets is not enough and never was:
+        // two descriptors appending to one file each keep their own position,
+        // so the second write lands on top of the first. This is the semantics
+        // `akuma-syscalls-glue`'s `sys_write` already has — it derives the
+        // append position from `file_size` per call — and aligning here is a
+        // prerequisite for folding `openat`, whose glue arm does **not** seed
+        // a starting position at all. Folded without this, every `>>` would
+        // start at 0 and clobber the file it was meant to extend.
+        let pos = if appending {
+            akuma_vfs_glue::metadata(&path).map_or(pos, |m| m.size as usize)
+        } else {
+            pos
         };
         let proc_rest = proc_rest_of(&path);
         let step = if proc_rest.is_some() {
@@ -2028,7 +2104,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     // has been redirected and is whatever it now names — since C2 slice 6 that
     // includes a spawned child's stdio pipes, so the guard has to ask rather
     // than assume, exactly as `sys_read` and `sys_write` do.
-    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+    if console_end(fd).is_some() {
         return errno::EBADF;
     }
     let Some(desc) = table_get(fd) else {
@@ -2298,7 +2374,7 @@ fn encode_stat(
 /// `S_ISDIR` holds, so `ls`/`find` need this to be right, not just `openat`
 /// succeeding.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+    let (mode, size, nlink) = if console_end(fd).is_some() {
         (S_IFCHR_0620, 0u64, 1u64)
     } else if pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() {
         // C2 slice 6: a spawned child's fd 0/1/2 are pipes, and a pipe has no
@@ -2456,7 +2532,7 @@ pub fn sys_statfs(path: u64, buf: u64) -> u64 {
 /// reports the root mount, which is what Linux does for an fd on a filesystem
 /// with no name to resolve.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
-    let path = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+    let path = if console_end(fd).is_some() {
         alloc::string::String::from("/")
     } else {
         let Some(path) = table_with(fd, |d| match d {
@@ -2768,11 +2844,10 @@ fn poll_ready(fd: u64) -> (bool, bool) {
     // this used to ask ("does this task have a stdin/stdout pipe?") are gone
     // with C2 slice 6: a spawned child's 0/1/2 are descriptors and fall through
     // to the pipe arms below.
-    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
-        if fd == 0 {
-            return (crate::input::has_byte(), false);
-        }
-        return (false, true);
+    match console_end(fd) {
+        Some(ConsoleEnd::Read) => return (crate::input::has_byte(), false),
+        Some(ConsoleEnd::Write) => return (false, true),
+        None => {}
     }
     if let Some(p) = pipe_read_id(fd) {
         return (crate::pipe::readable(p), false);
@@ -2877,7 +2952,14 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         return siocgif(req as u32, arg);
     }
 
-    let is_console = fd < FIRST_FILE_FD as u64;
+    // `fd < FIRST_FILE_FD` stays the first term on purpose: a spawned child's
+    // 0/1/2 are **pipes**, and answering `TCGETS` on them is what makes
+    // `isatty(0)` true for an interactive shell over ssh. The two new terms
+    // add the descriptor spellings: a bound `Stdin`/`Stdout`/`Stderr` (a
+    // registered process's own stdio) and an fd opened on `/dev/tty`, which is
+    // where a pager asks for the terminal it will read keys from.
+    let is_console =
+        fd < FIRST_FILE_FD as u64 || console_end(fd).is_some() || dev_node_of(fd) == Some("tty");
     if !is_console {
         return errno::ENOTTY;
     }
@@ -3581,6 +3663,75 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     // dereference it — so this is a faithful exercise of the same path.
     let mut buf = [0u8; 64];
     let path = b"/probe.txt\0";
+
+    // **The console, by descriptor** — the spelling a registered process uses
+    // (`SharedFdTable::with_stdio`) and the one every folded
+    // `akuma-syscalls-glue` arm will produce. The suite's own row has 0/1/2
+    // *unbound*, so it exercises the by-number rule on every other line;
+    // these six lines are the only place the variant arms are asked anything.
+    //
+    // Negative control, run 2026-09-09 rather than reasoned about: with
+    // `console_end`'s two variant arms returning `None`, `INIT=/bin/hello`
+    // printed `-- running /bin/hello --` and then nothing at all — its
+    // `write(1)` reached `sys_write_file`, which has no arm for a `Stdout`
+    // descriptor and answers `EBADF`. That is the failure this block pins.
+    // **Two descriptors appending to one file must interleave, not clobber.**
+    // Until 2026-09-09 `O_APPEND` was only a *starting* cursor set at `open`,
+    // so both descriptors began at the same offset and the second write landed
+    // on top of the first — `sys_openat`'s own comment pinned that as a
+    // divergence. The write path re-derives the position per call now, which
+    // is `akuma-syscalls-glue`'s semantics and the reason the `openat` fold
+    // can seed nothing.
+    {
+        const O_WRONLY: u64 = 1;
+        const O_CREAT: u64 = 0o100;
+        const O_TRUNC: u64 = 0o1000;
+        const O_APPEND: u64 = 0o2000;
+        let ap = b"/append-probe.txt\0";
+        let seed = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if t.check("fd: append probe opens for create", !errno::is_err(seed)) {
+            sys_write_file(seed, b"AAA".as_ptr() as u64, 3);
+            sys_close(seed);
+            let a = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_APPEND, 0);
+            let b = sys_openat(0, ap.as_ptr() as u64, O_WRONLY | O_APPEND, 0);
+            sys_write_file(a, b"B".as_ptr() as u64, 1);
+            // `b` was opened before `a` wrote, so its seeded cursor is stale;
+            // only a per-write re-derivation puts this byte after the `B`.
+            sys_write_file(b, b"C".as_ptr() as u64, 1);
+            sys_close(a);
+            sys_close(b);
+            let r = sys_openat(0, ap.as_ptr() as u64, 0, 0);
+            let n = sys_read(r, buf.as_mut_ptr() as u64, 8);
+            sys_close(r);
+            t.check_eq("fd: both appends landed", n, 5);
+            t.check("fd: the second appender did not clobber the first", &buf[..5] == b"AAABC");
+        }
+    }
+
+    let out_fd = install(FileDescriptor::Stdout);
+    let in_fd = install(FileDescriptor::Stdin);
+    t.check("fd: a Stdout descriptor is the console's write end",
+        console_end(out_fd) == Some(ConsoleEnd::Write));
+    t.check("fd: a Stdin descriptor is the console's read end",
+        console_end(in_fd) == Some(ConsoleEnd::Read));
+    // `S_IFCHR`, not the regular-file shape the fall-through arm would give:
+    // `isatty(3)` is `fstat` plus `S_ISCHR`, so this is the answer that makes
+    // a shell on these descriptors interactive.
+    let mut st = [0u8; 160];
+    t.check_eq("fd: fstat on a console descriptor succeeds",
+        sys_fstat(out_fd, st.as_mut_ptr() as u64), 0);
+    t.check("fd: and reports a character device",
+        u32::from_le_bytes([st[24], st[25], st[26], st[27]]) & 0xF000 == 0x2000);
+    // Not seekable, and `EBADF` is the answer this target has always given a
+    // console `lseek` — stated so the fold cannot quietly change it.
+    t.check_eq("fd: lseek on a console descriptor is EBADF",
+        sys_lseek(out_fd, 0, 0), errno::EBADF);
+    // Reading the write end is `EBADF`; the read end blocks on the UART, so it
+    // is deliberately not called here.
+    t.check_eq("fd: read of the console's write end is EBADF",
+        sys_read(out_fd, buf.as_mut_ptr() as u64, 1), errno::EBADF);
+    t.check_eq("fd: closing the console descriptors", sys_close(out_fd) | sys_close(in_fd), 0);
+
 
     let fd = sys_openat(0, path.as_ptr() as u64, 0, 0);
     if !t.check("fd: open /probe.txt", fd >= FIRST_FILE_FD as u64) {
