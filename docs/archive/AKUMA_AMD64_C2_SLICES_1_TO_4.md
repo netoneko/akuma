@@ -1,4 +1,4 @@
-# amd64 C2, slices 1–4: the whole-file cache stops being able to stop the machine, and the fd table gets a mirror
+# amd64 C2, slices 1–5: the whole-file cache is deleted, and the fd table gets a mirror
 
 **Dates:** 2026-09-09. Slices 1–3 verified end-to-end; slice 4 verified on
 Firecracker, and its wedge bug found on the metal the same day (see § "The
@@ -163,16 +163,90 @@ combination (`AKUMA_AMD64_TLB_SHOOTDOWN.md` carries that invariant).
 
 ## Where this leaves the plan
 
-- Slices 1–4 done; the table is complete, mirrored, fork-correct, and read by
-  nothing that matters yet.
-- Slice 5 (`open`/`read`/`write`/`pread64`, the cache dies, ring-3 workload
-  as the verifier) inherits: the mirror rule (own no refs until the flip),
-  `fork_table_mirror` (becomes `clone_deep_for_fork`), `clear_table_mirror`
-  (becomes unnecessary or a no-op once `close_all`'s hooks are genuinely
-  the owner), and the pinned stdio-dup gap (`dup(0)` is `EBADF` until the
-  data path routes through the table).
-- Slice 6 (pipes, `Spawn`'s four fields, the `wait4` decision) and slice 7
-  (`/proc`) unchanged.
+- Slices 1–5 done. The whole-file cache is deleted; the OOM class it caused
+  cannot recur, and the original reproducer runs to completion with a flat
+  heap. `Entry.data` survives only as the storage for synthetic `/proc`
+  renders.
+- Slice 6 (pipes into the table, `Spawn`'s four fields, the `wait4` decision)
+  and slice 7 (`/proc`) remain. The mirror rule and both helper obligations
+  (`fork_table_mirror`, `clear_table_mirror`) carry forward unchanged until
+  the refcount authority moves to the table.
+
+## Slice 5 — `open`/`read`/`write`/`pread64`: the cache dies (2026-09-09, same day)
+
+The discovery that made this slice cheap: **the partial-I/O surface already
+existed**. `akuma-vfs-glue` had `read_at` *and* `write_at` (path, offset,
+bounded buffer), ext2 implements both as real block-level partial I/O, and
+`amd64/src/fs.rs` re-exports `read_at` — nobody had ever wired a descriptor
+to them. Slice 5 is pure rewiring in `fd.rs`:
+
+- **`openat`** hands out descriptors with an **empty** buffer. Existence is a
+  *one-byte* `read_at` probe (see the probe bug below), `O_APPEND`'s starting
+  cursor is one `metadata`, and `O_TRUNC` truncates **once, at open, through
+  the VFS** — the old design truncated implicitly at close by persisting an
+  empty buffer, which also meant `O_CREAT` without `O_TRUNC` destroyed the
+  file; that bug dies with the cache.
+- **`read`/`pread64`/`file_bytes_at`** (the mmap backing) split on
+  `entry_is_synthetic`: real files answer through `fs::read_at` at the cursor
+  in `MAX_IO`-bounded chunks, disk I/O outside the `FILES` lock (the rule
+  `release` already stated); synthetic `/proc` views keep their cached render,
+  because there is no inode behind the path to read from.
+- **`sys_write_file`** writes through `write_at` at the cursor, chunk by
+  chunk; `ENOSPC`/`EROFS`/`EIO` reach ring 3 via `fs_err_errno`.
+- **`lseek`'s `SEEK_END`** and **`fstat`'s size** take the size from
+  `metadata` for real files, from the cache for synthetic ones.
+- **`release`'s persist arm** now carries a `!data.is_empty()` guard: a real
+  close is a no-op (POSIX: close does not truncate), and persisting an empty
+  buffer would have *truncated* every read-only-closed file.
+
+The real/synthetic discriminator is `data.is_empty()`, sound because every
+synthetic installer renders non-empty contents; if a future view can render
+empty, give it a flag instead.
+
+### The probe bug (first FC boot, 519/5)
+
+The existence probe was originally **zero-length** — and ext2's `read_at`
+returns `Ok` for a zero-length read *before resolving the path*, so every
+missing file opened successfully, shifted every fd number by one, and failed
+the suite's capacity/row tests as collateral. Existence checks and short-read
+semantics are different questions; a probe must not inherit the byte path's
+short-circuit. One-byte buffer; fixed; **512/0**.
+
+### Verification
+
+- Firecracker SMP=4 boot suite: **512/0** (twice: once failing with the probe
+  bug, once green after).
+- Bare metal: all self-tests passed, then the real ring-3 workload —
+  redirects (`>` and `>>`), `wc -c` (`SEEK_END` through `metadata`), sizes —
+  all correct.
+- **The witness, final form:** the original kill-the-machine ladder
+  (`cat /bin/akuma` × 120 into one held fd = 168 MB target) ran to **rc=0,
+  full 168 921 600 bytes — past the old 134 MB `ENOMEM` ceiling — with
+  `Cached:` flat at ~1.7 MB the whole time**. The heap cost of a write is now
+  one 64 KiB chunk, not three times the file.
+- `amd64_mem_trials.py --smp 4`: **8/10, 0 unexpected, on both the TCG and
+  the Firecracker arm** — `mmapsum` (pread loops), `mmap_file` (file-backed
+  mappings served by the VFS-backed `file_bytes_at`) and `cowstale` all green
+  against the cache-less world. The two "known" fails are the documented
+  no-signal-delivery gaps, untouched by this work.
+- `mem_suite.py` over ssh to the **metal** was attempted and abandoned as a
+  harness limitation, not a kernel one: its probe upload is a bulk
+  stdin-over-ssh transfer, and the metal's pre-existing BKL stalls throttle
+  that below the harness's timeouts. The FC arm runs the same ten probes.
+- AArch64 clippy and host tests: clean.
+
+### What slice 5 leaves for slices 6–7
+
+- `dup(0)`/`dup(1)` on *unbound* stdio is still `EBADF` — the data path now
+  routes through the table's *File* entries for files, but Stdin/Stdout/Stderr
+  still route by number; lifting that is natural the day `sys_read`/`sys_write`
+  consult the table for stdio variants.
+- The mirror still owns no refs (`fork_table_mirror` unchanged);
+  `clear_table_mirror` still runs at exit and is still required — `close_all`
+  would fire pipe hooks on mirrors. Both flip together when the refcount
+  authority moves.
+- `O_APPEND` re-seek-per-write and cloexec enforcement at execve remain pinned
+  divergences, now smaller (writes are no longer whole-file clobbers).
 
 ## Background
 

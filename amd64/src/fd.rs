@@ -76,6 +76,36 @@ use spinning_top::Spinlock;
 use crate::fs;
 use crate::serial;
 
+/// Map an `FsError` from the VFS byte paths onto a syscall errno.
+///
+/// The write-through path's error vocabulary: what ring 3 sees when
+/// `read_at`/`write_at` refuse. `EIO` for the catch-all is deliberate — the
+/// specific strings land on the console through `fs_err_str` where they
+/// matter; inventing eight more errnos nobody distinguishes is not honesty,
+/// it is noise.
+fn fs_err_errno(e: akuma_vfs::FsError) -> u64 {
+    use akuma_vfs::FsError as E;
+    match e {
+        E::NotFound => errno::ENOENT,
+        E::ReadOnly => errno::EROFS,
+        E::NoSpace => errno::ENOSPC,
+        _ => errno::EIO,
+    }
+}
+
+/// C2 SLICE 5: the discriminator between a **real** file (ext2-backed, read
+/// and written through the VFS at its cursor, `data` empty forever) and a
+/// **synthetic** one (`/proc`'s rendered views, whose bytes live only in
+/// `Entry.data` because there is no inode behind the path to read them from).
+///
+/// Every byte-path branch below splits on this. The rule that makes it sound:
+/// `open_proc`/`install_synthetic_file` always render **non-empty** contents —
+/// a synthetic view that cannot render fails the open — so an empty `data` on
+/// a `File` descriptor can only mean "real, uncached".
+fn entry_is_synthetic(entry: &Entry) -> bool {
+    !entry.is_dir && !entry.data.is_empty()
+}
+
 /// The console's line discipline.
 ///
 /// `akuma-terminal`, not a hand-rolled reader. That crate is the tree's
@@ -127,6 +157,10 @@ pub mod errno {
     pub const EEXIST: u64 = (-17i64) as u64;
     pub const ENOTEMPTY: u64 = (-39i64) as u64;
     pub const EIO: u64 = (-5i64) as u64;
+    /// The filesystem is mounted read-only (`MS_RDONLY` → `FsError::ReadOnly`).
+    pub const EROFS: u64 = (-30i64) as u64;
+    /// The device has no room — a write the VFS could not place.
+    pub const ENOSPC: u64 = (-28i64) as u64;
     /// Written to a pipe every reader has closed. New with `akuma-pipes`' end
     /// reference counts — before them this kernel could not tell a dead reader
     /// from a full buffer, and `write_pipe`'s retry loop span forever instead.
@@ -943,9 +977,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     let creating = flags_ & u64::from(open_flags::O_CREAT) != 0;
     if creating && fs::metadata(&normalised).is_ok_and(|m| m.is_dir) {
         return errno::EISDIR;
-    }
-
-    // A directory has no bytes to cache as file contents — `read_file` would
+    }    // A directory has no bytes to cache as file contents — `read_file` would
     // fail it as `NotAFile`. Check `metadata` first (one inode read, next to
     // `read_file`'s whole-file copy) so a directory opens successfully instead
     // of falling through to "not found"; `getdents64` lists it straight off
@@ -958,45 +990,65 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     if is_dir && flags_ & u64::from(open_flags::O_ACCMODE) != 0 {
         return errno::EISDIR;
     }
-    // What the descriptor's buffer starts as, and where its cursor starts.
+    // **C2 SLICE 5: THE CACHE DIES HERE.** This path only ever reaches a real
+    // ext2 file (synthetic views are answered above it, by `open_proc` and the
+    // synthetic installers), so the descriptor is born with an **empty**
+    // buffer: `read` goes to `fs::read_at` and `write` to `write_at` at the
+    // cursor, in `MAX_IO`-bounded chunks, and nothing holds the file's bytes
+    // in the kernel heap for the descriptor's lifetime. That is the whole-file
+    // heap bug's root cause, deleted rather than guarded.
     //
-    // This used to be "empty if `creating`, else the file's bytes", which
-    // collapsed three different opens into one: `O_TRUNC` (start empty),
-    // `O_APPEND` (start at the end) and a plain `O_CREAT` on a file that
-    // already exists (start at the beginning, keeping what is there — POSIX
-    // truncates only when asked). Since `close` persists this buffer as the
-    // file's *entire* contents, getting it wrong does not mis-position a
-    // write, it destroys the rest of the file.
+    // What replaced "read the bytes, and `ENOENT` if that fails" is a
+    // **one-byte** `read_at` probe: it answers existence through the same
+    // byte path the descriptor will use, which `metadata` alone cannot —
+    // `metadata("/dev/null")` succeeds (the synthetic `/dev` stats) while
+    // nothing will ever serve its bytes, and today's open answers that with
+    // `ENOENT` because `read_file` refuses the node. The probe keeps that
+    // pinned answer exactly. One byte, not zero: a zero-length `read_at`
+    // succeeds before the path is ever resolved (a short-circuit that is
+    // correct for `read(2)` and fatal for a probe — the first Firecracker
+    // boot of this slice opened missing files and gave them fds).
+    let mut probe = [0u8; 1];
+    let exists = fs::read_at(&normalised, 0, &mut probe).is_ok();
+    if !creating && !is_dir && !exists {
+        return errno::ENOENT;
+    }
     let truncating = flags_ & u64::from(open_flags::O_TRUNC) != 0;
     let appending = flags_ & u64::from(open_flags::O_APPEND) != 0;
-    let data = if is_dir || truncating {
-        Vec::new()
+    // `O_APPEND`'s starting cursor is the file's real size — one `metadata`,
+    // not "the length of what we happened to read".
+    let start_pos = if appending {
+        fs::metadata(&normalised).map_or(0, |m| m.size)
     } else {
-        match fs::read_file(&normalised) {
-            Ok(d) => d,
-            // A brand-new `O_CREAT` file: nothing to read, and that is not an
-            // error. Without `O_CREAT` it is `ENOENT`.
-            Err(_) if creating => Vec::new(),
-            Err(_) => return errno::ENOENT,
-        }
+        0
     };
-    let start_pos = if appending { data.len() } else { 0 };
+    // `O_TRUNC` happens **now**, once, through the VFS — not "start from an
+    // empty buffer and replace the whole file at close". A zero-length
+    // `write_at` truncates; a failure here is a real refusal (a read-only
+    // mount) and fails the open, which is what Linux answers too.
+    if truncating && !is_dir
+        && let Err(e) = akuma_vfs_glue::write_at(&normalised, 0, &[])
+    {
+        return fs_err_errno(e);
+    }
 
     // `KernelFile::new` leaves the inode 0 — "read by path", which is what
     // this target does — and the position 0, which `O_APPEND` overrides.
     //
-    // **Divergence, pinned.** Real `O_APPEND` re-seeks to the end before
-    // *every* write, so two processes appending to one file interleave whole
-    // records. Here it only sets the starting cursor. That is right for a
-    // shell's `>>` and wrong for concurrent appenders, and the fix is not
-    // local: this target keeps a private copy of the file per descriptor and
-    // writes it back whole at `close`, so two appenders already lose each
-    // other's data regardless of where the cursor starts.
+    // **Divergence, pinned, and now the only one left in append:** real
+    // `O_APPEND` re-seeks to the end before *every* write, so two processes
+    // appending to one file interleave whole records. Here it only sets the
+    // starting cursor. What changed with this slice is the *loss mode*: the
+    // old design already lost on concurrent appenders (each descriptor held
+    // its private copy and wrote the whole file back at close); now the
+    // writes go through the VFS as they happen, so appenders interleave at
+    // record granularity when they re-seek, and at cursor granularity when
+    // they do not — never the whole-file clobber.
     let mut file = KernelFile::new(normalised, flags_ as u32);
-    file.position = start_pos;
+    file.position = start_pos as usize;
     install(Entry {
         desc: FileDescriptor::File(file),
-        data,
+        data: Vec::new(),
         nonblocking: false,
         is_dir,
         refs: 1,
@@ -1438,15 +1490,18 @@ fn release(entry: Entry) {
         Entry { desc: FileDescriptor::PipeRead(p), .. } => {
             crate::pipe::close_read(p as usize);
         }
-        // A file opened for writing: this is the one and only point its
-        // buffered `data` reaches the disk (see the module header and
-        // `sys_write_file`) — `akuma-ext2`'s `write_file` replaces the whole
-        // file in one call, so there is nothing to flush incrementally.
-        // Read-only opens skip this: writing back an unmodified `read_file`
-        // copy on every `close` would be a silent no-op turned into needless
-        // disk I/O.
+        // A **synthetic** file opened for writing: this is where its cached
+        // render reaches... nowhere on disk — the persist below is a whole-file
+        // `write_file`, and a synthetic path has no inode behind it, so it
+        // fails with the console line exactly as it always did. The guard is
+        // `!data.is_empty()`, and its real job is the **real** files: since
+        // C2 slice 5 a real file's buffer is empty forever (the bytes went
+        // through the VFS at each `write`), and persisting an empty buffer
+        // would truncate it — a close that destroys the file it claims to
+        // save. A real close is now a no-op here, which is what POSIX says
+        // too: `close(2)` does not truncate.
         Entry { desc: FileDescriptor::File(file), data, is_dir: false, .. }
-            if file.flags & open_flags::O_ACCMODE != 0 =>
+            if file.flags & open_flags::O_ACCMODE != 0 && !data.is_empty() =>
         {
             // A failed persist is REPORTED, not discarded: this is the whole
             // file's worth of data, there is no second chance, and a silent
@@ -1555,24 +1610,58 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         return errno::EBADF;
     }
 
-    with_file(fd, |entry| {
+    // Resolve under the lock; do the I/O outside it — the rule `release`
+    // states for the same reason. Synthetic (`/proc`) views still read their
+    // cached bytes under the lock, because there is no second source.
+    let resolved = with_file(fd, |entry| {
         if entry.is_dir {
-            return errno::EISDIR;
+            return Err(errno::EISDIR);
         }
-        let total = entry.data.len();
-        let Some(file) = entry.file() else {
-            return errno::EBADF;
-        };
-        let pos = file.position;
-        let n = total.saturating_sub(pos).min(len as usize);
-        if n == 0 {
+        if entry.file().is_none() {
+            return Err(errno::EBADF);
+        }
+        let synthetic = entry_is_synthetic(entry);
+        let pos = entry.file().unwrap().position;
+        if synthetic {
+            let total = entry.data.len();
+            let n = total.saturating_sub(pos).min(len as usize);
+            let chunk = entry.data[pos..pos + n].to_vec();
+            Ok((None, alloc::string::String::new(), 0usize, chunk))
+        } else {
+            let path = entry.file().unwrap().path.clone();
+            Ok((Some(()), path, pos, Vec::new()))
+        }
+    });
+    let (real, path, pos, cached) = match resolved {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return e,
+        None => return errno::EBADF,
+    };
+    if real.is_none() {
+        // Synthetic path, under the original semantics.
+        if cached.is_empty() {
             return 0;
         }
-        file.position = pos + n;
-        let chunk = &entry.data[pos..pos + n];
-        copy_to_user(buf, chunk)
-    })
-    .unwrap_or(errno::EBADF)
+        with_file(fd, |entry| {
+            entry.file().unwrap().position = pos + cached.len();
+        });
+        return copy_to_user(buf, &cached);
+    }
+    // Real path: one bounded VFS read, then the position moves.
+    let mut kbuf = alloc::vec![0u8; len as usize];
+    let n = match fs::read_at(&path, pos, &mut kbuf) {
+        Ok(n) => n,
+        Err(_) => return errno::EIO,
+    };
+    if n == 0 {
+        return 0;
+    }
+    with_file(fd, |entry| {
+        if let Some(f) = entry.file() {
+            f.position = pos + n;
+        }
+    });
+    copy_to_user(buf, &kbuf[..n])
 }
 
 /// `pread64(fd, buf, count, offset)` — x86_64 syscall 17.
@@ -1629,28 +1718,43 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
         return errno::ESPIPE;
     }
 
-    with_file(fd, |entry| {
+    let resolved = with_file(fd, |entry| {
         if entry.is_dir {
-            return errno::EISDIR;
+            return Err(errno::EISDIR);
         }
-        // Read-only descriptors are fine; what is not is a descriptor that is
-        // not a file at all. `entry.file()` is the same gate `sys_read` uses.
         if entry.file().is_none() {
-            return errno::EBADF;
+            return Err(errno::EBADF);
         }
-        let total = entry.data.len();
-        let pos = off as usize;
-        // Past the end is 0, not an error — `read(2)`'s rule, and what a
-        // digest loop reading to EOF depends on to terminate.
-        let n = total.saturating_sub(pos).min(len as usize);
-        if n == 0 {
-            return 0;
-        }
-        // **`file.position` is deliberately not touched.** That is the entire
+        // **`position` is deliberately not touched.** That is the entire
         // contract of this call.
-        copy_to_user(buf, &entry.data[pos..pos + n])
-    })
-    .unwrap_or(errno::EBADF)
+        let synthetic = entry_is_synthetic(entry);
+        if synthetic {
+            let total = entry.data.len();
+            let pos = off as usize;
+            let n = total.saturating_sub(pos).min(len as usize);
+            let chunk = entry.data[pos..pos + n].to_vec();
+            Ok((None, alloc::string::String::new(), chunk))
+        } else {
+            let path = entry.file().unwrap().path.clone();
+            Ok((Some(off as usize), path, Vec::new()))
+        }
+    });
+    let (vfs_off, path, cached) = match resolved {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return e,
+        None => return errno::EBADF,
+    };
+    match vfs_off {
+        None => copy_to_user(buf, &cached),
+        Some(pos) => {
+            let mut kbuf = alloc::vec![0u8; len as usize];
+            let n = match fs::read_at(&path, pos, &mut kbuf) {
+                Ok(n) => n,
+                Err(_) => return errno::EIO,
+            };
+            copy_to_user(buf, &kbuf[..n])
+        }
+    }
 }
 
 /// Copy `dst.len()` bytes of `fd`'s cached contents starting at byte `offset`
@@ -1670,18 +1774,31 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
 /// that could not be read into the kernel cannot be mapped either, and both fail
 /// at `open`.
 pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
-    with_file(fd, |entry| {
+    let (synthetic, path) = with_file(fd, |entry| {
         if entry.is_dir || entry.file().is_none() {
             return None;
         }
-        let total = entry.data.len();
-        let n = total.saturating_sub(offset).min(dst.len());
-        if n > 0 {
-            dst[..n].copy_from_slice(&entry.data[offset..offset + n]);
-        }
-        Some(n)
-    })
-    .flatten()
+        let synthetic = entry_is_synthetic(entry);
+        let path = entry.file().unwrap().path.clone();
+        Some((synthetic, path))
+    })??;
+    if synthetic {
+        // A mapped synthetic view: its bytes exist only in the cache.
+        return with_file(fd, |entry| {
+            let total = entry.data.len();
+            let n = total.saturating_sub(offset).min(dst.len());
+            if n > 0 {
+                dst[..n].copy_from_slice(&entry.data[offset..offset + n]);
+            }
+            Some(n)
+        })
+        .flatten();
+    }
+    // Real file: the page comes off the VFS. A read error fills nothing —
+    // the caller's freshly zeroed page shows through, which is the same
+    // answer "past EOF" gets, and the only kind thing a fault path can do
+    // with an I/O error anyway.
+    fs::read_at(&path, offset, dst).ok()
 }
 
 /// Is `fd` a regular file — something `mmap` can back a mapping with?
@@ -1724,45 +1841,87 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
         let Some(incoming) = copy_in(buf + written as u64, chunk_len as u64) else {
             return if written == 0 { errno::EFAULT } else { written as u64 };
         };
-        let step = with_file(fd, |entry| {
+        // Resolve under the lock; for a **real** file the write itself goes
+        // through the VFS outside it (`write_at` at the cursor — the disk
+        // never belongs under `FILES`), and only the cursor move comes back.
+        // A **synthetic** entry is written into its cached render as before:
+        // there is no inode behind the path to write through.
+        let resolved = with_file(fd, |entry| {
             if entry.is_dir {
                 return Err(errno::EISDIR);
             }
-            // The position read and the write-permission check both come from
-            // `entry.desc`, borrowed immutably first so the mutable borrow of
-            // `entry.data` just below is not fighting a live borrow of a
-            // sibling field through the same `&mut Entry` — `entry.file()`
-            // would hold that borrow for the rest of the closure if used here.
-            let pos = match &entry.desc {
-                FileDescriptor::File(f) if f.flags & open_flags::O_ACCMODE != 0 => f.position,
-                FileDescriptor::File(_) => return Err(errno::EBADF), // opened read-only
-                _ => return Err(errno::EBADF),
+            let writable = match &entry.desc {
+                FileDescriptor::File(f) => f.flags & open_flags::O_ACCMODE != 0,
+                _ => false,
             };
-            let end = pos + incoming.len();
-            if entry.data.len() < end {
-                // Exact growth by the chunk's size, not `resize`'s doubling: a
-                // doubling grow needs ~3N of heap at the last step (old buffer,
-                // new buffer, copy), which on a 512 MiB heap put the OOM one
-                // doubling past a 135 MB file — and `alloc_error_handler` used
-                // to halt the holding core
-                // (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`). `try_reserve` is
-                // the guard that takes the spike off the machine: failure
-                // returns `ENOMEM` to ring 3, which is what Linux does.
-                if entry.data.try_reserve(end - entry.data.len()).is_err() {
-                    return Err(errno::ENOMEM);
-                }
-                entry.data.resize(end, 0);
+            if !writable {
+                return Err(errno::EBADF); // opened read-only, or not a file
             }
-            entry.data[pos..end].copy_from_slice(&incoming);
-            if let FileDescriptor::File(f) = &mut entry.desc {
-                f.position = end;
+            let synthetic = entry_is_synthetic(entry);
+            let f = entry.file().unwrap();
+            let pos = f.position;
+            if synthetic {
+                Ok((None, alloc::string::String::new(), pos))
+            } else {
+                Ok((Some(()), f.path.clone(), pos))
             }
-            Ok(incoming.len())
         });
-        match step {
-            Some(Ok(n)) => written += n,
+        let (real, path, pos) = match resolved {
+            Some(Ok(v)) => v,
             Some(Err(e)) => return e,
             None => return errno::EBADF,
+        };
+        let step = match real {
+            None => {
+                // Synthetic: grow the cached render exactly as before.
+                let n = incoming.len();
+                match with_file(fd, |entry| {
+                    let end = pos + n;
+                    if entry.data.len() < end {
+                        // Exact growth by the chunk's size, not `resize`'s
+                        // doubling — the guard that took the ~3N heap spike
+                        // off the machine in slice 1
+                        // (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`).
+                        if entry.data.try_reserve(end - entry.data.len()).is_err() {
+                            return Err(errno::ENOMEM);
+                        }
+                        entry.data.resize(end, 0);
+                    }
+                    entry.data[pos..end].copy_from_slice(&incoming);
+                    if let FileDescriptor::File(f) = &mut entry.desc {
+                        f.position = end;
+                    }
+                    Ok(())
+                }) {
+                    Some(Ok(())) => Ok(n),
+                    Some(Err(e)) => Err(e),
+                    None => Err(errno::EBADF),
+                }
+            }
+            Some(()) => match akuma_vfs_glue::write_at(&path, pos, &incoming) {
+                // Short/partial writes: `write_at` returns what it placed,
+                // and the cursor moves by that — the caller retries the rest,
+                // which is `write(2)`'s contract.
+                Ok(n) => {
+                    with_file(fd, |entry| {
+                        if let Some(f) = entry.file() {
+                            f.position = pos + n;
+                        }
+                    });
+                    Ok(n)
+                }
+                Err(e) => Err(fs_err_errno(e)),
+            },
+        };
+        match step {
+            Ok(0) => {
+                // A zero-byte placement means the write is not progressing
+                // (out of space at this cursor); report what was written so
+                // far, or `ENOSPC` if that is nothing.
+                return if written == 0 { errno::ENOSPC } else { written as u64 };
+            }
+            Ok(n) => written += n,
+            Err(e) => return if written == 0 { e } else { written as u64 },
         }
     }
     len
@@ -1889,11 +2048,40 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     let Some(fi) = file_index(fd) else {
         return errno::EBADF;
     };
+    // `SEEK_END` needs the size: synthetic from the cache, real from the VFS.
+    // One `metadata` outside the lock for the real case — the rule `release`
+    // states about disk I/O under `FILES`.
+    let (total, was_real) = {
+        let files = FILES.lock();
+        let Some(entry) = files[fi].as_ref() else {
+            return errno::EBADF;
+        };
+        let synthetic = entry_is_synthetic(entry);
+        let t = if synthetic { entry.data.len() } else { 0 };
+        (t, !synthetic && !entry.is_dir)
+    };
+    let total = if was_real {
+            let path = {
+                let files = FILES.lock();
+                match files[fi].as_ref().map(|e| match &e.desc {
+                    FileDescriptor::File(f) => Some(f.path.clone()),
+                    _ => None,
+                }) {
+                    Some(Some(p)) => p,
+                    _ => return errno::EBADF,
+                }
+            };
+        match fs::metadata(&path) {
+            Ok(m) => m.size as usize,
+            Err(_) => return errno::EIO,
+        }
+    } else {
+        total
+    };
     let mut files = FILES.lock();
     let Some(entry) = files[fi].as_mut() else {
         return errno::EBADF;
     };
-    let total = entry.data.len();
     let Some(file) = entry.file() else {
         return errno::EBADF;
     };
@@ -2107,16 +2295,29 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
-        let Some(triple) = with_file(fd, |entry| {
+        // Size: synthetic from the cache, real from the VFS — one `metadata`
+        // outside the lock, the rule `release` states about disk I/O.
+        let resolved = with_file(fd, |entry| {
             if entry.is_dir {
-                (S_IFDIR_0755, 0u64, 2u64)
-            } else {
-                (S_IFREG_0644, entry.data.len() as u64, 1u64)
+                return None;
             }
-        }) else {
-            return errno::EBADF;
-        };
-        triple
+            let synthetic = entry_is_synthetic(entry);
+            let size = if synthetic { entry.data.len() as u64 } else { 0 };
+            let path = entry.file()?.path.clone();
+            Some((synthetic, size, path))
+        });
+        match resolved.flatten() {
+            None => return errno::EBADF,
+            Some((true, _, _)) => (S_IFDIR_0755, 0u64, 2u64),
+            Some((false, cached_size, path)) => {
+                let size = if cached_size == 0 {
+                    fs::metadata(&path).map_or(0, |m| m.size)
+                } else {
+                    cached_size
+                };
+                (S_IFREG_0644, size, 1u64)
+            }
+        }
     };
     let st = encode_stat(mode, size, 0, nlink, None, None, None);
     if errno::is_err(copy_to_user(statbuf, &st)) {
