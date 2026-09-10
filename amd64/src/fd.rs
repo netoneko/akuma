@@ -1583,247 +1583,179 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> u64 
     ))
 }
 
-/// `poll(fds, nfds, timeout_ms)` — x86_64 syscall 7.
+/// `poll(fds, nfds, timeout_ms)` — x86_64 syscall 7. **Glue's `ppoll` arm**
+/// (4b batch 4b) behind a millisecond-to-`Option<u64>` conversion.
 ///
-/// Enough of `poll` for an interactive `busybox sh`: its line editor calls
-/// `poll(&stdin, 1, -1)` on every keystroke, and an `ENOSYS` there sent it into
-/// a tight retry loop printing `sh: poll: Function not implemented` forever.
+/// `poll(2)` and `ppoll(2)` differ in exactly one thing — how they spell the
+/// timeout — so this arm converts and [`sys_ppoll`] does not. `int timeout` in
+/// milliseconds arrives sign-extended in a 64-bit register: `< 0` is "wait
+/// forever" (`None`), `0` is one non-blocking pass, and anything else scales to
+/// microseconds. `as i32` is what recovers the sign, and it is why `-1` does not
+/// read as an 18-quintillion-millisecond wait.
 ///
-/// Readiness is real for the fds a shell actually polls — a stdin/stdout pipe
-/// (checked non-destructively) and the console — and optimistic (always ready)
-/// for a regular file, which POSIX allows. A UDP socket fd is real too (see
-/// [`poll_ready`]) — musl's stub DNS resolver polls one waiting for a reply. A
-/// TCP socket fd still reports **not** ready: nothing on this target polls a
-/// stream socket yet, and a false `POLLIN` would send the caller into a
-/// blocking `recv`. `POLLNVAL` is not distinguished from "not ready".
+/// # What the fold changed, and it is all of the interesting part
 ///
-/// Timeout: `< 0` waits indefinitely (yield-and-retry, so `sshd` and the
-/// netpoll daemon keep running); `0` is one non-blocking pass; `> 0` is
-/// approximated by a bounded yield budget — this target has no calibrated
-/// clock, and the finite-timeout polls a shell makes are short escape-sequence
-/// disambiguations that tolerate the imprecision.
+/// The loop this replaced was a **yield budget**: it re-scanned every fd, called
+/// `crate::sched::yield_now()`, and counted laps, approximating a finite timeout
+/// at "200 laps per millisecond, capped at two million". Glue's loop is
+/// `akuma_net_yarn::WaitMachine` under `WaitPolicy::epoll` — it registers the
+/// calling thread as a **waker** on each polled resource, parks (capped at the
+/// 10 ms blocking-poll interval so a resource with no waker is still re-checked),
+/// compares against a real deadline, and honours
+/// `should_interrupt_blocking_syscall` for `EINTR`. Four consequences, each of
+/// them a fix rather than a wash:
+///
+/// - **A finite timeout is now a timeout.** The budget approximated one with a
+///   lap count on a target whose lap cost is not fixed; `clock::uptime_us` is
+///   real here and the machine reads it.
+/// - **`nfds == 0` blocks.** It used to yield once and return 0. musl's
+///   `pause()` is exactly `ppoll(NULL, 0, NULL, …)`, so `alarm()` + `pause()`
+///   was a no-op that returned instantly. Glue's arm carries the fix and its
+///   comment.
+/// - **A signal interrupts the wait.** The budget loop had no interrupt check at
+///   all, so a `poll(-1)` slept through its own `SIGALRM` — nothing returned to
+///   the syscall-return path that delivers it.
+/// - **The wait stops spinning.** A blocked `poll` was a `yield_now` loop, so it
+///   consumed a full share of every scheduling round; it parks now.
+///
+/// The readiness answers change too, in the direction of more of them being
+/// real — see [`poll_console_state`], which is the one thing on this target
+/// glue's map cannot know.
 pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
-    const POLLIN: u16 = 0x001;
-    const POLLOUT: u16 = 0x004;
-    const MAX_NFDS: u64 = 64;
-
-    if nfds == 0 {
-        // A bare `poll(NULL, 0, ms)` is a sleep; with no clock, yield once.
-        crate::sched::yield_now();
-        return 0;
-    }
-    if fds == 0 || nfds > MAX_NFDS {
-        return errno::EINVAL;
-    }
-    let n = nfds as usize;
-    let timeout = timeout_ms as i32;
-
-    // Budget for a finite timeout: bounded so a stuck poll cannot wedge the
-    // task. Infinite (`< 0`) loops until something is ready.
-    let mut budget: u64 = match timeout {
-        0 => 1,
-        t if t < 0 => u64::MAX,
-        t => (t as u64).saturating_mul(200).min(2_000_000),
+    let timeout = match timeout_ms as i32 {
+        ms if ms < 0 => None,
+        ms => Some((ms as u64).saturating_mul(1_000)),
     };
-
-    loop {
-        let mut ready = 0u64;
-        for i in 0..n {
-            let base = fds + (i as u64) * 8;
-            // A `struct pollfd` (8 bytes): fd at +0, events at +4, revents at +6.
-            let (Some(fd), Some(events)) =
-                (crate::uaccess::read_val::<i32>(base), crate::uaccess::read_val::<u16>(base + 4))
-            else {
-                return errno::EFAULT;
-            };
-            let mut revents = 0u16;
-            if fd >= 0 {
-                let (r, w) = poll_ready(fd as u64);
-                if r && events & POLLIN != 0 {
-                    revents |= POLLIN;
-                }
-                if w && events & POLLOUT != 0 {
-                    revents |= POLLOUT;
-                }
-            }
-            if !crate::uaccess::write_val::<u16>(base + 6, revents) {
-                return errno::EFAULT;
-            }
-            if revents != 0 {
-                ready += 1;
-            }
-        }
-        if ready != 0 {
-            return ready;
-        }
-        budget -= 1;
-        if budget == 0 {
-            return 0;
-        }
-        crate::sched::yield_now();
-    }
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::poll::ppoll_timeout_us(
+        fds,
+        nfds as usize,
+        timeout,
+    ))
 }
 
-/// `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23.
+/// `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. **Glue's
+/// arm**, unconverted: the `struct timespec` read is glue's own
+/// (`akuma_syscalls_time::read_timeout_us`), which is the one place in the tree
+/// that decodes a poll timeout.
 ///
-/// The bit arithmetic, the return-value rule (a fd ready in both directions
-/// counts **twice**) and the fd-set shape are `akuma-syscalls-poll`'s — the
-/// same host-tested module the AArch64 kernel's `pselect6` marshals through.
-/// Hand-rolling them here was the tree's known failure mode and bought nothing:
-/// this module first shipped `poll` without `select`, and `apk` — which waits
-/// for post-connect socket writability through exactly this syscall (the
-/// AArch64 side's own `APK_MISSING_SYSCALLS.md` records the pselect6 twin of
-/// this bug) — spun `select -> ENOSYS` and wedged its TLS fetch mid-handshake.
+/// This used to fold the `timespec` down to *milliseconds* here and call
+/// [`sys_poll`], which threw away every sub-millisecond timeout — a `ppoll` of
+/// 500 µs became 0 and returned immediately. Nanoseconds survive now.
 ///
-/// The probes are this target's [`poll_ready`], the same readiness source
-/// `sys_poll` uses. `exceptfds` is received, and **overwritten to all-zero on
-/// the way out** — this kernel never reports exception conditions, and a set
-/// the kernel received but did not write comes back exactly as the caller
-/// passed it (the libcurl `CURL_CSELECT_ERR` bug in
-/// `docs/runbooks/cargo-cannot-reach-crates-io.md`).
+/// The `sigmask` is still ignored, on both kernels: glue takes it as `_sigmask`.
+/// A `ppoll` that atomically swaps the signal mask for the duration of the wait
+/// is the whole reason the call exists over `poll`, and neither kernel does it.
+/// Nothing in this tree passes a non-NULL mask, so it is a pinned divergence
+/// rather than a gap being closed here.
+pub fn sys_ppoll(fds: u64, nfds: u64, timeout: u64, sigmask: u64) -> u64 {
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::poll::sys_ppoll(
+        fds,
+        nfds as usize,
+        timeout,
+        sigmask,
+    ))
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23. **Glue's
+/// `pselect6` arm** (4b batch 4b) behind a `struct timeval` conversion.
 ///
-/// Timeout is `struct timeval { i64 tv_sec, i64 tv_usec }` (16 bytes); NULL
-/// blocks until something is ready. Linux's "returns the remaining time in
-/// the struct" behaviour is a divergence this target pins: the struct is left
-/// untouched, which nothing in this tree relies on.
+/// x86_64 is the architecture that has *both* spellings, and musl uses this one:
+/// `src/select/select.c` compiles its `#ifdef SYS_select` branch here and its
+/// `pselect6` branch on aarch64, which is why the two kernels needed two arms
+/// for one call. The difference is the timeout struct — `{ tv_sec, tv_usec }`
+/// against `{ tv_sec, tv_nsec }` — and the conversion below is the whole of it.
+///
+/// A NULL pointer blocks forever. `tv_usec` outside `0..1_000_000` is `EINVAL`,
+/// which Linux also enforces and which is what keeps a garbage `timeval` from
+/// becoming a very long wait.
+///
+/// # The divergences, carried
+///
+/// - **The struct is not updated on return.** Linux writes the remaining time
+///   back into it. Glue's `pselect6` cannot (its ABI has no such rule) and this
+///   arm never did; nothing in this tree reads it.
+/// - **`exceptfds` comes back all-zero**, and that is glue's arm doing it, not
+///   this one. It is load-bearing: a set the kernel *received* but did not write
+///   comes back exactly as the caller passed it, and cargo's vendored libcurl
+///   compiles the `select()` branch of `Curl_poll()` and reads `POLLPRI` out of
+///   the stale set — `docs/runbooks/cargo-cannot-reach-crates-io.md`. Both
+///   implementations had the rule; only one of them has the regression test.
+/// - **`nfds == 0` returns 0 immediately** instead of sleeping out the timeout.
+///   Glue's divergence, unchanged by the fold, and the opposite of `ppoll`'s
+///   (which was fixed) — stated here because the pair now sits in one place.
+///
+/// # What the fold buys
+///
+/// A **listening** TCP socket is readable when a connection is waiting. This
+/// arm's own readiness probe asked `akuma_net::socket::socket_tcp_ready`, which
+/// resolves a single smoltcp handle and answers `(false, false)` for a listener
+/// — a pool of `MAX_BACKLOG` handles, not one — so `select` on a listening fd
+/// could never report a pending connection, and an event-driven server that
+/// waits before calling `accept` waited forever. Glue's probe asks
+/// `listener_ready`, which also reaps backlog handles that died unaccepted.
 pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) -> u64 {
-    use akuma_syscalls_poll::fdset::{bytes, interests, nfds_ok, Interest, MAX_WORDS};
-
-    const EPOLLIN: u32 = 0x001;
-    const EPOLLOUT: u32 = 0x004;
-
-    let nfds = nfds as usize;
-    if !nfds_ok(nfds) {
-        return errno::EINVAL;
-    }
-    let nb = bytes(nfds);
-
-    // Zeroed MAX_WORDS buffers, filled only up to `nb`: `is_set` reads past
-    // `nb` as clear, so the tail needs no copy.
-    let mut in_read = [0u64; MAX_WORDS];
-    let mut in_write = [0u64; MAX_WORDS];
-    // `exceptfds` is part of the ABI even though no probe here can raise it:
-    // received (so a bad pointer faults loudly at the boundary, not later),
-    // then replaced with zeroes on the way back.
-    let mut in_except = [0u64; MAX_WORDS];
-    for (dst, src) in [
-        (&mut in_read, readfds),
-        (&mut in_write, writefds),
-        (&mut in_except, exceptfds),
-    ] {
-        if src != 0 {
-            let Some(v) = copy_in(src, nb as u64) else {
-                return errno::EFAULT;
-            };
-            for (dst_w, chunk) in dst[..nb / 8].iter_mut().zip(v.as_chunks::<8>().0) {
-                *dst_w = u64::from_le_bytes(*chunk);
-            }
-        }
-    }
-    let mut out_read = [0u64; MAX_WORDS];
-    let mut out_write = [0u64; MAX_WORDS];
-
-    // The timeout, decoded once. `None` = block forever.
-    let deadline_budget: Option<u64> = if timeout == 0 {
-        Some(1)
+    let deadline = if timeout == 0 {
+        None
     } else {
+        // `struct timeval { i64 tv_sec, i64 tv_usec }` — 16 bytes.
         let Some([sec, usec]) = crate::uaccess::read_val::<[i64; 2]>(timeout) else {
             return errno::EFAULT;
         };
         if sec < 0 || !(0..1_000_000).contains(&usec) {
             return errno::EINVAL;
         }
-        let ms = (sec as u64).saturating_mul(1000).saturating_add(usec as u64 / 1000);
-        Some(ms.saturating_mul(200).clamp(1, 2_000_000))
+        Some((sec as u64).saturating_mul(1_000_000).saturating_add(usec as u64))
     };
-
-    let mut budget = deadline_budget.unwrap_or(u64::MAX);
-    loop {
-        let mut ready = 0u64;
-        for i in interests(&in_read, &in_write, nfds) {
-            let Interest { fd, in_read: r, in_write: w } = i;
-            let (pr, pw) = poll_ready(fd as u64);
-            let mut revents = 0u32;
-            if r && pr {
-                revents |= EPOLLIN;
-            }
-            if w && pw {
-                revents |= EPOLLOUT;
-            }
-            ready += i.record(revents, &mut out_read, &mut out_write);
-        }
-        if ready != 0 {
-            for (src, ptr) in [
-                (&out_read, readfds),
-                (&out_write, writefds),
-                // `in_except` is zeroed, so `is_set` over it is always false —
-                // written back all-zero, which is the overwrite rule.
-                (&in_except, exceptfds),
-            ] {
-                if ptr != 0 {
-                    let flat: Vec<u8> = src.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    if errno::is_err(copy_to_user(ptr, &flat[..nb])) {
-                        return errno::EFAULT;
-                    }
-                }
-            }
-            return ready;
-        }
-        if budget == 1 {
-            break;
-        }
-        budget -= 1;
-        crate::sched::yield_now();
-    }
-    // Timed out: the sets come back zeroed, matching the ready path's shape.
-    for ptr in [readfds, writefds, exceptfds] {
-        if ptr != 0 {
-            let zero = [0u8; 128];
-            if errno::is_err(copy_to_user(ptr, &zero[..nb])) {
-                return errno::EFAULT;
-            }
-        }
-    }
-    0
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::poll::pselect6_timeout_us(
+        nfds as usize,
+        readfds,
+        writefds,
+        exceptfds,
+        deadline,
+    ))
 }
 
-/// `(readable, writable)` for one fd, for [`sys_poll`]. Non-destructive.
-fn poll_ready(fd: u64) -> (bool, bool) {
-    // Same rule as `sys_read`: an *unbound* 0/1/2 is the console, a bound one
-    // has been redirected and is described by what it now names — so the
-    // console answers here are guarded, not first. The `Spawn`-row questions
-    // this used to ask ("does this task have a stdin/stdout pipe?") are gone
-    // with C2 slice 6: a spawned child's 0/1/2 are descriptors and fall through
-    // to the pipe arms below.
-    match console_end(fd) {
-        Some(ConsoleEnd::Read) => return (crate::input::has_byte(), false),
-        Some(ConsoleEnd::Write) => return (false, true),
-        None => {}
+/// **This target's by-number console, for the poll family's readiness map** —
+/// `akuma_syscalls_glue::SyscallHooks::poll_console_state`, registered in
+/// `boot::install_shared_sinks`.
+///
+/// The one thing glue's readiness map cannot answer here, and the same preamble
+/// [`sys_read`] and [`sys_write`] carry for the same reason. Glue reaches the
+/// console through a `ProcessChannel`; **no process on this target has one**
+/// (a spawned child's stdio is a pipe from `bind_stdio`, and init on the serial
+/// line has nothing), so both of the answers glue would otherwise give are
+/// wrong:
+///
+/// - A **bound** `Stdin` — what `SharedFdTable::with_stdio` puts at fd 0 for
+///   every registered process, so `INIT=/bin/busybox INITARGS=sh` on the serial
+///   line — hits glue's `Stdin` arm, finds `current_channel() == None`, and
+///   reports never-readable. A line editor polling stdin per keystroke would
+///   never wake.
+/// - An **unbound** 0/1/2 — the boot task, which holds no descriptors at all —
+///   is not in the fd table, so glue reports `FdState::Missing`, which is
+///   `EPOLLHUP | EPOLLERR`: not "nothing yet" but "this fd is finished".
+///
+/// [`console_end`] is the test, so both spellings are covered and a *redirected*
+/// 0/1/2 is not claimed — a spawned child's fd 0 is a `PipeRead` and answers
+/// `None` here, falling through to glue's pipe arm, which is the one with a real
+/// waker.
+///
+/// Returning an [`FdState`](akuma_syscalls_poll::readiness::FdState) rather than
+/// event bits is deliberate: the console is then mapped by the same host-tested
+/// table as every other resource instead of beside it.
+///
+/// **There is no waker.** `crate::input::has_byte()` is a poll of the UART and
+/// the PS/2 buffer, and nothing on this target rings a bell when a byte lands.
+/// The wait loop's park is capped at the 10 ms blocking-poll interval for
+/// exactly this case, so a keystroke costs up to one interval — against the
+/// pre-fold `yield_now` spin, which noticed sooner and burned a core to do it.
+pub fn poll_console_state(fd: u32) -> Option<akuma_syscalls_poll::readiness::FdState> {
+    use akuma_syscalls_poll::readiness::FdState;
+    match console_end(u64::from(fd))? {
+        ConsoleEnd::Read => Some(FdState::Stdin { has_data: crate::input::has_byte() }),
+        // Always writable: the serial port never blocks.
+        ConsoleEnd::Write => Some(FdState::Sink),
     }
-    if let Some(p) = pipe_read_id(fd) {
-        return (crate::pipe::readable(p), false);
-    }
-    if let Some(p) = pipe_write_id(fd) {
-        return (false, crate::pipe::writable(p));
-    }
-    if let Some(idx) = socket_index(fd) {
-        // UDP: real readiness, via `akuma_net::socket::socket_udp_recv_ready`
-        // — needed since musl's stub DNS resolver `sendto`s a query then
-        // `poll`s the same socket for the reply, and a socket that always
-        // "isn't ready" makes every reply look like a timeout no matter how
-        // fast smoltcp actually receives it (`sys_sendto`'s doc has the rest
-        // of that bug). TCP: real readiness both ways via `socket_tcp_ready`
-        // — since `select(2)` arrived, `apk` polls a stream socket for
-        // post-connect writability, and the old hard-coded `(false, false)`
-        // turned every such wait into a permanent one (`sys_select`'s doc).
-        if akuma_net::socket::is_udp_socket(idx) {
-            return (akuma_net::socket::socket_udp_recv_ready(idx), false);
-        }
-        return akuma_net::socket::socket_tcp_ready(idx);
-    }
-    // A regular file: always ready, per POSIX.
-    let in_table = is_bound(fd);
-    (in_table, in_table)
 }
 
 /// `access(path)` / `faccessat(.., path, ..)` — does the path resolve?
@@ -1844,20 +1776,93 @@ pub fn sys_access(path: u64) -> u64 {
     ))
 }
 
-/// `ioctl(fd, request, arg)` — the terminal subset, plus `ENOTTY` for the rest.
+/// `ioctl(fd, request, arg)` — this target's fake tty, then **glue's arm**
+/// (4b batch 4b).
 ///
-/// An interactive `busybox sh` probes its stdin with `TCGETS` on startup and, if
-/// that fails, decides stdin is **not** a terminal: it prints no prompt, does no
-/// line editing, and reads to EOF — which over an SSH channel looks exactly like
-/// a hang. So fd 0/1/2 answer `TCGETS`/`TIOCGWINSZ` with a plausible cooked-mode
-/// `termios` and an 80x24 `winsize`, and accept the setters as no-ops. There is
-/// still no real line discipline on the pipe (`SPAWN_FLAG_PTY` is ignored), so
-/// the shell does its own editing on raw bytes — this only stops it giving up.
+/// # The divergence the preamble exists for
 ///
-/// Everything else, and any request on a non-console fd, stays `ENOTTY` rather
-/// than `ENOSYS`: a libc asking "is this a tty?" treats `ENOTTY` as a clean no,
-/// where `ENOSYS` reads as a broken kernel and some runtimes abort on it.
+/// This is the one place in the whole 4b fold where the two kernels do not
+/// disagree by accident. They implement **two different interactive-shell
+/// architectures** and each answers `TCGETS` on a pipe the way its own
+/// architecture requires:
+///
+/// - **Here**, a spawned child's stdin *is* a pipe — `bind_stdio` gives it one
+///   and there is no `ProcessChannel` and no PTY — so the pipe has to *be* the
+///   terminal, faked at `ioctl`. An interactive `busybox sh` probes stdin with
+///   `TCGETS` on startup and, if it fails, decides stdin is not a terminal: no
+///   prompt, no line editing, read to EOF. Over an ssh channel that is
+///   indistinguishable from a hang.
+/// - **Glue** checks the fd *table entry* and answers `ENOTTY` for a
+///   `PipeRead`, deliberately — "so shells like busybox run non-interactively
+///   over the SSH-into-box bridge instead of launching a line editor that hangs
+///   on an `ESC[6n` cursor query" (`TTY_SHENANIGANS.md` round 3). On that
+///   kernel the exec bridge hands the child a `ProcessChannel` that reports
+///   `is_terminal()` for a real PTY session, *separately* from its stdio pipes,
+///   so the table entry is free to be the ground truth.
+///
+/// Neither answer is wrong for its own kernel and neither can be adopted by the
+/// other, so this arm keeps its own answers for the requests that decide the
+/// question and delegates the rest. The preamble is `fd < FIRST_FILE_FD ||
+/// console_end(fd).is_some() || dev_node_of(fd) == Some("tty")` — the first
+/// term is the load-bearing one and is what claims a spawned child's pipe at
+/// fd 0; the second adds the descriptor spelling (a registered process's own
+/// `Stdin`/`Stdout`/`Stderr`); the third is the fd a pager opens on `/dev/tty`
+/// to read keys from, which is never 0/1/2.
+///
+/// The real fix is to give an amd64 sshd session's child a terminal-capable
+/// `ProcessChannel` — the deferred `/proc/<pid>/fd/0` + `delegate_pid` work in
+/// `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Then this preamble goes away,
+/// `poll`'s `Stdin` arm starts working on its own, and INTR→SIGINT on the
+/// foreground group becomes possible. It is one coherent piece of work and it
+/// is not this batch.
+///
+/// # What glue adds
+///
+/// Everything this arm never had, and each of them has a caller in the tree:
+/// `FIONBIO` (the non-blocking flag, which `fcntl` already tracked and `ioctl`
+/// could not set), `FIONREAD` (bytes available — answered per fd kind, so a
+/// pipe and a socket give real counts), `FIOCLEX`/`FIONCLEX` (the close-on-exec
+/// flag), `FIOASYNC` (a no-op success, without which nginx's
+/// `ngx_spawn_process` refuses to fork at all), and the `SIOCGIF*` block.
+///
+/// # Two carried behaviour changes
+///
+/// - **`SIOCGIF*` now requires a socket fd.** This arm answered them on *any*
+///   descriptor; glue gates them on `FileDescriptor::Socket(_)` and otherwise
+///   says `ENOTTY`. That is Linux (they are socket ioctls) and `busybox
+///   ifconfig` always holds an `AF_INET` socket, so the tightening costs
+///   nothing real — but the boot suite's checks were passing an unopened fd 3
+///   and moved to `sock::smoke_test`, which has a real one.
+/// - **A request on a non-console fd with no registered process is `ESRCH`,
+///   not `ENOTTY`.** Glue's first line is `current_process_shared()`. Only the
+///   boot task can be in that state, and `boot_row_register` is the answer the
+///   suite already uses for it (4b batch 2b).
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
+    // The by-number/by-descriptor console, plus a `/dev/tty` fd. See the header:
+    // the `fd < FIRST_FILE_FD` term is the fake tty and is the reason this
+    // preamble exists at all.
+    let is_console =
+        fd < FIRST_FILE_FD as u64 || console_end(fd).is_some() || dev_node_of(fd) == Some("tty");
+    if is_console
+        && let Some(r) = console_ioctl(req, arg)
+    {
+        return r;
+    }
+    // Everything else — including any request on a console fd that the terminal
+    // subset above does not claim, which glue also answers `ENOTTY`.
+    akuma_syscalls_glue::term::sys_ioctl(fd as u32, req as u32, arg)
+}
+
+/// The terminal subset this target answers itself, for a console fd.
+///
+/// `None` means "not one of mine" and sends the caller on to glue's arm. The
+/// values are fixed rather than read out of a `TerminalState`, and that is the
+/// difference from glue's versions of the same requests: there is no line
+/// discipline on this target to describe (`SPAWN_FLAG_PTY` is ignored, the shell
+/// does its own editing on raw bytes), so what these report is what a cooked
+/// 80x24 terminal *would* look like — enough that `isatty` says yes and a shell
+/// does not give up.
+fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
     // x86_64 ioctl request numbers (arch-generic for these).
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
@@ -1869,29 +1874,10 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCSCTTY: u64 = 0x540E;
 
-    // Read-only interface introspection. `busybox ifconfig` issues these on an
-    // AF_INET socket fd, so they are handled before the "non-console fd →
-    // ENOTTY" gate below. Shared layout with the aarch64 kernel.
-    if akuma_syscalls_net::cmd::is_interface_query(req as u32) {
-        return siocgif(req as u32, arg);
-    }
-
-    // `fd < FIRST_FILE_FD` stays the first term on purpose: a spawned child's
-    // 0/1/2 are **pipes**, and answering `TCGETS` on them is what makes
-    // `isatty(0)` true for an interactive shell over ssh. The two new terms
-    // add the descriptor spellings: a bound `Stdin`/`Stdout`/`Stderr` (a
-    // registered process's own stdio) and an fd opened on `/dev/tty`, which is
-    // where a pager asks for the terminal it will read keys from.
-    let is_console =
-        fd < FIRST_FILE_FD as u64 || console_end(fd).is_some() || dev_node_of(fd) == Some("tty");
-    if !is_console {
-        return errno::ENOTTY;
-    }
-
-    match req {
+    Some(match req {
         TCGETS => {
             if arg == 0 {
-                return errno::EFAULT;
+                return Some(errno::EFAULT);
             }
             // Kernel `struct termios`: c_iflag/oflag/cflag/lflag (u32 each),
             // c_line (u8), c_cc[19]. 36 bytes; a couple extra do no harm.
@@ -1904,7 +1890,10 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             put(&mut t, 8, 0x0000_00BF); // c_cflag = B38400 | CS8 | CREAD
             put(&mut t, 12, 0x0000_8A3B); // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
             // c_cc, the control characters that matter: VERASE, VKILL, VEOF,
-            // VINTR, VQUIT, VSUSP, VMIN, VTIME.
+            // VINTR, VQUIT, VSUSP, VMIN, VTIME. `c_cc[0]` is at byte **17** —
+            // byte 16 is `c_line`, which is not part of the array. Glue's
+            // `term::sys_ioctl` writes its `cc` at 16 and is one byte off for
+            // every control character; see the batch doc's § "found, not fixed".
             t[17] = 0x03; // VINTR  = ^C
             t[18] = 0x1C; // VQUIT  = ^\
             t[19] = 0x7F; // VERASE = DEL
@@ -1914,20 +1903,20 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             t[23] = 0x01; // VMIN   = 1
             t[27] = 0x1A; // VSUSP  = ^Z
             if errno::is_err(copy_to_user(arg, &t)) {
-                return errno::EFAULT;
+                return Some(errno::EFAULT);
             }
             0
         }
         TIOCGWINSZ => {
             if arg == 0 {
-                return errno::EFAULT;
+                return Some(errno::EFAULT);
             }
             // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }.
             let mut w = [0u8; 8];
             w[0..2].copy_from_slice(&24u16.to_le_bytes()); // ws_row
             w[2..4].copy_from_slice(&80u16.to_le_bytes()); // ws_col
             if errno::is_err(copy_to_user(arg, &w)) {
-                return errno::EFAULT;
+                return Some(errno::EFAULT);
             }
             0
         }
@@ -1936,12 +1925,12 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         TCSETS | TCSETSW | TCSETSF | TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
         TIOCGPGRP => {
             if arg != 0 && errno::is_err(copy_to_user(arg, &1i32.to_le_bytes())) {
-                return errno::EFAULT;
+                return Some(errno::EFAULT);
             }
             0
         }
-        _ => errno::ENOTTY,
-    }
+        _ => return None,
+    })
 }
 
 /// `(start, end, readable, write, exec, private)` — one mapping.
@@ -2096,79 +2085,15 @@ fn proc_consistency_check(t: &mut Suite) {
     }
 }
 
-/// The two synthetic interfaces `ifconfig` sees: `lo` and the live smoltcp
-/// `eth0`. Built fresh each call so a DHCP change is reflected.
-fn interfaces() -> [akuma_syscalls_net::Interface; 2] {
-    let snap = akuma_net::smoltcp_net::interface_snapshot();
-    [
-        akuma_syscalls_net::Interface::loopback(),
-        akuma_syscalls_net::Interface::ethernet(
-            snap.ip,
-            snap.prefix_len,
-            snap.mac,
-            u32::from(snap.mtu),
-        ),
-    ]
-}
+// `interfaces()` and `siocgif()` — the `struct ifreq`/`struct ifconf`
+// marshalling behind `busybox ifconfig` — left with the `ioctl` fold (4b batch
+// 4b). They were a **byte-for-byte** duplicate of `akuma_syscalls_glue::net`'s
+// `net_ifaces` + `sys_ioctl_siocgifconf`/`sys_ioctl_siocgifreq`, right down to
+// building the two-interface array fresh on every call so a DHCP change shows
+// up; both sides already marshalled through the same `akuma-syscalls-net`, so
+// there was one layout and two copies of the user-copy loop around it. What the
+// delegation adds is the socket-fd gate — see `sys_ioctl`'s header.
 
-/// `SIOCGIFCONF` / `SIOCGIF{FLAGS,ADDR,NETMASK,BRDADDR,MTU,HWADDR}` — the
-/// read-only half of `ifconfig`. The `struct ifreq` / `struct ifconf` byte
-/// layout is `akuma-syscalls-net`; this does the user copies.
-fn siocgif(cmd: u32, arg: u64) -> u64 {
-    use akuma_syscalls_linux::net::{IFREQ_UNION_OFFSET, SIZEOF_IFREQ};
-
-    if arg == 0 {
-        return errno::EFAULT;
-    }
-    let ifaces = interfaces();
-
-    if cmd == akuma_syscalls_net::cmd::SIOCGIFCONF {
-        // struct ifconf { i32 ifc_len; i32 _pad; u64 ifc_buf; }
-        let Some(len) = crate::uaccess::read_val::<i32>(arg) else {
-            return errno::EFAULT;
-        };
-        let Some(buf) = crate::uaccess::read_val::<u64>(arg + 8) else {
-            return errno::EFAULT;
-        };
-        let written = if buf == 0 {
-            akuma_syscalls_net::siocgifconf_size(&ifaces)
-        } else {
-            let cap = usize::try_from(len).unwrap_or(0);
-            let fit = akuma_syscalls_net::siocgifconf_capacity(&ifaces, cap);
-            for (i, iface) in ifaces.iter().take(fit).enumerate() {
-                let rec = akuma_syscalls_net::siocgifconf_record(iface);
-                if errno::is_err(copy_to_user(buf + (i * SIZEOF_IFREQ) as u64, &rec)) {
-                    return errno::EFAULT;
-                }
-            }
-            fit * SIZEOF_IFREQ
-        };
-        let n = i32::try_from(written).unwrap_or(i32::MAX);
-        if !crate::uaccess::write_val::<i32>(arg, n) {
-            return errno::EFAULT;
-        }
-        return 0;
-    }
-
-    // The rest: read the 16-byte ifr_name, marshal the union member, write it
-    // back at arg + 16.
-    let mut name = [0u8; 16];
-    if !crate::uaccess::read_bytes(arg, &mut name) {
-        return errno::EFAULT;
-    }
-    let mut union = [0u8; 24];
-    match akuma_syscalls_net::siocgifreq_reply(cmd, &ifaces, &name, &mut union) {
-        Ok(n) => {
-            if errno::is_err(copy_to_user(arg + IFREQ_UNION_OFFSET as u64, &union[..n])) {
-                errno::EFAULT
-            } else {
-                0
-            }
-        }
-        Err(akuma_syscalls_net::ReplyError::NoDevice) => errno::ENODEV,
-        Err(akuma_syscalls_net::ReplyError::NotHandled) => errno::ENOTTY,
-    }
-}
 
 #[cfg(not(feature = "no-tests"))]
 /// Give the boot row a process identity for the duration of a self-test, and
@@ -2549,37 +2474,11 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         errno::ENOTTY,
     );
 
-    // `ifconfig`'s read-only ioctls, on a kernel-stack `struct ifreq` (the
-    // self-tests run inside the user-pointer bypass). `SIOCGIF*` are answered
-    // regardless of the fd, so a not-open fd is fine here.
-    const SIOCGIFADDR: u64 = 0x8915;
-    const SIOCGIFFLAGS: u64 = 0x8913;
-    let mut ifr = [0u8; 40];
-    ifr[..2].copy_from_slice(b"lo");
-    t.check_eq(
-        "fd: SIOCGIFADDR(lo) succeeds",
-        sys_ioctl(3, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
-        0,
-    );
-    t.check("fd: SIOCGIFADDR(lo) returns 127.0.0.1", ifr[20..24] == [127, 0, 0, 1]);
-    ifr = [0u8; 40];
-    ifr[..4].copy_from_slice(b"eth0");
-    t.check_eq(
-        "fd: SIOCGIFFLAGS(eth0) succeeds",
-        sys_ioctl(3, SIOCGIFFLAGS, ifr.as_mut_ptr() as u64),
-        0,
-    );
-    t.check(
-        "fd: eth0 is UP|BROADCAST|RUNNING|MULTICAST",
-        i16::from_le_bytes([ifr[16], ifr[17]]) == akuma_syscalls_net::iff::ETHERNET,
-    );
-    ifr = [0u8; 40];
-    ifr[..3].copy_from_slice(b"zz9");
-    t.check_eq(
-        "fd: SIOCGIFADDR on an unknown interface is ENODEV",
-        sys_ioctl(3, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
-        errno::ENODEV,
-    );
+    // `ifconfig`'s read-only `SIOCGIF*` ioctls moved to `sock::smoke_test` with
+    // the `ioctl` fold (4b batch 4b). They were issued here on an **unopened**
+    // fd 3, which only worked because this module answered them regardless of
+    // the descriptor; glue gates them on a `FileDescriptor::Socket(_)`, as Linux
+    // does, and `sock::smoke_test` is the one that has a real socket fd.
     if have_fs {
         let devp = b"/proc/net/dev\0";
         let devfd = sys_openat(0, devp.as_ptr() as u64, 0, 0);
@@ -2655,8 +2554,23 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         );
     }
 
-    // `poll`: a regular file is always ready; a zero-length set with a timeout
-    // is a sleep that returns 0; an oversized set is EINVAL.
+    // ── the poll family, now `akuma-syscalls-glue`'s (4b batch 4b) ──────
+    //
+    // A regular file is always ready; a zero-length set with a zero timeout
+    // returns 0; an oversized set is EINVAL.
+    //
+    // **`nfds` and the boot stack.** The oversized case asks for
+    // `fdset::MAX_FDS + 1` fds and not, as it used to, 999. 999 was chosen
+    // against this module's own 64-fd cap; the cap is now
+    // `akuma_syscalls_poll::fdset::nfds_ok` — one number for the whole poll
+    // family, where there used to be 64 here, 1024 in `pselect6` and *nothing*
+    // in `ppoll` — so 999 became a legal `nfds`. The suite runs inside
+    // `BypassValidationGuard`, so the range check that would refuse a ring-3
+    // caller 7 992 bytes of unmapped `struct pollfd` passes here, and `poll`
+    // duly wrote 7 992 bytes of `revents` back over an 8-byte **stack** array,
+    // taking the return addresses with it: the boot died in a `#GP` at a
+    // non-canonical `rip`. The number has to be above the cap for the call to
+    // be refused before any copy happens.
     let mut pfd = [0u8; 8];
     pfd[0..4].copy_from_slice(&(fd as i32).to_le_bytes());
     pfd[4..6].copy_from_slice(&0x001u16.to_le_bytes()); // POLLIN
@@ -2673,9 +2587,95 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("fd: poll(NULL, 0, 0) returns 0", sys_poll(0, 0, 0), 0);
     t.check_eq(
         "fd: poll with too many fds is EINVAL",
-        sys_poll(pfd.as_mut_ptr() as u64, 999, 0),
+        sys_poll(pfd.as_mut_ptr() as u64, akuma_syscalls_poll::fdset::MAX_FDS as u64 + 1, 0),
         errno::EINVAL,
     );
+
+    // **The console, which is the whole reason `poll` needed a preamble** —
+    // see [`poll_console_state`]. Glue resolves an fd through the process
+    // table and reaches a console through a `ProcessChannel`; this target has
+    // no channel on any process, so without the hook fd 0 polls as
+    // `POLLHUP|POLLERR` (unbound: not in the table at all) or as
+    // never-readable (bound `Stdin`, `current_channel() == None`) — either way
+    // a shell's keystroke poll never wakes.
+    //
+    // With no key pressed, the read end is **not** ready and the screen end
+    // **is** writable. A zero timeout is what keeps this from blocking: an
+    // infinite one on an idle console is exactly the hang being tested for.
+    let mut cfd = [0u8; 8];
+    cfd[4..6].copy_from_slice(&0x001u16.to_le_bytes()); // fd 0, POLLIN
+    t.check_eq("fd: poll(stdin, POLLIN, 0) on an idle console returns 0", sys_poll(cfd.as_mut_ptr() as u64, 1, 0), 0);
+    t.check_eq(
+        "fd: and reports no POLLHUP/POLLERR (the hook, not FdState::Missing)",
+        u64::from(u16::from_le_bytes(cfd[6..8].try_into().unwrap_or([0; 2]))),
+        0,
+    );
+    cfd = [0u8; 8];
+    cfd[0..4].copy_from_slice(&1i32.to_le_bytes());
+    cfd[4..6].copy_from_slice(&0x004u16.to_le_bytes()); // fd 1, POLLOUT
+    t.check_eq("fd: poll(stdout, POLLOUT) is ready", sys_poll(cfd.as_mut_ptr() as u64, 1, 0), 1);
+
+    // **A pipe pair**, which is the readiness glue actually has a waker for and
+    // the shape every `cmd | cmd` and every ssh session's stdio is. Empty: the
+    // read end is not ready, the write end is. After a byte: both.
+    {
+        let mut fds = [0u32; 2];
+        let pr = sys_pipe2(fds.as_mut_ptr() as u64, 0);
+        if t.check_eq("fd: pipe2 for the poll checks", pr, 0) {
+            let (rfd, wfd) = (u64::from(fds[0]), u64::from(fds[1]));
+            let mut p2 = [0u8; 16];
+            p2[0..4].copy_from_slice(&(rfd as i32).to_le_bytes());
+            p2[4..6].copy_from_slice(&0x001u16.to_le_bytes()); // POLLIN
+            p2[8..12].copy_from_slice(&(wfd as i32).to_le_bytes());
+            p2[12..14].copy_from_slice(&0x004u16.to_le_bytes()); // POLLOUT
+            t.check_eq(
+                "fd: poll on an empty pipe reports only the write end",
+                sys_poll(p2.as_mut_ptr() as u64, 2, 0),
+                1,
+            );
+            t.check_eq(
+                "fd: and it is the write end that is ready",
+                u64::from(u16::from_le_bytes(p2[14..16].try_into().unwrap_or([0; 2]))) & 0x004,
+                0x004,
+            );
+            let byte = [b'x'];
+            t.check_eq("fd: write one byte into the pipe", sys_write_file(wfd, byte.as_ptr() as u64, 1), 1);
+            t.check_eq(
+                "fd: poll now reports both ends",
+                sys_poll(p2.as_mut_ptr() as u64, 2, 0),
+                2,
+            );
+
+            // **`select`**, on the same pair, through glue's `pselect6`. The
+            // return value counts *bits left set*, so a pair ready in one
+            // direction each is 2. `exceptfds` must come back all-zero — the
+            // libcurl `CURL_CSELECT_ERR` rule in
+            // `docs/runbooks/cargo-cannot-reach-crates-io.md`, and the reason
+            // this arm receives a set it can never populate.
+            let mut rset = [0u64; 1];
+            let mut wset = [0u64; 1];
+            let mut eset = [0u64; 1];
+            rset[0] = 1u64 << rfd;
+            wset[0] = 1u64 << wfd;
+            eset[0] = (1u64 << rfd) | (1u64 << wfd);
+            let tv = [0i64; 2]; // a non-NULL, zero timeval: one pass
+            t.check_eq(
+                "fd: select reports both ends of a pipe with a byte in it",
+                sys_select(
+                    (wfd + 1).max(rfd + 1),
+                    rset.as_mut_ptr() as u64,
+                    wset.as_mut_ptr() as u64,
+                    eset.as_mut_ptr() as u64,
+                    tv.as_ptr() as u64,
+                ),
+                2,
+            );
+            t.check_eq("fd: select cleared exceptfds", eset[0], 0);
+
+            t.check_eq("fd: close the poll pipe read end", sys_close(rfd), 0);
+            t.check_eq("fd: close the poll pipe write end", sys_close(wfd), 0);
+        }
+    }
 
     t.check_eq("fd: close", sys_close(fd), 0);
     t.check_eq("fd: closing twice is EBADF", sys_close(fd), errno::EBADF);

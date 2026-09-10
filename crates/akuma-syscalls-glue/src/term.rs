@@ -1,7 +1,7 @@
 use super::*;
 use akuma_terminal::mode_flags;
 
-pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
+pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCGETS: u32 = 0x5401;
     const TCSETS: u32 = 0x5402;
     const TCSETSW: u32 = 0x5403;

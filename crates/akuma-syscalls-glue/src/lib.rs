@@ -153,7 +153,7 @@ mod sync;
 ///
 /// Also the floor control for the syscall boundary. See the module docs.
 pub mod version;
-mod term;
+pub mod term;
 /// Itimers, clock_gettime/settime/getres, nanosleep, adjtimex — moved to the
 /// `akuma-syscalls-time` crate 2026-08-25 (docs/archive/MISSING_NTP_SYSCALLS.md); this
 /// alias keeps every `time::sys_*` call site below unchanged.
@@ -1312,6 +1312,17 @@ pub struct SyscallHooks {
     pub utc_time_us: fn() -> Option<u64>,
     /// `smp_shared::probed_core_count` — DTB-probed core count.
     pub probed_core_count: fn() -> usize,
+    /// Is this fd the target's **by-number** console, and is it ready?
+    ///
+    /// `None` means "not a console fd of mine" and is the answer on any kernel
+    /// whose console is reached through a `ProcessChannel`; the AArch64 kernel
+    /// registers exactly that. The amd64 kernel answers the serial line by fd
+    /// number instead — see the call site at the top of
+    /// [`poll::epoll_check_fd_readiness`], which is the only reader.
+    ///
+    /// The return is a *state*, not a bitmask, so the answer still goes through
+    /// the host-tested readiness map rather than around it.
+    pub poll_console_state: fn(u32) -> Option<akuma_syscalls_poll::readiness::FdState>,
 }
 
 static HOOKS: akuma_primitives::OnceCopy<SyscallHooks> = akuma_primitives::OnceCopy::new();
@@ -1353,5 +1364,10 @@ pub(crate) mod hooks {
     }
     pub fn probed_core_count() -> usize {
         HOOKS.get().map_or(1, |h| (h.probed_core_count)())
+    }
+    pub fn poll_console_state(
+        fd: u32,
+    ) -> Option<akuma_syscalls_poll::readiness::FdState> {
+        HOOKS.get().and_then(|h| (h.poll_console_state)(fd))
     }
 }

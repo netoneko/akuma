@@ -509,6 +509,54 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
         );
     }
 
+    // **`ifconfig`'s read-only `SIOCGIF*` ioctls**, on a kernel-stack `struct
+    // ifreq` (the self-tests run inside the user-pointer bypass). Here rather
+    // than in `fd::smoke_test` since 4b batch 4b: they are **socket** ioctls,
+    // and glue's arm — which `fd::sys_ioctl` now delegates to — gates them on
+    // the descriptor being a `FileDescriptor::Socket(_)`, as Linux does. The
+    // checks used to pass an unopened fd 3 and only worked because this target
+    // answered them regardless of the fd. `fd` above is a real one.
+    {
+        const SIOCGIFADDR: u64 = 0x8915;
+        const SIOCGIFFLAGS: u64 = 0x8913;
+        let mut ifr = [0u8; 40];
+        ifr[..2].copy_from_slice(b"lo");
+        t.check_eq(
+            "sock: SIOCGIFADDR(lo) succeeds",
+            crate::fd::sys_ioctl(fd, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
+            0,
+        );
+        t.check("sock: SIOCGIFADDR(lo) returns 127.0.0.1", ifr[20..24] == [127, 0, 0, 1]);
+        ifr = [0u8; 40];
+        ifr[..4].copy_from_slice(b"eth0");
+        t.check_eq(
+            "sock: SIOCGIFFLAGS(eth0) succeeds",
+            crate::fd::sys_ioctl(fd, SIOCGIFFLAGS, ifr.as_mut_ptr() as u64),
+            0,
+        );
+        t.check(
+            "sock: eth0 is UP|BROADCAST|RUNNING|MULTICAST",
+            i16::from_le_bytes([ifr[16], ifr[17]]) == akuma_syscalls_net::iff::ETHERNET,
+        );
+        ifr = [0u8; 40];
+        ifr[..3].copy_from_slice(b"zz9");
+        t.check_eq(
+            "sock: SIOCGIFADDR on an unknown interface is ENODEV",
+            crate::fd::sys_ioctl(fd, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
+            errno::ENODEV,
+        );
+        // A `SIOCGIF*` on a descriptor that is **not** a socket is `ENOTTY` —
+        // the gate itself, which is the half of this fold that is a behaviour
+        // change rather than a move.
+        ifr = [0u8; 40];
+        ifr[..2].copy_from_slice(b"lo");
+        t.check_eq(
+            "sock: SIOCGIFADDR on a non-socket fd is ENOTTY",
+            crate::fd::sys_ioctl(1, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
+            errno::ENOTTY,
+        );
+    }
+
     t.check_eq("sock: close", fd::sys_close(fd), 0);
 
     let drained = crate::fd::boot_row_release(boot_tid);

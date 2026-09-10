@@ -140,10 +140,10 @@ pub fn install_shared_sinks() {
     // `akuma-syscalls-glue`'s own hook table — distinct from
     // `akuma_vfs_glue::VfsGlueHooks` (which `fs::init_vfs` fills) and from
     // `akuma_syscalls_linux`'s. The AArch64 kernel registers this from
-    // `akuma-kernel-glue`, which does not build for x86_64. Only two of the
-    // seven fields have a real answer on this target — the wall clock and the
-    // core count; the rump five are `false`/no-op because there is no rump
-    // kernel here. `utc_time_us` is what glue's folded `utimensat` (4b batch
+    // `akuma-kernel-glue`, which does not build for x86_64. Only three of the
+    // eight fields have a real answer on this target — the wall clock, the core
+    // count and the by-number console; the rump five are `false`/no-op because
+    // there is no rump kernel here. `utc_time_us` is what glue's folded `utimensat` (4b batch
     // 3c) reads for "both times to now", and `futex`'s absolute-deadline arm;
     // without it `touch` on a fresh file never sets a real mtime even on the
     // metal with SNTP synced — the same "glue reads a hook amd64 never
@@ -156,6 +156,15 @@ pub fn install_shared_sinks() {
         rump_socket_readable: |_| false,
         utc_time_us: || crate::clock::is_synced().then(crate::clock::now_us),
         probed_core_count: crate::smp::online_cpus,
+        // The **third** real answer, and the newest (4b batch 4b): the serial
+        // console, answered by fd number, for the poll family's readiness map.
+        // Glue reaches a console through a `ProcessChannel` and no process here
+        // has one, so without this an unbound fd 0 polls as
+        // `EPOLLHUP | EPOLLERR` (not in the fd table → `FdState::Missing`) and a
+        // bound one polls as never-readable. Same shape as the two above: glue
+        // reads a hook, and a hook nobody registered is how batch 3a's prefault
+        // gap and 3c's `utc_time_us` gap each looked from ring 3.
+        poll_console_state: crate::fd::poll_console_state,
     });
     // The wake effect for the **one** pipe table (4b batch 2b). This target
     // shares `akuma-syscalls-glue`'s table rather than keeping a second

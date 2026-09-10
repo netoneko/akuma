@@ -424,6 +424,26 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
 /// the same branch registers a poller, and registering one for an event nobody
 /// asked about would add a wakeup source out of nowhere.
 pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
+    // **A target whose console is answered by fd *number* gets first refusal.**
+    //
+    // The arms below resolve an fd through the process table and, for the
+    // console, through a `ProcessChannel` — the SSH/PTY plumbing a process
+    // either has or has not. The amd64 kernel has no such channel on any
+    // process: its console is a serial line, and an unbound 0/1/2 *is* that
+    // line. Both of the things this map would otherwise do to such an fd are
+    // wrong for it — `current_channel()` is `None`, so a bound `Stdin` reports
+    // never-readable, and an *unbound* 0 is not in the table at all, so it
+    // reports `FdState::Missing`, i.e. `EPOLLHUP | EPOLLERR` on the console a
+    // shell is about to read from.
+    //
+    // So the hook answers "is this fd my console, and is it ready?" and this
+    // returns through the same [`readiness`] map as everything else — the state
+    // it hands back is `FdState::Stdin`/`FdState::Sink`, not a bitmask, so the
+    // console is mapped by the same host-tested table and not beside it. The
+    // AArch64 kernel registers `|_| None` and reaches the arms below unchanged.
+    if let Some(state) = crate::hooks::poll_console_state(fd_num) {
+        return readiness(state, requested);
+    }
     let fd_entry = akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num));
     let Some(fd_entry) = fd_entry else {
         // A poll on an fd the calling process cannot see. Rare and always worth
@@ -880,7 +900,30 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 /// failed with `[7] Could not connect to server` about one RTT into a connection
 /// that had in fact succeeded. `poll(2)` callers were unaffected, which is why
 /// apk cargo and `/bin/curl` always worked.
-pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> SysResult {
+pub fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> SysResult {
+    // Timeout first, for [`sys_ppoll`]'s reason: it is Linux's order and it is
+    // what lets `select(2)`'s own `struct timeval` spelling — the amd64 kernel's
+    // x86_64 `23` — share this loop through [`pselect6_timeout_us`].
+    pselect6_timeout_us(
+        nfds,
+        readfds_ptr,
+        writefds_ptr,
+        exceptfds_ptr,
+        time::read_timeout_us(timeout_ptr)?,
+    )
+}
+
+/// [`sys_pselect6`] with the timeout already decoded: `None` blocks forever.
+///
+/// See [`ppoll_timeout_us`] for why the `Option` is the shape the two spellings
+/// of the call share.
+pub fn pselect6_timeout_us(
+    nfds: usize,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_us: Option<u64>,
+) -> SysResult {
     if nfds == 0 { return Ok(0); }
     // The cap, the word arithmetic and the bit marshalling are
     // `akuma_syscalls_poll::fdset` — pure, and untested until it existed. The
@@ -908,7 +951,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
     // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
     // locals because the wait loops below read them separately; the pair is
     // derived from one `Option` so they cannot disagree.
-    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr)? {
+    let (infinite, timeout_us) = match timeout_us {
         Some(us) => (false, us),
         None => (true, 0),
     };
@@ -1300,7 +1343,39 @@ pub fn run_pselect6_eintr_test() {
     }
 }
 
-pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> SysResult {
+pub fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> SysResult {
+    // The timeout is read **first**, before `fds_ptr` is validated and before
+    // `nfds` is range-checked. That is Linux's order (`do_ppoll` calls
+    // `get_timespec64` at the top, ahead of `do_sys_poll`), and it is what makes
+    // the split below possible: a caller that already has the timeout in
+    // microseconds — the amd64 kernel's `poll(2)` shim, whose ABI carries an
+    // `int` of milliseconds and has no `struct timespec` to point at — reaches
+    // the loop through [`ppoll_timeout_us`] without fabricating a user pointer
+    // for one. Both spellings then share one wait loop.
+    ppoll_timeout_us(fds_ptr, nfds, time::read_timeout_us(timeout_ptr)?)
+}
+
+/// [`sys_ppoll`] with the timeout already decoded: `None` blocks forever.
+///
+/// The `Option` **is** the ABI difference between the two spellings of this
+/// call. `ppoll(2)` says "wait forever" with a NULL `struct timespec *`;
+/// `poll(2)` says it with a negative `int` millisecond count. Neither is
+/// representable as a plain `timeout_us`, and a sentinel would be a third
+/// spelling to get wrong.
+pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> SysResult {
+    // **The allocation below is sized by a ring-3 register**, so it needs a
+    // bound before it, not after. `nfds` arrives as a `usize` from userspace and
+    // `alloc::vec![PollFd; nfds]` is 8 bytes each, so a `poll` with `nfds =
+    // 2^40` asked the kernel allocator for 8 TiB — on the failure path of an
+    // infallible `Vec`, which aborts. `pselect6` has always had `fdset::nfds_ok`
+    // (its fd sets are fixed stack buffers, so it could not have gone without);
+    // this path had nothing, and the two now share the one number. Linux bounds
+    // `poll` by `RLIMIT_NOFILE` instead, which this tree does not model — see
+    // the `MAX_FDS`-is-a-lookup-bound rule in
+    // `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH2D.md`.
+    if !fdset::nfds_ok(nfds) {
+        return Err(EINVAL);
+    }
     // nfds == 0 is NOT "nothing to do, return immediately" — Linux blocks until
     // the timeout (or forever, if timeout is NULL) or a signal, and musl's
     // pause() is implemented as exactly `ppoll(NULL, 0, NULL, ...)`. Returning 0
@@ -1313,7 +1388,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
     // locals because the wait loops below read them separately; the pair is
     // derived from one `Option` so they cannot disagree.
-    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr)? {
+    let (infinite, timeout_us) = match timeout_us {
         Some(us) => (false, us),
         None => (true, 0),
     };

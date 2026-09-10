@@ -4,7 +4,7 @@
 //! the largest thing left in the binary and the last big one:
 //! `docs/archive/SRC_SYSCALL_EXTRACTION.md`.
 //!
-//! This file registers the seven callbacks the layer cannot reach from a crate
+//! This file registers the eight callbacks the layer cannot reach from a crate
 //! and re-exports the rest, so the ~578 `crate::syscall::` references in the boot
 //! suite are spelled exactly as they were.
 
@@ -21,6 +21,11 @@ pub fn register() {
         rump_socket_readable: rump::rump_socket_readable,
         utc_time_us: crate::timer::utc_time_us,
         probed_core_count,
+        // This kernel's console is a `ProcessChannel`, not a serial line
+        // answered by fd number, so it has no by-number console for
+        // `epoll_check_fd_readiness` to special-case — see that function's
+        // header. `None` keeps the poll family's fd arms exactly as they were.
+        poll_console_state: |_| None,
     });
 }
 

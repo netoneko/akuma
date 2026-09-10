@@ -232,6 +232,16 @@ syscall_table! {
     /// are the only spellings — so the amd64 kernel's `7`/`23` arms are shims
     /// and this is the neutral name they narrow to.
     Ppoll      => PPOLL      = 271, nr::PPOLL;
+    /// The `select` half of the same pair. Legitimately two-numbered — x86_64
+    /// 270, asm-generic 72 — unlike `select`(23), which is x86-only and stays a
+    /// shim.
+    ///
+    /// Nothing in the tree issues it on x86_64: musl's `select()`
+    /// (`src/select/select.c`) compiles its `#ifdef SYS_select` branch on an
+    /// architecture that has number 23, and only falls through to `pselect6` on
+    /// one that does not — which is aarch64. Dispatched anyway because a program
+    /// that calls it by hand got `ENOSYS` from a kernel that implements the call.
+    Pselect6   => PSELECT6   = 270, nr::PSELECT6;
 
     // ── memory ─────────────────────────────────────────────────────────────
     Mmap       => MMAP       = 9,   nr::MMAP;

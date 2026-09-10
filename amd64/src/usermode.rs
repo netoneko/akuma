@@ -1301,23 +1301,21 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Mkdirat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Unlinkat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Renameat => to_glue(call, [a1, a2, a3, a4, 0, 0]),
-        // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
-        // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
-        // milliseconds (this target has no finer clock to honour anyway).
-        Syscall::Ppoll => {
-            let timeout_ms = if a3 == 0 {
-                (-1i64) as u64
-            } else {
-                // A user `struct timespec` { i64 tv_sec, i64 tv_nsec }.
-                let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(a3) else {
-                    return errno::EFAULT;
-                };
-                (sec.max(0) as u64)
-                    .saturating_mul(1000)
-                    .saturating_add((nsec.max(0) as u64) / 1_000_000)
-            };
-            crate::fd::sys_poll(a1, a2, timeout_ms)
-        }
+        // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271, and
+        // `pselect6(nfds, r, w, e, *timespec, *sigmask)` — x86_64 270. Both are
+        // **glue's arms** since 4b batch 4b, and both read their own
+        // `struct timespec` there (`akuma_syscalls_time::read_timeout_us`, the
+        // one decoder in the tree). This arm used to fold the timespec down to
+        // milliseconds here, which silently floored every sub-millisecond
+        // `ppoll` to zero.
+        //
+        // `pselect6` is dispatched for completeness, not because anything issues
+        // it: x86_64 musl's `select()` compiles its `#ifdef SYS_select` branch
+        // and sends **23** (`fd::sys_select`), where aarch64 musl has no
+        // `select` number at all and sends 72. A program calling
+        // `syscall(SYS_pselect6, …)` by hand used to get `ENOSYS`.
+        Syscall::Ppoll => crate::fd::sys_ppoll(a1, a2, a3, a4),
+        Syscall::Pselect6 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
         // forked) task replaces its own image in place. See `sys_execve`.
         Syscall::Execve => sys_execve(a1, a2, a3),
