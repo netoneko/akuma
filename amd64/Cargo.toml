@@ -17,7 +17,18 @@ default = ["console-notify", "smp-shared"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
-smp-shared = ["akuma-exec/smp-shared"]
+#
+# Also forwards the **VFS BKL carve-out** (`no-bkl-vfs`) to glue, akuma-exec,
+# akuma-ext2 and akuma-primitives — the same set the AArch64 root kernel's
+# `smp-shared` includes. Without it every glue fs syscall on this target ran
+# BKL-HELD (the guards compile to no-ops when `kernel_no_bkl_vfs` is unset),
+# so one stalled xHCI transfer spun its full one-second timeout holding the
+# BKL and presented as a scheduler fault (`[BKL] stuck`) on every other core —
+# `docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-11. `no-bkl-network` and
+# the remaining phases are deliberately NOT forwarded yet: this target's net
+# syscalls are its own `net.rs`, and each further phase needs its own audit +
+# A/B before it lands here.
+smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a
