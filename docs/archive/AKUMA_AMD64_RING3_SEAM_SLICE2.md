@@ -176,6 +176,49 @@ the slot's `UserCtx` back and abandons the slot. The last check pins the
 `+5` on both QEMU rows, all of them `user_context_smoke_test`; 616/626 minus the
 new checks either side.
 
+### 4.0 The box, both lanes, measured rather than extrapolated
+
+The prompt flagged the Firecracker and bare-metal numbers as extrapolated from
+4b's `+20` and asked for a re-measurement. Both lanes were run on the trashcan
+(`hpbox`), against the commit this slice landed as:
+
+| lane | before | after |
+|---|---|---|
+| Firecracker/KVM `SMP=1` | 594/0 (slice 1) | **599/0** |
+| Firecracker/KVM `SMP=4` | 604/0 (slice 1) | **609/0** |
+| bare metal `SMP=4`, `root=/dev/sda1` | **619 passed, 3 FAILED** (measured, `cb7615a6`) | **624 passed, 3 FAILED** |
+
+`+5` on every row — the same five checks, on all three rigs. The Firecracker
+delta is `+5` rather than `+14` this time because slice 1's `+14` bundled 4b and
+the console fix; this slice's contribution is only the new test.
+
+**The metal's three failures are pre-existing and are USB's**, which is why the
+metal row is an A/B rather than a comparison against the 616/0 in
+`AMD64_CONSOLE_NONBLOCK_READ.md`: that figure no longer describes this box. The
+pre-change commit was staged and booted on the metal for exactly this question,
+and produced the same three:
+
+```
+xhci: controller + enumeration + BOT bring-up   [OK]
+xhci: driver registered                         [OK]
+xhci: READ CAPACITY reports a non-empty disk    [OK]
+xhci: disk sectors 1953525168
+xhci: read the MBR at LBA 0                     [FAIL]
+xhci: read the sda1 ext2 superblock             [FAIL]
+xhci: WRITE(10) to a scratch LBA in sda2        [FAIL]
+xhci: of the failures above, this many were USB's 3
+```
+
+Enumeration, addressing and `READ CAPACITY` all succeed — the controller
+answers and reports the right disk — and only the bulk **data** transfers fail.
+That is the shape `AKUMA_AMD64_XHCI_*` already records as unexplained on this
+controller, and the boot code's own `of the failures above, this many were
+USB's` line exists to separate it from a kernel fault. `fs: /dev/sda MBR check
+failed` and the fall back to the RAM image follow from it.
+
+The `[BKL] stuck: owner=1 waiter=3 tag=511` lines appear in both arms (165
+before, 170 after) — the load-driven, pre-existing storm class.
+
 **Pre-existing, not introduced:** the per-crate *host* clippy loop the
 pre-commit hook runs fails in `akuma-primitives/src/preempt.rs:153`
 (`too_long_first_doc_paragraph`), a file this slice does not touch. The three
@@ -234,14 +277,15 @@ The pre-existing TCG panic slice 1 warned about (`test_spawn_ext_passes_env`)
 does not occur under KVM in Lima; the whole suite runs, which makes this a
 stronger check than the one the prompt budgeted for.
 
-### 4.3 What was **not** run
+### 4.3 A baseline correction the box lanes forced
 
-The **Firecracker/KVM** and **bare metal** lanes on the trashcan box. The box
-was booted into its Akuma personality when this landed; the Firecracker lane
-needs it on Ubuntu (`hpbox.deploy` + `amd64_trials.py --remote-only`) and the
-metal lane needs a `stage` + `reboot_to("akuma")` on top of that. The prompt
-already flagged both numbers as extrapolated from 4b rather than measured, so
-they are still owed — by this slice and by 4b.
+`AMD64_CONSOLE_NONBLOCK_READ.md` records bare metal at **616/0**, and the
+prompt carried that forward as a baseline to hold. It is not one any more: the
+**pre-change** commit measures 619 passed / 3 FAILED on this box today. The
+three failures are USB's (§4.0) and the extra passes are checks added since. A
+future slice should A/B the metal rather than compare against a recorded
+figure — the box's USB behaviour drifts between sessions, and 4b's and slice 1's
+metal numbers were extrapolations, never measurements.
 
 ## 5. What slice 2 deliberately did not do
 
