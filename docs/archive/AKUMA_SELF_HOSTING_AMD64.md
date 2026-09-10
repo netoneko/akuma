@@ -707,6 +707,81 @@ through `openat`).
 > render carries `Slab:` now and the harness reads it — first live reading
 > **1576 → 1573 kB over 30 ssh sessions**.
 >
+> **The I/O cluster folded (batch 3a, 2026-09-10)** —
+> `AKUMA_AMD64_4B_FOLD_BATCH3A.md`. `read`, `pread64`, `write`, `lseek` and
+> `getdents64` are glue's arms now; `fd.rs` 3 846 -> **3 581**. What stays on
+> this side is five preambles, each a stated divergence: the serial console for
+> `read`/`write` (glue's `Stdin`/`Stdout` arm writes through a
+> `ProcessChannel` and **silently writes nothing** without one, which no
+> process here has), `ESPIPE` rather than glue's `EBADF` for an unseekable
+> `pread` (musl's `FILE` layer falls back on the first and gives up on the
+> second), a `/dev` node for `lseek`, the `MAX_IO` clamp, and the `O_ACCMODE`
+> refusal below. `getdents64` keeps **nothing**.
+>
+> **Two prerequisites, neither in the plan, and the second is the finding.**
+>
+> The **untimed park had no backstop in the shared crate**. `sched.rs` gives a
+> deadline-less park a 1 s tripwire for a stated reason — this target reaches
+> its scheduler only by being called, so a lost wake is terminal here where on
+> AArch64 it is merely slow — and glue parks `u64::MAX` in **22 places**,
+> including the `PipeRead`/`PipeWrite` arms `read` and `write` fold onto.
+> Folding first would have traded a 1 Hz degradation for a silent hang on the
+> paths a shell pipeline runs through. `akuma_threading::park_indefinitely`
+> owns the decision now, with a per-target knob whose unregistered value **is**
+> the old call, and 4 host tests on the degradation contract.
+>
+> And **amd64 registered no prefault hook**, so every glue arm that validates a
+> user buffer answered `EFAULT` for a page ring 3 had never touched.
+> `uaccess.rs`'s header said "no prefault: this target has no lazy user regions
+> yet… when lazy regions arrive, the walk goes here"; they arrived with **B1**
+> and nothing came back to the sentence, because this kernel's own copy path
+> faults and recovers and never needed it. Folding `read(2)` made it reachable
+> the most ordinary way there is — `mmap` a buffer, read a file into it — and it
+> surfaced as `apk` reporting **`Unable to read database: v2 database format
+> error`**, a file-format complaint about a file the kernel had refused to read.
+> **Neither standing gate could see it**: the boot suite runs under
+> `BypassValidationGuard`, which returns before the walk, and the ring-3 harness
+> reads into libc heap buffers that are already resident. New probe
+> `userspace/forktest/c_stress/lazybuf.c` — 6/6 on QEMU and on the metal, **3
+> FAIL `Bad address` with the hook removed**, and its first draft used a 64 KiB
+> mapping, which is exactly `MMAP_EAGER_MAX_PAGES`, and so passed 6/6 against
+> the kernel it was written to fail on.
+>
+> Two defects in the **shared** crate fell out: `/dev/urandom` read
+> `akuma_virtio::rng` outright and would have been `EIO` on every rig of this
+> target (the `getrandom` seam, one function along), and glue's `sys_write`
+> **does not check `O_ACCMODE` at all** — so on the AArch64 kernel an
+> `open(path, O_RDONLY)` descriptor is a write capability. The second is kept in
+> the amd64 preamble and left open rather than fixed blind, for batch 2d's
+> reason: it is a behaviour change on a kernel whose loop does not run here.
+>
+> **A pre-existing ceiling the long runs exposed, measured rather than guessed:**
+> **one pipe leaks per ssh session**, and at `MAX_PIPES` = 64 the machine can no
+> longer spawn anything (`sshd: failed to spawn '/bin/sh'`, from about session
+> 44, permanently). A per-spawn `pipe_live_count()` print reads 15, 16, 17, …
+> monotonic, and the identical 150-session run against **`02b9166f`** — a
+> worktree build of the commit before the fold — fails at the same 43/150. The
+> suspect is the stdin pipe's **write end**, whose initial reference `bind_stdio`
+> never consumes and which only `/proc/<pid>/fd/0` would take. Note
+> `amd64_ring3_check.py`'s default `-n 40` sits one session under the cliff.
+>
+> Verified QEMU/TCG **590/0** (`SMP=1`) and **600/0** (`SMP=4`), Firecracker
+> **576/0** and **586/0**, **bare metal 590/0** — +11 on every arm, the same
+> eleven, each falsified against the code it tests — plus `openflags` 20/20,
+> memory probes 8/10 with 0 unexpected on both transports, `apk update` +
+> `apk add file` end to end on QEMU *and* the metal with `file-5.47` running,
+> host tests **1371**, clippy clean on both kernels. **AArch64 is touched** (the
+> park call and one branch in the `/dev/urandom` arm) and does not claim
+> byte-identical sections.
+>
+> **`fstat`/`newfstatat` are the next batch and are a vocabulary, not a hunk:**
+> x86_64 `struct stat` is 144 bytes with `st_nlink` at 16 and `st_mode` at 24;
+> asm-generic is 128 with `st_mode` at 16. That is the **third** per-architecture
+> vocabulary after the syscall numbers and `open(2)`'s flags, and it wants a
+> converter in `akuma-syscalls-abi` plus a split of glue's arms at the user-copy
+> seam, the way batch 2d split `sys_openat`/`openat_path`. `statx` needs none of
+> it.
+
 > **4b is in progress: batch 1 folded, batch 2's prerequisites landed, and the
 > two pipe tables are one (2026-09-10)** —
 > `AKUMA_AMD64_4B_FOLD_BATCH2A.md` (console descriptors, `with_stdio()`, glue's
@@ -949,16 +1024,24 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   implementations become one, −500 lines (b2c) · **`openat`
    │   folds** (b2d) — the arm every other file syscall reads a
    │   descriptor from. `fd.rs` 4 454 → 3 846
+   ▼   then the I/O cluster (b3a): `read`/`pread64`/`write`/`lseek`/
+   │   `getdents64`, `fd.rs` → 3 581. Two prerequisites nobody listed:
+   │   the untimed-park backstop had to move into `akuma-threading`
+   │   (22 glue arms park `u64::MAX`; this target hangs where AArch64
+   │   merely slows), and **amd64 had never registered a prefault
+   │   hook** — so a glue arm reading into a page ring 3 had not
+   │   touched was `EFAULT`, and `apk` called its own database corrupt
    │                        docs: AKUMA_AMD64_4B_FLIP.md,
-   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D}.md,
+   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A}.md,
    │                              AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md
    ▼
  [09-10] ═══ YOU ARE HERE ═══
    │
    └──► three pieces left below the gate, none blocked on another:
-        **4b, continued** — `read`/`pread64`/`write`/`lseek`/`fstat`/
-                 `getdents64` are the cluster that reads what the
-                 folded `openat` produces, and are the next batch;
+        **4b, continued** — `read`/`pread64`/`write`/`lseek`/
+                 `getdents64` **folded (batch 3a)**; next is the
+                 `stat` family, which needs an x86_64 `struct stat`
+                 hop in `akuma-syscalls-abi` — the third vocabulary —
                  then `ioctl`, `poll`/`select`, `dup`, `pipe2`
         **the ring-3 entry seam** — an x86 arm for "enter userspace with
                  this process's first context"; unblocks `fork`, then
