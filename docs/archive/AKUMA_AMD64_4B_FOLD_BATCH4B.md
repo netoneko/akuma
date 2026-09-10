@@ -415,6 +415,10 @@ x86-only, the USB keyboard), `console_ioctl`, `poll_console_state`, and the
 module's own surface (`pid_map_rows`, `bind_stdio`, `alloc_socket_fd`/
 `alloc_pipe_fd`, `install`, `console_end`, `dev_node_of`, the boot checks).
 
+The `TIOCGWINSZ` half of `console_ioctl` is also why an ssh session's terminal
+size never reaches the shell — it answers from literals and never reads a
+`TerminalState` (`AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 5).
+
 Four of those preambles exist for one reason, and it is the same reason
 `AMD64_CONSOLE_NONBLOCK_READ.md` §6 gives: **no amd64 process has a
 `ProcessChannel`**. Giving one to an sshd session's child — the deferred

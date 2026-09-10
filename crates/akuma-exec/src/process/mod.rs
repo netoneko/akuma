@@ -1067,13 +1067,22 @@ impl Process {
         // Activate the user address space
         self.address_space.activate();
 
-        // Jump to user mode. The checked entry validates `spsr` targets EL0 —
-        // every context this kernel builds sets `spsr = 0`, so it is one compare
-        // on a once-per-launch path, and it removes this crate's last `eret`
-        // `unsafe`. `context` is `Copy` — take it out and drop the `image` guard
-        // before the `eret` that never returns.
+        // Jump to user mode, through the one hook whose implementations differ
+        // in *who owns the exit path* — see [`crate::ExecRuntime::enter_user`].
+        // On AArch64 the registered function is `enter_user_mode_checked`,
+        // whose check validates `spsr` targets EL0: every context this kernel
+        // builds sets `spsr = 0`, so it is one compare on a once-per-launch
+        // path, and it removes this crate's last `eret` `unsafe`. On x86_64 it
+        // is the whole ring-3 lifecycle, because `sysret` returns and `eret`
+        // cannot.
+        //
+        // `context` is `Copy` — take it out and drop the `image` guard before a
+        // call that never returns. Dropping it matters more here than the
+        // `eret` made it look: the x86_64 arm runs a process's entire
+        // `execve` loop and teardown inside this call, and both re-take this
+        // very lock.
         let ctx = self.image.lock().context;
-        enter_user_mode_checked(&ctx)
+        (runtime().enter_user)(&ctx)
     }
 
     /// Prepare process for execution (internal helper)

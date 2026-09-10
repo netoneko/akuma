@@ -420,6 +420,13 @@ pub(crate) fn build_exec_runtime(
         set_spawn_namespace: crate::vfs::set_spawn_namespace,
         clear_spawn_namespace: crate::vfs::clear_spawn_namespace,
         print_str: console::print,
+        // The AArch64 ring-3 entry: an `eret`, which never returns, and the
+        // `SPSR_EL1.M[3:0] == EL0t` compare that makes it safe to call. This
+        // registration is what `Process::run`'s tail *was* — a direct call —
+        // so the AArch64 kernel's behaviour here is unchanged by the seam;
+        // see `akuma_exec::ExecRuntime::enter_user` for what the other arm
+        // has to be instead.
+        enter_user: akuma_exec::process::enter_user_mode_checked,
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,

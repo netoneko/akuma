@@ -34,7 +34,7 @@ use crate::gdt;
 use akuma_mmap::{MmapRegion, PhysFrame};
 use alloc::vec::Vec;
 
-use akuma_exec::process::ProcAddressSpace;
+use akuma_exec::process::{ProcAddressSpace, UserContext};
 use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
 
 use crate::loader;
@@ -2522,6 +2522,38 @@ fn current_entry_stack() -> Option<(u64, u64)> {
     Some((img.context.pc, img.context.sp))
 }
 
+/// The running task's ring-3 register file, as the shared [`UserContext`].
+///
+/// The counterpart of [`current_entry_stack`] for the *whole* file rather than
+/// its two neutral scalars, and the reason `sys_fork` no longer carries a
+/// five-tuple: everything a child inherits from its parent's trap into the
+/// kernel is one value of one type, which is the type the shared fork path
+/// speaks.
+///
+/// `rax` is **not** captured, and cannot be: the assembly does not save it —
+/// it holds the syscall number on the way in and the return value on the way
+/// out — so there is no parent value to read. Zero is therefore the only
+/// honest answer, and it happens to be the one a `fork` child wants; callers
+/// that mean it say so with `set_child_return_zero`.
+fn current_user_context() -> UserContext {
+    // SAFETY: raw-pointer read under the BKL; the per-CPU `UserCtx` is this
+    // task's own slot.
+    unsafe {
+        let uctx = crate::smp::current_uctx();
+        if uctx.is_null() {
+            return UserContext::new(0, 0);
+        }
+        UserContext {
+            regs: (*uctx).saved_regs,
+            sp: (*uctx).user_rsp,
+            pc: (*uctx).user_rip,
+            fs_base: (*uctx).fs_base,
+            gs_base: (*uctx).gs_base,
+            rax: 0,
+        }
+    }
+}
+
 /// Read and clear this task's [`UserCtx::forked`] / [`UserCtx::exec_pending`]
 /// flags. Both are one-shot and both are consumed by [`run_process`] only.
 fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
@@ -2539,40 +2571,59 @@ fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
     }
 }
 
-/// Enter ring 3 for process slot `idx`, then mark the task finished.
+/// **`ExecRuntime::enter_user` on this target**: enter ring 3 with a process's
+/// first context, and never come back.
+///
+/// This is the amd64 half of the ring-3 entry seam
+/// (`proposals/NEXT_AGENT_AMD64_RING3_ENTRY_SEAM.md` §4, option 1). The shared
+/// `akuma_exec::process::Process::run` ends in `(runtime().enter_user)(&ctx)`;
+/// on AArch64 that is an `eret` and the story ends there, because a process's
+/// exit is handled from inside the syscall path. Here `sysret` **returns**, so
+/// everything after the entry — the `execve` loop and the whole teardown — has
+/// to live on this side of the hook. `-> !` is what says so.
+///
+/// The slot comes from the running task's own `UserCtx`, seeded by
+/// [`crate::sched::seed_proc_slot`] before the task was published, for the same
+/// reason [`proc_entry`] reads it there: shared code has no process-slot
+/// concept to hand one down.
+pub fn enter_ring3(first: &UserContext) -> ! {
+    let idx = current_proc_slot();
+    if idx >= PROC_SLOTS {
+        // A task published without being seeded. `proc_entry` catches this
+        // first for the tasks it starts; the check is repeated here because
+        // this function is a registered hook and its other caller (slice 3's
+        // shared `entry_point_trampoline`) does not go through `proc_entry`.
+        serial::puts("  [proc] ring-3 entry with no slot\n");
+        crate::sched::finish();
+    }
+    run_process(idx, first)
+}
+
+/// Enter ring 3 for process slot `idx` at `first`, then mark the task finished.
 ///
 /// The scheduler has already installed this task's address space by the time
 /// this runs — `spawn_in_space_unpublished` recorded the root, and `yield_now`
 /// writes `CR3` before switching stacks.
 ///
-/// The entry point and stack come from the registered process rather than from
-/// module constants. They were constants while every process was the same
-/// hand-assembled blob at the same address; an ELF's entry is `e_entry` and its
-/// stack is wherever the loader could put one.
-fn run_process(idx: usize) -> ! {
-    // Tell the syscall path which process this is, so fd 0/1/2 route to this
-    // task's pipes (if it is a spawned child) rather than the console.
-    // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own slot.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if !uctx.is_null() {
-            (*uctx).proc_slot = idx;
-        }
-    }
+/// `first` is the context `Process::run` read out of the registered process
+/// under the `image` lock, which is where the entry point and stack have come
+/// from since 5b slice 4 — they were module constants while every process was
+/// the same hand-assembled blob at the same address. The loop re-reads them
+/// with [`current_entry_stack`] on the way round, because that is what an
+/// `execve` rewrites; the first pass uses what it was handed, which is the
+/// same two scalars read microseconds earlier under the same lock (nothing can
+/// rewrite them in between: this task has not executed a user instruction yet,
+/// so it cannot have `execve`d, and no other task writes another process's
+/// image).
+fn run_process(idx: usize, first: &UserContext) -> ! {
     // A `fork` child's first entry re-enters ring 3 at the parent's post-`fork`
     // instruction with the parent's full register set; the `execve` it usually
     // does next installs a plain image, and every later loop iteration uses the
     // ordinary entry path. Read once, here, because it is spent by the first
     // entry whatever happens after it.
     let mut forked_child = take_uctx_flag(|u| &mut u.forked);
-    let mut status = 0;
-    // Whether ring 3 was ever entered. The teardown below reports an exit —
-    // `spawn_record_exit` publishes a status a parent's `wait4` will believe —
-    // so a task that never ran a program must not run it. Unreachable by
-    // construction since 5b slice 4 (every process task is registered before it
-    // is published) and checked rather than assumed, because the old shape got
-    // this for free: it wrapped the whole teardown in `if let Some(start)`.
-    let mut ran = false;
+    let mut status;
+    let (mut entry, mut stack) = (first.pc, first.sp);
     // The loop is `execve`. `sys_execve` has already done the swap — it
     // installs the new address space on the registered process, switches `CR3`
     // and drops the old space, then asks the task to leave ring 3 — so all that
@@ -2586,11 +2637,10 @@ fn run_process(idx: usize) -> ! {
     // precisely because every address space shares the kernel's upper half.
     // What the old shape bought was an array; what it cost was a second copy of
     // every image field.
-    while let Some((entry, stack)) = current_entry_stack() {
+    loop {
         // SAFETY: both are addresses the loader (or `Image::new`) mapped
         // user-accessible in the address space the scheduler installed for this
         // task, and every program this kernel runs ends in exit_group.
-        ran = true;
         status = {
             let forked = forked_child;
             forked_child = false;
@@ -2599,12 +2649,13 @@ fn run_process(idx: usize) -> ! {
         if !take_uctx_flag(|u| &mut u.exec_pending) {
             break;
         }
-    }
-    if !ran {
-        serial::puts("  [proc] slot ");
-        serial::put_dec(idx as u64);
-        serial::puts(" has no registered process; not entering ring 3\n");
-        crate::sched::finish();
+        // `execve` succeeded and asked this task to go back in. Where the new
+        // image starts is the registered process's business, not the old
+        // image's — and if the registration has gone (the process was reaped
+        // under us) there is nowhere to go, so fall through to the teardown
+        // with the status the last entry returned.
+        let Some(next) = current_entry_stack() else { break };
+        (entry, stack) = next;
     }
     EXIT_STATUS.store(status, Ordering::Relaxed);
     // Real Linux closes every fd a process still holds at exit. Since step 4b
@@ -2660,6 +2711,32 @@ fn run_process(idx: usize) -> ! {
 /// written by `sched::seed_proc_slot` while the task is still unpublished and
 /// read back here. Nothing else changed — the ceiling was never about memory
 /// or scheduling, only about where one `usize` could be kept.
+///
+/// # It ends in the shared `Process::run`, since the ring-3 entry seam
+///
+/// It used to call [`run_process`] directly. It goes through
+/// `akuma_exec::process::Process::run` — the same function AArch64's
+/// `entry_point_trampoline` ends in — which activates the address space,
+/// marks the process `Running` and calls back into [`enter_ring3`] through
+/// `ExecRuntime::enter_user`. Three things change on this target, and all
+/// three are the shared code closing a gap rather than a new behaviour:
+///
+/// * **The thread/process ownership gate.** `run()` refuses to enter ring 3
+///   when `THREAD_PID_MAP` says this task belongs to a *different* pid —
+///   proof it would otherwise install a foreign address space and jump to
+///   this process's entry point inside it. This target had no such check.
+/// * **`ProcessState::Running`.** Every process registered here was left
+///   `Ready` for its whole life, because `prepare_for_execution` is not on
+///   this target's path; `/proc/<pid>/stat` said `R` only by luck of the
+///   default.
+/// * **One extra `mov cr3`,** and this is the cost rather than a gain:
+///   `run()` calls `address_space.activate()`, and the scheduler has already
+///   installed exactly that root from the task slot's own `space_root`
+///   (`spawn_in_space_unpublished` recorded it from the same `Image`). It is
+///   one TLB flush per process launch, not per entry — the `execve` loop is
+///   inside [`run_process`], below the hook — and it is stated here rather
+///   than removed, because "the scheduler already did it" is a property of
+///   this target's spawn path and not of `run()`.
 extern "C" fn proc_entry() -> ! {
     let slot = current_proc_slot();
     if slot >= PROC_SLOTS {
@@ -2669,7 +2746,18 @@ extern "C" fn proc_entry() -> ! {
         serial::puts("  [proc] entry with no slot\n");
         crate::sched::finish();
     }
-    run_process(slot);
+    // The teardown below the entry reports an exit — `spawn_record_exit`
+    // publishes a status a parent's `wait4` will believe — so a task that
+    // never ran a program must not reach it. Unreachable by construction since
+    // 5b slice 4 (every process task is registered before it is published) and
+    // checked rather than assumed.
+    let Some(proc) = current_process() else {
+        serial::puts("  [proc] slot ");
+        serial::put_dec(slot as u64);
+        serial::puts(" has no registered process; not entering ring 3\n");
+        crate::sched::finish();
+    };
+    proc.run()
 }
 
 /// Reserve and seed — but do **not** publish — a task to run process slot
@@ -3566,24 +3654,22 @@ fn sys_fork() -> u64 {
         return errno::ENOSYS;
     }
 
-    // The point the child resumes from — the parent's own user RIP/RSP as
-    // captured on the way into this syscall — plus its TLS base and register
-    // snapshot.
-    // SAFETY: raw-pointer read under the BKL; the per-CPU `UserCtx` is this task's.
-    let (user_rip, user_rsp, parent_fs_base, parent_gs_base, parent_regs) = unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() {
-            (0, 0, 0, 0, [0u64; 12])
-        } else {
-            (
-                (*uctx).user_rip,
-                (*uctx).user_rsp,
-                (*uctx).fs_base,
-                (*uctx).gs_base,
-                (*uctx).saved_regs,
-            )
-        }
-    };
+    // The point the child resumes from — the parent's own ring-3 register file
+    // as captured on the way into this syscall, including its TLS base.
+    //
+    // A [`UserContext`], not a five-tuple, since the ring-3 entry seam: the
+    // x86_64 arm of that type *is* what `syscall_entry` saves, so the capture
+    // has a name, and `sched::write_user_context` below is the same writer the
+    // shared child-spawn path reaches through
+    // `akuma_threading::update_thread_context`. Building it here is what makes
+    // slice 3's fold a deletion rather than a translation.
+    let mut child_ctx = current_user_context();
+    // A child returns 0 from the `fork` its parent returns a pid from. Stated
+    // rather than implied: the value is what the entry assembly hard-codes
+    // (`enter_user_mode_forked` does `xor eax, eax`), and this is the field
+    // shared code sets for the same reason.
+    child_ctx.set_child_return_zero();
+    let (user_rip, user_rsp) = (child_ctx.pc, child_ctx.sp);
     if user_rip == 0 || user_rsp == 0 {
         return errno::ENOSYS;
     }
@@ -3653,7 +3739,7 @@ fn sys_fork() -> u64 {
         return errno::ENOMEM;
     };
     crate::sched::seed_proc_slot(task_slot, slot);
-    crate::sched::seed_forked_task(task_slot, parent_fs_base, parent_gs_base, &parent_regs);
+    crate::sched::write_user_context(task_slot, &child_ctx);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
     // 5b slice 4: registered **before** the task is published, which is the

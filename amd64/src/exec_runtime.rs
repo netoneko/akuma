@@ -132,6 +132,12 @@ fn enable_irqs() {
 fn runtime() -> ExecRuntime {
     ExecRuntime {
         // ── real ──────────────────────────────────────────────────────────
+        // The ring-3 entry seam. On AArch64 this hook is an `eret` and the
+        // call ends there; here `sysret` returns, so the registered function
+        // owns the `execve` loop and the whole process teardown as well as the
+        // entry. See `usermode::enter_ring3` and
+        // `akuma_exec::ExecRuntime::enter_user`.
+        enter_user: crate::usermode::enter_ring3,
         // The same clock `threading::ThreadRuntime` was already given, so the
         // scheduler and `akuma-exec` cannot disagree about what time it is.
         uptime_us: crate::net::uptime_us,

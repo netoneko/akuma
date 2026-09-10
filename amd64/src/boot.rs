@@ -388,6 +388,10 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
         sched::block_smoke_test(t);
         lapic::stop_timer();
     }
+    // Needs no tick and runs no task: it claims one unpublished slot, writes a
+    // ring-3 register file into it through `akuma-threading`, reads it back and
+    // abandons the slot. Outside the LAPIC block for that reason.
+    sched::user_context_smoke_test(t);
 
     crate::pipe::smoke_test(t);
     reboot::smoke_test(t);

@@ -170,6 +170,39 @@ pub struct ExecRuntime {
 
     // Console fallback
     pub print_str: fn(&str),
+
+    /// **Enter ring 3 with this process's first context, and do not come back.**
+    ///
+    /// The architecture seam of [`crate::process::Process::run`], and the one
+    /// hook in this table whose two implementations do not merely differ in
+    /// *how* they work but in *who owns the exit path*:
+    ///
+    /// - On AArch64 it is `akuma_el0_entry::enter_user_mode_checked` — an
+    ///   `eret`, which cannot return. The process's exit is somebody else's
+    ///   business entirely: `exit_group` marks the thread terminated from
+    ///   inside the syscall path and the thread never comes back here.
+    /// - On x86_64 `sysret` **does** return — `syscall_entry`'s
+    ///   `.Lexit_to_kernel` walks back onto the kernel stack this call is
+    ///   standing on and hands it an exit status. So the registered function is
+    ///   the whole ring-3 *lifecycle* of a process on that target: an
+    ///   entry/`execve` loop, then the teardown (close the fd table, drain the
+    ///   process's threads, publish the exit status, retire the slot), and only
+    ///   then does it stop being a thread.
+    ///
+    /// That is why the signature is `-> !` and not `-> u64`: `!` is the only
+    /// return type both can honour, and it forces the target whose entry
+    /// returns to say what it does afterwards *inside its own arm* rather than
+    /// handing a status back to shared code that has no idea what to do with
+    /// one. `proposals/NEXT_AGENT_AMD64_RING3_ENTRY_SEAM.md` §4 lays out the
+    /// three options and why this one — keep both lifecycles, state the
+    /// difference in one function pointer — was taken first.
+    ///
+    /// **The BKL hand-off belongs inside the arm, not at the call site.** Both
+    /// implementations release the kernel lock immediately before the
+    /// privilege drop (`akuma_bkl::bkl::leave_kernel` on one,
+    /// `crate::smp::bkl_leave` on the other) because ring 3 must not hold it.
+    /// Shared code must not know that a lock is being dropped here.
+    pub enter_user: fn(&crate::process::UserContext) -> !,
 }
 
 /// Compile-time kernel configuration, passed once at init.

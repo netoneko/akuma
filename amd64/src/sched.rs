@@ -69,6 +69,10 @@ use crate::lapic;
 use crate::paging;
 use crate::smp::{self, NO_CPU};
 use crate::usermode::UserCtx;
+// The shared ring-3 register file. `akuma-exec-core` rather than `akuma-exec`
+// because that is where the type lives and this file needs nothing else from
+// the bigger crate; the two paths name one struct.
+use akuma_exec_core::process::UserContext;
 use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -310,6 +314,7 @@ fn register_hooks() {
         can_run: hook_can_run,
         transfer_lock_depth: hook_transfer_lock_depth,
         allow_tick,
+        write_user_context,
     });
 
     // The scheduler also wants a clock and a console. The other four fields are
@@ -748,26 +753,58 @@ pub fn set_current_space_root(space_root: u64) {
     }
 }
 
-/// Seed a not-yet-running `vfork` child with the parent's TLS base and its full
-/// register snapshot, so it resumes as a true copy of the parent's context (see
-/// `usermode::enter_user_mode_forked`). The child inherits `%fs` because musl's
-/// post-fork fixups are `%fs`-relative, and the register set because a C
-/// compiler assumes r12-r15/rbx survive the `syscall`.
+/// Seed a not-yet-running `fork`/`vfork`/`clone(CLONE_VM)` child with the
+/// ring-3 register file it must resume on, so it comes back as a true copy of
+/// the parent's context (see `usermode::enter_user_mode_forked`). The child
+/// inherits `%fs` because musl's post-fork fixups are `%fs`-relative, and the
+/// register set because a C compiler assumes r12-r15/rbx survive the `syscall`.
 ///
 /// `forked` is set in the same call rather than by a separate one, and that is
-/// the point of it being here: the flag says "use the three values above", so a
-/// path that seeded the registers and forgot the flag — or set the flag with no
+/// the point of it being here: the flag says "use the values above", so a path
+/// that seeded the registers and forgot the flag — or set the flag with no
 /// registers behind it — cannot be written. Before 5b slice 4 the flag was a
 /// field on this target's own `Process`, one table away from the registers it
 /// refers to.
-pub fn seed_forked_task(task_slot: usize, fs_base: u64, gs_base: u64, saved_regs: &[u64; 12]) {
+///
+/// # This is `akuma_threading::update_thread_context`'s x86_64 arm
+///
+/// It took a `(fs_base, gs_base, &[u64; 12])` triple until 2026-09-10 and was
+/// called `seed_forked_task`. It takes the shared [`UserContext`] instead
+/// because that type **is** this triple — `akuma-exec-core`'s x86_64 arm is
+/// exactly what `syscall_entry` saves — and because the shared child-spawn
+/// path (`akuma_exec::process::spawn_child_thread_and_publish`) describes a
+/// child that way. One writer, reached from two spellings, is what stops the
+/// tree's `fork` and this target's own from seeding a child differently;
+/// registered as [`threading::X86ArchHooks::write_user_context`] and called
+/// directly by `usermode::sys_fork` until that folds (slice 3).
+///
+/// # `pc`/`sp` are deliberately not copied here
+///
+/// A `UserContext` carries them and this writes neither. `UserCtx::user_rip` /
+/// `user_rsp` are the *syscall entry* capture — written by the assembly on
+/// every `syscall`, read by `sys_fork` to find where its own caller resumes —
+/// and the authority for where a task (re-)enters ring 3 is
+/// `ProcessImage::context`, which `usermode::enter_ring3` is handed and reads.
+/// Writing them here would put a second copy of that in a second structure,
+/// which is the staleness bug `UserContext::set_address_space_root`'s doc
+/// describes, one field along.
+pub fn write_user_context(task_slot: usize, ctx: &UserContext) {
+    // `rax` has no home in `UserCtx`: both ring-3 entry points hard-code the
+    // value ring 3 resumes with (`enter_user_mode_forked` does `xor eax, eax`,
+    // `enter_user_mode` takes `entry_rax` and every caller passes 0), which
+    // matches every context shared code builds — `set_child_return_zero` is
+    // the only writer of the field. Say so if that ever stops being true,
+    // rather than dropping a value silently.
+    if ctx.rax != 0 {
+        crate::serial::puts("  [sched] write_user_context: non-zero rax dropped\n");
+    }
     // SAFETY: raw-pointer access; under the BKL, and the slot is unpublished so
     // no core can be running it.
     unsafe {
         if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.uctx.fs_base = fs_base;
-            m.uctx.gs_base = gs_base;
-            m.uctx.saved_regs = *saved_regs;
+            m.uctx.fs_base = ctx.fs_base;
+            m.uctx.gs_base = ctx.gs_base;
+            m.uctx.saved_regs = ctx.regs;
             m.uctx.forked = 1;
         }
     }
@@ -788,7 +825,7 @@ pub fn current_space_root() -> u64 {
 /// register snapshot and `%gs`, and the two identities the single `thread_entry`
 /// reads back out of its own `UserCtx`.
 ///
-/// Deliberately separate from [`seed_forked_task`] rather than a wider version
+/// Deliberately separate from [`write_user_context`] rather than a wider version
 /// of it. A `fork` child inherits the parent's `%fs` because musl's post-fork
 /// fixups are `%fs`-relative; a thread must **not** — it gets a base of its own
 /// from `CLONE_SETTLS`, and inheriting the parent's would put two threads on one
@@ -825,7 +862,7 @@ pub fn seed_thread_task(
 /// could not run more than nine processes at once. `cargo -j4` is cargo plus
 /// four `rustc`s plus their children before anything interesting happens.
 ///
-/// Deliberately not folded into [`seed_forked_task`]: a spawned process needs
+/// Deliberately not folded into [`write_user_context`]: a spawned process needs
 /// this and *not* a register snapshot (it starts at a fresh entry point, not at
 /// a copy of its parent's context), so one function taking both would make two
 /// unrelated requirements look like one call.
@@ -1302,4 +1339,75 @@ pub fn block_smoke_test(t: &mut Suite) {
     t.note("block: parks", blocks());
     t.note("block: wakes", wakes());
     t.note("block: backstop releases", backstop_wakes());
+}
+
+/// [`write_user_context`] does what `akuma-threading` asks of it, on a real
+/// slot, through the shared entry point.
+///
+/// # Why this is worth a boot test and the rest of the seam is not
+///
+/// The other half of the ring-3 entry seam —
+/// `usermode::enter_ring3` — is exercised by every ring-3 self-test that
+/// follows and by every process the kernel ever starts, so a mistake in it is
+/// impossible to miss. This half is the opposite: `update_thread_context` is
+/// called by the **shared** `spawn_child_thread_and_publish`, which this
+/// target does not reach until `sys_fork` folds (slice 3). Wired but
+/// unreachable is exactly the shape that rots — and the failure it would rot
+/// into is a child resuming on a register file that is subtly not its
+/// parent's, which reads as a userspace bug a long way from here.
+///
+/// So it is called the way the shared code will call it: by thread id, through
+/// `akuma_threading::update_thread_context`, with a `UserContext` whose every
+/// field is distinguishable. The last check is the one that pins a *decision*
+/// rather than a mapping — `pc`/`sp` are deliberately not copied into
+/// `UserCtx`, because `ProcessImage::context` is the authority for where a
+/// task enters ring 3 and a second copy of it here is a staleness bug waiting
+/// to happen.
+#[cfg(not(feature = "no-tests"))]
+pub fn user_context_smoke_test(t: &mut Suite) {
+    /// Never runs: the slot is abandoned before it is published.
+    extern "C" fn unreachable_entry() -> ! {
+        finish();
+    }
+
+    let Some(slot) = spawn_in_space_unpublished(unreachable_entry, 0) else {
+        t.check("uctx: unpublished slot claimed", false);
+        return;
+    };
+
+    // Every field distinct, and none of them zero: a writer that copied the
+    // wrong field, or none, cannot pass by accident.
+    let ctx = UserContext {
+        regs: [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab],
+        sp: 0x7fff_0000,
+        pc: 0x40_1000,
+        fs_base: 0x7f00_0000,
+        gs_base: 0x7e00_0000,
+        rax: 0,
+    };
+    threading::update_thread_context(slot, &ctx);
+
+    // SAFETY: raw-pointer read under the BKL; the slot is unpublished, so
+    // nothing else can be touching it.
+    let (regs, fs_base, gs_base, forked, user_rip, user_rsp) = unsafe {
+        let m = &(*machines())[slot];
+        (
+            m.uctx.saved_regs,
+            m.uctx.fs_base,
+            m.uctx.gs_base,
+            m.uctx.forked,
+            m.uctx.user_rip,
+            m.uctx.user_rsp,
+        )
+    };
+    t.check("uctx: the register snapshot is the parent's", regs == ctx.regs);
+    t.check_eq("uctx: fs_base (the TLS musl fixes up)", fs_base, ctx.fs_base);
+    t.check_eq("uctx: gs_base", gs_base, ctx.gs_base);
+    t.check_eq("uctx: the forked flag says to use them", forked, 1);
+    t.check(
+        "uctx: pc/sp stay with the process image, not the slot",
+        user_rip == 0 && user_rsp == 0,
+    );
+
+    abandon_unpublished(slot);
 }

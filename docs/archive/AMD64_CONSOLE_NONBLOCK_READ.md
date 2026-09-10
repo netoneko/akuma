@@ -218,7 +218,11 @@ from ring 3, so they are recorded rather than guessed at.
    `current_channel().is_none()` fallback, and returns 0. A pager that opens
    `/dev/tty` to read keys from sees EOF immediately.
 
-All three dissolve into the same piece of work: **give an amd64 process a
+A **fourth** wants the same thing: an ssh session's terminal *size* never
+reaches the shell, partly because glue's `TIOCSWINSZ` keys on a `ChildStdout`
+descriptor amd64 does not have — `AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 4.
+
+All of them dissolve into the same piece of work: **give an amd64 process a
 terminal-capable `ProcessChannel`** — the deferred `/proc/<pid>/fd/0` +
 `delegate_pid` item in `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Then the
 console preamble goes away, glue's `Stdin` arm serves fd 0 (with its own

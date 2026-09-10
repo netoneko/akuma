@@ -2731,6 +2731,22 @@ pub struct X86ArchHooks {
     /// It is emphatically **not** `akuma_cpu::park::wfi`, which is `hlt` on
     /// x86_64: halting with interrupts masked halts forever.
     pub allow_tick: fn(),
+    /// Write a child's ring-3 register file into `slot`'s machine state — the
+    /// x86_64 half of [`update_thread_context`].
+    ///
+    /// The AArch64 side of that function writes the fake IRQ-return frame it
+    /// built on the new thread's kernel stack, which is state this crate owns.
+    /// x86_64 has no such frame: its ring-3 register file lives in
+    /// `amd64::usermode::UserCtx`, one per task slot, written by the
+    /// `syscall_entry` assembly and read by the `sysret` on the way out. That
+    /// table is in `amd64::sched`'s own per-slot side array and this crate
+    /// cannot name it, so the write is an effect like `switch_to` and belongs
+    /// here.
+    ///
+    /// `slot` is always [`thread_state::INITIALIZING`] when this is called —
+    /// the child is not schedulable yet, which is what makes writing another
+    /// slot's machine state safe at all.
+    pub write_user_context: fn(slot: usize, ctx: &UserContext),
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -4679,13 +4695,28 @@ pub fn on_cpu_count() -> usize {
         .count()
 }
 
-/// x86_64 stub — process-thread context rewrite (execve/fork) needs the
-/// AArch64 fake-IRQ-frame trap layout `update_thread_context` writes into,
-/// which has no x86_64 counterpart in this pass's cooperative-only switch.
-/// See `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`.
+/// Update a thread's context for a new execution — the x86_64 arm.
+///
+/// It was `unimplemented!()` until 2026-09-10, on the argument that the
+/// AArch64 version writes a fake-IRQ-frame trap layout x86_64 does not have.
+/// True, and beside the point: this target has an equivalent place to put a
+/// ring-3 register file — `amd64::usermode::UserCtx`, the per-task-slot
+/// structure the `syscall_entry` assembly writes and the `sysret` reads — and
+/// `amd64::sched` has been seeding a `fork` child's copy of the parent into it
+/// since that target grew `fork` at all. This forwards to that same writer, so
+/// the shared `spawn_child_thread_and_publish` and the target's own `sys_fork`
+/// cannot describe a child two different ways.
+///
+/// Off both kernels (a host `cargo test`, where `target_arch` is the host's)
+/// this is a no-op rather than a panic: nothing on a host has a slot to write.
 #[cfg(not(target_arch = "aarch64"))]
-pub fn update_thread_context(_thread_id: usize, _user_context: &UserContext) {
-    unimplemented!("update_thread_context: not implemented on x86_64")
+pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    (arch().write_user_context)(thread_id, user_context);
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        let _ = (thread_id, user_context);
+    }
 }
 
 /// Update a thread's context for a new execution (e.g., after execve or fork)

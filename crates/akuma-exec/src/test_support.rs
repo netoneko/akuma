@@ -115,6 +115,11 @@ pub fn ensure_test_runtime() {
         set_spawn_namespace: |_| {},
         clear_spawn_namespace: || {},
         print_str: |_| {},
+        // A host build has no ring 3 to enter. The signature is `-> !`, so the
+        // stub has to diverge — and a panic is the right divergence: reaching
+        // it means a host test called `Process::run`, which would have been an
+        // `eret` (or a `sysret`) in the kernel.
+        enter_user: |_| panic!("ExecRuntime::enter_user on a host build"),
     };
     let cfg = ExecConfig {
         max_threads: 64,
