@@ -1119,8 +1119,8 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    └──► two pieces left below the gate, neither blocked on the other:
         **the ring-3 entry seam** — an x86 arm for "enter userspace with
                  this process's first context"; unblocks `fork`, then
-                 `clone`. Sized like 5b. **IN PROGRESS: slices 1 and 2
-                 of 4 landed.** 1: `UserContext` split, four arch-neutral
+                 `clone`. Sized like 5b. **IN PROGRESS: slices 1-3 of 4
+                 landed.** 1: `UserContext` split, four arch-neutral
                  setters, `fork_process` compiles for x86_64, aarch64
                  byte-identical. 2: the **return shape** (§4) — the real
                  seam, since `run()` erets and never returns while
@@ -1129,9 +1129,18 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
                  through the shared `Process::run` for **every** process
                  it starts; `update_thread_context` has its x86 arm.
                  aarch64 `.text` +28 B, same 284 self-tests side by side.
-                 Slice 3 is `sys_fork` → `fork_process`. Prompt:
+                 3: **`CHILD_CHANNELS` + `wait4` is glue's** — an exit
+                 channel per child, this target's wait loop and waiter
+                 bitmap deleted; brings `ECHILD`-for-a-non-child, `EINTR`
+                 and `rusage`. **And it re-scoped what is left:** the
+                 blocker on `fork_process` is not `CHILD_CHANNELS` but
+                 that its **memory pass is an un-`cfg`'d AArch64
+                 page-table walker** — ARM `VALID`/`TABLE` where x86 has
+                 `Present`/`R/W`, so a PML4 walks silently wrong. Slice 4
+                 is a seam for that pass (a hook, per §4's argument), not
+                 `clone`. Prompt:
                  `proposals/NEXT_AGENT_AMD64_RING3_ENTRY_SEAM.md`
-                        docs: AKUMA_AMD64_RING3_SEAM_SLICE{1,2}.md
+                        docs: AKUMA_AMD64_RING3_SEAM_SLICE{1,2,3}.md
         **`Spawn` + `wait4`** — three fields and one source decision
                  (populate `CHILD_CHANNELS`, or teach glue's `wait4` to
                  read `Process::exited`)

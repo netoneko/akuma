@@ -1339,31 +1339,34 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `futex` — x86_64 202. Six arguments, which is why `syscall_entry`
         // now forwards `a6`.
         Syscall::Futex => crate::futex::sys_futex(a1, a2, a3, a4, a5, a6),
-        // `wait4(pid, wstatus, options, rusage)` — x86_64 61. Route into the
-        // Akuma-private `waitpid` table, but **block** (unless `WNOHANG`): a
-        // forked shell calls `wait4(pid, &st, 0, 0)` expecting to sleep until
-        // the child is done, where `sys_waitpid` alone just returns 0.
+        // `wait4(pid, wstatus, options, rusage)` — x86_64 61. **Served by
+        // `akuma-syscalls-glue` since 2026-09-10**, which is the whole point of
+        // this target registering an exit `ProcessChannel` per child
+        // (`register_exec_process`).
+        //
+        // What it replaced was a hand-written loop over this file's own
+        // `sys_waitpid`, parking on a global bitmap of waiters that any child's
+        // exit woke wholesale. It worked, and it could not answer three things
+        // the shared implementation answers for free:
+        //
+        // * **`ECHILD` for a non-child.** `is_child_of_group` resolves the
+        //   recorded parent's *thread group*, so a multithreaded parent waiting
+        //   from a non-leader thread gets the right answer — and Go's pidfd
+        //   probe, which requires `ECHILD` from `waitid(P_PIDFD)` on itself,
+        //   stops deadlocking against its own exit.
+        // * **`EINTR`.** The loop here had no interrupt check at all; a `wait4`
+        //   was uninterruptible.
+        // * **`rusage`.** Zeroed rather than ignored, which is what a caller
+        //   that passes a pointer expects to find.
+        //
+        // The reap moved with it: glue unregisters the process and reaps the
+        // child channel, so this target's `SPAWN` row is collected by
+        // [`sweep_reaped_spawn_rows`] rather than freed inline. See its doc for
+        // why a sweep and not a hook.
         Syscall::Wait4 => {
-            const WNOHANG: u64 = 0x0000_0001;
-            let me = crate::sched::current_task();
-            loop {
-                // Arm, then join the waiter set, then ask. Both steps go before
-                // the question for the same reason: a child that exits between
-                // the answer and the park must leave something behind, and
-                // `wait4_wake_all` reaching an armed, registered task is that
-                // something. Registering *after* asking would reopen the window
-                // this ordering exists to close.
-                wait4_register(me);
-                // 0 = a matching child exists but has not exited; anything else
-                // is a reaped pid or `-ESRCH`.
-                let r = sys_waitpid(a1, a2, a3);
-                if r != 0 || a3 & WNOHANG != 0 {
-                    wait4_unregister(me);
-                    return r;
-                }
-                crate::sched::block_current();
-                wait4_unregister(me);
-            }
+            let r = to_glue(Syscall::Wait4, [a1, a2, a3, a4, 0, 0]);
+            sweep_reaped_spawn_rows();
+            r
         }
         // uname(2) — **the first arm served by `akuma-syscalls-glue`** (C1 step 3).
         //
@@ -2682,6 +2685,26 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     if idx >= SPAWN_SLOT_BASE {
         spawn_record_exit(idx, status as i32);
     }
+    // Drop this task's entry in the **per-thread** channel registry, the way
+    // the AArch64 exit epilogue does (`process/mod.rs`'s `remove_channel(tid)`
+    // in `return_to_kernel`). `CHILD_CHANNELS` still holds the same `Arc` —
+    // that one is the parent's to reap through `wait4` — so what this releases
+    // is the registry slot signal delivery and `should_interrupt_blocking_syscall`
+    // resolve through, which nothing should reach for a task that has left ring
+    // 3 for good.
+    //
+    // **After `spawn_record_exit`, and the order is load-bearing.** That call
+    // publishes the exit through `publish_child_exit`, which raises SIGCHLD
+    // only when *it* is the call that marked the channel exited. Setting the
+    // exit code here first — which is what the AArch64 site does, on the same
+    // `Arc`, as a deliberate redundant re-set — would make the publish a no-op
+    // and the parent would never get the signal. Unconditional, unlike the
+    // publish: a boot self-test process is registered (and therefore has a
+    // channel) but owns no `SPAWN` row.
+    let ch = akuma_exec::process::channel::remove_channel(crate::sched::current_task());
+    if let Some(ch) = ch {
+        ch.set_exited(status as i32);
+    }
     // 5b slice 1: terminal teardown is a vetted drain site (`process::reclaim`
     // site 1). On AArch64 `unregister_process`'s RETIRED slots are collected
     // from the exit paths, the idle loop and the PMM pressure ladder; this
@@ -3248,9 +3271,10 @@ fn register_exec_process(
     };
 
     use akuma_exec::process::{
-        AtomicProcessState, LazyRegionMap, Process, ProcessImage, ProcessMemory,
+        AtomicProcessState, LazyRegionMap, Process, ProcessChannel, ProcessImage, ProcessMemory,
         ProcessState, ProcessSyscallStats, SharedFdTable, SharedSignalTable,
-        StdioBuffer, UserContext, register_process, thread_pid_map_insert,
+        StdioBuffer, UserContext, register_channel, register_child_channel, register_process,
+        thread_pid_map_insert,
     };
 
     let stack_bottom = ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096);
@@ -3365,6 +3389,34 @@ fn register_exec_process(
     });
     register_process(pid, proc);
     thread_pid_map_insert(task_slot, pid);
+
+    // **The exit channel** — the AArch64 practice, adopted 2026-09-10.
+    //
+    // The two registrations are verbatim what the shared
+    // `spawn_child_thread_and_publish` does for a `fork`/`vfork` child on the
+    // other kernel, and they are what make `wait4` shared code rather than a
+    // second implementation. This target had neither, and answered "has my
+    // child exited?" from its own `SPAWN` row instead. Two things that could
+    // not be answered that way arrive with them:
+    //
+    // * **`is_child_of_group`.** `wait*` on a process that is not your child
+    //   must fail `ECHILD`, not block. The `SPAWN` row records a pid, not a
+    //   parent link resolvable by thread group, so a multithreaded parent
+    //   waiting from a non-leader thread had no correct answer — and Go's
+    //   `os/exec` pidfd probe *requires* the `ECHILD` (`waitid(P_PIDFD)` on
+    //   itself), where blocking deadlocks the caller against its own exit.
+    // * **`EINTR`.** Signal delivery and `should_interrupt_blocking_syscall`
+    //   both resolve through `get_channel(tid)`, which is why the per-thread
+    //   registration is not optional decoration: without it a `wait4` parked
+    //   in glue could not be interrupted.
+    //
+    // Deliberately **not** `Process::channel`, which stays `None`: that field
+    // is a process's *I/O* channel, and on this target stdio is bound
+    // descriptors over `crate::pipe`. This one carries an exit status and
+    // nothing else, exactly as the shared spawn path's comment says.
+    let exit_channel = alloc::sync::Arc::new(ProcessChannel::new());
+    register_channel(task_slot, exit_channel.clone());
+    register_child_channel(pid, exit_channel, ppid);
 }
 
 /// Tear a reaped child's registration down: retire the `Process` (the table's
@@ -3380,8 +3432,26 @@ fn register_exec_process(
 /// remove; a stale entry is self-correcting (the new owner's insert overwrote
 /// it), a matching one is ours.
 fn reap_exec_process(pid: u32, task_slot: usize) {
-    use akuma_exec::process::{pid_for_thread, thread_pid_map_remove, unregister_process};
+    use akuma_exec::process::{
+        pid_for_thread, reap_child_channel, thread_pid_map_remove, unregister_process,
+    };
     unregister_process(pid);
+    // The child channel goes with the registration, and it is done **here**
+    // rather than at either call site because since 2026-09-10 this target has
+    // a channel per child and **two** reapers: this file's `sys_waitpid`
+    // (Akuma's private 303, which `sshd`'s bridge polls non-blockingly) and
+    // glue's `wait4`. Whichever gets there must do the whole job, or a reap
+    // through one of them leaves a `CHILD_CHANNELS` entry — and the
+    // `Arc<ProcessChannel>` it holds — for the life of the boot. Measured: ~200
+    // bytes of kernel heap per child, which `amd64_ring3_check`'s `heap` column
+    // reports as a rising drift across 60 ssh sessions.
+    //
+    // Inside this function rather than beside it, because it has two callers
+    // and the second one is the path that is easy to forget: `sys_waitpid`'s
+    // fallback for a child the process table knows and no `SPAWN` row names.
+    // `reap_child_channel` declines while the channel still holds unread
+    // stdout, so a parent mid-drain is not robbed of it.
+    reap_child_channel(pid);
     if pid_for_thread(task_slot) == Some(pid) {
         thread_pid_map_remove(task_slot);
     }
@@ -3706,6 +3776,11 @@ fn sys_fork() -> u64 {
         return errno::ENOSYS;
     }
 
+    // Collect any row the reaper left behind first — glue's `wait4` frees the
+    // process, not the row (see `sweep_reaped_spawn_rows`), so without this the
+    // table fills with rows for processes that no longer exist and `fork`
+    // reports `ENOMEM` on a machine with gigabytes free.
+    sweep_reaped_spawn_rows();
     // A free child slot. The `SPAWN` row is the whole answer since 5b slice 4:
     // it used to be `PROCS[s].is_none() && SPAWN[s].is_none()`, and the
     // diagnostic below used to count both halves because they could diverge —
@@ -3876,6 +3951,9 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
     let spawn_cmdline = flatten_cmdline(argv_refs.iter().copied());
     let spawner_pid = current_pid();
 
+    // Same collect-first as `sys_fork`'s search, and for the same reason: the
+    // reaper frees the process, this frees the row.
+    sweep_reaped_spawn_rows();
     // A free process slot in the spawn range. The `SPAWN` row is the oracle
     // since 5b slice 4 — it was `PROCS`, and `fork` consulted both, which is
     // the divergence that made this function and that one disagree about how
@@ -4015,48 +4093,15 @@ fn cleanup_spawn_slot(stdout_pipe: PipeId, stdin_pipe: PipeId) {
     pipe::free(stdin_pipe);
 }
 
-/// Tasks parked inside `wait4`, as a bitmap over scheduler task slots.
-///
-/// A set rather than a per-child parent link, because `wait4(-1)` waits for
-/// *any* child and the waiter is frequently not in the spawn table at all
-/// (`sshd` is pid 1). Waking the whole set on any child's exit is a handful of
-/// spurious wakes at most — each parked task re-runs `sys_waitpid` and parks
-/// again if the exit was not its child — against the alternative of threading a
-/// parent task slot through every spawn, fork and vfork path.
-///
-/// Relaxed ordering throughout: every reader and writer runs under the BKL, and
-/// the atomics are here to make the `static` sound rather than to order
-/// anything.
-static WAIT4_PARKED: [AtomicU64; crate::sched::MAX_TASKS.div_ceil(64)] =
-    [const { AtomicU64::new(0) }; crate::sched::MAX_TASKS.div_ceil(64)];
-
-fn wait4_register(task: usize) {
-    if let Some(w) = WAIT4_PARKED.get(task / 64) {
-        w.fetch_or(1 << (task % 64), Ordering::Relaxed);
-    }
-}
-
-fn wait4_unregister(task: usize) {
-    if let Some(w) = WAIT4_PARKED.get(task / 64) {
-        w.fetch_and(!(1 << (task % 64)), Ordering::Relaxed);
-    }
-}
-
-/// Make every task parked in `wait4` runnable.
-///
-/// Called from [`spawn_record_exit`], which is the single place in this kernel
-/// where a child's exit status becomes visible — so this is the whole wake path
-/// for `wait4`, and it is one call site rather than a rule to remember.
-fn wait4_wake_all() {
-    for (word, bits) in WAIT4_PARKED.iter().enumerate() {
-        let mut set = bits.load(Ordering::Relaxed);
-        while set != 0 {
-            let bit = set.trailing_zeros() as usize;
-            set &= set - 1;
-            crate::sched::wake(word * 64 + bit);
-        }
-    }
-}
+// **`WAIT4_PARKED` is gone** (2026-09-10). It was a bitmap of every task parked
+// inside this file's own hand-written `wait4` loop, woken wholesale on any
+// child's exit — "a handful of spurious wakes at most", because the set carried
+// no parent link and could not tell whose child had died.
+//
+// It is `ProcessChannel`'s poller list now, which does carry one: a waiter
+// registers on the channel of the child (or children) it is actually waiting
+// for, and `publish_child_exit` wakes exactly those. The wake path did not move
+// so much as become answerable — see [`spawn_record_exit`] and the `Wait4` arm.
 
 /// Called from `run_process` when a spawned child leaves ring 3.
 pub fn spawn_record_exit(proc_slot: usize, status: i32) {
@@ -4114,9 +4159,19 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
         }
     }
     // Outside the `unsafe` block and after the status is recorded, both
-    // deliberately: a woken parent re-runs `sys_waitpid` immediately, and it
-    // must find `exit` already set or it parks again for nothing.
-    wait4_wake_all();
+    // deliberately: a woken parent re-runs its wait immediately, and it must
+    // find `exited` already set or it parks again for nothing.
+    //
+    // `publish_child_exit` is the shared publisher, and it does in one call
+    // what this function's own wake could not do at all: mark the child's
+    // channel exited (waking the pollers registered on *that* child, not every
+    // parked task) and **then** raise SIGCHLD on the parent, in that order,
+    // because a shell's SIGCHLD handler re-polls with `WNOHANG` immediately and
+    // must find the zombie. It publishes at most once per death, so a child
+    // that exits and is then torn down does not raise two.
+    if dying != 0 {
+        akuma_exec::process::publish_child_exit(dying, status);
+    }
 }
 
 // **C2 slice 6 deleted `spawn_stdio`, `current_stdin_pipe` and
@@ -4312,6 +4367,63 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 /// The row is addressed by pid rather than by slot since 5b slice 2: the
 /// process table decides *which* child is being reaped, and this finds the
 /// stdio that goes with it.
+/// Free every `SPAWN` row whose process has been reaped, and drop the one pipe
+/// end nothing else holds.
+///
+/// # Why a sweep and not a reap hook
+///
+/// Since 2026-09-10 the reaper is `akuma-syscalls-glue`'s `wait4`: it
+/// unregisters the process and reaps the child channel, and it knows nothing
+/// about this target's `SPAWN` table — nor should it, since the two things left
+/// in a row are a scheduler task slot and a `crate::pipe` id, neither of which
+/// exists on the other kernel.
+///
+/// A hook was the obvious alternative and is the wrong shape here. The reap is
+/// not the only way a row can become stale — a reparented orphan collected by
+/// init, a `wait4` that returned `EFAULT` after unregistering, a future second
+/// waiter — and a hook has to be called from every one of them, correctly,
+/// forever. "The process this row names is no longer registered" is checkable
+/// and true in all of them, so the sweep asks the question instead of trusting
+/// a call site to answer it. It runs after each `wait4` and again when
+/// `sys_spawn` looks for a free slot, which are the only two moments the answer
+/// matters.
+///
+/// **`pipe::close_write`, not `pipe::free`**, for the reason
+/// [`Spawn::stdin_pipe`]'s doc gives: `sshd` may still hold an open
+/// `/proc/<pid>/fd/0` over that pipe, and destroying it under that descriptor
+/// makes its eventual close land on a stranger's pipe id.
+fn sweep_reaped_spawn_rows() {
+    for off in 0..SPAWN_SLOTS {
+        // SAFETY: raw-pointer read under the BKL; nothing yields between the
+        // read and the write below.
+        let Some((pid, slot, stdin_pipe)) = (unsafe {
+            (*spawn_table())[off]
+                .as_ref()
+                .map(|s| (s.pid, s.exec_slot, s.stdin_pipe))
+        }) else {
+            continue;
+        };
+        if akuma_exec::process::lookup_process_shared(pid).is_some() {
+            continue;
+        }
+        // SAFETY: as above; the child's task reached `sched::finish()` before
+        // its process could be unregistered, so nothing is running on `slot`.
+        unsafe {
+            (*spawn_table())[off] = None;
+        }
+        if let Some(p) = stdin_pipe {
+            pipe::close_write(p);
+        }
+        // The identity map entry this row's spawn published, removed only if it
+        // still names this pid — task slots are recycled, and stripping a live
+        // process's identity would degrade every syscall it makes until its own
+        // insert re-stamped.
+        if akuma_exec::process::pid_for_thread(slot) == Some(pid) {
+            akuma_exec::process::thread_pid_map_remove(slot);
+        }
+    }
+}
+
 fn spawn_row_of(pid: u32) -> Option<usize> {
     // SAFETY: raw-pointer read; single core, no row mutated.
     unsafe { (*spawn_table()).iter().position(|e| e.as_ref().is_some_and(|s| s.pid == pid)) }
