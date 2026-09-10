@@ -2491,16 +2491,15 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
 /// kernels (`inherit_from` copies the parent's for a `CLONE_THREAD` child), so
 /// the leader is one lookup away.
 ///
-/// Falls back to the task's own `Process` when the leader is not in the table —
-/// a leader that has exited while a thread runs on. That is the pre-fold answer
-/// and no worse than it; a thread outliving its leader is what
-/// `thread::drain` exists to prevent.
+/// This is `akuma-exec`'s own `current_thread_tgid_process()`, which is the
+/// **group** half of a pair the other kernel has had all along —
+/// `current_thread_own_process()` being the per-thread half. Both resolve
+/// through the cached `THREAD_IDENTITY` table, so asking the right one costs
+/// the same as asking the wrong one. amd64 reached for the own-half everywhere
+/// only because, before the fold, a thread had no `Process` of its own and the
+/// two answers coincided.
 fn current_mm_process() -> Option<&'static akuma_exec::process::Process> {
-    let p = current_process()?;
-    if p.tgid == p.pid {
-        return Some(p);
-    }
-    akuma_exec::process::active_process_ref(p.tgid).or(Some(p))
+    akuma_exec::process::current_thread_tgid_process().map(|(_tgid, p)| p)
 }
 
 /// Run `f` with the running process's user address space, under its lock.
@@ -3107,14 +3106,32 @@ pub fn current_pid() -> u32 {
     // and the map answered there, and nothing checked them against each other.
     //
     // The key is the scheduler task slot, because on this target the tid **is**
-    // that slot. A thread resolves to its process's pid, which is what makes
-    // this correct for `CLONE_VM` where the old slot walk was correct by a
-    // different route (the shared `proc_slot` in the per-CPU `UserCtx`).
+    // that slot.
+    //
+    // **It answers the `tgid`, not the task's own pid**, which is what
+    // `getpid(2)` means on Linux: every thread of a group reports the group
+    // leader's pid, and `gettid` is the per-thread number
+    // (`crate::thread::current_tid`).
+    //
+    // Until the `clone` fold the two were the same thing here by accident — a
+    // `CLONE_THREAD` child had no `Process` of its own and was published into
+    // `THREAD_PID_MAP` under its *leader's* pid, so "own pid" already meant
+    // "group pid". The shared `clone_thread` gives each thread a real `Process`
+    // with its own pid and `tgid = parent.tgid`, so the two diverge and the
+    // distinction has to be made rather than inherited.
+    //
+    // Getting this wrong is silent and it bit immediately: this function is the
+    // **futex namespace** (`crate::futex::namespace`, `(tgid, uaddr)`), so a
+    // thread waking its parent enqueued on one key and woke another. The
+    // `threadprobe` parent parked in `FUTEX_WAIT` forever and the boot suite
+    // reported `0xffff…` — the never-stored sentinel — on two runs in three,
+    // passing on the third only when it happened to see the value before
+    // parking.
     //
     // Unmapped means init: the self-tests run before `run_init` registers
     // anything, and they are pid 1's work. That is the same answer the slot
     // walk gave for `slot < SPAWN_SLOT_BASE`.
-    akuma_exec::process::pid_for_thread(crate::sched::current_task()).unwrap_or(1)
+    akuma_exec::process::current_thread_tgid_process().map_or(1, |(tgid, _)| tgid)
 }
 
 fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
