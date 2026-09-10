@@ -561,7 +561,7 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !accept_wait_slot(listener, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
                 // The listener may have been closed while we were parked.
                 if with_table(|t| t.get(listener).is_none()) {
@@ -828,7 +828,7 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_writer(tx, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
                 if !super::pipe::pipe_can_write(tx) && super::pipe::pipe_hup(tx) {
                     return EPIPE;
@@ -924,7 +924,7 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool) -> u64 {
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_writer(queue, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             }
             Err(e) => return neg_errno(e),
@@ -957,7 +957,7 @@ fn pipe_write_bytes(tx: u32, data: &[u8], nonblock: bool) -> u64 {
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_writer(tx, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             }
             Ok(n) => return n as u64,
@@ -1059,7 +1059,7 @@ pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, b
         }
         let tid = akuma_exec::threading::current_thread_id();
         if !super::pipe::pipe_check_set_reader(rx, tid) {
-            akuma_exec::threading::schedule_blocking(u64::MAX);
+            akuma_exec::threading::park_indefinitely();
         }
     }
 }
@@ -1083,7 +1083,7 @@ fn pipe_read_bytes(rx: u32, buf: &mut [u8], nonblock: bool) -> u64 {
         }
         let tid = akuma_exec::threading::current_thread_id();
         if !super::pipe::pipe_check_set_reader(rx, tid) {
-            akuma_exec::threading::schedule_blocking(u64::MAX);
+            akuma_exec::threading::park_indefinitely();
         }
     }
 }

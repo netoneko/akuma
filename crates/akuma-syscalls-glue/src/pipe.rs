@@ -260,7 +260,7 @@ pub fn pipe_write_all_blocking(id: u32, data: &[u8]) -> Result<(), i32> {
                 // wakes writers on the last-reader close, and the retry then sees EPIPE).
                 let tid = akuma_exec::threading::current_thread_id();
                 if !pipe_check_set_writer(id, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             }
             n => off += n,

@@ -355,7 +355,7 @@ fn render_meminfo(buf: &mut [u8]) -> usize {
     let _ = writeln!(w, "SwapTotal:      {:>10} kB", 0);
     let _ = writeln!(w, "SwapFree:       {:>10} kB", 0);
     let _ = writeln!(w, "Shmem:          {:>10} kB", 0);
-    let _ = writeln!(w, "Slab:           {:>10} kB", slab_kb);
+    let _ = writeln!(w, "Slab:           {slab_kb:>10} kB");
     pos
 }
 

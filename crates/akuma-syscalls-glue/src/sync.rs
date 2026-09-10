@@ -339,7 +339,7 @@ pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
     akuma_primitives::irq::with_irqs_disabled(|| {
         FUTEX_WAITERS.lock().enqueue(key, QueuedWaiter(current_wake_handle()), BITSET_MATCH_ANY);
     });
-    akuma_exec::threading::schedule_blocking(u64::MAX);
+    akuma_exec::threading::park_indefinitely();
     // futex_do_wake removed us from the queue before calling wake()
 }
 

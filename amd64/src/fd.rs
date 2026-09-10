@@ -256,10 +256,6 @@ pub mod errno {
     pub const EROFS: u64 = (-30i64) as u64;
     /// The device has no room — a write the VFS could not place.
     pub const ENOSPC: u64 = (-28i64) as u64;
-    /// Written to a pipe every reader has closed. New with `akuma-pipes`' end
-    /// reference counts — before them this kernel could not tell a dead reader
-    /// from a full buffer, and `write_pipe`'s retry loop span forever instead.
-    pub const EPIPE: u64 = (-32i64) as u64;
     /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
     /// that no other syscall here produces.
     pub const ETIMEDOUT: u64 = (-110i64) as u64;
@@ -626,67 +622,6 @@ pub fn pipe_write_id(fd: u64) -> Option<usize> {
         FileDescriptor::PipeWrite(p) => Some(p as usize),
         _ => None,
     })
-}
-
-/// Read from a pipe, honouring `nonblock`. A blocking read **parks** until data
-/// or EOF — which is safe on this target only because a pipe reader is never
-/// also the pipe's writer (spawn wires them to different tasks).
-///
-/// Parks rather than spins since 2026-09-07. The loop is the same shape it was;
-/// what replaced `yield_now` is the three-step wait `sched::prepare_block`
-/// documents — arm, then test-and-register in one step, then park. Every wake
-/// this can be waiting for is produced by the pipe table (`write`,
-/// `close_write`, `close_read`, `destroy`) and fired by `pipe::fire`, so the
-/// wake set is complete by construction rather than by inspection.
-pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
-    let mut tmp = alloc::vec![0u8; len.min(MAX_IO as usize)];
-    loop {
-        match crate::pipe::read(pipe_id, &mut tmp) {
-            Some(0) => return 0, // EOF
-            Some(n) => return copy_to_user(buf, &tmp[..n]),
-            None if nonblock => return errno::EAGAIN,
-            None => {
-                // Arm before asking. A write landing between the question and
-                // the park then finds `wake_pending` to set, and the park is a
-                // no-op instead of a missed event.
-                if !crate::pipe::check_set_reader(pipe_id) {
-                    crate::sched::block_current();
-                }
-            }
-        }
-    }
-}
-
-/// Write to a pipe, honouring `nonblock`. A short write is returned as-is;
-/// `sshd`'s bridge carries the residue.
-pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
-    let Some(data) = copy_in(buf, len as u64) else {
-        return errno::EFAULT;
-    };
-    loop {
-        // `None` is a pipe with no readers left. Checking it is not optional:
-        // this loop retries a zero-count write forever, and before the pipe
-        // table grew end reference counts a dead reader was indistinguishable
-        // from a full buffer — so `busybox yes | busybox head -n 1` span here
-        // rather than ending. There is no signal machinery on this target, so
-        // `EPIPE` is the whole of Linux's answer that applies.
-        let Some(n) = crate::pipe::write(pipe_id, &data) else {
-            return errno::EPIPE;
-        };
-        if n > 0 || data.is_empty() {
-            return n as u64;
-        }
-        if nonblock {
-            return errno::EAGAIN;
-        }
-        // Full buffer: park until the reader drains it, or until the last
-        // reader goes away — `check_set_writer` reports that second case as
-        // "do not block", because a pipe with no readers never gains room and
-        // the retry above is what turns it into `EPIPE`.
-        if !crate::pipe::check_set_writer(pipe_id) {
-            crate::sched::block_current();
-        }
-    }
 }
 
 /// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
@@ -1415,234 +1350,131 @@ pub fn sys_close(fd: u64) -> u64 {
     akuma_syscalls_glue::fs::sys_close(fd as u32)
 }
 
-/// Serve a read from the `/dev` character node `node`.
+/// `read(fd, buf, len)` — **`akuma-syscalls-glue`'s arm** (4b batch 3a) behind
+/// a three-line preamble.
 ///
-/// Each of these is a *rule*, not a file: there is no inode behind the path,
-/// which is exactly why the ext2 read path answers `EIO` for all of them.
-/// Shared by [`sys_read`] and [`sys_pread64`] — the offset makes no difference
-/// to any of the four, which is the other half of why they are not files.
-fn dev_read(node: &str, buf: u64, len: u64) -> u64 {
-    match node {
-        // The bit bucket reads as an empty file — `read` returns 0, i.e. EOF.
-        "null" => 0,
-        "zero" => {
-            let zeros = alloc::vec![0u8; len as usize];
-            copy_to_user(buf, &zeros)
-        }
-        // The same entropy `getrandom(2)` gets (`net::rng_fill_checked`, via
-        // `akuma_primitives::rng`). Both `/dev/random` and `/dev/urandom`, and
-        // deliberately not distinguished: this target has one source and no
-        // entropy accounting to block on, so pretending `random` is the
-        // blocking one would be a fiction with a hang in it.
-        "random" | "urandom" => {
-            let mut bytes = alloc::vec![0u8; len as usize];
-            // `None` (no source registered) and `Some(false)` (the source
-            // failed) are both `EIO` here, and the distinction the crate keeps
-            // is not lost by that: it exists so `getrandom(2)` can fall back to
-            // a virtio device, and this target registers its source in
-            // `boot.rs` unconditionally. Handing ring 3 the zeroed buffer
-            // instead would be an entropy source that is not one.
-            if akuma_primitives::rng::fill_bytes(&mut bytes) != Some(true) {
-                return errno::EIO;
-            }
-            copy_to_user(buf, &bytes)
-        }
-        "tty" => read_console(buf, len as usize),
-        // Every node this target opens is one of the above: `sys_openat`
-        // refuses the block devices with `ENODEV` and there are no others in
-        // the table. A new one arriving there and not here would read as an
-        // empty file, so answer `EIO` instead — "this kernel cannot tell you"
-        // rather than a confident nothing.
-        _ => errno::EIO,
-    }
-}
-
-/// `read(fd, buf, len)`.
+/// # The console is the arm that stays
 ///
-/// fd 0 is the console and **blocks**: it spins on the UART until a byte
-/// arrives. That is what makes an interactive shell possible on a target with no
-/// device interrupts, and it is also why nothing else can run while a prompt
-/// waits — the honest cost of polling, and the thing an IOAPIC would fix.
+/// fd 0 here **blocks on the UART**: it spins on the serial port until a byte
+/// arrives, which is what makes an interactive shell possible on a target with
+/// no device interrupts (and is also why nothing else runs while a prompt
+/// waits — the honest cost of polling, and the thing an IOAPIC would fix).
+///
+/// Glue's `Stdin`/`DevTty` arm reads a `ProcessChannel` and, when there is
+/// none, falls back to `Process::read_stdin` — a `StdioBuffer` that on this
+/// target nothing ever fills. Delegating it would answer **0**, i.e. EOF, to
+/// every console read: `INIT=/bin/sh` on the serial line would exit at its
+/// first prompt, and the boot suite's own `read of the console's write end`
+/// check would be asking a different question. So [`console_end`] is asked
+/// first, by **both** spellings — a bound `Stdin`/`Stdout`/`Stderr`
+/// descriptor and an unbound 0/1/2 — exactly as it was.
+///
+/// Closing this means giving the shared stdin sink a way to find *this*
+/// target's real input, which is a change to behaviour on both kernels and
+/// waits for a working AArch64 verification loop — the same call batch 2d made
+/// for `/proc/<pid>/fd/0` and `openat`'s three flags.
+///
+/// `/dev/tty` needs no arm of its own: glue's `openat` refuses it with `ENODEV`
+/// here (it requires a terminal `channel`, and no process on this target has
+/// one), so a `DevTty` descriptor cannot exist. The day it can, it belongs in
+/// the guard above.
+///
+/// # And the clamp
+///
+/// `len` is bounded to [`MAX_IO`] before the call, not after. Glue's `File`,
+/// `BlockDev` and `Socket` arms clamp themselves, but its pipe, stdin and
+/// `/dev/zero` arms allocate `count` kernel bytes for whatever ring 3 asked
+/// for — `validate_user_ptr` bounds that to a *mapped* range, which a process
+/// holding a large mapping can make large. This arm has always clamped and a
+/// fold must not drop a bound. Clamped rather than refused, for the reason
+/// `apk` taught: an oversized count is ordinary POSIX and a short read is the
+/// contract (a 119-byte `/etc/apk/repositories` read through a 128 KiB buffer
+/// came back `EINVAL` before that was understood, and `apk update` never
+/// reached the network).
+///
+/// # What the fold gained
+///
+/// - **Reads go by inode.** Glue asks `read_at_open_file`, so a descriptor
+///   resolves its bytes through the `(mount id, inode)` `open(2)` pinned
+///   instead of walking the path again on every call — and an
+///   unlinked-but-open fd keeps reading.
+/// - **A `read` on a real file runs BKL-free** (`VfsBklGuard` scoped to that
+///   arm) rather than under the lock.
+/// - **`EPOLLET` edges are re-armed** after a pipe or socket read, which this
+///   arm never did.
 pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    // Clamped, not refused. `read(2)` on real Linux accepts an oversized
-    // count and just does a short read (or reads up to its own internal cap,
-    // ~2 GiB) — it is not an error for the caller to ask for more than is
-    // available or than this kernel wants to service in one call. Rejecting
-    // the whole call with `EINVAL` used to be this function's answer, and it
-    // broke `apk`: its I/O layer reads local files through a fixed
-    // (128 KiB-class) buffer regardless of the file's real size — completely
-    // ordinary POSIX usage — so a 119-byte `/etc/apk/repositories` came back
-    // "Invalid argument" before `apk update` ever got as far as opening a
-    // socket. The file-read path below already clamps to what is actually
-    // available (`total.saturating_sub(pos).min(len)`); this clamp is what
-    // lets a request past `MAX_IO` reach that logic instead of being refused
-    // outright.
-    let len = len.min(MAX_IO);
-
-    // **The row is consulted before the by-number defaults**, so a redirected
-    // descriptor wins. `sh -c 'prog < file'` is `open(file); dup2(fd, 0)`, and
-    // reading fd 0 must then reach the file rather than the console. For an
-    // *unbound* 0/1/2 nothing here matches and the console path below runs,
-    // exactly as it did before descriptors 0/1/2 could be bound at all.
-
-    // A socket descriptor routes to the network stack. The lock is dropped
-    // first: `socket_recv` blocks, and holding the descriptor table across a
-    // blocking wait would stop every other task from opening a file.
-    if let Some(sock) = socket_index(fd) {
-        return crate::sock::recv(sock, buf, len, is_nonblocking(fd));
-    }
-
-    // A pipe descriptor — the parent's read end of a spawned child's stdout,
-    // or either end of a `pipe(2)` pair.
-    if let Some(pid) = pipe_read_id(fd) {
-        return read_pipe(pid, buf, len as usize, is_nonblocking(fd));
-    }
-
-    // The console, by either spelling — see [`console_end`]. It used to also
-    // ask `current_stdin_pipe()` — the `Spawn` row — because a spawned child's
-    // stdin was a pipe reached *by number*; since C2 slice 6 it is a
-    // `PipeRead` descriptor and the branch above has already routed it.
+    // See the header.
     match console_end(fd) {
-        Some(ConsoleEnd::Read) => return read_console(buf, len as usize),
+        Some(ConsoleEnd::Read) => return read_console(buf, len.min(MAX_IO) as usize),
         // The screen side is not readable, and `EBADF` is the answer this arm
         // has always given for it.
         Some(ConsoleEnd::Write) => return errno::EBADF,
         None => {}
     }
-
-    // A `/dev` character node.
-    if let Some(node) = dev_node_of(fd) {
-        return dev_read(node, buf, len);
-    }
-
-    // Resolve under the lock; do the I/O outside it. **No directory guard
-    // here.** A `read` on a directory descriptor reaches `fs::read_at`, which
-    // answers `NotAFile`, which [`fs_err_errno`] maps to `EISDIR` — the same
-    // errno by the same route `akuma-syscalls-glue` uses, and the reason the
-    // entry no longer carries an `is_dir` bool. The common path pays nothing:
-    // the check that went away only ever fired on the error.
-    //
-    // `/proc` is read through the VFS like any other mount (4b batch 2c) — the
-    // mounted `ProcFilesystem`'s semantics, which is what this target's file
-    // surface is converging on; the render-at-open snapshot the old
-    // `Entry::data` cache gave was that field's whole reason to exist, and it
-    // went with the field.
-    let resolved = table_with(fd, |d| {
-        let FileDescriptor::File(f) = d else {
-            return Err(errno::EBADF);
-        };
-        Ok((f.path.clone(), f.position))
-    });
-    let (path, pos) = match resolved {
-        Some(Ok(v)) => v,
-        Some(Err(e)) => return e,
-        None => return errno::EBADF,
-    };
-    // One bounded VFS read, then the position moves — for `/proc` too, which is
-    // a mount like any other now.
-    let mut kbuf = alloc::vec![0u8; len as usize];
-    // **The error is mapped, not flattened.** `Err(_) => EIO` stood here, and
-    // it is what made `read` on a directory descriptor answer `EIO` the moment
-    // the entry stopped carrying an `is_dir` bool to refuse it earlier: ext2
-    // says `NotAFile`, [`fs_err_errno`] says `EISDIR`, and this line threw
-    // both away. Caught by a ring-3 probe, not by the suite.
-    let n = match fs::read_at(&path, pos, &mut kbuf) {
-        Ok(n) => n,
-        Err(e) => return fs_err_errno(e),
-    };
-    if n == 0 {
-        return 0;
-    }
-    table_with(fd, |d| {
-        if let FileDescriptor::File(f) = d {
-            f.position = pos + n;
-        }
-    });
-    copy_to_user(buf, &kbuf[..n])
+    akuma_syscalls_glue::fs::sys_read(fd, buf, len.min(MAX_IO) as usize)
 }
 
-/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17.
+/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17. **Glue's arm** (4b
+/// batch 3a) behind the errno this target refuses to give up.
 ///
 /// A read from an explicit offset that **does not move the descriptor's
-/// cursor**. That is the whole difference from [`sys_read`], and it is the
-/// reason the two cannot share a body: `sys_read` mutates `file.position` and
-/// every caller of `pread` is relying on it not to.
+/// cursor**. That is the whole difference from [`sys_read`], and it is why the
+/// two are separate arms in glue as well.
 ///
-/// # Why this exists
-///
-/// It was not dispatched at all until 2026-09-07, so every `pread` on this
-/// target returned `ENOSYS`. `scripts/mem_suite.py`'s `mmapsum` is what found
-/// it — its `read()` reference arm is a `pread` loop and it aborted at offset 0
-/// before comparing anything (`docs/archive/AKUMA_AMD64_MEMORY_GAPS.md` §1) —
-/// but the probe is only the messenger. `pread` is how every archive reader,
-/// every `rustc` metadata load and every threaded reader of a shared
-/// description reaches into a file, precisely because it needs no lock around a
-/// seek-then-read pair.
-///
-/// # The errnos, and why `ESPIPE` is not `EBADF`
+/// # `ESPIPE` is the preamble
 ///
 /// A pipe, socket or console descriptor has no offset to read from, and Linux
 /// says `ESPIPE` for that — a *seekability* answer, distinct from "no such
-/// descriptor". Answering `EBADF` instead would tell a caller its fd was closed
-/// when it is open and perfectly readable, which is the wrong-errno failure this
-/// document's §2 is about in a second place: musl's `FILE` layer falls back to
-/// `read()` on `ESPIPE` and gives up on `EBADF`.
+/// descriptor". Glue's arm answers `_ => EBADF` for all three, and the
+/// difference is not cosmetic: **musl's `FILE` layer falls back to `read()` on
+/// `ESPIPE` and gives up on `EBADF`**, so the wrong one turns a working
+/// unseekable stream into a closed file. Moving this into glue is a behaviour
+/// change on the AArch64 kernel, whose verification loop does not run on this
+/// machine, so it stays here and is stated rather than assumed absent.
 ///
-/// A negative `offset` is `EINVAL`. It arrives as a `u64` from a ring-3
-/// register, so the sign has to be recovered before it is used as an index —
-/// `0xFFFF_FFFF_FFFF_FFFF` as a `usize` offset would otherwise sail past every
-/// bound check by being larger than any file.
+/// Asked ahead of the table lookup, so the answer is about the *kind* of
+/// descriptor rather than about whether a file happens to sit behind it.
+///
+/// # Why this exists at all
+///
+/// It was not dispatched until 2026-09-07, so every `pread` on this target
+/// returned `ENOSYS`. `scripts/mem_suite.py`'s `mmapsum` is what found it —
+/// its `read()` reference arm is a `pread` loop and it aborted at offset 0
+/// before comparing anything — but the probe is only the messenger. `pread` is
+/// how every archive reader, every `rustc` metadata load and every threaded
+/// reader of a shared description reaches into a file, precisely because it
+/// needs no lock around a seek-then-read pair.
+///
+/// A negative `offset` is `EINVAL` — glue's first line, and it must stay a
+/// refusal: it arrives as a `u64` from a ring-3 register, so
+/// `0xFFFF_FFFF_FFFF_FFFF` used as a `usize` index would sail past every bound
+/// check by being larger than any file.
 pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
-    // Signed on the wire. Recovered before anything indexes with it.
-    let off = offset.cast_signed();
-    if off < 0 {
-        return errno::EINVAL;
-    }
     if len == 0 {
         return 0;
     }
-    // Clamped, not refused — the same rule and the same reason as `sys_read`:
-    // an oversized count is ordinary POSIX and a short read is the contract.
-    let len = len.min(MAX_IO);
-
-    // Not seekable: a socket, a pipe, or an unbound 0/1/2 (the console).
-    // Checked ahead of the table lookup so the answer is about the *kind* of
-    // descriptor rather than about whether a file happens to sit behind it.
-    if socket_index(fd).is_some() || pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() {
+    // See the header. A `/dev` character node **is** seekable — `pread` on
+    // `/dev/zero` is ordinary — so the nodes are deliberately not in this
+    // guard; glue serves all three, and the offset changes nothing for any of
+    // them.
+    if socket_index(fd).is_some()
+        || pipe_read_id(fd).is_some()
+        || pipe_write_id(fd).is_some()
+        || console_end(fd).is_some()
+    {
         return errno::ESPIPE;
     }
-    if console_end(fd).is_some() {
-        return errno::ESPIPE;
-    }
-    // A `/dev` character node **is** seekable — `pread` on `/dev/zero` is
-    // ordinary — and the offset changes nothing for any of the four, so this
-    // is the same answer `sys_read` gives.
-    if let Some(node) = dev_node_of(fd) {
-        return dev_read(node, buf, len);
-    }
-
-    let resolved = table_with(fd, |d| {
-        let FileDescriptor::File(f) = d else {
-            return Err(errno::EBADF);
-        };
-        // **`position` is deliberately not touched.** That is the entire
-        // contract of this call.
-        Ok(f.path.clone())
-    });
-    let path = match resolved {
-        Some(Ok(v)) => v,
-        Some(Err(e)) => return e,
-        None => return errno::EBADF,
-    };
-    let mut kbuf = alloc::vec![0u8; len as usize];
-    let n = match fs::read_at(&path, off as usize, &mut kbuf) {
-        Ok(n) => n,
-        Err(e) => return fs_err_errno(e),
-    };
-    copy_to_user(buf, &kbuf[..n])
+    akuma_syscalls_glue::fs::sys_pread64(
+        fd as u32,
+        buf,
+        // Clamped for [`sys_read`]'s reason: glue's `/dev/zero` and
+        // `/dev/urandom` arms allocate whatever ring 3 asked for.
+        len.min(MAX_IO) as usize,
+        offset.cast_signed(),
+    )
 }
 
 /// Copy `dst.len()` bytes of `fd`'s cached contents starting at byte `offset`
@@ -1708,137 +1540,61 @@ pub fn is_regular_file(fd: u64) -> bool {
     .is_some_and(|p| !path_is_dir(&p))
 }
 
-/// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
-/// `usermode.rs` does not itself handle (console, pipe, socket).
+/// Is a `write(2)` on `fd` refused by the descriptor's **access mode**?
 ///
-/// Writes through the VFS at the descriptor's cursor, in [`MAX_IO`]-bounded
-/// chunks, with the disk I/O outside the table lock (C2 slice 5). `/proc`
-/// writes used to be "accepted and dropped" here, because the paths under it
-/// were a view of this kernel's own with nothing behind them; since 4b batch 2c
-/// they reach the mounted filesystem like any other path.
+/// `Some(EBADF)` when `fd` names a regular file opened `O_RDONLY`, `None`
+/// otherwise — including for every descriptor kind that is not a file, which
+/// glue answers for itself.
+///
+/// # This is a gap in the shared arm, not a divergence this target wanted
+///
+/// `akuma_syscalls_glue::fs::sys_write`'s `File` arm does not look at
+/// `KernelFile::flags` at all, so on the AArch64 kernel a descriptor obtained
+/// with `open(path, O_RDONLY)` is a **write capability**: the bytes reach the
+/// filesystem and `write(2)` reports success. `O_ACCMODE` is checked at
+/// `open(2)` for whether the *file* may be written (`may_open`) and then never
+/// again for whether this *description* may.
+///
+/// This target has always refused it (the arm this replaces opened with the
+/// test), and 4b batch 3a's fold would have imported the gap silently — which
+/// is the one thing the fold rules forbid. So the refusal is asked here, ahead
+/// of the delegation.
+///
+/// **It is not moved into glue** for the reason batch 2d gives for `openat`'s
+/// three flags: it is a behaviour change on the other kernel and the AArch64
+/// verification loop does not run on this machine. Recorded as an open issue in
+/// `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH3.md` rather than fixed blind — a
+/// program that has been writing through a read-only descriptor would start
+/// getting `EBADF`, and that program deserves a boot behind the change.
+///
+/// `O_ACCMODE == 0` is `O_RDONLY`; the word is asm-generic by the time it is
+/// stored (`sys_openat` re-encodes it), so [`open_flags`] is the right table.
+#[must_use]
+pub fn write_mode_refusal(fd: u64) -> Option<u64> {
+    table_with(fd, |d| match d {
+        FileDescriptor::File(f) => (f.flags & open_flags::O_ACCMODE == 0).then_some(errno::EBADF),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `write(fd, buf, len)` on a **file** descriptor — **glue's arm** (4b batch
+/// 3a), by the name this module's self-tests already use.
+///
+/// A forward, not a second implementation, and the same shape as
+/// [`sys_close`]: the dispatcher's `write` arm is `usermode::sys_write`, which
+/// keeps the serial console and hands everything else here. The
+/// [`write_mode_refusal`] is asked on this path too, so a kernel-side check
+/// gets the answer ring 3 gets.
+///
+/// Named `_file` because that is what its callers write to; it will serve a
+/// pipe, a socket or a `/dev` node just as well, since glue's arm dispatches on
+/// the descriptor and not on the name of this function.
 pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
-    if len == 0 {
-        return 0;
+    if let Some(e) = write_mode_refusal(fd) {
+        return e;
     }
-    // Copied in per-`MAX_IO` chunk inside the loop: `copy_in` allocates, and
-    // refusing the whole call when `len` exceeds one chunk (the old
-    // `EINVAL`) was wrong twice over — real Linux accepts any `write(2)`
-    // length (short writes are the contract), and `apk` exercises that
-    // directly: it buffers a whole downloaded APKINDEX (hundreds of KB) and
-    // writes it to its cache file in one call. The EINVAL it got back was
-    // reported as `updating and opening ...: Invalid argument` and killed
-    // every fetch, 2026-09-04.
-
-    // A `/dev` character node, before any of the file machinery: none of these
-    // has an inode to write through, and the ext2 path would answer `EIO` for
-    // all of them. `/dev/null` accepting every byte and keeping none is the
-    // whole point of it; `zero` and the entropy nodes are sinks too, which is
-    // what Linux does. `tty` is the console this target already writes to.
-    match dev_node_of(fd) {
-        Some("null" | "zero" | "random" | "urandom") => return len,
-        Some("tty") => {
-            let mut chunk = [0u8; 256];
-            let mut done = 0u64;
-            while done < len {
-                let n = ((len - done) as usize).min(chunk.len());
-                if !crate::uaccess::read_bytes(buf + done, &mut chunk[..n]) {
-                    return if done == 0 { errno::EFAULT } else { done };
-                }
-                for &byte in &chunk[..n] {
-                    serial::putb(byte);
-                }
-                done += n as u64;
-            }
-            return len;
-        }
-        _ => {}
-    }
-
-    let mut written: usize = 0;
-    while written < len as usize {
-        let chunk_len = ((len as usize) - written).min(MAX_IO as usize);
-        // Copied in before the lock: there is no reason to hold the table
-        // across a user copy.
-        let Some(incoming) = copy_in(buf + written as u64, chunk_len as u64) else {
-            return if written == 0 { errno::EFAULT } else { written as u64 };
-        };
-        // Resolve under the lock; the write itself goes through the VFS
-        // outside it (`write_at` at the cursor — the disk never belongs under
-        // the table lock), and only the cursor move comes back.
-        // The directory guard that stood here was unreachable and is gone: a
-        // write-mode open of a directory is refused at `open(2)`
-        // (`sys_openat`'s `EISDIR`), so a directory descriptor is always
-        // read-only and the `writable` test below is what turns it away.
-        let resolved = table_with(fd, |d| {
-            let FileDescriptor::File(f) = d else {
-                return Err(errno::EBADF); // not a file
-            };
-            if f.flags & open_flags::O_ACCMODE == 0 {
-                return Err(errno::EBADF); // opened read-only
-            }
-            Ok((
-                f.path.clone(),
-                f.position,
-                f.flags & open_flags::O_APPEND != 0,
-            ))
-        });
-        let (path, pos, appending) = match resolved {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => return e,
-            None => return errno::EBADF,
-        };
-        // **`O_APPEND` re-derives the cursor from the live file, per write** —
-        // outside the table lock, because it is a `metadata` and the disk does
-        // not belong under that lock (the rule the resolve above states).
-        //
-        // A starting cursor set at `open` is not enough and never was: two
-        // descriptors appending to one file each keep their own position, so
-        // the second write lands on top of the first. This is the semantics
-        // `akuma-syscalls-glue`'s `sys_write` already has — it derives the
-        // append position from `file_size` per call — and aligning here was the
-        // prerequisite for folding `openat` (4b batch 2a), whose glue arm seeds
-        // **no** starting position at all. Folded without this, every `>>`
-        // would start at 0 and clobber the file it was meant to extend; the
-        // fold has landed, so this is now the only thing placing an append.
-        let pos = if appending {
-            akuma_vfs_glue::metadata(&path).map_or(pos, |m| m.size as usize)
-        } else {
-            pos
-        };
-        // **`/proc` writes reach the filesystem now.** They used to be
-        // "accepted and dropped" here, because the paths under `/proc` were a
-        // synthetic view with nothing behind them. They are a mount like any
-        // other since the view was deleted, and `write_at` on one is how
-        // `/proc/<pid>/fd/0` — the channel `sshd`'s bridge writes a session's
-        // keystrokes into — is served at all.
-        let step = {
-            match akuma_vfs_glue::write_at(&path, pos, &incoming) {
-                // Short/partial writes: `write_at` returns what it placed,
-                // and the cursor moves by that — the caller retries the rest,
-                // which is `write(2)`'s contract.
-                Ok(n) => {
-                    table_with(fd, |d| {
-                        if let FileDescriptor::File(f) = d {
-                            f.position = pos + n;
-                        }
-                    });
-                    Ok(n)
-                }
-                Err(e) => Err(fs_err_errno(e)),
-            }
-        };
-        match step {
-            Ok(0) => {
-                // A zero-byte placement means the write is not progressing
-                // (out of space at this cursor); report what was written so
-                // far, or `ENOSPC` if that is nothing.
-                return if written == 0 { errno::ENOSPC } else { written as u64 };
-            }
-            Ok(n) => written += n,
-            Err(e) => return if written == 0 { e } else { written as u64 },
-        }
-    }
-    len
+    akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize)
 }
 
 /// Akuma's own `poll_input_event(buf, len, timeout_us)` — a **raw** keystroke.
@@ -1955,203 +1711,89 @@ fn read_console(buf: u64, len: usize) -> u64 {
     }
 }
 
-/// `lseek(fd, offset, whence)`.
+/// `lseek(fd, offset, whence)` — **served by `akuma-syscalls-glue`** (4b batch
+/// 3a), behind one arm this kernel keeps.
+///
+/// # The one arm that stays
+///
+/// A `/dev` character node. Linux seeks one to exactly the offset asked for —
+/// `/dev/null` and `/dev/zero` are contentless and infinite, so no position is
+/// out of range and none of them means anything — and glue answers `0` for
+/// `DevNull`/`DevZero` and `ESPIPE` for `DevUrandom`/`DevTty`, which has no
+/// arm at all. Handing this over would trade a Linux answer for a matching
+/// one; fixing it in glue is a behaviour change on the AArch64 kernel, whose
+/// verification loop does not run on this machine (batch 2d records the same
+/// call for `openat`'s three flags). So it is a stated divergence, asked with
+/// one table lookup, ahead of the delegation.
+///
+/// The cursor stays at 0 for all three whences because nothing moves it: the
+/// read and write arms never touch a node's `position`.
+///
+/// # What the fold gained
+///
+/// - **`SEEK_END` by inode.** Glue asks `metadata_open_file`, so an
+///   unlinked-but-open descriptor still knows how big it is instead of being
+///   silently treated as a zero-length file.
+/// - **`rewinddir` works.** Glue clears `KernelFile::dir_cache` on a seek to
+///   0; this arm left the first snapshot in place for the life of the fd, so a
+///   directory re-read after `rewinddir` replayed the old listing forever.
+/// - **A console descriptor is `ESPIPE`, not `EBADF`.** The kind answer rather
+///   than the closed-descriptor one, which is the distinction
+///   [`sys_pread64`]'s header is about. An fd that names *nothing* is still
+///   `EBADF` — glue separates the two, where this arm's console guard could
+///   not.
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    const SEEK_SET: u64 = 0;
-    const SEEK_CUR: u64 = 1;
-    const SEEK_END: u64 = 2;
-
-    // An *unbound* 0/1/2 is the console, which has no offset. A **bound** one
-    // has been redirected and is whatever it now names — since C2 slice 6 that
-    // includes a spawned child's stdio pipes, so the guard has to ask rather
-    // than assume, exactly as `sys_read` and `sys_write` do.
-    if console_end(fd).is_some() {
-        return errno::EBADF;
-    }
-    let Some(desc) = table_get(fd) else {
-        return errno::EBADF;
-    };
-    // A pipe or a socket is not seekable, and Linux says so with `ESPIPE`. It
-    // used to be `EBADF` here by accident of the bound-0/1/2 guard above, which
-    // tells a caller its descriptor is closed when it is open and perfectly
-    // writable — the same wrong-errno failure `sys_pread64`'s header describes,
-    // and one musl's `FILE` layer reads as fatal rather than as "unseekable".
-    if pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() || socket_index(fd).is_some() {
-        return errno::ESPIPE;
-    }
-    // A `/dev` character node **is** seekable on Linux and every seek lands at
-    // the offset asked for — `/dev/null` and `/dev/zero` are infinite and
-    // contentless, so no position is out of range and none of them means
-    // anything. Answered as a zero-length file (`SEEK_END` → 0) rather than
-    // sent through `metadata`, which has no size to give for a node with no
-    // inode and would fail the seek with `EIO`.
-    //
-    // The cursor stays at 0 for all three whences because nothing moves it:
-    // the read and write arms above never touch `file.position` for a node.
+    // See the header. Ahead of the delegation, and unconditional: it is a
+    // table lookup with no I/O behind it.
     if dev_node_of(fd).is_some() {
+        const SEEK_SET: u64 = 0;
+        const SEEK_CUR: u64 = 1;
+        const SEEK_END: u64 = 2;
         if !matches!(whence, SEEK_SET | SEEK_CUR | SEEK_END) {
             return errno::EINVAL;
         }
         let delta = offset.cast_signed();
         return if delta < 0 { errno::EINVAL } else { delta as u64 };
     }
-    let FileDescriptor::File(f) = &desc else {
-        return errno::EBADF;
-    };
-    let (path, position) = (f.path.clone(), f.position);
-    // `SEEK_END` needs the size, and one `metadata` answers it — for `/proc`
-    // too, which renders its own sizes now. Outside the lock, per the rule
-    // about disk I/O under the table lock. A directory descriptor takes this
-    // branch rather than being excluded: Linux permits `lseek` on one, and the
-    // old exclusion left `total` at 0, so `SEEK_END` on a directory silently
-    // meant `SEEK_SET(0)`.
-    let total = {
-        match fs::metadata(&path) {
-            Ok(m) => m.size as usize,
-            Err(e) => return fs_err_errno(e),
-        }
-    };
-    // `offset` is signed on the wire; a negative seek from SEEK_CUR/SEEK_END is
-    // legal and must not be read as an enormous unsigned value.
-    let delta = offset.cast_signed();
-    let base = match whence {
-        SEEK_SET => 0i64,
-        SEEK_CUR => i64::try_from(position).unwrap_or(i64::MAX),
-        SEEK_END => i64::try_from(total).unwrap_or(i64::MAX),
-        _ => return errno::EINVAL,
-    };
-    let Some(target) = base.checked_add(delta) else {
-        return errno::EINVAL;
-    };
-    if target < 0 {
-        return errno::EINVAL;
-    }
-    // Seeking past the end is legal; reading there returns 0. The table's
-    // cursor is the only cursor — the mirror-sync block the flip deleted wrote
-    // the same number into a second structure.
-    table_with(fd, |d| {
-        if let FileDescriptor::File(f) = d {
-            f.position = target as usize;
-        }
-    });
-    target as u64
+    akuma_syscalls_glue::fs::sys_lseek(
+        // Truncating rather than refusing a number past `u32`: glue's own
+        // dispatch spells `args[0] as u32`, so a folded arm must decode the
+        // register the same way the AArch64 kernel does or the two disagree
+        // about which fd `lseek(0x1_0000_0003, …)` names. It resolves to
+        // nothing in either case — `EBADF`.
+        fd as u32,
+        // Signed on the wire. A negative seek from `SEEK_CUR`/`SEEK_END` is
+        // legal and must not read as an enormous unsigned offset.
+        offset.cast_signed(),
+        whence as i32,
+    )
 }
 
-/// `getdents64(fd, dirp, count)` — x86_64 217. `ls` and `find` both need this;
-/// until now `openat` on a directory returned `ENOENT` (`read_file` fails it as
-/// `NotAFile`) and this syscall did not exist at all.
+/// `getdents64(fd, dirp, count)` — **`akuma-syscalls-glue`'s arm** (4b batch
+/// 3a), by the name this module's self-tests already use.
 ///
-/// Reuses `KernelFile::dir_cache` — the same field and the same reason the
-/// AArch64 kernel has one: a directory that changes between two calls must not
-/// shift the caller's cursor mid-walk, so the listing is snapshotted on first
-/// use and `position` (otherwise a byte offset into cached file contents, see
-/// [`sys_read`]) is reused as an entry index for a directory descriptor.
+/// A forward, not a second implementation: the dispatcher hands the syscall
+/// straight to glue (`usermode.rs`), exactly as it does `close`. This kernel
+/// keeps **no** preamble for it — the record layout was already shared
+/// (`akuma_syscalls_linux::dirent`) and the snapshot field was already
+/// `KernelFile::dir_cache`, so the two arms differed only in what they got
+/// wrong.
 ///
-/// The wire record — offsets, the 8-byte `d_reclen` rounding, the NUL and the
-/// pad — is `akuma_syscalls_linux::dirent`, not hand-rolled: that module's own
-/// header explains why `size_of::<Header>()` is the wrong offset to reach for.
-/// `d_ino`/`d_off` are both 1, matching the AArch64 kernel — this target
-/// reports no real inode number through `getdents64` either, and nothing seeks
-/// a directory by `d_off`.
+/// # What the fold gained
 ///
-/// Separate table holds rather than one held across the call: the cache-miss
-/// path calls `fs::list_dir`, which takes the *other* lock (`fs::ROOT`), and
-/// nothing else in this module nests the two — see [`sys_openat`], which
-/// reads the file before ever touching the table.
+/// - **A `/dev` node lists as a device.** `DirEntry` carries only
+///   `is_dir`/`is_symlink`, so this arm reported every character node as
+///   `DT_REG`; glue asks `dev_node_named` for the real `d_type` (one string
+///   compare for every *other* directory, hoisted out of the per-entry map).
+/// - **The user buffer is validated up front** rather than only at the copy,
+///   so a partly-unmapped `dirp` is `EFAULT` before a directory is read off
+///   the disk.
+///
+/// The 64 KiB clamp this arm carried was **moved into glue rather than
+/// dropped**: `count` is a ring-3 number and it is that function's kernel
+/// allocation. Folding must not lose a bound.
 pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
-    if count == 0 {
-        return 0;
-    }
-
-    let resolved = table_with(fd, |d| {
-        let FileDescriptor::File(f) = d else {
-            return None;
-        };
-        Some((f.path.clone(), f.dir_cache.clone()))
-    })
-    .flatten();
-    let Some((path, cached)) = resolved else {
-        return errno::EBADF;
-    };
-
-    let entries = if let Some(c) = cached {
-        c
-    } else {
-        // `ENOTDIR` for a non-directory comes from here now, not from a bool
-        // on the entry: `list_dir` answers `NotADirectory` and
-        // [`fs_err_errno`] maps it. The blanket `ENOENT` this replaces was
-        // wrong for that case in the way that misdirects — "no such
-        // directory" for a path that plainly exists.
-        let dir_entries = match fs::list_dir(&path) {
-            Ok(e) => e,
-            Err(e) => return fs_err_errno(e),
-        };
-        let cache: Vec<akuma_exec_core::process::DirCacheEntry> = dir_entries
-            .iter()
-            .map(|e| akuma_exec_core::process::DirCacheEntry {
-                name: e.name.clone(),
-                d_type: if e.is_dir {
-                    4 // DT_DIR
-                } else if e.is_symlink {
-                    10 // DT_LNK
-                } else {
-                    8 // DT_REG
-                },
-            })
-            .collect();
-        table_with(fd, |d| {
-            if let FileDescriptor::File(f) = d {
-                f.dir_cache = Some(cache.clone());
-            }
-        });
-        cache
-    };
-
-    let position = table_with(fd, |d| match d {
-        FileDescriptor::File(f) => f.position,
-        _ => 0,
-    })
-    .unwrap_or(0);
-    if position >= entries.len() {
-        return 0;
-    }
-
-    let count = (count as usize).min(MAX_IO as usize);
-    let mut kernel_buf = alloc::vec![0u8; count];
-    let mut written = 0usize;
-    let mut consumed = 0usize;
-    for e in entries.iter().skip(position) {
-        let reclen = akuma_syscalls_linux::dirent::reclen(e.name.len());
-        if written + reclen > count {
-            break;
-        }
-        let ok = akuma_syscalls_linux::dirent::encode(
-            &mut kernel_buf[written..written + reclen],
-            1,
-            1,
-            e.d_type,
-            e.name.as_bytes(),
-        );
-        debug_assert!(ok, "dirent::reclen and dirent::encode disagree on the record size");
-        if !ok {
-            break;
-        }
-        written += reclen;
-        consumed += 1;
-    }
-    table_with(fd, |d| {
-        if let FileDescriptor::File(f) = d {
-            f.position += consumed;
-        }
-    });
-
-    if written > 0 {
-        let r = copy_to_user(dirp, &kernel_buf[..written]);
-        if errno::is_err(r) {
-            return r;
-        }
-    }
-    written as u64
+    akuma_syscalls_glue::fs::sys_getdents64(fd as u32, dirp, count as usize)
 }
 
 /// The x86_64 `struct stat` — 144 bytes. **Not** the aarch64 layout: x86_64
@@ -3196,10 +2838,20 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         sys_fstat(out_fd, st.as_mut_ptr() as u64), 0);
     t.check("fd: and reports a character device",
         u32::from_le_bytes([st[24], st[25], st[26], st[27]]) & 0xF000 == 0x2000);
-    // Not seekable, and `EBADF` is the answer this target has always given a
-    // console `lseek` — stated so the fold cannot quietly change it.
-    t.check_eq("fd: lseek on a console descriptor is EBADF",
-        sys_lseek(out_fd, 0, 0), errno::EBADF);
+    // Not seekable — and **`ESPIPE`, not `EBADF`, since 4b batch 3a**. That is
+    // the change the fold made and it is Linux's answer: `ESPIPE` says "this
+    // *kind* of thing has no offset", where `EBADF` says "you are holding a
+    // closed descriptor" and sends a caller looking at its own bookkeeping.
+    // musl's `FILE` layer reads the two differently (see [`sys_pread64`]'s
+    // header), and this arm could not tell them apart at all — its console
+    // guard fired before it ever looked in the table.
+    t.check_eq("fd: lseek on a console descriptor is ESPIPE",
+        sys_lseek(out_fd, 0, 0), errno::ESPIPE);
+    // The other half of that distinction, and the reason the check above is
+    // not simply relaxed: a descriptor that names **nothing** is still
+    // `EBADF`. `MAX_FDS - 1` is a number this suite never installs.
+    t.check_eq("fd: lseek on an unbound descriptor is EBADF",
+        sys_lseek(MAX_FDS as u64 - 1, 0, 0), errno::EBADF);
     // Reading the write end is `EBADF`; the read end blocks on the UART, so it
     // is deliberately not called here.
     t.check_eq("fd: read of the console's write end is EBADF",
@@ -3634,6 +3286,89 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             errno::ENOTDIR,
         );
         t.check_eq("fd: closing it", sys_close(rfd), 0);
+    }
+
+    // ── what the `getdents64` fold gained (4b batch 3a) ──────────────────
+    //
+    // Both of these are red against the arm this file used to carry, which is
+    // the only reason they are here — the ENOTDIR check above passes either
+    // way.
+    //
+    // **A `/dev` node lists as a device.** `DirEntry` carries only
+    // `is_dir`/`is_symlink`, so every character node under `/dev` came back
+    // `DT_REG` (8). Glue asks `dev_node_named` for the real type, which for
+    // `null` is `DT_CHR` (2). `ls -l /dev` reads `d_type` to decide whether to
+    // `stat` at all.
+    let dev = b"/dev\0";
+    let devfd = sys_openat(0, dev.as_ptr() as u64, 0, 0);
+    if t.check("fd: /dev opens as a directory", devfd >= FIRST_FILE_FD as u64) {
+        let mut d = alloc::vec![0u8; 4096];
+        let n = sys_getdents64(devfd, d.as_mut_ptr() as u64, 4096);
+        let mut null_type = 0u8;
+        let mut off = 0usize;
+        while !errno::is_err(n) && off + 19 < n as usize {
+            let reclen = u16::from_le_bytes([d[off + 16], d[off + 17]]) as usize;
+            if reclen == 0 || off + reclen > n as usize {
+                break;
+            }
+            let name_end = d[off + 19..off + reclen]
+                .iter()
+                .position(|b| *b == 0)
+                .map_or(off + reclen, |i| off + 19 + i);
+            if &d[off + 19..name_end] == b"null" {
+                null_type = d[off + 18];
+            }
+            off += reclen;
+        }
+        t.check_eq("fd: getdents64 reports /dev/null as DT_CHR", u64::from(null_type), 2);
+        t.check_eq("fd: closing /dev", sys_close(devfd), 0);
+    }
+
+    // **`rewinddir` re-reads the directory.** `lseek(dirfd, 0, SEEK_SET)`
+    // clears `KernelFile::dir_cache` in glue; this file's arm reset the entry
+    // index and left the first snapshot in place for the life of the
+    // descriptor, so a walk after a rewind replayed a listing that could no
+    // longer be true. Proven by *changing* the directory in between, which is
+    // the only way to tell a cleared cache from a rewound index.
+    let probe = b"/rewind-probe.txt\0";
+    let rdir = b"/\0";
+    let walk = |fd: u64| -> bool {
+        let mut d = alloc::vec![0u8; 8192];
+        let mut seen = false;
+        loop {
+            let n = sys_getdents64(fd, d.as_mut_ptr() as u64, 8192);
+            if errno::is_err(n) || n == 0 {
+                return seen;
+            }
+            let mut off = 0usize;
+            while off + 19 < n as usize {
+                let reclen = u16::from_le_bytes([d[off + 16], d[off + 17]]) as usize;
+                if reclen == 0 || off + reclen > n as usize {
+                    break;
+                }
+                let name_end = d[off + 19..off + reclen]
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map_or(off + reclen, |i| off + 19 + i);
+                if &d[off + 19..name_end] == b"rewind-probe.txt" {
+                    seen = true;
+                }
+                off += reclen;
+            }
+        }
+    };
+    let root = sys_openat(0, rdir.as_ptr() as u64, 0, 0);
+    if t.check("fd: / opens as a directory", root >= FIRST_FILE_FD as u64) {
+        t.check("fd: the rewind probe is not there yet", !walk(root));
+        const O_WRONLY_C: u64 = 0o1 | 0o100;
+        let made = sys_openat(0, probe.as_ptr() as u64, O_WRONLY_C, 0o644);
+        if t.check("fd: creating a file in the walked directory", !errno::is_err(made)) {
+            sys_close(made);
+        }
+        t.check_eq("fd: rewinddir seeks to 0", sys_lseek(root, 0, 0), 0);
+        t.check("fd: and the second walk sees the new entry", walk(root));
+        t.check_eq("fd: closing /", sys_close(root), 0);
+        fs::remove_file("/rewind-probe.txt").ok();
     }
 
     // A missing file, and a path that is not a path.

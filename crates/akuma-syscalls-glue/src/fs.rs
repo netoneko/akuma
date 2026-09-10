@@ -253,6 +253,27 @@ pub fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64> {
 pub use super::{IoVec, Stat, Statx, StatxTimestamp, makedev};
 
 
+/// Fill `buf` from the machine's entropy source, for the `/dev/urandom` and
+/// `/dev/random` read arms.
+///
+/// **The same seam `sys_getrandom` has, and for the same reason.** Naming
+/// `akuma_virtio::rng` outright makes this `EIO` on every machine with no
+/// virtio-rng device — which is every amd64 rig, whose entropy is `RDRAND`
+/// (`akuma_primitives::rng`, registered from that kernel's boot). Reading
+/// `/dev/urandom` is how a great deal of userspace seeds itself, so an `EIO`
+/// there is not a missing feature, it is a program that exits.
+///
+/// `None` from the hook is "no source registered, use the device"; `Some(false)`
+/// is "the registered source failed" and must **not** fall through to a device
+/// that is not there — see `akuma_primitives::rng::fill_bytes`. Handing the
+/// caller its zeroed buffer instead would be an entropy source that is not one.
+fn dev_urandom_fill(buf: &mut [u8]) -> bool {
+    match akuma_primitives::rng::fill_bytes(buf) {
+        Some(ok) => ok,
+        None => akuma_virtio::rng::fill_bytes(buf).is_ok(),
+    }
+}
+
 pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // Per-stage fixed-cost attribution (`read-profile`; ZST otherwise). Created
     // before the first line of real work and committed only on the `File` arm —
@@ -503,7 +524,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     continue;
                 }
 
-                akuma_exec::threading::schedule_blocking(u64::MAX);
+                akuma_exec::threading::park_indefinitely();
 
                 akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
             }
@@ -641,7 +662,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
 
                     // Block until data arrives or process exits
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             }
             EBADF
@@ -716,7 +737,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_reader(pipe_id, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             }
         }
@@ -748,7 +769,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_reader(rx, tid) {
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             }
         }
@@ -768,7 +789,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
                 let tid = akuma_exec::threading::current_thread_id();
                 super::eventfd::eventfd_add_poller(efd_id, tid);
-                akuma_exec::threading::schedule_blocking(u64::MAX);
+                akuma_exec::threading::park_indefinitely();
             }
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
@@ -783,7 +804,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
             let _drv_bkl = DriverBklGuard::new();
-            if akuma_virtio::rng::fill_bytes(&mut temp).is_ok() {
+            if dev_urandom_fill(&mut temp) {
                 if copy_to_user(buf_ptr, &temp).is_err() {
                     return EFAULT;
                 }
@@ -844,7 +865,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     }
 }
 
-pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+/// `pread64(fd, buf, count, offset)`.
+///
+/// `pub` since the amd64 `pread64` preamble delegates to it (4b batch 3a),
+/// behind the two answers that kernel keeps: a `len == 0` short-circuit and
+/// `ESPIPE` — not the `_ => EBADF` below — for a pipe, socket or console
+/// descriptor.
+pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
@@ -881,7 +908,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
             let _drv_bkl = DriverBklGuard::new();
-            if akuma_virtio::rng::fill_bytes(&mut temp).is_ok() {
+            if dev_urandom_fill(&mut temp) {
                 if copy_to_user(buf_ptr, &temp).is_err() {
                     return EFAULT;
                 }
@@ -919,7 +946,14 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
     }
 }
 
-pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+/// `write(fd, buf, count)`.
+///
+/// `pub` since the amd64 `write` preamble delegates to it (4b batch 3a), behind
+/// two answers that kernel keeps: the serial console (this function's
+/// `Stdout`/`Stderr` arm writes through a `ProcessChannel`, and no process on
+/// that target has one) and the `O_ACCMODE` refusal the `File` arm below does
+/// **not** make.
+pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     // Scoped for the same reason as `sys_read`'s: the Stdout/pipe/unix arms below park in
     // `schedule_blocking(u64::MAX)` inside the per-chunk loop, and a `&'static Process`
@@ -1036,7 +1070,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             }
                             let tid = akuma_exec::threading::current_thread_id();
                             if !ch.check_set_writer(tid) {
-                                akuma_exec::threading::schedule_blocking(u64::MAX);
+                                akuma_exec::threading::park_indefinitely();
                             }
                         }
                     }
@@ -1186,7 +1220,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             }
                             let tid = akuma_exec::threading::current_thread_id();
                             if !super::pipe::pipe_check_set_writer(pipe_id, tid) {
-                                akuma_exec::threading::schedule_blocking(u64::MAX);
+                                akuma_exec::threading::park_indefinitely();
                             }
                             // After waking, retry pipe_write
                         }
@@ -1214,7 +1248,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             }
                             let tid = akuma_exec::threading::current_thread_id();
                             if !super::pipe::pipe_check_set_writer(tx, tid) {
-                                akuma_exec::threading::schedule_blocking(u64::MAX);
+                                akuma_exec::threading::park_indefinitely();
                             }
                         }
                         Ok(n) => break n as u64,
@@ -2106,7 +2140,13 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
     0
 }
 
-pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
+/// `lseek(fd, offset, whence)`.
+///
+/// `pub` since the amd64 `lseek` preamble delegates to it (4b batch 3a): that
+/// kernel keeps one arm of its own — a `/dev` character node, which Linux seeks
+/// to the offset asked for and this function answers `0`/`ESPIPE` for — and
+/// hands everything else here.
+pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero)) {
             return 0;
@@ -2999,8 +3039,22 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
     }
 }
 
-pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
+/// `getdents64(fd, dirp, count)`.
+///
+/// `pub` since the amd64 kernel forwards to it (4b batch 3a) — the dispatcher
+/// there hands the syscall to [`crate::handle_syscall`], and the forward exists
+/// for that kernel's own self-tests, which call it by name.
+pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(ptr, size) { return EFAULT; }
+    // Clamped rather than trusted, and the clamp is *below* the validation so
+    // a caller with a partly-unmapped buffer still gets `EFAULT` for the range
+    // it named. `size` is a ring-3 number and it is this function's kernel
+    // allocation: 64 KiB is the same bound the `read`/`write`/`pread` arms in
+    // this file already impose, and it costs a caller nothing, because filling
+    // fewer records than the buffer holds is `getdents64(2)`'s contract — every
+    // caller loops until it gets 0. The amd64 arm carried this clamp before it
+    // folded here (4b batch 3a) and folding must not lose a bound.
+    let size = size.min(64 * 1024);
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     let f = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => f,

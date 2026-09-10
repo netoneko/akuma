@@ -1092,11 +1092,20 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // every descriptor-freeing arm in glue resolves
         // `current_process_shared()` first.
         Syscall::Close => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        // `lseek(fd, offset, whence)` — **glue's arm behind one preamble**
+        // (4b batch 3a): a `/dev` character node, which Linux seeks to the
+        // offset asked for and glue answers `0`/`ESPIPE` for. Not routed
+        // through `to_glue` for that reason — see `fd::sys_lseek`.
         Syscall::Lseek => crate::fd::sys_lseek(a1, a2, a3),
         Syscall::Fstat => crate::fd::sys_fstat(a1, a2),
         Syscall::Ioctl => crate::fd::sys_ioctl(a1, a2, a3),
         // `getdents64(fd, dirp, count)` — x86_64 217. `ls`/`find`.
-        Syscall::Getdents64 => crate::fd::sys_getdents64(a1, a2, a3),
+        // **Served by glue** (4b batch 3a) with no preamble at all: the record
+        // layout was already `akuma_syscalls_linux::dirent` and the snapshot
+        // was already `KernelFile::dir_cache`, so the two arms differed only
+        // in what this one got wrong (`/dev` nodes listed as `DT_REG`, no
+        // up-front validation of `dirp`).
+        Syscall::Getdents64 => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `a5` is mmap's fd and is deliberately unused: only anonymous mappings
         // are supported, so a file-backed request must fail rather than quietly
         // return zeroed memory that the caller believes holds a file.
@@ -1820,57 +1829,61 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     }
 }
 
-/// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
+/// `write(fd, buf, len)` — the serial console, and **`akuma-syscalls-glue`'s
+/// arm** for everything else (4b batch 3a).
 ///
-/// Kept here rather than moved into `fd` with its siblings because of the
-/// `WRITE_SEQ` bookkeeping below: the multitasking and preemption tests prove
-/// interleaving by recording *which task* performed each write, and that
-/// instrumentation belongs next to the tests that read it.
+/// # The console is why this function still exists
 ///
-/// `buf` is read through `crate::uaccess`, which range-checks it and brackets
-/// the copy in `stac`/`clac` — `CR4.SMAP` is on since 2026-09-05, so a raw read
-/// here would fault, and did (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
+/// Two reasons, and only the first is about the console.
+///
+/// Glue's `Stdout`/`Stderr`/`DevTty` arm writes through
+/// `akuma_exec::process::current_channel()` — a `ProcessChannel`, which is the
+/// SSH/PTY plumbing — and **silently writes nothing** when there is none. No
+/// process on this target has one: a spawned child's output is a pipe
+/// (`fd::bind_stdio`), and init on the serial line has no channel at all. So
+/// delegating fd 1 would make `INIT=/bin/hello` print nothing while reporting
+/// every byte written, which is exactly the failure `fd::console_end`'s own
+/// header describes from the other direction.
+///
+/// And the `WRITE_SEQ`/`WRITE_CPU` bookkeeping below: the multitasking and
+/// preemption tests prove interleaving by recording *which task and which core*
+/// performed each write, and that instrumentation belongs next to the tests
+/// that read it.
+///
+/// # The order is the fix, not a tidy-up
+///
+/// A console descriptor is asked about **first**. A registered process's table
+/// has `Stdout`/`Stderr` at 1/2 (`SharedFdTable::with_stdio`), so any
+/// "is it bound?" test is *true* for init — the pre-batch-2a version of this
+/// function fell through to the file path on exactly that and answered `EBADF`.
+/// See [`crate::fd::console_end`] for the two spellings (a bound descriptor,
+/// and an unbound 0/1/2) and why both have to be asked.
+///
+/// # What the fold gained
+///
+/// - **Concurrent writers cannot corrupt each other.** Glue reserves the file
+///   position with `reserve_write_pos` — read-and-advance in one lock hold —
+///   before any I/O. Two `CLONE_FILES` siblings writing one descriptor each
+///   read a stale cursor here and wrote over each other on disk.
+/// - **A socket write re-arms the `EPOLLET` edge** on a short write, which this
+///   kernel's `sock::send` path never did.
+/// - **A pipe write blocks with the scheduler's backstop.** Glue parks through
+///   `akuma_threading::park_indefinitely`, which this target now gives a 1 s
+///   deadline (`sched::BACKSTOP_US`) — the prerequisite that had to land before
+///   any blocking arm could fold at all.
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
-    const EBADF: u64 = (-9i64) as u64;
     const EFAULT: u64 = (-14i64) as u64;
 
-    // A socket descriptor routes to the network stack, so a program written
-    // against `write(2)` works on a connection without knowing it has one.
-    if let Some(sock) = crate::fd::socket_index(fd) {
-        return crate::sock::send(sock, buf, len, crate::fd::is_nonblocking(fd));
-    }
-    // An explicit pipe write end (a parent feeding a child's stdin).
-    if let Some(p) = crate::fd::pipe_write_id(fd) {
-        return crate::fd::write_pipe(p, buf, len as usize, crate::fd::is_nonblocking(fd));
-    }
-    // A real file descriptor, opened `O_WRONLY`/`O_RDWR` — tcc's `-o` output,
-    // the first real writer on this target (2026-09-04). Not a socket or pipe
-    // (both already routed above), so this is the last fd class before the two
-    // console descriptors.
-    //
-    // `is_bound` is what makes `prog > file` work: `sh` does `dup2(f, 1)`, so
-    // fd **1** now names a file and must be written to it rather than to the
-    // serial port. An unbound 1 or 2 is still the console, below.
-    // **A console descriptor wins over both tests below**, and that ordering is
-    // the fix rather than a tidy-up: a registered process's table has
-    // `Stdout`/`Stderr` at 1/2 (`SharedFdTable::with_stdio`), so `is_bound(1)`
-    // is *true* for init and the write went to the file path, which has no arm
-    // for those variants and answered `EBADF`. `INIT=/bin/hello` printed
-    // nothing at all. See `fd::console_end` for the two spellings and why both
-    // have to be asked.
+    // See the header: first, and by both spellings.
     if crate::fd::console_end(fd) != Some(crate::fd::ConsoleEnd::Write) {
-        if fd >= crate::fd::FIRST_FILE_FD as u64 || crate::fd::is_bound(fd) {
-            return crate::fd::sys_write_file(fd, buf, len);
+        // The `O_ACCMODE` refusal glue's `File` arm does not make — see
+        // `fd::write_mode_refusal`, which is where the finding is written down.
+        if let Some(e) = crate::fd::write_mode_refusal(fd) {
+            return e;
         }
-        // An unbound fd 0 (the keyboard side) or any other unbound number.
-        return EBADF;
+        return akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize);
     }
-    // An unbound 1 or 2 is the console, full stop. It used to ask
-    // `current_stdout_pipe()` first — the `Spawn` row — because a spawned
-    // child's stdout was a pipe reached *by number*; since C2 slice 6 both are
-    // `PipeWrite` descriptors and `pipe_write_id` above has already routed
-    // them. Only a task with no stdout descriptor reaches here: init on the
-    // serial line, and the boot suite's kernel row.
+    // An unbound 1 or 2, or a bound `Stdout`/`Stderr`: the console, full stop.
     if len > MAX_WRITE {
         return EFAULT;
     }

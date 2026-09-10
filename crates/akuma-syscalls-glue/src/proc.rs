@@ -623,7 +623,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                     // the child hasn't called execve/exit yet.  Re-block until
                     // vfork_complete() removes the VFORK_WAITERS entry.
                     loop {
-                        akuma_exec::threading::schedule_blocking(u64::MAX);
+                        akuma_exec::threading::park_indefinitely();
                         let still_pending = akuma_primitives::irq::with_irqs_disabled(|| {
                             VFORK_WAITERS.lock().contains_key(&new_pid)
                         });
@@ -1068,7 +1068,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
                 }
-                akuma_exec::threading::schedule_blocking(u64::MAX);
+                akuma_exec::threading::park_indefinitely();
             }
         }
     } else if pid == -1 || pid == 0 {
@@ -1138,7 +1138,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             if akuma_exec::process::should_interrupt_blocking_syscall() {
                 return EINTR;
             }
-            akuma_exec::threading::schedule_blocking(u64::MAX);
+            akuma_exec::threading::park_indefinitely();
         }
     }
 
@@ -1195,7 +1195,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     // Before blocking: on wake the loop re-tests has_exited()
                     // first, so a reapable child outranks EINTR.
                     if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             } else {
                 return ECHILD;
@@ -1217,7 +1217,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                 // Before blocking: on wake the loop re-tests find_exited_child()
                 // first, so a reapable child outranks EINTR.
                 if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
-                akuma_exec::threading::schedule_blocking(u64::MAX);
+                akuma_exec::threading::park_indefinitely();
             }
         }
         #[cfg(feature = "sc-pidfd")]
@@ -1254,7 +1254,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     // Before blocking: on wake the loop re-tests has_exited()
                     // first, so a reapable child outranks EINTR.
                     if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    akuma_exec::threading::park_indefinitely();
                 }
             } else {
                 return ECHILD;

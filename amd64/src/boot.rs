@@ -168,6 +168,25 @@ pub fn install_shared_sinks() {
     //   deadlock argument lives beside `set_shootdown_hooks` in `akuma-mmu`).
     akuma_mmu::set_shootdown_hooks(crate::shootdown::broadcast, crate::shootdown::wait_for_acks);
     akuma_bkl::sync::set_spin_assist(crate::shootdown::bkl_spin_assist);
+    // The untimed-park backstop (4b batch 3a). Every "wait until something
+    // happens" arm in the tree parks through
+    // `akuma_threading::park_indefinitely`, which is `schedule_blocking(u64::MAX)`
+    // until a target says otherwise. This target says otherwise, for the reason
+    // `sched::BACKSTOP_US` gives: it reaches its scheduler only by being
+    // called, so a missing wake path is an unrecoverable hang here where on
+    // AArch64 it is a slow one. Registered here, not in `sched::init`, and for
+    // this function's founding reason — a park is reachable from the boot suite
+    // on **both** protocols, and the version of this that only PVH set would be
+    // green on every rig this laptop can run.
+    crate::sched::install_untimed_park_backstop();
+    // Demand paging **for the kernel's own reach into user memory** (4b batch
+    // 3a). Every `akuma-syscalls-glue` arm validates a user buffer before
+    // touching it, and the validation is fail-closed without this: a lazily
+    // mapped page — which is what a fresh `mmap` hands ring 3 — reads as
+    // `EFAULT`. This kernel's own copy path never needed it (it faults and
+    // recovers), which is why the gap survived B1 and was only exposed by
+    // folding `read(2)`. See `mm::prefault_user_range`.
+    akuma_user_access::set_prefault_hook(crate::mm::prefault_user_range);
 }
 
 /// What the shared suite needs to know about the machine it is running on.
@@ -419,6 +438,20 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::smp_parallel_test(t);
 
     lapic::start_timer();
+    // **A descriptor identity for every test below that reads a child's
+    // stdout.** The fourth time this has been the prerequisite nobody listed
+    // (`fd::boot_row_register`, and batch 2b/2d found the first three): every
+    // `akuma-syscalls-glue` arm resolves `current_process_shared()` first, and
+    // this suite runs on the boot task, which is registered nowhere. `read`
+    // and `write` are glue's arms since 4b batch 3a, and a spawned child's
+    // stdout is a pipe *descriptor* — so `spawn`, `busybox`, `execve`, `fork`
+    // and `redirect` all went `EBADF` at once when the arms moved.
+    //
+    // Bracketing the whole block rather than each test, and **outside** their
+    // `free_count()` windows on purpose: `make_test_process` builds an address
+    // space, so a register/release inside one of those windows would read as
+    // the leak the check is looking for.
+    let usermode_boot_tid = fd::boot_row_register();
     usermode::elf_test(t);
     usermode::thread_test(t);
     usermode::fdprobe_test(t);
@@ -442,6 +475,9 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     }
 
     usermode::redirect_test(t);
+    // Hand pid 1 back before `run_init` claims it for the real init process.
+    let drained = fd::boot_row_release(usermode_boot_tid);
+    t.check("usermode: the borrowed identity was reclaimed", drained >= 1);
     lapic::stop_timer();
 
     // Deliberately here and not beside `mm::smoke_test`: this is the one check

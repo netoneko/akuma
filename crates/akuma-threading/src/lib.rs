@@ -4969,6 +4969,133 @@ fn resume_running_unless_terminated(tid: usize) {
     );
 }
 
+/// A backstop deadline, in microseconds, for a park that has none of its own —
+/// `0` for "none", which is every AArch64 build.
+///
+/// See [`set_untimed_park_backstop_us`].
+static UNTIMED_PARK_BACKSTOP_US: AtomicU64 = AtomicU64::new(0);
+
+/// Untimed parks that were released by the backstop rather than by a wake.
+///
+/// A number that climbs on a workload that should be event-driven names a
+/// missing wake path — which is the whole reason the backstop exists.
+static UNTIMED_PARK_BACKSTOP_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// Give every untimed park ([`park_indefinitely`]) a deadline `us`
+/// microseconds out, instead of `u64::MAX`.
+///
+/// **This is a tripwire, not a design.** A correct wait has a wake path: the
+/// pipe that gains a byte, the futex that is signalled, the child that exits.
+/// If that path is missing, an untimed park is an unrecoverable hang with no
+/// output — the failure mode that costs the most to diagnose and says the
+/// least. With a backstop the same bug degrades to a poll at `1/us` Hz: the
+/// machine stays usable and [`untimed_park_backstop_wakes`] says how often it
+/// happened.
+///
+/// **Registered per target, and only one registers it.** AArch64 parks untimed
+/// all the time and has an interrupt-driven scheduler to recover; amd64 reaches
+/// its scheduler only by being called, so a lost wake is terminal there in a
+/// way it is not here. That is why this is a knob and not a constant, and why
+/// the default — `0`, meaning `u64::MAX`, meaning exactly the behaviour every
+/// call site had before this existed — is the one AArch64 keeps.
+///
+/// It moved here from `amd64/src/sched.rs`'s `block_current`, which could only
+/// cover the four parks that kernel wrote itself. Every blocking arm in
+/// `akuma-syscalls-glue` parks through [`park_indefinitely`] now, so a target
+/// that sets this gets the tripwire on all 28 of them — which is what let the
+/// `read`/`write` arms fold (`docs/archive/AKUMA_AMD64_4B_FOLD_BATCH3.md`).
+pub fn set_untimed_park_backstop_us(us: u64) {
+    UNTIMED_PARK_BACKSTOP_US.store(us, Ordering::Relaxed);
+}
+
+/// How many untimed parks the backstop released. `0` is the healthy value.
+#[must_use]
+pub fn untimed_park_backstop_wakes() -> u64 {
+    UNTIMED_PARK_BACKSTOP_WAKES.load(Ordering::Relaxed)
+}
+
+/// Park the running thread with **no deadline of its own** — until a waker
+/// names it, or until the backstop [`set_untimed_park_backstop_us`] installed
+/// (if any) expires.
+///
+/// The spelling every "wait until something happens" arm uses, in place of a
+/// bare `schedule_blocking(u64::MAX)`. Unregistered it *is* that call, so a
+/// target that installs no backstop is unchanged.
+pub fn park_indefinitely() {
+    let backstop = UNTIMED_PARK_BACKSTOP_US.load(Ordering::Relaxed);
+    if backstop == 0 {
+        // The `runtime()` read is skipped, not just the arithmetic: an
+        // unregistered backstop must cost the AArch64 kernel nothing beyond
+        // the atomic load.
+        schedule_blocking(u64::MAX);
+        return;
+    }
+    let deadline = untimed_park_deadline(backstop, (runtime().uptime_us)());
+    schedule_blocking(deadline);
+    // Whether the backstop is what released us is only knowable here: the park
+    // reports "runnable again" and not why. A caller that re-parks immediately
+    // simply counts another.
+    if (runtime().uptime_us)() >= deadline {
+        UNTIMED_PARK_BACKSTOP_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The deadline an untimed park gets: `u64::MAX` with no backstop installed,
+/// and `now + backstop` with one.
+///
+/// Split out because it is the whole decision and the rest of
+/// [`park_indefinitely`] is effects. Two things it must get right, and both are
+/// silent when wrong: `0` means **no backstop** (not "a deadline of now", which
+/// would make every untimed park return instantly and turn every wait loop in
+/// the tree into a spin), and the addition **saturates** (a wrap would put the
+/// deadline in the past, with the same result).
+#[must_use]
+const fn untimed_park_deadline(backstop_us: u64, now_us: u64) -> u64 {
+    if backstop_us == 0 {
+        u64::MAX
+    } else {
+        now_us.saturating_add(backstop_us)
+    }
+}
+
+#[cfg(test)]
+mod untimed_park_backstop_tests {
+    use super::{UNTIMED_PARK_BACKSTOP_US, untimed_park_deadline};
+    use core::sync::atomic::Ordering;
+
+    /// The degradation contract every call site depends on: with nothing
+    /// installed, `park_indefinitely` **is** `schedule_blocking(u64::MAX)`.
+    /// That is what makes this change invisible to the AArch64 kernel.
+    #[test]
+    fn no_backstop_is_an_untimed_park() {
+        assert_eq!(untimed_park_deadline(0, 0), u64::MAX);
+        assert_eq!(untimed_park_deadline(0, 123_456), u64::MAX);
+    }
+
+    /// And nothing in this crate's tests installs one, so the default the
+    /// AArch64 kernel runs with is the one asserted above.
+    #[test]
+    fn the_default_is_no_backstop() {
+        assert_eq!(UNTIMED_PARK_BACKSTOP_US.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_backstop_is_relative_to_now() {
+        assert_eq!(untimed_park_deadline(1_000_000, 5), 1_000_005);
+        assert_eq!(untimed_park_deadline(1, 0), 1);
+    }
+
+    /// A wrap would land the deadline in the *past*, which
+    /// `schedule_blocking` answers by not parking at all — turning every wait
+    /// loop in the tree into a spin on a machine whose clock has run long
+    /// enough.
+    #[test]
+    fn the_deadline_saturates_rather_than_wrapping() {
+        assert_eq!(untimed_park_deadline(1_000_000, u64::MAX), u64::MAX);
+        assert_eq!(untimed_park_deadline(u64::MAX, u64::MAX), u64::MAX);
+    }
+}
+
 pub fn schedule_blocking(wake_time_us: u64) {
     let tid = current_thread_id();
 

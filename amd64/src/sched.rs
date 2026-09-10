@@ -457,19 +457,35 @@ pub fn all_user_tasks_finished() -> bool {
 /// instead of at scheduler frequency. The machine stays usable and
 /// [`backstop_wakes`] says how often it happened.
 ///
-/// It is spelled here rather than in the crate on purpose. AArch64 parks
+/// It is a **per-target policy** and only this target sets it. AArch64 parks
 /// untimed all the time and has an interrupt-driven scheduler to recover; this
 /// target reaches its scheduler only by being called, so a lost wake is
 /// terminal here in a way it is not there.
+///
+/// # It lives in the crate now (4b batch 3a)
+///
+/// The number is still this file's; the *mechanism* is
+/// [`akuma_threading::park_indefinitely`], registered at boot through
+/// [`install_untimed_park_backstop`]. It had to move for the `read`/`write`
+/// fold: an untimed park spelled here could only cover the four waits this
+/// kernel wrote itself, and every blocking arm in `akuma-syscalls-glue` — 22 of
+/// them, including the pipe read and write this batch folded — parked
+/// `u64::MAX`. Folding onto those arms while the backstop was local would have
+/// traded a 1 Hz degradation for a silent, unrecoverable hang, on the exact
+/// paths a shell pipeline runs through.
 const BACKSTOP_US: u64 = 1_000_000;
 
 /// Threads parked by [`block_current`]/[`block_until_deadline`].
 static BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Parked threads released by [`wake`].
 static WAKES: AtomicU64 = AtomicU64::new(0);
-/// Untimed parks released by [`BACKSTOP_US`] — see there. A number that climbs
-/// on a workload that should be event-driven names a missing wake path.
-static BACKSTOP_WAKES: AtomicU64 = AtomicU64::new(0);
+/// Install [`BACKSTOP_US`] as the deadline every untimed park in the tree gets.
+///
+/// Called from `boot::install_shared_sinks`, i.e. on **both** boot protocols —
+/// the drift that C1 step 3's first arm found the hard way.
+pub fn install_untimed_park_backstop() {
+    threading::set_untimed_park_backstop_us(BACKSTOP_US);
+}
 
 /// How many times a thread has parked.
 #[must_use]
@@ -485,9 +501,13 @@ pub fn wakes() -> u64 {
 
 /// How many untimed parks the [`BACKSTOP_US`] tripwire has released. Nonzero
 /// means a wait somewhere is not being woken; see that constant.
+///
+/// Counted by the crate since 4b batch 3a, so this number now covers every
+/// untimed park in the tree — `akuma-syscalls-glue`'s 22 included — and not
+/// just the ones spelled in this file.
 #[must_use]
 pub fn backstop_wakes() -> u64 {
-    BACKSTOP_WAKES.load(Ordering::Relaxed)
+    threading::untimed_park_backstop_wakes()
 }
 
 /// Park the running thread until [`wake`] names it.
@@ -526,16 +546,12 @@ pub fn backstop_wakes() -> u64 {
 ///   thread is the fallback the switch itself uses; parking one has nowhere to
 ///   go.
 pub fn block_current() {
-    let deadline = crate::net::uptime_us().saturating_add(BACKSTOP_US);
     BLOCKS.fetch_add(1, Ordering::Relaxed);
-    threading::schedule_blocking(deadline);
-    // Whether the backstop is what released us is only knowable here: the crate
-    // reports "runnable again" and not why. An untimed park that reached its
-    // deadline is the tripwire firing, and a caller that re-parks immediately
-    // will simply count another.
-    if crate::net::uptime_us() >= deadline {
-        BACKSTOP_WAKES.fetch_add(1, Ordering::Relaxed);
-    }
+    // The deadline arithmetic and the "was it the backstop" accounting are the
+    // crate's since 4b batch 3a — see [`BACKSTOP_US`] for why they had to be.
+    // This function keeps only [`BLOCKS`], which counts *this kernel's own*
+    // parks and is what `sched: threads parked` reports.
+    threading::park_indefinitely();
 }
 
 /// Park the running thread until [`wake`] names it or `deadline_us` passes.

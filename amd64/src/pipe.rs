@@ -202,18 +202,6 @@ pub fn check_set_reader(id: PipeId) -> bool {
     glue::pipe_check_set_reader(id as u32, crate::sched::current_task())
 }
 
-/// The writer's half of [`check_set_reader`]: `true` when there is room, or
-/// when every reader is gone and the write is about to fail with `EPIPE`.
-///
-/// That second case is why this is not simply "is there room". A pipe with no
-/// readers never gains any, so a writer that parked on it would park forever;
-/// answering `true` sends the caller back to [`write`], which reports the broken
-/// pipe. It is the same rule [`writable`] states for `poll`.
-#[must_use]
-pub fn check_set_writer(id: PipeId) -> bool {
-    glue::pipe_check_set_writer(id as u32, crate::sched::current_task())
-}
-
 /// Drop one writer. Losing the **last** one is EOF: a reader that has drained
 /// the buffer then sees end-of-file rather than polling forever.
 pub fn close_write(id: PipeId) {

@@ -532,6 +532,73 @@ pub fn fault_in(addr: u64) -> bool {
     .unwrap_or(false)
 }
 
+/// Demand-page every lazy page covering `[start, start + len)` so a **kernel**
+/// access to that user range cannot fault. `false` if any page could not be
+/// made present.
+///
+/// Registered into `akuma_user_access::set_prefault_hook` from
+/// `boot::install_shared_sinks`. Every `akuma-syscalls-glue` arm that touches a
+/// user buffer opens with `validate_user_ptr`, which is
+/// `validate_user_range(.., Prefault::Yes)`: it walks the page table, and only
+/// if the range is **not already present** does it call this. So the common
+/// path pays nothing and this runs once per genuinely-lazy buffer.
+///
+/// # Why this target had no hook, and what that cost (4b batch 3a)
+///
+/// `amd64/src/uaccess.rs`'s header said, correctly when it was written: *"There
+/// is no 'is it mapped' walk here and no prefault: this target has no lazy user
+/// regions yet, so the copy either succeeds or faults, and the fault is
+/// recovered. When lazy regions arrive, the walk goes here."* Lazy regions
+/// arrived with B1 on 2026-09-07 and nothing came back to this sentence,
+/// because nothing had to: this kernel's own `copy_to_user` still just copies,
+/// and `idt.rs` services the `#PF` inline.
+///
+/// The shared arms do not work that way — they **ask first** — and the
+/// unregistered hook is fail-closed, so the answer for a lazy page was
+/// `EFAULT`. Folding `read(2)` made that reachable from ring 3 in the most
+/// ordinary way there is: `apk` `mmap`s a buffer and `read`s a file into it,
+/// i.e. into pages that have never been touched. It reported
+/// `Unable to read database: v2 database format error` — a *file format*
+/// complaint about a file the kernel had refused to read, which is the
+/// wrong-layer symptom this whole fold keeps producing. The boot suite could
+/// not see it (it runs under `BypassValidationGuard`, which returns before the
+/// walk) and neither could `amd64_ring3_check.py`, whose workload reads into
+/// libc heap buffers that are already resident.
+///
+/// # The two rules the loop encodes
+///
+/// - **Skip a page that is already present**, exactly as the AArch64
+///   implementation does: re-populating one would leak the frame under it, and
+///   a `PROT_NONE` guard must stay a guard. [`fault_in`] refuses a reservation
+///   for the same reason, so the skip is belt and braces.
+/// - **`false` on the first page that will not come in**, rather than a partial
+///   success: the caller re-asserts `is_current_user_range_mapped` afterwards
+///   anyway, and a half-filled range must reach it as a failure and not as a
+///   copy into a hole.
+pub fn prefault_user_range(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // The last *byte*, so a range ending exactly on a page boundary does not
+    // pull in the page after it — and `checked_add` because `start + len` is
+    // ring 3's arithmetic, not this kernel's.
+    let Some(last_byte) = start.checked_add(len - 1) else {
+        return false;
+    };
+    let page_mask = !(PAGE_SIZE as usize - 1);
+    let last = last_byte & page_mask;
+    let mut page = start & page_mask;
+    loop {
+        if !akuma_mmu::is_current_user_range_mapped(page, 1) && !fault_in(page as u64) {
+            return false;
+        }
+        if page == last {
+            return true;
+        }
+        page += PAGE_SIZE as usize;
+    }
+}
+
 /// `munmap(addr, len)`.
 pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     if !addr.is_multiple_of(PAGE_SIZE) {
