@@ -99,6 +99,26 @@ The same asymmetry is the whole content of `AKUMA_AMD64_4B_FOLD_BATCH4B.md`
 time the answer has been "the console is by-number here", and §6 is the standing
 argument for stopping that.
 
+## 3a. This was only HALF of "typing does nothing"
+
+**The same feature had a second, independent bug, in userspace**, and both had
+to be fixed before an operator could actually answer a prompt:
+`prompt_yes_no` broke only on `\n` and discarded `\r`, so the TOFU host-key
+prompt ate the answer and hung — `docs/archive/AMD64_SSH_CLIENT_TOFU_PROMPT_CR.md`.
+
+They are genuinely independent. This one is the kernel refusing to return
+`EAGAIN` from a non-blocking console read; that one is userspace waiting for the
+wrong terminator on a *blocking* read. The prompt is reached at
+`protocol.rs:240` and the client only sets stdin non-blocking at ~376, **after**
+it, so this fix is not in that read's path at all. Fixing this one alone left
+the client still unusable interactively, which is worth knowing before reading
+§4 as a complete account.
+
+Note also which rigs each shows up on, because it is the same console/pipe split
+seen from two sides: **this** bug needs fd 0 to be a `FileDescriptor::Stdin`
+(the serial console), and **that** one needs fd 0 to be a pipe (an ssh session).
+A test on one rig cannot see the other.
+
 ## 4. Why it froze typing rather than just blocking
 
 `userspace/sshd/src/client/protocol.rs` sets **both** its socket and its stdin
@@ -307,6 +327,11 @@ mode, on the metal it is the pipe arm. And the rejection is a *real* OpenSSH
 reply with the server's actual method list, which only a completed
 `SSH_MSG_USERAUTH_FAILURE` can produce. Everything works except authorization,
 because neither server authorizes the guest's key — deliberately not arranged.
+
+**What these runs did not prove, and it matters.** Both piped `printf "yes\n"`.
+A real keyboard in raw mode sends `\r`, and with `\r` the prompt hung — the
+userspace bug in §3a, which these very runs walked straight past. The `\n` in a
+harness is the reason a broken interactive prompt tested green here.
 
 **The trap in reading this, and it cost two runs.** The client blocks on that
 host-key prompt, so a harness that sends nothing looks exactly like a hang: the
