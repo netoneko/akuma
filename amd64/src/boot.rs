@@ -488,6 +488,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::thread_test(t);
     usermode::fdprobe_test(t);
     usermode::spawn_test(t);
+    usermode::winsize_to_child_test(t);
     usermode::wait4_ownership_test(t);
     #[cfg(feature = "console-notify")]
     usermode::console_notify_test(t);
