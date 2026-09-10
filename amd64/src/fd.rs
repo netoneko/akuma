@@ -1082,7 +1082,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     // See the header.
     match console_end(fd) {
-        Some(ConsoleEnd::Read) => return read_console(buf, len.min(MAX_IO) as usize),
+        Some(ConsoleEnd::Read) => return read_console(fd, buf, len.min(MAX_IO) as usize),
         // The screen side is not readable, and `EBADF` is the answer this arm
         // has always given for it.
         Some(ConsoleEnd::Write) => return errno::EBADF,
@@ -1334,14 +1334,59 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
 /// Read from the console, through the line discipline.
 ///
 /// Polls the UART, feeds each byte to `process_canon_input`, writes back
-/// whatever it says to echo, and returns a line once one is ready. Blocking:
-/// this target takes no device interrupts, so there is nothing else for the CPU
-/// to do while a prompt waits — the honest cost of polling, and what an IOAPIC
-/// would fix.
+/// whatever it says to echo, and returns a line once one is ready. Blocking
+/// unless the descriptor is `O_NONBLOCK`: this target takes no device
+/// interrupts, so there is nothing else for the CPU to do while a prompt waits
+/// — the honest cost of polling, and what an IOAPIC would fix.
 ///
 /// Ctrl+D on an empty line returns 0, which is EOF. A reader that treated that
 /// as an error would never terminate.
-fn read_console(buf: u64, len: usize) -> u64 {
+///
+/// # `O_NONBLOCK`, and why only this target ever got it wrong
+///
+/// **This function is why a bound `Stdin` behaves differently here than on
+/// AArch64, and the difference is which function serves the descriptor — not
+/// which flag store it consults.**
+///
+/// `akuma_syscalls_glue::fs::sys_read`'s `Stdin`/`DevTty` arm ends its wait with
+/// `if fd_is_nonblock(fd) { return EAGAIN }`, and its comment records that the
+/// arm *itself* once lacked the check: "a caller that set it (mio, for the same
+/// reason crossterm needs `EPOLLET` semantics to work at all) got parked in
+/// `schedule_blocking(u64::MAX)` regardless, indistinguishable from a real
+/// hang." That is the canonical behaviour and it is already shared code.
+///
+/// **This target never reaches that arm for fd 0.** [`sys_read`]'s preamble asks
+/// [`console_end`] first, and a registered process's fd 0 *is* a
+/// `FileDescriptor::Stdin`, so it lands here — in a function written before that
+/// fix existed and which had no flag test at all. The preamble cannot simply be
+/// deleted: glue's arm reaches the console through a `ProcessChannel`, no
+/// process on this target has one, and its `current_channel().is_none()`
+/// fallback returns `proc.read_stdin()`'s zero, i.e. a spurious EOF on the
+/// console a shell is reading from. So the check comes here instead.
+///
+/// The store was a second suspect and is not one: since 4b batch 3c
+/// [`sys_fcntl`] is a one-line forward to glue's arm, whose `F_SETFL` writes
+/// `Process::set_nonblock` — `fds.nonblock` — which is the very set
+/// [`is_nonblocking`] reads through [`cur_table`]. One set, two readers.
+///
+/// **What this cost.** The `ssh` client sets both its socket and its stdin
+/// non-blocking and its interactive pump depends on `read(0)` returning
+/// `EAGAIN` to get back out to the socket. Parked here on the first `read(0)`,
+/// the pump never serviced the network side at all: remote echo and prompts
+/// froze and typing read as dead.
+///
+/// In canonical mode a *partial* line is not data: `drain_canon_ready` gives
+/// nothing until a terminator arrives, so a non-blocking reader gets `EAGAIN`
+/// with its half-typed line still in `canon_buffer`, which is what Linux does.
+///
+/// **`EINTR` is still missing**, deliberately. Every other read arm returns it
+/// on `should_interrupt_blocking_syscall`; adding it here would make a pending
+/// signal that this target never delivers turn a console read into a spin, so it
+/// stays a stated gap rather than a same-batch guess.
+fn read_console(fd: u64, buf: u64, len: usize) -> u64 {
+    // Read once, before the loop: the flag cannot change under us — only this
+    // thread's own `fcntl` could, and it is in here.
+    let nonblock = is_nonblocking(fd);
     loop {
         // Anything the discipline already has, first: a previous call may have
         // delivered two lines' worth of bytes in one burst.
@@ -1357,6 +1402,9 @@ fn read_console(buf: u64, len: usize) -> u64 {
         }
 
         let Some(byte) = crate::input::getb() else {
+            if nonblock {
+                return errno::EAGAIN;
+            }
             // A yield, not a spin: this task holds the Big Kernel Lock, and a
             // shell waiting for a key must not hold every other core's
             // syscalls hostage (`sched::yield_now` drops the lock briefly).
@@ -3080,4 +3128,65 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     // Hand pid 1 back before `run_init` claims it for the real init process.
     let drained = boot_row_release(boot_tid);
     t.check("fd: the boot row's identity was reclaimed, not parked", drained >= 1);
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// **`O_NONBLOCK` on the console**, which has to run after the console exists.
+///
+/// Separate from [`smoke_test`] for one mechanical reason: `boot::self_tests`
+/// calls `wire_console_and_syscalls()` — and therefore [`init_console`] — *after*
+/// `fd::smoke_test`, so `CONSOLE` is still `None` there and [`read_console`]
+/// returns 0 (no console, EOF) before it can reach any flag test. Written as a
+/// check inside `smoke_test` first, this reported `got 0x0 want -EAGAIN` and the
+/// missing console was the whole of it.
+pub fn console_nonblock_test(t: &mut Suite) {
+    // Two claims, and the first is the one that was mis-diagnosed as two
+    // disjoint flag stores. `fcntl` is glue's arm (4b batch 3c) and writes
+    // `Process::set_nonblock`; [`is_nonblocking`] reads the same `fds.nonblock`
+    // set through [`cur_table`]. One store, and this proves the two readers see
+    // it. The real defect was that [`read_console`] — which serves fd 0 here
+    // and only here, because a registered process's fd 0 is a
+    // `FileDescriptor::Stdin` and [`sys_read`]'s preamble claims it before glue
+    // sees it — had no flag test at all.
+    //
+    // The `EAGAIN` check assumes an idle console, which is true for all three
+    // rigs during the suite (QEMU's serial is fed from `/dev/null`, and the
+    // bare-metal box has no working keyboard). A keystroke landing here would
+    // read as one failing check, not as a hang.
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const O_NONBLOCK: u64 = 0o4000;
+
+    // `fcntl` is glue's arm and refuses an fd that is not in the table, so the
+    // boot task needs the descriptor identity every folded arm needs — see
+    // [`boot_row_register`].
+    let boot_tid = boot_row_register();
+    let mut buf = [0u8; 4];
+
+    t.check_eq("fd: fcntl(stdin, F_SETFL, O_NONBLOCK)", sys_fcntl(0, F_SETFL, O_NONBLOCK), 0);
+    t.check_eq(
+        "fd: fcntl(stdin, F_GETFL) reports it back",
+        sys_fcntl(0, F_GETFL, 0) & O_NONBLOCK,
+        O_NONBLOCK,
+    );
+    t.check("fd: and is_nonblocking agrees — one flag store", is_nonblocking(0));
+    t.check_eq(
+        "fd: a non-blocking read of an idle console is EAGAIN, not a park",
+        sys_read(0, buf.as_mut_ptr() as u64, 4),
+        errno::EAGAIN,
+    );
+    // Cleared before returning: `run_init` inherits this descriptor table's
+    // flags, and an init whose stdin is non-blocking reads its console as a
+    // stream of `EAGAIN`.
+    t.check_eq("fd: fcntl(stdin, F_SETFL, 0) clears it", sys_fcntl(0, F_SETFL, 0), 0);
+    t.check("fd: is_nonblocking cleared", !is_nonblocking(0));
+    // And a *blocking* read of an idle console still does not return data.
+    // Not that it blocks — the suite cannot wait for that — but that clearing
+    // the flag put the arm back on the path it was on.
+    t.check(
+        "fd: the flag is what changed, not the arm",
+        !errno::is_err(sys_fcntl(0, F_GETFL, 0)),
+    );
+
+    boot_row_release(boot_tid);
 }

@@ -2984,8 +2984,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     lifecycle_trace("[FORK-DBG] step6b: context captured\n");
     
     let mut child_ctx = parent_ctx;
-    child_ctx.x0 = 0;    // fork returns 0 to child
-    child_ctx.spsr = 0;  // Clean EL0t with interrupts enabled
+    child_ctx.set_child_return_zero();
+    child_ctx.set_unprivileged_entry();
     if stack_ptr != 0 {
         child_ctx.sp = stack_ptr;
     }
@@ -2998,7 +2998,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // garbage page table → ec=0x20 with IRQs masked → silent VM hang). The child
     // gets a fresh, independent address space from this fork, so its ttbr0 is
     // `new_proc.address_space.ttbr0()`, captured here before `new_proc` is consumed.
-    child_ctx.ttbr0 = new_proc.address_space.ttbr0();
+    child_ctx.set_address_space_root(new_proc.address_space.ttbr0());
 
     // 7./8. Spawn the child thread, publish the process, make it runnable — the
     // shared tail. No `clone_lazy_regions(parent_pid, child_pid)` in `before_ready`:
@@ -3079,8 +3079,8 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     let parent_tid = crate::threading::current_thread_id();
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
     let mut child_ctx = parent_ctx;
-    child_ctx.x0 = 0;
-    child_ctx.spsr = 0;
+    child_ctx.set_child_return_zero();
+    child_ctx.set_unprivileged_entry();
     if stack_ptr != 0 {
         child_ctx.sp = stack_ptr;
     }
@@ -3090,7 +3090,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     // vfork's child shares the parent's L0 table under a *new* ASID (new_shared
     // above), so new_proc.address_space.ttbr0() is the live, canonical value —
     // use that instead of the possibly-stale inherited one.
-    child_ctx.ttbr0 = new_proc.address_space.ttbr0();
+    child_ctx.set_address_space_root(new_proc.address_space.ttbr0());
 
     // The shared publish tail. `THREAD_PID_MAP` in particular must be populated
     // before the child runs: the shared ProcessInfo page still shows the parent's
@@ -3295,13 +3295,13 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
 
     let mut child_ctx = parent_ctx;
-    child_ctx.x0 = 0;
+    child_ctx.set_child_return_zero();
     child_ctx.sp = stack;
-    child_ctx.tpidr = tls;
-    child_ctx.spsr = 0;
-    // Override the (possibly stale) inherited ttbr0 with the live, canonical
-    // shared address-space ttbr0 — see the comment where `shared_ttbr0` is captured.
-    child_ctx.ttbr0 = shared_ttbr0;
+    child_ctx.set_tls_base(tls);
+    child_ctx.set_unprivileged_entry();
+    // Override the (possibly stale) inherited root with the live, canonical
+    // shared address-space one — see the comment where `shared_ttbr0` is captured.
+    child_ctx.set_address_space_root(shared_ttbr0);
 
     // The shared publish tail, with `clone_thread`'s two documented opt-outs
     // (`ForceDisabled` sigaltstack, `ThreadGroupMember` reaping — see those

@@ -527,7 +527,37 @@ mod process_state_bits_tests {
     }
 }
 
-/// User context saved during kernel entry
+/// **A process's ring-3 register file** — what an entry to user mode is built
+/// from, and what a trap from user mode saves.
+///
+/// # Two structs, one name, two architectures
+///
+/// This is the same split `Context` (the *kernel*-side switch state) already
+/// carries in `thread.rs`, one level up: the AArch64 arm below is the 36-`u64`
+/// `repr(C)` register file the `global_asm!` in `akuma-el0-entry` and
+/// `akuma-exceptions` index **by literal byte offset**, so its layout is
+/// load-bearing and cannot be reordered; the `x86_64` arm is a different, much
+/// smaller type carrying the registers the `syscall_entry` assembly actually
+/// saves.
+///
+/// `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md` § "The open decision" posed
+/// the alternative — one struct behind an arch-neutral accessor layer over its
+/// ~47 field reads — and § "Status" records that it was tried and rejected as
+/// "unnecessary work for what getting threading working on x86 actually
+/// required". This follows that verdict rather than re-litigating it.
+///
+/// # The three fields that are deliberately spelled the same on both
+///
+/// `pc`, `sp` and [`UserContext::new`]. They are the *neutral* half, and they
+/// are load-bearing on both kernels already: the amd64 kernel has stored
+/// `UserContext::new(image.entry, image.stack)` on every registered process
+/// since 5b slice 4 and reads it back through `current_entry_stack()`, and its
+/// `execve` rewrites the pair under the `image` lock so a re-entry cannot pair
+/// a new entry point with an old stack. Naming them `rip`/`rsp` on the x86 arm
+/// would have made every shared reader need a `cfg`.
+///
+/// Everything else differs, and the difference is the point — see each arm.
+#[cfg(not(target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct UserContext {
@@ -546,7 +576,68 @@ pub struct UserContext {
     pub ttbr0: u64,
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 impl UserContext {
+    /// **This context is a child's**: the call it resumes from returns `0`.
+    ///
+    /// The one thing shared code has ever read `x0` for. `fork`/`vfork`/
+    /// `clone` all inherit the parent's whole register file and then change
+    /// exactly this, because a parent returns the child's pid and a child
+    /// returns zero from the same instruction.
+    pub fn set_child_return_zero(&mut self) {
+        self.x0 = 0;
+    }
+
+    /// **This context enters unprivileged, with interrupts enabled.**
+    ///
+    /// Named for the property rather than the register because the two
+    /// architectures enforce it in different places, and only one of them can
+    /// get it wrong. On AArch64 it is `spsr = 0` — `M[3:0] = 0b0000` (EL0t) and
+    /// `DAIF` clear — and `eret` reads that field, which is why
+    /// `akuma_el0_entry::enter_user_mode_checked` exists to refuse a context
+    /// whose `spsr` targets EL1. On x86_64 privilege on entry comes from the
+    /// `sysret`/`iretq` selectors in the entry assembly, which no caller can
+    /// influence, so there is nothing to set and nothing to check.
+    ///
+    /// A child inherits its parent's saved state, and the parent's was saved on
+    /// a *trap from* user mode — so this is a normalisation, not a change of
+    /// intent. It stays explicit because "inherited from something that was
+    /// already unprivileged" is an argument, not a guarantee.
+    pub fn set_unprivileged_entry(&mut self) {
+        self.spsr = 0;
+    }
+
+    /// **This context runs in the address space rooted at `root`.**
+    ///
+    /// Always the child's *own* freshly captured root, never the value
+    /// inherited from the parent's saved context: that one is read from the
+    /// thread's saved context, which is refreshed only when the scheduler
+    /// switches *away* from a thread, so a parent that has `execve`'d or
+    /// `mmap`'d since its last switch-out has a stale one there. Loading a
+    /// stale root on the child's first schedule wedged the CPU — a TLB flush,
+    /// then an instruction fetch against a garbage page table, `ec=0x20` with
+    /// IRQs masked, and a silent VM hang. All three child-context builders
+    /// carry a comment about it because all three had the bug.
+    ///
+    /// On x86_64 this is a **no-op**, and that is the design: the page-table
+    /// root is not part of the register file there. The scheduler installs it
+    /// from the task slot's own `space_root` (`sched::set_current_space_root`)
+    /// before the entry, so the staleness this method exists to prevent cannot
+    /// arise — there is one authority and it is not a copy.
+    pub fn set_address_space_root(&mut self, root: u64) {
+        self.ttbr0 = root;
+    }
+
+    /// **The thread-local-storage base this context resumes with.**
+    ///
+    /// `tpidr_el0` on AArch64, `IA32_FS_BASE` on x86_64 — the register musl
+    /// keeps its TLS pointer in on each. Only `clone_thread` sets it: a new
+    /// thread is given its TLS block by the caller, where a `fork` child
+    /// inherits the parent's whole file including this.
+    pub fn set_tls_base(&mut self, tls: u64) {
+        self.tpidr = tls;
+    }
+
     #[must_use]
     pub fn new(entry_point: usize, stack_pointer: usize) -> Self {
         Self {
@@ -562,6 +653,142 @@ impl UserContext {
         }
     }
 
+}
+
+/// The `x86_64` ring-3 register file. See the type's header for why this is a
+/// separate struct with the same name.
+///
+/// **The field list is not a design choice — it is what the `syscall_entry`
+/// assembly saves**, and nothing more. `amd64/src/usermode.rs`'s `UserCtx` is
+/// where those bytes live per *task slot*, written by that assembly at fixed
+/// offsets; this is the same information as a value, so a process's first entry
+/// to ring 3 can be described the way the AArch64 side describes it.
+///
+/// What is absent, and why:
+///
+/// - **No `spsr`.** Privilege on entry is decided by the `sysret`/`iretq`
+///   selectors in the entry assembly, not by a field a caller could get wrong.
+///   The AArch64 arm carries one because `eret` reads it, which is why
+///   `enter_user_mode_checked` exists to refuse a context that does not target
+///   EL0. There is no equivalent mistake to guard against here.
+/// - **No `ttbr0`.** The page-table root is installed by the scheduler from the
+///   task slot's `space_root` (`sched::set_current_space_root`), before the
+///   entry, not carried in the register file.
+/// - **No `tpidr`.** Its counterpart is [`Self::fs_base`], named for the MSR it
+///   is written to.
+/// - **12 registers, not 15.** `syscall_entry` saves `rdi, rsi, rdx, r10, r8,
+///   r9, rbx, rbp, r12, r13, r14, r15` — the System V argument registers plus
+///   the callee-saved set. `rcx` and `r11` are clobbered by `syscall` itself
+///   (they hold the return `rip` and `rflags`), and `rax` is the syscall number
+///   on the way in and the return value on the way out, which is why it is a
+///   named field rather than an array slot.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UserContext {
+    /// `[rdi, rsi, rdx, r10, r8, r9, rbx, rbp, r12, r13, r14, r15]`, in the
+    /// order `syscall_entry` writes them. The order is the assembly's, so do
+    /// not sort it.
+    pub regs: [u64; 12],
+    /// `rsp`. Spelled `sp` on purpose — see the type header.
+    pub sp: u64,
+    /// `rip`. Spelled `pc` on purpose — see the type header.
+    pub pc: u64,
+    /// `IA32_FS_BASE` — musl's TLS pointer, set by `arch_prctl(ARCH_SET_FS)`.
+    /// The counterpart of the AArch64 arm's `tpidr`. `0` means "never set", and
+    /// the scheduler leaves the MSR alone for it.
+    pub fs_base: u64,
+    /// The program's `%gs` base, set by `arch_prctl(ARCH_SET_GS)`. Written to
+    /// `IA32_KERNEL_GS_BASE`, which `swapgs` turns into the program's `GS_BASE`
+    /// on the way back to ring 3 — the kernel's own per-CPU block occupies the
+    /// other half of that pair, so this value can never reach `IA32_GS_BASE`.
+    pub gs_base: u64,
+    /// The value ring 3 resumes with in `rax`. The counterpart of the AArch64
+    /// arm's `x0`, and it exists for the one reason `x0` is read by shared
+    /// code: a `fork` child returns **0** where its parent returns the child's
+    /// pid.
+    pub rax: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl UserContext {
+    /// **This context is a child's**: the call it resumes from returns `0`.
+    ///
+    /// The one thing shared code has ever read `x0` for. `fork`/`vfork`/
+    /// `clone` all inherit the parent's whole register file and then change
+    /// exactly this, because a parent returns the child's pid and a child
+    /// returns zero from the same instruction.
+    pub fn set_child_return_zero(&mut self) {
+        self.rax = 0;
+    }
+
+    /// **This context enters unprivileged, with interrupts enabled.**
+    ///
+    /// Named for the property rather than the register because the two
+    /// architectures enforce it in different places, and only one of them can
+    /// get it wrong. On AArch64 it is `spsr = 0` — `M[3:0] = 0b0000` (EL0t) and
+    /// `DAIF` clear — and `eret` reads that field, which is why
+    /// `akuma_el0_entry::enter_user_mode_checked` exists to refuse a context
+    /// whose `spsr` targets EL1. On x86_64 privilege on entry comes from the
+    /// `sysret`/`iretq` selectors in the entry assembly, which no caller can
+    /// influence, so there is nothing to set and nothing to check.
+    ///
+    /// A child inherits its parent's saved state, and the parent's was saved on
+    /// a *trap from* user mode — so this is a normalisation, not a change of
+    /// intent. It stays explicit because "inherited from something that was
+    /// already unprivileged" is an argument, not a guarantee.
+    // Genuinely empty, and the doc above is the argument for it. Not a `todo!`
+    // and not an `unimplemented!`: there is no x86_64 field this could set.
+    pub fn set_unprivileged_entry(&mut self) {}
+
+    /// **This context runs in the address space rooted at `root`.**
+    ///
+    /// Always the child's *own* freshly captured root, never the value
+    /// inherited from the parent's saved context: that one is read from the
+    /// thread's saved context, which is refreshed only when the scheduler
+    /// switches *away* from a thread, so a parent that has `execve`'d or
+    /// `mmap`'d since its last switch-out has a stale one there. Loading a
+    /// stale root on the child's first schedule wedged the CPU — a TLB flush,
+    /// then an instruction fetch against a garbage page table, `ec=0x20` with
+    /// IRQs masked, and a silent VM hang. All three child-context builders
+    /// carry a comment about it because all three had the bug.
+    ///
+    /// On x86_64 this is a **no-op**, and that is the design: the page-table
+    /// root is not part of the register file there. The scheduler installs it
+    /// from the task slot's own `space_root` (`sched::set_current_space_root`)
+    /// before the entry, so the staleness this method exists to prevent cannot
+    /// arise — there is one authority and it is not a copy.
+    // Genuinely empty — see the doc above. The root reaches the CPU from the
+    // task slot, and a second copy of it here is the staleness bug this method
+    // exists to prevent on the other architecture.
+    pub fn set_address_space_root(&mut self, _root: u64) {}
+
+    /// **The thread-local-storage base this context resumes with.**
+    ///
+    /// `tpidr_el0` on AArch64, `IA32_FS_BASE` on x86_64 — the register musl
+    /// keeps its TLS pointer in on each. Only `clone_thread` sets it: a new
+    /// thread is given its TLS block by the caller, where a `fork` child
+    /// inherits the parent's whole file including this.
+    pub fn set_tls_base(&mut self, tls: u64) {
+        self.fs_base = tls;
+    }
+
+    /// A context that enters `entry_point` on `stack_pointer` with everything
+    /// else zeroed — the shape a freshly loaded image starts in.
+    ///
+    /// Deliberately the same signature and the same meaning as the AArch64
+    /// arm's: these two scalars are what every shared caller sets.
+    #[must_use]
+    pub fn new(entry_point: usize, stack_pointer: usize) -> Self {
+        Self {
+            regs: [0; 12],
+            sp: stack_pointer as u64,
+            pc: entry_point as u64,
+            fs_base: 0,
+            gs_base: 0,
+            rax: 0,
+        }
+    }
 }
 
 /// The real trait, not an inherent `default()`.
@@ -770,12 +997,70 @@ mod tests {
         assert_eq!(f.flags, 0o100);
     }
 
+    /// [`UserContext::new`]'s two scalars — the neutral half, which is the same
+    /// on both architectures and is what every shared caller sets.
+    ///
+    /// This used to also assert `ctx.x0 == 0`, and **that line would not
+    /// compile on an x86_64 host**: this module is built for the host, so
+    /// `target_arch` here selects the host's arm of the struct, and an x86_64
+    /// developer running `cargo test` would get the x86 `UserContext`, which has
+    /// no `x0`. Same trap `akuma_syscalls_linux::nr` carries and CLAUDE.md
+    /// states — `cfg!(target_arch)` under `cargo test` resolves to the *host*.
+    /// The arch-specific half is covered by the next test, per arm.
     #[test]
     fn user_context_new() {
         let ctx = UserContext::new(0x1000, 0x2000);
         assert_eq!(ctx.pc, 0x1000);
         assert_eq!(ctx.sp, 0x2000);
-        assert_eq!(ctx.x0, 0);
+    }
+
+    /// The four arch-neutral setters map onto **this** host arch's fields, and
+    /// none of them disturbs the neutral half.
+    ///
+    /// These exist because `fork`/`vfork`/`clone_thread` build a child's
+    /// register file by inheriting the parent's and changing four things, and
+    /// each of the four means something different per architecture — see the
+    /// setters' own docs. Poisoned first, so a setter that silently did nothing
+    /// on the arm that needs it would fail here rather than pass against a
+    /// zeroed struct.
+    #[test]
+    fn user_context_setters_map_to_this_arch() {
+        let mut ctx = UserContext::new(0x1000, 0x2000);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            ctx.x0 = 7;
+            ctx.spsr = 0x3c5; // EL1h, DAIF set — the state a child must NOT enter
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx.rax = 7;
+        }
+
+        ctx.set_tls_base(0xbeef_0000);
+        ctx.set_address_space_root(0xdead_0000);
+        ctx.set_unprivileged_entry();
+        ctx.set_child_return_zero();
+
+        // The neutral half survives all four.
+        assert_eq!(ctx.pc, 0x1000);
+        assert_eq!(ctx.sp, 0x2000);
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert_eq!(ctx.x0, 0, "the child's fork() return value");
+            assert_eq!(ctx.spsr, 0, "EL0t with DAIF clear");
+            assert_eq!(ctx.ttbr0, 0xdead_0000, "the child's OWN root, not the inherited one");
+            assert_eq!(ctx.tpidr, 0xbeef_0000, "tpidr_el0");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(ctx.rax, 0, "the child's fork() return value");
+            assert_eq!(ctx.fs_base, 0xbeef_0000, "IA32_FS_BASE");
+            // `set_unprivileged_entry` and `set_address_space_root` are no-ops
+            // on this arm *by design* — there is no field for either, and their
+            // docs are the argument. Nothing to assert but that they compile
+            // and leave the rest alone, which the two checks above do.
+        }
     }
 
     #[test]

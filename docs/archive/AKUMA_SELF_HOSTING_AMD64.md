@@ -6,8 +6,8 @@
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** plan, with measurements taken 2026-09-07 and the walk kept current
-in the dated boxes below (last updated 2026-09-10, after 4b's fold batches
-through `openat`).
+in the dated boxes below (last updated 2026-09-10, after 4b's **last** fold
+batch — `poll`/`select`/`ioctl` — and the console `O_NONBLOCK` fix).
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
 > `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
@@ -1089,27 +1089,57 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   3 083. Out with them: `clone_refs`/`fs_err_errno`/`resolve_at`.
    │   Surfaced glue's *third* hook table (`SyscallHooks`, AArch64-only
    │   until now) — `utimensat`'s clock read `None`, so `touch` was 1970
+   ▼   then the two that needed care (b4b): `poll`/`select`/`ppoll`/
+   │   `pselect6` and `ioctl`. **`fd.rs` → 3 008 at the fold.** The
+   │   yield-budget `poll` loop is gone: a listening socket now polls
+   │   readable (the old probe resolved *one* smoltcp handle and a
+   │   listener is a pool of `MAX_BACKLOG`), `nfds == 0` blocks so
+   │   `pause()` works, a sub-ms `ppoll` survives, and a blocked poll
+   │   parks instead of spinning. `SyscallHooks` gained an **eighth**
+   │   field — `poll_console_state`, because this target's console is
+   │   answered by fd *number* and glue's map would call an unbound
+   │   fd 0 `EPOLLHUP|EPOLLERR`. `ioctl` keeps a seven-request tty
+   │   preamble on purpose (the two kernels have two interactive-shell
+   │   architectures) and delegates the rest, deleting a byte-for-byte
+   │   `SIOCGIF*` duplicate. Found while folding: glue's `ppoll` sized
+   │   `vec![PollFd; nfds]` from a **ring-3 register** with no bound
+   ▼   and, the same session, the `ssh`-client typing freeze: a
+   │   non-blocking `read(0)` on the console **parked forever**. Not
+   │   two `O_NONBLOCK` stores — `fcntl`'s 3c fold had already made it
+   │   one — but two *functions*: glue's `Stdin` arm honours the flag
+   │   and amd64 never reaches it, because `sys_read`'s preamble claims
+   │   a bound `Stdin` for `read_console`, which had no flag test at all
    │                        docs: AKUMA_AMD64_4B_FLIP.md,
-   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A,3B,3C}.md,
+   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A,3B,3C,4B}.md,
+   │                              AMD64_CONSOLE_NONBLOCK_READ.md,
    │                              AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md
    ▼
  [09-10] ═══ YOU ARE HERE ═══
    │
-   └──► three pieces left below the gate, none blocked on another:
-        **4b, continued** — I/O cluster **folded (3a)**, `stat` family
-                 **folded (3b)**, `fcntl`/`dup*`/`pipe2`/`access`/
-                 `utimensat` **folded (3c)**; `fd.rs` 4 454 → 3 083.
-                 What is left needs care not a forward: `poll`/`select`
-                 (the readiness model vs the shared `WaitPolicy`),
-                 `ioctl` (half x86-only), and the console/`/dev`
-                 preambles on `read`/`write`/`lseek`
+   └──► two pieces left below the gate, neither blocked on the other:
         **the ring-3 entry seam** — an x86 arm for "enter userspace with
                  this process's first context"; unblocks `fork`, then
-                 `clone`. Sized like 5b, and the only one with no
-                 hand-off prompt written
+                 `clone`. Sized like 5b. **IN PROGRESS: slice 1 of 4
+                 landed** — `UserContext` split, four arch-neutral
+                 setters, `fork_process` compiles for x86_64, aarch64
+                 byte-identical. Prompt now exists:
+                 `proposals/NEXT_AGENT_AMD64_RING3_ENTRY_SEAM.md`; the
+                 real seam is the **return shape** (§4), not the
+                 registers — `run()` erets and never returns, amd64's
+                 `enter_user` returns an exit status
+                        docs: AKUMA_AMD64_RING3_SEAM_SLICE1.md
         **`Spawn` + `wait4`** — three fields and one source decision
                  (populate `CHILD_CHANNELS`, or teach glue's `wait4` to
                  read `Process::exited`)
+
+        4b's syscall arms are **done**. What is left in `fd.rs` is the
+        console and `/dev` preambles on `read`/`write`/`lseek`/`poll`/
+        `ioctl`, and all five exist for **one** reason: no amd64 process
+        has a `ProcessChannel`. Giving an sshd session's child one — the
+        deferred `/proc/<pid>/fd/0` + `delegate_pid` item in
+        `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc` — retires all five
+        together and also fixes raw mode, `EINTR` on a console read and
+        `/dev/tty` (`AMD64_CONSOLE_NONBLOCK_READ.md` §6)
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -1190,15 +1220,22 @@ parity with what the AArch64 self-host already proves.
   │  ✔ 6    loader.rs placement → akuma-elf load half              │
   │  ✔ 5b   PROCS → akuma-exec, in four slices: register /         │
   │           identity+lifecycle / mount /proc / delete PROCS      │
-  │  ◐ 4b   the remaining VFS arms → glue  ◀── IN PROGRESS.        │
+  │  ✔ 4b   the remaining VFS arms → glue                          │
   │           Folded: mkdirat/unlinkat/renameat/symlinkat/         │
   │           readlinkat (b1), close (b2b), one /proc (b2c),       │
   │           openat (b2d), read/pread/write/lseek/getdents64      │
   │           (b3a), fstat/newfstatat/statfs/fstatfs/statx (b3b),  │
-  │           fcntl/dup/dup2/dup3/pipe2/access/utimensat (b3c).    │
-  │           fd.rs 4454 → 3083.                                   │
-  │           Next: poll/select, ioctl — care, not forwards.       │
-  │  ✖ THE RING-3 ENTRY SEAM — an x86 arm for "enter userspace     │
+  │           fcntl/dup/dup2/dup3/pipe2/access/utimensat (b3c),    │
+  │           poll/select/ppoll/pselect6 + ioctl (b4b).             │
+  │           fd.rs 4454 → 3008. **The syscall arms are DONE**;    │
+  │           what is left is the console/`/dev` preambles, which   │
+  │           the ProcessChannel item retires as one piece.         │
+  │  ◐ THE RING-3 ENTRY SEAM ◀── IN PROGRESS, slice 1 of 4 landed. │
+  │           UserContext is split and fork_process COMPILES for   │
+  │           x86_64; the aarch64 kernel is byte-identical.        │
+  │           Slice 2 = the return shape (run() erets and never    │
+  │           returns; amd64's enter_user RETURNS a status).       │
+  │           An x86 arm for "enter userspace                      │
   │           with this process's first context". fork_process     │
   │           `eret`s from a UserContext; amd64 has no eret. This  │
   │           is what "5c" turned out to be, and it is 5b-sized.   │

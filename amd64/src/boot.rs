@@ -420,6 +420,9 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     sock::smoke_test(t, cx.have_net);
 
     wire_console_and_syscalls();
+    // `O_NONBLOCK` on the console descriptor, which needs the console the line
+    // above just created — see `fd::console_nonblock_test`.
+    fd::console_nonblock_test(t);
     // The dispatch table itself, before anything runs through it: the
     // legacy-x86 list and the neutral `Syscall` table must stay disjoint,
     // and the x86_64 -> asm-generic hop C1 folds through must still happen.
