@@ -203,6 +203,34 @@ pub struct ExecRuntime {
     /// `crate::smp::bkl_leave` on the other) because ring 3 must not hold it.
     /// Shared code must not know that a lock is being dropped here.
     pub enter_user: fn(&crate::process::UserContext) -> !,
+
+    /// **Build a fork child's address space from its parent's** — the one step
+    /// of `fork_process` that is genuinely architecture work.
+    ///
+    /// AArch64 registers [`crate::process::fork_share_parent_memory`], which is
+    /// that step verbatim. amd64 registers its own, because the shared one is
+    /// an **AArch64 page-table walker wearing neutral clothes**: it reaches
+    /// every page through `akuma-mmu`'s raw-root family
+    /// (`translate_user_va`, `collect_mapped_pages_with_flags_into`,
+    /// `for_each_mapped_user_pte`, `demote_range_to_ro`), which reads ARM
+    /// descriptor bits and is not `#[cfg]`-gated — so it compiles for x86_64
+    /// and would walk a PML4 by ARM rules. ARM's `VALID` is x86's `Present`
+    /// and ARM's `TABLE` is x86's `R/W`, so it would descend according to
+    /// whether pages happen to be writable and produce a garbage address space
+    /// **without erroring anywhere**.
+    ///
+    /// A hook rather than a `cfg`, for the reason [`Self::enter_user`] is one:
+    /// the other kernel does not want a variant of this function, it has a
+    /// correct implementation of the same job already and the two should not be
+    /// merged into a single function pretending to be portable.
+    ///
+    /// The child is unpublished and not yet in the process table, so the
+    /// implementation has it exclusively; the parent is shared and every access
+    /// to its page tables must go through its own address-space lock.
+    pub fork_share_memory: fn(
+        parent: &crate::process::Process,
+        child: &mut crate::process::Process,
+    ) -> Result<(), &'static str>,
 }
 
 /// Compile-time kernel configuration, passed once at init.

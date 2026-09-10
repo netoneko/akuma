@@ -427,6 +427,10 @@ pub(crate) fn build_exec_runtime(
         // see `akuma_exec::ExecRuntime::enter_user` for what the other arm
         // has to be instead.
         enter_user: akuma_exec::process::enter_user_mode_checked,
+        // The AArch64 fork memory pass, which is `fork_process`'s own step 4 —
+        // registered rather than called directly so the amd64 kernel can
+        // substitute a walk that speaks x86 page tables. See the field's doc.
+        fork_share_memory: akuma_exec::process::fork_share_parent_memory,
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,

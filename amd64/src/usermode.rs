@@ -2246,130 +2246,8 @@ impl Image {
             serial::puts("\n");
             return None;
         };
-        let mut ok = true;
-
-        // The child's region list, and — separately — the VA ranges that must be
-        // shared **by identity** rather than copy-on-write. Both are read out of
-        // the parent's list in one hold, before the page walk below, because the
-        // walk maps pages and must not run under the region lock.
-        let (regions, shared_ranges) = {
-            let _irq = akuma_primitives::irq::IrqGuard::new();
-            let parent_regions = parent.mmap_regions.lock();
-            let shared: Vec<(usize, usize)> = parent_regions
-                .iter()
-                .filter(|r| r.shared_anon)
-                .map(|r| (r.start_va, r.start_va + r.len_bytes()))
-                .collect();
-            // The child maps every page of every parent region — read-only and
-            // CoW-shared by the pass below — but *owns* none of them, which is
-            // exactly the shape `inherit_mmap_regions_for_cow_child` produces.
-            // Carrying the **extent** across is the part that matters and the
-            // part that has been dropped before: a grandchild whose parent's
-            // regions read as zero-length shares nothing and faults on its first
-            // touch (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
-            (akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions), shared)
-        };
-
-        // One walk of the parent's tables, with the parent's own PTE edited in
-        // place where it has to be demoted.
-        //
-        // `rewrite_leaves_in_range` replaces `for_each_user_leaf` + a second
-        // `map_page_in` per demoted page: the walk already has the leaf slot in
-        // hand, so a `Reprotect` is one store rather than a fresh four-level
-        // descent. The child's pages are mapped inside the closure into
-        // `space`, a **different** address space, so nothing here edits the
-        // table the walk is standing on.
-        //
-        // The parent's hold is taken for the whole walk. That is the longest
-        // `ProcAddressSpace` hold on this target and it is bounded by the
-        // parent's residency; it has to be one hold, because a demote that
-        // published halfway would leave the parent writable on pages the child
-        // already shares.
-        let mut parent_as = parent.address_space.lock();
-        parent_as.rewrite_leaves_in_range(0, akuma_mmu::USER_HALF_END, |_ledger, leaf| {
-            if !ok {
-                return LeafAction::Keep;
-            }
-            let (va, pa) = (leaf.va, leaf.pa);
-            let frame = PhysFrame::new(pa);
-
-            // `MAP_SHARED | MAP_ANONYMOUS`: one object, not two copies.
-            //
-            // Everything else in an address space is private, so fork demotes it
-            // to read-only and lets the first write break the sharing. Doing that
-            // to a shared anonymous mapping gives parent and child separate pages
-            // — the child's write becomes invisible to the parent, which is the
-            // exact opposite of what the flag asks for, and it is how a process
-            // pool coordinating through shared memory silently measures nothing
-            // (`userspace/forktest/c_stress/shmanon.c`).
-            //
-            // So: same frame, writable in **both**, no CoW marker, and the
-            // parent's own PTE deliberately left alone (`LeafAction::Keep`).
-            if shared_ranges.iter().any(|(start, end)| va >= *start && va < *end) {
-                let shared_rw = PteProt { write: true, ..leaf.prot };
-                akuma_pmm::cow_ref_inc(frame.addr);
-                space.track_user_frame(frame);
-                if !space.map_page_pte(va, pa, shared_rw, false) {
-                    if space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
-                        akuma_pmm::free_page(frame.addr, 0);
-                    }
-                    ok = false;
-                }
-                return LeafAction::Keep;
-            }
-
-            // A page that is already read-only and *not* CoW stays exactly as it
-            // is in both spaces — `.rodata`, an `mprotect(PROT_READ)` region.
-            // Marking it would turn a legitimate `SIGSEGV` into a silent write.
-            let share_writable = leaf.prot.write || leaf.cow;
-
-            if share_writable {
-                // Demote in **both** address spaces. Demoting only the child
-                // leaves the parent writing straight through to memory the
-                // child can see change — the entire point of CoW, missed.
-                //
-                // The parent's own PTE is rewritten by the `Reprotect` returned
-                // below, in its live address space, and the walk issues the
-                // `invlpg` plus the shootdown IPI (`TlbFlush::drop` waits for
-                // the peers' acknowledgements), so a peer holding a stale
-                // writable translation has it invalidated before `fork`
-                // returns. The deadlock argument is on `set_shootdown_hooks`
-                // in `akuma-mmu`: the sender holds the BKL, and the one
-                // IRQ-masked state a peer can be stranded in — the BKL ticket
-                // wait — services shootdowns inline.
-                let demoted = PteProt { write: false, ..leaf.prot };
-                akuma_pmm::cow_ref_inc(frame.addr);
-                space.track_user_frame(frame);
-                if !space.map_page_pte(va, pa, demoted, true) {
-                    if space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
-                        akuma_pmm::free_page(frame.addr, 0);
-                    }
-                    ok = false;
-                    // The parent keeps its writable mapping: the child does not
-                    // share this page, so demoting the parent would cost it a
-                    // fault for nothing.
-                    return LeafAction::Keep;
-                }
-                LeafAction::Reprotect(demoted, true)
-            } else {
-                // Read-only and unshared-by-marker: the child maps the same
-                // frame at the same permissions. It still takes a reference,
-                // because teardown of either process must not free a page the
-                // other still maps.
-                akuma_pmm::cow_ref_inc(frame.addr);
-                space.track_user_frame(frame);
-                if !space.map_page_pte(va, pa, leaf.prot, leaf.cow) {
-                    if space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
-                        akuma_pmm::free_page(frame.addr, 0);
-                    }
-                    ok = false;
-                }
-                LeafAction::Keep
-            }
-        });
-        drop(parent_as);
-
-        if !ok {
+        let mut regions: Vec<MmapRegion> = Vec::new();
+        if !share_parent_memory_into(parent, &mut space, &mut regions) {
             serial::puts("  [fork] share pass failed; pmm free=");
             serial::put_dec(akuma_pmm::free_count() as u64);
             serial::puts(" pages=");
@@ -2382,6 +2260,197 @@ impl Image {
         Some(Self { space, entry, stack, regions })
     }
 }
+
+/// Share the parent's user memory into `child_space`, copy-on-write, and fill
+/// `child_regions` with the extents the child inherits.
+///
+/// **One walk of the parent's tables, with the parent's own PTE edited in place
+/// where it has to be demoted** — see the comments inside for why each of the
+/// three leaf cases is what it is.
+///
+/// Extracted from [`Image::fork_of`] on 2026-09-10 with C1 slice 4, because it
+/// has two callers now: that one, and the `ExecRuntime::fork_share_memory`
+/// registration through which the **shared** `akuma_exec::process::fork_process`
+/// builds a child on this target. One walk, two spellings, so the tree's `fork`
+/// and this target's own cannot describe a child's memory differently.
+///
+/// Returns `false` if any page failed to map; the caller owns what to do about
+/// it — `fork_of` drops the whole address space, the hook reports an error and
+/// lets `fork_process`'s own unwinding release the child.
+/// **`ExecRuntime::fork_share_memory` on this target** — build a `fork` child's
+/// address space from its parent's, for the shared
+/// `akuma_exec::process::fork_process`.
+///
+/// The shared implementation of this step
+/// (`akuma_exec::process::fork_share_parent_memory`) cannot run here, and the
+/// reason is the whole of C1 slice 4: it reaches every page through
+/// `akuma-mmu`'s raw-root walker family, which reads **AArch64 descriptor
+/// bits** and is not `#[cfg]`-gated. Handed an x86 PML4 it would descend by
+/// ARM rules — ARM's `VALID` is x86's `Present`, ARM's `TABLE` is x86's `R/W` —
+/// and build a garbage address space without erroring.
+///
+/// So this target registers its own, over the leaf iterator that *does* have
+/// both arms. It is [`share_parent_memory_into`], i.e. the same walk
+/// `Image::fork_of` has always used, pointed at the child `fork_process`
+/// already built rather than at a fresh one.
+///
+/// The child is unpublished and in the caller's exclusive hands, so
+/// `get_mut()` on its address space is sound and no lock is taken on it; the
+/// parent's is taken inside, for the whole walk.
+///
+/// **The `ProcessInfo` page is not this function's problem.** `fork_process`
+/// maps one into the child before calling here and re-maps it *after*, because
+/// this walk covers `PROCESS_INFO_ADDR` and would otherwise leave the child
+/// sharing the parent's copy — which is the same ordering the AArch64 side
+/// carries, for the same reason.
+pub fn fork_share_memory(
+    parent: &akuma_exec::process::Process,
+    child: &mut akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    let mut regions: Vec<MmapRegion> = Vec::new();
+    let ok = share_parent_memory_into(parent, child.address_space.get_mut(), &mut regions);
+    if !ok {
+        serial::puts("  [fork] share pass failed; pmm free=");
+        serial::put_dec(akuma_pmm::free_count() as u64);
+        serial::puts("\n");
+        return Err("fork: CoW share pass failed");
+    }
+    *child.mmap_regions.lock() = regions;
+    Ok(())
+}
+
+fn share_parent_memory_into(
+    parent: &akuma_exec::process::Process,
+    child_space: &mut UserAddressSpace,
+    child_regions: &mut Vec<MmapRegion>,
+) -> bool {
+    let mut ok = true;
+
+    // The child's region list, and — separately — the VA ranges that must be
+    // shared **by identity** rather than copy-on-write. Both are read out of
+    // the parent's list in one hold, before the page walk below, because the
+    // walk maps pages and must not run under the region lock.
+    let (inherited, shared_ranges) = {
+        let _irq = akuma_primitives::irq::IrqGuard::new();
+        let parent_regions = parent.mmap_regions.lock();
+        let shared: Vec<(usize, usize)> = parent_regions
+            .iter()
+            .filter(|r| r.shared_anon)
+            .map(|r| (r.start_va, r.start_va + r.len_bytes()))
+            .collect();
+        // The child maps every page of every parent region — read-only and
+        // CoW-shared by the pass below — but *owns* none of them, which is
+        // exactly the shape `inherit_mmap_regions_for_cow_child` produces.
+        // Carrying the **extent** across is the part that matters and the
+        // part that has been dropped before: a grandchild whose parent's
+        // regions read as zero-length shares nothing and faults on its first
+        // touch (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
+        (akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions), shared)
+    };
+    *child_regions = inherited;
+
+    // One walk of the parent's tables, with the parent's own PTE edited in
+    // place where it has to be demoted.
+    //
+    // `rewrite_leaves_in_range` replaces `for_each_user_leaf` + a second
+    // `map_page_in` per demoted page: the walk already has the leaf slot in
+    // hand, so a `Reprotect` is one store rather than a fresh four-level
+    // descent. The child's pages are mapped inside the closure into
+    // `child_space`, a **different** address space, so nothing here edits the
+    // table the walk is standing on.
+    //
+    // The parent's hold is taken for the whole walk. That is the longest
+    // `ProcAddressSpace` hold on this target and it is bounded by the
+    // parent's residency; it has to be one hold, because a demote that
+    // published halfway would leave the parent writable on pages the child
+    // already shares.
+    let mut parent_as = parent.address_space.lock();
+    parent_as.rewrite_leaves_in_range(0, akuma_mmu::USER_HALF_END, |_ledger, leaf| {
+        if !ok {
+            return LeafAction::Keep;
+        }
+        let (va, pa) = (leaf.va, leaf.pa);
+        let frame = PhysFrame::new(pa);
+
+        // `MAP_SHARED | MAP_ANONYMOUS`: one object, not two copies.
+        //
+        // Everything else in an address space is private, so fork demotes it
+        // to read-only and lets the first write break the sharing. Doing that
+        // to a shared anonymous mapping gives parent and child separate pages
+        // — the child's write becomes invisible to the parent, which is the
+        // exact opposite of what the flag asks for, and it is how a process
+        // pool coordinating through shared memory silently measures nothing
+        // (`userspace/forktest/c_stress/shmanon.c`).
+        //
+        // So: same frame, writable in **both**, no CoW marker, and the
+        // parent's own PTE deliberately left alone (`LeafAction::Keep`).
+        if shared_ranges.iter().any(|(start, end)| va >= *start && va < *end) {
+            let shared_rw = PteProt { write: true, ..leaf.prot };
+            akuma_pmm::cow_ref_inc(frame.addr);
+            child_space.track_user_frame(frame);
+            if !child_space.map_page_pte(va, pa, shared_rw, false) {
+                if child_space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                    akuma_pmm::free_page(frame.addr, 0);
+                }
+                ok = false;
+            }
+            return LeafAction::Keep;
+        }
+
+        // A page that is already read-only and *not* CoW stays exactly as it
+        // is in both spaces — `.rodata`, an `mprotect(PROT_READ)` region.
+        // Marking it would turn a legitimate `SIGSEGV` into a silent write.
+        let share_writable = leaf.prot.write || leaf.cow;
+
+        if share_writable {
+            // Demote in **both** address spaces. Demoting only the child
+            // leaves the parent writing straight through to memory the
+            // child can see change — the entire point of CoW, missed.
+            //
+            // The parent's own PTE is rewritten by the `Reprotect` returned
+            // below, in its live address space, and the walk issues the
+            // `invlpg` plus the shootdown IPI (`TlbFlush::drop` waits for
+            // the peers' acknowledgements), so a peer holding a stale
+            // writable translation has it invalidated before `fork`
+            // returns. The deadlock argument is on `set_shootdown_hooks`
+            // in `akuma-mmu`: the sender holds the BKL, and the one
+            // IRQ-masked state a peer can be stranded in — the BKL ticket
+            // wait — services shootdowns inline.
+            let demoted = PteProt { write: false, ..leaf.prot };
+            akuma_pmm::cow_ref_inc(frame.addr);
+            child_space.track_user_frame(frame);
+            if !child_space.map_page_pte(va, pa, demoted, true) {
+                if child_space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                    akuma_pmm::free_page(frame.addr, 0);
+                }
+                ok = false;
+                // The parent keeps its writable mapping: the child does not
+                // share this page, so demoting the parent would cost it a
+                // fault for nothing.
+                return LeafAction::Keep;
+            }
+            LeafAction::Reprotect(demoted, true)
+        } else {
+            // Read-only and unshared-by-marker: the child maps the same
+            // frame at the same permissions. It still takes a reference,
+            // because teardown of either process must not free a page the
+            // other still maps.
+            akuma_pmm::cow_ref_inc(frame.addr);
+            child_space.track_user_frame(frame);
+            if !child_space.map_page_pte(va, pa, leaf.prot, leaf.cow) {
+                if child_space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                    akuma_pmm::free_page(frame.addr, 0);
+                }
+                ok = false;
+            }
+            LeafAction::Keep
+        }
+    });
+    drop(parent_as);
+
+    ok
+}
+
 
 /// The registered process the running task belongs to, or `None`.
 ///

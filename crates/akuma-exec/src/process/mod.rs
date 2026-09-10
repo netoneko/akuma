@@ -2393,25 +2393,42 @@ fn spawn_child_thread_and_publish(
     Ok(tid)
 }
 
-/// Fork the current process (deep copy)
-/// Returns the new PID to the parent.
+/// **Populate a fork child's address space from its parent** — the AArch64
+/// implementation, and the one `akuma-kernel-glue` registers as
+/// [`crate::ExecRuntime::fork_share_memory`].
 ///
-/// **Locks:** `clone_deep_for_fork` and the lazy-region snapshot take
-/// `SharedFdTable` / the parent's `Process::lazy_regions` only inside short
-/// `with_irqs_disabled` windows. The long eager copies do **not** hold those locks,
-/// so fork is not expected to deadlock the fd table or either process's
-/// lazy-region map. A pathological
-/// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
-pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
-    // Serialize lifecycle against preemption under shared-kernel SMP. See
-    // `process/lifecycle.rs`. The guard drops on every return path (including `?`
-    // early-returns), so the lock is released exactly when the function exits.
-    let _lifecycle = LifecycleGuard::acquire();
-    lifecycle_trace("[FORK-DBG] fork_process ENTRY\n");
-    if (runtime().is_memory_low)() {
-        return Err("Kernel memory low, cannot fork");
-    }
-    let parent = current_process_shared().ok_or("No current process")?;
+/// This is `fork_process`'s step 4, lifted verbatim into a function so that the
+/// *decision* of how a child's memory is built can be registered rather than
+/// compiled in. Nothing about what it does changed in the lift.
+///
+/// # Why this needed a seam at all
+///
+/// It reads as architecture-neutral and it is not. Every page it looks at goes
+/// through `translate_user_va` / `collect_mapped_pages_with_flags_into` /
+/// `for_each_mapped_user_pte` / `demote_range_to_ro` — an `akuma-mmu` family
+/// that takes a raw `*const u64` root and walks it with **AArch64 descriptor
+/// semantics**: `flags::VALID`, `flags::TABLE`, the ARM block/table
+/// distinction, and `AP_RO_ALL`/`UXN`/`PXN` for permissions. None of it is
+/// `#[cfg]`-gated, so it compiles for x86_64 and would happily be handed a
+/// PML4.
+///
+/// The bits do not disagree loudly, they **near-miss**: ARM's `VALID` is bit 0
+/// and so is x86's `Present`; ARM's `TABLE` is bit 1, where x86 has `R/W`. A
+/// walk would descend or stop according to whether the parent's pages happen to
+/// be writable and build a child whose address space is garbage, with nothing
+/// returning an error. That is why the seam is a hook and not a `cfg`: the
+/// other kernel does not want a variant of this function, it has a correct
+/// implementation of the same job already (`amd64`'s `Image::fork_of`, over
+/// `UserAddressSpace::rewrite_leaves_in_range` — the leaf iterator that *does*
+/// have both arms).
+///
+/// `parent_pid`/`parent_tgid` are read off `parent` rather than passed: they
+/// were locals of `fork_process` and a caller that disagreed with the `Process`
+/// it just handed over is a class of bug worth not having.
+pub fn fork_share_parent_memory(
+    parent: &Process,
+    new_proc: &mut Process,
+) -> Result<(), &'static str> {
     let parent_pid = parent.pid;
     // Lazy mmap regions are keyed by *thread-group id* (see `mmap` →
     // `push_lazy_region(proc.tgid, …)`): every thread sharing this address space
@@ -2423,45 +2440,6 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // never replicated (docs/RUST_TOOLCHAIN.md §4). For a single-threaded
     // process pid == tgid, so this is a no-op there.
     let parent_tgid = parent.tgid;
-
-    if lifecycle_trace_on() {
-        crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
-            parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end.load(Ordering::Relaxed),
-            parent.mmap_regions.lock().len(),
-            parent.lazy_regions.lock().len());
-    }
-
-    // 1. Create new address space
-    let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
-    mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=fork parent={}\n",
-        child_pid, new_address_space.l0_phys(), new_address_space.asid(), parent_pid));
-
-    // 2. Allocate process info page
-    let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
-    track_frame(process_info_frame, FrameSource::UserData);
-    
-    new_address_space
-        .map_page(
-            PROCESS_INFO_ADDR,
-            process_info_frame.addr,
-            mmu::user_flags::RO_NO_EXEC,
-        )
-        .map_err(|_| "Failed to map process info")?;
-    new_address_space.track_user_frame(process_info_frame);
-
-    // 3. Create Process struct (fallible allocation to avoid kernel panic on OOM)
-    let mut new_proc = Process::inherit_from(parent, InheritOverrides {
-        pid: child_pid,
-        tgid: child_pid, // fork creates a new thread group
-        address_space: new_address_space,
-        process_info_phys: process_info_frame.addr,
-        fds: Arc::new(parent.fds.clone_deep_for_fork()),
-        // A COPY of the parent's dispositions, not a fresh table: POSIX says
-        // fork inherits them. See `SharedSignalTable::clone_for_fork`.
-        signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
-        clear_child_tid: 0,
-    })?;
-
     // 4. Perform memory copy
     let stack_top = parent.memory.stack_top.load(Ordering::Relaxed);
     let stack_size = config().user_stack_size; 
@@ -2663,7 +2641,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             lazy_regions_snapshot(parent_tgid)
                 .map(|m| m.into_values().collect())
                 .unwrap_or_default();
-        propagate_lazy_regions_to_child(&parent_lazy_regions, &new_proc);
+        propagate_lazy_regions_to_child(&parent_lazy_regions, new_proc);
 
         // Per-chunk PTE snapshot buffer, reserved ONCE here so no `as_lock` hold below
         // ever has to grow it (see `FORK_AS_CHUNK_PAGES`).
@@ -2916,7 +2894,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 lazy_regions_snapshot(parent_tgid)
                     .map(|m| m.into_values().collect())
                     .unwrap_or_default();
-            propagate_lazy_regions_to_child(&parent_regions, &new_proc);
+            propagate_lazy_regions_to_child(&parent_regions, new_proc);
             let num_regions = parent_regions.len();
             let mut lazy_pages_copied = 0usize;
             let mut lazy_pages_scanned = 0usize;
@@ -2955,6 +2933,75 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
         lifecycle_trace("[FORK-DBG] step4: lazy done\n");
     }
+    Ok(())
+}
+
+/// Fork the current process (deep copy)
+/// Returns the new PID to the parent.
+///
+/// **Locks:** `clone_deep_for_fork` and the lazy-region snapshot take
+/// `SharedFdTable` / the parent's `Process::lazy_regions` only inside short
+/// `with_irqs_disabled` windows. The long eager copies do **not** hold those locks,
+/// so fork is not expected to deadlock the fd table or either process's
+/// lazy-region map. A pathological
+/// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
+pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    // Serialize lifecycle against preemption under shared-kernel SMP. See
+    // `process/lifecycle.rs`. The guard drops on every return path (including `?`
+    // early-returns), so the lock is released exactly when the function exits.
+    let _lifecycle = LifecycleGuard::acquire();
+    lifecycle_trace("[FORK-DBG] fork_process ENTRY\n");
+    if (runtime().is_memory_low)() {
+        return Err("Kernel memory low, cannot fork");
+    }
+    let parent = current_process_shared().ok_or("No current process")?;
+    let parent_pid = parent.pid;
+    // (The thread-group id the lazy-region enumeration keys off now lives with
+    // the code that uses it — `fork_share_parent_memory` reads it off `parent`.)
+
+    if lifecycle_trace_on() {
+        crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
+            parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end.load(Ordering::Relaxed),
+            parent.mmap_regions.lock().len(),
+            parent.lazy_regions.lock().len());
+    }
+
+    // 1. Create new address space
+    let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
+    mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=fork parent={}\n",
+        child_pid, new_address_space.l0_phys(), new_address_space.asid(), parent_pid));
+
+    // 2. Allocate process info page
+    let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
+    track_frame(process_info_frame, FrameSource::UserData);
+    
+    new_address_space
+        .map_page(
+            PROCESS_INFO_ADDR,
+            process_info_frame.addr,
+            mmu::user_flags::RO_NO_EXEC,
+        )
+        .map_err(|_| "Failed to map process info")?;
+    new_address_space.track_user_frame(process_info_frame);
+
+    // 3. Create Process struct (fallible allocation to avoid kernel panic on OOM)
+    let mut new_proc = Process::inherit_from(parent, InheritOverrides {
+        pid: child_pid,
+        tgid: child_pid, // fork creates a new thread group
+        address_space: new_address_space,
+        process_info_phys: process_info_frame.addr,
+        fds: Arc::new(parent.fds.clone_deep_for_fork()),
+        // A COPY of the parent's dispositions, not a fresh table: POSIX says
+        // fork inherits them. See `SharedSignalTable::clone_for_fork`.
+        signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
+        clear_child_tid: 0,
+    })?;
+
+    // 4. Build the child's address space from the parent's — through the
+    // registered hook, because this step and only this step is architecture
+    // work. See `fork_share_parent_memory` for what it is and why it cannot be
+    // shared code the way the rest of this function is.
+    (runtime().fork_share_memory)(parent, &mut new_proc)?;
 
     lifecycle_trace("[FORK-DBG] step4: done, entering step5\n");
 

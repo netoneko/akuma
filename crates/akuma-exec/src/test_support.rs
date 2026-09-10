@@ -120,6 +120,9 @@ pub fn ensure_test_runtime() {
         // it means a host test called `Process::run`, which would have been an
         // `eret` (or a `sysret`) in the kernel.
         enter_user: |_| panic!("ExecRuntime::enter_user on a host build"),
+        // The real one walks page tables. A host test that reaches it wanted a
+        // kernel, so say so rather than silently building an empty child.
+        fork_share_memory: |_, _| Err("fork_share_memory on a host build"),
     };
     let cfg = ExecConfig {
         max_threads: 64,

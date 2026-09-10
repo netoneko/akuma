@@ -1254,17 +1254,21 @@ parity with what the AArch64 self-host already proves.
   │    ✔ 3  CHILD_CHANNELS + wait4 is glue's. An exit channel per  │
   │           child; this target's wait loop and waiter bitmap are │
   │           deleted; ECHILD-for-a-non-child, EINTR, rusage.      │
-  │    ✖ 4  **the memory pass needs an arch seam** — and this, not │
-  │           CHILD_CHANNELS, is what blocks fork_process.         │
-  │           translate_user_va / collect_mapped_pages_with_flags  │
-  │           / for_each_mapped_user_pte / demote_range_to_ro are  │
-  │           an un-cfg'd AArch64 walker: ARM VALID/TABLE where    │
-  │           x86 has Present/R/W, so a PML4 walks SILENTLY wrong. │
-  │           amd64 already does it right via rewrite_leaves_in_   │
-  │           range. Make the pass a hook (§4's argument), then    │
-  │           fork_process folds; clone is a separate step.        │
-  │           Also stubbed: get_saved_user_context (None) and      │
-  │           spawn_user_closure_initializing (Err).               │
+  │    ✔ 4  the memory pass has its seam. ExecRuntime::fork_share_ │
+  │           memory; step 4 is one call. AArch64 registers it     │
+  │           verbatim (493 lines lifted, .text +2532 B, same 283  │
+  │           tests side by side); amd64 registers a walk over     │
+  │           rewrite_leaves_in_range — Image::fork_of's existing  │
+  │           pass, now with two callers. It had to be a hook, not │
+  │           a cfg: the shared walker reads ARM VALID/TABLE where │
+  │           x86 has Present/R/W, so a PML4 walked SILENTLY wrong.│
+  │    ✖ 5  the fold. Two loud stubs first:                        │
+  │           get_saved_user_context (None — the read mirror of    │
+  │           slice 2's writer, one hook) and                      │
+  │           spawn_user_closure_initializing (Err — an amd64 task │
+  │           carries a space_root + proc_slot shared code has no  │
+  │           concept of; before_ready is where they go).          │
+  │           Then clone, as its own step.                         │
   │  ◐ Spawn: the stdin write end is reached by PATH, so the row   │
   │           keeps 2 real fields. **wait4 is DONE** (slice 3).    │
   │   keeps: syscall/sysret asm, swapgs bracketing (= el0-entry    │

@@ -138,6 +138,12 @@ fn runtime() -> ExecRuntime {
         // entry. See `usermode::enter_ring3` and
         // `akuma_exec::ExecRuntime::enter_user`.
         enter_user: crate::usermode::enter_ring3,
+        // The fork memory pass. **Not a stub and not a no-op**: the shared
+        // implementation is an AArch64 page-table walker that compiles here and
+        // would walk a PML4 by ARM rules, so this target has to supply its own.
+        // See `usermode::fork_share_memory` — it is the walk `Image::fork_of`
+        // already used, pointed at a child `fork_process` built.
+        fork_share_memory: crate::usermode::fork_share_memory,
         // The same clock `threading::ThreadRuntime` was already given, so the
         // scheduler and `akuma-exec` cannot disagree about what time it is.
         uptime_us: crate::net::uptime_us,
