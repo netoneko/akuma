@@ -3358,7 +3358,6 @@ fn test_spawn_ext_passes_env() {
             core::mem::size_of::<crate::syscall::proc::SpawnOptions>() as u64,
             0, 0, 0,
         ]);
-        unregister_at_syscall_process(pid, tid);
         if (r as i64) < 0 {
             return alloc::string::String::from("<spawn failed>");
         }
@@ -3380,6 +3379,14 @@ fn test_spawn_ext_passes_env() {
             }
             akuma_exec::threading::yield_now();
         }
+        // The drain MUST precede `unregister_at_syscall_process`: SPAWN_EXT stored
+        // the child's `ChildStdout` fd in THIS fake parent's fd table, and once the
+        // parent is retired and its slot reclaimed, `FdTable::drop → close_all`
+        // removes the child channel with whatever the child wrote still buffered.
+        // Under KVM (lima) the child finishes and the reclaim lands within ~11
+        // scheduler yields, so the drain then saw no channel at all and both cases
+        // read empty output (docs/archive/AKUMA_SELF_HOSTING_AMD64.md issue 4).
+        unregister_at_syscall_process(pid, tid);
         alloc::string::String::from_utf8_lossy(&out).into_owned()
     }
 
