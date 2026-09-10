@@ -2638,7 +2638,7 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
                 u64::from(u16::from_le_bytes(p2[14..16].try_into().unwrap_or([0; 2]))) & 0x004,
                 0x004,
             );
-            let byte = [b'x'];
+            let byte = *b"x";
             t.check_eq("fd: write one byte into the pipe", sys_write_file(wfd, byte.as_ptr() as u64, 1), 1);
             t.check_eq(
                 "fd: poll now reports both ends",
