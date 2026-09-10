@@ -1243,17 +1243,30 @@ parity with what the AArch64 self-host already proves.
   │           fd.rs 4454 → 3008. **The syscall arms are DONE**;    │
   │           what is left is the console/`/dev` preambles, which   │
   │           the ProcessChannel item retires as one piece.         │
-  │  ◐ THE RING-3 ENTRY SEAM ◀── IN PROGRESS, slice 1 of 4 landed. │
-  │           UserContext is split and fork_process COMPILES for   │
-  │           x86_64; the aarch64 kernel is byte-identical.        │
-  │           Slice 2 = the return shape (run() erets and never    │
-  │           returns; amd64's enter_user RETURNS a status).       │
-  │           An x86 arm for "enter userspace                      │
-  │           with this process's first context". fork_process     │
-  │           `eret`s from a UserContext; amd64 has no eret. This  │
-  │           is what "5c" turned out to be, and it is 5b-sized.   │
-  │  ✖ Spawn (3 fields now) and wait4: the stdin write end is      │
-  │           reached by PATH, and wait4 needs a source decision.  │
+  │  ◐ THE RING-3 ENTRY SEAM ◀── IN PROGRESS, slices 1-3 of 4.     │
+  │    ✔ 1  UserContext split; fork_process COMPILES for x86_64;   │
+  │           the aarch64 kernel came out byte-identical.          │
+  │    ✔ 2  the return shape — run() erets and never returns while │
+  │           amd64's enter_user RETURNS a status. ExecRuntime::   │
+  │           enter_user; amd64 enters ring 3 through the shared   │
+  │           Process::run now. update_thread_context gets its x86 │
+  │           arm. aarch64 .text +28 B, 284 self-tests side by side│
+  │    ✔ 3  CHILD_CHANNELS + wait4 is glue's. An exit channel per  │
+  │           child; this target's wait loop and waiter bitmap are │
+  │           deleted; ECHILD-for-a-non-child, EINTR, rusage.      │
+  │    ✖ 4  **the memory pass needs an arch seam** — and this, not │
+  │           CHILD_CHANNELS, is what blocks fork_process.         │
+  │           translate_user_va / collect_mapped_pages_with_flags  │
+  │           / for_each_mapped_user_pte / demote_range_to_ro are  │
+  │           an un-cfg'd AArch64 walker: ARM VALID/TABLE where    │
+  │           x86 has Present/R/W, so a PML4 walks SILENTLY wrong. │
+  │           amd64 already does it right via rewrite_leaves_in_   │
+  │           range. Make the pass a hook (§4's argument), then    │
+  │           fork_process folds; clone is a separate step.        │
+  │           Also stubbed: get_saved_user_context (None) and      │
+  │           spawn_user_closure_initializing (Err).               │
+  │  ◐ Spawn: the stdin write end is reached by PATH, so the row   │
+  │           keeps 2 real fields. **wait4 is DONE** (slice 3).    │
   │   keeps: syscall/sysret asm, swapgs bracketing (= el0-entry    │
   │          shape on AArch64) — the floor, ~900 lines. usermode.rs│
   │          never reaches zero; see § "usermode.rs's floor".      │
@@ -1266,7 +1279,7 @@ parity with what the AArch64 self-host already proves.
   │   file is GONE; reads  │ │   itimers, adjtimex                 │
   │   go at fs::read_at.   │ │                                     │
   │   LEFT: refcount flip, │ │                                     │
-  │   Spawn, wait4         │ │                                     │
+  │   Spawn (wait4 done)   │ │                                     │
   └───────────┬────────────┘ └────────────────┬────────────────────┘
               └───────────────┬───────────────┘
                               ▼
