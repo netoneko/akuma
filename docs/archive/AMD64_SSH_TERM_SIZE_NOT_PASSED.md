@@ -1,10 +1,11 @@
 # amd64: an ssh session's terminal size and `TERM` never reach the shell
 
 **Date:** 2026-09-10
-**Status:** **FIXED** 2026-09-10, verified end to end by the §6 recipe on the
-rig the bug was measured on. Diagnosed as five breaks; fixing them surfaced
-**two more** that the original diagnosis could not see, because the first five
-masked them (§7).
+**Status:** **FIXED** 2026-09-10, verified end to end by the §6 recipe — on the
+QEMU stand-in, under KVM on the dumpster, and **on the bare metal**, which is
+where the bug was measured in the first place. Diagnosed as five breaks; fixing
+them surfaced **two more** that the original diagnosis could not see, because
+the first five masked them (§7).
 **Symptom:** a full-screen program over ssh always behaved as if the terminal is
 80×24, whatever the real window was, and `TERM` was empty.
 **Grade:** B for the subsystem (verify behaviour) — was C; the measurement is A.
@@ -49,6 +50,13 @@ also the check on break 9.
 Without `-tt` the client sends no `pty-req` and the answer is still `24 80` /
 `TERM=[]`. That is correct and is checked deliberately: a non-interactive
 `ssh host cmd < file` must keep getting a pipe.
+
+**On the metal.** The same recipe against the HP box booted from its GRUB entry
+(`/boot/akuma`, `init=/bin/sshd`, ssh on `192.168.1.220:2222`) reports the real
+window and the client's `TERM`, confirmed 2026-09-10. That closes the loop: the
+`24 80` at the top of this section and the pass below were measured on the same
+machine, over the same path, either side of the fix — which is the only
+comparison that settles a bug whose whole character was answering plausibly.
 
 ## 2. Where it breaks — the size, by ioctl
 
@@ -193,12 +201,13 @@ always used — same caps, same stack builder, no new code below the syscall.
 
 ## 4. Which rig shows what
 
-The amd64 column was measured before and after. The AArch64 column is **read off
-the code, not observed in this session** — the fix landed against the amd64 rig
-and the AArch64 image was not re-staged to carry the new `sshd`. The shared
-breaks (6, 7, 10) are covered by host unit tests and by the amd64 run, which
-executes the same `userspace/` source; run §6 against an AArch64 rig with a
-freshly populated disk to fill the column in.
+The amd64 column was measured before and after, on three rigs: the QEMU
+`-M microvm` stand-in, `qrun2.sh` under KVM on the dumpster, and the bare metal.
+The AArch64 column is **read off the code, not observed** — the fix landed
+against the amd64 rig and the AArch64 image was not re-staged to carry the new
+`sshd`. The shared breaks (6, 7, 10) are covered by host unit tests and by the
+amd64 runs, which execute the same `userspace/` source; run §6 against an
+AArch64 rig with a freshly populated disk to fill the column in.
 
 | break | amd64 | AArch64 (inferred) |
 |---|---|---|
