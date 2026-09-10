@@ -1523,7 +1523,7 @@ pub(super) fn sys_pvec2(
     pvec_at(fd_num, iov_ptr, iov_cnt, pos_l as i64, write)
 }
 
-pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
+pub fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
     // Resolve the fd's path to the mount it sits on and report that mount's
     // real statistics. Before 2026-08-24 this returned hardcoded fiction
     // (f_type=0xEF53, 65536 blocks) for every fd, so `df`-style tools sized
@@ -1592,7 +1592,7 @@ pub(super) fn statfs_into(view: &akuma_vfs_glue::FsView, buf_ptr: u64) -> u64 {
 /// `statfs(2)` (nr 43) — resolve `path` the way file operations do and report
 /// the mount it lands on. Undispatched before 2026-08-24, which is what broke
 /// busybox `df`.
-pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
+pub fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
     let path = copy_from_user_str(path_ptr, 256)?;
     match akuma_vfs_glue::stats_for_path(&path) {
         Ok(view) => Ok(statfs_into(&view, buf_ptr)),
@@ -2215,11 +2215,16 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
     } else { ESRCH }
 }
 
-pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
-    let stat_size = core::mem::size_of::<Stat>();
-    if !validate_user_ptr(stat_ptr, stat_size) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
-    
+/// `fstat(2)` without the user copy — the `struct stat` (asm-generic layout) an
+/// open descriptor describes, or a negated errno.
+///
+/// Split out (4b batch 3b) so the amd64 kernel can re-lay the result in the
+/// x86_64 layout before writing it — the same seam batch 2d drew for
+/// `sys_openat`/`openat_path`. `pub`, and the caller does the `validate_user_ptr`
+/// + `write_user_val` its own layout needs.
+pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
+    let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
+
     let mut stat = Stat::default();
     let res = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
@@ -2292,20 +2297,40 @@ akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
+        // Sockets had no arm here and fell to `_ => EBADF` — so `fstat` of a
+        // socket fd told the caller its descriptor was closed. Linux answers
+        // `S_IFSOCK | 0777`. Found while folding the amd64 `fstat` arm, which
+        // had always answered this; the fix is here so both kernels get it
+        // (`docs/archive/AKUMA_AMD64_4B_FOLD_BATCH3B.md` §4).
+        Some(akuma_exec::process::FileDescriptor::Socket(_) |
+akuma_exec::process::FileDescriptor::UnixSocket { .. } |
+akuma_exec::process::FileDescriptor::RumpSocket { .. }) => {
+            stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o140777, st_nlink: 1, st_blksize: 4096, ..Default::default() };
+            0
+        }
         _ => EBADF,
     };
-    
-    if res == 0 && write_user_val(stat_ptr, &stat).is_err() {
-        return EFAULT;
-    }
-    res
+
+    if res == 0 { Ok(stat) } else { Err(res) }
 }
 
-pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> SysResult {
-    let path = copy_from_user_str(path_ptr, 512)?;
-    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(EFAULT); }
+pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
+    match fstat_fill(fd) {
+        Ok(stat) => {
+            if write_user_val(stat_ptr, &stat).is_err() { EFAULT } else { 0 }
+        }
+        Err(e) => e,
+    }
+}
 
-    let resolved_path = resolve_path_at(dirfd, &path)?;
+/// `newfstatat(2)` without the user copy — see [`fstat_fill`] for the seam.
+///
+/// `path` is already in kernel memory and is resolved against `dirfd` here;
+/// `AT_EMPTY_PATH` is the caller's to handle (it redirects to [`fstat_fill`]).
+pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, u64> {
+    let _flags = flags;
+    let resolved_path = resolve_path_at(dirfd, path)?;
 
     // Path resolution + `metadata` below are pure VFS work — run them BKL-free.
     let _vfs_bkl = VfsBklGuard::new();
@@ -2389,10 +2414,26 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         ENOENT
     })();
 
-    if res == 0 && write_user_val(stat_ptr, &stat).is_err() {
-        return Err(EFAULT);
-    }
-    Ok(res)
+    if res == 0 { Ok(stat) } else { Err(res) }
+}
+
+pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, flags: u32) -> SysResult {
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    let path = copy_from_user_str(path_ptr, 512)?;
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(EFAULT); }
+
+    let stat = if path.is_empty() {
+        if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
+            fstat_fill(dirfd as u32)?
+        } else {
+            return Err(ENOENT);
+        }
+    } else {
+        newfstatat_fill(dirfd, &path, flags)?
+    };
+
+    if write_user_val(stat_ptr, &stat).is_err() { return Err(EFAULT); }
+    Ok(0)
 }
 
 pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
@@ -2500,7 +2541,7 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
     }
 }
 
-pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> SysResult {
+pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> SysResult {
     // Early-out before any fs work; the copy at the end validates again for real. Sized
     // from the struct so the two can no longer disagree.
     if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return Err(EFAULT); }

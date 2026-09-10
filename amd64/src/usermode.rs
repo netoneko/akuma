@@ -1275,6 +1275,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // here.
         Syscall::Reboot => crate::reboot::sys_reboot(a1, a2, a3, a4),
         Syscall::Newfstatat => crate::fd::sys_newfstatat(a1, a2, a3, a4),
+        // `statx` — arch-neutral struct, so this is glue's arm with no
+        // preamble. New on this target (4b batch 3b); was `ENOSYS`.
+        Syscall::Statx => crate::fd::sys_statx(a1, a2, a3, a4, a5),
         Syscall::Faccessat => crate::fd::sys_access(a2),
         // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
         // signature-verification I/O setup; `ENOSYS` here made it report

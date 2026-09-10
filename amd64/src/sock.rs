@@ -494,6 +494,21 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     // Operations on a descriptor that is not a socket must say so.
     t.check_eq("sock: bind on a non-socket is ENOTSOCK", sys_bind(1, sa.as_ptr() as u64, 16), errno::ENOTSOCK);
 
+    // `fstat` on a socket fd is `S_IFSOCK`, not `EBADF`. Glue's `fstat_fill`
+    // had no `Socket` arm and fell to `_ => EBADF` — so `fstat(socket)` told a
+    // caller its descriptor was closed. The arm (and this check) landed with
+    // the amd64 `fstat` fold, 4b batch 3b, and the fix is in glue so both
+    // kernels get it.
+    {
+        let mut st = [0u8; 144];
+        t.check_eq("sock: fstat on a socket succeeds", crate::fd::sys_fstat(fd, st.as_mut_ptr() as u64), 0);
+        t.check_eq(
+            "sock: and reports S_IFSOCK",
+            u64::from(u32::from_le_bytes(st[24..28].try_into().unwrap_or([0; 4])) & 0o170_000),
+            0o140_000,
+        );
+    }
+
     t.check_eq("sock: close", fd::sys_close(fd), 0);
 
     let drained = crate::fd::boot_row_release(boot_tid);

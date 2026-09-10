@@ -41,6 +41,17 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   the same way as `futexops`: on real Linux it is 19 PASS + 1 DIVERGE
   (`O_TMPFILE`, which Linux supports). 20/20 on Akuma/amd64, QEMU and bare
   metal, as of 2026-09-10.
+- `lazybuf` — every syscall that **writes into** user memory, aimed at a page
+  the process has never touched (`read`, `pread64`, `fstat`, `newfstatat`,
+  `statx`, `getdents64`), with a `TOUCHED` control that does the identical call
+  after one store. Written for the amd64 C1 4b fold: `akuma-syscalls-glue`'s
+  arms `validate_user_ptr` first, which walks the page table and prefaults on a
+  miss, and amd64 had registered no prefault hook — so a freshly `mmap`ed
+  destination was `EFAULT` and `apk` reported its own database corrupt. The
+  mapping is **1 MiB on purpose**: a 64 KiB one is `MMAP_EAGER_MAX_PAGES` and
+  passes against the broken kernel. 8/8 on Akuma/amd64 QEMU + bare metal; 3
+  FAIL with the hook unregistered.
+  (`docs/archive/AKUMA_AMD64_4B_FOLD_BATCH{3A,3B}.md`)
 - `dynspawn` + `dynchild` — hammer vfork+exec of a **dynamically linked** binary
   and check the loader gets each child to `main`. Both binaries are dynamic on
   purpose: musl implements `posix_spawn` with `CLONE_VM|CLONE_VFORK`, so the

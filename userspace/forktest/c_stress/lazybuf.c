@@ -171,12 +171,13 @@ static void probe_fstat(const char *path)
      * stack `struct stat` and copy out, which would hide the very thing this
      * asks about.
      *
-     * This one **passed against the broken kernel** and that is not a flaw in
-     * it: `fstat` is not an `akuma-syscalls-glue` arm on amd64 yet (4b batch 3a
-     * folded `read`/`pread64`/`getdents64`/`write`/`lseek` and stopped short of
-     * the `stat` family, which needs a `struct stat` layout hop). It is here so
-     * that the day `fstat` folds, this line starts asking the question rather
-     * than having to be remembered. */
+     * `fstat` folded into `akuma-syscalls-glue` in 4b batch 3b (via
+     * `akuma_syscalls_abi::stat::to_x86_64` — `struct stat` is 144 bytes on
+     * x86_64 against 128 on asm-generic), so this line now asks the same
+     * prefault question of glue's `fstat_fill` that `probe_read` asks of
+     * `sys_read`. It passed against the pre-3a kernel because the arm was
+     * local then; a regression that unregisters the prefault hook turns it
+     * red now. */
     if (syscall(SYS_fstat, fd, buf) < 0)
         no(what, strerror(errno));
     else if (((struct stat *)buf)->st_size == 0)
@@ -184,6 +185,44 @@ static void probe_fstat(const char *path)
     else
         ok(what);
     close(fd);
+    munmap(buf, BUF_BYTES);
+}
+
+static void probe_newfstatat(const char *path)
+{
+    const char *what = "newfstatat(2) into an untouched mmap page";
+    void *buf = fresh();
+    if (!buf) { skip(what, "mmap failed"); return; }
+#ifdef SYS_newfstatat
+    if (syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0) < 0)
+        no(what, strerror(errno));
+    else if (((struct stat *)buf)->st_size == 0)
+        no(what, "st_size came back 0 for a file with bytes in it");
+    else
+        ok(what);
+#else
+    skip(what, "no SYS_newfstatat");
+#endif
+    munmap(buf, BUF_BYTES);
+}
+
+static void probe_statx(const char *path)
+{
+    const char *what = "statx(2) into an untouched mmap page";
+    void *buf = fresh();
+    if (!buf) { skip(what, "mmap failed"); return; }
+#ifdef SYS_statx
+    /* mask STATX_SIZE (0x200). The kernel writes the whole struct regardless
+     * of mask, so any nonzero write proves the page was reachable. */
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, 0x200, buf) < 0)
+        no(what, strerror(errno));
+    else if (((struct statx *)buf)->stx_size == 0)
+        no(what, "stx_size came back 0 for a file with bytes in it");
+    else
+        ok(what);
+#else
+    skip(what, "no SYS_statx");
+#endif
     munmap(buf, BUF_BYTES);
 }
 
@@ -221,6 +260,8 @@ int main(void)
         probe_read(path, 1);
         probe_pread(path);
         probe_fstat(path);
+        probe_newfstatat(path);
+        probe_statx(path);
     }
     probe_getdents();
     probe_write_from_fresh();

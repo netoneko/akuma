@@ -1823,307 +1823,117 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
     akuma_syscalls_glue::fs::sys_getdents64(fd as u32, dirp, count as usize)
 }
 
-/// The x86_64 `struct stat` — 144 bytes. **Not** the aarch64 layout: x86_64
-/// puts `st_nlink` at 16 (8 bytes) and `st_mode` at 24, where `asm-generic`
-/// has `st_mode` at 16 and `st_nlink` at 20. This is why `akuma-syscalls-linux`'s
-/// `Stat` cannot be reused here — its field offsets are the other architecture's
-/// (proposal item 5 territory).
-const STAT_SIZE: usize = 144;
+/// The size of the x86_64 `struct stat` this target writes — 144 bytes, pinned
+/// by `offset_of!` assertions in `akuma_syscalls_abi::stat`. Only the boot
+/// suite still names it, to size the buffers it reads fields back out of.
+#[cfg(not(feature = "no-tests"))]
+const STAT_SIZE: usize = core::mem::size_of::<akuma_syscalls_abi::stat::X8664>();
 
-/// `S_IFREG | 0644` — a plain file whose real mode the target does not track for
-/// an already-open fd (`KernelFile` here carries no inode).
-const S_IFREG_0644: u32 = 0o100_644;
-/// `S_IFCHR | 0620`, for the console descriptors.
-const S_IFCHR_0620: u32 = 0o020_620;
-/// `S_IFDIR | 0755`, for a directory descriptor.
-const S_IFDIR_0755: u32 = 0o040_755;
-/// `S_IFIFO | 0600`, for a pipe descriptor.
+/// `fstat(fd, statbuf)` — **glue's `fstat_fill`** (4b batch 3b) behind two
+/// answers this target keeps, then the x86_64 layout conversion.
 ///
-/// Needed from C2 slice 6, which is when a spawned child first *had* one at
-/// fd 1: `entry.file()` is `None` for a pipe, so the size/path arm below fell
-/// straight through to `EBADF` — a program that `fstat`s its own stdout (musl's
-/// stdio does, and so does every `test -p`) would have been told the descriptor
-/// it is holding does not exist.
-const S_IFIFO_0600: u32 = 0o010_600;
-/// `S_IFSOCK | 0600`, for a socket descriptor. Same reason as [`S_IFIFO_0600`],
-/// one variant along.
-const S_IFSOCK_0600: u32 = 0o140_600;
-
-/// Serialise a `struct stat` at the x86_64 field offsets. The fields this target
-/// can answer are filled; the rest stay zero rather than invented — a caller
-/// that reads `st_dev` gets 0, which is wrong but is not a plausible-looking lie.
-fn encode_stat(
-    mode: u32,
-    size: u64,
-    ino: u64,
-    nlink: u64,
-    atime: Option<u64>,
-    mtime: Option<u64>,
-    ctime: Option<u64>,
-) -> [u8; STAT_SIZE] {
-    const ST_INO: usize = 8;
-    const ST_NLINK: usize = 16;
-    const ST_MODE: usize = 24;
-    const ST_SIZE: usize = 48;
-    const ST_BLKSIZE: usize = 56;
-    const ST_BLOCKS: usize = 64;
-    const ST_ATIME: usize = 72;
-    const ST_MTIME: usize = 88;
-    const ST_CTIME: usize = 104;
-
-    let mut st = [0u8; STAT_SIZE];
-    st[ST_INO..ST_INO + 8].copy_from_slice(&ino.to_le_bytes());
-    st[ST_NLINK..ST_NLINK + 8].copy_from_slice(&nlink.to_le_bytes());
-    st[ST_MODE..ST_MODE + 4].copy_from_slice(&mode.to_le_bytes());
-    st[ST_SIZE..ST_SIZE + 8].copy_from_slice(&size.to_le_bytes());
-    st[ST_BLKSIZE..ST_BLKSIZE + 8].copy_from_slice(&4096u64.to_le_bytes());
-    st[ST_BLOCKS..ST_BLOCKS + 8].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-    st[ST_ATIME..ST_ATIME + 8].copy_from_slice(&atime.unwrap_or(0).to_le_bytes());
-    st[ST_MTIME..ST_MTIME + 8].copy_from_slice(&mtime.unwrap_or(0).to_le_bytes());
-    st[ST_CTIME..ST_CTIME + 8].copy_from_slice(&ctime.unwrap_or(0).to_le_bytes());
-    st
-}
-
-/// `fstat(fd, statbuf)` — `struct stat` for an already-open descriptor.
+/// `struct stat` is the **third architecture vocabulary**, after the syscall
+/// numbers (C1 step 1) and `open(2)`'s flag word (4b prerequisites): x86_64 is
+/// 144 bytes with `st_nlink` 8-wide at offset 16 and `st_mode` at 24, where
+/// `asm-generic` is 128 with `st_nlink` 4-wide at 20 and `st_mode` at 16. Glue
+/// fills the asm-generic `Stat`; `akuma_syscalls_abi::stat::to_x86_64` re-lays
+/// it. This used to be a hand-rolled `encode_stat` writing literal offsets into
+/// a `[u8; 144]`, under a comment calling it "proposal item 5 territory" — that
+/// item is `akuma_syscalls_abi::stat`, with `offset_of!` assertions on every
+/// one of those literals.
 ///
-/// The size comes from the VFS
-/// for a real file; the mode is a fixed `S_IFREG | 0644` because a
-/// `KernelFile` on this target carries no inode to read a real one from. A
-/// console descriptor reports `S_IFCHR`, a directory descriptor `S_IFDIR` —
-/// musl's `fdopendir` fstats the fd and refuses it with `ENOTDIR` unless
-/// `S_ISDIR` holds, so `ls`/`find` need this to be right, not just `openat`
-/// succeeding.
+/// # The preamble: the by-number console
+///
+/// An **unbound** 0/1/2 is the serial console (a kernel thread, the boot row
+/// before its stdio was wired). Glue resolves `current_process_shared().get_fd`
+/// and would answer `EBADF` for a descriptor that is not in a table at all;
+/// this target has always reported `S_IFCHR` for it, which is what `isatty(3)`
+/// on those numbers needs. A *bound* Stdin/Stdout/Stderr goes to glue, which
+/// gives the richer answer (`st_rdev` = `makedev(136, 0)`, the pts major).
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    let (mode, size, nlink) = if console_end(fd).is_some() {
-        (S_IFCHR_0620, 0u64, 1u64)
-    } else if pipe_read_id(fd).is_some() || pipe_write_id(fd).is_some() {
-        // C2 slice 6: a spawned child's fd 0/1/2 are pipes, and a pipe has no
-        // `KernelFile` for the arm below to take a path out of.
-        (S_IFIFO_0600, 0u64, 1u64)
-    } else if socket_index(fd).is_some() {
-        (S_IFSOCK_0600, 0u64, 1u64)
-    } else if dev_node_of(fd).is_some() {
-        // A `/dev` character node: `S_IFCHR`, size 0 — the same answer
-        // `sys_newfstatat` already gives for the same path, which is what
-        // keeps `stat file` and `fstat(open(file))` agreeing.
-        (S_IFCHR_0620, 0u64, 1u64)
-    } else {
-        // Size and shape: from the VFS —
-        // one `metadata` outside the lock, the rule `release_desc` states
-        // about disk I/O under the table lock.
-        //
-        // # This arm answered `EBADF` for every real directory descriptor
-        //
-        // It opened `if entry.is_dir { return None }`, and `None` here is
-        // `EBADF`. The `S_IFDIR` arm below it was never reached by an ext2
-        // directory at all — its `true` is *synthetic*, not *directory*, so
-        // the only descriptors ever reported as directories were `/proc`
-        // views, **including `/proc/meminfo`**, which was told it was a
-        // zero-length directory.
-        //
-        // Measured from ring 3 (`/probes/dirprobe`, x86_64 musl) before the
-        // fix, which is the only reason it was found — this file's own header
-        // says the opposite in prose:
-        //
-        // ```
-        // open(/etc, O_DIRECTORY) = 3 (ok)
-        // fstat(dirfd) = -1 errno=9(Bad file descriptor) mode=00 S_ISDIR=0
-        // fdopendir(dirfd) = NULL (Bad file descriptor)
-        // ```
-        //
-        // busybox never noticed because it walks with `opendir(path)` and
-        // `lstat`, not `fdopendir` — so `ls`, `find` and `ls -R` all work over
-        // a path that this call cannot describe. `fdopendir` is what `nftw`
-        // and most every `openat`-based directory walker are built on, which
-        // is the shape a self-hosting build reaches for.
-        //
-        // Both halves come from the VFS — including `/proc`, whose sizes the
-        // mounted filesystem renders, so `stat` and `fstat` agree by asking one
-        // source rather than by two views being kept in step.
-        let resolved = table_with(fd, |d| match d {
-            FileDescriptor::File(f) => Some(f.path.clone()),
-            _ => None,
-        })
-        .flatten();
-        let Some(path) = resolved else {
-            return errno::EBADF;
+    if console_end(fd).is_some() && !is_bound(fd) {
+        // `S_IFCHR | 0620`, size 0 — the answer the old `encode_stat` gave, in
+        // the x86_64 layout the converter also produces.
+        let g = akuma_syscalls_linux::Stat {
+            st_mode: 0o020_620,
+            st_nlink: 1,
+            st_blksize: 4096,
+            ..Default::default()
         };
-        if path_is_dir(&path) {
-            (S_IFDIR_0755, 0u64, 2u64)
-        } else {
-            match fs::metadata(&path) {
-                Ok(m) => (S_IFREG_0644, m.size, 1u64),
-                // The path resolved at `open` and does not now — an unlinked
-                // file, which this target has no inode pin for. Reported as
-                // the regular file it was rather than as a bad descriptor:
-                // the fd is perfectly valid, and `EBADF` would send a caller
-                // looking at its own bookkeeping.
-                Err(_) => (S_IFREG_0644, 0u64, 1u64),
-            }
-        }
-    };
-    let st = encode_stat(mode, size, 0, nlink, None, None, None);
-    if errno::is_err(copy_to_user(statbuf, &st)) {
-        return errno::EFAULT;
+        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
     }
-    0
+    match akuma_syscalls_glue::fs::fstat_fill(fd as u32) {
+        Ok(g) => {
+            let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+            if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT }
+        }
+        Err(e) => e,
+    }
 }
 
-/// `statfs` magic numbers, keyed by `Filesystem::name()` — the same table the
-/// AArch64 kernel keeps in `akuma-syscalls-glue`. `df` prints the mount's type
-/// from `/proc/mounts`, but anything reading `f_type` (a libc `fstatfs`, a
-/// build system checking for tmpfs) wants the real constant.
-const fn fs_magic(name_is_ext2: bool) -> i64 {
-    if name_is_ext2 { 0xEF53 } else { 0xADF5 }
-}
-
-/// Fill a user `struct statfs` from whichever mount serves `path`.
+/// `statfs(path, buf)` — x86_64 137, **glue's arm** (4b batch 3b).
 ///
-/// The layout is `asm-generic`'s, identical on x86_64 and aarch64, so the
-/// `Statfs` in `akuma-syscalls-linux` — whose 120-byte size and three field
-/// offsets are `const`-asserted there — is shared rather than re-declared. A
-/// re-declaration is exactly how the aarch64 side once shipped a 120 nothing
-/// could check.
-fn statfs_into(path: &str, buf: u64) -> u64 {
-    let view = match fs::stats_for_path(path) {
-        Ok(v) => v,
-        Err(akuma_vfs::FsError::NotFound) => return errno::ENOENT,
-        Err(_) => return errno::ENOSYS,
-    };
-    let (name, stats, flags) = (view.fs_name, view.stats, view.flags);
-    let bs = i64::from(stats.block_size);
-    // Saturating rather than `as`: `struct statfs` is signed and these are not,
-    // and a wrapped block count would make `df` print a negative size instead
-    // of an implausible one. No filesystem reaches the clamp; the point is that
-    // the conversion says what it does.
-    let blocks = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
-    let st = akuma_syscalls_linux::Statfs {
-        f_type: fs_magic(name == "ext2"),
-        f_bsize: bs,
-        f_blocks: blocks(stats.total_blocks),
-        f_bfree: blocks(stats.free_blocks),
-        // No reservation for root on this target, so available == free. Saying
-        // otherwise would make `df` report a Use% that never reaches 100.
-        f_bavail: blocks(stats.free_blocks),
-        // `akuma-ext2`'s `FsStats` carries no inode counts. Zero is what Linux
-        // reports for a filesystem with no fixed inode table, and `df -i` shows
-        // it as such rather than inventing a number.
-        f_files: 0,
-        f_ffree: 0,
-        f_fsid: [0, 0],
-        f_namelen: 255,
-        f_frsize: bs,
-        f_flags: i64::try_from(flags).unwrap_or(0),
-        f_spare: [0; 4],
-    };
-    // `write_val` rather than a hand-rolled byte view: `Statfs` is `repr(C)`
-    // plain data, which is exactly the `T` that helper takes, and it already
-    // owns the one `unsafe` this needs.
-    if crate::uaccess::write_val(buf, st) { 0 } else { errno::EFAULT }
-}
-
-/// `statfs(path, buf)` — x86_64 137. `busybox df` calls this for every line it
-/// read out of `/proc/mounts`; without it `df` printed its header and stopped.
+/// `struct statfs` is `asm-generic`'s on both architectures — 120 bytes, three
+/// offsets `const`-asserted in `akuma-syscalls-linux` — so this is a straight
+/// forward, no layout hop. Glue's `fs_magic` table is richer than this
+/// target's was (`proc`, `tmpfs`, `overlay`), which `df` prints as the mount's
+/// type. `busybox df` calls it once per line it read from `/proc/mounts`.
 pub fn sys_statfs(path: u64, buf: u64) -> u64 {
-    let Some(path) = path_from_user(path) else {
-        return errno::EFAULT;
-    };
-    // `AT_FDCWD` is `resolve_at`'s own local const; `statfs(2)` takes no dirfd,
-    // so pass the value that means "resolve from the root" explicitly.
-    const AT_FDCWD: u64 = (-100i64) as u64;
-    let Ok(normalised) = resolve_at(AT_FDCWD, path) else {
-        return errno::ENOTDIR;
-    };
-    statfs_into(&normalised, buf)
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::sys_statfs(path, buf))
 }
 
-/// `fstatfs(fd, buf)` — x86_64 138. Reports the mount serving the path the fd
-/// was opened on; a descriptor with no path (a socket, a pipe, a stdio fd)
-/// reports the root mount, which is what Linux does for an fd on a filesystem
-/// with no name to resolve.
+/// `fstatfs(fd, buf)` — x86_64 138, **glue's arm** (4b batch 3b). A descriptor
+/// with no path (socket, pipe, stdio) reports the root mount, which is Linux's
+/// answer for an fd on a filesystem with no name to resolve.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
-    let path = if console_end(fd).is_some() {
-        alloc::string::String::from("/")
-    } else {
-        let Some(path) = table_with(fd, |d| match d {
-            FileDescriptor::File(f) => f.path.clone(),
-            _ => alloc::string::String::from("/"),
-        }) else {
-            return errno::EBADF;
-        };
-        path
-    };
-    statfs_into(&path, buf)
+    akuma_syscalls_glue::fs::sys_fstatfs(fd as u32, buf)
 }
 
-/// `newfstatat(dirfd, path, statbuf, flags)` — and, by the two thin shims in
-/// `syscall_dispatch`, the x86-only `stat(2)` and `lstat(2)`.
+/// `newfstatat(dirfd, path, statbuf, flags)` — and, via two thin shims in the
+/// dispatcher, the x86-only `stat(2)` and `lstat(2)`. **Glue's
+/// `newfstatat_fill`** (4b batch 3b) plus the x86_64 `struct stat` conversion
+/// (see [`sys_fstat`]).
 ///
-/// `dirfd` is honoured only for `AT_EMPTY_PATH` (stat the fd itself, the
-/// `fstat` form busybox uses to size a file it just opened); every other path
-/// is resolved from the root by [`resolve_at`], because this target has no
-/// per-process working directory. [`sys_openat`] no longer resolves that way —
-/// it uses `akuma_syscalls_glue::fs::resolve_path_at`, which reads
-/// `Process::cwd` — and the two agree only because that field is `/` for every
-/// process here. Whichever arm folds next takes this one with it.
-///
-/// The mode, size, inode and timestamps come straight from `akuma-ext2`'s inode
-/// metadata — the `type_perms` field already *is* a Linux `st_mode` (type bits
-/// plus permissions), so `S_ISDIR` / `S_ISREG` / the executable bit a shell
-/// checks before running a PATH entry all come through unmodified.
-///
-/// Symlinks: this target's ext2 path walk does not follow them and the rootfs
-/// is built with hard links rather than symlinks, so `AT_SYMLINK_NOFOLLOW` is
-/// accepted and makes no difference — `metadata` reports the link's own inode
-/// either way. When a symlink farm appears, following belongs in `fs.rs` where
-/// `openat` would need it too, not here.
+/// `AT_EMPTY_PATH` (stat the fd itself) redirects to [`sys_fstat`] here rather
+/// than in glue, because that is where the fd-vs-path branch has always been.
+/// Every other path resolves through `akuma_syscalls_glue::fs::resolve_path_at`
+/// — `Process::cwd`-relative, `/` for every process on this target until it
+/// grows `chdir`.
 pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
-    /// `fstatat`'s "operate on `dirfd` itself when the path is empty" bit.
     const AT_EMPTY_PATH: u64 = 0x1000;
-
-    let Some(path) = path_from_user(path) else {
+    let Some(raw) = path_from_user(path) else {
         return errno::EFAULT;
     };
-
-    if path.is_empty() {
+    if raw.is_empty() {
         if flags & AT_EMPTY_PATH != 0 {
             return sys_fstat(dirfd, statbuf);
         }
         return errno::ENOENT;
     }
-
-    let normalised = if path.starts_with('/') {
-        path
-    } else {
-        let mut p = alloc::string::String::from("/");
-        p.push_str(&path);
-        p
-    };
-
-    // `/proc` paths have no inode. `ps` calls `stat` on `/proc/<pid>` to read
-    // the owning uid for its USER column, and `top` `stat`s `/proc` itself
-    // before it will start.
-    // `/proc` is the mounted `ProcFilesystem`'s, answered by the same
-    // `fs::metadata` every other path uses — which is what makes `open`, `stat`
-    // and `access` agree by construction rather than by three views being kept
-    // in step. This kernel served that namespace itself until 4b batch 2c.
-
-    let Ok(meta) = fs::metadata(&normalised) else {
-        return errno::ENOENT;
-    };
-    let st = encode_stat(
-        meta.mode,
-        meta.size,
-        meta.inode,
-        if meta.is_dir { 2 } else { 1 },
-        meta.accessed,
-        meta.modified,
-        meta.created,
-    );
-    if errno::is_err(copy_to_user(statbuf, &st)) {
-        return errno::EFAULT;
+    match akuma_syscalls_glue::fs::newfstatat_fill(dirfd as i32, &raw, flags as u32) {
+        Ok(g) => {
+            let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+            if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT }
+        }
+        Err(e) => e,
     }
-    0
+}
+
+/// `statx(dirfd, path, flags, mask, buf)` — x86_64 332. **Glue's arm** (4b
+/// batch 3b), and this one needs no preamble at all: `struct statx` is
+/// arch-neutral (256 bytes, same offsets on both), so there is nothing to
+/// convert. This target had no `statx` arm before — every call returned
+/// `ENOSYS` — which a modern coreutils `stat` and Rust's `std::fs` both reach
+/// for before falling back to `newfstatat`.
+pub fn sys_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> u64 {
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::sys_statx(
+        dirfd as i32,
+        path,
+        flags as u32,
+        mask as u32,
+        buf,
+    ))
 }
 
 /// `poll(fds, nfds, timeout_ms)` — x86_64 syscall 7.
@@ -2912,6 +2722,36 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         u64::from_le_bytes(st[48..56].try_into().unwrap_or([0; 8])),
         6623,
     );
+    // **The x86_64 layout hop** (4b batch 3b). Glue fills the asm-generic
+    // `Stat` — `st_mode` at offset 16 — and `akuma_syscalls_abi::stat::to_x86_64`
+    // moves it to 24. Reading a regular-file type bit out of byte 24 is the
+    // whole conversion in one check: with the converter dropped and glue's
+    // struct written raw, byte 24 lands in the middle of `st_nlink` and this
+    // reads 0.
+    t.check_eq(
+        "fd: fstat mode type bit is S_IFREG at the x86_64 offset",
+        u64::from(u32::from_le_bytes(st[24..28].try_into().unwrap_or([0; 4])) & 0o170_000),
+        0o100_000,
+    );
+
+    // `statx` — new on this target with batch 3b (was `ENOSYS`). `struct statx`
+    // is arch-neutral, so this is glue's arm with no hop; `stx_size` at offset
+    // 40, `stx_mode` (a `u16`) at 28.
+    {
+        let mut sx = [0u8; 256];
+        let r = sys_statx(0, path.as_ptr() as u64, 0, 0, sx.as_mut_ptr() as u64);
+        t.check_eq("fd: statx /probe.txt succeeds", r, 0);
+        t.check_eq(
+            "fd: statx reports the size",
+            u64::from_le_bytes(sx[40..48].try_into().unwrap_or([0; 8])),
+            6623,
+        );
+        t.check_eq(
+            "fd: statx reports a regular file",
+            u64::from(u16::from_le_bytes([sx[28], sx[29]]) & 0o170_000),
+            0o100_000,
+        );
+    }
 
     // The `/dev` character nodes. `ls -la /dev` has listed these since devfs
     // arrived, but nothing ever bound a **descriptor** to one: `open` fell

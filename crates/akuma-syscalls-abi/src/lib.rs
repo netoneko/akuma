@@ -207,6 +207,12 @@ syscall_table! {
     Getcwd     => GETCWD     = 79,  nr::GETCWD;
     Statfs     => STATFS     = 137, nr::STATFS;
     Fstatfs    => FSTATFS    = 138, nr::FSTATFS;
+    /// x86_64 332, asm-generic 291. Arch-neutral wire struct (`struct statx` is
+    /// 256 bytes with the same offsets on both), so unlike `fstat` it needs no
+    /// converter — only a number. The amd64 kernel had no arm for it until 4b
+    /// batch 3b; every `statx` returned `ENOSYS`, which a modern `stat(1)` and
+    /// Rust `std::fs::metadata` both try before `newfstatat`.
+    Statx      => STATX      = 332, nr::STATX;
 
     // ── paths: the `*at` family only ───────────────────────────────────────
     // The legacy non-`at` spellings are x86-only and stay as shims in the amd64
@@ -463,6 +469,102 @@ pub mod open_flags {
         }
         out
     }
+}
+
+/// `struct stat`, on which architecture.
+///
+/// The third vocabulary this crate carries, after the syscall numbers and
+/// `open(2)`'s flag word. `akuma_syscalls_linux::Stat` is the **aarch64**
+/// (`asm-generic/stat.h`) layout — its own header says so, and every shared
+/// crate that fills a `stat` fills that one. x86_64 predates `asm-generic` here
+/// too: `struct stat` is 144 bytes rather than 128, `st_nlink` is 8 bytes at
+/// offset 16 rather than 4 at offset 20, and `st_mode` lands at 24 rather than
+/// 16 — so a buffer filled in the aarch64 layout and handed to an x86_64 `ls`
+/// reads `st_mode` out of the middle of `st_nlink` and every field after it is
+/// shifted.
+///
+/// The amd64 kernel used to carry this as a hand-rolled `encode_stat` writing
+/// literal offsets into a `[u8; 144]`, beside a comment calling it "proposal
+/// item 5 territory". This is that item: the layout with `offset_of!`
+/// assertions, and a converter from the shared fill.
+pub mod stat {
+    use akuma_syscalls_linux::Stat as AsmGeneric;
+
+    /// `struct stat` as x86_64 Linux defines it
+    /// (`arch/x86/include/uapi/asm/stat.h`, 64-bit), 144 bytes.
+    ///
+    /// The `__pad0`/`__unused` fields are `pub` so the struct reads next to the
+    /// C one — the same choice `akuma_syscalls_linux::Stat` makes.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    #[allow(clippy::pub_underscore_fields)]
+    pub struct X8664 {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_nlink: u64,
+        pub st_mode: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub __pad0: u32,
+        pub st_rdev: u64,
+        pub st_size: i64,
+        pub st_blksize: i64,
+        pub st_blocks: i64,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub __unused: [i64; 3],
+    }
+
+    /// Re-lay a shared (aarch64) `struct stat` in the x86_64 layout.
+    ///
+    /// Field-by-field, not a reinterpret: the two structs disagree about
+    /// `st_nlink`'s width and about the order of `st_rdev`/`st_mode`, so there
+    /// is no cast that does this. Every field `akuma-syscalls-glue` actually
+    /// fills is carried; the padding words stay zero, matching what the old
+    /// `encode_stat` left them as.
+    #[must_use]
+    pub fn to_x86_64(s: &AsmGeneric) -> X8664 {
+        X8664 {
+            st_dev: s.st_dev,
+            st_ino: s.st_ino,
+            st_nlink: u64::from(s.st_nlink),
+            st_mode: s.st_mode,
+            st_uid: s.st_uid,
+            st_gid: s.st_gid,
+            __pad0: 0,
+            st_rdev: s.st_rdev,
+            st_size: s.st_size,
+            st_blksize: i64::from(s.st_blksize),
+            st_blocks: s.st_blocks,
+            st_atime: s.st_atime,
+            st_atime_nsec: s.st_atime_nsec,
+            st_mtime: s.st_mtime,
+            st_mtime_nsec: s.st_mtime_nsec,
+            st_ctime: s.st_ctime,
+            st_ctime_nsec: s.st_ctime_nsec,
+            __unused: [0; 3],
+        }
+    }
+
+    // The offsets the amd64 kernel's `encode_stat` spelled as literals
+    // (`ST_INO`, `ST_NLINK`, `ST_MODE`, `ST_SIZE`, `ST_BLKSIZE`, `ST_BLOCKS`,
+    // `ST_ATIME`, `ST_MTIME`, `ST_CTIME`). A layout change that moves one is a
+    // build failure rather than an `ls` reading the wrong field.
+    const _: () = assert!(core::mem::size_of::<X8664>() == 144);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_ino) == 8);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_nlink) == 16);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_mode) == 24);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_rdev) == 40);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_size) == 48);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_blksize) == 56);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_blocks) == 64);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_atime) == 72);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_mtime) == 88);
+    const _: () = assert!(core::mem::offset_of!(X8664, st_ctime) == 104);
 }
 
 #[cfg(test)]
@@ -742,5 +844,38 @@ mod tests {
         ] {
             assert_eq!(open_flags::x86_64_to_aarch64(f), f, "0o{f:o} should not move");
         }
+    }
+
+    /// The fields an x86_64 `ls -l` and `apk` read must land where the kernel's
+    /// old hand-rolled `encode_stat` wrote them, and the converter must carry
+    /// each one across the width change on `st_nlink`.
+    #[test]
+    fn stat_x86_64_layout_and_conversion() {
+        use akuma_syscalls_linux::Stat as G;
+        let g = G {
+            st_dev: 0,
+            st_ino: 42,
+            st_mode: 0o100_644,
+            st_nlink: 3,
+            st_size: 123_456,
+            st_blksize: 4096,
+            st_blocks: 241,
+            st_atime: 111,
+            st_mtime: 222,
+            st_ctime: 333,
+            st_rdev: 0,
+            ..Default::default()
+        };
+        let x = stat::to_x86_64(&g);
+        assert_eq!(x.st_ino, 42);
+        assert_eq!(x.st_nlink, 3);
+        assert_eq!(core::mem::size_of_val(&x.st_nlink), 8);
+        assert_eq!(x.st_mode, 0o100_644);
+        assert_eq!(x.st_size, 123_456);
+        assert_eq!(x.st_blocks, 241);
+        assert_eq!(x.st_mtime, 222);
+        // Offset *and* width on the field a 64-bit `ls` reads for the size.
+        assert_eq!(core::mem::offset_of!(stat::X8664, st_size), 48);
+        assert_eq!(core::mem::size_of_val(&x.st_size), 8);
     }
 }

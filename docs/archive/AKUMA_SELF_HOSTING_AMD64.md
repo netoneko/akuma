@@ -774,13 +774,33 @@ through `openat`).
 > park call and one branch in the `/dev/urandom` arm) and does not claim
 > byte-identical sections.
 >
-> **`fstat`/`newfstatat` are the next batch and are a vocabulary, not a hunk:**
-> x86_64 `struct stat` is 144 bytes with `st_nlink` at 16 and `st_mode` at 24;
-> asm-generic is 128 with `st_mode` at 16. That is the **third** per-architecture
-> vocabulary after the syscall numbers and `open(2)`'s flags, and it wants a
-> converter in `akuma-syscalls-abi` plus a split of glue's arms at the user-copy
-> seam, the way batch 2d split `sys_openat`/`openat_path`. `statx` needs none of
-> it.
+> **The `stat` family folded (batch 3b, 2026-09-10)** —
+> `AKUMA_AMD64_4B_FOLD_BATCH3B.md`. `fstat`, `newfstatat`, `statfs`, `fstatfs`
+> and `statx` are glue's arms now — `statx` was `ENOSYS` before, undispatched.
+> `fd.rs` 3 581 -> **3 448**. The **third architecture vocabulary** (after the
+> syscall numbers and `open(2)`'s flags): x86_64 `struct stat` is 144 bytes
+> with `st_nlink` 8-wide at 16 and `st_mode` at 24, asm-generic is 128 with
+> `st_mode` at 16. It is `akuma_syscalls_abi::stat` now — the `X8664` layout
+> with every one of the old hand-rolled `encode_stat` literals pinned by
+> `offset_of!`, and `to_x86_64(&Stat)` re-laying the shared fill field by
+> field (there is no cast: the two disagree on `st_nlink`'s *width*). Glue's
+> `sys_fstat`/`sys_newfstatat` split into `*_fill -> Result<Stat, u64>` +
+> the write, the way batch 2d split `openat`. `struct statfs` and `struct
+> statx` are arch-neutral, so those three are straight forwards.
+>
+> Two bugs in the **shared** crate fell out: `fstat` on a socket fd answered
+> `EBADF` on both kernels (no `Socket` arm in `fstat_fill`, fell to `_ =>
+> EBADF`) — fixed in glue, `S_IFSOCK` now; and `newfstatat` never implemented
+> `AT_EMPTY_PATH`, which now redirects to `fstat_fill`. Verified QEMU/TCG
+> **596/0**·**606/0**, Firecracker **580/0**·**590/0**, bare metal **596/0**
+> (+6 checks, +4 on Firecracker which has no NIC for the two `sock:` checks;
+> all six falsified by a negative control that broke `to_x86_64` and deleted
+> the `Socket` arm — which took `execve`/`fork`/`redirect` red with them).
+> `lazybuf` grew `newfstatat`/`statx` probes (**8/8** QEMU + metal), `apk`
+> end-to-end on both, host tests **1372**. **AArch64: no regression** —
+> committed HEAD and this batch booted side by side under Lima/KVM show
+> identical failure sets (the pre-existing `test_spawn_ext_passes_env` panic,
+> Open issue 4).
 
 > **4b is in progress: batch 1 folded, batch 2's prerequisites landed, and the
 > two pipe tables are one (2026-09-10)** —
@@ -1031,18 +1051,24 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   merely slows), and **amd64 had never registered a prefault
    │   hook** — so a glue arm reading into a page ring 3 had not
    │   touched was `EFAULT`, and `apk` called its own database corrupt
+   ▼   then the `stat` family (b3b): `fstat`/`newfstatat`/`statfs`/
+   │   `fstatfs`/`statx` — the last was `ENOSYS`. `fd.rs` → 3 448.
+   │   `struct stat` is the third architecture vocabulary (x86_64 144
+   │   bytes, asm-generic 128) — now `akuma_syscalls_abi::stat` with
+   │   `offset_of!` on every field. Socket `fstat` was `EBADF` on both
+   │   kernels; fixed in glue
    │                        docs: AKUMA_AMD64_4B_FLIP.md,
-   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A}.md,
+   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A,3B}.md,
    │                              AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md
    ▼
  [09-10] ═══ YOU ARE HERE ═══
    │
    └──► three pieces left below the gate, none blocked on another:
-        **4b, continued** — `read`/`pread64`/`write`/`lseek`/
-                 `getdents64` **folded (batch 3a)**; next is the
-                 `stat` family, which needs an x86_64 `struct stat`
-                 hop in `akuma-syscalls-abi` — the third vocabulary —
-                 then `ioctl`, `poll`/`select`, `dup`, `pipe2`
+        **4b, continued** — I/O cluster **folded (3a)**, `stat` family
+                 **folded (3b)**; next is `fcntl`, `dup`/`dup3`/
+                 `pipe2`, `access`, `utimensat` (mechanical), then
+                 `poll`/`select` and `ioctl` (the readiness model and
+                 the terminal ioctls need care)
         **the ring-3 entry seam** — an x86 arm for "enter userspace with
                  this process's first context"; unblocks `fork`, then
                  `clone`. Sized like 5b, and the only one with no
@@ -1133,8 +1159,11 @@ parity with what the AArch64 self-host already proves.
   │  ◐ 4b   the remaining VFS arms → glue  ◀── IN PROGRESS.        │
   │           Folded: mkdirat/unlinkat/renameat/symlinkat/         │
   │           readlinkat (b1), close (b2b), one /proc (b2c),       │
-  │           **openat (b2d)**. fd.rs 4454 → 3846.                 │
-  │           Next: read/pread/write/lseek/fstat/getdents64.       │
+  │           openat (b2d), read/pread/write/lseek/getdents64      │
+  │           (b3a), fstat/newfstatat/statfs/fstatfs/statx (b3b).  │
+  │           fd.rs 4454 → 3448.                                   │
+  │           Next: fcntl/dup/dup3/pipe2/access/utimensat, then    │
+  │           poll/select/ioctl.                                   │
   │  ✖ THE RING-3 ENTRY SEAM — an x86 arm for "enter userspace     │
   │           with this process's first context". fork_process     │
   │           `eret`s from a UserContext; amd64 has no eret. This  │
