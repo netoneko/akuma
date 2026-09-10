@@ -451,3 +451,121 @@ it comes back, isolate it: `root=/dev/sda1` alone and `usb skiptests` alone,
 same kernel. Note that `usb` + `skiptests` does **not** exercise the driver at
 all — the smoke test lives inside the suite `skiptests` bypasses, and only
 `root=/dev/sda1` runs `xhci::init` on the `skiptests` path.
+
+## 2026-09-10 — it was the socket: High Speed over xHCI has never worked
+
+The disk stopped mounting on the metal. Six boots in one session, every one
+falling back to the RAM image with the same three `xhci:` self-test failures
+(`read the MBR at LBA 0`, `read the sda1 ext2 superblock`, `WRITE(10) to a
+scratch LBA in sda2`).
+
+**Nothing regressed. The drive had been moved to a USB 2.0 socket.** Compare the
+2026-09-06 trace above, which mounted `sda1` and round-tripped a file:
+
+| | 2026-09-06 (worked) | 2026-09-10 (failed) |
+|---|---|---|
+| port | **20** — `proto USB3 ports 16..21` | **3** — `proto USB2 ports 1..14` |
+| speed | **4** (SuperSpeed) | **3** (High Speed) |
+| `READ CAPACITY` | `1953525168 x 512B` | `1953525168 x 512B` — identical |
+| result | `fs: ext2 mounted on sda1` | `transfer timeout: data`, RAM image |
+
+So the SuperSpeed path is the one that has ever worked, and **BOT over xHCI at
+High Speed is an untested path in this driver, not a broken one**. The fix for
+"the disk does not mount" is to plug it into a blue socket.
+
+**Confirmed the same day.** Moved to a USB 3.0 socket (Linux then shows it on
+bus 003, the xHCI SuperSpeed root hub, at `5000M`; it had been on `ehci-pci`
+bus 002 at `480M`), and the metal came up:
+
+```
+[xhci] port 21 USB3 connected PORTSC=0x00201203 PLS=0 enabled
+[xhci] port 21 enabled, speed 4
+[xhci] disk: 1953525168 x 512B = 953869 MiB
+fs:   ext2 mounted on /dev/sda1
+```
+
+**`641 passed, 0 failed`** — the first clean bare-metal boot in the session, with
+all five `xhci:` disk checks green (`read the MBR at LBA 0`, `MBR signature +
+sda1 @ LBA 2048`, `read the sda1 ext2 superblock`, `sda1 superblock magic
+0xEF53`, `WRITE(10) to a scratch LBA in sda2`). `df` reports 64 GB with ~63 GB
+free, and a write-and-read-back from ring 3 round-trips.
+
+**One trap on the way back in.** With `sda1` really mounted, `sshd` reads
+`etc/sshd/authorized_keys` **from the partition**, not from the RAM image — and
+a stale copy there locks you out of a box that is otherwise perfectly healthy
+(port 2222 open, `Akuma_0.1` in the banner, publickey refused). That is what
+`hpbox.restage_disk(keep_keys=True)` is for; run it from Ubuntu before the first
+boot onto a persistent root that has been sitting unused. Diagnosing it is
+easy once you know: if the key that worked on every RAM-image boot stops
+working, the mount *succeeded*.
+
+### The failure shape on the High-Speed path, for whoever fixes it
+
+```
+[xhci] BOT ep IN=0x81 OUT=0x02 / endpoints configured
+[xhci] .. READ CAPACITY
+[xhci] disk: 1953525168 x 512B = 953869 MiB     ← an 8-byte data-in: fine
+[xhci] transfer timeout: data                   ← the first 512-byte READ(10)
+```
+and on the self-test's second bring-up in the same boot:
+```
+[xhci] bulk cc=0x00000006      ← cc::STALL_ERROR (trb.rs:48)
+[xhci] phase CBW
+[xhci] transfer timeout: CBW   ← and every transfer after it
+```
+
+An 8-byte data-in succeeds and a 512-byte one does not, with `max_packet`
+correctly parsed from the descriptor — which points at the data TRB
+construction / TD size / bounce-buffer address rather than the endpoint
+context. `trb::data_trbs` splits at the 64 KiB boundary and 512 bytes needs no
+split, so the single-TRB path is what to read first.
+
+**Two recovery steps are also missing**, and they are why one failure wedges
+the device for the rest of the boot rather than costing one retry:
+
+1. **xHCI.** `recover()` issues Reset Endpoint and stops. `trb.rs:138` on
+   `reset_endpoint` itself: *"clears a halted (STALL) endpoint's state so the
+   transfer ring can be restarted with a **Set TR Dequeue Pointer**"*, and
+   `trb.rs:391` repeats it. There is no `set_tr_dequeue_pointer` builder in the
+   crate, so the ring's dequeue pointer stays parked on the stalled TRB — which
+   is exactly why every later transfer times out in the *first* phase.
+2. **BOT.** Class-standard recovery is Bulk-Only Mass Storage Reset (class
+   request `0xFF`) then CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints.
+   `recover()` does neither, so the *device* stays halted across a controller
+   reset — why the second bring-up fails earlier (CBW) than the first (data).
+
+Also: `Xhci::transfer`'s wait loop **silently discards** any event that does not
+match `(slot, dci, trb_pointer)`, so "no event arrived" and "an event arrived
+and we threw it away" are indistinguishable in the log. Printing the unmatched
+ones (bounded) is the first diagnostic to add.
+
+### Ruled out along the way, with the evidence
+
+| not this | how |
+|---|---|
+| **the media** | `e2fsck -f -n /dev/sdb1` from Ubuntu: five passes, no errors, 156 files, ~63 GB free |
+| **the partition table** | `fdisk -l`: valid DOS label `0x21dda1ff`, sdb1 64 G + sdb2 867.5 G, **1953525168 sectors** — the number Akuma's own `READ CAPACITY` returns |
+| **the cable** | the disk was physically reconnected mid-session; the next boot's trace was identical line for line |
+| **the other USB device** | the keyboard (ROCCAT, `speed 1` on port 8) was removed. Port 8 disappeared and the failure was unchanged |
+| **two host controllers contending** | `quiesce_all` was widened from `prog_if == 0x30` (xHCI only) to the whole USB class — `quiesced 1` → `quiesced 3`. Failures unchanged; **reverted**, since it fixed nothing and its crash-loop rationale is unmeasured for EHCI |
+| **a recent regression** | `git log -S` puts `read_bytes` and all three checks in the original `caf4076b xhci checkpoint`; the driver has three commits total and none touches the transfer path |
+
+### What Linux does with the same device
+
+`174c:55aa` — ASMedia ASM1051E/ASM1053E SATA bridge. One interface, two alt
+settings: **alt 0 = BOT** (`0x81` IN / `0x02` OUT, `wMaxPacketSize` 512) and
+alt 1 = UAS. Akuma picks the right pair.
+
+```
+usb 2-1.3: new high-speed USB device number 3 using ehci-pci
+usb 2-1.3: UAS is ignored for this device, using usb-storage instead
+usb-storage: Quirks match for vid 174c pid 55aa: 800000    ← US_FL_IGNORE_UAS
+```
+
+Note `ehci-pci`. On this box `XUSB2PR` (`00:14.0` config `0xd0`) reads
+`0x00000000` under Linux — every USB2 port routed to EHCI — and `lsusb -t`
+shows both xHCI root hubs empty. The machine has three USB controllers (xHCI
+`00:14.0`, EHCI `00:1a.0`, `00:1d.0`). So when the drive is in a USB 2.0
+socket, **Akuma is the only thing on this box that drives it over xHCI**, and
+that path has no Linux cross-check here. In a USB 3.0 socket both stacks use
+xHCI and the path is the one that works.

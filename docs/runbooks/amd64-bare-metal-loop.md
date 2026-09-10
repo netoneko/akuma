@@ -133,6 +133,33 @@ caller reading only stdout sees an empty success.
 
 ## Rules that cost time to learn
 
+- **The USB disk must be in a USB 3.0 socket.** This kernel's BOT-over-xHCI
+  path works at **SuperSpeed** and has never worked at High Speed. In a USB 2.0
+  socket the drive enumerates fine and `READ CAPACITY` returns the right sector
+  count — then the first 512-byte `READ(10)` times out, `fs: /dev/sda MBR check
+  failed`, and the box silently falls back to the RAM image. Nothing in the log
+  says "wrong socket". The tell is one line:
+
+  | | good | bad |
+  |---|---|---|
+  | | `[xhci] port 21 USB3 connected` | `[xhci] port 3 USB2 connected` |
+  | | `[xhci] port 21 enabled, speed 4` | `[xhci] port 3 enabled, speed 3` |
+  | | `fs: ext2 mounted on /dev/sda1` | `fs: USB root unavailable — using the RAM image` |
+
+  Cross-check from Ubuntu: `lsusb -t` must show the drive on the **`5000M`**
+  xHCI bus, not on an `ehci-pci` bus at `480M`. A USB 2.0 *cable* into a blue
+  socket looks the same as the wrong socket. Cost of learning this the hard
+  way: an evening, and every physical explanation ruled out one at a time
+  (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-10).
+- **A persistent root that locks you out means the mount worked.** With
+  `root=/dev/sda1` really mounted, `sshd` reads
+  `etc/sshd/authorized_keys` **from the partition**, not from the RAM image. A
+  partition that has been sitting unused has a stale copy, so a perfectly
+  healthy box answers on 2222 with `Akuma_0.1` in the banner and refuses your
+  key. Run `hpbox.restage_disk(keep_keys=True)` from Ubuntu *before* the first
+  boot onto a persistent root you have not staged recently. Diagnostic: if the
+  key that worked on every RAM-image boot suddenly does not, do not go looking
+  for a boot failure — you succeeded.
 - **The fast lane cannot see a multiboot2 bug.** QEMU and Firecracker both
   enter via **PVH** (`kmain`); GRUB — the metal, and `/root/ovmf5.sh` — enters
   via **multiboot2** (`kmain_mb2`). A step added to one entry point and not the
@@ -211,6 +238,10 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/sshd netprobe
 | `nosmp` | single core. Quietens the `[BKL] stuck: cpu N …` chatter while cornering something |
 | `ip=<addr>[/<prefix>][,<gw>[,<dns>]]` | override the built-in `192.168.1.220` for one boot |
 | `strace` | trace every syscall (framebuffer only) |
+
+`root=/dev/sda1` needs the drive in a **USB 3.0** socket — see the first rule in
+"Rules that cost time to learn". Without that it silently boots the RAM image
+instead, and every later "why is my file not there" is downstream of it.
 
 Read the kernel log over ssh: `ssh akuma "dmesg"` (a 64 KiB ring in `serial.rs`,
 served by `syslog(2)`). The `mem: heap …/… KiB, pmm … MiB free` line every 10 s
