@@ -150,10 +150,11 @@ pub fn current_tid() -> usize {
     tid
 }
 
-/// Current thread id on every target without a per-CPU register this crate
-/// knows how to read: host builds, bare-metal targets other than AArch64, and
-/// x86_64 builds without `kernel_smp_shared` (see the arm above for why the
-/// gate is the conjunction).
+/// Current thread id where this crate can read no per-CPU register.
+///
+/// That is host builds, bare-metal targets other than AArch64, and x86_64
+/// builds without `kernel_smp_shared` — see the arm above for why the gate is
+/// the conjunction.
 ///
 /// Zero, stated rather than inherited.
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
