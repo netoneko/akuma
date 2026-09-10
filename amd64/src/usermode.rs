@@ -3572,7 +3572,13 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let Ok(path) = core::str::from_utf8(&path_bytes) else {
         return errno::EINVAL;
     };
-    let Ok(image) = crate::fs::read_file(path) else {
+    // The image read runs BKL-free per `EXEC_BKL_DROP_ENABLED` — on a USB disk
+    // whose transfer stalled, this read is the multi-second BKL hold behind the
+    // `[BKL] stuck` storm of 2026-09-11 (`exec_runtime.rs` § "The exec-side
+    // BKL drop"). Everything after it needs the BKL again (the image switch
+    // edits live page tables, and the shootdown argument assumes the BKL is
+    // outermost), so the guard is scoped to exactly this read.
+    let Ok(image) = crate::exec_runtime::bkl_free_io(|| crate::fs::read_file(path)) else {
         return errno::ENOENT;
     };
 

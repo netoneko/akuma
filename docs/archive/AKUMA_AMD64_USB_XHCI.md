@@ -637,3 +637,130 @@ scheduler fault.
 3. **Then the stall itself**, with retries making each boot worth many samples
    instead of one.
 4. Separately: get the BKL out of the timeout path, or shorten it.
+
+## 2026-09-11 — the recovery gap is closed (in the worktree)
+
+Implemented on branch `amd64-xhci-recovery` (worktree
+`../akuma-xhci-recovery`); slices 1–3 and 5 of
+`proposals/NEXT_AGENT_AMD64_XHCI_RECOVERY.md`, in that order.
+**Slice 4 (why it stalls) is still open — it needs the metal.**
+
+### What landed
+
+1. **`trb::set_tr_dequeue_pointer(slot, dci, dequeue_phys, dequeue_cycle)`**
+   in `akuma-xhci`, plus `ProducerRing::cycle()` (the DCS a resume at
+   `enqueue_index()` must program). Host-tested alongside the other builders:
+   DCS in parameter bit 0, low nibble masked, type 15, slot/dci in control.
+2. **`recover()` is now full class-standard recovery**, in spec/Linux order:
+   controller Reset Endpoint on the endpoint that stalled → BOT Mass Storage
+   Reset (class request `0x21/0xFF`, `wIndex` = the BOT interface number,
+   now parsed by `parse_bot_endpoints` and carried in `Xhci::bot_if`) →
+   `CLEAR_FEATURE(ENDPOINT_HALT)` on both bulk endpoints → Set TR Dequeue
+   Pointer for **both** bulk rings, resuming each at its enqueue position with
+   the cycle the TRB there will carry. Non-STALL completion codes still get
+   diagnostics only and no retry.
+3. **One retry.** `bot_run` splits into `bot_run_once` + a wrapper: on a
+   stall it recovers and re-issues the whole command exactly once. A device
+   that stalls twice on the same command reports
+   `bulk transfer stalled again after recovery`.
+4. **The diagnostic.** `Xhci::transfer`'s wait loop prints (bounded, 4) every
+   event it would have discarded — unmatched transfer events with cc/slot/dci/
+   TRB pointer, and command completions or port events arriving mid-transfer.
+
+### What was verified
+
+- `cargo test -p akuma-xhci` on the host: 26 pass (two new tests).
+- The QEMU rig (`amd64/run-xhci.sh`, q35 + qemu-xhci + usb-storage): all 11
+  `xhci:` disk checks `[OK]`, WRITE(10) round-trip included. The rig's 4
+  `fs:/elf:/spawn:/mmap:` self-test failures are **pre-existing** — baseline
+  HEAD shows the identical 359 passed / 4 failed in the same rig, so they are
+  not this change.
+- Not yet confirmed on the metal; the rig models a *correct* controller and
+  cannot reproduce the stall, so slice 4 needs the metal (§ "Iterating the USB
+  driver" in the runbook).
+
+### Reading the next stall correctly
+
+With recovery in place the log language changes: a single
+`stall recovered — retrying the command once` line followed by success is the
+**good** outcome — a transient device halt, absorbed. The bad outcome to
+investigate is a stall that recurs on the same phase, and the new
+`discarded … event` lines are what say whether the controller ever answered at
+all. With slice 5 below, the `[BKL] stuck` storm is no longer the expected
+accompaniment to a stall — its presence after this change is new information,
+not background noise.
+
+### Slice 5 — the BKL is out of the timeout path (2026-09-11, same branch)
+
+Finding it took one grep past the obvious answer. The proposal assumed
+`Xhci::transfer` *chose* to spin under the BKL; in fact every VFS syscall on
+this target ran BKL-held, because **amd64's `smp-shared` feature never
+forwarded the `no-bkl-*` carve-outs**. The AArch64 root kernel's
+`smp-shared` includes `no-bkl-network`/`no-bkl-vfs`/`no-bkl-process`/
+`no-bkl-mm`/`no-bkl-drivers`/`no-bkl-irq`; amd64's forwarded only
+`akuma-exec/smp-shared`. Glue's `VfsBklGuard` is
+`cfg!(all(kernel_smp_shared, kernel_no_bkl_vfs))` — both cfgs off in an
+amd64 build — so every `read(2)`/`openat` on this kernel held the BKL straight
+through ext2 into the xHCI transfer loop. That is the whole mechanism of the
+photo: sshd's `read` of `authorized_keys` parked on the stalled CBW for its
+full one-second `BUDGET`, BKL held, three cores queuing, once per timeout.
+
+Two changes, both on the branch:
+
+1. **amd64/Cargo.toml**: `smp-shared` now forwards
+   `akuma-syscalls-glue/{smp-shared,no-bkl-vfs}`, `akuma-exec/no-bkl-vfs` and
+   `akuma-ext2/no-bkl-vfs` — the VFS phase only. The other phases are
+   deliberately not forwarded: this target's net syscalls are its own
+   `net.rs` (glue's `no-bkl-network` would not cover them), and each further
+   phase gets its own audit + A/B before landing here. The runtime kill
+   switch `akuma_bkl::policy::set_vfs_bkl_drop_enabled(false)` still works
+   unchanged.
+2. **`execve`** (`amd64/src/usermode.rs::sys_execve`) reads the whole image —
+   and via the `akuma_elf` VFS hooks, the interpreter — off the same disk, on
+   a path no carve-out covered. New `ExecIoBkl` `ToggledGuard` in
+   `exec_runtime.rs` over the existing `EXEC_BKL_DROP_ENABLED` policy toggle
+   (default on, `set_exec_bkl_drop_enabled(false)` to A/B), scoped to exactly
+   the image/interpreter reads; the image switch after them keeps the BKL,
+   as the shootdown outermost-lock argument requires.
+
+Rig verification: boot + all 11 `xhci:` checks identical to before the
+change, self-test tally unchanged (359/4, the 4 pre-existing).
+
+### Metal verification, same branch (2026-09-11, later the same day)
+
+Deployed via `hpbox.deploy()` (box at `2d9fc4bc` + no-op patch — the work had
+already been committed), `stage("root=/dev/sda1")`, `restage_disk` first.
+
+**The recovery works on real silicon, live.** On a SuperSpeed boot with the
+persistent root mounted, the enclosure stalled **repeatedly** — 57
+`transfer timeout` lines in the first ~17 minutes of uptime — and **recovered
+from every one**: the `stall recovered — retrying the command once` count
+tracks the timeout count exactly, 57/57, and every retried command succeeded.
+The disk never went away: `df` kept answering, ssh stayed up, the box passed
+the 17-minute mark while previously the **first** stall had killed the root
+filesystem for the rest of the boot (and, the run before this one, ended in a
+self-reset). A boot that used to yield one fatal sample now yields a stall
+per ~15 s.
+
+What the metal run also showed, honestly:
+
+- **Slice 4 stands.** The device still stalls, roughly every 15 s of use, at
+  SuperSpeed, with recovery absorbing each one. Why an 8-byte transfer always
+  works and larger ones intermittently stall is still the open question —
+  the diagnosis machinery (bounded discarded-event prints) is now in place
+  for it.
+- **`[BKL] stuck` lines still accumulate during recovery** (~6 per stall,
+  `tag=511` in every one, on every boot — the tag is evidently not the BOT
+  tag). The VFS and exec carve-outs are in, so these are a path this
+  investigation has not named — prime suspect is the recovery window itself
+  or the RTL8169 stall-kick path (`[rtl] stall` lines interleave). The
+  timeouts no longer freeze the box — it survived, answered ssh throughout,
+  and never reset — but the lines are real and someone still holds the BKL
+  for >1 s per stall.
+- A controlled second metal run ended with the box **resetting itself** into
+  Ubuntu after ~10 minutes idle-with-polling — no console witness, dmesg ring
+  lost. On the final run (with a `dmesg` snapshot loop writing to the
+  persistent root as insurance) it did not recur in 17+ minutes of active
+  use. Whether the reset was this code or the box's known-bad NIC is
+  undetermined; treat a self-reset on this box as new information, not
+  background noise.

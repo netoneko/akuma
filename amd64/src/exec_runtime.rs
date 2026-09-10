@@ -97,6 +97,59 @@
 
 use akuma_exec::{ExecConfig, ExecRuntime};
 
+// ===========================================================================
+// The exec-side BKL drop (`EXEC_BKL_DROP_ENABLED`)
+// ===========================================================================
+//
+// `execve` reads the whole image — and, through [`akuma_elf`]'s VFS hooks
+// below, the dynamic interpreter — off the root filesystem, and on this target
+// that filesystem can be the xHCI USB disk, whose stalled transfers spin a
+// full one-second timeout per BOT phase. The VFS carve-out (`no-bkl-vfs`)
+// covers `read(2)`/`write(2)`/`openat`, but the execve syscall entry is this
+// target's own `usermode::sys_execve`, which holds the BKL across
+// `crate::fs::read_file` — so before the carve-out landed here, one stalled
+// disk turned every `execve` into a multi-second BKL hold, and the `[BKL]
+// stuck` storm of the 2026-09-11 stall was an `execve` (or a `read`) frozen
+// on the dead disk while three cores queued for the lock.
+//
+// The window is the established [`akuma_primitives::ToggledGuard`] shape over
+// the existing `EXEC_BKL_DROP_ENABLED` policy toggle (default on, runtime
+// kill switch via `akuma_bkl::policy::set_exec_bkl_drop_enabled(false)` — the
+// same A/B convention as every other phase). `COMPILED_IN` is a constant
+// `true` rather than a cfg pair: this target has no `no-bkl-exec` feature
+// (the AArch64 gate was `smp_shared::exec_bkl_drop_enabled`, also a runtime
+// answer), and amd64 is always `smp-shared`.
+
+/// The `no-bkl-exec` carve-out, as a [`akuma_primitives::GuardToggle`] marker.
+struct ExecIoBkl;
+
+impl akuma_primitives::GuardToggle for ExecIoBkl {
+    const COMPILED_IN: bool = true;
+    #[inline]
+    fn enabled() -> bool {
+        akuma_bkl::policy::exec_bkl_drop_enabled()
+    }
+    #[inline]
+    fn enter() {
+        akuma_bkl::bkl::dropped_window_open();
+    }
+    #[inline]
+    fn exit() {
+        akuma_bkl::bkl::dropped_window_close();
+    }
+}
+
+type ExecIoBklGuard = akuma_primitives::ToggledGuard<ExecIoBkl>;
+
+/// Run `f` — a whole-file read on the exec path — with the BKL dropped, per
+/// `EXEC_BKL_DROP_ENABLED`. No-op when the toggle is off or the BKL was never
+/// held (a BKL-free caller just runs `f` inline; `dropped_window_open` already
+/// knows how to do nothing on a never-acquired entry).
+pub fn bkl_free_io<T>(f: impl FnOnce() -> T) -> T {
+    let _window = ExecIoBklGuard::new();
+    f()
+}
+
 /// A hook this target cannot serve yet: panic, naming itself.
 ///
 /// See the module header for why this is not a no-op. The message is the whole
@@ -176,7 +229,7 @@ fn runtime() -> ExecRuntime {
         // Both discard *which* `FsError` the VFS reported: the hook's error
         // channels are an `i32` errno-ish code and a `&'static str`, and
         // `akuma-exec` only tests for `Err`.
-        read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
+        read_file: |path| bkl_free_io(|| crate::fs::read_file(path).map_err(|_| -1)),
         file_size: |path| {
             crate::fs::metadata(path)
                 .map(|m| m.size)
@@ -293,7 +346,7 @@ fn runtime() -> ExecRuntime {
         // byte surface ring 3 already gets, not a second one — and the two
         // callers that reach it (`akuma-elf`'s `ElfSource::Path`, and glue's
         // partial reads) then behave here as they do on AArch64.
-        read_at: |path, off, buf| crate::fs::read_at(path, off, buf).map_err(|_| -1),
+        read_at: |path, off, buf| bkl_free_io(|| crate::fs::read_at(path, off, buf).map_err(|_| -1)),
 
         // ── still not wired: the **inode**-addressed read surface (C2) ────
         // These two are the lazy/prefault path and they are a different

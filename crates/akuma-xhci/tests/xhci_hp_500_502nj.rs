@@ -261,6 +261,36 @@ fn bulk_normal_trb() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn set_tr_dequeue_pointer_encoding() {
+    // Halt recovery: Reset Endpoint, then this — DCS (param bit 0) is the
+    // cycle a TRB at the new dequeue address carries; bits 3:1 are reserved
+    // and must stay clear even for a pointer that happens to have low bits.
+    let s = trb::set_tr_dequeue_pointer(3, 2, 0x20_0010, true);
+    assert_eq!(s[0], 0x20_0011, "pointer + DCS=1 in bit 0");
+    assert_eq!(s[1], 0);
+    assert_eq!(s[2], 0, "stream id 0");
+    assert_eq!(trb_type(s[3]), trb::ty::SET_TR_DEQUEUE);
+    assert_eq!(s[3] >> 24, 3, "slot id");
+    assert_eq!((s[3] >> 16) & 0x1f, 2, "endpoint dci");
+
+    let s = trb::set_tr_dequeue_pointer(1, 4, 0x3_0000_0007, false);
+    assert_eq!(s[0], 0x0000_0000, "low word masked, DCS=0");
+    assert_eq!(s[1], 0x3, "high pointer word");
+    assert_eq!(trb_type(s[3]), trb::ty::SET_TR_DEQUEUE);
+}
+
+#[test]
+fn producer_ring_cycle_tracks_wrap_for_set_tr_dequeue() {
+    const LEN: usize = 4;
+    let mut ring = ProducerRing::new(LEN);
+    assert!(ring.cycle(), "initial cycle 1");
+    for _ in 1..LEN {
+        let _ = ring.enqueue(trb::no_op_command(), 0x10_0000);
+    }
+    assert!(!ring.cycle(), "flipped by the wrap");
+}
+
+#[test]
 fn producer_ring_sets_cycle_and_wraps_with_a_link_trb() {
     const LEN: usize = 8; // 7 usable slots + 1 link
     let base = 0x20_0000u64;
