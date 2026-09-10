@@ -282,12 +282,24 @@ a comment pointing at this section.
 |---|---|---|---|
 | QEMU/TCG `SMP=1` | 596/0 | 609/0 | **616/0** |
 | QEMU/TCG `SMP=4` | 606/0 | 619/0 | **626/0** |
-| host tests | 1372 | 1372 | **1372** |
+| **Firecracker/KVM `SMP=1`** (the box) | 580/0 | — | **594/0** |
+| **Firecracker/KVM `SMP=4`** (the box) | 590/0 | — | **604/0** |
+| **bare metal** (HP 500-502nj) `SMP=4` | 596/0 | — | **616/0** |
+| host tests | 1372 | 1372 | **1373** |
 | clippy — aarch64 `release`, `extreme-size`, amd64 | clean | clean | **clean** |
 | amd64 `no-tests` build | OK | OK | **OK** |
-| `apk update` (QEMU) | OK | — | **OK**, 28 641 packages |
-| `apk add file` (QEMU) | OK | — | **OK**, 3 packages / 11.0 MiB |
+| `apk update` (QEMU / **metal**) | OK | — | **OK / OK**, 28 641 packages both |
+| `apk add file` (QEMU / **metal**) | OK | — | **OK / OK**, 3 packages / 11.0 MiB both |
 | `fd.rs` lines | 3 083 | 3 008 | 3 192 |
+
+**Firecracker gains +14 where QEMU and the metal gain +20, and that is not a
+missing check.** `hpbox.firecracker()` writes `"network-interfaces": []`, so
+that rig has no NIC, so `sock::smoke_test` reports *"sock: no network stack;
+skipped"* — and `sock::smoke_test` is exactly where §2.3 moved the six
+`SIOCGIF*` checks to. The poll/select block is **not** disk-gated (verified: it
+sits outside `fd::smoke_test`'s `if have_fs`), so it runs on all three. Add
+`FC_NET=1` to the Firecracker recipe to close the gap; the boot suite reporting
+`0 failed` on every rig is the part that matters.
 
 `apk` is the real-workload gate for this batch specifically: its DNS lookups
 `poll` a UDP socket for the reply and its TLS fetches wait for post-connect TCP
@@ -301,22 +313,98 @@ returning 2 with `exceptfds` cleared — the libcurl `CURL_CSELECT_ERR` rule in
 `docs/runbooks/cargo-cannot-reach-crates-io.md`, which amd64 had implemented and
 never tested.
 
+### The ring-3 gates, run
+
+| gate | result |
+|---|---|
+| `amd64_ring3_check --smp 1 -n 40` | **40/40 sessions**, `free` unmoved (1563224 → 1563224), `ps` 5 → 5, heap +100 kB, `grandfork` ALL PASS |
+| `amd64_ring3_check --smp 1 -n 60` | **60/60**, `free` unmoved, `ps` 5 → 5, heap +20 kB, `grandfork` ALL PASS |
+| `lazybuf` (over ssh) | **8/8** |
+| `openflags` (over ssh) | **20/20**, 0 known divergences |
+| **`consoletty`** (new — as init, on the serial line) | **41/41** |
+| interactive `busybox sh` over ssh, `-tt` **and** plain | **prompt, `isatty(0)` true, `stty size` 24×80, pipeline** |
+| `busybox stty -a` over ssh | decodes the whole `termios` correctly — see below |
+
+**`consoletty` is new and it is this batch's own probe**
+(`userspace/forktest/c_stress/consoletty.c`, house style of `lazybuf`/
+`openflags`). It runs as **init on the serial line**, not over ssh, and that is
+the point: over ssh a process's fd 0 is a `PipeRead` served by glue's pipe arm,
+so a probe run there would pass against a kernel with a broken console path.
+It covers `poll`/`select` on the console (including `revents` clear rather than
+`POLLHUP|POLLERR` — the §1.3 hook), the finite-timeout elapse, `exceptfds`
+being *written* clear, `TCGETS`/`TIOCGWINSZ`, all eight `c_cc` offsets, and the
+four ioctls the fold added (`FIONREAD`, `FIONBIO`, `FIOASYNC`, and `ENOTTY` for
+an unknown request). It is also the regression check for
+`AMD64_CONSOLE_NONBLOCK_READ.md`.
+
+**§3's one-byte `c_cc` offset, confirmed from ring 3.** `busybox stty -a` over
+ssh decodes amd64's `TCGETS` reply as
+
+```
+speed 38400 baud; rows 24; columns 80; line = 0;
+intr = ^C; quit = ^\; erase = ^?; kill = ^U; eof = ^D; susp = ^Z;
+min = 1; time = 0;
+```
+
+Every one of those is a `c_cc[]` index read at byte **17**, and every one is
+right. A kernel writing `cc` at byte 16 — which is what glue's arm does — would
+shift all of them by one and report `erase = ^\`, `kill = ^?`, and so on. So §3
+is not a reading of the source, it is a measurement, and the AArch64 side is
+where it still bites.
+
+### On the metal, through real ring-3 callers
+
+Both of the batch's arms, on the hardware, over ssh:
+
+```
+$ busybox ifconfig
+eth0  Link encap:Ethernet  HWaddr 60:02:92:61:4E:73
+      inet addr:192.168.1.123  Bcast:192.168.1.255  Mask:255.255.255.0
+      UP BROADCAST RUNNING MULTICAST  MTU:1514  Metric:1
+lo    inet addr:127.0.0.1  Mask:255.0.0.0
+      UP LOOPBACK RUNNING  MTU:65536
+
+$ ssh -tt … busybox sh
+/ # test -t 0 && echo TTY0 || echo NOTTY0
+TTY0
+/ # busybox stty size
+24 80
+/ # busybox stty -a
+speed 38400 baud; rows 24; columns 80; line = 0;
+intr = ^C; quit = ^\; erase = ^?; kill = ^U; eof = ^D; susp = ^Z; min = 1; time = 0;
+```
+
+`ifconfig` is §2.3's delegation — glue's `SIOCGIF*` arms behind the new
+socket-fd gate — answering correctly on a Realtek NIC. The interactive shell is
+§2.1's preamble: the **prompt** only appears if `TCGETS` on a pipe succeeded,
+and `TTY0` is `isatty(0)` over that pipe. `stty -a` decodes the whole `termios`,
+which is the byte-17 `c_cc` confirmation, now on two rigs.
+
+`dmesg | busybox grep -a FAILED` on the metal matches twice and **both are the
+harness's own command echoes** — sshd logs `[SSH] Exec: …` into the console
+ring, so a grep whose *pattern* contains `FAILED` matches itself. Read the
+tally, not the grep count.
+
 ### Still owed
 
-- **Firecracker/KVM** `SMP=1` 580/0 and `SMP=4` 590/0, and **bare metal** 596/0
-  — not re-run. The counts will be +20 there too.
-- **`amd64_ring3_check --smp 1 -n 40` / `-n 60`**, `lazybuf` 8/8, `openflags`
-  20/20.
-- **`apk update` + `apk add file` on the metal.**
-- **An interactive `busybox sh` over ssh, `less`, and a serial-console shell** —
-  the `ioctl` preamble's whole purpose, and the check no boot suite can make.
+- **`consoletty` on the metal.** It must run as init on the serial line, and on
+  that box there is no serial line and no keyboard — its output would go to the
+  framebuffer with no way to read it back, and staging `init=/probes/consoletty`
+  costs the ssh route in. The console code path is architecture-shared and
+  identical; the QEMU run is the coverage. (`hpbox.deploy` also does not sync
+  `userspace/`, so the binary would need pushing by hand.)
 - **The AArch64 side-by-side.** The `crates/` diff is *not* `pub(super)` → `pub`
   only this time: `poll.rs` gained the hook call and the `nfds_ok` cap, and
   `SyscallHooks` gained a field. HVF asserts (`hvf_handle_exception … isv`) and
   TCG panics in a pre-existing self-test (`test_spawn_ext_passes_env`,
   `AKUMA_SELF_HOSTING_AMD64.md` Open issue 4), so a committed-HEAD-vs-change
   boot to the panic point via `scripts/lima_aarch64_run.sh` is what this owes.
-  The AArch64 kernel does *build* clean and its clippy is clean.
+  The AArch64 kernel does *build* clean and its clippy is clean. (The *next*
+  step's slice 1 found a cheaper form of this check that this batch could also
+  have used — compare every loaded ELF section against HEAD; see
+  `AKUMA_AMD64_RING3_SEAM_SLICE1.md` §3.1. It will not come out identical here,
+  because this batch does change shared behaviour, but the section table alone
+  says *where*.)
 
 ## 6. After this: `fd.rs` is at its floor
 

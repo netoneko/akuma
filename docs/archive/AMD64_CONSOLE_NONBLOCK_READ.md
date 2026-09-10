@@ -220,19 +220,75 @@ SMP=1 INIT=/bin/busybox INITARGS=uname,-a sh amd64/run.sh -display none < /dev/n
 |---|---|---|
 | QEMU/TCG `SMP=1` | 609/0 | **616/0** |
 | QEMU/TCG `SMP=4` | 619/0 | **626/0** |
-| host tests | 1372 | **1372** |
+| host tests | 1372 | **1373** |
 | clippy, both kernels | clean | **clean** |
 | `apk update` (QEMU) | OK | **OK** — 28 641 packages |
 | `apk add file` (QEMU) | OK | **OK** — 3 packages, 11.0 MiB |
+| **`consoletty` (ring 3, as init)** | — | **41/41** |
+| `amd64_ring3_check --smp 1 -n 40` / `-n 60` | — | **40/40 · 60/60**, `free` unmoved, heap +100 / +20 kB |
+| `lazybuf` / `openflags` (QEMU, over ssh) | 8/8 · 20/20 | **8/8 · 20/20** |
+| interactive `busybox sh` over ssh, `-tt` and plain | OK | **OK** |
+| Firecracker/KVM `SMP=1` / `SMP=4` | 580/0 · 590/0 | **594/0 · 604/0** |
+| bare metal `SMP=4` | 596/0 | **616/0** |
+| `apk update` + `apk add file` on the **metal** | OK | **OK** |
+| interactive `busybox sh` on the **metal** | OK | **OK** |
 
-(+7 checks, all of them `console_nonblock_test`.) The `apk` runs carry
+(+7 boot checks, all of them `console_nonblock_test`.) The `apk` runs carry
 `WARNING: … failed to preserve …: owner` and report `3 errors`; that is
 pre-existing and unrelated — amd64 dispatches no `chown`/`fchownat` at all.
 
-Firecracker and the bare-metal box are **not** re-run here. The change is one
-`if` inside a function neither VMM configuration reaches differently, but the
-baseline table in `AKUMA_AMD64_4B_FOLD_BATCH4B.md` § Verification still owes
-both.
+### The ring-3 probe is the one that matters
+
+`userspace/forktest/c_stress/consoletty.c`, run **as init on the serial line**
+(`INIT=/probes/consoletty`), not over ssh — and that distinction is the probe's
+whole reason for existing. Over ssh a process's fd 0 is a `PipeRead` served by
+glue's pipe arm; only a process on the serial line has fd 0 as a
+`FileDescriptor::Stdin`, which is the descriptor `sys_read`'s preamble claims
+for `read_console`. A probe run over ssh would have passed against the broken
+kernel.
+
+41 checks, 0 failures. The load-bearing ones:
+
+```
+PASS a non-blocking read of an idle console returns -1
+PASS with errno == EAGAIN (not a hang, not EOF, not EBADF)
+PASS and again, so it is a state and not a one-shot
+PASS poll(stdin, POLLIN, 0) on an idle console returns 0
+PASS and revents is clear -- no POLLHUP/POLLERR
+PASS so the read is EAGAIN again -- one flag store, two setters   (via FIONBIO)
+```
+
+The last one closes §1 from the other side: `FIONBIO(1)` is glue's `ioctl` arm
+writing `Process::set_nonblock`, and the console read — a different function in
+a different crate — sees it. Two setters, one store.
+
+The `poll` line is the fix batch 4b's hook bought: without
+`poll_console_state`, an unbound fd 0 is not in the process fd table at all, so
+glue answers `FdState::Missing` → `POLLHUP | EPOLLERR`. A shell polling its own
+stdin would be told the console was finished.
+
+### The interactive shell, over ssh
+
+Both channel shapes, since the `ioctl` preamble threads exactly this:
+
+```
+$ ssh -tt … busybox sh   (and the same without -tt)
+/bin/sh: can't access tty; job control turned off
+/ # echo IT_WORKS
+IT_WORKS
+/ # test -t 0 && echo TTY0 || echo NOTTY0
+TTY0
+/ # busybox stty size
+24 80
+```
+
+The **prompt** is the check: busybox prints one only if `TCGETS` on fd 0
+succeeded, and fd 0 there is a pipe. `TTY0` is `isatty(0)` over that pipe — the
+amd64-only answer the preamble exists to keep. `busybox stty -a` additionally
+decodes the whole `termios` and reports `intr = ^C; quit = ^\; erase = ^?;
+kill = ^U; eof = ^D; susp = ^Z; min = 1; time = 0` — every one of those is a
+`c_cc[]` index read at byte 17, which is independent confirmation of the offset
+§6 of the batch-4b doc records glue getting wrong.
 
 ## Background
 

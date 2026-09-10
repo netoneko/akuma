@@ -123,6 +123,24 @@ a zeroed struct. Host tests 1372 → **1373**.
 | host tests | 1372 | **1373** |
 | clippy — aarch64 `release`, `extreme-size`, amd64, the three touched crates on host | clean | **clean** |
 
+The two QEMU rows are the ones that isolate *this slice*: 616/626 either side of
+it, since batch 4b had already moved them there. The rig gates below were run
+against the **combined** working tree (batch 4b + the console fix + this slice),
+because that is the state the box was deployed with, so they bound all three
+together rather than this one alone:
+
+| rig gate (combined state) | pre-4b baseline | measured |
+|---|---|---|
+| Firecracker/KVM `SMP=1` / `SMP=4` (the box) | 580/0 · 590/0 | **594/0 · 604/0** |
+| bare metal (HP 500-502nj) `SMP=4` | 596/0 | **616/0** |
+| `amd64_ring3_check --smp 1 -n 40` / `-n 60` | — | **40/40 · 60/60**, `free` unmoved |
+| `lazybuf` / `openflags` | 8/8 · 20/20 | **8/8 · 20/20** |
+| `apk update` + `apk add file`, QEMU **and** metal | OK | **OK** |
+
+The Firecracker delta is +14 rather than +20 because that rig declares
+`"network-interfaces": []`, so `sock::smoke_test` skips — see
+`AKUMA_AMD64_4B_FOLD_BATCH4B.md` § 5.
+
 ### 3.1 The AArch64 kernel is byte-for-byte identical
 
 This slice edits code the AArch64 kernel *executes*, and that kernel cannot be
