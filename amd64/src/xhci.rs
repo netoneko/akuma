@@ -246,6 +246,9 @@ struct Xhci {
 
     block_len: u32,
     block_count: u64,
+    /// The BOT interface's `bInterfaceNumber` — the `wIndex` the Mass Storage
+    /// Reset class request needs.
+    bot_if: u8,
     tag: u32,
 }
 
@@ -336,15 +339,55 @@ impl Xhci {
         w32(self.db, regs::db::doorbell(usize::from(self.slot)), regs::db::endpoint_target(dci));
 
         let start = tsc();
+        // Any event that does not match (slot, dci, trb_pointer) is discarded,
+        // which makes "no event arrived" and "an event arrived and we threw it
+        // away" indistinguishable in the log — exactly the ambiguity a stall
+        // investigation cannot afford. Print the discarded ones, bounded: four
+        // is enough to see what the controller is actually completing.
+        let mut unmatched = 0u32;
         loop {
-            if let Some(Event::Transfer {
-                completion_code, slot, endpoint_dci, residual, trb_pointer, ..
-            }) = self.next_event()
-                && slot == self.slot
-                && endpoint_dci == dci
-                && trb_pointer == last_phys
-            {
-                return Ok((completion_code, requested.saturating_sub(residual)));
+            match self.next_event() {
+                Some(Event::Transfer {
+                    completion_code, slot, endpoint_dci, residual, trb_pointer, ..
+                }) => {
+                    if slot == self.slot && endpoint_dci == dci && trb_pointer == last_phys {
+                        return Ok((completion_code, requested.saturating_sub(residual)));
+                    }
+                    if unmatched < 4 {
+                        unmatched += 1;
+                        serial::puts("  [xhci] discarded transfer event: cc=");
+                        serial::put_dec(u64::from(u32::from(completion_code)));
+                        serial::puts(" slot=");
+                        serial::put_dec(u64::from(u32::from(slot)));
+                        serial::puts(" dci=");
+                        serial::put_dec(u64::from(u32::from(endpoint_dci)));
+                        serial::puts(" trb=");
+                        putphys("", trb_pointer);
+                    }
+                }
+                Some(Event::CommandCompletion { completion_code, slot, trb_pointer }) => {
+                    if unmatched < 4 {
+                        unmatched += 1;
+                        serial::puts("  [xhci] discarded command completion during transfer: cc=");
+                        serial::put_dec(u64::from(u32::from(completion_code)));
+                        serial::puts(" slot=");
+                        serial::put_dec(u64::from(u32::from(slot)));
+                        serial::puts(" trb=");
+                        putphys("", trb_pointer);
+                    }
+                }
+                Some(Event::PortStatusChange { port, completion_code }) => {
+                    if unmatched < 4 {
+                        unmatched += 1;
+                        serial::puts("  [xhci] discarded port event during transfer: port=");
+                        serial::put_dec(u64::from(u32::from(port)));
+                        serial::puts(" cc=");
+                        serial::put_dec(u64::from(u32::from(completion_code)));
+                        serial::puts("\n");
+                    }
+                }
+                Some(_) => {}
+                None => {}
             }
             if tsc().wrapping_sub(start) > BUDGET {
                 serial::puts("  [xhci] transfer timeout: ");
@@ -629,6 +672,7 @@ pub fn init() -> Result<(), &'static str> {
             bulk_out_dci: 0,
             block_len: 512,
             block_count: 0,
+            bot_if: 0,
             tag: 1,
         };
 
@@ -1007,7 +1051,8 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
     let mut cfg = [0u8; 512];
     cfg[..usize::from(want)].copy_from_slice(&ctrl_buf()[..usize::from(want)]);
 
-    let (config_value, bin, bout) = parse_bot_endpoints(&cfg[..usize::from(want)])?;
+    let (config_value, bin, bout, bot_if) = parse_bot_endpoints(&cfg[..usize::from(want)])?;
+    x.bot_if = bot_if;
     serial::puts("  [xhci] BOT ep IN=0x");
     serial::put_hexn(u64::from(bin.address), 2);
     serial::puts(" OUT=0x");
@@ -1092,8 +1137,9 @@ struct BulkEp {
     max_burst: u8,
 }
 
-fn parse_bot_endpoints(cfg: &[u8]) -> Result<(u8, BulkEp, BulkEp), &'static str> {
+fn parse_bot_endpoints(cfg: &[u8]) -> Result<(u8, BulkEp, BulkEp, u8), &'static str> {
     let mut config_value = 1u8;
+    let mut bot_if = 0u8;
     let mut in_bot = false;
     let mut bin: Option<BulkEp> = None;
     let mut bout: Option<BulkEp> = None;
@@ -1107,9 +1153,15 @@ fn parse_bot_endpoints(cfg: &[u8]) -> Result<(u8, BulkEp, BulkEp), &'static str>
                 }
             }
             0x04 => {
-                in_bot = descriptor::InterfaceDescriptor::parse(d.bytes).is_some_and(|i| {
-                    i.class == 0x08 && i.sub_class == 0x06 && i.protocol == 0x50
-                });
+                in_bot = false;
+                if let Some(i) = descriptor::InterfaceDescriptor::parse(d.bytes)
+                    && i.class == 0x08
+                    && i.sub_class == 0x06
+                    && i.protocol == 0x50
+                {
+                    in_bot = true;
+                    bot_if = i.interface_number;
+                }
             }
             0x05 if in_bot => {
                 if let Some(e) = descriptor::EndpointDescriptor::parse(d.bytes)
@@ -1141,7 +1193,7 @@ fn parse_bot_endpoints(cfg: &[u8]) -> Result<(u8, BulkEp, BulkEp), &'static str>
     }
 
     match (bin, bout) {
-        (Some(i), Some(o)) => Ok((config_value, i, o)),
+        (Some(i), Some(o)) => Ok((config_value, i, o, bot_if)),
         _ => Err("BOT interface has no bulk in/out pair"),
     }
 }
@@ -1198,14 +1250,51 @@ fn read_capacity(x: &mut Xhci) -> Result<(), &'static str> {
 // BOT transport
 // ===========================================================================
 
-/// Run one BOT command whose data phase, if any, occupies the first `data_len`
-/// bytes of `BOUNCE_BUF`. Returns the CSW status and bytes moved in the data
-/// phase. The caller stages BOUNCE before an OUT and reads it after an IN.
+/// A data-phase-stalled BOT command, with what recovery needs to know.
+enum BotErr {
+    /// The controller never completed the TD.
+    Timeout(&'static str),
+    /// The controller completed the TD with a completion code the BOT layer
+    /// cannot use.
+    Stalled { code: u8, phase: &'static str, dci: u8 },
+}
+
+/// Run one BOT command, recovering from a stall once. Class-standard recovery
+/// (controller Reset Endpoint + Set TR Dequeue Pointer, then BOT Mass Storage
+/// Reset and CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints) happens in
+/// [`recover`]; this re-issues the whole command exactly once afterwards — a
+/// device that stalls twice on the same command has a real problem and should
+/// say so.
 fn bot_run(
     x: &mut Xhci,
     command: akuma_usb_storage::Command,
     data_len: usize,
 ) -> Result<(CswStatus, u32), &'static str> {
+    match bot_run_once(x, command, data_len) {
+        Ok(r) => Ok(r),
+        Err(BotErr::Timeout(e)) => Err(e),
+        Err(BotErr::Stalled { code, phase, dci }) => {
+            if !recover(x, code, phase, dci) {
+                return Err("bulk transfer error");
+            }
+            serial::puts("  [xhci] stall recovered — retrying the command once\n");
+            match bot_run_once(x, command, data_len) {
+                Ok(r) => Ok(r),
+                Err(BotErr::Timeout(e)) => Err(e),
+                Err(BotErr::Stalled { code, phase, dci }) => {
+                    let _ = recover(x, code, phase, dci);
+                    Err("bulk transfer stalled again after recovery")
+                }
+            }
+        }
+    }
+}
+
+fn bot_run_once(
+    x: &mut Xhci,
+    command: akuma_usb_storage::Command,
+    data_len: usize,
+) -> Result<(CswStatus, u32), BotErr> {
     let tag = x.tag;
     x.tag = x.tag.wrapping_add(1).max(1);
     let cbw = Cbw { tag, command, lun: 0 };
@@ -1219,9 +1308,10 @@ fn bot_run(
         &[trb::normal(cbw_phys, 31, true)],
         31,
         "CBW",
-    )?;
+    )
+    .map_err(BotErr::Timeout)?;
     if code != cc::SUCCESS {
-        return Err(recover(x, code, "CBW"));
+        return Err(BotErr::Stalled { code, phase: "CBW", dci: x.bulk_out_dci });
     }
 
     let mut moved = 0u32;
@@ -1233,10 +1323,10 @@ fn bot_run(
             _ => (Ring::BulkOut, RingField::BulkOut, x.bulk_out_dci, false),
         };
         let (count, td) = trb::data_trbs(bp, n);
-        let (code, m) = x.transfer(ring, field, dci, &td[..count], n, "data")?;
+        let (code, m) = x.transfer(ring, field, dci, &td[..count], n, "data").map_err(BotErr::Timeout)?;
         moved = m;
         if code != cc::SUCCESS && !(code == cc::SHORT_PACKET && is_in) {
-            return Err(recover(x, code, "data"));
+            return Err(BotErr::Stalled { code, phase: "data", dci });
         }
     }
 
@@ -1248,15 +1338,67 @@ fn bot_run(
         &[trb::normal(csw_phys, 13, true)],
         13,
         "CSW",
-    )?;
+    )
+    .map_err(BotErr::Timeout)?;
     if code != cc::SUCCESS && code != cc::SHORT_PACKET {
-        return Err(recover(x, code, "CSW"));
+        return Err(BotErr::Stalled { code, phase: "CSW", dci: x.bulk_in_dci });
     }
-    let csw = Csw::parse(&csw_buf()[..13]).ok_or("CSW signature mismatch — pipe desynced")?;
+    let csw = Csw::parse(&csw_buf()[..13]).ok_or(BotErr::Timeout("CSW signature mismatch — pipe desynced"))?;
     if csw.tag != tag {
-        return Err("CSW tag mismatch");
+        return Err(BotErr::Timeout("CSW tag mismatch"));
     }
     Ok((csw.status, moved))
+}
+
+/// The endpoint address a bulk dci was built from (`context::dci` is
+/// `ep_num * 2 + direction`, EP direction-in is odd).
+fn bulk_ep_addr(dci: u8) -> u8 {
+    if dci & 1 == 1 {
+        0x80 | (dci >> 1)
+    } else {
+        dci >> 1
+    }
+}
+
+/// Class-standard mass-storage stall recovery. Returns `true` when recovery
+/// ran and the caller may retry the command once; `false` for a completion
+/// code recovery does not cover.
+///
+/// Three halves, in the order the spec and Linux do them:
+///
+/// 1. **Controller.** Reset Endpoint clears the halted state — but leaves the
+///    ring's dequeue parked on the TRB that stalled, so every later transfer
+///    would time out in its first phase. Set TR Dequeue Pointer moves it to
+///    the ring's enqueue position, with the cycle the TRB there will carry
+///    (`ProducerRing::cycle`).
+/// 2. **Device.** The Bulk-Only Mass Storage Reset (class request `0xFF` on
+///    the BOT interface) clears the *device's* halt — a controller-side reset
+///    does not — and `CLEAR_FEATURE(ENDPOINT_HALT)` clears each bulk
+///    endpoint's halt at the device.
+/// 3. Both bulk rings get a fresh dequeue pointer, since either may have been
+///    the one the device halted.
+fn recover(x: &mut Xhci, code: u8, phase: &str, dci: u8) -> bool {
+    puthex("  [xhci] bulk cc=", u32::from(code));
+    serial::puts("  [xhci] phase ");
+    serial::puts(phase);
+    serial::puts("\n");
+    if code != cc::STALL_ERROR {
+        return false;
+    }
+    let _ = x.command(trb::reset_endpoint(x.slot, dci), "reset ep");
+    let _ = x.control(0x21, 0xFF, 0, u16::from(x.bot_if), 0); // BOT Mass Storage Reset
+    let _ = x.control(0x02, 0x01, 0, u16::from(bulk_ep_addr(x.bulk_in_dci)), 0);
+    let _ = x.control(0x02, 0x01, 0, u16::from(bulk_ep_addr(x.bulk_out_dci)), 0);
+    for (ring, field, d) in [
+        (Ring::BulkIn, RingField::BulkIn, x.bulk_in_dci),
+        (Ring::BulkOut, RingField::BulkOut, x.bulk_out_dci),
+    ] {
+        let idx = x.producer(field).enqueue_index();
+        let cycle = x.producer(field).cycle();
+        let dequeue = ring_phys(ring) + (idx as u64) * 16;
+        let _ = x.command(trb::set_tr_dequeue_pointer(x.slot, d, dequeue, cycle), "set tr dequeue");
+    }
+    true
 }
 
 /// A small command whose data fits a caller buffer (`INQUIRY`, `READ CAPACITY`,
@@ -1276,19 +1418,6 @@ fn bot_small(
         data[..n].copy_from_slice(&bounce()[..n]);
     }
     Ok(status)
-}
-
-/// Diagnostics + best-effort STALL recovery; always returns an error string.
-fn recover(x: &mut Xhci, code: u8, phase: &str) -> &'static str {
-    puthex("  [xhci] bulk cc=", u32::from(code));
-    serial::puts("  [xhci] phase ");
-    serial::puts(phase);
-    serial::puts("\n");
-    if code == cc::STALL_ERROR {
-        let _ = x.command(trb::reset_endpoint(x.slot, x.bulk_in_dci), "reset ep in");
-        let _ = x.command(trb::reset_endpoint(x.slot, x.bulk_out_dci), "reset ep out");
-    }
-    "bulk transfer error"
 }
 
 // ===========================================================================

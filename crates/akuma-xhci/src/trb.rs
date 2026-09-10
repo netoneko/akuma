@@ -29,6 +29,7 @@ pub mod ty {
     pub const CONFIGURE_ENDPOINT: u32 = 12;
     pub const EVALUATE_CONTEXT: u32 = 13;
     pub const RESET_ENDPOINT: u32 = 14;
+    pub const SET_TR_DEQUEUE: u32 = 15;
     pub const NO_OP_CMD: u32 = 23;
     pub const TRANSFER_EVENT: u32 = 32;
     pub const COMMAND_COMPLETION_EVENT: u32 = 33;
@@ -140,6 +141,27 @@ pub fn evaluate_context(input_context_phys: u64, slot_id: u8) -> [u32; 4] {
 pub fn reset_endpoint(slot_id: u8, endpoint_dci: u8) -> [u32; 4] {
     let control = (u32::from(slot_id) << 24) | (u32::from(endpoint_dci) << 16);
     [0, 0, 0, set_type(control, ty::RESET_ENDPOINT)]
+}
+
+/// Set TR Dequeue Pointer command — the second half of recovering a halted endpoint.
+///
+/// [`reset_endpoint`] clears the halt; without this the endpoint's dequeue stays
+/// parked on the TRB that stalled and every later transfer times out in its
+/// first phase. `dequeue_phys` is where the controller should resume — usually
+/// the transfer ring's enqueue position — and `dequeue_cycle` is the cycle bit a
+/// TRB at that address carries ([`ProducerRing::cycle`]).
+#[must_use]
+pub fn set_tr_dequeue_pointer(slot_id: u8, endpoint_dci: u8, dequeue_phys: u64, dequeue_cycle: bool) -> [u32; 4] {
+    // Parameter bits 3:0 are DCS (bit 0) + reserved — the pointer is 16-byte
+    // aligned by construction, so clear the low nibble before OR-ing DCS in.
+    let param = (dequeue_phys & !0xf) | u64::from(dequeue_cycle);
+    let control = (u32::from(slot_id) << 24) | (u32::from(endpoint_dci) << 16);
+    [
+        param as u32,
+        (param >> 32) as u32,
+        0,
+        set_type(control, ty::SET_TR_DEQUEUE),
+    ]
 }
 
 /// No-Op command — used to prove the command ring / event ring loop works
@@ -419,6 +441,13 @@ impl ProducerRing {
     #[must_use]
     pub fn enqueue_index(&self) -> usize {
         self.enqueue
+    }
+
+    /// The cycle bit the next enqueued TRB will carry — the DCS a Set TR
+    /// Dequeue Pointer resuming at [`Self::enqueue_index`] must program.
+    #[must_use]
+    pub fn cycle(&self) -> bool {
+        self.cycle
     }
 
     /// Place `trb` (built by one of the free functions above, cycle bit clear)
