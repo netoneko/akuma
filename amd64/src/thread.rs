@@ -385,7 +385,36 @@ fn teardown(slot: usize) {
     crate::futex::purge_task(t.task);
     // Same argument for the identity map: a stale `tid -> pid` row would hand
     // the next occupant of this slot the dead thread's process.
-    akuma_exec::process::thread_pid_map_remove(t.task);
+    //
+    // **And retire the `Process` behind it**, which is the half this target had
+    // no need of until the `clone` fold: a thread used to be a `THREADS` row and
+    // a task, with no `Process` of its own, so there was nothing here to
+    // release. `clone_thread` gives every thread a real registered `Process`
+    // (its own pid, `tgid` = the leader's), and on this target **nothing else
+    // releases it**: a process is retired by `sys_waitpid`, and a thread is
+    // never waited for.
+    //
+    // The other kernel does this from `akuma_exec::process::on_thread_cleanup`,
+    // registered as `threading::set_cleanup_callback` and run when a thread slot
+    // is recycled. That callback never fires here, because x86 slots are
+    // recycled by `x86_claim_slot` taking a `TERMINATED` one directly rather
+    // than through the crate's collector — so the release has to happen at the
+    // one point this target *does* know a thread is finished, which is here.
+    //
+    // Left out, it is a `Process` leaked per `pthread_create`, and the symptom
+    // is two: `ps` grows by a row that never goes away, and — because the dead
+    // `Process` keeps `thread_id = Some(task)` — `resolve_thread_process`'s
+    // table scan starts finding it for whoever inherits the task slot and logs
+    // `[TRAMP-MISMATCH]`. Measured on the metal: two `threadprobe` rows still in
+    // `ps` long after the boot self-test, and two mismatch lines naming them.
+    //
+    // No remaining-thread count, unlike the shared callback: the map row just
+    // removed was this thread's own pid, and a thread's `Process` has exactly
+    // one thread by construction. `unregister_process` retires the slot; the
+    // frames come back on the next `drain_retired_if_requested`.
+    if let Some(pid) = akuma_exec::process::thread_pid_map_remove(t.task) {
+        akuma_exec::process::unregister_process(pid);
+    }
 }
 
 /// `FUTEX_WAKE | FUTEX_PRIVATE_FLAG`, the op `teardown`'s wake uses. Spelled
