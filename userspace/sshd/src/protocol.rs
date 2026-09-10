@@ -93,6 +93,29 @@ struct SshSession {
     /// ignore the real terminal size. Defaults to 80x24.
     term_width: u32,
     term_height: u32,
+    /// The client's terminal type, from the same `pty-req`'s first field —
+    /// `xterm-256color` for a default OpenSSH client. Handed to the session's
+    /// child as `TERM`.
+    ///
+    /// It was read only to advance the parse offset and discarded until
+    /// `docs/archive/AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 6, so no kernel
+    /// here ever learned the client's terminal type and every program under a
+    /// session ran with `TERM` empty — which is what makes `less`, `vi` and
+    /// coloured `ls` fall back to their dumbest mode.
+    ///
+    /// **Client-controlled**, so it is filtered before it becomes an
+    /// environment variable: see `wire::sanitize_term`.
+    term_type: String,
+    /// Whether the client asked for a pty (`ssh -t`/`-tt`, i.e. a `pty-req`
+    /// ahead of its `shell` or `exec` request).
+    ///
+    /// Tracked because the `exec` path needs it: `ssh -tt host 'cmd'` sends
+    /// `pty-req` and then `exec`, and that path spawned a plain pipe with no
+    /// size and no `TERM` — so a command run that way saw 80x24 however the
+    /// window was set, which is exactly what the documented reproduction of
+    /// this bug measures. A client that sends no `pty-req` still gets a pipe,
+    /// which is what `ssh host 'cmd' < file` depends on.
+    pty_requested: bool,
 }
 
 impl SshSession {
@@ -113,6 +136,8 @@ impl SshSession {
             config,
             term_width: 80,
             term_height: 24,
+            term_type: String::new(),
+            pty_requested: false,
         }
     }
 }
@@ -127,6 +152,24 @@ impl SshSession {
 /// sessions, so exit-on-child-exit / stdin-forwarding / stdout-draining
 /// behave identically. There is no built-in fallback — a spawn failure ends
 /// the session with an error message.
+/// The environment a session's child is spawned with, as `KEY=VALUE` strings.
+///
+/// `TERM` only, and only for a client that asked for a pty — the same rule
+/// OpenSSH follows, and for the same reason: `TERM` describes a terminal, and a
+/// child whose stdout is a pipe does not have one. Everything else a login
+/// shell wants (`PATH`, `HOME`) is the shell's own default here; this is not
+/// the place to invent a login policy.
+///
+/// Returned owned because the strings must outlive the `spawn` call that
+/// borrows them.
+fn session_env(session: &SshSession) -> Vec<String> {
+    let mut env = Vec::new();
+    if session.pty_requested && !session.term_type.is_empty() {
+        env.push(format!("TERM={}", session.term_type));
+    }
+    env
+}
+
 async fn run_exec_session(
     stream: &mut SshStream,
     session: &mut SshSession,
@@ -138,8 +181,31 @@ async fn run_exec_session(
     arg_refs.push("-c");
     arg_refs.push(cmd_str);
     println(&format!("[SSH] Exec: {} {:?}", shell_path, arg_refs));
-    if let Some(res) = spawn(&shell_path, Some(&arg_refs)) {
-        return bridge_process(stream, session, res.pid, res.stdout_fd, false).await;
+    // `ssh -tt host 'cmd'` sends `pty-req` and *then* `exec`, and a client that
+    // asked for a terminal expects the command to get one: `TERM` set, and
+    // `TIOCGWINSZ` answering the real window rather than 80x24. This path
+    // always spawned a plain pipe and never called `set_terminal_size`, which
+    // is why `ssh -tt akuma 'busybox stty size'` reported `24 80` from a 132x50
+    // window (`AMD64_SSH_TERM_SIZE_NOT_PASSED.md` § 6's own reproduction).
+    //
+    // Without a `pty-req` this stays exactly as it was — a pipe — because a
+    // non-interactive `ssh host 'cmd'` must not have its output cooked.
+    let env = session_env(session);
+    let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
+    let res = if session.pty_requested {
+        spawn_pty(&shell_path, Some(&arg_refs), &env_refs)
+    } else {
+        spawn_with_env(&shell_path, Some(&arg_refs), None, &env_refs)
+    };
+    if let Some(res) = res {
+        if session.pty_requested {
+            set_terminal_size(
+                res.stdout_fd as i32,
+                session.term_width as u16,
+                session.term_height as u16,
+            );
+        }
+        return bridge_process(stream, session, res.pid, res.stdout_fd, session.pty_requested).await;
     }
     fail_spawn(stream, session, &shell_path, "exec").await
 }
@@ -199,7 +265,9 @@ async fn run_shell_session(
     // shell is cooked like a real terminal instead of a raw pipe. (A future
     // refinement could gate this on a tracked `pty-req` flag so a
     // no-pty client gets a pipe.)
-    if let Some(res) = spawn_pty(&shell_path, args) {
+    let env = session_env(session);
+    let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
+    if let Some(res) = spawn_pty(&shell_path, args, &env_refs) {
         // Push the client's pty-req dimensions into the child's TerminalState
         // so TIOCGWINSZ (vi, less, `stty size`) sees the real size, not 80x24.
         // Must happen before the first full-screen redraw. The child got a
@@ -657,10 +725,15 @@ async fn handle_message(
             if req_type == b"pty-req" {
                 // Format after want_reply: string TERM, u32 width, u32 height,
                 // u32 pixel_width, u32 pixel_height, string modes. Stash the
-                // dimensions; run_shell_session applies them to the spawned
-                // shell via TIOCSWINSZ once it has the child fd.
+                // terminal type and the dimensions; the session start applies
+                // the dimensions to the spawned child via TIOCSWINSZ once it
+                // has the child fd, and passes the type as `TERM` in its
+                // environment.
                 let mut off = offset + 1; // skip want_reply
-                let _term = read_string(payload, &mut off);
+                session.pty_requested = true;
+                if let Some(term) = read_string(payload, &mut off) {
+                    session.term_type = wire::sanitize_term(term);
+                }
                 if let (Some(w), Some(h)) = (read_u32(payload, &mut off), read_u32(payload, &mut off)) {
                     session.term_width = w;
                     session.term_height = h;

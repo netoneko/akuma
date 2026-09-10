@@ -14,6 +14,7 @@
 //! owns only what the bytes must look like.
 
 use akuma_ssh_crypto::crypto::{write_string, write_u32};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -128,10 +129,108 @@ pub fn channel_close_payload(channel: u32) -> Vec<u8> {
     payload
 }
 
+/// The client's `pty-req` terminal type, reduced to something safe to hand a
+/// child as `TERM`.
+///
+/// The string arrives over the wire from an unauthenticated-at-parse-time peer
+/// and ends up in a child's environment, where `ncurses` uses it to build a
+/// **path** into the terminfo database. So the filter is a whitelist, not a
+/// blacklist: ASCII alphanumerics and `-_.+` only, which is a superset of every
+/// real terminfo name (`xterm-256color`, `screen.linux`, `Eterm`) and admits no
+/// `/`, no `..`, no NUL, no shell metacharacter and no control byte.
+///
+/// A name that fails the filter — or is empty, or absurdly long — yields
+/// `String::new()`, and `protocol.rs`'s `session_env` then sends no `TERM` at
+/// all rather than a mangled one. An absent `TERM` is a state every program
+/// handles; a half-sanitized one is not.
+#[must_use]
+pub fn sanitize_term(raw: &[u8]) -> String {
+    // Longest real terminfo names are ~20 bytes; 64 is generous and bounded.
+    if raw.is_empty() || raw.len() > 64 {
+        return String::new();
+    }
+    if !raw
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+    {
+        return String::new();
+    }
+    // Every byte passed the ASCII filter, so this cannot fail.
+    String::from_utf8(raw.to_vec()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use akuma_ssh_crypto::crypto::{read_string, read_u32};
+
+    /// The names a real client sends, which must survive untouched. A filter
+    /// that rejects `xterm-256color` is worse than no filter: it puts every
+    /// session back to `TERM` empty, which is the bug this whole path exists to
+    /// fix.
+    #[test]
+    fn real_terminal_types_pass_through_unchanged() {
+        for name in [
+            "xterm-256color",
+            "xterm",
+            "screen.linux",
+            "rxvt-unicode-256color",
+            "Eterm",
+            "vt100",
+            "linux",
+            "tmux-256color",
+            "alacritty",
+            "dumb",
+        ] {
+            assert_eq!(sanitize_term(name.as_bytes()), name, "rejected {name}");
+        }
+    }
+
+    /// The shapes that must not reach a child's environment. `TERM` is a
+    /// **path component** to ncurses, and half of a `KEY=VALUE` string to the
+    /// spawn ABI, so a separator or a control byte in it is not merely ugly.
+    #[test]
+    fn hostile_terminal_types_are_dropped_whole() {
+        for hostile in [
+            &b"../../../etc/passwd"[..],
+            b"xterm/../../evil",
+            b"xterm\0extra",     // a NUL would truncate the C string early
+            b"xterm=other",      // an `=` would forge a second env var
+            b"xterm\nLD_PRELOAD=/tmp/x",
+            b"xterm color",      // a space splits an argv the shell rebuilds
+            b"$(reboot)",
+            b"xterm;reboot",
+            b"\x1b[2J",          // a control sequence, replayed on any tty
+            b"",
+        ] {
+            assert_eq!(
+                sanitize_term(hostile),
+                "",
+                "let through {:?}",
+                core::str::from_utf8(hostile)
+            );
+        }
+    }
+
+    /// Bounded, and at the boundary rather than near it: 64 bytes is the last
+    /// accepted length and 65 the first rejected one. An off-by-one here is a
+    /// name that passes the filter and no test.
+    #[test]
+    fn length_cap_is_enforced_at_its_exact_edge() {
+        let ok = "x".repeat(64);
+        assert_eq!(sanitize_term(ok.as_bytes()), ok);
+        let too_long = "x".repeat(65);
+        assert_eq!(sanitize_term(too_long.as_bytes()), "");
+    }
+
+    /// Non-UTF-8 input takes the same exit as any other rejected byte, and
+    /// takes it *before* the `String` conversion — the conversion's own
+    /// fallback is unreachable and this is what says so.
+    #[test]
+    fn invalid_utf8_is_rejected_by_the_byte_filter() {
+        assert_eq!(sanitize_term(&[0xFF, 0xFE, 0x80]), "");
+        assert_eq!(sanitize_term("xtérm".as_bytes()), "");
+    }
 
     /// Full byte-for-byte layout of an `exit-status` request, which is the part
     /// a real client actually parses. Spelled out literally rather than rebuilt

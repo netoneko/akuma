@@ -1781,7 +1781,7 @@ pub struct SpawnResult {
 /// Returns SpawnResult on success with child PID and stdout FD.
 /// Returns None on error.
 pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
-    spawn_with_stdin(path, args, None)
+    spawn_full(path, args, None, &[], 0)
 }
 
 /// Spawn flag bits passed in the SPAWN syscall's 6th argument (Akuma's own
@@ -1795,83 +1795,90 @@ pub const SPAWN_FLAG_PTY: u64 = 1;
 /// runs its canonical line discipline (ICRNL CR->NL, echo, line editing) on the
 /// child's stdin. Used by sshd when a client requests an interactive login shell
 /// (`pty-req` / `ssh -tt`) so typed input is cooked like a real terminal.
-pub fn spawn_pty(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
-    let path_terminated = alloc::format!("{}\0", path);
-    let mut argv = alloc::vec::Vec::new();
-    argv.push(path_terminated.as_ptr());
-
-    let mut args_terminated = alloc::vec::Vec::new();
-    if let Some(slice) = args {
-        for a in slice {
-            args_terminated.push(alloc::format!("{}\0", a));
-        }
-    }
-    for s in &args_terminated {
-        argv.push(s.as_ptr());
-    }
-    argv.push(core::ptr::null());
-
-    let result = syscall(
-        syscall::SPAWN,
-        path_terminated.as_ptr() as u64,
-        argv.as_ptr() as u64,
-        0, // NULL envp
-        0, // no stdin seed
-        0,
-        SPAWN_FLAG_PTY,
-    );
-
-    if (result as i64) < 0 {
-        return None;
-    }
-
-    let pid = (result & 0xFFFF_FFFF) as u32;
-    let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-    Some(SpawnResult { pid, stdout_fd })
+///
+/// `env` is the child's whole environment, as `KEY=VALUE` strings. It is a
+/// parameter and not an omission: a pty child is precisely the one that needs
+/// `TERM`, and this wrapper having nowhere to put it is why an ssh session's
+/// terminal type never reached the shell
+/// (`docs/archive/AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 7). Pass `&[]` for
+/// none.
+pub fn spawn_pty(path: &str, args: Option<&[&str]>, env: &[&str]) -> Option<SpawnResult> {
+    spawn_full(path, args, None, env, SPAWN_FLAG_PTY)
 }
 
 /// Spawn a child process with stdin data
 ///
 /// Returns SpawnResult on success with child PID and stdout FD.
 /// Returns None on error.
-/// 
+///
 /// If stdin is provided, it will be available to the child process
 /// when reading from stdin (fd 0).
 pub fn spawn_with_stdin(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Option<SpawnResult> {
-    // 1. Build argv array: [path, args..., NULL]
-    let mut argv = alloc::vec::Vec::new();
-    // Use raw pointers to strings. Strings must stay alive during syscall!
-    // In libakuma::spawn, the caller provides &str which usually live long enough.
-    // However, we need null-terminated strings for the kernel.
-    
-    // For simplicity and safety in this wrapper, we'll convert all to String
+    spawn_full(path, args, stdin, &[], 0)
+}
+
+/// Spawn a child process with stdin data and extra environment variables.
+/// env is a list of "KEY=VALUE" strings to inject into the child's environment.
+pub fn spawn_with_env(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, env: &[&str]) -> Option<SpawnResult> {
+    spawn_full(path, args, stdin, env, 0)
+}
+
+/// The one SPAWN call the four wrappers above are each a preset of.
+///
+/// They differed only in which of `stdin`, `env` and `flags` they passed and
+/// otherwise carried four copies of the same argv/envp marshalling — which is
+/// how `spawn_pty` came to be the only one with no `envp` at all, four spawn
+/// paths deep. One body means a fix to the marshalling is a fix everywhere.
+///
+/// **Lifetimes are the whole hazard here.** `argv`/`envp` are arrays of raw
+/// pointers into the `String`s built below; those `String`s must outlive the
+/// syscall, so they are named locals (`args_terminated`, `env_terminated`) and
+/// not temporaries inside the loops that take their addresses.
+fn spawn_full(
+    path: &str,
+    args: Option<&[&str]>,
+    stdin: Option<&[u8]>,
+    env: &[&str],
+    flags: u64,
+) -> Option<SpawnResult> {
+    // argv[0] is the path; the caller's args follow. NUL-terminated copies,
+    // because the kernel reads C strings and `&str` is not one.
     let path_terminated = alloc::format!("{}\0", path);
+    let args_terminated: alloc::vec::Vec<alloc::string::String> = args
+        .unwrap_or(&[])
+        .iter()
+        .map(|a| alloc::format!("{}\0", a))
+        .collect();
+    let mut argv = alloc::vec::Vec::with_capacity(args_terminated.len() + 2);
     argv.push(path_terminated.as_ptr());
-    
-    let mut args_terminated = alloc::vec::Vec::new();
-    if let Some(slice) = args {
-        for a in slice {
-            let s = alloc::format!("{}\0", a);
-            args_terminated.push(s);
-        }
-    }
-    
     for s in &args_terminated {
         argv.push(s.as_ptr());
     }
     argv.push(core::ptr::null());
 
-    let stdin_ptr = stdin.map(|s| s.as_ptr() as u64).unwrap_or(0);
-    let stdin_len = stdin.map(|s| s.len() as u64).unwrap_or(0);
+    let env_terminated: alloc::vec::Vec<alloc::string::String> =
+        env.iter().map(|e| alloc::format!("{}\0", e)).collect();
+    let mut envp = alloc::vec::Vec::with_capacity(env_terminated.len() + 1);
+    for s in &env_terminated {
+        envp.push(s.as_ptr());
+    }
+    envp.push(core::ptr::null());
+    // A NULL `envp` and a pointer to a lone NULL both mean "empty environment"
+    // to every kernel here; pass NULL for the empty case so the wire form is
+    // exactly what the pre-`spawn_full` wrappers sent.
+    let envp_arg = if env.is_empty() { 0 } else { envp.as_ptr() as u64 };
+
+    let stdin_ptr = stdin.map_or(0, |s| s.as_ptr() as u64);
+    let stdin_len = stdin.map_or(0, |s| s.len() as u64);
 
     let result = syscall(
         syscall::SPAWN,
         path_terminated.as_ptr() as u64,
         argv.as_ptr() as u64,
-        0, // NULL envp
+        envp_arg,
         stdin_ptr,
         stdin_len,
-        0,
+        flags,
     );
 
     // Check for error (negative value)
@@ -1880,58 +1887,6 @@ pub fn spawn_with_stdin(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>)
     }
 
     // Extract PID (low 32 bits) and stdout_fd (high 32 bits)
-    let pid = (result & 0xFFFF_FFFF) as u32;
-    let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-
-    Some(SpawnResult { pid, stdout_fd })
-}
-
-/// Spawn a child process with stdin data and extra environment variables.
-/// env is a list of "KEY=VALUE" strings to inject into the child's environment.
-pub fn spawn_with_env(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, env: &[&str]) -> Option<SpawnResult> {
-    let path_terminated = alloc::format!("{}\0", path);
-    let mut argv = alloc::vec::Vec::new();
-    argv.push(path_terminated.as_ptr());
-
-    let mut args_terminated = alloc::vec::Vec::new();
-    if let Some(slice) = args {
-        for a in slice {
-            let s = alloc::format!("{}\0", a);
-            args_terminated.push(s);
-        }
-    }
-    for s in &args_terminated {
-        argv.push(s.as_ptr());
-    }
-    argv.push(core::ptr::null());
-
-    let mut envp = alloc::vec::Vec::new();
-    let mut env_terminated = alloc::vec::Vec::new();
-    for e in env {
-        env_terminated.push(alloc::format!("{}\0", e));
-    }
-    for s in &env_terminated {
-        envp.push(s.as_ptr());
-    }
-    envp.push(core::ptr::null());
-
-    let stdin_ptr = stdin.map(|s| s.as_ptr() as u64).unwrap_or(0);
-    let stdin_len = stdin.map(|s| s.len() as u64).unwrap_or(0);
-
-    let result = syscall(
-        syscall::SPAWN,
-        path_terminated.as_ptr() as u64,
-        argv.as_ptr() as u64,
-        envp.as_ptr() as u64,
-        stdin_ptr,
-        stdin_len,
-        0,
-    );
-
-    if (result as i64) < 0 {
-        return None;
-    }
-
     let pid = (result & 0xFFFF_FFFF) as u32;
     let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
     Some(SpawnResult { pid, stdout_fd })

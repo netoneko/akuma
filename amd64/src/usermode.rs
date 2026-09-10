@@ -2160,8 +2160,9 @@ impl Image {
     }
 
     /// As [`Self::from_elf`], with the argv the program sees on its initial
-    /// stack. `sys_spawn` passes the real one (`sh -c "<cmd>"`); the tests pass
-    /// a single element because `hello.rs` only checks `argv[0]`.
+    /// stack and no environment. The self-tests pass a single element because
+    /// `hello.rs` only checks `argv[0]`; the syscall paths carry an environment
+    /// and go through [`Self::from_elf_argv_envp`] directly.
     fn from_elf_argv(
         image: &[u8],
         argv: &[&[u8]],
@@ -2169,9 +2170,10 @@ impl Image {
         Self::from_elf_argv_envp(image, argv, &[])
     }
 
-    /// As [`Self::from_elf_argv`], plus the environment. `execve` (Stage T)
-    /// hands the new image the caller's whole `envp`; `spawn` passes none, and a
-    /// program with an empty environment falls back to its own default `PATH`.
+    /// As [`Self::from_elf_argv`], plus the environment. Both `execve` and
+    /// `sys_spawn` hand the new image the caller's `envp`; `from_elf_argv` (the
+    /// self-tests) passes none, and a program with an empty environment falls
+    /// back to its own default `PATH`.
     fn from_elf_argv_envp(
         image: &[u8],
         argv: &[&[u8]],
@@ -2809,7 +2811,7 @@ fn start_test_process(
     let mut cmdline = alloc::vec::Vec::with_capacity(name.len() + 1);
     cmdline.extend_from_slice(name.as_bytes());
     cmdline.push(0);
-    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None);
+    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None, None);
     crate::sched::publish_task(task_slot);
     Some((pid, task_slot))
 }
@@ -2894,6 +2896,21 @@ struct Spawn {
     /// `None` for a `fork` child, which shares its parent's by descriptor. See
     /// the type's header for why this one field outlived the other three.
     stdin_pipe: Option<PipeId>,
+    /// The stdout pipe this spawn created, whose *read* end the parent holds as
+    /// a `PipeRead` descriptor; `None` for a `fork` child, which creates no
+    /// pipe of its own.
+    ///
+    /// Recorded for one reader: [`child_of_stdout_pipe`], which is how a
+    /// `TIOCSWINSZ` arriving on that descriptor finds the child whose
+    /// `TerminalState` it is meant for. On AArch64 the same question is
+    /// answered by the descriptor itself (`FileDescriptor::ChildStdout(pid)`);
+    /// this target hands the parent a plain `PipeRead` and so has to carry the
+    /// link here instead.
+    ///
+    /// The id cannot go stale under a live descriptor: a pipe is destroyed only
+    /// when both end counts reach zero, so while the parent holds the read end
+    /// this id names this pipe and no later spawn can be handed it.
+    stdout_pipe: Option<PipeId>,
     /// The scheduler task slot running this child, recorded at spawn so the
     /// `waitpid` reap can remove the `THREAD_PID_MAP` entry it published
     /// (`reap_exec_process`). A `usize` is wider than `sched::MAX_TASKS` needs,
@@ -3207,6 +3224,20 @@ fn register_exec_process(
     // (`KernelFile` is not hook-refcounted), and slice 6 is the one that has
     // to wire the hooks before a `PipeRead`/`PipeWrite` can be cloned.
     fds: Option<alloc::sync::Arc<akuma_exec::process::SharedFdTable>>,
+    // The terminal to describe when this process asks `TIOCGWINSZ` — `None`
+    // builds a fresh 24x80 one, and `sys_fork` passes the parent's `Arc`.
+    //
+    // A `fork` child inherits its parent's terminal on every Unix and on the
+    // AArch64 kernel (`Process::fork` clones this same `Arc`); building it a
+    // fresh one here meant an `sshd` session's window size stopped at the login
+    // shell and every program the shell ran read the 24x80 default —
+    // `AMD64_SSH_TERM_SIZE_NOT_PASSED.md`, the break its §5 fix order does not
+    // list because the size never reached the shell either.
+    //
+    // Sharing the `Arc` rather than copying the size is what a live resize
+    // needs: `sshd` writes the child's state on `window-change` and the running
+    // full-screen program reads the same cell.
+    term: Option<alloc::sync::Arc<Spinlock<akuma_terminal::TerminalState>>>,
 ) {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
@@ -3311,7 +3342,8 @@ fn register_exec_process(
         fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio())),
         thread_id: None,
         spawner_pid: None,
-        terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
+        terminal_state: term
+            .unwrap_or_else(|| Arc::new(Spinlock::new(akuma_terminal::TerminalState::default()))),
         box_id: 0,
         namespace: akuma_isolation::global_namespace(),
         channel: None,
@@ -3773,6 +3805,8 @@ fn sys_fork() -> u64 {
         // suite's `redirect` test, first boot of slice 4); with one authority
         // there is one place for it.
         Some(alloc::sync::Arc::new(parent.fds.clone_deep_for_fork())),
+        // The parent's terminal, shared — not a copy of its size.
+        Some(parent.terminal_state.clone()),
     );
 
     // SAFETY: raw-pointer write; single core.
@@ -3784,6 +3818,8 @@ fn sys_fork() -> u64 {
             // child's own row sweep at exit. This `None` is what `borrowed_io`
             // used to say.
             stdin_pipe: None,
+            // Nor a stdout pipe: fd 1/2 are names for the parent's.
+            stdout_pipe: None,
             exec_slot: task_slot,
         });
     }
@@ -3803,7 +3839,7 @@ fn sys_fork() -> u64 {
 /// bit 0 (`SPAWN_FLAG_PTY`) is accepted and currently ignored: this target has
 /// no pty line discipline for a pipe, so an interactive shell gets raw bytes
 /// and does its own editing (`paws` already does).
-pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin_len: u64) -> u64 {
+pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: u64) -> u64 {
     use crate::fd::errno;
 
     let Some(path_bytes) = user_cstr(path_ptr, 256) else {
@@ -3825,8 +3861,16 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         }
         v
     };
+    // The environment, which this arm named `_envp` and threw away until
+    // `AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 8: **no** environment reached
+    // any spawned child on this target, so anything reading `TERM`, `PATH`,
+    // `HOME` or `TZ` got nothing. `sys_execve` has always honoured it through
+    // the same loader entry point; this is that call, with the same caps.
+    let envp_owned = user_strv(envp_ptr, loader::MAX_ENVP);
     let argv_refs: alloc::vec::Vec<&[u8]> =
         argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
+    let envp_refs: alloc::vec::Vec<&[u8]> =
+        envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
     // Kept for `/proc/<pid>/cmdline`: the loader writes argv onto the child's
     // stack and this vector is dropped, so this is the last chance to record it.
     let spawn_cmdline = flatten_cmdline(argv_refs.iter().copied());
@@ -3845,7 +3889,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         return errno::ENOMEM;
     };
 
-    let (child, img) = match Image::from_elf_argv(&image, &argv_refs) {
+    let (child, img) = match Image::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [spawn] load failed: ");
@@ -3932,6 +3976,11 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         path,
         &spawn_cmdline,
         Some(child_fds),
+        // A spawned child gets a **fresh** terminal state, deliberately: that
+        // is the state `sshd` then writes the client's window size into, and
+        // two concurrent sessions must not share one. Same rule as the AArch64
+        // `pty` spawn (`akuma-exec`'s `spawn.rs`).
+        None,
     );
 
     // SAFETY: raw-pointer write; single core.
@@ -3939,6 +3988,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid,
             stdin_pipe: Some(stdin_pipe),
+            stdout_pipe: Some(stdout_pipe),
             exec_slot: task_slot,
         });
     }
@@ -4267,6 +4317,31 @@ fn spawn_row_of(pid: u32) -> Option<usize> {
     unsafe { (*spawn_table()).iter().position(|e| e.as_ref().is_some_and(|s| s.pid == pid)) }
 }
 
+/// The pid of the child whose stdout is `pipe_id`, if a live spawn row names it.
+///
+/// This is the amd64 stand-in for `FileDescriptor::ChildStdout(pid)`. `sshd`
+/// holds a spawned session's stdout as a plain `PipeRead` on this target, and
+/// `TIOCSWINSZ` has to reach the *child's* `TerminalState` rather than the
+/// caller's — a `pty` spawn deliberately gives the child a fresh one, so the
+/// parent cannot pass the window size along by writing its own
+/// (`akuma-syscalls-glue`'s `TIOCSWINSZ` arm states the same reasoning for the
+/// kernel that does have the descriptor).
+///
+/// `None` for any pipe that is not a spawn's stdout — an ordinary `pipe(2)`
+/// pair, or a child already reaped — and the caller then falls back to its own
+/// terminal state, which is the behaviour this target had for every fd.
+#[must_use]
+pub fn child_of_stdout_pipe(pipe_id: usize) -> Option<u32> {
+    // SAFETY: raw-pointer read; single core, no row mutated.
+    unsafe {
+        (*spawn_table())
+            .iter()
+            .flatten()
+            .find(|s| s.stdout_pipe == Some(pipe_id))
+            .map(|s| s.pid)
+    }
+}
+
 #[cfg(not(feature = "no-tests"))]
 /// Stage R: `sys_spawn` runs a child, its stdout comes back through a pipe, and
 /// `waitpid` reports its exit status.
@@ -4308,6 +4383,13 @@ pub fn spawn_test(t: &mut Suite) {
     // `dup2` target, a lost stderr. Asked here, of the live child, before it
     // is drained — the one moment the table is guaranteed populated and not
     // yet swept by `close_all`.
+    //
+    // `Spawn::stdout_pipe` is back in that list, and **not** as the routing
+    // field slice 6 deleted: nothing reads stdio through it and nothing frees a
+    // pipe by it (the descriptors' refcounts still own both ends). It records
+    // one fact the descriptor cannot, which is *which child* the parent's read
+    // end belongs to — see [`child_of_stdout_pipe`] and
+    // [`winsize_to_child_test`].
     {
         use akuma_exec::process::FileDescriptor;
         let stdio = akuma_exec::process::with_process(pid, |p| {
@@ -4374,6 +4456,162 @@ pub fn spawn_test(t: &mut Suite) {
         "spawn: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
+    );
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// **An ssh session's window size reaches the child it describes.**
+///
+/// The bug this pins is `AMD64_SSH_TERM_SIZE_NOT_PASSED.md`, where a full-screen
+/// program over ssh always read 80x24 whatever the client's window was. Both
+/// halves were silent — `TIOCSWINSZ` returned 0 having written the size into a
+/// process that never reads it, and `TIOCGWINSZ` returned a constant — so
+/// neither could be caught by anything but a check that follows a size all the
+/// way through. That is what this is, in the shape `sshd` uses:
+///
+/// 1. spawn a child and hold its stdout, which is what `sshd` has after
+///    `spawn_pty` (a `PipeRead` on this target; a `ChildStdout` on AArch64);
+/// 2. `TIOCSWINSZ` on that descriptor — the parent describing the *client's*
+///    terminal, not its own;
+/// 3. the size lands on the **child's** `TerminalState` and **not** the
+///    caller's, which is the half that was wrong (break 4) and the half a
+///    single-process check cannot tell apart;
+/// 4. `TIOCGWINSZ` on a console fd reports a tracked size rather than the
+///    compiled-in 24x80 (break 5).
+///
+/// The size is 132x50, deliberately not a default and not square: 80 or 24
+/// anywhere in this test would let a hardcoded answer pass it, which is the
+/// same reason the doc's own reproduction uses that window.
+pub fn winsize_to_child_test(t: &mut Suite) {
+    use crate::fd::errno;
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const ROWS: u16 = 50;
+    const COLS: u16 = 132;
+
+    if crate::fs::read_file("/bin/hello").is_err() {
+        t.note("winsize: /bin/hello not on the disk; skipped", 0);
+        return;
+    }
+
+    // The caller's own state, to prove at the end that the child's size did not
+    // land here. `boot_row_register` (held by the caller across this block) is
+    // what gives the boot task a registered process to own one.
+    let caller_pid = current_pid();
+
+    let path = b"/bin/hello\0";
+    let arg0 = b"hello\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if !t.check("winsize: spawned a child to describe a terminal to", r < ERRNO_FLOOR) {
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+
+    // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }.
+    let winsz: [u16; 4] = [ROWS, COLS, 0, 0];
+    t.check_eq(
+        "winsize: TIOCSWINSZ on the child's stdout is accepted",
+        crate::fd::sys_ioctl(stdout_fd, TIOCSWINSZ, winsz.as_ptr() as u64),
+        0,
+    );
+
+    // **Break 4.** Accepting it was never the problem; landing it on the right
+    // process was. A `PipeRead` that names no spawn falls through to glue and
+    // sets the caller's own state, which is what happened for every fd here.
+    let child = akuma_exec::process::with_process(pid, |p| {
+        let ts = p.terminal_state.lock();
+        (ts.term_height, ts.term_width)
+    });
+    t.check_eq(
+        "winsize: it landed on the CHILD's terminal state (rows)",
+        u64::from(child.map_or(0, |(h, _)| h)),
+        u64::from(ROWS),
+    );
+    t.check_eq(
+        "winsize: and its columns",
+        u64::from(child.map_or(0, |(_, w)| w)),
+        u64::from(COLS),
+    );
+    let caller = akuma_exec::process::with_process(caller_pid, |p| {
+        let ts = p.terminal_state.lock();
+        (ts.term_height, ts.term_width)
+    });
+    t.check(
+        "winsize: and NOT on the caller's, which is where it used to go",
+        caller.is_none_or(|(h, w)| (h, w) != (ROWS, COLS)),
+    );
+
+    // **Break 5**, from the reader's side. `console_ioctl` claims fd 0 for the
+    // boot task and used to answer 24x80 from literals; it now reports whatever
+    // this process's state says. Written here rather than read, because the
+    // suite's caller is not the spawned child and cannot run an ioctl as it.
+    let restore = akuma_exec::process::with_process(caller_pid, |p| {
+        let mut ts = p.terminal_state.lock();
+        let was = (ts.term_height, ts.term_width);
+        ts.term_height = ROWS;
+        ts.term_width = COLS;
+        was
+    });
+    let mut got = [0u16; 4];
+    t.check_eq(
+        "winsize: TIOCGWINSZ on a console fd succeeds",
+        crate::fd::sys_ioctl(0, TIOCGWINSZ, got.as_mut_ptr() as u64),
+        0,
+    );
+    t.check_eq(
+        "winsize: and reports the tracked size, not a compiled-in 24x80",
+        (u64::from(got[0]) << 16) | u64::from(got[1]),
+        (u64::from(ROWS) << 16) | u64::from(COLS),
+    );
+    if let Some((h, w)) = restore {
+        akuma_exec::process::with_process(caller_pid, |p| {
+            let mut ts = p.terminal_state.lock();
+            ts.term_height = h;
+            ts.term_width = w;
+        });
+    }
+
+    // A bad `winsize` pointer is `EFAULT` and not a wild kernel read — the arm
+    // copies four bytes in from userspace before it touches any state.
+    t.check_eq(
+        "winsize: an unreadable TIOCSWINSZ argument is EFAULT",
+        crate::fd::sys_ioctl(stdout_fd, TIOCSWINSZ, 0x1000),
+        errno::EFAULT,
+    );
+
+    // The link is by pipe id, so pin the one property that makes that safe: the
+    // id is claimed while the descriptor is open, and answers for nobody once
+    // the row is gone. A stale row here would aim a live session's resize at a
+    // dead pid — or at a *later* child that inherited the recycled id.
+    let pipe_id = crate::fd::pipe_read_id(stdout_fd);
+    t.check(
+        "winsize: the parent's stdout names this child while it is open",
+        pipe_id.and_then(child_of_stdout_pipe) == Some(pid),
+    );
+
+    // Drain and reap, so the child leaves no pipe and no row behind — the same
+    // shape `spawn_test` ends with, minus the output checks it owns.
+    let mut sink = [0u8; 256];
+    let mut spins = 0;
+    loop {
+        spins += 1;
+        if spins > 500_000 {
+            break;
+        }
+        let _ = crate::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
+    t.check(
+        "winsize: and names nobody once the child is reaped",
+        pipe_id.and_then(child_of_stdout_pipe).is_none(),
     );
 }
 
@@ -5191,7 +5429,7 @@ pub fn identity_cost_test(t: &mut Suite) {
     let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
     let pid = alloc_pid();
     let task = crate::sched::current_task();
-    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None);
+    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None, None);
 
     if !t.check("identity: the running task resolves to its process", current_process().is_some()) {
         finish_test_process(pid, task);
@@ -5892,7 +6130,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // `run_process` reads init's entry point and stack out of this
     // registration, so publishing first would race a task with nowhere to start
     // against the register that gives it one.
-    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None);
+    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None);
     crate::sched::publish_task(task_slot);
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes

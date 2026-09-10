@@ -1896,9 +1896,48 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     {
         return r;
     }
+    // `TIOCSWINSZ` on a spawned child's stdout, which is this target's answer
+    // to glue's `ChildStdout(pid)` arm. See [`child_pipe_set_winsize`].
+    if req == 0x5414
+        && let Some(r) = child_pipe_set_winsize(fd, arg)
+    {
+        return r;
+    }
     // Everything else — including any request on a console fd that the terminal
     // subset above does not claim, which glue also answers `ENOTTY`.
     akuma_syscalls_glue::term::sys_ioctl(fd as u32, req as u32, arg)
+}
+
+/// `TIOCSWINSZ` aimed at a spawned child, through the parent's stdout descriptor.
+///
+/// `None` means "not that" and lets the caller carry on to glue, which sets the
+/// *caller's* own terminal state — the right answer for a process resizing its
+/// own console and the wrong one for `sshd`, whose session shell got a fresh
+/// `TerminalState` at spawn and is the process the client's `pty-req` describes.
+///
+/// AArch64 asks the same question of the descriptor: `sshd` holds the child
+/// under a `FileDescriptor::ChildStdout(pid)` there and glue's arm reads the pid
+/// straight out of it. This target hands the parent a plain `PipeRead`, so the
+/// link is carried by the spawn row instead (`usermode::child_of_stdout_pipe`)
+/// and looked up here. Without it the size landed in `sshd`'s own state, which
+/// nothing ever reads — `AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 4.
+///
+/// The child's state is an `Arc` its `fork` children inherit, so the update
+/// reaches the whole session tree — the shell, and the full-screen program it
+/// runs — through [`console_ioctl`]'s `TIOCGWINSZ`.
+fn child_pipe_set_winsize(fd: u64, arg: u64) -> Option<u64> {
+    let pid = pipe_read_id(fd).and_then(crate::usermode::child_of_stdout_pipe)?;
+    // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }.
+    let Some(bytes) = copy_in(arg, 4) else {
+        return Some(errno::EFAULT);
+    };
+    let rows = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let cols = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let proc = akuma_exec::process::lookup_process_shared(pid)?;
+    let mut ts = proc.terminal_state.lock();
+    ts.term_height = rows;
+    ts.term_width = cols;
+    Some(0)
 }
 
 /// The terminal subset this target answers itself, for a console fd.
@@ -1959,10 +1998,29 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
             if arg == 0 {
                 return Some(errno::EFAULT);
             }
+            // **The one request here that is not a constant.** The window size
+            // is the only part of a terminal this target really tracks: an
+            // `sshd` session's client knows its own size, sends it in
+            // `pty-req`, and `sshd` writes it into this process's
+            // `TerminalState` through `TIOCSWINSZ` (see [`sys_ioctl`]'s arm for
+            // how it gets here from the *parent's* descriptor). Answering the
+            // compiled-in 24x80 instead is what made every full-screen program
+            // over ssh believe the window was 80 columns whatever it really was
+            // — `AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 5.
+            //
+            // The fallback stays 24x80, for a process with no registered
+            // terminal state at all (the boot task); `TerminalState::default()`
+            // is the same size, so a process that was never told anything reads
+            // exactly what it read before.
+            let (rows, cols) = akuma_exec::process::current_terminal_state()
+                .map_or((24u16, 80u16), |ts| {
+                    let ts = ts.lock();
+                    (ts.term_height, ts.term_width)
+                });
             // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }.
             let mut w = [0u8; 8];
-            w[0..2].copy_from_slice(&24u16.to_le_bytes()); // ws_row
-            w[2..4].copy_from_slice(&80u16.to_le_bytes()); // ws_col
+            w[0..2].copy_from_slice(&rows.to_le_bytes()); // ws_row
+            w[2..4].copy_from_slice(&cols.to_le_bytes()); // ws_col
             if errno::is_err(copy_to_user(arg, &w)) {
                 return Some(errno::EFAULT);
             }
@@ -1970,6 +2028,11 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
         }
         // The setters and job-control queries: accept, and answer with the one
         // process group this target has.
+        //
+        // `TIOCSWINSZ` is accepted-and-dropped on purpose: a process setting
+        // the size of its *own* console is describing a terminal this target
+        // does not own, and the size that matters comes from `sshd` on the
+        // parent's descriptor, which never reaches this arm ([`sys_ioctl`]).
         TCSETS | TCSETSW | TCSETSF | TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
         TIOCGPGRP => {
             if arg != 0 && errno::is_err(copy_to_user(arg, &1i32.to_le_bytes())) {
