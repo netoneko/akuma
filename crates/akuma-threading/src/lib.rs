@@ -1850,16 +1850,64 @@ impl ThreadPool {
     }
 }
 
-/// x86_64 stub — `pthread_create`-style spawning is out of scope for this
-/// pass's cooperative-only switch (see [`spawn_fn`]'s x86_64 arm instead).
 #[cfg(target_arch = "x86_64")]
 impl ThreadPool {
+    /// Claim a slot for a user thread and leave it `INITIALIZING` — the
+    /// x86_64 arm, and the read of this file that matters is that it is the
+    /// **same three steps** as the AArch64 one above (claim, give it a stack,
+    /// seed a context that enters `trampoline_fn(closure_ptr)`), with each
+    /// step spelled in this target's terms.
+    ///
+    /// It returned `Err` until 2026-09-11, which failed every shared
+    /// `fork`/`vfork`/`clone` at its spawn step. That was honest while nothing
+    /// on this target reached the shared path; it is what
+    /// `akuma_exec::process::fork_process` runs into first, so it is one half
+    /// of what the ring-3 entry seam's last slice had to build.
+    ///
+    /// # Three differences from the AArch64 arm, all of them this target's
+    ///
+    /// * **`self` is unused, and the pool lock buys nothing here.** The slot
+    ///   table this claims from is the crate's lock-free `THREAD_STATES`
+    ///   ([`x86_claim_slot`]); the `POOL`-guarded `stacks`/`slots` arrays are
+    ///   the AArch64 stack pool, which this target does not use. The method
+    ///   stays on `ThreadPool` so both architectures present one signature to
+    ///   [`spawn_user_thread_initializing`].
+    /// * **Stacks come from the target** ([`X86ArchHooks::prepare_task_slot`]),
+    ///   because `amd64` owns them per slot and reuses a recycled slot's pair.
+    /// * **Exhaustion is final, and the error string says so.**
+    ///   [`spawn_user_thread_initializing`] answers `"No free user thread
+    ///   slots"` with a reclaim-and-retry pass; that pass exists to move
+    ///   cooled-down `TERMINATED` slots to `FREE`, and [`x86_claim_slot`]
+    ///   already takes a `TERMINATED` slot no core is executing. There is
+    ///   nothing left for it to free — the stack-return half is
+    ///   `kernel_profile_extreme`, i.e. AArch64's — so a distinct string opts
+    ///   out of a retry that could only fail again.
     pub fn spawn_user_closure_initializing(
         &mut self,
-        _trampoline_fn: fn(*mut ()) -> !,
-        _closure_ptr: *mut (),
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
     ) -> Result<usize, &'static str> {
-        Err("spawn_user_closure_initializing: not implemented on x86_64 (see proposals/AKUMA_THREADING_ARCH_PORTABILITY.md)")
+        let slot = x86_claim_slot().ok_or("No free x86 task slots")?;
+
+        let Some(stack_top) = (arch().prepare_task_slot)(slot) else {
+            // `TERMINATED`, not `FREE` — the slot may already own one of the
+            // two stacks, and `x86_abandon` is what says "reusable, but not
+            // pristine". Same reasoning as `amd64::sched::abandon_unpublished`.
+            x86_abandon(slot);
+            return Err("Failed to allocate x86 task stacks");
+        };
+
+        // SAFETY: the slot is INITIALIZING, so no picker can select it and no
+        // switch can be reading its context concurrently — the same obligation
+        // `x86_seed_entry` documents, which this is the closure-carrying
+        // variant of.
+        unsafe {
+            *get_context_mut(slot) = x86_build_closure_context(stack_top, trampoline_fn, closure_ptr);
+        }
+
+        // NOTE: deliberately NOT published. The caller must `mark_thread_ready`,
+        // exactly as on AArch64.
+        Ok(slot)
     }
 }
 
@@ -2747,6 +2795,36 @@ pub struct X86ArchHooks {
     /// the child is not schedulable yet, which is what makes writing another
     /// slot's machine state safe at all.
     pub write_user_context: fn(slot: usize, ctx: &UserContext),
+    /// Read `slot`'s ring-3 register file back out — the x86_64 half of
+    /// [`get_saved_user_context`], and the exact mirror of
+    /// [`write_user_context`] above.
+    ///
+    /// `None` means "there is no user context here": the slot has never
+    /// trapped in from ring 3, so its `user_rip`/`user_rsp` are still zero.
+    /// That is the same refusal the AArch64 side makes when a thread has no
+    /// live EL0 trap frame, and for the same reason — a child built from a
+    /// slot that never entered ring 3 would be launched at whatever the
+    /// registers happened to hold, which is silent. Failing the syscall is
+    /// loud, local and recoverable.
+    ///
+    /// Unlike its writer this may be called on the **running** slot: `fork`
+    /// reads its own caller's capture, which the `syscall_entry` assembly
+    /// wrote on the way in and nothing rewrites until the way out.
+    pub read_user_context: fn(slot: usize) -> Option<UserContext>,
+    /// Give a freshly [`x86_claim_slot`]ed slot its kernel and trap stacks and
+    /// its default machine state, and answer the top of the kernel stack.
+    ///
+    /// Stacks are the *target's* on this architecture — `amd64` leaks a pair
+    /// per slot on first use and a recycled slot reuses the pair it already
+    /// owns — where AArch64 takes them from this crate's own PMM-backed pool.
+    /// So the crate can claim a slot and seed a context into it, but it cannot
+    /// make one somewhere to stand: that is this hook.
+    ///
+    /// `None` means the stacks could not be allocated; the caller abandons the
+    /// slot. Every other field the picker or the switch reads is reset here to
+    /// its default, so a recycled slot cannot inherit the previous occupant's
+    /// `space_root`, `pinned` core or saved `UserCtx`.
+    pub prepare_task_slot: fn(slot: usize) -> Option<usize>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -6085,14 +6163,51 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
     None
 }
 
-/// x86_64 stub — no fork/vfork/clone-of-a-user-process path exists yet on
-/// this target (see `update_thread_context`'s x86_64 stub), so there is
-/// never a valid child context to build. `None` is exactly what the AArch64
-/// side also returns whenever it lacks a live trap frame — the same
-/// "refuse the syscall" outcome, just always rather than conditionally.
+/// The user-mode context to give a new child of `thread_id` — the x86_64 arm.
+///
+/// It returned `None` unconditionally until 2026-09-11, on the argument that
+/// no fork-of-a-user-process path existed on this target. That stopped being
+/// true when `update_thread_context` grew its writer (the ring-3 entry seam,
+/// slice 2), and this is that writer's mirror: the register file the AArch64
+/// side reads out of a live EL0 trap frame lives on this target in
+/// `amd64::usermode::UserCtx`, one per task slot, written by the
+/// `syscall_entry` assembly on the way in.
+///
+/// The refusal is preserved and is the same refusal:
+/// [`X86ArchHooks::read_user_context`] answers `None` for a slot that has
+/// never trapped in from ring 3 (`user_rip`/`user_rsp` still zero), which is
+/// what "no live trap frame" means here. `amd64::usermode::sys_fork` performed
+/// exactly that check by hand before this existed.
+///
+/// Off both kernels (a host `cargo test`, where `target_arch` is the host's)
+/// there is no slot table at all, so `None` stays the only honest answer —
+/// the same shape `update_thread_context`'s host arm takes.
 #[cfg(not(target_arch = "aarch64"))]
-pub fn get_saved_user_context(_thread_id: usize) -> Option<UserContext> {
-    None
+pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        if thread_id >= MAX_THREADS {
+            return None;
+        }
+        let ctx = (arch().read_user_context)(thread_id);
+        if ctx.is_none() {
+            // Same accounting and the same rate-limited line as the AArch64
+            // side: a non-zero count means fork/vfork/clone syscalls are being
+            // refused, and the caller has to be identifiable from one line.
+            let n = NO_TRAP_FRAME_CHILDREN.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                safe_print!(160,
+                    "[NO-TRAPFRAME] refusing child of tid={} (cur={}) — slot never entered                      ring 3; count={}\n",
+                    thread_id, current_thread_id(), n + 1);
+            }
+        }
+        ctx
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        let _ = thread_id;
+        None
+    }
 }
 
 // ============================================================================

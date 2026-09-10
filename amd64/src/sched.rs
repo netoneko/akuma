@@ -315,6 +315,8 @@ fn register_hooks() {
         transfer_lock_depth: hook_transfer_lock_depth,
         allow_tick,
         write_user_context,
+        read_user_context,
+        prepare_task_slot,
     });
 
     // The scheduler also wants a clock and a console. The other four fields are
@@ -810,6 +812,136 @@ pub fn write_user_context(task_slot: usize, ctx: &UserContext) {
     }
 }
 
+/// Read a task slot's ring-3 register file back out as the shared
+/// [`UserContext`] — **`akuma_threading::get_saved_user_context`'s x86_64
+/// arm**, and the exact mirror of [`write_user_context`] above.
+///
+/// `None` for a slot that has never trapped in from ring 3. `user_rip == 0` is
+/// what says so: the `syscall_entry` assembly writes it on every `syscall`, so
+/// a zero there means the assembly has never run for this task — a kernel
+/// thread, or a process task that was published moments ago and has not
+/// reached its first instruction. A child built from that slot would resume at
+/// address 0 with a zero stack, which is exactly the silent birth the AArch64
+/// side refuses when it finds no live EL0 trap frame. `usermode::sys_fork`
+/// made the same check by hand, one field at a time, before this existed.
+///
+/// `user_rsp` is checked too and for the same reason, and both are checked
+/// rather than one: `enter_user_mode_forked` consumes the pair, and a child
+/// with a good `rip` and a zero `rsp` faults on its first `push` instead of
+/// its first fetch — a different-looking crash with the same cause.
+///
+/// `rax` is `0` and cannot be anything else: the assembly does not save it (it
+/// carries the syscall number in and the return value out), so there is no
+/// parent value to read. That is also the value a `fork` child wants, which
+/// callers state for themselves with `UserContext::set_child_return_zero`
+/// rather than lean on here.
+pub fn read_user_context(task_slot: usize) -> Option<UserContext> {
+    // SAFETY: raw-pointer read under the BKL. Reading the *running* slot is
+    // sound and is the common case — `fork` reads its own caller's capture,
+    // which the entry assembly wrote before this Rust ran and which nothing
+    // rewrites until the `sysret`.
+    let uctx = unsafe { (*machines()).get(task_slot).map(|m| m.uctx)? };
+    if uctx.user_rip == 0 || uctx.user_rsp == 0 {
+        return None;
+    }
+    Some(UserContext {
+        regs: uctx.saved_regs,
+        sp: uctx.user_rsp,
+        pc: uctx.user_rip,
+        fs_base: uctx.fs_base,
+        gs_base: uctx.gs_base,
+        rax: 0,
+    })
+}
+
+/// Give a freshly claimed slot its two stacks and its default machine state,
+/// and answer the top of its kernel stack — **the stack half of a spawn**,
+/// registered as [`threading::X86ArchHooks::prepare_task_slot`].
+///
+/// It is a hook because stacks are this target's on this architecture: a slot
+/// leaks its pair on first use and a recycled slot reuses the pair it already
+/// owns, where AArch64 takes stacks from `akuma-threading`'s own PMM-backed
+/// pool. So the crate can claim a slot and seed a context into it, but it
+/// cannot make one somewhere to stand.
+///
+/// [`spawn_unpublished`] is the other caller and calls it for the same reason,
+/// which is the point of the split: this target's own spawn path and the
+/// shared `spawn_user_closure_initializing` give a slot **one** initial
+/// machine state, so a field reset in one and forgotten in the other cannot
+/// exist.
+///
+/// Every field the picker or the switch reads is written here, not just the
+/// two stacks — `space_root`, `pinned`, `daemon`, `idle`, the saved `UserCtx`
+/// and the FPU area. A recycled slot must not inherit the previous occupant's:
+/// a stale `space_root` puts the new task in a freed address space, a stale
+/// `pinned` strands it on a core, and a stale `uctx` hands it a dead process's
+/// `proc_slot`. The caller overrides `space_root`/`daemon` afterwards, while
+/// the slot is still INITIALIZING.
+pub fn prepare_task_slot(slot: usize) -> Option<usize> {
+    // SAFETY: raw-pointer read; the slot is INITIALIZING and not running.
+    let (have_stack, have_trap) = unsafe {
+        let m = (*machines()).get(slot)?;
+        (m.stack_base, m.trap_base)
+    };
+
+    // Leaked deliberately on first use: a thread's stack must outlive the frame
+    // that made it. Bounded by `MAX_TASKS`, not by how many processes ever ran,
+    // because a recycled slot arrives here with its pair already set.
+    let stack_base = if have_stack == 0 {
+        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
+    } else {
+        have_stack
+    };
+    let stack_top = stack_base + STACK_SIZE;
+
+    // A second stack, for traps taken while this thread is in ring 3. Separate
+    // from its kernel stack because a preempted thread is suspended on the
+    // interrupt frame, and the two must not overlap.
+    let trap_base = if have_trap == 0 {
+        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
+    } else {
+        have_trap
+    };
+    let trap_top = (trap_base + STACK_SIZE) & !0xf;
+
+    // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
+    // nothing runs on it.
+    unsafe {
+        let m = &mut (*machines())[slot];
+        m.trap_stack_top = trap_top as u64;
+        m.stack_base = stack_base;
+        m.trap_base = trap_base;
+        m.space_root = 0;
+        m.daemon = false;
+        m.idle = false;
+        m.pinned = NO_CPU;
+        m.uctx = UserCtx::new();
+        m.fx = FxArea::initial();
+    }
+    Some(stack_top)
+}
+
+/// Point an **unpublished** slot's page-table root at `root`.
+///
+/// The slot-indexed counterpart of [`set_current_space_root`], and deliberately
+/// without its `mov cr3`: this task is not running, so the switch that picks it
+/// up installs the root from here. Writing `CR3` on its behalf would install a
+/// foreign address space on the core doing the spawning.
+///
+/// A task the shared child-spawn path created arrives with `space_root` 0 —
+/// kernel `CR3` — because [`prepare_task_slot`] has no `Process` to read one
+/// from. This is what supplies it, and forgetting it is not subtle: the first
+/// switch into the child runs ring-3 code with the kernel's page tables.
+pub fn set_task_space_root(task_slot: usize, root: u64) {
+    // SAFETY: raw-pointer access under the BKL; the slot is unpublished, so no
+    // core can be running it.
+    unsafe {
+        if let Some(m) = (*machines()).get_mut(task_slot) {
+            m.space_root = root;
+        }
+    }
+}
+
 /// The page-table root the **running** thread uses. `0` for a kernel thread.
 ///
 /// `clone(CLONE_VM)`'s whole memory story: the child gets this number, verbatim,
@@ -940,46 +1072,26 @@ fn spawn_unpublished(
 ) -> Option<usize> {
     let slot = threading::x86_claim_slot()?;
 
-    // SAFETY: raw-pointer read; the slot is INITIALIZING and not running.
-    let (have_stack, have_trap) = unsafe {
-        let m = &(*machines())[slot];
-        (m.stack_base, m.trap_base)
+    // The stacks and every default the picker reads — shared with the crate's
+    // own `spawn_user_closure_initializing`, so this target's spawn path and
+    // the tree's cannot describe a fresh slot two different ways.
+    let Some(stack_top) = prepare_task_slot(slot) else {
+        threading::x86_abandon(slot);
+        return None;
     };
-
-    // Leaked deliberately on first use: a thread's stack must outlive the frame
-    // that made it.
-    let stack_base = if have_stack == 0 {
-        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
-    } else {
-        have_stack
-    };
-    let stack_top = stack_base + STACK_SIZE;
-
-    // A second stack, for traps taken while this thread is in ring 3. Separate
-    // from its kernel stack because a preempted thread is suspended on the
-    // interrupt frame, and the two must not overlap.
-    let trap_base = if have_trap == 0 {
-        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
-    } else {
-        have_trap
-    };
-    let trap_top = (trap_base + STACK_SIZE) & !0xf;
 
     threading::x86_seed_entry(slot, stack_top, entry);
 
+    // The two `prepare_task_slot` cannot know: the caller's address space and
+    // whether this thread counts towards the boot's live-task tally. Written
+    // while the slot is still INITIALIZING, which is the whole reason there is
+    // no publish-immediately variant.
     // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
     // nothing runs on it.
     unsafe {
         let m = &mut (*machines())[slot];
-        m.trap_stack_top = trap_top as u64;
-        m.stack_base = stack_base;
-        m.trap_base = trap_base;
         m.space_root = space_root;
         m.daemon = daemon;
-        m.idle = false;
-        m.pinned = NO_CPU;
-        m.uctx = UserCtx::new();
-        m.fx = FxArea::initial();
     }
     Some(slot)
 }

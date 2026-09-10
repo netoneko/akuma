@@ -2596,38 +2596,6 @@ fn current_entry_stack() -> Option<(u64, u64)> {
     Some((img.context.pc, img.context.sp))
 }
 
-/// The running task's ring-3 register file, as the shared [`UserContext`].
-///
-/// The counterpart of [`current_entry_stack`] for the *whole* file rather than
-/// its two neutral scalars, and the reason `sys_fork` no longer carries a
-/// five-tuple: everything a child inherits from its parent's trap into the
-/// kernel is one value of one type, which is the type the shared fork path
-/// speaks.
-///
-/// `rax` is **not** captured, and cannot be: the assembly does not save it —
-/// it holds the syscall number on the way in and the return value on the way
-/// out — so there is no parent value to read. Zero is therefore the only
-/// honest answer, and it happens to be the one a `fork` child wants; callers
-/// that mean it say so with `set_child_return_zero`.
-fn current_user_context() -> UserContext {
-    // SAFETY: raw-pointer read under the BKL; the per-CPU `UserCtx` is this
-    // task's own slot.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() {
-            return UserContext::new(0, 0);
-        }
-        UserContext {
-            regs: (*uctx).saved_regs,
-            sp: (*uctx).user_rsp,
-            pc: (*uctx).user_rip,
-            fs_base: (*uctx).fs_base,
-            gs_base: (*uctx).gs_base,
-            rax: 0,
-        }
-    }
-}
-
 /// Read and clear this task's [`UserCtx::forked`] / [`UserCtx::exec_pending`]
 /// flags. Both are one-shot and both are consumed by [`run_process`] only.
 fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
@@ -3834,16 +3802,24 @@ fn sys_fork() -> u64 {
     // shared child-spawn path reaches through
     // `akuma_threading::update_thread_context`. Building it here is what makes
     // slice 3's fold a deletion rather than a translation.
-    let mut child_ctx = current_user_context();
+    // Read through `akuma_threading::get_saved_user_context` since 2026-09-11,
+    // not off this task's `UserCtx` directly: that function **is** step 6 of
+    // the shared `fork_process`, and its x86_64 arm is
+    // `sched::read_user_context` — the mirror of the `write_user_context` this
+    // function calls twenty lines down. Reading the parent through the same
+    // door the shared path will is what makes the fold a deletion; it also
+    // subsumes the `user_rip == 0 || user_rsp == 0` refusal this used to make
+    // by hand, which now lives with the reader and is shared with `clone`.
+    let Some(mut child_ctx) = akuma_threading::get_saved_user_context(crate::sched::current_task())
+    else {
+        return errno::ENOSYS;
+    };
     // A child returns 0 from the `fork` its parent returns a pid from. Stated
     // rather than implied: the value is what the entry assembly hard-codes
     // (`enter_user_mode_forked` does `xor eax, eax`), and this is the field
     // shared code sets for the same reason.
     child_ctx.set_child_return_zero();
     let (user_rip, user_rsp) = (child_ctx.pc, child_ctx.sp);
-    if user_rip == 0 || user_rsp == 0 {
-        return errno::ENOSYS;
-    }
 
     // Collect any row the reaper left behind first — glue's `wait4` frees the
     // process, not the row (see `sweep_reaped_spawn_rows`), so without this the
@@ -3908,12 +3884,26 @@ fn sys_fork() -> u64 {
     // IS the registration's `clone_deep_for_fork` below; there is no second,
     // legacy table to copy alongside it.)
 
-    let Some(task_slot) = crate::sched::spawn_in_space_unpublished(proc_entry, child_root) else {
+    // Through the crate's user-thread spawn since 2026-09-11, which is
+    // `spawn_child_thread_and_publish`'s own first step — so the x86_64 arm of
+    // `ThreadPool::spawn_user_closure_initializing` is exercised by every
+    // `fork` on this target before the fold depends on it, the way slice 2 put
+    // `write_user_context` on the live path ahead of its shared caller.
+    //
+    // Two things come with it and both are gains: a slot-exhaustion diagnostic
+    // naming live/terminated counts instead of a bare `ENOMEM`, and the
+    // live-task high-water line. What does **not** come with it is the address
+    // space — the crate has no `Process` to read one from — so the root is
+    // installed on the next line, while the slot is still INITIALIZING.
+    let Ok(task_slot) =
+        akuma_threading::spawn_user_thread_initializing(proc_entry, core::ptr::null_mut())
+    else {
         // `child` drops here, releasing every frame the CoW share pass claimed
         // and every page table it built — what `take_proc_slot` used to do by
         // taking the slot back out of `PROCS`.
         return errno::ENOMEM;
     };
+    crate::sched::set_task_space_root(task_slot, child_root);
     crate::sched::seed_proc_slot(task_slot, slot);
     crate::sched::write_user_context(task_slot, &child_ctx);
 

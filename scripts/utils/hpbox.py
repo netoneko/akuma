@@ -19,6 +19,8 @@ CLI:  python3 scripts/utils/hpbox.py which        # 'ubuntu' | 'akuma' | 'unknow
       python3 scripts/utils/hpbox.py ak  '<cmd>'  # run on Akuma
       python3 scripts/utils/hpbox.py ub  '<cmd>'  # run on Ubuntu
       python3 scripts/utils/hpbox.py patch [path…]  # send local diff, apply there
+      python3 scripts/utils/hpbox.py ramdisk [GiB]  # target/ on tmpfs (rotational root)
+      python3 scripts/utils/hpbox.py ramdisk-sync   # copy tmpfs target/ back to disk
 """
 
 import subprocess
@@ -376,6 +378,78 @@ def build(pkg="akuma-amd64", target="x86_64-unknown-none", timeout=900):
     return rc, (out + err).strip()
 
 
+# Where the on-disk copy of `target/` lives while a tmpfs stands in its place.
+BOX_TARGET = f"{BOX_REPO}/target"
+BOX_TARGET_DISK = f"{BOX_REPO}/target.disk"
+
+
+def ramdisk(size_g=6, prime=True, timeout=600):
+    """Put the box's `target/` on tmpfs, primed from the on-disk copy.
+
+    Returns ``(rc, message)``. Idempotent: already-mounted is a no-op success.
+
+    The box's root is a **rotational** disk (`/sys/block/sda/queue/rotational`
+    is 1) and a kernel build is thousands of small object writes, so rustc
+    spends real time waiting on it. RAM is not the constraint — 15 GiB total,
+    and the whole `target/` tree is ~300 MiB.
+
+    **It does not survive a reboot, and this loop reboots constantly** (Ubuntu →
+    Akuma → Ubuntu, several times a session). That is the reason for the
+    two-directory shape rather than a plain `mount -t tmpfs`:
+
+    * `target.disk/` is the persistent copy. It is what a boot with no tmpfs
+      mounted builds against, so *forgetting* to re-mount costs speed and
+      nothing else — never a cold rebuild, and never a stale artifact.
+    * `prime` rsyncs it into the fresh tmpfs, so the first build after a reboot
+      is incremental like every other one.
+    * :func:`ramdisk_sync` copies back. Call it before a reboot if the build
+      you just made is one you want to keep; skipping it only costs the next
+      boot's first build.
+
+    Every path `hpbox` and `/root/stage_akuma.sh` know stays exactly where it
+    was — `BOX_KERNEL`, `BOX_DISK`, GRUB's `/boot/akuma` install — because this
+    mounts *over* `target/` rather than moving it. A `CARGO_TARGET_DIR` export
+    would have been one line and would have desynchronised all of them.
+    """
+    script = (
+        'set -e\n'
+        f'mkdir -p {BOX_TARGET} {BOX_TARGET_DISK}\n'
+        f'if mountpoint -q {BOX_TARGET}; then echo "ALREADY on tmpfs"; '
+        f'df -h {BOX_TARGET} | tail -1; exit 0; fi\n'
+        # Seed the persistent copy from what is on disk — but ONLY the first
+        # time, when there is nothing there yet. After a reboot the tmpfs is
+        # gone and `target/` is once more the *underlying* directory, frozen at
+        # whatever it held before the first mount; copying that over
+        # `target.disk` would throw away every build since. `target.disk` is
+        # the authority once it exists, and :func:`ramdisk_sync` is the only
+        # thing that writes it.
+        f'if [ -z "$(ls -A {BOX_TARGET_DISK})" ]; then '
+        f'rsync -a --delete {BOX_TARGET}/ {BOX_TARGET_DISK}/; fi\n'
+        f'mount -t tmpfs -o size={size_g}G tmpfs {BOX_TARGET}\n'
+        + (f'rsync -a {BOX_TARGET_DISK}/ {BOX_TARGET}/\n' if prime else '')
+        + f'df -h {BOX_TARGET} | tail -1\n'
+        'echo RAMDISK OK\n'
+    )
+    rc, out, err = ubuntu(script, timeout=timeout)
+    return rc, (out + err).strip()
+
+
+def ramdisk_sync(timeout=600):
+    """Copy the tmpfs `target/` back to the persistent `target.disk/`.
+
+    A no-op success when `target/` is not on tmpfs. Worth doing before a reboot
+    into Akuma; the cost of skipping it is one slower build, not a wrong one.
+    """
+    script = (
+        'set -e\n'
+        f'if ! mountpoint -q {BOX_TARGET}; then echo "not on tmpfs; nothing to sync"; exit 0; fi\n'
+        f'rsync -a --delete {BOX_TARGET}/ {BOX_TARGET_DISK}/\n'
+        'echo SYNCED\n'
+    )
+    rc, out, err = ubuntu(script, timeout=timeout)
+    return rc, (out + err).strip()
+
+
 def firecracker(vcpus=1, init="/bin/busybox", initargs="uname,-a", memory=2048,
                 timeout_s=90, disk=True):
     """Boot the box's freshly-built kernel under Firecracker. Returns the log.
@@ -577,6 +651,14 @@ def _main(argv):
         return rc
     if cmd == "reboot-to":
         return 0 if reboot_to(rest[0]) else 1
+    if cmd == "ramdisk":
+        rc, msg = ramdisk(size_g=int(rest[0]) if rest else 6)
+        print(msg)
+        return rc
+    if cmd == "ramdisk-sync":
+        rc, msg = ramdisk_sync()
+        print(msg)
+        return rc
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 2
 
