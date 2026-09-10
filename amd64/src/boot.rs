@@ -137,6 +137,26 @@ pub fn install_shared_sinks() {
     // died at the first folded syscall (`AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`
     // §4).
     akuma_primitives::rng::set_rng_hook(crate::net::rng_fill_checked);
+    // `akuma-syscalls-glue`'s own hook table — distinct from
+    // `akuma_vfs_glue::VfsGlueHooks` (which `fs::init_vfs` fills) and from
+    // `akuma_syscalls_linux`'s. The AArch64 kernel registers this from
+    // `akuma-kernel-glue`, which does not build for x86_64. Only two of the
+    // seven fields have a real answer on this target — the wall clock and the
+    // core count; the rump five are `false`/no-op because there is no rump
+    // kernel here. `utc_time_us` is what glue's folded `utimensat` (4b batch
+    // 3c) reads for "both times to now", and `futex`'s absolute-deadline arm;
+    // without it `touch` on a fresh file never sets a real mtime even on the
+    // metal with SNTP synced — the same "glue reads a hook amd64 never
+    // registered" shape batch 3a's prefault gap had.
+    akuma_syscalls_glue::set_hooks(akuma_syscalls_glue::SyscallHooks {
+        box_is_rump: |_| false,
+        mark_box_rump: |_| {},
+        attach_server: |_, _| {},
+        intercept_box_syscall: |_, _| None,
+        rump_socket_readable: |_| false,
+        utc_time_us: || crate::clock::is_synced().then(crate::clock::now_us),
+        probed_core_count: crate::smp::online_cpus,
+    });
     // The wake effect for the **one** pipe table (4b batch 2b). This target
     // shares `akuma-syscalls-glue`'s table rather than keeping a second
     // instance of `akuma_pipes::PipeTable` — two instances meant two id

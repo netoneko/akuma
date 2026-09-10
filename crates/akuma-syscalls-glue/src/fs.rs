@@ -1600,7 +1600,7 @@ pub fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
     }
 }
 
-pub(super) fn sys_dup(oldfd: u32) -> u64 {
+pub fn sys_dup(oldfd: u32) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
@@ -1620,7 +1620,7 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
     u64::from(newfd)
 }
 
-pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
+pub fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
@@ -2676,7 +2676,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
 ///
 /// Reporting `ENOSYS` instead would be the honest alternative, and it is worse:
 /// it puts `touch` back to failing outright, which is the state this replaces.
-pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> SysResult {
+pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> SysResult {
     use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
     use akuma_syscalls_linux::flags::utimensat::{UTIME_NOW, UTIME_OMIT};
 
@@ -2771,7 +2771,7 @@ pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u3
     }
 }
 
-pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {
+pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
     
     let resolved_path = resolve_path_at(dirfd, &path)?;
@@ -2806,7 +2806,7 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     ENOENT
 }
 
-pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
+pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     // The command table, and the two flag bits `fcntl` moves, from
     // `akuma-syscalls-linux`. `F_SETLK`/`F_SETLKW`/`F_GETLK` are advisory
     // record locking — no-op stubs, we have no lock state. `F_SETOWN`/

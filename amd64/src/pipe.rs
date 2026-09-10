@@ -70,7 +70,7 @@ pub type PipeId = usize;
 /// **A policy, not a table rule**, which is why it lives here and the shared
 /// table does not have one: the AArch64 kernel runs workloads (a `-j4`
 /// self-host build) whose pipe count this would refuse outright.
-const MAX_PIPES: usize = 64;
+pub const MAX_PIPES: usize = 64;
 
 /// The wake effect this kernel registers with the shared table.
 ///
@@ -79,6 +79,16 @@ const MAX_PIPES: usize = 64;
 /// counting pipe wakes as it always has.
 pub fn wake_sink(tid: usize, _handle: akuma_exec::threading::WakeHandle) {
     crate::sched::wake(tid);
+}
+
+/// `true` once [`MAX_PIPES`] are live.
+///
+/// The preamble `fd::sys_pipe2` runs before handing `pipe2` to glue, whose
+/// `pipe_create` is a `BTreeMap` with no ceiling of its own; the `sys_spawn`
+/// path gates through [`alloc`] instead.
+#[must_use]
+pub fn at_capacity() -> bool {
+    glue::pipe_live_count() >= MAX_PIPES
 }
 
 /// Claim a fresh pipe with one reader end and one writer end, or `None` once

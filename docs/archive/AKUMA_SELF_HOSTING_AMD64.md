@@ -802,6 +802,33 @@ through `openat`).
 > identical failure sets (the pre-existing `test_spawn_ext_passes_env` panic,
 > Open issue 4).
 
+> **The mechanical batch folded (batch 3c, 2026-09-10)** —
+> `AKUMA_AMD64_4B_FOLD_BATCH3C.md`. `fcntl`, `dup`, `dup2`, `dup3`, `pipe2`,
+> `access`/`faccessat` and `utimensat` are glue's arms — mostly forwards,
+> because none carried a vocabulary of its own. `fd.rs` 3 448 -> **3 083**
+> (`+83 / −448`); what came out is bodies plus three local helper tables
+> (`clone_refs`/`release_desc`, `fs_err_errno`, the `resolve_at` dirfd ladder)
+> and four now-dead errno constants. Preambles kept: `newfd < MAX_FDS` for
+> `dup2`/`dup3` (glue's table is unbounded, this target's *lookup* is not —
+> the batch-2d finding), `oldfd == newfd` for `dup2` (returns `newfd`, where
+> `dup3` says `EINVAL`), and `crate::pipe::at_capacity()` for `pipe2`
+> (`MAX_PIPES` is a heap policy). Gains: `fcntl` grew the record-lock and
+> `F_SETOWN` no-ops nginx needs; `dup`/`fcntl(F_DUPFD)` allocate from fd 0
+> (Linux's "lowest available"); `faccessat` honours `dirfd`; `utimensat` gained
+> the `futimens(fd)` form.
+>
+> **The gap the fold surfaced: `akuma-syscalls-glue`'s own `SyscallHooks`** — a
+> *third* hook registry, filled by `akuma-kernel-glue` (AArch64-only). Glue's
+> `utimensat` and `futex`'s absolute-deadline arm read `utc_time_us()` from it,
+> so on this target both had always seen `None` — `touch`'s "now" was 1970 even
+> on the metal with SNTP up. Same shape as batch 3a's prefault gap;
+> `boot::install_shared_sinks` registers it now (`utc_time_us`,
+> `probed_core_count`; the rump five are no-ops). Verified QEMU **596/606**,
+> Firecracker **580/590**, metal **596/0**, `-n 40` *and* `-n 60` ring-3
+> (the pipe-leak cliff is gone — `f4844617`), 60-session metal churn 0
+> failures, `touch -d` sets a real mtime on the metal. **AArch64 untouched** —
+> the only `crates/` change is six `pub(super)` -> `pub`.
+
 > **4b is in progress: batch 1 folded, batch 2's prerequisites landed, and the
 > two pipe tables are one (2026-09-10)** —
 > `AKUMA_AMD64_4B_FOLD_BATCH2A.md` (console descriptors, `with_stdio()`, glue's
@@ -1057,18 +1084,25 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   bytes, asm-generic 128) — now `akuma_syscalls_abi::stat` with
    │   `offset_of!` on every field. Socket `fstat` was `EBADF` on both
    │   kernels; fixed in glue
+   ▼   then the mechanical batch (b3c): `fcntl`/`dup`/`dup2`/`dup3`/
+   │   `pipe2`/`access`/`utimensat` — forwards, mostly. `fd.rs` →
+   │   3 083. Out with them: `clone_refs`/`fs_err_errno`/`resolve_at`.
+   │   Surfaced glue's *third* hook table (`SyscallHooks`, AArch64-only
+   │   until now) — `utimensat`'s clock read `None`, so `touch` was 1970
    │                        docs: AKUMA_AMD64_4B_FLIP.md,
-   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A,3B}.md,
+   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D,3A,3B,3C}.md,
    │                              AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md
    ▼
  [09-10] ═══ YOU ARE HERE ═══
    │
    └──► three pieces left below the gate, none blocked on another:
         **4b, continued** — I/O cluster **folded (3a)**, `stat` family
-                 **folded (3b)**; next is `fcntl`, `dup`/`dup3`/
-                 `pipe2`, `access`, `utimensat` (mechanical), then
-                 `poll`/`select` and `ioctl` (the readiness model and
-                 the terminal ioctls need care)
+                 **folded (3b)**, `fcntl`/`dup*`/`pipe2`/`access`/
+                 `utimensat` **folded (3c)**; `fd.rs` 4 454 → 3 083.
+                 What is left needs care not a forward: `poll`/`select`
+                 (the readiness model vs the shared `WaitPolicy`),
+                 `ioctl` (half x86-only), and the console/`/dev`
+                 preambles on `read`/`write`/`lseek`
         **the ring-3 entry seam** — an x86 arm for "enter userspace with
                  this process's first context"; unblocks `fork`, then
                  `clone`. Sized like 5b, and the only one with no
@@ -1160,10 +1194,10 @@ parity with what the AArch64 self-host already proves.
   │           Folded: mkdirat/unlinkat/renameat/symlinkat/         │
   │           readlinkat (b1), close (b2b), one /proc (b2c),       │
   │           openat (b2d), read/pread/write/lseek/getdents64      │
-  │           (b3a), fstat/newfstatat/statfs/fstatfs/statx (b3b).  │
-  │           fd.rs 4454 → 3448.                                   │
-  │           Next: fcntl/dup/dup3/pipe2/access/utimensat, then    │
-  │           poll/select/ioctl.                                   │
+  │           (b3a), fstat/newfstatat/statfs/fstatfs/statx (b3b),  │
+  │           fcntl/dup/dup2/dup3/pipe2/access/utimensat (b3c).    │
+  │           fd.rs 4454 → 3083.                                   │
+  │           Next: poll/select, ioctl — care, not forwards.       │
   │  ✖ THE RING-3 ENTRY SEAM — an x86 arm for "enter userspace     │
   │           with this process's first context". fork_process     │
   │           `eret`s from a UserContext; amd64 has no eret. This  │

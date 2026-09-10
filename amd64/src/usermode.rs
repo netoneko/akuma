@@ -949,7 +949,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // and no per-file exec tracking worth trusting, so "the path resolves"
         // is the honest answer; a real permission check would be a guess. The
         // `faccessat` spelling is in the neutral table and answers identically.
-        21 => return crate::fd::sys_access(a1),
+        // `access(path, mode)` is `faccessat(AT_FDCWD, path, mode)` — glue's arm.
+        21 => return to_glue(Syscall::Faccessat, [AT_FDCWD, a1, a2, 0, 0, 0]),
         // `poll(fds, nfds, timeout_ms)` — x86_64 7, narrowing to the same core
         // `ppoll` uses. An interactive `busybox sh` polls its stdin on every
         // keystroke; `ENOSYS` here was a forever-loop of "sh: poll: Function
@@ -1278,7 +1279,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `statx` — arch-neutral struct, so this is glue's arm with no
         // preamble. New on this target (4b batch 3b); was `ENOSYS`.
         Syscall::Statx => crate::fd::sys_statx(a1, a2, a3, a4, a5),
-        Syscall::Faccessat => crate::fd::sys_access(a2),
+        // `faccessat(dirfd, path, mode)` — glue's arm (4b batch 3c). The old
+        // shim dropped `dirfd`; glue's `sys_faccessat2` honours it.
+        Syscall::Faccessat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
         // signature-verification I/O setup; `ENOSYS` here made it report
         // `UNTRUSTED signature` over a fetch that was fine (see
@@ -1457,12 +1460,15 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // contents are full of `.so.1` versioned-library symlinks; ENOSYS
         // here turned each into a counted `apk add` error.
         Syscall::Symlinkat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        // `utimensat(dirfd, path, times, flags)` — timestamp preservation for
-        // `apk add`'s post-extract pass. NULL times = both set to now. There is
-        // no `futimens` syscall to pair it with — libc spells that
-        // `utimensat(fd, NULL, times, 0)` — which is what the x86_64 88 arm
-        // above used to be mistaken for.
-        Syscall::Utimensat => crate::fd::sys_utimensat(a1, a2, a3, a4),
+        // `utimensat(dirfd, path, times, flags)` — glue's arm (4b batch 3c).
+        // Timestamp preservation for `apk add`'s post-extract pass. `struct
+        // timespec` is LP64 on both architectures and `UTIME_NOW`/`UTIME_OMIT`
+        // plus the `AT_*` flags are shared, so no translation. Glue's arm adds
+        // the `path == NULL` (`futimens(fd)`) form and validates the ns range
+        // ahead of any lookup. There is no `futimens` syscall to pair with —
+        // libc spells it `utimensat(fd, NULL, times, 0)` — which is what the
+        // x86_64 88 arm above used to be mistaken for.
+        Syscall::Utimensat => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // Process-group / session ids. One process, so it is its own group and
         // session leader; `setpgid`/`setsid` accept and report id 1.
         Syscall::Getppid => 1,

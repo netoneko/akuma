@@ -144,47 +144,9 @@ use spinning_top::Spinlock;
 use crate::fs;
 use crate::serial;
 
-/// Map an `FsError` from the VFS byte paths onto a syscall errno.
-///
-/// **`akuma-syscalls-glue`'s `fs_error_to_errno`, arm for arm.** One table, so
-/// a folded arm answers what this file answers.
-///
-/// It used to be three arms and a catch-all, defended by a comment saying
-/// "inventing eight more errnos nobody distinguishes is not honesty, it is
-/// noise". The argument was sound and the premise was not: half of these are
-/// distinguished, by callers this target already runs. `EISDIR` is how a
-/// program learns to call `getdents64` instead of `read`; busybox `find` reads
-/// `ENOTDIR` to stop descending; `EROFS` is what tells a writer the mount is
-/// the problem rather than the disk. `EIO` reads as a *hardware* fault and
-/// sends whoever gets it looking at the wrong layer entirely.
-///
-/// The four `*at` calls below (`mkdirat`, `unlinkat`, `symlinkat`,
-/// `utimensat`) each carried their own two- or three-arm subset of this list
-/// ending in `EIO`, which is the drift `clone_fd_refs`'s header describes in
-/// the other half of the tree: several partial copies of one table, each
-/// correct for the cases its author happened to hit.
-///
-/// One divergence from glue's table, deliberate: `NotSupported` is `ENOSYS`
-/// here and falls through to `EIO` there. `utimensat` is the caller that
-/// wants it — "this filesystem does not keep times" is not an I/O error, and
-/// a build system reading `ENOSYS` stops asking.
-fn fs_err_errno(e: akuma_vfs::FsError) -> u64 {
-    use akuma_vfs::FsError as E;
-    match e {
-        E::NotFound => errno::ENOENT,
-        E::PermissionDenied => errno::EACCES,
-        E::AlreadyExists => errno::EEXIST,
-        E::NotADirectory => errno::ENOTDIR,
-        E::NotAFile => errno::EISDIR,
-        E::DirectoryNotEmpty => errno::ENOTEMPTY,
-        E::NoSpace => errno::ENOSPC,
-        E::ReadOnly => errno::EROFS,
-        E::InvalidPath => errno::EINVAL,
-        E::TooManyOpenFiles => errno::EMFILE,
-        E::NotSupported => errno::ENOSYS,
-        _ => errno::EIO,
-    }
-}
+// `fs_err_errno` — the local `FsError` -> errno table — left with the last of
+// the arms that used it (`utimensat`, 4b batch 3c). `akuma-syscalls-glue`'s
+// `fs_error_to_errno` is the one table now.
 
 /// Does the path this descriptor names a directory?
 ///
@@ -250,12 +212,8 @@ pub mod errno {
     pub const ENOTDIR: u64 = (-20i64) as u64;
     pub const EISDIR: u64 = (-21i64) as u64;
     pub const EEXIST: u64 = (-17i64) as u64;
-    pub const ENOTEMPTY: u64 = (-39i64) as u64;
-    pub const EIO: u64 = (-5i64) as u64;
-    /// The filesystem is mounted read-only (`MS_RDONLY` → `FsError::ReadOnly`).
-    pub const EROFS: u64 = (-30i64) as u64;
-    /// The device has no room — a write the VFS could not place.
-    pub const ENOSPC: u64 = (-28i64) as u64;
+    // `ENOTEMPTY`/`EIO`/`EROFS`/`ENOSPC` left with `fs_err_errno` (4b batch 3c):
+    // the folded arms map `FsError` through `akuma-syscalls-glue`'s table now.
     /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
     /// that no other syscall here produces.
     pub const ETIMEDOUT: u64 = (-110i64) as u64;
@@ -440,64 +398,10 @@ pub fn console_end(fd: u64) -> Option<ConsoleEnd> {
     }
 }
 
-/// Take one more reference to whatever `desc` names — the [`clone_fd_refs`]
-/// rule, local to the variants this target interns.
-///
-/// `PipeRead`/`PipeWrite`/`Socket` are the refcounted families here; a `File`
-/// is unrefcounted (its bytes live in the filesystem, its cursor is copied by
-/// value — see the module header for what that makes `dup`), and the other
-/// variants are never interned by this module. The match stays exhaustive
-/// rather than falling through a `_`, so a variant added to `FileDescriptor`
-/// is a compile error here and not a silently unreferenced copy — which is
-/// the property `akuma_exec::process::clone_fd_refs` exists for on AArch64.
-/// This target cannot call that function for its *own* tables without
-/// dragging the `ExecRuntime` hook machinery into paths (the boot suite's
-/// kernel-table ops) that never needed it.
-///
-/// [`clone_fd_refs`]: akuma_exec::process::clone_fd_refs
-fn clone_refs(desc: &FileDescriptor) {
-    match desc {
-        FileDescriptor::PipeWrite(id) => crate::pipe::clone_ref(*id as usize, true),
-        FileDescriptor::PipeRead(id) => crate::pipe::clone_ref(*id as usize, false),
-        FileDescriptor::Socket(s) => akuma_net::socket::socket_clone_ref(*s),
-        FileDescriptor::File(_)
-        | FileDescriptor::Stdin
-        | FileDescriptor::Stdout
-        | FileDescriptor::Stderr
-        | FileDescriptor::DevTty
-        | FileDescriptor::DevNull
-        | FileDescriptor::DevZero
-        | FileDescriptor::DevDsp
-        | FileDescriptor::DevUrandom
-        | FileDescriptor::ChildStdout(_)
-        | FileDescriptor::UnixSocket { .. }
-        | FileDescriptor::EventFd(_)
-        | FileDescriptor::EpollFd(_)
-        | FileDescriptor::PidFd(_)
-        | FileDescriptor::RumpSocket { .. }
-        | FileDescriptor::Tap { .. }
-        | FileDescriptor::TimerFd(_)
-        | FileDescriptor::BlockDev { .. } => {}
-    }
-}
-
-/// Release the reference `desc` holds, now that its last table entry is gone.
-///
-/// The [`release`] of the deleted `FILES` table, minus the reference count it
-/// used to consult — the count is the set of table entries now, and this runs
-/// only when one is removed. A `File` is a no-op: real files are unbuffered
-/// (the cache died in C2 slice 5) and a synthetic `/proc` render has no inode
-/// behind it to persist to — the old persist arm fired only for cached
-/// writes, and it wrote to a path with no inode, so what it produced was a
-/// console error line and no bytes.
-fn release_desc(desc: &FileDescriptor) {
-    match desc {
-        FileDescriptor::Socket(s) => crate::sock::close(*s),
-        FileDescriptor::PipeWrite(p) => crate::pipe::close_write(*p as usize),
-        FileDescriptor::PipeRead(p) => crate::pipe::close_read(*p as usize),
-        _ => {}
-    }
-}
+// `clone_refs`/`release_desc` — the local refcount helpers `dup`/`dup2`/`dup3`
+// used — left with those arms in 4b batch 3c. `akuma-syscalls-glue`'s
+// `clone_fd_refs` (which `sys_dup`/`sys_dup3` call) is the one list now, and
+// it has the same exhaustive-match property.
 
 /// Insert `desc` into the calling table under the lowest free descriptor at
 /// or above [`FIRST_FILE_FD`], and hand the reference it holds to the table.
@@ -656,126 +560,23 @@ pub fn is_nonblocking(fd: u64) -> bool {
     fd < MAX_FDS as u64 && cur_table().nonblock.lock().contains(&(fd as u32))
 }
 
-/// Name the description `fi` with the lowest free descriptor **at or above**
-/// `min` — `fcntl(fd, F_DUPFD, min)`, and `F_DUPFD_CLOEXEC`, which is the same
-/// with the new name marked close-on-exec.
+/// `fcntl(fd, cmd, arg)` — **glue's arm** (4b batch 3c).
 ///
-/// # Why this exists (C2 slice 6)
+/// A forward, kept as a named function because ~5 sites in `usermode.rs` (the
+/// per-spawn `F_SETFL` that makes a child's stdout non-blocking) and two boot
+/// checks call it directly. `cmd` and `arg` need no translation: `F_DUPFD`=0,
+/// `F_GETFD`=1 … `F_SETFL`=4 and `F_DUPFD_CLOEXEC`=1030 are identical on
+/// x86_64 and asm-generic, and the only `arg` bit either side reads
+/// (`O_NONBLOCK`) is not one of the four `open(2)` flags that permute.
 ///
-/// It did not, and nothing noticed while descriptors 0/1/2 were unbound: an
-/// `fcntl` on one of them resolved to nothing and answered `EBADF`, which is
-/// the *one* error `busybox ash`'s `savefd()` forgives —
-///
-/// ```c
-/// newfd = fcntl(from, F_DUPFD_CLOEXEC, 10);
-/// err = newfd < 0 ? errno : 0;
-/// if (err != EBADF) { if (err) ash_msg_and_raise_perror(...); close(ofd); }
-/// ```
-///
-/// — so `echo x > file` worked by accident: ash asked to save fd 1, was told
-/// there was no fd 1, recorded it as closed and carried on to the `open` and
-/// the `dup2`. The moment [`bind_stdio`] gave a spawned child a *real* fd 1,
-/// the same call resolved, fell through this function's absence to the `_ =>`
-/// arm's `EINVAL`, and ash raised — **before** `openredirect` ran, so the
-/// redirect exited non-zero and the file was never created at all. Six boot
-/// checks, and none of them named `fcntl`.
-///
-/// The lesson is the general one: **making a descriptor real makes every
-/// descriptor operation on it reachable.** `F_DUPFD` is not a slice-6 feature,
-/// it is a hole slice 6 stopped hiding.
-fn dup_from(fd: u64, min: u64, cloexec: bool) -> u64 {
-    let t = cur_table();
-    let Some(desc) = table_get(fd) else {
-        return errno::EBADF;
-    };
-    // Linux answers `EINVAL` for a `min` past `RLIMIT_NOFILE`, not `EMFILE`:
-    // the argument is out of range, rather than the table being full.
-    let Some(min) = u32::try_from(min).ok().filter(|m| (*m as usize) < MAX_FDS) else {
-        return errno::EINVAL;
-    };
-    let newfd = t.alloc_fd_from(min, desc.clone());
-    if newfd as usize >= MAX_FDS {
-        t.table.lock().remove(&newfd);
-        return errno::EMFILE;
-    }
-    // Bumped only once the new name exists, as [`sys_dup`] does and for the
-    // same reason.
-    clone_refs(&desc);
-    if cloexec {
-        t.cloexec.lock().insert(newfd);
-    }
-    u64::from(newfd)
-}
-
-/// `fcntl(fd, cmd, arg)`. The flag commands, plus `F_DUPFD`/`F_DUPFD_CLOEXEC`
-/// (see [`dup_from`]). `F_SETFL` only inspects the `O_NONBLOCK` bit — `sshd`
-/// was long the sole caller and that is all it sets. `F_GETFL` reports the same
-/// bit back and nothing else.
+/// Glue's arm is a superset of the one it replaces: it adds `F_GETLK`/
+/// `F_SETLK`/`F_SETLKW` and `F_SETOWN`/`F_GETOWN` as accepted no-ops (nginx's
+/// `ngx_spawn_process` treats a failing `F_SETOWN` as fatal *before* it forks).
+/// `F_DUPFD` now allocates the lowest free fd from **0**, not from
+/// [`FIRST_FILE_FD`] — Linux's "lowest available" — which is the same
+/// convergence `openat` made in batch 2d.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
-    const F_DUPFD: u64 = 0;
-    const F_GETFL: u64 = 3;
-    const F_SETFL: u64 = 4;
-    const F_SETFD: u64 = 2;
-    const F_GETFD: u64 = 1;
-    const F_DUPFD_CLOEXEC: u64 = 1030;
-    const O_NONBLOCK: u64 = 0x800;
-    const FD_CLOEXEC: u64 = 1;
-
-    // Before the resolution below, because duplicating allocates a new name.
-    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
-        return dup_from(fd, arg, cmd == F_DUPFD_CLOEXEC);
-    }
-
-    let t = cur_table();
-    // EBADF for anything the table does not name — the same resolution the
-    // old `with_file` performed against the `FDS` row, console descriptors
-    // included.
-    if table_get(fd).is_none() {
-        return errno::EBADF;
-    }
-    match cmd {
-        // The one authority since the flip: the table's `nonblock` set, keyed
-        // by fd number — the same set `is_nonblocking` reads and the one the
-        // old `F_SETFL` arm mirrored into. The `Entry.nonblocking` field it
-        // used to write first (and mirror from) is gone with `Entry`.
-        F_SETFL => {
-            if arg & O_NONBLOCK != 0 {
-                t.nonblock.lock().insert(fd as u32);
-            } else {
-                t.nonblock.lock().remove(&(fd as u32));
-            }
-            0
-        }
-        F_GETFL => {
-            if t.nonblock.lock().contains(&(fd as u32)) {
-                O_NONBLOCK
-            } else {
-                0
-            }
-        }
-        // **`FD_CLOEXEC` is stored in the table's `cloexec` set** and read
-        // back by `F_GETFD` — but it still does not *do* anything: this
-        // target's `execve` sweeps fds through its own path and does not
-        // consult the set yet. That is the same "accepted, not enforced" shape
-        // as before the flip. A descriptor marked close-on-exec still survives
-        // one; the divergence stays pinned until that sweep folds.
-        F_SETFD => {
-            if arg & FD_CLOEXEC != 0 {
-                t.cloexec.lock().insert(fd as u32);
-            } else {
-                t.cloexec.lock().remove(&(fd as u32));
-            }
-            0
-        }
-        F_GETFD => {
-            if t.cloexec.lock().contains(&(fd as u32)) {
-                FD_CLOEXEC
-            } else {
-                0
-            }
-        }
-        _ => errno::EINVAL,
-    }
+    akuma_syscalls_glue::fs::sys_fcntl(fd as u32, cmd as u32, arg)
 }
 
 /// Copy `len` bytes in from a user pointer. Public for `sock`.
@@ -902,51 +703,11 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
     alloc::string::String::from_utf8(crate::uaccess::read_cstr(ptr, 256)?).ok()
 }
 
-/// Resolve an `*at()`-syscall path against its `dirfd`.
-///
-/// Absolute paths ignore `dirfd`, per POSIX. A relative path resolves against
-/// the directory the `dirfd` names — when it names one: a directory descriptor
-/// in the table (how `apk` opens each key: `openat(keys_dirfd, name)` after
-/// listing the very same directory, whose ignoring cost an afternoon). A
-/// directory fd is reached only as a *path* here — this target's descriptors
-/// cache no directory handle, so the join is string-level, which is exact for
-/// the paths `mkdisk`-built images actually hold. `AT_FDCWD` (`-100`) keeps
-/// the pre-`dirfd` behaviour, root-relative: this target has no per-process
-/// working directory yet. Everything else that is not a directory descriptor
-/// is `ENOTDIR`, per POSIX, rather than a silently different file.
-fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::String, u64> {
-    if path.starts_with('/') {
-        return Ok(path);
-    }
-    const AT_FDCWD: u64 = (-100i64) as u64;
-    if dirfd == AT_FDCWD {
-        let mut p = alloc::string::String::from("/");
-        p.push_str(&path);
-        return Ok(p);
-    }
-    // The descriptor's *path*, then one `metadata` to say whether it names a
-    // directory. That question used to be a bool on the entry; it is asked of
-    // the filesystem now, for the reason the field's removal states — glue has
-    // no such field and this is where it would have to come from anyway.
-    //
-    // Cold path: a `dirfd` open is `apk` walking `/etc/apk/keys`, not a read
-    // loop, so one inode read per `openat` with a real `dirfd` is not a cost
-    // worth caching a bool for.
-    let base = table_with(dirfd, |d| match d {
-        FileDescriptor::File(f) => Some(f.path.clone()),
-        _ => None,
-    })
-    .flatten()
-    .filter(|p| fs::metadata(p).is_ok_and(|m| m.is_dir));
-    let Some(mut joined) = base else {
-        return Err(errno::ENOTDIR);
-    };
-    if !joined.ends_with('/') {
-        joined.push('/');
-    }
-    joined.push_str(&path);
-    Ok(joined)
-}
+// `resolve_at` — the local `*at` dirfd ladder — left with the arms that used
+// it (`openat` in batch 2d, `newfstatat` in 3b, `utimensat`/`access` in 3c).
+// `akuma_syscalls_glue::fs::resolve_path_at` is the one ladder now, and it
+// reads `Process::cwd` where this one hard-coded root.
+
 
 /// `openat(dirfd, path, flags, mode)` — **glue's arm, behind a preamble**
 /// (4b batch 2d).
@@ -1169,145 +930,50 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
 /// `akuma-syscalls-glue` arm folds next — speaks one encoding.
 pub use akuma_syscalls_linux::flags::open as open_flags;
 
-/// `utimensat(dirfd, path, times, flags)` — x86_64 280. `times` is two
-/// `struct timespec` (atime, mtime); the `UTIME_NOW`/`UTIME_OMIT` sentinel
-/// nanosecond values map to "the wall clock" / "leave alone". A NULL `times`
-/// sets both to now. First consumer: `apk`'s post-extract mtime preservation.
-pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
-    const UTIME_NOW: i64 = 0x3fff_ffff;
-    const UTIME_OMIT: i64 = 0x3fff_fffe;
-
-    let Some(raw) = path_from_user(path) else {
-        return errno::EFAULT;
-    };
-    let Ok(path) = resolve_at(dirfd, raw) else {
-        return errno::ENOTDIR;
-    };
-
-    // Wall-clock seconds for UTIME_NOW; None until a boot without SNTP sync
-    // would make "now" a lie, which `clock::utc_seconds()`'s own contract
-    // already refuses to do.
-    let now = crate::clock::utc_seconds();
-    let decode = |spec: (i64, i64)| -> Option<Option<u64>> {
-        match spec.1 {
-            UTIME_OMIT => Some(None),
-            UTIME_NOW => Some(Some(now.unwrap_or(0))),
-            n if n < 0 => None,
-            secs => Some(Some(secs.max(0) as u64)),
-        }
-    };
-    let (atime, mtime) = if times == 0 {
-        let n = Some(now.unwrap_or(0));
-        (n, n)
-    } else {
-        // SAFETY: user array of two `struct timespec` { i64, i64 }: atime at
-        // +0, mtime at +16.
-        let read_ts = |off: u64| -> Option<(i64, i64)> {
-            crate::uaccess::read_val::<[i64; 2]>(times + off).map(<(i64, i64)>::from)
-        };
-        let (Some(raw_a), Some(raw_m)) = (read_ts(0), read_ts(16)) else {
-            return errno::EFAULT;
-        };
-        let Some(atime) = decode(raw_a) else {
-            return errno::EINVAL;
-        };
-        let Some(mtime) = decode(raw_m) else {
-            return errno::EINVAL;
-        };
-        (atime, mtime)
-    };
-
-    match fs::set_times(&path, atime, mtime) {
-        Ok(()) => 0,
-        Err(e) => fs_err_errno(e),
-    }
-}
-
-/// `dup(fd)` — x86_64 32. A new descriptor for an already-open one.
+/// `dup(fd)` — x86_64 32. **Glue's arm** (4b batch 3c).
 ///
-/// The first consumer is `apk`'s signature-verification I/O setup — it dups a
-/// just-reopened index fd, then closes the original, exactly as the aarch64
-/// bring-up found (`APK_MISSING_SYSCALLS.md` "dup (23)": without the syscall
-/// apk gave up and reported `UNTRUSTED signature` over a fetch that was in
-/// fact fine). Same bug, different syscall number.
-///
-/// **The flip re-pins the value-copy divergence.** Between C2 slice 4 and the
-/// step 4b flip this was the "real thing": one more name for one shared
-/// description, a shared cursor, a release only when the last name went. The
-/// description's state now lives in the table's own `KernelFile`, and a copy
-/// of a `KernelFile` clones by value — so the new descriptor carries a
-/// *snapshot* of the cursor, not a shared one. That is
-/// `akuma-syscalls-glue`'s `dup` on AArch64, bit for bit, and the AArch64
-/// kernel self-hosts on it; fixing it honestly means an `Arc` inside
-/// `FileDescriptor::File` in `akuma-exec-core`, which is a change to the
-/// shared type with its own pass behind it. Pinned by the self-test that
-/// used to assert the opposite.
+/// A named forward: two boot checks call it directly. The value-copy
+/// divergence stays pinned — glue copies the `KernelFile` by value, so two
+/// descriptors onto one file get *independent cursors* (POSIX shares the open
+/// file description; fixing that is an `Arc` inside `FileDescriptor::File`).
+/// One convergence: glue allocates the lowest free fd from **0**, where this
+/// arm started at [`FIRST_FILE_FD`] — the same "lowest available includes a
+/// closed 0/1/2" move `openat` made in batch 2d.
 pub fn sys_dup(fd: u64) -> u64 {
-    let t = cur_table();
-    let Some(desc) = table_get(fd) else {
-        return errno::EBADF;
-    };
-    let newfd = t.alloc_fd_from(FIRST_FILE_FD as u32, desc.clone());
-    if newfd as usize >= MAX_FDS {
-        t.table.lock().remove(&newfd);
-        return errno::EMFILE;
-    }
-    // Bumped only once the new name exists: a reference before a failed
-    // `alloc` would strand the pipe/socket at a count no `close` can reach.
-    clone_refs(&desc);
-    u64::from(newfd)
+    akuma_syscalls_glue::fs::sys_dup(fd as u32)
 }
 
-/// `dup2(oldfd, newfd)` — x86_64 33 — and `dup3`, which is the same with a
-/// flags word.
+/// `dup2(oldfd, newfd)` — x86_64 33, the legacy spelling asm-generic dropped.
+/// A preamble over glue's `sys_dup3`.
 ///
-/// **This is what makes shell redirection work**, and until 2026-09-06 it did
-/// not exist. `sh` implements `prog > file` as `open(file) -> 3`,
-/// `dup2(3, 1)`, `close(3)`: the whole mechanism is the ability to make fd 1
-/// name something else. Descriptors 0/1/2 were not in the table at all — they
-/// were routed by number below it — so there was nowhere for the new name to
-/// land, and `echo x > file` and `cmd | cmd` both failed with `ENOSYS` in a
-/// way that looked like a missing syscall rather than a missing table entry.
-///
-/// POSIX subtleties, both of which real shells depend on:
-/// - `oldfd == newfd` returns `newfd` **without closing it**, and is not an
-///   error. `dup3` differs here and returns `EINVAL`, which is the only
-///   behavioural difference between the two.
-/// - `newfd` is closed first if it was open, and that close is silent — its
-///   errors are not reported, because the caller is asking about `oldfd`.
+/// Two things glue's `dup3` arm does not do that `dup2` must:
+/// - **`oldfd == newfd` returns `newfd` unchanged, without closing it**, and
+///   is not an error — where `dup3` answers `EINVAL`. This is the whole
+///   behavioural difference between the two calls.
+/// - **`newfd` past [`MAX_FDS`] is `EBADF`.** Glue's table is a `BTreeMap` with
+///   no ceiling; this target's [`table_get_in`] refuses a number at or above
+///   `MAX_FDS`, so a descriptor glue placed there would be a successful `dup2`
+///   that every later syscall answered `EBADF` for — the trap batch 2d found
+///   for `openat`.
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
-    dup_onto(oldfd, newfd, false)
-}
-
-/// `dup3(oldfd, newfd, flags)` — x86_64 292. `O_CLOEXEC` is accepted and
-/// ignored, as `fcntl(F_SETFD)` is; see [`sys_fcntl`].
-pub fn sys_dup3(oldfd: u64, newfd: u64, _flags: u64) -> u64 {
-    dup_onto(oldfd, newfd, true)
-}
-
-fn dup_onto(oldfd: u64, newfd: u64, strict_same: bool) -> u64 {
-    let Some(desc) = table_get(oldfd) else {
+    if newfd >= MAX_FDS as u64 {
         return errno::EBADF;
-    };
+    }
     if oldfd == newfd {
-        return if strict_same { errno::EINVAL } else { newfd };
+        return if table_get(oldfd).is_some() { newfd } else { errno::EBADF };
     }
-    let Some(new_idx) = u32::try_from(newfd).ok().filter(|f| (*f as usize) < MAX_FDS) else {
-        return errno::EBADF;
-    };
+    akuma_syscalls_glue::fs::sys_dup3(oldfd as u32, newfd as u32, 0)
+}
 
-    // Install the new name and take out whatever it displaced, in one hold, so
-    // no window exists in which `newfd` names nothing. Then bump, then release
-    // the displaced reference outside the lock.
-    let displaced = {
-        let mut t = cur_table().table.lock();
-        t.insert(new_idx, desc.clone())
-    };
-    clone_refs(&desc);
-    if let Some(old) = displaced {
-        release_desc(&old);
+/// `dup3(oldfd, newfd, flags)` — x86_64 292. **Glue's arm** (4b batch 3c)
+/// behind the `MAX_FDS` ceiling `sys_dup2` explains. `O_CLOEXEC` in `flags` is
+/// honoured by glue; the bit is not one of the four `open(2)` flags that
+/// permute, so `flags` passes through raw.
+pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
+    if newfd >= MAX_FDS as u64 {
+        return errno::EBADF;
     }
-    newfd
+    akuma_syscalls_glue::fs::sys_dup3(oldfd as u32, newfd as u32, flags as u32)
 }
 
 /// `pipe2(fds, flags)` — x86_64 293 — and `pipe(fds)`, which is `pipe2` with
@@ -1324,35 +990,16 @@ fn dup_onto(oldfd: u64, newfd: u64, strict_same: bool) -> u64 {
 /// whichever order its bookkeeping reaches them, so getting that rule wrong
 /// frees the buffer under a live writer; it used to be a hand-rolled `ends`
 /// counter here and is now `akuma-pipes`' own.
-pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
-    let Some(id) = crate::pipe::alloc() else {
+pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
+    // **The `MAX_PIPES` preamble.** Glue's `pipe_create` is a `BTreeMap` with
+    // no ceiling; this target keeps one because each pipe is up to 64 KiB of
+    // kernel buffer on a userspace request (`crate::pipe::MAX_PIPES`). The
+    // `sys_spawn` path gates through `crate::pipe::alloc`; this is the same
+    // gate for the `pipe2(2)` path.
+    if crate::pipe::at_capacity() {
         return errno::ENFILE;
-    };
-    // The two installs **consume** the references `pipe::alloc` started each
-    // end with — the descriptor is the pipe's first name, not a copy of one.
-    let read_fd = install(FileDescriptor::PipeRead(id as u32));
-    if errno::is_err(read_fd) {
-        crate::pipe::free(id);
-        return read_fd;
     }
-    let write_fd = install(FileDescriptor::PipeWrite(id as u32));
-    if errno::is_err(write_fd) {
-        sys_close(read_fd);
-        crate::pipe::free(id);
-        return write_fd;
-    }
-
-    // Written last: a partial copy must not leave the caller holding two
-    // descriptors it does not know about.
-    let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&(read_fd as u32).to_ne_bytes());
-    out[4..].copy_from_slice(&(write_fd as u32).to_ne_bytes());
-    if errno::is_err(copy_to_user(fds, &out)) {
-        sys_close(read_fd);
-        sys_close(write_fd);
-        return errno::EFAULT;
-    }
-    0
+    akuma_syscalls_glue::pipe::sys_pipe2(fds, flags as u32)
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
@@ -2185,28 +1832,16 @@ fn poll_ready(fd: u64) -> (bool, bool) {
 /// permission enforcement anywhere else on this target, so answering anything
 /// finer would be inventing a result. `0` if it resolves, `-ENOENT` if not.
 pub fn sys_access(path: u64) -> u64 {
-    let Some(path) = path_from_user(path) else {
-        return errno::EFAULT;
-    };
-    let normalised = if path.starts_with('/') {
-        path
-    } else {
-        let mut p = alloc::string::String::from("/");
-        p.push_str(&path);
-        p
-    };
-    // `/proc` needed a branch of its own here until 4b batch 2c, and its
-    // absence was a real bug: `access` and `open` disagreed about what exists —
-    // `/proc/self/status` opened fine, `stat`ed fine, and `access(R_OK)` said
-    // `ENOENT` (found by `smapsdirty`'s `proc-self-files` sub-probe,
-    // `AKUMA_AMD64_MEMORY_GAPS.md` §3). With one implementation of `/proc`
-    // there is nothing to keep in step: `fs::metadata` below answers for it
-    // like any other mount.
-    if fs::metadata(&normalised).is_ok() {
-        0
-    } else {
-        errno::ENOENT
-    }
+    // **Glue's `faccessat2` arm** (4b batch 3c), from the root. The dispatcher
+    // routes the real `faccessat(2)` through `to_glue` so its `dirfd` is
+    // honoured; this spelling is `access(path)` and the kernel-side callers
+    // (`proc_consistency_check`) that want "does this path resolve".
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::sys_faccessat2(
+        (-100i64) as i32,
+        path,
+        0,
+        0,
+    ))
 }
 
 /// `ioctl(fd, request, arg)` — the terminal subset, plus `ENOTTY` for the rest.
