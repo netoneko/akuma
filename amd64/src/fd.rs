@@ -17,9 +17,12 @@
 //! a path that could now mean a different file.
 //!
 //! `KernelFile::new(path, flags)` leaves the inode 0, which its own doc defines
-//! as "no inode: read by path". That is exactly this target's situation — there
-//! is one filesystem and no mount table — so the shared type is used in the mode
-//! it already has for the case, rather than being extended for it.
+//! as "no inode: read by path". That was exactly this target's situation while
+//! this module built its own descriptors; since 4b batch 2d it builds none —
+//! `akuma-syscalls-glue`'s `openat` does, and it pins `(mount_id, inode)`
+//! through `open_file_ids` where the mount can name them. The read and write
+//! paths here still address the file by `f.path`, so the pin is carried and not
+//! yet used; what it buys on the day they do is "unlinked but still open".
 //!
 //! # Contents are **not** cached any more (C2 slice 5)
 //!
@@ -35,17 +38,27 @@
 //! `akuma_vfs_glue::write_at`), disk I/O outside the table lock. The heap
 //! cost of a write is one 64 KiB chunk rather than three times the file.
 //!
-//! **Synthetic `/proc` renders are re-rendered per `read(2)`** (step 4b). The
-//! render used to be cached in the description at `open` — Linux `seq_file`'s
-//! snapshot semantics — and that cache was the last field only [`Entry`]
-//! carried. Re-rendering per read is what the mounted `ProcFilesystem` —
-//! the fold destination, and what `akuma-syscalls-glue` serves `/proc`
-//! through on AArch64 — already does, so the target converges on the tree's
-//! behaviour instead of carrying a second structure (a side table) or
-//! extending a shared type (`KernelFile`) for one architecture's sake. The
-//! cost is the snapshot: two reads of one `/proc` file can see two renders.
-//! A synthetic **directory** still snapshots into `KernelFile::dir_cache`
-//! and needs nothing.
+//! **`/proc` is the mounted `ProcFilesystem`, not a view of this module's**
+//! (4b batch 2c). This kernel rendered that namespace itself — from its own
+//! spawn table, intercepting ahead of the VFS in eight syscalls — while the
+//! shared filesystem was mounted at the same path and served whatever the local
+//! view declined. ~500 lines went with the deletion; what is left is one path,
+//! `/proc/<pid>/fd/0`, whose semantics here are genuinely not the shared one's
+//! (see [`sys_openat`]). A `/proc` file is rendered by its filesystem per
+//! `read(2)`, so two reads can see two renders — Linux `seq_file`'s snapshot
+//! semantics are the thing neither side implements.
+//!
+//! # Which arms are `akuma-syscalls-glue`'s (C1 step 4b)
+//!
+//! Seven so far, and the list is the progress report: `mkdirat`, `unlinkat`,
+//! `renameat`, `symlinkat` and `readlinkat` (batch 1, path-only), `close`
+//! (batch 2b) and **`openat` (batch 2d)** — the one that matters, because every
+//! other file arm reads a descriptor `openat` produced. What is left here for
+//! it is a preamble, and [`sys_openat`] says what each part of that preamble is
+//! for. The arms still implemented in this file — `read`, `pread64`, `write`,
+//! `lseek`, `fstat`, `getdents64`, `fcntl`, `statfs`, `newfstatat`, `access`,
+//! `dup`, `dup3`, `pipe2`, `poll`, `select`, `ioctl`, `utimensat` — are what
+//! the next batches take.
 //!
 //! # The descriptor table is the registered `SharedFdTable` (C2 step 4b)
 //!
@@ -115,7 +128,13 @@
 //! free fd is 3" divergence — POSIX's "lowest available" includes a closed
 //! 0/1/2. [`bind_stdio`] writes the three slots directly for that reason.
 
-use akuma_exec_core::process::{FileDescriptor, KernelFile};
+use akuma_exec_core::process::FileDescriptor;
+// Named by this module's doc links and by nothing else since 4b batch 2d took
+// the last `KernelFile::new` with it — every descriptor this module hands out
+// for a file is now built by `akuma-syscalls-glue`. An intra-doc link resolves
+// through an import like any other path, so the import stays and says why.
+#[allow(unused_imports)]
+use akuma_exec_core::process::KernelFile;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_terminal::TerminalState;
@@ -257,6 +276,10 @@ pub mod errno {
     /// Permission denied. `mmap` on a descriptor that is not a regular file —
     /// Linux's answer for a mapping request the descriptor cannot back.
     pub const EACCES: u64 = (-13i64) as u64;
+    /// Too many symbolic links. The one errno here that is not a report of a
+    /// failure but a *refusal to follow*: `open(link, O_NOFOLLOW)`. Named for
+    /// the loop it usually means, and used by Linux for the flag as well.
+    pub const ELOOP: u64 = (-40i64) as u64;
 
     /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
     /// returned as `(-errno) as u64` — the very top of the range. Anything below
@@ -963,34 +986,71 @@ fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::
     Ok(joined)
 }
 
-/// `openat(dirfd, path, flags, mode)`.
+/// `openat(dirfd, path, flags, mode)` — **glue's arm, behind a preamble**
+/// (4b batch 2d).
 ///
-/// Absolute paths and `AT_FDCWD` resolve from the root; a relative path
-/// resolves against the directory `dirfd` names ([`resolve_at`]). That last
-/// case is not a nicety: `apk` loads every signing key with
+/// The ~280 lines that used to be here are
+/// `akuma_syscalls_glue::fs::openat_path`: the `AT_FDCWD` ladder, symlink
+/// resolution, the `/dev` nodes, the existence and parent-directory probes,
+/// `O_CREAT`/`O_TRUNC` through `write_file`, the inode pin, and the descriptor
+/// allocation. What is left is four things that are **this target's**, and each
+/// is here because it cannot be anywhere else.
+///
+/// **1. The flag word arrives in the x86_64 encoding and is re-encoded here,
+/// once** — the same hop `Syscall::from_x86_64` makes for the syscall number,
+/// one argument along. aarch64 Linux keeps the 32-bit ARM fcntl values, so four
+/// bits are *permuted* between the two architectures (`O_DIRECTORY`↔`O_DIRECT`,
+/// `O_NOFOLLOW`↔`O_LARGEFILE`); every other `O_*` bit is identical, which is
+/// exactly why this file used to say the two encodings "happen to share the
+/// same numeric encoding" and carry three separate `_X86` constants for the
+/// ones that do not. Everything below this line — and everything glue reads out
+/// of `KernelFile::flags` — is asm-generic, the one encoding every shared crate
+/// in this tree speaks. See `akuma_syscalls_abi::open_flags`, whose tests pin
+/// the trap: an untranslated x86_64 `O_TMPFILE` slips straight through glue's
+/// refusal.
+///
+/// **2. `/proc/<pid>/fd/0`** — the last path this kernel answers for itself,
+/// and the reason is semantic rather than structural: see the block below.
+///
+/// **3. The refusals glue does not make.** `O_DIRECTORY`, `O_EXCL`,
+/// `O_NOFOLLOW` and `O_CREAT`-on-a-directory are all enforced here and by
+/// nothing in `akuma-syscalls-glue`, so folding them away would have deleted
+/// four working checks — three of which this target grew *because* a real
+/// program tripped over their absence. They are stated as a preamble rather
+/// than pushed into glue because that arm is the AArch64 kernel's too, and
+/// adding a refusal there is a behaviour change on a kernel this pass has no
+/// loop to verify against. `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH2D.md` § "The
+/// three flags" records what moving them would cost and buy.
+///
+/// **4. A block node is `ENODEV`, not a raw descriptor.** Glue serves
+/// `/dev/vdX` as a `BlockDev` descriptor (`proposals/RAW_BLOCK_DEVICE_FD.md`);
+/// nothing on this target reads one, so a folded `open("/dev/vda")` would hand
+/// back a descriptor whose first `read` answers `EBADF` — a failure at the
+/// wrong syscall, which is the `O_TMPFILE` lesson exactly. Refused here, at
+/// `open`, which is the answer this target has always given.
+///
+/// The `dirfd` case is not a nicety: `apk` loads every signing key with
 /// `openat(keys_dirfd, name)` after listing that directory, and while `dirfd`
 /// was ignored each such open landed on a root-relative name that does not
 /// exist — zero keys loaded, and every fetched index reported `UNTRUSTED
-/// signature` no matter how correct the fetch and the keys were.
-pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
-    // **The flag word arrives in the x86_64 encoding and is re-encoded here,
-    // once** — the same hop `Syscall::from_x86_64` makes for the syscall
-    // number, one argument along. aarch64 Linux keeps the 32-bit ARM fcntl
-    // values, so four bits are *permuted* between the two architectures
-    // (`O_DIRECTORY`↔`O_DIRECT`, `O_NOFOLLOW`↔`O_LARGEFILE`); every other `O_*`
-    // bit is identical, which is exactly why this file used to say the two
-    // encodings "happen to share the same numeric encoding" and carry three
-    // separate `_X86` constants for the ones that do not.
-    //
-    // Everything below this line — and everything a folded `akuma-syscalls-glue`
-    // arm will read out of `KernelFile::flags` — is therefore asm-generic, the
-    // one encoding every shared crate in this tree speaks. See
-    // `akuma_syscalls_abi::open_flags`, whose tests pin the trap this closes:
-    // an untranslated x86_64 `O_TMPFILE` slips straight through glue's refusal.
-    let flags_ = u64::from(akuma_syscalls_abi::open_flags::x86_64_to_aarch64(
-        flags_ as u32,
-    ));
-    let Some(path) = path_from_user(path) else {
+/// signature` no matter how correct the fetch and the keys were. It is
+/// `akuma_syscalls_glue::fs::resolve_path_at` that answers it now, for both
+/// kernels, and [`resolve_at`] — this module's own ladder, still used by the
+/// arms that have not folded — is no longer in the `open` path at all. Two
+/// differences come with that swap and both are gains: a bogus negative
+/// `dirfd` is `EBADF` rather than `ENOTDIR`, and `AT_FDCWD` resolves against
+/// the process's `cwd` rather than against `/` — which is `/` for every
+/// process here until this target grows `chdir`, and correct on the day it
+/// does.
+pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
+    let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_ as u32);
+
+    // 1024, matching glue's own `copy_from_user_str` bound, so the preamble
+    // cannot refuse a path the arm behind it would have accepted. It was 256
+    // ([`path_from_user`]), which is what every unfolded arm still uses.
+    let Some(raw) = crate::uaccess::read_cstr(path, 1024)
+        .and_then(|b| alloc::string::String::from_utf8(b).ok())
+    else {
         return errno::EFAULT;
     };
 
@@ -1004,15 +1064,18 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // `StdioBuffer`/`ProcessChannel` that this target's children — whose fd 0
     // is a `PipeRead` since C2 slice 6 — never read.
     //
-    // Everything else under `/proc` is the mounted filesystem's, through the
-    // ordinary path below. This kernel rendered that whole namespace itself
-    // until 4b batch 2c, from its own spawn table, falling through to the mount
-    // only for what its view did not serve — two implementations of one
-    // namespace. Closing this one means teaching the shared stdin sink to find
-    // the target's real stdin (its own `get_fd(0)`), which is a change to
-    // behaviour on **both** kernels and so waits for a working AArch64
-    // verification loop.
-    if let Some(rest) = path.strip_prefix("/proc/")
+    // Everything else under `/proc` is the mounted filesystem's, through glue.
+    // This kernel rendered that whole namespace itself until 4b batch 2c, from
+    // its own spawn table, falling through to the mount only for what its view
+    // did not serve — two implementations of one namespace. Closing this one
+    // means teaching the shared stdin sink to find the target's real stdin (its
+    // own `get_fd(0)`), which is a change to behaviour on **both** kernels and
+    // so waits for a working AArch64 verification loop.
+    //
+    // Asked of the *raw* path, which is where it has always been asked: a
+    // relative spelling of the same file is not intercepted, and making it one
+    // would be a new behaviour rather than a preserved one.
+    if let Some(rest) = raw.strip_prefix("/proc/")
         && let Some(pid_str) = rest.strip_suffix("/fd/0")
     {
         let Ok(pid) = pid_str.parse::<u32>() else {
@@ -1024,234 +1087,103 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
     }
 
-    let Ok(normalised) = resolve_at(dirfd, path) else {
-        return errno::ENOTDIR;
+    // Resolved with **glue's** ladder, not this module's, so the refusals below
+    // are asked of exactly the path `openat_path` will open. Handing the
+    // resolved path back to it costs a `canonicalize` and no second lookup:
+    // it is absolute, so glue's `dirfd_base` returns before it touches the
+    // table.
+    let Ok(resolved) = akuma_syscalls_glue::fs::resolve_path_at(dirfd as i32, &raw) else {
+        return errno::EBADF;
     };
-    // Follow symlinks, which `open(2)` does unless `O_NOFOLLOW` says otherwise
-    // and which this target could not do at all until `akuma-vfs-glue` arrived
-    // (C1 step 4a). `readlink` already worked — `readlinkat` calls
-    // `fs::read_symlink` directly — so the gap was one-sided and silent:
-    // `ln -s` created a link `readlink` could describe and `cat` reported
-    // `ENOENT` for, because `read_file` on the link inode is `NotAFile`.
-    //
-    // Deliberately here and not in `resolve_at`: that helper also serves
-    // `symlinkat`, `readlinkat` and `unlinkat`, and every one of those operates
-    // on the link itself. Following there would make `rm` delete the target.
-    //
-    // `O_NOFOLLOW` is honoured by skipping the walk rather than by failing with
-    // `ELOOP` on a link, which is the weaker half of the flag: this target has
-    // no `O_PATH` and nothing that opens a link to inspect it. Stated so the
-    // divergence is pinned rather than assumed absent.
-    let normalised = if flags_ & u64::from(open_flags::O_NOFOLLOW) == 0 {
-        fs::resolve_symlinks(&normalised)
-    } else {
-        normalised
-    };
-    // `O_TMPFILE` is answered with `EINVAL`, as Linux kernels without tmpfile
-    // support do — and it is tested against the **asm-generic** mask, because
-    // the word was re-encoded at the top of this function. Read straight off
-    // the wire it would not have matched: x86_64 spells the flag `0o20200000`
-    // and aarch64 `0o20040000`, they share only `__O_TMPFILE`, and
-    // `flags & mask == mask` is therefore false for an x86_64 caller who
-    // asked for exactly this. That is the failure
-    // `akuma_syscalls_abi::open_flags`'s tests pin, and the reason a folded
-    // `sys_openat` could not have inherited this guard for free. This used to be *missing*,
-    // which repeated the aarch64 `APK_OTMPFILE_DIR_FD.md` bug bit for bit:
-    // apk-tools 3 opens its atomic-write temp file with
-    // `openat(dfd, ".", O_RDWR|O_TMPFILE|O_CLOEXEC)`, the open succeeded as a
-    // writable descriptor on the *directory*, apk wrote the whole downloaded
-    // index into it (the kernel buffered the bytes, `close` skipped the
-    // `is_dir` persistence), and the reopen-for-verify then had nothing to
-    // verify — surfacing as `UNTRUSTED signature` over a fetch that was fine.
-    // Portable callers (apk-tools 3's `__apk_ostream_to_file`) treat any
-    // failure here as "no tmpfiles" and fall back to `.tmp.<pid>` +
-    // `renameat`, which works.
-    let tmpfile = u64::from(open_flags::O_TMPFILE);
-    if flags_ & tmpfile == tmpfile {
-        return errno::EINVAL;
-    }
 
-    // `O_CREAT`: a new (or truncated) file, written back at `close(2)` — see
-    // [`sys_close`] and this module's header. Skips `read_file` entirely
-    // rather than reading-then-discarding an existing file's bytes: this
-    // target always truncates on `O_CREAT` (there is no in-place update path,
-    // and tcc — the first real writer here — always asks for
-    // `O_WRONLY|O_CREAT|O_TRUNC` together), so starting from an empty buffer
-    // is correct for the one case this target's callers actually use.
-    // Existing-directory check first: `O_CREAT` on a path that is already a
-    // directory must fail, not silently start writing a same-named file.
-    let creating = flags_ & u64::from(open_flags::O_CREAT) != 0;
-    if creating && fs::metadata(&normalised).is_ok_and(|m| m.is_dir) {
-        return errno::EISDIR;
-    }    // A directory has no bytes to cache as file contents — `read_file` would
-    // fail it as `NotAFile`. Check `metadata` first (one inode read, next to
-    // `read_file`'s whole-file copy) so a directory opens successfully instead
-    // of falling through to "not found"; `getdents64` lists it straight off
-    // the disk on first use. Write-mode opens of a directory are refused at
-    // `open(2)` time (Linux `may_open`'s answer) rather than handed out as a
-    // descriptor whose every meaningful write is a lie — the second half of
-    // the `O_TMPFILE` lesson above, and the same guard the aarch64 kernel
-    // shipped for it.
-    let is_dir = !creating && fs::metadata(&normalised).is_ok_and(|m| m.is_dir);
-    if is_dir && flags_ & u64::from(open_flags::O_ACCMODE) != 0 {
-        return errno::EISDIR;
-    }
-    // **C2 SLICE 5: THE CACHE DIES HERE.** This path only ever reaches a real
-    // ext2 file (synthetic views are answered above it, by `open_proc` and the
-    // synthetic installers), so the descriptor is born with an **empty**
-    // buffer: `read` goes to `fs::read_at` and `write` to `write_at` at the
-    // cursor, in `MAX_IO`-bounded chunks, and nothing holds the file's bytes
-    // in the kernel heap for the descriptor's lifetime. That is the whole-file
-    // heap bug's root cause, deleted rather than guarded.
-    //
-    // What replaced "read the bytes, and `ENOENT` if that fails" is a
-    // **one-byte** `read_at` probe: it answers existence through the same
-    // byte path the descriptor will use, which `metadata` alone cannot. One
-    // byte, not zero: a zero-length `read_at` succeeds before the path is ever
-    // resolved (a short-circuit that is correct for `read(2)` and fatal for a
-    // probe — the first Firecracker boot of this slice opened missing files
-    // and gave them fds).
-    //
-    // **The device arm below runs before it**, and that ordering is the whole
-    // reason it is written out here. A `/dev` node has no byte path at all, so
-    // the probe answers "absent" for every one of them; behind the probe,
-    // `open("/dev/zero")` was `ENOENT` and `open("/dev/null", O_CREAT)` — which
-    // skips the probe's guard — went on to try to *create* a node. Two
-    // different wrong answers to the same question, from one ordering.
-
-    // **The `/dev` character nodes.** `/dev` on this target is synthetic —
-    // `akuma_vfs_glue::dev_node` answers `ls -la /dev`, `stat` and `getdents`
-    // for it — but nothing had ever wired a *descriptor* to one, so every
-    // `open` under `/dev` fell through to the ext2 path below, where `/dev` is
-    // not a directory and the node is not a file.
-    //
-    // That fall-through was wrong in two different eras, and the second is the
-    // one that made this urgent. Measured over ssh against the committed
-    // kernel, not inferred:
-    //
-    // - **before C2 slice 5**, `> /dev/null` opened a descriptor with an empty
-    //   buffer, buffered every byte written to it, and dropped them at `close`
-    //   when the whole-file persist failed — a bit bucket by accident, with a
-    //   `[close] persist failed` console line per use;
-    // - **after slice 5** the writes go straight to `write_at`, which cannot
-    //   resolve `/dev`, so `echo hi > /dev/null` answers
-    //   `sh: write error: No such file or directory` and exits 1. `ls >
-    //   /dev/null` still *looks* fine only because busybox `ls` swallows its
-    //   write error — which is how a broken `/dev/null` survived a suite and a
-    //   ring-3 check that both run `>/dev/null` on every line.
-    //
-    // Reading has been broken longer than either: `cat /dev/null` is `ENOENT`,
-    // because the existence probe below asks for a byte a node has none of.
-    //
-    // None of these is `/dev/null`. It is the most-used special file in any shell
-    // script and this target reaches it on `ls > /dev/null` alone, so it is
-    // served here for real: the descriptor carries the node's path, and
-    // [`dev_node_of`] is what `read`, `write`, `lseek` and `fstat` ask instead
-    // of the VFS. A node this does not serve — the block devices — is
-    // `ENODEV` rather than a fall-through, which is the same "say so" answer
-    // the aarch64 kernel gives for `open("/dev/vda")`.
-    if let Some(node) = akuma_vfs_glue::dev_node(&normalised) {
-        if node.is_block {
-            return errno::ENODEV;
-        }
-        let file = KernelFile::new(normalised, flags_ as u32);
-        return install(FileDescriptor::File(file));
-    }
-    let mut probe = [0u8; 1];
-    let exists = fs::read_at(&normalised, 0, &mut probe).is_ok();
-    if !creating && !is_dir && !exists {
-        return errno::ENOENT;
-    }
-    // `O_DIRECTORY` — the other half of the `is_dir` answer above, and the one
-    // this file could not express before the word was re-encoded at the top.
-    //
-    // The flag was **never read at all**: it had no entry in the local
-    // `open_flags` module, and `is_dir` is decided by `fs::metadata`, so
-    // `open("/bin/busybox", O_RDONLY|O_DIRECTORY)` handed back a working
-    // descriptor on a regular file. It could not simply have been added
-    // either — the bit ring 3 sets is `0o200000`, which in the encoding every
-    // shared crate here uses is `O_DIRECT`, so reading it with the tree's own
-    // constant would have tested the wrong bit, and reading it with a fourth
-    // inline `_X86` const would have deepened the split this pass removes.
-    //
-    // **Below the existence probe, not above it**, and the first draft had it
-    // above: `open("/no/such/path", O_DIRECTORY)` must be `ENOENT`, because
-    // "there is no such file" outranks "and it would not have been a
-    // directory". Placed early it answered `ENOTDIR` for every missing path
-    // that carried the flag — which is the sort of thing that sends a caller
-    // looking for a directory it never asked about. The check's own negative
-    // control is what found it, by returning `ENOENT` from the arm that was
-    // supposed to be the broken one.
-    if !is_dir && flags_ & u64::from(open_flags::O_DIRECTORY) != 0 {
-        return errno::ENOTDIR;
-    }
-    let truncating = flags_ & u64::from(open_flags::O_TRUNC) != 0;
-    let appending = flags_ & u64::from(open_flags::O_APPEND) != 0;
-    // `O_CREAT | O_EXCL` on a path that already exists is `EEXIST`, which is
-    // the *whole* contract of `O_EXCL`: it is how a caller claims a lock file
-    // or an atomic temp name, and succeeding anyway tells two of them they
-    // both won. Asked here rather than left out, because the probe above has
-    // already paid for the existence answer.
-    if creating && flags_ & u64::from(open_flags::O_EXCL) != 0 && (exists || is_dir) {
-        return errno::EEXIST;
-    }
-    // **`O_TRUNC` truncates and `O_CREAT` creates — here, once, through the
-    // VFS**, and both used to do neither.
-    //
-    // The line this replaces was `write_at(path, 0, &[])`, and `write_at`'s
-    // very first statement is `if data.is_empty() { return Ok(0) }` — *before*
-    // it resolves the path, creates a missing inode or touches a length. So it
-    // reported success and did nothing, twice over:
-    //
-    // - `echo x > f` over a 31-byte `f` left `x\nAAAAAAAA…` — 31 bytes, the
-    //   tail of the old contents behind the new head. Silent corruption, and
-    //   invisible to the boot suite, whose `redirect` checks only ever write
-    //   to a file that did not exist yet.
-    // - `: > f`, `2> err` for a command that prints no errors, and any other
-    //   zero-length create made **no file at all**: nothing wrote bytes, so
-    //   nothing ever reached the filesystem.
-    //
-    // This is the *same short-circuit* slice 5 already paid for in the other
-    // direction — its existence probe was zero-length and `read_at` answers
-    // `Ok` for that before resolving anything, so every missing file opened
-    // successfully. One byte fixed the read; the write needs an API that does
-    // not have the short-circuit at all. `write_file(path, &[])` is that:
-    // existing → `truncate_inode` then write nothing, missing → allocate the
-    // inode and add the directory entry. It is a whole-file write of **zero
-    // bytes**, so it costs the heap nothing and reintroduces no cache.
-    //
-    // A failure is a real refusal (a read-only mount, a missing parent) and
-    // fails the open, which is what Linux answers too.
-    if !is_dir
-        && (truncating || (creating && !exists))
-        && let Err(e) = fs::write_file(&normalised, &[])
+    // A **block** node is refused rather than served — see the header. A
+    // table lookup, no I/O, so it is asked unconditionally.
+    if let Some(node) = akuma_vfs_glue::dev_node(&resolved)
+        && node.is_block
     {
-        return fs_err_errno(e);
+        return errno::ENODEV;
     }
-    // `O_APPEND`'s starting cursor is the file's real size — one `metadata`,
-    // not "the length of what we happened to read". **After** the truncate
-    // above, not before: `O_APPEND | O_TRUNC` together must start at 0, and
-    // reading the size first would have started at the old end.
-    let start_pos = if appending {
-        fs::metadata(&normalised).map_or(0, |m| m.size)
-    } else {
-        0
-    };
 
-    // `KernelFile::new` leaves the inode 0 — "read by path", which is what
-    // this target does — and the position 0, which `O_APPEND` overrides.
+    // `O_NOFOLLOW`: Linux's `ELOOP` on a final component that is a symlink.
     //
-    // **That divergence is closed (4b batch 2a).** It read, until 2026-09-09,
-    // "real `O_APPEND` re-seeks to the end before *every* write … here it only
-    // sets the starting cursor", so two descriptors appending to one file both
-    // started at the same offset and the second clobbered the first.
-    // [`sys_write_file`] re-derives the position from the live file per write
-    // now — the semantics `akuma-syscalls-glue`'s `sys_write` already had —
-    // which makes this seed a fast path rather than the whole answer, and is
-    // what lets the `openat` fold proceed: glue's arm seeds no position at all.
-    let mut file = KernelFile::new(normalised, flags_ as u32);
-    file.position = start_pos as usize;
-    install(FileDescriptor::File(file))
+    // This used to be spelled as *skipping* the symlink walk, which is the
+    // weaker half of the flag and answered `ENOENT` — the walk skipped, the
+    // existence probe then run against the link inode, which ext2 reports as
+    // `NotAFile`. Glue resolves unconditionally, so the choice here was between
+    // Linux's answer and silently following a link a caller asked not to
+    // follow. `is_symlink` is the exact predicate: `resolve_symlinks` reads the
+    // link off the *whole* path and never walks intermediate components, so
+    // "the path glue would rewrite" and "the final component is a link" are the
+    // same question in this tree.
+    if flags & open_flags::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(&resolved) {
+        return errno::ELOOP;
+    }
+
+    // The three that need to know what is already there. One `metadata` for all
+    // of them, taken only when a flag that reads it is set — an `open` with
+    // none of them pays nothing.
+    let creating = flags & open_flags::O_CREAT != 0;
+    let wants_dir = flags & open_flags::O_DIRECTORY != 0;
+    let excl = creating && flags & open_flags::O_EXCL != 0;
+    if creating || wants_dir {
+        let md = fs::metadata(&resolved);
+        let is_dir = md.as_ref().is_ok_and(|m| m.is_dir);
+        let present = md.is_ok();
+        // `O_CREAT` on a path that is already a directory must fail, not
+        // silently start writing a same-named file. Glue refuses a *write*
+        // open of a directory (`may_open`'s answer) and this is the other
+        // half: `open("/etc", O_CREAT)` with no access mode gets past that one.
+        if creating && is_dir {
+            return errno::EISDIR;
+        }
+        // `O_DIRECTORY` on something that is not one. **Below the existence
+        // question, not above it**, and the first draft of this check had it
+        // above: `open("/no/such/path", O_DIRECTORY)` must be `ENOENT`, because
+        // "there is no such file" outranks "and it would not have been a
+        // directory". Placed early it answered `ENOTDIR` for every missing path
+        // that carried the flag — which is the sort of thing that sends a
+        // caller looking for a directory it never asked about. Glue answers the
+        // `ENOENT`; this arm only refuses what is there.
+        //
+        // The flag was **never read at all** before the word was re-encoded at
+        // the top: the bit ring 3 sets is `0o200000`, which in the encoding
+        // every shared crate here uses is `O_DIRECT`, so
+        // `open("/bin/busybox", O_RDONLY|O_DIRECTORY)` handed back a working
+        // descriptor on a regular file.
+        if wants_dir && present && !is_dir {
+            return errno::ENOTDIR;
+        }
+        // `O_CREAT | O_EXCL` on a path that already exists is `EEXIST`, which
+        // is the *whole* contract of `O_EXCL`: it is how a caller claims a lock
+        // file or an atomic temp name, and succeeding anyway tells two of them
+        // they both won.
+        if excl && present {
+            return errno::EEXIST;
+        }
+    }
+
+    // **The row's descriptor ceiling.** Glue's `alloc_fd` has none — a
+    // `BTreeMap` grows — and here that is not merely a policy difference:
+    // [`MAX_FDS`] is also this module's *lookup* bound ([`table_get_in`],
+    // [`is_bound`] and [`is_nonblocking`] all refuse a number at or above it),
+    // so a descriptor glue handed out past the ceiling would be a successful
+    // `open` that every later syscall answers `EBADF` for. Asked here, one
+    // lock, where [`install`] asks it for every descriptor this module still
+    // allocates itself.
+    if cur_table().table.lock().len() >= MAX_FDS {
+        return errno::EMFILE;
+    }
+
+    // `mode` reaches the filesystem for the first time here: this arm ignored
+    // it (`_mode`) and every file this target created came out with whatever
+    // `write_file` picked. Glue `chmod`s a created file to `mode & 0o7777`,
+    // which is what makes a `tcc`-built binary executable without a `chmod +x`.
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::openat_path(
+        dirfd as i32,
+        &resolved,
+        flags,
+        mode as u32,
+    ))
 }
 
 /// The `open(2)` flag bits, **asm-generic encoding** — the tree's own table,
@@ -1593,7 +1525,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // entry no longer carries an `is_dir` bool. The common path pays nothing:
     // the check that went away only ever fired on the error.
     //
-    // A **synthetic** `/proc` view is re-rendered per read (step 4b) — the
+    // `/proc` is read through the VFS like any other mount (4b batch 2c) — the
     // mounted `ProcFilesystem`'s semantics, which is what this target's file
     // surface is converging on; the render-at-open snapshot the old
     // `Entry::data` cache gave was that field's whole reason to exist, and it
@@ -1734,7 +1666,7 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
 /// which is what makes that the right split: a mapping that extends past EOF
 /// reads as zeros, exactly as `mmap(2)` specifies for the partial last page.
 ///
-/// A synthetic `/proc` view is rendered fresh (step 4b); a real file's page
+/// A `/proc` file is rendered by its filesystem per read; a real file's page
 /// comes off the VFS.
 pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
     // A directory needs no guard of its own: `fs::read_at` below refuses one
@@ -1765,7 +1697,7 @@ pub fn is_regular_file(fd: u64) -> bool {
     if dev_node_of(fd).is_some() {
         return false;
     }
-    // "Not a directory", asked of the path. A synthetic `/proc` *file* stays
+    // "Not a directory", asked of the path. A `/proc` *file* stays
     // mappable exactly as it was — [`file_bytes_at`] serves it from a fresh
     // render — and a synthetic `/proc` directory is refused.
     table_with(fd, |d| match d {
@@ -1780,12 +1712,10 @@ pub fn is_regular_file(fd: u64) -> bool {
 /// `usermode.rs` does not itself handle (console, pipe, socket).
 ///
 /// Writes through the VFS at the descriptor's cursor, in [`MAX_IO`]-bounded
-/// chunks, with the disk I/O outside the table lock (C2 slice 5). A
-/// **synthetic** `/proc` view has no inode behind the path to write through;
-/// since step 4b there is no cached render to write into either, so the write
-/// is accepted and dropped — the same observable answer the old
-/// write-the-cache-then-fail-the-persist path produced, minus the console
-/// error line. Nothing on this target writes a `/proc` file.
+/// chunks, with the disk I/O outside the table lock (C2 slice 5). `/proc`
+/// writes used to be "accepted and dropped" here, because the paths under it
+/// were a view of this kernel's own with nothing behind them; since 4b batch 2c
+/// they reach the mounted filesystem like any other path.
 pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
@@ -1861,14 +1791,15 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
         // outside the table lock, because it is a `metadata` and the disk does
         // not belong under that lock (the rule the resolve above states).
         //
-        // The starting cursor `sys_openat` sets is not enough and never was:
-        // two descriptors appending to one file each keep their own position,
-        // so the second write lands on top of the first. This is the semantics
+        // A starting cursor set at `open` is not enough and never was: two
+        // descriptors appending to one file each keep their own position, so
+        // the second write lands on top of the first. This is the semantics
         // `akuma-syscalls-glue`'s `sys_write` already has — it derives the
-        // append position from `file_size` per call — and aligning here is a
-        // prerequisite for folding `openat`, whose glue arm does **not** seed
-        // a starting position at all. Folded without this, every `>>` would
-        // start at 0 and clobber the file it was meant to extend.
+        // append position from `file_size` per call — and aligning here was the
+        // prerequisite for folding `openat` (4b batch 2a), whose glue arm seeds
+        // **no** starting position at all. Folded without this, every `>>`
+        // would start at 0 and clobber the file it was meant to extend; the
+        // fold has landed, so this is now the only thing placing an append.
         let pos = if appending {
             akuma_vfs_glue::metadata(&path).map_or(pos, |m| m.size as usize)
         } else {
@@ -2286,7 +2217,7 @@ fn encode_stat(
 
 /// `fstat(fd, statbuf)` — `struct stat` for an already-open descriptor.
 ///
-/// The size comes from a fresh render for a synthetic view and from the VFS
+/// The size comes from the VFS
 /// for a real file; the mode is a fixed `S_IFREG | 0644` because a
 /// `KernelFile` on this target carries no inode to read a real one from. A
 /// console descriptor reports `S_IFCHR`, a directory descriptor `S_IFDIR` —
@@ -2308,7 +2239,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         // keeps `stat file` and `fstat(open(file))` agreeing.
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
-        // Size and shape: synthetic from a fresh render, real from the VFS —
+        // Size and shape: from the VFS —
         // one `metadata` outside the lock, the rule `release_desc` states
         // about disk I/O under the table lock.
         //
@@ -2461,8 +2392,11 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
 ///
 /// `dirfd` is honoured only for `AT_EMPTY_PATH` (stat the fd itself, the
 /// `fstat` form busybox uses to size a file it just opened); every other path
-/// is resolved from the root, exactly as [`sys_openat`] does it, because this
-/// target has no per-process working directory.
+/// is resolved from the root by [`resolve_at`], because this target has no
+/// per-process working directory. [`sys_openat`] no longer resolves that way —
+/// it uses `akuma_syscalls_glue::fs::resolve_path_at`, which reads
+/// `Process::cwd` — and the two agree only because that field is `/` for every
+/// process here. Whichever arm folds next takes this one with it.
 ///
 /// The mode, size, inode and timestamps come straight from `akuma-ext2`'s inode
 /// metadata — the `type_perms` field already *is* a Linux `st_mode` (type bits
@@ -2984,14 +2918,17 @@ fn collect_leaf_runs(uas: &akuma_mmu::UserAddressSpace, skip: &[(usize, usize)])
 ///
 /// # Why this is a self-test and not a comment
 ///
-/// The three answers came from **two** functions. `sys_openat` and
-/// `sys_newfstatat` both went through `proc_metadata`/`render_proc_file` —
-/// `render_proc_file`'s header says in as many words that one function serves
-/// both "so the two can never disagree about what exists" — and `sys_access`
-/// went straight to the disk, so it said `ENOENT` for every `/proc` path this
-/// target serves. Nothing failed loudly: `busybox` mostly `open`s, and the one
-/// caller that probes with `access` first is a program deciding whether the
-/// kernel has a `/proc` at all.
+/// The three answers came from **two** functions when this kernel rendered
+/// `/proc` itself: `sys_openat` and `sys_newfstatat` shared a renderer "so the
+/// two can never disagree about what exists", and `sys_access` went straight to
+/// the disk, so it said `ENOENT` for every `/proc` path the target served.
+/// Nothing failed loudly: `busybox` mostly `open`s, and the one caller that
+/// probes with `access` first is a program deciding whether the kernel has a
+/// `/proc` at all.
+///
+/// Since 4b batch 2c there is one implementation — the mounted
+/// `ProcFilesystem` — and this check is what says so: it is the same section it
+/// always was, asserting the same paths, against the survivor.
 ///
 /// Found 2026-09-07 by `smapsdirty`'s `proc-self-files` sub-probe, which
 /// reported `stat status cmdline` missing on a target that serves all three.
@@ -3137,12 +3074,26 @@ fn siocgif(cmd: u32, arg: u64) -> u64 {
 /// so any other pid would point `/proc/self` at a process the synthetic view
 /// has never heard of.
 ///
+/// **The row starts with stdio, which `make_test_process` does not give it.**
+/// A prerequisite for the `openat` fold (4b batch 2d), and the same one every
+/// registered process met in batch 2a: glue allocates with `alloc_fd`, which is
+/// `alloc_fd_from(0)`, so with 0/1/2 absent the suite's first `open` returns
+/// **fd 0** — and every check that reads `fd >= FIRST_FILE_FD` as "the open
+/// succeeded" reads a successful open as a failure. `make_test_process` builds
+/// `SharedFdTable::new()` and is `akuma-exec`'s, shared with 25 AArch64 call
+/// sites, so the triple is written here rather than there.
+///
 /// The AArch64 kernel has had this since long before: `register_at_syscall_process`,
 /// used 25 times in `src/process_tests.rs`.
 pub fn boot_row_register() -> usize {
     let tid = akuma_exec::threading::current_thread_id();
     akuma_exec::process::register_process(1, akuma_exec::process::make_test_process(1));
     akuma_exec::process::register_thread_pid(tid, 1);
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
+        proc.set_fd(0, FileDescriptor::Stdin);
+        proc.set_fd(1, FileDescriptor::Stdout);
+        proc.set_fd(2, FileDescriptor::Stderr);
+    }
     tid
 }
 

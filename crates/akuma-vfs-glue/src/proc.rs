@@ -321,6 +321,19 @@ fn render_stat_system(buf: &mut [u8]) -> usize {
 /// the reclaimable-on-demand cache `MemAvailable` accounts for). No swap
 /// exists on this kernel, so the `Swap*` fields are always 0 — a legitimate
 /// value, not a placeholder.
+///
+/// `Slab:` is the **kernel heap** (`akuma_alloc::stats().allocated`), and it is
+/// here because it is the only number in the system that can witness a
+/// kernel-heap leak from ring 3: `free` reads the PMM, and the PMM did not move
+/// at all across the 135 MB excursion into amd64's whole-file `fd` cache
+/// (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a method correction").
+/// amd64 used to render that number in `Cached:` from its own synthetic
+/// `/proc`; 4b batch 2c deleted that view in favour of this one, and with it —
+/// silently — the witness, because `Cached:` here is the *file page* cache and
+/// amd64 has none. Reported under its Linux name instead of borrowing another
+/// field's, so `scripts/utils/amd64_ring3_check.py` reads a row that means what
+/// it says on both kernels. busybox `free` matches by key prefix and ignores
+/// rows it does not know, so adding one costs its output nothing.
 fn render_meminfo(buf: &mut [u8]) -> usize {
     use akuma_primitives::console::FmtBuf;
     let (total_pages, _allocated, free_pages) = akuma_pmm::stats();
@@ -329,6 +342,7 @@ fn render_meminfo(buf: &mut [u8]) -> usize {
     let free_kb = free_pages as u64 * page_kb;
     let cached_kb = akuma_fpcache::len() as u64 * page_kb;
     let available_kb = free_kb + cached_kb;
+    let slab_kb = akuma_alloc::stats().allocated as u64 / 1024;
 
     let mut pos = 0usize;
     let mut w = FmtBuf { buf, pos: &mut pos };
@@ -341,6 +355,7 @@ fn render_meminfo(buf: &mut [u8]) -> usize {
     let _ = writeln!(w, "SwapTotal:      {:>10} kB", 0);
     let _ = writeln!(w, "SwapFree:       {:>10} kB", 0);
     let _ = writeln!(w, "Shmem:          {:>10} kB", 0);
+    let _ = writeln!(w, "Slab:           {:>10} kB", slab_kb);
     pos
 }
 

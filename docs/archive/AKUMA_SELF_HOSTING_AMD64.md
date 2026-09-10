@@ -6,8 +6,8 @@
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** plan, with measurements taken 2026-09-07 and the walk kept current
-in the dated boxes below (last updated 2026-09-09, after the TLB shootdown and
-C2's seven slices).
+in the dated boxes below (last updated 2026-09-10, after 4b's fold batches
+through `openat`).
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
 > `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
@@ -682,6 +682,31 @@ C2's seven slices).
 > and it is unblocked: 4a killed the private mount table, 5b supplied
 > `current_process_shared`, and the shootdown lifted the mem-arm deadline.
 
+> **`openat` is glue's arm (batch 2d, 2026-09-10)** —
+> `AKUMA_AMD64_4B_FOLD_BATCH2D.md`. The fold that mattered: every other file
+> syscall here reads a descriptor `openat` produced. `fd.rs` **+248 / −297**;
+> what stays is a preamble of four parts — the x86_64→asm-generic flag hop,
+> `/proc/<pid>/fd/0`, the four refusals glue does not make (`O_DIRECTORY`,
+> `O_EXCL`, `O_NOFOLLOW`, `O_CREAT`-on-a-directory), and `ENODEV` for a block
+> node. Glue's arm split into `sys_openat` + `openat_path` so the preamble does
+> not copy the user string twice, and `resolve_path_at` went `pub` so both
+> kernels answer `dirfd` from one ladder. Gains, from ring 3: `mode` reaches the
+> filesystem at last, a bogus negative `dirfd` is `EBADF`, `AT_FDCWD` resolves
+> against `Process::cwd`, and `O_NOFOLLOW` on a symlink is Linux's `ELOOP`
+> rather than `ENOENT`. Two prerequisites the plan had not named: the **boot
+> row** needed the `with_stdio` triple (glue's `alloc_fd` starts at 0, so the
+> suite's first `open` returned fd **0**), and **`MAX_FDS` turned out to be a
+> lookup bound**, not just a budget — glue has no ceiling, and fd 256 came back
+> from a successful `open` that every later syscall would answer `EBADF` for.
+> New gate: `userspace/forktest/c_stress/openflags.c`, 20 assertions, **20/20 on
+> QEMU and on the metal**, and 19 + 1 known divergence on real Linux.
+> It also found a **dead instrument**: batch 2c's `/proc` deletion silently
+> zeroed `amd64_ring3_check`'s kernel-heap column (amd64 rendered the heap in
+> `Cached:`; the shared procfs renders the file-page cache there, and this target
+> has none), so the check had been reporting `0 -> 0 kB` for a week. The shared
+> render carries `Slab:` now and the harness reads it — first live reading
+> **1576 → 1573 kB over 30 ssh sessions**.
+>
 > **4b is in progress: batch 1 folded, batch 2's prerequisites landed, and the
 > two pipe tables are one (2026-09-10)** —
 > `AKUMA_AMD64_4B_FOLD_BATCH2A.md` (console descriptors, `with_stdio()`, glue's
@@ -917,13 +942,24 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │                              AKUMA_AMD64_TLB_SHOOTDOWN.md,
    │                              AKUMA_AMD64_C2_SLICES_{1_TO_4,6_AND_7}.md
    ▼
- [09-09] ═══ YOU ARE HERE ═══
+ [09-10] ═══ 4b: THE ARMS START MOVING ═══
+   │
+   ▼   the refcount flip, then five path-only arms (b1) · the pipe
+   │   tables become one and `close` folds (b2a/b2b) · two `/proc`
+   │   implementations become one, −500 lines (b2c) · **`openat`
+   │   folds** (b2d) — the arm every other file syscall reads a
+   │   descriptor from. `fd.rs` 4 454 → 3 846
+   │                        docs: AKUMA_AMD64_4B_FLIP.md,
+   │                              AKUMA_AMD64_4B_FOLD_BATCH{1,2A,2B,2C,2D}.md,
+   │                              AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md
+   ▼
+ [09-10] ═══ YOU ARE HERE ═══
    │
    └──► three pieces left below the gate, none blocked on another:
-        **4b** — the VFS arms into glue, which is what retires `fd.rs`
-                 (4 454 lines, 22 `fd::` arms still in the dispatcher);
-                 its prerequisite inside C2 is flipping the refcount
-                 authority from `FILES` to the registered table
+        **4b, continued** — `read`/`pread64`/`write`/`lseek`/`fstat`/
+                 `getdents64` are the cluster that reads what the
+                 folded `openat` produces, and are the next batch;
+                 then `ioctl`, `poll`/`select`, `dup`, `pipe2`
         **the ring-3 entry seam** — an x86 arm for "enter userspace with
                  this process's first context"; unblocks `fork`, then
                  `clone`. Sized like 5b, and the only one with no
@@ -1011,9 +1047,11 @@ parity with what the AArch64 self-host already proves.
   │  ✔ 6    loader.rs placement → akuma-elf load half              │
   │  ✔ 5b   PROCS → akuma-exec, in four slices: register /         │
   │           identity+lifecycle / mount /proc / delete PROCS      │
-  │  ✖ 4b   the remaining VFS arms → glue  ◀── UNBLOCKED, and it   │
-  │           is what retires fd.rs (4454 lines, 22 fd:: arms).    │
-  │           Needs C2's refcount flip under it first.             │
+  │  ◐ 4b   the remaining VFS arms → glue  ◀── IN PROGRESS.        │
+  │           Folded: mkdirat/unlinkat/renameat/symlinkat/         │
+  │           readlinkat (b1), close (b2b), one /proc (b2c),       │
+  │           **openat (b2d)**. fd.rs 4454 → 3846.                 │
+  │           Next: read/pread/write/lseek/fstat/getdents64.       │
   │  ✖ THE RING-3 ENTRY SEAM — an x86 arm for "enter userspace     │
   │           with this process's first context". fork_process     │
   │           `eret`s from a UserContext; amd64 has no eret. This  │

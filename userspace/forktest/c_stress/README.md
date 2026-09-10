@@ -29,6 +29,18 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   `docker run --rm --platform linux/arm64 -v "$PWD/futexops:/futexops:ro" alpine /futexops`.
   As of 2026-08-03: 5 FAIL on Akuma, 5 PASS on Linux — see
   `docs/reference/subsystems/syscalls/sync.md` §"Known divergences from Linux".
+- `openflags` — probes `open(2)`'s **flag vocabulary** against Linux, 20
+  assertions: `O_EXCL`, `O_DIRECTORY` (including that a missing path is `ENOENT`
+  and not `ENOTDIR`), `O_NOFOLLOW` -> `ELOOP`, `O_TRUNC`, `O_TMPFILE`, the
+  write-open-of-a-directory `EISDIR`, the `mode` argument, `openat` against a
+  directory fd and against a bogus negative one, and `/dev/null` + `/dev/zero`.
+  Written for the amd64 `openat` fold (`docs/archive/AKUMA_AMD64_4B_FOLD_BATCH2D.md`),
+  whose preamble keeps four refusals `akuma-syscalls-glue` does not make — a
+  kernel-side self-test cannot assert those, because it runs under
+  `BypassValidationGuard` and never crosses the privilege boundary. Calibrated
+  the same way as `futexops`: on real Linux it is 19 PASS + 1 DIVERGE
+  (`O_TMPFILE`, which Linux supports). 20/20 on Akuma/amd64, QEMU and bare
+  metal, as of 2026-09-10.
 - `dynspawn` + `dynchild` — hammer vfork+exec of a **dynamically linked** binary
   and check the loader gets each child to `main`. Both binaries are dynamic on
   purpose: musl implements `posix_spawn` with `CLONE_VM|CLONE_VFORK`, so the

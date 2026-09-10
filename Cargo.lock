@@ -724,6 +724,7 @@ dependencies = [
 name = "akuma-vfs-glue"
 version = "0.1.0"
 dependencies = [
+ "akuma-alloc",
  "akuma-config",
  "akuma-exec",
  "akuma-ext2",

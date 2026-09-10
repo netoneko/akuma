@@ -123,15 +123,24 @@ def free_columns(text):
 
 
 def heap_used_kib(text):
-    """Live kernel-heap bytes off `/proc/meminfo`'s `Cached:` row, or `None`.
+    """Live kernel-heap bytes off `/proc/meminfo`'s `Slab:` row, or `None`.
 
-    On this target `Cached:` is `akuma_alloc::stats().allocated` — the kernel
-    heap, not a page cache (`amd64/src/fd.rs` `render_meminfo`). This is the
+    `Slab:` is `akuma_alloc::stats().allocated` — the kernel heap. This is the
     reading `free` cannot give: busybox `free`'s numbers come from the PMM and
     never moved across the 135 MB whole-file-cache excursion.
+
+    **It was `Cached:` until 2026-09-10, and had been reading a hard 0 since 4b
+    batch 2c.** amd64 rendered the heap number into `Cached:` from its own
+    synthetic `/proc`; batch 2c deleted that view for the mounted
+    `ProcFilesystem`, where `Cached:` is the *file page* cache — which amd64
+    does not have. Nothing failed: the column reported `0 -> 0 kB` and a drift
+    of `+0`, which reads as a perfect result and is a dead check. The shared
+    render carries the heap under its own Linux name now, so this row means the
+    same thing on both kernels. A kernel that predates that row makes this
+    return `None`, which the caller reports rather than scoring.
     """
     for line in text.splitlines():
-        if line.strip().startswith("Cached:"):
+        if line.strip().startswith("Slab:"):
             parts = line.split()
             if len(parts) >= 2:
                 return int(parts[1])
@@ -221,7 +230,10 @@ def main(argv=None):
                       "(AMD64_FD_WHOLE_FILE_HEAP.md)")
                 ok = False
         else:
-            print("heap:  NO READING — /proc/meminfo had no `Cached:` row")
+            print("heap:  NO READING — /proc/meminfo had no `Slab:` row. A "
+                  "kernel older than 2026-09-10 does not render one; this run "
+                  "proves nothing about the kernel heap.")
+            ok = False
 
         rc, gf = ssh(a.ssh_port, "/probes/grandfork", timeout=120)
         print(f"grandfork: rc={rc}")

@@ -227,7 +227,12 @@ pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u
 /// through raw, so `newfstatat("/a/../b")` now stats `/b` rather than the
 /// literal string. `akuma_vfs_glue::resolve_mount` canonicalizes on the next line
 /// either way, so this only changes what the *tracing* shows.
-pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64> {
+///
+/// `pub` since the amd64 `openat` preamble resolves with it (4b batch 2d): its
+/// own refusals have to be asked of the path [`openat_path`] will open, and a
+/// second `AT_FDCWD` ladder in another kernel is exactly the drift this
+/// function was written to end.
+pub fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64> {
     let Some(base) = dirfd_base(dirfd, raw_path)? else {
         return Ok(akuma_vfs_glue::canonicalize_path(raw_path));
     };
@@ -1646,9 +1651,28 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     u64::from(newfd)
 }
 
-pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult {
+/// `openat(2)`, from a user pointer: copy the path, then [`openat_path`].
+///
+/// The split is what lets a second kernel put a **preamble** in front of this
+/// arm without copying the user string twice. amd64's `fd::sys_openat` is that
+/// preamble — the x86_64 -> asm-generic flag hop, the refusals this arm does
+/// not make, and one path it answers for itself — and it calls
+/// [`openat_path`] with the path it already holds. `pub` for the same reason
+/// [`sys_close`] and [`sys_read`] are.
+pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
+    openat_path(dirfd, &raw_path, flags, mode)
+}
 
+/// `openat(2)` on a path already in kernel memory — the whole of the arm
+/// except the user copy.
+///
+/// `raw_path` is resolved against `dirfd` here, so an absolute path (what a
+/// caller that has already resolved one hands over) costs a `canonicalize`
+/// and no lookup, and a relative one behaves exactly as it does through
+/// [`sys_openat`]. `flags` is the **asm-generic** encoding, like every other
+/// flag word in this crate.
+pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResult {
     if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
         akuma_primitives::tprint!(128, "[syscall] openat(dirfd={}, path={:?}, flags=0x{:x}, mode=0x{:x})\n", dirfd, raw_path, flags, mode);
     }
@@ -1676,7 +1700,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
     // resolved a bogus negative `dirfd` against `/` instead of failing — which
     // turned `openat(-5, "rel")` into a successful open of a *different file*.
     // It is `EBADF` now; see `dirfd_base`.
-    let path = match resolve_path_at(dirfd, &raw_path) {
+    let path = match resolve_path_at(dirfd, raw_path) {
         Ok(p) => p,
         Err(e) => {
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED && e == EBADF {
