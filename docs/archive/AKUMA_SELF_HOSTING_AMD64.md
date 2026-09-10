@@ -1289,14 +1289,18 @@ parity with what the AArch64 self-host already proves.
                               ▼
   ┌────────────────────────────────────────────────────────────────┐
   │ D. RUSTC/CARGO APPETITE (the last mile, mostly by then free)   │
-  │   ✔ **somewhere to put a toolchain** — 2026-09-10. The metal   │
-  │     mounts its 64 GB persistent root again (`fs: ext2 mounted  │
-  │     on /dev/sda1`, 641 passed / 0 failed, ~63 GB free). It had │
-  │     regressed to the RAM image only because the drive had been │
-  │     moved to a USB 2.0 socket, and BOT-over-xHCI works at      │
-  │     SuperSpeed only. `apk` already works on this target, so    │
-  │     the toolchain is `apk add rust cargo`, not a prepared      │
-  │     image as on AArch64.                                       │
+  │   ◐ **somewhere to put a toolchain** — 2026-09-10, half done.  │
+  │     The metal mounts its 64 GB persistent root again (`fs:     │
+  │     ext2 mounted on /dev/sda1`, 641 passed / 0 failed, ~63 GB  │
+  │     free) once the drive is in a **USB 3.0** socket —          │
+  │     BOT-over-xHCI works at SuperSpeed only. `apk` works here,  │
+  │     so the toolchain is `apk add rust cargo`, not a prepared   │
+  │     image as on AArch64. **But it stalls again under use**     │
+  │     (`transfer timeout: CBW`, unrecoverable, root reads dead   │
+  │     for the boot) — which is why the RAM image path exists at  │
+  │     all. **The xHCI recovery gap is now on D's critical path:**│
+  │     Set TR Dequeue Pointer + the BOT reset. See                │
+  │     AKUMA_AMD64_USB_XHCI.md § "It stalls again under use".     │
   │   file-backed + lazy mmap  ← B1/B2 (rustc mmaps rlibs)         │
   │   threads + futex          ← A1/A2 (rayon, jobserver)          │
   │   wait4, pipes, signals    ← A2 (cargo -j, SIGINT)             │

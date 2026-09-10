@@ -473,7 +473,9 @@ So the SuperSpeed path is the one that has ever worked, and **BOT over xHCI at
 High Speed is an untested path in this driver, not a broken one**. The fix for
 "the disk does not mount" is to plug it into a blue socket.
 
-**Confirmed the same day.** Moved to a USB 3.0 socket (Linux then shows it on
+**Necessary, and NOT sufficient — read § "It stalls again under use" below
+before acting on this.** The socket change is real and it fixes the *boot*;
+it does not fix the device. Moved to a USB 3.0 socket (Linux then shows it on
 bus 003, the xHCI SuperSpeed root hub, at `5000M`; it had been on `ehci-pci`
 bus 002 at `480M`), and the metal came up:
 
@@ -569,3 +571,69 @@ shows both xHCI root hubs empty. The machine has three USB controllers (xHCI
 socket, **Akuma is the only thing on this box that drives it over xHCI**, and
 that path has no Linux cross-check here. In a USB 3.0 socket both stacks use
 xHCI and the path is the one that works.
+
+### It stalls again under use — the socket fixes the boot, not the device
+
+Within minutes of that clean boot, with the root mounted and a handful of
+successful reads behind it (`df`, `ls /`, a write-and-read-back from ring 3),
+the framebuffer console showed:
+
+```
+[SSH Keys] WARNING: cannot read /etc/sshd/authorized_keys -- every publickey auth will be refused
+[SSH Auth] Publickey auth failed
+  [xhci] transfer timeout: CBW
+[BKL] stuck: owner=2 waiter=4 tag=511 (aff0+1)
+[BKL] stuck: owner=2 waiter=1 tag=511 (aff0+1)
+  [xhci] transfer timeout: CBW
+```
+
+and the box refused the key it had just accepted — this time not because
+`authorized_keys` was stale, but because **the read of it timed out**. So:
+
+| | High Speed (USB 2.0 socket) | SuperSpeed (USB 3.0 socket) |
+|---|---|---|
+| first 512-byte `READ(10)` | fails immediately | **succeeds** |
+| boot self-test's five disk checks | 3 FAIL | **all [OK]**, 641/0 |
+| mount `sda1` | no | **yes** |
+| sustained use | — | **stalls after a while, and never recovers** |
+
+**This is why the RAM image path exists.** It was adopted as a workaround for
+exactly this failure, not as a design choice — so "the disk stopped working" has
+a history longer than one session.
+
+### What the recurrence proves about the recovery gap
+
+The two missing recovery steps above stop being a tidy-up and become the
+defect. Once *any* bulk transfer stalls:
+
+- Reset Endpoint is issued and **Set TR Dequeue Pointer is not**, so the ring's
+  dequeue pointer stays parked on the stalled TRB;
+- the **BOT mass-storage reset** and `CLEAR_FEATURE(ENDPOINT_HALT)` are never
+  sent, so the *device* stays halted too;
+
+and every subsequent transfer therefore times out in its **first** phase —
+which is precisely the repeated `transfer timeout: CBW` on that screen. One
+transient stall wedges the root filesystem for the rest of the boot. A device
+that stalls occasionally is ordinary; a driver that cannot recover from one
+turns it into "the disk is dead".
+
+**Second-order, and worth its own look:** `Xhci::transfer`'s wait loop spins to
+`BUDGET` **while holding the BKL**, so every stalled transfer freezes the other
+cores for the whole timeout. That is the `[BKL] stuck: … tag=511` storm
+interleaved with the timeouts in the photo — a disk fault presenting as a
+scheduler fault.
+
+### The order to fix it in
+
+1. **Recovery first**, because it converts a fatal wedge into a retry and is
+   independently correct: Set TR Dequeue Pointer after Reset Endpoint, then the
+   BOT reset + `CLEAR_FEATURE(ENDPOINT_HALT)` pair, then re-issue the CBW.
+   Until this exists, every experiment about *why* it stalls gets one sample per
+   boot.
+2. **Then the diagnostic**: `Xhci::transfer` silently discards any event that
+   does not match `(slot, dci, trb_pointer)`, so "no event arrived" and "an
+   event arrived and we threw it away" are indistinguishable. Print the
+   unmatched ones, bounded.
+3. **Then the stall itself**, with retries making each boot worth many samples
+   instead of one.
+4. Separately: get the BKL out of the timeout path, or shorten it.

@@ -151,6 +151,14 @@ caller reading only stdout sees an empty success.
   socket looks the same as the wrong socket. Cost of learning this the hard
   way: an evening, and every physical explanation ruled out one at a time
   (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-10).
+
+  **The socket fixes the boot, not the device.** On SuperSpeed the root mounts
+  and the suite goes green, and then a bulk transfer stalls somewhere later and
+  the driver cannot recover from it — `[xhci] transfer timeout: CBW` forever
+  after, every read off the root failing, `sshd` unable to read
+  `authorized_keys`. **This is why the RAM image path exists**, and it is the
+  reason to expect a persistent root to be usable for a session rather than
+  indefinitely, until the recovery gap is closed.
 - **A persistent root that locks you out means the mount worked.** With
   `root=/dev/sda1` really mounted, `sshd` reads
   `etc/sshd/authorized_keys` **from the partition**, not from the RAM image. A
