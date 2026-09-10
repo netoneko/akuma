@@ -438,7 +438,11 @@ pub(crate) fn build_exec_runtime(
         // Nothing to bind: on this kernel a child thread is described entirely
         // by its `Process` and the shared thread table. amd64 binds a `CR3`
         // root and a `SPAWN` row here. See the field's doc.
-        bind_child_task: |_tid, _child| Ok(()),
+        bind_child_task: |_tid, _child, _kind| Ok(()),
+        // The single aligned EL1 `str`, not the byte-by-byte user-copy loop —
+        // see the field's doc for the spurious `EFAULT` that distinction
+        // encodes, and for why x86_64 must do the opposite.
+        write_user_tid: |va, tid| akuma_exec::mmu::write_current_user_val(va, &tid),
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,

@@ -78,13 +78,17 @@ struct Thread {
     /// The process slot whose address space this thread runs in — shared with
     /// its process, which is what makes fd 0/1/2 route the same way.
     proc_slot: usize,
-    /// Linux tid. Drawn from the same counter as pids, as on Linux, so a tid
-    /// and a pid can never name two different things.
+    /// Linux tid — **the kernel thread slot**, which is also what `clone(2)`
+    /// returns and what every per-thread array in the tree is indexed by.
+    ///
+    /// It was `usermode::alloc_pid()`, the shared pid/tid counter, on the
+    /// argument that a tid and a pid must never name two different things.
+    /// True, and outranked: musl caches `clone`'s return value in
+    /// `pthread_self()->tid` and `tkill`s it, so the tid `gettid` reports has
+    /// to be the number the kernel indexes by, or a thread signals a stranger.
+    /// The shared `clone_thread` returns the slot and says so at length; this
+    /// stores the same value rather than a second one.
     tid: u32,
-    /// Where ring 3 resumes: the parent's post-`clone` instruction, on the
-    /// stack the caller supplied.
-    rip: u64,
-    rsp: u64,
     /// `CLONE_CHILD_CLEARTID`'s address, or 0. On exit the kernel zeroes this
     /// word and wakes one futex waiter on it — which is precisely how
     /// `pthread_join` learns the thread is gone, and the reason a `join` that
@@ -179,7 +183,7 @@ pub fn should_leave_now() -> bool {
     group_exiting(crate::usermode::current_proc_slot())
 }
 
-fn current_thread_slot() -> usize {
+pub fn current_thread_slot() -> usize {
     // SAFETY: under the BKL; the per-CPU `UserCtx` is the running task's.
     unsafe {
         let uctx = crate::smp::current_uctx();
@@ -188,14 +192,37 @@ fn current_thread_slot() -> usize {
 }
 
 /// `clone(flags, child_stack, parent_tid, child_tid, tls)` — x86_64 56, the
-/// `CLONE_VM` half. Without `CLONE_VM` the caller wants a `fork` and
-/// `syscall_dispatch` routes there instead.
+/// `CLONE_VM` arm. **Served by `akuma_exec::process::clone_thread` since the
+/// ring-3 seam's `clone` fold**; what is left here is this target's argument
+/// checks and its errno vocabulary.
 ///
-/// Note the argument order: x86_64's `clone` puts `tls` **last**, after
-/// `child_tid` — the reverse of most other architectures. Getting that pair
-/// backwards produces a thread whose `%fs` points at the join word, which
-/// fails in a way that looks like memory corruption rather than like a
-/// wrong argument.
+/// x86_64's argument order is its own — `tls` **last**, after `child_tid`,
+/// where most architectures put it fourth — which is why the forward reorders
+/// rather than passing straight through.
+///
+/// # The three refusals, kept
+///
+/// All three predate the fold and none is expressible in the shared path,
+/// which takes flags it has already been told are a thread clone:
+///
+/// * **`CLONE_THREAD` is required.** `CLONE_VM` without it is a distinct
+///   thing — a process that shares memory, which some sandboxes ask for — and
+///   it needs its own `wait4` semantics. Refuse rather than approximate: a
+///   "thread" a parent's `wait4` never reaps hangs the parent, which is much
+///   harder to read than an `ENOSYS` at the call.
+/// * **`CLONE_SETTLS` is required.** Without it a musl thread runs on the
+///   *parent's* `%fs`, so both write one `struct pthread` and the first thing
+///   to break is `errno`. There is no sane base to invent.
+/// * **a stack is required.** The shared path checks this too (and says so);
+///   checked here as well so the errno is `EINVAL` rather than a generic
+///   failure string turned into `EAGAIN`.
+///
+/// # Errno mapping
+///
+/// `clone_thread` returns `&'static str`, and the two failures a caller must
+/// tell apart are the resource limits: `EAGAIN` is what `pthread_create`
+/// already knows how to report and what Linux returns at the thread or task
+/// ceiling. Everything else is `ENOMEM`.
 pub fn sys_clone_thread(
     flags: u64,
     child_stack: u64,
@@ -205,139 +232,136 @@ pub fn sys_clone_thread(
 ) -> u64 {
     use crate::usermode::clone_flags::*;
 
-    // `CLONE_VM` without `CLONE_THREAD` is a distinct thing — a process that
-    // shares memory, which `vfork` and some sandboxes ask for. It needs its own
-    // `Spawn` record and its own `waitpid` semantics, and nothing on this target
-    // asks for it. Refuse rather than approximate: a "thread" that a parent's
-    // `wait4` never reaps hangs the parent, which is much harder to read than
-    // an `ENOSYS` at the call.
     if flags & CLONE_THREAD == 0 {
         return errno::ENOSYS;
     }
-    // A thread with no stack of its own would run on the parent's. musl always
-    // supplies one; refusing is cheaper than discovering the overlap later.
     if child_stack == 0 {
         return errno::EINVAL;
     }
-
-    let proc_slot = crate::usermode::current_proc_slot();
-    if proc_slot == usize::MAX {
-        return errno::ENOSYS;
-    }
-
-    // The point the child resumes from, and the register set it resumes with:
-    // the parent's own, captured by `syscall_entry` on the way in. Identical to
-    // `sys_fork`'s snapshot, and for the identical reason — a C compiler
-    // assumes r12-r15/rbx survive a `syscall`.
-    // SAFETY: raw-pointer read under the BKL; the per-CPU `UserCtx` is this task's.
-    let (rip, gs_base, saved_regs) = unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() {
-            return errno::ENOSYS;
-        }
-        ((*uctx).user_rip, (*uctx).gs_base, (*uctx).saved_regs)
-    };
-    if rip == 0 {
-        return errno::ENOSYS;
-    }
-
-    // SAFETY: raw-pointer read under the BKL.
-    let Some(slot) = (unsafe { (*threads()).iter().position(Option::is_none) }) else {
-        // `EAGAIN`, which is what Linux returns when the thread limit is hit
-        // and what `pthread_create` already knows how to report.
-        serial::puts("  [clone] thread table full\n");
-        return errno::EAGAIN;
-    };
-
-    let tid = crate::usermode::alloc_pid();
-
-    // `CLONE_SETTLS` is not optional for a musl thread: without it the child
-    // runs on the *parent's* `%fs`, so both write one `struct pthread` and the
-    // first thing to break is `errno`. Absent the flag there is no sane base to
-    // invent, so refuse.
     if flags & CLONE_SETTLS == 0 {
         return errno::EINVAL;
     }
+    // A task that is not running a registered process has no thread group to
+    // join. `current_proc_slot` answering `usize::MAX` is how that shows up,
+    // and `bind_clone_child` would have nothing to key its row on.
+    if crate::usermode::current_proc_slot() >= crate::usermode::PROC_SLOTS {
+        return errno::ENOSYS;
+    }
 
-    let space_root = crate::sched::current_space_root();
-    let Some(task) = crate::sched::spawn_in_space_unpublished(thread_entry, space_root) else {
-        return errno::EAGAIN;
+    // **The argument order is `(stack, tls, parent_tid, child_tid, flags)`** —
+    // `clone_thread`'s own, which is neither x86_64's syscall order (`flags`
+    // first, `tls` **last**) nor asm-generic's. Getting it wrong here does not
+    // fail: it hands `flags` to `stack`, and the child enters ring 3 on a
+    // plausible-looking address that is the parent's. The first `clone` after
+    // the fold did exactly that and faulted on its first `popq` with
+    // `cr2 == rsp` — the probe pushes the child's entry point onto the child
+    // stack before the `syscall` and the child pops it back off, so a wrong
+    // `sp` is a fault on the very first instruction. Spelled out per-argument
+    // rather than positionally, so a future reader is not asked to trust the
+    // order.
+    match akuma_exec::process::clone_thread(
+        /* stack */ child_stack,
+        /* tls */ tls,
+        /* parent_tid_ptr */ parent_tid,
+        /* child_tid_ptr */ child_tid,
+        /* flags */ flags,
+    ) {
+        Ok(tid) => u64::from(tid),
+        Err(e) => {
+            serial::puts("  [clone] ");
+            serial::puts(e);
+            serial::puts("\n");
+            if e.contains("table full") || e.contains("thread slot") {
+                errno::EAGAIN
+            } else {
+                errno::ENOMEM
+            }
+        }
+    }
+}
+
+/// **The `ChildKind::Thread` half of `ExecRuntime::bind_child_task`** — give a
+/// child the shared `clone_thread` just spawned its `THREADS` row and its
+/// `UserCtx::thread_slot`, so this file's four thread questions can be asked of
+/// it.
+///
+/// Those four are the whole reason the row exists, and each is silent if the
+/// row is missing:
+///
+/// * [`current_tid`] — `gettid`, which musl caches in `pthread_self()->tid` and
+///   `tkill`s. Without a row a thread answers its *process's* pid, so a
+///   `tkill(self->tid, …)` addresses the main thread.
+/// * [`current_is_main`] — the one question `exit` answers differently from
+///   `exit_group`. Without a row every thread claims to be the main one and its
+///   `exit()` tears the whole process down.
+/// * [`live_count`] / [`drain`] — a process's exit waits for its threads. A
+///   thread with no row is invisible to that wait, and the reaper frees an
+///   address space a live thread is standing in.
+/// * [`teardown`] — `clear_child_tid` and its futex wake, i.e. `pthread_join`.
+///
+/// # `tid` is the kernel thread slot, which is a change on this target
+///
+/// See [`Thread::tid`]'s own note. Storing anything else here would make
+/// `gettid` disagree with what `clone` returned.
+///
+/// # `clear_child_tid` comes off the `Process`, not off the flags
+///
+/// `clone_thread` has already applied the `CLONE_CHILD_CLEARTID` rule —
+/// `InheritOverrides::clear_child_tid` is `child_tid_ptr` only when the flag is
+/// set, and 0 otherwise — so reading the field is reading that decision rather
+/// than making it a second time. The two used to be made independently, in two
+/// files, from the same flag word.
+pub fn bind_clone_child(
+    task: usize,
+    proc_slot: usize,
+    clear_child_tid: u64,
+) -> Result<(), &'static str> {
+    // SAFETY: raw-pointer read under the BKL.
+    let Some(slot) = (unsafe { (*threads()).iter().position(Option::is_none) }) else {
+        // The caller turns this string into `EAGAIN`, which is what Linux
+        // returns at the thread limit and what `pthread_create` reports.
+        serial::puts("  [clone] thread table full\n");
+        return Err("clone: thread table full");
     };
-
     // SAFETY: raw-pointer write under the BKL; `slot` was just found free.
     unsafe {
         (*threads())[slot] = Some(Thread {
             task,
             proc_slot,
-            tid,
-            rip,
-            rsp: child_stack,
-            clear_child_tid: if flags & CLONE_CHILD_CLEARTID == 0 { 0 } else { child_tid },
+            tid: task as u32,
+            clear_child_tid,
         });
     }
-
-    // Everything the child reads must be in place before it can be scheduled —
-    // the same ordering rule `sys_fork` states, and the reason
-    // `spawn_in_space_unpublished` exists.
-    crate::sched::seed_thread_task(task, tls, gs_base, &saved_regs, proc_slot, slot);
-
-    // The tid, into the parent's and/or the child's memory. Both write into the
-    // shared address space, which is live right now, so no `CR3` gymnastics.
-    if flags & CLONE_PARENT_SETTID != 0 && !crate::uaccess::write_val::<u32>(parent_tid, tid) {
-        cancel(slot, task);
-        return errno::EFAULT;
-    }
-    if flags & CLONE_CHILD_SETTID != 0 && !crate::uaccess::write_val::<u32>(child_tid, tid) {
-        cancel(slot, task);
-        return errno::EFAULT;
-    }
-
-    // 5b slice 2: a thread resolves to its process's pid, so every
-    // `akuma-exec` identity lookup works from a thread too.
-    //
-    // Slice 1 registered only fork/spawn/execve/run_init, which was enough for
-    // `current_process_shared()` but leaves a `CLONE_VM` thread unmapped — and
-    // `current_pid()` cannot move onto `THREAD_PID_MAP` until it is mapped,
-    // because an unmapped tid answers "init" rather than "my process". Threads
-    // share the process, so the value is the *parent's* pid, not a new one:
-    // this is `tid -> tgid pid`, the same relation AArch64 publishes.
-    //
-    // Published after `publish_task` for the same reason the task's registers
-    // are: nothing may observe the thread before its identity is in place, and
-    // `publish_task` is the point at which something can.
-    crate::sched::publish_task(task);
-    akuma_exec::process::thread_pid_map_insert(task, crate::usermode::current_pid());
-    u64::from(tid)
+    crate::sched::seed_thread_slots(task, proc_slot, slot);
+    Ok(())
 }
 
-/// Undo a half-built thread. The task was never published, so nothing else can
-/// have seen either half.
-fn cancel(slot: usize, task: usize) {
-    // SAFETY: raw-pointer write under the BKL; the task is `Reserved`.
-    unsafe { (*threads())[slot] = None };
-    crate::sched::abandon_unpublished(task);
-}
-
-/// Every thread task starts here.
+/// **A `clone` child's ring-3 lifetime**, from `Process::run`'s
+/// `ExecRuntime::enter_user` hook down to `sched::finish`.
 ///
-/// One entry function for all of them, unlike `usermode::proc_entry_for`'s
-/// sixteen hand-written trampolines: those bake a process index into a `fn`
-/// pointer because there was nowhere else to put it, and by the time a thread
-/// runs there *is* somewhere — `UserCtx::thread_slot`, seeded before
-/// publication.
-extern "C" fn thread_entry() -> ! {
-    let slot = current_thread_slot();
-    // SAFETY: raw-pointer read under the BKL.
-    let Some(t) = (unsafe { (*threads()).get(slot).copied().flatten() }) else {
-        serial::puts("  [thread] entry with no record\n");
-        crate::sched::finish();
-    };
-
+/// This is the thread half of `usermode::enter_ring3`'s two-way split, and the
+/// reason that split exists: the process half (`run_process`) ends by closing
+/// the fd table, draining the thread group, publishing an exit status and
+/// retiring the process, all of which are wrong for one thread of several.
+///
+/// It was `thread_entry`, an `extern "C" fn() -> !` that `sched` spawned
+/// directly and that read its own `rip`/`rsp` out of the `THREADS` row. Since
+/// the `clone` fold the child is spawned by `spawn_child_thread_and_publish`
+/// like every other child, enters at the shared `entry_point_trampoline`, and
+/// is handed its first context — so `first` replaces the row's two fields and
+/// the row no longer carries them. One authority for where a task enters ring
+/// 3, which is `ProcessImage::context`.
+///
+/// **There is no `execve` loop here** and that is not an omission: `execve`
+/// from a non-main thread replaces the whole process image, which on Linux
+/// kills every sibling first. This target refuses it (`sys_execve` is reached
+/// only by a main thread), so a thread enters ring 3 exactly once.
+pub fn run_thread(slot: usize, first: &akuma_exec::process::UserContext) -> ! {
     // `forked = true`: enter ring 3 through `enter_user_mode_forked`, which
     // restores the parent's register set from this task's own `saved_regs` and
     // sets `rax = 0`. A `clone` child sees 0 for exactly the reason a `vfork`
     // child does, so the path is the same one.
-    let _status = crate::usermode::enter_user_from_thread(t.rip, t.rsp);
+    let _status = crate::usermode::enter_user_from_thread(first.pc, first.sp);
 
     teardown(slot);
     crate::sched::finish();

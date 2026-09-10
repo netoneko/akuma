@@ -942,42 +942,24 @@ pub fn set_task_space_root(task_slot: usize, root: u64) {
     }
 }
 
-/// The page-table root the **running** thread uses. `0` for a kernel thread.
+/// Seed a not-yet-running **clone child** with the two identities its entry
+/// path reads out of its own `UserCtx`: which process it belongs to, and which
+/// `thread::THREADS` row is its.
 ///
-/// `clone(CLONE_VM)`'s whole memory story: the child gets this number, verbatim,
-/// and therefore the parent's page tables — no copy, no CoW share pass, no
-/// demotion of the parent's PTEs. See `crate::thread`.
-#[must_use]
-pub fn current_space_root() -> u64 {
-    // SAFETY: raw-pointer read under the BKL.
-    unsafe { (*machines())[current()].space_root }
-}
-
-/// Seed a not-yet-running **thread**: the `CLONE_SETTLS` base, the parent's
-/// register snapshot and `%gs`, and the two identities the single `thread_entry`
-/// reads back out of its own `UserCtx`.
-///
-/// Deliberately separate from [`write_user_context`] rather than a wider version
-/// of it. A `fork` child inherits the parent's `%fs` because musl's post-fork
-/// fixups are `%fs`-relative; a thread must **not** — it gets a base of its own
-/// from `CLONE_SETTLS`, and inheriting the parent's would put two threads on one
-/// `struct pthread`. One function taking an `fs_base` argument would make those
-/// two opposite requirements look like one parameter.
-pub fn seed_thread_task(
-    task_slot: usize,
-    tls_base: u64,
-    gs_base: u64,
-    saved_regs: &[u64; 12],
-    proc_slot: usize,
-    thread_slot: usize,
-) {
+/// The `seed_thread_task` half that this is *not*: no `fs_base`, no `gs_base`,
+/// no register snapshot. The shared child-spawn path already wrote all three
+/// through `akuma_threading::update_thread_context`
+/// ([`write_user_context`]) — including the `CLONE_SETTLS` base, which reaches
+/// it as `UserContext::set_tls_base` -> `fs_base`. Writing them again here
+/// would be a second authority for the same fields, and the `fs_base` one is
+/// the field where the two primitives genuinely disagree (a `fork` child
+/// inherits the parent's; a thread must not), so it belongs with the context
+/// that states which primitive it is.
+pub fn seed_thread_slots(task_slot: usize, proc_slot: usize, thread_slot: usize) {
     // SAFETY: raw-pointer access under the BKL; the slot is unpublished, so no
     // core can be running it.
     unsafe {
         if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.uctx.fs_base = tls_base;
-            m.uctx.gs_base = gs_base;
-            m.uctx.saved_regs = *saved_regs;
             m.uctx.proc_slot = proc_slot;
             m.uctx.thread_slot = thread_slot;
         }

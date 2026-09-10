@@ -2460,9 +2460,47 @@ pub fn current_process() -> Option<&'static akuma_exec::process::Process> {
 /// concurrent `mmap` on another core impossible to collide with while keeping
 /// the allocator out of the hold.
 pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Option<R> {
-    let p = current_process()?;
+    let p = current_mm_process()?;
     let _irq = akuma_primitives::irq::IrqGuard::new();
     Some(f(&mut p.mmap_regions.lock()))
+}
+
+/// The process whose **memory** the running task uses: itself, or its
+/// thread-group leader if it is a `CLONE_THREAD` child.
+///
+/// One address space per thread group is what `CLONE_VM` means, and on this
+/// target the demand-paging state that describes that address space is the
+/// `Process`'s own `mmap_regions` — so a thread asking "is this VA mine?"
+/// through its *own* `Process` asks a list that is empty by construction
+/// (`Process::inherit_from` gives every child a fresh one).
+///
+/// **This is not a tidy-up; it is the bug the `clone` fold found.** Before the
+/// fold a thread had no `Process` at all and `THREAD_PID_MAP` published it
+/// under its *leader's* pid, so `current_process()` already answered with the
+/// leader — [`current_process`]'s own doc said so ("`own`, not `tgid`"). The
+/// shared `spawn_child_thread_and_publish` publishes a thread under its own
+/// pid, which is right for identity (`gettid`, signals, the exit channel) and
+/// wrong for memory. The first `clone` child after the fold faulted on the
+/// **first push to its own stack**: `.bss` is demand-paged here, the fault
+/// handler asked this thread's empty region list whether `cr2` was mapped, got
+/// "no", and killed the process. `#PF ... rip=0x400023 cr2=rsp` — the child's
+/// very first instruction after the `clone` returned.
+///
+/// Splitting the question in two is what Linux does: identity is per-thread,
+/// the `mm` is per-thread-group. `Process::tgid` is the leader's pid on both
+/// kernels (`inherit_from` copies the parent's for a `CLONE_THREAD` child), so
+/// the leader is one lookup away.
+///
+/// Falls back to the task's own `Process` when the leader is not in the table —
+/// a leader that has exited while a thread runs on. That is the pre-fold answer
+/// and no worse than it; a thread outliving its leader is what
+/// `thread::drain` exists to prevent.
+fn current_mm_process() -> Option<&'static akuma_exec::process::Process> {
+    let p = current_process()?;
+    if p.tgid == p.pid {
+        return Some(p);
+    }
+    akuma_exec::process::active_process_ref(p.tgid).or(Some(p))
 }
 
 /// Run `f` with the running process's user address space, under its lock.
@@ -2491,7 +2529,13 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
 /// take the region list first and reach the tables inside it. Nothing takes them
 /// the other way round, and nothing may start.
 pub fn with_current_address_space<R>(f: impl FnOnce(&mut akuma_mmu::UserAddressSpace) -> R) -> Option<R> {
-    let p = current_process()?;
+    // The **leader's**, for the reason `current_mm_process` gives: one address
+    // space per thread group. A `CLONE_THREAD` child's own `address_space` is a
+    // `new_shared` *view* of the same page tables — the walk would work — but
+    // its frame ledger is separate, so a page mapped through the view is
+    // charged to a `Process` that will be reaped before the leader is, and
+    // freed out from under it. Ask the owner.
+    let p = current_mm_process()?;
     Some(f(&mut p.address_space.lock()))
 }
 
@@ -2597,6 +2641,26 @@ pub fn enter_ring3(first: &UserContext) -> ! {
         // shared `entry_point_trampoline`) does not go through `proc_entry`.
         serial::puts("  [proc] ring-3 entry with no slot\n");
         crate::sched::finish();
+    }
+    // **A thread is not a process, and its exit is not a process's exit.**
+    //
+    // Both arrive here since the `clone` fold: `entry_point_trampoline` ends in
+    // `Process::run` for every child the shared spawn path builds, and a
+    // `CLONE_THREAD` child is one of those. What differs is entirely below the
+    // ring-3 entry — `run_process`'s teardown closes the fd table, drains the
+    // thread group, publishes an exit status a parent's `wait4` will believe
+    // and retires the process. Running that when *one thread* returns would
+    // report the whole process dead while its siblings are still executing.
+    //
+    // `crate::thread::run_thread` is the other teardown: zero
+    // `clear_child_tid` and wake one futex waiter on it (which is
+    // `pthread_join`), purge the futex table of this task, drop its identity
+    // row. The distinction is `UserCtx::thread_slot`, seeded by
+    // `thread::bind_clone_child` before the task was published — the same field
+    // `thread_entry` has always read, reached one function earlier.
+    let tslot = crate::thread::current_thread_slot();
+    if tslot != crate::thread::NO_THREAD {
+        crate::thread::run_thread(tslot, first)
     }
     run_process(idx, first)
 }
@@ -2945,18 +3009,28 @@ const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
 /// on this target) and none of them yield while touching it.
 static mut SPAWN: [Option<Spawn>; SPAWN_SLOTS] = [const { None }; SPAWN_SLOTS];
 
-/// Next pid to hand out. `sshd` itself is pid 1 (`Getpid` returns 1), so
-/// children start at 2.
-static NEXT_PID: AtomicU64 = AtomicU64::new(2);
-
-/// The next pid **or tid**.
+/// The next pid.
 ///
-/// One counter for both, as on Linux: a thread's tid and a process's pid live
-/// in one number space there, and `gettid` returning a value that collides with
-/// a live pid is the kind of thing that reads as a scheduler bug three layers
-/// later. `crate::thread` is the other caller.
+/// **One counter, and it is `akuma-exec`'s.** This was a `static NEXT_PID` of
+/// its own starting at 2 — which was safe only for as long as nothing on this
+/// target drew from the shared counter, and since 5b both kernels register into
+/// one process table. The first shared call that did draw from it
+/// (`clone_thread`'s internal `allocate_pid`) returned **1**, init's pid, and
+/// the new thread resolved through `THREAD_PID_MAP` to init's `Process` — so it
+/// entered ring 3 at init's `context.pc`, which is 0. Two counters minting into
+/// one table is the defect; this removes it rather than teaching the second
+/// counter to dodge the first.
+///
+/// The "children start at 2" reservation survives as
+/// `akuma_exec::process::reserve_pid_floor(2)`, called once at init — see that
+/// function for why this target needs it and AArch64 does not.
+///
+/// It used to hand out **tids** as well ("one number space, as on Linux"). It
+/// no longer does: a `clone` child's tid is its kernel thread slot, which is
+/// what `clone(2)` returns and what every per-thread array is indexed by. See
+/// `crate::thread::Thread::tid`.
 pub fn alloc_pid() -> u32 {
-    NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32
+    akuma_exec::process::allocate_pid()
 }
 
 /// The `clone(2)` flag bits this kernel names.
@@ -2969,9 +3043,14 @@ pub mod clone_flags {
     pub const CLONE_VM: u64 = 0x0000_0100;
     pub const CLONE_THREAD: u64 = 0x0001_0000;
     pub const CLONE_SETTLS: u64 = 0x0008_0000;
-    pub const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
-    pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-    pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    // `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
+    // are **not** here since the `clone` fold: the shared
+    // `akuma_exec::process::clone_thread` is the only reader of those three
+    // now — it decides which pointer gets the tid and which gets the zero-and-
+    // wake at exit — and a second copy of the bits beside a path that no longer
+    // consults them is how the two drift. `trace_clone_flags` still names them,
+    // from its own literal table, because a trace line has to name a bit
+    // whether or not this file acts on it.
 }
 
 /// Bytes of argv kept per process for `/proc/<pid>/cmdline`.
@@ -3753,7 +3832,28 @@ fn sys_fork() -> u64 {
 pub fn bind_child_task(
     task_slot: usize,
     child: &akuma_exec::process::Process,
+    kind: akuma_exec::process::ChildKind,
 ) -> Result<(), &'static str> {
+    // The root first: **both** kinds need it, and a thread's is the parent's
+    // own — `clone_thread` builds the child a `new_shared` view of the same
+    // PML4, so `ttbr0()` answers the parent's root and the scheduler installs
+    // exactly the address space the thread is meant to share.
+    crate::sched::set_task_space_root(task_slot, child.address_space.ttbr0());
+
+    // A `clone` child is not a process and must not get a `SPAWN` row: that row
+    // is the target's per-*process* exit record, and one written for a thread
+    // would make `spawn_record_exit` publish an exit status — a `wait4` in the
+    // parent would reap a process that is still running. What a thread needs
+    // instead is a `THREADS` row and a `UserCtx::thread_slot`; see
+    // `crate::thread::bind_clone_child` for the four questions that answers.
+    if kind == akuma_exec::process::ChildKind::Thread {
+        return crate::thread::bind_clone_child(
+            task_slot,
+            current_proc_slot(),
+            child.clear_child_tid.load(Ordering::Relaxed),
+        );
+    }
+
     // Collect any row the reaper left behind before looking for a free one.
     sweep_reaped_spawn_rows();
 
@@ -3791,7 +3891,6 @@ pub fn bind_child_task(
         });
     }
     crate::sched::seed_proc_slot(task_slot, slot);
-    crate::sched::set_task_space_root(task_slot, child.address_space.ttbr0());
     Ok(())
 }
 
@@ -3914,7 +4013,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
         return errno::ENOMEM;
     };
 
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
+    let pid = alloc_pid();
     // 5b slice 1: register the child with `akuma-exec`'s process table and
     // publish `task_slot → pid`, so `current_process_shared()` resolves for
     // this child from its first syscall. The heap starts where the loaded image

@@ -156,6 +156,11 @@ fn runtime() -> ExecRuntime {
         // naming that row — the three things `akuma-exec` has no concept of.
         // See the function.
         bind_child_task: crate::usermode::bind_child_task,
+        // **`stac`/`clac`, not a bare store.** SMAP is on here, so the shared
+        // `mmu::write_current_user_val` the other kernel registers would fault
+        // on every `pthread_create` that asks for a tid. `uaccess::write_val`
+        // is this target's user-copy path and has a `#PF` fixup in the IDT.
+        write_user_tid: |va, tid| crate::uaccess::write_val::<u32>(va as u64, tid),
         // The same clock `threading::ThreadRuntime` was already given, so the
         // scheduler and `akuma-exec` cannot disagree about what time it is.
         uptime_us: crate::net::uptime_us,
@@ -409,6 +414,14 @@ fn config() -> ExecConfig {
 pub fn init() {
     let rt = runtime();
     akuma_exec::runtime::register(rt, config());
+    // **Pid 1 is init's on this target and is not drawn from the counter.**
+    // `usermode::current_pid` answers 1 for the boot task, and `run_init`
+    // registers under it, so the first allocation must be 2 or the first real
+    // process is handed init's own pid — which resolves through
+    // `THREAD_PID_MAP` to init's `Process` and runs init's image. AArch64 does
+    // not call this: its init *is* the first allocation. See
+    // `reserve_pid_floor`.
+    akuma_exec::process::reserve_pid_floor(2);
     akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
         read_file: rt.read_file,
         read_at: rt.read_at,

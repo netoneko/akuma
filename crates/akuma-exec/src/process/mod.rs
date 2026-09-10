@@ -2289,6 +2289,38 @@ pub enum ChildReaping {
     ThreadGroupMember,
 }
 
+/// Which *kind* of child a clone-family call is building, for the one hook that
+/// has to build a different thing for each.
+///
+/// Derived from [`ChildReaping`] rather than passed alongside it
+/// ([`ChildReaping::child_kind`]), so a caller cannot say "reapable process"
+/// to one and "thread-group member" to the other. It exists as its own type
+/// because a target reading it is answering a different question — *what do I
+/// allocate for this child* — from the one `ChildReaping` answers, and a hook
+/// signature naming `ChildReaping` would read as if it could change the
+/// reaping.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChildKind {
+    /// `fork`/`vfork`: a new process, in a thread group of its own.
+    Process,
+    /// `clone_thread`: another thread of the caller's thread group, sharing its
+    /// address space and its file descriptors.
+    Thread,
+}
+
+impl ChildReaping {
+    /// The kind of child this reaping mode describes. One-to-one by
+    /// construction: the reason `CHILD_CHANNELS` skips a `CLONE_THREAD` child
+    /// is exactly that it is not a process.
+    #[must_use]
+    pub fn child_kind(&self) -> ChildKind {
+        match self {
+            ChildReaping::Reapable => ChildKind::Process,
+            ChildReaping::ThreadGroupMember => ChildKind::Thread,
+        }
+    }
+}
+
 /// Give a freshly built child `Process` a thread, wire up its identity and
 /// channels, publish it, and make it runnable — the ~40-line tail
 /// [`fork_process`], [`vfork_process`] and [`clone_thread`] each carried a
@@ -2359,7 +2391,7 @@ fn spawn_child_thread_and_publish(
     // AArch64 nothing. Fallible (a full row table must reach the user as an
     // error, not as a child with no exit path), and placed before
     // `thread_pid_map_insert` so a failure has nothing to undo but the slot.
-    if let Err(e) = (runtime().bind_child_task)(tid, &new_proc) {
+    if let Err(e) = (runtime().bind_child_task)(tid, &new_proc, reaping.child_kind()) {
         crate::threading::release_initializing_thread(tid);
         return Err(e);
     }
@@ -3476,7 +3508,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
             // EL1 fault to a skipped write.
             let child_tid = tid as u32;
             let mut set_tid = |ptr: u64, which: &str| {
-                if ptr != 0 && !crate::mmu::write_current_user_val(ptr as usize, &child_tid) {
+                if ptr != 0 && !(runtime().write_user_tid)(ptr as usize, child_tid) {
                     crate::safe_print!(128,
                         "[clone_thread] {} set_tid write to {:#x} skipped — page not writable\n",
                         which, ptr);
@@ -3503,6 +3535,34 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
 /// Allocate a new unique PID (uses the same global counter as Process::from_elf)
 pub fn allocate_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Raise the pid counter so the next [`allocate_pid`] is at least `floor` —
+/// for a kernel whose init process does **not** get its pid from this counter.
+///
+/// AArch64 does not call this: its init is allocated here like everything else,
+/// so pid 1 is init's because it was the first allocation. amd64's init is pid
+/// 1 by *convention* (`usermode::current_pid` answers 1 for the boot task,
+/// which is registered without drawing from a counter), so an unreserved
+/// counter starting at 1 hands the first real process init's own pid.
+///
+/// **That is not hypothetical and it is not a small bug.** Since 5b both
+/// kernels register into one process table, and until 2026-09-11 amd64 minted
+/// pids from a *second* counter of its own starting at 2 — so nothing collided
+/// only because the shared counter was never used on that target. The first
+/// call that used it (`clone_thread`'s internal `allocate_pid`) drew **1**,
+/// `thread_pid_map_insert` pointed the new thread at init, and
+/// `entry_point_trampoline` ran init's `Process`: the thread entered ring 3 at
+/// init's `context.pc`, which is `0`. Loud, but only because `pc = 0` faults —
+/// a collision with any *other* live pid would have run the wrong program
+/// silently.
+///
+/// Idempotent and monotonic: it never lowers the counter, so calling it after
+/// pids have been handed out cannot re-issue one.
+pub fn reserve_pid_floor(floor: Pid) {
+    let _ = NEXT_PID.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        (cur < floor).then_some(floor)
+    });
 }
 
 /// Trampoline for new process threads

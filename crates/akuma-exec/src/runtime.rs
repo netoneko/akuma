@@ -282,8 +282,47 @@ pub struct ExecRuntime {
     ///
     /// Runs **before** `THREAD_PID_MAP` is written, so a failure has nothing to
     /// undo but the slot itself.
-    pub bind_child_task:
-        fn(tid: usize, child: &crate::process::Process) -> Result<(), &'static str>,
+    ///
+    /// `kind` says which primitive is being served, because on amd64 the answer
+    /// is a *different table*: a `fork`/`vfork` child gets a `SPAWN` row, a
+    /// `clone` child gets a `THREADS` row and a `UserCtx::thread_slot`. Giving
+    /// a thread a `SPAWN` row would make its exit look like its whole process
+    /// exiting; giving a process no `THREADS` row is correct, and is what
+    /// `NO_THREAD` means. It is the same distinction
+    /// [`crate::process::ChildReaping`] already draws for `CHILD_CHANNELS`,
+    /// derived from it rather than passed separately — a caller that disagreed
+    /// with the reaping mode about what it was building is a class of bug worth
+    /// not having.
+    pub bind_child_task: fn(
+        tid: usize,
+        child: &crate::process::Process,
+        kind: crate::process::ChildKind,
+    ) -> Result<(), &'static str>,
+
+    /// **Store a tid into the current address space's user memory** — the
+    /// `CLONE_PARENT_SETTID` / `CLONE_CHILD_SETTID` write, and nothing else.
+    /// `false` means the page was not writable and the store did not happen.
+    ///
+    /// A hook because the two kernels need *different* stores here and each
+    /// refuses the other's:
+    ///
+    /// * **AArch64** uses `mmu::write_current_user_val` — a single aligned EL1
+    ///   `str` behind an AP-writable check — and deliberately **not**
+    ///   `akuma_user_access::copy_to_user`, whose byte-by-byte `strb` loop
+    ///   returned a spurious `EFAULT` mid-page for exactly these musl/Go stores
+    ///   (see `clone_thread`'s comment, and `mmap`'s `mp.procid=0` crash).
+    /// * **x86_64 cannot use that at all.** It runs with **SMAP** enabled
+    ///   (`amd64::uaccess::init_smap`), so a ring-0 store to a user page
+    ///   without `stac` is a fault — `write_current_user_val`'s plain
+    ///   `write_unaligned` would take down the kernel on every
+    ///   `pthread_create` that asks for a tid. Its store goes through
+    ///   `amd64::uaccess::write_val`, which brackets the copy with
+    ///   `stac`/`clac` and has a `#PF` fixup registered in the IDT.
+    ///
+    /// So this is not a portability wrapper over one operation; it is two
+    /// operations that happen to have the same signature, and the reason each
+    /// exists is written above so neither is "simplified" into the other.
+    pub write_user_tid: fn(va: usize, tid: u32) -> bool,
 }
 
 /// Compile-time kernel configuration, passed once at init.

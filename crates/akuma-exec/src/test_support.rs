@@ -127,7 +127,10 @@ pub fn ensure_test_runtime() {
         // `Ok`, not an error: this is the only one of the three fork hooks a
         // host build can honestly answer, because on a host there is genuinely
         // nothing to bind — which is also the AArch64 kernel's answer.
-        bind_child_task: |_, _| Ok(()),
+        bind_child_task: |_, _, _| Ok(()),
+        // No user address space on a host; refusing is what every other
+        // memory-touching hook here does.
+        write_user_tid: |_, _| false,
     };
     let cfg = ExecConfig {
         max_threads: 64,
