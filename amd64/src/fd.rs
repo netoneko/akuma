@@ -551,18 +551,37 @@ pub fn socket_index(fd: u64) -> Option<usize> {
 /// writer end. Used by `sys_spawn` (the parent's stdout reader) and
 /// `sys_openat`'s `/proc/<pid>/fd/0` (the parent's stdin writer).
 ///
-/// **Both callers are always second names.** The pipe `alloc` started one
-/// reference per end, and the creating side's inserts consumed those (the
-/// child's stdio in [`bind_stdio`], or the `pipe(2)` pair itself) — so this
-/// descriptor's reference is a new one, bumped here and handed to `install`.
-/// On a failed install the bump is given straight back.
-pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
+/// `adopt_initial` decides *whose* end reference this descriptor holds, and the
+/// two callers differ:
+///
+/// - **`sys_openat`'s `/proc/<pid>/fd/0` (`false`)** is a genuine second name.
+///   [`bind_stdio`] gave the child's fd 0 the stdin pipe's initial *reader*;
+///   its initial *writer* is spoken for by the `waitpid` reap
+///   (`pipe::close_write` on `Spawn::stdin_pipe`), which is the one place that
+///   knows the child is gone. So `sshd`'s writer must be a fresh reference —
+///   `clone_ref` here, released by `sshd`'s own `close`.
+///
+/// - **`sys_spawn`'s parent stdout reader (`true`)** adopts. [`bind_stdio`]
+///   consumed the stdout pipe's initial *writer* (fd 1) and cloned it (fd 2),
+///   but left the initial *reader* untouched and unowned — nothing else ever
+///   names it. Cloning a second reader here would strand that one: the child's
+///   `close_all` takes the writers to 0, this descriptor's `close` takes the
+///   cloned reader to 0, and the orphan reader keeps the pipe alive forever —
+///   one leaked pipe per spawn against `MAX_PIPES`
+///   (`proposals/AMD64_SPAWN_PIPE_LEAK.md`). Adopting the initial reader
+///   instead means no extra reference and no teardown gap.
+///
+/// On a failed install the reference this descriptor would have held — the
+/// cloned one, or the adopted initial one — is released so nothing leaks.
+pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool, adopt_initial: bool) -> Option<u64> {
     let desc = if is_write {
         FileDescriptor::PipeWrite(pipe_id as u32)
     } else {
         FileDescriptor::PipeRead(pipe_id as u32)
     };
-    crate::pipe::clone_ref(pipe_id, is_write);
+    if !adopt_initial {
+        crate::pipe::clone_ref(pipe_id, is_write);
+    }
     let fd = install(desc);
     if errno::is_err(fd) {
         if is_write {
@@ -807,6 +826,14 @@ pub fn copy_out(ptr: u64, src: &[u8]) -> u64 {
 /// end with; the insert at 2 is a second name for the write end and bumps one
 /// more through [`clone_refs`]. Called before the child is published, so no
 /// lock ordering question exists.
+///
+/// **Each pipe keeps one initial reference this function does not touch**, and
+/// each has its own claimant: the stdin pipe's initial *writer* is released by
+/// the `waitpid` reap (`pipe::close_write` on `Spawn::stdin_pipe`), and the
+/// stdout pipe's initial *reader* is adopted by the parent's stdout descriptor
+/// in [`alloc_pipe_fd`] (`adopt_initial`). Neither is a leak; both are load
+/// bearing — see `proposals/AMD64_SPAWN_PIPE_LEAK.md` for what a stray
+/// `clone_ref` on the second one cost.
 pub fn bind_stdio(
     table: &akuma_exec::process::SharedFdTable,
     stdin_pipe: usize,
@@ -1019,7 +1046,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
         let Some(pipe_id) = crate::usermode::stdin_pipe_for_pid(pid) else {
             return errno::ENOENT;
         };
-        return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
+        return alloc_pipe_fd(pipe_id, true, false).unwrap_or(errno::EMFILE);
     }
 
     // Resolved with **glue's** ladder, not this module's, so the refusals below

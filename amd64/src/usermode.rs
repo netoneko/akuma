@@ -3854,7 +3854,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     // schedule the child.
     crate::sched::publish_task(task_slot);
 
-    let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false);
+    let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false, true);
     let Some(stdout_fd) = stdout_fd else {
         // The child is already running; it will just write into a pipe nobody
         // reads. Report the failure — `sshd` drops the session.
