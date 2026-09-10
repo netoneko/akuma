@@ -880,6 +880,44 @@ fn read_version_line(conn: &mut Connection) -> Result<Vec<u8>, ClientError> {
     }
 }
 
+/// Read a yes/no answer from stdin.
+///
+/// # `\r` is a line terminator here, and that is the whole of a real bug
+///
+/// This loop used to break **only** on `\n` and explicitly *discard* `\r`, and
+/// the effect was that the TOFU prompt hung forever for every interactive user
+/// — typing `yes` and pressing Enter did nothing at all, which reads as a dead
+/// terminal rather than as a prompt waiting for a terminator it will never get.
+///
+/// A terminal in **raw mode sends CR for Enter**, and nothing on the path from
+/// an ssh session to this process converts it:
+///
+/// - On the **serial console** stdin is a `FileDescriptor::Stdin` and the
+///   kernel's `read_console` runs the line discipline, whose `map_cr_to_nl`
+///   turns Enter into `\n`. So the console always worked, which is what made
+///   this look like it worked everywhere.
+/// - Over an **ssh session** stdin is a *pipe*. There is no line discipline on
+///   a pipe on either kernel, so the `\r` arrived as a `\r`, was thrown away
+///   by the old `!= b'\r'` guard, and the loop kept waiting for an `\n` that
+///   the terminal was never going to send.
+///
+/// It also explains why `vi` over the same session was fine while this was not:
+/// `vi` reads raw keys and interprets them itself; this wanted one specific
+/// byte.
+///
+/// A CRLF pair leaves its `\n` unread, which the shell then sees as an empty
+/// command line — one spurious prompt, and cheaper than a non-blocking peek to
+/// consume it.
+///
+/// # The echo is not decoration
+///
+/// Nothing else echoes here. Real `ssh` relies on the local tty having `ECHO`
+/// set, but an interactive session reaches this process as a raw pipe with the
+/// *user's own* terminal in raw mode, so without echoing here the operator
+/// types blind and cannot tell a working prompt from a wedged one — which is
+/// exactly how the bug above was reported. Backspace is deliberately not
+/// handled: the answers are three characters long and a wrong one is safe (it
+/// declines).
 fn prompt_yes_no(prompt: &str) -> bool {
     print(prompt);
     let mut line = Vec::new();
@@ -889,11 +927,16 @@ fn prompt_yes_no(prompt: &str) -> bool {
         if n <= 0 {
             return false; // EOF or error on the prompt: fail safe, don't trust the host
         }
-        if byte[0] == b'\n' {
+        // Either terminator ends the answer. See the header: raw-mode Enter is
+        // `\r`, cooked-mode Enter is `\n`, and this prompt is reached both ways.
+        if byte[0] == b'\n' || byte[0] == b'\r' {
+            print("\r\n");
             break;
         }
-        if byte[0] != b'\r' && line.len() < 16 {
+        if line.len() < 16 {
             line.push(byte[0]);
+            // Echo the character, so the operator can see what they typed.
+            print(core::str::from_utf8(&byte).unwrap_or(""));
         }
     }
     let answer = core::str::from_utf8(&line).unwrap_or("").trim().to_lowercase();

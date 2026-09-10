@@ -267,6 +267,55 @@ The `poll` line is the fix batch 4b's hook bought: without
 glue answers `FdState::Missing` → `POLLHUP | EPOLLERR`. A shell polling its own
 stdin would be told the console was finished.
 
+### The `ssh` **client** itself, out to a real OpenSSH server
+
+§4 is about the client, so the client is what had to be run. Both stdin shapes,
+because they are served by different code and the whole finding is that they are:
+
+**On QEMU, client as init — stdin is the serial console** (`read_console`, the
+function this doc is about), out through slirp to the host's OpenSSH:
+
+```
+-- running /bin/ssh --
+[ssh] connecting to 10.0.2.2:22...
+The authenticity of host '10.0.2.2:22' can't be established.
+ED25519 key fingerprint is SHA256:TY9i7ysq+4zQbb23fz7Y3RDtntlRrkiDAvsYzmmtkHk=.
+Are you sure you want to continue connecting (yes/no)? yes
+[ssh] generating new identity key at /root/.ssh/id_ed25519
+ssh: publickey authentication failed for user 'netoneko' (server offers: publickey,password,keyboard-interactive)
+-- init exited --
+```
+
+**On the bare metal, client under an sshd exec channel — stdin is a pipe**
+(glue's `PipeRead` arm), out over the Realtek NIC to the same server on the LAN:
+
+```
+[ssh] connecting to 192.168.1.203:22...
+ED25519 key fingerprint is SHA256:TY9i7ysq+4zQbb23fz7Y3RDtntlRrkiDAvsYzmmtkHk=.
+Are you sure you want to continue connecting (yes/no)? yes
+[ssh] no /root/.ssh/id_ed25519; using sshd's host key as identity
+ssh: publickey authentication failed for user 'netoneko' (server offers: publickey,password,keyboard-interactive)
+rc=255
+```
+
+Read the two halves of that. The **fingerprint is byte-identical to the
+server's real one** (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` →
+`SHA256:TY9i7ysq+4zQbb23fz7Y3RDtntlRrkiDAvsYzmmtkHk`), so the ED25519 key
+exchange completed and transported the host key correctly. The **`yes` was
+echoed and consumed** — on QEMU that is `read_console` in blocking canonical
+mode, on the metal it is the pipe arm. And the rejection is a *real* OpenSSH
+reply with the server's actual method list, which only a completed
+`SSH_MSG_USERAUTH_FAILURE` can produce. Everything works except authorization,
+because neither server authorizes the guest's key — deliberately not arranged.
+
+**The trap in reading this, and it cost two runs.** The client blocks on that
+host-key prompt, so a harness that sends nothing looks exactly like a hang: the
+first metal attempts timed out at 60 s, and the guest console showed
+`[SSHD] Accepted connection` with no auth lines after it, which reads as a
+stalled handshake. It was the prompt. On QEMU a `yes` piped in at *t=0* is also
+lost — the guest needs ~30 s to boot and the bytes are gone by then — so the
+delay before sending is load-bearing. **Neither was a kernel stall.**
+
 ### The interactive shell, over ssh
 
 Both channel shapes, since the `ioctl` preamble threads exactly this:
