@@ -1406,14 +1406,17 @@ real third bug and worth its own autopsy rather than a guess.
 
 ### 4. **aarch64**, not amd64: `test_spawn_ext_passes_env` panics the boot suite
 
-> **[CLOSED — re-measured 2026-09-07, later the same day.]** `MEMORY=2048 cargo
-> run --release` reaches
-> `[Test] spawn_ext_passes_env PASSED (composed + default)` and the suite does
-> not panic. The failure belonged to a transient state of this branch, which is
-> what the original entry suspected ("belongs to the branch, not to that
-> work") without being able to say when it would go. No autopsy was ever
-> written and none is owed; recorded as closed so the next reader does not go
-> looking for a bug that is not there.
+> **[CLOSED — re-measured 2026-09-07, later the same day; RE-OPENED and
+> properly closed 2026-09-10.]** The 2026-09-07 closure attributed the failure
+> to "a transient state of this branch" — wrong variable. The real variable was
+> the accelerator's timing: the failure reproduces deterministically under
+> lima/KVM on committed HEAD and passes under local HVF/TCG, because the test
+> tore down its fake parent process *before* draining the child channel, and
+> KVM's faster scheduling wins that race. Root cause and fix (move the parent
+> teardown after the drain — test-only, no kernel change):
+> `docs/archive/AKUMA_SPAWN_EXT_ENV_TEST_PARENT_TEARDOWN.md`. The "no autopsy
+> was ever written" regret is discharged; the next reader should start there,
+> not look for a kernel bug.
 
 Found 2026-09-07 while running `scripts/lima_aarch64_run.sh` to prove the amd64
 `mmap` work had not touched the other kernel. It had not — `git diff` over
