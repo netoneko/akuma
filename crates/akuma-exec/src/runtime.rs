@@ -231,6 +231,59 @@ pub struct ExecRuntime {
         parent: &crate::process::Process,
         child: &mut crate::process::Process,
     ) -> Result<(), &'static str>,
+
+    /// **Give a fork child its `ProcessInfo` page, if this target has one** —
+    /// `fork_process`'s step 2. Returns the page's physical address, or `0` to
+    /// say this kernel does not use one.
+    ///
+    /// AArch64 allocates a zeroed frame, tracks it, maps it read-only at
+    /// `PROCESS_INFO_ADDR` and hands it to the space's user-frame ledger.
+    /// That page is how a thread on that kernel answers "which process am I?"
+    /// when `THREAD_PID_MAP` cannot (`read_current_pid`'s fallback), and
+    /// `fork_process` re-maps it *after* the share pass because the pass covers
+    /// `PROCESS_INFO_ADDR` and would otherwise leave the child reading its
+    /// parent's copy.
+    ///
+    /// **amd64 returns `0`, and that is a stated decision rather than a gap.**
+    /// Identity on that target resolves through the process table and
+    /// `THREAD_PID_MAP` alone; nothing there ever reads the page, and mapping
+    /// one would leak 4 KiB per process past the frame ledger. `0` is what its
+    /// `register_exec_process` has always written into `process_info_phys`, so
+    /// this hook is that same decision moved to where `fork` can see it — and
+    /// step 5's re-map and `ProcessInfo` write are skipped on the same `0`,
+    /// which is why there is one hook and not two.
+    ///
+    /// The child's address space is unpublished and exclusively the caller's,
+    /// hence `&mut`.
+    pub fork_alloc_process_info:
+        fn(space: &mut crate::mmu::UserAddressSpace) -> Result<usize, &'static str>,
+
+    /// **Bind a freshly spawned child thread to per-process state this crate
+    /// has no concept of**, in the window between the slot being claimed
+    /// (`INITIALIZING`) and the process being registered.
+    ///
+    /// AArch64 has nothing to do here and registers a no-op. amd64 does two
+    /// things it cannot do anywhere else, because both are keyed on the *task
+    /// slot* and the slot does not exist until the spawn returns:
+    ///
+    /// * the task's `space_root`, which the scheduler writes to `CR3` on every
+    ///   switch. A child arrives with `0` — kernel `CR3` — because the spawn
+    ///   path has no `Process` to read a root from, and the first switch into
+    ///   an unbound child would run ring-3 code against the kernel's tables.
+    /// * its `SPAWN` row and the `UserCtx::proc_slot` naming it. That index is
+    ///   what `run_process` uses for `thread::drain` and `spawn_record_exit`,
+    ///   i.e. how the target tears a process down at all.
+    ///
+    /// **Fallible, and the row table is why**: `SPAWN` is a fixed array and a
+    /// full one has to reach the user as an error, not as a child with no exit
+    /// path. On `Err` the caller releases the thread slot
+    /// (`threading::release_initializing_thread`) and unwinds the whole
+    /// `fork` — which is the only reason that function exists.
+    ///
+    /// Runs **before** `THREAD_PID_MAP` is written, so a failure has nothing to
+    /// undo but the slot itself.
+    pub bind_child_task:
+        fn(tid: usize, child: &crate::process::Process) -> Result<(), &'static str>,
 }
 
 /// Compile-time kernel configuration, passed once at init.

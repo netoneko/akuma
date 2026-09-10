@@ -2219,46 +2219,6 @@ impl Image {
     // ledger nor the bump-window walk — is settled by the same change: there is
     // one ledger, inside the address space, and nothing else to consult.
 
-    /// A `fork` child: `parent`'s address space **shared copy-on-write**,
-    /// resuming at `entry`/`stack`
-    /// (the parent's post-`fork` RIP/RSP) as a register-complete copy.
-    ///
-    /// `parent` is the **registered** `akuma_exec::Process` since 5b slice 4 —
-    /// the only process there is now. The two things read out of it are the
-    /// same two this function always read, under the same lock order
-    /// (**regions → address space**): the region extents first, in one hold,
-    /// then one walk of the tables.
-    ///
-    /// `None` if a frame for the child's PML4 or one of its page tables runs
-    /// out — the shell then sees `fork` fail with `ENOMEM`, which is a
-    /// survivable "can't fork" rather than a corrupt child. Both failure paths
-    /// print which one they took: an `ENOMEM` that names the wrong resource is
-    /// what made the scheduler's slot leak look like memory exhaustion for an
-    /// afternoon (`docs/archive/AKUMA_AMD64_COW.md`).
-    fn fork_of(
-        parent: &akuma_exec::process::Process,
-        entry: u64,
-        stack: u64,
-    ) -> Option<Self> {
-        let Some(mut space) = UserAddressSpace::new() else {
-            serial::puts("  [fork] no frame for a child PML4; pmm free=");
-            serial::put_dec(akuma_pmm::free_count() as u64);
-            serial::puts("\n");
-            return None;
-        };
-        let mut regions: Vec<MmapRegion> = Vec::new();
-        if !share_parent_memory_into(parent, &mut space, &mut regions) {
-            serial::puts("  [fork] share pass failed; pmm free=");
-            serial::put_dec(akuma_pmm::free_count() as u64);
-            serial::puts(" pages=");
-            serial::put_dec(space.user_frame_count() as u64);
-            serial::puts("\n");
-            // `space` drops on return, releasing every frame the pass above
-            // managed to claim and every page table it built.
-            return None;
-        }
-        Some(Self { space, entry, stack, regions })
-    }
 }
 
 /// Share the parent's user memory into `child_space`, copy-on-write, and fill
@@ -3050,86 +3010,11 @@ fn flatten_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) -> alloc::vec::
     out
 }
 
-/// One process, as `/proc` needs to describe it.
-///
-/// Owned rather than borrowed: every reader of the process table is a syscall
-/// rendering a virtual file, and the table is a `static mut` behind raw
-/// pointers — handing out a reference into it would outlive the single-core
-/// reasoning that makes touching it sound at all.
-pub struct ProcEntry {
-    /// argv, NUL-separated. Never empty: falls back to the program name.
-    ///
-    /// The only field left. This type used to carry `pid`, `ppid` and `exit`
-    /// as well, and render `/proc/<pid>/stat` through them — that was this
-    /// target's own `/proc`, deleted in 4b batch 2c in favour of the mounted
-    /// `ProcFilesystem`, which reads the same facts off `Process` directly.
-    /// What survives is one question `fork` asks: what did my parent's command
-    /// line say.
-    pub cmdline: alloc::vec::Vec<u8>,
-}
-
-impl ProcEntry {
-    /// argv[0], for `comm` and the `Name:` field.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        let first = self.cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
-        core::str::from_utf8(first).unwrap_or("?")
-    }
-}
-
 /// Record init's argv so `/proc/1` can describe it. Called once by [`run_init`].
 fn set_init_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) {
     *INIT_CMDLINE.lock() = flatten_cmdline(args);
 }
 
-/// One `akuma-exec` `Process`'s command line.
-///
-/// This rendered a whole `/proc` entry — pid, ppid, exit status — until 4b
-/// batch 2c deleted this target's own `/proc`. The mounted `ProcFilesystem`
-/// reads those facts off `Process` directly; what is left is the one question
-/// `sys_fork` asks about a parent it is about to copy.
-fn proc_entry_of(p: &akuma_exec::process::Process) -> ProcEntry {
-    let img = p.image.lock();
-    // `image.args` is `Vec<String>`; `/proc/<pid>/cmdline` is NUL-terminated
-    // bytes. Rebuilt here rather than stored twice.
-    let mut cmdline = alloc::vec::Vec::new();
-    for a in &img.args {
-        cmdline.extend_from_slice(a.as_bytes());
-        cmdline.push(0);
-    }
-    if cmdline.is_empty() {
-        cmdline.extend_from_slice(img.name.as_bytes());
-        cmdline.push(0);
-    }
-    ProcEntry { cmdline }
-}
-
-/// One process by pid, or `None` if no such process is live.
-#[must_use]
-pub fn proc_by_pid(pid: u32) -> Option<ProcEntry> {
-    // 5b slice 2: one table, and init is in it — `run_init` registers pid 1,
-    // so no special case is needed *once the machine is running*.
-    if let Some(e) = akuma_exec::process::find_process(|p| (p.pid == pid).then(|| proc_entry_of(p)))
-    {
-        return Some(e);
-    }
-    // ...but the boot self-tests run **before** `run_init`, on a task that is
-    // registered nowhere, and `current_pid()` answers 1 for it. So every
-    // `/proc/self` check in the suite asks for a pid 1 that does not exist yet.
-    //
-    // This fallback is that window and nothing else, which is why it is here
-    // rather than a `pid == 1` arm ahead of the lookup: once init is registered
-    // the table answers first and this is dead. Removing it during slice 2
-    // failed three `proc: /proc/self/...` checks immediately — the synthetic
-    // entry it replaces was load-bearing for a reason nobody had written down.
-    if pid == 1 {
-        let cmdline = INIT_CMDLINE.lock().clone();
-        return Some(ProcEntry {
-            cmdline: if cmdline.is_empty() { alloc::vec![b'i', b'n', b'i', b't', 0] } else { cmdline },
-        });
-    }
-    None
-}
 
 /// The pid of the process making the current syscall — what `/proc/self`
 /// resolves to. `1` for init and for anything not in the spawn table, matching
@@ -3783,64 +3668,105 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 fn sys_fork() -> u64 {
     use crate::fd::errno;
 
-    let parent_slot = current_proc_slot();
-    // `>= PROC_SLOTS`, not `>= 16`. The old bound existed because
-    // `proc_entry_for` had only sixteen trampolines and handed out nine, so a
-    // parent in a higher slot had no entry function for its child. There is one
-    // entry function now (`proc_entry`), and `usize::MAX` — the answer off a
-    // user task — is caught by the same comparison.
-    if parent_slot >= PROC_SLOTS {
-        return errno::ENOSYS;
-    }
-
-    // The point the child resumes from — the parent's own ring-3 register file
-    // as captured on the way into this syscall, including its TLS base.
+    // **The fold.** Everything this function used to do by hand —
+    // build the child's address space, copy the descriptor table, register the
+    // process, spawn and seed the task, publish — is
+    // `akuma_exec::process::fork_process`, and has been reachable from here one
+    // piece at a time since the ring-3 entry seam started:
     //
-    // A [`UserContext`], not a five-tuple, since the ring-3 entry seam: the
-    // x86_64 arm of that type *is* what `syscall_entry` saves, so the capture
-    // has a name, and `sched::write_user_context` below is the same writer the
-    // shared child-spawn path reaches through
-    // `akuma_threading::update_thread_context`. Building it here is what makes
-    // slice 3's fold a deletion rather than a translation.
-    // Read through `akuma_threading::get_saved_user_context` since 2026-09-11,
-    // not off this task's `UserCtx` directly: that function **is** step 6 of
-    // the shared `fork_process`, and its x86_64 arm is
-    // `sched::read_user_context` — the mirror of the `write_user_context` this
-    // function calls twenty lines down. Reading the parent through the same
-    // door the shared path will is what makes the fold a deletion; it also
-    // subsumes the `user_rip == 0 || user_rsp == 0` refusal this used to make
-    // by hand, which now lives with the reader and is shared with `clone`.
-    let Some(mut child_ctx) = akuma_threading::get_saved_user_context(crate::sched::current_task())
-    else {
-        return errno::ENOSYS;
-    };
-    // A child returns 0 from the `fork` its parent returns a pid from. Stated
-    // rather than implied: the value is what the entry assembly hard-codes
-    // (`enter_user_mode_forked` does `xor eax, eax`), and this is the field
-    // shared code sets for the same reason.
-    child_ctx.set_child_return_zero();
-    let (user_rip, user_rsp) = (child_ctx.pc, child_ctx.sp);
+    // * slice 1 gave `UserContext` an x86_64 arm, so the function compiles here;
+    // * slice 2 gave `Process::run` the `enter_user` hook, so a child spawned by
+    //   shared code reaches ring 3 through this target's returning lifecycle;
+    // * slice 3 put every child's exit `ProcessChannel` in `CHILD_CHANNELS`, so
+    //   `ChildReaping::Reapable` has somewhere to register;
+    // * slice 4 made the memory pass a hook, so step 4 speaks x86 page tables;
+    // * slice 5 gave `get_saved_user_context` and
+    //   `spawn_user_closure_initializing` real x86_64 arms, so steps 6 and 7
+    //   stop failing.
+    //
+    // What is left here is the pid and the errno translation. The `SPAWN` row,
+    // the `CR3` root and the `UserCtx::proc_slot` — the three things shared code
+    // has no concept of — are bound through `ExecRuntime::bind_child_task`
+    // below, in the one window where the child provably has not executed an
+    // instruction.
+    //
+    // Three behaviours arrive with the shared path and none is silent:
+    //
+    // * **the child inherits the parent's `brk`.** This target passed
+    //   `image_top: 0` and said so; `Process::inherit_from` carries the
+    //   parent's, which is what Linux does and what the CoW share pass makes
+    //   true — the child owns a copy of the parent's heap pages, so a `brk`
+    //   naming them is naming its own memory now.
+    // * **`signal_actions` is a `clone_for_fork` copy**, not a fresh table.
+    //   POSIX; this target had no dispositions to carry, so it is a gain that
+    //   costs nothing today and is correct the moment `sigaction` works.
+    // * **`LifecycleGuard`** wraps the whole thing. A no-op unless
+    //   `kernel_smp_shared`, which this target does not build.
+    //
+    // The parent-slot bound this used to check (`>= PROC_SLOTS`) is gone with
+    // the hand-rolled slot search; `current_process()` inside `fork_process` is
+    // the same question asked of the authoritative table.
+    let child_pid = alloc_pid();
+    match akuma_exec::process::fork_process(child_pid, 0) {
+        Ok(pid) => u64::from(pid),
+        Err(e) => {
+            // Named, not swallowed. Every failure inside `fork_process` is a
+            // `&'static str` and `sh: can't fork: Out of memory` names the
+            // wrong resource for most of them — the `SPAWN` table filling up
+            // being the one this target hits first.
+            serial::puts("  [fork] ");
+            serial::puts(e);
+            serial::puts("\n");
+            errno::ENOMEM
+        }
+    }
+}
 
-    // Collect any row the reaper left behind first — glue's `wait4` frees the
-    // process, not the row (see `sweep_reaped_spawn_rows`), so without this the
-    // table fills with rows for processes that no longer exist and `fork`
-    // reports `ENOMEM` on a machine with gigabytes free.
+/// **`ExecRuntime::bind_child_task` on this target** — give a freshly spawned
+/// `fork`/`vfork` child the three things `akuma-exec` has no concept of, in the
+/// window after its task slot exists and before it can be scheduled.
+///
+/// All three are keyed on the **task slot**, which is why this cannot happen
+/// before the spawn, and all three must be in place before publication, which
+/// is why it cannot happen after `mark_thread_ready`:
+///
+/// * **`space_root`** — the page-table root the scheduler writes to `CR3` on
+///   every switch into this task. The crate's spawn leaves it `0` (kernel
+///   `CR3`) because it has no `Process` to read a root from, and the first
+///   switch into an unbound child would run ring-3 code against the kernel's
+///   tables.
+/// * **the `SPAWN` row** — this target's per-process exit record.
+/// * **`UserCtx::proc_slot`** — the index naming that row, which
+///   [`run_process`] reads back for `thread::drain` and `spawn_record_exit`.
+///   [`proc_entry`] reads it too, and refuses to enter ring 3 without it.
+///
+/// The row is swept for reaped predecessors first, for the reason `sys_fork`
+/// swept before it: glue's `wait4` frees the process, not the row (see
+/// [`sweep_reaped_spawn_rows`]), so without this the table fills with rows for
+/// processes that no longer exist and `fork` reports failure on a machine with
+/// gigabytes free.
+///
+/// **`stdin_pipe`/`stdout_pipe` are `None` and that is not a stub.** A `fork`
+/// child's fd 0/1/2 are *names* for the parent's descriptions, copied by
+/// `Process::inherit_from`'s `clone_deep_for_fork` and released by this child's
+/// own table at exit. It owns no pipe of its own; only `sys_spawn` creates one.
+pub fn bind_child_task(
+    task_slot: usize,
+    child: &akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    // Collect any row the reaper left behind before looking for a free one.
     sweep_reaped_spawn_rows();
-    // A free child slot. The `SPAWN` row is the whole answer since 5b slice 4:
-    // it used to be `PROCS[s].is_none() && SPAWN[s].is_none()`, and the
-    // diagnostic below used to count both halves because they could diverge —
-    // `fork` searched them together, `sys_spawn` searched only `PROCS`. There
-    // is one array left, so they cannot.
-    // SAFETY: raw-pointer read; single core.
+
+    // SAFETY: raw-pointer read; under the BKL inside a syscall.
     let slot = unsafe {
         let spawn = spawn_table();
         (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| (*spawn)[s - SPAWN_SLOT_BASE].is_none())
     };
     let Some(slot) = slot else {
-        // A bare `ENOMEM` here reaches the user as `sh: can't fork: Out of
-        // memory`, which names the wrong resource: the table is full, and the
-        // machine may have gigabytes free. Say which, and how full.
-        // SAFETY: raw-pointer read; single core.
+        // A bare "out of memory" here reaches the user as `sh: can't fork: Out
+        // of memory`, which names the wrong resource: the table is full, and
+        // the machine may have gigabytes free. Say which, and how full.
+        // SAFETY: raw-pointer read; under the BKL.
         let spawn_used = unsafe {
             let spawn = spawn_table();
             (0..SPAWN_SLOTS).filter(|&s| (*spawn)[s].is_some()).count()
@@ -3852,119 +3778,21 @@ fn sys_fork() -> u64 {
         serial::puts(" registered ");
         serial::put_dec(akuma_exec::process::process_count() as u64);
         serial::puts("\n");
-        return errno::ENOMEM;
+        return Err("fork: no free SPAWN row");
     };
 
-    // The parent's pid and command line, for the child's `/proc` entry. Read
-    // before the child exists, because `proc_by_pid` walks the same table the
-    // registration below is about to touch.
-    let parent_pid = current_pid();
-    let parent_cmdline = proc_by_pid(parent_pid).map_or_else(alloc::vec::Vec::new, |p| p.cmdline);
-    let parent_name = proc_by_pid(parent_pid).map_or_else(
-        || alloc::string::String::from("fork"),
-        |p| alloc::string::String::from(p.name()),
-    );
-
-    // Copy the parent's whole address space, off the parent's **registered**
-    // process — the only process there is since 5b slice 4.
-    let Some(parent) = current_process() else {
-        return errno::ESRCH;
-    };
-    let Some(child) = Image::fork_of(parent, user_rip, user_rsp) else {
-        return errno::ENOMEM;
-    };
-    let child_root = child.space.ttbr0();
-
-    // The child gets its own descriptor table naming the same open
-    // descriptions. Before per-process tables existed there was nothing to do
-    // here and that was the bug: parent and child shared one flat table, so a
-    // child that closed fd 1 to redirect its own output closed the parent's
-    // too. Done before the task is published — a child that runs with an empty
-    // table cannot open anything and does not say why. (Since step 4b the copy
-    // IS the registration's `clone_deep_for_fork` below; there is no second,
-    // legacy table to copy alongside it.)
-
-    // Through the crate's user-thread spawn since 2026-09-11, which is
-    // `spawn_child_thread_and_publish`'s own first step — so the x86_64 arm of
-    // `ThreadPool::spawn_user_closure_initializing` is exercised by every
-    // `fork` on this target before the fold depends on it, the way slice 2 put
-    // `write_user_context` on the live path ahead of its shared caller.
-    //
-    // Two things come with it and both are gains: a slot-exhaustion diagnostic
-    // naming live/terminated counts instead of a bare `ENOMEM`, and the
-    // live-task high-water line. What does **not** come with it is the address
-    // space — the crate has no `Process` to read one from — so the root is
-    // installed on the next line, while the slot is still INITIALIZING.
-    let Ok(task_slot) =
-        akuma_threading::spawn_user_thread_initializing(proc_entry, core::ptr::null_mut())
-    else {
-        // `child` drops here, releasing every frame the CoW share pass claimed
-        // and every page table it built — what `take_proc_slot` used to do by
-        // taking the slot back out of `PROCS`.
-        return errno::ENOMEM;
-    };
-    crate::sched::set_task_space_root(task_slot, child_root);
-    crate::sched::seed_proc_slot(task_slot, slot);
-    crate::sched::write_user_context(task_slot, &child_ctx);
-
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
-    // 5b slice 4: registered **before** the task is published, which is the
-    // ordering rule this slice made mandatory — `run_process` reads the child's
-    // entry point and stack out of this registration, so a child scheduled
-    // first would have nowhere to start. Slices 1-2 registered after publishing
-    // and merely left a window where the child's identity did not resolve.
-    //
-    // `image_top` 0 is deliberate for a `fork` child: it has no heap of its own
-    // — it shares the parent's image CoW until the `execve` that virtually
-    // always follows refreshes the registered view (`sys_execve`) — and a `brk`
-    // naming the parent's heap would answer a grow request into a space the
-    // child does not own.
-    register_exec_process(
-        pid,
-        parent_pid,
-        task_slot,
-        child,
-        0,
-        parent_name.as_str(),
-        // A `fork` child runs the parent's image until it `execve`s, so it
-        // shows the parent's command line — the reason `ps` briefly lists two
-        // `sh`s.
-        &parent_cmdline,
-        // Step 4b: the child's registered fd table is the *only* table — a
-        // real POSIX copy of the parent's through `clone_deep_for_fork`, whose
-        // `clone_fd_refs` bumps one pipe-end/socket reference per inherited
-        // descriptor. The bump used to live in the deleted `inherit_fds` and
-        // the mirror copied **without** it (running both double-bumped every
-        // forked pipeline's pipes and `yes` blocked forever — found by the
-        // suite's `redirect` test, first boot of slice 4); with one authority
-        // there is one place for it.
-        Some(alloc::sync::Arc::new(parent.fds.clone_deep_for_fork())),
-        // The parent's terminal, shared — not a copy of its size.
-        Some(parent.terminal_state.clone()),
-    );
-
-    // SAFETY: raw-pointer write; single core.
+    // SAFETY: raw-pointer write; under the BKL, and the task is unpublished.
     unsafe {
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
-            pid,
-            // Owns no pipe: the child's fd 0/1/2 are *names* for the parent's
-            // descriptions, copied by `inherit_fds` above and released by this
-            // child's own row sweep at exit. This `None` is what `borrowed_io`
-            // used to say.
+            pid: child.pid,
             stdin_pipe: None,
-            // Nor a stdout pipe: fd 1/2 are names for the parent's.
             stdout_pipe: None,
             exec_slot: task_slot,
         });
     }
-
-    // Published last: the child's register/TLS snapshot, its identity and its
-    // stdio row must all be in place before anything can schedule it — the same
-    // ordering rule `spawn_in_space_unpublished` exists to enforce (a tick
-    // between spawn and seed used to run the child on garbage).
-    crate::sched::publish_task(task_slot);
-
-    u64::from(pid)
+    crate::sched::seed_proc_slot(task_slot, slot);
+    crate::sched::set_task_space_root(task_slot, child.address_space.ttbr0());
+    Ok(())
 }
 
 /// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.

@@ -144,6 +144,18 @@ fn runtime() -> ExecRuntime {
         // See `usermode::fork_share_memory` — it is the walk `Image::fork_of`
         // already used, pointed at a child `fork_process` built.
         fork_share_memory: crate::usermode::fork_share_memory,
+        // **No `ProcessInfo` page on this target**, and `0` is how the shared
+        // `fork_process` is told so — the same stated decision
+        // `register_exec_process` has always written into `process_info_phys`,
+        // moved to where `fork` can see it. Identity resolves through the
+        // process table and `THREAD_PID_MAP` here; nothing reads the page, and
+        // mapping one would leak 4 KiB per process past the frame ledger. Step
+        // 5's re-map and `ProcessInfo` write are skipped on the same `0`.
+        fork_alloc_process_info: |_space| Ok(0),
+        // The child's `CR3` root, its `SPAWN` row and the `UserCtx::proc_slot`
+        // naming that row — the three things `akuma-exec` has no concept of.
+        // See the function.
+        bind_child_task: crate::usermode::bind_child_task,
         // The same clock `threading::ThreadRuntime` was already given, so the
         // scheduler and `akuma-exec` cannot disagree about what time it is.
         uptime_us: crate::net::uptime_us,

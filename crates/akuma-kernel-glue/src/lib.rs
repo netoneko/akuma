@@ -431,6 +431,14 @@ pub(crate) fn build_exec_runtime(
         // registered rather than called directly so the amd64 kernel can
         // substitute a walk that speaks x86 page tables. See the field's doc.
         fork_share_memory: akuma_exec::process::fork_share_parent_memory,
+        // `fork_process`'s own step 2, registered for the same reason: whether a
+        // kernel keeps a per-process identity page in the user address space is
+        // a per-target answer, and this one's is yes.
+        fork_alloc_process_info: akuma_exec::process::fork_alloc_process_info,
+        // Nothing to bind: on this kernel a child thread is described entirely
+        // by its `Process` and the shared thread table. amd64 binds a `CR3`
+        // root and a `SPAWN` row here. See the field's doc.
+        bind_child_task: |_tid, _child| Ok(()),
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,

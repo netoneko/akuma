@@ -123,6 +123,11 @@ pub fn ensure_test_runtime() {
         // The real one walks page tables. A host test that reaches it wanted a
         // kernel, so say so rather than silently building an empty child.
         fork_share_memory: |_, _| Err("fork_share_memory on a host build"),
+        fork_alloc_process_info: |_| Err("fork_alloc_process_info on a host build"),
+        // `Ok`, not an error: this is the only one of the three fork hooks a
+        // host build can honestly answer, because on a host there is genuinely
+        // nothing to bind — which is also the AArch64 kernel's answer.
+        bind_child_task: |_, _| Ok(()),
     };
     let cfg = ExecConfig {
         max_threads: 64,

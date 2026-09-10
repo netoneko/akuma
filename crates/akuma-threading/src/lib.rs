@@ -1911,6 +1911,42 @@ impl ThreadPool {
     }
 }
 
+/// Release a slot that was claimed [`thread_state::INITIALIZING`] and will
+/// never be published — the unwind half of
+/// [`spawn_user_thread_initializing`].
+///
+/// It exists because publishing is no longer the only fallible thing that can
+/// happen between claiming a slot and making it runnable: a target may need to
+/// bind per-process state to the new thread first
+/// (`ExecRuntime::bind_child_task`), and that can fail. Without this the slot
+/// would sit `INITIALIZING` forever — invisible to the picker *and* to every
+/// claim path, i.e. leaked in the one state nothing collects.
+///
+/// **The two architectures answer with different states, and both are right
+/// for their own claim path.** AArch64 stores `FREE`, matching what
+/// `spawn_user_closure_initializing` already does when its own stack
+/// allocation fails: the stack went back to the PMM, so the slot is pristine.
+/// x86_64 stores `TERMINATED` ([`x86_abandon`]), because on that target the
+/// slot owns two leaked 32 KiB stacks that its next occupant reuses — handing
+/// it back as pristine would leak the pair — and [`x86_claim_slot`] treats a
+/// `TERMINATED` slot no core is executing as claimable anyway.
+///
+/// Off both kernels this is a no-op: there is no slot table on a host.
+pub fn release_initializing_thread(tid: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if tid < MAX_THREADS {
+            THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+        }
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    x86_abandon(tid);
+    #[cfg(not(any(target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64"))))]
+    {
+        let _ = tid;
+    }
+}
+
 /// Mark a thread as running (lock-free)
 #[track_caller]
 fn mark_thread_running(idx: usize) {

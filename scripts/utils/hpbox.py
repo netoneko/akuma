@@ -372,10 +372,23 @@ def build(pkg="akuma-amd64", target="x86_64-unknown-none", timeout=900):
     matches no `^error` grep and so reads as a *successful* build with no
     output. The binary's mtime is the only thing that gives it away.
     """
-    cmd = (f"{BOX_CARGO}; cd {BOX_REPO} && "
+    # `set -o pipefail` is not decoration. Without it the pipeline's status is
+    # `tail`'s, which is 0 whatever rustc did — so a failed build returned
+    # `rc == 0` and the caller went on to `stage()`, which happily installed
+    # the *previous* kernel and armed GRUB for it. Measured 2026-09-11: a
+    # compile error (E0063) reported `build rc 0` and `stage rc 0`, and the
+    # only evidence anything was wrong was an `error:` line inside the tail.
+    # Same silent-success family as `BOX_CARGO` itself, one line up.
+    cmd = (f"set -o pipefail; {BOX_CARGO}; cd {BOX_REPO} && "
            f"cargo build -p {pkg} --target {target} --release 2>&1 | tail -25")
     rc, out, err = ubuntu(cmd, timeout=timeout)
-    return rc, (out + err).strip()
+    out = (out + err).strip()
+    # Belt as well as braces: `pipefail` is a bash-ism and this command travels
+    # through whatever `ssh` gives it a shell of. A cargo `error:` line at the
+    # start of a line is unambiguous.
+    if rc == 0 and any(l.startswith("error") for l in out.splitlines()):
+        return 1, out
+    return rc, out
 
 
 # Where the on-disk copy of `target/` lives while a tmpfs stands in its place.
@@ -510,7 +523,17 @@ def stage(cmdline_extra="", timeout=900):
     """
     rc, out, err = ubuntu(f'CMDLINE_EXTRA="{cmdline_extra}" bash /root/stage_akuma.sh 2>&1',
                           timeout=timeout)
-    return rc, (out + err).strip()
+    out = (out + err).strip()
+    # The script builds before it installs, and a build failure inside it does
+    # not stop it: it installs whatever is already in `target/` and arms GRUB
+    # for that. So a `rc == 0` here means "the script ran", not "the kernel you
+    # just wrote is the one that will boot" — check for the failure the same
+    # way :func:`build` does, or the next boot silently measures the *previous*
+    # change. This is what made a staged run report a fold that had not
+    # compiled (2026-09-11).
+    if rc == 0 and any(l.startswith("error") for l in out.splitlines()):
+        return 1, out
+    return rc, out
 
 
 def restage_disk(keep_keys=True, timeout=600):

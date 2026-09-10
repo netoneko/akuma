@@ -2302,6 +2302,11 @@ pub enum ChildReaping {
 ///
 /// - `new_proc.context` is written **before** the thread is spawned, because
 ///   `entry_point_trampoline` erets to `proc.context`.
+/// - `ExecRuntime::bind_child_task` runs **before** `THREAD_PID_MAP`, and is the
+///   only fallible step after the slot is claimed. It is where a target binds
+///   state keyed on the task slot — amd64's `CR3` root and `SPAWN` row — and
+///   its failure path is the only caller of
+///   `threading::release_initializing_thread`.
 /// - `THREAD_PID_MAP` is populated **before** the child can run. Without it the
 ///   child's first `read_current_pid()` falls back to reading `PROCESS_INFO_ADDR`
 ///   — which for `vfork`/`clone_thread` is the *parent's* page — and resolves to
@@ -2349,6 +2354,16 @@ fn spawn_child_thread_and_publish(
     )?;
     new_proc.thread_id = Some(tid);
 
+    // Per-target state keyed on the *task slot*, which did not exist until the
+    // line above - on amd64 the child's `CR3` root and its `SPAWN` row; on
+    // AArch64 nothing. Fallible (a full row table must reach the user as an
+    // error, not as a child with no exit path), and placed before
+    // `thread_pid_map_insert` so a failure has nothing to undo but the slot.
+    if let Err(e) = (runtime().bind_child_task)(tid, &new_proc) {
+        crate::threading::release_initializing_thread(tid);
+        return Err(e);
+    }
+
     // See the doc comment: this is what makes `current_process_shared()` resolve to
     // the child rather than to whatever `PROCESS_INFO_ADDR` currently says.
     table::thread_pid_map_insert(tid, child_pid);
@@ -2391,6 +2406,35 @@ fn spawn_child_thread_and_publish(
     crate::threading::mark_thread_ready(tid);
 
     Ok(tid)
+}
+
+/// **Give a fork child its `ProcessInfo` page** — the AArch64 implementation,
+/// and the one `akuma-kernel-glue` registers as
+/// [`crate::ExecRuntime::fork_alloc_process_info`]. Returns the page's physical
+/// address.
+///
+/// This is `fork_process`'s step 2 verbatim; nothing about what it does changed
+/// in the lift. It is a hook because the *question* it answers — does this
+/// kernel keep a per-process identity page in the user address space at all? —
+/// has two answers, and the amd64 one is `0`.
+///
+/// On this kernel the page is `read_current_pid`'s fallback when
+/// `THREAD_PID_MAP` cannot answer, which is why `fork_process` re-maps it after
+/// the share pass: that pass covers `PROCESS_INFO_ADDR` and would otherwise
+/// leave the child reading its parent's pid — the bug that broke
+/// `vfork_complete` and sent CoW faults to the wrong address space.
+pub fn fork_alloc_process_info(
+    space: &mut mmu::UserAddressSpace,
+) -> Result<usize, &'static str> {
+    let frame = akuma_pmm::alloc_page_zeroed()
+        .map(PhysFrame::new)
+        .ok_or("OOM process info")?;
+    track_frame(frame, FrameSource::UserData);
+    space
+        .map_page(PROCESS_INFO_ADDR, frame.addr, mmu::user_flags::RO_NO_EXEC)
+        .map_err(|_| "Failed to map process info")?;
+    space.track_user_frame(frame);
+    Ok(frame.addr)
 }
 
 /// **Populate a fork child's address space from its parent** — the AArch64
@@ -2971,25 +3015,19 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=fork parent={}\n",
         child_pid, new_address_space.l0_phys(), new_address_space.asid(), parent_pid));
 
-    // 2. Allocate process info page
-    let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
-    track_frame(process_info_frame, FrameSource::UserData);
-    
-    new_address_space
-        .map_page(
-            PROCESS_INFO_ADDR,
-            process_info_frame.addr,
-            mmu::user_flags::RO_NO_EXEC,
-        )
-        .map_err(|_| "Failed to map process info")?;
-    new_address_space.track_user_frame(process_info_frame);
+    // 2. Allocate the child's process info page — through the registered hook,
+    // because *whether this kernel has one at all* is a per-target decision and
+    // not a step every kernel must take. `0` means "no page"; see
+    // `ExecRuntime::fork_alloc_process_info`, and note that step 5's re-map and
+    // write below are gated on the same value.
+    let process_info_phys = (runtime().fork_alloc_process_info)(&mut new_address_space)?;
 
     // 3. Create Process struct (fallible allocation to avoid kernel panic on OOM)
     let mut new_proc = Process::inherit_from(parent, InheritOverrides {
         pid: child_pid,
         tgid: child_pid, // fork creates a new thread group
         address_space: new_address_space,
-        process_info_phys: process_info_frame.addr,
+        process_info_phys,
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
         // A COPY of the parent's dispositions, not a fresh table: POSIX says
         // fork inherits them. See `SharedSignalTable::clone_for_fork`.
@@ -3015,17 +3053,22 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // current_process_shared() / read_current_pid() to return the wrong PID.
     // This broke vfork_complete (wrong child PID → parent never unblocked)
     // and the CoW fault handler (resolved pages in the wrong address space).
-    lifecycle_trace("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
-    let map_result = new_proc.address_space.get_mut().map_page(
-        PROCESS_INFO_ADDR,
-        new_proc.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
-        mmu::user_flags::RO_NO_EXEC,
-    );
-    if map_result.is_err() {
-        lifecycle_trace("[FORK-DBG] step5a: map_page FAILED\n");
-    }
-    lifecycle_trace("[FORK-DBG] step5b: writing ProcessInfo\n");
-    {
+    //
+    // Skipped entirely when step 2's hook declined to allocate a page (`0`) —
+    // a kernel that resolves identity through the process table alone has
+    // nothing to re-map and nothing to write, and `write_phys(0, …)` would be
+    // a store through a physical address the PMM does not own.
+    if process_info_phys != 0 {
+        lifecycle_trace("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
+        let map_result = new_proc.address_space.get_mut().map_page(
+            PROCESS_INFO_ADDR,
+            new_proc.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
+            mmu::user_flags::RO_NO_EXEC,
+        );
+        if map_result.is_err() {
+            lifecycle_trace("[FORK-DBG] step5a: map_page FAILED\n");
+        }
+        lifecycle_trace("[FORK-DBG] step5b: writing ProcessInfo\n");
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
         let wrote = mmu::write_phys(new_proc.process_info_phys.load(core::sync::atomic::Ordering::Relaxed), &info);
         debug_assert!(wrote, "fork: ProcessInfo frame not in PMM RAM");
