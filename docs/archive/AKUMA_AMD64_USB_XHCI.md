@@ -724,7 +724,43 @@ Two changes, both on the branch:
    as the shootdown outermost-lock argument requires.
 
 Rig verification: boot + all 11 `xhci:` checks identical to before the
-change, self-test tally unchanged (359/4, the 4 pre-existing). **Not
-measured under real SMP contention** — `run-xhci.sh` passes `nosmp`, and the
-stall itself needs the metal; the A/B (`set_vfs_bkl_drop_enabled(false)` +
-SMP boot) is the follow-up measurement, per the standing rule.
+change, self-test tally unchanged (359/4, the 4 pre-existing).
+
+### Metal verification, same branch (2026-09-11, later the same day)
+
+Deployed via `hpbox.deploy()` (box at `2d9fc4bc` + no-op patch — the work had
+already been committed), `stage("root=/dev/sda1")`, `restage_disk` first.
+
+**The recovery works on real silicon, live.** On a SuperSpeed boot with the
+persistent root mounted, the enclosure stalled **repeatedly** — 57
+`transfer timeout` lines in the first ~17 minutes of uptime — and **recovered
+from every one**: the `stall recovered — retrying the command once` count
+tracks the timeout count exactly, 57/57, and every retried command succeeded.
+The disk never went away: `df` kept answering, ssh stayed up, the box passed
+the 17-minute mark while previously the **first** stall had killed the root
+filesystem for the rest of the boot (and, the run before this one, ended in a
+self-reset). A boot that used to yield one fatal sample now yields a stall
+per ~15 s.
+
+What the metal run also showed, honestly:
+
+- **Slice 4 stands.** The device still stalls, roughly every 15 s of use, at
+  SuperSpeed, with recovery absorbing each one. Why an 8-byte transfer always
+  works and larger ones intermittently stall is still the open question —
+  the diagnosis machinery (bounded discarded-event prints) is now in place
+  for it.
+- **`[BKL] stuck` lines still accumulate during recovery** (~6 per stall,
+  `tag=511` in every one, on every boot — the tag is evidently not the BOT
+  tag). The VFS and exec carve-outs are in, so these are a path this
+  investigation has not named — prime suspect is the recovery window itself
+  or the RTL8169 stall-kick path (`[rtl] stall` lines interleave). The
+  timeouts no longer freeze the box — it survived, answered ssh throughout,
+  and never reset — but the lines are real and someone still holds the BKL
+  for >1 s per stall.
+- A controlled second metal run ended with the box **resetting itself** into
+  Ubuntu after ~10 minutes idle-with-polling — no console witness, dmesg ring
+  lost. On the final run (with a `dmesg` snapshot loop writing to the
+  persistent root as insurance) it did not recur in 17+ minutes of active
+  use. Whether the reset was this code or the box's known-bad NIC is
+  undetermined; treat a self-reset on this box as new information, not
+  background noise.
