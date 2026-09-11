@@ -219,6 +219,30 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
             enable_sgi_debug_prints: cfg.enable_sgi_debug_prints,
         },
     );
+    register_process_hooks();
+}
+
+/// Point `akuma-threading` at this crate's process layer — the eight things the
+/// scheduler asks of it.
+///
+/// Separate from [`init`], and `pub`, for one reason: **the amd64 kernel does
+/// not call `init`** (see `amd64/src/exec_runtime.rs`, "Why this is not
+/// `akuma_exec::init`"), so it used to write this table out by hand. Five of its
+/// eight rows answered a constant — `|_| false`, `|_| None` — under comments
+/// saying "no process table on this target", and every one of those reasons had
+/// expired by 2026-09-11 without the rows changing. Two of them were load-bearing:
+/// `is_current_interrupted` is the one hook the x86 park loop reads, and
+/// `clear_draining`/`drain_in_flight` guard a reclaim sweep this target genuinely
+/// runs (`akuma_exec::process::reclaim::drain_retired`, seven call sites in
+/// `amd64/src`). See `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`.
+///
+/// Three of the fields cannot be reached from outside this crate at all
+/// (`pub(crate)`), which is what made the hand-written copy the only option and
+/// is why the fix is a function rather than wider visibility.
+///
+/// Registration is once-only and stores function pointers, so it needs nothing
+/// initialised — call it as early as the scheduler is registered.
+pub fn register_process_hooks() {
     threading::register_process_hooks(threading::ProcessHooks {
         clear_draining: process::reclaim::clear_draining,
         drain_in_flight: process::reclaim::drain_in_flight,

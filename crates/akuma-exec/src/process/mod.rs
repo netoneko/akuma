@@ -462,6 +462,10 @@ pub use crate::box_registry::{
 /// `docs/reference/subsystems/containers.md`.
 pub use crate::box_registry::access as box_access;
 
+/// How many INTR characters the line discipline has consumed, for the
+/// rate-limited `[ISIG]` trace in [`write_to_process_stdin`].
+static INTR_TRACES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Write data to a process's stdin, returning how many bytes were accepted.
 ///
 /// This is a **short write**, not all-or-nothing: the channel's stdin buffer is
@@ -499,7 +503,21 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
             if data.contains(&vintr) {
                 let pgid = ts.foreground_pgid;
                 drop(ts);
-                signal::kill_process_group(pgid, 2 /* SIGINT */);
+                // Which group did the INTR character actually reach? A `^C`
+                // that raises SIGINT on the wrong `foreground_pgid` broadcasts
+                // to nobody and is indistinguishable, from the terminal, from
+                // one that never reached the line discipline at all — which is
+                // the amd64 bare-metal symptom this line exists to split
+                // (`docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`). Rate-limited
+                // to the first few: an interactive session sends one INTR per
+                // keystroke, so a handful is the whole interesting window, and a
+                // stuck client resending `0x03` must not be able to flood the
+                // console.
+                let members = signal::kill_process_group(pgid, 2 /* SIGINT */);
+                if INTR_TRACES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                    crate::safe_print!(96,
+                        "[ISIG] pid={} fg_pgid={} sig=2 members={}\n", pid, pgid, members);
+                }
                 if data.len() == 1 {
                     Filtered::Empty
                 } else {

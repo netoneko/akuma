@@ -367,23 +367,35 @@ fn register_hooks() {
         },
     );
 
-    // `is_current_interrupted` is the one hook the x86 park loop actually
-    // reads, and answering `false` is correct rather than lazy: this target has
-    // no signal delivery at all, so a parked thread is never interrupted out of
-    // its wait. When signals land here, this is the line that changes — see
-    // `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` A2.
-    threading::register_process_hooks(threading::ProcessHooks {
-        clear_draining: |_| {},
-        // No retired-process reclaim on this target yet — `akuma-exec`'s
-        // process table is not built here — so no drain can ever be in flight.
-        drain_in_flight: |_| false,
-        lifecycle_trace_on: || false,
-        pid_for_thread: |_| None,
-        find_pid_by_thread: |_| None,
-        is_current_interrupted: || false,
-        proc_dump_info: |_| None,
-        dump_orphan_processes: || {},
-    });
+    // The scheduler's eight questions for the process layer, answered by
+    // `akuma-exec` — **the same table the AArch64 kernel registers**, from the
+    // same function, so the two cannot drift.
+    //
+    // This was a hand-written literal until 2026-09-11, five of whose eight rows
+    // were `|_| false` / `|_| None` under two reasons that had both expired:
+    // "this target has no signal delivery at all" (it has since
+    // `AKUMA_AMD64_SIGNAL_DELIVERY.md`) and "`akuma-exec`'s process table is not
+    // built here" (it has been since 5b slice 1). Two of the five were doing
+    // real damage while they read as deliberate:
+    //
+    // * `is_current_interrupted` is **the one hook the x86 park loop reads**
+    //   (`akuma_threading`'s `schedule_blocking`). Answering `false` meant a
+    //   thread parked in this target's scheduler was never interrupted out of
+    //   its wait, which is the shape of "`^C` is raised and the sleeping job
+    //   does not die".
+    // * `clear_draining` / `drain_in_flight` guard
+    //   `akuma_exec::process::reclaim::drain_retired`, which this target calls
+    //   from seven places. As no-ops the reaper could free a stack out from
+    //   under a live sweep, and a thread killed mid-sweep left the
+    //   re-entrancy flag set forever on a slot its next occupant inherits.
+    //
+    // The other three are diagnostics: `find_pid_by_thread` gates the `[kill]`
+    // cross-thread-kill tracer (which therefore printed nothing here),
+    // `pid_for_thread` the `[TERM]` lifecycle trace, and `proc_dump_info` /
+    // `dump_orphan_processes` feed `dump_thread_resume_points`, which is a stub
+    // on x86_64 — those last two have no reader on this target and are wired for
+    // uniformity, not effect. `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`.
+    akuma_exec::register_process_hooks();
 }
 
 // ---------------------------------------------------------------------------

@@ -18,16 +18,27 @@
 //! | `park_until` | yield in a loop until the deadline | no WAITING state to enter |
 //! | `current_waker` | a no-op waker | nothing polls a future; the loop re-checks |
 //! | `wake_netpoll` | no-op | there is no parked core to ring a doorbell at |
-//! | `is_current_interrupted` | `false` | see below |
 //! | `current_box_id` | `0` | no containers |
 //!
-//! `is_current_interrupted` read "no signals" until 2026-09-11 and that reason
-//! expired: this target delivers signals now (`amd64/src/signal.rs`). The hook
-//! is still `false`, and it is now a *narrower* statement — the network stack's
-//! own waits are not interruptible here, where `akuma-syscalls-glue`'s blocking
-//! arms ask `should_interrupt_blocking_syscall` and are. Wiring it is the next
-//! step for `EINTR` out of a socket read, and it is not free: the hook is read
-//! from inside `smoltcp`'s poll loop.
+//! One row left that table on 2026-09-11.
+//! `is_current_interrupted` read "no signals" until then, and that reason
+//! expired: this target delivers signals now (`amd64/src/signal.rs`). It is
+//! wired to `should_interrupt_blocking_syscall` — the same function the AArch64
+//! kernel gives this hook (`akuma-kernel-glue`), the union of the deferred-kill
+//! bit, the Ctrl-C / `sys_kill` bit and the per-thread `pthread_kill` set — so a
+//! socket read blocked in `wait_until` honours a signal the way this target's
+//! pipe and wait loops already did.
+//!
+//! **The cost objection that used to stand here has expired too.** It read "not
+//! free: the hook is read from inside `smoltcp`'s poll loop", and it was written
+//! when the check was a `get_channel(tid)` map lookup behind an IRQ-masked
+//! spinlock. It is now one relaxed `AtomicBool::swap` on the common path
+//! (`akuma_threading::THREAD_INTERRUPTED`), and `wait_until` asks it only when
+//! the condition did **not** hold (`akuma-net`'s `socket.rs`, the
+//! `!condition_met &&` short-circuit) — so the fast path never reaches it at
+//! all. That short-circuit is load-bearing for a second reason: the interrupt
+//! bit **consumes**, so a speculative caller eats an `EINTR` a syscall arm was
+//! going to act on.
 //!
 //! Collapsing them is correct *for this machine* and would be wrong the moment
 //! it grows a second core or an IOAPIC. They are written out one by one rather
@@ -254,7 +265,10 @@ fn net_runtime() -> NetRuntime {
         current_waker: noop_waker,
         current_core_id: crate::smp::cpu_index_u32,
         current_box_id: || 0,
-        is_current_interrupted: || false,
+        // See the module header: the same union the AArch64 kernel registers,
+        // one relaxed atomic on the common path, and `wait_until` only asks it
+        // when the condition did not hold.
+        is_current_interrupted: akuma_exec::process::should_interrupt_blocking_syscall,
         rng_fill,
         current_thread_id: || crate::sched::current_task() as u32,
         wake_netpoll: || {},
