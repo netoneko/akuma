@@ -828,3 +828,89 @@ instead of `cc=0x13`. Then the root-cause experiment, from Ubuntu:
 stalls vanish entirely. If they do, decide: keep the recovery, or add a
 keepalive. If BKL lines survive the disk fix, run with
 `set_profiling(true)` so `tag=` names the holder's syscall.
+
+## 2026-09-11, final — metal run with the full fix set: one crash to hand off
+
+The complete build (timeout recovery + halt-gated plan + carve-outs + fs-cache)
+booted clean, absorbed the first post-idle stall exactly as designed
+(`timed out - device slow` → `plain retry` → 0.6 s access), then died during
+the boot suite with:
+
+```
+[EXCEPTION] #GP general protection err=0x0000000000000000
+rip=0xffffffff802b5b6a
+```
+
+Symbolised against the local build of the same source: **`rip` lands inside
+`akuma_amd64::sock::smoke_test`** (0xffffffff802b5b10, +0x5a) — the socket
+self-test, NOT the xHCI path. The xHCI retry storm on the console was the
+boot suite's disk checks stalling; the crash came from the next test in the
+suite.
+
+**Attribution: OPEN, and do not assume pre-existing.** This boot was the
+first with the carve-out forwards (`no-bkl-network` changes the net path to
+BKL-free syscalls under `PreemptGuard` IRQ masking) — if `sock::smoke_test`
+or netpoll assumed BKL serialization anywhere, the crash is a candidate
+*consequence of that change*, not an inherited bug. The A/B is cheap: flip
+`set_network_bkl_drop_enabled(false)` (and the other phase toggles) at boot
+and re-run the suite; if the #GP persists with the carve-outs off, hand it
+to the sock/net owner with the rip above. The retry loop before it also showed
+`ep 4 state 0 (disabled)` on the real controller — the endpoint-context
+reading DISABLED while transfers were working minutes earlier is unresolved
+and worth a look (context written by the controller at DCBAA[slot]; nothing
+in this driver writes DEV_CTX after bring-up).
+
+**The `lib`/`var`/`public` ENOENT mystery, refined**: Ubuntu proved the
+rootfs fine (`/lib` real, loader present; all applets byte-identical static
+busybox). Working theory now: those three directories' **inode-table block**
+gets read for the first time during a boot-suite stall window, the failed
+read poisons the block cache, and their lookups fail deterministically every
+boot (same layout, same read order, same poisoned block). `readdir` lists
+them (dir entries readable) while `stat` fails (inode read goes through the
+poisoned block). Decisive probes next boot:
+`/bin/busybox ls -i /` then `stat /lib` with the disk awake; and the kernel
+rule that falls out regardless: **never insert a block into the cache from a
+failed/short device read** (`with_block` currently `?`-returns before
+insert, but verify every cache fill path — including the fs-cache build).
+
+**Known for next boot: the vanish is NOT present from the start** — early
+after boot `lib`/`var`/`public` stat fine; at some point they stop. So the
+first probe is a timeline, not a spot-check: start this right after boot and
+note the uptime where they vanish, correlated with the first
+`transfer timeout`/`plain retry` lines:
+
+```sh
+/bin/busybox sh -c 'while :; do echo "$(cat /proc/uptime) $(/bin/busybox \
+  ls -d /lib /var /public 2>&1 | /bin/busybox tr "\n" " ")"; sleep 20; done' \
+  > /root/dirtrace.log 2>&1 &
+```
+
+Watch for: does the vanish coincide with (a) the first stall/recovery
+episode, (b) the first ssh connection, (c) a specific number of disk
+commands, or (d) nothing visible — plus `/bin/busybox ls -i /` before and
+after the vanish (do the inode numbers for the three change? a change would
+mean a re-read dir block with different rec_len parsing, not a poisoned
+inode-table block).
+
+Also read the crate's own cache-integrity counters after the vanish:
+`[E2C-BAD]` (ext2.rs, "cache hits whose bytes did not match a direct disk
+re-read", built for the 2026-08-15 zero-page hunt) — if it fires around the
+vanish, the fs-cache is serving corrupt blocks (amd64 runs the big
+clock-eviction cache against a *stalling* xHCI transport for the first
+time; a partially-filled fill surviving in the cache is the suspect), and
+the fix is at the cache layer. If it stays silent, the corruption is below
+the cache — the device returning bad data — which changes the bug report.
+
+**Clock finding (2026-09-11, from the "two clocks" question):** the xHCI
+timeout budget is **uncalibrated**. `spin_us`/`BUDGET` in
+`amd64/src/xhci.rs` count raw TSC ticks against an assumed ">= 1 GHz" —
+nothing on this target calibrates the TSC (`clock.rs` keeps a wall clock on
+the 10 ms LAPIC tick; the driver never consumes a frequency). On the
+trashcan's Haswell the TSC runs ~3x the assumption, so the "one second"
+transfer budget is really ~0.3 s — a device waking from idle that answers
+within a true second still "times out". Part of the stall severity may be
+this constant, not the device. Fix: read the TSC frequency at boot
+(CPUID 0x15/0x16 on Intel, LAPIC-tick cross-check as fallback), convert
+`BUDGET` to real time, and re-measure the stall cadence before touching the
+recovery again. The cache, for the record, is clockless: "clock eviction"
+is the second-chance algorithm, reference bit + hand, no wall time.
