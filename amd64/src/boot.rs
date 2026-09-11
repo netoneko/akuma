@@ -158,12 +158,14 @@ pub fn install_shared_sinks() {
         probed_core_count: crate::smp::online_cpus,
         // The **third** real answer, and the newest (4b batch 4b): the serial
         // console, answered by fd number, for the poll family's readiness map.
-        // Glue reaches a console through a `ProcessChannel` and no process here
-        // has one, so without this an unbound fd 0 polls as
-        // `EPOLLHUP | EPOLLERR` (not in the fd table → `FdState::Missing`) and a
-        // bound one polls as never-readable. Same shape as the two above: glue
-        // reads a hook, and a hook nobody registered is how batch 3a's prefault
-        // gap and 3c's `utc_time_us` gap each looked from ring 3.
+        // Narrowed to the *unbound* spelling once `crate::console` gave a
+        // console process a real `ProcessChannel` — glue's own `Stdin` arm
+        // answers a bound descriptor better than this can, because it registers
+        // a poller and this has no waker. What it still covers is an unbound
+        // fd 0, which is not in the fd table at all and would otherwise poll as
+        // `EPOLLHUP | EPOLLERR` (`FdState::Missing`). Same shape as the two
+        // above: glue reads a hook, and a hook nobody registered is how batch
+        // 3a's prefault gap and 3c's `utc_time_us` gap each looked from ring 3.
         poll_console_state: crate::fd::poll_console_state,
     });
     // The wake effect for the **one** pipe table (4b batch 2b). This target

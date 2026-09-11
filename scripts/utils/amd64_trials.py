@@ -135,7 +135,11 @@ def local_qemu(smp, init, initargs, ssh_port, http_port, timeout_s):
             ["sh", os.path.join(REPO, "amd64", "run.sh")],
             env=env, cwd=REPO, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            # `errors="replace"` for the reason spelled out in `hpbox.ubuntu`:
+            # a console at `SMP=4` interleaves, and a multi-byte sequence torn
+            # across two writers makes strict UTF-8 raise — turning a passing
+            # boot into `ERROR`.
+            text=True, errors="replace", bufsize=1,
         )
 
         state = {"tally_at": None}

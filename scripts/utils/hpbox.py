@@ -42,8 +42,18 @@ AK = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "akuma"]
 
 
 def ubuntu(cmd, timeout=300):
-    """Run `cmd` on the Ubuntu side. Returns (rc, stdout, stderr)."""
-    r = subprocess.run(UB + [cmd], capture_output=True, text=True, timeout=timeout)
+    """Run `cmd` on the Ubuntu side. Returns (rc, stdout, stderr).
+
+    `errors="replace"`, not strict UTF-8. What comes back here is often a guest
+    **console log**, and a console at `SMP=4` interleaves: measured 2026-09-11,
+    Firecracker's own `[anonymous-instance:main]` line landed between the two
+    halves of the banner's em dash and `text=True` raised
+    `UnicodeDecodeError('utf-8', b'\xe2\x80…')`. `amd64_trials.py` reported that
+    as `firecracker smp=4: ERROR` on a boot that had in fact passed 619/0 — a
+    green run read as a failure, which is the expensive direction.
+    """
+    r = subprocess.run(UB + [cmd], capture_output=True, text=True,
+                       errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -53,7 +63,8 @@ def akuma(cmd, timeout=60):
     `reboot -f` never returns cleanly — call it and catch TimeoutExpired, or use
     `reboot_to('ubuntu')`.
     """
-    r = subprocess.run(AK + [cmd], capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(AK + [cmd], capture_output=True, text=True,
+                       errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 

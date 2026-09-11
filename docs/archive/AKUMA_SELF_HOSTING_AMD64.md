@@ -1192,27 +1192,47 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │                              AKUMA_AMD64_EXECVE_INSTALL_IMAGE.md,
    │                              AKUMA_AMD64_SPAWN_ROW_STDIO.md
    ▼
+ [09-11] the console becomes a `ProcessChannel` — **piece A, done**
+   │   The last four `fd.rs` preambles existed for one reason and the file
+   │   said so in five places: no amd64 process had a `ProcessChannel`.
+   │   The prompt read as a deletion; the missing half was a **producer**.
+   │   Glue's `Stdin`/`DevTty` arm is a consumer — it drains `read_stdin`,
+   │   runs the line discipline, echoes through `write`, parks on an
+   │   `input_waker`. All of that already worked here. Nothing filled the
+   │   FIFO: on AArch64 the producer is *userspace* (`sshd` writing
+   │   `/proc/<pid>/fd/0`) and that kernel never reads a console device at
+   │   all, while here the console **is** one, polled destructively from
+   │   inside the reading thread.
+   │   So: `amd64/src/console.rs`, one channel + one `TerminalState` + a
+   │   **pump** — the console's answer to `sshd`'s `bridge_process`, both
+   │   directions in one daemon (`getb` → `write_stdin` → wake; the echo
+   │   glue writes to the channel's stdout FIFO → `serial::putb`).
+   │   **The claim in `fd.rs` had already gone stale, in the dangerous
+   │   direction.** It said folding would answer EOF. It would have
+   │   *parked forever*: the exit channel adopted 09-10 registers through
+   │   `register_channel(task_slot, ..)`, which is exactly where
+   │   `current_channel()` falls back to, and `ProcessChannel::new`
+   │   defaults `is_terminal` to true. Every process here already had a
+   │   channel — the wrong one. `/dev/tty` was *opening* and hanging.
+   │   Deleted: `read_console`, `fd::CONSOLE` (a second line discipline
+   │   for one serial line), `sys_read`'s preamble. Shrunk: `lseek`'s
+   │   `/dev` arm (a tty is not seekable), `poll_console_state` (bound
+   │   descriptors go to glue's arm, which registers a poller, so a parked
+   │   `poll` wakes on the keystroke). Wired: `TCGETS`/`TCSETS` to a real
+   │   `TerminalState` — which is the whole of raw mode.
+   │   `ioctl`'s preamble stays: an **sshd child's** stdin is still a pipe
+   │   with no channel, and that fake tty is what lets `busybox sh` run
+   │   interactively over the bridge.
+   │   Gates: `consoletty` as init on the serial line 41→**54/54**; typed
+   │   input through `busybox cat`, A/B against a HEAD worktree, echo and
+   │   delivery identical; Firecracker 619/0, bare metal 641/0, QEMU
+   │   641/0. **No shared crate changed** — AArch64 untouched.
+   │                        doc: AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md
+   ▼
  [09-11] ═══ YOU ARE HERE ═══
    │
-   └──► two pieces left, independent — **prompt for both:**
+   └──► one piece left — **prompt:**
         `proposals/NEXT_AGENT_AMD64_PROCESSCHANNEL_AND_LIFECYCLE.md`
-
-        **A. the `ProcessChannel`** — do this one first; both of its own
-                 source docs already said so, back when the seam was
-                 still ahead of it. What is left in `fd.rs` is the
-                 console and `/dev` preambles on `read`/`lseek`/`poll`/
-                 `ioctl`, and all four exist for **one** reason: no amd64
-                 process has a `ProcessChannel`. Giving an sshd session's
-                 child one — the deferred `/proc/<pid>/fd/0` +
-                 `delegate_pid` item in `AKUMA_AMD64_4B_FOLD_BATCH2A.md`
-                 § `/proc` — retires them together with the
-                 `poll_console_state` hook amd64 had to register, and
-                 fixes raw mode, `EINTR` on a console read and
-                 `/dev/tty` (`AMD64_CONSOLE_NONBLOCK_READ.md` §6).
-                 **That doc's fourth item, the ssh terminal size, is
-                 closed** — both halves, verified on the metal from a
-                 client pty at three sizes. The boot suite cannot check
-                 any of this: the gate is a session you type in
 
         **B. the lifecycle unification** (the retired seam prompt's §4
                  option 2) — move amd64 onto the never-returns shape. It

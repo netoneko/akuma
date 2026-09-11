@@ -16,6 +16,7 @@
  * Prints PASS/FAIL per line and a tally, in the `lazybuf`/`openflags` house
  * style, then exits non-zero if anything failed.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -148,6 +149,61 @@ int main(void) {
      * a tty?" treats ENOTTY as a clean no and ENOSYS as a broken kernel. */
     errno = 0;
     ck("an unknown ioctl is ENOTTY", ioctl(0, 0x5499, &zero) == -1 && errno == ENOTTY);
+
+    /* ---- 7. raw mode: TCSETS is no longer a no-op ---------------------- */
+    /* `console_ioctl` answered TCGETS from compiled-in literals and took
+     * TCSETS as a no-op, so a program that asked for raw mode still got
+     * line-buffered input with echo and saw its keystrokes only on Enter —
+     * which is every full-screen app and the `ssh` client. The flags live in
+     * the process's `TerminalState` now, and glue's Stdin arm branches on
+     * `is_canonical()` reading that same cell. `t` still holds the cooked
+     * state read back in section 5, so it is also the restore. */
+    struct termios raw = t;
+    cfmakeraw(&raw);
+    ck("TCSETS to raw mode succeeds", ioctl(0, TCSETS, &raw) == 0);
+    struct termios back;
+    memset(&back, 0, sizeof back);
+    ck("TCGETS reads the raw state back", ioctl(0, TCGETS, &back) == 0);
+    ck("ICANON is clear -- TCSETS is not a no-op", (back.c_lflag & ICANON) == 0);
+    ck("ECHO is clear", (back.c_lflag & ECHO) == 0);
+    /* The read path has to keep working in raw mode: no canonical buffer to
+     * drain, so an idle console is still EAGAIN rather than a park. */
+    fl = fcntl(0, F_GETFL);
+    ck("O_NONBLOCK in raw mode", fcntl(0, F_SETFL, fl | O_NONBLOCK) == 0);
+    errno = 0;
+    ck("a raw non-blocking read of an idle console is EAGAIN",
+       read(0, b, sizeof b) == -1 && errno == EAGAIN);
+    ck("clear O_NONBLOCK", fcntl(0, F_SETFL, fl) == 0);
+    ck("TCSETS back to cooked succeeds", ioctl(0, TCSETS, &t) == 0);
+    memset(&back, 0, sizeof back);
+    ioctl(0, TCGETS, &back);
+    ck("and ICANON|ECHO are back",
+       (back.c_lflag & (ICANON | ECHO)) == (ICANON | ECHO));
+
+    /* ---- 8. /dev/tty --------------------------------------------------- */
+    /* glue's `openat` refuses /dev/tty with ENODEV unless the process's
+     * channel reports `is_terminal()`. With no channel at all the open failed;
+     * with only the *exit* channel every process gained after 2026-09-10 it
+     * succeeded and the read then parked forever on a FIFO nothing fills.
+     * Both are wrong and both are silent — a pager opening /dev/tty for keys
+     * either cannot, or hangs. */
+    int tty = open("/dev/tty", O_RDWR);
+    ck("/dev/tty opens", tty >= 0);
+    if (tty >= 0) {
+        ck("and isatty() agrees", isatty(tty) == 1);
+        int tfl = fcntl(tty, F_GETFL);
+        ck("O_NONBLOCK on /dev/tty", fcntl(tty, F_SETFL, tfl | O_NONBLOCK) == 0);
+        errno = 0;
+        ssize_t tn = read(tty, b, sizeof b);
+        ck("a non-blocking read of /dev/tty is EAGAIN, not an instant EOF",
+           tn == -1 && errno == EAGAIN);
+        close(tty);
+    } else {
+        failed += 3;
+        printf("FAIL and isatty() agrees (no fd)\n");
+        printf("FAIL O_NONBLOCK on /dev/tty (no fd)\n");
+        printf("FAIL a non-blocking read of /dev/tty is EAGAIN (no fd)\n");
+    }
 
     printf("consoletty: %d passed, %d FAILED\n", passed, failed);
     fflush(stdout);

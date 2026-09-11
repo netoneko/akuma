@@ -285,13 +285,13 @@ pub fn spawn_pump() -> bool {
     if PUMP_SPAWNED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return true;
     }
-    match crate::sched::spawn_daemon(pump_daemon) {
-        Some(_) => true,
-        None => {
-            PUMP_SPAWNED.store(false, core::sync::atomic::Ordering::Release);
-            false
-        }
+    if crate::sched::spawn_daemon(pump_daemon).is_some() {
+        return true;
     }
+    // The task table was full. Hand the flag back so a later caller can try
+    // again rather than believing a pump it never got.
+    PUMP_SPAWNED.store(false, core::sync::atomic::Ordering::Release);
+    false
 }
 
 /// Is the pump running? Read by `fd::read_console` to tell "the console is idle"

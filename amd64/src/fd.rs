@@ -348,7 +348,8 @@ pub fn is_bound(fd: u64) -> bool {
 /// be `sshd`, which writes to a socket.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ConsoleEnd {
-    /// The keyboard side: `read(2)` reaches [`read_console`].
+    /// The keyboard side: `read(2)` reaches `akuma-syscalls-glue`'s
+    /// `Stdin`/`DevTty` arm, through the channel `crate::console` fills.
     Read,
     /// The screen side: `write(2)` reaches the serial port.
     Write,
@@ -999,34 +1000,41 @@ pub fn sys_close(fd: u64) -> u64 {
     akuma_syscalls_glue::fs::sys_close(fd as u32)
 }
 
-/// `read(fd, buf, len)` — **`akuma-syscalls-glue`'s arm** (4b batch 3a) behind
-/// a three-line preamble.
+/// `read(fd, buf, len)` — **`akuma-syscalls-glue`'s arm** (4b batch 3a), with
+/// no preamble at all since the console channel landed.
 ///
-/// # The console is the arm that stays
+/// # The console was the arm that stayed
 ///
-/// fd 0 here **blocks on the UART**: it spins on the serial port until a byte
-/// arrives, which is what makes an interactive shell possible on a target with
-/// no device interrupts (and is also why nothing else runs while a prompt
-/// waits — the honest cost of polling, and the thing an IOAPIC would fix).
+/// It is worth saying what used to be here, because the reason it had to be is
+/// the shape this series keeps meeting. `read_console` served fd 0 by
+/// **polling the UART from the reading thread itself**, and the preamble that
+/// routed both console spellings to it could not simply be deleted: glue's
+/// `Stdin`/`DevTty` arm reads a `ProcessChannel`, no process on this target
+/// had one, and its `current_channel().is_none()` fallback returns
+/// `Process::read_stdin`'s zero — an EOF on the console a shell is reading
+/// from. `INIT=/bin/sh` on the serial line would have exited at its first
+/// prompt.
 ///
-/// Glue's `Stdin`/`DevTty` arm reads a `ProcessChannel` and, when there is
-/// none, falls back to `Process::read_stdin` — a `StdioBuffer` that on this
-/// target nothing ever fills. Delegating it would answer **0**, i.e. EOF, to
-/// every console read: `INIT=/bin/sh` on the serial line would exit at its
-/// first prompt, and the boot suite's own `read of the console's write end`
-/// check would be asking a different question. So [`console_end`] is asked
-/// first, by **both** spellings — a bound `Stdin`/`Stdout`/`Stderr`
-/// descriptor and an unbound 0/1/2 — exactly as it was.
+/// **That claim went stale before it was removed**, and the staleness was the
+/// worse state of the two: the exit channel adopted 2026-09-10 registers
+/// through `register_channel(task_slot, ..)`, which is exactly where
+/// `current_channel()` falls back to, so every registered process here had a
+/// channel — an *exit* channel, whose stdin FIFO nothing fills and whose
+/// `is_terminal()` is `true`. A read reaching glue's arm would not have
+/// reported EOF; it would have **parked forever**.
 ///
-/// Closing this means giving the shared stdin sink a way to find *this*
-/// target's real input, which is a change to behaviour on both kernels and
-/// waits for a working AArch64 verification loop — the same call batch 2d made
-/// for `/proc/<pid>/fd/0` and `openat`'s three flags.
+/// What closes it is a producer: `crate::console` bridges
+/// `input::getb` into a real `ProcessChannel` and back out again, and
+/// `usermode::register_exec_process` hands that channel to any process whose
+/// fd 0 is a `FileDescriptor::Stdin`. Glue's arm then serves the console with
+/// its own `EAGAIN`, its `EINTR`, its raw/cooked branch and its `EPOLLET` edge
+/// re-arm — four things `read_console` either lacked or had to grow a copy of.
 ///
-/// `/dev/tty` needs no arm of its own: glue's `openat` refuses it with `ENODEV`
-/// here (it requires a terminal `channel`, and no process on this target has
-/// one), so a `DevTty` descriptor cannot exist. The day it can, it belongs in
-/// the guard above.
+/// `/dev/tty` needs no arm of its own either, and now for the right reason:
+/// glue's `openat` gates it on `current_channel().is_some_and(|c|
+/// c.is_terminal())`, which a console process satisfies, so the descriptor
+/// exists and glue's own `Stdin | DevTty` arm serves it — the same channel,
+/// the same line discipline.
 ///
 /// # And the clamp
 ///
@@ -1342,9 +1350,18 @@ fn console_has_input() -> bool {
 ///   `EBADF` — glue separates the two, where this arm's console guard could
 ///   not.
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    // See the header. Ahead of the delegation, and unconditional: it is a
-    // table lookup with no I/O behind it.
-    if dev_node_of(fd).is_some() {
+    // See the header. Ahead of the delegation, and one table lookup with no I/O
+    // behind it.
+    //
+    // **`/dev/tty` is excluded**, and it is the reason this test is no longer
+    // `is_some()`. A terminal is not seekable and Linux answers `ESPIPE` for
+    // one; glue's arm already does exactly that (its `_ =>` after the
+    // `DevNull`/`DevZero` and `File`/`BlockDev` arms). Before the console
+    // channel landed the exclusion was unnecessary because a `DevTty`
+    // descriptor could not exist here — glue's `openat` refused `/dev/tty` with
+    // `ENODEV` for want of a terminal channel. It can exist now, and without
+    // this it would seek to whatever offset it was handed.
+    if dev_node_of(fd).is_some_and(|n| n != "tty") {
         const SEEK_SET: u64 = 0;
         const SEEK_CUR: u64 = 1;
         const SEEK_END: u64 = 2;
@@ -1640,42 +1657,49 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
     ))
 }
 
-/// **This target's by-number console, for the poll family's readiness map** —
+/// **This target's *unbound* console, for the poll family's readiness map** —
 /// `akuma_syscalls_glue::SyscallHooks::poll_console_state`, registered in
 /// `boot::install_shared_sinks`.
 ///
-/// The one thing glue's readiness map cannot answer here, and the same preamble
-/// [`sys_read`] and [`sys_write`] carry for the same reason. Glue reaches the
-/// console through a `ProcessChannel`; **no process on this target has one**
-/// (a spawned child's stdio is a pipe from `bind_stdio`, and init on the serial
-/// line has nothing), so both of the answers glue would otherwise give are
-/// wrong:
+/// # What is left of it
 ///
-/// - A **bound** `Stdin` — what `SharedFdTable::with_stdio` puts at fd 0 for
-///   every registered process, so `INIT=/bin/busybox INITARGS=sh` on the serial
-///   line — hits glue's `Stdin` arm, finds `current_channel() == None`, and
-///   reports never-readable. A line editor polling stdin per keystroke would
-///   never wake.
-/// - An **unbound** 0/1/2 — the boot task, which holds no descriptors at all —
-///   is not in the fd table, so glue reports `FdState::Missing`, which is
-///   `EPOLLHUP | EPOLLERR`: not "nothing yet" but "this fd is finished".
+/// A descriptor **in** the fd table is glue's now. Its readiness arm resolves a
+/// `Stdin`/`DevTty` through `current_channel()`, reports
+/// `has_data: ch.has_stdin_data()` and — the part this hook cannot do —
+/// registers the caller as a poller on that channel, so `write_stdin`'s
+/// `wake_pollers` releases a parked `poll` on the keystroke rather than at the
+/// next 10 ms blocking-poll tick. Since `crate::console` gives a console
+/// process a real channel, that path is simply better than this one, and
+/// [`is_bound`] is the test that hands it over.
 ///
-/// [`console_end`] is the test, so both spellings are covered and a *redirected*
-/// 0/1/2 is not claimed — a spawned child's fd 0 is a `PipeRead` and answers
-/// `None` here, falling through to glue's pipe arm, which is the one with a real
-/// waker.
+/// What glue still cannot answer is an **unbound** 0/1/2 — the boot task, which
+/// holds no descriptors at all. It is not in the fd table, so the map reports
+/// `FdState::Missing`, which is `EPOLLHUP | EPOLLERR`: not "nothing yet" but
+/// "this fd is finished", on a console that is merely idle.
 ///
 /// Returning an [`FdState`](akuma_syscalls_poll::readiness::FdState) rather than
 /// event bits is deliberate: the console is then mapped by the same host-tested
 /// table as every other resource instead of beside it.
 ///
-/// **There is no waker.** `crate::input::has_byte()` is a poll of the UART and
-/// the PS/2 buffer, and nothing on this target rings a bell when a byte lands.
-/// The wait loop's park is capped at the 10 ms blocking-poll interval for
-/// exactly this case, so a keystroke costs up to one interval — against the
-/// pre-fold `yield_now` spin, which noticed sooner and burned a core to do it.
+/// **There is no waker here.** [`console_has_input`] asks the channel (or, before
+/// the pump exists, the UART), and nothing on this target rings a bell when a
+/// byte lands. The wait loop's park is capped at the 10 ms blocking-poll
+/// interval for exactly this case — which is the cost the bound path no longer
+/// pays.
 pub fn poll_console_state(fd: u32) -> Option<akuma_syscalls_poll::readiness::FdState> {
     use akuma_syscalls_poll::readiness::FdState;
+    // **A descriptor in the table is glue's**, and answering for it here would
+    // be worse than not answering: glue's own `Stdin` arm calls
+    // `ch.add_poller(tid)` on the console channel, so `write_stdin`'s
+    // `wake_pollers` releases a parked `poll` on the keystroke itself. This
+    // hook has no waker (its header says so) and a poll through it waits out
+    // the 10 ms blocking-poll interval instead. So the hook now covers only the
+    // spelling glue cannot see — an **unbound** 0/1/2, which is not in the fd
+    // table at all and would otherwise map to `FdState::Missing`, i.e.
+    // `EPOLLHUP | EPOLLERR` on a console that is merely idle.
+    if is_bound(u64::from(fd)) {
+        return None;
+    }
     match console_end(u64::from(fd))? {
         ConsoleEnd::Read => Some(FdState::Stdin { has_data: console_has_input() }),
         // Always writable: the serial port never blocks.
@@ -1734,12 +1758,15 @@ pub fn sys_access(path: u64) -> u64 {
 /// `Stdin`/`Stdout`/`Stderr`); the third is the fd a pager opens on `/dev/tty`
 /// to read keys from, which is never 0/1/2.
 ///
-/// The real fix is to give an amd64 sshd session's child a terminal-capable
-/// `ProcessChannel` — the deferred `/proc/<pid>/fd/0` + `delegate_pid` work in
-/// `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Then this preamble goes away,
-/// `poll`'s `Stdin` arm starts working on its own, and INTR→SIGINT on the
-/// foreground group becomes possible. It is one coherent piece of work and it
-/// is not this batch.
+/// **Half of that has happened and the half that matters here has not.** The
+/// *console* has a terminal-capable `ProcessChannel` now (`crate::console`), so
+/// `poll`'s `Stdin` arm does work on its own for a console process and
+/// [`poll_console_state`] has shrunk to the unbound spelling. An **sshd
+/// session's child** still has none: its stdin is a `PipeRead` from
+/// [`bind_stdio`], which is what the `fd < FIRST_FILE_FD` term above claims, and
+/// giving it one is the deferred `/proc/<pid>/fd/0` + `delegate_pid` work in
+/// `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Until then this preamble stays,
+/// and so does INTR→SIGINT on the foreground group.
 ///
 /// # What glue adds
 ///
@@ -1819,13 +1846,26 @@ fn child_pipe_set_winsize(fd: u64, arg: u64) -> Option<u64> {
 
 /// The terminal subset this target answers itself, for a console fd.
 ///
-/// `None` means "not one of mine" and sends the caller on to glue's arm. The
-/// values are fixed rather than read out of a `TerminalState`, and that is the
-/// difference from glue's versions of the same requests: there is no line
-/// discipline on this target to describe (`SPAWN_FLAG_PTY` is ignored, the shell
-/// does its own editing on raw bytes), so what these report is what a cooked
-/// 80x24 terminal *would* look like — enough that `isatty` says yes and a shell
-/// does not give up.
+/// `None` means "not one of mine" and sends the caller on to glue's arm.
+///
+/// **`TCGETS`/`TCSETS` read and write a real `TerminalState` now.** They were
+/// compiled-in literals and a no-op respectively, for as long as this target
+/// had no line discipline to describe — which is also why the console was
+/// always cooked: a program could ask for raw mode and nothing recorded the
+/// request. `crate::console::default_terminal_state` seeds every process's
+/// state with exactly the values the literals reported, so a program that reads
+/// without setting sees what it always saw, and `stty -a` over ssh still says
+/// `speed 38400 baud` and `susp = ^Z`.
+///
+/// They stay here rather than delegating for a reason that has nothing to do
+/// with the fold: glue's `term::sys_ioctl` writes `c_cc` at byte **16** instead
+/// of 17 (byte 16 is `c_line`), so every control character it reports is one
+/// off. See batch 4b's § "found, not fixed".
+///
+/// The rest are still fixed answers, and the reason is unchanged: a spawned
+/// child's stdin is a pipe with no channel behind it, so what these report is
+/// what a cooked terminal *would* look like — enough that `isatty` says yes and
+/// a shell does not give up.
 fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
     // x86_64 ioctl request numbers (arch-generic for these).
     const TCGETS: u64 = 0x5401;
@@ -1870,15 +1910,12 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
             // rather than zeroes, and without building a `TerminalState` to do
             // it.
             let (iflag, oflag, cflag, lflag, cc) =
-                match akuma_exec::process::current_terminal_state() {
-                    Some(lock) => {
-                        let ts = lock.lock();
-                        (ts.iflag, ts.oflag, ts.cflag, ts.lflag, ts.cc)
-                    }
-                    None => {
-                        let (i, o, c, l) = crate::console::DEFAULT_FLAGS;
-                        (i, o, c, l, crate::console::default_cc())
-                    }
+                if let Some(lock) = akuma_exec::process::current_terminal_state() {
+                    let ts = lock.lock();
+                    (ts.iflag, ts.oflag, ts.cflag, ts.lflag, ts.cc)
+                } else {
+                    let (iflag, oflag, cflag, lflag) = crate::console::DEFAULT_FLAGS;
+                    (iflag, oflag, cflag, lflag, crate::console::default_cc())
                 };
             put(&mut t, 0, iflag);
             put(&mut t, 4, oflag);
@@ -2664,13 +2701,12 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         errno::EINVAL,
     );
 
-    // **The console, which is the whole reason `poll` needed a preamble** —
-    // see [`poll_console_state`]. Glue resolves an fd through the process
-    // table and reaches a console through a `ProcessChannel`; this target has
-    // no channel on any process, so without the hook fd 0 polls as
-    // `POLLHUP|POLLERR` (unbound: not in the table at all) or as
-    // never-readable (bound `Stdin`, `current_channel() == None`) — either way
-    // a shell's keystroke poll never wakes.
+    // **The console.** The boot row registered above holds 0/1/2, so this is
+    // the *bound* spelling and glue's own readiness arm answers it, through
+    // the console `ProcessChannel` [`boot_row_register`] gave the row. The
+    // unbound spelling — no fd table at all, which would otherwise map to
+    // `FdState::Missing`, i.e. `POLLHUP|POLLERR` on an idle console — is what
+    // [`poll_console_state`] is still registered for.
     //
     // With no key pressed, the read end is **not** ready and the screen end
     // **is** writable. A zero timeout is what keeps this from blocking: an
@@ -3159,20 +3195,27 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
 /// **`O_NONBLOCK` on the console**, which has to run after the console exists.
 ///
 /// Separate from [`smoke_test`] for one mechanical reason: `boot::self_tests`
-/// calls `wire_console_and_syscalls()` — and therefore [`init_console`] — *after*
-/// `fd::smoke_test`, so `CONSOLE` is still `None` there and [`read_console`]
-/// returns 0 (no console, EOF) before it can reach any flag test. Written as a
-/// check inside `smoke_test` first, this reported `got 0x0 want -EAGAIN` and the
-/// missing console was the whole of it.
+/// calls `wire_console_and_syscalls()` — and therefore `console::init()` —
+/// *after* `fd::smoke_test`, so there is no console `ProcessChannel` there and
+/// a read of fd 0 answers 0 (no console, EOF) before it can reach any flag
+/// test. Written as a check inside `smoke_test` first, this reported
+/// `got 0x0 want -EAGAIN` and the missing console was the whole of it.
+///
+/// That failure came back, identically, the moment `read_console` was deleted
+/// and glue's `Stdin` arm took over — for the same reason one layer down: the
+/// boot row's `Stdin` resolved to a process with no channel. See
+/// [`boot_row_register`], which now hands the row the console's.
 pub fn console_nonblock_test(t: &mut Suite) {
     // Two claims, and the first is the one that was mis-diagnosed as two
     // disjoint flag stores. `fcntl` is glue's arm (4b batch 3c) and writes
     // `Process::set_nonblock`; [`is_nonblocking`] reads the same `fds.nonblock`
     // set through [`cur_table`]. One store, and this proves the two readers see
-    // it. The real defect was that [`read_console`] — which serves fd 0 here
-    // and only here, because a registered process's fd 0 is a
-    // `FileDescriptor::Stdin` and [`sys_read`]'s preamble claims it before glue
-    // sees it — had no flag test at all.
+    // it. The real defect was that `read_console` — which served fd 0 here and
+    // only here, because a registered process's fd 0 is a
+    // `FileDescriptor::Stdin` and [`sys_read`]'s preamble claimed it before glue
+    // saw it — had no flag test at all. There is no preamble and no
+    // `read_console` any more: glue's `Stdin` arm serves this read and has
+    // honoured `O_NONBLOCK` since before the fold, which is the point.
     //
     // The `EAGAIN` check assumes an idle console, which is true for all three
     // rigs during the suite (QEMU's serial is fed from `/dev/null`, and the
