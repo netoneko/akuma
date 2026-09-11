@@ -3,7 +3,7 @@ use spinning_top::Spinlock;
 
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
 use crate::process::table;
-use crate::process::channel::{remove_channel, get_channel};
+use crate::process::channel::remove_channel;
 use crate::process::children::lookup_process_shared;
 use crate::process::cleanup_process_fds;
 use crate::process::lifecycle::LifecycleGuard;
@@ -98,9 +98,12 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Set the interrupt flag FIRST - this allows blocked syscalls (like accept())
     // to detect the interrupt and properly abort their sockets before we clean up.
     if let Some(tid) = thread_id {
-        if let Some(channel) = get_channel(tid) {
-            channel.set_interrupted();
-        }
+        // `interrupt_thread`, not `get_channel(tid).set_interrupted()` — which is
+        // what this was until 2026-09-11, and which set only half of what an
+        // interrupt is. `is_current_interrupted` reads a per-thread bit now
+        // (`akuma_threading::THREAD_INTERRUPTED`); a site that writes the channel
+        // alone raises a flag the blocked syscall does not look at.
+        crate::process::interrupt_thread(tid);
 
         // Yield a few times to give the blocked thread a chance to detect the interrupt.
         for _ in 0..5 {
@@ -160,9 +163,8 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     let thread_id = proc.thread_id;
 
     if let Some(tid) = thread_id {
-        if let Some(channel) = get_channel(tid) {
-            channel.set_interrupted();
-        }
+        // Both halves; see the sibling call in `kill_process`.
+        crate::process::interrupt_thread(tid);
         for _ in 0..5 {
             threading::yield_now();
         }

@@ -110,13 +110,15 @@ pub fn check_itimers() {
         if deadline > 0 && now >= deadline {
             // Fire SIGALRM
             if wants_force_interrupt(tid) {
+                // `interrupt_thread` alone. It used to be followed by a second
+                // write to `proc.channel`'s flag, because the reader preferred
+                // `Process::channel` over the per-thread registry — a belt-and-
+                // braces that had to exist while the reader looked in the wrong
+                // place, and that wrote a flag an entire `fork` tree shares.
+                // `is_current_interrupted` reads a per-thread bit now
+                // (`akuma_threading::THREAD_INTERRUPTED`), which `interrupt_thread`
+                // sets, so the second write is both unnecessary and too wide.
                 akuma_exec::process::interrupt_thread(tid);
-                if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid)
-                    && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
-                    && let Some(ch) = proc.channel.as_ref()
-                {
-                    ch.set_interrupted();
-                }
             }
             akuma_exec::threading::pend_signal_for_thread(tid, 14);
             // Re-arm if periodic, else disarm

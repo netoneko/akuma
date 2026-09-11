@@ -1211,6 +1211,55 @@ static PENDING_KILL: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// **"This thread's blocking syscall should return `EINTR`."** One bit per
+/// thread, set by `akuma_exec::process::interrupt_thread` and consumed by
+/// `is_current_interrupted`.
+///
+/// # Why it is an array and not the `ProcessChannel` flag it mirrors
+///
+/// `is_current_interrupted` runs in the syscall prologue — **every syscall, both
+/// kernels** — and the flag it read lived in a channel reached through
+/// `get_channel(tid)`, which is `with_irqs_disabled(|| PROCESS_CHANNELS.lock()
+/// .get(&tid).cloned())`: an IRQ mask, a spinlock, a `BTreeMap` lookup and an
+/// `Arc` clone-and-drop. That was affordable only while the read had a fast path
+/// in front of it (`Process::channel`, one field load), and that fast path was
+/// *wrong* — it reads an object a whole `fork` tree shares, where the writer
+/// writes per-thread, so an interrupt aimed at one thread was invisible to it.
+///
+/// Fixing the reader by dropping to the registry made every syscall pay the
+/// lock. Measured on the HP box, 2026-09-11: `fdprobe` stopped finishing inside
+/// its 10 000-yield budget and the bare-metal suite went 665/0 -> 663/3, while
+/// QEMU and Firecracker both stayed green — a cost regression that only real
+/// silicon under SMP=4 was slow enough to show. This is the third shape and the
+/// first correct one: per-thread like the writer, one relaxed load like
+/// [`PENDING_KILL`] beside it.
+///
+/// Scrubbed with the rest of a slot's signal state in [`scrub_thread_slot`], so
+/// a recycled tid cannot inherit an interrupt aimed at its predecessor.
+static THREAD_INTERRUPTED: [AtomicBool; MAX_THREADS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_THREADS]
+};
+
+/// Raise [`THREAD_INTERRUPTED`] for `tid`. The bit half of
+/// `akuma_exec::process::interrupt_thread`, which also sets the channel's own
+/// flag for the readers that hold a channel directly.
+pub fn set_thread_interrupted(tid: usize) {
+    if tid < MAX_THREADS {
+        THREAD_INTERRUPTED[tid].store(true, Ordering::Release);
+    }
+}
+
+/// Atomically take (clear) `tid`'s interrupt bit.
+///
+/// **Consuming, like the flag it replaces.** `ProcessChannel::is_interrupted` is
+/// a `swap(false)`, and the syscall prologue calls it once per excursion: an
+/// interrupt is delivered to exactly one syscall and must not make every later
+/// one return `EINTR` too.
+pub fn take_thread_interrupted(tid: usize) -> bool {
+    tid < MAX_THREADS && THREAD_INTERRUPTED[tid].swap(false, Ordering::AcqRel)
+}
+
 /// Arm the restore-sigmask for the current thread: the next delivered signal's
 /// frame saves `saved` as `uc_sigmask` (so `sigreturn` restores it).
 pub fn set_restore_sigmask(saved: u64) {
@@ -1422,6 +1471,7 @@ fn scrub_thread_slot(i: usize) {
     // *not* delivered, which reads as a hang rather than an error.
     PENDING_SIGNALS[i].store(0, Ordering::Release);
     PENDING_KILL[i].store(false, Ordering::Release);
+    THREAD_INTERRUPTED[i].store(false, Ordering::Release);
     THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
     THREAD_RESTORE_SIGMASK[i].store(0, Ordering::Release);
     THREAD_RESTORE_SIGMASK_PENDING[i].store(false, Ordering::Release);
@@ -2291,6 +2341,9 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // Clear a stale deferred-kill request so a recycled slot's next occupant
             // is not wrongly self-terminated at its first EL1→EL0 boundary.
             PENDING_KILL[i].store(false, Ordering::Release);
+            // Same for a stale interrupt: it would make the new occupant's first
+            // blocking syscall return EINTR for a signal aimed at a dead thread.
+            THREAD_INTERRUPTED[i].store(false, Ordering::Release);
             // Reset the per-thread preemption-disable records. A thread that died with
             // a disable outstanding (e.g. a lifecycle op that never released — see
             // process/lifecycle.rs "No-return callers") must not poison the slot's next

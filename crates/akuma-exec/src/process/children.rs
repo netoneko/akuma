@@ -250,36 +250,23 @@ pub fn current_channel() -> Option<Arc<ProcessChannel>> {
 /// Called by syscall handlers to detect interrupt signal.
 /// Returns true if the process should terminate.
 pub fn is_current_interrupted() -> bool {
-    // **The per-thread registry first, because that is where the flag is
-    // written.** [`interrupt_thread`] sets it there and nowhere else, for the
-    // reason its own doc gives at length: `Process::inherit_from` clones
-    // `channel`, so `Process::channel` is shared by a whole `fork` tree and a
-    // *per-process* flag cannot live in it.
-    //
-    // This read used to prefer `Process::channel`, and the two agreed for as
-    // long as they were the same object — which they are for an AArch64 spawn
-    // (`spawn.rs` registers the I/O channel under the tid) and were on amd64
-    // only because a session child had no `Process::channel` at all, so the
-    // fallback ran. The moment amd64's spawned children got one (2026-09-11),
-    // a `fork` child inside an `ssh` session had the session's channel in
-    // `Process::channel` and its **own** exit channel under its tid — and the
-    // flag `deliver_signal` had just set became invisible. Observable: `^C` on
-    // `sh -c 'sleep 60; echo X'` killed the sleep but the shell went on to print
-    // `X`, where before it aborted the list.
-    //
-    // The registry is the right source on every shape, not merely on that one:
-    // `sys_reattach` (`box grab`) points a target's `Process::channel` at the
-    // *grabber's*, and the flag still lands on the target's own tid.
-    //
-    // `Process::channel` stays as the fallback for a caller with no tid
-    // registration at all, which is what the kernel-thread path was.
-    let thread_id = crate::threading::current_thread_id();
-    if let Some(ch) = get_channel(thread_id) {
-        return ch.is_interrupted();
+    // **One relaxed load in the common case**, and that is the whole design.
+    // This runs in the syscall prologue of both kernels, so what it must *not*
+    // do is take a lock — see `akuma_threading::THREAD_INTERRUPTED` for the two
+    // earlier shapes and what the second one cost on real silicon.
+    let tid = crate::threading::current_thread_id();
+    if !crate::threading::take_thread_interrupted(tid) {
+        return false;
     }
-    current_process_shared()
-        .and_then(|p| p.channel.as_ref().map(|ch| ch.is_interrupted()))
-        .unwrap_or(false)
+    // Interrupted. Now — and only now, off the hot path — consume the channel's
+    // copy as well, so a holder that reads its own channel directly
+    // (`process/exec.rs`'s exec-wait) does not see a flag this call has already
+    // answered. That equivalence is not new: on AArch64 the two *were* one
+    // object for a spawned process, and this keeps them behaving as one.
+    if let Some(ch) = get_channel(tid) {
+        let _ = ch.is_interrupted();
+    }
+    true
 }
 
 /// Interrupt a process by thread ID
@@ -331,6 +318,12 @@ pub fn is_current_interrupted() -> bool {
 /// `is_current_interrupted` a per-**thread** flag that is not a shared `Arc`,
 /// and not paying a `get_channel` map lookup on every syscall to find it.
 pub fn interrupt_thread(thread_id: usize) {
+    // The bit is what [`is_current_interrupted`] reads; the channel flag is what
+    // a holder of that channel reads (`process/exec.rs`). Both, because they
+    // answer different questions for different readers — and neither may be
+    // dropped in favour of the other, which is what the two paragraphs above
+    // are about.
+    crate::threading::set_thread_interrupted(thread_id);
     if let Some(channel) = get_channel(thread_id) {
         channel.set_interrupted();
     }

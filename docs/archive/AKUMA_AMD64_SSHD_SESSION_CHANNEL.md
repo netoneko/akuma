@@ -223,13 +223,18 @@ reader had the same problem from the other end.
 | gate | before | after |
 |---|---|---|
 | QEMU/TCG `SMP=4` | 665 / 0 | **666 / 0** |
-| Firecracker/KVM `SMP=4` | 643 / 0 | **644 / 0** |
+| Firecracker/KVM `SMP=4` | 643 / 0 | **644 / 0** (before the interrupt-bit fix) |
 | QEMU/TCG `SMP=1` | — | **656 / 0** |
-| `amd64_ring3_check.py --smp 1 -n 20` | OK | **OK** (heap drift +37 kB / 8192) |
+| `amd64_ring3_check.py --smp 1 -n 20` | OK | **OK** — heap drift **+5 kB**, down from +37 |
 | `amd64_mem_trials.py --local-only` | 10 / 10 | **10 / 10** |
 | AArch64 boot suite (`MEMORY=2048M INSTANCE=3`) | 307 / 0 | **307 / 0** |
 | host tests (`cargo test`) | 1375 / 0 | **1375 / 0** |
 | clippy — amd64 `--release`, `--release --features no-tests`, and AArch64 | clean | **clean** |
+| **bare metal** (HP box, `root=/dev/sda1`) | 665 / 0 | **663 / 3** before the fix; **re-run pending** |
+
+**The bare-metal re-run of the fix is outstanding** and is the one that matters:
+it is the only gate that measured the regression at all. Everything above it was
+green through both the broken and the fixed tree.
 
 The `+1` on the two boot suites is the new `spawn:` check that the child has an
 I/O channel behind its stdio descriptors. That one is not decoration: glue's
@@ -237,6 +242,82 @@ I/O channel behind its stdio descriptors. That one is not decoration: glue's
 `None`, and that buffer is never filled here — a reader would **park**, not
 report EOF (`AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3, where a comment claiming
 the opposite cost a boot).
+
+### Bare metal — and the regression only it could see
+
+The box runs it: an `ssh` session works and `dmesg` reads back over one. The
+suite, however, went **665 / 0 -> 663 / 3**, and the three failures are one
+symptom:
+
+```
+fdprobe: every syscall claim held   got 0xffffffffffffffff want 0xfff
+fdprobe: teardown leaks nothing     got 0x8c67e want 0x8c708
+spawn:   teardown leaks nothing     got 0x8c708 want 0x8c67e
+```
+
+`0xffff…ffff` is `u64::MAX`, the sentinel meaning `EXIT_STATUS` was **never
+written** — `fdprobe` hit its `spins < 10_000` bound rather than failing a
+claim (which is also why no per-claim breakdown printed: that branch excludes
+`u64::MAX`). The two leak numbers are complementary — the same 138 pages leave
+during `fdprobe` and come back during `spawn` — which is deferred reclaim, not
+a leak. Deterministic across two boots. `75041b73` on the same disk minutes
+later: both `fdprobe` checks `[OK]`, windowed FAIL count **0**. So it was mine.
+
+**The clock was the first hypothesis and it is ruled out.** The tick is
+calibrated against the PIT and the boot prints the measurement:
+
+```
+lapic: calibrated vs PIT: 62361 counts per 10000us (99 MHz)
+lapic: ticks per 50ms (expect 5) 5
+```
+
+Exactly 5, not merely inside `clock_rate_check`'s ±2x band — worth saying,
+because that band would pass a clock running twice as fast, so the check's
+`[OK]` is not evidence and the raw note is.
+
+**The cause was §4's own fix, and the cost of it.** `is_current_interrupted`
+runs in the syscall prologue of both kernels. Moving it off `Process::channel`
+and onto the per-thread registry made it correct and made every syscall pay
+`get_channel`, which is
+
+```rust
+with_irqs_disabled(|| PROCESS_CHANNELS.lock().get(&tid).cloned())
+```
+
+— an IRQ mask, a spinlock, a `BTreeMap` lookup and an `Arc` clone-and-drop,
+where `has_pending_kill` right beside it is one array load. Isolated on the
+metal rather than argued: `e414f41d` plus a one-line revert of **only** that
+ordering, staged and booted, and all three failures disappeared.
+
+**The third shape is the correct one.** The flag is now a per-thread bit
+(`akuma_threading::THREAD_INTERRUPTED`) beside `PENDING_KILL`, scrubbed with the
+rest of a slot's signal state so a recycled tid cannot inherit it.
+`interrupt_thread` sets the bit *and* the channel flag — different readers, both
+needed — and the three sites that used to set the channel alone
+(`kill_process`, `kill_process_with_signal`, `check_itimers`) go through
+`interrupt_thread` now, so no writer can raise half an interrupt.
+`check_itimers` also loses a second write to `Process::channel` that existed
+only because the reader looked in the wrong place, and which wrote a flag an
+entire `fork` tree shares.
+
+The prologue is now **cheaper than before any of this**: it resolves no identity
+at all. The AArch64 boot suite said so before a human did — `akuma_get_version`
+pins a `FastPath::Leaf` syscall at exactly 2 identity resolutions, both of them
+`is_current_interrupted -> current_process_shared`, with a comment saying that
+if the count ever moves "this trips and somebody decides on purpose". It tripped
+at **0**, on the first boot after the fix. `LEAF_EXPECTED_RESOLVES` is 0 now.
+
+### Two things this bare-metal round cost, both rig rather than kernel
+
+- **A boot with no `root=` cannot run a command.** The RAM image's `/bin/sh` is
+  a hard link to a busybox `mkdisk.sh` fetches with `curl`, behind
+  `if [ -f "$BB" ]` — absent on that box, so every applet is silently missing
+  and `sshd` answers `failed to spawn '/bin/sh' for exec`. The machine is up and
+  authenticating; it simply has nothing to run, and no way to be told to reboot.
+  Every recorded bare-metal baseline uses `root=/dev/sda1` for this reason.
+- **`dmesg` wraps.** 50 `xhci` lines after boot are enough to push the suite's
+  own tally out of the ring, so read it early or read `FAILED:` lines, which
+  survive longer than the summary that follows them.
 
 An earlier ring-3 run reported FAILED and it is worth recording that it did not
 mean anything: its *pre-workload* sample came back unparsed — both `free`'s

@@ -20100,21 +20100,28 @@ fn test_akuma_get_version() {
     // into a direct probe for "how many times did this excursion ask who am I?".
     //
     // `akuma_get_version` is `FastPath::Leaf`, so the prologue's resolve, both
-    // `Process` stamps and the epilogue's re-resolve are all skipped. What is
-    // NOT skipped is `is_current_interrupted()`, which runs between them and is
-    // deliberately outside the fast path: it decides whether a killed process
-    // keeps executing syscalls, and moving a signal check for 2 loads is not a
-    // trade to make casually. On a miss it costs exactly two resolutions, and
-    // the count is a mechanism, not an observation to be fitted:
+    // `Process` stamps and the epilogue's re-resolve are all skipped.
+    // `is_current_interrupted()` still runs between them — it decides whether a
+    // killed process keeps executing syscalls, and that is not a check to move
+    // for a few loads — but it **no longer resolves an identity**, so the leaf's
+    // expected count is now **zero**.
+    //
+    // It was 2, and the mechanism was stated here rather than fitted:
     //
     //   is_current_interrupted -> current_process_shared
     //       -> current_thread_own_process            = miss 1
     //       -> lookup_process_shared(current_pid()?)
     //            -> current_pid -> current_thread_own_process = miss 2
     //
-    // So the leaf's expected count is 2, and pinning it is the point: if the
-    // interrupted check ever joins the fast path, or a new identity consumer
-    // creeps into the prologue, this trips and somebody decides on purpose.
+    // Both are gone as of 2026-09-11: the interrupt flag moved to a per-thread
+    // bit (`akuma_threading::THREAD_INTERRUPTED`) that is one relaxed load,
+    // reached from `current_thread_id()` and not from a process. Which is
+    // exactly what this check exists to surface — "if a new identity consumer
+    // creeps into the prologue, this trips and somebody decides on purpose", and
+    // it tripped in the other direction, on a boot, the same day the prologue
+    // got cheaper. See that static for why the flag moved at all (a
+    // `get_channel` lock on every syscall cost the bare-metal suite 665/0 ->
+    // 663/3, and QEMU could not see it).
     //
     // `getpid` is the control, and it is load-bearing: without it, a fast path
     // that had silently stopped being taken would still satisfy a bare
@@ -20126,7 +20133,7 @@ fn test_akuma_get_version() {
     let fb1 = akuma_exec::process::table::IDENTITY_FALLBACKS.load(O::Relaxed);
     let _ = handle_syscall(nr::GETPID, &[0, 0, 0, 0, 0, 0]);
     let fb_full = akuma_exec::process::table::IDENTITY_FALLBACKS.load(O::Relaxed) - fb1;
-    const LEAF_EXPECTED_RESOLVES: u64 = 2; // is_current_interrupted, and only it
+    const LEAF_EXPECTED_RESOLVES: u64 = 0; // nothing in the prologue resolves an identity
     let leaf_resolved_nothing = fb_leaf == LEAF_EXPECTED_RESOLVES;
     let control_did_resolve = fb_full > fb_leaf;
 
