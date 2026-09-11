@@ -18,8 +18,16 @@
 //! | `park_until` | yield in a loop until the deadline | no WAITING state to enter |
 //! | `current_waker` | a no-op waker | nothing polls a future; the loop re-checks |
 //! | `wake_netpoll` | no-op | there is no parked core to ring a doorbell at |
-//! | `is_current_interrupted` | `false` | no signals |
+//! | `is_current_interrupted` | `false` | see below |
 //! | `current_box_id` | `0` | no containers |
+//!
+//! `is_current_interrupted` read "no signals" until 2026-09-11 and that reason
+//! expired: this target delivers signals now (`amd64/src/signal.rs`). The hook
+//! is still `false`, and it is now a *narrower* statement — the network stack's
+//! own waits are not interruptible here, where `akuma-syscalls-glue`'s blocking
+//! arms ask `should_interrupt_blocking_syscall` and are. Wiring it is the next
+//! step for `EINTR` out of a socket read, and it is not free: the hook is read
+//! from inside `smoltcp`'s poll loop.
 //!
 //! Collapsing them is correct *for this machine* and would be wrong the moment
 //! it grows a second core or an IOAPIC. They are written out one by one rather

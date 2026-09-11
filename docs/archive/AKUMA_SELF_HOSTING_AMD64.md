@@ -6,8 +6,8 @@
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** plan, with measurements taken 2026-09-07 and the walk kept current
-in the dated boxes below (last updated 2026-09-10, after 4b's **last** fold
-batch — `poll`/`select`/`ioctl` — and the console `O_NONBLOCK` fix).
+in the dated boxes below (last updated 2026-09-11, after signal delivery and
+INTR→SIGINT — `AKUMA_AMD64_SIGNAL_DELIVERY.md`).
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
 > `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
@@ -1270,53 +1270,85 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   cycle.
    │                        doc: AKUMA_AMD64_EXECVE_RETURNS.md
    ▼
+ [09-11] signals arrive — **items 1 and 2, done**
+   │   Every half of signals except one already worked here:
+   │   `akuma-threading` held the pending set, the mask, the sigaltstack;
+   │   glue had `rt_sigaction`/`kill`/`tkill`/`tgkill`; `deliver_signal`
+   │   pended on a thread group; `write_to_process_stdin` held the ISIG
+   │   branch. **What no amd64 code did was look.** So `kill(2)` would
+   │   have returned 0 and done nothing — `deliver_signal` returns `true`
+   │   whether or not it reached a thread.
+   │   So: `amd64/src/signal.rs`, the x86_64 counterpart to
+   │   `akuma_exceptions::try_deliver_signal` — a syscall-return epilogue,
+   │   an `rt_sigframe` on the user stack, and `rt_sigreturn`. **One new
+   │   return path for both directions** (`.Lsig_return`, `UserCtx` +3
+   │   fields, the hand-indexed assertion block 6 → 9): entering a handler
+   │   and leaving one are the same operation — install a register file and
+   ▼   `sysret` into it — differing only in who filled it.
+   │   Termination goes through **this target's own exit** (`leave`, into
+   │   `run_process`'s epilogue), not glue's `sys_exit_group`, which stops
+   │   short of the `SPAWN` row; that is also why `tkill`/`tgkill` are local
+   │   arms, since glue's decides fatality inline. The status travels in
+   │   **`%rax`**, not `EXIT_STATUS` — `run_process` overwrites the latter.
+   │   The console pump now calls `write_to_process_stdin`, so `^C` is a
+   │   `SIGINT` broadcast and not a `0x03` byte. `foreground_pgid` needed
+   │   no plumbing: it defaults to 1, `fork` propagates `pgid`, and
+   │   `kill_process_group` excludes the leader — so the shell survives.
+   │   **Both §7 prerequisites were real**, and two more were not on the
+   ▼   list. `Process::thread_id` (a): filled, and the old reason had
+   │   expired twice over — the task slot *is* the threading tid since A1,
+   │   and `fork`/`clone` children had it set all along through the shared
+   │   publish. `interrupt_thread` (b): fixed in `akuma-exec` at the root,
+   │   because `is_current_interrupted` reads `Process::channel` **first**
+   │   and the flag was going to the exit channel. Plus:
+   │   **`set_tid_address` answered a literal `1`** — musl seeds
+   │   `pthread_self()->tid` from it and `raise` is `tkill(that, sig)`, so
+   │   every self-signal in every program addressed thread slot 1 — and
+   │   **`gettid` answered the pid** for a main thread, a second namespace
+   ▼   on one target. Both folded to glue; the fold deleted `current_tid`
+   │   and `Thread::tid`.
+   │   One trap cost a boot: the first `sys_tkill` also called
+   │   `interrupt_thread`, which is the **Ctrl-C sledgehammer** (glue's
+   │   prologue reads it on every syscall, zombies the process and returns
+   │   `EINTR`). musl's `raise` is block-all/`tgkill`/restore, so the
+   │   `EINTR` landed on the **restore** and the signal stayed blocked
+   │   forever.
+   │   Gates: `sigprobe.c`, 8 rungs, in `amd64_ring3_check` — and the same
+   │   static binary passes 8/8 on **real Linux**, which is what says the
+   │   probe is right before the kernel is judged by it. QEMU 661/0,
+   │   Firecracker 639/0 (both +20, `signal:`), ring-3 check 40/40 OK,
+   │   `^C` on the serial console kills `cat` and leaves the shell.
+   │                        doc: AKUMA_AMD64_SIGNAL_DELIVERY.md
+   ▼
  [09-11] ═══ YOU ARE HERE ═══
    │
-   └──► **C1 is done.** Both pieces of
-        `proposals/NEXT_AGENT_AMD64_PROCESSCHANNEL_AND_LIFECYCLE.md`
-        landed the same day.
+   └──► **C1 is done**, and items 1 and 2 of what piece A left are done
+        with it. `kill`, `raise`, `abort`, `pthread`-style handlers,
+        `EINTR` out of a blocking read and `^C` on the console all work.
 
-        Owed, and cheap: the **bare-metal number for piece B**, on the
-        next boot after someone power-cycles the box.
+        What is left, in the order it argues for itself:
 
-        What piece A left, in the order it argues for itself:
-
-        1. **signal delivery**, which is now the only thing between this
-           target and `EINTR` on a console read — glue's `Stdin` arm
-           already asks `should_interrupt_blocking_syscall`, so the gap
-           moved out of `fd.rs` and into the signal path.
-        2. **INTR → SIGINT on the foreground group.** The pump delivers
-           `^C` as a byte; the shared route that turns it into a signal
-           is `write_to_process_stdin`'s ISIG handling — so the pump
-           should call *that* rather than `write_stdin` directly, and
-           the ISIG branch, the `foreground_pgid` broadcast and the wake
-           all arrive for free. It needs a pid, which a tracked "the
-           console's process" supplies (pid 1 is always console-attached).
-           **Two prerequisites, both read off the tree 2026-09-11 and
-           both silent if missed** — this is occurrence seven and eight
-           of "the shared code reads something amd64 never populated":
-             a. `deliver_signal` collects its target tids from
-                `Process::thread_id`, and every amd64 process registers
-                `thread_id: None` **deliberately** (`register_exec_process`
-                says why: this target's task lifecycle is `sched.rs`'s and
-                identity comes from `THREAD_PID_MAP`). So `all_tids` is
-                empty, nothing is pended, nothing is woken — and
-                `deliver_signal` still returns `true`, so `sys_kill` would
-                report success. Populating it is not free: it is what puts
-                `unregister_process`'s thread-termination arm back in this
-                target's path.
-             b. `interrupt_thread(tid)` sets the flag on
-                `get_channel(tid)` — which here is the **exit** channel —
-                while `is_current_interrupted()` reads `Process::channel`
-                first, which for a console process is the **console**
-                channel. Two channels per process is this target's own
-                shape (`AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3), and
-                the flag would land on the one nobody reads.
-        3. **an sshd session's child's `ProcessChannel`** — the deferred
+        1. **Delivery on the timer tick's `iretq`.** Today a signal is
+           only looked at on a `syscall` return, so a compute-bound
+           program with no syscalls is unreachable by `^C` — the same
+           gap `thread::should_leave_now` already documents for
+           `exit_group`, and closing one closes both.
+        2. **`akuma-net`'s `is_current_interrupted` hook is still
+           `false`**, so a socket read is not interruptible where glue's
+           other blocking arms are. The module header's reason used to be
+           "no signals"; it is narrower now, and the hook is read from
+           inside `smoltcp`'s poll loop, so wiring it is a measurement
+           rather than a one-liner.
+        3. **`getpid` still answers a literal `1`.** musl's
+           `pthread_kill` is `tgkill(self->pid, tid, sig)`, so it fails
+           the `tgid` check for any process but `init`. `raise` is
+           unaffected only by accident (an unresolved tid makes `tgkill`
+           defer to `tkill`), which is why the probe passes.
+        4. **an sshd session's child's `ProcessChannel`** — the deferred
            `/proc/<pid>/fd/0` + `delegate_pid` item, still the last
-           reason `ioctl` carries a fake-tty preamble, and what would
-           make a full-screen program work over ssh rather than only on
-           the serial line.
+           reason `ioctl` carries a fake-tty preamble, what would make a
+           full-screen program work over ssh rather than only on the
+           serial line, and what `^C` over ssh needs.
 
 ```
 

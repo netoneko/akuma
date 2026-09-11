@@ -406,6 +406,11 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     sched::user_context_smoke_test(t);
 
     crate::pipe::smoke_test(t);
+    // The signal ABI and its two filters. Beside `pipe` rather than with the
+    // ring-3 tests below because it needs no process and no ring-3 excursion —
+    // it is structure layout and two pure functions. The half that needs a real
+    // musl program is `/probes/sigprobe`, run by `amd64_ring3_check.py`.
+    crate::signal::smoke_test(t);
     reboot::smoke_test(t);
 
     // How many failures were xHCI's, reported rather than acted on: an

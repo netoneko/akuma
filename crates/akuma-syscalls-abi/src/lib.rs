@@ -300,10 +300,34 @@ syscall_table! {
     Getsid     => GETSID     = 124, nr::GETSID;
 
     // ── signals ────────────────────────────────────────────────────────────
-    // Named here because both kernels dispatch the numbers. The amd64 kernel
-    // has no delivery at all (A2); that divergence lives at its arms.
+    // Named here because both kernels dispatch the numbers. Every row below
+    // has a **different** number on the two architectures, and three of the
+    // crossings are live wrong answers rather than misses: x86_64 15
+    // (`rt_sigreturn`) is asm-generic `nanosleep`, x86_64 128
+    // (`rt_sigtimedwait`) is asm-generic `msgctl`, and x86_64 130
+    // (`rt_sigsuspend`) is asm-generic `tkill`. A signal table is exactly where
+    // a transposed number is least visible, because the caller is a libc
+    // start-up path that ignores the result.
     RtSigaction   => RT_SIGACTION   = 13, nr::RT_SIGACTION;
     RtSigprocmask => RT_SIGPROCMASK = 14, nr::RT_SIGPROCMASK;
+    /// x86_64 15, asm-generic 139. The amd64 kernel serves it locally (the
+    /// register file it restores is `UserCtx`, not a `UserTrapFrame`); glue's
+    /// row is `=> 0`, because on AArch64 `rt_sigreturn` is consumed inside the
+    /// EL0 sync handler and never reaches the dispatcher.
+    RtSigreturn   => RT_SIGRETURN   = 15, nr::RT_SIGRETURN;
+    /// x86_64 62, asm-generic 129 — and `nr::KILL` is **Akuma's private 302**,
+    /// not this. Naming the wrong constant here would dispatch `kill(2)` into
+    /// the box-kill syscall.
+    Kill          => KILL           = 62, nr::KILL_LINUX;
+    /// x86_64 131, asm-generic 132.
+    Sigaltstack   => SIGALTSTACK    = 131, nr::SIGALTSTACK;
+    /// x86_64 200, asm-generic 130.
+    Tkill         => TKILL          = 200, nr::TKILL;
+    /// x86_64 234, asm-generic 131. Note the two numbers are each the *other*
+    /// architecture's number for a different signal call — 131 is `sigaltstack`
+    /// on x86_64 and `tgkill` on asm-generic, 200 is `tkill` on x86_64 and
+    /// `mount` on asm-generic.
+    Tgkill        => TGKILL         = 234, nr::TGKILL;
 
     // ── sockets ────────────────────────────────────────────────────────────
     Socket     => SOCKET     = 41,  nr::SOCKET;

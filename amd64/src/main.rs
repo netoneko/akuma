@@ -125,6 +125,8 @@ mod sched;
 #[cfg(target_arch = "x86_64")]
 mod serial;
 #[cfg(target_arch = "x86_64")]
+mod signal;
+#[cfg(target_arch = "x86_64")]
 mod smp;
 #[cfg(target_arch = "x86_64")]
 mod shootdown;

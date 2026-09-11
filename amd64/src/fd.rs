@@ -1765,8 +1765,14 @@ pub fn sys_access(path: u64) -> u64 {
 /// session's child** still has none: its stdin is a `PipeRead` from
 /// [`bind_stdio`], which is what the `fd < FIRST_FILE_FD` term above claims, and
 /// giving it one is the deferred `/proc/<pid>/fd/0` + `delegate_pid` work in
-/// `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Until then this preamble stays,
-/// and so does INTR→SIGINT on the foreground group.
+/// `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Until then this preamble stays.
+///
+/// INTR→SIGINT was in that sentence too and is no longer: the **console's**
+/// keystrokes go through `akuma_exec::process::write_to_process_stdin` since
+/// 2026-09-11 (`crate::console`'s pump), so `^C` on the serial line raises
+/// `SIGINT` on the foreground group. An `ssh` session's `^C` still does not,
+/// for exactly the reason this paragraph gives — there is no channel to run a
+/// line discipline on.
 ///
 /// # What glue adds
 ///

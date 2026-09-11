@@ -36,6 +36,14 @@ What it checks, and why each part is there:
 * **`/probes/grandfork`** — all five rungs, the probe that pins the `wait4`
   ownership fix. It prints before each step because the failure mode is a hang
   with no exit status, so read its last line, not its verdict.
+* **`/probes/sigprobe`** — all eight rungs, the probe that pins signal delivery
+  (2026-09-11). It is here rather than in the boot suite for the same reason
+  `grandfork` is: the thing being checked is a **musl** program's view —
+  `sigaction` recording a handler, a frame the handler's `ret` returns through,
+  `rt_sigreturn` restoring a register file the kernel did not author — and the
+  boot suite runs inside the kernel, on init's task, where none of that exists.
+  Rungs 6 and 7 re-send the signal while polling `waitpid`, so a kernel with no
+  delivery at all reports a rung number instead of hanging the run.
 
 # Usage
 
@@ -180,12 +188,13 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run([CC, "-static", "-O2", "-o", str(OUTDIR / "grandfork"),
-                    str(PROBE_SRC / "grandfork.c")], check=True)
+    for probe in ("grandfork", "sigprobe"):
+        subprocess.run([CC, "-static", "-O2", "-o", str(OUTDIR / probe),
+                        str(PROBE_SRC / f"{probe}.c")], check=True)
     if not os.path.exists(IMG):
         subprocess.run(["sh", os.path.join(REPO, "amd64", "mkdisk.sh"), IMG, "128"],
                        cwd=REPO, check=True, capture_output=True)
-    inject_local(IMG, OUTDIR, ["grandfork"])
+    inject_local(IMG, OUTDIR, ["grandfork", "sigprobe"])
 
     proc, lines = boot(a.smp, a.ssh_port, a.http_port)
     ok = True
@@ -238,6 +247,11 @@ def main(argv=None):
         rc, gf = ssh(a.ssh_port, "/probes/grandfork", timeout=120)
         print(f"grandfork: rc={rc}")
         print("\n".join("  | " + l for l in gf.strip().splitlines()[-12:]))
+        ok = ok and rc == 0
+
+        rc, sp = ssh(a.ssh_port, "/probes/sigprobe", timeout=180)
+        print(f"sigprobe: rc={rc}")
+        print("\n".join("  | " + l for l in sp.strip().splitlines()[-14:]))
         ok = ok and rc == 0
     finally:
         if not a.keep:

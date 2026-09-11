@@ -39,6 +39,8 @@
 //! input queue. `fd::read_console` and `fd::poll_console_state` ask this module
 //! instead.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use alloc::sync::Arc;
 use spinning_top::Spinlock;
 
@@ -134,6 +136,38 @@ pub fn default_cc() -> [u8; 20] {
     cc
 }
 
+/// The pid the pump addresses its input to, or 0 before any console-attached
+/// process is registered.
+///
+/// # Why the pump needs a pid at all
+///
+/// Writing straight into [`CHANNEL`] delivers bytes and nothing else. The
+/// **terminal's** answer to a keystroke is not always "queue it": the INTR
+/// character (`^C`) is consumed by the line discipline and raises `SIGINT` on
+/// the terminal's foreground process group instead. That decision lives in
+/// `akuma_exec::process::write_to_process_stdin` — the same function `sshd`
+/// reaches through `/proc/<pid>/fd/0` on the other kernel — and it is keyed by
+/// pid, because it has to read the process's `TerminalState` (for `ISIG` and
+/// `c_cc[VINTR]`) and its `foreground_pgid`.
+///
+/// So this is the console's "who is attached", and *which* console-attached pid
+/// it holds does not matter: every one of them carries the same [`CHANNEL`] and
+/// the same [`TERM`] `Arc`, so the write, the flag read and the broadcast are
+/// identical through any of them. In practice it is `init`, registered first and
+/// outliving everything it spawns.
+///
+/// Set by `usermode::register_exec_process` for a process whose fd 0 is the
+/// console. Never cleared: a console with no attached process is exactly the
+/// state the fallback below already handles, and clearing it on exit would
+/// introduce a window where a keystroke typed during a shell's `execve` went to
+/// the direct path and skipped `ISIG`.
+static ATTACHED_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Record `pid` as the console's attached process. See [`ATTACHED_PID`].
+pub fn set_attached_pid(pid: u32) {
+    ATTACHED_PID.store(pid, Ordering::Release);
+}
+
 /// Bring the console channel and its line discipline up. Called once, from
 /// `boot::wire_console_and_syscalls`, before ring 3 exists.
 pub fn init() {
@@ -206,11 +240,31 @@ pub fn pump_once() -> bool {
         }
     }
     if n > 0 {
+        // **Through the shared line discipline, not into the FIFO.**
+        //
+        // `write_to_process_stdin` is the tty's front door on both kernels: it
+        // strips the INTR character and raises `SIGINT` on `foreground_pgid`
+        // when `ISIG` is set (`crates/akuma-exec/src/process/mod.rs`), mirrors
+        // the accepted prefix into the legacy `Process::stdin` buffer, and fires
+        // the `input_waker`. Calling `ProcessChannel::write_stdin` directly —
+        // which this did until 2026-09-11 — delivers the `0x03` to the program
+        // as data, so `^C` printed `^C` and killed nothing.
+        //
         // A short write means the queue is at its cap, i.e. nobody is reading;
         // the excess is dropped, which is what a tty input queue does when it
         // overflows. Not retried — retrying here would spin against a reader
         // that is not there.
-        ch.write_stdin(&inbuf[..n]);
+        //
+        // The fallback is the old direct write, for the window before any
+        // console-attached process exists (the boot self-tests) and for a pid
+        // that has since been reaped. It has no `ISIG` handling, which is
+        // correct: with nothing attached there is no foreground group to signal.
+        let pid = ATTACHED_PID.load(Ordering::Acquire);
+        if pid == 0
+            || akuma_exec::process::write_to_process_stdin(pid, &inbuf[..n]).is_err()
+        {
+            ch.write_stdin(&inbuf[..n]);
+        }
         wake_reader();
         moved = true;
     }

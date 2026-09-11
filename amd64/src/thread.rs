@@ -78,17 +78,6 @@ struct Thread {
     /// The process slot whose address space this thread runs in — shared with
     /// its process, which is what makes fd 0/1/2 route the same way.
     proc_slot: usize,
-    /// Linux tid — **the kernel thread slot**, which is also what `clone(2)`
-    /// returns and what every per-thread array in the tree is indexed by.
-    ///
-    /// It was `usermode::alloc_pid()`, the shared pid/tid counter, on the
-    /// argument that a tid and a pid must never name two different things.
-    /// True, and outranked: musl caches `clone`'s return value in
-    /// `pthread_self()->tid` and `tkill`s it, so the tid `gettid` reports has
-    /// to be the number the kernel indexes by, or a thread signals a stranger.
-    /// The shared `clone_thread` returns the slot and says so at length; this
-    /// stores the same value rather than a second one.
-    tid: u32,
     /// `CLONE_CHILD_CLEARTID`'s address, or 0. On exit the kernel zeroes this
     /// word and wakes one futex waiter on it — which is precisely how
     /// `pthread_join` learns the thread is gone, and the reason a `join` that
@@ -146,19 +135,6 @@ pub fn live_count(proc_slot: usize) -> usize {
     }
 }
 
-/// The tid of the running task: its thread tid, or its process pid if it is a
-/// main thread. `gettid` (186).
-#[must_use]
-pub fn current_tid() -> u32 {
-    match current_thread_slot() {
-        NO_THREAD => crate::usermode::current_pid(),
-        // SAFETY: raw-pointer read under the BKL.
-        slot => unsafe {
-            (*threads())[slot].map_or_else(crate::usermode::current_pid, |t| t.tid)
-        },
-    }
-}
-
 /// Is the running task a process's main thread (as opposed to a `clone` child)?
 ///
 /// The one question `exit` has to answer differently from `exit_group`.
@@ -171,10 +147,13 @@ pub fn current_is_main() -> bool {
 /// its next syscall rather than run on in an address space about to be freed.
 ///
 /// Checked at syscall entry, which is the only place a thread reliably passes
-/// through: this target has no signals, so there is no way to interrupt one in
-/// ring 3. A thread in an unbounded compute loop with no syscall in it is
+/// through. A thread in an unbounded compute loop with no syscall in it is
 /// therefore not reachable — a real gap, and the reason [`drain`] is a bounded
 /// wait rather than a guarantee.
+///
+/// The reason used to be "this target has no signals"; it now delivers them
+/// (`crate::signal`) and the gap is unchanged, because delivery is *also* at a
+/// syscall return and not on the LAPIC tick's `iretq`. Closing one closes both.
 #[must_use]
 pub fn should_leave_now() -> bool {
     if current_is_main() {
@@ -328,7 +307,6 @@ pub fn bind_clone_child(
         (*threads())[slot] = Some(Thread {
             task,
             proc_slot,
-            tid: task as u32,
             clear_child_tid,
         });
     }
@@ -432,8 +410,9 @@ const FUTEX_WAKE_PRIVATE: u32 = 1 | 128;
 ///
 /// Called from the main thread's exit path. A thread parked in `FUTEX_WAIT`
 /// notices through [`group_exiting`], which its poll loop checks; one running
-/// in ring 3 notices at its next syscall. Threads have no signals here, so a
-/// thread in a genuinely unbounded ring-3 loop is not reachable — bounded by
+/// in ring 3 notices at its next syscall. Signal delivery is at a syscall return
+/// too (`crate::signal`), so a thread in a genuinely unbounded ring-3 loop is
+/// still not reachable by either route — bounded by
 /// the same preemption that bounds any other runaway user program, and called
 /// out in `AKUMA_AMD64_RUST_STD.md` as a known gap rather than papered over.
 pub fn drain(proc_slot: usize) {

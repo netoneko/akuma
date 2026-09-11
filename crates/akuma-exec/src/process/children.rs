@@ -266,9 +266,39 @@ pub fn is_current_interrupted() -> bool {
 /// Interrupt a process by thread ID
 ///
 /// Used by the SSH shell to send Ctrl+C signal to a running process.
+///
+/// **Both channels, because a process can have two.** [`is_current_interrupted`]
+/// reads `Process::channel` *first* and only falls back to the per-thread
+/// registry; this function used to write the registry alone. Where the two are
+/// the same `Arc` — every AArch64 process — the second store is idempotent and
+/// nothing changes. Where they are not, the flag landed on the channel nobody
+/// reads and the interrupt was silently lost.
+///
+/// The target that has two is amd64: since 2026-09-10 every process there
+/// registers an **exit** channel under its task slot (that is what makes `wait4`
+/// shared code), and since 2026-09-11 a console-attached process *also* carries
+/// the serial line's own channel in `Process::channel`
+/// (`AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3). `deliver_signal` would set
+/// `interrupted` on the exit channel and `should_interrupt_blocking_syscall`
+/// would read the console one — so `kill` reported success and a `read` blocked
+/// on the console never returned `EINTR`.
+///
+/// Order is registry-then-process: `is_interrupted` **consumes** the flag
+/// (`swap`), and the process channel is the one that will be read, so it is
+/// written last for no reason other than symmetry — either order is correct
+/// because each store is independent.
 pub fn interrupt_thread(thread_id: usize) {
     if let Some(channel) = get_channel(thread_id) {
         channel.set_interrupted();
+    }
+    // The owning process's own channel, when it has one and it is a different
+    // object. Resolved through `THREAD_PID_MAP` rather than a scan: this runs
+    // once per signal delivery, not on a syscall path.
+    if let Some(pid) = crate::process::table::pid_for_thread(thread_id)
+        && let Some(proc) = lookup_process_shared(pid)
+        && let Some(ref ch) = proc.channel
+    {
+        ch.set_interrupted();
     }
 }
 

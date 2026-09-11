@@ -200,16 +200,58 @@ pub struct UserCtx {
     /// it — so per-task state is what it always was; the array was addressing
     /// by process slot for want of anywhere else to put one bit.
     pub exec_pending: u64,
+    /// The user `RFLAGS` captured on syscall entry — the `%r11` the `syscall`
+    /// instruction delivered. Offset 176, and **indexed by hand**: the ordinary
+    /// return pops `%r11` off the kernel stack, but `.Lsig_return` has abandoned
+    /// that frame and has to read the flags from somewhere.
+    ///
+    /// It is also the only place the interrupted flags can be *read* from Rust,
+    /// which a signal frame's `uc_mcontext.eflags` needs. Nothing wrote it
+    /// before signals existed, because nothing needed it: `enter_user_mode` and
+    /// `.Lexec_return` both synthesise `0x202` for a context that has no history.
+    pub user_rflags: u64,
+    /// Non-zero when this task must return to ring 3 with the register file in
+    /// this `UserCtx` rather than the one on the kernel stack. Offset 184,
+    /// indexed by hand (`.Lsig_return`'s selector).
+    ///
+    /// Set by both halves of signal handling, which is why there is one flag and
+    /// one return path: entering a handler and returning from one are the same
+    /// operation — install a register file and `sysret` into it — and differ
+    /// only in who filled it (`signal::deliver_pending` vs
+    /// `signal::sys_rt_sigreturn`).
+    ///
+    /// Consumed by `.Lsig_return` itself, like `exec_pending`. It can be left
+    /// **set** on one path — a fatal default action sets `leave` in the same
+    /// epilogue, and the assembly tests `leave` first — which for `leave` was
+    /// once a real bug ("a second entry with it still set returns immediately
+    /// after the first syscall"). It cannot be one here: a task that takes
+    /// `.Lexit_to_kernel` never re-enters ring 3, and `sched::prepare_task_slot`
+    /// assigns a whole fresh `UserCtx::new()` before a recycled slot runs
+    /// anything, so the flag cannot outlive its task.
+    pub sig_return: u64,
+    /// The `%rax` `.Lsig_return` enters ring 3 with. Offset 192, indexed by hand.
+    ///
+    /// Separate from `saved_regs` because `rax` is not in it: the ABI clobbers
+    /// `rax` across a `syscall`, so `syscall_entry` never saves it and the
+    /// ordinary return supplies it from the handler's result. A signal return
+    /// has no handler result — it carries either the handler's entry `rax` (0)
+    /// or the `rax` the interrupted context had.
+    pub sig_rax: u64,
 }
 
 /// **The offsets `syscall_entry` indexes by hand.**
 ///
-/// Six of them now, and the newest (`exec_pending`, 168) is the one that made
-/// this worth spelling: the return path branches on it and then takes the
-/// program counter it `sysret`s to from `user_rip`. A reordered field would not
-/// fail to compile, would not fail a boot check, and would send `execve` into
-/// whatever word had moved into 32 — which on this target is the entire
-/// mechanism by which any program is ever replaced.
+/// Nine of them now. `exec_pending` (168) is the one that made this worth
+/// spelling: the return path branches on it and then takes the program counter
+/// it `sysret`s to from `user_rip`. A reordered field would not fail to compile,
+/// would not fail a boot check, and would send `execve` into whatever word had
+/// moved into 32 — which on this target is the entire mechanism by which any
+/// program is ever replaced.
+///
+/// `sig_return` (184) is a second such branch and `user_rflags` (176) /
+/// `sig_rax` (192) are two more hand-indexed loads, with the same property: a
+/// signal handler entered with the wrong `%rip` is a `SIGSEGV` in a program that
+/// was handling a signal correctly.
 const _: () = {
     assert!(core::mem::offset_of!(UserCtx, kernel_rsp) == 0);
     assert!(core::mem::offset_of!(UserCtx, user_rsp) == 8);
@@ -217,6 +259,9 @@ const _: () = {
     assert!(core::mem::offset_of!(UserCtx, user_rip) == 32);
     assert!(core::mem::offset_of!(UserCtx, saved_regs) == 48);
     assert!(core::mem::offset_of!(UserCtx, exec_pending) == 168);
+    assert!(core::mem::offset_of!(UserCtx, user_rflags) == 176);
+    assert!(core::mem::offset_of!(UserCtx, sig_return) == 184);
+    assert!(core::mem::offset_of!(UserCtx, sig_rax) == 192);
 };
 
 impl UserCtx {
@@ -234,6 +279,9 @@ impl UserCtx {
             thread_slot: crate::thread::NO_THREAD,
             forked: 0,
             exec_pending: 0,
+            user_rflags: 0,
+            sig_return: 0,
+            sig_rax: 0,
         }
     }
 }
@@ -301,6 +349,7 @@ syscall_entry:
     mov rax, gs:[8]                 /* percpu.current_uctx */
     mov [rax + 8], rsp              /* uctx.user_rsp   = user rsp   */
     mov [rax + 32], rcx             /* uctx.user_rip   = return addr (for vfork) */
+    mov [rax + 176], r11            /* uctx.user_rflags = the flags `syscall` took */
     /* Full user register snapshot into uctx.saved_regs[12] (offset 48). Every
      * register the Linux syscall ABI preserves across `syscall` is still the
      * caller's here — `vfork` hands this exact set to the child so it resumes
@@ -408,6 +457,8 @@ syscall_entry:
     jne .Lexit_to_kernel
     cmp qword ptr [rcx + 168], 0    /* uctx.exec_pending */
     jne .Lexec_return
+    cmp qword ptr [rcx + 184], 0    /* uctx.sig_return */
+    jne .Lsig_return
 
     pop r11                         /* user rflags */
     pop rcx                         /* user rip    */
@@ -463,6 +514,43 @@ syscall_entry:
     xor r13d, r13d
     xor r14d, r14d
     xor r15d, r15d
+    swapgs
+    sysretq
+
+.Lsig_return:
+    /* **Return to ring 3 with the register file in `UserCtx`**, not the one on
+     * the kernel stack. Both halves of signal handling come through here:
+     * entering a handler (`signal::deliver_pending` filled the file with the
+     * handler's ABI) and leaving one (`signal::sys_rt_sigreturn` filled it from
+     * the frame on the user stack). Those are the same operation with two
+     * authors, so they share one path.
+     *
+     * The pushed `user rip`/`user rflags` and the rest of the kernel frame are
+     * abandoned exactly as `.Lexec_return` abandons them, and for the same
+     * reason: they describe a context this return is not going to.
+     *
+     * `rcx` holds the uctx pointer on entry and is reloaded LAST, because every
+     * other load is indexed off it.
+     *
+     * Still in ring 0 with the kernel's `%gs`; the `swapgs` below is the one the
+     * ordinary return does. */
+    mov qword ptr [rcx + 184], 0    /* consume uctx.sig_return */
+    mov rsp, [rcx + 8]              /* uctx.user_rsp */
+    mov r11, [rcx + 176]            /* uctx.user_rflags */
+    mov rax, [rcx + 192]            /* uctx.sig_rax */
+    mov rdi, [rcx + 48]
+    mov rsi, [rcx + 56]
+    mov rdx, [rcx + 64]
+    mov r10, [rcx + 72]
+    mov r8,  [rcx + 80]
+    mov r9,  [rcx + 88]
+    mov rbx, [rcx + 96]
+    mov rbp, [rcx + 104]
+    mov r12, [rcx + 112]
+    mov r13, [rcx + 120]
+    mov r14, [rcx + 128]
+    mov r15, [rcx + 136]
+    mov rcx, [rcx + 32]             /* uctx.user_rip — last: it is the base */
     swapgs
     sysretq
 
@@ -837,12 +925,56 @@ extern "C" fn syscall_handler(
         serial::puts("\n");
     }
     let uctx = crate::smp::current_uctx();
+    // **The signal epilogue.** Before the `leave` read below, because a fatal
+    // default action sets that flag — and after the trace lines, so a syscall's
+    // result is reported as the syscall computed it rather than as a signal
+    // rewrote it.
+    //
+    // Costs one relaxed load of this thread's pending word when nothing is
+    // pending, which is every syscall but a handful per boot.
+    let r = crate::signal::deliver_pending(uctx, r);
     // SAFETY: this task's own `UserCtx`, which only this task writes.
     let leaving = unsafe { !uctx.is_null() && (*uctx).leave != 0 };
     if !leaving {
         crate::smp::bkl_leave();
     }
     r
+}
+
+/// Leave ring 3 because a signal's default action says to, as if the program had
+/// called `exit_group(-sig)`.
+///
+/// The negative status is the tree's encoding for "killed by signal": glue's
+/// `encode_wait_status` turns it into `WIFSIGNALED`, and the AArch64 kernel's
+/// own fatal-signal path spells it the same way
+/// (`akuma_exceptions::fatal_signal_group_exit`).
+///
+/// Deliberately the same three lines as the [`Syscall::ExitGroup`] arm rather
+/// than a call into `akuma_syscalls_glue::sys_exit_group`: this target's
+/// teardown lives in [`run_process`]'s epilogue, and the `leave` flag is how a
+/// task gets there. Glue's version stops short of the `SPAWN` row and parks the
+/// thread in a `yield_now` loop, so a child killed through it would never report
+/// a status to its parent's `sys_waitpid`.
+///
+/// Returns; the caller must not deliver any further signal, and the task leaves
+/// ring 3 when the syscall return path reads `leave`.
+pub fn exit_current_from_signal(sig: u32) {
+    crate::thread::set_group_exiting(current_proc_slot());
+    // `EXIT_STATUS` is a diagnostic counter, not the path the status travels:
+    // [`run_process`] overwrites it with `enter_user`'s return value the moment
+    // the task leaves ring 3. The real carrier is `%rax`, which is why
+    // `signal::deliver_pending` returns `-(sig)` rather than the interrupted
+    // syscall's result. Stored anyway for the same reason `Syscall::ExitGroup`
+    // stores it: the two arms should read alike.
+    EXIT_STATUS.store((-(i64::from(sig))) as u64, Ordering::Relaxed);
+    // SAFETY: the running task's own `UserCtx`; only this task writes it, and it
+    // is inside its own syscall.
+    unsafe {
+        let uctx = crate::smp::current_uctx();
+        if !uctx.is_null() {
+            (*uctx).leave = 1;
+        }
+    }
 }
 
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
@@ -1239,6 +1371,38 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             }
             a1
         }
+        // ── signals ────────────────────────────────────────────────────────
+        //
+        // Dispatched here for the first time 2026-09-11. Every one of these
+        // numbers is different on the two architectures (`akuma-syscalls-abi`'s
+        // signal block says which), so the `to_glue` hop is doing real work: an
+        // x86_64 `kill`(62) handed to glue unhopped is asm-generic
+        // `sched_setaffinity`.
+        //
+        // `rt_sigaction` was `=> 0` and `rt_sigprocmask` a local arm that always
+        // reported an empty mask — both honest while nothing was ever delivered,
+        // and both wrong the moment something is: a program whose handler is not
+        // recorded cannot have it run, and a program whose `SIG_BLOCK` is
+        // discarded takes a signal it asked to defer.
+        Syscall::RtSigaction
+        | Syscall::RtSigprocmask
+        | Syscall::Sigaltstack
+        // `kill(2)` reaches `akuma_exec::process::deliver_signal`, which pends on
+        // the whole thread group and sets the interrupt flag
+        // `should_interrupt_blocking_syscall` reads. Nothing else here needs to
+        // change for `EINTR`: glue's blocking arms already ask.
+        | Syscall::Kill => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        // **Not** glue's, and `crate::signal::sys_tkill`'s doc comment is the
+        // reason: glue decides a fatal default *inline* by calling
+        // `sys_exit_group`, which on this target leaves ring 3 through the wrong
+        // epilogue. Here every signal is pended and `signal::deliver_pending`
+        // owns every fatality decision.
+        Syscall::Tkill => crate::signal::sys_tkill(a1 as u32, a2 as u32),
+        Syscall::Tgkill => crate::signal::sys_tgkill(a1 as u32, a2 as u32, a3 as u32),
+        // Local by necessity: the register file it restores is this target's
+        // `UserCtx`, and glue's row is `=> 0` because on AArch64 `rt_sigreturn`
+        // never reaches the dispatcher at all (the EL0 sync handler consumes it).
+        Syscall::RtSigreturn => crate::signal::sys_rt_sigreturn(),
         Syscall::Getpid => 1,
         Syscall::Fcntl => crate::fd::sys_fcntl(a1, a2, a3),
         // `getrandom(buf, len, flags)` — **served by glue** (C1 step 3, batch 3).
@@ -1308,7 +1472,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // The child-tid futex address a threaded libc registers on startup.
         // Single-address-space, no `CLONE_THREAD` here, so it is recorded
         // nowhere and the return value (the caller's tid) is ignored.
-        Syscall::SetTidAddress => 1,
+        // `set_tid_address(tidptr)` — **served by glue** (2026-09-11). It was a
+        // literal `1`, and that constant is what made `raise(3)` a no-op on this
+        // target: musl's `__init_tp` seeds `pthread_self()->tid` from this
+        // syscall's return, and `raise` is `tkill(pthread_self()->tid, sig)`. So
+        // every self-signal in every program here addressed **thread slot 1**,
+        // which is not the caller. Glue returns `current_thread_id()` and records
+        // `clear_child_tid` on the way, which is the other half this arm dropped.
+        Syscall::SetTidAddress => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         Syscall::SchedYield => {
             // The switch happens on *this task's* kernel stack, which is the
             // whole reason UserCtx is per-task: two processes sharing one
@@ -1397,7 +1568,23 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `gettid` — x86_64 186. Its own tid for a thread, its pid for a main
         // thread. Rust's `std` prints it in a panic message, which is how its
         // absence announced itself: `thread 'main' (18446744073709551615)`.
-        Syscall::Gettid => u64::from(crate::thread::current_tid()),
+        // `gettid` — **served by glue** (2026-09-11), for the same reason and
+        // with the same consequence as `set_tid_address` above. This answered
+        // `crate::thread::current_tid()`, which for a process's *main* thread
+        // falls back to the **pid** rather than the thread slot — so `gettid()`
+        // and the tid `clone` hands a child came from two different namespaces
+        // on one target, and `tkill(gettid(), …)` addressed whatever task
+        // happened to occupy slot `pid`. The slot is the namespace every
+        // per-thread array in `akuma-threading` is indexed by (pending signals,
+        // masks, sigaltstacks, wakers), which `clone_thread`'s own comment says
+        // at length.
+        //
+        // This arm was `current_tid`'s **only** caller, so the fold deleted the
+        // function and the `Thread::tid` field behind it — which held
+        // `task as u32`, the slot, i.e. exactly what glue answers. The two
+        // namespaces met only in the main-thread fallback, and that is where the
+        // divergence was.
+        Syscall::Gettid => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `futex` — x86_64 202. Six arguments, which is why `syscall_entry`
         // now forwards `a6`.
         Syscall::Futex => crate::futex::sys_futex(a1, a2, a3, a4, a5, a6),
@@ -1479,23 +1666,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // here, so the answer is the count `0`, and `size == 0` is the probe
         // form every caller actually uses.
         | Syscall::Getgroups => to_glue(call, [a1, a2, a3, a4, a5, a6]),
-        // Signals: this kernel has none, so "the mask is empty and stays empty"
-        // is the correct result, not a stub. `rt_sigprocmask` writes the old
-        // (empty) set back if asked.
-        Syscall::RtSigaction => 0, // rt_sigaction
-        Syscall::RtSigprocmask => {
-            if a3 != 0 {
-                let n = (a4 as usize).min(8);
-                // The old set, empty, into a user `sigset_t` bounded by sigsetsize.
-                // This was the last raw user write in the kernel; SMAP found it
-                // (`memset` → `#PF err=3` at a user stack address) the first boot
-                // it was on.
-                if !crate::uaccess::write_bytes(a3, &[0u8; 8][..n]) {
-                    return errno::EFAULT;
-                }
-            }
-            0
-        }
         // Best-effort robustness/rlimit hooks musl pokes on startup.
         Syscall::SetRobustList => 0,          // set_robust_list
         // `prlimit64(pid, resource, new, old)` — **served by glue** (C1 step 3,
@@ -3139,7 +3309,8 @@ pub fn current_pid() -> u32 {
     // **It answers the `tgid`, not the task's own pid**, which is what
     // `getpid(2)` means on Linux: every thread of a group reports the group
     // leader's pid, and `gettid` is the per-thread number
-    // (`crate::thread::current_tid`).
+    // (`akuma_exec::threading::current_thread_id`, which `gettid` answers from
+    // since the 2026-09-11 fold).
     //
     // Until the `clone` fold the two were the same thing here by accident — a
     // `CLONE_THREAD` child had no `Process` of its own and was published into
@@ -3188,9 +3359,11 @@ fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
 // * `fds: SharedFdTable::with_stdio()` — empty. The live descriptor table is
 //   `fd.rs`'s own; folding it is C2.
 // * `namespace: global_namespace()` — there are no boxes here.
-// * `signal_actions` empty, `signal_mask` 0 — no signal delivery on this
-//   target; `rt_sigaction`/`rt_sigprocmask` are local arms that never consult
-//   this.
+// * `signal_actions` empty, `signal_mask` 0 — the starting dispositions, which
+//   is what a fresh image has on any Unix. Spelled "no signal delivery on this
+//   target" until 2026-09-11, when both halves stopped being true together:
+//   `rt_sigaction` is glue's and writes this table, and `crate::signal`'s
+//   syscall-return epilogue reads it.
 // * `image.context: UserContext::new(0, 0)` — amd64 keeps ring-3 registers in
 //   its own `UserCtx` and `enter_user` is its own entry path; this context is
 //   never `eret`n from.
@@ -3427,7 +3600,28 @@ fn register_exec_process(
         // triple is what makes the tree's allocator safe here, and it is also
         // what `SharedFdTable::with_stdio` exists for.
         fds,
-        thread_id: None,
+        // **The `akuma-threading` slot this process runs on.**
+        //
+        // `None` until 2026-09-11, deliberately, and the note that stood here
+        // said why: this target's task lifecycle is `sched.rs`'s, and leaving
+        // the field empty kept `unregister_process`'s thread-termination arm out
+        // of it. What that also kept out was **signal delivery**:
+        // `deliver_signal` collects its target tids from exactly this field, so
+        // `all_tids` was empty, nothing was pended, nothing was woken — and it
+        // still returned `true`, so `kill(2)` reported success and did nothing.
+        //
+        // Two facts make filling it safe rather than a reversal of that
+        // reasoning. Since A1 the task slot **is** the `akuma-threading` thread
+        // id on this target (`threading::current_thread_id` reads
+        // `X86ArchHooks::current_slot`, which is `sched::current_task`), so there
+        // is no second numbering to reconcile. And the field was never
+        // consistently `None` anyway: a `fork` child and a `clone` thread both
+        // go through the shared `spawn_child_thread_and_publish`, which has
+        // always written `Some(tid)` here — so half this target's processes ran
+        // with it set and nothing came of it. What was `None` was precisely the
+        // half that could not be signalled: `init`, everything `sshd` spawns,
+        // and every `execve`d image.
+        thread_id: Some(task_slot),
         spawner_pid: None,
         // A console process gets the console's **shared** line discipline, not a
         // fresh one — one serial line, one set of termios flags, exactly as a
@@ -3477,6 +3671,13 @@ fn register_exec_process(
     });
     register_process(pid, proc);
     thread_pid_map_insert(task_slot, pid);
+    // Tell the console pump who to address its keystrokes to, so `^C` goes
+    // through the line discipline's `ISIG` branch instead of arriving as a
+    // `0x03` byte. Only for a console-attached process; see
+    // `console::ATTACHED_PID` for why "which one" does not matter.
+    if console_attached {
+        crate::console::set_attached_pid(pid);
+    }
 
     // **The exit channel** — the AArch64 practice, adopted 2026-09-10.
     //
@@ -3762,8 +3963,10 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     //   *previous* image would otherwise be zeroed-and-woken at exit — a write
     //   to whatever the new program has at that VA.
     // * custom signal handlers go back to `SIG_DFL` (`SIG_IGN` preserved).
-    //   Inert today (`rt_sigaction` is a stub here) and correct the moment it
-    //   is not.
+    //   Recorded here as "inert today, correct the moment `rt_sigaction` stops
+    //   being a stub"; it stopped on 2026-09-11 and this is live — an `execve`
+    //   that kept the old image's handler addresses would jump the new program
+    //   into whatever is at that VA on its first signal.
     // * the alternate signal stack is disabled; it pointed into the old space.
     //
     // The old address space and the old region list are dropped **inside**, not
