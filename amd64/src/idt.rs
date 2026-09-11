@@ -219,9 +219,9 @@ extern "x86-interrupt" fn unhandled(frame: InterruptStackFrame) {
 /// What [`page_fault_entry`] hands to [`page_fault_dispatch`]: the error code
 /// the CPU pushes for vector 14, then the ordinary return frame.
 ///
-/// Layout is fixed by the hardware and by the stub's `lea rdi, [rsp + 80]`,
-/// which points at the error code after the stub's ten pushes. Reordering these
-/// fields changes what that assembly reads.
+/// Layout is fixed by the hardware and by the stub's `lea rdi, [rsp + 128]`,
+/// which points at the error code past the stub's sixteen pushes. Reordering
+/// these fields changes what that assembly reads.
 #[repr(C)]
 pub struct PageFaultFrame {
     /// Bits: 0 present, 1 write, 2 user, 3 reserved-bit, 4 instruction fetch.
@@ -229,11 +229,67 @@ pub struct PageFaultFrame {
     pub frame: InterruptStackFrame,
 }
 
+/// The interrupted **general-purpose register file**, saved by the stub below
+/// and handed to the dispatcher as its second argument.
+///
+/// Field order is the stub's push order reversed — `r15` is pushed last and so
+/// lands at offset 0 — and it is the ABI between two files. The `const _`
+/// under this type asserts it.
+///
+/// # Why all fifteen, when ten were enough
+///
+/// Ten (the caller-saved set plus `rbp`) is exactly what a *serviced* fault
+/// needs: the dispatcher is `extern "C"`, so it preserves `rbx`/`r12`-`r15`
+/// itself, and the interrupted instruction re-executes with everything intact.
+///
+/// **Delivering a signal needs to read them, not merely preserve them.** A
+/// `SIGSEGV` handler is handed a `ucontext_t` whose `uc_mcontext` is the
+/// interrupted register file, and `rt_sigreturn` puts that file back — so a
+/// register the kernel never wrote down is a register a `longjmp`-free handler
+/// returns into garbage. Preserved-in-the-register is not the same as
+/// readable-from-Rust: by the time the dispatcher decides to deliver, its own
+/// Rust frames have used `rbx` and `r12`-`r15` for their own purposes and
+/// restored them only on the way out.
+///
+/// The sixteenth push is padding, and it is load-bearing: fifteen pushes is
+/// 120 bytes, which would leave `rsp` 8 off the 16-byte alignment System V
+/// requires at the `call`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrapRegs {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+}
+
+/// The stub indexes nothing by hand — it pushes and pops in a fixed order — but
+/// **Rust reads this struct off that stack**, so the two orders are one fact in
+/// two files. A reordered field here compiles, boots, and hands a signal
+/// handler a register file with two values swapped.
+const _: () = {
+    assert!(core::mem::offset_of!(TrapRegs, r15) == 0);
+    assert!(core::mem::offset_of!(TrapRegs, rbp) == 64);
+    assert!(core::mem::offset_of!(TrapRegs, rax) == 112);
+    assert!(core::mem::size_of::<TrapRegs>() == 120);
+};
+
 /// The hand-assembled entry for an exception **with an error code** whose
 /// handler may rewrite the return address: `$entry` is the symbol the IDT gate
 /// points at, `$dispatch` the `#[unsafe(no_mangle)] extern "C"
-/// fn(*mut PageFaultFrame)` it calls. Used for vectors 13 and 14; see the
-/// module header for why those two and no others.
+/// fn(*mut PageFaultFrame, *mut TrapRegs)` it calls. Used for vectors 13 and
+/// 14; see the module header for why those two and no others.
 macro_rules! fixable_exception_entry {
     ($entry:literal, $dispatch:literal) => {
         core::arch::global_asm!(concat!(
@@ -261,23 +317,41 @@ macro_rules! fixable_exception_entry {
             "    swapgs\n",
             "3:\n",
             /*
-             * Save every caller-saved register: the dispatcher is `extern "C"`,
-             * so it preserves rbx/rbp/r12-r15 itself, but it is free to destroy
-             * these nine and the interrupted code — which may be `rep movsb` in
-             * the middle of a user copy, about to be re-executed after demand
-             * paging — is not expecting a call. rbp is pushed too, as the tenth:
-             * ten pushes is 80 bytes, which keeps rsp 16-aligned at the `call`,
-             * as System V requires, and gives a debugger a frame chain for free. */
-            "    push rbp\n",
+             * Save the **whole** general-purpose register file, as `TrapRegs`.
+             *
+             * The caller-saved nine plus rbp is what a *serviced* fault needs:
+             * the dispatcher is `extern "C"`, so it preserves rbx/r12-r15
+             * itself, but it is free to destroy the rest and the interrupted
+             * code — which may be `rep movsb` in the middle of a user copy,
+             * about to be re-executed after demand paging — is not expecting a
+             * call. Delivering a **signal** needs more than that: the handler is
+             * handed the interrupted register file as `uc_mcontext`, and
+             * `rt_sigreturn` puts it back, so a register the kernel never wrote
+             * down is one a handler returns into garbage. See `TrapRegs`.
+             *
+             * The padding push first: fifteen registers is 120 bytes, and rsp
+             * must be 16-aligned at the `call`. Pushing it first rather than
+             * last is what puts the register block at [rsp + 0], so the
+             * dispatcher's second argument is a plain `lea rsi, [rsp]`.
+             *
+             * Push order is `TrapRegs` read bottom-up: rax first lands at the
+             * highest offset, r15 last lands at 0. */
+            "    sub rsp, 8\n",                   /* alignment padding */
             "    push rax\n",
+            "    push rbx\n",
             "    push rcx\n",
             "    push rdx\n",
             "    push rsi\n",
             "    push rdi\n",
+            "    push rbp\n",
             "    push r8\n",
             "    push r9\n",
             "    push r10\n",
             "    push r11\n",
+            "    push r12\n",
+            "    push r13\n",
+            "    push r14\n",
+            "    push r15\n",
             /* Hardware does NOT clear RFLAGS.AC on exception delivery, so a
              * fault taken inside a `stac` window would run the dispatcher with
              * SMAP suspended. Clear it — but only where SMAP is on, because
@@ -287,22 +361,31 @@ macro_rules! fixable_exception_entry {
             "    je 1f\n",
             "    clac\n",
             "1:\n",
-            "    lea rdi, [rsp + 80]\n",          /* &PageFaultFrame: the error code slot */
+            "    lea rdi, [rsp + 128]\n",         /* &PageFaultFrame: the error code slot */
+            "    lea rsi, [rsp]\n",               /* &TrapRegs */
             "    call ", $dispatch, "\n",
-            /* The dispatcher returned, so this fault was serviced or fixed up —
-             * it may have rewritten the saved rip. Restore exactly what was
-             * saved; a demand-paged store re-executes with the registers it
-             * faulted with. */
+            /* The dispatcher returned, so this fault was serviced, fixed up, or
+             * **redirected into a signal handler** — it may have rewritten the
+             * saved rip and rsp, and the argument registers in the block below.
+             * Restore exactly what is there now; a demand-paged store
+             * re-executes with the registers it faulted with, and a delivered
+             * signal enters with the three the dispatcher wrote. */
+            "    pop r15\n",
+            "    pop r14\n",
+            "    pop r13\n",
+            "    pop r12\n",
             "    pop r11\n",
             "    pop r10\n",
             "    pop r9\n",
             "    pop r8\n",
+            "    pop rbp\n",
             "    pop rdi\n",
             "    pop rsi\n",
             "    pop rdx\n",
             "    pop rcx\n",
+            "    pop rbx\n",
             "    pop rax\n",
-            "    pop rbp\n",
+            "    add rsp, 8\n",                   /* the alignment padding */
             "    add rsp, 8\n",                   /* drop the error code; iretq does not */
             /* Back to the program's `%gs` if that is where we are going. */
             "    test qword ptr [rsp + 8], 3\n",
@@ -317,9 +400,22 @@ macro_rules! fixable_exception_entry {
 // The LAPIC timer's entry: hand-assembled like the two above, because its
 // handler may **switch tasks** — the `iretq` at the end then resumes a
 // different task's frame — and because it must `swapgs` on a ring-3 origin so
-// the scheduler it calls can find its per-CPU block. There is no error code,
-// so the frame is 40 bytes and `rsp` arrives `≡ 8 (mod 16)`; the extra
-// `sub rsp, 8` restores the alignment the dispatcher's `call` needs.
+// the scheduler it calls can find its per-CPU block.
+//
+// It saves the same `TrapRegs` the exception stubs do, and for the same reason
+// they grew to: since 2026-09-11 the dispatcher may **redirect this frame into
+// a signal handler**, which means reading the whole interrupted register file
+// (a handler is handed it as `uc_mcontext` and `rt_sigreturn` puts it back) and
+// writing three registers back. The tick is the last place a signal could not
+// reach — a program that never syscalls and never faults.
+//
+// **The alignment arithmetic is different here and there is no padding push.**
+// There is no error code, so the CPU pushes 40 bytes and `rsp` arrives
+// `≡ 8 (mod 16)`; fifteen pushes is 120, which is also `≡ 8`, so the two cancel
+// and `rsp` is 16-aligned at the `call` exactly as System V requires. The old
+// ten-push form needed a `sub rsp, 8` to get there; adding one here would break
+// it. The exception stubs pad because their error code makes the entry
+// alignment the other one.
 core::arch::global_asm!(
     r#"
     .section .text
@@ -329,30 +425,39 @@ timer_entry:
     jz 1f
     swapgs
 1:
-    push rbp
     push rax
+    push rbx
     push rcx
     push rdx
     push rsi
     push rdi
+    push rbp
     push r8
     push r9
     push r10
     push r11
-    sub rsp, 8
-    lea rdi, [rsp + 88]              /* &InterruptStackFrame */
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rdi, [rsp + 120]             /* &InterruptStackFrame */
+    lea rsi, [rsp]                   /* &TrapRegs */
     call timer_dispatch
-    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop r11
     pop r10
     pop r9
     pop r8
+    pop rbp
     pop rdi
     pop rsi
     pop rdx
     pop rcx
+    pop rbx
     pop rax
-    pop rbp
     test qword ptr [rsp + 8], 3
     jz 2f
     swapgs
@@ -394,7 +499,7 @@ unsafe extern "C" {
 /// A plain function, not `x86-interrupt`: the stub already did the entry work,
 /// and this must be free to edit the frame — see the module header.
 #[unsafe(no_mangle)]
-extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
+extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
     // SAFETY: the stub passes a pointer into the current stack, to the frame
     // the CPU just pushed; it is live and exclusively ours until `iretq`.
     let pf = unsafe { &mut *frame };
@@ -492,10 +597,55 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
         return;
     }
 
-    describe_page_fault(code);
     if pf.frame.cs & 3 == 3 {
+        // **A ring-3 fault nothing serviced is a `SIGSEGV`, not a kill** — if
+        // the program installed a handler for it. `deliver_fault_signal`
+        // rewrites the pushed `rip`/`rsp` and the three argument registers, so
+        // the stub's `iretq` below enters the handler instead of resuming the
+        // instruction that faulted.
+        //
+        // Placed after every servicing arm and after the user-copy fixup, which
+        // is the only order that works: a demand-paged page or a CoW break is
+        // not a fault the program should hear about, and a fault inside
+        // `copy_to_user` belongs to the *kernel's* access, not to ring 3.
+        //
+        // `si_code` is the distinction a handler reads to tell a wild pointer
+        // from a permission it does not have, and it is exactly the
+        // present bit: `SEGV_MAPERR` for an address with no translation,
+        // `SEGV_ACCERR` for one that has a translation refusing the access —
+        // which is what an `mprotect` downgrade produces.
+        let si_code = if code.not_present() {
+            crate::signal::segv::MAPERR
+        } else {
+            crate::signal::segv::ACCERR
+        };
+        // SAFETY: the stub's own register block, live until its `pop` sequence;
+        // nothing else holds a reference to it.
+        let regs = unsafe { &mut *regs };
+        // **Under the BKL**, for the reason the servicing arms above state:
+        // writing the signal frame to the user stack can itself demand-page or
+        // break a CoW page, and a CoW break broadcasts a shootdown IPI whose
+        // acknowledgement wait assumes every sender holds the lock. The nested
+        // `#PF` would take it anyway (this dispatcher is reentrant by owner
+        // core), so this is belt and braces — and the belt is cheap next to a
+        // fault that is about to build a 440-byte frame. `kill_current_from_fault`
+        // takes it on the other side of this decision for the same reason.
+        let took = !crate::smp::bkl_held();
+        if took {
+            crate::smp::bkl_enter();
+        }
+        let delivered =
+            crate::signal::deliver_fault_signal(&mut pf.frame, regs, SIGSEGV, si_code, addr);
+        if took {
+            crate::smp::bkl_leave();
+        }
+        if delivered {
+            return;
+        }
+        describe_page_fault(code);
         user_fault("#PF page fault", &pf.frame, Some(code.raw()));
     }
+    describe_page_fault(code);
     fatal("#PF page fault", &pf.frame, Some(code.raw()));
 }
 
@@ -654,14 +804,29 @@ pub static COW_COPIES: AtomicU64 = AtomicU64::new(0);
 pub static COW_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub static COW_RETRIES: AtomicU64 = AtomicU64::new(0);
 
-/// A fault taken **in ring 3**: report it and kill the process, not the core.
+/// A fault taken **in ring 3** that no handler wanted: report it and kill the
+/// process, not the core.
 ///
 /// Halting was the right answer while every fault was the kernel's own bug to
 /// see. A program's segfault is not: on one core it took the whole machine
 /// down, and on several it silently parked one core with the others carrying
-/// on — which is how a `#GP` in busybox read as "busybox exited -1". The
-/// process leaves ring 3 the way `exit_group` does, with the status a Linux
-/// parent would see for a signal death (`128 + SIGSEGV`).
+/// on — which is how a `#GP` in busybox read as "busybox exited -1".
+///
+/// # The status is **negative**, and that is the whole difference
+///
+/// This passed `128 + SIGSEGV` = 139, on the reasoning that it is "the status a
+/// Linux parent would see". It is not: 139 is what a **shell** prints, computed
+/// from `WTERMSIG` *by the shell*. What `waitpid` reports is a *signalled*
+/// status, and this tree's encoding for that is a negative exit code —
+/// `encode_wait_status` turns `-11` into `WIFSIGNALED`/`WTERMSIG == 11` and
+/// turns `139` into `WIFEXITED` with code 139.
+///
+/// So every segfault on this target was reported to its parent as a **clean
+/// exit**, and the difference is not cosmetic: `waitpid`-based supervision
+/// cannot tell a crash from a program that chose to exit 139, and
+/// `userspace/forktest/c_stress/eager_mprotect_probe.c` — whose entire job is
+/// to assert that an `mprotect` downgrade produces a `SIGSEGV` — could never
+/// pass, which `amd64_mem_trials.py` recorded as an expected failure.
 fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
     serial::puts("\n[Fault] ");
     serial::puts(vector);
@@ -689,8 +854,15 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     serial::puts(" pid=");
     serial::put_dec(u64::from(crate::usermode::current_pid()));
     serial::puts(" — killing the process\n");
-    crate::usermode::kill_current_from_fault(128 + 11);
+    crate::usermode::kill_current_from_fault(SIGSEGV_STATUS);
 }
+
+/// The signal a ring-3 fault raises.
+const SIGSEGV: u32 = 11;
+
+/// The exit status a fault-killed process leaves with: `-SIGSEGV`, the tree's
+/// "killed by signal" encoding. See [`user_fault`] for why it is negative.
+const SIGSEGV_STATUS: u64 = -(SIGSEGV as i64) as u64;
 
 /// `#GP` — fatal, except inside the user-copy loop.
 ///
@@ -702,7 +874,7 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
 /// same fixup query as [`page_fault_dispatch`]; no demand paging, because a
 /// `#GP` is never "not mapped yet".
 #[unsafe(no_mangle)]
-extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame) {
+extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
     // SAFETY: as `page_fault_dispatch`.
     let pf = unsafe { &mut *frame };
     if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
@@ -711,6 +883,24 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame) {
         return;
     }
     if pf.frame.cs & 3 == 3 {
+        // The same `SIGSEGV` route as a `#PF`, with `SI_KERNEL` and no address:
+        // a `#GP` has no faulting *address* to report (the CPU rejected the
+        // operand before translation), and Linux reports it the same way.
+        // SAFETY: as in `page_fault_dispatch`, and the BKL for the same reason.
+        let regs = unsafe { &mut *regs };
+        let took = !crate::smp::bkl_held();
+        if took {
+            crate::smp::bkl_enter();
+        }
+        let delivered = crate::signal::deliver_fault_signal(
+            &mut pf.frame, regs, SIGSEGV, crate::signal::segv::SI_KERNEL, 0,
+        );
+        if took {
+            crate::smp::bkl_leave();
+        }
+        if delivered {
+            return;
+        }
         user_fault("#GP general protection", &pf.frame, Some(pf.error_code));
     }
     fatal("#GP general protection", &pf.frame, Some(pf.error_code));
@@ -734,13 +924,49 @@ unsafe extern "C" {
 /// kernel code is only asked (`need_resched`) and switches at its next yield.
 /// See `sched::preempt_if_needed` for why.
 #[unsafe(no_mangle)]
-extern "C" fn timer_dispatch(frame: *const InterruptStackFrame) {
-    // SAFETY: the stub passes a pointer into the current stack, to the frame
-    // the CPU just pushed; it is live until `iretq`.
+extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    // SAFETY: the stub passes pointers into the current stack, to the frame the
+    // CPU just pushed and to its own register block; both are live until
+    // `iretq`.
     let from_user = unsafe { (*frame).cs & 3 } == 3;
     // A tick can land inside a `stac` window; the scheduler must not inherit it.
     crate::uaccess::clac_if_enabled();
     crate::lapic::on_tick();
+    // **Pending signals, for a tick that interrupted ring 3.** The third and
+    // last place a signal is looked at, after a syscall return and a fault —
+    // and the one that reaches a program doing neither.
+    //
+    // `from_user` is the gate and it is load-bearing rather than an
+    // optimisation: the interrupted code is then provably not holding the BKL,
+    // so taking it here cannot deadlock against the very code it interrupted.
+    // (There is no register file worth redirecting on a ring-0 tick either —
+    // the frame belongs to kernel code.)
+    //
+    // Before `preempt_if_needed`, so the redirect is in this task's frame
+    // whether or not the tick also takes it off the CPU; the switch saves and
+    // restores this kernel stack, and the `iretq` below is still this task's.
+    if from_user {
+        let took = !crate::smp::bkl_held();
+        if took {
+            crate::smp::bkl_enter();
+        }
+        // SAFETY: as above; nothing else holds a reference to either.
+        let outcome = crate::signal::deliver_pending_on_tick(
+            unsafe { &mut *frame },
+            unsafe { &mut *regs },
+        );
+        if took {
+            crate::smp::bkl_leave();
+        }
+        // **After the release, and that is the whole reason this is not done
+        // inside.** `kill_current_from_fault` takes the BKL itself and never
+        // returns, so killing while still holding the bracket above would leave
+        // the lock one level deep for the rest of the boot — the task unwinds
+        // into `run_process`, which expects to hold it exactly once.
+        if let crate::signal::TickOutcome::Fatal(sig) = outcome {
+            crate::signal::kill_current_from_tick(sig);
+        }
+    }
     // Preemption. EOI has already been sent, so the LAPIC can deliver the next
     // tick to whichever task runs after this returns.
     crate::sched::preempt_if_needed(from_user);

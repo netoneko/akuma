@@ -18,23 +18,33 @@
 //! restorer convention are all different, and the only thing the two could share
 //! is a dispatch shape that neither would be shorter for.
 //!
-//! # Three things this target does differently, each pinned
+//! # Three places a signal is looked at
 //!
-//! 1. **Delivery happens at a `syscall` return only** — not on the LAPIC tick's
-//!    `iretq`, and not out of a `#PF`. A program that never syscalls therefore
-//!    never takes a signal. That is a real divergence from Linux and it is the
-//!    one to fix next; every program this kernel runs today (busybox, apk,
-//!    `sshd`, the shells) syscalls constantly, and the interesting case —
-//!    Ctrl-C reaching a job blocked in `read` — is a syscall return by
-//!    construction.
-//! 2. **`uc_mcontext.fpstate` is `NULL` and no FP state is saved.** Linux always
+//! A pending signal is only ever *acted on* at a boundary where this kernel has
+//! the interrupted register file in its hands, and there are exactly three:
+//!
+//! | boundary | entry point | the register file comes from |
+//! |---|---|---|
+//! | a `syscall` return | [`deliver_pending`] | `UserCtx` (`syscall_entry` wrote it) |
+//! | a `#PF`/`#GP` from ring 3 | [`deliver_fault_signal`] | `idt::TrapRegs` + the pushed frame |
+//! | a LAPIC tick that interrupted ring 3 | [`deliver_pending_on_tick`] | the same |
+//!
+//! The **decision** is one function ([`next_delivery`]) for all three; they
+//! differ only in where the file lives and in how the process leaves ring 3 if
+//! the answer is a fatal default. Together they leave no shape of program a
+//! signal cannot reach — the syscall return alone did (a compute loop), and the
+//! first two together still did (`AKUMA_AMD64_FAULT_SIGNALS.md` §7).
+//!
+//! # Two things this target does differently, each pinned
+//!
+//! 1. **`uc_mcontext.fpstate` is `NULL` and no FP state is saved.** Linux always
 //!    attaches an `xsave` area; a handler that reads `fpstate` would dereference
 //!    zero. Nothing in this tree's userspace does (musl does not; Go would), and
 //!    this kernel is both the writer *and* the reader — [`sys_rt_sigreturn`]
 //!    never looks at the field — so the pair is self-consistent. Attaching one
 //!    means saving/restoring the FPU across the excursion, which this target
 //!    does at context-switch granularity (`sched.rs`'s `fxsave`) and not here.
-//! 3. **`SA_RESTORER` is required.** So is it on real Linux/x86_64 — `sigaction`
+//! 2. **`SA_RESTORER` is required.** So is it on real Linux/x86_64 — `sigaction`
 //!    returns `EINVAL` without it, because the kernel has no signal trampoline
 //!    page on this architecture. Here the check is at *delivery* rather than at
 //!    registration (glue's `sys_rt_sigaction` is shared with AArch64, where
@@ -223,6 +233,31 @@ const _: () = {
     assert!(core::mem::size_of::<RtSigFrame>() == 440);
 };
 
+/// What the `siginfo_t` should say about where the signal came from.
+///
+/// The two arms are the two entry points. A `kill`/`tkill`/INTR signal is
+/// `SI_USER` with no payload; a CPU fault carries the address that faulted and
+/// a code saying why, which is the whole of what a `SIGSEGV` handler has to work
+/// with — `mprotectlb`'s handler reads neither, but Rust's stack-overflow
+/// handler and Go's `sigpanic` read both.
+#[derive(Clone, Copy)]
+enum Cause {
+    /// `SI_USER`.
+    User,
+    /// `si_code` is `SEGV_MAPERR`/`SEGV_ACCERR`/`SI_KERNEL`; `addr` is `%cr2`.
+    Fault { si_code: i32, addr: u64 },
+}
+
+/// `si_code` values this kernel produces for a fault.
+pub mod segv {
+    /// The address is not mapped at all.
+    pub const MAPERR: i32 = 1;
+    /// It is mapped, and the access was not permitted.
+    pub const ACCERR: i32 = 2;
+    /// `SI_KERNEL` — a fault with no meaningful address (`#GP`).
+    pub const SI_KERNEL: i32 = 0x80;
+}
+
 /// The interrupted ring-3 register file, gathered out of `UserCtx` so the frame
 /// builder and the restorer speak about one thing.
 ///
@@ -276,6 +311,26 @@ impl Regs {
         uctx.sig_rax = self.rax;
         uctx.saved_regs = self.regs;
         uctx.sig_return = 1;
+    }
+
+    /// The same file, gathered off the **exception** stub instead of `UserCtx`.
+    ///
+    /// Twelve hand-written positions again, and the third place this mapping is
+    /// spelled (`syscall_entry`'s store order and `to_sigcontext` are the other
+    /// two). A transposition here is invisible to the compiler and shows up as a
+    /// signal handler — or a `rt_sigreturn` — seeing two registers swapped, so
+    /// `signal::smoke_test` checks it against `TrapRegs` field by field.
+    fn from_trap(frame: &crate::idt::InterruptStackFrame, regs: &crate::idt::TrapRegs) -> Self {
+        Self {
+            rip: frame.rip,
+            rsp: frame.rsp,
+            rflags: frame.rflags,
+            rax: regs.rax,
+            regs: [
+                regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9,
+                regs.rbx, regs.rbp, regs.r12, regs.r13, regs.r14, regs.r15,
+            ],
+        }
     }
 
     fn to_sigcontext(self) -> SigContext {
@@ -413,50 +468,128 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
         return syscall_result;
     };
 
-    while let Some(sig) = threading::take_pending_signal(threading::thread_signal_mask()) {
-        let idx = (sig as usize).wrapping_sub(1);
-        if idx >= akuma_exec::process::MAX_SIGNALS {
-            continue;
+    match next_delivery(proc, tid, &cur) {
+        Next::Nothing => {
+            if restored { cur.rax } else { syscall_result }
         }
-        let action = { proc.signal_actions.actions.lock()[idx] };
-        match action.handler {
-            SignalHandler::Ignore => {}
-            SignalHandler::UserFn(entry) => {
-                if let Some(next) = build_frame(&cur, sig, entry, &action, tid) {
-                    if action.flags & sa::RESETHAND != 0 {
-                        proc.signal_actions.actions.lock()[idx] =
-                            akuma_exec::process::SignalAction::default();
-                    }
-                    // Block the delivered signal for the duration of the handler
-                    // (unless `SA_NODEFER`), plus the action's own `sa_mask`.
-                    // SIGKILL(9) and SIGSTOP(19) can never be masked.
-                    const UNMASKABLE: u64 = (1u64 << 8) | (1u64 << 18);
-                    let mut add = action.mask & !UNMASKABLE;
-                    if action.flags & sa::NODEFER == 0 && (1..=64).contains(&sig) {
-                        add |= (1u64 << (sig - 1)) & !UNMASKABLE;
-                    }
-                    threading::or_thread_signal_mask(add);
-                    threading::note_delivered_signal(tid, sig);
-                    DELIVERED.fetch_add(1, Ordering::Relaxed);
-                    next.store(uctx);
-                    return uctx.sig_rax;
-                }
-                DECLINED.fetch_add(1, Ordering::Relaxed);
-                // Fall through to the default action — a handler that cannot be
-                // entered must not silently swallow a fatal signal.
-                if let Some(status) = fatal_default(sig, proc) {
-                    return status;
-                }
-            }
-            SignalHandler::Default => {
-                if let Some(status) = fatal_default(sig, proc) {
-                    return status;
-                }
-            }
+        Next::Handler(next) => {
+            next.store(uctx);
+            uctx.sig_rax
+        }
+        // **This target's own exit**, not glue's `sys_exit_group`: setting
+        // `leave` returns the task into `crate::usermode::run_process`, whose
+        // epilogue drains sibling threads, closes the fd table, stamps the
+        // `SPAWN` row and removes the channel. And the status must be the
+        // **returned** value, not just `EXIT_STATUS`: `run_process` reads the
+        // exit status off `enter_user`'s return — the `%rax` the
+        // `.Lexit_to_kernel` path carries out — and stamps it into the child's
+        // exit channel, which is what the parent's `wait4` decodes. Returning
+        // the interrupted syscall's own result instead reported a `SIGTERM`
+        // death as whatever that syscall answered.
+        Next::Fatal(sig) => {
+            crate::usermode::exit_current_from_signal(sig);
+            signal_status(sig)
         }
     }
+}
 
-    if restored { cur.rax } else { syscall_result }
+/// The bookkeeping every delivered handler needs, whichever path built its
+/// frame: the `SA_RESETHAND` one-shot, the blocked-signal mask for the duration
+/// of the handler, and the sticky delivered-record that lets a blocking syscall
+/// learn it was interrupted after the pending bit is gone
+/// (`current_thread_has_pending_interrupt`, and
+/// `PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md` for why the record is separate).
+///
+/// Factored out when the fault path arrived rather than duplicated, because two
+/// copies of a mask update is exactly the shape that lets one path forget
+/// `sa_mask` and reenter a handler that asked not to be.
+fn enter_handler(
+    sig: u32,
+    idx: usize,
+    action: &akuma_exec::process::SignalAction,
+    proc: &akuma_exec::process::Process,
+    tid: usize,
+) {
+    if action.flags & sa::RESETHAND != 0 {
+        proc.signal_actions.actions.lock()[idx] = akuma_exec::process::SignalAction::default();
+    }
+    // Block the delivered signal for the duration of the handler (unless
+    // `SA_NODEFER`), plus the action's own `sa_mask`. SIGKILL(9) and SIGSTOP(19)
+    // can never be masked.
+    const UNMASKABLE: u64 = (1u64 << 8) | (1u64 << 18);
+    let mut add = action.mask & !UNMASKABLE;
+    if action.flags & sa::NODEFER == 0 && (1..=64).contains(&sig) {
+        add |= (1u64 << (sig - 1)) & !UNMASKABLE;
+    }
+    threading::or_thread_signal_mask(add);
+    threading::note_delivered_signal(tid, sig);
+    DELIVERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// **Turn a ring-3 CPU fault into a `SIGSEGV` its own handler can catch.**
+///
+/// Called from `idt.rs`'s `#PF` and `#GP` dispatchers for a fault that nothing
+/// serviced. Returns whether a handler took it: `true` means the stub's `iretq`
+/// now enters that handler and the fault is over; `false` means the caller must
+/// kill the process, which is what this target did unconditionally until
+/// 2026-09-11.
+///
+/// # Why this is not `deliver_pending` with different arguments
+///
+/// Three things differ, and each is the reason the two are separate functions:
+///
+/// - **The register file is somewhere else.** A syscall's is in `UserCtx`
+///   (`syscall_entry` put it there); a fault's is the `TrapRegs` block the
+///   exception stub pushed, plus the `rip`/`rsp`/`rflags` the CPU pushed. The
+///   frame builder speaks `Regs`, so the difference stops here.
+/// - **The return is an `iretq`, not a `sysret`.** So there is no `sig_return`
+///   flag and no `.Lsig_return`: rewriting the pushed frame in place *is* the
+///   redirect.
+/// - **Only three registers are written back** — see [`install_handler_frame`],
+///   which the tick path shares.
+///
+/// # What it refuses, and why each refusal ends in a kill
+///
+/// No process (a fault with no identity), no `UserFn` disposition, or the signal
+/// **blocked**. Linux force-unblocks a synchronous fault signal and then applies
+/// the default action if the handler cannot run; refusing here reaches the same
+/// place by the caller's route. Declining is always safe: the caller kills, and
+/// a killed process is what happened before this function existed.
+pub fn deliver_fault_signal(
+    frame: &mut crate::idt::InterruptStackFrame,
+    regs: &mut crate::idt::TrapRegs,
+    sig: u32,
+    si_code: i32,
+    addr: u64,
+) -> bool {
+    let idx = (sig as usize).wrapping_sub(1);
+    if idx >= akuma_exec::process::MAX_SIGNALS {
+        return false;
+    }
+    let Some(proc) = current_process_shared() else {
+        return false;
+    };
+    let action = { proc.signal_actions.actions.lock()[idx] };
+    let SignalHandler::UserFn(entry) = action.handler else {
+        return false;
+    };
+    let tid = threading::current_thread_id();
+    // A blocked synchronous fault cannot be deferred — the faulting instruction
+    // would simply re-execute and fault again. Kill instead.
+    if threading::thread_signal_mask() & (1u64 << idx) != 0 {
+        return false;
+    }
+
+    let cur = Regs::from_trap(frame, regs);
+    let Some(next) = build_frame(&cur, sig, entry, &action, tid, Cause::Fault { si_code, addr })
+    else {
+        DECLINED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+
+    install_handler_frame(frame, regs, &next);
+    enter_handler(sig, idx, &action, proc, tid);
+    true
 }
 
 /// Apply signal `sig`'s default action. Returns `Some(status)` when it
@@ -481,15 +614,149 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
 /// Glue's version does most but not all of that and then parks the thread in a
 /// `yield_now` loop, so reaching ring 3's exit through it would leave a child
 /// whose parent's `sys_waitpid` never sees a status.
-fn fatal_default(sig: u32, proc: &akuma_exec::process::Process) -> Option<u64> {
+fn fatal_default(sig: u32, proc: &akuma_exec::process::Process) -> bool {
     if !akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
-        return None;
+        return false;
     }
     akuma_primitives::safe_print!(128,
         "[signal] pid={} killed by signal {} (default action)\n", proc.pid, sig);
     DEFAULT_KILLS.fetch_add(1, Ordering::Relaxed);
-    crate::usermode::exit_current_from_signal(sig);
-    Some((-(i64::from(sig))) as u64)
+    true
+}
+
+/// The exit status a signal death carries. See [`fatal_default`].
+fn signal_status(sig: u32) -> u64 {
+    (-(i64::from(sig))) as u64
+}
+
+/// What the pending set says to do next.
+///
+/// Three outcomes because there are three *paths out*, and each caller leaves
+/// ring 3 its own way: a syscall return sets `UserCtx::leave`, a timer tick has
+/// no syscall to return from and unwinds through `kill_current_from_fault`. The
+/// decision is the same on both, so it is made once here and acted on twice.
+enum Next {
+    /// Nothing deliverable; the caller's ordinary return stands.
+    Nothing,
+    /// Enter this register file.
+    Handler(Regs),
+    /// This signal's default action terminates the process.
+    Fatal(u32),
+}
+
+/// Drain this thread's pending set until one signal produces a handler frame, a
+/// fatal default is reached, or the set is empty.
+///
+/// Consumes ignored and non-fatal-default signals on the way, which is what
+/// keeps the pending word from filling up with `SIGCHLD`s nobody asked for.
+fn next_delivery(proc: &akuma_exec::process::Process, tid: usize, cur: &Regs) -> Next {
+    while let Some(sig) = threading::take_pending_signal(threading::thread_signal_mask()) {
+        let idx = (sig as usize).wrapping_sub(1);
+        if idx >= akuma_exec::process::MAX_SIGNALS {
+            continue;
+        }
+        let action = { proc.signal_actions.actions.lock()[idx] };
+        match action.handler {
+            SignalHandler::Ignore => {}
+            SignalHandler::UserFn(entry) => {
+                if let Some(next) = build_frame(cur, sig, entry, &action, tid, Cause::User) {
+                    enter_handler(sig, idx, &action, proc, tid);
+                    return Next::Handler(next);
+                }
+                DECLINED.fetch_add(1, Ordering::Relaxed);
+                // Fall through to the default action — a handler that cannot be
+                // entered must not silently swallow a fatal signal.
+                if fatal_default(sig, proc) {
+                    return Next::Fatal(sig);
+                }
+            }
+            SignalHandler::Default => {
+                if fatal_default(sig, proc) {
+                    return Next::Fatal(sig);
+                }
+            }
+        }
+    }
+    Next::Nothing
+}
+
+/// Install a handler's register file into an **interrupt/exception** frame, so
+/// the stub's `iretq` enters it.
+///
+/// Only three registers are written back. Linux's `setup_rt_frame` sets
+/// `di`/`si`/`dx` (and `ip`/`sp`) and leaves the rest of the file alone, so a
+/// handler that looks at `%rbx` sees what the interrupted code had. The syscall
+/// path zeroes more because a `syscall` has already clobbered `rcx`/`r11` and
+/// the ABI makes the argument registers dead.
+fn install_handler_frame(
+    frame: &mut crate::idt::InterruptStackFrame,
+    regs: &mut crate::idt::TrapRegs,
+    next: &Regs,
+) {
+    frame.rip = next.rip;
+    frame.rsp = next.rsp;
+    // `iretq` restores these flags to ring 3. `IF` set is not optional (a ring-3
+    // thread with interrupts masked stops being preemptible) and `DF` clear is
+    // what the ABI promises the C function about to run. `cs`/`ss` are left
+    // alone: they are already the ring-3 selectors this frame came from.
+    frame.rflags = RFLAGS_FORCED;
+    regs.rdi = next.regs[r::RDI];
+    regs.rsi = next.regs[r::RSI];
+    regs.rdx = next.regs[r::RDX];
+}
+
+/// **The pending-signal check at a LAPIC tick** — the third and last place a
+/// signal can be looked at, and the one that closes "a program that never
+/// syscalls and never faults takes no signal".
+///
+/// Called from `idt::timer_dispatch` for a tick that interrupted **ring 3**,
+/// before the preemption decision. Only for a ring-3 origin, and that gate is
+/// load-bearing rather than an optimisation: the interrupted code then provably
+/// holds no BKL, so taking it here cannot deadlock against itself.
+///
+/// **Does not terminate the process itself**, and that is not a style choice:
+/// the caller is holding the BKL for the frame write, `kill_current_from_fault`
+/// takes it again and never returns, so killing from in here would leave the
+/// lock one level deep for the rest of the boot. `TickOutcome::Fatal` hands the
+/// decision back so `timer_dispatch` can drop its hold first.
+#[derive(Clone, Copy)]
+pub enum TickOutcome {
+    /// Nothing pending, or nothing deliverable. The tick returns as it was.
+    Unchanged,
+    /// The frame now enters a handler.
+    Redirected,
+    /// This signal's default action terminates the process — **after** the
+    /// caller releases the BKL.
+    Fatal(u32),
+}
+
+/// Leave ring 3 because a tick found a fatal default. Separate from
+/// [`deliver_pending_on_tick`] so the caller can drop the BKL first; see
+/// [`TickOutcome`].
+pub fn kill_current_from_tick(sig: u32) -> ! {
+    crate::usermode::kill_current_from_fault(signal_status(sig))
+}
+
+pub fn deliver_pending_on_tick(
+    frame: &mut crate::idt::InterruptStackFrame,
+    regs: &mut crate::idt::TrapRegs,
+) -> TickOutcome {
+    let tid = threading::current_thread_id();
+    if threading::pending_signals_raw(tid) == 0 {
+        return TickOutcome::Unchanged;
+    }
+    let Some(proc) = current_process_shared() else {
+        return TickOutcome::Unchanged;
+    };
+    let cur = Regs::from_trap(frame, regs);
+    match next_delivery(proc, tid, &cur) {
+        Next::Nothing => TickOutcome::Unchanged,
+        Next::Handler(next) => {
+            install_handler_frame(frame, regs, &next);
+            TickOutcome::Redirected
+        }
+        Next::Fatal(sig) => TickOutcome::Fatal(sig),
+    }
 }
 
 /// Build the `rt_sigframe` for `sig` and return the register file that enters
@@ -500,6 +767,7 @@ fn build_frame(
     entry: usize,
     action: &akuma_exec::process::SignalAction,
     tid: usize,
+    cause: Cause,
 ) -> Option<Regs> {
     // x86_64 has no kernel signal trampoline: the restorer is the program's.
     if action.flags & sa::RESTORER == 0 || action.restorer == 0 {
@@ -544,14 +812,17 @@ fn build_frame(
     frame.uc.uc_mcontext = cur.to_sigcontext();
     frame.uc.uc_mcontext.oldmask = frame.uc.uc_sigmask;
     frame.info.si_signo = sig.cast_signed();
-    // `SI_USER` — every signal this target can raise today comes from `kill`,
-    // `tkill`/`tgkill` or the terminal's INTR character. Faults do not deliver
-    // signals here (they go to `kill_current_from_fault`), so there is no
-    // `si_addr` arm to choose and writing `SI_USER` is the true answer rather
-    // than a placeholder. `si_pid`/`si_uid` stay 0: `deliver_signal` does not
-    // carry the sender's identity, and 0 is `init`, which is who a kernel-raised
-    // signal is from.
-    frame.info.si_code = 0;
+    match cause {
+        // `si_pid`/`si_uid` stay 0: `deliver_signal` does not carry the sender's
+        // identity, and 0 is `init`, which is who a kernel-raised signal is from.
+        Cause::User => frame.info.si_code = 0,
+        Cause::Fault { si_code, addr } => {
+            frame.info.si_code = si_code;
+            // `si_addr` is the first word of the union, which is what the
+            // `_sigfault` arm puts there.
+            frame.info.fields[0] = addr;
+        }
+    }
 
     if !crate::uaccess::write_val(base, frame) {
         akuma_primitives::safe_print!(128,
@@ -791,7 +1062,7 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
         restorer: 0,
     };
     t.check("signal: delivery declines without SA_RESTORER",
-        build_frame(&cur, 10, 0x40_1000, &no_restorer, 0).is_none());
+        build_frame(&cur, 10, 0x40_1000, &no_restorer, 0, Cause::User).is_none());
     let bad_handler = akuma_exec::process::SignalAction {
         handler: SignalHandler::UserFn(0),
         flags: sa::RESTORER,
@@ -799,7 +1070,7 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
         restorer: 0x40_2000,
     };
     t.check("signal: delivery declines a non-user handler",
-        build_frame(&cur, 10, 0, &bad_handler, 0).is_none());
+        build_frame(&cur, 10, 0, &bad_handler, 0, Cause::User).is_none());
 
     // The fatal-default table this target shares with AArch64, spot-checked at
     // the two ends that matter: `SIGINT` must kill a foreground job, `SIGCHLD`
@@ -808,6 +1079,48 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
         akuma_syscalls_glue::signal::signal_is_fatal_default(2));
     t.check("signal: SIGCHLD is not",
         !akuma_syscalls_glue::signal::signal_is_fatal_default(17));
+
+    // **The exception stub's register block, and the mapping off it.** This is
+    // the *third* place the register order is spelled — `syscall_entry`'s store
+    // order and `to_sigcontext` are the other two — and the only one whose
+    // source is assembly in another file. Distinct values again, so a swap
+    // cannot cancel out.
+    let trap = crate::idt::TrapRegs {
+        r15: 0x0f, r14: 0x0e, r13: 0x0d, r12: 0x0c,
+        r11: 0x0b, r10: 0x0a, r9: 0x09, r8: 0x08,
+        rbp: 0x05, rdi: 0x01, rsi: 0x02, rdx: 0x03,
+        rcx: 0x04, rbx: 0x06, rax: 0x07,
+    };
+    let tframe = crate::idt::InterruptStackFrame {
+        rip: 0x40_2000, cs: 0x23, rflags: 0x246, rsp: 0x7fff_1000, ss: 0x1b,
+    };
+    let from_trap = Regs::from_trap(&tframe, &trap);
+    t.check("signal: the trap register file maps by name",
+        from_trap.regs[r::RDI] == trap.rdi
+            && from_trap.regs[r::RSI] == trap.rsi
+            && from_trap.regs[r::RDX] == trap.rdx
+            && from_trap.regs[r::R10] == trap.r10
+            && from_trap.regs[r::R8] == trap.r8
+            && from_trap.regs[r::R9] == trap.r9
+            && from_trap.regs[r::RBX] == trap.rbx
+            && from_trap.regs[r::RBP] == trap.rbp
+            && from_trap.regs[r::R12] == trap.r12
+            && from_trap.regs[r::R13] == trap.r13
+            && from_trap.regs[r::R14] == trap.r14
+            && from_trap.regs[r::R15] == trap.r15);
+    t.check("signal: the trap frame carries rip/rsp/rflags/rax",
+        from_trap.rip == tframe.rip
+            && from_trap.rsp == tframe.rsp
+            && from_trap.rflags == tframe.rflags
+            && from_trap.rax == trap.rax);
+    // `%rcx` is deliberately absent from `Regs`: it is the one register the
+    // *syscall* path can never recover (the `syscall` instruction takes it), so
+    // the shared shape does not carry it and the fault path drops it too. Stated
+    // as a check so the asymmetry is a decision rather than an oversight.
+    t.check_eq("signal: rcx is not carried (sigcontext reports 0)",
+        from_trap.to_sigcontext().rcx, 0);
+    t.check_eq("signal: the trap register block is 120 bytes",
+        core::mem::size_of::<crate::idt::TrapRegs>() as u64, 120);
 
     // **The two checks above each print a `[signal] sig 10 declined: …` line and
     // each bump `DECLINED`.** That is the decline path doing its job, but two

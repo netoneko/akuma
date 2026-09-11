@@ -1403,7 +1403,26 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `UserCtx`, and glue's row is `=> 0` because on AArch64 `rt_sigreturn`
         // never reaches the dispatcher at all (the EL0 sync handler consumes it).
         Syscall::RtSigreturn => crate::signal::sys_rt_sigreturn(),
-        Syscall::Getpid => 1,
+        // `getpid`/`getppid` — **served by glue** (2026-09-11). Both answered a
+        // literal `1`, which was true once and stopped being true when 5b slice 2
+        // gave this target a real process table: `usermode::current_pid()` has
+        // resolved the caller's tgid since then, and only these two arms had not
+        // been told.
+        //
+        // A constant `1` is not a small lie here. `sys_kill` refuses `pid <= 1`
+        // with `EPERM`, so `kill(getpid(), sig)` — a spelling of `raise` that
+        // real programs use — could never work. `$$` was 1 in every shell on the
+        // machine at once (measured on the metal), so anything naming a temp
+        // file, a lock or a log line after its own pid collided with everything
+        // else, and no `ps` output could be correlated with it.
+        //
+        // **Not** `raise(3)` or `pthread_kill(3)`, and the difference is worth
+        // stating because it is the plausible-sounding wrong answer: musl spells
+        // both with `tkill`, which takes a *thread* id and never consults this.
+        // glibc spells them with `tgkill(getpid(), …)` and would have been
+        // broken by the constant — which matters the day something
+        // dynamically-linked and non-musl runs here, and not before.
+        Syscall::Getpid | Syscall::Getppid => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         Syscall::Fcntl => crate::fd::sys_fcntl(a1, a2, a3),
         // `getrandom(buf, len, flags)` — **served by glue** (C1 step 3, batch 3).
         //
@@ -1704,7 +1723,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Utimensat => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // Process-group / session ids. One process, so it is its own group and
         // session leader; `setpgid`/`setsid` accept and report id 1.
-        Syscall::Getppid => 1,
+        // `getpgid`/`getsid` still answer `1` — **deliberately, and the reason is
+        // the console**. `TerminalState::foreground_pgid` defaults to 1 and
+        // `kill_process_group` excludes the group leader, which is what makes
+        // `^C` reach `init`'s children and not `init` (`crate::console`). A shell
+        // that read a real `getpgid` and then `TIOCSPGRP`'d it would move that
+        // target, and nothing here has been tested against job control. Fold
+        // them when something needs them, with the Ctrl-C gate in hand.
         Syscall::Getpgid | Syscall::Getsid => 1,
         // `setpgid`/`setsid` accept and report id 1.
         Syscall::Setpgid | Syscall::Setsid => 0,

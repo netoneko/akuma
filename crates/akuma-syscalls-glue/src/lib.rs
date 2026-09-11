@@ -613,16 +613,30 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     );
 
     if akuma_exec::process::is_current_interrupted() {
-        // Plain `Process`-field writes still rely on the BKL for cross-core exclusion
-        // (`with_current_process` masks IRQs = same-core only; locking.md's
-        // load-bearing table). A BKL-opted-out syscall (Phase 7f) pauses its window so
-        // this cold arm runs held, exactly like every non-opted-out path; no-op there.
-        let _held = akuma_exec::bkl::DroppedWindowPause::new();
-        akuma_exec::process::with_current_process(|p| {
-            p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
-            p.exit_code.store(130, core::sync::atomic::Ordering::Relaxed);
-            p.state.store(akuma_exec::process::ProcessState::Zombie(130));
-        });
+        // **`EINTR`, and nothing else.**
+        //
+        // This used to also stamp the caller `exited = true`, `exit_code = 130`,
+        // `state = Zombie(130)` — marking a process dead *while it is running*,
+        // on the theory that the flag means Ctrl-C and Ctrl-C means death.
+        // Neither half holds:
+        //
+        // - The flag is set by `deliver_signal` for **every** signal, not only
+        //   `SIGINT`. So `kill(getpid(), SIGUSR1)` — a spelling real programs
+        //   use — stamped the caller as a zombie that had exited 130, and the
+        //   caller then ran on perfectly well and exited 0. Its **reported**
+        //   status was 130. Measured deterministically 2026-09-11 by
+        //   `userspace/forktest/c_stress/sigprobe.c` rung 11 on amd64: the
+        //   process printed every remaining rung and `_exit(0)`, and `ssh`
+        //   reported 130.
+        // - The killing is the **signal's** job and has been since 2026-08-24
+        //   (`docs/archive/CTRL_C_SIGINT_DELIVERY.md`): the same
+        //   `kill_process_group` that raises this flag pends `SIGINT`, whose
+        //   default action terminates at the next return to userspace. The
+        //   stamp was belt-and-braces from before delivery worked, and what it
+        //   actually did was overwrite the truth with a guess.
+        //
+        // The flag's own job — break the blocking syscall — is the `EINTR`, and
+        // that is kept.
         return EINTR;
     }
     crate::utils::read_profile::floor_laps::lap(

@@ -25,6 +25,17 @@
  *   6 eintr        a signal breaks a blocking read (no SA_RESTART)
  *   7 fatal        SIG_DFL SIGTERM to a child is WIFSIGNALED, not ignored
  *   8 abort        abort() reaches SIGABRT through musl's block/tkill/unblock
+ *   9 segv         a CPU fault becomes a catchable SIGSEGV, escaped by longjmp
+ *  10 segvret      ...and a handler that FIXES the fault and returns resumes
+ *                  the faulting instruction — the whole register file round
+ *                  trip through rt_sigreturn, which 9 never exercises
+ *  11 selfkill     kill(getpid(), sig) reaches this process — the one thing a
+ *                  kernel answering getpid() with a constant cannot do, since
+ *                  kill(2) refuses pid <= 1
+ *  12 tickdeliver  a signal reaches a child spinning in a pure compute loop
+ *                  that makes NO syscalls and takes NO faults — the only
+ *                  delivery point left after a syscall return and a fault is
+ *                  the timer interrupt
  *
  * Statically linked musl, so the same binary runs on real Linux for an A/B —
  * every rung must pass there, and if one does not, the probe is wrong rather
@@ -34,7 +45,9 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <setjmp.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -88,7 +101,12 @@ static int reap_with_signal(pid_t child, int sig, int release)
         if (waitpid(child, &st, WNOHANG) == child)
             return st;
     }
-    (void)write(release, "x", 1);
+    /* `release < 0` means the child is not blocked on anything and will end
+     * itself (rung 12's compute loop has its own bound); there is nothing to
+     * write to and the only thing left is to wait it out. */
+    if (release >= 0) {
+        (void)write(release, "x", 1);
+    }
     if (waitpid(child, &st, 0) != child)
         return -1;
     return st;
@@ -164,6 +182,47 @@ static int install_info(int sig, void (*fn)(int, siginfo_t *, void *))
     sa.sa_sigaction = fn;
     sa.sa_flags = SA_SIGINFO;
     return sigaction(sig, &sa, NULL);
+}
+
+static sigjmp_buf segv_jb;
+static volatile sig_atomic_t segv_hits;
+static volatile int segv_code;
+static void *volatile segv_addr;
+
+/* Rung 9: escape the fault with siglongjmp — the shape `mprotectlb` uses, and
+ * the one that never returns through `rt_sigreturn`. */
+static void segv_jump(int sig, siginfo_t *info, void *uc)
+{
+    (void)sig;
+    (void)uc;
+    segv_hits++;
+    segv_code = info ? info->si_code : -1;
+    segv_addr = info ? info->si_addr : NULL;
+    siglongjmp(segv_jb, 1);
+}
+
+static volatile sig_atomic_t spin_hit;
+
+static void spin_handler(int sig)
+{
+    (void)sig;
+    spin_hit = 1;
+}
+
+static void *fix_page;
+static volatile sig_atomic_t fix_hits;
+
+/* Rung 10: repair the mapping and RETURN, so the faulting store re-executes.
+ * The bound is not decoration — a kernel whose `mprotect` does not take effect,
+ * or whose `rt_sigreturn` restores the wrong `rip`, would fault here forever. */
+static void segv_fix(int sig, siginfo_t *info, void *uc)
+{
+    (void)sig;
+    (void)info;
+    (void)uc;
+    if (++fix_hits > 4)
+        _exit(90);
+    (void)mprotect(fix_page, 4096, PROT_READ | PROT_WRITE);
 }
 
 int main(void)
@@ -342,6 +401,145 @@ int main(void)
         if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGABRT) {
             sayn("   status=", st);
             return 8;
+        }
+    }
+
+    /* ---- 9: a CPU fault becomes a catchable SIGSEGV ---------------------- */
+    /* Touch first, then downgrade: a page that is **present** and read-only is
+     * the one shape where Linux and this kernel agree on `si_code`
+     * (`SEGV_ACCERR`). An untouched `PROT_NONE` mapping has no translation at
+     * all here — it is demand-paged — so it would report `SEGV_MAPERR` where
+     * Linux reports `SEGV_ACCERR`, which is a divergence about lazy mapping
+     * rather than about signals. */
+    say("9 segv\n");
+    {
+        char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            return 9;
+        *(volatile char *)p = 'a';
+        if (mprotect(p, 4096, PROT_READ) != 0) {
+            sayn("   mprotect errno=", errno);
+            return 9;
+        }
+        if (install_info(SIGSEGV, segv_jump) != 0)
+            return 9;
+        if (sigsetjmp(segv_jb, 1) == 0) {
+            *(volatile char *)p = 'b';
+            say("   the write to a PROT_READ page did not fault\n");
+            return 9;
+        }
+        if (segv_hits != 1 || segv_addr != (void *)p) {
+            sayn("   hits=", segv_hits);
+            return 9;
+        }
+        if (segv_code != 2 /* SEGV_ACCERR */) {
+            sayn("   si_code=", segv_code);
+            return 9;
+        }
+        (void)munmap(p, 4096);
+    }
+
+    /* ---- 10: the handler repairs the fault and returns -------------------- */
+    say("10 segvret\n");
+    {
+        char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        volatile long witness = 0x1234567;
+        if (p == MAP_FAILED)
+            return 10;
+        *(volatile char *)p = 'a';
+        if (mprotect(p, 4096, PROT_READ) != 0)
+            return 10;
+        fix_page = p;
+        if (install_info(SIGSEGV, segv_fix) != 0)
+            return 10;
+        *(volatile char *)p = 'z';
+        if (fix_hits != 1 || *(volatile char *)p != 'z') {
+            sayn("   fix_hits=", fix_hits);
+            return 10;
+        }
+        /* The store resumed, so `rt_sigreturn` restored `rip` and `rsp`. This
+         * asks the other question: did it restore the rest of the file? A local
+         * the compiler is free to keep in a callee-saved register across the
+         * faulting store is the only thing that can tell. */
+        if (witness != 0x1234567) {
+            sayn("   witness=", (long)witness);
+            return 10;
+        }
+        (void)munmap(p, 4096);
+    }
+
+    /* ---- 11: kill(getpid(), …) reaches this process ---------------------- */
+    /* `raise(3)` does **not** test this: musl spells it `tkill(gettid(), sig)`,
+     * which never asks who the process is. This is the spelling that does —
+     * and on a kernel answering `getpid()` with a constant 1 it cannot work at
+     * all, because `kill(2)` refuses `pid <= 1` with `EPERM`. */
+    say("11 selfkill\n");
+    {
+        pid_t me = getpid();
+        int before;
+        if (me <= 1) {
+            sayn("   getpid=", (long)me);
+            return 11;
+        }
+        if (install(SIGUSR1, plain, 0) != 0)
+            return 11;
+        before = hits[SIGUSR1];
+        if (kill(me, SIGUSR1) != 0) {
+            sayn("   kill errno=", errno);
+            return 11;
+        }
+        (void)getppid();   /* a syscall to deliver on, as in rung 4 */
+        if (hits[SIGUSR1] != before + 1) {
+            sayn("   hits delta=", hits[SIGUSR1] - before);
+            return 11;
+        }
+    }
+
+    /* ---- 12: delivery to a compute loop --------------------------------- */
+    /* The child makes **no syscalls at all** between arming and noticing — the
+     * loop is a `volatile` accumulate and a `volatile` flag read, so nothing
+     * the compiler can hoist and nothing that traps. A kernel that only looks
+     * at the pending set on a syscall return or a fault cannot reach it; only
+     * the timer interrupt can.
+     *
+     * The bound is the failure latency and nothing else: on success the child
+     * leaves on the first tick after the kill. `reap_with_signal` keeps sending
+     * for two seconds, and `release` is `-1` because there is nothing to
+     * release — the child is not blocked on anything, it is burning CPU, and it
+     * ends itself when the bound runs out. */
+    say("12 tickdeliver\n");
+    {
+        int rdy[2];
+        pid_t child;
+        int st = 0;
+        if (pipe(rdy) != 0)
+            return 12;
+        child = fork();
+        if (child < 0)
+            return 12;
+        if (child == 0) {
+            volatile long acc = 0;
+            long i;
+            (void)close(rdy[0]);
+            if (install(SIGUSR2, spin_handler, 0) != 0)
+                _exit(60 + (errno & 0x7f));
+            (void)write(rdy[1], "r", 1);
+            for (i = 0; i < 2000L * 1000L * 1000L; i++) {
+                acc += i;
+                if (spin_hit)
+                    _exit(0);
+            }
+            _exit(62);
+        }
+        (void)close(rdy[1]);
+        await_ready(rdy[0]);
+        (void)close(rdy[0]);
+        st = reap_with_signal(child, SIGUSR2, -1);
+        if (st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            sayn("   child status=", st);
+            return 12;
         }
     }
 

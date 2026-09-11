@@ -1330,31 +1330,111 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   simply wins that race. It handshakes now.
    │                        doc: AKUMA_AMD64_SIGNAL_DELIVERY.md
    ▼
+ [09-11] a fault becomes a catchable SIGSEGV — **the other half of item 1**
+   │   Two bugs one line apart, and the second hides behind the first.
+   │   `user_fault` passed `128 + SIGSEGV` = 139, which is what a *shell*
+   │   prints — `waitpid` wants a **negative** code, so `encode_wait_status`
+   │   read every segfault on this target as a **clean exit 139**. And
+   │   nothing tried a handler at all.
+   │   The stub had to save more: it pushed the caller-saved nine plus
+   ▼   `rbp`, which is exactly right for a *serviced* fault and not enough
+   │   to *deliver* one — a handler is handed `uc_mcontext` and
+   │   `rt_sigreturn` puts it back, and **preserved-in-the-register is not
+   │   readable-from-Rust** (the dispatcher's own frames have used
+   │   `rbx`/`r12`-`r15` by the time it decides). All fifteen now, as
+   │   `TrapRegs`; the sixteenth push is alignment and pushing it *first*
+   │   is what puts the block at `[rsp]`.
+   │   **No second return path this time** — rewriting the pushed frame in
+   │   place *is* the redirect and the stub's `iretq` does the rest, which
+   ▼   is the one way the fault path is simpler than the syscall path.
+   │   `si_code` is the present bit: `SEGV_MAPERR` vs `SEGV_ACCERR`, the
+   │   latter being exactly what an `mprotect` downgrade produces.
+   │   Gates: **the `c_stress` memory probes went 8/10 → 10/10** and
+   │   `amd64_mem_trials.py`'s `EXPECTED_FAIL` table is **empty** —
+   │   `mprotectlb` reports "0 divergence(s) from Linux" and
+   │   `eager_mprotect_probe` passes both phases. Two new `sigprobe` rungs
+   │   (`siglongjmp` out, and a handler that repairs the mapping and
+   │   *returns* — the whole register file through `rt_sigreturn`), both
+   │   green on real Linux first. QEMU 665/0, Firecracker 643/0, bare
+   │   metal 658/3 (the same stalled-USB three). No shared crate changed.
+   │                        doc: AKUMA_AMD64_FAULT_SIGNALS.md
+   ▼
+ [09-11] `getpid` stops lying — **a one-line fold with a metal-visible tell**
+   │   `Syscall::Getpid => 1` was true once and stopped being true when 5b
+   │   slice 2 gave this target a real process table: `current_pid()` has
+   │   resolved the caller's tgid since then and only that arm had not been
+   │   told. `$$` was **1 in every shell on the machine at once** (measured
+   ▼   on the metal), so a pid-named temp file, lock or log line collided
+   │   with everything else — and `kill(getpid(), sig)` could not work at
+   │   all, because `sys_kill` refuses `pid <= 1` with `EPERM`.
+   │   **Not `raise` or `pthread_kill`**, which is the plausible-sounding
+   │   wrong answer and was written down as fact before being checked: musl
+   │   spells both with `tkill`, which takes a *thread* id. glibc spells
+   │   them with `tgkill(getpid(), …)` and would have been broken.
+   │   `getppid` folded with it; `getpgid`/`getsid` deliberately did not —
+   │   `foreground_pgid` defaults to 1 and the Ctrl-C broadcast excludes the
+   │   leader, so moving that target wants a job-control gate first.
+   │   Gate: `sigprobe` rung 11 `selfkill`, which is the spelling `raise`
+   │   is not.
+   ▼
+ [09-11] the tick, and two defects the probe flushed out
+   │   **Signals now arrive from all three places a program can be
+   │   interrupted.** The timer stub got the same `TrapRegs` treatment the
+   │   exception stubs did — with the **opposite** alignment arithmetic:
+   │   no error code means entry `rsp ≡ 8`, which fifteen pushes cancel
+   │   exactly, so there is no padding push and adding one would break it.
+   ▼   `from_user` gates delivery, and that is load-bearing rather than an
+   │   optimisation: the interrupted code then provably holds no BKL.
+   │   The decision is one function (`next_delivery`) for all three paths,
+   │   which differ only in where the register file lives and how the task
+   │   leaves ring 3 if the answer is fatal.
+   │   **Then the probe went red, and the first two explanations were
+   │   wrong.** `sigprobe` rc=130, reproducible 3-of-3 once the ten ssh
+   │   workload sessions that precede it were included. Suspect 1, a real
+   │   hazard found by inspection — `Process::channel` is `parent.channel
+   ▼   .clone()`, so a per-process interrupt flag written there is shared
+   │   by the whole machine — was reverted and **did not fix it**.
+   │   Suspect 2, the tick itself, was cleared by compiling the call out:
+   │   **still 3-of-3**. What did it was one `safe_print!` in glue's
+   │   prologue naming the pid and syscall (`nr=173`, `getppid`).
+   │   The real one: `kill(getpid(), SIGUSR1)` raises the **Ctrl-C flag**
+   │   on the caller, and the prologue stamped it `exited / exit_code=130
+   │   / Zombie(130)` — **marking a live process dead**, so it ran to
+   ▼   completion and reported 130 instead of 0. The stamp was
+   │   belt-and-braces from before signal delivery worked; the killing is
+   │   the signal's job. `EINTR` and nothing else now. Plus `deliver_signal`
+   │   gained the stale-slot guard its two neighbours already had.
+   │   Gates: `sigprobe` 12 rungs (12 = a pure compute loop, no syscalls,
+   │   no faults), 12/12 on real Linux; the repro 3/3 green; QEMU 665/0,
+   │   memory probes 10/10, ring-3 OK, `^C` on the console re-checked,
+   │   AArch64 307/0, host tests 1375/0.
+   │                        doc: AKUMA_AMD64_FAULT_SIGNALS.md §7
+   ▼
  [09-11] ═══ YOU ARE HERE ═══
    │
-   └──► **C1 is done**, and items 1 and 2 of what piece A left are done
-        with it. `kill`, `raise`, `abort`, `pthread`-style handlers,
-        `EINTR` out of a blocking read and `^C` on the console all work.
+   └──► **C1 is done**, and so are items 1 and 2 of what piece A left.
+        `kill`, `raise`, `abort`, handlers, `EINTR` out of a blocking
+        read, `^C` on the console, a catchable `SIGSEGV`, a truthful
+        `getpid` and delivery on the timer tick all work; the memory
+        probes are 10/10 for the first time and `amd64_mem_trials.py`'s
+        `EXPECTED_FAIL` table is empty.
 
         What is left, in the order it argues for itself:
 
-        1. **Delivery on the timer tick's `iretq`.** Today a signal is
-           only looked at on a `syscall` return, so a compute-bound
-           program with no syscalls is unreachable by `^C` — the same
-           gap `thread::should_leave_now` already documents for
-           `exit_group`, and closing one closes both.
+        1. **`is_current_interrupted` cannot see a per-process flag on
+           this target**, because `Process::channel` is shared by a whole
+           fork tree here and a console-attached `init` makes that the
+           whole machine. The per-**thread** `EINTR` path is unaffected
+           and is what every real case uses, so this is narrow — but
+           closing it wants a per-thread flag that is not a shared `Arc`,
+           found without a `get_channel` map lookup on every syscall.
         2. **`akuma-net`'s `is_current_interrupted` hook is still
            `false`**, so a socket read is not interruptible where glue's
            other blocking arms are. The module header's reason used to be
            "no signals"; it is narrower now, and the hook is read from
            inside `smoltcp`'s poll loop, so wiring it is a measurement
            rather than a one-liner.
-        3. **`getpid` still answers a literal `1`.** musl's
-           `pthread_kill` is `tgkill(self->pid, tid, sig)`, so it fails
-           the `tgid` check for any process but `init`. `raise` is
-           unaffected only by accident (an unresolved tid makes `tgkill`
-           defer to `tkill`), which is why the probe passes.
-        4. **an sshd session's child's `ProcessChannel`** — the deferred
+        3. **an sshd session's child's `ProcessChannel`** — the deferred
            `/proc/<pid>/fd/0` + `delegate_pid` item, still the last
            reason `ioctl` carries a fake-tty preamble, what would make a
            full-screen program work over ssh rather than only on the

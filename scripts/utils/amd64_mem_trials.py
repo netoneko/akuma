@@ -66,16 +66,28 @@ CC = mem_suite.ARCHES[ARCH]
 # (`docs/archive/AKUMA_AMD64_MEMORY_CLOSEOUT.md`). Both survivors need **signal
 # delivery**, which is trunk A2 — neither is a memory-mapping defect, and
 # `mprotect` itself is verified working.
-EXPECTED_FAIL = {
-    # **Not "no signal delivery"** any more — that landed 2026-09-11
-    # (`amd64/src/signal.rs`). What is still missing is the *fault* half:
-    # `idt.rs` calls `usermode::kill_current_from_fault` directly, so a bad
-    # access never becomes a catchable `SIGSEGV`. Delivery happens at a syscall
-    # return only. See `AKUMA_AMD64_SIGNAL_DELIVERY.md` §8.
-    "mprotectlb": "needs a catchable SIGSEGV; faults are killed, not signalled",
-    "eager_mprotect_probe": "a killed child exits 128+SIGSEGV rather than reporting "
-                            "a signalled status, so WIFSIGNALED is never true",
-}
+# **Empty since 2026-09-11, and the emptiness is the point.**
+#
+# It held the last two probes, both signals rather than memory:
+#
+#   mprotectlb            "needs a SIGSEGV handler; this target has no signal
+#                          delivery" — it installs one and `siglongjmp`s out of
+#                          it, so nothing about `mprotect` could be measured
+#                          here until a fault could reach ring 3.
+#   eager_mprotect_probe  "a killed child exits 128+SIGSEGV rather than
+#                          reporting a signalled status, so WIFSIGNALED is never
+#                          true" — `user_fault` passed a *positive* 139, which
+#                          `encode_wait_status` reads as a clean exit.
+#
+# Both closed with `AKUMA_AMD64_FAULT_SIGNALS.md`: the exception stub saves the
+# whole register file, `signal::deliver_fault_signal` builds an `rt_sigframe`
+# from it, and a fault-killed process now leaves with `-SIGSEGV`. **amd64 passes
+# all ten**, and `mprotectlb` reports "0 divergence(s) from Linux".
+#
+# Leave it as an empty dict rather than deleting it: the reporter's `PASS*`
+# arm — "was expected to fail ... update EXPECTED_FAIL" — is what catches a
+# future gap being quietly normalised, and it needs somewhere to write.
+EXPECTED_FAIL = {}
 
 # The banner the in-guest runner prints around each probe. Chosen to survive a
 # torn console line at SMP>1: the marker is one short token on its own line, so

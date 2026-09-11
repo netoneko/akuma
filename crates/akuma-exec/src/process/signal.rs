@@ -225,37 +225,76 @@ pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
     // allocation — a fixed array bounded by `MAX_PROCESSES` (there can never
     // be more live threads than that) sidesteps it instead of a `Vec` that
     // would grow inside the callback.
-    let mut all_tids = [0usize; table::MAX_PROCESSES];
+    //
+    // Each entry is `(tid, the pid that recorded it)`, because the **staleness
+    // check below needs both** — see `slot_still_owned_by`.
+    let mut all_tids = [(0usize, 0 as Pid); table::MAX_PROCESSES];
     let mut tid_count = 0;
     if let Some(tid) = proc.thread_id {
-        all_tids[tid_count] = tid;
+        all_tids[tid_count] = (tid, pid);
         tid_count += 1;
     }
     table::for_each_process(|p| {
         if p.pid != pid && p.tgid == tgid
             && let Some(tid) = p.thread_id
             && tid_count < all_tids.len() {
-                all_tids[tid_count] = tid;
+                all_tids[tid_count] = (tid, p.pid);
                 tid_count += 1;
             }
     });
-    let all_tids = &all_tids[..tid_count];
+
+    // **Drop every slot that no longer belongs to the process that recorded
+    // it**, before touching any of them.
+    //
+    // `Process::thread_id` is a *recorded* slot number and thread slots are
+    // recycled, so a signal to a process whose thread has already exited — a
+    // zombie waiting to be reaped, which `lookup_process_shared` above finds
+    // perfectly well — names a slot that may now be running something else
+    // entirely. Both `kill_process` and `kill_process_with_signal` in this file
+    // guard exactly this, at length and after being bitten by it; this path did
+    // not, and the consequences are the two worst-behaved ones:
+    //
+    // - `interrupt_thread` on an innocent process sets the **Ctrl-C flag**,
+    //   which `akuma-syscalls-glue`'s dispatch prologue reads on *every*
+    //   syscall: it marks that process `Zombie(130)` and returns `EINTR`. An
+    //   unrelated program dies of a signal sent to a corpse.
+    // - `pend_signal_for_thread` deposits the signal on the wrong thread, which
+    //   then takes it — with the new occupant's dispositions, not the intended
+    //   target's.
+    //
+    // Found 2026-09-11 on amd64, by a probe that re-sends a signal every 50 ms
+    // while polling `waitpid`: the send after the child dies but before the
+    // reap is exactly this window, and one run in ~17 came back `130`.
+    // `slot_still_owned_by` prints when it fires, so the next one says so.
+    let mut kept = 0;
+    for i in 0..tid_count {
+        let (tid, owner) = all_tids[i];
+        if slot_still_owned_by(tid, owner) {
+            all_tids[kept] = (tid, owner);
+            kept += 1;
+        }
+    }
+    let all_tids = &all_tids[..kept];
 
     // Set ALL interrupted flags FIRST — before any wake() call. This prevents
     // a race where a thread wakes from schedule_blocking, checks
     // is_current_interrupted() (false — not set yet), and re-enters
     // schedule_blocking before we set the flag.
-    for &tid in all_tids {
+    for &(tid, _) in all_tids {
         crate::process::interrupt_thread(tid);
     }
 
     // NOW pend signals and wake. pend_signal_for_thread calls wake() internally.
     // The interrupted flag is already set, so when the thread wakes and checks
     // is_current_interrupted(), it sees true.
-    for &tid in all_tids {
+    for &(tid, _) in all_tids {
         threading::pend_signal_for_thread(tid, sig);
     }
 
+    // `true` regardless of `kept`: the process **exists** — that is what this
+    // return value means and what `sys_kill` maps to `0`-vs-`ESRCH`. A zombie
+    // whose slot has been reissued is still a process a `kill` legitimately
+    // finds; there is simply nothing running to interrupt.
     true
 }
 

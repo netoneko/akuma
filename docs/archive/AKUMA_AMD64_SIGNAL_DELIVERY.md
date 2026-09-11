@@ -146,19 +146,78 @@ the shared `spawn_child_thread_and_publish`, which has always written
 `Some(tid)`. What was `None` was precisely the half that could not be
 signalled — `init`, everything `sshd` spawns, and every `execve`d image.
 
-### 5d. `interrupt_thread` wrote the channel nobody reads
+### 5d. `interrupt_thread` writes the channel nobody reads — and the obvious fix is a worse bug
 
 `is_current_interrupted` reads `Process::channel` **first** and only falls back
-to the per-thread registry; `interrupt_thread` wrote the registry alone. On
-AArch64 those are the same `Arc` and the difference never showed. On amd64 they
+to the per-thread registry; `interrupt_thread` writes the registry alone. On
+AArch64 those are the same `Arc` and the difference never shows. On amd64 they
 are two objects — every process registers an *exit* channel under its task slot
 (that is what makes `wait4` shared code), and a console-attached process also
-carries the serial line's own channel in `Process::channel`. So `kill` set
-`interrupted` on the exit channel and `should_interrupt_blocking_syscall` read
+carries the serial line's own channel in `Process::channel`. So `kill` sets
+`interrupted` on the exit channel and `should_interrupt_blocking_syscall` reads
 the console one.
 
-Fixed in `akuma-exec`, at the root rather than at `deliver_signal`, so every
-caller gets it. This is the **only** shared-crate behaviour change in this work;
+**This was "fixed" by having `interrupt_thread` write both, and the fix was
+reverted.** One line up the file from the field, `Process::inherit_from` does
+`channel: parent.channel.clone()` — so a `Process::channel` is shared by an
+entire **process tree**, and on amd64 with a console-attached `init` (which is
+every rig: `init=/bin/sshd`) that is every process on the machine. A
+per-process interrupt flag cannot live in an object the whole machine shares.
+
+**So the gap stands**, and it is narrower than it looks: the per-thread `EINTR`
+path (`current_thread_has_pending_interrupt`, reading the pending set) is
+unaffected and is what every "a `kill` interrupts a blocking syscall" case
+actually uses — rung 6 passes without the flag. Closing it properly means a
+per-**thread** interrupt flag that is not a shared `Arc`, found without paying a
+`get_channel` map lookup on every syscall.
+
+**A false trail is recorded here on purpose**, because it cost the most time in
+this whole piece and the shape of the mistake is reusable. A `sigprobe` rc=130
+appeared, the sharing hazard above was a perfect-looking explanation, and
+reverting `interrupt_thread` **did not fix it** — 3 runs of 3 still failed. The
+sharing hazard is real by inspection and the revert stands on its own; it was
+simply not this failure. What found the real one was refusing to stop at a
+plausible cause: one `safe_print!` in the prologue's interrupted arm, naming the
+pid and syscall number (`pid=77 tid=4 nr=173` — `getppid`, rung 11's), and then
+an A/B with the tick delivery compiled out, which still failed and cleared the
+other suspect. See §5f.
+
+### 5e. `deliver_signal` signalled recycled thread slots
+
+Found while chasing 5d, and kept. `Process::thread_id` is a *recorded* slot
+number and slots are recycled, so a signal to a process whose thread has already
+exited — a zombie, which `lookup_process_shared` finds perfectly well — names a
+slot that may be running something else. `kill_process` and
+`kill_process_with_signal` both guard this, at length and after being bitten;
+`deliver_signal` did not. `sigprobe`'s `reap_with_signal` creates the window
+deliberately: it re-sends every 50 ms while polling `waitpid`, and the send
+after the child dies but before the reap is exactly it.
+
+Guarded now with the same `slot_still_owned_by` the neighbours use, applied
+after collection so the `for_each_process` callback — which runs IRQ-masked and
+must not lock — stays as it was.
+
+### 5f. A `kill` marked its target a zombie that had exited 130 — while it ran on
+
+The one rung 11 found, and the one the false trail in §5d was hiding.
+
+`akuma-syscalls-glue`'s dispatch prologue read `is_current_interrupted()` on
+every syscall and, when set, stamped the caller `exited = true`,
+`exit_code = 130`, `state = Zombie(130)` — **marking a process dead while it is
+running** — before returning `EINTR`. The theory was that the flag means Ctrl-C
+and Ctrl-C means death. Neither half holds. `deliver_signal` raises the flag for
+**every** signal, not only `SIGINT`, so `kill(getpid(), SIGUSR1)` stamped the
+caller; and the killing is the *signal's* job, and has been since 2026-08-24
+(`CTRL_C_SIGINT_DELIVERY.md`) — the same `kill_process_group` that raises the
+flag pends `SIGINT`, whose default action terminates at the next return to
+userspace. The stamp was belt-and-braces from before delivery worked, and what
+it did instead was overwrite the truth with a guess.
+
+Measured: `sigprobe` printed every remaining rung and `_exit(0)`, and `ssh`
+reported **130**. Deterministic, 3 runs of 3. The prologue returns `EINTR` and
+nothing else now — which is the flag's actual job.
+
+Together with 5e, that is **two** shared-crate behaviour changes;
 `akuma-syscalls-abi`'s seven new rows are additive.
 
 ## 6. The console: `^C` becomes `SIGINT`
@@ -209,15 +268,13 @@ and honours `SA_RESTART`.
 
 ## 8. What is still open
 
-- **Delivery on the timer tick's `iretq`, and out of a `#PF`** — §3 item 1. Two
-  consequences, and the second is the bigger one. A compute-bound program with
-  no syscalls is unreachable by `^C`; and a **fault does not become a signal**
-  at all — `idt.rs` calls `usermode::kill_current_from_fault` directly, so there
-  is no `SIGSEGV` to catch. That is why the two `c_stress` memory probes
-  `amd64_mem_trials.py` excuses — `mprotectlb` and `eager_mprotect_probe`, both
-  recorded as "needs a SIGSEGV handler; this target has no signal delivery" —
-  are **not** fixed by this work. Their `EXPECTED_FAIL` reason wants rewording to
-  name the fault path rather than delivery in general; the probes still fail.
+- **Delivery on the timer tick's `iretq`** — §3 item 1. A compute-bound program
+  with no syscalls is unreachable by `^C`.
+
+  The other half of that item — **delivery out of a `#PF`/`#GP`** — is **done**,
+  later the same day: `AKUMA_AMD64_FAULT_SIGNALS.md`. A fault is a catchable
+  `SIGSEGV` now, `amd64_mem_trials.py`'s `EXPECTED_FAIL` table is empty, and the
+  memory probes are 10/10.
 - **`akuma-net`'s `is_current_interrupted` hook is still `false`**, so a socket
   read is not interruptible even though glue's blocking arms are. The module
   header's reason used to be "no signals"; it is narrower now and the hook is
@@ -227,12 +284,26 @@ and honours `SA_RESTART`.
   exist in glue and would fold; `rt_sigsuspend` in particular interacts with the
   epilogue (it arms a restore-mask that AArch64's frame builder consumes), so it
   wants its own probe rung before it lands.
-- **`getpid` still answers a literal `1`.** That is a separate pinned decision
-  and it makes musl's `pthread_kill` — which is `tgkill(self->pid, tid, sig)` —
-  fail the `tgid` check for any process but `init`. `raise` is unaffected
-  (`find_pid_by_thread` falling through means `tgkill` defers to `tkill`), which
-  is why the probe passes; `pthread_kill` between two threads of a real process
-  is the case to fix it for.
+- ~~**`getpid` still answers a literal `1`.**~~ **Fixed later the same day** —
+  folded to glue with `getppid`, and `sigprobe` gained rung 11 for it.
+
+  **The reason first written here was wrong and is worth correcting rather than
+  deleting**, because it is the plausible-sounding one: musl spells *both*
+  `raise(3)` and `pthread_kill(3)` with **`tkill`**, which takes a thread id and
+  never consults `getpid`. (glibc spells them with `tgkill(getpid(), …)` and
+  *would* have been broken by the constant — the day something
+  dynamically-linked and non-musl runs here.) What the literal 1 actually broke
+  is `kill(getpid(), sig)`, which `sys_kill` refuses outright (`pid <= 1` →
+  `EPERM`), and every identity use of a pid: `$$` was 1 in every shell on the
+  machine at once — measured on the metal — so a pid-named temp file, lock or
+  log line collided with everything else, and no `ps` row could be correlated
+  with it.
+
+  `getpgid`/`getsid` still answer `1`, deliberately: `foreground_pgid` defaults
+  to 1 and `kill_process_group` excludes the leader, which is exactly what makes
+  `^C` reach `init`'s children and not `init`. A shell reading a real `getpgid`
+  and `TIOCSPGRP`ing it would move that target, and nothing here has been tested
+  against job control.
 - **An `ssh` session's `^C`** still does not raise `SIGINT`: the child's stdin is
   a pipe with no channel to run a line discipline on. That is item 3 of the
   walk's YOU-ARE-HERE, unchanged.
@@ -253,7 +324,9 @@ and honours `SA_RESTART`.
 
 ## 9. Verification
 
-`userspace/forktest/c_stress/sigprobe.c`, eight rungs, wired into
+`userspace/forktest/c_stress/sigprobe.c` — eight rungs when this piece landed,
+twelve by the end of the day (`AKUMA_AMD64_FAULT_SIGNALS.md` adds 9-12) — wired
+into
 `scripts/utils/amd64_ring3_check.py` beside `grandfork`. It is a **musl
 program's** view — `sigaction` recording a handler, a frame the handler's `ret`
 returns through, `rt_sigreturn` restoring a register file the kernel did not
@@ -272,6 +345,7 @@ the run.
 | 6 eintr | a signal breaks a blocking `read` (no `SA_RESTART`) |
 | 7 fatal | `SIG_DFL` `SIGTERM` to a child is `WIFSIGNALED`, not ignored |
 | 8 abort | `abort()` reaches `SIGABRT` through musl's block/`tkill`/unblock |
+| 9-12 | added later the same day: a catchable `SIGSEGV` two ways, `kill(getpid())`, and delivery to a pure compute loop — `AKUMA_AMD64_FAULT_SIGNALS.md` §6 and §7 |
 
 Statically linked musl, so **the same binary was run on real Linux** (the
 trashcan's Ubuntu personality) and all eight rungs pass there — the A/B that

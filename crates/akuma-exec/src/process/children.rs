@@ -267,38 +267,36 @@ pub fn is_current_interrupted() -> bool {
 ///
 /// Used by the SSH shell to send Ctrl+C signal to a running process.
 ///
-/// **Both channels, because a process can have two.** [`is_current_interrupted`]
-/// reads `Process::channel` *first* and only falls back to the per-thread
-/// registry; this function used to write the registry alone. Where the two are
-/// the same `Arc` — every AArch64 process — the second store is idempotent and
-/// nothing changes. Where they are not, the flag landed on the channel nobody
-/// reads and the interrupt was silently lost.
+/// # Why this writes the per-thread registry and **not** `Process::channel`
 ///
-/// The target that has two is amd64: since 2026-09-10 every process there
-/// registers an **exit** channel under its task slot (that is what makes `wait4`
-/// shared code), and since 2026-09-11 a console-attached process *also* carries
-/// the serial line's own channel in `Process::channel`
-/// (`AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3). `deliver_signal` would set
-/// `interrupted` on the exit channel and `should_interrupt_blocking_syscall`
-/// would read the console one — so `kill` reported success and a `read` blocked
-/// on the console never returned `EINTR`.
+/// It tried to, for one day (2026-09-11), and the reason it was tried is a real
+/// gap: [`is_current_interrupted`] reads `Process::channel` **first** and only
+/// falls back to this registry, so on a target where the two differ the flag
+/// lands on the channel nobody reads. That target is amd64, where every process
+/// registers an *exit* channel under its task slot and a console-attached one
+/// also carries the serial line's channel in `Process::channel`.
 ///
-/// Order is registry-then-process: `is_interrupted` **consumes** the flag
-/// (`swap`), and the process channel is the one that will be read, so it is
-/// written last for no reason other than symmetry — either order is correct
-/// because each store is independent.
+/// **Writing both is wrong, and the reason is one line up the file:**
+/// `Process::inherit_from` does `channel: parent.channel.clone()`, so a
+/// `Process::channel` is shared by an entire process tree. On amd64 with a
+/// console-attached `init` — which is every rig, `init=/bin/sshd` — that is
+/// *every process on the machine*. Setting the flag there made a `kill` to one
+/// process interrupt all of them: `akuma-syscalls-glue`'s dispatch prologue
+/// reads `is_current_interrupted` on every syscall and marks the caller
+/// `Zombie(130)`, so an unrelated program reported exit 130 while still
+/// running. Measured deterministically — 3 runs of 3 — by
+/// `userspace/forktest/c_stress/sigprobe.c` after ten `ssh` workload sessions;
+/// `AKUMA_AMD64_SIGNAL_DELIVERY.md` §5d.
+///
+/// So the gap stands, and it is narrower than it looks: the *per-thread*
+/// `EINTR` path (`current_thread_has_pending_interrupt`, reading the pending
+/// set) is not affected and is what every `kill`-interrupts-a-blocking-syscall
+/// case actually uses. Closing it properly means giving
+/// `is_current_interrupted` a per-**thread** flag that is not a shared `Arc`,
+/// and not paying a `get_channel` map lookup on every syscall to find it.
 pub fn interrupt_thread(thread_id: usize) {
     if let Some(channel) = get_channel(thread_id) {
         channel.set_interrupted();
-    }
-    // The owning process's own channel, when it has one and it is a different
-    // object. Resolved through `THREAD_PID_MAP` rather than a scan: this runs
-    // once per signal delivery, not on a syscall path.
-    if let Some(pid) = crate::process::table::pid_for_thread(thread_id)
-        && let Some(proc) = lookup_process_shared(pid)
-        && let Some(ref ch) = proc.channel
-    {
-        ch.set_interrupted();
     }
 }
 
