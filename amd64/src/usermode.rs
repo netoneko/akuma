@@ -2942,8 +2942,11 @@ use crate::pipe::{self, PipeId};
 
 /// One spawned child.
 ///
-/// **C2 slice 6 deleted three of the four stdio fields.**
-/// `stdout_pipe`/`borrowed_io`/`console_io` existed because a spawned child's
+/// **One stdio field left of four, and the last one to go had a reader.**
+///
+/// C2 slice 6 deleted `borrowed_io`/`console_io` and rewrote what `stdout_pipe`
+/// was *for*; 2026-09-11 deleted `stdout_pipe` itself. The three existed
+/// because a spawned child's
 /// stdio was routed *by number*: every unbound fd 0/1/2 read or write asked
 /// the spawn row which pipe (or console) served it, and the exit path closed
 /// the child's stdout end by hand, guarded by `borrowed_io` so a `fork` child
@@ -2960,6 +2963,12 @@ use crate::pipe::{self, PipeId};
 ///   `spawn_record_exit` runs — the parent's reader sees EOF with no
 ///   per-spawn code (the manual `close_write` this replaced would now be a
 ///   *double* close).
+///
+/// `stdout_pipe` outlived those by one slice because it had acquired a second,
+/// unrelated job: naming the child a `TIOCSWINSZ` on the parent's stdout
+/// descriptor is meant for. That question is asked of the child's registered
+/// fd 1 now ([`child_of_stdout_pipe`]) — the same descriptor slice 6 created,
+/// so the row was carrying a second copy of a fact the table already held.
 ///
 /// **`stdin_pipe` stays, and that is a carried decision rather than a
 /// leftover.** Its *read* end is the child's fd 0 and dies with the child's
@@ -2979,21 +2988,6 @@ struct Spawn {
     /// `None` for a `fork` child, which shares its parent's by descriptor. See
     /// the type's header for why this one field outlived the other three.
     stdin_pipe: Option<PipeId>,
-    /// The stdout pipe this spawn created, whose *read* end the parent holds as
-    /// a `PipeRead` descriptor; `None` for a `fork` child, which creates no
-    /// pipe of its own.
-    ///
-    /// Recorded for one reader: [`child_of_stdout_pipe`], which is how a
-    /// `TIOCSWINSZ` arriving on that descriptor finds the child whose
-    /// `TerminalState` it is meant for. On AArch64 the same question is
-    /// answered by the descriptor itself (`FileDescriptor::ChildStdout(pid)`);
-    /// this target hands the parent a plain `PipeRead` and so has to carry the
-    /// link here instead.
-    ///
-    /// The id cannot go stale under a live descriptor: a pipe is destroyed only
-    /// when both end counts reach zero, so while the parent holds the read end
-    /// this id names this pipe and no later spawn can be handed it.
-    stdout_pipe: Option<PipeId>,
     /// The scheduler task slot running this child, recorded at spawn so the
     /// `waitpid` reap can remove the `THREAD_PID_MAP` entry it published
     /// (`reap_exec_process`). A `usize` is wider than `sched::MAX_TASKS` needs,
@@ -3948,7 +3942,6 @@ pub fn bind_child_task(
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid: child.pid,
             stdin_pipe: None,
-            stdout_pipe: None,
             exec_slot: task_slot,
         });
     }
@@ -4114,7 +4107,6 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid,
             stdin_pipe: Some(stdin_pipe),
-            stdout_pipe: Some(stdout_pipe),
             exec_slot: task_slot,
         });
     }
@@ -4136,6 +4128,14 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
 /// Release the pipes of a spawn that never got a task. The image itself is a
 /// local value now and drops on the way out of [`sys_spawn`], which is why this
 /// no longer takes a slot: there is nothing parked under one to take back.
+/// Release both pipes of a `sys_spawn` that failed **before** the row was
+/// written and before any descriptor named them.
+///
+/// `pipe::free`, not `close_write`/`close_read`, and that is right *here* and
+/// nowhere else: on this path the pipes were allocated moments ago and nothing
+/// holds an end — no child table, no `/proc/<pid>/fd/0`, no row — so there are
+/// no counts to let decide. Every other release site in this module has a
+/// holder and uses the counts (see the `Spawn` header).
 fn cleanup_spawn_slot(stdout_pipe: PipeId, stdin_pipe: PipeId) {
     pipe::free(stdout_pipe);
     pipe::free(stdin_pipe);
@@ -4492,14 +4492,39 @@ fn spawn_row_of(pid: u32) -> Option<usize> {
 /// terminal state, which is the behaviour this target had for every fd.
 #[must_use]
 pub fn child_of_stdout_pipe(pipe_id: usize) -> Option<u32> {
-    // SAFETY: raw-pointer read; single core, no row mutated.
-    unsafe {
-        (*spawn_table())
-            .iter()
-            .flatten()
-            .find(|s| s.stdout_pipe == Some(pipe_id))
-            .map(|s| s.pid)
-    }
+    // **Asked of the child's own registered fd table, not of a `Spawn` field.**
+    //
+    // The row carried a `stdout_pipe: Option<PipeId>` for this one reader until
+    // 2026-09-11, which was the right answer while a spawned child's stdio was
+    // routed *by number* — there was no descriptor to ask. C2 slice 6 made the
+    // child's fd 1 a real `PipeWrite` in its own registered table
+    // (`fd::bind_stdio`), so the link the row was carrying is now recorded in
+    // the place that owns it, and a second copy could only drift.
+    //
+    // fd **1**, not 2: `bind_stdio` binds both names to the one description, so
+    // either answers, and 1 is the one whose meaning is "this child's stdout".
+    //
+    // A scan, where the field was a lookup, and that is affordable here in a
+    // way it would not be on a hot path: the one caller is `TIOCSWINSZ`
+    // arriving on a parent's stdout descriptor — once per `pty-req`, i.e. once
+    // per ssh session. `for_each_process` runs with IRQs disabled and its
+    // callback must not allocate; `get_fd` returns a `Copy` descriptor and
+    // allocates nothing.
+    let mut found = None;
+    akuma_exec::process::for_each_process(|p| {
+        // `FileDescriptor` has no `PartialEq`, so the arm is matched rather
+        // than compared — which also keeps this honest about wanting a
+        // `PipeWrite` specifically and not "whatever fd 1 is".
+        if found.is_none()
+            && matches!(
+                p.fds.table.lock().get(&1),
+                Some(akuma_exec::process::FileDescriptor::PipeWrite(id)) if *id == pipe_id as u32
+            )
+        {
+            found = Some(p.pid);
+        }
+    });
+    found
 }
 
 #[cfg(not(feature = "no-tests"))]
