@@ -1250,44 +1250,65 @@ fn read_capacity(x: &mut Xhci) -> Result<(), &'static str> {
 // BOT transport
 // ===========================================================================
 
-/// A data-phase-stalled BOT command, with what recovery needs to know.
+/// How one BOT command attempt came back. The *decision* — recover and
+/// retry, or give up — lives in `akuma_xhci::recovery::retry_decision` and is
+/// host-tested against the 2026-09-11 metal incident; this enum only carries
+/// what that decision and the recovery need.
 enum BotErr {
-    /// The controller never completed the TD.
-    Timeout(&'static str),
     /// The controller completed the TD with a completion code the BOT layer
     /// cannot use.
-    Stalled { code: u8, phase: &'static str, dci: u8 },
+    Stalled { code: u8, phase: Phase, dci: u8 },
+    /// The controller never completed the TD within `BUDGET`. The TD is
+    /// still live in the ring and the device may answer late — the photograph
+    /// of 2026-09-11 shows a data-phase STALL arriving just past the budget:
+    /// indistinguishable from never answering, and deadly when treated that
+    /// way, because nothing un-halted.
+    TimedOut { phase: Phase, dci: u8 },
+    /// The CSW was unparseable or its tag mismatched — pipe desynced.
+    Desynced { phase: Phase, dci: u8 },
 }
 
-/// Run one BOT command, recovering from a stall once. Class-standard recovery
-/// (controller Reset Endpoint + Set TR Dequeue Pointer, then BOT Mass Storage
-/// Reset and CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints) happens in
-/// [`recover`]; this re-issues the whole command exactly once afterwards — a
-/// device that stalls twice on the same command has a real problem and should
-/// say so.
+use akuma_xhci::recovery::{recovery_plan, retry_decision, AttemptOutcome, Decision, Phase, RecoveryStep};
+
+impl BotErr {
+    fn outcome(&self) -> AttemptOutcome {
+        match *self {
+            Self::Stalled { code, phase, dci } => AttemptOutcome::Stalled { code, phase, dci },
+            Self::TimedOut { phase, dci } => AttemptOutcome::TimedOut { phase, dci },
+            Self::Desynced { phase, dci } => AttemptOutcome::Desynced { phase, dci },
+        }
+    }
+}
+
+/// Run one BOT command, recovering once from a stall OR a timeout. Every
+/// failure shape `akuma_xhci::recovery` covers gets the class-standard
+/// recovery (see [`recover`]) and exactly one retry; a command that fails
+/// again afterwards is reported and given up on.
 fn bot_run(
     x: &mut Xhci,
     command: akuma_usb_storage::Command,
     data_len: usize,
 ) -> Result<(CswStatus, u32), &'static str> {
-    match bot_run_once(x, command, data_len) {
-        Ok(r) => Ok(r),
-        Err(BotErr::Timeout(e)) => Err(e),
-        Err(BotErr::Stalled { code, phase, dci }) => {
-            if !recover(x, code, phase, dci) {
-                return Err("bulk transfer error");
-            }
-            serial::puts("  [xhci] stall recovered — retrying the command once\n");
-            match bot_run_once(x, command, data_len) {
-                Ok(r) => Ok(r),
-                Err(BotErr::Timeout(e)) => Err(e),
-                Err(BotErr::Stalled { code, phase, dci }) => {
-                    let _ = recover(x, code, phase, dci);
-                    Err("bulk transfer stalled again after recovery")
+    for attempt in 0..=2u8 {
+        match bot_run_once(x, command, data_len) {
+            Ok(r) => return Ok(r),
+            Err(e) => match retry_decision(attempt, &e.outcome()) {
+                Decision::RecoverAndRetry => {
+                    if !recover(x, &e) {
+                        return Err("bulk transfer error");
+                    }
+                    if attempt == 0 {
+                        serial::puts("  [xhci] stall recovered - retrying the command once\n");
+                    }
                 }
-            }
+                Decision::GiveUp => return Err("bulk transfer error"),
+                Decision::Dead => {
+                    return Err("bulk transfer failed again after recovery");
+                }
+            },
         }
     }
+    unreachable!("retry_decision caps the loop at one retry")
 }
 
 fn bot_run_once(
@@ -1307,11 +1328,11 @@ fn bot_run_once(
         x.bulk_out_dci,
         &[trb::normal(cbw_phys, 31, true)],
         31,
-        "CBW",
+        Phase::Cbw.as_str(),
     )
-    .map_err(BotErr::Timeout)?;
+    .map_err(|_| BotErr::TimedOut { phase: Phase::Cbw, dci: x.bulk_out_dci })?;
     if code != cc::SUCCESS {
-        return Err(BotErr::Stalled { code, phase: "CBW", dci: x.bulk_out_dci });
+        return Err(BotErr::Stalled { code, phase: Phase::Cbw, dci: x.bulk_out_dci });
     }
 
     let mut moved = 0u32;
@@ -1322,11 +1343,14 @@ fn bot_run_once(
             Direction::In => (Ring::BulkIn, RingField::BulkIn, x.bulk_in_dci, true),
             _ => (Ring::BulkOut, RingField::BulkOut, x.bulk_out_dci, false),
         };
+        let phase = Phase::Data;
         let (count, td) = trb::data_trbs(bp, n);
-        let (code, m) = x.transfer(ring, field, dci, &td[..count], n, "data").map_err(BotErr::Timeout)?;
+        let (code, m) = x
+            .transfer(ring, field, dci, &td[..count], n, phase.as_str())
+            .map_err(|_| BotErr::TimedOut { phase, dci })?;
         moved = m;
         if code != cc::SUCCESS && !(code == cc::SHORT_PACKET && is_in) {
-            return Err(BotErr::Stalled { code, phase: "data", dci });
+            return Err(BotErr::Stalled { code, phase, dci });
         }
     }
 
@@ -1337,15 +1361,16 @@ fn bot_run_once(
         x.bulk_in_dci,
         &[trb::normal(csw_phys, 13, true)],
         13,
-        "CSW",
+        Phase::Csw.as_str(),
     )
-    .map_err(BotErr::Timeout)?;
+    .map_err(|_| BotErr::TimedOut { phase: Phase::Csw, dci: x.bulk_in_dci })?;
     if code != cc::SUCCESS && code != cc::SHORT_PACKET {
-        return Err(BotErr::Stalled { code, phase: "CSW", dci: x.bulk_in_dci });
+        return Err(BotErr::Stalled { code, phase: Phase::Csw, dci: x.bulk_in_dci });
     }
-    let csw = Csw::parse(&csw_buf()[..13]).ok_or(BotErr::Timeout("CSW signature mismatch — pipe desynced"))?;
+    let csw = Csw::parse(&csw_buf()[..13])
+        .ok_or(BotErr::Desynced { phase: Phase::Csw, dci: x.bulk_in_dci })?;
     if csw.tag != tag {
-        return Err(BotErr::Timeout("CSW tag mismatch"));
+        return Err(BotErr::Desynced { phase: Phase::Csw, dci: x.bulk_in_dci });
     }
     Ok((csw.status, moved))
 }
@@ -1360,44 +1385,144 @@ fn bulk_ep_addr(dci: u8) -> u8 {
     }
 }
 
-/// Class-standard mass-storage stall recovery. Returns `true` when recovery
-/// ran and the caller may retry the command once; `false` for a completion
-/// code recovery does not cover.
+/// Run one step of [`akuma_xhci::recovery`]'s plan, printing the result.
+/// Every step used to be `let _ =`-swallowed; the 2026-09-11 photograph
+/// shows recovery announcing success while the very next transfer was dead —
+/// if Set TR Dequeue Pointer answers `cc=CONTEXT_STATE` (STDP on a running
+/// endpoint) we must see it, not sail past it.
+fn recover_step(x: &mut Xhci, what: &str, t: [u32; 4]) {
+    match x.command(t, what) {
+        Ok((code, _)) if code == cc::SUCCESS => {}
+        Ok((code, _)) => {
+            puthex("  [xhci] recovery step cc=", u32::from(code));
+            serial::puts("  [xhci] step ");
+            serial::puts(what);
+            serial::puts("\n");
+        }
+        Err(e) => {
+            serial::puts("  [xhci] recovery step timeout: ");
+            serial::puts(e);
+            serial::puts(" (");
+            serial::puts(what);
+            serial::puts(")\n");
+        }
+    }
+}
+
+/// Read the EP State field of endpoint `dci` from the device context —
+/// 0 disabled, 1 running, 2 halted, 3 stopped, 4 error (xHCI Table 6-9).
 ///
-/// Three halves, in the order the spec and Linux do them:
+/// Indexing: the **device** context lays out slot ctx at index 0 and EP ctx
+/// for `dci` at index `dci` — `dci + 1` is the *input* context's layout
+/// (which has the Input Control Context at 0). First version read `dci + 1`
+/// here and reported state 0 (disabled) for a perfectly running endpoint,
+/// because it was reading the zeroed slot past the last real context.
+fn ep_state(x: &Xhci, dci: u8) -> u32 {
+    let base = context::context_offset(usize::from(dci), x.context_bytes);
+    // SAFETY: `DEV_CTX` is the live device context (DCBAA slot points at it);
+    // the lock is held and this is a read of our own DMA memory.
+    let dw0 = unsafe {
+        core::ptr::read_unaligned((&raw const DEV_CTX).cast::<u8>().add(base).cast::<u32>())
+    };
+    (dw0 >> 2) & 0x7
+}
+
+fn print_ep_state(x: &Xhci, dci: u8) {
+    let state = ep_state(x, dci);
+    serial::puts("  [xhci] ep ");
+    serial::put_dec(u64::from(u32::from(dci)));
+    serial::puts(" state ");
+    serial::put_dec(u64::from(state));
+    serial::puts(" (0=dis 1=run 2=halt 3=stop 4=err)\n");
+}
+
+/// Class-standard mass-storage recovery for a stalled or timed-out phase.
+/// Returns `true` when recovery ran and the caller may retry the command
+/// once; `false` for a completion code recovery does not cover.
 ///
-/// 1. **Controller.** Reset Endpoint clears the halted state — but leaves the
-///    ring's dequeue parked on the TRB that stalled, so every later transfer
-///    would time out in its first phase. Set TR Dequeue Pointer moves it to
-///    the ring's enqueue position, with the cycle the TRB there will carry
-///    (`ProducerRing::cycle`).
-/// 2. **Device.** The Bulk-Only Mass Storage Reset (class request `0xFF` on
-///    the BOT interface) clears the *device's* halt — a controller-side reset
-///    does not — and `CLEAR_FEATURE(ENDPOINT_HALT)` clears each bulk
-///    endpoint's halt at the device.
-/// 3. Both bulk rings get a fresh dequeue pointer, since either may have been
-///    the one the device halted.
-fn recover(x: &mut Xhci, code: u8, phase: &str, dci: u8) -> bool {
-    puthex("  [xhci] bulk cc=", u32::from(code));
-    serial::puts("  [xhci] phase ");
-    serial::puts(phase);
-    serial::puts("\n");
-    if code != cc::STALL_ERROR {
+/// The sequence and its ordering come from
+/// [`akuma_xhci::recovery::recovery_plan`] (host-tested); this function only
+/// performs the steps against the hardware. Controller-side work touches the
+/// failed ring ONLY — Reset Endpoint and Set TR Dequeue Pointer are illegal
+/// on a running endpoint — while the device-side Mass Storage Reset and the
+/// per-endpoint CLEAR_FEATUREs cover either bulk endpoint, because the
+/// device may have halted either.
+fn recover(x: &mut Xhci, e: &BotErr) -> bool {
+    let outcome = e.outcome();
+    let (code, phase, dci) = match outcome {
+        AttemptOutcome::Stalled { code, phase, dci } => (Some(code), phase, dci),
+        AttemptOutcome::TimedOut { phase, dci } | AttemptOutcome::Desynced { phase, dci } => {
+            (None, phase, dci)
+        }
+    };
+    if let Some(code) = code
+        && code != cc::STALL_ERROR
+    {
+        puthex("  [xhci] bulk cc=", u32::from(code));
+        serial::puts("  [xhci] phase ");
+        serial::puts(phase.as_str());
+        serial::puts("\n");
         return false;
     }
-    let _ = x.command(trb::reset_endpoint(x.slot, dci), "reset ep");
-    let _ = x.control(0x21, 0xFF, 0, u16::from(x.bot_if), 0); // BOT Mass Storage Reset
-    let _ = x.control(0x02, 0x01, 0, u16::from(bulk_ep_addr(x.bulk_in_dci)), 0);
-    let _ = x.control(0x02, 0x01, 0, u16::from(bulk_ep_addr(x.bulk_out_dci)), 0);
-    for (ring, field, d) in [
-        (Ring::BulkIn, RingField::BulkIn, x.bulk_in_dci),
-        (Ring::BulkOut, RingField::BulkOut, x.bulk_out_dci),
-    ] {
-        let idx = x.producer(field).enqueue_index();
-        let cycle = x.producer(field).cycle();
-        let dequeue = ring_phys(ring) + (idx as u64) * 16;
-        let _ = x.command(trb::set_tr_dequeue_pointer(x.slot, d, dequeue, cycle), "set tr dequeue");
+
+    match e {
+        BotErr::Stalled { code, .. } => {
+            puthex("  [xhci] bulk cc=", u32::from(*code));
+        }
+        BotErr::TimedOut { .. } => {
+            serial::puts("  [xhci] transfer timed out - device slow, not halted; retrying\n");
+        }
+        BotErr::Desynced { .. } => {
+            serial::puts("  [xhci] CSW desynced - recovering\n");
+        }
     }
+    serial::puts("  [xhci] phase ");
+    serial::puts(phase.as_str());
+    serial::puts("\n");
+
+    // `failed_dci` maps to exactly one bulk ring; the other ring keeps its
+    // dequeue. Controller-side steps (Reset Endpoint, Set TR Dequeue Pointer)
+    // are legal only on a HALTED endpoint — the 2026-09-11 metal run answered
+    // both with `cc=0x13 CONTEXT_STATE_ERROR` because the endpoint was merely
+    // slow (a post-idle command completing late, `cc=1` events arriving after
+    // the budget), not halted. Resetting a running endpoint is at best noise
+    // and at worst deranges a live ring, so a timeout whose endpoint reads
+    // not-halted skips them entirely and just retries the command.
+    let (failed_ring, failed_field) = if dci == x.bulk_in_dci {
+        (Ring::BulkIn, RingField::BulkIn)
+    } else {
+        (Ring::BulkOut, RingField::BulkOut)
+    };
+    let halted = ep_state(x, dci) == 2;
+    print_ep_state(x, dci);
+    if !halted {
+        serial::puts("  [xhci] ep not halted - controller reset skipped (device slow, not stuck)\n");
+    }
+    for step in recovery_plan(dci, bulk_ep_addr(x.bulk_in_dci), bulk_ep_addr(x.bulk_out_dci)) {
+        match step {
+            RecoveryStep::ResetEndpoint { dci } if halted => {
+                recover_step(x, "reset ep", trb::reset_endpoint(x.slot, dci));
+            }
+            RecoveryStep::SetTrDequeuePointer { dci } if halted => {
+                let idx = x.producer(failed_field).enqueue_index();
+                let cycle = x.producer(failed_field).cycle();
+                let dequeue = ring_phys(failed_ring) + (idx as u64) * 16;
+                recover_step(
+                    x,
+                    "set tr dequeue",
+                    trb::set_tr_dequeue_pointer(x.slot, dci, dequeue, cycle),
+                );
+            }
+            RecoveryStep::ResetEndpoint { .. } | RecoveryStep::SetTrDequeuePointer { .. } => {}
+            RecoveryStep::BotMassStorageReset => {
+                let _ = x.control(0x21, 0xFF, 0, u16::from(x.bot_if), 0);
+            }
+            RecoveryStep::ClearHalt { ep_addr } => {
+                let _ = x.control(0x02, 0x01, 0, u16::from(ep_addr), 0);
+            }
+        }
+    }
+    print_ep_state(x, dci);
     true
 }
 

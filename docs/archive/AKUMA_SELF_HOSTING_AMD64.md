@@ -2032,3 +2032,18 @@ divergence. Difference-by-duplication (the third category, most of
   (`clone(CLONE_VM|CLONE_THREAD)`) as the wall A1 removes.
 - `docs/archive/AKUMA_AMD64_COW.md` — the pinned CoW-marker divergence, and why
   CoW fork is SMP=1-only on this target today.
+
+## Console font: no em-dash / emoji glyphs (found 2026-09-11)
+
+The amd64 framebuffer console font (spleen 8x16) has no glyphs for `—`
+(U+2014) or any emoji, so runtime log strings using them print replacement
+boxes — `transfer timed out ▯▯▯ recovering` went to the framebuffer that way
+during the xHCI stall investigation. Two of the new strings shipped with the
+box characters before being converted to ASCII (`--`).
+
+What we want: a console font (or font-override table) that carries the
+em-dash and a small emoji set, so kernel messages can use them without
+printing boxes. Until then the rule stands: **runtime strings are plain
+ASCII** — comments may use whatever the editor likes, `serial::puts`/console
+output may not. The aarch64 kernel's console path has the same constraint;
+the want applies to both.
