@@ -230,11 +230,12 @@ reader had the same problem from the other end.
 | AArch64 boot suite (`MEMORY=2048M INSTANCE=3`) | 307 / 0 | **307 / 0** |
 | host tests (`cargo test`) | 1375 / 0 | **1375 / 0** |
 | clippy — amd64 `--release`, `--release --features no-tests`, and AArch64 | clean | **clean** |
-| **bare metal** (HP box, `root=/dev/sda1`) | 665 / 0 | **663 / 3** before the fix; **re-run pending** |
+| **bare metal** (HP box, `root=/dev/sda1`) | 665 / 0 | **666 / 0** — 663/3 before the interrupt-bit fix |
 
-**The bare-metal re-run of the fix is outstanding** and is the one that matters:
-it is the only gate that measured the regression at all. Everything above it was
-green through both the broken and the fixed tree.
+Bare metal is the gate that matters here: it is the **only** one that saw the
+regression at all — everything above it was green through both the broken and
+the fixed tree. 666 = the parent's 665 plus this piece's one new check, which is
+the arithmetic that says nothing else moved.
 
 The `+1` on the two boot suites is the new `spawn:` check that the child has an
 I/O channel behind its stdio descriptors. That one is not decoration: glue's
@@ -335,11 +336,53 @@ of each test that matters is the one where before and after differ.
 
 | | `75041b73` | after |
 |---|---|---|
-| `[ -t 0 ] [ -t 1 ] [ -t 2 ]` in an `ssh` session | tty / tty / tty — the **fake tty**, `fd < FIRST_FILE_FD` | **tty / tty / tty** — real channel-backed descriptors, the preamble deleted |
-| `^C` on `sh -c 'echo MARK; sleep 60; echo NOTREACHED'` | `MARK`, prompt; list aborted | **same** (it printed `NOTREACHED` until the `is_current_interrupted` fix — §4) |
+| `[ -t 0 ] [ -t 1 ] [ -t 2 ]` in an `ssh` session | tty / tty / tty — the **fake tty**, `fd < FIRST_FILE_FD` | **tty / tty / tty** — real channel-backed descriptors, the preamble deleted (and the same on bare metal) |
+| `^C` on `sh -c 'echo MARK; sleep 60; echo NOTREACHED'`, QEMU | list aborted | **same** (it printed `NOTREACHED` until the interrupt-flag fix — §4) |
 | the shell survives `^C` | yes | **yes**, same pid |
 | `busybox stty size` | `stty: standard input` | `stty: standard input` — **pre-existing**, now with `ENOTTY` attached where it used to report nothing |
 | `busybox tty` | `not a tty` | `not a tty` — pre-existing; `ttyname` needs a `/proc/self/fd/0` readlink and procfs answers `NotFound` for a non-`File` fd |
+
+### `^C` over `ssh` does not work on bare metal
+
+**Measured, not inferred**, with a timing probe rather than by reading output:
+send `echo GO; sleep 30; echo NOTREACHED`, wait for `GO`, send `0x03` three
+seconds later, and time how long until the prompt returns.
+
+| | seconds |
+|---|---|
+| QEMU/TCG `SMP=1` | **5.6** — the job was killed |
+| QEMU/TCG `SMP=4` | **4.8** — killed |
+| bare metal `SMP=4` | **30.2** — the sleep ran to completion |
+| bare metal **single core** (`nosmp`) | **30.4** — ditto |
+
+This is a gap in a **new** capability, not a regression: there was no `^C` over
+`ssh` on this target at all before this piece, so there is no "before" to have
+broken. It is also not any of the obvious things, each ruled out rather than
+assumed:
+
+- **Not the clock.** PIT-calibrated, `ticks per 50ms (expect 5) 5` (above).
+- **Not cross-core signal delivery.** It fails identically at `nosmp`.
+- **Not the pty path.** The console says `[SSH] Spawning shell: /bin/sh`, which
+  is `handle_shell` -> `spawn_pty`, so `SPAWN_FLAG_PTY` is set.
+- **Not a missing stdin fd.** No `bridge_process: couldn't open stdin` line, and
+  typed commands run.
+- **Not the channel.** `[ -t 0 ]` answers *tty* on the metal, and with the fake
+  tty deleted the only thing that can say so is glue's ioctl seeing a `Stdin`
+  descriptor whose `current_channel().is_terminal()` holds.
+
+Two dead ends worth recording so they are not re-walked:
+
+- **`/proc/<pid>/stat` cannot show you a process group here.** Fields 5 and 6
+  are rendered as *the pid itself*, deliberately (`akuma-procfs`: "neither kernel
+  has process groups in the sense the `getpgrp`/`getsid` syscalls give"). A
+  reading of `pgrp` from there is not evidence about `Process::pgid`.
+- **`busybox kill -TERM` on a backgrounded `sleep` fails on QEMU too**, so it
+  does not discriminate anything. Run the control before believing a metal-only
+  symptom; this one cost a hypothesis.
+
+The next instrumentation is a `safe_print!` inside `write_to_process_stdin`'s
+ISIG branch — does it fire on the metal, and what `foreground_pgid` does it
+broadcast to? One boot answers it, and nothing short of that is worth guessing.
 
 Two earlier claims of mine did **not** survive their A/B and are struck rather
 than quietly dropped:
