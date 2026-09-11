@@ -61,6 +61,10 @@ mod blk;
 mod boot;
 #[cfg(target_arch = "x86_64")]
 mod clock;
+/// The serial console as a `ProcessChannel` — the producer `akuma-syscalls-glue`'s
+/// `Stdin`/`DevTty` arm reads, and the drain for the echo it writes back.
+#[cfg(target_arch = "x86_64")]
+mod console;
 #[cfg(target_arch = "x86_64")]
 mod dns;
 /// The `akuma-exec` runtime + config tables this target registers — the

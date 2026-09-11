@@ -3290,6 +3290,23 @@ fn register_exec_process(
     };
 
     let stack_bottom = ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096);
+
+    // **Is this process attached to the console?**
+    //
+    // Hoisted out of the struct literal because two fields below depend on the
+    // answer, and the answer is a property of the fd table: a descriptor 0 that
+    // is a `FileDescriptor::Stdin` names the serial line (`fd::console_end`'s
+    // descriptor spelling), while a spawned child's fd 0 is a `PipeRead` from
+    // `fd::bind_stdio` and a `fork` child's is whatever its parent's was. So
+    // `init` on the serial line and its descendants are console-attached;
+    // everything `sshd` spawns is not, which is exactly the split the two
+    // fields want.
+    let fds = fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio()));
+    let console_attached = matches!(
+        fds.table.lock().get(&0),
+        Some(akuma_exec::process::FileDescriptor::Stdin)
+    );
+
     let proc = Box::new(Process {
         pid,
         pgid: pid,
@@ -3375,14 +3392,39 @@ fn register_exec_process(
         // fd 1 lands in whatever file the process opened next. Occupying the
         // triple is what makes the tree's allocator safe here, and it is also
         // what `SharedFdTable::with_stdio` exists for.
-        fds: fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio())),
+        fds,
         thread_id: None,
         spawner_pid: None,
+        // A console process gets the console's **shared** line discipline, not a
+        // fresh one — one serial line, one set of termios flags, exactly as a
+        // tty behaves and as a `fork` child already inherits through `term`.
+        // It is also what makes the pump's wake reach a parked reader:
+        // `console::pump_once` fires the `input_waker` on this very cell, and
+        // glue's `Stdin` arm registers on `current_terminal_state()`, which is
+        // this field. Two objects here means a keystroke that wakes nobody.
         terminal_state: term
-            .unwrap_or_else(|| Arc::new(Spinlock::new(akuma_terminal::TerminalState::default()))),
+            .or_else(|| console_attached.then(crate::console::terminal_state).flatten())
+            .unwrap_or_else(|| Arc::new(Spinlock::new(crate::console::default_terminal_state()))),
         box_id: 0,
         namespace: akuma_isolation::global_namespace(),
-        channel: None,
+        // **The console's channel, for a console-attached process; `None` for
+        // everything else.**
+        //
+        // `None` here does not mean `current_channel()` answers `None` on this
+        // target — it falls back to `get_channel(tid)`, and since the exit
+        // channel landed (2026-09-10) that lookup succeeds for *every*
+        // registered process. So the fd.rs comments that read "no process on
+        // this target has one" describe a tree that no longer exists: what a
+        // non-console process has is an **exit** channel, whose stdin FIFO
+        // nothing fills, which is worse than none at all for a reader (it
+        // parks rather than reporting EOF).
+        //
+        // Filling the field for the console case is what makes glue's
+        // `Stdin`/`DevTty` arm correct here: it reads this channel, the pump
+        // fills it, `/dev/tty` opens because `is_terminal()` holds, and the
+        // arm's own `EAGAIN`, `EINTR`, raw/cooked branch and `EPOLLET` edge
+        // re-arm come with it.
+        channel: console_attached.then(crate::console::channel).flatten(),
         delegate_pid: None,
         grabbed_by: None,
         clear_child_tid: AtomicU64::new(0),
@@ -6316,6 +6358,18 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // registration, so publishing first would race a task with nowhere to start
     // against the register that gives it one.
     register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None);
+    // **The console's producer**, started here and nowhere earlier.
+    //
+    // After the registration, so the channel it fills already belongs to a
+    // process; before `publish_task`, so init cannot reach its first `read(0)`
+    // with nothing draining the UART. Not during the self-test suite: the pump
+    // owns `input::getb` destructively once it runs, and the suite's own
+    // console checks (`fd::console_nonblock_test`) are written against an idle
+    // line — starting it there would add a second reader of the hardware for no
+    // gain, since no test types.
+    if !crate::console::spawn_pump() {
+        serial::puts("  [init] WARNING: no task slot for the console pump — the console will not deliver input\n");
+    }
     crate::sched::publish_task(task_slot);
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes

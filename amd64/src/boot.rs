@@ -248,7 +248,7 @@ pub struct SuiteCtx<'a> {
 
 /// The initialisation the suite performs **inline**, spelled once.
 ///
-/// `fd::init_console` and `usermode::init_syscall` are not tests: without them
+/// `console::init` and `usermode::init_syscall` are not tests: without them
 /// there is no console descriptor and no `IA32_LSTAR`, so ring 3 cannot make a
 /// syscall at all. They sit in the middle of [`self_tests`] because the
 /// userspace checks after them need both — and that is exactly why this
@@ -258,7 +258,17 @@ pub struct SuiteCtx<'a> {
 /// *checks* belongs here, and the `no-tests` build is what would notice if it
 /// did not.
 fn wire_console_and_syscalls() {
-    fd::init_console();
+    // The console's `ProcessChannel` and its shared line discipline, brought up
+    // at exactly the point `fd::init_console` used to be. That function, and
+    // the `TerminalState` it owned, are gone: `akuma-syscalls-glue`'s
+    // `Stdin`/`DevTty` arm serves fd 0 now and reaches the line discipline
+    // through `Process::terminal_state`, which for a console process **is** the
+    // cell this creates. Two line disciplines for one serial line was the old
+    // shape and it could not express raw mode, because `ioctl` wrote neither.
+    //
+    // The *pump* is spawned later (`usermode::run_init`) — nothing produces
+    // console input until there is a ring-3 process that could read it.
+    crate::console::init();
     usermode::init_syscall();
 }
 
@@ -319,7 +329,7 @@ pub struct Verdict {
 ///   of them on purpose.
 /// - The scheduler tests want a live tick, so the timer is started for them and
 ///   stopped again — every test in between ends with interrupts masked.
-/// - `fd::init_console` and `usermode::init_syscall` sit *inside* the suite
+/// - `console::init` and `usermode::init_syscall` sit *inside* the suite
 ///   because the userspace tests after them need both. They are spelled once,
 ///   in [`wire_console_and_syscalls`], which [`late_init`] also calls — see
 ///   there for the rule.

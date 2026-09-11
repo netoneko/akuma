@@ -137,7 +137,6 @@ use akuma_exec_core::process::FileDescriptor;
 use akuma_exec_core::process::KernelFile;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
-use akuma_terminal::TerminalState;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -161,30 +160,6 @@ use crate::serial;
 /// it, so one question suffices.
 fn path_is_dir(path: &str) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_dir)
-}
-
-/// The console's line discipline.
-///
-/// `akuma-terminal`, not a hand-rolled reader. That crate is the tree's
-/// canonical-mode implementation — line buffering, backspace, Ctrl+D as EOF,
-/// echo, and `map_cr_to_nl` — and it is `no_std`, dependency-free apart from a
-/// spinlock, and already built for `x86_64-unknown-none`.
-///
-/// `map_cr_to_nl` is the one that would have cost a debugging session: a serial
-/// terminal sends **CR** when Enter is pressed, and every line-oriented reader
-/// waits for **NL**. A naive byte-at-a-time console read looks correct, echoes
-/// what you type, and never returns a line.
-///
-/// `push_input`'s doc warns that its caller must hold the outer lock with
-/// preemption disabled for the duration. That discipline is satisfied here for a
-/// reason that will not survive: this target polls the UART from the reading
-/// thread itself rather than from an interrupt, so there is no second context to
-/// race with. When the 16550 gets an IRQ, this becomes a real obligation.
-static CONSOLE: Spinlock<Option<TerminalState>> = Spinlock::new(None);
-
-/// Bring the console line discipline up. Called once, before ring 3 exists.
-pub fn init_console() {
-    *CONSOLE.lock() = Some(TerminalState::default());
 }
 
 /// Linux errno values, negated as the kernel ABI returns them.
@@ -1080,14 +1055,6 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    // See the header.
-    match console_end(fd) {
-        Some(ConsoleEnd::Read) => return read_console(fd, buf, len.min(MAX_IO) as usize),
-        // The screen side is not readable, and `EBADF` is the answer this arm
-        // has always given for it.
-        Some(ConsoleEnd::Write) => return errno::EBADF,
-        None => {}
-    }
     akuma_syscalls_glue::fs::sys_read(fd, buf, len.min(MAX_IO) as usize)
 }
 
@@ -1331,107 +1298,17 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
     }
 }
 
-/// Read from the console, through the line discipline.
-///
-/// Polls the UART, feeds each byte to `process_canon_input`, writes back
-/// whatever it says to echo, and returns a line once one is ready. Blocking
-/// unless the descriptor is `O_NONBLOCK`: this target takes no device
-/// interrupts, so there is nothing else for the CPU to do while a prompt waits
-/// — the honest cost of polling, and what an IOAPIC would fix.
-///
-/// Ctrl+D on an empty line returns 0, which is EOF. A reader that treated that
-/// as an error would never terminate.
-///
-/// # `O_NONBLOCK`, and why only this target ever got it wrong
-///
-/// **This function is why a bound `Stdin` behaves differently here than on
-/// AArch64, and the difference is which function serves the descriptor — not
-/// which flag store it consults.**
-///
-/// `akuma_syscalls_glue::fs::sys_read`'s `Stdin`/`DevTty` arm ends its wait with
-/// `if fd_is_nonblock(fd) { return EAGAIN }`, and its comment records that the
-/// arm *itself* once lacked the check: "a caller that set it (mio, for the same
-/// reason crossterm needs `EPOLLET` semantics to work at all) got parked in
-/// `schedule_blocking(u64::MAX)` regardless, indistinguishable from a real
-/// hang." That is the canonical behaviour and it is already shared code.
-///
-/// **This target never reaches that arm for fd 0.** [`sys_read`]'s preamble asks
-/// [`console_end`] first, and a registered process's fd 0 *is* a
-/// `FileDescriptor::Stdin`, so it lands here — in a function written before that
-/// fix existed and which had no flag test at all. The preamble cannot simply be
-/// deleted: glue's arm reaches the console through a `ProcessChannel`, no
-/// process on this target has one, and its `current_channel().is_none()`
-/// fallback returns `proc.read_stdin()`'s zero, i.e. a spurious EOF on the
-/// console a shell is reading from. So the check comes here instead.
-///
-/// The store was a second suspect and is not one: since 4b batch 3c
-/// [`sys_fcntl`] is a one-line forward to glue's arm, whose `F_SETFL` writes
-/// `Process::set_nonblock` — `fds.nonblock` — which is the very set
-/// [`is_nonblocking`] reads through [`cur_table`]. One set, two readers.
-///
-/// **What this cost.** The `ssh` client sets both its socket and its stdin
-/// non-blocking and its interactive pump depends on `read(0)` returning
-/// `EAGAIN` to get back out to the socket. Parked here on the first `read(0)`,
-/// the pump never serviced the network side at all: remote echo and prompts
-/// froze and typing read as dead.
-///
-/// In canonical mode a *partial* line is not data: `drain_canon_ready` gives
-/// nothing until a terminator arrives, so a non-blocking reader gets `EAGAIN`
-/// with its half-typed line still in `canon_buffer`, which is what Linux does.
-///
-/// **`EINTR` is still missing**, deliberately. Every other read arm returns it
-/// on `should_interrupt_blocking_syscall`; adding it here would make a pending
-/// signal that this target never delivers turn a console read into a spin, so it
-/// stays a stated gap rather than a same-batch guess.
-fn read_console(fd: u64, buf: u64, len: usize) -> u64 {
-    // Read once, before the loop: the flag cannot change under us — only this
-    // thread's own `fcntl` could, and it is in here.
-    let nonblock = is_nonblocking(fd);
-    loop {
-        // Anything the discipline already has, first: a previous call may have
-        // delivered two lines' worth of bytes in one burst.
-        {
-            let mut guard = CONSOLE.lock();
-            let Some(term) = guard.as_mut() else {
-                return 0;
-            };
-            let ready = term.drain_canon_ready(len);
-            if !ready.is_empty() {
-                return copy_to_user(buf, &ready);
-            }
-        }
-
-        let Some(byte) = crate::input::getb() else {
-            if nonblock {
-                return errno::EAGAIN;
-            }
-            // A yield, not a spin: this task holds the Big Kernel Lock, and a
-            // shell waiting for a key must not hold every other core's
-            // syscalls hostage (`sched::yield_now` drops the lock briefly).
-            crate::sched::yield_now();
-            continue;
-        };
-
-        let (echo, eof) = {
-            let mut guard = CONSOLE.lock();
-            let Some(term) = guard.as_mut() else {
-                return 0;
-            };
-            // CR -> NL before the discipline sees it. A serial terminal sends CR
-            // for Enter; canonical mode ends a line on NL.
-            let mut one = [byte];
-            term.map_cr_to_nl(&mut one);
-            let processed = term.process_canon_input(&one);
-            (processed.echo, processed.eof)
-        };
-        for b in echo {
-            serial::putb(b);
-        }
-        if eof {
-            return 0;
-        }
+/// Is there console input waiting? [`console_take_byte`]'s non-destructive
+/// twin, and it has to consult the same source for the same reason: once the
+/// pump runs, a typed line lives in the channel and the UART reads empty.
+fn console_has_input() -> bool {
+    if crate::console::pump_running() {
+        crate::console::has_input()
+    } else {
+        crate::input::has_byte()
     }
 }
+
 
 /// `lseek(fd, offset, whence)` — **served by `akuma-syscalls-glue`** (4b batch
 /// 3a), behind one arm this kernel keeps.
@@ -1800,7 +1677,7 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
 pub fn poll_console_state(fd: u32) -> Option<akuma_syscalls_poll::readiness::FdState> {
     use akuma_syscalls_poll::readiness::FdState;
     match console_end(u64::from(fd))? {
-        ConsoleEnd::Read => Some(FdState::Stdin { has_data: crate::input::has_byte() }),
+        ConsoleEnd::Read => Some(FdState::Stdin { has_data: console_has_input() }),
         // Always writable: the serial port never blocks.
         ConsoleEnd::Write => Some(FdState::Sink),
     }
@@ -1960,37 +1837,93 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCSCTTY: u64 = 0x540E;
+    /// `c_cc`'s length in the kernel `struct termios`. `TerminalState::cc` is
+    /// 20 bytes and Linux's array is 19; the copy is bounded by this so neither
+    /// side reads past its own.
+    const NCCS: usize = 19;
 
     Some(match req {
         TCGETS => {
             if arg == 0 {
                 return Some(errno::EFAULT);
             }
+            // **Read out of the line discipline, not out of literals.**
+            //
+            // These four words were compiled-in constants for as long as this
+            // target had no `TerminalState` to describe, which is also why
+            // `TCSETS` below could only be a no-op: there was nowhere to put
+            // what a caller set. `crate::console::default_terminal_state`
+            // starts every process's state at exactly the values that used to
+            // be spelled here, so what a program reads is unchanged until it
+            // sets something — and now a program that sets raw mode gets raw
+            // mode, because glue's `Stdin` arm branches on `is_canonical()`
+            // reading this same cell.
+            //
             // Kernel `struct termios`: c_iflag/oflag/cflag/lflag (u32 each),
             // c_line (u8), c_cc[19]. 36 bytes; a couple extra do no harm.
             let mut t = [0u8; 44];
             let put = |t: &mut [u8], off: usize, v: u32| {
                 t[off..off + 4].copy_from_slice(&v.to_le_bytes());
             };
-            put(&mut t, 0, 0x0000_0500); // c_iflag = ICRNL | IXON
-            put(&mut t, 4, 0x0000_0005); // c_oflag = OPOST | ONLCR
-            put(&mut t, 8, 0x0000_00BF); // c_cflag = B38400 | CS8 | CREAD
-            put(&mut t, 12, 0x0000_8A3B); // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
-            // c_cc, the control characters that matter: VERASE, VKILL, VEOF,
-            // VINTR, VQUIT, VSUSP, VMIN, VTIME. `c_cc[0]` is at byte **17** —
-            // byte 16 is `c_line`, which is not part of the array. Glue's
-            // `term::sys_ioctl` writes its `cc` at 16 and is one byte off for
-            // every control character; see the batch doc's § "found, not fixed".
-            t[17] = 0x03; // VINTR  = ^C
-            t[18] = 0x1C; // VQUIT  = ^\
-            t[19] = 0x7F; // VERASE = DEL
-            t[20] = 0x15; // VKILL  = ^U
-            t[21] = 0x04; // VEOF   = ^D
-            t[22] = 0x00; // VTIME
-            t[23] = 0x01; // VMIN   = 1
-            t[27] = 0x1A; // VSUSP  = ^Z
+            // A thread with no registered state at all — the boot task before
+            // `boot_row_register` — reads the same defaults it always did
+            // rather than zeroes, and without building a `TerminalState` to do
+            // it.
+            let (iflag, oflag, cflag, lflag, cc) =
+                match akuma_exec::process::current_terminal_state() {
+                    Some(lock) => {
+                        let ts = lock.lock();
+                        (ts.iflag, ts.oflag, ts.cflag, ts.lflag, ts.cc)
+                    }
+                    None => {
+                        let (i, o, c, l) = crate::console::DEFAULT_FLAGS;
+                        (i, o, c, l, crate::console::default_cc())
+                    }
+                };
+            put(&mut t, 0, iflag);
+            put(&mut t, 4, oflag);
+            put(&mut t, 8, cflag);
+            put(&mut t, 12, lflag);
+            // `c_cc[0]` is at byte **17** — byte 16 is `c_line`, which is not
+            // part of the array. Glue's `term::sys_ioctl` writes its `cc` at 16
+            // and is one byte off for every control character; see batch 4b's
+            // § "found, not fixed". That bug is the reason this request is
+            // still answered here rather than delegated.
+            t[17..17 + NCCS].copy_from_slice(&cc[..NCCS]);
             if errno::is_err(copy_to_user(arg, &t)) {
                 return Some(errno::EFAULT);
+            }
+            0
+        }
+        // **The setters that used to be no-ops.**
+        //
+        // `TCSETS`/`TCSETSW`/`TCSETSF` differ only in when they take effect
+        // relative to queued output (`stty` uses all three); this target has no
+        // output queue to drain, so all three are immediate. Landing them in the
+        // process's `TerminalState` is the whole of raw mode: `stty raw` and
+        // every `cfmakeraw` caller clear `ICANON|ECHO` here, and glue's `Stdin`
+        // arm reads that cell on its next pass.
+        //
+        // A caller with no registered terminal state is accepted and dropped,
+        // which is what all three did for everyone before this.
+        TCSETS | TCSETSW | TCSETSF => {
+            if arg == 0 {
+                return Some(errno::EFAULT);
+            }
+            let Some(bytes) = copy_in(arg, 36) else {
+                return Some(errno::EFAULT);
+            };
+            if let Some(lock) = akuma_exec::process::current_terminal_state() {
+                let get = |off: usize| {
+                    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                };
+                let mut ts = lock.lock();
+                ts.iflag = get(0);
+                ts.oflag = get(4);
+                ts.cflag = get(8);
+                ts.lflag = get(12);
+                // `c_cc` from byte 17, the same offset `TCGETS` writes it at.
+                ts.cc[..NCCS].copy_from_slice(&bytes[17..17 + NCCS]);
             }
             0
         }
@@ -2026,14 +1959,14 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
             }
             0
         }
-        // The setters and job-control queries: accept, and answer with the one
-        // process group this target has.
+        // The job-control queries: accept, and answer with the one process
+        // group this target has.
         //
         // `TIOCSWINSZ` is accepted-and-dropped on purpose: a process setting
         // the size of its *own* console is describing a terminal this target
         // does not own, and the size that matters comes from `sshd` on the
         // parent's descriptor, which never reaches this arm ([`sys_ioctl`]).
-        TCSETS | TCSETSW | TCSETSF | TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
+        TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
         TIOCGPGRP => {
             if arg != 0 && errno::is_err(copy_to_user(arg, &1i32.to_le_bytes())) {
                 return Some(errno::EFAULT);
@@ -2244,6 +2177,31 @@ pub fn boot_row_register() -> usize {
         proc.set_fd(1, FileDescriptor::Stdout);
         proc.set_fd(2, FileDescriptor::Stderr);
     }
+    // **And the console itself.** The boot task sits on the serial line exactly
+    // as `init` does, so a `Stdin` in its table has to name the same channel a
+    // ring-3 console process's does — otherwise glue's `Stdin` arm takes its
+    // `current_channel().is_none()` fallback and answers `0`, i.e. EOF, which is
+    // what `console_nonblock_test` saw the moment `read_console` was deleted.
+    //
+    // Through the **per-thread** registry rather than `Process::channel`:
+    // `make_test_process` builds the row and its fields are not reachable
+    // afterwards, and `current_channel` consults `get_channel(tid)` precisely
+    // for a thread whose identity was assembled this way.
+    // [`boot_row_release`] takes it back.
+    //
+    // **The line discipline is deliberately NOT registered alongside it.**
+    // `register_terminal_state(tid, ..)` would shadow `Process::terminal_state`
+    // for this thread, and the boot row's own state is what `winsize_test`
+    // writes through `with_process(caller_pid, ..)` and reads back through
+    // `TIOCGWINSZ` — the Break 5 check. The one thing the row therefore does
+    // not get is the pump's `input_waker`: a *blocking* console read from the
+    // boot task would park on a cell `console::pump_once` never fires and wait
+    // out the 1 Hz untimed-park backstop instead. No check does that (the suite
+    // runs against an idle line and reads non-blocking), and the pump is not
+    // even spawned until `run_init`; this note is for the one that tries.
+    if let Some(ch) = crate::console::channel() {
+        akuma_exec::process::channel::register_channel(tid, ch);
+    }
     tid
 }
 
@@ -2257,6 +2215,10 @@ pub fn boot_row_register() -> usize {
 /// leaks nothing` reports it, correctly. Draining is what makes the
 /// registration a loan rather than a leak.
 pub fn boot_row_release(tid: usize) -> usize {
+    // The console channel [`boot_row_register`] took out. Left behind, the next
+    // boot row to land on this slot inherits it — and so would any unrelated
+    // thread the slot is recycled to.
+    akuma_exec::process::channel::remove_channel(tid);
     akuma_exec::process::unregister_thread_pid(tid);
     akuma_exec::process::unregister_process(1);
     akuma_exec::process::reclaim::drain_retired()
