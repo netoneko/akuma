@@ -88,6 +88,29 @@ fn main() {
         }
     }
 
+    // The **kernel's** version, read out of the workspace root's `[package]`
+    // section — the same manifest `cargo` builds the kernel from.
+    //
+    // Not `CARGO_PKG_VERSION`, and that is the whole point: that macro expands
+    // to *the crate it is written in*, so `uname -r` reported `0.1.0` (this
+    // crate) instead of the kernel from the moment `src/syscall/` became a
+    // crate on 2026-09-01. Same class as `AKUMA_GIT_SHA` above — `rustc-env`
+    // does not propagate across crates — and fixed in the same place, because
+    // a crate has no other way to see the version of the binary linking it.
+    //
+    // Not a literal here either. A literal that happens to match the manifest
+    // is indistinguishable from one that has drifted, which is exactly the
+    // failure being closed; reading the file means a `cargo` bump moves
+    // `uname -r` and nothing has to remember to.
+    println!("cargo:rerun-if-changed=../../Cargo.toml");
+    let kernel_version = std::fs::read_to_string("../../Cargo.toml")
+        .ok()
+        .and_then(|t| package_version(&t))
+        // Unreachable in a build that got this far; `0.0.0` is at least
+        // visibly not a release rather than a plausible wrong one.
+        .unwrap_or_else(|| "0.0.0".to_string());
+    println!("cargo:rustc-env=AKUMA_KERNEL_VERSION={kernel_version}");
+
     // Mirrors the binary's old three-way choice. The inputs are the same two
     // features this file already keys off above.
     let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
@@ -101,4 +124,33 @@ fn main() {
         "release"
     };
     println!("cargo:rustc-env=AKUMA_BUILD_PROFILE={build_profile}");
+}
+
+/// The `version = "..."` of a manifest's `[package]` section.
+///
+/// Hand-rolled rather than pulled in with a TOML crate: a build-script
+/// dependency is a build of its own on every clean tree, and the shape being
+/// read is two lines of a file this repo owns.
+///
+/// It looks for the `[package]` header first, and that is not defensiveness —
+/// the root manifest has `[workspace]` **above** `[package]`, and
+/// `[workspace.package]`, `[workspace.lints.*]` and every `[dependencies.*]`
+/// table can carry a `version` key of their own. Taking the file's first
+/// `version =` would read whichever of those came first.
+fn package_version(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if in_package
+            && let Some(rest) = line.strip_prefix("version")
+            && let Some(rest) = rest.trim_start().strip_prefix('=')
+        {
+            return Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    None
 }

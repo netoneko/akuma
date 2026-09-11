@@ -20070,8 +20070,8 @@ fn test_identity_recycled_slot_rejected() {
 /// probe would silently be timing the ENOSYS path instead, and every floor
 /// number taken with it would be wrong in a way nothing else notices.
 ///
-/// The expected value is rebuilt from `unpack`, not written out as a literal:
-/// a test you have to edit to keep passing checks nothing.
+/// The expected value is the constant itself, never a literal: a test you have
+/// to edit to keep passing checks nothing.
 fn test_akuma_get_version() {
     use akuma_syscalls_linux::nr;
     use crate::syscall::handle_syscall;
@@ -20079,14 +20079,15 @@ fn test_akuma_get_version() {
 
     let dispatched = handle_syscall(nr::AKUMA_GET_VERSION, &[0, 0, 0, 0, 0, 0]);
     let wired = dispatched == AKUMA_VERSION;
+    let commit_ok = dispatched == u64::from(version::COMMIT);
 
-    let (major, minor, patch, commit) = version::unpack(dispatched);
-    let triple_ok = [major, minor, patch] == version::VERSION_TRIPLE;
-    let commit_ok = commit == version::COMMIT;
-
-    // The reserved top byte. Load-bearing, not cosmetic: with bit 63 set a libc
-    // wrapper would read the return as a negative errno.
-    let non_negative = (dispatched >> 56) == 0 && (dispatched as i64) > 0;
+    // The return must not read as a negative errno in a libc wrapper. The
+    // packed form reserved a whole top byte to guarantee that; the value is a
+    // `u32` now, so it is structural — which is worth asserting precisely
+    // because it is the kind of property a later widening would quietly take
+    // away. `>= 0` and not `> 0`: a build outside a git checkout has no commit
+    // and answers 0, which is the honest value, not a failure.
+    let non_negative = (dispatched >> 56) == 0 && (dispatched as i64) >= 0;
 
     // And it must not read as an error at all — ENOSYS is what a missing arm
     // would return, and it must be distinguishable from a real answer.
@@ -20129,14 +20130,14 @@ fn test_akuma_get_version() {
     let leaf_resolved_nothing = fb_leaf == LEAF_EXPECTED_RESOLVES;
     let control_did_resolve = fb_full > fb_leaf;
 
-    if wired && triple_ok && commit_ok && non_negative && not_enosys
+    if wired && commit_ok && non_negative && not_enosys
         && leaf_resolved_nothing && control_did_resolve
     {
         console::print("[Test] akuma_get_version PASSED\n");
     } else {
         crate::safe_print!(240,
-            "[Test] akuma_get_version FAILED: wired={} triple_ok={} commit_ok={} non_negative={} not_enosys={} leaf_resolves={} (want {}) control_resolves_more={} (got {:#x}, want {:#x}, fb_leaf={} fb_full={})\n",
-            wired, triple_ok, commit_ok, non_negative, not_enosys,
+            "[Test] akuma_get_version FAILED: wired={} commit_ok={} non_negative={} not_enosys={} leaf_resolves={} (want {}) control_resolves_more={} (got {:#x}, want {:#x}, fb_leaf={} fb_full={})\n",
+            wired, commit_ok, non_negative, not_enosys,
             leaf_resolved_nothing, LEAF_EXPECTED_RESOLVES, control_did_resolve,
             dispatched, AKUMA_VERSION,
             fb_leaf, fb_full);
