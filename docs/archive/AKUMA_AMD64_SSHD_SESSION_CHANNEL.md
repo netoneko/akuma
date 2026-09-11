@@ -344,6 +344,20 @@ of each test that matters is the one where before and after differ.
 
 ### `^C` over `ssh` does not work on bare metal
 
+> **CORRECTED 2026-09-11, same day.** The table below is real but its
+> *conclusion* is not: `^C` did not work on QEMU either. This target's
+> `nanosleep` was a busy-yield loop that checked only group exit, so a sleeping
+> foreground job could not be interrupted on **either** machine — the `SIGINT`
+> was taken when the sleep ran out. What differs is the clock: `uptime_us` is
+> `lapic::ticks() * 10_000`, and under TCG that counter runs about **six times
+> wall-clock** (guest `sleep 10` returns in 1.69 s against 10.49 s on the
+> metal), so the 30 s sleep ended ~2 s after the `^C` and read as an honoured
+> interrupt. The absent `NOTREACHED` agreed for the wrong reason — the job did
+> die of the signal, just at the end of its own fast sleep. Every "ruled out"
+> item below stands; the diagnosis they were narrowing toward does not. Fixed
+> and re-measured (3.3 s on both machines):
+> `AKUMA_AMD64_STALE_FALSE_HOOKS.md` §5.
+
 **Measured, not inferred**, with a timing probe rather than by reading output:
 send `echo GO; sleep 30; echo NOTREACHED`, wait for `GO`, send `0x03` three
 seconds later, and time how long until the prompt returns.
@@ -383,6 +397,10 @@ Two dead ends worth recording so they are not re-walked:
 The next instrumentation is a `safe_print!` inside `write_to_process_stdin`'s
 ISIG branch — does it fire on the metal, and what `foreground_pgid` does it
 broadcast to? One boot answers it, and nothing short of that is worth guessing.
+
+**It was done, and it did answer it** (`AKUMA_AMD64_STALE_FALSE_HOOKS.md` §3,
+§5): the branch fires on the metal with the same `fg_pgid` and the same
+`members=1` as QEMU. Delivery was never the missing half — the sleep was.
 
 Two earlier claims of mine did **not** survive their A/B and are struck rather
 than quietly dropped:

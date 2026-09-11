@@ -353,6 +353,29 @@ wedge this kernel — reads `free` and `ps | wc -l` either side, and finishes wi
 own: a harness that has only ever seen the tree it was written for is not yet
 evidence (`docs/archive/AKUMA_AMD64_STEP5B_SLICE4_PROCS.md`).
 
+### The `^C`-over-ssh check
+
+```bash
+python3 scripts/utils/amd64_ctrlc_probe.py --port 2224                 # local QEMU
+python3 scripts/utils/amd64_ctrlc_probe.py --host 192.168.1.123 --port 2222 -n 3
+```
+
+Whether a signal actually reaches a foreground job, timed rather than eyeballed:
+`echo GO; sleep 30; echo NOTREACHED`, `0x03` after three seconds, then
+`echo BACK` — which cannot be echoed until the shell is back in control. Expect
+**~3.3 s**; a reading near the sleep duration means the job was never
+interrupted. It drives a real `pty.fork()` because `ssh -tt`'s `pty-req` is what
+sets `SPAWN_FLAG_PTY`, and without that the session has no terminal-backed
+channel and the kernel's ISIG branch is unreachable.
+
+**Believe the metal, not QEMU, for anything timed in guest seconds.** This
+target's `uptime_us` is `lapic::ticks() * 10_000`, and under TCG that counter
+runs about **six times wall-clock** — measured 2026-09-11, guest `sleep 10`
+returned in 1.69 s against 10.49 s on the box. A wall-clock threshold on an
+emulated guest is comparing two clocks, and that is exactly how an
+uninterruptible `nanosleep` passed this check for a day
+(`docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md` §5).
+
 ### Timing anything from ring 3 does not work here
 
 `userspace/memprobe/c/`'s two instruments build and run on this target and

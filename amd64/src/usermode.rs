@@ -1485,11 +1485,35 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 if crate::thread::should_leave_now() {
                     return errno::EINTR;
                 }
+                // **A signal ends the nap**, the same check
+                // `akuma_syscalls_time::sys_nanosleep` makes on the other
+                // kernel: the deferred-kill bit, the Ctrl-C / `sys_kill` bit
+                // and the per-thread `pthread_kill` set, minus `SA_RESTART`
+                // handlers (which want the loop to take another pass).
+                //
+                // Without it this loop checked **only** group exit, and the
+                // comment that used to sit below said so — "this one cannot be
+                // interrupted". That made `^C` on a sleeping foreground job a
+                // no-op until the sleep ran out on its own: the SIGINT stayed
+                // pending and was taken at the return to ring 3, so a
+                // `sleep 30` died 30 seconds after the keystroke.
+                //
+                // It looked fixed under QEMU/TCG for a measurement's worth of
+                // time and was not: this target's `uptime_us` is LAPIC ticks
+                // x 10 ms, and under TCG that counter runs about **six times
+                // wall-clock** (measured 2026-09-11: guest `sleep 10` returned
+                // in 1.69 s, against 10.49 s on the metal). The same
+                // uninterruptible sleep therefore ended within a few seconds of
+                // the `^C` there, which is indistinguishable from honouring it.
+                // `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md` §6.
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
+                    return errno::EINTR;
+                }
             }
-            // `rem` is only written on an interrupted sleep, and this one
-            // cannot be interrupted except by the group exit above (which does
-            // not return here). A completed sleep leaves it untouched, as Linux
-            // does.
+            // `rem` is left untouched on both paths out of this loop, which is
+            // what `akuma_syscalls_time::sys_nanosleep` does too. Linux fills it
+            // on an interrupted *relative* sleep; neither kernel does, and the
+            // divergence is pinned here rather than in one of them.
             0
         }
         // The child-tid futex address a threaded libc registers on startup.

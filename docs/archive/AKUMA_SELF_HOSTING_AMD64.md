@@ -1464,22 +1464,31 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
            obvious fix (drop to `get_channel(tid)`) put an IRQ-masked
            spinlock on every syscall and cost the **bare-metal** suite
            665/0 → 663/3 while QEMU and Firecracker stayed green.
-           What it leaves: **two `|| false` hooks whose stated reason
-           ("no signals on this target") has expired** —
-           `amd64/src/sched.rs`'s `ProcessHooks`, read by the **park
-           loop** and explicitly marked "when signals land here, this is
-           the line that changes", and `amd64/src/net.rs`'s. The first
-           is the prime suspect for `^C` over ssh not working on bare
-           metal (it works on QEMU at SMP=1 and 4; the metal runs a
-           `sleep 30` to completion, at SMP=4 *and* nosmp).
-           **Prompt: `proposals/NEXT_AGENT_AMD64_STALE_FALSE_HOOKS.md`.**
-        2. **`akuma-net`'s `is_current_interrupted` hook is still
-           `false`**, so a socket read is not interruptible where glue's
-           other blocking arms are. Still a measurement — the consuming
-           site is a poll loop — but the *function* is no longer the
-           expensive half (item 1), so the note in `net.rs`'s header
-           saying "it is not free" needs updating in whichever direction
-           the measurement lands.
+           What it left: **five `|_| false` / `|_| None` hook rows whose
+           stated reasons had expired** — `amd64/src/sched.rs`'s
+           hand-written `ProcessHooks`. *(done 2026-09-11)* The table is
+           now `akuma_exec::register_process_hooks()`, the same eight
+           pointers the AArch64 kernel registers, so it cannot drift
+           again. Two rows were load-bearing: the park loop's
+           `is_current_interrupted`, and `clear_draining`/
+           `drain_in_flight`, which guard a reclaim sweep this target
+           calls from seven places.
+           **It was NOT the cause of `^C` on bare metal**, and chasing it
+           produced something better: `^C` had never interrupted a
+           sleeping job on **either** machine. `nanosleep` here was a
+           busy-yield loop checking only group exit, and QEMU/TCG's
+           guest clock runs ~6x wall-clock (`sleep 10` → 1.69 s vs
+           10.49 s on the metal), which made an uninterruptible 30 s
+           sleep end ~2 s after the keystroke and read as working. Fixed;
+           3.3 s on both machines now.
+           **Doc: `AKUMA_AMD64_STALE_FALSE_HOOKS.md`. Probe:
+           `scripts/utils/amd64_ctrlc_probe.py`.**
+        2. *(done 2026-09-11)* **`akuma-net`'s `is_current_interrupted`
+           hook** is wired to `should_interrupt_blocking_syscall`, the
+           same function AArch64 gives it. The "it is not free" note in
+           `net.rs`'s header is gone with it: the check is one relaxed
+           `AtomicBool::swap` on the common path, and `wait_until` asks
+           it only when the condition did not hold.
         3. *(done — see the entry above)* **amd64's second implementation
            of session stdio is deleted.** What it leaves open is smaller
            and worth naming: `busybox stty size` still fails over ssh
