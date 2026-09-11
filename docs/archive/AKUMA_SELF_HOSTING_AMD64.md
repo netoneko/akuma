@@ -599,6 +599,17 @@ batch — `poll`/`select`/`ioctl` — and the console `O_NONBLOCK` fix).
 > of either, because it is what makes `fork` work at `SMP>1` at all —
 > `proposals/NEXT_AGENT_AMD64_TLB_SHOOTDOWN.md`.
 >
+> > **[BOTH CLOSED 2026-09-11.]** The ring-3 entry seam took seven slices and
+> > `fork`, `clone` and `execve` all fold now
+> > (`AKUMA_AMD64_RING3_SEAM_SLICE{1..7}.md`,
+> > `AKUMA_AMD64_EXECVE_INSTALL_IMAGE.md`). C2 finished earlier, and the last
+> > of `Spawn`'s four stdio fields that *could* go went with it —
+> > `stdout_pipe` deleted, `stdin_pipe` kept with a measured reason
+> > (`AKUMA_AMD64_SPAWN_ROW_STDIO.md`). `wait4` has been glue's since seam
+> > slice 3. What is left of C1 is the **lifecycle unification** (§4 option 2
+> > of the seam prompt) and the **`ProcessChannel`** item; see the walk's
+> > "YOU ARE HERE".
+>
 > **A third thing came out of writing those, and it is not in this chart:** the
 > two comments authorising the absence of a TLB shootdown both state
 > "processes are single-threaded — no `CLONE_VM`" / "single-core here", and
@@ -1114,45 +1125,106 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │                              AMD64_CONSOLE_NONBLOCK_READ.md,
    │                              AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md
    ▼
- [09-10] ═══ YOU ARE HERE ═══
+ [09-10] ═══ the ring-3 entry seam, slices 1-4 ═══
    │
-   └──► two pieces left below the gate, neither blocked on the other:
-        **the ring-3 entry seam** — an x86 arm for "enter userspace with
-                 this process's first context"; unblocks `fork`, then
-                 `clone`. Sized like 5b. **IN PROGRESS: slices 1-3 of 4
-                 landed.** 1: `UserContext` split, four arch-neutral
-                 setters, `fork_process` compiles for x86_64, aarch64
-                 byte-identical. 2: the **return shape** (§4) — the real
-                 seam, since `run()` erets and never returns while
-                 amd64's `enter_user` returns an exit status —
-                 `ExecRuntime::enter_user`, and amd64 now enters ring 3
-                 through the shared `Process::run` for **every** process
-                 it starts; `update_thread_context` has its x86 arm.
-                 aarch64 `.text` +28 B, same 284 self-tests side by side.
-                 3: **`CHILD_CHANNELS` + `wait4` is glue's** — an exit
-                 channel per child, this target's wait loop and waiter
-                 bitmap deleted; brings `ECHILD`-for-a-non-child, `EINTR`
-                 and `rusage`. **And it re-scoped what is left:** the
-                 blocker on `fork_process` is not `CHILD_CHANNELS` but
-                 that its **memory pass is an un-`cfg`'d AArch64
-                 page-table walker** — ARM `VALID`/`TABLE` where x86 has
-                 `Present`/`R/W`, so a PML4 walks silently wrong. Slice 4
-                 is a seam for that pass (a hook, per §4's argument), not
-                 `clone`. Prompt:
-                 `proposals/NEXT_AGENT_AMD64_RING3_ENTRY_SEAM.md`
-                        docs: AKUMA_AMD64_RING3_SEAM_SLICE{1,2,3}.md
-        **`Spawn` + `wait4`** — three fields and one source decision
-                 (populate `CHILD_CHANNELS`, or teach glue's `wait4` to
-                 read `Process::exited`)
+   │   **the ring-3 entry seam** — an x86 arm for "enter userspace with
+   │   this process's first context". Sized like 5b, took seven slices.
+   │   1: `UserContext` split, four arch-neutral setters, `fork_process`
+   │   compiles for x86_64, aarch64 byte-identical. 2: the **return
+   │   shape** (§4) — the real seam, since `run()` erets and never
+   │   returns while amd64's `enter_user` returns an exit status —
+   │   `ExecRuntime::enter_user`, and amd64 enters ring 3 through the
+   │   shared `Process::run` for **every** process it starts.
+   │   3: **`CHILD_CHANNELS` + `wait4` is glue's**; brings
+   │   `ECHILD`-for-a-non-child, `EINTR` and `rusage`. **And it
+   │   re-scoped what was left:** the blocker on `fork_process` was not
+   │   `CHILD_CHANNELS` but that its **memory pass is an un-`cfg`'d
+   ▼   AArch64 page-table walker** — ARM `VALID`/`TABLE` where x86 has
+   │   `Present`/`R/W`, so a PML4 walks silently wrong. 4: a hook for
+   │   that pass, registered over the walk `Image::fork_of` already used
+   │                        docs: AKUMA_AMD64_RING3_SEAM_SLICE{1,2,3,4}.md
+   ▼
+ [09-11] ═══ the folds: fork, clone, execve ═══
+   │
+   │   5: the two loud x86 stubs get real arms — `get_saved_user_context`
+   │   (the read mirror of 2's writer) and
+   │   `spawn_user_closure_initializing` (claim + a `prepare_task_slot`
+   │   hook, which `sched::spawn_unpublished` now shares so the two
+   │   spawn paths give a slot **one** initial machine state). Both put
+   │   on the live `fork` path the day they were written.
+   │   6: **the fold.** `sys_fork` is 20 lines over `fork_process`;
+   │   `usermode.rs` 6413 → 6247 and `Image::fork_of`, `ProcEntry`,
+   │   `proc_entry_of`, `proc_by_pid` all went dead — *that* deletion is
+   ▼   the check that a fold is a fold. Two hooks: `bind_child_task`
+   │   (the `SPAWN` row + `CR3` root; the first **fallible** step after a
+   │   slot is claimed, hence `release_initializing_thread`) and
+   │   `alloc_process_info` (amd64 returns `0` — the `ProcessInfo`
+   │   capability difference, pinned rather than adopted).
+   │   7: **`clone`, which found four identity bugs and they are one
+   │   bug.** A thread used to have *no* `Process` and lived in
+   │   `THREAD_PID_MAP` under its **leader's** pid, so "my pid" and "my
+   │   group's pid" were the same number. Giving each thread a real
+   │   `Process` separates them: **two pid counters minting into one
+   │   table** (amd64's started at 2, the shared one at 1 — `clone_thread`
+   ▼   drew **pid 1**, init's, and the thread ran init's image at
+   │   `pc = 0`), **`getpid`** and **the futex namespace** (both must be
+   │   the tgid — a lost wakeup that failed 2 runs in 3, which AArch64's
+   │   `read_current_pid` comment had predicted verbatim), and
+   │   **regions/address space** (the leader's — a thread's own
+   │   `mmap_regions` is empty, so the first child faulted on its first
+   │   stack push). `akuma-exec` already shipped the split as
+   │   `current_thread_own_process` vs `current_thread_tgid_process`.
+   │   Plus a **`Process` leaked per `pthread_create`**, found by reading
+   │   `ps` on the metal. And `write_user_tid`, because **SMAP** makes
+   │   the shared `write_current_user_val` fatal here.
+   │   8: **`execve`** — folded at a **load/install** seam, not at
+   │   `replace_image`: that function *begins* by loading through
+   │   `akuma-elf`'s deferring loader, and amd64 maps eagerly and never
+   ▼   reads `lazy_regions`. `Process::install_image` + a neutral
+   │   `ImageInstall`; amd64 gains `clear_child_tid` reset, handlers to
+   │   `SIG_DFL` and the sigaltstack disabled. `.text` −776 B with only
+   │   the two split symbols changed.
+   │   9: **`Spawn::stdout_pipe` deleted** — C2 slice 6 had already
+   │   recorded that link in the child's registered fd 1.
+   │   **`stdin_pipe` kept**, measured: its write reference has no
+   │   descriptor and `close_all` empties the table before the reap looks
+   │                        docs: AKUMA_AMD64_RING3_SEAM_SLICE{5,6,7}.md,
+   │                              AKUMA_AMD64_EXECVE_INSTALL_IMAGE.md,
+   │                              AKUMA_AMD64_SPAWN_ROW_STDIO.md
+   ▼
+ [09-11] ═══ YOU ARE HERE ═══
+   │
+   └──► two pieces left, independent — **prompt for both:**
+        `proposals/NEXT_AGENT_AMD64_PROCESSCHANNEL_AND_LIFECYCLE.md`
 
-        4b's syscall arms are **done**. What is left in `fd.rs` is the
-        console and `/dev` preambles on `read`/`write`/`lseek`/`poll`/
-        `ioctl`, and all five exist for **one** reason: no amd64 process
-        has a `ProcessChannel`. Giving an sshd session's child one — the
-        deferred `/proc/<pid>/fd/0` + `delegate_pid` item in
-        `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc` — retires all five
-        together and also fixes raw mode, `EINTR` on a console read and
-        `/dev/tty` (`AMD64_CONSOLE_NONBLOCK_READ.md` §6)
+        **A. the `ProcessChannel`** — do this one first; both of its own
+                 source docs already said so, back when the seam was
+                 still ahead of it. What is left in `fd.rs` is the
+                 console and `/dev` preambles on `read`/`lseek`/`poll`/
+                 `ioctl`, and all four exist for **one** reason: no amd64
+                 process has a `ProcessChannel`. Giving an sshd session's
+                 child one — the deferred `/proc/<pid>/fd/0` +
+                 `delegate_pid` item in `AKUMA_AMD64_4B_FOLD_BATCH2A.md`
+                 § `/proc` — retires them together with the
+                 `poll_console_state` hook amd64 had to register, and
+                 fixes raw mode, `EINTR` on a console read and
+                 `/dev/tty` (`AMD64_CONSOLE_NONBLOCK_READ.md` §6).
+                 **That doc's fourth item, the ssh terminal size, is
+                 closed** — both halves, verified on the metal from a
+                 client pty at three sizes. The boot suite cannot check
+                 any of this: the gate is a session you type in
+
+        **B. the lifecycle unification** (the retired seam prompt's §4
+                 option 2) — move amd64 onto the never-returns shape. It
+                 is now the *only* reason `usermode.rs` owns an `execve`
+                 re-entry loop and a two-way `enter_ring3` (`run_thread`
+                 vs `run_process`), and slice 7 sharpened the case: that
+                 split exists because a process teardown is wrong for one
+                 thread of several. The loop exists because `sysret`
+                 returns to the saved `user_rip` — so the shape to try is
+                 `execve` **rewriting its own `UserCtx`** instead of
+                 leaving ring 3, which is how Linux does it. Untested;
+                 it is a rewrite of the one mechanism `execve` has here
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -1321,11 +1393,12 @@ Two properties of the shape:
   Everything above it is deletions from `amd64/src`; everything below it is
   parity with what the AArch64 self-host already has.
 
-## `usermode.rs`'s floor (measured 2026-09-09)
+## `usermode.rs`'s floor (measured 2026-09-09, **re-measured 2026-09-11**)
 
 The C1 box says "5871 → entry seam", and the question that keeps coming back is
-what the seam actually weighs. Measured rather than estimated, on a file that is
-**5 871 lines**:
+what the seam actually weighs.
+
+### The 2026-09-09 measurement, on a 5 871-line file
 
 | what | lines | where it goes |
 |---|---|---|
@@ -1339,17 +1412,45 @@ what the seam actually weighs. Measured rather than estimated, on a file that is
 So **it never reaches zero, and it should not.** Its floor is the entry seam
 plus a dispatch table plus the x86-only arms — call it **900–1 000 lines**, the
 amd64 twin of `akuma-el0-entry` + `src/exceptions.rs`'s syscall path, which is
-exactly what the C1 box's "keeps:" line has always said. The path from 5 871 to
-that floor is three named pieces and nothing else: **4b** takes the ordinary
-syscall bodies and most of the dispatcher, **the ring-3 entry seam** takes the
-process calls, and **`Spawn` + `wait4`** take the spawn table with them.
+exactly what the C1 box's "keeps:" line has always said.
 
-One cheap move is available at any time and is independent of all three:
-**the 1 850 test lines are 31% of the file and are not debt** — they are
+### What actually happened: the file got *bigger*
+
+After `fork`, `clone` and `execve` all folded, `usermode.rs` is **6 434 lines** —
+**+563 on the file the prediction was made about**, with `sys_fork` down from
+164 to **56** and `Image::fork_of`, `ProcEntry`, `proc_entry_of` and
+`proc_by_pid` deleted outright. The prediction was not wrong about where the
+code went. It was wrong about what fills the space:
+
+| | lines | share |
+|---|---|---|
+| doc comments (`///`, `//!`) | **1 299** | 20% |
+| ordinary comments (`//`) | **1 796** | 28% |
+| blank | 319 | 5% |
+| **code** | **~3 020** | **47%** |
+
+**Less than half the file is code, and the folds are what did that.** Each one
+deleted a body and left behind the reason the seam is where it is — why
+`ChildKind` is derived from `ChildReaping`, why `write_user_tid` cannot be
+`write_current_user_val` under SMAP, why `stdin_pipe` survived when
+`stdout_pipe` did not, which half of `current_thread_*_process` a call site
+means. Those are the notes this port cost the most to learn, and they live next
+to the code they constrain rather than only in `docs/archive/`.
+
+So the 900–1 000 figure is a **code** floor, and the file will sit well above it.
+Counting lines as debt was the wrong instrument once the folds started: the
+right question is the code column, which is doing what the prediction said it
+would.
+
+Current large items, re-measured: `syscall_dispatch` **816** (up — folded arms
+get a comment naming what they fold to), `sys_execve` **227**, `sys_spawn`
+**169**, `sys_waitpid` **122**, `run_process` **100**, `sys_fork` **56**.
+
+One cheap move remains available and is independent of everything:
+**the test lines are ~30% of the file and are not debt** — they are
 `no-tests`-gated and do not ship in the small profile. Splitting them into
-`amd64/src/usermode_tests.rs` is mechanical and takes the file to ~4 000 without
-folding anything. Worth doing when it stops being the thing that makes the file
-hard to read, not as an end in itself.
+`amd64/src/usermode_tests.rs` is mechanical. Worth doing when it stops being the
+thing that makes the file hard to read, not as an end in itself.
 
 ## Open issues found by probing the bare-metal box (2026-09-07)
 
