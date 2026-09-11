@@ -36,6 +36,9 @@ pub mod bkl_guard;
 pub mod reclaim;
 
 pub use lifecycle::LifecycleGuard;
+// `execve`'s load/install seam — see `image::ImageInstall`. Re-exported beside
+// the other process types because both kernels' syscall layers build one.
+pub use image::ImageInstall;
 pub use address_space::{AddressSpaceGuard, ProcAddressSpace};
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
 
@@ -3052,7 +3055,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // not a step every kernel must take. `0` means "no page"; see
     // `ExecRuntime::fork_alloc_process_info`, and note that step 5's re-map and
     // write below are gated on the same value.
-    let process_info_phys = (runtime().fork_alloc_process_info)(&mut new_address_space)?;
+    let process_info_phys = (runtime().alloc_process_info)(&mut new_address_space)?;
 
     // 3. Create Process struct (fallible allocation to avoid kernel panic on OOM)
     let mut new_proc = Process::inherit_from(parent, InheritOverrides {

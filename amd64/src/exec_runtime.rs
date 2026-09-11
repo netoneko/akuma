@@ -204,7 +204,7 @@ fn runtime() -> ExecRuntime {
         // process table and `THREAD_PID_MAP` here; nothing reads the page, and
         // mapping one would leak 4 KiB per process past the frame ledger. Step
         // 5's re-map and `ProcessInfo` write are skipped on the same `0`.
-        fork_alloc_process_info: |_space| Ok(0),
+        alloc_process_info: |_space| Ok(0),
         // The child's `CR3` root, its `SPAWN` row and the `UserCtx::proc_slot`
         // naming that row — the three things `akuma-exec` has no concept of.
         // See the function.

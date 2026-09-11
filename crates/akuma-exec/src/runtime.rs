@@ -232,9 +232,9 @@ pub struct ExecRuntime {
         child: &mut crate::process::Process,
     ) -> Result<(), &'static str>,
 
-    /// **Give a fork child its `ProcessInfo` page, if this target has one** —
-    /// `fork_process`'s step 2. Returns the page's physical address, or `0` to
-    /// say this kernel does not use one.
+    /// **Give an address space its `ProcessInfo` page, if this target has one**
+    /// — `fork_process`'s step 2 and `install_image`'s re-map. Returns the
+    /// page's physical address, or `0` to say this kernel does not use one.
     ///
     /// AArch64 allocates a zeroed frame, tracks it, maps it read-only at
     /// `PROCESS_INFO_ADDR` and hands it to the space's user-frame ledger.
@@ -255,7 +255,7 @@ pub struct ExecRuntime {
     ///
     /// The child's address space is unpublished and exclusively the caller's,
     /// hence `&mut`.
-    pub fork_alloc_process_info:
+    pub alloc_process_info:
         fn(space: &mut crate::mmu::UserAddressSpace) -> Result<usize, &'static str>,
 
     /// **Bind a freshly spawned child thread to per-process state this crate

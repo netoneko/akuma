@@ -3674,38 +3674,49 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         .map(|a| alloc::string::String::from_utf8_lossy(a).into_owned())
         .collect();
 
-    // Step 1: install the new image on the registered process, taking the old
-    // address space and region list back out rather than letting them drop
-    // under that same hold — `UserAddressSpace::drop` frees every user frame and
-    // page table, which is not work for a closure that runs with interrupts off.
-    let taken = akuma_exec::process::with_process(pid, |p| {
-        {
-            let mut im = p.image.lock();
-            im.name = new_name;
-            im.args = new_args;
-            im.context = akuma_exec::process::UserContext::new(
-                new_entry as usize,
-                new_stack as usize,
-            );
-        }
-        p.brk.store(new_brk as usize, Ordering::Relaxed);
-        p.initial_brk.store(new_brk as usize, Ordering::Relaxed);
-        p.entry_point.store(new_entry as usize, Ordering::Relaxed);
-        // The heap, the stack and the mmap window all move with the image.
-        // Nothing on this target places through `ProcessMemory` yet — `mm.rs`
-        // has its own placer over the region list — but a registration that
-        // states the *previous* image's arena is a wrong answer waiting for the
-        // first folded arm that reads it.
-        p.memory.reset(new_brk as usize, stack_bottom, ELF_STACK_TOP as usize, crate::mm::MMAP_BASE);
-        // A new image inherits no mappings. This was implicit while `execve`
-        // replaced a whole `Process` — the new one simply had an empty list —
-        // and has to be explicit now that the process outlives its image: a
-        // `fork` child's inherited extents would otherwise survive into the
-        // program it `execve`s and reserve VA ranges nothing maps.
-        let old_regions = core::mem::take(&mut *p.mmap_regions.lock());
-        (p.address_space.replace(next.space), old_regions)
-    });
-    let Some((old_space, old_regions)) = taken else {
+    // Step 1: install the new image on the registered process — **the shared
+    // `Process::install_image` since 2026-09-11**, which is the half of
+    // `execve` that is about the process rather than about the ELF.
+    //
+    // The load above stays this target's (`Image::from_elf_argv_envp`, i.e.
+    // `akuma-elf`'s `load_elf` plus `loader::build_stack`): C1 step 6 kept that
+    // stack builder deliberately, and the shared `replace_image` begins by
+    // loading its own way. `ImageInstall` is the seam between the two, and it
+    // carries only what the install needs to know — no `ImageSource`, no
+    // deferred segments (this target maps eagerly, so the slice is empty).
+    //
+    // **Three POSIX obligations arrive with it that this function did not
+    // perform**, and none is cosmetic:
+    //
+    // * `clear_child_tid` is reset. A `CLONE_CHILD_CLEARTID` address from the
+    //   *previous* image would otherwise be zeroed-and-woken at exit — a write
+    //   to whatever the new program has at that VA.
+    // * custom signal handlers go back to `SIG_DFL` (`SIG_IGN` preserved).
+    //   Inert today (`rt_sigaction` is a stub here) and correct the moment it
+    //   is not.
+    // * the alternate signal stack is disabled; it pointed into the old space.
+    //
+    // The old address space and the old region list are dropped **inside**, not
+    // returned to be dropped here. That was this function's own arrangement for
+    // a good reason — `UserAddressSpace::drop` frees every user frame and page
+    // table, which is not work for a closure `with_process` runs with
+    // interrupts disabled — and the reason does not apply to `install_image`:
+    // it takes `&self` and interior locks, at normal priority. It also
+    // `deactivate()`s first, so the hardware is off the old tables before they
+    // are freed, which is the ordering this function achieved with
+    // `set_current_space_root` and which is now stated where it is relied on.
+    // **The thread group leader's `Process`, not the calling task's own.** The
+    // block this replaced resolved through `with_process(current_pid(), ..)`,
+    // and `current_pid()` is the *tgid* since the `clone` fold — so this is the
+    // same process it always installed onto, named through the accessor that
+    // says which one it means. `current_process()` would be the own-half and
+    // would install the new image onto a non-leader thread's own `Process`,
+    // leaving the group leader running the program that was just replaced.
+    //
+    // `execve` replaces an address space, which is a property of the thread
+    // *group*, so the leader is right on both counts — the same reasoning
+    // `current_mm_process` carries for the fault path.
+    let Some((_, proc)) = akuma_exec::process::current_thread_tgid_process() else {
         // Unreachable by construction since 5b slice 4: every process task is
         // registered before it is published, so a task running `execve` has a
         // registered process. Say so rather than proceeding — the new image
@@ -3716,20 +3727,48 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         serial::puts("\n");
         return errno::ESRCH;
     };
+    if let Err(e) = proc.install_image(akuma_exec::process::ImageInstall {
+        address_space: next.space,
+        entry_point: new_entry as usize,
+        sp: new_stack as usize,
+        brk: new_brk as usize,
+        stack_bottom,
+        stack_top: ELF_STACK_TOP as usize,
+        mmap_floor: crate::mm::MMAP_BASE,
+        args: &new_args,
+        // This target maps every segment eagerly (`loader::load`), so there is
+        // nothing for the shared lazy path to defer.
+        deferred_segments: &[],
+    }) {
+        serial::puts("  [execve] install failed: ");
+        serial::puts(&e);
+        serial::puts("\n");
+        return errno::ENOMEM;
+    }
+    // The display name is the syscall layer's, on both kernels —
+    // `install_image`'s doc says so, because it is the *resolved path* here and
+    // `argv[0]` would be a name the caller chose rather than something that
+    // opens. `/proc/<pid>/exe` reports it.
+    proc.image.lock().name = new_name;
 
     // A new program in an existing slot starts with a clean group: a stale
     // `exit_group` flag from the image just replaced would kill its first
     // thread at its first syscall.
     crate::thread::clear_group_exiting(slot);
-    // Step 2: `CR3` off the old space, onto the new one. After this the old
-    // tables are unreferenced by this core.
+    // Step 2: `CR3` onto the new space, and record it on the task slot so the
+    // next switch into this task installs the same thing.
+    //
+    // `install_image` left the hardware on the **boot** root
+    // (`UserAddressSpace::deactivate`) rather than on the new space: it has no
+    // opinion about which address space a caller wants active afterwards, and
+    // on the other kernel the `eret` path decides. Here it is this line, and it
+    // must run before ring 3 is re-entered — which `run_process`'s loop does
+    // immediately after this syscall returns.
+    //
+    // The old space and the old region list are already gone, dropped inside
+    // the install *after* that `deactivate` — which is the ordering the two
+    // explicit `drop`s that used to stand here were arranging by hand.
     crate::sched::set_current_space_root(new_root);
-    // Step 3: and now the old image can go. `free_or_defer_as_frames` still
-    // parks it if another core's `CR3` or a preempted thread's saved context
-    // stands on that L0 — a `CLONE_VM` sibling, which this target does not
-    // terminate on `execve`.
-    drop(old_space);
-    drop(old_regions);
 
     // Ask the entry path to leave ring 3, and tell `run_process` this is an
     // `execve` rather than an exit.

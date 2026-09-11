@@ -434,7 +434,7 @@ pub(crate) fn build_exec_runtime(
         // `fork_process`'s own step 2, registered for the same reason: whether a
         // kernel keeps a per-process identity page in the user address space is
         // a per-target answer, and this one's is yes.
-        fork_alloc_process_info: akuma_exec::process::fork_alloc_process_info,
+        alloc_process_info: akuma_exec::process::fork_alloc_process_info,
         // Nothing to bind: on this kernel a child thread is described entirely
         // by its `Process` and the shared thread table. amd64 binds a `CR3`
         // root and a `SPAWN` row here. See the field's doc.

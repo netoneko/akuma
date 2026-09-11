@@ -116,6 +116,38 @@ fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegme
     }
 }
 
+/// Everything [`Process::install_image`] needs to know about a freshly loaded
+/// program, and nothing about **how** it was loaded.
+///
+/// The two kernels load differently and legitimately so: AArch64 goes through
+/// `ImageSource::load` (`akuma-elf`'s `load_elf_with_stack`, which may defer
+/// segments), amd64 through `amd64::loader::load` + its own `build_stack`
+/// (`akuma-elf`'s `load_elf` underneath, mapped eagerly — C1 step 6 kept the
+/// stack builder deliberately). What they agree on is the *result*, which is
+/// this struct, and what happens to the `Process` afterwards, which is
+/// `install_image`.
+///
+/// Drawing the seam here rather than at `replace_image` is what lets amd64
+/// adopt the install half — where `execve`'s POSIX obligations live — without
+/// also adopting a demand-paging model it does not have.
+pub struct ImageInstall<'a> {
+    /// The new address space, moved in. The old one is dropped by the install.
+    pub address_space: mmu::UserAddressSpace,
+    /// Where ring 3 starts, and on what stack.
+    pub entry_point: usize,
+    pub sp: usize,
+    /// The new arena: heap base, stack extent, and where `mmap` may place.
+    pub brk: usize,
+    pub stack_bottom: usize,
+    pub stack_top: usize,
+    pub mmap_floor: usize,
+    /// The new `argv`, for `/proc/<pid>/cmdline`.
+    pub args: &'a [String],
+    /// Segments the loader chose not to map, to be demand-paged from
+    /// `lazy_regions`. Empty for a kernel that maps eagerly.
+    pub deferred_segments: &'a [DeferredLazySegment],
+}
+
 impl Process {
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
@@ -157,24 +189,69 @@ impl Process {
         // allocates/copies for milliseconds and, for an `ImageSource::Path`, does block
         // I/O — holding the preemption-disable guard across such waits wedges the box
         // (see `process/lifecycle.rs` and the spawn.rs load-phase note).
+        self.install_image(ImageInstall {
+            address_space: loaded.address_space,
+            entry_point: loaded.entry_point,
+            sp: loaded.sp,
+            brk: loaded.brk,
+            stack_bottom: loaded.stack_bottom,
+            stack_top: loaded.stack_top,
+            mmap_floor: loaded.mmap_floor,
+            args,
+            deferred_segments: &loaded.deferred_segments,
+        })
+    }
+
+    /// **Install a loaded program onto this `Process`** — the half of `execve`
+    /// that is about the process rather than about the ELF, and the half both
+    /// kernels share.
+    ///
+    /// Split out of [`Self::replace_image_from`] so amd64 can reach it: that
+    /// function begins by loading the ELF *its* way, and the two targets' load
+    /// halves differ for reasons C1 step 6 settled (see [`ImageInstall`]).
+    /// Everything below the load is the same job on both, and three of its
+    /// steps are POSIX obligations amd64's hand-rolled `sys_execve` did not
+    /// perform at all:
+    ///
+    /// * **`clear_child_tid` is reset.** A `CLONE_CHILD_CLEARTID` address from
+    ///   the *previous* image would otherwise be zeroed-and-woken at this
+    ///   process's exit — a write to whatever the new program has at that VA.
+    /// * **Custom signal handlers are reset to `SIG_DFL`,** `SIG_IGN`
+    ///   preserved, which is what `execve(2)` specifies. A handler address from
+    ///   the old image is a pointer into a program that no longer exists.
+    /// * **The alternate signal stack is disabled,** for the same reason: it
+    ///   pointed into the old address space.
+    ///
+    /// # Ordering
+    ///
+    /// `deactivate()` moves the hardware off the old tables *before* the swap
+    /// drops them, which is what makes dropping an address space this core was
+    /// running on safe at all. A caller that needs the new space in the MMU
+    /// afterwards installs it itself — on AArch64 the `eret` path does it, on
+    /// amd64 `sched::set_current_space_root` does, and neither belongs here.
+    ///
+    /// Between the `deactivate` and that re-install there is **no user memory
+    /// access**: the `ProcessInfo` write goes through the physmap and the page
+    /// tables are reached the same way.
+    pub fn install_image(&self, inst: ImageInstall<'_>) -> Result<(), String> {
         let _lifecycle = LifecycleGuard::acquire();
 
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: deactivating\n");
         mmu::as_trace(format_args!(
             "[AS-EXEC] pid={} old_l0=0x{:x} old_asid=0x{:x} new_l0=0x{:x} new_asid=0x{:x} core={}\n",
             self.pid, self.address_space.l0_phys(), self.address_space.asid(),
-            loaded.address_space.l0_phys(), loaded.address_space.asid(), crate::bkl::current_core_id()));
+            inst.address_space.l0_phys(), inst.address_space.asid(), crate::bkl::current_core_id()));
         mmu::UserAddressSpace::deactivate();
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: swapping AS\n");
         // `replace` swaps the inner address space and refreshes the lock-free
         // scalar mirror (`ttbr0`/`shared`) in one step; the returned old address
         // space drops here, freeing its page-table frames.
-        drop(self.address_space.replace(loaded.address_space));
+        drop(self.address_space.replace(inst.address_space));
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: AS swapped\n");
-        self.entry_point.store(loaded.entry_point, Ordering::Relaxed);
-        self.brk.store(loaded.brk, Ordering::Relaxed);
-        self.initial_brk.store(loaded.brk, Ordering::Relaxed);
-        self.memory.reset(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
+        self.entry_point.store(inst.entry_point, Ordering::Relaxed);
+        self.brk.store(inst.brk, Ordering::Relaxed);
+        self.initial_brk.store(inst.brk, Ordering::Relaxed);
+        self.memory.reset(inst.brk, inst.stack_bottom, inst.stack_top, inst.mmap_floor);
         self.mmap_regions.lock().clear();
         self.lazy_regions.lock().clear();
         // `dynamic_page_tables` is always empty in this tree (nothing pushes to
@@ -184,21 +261,21 @@ impl Process {
         // Written through the owned field rather than the pid-keyed
         // `push_lazy_region`: that would resolve `self.pid` back to this very
         // `Process` through a *shared* table lookup, re-entering the caller.
-        let heap_lazy_size = compute_heap_lazy_size(loaded.brk, &self.memory);
-        let lazy_stack_start = loaded.stack_top.saturating_sub(LAZY_STACK_MAX);
+        let heap_lazy_size = compute_heap_lazy_size(inst.brk, &self.memory);
+        let lazy_stack_start = inst.stack_top.saturating_sub(LAZY_STACK_MAX);
         {
             let mut lazy = self.lazy_regions.lock();
             // Demand-paged segments first, then heap and stack — the order the
             // on-demand path has always used.
-            push_deferred_regions(&mut lazy, &loaded.deferred_segments);
-            lazy.push(loaded.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+            push_deferred_regions(&mut lazy, inst.deferred_segments);
+            lazy.push(inst.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
             lazy.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
         }
 
         if config().syscall_debug_info_enabled {
-            let how = if loaded.deferred_segments.is_empty() { "" } else { " (on-demand)" };
+            let how = if inst.deferred_segments.is_empty() { "" } else { " (on-demand)" };
             log::debug!("[Process] PID {} replaced{}: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",
-                self.pid, how, loaded.entry_point, loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.sp);
+                self.pid, how, inst.entry_point, inst.brk, inst.stack_bottom, inst.stack_top, inst.sp);
         }
 
         // The new argv and the first-run `eret` target — the two `Process::image`
@@ -206,29 +283,29 @@ impl Process {
         // returns). One lock hold, no reader between here and it.
         {
             let mut img = self.image.lock();
-            img.args = args.to_vec();
-            img.context = crate::process::UserContext::new(loaded.entry_point, loaded.sp);
+            img.args = inst.args.to_vec();
+            img.context = crate::process::UserContext::new(inst.entry_point, inst.sp);
         }
 
-        // Re-write process info page in the NEW address space
-        let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
-        track_frame(process_info_frame, FrameSource::UserData);
-
-        {
+        // Re-write the process info page in the NEW address space — through the
+        // registered hook, because **whether this kernel has one at all** is a
+        // per-target answer and not a step every kernel must take. `0` means
+        // "no page"; amd64 returns it, for the reason
+        // `ExecRuntime::alloc_process_info` gives, and the write below is
+        // skipped on the same value.
+        //
+        // The page is per-*address space*, so a fresh one is mandatory here and
+        // not merely tidy: the old one went with the address space this
+        // function just dropped.
+        let process_info_phys = {
             let mut asg = self.address_space.lock();
-            asg.map_page(
-                PROCESS_INFO_ADDR,
-                process_info_frame.addr,
-                mmu::user_flags::RO_NO_EXEC,
-            )
-            .map_err(|_| "Failed to map process info")?;
-            asg.track_user_frame(process_info_frame);
-        }
-        self.process_info_phys.store(process_info_frame.addr, Ordering::Relaxed);
+            (runtime().alloc_process_info)(&mut asg)?
+        };
+        self.process_info_phys.store(process_info_phys, Ordering::Relaxed);
 
-        {
+        if process_info_phys != 0 {
             let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
-            let wrote = mmu::write_phys(self.process_info_phys.load(Ordering::Relaxed), &info);
+            let wrote = mmu::write_phys(process_info_phys, &info);
             debug_assert!(wrote, "exec: ProcessInfo frame not in PMM RAM");
         }
 
