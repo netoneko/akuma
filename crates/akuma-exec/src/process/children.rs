@@ -250,17 +250,36 @@ pub fn current_channel() -> Option<Arc<ProcessChannel>> {
 /// Called by syscall handlers to detect interrupt signal.
 /// Returns true if the process should terminate.
 pub fn is_current_interrupted() -> bool {
-    // Borrowed read: this runs on every syscall (handle_syscall prologue), and
-    // `current_process_shared` is an identity-cache hit, so the whole check is
-    // a couple of loads. The old shape cloned the channel `Arc` here.
-    if let Some(proc) = current_process_shared() {
-        if let Some(ref ch) = proc.channel {
-            return ch.is_interrupted();
-        }
-        // No channel on the process → legacy kernel-thread fallback below.
-    }
+    // **The per-thread registry first, because that is where the flag is
+    // written.** [`interrupt_thread`] sets it there and nowhere else, for the
+    // reason its own doc gives at length: `Process::inherit_from` clones
+    // `channel`, so `Process::channel` is shared by a whole `fork` tree and a
+    // *per-process* flag cannot live in it.
+    //
+    // This read used to prefer `Process::channel`, and the two agreed for as
+    // long as they were the same object — which they are for an AArch64 spawn
+    // (`spawn.rs` registers the I/O channel under the tid) and were on amd64
+    // only because a session child had no `Process::channel` at all, so the
+    // fallback ran. The moment amd64's spawned children got one (2026-09-11),
+    // a `fork` child inside an `ssh` session had the session's channel in
+    // `Process::channel` and its **own** exit channel under its tid — and the
+    // flag `deliver_signal` had just set became invisible. Observable: `^C` on
+    // `sh -c 'sleep 60; echo X'` killed the sleep but the shell went on to print
+    // `X`, where before it aborted the list.
+    //
+    // The registry is the right source on every shape, not merely on that one:
+    // `sys_reattach` (`box grab`) points a target's `Process::channel` at the
+    // *grabber's*, and the flag still lands on the target's own tid.
+    //
+    // `Process::channel` stays as the fallback for a caller with no tid
+    // registration at all, which is what the kernel-thread path was.
     let thread_id = crate::threading::current_thread_id();
-    get_channel(thread_id).map(|ch| ch.is_interrupted()).unwrap_or(false)
+    if let Some(ch) = get_channel(thread_id) {
+        return ch.is_interrupted();
+    }
+    current_process_shared()
+        .and_then(|p| p.channel.as_ref().map(|ch| ch.is_interrupted()))
+        .unwrap_or(false)
 }
 
 /// Interrupt a process by thread ID
@@ -298,6 +317,12 @@ pub fn is_current_interrupted() -> bool {
 ///
 /// Narrower than one object per machine, and still the wrong place for the
 /// flag. See `AKUMA_AMD64_SIGNAL_DELIVERY.md` §5d.
+///
+/// **The reader was the half that was actually wrong**, and it is fixed:
+/// [`is_current_interrupted`] read `Process::channel` first, which agreed with
+/// this registry only while the two were the same object. They stopped being
+/// one on amd64 the day a session child got an I/O channel — see that
+/// function.
 ///
 /// So the gap stands, and it is narrower than it looks: the *per-thread*
 /// `EINTR` path (`current_thread_has_pending_interrupt`, reading the pending

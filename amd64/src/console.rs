@@ -168,6 +168,14 @@ pub fn set_attached_pid(pid: u32) {
     ATTACHED_PID.store(pid, Ordering::Release);
 }
 
+/// [`CHANNEL`]'s address, for [`is_console_channel`].
+///
+/// A raw pointer in an atomic rather than a second `Arc`: the question is asked
+/// on every ring-3 write to fd 1 or 2, and taking [`CHANNEL`]'s lock there would
+/// put a spinlock on the console write path to answer a question about identity.
+/// 0 before [`init`]. Never cleared — the console channel outlives everything.
+static CHANNEL_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Bring the console channel and its line discipline up. Called once, from
 /// `boot::wire_console_and_syscalls`, before ring 3 exists.
 pub fn init() {
@@ -176,8 +184,26 @@ pub fn init() {
     // assumed, because it is the flag glue's `openat` gates `/dev/tty` on and
     // the one that selects cooked input over raw pipe pass-through.
     ch.set_terminal(true);
+    CHANNEL_PTR.store(Arc::as_ptr(&ch) as usize, Ordering::Release);
     *CHANNEL.lock() = Some(ch);
     *TERM.lock() = Some(Arc::new(Spinlock::new(default_terminal_state())));
+}
+
+/// Is `ch` **the** console's channel — the serial line — rather than a spawned
+/// session's?
+///
+/// `Process::channel` means two different things on this target and the answer
+/// decides where a write to fd 1 goes: a console-attached process carries
+/// [`CHANNEL`] and its output is the UART; an `ssh` session's child carries its
+/// own, and its output belongs to `sshd` through glue's `Stdout` arm. Identity,
+/// not a flag, because both report `is_terminal()` for an interactive session
+/// and neither is distinguishable any other way.
+///
+/// `false` before [`init`], which is the safe answer: nothing has a channel yet.
+#[must_use]
+pub fn is_console_channel(ch: &Arc<ProcessChannel>) -> bool {
+    let p = CHANNEL_PTR.load(Ordering::Acquire);
+    p != 0 && Arc::as_ptr(ch) as usize == p
 }
 
 /// The console channel, or `None` before [`init`].

@@ -98,20 +98,6 @@ pub fn alloc() -> Option<PipeId> {
     (glue::pipe_live_count() < MAX_PIPES).then(|| glue::pipe_create() as PipeId)
 }
 
-/// Remove a pipe outright, whatever its end counts say.
-///
-/// For the lifetimes `sys_spawn` manages by hand: a spawned child's stdin pipe
-/// is read by the child *by number* rather than through a descriptor, so its
-/// read end never closes and refcounting alone would never free it. `waitpid`
-/// is what knows the child is gone.
-///
-/// A `pipe(2)` pair must **not** come through here — it is destroyed by the
-/// last [`close_read`]/[`close_write`], and short-circuiting that frees the
-/// buffer under a live peer.
-pub fn free(id: PipeId) {
-    glue::pipe_destroy(id as u32);
-}
-
 /// One more open file description names this end — `dup`, or a `fork`
 /// inheriting it.
 ///

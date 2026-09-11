@@ -1761,12 +1761,21 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
     0
 }
 
-/// `CLOSE_CHILD_STDIN(pid)` — deliver EOF to a spawned child's stdin so a shell
-/// reading a piped script (busybox `sh`) finishes reading and runs the commands.
-/// The userspace SSH-into-box bridge calls this on the client's `CHANNEL_EOF`.
+/// `CLOSE_CHILD_STDIN(pid)` — deliver EOF to a spawned child's stdin.
+///
+/// So a shell reading a piped script (busybox `sh`) finishes reading and runs
+/// the commands. The userspace SSH-into-box bridge calls this on the client's
+/// `CHANNEL_EOF`.
 /// Authorization mirrors the procfs `/proc/<pid>/fd/0` write path: only the
 /// spawner may close its child's stdin, and box isolation is enforced.
-pub(super) fn sys_close_child_stdin(pid: u32) -> u64 {
+///
+/// `pub`, not `pub(super)`, since 2026-09-11: the amd64 kernel dispatches Akuma's
+/// 326 in its own table and used to answer it by closing the write end of a pipe
+/// it owned. Its spawned children have a `ProcessChannel` now, so the answer is
+/// this function — reached from outside the crate rather than reimplemented
+/// beside it, which is what keeps the two authorization checks above from
+/// existing in one kernel and not the other.
+pub fn sys_close_child_stdin(pid: u32) -> u64 {
     let caller = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     let target = match akuma_exec::process::lookup_process_shared(pid) { Some(p) => p, None => return ESRCH };
 

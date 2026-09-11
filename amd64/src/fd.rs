@@ -286,7 +286,7 @@ fn cur_table() -> &'static akuma_exec::process::SharedFdTable {
 /// Clone `fd`'s description out of the calling table, or `None` if the fd
 /// names nothing — a closed descriptor, one out of range, or a console
 /// descriptor.
-fn table_get(fd: u64) -> Option<FileDescriptor> {
+pub fn table_get(fd: u64) -> Option<FileDescriptor> {
     table_get_in(cur_table(), fd)
 }
 
@@ -430,36 +430,20 @@ pub fn socket_index(fd: u64) -> Option<usize> {
     })
 }
 
-/// Give `sys_spawn`'s caller the read end of its child's stdout pipe, as a
-/// `FileDescriptor::PipeRead`.
+/// Give `sys_spawn`'s caller a handle on its child's output: a
+/// `FileDescriptor::ChildStdout(pid)`, which glue's read arm resolves through
+/// `get_child_channel(pid)`.
 ///
-/// **It adopts the initial reader reference rather than cloning one.**
-/// [`bind_stdio`] consumed the stdout pipe's initial *writer* (fd 1) and cloned
-/// it (fd 2), but left the initial *reader* untouched and unowned — nothing
-/// else ever names it. Cloning a second reader here would strand that one: the
-/// child's `close_all` takes the writers to 0, this descriptor's `close` takes
-/// the cloned reader to 0, and the orphan reader keeps the pipe alive forever —
-/// one leaked pipe per spawn against `MAX_PIPES`
-/// (`proposals/AMD64_SPAWN_PIPE_LEAK.md`).
-///
-/// It had a second caller and two more parameters until 2026-09-11:
-/// `sys_openat`'s `/proc/<pid>/fd/0` took the *write* end of the child's stdin
-/// pipe, and did `clone_ref` rather than adopt, because that pipe's initial
-/// writer is spoken for by the `waitpid` reap (`pipe::close_write` on
-/// `Spawn::stdin_pipe`), the one place that knows the child is gone. That path
-/// is gone — the bridge reaches the child through the shared
-/// `write_to_process_stdin` now, which needs no descriptor at all — so both the
-/// `is_write` and `adopt_initial` arms went with it rather than sitting here as
-/// the only untaken branches in the module.
-///
-/// On a failed install the adopted reference is released so nothing leaks.
-pub fn alloc_child_stdout_fd(pipe_id: usize) -> Option<u64> {
-    let fd = install(FileDescriptor::PipeRead(pipe_id as u32));
-    if errno::is_err(fd) {
-        crate::pipe::close_read(pipe_id);
-        return None;
-    }
-    Some(fd)
+/// This was `alloc_pipe_fd(stdout_pipe, false, true)` until 2026-09-11 — a
+/// `PipeRead` on the other end of the child's stdout pipe, with a stated
+/// adopt-don't-clone rule because `bind_stdio` left that pipe's initial *reader*
+/// unowned and cloning a second one stranded it (one leaked pipe per spawn
+/// against `MAX_PIPES`, `proposals/AMD64_SPAWN_PIPE_LEAK.md`). None of that
+/// applies now: the channel is reference-counted by `Arc` and the registration
+/// is dropped by glue's own `close` arm, so there is no hand-managed end to
+/// account for.
+pub fn install_child_stdout(pid: u32) -> u64 {
+    install(FileDescriptor::ChildStdout(pid))
 }
 
 /// The pipe id behind `fd` if it is a `PipeRead` descriptor.
@@ -560,66 +544,6 @@ pub fn copy_out(ptr: u64, src: &[u8]) -> u64 {
     copy_to_user(ptr, src)
 }
 
-
-/// Give a not-yet-running spawned child its stdio as **real descriptors**:
-/// fd 0 = the read end of its stdin pipe, fd 1 **and fd 2** = the write end of
-/// its stdout pipe, in the child's own table.
-///
-/// **C2 slice 6.** This replaces the by-number stdio routing the `Spawn` row
-/// used to carry (`Spawn::stdin_pipe`/`stdout_pipe`, consulted at every
-/// unbound fd 0/1/2 read and write). Bound descriptors mean every existing
-/// mechanism just works: `pipe_read_id`/`pipe_write_id` route the child's
-/// I/O, `fork`'s `clone_deep_for_fork` shares the ends with correct
-/// refcounts, and the child's exit `close_all` drops its ends — the EOF the
-/// parent's reader waits for — with no per-spawn teardown code at all.
-///
-/// **fd 2 is a second *name*, not a second description**, and that is the
-/// whole reason it is bound here rather than left to fall through to the
-/// console: the old router answered fd 1 *and* fd 2 from `Spawn::stdout_pipe`,
-/// so `prog > file` kept sending stderr to the session. Binding fd 2 to the
-/// same write end — one more reference, exactly what `dup2(1, 2)` would build
-/// — reproduces that: the `dup2(f, 1)` a shell emits for `>` drops one name
-/// and the pipe end stays open under the other. Leaving fd 2 unbound and
-/// answering it from fd 1 instead would put the second source of truth this
-/// slice exists to delete back in, one indirection further along — and it
-/// would break at exactly the redirect it was meant to survive.
-///
-/// Direct inserts rather than [`install`], deliberately: `install` starts at
-/// [`FIRST_FILE_FD`] (the pinned "first free fd is 3" divergence), and stdio
-/// is precisely the case that must land on 0/1/2. The reference rule: the
-/// inserts at 0 and 1 **consume** the references `pipe::alloc` started each
-/// end with; the insert at 2 is a second name for the write end and bumps one
-/// more through [`clone_refs`]. Called before the child is published, so no
-/// lock ordering question exists.
-///
-/// **Each pipe keeps one initial reference this function does not touch**, and
-/// each has its own claimant: the stdin pipe's initial *writer* is released by
-/// the `waitpid` reap (`pipe::close_write` on `Spawn::stdin_pipe`), and the
-/// stdout pipe's initial *reader* is adopted by the parent's stdout descriptor
-/// in [`alloc_child_stdout_fd`]. Neither is a leak; both are load
-/// bearing — see `proposals/AMD64_SPAWN_PIPE_LEAK.md` for what a stray
-/// `clone_ref` on the second one cost.
-pub fn bind_stdio(
-    table: &akuma_exec::process::SharedFdTable,
-    stdin_pipe: usize,
-    stdout_pipe: usize,
-) -> u64 {
-    {
-        let mut t = table.table.lock();
-        // The child's table is fresh (`SharedFdTable::new`), so 0/1/2 are free;
-        // a stale entry here would mean the caller reused a table, and stdio
-        // must not silently overwrite it.
-        if t.contains_key(&0) || t.contains_key(&1) || t.contains_key(&2) {
-            return errno::EINVAL;
-        }
-        t.insert(0, FileDescriptor::PipeRead(stdin_pipe as u32));
-        t.insert(1, FileDescriptor::PipeWrite(stdout_pipe as u32));
-        t.insert(2, FileDescriptor::PipeWrite(stdout_pipe as u32));
-    }
-    // fd 2: one more open description names the write end.
-    crate::pipe::clone_ref(stdout_pipe, true);
-    0
-}
 
 /// Largest single `read`/`write` this kernel will accept.
 ///
@@ -1737,14 +1661,19 @@ pub fn sys_access(path: u64) -> u64 {
 /// `PipeRead` from [`bind_stdio`] — the channel carries the terminal's identity,
 /// not its data — so glue's table test still answers `ENOTTY` for it and the
 /// `fd < FIRST_FILE_FD` fake tty is still what lets `busybox sh` run
-/// interactively over the bridge. Moving fd 0 onto the channel is not a
-/// one-liner and it is not blocked on anything mysterious: glue's `Stdin` arm
-/// writes the line discipline's **echo** to the channel's *stdout* FIFO, and on
-/// this target nothing drains that — a spawned child's stdout is a pipe and
-/// `sshd` reads the pipe. So fd 0 and fd 1/2 have to move together, i.e.
-/// `sys_spawn` has to hand back a `ChildStdout(pid)` and `sys_write`'s console
-/// preamble has to stop claiming every `Stdout` descriptor. Until then this
-/// preamble stays.
+/// interactively over the bridge.
+///
+/// What is in the way is **not** a missing mechanism, and the first note here
+/// said it was. It is this target's *second implementation of session stdio*.
+/// An AArch64 spawned child has one `ProcessChannel` serving its I/O, its exit
+/// status and the parent's `ChildStdout(pid)` descriptor, with
+/// `SharedFdTable::with_stdio()` for fd 0/1/2 and **no pipes**; the line
+/// discipline's echo and the program's own output land in one FIFO and `sshd`
+/// reads that FIFO. This target builds the same session on `crate::pipe`
+/// because `sys_spawn` predates all of it, so moving fd 0 is a deletion:
+/// [`bind_stdio`] and both pipes out, `sys_spawn` returning a `ChildStdout`,
+/// and two preambles moving with it — `sys_write`'s, which claims **every**
+/// `Stdout`/`Stderr` descriptor for the serial line, and this one.
 ///
 /// (`delegate_pid` used to be named here as part of the same deferred work. It
 /// is not: `delegate_pid` is `sys_reattach`'s — `box grab` — which moves a
@@ -1776,55 +1705,21 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     // The by-number/by-descriptor console, plus a `/dev/tty` fd. See the header:
     // the `fd < FIRST_FILE_FD` term is the fake tty and is the reason this
     // preamble exists at all.
-    let is_console =
-        fd < FIRST_FILE_FD as u64 || console_end(fd).is_some() || dev_node_of(fd) == Some("tty");
+    let is_console = console_end(fd).is_some() || dev_node_of(fd) == Some("tty");
     if is_console
         && let Some(r) = console_ioctl(req, arg)
     {
         return r;
     }
-    // `TIOCSWINSZ` on a spawned child's stdout, which is this target's answer
-    // to glue's `ChildStdout(pid)` arm. See [`child_pipe_set_winsize`].
-    if req == 0x5414
-        && let Some(r) = child_pipe_set_winsize(fd, arg)
-    {
-        return r;
-    }
+    // `TIOCSWINSZ` on a spawned child's stdout needed a shim here while the
+    // parent held that stdout as a plain `PipeRead`: glue's arm reads the child
+    // pid straight out of a `FileDescriptor::ChildStdout(pid)`, which this
+    // target had none of, so the size landed in `sshd`'s own `TerminalState`
+    // and nothing ever read it (`AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 4).
+    // `sys_spawn` hands back a real `ChildStdout` now, so glue's arm answers it.
     // Everything else — including any request on a console fd that the terminal
     // subset above does not claim, which glue also answers `ENOTTY`.
     akuma_syscalls_glue::term::sys_ioctl(fd as u32, req as u32, arg)
-}
-
-/// `TIOCSWINSZ` aimed at a spawned child, through the parent's stdout descriptor.
-///
-/// `None` means "not that" and lets the caller carry on to glue, which sets the
-/// *caller's* own terminal state — the right answer for a process resizing its
-/// own console and the wrong one for `sshd`, whose session shell got a fresh
-/// `TerminalState` at spawn and is the process the client's `pty-req` describes.
-///
-/// AArch64 asks the same question of the descriptor: `sshd` holds the child
-/// under a `FileDescriptor::ChildStdout(pid)` there and glue's arm reads the pid
-/// straight out of it. This target hands the parent a plain `PipeRead`, so the
-/// link is carried by the spawn row instead (`usermode::child_of_stdout_pipe`)
-/// and looked up here. Without it the size landed in `sshd`'s own state, which
-/// nothing ever reads — `AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 4.
-///
-/// The child's state is an `Arc` its `fork` children inherit, so the update
-/// reaches the whole session tree — the shell, and the full-screen program it
-/// runs — through [`console_ioctl`]'s `TIOCGWINSZ`.
-fn child_pipe_set_winsize(fd: u64, arg: u64) -> Option<u64> {
-    let pid = pipe_read_id(fd).and_then(crate::usermode::child_of_stdout_pipe)?;
-    // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }.
-    let Some(bytes) = copy_in(arg, 4) else {
-        return Some(errno::EFAULT);
-    };
-    let rows = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let cols = u16::from_le_bytes([bytes[2], bytes[3]]);
-    let proc = akuma_exec::process::lookup_process_shared(pid)?;
-    let mut ts = proc.terminal_state.lock();
-    ts.term_height = rows;
-    ts.term_width = cols;
-    Some(0)
 }
 
 /// The terminal subset this target answers itself, for a console fd.

@@ -2100,6 +2100,27 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     }
 }
 
+/// Does the running process have an I/O channel that is **not** the console's?
+///
+/// `Process::channel` is `Some` in exactly two cases here: a console-attached
+/// process carries the serial line's channel, and a `sys_spawn` child carries
+/// its own (inherited by everything it forks). Everything else — the boot task,
+/// the self-test processes — is `None` and writes to the serial line, which is
+/// what it always did.
+///
+/// Deliberately `Process::channel` and **not** `current_channel()`: that falls
+/// back to the per-thread exit channel, which every registered process has, so
+/// it would answer `true` for a self-test process and route its output into a
+/// FIFO nobody drains. `AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3 is the record
+/// of that exact confusion costing a boot.
+fn owns_non_console_channel() -> bool {
+    akuma_exec::process::current_process_shared().is_some_and(|p| {
+        p.channel
+            .as_ref()
+            .is_some_and(|ch| !crate::console::is_console_channel(ch))
+    })
+}
+
 /// `write(fd, buf, len)` — the serial console, and **`akuma-syscalls-glue`'s
 /// arm** for everything else (4b batch 3a).
 ///
@@ -2145,8 +2166,22 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
 
-    // See the header: first, and by both spellings.
-    if crate::fd::console_end(fd) != Some(crate::fd::ConsoleEnd::Write) {
+    // See the header: first, and by both spellings — **unless this process's
+    // stdout belongs to a channel of its own**, which is what an `ssh` session's
+    // child has had since its stdio stopped being pipes (2026-09-11). Its fd 1
+    // and fd 2 are `Stdout`/`Stderr` descriptors like init's, so `console_end`
+    // claims them by spelling, and answering them here would put every session's
+    // output on the serial line instead of on the SSH stream. Glue's own
+    // `Stdout`/`Stderr` arm writes `current_channel()` with the line
+    // discipline's output translation and real backpressure, which is where they
+    // belong; `crate::console::is_console_channel` is what tells the two apart,
+    // because both report `is_terminal()` and nothing else distinguishes them.
+    //
+    // Asked **after** the cheap spelling test, so a write to a file or a socket
+    // never pays for it.
+    let console_write = crate::fd::console_end(fd) == Some(crate::fd::ConsoleEnd::Write)
+        && !owns_non_console_channel();
+    if !console_write {
         // The `O_ACCMODE` refusal glue's `File` arm does not make — see
         // `fd::write_mode_refusal`, which is where the finding is written down.
         if let Some(e) = crate::fd::write_mode_refusal(fd) {
@@ -3173,63 +3208,32 @@ fn finish_test_process(pid: u32, task_slot: usize) {
 // No `fork`, no per-process fd table, no real process hierarchy — one spawn per
 // `SPAWN` slot, and fd 0/1/2 are routed per task through `UserCtx::proc_slot`.
 
-use crate::pipe::{self, PipeId};
-
-/// One spawned child.
+/// One spawned child: a pid and the scheduler task running it.
 ///
-/// **One stdio field left of four, and the last one to go had a reader.**
+/// **All four stdio fields are gone**, and the last two went on 2026-09-11 with
+/// the pipes themselves.
 ///
 /// C2 slice 6 deleted `borrowed_io`/`console_io` and rewrote what `stdout_pipe`
-/// was *for*; 2026-09-11 deleted `stdout_pipe` itself. The three existed
-/// because a spawned child's
-/// stdio was routed *by number*: every unbound fd 0/1/2 read or write asked
-/// the spawn row which pipe (or console) served it, and the exit path closed
-/// the child's stdout end by hand, guarded by `borrowed_io` so a `fork` child
-/// did not close its parent's. The child's stdio is now **bound descriptors**
-/// in its own row and registered table (`fd::bind_stdio`), so every one of
-/// those jobs is done by machinery that already existed:
+/// was *for*; those three existed because a spawned child's stdio was routed *by
+/// number*: every unbound fd 0/1/2 read or write asked the spawn row which pipe
+/// (or console) served it, and the exit path closed the child's stdout end by
+/// hand. Binding real descriptors in the child's own registered table retired
+/// every one of those jobs. `stdout_pipe` outlived them by a slice because it
+/// had acquired a second one — naming the child a `TIOCSWINSZ` on the parent's
+/// stdout descriptor was meant for — and that moved to the child's registered
+/// fd 1.
 ///
-/// - routing: `pipe_read_id`/`pipe_write_id` resolve fd 0/1/2 like any pipe;
-/// - `borrowed_io`: a `fork` child's `clone_deep_for_fork` bumps the shared
-///   ends' refcounts, and only the last reference's close reaches the pipe;
-/// - `console_io`: a child of a console task inherits an empty table, so its
-///   0/1/2 are unbound and fall through to the console exactly as before;
-/// - exit EOF: `close_all` releases the child's ends before
-///   `spawn_record_exit` runs — the parent's reader sees EOF with no
-///   per-spawn code (the manual `close_write` this replaced would now be a
-///   *double* close).
+/// `stdin_pipe` outlived them all, for a real reason while it lasted: its write
+/// end was reached by *path* (`sshd` opened `/proc/<pid>/fd/0`) and later by
+/// *id*, and neither is a reference, so nothing refcounted it and the reap had
+/// to drop it by hand or leak a pipe per spawn against a 64-pipe ceiling.
 ///
-/// `stdout_pipe` outlived those by one slice because it had acquired a second,
-/// unrelated job: naming the child a `TIOCSWINSZ` on the parent's stdout
-/// descriptor is meant for. That question is asked of the child's registered
-/// fd 1 now ([`child_of_stdout_pipe`]) — the same descriptor slice 6 created,
-/// so the row was carrying a second copy of a fact the table already held.
-///
-/// **`stdin_pipe` stays, and that is a carried decision rather than a
-/// leftover.** Its *read* end is the child's fd 0 and dies with the child's
-/// row; its **write** end has no descriptor anywhere in the machine. `sshd`
-/// used to hold one — this module served `/proc/<pid>/fd/0` as a `PipeWrite` —
-/// and since 2026-09-11 does not: the bridge's bytes arrive through
-/// `akuma_exec::process::write_to_process_stdin`, which resolves the child's
-/// own fd 0 and writes the pipe **by id**, through the `pipe_write` runtime
-/// hook. An id is not a reference either, so the argument here is unchanged and
-/// slightly stronger. Left to the counts alone, a spawn whose stdin nobody ever
-/// wrote (every `run_sh_capture` in the boot suite) would keep one writer
-/// forever and the pipe would never be destroyed: a leak against a 64-pipe
-/// ceiling. The reap is the one place that knows the child is gone, so the reap
-/// drops it. What changed is *how*: `pipe::close_write`, not the old
-/// `pipe::free` — `free` destroys the pipe whatever the counts say, and the
-/// *reader* side can still be held (a zombie whose table is not yet torn down,
-/// a `fork` descendant that inherited fd 0), so its eventual close would land on
-/// a reissued id. `close_write` lets the end counts decide, which is the rule
-/// everywhere else in this module. A `fork` child owns no pipe of its own and
-/// carries `None`.
+/// **There are no pipes.** A spawned child's stdio is one `ProcessChannel`,
+/// which is what an AArch64 spawn has always been, and an `Arc` needs no reap to
+/// notice it is finished. What the row still carries is the pair `waitpid` needs
+/// and nothing else: which pid this slot is, and which task slot to unpublish.
 struct Spawn {
     pid: u32,
-    /// The stdin pipe this spawn created and still owns the *write* end of;
-    /// `None` for a `fork` child, which shares its parent's by descriptor. See
-    /// the type's header for why this one field outlived the other three.
-    stdin_pipe: Option<PipeId>,
     /// The scheduler task slot running this child, recorded at spawn so the
     /// `waitpid` reap can remove the `THREAD_PID_MAP` entry it published
     /// (`reap_exec_process`). A `usize` is wider than `sched::MAX_TASKS` needs,
@@ -3703,7 +3707,7 @@ fn register_exec_process(
         // fills it, `/dev/tty` opens because `is_terminal()` holds, and the
         // arm's own `EAGAIN`, `EINTR`, raw/cooked branch and `EPOLLET` edge
         // re-arm come with it.
-        channel: channel.or_else(|| console_attached.then(crate::console::channel).flatten()),
+        channel: channel.clone().or_else(|| console_attached.then(crate::console::channel).flatten()),
         delegate_pid: None,
         grabbed_by: None,
         clear_child_tid: AtomicU64::new(0),
@@ -3754,7 +3758,17 @@ fn register_exec_process(
     // is a process's *I/O* channel, and on this target stdio is bound
     // descriptors over `crate::pipe`. This one carries an exit status and
     // nothing else, exactly as the shared spawn path's comment says.
-    let exit_channel = alloc::sync::Arc::new(ProcessChannel::new());
+    //
+    // **A spawn passes its own channel in and all three registrations name
+    // it**, which is what AArch64 does and is not a second shape: there, a
+    // spawned process's `register_channel(tid, ch)` and `register_child_channel`
+    // both take the I/O channel (`spawn.rs`'s thread body, glue's `sys_spawn`),
+    // while a `fork`/`clone` child gets a fresh exit channel from
+    // `spawn_child_thread_and_publish`. One channel is what lets the parent's
+    // `ChildStdout(pid)` read the child's output *and* see EOF from
+    // `has_exited()`; two would mean a reader parked on an empty FIFO that the
+    // exit never marks.
+    let exit_channel = channel.unwrap_or_else(|| alloc::sync::Arc::new(ProcessChannel::new()));
     register_channel(task_slot, exit_channel.clone());
     register_child_channel(pid, exit_channel, ppid);
 }
@@ -4287,7 +4301,6 @@ pub fn bind_child_task(
     unsafe {
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid: child.pid,
-            stdin_pipe: None,
             exec_slot: task_slot,
         });
     }
@@ -4399,80 +4412,63 @@ pub fn sys_spawn(
         }
     };
 
-    let (Some(stdout_pipe), Some(stdin_pipe)) = (pipe::alloc(), pipe::alloc()) else {
-        drop(child);
-        return errno::ENOMEM;
-    };
-
-    // Seed the child's stdin, if the caller supplied any (`spawn_with_stdin`).
-    if stdin_ptr != 0 && stdin_len != 0 {
-        // A bad seed pointer seeds nothing rather than failing the spawn: the
-        // child is already built, and an empty stdin is a state it handles.
-        if let Some(seed) = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024)) {
-            // The pipe was created two statements ago and has both ends, so the
-            // broken-pipe answer is unreachable; a short write is not, and the
-            // seed is capped at the pipe's own capacity above.
-            let _ = pipe::write(stdin_pipe, &seed);
-        }
-    }
-
     let root = child.space.ttbr0();
 
-    // **C2 slice 6:** the child's stdio becomes real descriptors — fd 0 = the
-    // read end of `stdin_pipe`, fd 1 **and fd 2** = the write end of
-    // `stdout_pipe` (one description, two names, which is what keeps stderr on
-    // the session after a `dup2(file, 1)`) — in its own registered table,
-    // which since step 4b is the only table, replacing the by-number routing
-    // the `Spawn` row used to carry. See `fd::bind_stdio` for what this buys.
-    // Done before the child can be scheduled: the table is seeded before
-    // `publish_task` and handed to the registration below. There is no legacy
-    // row to reset defensively — a fresh `SharedFdTable` starts empty.
-    let child_fds = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new());
-    let bind = crate::fd::bind_stdio(&child_fds, stdin_pipe, stdout_pipe);
-    if bind != 0 {
-        drop(child);
-        cleanup_spawn_slot(stdout_pipe, stdin_pipe);
-        return bind;
+    // **The session channel — this child's whole stdio, and nothing else.**
+    //
+    // One `ProcessChannel` serving all three jobs, which is verbatim what an
+    // AArch64 spawn does (`akuma_exec::process::spawn_process_with_channel_ext`
+    // plus glue's `sys_spawn`): the child's I/O (`Process::channel`, below), its
+    // exit status (`register_channel(task_slot, ..)`), and the caller's handle
+    // on it (`register_child_channel` + the `ChildStdout(pid)` descriptor
+    // returned at the bottom).
+    //
+    // Until 2026-09-11 this was **two pipes** — `bind_stdio` put the stdin
+    // pipe's read end at fd 0 and the stdout pipe's write end at fd 1 and 2, and
+    // the caller got a `PipeRead` on the other end. That was a second
+    // implementation of session stdio, living beside the shared one because
+    // `sys_spawn` here predates it, and it is what kept an `ssh` session's shell
+    // from having a line discipline at all: glue's `Stdin` read arm serves
+    // cooked input and writes its **echo** to this channel's *stdout* FIFO, so a
+    // session split across a channel and a pipe has its echo land where nothing
+    // reads. There is no drain to add — there is a parallel implementation to
+    // delete, which is what this is.
+    let channel = alloc::sync::Arc::new(akuma_exec::process::ProcessChannel::new());
+    // `is_terminal()` is what glue's `Stdin` arm selects cooked input on, what
+    // gates `/dev/tty`, and what `write_to_process_stdin`'s ISIG branch reads —
+    // so `SPAWN_FLAG_PTY` decides whether `^C` is a signal or a byte. A plain
+    // `spawn` (herd's services, the boot suite's `run_sh_capture`) is a pipe and
+    // must not have its stream cooked.
+    channel.set_terminal(pty);
+
+    // Seed the child's stdin, if the caller supplied any (`spawn_with_stdin`).
+    //
+    // **Closed straight after**, as the AArch64 spawn does: a seed is the whole
+    // input, and a child that reads past it must see EOF rather than block on a
+    // writer that will never come. `sshd` passes no seed for either an
+    // interactive shell or an `exec` channel — it feeds them through
+    // `/proc/<pid>/fd/0` and ends them with `close_child_stdin` — so this is the
+    // in-kernel callers' path only.
+    if stdin_ptr != 0 && stdin_len != 0
+        && let Some(seed) = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024))
+    {
+        channel.write_stdin(&seed);
+        channel.close_stdin();
     }
+
+    // fd 0/1/2 = `Stdin`/`Stdout`/`Stderr`, served from the channel by glue's
+    // own arms. `with_stdio()`, the same table every other registered process
+    // gets — there is nothing spawn-specific left to bind.
+    let child_fds = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio());
 
     let Some(task_slot) = spawn_process_task(slot, root) else {
         // `child` drops here: the image is freed by the same destructor that
-        // would have freed it out of `PROCS`.
-        //
-        // The table is unwound **before** the pipes go: it holds three real
-        // references now, and `child_fds` is about to drop unregistered —
-        // `SharedFdTable::drop` runs `close_all()` anyway, but doing it
-        // explicitly keeps the release before `cleanup_spawn_slot` destroys
-        // the ends by id, the same ordering the exit path keeps.
-        child_fds.close_all();
-        cleanup_spawn_slot(stdout_pipe, stdin_pipe);
+        // would have freed it out of `PROCS`. `child_fds` drops unregistered and
+        // holds nothing refcounted — the stdio triple names no resource — so
+        // there is nothing to unwind, where the pipe version had to release
+        // three pipe-end references in a stated order.
         return errno::ENOMEM;
     };
-
-    // **The session channel** — see the header's `SPAWN_FLAG_PTY` section.
-    //
-    // Only for a pty spawn. It carries no data on this target: the child's
-    // stdin is `stdin_pipe` and its stdout is `stdout_pipe`, and both stay that
-    // way. What it carries is `is_terminal()`, which is the flag
-    // `write_to_process_stdin` gates its ISIG branch on — so this is the object
-    // that makes `^C` a signal on an `ssh` session.
-    //
-    // Deliberately **not** the console's channel and not the per-thread exit
-    // channel: three different things, and `AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md`
-    // §3 is the record of what confusing two of them cost.
-    //
-    // `Process::channel` is `clone`d by `inherit_from`, so everything the shell
-    // forks carries this same channel — which is right for a session, and is
-    // why a per-process interrupt flag must not live here
-    // (`AKUMA_AMD64_SIGNAL_DELIVERY.md` §5d).
-    let session_channel = pty.then(|| {
-        let ch = alloc::sync::Arc::new(akuma_exec::process::ProcessChannel::new());
-        // `ProcessChannel::new` already defaults this to `true`; stated rather
-        // than assumed, exactly as `console::init` states it, because it is the
-        // whole point of the object.
-        ch.set_terminal(true);
-        ch
-    });
 
     let pid = alloc_pid();
     // 5b slice 1: register the child with `akuma-exec`'s process table and
@@ -4506,7 +4502,7 @@ pub fn sys_spawn(
         // two concurrent sessions must not share one. Same rule as the AArch64
         // `pty` spawn (`akuma-exec`'s `spawn.rs`).
         None,
-        session_channel,
+        Some(channel),
     );
 
     // **The session's foreground process group.**
@@ -4527,41 +4523,32 @@ pub fn sys_spawn(
 
     // SAFETY: raw-pointer write; single core.
     unsafe {
-        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
-            pid,
-            stdin_pipe: Some(stdin_pipe),
-            exec_slot: task_slot,
-        });
+        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn { pid, exec_slot: task_slot });
     }
 
     // Last, as in `sys_fork`: identity and stdio in place before anything can
     // schedule the child.
     crate::sched::publish_task(task_slot);
 
-    let stdout_fd = crate::fd::alloc_child_stdout_fd(stdout_pipe);
-    let Some(stdout_fd) = stdout_fd else {
-        // The child is already running; it will just write into a pipe nobody
+    // The caller's handle on the child's output: a `ChildStdout(pid)`, which
+    // glue's read arm resolves through `get_child_channel(pid)` to the very
+    // channel above — blocking, `O_NONBLOCK`-aware, `EINTR`-able, and reporting
+    // EOF from `has_exited()` rather than from a writer count. Verbatim what
+    // glue's own `sys_spawn` hands back on the other kernel.
+    //
+    // It replaced a `PipeRead` on the stdout pipe, and two things came with the
+    // swap for free: `TIOCSWINSZ` aimed at the child now resolves through glue's
+    // `ChildStdout(pid)` arm (this file's `child_pipe_set_winsize` shim existed
+    // only because a `PipeRead` does not name a child), and `close(2)` drops the
+    // child-channel registration through glue's own arm.
+    let stdout_fd = crate::fd::install_child_stdout(pid);
+    if crate::fd::errno::is_err(stdout_fd) {
+        // The child is already running; it will just write into a channel nobody
         // reads. Report the failure — `sshd` drops the session.
         return errno::EMFILE;
-    };
+    }
 
     u64::from(pid) | (stdout_fd << 32)
-}
-
-/// Release the pipes of a spawn that never got a task. The image itself is a
-/// local value now and drops on the way out of [`sys_spawn`], which is why this
-/// no longer takes a slot: there is nothing parked under one to take back.
-/// Release both pipes of a `sys_spawn` that failed **before** the row was
-/// written and before any descriptor named them.
-///
-/// `pipe::free`, not `close_write`/`close_read`, and that is right *here* and
-/// nowhere else: on this path the pipes were allocated moments ago and nothing
-/// holds an end — no child table, no `/proc/<pid>/fd/0`, no row — so there are
-/// no counts to let decide. Every other release site in this module has a
-/// holder and uses the counts (see the `Spawn` header).
-fn cleanup_spawn_slot(stdout_pipe: PipeId, stdin_pipe: PipeId) {
-    pipe::free(stdout_pipe);
-    pipe::free(stdin_pipe);
 }
 
 // **`WAIT4_PARKED` is gone** (2026-09-10). It was a bitmap of every task parked
@@ -4671,41 +4658,19 @@ pub fn current_proc_slot() -> usize {
     }
 }
 
-/// The stdin pipe write end for pid `pid`, for [`sys_close_child_stdin`].
-///
-/// Off the spawn row, not off the child's fd table, and the difference is the
-/// direction of the question. `sshd` is asking about the end **it** was
-/// writing — the end no descriptor names — and the child's fd 0 is the *other*
-/// end. Reading the child's table for it would work only for as long as fd 0
-/// still named that pipe: a shell that redirects its own stdin, or a child
-/// already past `close_all` on the exit path, would silently answer `ESRCH` to
-/// a bridge that is still live. The row outlives both, up to the reap.
-///
-/// It had a second caller — `fd::sys_openat`'s `/proc/<pid>/fd/0` — until
-/// 2026-09-11. The **data** path no longer needs it (the shared
-/// `write_to_process_stdin` finds the child's own fd 0); the **EOF** path still
-/// does, for exactly the reason above.
-fn stdin_pipe_for_pid(pid: u32) -> Option<PipeId> {
-    // SAFETY: raw-pointer read; single core, no row mutated.
-    unsafe {
-        (*spawn_table())
-            .iter()
-            .flatten()
-            .find(|s| s.pid == pid)
-            .and_then(|s| s.stdin_pipe)
-    }
-}
-
 /// `close_child_stdin(pid)` — Akuma's syscall 326. `sshd` calls it when the
 /// client sends EOF on the channel, so the shell sees end-of-input.
+///
+/// **Glue's arm**, since the child's stdin became a `ProcessChannel`
+/// (2026-09-11). It was a `pipe::close_write` on the spawn row's own write
+/// reference, found through a `stdin_pipe_for_pid` helper that scanned the spawn
+/// table — the row being consulted rather than the child's fd table because
+/// `sshd` was asking about the end **it** wrote, which no descriptor named.
+/// There is no such end now: `close_process_stdin` marks the channel's stdin
+/// closed and wakes whatever is parked in a read of it, which is the same job
+/// done by the object that owns it.
 pub fn sys_close_child_stdin(pid: u64) -> u64 {
-    match stdin_pipe_for_pid(pid as u32) {
-        Some(p) => {
-            pipe::close_write(p);
-            0
-        }
-        None => crate::fd::errno::ESRCH,
-    }
+    akuma_syscalls_glue::proc::sys_close_child_stdin(pid as u32)
 }
 
 /// `waitpid(pid, status_ptr, options)` — Akuma's syscall 303.
@@ -4774,23 +4739,13 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         return u64::from(child_pid);
     };
     // SAFETY: `slot_off` came from a live row and nothing yields between.
-    let (exec_slot, stdin_pipe) = unsafe {
-        let s = (*spawn_table())[slot_off].as_ref().unwrap();
-        (s.exec_slot, s.stdin_pipe)
-    };
+    let exec_slot = unsafe { (*spawn_table())[slot_off].as_ref().unwrap().exec_slot };
 
-    // Drop the spawn's own writer reference on the child's stdin pipe — the
-    // one no descriptor names, so nothing else will. `close_write`, **not** the
-    // `pipe::free` this replaced: `free` destroys the pipe whatever the end
-    // counts say, and a *reader* reference can still be live here (a zombie
-    // whose fd table is not yet torn down, a `fork` descendant that inherited
-    // fd 0) whose own close would then land on a reissued pipe id. Letting the
-    // counts decide means the last end out destroys it, which is the rule every
-    // other pipe here follows. A `fork` child carries `None` and borrows its
-    // parent's, exactly as `borrowed_io` used to say.
-    if let Some(p) = stdin_pipe {
-        pipe::close_write(p);
-    }
+    // **Nothing to release here any more.** This used to drop the spawn's own
+    // writer reference on the child's stdin pipe — the one no descriptor named,
+    // so nothing else would, and a reap that skipped it leaked a pipe per spawn
+    // against a 64-pipe ceiling. A spawned child's stdio is a `ProcessChannel`
+    // now; the last `Arc` out drops it, and a reap has no bookkeeping to do.
 
     if status_ptr != 0 {
         let raw = ((u64::from((code as u32) & 0xff)) << 8) as i32;
@@ -4865,16 +4820,15 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 ///
 /// **`pipe::close_write`, not `pipe::free`**, for the reason
 /// [`Spawn::stdin_pipe`]'s doc gives: a reader reference on that pipe can
-/// outlive the row, and destroying the pipe under one makes its eventual close
-/// land on a reissued pipe id.
+/// It released the spawn's stdin-pipe writer reference too, until the pipes
+/// themselves went (2026-09-11). A `ProcessChannel` needs no such hand: the last
+/// `Arc` out drops it.
 fn sweep_reaped_spawn_rows() {
     for off in 0..SPAWN_SLOTS {
         // SAFETY: raw-pointer read under the BKL; nothing yields between the
         // read and the write below.
-        let Some((pid, slot, stdin_pipe)) = (unsafe {
-            (*spawn_table())[off]
-                .as_ref()
-                .map(|s| (s.pid, s.exec_slot, s.stdin_pipe))
+        let Some((pid, slot)) = (unsafe {
+            (*spawn_table())[off].as_ref().map(|s| (s.pid, s.exec_slot))
         }) else {
             continue;
         };
@@ -4885,9 +4839,6 @@ fn sweep_reaped_spawn_rows() {
         // its process could be unregistered, so nothing is running on `slot`.
         unsafe {
             (*spawn_table())[off] = None;
-        }
-        if let Some(p) = stdin_pipe {
-            pipe::close_write(p);
         }
         // The identity map entry this row's spawn published, removed only if it
         // still names this pid — task slots are recycled, and stripping a live
@@ -4902,56 +4853,6 @@ fn sweep_reaped_spawn_rows() {
 fn spawn_row_of(pid: u32) -> Option<usize> {
     // SAFETY: raw-pointer read; single core, no row mutated.
     unsafe { (*spawn_table()).iter().position(|e| e.as_ref().is_some_and(|s| s.pid == pid)) }
-}
-
-/// The pid of the child whose stdout is `pipe_id`, if a live spawn row names it.
-///
-/// This is the amd64 stand-in for `FileDescriptor::ChildStdout(pid)`. `sshd`
-/// holds a spawned session's stdout as a plain `PipeRead` on this target, and
-/// `TIOCSWINSZ` has to reach the *child's* `TerminalState` rather than the
-/// caller's — a `pty` spawn deliberately gives the child a fresh one, so the
-/// parent cannot pass the window size along by writing its own
-/// (`akuma-syscalls-glue`'s `TIOCSWINSZ` arm states the same reasoning for the
-/// kernel that does have the descriptor).
-///
-/// `None` for any pipe that is not a spawn's stdout — an ordinary `pipe(2)`
-/// pair, or a child already reaped — and the caller then falls back to its own
-/// terminal state, which is the behaviour this target had for every fd.
-#[must_use]
-pub fn child_of_stdout_pipe(pipe_id: usize) -> Option<u32> {
-    // **Asked of the child's own registered fd table, not of a `Spawn` field.**
-    //
-    // The row carried a `stdout_pipe: Option<PipeId>` for this one reader until
-    // 2026-09-11, which was the right answer while a spawned child's stdio was
-    // routed *by number* — there was no descriptor to ask. C2 slice 6 made the
-    // child's fd 1 a real `PipeWrite` in its own registered table
-    // (`fd::bind_stdio`), so the link the row was carrying is now recorded in
-    // the place that owns it, and a second copy could only drift.
-    //
-    // fd **1**, not 2: `bind_stdio` binds both names to the one description, so
-    // either answers, and 1 is the one whose meaning is "this child's stdout".
-    //
-    // A scan, where the field was a lookup, and that is affordable here in a
-    // way it would not be on a hot path: the one caller is `TIOCSWINSZ`
-    // arriving on a parent's stdout descriptor — once per `pty-req`, i.e. once
-    // per ssh session. `for_each_process` runs with IRQs disabled and its
-    // callback must not allocate; `get_fd` returns a `Copy` descriptor and
-    // allocates nothing.
-    let mut found = None;
-    akuma_exec::process::for_each_process(|p| {
-        // `FileDescriptor` has no `PartialEq`, so the arm is matched rather
-        // than compared — which also keeps this honest about wanting a
-        // `PipeWrite` specifically and not "whatever fd 1 is".
-        if found.is_none()
-            && matches!(
-                p.fds.table.lock().get(&1),
-                Some(akuma_exec::process::FileDescriptor::PipeWrite(id)) if *id == pipe_id as u32
-            )
-        {
-            found = Some(p.pid);
-        }
-    });
-    found
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -4984,47 +4885,55 @@ pub fn spawn_test(t: &mut Suite) {
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
     t.check("spawn: pid is a real child pid", pid >= 2);
 
-    // **C2 slice 6's central claim, pinned.** The child's stdio is descriptors
-    // in its own registered table — fd 0 the read end of its stdin pipe, fd 1
-    // and fd 2 the write end of its stdout pipe — and *not* a `Spawn` row
-    // consulted by number. Everything slice 6 deleted (`spawn_stdio`,
-    // `current_stdin_pipe`, `current_stdout_pipe`, `Spawn::stdout_pipe`,
-    // `borrowed_io`, `console_io`) depends on this being true, and the
-    // observable failures if it stops being true are all indirect: a shell
-    // that reads the console instead of the channel, an `EBADF` from a
-    // `dup2` target, a lost stderr. Asked here, of the live child, before it
-    // is drained — the one moment the table is guaranteed populated and not
-    // yet swept by `close_all`.
+    // **The child's stdio is one `ProcessChannel`, pinned.** fd 0/1/2 in its own
+    // registered table are `Stdin`/`Stdout`/`Stderr`, served by glue's own arms
+    // from `Process::channel` — which is what an AArch64 spawn has always had,
+    // and what a session needs so the line discipline's echo and the program's
+    // own output land in one place.
     //
-    // `Spawn::stdout_pipe` is back in that list, and **not** as the routing
-    // field slice 6 deleted: nothing reads stdio through it and nothing frees a
-    // pipe by it (the descriptors' refcounts still own both ends). It records
-    // one fact the descriptor cannot, which is *which child* the parent's read
-    // end belongs to — see [`child_of_stdout_pipe`] and
-    // [`winsize_to_child_test`].
+    // Until 2026-09-11 they were a `PipeRead` and two `PipeWrite`s over two
+    // pipes this file allocated (`fd::bind_stdio`), and this check asserted
+    // that shape. That was a second implementation of session stdio, and the
+    // observable failures if *this* shape stops holding are the same indirect
+    // ones: a shell that reads the console instead of its channel, an `EBADF`
+    // from a `dup2` target, a lost stderr. Asked of the live child, before it is
+    // drained — the one moment the table is guaranteed populated and not yet
+    // swept by `close_all`.
+    //
+    // fd 2 is `Stderr` and not a second name for fd 1: they are distinct
+    // descriptors onto one channel, so a `dup2(file, 1)` leaves stderr on the
+    // session exactly as the two-names-on-one-pipe arrangement did.
     {
         use akuma_exec::process::FileDescriptor;
         let stdio = akuma_exec::process::with_process(pid, |p| {
             let t = p.fds.table.lock();
             (
-                matches!(t.get(&0), Some(FileDescriptor::PipeRead(_))),
-                matches!(t.get(&1), Some(FileDescriptor::PipeWrite(_))),
-                matches!(t.get(&2), Some(FileDescriptor::PipeWrite(_))),
+                matches!(t.get(&0), Some(FileDescriptor::Stdin)),
+                matches!(t.get(&1), Some(FileDescriptor::Stdout)),
+                matches!(t.get(&2), Some(FileDescriptor::Stderr)),
+                p.channel.is_some(),
             )
         });
         t.check(
-            "spawn: the child's registered table holds fd 0 as its stdin pipe",
-            stdio.is_some_and(|(r, _, _)| r),
+            "spawn: the child's registered table holds fd 0 as Stdin",
+            stdio.is_some_and(|(r, _, _, _)| r),
         );
         t.check(
-            "spawn: fd 1 as its stdout pipe",
-            stdio.is_some_and(|(_, w, _)| w),
+            "spawn: fd 1 as Stdout",
+            stdio.is_some_and(|(_, w, _, _)| w),
         );
-        // fd 2 is a second *name* for fd 1's description, which is what keeps
-        // stderr on the session after a `dup2(file, 1)`.
         t.check(
-            "spawn: and fd 2 as a second name for the same end",
-            stdio.is_some_and(|(_, _, e)| e),
+            "spawn: and fd 2 as Stderr",
+            stdio.is_some_and(|(_, _, e, _)| e),
+        );
+        // The descriptors are only meaningful with a channel behind them: glue's
+        // `Stdin` arm falls back to `Process::read_stdin` when
+        // `current_channel()` is `None`, and that buffer is never filled here —
+        // a reader would park rather than report EOF
+        // (`AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3).
+        t.check(
+            "spawn: and the child has an I/O channel behind them",
+            stdio.is_some_and(|(_, _, _, c)| c),
         );
     }
 
@@ -5053,15 +4962,25 @@ pub fn spawn_test(t: &mut Suite) {
     }
 
     t.check(
-        "spawn: the child's stdout came back through the pipe",
+        "spawn: the child's stdout came back through the channel",
         out.windows(5).any(|w| w == b"[elf]"),
     );
     t.check_eq("spawn: waitpid reported the child's exit status", status, HELLO_ALL_OK);
-    // A drained, EOF pipe read returns 0.
+    // **`EBADF` past the reap, and that is the shared answer, not a gap.**
+    //
+    // This asked for `0` while the parent held a `PipeRead`: the pipe outlived
+    // the child (the descriptor held a reader reference) and a drained pipe with
+    // no writers reads EOF. A `ChildStdout(pid)` names a *registration*, and
+    // `reap_child_channel` drops it at the reap — but only once the stdout FIFO
+    // is **empty**, which is the check that stops a reap from eating a shell's
+    // final buffered write (`children.rs`, and the sshd bridge it was written
+    // for: it polls `waitpid` before it drains). The loop above drained to EOF
+    // first, so the registration is legitimately gone and there is nothing left
+    // to report EOF *about*.
     t.check_eq(
-        "spawn: reading the child's stdout past EOF returns 0",
+        "spawn: reading the child's stdout after the reap is EBADF",
         crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64),
-        0,
+        crate::fd::errno::EBADF,
     );
     crate::fd::sys_close(stdout_fd);
     t.check_eq(
@@ -5194,14 +5113,19 @@ pub fn winsize_to_child_test(t: &mut Suite) {
         errno::EFAULT,
     );
 
-    // The link is by pipe id, so pin the one property that makes that safe: the
-    // id is claimed while the descriptor is open, and answers for nobody once
-    // the row is gone. A stale row here would aim a live session's resize at a
-    // dead pid — or at a *later* child that inherited the recycled id.
-    let pipe_id = crate::fd::pipe_read_id(stdout_fd);
+    // The link is carried by the **descriptor**, so pin that: the parent's
+    // stdout is a `ChildStdout(pid)` naming this child, which is what glue's
+    // `TIOCSWINSZ` arm reads the pid out of. It was a `PipeRead` plus a
+    // spawn-row lookup (`child_of_stdout_pipe`) until 2026-09-11, and a stale
+    // row there would have aimed a live session's resize at a dead pid — or at
+    // a later child that inherited the recycled pipe id. A descriptor cannot go
+    // stale that way: it names a pid directly and `close` drops it.
     t.check(
-        "winsize: the parent's stdout names this child while it is open",
-        pipe_id.and_then(child_of_stdout_pipe) == Some(pid),
+        "winsize: the parent's stdout is a ChildStdout naming this child",
+        matches!(
+            crate::fd::table_get(stdout_fd),
+            Some(akuma_exec::process::FileDescriptor::ChildStdout(p)) if p == pid
+        ),
     );
 
     // Drain and reap, so the child leaves no pipe and no row behind — the same
@@ -5222,8 +5146,8 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     }
     crate::fd::sys_close(stdout_fd);
     t.check(
-        "winsize: and names nobody once the child is reaped",
-        pipe_id.and_then(child_of_stdout_pipe).is_none(),
+        "winsize: and names nobody once the descriptor is closed",
+        crate::fd::table_get(stdout_fd).is_none(),
     );
 }
 
