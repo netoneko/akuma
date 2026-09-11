@@ -1495,10 +1495,20 @@ fn recover(x: &mut Xhci, e: &BotErr) -> bool {
     };
     let halted = ep_state(x, dci) == 2;
     print_ep_state(x, dci);
-    if !halted {
-        serial::puts("  [xhci] ep not halted - controller reset skipped (device slow, not stuck)\n");
+    let kind = match outcome {
+        AttemptOutcome::Stalled { .. } => akuma_xhci::recovery::OutcomeKind::Stalled,
+        AttemptOutcome::TimedOut { .. } => akuma_xhci::recovery::OutcomeKind::TimedOut,
+        AttemptOutcome::Desynced { .. } => akuma_xhci::recovery::OutcomeKind::Desynced,
+    };
+    let plan = recovery_plan(kind, halted, dci, bulk_ep_addr(x.bulk_in_dci), bulk_ep_addr(x.bulk_out_dci));
+    if plan.iter().all(|s| matches!(s, RecoveryStep::None)) {
+        serial::puts("  [xhci] no recovery needed - plain retry (device slow, not stuck)\n");
+        return true;
     }
-    for step in recovery_plan(dci, bulk_ep_addr(x.bulk_in_dci), bulk_ep_addr(x.bulk_out_dci)) {
+    if !halted {
+        serial::puts("  [xhci] ep not halted - controller reset skipped\n");
+    }
+    for step in plan {
         match step {
             RecoveryStep::ResetEndpoint { dci } if halted => {
                 recover_step(x, "reset ep", trb::reset_endpoint(x.slot, dci));
@@ -1513,6 +1523,7 @@ fn recover(x: &mut Xhci, e: &BotErr) -> bool {
                     trb::set_tr_dequeue_pointer(x.slot, dci, dequeue, cycle),
                 );
             }
+            RecoveryStep::None => {}
             RecoveryStep::ResetEndpoint { .. } | RecoveryStep::SetTrDequeuePointer { .. } => {}
             RecoveryStep::BotMassStorageReset => {
                 let _ = x.control(0x21, 0xFF, 0, u16::from(x.bot_if), 0);

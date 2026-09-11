@@ -764,3 +764,67 @@ What the metal run also showed, honestly:
   use. Whether the reset was this code or the box's known-bad NIC is
   undetermined; treat a self-reset on this box as new information, not
   background noise.
+
+## 2026-09-11, later — the photograph decodes the stall: the device is slow, not halted
+
+A framebuffer photograph of the next death (the rebased kernel, recovery
+present but timeout-blind) plus the new diagnostics settled the mechanism.
+
+**What the console showed**, per post-idle ssh connection:
+`transfer timeout: data` → `discarded transfer event: cc=6 slot=1 dci=3`
+(the data phase's STALL, arriving just past the 1 s budget) → the next CBW
+stalls (`bulk cc=6`, recovered) → the retry times out while
+`discarded transfer event: cc=1` (the *previous* CBW completing
+SUCCESSFULLY, late) → repeated `transfer timeout: CBW` with no recovery,
+because timeouts took no recovery at all.
+
+**What the fixed build then printed on the metal**: `ep 4 state` reads and
+`recovery step cc=0x00000013` — CONTEXT_STATE_ERROR — on both Reset Endpoint
+and Set TR Dequeue Pointer. **The endpoint was never halted**; the recovery
+commands were illegal on it. The late `cc=1` completions (consecutive TRBs,
+each a timed-out retry CBW eventually succeeding) prove the whole chain:
+the first command after an idle gap takes seconds — ASMedia bridge / SATA
+idle wake, most likely; USB link LPM is out (the driver never sets
+`PORTSC.U1TO/U2TO`) — and everything after that is the driver reacting to a
+answer that came back late.
+
+Also decoded: `tag=511` in every `[BKL] stuck` line is `HOLD_TAG_UNKNOWN`
+(`akuma-bkl` sync.rs) — the attribution placeholder shown while the BKL
+profiler is off; it never carried information on this box. With the
+carve-outs all forwarded, BKL-still-storms correlate with the ssh
+connection/stall-recovery events and not with output volume (`uname -a`
+clean, `dmesg` spew dirty is *output*-correlated on the old build; on the
+new build all four discriminators grow BKL in lockstep with the ~4 disk
+timeouts each connection provokes). `amd64/src/sock.rs` — this target's own
+socket layer, which glue's `NetBklGuard` never covers — has no BKL handling
+at all; still unattributed.
+
+**Fixes staged on branch `amd64-xhci-timeout-recovery` (worktree
+`../akuma-xhci-recovery`), NOT yet deployed**:
+
+- Timeouts recover like stalls (`akuma-xhci::recovery::retry_decision`,
+  host-tested: stall/desync = one recovery cycle, timeout = two — spin-up
+  needs seconds).
+- The recovery plan gates controller-side Reset Endpoint + Set TR Dequeue
+  Pointer on the endpoint actually reading HALTED; a timeout on a
+  running/stopped endpoint skips them (they answered `cc=0x13`) and just
+  retries. BOT Mass Storage Reset + CLEAR_FEATURE both remain.
+- `recover_step` prints every step's completion code; `ep_state` reads the
+  EP State field (device-context index is `dci`, not `dci+1` — the first
+  version read the input-context layout and reported disabled for a running
+  endpoint).
+- Runtime strings back to plain ASCII (`—` prints as boxes; see
+  `AKUMA_SELF_HOSTING_AMD64.md` § font note).
+- amd64 now forwards `no-bkl-network`, `no-bkl-process`, `no-bkl-mm`,
+  `no-bkl-drivers` and `fs-cache` (16 MiB default cap) — the full AArch64
+  `smp-shared` set. Fast lane with all of it: Firecracker SMP=4 639/0,
+  OVMF 631/0, local microvm 641/0.
+
+**Next session, in order**: deploy this build; idle the box 5 min; the next
+access should print `transfer timed out - device slow, not halted;
+retrying` + `ep not halted - controller reset skipped` and then SUCCEED
+instead of `cc=0x13`. Then the root-cause experiment, from Ubuntu:
+`hdparm -S 0 /dev/sdb` (kill the drive's standby timer) and see whether the
+stalls vanish entirely. If they do, decide: keep the recovery, or add a
+keepalive. If BKL lines survive the disk fix, run with
+`set_profiling(true)` so `tag=` names the holder's syscall.

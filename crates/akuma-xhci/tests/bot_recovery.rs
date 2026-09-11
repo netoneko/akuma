@@ -8,7 +8,7 @@
 //! the budget. The difference between survivable and fatal was one code
 //! path; these tests make that path impossible to reintroduce silently.
 
-use akuma_xhci::recovery::{recovery_plan, retry_decision, AttemptOutcome, Decision, Phase, RecoveryStep};
+use akuma_xhci::recovery::{recovery_plan, retry_decision, AttemptOutcome, Decision, OutcomeKind, Phase, RecoveryStep};
 use akuma_xhci::trb::cc;
 
 const BULK_IN_DCI: u8 = 3; // EP1 IN (0x81)
@@ -94,7 +94,7 @@ fn recovery_plan_touches_the_failed_ring_only_controller_side() {
     // are controller-side commands that are only legal on a halted/stopped
     // endpoint — issuing them against the *other*, running ring is the
     // spec-illegal gamble the 2026-09-11 photograph caught the tail of.
-    let plan = recovery_plan(BULK_OUT_DCI, 0x81, 0x02);
+    let plan = recovery_plan(OutcomeKind::Stalled, true, BULK_OUT_DCI, 0x81, 0x02);
     assert_eq!(
         plan.iter().filter(|s| matches!(s, RecoveryStep::ResetEndpoint { .. })).count(),
         1,
@@ -114,7 +114,7 @@ fn recovery_plan_clears_the_device_halt_on_both_bulk_endpoints() {
     // A controller-side reset does not un-halt the *device*; the device may
     // have halted either endpoint. BOT reset once, then CLEAR_FEATURE on
     // both — IN first, matching `usb_stor_reset_common`'s order.
-    let plan = recovery_plan(BULK_OUT_DCI, 0x81, 0x02);
+    let plan = recovery_plan(OutcomeKind::Stalled, true, BULK_OUT_DCI, 0x81, 0x02);
     let halts: Vec<u8> =
         plan.iter().filter_map(|s| match s {
             RecoveryStep::ClearHalt { ep_addr } => Some(*ep_addr),
@@ -133,7 +133,7 @@ fn recovery_plan_is_order_sensitive() {
     // halts, THEN move the dequeue — a plan that STDP'd before the endpoint
     // was reset would program a running endpoint; one that retried before
     // the clear-halts would run straight back into the device halt.
-    let plan = recovery_plan(BULK_IN_DCI, 0x81, 0x02);
+    let plan = recovery_plan(OutcomeKind::Stalled, true, BULK_IN_DCI, 0x81, 0x02);
     let expected = [
         RecoveryStep::ResetEndpoint { dci: BULK_IN_DCI },
         RecoveryStep::BotMassStorageReset,
@@ -147,9 +147,44 @@ fn recovery_plan_is_order_sensitive() {
 #[test]
 fn a_stall_on_either_ring_produces_its_own_plan() {
     for (dci, addr) in [(BULK_IN_DCI, 0x81), (BULK_OUT_DCI, 0x02)] {
-        let plan = recovery_plan(dci, 0x81, 0x02);
+        let plan = recovery_plan(OutcomeKind::Stalled, true, dci, 0x81, 0x02);
         assert_eq!(plan[0], RecoveryStep::ResetEndpoint { dci });
         assert_eq!(plan[4], RecoveryStep::SetTrDequeuePointer { dci });
         let _ = addr;
     }
+}
+
+#[test]
+fn a_timeout_on_a_running_endpoint_is_a_plain_retry() {
+    // The `ls` regression, 2026-09-11: every post-idle command timed out once
+    // and the recovery ran the full BOT Mass Storage Reset — whose scrubbed
+    // transfer state made the NEXT command stall too, so a directory listing
+    // stalled through every entry. A timeout on a non-halted endpoint (the
+    // late completions arrive as `cc=1` SUCCESS) must touch nothing.
+    let plan = recovery_plan(OutcomeKind::TimedOut, false, BULK_OUT_DCI, 0x81, 0x02);
+    assert!(
+        plan.iter().all(|s| matches!(s, RecoveryStep::None)),
+        "empty plan: the executor just retries"
+    );
+}
+
+#[test]
+fn a_timeout_with_a_real_halt_still_gets_the_full_sequence() {
+    let plan = recovery_plan(OutcomeKind::TimedOut, true, BULK_IN_DCI, 0x81, 0x02);
+    assert_eq!(plan[0], RecoveryStep::ResetEndpoint { dci: BULK_IN_DCI });
+    assert_eq!(plan[4], RecoveryStep::SetTrDequeuePointer { dci: BULK_IN_DCI });
+    assert!(matches!(plan[1], RecoveryStep::BotMassStorageReset));
+}
+
+#[test]
+fn a_desync_gets_the_device_half_only() {
+    // CSW desync: the pipe needs the BOT reset + clear-halts, but no
+    // endpoint is halted, so the controller-side commands stay out.
+    let plan = recovery_plan(OutcomeKind::Desynced, false, BULK_IN_DCI, 0x81, 0x02);
+    assert_eq!(
+        plan.iter().filter(|s| matches!(s, RecoveryStep::BotMassStorageReset)).count(),
+        1,
+    );
+    assert!(plan.iter().all(|s| !matches!(s, RecoveryStep::ResetEndpoint { .. })));
+    assert!(plan.iter().all(|s| !matches!(s, RecoveryStep::SetTrDequeuePointer { .. })));
 }

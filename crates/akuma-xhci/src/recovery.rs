@@ -122,22 +122,62 @@ pub enum RecoveryStep {
     /// the retry does not land on it. The failed ring ONLY, and only after
     /// its Reset Endpoint.
     SetTrDequeuePointer { dci: u8 },
+    /// No hardware action — a plain retry. A padding step, not a real one:
+    /// the plan is a fixed-size array and `recover`'s executor skips these.
+    None,
 }
 
 /// Build the recovery plan for a failure on `failed_dci` (the timed-out or
 /// stalled ring). `bulk_in_addr`/`bulk_out_addr` are the USB endpoint
 /// addresses (`0x80 | n` for IN) the CLEAR_FEATURE steps need.
+///
+/// The plan depends on WHY the command failed:
+///
+/// - **STALL** (endpoint halted): the full sequence — controller reset +
+///   dequeue move, BOT Mass Storage Reset, CLEAR_FEATURE on both bulk
+///   endpoints.
+/// - **Desync** (CSW unparseable / tag mismatch): the device half only
+///   (BOT reset + clear-halts). The pipe is desynced but no endpoint halted.
+/// - **Timeout, endpoint not halted** (the 2026-09-11 metal finding: the
+///   post-idle command completes `cc=1` seconds late): **the empty plan** —
+///   a plain retry. Running the BOT reset here was actively harmful: it
+///   scrubbed the device's transfer state after every slow command, so the
+///   NEXT command stalled too, and any multi-command burst (a directory
+///   listing) stalled its way through every entry.
+/// - **Timeout, endpoint halted**: the full sequence — the halt is real.
 #[must_use]
 pub fn recovery_plan(
+    outcome_kind: OutcomeKind,
+    endpoint_halted: bool,
     failed_dci: u8,
     bulk_in_addr: u8,
     bulk_out_addr: u8,
 ) -> [RecoveryStep; 5] {
-    [
-        RecoveryStep::ResetEndpoint { dci: failed_dci },
-        RecoveryStep::BotMassStorageReset,
-        RecoveryStep::ClearHalt { ep_addr: bulk_in_addr },
-        RecoveryStep::ClearHalt { ep_addr: bulk_out_addr },
-        RecoveryStep::SetTrDequeuePointer { dci: failed_dci },
-    ]
+    match (outcome_kind, endpoint_halted) {
+        (OutcomeKind::TimedOut, false) => [RecoveryStep::None; 5],
+        _ => [
+            if endpoint_halted {
+                RecoveryStep::ResetEndpoint { dci: failed_dci }
+            } else {
+                RecoveryStep::None
+            },
+            RecoveryStep::BotMassStorageReset,
+            RecoveryStep::ClearHalt { ep_addr: bulk_in_addr },
+            RecoveryStep::ClearHalt { ep_addr: bulk_out_addr },
+            if endpoint_halted {
+                RecoveryStep::SetTrDequeuePointer { dci: failed_dci }
+            } else {
+                RecoveryStep::None
+            },
+        ],
+    }
+}
+
+/// Which disease the recovery is for — decided by [`retry_decision`]'s
+/// caller and fed to [`recovery_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    Stalled,
+    TimedOut,
+    Desynced,
 }
