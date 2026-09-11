@@ -67,7 +67,12 @@ CC = mem_suite.ARCHES[ARCH]
 # delivery**, which is trunk A2 — neither is a memory-mapping defect, and
 # `mprotect` itself is verified working.
 EXPECTED_FAIL = {
-    "mprotectlb": "needs a SIGSEGV handler; this target has no signal delivery",
+    # **Not "no signal delivery"** any more — that landed 2026-09-11
+    # (`amd64/src/signal.rs`). What is still missing is the *fault* half:
+    # `idt.rs` calls `usermode::kill_current_from_fault` directly, so a bad
+    # access never becomes a catchable `SIGSEGV`. Delivery happens at a syscall
+    # return only. See `AKUMA_AMD64_SIGNAL_DELIVERY.md` §8.
+    "mprotectlb": "needs a catchable SIGSEGV; faults are killed, not signalled",
     "eager_mprotect_probe": "a killed child exits 128+SIGSEGV rather than reporting "
                             "a signalled status, so WIFSIGNALED is never true",
 }

@@ -209,8 +209,15 @@ and honours `SA_RESTART`.
 
 ## 8. What is still open
 
-- **Delivery on the timer tick's `iretq`** — §3 item 1. A compute-bound program
-  with no syscalls is unreachable by `^C`.
+- **Delivery on the timer tick's `iretq`, and out of a `#PF`** — §3 item 1. Two
+  consequences, and the second is the bigger one. A compute-bound program with
+  no syscalls is unreachable by `^C`; and a **fault does not become a signal**
+  at all — `idt.rs` calls `usermode::kill_current_from_fault` directly, so there
+  is no `SIGSEGV` to catch. That is why the two `c_stress` memory probes
+  `amd64_mem_trials.py` excuses — `mprotectlb` and `eager_mprotect_probe`, both
+  recorded as "needs a SIGSEGV handler; this target has no signal delivery" —
+  are **not** fixed by this work. Their `EXPECTED_FAIL` reason wants rewording to
+  name the fault path rather than delivery in general; the probes still fail.
 - **`akuma-net`'s `is_current_interrupted` hook is still `false`**, so a socket
   read is not interruptible even though glue's blocking arms are. The module
   header's reason used to be "no signals"; it is narrower now and the hook is
@@ -229,6 +236,20 @@ and honours `SA_RESTART`.
 - **An `ssh` session's `^C`** still does not raise `SIGINT`: the child's stdin is
   a pipe with no channel to run a line discipline on. That is item 3 of the
   walk's YOU-ARE-HERE, unchanged.
+- **`kill(2)` is more than a signal in this tree, on both kernels.**
+  `deliver_signal` sets the Ctrl-C `interrupted` flag alongside the pend, and
+  glue's dispatch prologue reads that flag on *every* syscall: it marks the
+  process `Zombie(130)` and returns `EINTR`. So `kill(pid, SIGUSR1)` — a signal
+  whose default action is to be *ignored* — still makes the target's next
+  syscall fail, and marks it a zombie while it runs on. Pre-existing and shared
+  with AArch64, so not changed here; found because the probe's first version
+  raced its `kill` against the child's own `sigaction` and got `EINTR` back
+  **from the `sigaction`** (exit `60 + EINTR`), 22 runs in 25 at `SMP=4` under
+  TCG. The probe handshakes now (§9); the divergence stands.
+
+  Worth a measurement before touching it: the flag is what makes Ctrl-C able to
+  end a job blocked in a syscall with a `SA_RESTART` handler installed, which is
+  the case `current_thread_has_pending_interrupt` deliberately declines.
 
 ## 9. Verification
 
@@ -255,9 +276,19 @@ the run.
 Statically linked musl, so **the same binary was run on real Linux** (the
 trashcan's Ubuntu personality) and all eight rungs pass there — the A/B that
 says the probe is right before the kernel is judged by it
-(`LINUX_AB_PROBE_TECHNIQUE.md`). It caught its own bug on the first Linux run:
-rung 6 raced the child into its `read`, which is what `reap_with_signal` exists
-for.
+(`LINUX_AB_PROBE_TECHNIQUE.md`).
+
+**It took two races to get right, and Linux only showed the first.** On the
+first Linux run rung 6's single `kill` after a fixed sleep raced the child into
+its blocking `read`, so the read returned EOF instead of `EINTR`; that is what
+`reap_with_signal` exists for. The second race Linux never lost: the `kill` also
+raced the child's *`sigaction`*, and on Akuma at `SMP=4` it won 22 times in 25 —
+the signal arrived before the handler was armed, and the Ctrl-C flag it also
+sets made the racing `sigaction` itself return `EINTR`. A `sleep` is not a
+handshake; the child writes a ready byte now, and the retry loop still covers
+the last gap (between that byte and entering the `read`). A probe that passes on
+Linux is not yet a probe that is right — it is a probe whose races Linux happens
+to win.
 
 The boot suite gets `signal::smoke_test` — 20 checks for exactly the code whose
 failure would be *silent* in the probe too: the `sigcontext`/`ucontext`/frame
@@ -269,14 +300,44 @@ guard, and delivery declining rather than jumping into nothing.
 | gate | before | after |
 |---|---|---|
 | QEMU/TCG `SMP=4` | 641/0 | **661/0** (+20, `signal:`) |
-| Firecracker/KVM `SMP=4` | 619/0 | (§ below) |
-| bare metal `SMP=4` `root=/dev/sda1` | 641/0 | (§ below) |
-| `amd64_ring3_check --smp 1` | grandfork only | **+ sigprobe 8/8** |
-| `sigprobe` on real Linux x86_64 | — | **8/8** |
+| Firecracker/KVM `SMP=4` | 619/0 | **639/0** (+20) |
+| bare metal `SMP=4` | 634/3 | **654/3** (+20; the same three `xhci:`) |
+| `amd64_ring3_check --smp 1 -n 40` | grandfork only | **OK**, + sigprobe 8/8 |
+| `amd64_ring3_check --smp 4` | grandfork only | **OK**, + sigprobe 8/8 |
+| `sigprobe` x25 in one `SMP=4` guest | — | **25/25** (22 failed before the handshake) |
+| `sigprobe` on real Linux x86_64, x10 | — | **10/10** |
 | `^C` on the serial console, `busybox sh` init | byte `0x03` | **`cat` dies, shell survives** |
+| `kill` / `kill -9` from ash, **on the metal** | `ENOSYS` | **143 / 137** |
 | host tests | 1375/0 | **1375/0** |
 | clippy, amd64 ±`no-tests` | clean | **clean** |
-| AArch64 boot suite | — | (§ below) |
+| AArch64 boot suite (HVF, `MEMORY=2048M`) | 307/0 | **307/0** |
+
+**The bare-metal `3` is the USB disk, not this change**, and it is the same
+three failures and the same count the previous session measured on *two*
+different kernels (`AKUMA_AMD64_EXECVE_RETURNS.md`): `xhci: read the MBR at
+LBA 0`, `xhci: read the sda1 ext2 superblock`, `xhci: WRITE(10) to a scratch
+LBA in sda2`, with `fs: ext2 mounted on module` — the RAM fallback. The drive
+has stalled and needs a power cycle, which is a hand on the machine. The
+arithmetic is exact: 634 + 20 = 654, so nothing else moved.
+
+Because the persistent root is not mounted, `sigprobe` could not be staged onto
+the metal (there is no `base64` in the RAM image's busybox and `chmod` is
+`ENOSYS` there). What ran instead is the end-to-end path through `ash`:
+
+```
+sh -c 'sleep 30 & p=$!; sleep 1; kill    $p; wait $p; echo rc=$?'   -> Terminated / rc=143
+sh -c 'sleep 30 & p=$!; sleep 1; kill -9 $p; wait $p; echo rc9=$?'  -> rc9=137
+```
+
+`kill(2)` → `deliver_signal` → pend → default action → the parent's `wait`
+decoding `WIFSIGNALED`, on real silicon with real musl. Before this change
+`kill` was not dispatched at all.
+
+**AArch64 is not untouched this time** — `akuma-exec`'s `interrupt_thread` is
+the one shared behaviour change (§5d) and `akuma-syscalls-abi` gained seven
+additive rows — so the AArch64 kernel was built and booted rather than compared
+by section: 307 passed, 0 failed, which is the same tally as the A1/A2 baseline
+on the same accelerator.
 
 The console check is the delayed-feed rig `AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md`
 §6 describes — QEMU's serial is `mon:stdio`, so a timed `python3 -c` feed is

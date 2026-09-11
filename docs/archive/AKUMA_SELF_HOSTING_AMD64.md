@@ -1316,8 +1316,18 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   Gates: `sigprobe.c`, 8 rungs, in `amd64_ring3_check` — and the same
    │   static binary passes 8/8 on **real Linux**, which is what says the
    │   probe is right before the kernel is judged by it. QEMU 661/0,
-   │   Firecracker 639/0 (both +20, `signal:`), ring-3 check 40/40 OK,
-   │   `^C` on the serial console kills `cat` and leaves the shell.
+   │   Firecracker 639/0, bare metal 654/3 (all +20 `signal:`; the 3 are
+   │   the same stalled-USB `xhci:` the previous session measured on two
+   │   different kernels), ring-3 check OK at SMP=1 **and** SMP=4,
+   │   25/25 `sigprobe` in one SMP=4 guest, `kill`/`kill -9` from ash on
+   │   the metal reporting 143/137, AArch64 307/0, and `^C` on the serial
+   │   console killing `cat` and leaving the shell.
+   │   **A probe that passes on Linux is not yet a probe that is right.**
+   │   The first version raced its `kill` against the child's own
+   │   `sigaction` and lost 22 times in 25 at SMP=4 — and the error it got
+   │   back was `EINTR` *from the `sigaction`*, because `kill(2)` also
+   │   raises the Ctrl-C flag glue's prologue reads on every syscall. Linux
+   │   simply wins that race. It handshakes now.
    │                        doc: AKUMA_AMD64_SIGNAL_DELIVERY.md
    ▼
  [09-11] ═══ YOU ARE HERE ═══

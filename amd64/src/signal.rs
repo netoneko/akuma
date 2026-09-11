@@ -84,15 +84,23 @@ const SS_ONSTACK: i32 = 1;
 /// inside it corrupts live data in the interrupted function.
 const RED_ZONE: u64 = 128;
 
-/// How many signals have been delivered to a handler, and how many default
-/// actions have killed a process. Read by the boot suite and by `[signal]`
-/// diagnostics; cheap enough to be unconditional.
+/// How many signals have been delivered to a handler.
+///
+/// All three counters are reported by [`smoke_test`] as suite notes, so a
+/// `dmesg` from any boot carries them. They are relaxed adds on a cold path —
+/// nothing pends a signal in the common syscall — so they are unconditional
+/// rather than gated.
+///
+/// The interesting one is [`DECLINED`]. A delivery this kernel refuses falls
+/// through to the **default action**, which for most signals is termination —
+/// so a non-zero count is programs being killed where Linux would have run
+/// their handler, and it is invisible from ring 3 (the process just dies).
 pub static DELIVERED: AtomicU64 = AtomicU64::new(0);
 /// Fatal default actions applied.
 pub static DEFAULT_KILLS: AtomicU64 = AtomicU64::new(0);
-/// Deliveries declined because the frame could not be written or the action
-/// named no restorer. Non-zero means signals were turned into kills that Linux
-/// would have handled — a number worth looking at rather than a failure.
+/// Deliveries declined because the frame could not be written, the handler was
+/// not a user address, or the action named no restorer. See [`DELIVERED`] for
+/// why this is the one to read.
 pub static DECLINED: AtomicU64 = AtomicU64::new(0);
 
 /// `struct sigcontext_64` — the interrupted register file, as Linux lays it out
@@ -800,4 +808,20 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
         akuma_syscalls_glue::signal::signal_is_fatal_default(2));
     t.check("signal: SIGCHLD is not",
         !akuma_syscalls_glue::signal::signal_is_fatal_default(17));
+
+    // **The two checks above each print a `[signal] sig 10 declined: …` line and
+    // each bump `DECLINED`.** That is the decline path doing its job, but two
+    // unexplained lines in every boot's `dmesg` is exactly the noise that costs
+    // somebody an hour later — so they are named here, and the counter is put
+    // back to zero so the note below means what it says on a real workload.
+    t.note("signal: the two `declined` lines above are this test's", 2);
+    DECLINED.store(0, Ordering::Relaxed);
+
+    // The counters, so a `dmesg` from any boot carries them. All three read 0
+    // here, which is the point: a non-zero `declined` on a real workload is
+    // programs being killed where Linux would have run their handler, and
+    // nothing in ring 3 can see that happen.
+    t.note("signal: delivered to a handler", DELIVERED.load(Ordering::Relaxed));
+    t.note("signal: fatal default actions", DEFAULT_KILLS.load(Ordering::Relaxed));
+    t.note("signal: deliveries declined", DECLINED.load(Ordering::Relaxed));
 }

@@ -45,13 +45,32 @@ static void say(const char *s)
     (void)write(1, s, strlen(s));
 }
 
+/* Wait for the child's "I am set up" byte.
+ *
+ * **Not an optimisation — the signal must not arrive first.** Rung 6's child
+ * installs its handler *after* it is forked, and a `SIGUSR1` that lands before
+ * that takes the signal's default disposition; more sharply on Akuma, `kill(2)`
+ * also raises the Ctrl-C `interrupted` flag, which makes the target's very next
+ * syscall return `EINTR` from the dispatch prologue — so the racing `sigaction`
+ * itself failed, and the rung reported `60 + EINTR` rather than anything about
+ * signals. A `sleep` is not a handshake: it loses at `SMP=4` under emulation,
+ * which is exactly where it was observed (22 of 25 runs).
+ */
+static void await_ready(int fd)
+{
+    char c;
+    while (read(fd, &c, 1) < 0 && errno == EINTR)
+        ;
+}
+
 /* Kill `child` until it dies, then reap it.
  *
- * **The retry is not belt and braces, it is the race.** A signal that lands
- * before the child reaches its blocking `read` runs (or kills) at once and
- * leaves the read to block forever, so a single `kill` after a fixed sleep
- * either works or hangs the probe — and a hang has no rung number. Re-sending
- * until the child is reaped removes the ordering question entirely.
+ * **The retry is not belt and braces either.** [`await_ready`] closes the gap
+ * up to the child's *setup*, but not the last one — between its ready byte and
+ * its entry into the blocking `read`. A signal landing in there runs (or is
+ * dropped) at once and leaves the read to block, so a single `kill` would hang
+ * the probe, and a hang has no rung number. Re-sending every 50 ms removes the
+ * ordering question entirely.
  *
  * `release` is the write end of the pipe the child is blocked on: if the signal
  * never does anything at all, writing a byte lets the child out, and the rung
@@ -235,10 +254,10 @@ int main(void)
     /* ---- 6: EINTR out of a blocking read -------------------------------- */
     say("6 eintr\n");
     {
-        int fds[2];
+        int fds[2], rdy[2];
         pid_t child;
         int st = 0;
-        if (pipe(fds) != 0)
+        if (pipe(fds) != 0 || pipe(rdy) != 0)
             return 6;
         child = fork();
         if (child < 0)
@@ -247,15 +266,20 @@ int main(void)
             char c;
             ssize_t n;
             (void)close(fds[1]);
+            (void)close(rdy[0]);
             /* No SA_RESTART: Linux reports EINTR rather than restarting. */
             if (install(SIGUSR1, plain, 0) != 0)
-                _exit(60);
+                _exit(60 + (errno & 0x7f));
+            (void)write(rdy[1], "r", 1);   /* the handler is armed — signal now */
             n = read(fds[0], &c, 1);
             if (n < 0 && errno == EINTR)
                 _exit(0);
             _exit(n < 0 ? 61 : 62);
         }
         (void)close(fds[0]);
+        (void)close(rdy[1]);
+        await_ready(rdy[0]);
+        (void)close(rdy[0]);
         st = reap_with_signal(child, SIGUSR1, fds[1]);
         (void)close(fds[1]);
         if (st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
@@ -267,10 +291,10 @@ int main(void)
     /* ---- 7: a fatal default action kills --------------------------------- */
     say("7 fatal\n");
     {
-        int fds[2];
+        int fds[2], rdy[2];
         pid_t child;
         int st = 0;
-        if (pipe(fds) != 0)
+        if (pipe(fds) != 0 || pipe(rdy) != 0)
             return 7;
         child = fork();
         if (child < 0)
@@ -278,10 +302,18 @@ int main(void)
         if (child == 0) {
             char c;
             (void)close(fds[1]);
+            (void)close(rdy[0]);
+            /* Nothing to install — `SIGTERM`'s default action is the point —
+             * but the handshake still matters: a signal delivered before the
+             * child exists at all is delivered to nobody. */
+            (void)write(rdy[1], "r", 1);
             (void)read(fds[0], &c, 1);
             _exit(70);
         }
         (void)close(fds[0]);
+        (void)close(rdy[1]);
+        await_ready(rdy[0]);
+        (void)close(rdy[0]);
         st = reap_with_signal(child, SIGTERM, fds[1]);
         (void)close(fds[1]);
         if (st < 0 || !WIFSIGNALED(st) || WTERMSIG(st) != SIGTERM) {
