@@ -1457,19 +1457,29 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
 
         What is left, in the order it argues for itself:
 
-        1. **`is_current_interrupted` cannot see a per-process flag on
-           this target**, because `Process::channel` is shared by a whole
-           fork tree here and a console-attached `init` makes that the
-           whole machine. The per-**thread** `EINTR` path is unaffected
-           and is what every real case uses, so this is narrow — but
-           closing it wants a per-thread flag that is not a shared `Arc`,
-           found without a `get_channel` map lookup on every syscall.
+        1. *(done)* **`is_current_interrupted` reads a per-thread bit**
+           (`akuma_threading::THREAD_INTERRUPTED`) — one relaxed atomic,
+           no `Arc`, no map lookup, and no identity resolution at all.
+           The shape this line asked for, arrived at the hard way: the
+           obvious fix (drop to `get_channel(tid)`) put an IRQ-masked
+           spinlock on every syscall and cost the **bare-metal** suite
+           665/0 → 663/3 while QEMU and Firecracker stayed green.
+           What it leaves: **two `|| false` hooks whose stated reason
+           ("no signals on this target") has expired** —
+           `amd64/src/sched.rs`'s `ProcessHooks`, read by the **park
+           loop** and explicitly marked "when signals land here, this is
+           the line that changes", and `amd64/src/net.rs`'s. The first
+           is the prime suspect for `^C` over ssh not working on bare
+           metal (it works on QEMU at SMP=1 and 4; the metal runs a
+           `sleep 30` to completion, at SMP=4 *and* nosmp).
+           **Prompt: `proposals/NEXT_AGENT_AMD64_STALE_FALSE_HOOKS.md`.**
         2. **`akuma-net`'s `is_current_interrupted` hook is still
            `false`**, so a socket read is not interruptible where glue's
-           other blocking arms are. The module header's reason used to be
-           "no signals"; it is narrower now, and the hook is read from
-           inside `smoltcp`'s poll loop, so wiring it is a measurement
-           rather than a one-liner.
+           other blocking arms are. Still a measurement — the consuming
+           site is a poll loop — but the *function* is no longer the
+           expensive half (item 1), so the note in `net.rs`'s header
+           saying "it is not free" needs updating in whichever direction
+           the measurement lands.
         3. *(done — see the entry above)* **amd64's second implementation
            of session stdio is deleted.** What it leaves open is smaller
            and worth naming: `busybox stty size` still fails over ssh
