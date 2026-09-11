@@ -202,6 +202,23 @@ pub struct UserCtx {
     pub exec_pending: u64,
 }
 
+/// **The offsets `syscall_entry` indexes by hand.**
+///
+/// Six of them now, and the newest (`exec_pending`, 168) is the one that made
+/// this worth spelling: the return path branches on it and then takes the
+/// program counter it `sysret`s to from `user_rip`. A reordered field would not
+/// fail to compile, would not fail a boot check, and would send `execve` into
+/// whatever word had moved into 32 — which on this target is the entire
+/// mechanism by which any program is ever replaced.
+const _: () = {
+    assert!(core::mem::offset_of!(UserCtx, kernel_rsp) == 0);
+    assert!(core::mem::offset_of!(UserCtx, user_rsp) == 8);
+    assert!(core::mem::offset_of!(UserCtx, leave) == 16);
+    assert!(core::mem::offset_of!(UserCtx, user_rip) == 32);
+    assert!(core::mem::offset_of!(UserCtx, saved_regs) == 48);
+    assert!(core::mem::offset_of!(UserCtx, exec_pending) == 168);
+};
+
 impl UserCtx {
     #[must_use]
     pub const fn new() -> Self {
@@ -389,6 +406,8 @@ syscall_entry:
     mov rcx, gs:[8]
     cmp qword ptr [rcx + 16], 0     /* uctx.leave */
     jne .Lexit_to_kernel
+    cmp qword ptr [rcx + 168], 0    /* uctx.exec_pending */
+    jne .Lexec_return
 
     pop r11                         /* user rflags */
     pop rcx                         /* user rip    */
@@ -401,6 +420,49 @@ syscall_entry:
     /* The program's %gs back, the kernel's parked. The BKL was released in
      * `syscall_handler` already; nothing between there and here touches
      * shared state. */
+    swapgs
+    sysretq
+
+.Lexec_return:
+    /* **`execve` returns into the new image**, which is how Linux does it and
+     * is what retires this target's `execve` loop.
+     *
+     * The pushed `user rip`/`user rflags` and the whole kernel frame are
+     * abandoned deliberately: they describe the program that just ceased to
+     * exist. `rsp` is overwritten below, and `syscall_entry` re-establishes the
+     * kernel stack from `uctx.kernel_rsp` on every entry, so nothing leaks.
+     *
+     * **Every register is zeroed**, and that is not hygiene. Linux clears the
+     * register file across `execve`, and System V says `%rdx` at process entry
+     * is a function pointer to register with `atexit` — musl's `_start` passes
+     * it straight to `__libc_start_main` as `rtld_fini`. Left holding the old
+     * image's third syscall argument, the new program would call it on the way
+     * out. `enter_user_mode` gets this for free (it is reached from Rust, so
+     * `rdx` holds its own third argument, 0); this path has to say it.
+     *
+     * `r11 = 0x202` for the same reason: `IF` set, and `DF` **clear**, which
+     * `execve` guarantees a fresh image. Returning the old program's flags
+     * would hand the new one a direction flag it never set.
+     *
+     * Still in ring 0 with the kernel's `%gs`; the `swapgs` below is the same
+     * one the ordinary return does. */
+    mov qword ptr [rcx + 168], 0    /* consume uctx.exec_pending */
+    mov rsp, [rcx + 8]              /* uctx.user_rsp — the new image's stack */
+    mov rcx, [rcx + 32]             /* uctx.user_rip — its entry point */
+    mov r11, 0x202
+    xor eax, eax
+    xor edi, edi
+    xor esi, esi
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor ebx, ebx
+    xor ebp, ebp
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
     swapgs
     sysretq
 
@@ -2581,26 +2643,14 @@ pub const PROC_SLOTS: usize = 128;
 /// and `run_init`.
 pub const SPAWN_SLOT_BASE: usize = 7;
 
-/// Where ring 3 starts for the running task: `(entry, stack)` off its
-/// registered process, or `None` if it has none.
-///
-/// The pair is `ProcessImage::context`'s `pc`/`sp` — the field `akuma-exec`
-/// already calls "the register state the first entry to ring 3 uses", which is
-/// exactly what these two are. Slice 1 registered it zeroed with the note that
-/// amd64 "never `eret`s from it"; that stays true and is beside the point, since
-/// what is read here is the two scalars, not a register file.
-///
-/// Taken under `image`'s lock, which is also what makes an `execve` atomic
-/// against this read: `sys_execve` writes both halves in one hold, so a task
-/// re-entering ring 3 cannot pair a new entry point with an old stack.
-fn current_entry_stack() -> Option<(u64, u64)> {
-    let p = current_process()?;
-    let img = p.image.lock();
-    Some((img.context.pc, img.context.sp))
-}
 
-/// Read and clear this task's [`UserCtx::forked`] / [`UserCtx::exec_pending`]
-/// flags. Both are one-shot and both are consumed by [`run_process`] only.
+/// Read and clear this task's [`UserCtx::forked`] flag — one-shot, and
+/// consumed by [`run_process`] only.
+///
+/// It was two flags. `exec_pending` is still one-shot but is consumed in the
+/// syscall return path's `.Lexec_return`, not here: since `execve` returns into
+/// the new image rather than leaving ring 3, nothing in Rust is running at the
+/// moment it is spent.
 fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
     // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own
     // slot, and only this task reads or clears these two fields.
@@ -2682,46 +2732,30 @@ pub fn enter_ring3(first: &UserContext) -> ! {
 /// image).
 fn run_process(idx: usize, first: &UserContext) -> ! {
     // A `fork` child's first entry re-enters ring 3 at the parent's post-`fork`
-    // instruction with the parent's full register set; the `execve` it usually
-    // does next installs a plain image, and every later loop iteration uses the
-    // ordinary entry path. Read once, here, because it is spent by the first
-    // entry whatever happens after it.
-    let mut forked_child = take_uctx_flag(|u| &mut u.forked);
-    let mut status;
-    let (mut entry, mut stack) = (first.pc, first.sp);
-    // The loop is `execve`. `sys_execve` has already done the swap — it
-    // installs the new address space on the registered process, switches `CR3`
-    // and drops the old space, then asks the task to leave ring 3 — so all that
-    // is left here is to re-read where the new image starts and go back in.
+    // instruction with the parent's full register set. Read once, and spent by
+    // that entry.
+    let forked_child = take_uctx_flag(|u| &mut u.forked);
+    // **One entry, one exit.**
     //
-    // That is a change of *place*, not of order: the swap used to happen right
-    // here, out of `static mut PENDING_EXEC`, because a `mov cr3` and a frame
-    // free "do not belong inside the syscall asm". They still do not, and they
-    // still are not: `sys_execve` runs on the kernel stack in ordinary Rust,
-    // and `sched::set_current_space_root` is documented safe mid-flight
-    // precisely because every address space shares the kernel's upper half.
-    // What the old shape bought was an array; what it cost was a second copy of
-    // every image field.
-    loop {
-        // SAFETY: both are addresses the loader (or `Image::new`) mapped
-        // user-accessible in the address space the scheduler installed for this
-        // task, and every program this kernel runs ends in exit_group.
-        status = {
-            let forked = forked_child;
-            forked_child = false;
-            enter_user(entry, stack, forked)
-        };
-        if !take_uctx_flag(|u| &mut u.exec_pending) {
-            break;
-        }
-        // `execve` succeeded and asked this task to go back in. Where the new
-        // image starts is the registered process's business, not the old
-        // image's — and if the registration has gone (the process was reaped
-        // under us) there is nowhere to go, so fall through to the teardown
-        // with the status the last entry returned.
-        let Some(next) = current_entry_stack() else { break };
-        (entry, stack) = next;
-    }
+    // `execve` used to bring this task back here: it set `leave`, the entry
+    // returned, and a loop re-read the new image's entry point out of the
+    // registered process and went in again. It does not any more —
+    // `sys_execve` writes `UserCtx::user_rip`/`user_rsp` and sets
+    // `exec_pending`, and the syscall return path's `.Lexec_return` `sysret`s
+    // straight into the new image. That is how Linux does it, and it is what
+    // makes this a process lifecycle shaped like the AArch64 kernel's
+    // (`Process::run` is `-> !` there; the exit leaves from inside the syscall
+    // path) rather than a loop with a teardown hanging off the end.
+    //
+    // What the loop cost was never the four lines. It was that one task could
+    // be below ring 3 more than once for one process, so everything after the
+    // entry — the teardown, the exit status, the reap ordering — had to be
+    // written as "the last time round". There is no last time round now.
+    //
+    // SAFETY: both are addresses the loader (or `Image::new`) mapped
+    // user-accessible in the address space the scheduler installed for this
+    // task, and every program this kernel runs ends in exit_group.
+    let status = enter_user(first.pc, first.sp, forked_child);
     EXIT_STATUS.store(status, Ordering::Relaxed);
     // Real Linux closes every fd a process still holds at exit. Since step 4b
     // the registered table is the only descriptor authority and every entry in
@@ -3806,16 +3840,32 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // explicit `drop`s that used to stand here were arranging by hand.
     crate::sched::set_current_space_root(new_root);
 
-    // Ask the entry path to leave ring 3, and tell `run_process` this is an
-    // `execve` rather than an exit.
+    // **Return into the new image**, rather than leaving ring 3 and being sent
+    // back in by a loop.
+    //
+    // `user_rip`/`user_rsp` are where the syscall return path takes the program
+    // counter and stack from — the first is true only since this change. The
+    // ordinary return pops the `rcx`/`r11` that the `syscall` instruction
+    // itself delivered; `[rax + 32]` was written for `vfork`'s benefit alone
+    // and nothing read it on the way out. `exec_pending` now selects
+    // `.Lexec_return`, which reads both, zeroes the register file and
+    // `sysret`s. `leave` is deliberately **not** set: leaving ring 3 is what
+    // made `execve` need a loop to get back in.
+    //
     // SAFETY: under the BKL, interrupts off inside a syscall; the per-CPU
-    // `UserCtx` is this task's slot. Same `leave` mechanism `exit` uses.
+    // `UserCtx` is this task's slot, and only this task reads these fields.
     unsafe {
         let uctx = crate::smp::current_uctx();
-        if !uctx.is_null() {
-            (*uctx).leave = 1;
-            (*uctx).exec_pending = 1;
+        if uctx.is_null() {
+            // Nothing to return through. The old image is already gone, so
+            // there is no program to return to either; say so rather than
+            // `sysret`ing somewhere arbitrary.
+            serial::puts("  [execve] no UserCtx on this task\n");
+            return errno::ENOSYS;
         }
+        (*uctx).user_rip = new_entry;
+        (*uctx).user_rsp = new_stack;
+        (*uctx).exec_pending = 1;
     }
     0
 }

@@ -352,10 +352,15 @@ pub fn bind_clone_child(
 /// the row no longer carries them. One authority for where a task enters ring
 /// 3, which is `ProcessImage::context`.
 ///
-/// **There is no `execve` loop here** and that is not an omission: `execve`
-/// from a non-main thread replaces the whole process image, which on Linux
-/// kills every sibling first. This target refuses it (`sys_execve` is reached
-/// only by a main thread), so a thread enters ring 3 exactly once.
+/// **There is no `execve` loop here** — and since 2026-09-11 there is not one
+/// in [`crate::usermode::run_process`] either: `execve` writes its own
+/// `UserCtx` and the syscall return path `sysret`s into the new image, so no
+/// task on this target leaves ring 3 and comes back for one. A thread enters
+/// ring 3 exactly once, and so does a process.
+///
+/// It was never an omission here regardless: `execve` from a non-main thread
+/// replaces the whole process image, which on Linux kills every sibling first,
+/// and this target refuses it (`sys_execve` is reached only by a main thread).
 pub fn run_thread(slot: usize, first: &akuma_exec::process::UserContext) -> ! {
     // `forked = true`: enter ring 3 through `enter_user_mode_forked`, which
     // restores the parent's register set from this task's own `saved_regs` and

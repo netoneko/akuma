@@ -1229,22 +1229,72 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   641/0. **No shared crate changed** — AArch64 untouched.
    │                        doc: AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md
    ▼
+ [09-11] `execve` returns into the new image — **piece B, done**
+   │   The prompt's evidence was wrong and that changed the cost: it
+   │   said `syscall_entry` writes `user_rip` at `[rax+32]` **and the
+   │   return path reads it**, so `execve` writing that field would make
+   │   the two agree. The return path pops the `rcx`/`r11` the `syscall`
+   │   instruction delivered, off the kernel stack; `[rax+32]` is
+   │   `vfork`'s alone and nothing read it on the way out. Writing it
+   │   would have changed nothing at all.
+   │   So: a **second return path**. `.Lexec_return`, selected by
+   │   `exec_pending`, abandons the pushed rip/rflags, takes both from
+   │   `UserCtx`, **zeroes every register** and forces `r11 = 0x202`.
+   │   The zeroing is not hygiene — System V says `%rdx` at process
+   │   entry is `rtld_fini`, which musl's `_start` hands to
+   │   `__libc_start_main`; left holding the old image's third syscall
+   │   argument the new program *calls* it on the way out.
+   │   `enter_user_mode` got that for free (reached from Rust, `rdx` = 0);
+   │   a second entry path does not inherit an accident.
+   │   `sys_execve` no longer sets `leave`, so the BKL accounting is
+   │   unchanged — `syscall_handler` drops it on the ordinary line
+   │   instead of `enter_user` dropping it one instruction before
+   │   `sysret` — and the new window runs with `IF` clear throughout.
+   │   `run_process` is one entry and one exit. Gone with the loop:
+   │   `exec_pending`'s Rust consumer, `current_entry_stack`.
+   │   **The two-way `enter_ring3` did NOT collapse**, and the prompt
+   │   expected it might for the same reason its evidence was wrong:
+   │   `run_thread` vs `run_process` is about **teardown**, not re-entry.
+   │   Also added: a `const _` asserting all six hand-indexed `UserCtx`
+   │   offsets. A reordered field would compile, pass the boot suite, and
+   │   send `execve` to whatever moved into 32.
+   │   Gates: Firecracker 619/0; `amd64_ring3_check --smp 1 -n 60`
+   │   **OK** (60/60, `grandfork` all 5 steps incl. the grandchild exec)
+   │   — that is the gate, not the boot suite, because each session is
+   │   `sshd`→fork→execve→busybox against a real musl `_start`.
+   │   **Bare metal is owed**: the box reported 634/3, all three
+   │   `xhci:`, with `ext2 mounted on module` — the RAM fallback. The
+   │   piece-A kernel that scored 641/0 ninety minutes earlier, restored
+   │   from its own `.bak` and rebooted, reported the *same* 634/3. Two
+   │   binaries, one result: the USB disk has stalled and needs a power
+   │   cycle.
+   │                        doc: AKUMA_AMD64_EXECVE_RETURNS.md
+   ▼
  [09-11] ═══ YOU ARE HERE ═══
    │
-   └──► one piece left — **prompt:**
+   └──► **C1 is done.** Both pieces of
         `proposals/NEXT_AGENT_AMD64_PROCESSCHANNEL_AND_LIFECYCLE.md`
+        landed the same day.
 
-        **B. the lifecycle unification** (the retired seam prompt's §4
-                 option 2) — move amd64 onto the never-returns shape. It
-                 is now the *only* reason `usermode.rs` owns an `execve`
-                 re-entry loop and a two-way `enter_ring3` (`run_thread`
-                 vs `run_process`), and slice 7 sharpened the case: that
-                 split exists because a process teardown is wrong for one
-                 thread of several. The loop exists because `sysret`
-                 returns to the saved `user_rip` — so the shape to try is
-                 `execve` **rewriting its own `UserCtx`** instead of
-                 leaving ring 3, which is how Linux does it. Untested;
-                 it is a rewrite of the one mechanism `execve` has here
+        Owed, and cheap: the **bare-metal number for piece B**, on the
+        next boot after someone power-cycles the box.
+
+        What piece A left, in the order it argues for itself:
+
+        1. **signal delivery**, which is now the only thing between this
+           target and `EINTR` on a console read — glue's `Stdin` arm
+           already asks `should_interrupt_blocking_syscall`, so the gap
+           moved out of `fd.rs` and into the signal path.
+        2. **INTR → SIGINT on the foreground group.** The pump delivers
+           `^C` as a byte; the shared route that turns it into a signal
+           is `write_to_process_stdin`'s ISIG handling, which needs a
+           pid — i.e. a foreground-process notion this target lacks.
+        3. **an sshd session's child's `ProcessChannel`** — the deferred
+           `/proc/<pid>/fd/0` + `delegate_pid` item, still the last
+           reason `ioctl` carries a fake-tty preamble, and what would
+           make a full-screen program work over ssh rather than only on
+           the serial line.
+
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
