@@ -533,6 +533,49 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
     // tick instead of once per keystroke.
     let stripped_count = original_len - data.len();
 
+    // **The target's own fd 0, when that is a pipe, IS its stdin** — and a
+    // `ProcessChannel` it never reads is not.
+    //
+    // On the AArch64 kernel a spawned child's fd 0 is a `FileDescriptor::Stdin`
+    // served from `proc.channel`, so this arm is unreachable for every caller
+    // that exists: the one writer of `/proc/<pid>/fd/0` in the tree is `sshd`'s
+    // bridge, aimed at its own session child. On the amd64 kernel that same
+    // child's fd 0 is a `PipeRead` (`fd::bind_stdio`, C2 slice 6), and routing
+    // the bridge through here instead of through a kernel-private
+    // `/proc/<pid>/fd/0` interception is what gives an `ssh` session the ISIG
+    // branch above — `^C` as a signal rather than as a `0x03` byte.
+    //
+    // **After the filtering, never before it.** The INTR character is the line
+    // discipline's, not the pipe's; a pipe route taken first would hand `0x03`
+    // to the program as data, which is exactly the defect this closes.
+    //
+    // A `PipeRead` at fd 0 outranks the channel because it is what the process
+    // actually reads. The case where both exist and disagree is a shell
+    // pipeline's downstream child (`cat f | less`), which inherits its parent's
+    // terminal channel and dup2s a pipe over fd 0; Linux delivers such a write
+    // to the pipe, and nothing in this tree wrote to one before today.
+    if let Some(FileDescriptor::PipeRead(id)) = proc.get_fd(0) {
+        // Errors are the pipe's own (`EPIPE` for a hung-up reader) and are
+        // reported as a failed write, the same answer the caller got when it
+        // held a real `PipeWrite` descriptor.
+        //
+        // **An empty `data` is not offered to the pipe at all.** That is the
+        // lone-INTR keystroke (`[0x03]`, filtered to nothing), which is the
+        // commonest thing on this path and the one case where a write of zero
+        // bytes could fail: a `^C` typed at a shell whose stdin pipe has already
+        // lost its reader would come back `EPIPE` and be reported to `sshd` as a
+        // failed write of a byte the line discipline had already consumed — and
+        // `sshd` would resend it, re-raising `SIGINT` every bridge tick. Linux
+        // does not signal a zero-length write either. `stripped_count` still
+        // counts it as accepted, for the reason the comment above gives.
+        let n = if data.is_empty() {
+            0
+        } else {
+            (runtime().pipe_write)(id, data).map_err(|_| "Pipe write failed")?
+        };
+        return Ok(n + stripped_count);
+    }
+
     let Some(ref channel) = proc.channel else {
         // No channel: the legacy buffer is the only sink, and it has always taken
         // everything (clearing itself on overflow), so report a full write.

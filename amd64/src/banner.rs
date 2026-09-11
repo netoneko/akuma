@@ -7,9 +7,20 @@
 
 use crate::serial;
 
-/// `uname -r` — the kernel release. Shared with `usermode::UTSNAME` so the
-/// banner and `uname(2)` cannot disagree.
-pub const RELEASE: &str = "0.1.0-amd64";
+/// `uname -r` — the kernel release, plus this target's suffix.
+///
+/// The doc here claimed it was "shared with `usermode::UTSNAME` so the banner
+/// and `uname(2)` cannot disagree". There is no `usermode::UTSNAME` — `uname`
+/// folded into `akuma-syscalls-glue` at C1 step 3 — and the two did disagree:
+/// this literal said `0.1.0-amd64` while `uname -r` said `0.1.0` only by
+/// coincidence, both of them wrong (the glue crate's package version, not the
+/// kernel's). Now it *is* shared, so [`print`] writes this const and then the
+/// suffix rather than one string.
+pub const RELEASE: &str = akuma_syscalls_glue::version::RELEASE;
+
+/// What this target appends to [`RELEASE`], so a banner on the HP box's
+/// television says which of the two kernels is up.
+const RELEASE_SUFFIX: &str = "-amd64";
 
 /// `uname -v` — the longer description, same source as above.
 pub const VERSION_DESC: &str = "Akuma/amd64 (x86_64 bring-up)";
@@ -32,5 +43,6 @@ pub fn print() {
     serial::puts(VERSION_DESC);
     serial::puts("  ");
     serial::puts(RELEASE);
+    serial::puts(RELEASE_SUFFIX);
     serial::puts("\n\n");
 }

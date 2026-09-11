@@ -135,6 +135,19 @@ pub struct ExecRuntime {
     pub pipe_close_write: fn(u32),
     pub pipe_close_read: fn(u32),
     pub pipe_clone_ref: fn(u32, bool),
+    /// Write into a pipe by id, **without** raising `SIGPIPE` — the
+    /// `pipe_write_no_sigpipe` spelling, because the caller here is never the
+    /// process whose pipe it is.
+    ///
+    /// A hook for the same reason the three above are: the pipe table lives in
+    /// `akuma-syscalls-glue`, which depends on this crate and cannot be
+    /// depended on back. Its one caller is [`crate::process::write_to_process_stdin`],
+    /// which has to reach a target whose real stdin is a pipe rather than a
+    /// `ProcessChannel` — the amd64 kernel's spawned children, whose fd 0 is a
+    /// `PipeRead` from `fd::bind_stdio`. Non-blocking: a full pipe answers
+    /// `Ok(0)` and the caller reports a short write, which is what lets `sshd`'s
+    /// bridge carry the child's backpressure to the client.
+    pub pipe_write: fn(u32, &[u8]) -> Result<usize, i32>,
     pub eventfd_close: fn(u32),
     pub eventfd_clone_ref: fn(u32),
     /// Release one reference to an AF_UNIX table entry

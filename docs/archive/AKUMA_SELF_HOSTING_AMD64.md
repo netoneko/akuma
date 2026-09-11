@@ -1410,6 +1410,35 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   AArch64 307/0, host tests 1375/0.
    │                        doc: AKUMA_AMD64_FAULT_SIGNALS.md §7
    ▼
+   ▼
+ [09-11] **an ssh session's child gets a `ProcessChannel`, and `^C` over
+   │   ssh becomes a signal.** Three of the prompt's four steps.
+   │   `SPAWN_FLAG_PTY` **arrives** (the dispatch arm passed five
+   │   arguments; `syscall_entry` had always carried the sixth), and a
+   │   pty spawn's child gets a terminal-marked channel plus
+   │   `foreground_pgid = pid` — which is what
+   │   `write_to_process_stdin`'s ISIG branch reads. The
+   │   `/proc/<pid>/fd/0` interception is **deleted**: the shared sink
+   ▼   learned to deliver to a target whose real stdin is a pipe (its
+   │   own fd 0, through a new `pipe_write` runtime hook), *after* the
+   │   INTR filtering — so `sshd` opens the real procfs path like
+   │   everything else under `/proc` and nothing in `sshd` changed.
+   │   `alloc_pipe_fd`'s two dead parameters and `stdin_pipe_for_pid`'s
+   │   `pub` went with it. **Step 4 (fd 0 onto the channel) is not
+   │   done and the reason is concrete, not deferred**: glue's `Stdin`
+   │   arm writes the line discipline's echo to the channel's *stdout*
+   │   FIFO, which on this target nothing drains — a spawned child's
+   ▼   stdout is a pipe and `sshd` reads the pipe. fd 0 cannot move
+   │   without fd 1/2. Gates: QEMU 665/0, Firecracker 643/0, memory
+   │   probes 10/10, ring-3 OK, AArch64 307/0, host tests 1375/0.
+   │   Alongside: `uname -r` reported `0.1.0` on **both** kernels —
+   │   `akuma-syscalls-glue`'s package version, because
+   │   `env!("CARGO_PKG_VERSION")` names the crate the macro is in and
+   │   `src/syscall/` became a crate on 09-01. One literal now
+   │   (`version::RELEASE`), read by `uname`, the version triple and
+   │   the amd64 banner, which had a third hardcoded spelling.
+   │                   doc: AKUMA_AMD64_SSHD_SESSION_CHANNEL.md
+   ▼
  [09-11] ═══ YOU ARE HERE ═══
    │
    └──► **C1 is done**, and so are items 1 and 2 of what piece A left.
@@ -1434,11 +1463,22 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
            "no signals"; it is narrower now, and the hook is read from
            inside `smoltcp`'s poll loop, so wiring it is a measurement
            rather than a one-liner.
-        3. **an sshd session's child's `ProcessChannel`** — the deferred
-           `/proc/<pid>/fd/0` + `delegate_pid` item, still the last
-           reason `ioctl` carries a fake-tty preamble, what would make a
-           full-screen program work over ssh rather than only on the
-           serial line, and what `^C` over ssh needs.
+        3. **an ssh session's child's stdio, fd 0 and fd 1/2 together.**
+           The channel itself landed (`AKUMA_AMD64_SSHD_SESSION_CHANNEL.md`)
+           and with it `^C` over ssh; what did **not** is moving the
+           child's descriptors onto it, which is the last reason `ioctl`
+           carries a fake-tty preamble and what a full-screen program
+           over ssh needs. It is one piece, not two: glue's `Stdin` read
+           arm writes the line discipline's echo to the channel's
+           *stdout* FIFO, and here nothing drains that — so fd 0 cannot
+           move without fd 1/2, which means `sys_spawn` returning a
+           `ChildStdout(pid)` and `sys_write`'s console preamble no
+           longer claiming every `Stdout` descriptor. It also collides
+           with this target's two-channels-per-process shape:
+           `register_child_channel` carries the **exit** channel here,
+           and glue's `ChildStdout` arm resolves through exactly that
+           map. (`delegate_pid` was never part of this and the phrase is
+           gone from both places that carried it.)
 
 ```
 

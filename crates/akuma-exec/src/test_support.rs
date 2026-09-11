@@ -102,6 +102,7 @@ pub fn ensure_test_runtime() {
         pipe_close_write: |_| {},
         pipe_close_read: |_| {},
         pipe_clone_ref: |_, _| {},
+        pipe_write: |_, d| Ok(d.len()),
         eventfd_close: |_| {},
         eventfd_clone_ref: |_| {},
         unix_sock_close: |_| {},

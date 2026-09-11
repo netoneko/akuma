@@ -278,15 +278,26 @@ pub fn is_current_interrupted() -> bool {
 ///
 /// **Writing both is wrong, and the reason is one line up the file:**
 /// `Process::inherit_from` does `channel: parent.channel.clone()`, so a
-/// `Process::channel` is shared by an entire process tree. On amd64 with a
-/// console-attached `init` — which is every rig, `init=/bin/sshd` — that is
-/// *every process on the machine*. Setting the flag there made a `kill` to one
-/// process interrupt all of them: `akuma-syscalls-glue`'s dispatch prologue
-/// reads `is_current_interrupted` on every syscall and marks the caller
-/// `Zombie(130)`, so an unrelated program reported exit 130 while still
-/// running. Measured deterministically — 3 runs of 3 — by
-/// `userspace/forktest/c_stress/sigprobe.c` after ten `ssh` workload sessions;
-/// `AKUMA_AMD64_SIGNAL_DELIVERY.md` §5d.
+/// `Process::channel` is shared by an entire **`fork` tree** — and a
+/// per-process interrupt flag cannot live in an object a tree shares.
+///
+/// How far that reaches on amd64, checked rather than assumed — and it is
+/// **two** trees, not one machine-wide object as the first draft of this
+/// comment claimed:
+///
+/// * `init` on the serial line and its `fork` descendants share the *console's*
+///   channel. `register_exec_process` derives "is this the console's process"
+///   from fd 0 being a `FileDescriptor::Stdin`, and `fd::bind_stdio` gives every
+///   `sys_spawn` child a `PipeRead` there before the registration reads it, so
+///   nothing `sshd` spawns is in this tree.
+/// * an `ssh` session's shell and its `fork` descendants share that **session's**
+///   channel, since `SPAWN_FLAG_PTY` started arriving (2026-09-11). It is a
+///   different object per session, which is what makes `^C` reach one session's
+///   foreground job and not another's — and it is just as shared *within* a
+///   session, so the flag would still interrupt a whole session at once.
+///
+/// Narrower than one object per machine, and still the wrong place for the
+/// flag. See `AKUMA_AMD64_SIGNAL_DELIVERY.md` §5d.
 ///
 /// So the gap stands, and it is narrower than it looks: the *per-thread*
 /// `EINTR` path (`current_thread_has_pending_interrupt`, reading the pending

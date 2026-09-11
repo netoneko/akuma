@@ -160,9 +160,18 @@ the console one.
 **This was "fixed" by having `interrupt_thread` write both, and the fix was
 reverted.** One line up the file from the field, `Process::inherit_from` does
 `channel: parent.channel.clone()` — so a `Process::channel` is shared by an
-entire **process tree**, and on amd64 with a console-attached `init` (which is
-every rig: `init=/bin/sshd`) that is every process on the machine. A
-per-process interrupt flag cannot live in an object the whole machine shares.
+entire **`fork` tree**, and a per-process interrupt flag cannot live in an
+object a tree shares.
+
+**How far that reaches, checked rather than assumed** (an earlier draft of this
+paragraph said "every process on the machine", which is wrong):
+`register_exec_process` derives `console_attached` from fd 0 being a
+`FileDescriptor::Stdin`, and `fd::bind_stdio` gives every `sys_spawn` child a
+`PipeRead` there — *before* the registration reads it. So a spawned child and
+everything under it get `channel: None`, and the shared object covers exactly
+`init` and its **`fork`** descendants. On a console rig that is `init` plus
+whatever it forks without going through `sys_spawn`; an `ssh` session is
+outside it.
 
 **So the gap stands**, and it is narrower than it looks: the per-thread `EINTR`
 path (`current_thread_has_pending_interrupt`, reading the pending set) is

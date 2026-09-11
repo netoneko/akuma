@@ -306,6 +306,7 @@ fn runtime() -> ExecRuntime {
         pipe_close_write: |id| crate::pipe::close_write(id as usize),
         pipe_close_read: |id| crate::pipe::close_read(id as usize),
         pipe_clone_ref: |id, is_write| crate::pipe::clone_ref(id as usize, is_write),
+        pipe_write: akuma_syscalls_glue::pipe::pipe_write_no_sigpipe,
         eventfd_close: |_| not_wired!("eventfd_close", "sc-eventfd is not in this target's feature set"),
         eventfd_clone_ref: |_| not_wired!("eventfd_clone_ref", "sc-eventfd is not in this target's feature set"),
         unix_sock_close: |_| not_wired!("unix_sock_close", "AF_UNIX is not built for this target"),

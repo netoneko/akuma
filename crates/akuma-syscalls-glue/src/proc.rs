@@ -193,7 +193,10 @@ const fn uts_field(mut buf: [u8; UTS_LEN], index: usize, value: &[u8]) -> [u8; U
 /// As a `static` it lives in `.rodata` and the syscall is one `copy_to_user`,
 /// which is what Linux does (it copies straight out of `init_uts_ns.name`).
 ///
-/// `release` tracks the kernel crate version, and `version` carries the build
+/// `release` is [`crate::version::RELEASE`] — **not** `env!("CARGO_PKG_VERSION")`,
+/// which it was until 2026-09-11 and which expands to *this crate's* version, so
+/// both kernels reported `0.1.0` (the glue crate) as the kernel release from the
+/// moment `src/syscall/` became a crate. `version` carries the build
 /// identity `<git-sha>-<profile>` (e.g. `a1b2c3d-release-smp-shared`) — enough
 /// for `uname -a` to say which commit and build target is running. See
 /// docs/archive/UNAME.md. sysname/nodename/domainname stay static literals:
@@ -226,7 +229,7 @@ static UTSNAME: [u8; UTS_LEN] = {
     let b = [0u8; UTS_LEN];
     let b = uts_field(b, 0, b"Akuma");
     let b = uts_field(b, 1, b"akuma");
-    let b = uts_field(b, 2, env!("CARGO_PKG_VERSION").as_bytes());
+    let b = uts_field(b, 2, crate::version::RELEASE.as_bytes());
     let b = uts_field(
         b,
         3,

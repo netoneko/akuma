@@ -387,6 +387,7 @@ pub(crate) fn build_exec_runtime(
         pipe_close_write: crate::syscall::pipe::pipe_close_write,
         pipe_close_read: crate::syscall::pipe::pipe_close_read,
         pipe_clone_ref: crate::syscall::pipe::pipe_clone_ref,
+        pipe_write: crate::syscall::pipe::pipe_write_no_sigpipe,
         // Tier 2 FD-teardown callbacks. akuma-exec calls these unconditionally
         // during FD drop, but when a family is gated out its FileDescriptor
         // variant is never constructed, so the no-op is never actually invoked

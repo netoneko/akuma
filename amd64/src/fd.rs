@@ -42,9 +42,12 @@
 //! (4b batch 2c). This kernel rendered that namespace itself — from its own
 //! spawn table, intercepting ahead of the VFS in eight syscalls — while the
 //! shared filesystem was mounted at the same path and served whatever the local
-//! view declined. ~500 lines went with the deletion; what is left is one path,
-//! `/proc/<pid>/fd/0`, whose semantics here are genuinely not the shared one's
-//! (see [`sys_openat`]). A `/proc` file is rendered by its filesystem per
+//! view declined. ~500 lines went with the deletion; one path outlived it —
+//! `/proc/<pid>/fd/0`, whose semantics here were genuinely not the shared one's
+//! — and since 2026-09-11 **nothing is left**: the shared stdin sink learned to
+//! find a target whose real stdin is a pipe, which is what that path was
+//! working around (see [`sys_openat`]). A `/proc` file is rendered by its
+//! filesystem per
 //! `read(2)`, so two reads can see two renders — Linux `seq_file`'s snapshot
 //! semantics are the thing neither side implements.
 //!
@@ -427,48 +430,33 @@ pub fn socket_index(fd: u64) -> Option<usize> {
     })
 }
 
-/// Give `pipe_id` a descriptor: `PipeRead` for a reader end, `PipeWrite` for a
-/// writer end. Used by `sys_spawn` (the parent's stdout reader) and
-/// `sys_openat`'s `/proc/<pid>/fd/0` (the parent's stdin writer).
+/// Give `sys_spawn`'s caller the read end of its child's stdout pipe, as a
+/// `FileDescriptor::PipeRead`.
 ///
-/// `adopt_initial` decides *whose* end reference this descriptor holds, and the
-/// two callers differ:
+/// **It adopts the initial reader reference rather than cloning one.**
+/// [`bind_stdio`] consumed the stdout pipe's initial *writer* (fd 1) and cloned
+/// it (fd 2), but left the initial *reader* untouched and unowned — nothing
+/// else ever names it. Cloning a second reader here would strand that one: the
+/// child's `close_all` takes the writers to 0, this descriptor's `close` takes
+/// the cloned reader to 0, and the orphan reader keeps the pipe alive forever —
+/// one leaked pipe per spawn against `MAX_PIPES`
+/// (`proposals/AMD64_SPAWN_PIPE_LEAK.md`).
 ///
-/// - **`sys_openat`'s `/proc/<pid>/fd/0` (`false`)** is a genuine second name.
-///   [`bind_stdio`] gave the child's fd 0 the stdin pipe's initial *reader*;
-///   its initial *writer* is spoken for by the `waitpid` reap
-///   (`pipe::close_write` on `Spawn::stdin_pipe`), which is the one place that
-///   knows the child is gone. So `sshd`'s writer must be a fresh reference —
-///   `clone_ref` here, released by `sshd`'s own `close`.
+/// It had a second caller and two more parameters until 2026-09-11:
+/// `sys_openat`'s `/proc/<pid>/fd/0` took the *write* end of the child's stdin
+/// pipe, and did `clone_ref` rather than adopt, because that pipe's initial
+/// writer is spoken for by the `waitpid` reap (`pipe::close_write` on
+/// `Spawn::stdin_pipe`), the one place that knows the child is gone. That path
+/// is gone — the bridge reaches the child through the shared
+/// `write_to_process_stdin` now, which needs no descriptor at all — so both the
+/// `is_write` and `adopt_initial` arms went with it rather than sitting here as
+/// the only untaken branches in the module.
 ///
-/// - **`sys_spawn`'s parent stdout reader (`true`)** adopts. [`bind_stdio`]
-///   consumed the stdout pipe's initial *writer* (fd 1) and cloned it (fd 2),
-///   but left the initial *reader* untouched and unowned — nothing else ever
-///   names it. Cloning a second reader here would strand that one: the child's
-///   `close_all` takes the writers to 0, this descriptor's `close` takes the
-///   cloned reader to 0, and the orphan reader keeps the pipe alive forever —
-///   one leaked pipe per spawn against `MAX_PIPES`
-///   (`proposals/AMD64_SPAWN_PIPE_LEAK.md`). Adopting the initial reader
-///   instead means no extra reference and no teardown gap.
-///
-/// On a failed install the reference this descriptor would have held — the
-/// cloned one, or the adopted initial one — is released so nothing leaks.
-pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool, adopt_initial: bool) -> Option<u64> {
-    let desc = if is_write {
-        FileDescriptor::PipeWrite(pipe_id as u32)
-    } else {
-        FileDescriptor::PipeRead(pipe_id as u32)
-    };
-    if !adopt_initial {
-        crate::pipe::clone_ref(pipe_id, is_write);
-    }
-    let fd = install(desc);
+/// On a failed install the adopted reference is released so nothing leaks.
+pub fn alloc_child_stdout_fd(pipe_id: usize) -> Option<u64> {
+    let fd = install(FileDescriptor::PipeRead(pipe_id as u32));
     if errno::is_err(fd) {
-        if is_write {
-            crate::pipe::close_write(pipe_id);
-        } else {
-            crate::pipe::close_read(pipe_id);
-        }
+        crate::pipe::close_read(pipe_id);
         return None;
     }
     Some(fd)
@@ -608,7 +596,7 @@ pub fn copy_out(ptr: u64, src: &[u8]) -> u64 {
 /// each has its own claimant: the stdin pipe's initial *writer* is released by
 /// the `waitpid` reap (`pipe::close_write` on `Spawn::stdin_pipe`), and the
 /// stdout pipe's initial *reader* is adopted by the parent's stdout descriptor
-/// in [`alloc_pipe_fd`] (`adopt_initial`). Neither is a leak; both are load
+/// in [`alloc_child_stdout_fd`]. Neither is a leak; both are load
 /// bearing — see `proposals/AMD64_SPAWN_PIPE_LEAK.md` for what a stray
 /// `clone_ref` on the second one cost.
 pub fn bind_stdio(
@@ -708,8 +696,17 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
 /// the trap: an untranslated x86_64 `O_TMPFILE` slips straight through glue's
 /// refusal.
 ///
-/// **2. `/proc/<pid>/fd/0`** — the last path this kernel answers for itself,
-/// and the reason is semantic rather than structural: see the block below.
+/// **2. `/proc/<pid>/fd/0` was the last path this kernel answered for itself,
+/// and no longer is** (2026-09-11). It returned the **write end of the child's
+/// stdin pipe**, which is not what the name means anywhere else: on Linux, and
+/// in the shared `ProcFilesystem`, writing to a process's fd 0 delivers into
+/// *its* stdin. The note here said closing it meant "teaching the shared stdin
+/// sink to find the target's real stdin (its own `get_fd(0)`)", and that is
+/// exactly what happened — `akuma_exec::process::write_to_process_stdin` now
+/// routes to a `PipeRead` at the target's fd 0 through the `pipe_write` runtime
+/// hook, *after* its ISIG filtering. So `sshd`'s bridge opens the real procfs
+/// symlink through glue like everything else under `/proc`, and an `ssh`
+/// session's `^C` becomes a `SIGINT` instead of a `0x03` byte.
 ///
 /// **3. The refusals glue does not make.** `O_DIRECTORY`, `O_EXCL`,
 /// `O_NOFOLLOW` and `O_CREAT`-on-a-directory are all enforced here and by
@@ -752,39 +749,6 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     else {
         return errno::EFAULT;
     };
-
-    // **The last path this kernel answers for itself.**
-    //
-    // `/proc/<pid>/fd/0` — `sshd`'s bridge opens it to feed a spawned shell's
-    // stdin, and gets back the **write end of that child's stdin pipe**, which
-    // is not what the name means anywhere else: on Linux, and in the shared
-    // `ProcFilesystem`, writing to a process's fd 0 delivers into *its* stdin,
-    // and the shared route (`write_to_process_stdin`) delivers into a
-    // `StdioBuffer`/`ProcessChannel` that this target's children — whose fd 0
-    // is a `PipeRead` since C2 slice 6 — never read.
-    //
-    // Everything else under `/proc` is the mounted filesystem's, through glue.
-    // This kernel rendered that whole namespace itself until 4b batch 2c, from
-    // its own spawn table, falling through to the mount only for what its view
-    // did not serve — two implementations of one namespace. Closing this one
-    // means teaching the shared stdin sink to find the target's real stdin (its
-    // own `get_fd(0)`), which is a change to behaviour on **both** kernels and
-    // so waits for a working AArch64 verification loop.
-    //
-    // Asked of the *raw* path, which is where it has always been asked: a
-    // relative spelling of the same file is not intercepted, and making it one
-    // would be a new behaviour rather than a preserved one.
-    if let Some(rest) = raw.strip_prefix("/proc/")
-        && let Some(pid_str) = rest.strip_suffix("/fd/0")
-    {
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            return errno::ENOENT;
-        };
-        let Some(pipe_id) = crate::usermode::stdin_pipe_for_pid(pid) else {
-            return errno::ENOENT;
-        };
-        return alloc_pipe_fd(pipe_id, true, false).unwrap_or(errno::EMFILE);
-    }
 
     // Resolved with **glue's** ladder, not this module's, so the refusals below
     // are asked of exactly the path `openat_path` will open. Handing the
@@ -1758,21 +1722,34 @@ pub fn sys_access(path: u64) -> u64 {
 /// `Stdin`/`Stdout`/`Stderr`); the third is the fd a pager opens on `/dev/tty`
 /// to read keys from, which is never 0/1/2.
 ///
-/// **Half of that has happened and the half that matters here has not.** The
-/// *console* has a terminal-capable `ProcessChannel` now (`crate::console`), so
-/// `poll`'s `Stdin` arm does work on its own for a console process and
+/// **Two thirds of that has happened and the term above is the third.** The
+/// *console* has a terminal-capable `ProcessChannel` (`crate::console`), so
+/// `poll`'s `Stdin` arm works on its own for a console process and
 /// [`poll_console_state`] has shrunk to the unbound spelling. An **sshd
-/// session's child** still has none: its stdin is a `PipeRead` from
-/// [`bind_stdio`], which is what the `fd < FIRST_FILE_FD` term above claims, and
-/// giving it one is the deferred `/proc/<pid>/fd/0` + `delegate_pid` work in
-/// `AKUMA_AMD64_4B_FOLD_BATCH2A.md` § `/proc`. Until then this preamble stays.
+/// session's child** has one too since 2026-09-11 — `sys_spawn` builds it for
+/// `SPAWN_FLAG_PTY` — which is what gives an `ssh` session INTR→SIGINT: the
+/// bridge's keystrokes reach `akuma_exec::process::write_to_process_stdin`
+/// through the real procfs `/proc/<pid>/fd/0`, its ISIG branch reads that
+/// channel's `is_terminal()`, and `^C` raises `SIGINT` on the session's
+/// foreground group instead of arriving as a `0x03` byte.
 ///
-/// INTR→SIGINT was in that sentence too and is no longer: the **console's**
-/// keystrokes go through `akuma_exec::process::write_to_process_stdin` since
-/// 2026-09-11 (`crate::console`'s pump), so `^C` on the serial line raises
-/// `SIGINT` on the foreground group. An `ssh` session's `^C` still does not,
-/// for exactly the reason this paragraph gives — there is no channel to run a
-/// line discipline on.
+/// **What has not happened is fd 0.** The session child's stdin is still a
+/// `PipeRead` from [`bind_stdio`] — the channel carries the terminal's identity,
+/// not its data — so glue's table test still answers `ENOTTY` for it and the
+/// `fd < FIRST_FILE_FD` fake tty is still what lets `busybox sh` run
+/// interactively over the bridge. Moving fd 0 onto the channel is not a
+/// one-liner and it is not blocked on anything mysterious: glue's `Stdin` arm
+/// writes the line discipline's **echo** to the channel's *stdout* FIFO, and on
+/// this target nothing drains that — a spawned child's stdout is a pipe and
+/// `sshd` reads the pipe. So fd 0 and fd 1/2 have to move together, i.e.
+/// `sys_spawn` has to hand back a `ChildStdout(pid)` and `sys_write`'s console
+/// preamble has to stop claiming every `Stdout` descriptor. Until then this
+/// preamble stays.
+///
+/// (`delegate_pid` used to be named here as part of the same deferred work. It
+/// is not: `delegate_pid` is `sys_reattach`'s — `box grab` — which moves a
+/// *target's* channel to a *grabber*, and has nothing to do with how `sshd`
+/// reaches its own child. The phrase was a leftover.)
 ///
 /// # What glue adds
 ///

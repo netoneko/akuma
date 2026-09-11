@@ -1000,10 +1000,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     const AKUMA_PRIVATE_BASE: u64 = 0x1000;
     if nr >= AKUMA_PRIVATE_BASE {
         return match nr - AKUMA_PRIVATE_BASE {
-            // `spawn(path, argv, envp, stdin, stdin_len[, flags])` — the sixth
-            // argument (the PTY flag) is dropped by `syscall_entry` and this
-            // target ignores it anyway (a pipe has no line discipline).
-            301 => sys_spawn(a1, a2, a3, a4, a5),
+            // `spawn(path, argv, envp, stdin, stdin_len, flags)` — six
+            // arguments, and the sixth is the one `sshd` sets for a client's
+            // `pty-req`. It used to stop here: this arm passed five and the
+            // comment claimed `syscall_entry` had dropped the flags word, which
+            // it never did (it pushes `r9` precisely so a sixth argument
+            // survives — `futex`'s bitset is the other user). So `SPAWN_FLAG_PTY`
+            // was not "accepted and ignored", it was not received.
+            301 => sys_spawn(a1, a2, a3, a4, a5, a6),
             // `resolve_host(name_ptr, name_len, out4)` — Akuma's own 300.
             //
             // Wired 2026-09-06 because `hget` (and anything else built on
@@ -3123,7 +3127,7 @@ fn start_test_process(
     let mut cmdline = alloc::vec::Vec::with_capacity(name.len() + 1);
     cmdline.extend_from_slice(name.as_bytes());
     cmdline.push(0);
-    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None, None);
+    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None, None, None);
     crate::sched::publish_task(task_slot);
     Some((pid, task_slot))
 }
@@ -3160,9 +3164,11 @@ fn finish_test_process(pid: u32, task_slot: usize) {
 // keystrokes forward to its stdin. This is the amd64 half of that: load an ELF
 // (the loader already exists), give the child a stdout pipe and a stdin pipe,
 // run it as a scheduler task, and hand `sshd` back a pid plus a descriptor that
-// reads the stdout pipe. `waitpid` reports the exit status; `/proc/<pid>/fd/0`
-// (in `fd::sys_openat`) resolves to the stdin pipe's write end, which is how
-// `sshd`'s `bridge_process` feeds the shell.
+// reads the stdout pipe. `waitpid` reports the exit status; the client's
+// keystrokes arrive through the shared `write_to_process_stdin`, which finds
+// the child's own fd 0 and writes the pipe behind it — `sshd` opens the real
+// procfs `/proc/<pid>/fd/0` for that, the same call it makes on the other
+// kernel. This file answered that path itself until 2026-09-11.
 //
 // No `fork`, no per-process fd table, no real process hierarchy — one spawn per
 // `SPAWN` slot, and fd 0/1/2 are routed per task through `UserCtx::proc_slot`.
@@ -3201,16 +3207,23 @@ use crate::pipe::{self, PipeId};
 ///
 /// **`stdin_pipe` stays, and that is a carried decision rather than a
 /// leftover.** Its *read* end is the child's fd 0 and dies with the child's
-/// row; its **write** end is reached by *path* — `sshd` opens
-/// `/proc/<pid>/fd/0` — and a path is not a reference, so nothing refcounts
-/// it. Left to the counts alone, a spawn whose stdin nobody ever opened (every
-/// `run_sh_capture` in the boot suite) would keep one writer forever and the
-/// pipe would never be destroyed: a leak against a 64-pipe ceiling. The reap
-/// is the one place that knows the child is gone, so the reap drops it. What
-/// changed is *how*: `pipe::close_write`, not the old `pipe::free` —
-/// `free` destroyed the pipe under `sshd`'s still-open descriptor, and
-/// `close_write` lets the end counts decide, which is the rule everywhere else
-/// in this module. A `fork` child owns no pipe of its own and carries `None`.
+/// row; its **write** end has no descriptor anywhere in the machine. `sshd`
+/// used to hold one — this module served `/proc/<pid>/fd/0` as a `PipeWrite` —
+/// and since 2026-09-11 does not: the bridge's bytes arrive through
+/// `akuma_exec::process::write_to_process_stdin`, which resolves the child's
+/// own fd 0 and writes the pipe **by id**, through the `pipe_write` runtime
+/// hook. An id is not a reference either, so the argument here is unchanged and
+/// slightly stronger. Left to the counts alone, a spawn whose stdin nobody ever
+/// wrote (every `run_sh_capture` in the boot suite) would keep one writer
+/// forever and the pipe would never be destroyed: a leak against a 64-pipe
+/// ceiling. The reap is the one place that knows the child is gone, so the reap
+/// drops it. What changed is *how*: `pipe::close_write`, not the old
+/// `pipe::free` — `free` destroys the pipe whatever the counts say, and the
+/// *reader* side can still be held (a zombie whose table is not yet torn down,
+/// a `fork` descendant that inherited fd 0), so its eventual close would land on
+/// a reissued id. `close_write` lets the end counts decide, which is the rule
+/// everywhere else in this module. A `fork` child owns no pipe of its own and
+/// carries `None`.
 struct Spawn {
     pid: u32,
     /// The stdin pipe this spawn created and still owns the *write* end of;
@@ -3505,6 +3518,19 @@ fn register_exec_process(
     // needs: `sshd` writes the child's state on `window-change` and the running
     // full-screen program reads the same cell.
     term: Option<alloc::sync::Arc<Spinlock<akuma_terminal::TerminalState>>>,
+    // The process's **I/O** channel — `Process::channel`, not the per-thread
+    // exit channel this function registers below. `Some` only for a
+    // `SPAWN_FLAG_PTY` spawn, whose child needs a channel that reports
+    // `is_terminal()` so the shared stdin sink runs its ISIG branch; `None`
+    // falls back to the console's channel for a console-attached process and to
+    // nothing for everything else.
+    //
+    // A parameter rather than a second reading of the fd table, because since
+    // this argument exists the table can no longer answer the question: the
+    // console test is "fd 0 is a `FileDescriptor::Stdin`", and a session child
+    // that later takes its stdin from the channel too would answer it the same
+    // way and be handed the *serial line's* channel.
+    channel: Option<alloc::sync::Arc<akuma_exec::process::ProcessChannel>>,
 ) {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
@@ -3677,7 +3703,7 @@ fn register_exec_process(
         // fills it, `/dev/tty` opens because `is_terminal()` holds, and the
         // arm's own `EAGAIN`, `EINTR`, raw/cooked branch and `EPOLLET` edge
         // re-arm come with it.
-        channel: console_attached.then(crate::console::channel).flatten(),
+        channel: channel.or_else(|| console_attached.then(crate::console::channel).flatten()),
         delegate_pid: None,
         grabbed_by: None,
         clear_child_tid: AtomicU64::new(0),
@@ -4269,14 +4295,49 @@ pub fn bind_child_task(
     Ok(())
 }
 
+/// Spawn flag bits (Akuma's own SPAWN ABI, arg6). Keep in sync with
+/// `libakuma::SPAWN_FLAG_PTY` and glue's constant of the same name.
+const SPAWN_FLAG_PTY: u64 = 1;
+
 /// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.
 ///
-/// Returns `pid | (stdout_fd << 32)` on success, or a negative errno. `flags`
-/// bit 0 (`SPAWN_FLAG_PTY`) is accepted and currently ignored: this target has
-/// no pty line discipline for a pipe, so an interactive shell gets raw bytes
-/// and does its own editing (`paws` already does).
-pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: u64) -> u64 {
+/// Returns `pid | (stdout_fd << 32)` on success, or a negative errno.
+///
+/// # `SPAWN_FLAG_PTY`
+///
+/// Set by `libakuma::spawn_pty`, which `sshd` calls for a client's `pty-req`.
+/// The doc here said the bit was "accepted and currently ignored"; it was
+/// neither — the dispatch arm passed five arguments and the flags word is the
+/// sixth, so it never arrived.
+///
+/// What it buys now is the **line discipline's identity**, not (yet) its data
+/// path. The child gets a `ProcessChannel` marked `is_terminal()` and a fresh
+/// `TerminalState` whose `foreground_pgid` is its own pid — which is exactly
+/// what `akuma_exec::process::write_to_process_stdin`'s ISIG branch reads, so a
+/// `^C` arriving on `/proc/<pid>/fd/0` is consumed by the terminal and raised as
+/// `SIGINT` on the session's process group instead of being handed to the shell
+/// as a `0x03` byte. The child's stdin **stays a pipe** ([`crate::fd::bind_stdio`]),
+/// and the bridge's bytes reach it through that same shared sink, which since
+/// 2026-09-11 delivers to a target whose fd 0 is a `PipeRead`.
+///
+/// What it does **not** buy, and the reason is worth stating rather than
+/// discovering: cooked input and echo. Those come from glue's `Stdin` read arm,
+/// which is reached only when fd 0 is a `FileDescriptor::Stdin`, and its echo
+/// goes to the *channel's stdout FIFO* — which on this target nothing drains,
+/// because a spawned child's stdout is a pipe and `sshd` reads that. Moving fd 0
+/// onto the channel therefore has to move fd 1/2 with it, which is a different
+/// piece (see the `ioctl` header in `crate::fd`).
+pub fn sys_spawn(
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    stdin_ptr: u64,
+    stdin_len: u64,
+    flags: u64,
+) -> u64 {
     use crate::fd::errno;
+
+    let pty = (flags & SPAWN_FLAG_PTY) != 0;
 
     let Some(path_bytes) = user_cstr(path_ptr, 256) else {
         return errno::EFAULT;
@@ -4388,6 +4449,31 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
         return errno::ENOMEM;
     };
 
+    // **The session channel** — see the header's `SPAWN_FLAG_PTY` section.
+    //
+    // Only for a pty spawn. It carries no data on this target: the child's
+    // stdin is `stdin_pipe` and its stdout is `stdout_pipe`, and both stay that
+    // way. What it carries is `is_terminal()`, which is the flag
+    // `write_to_process_stdin` gates its ISIG branch on — so this is the object
+    // that makes `^C` a signal on an `ssh` session.
+    //
+    // Deliberately **not** the console's channel and not the per-thread exit
+    // channel: three different things, and `AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md`
+    // §3 is the record of what confusing two of them cost.
+    //
+    // `Process::channel` is `clone`d by `inherit_from`, so everything the shell
+    // forks carries this same channel — which is right for a session, and is
+    // why a per-process interrupt flag must not live here
+    // (`AKUMA_AMD64_SIGNAL_DELIVERY.md` §5d).
+    let session_channel = pty.then(|| {
+        let ch = alloc::sync::Arc::new(akuma_exec::process::ProcessChannel::new());
+        // `ProcessChannel::new` already defaults this to `true`; stated rather
+        // than assumed, exactly as `console::init` states it, because it is the
+        // whole point of the object.
+        ch.set_terminal(true);
+        ch
+    });
+
     let pid = alloc_pid();
     // 5b slice 1: register the child with `akuma-exec`'s process table and
     // publish `task_slot → pid`, so `current_process_shared()` resolves for
@@ -4420,7 +4506,24 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
         // two concurrent sessions must not share one. Same rule as the AArch64
         // `pty` spawn (`akuma-exec`'s `spawn.rs`).
         None,
+        session_channel,
     );
+
+    // **The session's foreground process group.**
+    //
+    // `TerminalState::default()` seeds `foreground_pgid = 1`, which is `init`'s
+    // — so without this a `^C` on an ssh session would broadcast `SIGINT` at
+    // `init`'s group rather than at the session's. The AArch64 spawn sets the
+    // same field, for the same reason and unconditionally
+    // (`spawn_process_with_channel_ext`); a spawn's terminal state is fresh
+    // (the `None` above), so there is no caller's group to clobber.
+    //
+    // `kill_process_group` excludes the **leader**, so this names the shell and
+    // reaches everything the shell forks — which is the job that should die on
+    // `^C`, and not the shell running it.
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
+        proc.terminal_state.lock().foreground_pgid = pid;
+    }
 
     // SAFETY: raw-pointer write; single core.
     unsafe {
@@ -4435,7 +4538,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, st
     // schedule the child.
     crate::sched::publish_task(task_slot);
 
-    let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false, true);
+    let stdout_fd = crate::fd::alloc_child_stdout_fd(stdout_pipe);
     let Some(stdout_fd) = stdout_fd else {
         // The child is already running; it will just write into a pipe nobody
         // reads. Report the failure — `sshd` drops the session.
@@ -4568,17 +4671,21 @@ pub fn current_proc_slot() -> usize {
     }
 }
 
-/// The stdin pipe write end for pid `pid`, for `fd::sys_openat`'s
-/// `/proc/<pid>/fd/0` handling.
+/// The stdin pipe write end for pid `pid`, for [`sys_close_child_stdin`].
 ///
 /// Off the spawn row, not off the child's fd table, and the difference is the
-/// direction of the question. `sshd` is asking for the end **it** writes — the
-/// end no descriptor names — and the child's fd 0 is the *other* end. Reading
-/// the child's table for it would work only for as long as fd 0 still named
-/// that pipe: a shell that redirects its own stdin, or a child already past
-/// `close_all` on the exit path, would silently answer `ENOENT` to a
-/// bridge that is still live. The row outlives both, up to the reap.
-pub fn stdin_pipe_for_pid(pid: u32) -> Option<PipeId> {
+/// direction of the question. `sshd` is asking about the end **it** was
+/// writing — the end no descriptor names — and the child's fd 0 is the *other*
+/// end. Reading the child's table for it would work only for as long as fd 0
+/// still named that pipe: a shell that redirects its own stdin, or a child
+/// already past `close_all` on the exit path, would silently answer `ESRCH` to
+/// a bridge that is still live. The row outlives both, up to the reap.
+///
+/// It had a second caller — `fd::sys_openat`'s `/proc/<pid>/fd/0` — until
+/// 2026-09-11. The **data** path no longer needs it (the shared
+/// `write_to_process_stdin` finds the child's own fd 0); the **EOF** path still
+/// does, for exactly the reason above.
+fn stdin_pipe_for_pid(pid: u32) -> Option<PipeId> {
     // SAFETY: raw-pointer read; single core, no row mutated.
     unsafe {
         (*spawn_table())
@@ -4673,14 +4780,14 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     };
 
     // Drop the spawn's own writer reference on the child's stdin pipe — the
-    // one `sshd` reaches by path rather than by descriptor, so nothing else
-    // will. `close_write`, **not** the `pipe::free` this replaced: `free`
-    // destroys the pipe whatever the end counts say, and `sshd` may still hold
-    // an open `/proc/<pid>/fd/0` descriptor over it whose own close would then
-    // land on a stranger's pipe id. Letting the counts decide means the last
-    // end out destroys it, which is the rule every other pipe here follows. A
-    // `fork` child carries `None` and borrows its parent's, exactly as
-    // `borrowed_io` used to say.
+    // one no descriptor names, so nothing else will. `close_write`, **not** the
+    // `pipe::free` this replaced: `free` destroys the pipe whatever the end
+    // counts say, and a *reader* reference can still be live here (a zombie
+    // whose fd table is not yet torn down, a `fork` descendant that inherited
+    // fd 0) whose own close would then land on a reissued pipe id. Letting the
+    // counts decide means the last end out destroys it, which is the rule every
+    // other pipe here follows. A `fork` child carries `None` and borrows its
+    // parent's, exactly as `borrowed_io` used to say.
     if let Some(p) = stdin_pipe {
         pipe::close_write(p);
     }
@@ -4757,9 +4864,9 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 /// matters.
 ///
 /// **`pipe::close_write`, not `pipe::free`**, for the reason
-/// [`Spawn::stdin_pipe`]'s doc gives: `sshd` may still hold an open
-/// `/proc/<pid>/fd/0` over that pipe, and destroying it under that descriptor
-/// makes its eventual close land on a stranger's pipe id.
+/// [`Spawn::stdin_pipe`]'s doc gives: a reader reference on that pipe can
+/// outlive the row, and destroying the pipe under one makes its eventual close
+/// land on a reissued pipe id.
 fn sweep_reaped_spawn_rows() {
     for off in 0..SPAWN_SLOTS {
         // SAFETY: raw-pointer read under the BKL; nothing yields between the
@@ -4869,7 +4976,7 @@ pub fn spawn_test(t: &mut Suite) {
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("spawn: sys_spawn returned a handle", r < ERRNO_FLOOR) {
         return;
     }
@@ -5008,7 +5115,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("winsize: spawned a child to describe a terminal to", r < ERRNO_FLOOR) {
         return;
     }
@@ -5173,7 +5280,7 @@ pub fn busybox_test(t: &mut Suite) {
         a2a.as_ptr() as u64,
         0,
     ];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("busybox: spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -5239,7 +5346,7 @@ pub fn execve_test(t: &mut Suite) {
     // have yet.
     let (a0, a1a, a2a) = (b"sh\0", b"-c\0", b"uname -a\0");
     let argv: [u64; 4] = [a0.as_ptr() as u64, a1a.as_ptr() as u64, a2a.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("execve: sh spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -5292,7 +5399,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
     let path = b"/bin/sh\0";
     let (a0, adash) = (b"sh\0", b"-c\0");
     let argv: [u64; 4] = [a0.as_ptr() as u64, adash.as_ptr() as u64, cmd.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if r >= ERRNO_FLOOR {
         return None;
     }
@@ -5553,7 +5660,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("wait4: child spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -5597,7 +5704,7 @@ pub fn fork_test(t: &mut Suite) {
     let path = b"/bin/sh\0";
     let (a0, a1a, a2a) = (b"sh\0", b"-c\0", b"uname; echo DONE\0");
     let argv: [u64; 4] = [a0.as_ptr() as u64, a1a.as_ptr() as u64, a2a.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("fork: sh spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -5934,7 +6041,7 @@ pub fn identity_cost_test(t: &mut Suite) {
     let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
     let pid = alloc_pid();
     let task = crate::sched::current_task();
-    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None, None);
+    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None, None, None);
 
     if !t.check("identity: the running task resolves to its process", current_process().is_some()) {
         finish_test_process(pid, task);
@@ -6635,7 +6742,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // `run_process` reads init's entry point and stack out of this
     // registration, so publishing first would race a task with nowhere to start
     // against the register that gives it one.
-    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None);
+    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None, None);
     // **The console's producer**, started here and nowhere earlier.
     //
     // After the registration, so the channel it fills already belongs to a

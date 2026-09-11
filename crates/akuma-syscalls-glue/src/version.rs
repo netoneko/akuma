@@ -37,15 +37,70 @@
 //!
 //! Userspace unpacks with shifts; there is no ABI struct to keep in sync.
 
+/// **The kernel release. One literal, and everything that names a version
+/// reads it**: `uname -r`, this call's packed triple, and the amd64 banner.
+///
+/// Deliberately not `CARGO_PKG_VERSION`, and the reason is no longer only the
+/// ABI argument it used to be. `env!("CARGO_PKG_VERSION")` in a crate expands to
+/// *that crate's* version, so when `src/syscall/` became `akuma-syscalls-glue`
+/// on 2026-09-01 the `uname -r` arm in `proc.rs` silently stopped reporting the
+/// kernel (`0.0.7`) and started reporting the glue crate (`0.1.0`) — on both
+/// kernels, for ten days, with nothing to refuse it. Exactly the same class of
+/// break as `AKUMA_GIT_SHA`, which that move caught because it failed to
+/// compile; this one still compiled and just answered wrong.
+///
+/// A hand-maintained value is the right shape here (a routine `Cargo.toml` bump
+/// should not be a silent ABI change) — it simply has to be a value that
+/// *cannot* be a different crate's. Bump it here and nowhere else.
+pub const RELEASE: &str = "0.0.8";
+
 /// The version this call reports, as `[major, minor, patch]`.
 ///
-/// Deliberately independent of `CARGO_PKG_VERSION` (`0.0.7` at the time of
-/// writing) — this is a hand-maintained ABI value, not a mirror of the package
-/// version, and coupling them would make a routine `Cargo.toml` bump a silent
-/// ABI change. `uname -r` is where the package version is reported.
+/// Derived from [`RELEASE`] rather than written beside it: two hand-maintained
+/// spellings of one number is how `uname -r` and `akuma_get_version` would come
+/// to disagree, and the doc here used to say so out loud ("whoever changes one
+/// should look at the other"). Now there is only one to change.
+pub const VERSION_TRIPLE: [u8; 3] = parse_triple(RELEASE);
+
+/// Parse `"major.minor.patch"` into its three bytes, at compile time.
 ///
-/// Whoever changes one should look at the other.
-pub const VERSION_TRIPLE: [u8; 3] = [0, 0, 8];
+/// Deliberately strict — a component that is not a decimal number, a missing or
+/// extra dot, or a component above 255 is a **compile error**, not a `0`. This
+/// runs once per build on a literal in this file; a lenient parse would turn a
+/// typo into a plausible wrong version, which is the failure mode the whole
+/// const is here to remove.
+#[must_use]
+pub const fn parse_triple(s: &str) -> [u8; 3] {
+    let b = s.as_bytes();
+    let mut out = [0u8; 3];
+    let mut field = 0;
+    let mut acc: u32 = 0;
+    let mut digits = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            c @ b'0'..=b'9' => {
+                acc = acc * 10 + (c - b'0') as u32;
+                assert!(acc <= 255, "version component above 255");
+                digits += 1;
+            }
+            b'.' => {
+                assert!(digits > 0, "empty version component");
+                assert!(field < 2, "too many version components");
+                out[field] = acc as u8;
+                field += 1;
+                acc = 0;
+                digits = 0;
+            }
+            _ => panic!("version is not major.minor.patch"),
+        }
+        i += 1;
+    }
+    assert!(digits > 0, "empty version component");
+    assert!(field == 2, "too few version components");
+    out[2] = acc as u8;
+    out
+}
 
 /// The commit, as the numeric value of the abbreviated git SHA.
 ///
@@ -147,4 +202,37 @@ pub const fn parse_hex_prefix(s: &str) -> u32 {
 #[inline]
 pub(super) fn sys_akuma_get_version() -> u64 {
     AKUMA_VERSION
+}
+
+/// `parse_triple` is what makes [`RELEASE`] and [`VERSION_TRIPLE`] one fact
+/// instead of two, so it is worth a few cases of its own.
+///
+/// The rejection cases cannot be tested — they are `panic!`s in a `const fn`,
+/// which is a *compile* error at the one call site and not something a test can
+/// observe. That is the point of them; what is tested here is that the accepting
+/// path accepts what it should and puts the components in the right order, which
+/// is the failure a malformed-input check would not catch.
+#[cfg(test)]
+mod tests {
+    use super::{RELEASE, VERSION_TRIPLE, parse_triple};
+
+    #[test]
+    fn parses_the_shipped_release() {
+        assert_eq!(VERSION_TRIPLE, parse_triple(RELEASE));
+    }
+
+    #[test]
+    fn components_are_in_order() {
+        assert_eq!(parse_triple("1.2.3"), [1, 2, 3]);
+    }
+
+    #[test]
+    fn multi_digit_components() {
+        assert_eq!(parse_triple("10.255.0"), [10, 255, 0]);
+    }
+
+    #[test]
+    fn zeroes_are_not_special() {
+        assert_eq!(parse_triple("0.0.0"), [0, 0, 0]);
+    }
 }
