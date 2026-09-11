@@ -1287,8 +1287,31 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
            moved out of `fd.rs` and into the signal path.
         2. **INTR → SIGINT on the foreground group.** The pump delivers
            `^C` as a byte; the shared route that turns it into a signal
-           is `write_to_process_stdin`'s ISIG handling, which needs a
-           pid — i.e. a foreground-process notion this target lacks.
+           is `write_to_process_stdin`'s ISIG handling — so the pump
+           should call *that* rather than `write_stdin` directly, and
+           the ISIG branch, the `foreground_pgid` broadcast and the wake
+           all arrive for free. It needs a pid, which a tracked "the
+           console's process" supplies (pid 1 is always console-attached).
+           **Two prerequisites, both read off the tree 2026-09-11 and
+           both silent if missed** — this is occurrence seven and eight
+           of "the shared code reads something amd64 never populated":
+             a. `deliver_signal` collects its target tids from
+                `Process::thread_id`, and every amd64 process registers
+                `thread_id: None` **deliberately** (`register_exec_process`
+                says why: this target's task lifecycle is `sched.rs`'s and
+                identity comes from `THREAD_PID_MAP`). So `all_tids` is
+                empty, nothing is pended, nothing is woken — and
+                `deliver_signal` still returns `true`, so `sys_kill` would
+                report success. Populating it is not free: it is what puts
+                `unregister_process`'s thread-termination arm back in this
+                target's path.
+             b. `interrupt_thread(tid)` sets the flag on
+                `get_channel(tid)` — which here is the **exit** channel —
+                while `is_current_interrupted()` reads `Process::channel`
+                first, which for a console process is the **console**
+                channel. Two channels per process is this target's own
+                shape (`AKUMA_AMD64_CONSOLE_PROCESSCHANNEL.md` §3), and
+                the flag would land on the one nobody reads.
         3. **an sshd session's child's `ProcessChannel`** — the deferred
            `/proc/<pid>/fd/0` + `delegate_pid` item, still the last
            reason `ioctl` carries a fake-tty preamble, and what would
