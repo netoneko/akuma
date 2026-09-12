@@ -259,10 +259,21 @@ fn runtime() -> ExecRuntime {
         // `akuma-exec`'s process table is not built here (C1 step 5), so no
         // process it knows about can exit.
         on_process_exit: |_pid| {},
-        // ITIMER_REAL/alarm expiry, driven from the tick. This target has no
-        // itimers at all — that is C3 (`clock.rs`) — and nothing arms one, so
-        // there is never an expiry to check.
-        check_itimers: || {},
+        // ITIMER_REAL/`alarm` expiry. Wired with C3 (2026-09-12): `setitimer`
+        // and `alarm` reach `akuma-syscalls-time`'s timer state now, so there
+        // *is* an expiry to check, and this is the function that delivers
+        // SIGALRM for it.
+        //
+        // The AArch64 kernel reaches it through `akuma_exec::alarms::
+        // on_timer_interrupt`, which also services the async waker queue this
+        // target does not have. `idt::timer_dispatch` calls it directly for
+        // that reason — and because the waker queue's `Spinlock` would then be
+        // taken from an IRQ handler on a core that might already hold it. The
+        // row is still filled in rather than left a no-op: a table whose
+        // entries disagree with what the kernel actually does is how five
+        // `ProcessHooks` rows kept stale `false`s for months
+        // (`docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`).
+        check_itimers: akuma_syscalls_glue::check_itimers,
         // Containers are not built for this target: there is no box table and
         // `sc-containers` is not in its feature set, so no namespace exists to
         // return and nothing can set one.

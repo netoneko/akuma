@@ -49,24 +49,30 @@
 
 use akuma_net::socket::socket_const::SOCK_DGRAM;
 use akuma_net::socket::SocketAddrV4;
+use akuma_primitives::clock as wall;
 use akuma_sntp::boot::{bootstrap_over_udp, BootstrapEffects};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::serial;
 
-/// Unix epoch microseconds at the instant [`ANCHOR_UPTIME_US`] was read.
-/// `0` means "never synced" — see [`is_synced`]. Never legitimately `0`
-/// itself (that would be 1970-01-01T00:00:00Z, not a value SNTP will ever
-/// hand back for the present day), so the sentinel cannot collide with a
-/// real reading.
-static ANCHOR_UNIX_US: AtomicU64 = AtomicU64::new(0);
-/// [`net::uptime_us`] at the same instant as `ANCHOR_UNIX_US`.
-static ANCHOR_UPTIME_US: AtomicU64 = AtomicU64::new(0);
+// ---------------------------------------------------------------------------
+// The anchor is `akuma_primitives::clock`'s, not this file's (C3, 2026-09-12).
+//
+// It used to be a private `(ANCHOR_UNIX_US, ANCHOR_UPTIME_US)` pair right
+// here, and that pair was the whole C3 problem in one object: this file wrote
+// it, `fd.rs`'s and `boot.rs`'s `utc_time_us` hooks read it, and
+// `akuma-syscalls-time` — which serves `clock_gettime`/`clock_settime`/
+// `adjtimex` for the *other* kernel — read a different one. So folding the
+// time syscalls in would have given ring 3 a clock nothing on this target
+// ever set. One static now, in the crate both kernels already share, and
+// there is nothing left here to disagree with.
+// ---------------------------------------------------------------------------
 
-/// Has [`sync_via_sntp`] ever succeeded?
+/// Has the wall clock ever been set — by [`sync_via_sntp`] here, or by
+/// `clock_settime`/`settimeofday`/`adjtimex` from ring 3?
 #[must_use]
 pub fn is_synced() -> bool {
-    ANCHOR_UNIX_US.load(Ordering::Relaxed) != 0
+    wall::is_utc_set()
 }
 
 /// Current wall-clock time, in microseconds since the Unix epoch. `0` if
@@ -75,13 +81,7 @@ pub fn is_synced() -> bool {
 /// plausible-looking but wrong value.
 #[must_use]
 pub fn now_us() -> u64 {
-    let anchor_unix = ANCHOR_UNIX_US.load(Ordering::Relaxed);
-    if anchor_unix == 0 {
-        return 0;
-    }
-    let anchor_uptime = ANCHOR_UPTIME_US.load(Ordering::Relaxed);
-    let elapsed = crate::net::uptime_us().saturating_sub(anchor_uptime);
-    anchor_unix.saturating_add(elapsed)
+    wall::utc_time_us(crate::net::uptime_us()).unwrap_or(0)
 }
 
 /// As [`now_us`], in whole seconds — for `net.rs`'s `NetRuntime::utc_seconds`
@@ -98,24 +98,25 @@ pub fn utc_seconds() -> Option<u64> {
 
 /// Set the wall clock, in microseconds since the Unix epoch.
 ///
-/// The write half of [`now_us`], for `clock_settime`/`settimeofday` from ring
-/// 3 — which is how `busybox ntpd -q` sets the time, and therefore how this
-/// machine gets a usable clock when the kernel's own [`sync_via_sntp`] does not
-/// manage it. Both paths anchor the same pair, so whichever runs last wins and
-/// nothing has to know which.
+/// The write half of [`now_us`], for the x86-only `settimeofday`/`time` ABI
+/// spellings that have no asm-generic number and therefore stay in
+/// `usermode.rs` as shims. `clock_settime` and `adjtimex` do not come through
+/// here any more — they are glue's since C3 — but they write the same static,
+/// so whichever path runs last wins and nothing has to know which.
 ///
-/// `0` is rejected rather than stored: it is [`is_synced`]'s "never" sentinel,
-/// and a caller asking to set the clock to 1970-01-01T00:00:00Z is either
-/// confused or reporting a failure as a time.
+/// `0` is still rejected. It is no longer a sentinel — the shared anchor has
+/// its own, so 1970-01-01T00:00:00Z is representable — but the other half of
+/// the reason stands on its own: a caller asking for the epoch is reporting a
+/// failure as a time, and storing it would make [`is_synced`] answer true for
+/// a machine that does not know what year it is.
 pub fn set_unix_us(us: u64) {
     if us == 0 {
         return;
     }
-    // Uptime first: if it were read second, everything between the two reads
-    // would be silently added to the wall clock.
+    // Uptime first, then anchor to it: read the other way round, everything
+    // between the two reads is silently added to the wall clock.
     let uptime = crate::net::uptime_us();
-    ANCHOR_UPTIME_US.store(uptime, Ordering::Relaxed);
-    ANCHOR_UNIX_US.store(us, Ordering::Relaxed);
+    wall::set_utc_time_us(us, uptime);
 }
 
 /// SNTP server. A public pool rather than a fixed IP: `pool.ntp.org` round-
@@ -342,8 +343,12 @@ fn attempt_sntp(timeout_us: u64) -> SyncOutcome {
 
     match result {
         Ok(r) => {
-            ANCHOR_UNIX_US.store(r.unix_epoch_us.max(1), Ordering::Relaxed);
-            ANCHOR_UPTIME_US.store(r.anchor_uptime_us, Ordering::Relaxed);
+            // `anchor_uptime_us` is the uptime SNTP sampled at *packet
+            // receipt*, not now — anchoring at now would add the parse to the
+            // clock. `.max(1)` is gone with the old `0`-means-unset sentinel:
+            // the shared anchor has its own, so a reply really claiming the
+            // epoch is now storable and `is_utc_set` still answers true.
+            wall::set_utc_time_us(r.unix_epoch_us, r.anchor_uptime_us);
             SyncOutcome::Ok
         }
         Err(_) => SyncOutcome::NoReply,

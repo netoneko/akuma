@@ -523,6 +523,13 @@ fn enter_handler(
     }
     threading::or_thread_signal_mask(add);
     threading::note_delivered_signal(tid, sig);
+    // The interrupt bit has done its job: this signal has reached userspace.
+    // Without this, the **next syscall the program makes** — any syscall,
+    // including ones that cannot block — answers `EINTR` from glue's prologue,
+    // because nothing consumed a flag raised for a blocking wait the thread
+    // was never in. Measured here with `alarm(1); pause(); getpid()`, which
+    // returned `-4`. See `akuma_exec::process::signal_frame_installed`.
+    akuma_exec::process::signal_frame_installed(tid);
     DELIVERED.fetch_add(1, Ordering::Relaxed);
 }
 

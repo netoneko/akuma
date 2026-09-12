@@ -325,31 +325,14 @@ pub fn uptime_us() -> u64 {
 // UTC offset + PL031 RTC
 // ============================================================================
 
-/// UTC offset in microseconds since the Unix epoch, or [`UTC_OFFSET_UNSET`].
-///
-/// A lock-free atomic rather than a `Spinlock<Option<u64>>`: the value is one
-/// scalar with no other state published alongside it, and the read path is
-/// reachable from a BKL-free syscall window (`futex(FUTEX_WAIT_BITSET|
-/// CLOCK_REALTIME)` converts its absolute wall-clock deadline through this).
-/// `UNSET` encodes the old `None` — a real offset is a Unix-epoch microsecond
-/// count (~1.7e15), unreachable by four orders of magnitude.
-const UTC_OFFSET_UNSET: u64 = u64::MAX;
-static UTC_OFFSET_US: AtomicU64 = AtomicU64::new(UTC_OFFSET_UNSET);
-
-/// Record the current instant as Unix epoch `unix_epoch_us`.
-#[inline]
-pub fn set_utc_time_us(unix_epoch_us: u64, boot_uptime_us: u64) {
-    UTC_OFFSET_US.store(unix_epoch_us.saturating_sub(boot_uptime_us), Ordering::Release);
-}
-
-/// Current UTC in microseconds since the epoch, or `None` if never set.
-#[inline]
-pub fn utc_time_us(boot_uptime_us: u64) -> Option<u64> {
-    match UTC_OFFSET_US.load(Ordering::Acquire) {
-        UTC_OFFSET_UNSET => None,
-        off => Some(off.wrapping_add(boot_uptime_us)),
-    }
-}
+// The UTC offset used to live here. It is `akuma_primitives::clock`'s since
+// 2026-09-12 (C3), and moved for one reason: this crate is the **AArch64**
+// generic timer — CNTVCT, CNTV_CVAL, the PL031 — and the amd64 kernel cannot
+// depend on it to hold the wall clock, so it kept a second anchor of its own
+// and the shared time syscalls read neither. See that module's header. The
+// two callers here (`akuma-kernel-core`'s `timer`/`ntp_boot`) name the new
+// home directly rather than going through a forwarder: one spelling, so a
+// future reader cannot find the offset in two places again.
 
 /// QEMU virt PL031 RTC at 0x0901_0000, reached via the kernel's fixed device
 /// mapping. Only the raw seconds read lives here; presentation stays in the

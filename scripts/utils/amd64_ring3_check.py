@@ -44,6 +44,13 @@ What it checks, and why each part is there:
   boot suite runs inside the kernel, on init's task, where none of that exists.
   Rungs 6 and 7 re-send the signal while polling `waitpid`, so a kernel with no
   delivery at all reports a rung number instead of hanging the run.
+* **`/probes/clockprobe`** — all eleven rungs, the probe that pins the time
+  family (C3, 2026-09-12). It is here rather than in the boot suite because the
+  suite runs with the LAPIC timer stopped, so nothing in it can prove that a
+  clock *moves*, that a `nanosleep` sleeps, or that an `alarm` fires. Its
+  second rung is the C3 property itself: `gettimeofday`, `time(2)` and
+  `clock_gettime(CLOCK_REALTIME)` must be one clock, which on this target they
+  were not — two anchors, each internally plausible.
 
 # Usage
 
@@ -188,13 +195,13 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
-    for probe in ("grandfork", "sigprobe"):
+    for probe in ("grandfork", "sigprobe", "clockprobe"):
         subprocess.run([CC, "-static", "-O2", "-o", str(OUTDIR / probe),
                         str(PROBE_SRC / f"{probe}.c")], check=True)
     if not os.path.exists(IMG):
         subprocess.run(["sh", os.path.join(REPO, "amd64", "mkdisk.sh"), IMG, "128"],
                        cwd=REPO, check=True, capture_output=True)
-    inject_local(IMG, OUTDIR, ["grandfork", "sigprobe"])
+    inject_local(IMG, OUTDIR, ["grandfork", "sigprobe", "clockprobe"])
 
     proc, lines = boot(a.smp, a.ssh_port, a.http_port)
     ok = True
@@ -252,6 +259,11 @@ def main(argv=None):
         rc, sp = ssh(a.ssh_port, "/probes/sigprobe", timeout=180)
         print(f"sigprobe: rc={rc}")
         print("\n".join("  | " + l for l in sp.strip().splitlines()[-14:]))
+        ok = ok and rc == 0
+
+        rc, cp = ssh(a.ssh_port, "/probes/clockprobe", timeout=180)
+        print(f"clockprobe: rc={rc}")
+        print("\n".join("  | " + l for l in cp.strip().splitlines()[-14:]))
         ok = ok and rc == 0
     finally:
         if not a.keep:

@@ -646,7 +646,6 @@ dependencies = [
  "akuma-primitives",
  "akuma-sntp",
  "akuma-syscalls-linux",
- "akuma-timer",
  "log",
 ]
 

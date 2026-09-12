@@ -13,9 +13,11 @@
 //! (`docs/archive/MISSING_NTP_SYSCALLS.md`). Everything here used to be
 //! bin-crate-private, but nothing in it actually needs the bin crate: the two
 //! `crate::timer::{utc_time_us, uptime_us}` wrappers it used to call are thin
-//! forwarders to `akuma_timer` (kept as bin-crate re-exports for the ~190
-//! other call sites, see `src/timer.rs`), so this crate calls `akuma_timer`
-//! directly instead; the one diagnostic print goes through the `log` facade
+//! forwarders (see `src/timer.rs`), so this crate reads the clock directly
+//! instead — `akuma_timer`'s until 2026-09-12 and `akuma_primitives::clock`'s
+//! since, which is what made the family work on a second architecture (C3;
+//! `docs/archive/AKUMA_AMD64_C3_CLOCK.md`). The one diagnostic print goes
+//! through the `log` facade
 //! (`akuma-net`'s pattern — see `src/klog.rs`) instead of `crate::safe_print!`.
 //! Everything else it touches (`akuma_exec::threading`, `akuma_exec::process`,
 //! `akuma_exec::process::user_access`, `akuma_primitives::errno`) was already a
@@ -39,6 +41,13 @@
 // call site is unaffected.
 pub use akuma_sntp::{boot, sntp};
 
+// **The clock seam.** Not `akuma_timer::*`, which is what this crate called
+// until 2026-09-12 and which is `0` on every target that is not AArch64 — see
+// `akuma_primitives::clock`'s header for the whole argument. `uptime_us` is
+// the boot-registered monotonic hook (the AArch64 kernel registers
+// `akuma_timer::uptime_us` itself, so nothing changed there); the UTC anchor
+// is the one static both kernels write.
+use akuma_primitives::clock::{set_utc_time_us, uptime_us, utc_time_us};
 use akuma_exec::process::user_access::{copy_to_user, read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL};
@@ -104,7 +113,7 @@ use akuma_syscalls_linux::{Itimerval, Timespec, Timeval, Timex};
 /// with `SA_RESTART` that expects its own blocking syscalls to keep running
 /// after each tick — docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md.
 pub fn check_itimers() {
-    let now = akuma_timer::uptime_us();
+    let now = uptime_us();
     for tid in 0..MAX_THREADS {
         let (deadline, interval) = akuma_exec::threading::get_itimer(tid);
         if deadline > 0 && now >= deadline {
@@ -134,10 +143,30 @@ pub fn check_itimers() {
 /// actual decision, keyed on SIGALRM's disposition, is
 /// [`SignalAction::wants_itimer_force_interrupt`] — host-tested there since
 /// this module isn't (kernel-binary-only, no `cargo test` target).
+///
+/// # `try_lock`, and why the default covers it
+///
+/// [`check_itimers`] runs in **timer-IRQ context** on whichever core took the
+/// tick, and `signal_actions.actions` is a plain `Spinlock` with no IRQ
+/// masking on its holders. A tick landing on a core that is inside
+/// `rt_sigaction` for the same process would therefore spin forever on a lock
+/// this core already owns — a hang, in an interrupt handler, on a window
+/// measured in a few instructions. So the hold is attempted, never waited on:
+/// a contended read falls back to the same `true` this function already
+/// returns when there is no process context at all, which costs an
+/// `SA_RESTART` handler one un-restarted syscall in a window it can only lose
+/// by racing its own `sigaction` call.
+///
+/// Made a `try_lock` with the amd64 fold (C3, 2026-09-12). The AArch64 kernel
+/// has driven this from its tick since the itimer work landed and has not hit
+/// it; the window is narrow, not absent, and the amd64 tick reaches the same
+/// code from a handler that runs with `IF` clear.
 fn wants_force_interrupt(tid: usize) -> bool {
     let Some(pid) = akuma_exec::process::find_pid_by_thread(tid) else { return true };
     let Some(proc) = akuma_exec::process::lookup_process_shared(pid) else { return true };
-    let action = { let actions = proc.signal_actions.actions.lock(); actions[13] }; // SIGALRM(14) - 1
+    let Some(actions) = proc.signal_actions.actions.try_lock() else { return true };
+    let action = actions[13]; // SIGALRM(14) - 1
+    drop(actions);
     action.wants_itimer_force_interrupt()
 }
 
@@ -159,7 +188,7 @@ pub fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
     // Write old timer state if requested
     if old_ptr != 0 {
         let (old_deadline, old_interval) = akuma_exec::threading::get_itimer(tid);
-        let now = akuma_timer::uptime_us();
+        let now = uptime_us();
         let remaining = old_deadline.saturating_sub(now);
         let old = Itimerval {
             it_interval: Timeval::from_bits(old_interval / 1_000_000, old_interval % 1_000_000),
@@ -182,7 +211,7 @@ pub fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
         let interval_us = int_sec.saturating_mul(1_000_000) + int_usec;
         let value_us = val_sec.saturating_mul(1_000_000) + val_usec;
 
-        let now = akuma_timer::uptime_us();
+        let now = uptime_us();
         if value_us > 0 {
             akuma_exec::threading::set_itimer(tid, now.saturating_add(value_us), interval_us);
         } else {
@@ -192,6 +221,52 @@ pub fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
     }
 
     0
+}
+
+/// `alarm(2)` — arm `ITIMER_REAL` for `seconds`, return the seconds left on
+/// whatever alarm was already running (`0` if none). `alarm(0)` cancels.
+///
+/// # Why this is a syscall here and not a libc wrapper
+///
+/// musl's `alarm(3)` is `SYS_alarm` on any architecture whose table has the
+/// number and a `setitimer` wrapper on any that does not. asm-generic — which
+/// is what the AArch64 kernel dispatches — does not have it, so that kernel
+/// has never needed this and serves `alarm(3)` through [`sys_setitimer`].
+/// x86_64 has it at 37, so the amd64 kernel gets the raw syscall and answered
+/// `ENOSYS` to it until C3 (2026-09-12).
+///
+/// It takes and returns plain integers — no user memory, no `itimerval` — so
+/// it lives here beside the timer state it edits rather than being open-coded
+/// in the one kernel whose ABI needs it.
+///
+/// Rounds the remaining time **up**, as Linux does: a caller told `0` would
+/// read that as "no alarm was pending", so an alarm with 1 µs left must report
+/// `1`.
+#[must_use]
+pub fn sys_alarm(seconds: u64) -> u64 {
+    let tid = akuma_exec::threading::current_thread_id();
+    if tid >= MAX_THREADS {
+        return 0;
+    }
+    let now = uptime_us();
+
+    let (old_deadline, _old_interval) = akuma_exec::threading::get_itimer(tid);
+    // `saturating_sub`, so a deadline already passed but not yet swept by
+    // `check_itimers` reports `0` — "no alarm pending" — rather than wrapping
+    // to ~584 000 years, which `div_ceil` below would report as `u64::MAX`
+    // seconds left.
+    let remaining = old_deadline.saturating_sub(now);
+
+    // `alarm` is always one-shot: a periodic `setitimer` interval it replaces
+    // is cancelled, which is what Linux does too (the two share one timer).
+    if seconds == 0 {
+        akuma_exec::threading::set_itimer(tid, 0, 0);
+    } else {
+        let deadline = now.saturating_add(seconds.saturating_mul(1_000_000));
+        akuma_exec::threading::set_itimer(tid, deadline, 0);
+    }
+
+    remaining.div_ceil(1_000_000)
 }
 
 /// `CLOCK_REALTIME`, the only clock id `clock_settime`/`clock_adjtime` accept
@@ -235,10 +310,10 @@ pub fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     let clock_id = clock_id_arg as u32;
 
     let (sec, nsec) = if clock_id == 0 {
-        let us = akuma_timer::utc_time_us(akuma_timer::uptime_us()).unwrap_or(0);
+        let us = utc_time_us(uptime_us()).unwrap_or(0);
         ((us / 1_000_000) as u64, ((us % 1_000_000) * 1_000) as u64)
     } else {
-        let us = akuma_timer::uptime_us();
+        let us = uptime_us();
         ((us / 1_000_000), ((us % 1_000_000) * 1_000))
     };
 
@@ -295,7 +370,7 @@ pub fn sys_clock_settime(clock_id: u32, tp_ptr: u64) -> u64 {
     if read_user_into(&mut ts, tp_ptr).is_err() {
         return EFAULT;
     }
-    akuma_timer::set_utc_time_us(ts.to_us(), akuma_timer::uptime_us());
+    set_utc_time_us(ts.to_us(), uptime_us());
     0
 }
 
@@ -348,7 +423,7 @@ pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
 
     // Report current state back. No leap-second/frequency tracking, so every
     // read-only field besides `time` stays at its zeroed default.
-    let now_us = akuma_timer::utc_time_us(akuma_timer::uptime_us()).unwrap_or(0);
+    let now_us = utc_time_us(uptime_us()).unwrap_or(0);
     tx.time_sec = (now_us / 1_000_000).cast_signed();
     tx.time_usec = if nano {
         ((now_us % 1_000_000) * 1000).cast_signed()
@@ -372,10 +447,10 @@ pub fn sys_adjtimex(buf_ptr: u64) -> u64 {
 /// and guessing an anchor would fabricate a wrong absolute time instead of
 /// leaving it honestly unset.
 fn step_utc_by(delta_us: i64) {
-    let uptime = akuma_timer::uptime_us();
-    if let Some(now_us) = akuma_timer::utc_time_us(uptime) {
+    let uptime = uptime_us();
+    if let Some(now_us) = utc_time_us(uptime) {
         let new_us = now_us.cast_signed().saturating_add(delta_us).max(0).cast_unsigned();
-        akuma_timer::set_utc_time_us(new_us, uptime);
+        set_utc_time_us(new_us, uptime);
     }
 }
 
@@ -397,14 +472,23 @@ pub fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
     let mut ts = Timespec::default();
     let total_us = if a0 >= 4096 && read_user_into(&mut ts, a0).is_ok() {
+        // Linux's `EINVAL`, applied to the *Linux* ABI only: the libakuma
+        // spelling below passes raw `u64`s, where a "negative" second count is
+        // not a thing a caller can have meant. Added with the amd64 fold (C3,
+        // 2026-09-12) — that kernel's own arm checked it and the shared one
+        // did not, so folding without this would have traded an `EINVAL` for a
+        // ~584 000-year park. See `Timespec::is_valid_interval`.
+        if !ts.is_valid_interval() {
+            return EINVAL;
+        }
         ts.to_us()
     } else {
         Timespec::from_bits(a0, a1).to_us()
     };
     if total_us == 0 { return 0; }
-    let deadline = akuma_timer::uptime_us().saturating_add(total_us);
+    let deadline = uptime_us().saturating_add(total_us);
     loop {
-        if akuma_timer::uptime_us() >= deadline { return 0; }
+        if uptime_us() >= deadline { return 0; }
         if akuma_exec::process::should_interrupt_blocking_syscall() {
             return akuma_primitives::errno::negated::EINTR;
         }
@@ -437,6 +521,12 @@ pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_p
     if read_user_into(&mut ts, request_ptr).is_err() {
         return EFAULT;
     }
+    // As `sys_nanosleep`: a malformed interval is Linux's `EINVAL`, not an
+    // unbounded park. Applies to the absolute form too — `TIMER_ABSTIME` with
+    // `tv_nsec = -1` is equally malformed, and Linux refuses it there as well.
+    if !ts.is_valid_interval() {
+        return EINVAL;
+    }
     let req_us = ts.to_us();
 
     let deadline = if flags & TIMER_ABSTIME != 0 {
@@ -445,9 +535,9 @@ pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_p
         // `sys_futex`'s FUTEX_CLOCK_REALTIME absolute-deadline conversion in
         // `src/syscall/sync.rs` — same wall-clock-to-uptime math, different caller.
         if clock_id == 0 {
-            match akuma_timer::utc_time_us(akuma_timer::uptime_us()) {
-                Some(utc_now) if req_us > utc_now => akuma_timer::uptime_us() + (req_us - utc_now),
-                Some(_) => akuma_timer::uptime_us(), // already past -> immediate return
+            match utc_time_us(uptime_us()) {
+                Some(utc_now) if req_us > utc_now => uptime_us() + (req_us - utc_now),
+                Some(_) => uptime_us(), // already past -> immediate return
                 None => req_us,
             }
         } else {
@@ -456,11 +546,11 @@ pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_p
     } else {
         // Relative sleep, same as plain nanosleep.
         if req_us == 0 { return 0; }
-        akuma_timer::uptime_us().saturating_add(req_us)
+        uptime_us().saturating_add(req_us)
     };
 
     loop {
-        if akuma_timer::uptime_us() >= deadline { return 0; }
+        if uptime_us() >= deadline { return 0; }
         if akuma_exec::process::should_interrupt_blocking_syscall() {
             return akuma_primitives::errno::negated::EINTR;
         }
@@ -475,7 +565,7 @@ pub fn sys_times(buf_ptr: usize) -> u64 {
         let zero = [0u8; TMS_SIZE];
         if copy_to_user(buf_ptr as u64, &zero).is_err() { return EFAULT; }
     }
-    let uptime_us = akuma_timer::uptime_us();
+    let uptime_us = uptime_us();
     uptime_us / 10_000
 }
 
@@ -489,7 +579,7 @@ pub fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
 }
 
 #[must_use] 
-pub fn sys_time() -> u64 { akuma_timer::utc_time_us(akuma_timer::uptime_us()).unwrap_or(0) }
+pub fn sys_time() -> u64 { utc_time_us(uptime_us()).unwrap_or(0) }
 
 #[must_use] 
-pub fn sys_uptime() -> u64 { akuma_timer::uptime_us() }
+pub fn sys_uptime() -> u64 { uptime_us() }

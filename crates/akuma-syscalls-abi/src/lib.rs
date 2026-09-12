@@ -346,10 +346,28 @@ syscall_table! {
     // ── time ───────────────────────────────────────────────────────────────
     // `gettimeofday`(96), `settimeofday`(164) and `time`(201) are x86-only and
     // are absent by rule 2.
-    Nanosleep     => NANOSLEEP      = 35,  nr::NANOSLEEP;
-    ClockGettime  => CLOCK_GETTIME  = 228, nr::CLOCK_GETTIME;
-    ClockSettime  => CLOCK_SETTIME  = 227, nr::CLOCK_SETTIME;
-    Adjtimex      => ADJTIMEX       = 159, nr::ADJTIMEX;
+    // `alarm`(37) is x86-only too, and is the one absence with a consequence
+    // worth naming: musl spells `alarm(3)` as `SYS_alarm` where the number
+    // exists and as `setitimer` where it does not, so the aarch64 kernel
+    // serves it through `Setitimer` below and this one needs a shim. See
+    // `akuma_syscalls_glue::sys_alarm`.
+    Nanosleep      => NANOSLEEP       = 35,  nr::NANOSLEEP;
+    ClockGettime   => CLOCK_GETTIME   = 228, nr::CLOCK_GETTIME;
+    ClockSettime   => CLOCK_SETTIME   = 227, nr::CLOCK_SETTIME;
+    Adjtimex       => ADJTIMEX        = 159, nr::ADJTIMEX;
+    // Added with C3 (2026-09-12). Every one of these had a working
+    // implementation in `akuma-syscalls-time` and no number to reach it by on
+    // this architecture, so each was an `ENOSYS` the other kernel does not
+    // have. `clock_adjtime` is the widest crossing in the block — x86_64 305
+    // against asm-generic 266 — and 305 is `akuma_syscalls_linux::nr::TIME`,
+    // an Akuma-private number, which is exactly the wrong-arm-not-no-arm
+    // failure this table exists to make impossible.
+    ClockGetres    => CLOCK_GETRES    = 229, nr::CLOCK_GETRES;
+    ClockNanosleep => CLOCK_NANOSLEEP = 230, nr::CLOCK_NANOSLEEP;
+    ClockAdjtime   => CLOCK_ADJTIME   = 305, nr::CLOCK_ADJTIME;
+    Setitimer      => SETITIMER       = 38,  nr::SETITIMER;
+    Times          => TIMES           = 100, nr::TIMES;
+    Getrusage      => GETRUSAGE       = 98,  nr::GETRUSAGE;
 
     // ── machine / misc ─────────────────────────────────────────────────────
     /// x86_64 63 is `uname` and asm-generic 63 is `read`. Of every crossing in

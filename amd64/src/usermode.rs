@@ -1231,6 +1231,23 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             );
             return 0;
         }
+        // `alarm(seconds)` — x86_64 37, x86-only. asm-generic has no `alarm`,
+        // so musl on *that* architecture spells `alarm(3)` as a `setitimer`
+        // pair and the other kernel never sees this number; here musl emits
+        // the raw syscall, and it was `ENOSYS` until C3.
+        //
+        // Served by the crate that owns the itimer state rather than by a
+        // local copy: it takes and returns plain seconds, so no `itimerval`
+        // has to be marshalled through user memory to reach the same three
+        // atomics `setitimer` writes.
+        37 => return akuma_syscalls_glue::sys_alarm(a1),
+        // `pause()` — x86_64 34, x86-only, and `alarm`'s other half: musl
+        // emits the raw syscall here and `ppoll(0,0,0,0)` on asm-generic, so
+        // the other kernel has never needed a number for it and this one
+        // answered `ENOSYS` to the oldest idiom in POSIX. Found by
+        // `/probes/clockprobe` rung 8, which armed an `alarm` correctly and
+        // then did not wait for it.
+        34 => return akuma_syscalls_glue::sys_pause(),
         // `gettimeofday(*timeval, *timezone)` — x86_64 96. `timezone` (a2)
         // is always NULL from every real caller and is not consulted.
         96 => {
@@ -1446,76 +1463,39 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // regardless — so a `RDRAND` that ran out of entropy handed ring 3 a
         // buffer whose tail was kernel stack and called it random.
         Syscall::Getrandom => to_glue(call, [a1, a2, a3, a4, a5, a6]),
-        // `nanosleep(req, rem)`.
+        // `nanosleep(req, rem)` — **glue's** (C3, 2026-09-12).
         //
-        // This was a bare `yield_now()` — "no high-resolution sleep: this
-        // target has a coarse, uncalibrated clock", which is true and was the
-        // wrong conclusion. A `nanosleep` that returns immediately is not a
-        // coarse sleep, it is **no sleep**, and every program that uses one to
-        // sequence against another thread silently loses its ordering.
+        // This was a bare `yield_now()` until 2026-09-06 — "no high-resolution
+        // sleep: this target has a coarse, uncalibrated clock", which is true
+        // and was the wrong conclusion. A `nanosleep` that returns immediately
+        // is not a coarse sleep, it is **no sleep**, and every program that
+        // uses one to sequence against another thread silently loses its
+        // ordering. (Found by `scripts/futex_suite.py`'s `futexops`, which
+        // reported a requeue bug that did not exist: the probe `nanosleep`s
+        // three times for a second each and all three returned at once, so of
+        // course the 400 ms park had not fired. The futex was correct and the
+        // clock the probe steered by was not moving.)
         //
-        // Found 2026-09-06 by `scripts/futex_suite.py`'s `futexops`, which
-        // reported a requeue bug that did not exist: the probe parks a thread
-        // with a 400 ms timeout, then `nanosleep`s three times for a second
-        // each and checks whether it fired. All three returned at once, ~0 ms
-        // of guest time in, so of course it had not. The futex was correct and
-        // the clock the probe was steering by was not moving.
+        // What replaced it was a yield-spin with `allow_tick`, and what
+        // replaces *that* is `akuma_syscalls_time::sys_nanosleep`, which parks
+        // the thread WAITING against a deadline (`schedule_blocking`) instead
+        // of spinning — its x86 arm is the same `yield`-then-`allow_tick`
+        // sequence, reached only when nothing else can take the core, and
+        // `x86_wake_pass` is what readies the sleeper at the deadline.
         //
-        // So: sleep for real, to the 10 ms tick this target's clock has.
-        // `allow_tick` is what makes the deadline reachable at all — see its
-        // own comment; without it a sleeper spinning while any other task also
-        // spins in the kernel freezes the very counter it is waiting on.
-        Syscall::Nanosleep => {
-            let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(a1) else {
-                return errno::EFAULT;
-            };
-            if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-                return errno::EINVAL;
-            }
-            let want_us = (sec.cast_unsigned())
-                .saturating_mul(1_000_000)
-                .saturating_add(nsec.cast_unsigned() / 1000);
-            let deadline = crate::net::uptime_us().saturating_add(want_us);
-            while crate::net::uptime_us() < deadline {
-                crate::sched::yield_now();
-                crate::sched::allow_tick();
-                // A thread whose group is exiting must not finish its nap
-                // first: `thread::drain` is waiting on it. Same argument as the
-                // futex wait loop's own check, and the same errno.
-                if crate::thread::should_leave_now() {
-                    return errno::EINTR;
-                }
-                // **A signal ends the nap**, the same check
-                // `akuma_syscalls_time::sys_nanosleep` makes on the other
-                // kernel: the deferred-kill bit, the Ctrl-C / `sys_kill` bit
-                // and the per-thread `pthread_kill` set, minus `SA_RESTART`
-                // handlers (which want the loop to take another pass).
-                //
-                // Without it this loop checked **only** group exit, and the
-                // comment that used to sit below said so — "this one cannot be
-                // interrupted". That made `^C` on a sleeping foreground job a
-                // no-op until the sleep ran out on its own: the SIGINT stayed
-                // pending and was taken at the return to ring 3, so a
-                // `sleep 30` died 30 seconds after the keystroke.
-                //
-                // It looked fixed under QEMU/TCG for a measurement's worth of
-                // time and was not: this target's `uptime_us` is LAPIC ticks
-                // x 10 ms, and under TCG that counter runs about **six times
-                // wall-clock** (measured 2026-09-11: guest `sleep 10` returned
-                // in 1.69 s, against 10.49 s on the metal). The same
-                // uninterruptible sleep therefore ended within a few seconds of
-                // the `^C` there, which is indistinguishable from honouring it.
-                // `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md` §6.
-                if akuma_exec::process::should_interrupt_blocking_syscall() {
-                    return errno::EINTR;
-                }
-            }
-            // `rem` is left untouched on both paths out of this loop, which is
-            // what `akuma_syscalls_time::sys_nanosleep` does too. Linux fills it
-            // on an interrupted *relative* sleep; neither kernel does, and the
-            // divergence is pinned here rather than in one of them.
-            0
-        }
+        // Two checks came with the fold rather than being dropped at it: the
+        // signal check this arm had (`^C` on a sleeping foreground job) is
+        // `should_interrupt_blocking_syscall` there too, and the `EINVAL` for
+        // a malformed interval moved *into* the shared crate, which did not
+        // have it — see `Timespec::is_valid_interval`. The group-exit check
+        // (`thread::should_leave_now`) does not survive as itself: glue's loop
+        // asks `should_interrupt_blocking_syscall`, whose first half is the
+        // same per-thread interrupt bit a group exit sets.
+        //
+        // `rem` is untouched on both paths out, there as here: Linux fills it
+        // on an interrupted *relative* sleep and neither kernel does. The
+        // divergence is pinned in the shared crate now instead of in each.
+        Syscall::Nanosleep => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // The child-tid futex address a threaded libc registers on startup.
         // Single-address-space, no `CLONE_THREAD` here, so it is recorded
         // nowhere and the return value (the caller's tid) is ignored.
@@ -1794,93 +1774,61 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
         Syscall::Sendmsg => crate::sock::sys_sendmsg(a1, a2, a3),
         Syscall::Recvmsg => crate::sock::sys_recvmsg(a1, a2, a3),
-        // `clock_gettime(clockid, *timespec)` — x86_64 228. `CLOCK_REALTIME`
-        // (0) reads `clock::now_us()` — `0` until `clock::sync_via_sntp`
-        // succeeds, exactly the "every real TLS certificate looks not-yet-
-        // valid" bug this syscall existing at all closes
-        // (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.5/§3.30).
-        // `CLOCK_MONOTONIC` (1) and anything else read `net::uptime_us`
-        // instead: always available with no SNTP dependency, which is all a
-        // monotonic clock ever promised (an arbitrary epoch, not the Unix
-        // one) — busybox `sh`'s own `poll` timeout math and similar callers
-        // that just want *a* moving clock get one either way.
-        Syscall::ClockGettime => {
-            const CLOCK_REALTIME: u64 = 0;
-            let us = if a1 == CLOCK_REALTIME { crate::clock::now_us() } else { crate::net::uptime_us() };
-            // A user `struct timespec { i64 tv_sec, i64 tv_nsec }`.
-            let ts = [(us / 1_000_000).cast_signed(), ((us % 1_000_000) * 1000).cast_signed()];
-            if !crate::uaccess::write_val(a2, ts) {
-                return errno::EFAULT;
-            }
-            0
-        }
-        // The write side of the clock — x86_64 227 `clock_settime`, 164
-        // `settimeofday`, 159 `adjtimex`.
+        // **The clock family is glue's** (C3, 2026-09-12 —
+        // `docs/archive/AKUMA_AMD64_C3_CLOCK.md`). Three arms that were a
+        // second implementation of `akuma-syscalls-time`, kept here only
+        // because that crate read its clock from `akuma_timer` — CNTVCT, which
+        // is a stub returning `0` on this architecture. It reads the
+        // boot-registered `akuma_primitives::clock` hook now, and the wall
+        // clock both halves anchor is one static in the same place, so these
+        // arms have nothing left to say that glue does not say better:
         //
-        // This is how the machine gets a usable time when the kernel's own
-        // SNTP does not manage it: `busybox ntpd -q` fetches the time and
-        // steps the clock through these. Without them it fetches correctly and
-        // then fails to apply the answer, which looks exactly like a network
-        // problem and is not.
+        // - `clock_gettime` gains the large-`clock_id` guard (a pointer-sized
+        //   id from a Go heap is `EINVAL` on Linux and used to copy a timespec
+        //   to it here);
+        // - `clock_settime` gains nothing and loses nothing — same two checks;
+        // - `adjtimex` gains `ADJ_OFFSET` (this arm honoured only
+        //   `ADJ_SETOFFSET`, so an `ntpd` asking for a slew got silence), the
+        //   `ADJ_NANO` unit switch, and `STA_UNSYNC` in `status` — which is
+        //   the honest answer from a machine with no frequency discipline and
+        //   is what this arm reported `TIME_OK` with a zeroed status for.
         //
-        // Why it matters beyond `date` being wrong: at the epoch **every TLS
-        // certificate on earth is not-yet-valid**, and `apk` reports that as
-        // `server certificate not trusted` — sending you to look at the CA
-        // bundle, which is fine.
-        Syscall::ClockSettime => {
-            const CLOCK_REALTIME: u64 = 0;
-            if a1 != CLOCK_REALTIME {
-                return errno::EINVAL;
-            }
-            let Some(ts) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timespec>(a2)
-            else {
-                return errno::EFAULT;
-            };
-            if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-                return errno::EINVAL;
-            }
-            crate::clock::set_unix_us(
-                (ts.tv_sec.cast_unsigned()).saturating_mul(1_000_000)
-                    + (ts.tv_nsec.cast_unsigned() / 1000),
-            );
-            0
-        }
-        Syscall::Adjtimex => {
-            // `adjtimex(buf)`. This target has no frequency discipline — the
-            // tick comes from a PIT-calibrated LAPIC and nothing slews it — so
-            // the honest implementation reports the current time and an
-            // otherwise zeroed state, and accepts a step through `ADJ_SETOFFSET`
-            // because that is a real capability here.
-            //
-            // Returning `ENOSYS` instead is what makes `ntpd` give up before it
-            // ever sends a packet: it probes the clock's state on startup.
-            const ADJ_SETOFFSET: u32 = 0x0100;
-            const TIME_OK: u64 = 0;
-            let Some(mut tx) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timex>(a1)
-            else {
-                return errno::EFAULT;
-            };
-            if tx.modes & ADJ_SETOFFSET != 0 {
-                let now = crate::clock::now_us();
-                let delta = tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec);
-                let stepped = now.cast_signed().saturating_add(delta).max(0);
-                crate::clock::set_unix_us(stepped.cast_unsigned());
-            }
-            let now = crate::clock::now_us();
-            tx = akuma_syscalls_linux::time::Timex {
-                time_sec: (now / 1_000_000).cast_signed(),
-                time_usec: (now % 1_000_000).cast_signed(),
-                // A tick of exactly `US_PER_TICK_TARGET`: it is what the
-                // calibration makes true, and reporting the Linux default of
-                // 10000 by accident would be right only by coincidence.
-                tick: i64::from(crate::lapic::US_PER_TICK_TARGET),
-                ..akuma_syscalls_linux::time::Timex::default()
-            };
-            if !crate::uaccess::write_val(a1, tx) {
-                return errno::EFAULT;
-            }
-            TIME_OK
-        }
+        // **One pinned divergence:** glue leaves `timex.tick` at `0` where
+        // this arm reported `lapic::US_PER_TICK_TARGET`. Not restored on
+        // purpose — the AArch64 tick is governor-tuned and can demote to 1 ms,
+        // so a constant in the shared crate would be wrong on one of the two
+        // kernels, and nothing in the tree reads the field.
+        Syscall::ClockGettime => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::ClockSettime => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::Adjtimex => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        // The rest of the family, which had no arm here at all: each was
+        // `ENOSYS` on this target and served on the other one, because the
+        // number to reach it by was missing from `akuma-syscalls-abi` rather
+        // than the implementation being missing from glue (C3).
+        //
+        // `clock_getres` reports 1 us for every clock id — a claim this
+        // target cannot make good on with a 10 ms tick, and one the AArch64
+        // kernel makes too; pinned there, not re-litigated here.
+        //
+        // `clock_nanosleep` is what `std::thread::sleep` calls on any
+        // `target_os = "linux"` build, plain `nanosleep` is not, and this
+        // target runs Rust std binaries (`ruststd`). It carries
+        // `TIMER_ABSTIME` and the CLOCK_REALTIME-to-uptime conversion with it.
+        //
+        // `setitimer` is the one with state behind it: see `check_itimers`,
+        // driven from the tick in `idt::timer_dispatch`. Without that call the
+        // arm would arm a timer nothing ever fires.
+        //
+        // `times`/`getrusage` zero their buffers and report uptime in clock
+        // ticks. Nothing here accounts per-process CPU time yet, on either
+        // kernel, and a zeroed `struct tms` is what shells read to print `0m0s`
+        // rather than garbage.
+        Syscall::ClockGetres => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::ClockNanosleep => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        Syscall::ClockAdjtime => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::Setitimer => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::Times => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::Getrusage => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         _ => errno::ENOSYS,
     }
 }
@@ -5742,8 +5690,9 @@ fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
 pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // Every number the legacy `match nr` above claims to own. Each must be
     // x86-only; a number that also decodes through `Syscall` is handled twice.
-    const X86_ONLY: [u64; 21] = [
-        2, 4, 6, 7, 21, 22, 23, 33, 57, 58, 82, 83, 84, 87, 88, 89, 96, 111, 158, 164, 201,
+    const X86_ONLY: [u64; 23] = [
+        2, 4, 6, 7, 21, 22, 23, 33, 34, 37, 57, 58, 82, 83, 84, 87, 88, 89, 96, 111, 158, 164,
+        201,
     ];
     let mut overlap = 0u64;
     for n in X86_ONLY {
@@ -5822,6 +5771,60 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // arm they replaced would fail each one.
     t.check("dispatch: prlimit64 302 -> 261", hop(Syscall::Prlimit64, 302, nr::PRLIMIT64));
     t.check("dispatch: getrandom 318 -> 278", hop(Syscall::Getrandom, 318, nr::GETRANDOM));
+
+    // C3's six. Each was `ENOSYS` on this target — the implementation was in
+    // glue all along and there was no number to reach it by — so unlike the
+    // credentials above the *value* moves too, and each hop is asserted for
+    // the same reason: a missed one lands on a different arm, not on none.
+    // `clock_adjtime` is the sharpest: x86_64 305 is `nr::TIME`, an
+    // Akuma-private number, so a table that forgot to translate it would
+    // answer a `clock_adjtime` with the wall clock in seconds and no error.
+    t.check("dispatch: clock_getres 229 -> 114", hop(Syscall::ClockGetres, 229, nr::CLOCK_GETRES));
+    t.check(
+        "dispatch: clock_nanosleep 230 -> 115",
+        hop(Syscall::ClockNanosleep, 230, nr::CLOCK_NANOSLEEP),
+    );
+    t.check(
+        "dispatch: clock_adjtime 305 -> 266, not to nr::TIME",
+        hop(Syscall::ClockAdjtime, 305, nr::CLOCK_ADJTIME) && nr::CLOCK_ADJTIME != nr::TIME,
+    );
+    t.check("dispatch: setitimer 38 -> 103", hop(Syscall::Setitimer, 38, nr::SETITIMER));
+    t.check("dispatch: times 100 -> 153", hop(Syscall::Times, 100, nr::TIMES));
+    t.check("dispatch: getrusage 98 -> 165", hop(Syscall::Getrusage, 98, nr::GETRUSAGE));
+
+    // `clock_gettime(CLOCK_MONOTONIC)` through the real dispatcher, checked
+    // against **this kernel's own clock**.
+    //
+    // The value check that could not have been written before C3. This arm
+    // used to read `net::uptime_us` locally; glue's reads
+    // `akuma_primitives::clock`, which `akuma-syscalls-time` never consulted —
+    // it asked `akuma_timer::uptime_us`, i.e. CNTVCT, i.e. `0` on x86 forever.
+    // So the property is not "a plausible number came back" but "the number is
+    // the one this kernel counts", and a fold that lost the hook reports zero
+    // against a running uptime rather than an error.
+    //
+    // Agreement within one tick rather than exact equality: the two reads are
+    // separated by a syscall's worth of work, and `net::uptime_us` advances in
+    // whole `US_PER_TICK_TARGET` steps.
+    //
+    // It deliberately does **not** assert that the clock *moves*. The suite
+    // runs with the LAPIC timer stopped (`lapic::stop_timer`, so the tick does
+    // not interleave with the suite's own output), so `allow_tick` opens
+    // windows no interrupt is waiting in and nothing here can advance it —
+    // measured, after a first version of this check spun 50 million times and
+    // failed against a working clock. Movement is a ring-3 property and
+    // `/probes/clockprobe` is where it is proved.
+    const CLOCK_MONOTONIC: u64 = 1;
+    let mut ts = [0i64; 2];
+    let r1 = syscall_dispatch(228, CLOCK_MONOTONIC, ts.as_mut_ptr() as u64, 0, 0, 0, 0);
+    let kernel_us = crate::net::uptime_us();
+    let syscall_us = (ts[0].cast_unsigned()) * 1_000_000 + (ts[1].cast_unsigned()) / 1_000;
+    t.check_eq("dispatch: glue answers clock_gettime", r1, 0);
+    t.check("dispatch: the monotonic clock is not stuck at zero", syscall_us != 0);
+    t.check(
+        "dispatch: and it is this kernel's clock, not another one",
+        kernel_us.abs_diff(syscall_us) <= u64::from(crate::lapic::US_PER_TICK_TARGET),
+    );
 
     // `prlimit64(0, RLIMIT_STACK, NULL, &old)`. The old arm was `=> 0` and
     // wrote nothing, so the sentinel is what catches it — a return-value check

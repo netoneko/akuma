@@ -140,7 +140,34 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: usize) -> u64 {
     if read_user_into(&mut new_mask, mask_ptr).is_err() {
         return EFAULT;
     }
+    suspend_until_signal(new_mask)
+}
 
+/// `pause(2)` — [`sys_rt_sigsuspend`] with the mask the thread already has.
+///
+/// # Why this is a syscall here and not a libc wrapper
+///
+/// Like `alarm`, `pause` is an **x86-only** number (34) with no asm-generic
+/// sibling: musl emits the raw syscall where `SYS_pause` is defined and falls
+/// back to `ppoll(0, 0, 0, 0)` where it is not. So the AArch64 kernel has
+/// never seen it and the amd64 kernel answered `ENOSYS` to every `pause()`
+/// until 2026-09-12 — which made `alarm(n); pause();`, the oldest idiom in
+/// POSIX and the reason `alarm` exists, return immediately with `ENOSYS`
+/// instead of waiting. Found by `/probes/clockprobe`'s rung 8 while landing
+/// C3: `alarm` was armed correctly and the probe never waited to see it fire.
+///
+/// Arming the restore-sigmask with the mask that is already installed is a
+/// deliberate no-op rather than a special case — it keeps one wait loop, and
+/// what `rt_sigreturn` then restores is the mask the thread had.
+#[must_use]
+pub fn sys_pause() -> u64 {
+    suspend_until_signal(akuma_exec::threading::thread_signal_mask())
+}
+
+/// The wait both spellings do: install `new_mask`, block until a signal it
+/// does not block is pending, return `EINTR` so the syscall-return path
+/// delivers it.
+fn suspend_until_signal(new_mask: u64) -> u64 {
     let force_bits = (1u64 << 8) | (1u64 << 18); // SIGKILL(9), SIGSTOP(19) — unblockable
     let suspend_mask = new_mask & !force_bits;
     let saved_mask = akuma_exec::threading::thread_signal_mask();

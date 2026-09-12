@@ -269,6 +269,42 @@ pub fn is_current_interrupted() -> bool {
     true
 }
 
+/// The interrupt bit's job is finished: a signal frame has been installed for
+/// `tid`, so the signal it stood for has reached userspace.
+///
+/// # The spurious `EINTR` this removes
+///
+/// [`interrupt_thread`] raises a flag meaning "break whatever blocking syscall
+/// this thread is in", and [`is_current_interrupted`] — which **consumes** it —
+/// is read by two sorts of caller: a blocking wait loop, and the syscall
+/// prologue of both kernels, which answers `EINTR` and returns.
+///
+/// That works when the thread is blocked. When it is *running*, nothing
+/// consumes the flag: the signal is delivered at the next tick or syscall
+/// return, the handler runs and returns, and then the **next syscall the
+/// program makes — any syscall, including ones that cannot block — fails with
+/// `EINTR`**. Measured on amd64 2026-09-12 with an `alarm(1)`/`pause()` pair,
+/// where the `getpid()` after the handler returned `-4`; Linux returns the pid.
+///
+/// So delivery consumes it. Called from the point each kernel *installs a
+/// frame* — `akuma_exceptions::try_deliver_signal` and `amd64`'s
+/// `signal::enter_handler` — and deliberately not from the decision before it:
+/// a signal that turns out to be ignored, or one whose handler cannot be
+/// entered, has not reached userspace, and a flag raised for a blocking wait
+/// that has not happened yet must survive to break it.
+///
+/// Idempotent, and returns nothing: the caller is reporting an event, not
+/// asking a question.
+pub fn signal_frame_installed(tid: usize) {
+    let _ = crate::threading::take_thread_interrupted(tid);
+    if let Some(ch) = get_channel(tid) {
+        // The channel's copy too, for the same reason `is_current_interrupted`
+        // consumes both: a holder reading its own channel directly must not
+        // see a flag this delivery has already answered.
+        let _ = ch.is_interrupted();
+    }
+}
+
 /// Interrupt a process by thread ID
 ///
 /// Used by the SSH shell to send Ctrl+C signal to a running process.

@@ -177,6 +177,16 @@ pub use sync::futex_wake;
 pub use sync::futex_purge_tid;
 pub use sync::futex_dump;
 pub use time::check_itimers;
+// `alarm(2)`, for the one kernel whose syscall table has a number for it.
+// Re-exported rather than dispatched because there is no asm-generic `alarm`:
+// x86_64 37 is an x86-only legacy spelling, and inventing a neutral number for
+// one of those is what `akuma-syscalls-abi`'s rule 2 forbids. So `amd64`'s
+// legacy `match nr` calls this directly — the same seam `check_itimers` above
+// uses, and the reason neither needs a dependency on `akuma-syscalls-time`.
+pub use time::sys_alarm;
+// `pause(2)`, x86-only for the same reason and found by the same probe — see
+// `signal::sys_pause`.
+pub use signal::sys_pause;
 #[cfg(kernel_tests)]
 pub use sync::futex_do_wake;
 /// Futex waiter-table hooks for `process_tests::test_futex_table_irq_masked_requeue`.

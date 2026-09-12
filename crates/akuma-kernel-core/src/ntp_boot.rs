@@ -80,7 +80,7 @@ pub fn try_bootstrap_clock() -> Result<(), &'static str> {
             }
         })?;
 
-    akuma_timer::set_utc_time_us(result.unix_epoch_us, result.anchor_uptime_us);
+    akuma_primitives::clock::set_utc_time_us(result.unix_epoch_us, result.anchor_uptime_us);
     Ok(())
 }
 

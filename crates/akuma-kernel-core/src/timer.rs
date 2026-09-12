@@ -275,7 +275,7 @@ pub fn init_utc_from_rtc() -> bool {
     if let Some(timestamp) = read_rtc_timestamp() {
         // Convert seconds to microseconds
         let unix_epoch_us = u64::from(timestamp) * 1_000_000;
-        akuma_timer::set_utc_time_us(unix_epoch_us, uptime_us());
+        akuma_primitives::clock::set_utc_time_us(unix_epoch_us, uptime_us());
         true
     } else {
         false
@@ -286,7 +286,7 @@ pub fn init_utc_from_rtc() -> bool {
 // Returns None if UTC time has not been set
 #[must_use]
 pub fn utc_time_us() -> Option<u64> {
-    akuma_timer::utc_time_us(uptime_us())
+    akuma_primitives::clock::utc_time_us(uptime_us())
 }
 
 // Get current UTC time in seconds since Unix epoch

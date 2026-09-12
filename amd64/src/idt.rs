@@ -967,6 +967,27 @@ extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
             crate::signal::kill_current_from_tick(sig);
         }
     }
+    // **ITIMER_REAL / `alarm` expiry** (C3, 2026-09-12). Ungated by
+    // `from_user`, unlike the signal delivery above, and that is the point: an
+    // `alarm(5)` is most often set by a process that then *blocks*, so a check
+    // that only ran on ticks interrupting ring 3 would never fire for the
+    // caller it was written for. It is safe ungated because the work is
+    // atomics plus one `try_lock` that falls back rather than spinning — see
+    // `akuma_syscalls_time::wants_force_interrupt`. It only pends a signal;
+    // delivery still happens at this task's own next return to ring 3.
+    //
+    // Before `preempt_if_needed`, so a thread this readies is a candidate for
+    // the switch that follows rather than waiting a further tick.
+    //
+    // Called directly and not through `akuma_exec::runtime().check_itimers`,
+    // which is the same function: `runtime()` is `require()` and **panics**
+    // when nothing is registered, and this vector is live from
+    // `boot::late_init`'s `sti` — which the self-test path reaches by more
+    // than one route. The direct call degrades instead: with no clock
+    // registered `uptime_us()` is `0`, no deadline is `<= 0`, and the walk is
+    // a few hundred relaxed loads that find nothing.
+    akuma_syscalls_glue::check_itimers();
+
     // Preemption. EOI has already been sent, so the LAPIC can deliver the next
     // tick to whichever task runs after this returns.
     crate::sched::preempt_if_needed(from_user);

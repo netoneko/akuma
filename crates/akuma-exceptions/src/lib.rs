@@ -2147,6 +2147,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         akuma_exec::process::SignalHandler::UserFn(addr) => addr,
         _ => return false,
     };
+    // Past the last early return that means "no frame": from here a handler
+    // frame is installed, so the interrupt bit that stood for this signal has
+    // been answered and must not survive to fail the program's next syscall
+    // with `EINTR`. See `akuma_exec::process::signal_frame_installed` for the
+    // measurement that found it (amd64, `alarm(1); pause(); getpid()` → -4).
+    // Deliberately after the `Ignore`/`Default` arms above: a signal that never
+    // reaches userspace has not answered anything.
+    akuma_exec::process::signal_frame_installed(thread_slot);
 
     // SA_RESTART (ARM64 nr=0x10000000)
     // If the signal was delivered during a syscall, and SA_RESTART is set,

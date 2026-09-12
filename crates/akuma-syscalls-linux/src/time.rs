@@ -86,6 +86,28 @@ impl Timespec {
         let (sec, nsec) = self.bits();
         sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000)
     }
+
+    /// Is this a well-formed *interval* — the check Linux's `nanosleep(2)` and
+    /// `clock_nanosleep(2)` answer `EINVAL` to?
+    ///
+    /// The predicate [`to_us`](Self::to_us) deliberately does not apply (see
+    /// its own note: validating inside a conversion helper changes syscall
+    /// behaviour behind its callers' backs). It is spelled here, beside the
+    /// arithmetic it guards, and applied by the two sleep syscalls only —
+    /// `pselect6`/`ppoll`/`futex` pass *timeouts*, where the tree's saturating
+    /// answer to an absurd value is the established one.
+    ///
+    /// Why it exists at all: `to_us` reinterprets, so `tv_sec = -1` is
+    /// `1.8e19` microseconds, and a sleep loop handed that parks for ~584 000
+    /// years. That is an unbounded wait reachable from unprivileged ring 3 by
+    /// one bad argument — a hang, where Linux returns an error. The amd64
+    /// kernel's own `nanosleep` arm checked this before it folded into the
+    /// shared crate (C3, 2026-09-12); the check came with it rather than being
+    /// dropped on the way in.
+    #[must_use]
+    pub const fn is_valid_interval(self) -> bool {
+        self.tv_sec >= 0 && self.tv_nsec >= 0 && self.tv_nsec < 1_000_000_000
+    }
 }
 
 /// Linux `struct timeval` — `{ time_t tv_sec; suseconds_t tv_usec; }`.
@@ -219,6 +241,23 @@ mod tests {
         let tv = Timeval { tv_sec: -1, tv_usec: -2 };
         assert_eq!(tv.bits(), (u64::MAX, u64::MAX - 1));
         assert_eq!(Timeval::from_bits(u64::MAX, u64::MAX - 1), tv);
+    }
+
+    /// The `EINVAL` cases `nanosleep`/`clock_nanosleep` owe Linux, and the
+    /// one that is a hang rather than a wrong number: `tv_sec = -1` converts
+    /// to `1.8e19` microseconds, so an unvalidated sleep loop parks for
+    /// ~584 000 years on one bad argument from ring 3.
+    #[test]
+    fn an_interval_is_non_negative_with_a_sub_second_nsec() {
+        assert!(Timespec { tv_sec: 0, tv_nsec: 0 }.is_valid_interval());
+        assert!(Timespec { tv_sec: 5, tv_nsec: 999_999_999 }.is_valid_interval());
+        assert!(Timespec { tv_sec: i64::MAX, tv_nsec: 0 }.is_valid_interval());
+
+        assert!(!Timespec { tv_sec: -1, tv_nsec: 0 }.is_valid_interval());
+        assert!(!Timespec { tv_sec: 0, tv_nsec: -1 }.is_valid_interval());
+        // Exactly one second in the nanosecond field: the sloppy spelling
+        // Linux also refuses, and the boundary a `<=` here would let through.
+        assert!(!Timespec { tv_sec: 0, tv_nsec: 1_000_000_000 }.is_valid_interval());
     }
 
     /// The ordinary case, and the sub-microsecond truncation every caller
