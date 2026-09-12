@@ -328,7 +328,14 @@ pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
 /// INTR-character handling in `write_to_process_stdin`, not as a general
 /// `kill(-pgid, sig)` primitive, and the thing that should die on Ctrl-C is
 /// the foreground job, never the shell running it.
-pub fn kill_process_group(pgid: Pid, sig: u32) {
+///
+/// Returns how many group members it delivered to — **the number the `[ISIG]`
+/// trace in [`crate::process::write_to_process_stdin`] prints**. Zero is the
+/// interesting value: it means the INTR character reached the line discipline,
+/// named a `foreground_pgid`, and found nothing carrying that `pgid` — which is
+/// a `^C` that raises a signal at nobody and is indistinguishable, from the
+/// terminal, from one that never arrived.
+pub fn kill_process_group(pgid: Pid, sig: u32) -> usize {
     // Fixed array, not a `Vec`: `for_each_process`'s callback runs with IRQs
     // disabled and forbids allocation, and there can never be more than
     // `MAX_PROCESSES` matches.
@@ -343,6 +350,7 @@ pub fn kill_process_group(pgid: Pid, sig: u32) {
     for &pid in &targets[..count] {
         deliver_signal(pid, sig);
     }
+    count
 }
 
 /// Does thread slot `tid` still belong to `pid`?
