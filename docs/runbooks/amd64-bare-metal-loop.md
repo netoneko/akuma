@@ -44,7 +44,9 @@ above any more.
 
 `reboot -f`, not `reboot`: busybox `reboot` opens `/proc` to find init and
 refuses without it. `/proc` exists as an empty directory now, but `-f` skips the
-check entirely and is what makes this unattended.
+check entirely and is what makes this unattended. (From a *running* Akuma,
+plain `reboot -f` has answered `I/O error` and done nothing —
+`/bin/busybox reboot -f` works.)
 
 A helper that knows both personalities lives at
 [`scripts/utils/hpbox.py`](../../scripts/utils/hpbox.py): `which_system()`,
@@ -508,6 +510,16 @@ scratch `sda2` at LBA 134217728, sparse so 64 GiB costs ~256 MiB), so all four
 disk checks are live rather than skipped. It found the bug that had survived a
 whole session of metal reboots — a Configure Endpoint command that also claimed
 EP0, which the controller answers with `TRB Error` — on its first run.
+
+**Its blind spot is now pinned**: the failure/recovery path. `qemu-xhci`'s
+usb-storage never stalls, so nothing down there is exercised — which is how
+`ep_state`'s `(dw0 >> 2) & 0x7` decode (RUNNING read as Disabled, `halted`
+unreachable, Reset Endpoint never once executing on the metal) survived a
+week. That path is covered where it can be: `cargo test -p akuma-xhci` runs
+`device::drive_command`'s sweep (19,683 scripted behaviors, termination +
+legality) and the differential that reproduces the misread wedge. Run it
+before every metal boot of a recovery change. Full account:
+`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-12.
 
 What it models is a *correct* controller, so it catches every way the driver is
 wrong about the spec and none of the ways a particular controller is wrong about

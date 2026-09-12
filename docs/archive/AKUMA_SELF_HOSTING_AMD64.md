@@ -2107,3 +2107,45 @@ divergence. Difference-by-duplication (the third category, most of
   (`clone(CLONE_VM|CLONE_THREAD)`) as the wall A1 removes.
 - `docs/archive/AKUMA_AMD64_COW.md` — the pinned CoW-marker divergence, and why
   CoW fork is SMP=1-only on this target today.
+
+## Console font: no em-dash / emoji glyphs (found 2026-09-11)
+
+The amd64 framebuffer console font (spleen 8x16) has no glyphs for `—`
+(U+2014) or any emoji, so runtime log strings using them print replacement
+boxes — `transfer timed out ▯▯▯ recovering` went to the framebuffer that way
+during the xHCI stall investigation. Two of the new strings shipped with the
+box characters before being converted to ASCII (`--`).
+
+What we want: a console font (or font-override table) that carries the
+em-dash and a small emoji set, so kernel messages can use them without
+printing boxes. Until then the rule stands: **runtime strings are plain
+ASCII** — comments may use whatever the editor likes, `serial::puts`/console
+output may not. The aarch64 kernel's console path has the same constraint;
+the want applies to both.
+
+## Persistent root: `/bin/*` execs fail ENOENT under disk stalls — rootfs is FINE (found 2026-09-11, revised same day)
+
+First report (from the Akuma console): bare `ls`/`ps`/`reboot` and even
+absolute `/bin/ls` answered "not found" while `/bin/busybox <applet>` worked,
+and `ls /` showed `lib`, `var`, `public` as readdir-present but stat-ENOENT.
+That read as a staged rootfs with a missing/dangling `/lib`.
+
+**Ubuntu-side inspection disproved it.** `/dev/sdb1` is fine: `/lib` exists
+with `ld-musl-x86_64.so.1` in it, `lib`/`var`/`public` are real directories,
+and every applet in `/bin` is a byte-identical copy of the *static* busybox
+(same md5, mode 644 — this kernel ignores the execute bit). Nothing is
+missing.
+
+The real mechanism: `sys_execve` mapped **every** `read_file` error to
+ENOENT. During the USB-stall windows, whole-file reads of cache-cold
+binaries failed with `IoError` and printed as "not found" — while
+`/bin/busybox` (block-cache-hot from boot) and already-read binaries kept
+working. The inode-interleaved fail/work pattern was just which reads hit
+stall windows. Fixed on branch `amd64-xhci-timeout-recovery`: `sys_execve`
+maps through `fs_error_to_errno` now (`IoError` → `EIO`), and the stall
+itself is the timeout-recovery path's problem.
+
+Still open, smaller: the shell on the persistent root has no `PATH` (bare
+applet names fail lookup even when the disk is healthy — use full paths),
+and the `644` modes mean this target's exec never checks permission bits
+(observability gap, not a correctness bug today).

@@ -3,8 +3,11 @@
 **Grade: B** (the driver works end-to-end **on the metal** and under
 `qemu-xhci`; `sda1` is a mountable persistent root. Verify behaviour rather than
 trusting it — one boot path's reset is unexplained, see the last section).
-Written 2026-09-06 and revised twice the same day — **the two dated sections at
-the end supersede everything above them**, in order.
+Written 2026-09-06 and revised through 2026-09-12 — **the dated sections at
+the end supersede everything above them, in order**; the last one
+(2026-09-12) is current: the recovery path never executed on the metal until
+that date, because a wrong endpoint-state decode made every halt read as
+"disabled".
 
 **The crash-loop is gone**, and so is the bring-up failure. A failed bring-up
 halts the controller and the boot carries on; a successful one mounts the disk.
@@ -764,3 +767,269 @@ What the metal run also showed, honestly:
   use. Whether the reset was this code or the box's known-bad NIC is
   undetermined; treat a self-reset on this box as new information, not
   background noise.
+
+## 2026-09-11, later — the photograph decodes the stall: the device is slow, not halted
+
+A framebuffer photograph of the next death (the rebased kernel, recovery
+present but timeout-blind) plus the new diagnostics settled the mechanism.
+
+**What the console showed**, per post-idle ssh connection:
+`transfer timeout: data` → `discarded transfer event: cc=6 slot=1 dci=3`
+(the data phase's STALL, arriving just past the 1 s budget) → the next CBW
+stalls (`bulk cc=6`, recovered) → the retry times out while
+`discarded transfer event: cc=1` (the *previous* CBW completing
+SUCCESSFULLY, late) → repeated `transfer timeout: CBW` with no recovery,
+because timeouts took no recovery at all.
+
+**What the fixed build then printed on the metal**: `ep 4 state` reads and
+`recovery step cc=0x00000013` — CONTEXT_STATE_ERROR — on both Reset Endpoint
+and Set TR Dequeue Pointer. **The endpoint was never halted**; the recovery
+commands were illegal on it. The late `cc=1` completions (consecutive TRBs,
+each a timed-out retry CBW eventually succeeding) prove the whole chain:
+the first command after an idle gap takes seconds — ASMedia bridge / SATA
+idle wake, most likely; USB link LPM is out (the driver never sets
+`PORTSC.U1TO/U2TO`) — and everything after that is the driver reacting to a
+answer that came back late.
+
+Also decoded: `tag=511` in every `[BKL] stuck` line is `HOLD_TAG_UNKNOWN`
+(`akuma-bkl` sync.rs) — the attribution placeholder shown while the BKL
+profiler is off; it never carried information on this box. With the
+carve-outs all forwarded, BKL-still-storms correlate with the ssh
+connection/stall-recovery events and not with output volume (`uname -a`
+clean, `dmesg` spew dirty is *output*-correlated on the old build; on the
+new build all four discriminators grow BKL in lockstep with the ~4 disk
+timeouts each connection provokes). `amd64/src/sock.rs` — this target's own
+socket layer, which glue's `NetBklGuard` never covers — has no BKL handling
+at all; still unattributed.
+
+**Fixes staged on branch `amd64-xhci-timeout-recovery` (worktree
+`../akuma-xhci-recovery`), NOT yet deployed**:
+
+- Timeouts recover like stalls (`akuma-xhci::recovery::retry_decision`,
+  host-tested: stall/desync = one recovery cycle, timeout = two — spin-up
+  needs seconds).
+- The recovery plan gates controller-side Reset Endpoint + Set TR Dequeue
+  Pointer on the endpoint actually reading HALTED; a timeout on a
+  running/stopped endpoint skips them (they answered `cc=0x13`) and just
+  retries. BOT Mass Storage Reset + CLEAR_FEATURE both remain.
+- `recover_step` prints every step's completion code; `ep_state` reads the
+  EP State field (device-context index is `dci`, not `dci+1` — the first
+  version read the input-context layout and reported disabled for a running
+  endpoint).
+- Runtime strings back to plain ASCII (`—` prints as boxes; see
+  `AKUMA_SELF_HOSTING_AMD64.md` § font note).
+- amd64 now forwards `no-bkl-network`, `no-bkl-process`, `no-bkl-mm`,
+  `no-bkl-drivers` and `fs-cache` (16 MiB default cap) — the full AArch64
+  `smp-shared` set. Fast lane with all of it: Firecracker SMP=4 639/0,
+  OVMF 631/0, local microvm 641/0.
+
+**Next session, in order**: deploy this build; idle the box 5 min; the next
+access should print `transfer timed out - device slow, not halted;
+retrying` + `ep not halted - controller reset skipped` and then SUCCEED
+instead of `cc=0x13`. Then the root-cause experiment, from Ubuntu:
+`hdparm -S 0 /dev/sdb` (kill the drive's standby timer) and see whether the
+stalls vanish entirely. If they do, decide: keep the recovery, or add a
+keepalive. If BKL lines survive the disk fix, run with
+`set_profiling(true)` so `tag=` names the holder's syscall.
+
+## 2026-09-11, final — metal run with the full fix set: one crash to hand off
+
+The complete build (timeout recovery + halt-gated plan + carve-outs + fs-cache)
+booted clean, absorbed the first post-idle stall exactly as designed
+(`timed out - device slow` → `plain retry` → 0.6 s access), then died during
+the boot suite with:
+
+```
+[EXCEPTION] #GP general protection err=0x0000000000000000
+rip=0xffffffff802b5b6a
+```
+
+Symbolised against the local build of the same source: **`rip` lands inside
+`akuma_amd64::sock::smoke_test`** (0xffffffff802b5b10, +0x5a) — the socket
+self-test, NOT the xHCI path. The xHCI retry storm on the console was the
+boot suite's disk checks stalling; the crash came from the next test in the
+suite.
+
+**Attribution: OPEN, and do not assume pre-existing.** This boot was the
+first with the carve-out forwards (`no-bkl-network` changes the net path to
+BKL-free syscalls under `PreemptGuard` IRQ masking) — if `sock::smoke_test`
+or netpoll assumed BKL serialization anywhere, the crash is a candidate
+*consequence of that change*, not an inherited bug. The A/B is cheap: flip
+`set_network_bkl_drop_enabled(false)` (and the other phase toggles) at boot
+and re-run the suite; if the #GP persists with the carve-outs off, hand it
+to the sock/net owner with the rip above. The retry loop before it also showed
+`ep 4 state 0 (disabled)` on the real controller — the endpoint-context
+reading DISABLED while transfers were working minutes earlier is unresolved
+and worth a look (context written by the controller at DCBAA[slot]; nothing
+in this driver writes DEV_CTX after bring-up).
+
+**The `lib`/`var`/`public` ENOENT mystery, refined**: Ubuntu proved the
+rootfs fine (`/lib` real, loader present; all applets byte-identical static
+busybox). Working theory now: those three directories' **inode-table block**
+gets read for the first time during a boot-suite stall window, the failed
+read poisons the block cache, and their lookups fail deterministically every
+boot (same layout, same read order, same poisoned block). `readdir` lists
+them (dir entries readable) while `stat` fails (inode read goes through the
+poisoned block). Decisive probes next boot:
+`/bin/busybox ls -i /` then `stat /lib` with the disk awake; and the kernel
+rule that falls out regardless: **never insert a block into the cache from a
+failed/short device read** (`with_block` currently `?`-returns before
+insert, but verify every cache fill path — including the fs-cache build).
+
+**Known for next boot: the vanish is NOT present from the start** — early
+after boot `lib`/`var`/`public` stat fine; at some point they stop. So the
+first probe is a timeline, not a spot-check: start this right after boot and
+note the uptime where they vanish, correlated with the first
+`transfer timeout`/`plain retry` lines:
+
+```sh
+/bin/busybox sh -c 'while :; do echo "$(cat /proc/uptime) $(/bin/busybox \
+  ls -d /lib /var /public 2>&1 | /bin/busybox tr "\n" " ")"; sleep 20; done' \
+  > /root/dirtrace.log 2>&1 &
+```
+
+Watch for: does the vanish coincide with (a) the first stall/recovery
+episode, (b) the first ssh connection, (c) a specific number of disk
+commands, or (d) nothing visible — plus `/bin/busybox ls -i /` before and
+after the vanish (do the inode numbers for the three change? a change would
+mean a re-read dir block with different rec_len parsing, not a poisoned
+inode-table block).
+
+Also read the crate's own cache-integrity counters after the vanish:
+`[E2C-BAD]` (ext2.rs, "cache hits whose bytes did not match a direct disk
+re-read", built for the 2026-08-15 zero-page hunt) — if it fires around the
+vanish, the fs-cache is serving corrupt blocks (amd64 runs the big
+clock-eviction cache against a *stalling* xHCI transport for the first
+time; a partially-filled fill surviving in the cache is the suspect), and
+the fix is at the cache layer. If it stays silent, the corruption is below
+the cache — the device returning bad data — which changes the bug report.
+
+**Clock finding (2026-09-11, from the "two clocks" question):** the xHCI
+timeout budget is **uncalibrated**. `spin_us`/`BUDGET` in
+`amd64/src/xhci.rs` count raw TSC ticks against an assumed ">= 1 GHz" —
+nothing on this target calibrates the TSC (`clock.rs` keeps a wall clock on
+the 10 ms LAPIC tick; the driver never consumes a frequency). On the
+trashcan's Haswell the TSC runs ~3x the assumption, so the "one second"
+transfer budget is really ~0.3 s — a device waking from idle that answers
+within a true second still "times out". Part of the stall severity may be
+this constant, not the device. Fix: read the TSC frequency at boot
+(CPUID 0x15/0x16 on Intel, LAPIC-tick cross-check as fallback), convert
+`BUDGET` to real time, and re-measure the stall cadence before touching the
+recovery again. The cache, for the record, is clockless: "clock eviction"
+is the second-chance algorithm, reference bit + hand, no wall time.
+
+## 2026-09-12 — the "disabled endpoint" was the driver's own arithmetic, and the failure loop is now a proven model
+
+Three metal boots on the merged branch (`702b9fef` + diagnostics), plus a host
+model. The headline: **the controller was never tearing the endpoints down.**
+
+### The diagnostic, and what it showed
+
+A timeout-path dump was added to `amd64/src/xhci.rs` (`transfer timeout` now
+also prints PORTSC and the raw first dword of the slot context and both bulk
+endpoint contexts). Its first catch, on the real Intel controller:
+
+```
+[xhci] transfer timeout: data
+[xhci] PORTSC=0x00201203          ← link UP, PLS=0, speed 4 — identical to bring-up
+[xhci] slot ctx dw0=0x20400000    ← sane: ctx entries=4, speed=4 (SuperSpeed)
+[xhci] ep in ctx dw0=0x00000001   ← EP State bits [2:0] = 1 = RUNNING
+[xhci] ep out ctx dw0=0x00000001  ← 1 = RUNNING
+```
+
+Every timeout arrived with the link healthy and both endpoint contexts
+**Running** — while the driver's log said `ep 4 state 0 (disabled)`. The
+glue's `ep_state` computed `(dw0 >> 2) & 0x7`; EP State is DW0 bits **[2:0]**
+with no shift (xHCI §6.2.3; Linux's `EP_STATE_MASK`). Consequences, in order
+of severity:
+
+1. `halted = (ep_state == 2)` was **unreachable**. Reset Endpoint and Set TR
+   Dequeue Pointer — the whole controller-side half of the class recovery
+   built on 2026-09-11 — never executed once on real silicon. Every genuine
+   halt took the "device slow, plain retry" path, which cannot clear a device
+   halt. One real stall still poisoned the session (`ls` → EIO forever,
+   observed live: `md5sum /bin/uptime` 0/10, and files already in the ext2
+   block cache reading fine while any read needing fresh device I/O failed).
+2. The § 2026-09-11 note "the endpoint-context reading DISABLED while
+   transfers were working minutes earlier is unresolved" — resolved: it was
+   this arithmetic, not the controller. Nothing ever rewrote the context.
+3. The QEMU rig never caught it because the state is only *read* on the
+   failure path, and `qemu-xhci`'s usb-storage never stalls. A bug reachable
+   only through the recovery path survived every rig run.
+
+Fixed by routing the decode through the crate — `ep_state` returns
+`akuma_xhci::device::EpState::decode(dev_ctx_dw0(x, dci))` — so the glue
+keeps no arithmetic copy to drift.
+
+### The failure loop is now a host model: `akuma-xhci::device`
+
+`crates/akuma-xhci/src/device.rs` (pure, `forbid(unsafe_code)`) plus
+`tests/device_model.rs`:
+
+- `EpState::decode` — the spec decode, pinned (`0x1` → Running, the exact
+  metal value) with a regression test asserting the old shift can never
+  produce `Halted` from any legal state dword.
+- `SimDevice` — the enclosure + controller pair: per-endpoint context state,
+  a device-side halt only a BOT Mass Storage Reset / CLEAR_FEATURE can clear,
+  a transition ledger, `illegal_steps` and `dequeues_moved` counters.
+- `drive_command` — the glue's failure loop as a pure function (attempt →
+  `recovery::retry_decision` → `recovery::recovery_plan` executed with spec
+  legality: Reset Endpoint only on Halted, Set TR Dequeue only on non-Running
+  → doorbell → re-issue).
+
+The proof (`7` tests): the **sweep** drives every answer matrix of 3 attempts
+× 3 BOT phases — 19,683 scripted behaviors — and each terminates in a bounded
+verdict with zero illegal steps; the **differential** runs an identical
+enclosure + script twice, differing only in the state read: honest →
+`Served` with the dequeue moved; the `>> 2` misread (expressed as
+`state_read_override = Some(false)`) → `Dead`, still Halted, dequeue never
+moved. That is last week's box, reproduced and isolated in 20 lines.
+
+Also pinned honestly: a second *deliberate* STALL after recovery is terminal
+(`retry_decision`'s cap) — the model encodes that as correct, not stuck.
+
+### Device-state transitions are now tracked on the metal
+
+`note_ep_state` in `amd64/src/xhci.rs` keeps the last observed state per bulk
+endpoint and prints every change (`ep 4 state run->halt->stop->run`) at the
+recovery and timeout sites. A transition the model does not know about is a
+driver/controller disagreement, and will now announce itself on the first
+boot that produces it.
+
+### The BKL `tag=511` storm: profiler was never on, and amd64 installs no tags
+
+Two layers. First, glue's `bkl_profile::init()` runs under
+`cfg(kernel_bkl_profile)`, which nothing in amd64 ever enabled — the
+profiling `tag=511` was just "profiler off". With it force-enabled
+(diagnostic in `boot::wire_console_and_syscalls`, the one bring-up point both
+entry paths spell — note `late_init` only runs on `skiptests`/`no-tests`
+builds, which is why the first attempt at this missed the suite path), the
+metal *still* printed `tag=511` — and that now means `HOLD_TAG_UNKNOWN`:
+**amd64's syscall entry installs no holder tags at all**. Glue's
+`set_holder_tag` sites never run on this target. If the `[BKL] stuck` lines
+survive the stall fix, tagging amd64's syscall entry is the next slice.
+
+### Reset recurrence, and where the fix continues
+
+The self-reset recurred: one boot died into Ubuntu at ~4.5 min uptime under
+deliberate disk load (timeline: last good sample at uptime 274 s, ssh timing
+out ~20 s later), again with no console witness and no pstore. Earlier boots
+with identical kernels ran 25+ min under load. Treat a reset as correlated
+with stall storms, not with a specific build.
+
+The clock finding in the previous section is being fixed on the trunk
+(`i-am-about-to-regret-this-joke-down-the-line`), where this branch merges:
+with the TSC budget ~3× short on the Haswell, the dominant "stall" may be a
+device answering within a real second but after 0.3 s of budget. Re-measure
+the cadence **there**, with the corrected decode — the recovery will now
+actually fire on genuine halts, so the log language is: `run->halt->stop->run`
+plus `stall recovered` is a *good* line; repeated `state run` timeouts at a
+short cadence point at the budget, not the device.
+
+**Deploy notes for the next run**: the stage path is
+`hpbox.deploy() → restage_disk(keep_keys=True) → stage("root=/dev/sda1") →
+reboot_to("akuma")`; verify the box build contains the new code with
+`strings /boot/akuma/akuma-amd64 | grep BKLPROF` (the trap this trip: the
+first "staged" boot was a stale `target/` binary because `late_init` never
+ran — grep before believing). `reboot -f` from Akuma intermittently answers
+`I/O error` and does nothing; `/bin/busybox reboot -f` works.

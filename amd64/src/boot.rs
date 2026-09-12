@@ -272,6 +272,15 @@ fn wire_console_and_syscalls() {
     // console input until there is a ring-3 process that could read it.
     crate::console::init();
     usermode::init_syscall();
+
+    // Diagnostic (trash box, uncommitted): the AArch64 kernel turns the BKL-hold
+    // profiler on from glue's kernel_main under `kernel_bkl_profile`; amd64 has
+    // no such call site, so every `[BKL] stuck` line on the metal read
+    // `tag=511` (HOLD_TAG_UNKNOWN) and named nothing. This function is the one
+    // bring-up step both entry points spell once — the suite path and
+    // `late_init` — so the attribution is on whichever way the box came up.
+    akuma_bkl::sync::set_profiling(true);
+    crate::serial::puts("[BKLPROF] enabled (amd64 diagnostic)\n");
 }
 
 /// Bring the machine up to `init` **without** running the suite: the LAPIC, the

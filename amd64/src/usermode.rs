@@ -3886,8 +3886,15 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // BKL drop"). Everything after it needs the BKL again (the image switch
     // edits live page tables, and the shootdown argument assumes the BKL is
     // outermost), so the guard is scoped to exactly this read.
-    let Ok(image) = crate::exec_runtime::bkl_free_io(|| crate::fs::read_file(path)) else {
-        return errno::ENOENT;
+    //
+    // The errno is the table's, not a blanket ENOENT: during the stall,
+    // `read_file` failing with `IoError` on cache-cold binaries printed as
+    // "not found" for files that exist — `/bin/ls` "missing" while
+    // `/bin/busybox` (block-cache-hot) ran — which sent the investigation
+    // hunting for a broken rootfs.
+    let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_file(path)) {
+        Ok(image) => image,
+        Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
     };
 
     let argv_owned = {

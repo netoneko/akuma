@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared"]
+default = ["console-notify", "smp-shared", "fs-cache"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -28,7 +28,40 @@ default = ["console-notify", "smp-shared"]
 # the remaining phases are deliberately NOT forwarded yet: this target's net
 # syscalls are its own `net.rs`, and each further phase needs its own audit +
 # A/B before it lands here.
-smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "no-bkl-network", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
+# The ext2 block cache forwarded to the aarch64 default (root Cargo.toml has
+# `fs-cache` in `default` since 2026-08-02). Without it this target runs the
+# 64-slot FIFO ring, which a single ssh session thrashes: every connection
+# execs `/bin/sh` (~25 blocks) + `dmesg`/`grep` through 64 slots, evicting
+# `/etc/sshd/authorized_keys` between reads — so every auth re-reads it off
+# the USB disk, the one device that stalls. 16 MiB default cap
+# (`DEFAULT_CACHE_CAP_BYTES`); the kernel never calls `set_cache_cap_bytes`.
+fs-cache = ["akuma-ext2/fs-cache"]
+
+# The remaining BKL carve-outs, forwarded to mirror the AArch64 root kernel's
+# `smp-shared` (which has carried all of them since 2026-08). Each is audited
+# code on AArch64 with a runtime kill switch in `akuma_bkl::policy`; amd64
+# never inherited them, which is why this target alone showed the `[BKL]
+# stuck` storms.
+#
+# - `no-bkl-network`: net syscalls drop the BKL for their duration, relying
+#   on NETWORK/SOCKET_TABLE/fd-table spinlocks; the yarn wait loop's
+#   PreemptGuard masks IRQs for the holds. On amd64 the socket path held the
+#   BKL across blocking writes/reads — sshd relaying console output into a
+#   quiet TCP session held it for the whole drain.
+# - `no-bkl-process`: fork's CoW share/copy page-copy window runs BKL-free,
+#   chunked, under the address space's own `as_lock`. Without it every sshd
+#   per-connection fork copied the whole address space under one BKL hold.
+# - `no-bkl-mm`: mmap/mprotect/munmap/madvise/mremap rely on `as_lock`/
+#   `vm_lock`/PMM spinlocks, all IRQ-masking unconditionally.
+# - `no-bkl-drivers`: getrandom / /dev/urandom reads / dsp writes — every
+#   device these touch carries its own Spinlock. (No `no-bkl-irq` here: that
+#   phase is the AArch64 timer IRQ 27 dispatch; amd64's LAPIC tick path is
+#   its own thing and has never been attributed as a BKL contention target.)
+no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network", "akuma-syscalls-glue/no-bkl-network"]
+no-bkl-process = ["akuma-exec/no-bkl-process"]
+no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
+no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a
