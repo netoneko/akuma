@@ -1617,7 +1617,44 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // parent_tid, child_tid, tls)` — `tls` **last**, after `child_tid`,
             // where most architectures put it fourth.
             if a1 & clone_flags::CLONE_VM != 0 {
-                return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
+                // `CLONE_VM|CLONE_THREAD` — a thread (`crate::thread`).
+                if a1 & clone_flags::CLONE_THREAD != 0 {
+                    return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
+                }
+                // **`CLONE_VM` without `CLONE_THREAD` — musl's `posix_spawn`
+                // child** (`clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, a separate
+                // stack, no `CLONE_SETTLS`). It was `ENOSYS` here for the whole
+                // life of the port, which is the one arm every compile driver
+                // dies on: gcc, clang and rustc all run their subprograms
+                // through `posix_spawn` (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+                //
+                // Served as a **fork whose child enters on the clone-supplied
+                // stack** — `fork_process`'s `stack_ptr` parameter, which sets
+                // the child's `rsp` and leaves its syscall return `0`. That is
+                // exactly the entry convention musl's `__clone` arranges:
+                // `[rsp]` is the child function, `[rsp+8]` its argument, so the
+                // child pops both and calls `fn(arg)` — which is `execve` or
+                // `_exit`, never a return into shared code. Two deliberate
+                // divergences from Linux, both safe here:
+                //
+                // * the address space is **copied (CoW), not shared**. `vfork`
+                //   sharing is only sound with the parent suspended until exec
+                //   or exit, and this target does not suspend; a copy makes the
+                //   unsuspendable race uninteresting, at the cost of one CoW
+                //   share per spawn — the thing `vfork` exists to avoid, paid
+                //   where it is correctness rather than speed that is for sale.
+                // * the parent is **not** suspended (`CLONE_VFORK` ignored).
+                //   musl's spawn parent only `waitpid`s, so it never observes
+                //   the difference.
+                //
+                // `CLONE_SETTLS` is *absent* on this path by construction — the
+                // spawn child inherits the parent's `%fs` — which is correct:
+                // it execs immediately, and `execve` installs the new image's
+                // TLS. `SMP>1`: CoW fork on this target is `SMP=1`-only today
+                // (see `akuma-cow`'s pinned marker divergence), so a
+                // multi-core Firecracker running `gcc` wants `SMP=1` until that
+                // lifts.
+                return sys_spawn_clone(a2);
             }
             sys_fork()
         }
@@ -3943,7 +3980,13 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // "not found" for files that exist — `/bin/ls` "missing" while
     // `/bin/busybox` (block-cache-hot) ran — which sent the investigation
     // hunting for a broken rootfs.
-    let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_file(path)) {
+    //
+    // `read_image`, not `read_file`, since 2026-09-12: it resolves symlinks
+    // (the raw read handed the *link text* to the loader — every apk-installed
+    // wrapper is a link) and lifts the 16 MiB cap through chunked `read_at`,
+    // which is what a 42 MB `cc1` needs
+    // (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+    let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image(path)) {
         Ok(image) => image,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
     };
@@ -4247,6 +4290,24 @@ fn sys_fork() -> u64 {
     }
 }
 
+/// `clone(CLONE_VM|CLONE_VFORK)` — the `posix_spawn` child, served as a fork
+/// that enters on the caller's clone stack. See the `Syscall::Clone` arm for
+/// the full mechanism and the two deliberate divergences; this is only the
+/// errno translation, matching [`sys_fork`].
+fn sys_spawn_clone(child_stack: u64) -> u64 {
+    use crate::fd::errno;
+    let child_pid = alloc_pid();
+    match akuma_exec::process::fork_process(child_pid, child_stack) {
+        Ok(pid) => u64::from(pid),
+        Err(e) => {
+            serial::puts("  [spawn-clone] ");
+            serial::puts(e);
+            serial::puts("\n");
+            errno::ENOMEM
+        }
+    }
+}
+
 /// **`ExecRuntime::bind_child_task` on this target** — give a freshly spawned
 /// `fork`/`vfork` child the three things `akuma-exec` has no concept of, in the
 /// window after its task slot exists and before it can be scheduled.
@@ -4389,7 +4450,10 @@ pub fn sys_spawn(
         return errno::EINVAL;
     };
 
-    let Ok(image) = crate::fs::read_file(path) else {
+    // Same helper as `sys_execve`: symlink-resolved, chunked, fallible — so a
+    // spawn of a link, or of any binary over 16 MiB, loads instead of failing
+    // as ENOENT.
+    let Ok(image) = crate::fs::read_image(path) else {
         return errno::ENOENT;
     };
 
@@ -5444,6 +5508,38 @@ pub fn redirect_test(t: &mut Suite) {
             "proc: opening through /proc/self/exe reads the ELF it names",
             out.windows(4).any(|w| w == b"\x7fELF"),
         );
+    }
+
+    // `chdir`/`getcwd`/`chmod` — the 2026-09-12 dispatch fix
+    // (`docs/archive/RUST_TOOLCHAIN_AMD64.md`). Three properties, each a
+    // different half of the fix: `chdir` moves `Process::cwd` (glue's arm),
+    // `getcwd` *reports* the moved cwd (the old local arm hard-coded `/`), and
+    // a `fork` child inherits it (`Process::inherit_from`) — which is what
+    // `busybox pwd` after a `cd` exercises, because the applet runs as a child
+    // of the shell that did the `cd`. `chmod` exercises the `fchmodat` shim
+    // plus ext2's on-disk mode bits, checked kernel-side through `metadata`.
+    if let Some((status, out)) = run_sh_capture(b"cd /proc && pwd\0") {
+        t.check_eq("cwd: `cd /proc && pwd` exited 0", status, 0);
+        t.check("cwd: and pwd reports the moved directory", out.starts_with(b"/proc"));
+    } else {
+        t.check("cwd: sh spawned for `cd /proc`", false);
+    }
+    let _ = run_sh_capture(b"mkdir -p /tmp/cwdprobe\0");
+    if let Some((status, out)) = run_sh_capture(b"cd /tmp/cwdprobe && busybox pwd\0") {
+        t.check_eq("cwd: forked child's pwd exited 0", status, 0);
+        t.check(
+            "cwd: and the fork child inherited the chdir",
+            out.starts_with(b"/tmp/cwdprobe"),
+        );
+    } else {
+        t.check("cwd: sh spawned for the fork-inheritance probe", false);
+    }
+    if let Some((status, _)) = run_sh_capture(b"echo x > /tmp/modeprobe && chmod 755 /tmp/modeprobe\0") {
+        t.check_eq("chmod: `chmod 755 file` exited 0", status, 0);
+        let mode = akuma_vfs_glue::metadata("/tmp/modeprobe").map(|m| (m.mode & 0o777) as u64);
+        t.check_eq("chmod: and the on-disk mode is 755", mode.unwrap_or(0), 0o755);
+    } else {
+        t.check("chmod: sh spawned for the mode probe", false);
     }
 
     // 1. `>` — the shell's open/dup2/close sequence onto fd 1.

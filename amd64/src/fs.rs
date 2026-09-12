@@ -104,6 +104,68 @@ pub use akuma_vfs_glue::{
     remove_dir, remove_file, rename, resolve_symlinks, set_times, stats_for_path, write_file,
 };
 
+/// The exec-side image read.
+///
+/// `read_file` caps the kernel-side allocation at 16 MiB
+/// (`akuma-ext2`'s `read_inode_data`, an OOM guard for a caller that has no
+/// idea how big the file is) — and a real toolchain binary is bigger:
+/// Alpine's `cc1` is **42 MB**, so every `gcc` run died as
+/// `[execve] load failed: Read past end of image`-adjacent `ENOENT` before a
+/// single byte of it was parsed. The exec path knows exactly what it is
+/// reading and how big it is (`metadata` first), so it can afford what the
+/// generic read cannot:
+///
+/// * the path is **symlink-resolved first** — `sys_execve` read the raw path,
+///   so `cc` (a link to `gcc`) handed the loader the *link text* as the image
+///   and `open`'s resolution never ran on this path;
+/// * the bytes arrive through `read_at` in 64 KiB chunks, which never touches
+///   the cap;
+/// * the chunk buffer and the image are reserved **fallibly**
+///   (`try_reserve_exact`) — under memory pressure this returns `Err` and the
+///   exec fails with `ENOMEM`, rather than taking the kernel down in the
+///   allocator. The chunk lives on the **heap**, deliberately: the kernel
+///   stack is 32 KiB (`sched::STACK_SIZE`), so a 64 KiB `[0u8; CHUNK]` local
+///   is a stack smash, not a buffer — the first boot with a stack array died
+///   in `ClockBlockCache::get` with `cr2 = 0x8e`, several frames after the
+///   overflowing write.
+///
+/// 256 MiB is the hard refusal: past it the load is a mistake, not a
+/// binary. `cc1`'s 42 MB sits well inside, with room for `rustc`'s ~70 MB.
+pub fn read_image(path: &str) -> Result<alloc::vec::Vec<u8>, akuma_vfs_glue::FsError> {
+    use akuma_vfs_glue::FsError;
+    const MAX_IMAGE: usize = 256 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
+
+    let resolved = resolve_symlinks(path);
+    let size = metadata(&resolved)?.size as usize;
+    if size > MAX_IMAGE {
+        return Err(FsError::Internal);
+    }
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(size).is_err() {
+        return Err(FsError::Internal);
+    }
+    let mut chunk: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if chunk.try_reserve_exact(CHUNK).is_err() {
+        return Err(FsError::Internal);
+    }
+    chunk.resize(CHUNK, 0);
+    let mut off = 0;
+    while off < size {
+        let want = (size - off).min(CHUNK);
+        let got = read_at(&resolved, off, &mut chunk[..want])?;
+        if got == 0 {
+            // The metadata said `size`; the file delivered less. A truncated
+            // image is a different failure from a short one — refuse rather
+            // than let the ELF loader find a zero tail.
+            return Err(FsError::Internal);
+        }
+        buf.extend_from_slice(&chunk[..got]);
+        off += got;
+    }
+    Ok(buf)
+}
+
 /// The virtio-blk device, as something `akuma-ext2` can read.
 ///
 /// Device 0 — `vda`, the first disk the machine announced. A second disk would
