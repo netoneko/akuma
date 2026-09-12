@@ -1209,6 +1209,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `ENOSYS` for the whole life of the port and `git clone` chmods every
         // file it writes (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
         90 => return to_glue(Syscall::Fchmodat, [AT_FDCWD, a1, a2, 0, 0, 0]),
+        // `fchown(fd, uid, gid)` — x86_64 93. Its asm-generic twin is `fchown`
+        // (55) and glue answers 0 for it, but this kernel reaches glue through
+        // `Syscall`, which only names the `*at` spelling — so it shims like
+        // `chmod` above. `tar`/`apk` chown every file they unpack.
+        93 => return to_glue(Syscall::Fchownat, [u64::from(a1 as u32), 0, a2, a3, 0, 0]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`
@@ -1312,6 +1317,29 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `rust-lld` reported `cannot open output file` for a file it had
         // already opened successfully.
         Syscall::Ftruncate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // ── 2026-09-12: the batch the in-guest `cargo` asked for ───────────
+        //
+        // Every one of these had a number in `akuma-syscalls-linux` and an arm
+        // in `akuma-syscalls-glue`, and no row in `akuma-syscalls-abi`. They
+        // were found the way the last three were — by the console naming the
+        // number (`[syscall] no row for x86_64 nr=…`) while `cargo` ran — and
+        // none of them needed an implementation written.
+        //
+        // `pwrite64` is the one with a visible symptom: **SQLite writes with
+        // it**, cargo's global cache is a SQLite database, and every in-guest
+        // cargo invocation opened with `disk I/O error / Error code 778`.
+        Syscall::Pwrite64 => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        // `pwritev2` needs its `flags`, which is the **sixth** argument.
+        Syscall::Pwritev2 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        Syscall::Linkat => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        Syscall::Fchownat => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        Syscall::Membarrier => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::Prctl => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        // `rustc` sizes its codegen thread pool from this one, so an `ENOSYS`
+        // was quietly making every in-guest build single-threaded.
+        Syscall::SchedGetaffinity => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::Umask => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::Fsync | Syscall::Fdatasync => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `socketpair(domain, type, protocol, sv)` — glue's AF_UNIX pair, two
         // kernel pipes behind two `FileDescriptor::UnixSocket` entries. It
         // needs no arm of its own here beyond the hop: the descriptors land in

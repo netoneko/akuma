@@ -3224,6 +3224,30 @@ the bugs it found are the ones an emulator does not have: a framebuffer BAR at
 `mmap`-bound BKL under a toolchain load, and a USB root that mounts clean and
 stalls under use.
 
+### The timeline
+
+Every date below is the header of the document beside it, so the chain is
+checkable rather than remembered.
+
+| date | milestone | doc |
+|---|---|---|
+| **09-03** | first long mode, under Firecracker — PVH ELF64, serial console | this doc |
+| 09-04 | stages A-K: heap/PMM, 4-level paging, IDT + demand paging, LAPIC timer, context switching, ring 3 with real Linux syscalls, isolated address spaces, higher-half kernel | this doc |
+| **09-05** | **first boot on real hardware** — the HP box from a GRUB entry, UEFI + multiboot2, framebuffer console | `AKUMA_AMD64_ON_HP_500_502NJ.md`, `AMD64_SMP_BRINGUP.md` |
+| 09-06 | a real Rust `std` binary runs in ring 3 — `clone`, futex, threads; CoW fork; xHCI bring-up begins | `AKUMA_AMD64_RUST_STD.md`, `AKUMA_AMD64_COW.md`, `AKUMA_AMD64_USB_XHCI.md` |
+| 09-07 | `akuma-mmap` regions + demand paging; the six memory gaps closed; the dispatch vocabulary split into `akuma-syscalls-abi` | `AKUMA_AMD64_MMAP_REGIONS.md`, `AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md` |
+| 09-11 | signal delivery, `^C` over ssh, session stdio as one `ProcessChannel` | `AKUMA_AMD64_SIGNAL_DELIVERY.md`, `AKUMA_AMD64_SSHD_SESSION_CHANNEL.md` |
+| 09-12 | the clock (C3) — closes trunk C | `AKUMA_AMD64_C3_CLOCK.md` |
+| **09-12** | **`rustc` compiles, links and runs** — in the guest, then the same day on the metal | `RUST_TOOLCHAIN_AMD64.md` § session 3 |
+| **09-12** | **`cargo` builds workspace crates in the guest** | `RUST_TOOLCHAIN_AMD64.md` § session 4 |
+
+Two things that shape are worth noticing. The gap between "a Rust `std` binary
+runs" (09-06) and "`rustc` runs" (09-12) is six days and almost none of it was
+about Rust: it was signals, the clock, ssh, and four missing dispatch rows. And
+the last four defects before a linked binary were all **absences** rather than
+bugs — an `argv` cap, `ftruncate`, `socketpair`, `pwrite` — each with a working
+implementation already compiled into the kernel and no number pointing at it.
+
 Between the first boot and `rustc`: the ELF loader, ring 3, isolated address spaces,
 preemption, CoW `fork`, `execve`, signals, a clock, SMP, ext2, a network stack,
 sshd, and — at the end — four kernel defects that stood between a working

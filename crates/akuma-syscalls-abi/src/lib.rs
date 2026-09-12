@@ -193,6 +193,30 @@ syscall_table! {
     /// for it at all — `mmapsum`'s `read()` reference arm aborted at offset 0
     /// and every archive reader and `rustc` metadata load goes through it.
     Pread64    => PREAD64    = 17,  nr::PREAD64;
+    /// Positional write — [`Pread64`]'s other half, and missing while that one
+    /// was present, which is the shape of gap a table maintained by hand grows.
+    ///
+    /// Added 2026-09-12: **it is how SQLite writes.** `cargo`'s global cache is
+    /// a SQLite database, so every in-guest `cargo` invocation opened with
+    /// `disk I/O error / Error code 778` — `SQLITE_IOERR_WRITE`, an errno-free
+    /// complaint from a library three layers above the missing number. cargo
+    /// warns and carries on, so this cost no builds; it cost the *reading* of
+    /// every build's output.
+    Pwrite64   => PWRITE64   = 18,  nr::PWRITE64;
+    /// Positional vectored write with flags. `pwritev2` is what a libc reaches
+    /// for when it has both an offset and an iovec; glue serves it through the
+    /// same `sys_pvec2` as `preadv2`.
+    Pwritev2   => PWRITEV2   = 328, nr::PWRITEV2;
+    /// Flush a descriptor's writes. The **next** wall after [`Pwrite64`], and
+    /// the errno said so in as many words: with `pwrite` dispatched, cargo's
+    /// SQLite complaint changed from `Error code 778` (`SQLITE_IOERR_WRITE`) to
+    /// `1034` (`SQLITE_IOERR_FSYNC`) on the very next run.
+    Fsync      => FSYNC      = 74,  nr::FSYNC;
+    /// Data-only flush. Added with [`Fsync`] rather than after it: it is the
+    /// same operation with a narrower contract, glue implements both, and
+    /// which one SQLite issues is chosen at **runtime** by journal mode — so
+    /// "a caller needs it" is already true of the caller that needed `fsync`.
+    Fdatasync  => FDATASYNC  = 75,  nr::FDATASYNC;
     /// Set a file's length through an open descriptor. Added 2026-09-12: it
     /// had a handler in `akuma-syscalls-glue` and a number in
     /// `akuma-syscalls-linux` and no row here, so `rust-lld` — which creates
@@ -247,6 +271,15 @@ syscall_table! {
     /// x86_64 268, asm-generic 53. The neutral spelling `chmod`(90) shims to.
     Fchmodat   => FCHMODAT   = 268, nr::FCHMODAT;
 
+    /// Hard link, `*at`-style. **`cargo` hardlinks build artifacts** into
+    /// `target/`, which is what made this the first of the 2026-09-12 batch to
+    /// be noticed: an `ENOSYS` here is a build that either copies instead
+    /// (slower, silently) or fails, depending on the caller's fallback.
+    Linkat     => LINKAT     = 265, nr::LINKAT;
+    /// Change owner, `*at`-style. The x86-only `fchown`(93) shims to it in
+    /// `amd64/src/usermode.rs`, the same way `chmod`(90) shims to `fchmodat`.
+    Fchownat   => FCHOWNAT   = 260, nr::FCHOWNAT;
+
     // ── readiness ──────────────────────────────────────────────────────────
     /// asm-generic has no `poll`(7) or `select`(23) — `ppoll` and `pselect6`
     /// are the only spellings — so the amd64 kernel's `7`/`23` arms are shims
@@ -275,6 +308,10 @@ syscall_table! {
     /// Added 2026-09-07. `akuma_syscalls_mem::mremap` holds the
     /// move-vs-expand decision both kernels build against.
     Mremap     => MREMAP     = 25,  nr::MREMAP;
+
+    /// Process-wide memory barrier. `akuma-syscalls-mem` has decoded its
+    /// command set since that crate existed; only the number was absent.
+    Membarrier => MEMBARRIER = 324, nr::MEMBARRIER;
 
     // ── process lifecycle ──────────────────────────────────────────────────
     /// x86-only `fork`(57)/`vfork`(58) narrow to this with `CLONE_VM` clear;
@@ -318,6 +355,18 @@ syscall_table! {
     Getpgid    => GETPGID    = 121, nr::GETPGID;
     Setsid     => SETSID     = 112, nr::SETSID;
     Getsid     => GETSID     = 124, nr::GETSID;
+
+    /// Per-process operations — thread names, `PR_SET_*`. Rust `std` sets a
+    /// thread's name through it, so every spawned thread in every Rust program
+    /// on this target was making a failing syscall.
+    Prctl      => PRCTL      = 157, nr::PRCTL;
+    /// Which CPUs this process may run on. **`rustc` sizes its codegen thread
+    /// pool from it**, so `ENOSYS` here quietly makes every in-guest build
+    /// single-threaded — a performance answer delivered as an error.
+    SchedGetaffinity => SCHED_GETAFFINITY = 204, nr::SCHED_GETAFFINITY;
+    /// File-creation mask. musl reads it during start-up; glue answers the
+    /// conventional `0o022` rather than tracking one.
+    Umask      => UMASK      = 95,  nr::UMASK;
 
     // ── signals ────────────────────────────────────────────────────────────
     // Named here because both kernels dispatch the numbers. Every row below
@@ -692,6 +741,53 @@ mod tests {
     /// Modelled on `akuma-firecracker`'s `no_address_is_hardcoded`, and for the
     /// same reason: the failure this guards against is a second table that was
     /// copied from the first, which looks correct until it is used. If this ever
+    /// The rows added for the in-guest `cargo`, pinned by **both** numbers.
+    ///
+    /// `syscall_table!` generates the decodes from one row, so the macro cannot
+    /// let the two halves drift — but nothing stops a row from carrying a
+    /// transposed digit, and the failure mode of that is the worst one this
+    /// crate has: a call dispatched to the **wrong handler**, silently. x86_64
+    /// `symlink`(88) once reached `sys_utimensat`, which returns 0, so `ln -s`
+    /// reported success and created nothing for months
+    /// (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`).
+    ///
+    /// Written out here rather than derived, because a test that computes the
+    /// expected number the same way the table does agrees with itself. Every
+    /// pair below was read off a running guest's `[syscall] no row for x86_64
+    /// nr=…` line and checked against `asm-generic/unistd.h`.
+    #[test]
+    fn the_cargo_batch_carries_both_numbers() {
+        for (call, x86, generic) in [
+            (Syscall::Pwrite64, 18u64, 68u64),
+            (Syscall::Umask, 95, 166),
+            (Syscall::Prctl, 157, 167),
+            (Syscall::SchedGetaffinity, 204, 123),
+            (Syscall::Fchownat, 260, 54),
+            (Syscall::Linkat, 265, 37),
+            (Syscall::Membarrier, 324, 283),
+            (Syscall::Pwritev2, 328, 287),
+            (Syscall::Fsync, 74, 82),
+            (Syscall::Fdatasync, 75, 83),
+        ] {
+            assert_eq!(
+                Syscall::from_x86_64(x86),
+                Some(call),
+                "x86_64 {x86} must decode to {call:?}"
+            );
+            assert_eq!(call.to_x86_64(), x86, "{call:?} must encode back to {x86}");
+            assert_eq!(
+                call.to_aarch64(),
+                generic,
+                "{call:?} must reach glue as asm-generic {generic}"
+            );
+            assert_eq!(
+                Syscall::from_aarch64(generic),
+                Some(call),
+                "asm-generic {generic} must decode to {call:?}"
+            );
+        }
+    }
+
     /// passes trivially — because someone "unified" the numbering — the bug it
     /// exists to catch is already in the tree.
     #[test]

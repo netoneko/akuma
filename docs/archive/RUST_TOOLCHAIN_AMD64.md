@@ -469,8 +469,6 @@ Two things fall out of that table beyond the root cause:
   where none should, while a real signal arrives nowhere. Worth one probe of
   its own.
 
-### Staging the toolchain
-
 **Workarounds today**, in order of preference:
 
 * `-C linker-flavor=ld -C linker=<sysroot>/lib/rustlib/x86_64-unknown-linux-musl/bin/gcc-ld/ld.lld -C link-self-contained=yes`
@@ -478,6 +476,104 @@ Two things fall out of that table beyond the root cause:
   combination that compiled, linked and ran a program.
 * `-C linker=/usr/bin/cc` plus a `PATH` carrying `/usr/bin` and gcc's exec
   prefix, which then meets items 4 and 5.
+
+### Session 4 (2026-09-12, evening): `cargo`, and the numbers it asked for
+
+**`cargo` builds in the guest.** `cargo --version` in 0.6 s, a hello-world crate
+built and run, and `akuma-syscalls-abi` + `akuma-syscalls-linux` compiled **out
+of the real workspace** in 1.82 s. The kernel's own build (`-p akuma-amd64
+--target x86_64-unknown-none --release`) gets 18 crates in — past `proc-macro2`,
+`quote` and `syn`, which is where the AArch64 side's self-host wall stood.
+
+#### Staging source without `git`
+
+`git` cannot clone here (`curl_multi_init failed` — `eventfd2`, above), so the
+source is staged the way the AArch64 self-host staged its dependencies:
+
+```sh
+git archive HEAD | tar -x -C /root/akuma-src      # 35 MB, tracked files only
+cd /root/akuma-src && cargo vendor vendor         # 54 MB with the graph
+# then APPEND the vendored-sources replacement to .cargo/config.toml
+```
+
+`git archive`, not `cp -a`: it takes exactly the tracked files at a named
+commit, leaves `target/` and every vendored submodule behind (this tree's
+submodules are ~37 GB), and the result is reproducible from a commit id.
+**Append** to `.cargo/config.toml` rather than write it — that file carries the
+per-target linker and rustflags, and overwriting it produces a tree that cannot
+link.
+
+#### Three environment facts, none of them cargo's fault
+
+* **`cargo` needs `$HOME`** — "Cargo couldn't find your home directory". The
+  spawned-child environment is empty here, so it must be passed explicitly.
+* **`$PATH` must carry gcc's exec prefix** for the link step, as `rustc` does.
+* **A long, silent ssh exec channel is killed**, which made the first two build
+  attempts look like stalls at 18 crates when they had simply been shot. The
+  build must be detached (`setsid`, output to a file) and polled.
+
+#### The batch of missing rows `cargo` found
+
+Ten distinct numbers came back as `[syscall] no row for x86_64 nr=…` during one
+cargo run. Eight had a number in `akuma-syscalls-linux` **and** an arm in
+`akuma-syscalls-glue`, and needed only a row — the `ftruncate` shape, for the
+fourth time:
+
+| x86_64 | asm-generic | call | what it cost |
+|---|---|---|---|
+| 18 | 68 | `pwrite64` | **cargo's `disk I/O error`** — below |
+| 328 | 287 | `pwritev2` | — |
+| 74 | 82 | `fsync` | the next wall after `pwrite64` — below |
+| 75 | 83 | `fdatasync` | added with `fsync`: same operation, chosen at runtime by journal mode |
+| 265 | 37 | `linkat` | cargo hardlinks build artifacts into `target/` |
+| 260 | 54 | `fchownat` | `tar`/`apk` chown what they unpack; x86-only `fchown`(93) shims to it |
+| 204 | 123 | `sched_getaffinity` | **`rustc` sizes its codegen thread pool from it** — `ENOSYS` was quietly making every in-guest build single-threaded |
+| 157 | 167 | `prctl` | Rust `std` names its threads through it |
+| 95 | 166 | `umask` | musl start-up |
+| 324 | 283 | `membarrier` | `akuma-syscalls-mem` had decoded its commands all along |
+
+Not added, and that is the rule working rather than an omission: **`sendfile`
+(40)** and **`copy_file_range` (326)** have no asm-generic number in
+`akuma-syscalls-linux` and no implementation in glue. `ENOSYS` is the correct
+answer for both — their callers fall back to `read`/`write` — and inventing a
+number would dispatch them into whatever happens to sit there.
+
+Pinned by a host test (`the_cargo_batch_carries_both_numbers`) that writes out
+**both** numbers for every row rather than deriving either: a test that computes
+the expected number the way the table does agrees with itself, and the failure
+mode of a transposed digit here is a call reaching the *wrong handler* silently
+— which is what `ln -s` did for months.
+
+#### `disk I/O error` was `pwrite`, and the errno said so twice
+
+Every in-guest `cargo` invocation opened with:
+
+```
+disk I/O error
+
+Caused by:
+  Error code 778: disk I/O error
+warning: failed to auto-clean cache data
+```
+
+cargo's global cache is a **SQLite database**, and `778` is
+`SQLITE_IOERR_WRITE`. SQLite writes with `pwrite`, which had no row. Adding it
+did not make the message go away — it **changed the number**:
+
+```
+  Error code 1034: disk I/O error      # SQLITE_IOERR_FSYNC
+```
+
+`fsync`, the very next thing a committing database does, also rowless. With both
+dispatched, cargo runs clean. Two things worth keeping:
+
+* The complaint was never about the disk. It is a library three layers above the
+  missing number reporting the only thing it can see, and the **extended** errno
+  — `778`, then `1034` — is what named the syscall each time. Read the extended
+  code, not the message.
+* It was non-fatal throughout: cargo warned and carried on, so it cost no
+  builds. What it cost was the legibility of every build's output, which is how
+  it survived being noticed at all.
 
 ### Staging the toolchain
 
