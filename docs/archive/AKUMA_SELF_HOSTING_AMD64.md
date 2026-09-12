@@ -1495,10 +1495,14 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   untouched. A third closed on the way in: the shared
    │   `sys_nanosleep` had no argument validation, and `tv_sec = -1`
    │   reinterprets to a ~584 000-year park.
-   │   Gates: QEMU 665/0 (`SMP=1`, from 656/0) and 675/0 (`SMP=4`),
+   │   Gates, on all four rigs: QEMU 665/0 (`SMP=1`, from 656/0) and
+   │   675/0 (`SMP=4`), Firecracker/KVM 653/0, **bare metal 665/0**,
    │   AArch64 315/0, host tests 1377/0, memory probes 10/10, ring-3
-   │   check OK, `^C` KILLED after 3.3 s. **Bare metal owed** — the box
-   │   was in use by another session.
+   │   check OK, `clockprobe` 12/12 on QEMU *and* the metal *and* real
+   │   Linux, `^C` KILLED after 3.3 s (QEMU) / 3.4 s (metal).
+   │   The metal's wall clock is within **1 s** of the host's, and
+   │   `sleep 3` takes 3.51 s there against 0.63 s under TCG — same
+   │   kernel, so the ~5x skew is the emulated LAPIC.
    │                        doc: AKUMA_AMD64_C3_CLOCK.md
    ▼
  [09-12] ═══ YOU ARE HERE ═══
@@ -1536,9 +1540,12 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
 
         Smaller, and carried rather than blocking:
 
-        * **A bare-metal number is owed** for C3, and one has been owed
-          for the `execve`-returns piece since 09-11. Both want one boot
-          on a box that was in use by another session.
+        * **The bare-metal number owed for the `execve`-returns piece
+          since 09-11 is paid *on the RAM image*** — the 09-12 metal
+          boot that scored C3's 665/0 carries that change too. What it
+          does **not** re-measure is the `root=/dev/sda1` path, which is
+          where that boot's `634/3` came from: three `xhci:` failures
+          and the RAM fallback, i.e. item 1 above, not the kernel.
         * `busybox stty size` still fails over ssh (`stty: standard
           input`), **pre-existing** — A/B'd against `75041b73` on the
           same rig, identical — and now reports `ENOTTY` where it used

@@ -4,15 +4,19 @@
 **Scope:** box C3 of `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — "`clock.rs`
 dies; `akuma-syscalls-time` builds here; real clock: re-sync, drift, itimers,
 adjtimex". The last box of trunk C.
-**Status:** done. QEMU/TCG `SMP=1` **665/0** (from a measured 656/0 baseline —
-nine new checks, all in the dispatch smoke test) and `SMP=4` **675/0** (no
-separate `SMP=4` baseline was taken), AArch64
-**315/0** at `SMP=4`, host tests **1377/0**, memory probes **10/10**,
-`amd64_ring3_check` **OK**, `/probes/clockprobe` **12/12** on the guest and
-**12/12** on real Linux, `amd64_ctrlc_probe` KILLED after 3.3 s. Bare metal is
-owed — the box was in use by another session; nothing here is
-hardware-specific, and the one thing that would differ (a TSC-derived uptime)
-was deliberately not attempted. See § 7.
+**Status:** done, on all four rigs. QEMU/TCG `SMP=1` **665/0** (from a measured
+656/0 baseline — nine new checks, all in the dispatch smoke test) and `SMP=4`
+**675/0**; Firecracker/KVM on the box `SMP=4` **653/0**; **bare metal 665/0**;
+AArch64 **315/0** at `SMP=4`; host tests **1377/0**; memory probes **10/10**;
+`amd64_ring3_check` **OK**; `/probes/clockprobe` **12/12** on QEMU, **12/12 on
+bare metal** and **12/12 on real Linux**; `amd64_ctrlc_probe` KILLED after
+3.3 s (QEMU) and 3.4 s (metal).
+
+**The metal's clock is right to the second.** `date -u +%s` against the host at
+the same instant: **skew −1 s**, from SNTP through the LAN. And `busybox
+sleep 3` takes **3.51 s** of real time there against **0.63 s** under QEMU/TCG
+— the same kernel, the same arithmetic, so the ~5× skew is the emulated LAPIC
+and not this code. See § 7.
 
 ---
 
@@ -295,10 +299,10 @@ which cost one boot to work out.
 - **`getitimer` (x86_64 36) is still `ENOSYS`.** Glue has no arm for
   asm-generic 102 either, so there was nothing to reach; both kernels lack it
   equally.
-- **The QEMU/TCG guest clock still runs ~5× wall-clock.** Measured again here:
-  `busybox sleep 3` returns in 0.63 s of host time. The metal is correct
-  (`sleep 10` → 10.49 s, 2026-09-11), so this is the emulated LAPIC and not the
-  kernel's arithmetic. Every rung of `clockprobe` that measures a sleep does it
+- **The QEMU/TCG guest clock still runs ~5× wall-clock.** Both halves measured
+  here on the same kernel: `busybox sleep 3` returns in **0.63 s** of host time
+  under QEMU/TCG and **3.51 s** on the metal, whose wall clock is within **1 s**
+  of the host's. So this is the emulated LAPIC and not the kernel's arithmetic. Every rung of `clockprobe` that measures a sleep does it
   against the *guest's own* monotonic clock for that reason — what must hold is
   that the clock a program steers by and the sleep it asks for agree with each
   other.
@@ -322,10 +326,15 @@ which cost one boot to work out.
 | `/probes/clockprobe` on real Linux (aarch64 musl, Lima) | **12/12, rc=0** |
 | `amd64_mem_trials.py --local-only` | **10/10**, 0 unexpected failures |
 | `amd64_ctrlc_probe.py` | **KILLED after 3.3 s** |
+| `amd64_trials.py --remote-only --smp 4` (Firecracker/KVM on the box) | **653 passed, 0 failed** |
+| **bare metal**, RAM image, `init=/bin/sshd` | **665 passed, 0 failed** — same number as QEMU `SMP=1`. Staged with no `root=`, so the USB controller is not touched: this does not re-measure the `root=/dev/sda1` path, which is still item 1 of the walk's YOU-ARE-HERE |
+| `/probes/clockprobe` on bare metal | **12/12, rc=0** |
+| `amd64_ctrlc_probe.py` against the metal | **KILLED after 3.4 s** |
+| the metal's wall clock vs the host's, same instant | **−1 s** |
+| `busybox sleep 3` on the metal / under QEMU-TCG | **3.51 s** / 0.63 s |
 | AArch64 `MEMORY=2048 SMP=4 cargo run --release` | **315 passed, 0 failed** |
 | `cargo test` (host) | **1377 passed, 0 failed** |
-| clippy, every touched crate + both kernels | clean at `-D warnings` |
-| bare metal | **owed** — the box was in use by another session |
+| clippy, every crate + both kernels + `extreme-size` | clean at `-D warnings` |
 
 ## Background
 
