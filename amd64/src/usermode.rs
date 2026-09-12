@@ -986,8 +986,10 @@ pub fn exit_current_from_signal(sig: u32) {
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     use crate::fd::errno;
 
-    /// `AT_FDCWD` — "relative to the current directory", which on a target with
-    /// no per-process cwd means relative to the root. What every legacy,
+    /// `AT_FDCWD` — "relative to the current directory". Every process here
+    /// starts at `/` and only `chdir` moves it, so for most of the process's
+    /// life this is the root; the resolution against `Process::cwd` happens in
+    /// `akuma_syscalls_glue::fs::resolve_path_at`, not here. What every legacy,
     /// non-`at` path syscall below passes to its `*at` implementation.
     const AT_FDCWD: u64 = (-100i64) as u64;
 
@@ -1146,8 +1148,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `open(path, flags, mode)` — x86_64 2. x86_64 musl issues this directly
         // (it only falls back to `openat` on architectures without `open`, like
         // aarch64), so `busybox cat` hit `ENOSYS` here until now. `openat`
-        // ignores the dirfd for absolute paths and treats a relative one as
-        // root-relative, which is what `AT_FDCWD` means on a target with no cwd.
+        // resolves the relative path against `Process::cwd` (the root until a
+        // `chdir` moves it), which is what `AT_FDCWD` means.
         2 => return crate::fd::sys_openat(AT_FDCWD, a1, a2, a3),
         // `access(path, mode)` — existence only. This target has one user (root)
         // and no per-file exec tracking worth trusting, so "the path resolves"
@@ -1202,6 +1204,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `readlink(path, buf, size)` — x86_64 89. Was a flat EINVAL while no
         // symlink could exist; `symlinkat` made package symlinks real.
         89 => return to_glue(Syscall::Readlinkat, [AT_FDCWD, a1, a2, a3, 0, 0]),
+        // `chmod(path, mode)` — x86_64 90. No asm-generic twin (`fchmodat` is
+        // the modern spelling), so per rule 2 it is an `AT_FDCWD` shim. It was
+        // `ENOSYS` for the whole life of the port and `git clone` chmods every
+        // file it writes (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+        90 => return to_glue(Syscall::Fchmodat, [AT_FDCWD, a1, a2, 0, 0, 0]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`
@@ -1305,6 +1312,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Writev => sys_writev(a1, a2, a3),
         Syscall::Readv => sys_readv(a1, a2, a3),
         Syscall::Openat => crate::fd::sys_openat(a1, a2, a3, a4),
+        // `chdir(path)` / `fchmod(fd, mode)` / `fchmodat(dirfd, path, mode)` —
+        // **glue's arms, with no preamble** (2026-09-12). All three have been
+        // implemented in `akuma-syscalls-glue` since before this port existed;
+        // the numbers just had no variants in `akuma-syscalls-abi`, so they
+        // died as `ENOSYS` at the decode above — `git clone` on `chmod`,
+        // busybox `top` on `chdir("/proc")`
+        // (`docs/archive/RUST_TOOLCHAIN_AMD64.md`). Glue's `sys_chdir` reads
+        // and writes `Process::cwd` — the per-process cwd this file's older
+        // comments describe as absent — and every `*at` arm already resolves
+        // `AT_FDCWD` against it through `resolve_path_at`, so a successful
+        // `chdir` takes effect on the paths userspace opens next with no
+        // further wiring. x86-only `chmod`(90) arrives as the `Fchmodat` shim
+        // in the legacy block above.
+        Syscall::Chdir => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::Fchmod => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::Fchmodat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `close(fd)` — **served by glue** (4b batch 2b). Two prerequisites had
         // to land before this arm could move, and neither was in the plan:
         // the two kernels had to share **one pipe table** (glue's `sys_close`
@@ -1747,18 +1770,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Getpgid | Syscall::Getsid => 1,
         // `setpgid`/`setsid` accept and report id 1.
         Syscall::Setpgid | Syscall::Setsid => 0,
-        // `getcwd(buf, size)` — this target has no per-process cwd; it is always
-        // root. Linux returns the length *including* the NUL.
-        Syscall::Getcwd => {
-            if a1 == 0 || a2 < 2 {
-                return errno::EINVAL;
-            }
-            // A user buffer of at least `a2` bytes, `a2 >= 2` checked.
-            if !crate::uaccess::write_bytes(a1, b"/\0") {
-                return errno::EFAULT;
-            }
-            2
-        }
+        // `getcwd(buf, size)` — **glue's arm** (2026-09-12). The local version
+        // here predated per-process cwd and hard-coded `/`; since `Chdir`
+        // landed above, a `getcwd` that ignored `Process::cwd` would report a
+        // directory the process is not in. Glue returns the length *including*
+        // the NUL, same as the arm it replaces.
+        Syscall::Getcwd => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `mprotect` — real since the region table landed (2026-09-07). It
         // splits the regions the range crosses and re-permissions the pages
         // that are present; see `mm::sys_mprotect` for why it was `return 0`

@@ -226,6 +226,19 @@ syscall_table! {
     Readlinkat => READLINKAT = 267, nr::READLINKAT;
     Faccessat  => FACCESSAT  = 269, nr::FACCESSAT;
     Utimensat  => UTIMENSAT  = 280, nr::UTIMENSAT;
+    /// `chdir` — added 2026-09-12 after `busybox top` (`can't change directory
+    /// to '/proc'`) and `git clone` both died on `ENOSYS`: the implementation
+    /// (`akuma_syscalls_glue::fs::sys_chdir`) has been shared since before the
+    /// amd64 port, but the number had no variant, so `from_x86_64(80)` answered
+    /// `None` at the boundary. x86-only `chmod`(90) has no asm-generic twin and
+    /// stays a shim, narrowing to [`Self::Fchmodat`] with `AT_FDCWD`.
+    Chdir      => CHDIR      = 80,  nr::CHDIR;
+    /// x86_64 91, asm-generic 52. Same session as [`Self::Chdir`] — the arm was
+    /// `ENOSYS` while glue's `sys_fchmod` and the ext2 mode bits behind it were
+    /// real, and `git` chmods every file it writes.
+    Fchmod     => FCHMOD     = 91,  nr::FCHMOD;
+    /// x86_64 268, asm-generic 53. The neutral spelling `chmod`(90) shims to.
+    Fchmodat   => FCHMODAT   = 268, nr::FCHMODAT;
 
     // ── readiness ──────────────────────────────────────────────────────────
     /// asm-generic has no `poll`(7) or `select`(23) — `ppoll` and `pselect6`
@@ -741,8 +754,10 @@ mod tests {
         // `open`, `stat`, `lstat`, `poll`, `access`, `pipe`, `select`, `dup2`,
         // `fork`, `vfork`, `rename`, `mkdir`, `rmdir`, `unlink`, `symlink`,
         // `readlink`, `gettimeofday`, `getpgrp`, `arch_prctl`, `settimeofday`,
-        // `time`.
-        for n in [2u64, 4, 6, 7, 21, 22, 23, 33, 57, 58, 82, 83, 84, 87, 88, 89, 96, 111, 158, 164, 201]
+        // `time`, `chmod`. (`chmod` has no asm-generic twin — `fchmod`/`fchmodat`
+        // do — so it narrows to `fchmodat(AT_FDCWD, …)` in the amd64 kernel
+        // rather than getting a row.)
+        for n in [2u64, 4, 6, 7, 21, 22, 23, 33, 57, 58, 82, 83, 84, 87, 88, 89, 90, 96, 111, 158, 164, 201]
         {
             assert_eq!(
                 Syscall::from_x86_64(n),
@@ -760,6 +775,19 @@ mod tests {
     fn newly_named_asm_generic_numbers() {
         assert_eq!(Syscall::Syslog.to_aarch64(), 116);
         assert_eq!(Syscall::Getsid.to_aarch64(), 156);
+    }
+
+    /// The `chdir`/`fchmod`/`fchmodat` rows of 2026-09-12 — the calls whose
+    /// implementations pre-dated their numbers on amd64
+    /// (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+    #[test]
+    fn cwd_and_mode_rows() {
+        assert_eq!(Syscall::Chdir.to_x86_64(), 80);
+        assert_eq!(Syscall::Chdir.to_aarch64(), nr::CHDIR);
+        assert_eq!(Syscall::Fchmod.to_x86_64(), 91);
+        assert_eq!(Syscall::Fchmod.to_aarch64(), nr::FCHMOD);
+        assert_eq!(Syscall::Fchmodat.to_x86_64(), 268);
+        assert_eq!(Syscall::Fchmodat.to_aarch64(), nr::FCHMODAT);
     }
 
     // ── the open(2) flag vocabulary ──────────────────────────────────────

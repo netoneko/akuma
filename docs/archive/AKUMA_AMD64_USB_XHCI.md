@@ -1134,6 +1134,55 @@ now says how long it waited: `transfer timeout: data after 10000 ms`.
   `tsc 997 MHz` under TCG.
 - clippy clean on `akuma-xhci` (host, all targets) and `akuma-amd64`.
 
-### Metal
+### Metal (2026-09-12, one boot, 27 min)
 
-See the next section, written after the soak.
+Deployed with `hpbox.deploy()` (box at `fa6a9f42` + a 1053-line patch),
+`stage("root=/dev/sda1")` — **no `restage_disk`**, the glibc runtime on the
+partition survived — and `reboot_to("akuma")`. Boot: `port 21 USB3`, `speed
+4`, `fs: ext2 mounted on /dev/sda1`, all 11 `xhci:` checks `[OK]`, and the
+new calibration line:
+
+```
+lapic: calibrated vs PIT: 62360 counts per 10000us (99 MHz); tsc 3192 MHz
+```
+
+Then a 25-minute soak (`scratchpad/disk_soak.py`, laptop-driven): 13 cycles
+of push 24 MiB of `os.urandom` over ssh → `busybox md5sum` on the box, twice
+→ re-read the previous cycle's file → `ls -la /lib /var /root` → 75 s idle →
+first access timed. Result: **13/13 md5 matches, 0 mismatches, 0 transfer
+timeouts, 0 recovery events** in the kernel log for the whole run. Writes
+took 24–33 s per 24 MiB (the ssh push path, not the disk — the box hashes
+the same file in 1.0 s), post-idle first access 0.4–0.7 s every time,
+`lib`/`var` never vanished, `df` kept answering, the same ssh sessions
+worked throughout, and the box never reset.
+
+**What this does and does not prove.** The previous kernel on this box
+produced a "stall" roughly every 15 s of use and one every idle gap; this
+one produced none in 27 minutes of the same shape of load. Given `tsc 3192
+MHz`, the budget it replaced was 0.31 s — so most of those stalls were a
+slow device read as a dead one, and the fix that is *proven* on the metal is
+the budget. The Stop Endpoint + Set TR Dequeue Pointer abort path is proven
+on the host model (19,683 scripts, zero illegal steps) and correct against
+the spec and NetBSD's encoding, but **it did not fire on the metal in this
+run, because nothing timed out for it to abort.** Do not read this section
+as "the abort path works on the Intel controller"; read it as "the disk no
+longer stalls under this load, and if it ever does, the path that runs is
+now the legal one". To exercise it deliberately: from Ubuntu, `hdparm -S 12
+/dev/sdb` (60 s standby timer) before the boot, then idle Akuma past it and
+watch the first access — a real spin-up from standby is the case the 10 s
+budget and the NOT READY retry exist for.
+
+**The ssh readback trap, found on the way.** The harness first compared the
+laptop-side md5 of `ssh akuma cat file` and reported a mismatch on a file
+the box hashed correctly. The bytes over ssh were 25 264 169 for a
+25 165 824-byte file — one extra byte per 256: the session channel emits CR
+before every LF. Byte-exact verification of disk contents on this target is
+`busybox md5sum` on the box, full stop. A second finding from the same
+abort — a `cat` left blocked on the dead channel that even `SIGKILL` cannot
+remove — is `AKUMA_SELF_HOSTING_AMD64.md` open issue 6.
+
+**Still there:** `[BKL] stuck … tag=1 / tag=57` bursts around every 24 MiB
+write (the `write(2)` flush at `close` runs BKL-held for the whole flush),
+per the context-switch analysis in
+`AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`. Nothing froze; noted, not
+fixed here.

@@ -659,9 +659,8 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
 /// arms that have not folded — is no longer in the `open` path at all. Two
 /// differences come with that swap and both are gains: a bogus negative
 /// `dirfd` is `EBADF` rather than `ENOTDIR`, and `AT_FDCWD` resolves against
-/// the process's `cwd` rather than against `/` — which is `/` for every
-/// process here until this target grows `chdir`, and correct on the day it
-/// does.
+/// the process's `cwd` rather than against `/` — `/` for every process until a
+/// `chdir` moves it, which the target has served since 2026-09-12.
 pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_ as u32);
 
@@ -1375,8 +1374,8 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
 /// `AT_EMPTY_PATH` (stat the fd itself) redirects to [`sys_fstat`] here rather
 /// than in glue, because that is where the fd-vs-path branch has always been.
 /// Every other path resolves through `akuma_syscalls_glue::fs::resolve_path_at`
-/// — `Process::cwd`-relative, `/` for every process on this target until it
-/// grows `chdir`.
+/// — `Process::cwd`-relative; `/` until a `chdir` moves it (served since
+/// 2026-09-12).
 pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
     const AT_EMPTY_PATH: u64 = 0x1000;
     let Some(raw) = path_from_user(path) else {

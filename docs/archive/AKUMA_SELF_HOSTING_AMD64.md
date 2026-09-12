@@ -2049,6 +2049,29 @@ ladder, and this target's CoW is newer than that fix.
 On the metal it needed a power cycle — the one-shot GRUB entry means the box
 comes back on Ubuntu, so recovery is a button press, not a reinstall.
 
+### 6. A writer on a dead session channel is unkillable — even by SIGKILL (found 2026-09-12)
+
+A laptop-side harness was aborted mid-`ssh akuma "cat /root/soak2.bin"`. The
+ssh connection died; the box-side `cat` (pid 81) did not. `ps` showed it at
+`0:00` for twenty minutes afterwards, parked in `write(1, …)` on the session
+channel the connection had been. `kill -9 81` from another session **did
+nothing** — while `sleep 300 & kill -9 $!` in the same shell removed the
+sleeper at once, so signal delivery itself is fine. What is missing is
+narrower and worse: the channel's blocking-write wait neither returns `EPIPE`
+when the far side goes away nor re-checks pending signals when it is woken,
+so a process in that wait is uninterruptible until reboot. It held no
+filesystem lock (a disk soak ran around it for the whole time), so it leaks a
+process and a channel, not the disk. Fix belongs in the `ProcessChannel`
+write path (`amd64/src/fd.rs` / the sshd session close): on channel close,
+wake every writer with `EPIPE`; and any sleep on the channel must be
+signal-interruptible so SIGKILL takes it out regardless.
+
+Until then: a one-shot `ssh akuma "cat bigfile"` that you interrupt on the
+laptop leaves a permanent process on the box. Verify disk contents with
+`busybox md5sum` *on the box* instead (which is also the only correct way —
+the channel turns LF into CRLF on output, see
+`docs/runbooks/amd64-bare-metal-loop.md`).
+
 ## What stays different forever, by design
 
 Not work items — pinned seams. The end state is not zero platform differences;
