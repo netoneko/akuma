@@ -75,7 +75,7 @@ use crate::usermode::UserCtx;
 // the bigger crate; the two paths name one struct.
 use akuma_exec_core::process::UserContext;
 use alloc::vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-thread kernel stack. Generous: these are `Vec` allocations from a large
 /// heap, and a stack overflow here has no guard page to catch it.
@@ -292,6 +292,37 @@ fn hook_switch_to(from: usize, to: usize) {
             crate::usermode::set_fs_base(fs);
         }
         crate::usermode::set_user_gs_base((*m)[to].uctx.gs_base);
+
+        // The switch's whole cross-core safety argument is `x86_yield_now`'s:
+        // `ON_CPU` is cleared for the outgoing thread *before* the stack moves,
+        // and "no other core can observe that until this core releases the
+        // kernel lock". That is only an argument if the lock is in fact held
+        // here — and if it ever is not, a peer's `x86_pick_next` can take the
+        // outgoing thread's slot while this core is still standing on its
+        // stack, which is two cores on one stack and every symptom the ssh/apk
+        // wedge has. Assert it where the claim is used rather than where it is
+        // written.
+        if !smp::bkl_held() {
+            let n = SWITCH_WITHOUT_BKL.fetch_add(1, Ordering::Relaxed);
+            if n < CANARY_REPORT_LIMIT {
+                // One `print_str`, not a dozen `puts`: `serial::LOCK` is per
+                // call, so a peer core's `safe_print!` lands between two of
+                // them and shreds the line — the first capture of this report
+                // read `[SWITCH NO-BKL] from=[SWITCH BADFRAME] cur=128 …`.
+                //
+                // `via=` is the whole value of the report, and it is a per-core
+                // tag rather than a stack walk for a measured reason — see
+                // [`YIELD_TAG`].
+                let mut w = akuma_primitives::console::StackWriter::<128>::new();
+                let _ = core::fmt::write(&mut w, format_args!(
+                    "[SWITCH NO-BKL] from={} to={} core={} via={}\n",
+                    from, to, smp::cpu_index(),
+                    yield_tag_name(YIELD_TAG[smp::cpu_index() % 8].load(Ordering::Relaxed))));
+                w.flush();
+            }
+        }
+        check_canaries(from, "switch-out");
+        check_canaries(to, "switch-in");
 
         let fx_out = &raw mut (*m)[from].fx;
         let fx_in = &raw const (*m)[to].fx;
@@ -630,6 +661,7 @@ pub fn backstop_wakes() -> u64 {
 ///   thread is the fallback the switch itself uses; parking one has nowhere to
 ///   go.
 pub fn block_current() {
+    note_yield(2);
     BLOCKS.fetch_add(1, Ordering::Relaxed);
     // The deadline arithmetic and the "was it the backstop" accounting are the
     // crate's since 4b batch 3a — see [`BACKSTOP_US`] for why they had to be.
@@ -645,6 +677,7 @@ pub fn block_current() {
 /// cannot drift. Resolution is the LAPIC tick (10 ms), so a shorter timeout
 /// rounds up to one tick rather than returning instantly.
 pub fn block_until_deadline(deadline_us: u64) {
+    note_yield(3);
     BLOCKS.fetch_add(1, Ordering::Relaxed);
     threading::schedule_blocking(deadline_us);
 }
@@ -713,7 +746,27 @@ pub fn init() {
     threading::x86_adopt_running_thread(0);
 }
 
-/// Allocate the idle thread for core `cpu` — the context that core is already
+// **This target registers no `akuma_bkl` yield hook, and that is deliberate.**
+//
+// `akuma_bkl::sync::lock_bounded` backs a contended spinlock off by calling the
+// registered hook — a *voluntary* handoff — and it does so **holding nothing**,
+// which is the point of `lock_bounded`. `akuma_exec::init` registers
+// `threading::yield_now` there, which on this target is a context switch, and a
+// context switch here is only safe under the BKL: `x86_yield_now` clears
+// `ON_CPU` for the outgoing thread *before* the stack moves and relies on no
+// peer observing that until this core releases the kernel lock. With no lock
+// held there is nothing to release, and a peer takes the outgoing slot while
+// this core is still standing on its stack.
+//
+// `amd64` never calls `akuma_exec::init` (`exec_runtime::init` registers the
+// runtime table and the ELF hooks and stops there), so the hook is unregistered
+// and `akuma_bkl::yield_now` degrades to a spin hint — which is why that path
+// has never bitten here. If this target ever wants one, it must be a wrapper
+// that takes the BKL around the switch and puts it back, registered **before**
+// anything else claims the cell (`Registered` is first-wins). Until then
+// [`switches_without_bkl`] is the guard, and the boot suite asserts it is zero.
+
+/// Allocate the idle thread for core `cpu` — the context that core is already/// Allocate the idle thread for core `cpu` — the context that core is already
 /// executing when it arrives in `ap_entry64`, so the slot gets an empty context
 /// that the first switch away from it fills in.
 ///
@@ -960,6 +1013,144 @@ pub fn read_user_context(task_slot: usize) -> Option<UserContext> {
 /// `pinned` strands it on a core, and a stale `uctx` hands it a dead process's
 /// `proc_slot`. The caller overrides `space_root`/`daemon` afterwards, while
 /// the slot is still INITIALIZING.
+/// Written at the **bottom** of every kernel and trap stack, and checked on
+/// every context switch.
+///
+/// # Why this target needs its own
+///
+/// `akuma-threading` has canary machinery, and it does not cover these stacks:
+/// it paints the ones *it* allocates from the PMM, and amd64 supplies its own
+/// (`prepare_task_slot`, two `vec![0u8; STACK_SIZE].leak()` per task). Those are
+/// plain heap blocks — **no guard page and, until 2026-09-12, no canary** — so a
+/// thread that ran off the bottom of its stack wrote silently into whatever the
+/// allocator had put below it, which under `MAX_TASKS` stacks allocated back to
+/// back is very often another task's stack, at the end where its *saved frames*
+/// live.
+///
+/// That is the shape of the ssh/apk wedge: an off-CPU thread's saved `rflags`
+/// comes back with bits nothing in this kernel sets, or an `iretq` frame comes
+/// back with a `CS` whose upper half is a small integer — a word rewritten
+/// while its owner was not looking
+/// (`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`). A canary does not
+/// fix that; it says **which stack** and **which direction**, which no capture
+/// so far has.
+const STACK_CANARY: u64 = 0xC0FF_EE15_DEAD_BEEF;
+
+/// Words of canary at each stack's base. Four, not one: a `memcpy`-shaped
+/// overrun can step over a single word, and 32 bytes out of 32 KiB is free.
+const CANARY_WORDS: usize = 4;
+
+fn paint_canary(base: usize) {
+    for i in 0..CANARY_WORDS {
+        // SAFETY: `base` is the start of a live `STACK_SIZE` allocation this
+        // function owns; `CANARY_WORDS * 8` is far inside it.
+        unsafe { ((base + i * 8) as *mut u64).write_volatile(STACK_CANARY) };
+    }
+}
+
+fn canary_intact(base: usize) -> bool {
+    if base == 0 {
+        return true;
+    }
+    (0..CANARY_WORDS).all(|i| {
+        // SAFETY: as `paint_canary`.
+        let w = unsafe { ((base + i * 8) as *const u64).read_volatile() };
+        w == STACK_CANARY
+    })
+}
+
+/// Canary failures seen this boot. Non-zero means some thread wrote past the
+/// bottom of a kernel stack.
+static CANARY_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// How many canary failures to describe before going quiet — the same reason
+/// the ring-0 `#DB` report is capped: a corrupted stack keeps being corrupt,
+/// and a repeating line pushes the interesting part of the log out of the ring.
+const CANARY_REPORT_LIMIT: u64 = 8;
+
+/// Which of this file's four entries into the scheduler this core passed
+/// through last, so a `[SWITCH NO-BKL]` report names the *path* rather than
+/// only the slot numbers. One relaxed store per yield; read only by the report.
+///
+/// Stack walking was tried first and does not work here: a release build has no
+/// frame pointers, the frame at the switch is two deep, and everything above it
+/// is stale data from when the stack was used more deeply — three plausible-
+/// looking symbols (`parse_directory`, `socket_egress`, `RawVecInner::
+/// finish_grow`) that belonged to no live frame.
+#[allow(clippy::declare_interior_mutable_const)]
+const YIELD_TAG_ZERO: AtomicU32 = AtomicU32::new(0);
+static YIELD_TAG: [AtomicU32; 8] = [YIELD_TAG_ZERO; 8];
+
+fn note_yield(tag: u32) {
+    if let Some(slot) = YIELD_TAG.get(smp::cpu_index()) {
+        slot.store(tag, Ordering::Relaxed);
+    }
+}
+
+fn yield_tag_name(tag: u32) -> &'static str {
+    match tag {
+        1 => "yield_now",
+        2 => "block_current",
+        3 => "block_until_deadline",
+        4 => "finish",
+        _ => "unknown",
+    }
+}
+
+/// Context switches taken without the BKL — the invariant `x86_yield_now`'s
+/// `ON_CPU` argument rests on. `0` is the expected value.
+static SWITCH_WITHOUT_BKL: AtomicU64 = AtomicU64::new(0);
+
+/// Switches taken without the kernel lock held (`0` is the expected value).
+#[must_use]
+pub fn switches_without_bkl() -> u64 {
+    SWITCH_WITHOUT_BKL.load(Ordering::Relaxed)
+}
+
+/// Kernel-stack canary failures seen this boot (`0` is the expected value).
+#[must_use]
+pub fn stack_canary_failures() -> u64 {
+    CANARY_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Check both of a slot's stacks, reporting the first few failures.
+///
+/// Called for the outgoing and the incoming thread of every switch: the
+/// outgoing one names a thread that has just overflowed, the incoming one names
+/// a victim *before* it resumes onto a frame somebody else rewrote.
+fn check_canaries(slot: usize, when: &str) {
+    // SAFETY: raw-pointer read of two `usize` fields under the BKL.
+    let (kbase, tbase) = unsafe {
+        let m = &(*machines())[slot];
+        (m.stack_base, m.trap_base)
+    };
+    for (base, which) in [(kbase, "kernel"), (tbase, "trap")] {
+        if canary_intact(base) {
+            continue;
+        }
+        let n = CANARY_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < CANARY_REPORT_LIMIT {
+            serial::puts("[STACK CANARY] slot=");
+            serial::put_dec(slot as u64);
+            serial::puts(" ");
+            serial::puts(which);
+            serial::puts(" base=0x");
+            serial::put_hex(base as u64);
+            serial::puts(" at=");
+            serial::puts(when);
+            serial::puts(" core=");
+            serial::put_dec(smp::cpu_index() as u64);
+            serial::puts(" w0=0x");
+            // SAFETY: as `canary_intact` — the base of a live stack.
+            serial::put_hex(unsafe { (base as *const u64).read_volatile() });
+            serial::puts("\n");
+        }
+        // Repaint, so the next check reports a *new* overflow rather than this
+        // one again on every switch for the rest of the boot.
+        paint_canary(base);
+    }
+}
+
 pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     // SAFETY: raw-pointer read; the slot is INITIALIZING and not running.
     let (have_stack, have_trap) = unsafe {
@@ -985,6 +1176,11 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     } else {
         have_trap
     };
+    // Repainted on every reuse, not only on first allocation: a recycled slot
+    // inherits its pair, and a canary checked but never rewritten would report
+    // the previous occupant's overflow forever.
+    paint_canary(stack_base);
+    paint_canary(trap_base);
     let trap_top = (trap_base + STACK_SIZE) & !0xf;
 
     // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
@@ -1188,6 +1384,7 @@ fn spawn_unpublished(
 /// dead one's TLB entries — `hello` read a garbage `argc`, busybox `#GP`'d
 /// walking `argv`.
 pub fn finish() -> ! {
+    note_yield(4);
     // SAFETY: raw-pointer access; under the BKL.
     unsafe {
         (*machines())[current()].space_root = 0;
@@ -1258,11 +1455,63 @@ pub fn allow_tick() {
 /// this target's lock: `akuma-threading` has no idea the BKL exists beyond the
 /// depth it is handed.
 pub fn yield_now() {
+    note_yield(1);
     smp::bkl_drop_window();
     if smp::take_need_resched() {
         TICK_YIELDS.fetch_add(1, Ordering::Relaxed);
     }
+    // **The switch requires the BKL, and `bkl_drop_window` above does not
+    // supply it** — it is a no-op for a caller that did not hold the lock in
+    // the first place, and several of this file's ~20 callers are exactly that
+    // (kernel wait loops: `net.rs`'s `blocking_relax`, `console.rs`, `dns.rs`,
+    // `fd.rs`, the `smp.rs` drive loops).
+    //
+    // `x86_yield_now`'s cross-core safety argument is that `ON_CPU` is cleared
+    // for the outgoing thread *before* the stack moves, and that no peer can
+    // observe the clear until this core releases the kernel lock. With no lock
+    // held there is nothing to release: the clear is visible at once, a peer's
+    // `x86_pick_next` takes the outgoing slot while this core is still standing
+    // on its stack, loads its stale saved `rsp` and runs there. Two cores, one
+    // stack — which is the ssh/apk wedge, arriving as a `popfq` that restores
+    // impossible `rflags`, an `iretq` frame with a small integer in the high
+    // half of `CS`, and frame words that change between two reads
+    // (`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`).
+    //
+    // Measured before the fix: `[SWITCH NO-BKL] … via=yield_now`, four times in
+    // one `apk update` boot, always on a secondary core.
+    //
+    // Take it, switch, and put it back exactly as found. Holding the lock
+    // across a switch is this kernel's normal state, not a new idea — the BKL
+    // belongs to the *core*, every kernel task is born holding it, and
+    // `idle_loop` is entered with it at depth 1. **Not** "skip the switch when
+    // unlocked": these are wait loops with no other way to make progress, and a
+    // kernel thread spinning in ring 0 is only *asked* to reschedule by the
+    // tick, never forced — so refusing to switch would livelock them.
+    let held = smp::bkl_held();
+    if !held {
+        YIELDS_THAT_TOOK_BKL.fetch_add(1, Ordering::Relaxed);
+        smp::bkl_enter();
+    }
     threading::yield_now();
+    if !held {
+        // The lock belongs to the core and travels with it across the switch,
+        // so this core holds it again now whoever resumed us handed it over.
+        smp::bkl_leave();
+    }
+}
+
+/// Yields that arrived without the BKL and had to take it for the switch.
+///
+/// Not asserted zero — a non-zero count is [`yield_now`]'s guard *working*, and
+/// the kernel wait loops that reach it unlocked are legitimate. The assertion
+/// is [`switches_without_bkl`], which must stay at zero: that one counts
+/// switches that actually happened with no lock.
+static YIELDS_THAT_TOOK_BKL: AtomicU64 = AtomicU64::new(0);
+
+/// How many yields had to take the BKL for their switch.
+#[must_use]
+pub fn yields_that_took_bkl() -> u64 {
+    YIELDS_THAT_TOOK_BKL.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------

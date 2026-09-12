@@ -186,22 +186,31 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // crash were torn past reading). No release — the caller is `!`.
     FATAL_IN_PROGRESS.store(true, core::sync::atomic::Ordering::Release);
     let _ = akuma_primitives::console::claim_console_exclusive();
-    serial::puts("\n[EXCEPTION] ");
-    serial::puts(vector);
-    if let Some(code) = error_code {
-        serial::puts(" err=0x");
-        serial::put_hex(code);
+    // And the port itself, byte for byte. `claim_console_exclusive` silences
+    // the `safe_print!` storms; it does not silence another core that is also
+    // in `fatal`, and two dumps sharing a UART interleave *inside* numbers —
+    // `serial::LOCK` is best-effort and `put_hex` emits sixteen digits under one
+    // acquire. If a peer claimed it first, this core has nothing to add that is
+    // worth shredding the first dump for: stop.
+    if serial::begin_fatal() {
+        crate::halt();
     }
-    serial::puts("\n  rip=0x");
-    serial::put_hex(frame.rip);
-    serial::puts(" rsp=0x");
-    serial::put_hex(frame.rsp);
-    serial::puts("\n  cs=0x");
-    serial::put_hex(frame.cs);
-    serial::puts(" rflags=0x");
-    serial::put_hex(frame.rflags);
-    serial::puts("\n  cr2=0x");
-    serial::put_hex(read_cr2());
+    serial::fatal_puts("\n[EXCEPTION] ");
+    serial::fatal_puts(vector);
+    if let Some(code) = error_code {
+        serial::fatal_puts(" err=0x");
+        serial::fatal_hex(code);
+    }
+    serial::fatal_puts("\n  rip=0x");
+    serial::fatal_hex(frame.rip);
+    serial::fatal_puts(" rsp=0x");
+    serial::fatal_hex(frame.rsp);
+    serial::fatal_puts("\n  cs=0x");
+    serial::fatal_hex(frame.cs);
+    serial::fatal_puts(" rflags=0x");
+    serial::fatal_hex(frame.rflags);
+    serial::fatal_puts("\n  cr2=0x");
+    serial::fatal_hex(read_cr2());
 
     // The address space the fault happened in, and where that root came from.
     //
@@ -218,18 +227,18 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // that faulted before `install_percpu` that is a dereference of 0 — a
     // second fault inside the dump, which is how evidence gets lost.
     let cr3 = crate::paging::active_root();
-    serial::puts(" cr3=0x");
-    serial::put_hex(cr3);
-    serial::puts(" freed=");
-    serial::put_dec(u64::from(akuma_mmu::l0_recently_freed(cr3 & CR3_FRAME_MASK)));
+    serial::fatal_puts(" cr3=0x");
+    serial::fatal_hex(cr3);
+    serial::fatal_puts(" freed=");
+    serial::fatal_dec(u64::from(akuma_mmu::l0_recently_freed(cr3 & CR3_FRAME_MASK)));
     if crate::smp::percpu_installed() {
         let slot = crate::smp::current_task();
-        serial::puts("\n  core=");
-        serial::put_dec(crate::smp::cpu_index() as u64);
-        serial::puts(" task_slot=");
-        serial::put_dec(slot as u64);
-        serial::puts(" slot_root=0x");
-        serial::put_hex(crate::sched::task_space_root(slot));
+        serial::fatal_puts("\n  core=");
+        serial::fatal_dec(crate::smp::cpu_index() as u64);
+        serial::fatal_puts(" task_slot=");
+        serial::fatal_dec(slot as u64);
+        serial::fatal_puts(" slot_root=0x");
+        serial::fatal_hex(crate::sched::task_space_root(slot));
     }
 
     // Dump the words at the faulting rsp. For a fault *on* an `iretq` this is
@@ -251,29 +260,32 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // real floor: below it is non-canonical or user, and both are unreadable
     // here.
     if frame.rsp >= crate::phys::PHYSMAP_BASE {
-        // Eight words BELOW rsp first — the frame the interrupted code just
-        // finished popping. A `#DB` at the instruction after
-        // `akuma_threading_x86_switch_context` returns is the switch's own
-        // `popfq` having restored a flags word with `TF` set, and that word is
-        // at `rsp-64`: above rsp there is only what the resumed thread is about
-        // to use, which says nothing about what it restored. Read low-to-high
-        // so the last word printed is the one immediately under rsp.
-        serial::puts("\n  [rsp-64..rsp)");
+        // Eight words BELOW rsp. This was added to read the frame a switch had
+        // just popped — and what it actually shows is **the CPU's own exception
+        // frame**, which lands on exactly those bytes: `rip`, `cs`, `rflags`,
+        // `rsp`, `ss` in order, verbatim, at `rsp-48`..`rsp-8`. That is the
+        // reason a restored frame can never be recovered after the fault and
+        // has to be read before the `popfq` (`akuma-threading`'s
+        // `x86_check_incoming_frame`). Kept because seeing the hardware frame
+        // beside the decoded one is how a torn or misaligned dump is caught —
+        // the two must agree. Read low-to-high, so the last word printed is the
+        // one immediately under rsp.
+        serial::fatal_puts("\n  [rsp-64..rsp)");
         for i in (1..=8).rev() {
             // SAFETY: `rsp` is in the physmap and a kernel stack is at least a
             // page, so 64 bytes below a live stack pointer is the same stack.
             // Volatile so nothing reorders it into the prints.
             let w = unsafe { (frame.rsp as *const u64).sub(i).read_volatile() };
             if i % 4 == 0 {
-                serial::puts("\n   ");
+                serial::fatal_puts("\n   ");
             }
-            serial::puts(" ");
-            serial::put_hex(w);
+            serial::fatal_puts(" ");
+            serial::fatal_hex(w);
         }
         // Which window the stack is in, because it says which kind of stack it
         // is without a symbol lookup: `physmap` is a heap-allocated thread
         // stack, `image` is the boot/.bss one.
-        serial::puts(if frame.rsp >= crate::phys::KERNEL_VMA {
+        serial::fatal_puts(if frame.rsp >= crate::phys::KERNEL_VMA {
             "\n  [rsp/image]"
         } else {
             "\n  [rsp/physmap]"
@@ -284,17 +296,17 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
             // reorders it into the prints.
             let w = unsafe { (frame.rsp as *const u64).add(i).read_volatile() };
             if i % 4 == 0 {
-                serial::puts("\n   ");
+                serial::fatal_puts("\n   ");
             }
-            serial::puts(" ");
-            serial::put_hex(w);
+            serial::fatal_puts(" ");
+            serial::fatal_hex(w);
         }
     }
     // And the caller chain hunt needs the fault address untorn — print it last
     // so a torn line cannot hide it again.
-    serial::puts("\n  [cr2 final]=0x");
-    serial::put_hex(read_cr2());
-    serial::puts("\n");
+    serial::fatal_puts("\n  [cr2 final]=0x");
+    serial::fatal_hex(read_cr2());
+    serial::fatal_puts("\n");
     crate::halt();
 }
 
@@ -1698,6 +1710,28 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
     // counted, because the whole value of surviving the trap is that a boot
     // still reports it.
     t.check_eq("debug: no ring-0 #DB was taken", ring0_debug_traps(), 0);
+
+    // The same assertion one layer down: a ring-0 `#DB` is usually a restored
+    // `rflags` that was rewritten in memory, and the canary at the bottom of
+    // every kernel and trap stack says whether an overflow is what rewrote it
+    // (`sched::check_canaries`, run on both sides of every switch).
+    t.check_eq(
+        "debug: no kernel stack canary was overwritten",
+        crate::sched::stack_canary_failures(),
+        0,
+    );
+    t.check_eq(
+        "debug: every context switch held the kernel lock",
+        crate::sched::switches_without_bkl(),
+        0,
+    );
+    // Informational, deliberately not an equality: `yield_now` taking the lock
+    // for a caller that had none is the guard working, not a fault. It is
+    // printed so a boot says how often the kernel's wait loops reach the
+    // scheduler unlocked.
+    serial::puts("  sched: yields that took the BKL for their switch: ");
+    serial::put_dec(crate::sched::yields_that_took_bkl());
+    serial::puts("\n");
 
     // The differential sweep, on kernel memory: `rep movsb` vs. the byte loop.
     let (checked, bad, first_bad) = akuma_user_access::copy_loop_differential_sweep();

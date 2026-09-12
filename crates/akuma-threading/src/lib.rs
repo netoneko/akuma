@@ -3314,6 +3314,24 @@ fn x86_check_incoming_frame(cur: usize, next: usize) {
     // SAFETY: `rsp` is a kernel stack pointer with at least seven words of
     // frame above it — the frame the `pop`s below are about to consume.
     let flags = unsafe { ((rsp as usize + RFLAGS_OFF) as *const u64).read_volatile() };
+    // Read it again. `next` is not on any core (`ON_CPU`) and its stack is
+    // therefore nobody's to touch, so these two loads must agree — and when
+    // they do not, *that* is the finding, not whatever value the first one got.
+    // Measured 2026-09-12: the word this read at `+0x30` turned up at `+0x0` a
+    // few microseconds later, which is a thread's saved frame moving while the
+    // switch that is about to restore it looks on.
+    // SAFETY: as above.
+    let again = unsafe { ((rsp as usize + RFLAGS_OFF) as *const u64).read_volatile() };
+    if again != flags {
+        safe_print!(192,
+            "[SWITCH FRAME MOVED] cur={} next={} state={} on_cpu={} last_core={} \
+             rsp={:#x} first={:#x} second={:#x}\n",
+            cur, next, THREAD_STATES[next].load(Ordering::SeqCst),
+            ON_CPU[next].load(Ordering::SeqCst),
+            LAST_CORE[next].load(Ordering::Relaxed),
+            rsp, flags, again);
+        return;
+    }
     if flags & !X86_KERNEL_RFLAGS_ALLOWED == 0 && flags & 0x2 != 0 {
         return;
     }

@@ -248,8 +248,69 @@ pub fn init() {
 /// console: a dropped byte during boot is a bug you cannot see, and a stall is
 /// a bug you can.
 pub fn putb(byte: u8) {
+    if fatal_active() {
+        return;
+    }
     let _g = lock();
     putb_raw(byte);
+}
+
+/// Set once a core has started printing a fatal-exception dump.
+///
+/// # Why the per-call [`LOCK`] above is not enough
+///
+/// That lock is **best-effort by design** — a core that cannot take it inside
+/// `LOCK_BUDGET` prints anyway, because a lock held by a core that died
+/// mid-line must never silence the next report. The cost is that a dump made of
+/// eighty `puts`/`put_hex` calls will have a peer barge in between two of them,
+/// and [`put_hex`] emits its sixteen digits under one acquire — so the peer's
+/// byte lands *inside* a number. That is not a theory: three captures of the
+/// 2026-09-12 ssh/apk wedge read `ffffyfff80296506` and `cs=0x0000]00000000008`,
+/// single characters substituted into otherwise-correct hex, and one of them had
+/// every printed register wrong in the same high bits. A dump you cannot trust
+/// digit by digit is worse than no dump, because it invites a diagnosis.
+///
+/// So a fatal dump does not share the port: the core that starts one silences
+/// every other writer for the rest of the boot. There is no release — the
+/// claimer is `!`. Its own output goes through the `fatal_*` entry points below,
+/// which skip this check; the second core to reach [`begin_fatal`] is told so
+/// and stops rather than printing a second dump into the first.
+static FATAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Claim the port for a fatal dump. Returns `true` if some other core already
+/// has it — in which case the caller must not print at all.
+#[must_use]
+pub fn begin_fatal() -> bool {
+    FATAL_ACTIVE.swap(true, Ordering::AcqRel)
+}
+
+/// Is a fatal dump in progress? Every ordinary writer answers `true` by staying
+/// quiet.
+fn fatal_active() -> bool {
+    FATAL_ACTIVE.load(Ordering::Acquire)
+}
+
+/// [`puts`] for the core printing a fatal dump: bypasses [`fatal_active`].
+pub fn fatal_puts(s: &str) {
+    let _g = lock();
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            putb_raw(b'\r');
+        }
+        putb_raw(b);
+    }
+}
+
+/// [`put_hex`] for the core printing a fatal dump.
+pub fn fatal_hex(val: u64) {
+    let _g = lock();
+    put_hex_digits_raw(val);
+}
+
+/// [`put_dec`] for the core printing a fatal dump.
+pub fn fatal_dec(val: u64) {
+    let _g = lock();
+    put_dec_digits_raw(val);
 }
 
 /// [`putb`] without the lock, for callers that hold it across a whole string.
@@ -324,6 +385,9 @@ pub fn has_byte() -> bool {
 }
 
 pub fn puts(s: &str) {
+    if fatal_active() {
+        return;
+    }
     let _g = lock();
     for &b in s.as_bytes() {
         if b == b'\n' {
@@ -337,14 +401,23 @@ pub fn puts(s: &str) {
 ///
 /// Fixed width rather than trimmed: leading zeros make addresses line up in a
 /// boot log, and a variable-width printer needs a branch this does not.
-pub fn put_hex(mut val: u64) {
+pub fn put_hex(val: u64) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    put_hex_digits_raw(val);
+}
+
+/// The sixteen digits, lock already held. Shared by [`put_hex`] and
+/// [`fatal_hex`] so the two cannot format differently.
+fn put_hex_digits_raw(mut val: u64) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 16];
     for slot in out.iter_mut().rev() {
         *slot = DIGITS[(val & 0xF) as usize];
         val >>= 4;
     }
-    let _g = lock();
     for &b in &out {
         putb_raw(b);
     }
@@ -355,6 +428,9 @@ pub fn put_hex(mut val: u64) {
 /// For fields that are not addresses — a PCI class byte, a 16-bit vendor id, a
 /// MAC octet — where the full 16-digit [`put_hex`] is noise.
 pub fn put_hexn(val: u64, nibbles: u32) {
+    if fatal_active() {
+        return;
+    }
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let n = nibbles.clamp(1, 16);
     let _g = lock();
@@ -365,8 +441,17 @@ pub fn put_hexn(val: u64, nibbles: u32) {
 
 /// Emit a `u64` in decimal.
 pub fn put_dec(val: u64) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    put_dec_digits_raw(val);
+}
+
+/// The decimal digits, lock already held. Shared with [`fatal_dec`].
+fn put_dec_digits_raw(val: u64) {
     if val == 0 {
-        putb(b'0');
+        putb_raw(b'0');
         return;
     }
     // 20 digits is the width of u64::MAX; the buffer can never overflow.
@@ -378,7 +463,6 @@ pub fn put_dec(val: u64) {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    let _g = lock();
     for &b in &buf[i..] {
         putb_raw(b);
     }

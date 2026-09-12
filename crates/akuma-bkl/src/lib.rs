@@ -109,7 +109,15 @@ static YIELD_HOOK: Registered<fn()> = Registered::new(
     "akuma-bkl: yield hook not registered — call akuma_exec::init() first",
 );
 
-/// Register the scheduler's `yield_now`. Idempotent; last registration wins.
+/// Register the scheduler's `yield_now`.
+///
+/// **First registration wins**, not last: this is a [`Registered`], whose
+/// `set` returns early once initialised. The distinction is load-bearing —
+/// `amd64/src/sched.rs` registers a BKL-taking wrapper here and relies on
+/// running before `akuma_exec::init`'s bare registration, because on that
+/// target a context switch with no kernel lock held puts two cores on one
+/// stack. A later caller is silently ignored, so a target that needs its own
+/// hook must register it *first*.
 pub fn set_yield_hook(f: fn()) {
     YIELD_HOOK.register(f);
 }
