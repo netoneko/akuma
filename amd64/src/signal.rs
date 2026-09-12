@@ -72,7 +72,6 @@ use akuma_exec::process::{SignalHandler, current_process_shared};
 use akuma_exec::threading;
 
 use crate::fd::errno;
-use crate::serial;
 use crate::usermode::UserCtx;
 
 /// `sa_flags` bits this module reads. The `SA_*` values are asm-generic and
@@ -663,13 +662,6 @@ pub fn notify_group_of_thread_fatal(sig: u32) {
     if proc.tgid == proc.pid {
         return;
     }
-    serial::puts("  [DBG group-fatal] tid_pid=");
-    serial::put_dec(proc.pid as u64);
-    serial::puts(" tgid=");
-    serial::put_dec(proc.tgid as u64);
-    serial::puts(" sig=");
-    serial::put_dec(sig as u64);
-    serial::puts("\n");
     akuma_exec::process::deliver_signal(proc.tgid, sig);
 }
 
@@ -778,7 +770,7 @@ pub enum TickOutcome {
 /// [`deliver_pending_on_tick`] so the caller can drop the BKL first; see
 /// [`TickOutcome`].
 pub fn kill_current_from_tick(sig: u32) -> ! {
-    crate::usermode::kill_current_from_fault(signal_status(sig))
+    crate::usermode::kill_current_from_fault(sig)
 }
 
 pub fn deliver_pending_on_tick(

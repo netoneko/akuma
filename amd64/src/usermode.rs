@@ -702,8 +702,8 @@ pub fn set_user_gs_base(base: u64) {
     unsafe { wrmsr(crate::smp::IA32_KERNEL_GS_BASE, base) };
 }
 
-/// Leave ring 3 from an exception handler as if the program had called
-/// `exit_group(status)`.
+/// Leave ring 3 from an exception handler because signal `sig`'s default
+/// action says to, as if the program had called `exit_group(-sig)`.
 ///
 /// The syscall path's `.Lexit_to_kernel`, done by hand: back onto the task's
 /// kernel stack at the point `enter_user_mode` saved its callee-saved registers,
@@ -712,12 +712,13 @@ pub fn set_user_gs_base(base: u64) {
 /// needed again. Takes the BKL first, because the code it returns into is
 /// kernel code and expects to hold it; the exception stub already `swapgs`'d,
 /// so the per-CPU block is in place.
-pub fn kill_current_from_fault(status: u64) -> ! {
+pub fn kill_current_from_fault(sig: u32) -> ! {
     crate::smp::bkl_enter();
     // Same group-death rule as `exit_current_from_signal`: a *thread* faulting
     // out of ring 3 by default action must not just kill itself, or the leader
     // runs on and nothing ever reaches the parent's `waitpid`.
-    crate::signal::notify_group_of_thread_fatal((-(status as i64)) as u32);
+    crate::signal::notify_group_of_thread_fatal(sig);
+    let status = (-(i64::from(sig))) as u64;
     EXIT_STATUS.store(status, Ordering::Relaxed);
     let uctx = crate::smp::current_uctx();
     assert!(!uctx.is_null(), "ring-3 fault with no current UserCtx");

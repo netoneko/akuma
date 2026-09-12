@@ -1235,7 +1235,7 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     serial::puts(" pid=");
     serial::put_dec(u64::from(crate::usermode::current_pid()));
     serial::puts(" — killing the process\n");
-    crate::usermode::kill_current_from_fault(SIGSEGV_STATUS);
+    crate::usermode::kill_current_from_fault(SIGSEGV);
 }
 
 /// The signal a ring-3 fault raises.
@@ -1243,10 +1243,6 @@ const SIGSEGV: u32 = 11;
 
 /// `SIGTRAP`, the signal a ring-3 `#DB` is.
 const SIGTRAP: u32 = 5;
-
-/// The exit status a fault-killed process leaves with: `-SIGSEGV`, the tree's
-/// "killed by signal" encoding. See [`user_fault`] for why it is negative.
-const SIGSEGV_STATUS: u64 = -(SIGSEGV as i64) as u64;
 
 /// `#GP` — fatal, except inside the user-copy loop.
 ///

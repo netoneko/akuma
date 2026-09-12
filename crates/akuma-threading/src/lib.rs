@@ -3014,9 +3014,17 @@ pub fn x86_claim_slot() -> Option<usize> {
             )
             .is_ok()
         {
-            // A recycled slot must not inherit the previous occupant's wait
-            // state: an armed `WOKEN_STATES` would make this thread's first
-            // park a no-op, and a stale `WAKE_TIMES` would release it early.
+            // A recycled slot must not inherit the previous occupant's
+            // per-slot state, and not just its wait state: `scrub_thread_slot`
+            // clears the pending-signal bitmask, the blocked mask, the
+            // sigaltstack and the itimer deadlines, every one of which fired
+            // against the *new* occupant when left stale. The measured case
+            // (2026-09-12): a group-fatal'd thread's slot — one bit of pending
+            // `SIGSEGV` set — was recycled by an innocent `futextest`
+            // spawn/join thread, whose first syscall return then killed it
+            // with the dead process's signal. Only `ON_CPU` is kept below,
+            // because this claim path owns it directly.
+            scrub_thread_slot(slot);
             WAKE_TIMES[slot].store(0, Ordering::SeqCst);
             WOKEN_STATES[slot].store(false, Ordering::SeqCst);
             ON_CPU[slot].store(0, Ordering::SeqCst);
