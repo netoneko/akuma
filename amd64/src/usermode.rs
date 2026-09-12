@@ -2214,7 +2214,35 @@ pub fn init_syscall() {
         // executes `syscall` would otherwise enter the kernel with SMAP
         // suspended — the one way userspace could grant itself the kernel's
         // access to user pages. Linux masks it for the same reason.
-        wrmsr(IA32_FMASK, (1 << 9) | (1 << 10) | (1 << 18));
+        //
+        // **TF (8), IOPL (12:13) and NT (14) are masked for reasons of exactly
+        // the same shape**, added 2026-09-12:
+        //
+        // * `TF` — `syscall` is not an interrupt gate and does not clear it, so
+        //   a program that enters the kernel single-stepping makes the *kernel*
+        //   single-step: a `#DB` on the first instruction after `syscall`, on a
+        //   target that had no `#DB` handler at all. And a program can set it —
+        //   `signal::sanitize_rflags` permits `TF` deliberately, as Linux does,
+        //   because a debugger legitimately restores it. That pair (userspace
+        //   may set it, the entry does not clear it) is a ring-3 kill switch
+        //   for the whole machine.
+        // * `IOPL`/`NT` — `sysret` loads `RFLAGS` from `%r11` and its mask
+        //   covers both, so they can be non-zero on entry; `NT` set turns the
+        //   kernel's next `iret` into a task switch.
+        //
+        // Linux masks all of these and more in `MSR_SYSCALL_MASK`; this is the
+        // same list minus the arithmetic flags, which are harmless and which
+        // the ABI lets a syscall clobber anyway.
+        const FMASK_IF: u64 = 1 << 9;
+        const FMASK_DF: u64 = 1 << 10;
+        const FMASK_AC: u64 = 1 << 18;
+        const FMASK_TF: u64 = 1 << 8;
+        const FMASK_IOPL: u64 = 3 << 12;
+        const FMASK_NT: u64 = 1 << 14;
+        wrmsr(
+            IA32_FMASK,
+            FMASK_IF | FMASK_DF | FMASK_AC | FMASK_TF | FMASK_IOPL | FMASK_NT,
+        );
     }
 }
 

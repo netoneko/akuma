@@ -1496,9 +1496,6 @@ fn note_ep_state(x: &mut Xhci, dci: u8) {
     serial::puts("\n");
 }
 
-/// The crate's `EpState::as_str`, by way of a code — a tiny shim so the call
-/// sites above stay one line.
-
 /// Class-standard mass-storage recovery for a stalled or timed-out phase.
 /// Returns `true` when recovery ran and the caller may retry the command
 /// once; `false` for a completion code recovery does not cover.

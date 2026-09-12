@@ -1,9 +1,49 @@
-# Akuma/amd64: the ssh/apk wedge — a context-switch page fault, not a lock bug
+# Akuma/amd64: the ssh/apk wedge — a `#DB` out of the context switch, not a page fault
 
-**Grade: C** (active investigation, 2026-09-12; the crash is reproduced in
-QEMU with a symbolized faulting rip, the culprit thread race is not yet fixed).
-Supersedes the "self-reset" and "BKL storm" theories in
+**Grade: C** (active investigation; the crash is reproduced in QEMU with a
+symbolized faulting rip and a named vector, the source of the bad frame is not
+yet found). Supersedes the "self-reset" and "BKL storm" theories in
 `AKUMA_AMD64_USB_XHCI.md` for this symptom: those were consequences.
+
+> **CORRECTION 2026-09-12 (later the same day).** The title of this document
+> used to say *page fault*, and §1 below described a `#PF: not-present write
+> from ring 0` at `akuma_threading_x86_switch_context+0xb` (the
+> `mov [rdi], rsp`). **That is not what happens.** Two things were wrong:
+>
+> * **The vector.** Every vector but 0/6/8/13/14 was installed as one
+>   `unhandled` handler that printed the same four words for all of them, so
+>   the dump could not say which exception fired. It is **`#DB`**, vector 1.
+>   Per-vector stubs (`idt.rs`, `exception_stubs!`) name it now, and the first
+>   boot with them said so.
+> * **The rip.** The `+0xb` reading came from symbolizing against a build that
+>   was not the one that crashed. Symbolized against the binary that produced
+>   it, the faulting rip is `x86_yield_now+0x215`, which `objdump` shows is the
+>   instruction *immediately after* `callq …x86_switch_context`:
+>
+>   ```
+>   …01b0: e8 c3 fd ff ff   callq  akuma_threading_x86_switch_context
+>   …01b5: b0 01            movb   $0x1, %al          <- faulting rip
+>   ```
+>
+> That is the signature of the switch's closing `popfq; ret` restoring a saved
+> flags word with **`TF` set**: `popfq` arms single-step, the `ret` retires, and
+> the `#DB` lands on the first instruction of the resumed thread. There is no
+> `#DB` handler, so `fatal()` halts the core — and stages 2-4 of the chain below
+> (halted core, TLB acks that never complete, BKL storm, ssh death) all still
+> hold. Only stage 1 is a different exception than this document first said.
+>
+> Three captures, three flags words, all impossible for this kernel:
+> `0x202312`, `0x243392`, `0x204312` — each carries `TF`, and between them
+> `IOPL=2`, `IOPL=3`, `NT` and `AC`. The kernel sets none of those, and `AC` in
+> particular cannot have arrived through `syscall` (`IA32_FMASK` clears it), so
+> the value came off a saved frame rather than out of a `syscall` entry.
+>
+> **The evidence is destroyed by the crash itself**, which is why it took three
+> captures to get this far: the `#DB` frame the CPU pushes lands exactly on the
+> 64 bytes the switch just popped. A `[rsp-64..rsp)` dump added to read the
+> restored frame shows the exception frame instead — `rip`, `cs`, `rflags`,
+> `rsp`, `ss` in order, verbatim. The frame has to be read **before** the
+> `popfq`; `x86_check_incoming_frame` in `akuma-threading` does that now.
 
 ## The symptom chain, and what each stage was
 

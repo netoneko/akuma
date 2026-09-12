@@ -373,7 +373,6 @@ macro_rules! exception_stubs_with_code {
 }
 
 exception_stubs! {
-    vec_db  =  1, "#DB debug (TF/breakpoint)";
     vec_nmi =  2, "#NMI non-maskable interrupt";
     vec_bp  =  3, "#BP breakpoint";
     vec_of  =  4, "#OF overflow";
@@ -646,6 +645,187 @@ timer_entry:
     iretq
 "#
 );
+
+// `#DB`'s entry, shaped like `timer_entry` rather than like the two
+// `fixable_exception_entry!` stubs: vector 1 pushes **no error code**, so the
+// frame the CPU leaves is the five-word one and the alignment arithmetic is the
+// timer's (40 bytes pushed + 120 of registers, both `= 8 (mod 16)`, cancelling
+// to a 16-aligned `call`).
+//
+// It needs a dispatcher that can edit the frame — clearing `TF` in the saved
+// `rflags` is the whole point — which is exactly what the `x86-interrupt`
+// stubs cannot do, and why `#DB` does not stay on the generated ones.
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global debug_entry
+debug_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rdi, [rsp + 120]             /* &InterruptStackFrame */
+    lea rsi, [rsp]                   /* &TrapRegs */
+    call debug_dispatch
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+"#
+);
+
+unsafe extern "C" {
+    /// The vector-1 entry point, installed in the IDT by [`init`].
+    fn debug_entry();
+}
+
+/// `RFLAGS.TF` — single-step.
+const RFLAGS_TF: u64 = 1 << 8;
+
+/// How many ring-0 `#DB`s this boot has disarmed. Non-zero means the kernel
+/// restored a corrupt `rflags` from somewhere and survived it; the boot log's
+/// `[DB]` lines say where.
+static RING0_DEBUG_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// How many ring-0 `#DB` reports to print before going quiet. A single-step
+/// that re-arms would otherwise fill the console with the same line and push
+/// the interesting part of the log out of the ring.
+const RING0_DEBUG_REPORT_LIMIT: u64 = 8;
+
+/// Ring-0 `#DB`s taken this boot (`0` is the expected value).
+#[must_use]
+pub fn ring0_debug_traps() -> u64 {
+    RING0_DEBUG_TRAPS.load(Ordering::Relaxed)
+}
+
+/// `#DB` — and the reason this kernel needs one at all.
+///
+/// Vector 1 fires on a single-step (`RFLAGS.TF`), a hardware breakpoint, or a
+/// task-switch trap. This target armed none of those and therefore had no
+/// handler: `#DB` went to the blanket `unhandled` stub, which prints and halts
+/// the core. **That made a stray `TF` bit a whole-machine kill** — and one
+/// arrives: the ssh/apk wedge is `akuma_threading_x86_switch_context`'s closing
+/// `popfq` restoring a saved flags word that has `TF` set, so the `ret` retires
+/// and the trap lands on the resumed thread's first instruction
+/// (`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`).
+///
+/// Two origins, two answers:
+///
+/// * **Ring 3** — a program single-stepping itself, or one that set `TF`
+///   through a signal frame (`signal::sanitize_rflags` permits `TF` on
+///   purpose, as Linux does). That is a `SIGTRAP` for the program, never a
+///   kernel event, and it was killing the machine.
+/// * **Ring 0** — the kernel is not a debuggee and never sets `TF`, so this is
+///   corruption. **Disarm and continue**: clear `TF` in the frame `iretq` is
+///   about to restore, count it, and report the first few. Continuing is not a
+///   guess — the crash's own evidence shows the *return address* on the
+///   restored frame was correct and only the flags word was wrong, so the
+///   resumed thread is otherwise intact. A machine that survives with a `[DB]`
+///   line in the log is worth more than one that halts with the evidence
+///   overwritten by its own exception frame.
+///
+/// `DR6` is cleared either way: hardware accumulates its bits and never clears
+/// them, so a stale `BS` would misattribute the next trap.
+#[unsafe(no_mangle)]
+extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    akuma_bkl::sync::set_core_tag_transient(
+        crate::smp::cpu_index_u32(),
+        akuma_bkl::sync::HOLD_TAG_FAULT,
+    );
+    let dr6 = read_dr6();
+    write_dr6(0);
+    // SAFETY: the stub passes a pointer into the current stack, to the frame
+    // the CPU just pushed; it is live and exclusively ours until `iretq`.
+    let f = unsafe { &mut *frame };
+    if f.cs & 3 == 3 {
+        crate::uaccess::clac_if_enabled();
+        // SAFETY: as in `general_protection_dispatch`, and the BKL for the
+        // same reason.
+        let regs = unsafe { &mut *regs };
+        let took = !crate::smp::bkl_held();
+        if took {
+            crate::smp::bkl_enter();
+        }
+        let delivered = crate::signal::deliver_fault_signal(
+            f, regs, SIGTRAP, crate::signal::segv::SI_KERNEL, 0,
+        );
+        if took {
+            crate::smp::bkl_leave();
+        }
+        if delivered {
+            return;
+        }
+        // No handler: Linux's default for `SIGTRAP` is to terminate, which is
+        // what `user_fault` does here — the process, not the kernel.
+        user_fault("#DB debug (ring 3, no handler)", f, None);
+    }
+    let n = RING0_DEBUG_TRAPS.fetch_add(1, Ordering::Relaxed);
+    if n < RING0_DEBUG_REPORT_LIMIT {
+        serial::puts("\n[DB] ring-0 debug trap disarmed: rip=0x");
+        serial::put_hex(f.rip);
+        serial::puts(" rflags=0x");
+        serial::put_hex(f.rflags);
+        serial::puts(" dr6=0x");
+        serial::put_hex(dr6);
+        serial::puts(" core=");
+        serial::put_dec(crate::smp::cpu_index() as u64);
+        serial::puts(" task=");
+        serial::put_dec(crate::smp::current_task() as u64);
+        serial::puts("\n");
+    }
+    f.rflags &= !RFLAGS_TF;
+}
+
+/// `DR6` records why the last `#DB` fired; hardware never clears it.
+fn read_dr6() -> u64 {
+    let v: u64;
+    // SAFETY: reading a debug register copies it into a local; it dereferences
+    // nothing.
+    unsafe {
+        core::arch::asm!("mov {}, dr6", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+fn write_dr6(v: u64) {
+    // SAFETY: `DR6` is a status register — writing it clears the sticky
+    // condition bits and has no other effect. Nothing in this kernel arms
+    // `DR0`-`DR3`/`DR7`, so there is no debugger state to disturb.
+    unsafe {
+        core::arch::asm!("mov dr6, {}", in(reg) v, options(nomem, nostack, preserves_flags));
+    }
+}
 
 fixable_exception_entry!("page_fault_entry", "page_fault_dispatch");
 fixable_exception_entry!("general_protection_entry", "general_protection_dispatch");
@@ -1049,6 +1229,9 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
 /// The signal a ring-3 fault raises.
 const SIGSEGV: u32 = 11;
 
+/// `SIGTRAP`, the signal a ring-3 `#DB` is.
+const SIGTRAP: u32 = 5;
+
 /// The exit status a fault-killed process leaves with: `-SIGSEGV`, the tree's
 /// "killed by signal" encoding. See [`user_fault`] for why it is negative.
 const SIGSEGV_STATUS: u64 = -(SIGSEGV as i64) as u64;
@@ -1246,9 +1429,10 @@ pub fn init() {
         install_exception_stubs(idt);
         install_exception_stubs_with_code(idt);
         (*idt)[0].set(divide_error as usize);
+        (*idt)[1].set(debug_entry as usize);
         (*idt)[6].set(invalid_opcode as usize);
         (*idt)[8].set(double_fault as usize);
-        // The two hand-assembled entries; see the module header.
+        // The hand-assembled entries; see the module header.
         (*idt)[13].set(general_protection_entry as usize);
         (*idt)[14].set(page_fault_entry as usize);
     }
@@ -1506,6 +1690,14 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
         (COPY_FIXUPS.load(Ordering::Relaxed) - fixups_before) as u64,
         4,
     );
+
+    // Nothing in this kernel sets `TF` or arms a debug register, so a ring-0
+    // `#DB` is corruption that [`debug_dispatch`] disarmed rather than a trap
+    // anybody asked for. Zero here is the assertion; the `[DB]` lines in the
+    // log say where if it is not. Checked in the suite rather than only
+    // counted, because the whole value of surviving the trap is that a boot
+    // still reports it.
+    t.check_eq("debug: no ring-0 #DB was taken", ring0_debug_traps(), 0);
 
     // The differential sweep, on kernel memory: `rep movsb` vs. the byte loop.
     let (checked, bad, first_bad) = akuma_user_access::copy_loop_differential_sweep();
