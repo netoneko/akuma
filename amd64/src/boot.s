@@ -213,51 +213,93 @@ common32:
     movl $__pdpt_kern, %eax
     orl  $0x03, %eax
     movl %eax, __pml4 + 4088
-
-    /* The low PDPT and the physmap PDPT point at the SAME four page directories.
+    /* The low PDPT and the physmap PDPT point at the SAME page directories.
      * The identity map and the physmap describe identical memory, so sharing
-     * costs four frames less and makes it impossible for the two views to
+     * costs {PDS} frames less and makes it impossible for the two views to
      * disagree.
      *
-     * **Four** page directories, covering the low 4 GiB, where there used to be
-     * one covering 1 GiB. That is not generosity: on real hardware the things a
-     * kernel must reach before it can allocate anything are all up there. The
-     * framebuffer this machine's only console lives in is a PCI BAR at
-     * 0xE0000000 — 3.5 GiB — and with a 1 GiB map the first write to it faults
-     * before there is any way to say so. A VMM guest never noticed because a
-     * VMM puts everything low. */
+     * **{PDS} page directories, one per GiB**, where there used to be four
+     * covering 4 GiB and before that one covering 1 GiB. The count is not a
+     * tuning knob and is not written down here: it arrives as `PHYSMAP_PDS`
+     * from `phys.rs`, derived from `PHYSMAP_LIMIT`, because the constant and
+     * these tables describe the same thing and drifting apart is silent —
+     * `phys_to_virt` would hand back a pointer inside a window nothing maps.
+     *
+     * Why the low 4 GiB was not enough, in two steps:
+     *
+     * 1. Below 4 GiB is where the devices are. The framebuffer this machine's
+     *    only console lives in is a PCI BAR at 0xE0000000 — 3.5 GiB — and with
+     *    a 1 GiB map the first write to it faults before there is any way to
+     *    say so. That is what took this from one directory to four.
+     * 2. Above 4 GiB is where the RAM is. A PC displaces the memory behind the
+     *    MMIO hole to just above 4 GiB, so on the 16 GiB reference machine the
+     *    low map reached 3275 MiB of usable RAM and the other 13046 MiB sat in
+     *    a region `mem::init` could not address and silently skipped. Measured
+     *    2026-09-12: 16321 MiB reported, 2504 MiB allocatable.
+     *
+     * A VMM guest never noticed either problem, because a VMM puts everything
+     * low — and QEMU only reproduces the second one past `-m 4096`. */
     movl $__pd0, %eax
     orl  $0x03, %eax
-    movl %eax, __pdpt_low + 0
-    movl %eax, __pdpt_high + 0
     /* 0xFFFFFFFF80000000 falls in PDPT slot 510 (byte offset 510*8 = 4080), so
-     * that is where the kernel image's first GiB is described. */
+     * that is where the kernel image's first GiB is described. Set from the
+     * first directory before the loop walks %eax past it. */
     movl %eax, __pdpt_kern + 4080
+    xorl %ecx, %ecx
+2:
+    movl %eax, __pdpt_low(, %ecx, 8)
+    movl %eax, __pdpt_high(, %ecx, 8)
     addl $4096, %eax
-    movl %eax, __pdpt_low + 8
-    movl %eax, __pdpt_high + 8
-    addl $4096, %eax
-    movl %eax, __pdpt_low + 16
-    movl %eax, __pdpt_high + 16
-    addl $4096, %eax
-    movl %eax, __pdpt_low + 24
-    movl %eax, __pdpt_high + 24
+    incl %ecx
+    cmpl ${PDS}, %ecx
+    jb 2b
 
-    /* PD[i] = (i * 2 MiB) | present | writable | PS  -> identity-map 1 GiB.
-     * 2 MiB pages rather than a single 1 GiB PDPT entry on purpose: 1 GiB
-     * pages need CPUID PDPE1GB, which the default `qemu64` CPU does not
-     * advertise, and the failure mode would be a triple-fault at `mov %cr0`
-     * with nothing on the serial line. */
-    /* 2048 entries across the four contiguous directories = 4 GiB. The four are
-     * declared adjacently in .bss.pagetables precisely so one loop can index
-     * them as a single array; splitting them apart breaks this silently. */
+    /* PD[i] = (i * 2 MiB) | present | writable | PS.
+     * 2 MiB pages rather than 1 GiB PDPT entries on purpose: 1 GiB pages need
+     * CPUID PDPE1GB, which the default `qemu64` CPU does not advertise, and the
+     * failure mode would be a triple-fault at `mov %cr0` with nothing on the
+     * serial line.
+     *
+     * 512 entries per directory across the contiguous directories. They are
+     * declared as ONE `.skip` in .bss.pagetables precisely so this loop can
+     * index them as a single array; splitting them into separate labels breaks
+     * this silently, which is why it is no longer written that way.
+     *
+     * Present-but-unbacked entries past the end of installed RAM are harmless
+     * and always were: nothing dereferences the physmap except through
+     * `phys_to_virt`, and the PMM only ever hands out addresses the memory map
+     * called RAM. A 2 GiB guest has run with 4 GiB mapped since 2026-09-05.
+     *
+     * # %edx is not optional, and this is why the old loop stopped at 4 GiB
+     *
+     * A PDE is 64 bits and this code runs in 32-bit protected mode, so the
+     * physical address has to be built in a register pair. While the whole map
+     * fitted under 4 GiB the high dword was zero and the `rep stosl` above had
+     * already written it, so one register did the job and the second store was
+     * invisible by being unnecessary.
+     *
+     * Past 2048 entries it stops being unnecessary and starts being wrong in
+     * the worst available way: `addl $0x200000, %eax` **wraps**, so entry 2048
+     * is written with physical 0 instead of 4 GiB and the physmap becomes a
+     * second alias of the low 4 GiB rather than a window onto high memory.
+     * Nothing faults. A page table allocated up there is written and read back
+     * through the same wrong alias, so it is self-consistent to every walk the
+     * kernel performs — and the CPU's own page walker, which uses the real
+     * frame, sees an empty table. Measured 2026-09-12 as a not-present #PF on
+     * the *first* virtio register read, at a virtual address `paging::translate`
+     * simultaneously reported as correctly mapped.
+     *
+     * `adcl $0, %edx` carries into the high dword, which is the entire fix. */
     xorl %ecx, %ecx
     movl $0x83, %eax
+    xorl %edx, %edx
 1:
     movl %eax, __pd0(, %ecx, 8)
+    movl %edx, __pd0 + 4(, %ecx, 8)
     addl $0x200000, %eax
+    adcl $0, %edx
     incl %ecx
-    cmpl $2048, %ecx
+    cmpl $(512 * {PDS}), %ecx
     jb 1b
 
 
@@ -520,15 +562,42 @@ ap_trampoline_end:
 .section .bss.pagetables, "aw", @nobits
 .align 4096
 __pml4:      .skip 4096
+/* `.globl` because `smp.rs` names it: the AP boot root points its slot 0 at
+ * this table rather than building a second identity map of its own. */
+.globl __pdpt_low
 __pdpt_low:  .skip 4096
 __pdpt_high: .skip 4096
 __pdpt_kern: .skip 4096
-/* The four page directories are last and adjacent so the fill loop above can
- * treat them as one 2048-entry array. Keep them together. */
-__pd0:       .skip 4096
-__pd1:       .skip 4096
-__pd2:       .skip 4096
-__pd3:       .skip 4096
+/* The page directories are last, and are ONE allocation rather than a label per
+ * GiB, so the fill loop above can treat them as a single (512 * PDS)-entry
+ * array by construction instead of by convention. They used to be four separate
+ * `.skip`s with a comment asking the reader to keep them adjacent; a comment is
+ * not a constraint, and the loop indexes straight off `__pd0`.
+ *
+ * PDS comes from `phys.rs`'s `PHYSMAP_PDS`. At 64 that is 256 KiB of .bootbss,
+ * which is NOLOAD — it costs nothing in the image on disk and pushes the rest
+ * of the kernel up by that much. */
+__pd0:       .skip 4096 * {PDS}
+
+/* The page-table root a secondary core enables paging on: the kernel's PML4
+ * with slot 0 restored, since `paging::drop_identity_map` cleared it and the AP
+ * trampoline runs identity-mapped. `smp::ap_boot_root` fills it.
+ *
+ * It is HERE, in the low boot region, and not a PMM frame, because the
+ * trampoline loads it with `movl AP_MB_CR3, %eax; movl %eax, %cr3` — and it has
+ * no choice: CR3 is a 32-bit register until long mode is on, and long mode is
+ * what this is being loaded to enable. A root above 4 GiB is silently truncated
+ * and the core triple-faults on its first paged instruction, which on a VMM
+ * looks like the whole machine exiting with no output at all. That is what it
+ * did on 2026-09-12, the first time the physmap reached past 4 GiB and the PMM
+ * started handing out frames up there.
+ *
+ * After `__pd0` rather than before it so the zeroing above, and the fill loop's
+ * view of the directories as one array, are both unchanged. It does mean this
+ * is what an overflowing boot stack reaches first, which is a downgrade in
+ * severity from what it used to reach: the map itself. */
+.globl __ap_pml4
+__ap_pml4:   .skip 4096
 
 /* The boot stack is addressed physically by the 32-bit trampoline, so it lives
  * in .bootbss beside the page tables rather than in the high .bss.

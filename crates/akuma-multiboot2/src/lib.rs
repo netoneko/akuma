@@ -26,6 +26,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+// The tests below build `Vec`s of measured memory maps; `no_std` is about what
+// the kernel links, not about what the host test harness may use.
+#[cfg(test)]
+extern crate std;
+
 /// What GRUB leaves in `%eax`. A block reached without this is not ours.
 pub const BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
 
@@ -437,9 +442,7 @@ impl<'a> BootInfo<'a> {
 
     /// Usable memory, sorted and with adjacent ranges merged.
     ///
-    /// Writes `(base, length)` pairs into `out` and returns how many. Regions
-    /// past `out.len()` are dropped, largest-first ordering being the caller's
-    /// business rather than this function's.
+    /// Writes `(base, length)` pairs into `out` and returns how many.
     ///
     /// # Why merging is not tidiness
     ///
@@ -452,43 +455,35 @@ impl<'a> BootInfo<'a> {
     /// on a machine with 16 GiB of memory, which then failed to fit a 64 MiB
     /// heap. Merging first turns the same map into a handful of large regions
     /// and the question into the one the kernel meant to ask.
+    ///
+    /// # Why the merge happens per entry rather than at the end
+    ///
+    /// It used to fill `out` with raw entries and merge once afterwards, which
+    /// put the capacity check on the **fragments** instead of on the regions.
+    /// Those are different numbers by an order of magnitude on the machine this
+    /// was written for: two dozen raw entries collapsing to eight regions, into
+    /// a sixteen-slot array. The check was therefore doing nothing on that
+    /// machine and would have done the worst possible thing on a slightly more
+    /// fragmented one — entries arrive in ascending address order, so the
+    /// sixteen slots fill with low fragments and the **last** entry is the one
+    /// dropped, and on a PC the last entry is the high-memory region holding
+    /// most of the RAM. Merging on the way in means a full array means sixteen
+    /// genuinely disjoint regions, which is the condition the cap was meant to
+    /// describe.
+    ///
+    /// If it does overflow, the smallest run is what gets dropped rather than
+    /// whatever happened to arrive last — losing 7 MiB is recoverable, losing
+    /// 13 GiB is not.
     #[must_use]
     pub fn usable_coalesced(&self, out: &mut [(u64, u64)]) -> usize {
         let mut n = 0;
-        // Insertion sort by base as they arrive: no allocator here, and the
-        // counts involved are dozens.
         for r in self.memory_regions().into_iter().flatten() {
-            if !r.is_usable() || r.length == 0 {
+            if !r.is_usable() {
                 continue;
             }
-            if n == out.len() {
-                continue;
-            }
-            let mut i = n;
-            while i > 0 && out[i - 1].0 > r.base {
-                out[i] = out[i - 1];
-                i -= 1;
-            }
-            out[i] = (r.base, r.length);
-            n += 1;
+            n = coalesce_insert(out, n, r.base, r.length);
         }
-
-        // Merge anything that touches or overlaps its predecessor.
-        let mut w = 0;
-        for i in 0..n {
-            if w > 0 {
-                let (pb, pl) = out[w - 1];
-                let pend = pb.saturating_add(pl);
-                if out[i].0 <= pend {
-                    let end = out[i].0.saturating_add(out[i].1).max(pend);
-                    out[w - 1] = (pb, end - pb);
-                    continue;
-                }
-            }
-            out[w] = out[i];
-            w += 1;
-        }
-        w
+        n
     }
 
     /// The framebuffer, if the loader provided one.
@@ -539,5 +534,189 @@ impl<'a> BootInfo<'a> {
         };
 
         Some(Framebuffer { addr, pitch, width, height, bpp, kind, format, format_assumed })
+    }
+}
+
+/// Add `[base, base + length)` to the sorted, disjoint runs in `out[..n]`,
+/// merging it into any run it touches. Returns the new count.
+///
+/// A free function rather than a method because it is the whole of
+/// [`BootInfo::usable_coalesced`]'s logic and none of its input: the method
+/// needs a real multiboot2 blob to exist at all, and this needs four integers,
+/// which is the difference between an algorithm that is tested and one that is
+/// only booted. Every case in `tests` below came off a measured memory map.
+///
+/// Runs are kept sorted by base and never touch each other, so "the region
+/// containing X" and "the largest region" mean the same thing here that they
+/// mean to a reader of the machine's own map.
+fn coalesce_insert(out: &mut [(u64, u64)], mut n: usize, base: u64, length: u64) -> usize {
+    if length == 0 || out.is_empty() {
+        return n;
+    }
+    let end = base.saturating_add(length);
+
+    // Touching or overlapping an existing run: widen it and re-merge. Scanning
+    // from 0 finds the leftmost such run, which is what keeps `out` sorted --
+    // anything starting before it would have had to touch it too.
+    for i in 0..n {
+        let (b, l) = out[i];
+        let e = b.saturating_add(l);
+        if base <= e && b <= end {
+            let nb = b.min(base);
+            let ne = e.max(end);
+            out[i] = (nb, ne - nb);
+            return merge_neighbours(out, n);
+        }
+    }
+
+    // Disjoint, so it needs a slot of its own.
+    if n == out.len() {
+        // Full. Drop the smallest run, and only if this one is bigger -- the
+        // alternative, dropping whatever arrived last, is how a map that lists
+        // its high-memory region last loses it.
+        let mut smallest = 0;
+        for i in 1..n {
+            if out[i].1 < out[smallest].1 {
+                smallest = i;
+            }
+        }
+        if out[smallest].1 >= length {
+            return n;
+        }
+        out.copy_within(smallest + 1..n, smallest);
+        n -= 1;
+    }
+
+    let mut i = n;
+    while i > 0 && out[i - 1].0 > base {
+        out[i] = out[i - 1];
+        i -= 1;
+    }
+    out[i] = (base, length);
+    n + 1
+}
+
+/// Merge any run in `out[..n]` that touches or overlaps its predecessor.
+///
+/// `out[..n]` must be sorted by base. Returns the new count.
+fn merge_neighbours(out: &mut [(u64, u64)], n: usize) -> usize {
+    let mut w = 0;
+    for i in 0..n {
+        if w > 0 {
+            let (pb, pl) = out[w - 1];
+            let pend = pb.saturating_add(pl);
+            if out[i].0 <= pend {
+                let end = out[i].0.saturating_add(out[i].1).max(pend);
+                out[w - 1] = (pb, end - pb);
+                continue;
+            }
+        }
+        out[w] = out[i];
+        w += 1;
+    }
+    w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coalesce_insert;
+    use std::vec;
+    use std::vec::Vec;
+
+    /// Feed `regions` through `coalesce_insert` into a `CAP`-slot array.
+    fn run<const CAP: usize>(regions: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut out = [(0u64, 0u64); CAP];
+        let mut n = 0;
+        for &(b, l) in regions {
+            n = coalesce_insert(&mut out, n, b, l);
+        }
+        out[..n].to_vec()
+    }
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn abutting_fragments_become_one_region() {
+        assert_eq!(
+            run::<16>(&[(0, 4 * MIB), (4 * MIB, 4 * MIB), (8 * MIB, 8 * MIB)]),
+            vec![(0, 16 * MIB)]
+        );
+    }
+
+    #[test]
+    fn arrival_order_does_not_matter() {
+        let ascending = run::<16>(&[(0, 4 * MIB), (4 * MIB, 4 * MIB), (8 * MIB, 8 * MIB)]);
+        let shuffled = run::<16>(&[(8 * MIB, 8 * MIB), (0, 4 * MIB), (4 * MIB, 4 * MIB)]);
+        assert_eq!(ascending, shuffled);
+    }
+
+    #[test]
+    fn a_gap_is_not_closed() {
+        // One byte of daylight is still two regions: the byte belongs to
+        // something, and handing it to a frame allocator is how a kernel writes
+        // over a firmware table.
+        assert_eq!(
+            run::<16>(&[(0, 4 * MIB), (4 * MIB + 1, 4 * MIB)]),
+            vec![(0, 4 * MIB), (4 * MIB + 1, 4 * MIB)]
+        );
+    }
+
+    #[test]
+    fn overlapping_entries_merge_without_double_counting() {
+        assert_eq!(run::<16>(&[(0, 8 * MIB), (4 * MIB, 8 * MIB)]), vec![(0, 12 * MIB)]);
+    }
+
+    #[test]
+    fn zero_length_entries_are_ignored() {
+        assert_eq!(run::<16>(&[(0, 0), (MIB, 4 * MIB), (8 * MIB, 0)]), vec![(MIB, 4 * MIB)]);
+    }
+
+    /// The bug this function was rewritten for, as the measured machine reports
+    /// it: a long run of abutting low fragments, then the high-memory region.
+    ///
+    /// With the cap applied to fragments rather than regions, the array fills
+    /// with low fragments and the last entry -- 13 GiB of RAM -- is dropped.
+    #[test]
+    fn high_memory_survives_a_fragmented_low_map() {
+        let mut map: Vec<(u64, u64)> = (0..40).map(|i| (i * MIB, MIB)).collect();
+        map.push((4 * GIB, 13 * GIB));
+        assert_eq!(run::<16>(&map), vec![(0, 40 * MIB), (4 * GIB, 13 * GIB)]);
+    }
+
+    /// And if the map really is more fragmented than the array is deep, the
+    /// small runs are what go.
+    #[test]
+    fn overflow_drops_the_smallest_run_not_the_newest() {
+        // Four slots, five disjoint runs; the 1 MiB one arrived first.
+        let map = [
+            (0, MIB),
+            (2 * GIB, GIB),
+            (8 * GIB, GIB),
+            (16 * GIB, GIB),
+            (32 * GIB, 4 * GIB),
+        ];
+        assert_eq!(
+            run::<4>(&map),
+            vec![(2 * GIB, GIB), (8 * GIB, GIB), (16 * GIB, GIB), (32 * GIB, 4 * GIB)]
+        );
+    }
+
+    #[test]
+    fn overflow_keeps_what_it_has_when_the_newcomer_is_smaller() {
+        let map = [(0, GIB), (2 * GIB, GIB), (8 * GIB, GIB), (16 * GIB, GIB), (32 * GIB, MIB)];
+        assert_eq!(
+            run::<4>(&map),
+            vec![(0, GIB), (2 * GIB, GIB), (8 * GIB, GIB), (16 * GIB, GIB)]
+        );
+    }
+
+    /// A merge that closes the gap between two runs collapses all three.
+    #[test]
+    fn a_bridging_entry_merges_both_sides() {
+        assert_eq!(
+            run::<16>(&[(0, MIB), (2 * MIB, MIB), (MIB, MIB)]),
+            vec![(0, 3 * MIB)]
+        );
     }
 }
