@@ -440,6 +440,24 @@ pub fn socket_index(fd: u64) -> Option<usize> {
     })
 }
 
+/// Is `fd` one end of an AF_UNIX pair?
+///
+/// The socket syscalls on this target are served by `crate::sock`, which knows
+/// only `FileDescriptor::Socket` — an index into the smoltcp table. AF_UNIX is
+/// a different object with a different implementation (`akuma-syscalls-glue`'s
+/// `unixsock`, two pipes behind it), and asking `socket_index` about one
+/// answers `None`, which `sys_recvfrom` reports as `ENOTSOCK`: "that descriptor
+/// is not a socket" about a descriptor `socketpair(2)` just returned.
+///
+/// So the family has to be decided before the implementation is chosen, which
+/// is the shape glue's own dispatchers already have ("try AF_UNIX first, then
+/// the native stack"). This is that test, for the arms this target still serves
+/// itself.
+#[must_use]
+pub fn is_unix_socket(fd: u64) -> bool {
+    matches!(table_get(fd), Some(FileDescriptor::UnixSocket { .. }))
+}
+
 /// Give `sys_spawn`'s caller a handle on its child's output: a
 /// `FileDescriptor::ChildStdout(pid)`, which glue's read arm resolves through
 /// `get_child_channel(pid)`.

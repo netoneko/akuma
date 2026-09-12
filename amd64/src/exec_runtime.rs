@@ -320,8 +320,25 @@ fn runtime() -> ExecRuntime {
         pipe_write: akuma_syscalls_glue::pipe::pipe_write_no_sigpipe,
         eventfd_close: |_| not_wired!("eventfd_close", "sc-eventfd is not in this target's feature set"),
         eventfd_clone_ref: |_| not_wired!("eventfd_clone_ref", "sc-eventfd is not in this target's feature set"),
-        unix_sock_close: |_| not_wired!("unix_sock_close", "AF_UNIX is not built for this target"),
-        unix_sock_clone_ref: |_| not_wired!("unix_sock_clone_ref", "AF_UNIX is not built for this target"),
+        // ── wired 2026-09-12, with `socketpair` ───────────────────────────
+        //
+        // "AF_UNIX is not built for this target" was true of the *syscalls* and
+        // never of the code: `akuma-syscalls-glue`'s `unixsock` module is
+        // ungated and has always been compiled in here. What changed is that
+        // something now creates these objects — `socketpair(2)`, dispatched for
+        // the first time — so a `FileDescriptor::UnixSocket` can reach a
+        // registered table, and the two lifecycle hooks stopped being
+        // hypothetical.
+        //
+        // They are the reason `socketpair` is more than a dispatch row. A pair
+        // is two descriptors over two pipes, and both halves get **cloned on
+        // fork and dropped on exec** — which is the whole of what Rust `std`
+        // uses it for: the child's end is close-on-exec, and the parent reads
+        // EOF to learn the exec succeeded. Unwired, the first `fork` of a
+        // process holding one took the machine down rather than leaking; that
+        // was the panic's design and it is what named this hook.
+        unix_sock_close: akuma_syscalls_glue::unixsock::unix_sock_close,
+        unix_sock_clone_ref: akuma_syscalls_glue::unixsock::unix_sock_clone_ref,
         epoll_destroy: |_| not_wired!("epoll_destroy", "sc-epoll is not in this target's feature set"),
         pidfd_close: |_| not_wired!("pidfd_close", "sc-pidfd is not in this target's feature set"),
         // **A stated no-op, not a panic** — and the distinction is the whole

@@ -4,10 +4,12 @@
 **Rig:** the bare-metal HP box (`docs/runbooks/amd64-bare-metal-loop.md`), kernel
 `fa6a9f42-release-smp-shared`, toolchain installed with `apk add rust cargo`
 (Alpine `1.96.1-r0`, musl host target) onto the persistent root.
-**Status:** **rustc compiles, links and runs a Rust program in the guest**
-(session 3, 2026-09-12 — see below), given an explicit `-C linker`. Plain
-`rustc hello.rs` still fails at `cc`, and the environment a spawned child
-receives is **empty** — no `PATH` at all — which is the open item to pull next. Sessions 1 and 2 are preserved as written;
+**Status:** **`rustc <file>` compiles, links and runs in the guest** — plainly,
+with no `-C linker` flags, once `PATH` carries `/usr/bin` (session 3,
+2026-09-12). Four kernel defects were between here and session 2: the argv cap,
+`ftruncate`, `socketpair` and the two AF_UNIX lifecycle hooks under it. The open
+item to pull next is that the environment a spawned child receives is **empty**
+— no `PATH` at all — which is why that caveat about `PATH` exists. Sessions 1 and 2 are preserved as written;
 their open item 1 is closed. Follow-up to `docs/archive/RUST_TOOLCHAIN_ISSUES.md`
 (the AArch64 investigation) and part of box **D** of
 `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`.
@@ -369,13 +371,67 @@ Which is why the failure looks like it is about `cc` and is not:
 | an absent name, rustc's `PATH` | fork + socketpair | **os error 38** |
 | `/usr/bin/cc`, rustc's `PATH` | `posix_spawn` (has a slash) | works |
 
-It is the `ftruncate` shape for the third time: `nr::SOCKETPAIR = 199` exists,
-`akuma-syscalls-glue::net::sys_socketpair` exists (AF_UNIX, pipe-backed) and
-glue dispatches it — there is no row in `akuma-syscalls-abi`. Unlike
-`ftruncate` it *creates* descriptors, so it needs whatever the `eventfd2` note
-above needs: the fold has already unified the pipe table
-([`AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md`](AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md)),
-so check where glue's socketpair installs its two fds before adding the row.
+**FIXED 2026-09-12, and it was not one line.** It starts as the `ftruncate`
+shape — `nr::SOCKETPAIR = 199` existed, `akuma-syscalls-glue::net::sys_socketpair`
+existed (AF_UNIX, pipe-backed), glue dispatched it, and there was no row in
+`akuma-syscalls-abi`. But unlike `ftruncate` it *creates* objects, and each
+layer under it had to be reached in turn. Three fixes, each found by the one
+after it failing:
+
+1. **The row and the arm.** `Socketpair => SOCKETPAIR = 53, nr::SOCKETPAIR`,
+   and `Syscall::Socketpair => to_glue(…)`. The descriptors need no work of
+   their own: they land in `Process::fds`, which is the table `crate::fd`
+   allocates into, and `read`/`write`/`close` on this target are already glue's.
+2. **The two `ExecRuntime` hooks.** `unix_sock_close` and
+   `unix_sock_clone_ref` were `not_wired!` panics reading "AF_UNIX is not built
+   for this target" — true of the *syscalls* and never of the code, since glue's
+   `unixsock` module is ungated and has always been compiled in. With step 1 in
+   place the first `fork` of a process holding a pair took the machine down with
+   exactly that message. That panic is well-designed: it named the hook, the
+   file and the reason, and it is the difference between five minutes and a
+   session. Both now point at `akuma_syscalls_glue::unixsock`.
+3. **AF_UNIX before the native stack, in `recv`/`send`.** Rust's spawn channel
+   is a `SOCK_SEQPACKET` pair, so it `recv`s rather than `read`s — and
+   `crate::sock::sys_recvfrom` knows only `FileDescriptor::Socket`, an index
+   into the smoltcp table. It answered `ENOTSOCK` for a descriptor
+   `socketpair(2)` had returned three syscalls earlier, which Rust reported as
+   `the CLOEXEC pipe failed: Not a socket`. The `Sendto`/`Recvfrom` arms now
+   test the family first and hop to glue (whose own dispatchers have had that
+   shape all along); `crate::sock` stays the smoltcp implementation rather than
+   growing a second family.
+
+Guarded by 14 boot checks (`usermode::socketpair_smoke_test`): the row decodes,
+a pair is created, bytes cross in **both** directions — the endpoints are not
+symmetric in the implementation and a crossed pair passes a one-way test — both
+ends close through the newly-wired hooks, a closed endpoint is `EBADF`, teardown
+leaks no frames, and `AF_INET` is `EAFNOSUPPORT` rather than `ENOSYS`. 696/0.
+
+### What it bought
+
+```
+# rustc -o /tmp/hello2 /tmp/hello.rs        (no -C linker, PATH carrying /usr/bin)
+# /tmp/hello2
+ssh late.sh from Akuma akuma 0.0.7 83a3752f-release-smp-shared x86_64
+```
+
+**Plain `rustc <file>` now links**, through `cc` → `collect2` → `ld`, in ~4 s.
+The program is `userspace/amd64/selfhost/hello.rs`, which makes a raw
+`uname(2)` and unpacks `struct utsname` by hand — `std` has no `uname` and
+pulling in the `libc` crate would need a registry and a network, and doing it
+raw tests something a wrapper would hide: that a Rust `std` program, with
+musl's start-up and TLS behind it, can issue an arbitrary syscall here and
+unpack a `repr(C)` struct the kernel filled.
+
+**One known divergence remains on this path.** A *failed* exec reports the
+child's exit status rather than its errno: `Command::spawn` of an absent
+program answers `Ok(status 1)` where Linux answers `Err(ENOENT)`. Rust's child
+writes the errno into the pair and `_exit(1)`s, and the parent reads EOF
+instead of those bytes — so the bytes are being lost when the write end closes.
+That is the "EOF-on-success" approximation `sys_socketpair`'s own doc comment
+warns about, seen from the other side, and it is a **pipe teardown** question
+(does a pipe with buffered data and a closed write end still deliver it?)
+rather than a socketpair one. It costs a misleading error message, not a
+failure to link.
 
 ### The probe: `userspace/forktest/c_stress/execenv.c`
 

@@ -1517,6 +1517,12 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   linker ran without its inputs — this was box D's open item 1,
    │   guessed at and unresolved since 09-12 morning), and `ftruncate`
    │   had a handler and a number but no `akuma-syscalls-abi` row.
+   │   Then **`socketpair`** — the last one, and the one that makes
+   │   plain `rustc <file>` link with no flags at all: Rust `std`'s
+   │   spawn opens one to carry a child's exec errno, so an `ENOSYS`
+   │   there surfaced as `could not exec the linker`. Row, arm, the two
+   │   `unix_sock_*` `ExecRuntime` hooks, and AF_UNIX-before-smoltcp in
+   │   `recv`/`send`. 696/0.
    │   `syscall_dispatch` now *names* a missing number on the console,
    │   which is what found the second one and what found `eventfd2`
    │   behind `git clone`'s `curl_multi_init failed`.

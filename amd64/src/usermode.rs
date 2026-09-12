@@ -1391,6 +1391,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // UDP `sendto` has no peer to fall back on, and musl's DNS resolver
         // never `connect()`s its query socket — it addresses every nameserver
         // by hand on each `sendto`. See `sock::sys_sendto`.
+        // **AF_UNIX first, then the native stack** — the shape glue's own
+        // dispatchers have, and the reason these two arms are guarded rather
+        // than left to `crate::sock`. A `socketpair(2)` endpoint is not a
+        // `FileDescriptor::Socket`, so `sock::sys_recvfrom` answers `ENOTSOCK`
+        // for a descriptor the kernel handed out three syscalls earlier — which
+        // is what Rust `std` hit the moment `socketpair` started working
+        // (`the CLOEXEC pipe failed: Not a socket`). Its spawn channel is a
+        // `SOCK_SEQPACKET` pair, so it `recv`s rather than `read`s, and `recv`
+        // on this target had no AF_UNIX arm at all.
+        //
+        // Glue's `sys_sendto`/`sys_recvfrom` test the family themselves and
+        // serve AF_UNIX from `unixsock`; the hop is here so `crate::sock` stays
+        // the smoltcp implementation rather than growing a second family.
+        Syscall::Sendto | Syscall::Recvfrom if crate::fd::is_unix_socket(a1) => {
+            to_glue(call, [a1, a2, a3, a4, a5, a6])
+        }
         Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3, a5),
         Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3, a5),
         Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
@@ -6558,6 +6574,11 @@ fn count_pt_load(image: &[u8]) -> u64 {
 /// so that a partial failure names itself. Reporting through the status rather
 /// than through `write` is what makes a bad load fail the boot: a program that
 /// printed its verdict would still have "passed" by running at all.
+pub fn socketpair_smoke_test(t: &mut Suite) {
+    socketpair_test(t);
+}
+
+#[cfg(not(feature = "no-tests"))]
 pub fn elf_test(t: &mut Suite) {
     /// `.data` arrived with its linked contents.
     const DATA_OK: u64 = 1 << 0;
@@ -6741,6 +6762,102 @@ pub fn elf_test(t: &mut Suite) {
         "elf: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
+    );
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// `socketpair(2)` — the pair is created, carries bytes both ways, and closes.
+///
+/// # Why a boot test and not a userspace one
+///
+/// This syscall is three things stacked, and only the first is a dispatch row:
+/// the row in `akuma-syscalls-abi`, glue's AF_UNIX implementation behind it,
+/// and the two `ExecRuntime` lifecycle hooks a `FileDescriptor::UnixSocket`
+/// needs once one can exist. The middle layer was compiled in and unreachable
+/// for the whole life of the port; the hooks were `not_wired!` panics. A test
+/// that only asked "does the syscall return 0" would have passed on a kernel
+/// that takes itself down the first time a process holding one forks.
+///
+/// So this exercises the object, not the number: both directions, then the
+/// close path, then the frame count. The number gets its own check because it
+/// is the part that was missing — `rustc` reached this syscall through
+/// `Rust std`'s spawn and got `ENOSYS`, which surfaced as
+/// `could not exec the linker` (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+fn socketpair_test(t: &mut Suite) {
+    use crate::fd::errno;
+
+    // The row itself. `53` is x86_64's number and the one a program sends.
+    t.check(
+        "socketpair: x86_64 53 decodes to Socketpair",
+        Syscall::from_x86_64(53) == Some(Syscall::Socketpair),
+    );
+
+    let free_before = akuma_pmm::free_count();
+    let mut sv = [0i32; 2];
+    // AF_UNIX (1), SOCK_STREAM (1). The suite runs inside
+    // `BypassValidationGuard`, which is what lets a kernel pointer stand in for
+    // the `int sv[2]` a ring-3 caller would pass.
+    let rc = to_glue(Syscall::Socketpair, [1, 1, 0, sv.as_mut_ptr() as u64, 0, 0]);
+    if !t.check_eq("socketpair: AF_UNIX/SOCK_STREAM pair created", rc, 0) {
+        return;
+    }
+    let (a, b) = (sv[0] as u64, sv[1] as u64);
+    t.check("socketpair: two distinct descriptors", a != b);
+
+    // Both directions, because the two endpoints are not symmetric in the
+    // implementation: each reads one pipe and writes the other, and a crossed
+    // pair passes a one-way test.
+    let msg = *b"pair";
+    let mut got = [0u8; 4];
+    t.check_eq(
+        "socketpair: a write reaches b",
+        sys_write(a, msg.as_ptr() as u64, 4),
+        4,
+    );
+    t.check_eq(
+        "socketpair: b reads what a wrote",
+        crate::fd::sys_read(b, got.as_mut_ptr() as u64, 4),
+        4,
+    );
+    t.check("socketpair: and the bytes match", got == msg);
+
+    got = [0u8; 4];
+    let back = *b"kcab";
+    t.check_eq(
+        "socketpair: b writes back to a",
+        sys_write(b, back.as_ptr() as u64, 4),
+        4,
+    );
+    t.check_eq(
+        "socketpair: a reads it",
+        crate::fd::sys_read(a, got.as_mut_ptr() as u64, 4),
+        4,
+    );
+    t.check("socketpair: and those bytes match too", got == back);
+
+    // The close path runs `unix_sock_close` and both pipe closes — the hooks
+    // that were `not_wired!` panics until 2026-09-12.
+    t.check_eq("socketpair: closing one end", crate::fd::sys_close(a), 0);
+    t.check_eq("socketpair: closing the other", crate::fd::sys_close(b), 0);
+    t.check_eq(
+        "socketpair: a closed endpoint is EBADF",
+        crate::fd::sys_read(a, got.as_mut_ptr() as u64, 4),
+        errno::EBADF,
+    );
+
+    t.check_eq(
+        "socketpair: teardown leaks no frames",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+
+    // The refusals, which are what a wrong `domain` must get: `EAFNOSUPPORT`,
+    // not `ENOSYS`. A caller reads the first as "this kernel has no AF_INET
+    // pairs" and the second as "this kernel has no socketpair".
+    t.check_eq(
+        "socketpair: AF_INET is EAFNOSUPPORT",
+        to_glue(Syscall::Socketpair, [2, 1, 0, sv.as_mut_ptr() as u64, 0, 0]),
+        errno::EAFNOSUPPORT,
     );
 }
 

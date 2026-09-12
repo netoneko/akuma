@@ -516,6 +516,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     let usermode_boot_tid = fd::boot_row_register();
     usermode::elf_test(t);
     usermode::thread_test(t);
+    usermode::socketpair_smoke_test(t);
     usermode::fdprobe_test(t);
     usermode::spawn_test(t);
     usermode::winsize_to_child_test(t);
