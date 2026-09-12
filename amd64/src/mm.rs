@@ -30,24 +30,37 @@
 //! produces, not what a private file mapping is.
 //!
 //! `MAP_PRIVATE` asks for a private copy of the file's bytes whose writes
-//! nobody else can see. This target can give exactly that, because
-//! `fd.rs` already holds every open file's contents in the kernel: each page is
-//! allocated, zeroed, and then overwritten from the file
-//! ([`populate_file_page`]). What it does **not** give is a page *cache* — two
-//! processes mapping one file hold two sets of frames. That is a cost, not a
-//! semantic difference, and it is the state the AArch64 kernel was in until
-//! `src/file_page_cache.rs` landed in 2026-08.
+//! nobody else can see. This target gives exactly that: each page is allocated,
+//! zeroed, and then overwritten from the file ([`populate_file_page`]).
 //!
-//! One refusal is left and it is the one that genuinely needs the cache: a
-//! **writable `MAP_SHARED`** file mapping, whose writes must reach the file and
-//! every other mapper. A private copy would accept the write and drop it, which
-//! is the original objection in its true scope.
+//! One refusal is left: a **writable `MAP_SHARED`** file mapping, whose writes
+//! must reach the file and every other mapper. A private copy would accept the
+//! write and drop it, which is the original objection in its true scope.
 //!
-//! Two pinned divergences come with it: a file mapping is always **eager** here
-//! (`plan` never marks a file mapping lazy, so a mapping larger than free memory
-//! is `ENOMEM` at `mmap` rather than a fault later), and a mapping never sees a
-//! write made to the file after the `mmap` — `MAP_PRIVATE` leaves that
-//! unspecified on Linux too.
+//! One pinned divergence comes with it: a mapping never sees a write made to
+//! the file after the `mmap` — `MAP_PRIVATE` leaves that unspecified on Linux
+//! too.
+//!
+//! # What changed on 2026-09-13: lazy, and shared
+//!
+//! Until then a file mapping was always **eager** — every frame allocated and
+//! every page read before `mmap` returned — and every mapping held its own
+//! copy. Both are gone, and they were one change: a cache is only reachable
+//! from a path that fills pages one at a time.
+//!
+//! | before | now |
+//! |---|---|
+//! | eager: 311 MB read and 76 000 frames allocated to start `rustc` | demand-paged from [`MmapRegion::file`] by [`fault_in`], 16 pages a fault |
+//! | 207 ms inside one `sys_mmap`, holding the BKL (`[BKL] stuck … tag=9`) | 0 — nothing is read at `mmap` time |
+//! | two processes mapping one file held two sets of frames | one frame per `(mount, inode, offset)`, `akuma-fpcache` |
+//! | a mapping larger than free memory was `ENOMEM` at `mmap` | it faults, and evicts, like the AArch64 kernel |
+//!
+//! Measured: four concurrent mappers of a 311 MB library, 1.17 GiB resident
+//! before and 303 MiB after. The cost is the opposite case — a pass that
+//! touches *every* page of what it maps pays a fault per 16 pages for bytes one
+//! sequential read would have delivered, and comes out ~16% behind
+//! (`docs/archive/RUST_TOOLCHAIN_AMD64.md` § session 5). The win is not a
+//! faster fill; it is not filling.
 //!
 //! # The decisions are shared crates, not local
 //!
@@ -503,7 +516,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
                 }
                 for j in 0..CHUNK_PAGES {
                     let src = &buf[j * PAGE_SIZE as usize..(j + 1) * PAGE_SIZE as usize];
-                    if !populate_file_page_from(va + j * PAGE_SIZE as usize, region_prot, src) {
+                    if populate_file_page_from(va + j * PAGE_SIZE as usize, region_prot, src).is_none() {
                         batch_failed = true;
                         break;
                     }
@@ -667,10 +680,8 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
 /// cost is paid per chunk instead of per page. Same rules: freshly allocated
 /// frame (no stale contents), PTE edit and ledger entry under the
 /// address-space hold, frame freed on a failed map.
-fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> bool {
-    let Some(frame) = akuma_pmm::alloc_page() else {
-        return false;
-    };
+fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> Option<PhysFrame> {
+    let frame = akuma_pmm::alloc_page()?;
     // SAFETY: a fresh PMM frame, reached through the physmap, and no other
     // reference to it exists until it is mapped below.
     let page = unsafe {
@@ -688,9 +699,9 @@ fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> bool {
     }) != Some(true)
     {
         akuma_pmm::free_page(frame, 0);
-        return false;
+        return None;
     }
-    true
+    Some(PhysFrame::new(frame))
 }
 
 /// Service a not-present fault at `addr` from the region table — demand paging.
@@ -764,6 +775,12 @@ pub static FILE_DEMAND_FAULTS: core::sync::atomic::AtomicU64 =
 /// Pages filled from a file by [`fill_file_pages`], readahead included.
 pub static FILE_PAGES_FILLED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// Of those, how many cost **no frame and no read** because the shared
+/// file-page cache already held the page. The ratio to
+/// [`FILE_PAGES_FILLED`] is the deduplication actually achieved, which is the
+/// number worth watching when several compilers run at once.
+pub static FILE_PAGES_SHARED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// How many pages one file fault brings in.
 ///
@@ -825,6 +842,33 @@ fn fill_file_pages(
         }
     }
 
+    // **Frame sharing**, the second half of the AArch64 win. Two `rustc`s
+    // mapping one `librustc_driver.so` held two physical copies of every page
+    // and read each of them off ext2 twice; deduplicating on
+    // `(mount_id, inode, file offset)` collapses that to one fill and one frame
+    // however many mappers there are, which is what stops `-j4` being *slower*
+    // than `-j1` (`akuma-fpcache`'s crate docs).
+    //
+    // The eligibility rules are the crate's, restated in this target's
+    // vocabulary rather than passed as AArch64 PTE bits:
+    //
+    // * **Read-only to ring 3.** A writable private file mapping would have to
+    //   break copy-on-write before sharing; `ld.so`'s relocated data segments
+    //   stay private. `PteProt::from_region` is the authority on what this
+    //   region's pages will actually be mapped as.
+    // * **Fully covered by file data** (below, per page). The page straddling
+    //   EOF has a zero-fill tail whose length belongs to the *mapping*, so two
+    //   mappers may legitimately disagree about its contents.
+    // * **A resolved identity**, which a lazy region always has — it could not
+    //   have been created without one.
+    //
+    // A cap of zero means the cache is off (`akuma_fpcache::init` never armed
+    // it, or `SHARED_FILE_PAGES_ENABLED` is false), and then nothing here takes
+    // a reference: a private page left with a global refcount of 1 would read
+    // as CoW-shared to `pte_prot_for` and cost a copy on the first write.
+    let region_pte = PteProt::from_region(prot);
+    let sharing = !region_pte.write && akuma_fpcache::cap() > 0;
+
     let mut faulting_page_ok = false;
     for idx in first..last {
         let va = region_start + idx * PAGE_SIZE as usize;
@@ -837,16 +881,65 @@ fn fill_file_pages(
             continue;
         }
         let (offset, from_file) = file.page_source(idx);
-        let ok = match buf.as_ref() {
+        let share_this = sharing && from_file == PAGE_SIZE as usize;
+
+        // A hit costs no frame, no read and no copy — just a reference and a
+        // PTE. This is the whole point of the cache, and on the self-host build
+        // it is the common case from the second `rustc` onwards.
+        if share_this
+            && let Some((frame, _needs_icache)) = akuma_fpcache::lookup_and_ref(
+                file.mount_id,
+                file.inode,
+                offset,
+                region_pte.exec,
+            )
+        {
+            // `_needs_icache`: x86 has coherent instruction caches, so there is
+            // no `ic ivau` counterpart to perform. The AArch64 caller acts on
+            // this flag; ignoring it here is a property of the architecture, not
+            // an omission.
+            let ok = map_shared_file_page(va, prot, frame);
+            if ok {
+                FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
+                FILE_PAGES_SHARED.fetch_add(1, Ordering::Relaxed);
+            }
+            if va == page {
+                faulting_page_ok = ok;
+            }
+            if !ok {
+                break;
+            }
+            continue;
+        }
+
+        let filled = match buf.as_ref() {
             Some(b) => {
                 let at = (idx - first) * PAGE_SIZE as usize;
                 populate_file_page_from(va, prot, &b[at..at + from_file])
             }
             None => populate_file_page_by_inode(va, prot, file, offset, from_file),
         };
-        if ok {
+        if let Some(frame) = filled {
             FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
+            if share_this {
+                // Two references, in this order. The first is **this mapping's**:
+                // the page was installed through `map_and_track_pte`, which
+                // counts VAs in this address space and takes no global
+                // reference, and teardown frees each distinct frame once through
+                // `free_page` — which decrements. Without it, the first process
+                // to exit would free a frame the cache still publishes and every
+                // later mapper would be handed a recycled page as file content.
+                // The second is the cache's own, taken inside `insert`.
+                //
+                // `insert` may decline (over cap, or a peer published the same
+                // page first). That is not an error and needs no undo: the frame
+                // stays private with exactly the one reference this mapping
+                // holds, which teardown balances.
+                akuma_pmm::cow_ref_inc(frame.addr);
+                akuma_fpcache::insert(file.mount_id, file.inode, offset, frame, true);
+            }
         }
+        let ok = filled.is_some();
         if va == page {
             faulting_page_ok = ok;
         }
@@ -857,6 +950,47 @@ fn fill_file_pages(
         }
     }
     faulting_page_ok
+}
+
+/// Map an already-filled **shared** file page into this address space.
+///
+/// The frame comes from [`akuma_fpcache::lookup_and_ref`], which has already
+/// taken a global reference on this mapper's behalf — so this either installs
+/// the page (the reference becomes the address space's) or gives the reference
+/// back. There is no path where it is silently kept: a leaked reference pins a
+/// frame until reboot, and a dropped one frees a page other processes are
+/// executing from.
+fn map_shared_file_page(va: usize, prot: Prot, frame: PhysFrame) -> bool {
+    let (pte, cow) = pte_prot_for(prot, frame.addr);
+    let outcome = usermode::with_current_address_space(|uas| {
+        // `true` — the caller's reference. `adopt_user_frame` reports it back as
+        // *surplus* when this address space already held the frame at another
+        // VA, because teardown frees each distinct frame exactly once and a
+        // second reference for a second VA would never be balanced.
+        let surplus = uas.adopt_user_frame(frame, true);
+        if uas.map_page_pte(va, frame.addr, pte, cow) {
+            (true, surplus)
+        } else {
+            // Nothing was mapped, so this address space is not a mapper: undo
+            // the adoption and hand the reference back.
+            let _ = uas.remove_user_frame(frame);
+            (false, true)
+        }
+    });
+    match outcome {
+        // No address space at all — a kernel thread has no business faulting
+        // into one, and the reference must not be kept for it.
+        None => {
+            akuma_pmm::free_page(frame.addr, 0);
+            false
+        }
+        Some((mapped, release)) => {
+            if release {
+                akuma_pmm::free_page(frame.addr, 0);
+            }
+            mapped
+        }
+    }
 }
 
 /// Allocate, fill **directly from the file**, map and record one page.
@@ -871,10 +1005,8 @@ fn populate_file_page_by_inode(
     file: FileBacking,
     offset: usize,
     from_file: usize,
-) -> bool {
-    let Some(frame) = akuma_pmm::alloc_page() else {
-        return false;
-    };
+) -> Option<PhysFrame> {
+    let frame = akuma_pmm::alloc_page()?;
     // SAFETY: a fresh PMM frame, reached through the physmap, and no other
     // reference to it exists until it is mapped below.
     let page = unsafe {
@@ -889,7 +1021,7 @@ fn populate_file_page_by_inode(
             .is_none()
     {
         akuma_pmm::free_page(frame, 0);
-        return false;
+        return None;
     }
     let (pte, cow) = pte_prot_for(prot, frame);
     if usermode::with_current_address_space(|uas| {
@@ -897,9 +1029,9 @@ fn populate_file_page_by_inode(
     }) != Some(true)
     {
         akuma_pmm::free_page(frame, 0);
-        return false;
+        return None;
     }
-    true
+    Some(PhysFrame::new(frame))
 }
 
 /// Demand-page every lazy page covering `[start, start + len)` so a **kernel**

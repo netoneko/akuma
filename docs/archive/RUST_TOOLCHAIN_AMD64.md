@@ -601,6 +601,83 @@ Three things worth carrying:
   `rust-lld` with `-C linker-flavor=ld -C link-self-contained=yes`. Session 2's
   `apk add gcc musl-dev binutils` route also works and is what `collect2` needs.
 
+### Session 5 (2026-09-13): demand-paged file mappings and shared frames
+
+The toolchain ran; what it did not do was run *cheaply*. Every `mmap` of a file
+on this target was **eager** — `sys_mmap` allocated a frame for every page,
+read the whole mapping off ext2 and only then returned — so `rustc`'s own
+startup mapped 311 MB of `librustc_driver.so` before it printed its version,
+and did it inside one syscall holding the BKL. That is the `[BKL] stuck …
+tag=9` storm session 4 chased, seen from the other end.
+
+Both halves of the AArch64 answer are now on this target:
+
+* **Lazy file mappings.** `MmapRegion` carries a `FileBacking` — `(mount_id,
+  inode, offset, filesz)` — and `mm::fault_in` fills pages from the file on
+  first touch, 16 at a time. The identity is the inode pair and not the fd,
+  because `ld.so` closes the descriptor the moment the mapping exists.
+* **Shared frames.** `akuma-fpcache`, the cache the AArch64 kernel has had
+  since 2026-08, is wired here: one physical frame per
+  `(mount, inode, file offset)`, however many processes map it.
+
+#### What it bought, measured
+
+Firecracker guest on the trashcan, 1 vCPU, 6 GiB, `librustc_driver.so`
+(311 MB, 75 986 pages). **A/B on one binary** — the two arms differ only by
+forcing `lazy_file` to `None` in `sys_mmap`, rebuilt and rebooted between them,
+run A/B/A. Wall-clock is measured **from the laptop**, including a ~0.38 s ssh
+round-trip that is identical in both arms: the guest's own `CLOCK_MONOTONIC` is
+a LAPIC tick that does **not advance while a syscall runs with interrupts
+masked**, so an in-guest stopwatch reports one 10 ms tick for an `mmap` the
+kernel's TSC print calls 270 ms. The "work" column subtracts the measured ssh
+floor; treat it as the honest lower bound rather than a precise figure.
+
+| workload | eager | lazy + shared | change (wall / work) |
+|---|---|---|---|
+| `rustc --version` | 0.621 s | 0.514 s | **−17% / −35%** |
+| … time inside `sys_mmap` for file mappings, per run | **207 ms** | **0** | −100% |
+| … pages allocated and read before `main` | **59 841** | 0 up front | — |
+| `mapbig` stride 64 (map 311 MB, touch 1 page in 64) | 0.681 s | 0.504 s | **−26% / −51%** |
+| `mapbig` stride 1 (map 311 MB, touch **every** page) | 0.793 s | 0.834 s | **+5% / +16%** |
+| 4 concurrent mappers, peak resident | **1.17 GiB** | **303 MiB** | **−74%** |
+| 4 concurrent mappers, wall (stride 8) | 1.78 s | 1.90 s | +7% |
+
+Read the last two rows together and the shape of the change is clear. The win
+is **not** a faster fill — it is not filling. A workload that touches
+everything it maps pays a fault per 16 pages for the same bytes and comes out
+slightly behind (+16% of work, the honest cost); a workload that maps a
+toolchain and uses part of it — which is every `rustc`, every `ld.so`, every
+`cargo` subprocess — skips the rest entirely. And four compilers now share one
+copy of the driver instead of holding four: 303 MiB against 1.17 GiB, which is
+the difference between `-j4` fitting in the guest and thrashing. The 303 MiB
+stays resident in the cache after the four exit, which is why the *next*
+`rustc` starts warm.
+
+`mapbig` also names the crossover: with 16-page readahead, an access stride
+above ~16 pages wins and a dense one does not. If a future workload sits on the
+wrong side of that line, `READAHEAD_PAGES` in `amd64/src/mm.rs` is the knob, and
+the measurement above is the method — not a guess at a better default.
+
+#### Correctness: `mmaplazy`
+
+A lazy fill path fails *silently* — it delivers zeros, or another part of the
+file, or another file entirely — so the new probe
+`userspace/forktest/c_stress/mmaplazy.c` checks the four shapes only a lazy path
+can get wrong, and is calibrated on real Linux before it is trusted here:
+
+| check | what it would catch |
+|---|---|
+| pages touched long after `mmap` | a region that forgot where it sits in the file |
+| **unlinked while mapped**, with inode churn afterwards | a mapping that does not pin its inode — root cause #2 of the AArch64 self-host ICE |
+| `mprotect(PROT_NONE)` splitting a mapping three ways, then restored | per-piece file offsets after a split |
+| a `fork` child faulting pages the parent never touched | a child that inherits the extent but not the backing |
+| the same file mapped twice here and once in a child | reference counting on shared frames |
+
+17 checks, **identical results on real Linux (Ubuntu on the box) and on
+Akuma/amd64**. One divergence is deliberately not exercised: a page *wholly*
+past EOF is `SIGBUS` on Linux and zeros here, and a probe that touched one
+would die on the calibration arm rather than report.
+
 ## Background
 
 - `docs/archive/RUST_TOOLCHAIN_ISSUES.md` — the AArch64 toolchain

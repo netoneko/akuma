@@ -214,6 +214,11 @@ akuma-procfs = { path = "../crates/akuma-procfs" }
 akuma-user-space = { path = "../crates/akuma-user-space" }
 # `PhysFrame`, the ledger's currency.
 akuma-mmap = { path = "../crates/akuma-mmap" }
+# The shared file-page cache: one physical frame per `(mount, inode, offset)`,
+# however many processes map it. Adopted 2026-09-13 with demand-paged file
+# mappings — the two are one change, since a cache is only reachable from a path
+# that fills pages one at a time.
+akuma-fpcache = { path = "../crates/akuma-fpcache" }
 # The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
 # table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
 # `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own

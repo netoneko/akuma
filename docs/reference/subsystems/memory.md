@@ -611,7 +611,16 @@ still-mapped page costs a future re-read while freeing nothing now.
 
 ## Shared file pages (`src/file_page_cache.rs`)
 
-**Stability: B — verify behaviour.** Landed 2026-08-05.
+**Stability: B — verify behaviour.** Landed 2026-08-05. **Both kernels since
+2026-09-13** — the amd64 kernel consumes the same `akuma-fpcache`, through its
+own demand-paged file mappings (`amd64/src/mm.rs`'s `fill_file_pages`); what is
+written below about keying, references, sizing and invalidation holds there
+unchanged. Two differences worth knowing: it maps a cached frame through
+`FrameLedger::adopt_user_frame` rather than the AArch64 fault path's three-pass
+readahead, and it does no I-cache maintenance, because x86 instruction caches
+are coherent. Its measured effect — four concurrent mappers of one 311 MB
+library, 1.17 GiB resident against 303 MiB — is in
+`archive/RUST_TOOLCHAIN_AMD64.md` § session 5.
 
 Read-only file-backed pages are deduplicated on `(inode, file_offset)`, so every
 process mapping the same page of the same file shares one physical frame.

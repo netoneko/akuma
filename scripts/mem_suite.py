@@ -22,6 +22,8 @@ that currently work:
   cowstale              CoW stale-write fault; prints PASS/FAIL
   eager_mprotect_probe  eager-region protection record; prints RESULT/PASS
   smapsdirty            /proc/self/smaps dirty accounting; prints PASS/FAIL
+  mmaplazy              demand-paged file mappings: late pages, unlink-while-
+                        mapped, mprotect splits, fork; prints [OK]/[FAIL]
 
 So the verdict is layered rather than one regex:
 
@@ -102,6 +104,12 @@ PROBES = {
     "cowstale":             ("", 420),
     "eager_mprotect_probe": ("", 300),
     "smapsdirty":           ("", 300),
+    # Demand-paged file mappings: the four shapes only a *lazy* fill path can
+    # get wrong, each of which is silent (zeros, or another part of the file, or
+    # another file). It stages its own data file in the directory it is given,
+    # so it takes a path rather than reading `mem_suite_data` — the unlink arm
+    # has to be free to delete what it mapped.
+    "mmaplazy":             ("/tmp", 300),
 }
 
 SSH_BASE = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",

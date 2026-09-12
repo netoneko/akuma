@@ -317,17 +317,47 @@ pub fn init_vfs() {
         // sync — `clock::now_us` returns 0 for "never synced", which as a
         // timestamp would be 1970 dressed up as a reading.
         utc_time_us: || crate::clock::is_synced().then(crate::clock::now_us),
-        // The shared file-page cache is not wired on this target: every file
-        // mapping still gets its own copy of every page
-        // (`AKUMA_AMD64_MEMORY_CLOSEOUT.md`). Sizing a cache nothing consults
-        // would reserve RAM for no reader, so this stays a no-op until
-        // `akuma-fpcache` is adopted here.
-        fpcache_init: |_total_ram_bytes| {},
+        // The shared file-page cache, adopted 2026-09-13 with the demand-paged
+        // file mappings that consult it (`mm::fill_file_pages`). Until then
+        // every file mapping held its own copy of every page, which is what made
+        // two concurrent `rustc`s read one `librustc_driver.so` twice and hold
+        // it twice.
+        //
+        // `akuma_fpcache::init` directly rather than through a shim: the four
+        // tunables it reads are `akuma-config` consts, and this target has no
+        // second copy of them to supply.
+        fpcache_init: akuma_fpcache::init,
         // `/proc/<pid>/maps` and `/proc/<pid>/statm`, which the shared
         // `ProcFilesystem` renders and cannot walk for itself — the leaf walk
         // is x86-only. See `fd::pid_map_rows`.
         pid_map_rows: crate::fd::pid_map_rows,
     });
+    // Drop cached file pages when ext2 frees an inode number, **before** any
+    // mapping can be made. The cache is keyed on `(inode, mount, offset)` and
+    // ext2 reissues inode numbers, so without this a newly created file
+    // silently inherits the cached pages of whatever last held its number —
+    // a wrong-bytes bug, not a crash (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md`
+    // §15). The AArch64 kernel registers it in `akuma_vfs_glue::fs::init`,
+    // which this target does not call: it mounts ext2 itself. The other half of
+    // invalidation — every mutating VFS entry point — is already shared code.
+    akuma_ext2::init_inode_freed_hook(akuma_fpcache::invalidate_inode);
+
+    // Size the cache from the RAM the PMM actually manages.
+    //
+    // The `fpcache_init` hook above is **not** what calls this: that hook fires
+    // from `akuma_vfs_glue::fs::init`, which is the AArch64 binary's mount path
+    // and not this one — this target mounts ext2 itself, a few lines below. It
+    // is registered anyway so the two kernels answer the hook identically, and
+    // the call is made here, at the equivalent moment.
+    //
+    // Guarded because this function is deliberately idempotent and called twice
+    // (see `mount_root_on`), and `akuma_fpcache::init` is not: it re-arms and
+    // re-announces itself, which printed the banner twice and would have read
+    // as two caches.
+    if akuma_fpcache::cap() == 0 {
+        akuma_fpcache::init(akuma_pmm::total_count() * 4096);
+    }
+
     akuma_vfs_glue::init();
 
     // 5b slice 3: mount the real `ProcFilesystem`.

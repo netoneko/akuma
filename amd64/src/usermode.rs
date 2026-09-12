@@ -5703,7 +5703,7 @@ pub fn redirect_test(t: &mut Suite) {
     }
     if let Some((status, _)) = run_sh_capture(b"echo x > /tmp/modeprobe && chmod 755 /tmp/modeprobe\0") {
         t.check_eq("chmod: `chmod 755 file` exited 0", status, 0);
-        let mode = akuma_vfs_glue::metadata("/tmp/modeprobe").map(|m| (m.mode & 0o777) as u64);
+        let mode = akuma_vfs_glue::metadata("/tmp/modeprobe").map(|m| u64::from(m.mode & 0o777));
         t.check_eq("chmod: and the on-disk mode is 755", mode.unwrap_or(0), 0o755);
     } else {
         t.check("chmod: sh spawned for the mode probe", false);

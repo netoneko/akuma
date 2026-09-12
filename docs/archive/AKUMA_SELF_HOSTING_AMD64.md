@@ -1505,7 +1505,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   kernel, so the ~5x skew is the emulated LAPIC.
    │                        doc: AKUMA_AMD64_C3_CLOCK.md
    ▼
- [09-12] ═══ YOU ARE HERE ═══
+ [09-12] ═══ CARGO, AND THE mmap WALL ═══
    │
    ├──► **The guest compiled, linked and ran a Rust program** —
    │   **nine days after this architecture first reached long mode**
@@ -1655,6 +1655,63 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
           `net::uptime_us` is what the scheduler, the network timeouts
           and `park_until` all steer by. See
           `AKUMA_AMD64_C3_CLOCK.md` § 7.
+   ▼
+ [09-13] ═══ YOU ARE HERE ═══ file mappings stop being eager
+   │
+   ├──► **`tag=9` is answered.** The `[BKL] stuck … tag=9` storms above
+   │   were not contention *around* `mmap`; they were one `mmap`. Every
+   │   file mapping on this target was eager — a frame allocated and a
+   │   page read for all of it before the syscall returned — so `rustc`
+   │   starting up spent **207 ms inside a single `sys_mmap`**, holding
+   │   the BKL, to map 311 MB of `librustc_driver.so` it then uses a few
+   │   per cent of. Measured on the guest's own console, TSC-derived:
+   │   `[mmap-t] pages=75987 file=1 us=270161`.
+   │
+   │   Both halves of the AArch64 answer now exist here:
+   │   **demand-paged file mappings** (`MmapRegion` carries a
+   │   `FileBacking` — `(mount_id, inode, offset, filesz)` — and
+   │   `mm::fault_in` fills 16 pages at a time from the file, by inode,
+   │   because `ld.so` closes the fd the moment the mapping exists) and
+   │   **shared frames** (`akuma-fpcache`, one physical frame per
+   │   `(mount, inode, offset)` however many processes map it — wired
+   │   here for the first time, along with the `init_inode_freed_hook`
+   │   that keeps a reissued inode number from inheriting cached pages).
+   │
+   │   A/B on one binary, Firecracker guest, 1 vCPU, run A/B/A:
+   │   time inside `sys_mmap` for file mappings **207 ms → 0** per
+   │   `rustc --version`; pages allocated and read before `main`
+   │   **59 841 → 0**; wall clock **−17%** (−35% once the ~0.38 s ssh
+   │   floor is taken out); a map-and-touch-1-page-in-64 pass **−26%**
+   │   (−51% of work). Four concurrent mappers of the same 311 MB
+   │   library go from **1.17 GiB resident to 303 MiB** — 4 copies to
+   │   one, **−74%** — which is the difference between `-j4` fitting in
+   │   this guest and thrashing it.
+   │
+   │   The honest cost, in the same table: a pass that touches **every**
+   │   page of what it maps is **+16% of work**, because it pays a fault
+   │   per 16 pages for bytes an eager fill would have read in one
+   │   sequential run. The win is not a faster fill; it is not filling.
+   │
+   ├──► **A lazy fill path fails silently**, so it arrives with a probe:
+   │   `userspace/forktest/c_stress/mmaplazy.c`, 17 checks over the four
+   │   shapes only a lazy path can get wrong — late pages, **unlinked
+   │   while mapped** (with inode churn afterwards, which is what an
+   │   unpinned inode dies on), `mprotect` splitting a region three ways,
+   │   and a `fork` child faulting pages the parent never touched — plus
+   │   two mappings here and one in a child, for the reference counting
+   │   on shared frames. **Identical results on real Linux and on
+   │   Akuma/amd64.** The region algebra under it is host-tested in
+   │   `akuma-mmap` (7 new tests on `FileBacking`'s offsets through
+   │   every clip and split).
+   │
+   └──► Where the pin lives is the one design decision worth carrying:
+        `akuma-mmap` has an empty `[dependencies]` table and that is
+        load-bearing, so `FileBacking` is **integers only** and the
+        `InodePin` sits in the x86_64 `UserAddressSpace` — which dies
+        exactly when the mappings do, on `exec` and on exit, so `Drop`
+        releases every pin with no teardown path having to know they
+        exist.
+        docs: RUST_TOOLCHAIN_AMD64.md § session 5
 
 ```
 
