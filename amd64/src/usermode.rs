@@ -717,7 +717,7 @@ pub fn kill_current_from_fault(status: u64) -> ! {
     // Same group-death rule as `exit_current_from_signal`: a *thread* faulting
     // out of ring 3 by default action must not just kill itself, or the leader
     // runs on and nothing ever reaches the parent's `waitpid`.
-    crate::signal::notify_group_of_thread_fatal((!(status as i64)) as u32);
+    crate::signal::notify_group_of_thread_fatal((-(status as i64)) as u32);
     EXIT_STATUS.store(status, Ordering::Relaxed);
     let uctx = crate::smp::current_uctx();
     assert!(!uctx.is_null(), "ring-3 fault with no current UserCtx");
