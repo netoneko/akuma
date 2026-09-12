@@ -714,6 +714,10 @@ pub fn set_user_gs_base(base: u64) {
 /// so the per-CPU block is in place.
 pub fn kill_current_from_fault(status: u64) -> ! {
     crate::smp::bkl_enter();
+    // Same group-death rule as `exit_current_from_signal`: a *thread* faulting
+    // out of ring 3 by default action must not just kill itself, or the leader
+    // runs on and nothing ever reaches the parent's `waitpid`.
+    crate::signal::notify_group_of_thread_fatal((!(status as i64)) as u32);
     EXIT_STATUS.store(status, Ordering::Relaxed);
     let uctx = crate::smp::current_uctx();
     assert!(!uctx.is_null(), "ring-3 fault with no current UserCtx");
@@ -965,6 +969,12 @@ extern "C" fn syscall_handler(
 /// Returns; the caller must not deliver any further signal, and the task leaves
 /// ring 3 when the syscall return path reads `leave`.
 pub fn exit_current_from_signal(sig: u32) {
+    // A thread dying by signal takes its thread group with it (Linux
+    // `do_group_exit`): pend the signal on the leader so *its* exit — the one
+    // whose epilogue reaches the parent's `waitpid` — happens too. No-op for a
+    // main thread, which is already that leader. See
+    // `crate::signal::notify_group_of_thread_fatal`.
+    crate::signal::notify_group_of_thread_fatal(sig);
     crate::thread::set_group_exiting(current_proc_slot());
     // `EXIT_STATUS` is a diagnostic counter, not the path the status travels:
     // [`run_process`] overwrites it with `enter_user`'s return value the moment

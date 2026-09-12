@@ -636,6 +636,35 @@ fn signal_status(sig: u32) -> u64 {
     (-(i64::from(sig))) as u64
 }
 
+/// **A fatal signal that reaches a *non-main* thread is a group death**
+/// (Linux `do_group_exit`), and on this target the group dies only through the
+/// **leader's** `run_process` epilogue — that is where `thread::drain`, the fd
+/// sweep, the `SPAWN` row and the parent's exit status live. A thread unwinds
+/// into `run_thread` instead, which tears down the thread and nothing else: the
+/// leader ran on (parked in `pause()`, in the measured case), the parent's
+/// `waitpid` never resolved, and the whole group — task slots, `Process` rows,
+/// the address space — leaked per crash.
+///
+/// So before a non-main thread leaves ring 3 by signal, pend the same signal on
+/// the leader (`deliver_signal` = pend + interrupt): its next syscall return
+/// takes `Next::Fatal`, `exit_current_from_signal` sets `leave` with the same
+/// negative status, and the death travels the complete path. If the leader
+/// *handles* the signal instead, it survives — which is what Linux answers too.
+///
+/// Called from both fatal funnels — [`crate::usermode::kill_current_from_fault`]
+/// (faults and the timer-tick path) and [`crate::usermode::exit_current_from_signal`]
+/// (fatal delivery at a syscall return) — under the BKL, which both hold.
+pub fn notify_group_of_thread_fatal(sig: u32) {
+    if crate::thread::current_is_main() {
+        return;
+    }
+    let Some(proc) = current_process_shared() else { return };
+    if proc.tgid == proc.pid {
+        return;
+    }
+    akuma_exec::process::deliver_signal(proc.tgid, sig);
+}
+
 /// What the pending set says to do next.
 ///
 /// Three outcomes because there are three *paths out*, and each caller leaves
