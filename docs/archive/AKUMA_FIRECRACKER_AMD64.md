@@ -3208,6 +3208,34 @@ reference in `boot.s` with `R_X86_64_32 cannot be used against local symbol`.
 
 ---
 
+## Nine days later — seven of them on real hardware
+
+**2026-09-12.** This target compiled, linked and ran a Rust program with its own
+`rustc` — under Firecracker, and the same day on the bare-metal HP box.
+
+The dates are worth keeping together, because they say what kind of port this
+was: first long mode **2026-09-03** (above), first boot on the HP box from a
+GRUB entry **2026-09-05** (`AKUMA_AMD64_ON_HP_500_502NJ.md`), `rustc`
+**2026-09-12**. Seven of the nine days ran on the metal, so all but the first
+two days' worth of bring-up was measured against a real machine — which is why
+the bugs it found are the ones an emulator does not have: a framebuffer BAR at
+`0xe0000000` with a pitch of 8192, an uncalibrated LAPIC whose "one second" was
+0.31 s on a 3.2 GHz Haswell, a physmap that could reach only 15% of 16 GiB, an
+`mmap`-bound BKL under a toolchain load, and a USB root that mounts clean and
+stalls under use.
+
+Between the first boot and `rustc`: the ELF loader, ring 3, isolated address spaces,
+preemption, CoW `fork`, `execve`, signals, a clock, SMP, ext2, a network stack,
+sshd, and — at the end — four kernel defects that stood between a working
+toolchain and a linked binary, of which the last two were an `argv` truncated at
+sixteen entries and a `socketpair` that had an implementation, a number, and no
+row in the dispatch table.
+
+`docs/archive/RUST_TOOLCHAIN_AMD64.md` is that story;
+`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` is the chart it closes a box on.
+
+---
+
 **Background:** the one kernel defect this port has found so far has its own
 document: `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
 `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected

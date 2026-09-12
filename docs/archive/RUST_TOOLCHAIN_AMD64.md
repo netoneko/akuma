@@ -4,6 +4,13 @@
 **Rig:** the bare-metal HP box (`docs/runbooks/amd64-bare-metal-loop.md`), kernel
 `fa6a9f42-release-smp-shared`, toolchain installed with `apk add rust cargo`
 (Alpine `1.96.1-r0`, musl host target) onto the persistent root.
+**Nine days of porting, seven of them on real hardware.** This target reached
+long mode for the first time on **2026-09-03** under Firecracker
+(`AKUMA_FIRECRACKER_AMD64.md`), booted the HP box from a GRUB entry on
+**2026-09-05** (`AKUMA_AMD64_ON_HP_500_502NJ.md`), and compiled, linked and ran
+a Rust program with its own `rustc` on **2026-09-12** — in the guest, and the
+same day on the metal.
+
 **Status:** **`rustc <file>` compiles, links and runs in the guest** — plainly,
 with no `-C linker` flags, once `PATH` carries `/usr/bin` (session 3,
 2026-09-12). Four kernel defects were between here and session 2: the argv cap,

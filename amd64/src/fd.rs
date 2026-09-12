@@ -1068,15 +1068,34 @@ pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
     // A directory needs no guard of its own: `fs::read_at` below refuses one
     // (`NotAFile`), and this function's contract is already `None` for
     // anything a `MAP_PRIVATE` file mapping must not be served from.
-    let path = table_with(fd, |d| match d {
-        FileDescriptor::File(f) => Some(f.path.clone()),
+    // **By inode, not by path** — the same read `read(2)` does, for the same
+    // reason and with much more at stake here.
+    //
+    // `read_at(path, ..)` resolves the path from the mount table down, per call.
+    // This function is called **once per 4 KiB page of a file mapping**, so a
+    // 300 MB shared object cost ~76 800 full directory walks and ~76 800 heap
+    // allocations for the `String` clone — inside `sys_mmap`, holding the BKL,
+    // while every other core spun. That is what made `rustc --version` (which
+    // maps `librustc_driver` and reads a sliver of it) take 16 s on the metal
+    // and fill the console with `[BKL] stuck … tag=9`.
+    //
+    // `open(2)` already resolved this descriptor to an inode and pinned it, so
+    // the walk was re-deriving something the fd has been holding all along.
+    // With `inode != 0` the path is not touched at all, which is why it is only
+    // cloned when there is no inode to use.
+    let (path, mount_id, inode) = table_with(fd, |d| match d {
+        FileDescriptor::File(f) => {
+            let inode = f.inode();
+            let path = if inode == 0 { Some(f.path.clone()) } else { None };
+            Some((path, f.mount_id(), inode))
+        }
         _ => None,
     })??;
     // Real file: the page comes off the VFS. A read error fills nothing —
     // the caller's freshly zeroed page shows through, which is the same
     // answer "past EOF" gets, and the only kind thing a fault path can do
     // with an I/O error anyway.
-    fs::read_at(&path, offset, dst).ok()
+    fs::read_at_open_file(path.as_deref().unwrap_or(""), mount_id, inode, offset, dst).ok()
 }
 
 /// Is `fd` a regular file — something `mmap` can back a mapping with?

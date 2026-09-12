@@ -100,8 +100,9 @@ use crate::serial;
 // it is re-exporting.
 #[allow(unused_imports)]
 pub use akuma_vfs_glue::{
-    create_dir, create_symlink, exists, list_dir, metadata, read_at, read_file, read_symlink,
-    remove_dir, remove_file, rename, resolve_symlinks, set_times, stats_for_path, write_file,
+    create_dir, create_symlink, exists, list_dir, metadata, read_at, read_at_open_file, read_file,
+    read_symlink, remove_dir, remove_file, rename, resolve_symlinks, set_times, stats_for_path,
+    write_file,
 };
 
 /// The exec-side image read.

@@ -1507,7 +1507,13 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    ▼
  [09-12] ═══ YOU ARE HERE ═══
    │
-   ├──► **The guest compiled, linked and ran a Rust program** — later
+   ├──► **The guest compiled, linked and ran a Rust program** —
+   │   **nine days after this architecture first reached long mode**
+   │   (2026-09-03, `AKUMA_FIRECRACKER_AMD64.md`) and **seven after it
+   │   first booted the HP box** (2026-09-05,
+   │   `AKUMA_AMD64_ON_HP_500_502NJ.md`) — so most of the port was
+   │   done against real hardware rather than against an emulator.
+   │   Later
    │   the same day, under **Firecracker**, which needs no disk that
    │   survives a build and therefore does not wait on item 1 below.
    │   Nightly `rustc` (musl host) staged into the 4 GiB root image,
@@ -1581,6 +1587,52 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
            `eventfd2`/`epoll` are compiled out of glue on this target
            (so anything using libcurl, including `git` over https,
            fails), and spawn children start at cwd `/`.
+
+        **Loading the toolchain on the metal is BKL-bound on `mmap`
+        (2026-09-12).** `rustc --version` — which does nothing but
+        start up and print — takes **~16 s then ~8 s** on bare metal
+        against **~1 s** in the Firecracker guest, and the console says
+        why:
+
+        ```
+        [BKL] stuck: owner=4 waiter=3 tag=9 (aff0+1)
+        [BKL] stuck: owner=4 waiter=2 tag=9 (aff0+1)
+        [BKL] stuck: owner=4 waiter=1 tag=9 (aff0+1)
+        ```
+
+        **`tag=9` is `mmap`** — the tag is the raw x86_64 syscall
+        number, stamped at entry by `usermode.rs`'s
+        `set_holder_tag(cpu, nr)`, so it is x86_64's numbering and not
+        asm-generic's (9 there is unrelated). Counted over one boot:
+        **1305 of 1315 `[BKL] stuck` lines are tag=9**, 9 are tag=1
+        (`write`), 1 is tag=511 (unknown). One core maps while the
+        other three spin on the ticket, over and over.
+
+        That is the shape of the workload rather than a new defect:
+        `rustc` is a 9 KB shim over a `librustc_driver-*.so` of a few
+        hundred MB, so starting it is a long run of file-backed `mmap`
+        and the faults behind it, and `mmap` is a BKL excursion. Two
+        things follow, and they are the reason this is written down
+        here rather than in the toolchain doc:
+
+        * **The Firecracker/metal gap is not all storage.** The guest
+          runs **1 vCPU**, so it has no BKL contention at all; the
+          metal runs four. The disk explains part of the 5 s → 16 s on
+          a full compile (virtio-blk on the internal SSD vs the
+          xHCI/USB root) and this explains the rest. Measuring one
+          without controlling the other will attribute the whole gap
+          to whichever was looked at first.
+        * **This is the first workload that makes `mmap` the BKL's hot
+          tag on this target**, which is a fact about what a self-host
+          campaign will contend on — not `read`, not `openat`. Phase 7f
+          -style per-syscall opt-outs would have to start there, and
+          `tag=` naming the syscall (added the same day) is what made
+          that answerable from one boot instead of a profiler run.
+
+        Not yet measured: whether `SMP=1` on the metal is *faster* for
+        this workload than `SMP=4`. It is a one-line cmdline change
+        (`nosmp`) and it is the experiment that says whether the
+        contention costs real time or merely prints.
 
         Smaller, and carried rather than blocking:
 
