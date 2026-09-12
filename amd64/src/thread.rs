@@ -211,6 +211,24 @@ pub fn sys_clone_thread(
 ) -> u64 {
     use crate::usermode::clone_flags::*;
 
+    // **Collect before claiming.** Every `pthread_create` on this target
+    // registers a `Process` row (see `teardown`'s note), and the five existing
+    // drain sites are all on *process* exit/reap paths — none on the thread
+    // one. So a thread-churning workload retires rows that nobody collects:
+    // `futextest` step 6 took the table from empty to
+    // `Process table full (256 slots, 246 reclaimable RETIRED)` and panicked
+    // the kernel, with 96% of the table collectable at that instant.
+    //
+    // Draining here rather than at teardown is deliberate. `register_process`'s
+    // own comment explains why reclaim cannot run from inside the spawn path:
+    // it executes `Process::drop`, which frees page tables and releases an
+    // ASID, and a caller already holding those locks self-deadlocks. Syscall
+    // entry is before any of that — no address-space lock, no region lock — and
+    // it is the same context the other `drain_retired_if_requested` sites run
+    // in. It is also demand-driven: the one path that consumes slots is the one
+    // that pays for collecting them.
+    akuma_exec::process::reclaim::drain_retired_if_requested();
+
     if flags & CLONE_THREAD == 0 {
         return errno::ENOSYS;
     }

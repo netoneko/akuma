@@ -458,8 +458,32 @@ fn config() -> ExecConfig {
         // gates `akuma-exec`'s path, which is not reachable here.
         cow_fork_enabled: false,
         vfork_fastpath_enabled: false,
-        // No signal delivery on this target at all — that is A2.
-        pthread_kill_eintr_enabled: false,
+        // **A stale `false`, flipped 2026-09-12.** The comment here read "no
+        // signal delivery on this target at all — that is A2" and was true when
+        // written; signal delivery landed 2026-09-11
+        // (`AKUMA_AMD64_SIGNAL_DELIVERY.md`) and nothing came back to it. Same
+        // class as the five `|_| false` process hooks in
+        // `AKUMA_AMD64_STALE_FALSE_HOOKS.md`, and the same kind of damage: it
+        // read as a deliberate refusal while it was an expired one.
+        //
+        // This flag is the third arm of `should_interrupt_blocking_syscall`,
+        // and without it a signal cannot reach a **parked** thread. Posting one
+        // (`pend_signal_for_thread`) sets the pending bit and `wake()`s the
+        // slot — which is eligibility, not delivery: the thread wakes inside
+        // its blocking wait, re-checks its own condition, finds it unchanged
+        // and parks again, never reaching the syscall return where
+        // `deliver_pending` runs. Measured: `kill -9` on a process parked in a
+        // blocking read did **nothing at all**, and `pthread_kill_eintr`'s
+        // phase 1 reported the handler running zero times in 100 attempts.
+        //
+        // The consequences compound, which is why this is worth the paragraph.
+        // A process that cannot be signalled cannot be killed; its parent waits
+        // forever; the orphan is reparented to init and holds its `Process` row
+        // and its thread slots for the life of the boot. That is the leak
+        // behind `Process table full (256 slots, 246 reclaimable RETIRED)` and
+        // behind `segvgroup` failing from round 31 with "leaked thread slots"
+        // (`AKUMA_AMD64_THREAD_LIFECYCLE.md`).
+        pthread_kill_eintr_enabled: true,
         // No file-page cache here yet; every file mapping gets its own copy
         // (`AKUMA_AMD64_MEMORY_CLOSEOUT.md`).
         shared_file_pages_enabled: false,
