@@ -506,57 +506,55 @@ pub fn trampoline_page_available(machine: &MachineDescription, keep_out: &[(u64,
     in_ram && clear
 }
 
-/// Present + writable, for the intermediate entries of the AP boot tables.
+/// Present + writable, for the slot-0 entry of the AP boot root.
 const PTE_P_RW: u64 = 0x3;
-/// ...plus page-size, for a 2 MiB identity leaf.
-const PTE_P_RW_PS: u64 = 0x83;
 
-/// The page-table root APs enable paging on: the kernel's PML4 with slot 0
-/// pointing at an identity map of the first gigabyte. Three frames.
-struct ApBootTables {
-    pml4: usize,
-    pdpt: usize,
-    pd: usize,
+unsafe extern "C" {
+    /// The AP boot root, a page in the low boot region (`boot.s`).
+    static __ap_pml4: u8;
+    /// The identity map `boot.s` built, which `drop_identity_map` unlinked from
+    /// the kernel root but did not destroy.
+    static __pdpt_low: u8;
 }
 
-impl ApBootTables {
-    fn build(kernel_root: u64) -> Option<Self> {
-        let pml4 = akuma_pmm::alloc_page()?;
-        let Some(pdpt) = akuma_pmm::alloc_page() else {
-            akuma_pmm::free_page(pml4, 0);
-            return None;
-        };
-        let Some(pd) = akuma_pmm::alloc_page() else {
-            akuma_pmm::free_page(pml4, 0);
-            akuma_pmm::free_page(pdpt, 0);
-            return None;
-        };
-        // SAFETY: three fresh PMM frames, reached through the physmap; the
-        // kernel root is a live PML4 that is likewise inside the physmap.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys_ptr::<u8>(kernel_root),
-                phys_ptr::<u8>(pml4 as u64),
-                4096,
-            );
-            core::ptr::write_bytes(phys_ptr::<u8>(pdpt as u64), 0, 4096);
-            let pd_ptr = phys_ptr::<u64>(pd as u64);
-            for i in 0..512u64 {
-                pd_ptr.add(i as usize).write_volatile((i << 21) | PTE_P_RW_PS);
-            }
-            phys_ptr::<u64>(pdpt as u64).write_volatile(pd as u64 | PTE_P_RW);
-            phys_ptr::<u64>(pml4 as u64).write_volatile(pdpt as u64 | PTE_P_RW);
-        }
-        Some(Self { pml4, pdpt, pd })
+/// Build the page-table root APs enable paging on, and return its **physical**
+/// address: the kernel's PML4 with slot 0 pointing back at `boot.s`'s identity
+/// map, so the trampoline has somewhere to stand before it jumps high.
+///
+/// # Why this is a static page and not three PMM frames
+///
+/// It used to allocate three — a root, a PDPT and a PD carrying a fresh 1 GiB
+/// identity map — and free them once every core was up. That was correct for as
+/// long as every PMM frame was below 4 GiB, and stopped being correct the moment
+/// the physmap grew past it (2026-09-12). The trampoline sets CR3 in 32-bit
+/// protected mode, because setting CR3 is how it gets *out* of 32-bit protected
+/// mode; CR3 is 32 bits wide there, so a root at `0x1_2000_0000` is loaded as
+/// `0x2000_0000` and the core triple-faults on its first paged instruction. The
+/// symptom is a VMM that exits with no output during `smp: cpu 1 online`.
+///
+/// The other two frames were never the problem — the PDPT and PD are named by
+/// 64-bit page-table fields the CPU only walks once it is in long mode — but
+/// they are not needed either: `boot.s`'s own identity map is still sitting in
+/// `.bss`, unlinked from the kernel root by `drop_identity_map` and otherwise
+/// untouched. Pointing at it costs one static page instead of three
+/// allocations, deletes the "no frames for the AP boot tables" failure path,
+/// and makes the map a core boots on the same map the BSP booted on rather than
+/// a second one that has to be kept in agreement with it.
+fn ap_boot_root(kernel_root: u64) -> u64 {
+    let root = (&raw const __ap_pml4) as u64;
+    let identity = (&raw const __pdpt_low) as u64;
+    // SAFETY: both symbols are page-aligned pages in `.bss.pagetables`, whose
+    // VMA is its LMA, so their addresses are physical and inside the physmap.
+    // `kernel_root` is a live PML4, likewise inside it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_ptr::<u8>(kernel_root),
+            phys_ptr::<u8>(root),
+            4096,
+        );
+        phys_ptr::<u64>(root).write_volatile(identity | PTE_P_RW);
     }
-
-    /// Give the frames back. Safe once every AP has switched to the kernel root,
-    /// which each does as its first act in [`ap_entry64`].
-    fn free(self) {
-        akuma_pmm::free_page(self.pml4, 0);
-        akuma_pmm::free_page(self.pdpt, 0);
-        akuma_pmm::free_page(self.pd, 0);
-    }
+    root
 }
 
 /// Copy the trampoline to its page. Returns false if it does not fit below the
@@ -609,14 +607,16 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         serial::puts("\n");
     }
 
-    let kernel_root = sched::kernel_root();
-    let Some(tables) = ApBootTables::build(kernel_root) else {
-        serial::puts("  smp:  [FAIL] no frames for the AP boot tables\n");
+    let ap_root = ap_boot_root(sched::kernel_root());
+    // The constraint `ap_boot_root` exists to satisfy, checked rather than
+    // trusted: this is a link-time property of `.bss.pagetables`, and a boot
+    // that violated it would take the machine down with nothing on the wire.
+    if ap_root >= (4 << 30) {
+        serial::puts("  smp:  [FAIL] AP boot root is above 4 GiB; CR3 is 32-bit here\n");
         return 0;
-    };
+    }
     if !install_trampoline() {
         serial::puts("  smp:  [FAIL] trampoline does not fit its page\n");
-        tables.free();
         return 0;
     }
 
@@ -651,7 +651,7 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         cpu.current_task.store(idle_slot, Ordering::Relaxed);
         cpu.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
 
-        mailbox_write(AP_MB_CR3, tables.pml4 as u64);
+        mailbox_write(AP_MB_CR3, ap_root);
         mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
         #[allow(function_casts_as_integer)]
         mailbox_write(AP_MB_ENTRY, ap_entry64 as usize as u64);
@@ -677,7 +677,6 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         }
         started += 1;
     }
-    tables.free();
     ONLINE.store(1 + started, Ordering::Release);
     serial::puts("  smp:  ");
     serial::put_dec((1 + started) as u64);

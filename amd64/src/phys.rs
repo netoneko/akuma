@@ -46,17 +46,43 @@ pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 
 /// How much physical memory the physmap covers.
 ///
-/// `boot.s` builds **four** page directories of 512 x 2 MiB pages each and
-/// points the physmap, the identity map and the kernel window at them, so all
-/// three describe the same first **4 GiB**. Physical memory beyond this is not
-/// addressable by the kernel, which is why `mem::init` clamps the PMM to it.
+/// `boot.s` builds [`PHYSMAP_PDS`] page directories of 512 x 2 MiB pages each
+/// and points the physmap, the identity map and the kernel window at them, so
+/// all three describe the same first **64 GiB**. Physical memory beyond this is
+/// not addressable by the kernel, which is why `mem::init` clamps the PMM to it
+/// — and says so in the boot log rather than dropping it in silence.
 ///
-/// **Raised from 1 GiB on 2026-09-05**, when the bare-metal boot arrived. It is
-/// not a tuning knob: on real hardware the framebuffer is a PCI BAR at
-/// `0xE000_0000` and the LAPIC is at `0xFEE0_0000`, both of them nearly 4 GiB
-/// up, and with a 1 GiB physmap neither is reachable at all. The constant and
-/// the page tables in `boot.s` describe the same thing and must move together.
-pub const PHYSMAP_LIMIT: u64 = 4 << 30;
+/// **Raised from 1 GiB to 4 GiB on 2026-09-05**, when the bare-metal boot
+/// arrived: on real hardware the framebuffer is a PCI BAR at `0xE000_0000` and
+/// the LAPIC is at `0xFEE0_0000`, both of them nearly 4 GiB up, and with a
+/// 1 GiB physmap neither is reachable at all.
+///
+/// **Raised from 4 GiB to 64 GiB on 2026-09-12**, for the opposite half of the
+/// address space. A PC displaces the RAM sitting behind the MMIO hole to just
+/// above 4 GiB, so on the 16 GiB reference machine the memory map reported
+/// 16321 MiB across eight regions and every one of them past the first began at
+/// `0x1_0000_0000`. `mem::init`'s `end.min(PHYSMAP_LIMIT)` turned each into an
+/// empty range and skipped it, leaving 3275 MiB reachable and 2504 MiB
+/// allocatable — 15% of the machine, with nothing in the log saying so.
+///
+/// 64 rather than 16 (which would have fitted that machine exactly) because
+/// unbacked entries cost one PDE apiece and buy the next machine: the whole
+/// class of "the box has more RAM than the kernel can see" closes at a price of
+/// 256 KiB of NOLOAD `.bss`.
+///
+/// The constant and the page tables in `boot.s` describe the same thing, which
+/// is why [`PHYSMAP_PDS`] is *passed into* that file as a `global_asm!` operand
+/// instead of being written down twice. `boot::physmap_reaches_limit` then
+/// walks the live page tables for the last page of this window on every boot,
+/// so a drift is a failed self-test rather than a `phys_to_virt` that returns a
+/// plausible pointer into nothing.
+pub const PHYSMAP_LIMIT: u64 = 64 << 30;
+
+/// Page directories `boot.s` builds, one per GiB of [`PHYSMAP_LIMIT`].
+///
+/// Handed to `boot.s` through `global_asm!` (see `main.rs`), so the count and
+/// the limit cannot disagree.
+pub const PHYSMAP_PDS: usize = (PHYSMAP_LIMIT >> 30) as usize;
 
 /// The kernel-virtual address of a physical address.
 ///

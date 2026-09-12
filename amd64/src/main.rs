@@ -143,7 +143,16 @@ mod uaccess;
 mod xhci;
 
 #[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
+// `PDS` is the one number `boot.s` is not allowed to know on its own: it sizes
+// the boot page directories, and `phys::PHYSMAP_LIMIT` is what every `phys_to_virt`
+// is checked against. Passing it in as a `const` operand makes them the same
+// value rather than two values that agree today. `boot.s` deliberately contains
+// no other brace, so the whole file is a valid format template.
+core::arch::global_asm!(
+    include_str!("boot.s"),
+    PDS = const phys::PHYSMAP_PDS,
+    options(att_syntax)
+);
 
 /// The kernel heap.
 ///
