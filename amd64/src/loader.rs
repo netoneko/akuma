@@ -126,6 +126,14 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_HWCAP: u64 = 16;
+const AT_CLKTCK: u64 = 17;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
 
 /// What a successful load produced.
 ///
@@ -394,8 +402,10 @@ pub const MAX_ARGV: usize = 16;
 pub const MAX_ENVP: usize = 32;
 
 /// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL,
-/// and the auxv — **seven** key/value pairs, so fourteen words: `AT_PHDR`,
-/// `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_BASE`, `AT_NULL`.
+/// and the auxv — **fifteen** key/value pairs, so thirty words: `AT_PHDR`,
+/// `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_BASE`, `AT_UID`,
+/// `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_HWCAP`, `AT_CLKTCK`, `AT_SECURE`,
+/// `AT_RANDOM` and `AT_NULL`.
 ///
 /// This must be kept in step with the `words` computation in [`build_stack`],
 /// which writes into a `[u8; STACK_WORDS_MAX * 8]`. It is the *bound*, not the
@@ -403,7 +413,12 @@ pub const MAX_ENVP: usize = 32;
 /// an index-out-of-bounds panic in the kernel on the first program with a full
 /// argv. `AT_BASE` was added on 2026-09-06 and this constant was **not** bumped
 /// with it, which is exactly the shape of bug the assertion now prevents.
-const AUXV_WORDS: usize = 14;
+/// The eight glibc-facing pairs were added 2026-09-12: glibc's `ld.so`
+/// segfaulted on its first relocation against address 0 with the seven-pair
+/// vector (musl never reads the difference), and `docs/archive/` has no record
+/// of which entry it wanted — so all the identity/entropy entries Linux
+/// supplies came in at once rather than one guess per reboot.
+const AUXV_WORDS: usize = 30;
 const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + AUXV_WORDS;
 
 /// As [`load`]'s return value: `AT_PHDR`/`AT_PHNUM`/`AT_PHENT` are what let a
@@ -445,13 +460,25 @@ pub fn build_stack(
         cursor -= e.len() as u64 + 1;
         *slot = cursor;
     }
+    // `AT_RANDOM` points at 16 bytes on the stack, below the string blob.
+    // glibc's `ld.so` reads it unconditionally for its pointer-guard setup;
+    // handing it 0 makes every guard 0, which is worse than absent. musl and
+    // every probe on this target ignore it.
+    cursor -= 16;
+    let random_va = cursor;
+    let mut random = [0u8; 16];
+    let seeded = akuma_primitives::rng::fill_bytes(&mut random);
+    if seeded != Some(true) {
+        // Fall back to a fixed but non-zero pattern rather than leaving zeros:
+        // a 0 guard is the one value a relative-pointer forge trivially beats.
+        random = [0xA5; 16];
+    }
     // Round the whole string blob down to 16 so the word block below starts
     // aligned without a second adjustment.
     let strings_base = cursor & !0xf;
 
     // argc, one pointer per argv entry, argv NULL, one per envp entry, envp
-    // NULL, seven auxv pairs (AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY,
-    // AT_BASE, AT_NULL).
+    // NULL, fifteen auxv pairs — see `AUXV_WORDS`.
     let words = 1 + argv.len() + 1 + envp.len() + 1 + AUXV_WORDS;
     debug_assert!(
         words <= STACK_WORDS_MAX,
@@ -491,13 +518,35 @@ pub fn build_stack(
     put(aux + 9, img.prog_entry);
     put(aux + 10, AT_BASE);
     put(aux + 11, img.interp_base);
-    put(aux + 12, AT_NULL);
+    put(aux + 12, AT_UID);
     put(aux + 13, 0);
+    put(aux + 14, AT_EUID);
+    put(aux + 15, 0);
+    put(aux + 16, AT_GID);
+    put(aux + 17, 0);
+    put(aux + 18, AT_EGID);
+    put(aux + 19, 0);
+    put(aux + 20, AT_HWCAP);
+    // Deliberately 0: baseline x86-64 only. A bit set here licenses ifunc
+    // resolvers (AVX `memcpy` and friends) whose dispatch glibc assumes the
+    // kernel checked — claim nothing and it picks the baseline copies.
+    put(aux + 21, 0);
+    put(aux + 22, AT_CLKTCK);
+    put(aux + 23, 100);
+    put(aux + 24, AT_SECURE);
+    put(aux + 25, 0);
+    put(aux + 26, AT_RANDOM);
+    put(aux + 27, random_va);
+    put(aux + 28, AT_NULL);
+    put(aux + 29, 0);
 
     for (&va, a) in arg_va.iter().zip(argv).chain(env_va.iter().zip(envp)) {
         if !write_user(space, va, a) || !write_user(space, va + a.len() as u64, &[0]) {
             return Err("could not write argv/envp");
         }
+    }
+    if !write_user(space, random_va, &random) {
+        return Err("could not write the AT_RANDOM bytes");
     }
     if !write_user(space, rsp, &buf[..words * 8]) {
         return Err("could not write the initial stack frame");
