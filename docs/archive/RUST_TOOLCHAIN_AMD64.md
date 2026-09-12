@@ -4,9 +4,9 @@
 **Rig:** the bare-metal HP box (`docs/runbooks/amd64-bare-metal-loop.md`), kernel
 `fa6a9f42-release-smp-shared`, toolchain installed with `apk add rust cargo`
 (Alpine `1.96.1-r0`, musl host target) onto the persistent root.
-**Status:** observations from a first self-host probe session. The toolchain
-*installs* and `rustc --version` works; compiling anything that links does not
-get past the kernel gaps below. Follow-up to `docs/archive/RUST_TOOLCHAIN_ISSUES.md`
+**Status:** **rustc compiles, links and runs a Rust program in the guest**
+(session 3, 2026-09-12 — see below). Sessions 1 and 2 are preserved as written;
+their open item 1 is closed. Follow-up to `docs/archive/RUST_TOOLCHAIN_ISSUES.md`
 (the AArch64 investigation) and part of box **D** of
 `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`.
 
@@ -83,12 +83,19 @@ list's status.
 
 ## Open after session 2 (2026-09-12, ordered)
 
-1. **`collect2` → `ld`: "no input files".** `gcc hello.c -o hello` compiles and
-   assembles, then its own link step fails — while the *same* `ld` invocation
-   run by hand with the same inputs links fine. `collect2` builds the ld
-   command line itself and something in that hand-off (argv length? the
-   spawn's argv copy? a `/tmp/ccXXXX.o` path lookup?) drops the input files.
-   This is the one thing between `gcc hello.c -o hello` working.
+> Item 1 is **closed** (session 3, same day) and item 3's misattribution is
+> still live. Everything else here stands as written.
+
+1. ~~**`collect2` → `ld`: "no input files".**~~ **CLOSED 2026-09-12** — it was
+   the first guess on the list: **argv length.** `loader::MAX_ARGV` was 16 and
+   `execve` truncated at it silently, so `ld` received a command line with its
+   inputs (and, for `rust-lld`, its `-o`) removed. See "Session 3" below. The
+   original text: `gcc hello.c -o hello` compiles and assembles, then its own
+   link step fails — while the *same* `ld` invocation run by hand with the same
+   inputs links fine. `collect2` builds the ld command line itself and
+   something in that hand-off (argv length? the spawn's argv copy? a
+   `/tmp/ccXXXX.o` path lookup?) drops the input files. This is the one thing
+   between `gcc hello.c -o hello` working.
 2. **gcc spawns bare `cc1`** — its exec-prefix lookup fails and falls back to
    PATH search, so gcc only works with
    `PATH=/usr/libexec/gcc/x86_64-alpine-linux-musl/15.2.0:$PATH`. Candidate:
@@ -132,6 +139,175 @@ question, not a correctness one, and it rides behind all of these. None are on
 box D's xHCI critical path — they are kernel work that the first in-guest
 build (`proposals/NEXT_AGENT_AMD64_SELFHOST_FIRST_BUILD.md`) will hit
 immediately after the disk survives.
+
+## Session 3 (2026-09-12, later the same day): it links
+
+**`rustc` compiled, linked and ran a Rust program inside Akuma/amd64 under
+Firecracker** — a 4.8 MB static `x86_64-unknown-linux-musl` binary, 5 seconds
+end to end, printing `hello from akuma amd64`. Two kernel defects were between
+that and session 2, and one of them is open item 1 above.
+
+```
+# busybox env LD_LIBRARY_PATH=/usr/local/rust/lib /usr/local/rust/bin/rustc \
+    -C linker-flavor=ld \
+    -C linker=/usr/local/rust/lib/rustlib/x86_64-unknown-linux-musl/bin/gcc-ld/ld.lld \
+    -C link-self-contained=yes -o /tmp/hello /tmp/hello.rs
+# /tmp/hello
+hello from akuma amd64
+```
+
+### Defect 1 — `argv` was capped at 16, silently. **This is open item 1.**
+
+`loader::MAX_ARGV` was 16, sized in a comment for `sh -c "<cmd>"`, and
+`sys_execve` **truncated** at it rather than refusing. A toolchain's linker
+invocation is forty-odd arguments, so `ld` ran with a command line that was
+well-formed, shorter, and missing its `-o` and its inputs. Each linker then
+reported it in its own vocabulary and blamed itself:
+
+| linker | what it said | what was actually wrong |
+|---|---|---|
+| `collect2` → `ld` (session 2, item 1) | `no input files` | the input files were argv entries 17+ |
+| `rust-lld` | `cannot open output file a.out` | `-o /tmp/hello` was argv entries 39–40 |
+
+Session 2 guessed at "argv length? the spawn's argv copy? a `/tmp/ccXXXX.o` path
+lookup?" and could not choose between them. The probe that settles it is one
+line in the guest and needs no toolchain at all:
+
+```
+# busybox echo a b c d e f g h i j k l m n o p q r s t u v w x y z
+a b c d e f g h i j k l m n
+```
+
+Fourteen letters — sixteen argv entries counting `busybox` and `echo`.
+
+**Fixed:** `MAX_ARGV` 16 → 256, `MAX_ENVP` 32 → 64, and `user_strv` now returns
+`None` when the caller's array is longer than the cap so `execve` and `sys_spawn`
+answer **`E2BIG`**, which is what Linux answers and is impossible to
+misattribute. Truncating was the whole defect; the cap was only its size.
+
+The caps cost kernel stack, and paying for 256 entries the old way would have
+been ~5 KiB against a 32 KiB `sched::STACK_SIZE`. So `build_stack` no longer
+keeps `[u64; MAX_ARGV]` / `[u64; MAX_ENVP]` beside its word block: the string
+pointers are written straight into the block (they are what the block holds
+anyway) and the string-placement cursor is walked twice instead — once to find
+the bottom of the blob, once to fill in the pointers. Net growth ~2 KiB.
+
+Guarded by six boot self-tests (`elf: a full-size argv builds a stack` and its
+five checks): a stack is built with a full `MAX_ARGV` argv and read back out of
+the address space — `argc`, `argv[0]`, **`argv[MAX_ARGV-1]`** and the NULL after
+it. The last pointer is the one a cap drops, and the cursor rewrite is the code
+those tests exist for.
+
+### Defect 2 — `ftruncate` had a handler, a number, and no row
+
+With argv fixed, `rust-lld` saw its `-o` and failed one step later:
+`cannot open output file /tmp/hello: Function not implemented`. It opens the
+output, sizes it with `ftruncate`, and maps the result; the open succeeded and
+the `ftruncate` was `ENOSYS`.
+
+`sys_ftruncate` was in `akuma-syscalls-glue`, `nr::FTRUNCATE` was in
+`akuma-syscalls-linux`, glue dispatched it — and `akuma-syscalls-abi`'s
+`syscall_table!` had no row, so `Syscall::from_x86_64(77)` was `None`. Exactly
+the `chmod`/`chdir` shape from session 2, for the third time.
+
+**Fixed:** one row (`Ftruncate => FTRUNCATE = 77, nr::FTRUNCATE`) and one arm.
+
+### The change that stops this recurring: name the missing number
+
+Three sessions have now lost time to "the implementation exists, the number does
+not", and every instance reached userspace as `Function not implemented` from a
+program that then blamed itself. `syscall_dispatch`'s unknown-number arm now
+says so on the console:
+
+```
+[syscall] no row for x86_64 nr=77 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+```
+
+One line per distinct number, bounded to 32 of them, so a program probing in a
+loop costs one line and a runaway cannot flood the console. It found `ftruncate`
+in a single boot, and it is what turned the `git clone` failure below from a
+symptom into a named gap.
+
+### Numbers observed missing, and what each costs
+
+From one `rustc` compile-and-link plus one `git clone` in the guest:
+
+| x86_64 | call | consequence observed |
+|---|---|---|
+| 77 | `ftruncate` | **fixed** — nothing could link |
+| 290 | `eventfd2` | `git clone` over https fails at `curl_multi_init` — below |
+| 95 | `umask` | none seen; musl start-up probe |
+| 40 | `sendfile` | none seen |
+| 324 | `membarrier` | none seen (`akuma-syscalls-mem` decodes it; no row) |
+| 204 | `sched_getaffinity` | none seen; rustc falls back to 1 thread |
+| 157 | `prctl` | none seen |
+| 260 | `fchownat` | none seen |
+
+Only `ftruncate` was load-bearing for linking; the rest are tolerated by their
+callers and are listed so the next `ENOSYS` can be checked against them rather
+than rediscovered. **Do not add rows speculatively** — `akuma-syscalls-abi`'s
+rule 1 is that a row is a claim that both architectures' numbers were checked.
+
+### `git clone https://…` → `curl_multi_init failed`
+
+```
+$ git clone https://github.com/netoneko/akuma-playground.git
+Cloning into 'akuma-playground'...
+fatal: curl_multi_init failed
+fatal: remote helper 'https' aborted session
+```
+
+**Cause, named by the diagnostic above: `eventfd2` (x86_64 290) is `ENOSYS`.**
+`curl_multi_init` builds the multi handle's wakeup channel with
+`eventfd(0, EFD_CLOEXEC|EFD_NONBLOCK)`; when that fails it returns `NULL`, and
+git's https remote helper reports the `NULL` without ever naming the syscall.
+`sched_getaffinity` (204) and `prctl` (157) are also missing and are also in
+libcurl's start-up path, but neither aborts it.
+
+This is **not** the same shape as `ftruncate`, and the difference is the work:
+
+* `akuma-syscalls-glue` *has* `eventfd` (`crates/akuma-syscalls-glue/src/eventfd.rs`,
+  `eventfd_create`/`eventfd_read`/`eventfd_write`), but behind the
+  `sc-eventfd` feature, and `amd64/Cargo.toml` takes glue with
+  `default-features = false, features = ["smoltcp"]` — so it is **compiled
+  out**, not merely undispatched.
+* An eventfd is an **fd**, and amd64 keeps its own descriptor table
+  (`amd64/src/fd.rs`, `FIRST_FILE_FD = 3`). Turning the feature on gives an
+  `eventfd_create` whose id nothing on this target can `read`, `write`, `close`
+  or poll. The row is the last step, not the first.
+
+So the fix is: enable `sc-eventfd`, give `amd64/src/fd.rs` an `Eventfd` variant
+routed to glue's three entry points, then add the `Eventfd2 => 290, nr::EVENTFD2`
+row. `epoll` is the same shape behind `sc-epoll` and is what libcurl wants next.
+
+Until then, in-guest `git` works over `git://`/`ssh://` but not `https://`, and
+`apk` (which uses its own HTTP client, not libcurl) is unaffected.
+
+### Staging the toolchain
+
+Session 2 used `apk add rust cargo` (Alpine 1.96.1) onto the persistent root.
+Session 3 staged **nightly** into the Firecracker root image instead, because
+the kernel's own manifest needs a nightly cargo to parse
+(`cargo-features = ["panic-immediate-abort"]`) and Alpine ships stable —
+the same conclusion the AArch64 side reached
+(`docs/archive/AKUMA_SELF_HOSTING.md`). Procedure:
+[`docs/runbooks/stage-rust-toolchain-amd64.md`](../runbooks/stage-rust-toolchain-amd64.md).
+
+Three things worth carrying:
+
+* The toolchain must be the **musl host** build
+  (`rustup toolchain install nightly-x86_64-unknown-linux-musl --profile minimal
+  --force-non-host`); `--force-non-host` is needed because the box's own rustup
+  host is gnu. 777 MiB, 161 files, no symlinks.
+* `rustc` is dynamically linked against `/lib/ld-musl-x86_64.so.1` (already on
+  the image, from `apk add musl`) and finds `librustc_driver-*.so` through
+  `DT_RUNPATH` `$ORIGIN/../lib`. **musl expands `$ORIGIN` by reading
+  `/proc/self/exe`**, and this target has no procfs, so every invocation needs
+  `LD_LIBRARY_PATH=/usr/local/rust/lib`. That is a real gap, not a nuisance: any
+  binary that relies on `$ORIGIN` will behave the same way.
+* There is no `cc` on this image, so linking goes through the toolchain's own
+  `rust-lld` with `-C linker-flavor=ld -C link-self-contained=yes`. Session 2's
+  `apk add gcc musl-dev binutils` route also works and is what `collect2` needs.
 
 ## Background
 

@@ -1507,6 +1507,30 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    ▼
  [09-12] ═══ YOU ARE HERE ═══
    │
+   ├──► **The guest compiled, linked and ran a Rust program** — later
+   │   the same day, under **Firecracker**, which needs no disk that
+   │   survives a build and therefore does not wait on item 1 below.
+   │   Nightly `rustc` (musl host) staged into the 4 GiB root image,
+   │   `hello.rs` → a 4.8 MB static binary in 5 s, and it runs.
+   │   Two kernel defects were in the way and both are fixed:
+   │   `execve` truncated argv at **16** entries silently (so every
+   │   linker ran without its inputs — this was box D's open item 1,
+   │   guessed at and unresolved since 09-12 morning), and `ftruncate`
+   │   had a handler and a number but no `akuma-syscalls-abi` row.
+   │   `syscall_dispatch` now *names* a missing number on the console,
+   │   which is what found the second one and what found `eventfd2`
+   │   behind `git clone`'s `curl_multi_init failed`.
+   │   **This is not `cargo` yet** — one file, one crate, no
+   │   dependency graph, no build script, no fingerprinting.
+   │                    docs: RUST_TOOLCHAIN_AMD64.md § session 3,
+   │                          runbooks/stage-rust-toolchain-amd64.md
+   │
+   ├──► **A 6 GiB guest now has 6 GiB.** `akuma-pmm` managed one
+   │   contiguous region and a PC reports two (the MMIO hole splits
+   │   them), so half of every amd64 machine was dropped — 2554 MiB of
+   │   6 GiB, 13 GiB of the trashcan's 16. One bitmap now spans the gap.
+   │                        doc: AKUMA_AMD64_SPARSE_ARENA.md
+   │
    └──► **Trunk C is done.** C1, C2 and C3 have all landed, and with
         them every box in this chart except **D**. `clock_gettime`,
         `nanosleep`, `clock_nanosleep`, itimers, `alarm`, `pause`,
@@ -1537,6 +1561,20 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
            to stop `cargo`, because fingerprinting is mtime-based; that
            prediction is now answerable rather than open, and
            `/probes/clockprobe` is the thing that answers it.
+
+           **Partly overtaken (2026-09-12, session 3):** the *compiler*
+           half of this no longer waits on item 1. `rustc` compiles,
+           links and runs a single-file program under Firecracker, whose
+           virtio-blk disk has nothing to do with xHCI. What still waits
+           on item 1 is a build big enough to need a disk that survives
+           it — which is the point of the item, not an accident of
+           ordering. The next thing to try is `cargo` on a two-crate
+           workspace in the Firecracker guest: it exercises
+           fingerprinting, build scripts and the spawn path without
+           needing the 64 GB root. Known blockers before it can work:
+           `eventfd2`/`epoll` are compiled out of glue on this target
+           (so anything using libcurl, including `git` over https,
+           fails), and spawn children start at cwd `/`.
 
         Smaller, and carried rather than blocking:
 

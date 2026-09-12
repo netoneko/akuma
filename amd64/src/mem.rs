@@ -27,7 +27,7 @@
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use akuma_ryzen_amd64::MachineDescription;
+use akuma_ryzen_amd64::{MachineDescription, MemRegion};
 use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
 use crate::serial;
 
@@ -64,11 +64,9 @@ const fn align_up(v: usize, to: usize) -> usize {
 
 /// Bring up heap then PMM. Returns false if the machine described no usable RAM.
 ///
-/// The region is chosen by **containment** — `region_containing`, in
-/// `akuma-ryzen-amd64` and host-tested there. The largest usable region is very
-/// nearly always the right one, but "the region holding the kernel" is right by
-/// construction: picking any other would hand the PMM frames while the kernel
-/// image sits somewhere it has never heard of.
+/// Every RAM region the machine reports is managed, across whatever gaps the
+/// chipset left between them; only the heap's *placement* still picks one, and
+/// it picks the region holding the kernel image when that has room.
 pub fn init(machine: &MachineDescription) -> bool {
     init_reserving(machine, 0)
 }
@@ -85,12 +83,14 @@ pub fn init(machine: &MachineDescription) -> bool {
 enum Fate {
     /// The PMM manages it.
     Pmm,
-    /// The heap is carved out of it, and the PMM manages the rest.
+    /// The PMM manages it, and the heap is carved out of it.
     HeapAndPmm,
-    /// The heap is carved out of it; the PMM is somewhere else.
-    Heap,
-    /// Reachable, but the PMM manages exactly one region and this is not it.
-    Unused,
+    /// Below [`LOW_RAM_FLOOR`] — the BIOS's memory, not ours.
+    BelowFloor,
+    /// More RAM regions than [`akuma_pmm::MAX_RAM_REGIONS`], so this one cannot
+    /// be described to the PMM and must not be handed out. No machine here has
+    /// ever reported enough regions to reach this.
+    Undescribable,
     /// Past [`PHYSMAP_LIMIT`]: `phys_to_virt` cannot name an address in it.
     Unreachable,
 }
@@ -100,8 +100,8 @@ impl Fate {
         match self {
             Self::Pmm => "pmm",
             Self::HeapAndPmm => "heap + pmm",
-            Self::Heap => "heap",
-            Self::Unused => "unused (the PMM manages one region)",
+            Self::BelowFloor => "unused (below the 1 MiB floor)",
+            Self::Undescribable => "UNUSED (more regions than the PMM can describe)",
             Self::Unreachable => "UNREACHABLE (past the physmap)",
         }
     }
@@ -136,79 +136,72 @@ impl Usable {
 pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as u64;
 
-    // TWO REGIONS ARE CHOSEN HERE, NOT ONE, and separating them is the fix.
+    // EVERY REGION IS MANAGED, NOT ONE, and that is the whole of this function.
     //
-    // Until 2026-09-12 this picked a single region for both the heap and the
-    // PMM, by "most room after everything already in it". That was written for
-    // UEFI, and it was right about the problem it was written for: the firmware
-    // map is carved up by how the firmware used memory, and the region
-    // *containing the kernel* on the reference machine runs 0x100000..0x800000
-    // -- seven megabytes on a box with sixteen gigabytes -- so a rule of
-    // "containment" put a 64 MiB heap somewhere it did not fit.
+    // `akuma_pmm` is a single bitmap over a single base..end range, so for most
+    // of this port it was given one region and the rest of the machine's memory
+    // was dropped on the floor. That is fine while there *is* one region, which
+    // is every aarch64 machine here and QEMU below `-m 4096`. A PC is not one:
+    // the chipset leaves a hole below 4 GiB for MMIO and the RAM displaced by it
+    // reappears just above 4 GiB, so the map has two runs with a gap between
+    // them. Firecracker with 6144 MiB reports ~3 GiB low and 3 GiB high; the
+    // trashcan's 16 GiB reports ~3 GiB low and ~13 GiB high.
     //
-    // One region for both is fine while there is only one big one. On a PC
-    // there are two, because a PC displaces the RAM behind the MMIO hole to
-    // just above 4 GiB: a 16 GiB machine reports ~3 GiB low and ~13 GiB high.
-    // Ranking those and taking one means the *other* is dropped entirely, and
-    // whichever way the rank goes the machine loses gigabytes. Before the
-    // physmap reached past 4 GiB the high region was not even a candidate and
-    // the answer was always the low one; raising the limit alone would simply
-    // have moved the loss to the other side.
+    // Two earlier answers, both wrong in the same way:
     //
-    // So:
-    //   * the PMM gets the largest reachable region, because it is the one that
-    //     has to hold every process;
-    //   * the heap is carved out of the region holding the kernel image, when
-    //     that region has room -- which keeps the heap, the kernel and a
-    //     loader-placed module together in low memory, and leaves the PMM's
-    //     region whole.
+    //   * pick the largest region for both heap and PMM -- loses the other one,
+    //     which is 13 GiB of the trashcan's 16;
+    //   * (2026-09-12) pick the largest for the PMM and put the heap in the
+    //     kernel's region -- loses that region's remainder instead. On the
+    //     6 GiB guest the high region won by 5.7 MiB and 2554 MiB went nowhere,
+    //     with `free` reporting 3.0G on a box configured for 6.
     //
-    // When the machine reports one region (every VMM guest, and QEMU below
-    // `-m 4096`) both rules select it and the result is byte-identical to what
-    // this function did before.
-    let mut pmm: Option<Usable> = None;
+    // So: one bitmap ACROSS the gap (`init_sparse`), with each run of real
+    // memory handed over by `add_ram` and the gap simply never described. The
+    // PMM cannot allocate what it was not told about, `total_count` counts only
+    // what was described -- it feeds `sysinfo.totalram`, which is what `free`
+    // prints -- and `contains` refuses the gap, so the safe physical copies
+    // cannot reach the device window the arena now spans.
+    //
+    // When the machine reports one region both shapes coincide and the result
+    // is what this function did before, one `add_ram` call later.
+    let mut regions = 0;
+    let mut span_base = u64::MAX;
+    let mut span_end = 0u64;
+    let mut ram_total = 0u64;
+    for u in usable_regions(machine, kernel_end, reserve_to).take(akuma_pmm::MAX_RAM_REGIONS) {
+        span_base = span_base.min(u.base);
+        span_end = span_end.max(u.end);
+        ram_total += u.end - u.base;
+        regions += 1;
+    }
+
+    if regions == 0 {
+        serial::puts("  [FATAL] no usable region is reachable through the physmap\n");
+        return false;
+    }
+
+    // The heap's home: beside the kernel when that fits, the roomiest region
+    // otherwise. The fallback is what the 2026-09-06 change to `HEAP_SIZE`
+    // needs -- a seven-megabyte UEFI fragment cannot hold 512 MiB, and a boot
+    // that refuses on that basis is worse than one that puts the heap next
+    // door. Which region it lands in no longer costs anything either way; it
+    // decides only where the heap sits, not which memory the machine keeps.
+    let mut roomiest: Option<Usable> = None;
     let mut kernel_home: Option<Usable> = None;
-    for r in machine.regions().iter().filter(|r| r.is_ram()) {
-        let base = r.addr;
-        let end = r.end().min(PHYSMAP_LIMIT);
-        if end <= base {
-            continue; // entirely past the physmap
+    for u in usable_regions(machine, kernel_end, reserve_to).take(regions) {
+        if roomiest.is_none_or(|r| u.room() > r.room()) {
+            roomiest = Some(u);
         }
-        // Anything already occupying part of this region raises the floor.
-        let mut floor = base;
-        if kernel_end > base && kernel_end < end {
-            floor = floor.max(kernel_end);
-        }
-        if reserve_to > base && reserve_to < end {
-            floor = floor.max(reserve_to);
-        }
-        let floor = align_up(floor as usize, PAGE_SIZE) as u64;
-        if floor >= end {
-            continue;
-        }
-        let u = Usable { base, end, floor };
-        if pmm.is_none_or(|p| u.room() > p.room()) {
-            pmm = Some(u);
-        }
-        if kernel_end > base && kernel_end < end {
+        if kernel_end > u.base && kernel_end < u.end {
             kernel_home = Some(u);
         }
     }
-
-    let Some(pmm) = pmm else {
-        serial::puts("  [FATAL] no usable region is reachable through the physmap\n");
-        return false;
-    };
-
-    // The heap's home: beside the kernel when that fits, the PMM's region
-    // otherwise. The fallback is what the 2026-09-06 change to `HEAP_SIZE`
-    // needs -- a seven-megabyte UEFI fragment cannot hold 512 MiB, and a boot
-    // that refuses on that basis is worse than one that shares.
+    let roomiest = roomiest.expect("regions > 0");
     let heap_home = match kernel_home {
         Some(k) if k.floor.saturating_add(HEAP_SIZE as u64) < k.end => k,
-        _ => pmm,
+        _ => roomiest,
     };
-    let shared = heap_home.base == pmm.base;
     let heap_start = heap_home.floor as usize;
     let heap_end = heap_start + HEAP_SIZE;
 
@@ -216,17 +209,26 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     // with no sizes in it says only that something is wrong, which is the least
     // useful thing a fatal error can say -- and the accounting below is the
     // whole point of the rest: every reported region, and what became of it.
-    let managed = pmm.end - pmm.base;
+    let mut seen = 0usize;
     serial::puts("  mem:  RAM the machine reported, and what became of each:\n");
     for r in machine.regions().iter().filter(|r| r.is_ram()) {
         let fate = if r.addr >= PHYSMAP_LIMIT {
             Fate::Unreachable
-        } else if r.addr == pmm.base {
-            if shared { Fate::HeapAndPmm } else { Fate::Pmm }
-        } else if r.addr == heap_home.base {
-            Fate::Heap
         } else {
-            Fate::Unused
+            match usable_of(*r, kernel_end, reserve_to) {
+                None => Fate::BelowFloor,
+                Some(u) => {
+                    let idx = seen;
+                    seen += 1;
+                    if idx >= regions {
+                        Fate::Undescribable
+                    } else if u.base == heap_home.base {
+                        Fate::HeapAndPmm
+                    } else {
+                        Fate::Pmm
+                    }
+                }
+            }
         };
         serial::puts("    0x");
         serial::put_hex(r.addr);
@@ -236,11 +238,14 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
         serial::puts(fate.label());
         serial::puts("\n");
     }
+    // `usable` and `managed` are the same fact counted two ways, and printing
+    // both is what makes a repeat of the 2554 MiB loss impossible to miss: they
+    // match, or the difference is a number with a region beside it above.
     serial::puts("  mem:  ");
     serial::put_dec(machine.usable_ram() / 1024 / 1024);
     serial::puts(" MiB usable, ");
-    serial::put_dec(managed / 1024 / 1024);
-    serial::puts(" MiB in the PMM's region, physmap reaches ");
+    serial::put_dec(ram_total / 1024 / 1024);
+    serial::puts(" MiB managed, physmap reaches ");
     serial::put_dec(PHYSMAP_LIMIT / 1024 / 1024 / 1024);
     serial::puts(" GiB\n");
 
@@ -290,33 +295,93 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
         shrink_page_cache: |_| 0,
     });
 
-    // What the PMM must keep its hands off, and it is not always the same thing.
-    //
-    // When the heap shares the PMM's region it is `heap_end`: the heap was
-    // carved out before the PMM existed, so it has to be inside the reservation
-    // or the PMM hands out frames the allocator is already using. When the heap
-    // lives elsewhere there is nothing of the kernel's in this region, and the
-    // reservation is only whatever the loader placed here -- which `floor`
-    // already accounts for, and which is `base` when there is none.
-    let reserved_to = if shared { heap_end } else { pmm.floor as usize };
-    let ram_size = (pmm.end - pmm.base) as usize;
-    serial::puts("  pmm:  init(base=0x");
-    serial::put_hex(pmm.base);
-    serial::puts(", size=");
-    serial::put_dec((ram_size / 1024 / 1024) as u64);
-    serial::puts(" MiB, reserved_to=0x");
-    serial::put_hex(reserved_to as u64);
-    serial::puts(")\n");
+    serial::puts("  pmm:  arena 0x");
+    serial::put_hex(span_base);
+    serial::puts(" + ");
+    serial::put_dec((span_end - span_base) / 1024 / 1024);
+    serial::puts(" MiB spanning ");
+    serial::put_dec(regions as u64);
+    serial::puts(" RAM region(s)\n");
 
-    akuma_pmm::init(pmm.base as usize, ram_size, reserved_to);
+    // Nothing is allocatable until `add_ram` describes it, so the order here is
+    // load-bearing: describe every region first, then take back what is already
+    // spoken for. The reverse would reserve pages that are about to be declared
+    // free and hand out the kernel image.
+    akuma_pmm::init_sparse(span_base as usize, (span_end - span_base) as usize);
+    for u in usable_regions(machine, kernel_end, reserve_to).take(regions) {
+        if akuma_pmm::add_ram(u.base as usize, (u.end - u.base) as usize).is_none() {
+            // Cannot happen -- the scan above took at most `MAX_RAM_REGIONS` --
+            // but a PMM that is handing out an undescribed region is handing out
+            // MMIO, so refuse the boot rather than trust the arithmetic.
+            serial::puts("  [FATAL] the PMM would not describe region 0x");
+            serial::put_hex(u.base);
+            serial::puts("\n");
+            return false;
+        }
+        // Whatever already sits at the bottom of this region: the kernel image,
+        // and on a multiboot2 boot the root filesystem GRUB left in RAM.
+        akuma_pmm::reserve_range(u.base as usize, (u.floor - u.base) as usize);
+    }
+    // The heap was carved out before the PMM existed and is inside one of the
+    // regions just described, so it has to be taken back explicitly.
+    akuma_pmm::reserve_range(heap_start, HEAP_SIZE);
 
     serial::puts("  pmm:  ");
+    serial::put_dec((akuma_pmm::total_count() * PAGE_SIZE / 1024 / 1024) as u64);
+    serial::puts(" MiB RAM, ");
     serial::put_dec(akuma_pmm::free_count() as u64);
     serial::puts(" free frames (");
     serial::put_dec((akuma_pmm::free_count() * PAGE_SIZE / 1024 / 1024) as u64);
     serial::puts(" MiB)\n");
 
     true
+}
+
+/// The RAM below this is not ours: the interrupt vector table, the BIOS data
+/// area and the EBDA live there, and page 0 is a frame whose address reads as a
+/// null pointer everywhere it is passed. Every machine here reports it as
+/// ordinary available memory; no machine here needs the 639 KiB.
+const LOW_RAM_FLOOR: u64 = 0x10_0000;
+
+/// One RAM region as the kernel can actually use it, or `None` if nothing of it
+/// is left once the physmap, the low floor and whatever already occupies it are
+/// taken off.
+fn usable_of(r: MemRegion, kernel_end: u64, reserve_to: u64) -> Option<Usable> {
+    let base = r.addr.max(LOW_RAM_FLOOR);
+    let end = r.end().min(PHYSMAP_LIMIT);
+    if end <= base {
+        return None;
+    }
+    // Anything already occupying part of this region raises the floor.
+    let mut floor = base;
+    if kernel_end > base && kernel_end < end {
+        floor = floor.max(kernel_end);
+    }
+    if reserve_to > base && reserve_to < end {
+        floor = floor.max(reserve_to);
+    }
+    let floor = align_up(floor as usize, PAGE_SIZE) as u64;
+    if floor >= end {
+        return None;
+    }
+    Some(Usable { base, end, floor })
+}
+
+/// Every usable RAM region, in the order the machine reported them.
+///
+/// Deliberately an iterator recomputed at each use rather than an array built
+/// once: this runs before the heap exists, so there is nowhere to build one,
+/// and the list is walked three times at boot and never again.
+fn usable_regions(
+    machine: &MachineDescription,
+    kernel_end: u64,
+    reserve_to: u64,
+) -> impl Iterator<Item = Usable> + '_ {
+    machine
+        .regions()
+        .iter()
+        .filter(|r| r.is_ram())
+        .filter_map(move |r| usable_of(*r, kernel_end, reserve_to))
 }
 
 #[cfg(not(feature = "no-tests"))]

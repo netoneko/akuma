@@ -193,6 +193,13 @@ syscall_table! {
     /// for it at all — `mmapsum`'s `read()` reference arm aborted at offset 0
     /// and every archive reader and `rustc` metadata load goes through it.
     Pread64    => PREAD64    = 17,  nr::PREAD64;
+    /// Set a file's length through an open descriptor. Added 2026-09-12: it
+    /// had a handler in `akuma-syscalls-glue` and a number in
+    /// `akuma-syscalls-linux` and no row here, so `rust-lld` — which creates
+    /// its output with open + `ftruncate` + `mmap` — died as
+    /// `cannot open output file …: Function not implemented` and blamed
+    /// itself. Nothing in the guest could link until this row existed.
+    Ftruncate  => FTRUNCATE  = 77,  nr::FTRUNCATE;
     Readv      => READV      = 19,  nr::READV;
     Writev     => WRITEV     = 20,  nr::WRITEV;
     /// x86_64 32 is `dup` and asm-generic 32 is `flock`; the pair is one of the

@@ -187,6 +187,16 @@ pub mod errno {
     pub const ECHILD: u64 = (-10i64) as u64;
     pub const EAGAIN: u64 = (-11i64) as u64;
     pub const ENOMEM: u64 = (-12i64) as u64;
+    /// "The image was rejected by the loader" — `exec_load_errno`'s default
+    /// for a rejection string it does not recognise.
+    pub const ENOEXEC: u64 = (-8i64) as u64;
+    /// The argument or environment list is longer than the initial stack
+    /// builder will place ([`crate::loader::MAX_ARGV`] / `MAX_ENVP`). Linux
+    /// answers this when `argv` exceeds `ARG_MAX`; this target answers it for
+    /// the same reason, and answering it **at all** is the point — truncating
+    /// instead handed `ld` a command line with its inputs missing and cost a
+    /// session of looking at `collect2` (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+    pub const E2BIG: u64 = (-7i64) as u64;
     pub const ENOTDIR: u64 = (-20i64) as u64;
     pub const EISDIR: u64 = (-21i64) as u64;
     pub const EEXIST: u64 = (-17i64) as u64;

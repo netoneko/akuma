@@ -1296,6 +1296,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // handler rather than none — so the vocabulary hop happens once, here,
     // through a table whose two halves are round-trip tested against each other.
     let Some(call) = Syscall::from_x86_64(nr) else {
+        report_unknown_syscall(nr);
         return errno::ENOSYS;
     };
 
@@ -1306,6 +1307,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // cursor. Not dispatched at all until 2026-09-07: every `pread` on this
         // target was `ENOSYS`, which `mmapsum`'s reference arm hit at offset 0.
         Syscall::Pread64 => crate::fd::sys_pread64(a1, a2, a3, a4),
+        // `ftruncate(fd, length)`. The linker's output file is created by
+        // opening it, sizing it with this, and mapping the result; without it
+        // `rust-lld` reported `cannot open output file` for a file it had
+        // already opened successfully.
+        Syscall::Ftruncate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // busybox prints through `writev`, not `write`. Walk the iovec array and
         // forward each segment; a short write on any segment stops the walk, as
         // `writev(2)` specifies.
@@ -3871,49 +3877,92 @@ fn reap_exec_process(pid: u32, task_slot: usize) {
     }
 }
 
+/// x86_64 syscall numbers already reported by [`report_unknown_syscall`].
+///
+/// `u64::MAX` is the empty marker, not `0` — x86_64 `0` is `read`.
+static UNKNOWN_SYSCALLS: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
+
+/// Say, once per number, that a syscall arrived with no row in
+/// `akuma_syscalls_abi`'s table.
+///
+/// **This class of gap has cost three sessions.** `chmod`/`chdir`/`fchmod`/
+/// `fchmodat` had implementations in `akuma-syscalls-glue` and no numbers, so
+/// `git clone` failed at a `chmod` and `top` at a `chdir`; x86_64 `symlink`
+/// dispatched to `sys_utimensat` and `ln -s` silently created nothing for
+/// months (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`). Every one of
+/// them reached userspace as `Function not implemented` from a program that
+/// then blamed itself — `rust-lld` reported `cannot open output file`, `gcc`
+/// reported `no input files` — and the kernel said nothing at all.
+///
+/// One line per distinct number, on the console, is the whole fix: it names the
+/// number the ABI table is missing, at the moment it is missed. Bounded to 32
+/// distinct numbers and printed once each, so a program probing for a syscall
+/// in a loop costs one line and a runaway cannot flood the console that is
+/// meant to survive things going wrong.
+fn report_unknown_syscall(nr: u64) {
+    let mut claimed = false;
+    for slot in &UNKNOWN_SYSCALLS {
+        match slot.compare_exchange(u64::MAX, nr, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                claimed = true; // ours to report
+                break;
+            }
+            Err(seen) if seen == nr => return, // already reported
+            Err(_) => {}                       // someone else's; try the next slot
+        }
+    }
+    if !claimed {
+        // The table is full: thirty-two distinct numbers have already been
+        // named, which is a finding in itself and more than enough to act on.
+        // Falling through to print here instead would flood the console on
+        // exactly the kernel that is missing the most.
+        return;
+    }
+    serial::puts("[syscall] no row for x86_64 nr=");
+    serial::put_dec(nr);
+    serial::puts(" — returning ENOSYS (add it to akuma-syscalls-abi's table)\n");
+}
+
 /// Read a NUL-terminated string from user memory, bounded.
 fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
     crate::uaccess::read_cstr(ptr, max)
 }
 
-/// Parse a NULL-terminated array of C-string pointers into owned bytes.
-fn user_argv(ptr: u64) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-    let mut argv = alloc::vec::Vec::new();
-    if ptr == 0 {
-        return argv;
-    }
-    for i in 0..loader::MAX_ARGV {
-        // A bad array pointer ends the list, like a NULL entry would.
-        let p = crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
-        if p == 0 {
-            break;
-        }
-        match user_cstr(p, 512) {
-            Some(s) => argv.push(s),
-            None => break,
-        }
-    }
-    argv
-}
-
-/// Parse a NULL-terminated array of C-string pointers, bounded at `max` entries.
-fn user_strv(ptr: u64, max: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+/// Parse a NULL-terminated array of C-string pointers, bounded at `max`
+/// entries — `None` if the caller's array is longer than that.
+///
+/// **`None` rather than a short list, and that distinction is the whole
+/// function.** Until 2026-09-12 this returned whatever fitted, so an `execve`
+/// with more arguments than [`loader::MAX_ARGV`] started the program with a
+/// command line that was well-formed and wrong. `rustc` and `collect2` both
+/// build linker invocations of forty-odd arguments; the linker ran without its
+/// `-o` and without its inputs, and said so in its own vocabulary
+/// (`no input files`, `cannot open output file a.out`) with nothing pointing
+/// at the kernel. `E2BIG` is what Linux answers and is impossible to
+/// misattribute.
+fn user_strv(ptr: u64, max: usize) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
     let mut out = alloc::vec::Vec::new();
     if ptr == 0 {
-        return out;
+        return Some(out);
     }
+    let entry = |i: usize| crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
     for i in 0..max {
         // A bad array pointer ends the list, like a NULL entry would.
-        let p = crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
+        let p = entry(i);
         if p == 0 {
-            break;
+            return Some(out);
         }
         match user_cstr(p, 512) {
             Some(s) => out.push(s),
-            None => break,
+            None => return Some(out),
         }
     }
-    out
+    // `max` entries and still no terminator: the caller has more to say than
+    // this target can place on the initial stack.
+    if entry(max) != 0 {
+        return None;
+    }
+    Some(out)
 }
 
 /// `execve(path, argv, envp)` — x86_64 syscall 59.
@@ -3952,8 +4001,30 @@ fn user_strv(ptr: u64, max: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
 /// On success this does not really "return": it sets `leave` and `exec_pending`
 /// and the next thing the task does is re-enter ring 3 at the new entry. On
 /// failure it returns a negative errno and the caller runs on.
-fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+/// `Image::from_elf_argv_envp`'s rejection strings, mapped to the errno Linux
+/// would return — the honest replacement for the blanket `ENOMEM` that stood
+/// here, which turned a missing `PT_INTERP` file into
+/// `sh: ./hello: Out of memory` (`docs/archive/RUST_TOOLCHAIN_AMD64.md`
+/// § "Open" item 3). Keyed on the strings `loader::elf_err` produces from
+/// `akuma-elf`'s `ElfError`; a string this does not recognise is `ENOEXEC` —
+/// "the image was rejected", the default a loader rejection deserves — rather
+/// than a resource lie. The string is still printed on the serial console, so
+/// nothing is lost by the narrowing.
+fn exec_load_errno(e: &str) -> u64 {
     use crate::fd::errno;
+    if e.contains("out of memory") {
+        // The one string `elf_err` produces for `ElfError::OutOfMemory`.
+        return errno::ENOMEM;
+    }
+    if e.contains("interpreter") {
+        // "Cannot read interpreter" — the `PT_INTERP` file is missing or
+        // unreadable, which is what `./hello` naming `/lib/ld64.so.1` hit.
+        return errno::ENOENT;
+    }
+    errno::ENOEXEC
+}
+
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate::fd::errno;
 
     let slot = current_proc_slot();
     if slot >= PROC_SLOTS {
@@ -3992,13 +4063,17 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
 
     let argv_owned = {
-        let mut v = user_strv(argv_ptr, loader::MAX_ARGV);
+        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
+            return crate::fd::errno::E2BIG;
+        };
         if v.is_empty() {
             v.push(path_bytes.clone());
         }
         v
     };
-    let envp_owned = user_strv(envp_ptr, loader::MAX_ENVP);
+    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
+        return crate::fd::errno::E2BIG;
+    };
     let argv_refs: alloc::vec::Vec<&[u8]> =
         argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
     let envp_refs: alloc::vec::Vec<&[u8]> =
@@ -4012,7 +4087,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             serial::puts("\n");
             // The image was rejected; the caller's own image is untouched, so
             // this is a real errno return, not a leave.
-            return errno::ENOMEM;
+            return exec_load_errno(e);
         }
     };
 
@@ -4452,14 +4527,17 @@ pub fn sys_spawn(
 
     // Same helper as `sys_execve`: symlink-resolved, chunked, fallible — so a
     // spawn of a link, or of any binary over 16 MiB, loads instead of failing
-    // as ENOENT.
-    let Ok(image) = crate::fs::read_image(path) else {
-        return errno::ENOENT;
+    // as ENOENT. The VFS error is passed through, not flattened.
+    let image = match crate::fs::read_image(path) {
+        Ok(image) => image,
+        Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
     };
 
     // argv[0] defaults to the path if the caller passed none.
     let argv_owned = {
-        let mut v = user_argv(argv_ptr);
+        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
+            return crate::fd::errno::E2BIG;
+        };
         if v.is_empty() {
             v.push(path_bytes.clone());
         }
@@ -4470,7 +4548,9 @@ pub fn sys_spawn(
     // any spawned child on this target, so anything reading `TERM`, `PATH`,
     // `HOME` or `TZ` got nothing. `sys_execve` has always honoured it through
     // the same loader entry point; this is that call, with the same caps.
-    let envp_owned = user_strv(envp_ptr, loader::MAX_ENVP);
+    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
+        return crate::fd::errno::E2BIG;
+    };
     let argv_refs: alloc::vec::Vec<&[u8]> =
         argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
     let envp_refs: alloc::vec::Vec<&[u8]> =
@@ -4502,7 +4582,9 @@ pub fn sys_spawn(
             serial::puts("  [spawn] load failed: ");
             serial::puts(e);
             serial::puts("\n");
-            return errno::ENOMEM;
+            // Same misattribution `sys_execve` carried: every rejection printed
+            // as `Out of memory`. Same honest mapping.
+            return exec_load_errno(e);
         }
     };
 
@@ -6534,6 +6616,8 @@ pub fn elf_test(t: &mut Suite) {
     };
     t.check("elf: image came from the filesystem", from_disk.is_ok());
 
+    argv_capacity_test(t, image);
+
     let (proc, img) = match Image::from_elf(image) {
         Ok(p) => p,
         Err(e) => {
@@ -6649,6 +6733,88 @@ pub fn elf_test(t: &mut Suite) {
     finish_test_process(started.0, started.1);
     t.check_eq(
         "elf: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// A **toolchain-sized** argv reaches the program intact.
+///
+/// `loader::MAX_ARGV` was 16 until 2026-09-12, and `execve` truncated silently
+/// at it: `rustc` and `collect2` build linker command lines of forty-odd
+/// arguments, so `ld` ran without its `-o` and without its inputs and blamed
+/// itself (`docs/archive/RUST_TOOLCHAIN_AMD64.md`, open item 1). This builds a
+/// stack with a full argv and reads back what landed on it — `argc`, the first
+/// pointer and the **last** pointer, which is the one a cap drops.
+///
+/// It inspects the address space directly rather than running a program: no
+/// probe binary reports its own `argv[255]`, and the property under test is
+/// what the stack builder wrote, not what a program made of it.
+fn argv_capacity_test(t: &mut Suite, image: &[u8]) {
+    let free_before = akuma_pmm::free_count();
+
+    // `arg000` … `arg255`, each distinct, built without `format!`.
+    let mut owned: Vec<[u8; 6]> = Vec::with_capacity(loader::MAX_ARGV);
+    for i in 0..loader::MAX_ARGV {
+        owned.push([
+            b'a', b'r', b'g',
+            b'0' + (i / 100) as u8,
+            b'0' + ((i / 10) % 10) as u8,
+            b'0' + (i % 10) as u8,
+        ]);
+    }
+    let argv: Vec<&[u8]> = owned.iter().map(<[u8; 6]>::as_slice).collect();
+
+    let (proc, _img) = match Image::from_elf_argv(image, &argv) {
+        Ok(p) => p,
+        Err(e) => {
+            t.check("elf: a full-size argv builds a stack", false);
+            serial::puts("  elf: full argv failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return;
+        }
+    };
+    t.check("elf: a full-size argv builds a stack", true);
+
+    let word = |slot: u64| -> u64 {
+        let mut w = [0u8; 8];
+        if loader::read_user(&proc.space, proc.stack + slot * 8, &mut w) {
+            u64::from_le_bytes(w)
+        } else {
+            0
+        }
+    };
+    let string_at = |va: u64| -> [u8; 6] {
+        let mut b = [0u8; 6];
+        loader::read_user(&proc.space, va, &mut b);
+        b
+    };
+
+    t.check_eq("elf:   argc is the whole argv", word(0), loader::MAX_ARGV as u64);
+    t.check_eq("elf:   argv[0] reads back", u64::from(string_at(word(1))[3]), u64::from(b'0'));
+    // The last entry, and the NULL after it: a cap or an off-by-one in the
+    // pointer walk shows up here and nowhere earlier.
+    let last = loader::MAX_ARGV as u64;
+    t.check_eq(
+        "elf:   argv[MAX_ARGV-1] holds its own string",
+        u64::from_le_bytes({
+            let mut w = [0u8; 8];
+            w[..6].copy_from_slice(&string_at(word(last)));
+            w
+        }),
+        u64::from_le_bytes({
+            let mut w = [0u8; 8];
+            w[..6].copy_from_slice(&owned[loader::MAX_ARGV - 1]);
+            w
+        }),
+    );
+    t.check_eq("elf:   argv is NULL-terminated", word(last + 1), 0);
+
+    drop(proc);
+    t.check_eq(
+        "elf:   the full-argv stack frees cleanly",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );

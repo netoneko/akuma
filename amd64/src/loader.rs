@@ -319,6 +319,38 @@ fn write_user(space: &UserAddressSpace, va: u64, src: &[u8]) -> bool {
     true
 }
 
+#[cfg(not(feature = "no-tests"))]
+/// Read `dst.len()` bytes out of `space` at `va`, through the physmap.
+///
+/// The counterpart of [`write_user`], and test-only: nothing in the running
+/// kernel reads a *foreign* address space this way — a live one is read through
+/// `uaccess` with `CR3` already naming it. The self-test that checks what the
+/// stack builder actually wrote has no such luxury, since the space it is
+/// inspecting has never been entered.
+pub fn read_user(space: &UserAddressSpace, va: u64, dst: &mut [u8]) -> bool {
+    let mut done = 0usize;
+    while done < dst.len() {
+        let at = va + done as u64;
+        let page = at & !(PAGE_SIZE as u64 - 1);
+        let off = (at - page) as usize;
+        let n = (PAGE_SIZE - off).min(dst.len() - done);
+        let Some(pa) = space.translate(page as usize) else {
+            return false;
+        };
+        // SAFETY: as `write_user`, in the other direction — `pa` came from a
+        // walk of this space's own tables and `off + n` is bounded by PAGE_SIZE.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_ptr::<u8>(pa as u64).add(off),
+                dst.as_mut_ptr().add(done),
+                n,
+            );
+        }
+        done += n;
+    }
+    true
+}
+
 /// Make sure every page of `[start, end)` is mapped in `space` with at least
 /// `prot`, allocating and zeroing frames as needed.
 ///
@@ -390,16 +422,35 @@ fn map_range(
 /// kernel that maps a stack and sets `rsp` without building it has produced a
 /// program that runs and reads garbage — which is why `hello.rs` checks three of
 /// these fields and reports them in its exit status.
-/// The most argv entries the initial stack builder will place. A shell invoked
-/// as `sh -c "<cmd>"` needs three; a generous bound catches a runaway without a
-/// heap allocation on the spawn path.
-pub const MAX_ARGV: usize = 16;
+/// The most argv entries the initial stack builder will place.
+///
+/// **Was 16 until 2026-09-12, and that cost a week of the wrong suspicion.**
+/// A shell invoked as `sh -c "<cmd>"` needs three, which is what the original
+/// bound was sized for; a *toolchain* does not. `rustc`'s call to its linker
+/// passes about fifty arguments and `collect2`'s call to `ld` a similar number,
+/// and the sixteenth onward were silently dropped — `sys_execve` truncated
+/// rather than refusing. The linker therefore ran with a command line that was
+/// valid, shorter, and missing its `-o` and its input files, so it reported
+/// "no input files" and `cannot open output file a.out`, and every
+/// investigation went looking at `collect2` and at path resolution
+/// (`docs/archive/RUST_TOOLCHAIN_AMD64.md`, "Open after session 2", item 1).
+///
+/// The probe that settles it in one line, in the guest:
+/// `busybox echo a b c … z` prints exactly fourteen letters — sixteen argv
+/// entries counting `busybox` and `echo`.
+///
+/// 256 covers a linker invocation with a large crate graph. The cost is the
+/// word block below, which is `STACK_WORDS_MAX * 8` bytes of **kernel** stack
+/// against `sched::STACK_SIZE`; the string pointers now live in that same
+/// block rather than in arrays beside it, which is what keeps the growth to
+/// ~2 KiB and not ~5.
+pub const MAX_ARGV: usize = 256;
 
 /// The most envp entries the initial stack builder will place. `execve` from a
-/// shell hands the child its whole environment; 32 covers a login shell's
-/// `PATH`/`HOME`/`TERM`/… with headroom, and bounds the copy without a heap
-/// allocation (same reasoning as [`MAX_ARGV`]).
-pub const MAX_ENVP: usize = 32;
+/// shell hands the child its whole environment; 64 covers a login shell's
+/// `PATH`/`HOME`/`TERM`/… and the dozen `CARGO_*`/`RUST*` variables a build
+/// adds, and bounds the copy (same reasoning as [`MAX_ARGV`]).
+pub const MAX_ENVP: usize = 64;
 
 /// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL,
 /// and the auxv — **fifteen** key/value pairs, so thirty words: `AT_PHDR`,
@@ -448,17 +499,15 @@ pub fn build_stack(
     map_range(space, base, top, PteProt::USER_RW)?;
 
     // The argv then envp strings sit at the very top, NUL-terminated, packed
-    // downward. `arg_va[i]` / `env_va[i]` is where each string's bytes land.
-    let mut arg_va = [0u64; MAX_ARGV];
-    let mut env_va = [0u64; MAX_ENVP];
+    // downward. Where each string's bytes land is also the pointer the program
+    // reads, so the cursor is walked once here to find the bottom of the blob
+    // and again below to fill in the pointers — rather than kept in a
+    // `[u64; MAX_ARGV]` beside the word block, which at a 256-entry argv is two
+    // kilobytes of kernel stack holding what the word block is about to hold
+    // anyway.
     let mut cursor = top;
-    for (slot, a) in arg_va.iter_mut().zip(argv) {
-        cursor -= a.len() as u64 + 1;
-        *slot = cursor;
-    }
-    for (slot, e) in env_va.iter_mut().zip(envp) {
-        cursor -= e.len() as u64 + 1;
-        *slot = cursor;
+    for s in argv.iter().chain(envp) {
+        cursor -= s.len() as u64 + 1;
     }
     // `AT_RANDOM` points at 16 bytes on the stack, below the string blob.
     // glibc's `ld.so` reads it unconditionally for its pointer-guard setup;
@@ -495,14 +544,20 @@ pub fn build_stack(
         buf[slot * 8..slot * 8 + 8].copy_from_slice(&v.to_le_bytes());
     };
     put(0, argv.len() as u64);
-    for (i, &va) in arg_va.iter().take(argv.len()).enumerate() {
-        put(1 + i, va);
+    // Second walk of the same cursor: `argv[i]` is the address its bytes get,
+    // and the slot it goes in is the one the program will read it from.
+    let mut sp = top;
+    for (i, a) in argv.iter().enumerate() {
+        sp -= a.len() as u64 + 1;
+        put(1 + i, sp);
     }
     put(1 + argv.len(), 0); // argv terminator
-    for (i, &va) in env_va.iter().take(envp.len()).enumerate() {
-        put(2 + argv.len() + i, va);
+    for (i, e) in envp.iter().enumerate() {
+        sp -= e.len() as u64 + 1;
+        put(2 + argv.len() + i, sp);
     }
     put(2 + argv.len() + envp.len(), 0); // envp terminator
+    debug_assert_eq!(sp, cursor + 16, "both cursor walks must land together");
     let aux = 3 + argv.len() + envp.len();
     put(aux, AT_PHDR);
     put(aux + 1, img.phdr_addr);
@@ -540,8 +595,18 @@ pub fn build_stack(
     put(aux + 28, AT_NULL);
     put(aux + 29, 0);
 
-    for (&va, a) in arg_va.iter().zip(argv).chain(env_va.iter().zip(envp)) {
-        if !write_user(space, va, a) || !write_user(space, va + a.len() as u64, &[0]) {
+    // The strings themselves, read back from the slots just filled so there is
+    // one source of truth for where each one goes.
+    let get = |slot: usize| -> u64 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&buf[slot * 8..slot * 8 + 8]);
+        u64::from_le_bytes(w)
+    };
+    for (i, s) in argv.iter().enumerate().chain(
+        envp.iter().enumerate().map(|(i, e)| (i + argv.len() + 1, e)),
+    ) {
+        let va = get(1 + i);
+        if !write_user(space, va, s) || !write_user(space, va + s.len() as u64, &[0]) {
             return Err("could not write argv/envp");
         }
     }

@@ -485,7 +485,14 @@ pub fn leak_count() -> usize {
 struct BitmapAllocator {
     bitmap: Vec<u64>,
     base_addr: usize,
+    /// Pages the bitmap covers — the *span*, which on a sparse arena
+    /// ([`BitmapAllocator::init_sparse`]) includes gaps that are not memory.
     total_pages: usize,
+    /// Pages of the span that are actually RAM. Equal to `total_pages` on an
+    /// arena built by [`BitmapAllocator::init`]; grown by
+    /// [`BitmapAllocator::add_ram`] on a sparse one. This is what the machine
+    /// *has*, and what `sysinfo.totalram` — and so `free(1)` — reports.
+    ram_pages: usize,
     free_pages: usize,
     next_free_hint: usize,
 }
@@ -496,35 +503,121 @@ impl BitmapAllocator {
             bitmap: Vec::new(),
             base_addr: 0,
             total_pages: 0,
+            ram_pages: 0,
             free_pages: 0,
             next_free_hint: 0,
         }
     }
 
     fn init(&mut self, base: usize, size: usize, kernel_end: usize) {
-        self.base_addr = base;
-        self.total_pages = size / PAGE_SIZE;
-
-        let bitmap_size = self.total_pages.div_ceil(64);
-        self.bitmap = alloc::vec![0u64; bitmap_size];
-
-        for i in 0..bitmap_size {
-            self.bitmap[i] = !0u64;
-        }
+        self.alloc_bitmap(base, size, true);
 
         let kernel_pages = kernel_end.saturating_sub(base).div_ceil(PAGE_SIZE);
-        for i in 0..kernel_pages {
+        for i in 0..kernel_pages.min(self.total_pages) {
             self.mark_used(i);
         }
 
-        self.free_pages = self.total_pages - kernel_pages;
+        self.free_pages = self.total_pages - kernel_pages.min(self.total_pages);
         self.next_free_hint = kernel_pages;
+    }
 
+    /// An arena whose span is **not** all memory: nothing is allocatable, and
+    /// nothing counts as RAM, until [`Self::add_ram`] says which parts are.
+    ///
+    /// This exists because a PC does not report one run of RAM. The chipset
+    /// leaves a hole below 4 GiB for MMIO and the RAM displaced by it reappears
+    /// above 4 GiB, so a 6 GiB guest reports ~3 GiB low and ~3 GiB high with a
+    /// 1 GiB gap between them. One bitmap stretched across the gap manages both
+    /// — the alternative, picking one region and dropping the other, costs
+    /// whichever half loses, and that is exactly what it cost
+    /// (`docs/archive/AKUMA_AMD64_SPARSE_ARENA.md`).
+    ///
+    /// Inverted deliberately: init-everything-used then hand back the RAM,
+    /// rather than init-everything-free then punch out the gaps. The gaps are
+    /// what the caller does *not* know — it has a list of RAM regions, in no
+    /// guaranteed order — so making the unknown the default state means a
+    /// region the caller forgets to describe is merely unused, not handed out
+    /// as memory. The failure directions are not symmetric.
+    fn init_sparse(&mut self, base: usize, size: usize) {
+        self.alloc_bitmap(base, size, false);
+        self.free_pages = 0;
+        self.next_free_hint = 0;
+    }
+
+    /// The part both entry points share: size the bitmap and set every page to
+    /// `free` (`init`) or to `used` (`init_sparse`).
+    fn alloc_bitmap(&mut self, base: usize, size: usize, free: bool) {
+        self.base_addr = base;
+        self.total_pages = size / PAGE_SIZE;
+        self.ram_pages = if free { self.total_pages } else { 0 };
+
+        let bitmap_size = self.total_pages.div_ceil(64);
+        self.bitmap = alloc::vec![if free { !0u64 } else { 0u64 }; bitmap_size];
+
+        // Pages past `total_pages` in the last word are not real and must never
+        // be handed out — `alloc_page` guards on the index too, but a set bit
+        // there would make `bitmap[word] != 0` lie about having room.
         let remaining = self.total_pages % 64;
-        if remaining != 0 {
+        if free && remaining != 0 {
             let last_idx = bitmap_size - 1;
             let mask = (1u64 << remaining) - 1;
             self.bitmap[last_idx] &= mask;
+        }
+    }
+
+    /// Declare `[base, base + len)` to be RAM: count it and make it free.
+    ///
+    /// Returns the pages newly freed. Only meaningful on a sparse arena; on a
+    /// plain one every page is already RAM and already free, so this would
+    /// double-count, which is why the public wrapper is the only caller and
+    /// the two entry points are separate functions.
+    fn add_ram(&mut self, base: usize, len: usize) -> usize {
+        let mut added = 0;
+        self.for_each_page(base, len, |me, idx| {
+            if !me.is_free(idx) {
+                me.mark_free(idx);
+                me.free_pages += 1;
+                me.ram_pages += 1;
+                added += 1;
+            }
+        });
+        self.next_free_hint = 0;
+        added
+    }
+
+    /// Take `[base, base + len)` out of circulation — RAM that something else
+    /// already owns: the kernel image, a loader-placed module, the heap.
+    ///
+    /// Returns the pages newly reserved. It does **not** change `ram_pages`:
+    /// this memory exists, it is simply spoken for, and `free(1)` should say so
+    /// by counting it as used rather than by pretending the machine is smaller.
+    /// Idempotent — a page already used is left alone and not counted twice.
+    fn reserve(&mut self, base: usize, len: usize) -> usize {
+        let mut taken = 0;
+        self.for_each_page(base, len, |me, idx| {
+            if me.is_free(idx) {
+                me.mark_used(idx);
+                me.free_pages -= 1;
+                taken += 1;
+            }
+        });
+        taken
+    }
+
+    /// Walk the page indices `[base, base + len)` covers, clipped to the arena.
+    /// Rounds outward: a partially-covered page is a covered page, since the
+    /// unit of ownership here is the frame.
+    fn for_each_page(&mut self, base: usize, len: usize, mut f: impl FnMut(&mut Self, usize)) {
+        let arena_end = self.base_addr + self.total_pages * PAGE_SIZE;
+        let start = base.max(self.base_addr);
+        let end = base.saturating_add(len).min(arena_end);
+        if end <= start {
+            return;
+        }
+        let first = (start - self.base_addr) / PAGE_SIZE;
+        let last = (end - self.base_addr).div_ceil(PAGE_SIZE).min(self.total_pages);
+        for idx in first..last {
+            f(self, idx);
         }
     }
 
@@ -764,6 +857,127 @@ mod bitmap_allocator_tests {
         for i in 3..10 {
             assert!(a.is_free(i), "page {i} past the kernel prefix must start free");
         }
+    }
+
+    // ---- sparse arenas: one bitmap across a memory map with a gap in it ----
+    //
+    // Shapes taken from the machine that motivated this: Firecracker with
+    // `mem_size_mib: 6144` reports RAM at 0x10_0000 (3071 MiB) and at
+    // 0x1_0000_0000 (3072 MiB), with the MMIO hole between them.
+
+    const LOW: usize = 0x10_0000;
+    const LOW_PAGES: usize = 8;
+    const HIGH: usize = LOW + 64 * PAGE_SIZE; // a 56-page gap
+    const HIGH_PAGES: usize = 8;
+    const SPAN: usize = (HIGH + HIGH_PAGES * PAGE_SIZE) - LOW;
+
+    fn sparse_two_regions() -> BitmapAllocator {
+        let mut a = BitmapAllocator::new();
+        a.init_sparse(LOW, SPAN);
+        assert_eq!(a.add_ram(LOW, LOW_PAGES * PAGE_SIZE), LOW_PAGES);
+        assert_eq!(a.add_ram(HIGH, HIGH_PAGES * PAGE_SIZE), HIGH_PAGES);
+        a
+    }
+
+    #[test]
+    fn init_sparse_owns_nothing_until_the_ram_is_described() {
+        let mut a = BitmapAllocator::new();
+        a.init_sparse(LOW, SPAN);
+        assert_eq!(a.free_pages, 0);
+        assert_eq!(a.ram_pages, 0, "a span is not a claim that it is memory");
+        assert!(a.total_pages > 0, "the bitmap still covers the whole span");
+        assert!(a.alloc_page().is_none(), "must refuse until add_ram runs");
+    }
+
+    #[test]
+    fn add_ram_counts_only_the_regions_not_the_span() {
+        let a = sparse_two_regions();
+        assert_eq!(a.ram_pages, LOW_PAGES + HIGH_PAGES);
+        assert_eq!(a.free_pages, LOW_PAGES + HIGH_PAGES);
+        // The gap is the whole point: spanning it must not invent memory.
+        assert!(a.total_pages > a.ram_pages);
+    }
+
+    #[test]
+    fn alloc_never_hands_out_a_page_from_the_gap() {
+        let mut a = sparse_two_regions();
+        let mut got = alloc::vec::Vec::new();
+        while let Some(pa) = a.alloc_page() {
+            got.push(pa);
+        }
+        assert_eq!(got.len(), LOW_PAGES + HIGH_PAGES, "both regions, and nothing else");
+        for pa in got {
+            let in_low = (LOW..LOW + LOW_PAGES * PAGE_SIZE).contains(&pa);
+            let in_high = (HIGH..HIGH + HIGH_PAGES * PAGE_SIZE).contains(&pa);
+            assert!(in_low || in_high, "0x{pa:x} is in the MMIO hole");
+        }
+    }
+
+    #[test]
+    fn reserving_ram_spends_it_without_shrinking_the_machine() {
+        let mut a = sparse_two_regions();
+        let ram = a.ram_pages;
+        assert_eq!(a.reserve(LOW, 3 * PAGE_SIZE), 3);
+        assert_eq!(a.free_pages, ram - 3);
+        assert_eq!(
+            a.ram_pages, ram,
+            "the kernel image and heap are memory the machine has — `free` must \
+             count them used, not absent"
+        );
+    }
+
+    #[test]
+    fn reserve_is_idempotent_and_never_double_counts() {
+        let mut a = sparse_two_regions();
+        let free_before = a.free_pages;
+        assert_eq!(a.reserve(LOW, 3 * PAGE_SIZE), 3);
+        assert_eq!(a.reserve(LOW, 3 * PAGE_SIZE), 0, "already reserved");
+        assert_eq!(a.free_pages, free_before - 3);
+    }
+
+    #[test]
+    fn reserve_and_add_ram_clip_to_the_arena_instead_of_wrapping() {
+        let mut a = sparse_two_regions();
+        let free_before = a.free_pages;
+        // Straddles the low edge, and runs off the top by a mile.
+        assert_eq!(a.reserve(0, LOW + PAGE_SIZE), 1, "only the first arena page");
+        assert_eq!(a.reserve(HIGH, usize::MAX), HIGH_PAGES);
+        assert_eq!(a.free_pages, free_before - 1 - HIGH_PAGES);
+        assert_eq!(a.add_ram(usize::MAX - PAGE_SIZE, PAGE_SIZE), 0, "entirely past the arena");
+    }
+
+    #[test]
+    fn a_partially_covered_page_is_a_covered_page() {
+        let mut a = sparse_two_regions();
+        // One byte into page 0, one byte into page 1: both frames are spoken for.
+        assert_eq!(a.reserve(LOW + 1, PAGE_SIZE), 2);
+    }
+
+    #[test]
+    fn the_six_gigabyte_guest_sees_six_gigabytes() {
+        // The regression this whole path exists for: the arena spans 7 GiB to
+        // reach both halves, and the machine must still report 6 GiB.
+        const MIB: usize = 1024 * 1024;
+        let low_base = 0x10_0000;
+        let low_len = 3071 * MIB;
+        let high_base = 0x1_0000_0000;
+        let high_len = 3072 * MIB;
+        let mut a = BitmapAllocator::new();
+        a.init_sparse(low_base, (high_base + high_len) - low_base);
+        assert_eq!(a.add_ram(low_base, low_len), low_len / PAGE_SIZE);
+        assert_eq!(a.add_ram(high_base, high_len), high_len / PAGE_SIZE);
+        // The kernel image and a 512 MiB heap come off the low region.
+        let _ = a.reserve(low_base, 512 * MIB + 0x5ac000 - low_base);
+        assert_eq!(
+            a.ram_pages * PAGE_SIZE / MIB,
+            6143,
+            "6143 MiB usable, exactly what the memory map reported"
+        );
+        assert!(
+            a.free_pages * PAGE_SIZE / MIB > 5600,
+            "only the heap and the image are spent: {} MiB free",
+            a.free_pages * PAGE_SIZE / MIB
+        );
     }
 
     #[test]
@@ -1893,17 +2107,104 @@ pub fn quarantine_stats() -> (usize, usize) {
 pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
     let mut pmm = PMM.lock();
     pmm.init(ram_base, ram_size, kernel_end);
-
-    TOTAL_PAGES.store(pmm.total_pages, Ordering::Release);
-    ALLOCATED_PAGES.store(pmm.total_pages - pmm.free_pages, Ordering::Release);
-    MANAGED_BASE.store(pmm.base_addr, Ordering::Release);
-    MANAGED_END.store(pmm.base_addr + pmm.total_pages * PAGE_SIZE, Ordering::Release);
+    publish(&pmm);
 
     if config().cow_ref_ledger {
         let words = pmm.total_pages.div_ceil(64);
         COW_EVER_BASE.store(pmm.base_addr, Ordering::Release);
         *COW_EVER.lock() = alloc::vec![0u64; words];
     }
+}
+
+/// Bring up an arena that **spans gaps**: one bitmap from `span_base` across
+/// `span_size` bytes, with nothing allocatable and nothing counted as RAM until
+/// [`add_ram`] describes each run of real memory.
+///
+/// For a machine whose memory map is not one contiguous run — every PC, which
+/// displaces the RAM behind the MMIO hole to just above 4 GiB. See
+/// [`BitmapAllocator::init_sparse`] for why the polarity is this way round.
+///
+/// The caller must follow this with one [`add_ram`] per RAM region and then
+/// [`reserve_range`] for whatever within those regions is already spoken for
+/// (the kernel image, the heap); until it does, the PMM has no free pages.
+pub fn init_sparse(span_base: usize, span_size: usize) {
+    let mut pmm = PMM.lock();
+    pmm.init_sparse(span_base, span_size);
+    publish(&pmm);
+
+    if config().cow_ref_ledger {
+        let words = pmm.total_pages.div_ceil(64);
+        COW_EVER_BASE.store(pmm.base_addr, Ordering::Release);
+        *COW_EVER.lock() = alloc::vec![0u64; words];
+    }
+}
+
+/// Declare `[base, base + len)` to be RAM the PMM may hand out. Returns the
+/// pages added, or `None` if the region table is full ([`MAX_RAM_REGIONS`]) —
+/// in which case **nothing is added**, because a region the bounds check cannot
+/// describe must not become allocatable.
+///
+/// Sparse arenas only. On one built by [`init`] every page is RAM already.
+#[must_use]
+pub fn add_ram(base: usize, len: usize) -> Option<usize> {
+    let n = RAM_REGION_COUNT.load(Ordering::Acquire);
+    if n >= MAX_RAM_REGIONS {
+        return None;
+    }
+    let mut pmm = PMM.lock();
+    let added = pmm.add_ram(base, len);
+    // Record the region before publishing the counts: `contains` reads this
+    // table, and a page that is allocatable but not yet described would be a
+    // frame the safe physical copies refuse to touch.
+    RAM_REGION_BASE[n].store(base, Ordering::Relaxed);
+    RAM_REGION_END[n].store(base.saturating_add(len), Ordering::Relaxed);
+    RAM_REGION_COUNT.store(n + 1, Ordering::Release);
+    publish(&pmm);
+    Some(added)
+}
+
+/// Take `[base, base + len)` out of circulation: RAM that exists but is already
+/// owned — the kernel image, a module the loader placed, the heap carved out
+/// before this allocator existed. Returns the pages newly reserved.
+///
+/// Idempotent, and counted as *used* rather than as absent, so `free(1)` keeps
+/// reporting the memory the machine actually has.
+pub fn reserve_range(base: usize, len: usize) -> usize {
+    let mut pmm = PMM.lock();
+    let taken = pmm.reserve(base, len);
+    publish(&pmm);
+    taken
+}
+
+/// Publish the locked allocator's counts to the lock-free atomics the rest of
+/// the kernel reads. Called by everything that changes them wholesale; the
+/// per-page alloc/free paths adjust `ALLOCATED_PAGES` themselves.
+fn publish(pmm: &BitmapAllocator) {
+    TOTAL_PAGES.store(pmm.ram_pages, Ordering::Release);
+    ALLOCATED_PAGES.store(pmm.ram_pages - pmm.free_pages, Ordering::Release);
+    MANAGED_BASE.store(pmm.base_addr, Ordering::Release);
+    MANAGED_END.store(pmm.base_addr + pmm.total_pages * PAGE_SIZE, Ordering::Release);
+}
+
+/// Runs of real memory a sparse arena can be told about.
+///
+/// Eight is far more than any machine seen here needs (a PC reports two), and
+/// the table is fixed rather than a `Vec` because [`contains`] reads it on the
+/// physical-copy path: a lock there would sit *inside* the safe copies, under
+/// every caller's own locks.
+pub const MAX_RAM_REGIONS: usize = 8;
+
+static RAM_REGION_BASE: [AtomicUsize; MAX_RAM_REGIONS] =
+    [const { AtomicUsize::new(0) }; MAX_RAM_REGIONS];
+static RAM_REGION_END: [AtomicUsize; MAX_RAM_REGIONS] =
+    [const { AtomicUsize::new(0) }; MAX_RAM_REGIONS];
+static RAM_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// How many more [`add_ram`] calls will be accepted. Ask **before** sizing a
+/// span across regions you then cannot describe.
+#[must_use]
+pub fn ram_region_capacity() -> usize {
+    MAX_RAM_REGIONS - RAM_REGION_COUNT.load(Ordering::Acquire)
 }
 
 pub fn alloc_page() -> Option<usize> {
@@ -2066,9 +2367,90 @@ pub fn contains(pa: usize, len: usize) -> bool {
     if base == 0 && end == 0 {
         return false;
     }
-    match pa.checked_add(len) {
-        Some(last) => pa >= base && last <= end,
-        None => false,
+    let Some(last) = pa.checked_add(len) else {
+        return false;
+    };
+    if pa < base || last > end {
+        return false;
+    }
+    // On a sparse arena the span is wider than the memory: it reaches across
+    // the MMIO hole to manage the RAM on the far side. Being inside it is
+    // therefore no longer the same question as being RAM, and answering the
+    // easy one would hand a physical copy the device window this check exists
+    // to keep it out of. No regions recorded means a plain arena, where the
+    // span *is* the memory and the check above was the whole answer.
+    let regions = RAM_REGION_COUNT.load(Ordering::Acquire);
+    if regions == 0 {
+        return true;
+    }
+    range_within_any(
+        pa,
+        last,
+        (0..regions).map(|i| {
+            (
+                RAM_REGION_BASE[i].load(Ordering::Relaxed),
+                RAM_REGION_END[i].load(Ordering::Relaxed),
+            )
+        }),
+    )
+}
+
+/// The question [`contains`] asks of the recorded regions: does `[pa, last)`
+/// lie **entirely** within one of them? Split out as a pure function because
+/// the alternative is testing it through a global arena that can only be
+/// initialised once per process.
+///
+/// Entirely within *one*, not covered by the union: two abutting regions are
+/// two separate runs of memory as far as the map is concerned, and a copy
+/// straddling them is a copy whose caller has confused a span for a region.
+fn range_within_any(
+    pa: usize,
+    last: usize,
+    regions: impl Iterator<Item = (usize, usize)>,
+) -> bool {
+    for (base, end) in regions {
+        if pa >= base && last <= end {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod ram_region_tests {
+    use super::range_within_any;
+
+    const LOW: (usize, usize) = (0x10_0000, 0xC000_0000);
+    const HIGH: (usize, usize) = (0x1_0000_0000, 0x1_C000_0000);
+
+    fn within(pa: usize, len: usize) -> bool {
+        range_within_any(pa, pa + len, [LOW, HIGH].into_iter())
+    }
+
+    #[test]
+    fn ram_in_either_region_is_vouched_for() {
+        assert!(within(0x20_0000, 4096));
+        assert!(within(0x1_0000_0000, 4096));
+        assert!(within(LOW.1 - 4096, 4096), "the last page of a region is in it");
+    }
+
+    #[test]
+    fn the_mmio_hole_between_the_regions_is_refused() {
+        // Firecracker's virtio-mmio window and the LAPIC both live here. They
+        // are inside the arena's span and must never be inside `contains`.
+        assert!(!within(0xC000_1000, 4096), "virtio-mmio");
+        assert!(!within(0xFEE0_0000, 4096), "LAPIC");
+        assert!(!within(LOW.1, 4096), "the first page past a region is not in it");
+    }
+
+    #[test]
+    fn a_copy_straddling_a_regions_edge_is_refused_whole() {
+        assert!(!within(LOW.1 - 4096, 8192), "half in the hole is not half allowed");
+    }
+
+    #[test]
+    fn nothing_is_vouched_for_when_no_region_matches() {
+        assert!(!range_within_any(0x20_0000, 0x20_1000, core::iter::empty()));
     }
 }
 

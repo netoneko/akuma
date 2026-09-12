@@ -155,6 +155,17 @@ span, including an 819 MiB MMIO hole with the framebuffer BAR in it". That is a
 real weakening of a real guard and wants its own change, with `contains` taught
 about the holes rather than left to vouch for them.
 
+## Done, later the same day
+
+The change this section specifies landed:
+[`AKUMA_AMD64_SPARSE_ARENA.md`](AKUMA_AMD64_SPARSE_ARENA.md). `akuma-pmm` gained
+a sparse arena (`init_sparse` + `add_ram`), the span now runs from the lowest
+usable address to the highest, and `contains` was taught the holes rather than
+left to vouch for them — it requires the range to lie inside a recorded RAM
+region, and short-circuits to its old behaviour on a plain arena, so aarch64 is
+untouched. A 6 GiB Firecracker guest went from 3.0G to 6143 MiB; the residual
+this section predicted is zero.
+
 ## Background
 
 - `amd64/src/phys.rs` — `PHYSMAP_LIMIT`, `PHYSMAP_PDS`, and why the limit moved twice
