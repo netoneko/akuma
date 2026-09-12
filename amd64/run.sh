@@ -159,6 +159,14 @@ if [ "$DISK" != "none" ]; then
 fi
 
 # shellcheck disable=SC2086  # these are deliberately word-split
+GDB_ARGS=""
+# `GDB=1` opens the gdbstub on :1234 and holds the guest at reset, so a
+# breakpoint can be armed before the boot — the x86 counterpart of the
+# aarch64 runner's `GDB=1`. Attach with:
+#   gdb target/x86_64-unknown-none/release/akuma-amd64 -ex 'target remote :1234'
+if [ -n "$GDB" ]; then
+    GDB_ARGS="-gdb tcp::1234 -S"
+fi
 exec qemu-system-x86_64 \
     $MACHINE \
     $CPU \
@@ -169,6 +177,7 @@ exec qemu-system-x86_64 \
     $DRIVE \
     $NIC \
     ${CMDLINE:+-append "$CMDLINE"} \
+    $GDB_ARGS \
     -serial mon:stdio \
     -display none \
     -no-reboot \

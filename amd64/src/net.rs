@@ -505,6 +505,13 @@ extern "C" fn netpoll_daemon() -> ! {
     let mut next_us = 0u64;
     NETPOLL_ENTERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     loop {
+        // BKL-hold attribution: the daemon is a long-lived kernel thread with
+        // no syscall entry, so without this its holds read `tag=511` — the
+        // AArch64 glue spells the same two tags around its drain.
+        akuma_bkl::sync::set_holder_tag(
+            crate::smp::cpu_index_u32(),
+            akuma_bkl::sync::HOLD_TAG_NETPOLL,
+        );
         drain_step();
         NETPOLL_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Keep trying SNTP until the wall clock is set. `sync_tick` is a no-op

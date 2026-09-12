@@ -185,12 +185,23 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // the return frame the CPU was rejecting — rip, cs, rflags, rsp, ss — which
     // is the only way to see which selector it actually objected to rather than
     // inferring it from the error code.
+    //
+    // 64 words, not 5: there are no frame pointers in a default build, so the
+    // stack is the only backtrace there is — return addresses from every frame
+    // the crash interrupted are in there, symbolizable against `nm` output.
+    // Learned from the 2026-09-12 ssh-login crash: the faulting rip was a wild
+    // `0x86` with no caller named, and 5 words were not enough to find one.
     if frame.rsp != 0 && frame.rsp >= crate::phys::KERNEL_VMA {
-        serial::puts("\n  [rsp]=");
-        for i in 0..5 {
-            // SAFETY: checked to be a kernel-window address above.
+        serial::puts("\n  [rsp]");
+        for i in 0..64 {
+            // SAFETY: checked to be a kernel-window address above; the kernel
+            // stack is at least a page, and the read is volatile so nothing
+            // reorders it into the prints.
             let w = unsafe { (frame.rsp as *const u64).add(i).read_volatile() };
-            serial::puts(" 0x");
+            if i % 4 == 0 {
+                serial::puts("\n   ");
+            }
+            serial::puts(" ");
             serial::put_hex(w);
         }
     }
@@ -500,6 +511,14 @@ unsafe extern "C" {
 /// and this must be free to edit the frame — see the module header.
 #[unsafe(no_mangle)]
 extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    // BKL-hold attribution: stamp the core's cache for this transient
+    // excursion (the interrupted thread keeps its own tag — see
+    // `set_core_tag_transient`), so a hold inside fault service names
+    // "fault" rather than the syscall that was interrupted.
+    akuma_bkl::sync::set_core_tag_transient(
+        crate::smp::cpu_index_u32(),
+        akuma_bkl::sync::HOLD_TAG_FAULT,
+    );
     // SAFETY: the stub passes a pointer into the current stack, to the frame
     // the CPU just pushed; it is live and exclusively ours until `iretq`.
     let pf = unsafe { &mut *frame };
@@ -875,6 +894,10 @@ const SIGSEGV_STATUS: u64 = -(SIGSEGV as i64) as u64;
 /// `#GP` is never "not mapped yet".
 #[unsafe(no_mangle)]
 extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    akuma_bkl::sync::set_core_tag_transient(
+        crate::smp::cpu_index_u32(),
+        akuma_bkl::sync::HOLD_TAG_FAULT,
+    );
     // SAFETY: as `page_fault_dispatch`.
     let pf = unsafe { &mut *frame };
     if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
@@ -925,6 +948,12 @@ unsafe extern "C" {
 /// See `sched::preempt_if_needed` for why.
 #[unsafe(no_mangle)]
 extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    // BKL-hold attribution: a tick that lands mid-hold is the IRQ/scheduler,
+    // not the interrupted thread (transient stamp; the thread's tag survives).
+    akuma_bkl::sync::set_core_tag_transient(
+        crate::smp::cpu_index_u32(),
+        akuma_bkl::sync::HOLD_TAG_IRQ,
+    );
     // SAFETY: the stub passes pointers into the current stack, to the frame the
     // CPU just pushed and to its own register block; both are live until
     // `iretq`.

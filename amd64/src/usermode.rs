@@ -830,6 +830,12 @@ extern "C" fn syscall_handler(
     // for good — that path returns into kernel code (`run_process`) which
     // expects to hold it.
     crate::smp::bkl_enter();
+    // BKL-hold attribution (the AArch64 glue does this at every kernel entry;
+    // amd64 never had it, so every `[BKL] stuck` line on the metal read
+    // `tag=511` and named nothing — the profiler was on, the announcement
+    // was not). Holding the BKL implies passing through here or through a
+    // fault, so this one line is what makes `tag=` name the holder's syscall.
+    akuma_bkl::sync::set_holder_tag(crate::smp::cpu_index_u32(), nr);
     CALLS.fetch_add(1, Ordering::Relaxed);
     let trace = SYSCALL_TRACE.load(Ordering::Relaxed);
     // Entry line: a syscall that blocks forever has no result line, so the

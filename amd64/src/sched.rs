@@ -687,6 +687,12 @@ pub fn register_idle_task(cpu: usize) -> Option<usize> {
 /// cannot slip between them and leave the core asleep past it.
 pub fn idle_loop() -> ! {
     loop {
+        // BKL-hold attribution: the idle thread never passes a syscall entry,
+        // so without this its (dropped-window, reclaim) holds read `tag=511`.
+        akuma_bkl::sync::set_holder_tag(
+            crate::smp::cpu_index_u32(),
+            akuma_bkl::sync::HOLD_TAG_IDLE,
+        );
         // 5b slice 1: the idle loop is reclaim site 2 (`process::reclaim`'s
         // vetted list). Every exit's terminal drain (`run_process`) and the
         // boot drive loop's `yield_now` keep the RETIRED set near-empty while

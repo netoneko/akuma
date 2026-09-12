@@ -1033,3 +1033,11 @@ reboot_to("akuma")`; verify the box build contains the new code with
 first "staged" boot was a stale `target/` binary because `late_init` never
 ran — grep before believing). `reboot -f` from Akuma intermittently answers
 `I/O error` and does nothing; `/bin/busybox reboot -f` works.
+
+**Correction (2026-09-12, later)**: the "reset-under-load" and "BKL storm"
+threads above have a named root cause that is not the lock and not the USB
+transport — a ring-0 page fault inside the x86_64 context switch kills one
+core, and the dead core's unacknowledged TLB shootdown is what wedges the
+BKL. `apk` itself works on the ramdisk. Full account, reproduction, and the
+suspect race:
+`AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`.
