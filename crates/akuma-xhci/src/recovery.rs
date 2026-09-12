@@ -10,7 +10,7 @@
 //! recovered 57/57. The difference between survivable and fatal was one code
 //! path; this module pins both to the same decision, with tests.
 //!
-//! Two rules, in order:
+//! Three rules, in order:
 //!
 //! 1. **Both failure shapes recover.** A completion code of `STALL_ERROR` and
 //!    a poll-budget timeout are the same situation seen at different speeds —
@@ -27,6 +27,14 @@
 //!    re-issue, so a *timeout* gets a second recovery cycle. A stall after
 //!    recovery stays terminal — that is a device refusing the command, not a
 //!    slow one.
+//! 3. **A timed-out TD is aborted before anything is retried.** The TD is
+//!    still live in the ring when the budget expires, and the ring is
+//!    strictly ordered: a retry enqueued behind it does not run until the
+//!    dead TD completes, and when the device does answer late it answers the
+//!    *old* TRB into the *shared* bounce buffer. Stop Endpoint + Set TR
+//!    Dequeue Pointer take the ring past the dead TD first (see
+//!    [`recovery_plan`]); the model in `device.rs` counts a Stop or a Set TR
+//!    Dequeue Pointer against a forbidding state as an illegal step.
 
 /// Which BOT phase failed — the log's phase string and the endpoint the
 /// failure belongs to.
@@ -110,6 +118,12 @@ pub enum RecoveryStep {
     /// a *running* endpoint is spec-illegal (xHCI §4.6.9), and both bulk
     /// rings are not necessarily halted.
     ResetEndpoint { dci: u8 },
+    /// Controller-side: abort the TD a *running* endpoint never finished
+    /// (xHCI §4.6.9 Stop Endpoint). The timeout's TD is still live in the
+    /// ring; without this the retry is enqueued **behind** it and the device
+    /// is handed two commands back to back — see the module doc. Running ->
+    /// Stopped, after which [`Self::SetTrDequeuePointer`] is legal.
+    StopEndpoint { dci: u8 },
     /// Device-side: the Bulk-Only Mass Storage Reset class request
     /// (`bmRequestType 0x21`, `bRequest 0xFF`, `wIndex` = BOT interface).
     /// A controller-side reset does not un-halt the device.
@@ -139,11 +153,20 @@ pub enum RecoveryStep {
 /// - **Desync** (CSW unparseable / tag mismatch): the device half only
 ///   (BOT reset + clear-halts). The pipe is desynced but no endpoint halted.
 /// - **Timeout, endpoint not halted** (the 2026-09-11 metal finding: the
-///   post-idle command completes `cc=1` seconds late): **the empty plan** —
-///   a plain retry. Running the BOT reset here was actively harmful: it
-///   scrubbed the device's transfer state after every slow command, so the
-///   NEXT command stalled too, and any multi-command burst (a directory
-///   listing) stalled its way through every entry.
+///   post-idle command completes `cc=1` seconds late): **abort the live TD**
+///   — Stop Endpoint, then the device half, then Set TR Dequeue Pointer past
+///   the dead TD. Until 2026-09-12 this was the *empty* plan, a plain retry,
+///   on the reasoning that a slow endpoint should be left alone. That was
+///   wrong in a way the metal showed twice over: the retry's TRBs went onto
+///   the ring **behind** the still-live TD, so when the device finally
+///   answered, the late completion was for the old TRB (`discarded transfer
+///   event: cc=1`), the second CBW hit the device mid-command, and a 13-byte
+///   CSW could land in the retry's 64 KiB data TRB and read as a short —
+///   successful — data phase with 13 bytes of `USBS` at the front of a
+///   filesystem block. The "next command stalled too" that got blamed on the
+///   BOT reset was this: two TDs, one device, no abort. Stop Endpoint is the
+///   abort; with it the ring is clean before the retry and the BOT reset
+///   just brings the device back to its command phase.
 /// - **Timeout, endpoint halted**: the full sequence — the halt is real.
 #[must_use]
 pub fn recovery_plan(
@@ -154,7 +177,13 @@ pub fn recovery_plan(
     bulk_out_addr: u8,
 ) -> [RecoveryStep; 5] {
     match (outcome_kind, endpoint_halted) {
-        (OutcomeKind::TimedOut, false) => [RecoveryStep::None; 5],
+        (OutcomeKind::TimedOut, false) => [
+            RecoveryStep::StopEndpoint { dci: failed_dci },
+            RecoveryStep::BotMassStorageReset,
+            RecoveryStep::ClearHalt { ep_addr: bulk_in_addr },
+            RecoveryStep::ClearHalt { ep_addr: bulk_out_addr },
+            RecoveryStep::SetTrDequeuePointer { dci: failed_dci },
+        ],
         _ => [
             if endpoint_halted {
                 RecoveryStep::ResetEndpoint { dci: failed_dci }

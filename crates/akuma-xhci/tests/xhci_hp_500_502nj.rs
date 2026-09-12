@@ -261,6 +261,56 @@ fn bulk_normal_trb() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn trb_type_table_is_the_specs() {
+    // xHCI Table 6-91, as literals. The Set TR Dequeue Pointer test below
+    // compared `trb_type(s[3])` against `trb::ty::SET_TR_DEQUEUE` — a test
+    // that would pass with the constant set to anything — and the constant
+    // was 15 (Stop Endpoint) from the driver's first commit until
+    // 2026-09-12. Every "dequeue move" the recovery issued on the metal was
+    // a Stop Endpoint; on the Stopped endpoint Reset Endpoint had just
+    // produced, the controller answered Context State Error and the ring
+    // stayed parked on the dead TD. Cross-checked against NetBSD's
+    // `xhcireg.h` (`XHCI_TRB_TYPE_STOP_EP 0x0F`, `_SET_TR_DEQUEUE 0x10`).
+    assert_eq!(trb::ty::NORMAL, 1);
+    assert_eq!(trb::ty::SETUP_STAGE, 2);
+    assert_eq!(trb::ty::DATA_STAGE, 3);
+    assert_eq!(trb::ty::STATUS_STAGE, 4);
+    assert_eq!(trb::ty::LINK, 6);
+    assert_eq!(trb::ty::ENABLE_SLOT, 9);
+    assert_eq!(trb::ty::DISABLE_SLOT, 10);
+    assert_eq!(trb::ty::ADDRESS_DEVICE, 11);
+    assert_eq!(trb::ty::CONFIGURE_ENDPOINT, 12);
+    assert_eq!(trb::ty::EVALUATE_CONTEXT, 13);
+    assert_eq!(trb::ty::RESET_ENDPOINT, 14);
+    assert_eq!(trb::ty::STOP_ENDPOINT, 15);
+    assert_eq!(trb::ty::SET_TR_DEQUEUE, 16);
+    assert_eq!(trb::ty::NO_OP_CMD, 23);
+    assert_eq!(trb::ty::TRANSFER_EVENT, 32);
+    assert_eq!(trb::ty::COMMAND_COMPLETION_EVENT, 33);
+    assert_eq!(trb::ty::PORT_STATUS_CHANGE_EVENT, 34);
+    // And the completion codes the recovery path reads (Table 6-90).
+    assert_eq!(trb::cc::STALL_ERROR, 6);
+    assert_eq!(trb::cc::CONTEXT_STATE_ERROR, 19);
+    assert_eq!(trb::cc::STOPPED, 26);
+    assert_eq!(trb::cc::STOPPED_LENGTH_INVALID, 27);
+}
+
+#[test]
+fn stop_endpoint_encoding() {
+    // The abort primitive for a timed-out TD: slot + dci in the control
+    // dword, type 15, Suspend (bit 23) clear, parameter and status zero.
+    let s = trb::stop_endpoint(1, 3);
+    assert_eq!(s[0], 0);
+    assert_eq!(s[1], 0);
+    assert_eq!(s[2], 0);
+    assert_eq!(trb_type(s[3]), 15, "Stop Endpoint is type 15");
+    assert_eq!(s[3] >> 24, 1, "slot id");
+    assert_eq!((s[3] >> 16) & 0x1f, 3, "endpoint dci");
+    assert_eq!(s[3] & (1 << 23), 0, "Suspend clear: stopped to restart, not parked");
+    assert_eq!(s[3] & 1, 0, "cycle bit left for the ring");
+}
+
+#[test]
 fn set_tr_dequeue_pointer_encoding() {
     // Halt recovery: Reset Endpoint, then this — DCS (param bit 0) is the
     // cycle a TRB at the new dequeue address carries; bits 3:1 are reserved
@@ -269,6 +319,7 @@ fn set_tr_dequeue_pointer_encoding() {
     assert_eq!(s[0], 0x20_0011, "pointer + DCS=1 in bit 0");
     assert_eq!(s[1], 0);
     assert_eq!(s[2], 0, "stream id 0");
+    assert_eq!(trb_type(s[3]), 16, "Set TR Dequeue Pointer is type 16, not 15 (Stop Endpoint)");
     assert_eq!(trb_type(s[3]), trb::ty::SET_TR_DEQUEUE);
     assert_eq!(s[3] >> 24, 3, "slot id");
     assert_eq!((s[3] >> 16) & 0x1f, 2, "endpoint dci");

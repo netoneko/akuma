@@ -100,6 +100,9 @@ static mut BULK_OUT_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
 static mut CTRL_BUF: Aligned4K<512> = Aligned4K([0; 512]);
 static mut CBW_BUF: Aligned64<64> = Aligned64([0; 64]);
 static mut CSW_BUF: Aligned64<64> = Aligned64([0; 64]);
+/// `REQUEST SENSE`'s 18 bytes. Its own buffer so asking a failed command why
+/// does not overwrite the data (or the `WRITE(10)` payload) the retry needs.
+static mut SENSE_BUF: Aligned64<64> = Aligned64([0; 64]);
 /// 4 KiB-aligned; the data phase splits at the 64 KiB boundary it may straddle
 /// (`trb::data_trbs`), so page alignment is enough — `.bss` cannot promise more.
 static mut BOUNCE_BUF: Aligned4K<BOUNCE_LEN> = Aligned4K([0; BOUNCE_LEN]);
@@ -159,6 +162,7 @@ dma_buf!(scratch_arr, scratch_arr_mut, SCRATCH_ARR, SCRATCH_PAGES * 8);
 dma_buf!(ctrl_buf, ctrl_buf_mut, CTRL_BUF, 512);
 dma_buf!(cbw_buf, cbw_buf_mut, CBW_BUF, 64);
 dma_buf!(csw_buf, csw_buf_mut, CSW_BUF, 64);
+dma_buf!(sense_buf, sense_buf_mut, SENSE_BUF, 64);
 dma_buf!(bounce, bounce_mut, BOUNCE_BUF, BOUNCE_LEN);
 
 fn dcbaa_mut() -> &'static mut [u64] {
@@ -170,10 +174,38 @@ fn dcbaa_mut() -> &'static mut [u64] {
 // Timing
 // ===========================================================================
 
-/// Busy-wait `us` microseconds. Assumes a >= 1 GHz TSC (every x86_64 part), so
-/// it over-waits on a fast box rather than under-waiting a reset poll.
+/// The TSC rate every budget below is written against.
+///
+/// `lapic::calibrate` measures it across the same 10 ms PIT gate as the LAPIC
+/// count, so this driver's "one second" and the scheduler's agree. When no PIT
+/// was there to measure against (Firecracker, `microvm`) the fallback is the
+/// **fastest** part this kernel could plausibly meet, so a budget is never
+/// shorter than asked — the failure that matters here is a slow drive read as
+/// dead, not a dead drive read as slow.
+///
+/// History: the budgets used to be a bare `1_000_000_000` ticks, assuming a
+/// TSC of at least 1 GHz. On the trashcan's 3.2 GHz Haswell that "second" was
+/// 0.31 s. A drive waking from standby answers in seconds, so the first
+/// command after every idle gap "timed out", the recovery ran against a device
+/// that was merely busy, and much of the stall cadence on that box was this
+/// constant (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § "Clock finding").
+const TSC_HZ_FALLBACK: u64 = 4_000_000_000;
+
+fn tsc_hz() -> u64 {
+    match crate::lapic::tsc_hz() {
+        0 => TSC_HZ_FALLBACK,
+        hz => hz,
+    }
+}
+
+/// TSC ticks in `ms` milliseconds.
+fn ticks_ms(ms: u64) -> u64 {
+    tsc_hz() / 1000 * ms
+}
+
+/// Busy-wait `us` microseconds.
 fn spin_us(us: u64) {
-    let target = us * 1000;
+    let target = tsc_hz() / 1_000_000 * us;
     // SAFETY: RDTSC is unprivileged and present on all x86_64.
     let start = unsafe { core::arch::x86_64::_rdtsc() };
     while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < target {
@@ -186,8 +218,30 @@ fn tsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// One-second poll budget, in TSC ticks (assuming >= 1 GHz).
-const BUDGET: u64 = 1_000_000_000;
+/// Controller commands and bring-up register polls. The controller itself
+/// answers in microseconds; a second is generous and keeps a dead controller
+/// from holding the boot.
+fn command_budget() -> u64 {
+    ticks_ms(1_000)
+}
+
+/// EP0 control transfers — descriptors, the BOT Mass Storage Reset,
+/// `CLEAR_FEATURE`. The device answers these from its bridge firmware with no
+/// media involved, but a bridge mid-reset can take a while to come back.
+fn control_budget() -> u64 {
+    ticks_ms(5_000)
+}
+
+/// Bulk phases carry the SCSI command, and a SCSI command may have to spin a
+/// platter up: a 2.5" SATA drive leaving standby needs 3-8 s, and the ASMedia
+/// bridge in front of it adds its own link wake. Linux's `sd` gives the whole
+/// command 30 s. Ten covers spin-up with margin while still failing a genuinely
+/// dead disk in a time a human at the console can wait out.
+const BULK_BUDGET_MS: u64 = 10_000;
+
+fn bulk_budget() -> u64 {
+    ticks_ms(BULK_BUDGET_MS)
+}
 
 fn puthex(label: &str, v: u32) {
     serial::puts(label);
@@ -297,7 +351,7 @@ impl Xhci {
                 Some(Event::PortStatusChange { .. }) | None => {}
                 Some(_) => {}
             }
-            if tsc().wrapping_sub(start) > BUDGET {
+            if tsc().wrapping_sub(start) > command_budget() {
                 serial::puts("  [xhci] timeout: ");
                 serial::puts(what);
                 serial::puts("\n");
@@ -319,7 +373,15 @@ impl Xhci {
     }
 
     /// Push `td` onto a transfer ring, ring the slot doorbell for `dci`, wait
-    /// for the last TRB's Transfer Event. Returns `(completion_code, bytes moved)`.
+    /// up to `budget` TSC ticks for the last TRB's Transfer Event. Returns
+    /// `(completion_code, bytes moved)`.
+    ///
+    /// On `Err` the TD is **still live in the ring**. The caller must not
+    /// enqueue behind it: the ring is strictly ordered, so the retry would not
+    /// run until the dead TD completes, and a late completion would land the
+    /// device's next bytes in whichever TRB is at the dequeue — the 2026-09-12
+    /// double-TD bug. `recover` aborts it with Stop Endpoint + Set TR Dequeue
+    /// Pointer before any retry.
     fn transfer(
         &mut self,
         ring: Ring,
@@ -327,6 +389,7 @@ impl Xhci {
         dci: u8,
         td: &[[u32; 4]],
         requested: u32,
+        budget: u64,
         what: &str,
     ) -> Result<(u8, u32), &'static str> {
         let base = ring_phys(ring);
@@ -394,10 +457,12 @@ impl Xhci {
                 Some(_) => {}
                 None => {}
             }
-            if tsc().wrapping_sub(start) > BUDGET {
+            if tsc().wrapping_sub(start) > budget {
                 serial::puts("  [xhci] transfer timeout: ");
                 serial::puts(what);
-                serial::puts("\n");
+                serial::puts(" after ");
+                serial::put_dec(budget / (tsc_hz() / 1000));
+                serial::puts(" ms\n");
                 // Diagnostic (trash box, uncommitted): a timeout whose endpoint
                 // context reads disabled can never succeed on retry — the ring
                 // doorbell on a disabled endpoint is ignored. What is not known
@@ -458,8 +523,15 @@ impl Xhci {
         td[n] = trb::status_stage(dir, true);
         n += 1;
 
-        let (code, moved) =
-            self.transfer(Ring::Ep0, RingField::Ep0, 1, &td[..n], u32::from(w_length), "control")?;
+        let (code, moved) = self.transfer(
+            Ring::Ep0,
+            RingField::Ep0,
+            1,
+            &td[..n],
+            u32::from(w_length),
+            control_budget(),
+            "control",
+        )?;
         if code != cc::SUCCESS && code != cc::SHORT_PACKET {
             puthex("  [xhci] control cc=", u32::from(code));
             return Err("control transfer error");
@@ -566,7 +638,7 @@ pub fn init() -> Result<(), &'static str> {
         w32(op, op::USBCMD, cmd & !usbcmd::RS);
         let s = tsc();
         while r32(op, op::USBSTS) & usbsts::HCH == 0 {
-            if tsc().wrapping_sub(s) > BUDGET {
+            if tsc().wrapping_sub(s) > command_budget() {
                 return Err("xHCI would not halt");
             }
             spin_us(100);
@@ -579,7 +651,7 @@ pub fn init() -> Result<(), &'static str> {
         if r32(op, op::USBCMD) & usbcmd::HCRST == 0 && r32(op, op::USBSTS) & usbsts::CNR == 0 {
             break;
         }
-        if tsc().wrapping_sub(s) > BUDGET {
+        if tsc().wrapping_sub(s) > command_budget() {
             return Err("xHCI reset timeout");
         }
         spin_us(100);
@@ -669,7 +741,7 @@ pub fn init() -> Result<(), &'static str> {
 
         let s = tsc();
         while r32(op, op::USBSTS) & usbsts::HCH != 0 {
-            if tsc().wrapping_sub(s) > BUDGET {
+            if tsc().wrapping_sub(s) > command_budget() {
                 return Err("xHCI would not start");
             }
             spin_us(100);
@@ -795,7 +867,7 @@ fn halt_controller(op: usize) {
     w32(op, op::USBCMD, 0);
     let s = tsc();
     while r32(op, op::USBSTS) & usbsts::HCH == 0 {
-        if tsc().wrapping_sub(s) > BUDGET / 4 {
+        if tsc().wrapping_sub(s) > command_budget() / 4 {
             break;
         }
         spin_us(100);
@@ -803,7 +875,7 @@ fn halt_controller(op: usize) {
     w32(op, op::USBCMD, usbcmd::HCRST);
     let s = tsc();
     while r32(op, op::USBCMD) & usbcmd::HCRST != 0 {
-        if tsc().wrapping_sub(s) > BUDGET / 4 {
+        if tsc().wrapping_sub(s) > command_budget() / 4 {
             break;
         }
         spin_us(100);
@@ -813,7 +885,7 @@ fn halt_controller(op: usize) {
 fn wait_cnr_clear(op: usize) -> Result<(), &'static str> {
     let s = tsc();
     while r32(op, op::USBSTS) & usbsts::CNR != 0 {
-        if tsc().wrapping_sub(s) > BUDGET {
+        if tsc().wrapping_sub(s) > command_budget() {
             return Err("xHCI CNR never cleared");
         }
         spin_us(100);
@@ -837,7 +909,7 @@ fn bios_handoff(bar_va: usize, mut off: usize) {
                 loop {
                     // SAFETY: as above.
                     let now = xcap::UsbLegSup(unsafe { MmioReg::<u32>::new(bar_va + off).read() });
-                    if now.handoff_complete() || tsc().wrapping_sub(s) > BUDGET {
+                    if now.handoff_complete() || tsc().wrapping_sub(s) > command_budget() {
                         break;
                     }
                     spin_us(1000);
@@ -941,7 +1013,7 @@ fn reset_port(op: usize, port: u8, superspeed: bool) -> Result<(), &'static str>
                 w32(op, op::portsc(port), now.acknowledging_reset());
                 return Ok(());
             }
-            if tsc().wrapping_sub(s) > BUDGET {
+            if tsc().wrapping_sub(s) > command_budget() {
                 break;
             }
             spin_us(1000);
@@ -1255,10 +1327,11 @@ fn read_capacity(x: &mut Xhci) -> Result<(), &'static str> {
             Err(e) => return Err(e),
         }
     }
+    // Through the status layer: a freshly powered enclosure answers its first
+    // real command with UNIT ATTENTION, which `scsi_io` clears and retries.
+    scsi_io(x, cdb::read_capacity_10(), 8).map_err(|_| "READ CAPACITY failed")?;
     let mut cap = [0u8; 8];
-    if bot_small(x, cdb::read_capacity_10(), &mut cap)? != CswStatus::Passed {
-        return Err("READ CAPACITY failed");
-    }
+    cap.copy_from_slice(&bounce()[..8]);
     let rc = akuma_usb_storage::ReadCapacity10::parse(&cap).ok_or("bad READ CAPACITY response")?;
     x.block_len = rc.block_len;
     x.block_count = rc.block_count();
@@ -1280,7 +1353,7 @@ enum BotErr {
     /// The controller completed the TD with a completion code the BOT layer
     /// cannot use.
     Stalled { code: u8, phase: Phase, dci: u8 },
-    /// The controller never completed the TD within `BUDGET`. The TD is
+    /// The controller never completed the TD within `bulk_budget`. The TD is
     /// still live in the ring and the device may answer late — the photograph
     /// of 2026-09-11 shows a data-phase STALL arriving just past the budget:
     /// indistinguishable from never answering, and deadly when treated that
@@ -1310,9 +1383,10 @@ fn bot_run(
     x: &mut Xhci,
     command: akuma_usb_storage::Command,
     data_len: usize,
+    data_phys: u64,
 ) -> Result<(CswStatus, u32), &'static str> {
     for attempt in 0..=2u8 {
-        match bot_run_once(x, command, data_len) {
+        match bot_run_once(x, command, data_len, data_phys) {
             Ok(r) => return Ok(r),
             Err(e) => match retry_decision(attempt, &e.outcome()) {
                 Decision::RecoverAndRetry => {
@@ -1333,10 +1407,14 @@ fn bot_run(
     unreachable!("retry_decision caps the loop at one retry")
 }
 
+/// `data_phys` is the DMA address of the data phase's buffer — `BOUNCE_BUF`
+/// for disk I/O, `SENSE_BUF` for the `REQUEST SENSE` that must not overwrite
+/// the payload a failed command is about to retry with.
 fn bot_run_once(
     x: &mut Xhci,
     command: akuma_usb_storage::Command,
     data_len: usize,
+    data_phys: u64,
 ) -> Result<(CswStatus, u32), BotErr> {
     let tag = x.tag;
     x.tag = x.tag.wrapping_add(1).max(1);
@@ -1350,6 +1428,7 @@ fn bot_run_once(
         x.bulk_out_dci,
         &[trb::normal(cbw_phys, 31, true)],
         31,
+        bulk_budget(),
         Phase::Cbw.as_str(),
     )
     .map_err(|_| BotErr::TimedOut { phase: Phase::Cbw, dci: x.bulk_out_dci })?;
@@ -1360,7 +1439,7 @@ fn bot_run_once(
     let mut moved = 0u32;
     if data_len > 0 && command.direction != Direction::None {
         let n = data_len.min(BOUNCE_LEN) as u32;
-        let bp = phys_of(bounce().as_ptr());
+        let bp = data_phys;
         let (ring, field, dci, is_in) = match command.direction {
             Direction::In => (Ring::BulkIn, RingField::BulkIn, x.bulk_in_dci, true),
             _ => (Ring::BulkOut, RingField::BulkOut, x.bulk_out_dci, false),
@@ -1368,7 +1447,7 @@ fn bot_run_once(
         let phase = Phase::Data;
         let (count, td) = trb::data_trbs(bp, n);
         let (code, m) = x
-            .transfer(ring, field, dci, &td[..count], n, phase.as_str())
+            .transfer(ring, field, dci, &td[..count], n, bulk_budget(), phase.as_str())
             .map_err(|_| BotErr::TimedOut { phase, dci })?;
         moved = m;
         if code != cc::SUCCESS && !(code == cc::SHORT_PACKET && is_in) {
@@ -1383,6 +1462,7 @@ fn bot_run_once(
         x.bulk_in_dci,
         &[trb::normal(csw_phys, 13, true)],
         13,
+        bulk_budget(),
         Phase::Csw.as_str(),
     )
     .map_err(|_| BotErr::TimedOut { phase: Phase::Csw, dci: x.bulk_in_dci })?;
@@ -1561,19 +1641,34 @@ fn recover(x: &mut Xhci, e: &BotErr) -> bool {
         AttemptOutcome::Desynced { .. } => akuma_xhci::recovery::OutcomeKind::Desynced,
     };
     let plan = recovery_plan(kind, halted, dci, bulk_ep_addr(x.bulk_in_dci), bulk_ep_addr(x.bulk_out_dci));
-    if plan.iter().all(|s| matches!(s, RecoveryStep::None)) {
-        serial::puts("  [xhci] no recovery needed - plain retry (device slow, not stuck)\n");
-        return true;
+    if !halted && kind == akuma_xhci::recovery::OutcomeKind::TimedOut {
+        // The TD is live and the endpoint is running: the only legal way off
+        // it is Stop Endpoint (Running -> Stopped), then the dequeue move.
+        // Until 2026-09-12 this case retried with the dead TD still queued
+        // ahead of the retry — see `akuma_xhci::recovery`'s module doc.
+        serial::puts("  [xhci] ep not halted - aborting the live TD (stop ep)\n");
     }
-    if !halted {
-        serial::puts("  [xhci] ep not halted - controller reset skipped\n");
-    }
+    // The plan encodes spec legality (host-tested against the model in
+    // `akuma_xhci::device`); this loop only performs the steps, in order.
     for step in plan {
         match step {
-            RecoveryStep::ResetEndpoint { dci } if halted => {
+            RecoveryStep::None => {}
+            RecoveryStep::ResetEndpoint { dci } => {
                 recover_step(x, "reset ep", trb::reset_endpoint(x.slot, dci));
             }
-            RecoveryStep::SetTrDequeuePointer { dci } if halted => {
+            RecoveryStep::StopEndpoint { dci } => {
+                // The controller answers with a Transfer Event (cc=STOPPED /
+                // STOPPED_LENGTH_INVALID) for the aborted TD and then the
+                // Command Completion; `command` consumes the first, and one
+                // that lands late shows up as a `discarded transfer event`
+                // on the next transfer — expected, and the proof the abort
+                // took.
+                recover_step(x, "stop ep", trb::stop_endpoint(x.slot, dci));
+            }
+            RecoveryStep::SetTrDequeuePointer { dci } => {
+                // Resume at the ring's enqueue position with the cycle the
+                // next TRB there will carry: everything up to it — the dead
+                // TD included — is abandoned.
                 let idx = x.producer(failed_field).enqueue_index();
                 let cycle = x.producer(failed_field).cycle();
                 let dequeue = ring_phys(failed_ring) + (idx as u64) * 16;
@@ -1583,13 +1678,17 @@ fn recover(x: &mut Xhci, e: &BotErr) -> bool {
                     trb::set_tr_dequeue_pointer(x.slot, dci, dequeue, cycle),
                 );
             }
-            RecoveryStep::None => {}
-            RecoveryStep::ResetEndpoint { .. } | RecoveryStep::SetTrDequeuePointer { .. } => {}
             RecoveryStep::BotMassStorageReset => {
-                let _ = x.control(0x21, 0xFF, 0, u16::from(x.bot_if), 0);
+                if x.control(0x21, 0xFF, 0, u16::from(x.bot_if), 0).is_err() {
+                    serial::puts("  [xhci] BOT mass storage reset: control transfer failed\n");
+                }
             }
             RecoveryStep::ClearHalt { ep_addr } => {
-                let _ = x.control(0x02, 0x01, 0, u16::from(ep_addr), 0);
+                if x.control(0x02, 0x01, 0, u16::from(ep_addr), 0).is_err() {
+                    serial::puts("  [xhci] CLEAR_FEATURE(ENDPOINT_HALT) failed for ep 0x");
+                    serial::put_hexn(u64::from(ep_addr), 2);
+                    serial::puts("\n");
+                }
             }
         }
     }
@@ -1608,12 +1707,140 @@ fn bot_small(
         let n = data.len().min(command.data_len as usize).min(BOUNCE_LEN);
         bounce_mut()[..n].copy_from_slice(&data[..n]);
     }
-    let (status, moved) = bot_run(x, command, command.data_len as usize)?;
+    let (status, moved) = bot_run(x, command, command.data_len as usize, phys_of(bounce().as_ptr()))?;
     if command.direction == Direction::In {
         let n = (moved as usize).min(data.len()).min(BOUNCE_LEN);
         data[..n].copy_from_slice(&bounce()[..n]);
     }
     Ok(status)
+}
+
+// ===========================================================================
+// SCSI status: the layer between "the BOT transport delivered a CSW" and "the
+// block device did what it was asked"
+// ===========================================================================
+
+/// How long to keep asking a drive that answers `NOT READY`: standby spin-up
+/// on a 2.5" SATA drive behind the bridge is 3-8 s. Twelve covers it with
+/// margin and still fails a genuinely dead disk in a time a human at the
+/// console can wait out.
+const NOT_READY_WAIT_MS: u64 = 12_000;
+const NOT_READY_POLL_MS: u64 = 250;
+/// `UNIT ATTENTION` retries per command. The device raises it once after a
+/// reset (ours, or a power event) and clears it on the next command; a device
+/// that raises it on every command is broken, not attentive.
+const UNIT_ATTENTION_RETRIES: u8 = 4;
+
+/// Run one SCSI command through the BOT transport and interpret its status:
+/// `Passed` must have moved exactly `span` bytes, `Failed` is asked why with
+/// `REQUEST SENSE` and retried when the answer is "not yet" (a platter
+/// spinning up, or the unit-attention every device raises after a reset — the
+/// reset *this driver's recovery* just sent included), and a `PhaseError`
+/// gets the class-standard reset once.
+///
+/// This exists because `read_bytes` used to check only `status == Passed` and
+/// copied `span` bytes out of the bounce buffer regardless of how many the
+/// device had actually delivered. A short data phase reported as success is
+/// exactly what the double-TD bug produced, and a 64 KiB read that carried 13
+/// real bytes went into the ext2 block cache as a full block.
+///
+/// The bounce buffer holds the command's data across every retry: `REQUEST
+/// SENSE` lands in its own `SENSE_BUF`, so a `WRITE(10)` payload staged
+/// before the call is still intact when the command is re-issued.
+fn scsi_io(
+    x: &mut Xhci,
+    command: akuma_usb_storage::Command,
+    span: usize,
+) -> Result<(), &'static str> {
+    let mut not_ready_polls: u64 = 0;
+    let mut unit_attentions: u8 = 0;
+    let mut phase_errors: u8 = 0;
+    loop {
+        let (status, moved) = bot_run(x, command, span, phys_of(bounce().as_ptr()))?;
+        match status {
+            CswStatus::Passed => {
+                if moved as usize != span {
+                    serial::puts("  [xhci] short transfer: device moved ");
+                    serial::put_dec(u64::from(moved));
+                    serial::puts(" of ");
+                    serial::put_dec(span as u64);
+                    serial::puts(" bytes\n");
+                    return Err("short bulk transfer");
+                }
+                return Ok(());
+            }
+            CswStatus::Failed => {
+                let sense = request_sense(x)?;
+                match sense.sense_key {
+                    // UNIT ATTENTION: "something happened" (0x29 = reset
+                    // occurred — including the BOT reset recovery just sent).
+                    // Acknowledged by the asking; retry at once.
+                    0x06 => {
+                        unit_attentions += 1;
+                        if unit_attentions > UNIT_ATTENTION_RETRIES {
+                            return Err("SCSI unit attention would not clear");
+                        }
+                        serial::puts("  [xhci] unit attention asc=0x");
+                        serial::put_hexn(u64::from(sense.asc), 2);
+                        serial::puts(" ascq=0x");
+                        serial::put_hexn(u64::from(sense.ascq), 2);
+                        serial::puts(" - retrying\n");
+                    }
+                    // NOT READY: the platter is spinning up (0x04/0x01
+                    // "becoming ready", 0x04/0x02 "initializing command
+                    // required" on some bridges). Wait, bounded.
+                    0x02 => {
+                        if not_ready_polls == 0 {
+                            serial::puts("  [xhci] not ready asc=0x");
+                            serial::put_hexn(u64::from(sense.asc), 2);
+                            serial::puts(" ascq=0x");
+                            serial::put_hexn(u64::from(sense.ascq), 2);
+                            serial::puts(" - waiting for the drive\n");
+                        }
+                        not_ready_polls += 1;
+                        if not_ready_polls * NOT_READY_POLL_MS > NOT_READY_WAIT_MS {
+                            return Err("SCSI device not ready");
+                        }
+                        spin_us(NOT_READY_POLL_MS * 1000);
+                    }
+                    key => {
+                        serial::puts("  [xhci] check condition key=0x");
+                        serial::put_hexn(u64::from(key), 1);
+                        serial::puts(" asc=0x");
+                        serial::put_hexn(u64::from(sense.asc), 2);
+                        serial::puts(" ascq=0x");
+                        serial::put_hexn(u64::from(sense.ascq), 2);
+                        serial::puts("\n");
+                        return Err("SCSI command failed");
+                    }
+                }
+            }
+            CswStatus::PhaseError => {
+                // BOT §6.7.3: the device lost the plot; reset the interface
+                // (the Desynced plan is exactly that) and re-issue once.
+                phase_errors += 1;
+                if phase_errors > 1 {
+                    return Err("BOT phase error persists");
+                }
+                serial::puts("  [xhci] CSW phase error - resetting the interface\n");
+                let e = BotErr::Desynced { phase: Phase::Csw, dci: x.bulk_in_dci };
+                if !recover(x, &e) {
+                    return Err("BOT phase error");
+                }
+            }
+            CswStatus::Unknown(_) => return Err("unknown CSW status"),
+        }
+    }
+}
+
+/// `REQUEST SENSE` into `SENSE_BUF` (never the bounce buffer — the failed
+/// command's data or payload is still there and about to be retried).
+fn request_sense(x: &mut Xhci) -> Result<akuma_usb_storage::RequestSense, &'static str> {
+    let (status, moved) = bot_run(x, cdb::request_sense(), 18, phys_of(sense_buf().as_ptr()))?;
+    if status != CswStatus::Passed || moved < 14 {
+        return Err("REQUEST SENSE failed");
+    }
+    akuma_usb_storage::RequestSense::parse(&sense_buf()[..18]).ok_or("bad REQUEST SENSE response")
 }
 
 // ===========================================================================
@@ -1653,9 +1880,7 @@ pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
         let span = blocks * bl;
         let lba32 = u32::try_from(lba).map_err(|_| "LBA exceeds 32 bits")?;
 
-        if bot_run(x, cdb::read_10(lba32, blocks as u16, x.block_len), span)?.0 != CswStatus::Passed {
-            return Err("READ(10) failed");
-        }
+        scsi_io(x, cdb::read_10(lba32, blocks as u16, x.block_len), span)?;
         let take = (span - within).min(remaining);
         buf[done..done + take].copy_from_slice(&bounce()[within..within + take]);
         done += take;
@@ -1685,17 +1910,11 @@ pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
         let lba32 = u32::try_from(lba).map_err(|_| "LBA exceeds 32 bits")?;
         let take = (span - within).min(remaining);
 
-        if (within != 0 || take != span)
-            && bot_run(x, cdb::read_10(lba32, blocks as u16, x.block_len), span)?.0
-                != CswStatus::Passed
-        {
-            return Err("RMW read failed");
+        if within != 0 || take != span {
+            scsi_io(x, cdb::read_10(lba32, blocks as u16, x.block_len), span)?;
         }
         bounce_mut()[within..within + take].copy_from_slice(&data[done..done + take]);
-        if bot_run(x, cdb::write_10(lba32, blocks as u16, x.block_len), span)?.0 != CswStatus::Passed
-        {
-            return Err("WRITE(10) failed");
-        }
+        scsi_io(x, cdb::write_10(lba32, blocks as u16, x.block_len), span)?;
         done += take;
     }
     Ok(())

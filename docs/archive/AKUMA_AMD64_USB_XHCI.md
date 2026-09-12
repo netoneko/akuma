@@ -1041,3 +1041,99 @@ core, and the dead core's unacknowledged TLB shootdown is what wedges the
 BKL. `apk` itself works on the ramdisk. Full account, reproduction, and the
 suspect race:
 `AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`.
+
+## 2026-09-12, later — the dequeue move never moved, the retry queued behind the corpse, and the second was 0.31 s
+
+Three defects, each of which alone would have kept the stall from being
+survivable, found by reading the recovery path against the spec instead of
+against its own tests. All three are fixed on the trunk
+(`i-am-about-to-regret-this-joke-down-the-line`, uncommitted at time of
+writing); host tests first, the QEMU rig second, the metal third.
+
+### 1. `SET_TR_DEQUEUE` was 15. Fifteen is Stop Endpoint.
+
+xHCI Table 6-91: Reset Endpoint 14, **Stop Endpoint 15, Set TR Dequeue
+Pointer 16**. `crates/akuma-xhci/src/trb.rs` had `SET_TR_DEQUEUE = 15` from the
+driver's first commit, so every Set TR Dequeue Pointer the recovery ever
+issued was a Stop Endpoint command. Cross-checked against NetBSD's
+`xhcireg.h` (`XHCI_TRB_TYPE_STOP_EP 0x0F`, `XHCI_TRB_TYPE_SET_TR_DEQUEUE
+0x10`) before believing it.
+
+What that did on the metal, in order: Reset Endpoint on a halted endpoint
+succeeds (Halted → Stopped); the "Set TR Dequeue Pointer" that follows is a
+Stop Endpoint on a **Stopped** endpoint, which is `cc=0x13 CONTEXT_STATE_ERROR`
+— the exact code the 2026-09-11 photograph recorded on that step; the retry's
+doorbell restarts the ring **at the stalled TRB**, re-running the dead TD
+ahead of the retry. So the 57/57 "recoveries" of 2026-09-11 recovered the
+device (the BOT reset and clear-halts are real) and never once moved the ring.
+
+How the test missed it: `set_tr_dequeue_pointer_encoding` asserted
+`trb_type(s[3]) == trb::ty::SET_TR_DEQUEUE` — the builder against its own
+constant, true for any value. `trb_type_table_is_the_specs` now pins the
+whole `ty` table and the recovery-path completion codes as **literals**.
+
+### 2. A timed-out TD was retried *behind itself*
+
+`recovery_plan(TimedOut, endpoint not halted)` returned the empty plan — a
+plain re-issue — on the 2026-09-11 reasoning that a slow endpoint should be
+left alone. But the timed-out TD is still live in the ring, and a transfer
+ring is strictly ordered: the retry's TRBs sit behind the dead TD and do not
+run until it completes, and when the device does answer late it answers the
+*old* TRB into the *shared* bounce buffer. The 2026-09-11 console shows the
+whole sequence: `discarded transfer event: cc=1` (the old CBW completing
+late), the retry CBW landing on a device mid-command, a CSW desync. Worse,
+for a data-phase timeout both the dead data TRB and the retry's point at
+`BOUNCE_BUF`, so the device's 13-byte CSW can land in the retry's 64 KiB data
+TRB as a *short, successful* data phase — and `read_bytes` checked only
+`status == Passed`, never the byte count, and copied the full span out of the
+bounce buffer. That is a filesystem block with `USBS…` at the front going
+into the ext2 cache, which is the most economical explanation on record for
+`lib`/`var`/`public` vanishing after a stall while `readdir` still listed them.
+The "BOT reset makes the next command stall too" note of 2026-09-11 was this
+mechanism, misattributed.
+
+Fix, spec-shaped: the plan for a running-endpoint timeout is now **Stop
+Endpoint** (the only legal abort of a running TD; `trb::stop_endpoint` is
+new) → BOT Mass Storage Reset → `CLEAR_FEATURE(ENDPOINT_HALT)` ×2 → Set TR
+Dequeue Pointer to the enqueue position. The host model
+(`akuma-xhci::device`) gained Stop Endpoint with its legality (Running only)
+and tightened Set TR Dequeue Pointer to Stopped/Error only — on **Halted**
+it is a Context State Error, Figure 4-4's only exit from Halted being Reset
+Endpoint. The 19,683-script sweep still records zero illegal steps;
+`a_timeout_aborts_the_live_td_before_the_retry` pins the transition trace
+`run→stop→run`.
+
+And the byte count is checked: `scsi_io` (new, `amd64/src/xhci.rs`) refuses
+a `Passed` CSW whose data phase moved fewer bytes than asked
+(`short transfer: device moved N of M bytes`), asks `REQUEST SENSE` on
+`Failed` and retries on UNIT ATTENTION (the device raises it after every
+reset — including *our* BOT reset, which is why a recovered command could
+still come back `Failed`) and on NOT READY (spin-up, bounded 12 s), and runs
+the interface reset once on a phase error. `REQUEST SENSE` lands in its own
+`SENSE_BUF`, never the bounce buffer that holds the payload the retry needs.
+`READ CAPACITY` goes through the same layer.
+
+### 3. The budgets were TSC ticks against an assumed 1 GHz
+
+`BUDGET = 1_000_000_000` ticks "assuming >= 1 GHz". `lapic::calibrate` now
+reads the TSC across the same 10 ms PIT gate it already uses for the LAPIC,
+and the box says: **`tsc 3192 MHz`**. The one-second transfer budget was
+0.31 s on this machine, against a drive that needs seconds to come off
+standby. The driver's budgets are now real time through `lapic::tsc_hz()`
+(fallback 4 GHz when no PIT — never *shorter* than asked): commands and
+bring-up polls 1 s, control transfers 5 s, bulk phases **10 s** (Linux's
+`sd` gives a command 30 s; a 2.5" drive spins up in 3–8 s). The timeout line
+now says how long it waited: `transfer timeout: data after 10000 ms`.
+
+### Verified before the metal
+
+- `cargo test -p akuma-xhci`: 14 + 9 + 28 pass, including the sweep.
+- `amd64/run-xhci.sh`: all 11 `xhci:` checks `[OK]`, 397 passed / 4 FAILED —
+  the same 4 as the baseline run of HEAD in the same rig (`fs: ext2 mounted`,
+  `elf:`, `spawn:`, `mmap: lazy`), so not this change. The rig prints
+  `tsc 997 MHz` under TCG.
+- clippy clean on `akuma-xhci` (host, all targets) and `akuma-amd64`.
+
+### Metal
+
+See the next section, written after the soak.

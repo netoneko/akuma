@@ -192,14 +192,31 @@ impl SimDevice {
         }
     }
 
-    /// Controller-side: move the dequeue past the failed TD. Legal only on a
-    /// non-running endpoint (spec §4.6.10); the ring restart is what a
-    /// "Reset Endpoint without this" recovery forgot.
-    pub fn set_tr_dequeue_pointer(&mut self, ep: usize) {
+    /// Controller-side: abort a *running* endpoint's live TD (spec §4.6.9
+    /// Stop Endpoint). Running -> Stopped; on any other state the controller
+    /// answers Context State Error, counted here as an illegal step. This is
+    /// the step a timeout on a running endpoint needs before its dequeue can
+    /// legally move — a plain retry behind the live TD was the 2026-09-12
+    /// double-TD bug.
+    pub fn stop_endpoint(&mut self, ep: usize) {
         if self.ep[ep].state == EpState::Running {
-            self.illegal_steps += 1;
+            self.transition(ep, EpState::Stopped);
         } else {
+            self.illegal_steps += 1;
+        }
+    }
+
+    /// Controller-side: move the dequeue past the failed TD. Legal only in
+    /// the Stopped or Error state (spec §4.6.10, endpoint state machine
+    /// Figure 4-4): on Running the ring is live, and on **Halted** the only
+    /// exit is Reset Endpoint — a Set TR Dequeue Pointer there is a Context
+    /// State Error, not a move. The ring restart is what a "Reset Endpoint
+    /// without this" recovery forgot.
+    pub fn set_tr_dequeue_pointer(&mut self, ep: usize) {
+        if matches!(self.ep[ep].state, EpState::Stopped | EpState::Error) {
             self.dequeues_moved += 1;
+        } else {
+            self.illegal_steps += 1;
         }
     }
 
@@ -342,6 +359,7 @@ pub fn drive_command(dev: &mut SimDevice, answer: Script<'_>, failed_dci: u8) ->
 fn exec_step(dev: &mut SimDevice, failed_ep: usize, step: RecoveryStep) {
     match step {
         RecoveryStep::ResetEndpoint { .. } => dev.reset_endpoint(failed_ep),
+        RecoveryStep::StopEndpoint { .. } => dev.stop_endpoint(failed_ep),
         RecoveryStep::SetTrDequeuePointer { .. } => dev.set_tr_dequeue_pointer(failed_ep),
         RecoveryStep::BotMassStorageReset => dev.mass_storage_reset(),
         RecoveryStep::ClearHalt { ep_addr } => {

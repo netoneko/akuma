@@ -29,7 +29,16 @@ pub mod ty {
     pub const CONFIGURE_ENDPOINT: u32 = 12;
     pub const EVALUATE_CONTEXT: u32 = 13;
     pub const RESET_ENDPOINT: u32 = 14;
-    pub const SET_TR_DEQUEUE: u32 = 15;
+    /// 15 — Stop Endpoint. **Not** Set TR Dequeue Pointer.
+    ///
+    /// Until 2026-09-12 `SET_TR_DEQUEUE` was 15, so every "dequeue move" the
+    /// amd64 recovery ever issued was in fact a Stop Endpoint, and the ring
+    /// never left the failed TD. The host test that pinned the encoding
+    /// compared against this constant rather than the spec's literal, which
+    /// is how it survived — `trb_type_table_is_the_specs` now pins the
+    /// literals.
+    pub const STOP_ENDPOINT: u32 = 15;
+    pub const SET_TR_DEQUEUE: u32 = 16;
     pub const NO_OP_CMD: u32 = 23;
     pub const TRANSFER_EVENT: u32 = 32;
     pub const COMMAND_COMPLETION_EVENT: u32 = 33;
@@ -55,8 +64,16 @@ pub mod cc {
     pub const RING_OVERRUN: u8 = 15;
     pub const EVENT_RING_FULL: u8 = 21;
     pub const COMMAND_RING_STOPPED: u8 = 24;
+    /// 19 — a command issued against an endpoint whose state forbids it
+    /// (Reset Endpoint on a running endpoint, Set TR Dequeue Pointer on a
+    /// running or halted one, Stop Endpoint on one already stopped).
+    pub const CONTEXT_STATE_ERROR: u8 = 19;
     pub const COMMAND_ABORTED: u8 = 25;
+    /// 26 / 27 — the Transfer Event a Stop Endpoint command generates for the
+    /// TD it interrupted (27 when the transferred length could not be
+    /// determined). Expected noise right after an abort, not a failure.
     pub const STOPPED: u8 = 26;
+    pub const STOPPED_LENGTH_INVALID: u8 = 27;
 }
 
 const CYCLE: u32 = 1 << 0;
@@ -143,13 +160,39 @@ pub fn reset_endpoint(slot_id: u8, endpoint_dci: u8) -> [u32; 4] {
     [0, 0, 0, set_type(control, ty::RESET_ENDPOINT)]
 }
 
-/// Set TR Dequeue Pointer command — the second half of recovering a halted endpoint.
+/// Stop Endpoint command (xHCI §4.6.9) — takes a **running** endpoint to the
+/// Stopped state, abandoning the TD it was working on.
 ///
-/// [`reset_endpoint`] clears the halt; without this the endpoint's dequeue stays
-/// parked on the TRB that stalled and every later transfer times out in its
-/// first phase. `dequeue_phys` is where the controller should resume — usually
-/// the transfer ring's enqueue position — and `dequeue_cycle` is the cycle bit a
-/// TRB at that address carries ([`ProducerRing::cycle`]).
+/// This is the abort primitive for a transfer that *timed out*: the TD is still
+/// live in the ring, and enqueuing a retry behind it hands the device two
+/// commands back to back — the second CBW lands while the device is still in
+/// the first command's data phase, and whatever it sends next arrives in the
+/// wrong buffer (a 13-byte CSW landing in the retry's 64 KiB data TRB reads
+/// as a successful short data phase). Stop first, then move the dequeue past
+/// the dead TD with [`set_tr_dequeue_pointer`], then retry on a clean ring.
+/// Legal only on a Running endpoint; on Stopped/Halted/Disabled the controller
+/// answers `cc::CONTEXT_STATE_ERROR`. The controller emits a Transfer Event
+/// (`cc::STOPPED` / `cc::STOPPED_LENGTH_INVALID`) for the interrupted TD, then
+/// the Command Completion Event.
+///
+/// The Suspend bit (control bit 23) is left clear: the endpoint is stopped to
+/// be restarted, not parked.
+#[must_use]
+pub fn stop_endpoint(slot_id: u8, endpoint_dci: u8) -> [u32; 4] {
+    let control = (u32::from(slot_id) << 24) | (u32::from(endpoint_dci) << 16);
+    [0, 0, 0, set_type(control, ty::STOP_ENDPOINT)]
+}
+
+/// Set TR Dequeue Pointer command (xHCI §4.6.10) — the second half of
+/// recovering a halted **or stopped** endpoint.
+///
+/// [`reset_endpoint`] clears a halt and [`stop_endpoint`] aborts a live TD;
+/// both leave the endpoint Stopped with its dequeue still parked on the failed
+/// TRB, so every later transfer would time out in its first phase. This moves
+/// it. `dequeue_phys` is where the controller should resume — the transfer
+/// ring's enqueue position — and `dequeue_cycle` is the cycle bit a TRB at that
+/// address carries ([`ProducerRing::cycle`]). Legal only in the Stopped or
+/// Error state; on Running *or Halted* the answer is `cc::CONTEXT_STATE_ERROR`.
 #[must_use]
 pub fn set_tr_dequeue_pointer(slot_id: u8, endpoint_dci: u8, dequeue_phys: u64, dequeue_cycle: bool) -> [u32; 4] {
     // Parameter bits 3:0 are DCS (bit 0) + reserved — the pointer is 16-byte

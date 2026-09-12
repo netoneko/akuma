@@ -155,17 +155,46 @@ fn a_stall_on_either_ring_produces_its_own_plan() {
 }
 
 #[test]
-fn a_timeout_on_a_running_endpoint_is_a_plain_retry() {
-    // The `ls` regression, 2026-09-11: every post-idle command timed out once
-    // and the recovery ran the full BOT Mass Storage Reset — whose scrubbed
-    // transfer state made the NEXT command stall too, so a directory listing
-    // stalled through every entry. A timeout on a non-halted endpoint (the
-    // late completions arrive as `cc=1` SUCCESS) must touch nothing.
+fn a_timeout_on_a_running_endpoint_aborts_the_live_td() {
+    // Until 2026-09-12 this was the empty plan — "a slow endpoint, leave it
+    // alone, just retry". The retry's TRBs then sat BEHIND the still-live TD
+    // in a strictly ordered ring: the late completion was for the old TRB
+    // (`discarded transfer event: cc=1` on the metal), the second CBW hit the
+    // device mid-command, and the device's 13-byte CSW could land in the
+    // retry's data TRB as a "successful" short data phase. The `ls`
+    // regression blamed on the BOT reset was this. Now: stop the endpoint
+    // (the only legal abort of a running TD), reset the device's BOT state,
+    // clear both halts, move the dequeue past the dead TD — then retry.
     let plan = recovery_plan(OutcomeKind::TimedOut, false, BULK_OUT_DCI, 0x81, 0x02);
-    assert!(
-        plan.iter().all(|s| matches!(s, RecoveryStep::None)),
-        "empty plan: the executor just retries"
-    );
+    let expected = [
+        RecoveryStep::StopEndpoint { dci: BULK_OUT_DCI },
+        RecoveryStep::BotMassStorageReset,
+        RecoveryStep::ClearHalt { ep_addr: 0x81 },
+        RecoveryStep::ClearHalt { ep_addr: 0x02 },
+        RecoveryStep::SetTrDequeuePointer { dci: BULK_OUT_DCI },
+    ];
+    assert_eq!(plan, expected);
+    // No Reset Endpoint: the endpoint is not halted, and Reset Endpoint on a
+    // running one is a Context State Error (the 2026-09-11 `cc=0x13`).
+    assert!(plan.iter().all(|s| !matches!(s, RecoveryStep::ResetEndpoint { .. })));
+}
+
+#[test]
+fn only_a_timeout_on_a_running_endpoint_stops_it() {
+    // Stop Endpoint is legal on Running only. A halted endpoint (stall, or a
+    // timeout whose context reads Halted) takes Reset Endpoint instead; a
+    // desync touches no controller state at all.
+    for (kind, halted) in [
+        (OutcomeKind::Stalled, true),
+        (OutcomeKind::TimedOut, true),
+        (OutcomeKind::Desynced, false),
+    ] {
+        let plan = recovery_plan(kind, halted, BULK_IN_DCI, 0x81, 0x02);
+        assert!(
+            plan.iter().all(|s| !matches!(s, RecoveryStep::StopEndpoint { .. })),
+            "{kind:?}/halted={halted}: Stop Endpoint only belongs to a running-endpoint timeout"
+        );
+    }
 }
 
 #[test]

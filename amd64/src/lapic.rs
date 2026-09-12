@@ -308,7 +308,9 @@ pub fn init() -> bool {
         serial::puts("us (");
         // counts per 10 ms at divide-16 -> the APIC's own input, in kHz.
         serial::put_dec(u64::from(counts) * 16 / 10_000);
-        serial::puts(" MHz)\n");
+        serial::puts(" MHz); tsc ");
+        serial::put_dec(tsc_hz() / 1_000_000);
+        serial::puts(" MHz\n");
     } else {
         serial::puts("[WARN] no PIT to calibrate against; tick period is a GUESS ");
         serial::puts("and every network timeout is scaled by it\n");
@@ -363,6 +365,24 @@ static TIMER_COUNT: core::sync::atomic::AtomicU32 =
 
 /// Whether [`calibrate`] found a PIT and succeeded.
 static CALIBRATED: AtomicBool = AtomicBool::new(false);
+
+/// The TSC rate in Hz, measured across the same PIT gate as the LAPIC count;
+/// 0 until [`calibrate`] succeeds. Read by [`tsc_hz`].
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// The TSC frequency in Hz, or 0 when no PIT was there to measure it against.
+///
+/// Every polled-hardware budget in this kernel that is written in TSC ticks
+/// (the xHCI driver's transfer timeouts) converts through this. Before it
+/// existed the USB driver assumed ">= 1 GHz" and called 1e9 ticks one second;
+/// on the trashcan's 3.2 GHz Haswell that second was 0.31 s, and a drive
+/// answering within a real half-second was a "transfer timeout"
+/// (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § "Clock finding"). A caller that
+/// gets 0 must pick a conservative rate itself; this function does not guess.
+#[must_use]
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
 
 /// The tick period the timer is calibrated to, in microseconds. `net::uptime_us`
 /// multiplies by this same number, so the two must agree — hence one constant.
@@ -440,6 +460,11 @@ pub fn calibrate() -> bool {
 
         // Gate high: channel 2 starts counting now, and so does the measurement.
         crate::port::outb(PORT_61, (saved & !SPEAKER) | GATE);
+        // The TSC rides along on the same gate — one PIT period measures both
+        // the LAPIC count and the TSC count, so the two clocks this kernel
+        // keeps agree about what 10 ms is. RDTSC is unprivileged and present
+        // on every x86_64 part.
+        let tsc0 = core::arch::x86_64::_rdtsc();
 
         // A freshly gated mode-0 count holds its output LOW until it expires.
         // If it is already high we are not talking to a PIT, whatever
@@ -462,6 +487,7 @@ pub fn calibrate() -> bool {
             core::hint::spin_loop();
         }
         let remaining = read(REG_TIMER_CUR);
+        let tsc1 = core::arch::x86_64::_rdtsc();
         write(REG_TIMER_INIT, 0);
         crate::port::outb(PORT_61, saved);
 
@@ -474,6 +500,15 @@ pub fn calibrate() -> bool {
             return false;
         }
         TIMER_COUNT.store(elapsed, Ordering::Relaxed);
+        // Ticks in one US_PER_TICK_TARGET period -> Hz. Same plausibility
+        // logic as the LAPIC: a TSC that "ran" fewer ticks than a 100 MHz
+        // part would in 10 ms did not measure anything, and stays 0 so the
+        // consumer falls back to its conservative assumption.
+        let tsc_ticks = tsc1.wrapping_sub(tsc0);
+        let hz = tsc_ticks * 1_000_000 / u64::from(US_PER_TICK_TARGET);
+        if hz >= 100_000_000 {
+            TSC_HZ.store(hz, Ordering::Relaxed);
+        }
         CALIBRATED.store(true, Ordering::Relaxed);
     }
     true

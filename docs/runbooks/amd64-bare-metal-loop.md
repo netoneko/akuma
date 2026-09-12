@@ -155,12 +155,17 @@ caller reading only stdout sees an empty success.
   (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-10).
 
   **The socket fixes the boot, not the device.** On SuperSpeed the root mounts
-  and the suite goes green, and then a bulk transfer stalls somewhere later and
-  the driver cannot recover from it — `[xhci] transfer timeout: CBW` forever
-  after, every read off the root failing, `sshd` unable to read
-  `authorized_keys`. **This is why the RAM image path exists**, and it is the
-  reason to expect a persistent root to be usable for a session rather than
-  indefinitely, until the recovery gap is closed.
+  and the suite goes green; a bulk transfer may still stall later. Until
+  2026-09-12 the driver could not recover from one — `[xhci] transfer
+  timeout: CBW` forever after, every read off the root failing, `sshd` unable
+  to read `authorized_keys` — which is why the RAM image path exists. The
+  recovery is now real (Stop Endpoint / Reset Endpoint, a Set TR Dequeue
+  Pointer that is actually type 16, BOT reset, `REQUEST SENSE` retries, a
+  10 s budget in real seconds); the log vocabulary for reading it is in
+  `docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-12, later. A `transfer
+  timeout` followed by `stop ep` / `set tr dequeue` and a served command is
+  the good outcome; `short transfer: device moved` or `check condition` is
+  the disk saying no and worth a look.
 - **A persistent root that locks you out means the mount worked.** With
   `root=/dev/sda1` really mounted, `sshd` reads
   `etc/sshd/authorized_keys` **from the partition**, not from the RAM image. A
@@ -516,11 +521,21 @@ EP0, which the controller answers with `TRB Error` — on its first run.
 usb-storage never stalls, so nothing down there is exercised — which is how
 `ep_state`'s `(dw0 >> 2) & 0x7` decode (RUNNING read as Disabled, `halted`
 unreachable, Reset Endpoint never once executing on the metal) survived a
-week. That path is covered where it can be: `cargo test -p akuma-xhci` runs
-`device::drive_command`'s sweep (19,683 scripted behaviors, termination +
-legality) and the differential that reproduces the misread wedge. Run it
-before every metal boot of a recovery change. Full account:
-`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-12.
+week, and how a Set TR Dequeue Pointer encoded as TRB type 15 (Stop
+Endpoint) survived from the first commit. That path is covered where it can
+be: `cargo test -p akuma-xhci` runs `device::drive_command`'s sweep (19,683
+scripted behaviors, termination + legality), the differential that
+reproduces the misread wedge, and `trb_type_table_is_the_specs`, which pins
+the TRB types as **literals** — a builder test that compares against the
+crate's own constant is true for any value. Run it before every metal boot
+of a recovery change. Full account:
+`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-12 and § 2026-09-12, later.
+
+**A byte-exact readback over ssh is impossible on this target**: the session
+channel turns LF into CRLF on output (measured 2026-09-12: 25 165 824 bytes
+on disk, 25 264 169 over `ssh akuma cat`, one extra byte per 256). Verify
+disk contents with `/bin/busybox md5sum` *on the box*, never by hashing what
+`cat` sends you.
 
 What it models is a *correct* controller, so it catches every way the driver is
 wrong about the spec and none of the ways a particular controller is wrong about

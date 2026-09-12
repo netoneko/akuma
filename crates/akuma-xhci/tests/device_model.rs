@@ -88,12 +88,59 @@ fn a_slow_device_that_never_answers_still_terminates() {
     assert_eq!(
         dev.ep[EP_IN].state,
         EpState::Running,
-        "a plain-retry timeout leaves the context alone"
+        "the last retry rang the doorbell; the cap gives up without touching the ring again"
     );
-    assert_eq!(dev.illegal_steps, 0);
+    assert_eq!(dev.illegal_steps, 0, "Stop Endpoint on Running, Set TR Dequeue on Stopped: all legal");
+    // Two recovery cycles (timeouts get two), and each one aborted the live
+    // TD and moved the dequeue past it before the retry.
+    assert_eq!(dev.dequeues_moved, 2);
     // The loop stops at the first failing phase (Cbw), so a phase is only
     // ever scripted as far as it got: 3 attempts, one phase each.
     assert_eq!(calls.get(), 3);
+}
+
+#[test]
+fn a_timeout_aborts_the_live_td_before_the_retry() {
+    // The 2026-09-12 double-TD bug, as a transition trace. A running endpoint
+    // never answers the data phase (a drive waking from standby); the plan
+    // must take it Running -> Stopped (Stop Endpoint: the abort), move the
+    // dequeue while Stopped, and the retry's doorbell takes it back to
+    // Running — on a ring that no longer carries the dead TD.
+    let dev = &mut SimDevice::new();
+    let v = drive_command(dev, &mut |attempt, phase| match (attempt, phase) {
+        (0, Phase::Data) => SimAnswer::Nothing,
+        _ => SimAnswer::Done,
+    }, BULK_IN_DCI);
+    assert_eq!(v, Verdict::Served);
+    assert_eq!(dev.illegal_steps, 0);
+    assert_eq!(dev.dequeues_moved, 1, "the dequeue moved past the timed-out TD exactly once");
+    let seen: Vec<_> = dev.recorded().map(|t| (t.from, t.to)).collect();
+    assert_eq!(
+        seen,
+        [(EpState::Running, EpState::Stopped), (EpState::Stopped, EpState::Running)],
+        "stop (abort), then the retry's doorbell — no halt, no reset"
+    );
+}
+
+#[test]
+fn a_dequeue_move_on_a_halted_endpoint_is_illegal() {
+    // Figure 4-4: Halted's only exit is Reset Endpoint. A Set TR Dequeue
+    // Pointer there is a Context State Error on the controller — and the
+    // model must say so, or a plan that skipped Reset Endpoint would look
+    // like it moved the ring.
+    let dev = &mut SimDevice::new();
+    dev.set_state(EP_OUT, EpState::Halted);
+    dev.set_tr_dequeue_pointer(EP_OUT);
+    assert_eq!(dev.illegal_steps, 1);
+    assert_eq!(dev.dequeues_moved, 0);
+    // Stop Endpoint is Running-only too.
+    dev.stop_endpoint(EP_OUT);
+    assert_eq!(dev.illegal_steps, 2);
+    // The legal path: Reset Endpoint (Halted -> Stopped), then the move.
+    dev.reset_endpoint(EP_OUT);
+    dev.set_tr_dequeue_pointer(EP_OUT);
+    assert_eq!(dev.illegal_steps, 2, "no new illegal step");
+    assert_eq!(dev.dequeues_moved, 1);
 }
 
 #[test]
