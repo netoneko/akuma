@@ -456,6 +456,31 @@ fn wake_group(proc_slot: usize) {
     unsafe {
         for t in (*threads()).iter().flatten() {
             if t.proc_slot == proc_slot {
+                // **Waking is not interrupting, and the difference is the
+                // whole of `DRAIN INCOMPLETE`.**
+                //
+                // `sched::wake` makes a parked thread runnable. A thread parked
+                // in the *futex* loop is then fine: that loop re-checks
+                // `should_leave_now` and leaves. A thread parked anywhere else
+                // — a pipe `read`, `poll`, the console — wakes, re-evaluates
+                // its **own** condition (still no data), and parks again. It
+                // never returns to syscall entry, which is the only other place
+                // `should_leave_now` is tested, so it never learns the group is
+                // exiting and `drain` spins out its 100 000 rounds and gives up.
+                //
+                // `request_thread_kill` arms `PENDING_KILL`, which is what
+                // `should_interrupt_blocking_syscall` reads — the one hook the
+                // park loop consults (`akuma_threading::schedule_blocking`). So
+                // the sibling's wait returns `EINTR`, unwinds to syscall entry,
+                // and sees the flag. That is also what Linux does: `exit_group`
+                // is a group-wide kill, not a group-wide nudge.
+                //
+                // Found by `cargo`: `rustc` exits with two threads parked on
+                // its jobserver pipe, drain gives up, the process is never
+                // reaped, and the parent waits forever — a build that stops
+                // dead at a random crate with nothing in cargo's own log
+                // (`docs/archive/RUST_TOOLCHAIN_AMD64.md` § session 4).
+                akuma_threading::request_thread_kill(t.task);
                 crate::sched::wake(t.task);
             }
         }

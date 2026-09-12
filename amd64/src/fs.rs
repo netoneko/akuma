@@ -246,7 +246,8 @@ impl BlockDevice for RootDevice {
     }
 }
 
-/// Wall-clock source for inode timestamps, in seconds since the Unix epoch.
+/// Wall-clock source for inode timestamps, in **microseconds** since the Unix
+/// epoch — the unit `Ext2Filesystem::new` asks for.
 ///
 /// `clock::now_us` is fed by the SNTP client that self-heals in the netpoll
 /// daemon (`docs/archive/AKUMA_SELF_HEALING_PORT.md` § "The wall clock synced
@@ -254,8 +255,37 @@ impl BlockDevice for RootDevice {
 /// still the honest answer `Ext2Filesystem::new` documents `|| 0` for, not a
 /// guess dressed up as one — so an early write before the clock sets is stamped
 /// 1970 and every write after it is stamped correctly.
-fn wall_clock_secs() -> u64 {
-    crate::clock::now_us() / 1_000_000
+///
+/// # It divided by a million twice, and that is why `cargo` rebuilt everything
+///
+/// This was `wall_clock_secs`, returning **seconds**, handed to a parameter
+/// named `utc_time_us` whose consumer is `Ext2Filesystem::current_time`:
+///
+/// ```text
+/// fn current_time(&self) -> u32 { ((self.time_fn)() / 1_000_000) as u32 }
+/// ```
+///
+/// So every inode written by this kernel was stamped `epoch_seconds / 1e6` —
+/// **1789** at the time of writing, i.e. 1970-01-01T00:29:49Z, and *constant*
+/// for eleven and a half days at a stretch. A `u64` of seconds and a `u64` of
+/// microseconds are the same type, so nothing could catch it but the units in
+/// the two names, which disagreed.
+///
+/// The cost is `cargo`. Its fingerprinting is **mtime-based**: source files
+/// staged from the host carry real 2026 mtimes, every artifact this kernel
+/// writes carries 1970, so every output is older than its input and **nothing
+/// is ever up to date**. A no-op rebuild recompiles the world, which on a
+/// self-host loop is the difference between a build and a career.
+/// `proposals/NEXT_AGENT_AMD64_SELFHOST_FIRST_BUILD.md` § 3 ranked the clock
+/// first among the three things most likely to stop `cargo`, and named the
+/// test that finds it: *does a file written now have a plausible mtime?*
+///
+/// The test that separates this from the other candidate (an mtime tracking
+/// **uptime**, which is what 1789 also looks like on a box that has been up
+/// 1789 seconds) is to write two files two minutes apart: uptime advances,
+/// `epoch/1e6` does not.
+fn wall_clock_us() -> u64 {
+    crate::clock::now_us()
 }
 
 /// Point [`akuma_vfs_glue`] at this kernel's four facts and create the mount
@@ -369,7 +399,7 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
 
     // Not an error worth halting for: a raw disk with no filesystem is a
     // legitimate thing to be handed, and the message says which happened.
-    let Ok(fs) = Ext2Filesystem::new(device, wall_clock_secs) else {
+    let Ok(fs) = Ext2Filesystem::new(device, wall_clock_us) else {
         serial::puts("  fs:   ");
         serial::puts(name);
         serial::puts(" holds no readable ext2 image\n");
