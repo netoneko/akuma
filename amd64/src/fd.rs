@@ -1098,6 +1098,53 @@ pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
     fs::read_at_open_file(path.as_deref().unwrap_or(""), mount_id, inode, offset, dst).ok()
 }
 
+/// The file identity a **demand-paged mapping** must remember: `(mount_id,
+/// inode, size)`.
+///
+/// `None` for anything that cannot be mapped lazily — a descriptor that is not a
+/// file, or one `open(2)` resolved no inode for (`inode == 0`, "read by path").
+/// A lazy mapping outlives the descriptor that created it: `ld.so` `mmap`s a
+/// shared object and closes the fd immediately, and every fault after that has
+/// no fd to ask. The pair is what [`akuma_vfs_glue::fs::read_at_open_file`]
+/// needs to answer without one, and it is the same pair the page cache is keyed
+/// by — an inode number alone does not name a file across two mounts.
+///
+/// The **size** is read here, once, rather than at each fault: it is where the
+/// file's data stops, and a mapping may legitimately extend past it — `mmap(2)`
+/// specifies the remainder of the last page, and every page after it, as zero.
+/// A fault path that re-`stat`ed to learn that would pay a metadata read per
+/// page for a number that, for a `MAP_PRIVATE` mapping, is not allowed to
+/// change the mapping's contents anyway.
+#[must_use]
+pub fn file_identity(fd: u64) -> Option<(u32, u32, usize)> {
+    // A `/dev` node has no inode to map from, exactly as in `is_regular_file`.
+    if dev_node_of(fd).is_some() {
+        return None;
+    }
+    let (path, mount_id, inode) = table_with(fd, |d| match d {
+        FileDescriptor::File(f) => Some((f.path.clone(), f.mount_id(), f.inode())),
+        _ => None,
+    })??;
+    if inode == 0 {
+        return None;
+    }
+    let meta = akuma_vfs_glue::fs::metadata_open_file(&path, mount_id, inode).ok()?;
+    Some((mount_id, inode, meta.size as usize))
+}
+
+/// Read from a file **by inode**, with no descriptor involved.
+///
+/// [`file_bytes_at`]'s counterpart for a mapping whose fd is long gone. The two
+/// end at the same `read_at_open_file`; the difference is only where the
+/// identity comes from, and that is the whole point — see [`file_identity`].
+#[must_use]
+pub fn file_bytes_by_inode(mount_id: u32, inode: u32, offset: usize, dst: &mut [u8]) -> Option<usize> {
+    if inode == 0 {
+        return None;
+    }
+    fs::read_at_open_file("", mount_id, inode, offset, dst).ok()
+}
+
 /// Is `fd` a regular file — something `mmap` can back a mapping with?
 ///
 /// Separate from [`file_bytes_at`] because `mmap` has to refuse a socket, a pipe

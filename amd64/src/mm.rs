@@ -101,7 +101,7 @@ use akuma_mmu::{LeafAction, PteProt};
 
 use crate::phys::phys_ptr;
 use crate::usermode;
-use akuma_mmap::{MmapRegion, PhysFrame, Prot};
+use akuma_mmap::{FileBacking, MmapRegion, PhysFrame, Prot};
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use alloc::vec::Vec;
@@ -353,11 +353,66 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // inside it. A `MAP_SHARED|MAP_ANONYMOUS` region is marked as such —
     // `fork` must share it by identity rather than copy-on-write, or a child's
     // write becomes invisible to the parent.
+    // **A read-only file mapping is demand-paged** (2026-09-13), which is the
+    // single largest thing this target was doing differently from the AArch64
+    // kernel and the reason a `cargo` build here was memory- and I/O-bound.
+    //
+    // Eagerly, `mmap`ping `librustc_driver.so` allocated ~76 000 frames and read
+    // 300 MB off ext2 before the call returned — for a library the linker then
+    // touches a few megabytes of. Every page of that was paid for twice: once in
+    // wall-clock inside the `mmap` (measured 2.2 µs/page, holding the BKL, which
+    // is where the `[BKL] stuck … tag=9` storms came from) and once in physical
+    // memory that could not be reclaimed while the mapping lived.
+    //
+    // What makes it possible is the record below: `MmapRegion::file` remembers
+    // *which* file and *where in it*, so [`fault_in`] can answer a page later.
+    // The identity is `(mount_id, inode)` and not the fd — `ld.so` closes the
+    // descriptor the moment the mapping exists, and every fault after that has
+    // no fd to ask.
+    //
+    // Gated on the same `akuma_config::MMAP_FILE_BACKED_LAZY` the AArch64 kernel
+    // reads, and `plan.file_lazy_eligible`, which excludes writable `MAP_SHARED`
+    // — refused outright above on this target. A file with no inode identity
+    // (`file_identity` answers `None`) stays eager: there is nothing to fault
+    // against.
+    let lazy_file: Option<FileBacking> = if akuma_config::MMAP_FILE_BACKED_LAZY
+        && plan.file_lazy_eligible
+    {
+        crate::fd::file_identity(fd).map(|(mount_id, inode, size)| FileBacking {
+            mount_id,
+            inode,
+            offset: offset as usize,
+            // What is left of the file from this mapping's own offset — the
+            // rest of the mapping is zero-fill. A mapping that starts past EOF
+            // is all zeros, which is what `mmap(2)` says and what
+            // `saturating_sub` gives.
+            filesz: size.saturating_sub(offset as usize),
+        })
+    } else {
+        None
+    };
+
     let mut region = MmapRegion::inherited_with_prot(base, pages, region_prot);
     if plan.shared_anon {
         region = region.shared_anon();
     }
+    if let Some(file) = lazy_file {
+        // The pin **before** the region is published: from the moment a fault
+        // can reach this mapping, the inode it names has to be one the
+        // filesystem will not free and reissue under it. That is root cause #2
+        // of the AArch64 self-host `rustc` ICE, arriving here with the lazy path
+        // that makes it reachable (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md`).
+        pin_mapping_inode(file.inode);
+        region = region.file_backed(file);
+    }
     usermode::with_current_regions(|regions| regions.push(region));
+
+    if lazy_file.is_some() {
+        // Nothing is allocated and nothing is read. `fault_in` fills pages from
+        // the file as they are touched, which for a shared object is a few per
+        // cent of it.
+        return base as u64;
+    }
 
     // **Pinned divergence: a `MAP_SHARED | MAP_ANONYMOUS` mapping is never lazy
     // here**, whatever `plan` says. Such a region is shared with a `fork` child
@@ -388,21 +443,101 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // them this loop holding the BKL; this print says how long one mmap
     // actually holds it and at which file sizes the cost sits.
     let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-    for i in 0..pages {
-        let va = base + i * PAGE_SIZE as usize;
-        let filled = match file_source {
-            Some((fd, off)) => {
-                populate_file_page(va, region_prot, fd, off + i * PAGE_SIZE as usize)
-            }
-            None => populate_page(va, region_prot),
-        };
-        if !filled {
-            // Out of memory partway through. Unlike the pre-region version,
-            // which leaked the pages it had already mapped because it had no
-            // record of them, this can undo exactly what it did.
-            unmap_range(base, base + byte_len);
-            return errno::ENOMEM;
+    // **File fills are batched.** One `file_bytes_at` call per 4 KiB page made
+    // ext2 re-resolve the inode, re-derive block mappings and allocate its
+    // `phys_blocks` scratch `Vec` per page — the measured 2.2 µs/page (8 MB in
+    // 4.4 ms) was mostly that fixed cost, paid 76 000 times for one
+    // `librustc_driver` mapping. Reading a 64 KiB chunk and fanning it out to
+    // 16 frames amortizes it away; a transient bounded `Vec`, one per file
+    // mapping, is the only allocation added.
+    //
+    // The chunk read answers the same bytes the per-page reads did, and that
+    // equivalence rests on two things this loop must do and the per-page path
+    // got for free:
+    //
+    // - **The buffer carries its own zeros.** `file_bytes_at` takes a `&mut
+    //   [u8]` and fills a prefix; `populate_file_page` zeroed the frame first,
+    //   so a short answer at EOF left zeros behind it. Here the buffer is
+    //   reused across chunks, so anything past the `n` bytes read is the
+    //   *previous* chunk's data unless it is cleared — the file would be
+    //   mapped with a 60 KiB slice of itself repeated at the tail. Cleared
+    //   below on every read, including the `n == 0` whole-chunk-past-EOF case.
+    // - **A `Vec` with reserved capacity is still empty.** `try_reserve` sets
+    //   capacity, not length, and `&mut v` derefs to a zero-length slice: the
+    //   read would fill nothing, the fan-out would index past the end and the
+    //   kernel would panic on the first file mapping of 16 pages or more.
+    //   `resize` is what makes the buffer a buffer.
+    //
+    // TEMPORARY instrumentation note: `[mmap-t]` below measures the whole
+    // loop, so the A/B is direct (2026-09-13: 2048 pages 4408 µs before).
+    const CHUNK_PAGES: usize = 16;
+    let chunk_bytes = CHUNK_PAGES * PAGE_SIZE as usize;
+    // A failed allocation just means the per-page path below runs; the mmap
+    // still succeeds, which is the right shape for a transient scratch buffer
+    // on a path that must not turn memory pressure into a failed syscall.
+    let mut chunk: Option<Vec<u8>> = file_source.and_then(|_| {
+        let mut v: Vec<u8> = Vec::new();
+        if v.try_reserve(chunk_bytes).is_ok() {
+            v.resize(chunk_bytes, 0);
+            Some(v)
+        } else {
+            None
         }
+    });
+    let mut batch_failed = false;
+    let mut i = 0usize;
+    while i < pages {
+        let va = base + i * PAGE_SIZE as usize;
+        match file_source {
+            Some((fd, off)) if chunk.is_some() && i + CHUNK_PAGES <= pages => {
+                let buf = chunk.as_mut().expect("guarded by the arm above");
+                // `None` is "not a regular file" — a failure, exactly as it was
+                // per page. A short answer is not: it is the tail of the file,
+                // whose remainder `mmap(2)` specifies as zero.
+                match crate::fd::file_bytes_at(fd, off + i * PAGE_SIZE as usize, buf) {
+                    None => {
+                        batch_failed = true;
+                        break;
+                    }
+                    Some(n) => buf[n.min(chunk_bytes)..].fill(0),
+                }
+                for j in 0..CHUNK_PAGES {
+                    let src = &buf[j * PAGE_SIZE as usize..(j + 1) * PAGE_SIZE as usize];
+                    if !populate_file_page_from(va + j * PAGE_SIZE as usize, region_prot, src) {
+                        batch_failed = true;
+                        break;
+                    }
+                }
+                // Checked here and not only by the `for` above: a `break` out of
+                // the fan-out leaves this loop's own condition untouched, and
+                // without this the fill would carry on allocating frames for
+                // every remaining page of a mapping already being torn down.
+                if batch_failed {
+                    break;
+                }
+                i += CHUNK_PAGES;
+            }
+            other => {
+                let filled = match other {
+                    Some((fd, off)) => {
+                        populate_file_page(va, region_prot, fd, off + i * PAGE_SIZE as usize)
+                    }
+                    None => populate_page(va, region_prot),
+                };
+                if !filled {
+                    batch_failed = true;
+                    break;
+                }
+                i += 1;
+            }
+        }
+    }
+    if batch_failed {
+        // Out of memory partway through. Unlike the pre-region version,
+        // which leaked the pages it had already mapped because it had no
+        // record of them, this can undo exactly what it did.
+        unmap_range(base, base + byte_len);
+        return errno::ENOMEM;
     }
     if pages >= 16 {
         let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
@@ -417,6 +552,17 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         serial::puts("\n");
     }
     base as u64
+}
+
+/// Keep a demand-paged mapping's file alive for as long as the mapping is.
+///
+/// Delegates to the address space, which is where the pins live and why:
+/// `akuma_mmu::UserAddressSpace::pin_mapped_inode`. It is the **leader's**
+/// address space — the same owner `with_current_regions` answers for — so a
+/// `CLONE_THREAD` thread's `mmap` pins where its region record went, not into a
+/// view that dies with the thread.
+fn pin_mapping_inode(inode: u32) {
+    usermode::with_current_address_space(|uas| uas.pin_mapped_inode(inode));
 }
 
 /// Allocate, zero, map and record one anonymous page at `va`.
@@ -514,6 +660,39 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
     true
 }
 
+/// Allocate, **fill from an already-read buffer**, map and record one page.
+///
+/// [`populate_file_page`]'s batched twin — [`sys_mmap`]'s fill loop reads a
+/// 64 KiB chunk once and hands each 4 KiB slice here, so ext2's per-call fixed
+/// cost is paid per chunk instead of per page. Same rules: freshly allocated
+/// frame (no stale contents), PTE edit and ledger entry under the
+/// address-space hold, frame freed on a failed map.
+fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> bool {
+    let Some(frame) = akuma_pmm::alloc_page() else {
+        return false;
+    };
+    // SAFETY: a fresh PMM frame, reached through the physmap, and no other
+    // reference to it exists until it is mapped below.
+    let page = unsafe {
+        core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize)
+    };
+    // Clamped rather than trusted: the caller slices a chunk buffer, and a page
+    // is the most this frame can hold. A longer `src` is a caller bug, and the
+    // kind that would otherwise write past the frame into the physmap.
+    let n = src.len().min(PAGE_SIZE as usize);
+    page[..n].copy_from_slice(&src[..n]);
+    page[n..].fill(0);
+    let (pte, cow) = pte_prot_for(prot, frame);
+    if usermode::with_current_address_space(|uas| {
+        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
+    }) != Some(true)
+    {
+        akuma_pmm::free_page(frame, 0);
+        return false;
+    }
+    true
+}
+
 /// Service a not-present fault at `addr` from the region table — demand paging.
 ///
 /// `true` when the faulting instruction can be re-executed. `false` means the
@@ -540,17 +719,187 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
 /// rather than refuses anyway, which is the direction that trap says to fail in.
 pub fn fault_in(addr: u64) -> bool {
     let page = (addr as usize) & !0xfff;
-    usermode::with_current_regions(|regions| {
-        let Some(region) = regions.iter().find(|r| r.contains(page)) else {
-            return false;
-        };
+
+    // **Decide under the region lock; fill outside it.** The anonymous case
+    // could do both inside, and did — a zero-fill takes no other lock. A file
+    // fill reads ext2, and this module's lock order is regions -> address space
+    // -> PMM with nothing else in it; adding a filesystem underneath the region
+    // lock would make this the one place where a VFS lock is taken under it, and
+    // the `read(2)` path that prefaults a lazy user buffer (`prefault_user_range`
+    // below) arrives with filesystem state of its own. The window the release
+    // opens is closed by the BKL: `idt.rs` takes it for the whole servicing
+    // window, and a peer's `munmap` is a syscall, which cannot run without it.
+    let Some((prot, file)) = usermode::with_current_regions(|regions| {
+        let region = regions.iter().find(|r| r.contains(page))?;
         let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
         if prot.is_none() {
-            return false; // a reservation, or a guard page: a real fault
+            return None; // a reservation, or a guard page: a real fault
         }
-        populate_page(page, prot)
+        // Extent as well as identity: the readahead below must not run off the
+        // end of the region it started in.
+        Some((prot, region.file.map(|f| (f, region.start_va, region.pages))))
     })
-    .unwrap_or(false)
+    .flatten() else {
+        return false;
+    };
+
+    match file {
+        None => populate_page(page, prot),
+        Some((file, region_start, region_pages)) => {
+            fill_file_pages(page, prot, file, region_start, region_pages)
+        }
+    }
+}
+
+/// How many faults were served from a file, and how many pages that filled.
+///
+/// Counters rather than a log line: a demand-paged file mapping is *quiet* when
+/// it works, and the failure mode that matters is not an error but the arm never
+/// being taken at all — a regression to the eager path is invisible in every
+/// other measurement, because eager mappings work too. They are reported by
+/// [`demand_paging_report`] after the boot suite has run real programs, the same
+/// argument [`crate::idt::USER_DEMAND_FAULTS`] exists for.
+pub static FILE_DEMAND_FAULTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Pages filled from a file by [`fill_file_pages`], readahead included.
+pub static FILE_PAGES_FILLED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// How many pages one file fault brings in.
+///
+/// A fault costs a `#PF`, a region-list walk and an ext2 call whose cost is
+/// mostly fixed (inode resolve, block-map derivation, a scratch `Vec`), so
+/// serving one page per fault pays that fixed cost per 4 KiB. Sixteen pages is
+/// one 64 KiB read, which is also the chunk [`sys_mmap`]'s eager fill uses, and
+/// it is deliberately **not** the AArch64 kernel's 256: this is the target where
+/// the page is copied out of a heap buffer rather than shared out of a page
+/// cache, so every page read ahead and not used is a frame allocated and a
+/// memcpy performed for nothing. Raise it once pages can be shared.
+const READAHEAD_PAGES: usize = 16;
+
+/// Fill the faulting page — and the readahead window after it — from the file.
+///
+/// Returns `true` when **the faulting page** is present on return; a readahead
+/// page that could not be filled is not a failure, it is just a page that will
+/// fault later.
+///
+/// Pages already present are skipped rather than refilled: a sibling thread may
+/// have faulted the same window, and re-populating a live page would leak the
+/// frame under it and discard whatever ring 3 has written there.
+fn fill_file_pages(
+    page: usize,
+    prot: Prot,
+    file: FileBacking,
+    region_start: usize,
+    region_pages: usize,
+) -> bool {
+    use core::sync::atomic::Ordering;
+    FILE_DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+    let first = (page - region_start) / PAGE_SIZE as usize;
+    let last = (first + READAHEAD_PAGES).min(region_pages);
+
+    // One 64 KiB read for the whole window, fanned out to the frames — the same
+    // amortization the eager fill does, for the same reason. A failed allocation
+    // is not a failed fault: the per-page path below reads straight into each
+    // frame and needs no buffer at all.
+    let mut buf: Option<Vec<u8>> = {
+        let want = (last - first) * PAGE_SIZE as usize;
+        let mut v: Vec<u8> = Vec::new();
+        if v.try_reserve(want).is_ok() {
+            v.resize(want, 0);
+            Some(v)
+        } else {
+            None
+        }
+    };
+    if let Some(b) = buf.as_mut() {
+        let (offset, _) = file.page_source(first);
+        match crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, b) {
+            // The file is gone, or was never readable by inode. Fall back to the
+            // per-page path, which fails the same way and one page at a time.
+            None => buf = None,
+            // Short at EOF, or nothing at all: the rest of the window is
+            // zero-fill, and the buffer must say so rather than keep whatever
+            // `resize` left there.
+            Some(n) => b[n..].fill(0),
+        }
+    }
+
+    let mut faulting_page_ok = false;
+    for idx in first..last {
+        let va = region_start + idx * PAGE_SIZE as usize;
+        if akuma_mmu::is_current_user_range_mapped(va, 1) {
+            if va == page {
+                // A peer filled the very page this fault is about. Present is
+                // present: return to ring 3 and let the access retry.
+                faulting_page_ok = true;
+            }
+            continue;
+        }
+        let (offset, from_file) = file.page_source(idx);
+        let ok = match buf.as_ref() {
+            Some(b) => {
+                let at = (idx - first) * PAGE_SIZE as usize;
+                populate_file_page_from(va, prot, &b[at..at + from_file])
+            }
+            None => populate_file_page_by_inode(va, prot, file, offset, from_file),
+        };
+        if ok {
+            FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
+        }
+        if va == page {
+            faulting_page_ok = ok;
+        }
+        if !ok {
+            // Out of memory, or the file stopped answering. Stop reading ahead;
+            // whether the fault itself succeeded is already recorded.
+            break;
+        }
+    }
+    faulting_page_ok
+}
+
+/// Allocate, fill **directly from the file**, map and record one page.
+///
+/// [`populate_file_page`] without a descriptor — the fault path's fallback for
+/// when the readahead buffer could not be allocated, which is exactly the moment
+/// a 64 KiB allocation is the wrong thing to insist on. Reads into the frame
+/// through the physmap, so it needs no buffer of its own.
+fn populate_file_page_by_inode(
+    va: usize,
+    prot: Prot,
+    file: FileBacking,
+    offset: usize,
+    from_file: usize,
+) -> bool {
+    let Some(frame) = akuma_pmm::alloc_page() else {
+        return false;
+    };
+    // SAFETY: a fresh PMM frame, reached through the physmap, and no other
+    // reference to it exists until it is mapped below.
+    let page = unsafe {
+        core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize)
+    };
+    // Zeroed before the fill, never instead of it: zero is the value of a byte
+    // past EOF and of nothing else.
+    page.fill(0);
+    let want = from_file.min(PAGE_SIZE as usize);
+    if want > 0
+        && crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, &mut page[..want])
+            .is_none()
+    {
+        akuma_pmm::free_page(frame, 0);
+        return false;
+    }
+    let (pte, cow) = pte_prot_for(prot, frame);
+    if usermode::with_current_address_space(|uas| {
+        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
+    }) != Some(true)
+    {
+        akuma_pmm::free_page(frame, 0);
+        return false;
+    }
+    true
 }
 
 /// Demand-page every lazy page covering `[start, start + len)` so a **kernel**
@@ -1358,6 +1707,20 @@ pub fn demand_paging_report(t: &mut Suite) {
     let n = crate::idt::USER_DEMAND_FAULTS.load(Ordering::Relaxed);
     t.note("mmap: user pages demand-paged from a region", n);
     t.check("mmap: the lazy path was actually taken", n > 0);
+    // The file arm separately, because it is the one added on 2026-09-13 and the
+    // one that goes quiet rather than red when it regresses. Noted, not
+    // `check`ed: whether any program in the boot suite `mmap`s a **file** is a
+    // property of the disk image, not of this kernel — in the guest that runs
+    // `cargo`, every `ld.so` does, and these two numbers are what say the mapping
+    // of a 300 MB shared object cost a few hundred pages instead of 76 000.
+    t.note(
+        "mmap: faults served from a file",
+        FILE_DEMAND_FAULTS.load(Ordering::Relaxed),
+    );
+    t.note(
+        "mmap: pages filled from a file (readahead included)",
+        FILE_PAGES_FILLED.load(Ordering::Relaxed),
+    );
 }
 
 #[cfg(not(feature = "no-tests"))]

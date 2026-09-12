@@ -2748,6 +2748,14 @@ fn share_parent_memory_into(
     // published halfway would leave the parent writable on pages the child
     // already shares.
     let mut parent_as = parent.address_space.lock();
+    // The child inherits the parent's file mappings — including the pages of
+    // them nobody has faulted yet — so it must inherit their claim on the
+    // files. Without this the child's demand-paged mappings are kept alive only
+    // by the parent's pins, and a parent that execs or exits first leaves the
+    // child faulting against an inode the filesystem is free to reissue.
+    // Beside the region inheritance above in intent; here in position because
+    // this is where the parent's address space is in hand.
+    child_space.inherit_mapped_inode_pins(&parent_as);
     parent_as.rewrite_leaves_in_range(0, akuma_mmu::USER_HALF_END, |_ledger, leaf| {
         if !ok {
             return LeafAction::Keep;
@@ -4546,6 +4554,7 @@ pub fn bind_child_task(
         });
     }
     crate::thread::clear_group_exiting(slot);
+    crate::thread::clear_group_exit_status(slot);
     crate::sched::seed_proc_slot(task_slot, slot);
     Ok(())
 }

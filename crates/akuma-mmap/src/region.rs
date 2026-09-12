@@ -77,6 +77,96 @@ pub struct MmapRegion {
     /// Use [`recorded_prot`](Self::recorded_prot) rather than reading this
     /// directly.
     pub prot_recorded: bool,
+
+    /// Where this region's pages come from when it is **file-backed and
+    /// demand-paged**: the file's identity and this region's place in it.
+    ///
+    /// `None` for anonymous memory and for a file mapping whose pages were
+    /// filled at `mmap` time — an eager file region needs no record, because
+    /// nothing will ever ask it for bytes again.
+    ///
+    /// It lives here rather than beside the region list because a region is the
+    /// only thing that survives the operations that reshape a mapping.
+    /// `mprotect` splits one region into three and `munmap` clips it at either
+    /// end; a parallel table keyed by VA would have to be taught each of those
+    /// shapes over again, and the first one it was not taught would serve a page
+    /// the bytes that belong 64 KiB away. Carried through them here instead, by
+    /// [`FileBacking::advance`], with the offsets tested.
+    ///
+    /// **The identity is integers only, deliberately.** Keeping the file's data
+    /// alive across an `unlink` needs an `akuma_primitives::InodePin`, and this
+    /// crate has an empty `[dependencies]` table that is load-bearing (see the
+    /// crate docs). The pin is the kernel's to hold; this is the record of
+    /// *which* file, not a claim on it.
+    pub file: Option<FileBacking>,
+}
+
+/// The file identity and extent behind a demand-paged file mapping.
+///
+/// `Copy` and four integers: a region's file backing has to survive every clip
+/// and split in this module, and a type that could not be copied would make each
+/// of those a decision about ownership instead of arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileBacking {
+    /// Which mount `inode` belongs to (`akuma_vfs::ResolvedMount::id`).
+    ///
+    /// An inode number alone does not name a file — a second `mount(2)` puts
+    /// another filesystem's numbers in the same range — and this pair is what a
+    /// global page cache must be keyed by.
+    pub mount_id: u32,
+    /// The inode the mapping was created against. Never `0`: a mapping with no
+    /// inode identity has to read by path, and a path is not something this
+    /// crate can hold.
+    pub inode: u32,
+    /// Byte offset in the file of this region's `start_va`.
+    pub offset: usize,
+    /// Bytes of **file data** reachable from [`offset`](Self::offset).
+    ///
+    /// Everything past it is zero-fill: a mapping may legitimately extend beyond
+    /// EOF, and `mmap(2)` specifies the remainder of the last page as zero. Kept
+    /// as a length rather than a file size so a clipped head adjusts it by the
+    /// same arithmetic that adjusts the offset.
+    pub filesz: usize,
+}
+
+impl FileBacking {
+    /// Where the page `page_index` pages into this region gets its bytes:
+    /// `(file offset, bytes of file data)`.
+    ///
+    /// The second half is what stops a mapping that extends past EOF showing the
+    /// file's neighbours: a page fully inside the data reports a whole page, the
+    /// page straddling EOF reports the part that is real, and a page entirely
+    /// past it reports `0` — all zero-fill.
+    ///
+    /// The rule lives here, in one place, because both callers need it and they
+    /// are far apart: [`MmapRegion::file_page_source`] answers it for a VA, and
+    /// a fault path filling a readahead batch answers it for page after page
+    /// without a region in hand.
+    #[must_use]
+    pub const fn page_source(self, page_index: usize) -> (usize, usize) {
+        let delta = page_index.saturating_mul(crate::PAGE_SIZE);
+        let from_file = {
+            let left = self.filesz.saturating_sub(delta);
+            if left > crate::PAGE_SIZE { crate::PAGE_SIZE } else { left }
+        };
+        (self.offset.saturating_add(delta), from_file)
+    }
+
+    /// This backing with its first `pages` pages clipped away — the record a
+    /// surviving *tail* piece needs after a split.
+    ///
+    /// Saturating on `filesz`: a piece that starts past EOF has no file data at
+    /// all, which is `0` and not a wrap to `usize::MAX`.
+    #[must_use]
+    pub const fn advance(self, pages: usize) -> Self {
+        let bytes = pages.saturating_mul(crate::PAGE_SIZE);
+        Self {
+            mount_id: self.mount_id,
+            inode: self.inode,
+            offset: self.offset.saturating_add(bytes),
+            filesz: self.filesz.saturating_sub(bytes),
+        }
+    }
 }
 
 impl MmapRegion {
@@ -101,7 +191,7 @@ impl MmapRegion {
     pub fn owned_with_prot(start_va: usize, frames: Vec<PhysFrame>, prot: Prot) -> Self {
         Self {
             start_va, pages: frames.len(), frames, prot,
-            shared_anon: false, prot_recorded: true,
+            shared_anon: false, prot_recorded: true, file: None,
         }
     }
 
@@ -119,7 +209,7 @@ impl MmapRegion {
     pub fn inherited_with_prot(start_va: usize, pages: usize, prot: Prot) -> Self {
         Self {
             start_va, pages, frames: Vec::new(), prot,
-            shared_anon: false, prot_recorded: true,
+            shared_anon: false, prot_recorded: true, file: None,
         }
     }
 
@@ -138,6 +228,31 @@ impl MmapRegion {
     pub fn shared_anon(mut self) -> Self {
         self.shared_anon = true;
         self
+    }
+
+    /// Mark this region as demand-paged from a file. See [`MmapRegion::file`].
+    #[must_use]
+    pub fn file_backed(mut self, file: FileBacking) -> Self {
+        self.file = Some(file);
+        self
+    }
+
+    /// Where the page at `va` gets its bytes: `(file offset, bytes of file data)`.
+    ///
+    /// The second half is what stops a mapping that extends past EOF showing the
+    /// file's neighbours: a page fully inside the data reports a whole page, the
+    /// page straddling EOF reports the part that is real, and a page entirely
+    /// past it reports `0` — all zero-fill. `None` when the region is not
+    /// file-backed or `va` is outside it, which the caller must treat as
+    /// anonymous rather than as an error.
+    #[must_use]
+    pub fn file_page_source(&self, va: usize) -> Option<(usize, usize)> {
+        let file = self.file?;
+        if !self.contains(va) {
+            return None;
+        }
+        let page = va & !(crate::PAGE_SIZE - 1);
+        Some(file.page_source((page - self.start_va) / crate::PAGE_SIZE))
     }
 
 
@@ -191,6 +306,12 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
             inherited.prot_recorded = r.prot_recorded;
             // Must carry `shared_anon` across, or a grandchild silently stops sharing:
             // the child would CoW-share a mapping its parent shares by identity.
+            // And the file backing, for the same reason one step further on: a
+            // child of a demand-paged file mapping faults on pages its parent
+            // never touched, and a child that forgot where they come from
+            // would serve them as anonymous zeros — a program image full of
+            // holes, reported as a `SIGSEGV` or worse as silence.
+            inherited.file = r.file;
             if r.shared_anon { inherited.shared_anon() } else { inherited }
         })
         .collect()
@@ -262,6 +383,9 @@ pub fn mprotect_eager_regions_in_range(
         let old_prot = reg.prot;
         let shared_anon = reg.shared_anon;
         let was_recorded = reg.prot_recorded;
+        // Each piece keeps its own place in the file: the head starts where the
+        // region did, and the two below it start that many pages further in.
+        let file = reg.file;
         // `filter_map(next)` tolerates a CoW-inherited region (`frames` empty):
         // each piece then carries its page count and no frames, which is right.
         let mut it = reg.frames.into_iter();
@@ -274,18 +398,20 @@ pub fn mprotect_eager_regions_in_range(
         if head_pages > 0 {
             out.push(MmapRegion {
                 start_va: reg_start, pages: head_pages, frames: head,
-                prot: old_prot, shared_anon, prot_recorded: was_recorded });
+                prot: old_prot, shared_anon, prot_recorded: was_recorded, file });
         }
         if mid_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_start, pages: mid_pages, frames: mid,
-                prot: new_prot, shared_anon, prot_recorded: true });
+                prot: new_prot, shared_anon, prot_recorded: true,
+                file: file.map(|f| f.advance(head_pages)) });
             touched += 1;
         }
         if tail_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail,
-                prot: old_prot, shared_anon, prot_recorded: was_recorded });
+                prot: old_prot, shared_anon, prot_recorded: was_recorded,
+                file: file.map(|f| f.advance(head_pages + mid_pages)) });
         }
     }
     *regions = out;
@@ -351,6 +477,9 @@ pub fn detach_eager_regions_in_range(
         let shared_anon = reg.shared_anon;
         // A partial unmap changes extent, not what the region states about itself.
         let prot_recorded = reg.prot_recorded;
+        // Nor where the region sits in its file — but the surviving *tail*
+        // starts further in, by everything the head and the clip took.
+        let file = reg.file;
         let mut it = reg.frames.into_iter();
         let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
         let mid: alloc::vec::Vec<PhysFrame> = (0..clip_pages).filter_map(|_| it.next()).collect();
@@ -363,12 +492,13 @@ pub fn detach_eager_regions_in_range(
         if head_pages > 0 {
             regions.push(MmapRegion {
                 start_va: reg_start, pages: head_pages, frames: head, prot,
-                shared_anon, prot_recorded });
+                shared_anon, prot_recorded, file });
         }
         if tail_pages > 0 {
             regions.push(MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail, prot,
-                shared_anon, prot_recorded });
+                shared_anon, prot_recorded,
+                file: file.map(|f| f.advance(head_pages + clip_pages)) });
         }
         if clip_pages > 0 {
             pieces.push((clip_start, clip_pages, mid));
@@ -793,4 +923,123 @@ mod mmap_region_inheritance_tests {
         assert_eq!(total_pages(&r), 2);
     }
 
+}
+
+#[cfg(test)]
+mod file_backing_tests {
+    //! Where a demand-paged file mapping's pages come from, through every
+    //! operation that reshapes a region.
+    //!
+    //! These are the tests the amd64 lazy file mapping is built on, and they
+    //! exist because the failure they guard is silent. A region that loses its
+    //! file backing serves anonymous zeros — a hole in a program image, which
+    //! surfaces as a `SIGILL` or a wrong answer, not as an error. A region that
+    //! keeps the backing but not the *offset* is worse: every page is real file
+    //! data, from the wrong place in the file.
+    use super::*;
+
+    const PAGE: usize = 4096;
+
+    fn backing(offset: usize, filesz: usize) -> FileBacking {
+        FileBacking { mount_id: 2, inode: 77, offset, filesz }
+    }
+
+    fn file_region(start_va: usize, pages: usize, file: FileBacking) -> MmapRegion {
+        MmapRegion::inherited_with_prot(start_va, pages, crate::Prot::RO_NO_EXEC)
+            .file_backed(file)
+    }
+
+    /// A page wholly inside the file's data reads a whole page from it; the page
+    /// straddling EOF reads the part that exists; past EOF reads nothing.
+    #[test]
+    fn page_source_tracks_eof() {
+        // 4 pages mapped, 2.5 pages of file data behind them.
+        let r = file_region(0x1_0000_0000, 4, backing(0x2000, 2 * PAGE + 2048));
+        assert_eq!(r.file_page_source(0x1_0000_0000), Some((0x2000, PAGE)));
+        assert_eq!(r.file_page_source(0x1_0000_1000), Some((0x3000, PAGE)));
+        assert_eq!(r.file_page_source(0x1_0000_2000), Some((0x4000, 2048)));
+        assert_eq!(r.file_page_source(0x1_0000_3000), Some((0x5000, 0)));
+    }
+
+    /// An address inside the page, not just its base, answers for that page.
+    #[test]
+    fn page_source_rounds_the_fault_address_down() {
+        let r = file_region(0x1_0000_0000, 2, backing(0, 2 * PAGE));
+        assert_eq!(r.file_page_source(0x1_0000_1abc), Some((PAGE, PAGE)));
+    }
+
+    /// Not file-backed, or not in this region: `None`, which the fault path
+    /// reads as "anonymous", not as "fail".
+    #[test]
+    fn page_source_is_none_outside_and_for_anonymous() {
+        let r = file_region(0x1_0000_0000, 2, backing(0, 2 * PAGE));
+        assert_eq!(r.file_page_source(0x1_0000_2000), None);
+        let anon = MmapRegion::inherited(0x1_0000_0000, 2);
+        assert_eq!(anon.file_page_source(0x1_0000_0000), None);
+    }
+
+    /// A CoW child faults on pages its parent never touched, so it must inherit
+    /// where they come from.
+    #[test]
+    fn cow_child_inherits_the_file_backing() {
+        let parent = alloc::vec![file_region(0x1_0000_0000, 4, backing(0x1000, 4 * PAGE))];
+        let child = inherit_mmap_regions_for_cow_child(&parent);
+        assert_eq!(child[0].file, parent[0].file);
+        assert_eq!(child[0].file_page_source(0x1_0000_2000), Some((0x3000, PAGE)));
+    }
+
+    /// `mprotect` in the middle of a mapping splits it three ways, and each
+    /// piece keeps its own place in the file.
+    ///
+    /// This is the shape the dynamic linker produces on every shared object it
+    /// loads — `mprotect(PROT_READ)` over the relocated middle of a mapping it
+    /// made `PROT_READ|PROT_WRITE` — so it is not an exotic case.
+    #[test]
+    fn mprotect_split_advances_each_piece() {
+        let mut regions = alloc::vec![file_region(0x1_0000_0000, 6, backing(0, 6 * PAGE))];
+        let touched = mprotect_eager_regions_in_range(
+            &mut regions,
+            0x1_0000_2000,
+            0x1_0000_4000,
+            crate::Prot::RO_NO_EXEC,
+        );
+        assert_eq!(touched, 1);
+        regions.sort_by_key(|r| r.start_va);
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].file.map(|f| f.offset), Some(0));
+        assert_eq!(regions[1].file.map(|f| f.offset), Some(2 * PAGE));
+        assert_eq!(regions[2].file.map(|f| f.offset), Some(4 * PAGE));
+        // Every piece still answers for its own pages with the offset it had
+        // before the split — the property the offsets exist to preserve.
+        for i in 0..6 {
+            let va = 0x1_0000_0000 + i * PAGE;
+            let r = regions.iter().find(|r| r.contains(va)).expect("still mapped");
+            assert_eq!(r.file_page_source(va), Some((i * PAGE, PAGE)));
+        }
+    }
+
+    /// `munmap` of a middle range leaves a head and a tail; the tail starts
+    /// further into the file by everything that went away.
+    #[test]
+    fn munmap_clip_advances_the_tail() {
+        let mut regions = alloc::vec![file_region(0x1_0000_0000, 6, backing(0x8000, 6 * PAGE))];
+        let pieces = detach_eager_regions_in_range(&mut regions, 0x1_0000_1000, 0x1_0000_3000);
+        assert_eq!(pieces.len(), 1);
+        regions.sort_by_key(|r| r.start_va);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].file.map(|f| f.offset), Some(0x8000));
+        assert_eq!(regions[1].file.map(|f| f.offset), Some(0x8000 + 3 * PAGE));
+        assert_eq!(regions[1].file_page_source(0x1_0000_3000), Some((0x8000 + 3 * PAGE, PAGE)));
+    }
+
+    /// Clipping the head shortens the data behind the survivor as well as
+    /// moving its offset — otherwise a region past EOF starts reporting file
+    /// bytes that are not there.
+    #[test]
+    fn advance_shrinks_the_data_length() {
+        let f = backing(0, 3 * PAGE);
+        assert_eq!(f.advance(2), backing(2 * PAGE, PAGE));
+        // Past the end of the data entirely: zero bytes, not a wrap.
+        assert_eq!(f.advance(5), backing(5 * PAGE, 0));
+    }
 }

@@ -3409,6 +3409,29 @@ pub struct UserAddressSpace {
     /// each. The same arch-neutral, host-tested `akuma-user-space` ledger the
     /// AArch64 struct carries — everything else here is the x86 walker.
     ledger: FrameLedger,
+    /// The inodes this address space's **demand-paged file mappings** keep
+    /// alive, one entry per distinct inode.
+    ///
+    /// A lazy file mapping reads its pages long after `mmap` returned and, in
+    /// every real case, long after the descriptor was closed — `ld.so` closes it
+    /// immediately. The inode number it remembers has no lifetime tie to the
+    /// file, so without a pin the filesystem is free to free that inode on an
+    /// `unlink` and reissue the number to the next file created; the mapping
+    /// then faults in either zeros or **another file's bytes**, with nothing
+    /// logged. That is root cause #2 of the AArch64 self-host `rustc` ICE
+    /// (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14), and the amd64 lazy path
+    /// inherits the exposure along with the speed.
+    ///
+    /// It lives here, and not in the region record, for lifetime: this struct
+    /// dies exactly when the mappings do — on `exec` (the address space is
+    /// swapped) and on exit — so `Drop` releases every pin with no teardown path
+    /// having to know they exist. `akuma_mmap::MmapRegion` cannot hold them at
+    /// all: that crate's `[dependencies]` table is empty and load-bearing.
+    ///
+    /// The AArch64 struct has no such field because its lazy file regions carry
+    /// their own pin inside `LazySource::File`; this target demand-pages from
+    /// `mmap_regions`, which has nowhere to put one.
+    mapping_pins: alloc::vec::Vec<akuma_primitives::InodePin>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3448,7 +3471,37 @@ impl UserAddressSpace {
         // down table, and a frame the PMM has re-issued *as an L0* is a live
         // table, not a stale reference.
         unnote_freed_l0(root as u64 & L0_BASE_MASK);
-        Some(Self { root, ledger: FrameLedger::new(false) })
+        Some(Self { root, ledger: FrameLedger::new(false), mapping_pins: alloc::vec::Vec::new() })
+    }
+
+    /// Keep `inode`'s data alive for as long as this address space exists.
+    ///
+    /// Idempotent per inode: a program that maps one shared object three times
+    /// (`ld.so` maps the same file once per segment) takes one pin, not three.
+    /// The count is a global table of bounded size, and an entry held per
+    /// *mapping* rather than per *file* is how it saturates — a saturated pin
+    /// table answers "pinned" for everything and stalls the filesystem's
+    /// deferred frees, which is a failure this tree has already had once
+    /// (`docs/archive/EXT2_UNLINK_LEAK.md`).
+    ///
+    /// `inode == 0` means "no inode identity", and pins nothing.
+    pub fn pin_mapped_inode(&mut self, inode: u32) {
+        if inode == 0 || self.mapping_pins.iter().any(|p| p.inode() == inode) {
+            return;
+        }
+        self.mapping_pins.push(akuma_primitives::InodePin::new(inode));
+    }
+
+    /// Take the same pins `other` holds — a `fork` child inherits its parent's
+    /// file mappings, so it must inherit their claim on the files.
+    ///
+    /// Without this the child's mappings are pinned only by the parent's, and a
+    /// parent that execs or exits while the child still faults leaves the child
+    /// reading an inode nothing keeps alive.
+    pub fn inherit_mapped_inode_pins(&mut self, other: &Self) {
+        for pin in &other.mapping_pins {
+            self.pin_mapped_inode(pin.inode());
+        }
     }
 
     /// A borrowed view of an existing address space (`CLONE_VM` / `vfork`):
@@ -3470,7 +3523,13 @@ impl UserAddressSpace {
     ///   views name the same `CR3` value, so a switch between them is not even
     ///   observable to the MMU.
     pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
-        Some(Self { root: parent_l0_phys, ledger: FrameLedger::new(true) })
+        Some(Self {
+            root: parent_l0_phys,
+            ledger: FrameLedger::new(true),
+            // A borrowed view pins nothing: the mappings — and the pins that
+            // keep their files alive — belong to the owner, which outlives it.
+            mapping_pins: alloc::vec::Vec::new(),
+        })
     }
 
     // ── scalar identity ────────────────────────────────────────────────────

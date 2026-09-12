@@ -114,6 +114,44 @@ pub fn set_group_exiting(proc_slot: usize) {
     }
 }
 
+/// The exit status a **group death by signal** carries, per process slot: the
+/// bit pattern of `-(sig)`, 0 when none. Set by
+/// `crate::signal::notify_group_of_thread_fatal` when a non-main thread dies
+/// by a default-action signal.
+///
+/// Why this exists beside [`GROUP_EXIT`]: the interrupt-and-pend route
+/// (`deliver_signal`) honors dispositions, and a main thread with a `SIGSEGV`
+/// handler — every rustc, which installs one process-wide — would *handle* the
+/// pended signal and run on, hung forever behind its already-dead workers.
+/// Measured 2026-09-13: rustc's worker `#GP`ed, its eight siblings died, and
+/// the leader survived in `ps` because it handled the notification. Linux's
+/// `do_group_exit` does not consult handlers either; the group exit code is
+/// fixed at the signal that started it.
+static GROUP_EXIT_STATUS: [AtomicU32; crate::usermode::PROC_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::usermode::PROC_SLOTS];
+
+/// Record the group's death status for `proc_slot`.
+pub fn set_group_exit_status(proc_slot: usize, status: u32) {
+    if let Some(f) = GROUP_EXIT_STATUS.get(proc_slot) {
+        f.store(status, Ordering::Relaxed);
+    }
+}
+
+/// The recorded group death status, if any.
+#[must_use]
+pub fn group_exit_status(proc_slot: usize) -> Option<u32> {
+    GROUP_EXIT_STATUS.get(proc_slot).map(|f| f.load(Ordering::Relaxed))
+        .filter(|&s| s != 0)
+}
+
+/// Clear the group death status when a slot is rebound to a new process —
+/// same reasoning as [`clear_group_exiting`], which this is cleared beside.
+pub fn clear_group_exit_status(proc_slot: usize) {
+    if let Some(f) = GROUP_EXIT_STATUS.get(proc_slot) {
+        f.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Clear the flag when a slot is reused — `execve` and `sys_spawn` both put a
 /// new program in an existing slot, and a stale flag would kill it on its first
 /// syscall.

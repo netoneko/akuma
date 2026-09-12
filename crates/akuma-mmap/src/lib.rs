@@ -70,7 +70,7 @@ mod types;
 
 pub use frame::PhysFrame;
 pub use region::{
-    MmapRegion, detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child,
+    FileBacking, MmapRegion, detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child,
     mprotect_eager_regions_in_range,
 };
 pub mod span;

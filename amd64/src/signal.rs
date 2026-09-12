@@ -453,6 +453,23 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
     }
 
     let tid = threading::current_thread_id();
+
+    // **A group death in progress outranks every disposition.** A sibling
+    // thread died by a default-action signal and notified the group
+    // (`notify_group_of_thread_fatal`); this thread's next syscall return is
+    // its exit, handler or no handler — Linux's `do_group_exit` semantics,
+    // without which a leader carrying a `SIGSEGV` handler handles the
+    // notification and lives on, hung behind its dead workers. Checked here
+    // and not as a pending signal because pending signals run
+    // `next_delivery`'s disposition logic, which is exactly what a group
+    // death bypasses.
+    let slot = crate::usermode::current_proc_slot();
+    if let Some(status) = crate::thread::group_exit_status(slot) {
+        let sig = status.cast_signed().wrapping_neg() as u32;
+        crate::usermode::exit_current_from_signal(sig);
+        return signal_status(sig);
+    }
+
     if threading::pending_signals_raw(tid) == 0 {
         return syscall_result;
     }
@@ -662,6 +679,12 @@ pub fn notify_group_of_thread_fatal(sig: u32) {
     if proc.tgid == proc.pid {
         return;
     }
+    // Record the death **status** first: every group member's next syscall
+    // return takes this exit, bypassing dispositions — the leader may carry a
+    // `SIGSEGV` handler (rustc does), and a handled notification is a hung
+    // process, not a dead one. Then interrupt everyone (`deliver_signal`
+    // pends as well; those pends are superseded by the status check below).
+    crate::thread::set_group_exit_status(crate::usermode::current_proc_slot(), signal_status(sig) as u32);
     akuma_exec::process::deliver_signal(proc.tgid, sig);
 }
 
