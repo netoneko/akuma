@@ -107,6 +107,7 @@ use akuma_selftest::Suite;
 use alloc::vec::Vec;
 
 use crate::fd::errno;
+use crate::serial;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -379,6 +380,14 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // so control only reaches here for a file after the lazy return above.
     let file_source = plan.is_file_backed.then_some((fd, offset as usize));
 
+    // Duration instrumentation, measured against the TSC — not
+    // `net::uptime_us`, whose LAPIC tick does not advance inside a syscall
+    // (`IF` clear), so a bare counter read here would measure 0
+    // (`sched.rs`'s frozen-clock note). TEMPORARY: the `cargo -j4` guest fill
+    // and console saw 429 `[BKL] stuck … tag=9` lines in one boot, all of
+    // them this loop holding the BKL; this print says how long one mmap
+    // actually holds it and at which file sizes the cost sits.
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     for i in 0..pages {
         let va = base + i * PAGE_SIZE as usize;
         let filled = match file_source {
@@ -394,6 +403,18 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
             unmap_range(base, base + byte_len);
             return errno::ENOMEM;
         }
+    }
+    if pages >= 16 {
+        let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+        let hz = crate::lapic::tsc_hz();
+        let us = if hz != 0 { dt / (hz / 1_000_000) } else { 0 };
+        serial::puts("  [mmap-t] pages=");
+        serial::put_dec(pages as u64);
+        serial::puts(" file=");
+        serial::put_dec(u64::from(file_source.is_some()));
+        serial::puts(" us=");
+        serial::put_dec(us);
+        serial::puts("\n");
     }
     base as u64
 }
