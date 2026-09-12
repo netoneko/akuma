@@ -359,6 +359,19 @@ syscall_table! {
     Recvfrom   => RECVFROM   = 45,  nr::RECVFROM;
     Sendmsg    => SENDMSG    = 46,  nr::SENDMSG;
     Recvmsg    => RECVMSG    = 47,  nr::RECVMSG;
+    /// A connected pair of AF_UNIX endpoints. Added 2026-09-12 for the amd64
+    /// port, where it was the last thing between the guest's `rustc` and a
+    /// linked binary — and where it failed nowhere near the linker.
+    ///
+    /// Rust `std`'s `Command::spawn` declines `posix_spawnp` when the program
+    /// has no slash *and* the command overrides `PATH` (spawnp searches the
+    /// **caller's** `PATH`, which would be the wrong one). It forks instead,
+    /// and the fork path opens a socketpair to carry the child's exec errno
+    /// back to the parent — so an `ENOSYS` here surfaces as
+    /// `could not exec the linker \`cc\`: Function not implemented`, before
+    /// any exec is attempted and with nothing pointing at this syscall.
+    /// `docs/archive/RUST_TOOLCHAIN_AMD64.md` § session 3.
+    Socketpair => SOCKETPAIR = 53,  nr::SOCKETPAIR;
     Setsockopt => SETSOCKOPT = 54,  nr::SETSOCKOPT;
     Getsockopt => GETSOCKOPT = 55,  nr::GETSOCKOPT;
     Shutdown   => SHUTDOWN   = 48,  nr::SHUTDOWN;

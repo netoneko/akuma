@@ -343,14 +343,70 @@ what is actually going on. What is **measured**, in order:
 * *Not* a failed `execve` poisoning the next one in the same task — the
   `PATH=/tmp/nope:/usr/bin` control runs `cc` fine.
 
-**What is left**, and where to look next: Rust `std`'s `Command::spawn` does not
-use musl's `posix_spawnp` when the program has no slash *and* `PATH` is
-overridden — it does the search itself and execs in a forked child, reporting
-the child's errno through a `CLOEXEC` pipe. `38` is what comes back. So the
-question is what that child's exec (or the error pipe) answers on this target
-that Linux answers `ENOENT` for, with an **empty inherited environment**. Start
-by giving the guest a real `PATH` (fix 1) and re-testing: it may simply
-disappear, and it is worth knowing before chasing the errno.
+**Root cause: `socketpair` (x86_64 53) is `ENOSYS`** — found with the kernel's
+own tracer, `strace` on the command line, in a 1502-line boot:
+
+```
+[sc>] cpu=0 task=2 nr=53 a1=0x0000000000000001
+[syscall] no row for x86_64 nr=53 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[sc]  cpu=0 task=2 nr=53 -> 0xffffffffffffffda        (= -38)
+cc, rustc's PATH -> Function not implemented (os error 38)
+```
+
+Rust `std`'s `Command::spawn` will not use `posix_spawnp` when the program has
+no slash **and** the command overrides `PATH` — `posix_spawnp` searches the
+*caller's* `PATH`, not the child's, so it would look in the wrong directories.
+It forks instead, and the fork path opens a **`socketpair`** to carry the
+child's exec errno back to the parent. That is the call that fails, before any
+exec happens, and `spawn` returns its errno verbatim.
+
+Which is why the failure looks like it is about `cc` and is not:
+
+| shape | path taken | result |
+|---|---|---|
+| `cc`, rustc's `PATH` | fork + socketpair | **os error 38** |
+| `cc`, inherited `PATH` | `posix_spawnp` | works |
+| an absent name, rustc's `PATH` | fork + socketpair | **os error 38** |
+| `/usr/bin/cc`, rustc's `PATH` | `posix_spawn` (has a slash) | works |
+
+It is the `ftruncate` shape for the third time: `nr::SOCKETPAIR = 199` exists,
+`akuma-syscalls-glue::net::sys_socketpair` exists (AF_UNIX, pipe-backed) and
+glue dispatches it — there is no row in `akuma-syscalls-abi`. Unlike
+`ftruncate` it *creates* descriptors, so it needs whatever the `eventfd2` note
+above needs: the fold has already unified the pipe table
+([`AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md`](AKUMA_AMD64_PIPE_TABLE_UNIFICATION.md)),
+so check where glue's socketpair installs its two fds before adding the row.
+
+### The probe: `userspace/forktest/c_stress/execenv.c`
+
+Written for this, and it is what separated the three candidate causes. It
+re-execs itself as its own child so that "what a child receives" is written
+down in one place. Measured in the guest:
+
+| # | case | result |
+|---|---|---|
+| 0 | what the probe itself received | `envc=2`, **`PATH` unset** — the empty-environment gap |
+| 1 | `execve` carries `envp` | **works**, all 3 entries |
+| 2 | `posix_spawn` carries `envp` | **works**, both entries |
+| 3 | `posix_spawnp` searches the *passed* `PATH` | `ENOENT` — **correct**, POSIX says it uses the caller's |
+| 4 | `posix_spawnp("cc")` with rustc's `PATH` | **finds and runs cc** — so musl's spawn is not the fault |
+| 5 | `fork` + `execvp` of an absent name | `ENOENT` — correct |
+| 6/7 | `waitpid` across `alarm(1)`, with and without `SA_RESTART` | **`alarms=0`** — the signal never fired at all |
+| 8 | a spawned child inherits the spawner's cwd | **works** (`/tmp`) — open item 4 below is **stale** |
+| 9 | fork + install `envp` over `environ` + `execvp` (Rust `std`'s shape in C) | `ENOENT` — correct |
+
+Two things fall out of that table beyond the root cause:
+
+* **Open item 4 is fixed.** Spawn children do inherit cwd; the note below
+  predates it.
+* **`alarm(2)` does not deliver `SIGALRM`** (cases 6 and 7, both arms, handler
+  installed, three-second child). No `EINTR` either way, so the two arms cannot
+  be told apart — and `collect2`'s `cannot get program status: Interrupted
+  system call` is the *other* half of the same subject: an `EINTR` arriving
+  where none should, while a real signal arrives nowhere. Worth one probe of
+  its own.
+
+### Staging the toolchain
 
 **Workarounds today**, in order of preference:
 

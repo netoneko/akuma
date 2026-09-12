@@ -1312,6 +1312,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `rust-lld` reported `cannot open output file` for a file it had
         // already opened successfully.
         Syscall::Ftruncate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `socketpair(domain, type, protocol, sv)` — glue's AF_UNIX pair, two
+        // kernel pipes behind two `FileDescriptor::UnixSocket` entries. It
+        // needs no arm of its own here beyond the hop: the descriptors land in
+        // `Process::fds`, which is the table `crate::fd` allocates into, and
+        // `read`/`write`/`close` on this target are already glue's.
+        Syscall::Socketpair => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // busybox prints through `writev`, not `write`. Walk the iovec array and
         // forward each segment; a short write on any segment stops the walk, as
         // `writev(2)` specifies.
