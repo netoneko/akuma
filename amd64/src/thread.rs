@@ -329,6 +329,13 @@ pub fn bind_clone_child(
         });
     }
     crate::sched::seed_thread_slots(task, proc_slot, slot);
+    serial::puts("  [DBG bind-thread] task=");
+    serial::put_dec(task as u64);
+    serial::puts(" proc=");
+    serial::put_dec(proc_slot as u64);
+    serial::puts(" tslot=");
+    serial::put_dec(slot as u64);
+    serial::puts("\n");
     Ok(())
 }
 
@@ -358,11 +365,21 @@ pub fn bind_clone_child(
 /// replaces the whole process image, which on Linux kills every sibling first,
 /// and this target refuses it (`sys_execve` is reached only by a main thread).
 pub fn run_thread(slot: usize, first: &akuma_exec::process::UserContext) -> ! {
+    serial::puts("  [DBG thread-run] task=");
+    serial::put_dec(crate::sched::current_task() as u64);
+    serial::puts(" tslot=");
+    serial::put_dec(slot as u64);
+    serial::puts("\n");
     // `forked = true`: enter ring 3 through `enter_user_mode_forked`, which
     // restores the parent's register set from this task's own `saved_regs` and
     // sets `rax = 0`. A `clone` child sees 0 for exactly the reason a `vfork`
     // child does, so the path is the same one.
     let _status = crate::usermode::enter_user_from_thread(first.pc, first.sp);
+    serial::puts("  [DBG thread-back] tslot=");
+    serial::put_dec(slot as u64);
+    serial::puts(" status=");
+    serial::put_dec(_status as u64);
+    serial::puts("\n");
 
     teardown(slot);
     crate::sched::finish();

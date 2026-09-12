@@ -4486,6 +4486,20 @@ pub fn bind_child_task(
         );
     }
 
+    // **A new process in this slot must not inherit the old one's exit.**
+    // `GROUP_EXIT` outlives the process that set it — `drain` sets it and
+    // nothing cleared it on the plain `fork` path, where the child is bound to
+    // a *recycled* slot the way `execve`/`spawn` are (and only those two
+    // cleared it). A fork child landed on such a slot ran fine itself —
+    // `should_leave_now` is false for a main thread — but every thread it
+    // ever `pthread_create`d saw `group_exiting` true at its **first** syscall,
+    // answered `EINTR` and left before executing a user instruction. Measured
+    // 2026-09-12 with a fork → spawn-8-parkers child: `started=0`, and the
+    // console showed every worker's `run_thread` returning `-4` immediately —
+    // `/probes/segvgroup` failing its worker barrier from round 0. Threads
+    // must not clear this: they *join* the running group, which may genuinely
+    // be exiting.
+
     // Collect any row the reaper left behind before looking for a free one.
     sweep_reaped_spawn_rows();
 
@@ -4520,6 +4534,7 @@ pub fn bind_child_task(
             exec_slot: task_slot,
         });
     }
+    crate::thread::clear_group_exiting(slot);
     crate::sched::seed_proc_slot(task_slot, slot);
     Ok(())
 }
