@@ -250,6 +250,11 @@ struct Xhci {
     /// Reset class request needs.
     bot_if: u8,
     tag: u32,
+    /// Last endpoint-context state seen for each bulk endpoint (index 0 =
+    /// bulk IN, 1 = bulk OUT; `0xff` = nothing seen yet). `note_ep_state`
+    /// prints the transition when it changes — the device-state tracking
+    /// that would have exposed the `>> 2` decode bug on its first boot.
+    ep_state_seen: [u8; 2],
 }
 
 static XHCI: Spinlock<Option<Xhci>> = Spinlock::new(None);
@@ -393,6 +398,22 @@ impl Xhci {
                 serial::puts("  [xhci] transfer timeout: ");
                 serial::puts(what);
                 serial::puts("\n");
+                // Diagnostic (trash box, uncommitted): a timeout whose endpoint
+                // context reads disabled can never succeed on retry — the ring
+                // doorbell on a disabled endpoint is ignored. What is not known
+                // is WHO disabled it: nothing in this driver writes DEV_CTX
+                // after Configure Endpoint, so a 0 here was written by the
+                // controller (or the read is stale/garbage). PORTSC says
+                // whether the link is still up when that happened; the raw
+                // slot-context dword says whether the whole slot went with it
+                // or only the bulk endpoints.
+                let psc = PortSc(r32(self.op, op::portsc(self.port)));
+                puthex("  [xhci] PORTSC=0x", psc.0);
+                puthex("  [xhci] slot ctx dw0=0x", dev_ctx_dw0(self, 0));
+                puthex("  [xhci] ep in ctx dw0=0x", dev_ctx_dw0(self, self.bulk_in_dci));
+                puthex("  [xhci] ep out ctx dw0=0x", dev_ctx_dw0(self, self.bulk_out_dci));
+                note_ep_state(self, self.bulk_in_dci);
+                note_ep_state(self, self.bulk_out_dci);
                 return Err("xhci transfer timeout");
             }
             spin_us(10);
@@ -674,6 +695,7 @@ pub fn init() -> Result<(), &'static str> {
             block_count: 0,
             bot_if: 0,
             tag: 1,
+            ep_state_seen: [0xff; 2],
         };
 
         step("no-op command");
@@ -1409,32 +1431,73 @@ fn recover_step(x: &mut Xhci, what: &str, t: [u32; 4]) {
     }
 }
 
-/// Read the EP State field of endpoint `dci` from the device context —
-/// 0 disabled, 1 running, 2 halted, 3 stopped, 4 error (xHCI Table 6-9).
+/// Read the EP State of endpoint `dci` from the device context, decoded by
+/// the crate (`EpState::decode` — one decode, host-tested; the glue keeps no
+/// arithmetic copy).
 ///
 /// Indexing: the **device** context lays out slot ctx at index 0 and EP ctx
 /// for `dci` at index `dci` — `dci + 1` is the *input* context's layout
 /// (which has the Input Control Context at 0). First version read `dci + 1`
 /// here and reported state 0 (disabled) for a perfectly running endpoint,
 /// because it was reading the zeroed slot past the last real context.
-fn ep_state(x: &Xhci, dci: u8) -> u32 {
-    let base = context::context_offset(usize::from(dci), x.context_bytes);
-    // SAFETY: `DEV_CTX` is the live device context (DCBAA slot points at it);
-    // the lock is held and this is a read of our own DMA memory.
-    let dw0 = unsafe {
-        core::ptr::read_unaligned((&raw const DEV_CTX).cast::<u8>().add(base).cast::<u32>())
-    };
-    (dw0 >> 2) & 0x7
+fn ep_state(x: &Xhci, dci: u8) -> akuma_xhci::device::EpState {
+    // History: this read `dw0 >> 2` for a week — RUNNING became "disabled",
+    // `halted` was unreachable, Reset Endpoint never once ran on the metal,
+    // and the "ep disabled while transfers were working" mystery in
+    // `AKUMA_AMD64_USB_XHCI.md` was this arithmetic, not the controller.
+    // The decode moved into the crate so it cannot drift again.
+    akuma_xhci::device::EpState::decode(dev_ctx_dw0(x, dci))
 }
 
-fn print_ep_state(x: &Xhci, dci: u8) {
+/// Raw first dword of context entry `idx` in the live device context
+/// (idx 0 = slot context, idx dci = that endpoint's context). Diagnostic.
+fn dev_ctx_dw0(x: &Xhci, idx: u8) -> u32 {
+    let base = context::context_offset(usize::from(idx), x.context_bytes);
+    // SAFETY: `DEV_CTX` is the live device context (DCBAA slot points at it);
+    // the lock is held and this is a read of our own DMA memory.
+    unsafe {
+        core::ptr::read_unaligned((&raw const DEV_CTX).cast::<u8>().add(base).cast::<u32>())
+    }
+}
+
+/// Track the bulk endpoints' context states and print every transition —
+/// `ep 4 state run->halt->stop->run` is the recovery loop made visible, and
+/// a transition the model in `akuma_xhci::device` does not know about is a
+/// driver/controller disagreement worth a line. The state byte itself goes
+/// through the crate's decode (one decode, host-tested) rather than this
+/// file's arithmetic — the `>> 2` bug lived exactly in such a copy.
+fn note_ep_state(x: &mut Xhci, dci: u8) {
     let state = ep_state(x, dci);
+    let idx = usize::from(dci != x.bulk_in_dci);
+    let prev = x.ep_state_seen[idx];
+    x.ep_state_seen[idx] = match state {
+        akuma_xhci::device::EpState::Disabled => 0,
+        akuma_xhci::device::EpState::Running => 1,
+        akuma_xhci::device::EpState::Halted => 2,
+        akuma_xhci::device::EpState::Stopped => 3,
+        akuma_xhci::device::EpState::Error => 4,
+    };
+    if prev == x.ep_state_seen[idx] {
+        return;
+    }
+    let label = |code: u8| -> &'static str {
+        if code == 0xff {
+            "?"
+        } else {
+            akuma_xhci::device::EpState::decode(u32::from(code)).as_str()
+        }
+    };
     serial::puts("  [xhci] ep ");
     serial::put_dec(u64::from(u32::from(dci)));
     serial::puts(" state ");
-    serial::put_dec(u64::from(state));
-    serial::puts(" (0=dis 1=run 2=halt 3=stop 4=err)\n");
+    serial::puts(label(prev));
+    serial::puts("->");
+    serial::puts(label(x.ep_state_seen[idx]));
+    serial::puts("\n");
 }
+
+/// The crate's `EpState::as_str`, by way of a code — a tiny shim so the call
+/// sites above stay one line.
 
 /// Class-standard mass-storage recovery for a stalled or timed-out phase.
 /// Returns `true` when recovery ran and the caller may retry the command
@@ -1493,8 +1556,8 @@ fn recover(x: &mut Xhci, e: &BotErr) -> bool {
     } else {
         (Ring::BulkOut, RingField::BulkOut)
     };
-    let halted = ep_state(x, dci) == 2;
-    print_ep_state(x, dci);
+    let halted = ep_state(x, dci) == akuma_xhci::device::EpState::Halted;
+    note_ep_state(x, dci);
     let kind = match outcome {
         AttemptOutcome::Stalled { .. } => akuma_xhci::recovery::OutcomeKind::Stalled,
         AttemptOutcome::TimedOut { .. } => akuma_xhci::recovery::OutcomeKind::TimedOut,
@@ -1533,7 +1596,7 @@ fn recover(x: &mut Xhci, e: &BotErr) -> bool {
             }
         }
     }
-    print_ep_state(x, dci);
+    note_ep_state(x, dci);
     true
 }
 

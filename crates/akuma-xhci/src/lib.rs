@@ -36,6 +36,7 @@
 //! glue consumes it directly.
 
 pub mod context;
+pub mod device;
 pub mod recovery;
 pub mod regs;
 pub mod trb;
