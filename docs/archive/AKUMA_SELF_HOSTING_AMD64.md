@@ -6,8 +6,9 @@
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** plan, with measurements taken 2026-09-07 and the walk kept current
-in the dated boxes below (last updated 2026-09-11, after signal delivery and
-INTR→SIGINT — `AKUMA_AMD64_SIGNAL_DELIVERY.md`).
+in the dated boxes below (last updated 2026-09-12, after **C3** — the clock —
+which closes trunk C entirely: `AKUMA_AMD64_C3_CLOCK.md`. Only **box D** is
+left, and it is blocked on the xHCI recovery gap, not on kernel work).
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
 > `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
@@ -1446,56 +1447,111 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   hardcoded spelling reads it too. Both report `0.0.7`.
    │                   doc: AKUMA_AMD64_SSHD_SESSION_CHANNEL.md
    ▼
- [09-11] ═══ YOU ARE HERE ═══
+ [09-12] **C3: one clock.** The box said "clock.rs dies" and what had to
+   │   die was the second **anchor**. `akuma-syscalls-time` — shared,
+   │   linked into this kernel since B3's gate, and serving the family
+   │   for the *other* one — read `akuma_timer::uptime_us`, i.e. CNTVCT,
+   │   i.e. **`0` on x86 forever**, against a UTC offset nothing on this
+   ▼   target ever wrote. Meanwhile `amd64/src/clock.rs` kept its own
+   │   `(anchor_unix, anchor_uptime)` pair that `usermode.rs`'s own arms
+   │   and the two `utc_time_us` hooks read. Two clocks, each internally
+   │   plausible. Folding first would have been silent, and `nanosleep`
+   │   worst of all: it takes its deadline from the frozen clock and
+   │   parks against the *registered* one, so the park returns at once
+   │   and the exit test never fires — an unkillable spin.
+   │   Both halves now live in `akuma_primitives::clock`, which already
+   ▼   owned the monotonic hook both kernels register and which five of
+   │   glue's own modules already read. `akuma-timer` — the **AArch64**
+   │   generic-timer crate — no longer holds a wall clock, and
+   │   `akuma-syscalls-time` no longer depends on it at all.
+   │   Four arms folded (`clock_gettime`/`settime`/`adjtimex`/
+   │   `nanosleep`) and **six new `akuma-syscalls-abi` rows** —
+   │   `clock_getres`, `clock_nanosleep` (the spelling
+   │   `std::thread::sleep` emits), `clock_adjtime`, `setitimer`,
+   ▼   `times`, `getrusage` — each an `ENOSYS` here and served there,
+   │   because the implementation was in glue all along and there was no
+   │   number to reach it by. x86_64 305 is `clock_adjtime` and
+   │   **`nr::TIME`**; untranslated it would have answered with the wall
+   │   clock and no error. itimers fire from `idt::timer_dispatch`,
+   │   ungated by `from_user` (an `alarm` is set by a process that then
+   │   *blocks*), which first needed `wants_force_interrupt`'s
+   │   `signal_actions` hold to become a `try_lock` — a tick landing
+   ▼   inside `rt_sigaction` on the same core would have spun forever on
+   │   a lock that core owns.
+   │   **The probe found two defects and neither was a clock.**
+   │   `/probes/clockprobe`, 12 rungs, 12/12 on real Linux.
+   │   `pause(2)` **did not exist** — x86_64 34 is x86-only, musl emits
+   │   it raw here and `ppoll(0,0,0,0)` there, so `alarm(n); pause();`
+   │   — the oldest idiom in POSIX — had answered `ENOSYS` for this
+   ▼   kernel's whole life. And **every delivered signal cost the next
+   │   syscall a spurious `EINTR`**: `interrupt_thread`'s flag is
+   │   consumed by whoever reads it, and when the thread is *running*
+   │   nobody does, so the syscall after a handler returned got
+   │   `-EINTR` — `getpid()` came back `-4`. Pre-existing on **both**
+   │   kernels and invisible because the obvious victim is a `write`
+   │   whose result nobody checks. Consumed at the frame-install point
+   ▼   in each (`enter_handler`, `try_deliver_signal`), after the
+   │   `Ignore`/`Default` arms so the default-action Ctrl-C path is
+   │   untouched. A third closed on the way in: the shared
+   │   `sys_nanosleep` had no argument validation, and `tv_sec = -1`
+   │   reinterprets to a ~584 000-year park.
+   │   Gates: QEMU 665/0 (`SMP=1`, from 656/0) and 675/0 (`SMP=4`),
+   │   AArch64 315/0, host tests 1377/0, memory probes 10/10, ring-3
+   │   check OK, `^C` KILLED after 3.3 s. **Bare metal owed** — the box
+   │   was in use by another session.
+   │                        doc: AKUMA_AMD64_C3_CLOCK.md
+   ▼
+ [09-12] ═══ YOU ARE HERE ═══
    │
-   └──► **C1 is done**, and so are items 1 and 2 of what piece A left.
-        `kill`, `raise`, `abort`, handlers, `EINTR` out of a blocking
-        read, `^C` on the console, a catchable `SIGSEGV`, a truthful
-        `getpid` and delivery on the timer tick all work; the memory
-        probes are 10/10 for the first time and `amd64_mem_trials.py`'s
-        `EXPECTED_FAIL` table is empty.
+   └──► **Trunk C is done.** C1, C2 and C3 have all landed, and with
+        them every box in this chart except **D**. `clock_gettime`,
+        `nanosleep`, `clock_nanosleep`, itimers, `alarm`, `pause`,
+        `times`, `getrusage`, `adjtimex`, `kill`, `raise`, `abort`,
+        handlers, `EINTR` out of a blocking read, `^C` on the console, a
+        catchable `SIGSEGV`, a truthful `getpid` and delivery on the
+        timer tick all work; the memory probes are 10/10 and
+        `amd64_mem_trials.py`'s `EXPECTED_FAIL` table is empty.
 
-        What is left, in the order it argues for itself:
+        The three items C1 left are all closed — the per-thread
+        interrupt bit and its five stale `ProcessHooks` rows
+        (`AKUMA_AMD64_STALE_FALSE_HOOKS.md`), `akuma-net`'s
+        `is_current_interrupted` hook, and amd64's second session-stdio
+        implementation (`AKUMA_AMD64_SSHD_SESSION_CHANNEL.md`).
 
-        1. *(done)* **`is_current_interrupted` reads a per-thread bit**
-           (`akuma_threading::THREAD_INTERRUPTED`) — one relaxed atomic,
-           no `Arc`, no map lookup, and no identity resolution at all.
-           The shape this line asked for, arrived at the hard way: the
-           obvious fix (drop to `get_channel(tid)`) put an IRQ-masked
-           spinlock on every syscall and cost the **bare-metal** suite
-           665/0 → 663/3 while QEMU and Firecracker stayed green.
-           What it left: **five `|_| false` / `|_| None` hook rows whose
-           stated reasons had expired** — `amd64/src/sched.rs`'s
-           hand-written `ProcessHooks`. *(done 2026-09-11)* The table is
-           now `akuma_exec::register_process_hooks()`, the same eight
-           pointers the AArch64 kernel registers, so it cannot drift
-           again. Two rows were load-bearing: the park loop's
-           `is_current_interrupted`, and `clear_draining`/
-           `drain_in_flight`, which guard a reclaim sweep this target
-           calls from seven places.
-           **It was NOT the cause of `^C` on bare metal**, and chasing it
-           produced something better: `^C` had never interrupted a
-           sleeping job on **either** machine. `nanosleep` here was a
-           busy-yield loop checking only group exit, and QEMU/TCG's
-           guest clock runs ~6x wall-clock (`sleep 10` → 1.69 s vs
-           10.49 s on the metal), which made an uninterruptible 30 s
-           sleep end ~2 s after the keystroke and read as working. Fixed;
-           3.3 s on both machines now.
-           **Doc: `AKUMA_AMD64_STALE_FALSE_HOOKS.md`. Probe:
-           `scripts/utils/amd64_ctrlc_probe.py`.**
-        2. *(done 2026-09-11)* **`akuma-net`'s `is_current_interrupted`
-           hook** is wired to `should_interrupt_blocking_syscall`, the
-           same function AArch64 gives it. The "it is not free" note in
-           `net.rs`'s header is gone with it: the check is one relaxed
-           `AtomicBool::swap` on the common path, and `wait_until` asks
-           it only when the condition did not hold.
-        3. *(done — see the entry above)* **amd64's second implementation
-           of session stdio is deleted.** What it leaves open is smaller
-           and worth naming: `busybox stty size` still fails over ssh
-           (`stty: standard input`), which is **pre-existing** — A/B'd
-           against `75041b73` on the same rig, identical — and now
-           reports `ENOTTY` where it used to report nothing, so the
-           failing request is finally identifiable.
+        **What is left is box D, and it is not kernel work.**
+
+        1. **The xHCI recovery gap**, which is D's critical path. The
+           64 GB persistent root mounts clean at SuperSpeed and then
+           stalls under use (`transfer timeout: CBW`, unrecoverable for
+           the boot), and a self-host campaign needs a disk that
+           survives a build. Prompt:
+           `proposals/NEXT_AGENT_AMD64_XHCI_RECOVERY.md`. Needs the
+           bare-metal box.
+        2. **Then the first in-guest build** —
+           `proposals/NEXT_AGENT_AMD64_SELFHOST_FIRST_BUILD.md`. Its § 3
+           ranked the clock **first** among the three things most likely
+           to stop `cargo`, because fingerprinting is mtime-based; that
+           prediction is now answerable rather than open, and
+           `/probes/clockprobe` is the thing that answers it.
+
+        Smaller, and carried rather than blocking:
+
+        * **A bare-metal number is owed** for C3, and one has been owed
+          for the `execve`-returns piece since 09-11. Both want one boot
+          on a box that was in use by another session.
+        * `busybox stty size` still fails over ssh (`stty: standard
+          input`), **pre-existing** — A/B'd against `75041b73` on the
+          same rig, identical — and now reports `ENOTTY` where it used
+          to report nothing, so the failing request is identifiable.
+        * `getitimer` (x86_64 36) is still `ENOSYS`, equally on both
+          kernels: glue has no arm for asm-generic 102 either, so C3
+          had nothing to reach.
+        * The QEMU/TCG guest clock still runs ~5x wall-clock. The metal
+          is correct, so this is the emulated LAPIC. A TSC-derived
+          uptime is the obvious answer and is its own measured change —
+          `net::uptime_us` is what the scheduler, the network timeouts
+          and `park_until` all steer by. See
+          `AKUMA_AMD64_C3_CLOCK.md` § 7.
 
 ```
 
@@ -1621,13 +1677,16 @@ parity with what the AArch64 self-host already proves.
   └──────────────┬───────────────────┬─────────────────────────────┘
                  ▼                   ▼
   ┌────────────────────────┐ ┌─────────────────────────────────────┐
-  │ C2. fd.rs cache dies ✔ │ │ C3. clock.rs dies                   │
-  │   seven slices, 09-09  │ │   akuma-syscalls-time builds here   │
-  │   the Vec<u8> per open │ │   real clock: re-sync, drift,       │
-  │   file is GONE; reads  │ │   itimers, adjtimex                 │
-  │   go at fs::read_at.   │ │                                     │
-  │   LEFT: refcount flip, │ │                                     │
-  │   Spawn (wait4 done)   │ │                                     │
+  │ C2. fd.rs cache dies ✔ │ │ C3. the clock is one clock       ✔  │
+  │   seven slices, 09-09  │ │   DONE 09-12 — AKUMA_AMD64_C3_      │
+  │   the Vec<u8> per open │ │   CLOCK.md. Not the file: the       │
+  │   file is GONE; reads  │ │   second **anchor**. akuma-syscalls- │
+  │   go at fs::read_at.   │ │   time read akuma_timer (CNTVCT = 0  │
+  │   LEFT: refcount flip, │ │   on x86); it reads akuma_primitives │
+  │   Spawn (wait4 done)   │ │   ::clock now, where the UTC offset  │
+  │                        │ │   also lives. 4 arms folded, 6 new   │
+  │                        │ │   abi rows, itimers on the tick.     │
+  │                        │ │   clock.rs keeps only its SNTP client│
   └───────────┬────────────┘ └────────────────┬────────────────────┘
               └───────────────┬───────────────┘
                               ▼

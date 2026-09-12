@@ -8,21 +8,25 @@
 //! (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.5 — found while getting
 //! `apk` working, which is what this exists to fix).
 //!
-//! # The clock this keeps is not a real clock
+//! # What this file is, after C3
 //!
-//! It syncs **once**, right after the network comes up, and then just adds
-//! elapsed [`net::uptime_us`] to that one reading forever — there is no
-//! ongoing drift correction, no periodic re-sync, and the uptime source it
-//! rides on is itself the "coarse but honest" 10 ms-granularity LAPIC tick
-//! count `net.rs` already uses for network timeouts, not a calibrated
-//! hardware clock. That is a deliberate scope cut, not an oversight: the
-//! actual requirement — TLS certificate date validation — only needs the
-//! answer to be right to within the *year*, arguably the *day*, never the
-//! millisecond, and a stock-static-musl program's own TLS stack (`apk`,
-//! `wget`) is the only consumer. A real clock (periodic re-sync, drift
-//! slewing, an `adjtimex`-style gradual correction) is what `akuma-syscalls-
-//! time` already implements properly for platforms with a calibrated timer —
-//! see that crate's own header — and is not what this file is.
+//! **Only the SNTP client.** The clock it used to *keep* — a private
+//! `(anchor_unix, anchor_uptime)` pair, and the `clock_gettime`/`clock_settime`
+//! /`adjtimex` arms in `usermode.rs` that read it — is gone (2026-09-12,
+//! `docs/archive/AKUMA_AMD64_C3_CLOCK.md`). The anchor is
+//! `akuma_primitives::clock`'s, which is what `akuma-syscalls-time` reads, so
+//! there is one wall clock on this target instead of two that disagreed. What
+//! is left here is the part that is genuinely platform-specific: this machine
+//! has no RTC, so the only way it can learn the date is to ask the network.
+//!
+//! It is still not a *disciplined* clock. It anchors once and then adds
+//! elapsed [`net::uptime_us`] — the "coarse but honest" 10 ms-granularity
+//! LAPIC tick count `net.rs` already uses for network timeouts — with no
+//! frequency discipline; `adjtimex` steps rather than slews, a divergence
+//! pinned in `akuma-syscalls-time` for both kernels. That is a deliberate
+//! scope cut: the requirement this exists for — TLS certificate date
+//! validation — needs the answer right to within the *year*, arguably the
+//! *day*, never the millisecond.
 //!
 //! # Why SNTP and not the kernel command line
 //!
@@ -45,7 +49,8 @@
 //! header for why the AArch64 kernel does not wire the same loop up yet. This
 //! file is only the amd64-specific effects: a UDP socket via
 //! `akuma_net::socket`, DNS resolution via `akuma_net::dns`, and the local
-//! uptime/yield hooks `net.rs` already has.
+//! uptime/yield hooks `net.rs` already has. Where the result is *stored* is
+//! shared — see above.
 
 use akuma_net::socket::socket_const::SOCK_DGRAM;
 use akuma_net::socket::SocketAddrV4;

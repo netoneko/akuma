@@ -35,10 +35,42 @@ WILD-DA at `FAR=0x10`. On a large `clock_id`, the handler also decodes the
 diagnostics, no behavioural effect.
 
 Once past the guard: `clock_id == 0` (`CLOCK_REALTIME`) reads
-`akuma_timer::utc_time_us(akuma_timer::uptime_us())`; anything else falls
-back to `akuma_timer::uptime_us()` (i.e. every non-zero clock ID is treated
-as monotonic). `sys_clock_getres` (`lib.rs:380`) always reports 1 ns
+`akuma_primitives::clock::utc_time_us(uptime_us())`; anything else falls
+back to `akuma_primitives::clock::uptime_us()` (i.e. every non-zero clock ID
+is treated as monotonic). **Not `akuma_timer`** — see [the clock seam](#where-the-clock-comes-from). `sys_clock_getres` (`lib.rs:380`) always reports 1 ns
 resolution and ignores `clock_id` entirely.
+
+## where the clock comes from
+
+Both clocks this crate reads are `akuma_primitives::clock`'s:
+
+| | what it is | who installs it |
+|---|---|---|
+| `uptime_us()` | monotonic microseconds since boot, a boot-registered `OnceCopy` hook | `akuma_exec::runtime::register`, from each kernel's `ExecRuntime::uptime_us` — AArch64 passes `akuma_timer::uptime_us` (CNTVCT/CNTFRQ), amd64 passes `net::uptime_us` (`lapic::ticks() * 10_000`) |
+| `utc_time_us(at)` / `set_utc_time_us(unix, at)` | the UTC offset, one `AtomicU64`, `None` until something sets it | PL031/NTP on AArch64 (`akuma-kernel-core`'s `timer`/`ntp_boot`), SNTP on amd64 (`amd64/src/clock.rs`), and `clock_settime`/`settimeofday`/`adjtimex` from ring 3 on either |
+
+**It was `akuma_timer`'s until 2026-09-12** — both halves — and that is worth
+knowing because `akuma-timer` is the *AArch64 generic timer*: `uptime_us` there
+is `cntvct_el0()/cntfrq_el0()`, whose x86_64 arms in `akuma-cpu` are stubs
+returning `0`. So on the amd64 kernel every read in this crate was zero and the
+UTC offset was one nothing on that target ever wrote, while `amd64/src/clock.rs`
+kept a second anchor of its own. Two clocks, each internally plausible.
+`docs/archive/AKUMA_AMD64_C3_CLOCK.md` is the whole story; the rules that came
+out of it:
+
+- **Read the hook, not the timer crate.** A syscall crate says "the clock this
+  kernel installed", not "the ARM counter". The five sibling modules inside
+  `akuma-syscalls-glue` — `poll`, `sync`, `flock`, `timerfd`, `proc` — already
+  did; this crate was the odd one out and no longer depends on `akuma-timer`
+  at all.
+- **The anchor uptime is the caller's to supply.** `set_utc_time_us` takes it
+  rather than reading `uptime_us()` itself, because SNTP samples it at *packet
+  receipt* and hands it over after the parse. A convenience that read it
+  internally would silently add the parse to the clock.
+- **`0` is not "unset".** `utc_time_us` answers `Option`, and `is_utc_set()`
+  answers the same question without a timestamp in hand. At epoch 0 every TLS
+  certificate on earth is not-yet-valid, and a caller that cannot tell "no
+  clock" from "1970" reports that as a certificate error.
 
 ## clock_settime / adjtimex / clock_adjtime
 
@@ -167,6 +199,39 @@ deadlines convert through `akuma_timer::utc_time_us()` the same way
 `std::thread::sleep` on `target_os = "linux"` calls this syscall
 specifically, not plain `nanosleep`.
 
+### the `EINVAL` both sleeps owe Linux
+
+`sys_nanosleep` and `sys_clock_nanosleep` reject a malformed interval —
+`tv_sec < 0`, or `tv_nsec` outside `[0, 1e9)` — with `EINVAL`, via
+`Timespec::is_valid_interval()` in `akuma-syscalls-linux` (host-tested there).
+
+Added 2026-09-12 with the amd64 fold, and it is a hang rather than a wrong
+number: `to_us` *reinterprets*, so `tv_sec = -1` is `1.8e19` microseconds and
+the sleep loop parks for ~584 000 years — an unbounded wait reachable from
+unprivileged ring 3 by one bad argument. The amd64 kernel's own arm checked it
+and this crate did not, so the check came with the fold rather than being
+dropped on the way in.
+
+**It applies to the two sleeps and nothing else.** `pselect6`/`ppoll`/`futex`
+pass *timeouts*, where the tree's saturating answer to an absurd value is the
+established one, and `to_us`'s own note explains why validating inside a
+conversion helper changes syscall behaviour behind its callers' backs.
+
+### `alarm` and `pause` — the two x86-only spellings
+
+`sys_alarm(seconds)` (2026-09-12) arms `ITIMER_REAL` one-shot and returns the
+seconds left on whatever alarm it replaced, rounded up. It exists because musl
+spells `alarm(3)` as `SYS_alarm` where the number exists (x86_64 37) and as a
+`setitimer` pair where it does not — asm-generic has no `alarm`, so the AArch64
+kernel has never seen the syscall and the amd64 one answered `ENOSYS` to it.
+Plain integers in and out, so it lives here beside the timer state rather than
+being open-coded in the one kernel whose ABI needs it.
+
+Its partner `pause(2)` (x86_64 34, same story) is
+`akuma_syscalls_glue::sys_pause` — `rt_sigsuspend` with the mask the thread
+already has. Between them, `alarm(n); pause();` works on both kernels; it had
+returned `ENOSYS` on amd64 for that kernel's whole life.
+
 ## the timespec-to-timeout conversion (shared)
 
 Every blocking syscall that takes a `struct timespec *` timeout used to do the
@@ -222,6 +287,22 @@ wants_itimer_force_interrupt`) — an `SA_RESTART` heartbeat handler must not
 have its own blocking syscalls broken every tick. See
 `archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md` for the bug this guards against.
 
+That disposition read is a **`try_lock`** on `proc.signal_actions.actions`,
+falling back to the conservative `true` the function already returns when there
+is no process context. `check_itimers` runs in timer-IRQ context and that
+`Spinlock` has no IRQ masking on its holders, so a tick landing on a core
+already inside `rt_sigaction` for the same process would spin forever on a lock
+that core owns. A contended read costs an `SA_RESTART` handler one un-restarted
+syscall, in a window it can only reach by racing its own `sigaction` call.
+
+**Who calls it:** the AArch64 kernel through `akuma_exec::alarms::
+on_timer_interrupt`, which also services the async waker queue; the amd64
+kernel directly from `idt::timer_dispatch`, because that target has no waker
+queue and taking its `Spinlock` from an IRQ handler would be the same hazard
+again. Both are ungated by "did this tick interrupt ring 3" — an `alarm(5)` is
+usually set by a process that then *blocks*, so a check that only ran on
+ring-3 ticks would never fire for the caller it was written for.
+
 ## times / getrusage
 
 `sys_times` (`lib.rs:470`) and `sys_getrusage` (`lib.rs:481`) both zero-fill
@@ -236,6 +317,27 @@ i.e. clock ticks) is otherwise real.
 around `akuma_timer::utc_time_us()` / `akuma_timer::uptime_us()` — no
 argument validation needed since neither takes a pointer.
 
+## Coverage on the two kernels
+
+Every syscall in this file is served on **both** kernels since 2026-09-12.
+Before that the amd64 kernel had four of them as local arms in
+`amd64/src/usermode.rs` and answered `ENOSYS` to `clock_getres`,
+`clock_nanosleep`, `clock_adjtime`, `setitimer`, `times`, `getrusage` and
+`alarm` — not because the implementation was missing (it is here, and glue
+links into that kernel) but because `akuma-syscalls-abi` had no row mapping the
+x86_64 number to the asm-generic one. Watch `clock_adjtime`: x86_64 305 is
+`akuma_syscalls_linux::nr::TIME`, an Akuma-private number, so an untranslated
+one finds the *wrong arm* rather than none.
+
+Still `ENOSYS` on both: **`getitimer`** — there is no arm for asm-generic 102
+here either.
+
+The ring-3 gate is `userspace/forktest/c_stress/clockprobe.c`, twelve rungs,
+run by `scripts/utils/amd64_ring3_check.py` and valid on real Linux for an A/B.
+Its second rung is the one worth knowing about: `gettimeofday`, `time(2)` and
+`clock_gettime(CLOCK_REALTIME)` must be **one clock**, which is the property
+[the clock seam](#where-the-clock-comes-from) exists to keep.
+
 ## Background
 
 - `archive/GO_FORKTEST_DEBUG.md` — the `clock_gettime` leaked-x8 /
@@ -246,3 +348,8 @@ argument validation needed since neither takes a pointer.
   and the boot-time SNTP fallback. **Closed 2026-08-25**, verified on both
   QEMU (regression) and the actual Firecracker platform (the fallback
   firing).
+- `archive/AKUMA_AMD64_C3_CLOCK.md` — the 2026-09-12 clock-seam move (two
+  anchors into one), the six new `akuma-syscalls-abi` rows, the itimer tick,
+  and the two defects `clockprobe` found on the way: `pause(2)` missing
+  entirely, and every delivered signal costing the **next** syscall a spurious
+  `EINTR` on both kernels.
