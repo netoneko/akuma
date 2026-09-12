@@ -12,6 +12,7 @@ Start from the symptom or task on the left.
 | Booting a VM and connecting via SSH | [`boot-and-connect.md`](boot-and-connect.md) |
 | Changing Akuma/amd64 and testing it on the **real HP box**, hands-off | [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the two-personality ssh trap, `reboot -f`, the three KVM rigs, and the known-broken list (`date` 1970 → "certificate not trusted", pipes, `ps`, `wget https`) |
 | Not sure whether a devbox userspace process is actually hung or just slow | [`diagnose-hung-userspace-process.md`](diagnose-hung-userspace-process.md) — start here before kernel tracing or gdb |
+| Putting a nightly Rust toolchain inside the Akuma/amd64 guest | [`stage-rust-toolchain-amd64.md`](stage-rust-toolchain-amd64.md) — musl host, `--force-non-host`, loop-mount the image; and the `LD_LIBRARY_PATH`/`$ORIGIN` trap that makes `rustc` unable to find its own `.so` |
 | Building the devbox image | [`build-devbox.md`](build-devbox.md) |
 | Building the `extreme-size` (4 MB floor) image | [`build-extreme-size.md`](build-extreme-size.md) |
 | Debugging the devbox (SSH down, cargo crash, 100% CPU) | [`debug-devbox.md`](debug-devbox.md) |

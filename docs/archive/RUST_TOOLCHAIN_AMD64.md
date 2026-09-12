@@ -5,7 +5,9 @@
 `fa6a9f42-release-smp-shared`, toolchain installed with `apk add rust cargo`
 (Alpine `1.96.1-r0`, musl host target) onto the persistent root.
 **Status:** **rustc compiles, links and runs a Rust program in the guest**
-(session 3, 2026-09-12 — see below). Sessions 1 and 2 are preserved as written;
+(session 3, 2026-09-12 — see below), given an explicit `-C linker`. Plain
+`rustc hello.rs` still fails at `cc`, and the environment a spawned child
+receives is **empty** — no `PATH` at all — which is the open item to pull next. Sessions 1 and 2 are preserved as written;
 their open item 1 is closed. Follow-up to `docs/archive/RUST_TOOLCHAIN_ISSUES.md`
 (the AArch64 investigation) and part of box **D** of
 `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`.
@@ -245,7 +247,9 @@ From one `rustc` compile-and-link plus one `git clone` in the guest:
 
 Only `ftruncate` was load-bearing for linking; the rest are tolerated by their
 callers and are listed so the next `ENOSYS` can be checked against them rather
-than rediscovered. **Do not add rows speculatively** — `akuma-syscalls-abi`'s
+than rediscovered. Note what the list is also good for: a reproduction that adds
+**no** new number has ruled out this whole class, which is how the `cc` failure
+below was separated from it in one run. **Do not add rows speculatively** — `akuma-syscalls-abi`'s
 rule 1 is that a row is a claim that both architectures' numbers were checked.
 
 ### `git clone https://…` → `curl_multi_init failed`
@@ -282,6 +286,79 @@ row. `epoll` is the same shape behind `sc-epoll` and is what libcurl wants next.
 
 Until then, in-guest `git` works over `git://`/`ssh://` but not `https://`, and
 `apk` (which uses its own HTTP client, not libcurl) is unaffected.
+
+### Open: `rustc hello.rs` with no `-C linker` → `could not exec the linker \`cc\`: Function not implemented (os error 38)`
+
+Plain `rustc hello.rs` still fails, and the errno is wrong in a way that hides
+what is actually going on. What is **measured**, in order:
+
+1. **A spawned child gets no environment at all.** Over ssh, `busybox env`
+   prints exactly:
+
+   ```
+   SHLVL=1
+   PWD=/
+   ```
+
+   Both are the shell's own additions, so what sshd handed it was *empty*: no
+   `PATH`, no `HOME`, no `TERM`. (The shell's `echo $PATH` shows
+   `/sbin:/usr/sbin:/bin:/usr/bin`, which is busybox ash's built-in default for
+   an unset `PATH` — a default it does not export.) This is the standing item
+   in [`AMD64_SSH_TERM_SIZE_NOT_PASSED.md`](AMD64_SSH_TERM_SIZE_NOT_PASSED.md)
+   break 8 seen from the other end, and it is almost certainly upstream of
+   everything below: a toolchain driver decides what to exec from `PATH`.
+   The `VAR=val cmd` prefix form *does* work within the shell (`PATH=/zzz
+   busybox env` fails looking for `busybox` in `/zzz`), so this is about what
+   crosses `sys_spawn`, not about the shell.
+2. **rustc replaces the child's `PATH` with its own two directories** —
+   `…/rustlib/x86_64-unknown-linux-musl/bin` and that path's `self-contained`
+   subdirectory, **which does not exist** in a `--profile minimal` toolchain.
+   Neither contains `cc`. So on this image `cc` is genuinely unfindable by name
+   from rustc's linker invocation, and would be on Linux too.
+3. **An absolute linker path spawns fine.** `-C linker=/usr/bin/cc` gets all the
+   way to running gcc, which then fails for reasons 4 and 5. So neither the
+   spawn path nor argv is at fault.
+4. `collect2` then reports `cannot find 'ld'` — same PATH, one layer down. The
+   user reproduced this by hand with the exact command line rustc printed.
+5. With gcc's exec-prefix `PATH` supplied by hand, a `cc -static` of a C file
+   reaches `collect2: fatal error: cannot get program status: Interrupted
+   system call` — **a spurious `EINTR` out of `waitpid`**, which is its own
+   kernel bug and is the same family as the spurious-`EINTR`-after-a-signal
+   defect C3 found on both kernels ([`AKUMA_AMD64_C3_CLOCK.md`](AKUMA_AMD64_C3_CLOCK.md)).
+
+**Ruled out, by measurement rather than by argument:**
+
+* *Not* the argv cap. It is 256 now, this command line is ~40 entries, and the
+  `= note:` rustc prints is the line it *built*, which arrives complete.
+* *Not* a missing syscall row. The new `[syscall] no row for …` diagnostic
+  printed **nothing new** across a reproduction — the set before and after is
+  identical.
+* *Not* `execve` mis-reporting a missing file. Absolute missing paths answer
+  `ENOENT` (`/tmp/definitely-not-here`, `/usr/bin/zzz-not-here`, a seven-deep
+  `/tmp/a/b/c/d/e/f/g/zzz`), a missing program under a **nonexistent** directory
+  answers `ENOENT`, and musl's own `posix_spawnp` of an absent program answers
+  `ENOENT` (observed from gcc: `cannot execute 'cc1': posix_spawnp: No such file
+  or directory`). A busybox `PATH` search that steps over a missing directory
+  first still finds the program in a later one.
+* *Not* a failed `execve` poisoning the next one in the same task — the
+  `PATH=/tmp/nope:/usr/bin` control runs `cc` fine.
+
+**What is left**, and where to look next: Rust `std`'s `Command::spawn` does not
+use musl's `posix_spawnp` when the program has no slash *and* `PATH` is
+overridden — it does the search itself and execs in a forked child, reporting
+the child's errno through a `CLOEXEC` pipe. `38` is what comes back. So the
+question is what that child's exec (or the error pipe) answers on this target
+that Linux answers `ENOENT` for, with an **empty inherited environment**. Start
+by giving the guest a real `PATH` (fix 1) and re-testing: it may simply
+disappear, and it is worth knowing before chasing the errno.
+
+**Workarounds today**, in order of preference:
+
+* `-C linker-flavor=ld -C linker=<sysroot>/lib/rustlib/x86_64-unknown-linux-musl/bin/gcc-ld/ld.lld -C link-self-contained=yes`
+  — the toolchain's own linker, no `cc` and no `PATH` involved. This is the
+  combination that compiled, linked and ran a program.
+* `-C linker=/usr/bin/cc` plus a `PATH` carrying `/usr/bin` and gcc's exec
+  prefix, which then meets items 4 and 5.
 
 ### Staging the toolchain
 
