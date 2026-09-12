@@ -189,6 +189,19 @@ pub fn wait_for_acks() {
         if remaining == 0 {
             break;
         }
+        // A peer that took a fatal exception prints its dump and `halt()`s with
+        // interrupts off, so it will never acknowledge this generation and this
+        // loop can never end. That is stage 3 of the ssh-wedge chain
+        // (`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`): the
+        // sender spins here **holding the BKL**, every other core queues behind
+        // it, and the box looks hung rather than crashed. The machine is
+        // already dead at this point — one core is gone and its address space
+        // half-flushed — so stop, quietly: the dump on the console is the
+        // evidence, and a silent stop is what keeps it the last thing on screen.
+        // Deliberately not a print: this core would be printing into that dump.
+        if crate::idt::fatal_in_progress() {
+            crate::halt();
+        }
         spins += 1;
         if spins == STUCK_REPORT_SPINS {
             spins = 0;

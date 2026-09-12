@@ -67,6 +67,7 @@ use akuma_threading as threading;
 #[cfg(not(feature = "no-tests"))]
 use crate::lapic;
 use crate::paging;
+use crate::serial;
 use crate::smp::{self, NO_CPU};
 use crate::usermode::UserCtx;
 // The shared ring-3 register file. `akuma-exec-core` rather than `akuma-exec`
@@ -197,6 +198,12 @@ fn machines() -> *mut [Machine; MAX_TASKS] {
     &raw mut MACHINE
 }
 
+/// Page-frame bits of a page-table root, matching what `akuma-mmu` records in
+/// its freed-L0 ring. `CR3`'s low 12 bits are flags (`PWT`/`PCD`) and the top
+/// bits are reserved, so a root has to be reduced to the frame before it can be
+/// compared against that ring.
+const L0_BASE_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
 /// The kernel's own page-table root, captured at [`init`].
 ///
 /// A thread with `space_root == 0` runs in this. Recorded rather than re-read
@@ -250,6 +257,25 @@ fn hook_switch_to(from: usize, to: usize) {
             0 => KERNEL_ROOT.load(Ordering::Relaxed),
             root => root,
         };
+        // F8 tripwire, x86 spelling — the counterpart of `akuma-threading`'s
+        // `[SGI-S FREED-L0]`. A slot whose `space_root` names an L0 the free
+        // path has already handed back to the PMM is a dead address space one
+        // `mov cr3` away from being live again: the frame is reissued as
+        // something else, its PML4 slot 511 stops naming the kernel's PDPT, and
+        // the very next kernel access faults not-present from ring 0. Print the
+        // pair BEFORE the install, so a log names the culprit slot rather than
+        // only the core that died on it.
+        if akuma_mmu::l0_recently_freed(want & L0_BASE_MASK) {
+            serial::puts("[SWITCH FREED-CR3] root=0x");
+            serial::put_hex(want);
+            serial::puts(" from_slot=");
+            serial::put_dec(from as u64);
+            serial::puts(" to_slot=");
+            serial::put_dec(to as u64);
+            serial::puts(" core=");
+            serial::put_dec(smp::cpu_index() as u64);
+            serial::puts("\n");
+        }
         if (*m)[to].space_root != 0 || want != paging::active_root() {
             paging::activate(want);
         }
@@ -303,9 +329,48 @@ fn hook_can_run(slot: usize) -> bool {
     }
 }
 
+/// Which task slot, if any, is still carrying `l0_base` as the root its next
+/// switch-in will install — the x86 half of the address-space free gate.
+///
+/// `Machine::space_root` is this target's saved `TTBR0`: an off-CPU slot holds
+/// one, [`hook_switch_to`] writes it to `CR3` verbatim, and no per-core registry
+/// can see it (`akuma_mmu::any_core_on_l0` only knows what a core is running
+/// *now*). Freeing an L0 under such a reference is the ssh-wedge crash — the
+/// frame comes back as something else, PML4 slot 511 stops naming the kernel's
+/// PDPT, and the next kernel access after the `mov cr3` faults not-present from
+/// ring 0, inside the context switch.
+///
+/// Slot `0` never blocks: that is [`kernel_root`]'s spelling, not an address
+/// space. Every other state is a blocker on purpose, exactly as the AArch64
+/// scan documents — a FREE or INITIALIZING slot's root is overwritten by the
+/// next spawn and a TERMINATED one's by [`finish`], both of which release the
+/// deferred frames at the next drain, so treating them as references costs a
+/// short deferral where trusting the state machine costs the machine.
+///
+/// Bounded, lock-free, no heap: it runs inside the free gate, which the idle
+/// loop's reclaim reaches with the BKL held.
+fn any_task_on_space_root(l0_base: u64) -> Option<(usize, u8)> {
+    let l0 = l0_base & L0_BASE_MASK;
+    if l0 == 0 {
+        return None;
+    }
+    // SAFETY: raw-pointer read of one `u64` per slot. Unsynchronised on
+    // purpose — a slot that acquires this root *after* the scan cannot be a
+    // problem, because acquiring it requires a live `UserAddressSpace`, whose
+    // existence is what forbids the drop running this scan.
+    (0..MAX_TASKS).find(|&i| unsafe { (*machines())[i].space_root & L0_BASE_MASK == l0 })
+        .map(|i| (i, threading::get_thread_state(i)))
+}
+
 /// Register this target's machine effects with the scheduler. Called once, from
 /// [`init`], before any thread but the boot thread exists.
 fn register_hooks() {
+    // The free gate's saved-context arm, which answered a hardcoded `None` on
+    // this target until 2026-09-12 — see `akuma_threading::any_saved_ctx_on_l0`
+    // for what that cost. Registered first, before any hook that can start a
+    // thread: the gate has to be correct from the first address space, not from
+    // the first one that dies.
+    threading::register_saved_root_probe(any_task_on_space_root);
     threading::register_x86_arch_hooks(threading::X86ArchHooks {
         switch_to: hook_switch_to,
         current_slot: smp::current_task,
@@ -958,6 +1023,21 @@ pub fn set_task_space_root(task_slot: usize, root: u64) {
             m.space_root = root;
         }
     }
+}
+
+/// The page-table root a task slot will be given on its next switch-in — the
+/// value [`hook_switch_to`] writes to `CR3`, `0` meaning [`kernel_root`].
+///
+/// A **diagnostic** reader, for the fatal-exception dump and the freed-root
+/// tripwire: a `CR3` that names a torn-down address space is invisible in the
+/// register file (it is just a number), and the only thing that can say where
+/// it came from is the slot that carries it.
+#[must_use]
+pub fn task_space_root(task_slot: usize) -> u64 {
+    // SAFETY: raw-pointer read of one `u64`. Unsynchronised on purpose — the
+    // callers are a crashing core and a switch that already holds the slot —
+    // and out-of-range slots answer 0 rather than indexing.
+    unsafe { (*machines()).get(task_slot).map_or(0, |m| m.space_root) }
 }
 
 /// Seed a not-yet-running **clone child** with the two identities its entry

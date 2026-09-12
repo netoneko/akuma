@@ -151,6 +151,11 @@ static LAZY_BASE: AtomicU64 = AtomicU64::new(0);
 /// Length in bytes of the lazily-backed region.
 static LAZY_LEN: AtomicU64 = AtomicU64::new(0);
 
+/// Page-frame bits of `CR3` — the low 12 are `PWT`/`PCD` flags, not address.
+/// Matches `sched::L0_BASE_MASK` and `akuma-mmu`'s own; the freed-L0 ring is
+/// keyed on the frame.
+const CR3_FRAME_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
 /// `CR2` holds the faulting linear address after a page fault.
 fn read_cr2() -> u64 {
     let v: u64;
@@ -163,7 +168,24 @@ fn read_cr2() -> u64 {
 }
 
 /// Print a stack frame and stop.
+/// Set for the lifetime of a fatal exception (which is the life of the
+/// machine — `fatal` never returns). Printers that can fire from other cores
+/// during the dump check this and stand down.
+static FATAL_IN_PROGRESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether some core is printing a fatal exception dump.
+#[must_use]
+pub fn fatal_in_progress() -> bool {
+    FATAL_IN_PROGRESS.load(core::sync::atomic::Ordering::Acquire)
+}
+
 fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+    // Claim the console before the first byte: peer cores' `[BKL] stuck` and
+    // `[TLB] stuck` prints would otherwise interleave with this dump and
+    // shred the register values (both captures of the 2026-09-12 ssh-wedge
+    // crash were torn past reading). No release — the caller is `!`.
+    FATAL_IN_PROGRESS.store(true, core::sync::atomic::Ordering::Release);
+    let _ = akuma_primitives::console::claim_console_exclusive();
     serial::puts("\n[EXCEPTION] ");
     serial::puts(vector);
     if let Some(code) = error_code {
@@ -181,6 +203,35 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     serial::puts("\n  cr2=0x");
     serial::put_hex(read_cr2());
 
+    // The address space the fault happened in, and where that root came from.
+    //
+    // `CR3` is a bare number in the register file: nothing in a dump says
+    // whether it is the kernel root, a live process's, or a page-table frame
+    // the free path already handed back to the PMM. The last of those is the
+    // ssh-wedge crash's shape — a ring-0 not-present fault on a kernel address
+    // a `mov cr3` ago was mapped — and the three words below are what tell it
+    // apart from the other two in one line: `freed=1` means the root names a
+    // torn-down address space, and `slot_root` names the task slot that was
+    // carrying it (`sched::hook_switch_to` installs exactly that value).
+    //
+    // Guarded on `percpu_installed`: `cpu_index` reads `gs:[0]`, and on a core
+    // that faulted before `install_percpu` that is a dereference of 0 — a
+    // second fault inside the dump, which is how evidence gets lost.
+    let cr3 = crate::paging::active_root();
+    serial::puts(" cr3=0x");
+    serial::put_hex(cr3);
+    serial::puts(" freed=");
+    serial::put_dec(u64::from(akuma_mmu::l0_recently_freed(cr3 & CR3_FRAME_MASK)));
+    if crate::smp::percpu_installed() {
+        let slot = crate::smp::current_task();
+        serial::puts("\n  core=");
+        serial::put_dec(crate::smp::cpu_index() as u64);
+        serial::puts(" task_slot=");
+        serial::put_dec(slot as u64);
+        serial::puts(" slot_root=0x");
+        serial::put_hex(crate::sched::task_space_root(slot));
+    }
+
     // Dump the words at the faulting rsp. For a fault *on* an `iretq` this is
     // the return frame the CPU was rejecting — rip, cs, rflags, rsp, ss — which
     // is the only way to see which selector it actually objected to rather than
@@ -191,8 +242,42 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // the crash interrupted are in there, symbolizable against `nm` output.
     // Learned from the 2026-09-12 ssh-login crash: the faulting rip was a wild
     // `0x86` with no caller named, and 5 words were not enough to find one.
-    if frame.rsp != 0 && frame.rsp >= crate::phys::KERNEL_VMA {
-        serial::puts("\n  [rsp]");
+    //
+    // Gated on `PHYSMAP_BASE`, not `KERNEL_VMA`: kernel stacks are `Vec`
+    // allocations reached through the physmap (`0xFFFF_8000_…`), which is
+    // *below* the kernel image window, so a `>= KERNEL_VMA` test excluded every
+    // stack this dump was added to read. Measured 2026-09-12 — a crash with
+    // `rsp=0xffff80000080e1d8` printed no stack at all. The physmap base is the
+    // real floor: below it is non-canonical or user, and both are unreadable
+    // here.
+    if frame.rsp >= crate::phys::PHYSMAP_BASE {
+        // Eight words BELOW rsp first — the frame the interrupted code just
+        // finished popping. A `#DB` at the instruction after
+        // `akuma_threading_x86_switch_context` returns is the switch's own
+        // `popfq` having restored a flags word with `TF` set, and that word is
+        // at `rsp-64`: above rsp there is only what the resumed thread is about
+        // to use, which says nothing about what it restored. Read low-to-high
+        // so the last word printed is the one immediately under rsp.
+        serial::puts("\n  [rsp-64..rsp)");
+        for i in (1..=8).rev() {
+            // SAFETY: `rsp` is in the physmap and a kernel stack is at least a
+            // page, so 64 bytes below a live stack pointer is the same stack.
+            // Volatile so nothing reorders it into the prints.
+            let w = unsafe { (frame.rsp as *const u64).sub(i).read_volatile() };
+            if i % 4 == 0 {
+                serial::puts("\n   ");
+            }
+            serial::puts(" ");
+            serial::put_hex(w);
+        }
+        // Which window the stack is in, because it says which kind of stack it
+        // is without a symbol lookup: `physmap` is a heap-allocated thread
+        // stack, `image` is the boot/.bss one.
+        serial::puts(if frame.rsp >= crate::phys::KERNEL_VMA {
+            "\n  [rsp/image]"
+        } else {
+            "\n  [rsp/physmap]"
+        });
         for i in 0..64 {
             // SAFETY: checked to be a kernel-window address above; the kernel
             // stack is at least a page, and the read is volatile so nothing
@@ -205,6 +290,10 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
             serial::put_hex(w);
         }
     }
+    // And the caller chain hunt needs the fault address untorn — print it last
+    // so a torn line cannot hide it again.
+    serial::puts("\n  [cr2 final]=0x");
+    serial::put_hex(read_cr2());
     serial::puts("\n");
     crate::halt();
 }
@@ -225,6 +314,87 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
 
 extern "x86-interrupt" fn unhandled(frame: InterruptStackFrame) {
     fatal("unhandled vector", &frame, None);
+}
+
+/// One named stub per CPU exception vector, because `unhandled` names none.
+///
+/// An `x86-interrupt` handler is not told which vector called it, so every
+/// vector without a dedicated handler printed the same four words — and a dump
+/// that says `unhandled vector` is a dump that cannot tell `#DB` (a stray `TF`
+/// in a restored `rflags`) from `#SS` (a bad `rsp`) from `#MF` (a bad `fxrstor`
+/// area). Those are different bugs with the same four words, and the ssh-wedge
+/// crash produced exactly that line.
+///
+/// **Two macros, because the error-code shape is not cosmetic**: for a vector
+/// that pushes an error code, a handler declared without one reads the code
+/// where `rip` should be and reports a fabricated frame. The split is the
+/// architectural list (`#TS`, `#NP`, `#SS`, `#AC`, `#CP`, `#VC`, `#SX`), not a
+/// preference.
+///
+/// Vectors 0/6/8/13/14 keep their own handlers and are not generated here;
+/// everything at 32 and above is a device or IPI vector that `set_handler`
+/// claims at wire-up time and stays on plain [`unhandled`], where a wrong one
+/// means "nobody installed it" rather than "the CPU objected".
+macro_rules! exception_stubs {
+    ($($name:ident = $vector:literal, $label:literal;)*) => {
+        $(
+            extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+                fatal($label, &frame, None);
+            }
+        )*
+        /// Install every generated stub. Called by [`init`] after the blanket
+        /// fill and before the five hand-written entries, which override the
+        /// ones they share a vector with.
+        ///
+        /// `function_casts_as_integer` allowed for the reason [`init`] states:
+        /// a handler's address in a gate descriptor is what an IDT is.
+        #[allow(function_casts_as_integer)]
+        fn install_exception_stubs(idt: *mut [Entry; IDT_LEN]) {
+            // SAFETY: same obligation as `init`'s own writes — single core,
+            // interrupts masked, reached only through the raw pointer.
+            unsafe { $( (*idt)[$vector].set($name as usize); )* }
+        }
+    };
+}
+
+macro_rules! exception_stubs_with_code {
+    ($($name:ident = $vector:literal, $label:literal;)*) => {
+        $(
+            extern "x86-interrupt" fn $name(frame: InterruptStackFrame, code: u64) {
+                fatal($label, &frame, Some(code));
+            }
+        )*
+        #[allow(function_casts_as_integer)]
+        fn install_exception_stubs_with_code(idt: *mut [Entry; IDT_LEN]) {
+            // SAFETY: as above.
+            unsafe { $( (*idt)[$vector].set($name as usize); )* }
+        }
+    };
+}
+
+exception_stubs! {
+    vec_db  =  1, "#DB debug (TF/breakpoint)";
+    vec_nmi =  2, "#NMI non-maskable interrupt";
+    vec_bp  =  3, "#BP breakpoint";
+    vec_of  =  4, "#OF overflow";
+    vec_br  =  5, "#BR bound range";
+    vec_nm  =  7, "#NM device not available";
+    vec_cso =  9, "#CSO coprocessor segment overrun";
+    vec_mf  = 16, "#MF x87 floating point";
+    vec_mc  = 18, "#MC machine check";
+    vec_xm  = 19, "#XM SIMD floating point";
+    vec_ve  = 20, "#VE virtualization";
+    vec_hv  = 28, "#HV hypervisor injection";
+}
+
+exception_stubs_with_code! {
+    vec_ts  = 10, "#TS invalid TSS";
+    vec_np  = 11, "#NP segment not present";
+    vec_ss  = 12, "#SS stack fault";
+    vec_ac  = 17, "#AC alignment check";
+    vec_cp  = 21, "#CP control protection";
+    vec_vc  = 29, "#VC VMM communication";
+    vec_sx  = 30, "#SX security exception";
 }
 
 /// What [`page_fault_entry`] hands to [`page_fault_dispatch`]: the error code
@@ -1073,6 +1243,8 @@ pub fn init() {
         for i in 0..IDT_LEN {
             (*idt)[i].set(unhandled as usize);
         }
+        install_exception_stubs(idt);
+        install_exception_stubs_with_code(idt);
         (*idt)[0].set(divide_error as usize);
         (*idt)[6].set(invalid_opcode as usize);
         (*idt)[8].set(double_fault as usize);

@@ -3253,6 +3253,8 @@ fn x86_yield_now() -> bool {
     // Every machine effect, with `cur` still current and before the stack moves.
     (hooks.switch_to)(cur, next);
 
+    x86_check_incoming_frame(cur, next);
+
     // SAFETY: `cur`/`next` are both valid slot indices (`x86_pick_next` only
     // returns in-range candidates), `ON_CPU` above is what stops another core
     // resuming `next` concurrently, and `next`'s context was built either by
@@ -3261,6 +3263,68 @@ fn x86_yield_now() -> bool {
         x86_switch_context(get_context_mut(cur), get_context(next));
     }
     true
+}
+
+/// `RFLAGS` bits the kernel can legitimately be holding at a `pushfq` in
+/// [`akuma_threading_x86_switch_context`].
+///
+/// Everything else — `TF`, `IOPL`, `NT`, `VM`, `AC`, `VIF`/`VIP` — is either
+/// never set by this kernel or not settable from where it runs, so a saved
+/// frame carrying one is a frame that is not what it claims to be.
+#[cfg(target_arch = "x86_64")]
+/// `CF|1|PF|AF|ZF|SF|IF|DF|OF` (0xED7) plus `RF` (0x1_0000) and `ID`
+/// (0x20_0000). Written out because dropping one bit turns the check into a
+/// printer: an omitted `IF` made every ordinary `0x202` frame a report.
+const X86_KERNEL_RFLAGS_ALLOWED: u64 = 0x0021_0ED7;
+
+/// Look at the frame the switch is about to restore, and say so if it cannot be
+/// one.
+///
+/// # Why this is a check and not a repair
+///
+/// `akuma_threading_x86_switch_context` ends `popfq; ret`. A saved flags word
+/// with `TF` set makes the `ret` the last instruction before a `#DB` the kernel
+/// has no handler for — the machine dies one instruction after the switch, with
+/// the evidence already overwritten: the CPU pushes its exception frame exactly
+/// onto the 64 bytes the switch just popped. That is the 2026-09-12 ssh/apk
+/// wedge (`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`), and three
+/// captures of it said only "a bad flags word arrived from somewhere".
+///
+/// So this reads the word **before** the `popfq`, while the frame is still
+/// intact, and prints the whole of it: which slot, where its saved `rsp` points,
+/// and the seven words there. Sanitising the flags instead would be worse than
+/// useless — the other six registers and the return address come off the same
+/// frame, so a frame whose flags are wrong is one the `ret` cannot survive
+/// either; the value of stopping here is naming it.
+///
+/// One load and one compare on a switch that is already writing `CR3` and doing
+/// an `fxsave`/`fxrstor` pair.
+#[cfg(target_arch = "x86_64")]
+fn x86_check_incoming_frame(cur: usize, next: usize) {
+    // Layout is `switch_context`'s push order: [rsp+0] r15, +8 r14, +16 r13,
+    // +24 r12, +32 rbx, +40 rbp, +48 rflags, +56 return address.
+    const RFLAGS_OFF: usize = 48;
+    // SAFETY: `next` is in range and not running on any core (`ON_CPU`), so its
+    // context is stable here; the read is one word from a kernel stack this
+    // switch is about to restore from anyway.
+    let rsp = unsafe { (*get_context(next)).rsp };
+    if rsp == 0 {
+        return;
+    }
+    // SAFETY: `rsp` is a kernel stack pointer with at least seven words of
+    // frame above it — the frame the `pop`s below are about to consume.
+    let flags = unsafe { ((rsp as usize + RFLAGS_OFF) as *const u64).read_volatile() };
+    if flags & !X86_KERNEL_RFLAGS_ALLOWED == 0 && flags & 0x2 != 0 {
+        return;
+    }
+    safe_print!(160,
+        "[SWITCH BADFRAME] cur={} next={} state={} rsp={:#x} rflags={:#x}\n",
+        cur, next, THREAD_STATES[next].load(Ordering::SeqCst), rsp, flags);
+    for i in 0..8 {
+        // SAFETY: as above — eight words of the frame being restored.
+        let w = unsafe { ((rsp as usize + i * 8) as *const u64).read_volatile() };
+        safe_print!(64, "[SWITCH BADFRAME]   +{:#x} = {:#x}\n", i * 8, w);
+    }
 }
 
 /// Set up a fake IRQ frame on a new thread's stack
@@ -4819,15 +4883,46 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     })
 }
 
-/// x86_64 stub — TTBR0/L0 tracking is an AArch64 MMU concept with no x86_64
-/// analogue built yet (`akuma-mmu`'s x86_64 arm has no ASID/PCID support
-/// either, see `docs/archive/AKUMA_MMU_X86_ADDRESS_SPACE.md`). Answering
-/// "never referenced" is conservative in the caller's favor (it never blocks
-/// an L0 free on x86_64's account) and correct today: nothing on this target
-/// saves a `ttbr0`-shaped value anywhere.
+/// The x86_64 arm, which asks the target's scheduler rather than this file's
+/// [`Context`] — and **is not a stub**, though it was one until 2026-09-12.
+///
+/// The stub answered `None` under a premise it stated plainly: "nothing on this
+/// target saves a `ttbr0`-shaped value anywhere". That expired. `amd64`'s
+/// `sched::Machine::space_root` is exactly such a value — one `u64` per task
+/// slot that `hook_switch_to` writes to `CR3` verbatim on switch-in — and a
+/// `None` here let the free gate release an L0 that an off-CPU slot was still
+/// carrying. The failure is the x86 spelling of F8: the reissued frame stops
+/// naming the kernel's PDPT in PML4 slot 511, and the first kernel access after
+/// the `mov cr3` takes a not-present write fault from ring 0, inside the
+/// context switch (`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`).
+///
+/// It is a registered probe rather than a scan of `THREAD_CONTEXTS`, because on
+/// this target the page-table root is **not** in the saved context: x86
+/// `Context` is one `rsp` field (the callee-saved file lives on the thread's own
+/// stack), and the root lives in a table this crate cannot name without
+/// depending on the kernel that owns it. Unregistered it answers `None`, which
+/// is the old behaviour and is correct for exactly as long as the old premise
+/// held — before a scheduler exists there is no slot to be carrying a root.
 #[cfg(not(target_arch = "aarch64"))]
-pub fn any_saved_ctx_on_l0(_l0_base: u64) -> Option<(usize, u8)> {
-    None
+static SAVED_ROOT_PROBE: akuma_primitives::Registered<fn(u64) -> Option<(usize, u8)>> =
+    akuma_primitives::Registered::new(
+        "akuma-threading: saved-root probe not registered (x86_64 free gate degraded)",
+    );
+
+/// Register the x86_64 saved-root probe. Called once, by the target's scheduler
+/// `init`, before any address space can be built — the gate it feeds has to be
+/// correct for the whole run, not from the moment the first process dies.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn register_saved_root_probe(probe: fn(u64) -> Option<(usize, u8)>) {
+    SAVED_ROOT_PROBE.register(probe);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
+    if l0_base == 0 {
+        return None;
+    }
+    SAVED_ROOT_PROBE.get().and_then(|p| p(l0_base))
 }
 
 /// Test hook: swap a slot's saved-context TTBR0, returning the previous value

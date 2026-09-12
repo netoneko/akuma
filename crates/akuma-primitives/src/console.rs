@@ -159,6 +159,28 @@ pub fn print_args<const N: usize>(args: core::fmt::Arguments) {
     w.flush();
 }
 
+/// Set while one core is printing something nothing may interleave with — the
+/// fatal-exception dump, today its only claimer.
+static CONSOLE_EXCLUSIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Claim the console exclusively, returning whether it was already claimed.
+///
+/// Every [`print_args_if_registered`] on every core becomes a no-op from here
+/// on. **There is no release**, because the only caller is a `!` one: a core
+/// that has decided to print a dump and stop. Anything that wants a scoped
+/// claim needs a different device, not a `release` on this one — a peer core
+/// left mid-line by a premature release is the tear this exists to prevent.
+#[must_use]
+pub fn claim_console_exclusive() -> bool {
+    CONSOLE_EXCLUSIVE.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Whether a core holds the console exclusively.
+#[must_use]
+pub fn console_exclusive() -> bool {
+    CONSOLE_EXCLUSIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Like [`print_args`], but safe for callers that may run before/without a registered
 /// console sink.
 ///
@@ -166,7 +188,22 @@ pub fn print_args<const N: usize>(args: core::fmt::Arguments) {
 /// tests driving kernel types directly) and must never assume `runtime()`-style
 /// unconditional resolution. Skips the formatting work entirely — not just the print — when
 /// no sink is registered, per [`print_str`]'s "skip formatting work entirely" contract.
+///
+/// Output through this path is **suppressed while a core holds the console
+/// exclusively** (see [`claim_console_exclusive`]): a fatal exception dump is
+/// evidence, and a `[BKL] stuck` line from a peer core printed into its middle
+/// has shredded register values past reading (the 2026-09-12 ssh-wedge crash —
+/// both the metal photograph and the first QEMU capture were torn). A dump that
+/// names no caller is worth exactly what it costs to print.
+///
+/// Only this path is gated, not [`print_str`]/[`print_args`]: the claim is a
+/// last-words device, and the printers it has to outrank are exactly the
+/// unattended storms — `[BKL] stuck`, `[BKL] RECOVERED` — which all come
+/// through here. A deliberate print from the dying core still gets out.
 pub fn print_args_if_registered<const N: usize>(args: core::fmt::Arguments) {
+    if console_exclusive() {
+        return;
+    }
     if is_print_registered() {
         print_args::<N>(args);
     }
