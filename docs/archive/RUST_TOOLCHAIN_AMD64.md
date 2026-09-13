@@ -772,6 +772,81 @@ session does not rediscover them:
   (`busybox env` prints one line where it should print three), and a total
   environment around 4.5 KiB is `E2BIG` where Linux allows ~2 MiB.
 
+#### Defect 11 — every wait spun the core, and it cost ~100% of a vCPU
+
+**This is the one that was making the toolchain slow, and it was invisible.**
+
+`zerocopy` had never compiled on this target — two sessions had watched it sit
+at `Compiling zerocopy` and be killed. The measurement that started the hunt:
+the **same crate, same workspace, same physical CPU** builds in **16.2 s** on
+the box's Linux, and the guest was 30+ minutes in with its vCPU pegged at 100%.
+A pegged vCPU reads as "it is working", and that is the trap — the guest was
+pegged **while idle**, with nothing running but `sshd`:
+
+```
+IDLE guest, nothing running: 30.6 s CPU per 30 s wall = 102% of one host core
+```
+
+Three loops looked guilty and three fixes did not move the number:
+
+| loop | what it did | after fixing it |
+|---|---|---|
+| `net::netpoll_daemon` | `drain_step(); yield_now();` — never parked | 1 lap/tick. **Still 102%** |
+| `console::pump_daemon` | same, and its doc justified it by citing netpoll | parks on an idle lap. **Still 102%** |
+| `usermode::run_init`'s drive loop | `while !all_user_tasks_finished() { yield_now() }` for the life of the boot | parks a tick at a time. **Still 102%** |
+
+Guessing was not converging, so the kernel got a **profiler**:
+`sched::tick_profile` — two atomics in the timer vector, a hundred samples a
+second, printed by `netprobe`. One boot answered it:
+
+```
+[probe] ... laps=7303 idle=0 t0=7418 t1=16 t2=2
+```
+
+`idle=0`. The idle thread — which *does* `hlt` — was never reached, because
+something was always runnable. And the something was in the shared crate, not
+in any of the three loops: `akuma_threading::schedule_blocking`'s x86 arm ends
+
+```rust
+if !x86_yield_now() { (arch().allow_tick)(); }   // and loops
+```
+
+and `sched::allow_tick` was `sti; nop; cli`. So **the last thread to park spins
+the core at full speed until its deadline** instead of sleeping until the tick
+that will serve it. Every `nanosleep`, every futex timeout, every socket wait,
+every one of the three loops above — all of them ended in that spin. Fixing the
+loops only changed *which* thread did the spinning.
+
+`sti; hlt; cli` when the timer is armed (and the old spin when it is not — a
+no-network boot has no tick to wake on, and `main.rs` arms the timer only when
+there is a network):
+
+| | before | after |
+|---|---|---|
+| idle guest, host CPU | **102%** | **3%** |
+| `zerocopy` in the guest | never completed | **11 m 41 s** |
+
+The regression check is in the boot suite and had to be written three times,
+which is itself the lesson:
+
+* against the tick profile — wrong: when the parking thread is the *only*
+  runnable one, the halt happens on its own stack, so the ticks land on it and
+  not on the idle thread;
+* against `allow_tick`'s counter alone — wrong: when there *is* an idle thread
+  to switch to, the sleep happens in `idle_loop` instead and that counter stays
+  zero;
+* against both counters, parking twice, asserting the elapsed time as well —
+  right. The first park spends the sticky `WOKEN_STATES` flag the test's own
+  `wake(0)` left on the boot thread; without that the park returns instantly
+  and reports zero halts *and* zero spins, which looks exactly like the bug.
+
+It now reports `halts 6, spins 0` for a 50 ms park at a 10 ms tick — one sleep
+per tick.
+
+This is the AArch64 finding of `AKUMA_TIME_EXTRACTION.md` reached from the other
+side. There the host refused to honour a sub-2.5 ms `wfi` deadline and the idle
+loops became busy-polls; here the loops never asked to sleep at all.
+
 #### Correctness: `mmaplazy`
 
 A lazy fill path fails *silently* — it delivers zeros, or another part of the

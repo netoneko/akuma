@@ -271,7 +271,12 @@ fn net_runtime() -> NetRuntime {
         is_current_interrupted: akuma_exec::process::should_interrupt_blocking_syscall,
         rng_fill,
         current_thread_id: || crate::sched::current_task() as u32,
-        wake_netpoll: || {},
+        // **No longer a no-op.** The table above said "there is no parked core to
+        // ring a doorbell at", and that was true while every wait was a spin.
+        // The netpoll daemon parks between idle laps now, so a caller that has
+        // just given the stack something to do — a loopback push, a socket
+        // write — must end that park, or the work waits for the next tick.
+        wake_netpoll,
     }
 }
 
@@ -401,6 +406,30 @@ fn report_init(r: Result<(), &'static str>) -> bool {
 /// spawned task is actually being scheduled.
 static NETPOLL_LAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// How long an idle netpoll lap parks for.
+///
+/// **One tick, because one tick is the clock's resolution** — `block_until_deadline`
+/// compares against `uptime_us`, which advances only on the LAPIC tick, so any
+/// shorter deadline rounds up to this anyway (`sched::block_until_deadline`).
+///
+/// This exists because the loop used to end in a bare `yield_now()`, which is
+/// the AArch64 disease of `docs/archive/AKUMA_TIME_EXTRACTION.md` in a different
+/// dialect: nothing ever parked, so the scheduler always had a runnable thread,
+/// the idle loop never reached its `hlt`, and **an idle guest burned 102% of a
+/// host core** (measured 2026-09-13 on the Firecracker rig, nothing running but
+/// `sshd`). On a one-vCPU guest that is not merely waste — it is the CPU a
+/// compile is trying to use.
+///
+/// The cost is latency on an idle system: with no NIC interrupt on this target
+/// (see the module header), an arriving packet waits for the next tick. That is
+/// the regime the AArch64 kernel was in before it registered the virtio-net SPI
+/// on 2026-08-19 (`docs/archive/AKUMA_NET_ISSUES.md` §3.1 measured ~4.9 ms
+/// average), and registering the MMIO IRQ here is the same fix — the command
+/// line already names it (`virtio_mmio.device=512@0xfeb00000:5`). Until then a
+/// **doorbell** covers the case that matters most: anything that hands the stack
+/// local work rings `wake_netpoll` and the park ends immediately.
+const NETPOLL_IDLE_PARK_US: u64 = crate::lapic::US_PER_TICK_TARGET as u64; // one tick
+
 /// Where inside its loop the daemon has got to — three counters, bumped at
 /// three points, because "laps 0" alone has three completely different causes
 /// and they need opposite fixes.
@@ -512,7 +541,7 @@ extern "C" fn netpoll_daemon() -> ! {
             crate::smp::cpu_index_u32(),
             akuma_bkl::sync::HOLD_TAG_NETPOLL,
         );
-        drain_step();
+        let polls = drain_step();
         NETPOLL_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Keep trying SNTP until the wall clock is set. `sync_tick` is a no-op
         // once synced and self-rate-limits otherwise, so this costs a relaxed
@@ -531,7 +560,33 @@ extern "C" fn netpoll_daemon() -> ! {
                 print_probe_line(now, laps);
             }
         }
-        crate::sched::yield_now();
+        // **Park when the lap did nothing; yield when it did.**
+        //
+        // `drain_step` answers how many polls moved the stack, and the two cases
+        // want opposite things. A lap that found work is in the middle of a
+        // burst — TCP rarely arrives alone — so it yields and comes straight
+        // back, which is what keeps throughput. A lap that found none has
+        // nothing to come back for until a packet or a timer says otherwise,
+        // and spinning through it is what cost this target an entire host core
+        // at idle (see [`NETPOLL_IDLE_PARK_US`]).
+        if polls == 0 {
+            crate::sched::block_until_deadline(uptime_us() + NETPOLL_IDLE_PARK_US);
+        } else {
+            crate::sched::yield_now();
+        }
+    }
+}
+
+/// End [`netpoll_daemon`]'s idle park early: the stack has work now.
+///
+/// Registered as `NetRuntime::wake_netpoll`. Safe before the daemon exists
+/// (slot 0 means unspawned) and safe when it is not parked — `sched::wake`
+/// records the sticky wake flag rather than losing it, which is what stops a
+/// doorbell rung just before the park from being missed.
+fn wake_netpoll() {
+    let slot = NETPOLL_SLOT.load(core::sync::atomic::Ordering::Relaxed);
+    if slot != usize::MAX {
+        crate::sched::wake(slot);
     }
 }
 
@@ -738,6 +793,21 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     serial::put_dec(akuma_net::smoltcp_net::nic_irq_count());
     serial::puts(" laps=");
     serial::put_dec(laps);
+    // The tick-sampled profile: who is actually on the CPU. Three slots and the
+    // idle count are enough to tell "one thread is spinning" from "the machine
+    // is asleep", which is the question a 100%-busy vCPU poses.
+    let (idle, top) = crate::sched::tick_profile::<3>();
+    serial::puts(" idle=");
+    serial::put_dec(idle);
+    for (slot, n) in top {
+        if n == 0 {
+            continue;
+        }
+        serial::puts(" t");
+        serial::put_dec(slot as u64);
+        serial::puts("=");
+        serial::put_dec(n);
+    }
     serial::puts("\n");
 }
 

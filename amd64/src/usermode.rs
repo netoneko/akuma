@@ -7373,8 +7373,38 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // Drive the round-robin from the boot task. Unbounded on purpose: a shell
     // runs until it exits, and the spin cap the self-tests use would kill it
     // mid-session.
+    //
+    // **It parks between checks; it used to spin.** This loop was a bare
+    // `yield_now()`, and it is what kept this target's vCPU at 100% for the
+    // whole life of every boot — measured 2026-09-13 on the Firecracker rig: an
+    // idle guest, nothing running but `sshd`, burned 102% of a host core, and
+    // the tick-sampled profile (`sched::tick_profile`, written to answer this)
+    // read `idle=0 t0=4818` — every sample on slot 0, none on the idle thread.
+    // `sched::idle_loop` can only reach its `hlt` when nothing is runnable, and
+    // this thread was always runnable.
+    //
+    // Two poll loops were parked first on the theory that they were the cause
+    // (`net::netpoll_daemon`, `console::pump_daemon`); both were, in their own
+    // right, and neither moved the number. The profiler did in one boot what
+    // three rounds of reading code did not, which is the lesson worth keeping.
+    //
+    // Why a deadline and not an event: what this waits for is "every user task
+    // finished", which no single site publishes — there is no one place to hang
+    // a wake on. One tick of latency on noticing that init exited costs
+    // nothing; a spin costs the core a compile is trying to use.
+    //
+    // Why the `timer_running` guard: `uptime_us` advances only on the tick, and
+    // `main.rs` arms the timer only when there is a network. Parking against a
+    // clock that does not move would hang a no-network boot forever — the same
+    // condition `console::pump_daemon` carries, for the same reason.
     while !crate::sched::all_user_tasks_finished() {
-        crate::sched::yield_now();
+        if crate::lapic::timer_running() {
+            crate::sched::block_until_deadline(
+                crate::net::uptime_us() + u64::from(crate::lapic::US_PER_TICK_TARGET),
+            );
+        } else {
+            crate::sched::yield_now();
+        }
     }
     serial::puts("\n-- init exited --\n");
     true

@@ -335,24 +335,48 @@ fn wake_reader() {
 
 /// The pump, as a daemon task.
 ///
-/// # Why it yields rather than parking on a deadline
+/// # It parks between idle laps, and yields when it cannot
 ///
-/// `sched::block_until_deadline` resolves at the LAPIC tick, and the timer is
-/// not running on every boot this target supports (`main.rs` starts it only
-/// when there is a network). A pump that parks on a clock that is not ticking
-/// is a console that never delivers a keystroke — the one failure this module
-/// must not have. `yield_now` needs nothing but the round-robin, and it is the
-/// same cost profile this target already accepts: `net::netpoll_daemon` is a
-/// permanent yield loop, and `fd::read_console` was one for the whole time a
-/// shell sat at a prompt. The difference is that this one also runs while
-/// nothing is reading, which is the honest price of a polled console with no
-/// IOAPIC behind it.
+/// This loop was `pump_once(); yield_now();` unconditionally, and the note here
+/// justified that by pointing at its neighbour: *"the same cost profile this
+/// target already accepts: `net::netpoll_daemon` is a permanent yield loop"*.
+/// Both were wrong together, and the measurement says how wrong: **an idle
+/// guest — nothing running but `sshd` — burned 102% of a host core**
+/// (2026-09-13, Firecracker rig). Nothing ever parked, so the scheduler always
+/// had a runnable thread, so `sched::idle_loop` never reached its `hlt` and the
+/// vCPU never slept. On a one-vCPU guest that is the CPU a compile is trying to
+/// use. It is the AArch64 finding of `docs/archive/AKUMA_TIME_EXTRACTION.md` in
+/// a different dialect — there the host refused to honour a sub-2.5 ms `wfi`
+/// deadline and the idle loops became busy-polls; here the loops simply never
+/// asked to sleep.
+///
+/// The original objection was real and is kept as the `else`: `uptime_us`
+/// advances only on the LAPIC tick, and `main.rs` arms the timer only when
+/// there is a network, so on a no-network boot a parked pump is **a console
+/// that never delivers a keystroke** — the one failure this module must not
+/// have. So the park is conditional on [`crate::lapic::timer_running`], and a
+/// lap that moved bytes yields rather than parking, because someone is typing.
+///
+/// Cost of the park: a keystroke arriving while parked waits for the next tick,
+/// 10 ms. Against a human at a keyboard that is not observable; against the
+/// host core it saves, it is free.
 extern "C" fn pump_daemon() -> ! {
     loop {
-        pump_once();
-        crate::sched::yield_now();
+        let moved = pump_once();
+        if moved || !crate::lapic::timer_running() {
+            crate::sched::yield_now();
+        } else {
+            crate::sched::block_until_deadline(
+                crate::net::uptime_us() + PUMP_IDLE_PARK_US,
+            );
+        }
     }
 }
+
+/// How long an idle pump lap parks for: one tick, which is the resolution
+/// `block_until_deadline` has (`sched::block_until_deadline`). See
+/// [`pump_daemon`].
+const PUMP_IDLE_PARK_US: u64 = crate::lapic::US_PER_TICK_TARGET as u64; // one tick
 
 /// Whether [`spawn_pump`] has already run.
 static PUMP_SPAWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

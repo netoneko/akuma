@@ -1734,6 +1734,27 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │     argument after it — session 3's silent-argv-truncation defect one
    │     layer down. `MAX_ARG_STRLEN` and a hard `E2BIG` now.
    │
+   ├──► **And the one that was actually making it slow: every wait spun.**
+   │   `zerocopy` had never compiled here — two sessions watched it sit at
+   │   `Compiling zerocopy` and killed it. The same crate builds in **16.2 s**
+   │   on the box's own Linux, on the same silicon. The guest was pegged at
+   │   100% — which reads as progress, until you measure an **idle** guest and
+   │   find it pegged too: 102% of a host core with nothing but `sshd` running.
+   │
+   │   Three poll loops were the obvious suspects and three fixes moved
+   │   nothing (`netpoll_daemon`, `console::pump_daemon`, `run_init`'s drive
+   │   loop — all `yield_now()` forever). So the kernel got a **tick-sampled
+   │   profiler** (`sched::tick_profile`, two atomics in the timer vector), and
+   │   one boot said it: `idle=0` — the idle thread, which does `hlt`, was
+   │   never reached.
+   │
+   │   The spin was in the shared crate: `schedule_blocking`'s x86 arm ends in
+   │   `allow_tick()` when nothing else can take the core, and that was
+   │   `sti; nop; cli`. **The last thread to park spun until its deadline** —
+   │   every `nanosleep`, futex timeout and socket wait on this target. Making
+   │   it `sti; hlt; cli` when the timer is armed: **idle 102% → 3%**, and
+   │   `zerocopy` compiles in **11 m 41 s**.
+   │
    └──► Where the pin lives is the one design decision worth carrying:
         `akuma-mmap` has an empty `[dependencies]` table and that is
         load-bearing, so `FileBacking` is **integers only** and the

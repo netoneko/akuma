@@ -169,6 +169,9 @@ pub fn ticks() -> u64 {
 /// (`smp::ticks_on`) and every core's request a reschedule of *that core*.
 pub fn on_tick() {
     crate::smp::this_cpu_tick();
+    // A hundred samples a second, costing two atomics: which thread was on the
+    // CPU when the tick landed. See `sched::note_tick_sample`.
+    crate::sched::note_tick_sample();
     if crate::smp::cpu_index() == 0 {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
@@ -351,7 +354,26 @@ pub fn start_timer() {
     write(REG_TIMER_DIV, TIMER_DIV_16);
     write(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_TIMER_PERIODIC);
     write(REG_TIMER_INIT, TIMER_COUNT.load(Ordering::Relaxed));
+    TIMER_RUNNING.store(true, Ordering::Relaxed);
 }
+
+/// Is the periodic tick armed?
+///
+/// **A daemon that wants to sleep has to ask this first.** `uptime_us` advances
+/// only when the timer vector runs, and `main.rs` arms the timer only when there
+/// is a network — so on a no-network boot every deadline is unreachable and a
+/// thread parked against one never wakes. A poll loop therefore has two correct
+/// behaviours, not one: park between laps when the clock moves, yield when it
+/// does not. `console::pump_daemon` is the loop that made this needed
+/// (2026-09-13); before it, "the timer might not be running" was a reason to
+/// spin *always*, which cost a host core at idle.
+#[must_use]
+pub fn timer_running() -> bool {
+    TIMER_RUNNING.load(Ordering::Relaxed)
+}
+
+/// Backs [`timer_running`]. Set by [`start_timer`], cleared by [`stop_timer`].
+static TIMER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// The initial count when calibration could not run: the historical value, kept
 /// so a machine with no PIT behaves exactly as it did before calibration
@@ -694,6 +716,7 @@ pub fn enable_and_check_clock() -> bool {
 pub fn stop_timer() {
     write(REG_LVT_TIMER, LVT_MASKED);
     write(REG_TIMER_INIT, 0);
+    TIMER_RUNNING.store(false, Ordering::Relaxed);
 }
 
 #[cfg(not(feature = "no-tests"))]

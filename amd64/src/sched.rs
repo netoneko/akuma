@@ -528,6 +528,59 @@ pub fn preempt_if_needed(from_user: bool) {
     }
 }
 
+/// A **tick-sampled profile**: how many timer ticks found each task slot on the
+/// CPU, plus one bucket for "the core was idle".
+///
+/// A hundred samples a second is a profiler, and this target had none. It was
+/// added on 2026-09-13 to answer a question nothing else could: the Firecracker
+/// guest burned 100% of a host vCPU while `ps` showed one sleeping process, and
+/// two separate poll loops were "obviously" the cause — both were parked, and
+/// the CPU stayed pegged. Guessing which thread is runnable does not converge;
+/// asking the tick does, in one boot.
+///
+/// Read it with `netprobe`, which prints the busiest slots on its status line.
+static TICK_SAMPLES: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Ticks that landed on the idle thread — the CPU had nothing to do.
+static TICK_SAMPLES_IDLE: AtomicU64 = AtomicU64::new(0);
+
+/// Record which slot this tick interrupted. Called from the timer vector, so it
+/// must do nothing but arithmetic: no lock, no allocation, no print.
+pub fn note_tick_sample() {
+    let cur = current();
+    // SAFETY: raw-pointer read of this core's own machine slot, as
+    // `preempt_if_needed` does two lines away and for the same reason.
+    let idle = unsafe { (*machines())[cur].idle };
+    if idle {
+        TICK_SAMPLES_IDLE.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(c) = TICK_SAMPLES.get(cur) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(idle_samples, [(slot, samples); n])` for the busiest `n` non-idle slots.
+#[must_use]
+pub fn tick_profile<const N: usize>() -> (u64, [(usize, u64); N]) {
+    let mut top = [(0usize, 0u64); N];
+    for (slot, c) in TICK_SAMPLES.iter().enumerate() {
+        let v = c.load(Ordering::Relaxed);
+        if v == 0 {
+            continue;
+        }
+        // Insertion into a tiny fixed array: N is 3, so a sort would cost more
+        // than it saves and would need a scratch buffer this cannot allocate.
+        if let Some(pos) = top.iter().position(|&(_, have)| v > have) {
+            let mut i = N - 1;
+            while i > pos {
+                top[i] = top[i - 1];
+                i -= 1;
+            }
+            top[pos] = (slot, v);
+        }
+    }
+    (TICK_SAMPLES_IDLE.load(Ordering::Relaxed), top)
+}
+
 /// Switches performed from the timer interrupt rather than from a `yield_now`.
 static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -819,6 +872,7 @@ pub fn idle_loop() -> ! {
         akuma_exec::process::reclaim::drain_retired_if_requested();
         if !threading::x86_yield() {
             smp::bkl_leave();
+            IDLE_HALTS.fetch_add(1, Ordering::Relaxed);
             // SAFETY: interrupts on for exactly the `hlt`, then off again. The
             // timer vector is installed and its handler takes the BKL itself.
             unsafe {
@@ -1428,11 +1482,77 @@ pub fn finish() -> ! {
 /// `sti` takes effect only after the following instruction, so the `nop` is the
 /// window and a pending tick is recognised at the boundary before `cli`.
 pub fn allow_tick() {
-    // SAFETY: interrupts on for exactly one instruction. The timer vector is
-    // installed, takes no lock, and will not switch away from kernel code.
-    unsafe {
-        core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+    // **`hlt`, not `nop`, when the tick is what we are waiting for.**
+    //
+    // This was `sti; nop; cli`: open a one-instruction window, let a pending
+    // tick land, mask again. Correct, and it is also why this target burned a
+    // whole host core doing nothing. `akuma_threading::schedule_blocking`'s x86
+    // arm ends with
+    //
+    // ```text
+    // if !x86_yield_now() { (arch().allow_tick)(); }   // and loop
+    // ```
+    //
+    // — so the *last* thread to park spins through this window at full speed
+    // until its deadline, instead of sleeping until the tick that will serve
+    // it. Measured 2026-09-13 on the Firecracker rig: an idle guest with
+    // nothing but `sshd` running held its vCPU thread at **102% of a host
+    // core**, and `sched::tick_profile` showed `idle=0` — the idle loop, which
+    // does halt, was never reached, because someone was always runnable.
+    //
+    // `hlt` waits for the same interrupt the `nop` was hoping to catch, and
+    // wakes on anything else that matters too. The safety argument is
+    // unchanged: `sti` opens the window, the timer vector takes no lock and
+    // does not switch away from kernel code, and `cli` restores the mask the
+    // caller had.
+    //
+    // **Unless the timer is not running.** `main.rs` arms it only when there is
+    // a network, and a `hlt` with no timer and no device interrupt is a core
+    // that never comes back. That boot keeps the old spin, which is the
+    // behaviour it has always had.
+    if crate::lapic::timer_running() {
+        ALLOW_TICK_HALTS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: interrupts on for exactly the `hlt`, then off again — the
+        // same bracket `idle_loop` uses.
+        unsafe {
+            core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+        }
+    } else {
+        ALLOW_TICK_SPINS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: interrupts on for exactly one instruction.
+        unsafe {
+            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+        }
     }
+}
+
+/// Times [`idle_loop`] put the core to sleep.
+///
+/// The other half of "did the core sleep": a park either switches to the idle
+/// thread (which halts here) or, when the parking thread is the only one left,
+/// halts inside [`allow_tick`]. A check that counts one and not the other reads
+/// a sleeping kernel as a spinning one — which is exactly what the first two
+/// versions of the boot check did.
+static IDLE_HALTS: AtomicU64 = AtomicU64::new(0);
+
+/// [`allow_tick`] calls that slept until the next interrupt.
+static ALLOW_TICK_HALTS: AtomicU64 = AtomicU64::new(0);
+/// [`allow_tick`] calls that opened a one-instruction window and returned — the
+/// no-timer fallback.
+static ALLOW_TICK_SPINS: AtomicU64 = AtomicU64::new(0);
+
+/// `(halts, spins)` — how the kernel spends a wait: halts counts both
+/// [`allow_tick`]'s sleep and [`idle_loop`]'s.
+///
+/// The pair is the regression check on the 2026-09-13 fix: a wait that halts
+/// calls this once per tick, and one that spins calls it as fast as the CPU
+/// can loop. Counting both separates "it slept" from "it could not".
+#[must_use]
+pub fn allow_tick_counts() -> (u64, u64) {
+    (
+        ALLOW_TICK_HALTS.load(Ordering::Relaxed) + IDLE_HALTS.load(Ordering::Relaxed),
+        ALLOW_TICK_SPINS.load(Ordering::Relaxed),
+    )
 }
 
 /// Switch to the next runnable thread, round-robin.
@@ -1771,6 +1891,62 @@ pub fn block_smoke_test(t: &mut Suite) {
     } else {
         t.check("block: timeout worker spawned", false);
     }
+
+    // **A park must let the core sleep, not spin it.**
+    //
+    // Everything above passes whether the wait halts or burns the CPU — a
+    // deadline arrives either way — and for the life of this target it burned
+    // it. `akuma_threading::schedule_blocking`'s x86 arm ends in
+    // [`allow_tick`] when nothing else can take the core, and that was
+    // `sti; nop; cli`: the last thread to park spun at full speed until its
+    // deadline. Measured 2026-09-13 on the Firecracker rig, an idle guest held
+    // a host core at **102%**; with `allow_tick` halting it is 3%.
+    //
+    // The tick-sampled profile is what makes it checkable from inside: park
+    // this thread with nothing else runnable, and the ticks that pass must land
+    // on the **idle** thread. If they land anywhere else, something is spinning
+    // through the wait — which is the regression this check exists for.
+    //
+    // The counter, not the profile: when the caller is the *only* runnable
+    // thread the halt happens on its own stack, so the ticks land on it rather
+    // than on the idle thread — the first version of this check asserted the
+    // opposite and failed against a kernel that was sleeping correctly.
+    //
+    // A 50 ms park at a 10 ms tick sleeps ~5 times. A spinning one calls
+    // `allow_tick` as fast as the CPU can loop, so the bound is what
+    // discriminates: anything under a tick's worth of calls is a sleep, and
+    // thousands is the bug.
+    //
+    // **Park twice.** `schedule_blocking` returns immediately when the sticky
+    // `WOKEN_STATES` flag is set, and this test set it two steps ago: its
+    // `wake(0)` — the "waking a task that is not parked reports false" check —
+    // names slot 0, which is this thread. The first park spends that flag; the
+    // second is the one worth measuring. A park that returns instantly counts
+    // no halts and no spins, which is how the first version of this check
+    // reported a sleeping kernel as neither.
+    let deadline = crate::net::uptime_us().saturating_add(TEST_TIMEOUT_US);
+    block_until_deadline(deadline);
+
+    let (halts_before, spins_before) = allow_tick_counts();
+    let started = crate::net::uptime_us();
+    block_until_deadline(started.saturating_add(TEST_TIMEOUT_US));
+    let elapsed = crate::net::uptime_us().saturating_sub(started);
+    let (halts, spins) = allow_tick_counts();
+    let (halted, spun) = (halts - halts_before, spins - spins_before);
+    t.note("block: microseconds the 50 ms park actually took", elapsed);
+    t.note("block: halts during it", halted);
+    t.note("block: allow_tick spins during it", spun);
+    // Both halves, because either alone can pass on a broken kernel: a park
+    // that returns instantly halts zero times *and* spins zero times, and a
+    // park that spins for the full 50 ms also "waited".
+    t.check(
+        "block: the park actually waited its deadline",
+        elapsed >= TEST_TIMEOUT_US,
+    );
+    t.check(
+        "block: and it slept rather than spinning (allow_tick/idle halt)",
+        halted > 0 && spun == 0,
+    );
 
     // SAFETY: masking interrupts is the conservative direction.
     unsafe {
