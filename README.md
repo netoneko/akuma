@@ -6,6 +6,8 @@
 
 **Bare-metal AArch64 OS in Rust — preemptive kernel, Linux ABI, SSH, containers, apk, TCC/Clang/GCC/rustc, Git**
 
+**Self-hosting achieved on aarch64** (2026-08-16) - see [here](./docs/archive/AKUMA_SELF_HOSTING.md).
+
 **Now runs on Graviton 2** via Firecracker (2026-08-21) - verified on `m6g.metal` machine in `ap-northeast-1` Tokyo AWS region, see [here](./docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md).
 
 **Redis, Go and Rust all run real workloads here** (2026-08-17) — including the
