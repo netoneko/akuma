@@ -1704,6 +1704,36 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   `akuma-mmap` (7 new tests on `FileBacking`'s offsets through
    │   every clip and split).
    │
+   ├──► **`cargo` builds a proc macro.** With the mappings fixed the guest was
+   │   given real `cargo` work, smallest first: a fresh crate (2.2 s), a no-op
+   │   rebuild (0.04 s — fingerprinting works), `--release`, two vendored
+   │   dependencies, a build script emitting `cargo:rustc-env`, and then
+   │   `thiserror` — which drags in `thiserror-impl`, `syn`, `quote` and
+   │   `proc-macro2`. All of it builds and runs; `rustc` `dlopen`s the macro.
+   │   **That is the wall the previous session hit** ("still zerocopy and
+   │   zerocopy-derived not compiled").
+   │
+   │   Two defects were behind it, both silent:
+   │
+   │   * **`execve` resolved a relative path against `/`.** Relative `open`
+   │     goes through glue and uses `cwd`; this target's own `execve`/`spawn`
+   │     handed the raw string to `read_image`. So
+   │     `cargo build && ./target/debug/prog` said "not found" for a file `ls`
+   │     had just listed — and where a same-named file existed at the root, it
+   │     **silently ran that one instead**.
+   │   * **`MAX_ENVP` was 64; a cargo build script's environment is ~62.**
+   │     Cargo sets 56 variables itself (counted from its own `-vv` line), and
+   │     the shell's are on top. `execve` refuses rather than truncating —
+   │     correct — but the child then `_exit(1)`s before its first instruction
+   │     and the errno never reaches the parent (§ 4.5), so cargo reports
+   │     `exit status: 1` with **no stdout and no stderr**. Two extra exported
+   │     variables were enough to flip a working crate into it. 256 now.
+   │   * **And the boot test written for that one found a third:** every
+   │     argv/envp string was read with a 512-byte cap that answered by
+   │     *ending the list*, so an argument past it vanished along with every
+   │     argument after it — session 3's silent-argv-truncation defect one
+   │     layer down. `MAX_ARG_STRLEN` and a hard `E2BIG` now.
+   │
    └──► Where the pin lives is the one design decision worth carrying:
         `akuma-mmap` has an empty `[dependencies]` table and that is
         load-bearing, so `FileBacking` is **integers only** and the

@@ -4010,21 +4010,44 @@ fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
 /// at the kernel. `E2BIG` is what Linux answers and is impossible to
 /// misattribute.
 fn user_strv(ptr: u64, max: usize) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    // The initial stack is where every one of these strings lands
+    // ([`loader::build_stack`]), so it is the honest ceiling on their total
+    // size. Refusing here rather than there keeps the kernel from copying
+    // megabytes out of ring 3 to build an argv that cannot be placed — and
+    // `build_stack` still has its own `rsp < base` check, because this one is
+    // about the copy and that one is about the arithmetic.
+    const ARG_BYTES_MAX: usize = ELF_STACK_PAGES * 4096 / 2;
+
     let mut out = alloc::vec::Vec::new();
     if ptr == 0 {
         return Some(out);
     }
     let entry = |i: usize| crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
+    let mut bytes = 0usize;
     for i in 0..max {
         // A bad array pointer ends the list, like a NULL entry would.
         let p = entry(i);
         if p == 0 {
             return Some(out);
         }
-        match user_cstr(p, 512) {
-            Some(s) => out.push(s),
-            None => return Some(out),
+        // **An over-long string fails the whole call; it does not end the
+        // list.** This read was capped at 512 bytes and answered `None` by
+        // returning what it had so far, which is the silent-truncation shape
+        // this tree has paid for twice: session 3's `argv` cap of 16 ran every
+        // linker without its inputs, and glue's own `parse_argv_array` had the
+        // identical `break` (rustc saw `--check-cfg` with its value gone).
+        // Measured 2026-09-13: `sh -c "<667-byte command>"` lost the command
+        // and the child reported `sh: -c requires an argument` — a 512-byte
+        // argument is nothing unusual in a `cargo`-generated `rustc` line.
+        //
+        // `MAX_ARG_STRLEN` is the shared cap glue uses, so the two kernels
+        // refuse the same argument rather than one of them mangling it.
+        let s = user_cstr(p, akuma_config::MAX_ARG_STRLEN)?;
+        bytes = bytes.saturating_add(s.len() + 1);
+        if bytes > ARG_BYTES_MAX {
+            return None;
         }
+        out.push(s);
     }
     // `max` entries and still no terminator: the caller has more to say than
     // this target can place on the initial stack.
@@ -5740,6 +5763,68 @@ pub fn redirect_test(t: &mut Suite) {
     } else {
         t.check("cwd: sh spawned for the fork-inheritance probe", false);
     }
+    // **A big environment must survive `execve`.** The loader caps envp entries
+    // ([`loader::MAX_ENVP`]) and `execve` refuses rather than truncating, so a
+    // cap set too low does not degrade — it kills the child before its first
+    // instruction, with `E2BIG` that reaches the parent as a bare `exit status:
+    // 1`. At 64 that was every cargo **build script**: measured 2026-09-13, a
+    // crate that built went to `exit status: 1` on exporting two more shell
+    // variables, and `proc-macro2`'s script — which every derive macro needs —
+    // never ran.
+    //
+    // 80 entries here is past where the old cap sat and far below the new one,
+    // so it fails if `MAX_ENVP` is ever lowered back toward a cargo-sized
+    // environment. The shell adds its own on top of these.
+    {
+        let mut cmd = alloc::vec::Vec::new();
+        cmd.extend_from_slice(b"env");
+        for i in 0u8..80 {
+            // Digits by hand: this runs before anything in the suite may
+            // allocate for a message, and a two-digit name needs no formatter.
+            cmd.extend_from_slice(b" PAD");
+            cmd.push(b'0' + i / 10);
+            cmd.push(b'0' + i % 10);
+            cmd.extend_from_slice(b"=y");
+        }
+        cmd.extend_from_slice(b" /bin/busybox echo ENVOK\0");
+        if let Some((status, out)) = run_sh_capture(&cmd) {
+            t.check_eq("exec: 80 environment entries exited 0", status, 0);
+            t.check(
+                "exec: and the program ran with them (MAX_ENVP is not a cargo-sized cap)",
+                out.starts_with(b"ENVOK"),
+            );
+        } else {
+            t.check("exec: sh spawned for the big-environment probe", false);
+        }
+    }
+
+    // **A long single argument must survive `execve`.** Each argv/envp string
+    // was read with a 512-byte cap that answered by *ending the list*, so an
+    // argument longer than that took every argument after it with it — the
+    // silent-truncation shape that ran every linker without its inputs in
+    // session 3, here one layer down. `sh -c "<667 bytes>"` lost the command
+    // and busybox reported `sh: -c requires an argument` (measured
+    // 2026-09-13); a `cargo`-generated `rustc` line carries several arguments
+    // that size.
+    {
+        let mut cmd = alloc::vec::Vec::new();
+        cmd.extend_from_slice(b"/bin/busybox echo LONGARG");
+        // Past the old cap by a clear margin, in one argument.
+        for _ in 0..700 {
+            cmd.push(b'x');
+        }
+        cmd.push(0);
+        if let Some((status, out)) = run_sh_capture(&cmd) {
+            t.check_eq("exec: an argument past the old 512-byte cap exited 0", status, 0);
+            t.check(
+                "exec: and the whole command line survived",
+                out.starts_with(b"LONGARG"),
+            );
+        } else {
+            t.check("exec: sh spawned for the long-argument probe", false);
+        }
+    }
+
     // **A relative path means the process's own directory, at `execve` too.**
     // This target's `execve`/`sys_spawn` handed the raw path to `read_image`,
     // which resolves symlinks and not `cwd`, so every relative exec was read

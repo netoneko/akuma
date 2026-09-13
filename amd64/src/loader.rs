@@ -446,11 +446,36 @@ fn map_range(
 /// ~2 KiB and not ~5.
 pub const MAX_ARGV: usize = 256;
 
-/// The most envp entries the initial stack builder will place. `execve` from a
-/// shell hands the child its whole environment; 64 covers a login shell's
-/// `PATH`/`HOME`/`TERM`/… and the dozen `CARGO_*`/`RUST*` variables a build
-/// adds, and bounds the copy (same reasoning as [`MAX_ARGV`]).
-pub const MAX_ENVP: usize = 64;
+/// The most envp entries the initial stack builder will place.
+///
+/// **256 since 2026-09-13, and the 64 it replaces was the wall every
+/// proc-macro crate hit.** The note here used to say 64 "covers a login
+/// shell's `PATH`/`HOME`/`TERM`/… and the dozen `CARGO_*`/`RUST*` variables a
+/// build adds". A dozen is what a *rustc* invocation adds. A **build script**
+/// gets the full `CARGO_CFG_*` / `CARGO_PKG_*` / `CARGO_FEATURE_*` set —
+/// measured, 56 variables cargo sets itself — plus whatever the shell already
+/// had, which lands a `cargo build` at 60-64 entries: right on the cap, so
+/// whether a crate built at all depended on how many features it had and how
+/// many variables the operator happened to export.
+///
+/// The failure was silent in the worst way. `execve` refuses rather than
+/// truncating (correctly — silent argv truncation is what made every linker run
+/// without its inputs, see [`MAX_ARGV`]), so the child got `E2BIG`, `_exit(1)`d
+/// before running a line of its own code, and cargo reported
+/// `process didn't exit successfully … (exit status: 1)` with **no stdout and
+/// no stderr**, because the program had never started. `proc-macro2`'s build
+/// script is the first one every derive macro needs, so `thiserror`, `serde`,
+/// `zerocopy` and everything like them failed at exactly that line with nothing
+/// to read (`docs/archive/RUST_TOOLCHAIN_AMD64.md` § session 5).
+///
+/// The one-line reproduction, in the guest: take any crate with a build script
+/// that builds, `export` two more variables, and build it again.
+///
+/// Linux caps the *bytes* (`ARG_MAX`), not the entry count. 256 is four times
+/// what a cargo build script needs and symmetric with [`MAX_ARGV`]; the cost is
+/// [`STACK_WORDS_MAX`]'s word block, which is kernel stack — 2824 B before,
+/// 4360 B now, against `sched::STACK_SIZE`'s 32 KiB.
+pub const MAX_ENVP: usize = 256;
 
 /// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL,
 /// and the auxv — **fifteen** key/value pairs, so thirty words: `AT_PHDR`,
@@ -505,9 +530,16 @@ pub fn build_stack(
     // `[u64; MAX_ARGV]` beside the word block, which at a 256-entry argv is two
     // kilobytes of kernel stack holding what the word block is about to hold
     // anyway.
+    // `checked_sub`, not `-`: the caller bounds the total string size
+    // (`usermode::user_strv`'s `ARG_BYTES_MAX`), and this is the arithmetic
+    // that would wrap if it ever stopped. A wrapped cursor stays *above* the
+    // `rsp < base` check below, so the failure would be a write at a wild
+    // address rather than the `Err` it is here.
     let mut cursor = top;
     for s in argv.iter().chain(envp) {
-        cursor -= s.len() as u64 + 1;
+        cursor = cursor
+            .checked_sub(s.len() as u64 + 1)
+            .ok_or("argv/envp strings do not fit below the stack top")?;
     }
     // `AT_RANDOM` points at 16 bytes on the stack, below the string blob.
     // glibc's `ld.so` reads it unconditionally for its pointer-guard setup;

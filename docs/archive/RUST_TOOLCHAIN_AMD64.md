@@ -658,6 +658,120 @@ above ~16 pages wins and a dense one does not. If a future workload sits on the
 wrong side of that line, `READAHEAD_PAGES` in `amd64/src/mm.rs` is the knob, and
 the measurement above is the method — not a guess at a better default.
 
+#### `cargo` builds a crate graph, a build script, and a proc macro
+
+With the mapping work in, the guest was asked to do real `cargo` work, smallest
+first. Everything below is one `cargo build --offline` in the Firecracker guest
+against the vendored sources at `/src/akuma`:
+
+| shape | result |
+|---|---|
+| `cargo new` + `cargo build` | 2.2 s, runs |
+| the same build again, nothing changed | 0.04 s — **fingerprinting works**, so mtimes are right |
+| `--release` | 0.9 s, runs |
+| two vendored dependencies (`byteorder`, `bitflags`) | resolves, locks, compiles three crates, runs |
+| a **build script** emitting `cargo:rustc-env` | runs, and the value reaches the crate |
+| a **proc macro** (`thiserror` → `thiserror-impl` → `syn`/`quote`/`proc-macro2`) | **works** — 1 m 50 s, and `rustc` `dlopen`s the macro |
+
+Two kernel defects were in the way, and both were silent in a way that cost the
+previous session a whole evening ("still zerocopy and zerocopy-derived not
+compiled").
+
+##### Defect 8 — `execve` resolved a relative path against `/`, not the cwd
+
+`cargo build && ./target/debug/prog` reported `not found` for a binary `ls` had
+listed in that same shell a line earlier. Relative `open` goes through glue's
+`sys_openat`, which resolves against `Process::cwd`; this target's **own**
+`sys_execve` and `sys_spawn` handed the raw string to `read_image`, which
+resolves symlinks and nothing else. So the two syscalls disagreed about what a
+path meant.
+
+The dangerous half is not the missing file. With a same-named file at the root,
+the exec **silently ran the wrong program**:
+
+```
+# cd /tmp/hi/target/debug && ls -l hi     → the 4.6 MB binary cargo just built
+# ./hi
+hello from akuma gcc                      ← /hi, left over from an earlier session
+```
+
+Fixed in `amd64/src/usermode.rs` (`process_relative_path`, on both the `execve`
+and `sys_spawn` paths), which is glue's rule restated where this kernel can
+reach it. Boot self-test: `cd /bin && ./busybox echo RELEXEC`, guarded by an
+assertion that no `/busybox` exists, so the check cannot pass vacuously.
+
+##### Defect 9 — the envp cap was 64, and a cargo build script needs ~62
+
+**This is the proc-macro wall.** `amd64/src/loader.rs`'s `MAX_ENVP` was 64, and
+its note said that covered "a login shell's `PATH`/`HOME`/`TERM`/… and the dozen
+`CARGO_*`/`RUST*` variables a build adds". A dozen is what a *rustc* invocation
+adds. A **build script** gets the whole `CARGO_CFG_*` / `CARGO_PKG_*` /
+`CARGO_FEATURE_*` set — counted from cargo's own `-vv` line, **56 variables
+cargo sets itself** — plus whatever the shell already exported. That lands a
+build script at 60-64 entries: exactly on the cap.
+
+`execve` refuses rather than truncating, which is correct (silent argv
+truncation is defect 1 of session 3). But the child then `_exit(1)`s before
+running a line of its own code, and the parent reads EOF instead of the errno
+(§ 4.5's open divergence), so cargo reports:
+
+```
+error: failed to run custom build command for `proc-macro2 v1.0.106`
+Caused by:
+  process didn't exit successfully: `…/build_script_build` (exit status: 1)
+```
+
+with **no `--- stdout` and no `--- stderr`** — because the program never
+started. Every derive macro needs `proc-macro2`, so `thiserror`, `serde` and
+`zerocopy` all failed at that line with nothing to read.
+
+The reproduction is two lines, and it is what made the diagnosis certain:
+
+```sh
+cd /tmp/rep && cargo build --offline          # a crate with a build script: works
+cd /tmp/rep && env PAD0=y PAD1=y cargo build --offline   # exit status: 1
+```
+
+Two more environment variables, nothing else. `MAX_ENVP` is 256 now — four
+times what a cargo build script needs, symmetric with `MAX_ARGV`, and costing
+1.5 KiB more kernel stack in the word block (2824 → 4360 bytes against
+`sched::STACK_SIZE`'s 32 KiB). Linux caps the *bytes* (`ARG_MAX`), not the
+count. Boot self-test: an 80-entry environment through `execve`.
+
+##### Defect 10 — every argv/envp string was capped at 512 bytes, and the cap truncated the list
+
+Found by the boot self-test written for defect 9, which is the argument for
+writing it: an 80-variable `env` line is ~660 bytes as a single `sh -c` string,
+and the child answered `sh: -c requires an argument`. `usermode::user_strv` read
+each string with `user_cstr(p, 512)` and, on failure, `return Some(out)` — the
+list ended there. So an argument longer than 512 bytes disappeared **and took
+every argument after it**.
+
+That is session 3's defect 1 one layer down (there the cap was 16 *entries*),
+and glue's `parse_argv_array` had the identical `break` until it was fixed for
+the same reason — `rustc` saw `--check-cfg` with its value gone. A
+cargo-generated `rustc` command line carries several arguments of that size, so
+this was reached by ordinary work, not by anything exotic.
+
+Now: the shared `akuma_config::MAX_ARG_STRLEN` per string, so both kernels
+refuse the same argument rather than one of them mangling it, and an over-long
+string fails the call (`E2BIG`) instead of ending the list. A total-bytes budget
+comes with it — the initial stack is where the strings land, so half of it is
+the ceiling on the copy — and `build_stack`'s cursor walk is `checked_sub` now,
+because a wrapped cursor would have stayed *above* its `rsp < base` guard and
+written at a wild address.
+
+Two smaller things found on the way and **not** fixed, recorded so the next
+session does not rediscover them:
+
+* A linker output lands mode `644`. `chmod` works (the boot suite checks it), so
+  this is `rust-lld`'s own `fchmod`/create mode not taking effect. Harmless
+  today only because this kernel's `execve` does not check `X_OK` — two
+  divergences cancelling, which is worth fixing before one of them moves.
+* A single environment variable above ~256 bytes comes out mangled
+  (`busybox env` prints one line where it should print three), and a total
+  environment around 4.5 KiB is `E2BIG` where Linux allows ~2 MiB.
+
 #### Correctness: `mmaplazy`
 
 A lazy fill path fails *silently* — it delivers zeros, or another part of the
