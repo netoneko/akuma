@@ -5,10 +5,16 @@
 `akuma-mmap` adoption, the `akuma-mmu` x86 surface, and the `usermode.rs` fold —
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
-**Status:** plan, with measurements taken 2026-09-07 and the walk kept current
-in the dated boxes below (last updated 2026-09-12, after **C3** — the clock —
-which closes trunk C entirely: `AKUMA_AMD64_C3_CLOCK.md`. Only **box D** is
-left, and it is blocked on the xHCI recovery gap, not on kernel work).
+**Status:** **the quest is answered — on 2026-09-13 the guest built this
+kernel.** `cargo build --release` for the amd64 kernel ran to completion inside
+Akuma/amd64 under Firecracker: 94 crates, 7 m 53 s, `rc=0`, and a 2 895 920-byte
+`ET_EXEC` x86-64 image with a PVH note at the end of it. Trunks A, B and C all
+landed (C3, the clock, closed C on 2026-09-12 — `AKUMA_AMD64_C3_CLOCK.md`), and
+box D fell to the last three walls: the idle spin, the unvendored fonts and
+`MAX_ARGV`. What is *not* done is the same thing it has been since 09-10 — the
+build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
+64 GB xHCI root, which still stalls under use. The plan below is kept as written
+(measurements taken 2026-09-07) with the walk current in the dated boxes.
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
 > `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
@@ -1656,7 +1662,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
           and `park_until` all steer by. See
           `AKUMA_AMD64_C3_CLOCK.md` § 7.
    ▼
- [09-13] ═══ YOU ARE HERE ═══ file mappings stop being eager
+ [09-13] ═══ FILE MAPPINGS STOP BEING EAGER ═══
    │
    ├──► **`tag=9` is answered.** The `[BKL] stuck … tag=9` storms above
    │   were not contention *around* `mmap`; they were one `mmap`. Every
@@ -1763,6 +1769,61 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         releases every pin with no teardown path having to know they
         exist.
         docs: RUST_TOOLCHAIN_AMD64.md § session 5
+   ▼
+ [09-13] ═══ YOU ARE HERE ═══ THE KERNEL BUILT ITSELF
+   │
+   ├──► **Akuma/amd64 compiled its own kernel, inside itself**, under
+   │   Firecracker on the trashcan:
+   │
+   │       Finished `release` profile [optimized] target(s) in 7m 53s
+   │       BUILD EXITED rc=0
+   │
+   │   and the artifact is real:
+   │   `/tmp/ktarget/x86_64-unknown-none/release/akuma-amd64`,
+   │   **2 895 920 bytes**, `7f 45 4c 46 02 01 01` — ELF64, `02 00` =
+   │   `ET_EXEC`, `3e 00` = x86-64 — and it carries the **PVH note**
+   │   Firecracker boots from. 94 crates in the graph.
+   │
+   ├──► **Three walls stood between the box above and this one**, and the
+   │   first is that box: the idle spin. `zerocopy` was never stuck, it
+   │   was **starved** — idle burned 102% of a host core.
+   │
+   │   2. **The staged source had no vendored fonts**, so
+   │      `akuma-fbcon`'s build script panicked: `git archive` skips
+   │      submodules.
+   │
+   │   3. **`MAX_ARGV` was 256 and cargo's `rustc` line is 300
+   │      arguments** — `could not compile akuma-syscalls-glue` with
+   │      **no diagnostic at all**, because rustc never ran to emit one.
+   │
+   │   Wall 3 is the same silent shape as the `MAX_ENVP` one in the box
+   │   above: `execve` correctly **refuses** rather than truncating, the
+   │   child `_exit(1)`s before its first instruction, and the errno
+   │   never reaches the parent (RUST_TOOLCHAIN_AMD64.md § 4.5) — so
+   │   cargo prints a failure with no stdout and no stderr. rustc's real
+   │   message came from re-running cargo's own invocation with
+   │   `--error-format=human` instead of the JSON cargo asks for:
+   │   **`rustc: Argument list too long`**, on a 12 570-byte,
+   │   300-argument command line.
+   │
+   ├──► **Raising the cap needed the word block off the kernel stack
+   │   first.** It was `[u8; STACK_WORDS_MAX * 8]` — *sized by the caps*
+   │   — inside an `execve` frame, against a 32 KiB kernel stack
+   │   (`sched::STACK_SIZE`); 1024 entries would have put 10.5 KiB
+   │   there. It is a fallible heap `Vec` sized to the actual call now,
+   │   so `MAX_ARGV = 1024` costs **no stack at all**, and `MAX_ENVP`
+   │   is 256 on the same allocation.
+   │
+   └──► **Verification:** boot suite **707 passed / 0 failed**, with three
+        new exec checks — 80 environment entries, a 700-byte argument, a
+        400-argument command line — each placed past the cap that failed
+        and below the new one, so lowering either cap back is loud
+        instead of silent. Clippy clean; 148 host test binaries pass.
+        **Timing, for the record:** 7 m 53 s for the final stretch, where
+        the box's own Linux builds the same 94-crate graph single-job in
+        **1 m 09 s** — the guest is ~30-50x slower. That gap is the next
+        thing worth attacking, and it is **no longer the idle spin**.
+        code: `amd64/src/loader.rs` § `MAX_ARGV` / `MAX_ENVP`
 
 ```
 
@@ -1903,7 +1964,16 @@ parity with what the AArch64 self-host already proves.
                               ▼
   ┌────────────────────────────────────────────────────────────────┐
   │ D. RUSTC/CARGO APPETITE (the last mile, mostly by then free)   │
-  │   ◐ **somewhere to put a toolchain** — 2026-09-10, half done.  │
+  │   ✔ **DONE 2026-09-13 — the guest built this kernel.** 94      │
+  │     crates, 7 m 53 s, rc=0, a 2 895 920-byte ET_EXEC with the  │
+  │     PVH note, under **Firecracker** (virtio-blk). The last     │
+  │     three walls were the idle spin (`sti; nop; cli` → `hlt`),  │
+  │     `git archive` dropping the vendored fonts, and MAX_ARGV    │
+  │     256 < cargo's 300-argument rustc line. See the walk's      │
+  │     "YOU ARE HERE".                                            │
+  │   ◐ **somewhere to put a toolchain** — 2026-09-10, half done;  │
+  │     still open, and now the ONLY thing D is missing: the       │
+  │     build above did not run on the metal's 64 GB root.         │
   │     The metal mounts its 64 GB persistent root again (`fs:     │
   │     ext2 mounted on /dev/sda1`, 641 passed / 0 failed, ~63 GB  │
   │     free) once the drive is in a **USB 3.0** socket —          │
@@ -1922,7 +1992,10 @@ parity with what the AArch64 self-host already proves.
   │   procfs stat/status       ← already shared (akuma-procfs)     │
   └──────────────────────────────┬─────────────────────────────────┘
                                  ▼
-              scripts/run_selfhost_kernelbuild.py, amd64 arm: GREEN
+     scripts/amd64_selfhost_build.py: GREEN — 2026-09-13, `BUILD EXITED
+     rc=0` after 7m53s in the Firecracker guest, artifact at
+     /tmp/ktarget/x86_64-unknown-none/release/akuma-amd64.
+     On the metal it still waits on the xHCI root.
 ```
 
 Two properties of the shape:
