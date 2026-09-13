@@ -12,6 +12,7 @@
 official `redis:alpine` image pulled from Docker Hub. See
 [Real software](#real-software) below.
 
+**Self-hosting achieved on amd64** (2026-09-13) - verified on bare metal HP 500-502nj (2015 setup) see [here](./docs/archive/AKUMA_SELF_HOSTING_AMD64.md).
 
 ```
                                              %#%:                +
