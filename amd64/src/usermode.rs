@@ -4093,6 +4093,38 @@ fn exec_load_errno(e: &str) -> u64 {
     errno::ENOEXEC
 }
 
+/// A path from ring 3, resolved the way the calling process means it.
+///
+/// **`execve("./prog")` must mean the process's own directory, not `/`.** This
+/// target's `execve` and `sys_spawn` handed the raw string to
+/// `crate::fs::read_image`, which resolves symlinks and nothing else, so every
+/// relative path was read as if it started at the root. Two failures, and the
+/// second is the dangerous one:
+///
+/// * `cargo build && ./target/debug/prog` reported `not found` for a binary
+///   `ls` had just listed in that very directory — relative `open` goes through
+///   glue's `sys_openat`, which resolves against `cwd`, so the two syscalls
+///   disagreed about what a path meant.
+/// * With a same-named file at the root, the exec **silently ran the wrong
+///   program**: `cd /tmp/hi/target/debug && ./hi` ran `/hi`, left over from an
+///   earlier session, and printed its output as if it were the build's.
+///
+/// The rule is glue's `sys_execve`, restated here because this kernel does not
+/// route `execve` through it: absolute paths are already absolute, a relative
+/// path is joined to `Process::cwd`, and a caller with no registered process
+/// (a kernel task running the boot suite) keeps what it passed.
+///
+/// Not PATH lookup — `execve(2)` does not search `PATH` and neither does this.
+fn process_relative_path(path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        return alloc::string::String::from(path);
+    }
+    match current_process() {
+        Some(proc) => akuma_vfs_glue::resolve_path(&proc.cwd, path),
+        None => alloc::string::String::from(path),
+    }
+}
+
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate::fd::errno;
 
     let slot = current_proc_slot();
@@ -4126,6 +4158,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
     // wrapper is a link) and lifts the 16 MiB cap through chunked `read_at`,
     // which is what a 42 MB `cc1` needs
     // (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
+    // Against the process's own directory — see [`process_relative_path`].
+    let path = process_relative_path(path);
+    let path = path.as_str();
     let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image(path)) {
         Ok(image) => image,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
@@ -4613,6 +4648,10 @@ pub fn sys_spawn(
     // Same helper as `sys_execve`: symlink-resolved, chunked, fallible — so a
     // spawn of a link, or of any binary over 16 MiB, loads instead of failing
     // as ENOENT. The VFS error is passed through, not flattened.
+    // Cwd-relative, exactly as `sys_execve` is — a spawn of `./prog` from a
+    // shell means the shell's directory.
+    let path = process_relative_path(path);
+    let path = path.as_str();
     let image = match crate::fs::read_image(path) {
         Ok(image) => image,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
@@ -5701,6 +5740,32 @@ pub fn redirect_test(t: &mut Suite) {
     } else {
         t.check("cwd: sh spawned for the fork-inheritance probe", false);
     }
+    // **A relative path means the process's own directory, at `execve` too.**
+    // This target's `execve`/`sys_spawn` handed the raw path to `read_image`,
+    // which resolves symlinks and not `cwd`, so every relative exec was read
+    // from the root. `cd /tmp/x && ./prog` reported "not found" for a binary
+    // `ls` in that same shell had just listed — and where a same-named file
+    // existed at `/`, it silently ran **that** instead
+    // (measured 2026-09-13: `cd /tmp/hi/target/debug && ./hi` ran `/hi`).
+    //
+    // `/bin/busybox` with no `/busybox` beside it is the whole test: the
+    // relative spelling can only work if `cwd` was consulted, and the
+    // `exists` guard is what stops the check passing vacuously if some future
+    // image ships a `/busybox`.
+    t.check(
+        "exec: no /busybox, so the relative-exec probe below means something",
+        !akuma_vfs_glue::fs::exists("/busybox"),
+    );
+    if let Some((status, out)) = run_sh_capture(b"cd /bin && ./busybox echo RELEXEC\0") {
+        t.check_eq("exec: `cd /bin && ./busybox` exited 0", status, 0);
+        t.check(
+            "exec: a relative path resolves against cwd, not /",
+            out.starts_with(b"RELEXEC"),
+        );
+    } else {
+        t.check("exec: sh spawned for the relative-exec probe", false);
+    }
+
     if let Some((status, _)) = run_sh_capture(b"echo x > /tmp/modeprobe && chmod 755 /tmp/modeprobe\0") {
         t.check_eq("chmod: `chmod 755 file` exited 0", status, 0);
         let mode = akuma_vfs_glue::metadata("/tmp/modeprobe").map(|m| u64::from(m.mode & 0o777));
