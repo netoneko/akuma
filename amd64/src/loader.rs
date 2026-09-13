@@ -83,7 +83,8 @@
 //!   `elf` 0.7 crate rather than by this file re-doing the same reads.
 //!
 //! What did **not** get closed, and stays a bound on this target: `build_stack`
-//! assembles the word block in a `[u8; STACK_WORDS_MAX * 8]` on the kernel
+//! assembles the word block in a fallible heap `Vec` sized to the call (it was
+//! a `[u8; STACK_WORDS_MAX * 8]` on the kernel
 //! stack, so [`MAX_ARGV`] and [`MAX_ENVP`] are still hard caps. `akuma-elf`'s
 //! `setup_linux_stack` builds on the heap and has no such limit — that is a gap
 //! it *would* close, and taking it means taking its auxv (fourteen entries
@@ -439,12 +440,25 @@ fn map_range(
 /// `busybox echo a b c … z` prints exactly fourteen letters — sixteen argv
 /// entries counting `busybox` and `echo`.
 ///
-/// 256 covers a linker invocation with a large crate graph. The cost is the
-/// word block below, which is `STACK_WORDS_MAX * 8` bytes of **kernel** stack
-/// against `sched::STACK_SIZE`; the string pointers now live in that same
-/// block rather than in arrays beside it, which is what keeps the growth to
-/// ~2 KiB and not ~5.
-pub const MAX_ARGV: usize = 256;
+/// **1024 since 2026-09-13, and 256 was not enough to build this kernel.**
+/// `cargo`'s `rustc` invocation for one crate of the kernel's own graph is
+/// **300 arguments** (measured: `akuma-syscalls-glue`, 12 570 bytes of command
+/// line, longest single argument 156 bytes) — ~100 `--extern name=path`, ~40
+/// `--allow=clippy::…`, the `--check-cfg` set. At 256 the `execve` was `E2BIG`
+/// and the self-host build stopped there, with cargo reporting only
+/// `could not compile` and no diagnostic, because rustc never ran to emit one.
+///
+/// Linux caps the *bytes* (`ARG_MAX`, ~2 MB) and never the count; this cap is a
+/// sanity bound, so it is set well past what the workload needs rather than
+/// just past it. The byte budget is `usermode::user_strv`'s.
+///
+/// The cost used to be the reason not to: the word block below was
+/// `[u8; STACK_WORDS_MAX * 8]` on the **kernel** stack, and 1024 argv entries
+/// would have put 10.5 KiB of it there, inside an `execve` frame, against
+/// `sched::STACK_SIZE`'s 32 KiB. It is a fallible heap allocation now, so the
+/// cap costs a `Vec` of exactly the size one call needs and nothing on the
+/// stack — see [`build_stack`].
+pub const MAX_ARGV: usize = 1024;
 
 /// The most envp entries the initial stack builder will place.
 ///
@@ -472,9 +486,9 @@ pub const MAX_ARGV: usize = 256;
 /// that builds, `export` two more variables, and build it again.
 ///
 /// Linux caps the *bytes* (`ARG_MAX`), not the entry count. 256 is four times
-/// what a cargo build script needs and symmetric with [`MAX_ARGV`]; the cost is
-/// [`STACK_WORDS_MAX`]'s word block, which is kernel stack — 2824 B before,
-/// 4360 B now, against `sched::STACK_SIZE`'s 32 KiB.
+/// what a cargo build script needs and symmetric with [`MAX_ARGV`]. It cost
+/// kernel stack when this note was written — the word block was an array sized
+/// by these two caps — and costs none now: [`build_stack`] allocates it.
 pub const MAX_ENVP: usize = 256;
 
 /// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL,
@@ -483,11 +497,11 @@ pub const MAX_ENVP: usize = 256;
 /// `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_HWCAP`, `AT_CLKTCK`, `AT_SECURE`,
 /// `AT_RANDOM` and `AT_NULL`.
 ///
-/// This must be kept in step with the `words` computation in [`build_stack`],
-/// which writes into a `[u8; STACK_WORDS_MAX * 8]`. It is the *bound*, not the
-/// count — the assertion below is what makes a drift a build failure instead of
-/// an index-out-of-bounds panic in the kernel on the first program with a full
-/// argv. `AT_BASE` was added on 2026-09-06 and this constant was **not** bumped
+/// This must be kept in step with the `words` computation in [`build_stack`].
+/// It is the *bound*, not the count — the assertion there is what makes a drift
+/// visible instead of silently over-allocating. Since the word block moved to
+/// the heap this no longer sizes an array, but it still states what the caps
+/// imply, which is what the assertion checks. `AT_BASE` was added on 2026-09-06 and this constant was **not** bumped
 /// with it, which is exactly the shape of bug the assertion now prevents.
 /// The eight glibc-facing pairs were added 2026-09-12: glibc's `ld.so`
 /// segfaulted on its first relocation against address 0 with the seven-pair
@@ -570,8 +584,24 @@ pub fn build_stack(
         return Err("initial stack frame does not fit");
     }
 
-    // Assemble the word block on the kernel stack, then copy it in one shot.
-    let mut buf = [0u8; STACK_WORDS_MAX * 8];
+    // Assemble the word block, then copy it in one shot.
+    //
+    // **On the heap, not the stack.** This was `[u8; STACK_WORDS_MAX * 8]`, and
+    // that is what capped [`MAX_ARGV`] at 256: the array is sized by the cap, it
+    // lives in an `execve` frame, and the kernel stack is 32 KiB
+    // (`sched::STACK_SIZE`) — a 1024-entry cap would have put 10.5 KiB of it
+    // there. `read_image`'s header records what a large stack array on this
+    // path costs when it does not fit: a boot that died in `ClockBlockCache::get`
+    // several frames after the overflowing write.
+    //
+    // Fallible, and sized to *this* call rather than to the cap, so an `execve`
+    // under memory pressure fails with `ENOMEM` instead of taking the kernel
+    // down in the allocator.
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(words * 8).is_err() {
+        return Err("no memory for the initial stack's word block");
+    }
+    buf.resize(words * 8, 0);
     let mut put = |slot: usize, v: u64| {
         buf[slot * 8..slot * 8 + 8].copy_from_slice(&v.to_le_bytes());
     };

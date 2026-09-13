@@ -5814,6 +5814,7 @@ pub fn redirect_test(t: &mut Suite) {
             cmd.push(b'x');
         }
         cmd.push(0);
+        // (The *count* limit has its own check below.)
         if let Some((status, out)) = run_sh_capture(&cmd) {
             t.check_eq("exec: an argument past the old 512-byte cap exited 0", status, 0);
             t.check(
@@ -5822,6 +5823,28 @@ pub fn redirect_test(t: &mut Suite) {
             );
         } else {
             t.check("exec: sh spawned for the long-argument probe", false);
+        }
+    }
+
+    // **And a command line with many arguments.** `MAX_ARGV` was 256, and one
+    // `cargo`-generated `rustc` invocation for this kernel's own graph is
+    // **300** arguments — so the self-host build stopped at `E2BIG` with cargo
+    // reporting `could not compile` and no diagnostic, because rustc never ran
+    // to emit one (measured 2026-09-13, `akuma-syscalls-glue`). 400 here is
+    // past that workload and past the old cap, so it fails if either the cap or
+    // the heap word block regresses.
+    {
+        let mut cmd = alloc::vec::Vec::new();
+        cmd.extend_from_slice(b"/bin/busybox echo");
+        for _ in 0..400 {
+            cmd.extend_from_slice(b" a");
+        }
+        cmd.push(0);
+        if let Some((status, out)) = run_sh_capture(&cmd) {
+            t.check_eq("exec: a 400-argument command line exited 0", status, 0);
+            t.check("exec: and the program ran", out.starts_with(b"a a"));
+        } else {
+            t.check("exec: sh spawned for the many-arguments probe", false);
         }
     }
 
