@@ -1,4 +1,4 @@
-# amd64: wiring `epoll_create1`/`epoll_ctl`/`epoll_pwait`/`eventfd2`, plus a syscall-table audit
+# amd64: wiring `epoll_create1`/`epoll_ctl`/`epoll_pwait`/`eventfd2`, and the `struct epoll_event` ABI bug booting them found
 
 **Date:** 2026-09-17
 **Status:** landed in the working tree, **uncommitted** — the user drives commits on this repo.
@@ -111,24 +111,31 @@ is NOT `__attribute__((packed))`**, unlike x86-64, where the same struct is
 12 bytes") — the fact was recorded, nothing had acted on it, because nothing
 on amd64 had ever reached this code before this session.
 
-**The consequence is two bugs, not one:**
+**The consequence is two bugs, not one — one directly observed, one reasoned
+from the code but not reproduced this session:**
 
-1. `epoll_ctl`'s event argument, and `epoll_wait`'s output array, are
-   marshalled at the wrong stride — `data` is read/written 4 bytes off from
-   where the caller's own (packed) struct puts it, which is what produced the
-   `fd=0`.
-2. `sys_epoll_pwait`'s buffer-size check (`maxevents * size_of::<EpollEvent>()`,
-   i.e. `maxevents * 16`) validates against the **wrong** total. An x86_64
-   caller sizes its array at `maxevents * 12` bytes; the kernel copies out
-   `maxevents * 16`. `validate_user_ptr` only checks the destination range is
-   *mapped and writable*, not that it matches the caller's own allocation —
-   so for any `maxevents > 1` this silently overwrote up to `4 * (maxevents -
-   1)` bytes of whatever the caller had placed immediately after its array
-   (this session's live probe used `maxevents = 4`, `struct epoll_event
-   evbuf[4]` — a 48-byte stack array taking a 64-byte write). Contained inside
-   the caller's own address space, not a kernel privilege issue, but a live
-   stack/heap corruption bug in every real caller (`mio`'s reactor included:
-   it always asks for more than one event).
+1. **Observed.** `epoll_ctl`'s event argument, and `epoll_wait`'s output
+   array, are marshalled at the wrong stride — `data` is read/written 4 bytes
+   off from where the caller's own (packed) struct puts it, which is what
+   produced the `fd=0`. This fires on **every** call, regardless of how many
+   events are ready.
+2. **The overflow condition itself was reasoned, not reproduced** — but the
+   per-event stride fix behind it *was* confirmed across multiple
+   simultaneous events, see below. The actual copy-out is
+   `ready_count * size_of::<EpollEvent>()` bytes (`ready_count`, not
+   `maxevents` — see the code near `WaitStep::Ready`), so it exceeds an
+   x86_64 caller's real `maxevents * 12`-byte array only once
+   `ready_count * 16 > maxevents * 12`, i.e. once more than three-quarters of
+   the requested slots are simultaneously ready. Neither of this session's
+   probes drove `ready_count` that high relative to `maxevents`, so the
+   out-of-bounds write itself was never triggered; it follows from reading
+   `sys_epoll_pwait`'s copy math, not from a reproduced crash.
+   `validate_user_ptr`'s bound (computed from the same wrong `maxevents * 16`)
+   only checks the destination is *mapped and writable*, not that it matches
+   the caller's real allocation, so nothing about the size check would have
+   caught it either. Contained inside the caller's own address space, not a
+   kernel privilege issue, but a real stack/heap corruption risk for any busy
+   multi-fd `epoll_wait` — the case `mio`'s reactor is built around.
 
 ### The fix
 
@@ -149,15 +156,20 @@ the boundary) — the difference is this conversion lives inside
 `akuma-syscalls-glue` itself rather than in `akuma-syscalls-abi`, since
 nothing outside `poll.rs` needs to know the x86_64 layout exists.
 
-Re-verified after the fix, same live probe: `epoll_wait after wakeup write:
-n=1 events=0x1 fd=3 OK` — `fd=3` is the real eventfd descriptor. Host tests
-(`cargo test -p akuma-syscalls-linux -p akuma-syscalls-glue`, 43 tests
-including `io::tests::epoll_event_array_stride_is_16_not_12`) and
-`cargo clippy` stay clean on **both** `x86_64-unknown-none` and
-`aarch64-unknown-none`, and the amd64 boot suite still reports 713/713 after
-the fix (unchanged from before it — this bug had no boot-suite coverage
-either way, since the suite never previously reached live epoll code with
-more than a trivial case).
+Re-verified after the fix, same single-event live probe: `epoll_wait after
+wakeup write: n=1 events=0x1 fd=3 OK` — `fd=3` is the real eventfd
+descriptor. A second, new probe then checked the case the single-event one
+couldn't: three eventfds registered on one epoll instance, all three written
+before one `epoll_wait(epfd, out, 8, …)` — `n=3`, `fd=4`/`5`/`6` (each
+distinct, each the real descriptor, each `EPOLLIN`), confirming the packed
+repack is correct at each of three consecutive 12-byte slots, not just the
+first. Host tests (`cargo test -p akuma-syscalls-linux -p
+akuma-syscalls-glue`, 43 tests including
+`io::tests::epoll_event_array_stride_is_16_not_12`) and `cargo clippy` stay
+clean on **both** `x86_64-unknown-none` and `aarch64-unknown-none`, and the
+amd64 boot suite still reports 713/713 after the fix (unchanged from before
+it — this bug had no boot-suite coverage either way, since the suite never
+previously reached live epoll code with more than a trivial case).
 
 ## What else was missing: a full syscall-table audit
 
@@ -251,15 +263,18 @@ key `mkdisk.sh` bakes into the disk image at
 | **`dispatch_smoke_test`'s new `hop()`/overlap checks, live** | **all `[OK]`** — `epoll_create1 291 -> 20`, `epoll_ctl 233 -> 21`, `epoll_pwait 281 -> 22`, `eventfd2 290 -> 19`, both 213/232 overlap checks |
 | **Live `userspace/epollprobe/c/epoll_op_cost`, cross-built for x86_64 and pushed over ssh** | `epwait_empty`/`epwait_1fd` `ret=0`, `epwait_ready` `ret=1`, `epctl_mod` `ret=0` — epoll agrees with `ppoll`/`select` on the same fd's readiness |
 | **Live eventfd2 + epoll integration probe** (ad hoc, not committed — see below) | roundtrip OK, drained-read `EAGAIN` OK, registered-in-epoll wakeup delivered with the **correct** fd after the fix (see the ABI-bug section above) |
+| **Live 3-eventfd multi-ready probe** (ad hoc, not committed) | `epoll_wait` on one instance with 3 registered, all-ready eventfds returns `n=3`, each event's `data.fd` distinct and correct — the multi-event stride case the single-fd probes couldn't exercise |
 
-The eventfd/epoll integration probe was written for this session
-(`eventfd(2)` round trip, a drained non-blocking read, then the exact `mio`
-pattern — register the eventfd in an epoll set, write to it, confirm
-`epoll_wait` reports `EPOLLIN` for the right fd) and run from the scratch
-directory rather than added to `userspace/`; `userspace/epollprobe/c/` is the
-tree's own, already-existing epoll probe and needed only a cross-build
-(`x86_64-linux-musl-gcc`, no source changes) to serve as the multi-fd,
-multi-syscall-family live check.
+The two ad hoc probes were written for this session (a plain `eventfd(2)`
+round trip plus a drained non-blocking read; then the exact `mio` pattern —
+register an eventfd in an epoll set, write to it, confirm `epoll_wait`
+reports `EPOLLIN` for the right fd; then three eventfds on one instance to
+check more than one ready slot at once) and run from the scratch directory
+rather than added to `userspace/`. `userspace/epollprobe/c/` is the tree's
+own, already-existing epoll probe and needed only a cross-build
+(`x86_64-linux-musl-gcc`, no source changes) to serve as the
+multi-syscall-family (`epoll_create1`/`epoll_ctl`/`epoll_wait`, cross-checked
+against `ppoll`/`select` on the same fd) live check.
 
 **Not done:** bare-metal verification on the physical reference box (this was
 a local QEMU/TCG boot only), and a live `mio`/crossterm/`akuma-cli matrix`
