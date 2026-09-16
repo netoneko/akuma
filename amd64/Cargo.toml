@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd"]
+default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -75,6 +75,20 @@ sc-epoll = ["akuma-syscalls-glue/sc-epoll"]
 # See `sc-epoll` just above; the two are default-on together for the same
 # reason.
 sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]
+# `timerfd_create`/`timerfd_settime`/`timerfd_gettime`. `struct itimerspec` is
+# the same 32-byte layout on every architecture (no `struct epoll_event`-style
+# x86_64 packing wart), so unlike epoll this family needed no ABI-boundary fix
+# — only the three numbers and the dispatch arms.
+sc-timerfd = ["akuma-syscalls-glue/sc-timerfd"]
+# `pidfd_open`. Forwards to glue's gate; `pidfd_send_signal` is not wired —
+# glue has no implementation of it yet (`sys_pidfd_open` is the only function
+# in `akuma-syscalls-glue::pidfd`), so it stays a plain `ENOSYS` gap rather
+# than a feature to turn on. `pidfd_open`/`pidfd_send_signal` are numbered
+# **identically** on x86_64 and asm-generic (both post-Linux-5.1 syscalls,
+# unified across architectures on purpose) and so have no
+# `akuma-syscalls-abi` row — see that crate's module doc, rule 3 — and are
+# dispatched by their one shared number directly in `amd64/src/usermode.rs`.
+sc-pidfd = ["akuma-syscalls-glue/sc-pidfd"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a

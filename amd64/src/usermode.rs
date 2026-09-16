@@ -1316,6 +1316,33 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         _ => {}
     }
 
+    // The **shared-number** syscalls, and nothing else.
+    //
+    // A third category next to the x86-only legacy list above and the neutral
+    // table below: every syscall Linux added since roughly 5.1 was given the
+    // same number on every 64-bit architecture, x86_64 included, so there is
+    // no vocabulary to hop — `akuma_syscalls_abi::Syscall` deliberately cannot
+    // name one (rule 3 in that crate's header, would fail
+    // `tables_disagree_where_linux_does` by construction). Dispatched straight
+    // to glue by the one number both sides already agree on.
+    //
+    // **Adding an arm here is a claim that the number is identical on both
+    // architectures.** Check the real x86_64 and asm-generic numbers (musl's
+    // own `bits/syscall.h` for each target is the authoritative source used
+    // here) before adding one; getting this wrong silently reaches a
+    // *different* handler on one architecture, the same failure mode C1's
+    // vocabulary hop exists to prevent.
+    match nr {
+        // `pidfd_open(pid, flags)` — 434 on both x86_64 and asm-generic.
+        // `sys_pidfd_send_signal` has no implementation in
+        // `akuma-syscalls-glue::pidfd` yet (only `sys_pidfd_open` does), so
+        // 424 is not dispatched here — it would reach `report_unknown_syscall`
+        // below exactly as before, which is correct: there is nothing to
+        // forward it to.
+        434 => return to_glue_raw(akuma_syscalls_linux::nr::PIDFD_OPEN, [a1, a2, 0, 0, 0, 0]),
+        _ => {}
+    }
+
     // Everything else goes through `akuma_syscalls_abi::Syscall` — the
     // architecture-neutral name, decoded from the x86_64 number here and
     // encodable back to the asm-generic one `akuma-syscalls-glue` dispatches on.
@@ -1712,6 +1739,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // cross-thread wakeup a `mio` epoll reactor uses to interrupt a
         // blocking `epoll_pwait`.
         Syscall::Eventfd2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `timerfd_create(clockid, flags)` / `timerfd_settime(fd, flags,
+        // new_value, old_value)` / `timerfd_gettime(fd, out)` — glue's arms
+        // (`sc-timerfd`). `struct itimerspec` needs no boundary translation
+        // (see the row's own doc comment in `akuma-syscalls-abi`), so unlike
+        // epoll these are a straight forward with no ABI fix alongside them.
+        Syscall::TimerfdCreate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::TimerfdSettime => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        Syscall::TimerfdGettime => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
         // forked) task replaces its own image in place. See `sys_execve`.
         Syscall::Execve => sys_execve(a1, a2, a3),
@@ -6201,6 +6236,13 @@ fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
     akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args)
 }
 
+/// [`to_glue`]'s sibling for the shared-number syscalls — see that match
+/// block's own header comment. There is no `Syscall` to hop through because
+/// there is no hop: `nr` is already the number glue dispatches on.
+fn to_glue_raw(nr: u64, args: [u64; 6]) -> u64 {
+    akuma_syscalls_glue::handle_syscall(nr, &args)
+}
+
 #[cfg(not(feature = "no-tests"))]
 /// The dispatch **vocabulary**: two tables that must stay disjoint, and the
 /// number hop that must keep happening.
@@ -6436,6 +6478,29 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check(
         "dispatch: 232 is not also a neutral-table number",
         Syscall::from_x86_64(232).is_none(),
+    );
+
+    // The `sc-timerfd` rows.
+    t.check("dispatch: timerfd_create 283 -> 85", hop(Syscall::TimerfdCreate, 283, nr::TIMERFD_CREATE));
+    t.check("dispatch: timerfd_settime 286 -> 86", hop(Syscall::TimerfdSettime, 286, nr::TIMERFD_SETTIME));
+    t.check("dispatch: timerfd_gettime 287 -> 87", hop(Syscall::TimerfdGettime, 287, nr::TIMERFD_GETTIME));
+
+    // `pidfd_open`(434) is a **shared-number** dispatch (`amd64/src/
+    // usermode.rs`'s third match block), not a `Syscall` row — 434 must NOT
+    // decode through the neutral table, or the shared-number arm and a table
+    // row would silently race for the same number.
+    t.check(
+        "dispatch: 434 is not a neutral-table number (shared-number dispatch owns it)",
+        Syscall::from_x86_64(434).is_none(),
+    );
+    // `pidfd_open` on a pid that is not a child of the caller: `ESRCH`
+    // (`get_child_channel` returns `None`), through the real dispatcher by the
+    // x86_64 number userspace sends. This is the whole live check available
+    // without a registered process — see the epoll rows above for why.
+    t.check_eq(
+        "dispatch: pidfd_open on an unknown pid is ESRCH",
+        syscall_dispatch(434, 999_999, 0, 0, 0, 0, 0),
+        (-3i64) as u64,
     );
 
     if !have_fs {

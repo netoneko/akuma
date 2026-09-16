@@ -86,7 +86,7 @@
 //!
 //! Deliberately a **subset**: an entry is a claim that *both* tables were
 //! checked, and `tables_disagree_where_linux_does` is what makes that claim
-//! testable. Two rules keep it honest:
+//! testable. Three rules keep it honest:
 //!
 //! 1. **Add a row when a caller needs it**, not speculatively. It is not a
 //!    mirror of `nr` and should not become one.
@@ -100,6 +100,17 @@
 //!    have **no** asm-generic number and must not get invented ones. They stay
 //!    where they belong: `AT_FDCWD` shims in `amd64/src/usermode.rs`, each
 //!    forwarding to the `*at` call this table does name.
+//! 3. **A row means the two numbers *differ*.** Every syscall Linux added
+//!    since roughly 5.1 (`rseq`, `pidfd_send_signal`(424), `pidfd_open`(434),
+//!    `clone3`, `openat2`, `epoll_pwait2`, …) was given the **same** number on
+//!    every 64-bit architecture, x86_64 included — the two-table problem this
+//!    crate exists to solve was recognized industry-wide and stopped being
+//!    reproduced going forward. A row for one of these would violate
+//!    `tables_disagree_where_linux_does` by construction (`to_x86_64() ==
+//!    to_aarch64()`), so they are not rows: `amd64/src/usermode.rs` dispatches
+//!    them straight through by their one shared number, no `Syscall` variant
+//!    or translation involved. `pidfd_open` is the first of these this target
+//!    dispatches.
 
 use akuma_syscalls_linux::nr;
 
@@ -316,6 +327,16 @@ syscall_table! {
     /// to this with a null sigmask, the same shape as [`Self::Ppoll`]'s
     /// `poll`(7)/`select`(23) shims.
     EpollPwait   => EPOLL_PWAIT   = 281, nr::EPOLL_PWAIT;
+
+    // ── timers: timerfd ────────────────────────────────────────────────────
+    /// `timerfd_create(clockid, flags)`.
+    TimerfdCreate  => TIMERFD_CREATE  = 283, nr::TIMERFD_CREATE;
+    /// `timerfd_settime(fd, flags, new_value, old_value)` — both pointers are
+    /// `struct itimerspec`, the same 32-byte, natural-alignment layout on
+    /// every architecture (unlike [`Self::EpollCtl`]'s `struct epoll_event`,
+    /// `itimerspec` has no x86_64 packing wart to translate).
+    TimerfdSettime => TIMERFD_SETTIME = 286, nr::TIMERFD_SETTIME;
+    TimerfdGettime => TIMERFD_GETTIME = 287, nr::TIMERFD_GETTIME;
 
     // ── memory ─────────────────────────────────────────────────────────────
     Mmap       => MMAP       = 9,   nr::MMAP;

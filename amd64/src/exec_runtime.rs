@@ -70,19 +70,20 @@
 //! only allocators it has. The pipe hooks were wired in slice 4 and the socket
 //! hooks in slice 7, each at its own field with that argument restated.
 //!
-//! **Four `not_wired!` stubs are left** — it was 16 when the C2 plan was
+//! **Three `not_wired!` stubs are left** — it was 16 when the C2 plan was
 //! written, seven once `unix_sock_*` wired with `socketpair` (2026-09-12, a
-//! count this header went stale on and stayed at nine through), and four once
-//! `eventfd_*`/`epoll_destroy` wired behind `sc-eventfd`/`sc-epoll` — and they
-//! divide cleanly, each saying which:
+//! count this header went stale on and stayed at nine through), four once
+//! `eventfd_*`/`epoll_destroy` wired behind `sc-eventfd`/`sc-epoll`, and three
+//! once `pidfd_close` wired behind `sc-pidfd` — and they divide cleanly, each
+//! saying which:
 //!
-//! - **not built for this target** — `rump_socket_clone_ref`, `pidfd_close`.
-//!   Two of these, and neither is C2's business.
+//! - **not built for this target** — `rump_socket_clone_ref`. Rump is not
+//!   built for amd64 at all, and never will be by this file's own business.
 //! - **the subsystem does not exist here** — `resolve_file_id` and
 //!   `read_at_by_inode`, which name a file by `(mount id, inode)`; this target
 //!   has one filesystem and no mount table.
 //!
-//! None of the four still says "C2", and that is the point of having gone
+//! None of the three still says "C2", and that is the point of having gone
 //! through them: a stub whose stated reason is a *step* stops being true when
 //! the step lands, and nothing in the type system notices.
 //!
@@ -363,6 +364,13 @@ fn runtime() -> ExecRuntime {
         epoll_destroy: akuma_syscalls_glue::poll::epoll_destroy,
         #[cfg(not(feature = "sc-epoll"))]
         epoll_destroy: |_| not_wired!("epoll_destroy", "sc-epoll is not in this target's feature set"),
+        // ── wired with `sc-pidfd` ───────────────────────────────────────────
+        // Same argument as eventfd/epoll above: once `pidfd_open` is
+        // dispatched, `FileDescriptor::PidFd` is real and table-reachable,
+        // and `close_all()` fires this on every one it pops.
+        #[cfg(feature = "sc-pidfd")]
+        pidfd_close: akuma_syscalls_glue::pidfd::pidfd_close,
+        #[cfg(not(feature = "sc-pidfd"))]
         pidfd_close: |_| not_wired!("pidfd_close", "sc-pidfd is not in this target's feature set"),
         // **A stated no-op, not a panic** — and the distinction is the whole
         // reason this changed.

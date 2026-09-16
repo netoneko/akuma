@@ -1,7 +1,11 @@
-# amd64: wiring `epoll_create1`/`epoll_ctl`/`epoll_pwait`/`eventfd2`, and the `struct epoll_event` ABI bug booting them found
+# amd64: wiring the epoll/eventfd/timerfd/pidfd families, and the `struct epoll_event` ABI bug booting them found
 
 **Date:** 2026-09-17
 **Status:** landed in the working tree, **uncommitted** — the user drives commits on this repo.
+**Scope:** two passes in one session — `epoll_create1`/`epoll_ctl`/
+`epoll_pwait`/`eventfd2` (plus `getsockopt`/`shutdown`, found along the way),
+then `timerfd_create`/`_settime`/`_gettime` and `pidfd_open` as a requested
+follow-up. See "Follow-up" below for the second pass.
 **Trigger:** `akuma-cli matrix` over ssh on amd64 failed at start-up with
 `Error: Failed to initialize input reader`. Root cause (found in the prior
 session, in the sibling `akuma-cli` repo, not here): crossterm's default input
@@ -171,6 +175,90 @@ amd64 boot suite still reports 713/713 after the fix (unchanged from before
 it — this bug had no boot-suite coverage either way, since the suite never
 previously reached live epoll code with more than a trivial case).
 
+## Follow-up: `sc-timerfd` and `pidfd_open`
+
+Requested as a second pass ("wire some more syscalls there and verify that
+they work"), picking the two remaining `sc-*` families closest in shape to
+epoll/eventfd from the survey below.
+
+| syscall | x86_64 | asm-generic | dispatch |
+|---|---:|---:|---|
+| `timerfd_create` | 283 | 85 | `to_glue`, `syscall_table!` row |
+| `timerfd_settime` | 286 | 86 | `to_glue`, `syscall_table!` row |
+| `timerfd_gettime` | 287 | 87 | `to_glue`, `syscall_table!` row |
+| `pidfd_open` | 434 | 434 (same number) | direct, **not** a `syscall_table!` row — see below |
+
+**`pidfd_open`/`pidfd_send_signal` don't fit the table at all**, and finding
+that out is the actual finding here: every Linux syscall added since roughly
+5.1 (`rseq`, `pidfd_send_signal`(424), `pidfd_open`(434), `clone3`,
+`openat2`, `epoll_pwait2`, …) got the **same** number on every 64-bit
+architecture — the two-number problem this whole crate exists to solve was
+recognized industry-wide and Linux stopped reproducing it going forward. A
+`syscall_table!` row requires the two numbers to *differ*
+(`tables_disagree_where_linux_does` asserts it for every row), so `pidfd_open`
+would fail that test by construction. It's rule 3 in
+`akuma-syscalls-abi`'s module doc now, and `amd64/src/usermode.rs` gained a
+third dispatch category alongside the x86-only-legacy list and the neutral
+table: a `match nr` for shared numbers, dispatched straight to glue with the
+one number both sides already agree on, no `Syscall` variant involved. Verified
+against real x86_64/aarch64 musl headers
+(`/opt/homebrew/Cellar/musl-cross/*/libexec/{x86_64,aarch64}-linux-musl/include/bits/syscall.h`)
+rather than trusted from memory, given how much this exact class of number
+got exactly this wrong for `symlink`(88) earlier in the port
+(`AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`).
+
+Only `pidfd_open` is dispatched — `akuma-syscalls-glue::pidfd` has no
+`sys_pidfd_send_signal` at all (only `sys_pidfd_open`), so 424 is left
+unreached; nothing regresses by leaving it `ENOSYS`, since nothing dispatched
+it before either.
+
+`amd64/src/exec_runtime.rs`: `pidfd_close` goes from `not_wired!` to real
+(`akuma_syscalls_glue::pidfd::pidfd_close`) behind `#[cfg(feature =
+"sc-pidfd")]`, same reasoning as the eventfd/epoll teardown hooks — once
+`pidfd_open` can be dispatched, `FileDescriptor::PidFd` is a real,
+table-reachable variant. Down to **three** `not_wired!` stubs left in that
+file now (`rump_socket_clone_ref`, `resolve_file_id`, `read_at_by_inode`),
+from four before this follow-up and nine before the epoll/eventfd pass.
+
+**No ABI-boundary bug this time** — `struct itimerspec` (two back-to-back
+`struct timespec`, 32 bytes) has no x86_64 packing wart the way `struct
+epoll_event` does; every 64-bit architecture lays it out the same way, and
+`amd64/src/usermode.rs` already forwards several other `Timespec`-shaped
+syscalls (`ClockGettime`, `Nanosleep`, …) through the identical path
+unmodified. Confirmed rather than assumed: `timerfd_gettime` came back with
+the right `it_value` on the first live try.
+
+`amd64/Cargo.toml`: `sc-timerfd`/`sc-pidfd` added, both default-on.
+
+### Live verification
+
+Same rig as before (`amd64/run.sh`, `SSH_PORT=2322`), two new ad hoc probes.
+
+| check | result |
+|---|---|
+| Boot suite | **718 passed, 0 failed** (713 + the 5 new `dispatch_smoke_test` checks below) |
+| `hop()` checks: `timerfd_create 283->85`, `timerfd_settime 286->86`, `timerfd_gettime 287->87` | all `[OK]` |
+| `434` absent from the neutral table (shared-number dispatch owns it) | `[OK]` |
+| `pidfd_open` on an unknown pid, live, boot task (no registered process) | `ESRCH`, as expected — the check runs *before* `current_process_shared()` |
+| **Live timerfd probe**: `timerfd_create`/`settime`, then `read()` after the deadline, `epoll_wait` on a second timer, `timerfd_gettime` while armed | read returns the expiration count, epoll reports the fd ready with `EPOLLIN`, gettime reports a positive `it_value` — all `OK` |
+| **Live pidfd probe**: `fork()`, `pidfd_open` the child, `epoll_wait` on the pidfd, then `waitpid` | epoll reports the pidfd ready exactly when the child exits (`n=1`, correct fd), `pidfd_open(999999)` (not a real/child pid) is `ESRCH` |
+
+**One real discovery, and it isn't a bug:** the first version of the timerfd
+probe did a plain blocking `read()` on an armed timer before its deadline and
+got `EAGAIN` instead of blocking — this looked exactly like the epoll bug
+until `docs/reference/subsystems/syscalls/timerfd.md` was read: `read()` on
+Akuma's timerfd is **documented** as always non-blocking, `EAGAIN` until
+something has actually expired, on both kernels, and has been that way since
+before this session (Stability: B, "no timerfd-specific bugs since Mar
+2026"). Every real consumer (libuv, tokio) reaches a timerfd through
+`epoll`/`poll` first and never does a bare blocking `read()`, which is
+exactly the pattern the corrected probe uses and the pattern that passed
+clean the first time. Worth recording as a **negative** result: a live probe
+disagreeing with Linux is not automatically a bug, and the fix here was to
+the probe, not the kernel — checking the docs before reaching for
+`akuma-syscalls-glue/src/poll.rs` again saved from "fixing" behavior that was
+already correct on purpose.
+
 ## What else was missing: a full syscall-table audit
 
 Beyond the specific ask, every row in the (now 113-entry) `Syscall` table was
@@ -190,24 +278,25 @@ look). Left as a finding, not fixed here.
 ## Whole families still gated off
 
 Amd64's `akuma-syscalls-glue` dependency is `default-features = false` plus
-only `smoltcp` — every `sc-*` family the AArch64 kernel turns on by default is
-off here. Beyond the `sc-epoll`/`sc-eventfd` pair this session adds, checked
-each remaining one for standalone buildability
+only `smoltcp` — every `sc-*` family the AArch64 kernel turns on by default
+started off here. `sc-epoll`/`sc-eventfd` and now `sc-timerfd`/`sc-pidfd` are
+wired (above); the rest were checked for standalone buildability
 (`cargo check -p akuma-syscalls-glue --no-default-features --features
-smoltcp,<feature> --target x86_64-unknown-none`):
+smoltcp,<feature> --target x86_64-unknown-none`) but not implemented:
 
 | feature | syscalls | builds standalone for x86_64? | notes |
 |---|---|---|---|
-| `sc-timerfd` | `timerfd_create`/`_settime`/`_gettime` | yes | |
-| `sc-pidfd` | `pidfd_open`, `pidfd_send_signal` | yes | `pidfd_close` teardown hook already `not_wired!`, same shape as eventfd/epoll were |
 | `sc-aio` | `io_setup`/`io_submit`/`io_getevents`/`io_cancel`/`io_destroy` | yes | Linux native AIO — the AArch64 kernel needed this for `bun` (`docs/archive/BUN_MISSING_SYSCALLS.md`; `sys_io_setup` has to write a real mmap'd `aio_ring`, not a small integer, because `bun` dereferences the returned context immediately) |
 | `sc-sysv-ipc` | `shmget`/`shmat`/`shmdt`/`shmctl`, `semget`/`semop`, `msgget`/`msgsnd`/`msgrcv` | yes | matters for anything Postgres-shaped |
 | `sc-containers` | mount/namespace syscalls for the "box" abstraction | **no**, standalone | needs `akuma-vfs-glue/sc-containers` forwarded too (root `Cargo.toml` does this because the aarch64 binary depends on `akuma-vfs-glue` directly, same as amd64 does — amd64's own `Cargo.toml` just never defined the forwarding feature). Separately, unclear amd64 has any "box"/namespace concept for this to attach to yet |
 
-Each of the first four is the same shape as this session's `sc-epoll`/
-`sc-eventfd` work: turn the feature on, add `syscall_table!` rows, add
-dispatch arms, wire any teardown hooks the new `FileDescriptor` variant needs.
-None of that was done here — this is a survey, not an implementation.
+Each is the same shape as `sc-epoll`/`sc-eventfd`/`sc-timerfd`/`sc-pidfd`:
+turn the feature on, add `syscall_table!` rows (or, if Linux gave the
+syscall a shared number the way it did `pidfd_open`, a shared-number
+dispatch arm instead), add dispatch arms, wire any teardown hooks the new
+`FileDescriptor` variant needs — and, per the epoll lesson, check every wire
+struct the family reads or writes against the real x86_64 headers before
+trusting a straight forward.
 
 ## A build-tooling trap that cost real time in this session
 
@@ -289,14 +378,20 @@ harmless to leave in place but no longer necessary).
   trip that started this (above).
 - `brk`(12) — the one syscall-table row with no amd64 arm; needs real
   heap-bookkeeping design work, not a forward.
-- `sc-timerfd`, `sc-pidfd`, `sc-aio`, `sc-sysv-ipc`, `sc-containers` — each a
-  bounded follow-up in this session's shape; `sc-containers` additionally
-  needs the `akuma-vfs-glue` feature-forwarding fix described above. Given
-  what turned up in `struct epoll_event`, any future family with its own
-  x86_64-vs-aarch64 wire struct (`sc-aio`'s `io_event`, `sc-sysv-ipc`'s
-  `shmid_ds`/`semid_ds`/`msqid_ds`) should be checked against the real x86_64
-  Linux headers **before** trusting a straight `to_glue` forward, not after a
-  live probe catches it by accident.
+- `pidfd_send_signal`(424, shared number, same category as `pidfd_open`) —
+  has no `akuma-syscalls-glue` implementation at all yet, unlike the other
+  gaps in this doc which all had a glue arm waiting to be reached.
+- `sc-aio`, `sc-sysv-ipc`, `sc-containers` — each a bounded follow-up in the
+  shape `sc-epoll`/`sc-eventfd`/`sc-timerfd`/`sc-pidfd` used; `sc-containers`
+  additionally needs the `akuma-vfs-glue` feature-forwarding fix described
+  above. Given what turned up in `struct epoll_event`, any future family
+  with its own x86_64-vs-aarch64 wire struct (`sc-aio`'s `io_event`,
+  `sc-sysv-ipc`'s `shmid_ds`/`semid_ds`/`msqid_ds`) should be checked against
+  the real x86_64 Linux headers **before** trusting a straight `to_glue`
+  forward, not after a live probe catches it by accident — musl's own
+  cross-compiled `bits/syscall.h` (used to verify `pidfd_open`/
+  `pidfd_send_signal`'s numbers this session) is a source already sitting on
+  this machine, not something to derive from memory.
 
 ## Background
 
