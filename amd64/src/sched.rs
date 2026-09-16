@@ -233,10 +233,19 @@ fn current() -> usize {
 ///
 /// - `CR3` **before** the switch — every address space shares the kernel's
 ///   upper-half mappings, so the stack and the code stay mapped across the
-///   write. Written unconditionally for a process root even when `CR3` already
-///   holds that value: the write is what flushes the TLB, and "same value" does
-///   not mean "same address space" — a freed root frame can be the next
-///   process's root (see [`finish`]). Only kernel-root to kernel-root skips it.
+///   write. Written only when the root actually changes: "same value" used to
+///   be treated as "maybe a different address space" — a freed root frame can
+///   be the next process's root (see [`finish`]) — so the write doubled as an
+///   unconditional TLB flush. That hazard is closed upstream of here:
+///   `free_or_defer_as_frames` refuses to free an L0 that any core's live
+///   `CR3` (`any_core_on_l0`, fed by `paging::activate`'s publish on *every*
+///   write, line-checked against this core) or any saved context still
+///   references — it parks the frames instead. So `want == active_root()`
+///   proves the root frame was never freed under us, i.e. it is the *same
+///   live address space* and there is nothing to flush. Kernel-root →
+///   kernel-root and sibling-thread switches skip the `mov cr3` entirely;
+///   the `[SWITCH FREED-CR3]` tripwire below still runs on every switch-in.
+///   Only kernel-root to kernel-root skipped it before this refinement.
 /// - `%fs` restored only when set. `IA32_FS_BASE` is one per-core register and
 ///   `arch_prctl` is its only writer, so a thread that set it keeps its value
 ///   only as long as nothing else runs. A shell and the child it forked each
@@ -276,7 +285,13 @@ fn hook_switch_to(from: usize, to: usize) {
             serial::put_dec(smp::cpu_index() as u64);
             serial::puts("\n");
         }
-        if (*m)[to].space_root != 0 || want != paging::active_root() {
+        // Skip only when this core already walks exactly this root. The skip is
+        // sound because of the liveness gate, not because of the comparison:
+        // an L0 whose frame value equals our live CR3 cannot have been torn
+        // down (that free would have seen this core in `any_core_on_l0` and
+        // deferred), so equality is the same address space, never a recycled
+        // frame. Under BKL here, so the gate's decision cannot race this read.
+        if want != paging::active_root() {
             paging::activate(want);
         }
 
