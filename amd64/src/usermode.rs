@@ -842,6 +842,17 @@ extern "C" fn syscall_handler(
     // fault, so this one line is what makes `tag=` name the holder's syscall.
     akuma_bkl::sync::set_holder_tag(crate::smp::cpu_index_u32(), nr);
     CALLS.fetch_add(1, Ordering::Relaxed);
+    // Per-process syscall counters — the `[PSTATS]` machinery, aarch64 parity
+    // (`akuma-kernel-glue` bumps the same counters through the `akuma-syscalls`
+    // excursion hooks; this target's dispatcher is its own, so the bump lives
+    // here). Counts are exact. Times are the LAPIC tick — 10 ms, so a syscall
+    // shorter than that folds to 0 — which is the point: the 30 s sweep sorts
+    // by time, so what surfaces is where the *wall clock* went, i.e. the
+    // blocking syscalls, not the leaf-traffic ones.
+    let stats_t0 = crate::lapic::ticks();
+    if let Some(p) = current_process() {
+        p.syscall_stats.inc(nr);
+    }
     let trace = SYSCALL_TRACE.load(Ordering::Relaxed);
     // Entry line: a syscall that blocks forever has no result line, so the
     // entry line is what names it (a bring-up aid — without it a hang inside
@@ -924,6 +935,13 @@ extern "C" fn syscall_handler(
     } else {
         syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
     };
+    if let Some(p) = current_process() {
+        p.syscall_stats.add_time_us(
+            nr,
+            crate::lapic::ticks().saturating_sub(stats_t0)
+                * u64::from(crate::lapic::US_PER_TICK_TARGET),
+        );
+    }
     if trace {
         serial::puts("[sc] cpu=");
         serial::put_dec(crate::smp::cpu_index() as u64);

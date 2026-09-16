@@ -921,6 +921,14 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
         crate::smp::bkl_enter();
     }
 
+    // Count the serviced fault into the current process's `[PSTATS]` record
+    // (aarch64 gets this through glue's fault accounting; this target's fault
+    // path is its own). One relaxed add per fault; `inc_pagefault(1)` also
+    // bumps `pagefault_pages`, whose unit here is one 4 KiB page per fault.
+    if let Some(p) = crate::usermode::current_process() {
+        p.syscall_stats.inc_pagefault(1);
+    }
+
     // Demand paging for ring 3, from the per-address-space region table
     // (`mm::fault_in`). A not-present fault inside a mapping this process has
     // been given gets a zeroed frame at the region's own protection; anything

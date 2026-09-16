@@ -552,7 +552,12 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         unmap_range(base, base + byte_len);
         return errno::ENOMEM;
     }
-    if pages >= 16 {
+    if pages >= 16 && MMAP_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        // TEMPORARY instrumentation (2026-09-13), now gated: this fired on
+        // every mapping of 16 pages or more, and rustc mmaps constantly — an
+        // in-guest build wrote hundreds of these lines to the UART *while
+        // compiling*. The print, not the timing, was the cost; `rdtsc` is a
+        // few cycles and stays. Flip `mm::MMAP_TRACE` for the A/B.
         let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         let hz = crate::lapic::tsc_hz();
         let us = if hz != 0 { dt / (hz / 1_000_000) } else { 0 };
@@ -781,6 +786,13 @@ pub static FILE_PAGES_FILLED: core::sync::atomic::AtomicU64 =
 /// number worth watching when several compilers run at once.
 pub static FILE_PAGES_SHARED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// Enables the `[mmap-t]` per-mapping timing print (see `fill_file_pages`).
+/// Off by default: the print fired on every ≥16-page mmap and an in-guest
+/// rustc build flooded the UART with it while compiling. Same shape as
+/// `usermode::SYSCALL_TRACE` — a diagnostics toggle, not a test-only gate.
+pub static MMAP_TRACE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// How many pages one file fault brings in.
 ///

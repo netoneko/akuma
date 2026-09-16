@@ -885,6 +885,25 @@ pub fn idle_loop() -> ! {
         // processes die; this is the collector that runs when nothing else
         // does — the regime where the cooldown has always elapsed.
         akuma_exec::process::reclaim::drain_retired_if_requested();
+        // `[PSTATS]` sweep, aarch64 parity — `kernel-glue`'s `kernel_main` runs
+        // the same 30 s block; this target's idle loop is the equivalent
+        // nothing-else-is-running point. Each `hlt` below wakes on ~one tick,
+        // so this runs at most once per wake and the uptime check keeps it to
+        // one print per 30 s. The dump itself is allocation-free (`FmtBuf`).
+        {
+            static LAST_PSTATS_US: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            const PSTATS_INTERVAL_US: u64 = 30_000_000;
+            let now_us = crate::net::uptime_us();
+            let last = LAST_PSTATS_US.load(Ordering::Relaxed);
+            if now_us.saturating_sub(last) >= PSTATS_INTERVAL_US
+                && LAST_PSTATS_US
+                    .compare_exchange(last, now_us, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                akuma_exec::process::dump_running_process_stats();
+            }
+        }
         if !threading::x86_yield() {
             smp::bkl_leave();
             IDLE_HALTS.fetch_add(1, Ordering::Relaxed);
