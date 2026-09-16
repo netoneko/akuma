@@ -1022,6 +1022,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32),
         #[cfg(feature = "sc-pidfd")]
         nr::PIDFD_OPEN => pidfd::sys_pidfd_open(args[0] as u32, args[1] as u32),
+        #[cfg(feature = "sc-pidfd")]
+        nr::PIDFD_SEND_SIGNAL => pidfd::sys_pidfd_send_signal(args[0] as u32, args[1] as u32, args[2], args[3] as u32),
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }

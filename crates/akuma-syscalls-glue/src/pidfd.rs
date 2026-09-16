@@ -72,3 +72,32 @@ pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
     }
     u64::from(fd)
 }
+
+/// `pidfd_send_signal(pidfd, sig, info, flags)`. `info` is not read: this
+/// kernel's signal delivery (`akuma_exec::process::deliver_signal`, the same
+/// one `kill(2)`/`tgkill(2)` use) has no siginfo payload to carry it in, the
+/// same simplification `sys_kill` already makes. `flags` has exactly one
+/// defined value (0) as of this writing; anything else is `EINVAL` rather
+/// than silently ignored.
+pub(super) fn sys_pidfd_send_signal(pidfd: u32, sig: u32, _info: u64, flags: u32) -> u64 {
+    if flags != 0 {
+        return EINVAL;
+    }
+    let target = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(pidfd)) {
+        Some(akuma_exec::process::FileDescriptor::PidFd(id)) => id,
+        _ => return EBADF,
+    };
+    let Some(pid) = pidfd_get_pid(target) else {
+        return ESRCH;
+    };
+    // `sig == 0` probes existence without delivering anything — same
+    // exemption `sys_kill` makes, for the same reason: `deliver_signal(pid,
+    // 0)` would have nothing to deliver and no defined meaning.
+    if sig == 0 {
+        return if akuma_exec::process::lookup_process_shared(pid).is_some() { 0 } else { ESRCH };
+    }
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+        akuma_primitives::tprint!(96, "[pidfd] send_signal pidfd={} → pid={} sig={}\n", pidfd, pid, sig);
+    }
+    if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
+}

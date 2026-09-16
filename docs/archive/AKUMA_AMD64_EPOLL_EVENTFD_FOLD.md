@@ -2,11 +2,12 @@
 
 **Date:** 2026-09-17
 **Status:** landed in the working tree, **uncommitted** — the user drives commits on this repo.
-**Scope:** three passes in one session, each "keep going" from the last —
+**Scope:** four passes in one session, each "keep going" from the last —
 `epoll_create1`/`epoll_ctl`/`epoll_pwait`/`eventfd2` (plus `getsockopt`/
 `shutdown`, found along the way); `timerfd_create`/`_settime`/`_gettime` and
-`pidfd_open`; then `io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
-`io_getevents` and `msgget`/`msgctl`/`msgsnd`/`msgrcv`. Every syscall family
+`pidfd_open`; `io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
+`io_getevents` and `msgget`/`msgctl`/`msgsnd`/`msgrcv`; then
+`pidfd_send_signal`, the one gap the second pass left open. Every syscall
 `akuma-syscalls-glue` has an implementation for is now reachable from amd64
 except `sc-containers` — see "What's left". Firecracker verification was
 requested and is blocked on host access — see that section.
@@ -211,10 +212,9 @@ rather than trusted from memory, given how much this exact class of number
 got exactly this wrong for `symlink`(88) earlier in the port
 (`AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`).
 
-Only `pidfd_open` is dispatched — `akuma-syscalls-glue::pidfd` has no
-`sys_pidfd_send_signal` at all (only `sys_pidfd_open`), so 424 is left
-unreached; nothing regresses by leaving it `ENOSYS`, since nothing dispatched
-it before either.
+Only `pidfd_open` was dispatched in this pass — `akuma-syscalls-glue::pidfd`
+had no `sys_pidfd_send_signal` at all, so 424 was left unreached. Given a
+fourth "keep going", it now does — see "Follow-up 3" below.
 
 `amd64/src/exec_runtime.rs`: `pidfd_close` goes from `not_wired!` to real
 (`akuma_syscalls_glue::pidfd::pidfd_close`) behind `#[cfg(feature =
@@ -360,6 +360,45 @@ than `current_process_shared()`'s "is a process registered at all" that
 Moved the live check to a real userspace probe over ssh instead, same
 reasoning as the epoll rows' boot-task caveat earlier in this doc.
 
+## Follow-up 3: `pidfd_send_signal`
+
+A fourth "continue", closing the one gap Follow-up 1 explicitly left open:
+`pidfd_open`'s sibling had no implementation in `akuma-syscalls-glue` at
+all. Added one rather than leaving it, since it's small and it's the whole
+reason a pidfd is more useful than a raw pid (race-free signaling — the pid
+can't be recycled out from under the fd the way it can under a bare number).
+
+`crates/akuma-syscalls-glue/src/pidfd.rs`: `sys_pidfd_send_signal(pidfd, sig,
+info, flags)` — resolves the fd to a tracked pid via the same table
+`pidfd_open`/`pidfd_close` already maintain, then delivers through
+`akuma_exec::process::deliver_signal`, the identical function `kill(2)`
+already uses. `info` (the `siginfo_t` payload real `pidfd_send_signal` can
+carry) is not read — `deliver_signal` has no siginfo slot to put it in, the
+same simplification already made for plain `kill`. `flags` must be `0`
+(Linux's only currently-defined value) or `EINVAL`.
+
+`crates/akuma-syscalls-linux/src/nr.rs`: `PIDFD_SEND_SIGNAL = 424`, same
+number on both architectures (confirmed against musl's headers along with
+`pidfd_open`'s in Follow-up 1) — another shared-number dispatch in
+`amd64/src/usermode.rs`'s third match block, no `syscall_table!` row.
+
+### Live verification
+
+| check | result |
+|---|---|
+| Boot suite | **735 passed, 0 failed** (733 + `424` neutral-table-absence + `EBADF` on an unopened fd) |
+| **Live probe**: `fork()`, `pidfd_open`, a `sig=0` existence probe, then `SIGTERM` via the pidfd | existence probe `OK`; child reaped **signaled by SIGTERM in 0.01s** (the child's own sleep was 30s, so this timing is the proof the signal — not the timer — ended it); bad `flags` is `EINVAL`; a signal after the child is reaped is `ESRCH` |
+
+One test-authoring mistake worth naming since the fix is instructive: the
+first run of this probe printed `OK` on every line and then exited `1`. The
+final summary re-checked `errno` after a *later* syscall had already
+overwritten it — a plain errno-clobbering bug in the C probe, not in the
+kernel. Each `printf` had already captured the right `errno` immediately
+after its own call; only the trailing aggregate check was wrong. Fixed by
+saving `errno` into a local right after the call it belongs to, same
+discipline this codebase's own Rust code already applies to `Result`s for
+exactly this reason.
+
 ## Whole families still gated off
 
 `sc-containers` is the one family left from the original survey — mount/
@@ -495,9 +534,6 @@ comment) and everything downstream of `kmain` is the same binary either way.
   trip that started this (above).
 - `brk`(12) — the one syscall-table row with no amd64 arm; needs real
   heap-bookkeeping design work, not a forward.
-- `pidfd_send_signal`(424, shared number, same category as `pidfd_open`) —
-  has no `akuma-syscalls-glue` implementation at all yet, unlike the other
-  gaps in this doc which all had a glue arm waiting to be reached.
 - `sc-containers` — needs the `akuma-vfs-glue` feature-forwarding fix
   described above, and it's not clear amd64 has a "box"/namespace concept
   for it to attach real behavior to. The last family from the original

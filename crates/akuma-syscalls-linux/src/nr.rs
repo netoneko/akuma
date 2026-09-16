@@ -213,6 +213,9 @@ pub const SCHED_GETAFFINITY: u64 = 123;
 pub const TKILL: u64 = 130;
 pub const TGKILL: u64 = 131;
 pub const PIDFD_OPEN: u64 = 434;
+/// Same number on x86_64 as here — a post-5.1 syscall, numbered identically
+/// on every 64-bit architecture (`akuma-syscalls-abi`'s module doc, rule 3).
+pub const PIDFD_SEND_SIGNAL: u64 = 424;
 pub const CLOSE_RANGE: u64 = 436;
 pub const SYSINFO: u64 = 179;
 pub const CLOCK_GETRES: u64 = 114;

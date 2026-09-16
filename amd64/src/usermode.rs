@@ -1334,12 +1334,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // vocabulary hop exists to prevent.
     match nr {
         // `pidfd_open(pid, flags)` — 434 on both x86_64 and asm-generic.
-        // `sys_pidfd_send_signal` has no implementation in
-        // `akuma-syscalls-glue::pidfd` yet (only `sys_pidfd_open` does), so
-        // 424 is not dispatched here — it would reach `report_unknown_syscall`
-        // below exactly as before, which is correct: there is nothing to
-        // forward it to.
         434 => return to_glue_raw(akuma_syscalls_linux::nr::PIDFD_OPEN, [a1, a2, 0, 0, 0, 0]),
+        // `pidfd_send_signal(pidfd, sig, info, flags)` — 424 on both. `info`
+        // is not decoded here or in glue — see `sys_pidfd_send_signal`'s own
+        // doc comment for why the siginfo payload has nowhere to land.
+        424 => return to_glue_raw(akuma_syscalls_linux::nr::PIDFD_SEND_SIGNAL, [a1, a2, a3, a4, 0, 0]),
         _ => {}
     }
 
@@ -6520,6 +6519,18 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         "dispatch: pidfd_open on an unknown pid is ESRCH",
         syscall_dispatch(434, 999_999, 0, 0, 0, 0, 0),
         (-3i64) as u64,
+    );
+    // `pidfd_send_signal`(424) is the shared-number dispatch's other member.
+    t.check(
+        "dispatch: 424 is not a neutral-table number (shared-number dispatch owns it)",
+        Syscall::from_x86_64(424).is_none(),
+    );
+    // On a `pidfd` this process never opened, `EBADF` — `get_fd` finds
+    // nothing at 999, `_ => return EBADF` in `sys_pidfd_send_signal`.
+    t.check_eq(
+        "dispatch: pidfd_send_signal on an unopened fd is EBADF",
+        syscall_dispatch(424, 999, 15, 0, 0, 0, 0),
+        (-9i64) as u64,
     );
 
     // The `sc-aio` rows. `io_setup` 206 -> asm-generic 0 is the sharpest of
