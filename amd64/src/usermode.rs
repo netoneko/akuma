@@ -2031,6 +2031,25 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Setitimer => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Times => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         Syscall::Getrusage => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `io_setup`/`io_destroy`/`io_submit`/`io_cancel`/`io_getevents` —
+        // Linux native AIO, glue's arms (`sc-aio`). `io_setup`'s `ctx_idp` is
+        // a VA the caller's `libc` dereferences directly (the mmap'd
+        // `aio_ring`), so it goes through glue's own `read_user_into`/
+        // `write_user_val` exactly as on AArch64 — nothing here decodes it.
+        Syscall::IoSetup => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::IoDestroy => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::IoSubmit => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::IoCancel => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::IoGetevents => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        // `msgget`/`msgctl`/`msgsnd`/`msgrcv` — SysV message queues, glue's
+        // arms (`sc-sysv-ipc`). Queues are keyed `(box_id, msqid)`; this
+        // target's processes all read `box_id == 0` (no "box"/namespace
+        // concept here), so every process shares one queue namespace — the
+        // correct single-box answer, not a divergence.
+        Syscall::MsgGet => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::MsgCtl => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::MsgSnd => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        Syscall::MsgRcv => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         _ => errno::ENOSYS,
     }
 }
@@ -6502,6 +6521,50 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         syscall_dispatch(434, 999_999, 0, 0, 0, 0, 0),
         (-3i64) as u64,
     );
+
+    // The `sc-aio` rows. `io_setup` 206 -> asm-generic 0 is the sharpest of
+    // these: x86_64 0 is `Read` in this very table, so a missed hop here
+    // would not compile to `ENOSYS`, it would compile to a working `read`
+    // fed an `nr_events`/`ctx_idp` pair as if they were an fd/buf/len.
+    t.check("dispatch: io_setup 206 -> 0", hop(Syscall::IoSetup, 206, nr::IO_SETUP));
+    t.check("dispatch: io_destroy 207 -> 1", hop(Syscall::IoDestroy, 207, nr::IO_DESTROY));
+    t.check("dispatch: io_getevents 208 -> 4", hop(Syscall::IoGetevents, 208, nr::IO_GETEVENTS));
+    t.check("dispatch: io_submit 209 -> 2", hop(Syscall::IoSubmit, 209, nr::IO_SUBMIT));
+    t.check("dispatch: io_cancel 210 -> 3", hop(Syscall::IoCancel, 210, nr::IO_CANCEL));
+    // No live `io_setup` round trip here, unlike `msgget` below:
+    // `sys_io_setup` resolves its own pid through
+    // `akuma_exec::process::lookup_process_shared`, which the boot task does
+    // not answer to (`EFAULT`, measured) — a different, stricter lookup than
+    // `current_process_shared()`'s "am I registered at all", which is why
+    // `msgget`'s `current_box_id()` (built on the latter) still works here.
+    // A live probe belongs in `userspace/`, same reasoning as the epoll rows
+    // above.
+
+    // The `sc-sysv-ipc` rows (message queues only — see the row's own doc
+    // comment for why shm/sem are absent).
+    t.check("dispatch: msgget 68 -> 186", hop(Syscall::MsgGet, 68, nr::MSGGET));
+    t.check("dispatch: msgsnd 69 -> 189", hop(Syscall::MsgSnd, 69, nr::MSGSND));
+    t.check("dispatch: msgrcv 70 -> 188", hop(Syscall::MsgRcv, 70, nr::MSGRCV));
+    t.check("dispatch: msgctl 71 -> 187", hop(Syscall::MsgCtl, 71, nr::MSGCTL));
+    // A live `msgget`/`msgsnd`/`msgrcv` round trip, IPC_PRIVATE so it cannot
+    // collide with anything else the suite creates.
+    let msqid = syscall_dispatch(68, 0, 0o600, 0, 0, 0, 0);
+    t.check("dispatch: glue accepts msgget(IPC_PRIVATE)", !crate::fd::errno::is_err(msqid));
+    if !crate::fd::errno::is_err(msqid) {
+        #[repr(C)]
+        struct Msgbuf { mtype: i64, data: [u8; 5] }
+        let mut out = Msgbuf { mtype: 0, data: [0; 5] };
+        let msg = Msgbuf { mtype: 7, data: *b"hello" };
+        let send_rc = syscall_dispatch(69, msqid, core::ptr::addr_of!(msg) as u64, 5, 0, 0, 0);
+        t.check_eq("dispatch: glue accepts msgsnd", send_rc, 0);
+        let recv_rc = syscall_dispatch(70, msqid, core::ptr::addr_of_mut!(out) as u64, 5, 0, 0, 0);
+        t.check_eq("dispatch: msgrcv returns the byte count", recv_rc, 5);
+        t.check_eq("dispatch: and the right mtype", out.mtype as u64, 7);
+        t.check("dispatch: and the right bytes", out.data == *b"hello");
+        const IPC_RMID: u64 = 0;
+        let rmid_rc = syscall_dispatch(71, msqid, IPC_RMID, 0, 0, 0, 0);
+        t.check_eq("dispatch: glue accepts msgctl(IPC_RMID)", rmid_rc, 0);
+    }
 
     if !have_fs {
         t.note("dispatch: no filesystem; symlink round trip skipped", 0);

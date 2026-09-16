@@ -1,11 +1,15 @@
-# amd64: wiring the epoll/eventfd/timerfd/pidfd families, and the `struct epoll_event` ABI bug booting them found
+# amd64: wiring epoll/eventfd/timerfd/pidfd/aio/msgqueue, and the `struct epoll_event` ABI bug booting them found
 
 **Date:** 2026-09-17
 **Status:** landed in the working tree, **uncommitted** — the user drives commits on this repo.
-**Scope:** two passes in one session — `epoll_create1`/`epoll_ctl`/
-`epoll_pwait`/`eventfd2` (plus `getsockopt`/`shutdown`, found along the way),
-then `timerfd_create`/`_settime`/`_gettime` and `pidfd_open` as a requested
-follow-up. See "Follow-up" below for the second pass.
+**Scope:** three passes in one session, each "keep going" from the last —
+`epoll_create1`/`epoll_ctl`/`epoll_pwait`/`eventfd2` (plus `getsockopt`/
+`shutdown`, found along the way); `timerfd_create`/`_settime`/`_gettime` and
+`pidfd_open`; then `io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
+`io_getevents` and `msgget`/`msgctl`/`msgsnd`/`msgrcv`. Every syscall family
+`akuma-syscalls-glue` has an implementation for is now reachable from amd64
+except `sc-containers` — see "What's left". Firecracker verification was
+requested and is blocked on host access — see that section.
 **Trigger:** `akuma-cli matrix` over ssh on amd64 failed at start-up with
 `Error: Failed to initialize input reader`. Root cause (found in the prior
 session, in the sibling `akuma-cli` repo, not here): crossterm's default input
@@ -275,28 +279,101 @@ per-process program-break bookkeeping amd64 doesn't have yet (glue's own
 space tracking, and whether that shape matches amd64's own would need its own
 look). Left as a finding, not fixed here.
 
+## Follow-up 2: `sc-aio` and `sc-sysv-ipc`
+
+A third pass, same request repeated ("keep going"). Picks the two remaining
+families the earlier survey had marked buildable — and corrects an error in
+that survey along the way.
+
+**Correction: `sc-sysv-ipc` is message queues only.** The original survey
+listed it as covering `shmget`/`shmat`/`shmdt`/`shmctl`,
+`semget`/`semop`, and `msgget`/`msgsnd`/`msgrcv` — wrong. Reading
+`akuma-syscalls-ipc`'s own module doc before wiring anything: the crate is
+`msgget`/`msgctl`/`msgsnd`/`msgrcv` **only** — no shared memory, no
+semaphores, neither has any `akuma-syscalls-glue` implementation to forward
+to. "Matters for anything Postgres-shaped" was wrong along with the
+scope claim — Postgres's IPC is shared memory and semaphores, barely message
+queues at all. Corrected here rather than silently.
+
+| syscall | x86_64 | asm-generic | dispatch |
+|---|---:|---:|---|
+| `io_setup` | 206 | **0** | `to_glue`, `syscall_table!` row |
+| `io_destroy` | 207 | 1 | `to_glue`, `syscall_table!` row |
+| `io_submit` | 209 | 2 | `to_glue`, `syscall_table!` row |
+| `io_cancel` | 210 | 3 | `to_glue`, `syscall_table!` row |
+| `io_getevents` | 208 | 4 | `to_glue`, `syscall_table!` row |
+| `msgget` | 68 | 186 | `to_glue`, `syscall_table!` row |
+| `msgctl` | 71 | 187 | `to_glue`, `syscall_table!` row |
+| `msgsnd` | 69 | 189 | `to_glue`, `syscall_table!` row |
+| `msgrcv` | 70 | 188 | `to_glue`, `syscall_table!` row |
+
+`io_setup`'s asm-generic number is the sharpest crossing found this session:
+**0**, the same number `Read` claims on x86_64 — a wrong hop here would not
+have compiled to `ENOSYS`, it would have compiled to a working `read(2)` fed
+an `nr_events`/`ctx_idp` pair as if they were `fd`/`buf`/`len`.
+
+**ABI check, same discipline as `pidfd_open`:** `struct msqid_ds` (the
+`msgctl(IPC_STAT/IPC_SET)` wire struct) is checked field-by-field against
+musl's own `x86_64-linux-musl`/`aarch64-linux-musl` `bits/msg.h` and
+`bits/ipc.h` — **byte-identical** on both, unlike `struct epoll_event`. No
+translation layer needed. `io_getevents`'s `struct io_event` buffer is never
+actually written (the ring is always reported empty, a documented stub), so
+there is no wire struct to check there either.
+
+`io_setup` is the one syscall in either family that does something the
+`FileDescriptor` table doesn't model: it maps a real page into the calling
+process's address space via `akuma_exec::process::vm_alloc_mmap`/
+`with_address_space`/`map_user_page_tracked` — the same shared
+address-space API amd64's CoW fork already goes through, but **not** the
+path amd64's own native `Mmap`/`Munmap`/`Madvise`/`Mremap` use
+(`crate::mm`). Worth a live check specifically because of that seam, and it
+got one (below): the returned `ctx` was a real, correctly-mapped VA whose
+header read back right.
+
+Neither family touches `exec_runtime.rs` — `io_setup`'s `ctx` is a raw VA
+returned to userspace, not a `FileDescriptor`/fd-table entry, and neither is
+a SysV `msqid` (queues persist independent of any one process, matching
+real Linux — a crash doesn't destroy the queue). No new teardown hooks.
+
+`amd64/Cargo.toml`: `sc-aio`/`sc-sysv-ipc` added, both default-on.
+`akuma-vfs-glue/sc-sysv-ipc` (the `/proc/sysvipc/msg` listing) is
+deliberately **not** forwarded — that code lives inside `akuma-vfs-glue`'s
+`ProcFilesystem`, which does not build for `x86_64-unknown-none` at all, so
+there is nothing on this target for the feature to reach.
+
+### Live verification
+
+| check | result |
+|---|---|
+| Boot suite | **733 passed, 0 failed** |
+| `hop()` checks: all 5 `io_*` rows, all 4 `msg*` rows | all `[OK]` |
+| **Live `msgget`/`msgsnd`/`msgrcv`/`msgctl`, in the boot suite itself** (`current_process_shared` answers there, unlike `io_setup`'s stricter lookup — see below) | `IPC_PRIVATE` queue created, "hello" sent with `mtype=7`, received back with the right byte count/mtype/data, `IPC_RMID` cleaned it up — all `[OK]` |
+| **Live `io_setup`/`io_destroy` probe, real userspace over ssh** | ring mapped, header carries `AIO_RING_MAGIC` and the capped `nr`, a second `io_setup` on the live `ctx` is `EEXIST`, `io_submit`/`io_getevents` are the documented `0`/`0` stubs, `io_destroy` succeeds — all `OK` |
+
+**One test mistake, caught by the boot suite itself rather than shipped:**
+the first version of this pass tried the `io_setup` round trip inside
+`dispatch_smoke_test`, like `msgget`'s. It failed with `EFAULT` — not a
+wiring bug: `sys_io_setup` resolves its own pid through
+`akuma_exec::process::lookup_process_shared`, a stricter, different lookup
+than `current_process_shared()`'s "is a process registered at all" that
+`msgget`'s `current_box_id()` uses, and the boot task doesn't answer to it.
+Moved the live check to a real userspace probe over ssh instead, same
+reasoning as the epoll rows' boot-task caveat earlier in this doc.
+
 ## Whole families still gated off
 
-Amd64's `akuma-syscalls-glue` dependency is `default-features = false` plus
-only `smoltcp` — every `sc-*` family the AArch64 kernel turns on by default
-started off here. `sc-epoll`/`sc-eventfd` and now `sc-timerfd`/`sc-pidfd` are
-wired (above); the rest were checked for standalone buildability
-(`cargo check -p akuma-syscalls-glue --no-default-features --features
-smoltcp,<feature> --target x86_64-unknown-none`) but not implemented:
-
-| feature | syscalls | builds standalone for x86_64? | notes |
-|---|---|---|---|
-| `sc-aio` | `io_setup`/`io_submit`/`io_getevents`/`io_cancel`/`io_destroy` | yes | Linux native AIO — the AArch64 kernel needed this for `bun` (`docs/archive/BUN_MISSING_SYSCALLS.md`; `sys_io_setup` has to write a real mmap'd `aio_ring`, not a small integer, because `bun` dereferences the returned context immediately) |
-| `sc-sysv-ipc` | `shmget`/`shmat`/`shmdt`/`shmctl`, `semget`/`semop`, `msgget`/`msgsnd`/`msgrcv` | yes | matters for anything Postgres-shaped |
-| `sc-containers` | mount/namespace syscalls for the "box" abstraction | **no**, standalone | needs `akuma-vfs-glue/sc-containers` forwarded too (root `Cargo.toml` does this because the aarch64 binary depends on `akuma-vfs-glue` directly, same as amd64 does — amd64's own `Cargo.toml` just never defined the forwarding feature). Separately, unclear amd64 has any "box"/namespace concept for this to attach to yet |
-
-Each is the same shape as `sc-epoll`/`sc-eventfd`/`sc-timerfd`/`sc-pidfd`:
-turn the feature on, add `syscall_table!` rows (or, if Linux gave the
-syscall a shared number the way it did `pidfd_open`, a shared-number
-dispatch arm instead), add dispatch arms, wire any teardown hooks the new
-`FileDescriptor` variant needs — and, per the epoll lesson, check every wire
-struct the family reads or writes against the real x86_64 headers before
-trusting a straight forward.
+`sc-containers` is the one family left from the original survey — mount/
+namespace syscalls for the "box" abstraction. It does **not** build
+standalone the way the other five did:
+`cargo check -p akuma-syscalls-glue --no-default-features --features
+smoltcp,sc-containers --target x86_64-unknown-none` fails, because it needs
+`akuma-vfs-glue/sc-containers` forwarded alongside it (root `Cargo.toml`
+does this because the aarch64 binary depends on `akuma-vfs-glue` directly,
+same as amd64 does — amd64's own `Cargo.toml` just never defined the
+forwarding feature). Separately, unlike `sc-sysv-ipc`'s `/proc/sysvipc/msg`
+gap, it is not obvious amd64 has any "box"/namespace concept at all for this
+family to attach real behavior to, rather than just compiling — the
+buildability check alone would not settle that.
 
 ## A build-tooling trap that cost real time in this session
 
@@ -372,8 +449,48 @@ sibling `akuma-cli` repo's binary rebuilt against these syscalls now being
 real (it currently still carries the `use-dev-tty` workaround, which is
 harmless to leave in place but no longer necessary).
 
+## Firecracker: not tested, blocked on host access
+
+Asked for explicitly ("don't forget to test on the firecracker"). `amd64/
+run-firecracker.sh` exists and is the right tool — `FC_HOST=user@host
+amd64/run-firecracker.sh` builds, pushes the ELF over `scp`, and boots it
+under real Firecracker on a remote KVM host (Firecracker needs `/dev/kvm`,
+which no macOS host has, this dev machine included).
+
+No `FC_HOST` was available this session. Checked what this session's own
+`~/.ssh/config` already names:
+
+- `172.31.16.227` / `172.31.82.49` — private (10.0.0.0/8-style) AWS
+  addresses; both timed out on port 22, unreachable from this machine
+  without a VPN or bastion this session doesn't have.
+- `192.168.1.123` (alias `akuma`) — the bare-metal reference box. Answers
+  ping (13 ms, genuinely on the network) but refused the connection on
+  port 2222: nothing is currently listening, i.e. Akuma isn't the box's
+  current boot. This is the bare-metal target itself, not a Firecracker
+  *host* to launch Firecracker from, in any case.
+
+**What's needed to actually run this:** an `FC_HOST=user@host` this session
+can reach over ssh with a working key, where `host` has KVM and a
+`firecracker` binary (`docs/runbooks/run-on-firecracker.md` /
+`docs/archive/AKUMA_FIRECRACKER_AMD64.md` have the setup story if one needs
+building). Once that exists, the run is exactly:
+
+```
+FC_HOST=user@host FC_NET=1 INIT=/bin/sshd amd64/run-firecracker.sh
+```
+
+and the same live probes this session already wrote
+(`epoll_op_cost`/`eventfd_epoll_check`/`epoll_multi_check`/`timerfd_check`/
+`pidfd_check`/`aio_check`, all cross-built and sitting in this session's
+scratch directory) push over ssh and run unchanged — the point of testing
+under Firecracker rather than QEMU again is the PVH entry differs in one
+concrete, previously-measured way (boot block at Firecracker's
+`PVH_INFO_START` vs QEMU's `0x1580`, per `amd64/run.sh`'s own header
+comment) and everything downstream of `kmain` is the same binary either way.
+
 ## What's left
 
+- **Firecracker verification** (above) — needs `FC_HOST` from the user.
 - Bare-metal boot verification, and the live `akuma-cli matrix`/`mio` round
   trip that started this (above).
 - `brk`(12) — the one syscall-table row with no amd64 arm; needs real
@@ -381,17 +498,21 @@ harmless to leave in place but no longer necessary).
 - `pidfd_send_signal`(424, shared number, same category as `pidfd_open`) —
   has no `akuma-syscalls-glue` implementation at all yet, unlike the other
   gaps in this doc which all had a glue arm waiting to be reached.
-- `sc-aio`, `sc-sysv-ipc`, `sc-containers` — each a bounded follow-up in the
-  shape `sc-epoll`/`sc-eventfd`/`sc-timerfd`/`sc-pidfd` used; `sc-containers`
-  additionally needs the `akuma-vfs-glue` feature-forwarding fix described
-  above. Given what turned up in `struct epoll_event`, any future family
-  with its own x86_64-vs-aarch64 wire struct (`sc-aio`'s `io_event`,
-  `sc-sysv-ipc`'s `shmid_ds`/`semid_ds`/`msqid_ds`) should be checked against
-  the real x86_64 Linux headers **before** trusting a straight `to_glue`
-  forward, not after a live probe catches it by accident — musl's own
-  cross-compiled `bits/syscall.h` (used to verify `pidfd_open`/
-  `pidfd_send_signal`'s numbers this session) is a source already sitting on
-  this machine, not something to derive from memory.
+- `sc-containers` — needs the `akuma-vfs-glue` feature-forwarding fix
+  described above, and it's not clear amd64 has a "box"/namespace concept
+  for it to attach real behavior to. The last family from the original
+  survey; `sc-aio` and `sc-sysv-ipc` are done (above).
+- Shared memory (`shmget`/`shmat`/`shmdt`/`shmctl`) and semaphores
+  (`semget`/`semop`/`semctl`) — not part of `sc-sysv-ipc`, which is message
+  queues only (this session's correction, above), and have no
+  `akuma-syscalls-glue` implementation on **either** architecture to
+  forward to. A real gap, not a wiring gap.
+- The general lesson stands for anything still ahead: check a family's wire
+  structs against the real x86_64 headers **before** trusting a straight
+  `to_glue` forward, not after a live probe catches it by accident — musl's
+  own cross-compiled `bits/*.h` (used for `pidfd_open`'s numbers, `struct
+  msqid_ds`, and `io_setup`'s numbers this session) is a source already
+  sitting on this machine, not something to derive from memory.
 
 ## Background
 

@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd"]
+default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -89,6 +89,26 @@ sc-timerfd = ["akuma-syscalls-glue/sc-timerfd"]
 # `akuma-syscalls-abi` row — see that crate's module doc, rule 3 — and are
 # dispatched by their one shared number directly in `amd64/src/usermode.rs`.
 sc-pidfd = ["akuma-syscalls-glue/sc-pidfd"]
+# `io_setup`/`io_destroy`/`io_submit`/`io_cancel`/`io_getevents` — Linux
+# native AIO. `io_submit`/`io_cancel`/`io_getevents` are stubs in glue (no
+# real I/O is ever submitted; the ring always reports empty), but
+# `io_setup` is not: it allocates a real page and maps it into the calling
+# process's address space via `akuma_exec::process::vm_alloc_mmap`/
+# `with_address_space` — the same shared-address-space API this target's own
+# CoW fork already goes through, not the native `crate::mm` path
+# `Mmap`/`Munmap`/`Madvise`/`Mremap` use, so this is worth re-checking if the
+# two ever appear to disagree about a region.
+sc-aio = ["akuma-syscalls-glue/sc-aio"]
+# `msgget`/`msgctl`/`msgsnd`/`msgrcv` — SysV message queues, the only quarter
+# of SysV IPC `akuma-syscalls-glue` implements (no shared memory, no
+# semaphores). `struct msqid_ds` is confirmed byte-identical between x86_64
+# and aarch64 musl, so — like `sc-timerfd` and unlike `sc-epoll` — this
+# needed no ABI-boundary translation. Not forwarded to
+# `akuma-vfs-glue/sc-sysv-ipc`: that crate's `/proc/sysvipc/msg` listing
+# lives inside its `ProcFilesystem`, which does not build for
+# `x86_64-unknown-none` at all (see `akuma-procfs`'s own doc comment), so
+# there is nothing on this target for that feature to reach.
+sc-sysv-ipc = ["akuma-syscalls-glue/sc-sysv-ipc"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a

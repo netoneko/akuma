@@ -338,6 +338,37 @@ syscall_table! {
     TimerfdSettime => TIMERFD_SETTIME = 286, nr::TIMERFD_SETTIME;
     TimerfdGettime => TIMERFD_GETTIME = 287, nr::TIMERFD_GETTIME;
 
+    // ── Linux native AIO ───────────────────────────────────────────────────
+    /// `io_setup(nr_events, ctx_idp)`. x86_64 206, asm-generic **0** — the
+    /// same number `Read` claims on x86_64 (`zero_means_different_things`),
+    /// which is exactly the shape of crossing this table exists to prevent:
+    /// the two rows never collide because each names a number in only one of
+    /// the two literal positions.
+    IoSetup     => IO_SETUP     = 206, nr::IO_SETUP;
+    IoDestroy   => IO_DESTROY   = 207, nr::IO_DESTROY;
+    /// `io_getevents` never writes a `struct io_event` in this kernel — the
+    /// ring is always reported empty (`aio.rs`'s stub) — so unlike
+    /// `epoll_event`/`itimerspec` there is no wire struct here to check for a
+    /// cross-architecture layout difference; the buffer argument is
+    /// validated but never dereferenced for its contents.
+    IoGetevents => IO_GETEVENTS = 208, nr::IO_GETEVENTS;
+    IoSubmit    => IO_SUBMIT    = 209, nr::IO_SUBMIT;
+    IoCancel    => IO_CANCEL    = 210, nr::IO_CANCEL;
+
+    // ── System V message queues ────────────────────────────────────────────
+    /// `msgget(key, flags)`. Only the message-queue quarter of SysV IPC has an
+    /// `akuma-syscalls-glue` implementation (`akuma-syscalls-ipc`) — shared
+    /// memory (`shmget`/`shmat`/`shmdt`/`shmctl`) and semaphores
+    /// (`semget`/`semop`/`semctl`) have none, and are not in this table.
+    MsgGet => MSGGET = 68, nr::MSGGET;
+    MsgSnd => MSGSND = 69, nr::MSGSND;
+    MsgRcv => MSGRCV = 70, nr::MSGRCV;
+    /// `msgctl(msqid, cmd, buf)`. `buf`'s `struct msqid_ds` **is** the same
+    /// layout on x86_64 and aarch64 — confirmed against musl's own
+    /// `bits/msg.h`/`bits/ipc.h` for both targets, byte for byte identical —
+    /// so unlike `epoll_event` this row needed no boundary translation either.
+    MsgCtl => MSGCTL = 71, nr::MSGCTL;
+
     // ── memory ─────────────────────────────────────────────────────────────
     Mmap       => MMAP       = 9,   nr::MMAP;
     Mprotect   => MPROTECT   = 10,  nr::MPROTECT;
