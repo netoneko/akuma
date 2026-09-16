@@ -95,7 +95,8 @@
 //!    `lstat`(6), `poll`(7), `access`(21), `pipe`(22), `select`(23), `dup2`(33),
 //!    `fork`(57), `vfork`(58), `rename`(82), `mkdir`(83), `rmdir`(84),
 //!    `unlink`(87), `symlink`(88), `readlink`(89), `gettimeofday`(96),
-//!    `getpgrp`(111), `arch_prctl`(158), `settimeofday`(164), `time`(201) —
+//!    `getpgrp`(111), `arch_prctl`(158), `settimeofday`(164), `time`(201),
+//!    `epoll_create`(213), `epoll_wait`(232) —
 //!    have **no** asm-generic number and must not get invented ones. They stay
 //!    where they belong: `AT_FDCWD` shims in `amd64/src/usermode.rs`, each
 //!    forwarding to the `*at` call this table does name.
@@ -295,6 +296,26 @@ syscall_table! {
     /// one that does not — which is aarch64. Dispatched anyway because a program
     /// that calls it by hand got `ENOSYS` from a kernel that implements the call.
     Pselect6   => PSELECT6   = 270, nr::PSELECT6;
+
+    // ── fd notification: epoll / eventfd ──────────────────────────────────
+    /// `eventfd2(initval, flags)`. musl's `eventfd()` always issues this
+    /// number (there is no separate `eventfd`(284) spelling to shim), and it
+    /// is what a `mio`-based epoll reactor uses to interrupt a blocking
+    /// `epoll_pwait` from another thread — crossterm's default input backend
+    /// failed to construct at all on amd64 for want of this row and
+    /// [`Self::EpollCreate1`] together.
+    Eventfd2     => EVENTFD2     = 290, nr::EVENTFD2;
+    /// `epoll_create1(flags)`. musl's `epoll_create(size)` narrows to this
+    /// with `flags = 0` (size is advisory and discarded) rather than issuing
+    /// a distinct number, so `epoll_create`(213) is the one legacy spelling
+    /// that shims to it in `amd64/src/usermode.rs`.
+    EpollCreate1 => EPOLL_CREATE1 = 291, nr::EPOLL_CREATE1;
+    EpollCtl     => EPOLL_CTL     = 233, nr::EPOLL_CTL;
+    /// `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)`.
+    /// x86_64's legacy `epoll_wait`(232) has no asm-generic twin and narrows
+    /// to this with a null sigmask, the same shape as [`Self::Ppoll`]'s
+    /// `poll`(7)/`select`(23) shims.
+    EpollPwait   => EPOLL_PWAIT   = 281, nr::EPOLL_PWAIT;
 
     // ── memory ─────────────────────────────────────────────────────────────
     Mmap       => MMAP       = 9,   nr::MMAP;
@@ -872,8 +893,13 @@ mod tests {
         // `readlink`, `gettimeofday`, `getpgrp`, `arch_prctl`, `settimeofday`,
         // `time`, `chmod`. (`chmod` has no asm-generic twin — `fchmod`/`fchmodat`
         // do — so it narrows to `fchmodat(AT_FDCWD, …)` in the amd64 kernel
-        // rather than getting a row.)
-        for n in [2u64, 4, 6, 7, 21, 22, 23, 33, 57, 58, 82, 83, 84, 87, 88, 89, 90, 96, 111, 158, 164, 201]
+        // rather than getting a row.) `epoll_create`(213) and `epoll_wait`(232)
+        // joined the list with [`Syscall::EpollCreate1`]/[`Syscall::EpollPwait`]
+        // — asm-generic only ever had the `1`/`p` spellings.
+        for n in [
+            2u64, 4, 6, 7, 21, 22, 23, 33, 57, 58, 82, 83, 84, 87, 88, 89, 90, 96, 111, 158, 164,
+            201, 213, 232,
+        ]
         {
             assert_eq!(
                 Syscall::from_x86_64(n),

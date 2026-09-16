@@ -368,11 +368,23 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
         if !akuma_primitives::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
             return EBADF;
         }
-        let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
-        if read_user_into(&mut ev, event_ptr as u64).is_err() {
-            return EFAULT;
-        }
-        Some(({ ev.events }, { ev.data }))
+        #[cfg(target_arch = "x86_64")]
+        let pair = {
+            let mut ev = EpollEventX86::default();
+            if read_user_into(&mut ev, event_ptr as u64).is_err() {
+                return EFAULT;
+            }
+            ({ ev.events }, { ev.data })
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pair = {
+            let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
+            if read_user_into(&mut ev, event_ptr as u64).is_err() {
+                return EFAULT;
+            }
+            ({ ev.events }, { ev.data })
+        };
+        Some(pair)
     } else {
         None
     };
@@ -645,10 +657,36 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
     ready
 }
 
+/// x86_64's `struct epoll_event` is `__attribute__((packed))` — 12 bytes,
+/// `events` immediately followed by `data` with no alignment gap — where
+/// [`EpollEvent`] (asm-generic/aarch64) is the natural, 16-byte layout with a
+/// 4-byte pad before `data`. [`EpollEvent`]'s own doc comment already named
+/// this crossing; nothing acted on it until a live `epoll_ctl`/`epoll_wait`
+/// round trip on amd64 read back `data.fd == 0` for a real fd and, separately,
+/// would have overrun the caller's event array by 4 bytes per slot on every
+/// multi-event `epoll_wait` (`out_size` was computed from the 16-byte stride
+/// against a buffer the x86_64 caller sized at 12 bytes/event) —
+/// `docs/archive/AKUMA_AMD64_EPOLL_EVENTFD_FOLD.md`.
+#[cfg(all(feature = "sc-epoll", target_arch = "x86_64"))]
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct EpollEventX86 {
+    events: u32,
+    data: u64,
+}
+#[cfg(all(feature = "sc-epoll", target_arch = "x86_64"))]
+const _: () = assert!(core::mem::size_of::<EpollEventX86>() == 12);
+
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+    // 12 on x86_64 (packed ABI), 16 everywhere else (natural layout, the
+    // asm-generic/aarch64 shape `EpollEvent` itself uses) — see
+    // `EpollEventX86`'s doc comment for why the two differ.
+    #[cfg(target_arch = "x86_64")]
+    const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEventX86>();
+    #[cfg(not(target_arch = "x86_64"))]
     const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
-    
+
     if maxevents <= 0 { return EINVAL; }
     let maxevents = maxevents as usize;
     let out_size = maxevents * EPOLL_EVENT_SIZE;
@@ -840,12 +878,25 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 
         match machine.lap_end(&obs) {
             WaitStep::Ready => {
-                if copy_to_user(
+                // `kernel_events` stays the native (16-byte, aarch64-shaped)
+                // `EpollEvent` throughout the computation above, on both
+                // architectures — only the copy out to the caller's own
+                // buffer needs the x86_64 packed shape, so the repacking
+                // happens here and nowhere upstream of it.
+                #[cfg(target_arch = "x86_64")]
+                let copy_result = {
+                    let packed: alloc::vec::Vec<EpollEventX86> = kernel_events[..ready_count]
+                        .iter()
+                        .map(|e| EpollEventX86 { events: e.events, data: e.data })
+                        .collect();
+                    copy_to_user(events_ptr as u64, as_user_bytes(&packed))
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let copy_result = copy_to_user(
                     events_ptr as u64,
                     &as_user_bytes(&kernel_events)[..ready_count * EPOLL_EVENT_SIZE],
-                )
-                .is_err()
-                {
+                );
+                if copy_result.is_err() {
                     return EFAULT;
                 }
                 log_epoll_pwait_return(

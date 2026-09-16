@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache"]
+default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -62,6 +62,19 @@ no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akum
 no-bkl-process = ["akuma-exec/no-bkl-process"]
 no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
 no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
+# `epoll_create1`/`epoll_ctl`/`epoll_pwait`. Forwards to glue's own gate of
+# the same name — `crates/akuma-syscalls-abi`'s table names the numbers on
+# both architectures unconditionally, but the *implementation*
+# (`akuma_syscalls_glue::poll::sys_epoll_*`) and the `EpollFd`
+# fd-table-teardown hook it needs (`exec_runtime.rs`'s `epoll_destroy`) stay
+# behind this feature exactly as they do for the AArch64 kernel. Default-on:
+# `mio`'s epoll backend — what every non-`use-dev-tty` crossterm build and
+# the `tokio`/`bun` reactors reach for — needs both this and `sc-eventfd`.
+sc-epoll = ["akuma-syscalls-glue/sc-epoll"]
+# `eventfd2`, `mio`'s own cross-thread interrupt for a blocking `epoll_pwait`.
+# See `sc-epoll` just above; the two are default-on together for the same
+# reason.
+sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a

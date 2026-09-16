@@ -70,17 +70,19 @@
 //! only allocators it has. The pipe hooks were wired in slice 4 and the socket
 //! hooks in slice 7, each at its own field with that argument restated.
 //!
-//! **Nine `not_wired!` stubs are left** — it was 16 when the C2 plan was
-//! written — and they divide cleanly, each saying which:
+//! **Four `not_wired!` stubs are left** — it was 16 when the C2 plan was
+//! written, seven once `unix_sock_*` wired with `socketpair` (2026-09-12, a
+//! count this header went stale on and stayed at nine through), and four once
+//! `eventfd_*`/`epoll_destroy` wired behind `sc-eventfd`/`sc-epoll` — and they
+//! divide cleanly, each saying which:
 //!
-//! - **not built for this target** — `rump_socket_clone_ref`, `eventfd_*`,
-//!   `unix_sock_*`, `epoll_destroy`, `pidfd_close`. Seven of these, and none
-//!   is C2's business.
+//! - **not built for this target** — `rump_socket_clone_ref`, `pidfd_close`.
+//!   Two of these, and neither is C2's business.
 //! - **the subsystem does not exist here** — `resolve_file_id` and
 //!   `read_at_by_inode`, which name a file by `(mount id, inode)`; this target
 //!   has one filesystem and no mount table.
 //!
-//! None of the nine still says "C2", and that is the point of having gone
+//! None of the four still says "C2", and that is the point of having gone
 //! through them: a stub whose stated reason is a *step* stops being true when
 //! the step lands, and nothing in the type system notices.
 //!
@@ -318,7 +320,21 @@ fn runtime() -> ExecRuntime {
         pipe_close_read: |id| crate::pipe::close_read(id as usize),
         pipe_clone_ref: |id, is_write| crate::pipe::clone_ref(id as usize, is_write),
         pipe_write: akuma_syscalls_glue::pipe::pipe_write_no_sigpipe,
+        // ── wired with `sc-eventfd` ─────────────────────────────────────────
+        // `akuma_syscalls_glue::eventfd`'s two lifecycle hooks, real for the
+        // same reason the socket/pipe/AF_UNIX hooks above are: once
+        // `eventfd2(2)` is dispatched, a `FileDescriptor::EventFd` can reach a
+        // registered `SharedFdTable`, and `close_all()` fires these
+        // unconditionally on teardown — so leaving them `not_wired!` past that
+        // point is not "eventfd isn't built here", it is a panic waiting on
+        // the first process that opens one and exits.
+        #[cfg(feature = "sc-eventfd")]
+        eventfd_close: akuma_syscalls_glue::eventfd::eventfd_close,
+        #[cfg(not(feature = "sc-eventfd"))]
         eventfd_close: |_| not_wired!("eventfd_close", "sc-eventfd is not in this target's feature set"),
+        #[cfg(feature = "sc-eventfd")]
+        eventfd_clone_ref: akuma_syscalls_glue::eventfd::eventfd_clone_ref,
+        #[cfg(not(feature = "sc-eventfd"))]
         eventfd_clone_ref: |_| not_wired!("eventfd_clone_ref", "sc-eventfd is not in this target's feature set"),
         // ── wired 2026-09-12, with `socketpair` ───────────────────────────
         //
@@ -339,6 +355,13 @@ fn runtime() -> ExecRuntime {
         // was the panic's design and it is what named this hook.
         unix_sock_close: akuma_syscalls_glue::unixsock::unix_sock_close,
         unix_sock_clone_ref: akuma_syscalls_glue::unixsock::unix_sock_clone_ref,
+        // ── wired with `sc-epoll` ───────────────────────────────────────────
+        // Same argument as the eventfd pair above: once `epoll_create1(2)` is
+        // dispatched, `FileDescriptor::EpollFd` is a real, table-reachable
+        // variant, and `close_all()` fires this on every one it pops.
+        #[cfg(feature = "sc-epoll")]
+        epoll_destroy: akuma_syscalls_glue::poll::epoll_destroy,
+        #[cfg(not(feature = "sc-epoll"))]
         epoll_destroy: |_| not_wired!("epoll_destroy", "sc-epoll is not in this target's feature set"),
         pidfd_close: |_| not_wired!("pidfd_close", "sc-pidfd is not in this target's feature set"),
         // **A stated no-op, not a panic** — and the distinction is the whole

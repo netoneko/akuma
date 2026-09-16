@@ -1299,6 +1299,20 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             }
             return secs as u64;
         }
+        // `epoll_create(size)` — x86_64 213, x86-only (`epoll_create1` is the
+        // asm-generic spelling and the one in the neutral table). `size` has
+        // been advisory since Linux 2.6.8 and every kernel including this one
+        // ignores it; musl's own `epoll_create` narrows to `epoll_create1(0)`
+        // the same way, so this arm exists for a caller that issues 213 by
+        // hand rather than for anything musl emits.
+        213 => return to_glue(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]),
+        // `epoll_wait(epfd, events, maxevents, timeout)` — x86_64 232,
+        // x86-only (asm-generic only ever had `epoll_pwait`). Narrows to it
+        // with a null sigmask/sigsetsize, which is exactly what
+        // `epoll_wait(2)` already means — glue's `sys_epoll_pwait` never reads
+        // those two arguments regardless, so there is no signal-mask feature
+        // silently lost by treating the two spellings alike.
+        232 => return to_glue(Syscall::EpollPwait, [a1, a2, a3, a4, 0, 0]),
         _ => {}
     }
 
@@ -1449,6 +1463,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3, a5),
         Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3, a5),
         Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
+        // `getsockopt`/`shutdown` never had a native `crate::sock` arm at all —
+        // unlike `Setsockopt`/`Sendto`, there is no "second family" to avoid
+        // growing by going through glue; `net::dispatch_getsockopt`/
+        // `dispatch_shutdown` resolve the same `FileDescriptor::Socket(idx)`
+        // into the same `akuma_net::socket` table `sys_socket` above allocates
+        // out of. Without `Shutdown`, a program doing the ordinary
+        // half-close-then-drain pattern (`shutdown(fd, SHUT_WR)`, keep reading
+        // until EOF) got `ENOSYS` on the shutdown and never sent the FIN.
+        // Without `Getsockopt`, `SO_ERROR` after a non-blocking `connect()`
+        // that a poller reported writable was unreadable, so the caller could
+        // not tell success from a refused connection.
+        Syscall::Getsockopt => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        Syscall::Shutdown => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `exit` (60) and `exit_group` (231) are the same call for a
         // single-threaded process and emphatically not for a threaded one:
         // `exit` ends the calling thread, `exit_group` ends every thread in the
@@ -1672,6 +1699,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `syscall(SYS_pselect6, …)` by hand used to get `ENOSYS`.
         Syscall::Ppoll => crate::fd::sys_ppoll(a1, a2, a3, a4),
         Syscall::Pselect6 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        // `epoll_create1(flags)` / `epoll_ctl(epfd, op, fd, *event)` /
+        // `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)`
+        // — all three are glue's arms (`sc-epoll`), sharing the same
+        // `akuma_net_yarn::WaitPolicy` blocking-wait machine `Pselect6` above
+        // already exercises on this target, so the park/wake path needs no
+        // amd64-specific arm the way `Ppoll`'s does.
+        Syscall::EpollCreate1 => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::EpollCtl => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        Syscall::EpollPwait => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        // `eventfd2(initval, flags)` — glue's arm (`sc-eventfd`). The
+        // cross-thread wakeup a `mio` epoll reactor uses to interrupt a
+        // blocking `epoll_pwait`.
+        Syscall::Eventfd2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
         // forked) task replaces its own image in place. See `sys_execve`.
         Syscall::Execve => sys_execve(a1, a2, a3),
@@ -6184,9 +6224,9 @@ fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
 pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // Every number the legacy `match nr` above claims to own. Each must be
     // x86-only; a number that also decodes through `Syscall` is handled twice.
-    const X86_ONLY: [u64; 23] = [
+    const X86_ONLY: [u64; 25] = [
         2, 4, 6, 7, 21, 22, 23, 33, 34, 37, 57, 58, 82, 83, 84, 87, 88, 89, 96, 111, 158, 164,
-        201,
+        201, 213, 232,
     ];
     let mut overlap = 0u64;
     for n in X86_ONLY {
@@ -6369,6 +6409,34 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         big.len() as u64,
     );
     t.check("dispatch: and the tail past 256 was written", big[256..] != [0u8; 44]);
+
+    // The `sc-epoll`/`sc-eventfd` rows added with `mio`/crossterm's amd64
+    // epoll backend. Number-mapping only, not a live round trip: unlike
+    // credentials or `getrandom`, `sys_epoll_create1` needs a registered
+    // process's `SharedFdTable` to allocate into (`EBADF` without one), and
+    // the boot task this suite runs as is not one — a live probe belongs in
+    // `userspace/`, not here. What this pins is the fold, the same crossing
+    // C3's six timers guarded above: x86_64 233 is `epoll_ctl`, but
+    // asm-generic 233 is `nr::MADVISE` — a missed hop would not compile to
+    // `ENOSYS`, it would compile to a working `madvise` call fed an fd, an
+    // op and an event pointer as if they were an address, a length and an
+    // advice value.
+    t.check("dispatch: epoll_create1 291 -> 20", hop(Syscall::EpollCreate1, 291, nr::EPOLL_CREATE1));
+    t.check("dispatch: epoll_ctl 233 -> 21", hop(Syscall::EpollCtl, 233, nr::EPOLL_CTL));
+    t.check("dispatch: epoll_pwait 281 -> 22", hop(Syscall::EpollPwait, 281, nr::EPOLL_PWAIT));
+    t.check("dispatch: eventfd2 290 -> 19", hop(Syscall::Eventfd2, 290, nr::EVENTFD2));
+    // The two x86-only legacy spellings, `epoll_create`(213) and
+    // `epoll_wait`(232), must not also be neutral-table numbers — the
+    // overlap check every entry in `X86_ONLY` above gets, spelled out for
+    // these two specifically because they are new.
+    t.check(
+        "dispatch: 213 is not also a neutral-table number",
+        Syscall::from_x86_64(213).is_none(),
+    );
+    t.check(
+        "dispatch: 232 is not also a neutral-table number",
+        Syscall::from_x86_64(232).is_none(),
+    );
 
     if !have_fs {
         t.note("dispatch: no filesystem; symlink round trip skipped", 0);
