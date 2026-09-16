@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc"]
+default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -105,10 +105,37 @@ sc-aio = ["akuma-syscalls-glue/sc-aio"]
 # and aarch64 musl, so — like `sc-timerfd` and unlike `sc-epoll` — this
 # needed no ABI-boundary translation. Not forwarded to
 # `akuma-vfs-glue/sc-sysv-ipc`: that crate's `/proc/sysvipc/msg` listing
-# lives inside its `ProcFilesystem`, which does not build for
-# `x86_64-unknown-none` at all (see `akuma-procfs`'s own doc comment), so
-# there is nothing on this target for that feature to reach.
+# lives inside its `ProcFilesystem`, which this target does not mount (it
+# renders from `akuma-exec`'s process table via a global `/proc`, and this
+# target's own VFS mount is separate) — not because it fails to build for
+# `x86_64-unknown-none`, which it has since B3 (correction, 2026-09-17: the
+# comment used to say the opposite; see `akuma-vfs-glue`'s own Cargo.toml).
 sc-sysv-ipc = ["akuma-syscalls-glue/sc-sysv-ipc"]
+# `mount`(165)/`umount2`(166) — real Linux syscalls, gated behind
+# `akuma-syscalls-glue`'s `sc-containers` (the same feature that also compiles
+# `register_box`/`kill_box`/`reattach`/`mount_in_ns`, the "box" lifecycle
+# calls — see that crate's `container.rs`). Forwards to
+# `akuma-vfs-glue/sc-containers` too: `container::sys_mount`'s `fstype ==
+# "proc"` arm builds `akuma_vfs_glue::proc::ProcFilesystem`, and without the
+# forward `cargo check` on the standalone crate fails "item configured out"
+# (root `Cargo.toml` already does this for the AArch64 binary; amd64's own
+# manifest had just never defined the forwarding feature). `ProcFilesystem`
+# itself compiles for `x86_64-unknown-none` (has since B3, see the
+# `sc-sysv-ipc` note above) so this needed no `#[cfg]` carve-out inside
+# `container.rs`.
+#
+# **Only `Mount`/`Umount2` got an amd64 dispatch arm.**
+# `register_box`/`kill_box`/`reattach`(316-318)/`mount_in_ns`(325) are
+# Akuma-private numbers reached through `usermode.rs`'s `AKUMA_PRIVATE_BASE`
+# match, which has no arms for them — so turning this feature on does not
+# make them reachable, and it should stay that way until amd64 has a "box"
+# concept of its own to give them meaning: every process here is hardcoded
+# `box_id: 0` (`net.rs`, `usermode.rs`), so `register_box`'s registration and
+# `mount_in_ns`'s per-box namespace composition have nothing to attach to.
+# `caller_may_mount` (box 0 only) always passes here as a result, matching
+# the single-box world this target already is.
+# `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
+sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-containers"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a

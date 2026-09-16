@@ -1710,6 +1710,21 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Mkdirat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Unlinkat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Renameat => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        // `mount(source, target, fstype, flags, data)` / `umount2(target,
+        // flags)` — glue's arms (`sc-containers`), same mount table this
+        // target's own root and every `*at` call above already resolve
+        // through. `caller_may_mount` there is "box 0 only", which every
+        // process on this target satisfies (`box_id: 0`, hardcoded — see
+        // `net.rs`), so this is real mount/unmount rather than a stub.
+        //
+        // The box-lifecycle calls the same feature also compiles
+        // (`register_box`/`kill_box`/`reattach`/`mount_in_ns`) get no arm
+        // here on purpose: they are Akuma-private numbers dispatched through
+        // the `AKUMA_PRIVATE_BASE` match above, which does not list them, and
+        // this target has no second "box" concept for them to mean anything
+        // against yet. See `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
+        Syscall::Mount => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        Syscall::Umount2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271, and
         // `pselect6(nfds, r, w, e, *timespec, *sigmask)` — x86_64 270. Both are
         // **glue's arms** since 4b batch 4b, and both read their own
@@ -6577,9 +6592,73 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         t.check_eq("dispatch: glue accepts msgctl(IPC_RMID)", rmid_rc, 0);
     }
 
+    // The `sc-containers` rows — `mount`/`umount2` only. The box-lifecycle
+    // calls the same feature also compiles (`register_box`/`kill_box`/
+    // `reattach`/`mount_in_ns`, 316/317/318/325) get no dispatch arm here —
+    // see the `Mount` match arm's own comment and
+    // `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
+    t.check("dispatch: mount 165 -> 40", hop(Syscall::Mount, 165, nr::MOUNT));
+    t.check("dispatch: umount2 166 -> 39", hop(Syscall::Umount2, 166, nr::UMOUNT2));
+    // The global `/` guard fires before any real mount-table lookup, so this
+    // needs no disk and runs even when `have_fs` is false.
+    let root = b"/\0";
+    t.check_eq(
+        "dispatch: umount2(\"/\") is EBUSY",
+        syscall_dispatch(166, root.as_ptr() as u64, 0, 0, 0, 0, 0),
+        (-16i64) as u64,
+    );
+
     if !have_fs {
         t.note("dispatch: no filesystem; symlink round trip skipped", 0);
         return;
+    }
+
+    // A live tmpfs mount/write/unmount round trip, through the real
+    // dispatcher for `mount`/`umount2` and the same native VFS helpers the
+    // redirect suite above uses to observe the effect (`crate::fs::*`,
+    // `akuma_vfs_glue`'s facade) rather than a hand-rolled openat/read/write
+    // sequence. The disk image survives a boot, so clear any leftover before
+    // creating it, same discipline as the symlink probe below.
+    let _ = crate::fs::remove_dir("/mount-probe");
+    let dir_ok = crate::fs::create_dir("/mount-probe").is_ok();
+    t.check("mount: probe directory created", dir_ok);
+    if dir_ok {
+        let mount_target = b"/mount-probe\0";
+        let fstype = b"tmpfs\0";
+        let mount_rc = syscall_dispatch(
+            165,
+            0,
+            mount_target.as_ptr() as u64,
+            fstype.as_ptr() as u64,
+            0,
+            0,
+            0,
+        );
+        t.check_eq("dispatch: glue accepts mount(tmpfs)", mount_rc, 0);
+        if !crate::fd::errno::is_err(mount_rc) {
+            t.check(
+                "mount: a file written after mounting lands on the new tmpfs",
+                crate::fs::write_file("/mount-probe/hello.txt", b"MOUNTOK").is_ok(),
+            );
+            t.check(
+                "mount: and reads back the exact bytes",
+                crate::fs::read_file("/mount-probe/hello.txt").is_ok_and(|d| d == b"MOUNTOK"),
+            );
+            let umount_rc = syscall_dispatch(166, mount_target.as_ptr() as u64, 0, 0, 0, 0, 0);
+            t.check_eq("dispatch: glue accepts umount2", umount_rc, 0);
+            // Unmounted: the underlying (empty) ext2 directory is exposed
+            // again, so the file that only ever existed on the tmpfs overlay
+            // is gone — the property that proves this was a real second
+            // filesystem, not a write straight through to `/mount-probe`.
+            t.check(
+                "mount: the file is gone once the tmpfs is unmounted",
+                crate::fs::read_file("/mount-probe/hello.txt").is_err(),
+            );
+        }
+        t.check(
+            "mount: cleanup removes the probe directory",
+            crate::fs::remove_dir("/mount-probe").is_ok(),
+        );
     }
 
     let target = b"/probe.txt\0";

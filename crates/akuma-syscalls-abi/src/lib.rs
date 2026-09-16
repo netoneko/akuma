@@ -292,6 +292,21 @@ syscall_table! {
     /// `amd64/src/usermode.rs`, the same way `chmod`(90) shims to `fchmodat`.
     Fchownat   => FCHOWNAT   = 260, nr::FCHOWNAT;
 
+    // ── mount ──────────────────────────────────────────────────────────────
+    /// `mount(source, target, fstype, flags, data)`. Reaches
+    /// `akuma-syscalls-glue::container::sys_mount`, gated by that crate's
+    /// `sc-containers` feature — the same feature the three Akuma-private box
+    /// syscalls (`REGISTER_BOX`/`KILL_BOX`/`REATTACH`, 316-318) and
+    /// `MOUNT_IN_NS`(325) live behind, but those four have no row here: they
+    /// have no meaning without a second "box" on the calling architecture, so
+    /// only the two real Linux mount calls got an amd64 dispatch arm. See
+    /// `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`. Plain arguments, no
+    /// wire struct — unlike [`Syscall::EpollCtl`]'s `struct epoll_event`,
+    /// nothing here needed an x86_64 packing check.
+    Mount   => MOUNT   = 165, nr::MOUNT;
+    /// `umount2(target, flags)`. Same gate and same doc as [`Syscall::Mount`].
+    Umount2 => UMOUNT2 = 166, nr::UMOUNT2;
+
     // ── readiness ──────────────────────────────────────────────────────────
     /// asm-generic has no `poll`(7) or `select`(23) — `ppoll` and `pselect6`
     /// are the only spellings — so the amd64 kernel's `7`/`23` arms are shims
