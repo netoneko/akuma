@@ -153,10 +153,25 @@ impl VirtioBlockDevice {
         Ok(())
     }
 
-    /// Read bytes at an arbitrary offset (handles sector alignment internally)
+    /// Read bytes at an arbitrary offset (handles sector alignment internally).
+    ///
+    /// **Fast path**: when `offset` and `buf.len()` are both sector-multiples —
+    /// true of every ext2 call site, since `block_size` (4096) is a multiple of
+    /// `SECTOR_SIZE` (512) — `buf` reads straight from the device with no
+    /// intermediate allocation. The slow path below is what a misaligned
+    /// caller still needs: a temp buffer sized to whole sectors, because
+    /// `read_sectors` cannot write a partial one.
+    /// (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` audit item 4 —
+    /// measured: every one of a self-host build's ~62k page reads paid this
+    /// allocate-then-copy for bytes that were already going to the right
+    /// place.)
     pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if buf.is_empty() {
             return Ok(());
+        }
+
+        if offset.is_multiple_of(SECTOR_SIZE as u64) && buf.len().is_multiple_of(SECTOR_SIZE) {
+            return self.read_sectors(offset / SECTOR_SIZE as u64, buf);
         }
 
         let start_sector = offset / SECTOR_SIZE as u64;
@@ -175,10 +190,19 @@ impl VirtioBlockDevice {
         Ok(())
     }
 
-    /// Write bytes at an arbitrary offset (handles sector alignment internally)
+    /// Write bytes at an arbitrary offset (handles sector alignment internally).
+    ///
+    /// **Fast path**, same condition and reason as [`Self::read_bytes`]: an
+    /// aligned write needs no read-modify-write at all, not just no temp
+    /// buffer — the existing sector contents are being replaced wholesale, so
+    /// reading them first was pure waste, not caution.
     pub fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
         if buf.is_empty() {
             return Ok(());
+        }
+
+        if offset.is_multiple_of(SECTOR_SIZE as u64) && buf.len().is_multiple_of(SECTOR_SIZE) {
+            return self.write_sectors(offset / SECTOR_SIZE as u64, buf);
         }
 
         let start_sector = offset / SECTOR_SIZE as u64;

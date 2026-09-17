@@ -46,10 +46,18 @@
 //!
 //! # The clock
 //!
-//! `uptime_us` comes from the LAPIC tick counter, not the TSC. The TSC is finer
-//! and would need calibrating against a known-rate source; the tick period is
-//! already known because `lapic::start_timer` set it. Coarse but honest — and
-//! the stack uses this for timeouts, where a 10 ms granularity is fine.
+//! `uptime_us` prefers the TSC (2026-09-17,
+//! `docs/reference/subsystems/config-flags.md` has no entry for this — see
+//! `lapic::tsc_uptime_us` instead), calibrated against the PIT at boot, and
+//! falls back to the LAPIC tick counter — `lapic::ticks() * US_PER_TICK`,
+//! 10 ms per tick — only on a machine [`lapic::calibrate`] found no PIT on.
+//! Until 2026-09-17 the tick counter was the only source, unconditionally:
+//! "coarse but honest", and correspondingly blind to anything faster than one
+//! tick — a single page fault, a single `read(2)`, docs/archive/ has more than
+//! one benchmark that hit exactly that floor and had to be run from the
+//! kernel's own self-test suite instead of from userspace to see anything at
+//! all. The fallback keeps that honesty on a target with no PIT to calibrate
+//! against; it does not still apply to `microvm`, which has one.
 
 use akuma_net::NetRuntime;
 use akuma_net::smoltcp_net::StaticIpv4;
@@ -58,16 +66,18 @@ use akuma_selftest::Suite;
 
 use crate::serial;
 
-/// Microseconds per LAPIC tick. Set by `lapic::start_timer`.
+/// Microseconds per LAPIC tick. Set by `lapic::start_timer`. Only reached when
+/// [`crate::lapic::tsc_uptime_us`] returns `None` — no PIT to calibrate
+/// against.
 const US_PER_TICK: u64 = 10_000;
 
-/// `clock.rs`'s SNTP bootstrap (2026-09-05) uses this same coarse-but-honest
-/// tick clock for its own round-trip timing — one uptime source for the
-/// whole target, not two that could disagree. `pub` rather than `pub(crate)`
-/// because `mod net;` is itself private, which already bounds this to the
-/// crate (clippy's `redundant_pub_crate`).
+/// `clock.rs`'s SNTP bootstrap (2026-09-05) uses this same source for its own
+/// round-trip timing — one uptime source for the whole target, not two that
+/// could disagree. `pub` rather than `pub(crate)` because `mod net;` is
+/// itself private, which already bounds this to the crate (clippy's
+/// `redundant_pub_crate`).
 pub fn uptime_us() -> u64 {
-    crate::lapic::ticks() * US_PER_TICK
+    crate::lapic::tsc_uptime_us().unwrap_or_else(|| crate::lapic::ticks() * US_PER_TICK)
 }
 
 /// Wall clock, via `clock.rs`'s SNTP bootstrap (2026-09-05) — `None` until it

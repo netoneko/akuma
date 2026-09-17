@@ -1,8 +1,13 @@
 # Self-host build slowness on amd64 — investigation and first fix
 
-*Investigation of 2026-09-16/17, worktree `profiling/amd64-build-slow`.*
-*Status: first fix landed (CR3-skip on same-root switches); measured A/B on
-real hardware still pending — the FC box was unreachable for the final arm.*
+*Investigation of 2026-09-16/17, worktree `profiling/amd64-build-slow`,
+folded to the main tree 2026-09-17 (merge e5ba8298).*
+*Status: the 1-vCPU anchor landed (77.9 s, −24 %) and both SMP=4 crash
+causes are fixed and FC-verified; the `-j4` run survives ~50 min / 31
+crates with flat memory but still ends in a silent wedge behind a residual
+ring-3 kill pair, and the build remains slow (rustc ≈44 % of wall
+in-kernel, dominated by `read`) — see "The `-j4` verification run" and
+"Iterate" below.*
 
 ## Question
 
@@ -134,7 +139,7 @@ traps the script now handles: rust's x86_64 musl target defaults to
 applet link; and a nested ssh re-splits multi-word remote commands at every
 shell layer, so guest scripts must travel as staged files.
 
-## Open: SMP=4 build load kills the guest — one cause found and fixed, one reproduced (2026-09-17)
+## Open: SMP=4 build load — two crash causes found and fixed, one wedge left (2026-09-17)
 
 With the BKL fixes in, a `cargo build -j4` at 4 vCPUs ran ~10 minutes and
 then died: a **ring-3 `#UD`** (rip=0x1009266a0, cs=0x23 — a userspace
@@ -247,9 +252,82 @@ owner (kernel root, ring-0 self-test) proceeds unlocked exactly as before.
 
 Verification so far: boot suite + clippy clean on the amd64 target, host
 tests green (identical pre/post warning counts on the host clippy — the 183
-warnings are pre-existing and unrelated). The `w4g` FC A/B and the
-`cargo -j4` SMP=4 retime are the remaining gates — the repro fires in ~1
-minute, so a red run means this fix is wrong, fast.
+warnings are pre-existing and unrelated). FC-verified 2026-09-17 (KVM,
+vcpu_count=4, 6 GB): **`execleak2 w4g` green** — 4 replicas × 100 churn
+cycles, freeram flat at 2034 MB, zero `[Fault]` lines, `DONE w4`; pre-fix
+the same mode died in ~1 minute. The `cargo -j4` run under it is §"The
+-j4 verification run" below.
+
+### The `-j4` verification run (2026-09-17, FC SMP=4, 6 GB) — big win, not done
+
+`cargo build --release -p akuma-amd64 -j4 --offline` in the FC guest
+(`/root/akuma-fc-rust.img`'s `/src/akuma`, `/usr/local/rust/bin` nightly,
+booted by `/root/akuma-fc-run.sh` against `/root/akuma-fc.json`; guest sshd
+listens on **2222**, not 22). Against the pre-fix kernel this workload died
+at ~10 minutes with `pmm_free=0` → fork EAGAIN → ring-3 `#UD` → dead
+network. On the fixed kernel:
+
+- **~50 minutes and 31 crates compiled with memory flat** (`pmm_free`
+  1.2–1.3 M frames throughout, fpcache healthy, `cow_ref_frames` ≈83 k —
+  plausible live sharing, not the stranded-663 k signature). No OOM, no
+  fork EAGAIN, no NULL-write/NULL-exec faults. Cause 1 + cause 2 held.
+- **Two residual ring-3 kills, ~50 min in**: `#GP(0) rip=0x30046b96` killing
+  pid 957, and a `pid=1215 killed by signal 11` one line later — both right
+  after a `[TRAMP-MISMATCH]` pair (tid 18/19 resolving against stale
+  `THREAD_PID_MAP` entries). PID-recycling ambiguity: the long-lived rustc
+  that *also* carried pid 957 was alive 30 minutes later (PSTATS elapsed
+  2675 s), so the victim was a recycled slot, not that job — no cargo job
+  was lost and the build kept advancing. Console evidence:
+  `/root/akuma-fc.log` lines ~2700-2710 of the 2026-09-17 boot.
+- **The run then ended in a SILENT WEDGE** (the Defect-A family,
+  selfhost-kernel-build.md §5.3a row 3): `virtio-drivers` sat "Compiling"
+  30+ minutes, and a 40-second PSTATS delta showed **zero syscalls across
+  every remaining rustc** while cargo stayed alive — cargo waiting on a
+  child that is gone, i.e. `wait4` never returned or the child died without
+  waking it. Prime suspect: the `#GP`/SIGSEGV kill pair killed a build
+  process without cargo being woken. This wedge, plus its kill-class
+  precursor, is the top open item — not cause 2, which is fixed.
+
+Speed (the original question, still open): it is slow, and the counters
+say where. rustc pid 1417 burned **258 s of 590 s in-kernel on 62 k `read`
+syscalls (246 s)**; cargo sat **716 s blocked in `recvfrom`** on the
+jobserver pipe; individual mid-size crates (`akuma-dmesg`,
+`virtio-drivers`) took 10–30 min of wall. That is the file-read/fault path,
+not codegen and not scheduling — matching the audit's remaining levers
+below (virtio-blk double-copy, ext2 per-page block re-derivation, no shared
+zero page). The wedge masks honest re-timing until it is fixed.
+
+### Status and next steps
+
+- **Cause 1 fixed** (one-line reference fix in `amd64/src/mm.rs`), verified:
+  16k rewrites flat, boot suite 707/707 SMP=1 and 717/717 SMP=4, clippy
+  clean, full smpstress on FC no longer OOMs.
+- **Cause 2 fixed** (`idt.rs` owner-locked CoW break + owner-resolved share
+  pass, above) — `w4g` green, `-j4` memory flat for ~50 min. Fix folded to
+  the main tree (merge e5ba8298).
+- **Open: the `-j4` wedge + its kill-class precursor** (§ above). Next:
+  catch the `#GP`/SIGSEGV kills with a rip/cr3 dump plus the victim's
+  `/proc/<pid>/stat`-equivalent from PSTATS before the kill, and check
+  whether every `[TRAMP-MISMATCH]` burst precedes a kill; then decide
+  whether the trampoline first-mismatch defense is losing once per N
+  thousand execs. A cargo-side mitigation (retry a job whose rustc died
+  without a signal-carrying exit) would unblock re-timing while the kernel
+  hunt runs — but is a mask, not a fix.
+- **Then: the read path** for speed — `[PSTATS]` now gives the attribution
+  for free (per-syscall counts and coarse times per process). The three
+  audit levers (virtio-blk `read_bytes` temp-Vec double-copy, ext2 per-page
+  block re-derivation, shared zero page for anon reads) are where the 258 s
+  of rustc in-kernel time lives.
+- `[TRAMP-MISMATCH]` fires ~500–800×/run under exec churn (aarch64
+  ancestor: `KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`) — map-first resolution
+  defends the trampoline, but the 2026-09-17 `-j4` run ties it (in time) to
+  the residual kill pair; treat "burst then kill" as one bug, not two.
+- The FC box kernel: the fixed build (with the kill-line forensics) is
+  staged at `/root/akuma/target/x86_64-unknown-none/release/akuma-amd64`;
+  the pre-investigation binary is backed up beside it as
+  `akuma-amd64.pre-smpstress`. The wedged 2026-09-17 `-j4` guest was still
+  up when this was written — kill it (`pgrep -x firecracker` on the box's
+  Ubuntu side, port-22) before reusing the rig.
 
 ### The probes (`userspace/amd64/{smpstress,execleak,execleak2}/`)
 
@@ -344,23 +422,26 @@ guest never idles into the `[PSTATS]` sweep).
 1. ~~CR3-skip~~, ~~futex hlt~~, ~~netpoll/allow_tick BKL~~ — **landed, see
    above**. The FC guest runs the fixed kernel; the pre-fix binary is kept as
    `akuma-amd64.pre-c3skip`.
-2. **Root-cause the SMP=4 ring-3 `#UD`** (open item above) — it gates the
-   biggest remaining lever, which is not a kernel change at all: rustc is
-   single-threaded at `vcpu_count=1`, and the aarch64 self-host baseline
-   (44 s clean build) had four cores. Once SMP builds are stable, re-time the
-   anchor at `-j4`/4 vCPUs.
+2. **Root-cause the `-j4` silent wedge and its kill-class precursor**
+   (open item above; the original `#UD`/OOM shape is fixed — causes 1 and 2).
+   It still gates re-timing: the aarch64 self-host baseline (44 s clean
+   build) had four cores, and this run shows SMP builds are survivable but
+   not yet dependable.
 3. **Attribute the rest in-guest** with the new PSTATS counters: run a build,
    then read the 30 s `[PSTATS]` block (per-syscall counts, coarse times —
    blocking syscalls are the ones that surface — and `pf=` fault counts).
    rustc's `/proc/<pid>/stat` utime/minflt are stubs on this target (both
-   read 0 mid-compile); PSTATS is the working instrument now.
-4. Remaining audit levers if PSTATS shows fault/read domination: shared zero
-   page for anonymous read faults; virtio-blk `read_bytes` temp-Vec; the
+   read 0 mid-compile); PSTATS is the working instrument now. **First
+   attribution is in (§ the -j4 run): rustc spends ~44 % of its wall
+   in-kernel, almost all of it in `read`** — the read path, not codegen.
+4. Remaining audit levers, now ranked by that attribution: **virtio-blk
+   `read_bytes` temp-Vec double-copy** and **ext2 per-page block
+   re-derivation** first (they tax every one of those 62 k reads), then
+   shared zero page for anonymous read faults; the
    syscall-entry opt-out bitmap (aarch64 `SYSCALL_BKL_OPTOUT_SEED`) — the
    *mechanism* ports as-is, but each seed needs its amd64 handler audited
    (e.g. `futex` cannot be seeded until `WAITERS` stops naming the BKL as its
-   safety argument), and at 1 vCPU the uncontended BKL is cheap, so this pays
-   only at SMP>1 — do it after item 2.
+   safety argument) — only pays at SMP>1, after item 2.
 
 ## Background
 

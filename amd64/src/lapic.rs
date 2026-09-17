@@ -392,6 +392,10 @@ static CALIBRATED: AtomicBool = AtomicBool::new(false);
 /// 0 until [`calibrate`] succeeds. Read by [`tsc_hz`].
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
+/// The TSC value [`calibrate`] read as its `tsc0` — boot's zero point for
+/// [`tsc_uptime_us`]. Meaningless while [`TSC_HZ`] is still 0.
+static TSC_START: AtomicU64 = AtomicU64::new(0);
+
 /// The TSC frequency in Hz, or 0 when no PIT was there to measure it against.
 ///
 /// Every polled-hardware budget in this kernel that is written in TSC ticks
@@ -404,6 +408,37 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 #[must_use]
 pub fn tsc_hz() -> u64 {
     TSC_HZ.load(Ordering::Relaxed)
+}
+
+/// Monotonic microseconds since boot, at TSC resolution — `None` until
+/// [`calibrate`] has run and found a real rate.
+///
+/// [`net::uptime_us`](crate::net::uptime_us) is `lapic::ticks() *
+/// US_PER_TICK_TARGET`, and every clock on this target derives from it,
+/// `clock_gettime` included: 10 ms granularity, documented at the usermode
+/// self-test that first measured its cost (`usermode.rs`'s `fault_cost_
+/// tests`, 2026-09-08) as unable to see a single page fault at all — a
+/// 1000-iteration control landed on exactly one tick, every 512-fault bracket
+/// read 0 ns, and the note there says outright: "TSC has the resolution the
+/// tick clock lacks, and the kernel is where the TSC is reachable." This is
+/// that resolution, exposed so [`net::uptime_us`](crate::net::uptime_us) —
+/// and everything downstream of it, `clock_gettime` among them — can use it.
+///
+/// `u128` for the multiply: at a ~1 GHz TSC, a delta more than about 213 days
+/// old would overflow a `u64` multiplied by `1_000_000` before the divide.
+/// This kernel does not run that long, but the wraparound would land as a
+/// silently wrong timestamp rather than a panic, which is worse than the
+/// extra multiply — the conversion runs once per call, not once per tick.
+#[must_use]
+pub fn tsc_uptime_us() -> Option<u64> {
+    let hz = tsc_hz();
+    if hz == 0 {
+        return None;
+    }
+    // SAFETY: unprivileged, reads no memory.
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let delta = now.wrapping_sub(TSC_START.load(Ordering::Relaxed));
+    Some((u128::from(delta) * 1_000_000 / u128::from(hz)) as u64)
 }
 
 /// The tick period the timer is calibrated to, in microseconds. `net::uptime_us`
@@ -426,16 +461,30 @@ pub fn calibrated_count() -> u32 {
 /// Measure the LAPIC timer against the 8254 PIT and set [`TIMER_COUNT`] so one
 /// tick is [`US_PER_TICK_TARGET`].
 ///
-/// # Why the PIT, and why channel 2
+/// # Why channel 0, not channel 2
 ///
 /// The PIT's 1_193_182 Hz crystal is the one reference every PC-compatible
-/// machine agrees on, and **channel 2 is the only one that can be polled**: its
-/// gate is software-controlled through port `0x61` and its output is readable
-/// there as bit 5, so the whole measurement needs no interrupt, no IDT entry
-/// and no ordering against anything else. (Channel 0 drives IRQ0 and would
-/// mean taking interrupts during early boot, which is precisely the state this
-/// runs before.) The speaker bit is left off throughout — this is the standard
-/// trick, and it is worth saying out loud that it does not make a sound.
+/// machine agrees on. This used to poll channel 2 — its gate and output are
+/// both reachable through port `0x61`, so a measurement needs no interrupt —
+/// but that port is board glue, not part of the 8254 itself, and QEMU's
+/// `microvm` machine wires up an `isa-pit` (ports 0x40/0x43) with no such
+/// glue: `info qtree` shows the chip and nothing answering 0x61. Measured
+/// 2026-09-17: `pit_present`'s old port-0x61 probe therefore always failed
+/// there, `calibrate` never ran, and every timeout on that machine was scaled
+/// by whatever `UNCALIBRATED_COUNT` happens to be worth under TCG — the
+/// "6x fast, 1.6x slow, both called it 10 ms" case [`start_timer`] documents.
+///
+/// Channel 0 needs no gate at all: it is hardwired enabled on every PC, so
+/// loading a new count starts it counting immediately. What it lacks is a
+/// dedicated output pin on a legacy port — but the 8254's own **read-back
+/// command** (`0xD2` on the command port, decoded below) latches a channel's
+/// status, OUTPUT bit included, onto its own data port. That is standard
+/// 8254 behaviour with no motherboard glue involved, so it works identically
+/// on `microvm`, on real hardware, and (unlike a channel-0 IRQ) it needs no
+/// interrupt, no IDT entry and no ordering against anything else — the same
+/// property channel 2 had, reached a different way. The speaker bit that
+/// channel 2's version had to keep clear does not exist here: nothing about
+/// channel 0 or the read-back command ever touches port `0x61`.
 ///
 /// # Not every machine has one
 ///
@@ -450,60 +499,49 @@ pub fn calibrated_count() -> u32 {
 pub fn calibrate() -> bool {
     /// Ticks of the PIT in one target period.
     const PIT_COUNT: u32 = (PIT_HZ as u64 * US_PER_TICK_TARGET as u64 / 1_000_000) as u32;
-    /// Spins before giving up on an output line that is never going to rise.
+    /// Spins before giving up on an output that is never going to latch high.
     /// One period is ~10 ms; this is orders of magnitude more than that and
     /// still a fraction of a second.
     const SPIN_LIMIT: u32 = 50_000_000;
 
-    if !pit_present() {
-        return false;
-    }
-
-    // SAFETY: the 8254 and the NMI status/control port are fixed legacy I/O
-    // ports. The speaker bit is explicitly cleared in every write, so the gate
-    // manipulation below cannot make a sound, and nothing else in this kernel
-    // touches channel 2 — there is no other user to race with.
+    // SAFETY: fixed legacy I/O ports (the PIT's own command/data ports, not
+    // board glue). Nothing else in this kernel programs channel 0 — the
+    // legacy PICs are masked before `calibrate` runs (`init`'s ordering), so
+    // even if this makes it raise IRQ0 nothing delivers it.
     unsafe {
-        let saved = crate::port::inb(PORT_61);
-        // Gate low, speaker off: channel 2 stopped and reset.
-        crate::port::outb(PORT_61, (saved & !SPEAKER) & !GATE);
-        // Channel 2, lobyte then hibyte, mode 0 (interrupt on terminal count),
-        // binary. Mode 0 is what makes the output line stay low until the count
-        // expires and then latch high, which is the edge this polls for.
-        crate::port::outb(0x43, 0b1011_0000);
-        crate::port::outb(0x42, (PIT_COUNT & 0xff) as u8);
-        crate::port::outb(0x42, (PIT_COUNT >> 8) as u8);
+        // Channel 0, lobyte then hibyte, mode 0 (interrupt on terminal
+        // count), binary. Channel 0's gate is hardwired high, so this load
+        // itself starts the countdown — there is no separate arm step.
+        crate::port::outb(PORT_CMD, 0b0011_0000);
+        crate::port::outb(PORT_CH0_DATA, (PIT_COUNT & 0xff) as u8);
+        crate::port::outb(PORT_CH0_DATA, (PIT_COUNT >> 8) as u8);
 
         // Arm the LAPIC at full scale, masked — this borrows the timer exactly
         // as `delay_counts` does, and `start_timer` re-arms it afterwards.
         write(REG_TIMER_DIV, TIMER_DIV_16);
         write(REG_LVT_TIMER, LVT_MASKED);
         write(REG_TIMER_INIT, u32::MAX);
-
-        // Gate high: channel 2 starts counting now, and so does the measurement.
-        crate::port::outb(PORT_61, (saved & !SPEAKER) | GATE);
-        // The TSC rides along on the same gate — one PIT period measures both
+        // The TSC rides along on the same load — one PIT period measures both
         // the LAPIC count and the TSC count, so the two clocks this kernel
         // keeps agree about what 10 ms is. RDTSC is unprivileged and present
         // on every x86_64 part.
         let tsc0 = core::arch::x86_64::_rdtsc();
 
-        // A freshly gated mode-0 count holds its output LOW until it expires.
-        // If it is already high we are not talking to a PIT, whatever
-        // `pit_present` concluded — belt and braces on the failure that cost a
-        // 50x clock.
-        if crate::port::inb(PORT_61) & OUT != 0 {
+        // A freshly loaded mode-0 count holds OUTPUT low until it expires. If
+        // it reads high immediately, this is not a real PIT answering — the
+        // same belt-and-braces the old port-0x61 version kept, against the
+        // same 50x-clock failure, reached through the read-back command
+        // instead of a floating board-glue port.
+        if ch0_status() & STATUS_OUTPUT != 0 {
             write(REG_TIMER_INIT, 0);
-            crate::port::outb(PORT_61, saved);
             return false;
         }
 
         let mut spins: u32 = 0;
-        while crate::port::inb(PORT_61) & OUT == 0 {
+        while ch0_status() & STATUS_OUTPUT == 0 {
             spins += 1;
             if spins >= SPIN_LIMIT {
                 write(REG_TIMER_INIT, 0);
-                crate::port::outb(PORT_61, saved);
                 return false;
             }
             core::hint::spin_loop();
@@ -511,7 +549,6 @@ pub fn calibrate() -> bool {
         let remaining = read(REG_TIMER_CUR);
         let tsc1 = core::arch::x86_64::_rdtsc();
         write(REG_TIMER_INIT, 0);
-        crate::port::outb(PORT_61, saved);
 
         let elapsed = u32::MAX - remaining;
         // A plausibility band rather than a bare non-zero check. Below this the
@@ -529,6 +566,11 @@ pub fn calibrate() -> bool {
         let tsc_ticks = tsc1.wrapping_sub(tsc0);
         let hz = tsc_ticks * 1_000_000 / u64::from(US_PER_TICK_TARGET);
         if hz >= 100_000_000 {
+            // `tsc0`, not `tsc1` or a fresh read: boot's zero point is the
+            // instant this measurement started, and `tsc_uptime_us` needs to
+            // agree with `ticks()` (0 until `start_timer` below) about what
+            // "just now" meant at that instant.
+            TSC_START.store(tsc0, Ordering::Relaxed);
             TSC_HZ.store(hz, Ordering::Relaxed);
         }
         CALIBRATED.store(true, Ordering::Relaxed);
@@ -536,55 +578,49 @@ pub fn calibrate() -> bool {
     true
 }
 
-/// Ports and bits of PIT channel 2's software gate (port `0x61`).
-const PORT_61: u16 = 0x61;
-/// Channel 2's gate: counting runs while this is high.
-const GATE: u8 = 1 << 0;
-/// The PC speaker. Cleared in every write here — none of this makes a sound.
-const SPEAKER: u8 = 1 << 1;
-/// Channel 2's output, readable at port `0x61`. Low while counting.
-const OUT: u8 = 1 << 5;
+/// PIT channel 0's data port — also where a latched **status** byte (from
+/// [`CH0_STATUS_LATCH`]) comes back, since the read-back command routes it
+/// through the same port a count would use.
+const PORT_CH0_DATA: u16 = 0x40;
+/// The PIT's command port, shared by every channel.
+const PORT_CMD: u16 = 0x43;
+/// Read-back command (`11` in bits 7:6) for channel 0's status only: bit 5
+/// set = don't latch a count, bit 4 clear = do latch status, bit 1 = channel
+/// 0. Standard 8254, defined by the chip and not by any board glue — unlike
+/// the port-`0x61` gate/output trick this replaces, every PIT that exists at
+/// all answers it the same way.
+const CH0_STATUS_LATCH: u8 = 0b1110_0010;
+/// The OUTPUT bit in a status byte latched by [`CH0_STATUS_LATCH`]. Mode 0
+/// holds this low until the count reaches zero, then it latches high — the
+/// same edge the old port-`0x61` version polled, read through the port the
+/// 8254 itself exposes it on instead of board glue that `microvm` lacks.
+const STATUS_OUTPUT: u8 = 1 << 7;
 
-/// Is there a PIT channel 2 that actually responds?
-///
-/// **`inb` on an unimplemented port returns `0xFF`, not zero**, and that is not
-/// a detail — it is the bug this function exists to prevent. QEMU `microvm` and
-/// Firecracker present no PIT, so port `0x61` floats: the [`OUT`] bit reads as
-/// already high, a wait-for-expiry loop falls through on its first iteration,
-/// and a "calibration" comes back having measured the handful of cycles between
-/// two instructions. Measured: 1199 counts where the real answer was 626 088,
-/// which sailed through a plausibility band and left `uptime_us` running about
-/// fifty times fast — with `CALIBRATED` set, so nothing downstream doubted it.
-///
-/// The probe is to clear the gate bit and read it back. A real `0x61` returns
-/// what was written; a floating bus returns the bit still set.
-fn pit_present() -> bool {
-    // SAFETY: a fixed legacy I/O port, restored before returning. The speaker
-    // bit is cleared, so nothing audible happens.
+/// Latch and return PIT channel 0's status byte.
+fn ch0_status() -> u8 {
+    // SAFETY: fixed legacy I/O ports (the PIT's own), no other user.
     unsafe {
-        let saved = crate::port::inb(PORT_61);
-        crate::port::outb(PORT_61, (saved & !SPEAKER) & !GATE);
-        let back = crate::port::inb(PORT_61);
-        crate::port::outb(PORT_61, saved);
-        back & GATE == 0
+        crate::port::outb(PORT_CMD, CH0_STATUS_LATCH);
+        crate::port::inb(PORT_CH0_DATA)
     }
 }
 
-/// Gate PIT channel 2 for `us` microseconds and spin until it expires.
+/// Run PIT channel 0 for `us` microseconds and spin until it expires.
 ///
-/// The measurement primitive [`calibrate`] and [`clock_rate_check`] share. `us`
-/// must be at most [`PIT_MAX_US`] — the channel's count is 16 bits, so ~54.9 ms
-/// is the longest interval it can express, and asking for more would silently
-/// wrap to a short one.
+/// The measurement primitive [`clock_rate_check`] uses (separately from
+/// [`calibrate`]'s own channel-0 use, so the two never share a live count).
+/// `us` must be at most [`PIT_MAX_US`] — the channel's count is 16 bits, so
+/// ~54.9 ms is the longest interval it can express, and asking for more would
+/// silently wrap to a short one.
 ///
-/// Returns false if the output line never rose within a bounded spin, which is
-/// how a machine with no PIT answers.
+/// Returns false if OUTPUT never latches high within a bounded spin, which is
+/// how a machine with no PIT answers — **`inb` on an unimplemented port
+/// returns `0xFF`, not zero**, so an absent chip would otherwise read as an
+/// output already high and return instantly having measured nothing; the
+/// immediate-high check catches that the same way [`calibrate`]'s does.
 fn pit_wait_us(us: u32) -> bool {
     const SPIN_LIMIT: u32 = 500_000_000;
 
-    if !pit_present() {
-        return false;
-    }
     if us == 0 || us > PIT_MAX_US {
         return false;
     }
@@ -592,27 +628,23 @@ fn pit_wait_us(us: u32) -> bool {
     if count == 0 || count > 0xFFFF {
         return false;
     }
-    // SAFETY: fixed legacy I/O ports. The speaker bit is cleared in every write
-    // so nothing audible happens, and channel 2 has no other user in this
-    // kernel to race with.
+    // SAFETY: fixed legacy I/O ports (the PIT's own command/data ports).
     unsafe {
-        let saved = crate::port::inb(PORT_61);
-        crate::port::outb(PORT_61, (saved & !SPEAKER) & !GATE);
-        crate::port::outb(0x43, 0b1011_0000);
-        crate::port::outb(0x42, (count & 0xff) as u8);
-        crate::port::outb(0x42, ((count >> 8) & 0xff) as u8);
-        crate::port::outb(PORT_61, (saved & !SPEAKER) | GATE);
+        crate::port::outb(PORT_CMD, 0b0011_0000);
+        crate::port::outb(PORT_CH0_DATA, (count & 0xff) as u8);
+        crate::port::outb(PORT_CH0_DATA, ((count >> 8) & 0xff) as u8);
 
+        if ch0_status() & STATUS_OUTPUT != 0 {
+            return false;
+        }
         let mut spins: u32 = 0;
-        while crate::port::inb(PORT_61) & OUT == 0 {
+        while ch0_status() & STATUS_OUTPUT == 0 {
             spins += 1;
             if spins >= SPIN_LIMIT {
-                crate::port::outb(PORT_61, saved);
                 return false;
             }
             core::hint::spin_loop();
         }
-        crate::port::outb(PORT_61, saved);
     }
     true
 }
