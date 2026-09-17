@@ -1,3 +1,5 @@
+*.aarch64
+*.x86_64
 forktest_child
 forktest_parent
 pattern2_minimal.bin
