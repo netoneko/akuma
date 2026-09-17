@@ -134,7 +134,7 @@ traps the script now handles: rust's x86_64 musl target defaults to
 applet link; and a nested ssh re-splits multi-word remote commands at every
 shell layer, so guest scripts must travel as staged files.
 
-## Open: SMP=4 build load kills the guest (probe bring-up, 2026-09-17)
+## Open: SMP=4 build load kills the guest — one cause found and fixed, one reproduced (2026-09-17)
 
 With the BKL fixes in, a `cargo build -j4` at 4 vCPUs ran ~10 minutes and
 then died: a **ring-3 `#UD`** (rip=0x1009266a0, cs=0x23 — a userspace
@@ -143,133 +143,132 @@ that) followed by the guest leaving the network (`10.0.2.15` ARPs dead,
 console shows the exception dump and nothing after). This is the
 "reads serving zeros under memory pressure" family from the aarch64
 self-host history (§5.1a-era rustc ICEs, Defect B). Console evidence saved
-on the FC host as **`/root/akuma-fc2.crash-smp4-ud.log`**. Until root-caused,
-treat `vcpu_count>1` + parallel builds on amd64 as unstable; the FC box is
-restored to its original `vcpu_count=1` with the fixed kernel
-(md5 `5b394360…`).
+on the FC host as **`/root/akuma-fc2.crash-smp4-ud.log`**.
 
-### The fast-iteration probe (`userspace/amd64/smpstress/`)
+### Cause 1 — FIXED: the file-page cache leaked one CoW reference per freshly filled page
 
-A cargo build is a ten-minute repro; the probe below catches the same family
-in seconds and boots as `INIT=/probes/smpstress` (build: `x86_64-linux-musl-gcc
--static -O2 -pthread -o smpstress smpstress.c`; inject with `debugfs` into
-`/probes/`, the same mechanism `scripts/benchmarks/amd64_fault_cost.py` uses;
-boot `SMP=4 SSH_PORT=2444 HTTP_PORT=8484 MEMORY=3072 DISK=<img>
-INIT=/probes/smpstress sh amd64/run.sh` from the worktree — ports 2222/8080
-are taken by other VMs).
+`amd64/src/mm.rs`'s `fill_file_pages` miss arm took a third `cow_ref_inc`
+("this mapping's reference") before `akuma_fpcache::insert`, which takes the
+cache's own reference itself, and `populate_file_page_by_inode`'s
+allocation already carries the mapper's reference
+(`map_and_track_pte`/teardown are the inc/dec pair). Three refs in, two out
+(munmap and the next write's `invalidate_inode`) — **one reference stranded
+per freshly filled shared file page**, so the frame could never be freed.
+The AArch64 original never had the extra increment (its fill carries the
+allocation reference into `adopt_user_frame(frame, owns_ref=true)` — one
+allocation ref + one cache ref).
 
-Shape, chosen to mirror what a `-j4` build actually does: 4 forked workers ×
-(2 churn threads + file checker) — per-thread private anon region and a
-**160 MiB ballast** filled with a per-thread pattern and re-verified on a
-rotating window (8 threads live ≈ 1.3 GiB of the 3 GiB guest, so frames are
-recycled under live mappings, which is the pressure the crash happened
-under); per-iteration `madvise(MADV_DONTNEED)` + mmap/munmap churn; a fork
-grandchild every 64 iterations writing a CoW copy; every process maps the
-shared file `PROT_READ` and re-verifies it; a writer thread rewrites the file
-in place (2789 versions in 5 min) while the mappings exist; and an
-`execv("/bin/hello")` churn loop per worker (in flight — see below) to stress
-loader/teardown of file-backed text at SMP, the #UD-shaped surface.
+Every `write(2)` to a file invalidates that inode's cache entries
+(`invalidate_inode`, via ext2's inode-freed hook), so a workload that
+rewrites files re-filled and re-stranded on every rewrite: **exactly one
+leaked frame per page per rewrite**, measured at 256 KB per 256 KB rewrite.
+`cargo build -j4` rewrites thousands of files over ten minutes → ~2.5 GiB
+stranded → `pmm_free=0` → every downstream symptom: fork/report EAGAIN, the
+ring-3 `#UD`, the dead network.
 
-### Result so far: clean ≥5 min ×2 at SMP=4 under TCG — negative
-
-Two full 5-minute runs (run5: anon+CoW+madvise+ballast+file-read; run10:
-+ file-rewrite-under-mapping) **passed with zero pattern mismatches** at
-SMP=4, boot suite 717/717 ahead of the probe, and the kernel tripwires the
-crash should have left — `[SWITCH FREED-CR3]`, `[BKL] stuck`, `[SWITCH
-NO-BKL]`, `[FUTEX-DUMP]`, `#UD` — never fired. The audit's two named
-suspects are *not* cleared by this, but the obvious races in both are not
-this shallow:
-
-- **CoW window + shootdown under the BKL** (`amd64/src/idt.rs` ~919): the
-  fault path takes the BKL for the servicing window, and the shootdown's
-  ack-wait assumes every sender holds it — a peer resuming inside that window
-  is what the design already argues away, and the probe did not break it.
-- **`madvise(MADV_DONTNEED)` shared-frame memset** (the exact Defect B
-  analogue): `dontneed_range` (`amd64/src/mm.rs`) already consults the CoW
-  share count and breaks sharing with a fresh frame rather than zeroing a
-  peer-visible frame; fpcache frames carry `cow_ref_inc`, so the ZeroInPlace
-  arm does not wipe another process's cached page. The aarch64 defect's
-  mechanism (`MADV_DONTNEED_SHARED_FRAME.md`) is not present in the amd64
-  code in that form.
-
-New instrumentation signal worth keeping an eye on (new under SMP=4 load,
-self-correcting, fired ~6×/run during fork churn):
+Evidence trail (all on the FC box, KVM, vcpu_count=4):
 
 ```
-[TRAMP-MISMATCH] tid=23 THREAD_PID_MAP=353 but table scan found 352 — using 353
-[unregister] pid=352 stale tid=23 now owned by pid=353
+execleak2 mode=file (rewrite churn, cache on):  freeram 2553 → 1553 MB, −256 KB/rewrite, linear
+execleak2 mode=file, SHARED_FILE_PAGES_ENABLED=false: 16000 cycles, flat 2553 MB  ← A/B
+execleak2 mode=remap (cache hits, munmap):      flat — mapper refs are balanced
+execleak2 modes mt/mtexec/mtfork/mtforkexec/madv: all flat — fork/exec/madvise leak nothing
+kill-line forensics at pmm_free=0: fpcache_len=19 (cache nearly empty!), cow_ref_frames=653587
+per-site counters: fill-inc=653587, insert-inc=653587, invalidate-dec=653568, munmap-dec=28632
 ```
 
-That is tid-recycling racing the trampoline's pid map during heavy
-fork/exit — a benign-looking recovery path, but exactly the kind of window a
-`#UD`-class bug hides behind if the recovery ever loses. Not implicated yet.
-The aarch64 self-host history has the closest ancestor for this signal:
-`KTG_STALE_TID_EXIT_STAMP_J4_HANG.md` — a stale-tid window that only opened
-at `-j4` (its guard fired 63× in one build) and whose fix preceded the first
-clean `-j4` completion. Treat a non-zero steady-state rate of
-`[TRAMP-MISMATCH]` during the next real build the same way the `[KTG-STALE-CH]`
-guard was treated there: a counter to drive to zero, not noise.
+`fpcache_len` pinned near zero rules out cap/eviction; `cow_ref_frames` at
+~653k with hits=0/misses≈cycles×64 pins the stranded third reference. The
+fix is the deletion of that one `cow_ref_inc`; post-fix, 16,000 rewrites run
+flat at 2552 MB and the full smpstress file churn no longer drains.
 
-### Probe-side lessons (read before touching the checker)
+### Cause 2 — REPRODUCED, still open: fork's share pass races a sibling thread's faults
 
-Three false positives, all mine, all worth remembering because each looks
-*exactly* like the corruption family being hunted:
+With the leak fixed, the full smpstress still drained PMM to its floor —
+and bisecting the worker shape (`execleak2` mode `w`/`w4`, below) isolated
+the trigger: **fork executing on one thread while a sibling thread is
+faulting in / madvising its own region concurrently**. At 4 vCPUs with four
+such workers, in about a minute — no memory pressure required
+(`pmm_free=587281`):
 
-1. **Rotating-window verification must shift the seed with the pointer.**
-   Checking `b + off` against `mix(seed + rel)` with an unshifted seed fails
-   from the second window on, and the failing qword then legitimately reads
-   as "the content from 512 KiB earlier" — a perfect wrong-frame-mapped
-   impostor. (It consumed an hour; the "512 KiB shift = REGION_BYTES"
-   numerology was seductive and wrong.)
-2. **A page re-verified against a tag read moments ago can be rewritten in
-   between** by a concurrent writer. A mismatch is only real if the tag is
-   unchanged *and* the qword still mismatches on re-read.
-3. **If the version tag lives in the page, the fill must write it there.**
-   `mix(seed + i)` at every offset makes the tag qword read back as pattern
-   data, and every check downstream mis-keys. Torn *pages* (different
-   versions in different pages of one read pass) are legal under a
-   concurrent writer; verify per page against that page's own tag, and
-   give a first-seen version one pass before verifying it.
+```
+[Fault] #PF write to not-present page, cr2=0x30, rip=0x403460, pid=796
+[Fault] #PF instruction fetch, rip=0x0,  cr2=0x0,        pid=60
+  [memwatch-at-kill] pmm_free=587264 fpcache_len=0 cow_ref_frames=66347
+```
+
+The first is the aarch64 Defect-B signature (a pointer field in a live page
+read back as null → write through `NULL+0x30`); the second is a process
+that **jumped to NULL** — the same terminal as the cargo `#UD` (execute a
+page that cannot hold code). 66k frames sit stuck in the CoW ledger
+afterwards. So the SMP=4 crash is a **fork-share-pass vs concurrent
+sibling-fault race** — lost PTE demotes or lost refcounts — and the OOM
+floor from cause 1 was almost certainly what made it rare enough to look
+like a 1-in-N, ten-minute event.
+
+### The probes (`userspace/amd64/{smpstress,execleak,execleak2}/`)
+
+Static musl C probes, injected with `debugfs` into `/probes/`, booted as
+`INIT=` (mechanism: `scripts/utils/amd64_mem_trials.py::inject_local`,
+FC: `scripts/utils/hpbox.py::firecracker`). This loop — probe, not cargo —
+is what turned a 1-in-N ten-minute crash into a one-minute repro.
+
+- `smpstress` — the original fast-iteration probe: 4 workers × (2 churn
+  threads + exec churner + file checker), per-thread pattern-verified
+  ballast, madvise/mmap churn, CoW grandchildren, shared file rewritten
+  under mapping. Found cause 1; post-fix it is the end-to-end regression
+  gate.
+- `execleak` — freeram (sysinfo) across N fork+exec+waitpid of /bin/hello.
+- `execleak2` — the bisect tree, one mode per shape: `file` (rewrite under
+  mapping — caught cause 1), `remap` (cache hits + munmap), `mt`/`mtexec`
+  (fork from main), `mtfork`/`mtforkexec` (fork from a thread), `madv`,
+  and `w`/`w4` — one faithful smpstress worker (or four concurrent), knobs
+  `f`=file-checker `x`=exec-churner `g`=grandchild-CoW-write. **`w4g` is
+  the current minimal reproducer of cause 2**; the mode that finally caught
+  it runs the churn+fork on the holder threads themselves, so the fork
+  share pass races a sibling's fault-in/madvise — every earlier shape
+  (paused holders, churn on main) was flat.
+
+Probe-side lessons (each false positive looked exactly like the bug):
+rotating-window checks must shift the seed with the window; a page
+re-verified against a recently read tag can be legitimately rewritten in
+between; if the version tag lives in the page the fill must write it there;
+`/bin/hello` is the self-check ELF (healthy exit **0x7F**, argv[0] must be
+`"hello"`); guest `time()` stretches ~4× under full TCG saturation — bound
+loops by iteration count too; and a boot with no NIC never runs
+`mem_watch_tick`, so OOM/fpcache forensics ride the ring-3 kill line
+(`[memwatch-at-kill]`, permanent since this investigation).
+
+### Instrumentation kept
+
+The ring-3 kill path now prints `[memwatch-at-kill] pmm_free= fpcache_len=
+fpcache_cap= cow_ref_frames=` plus the `[FPCACHE]` hit/miss/evict/inval
+line — the two numbers that split "the cache ate the RAM" from "a mapper
+leaked refs" at the moment of death, which no other surface on this target
+exposes (a NIC-less boot never reaches `mem_watch_tick`, and a saturated
+guest never idles into the `[PSTATS]` sweep).
 
 ### Status and next steps
 
-- **The premise held**: SMP=4 amd64 QEMU boots, serves the boot suite
-  (717/717 — the SMP-only tests; the SMP=1 figure is the usual 707/707,
-  re-verified 2026-09-17), and runs heavy memory churn cleanly on this
-  branch — the `cargo build -j4` crash is not reachable by the generic
-  probe under TCG.
-- **Exec churn joined the probe and is clean.** The per-worker
-  `fork`+`execv("/bin/hello")`+`waitpid` loop survived ~2600 cycles under
-  full 4-vCPU saturation (run13), which also exercises the loader's
-  file-backed text mappings and process teardown at SMP — the #UD-shaped
-  surface. Two probe accommodations worth knowing: `/bin/hello` is the
-  tree's self-check ELF, so a healthy run exits **0x7F**, not 0, and its
-  argv check wants `argv[0] == "hello"` — exec'ing it as `"/bin/hello"`
-  costs one probe bit (status 0x6F) and looks like a kernel failure.
-- **Guest time stretches under full TCG saturation**: a `time()`-bounded
-  churn loop ran ~4x its wall bound before noticing (the guest clock lags
-  when all vCPUs are pegged). Bound long loops by iteration count too.
-- **TCG may be hiding the crash** — TCG serializes vCPU timing in ways KVM
-  does not. Next: run `smpstress` on the FC box at `vcpu_count=4` (config
-  backup `/root/akuma-fc.json.vcpu1`, crash log
-  `/root/akuma-fc2.crash-smp4-ud.log`) — the probe keeps FC iterations
-  short, no cargo needed.
-- If the FC probe run is clean too, the remaining divergence is *scale and
-  shape*: the real build runs rustc (huge address spaces, thousands of
-  mmap/futex ops per second, constant process churn) for ten minutes. Raise
-  probe pressure toward near-OOM and add futex/condvar churn, and only then
-  fall back to a real `-j4` cargo build on the FC box as the last resort.
-- PSTATS (this branch's addition) works on this target and is the
-  instrument for the next real build: `pgfault=` counts and per-syscall
-  times appear in the 30 s `[PSTATS]` sweep (absent while all cores are
-  saturated — the dump lives in `idle_loop`, and a saturated guest never
-  idles).
-- Verification state 2026-09-17: clippy clean (workspace minus
-  `akuma-amd64` for the host target, `akuma-amd64` under
-  `--target x86_64-unknown-none --release`), SMP=1 boot 707/707, SMP=4 boot
-  717/717 twice, `smpstress` ≥5 min clean at SMP=4 twice and one
-  ~30-minute saturated run with exec churn, zero CHECK-FAIL. Everything
-  uncommitted.
+- **Cause 1 fixed** (one-line reference fix in `amd64/src/mm.rs`), verified:
+  16k rewrites flat, boot suite 707/707 SMP=1 and 717/717 SMP=4, clippy
+  clean, full smpstress on FC no longer OOMs.
+- **Cause 2 reproduced, not yet fixed.** Next: instrument the fork share
+  pass (`usermode::fork_share_memory`) and the demote's ranged shootdown
+  against concurrent `fault_in`/`madvise` on sibling threads — the `w4g`
+  mode reproduces in ~1 minute at SMP=4 on the FC box, which is fast
+  enough to A/B candidate fixes. The stuck `cow_ref_frames=66347` says at
+  least one path loses a decrement or an inc lands untracked; the
+  NULL-write/NULL-exec faults say PTE content is also getting lost, so
+  this is likely more than a refcount bug.
+- `[TRAMP-MISMATCH]` fires ~500–800×/run under exec churn (aarch64
+  ancestor: `KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`) — map-first resolution
+  defends the trampoline, but treat a non-zero steady-state rate as a
+  counter to drive to zero.
+- The FC box kernel: the fixed build (with the kill-line forensics) is
+  staged at `/root/akuma/target/x86_64-unknown-none/release/akuma-amd64`;
+  the pre-investigation binary is backed up beside it as
+  `akuma-amd64.pre-smpstress`.
 
 ## What the profiling sessions turned up along the way
 

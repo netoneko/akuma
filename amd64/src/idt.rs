@@ -1243,6 +1243,32 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     serial::puts(" pid=");
     serial::put_dec(u64::from(crate::usermode::current_pid()));
     serial::puts(" — killing the process\n");
+    // Post-mortem at the OOM floor: a ring-3 kill under memory pressure is
+    // only diagnosable from these numbers (found 2026-09-17, when the
+    // file-page-cache reference leak drained the guest to `pmm_free=0` and
+    // every downstream symptom — the SMP=4 `#UD`, the dead network — was
+    // downstream of that). A boot with no NIC never reaches
+    // `mem_watch_tick`, so the counters ride the fault line itself.
+    serial::puts("  [memwatch-at-kill] pmm_free=");
+    serial::put_dec(akuma_pmm::free_count() as u64);
+    serial::puts(" fpcache_len=");
+    serial::put_dec(akuma_fpcache::len() as u64);
+    serial::puts(" fpcache_cap=");
+    serial::put_dec(akuma_fpcache::cap() as u64);
+    serial::puts(" cow_ref_frames=");
+    serial::put_dec(akuma_pmm::cow_ref_count() as u64);
+    serial::puts("\n");
+    {
+        // Hit/miss/evict/inval: distinguishes "the cache ate the RAM" (len
+        // pinned at cap, evictions churning) from "a mapper leaked refs"
+        // (len small, `cow_ref_frames` huge) — the two look identical from
+        // `pmm_free=0` alone.
+        let mut buf = [0u8; 160];
+        let mut pos = 0usize;
+        let mut w = akuma_primitives::console::FmtBuf { buf: &mut buf, pos: &mut pos };
+        akuma_fpcache::stats_line(&mut w);
+        serial::puts(core::str::from_utf8(&buf[..pos]).unwrap_or("[fpcache stats]\n"));
+    }
     crate::usermode::kill_current_from_fault(SIGSEGV);
 }
 

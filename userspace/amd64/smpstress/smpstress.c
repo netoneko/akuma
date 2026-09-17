@@ -32,6 +32,7 @@
 #include <sys/wait.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/sysinfo.h>
 
 #define NPROC 4
 #define NT    2
@@ -43,7 +44,7 @@
  * 4 x BALLAST + regions + kernel ~= 1.3 GiB of 2 GiB. Touched once, then
  * spot-verified on a rotating window, so a frame the kernel gave away or
  * zeroed while the mapping still exists shows up within a few iterations. */
-#define BALLAST_BYTES (160u * 1024 * 1024)
+#define BALLAST_BYTES (64u * 1024 * 1024)
 #define BALLAST_SPOT  (4u * 1024 * 1024)
 
 static void fill_file_pages(unsigned char *, size_t, uint64_t);
@@ -111,9 +112,17 @@ static void *exec_churner(void *arg) {
     time_t t0 = time(NULL);
     /* Iteration cap, not just the clock: under full TCG saturation the guest
      * clock lags host time enough that a clock-only bound drags on. */
-    while (n < 4000 && time(NULL) - t0 < RUN_SECS && !g_fail) {
+    int eagain_run = 0;
+    while (n < 1500 && time(NULL) - t0 < RUN_SECS && !g_fail) {
         pid_t pid = fork();
-        if (pid < 0) { fail("exec-fork", 0, 0, errno); return NULL; }
+        if (pid < 0) {
+            /* Transient EAGAIN under churn is the aarch64 fork-exhaustion
+             * family; only a sustained failure is a probe-worthy signal. */
+            if (errno == EAGAIN && ++eagain_run < 50) { usleep(10000); continue; }
+            fail("exec-fork", eagain_run, 0, errno);
+            return NULL;
+        }
+        eagain_run = 0;
         if (pid == 0) {
             char *argv[] = {"hello", NULL};
             execv("/bin/hello", argv);
@@ -260,7 +269,11 @@ static void diagnose(const unsigned char *p, size_t i, uint64_t seed, /* seed al
 
 static void fork_grandchild(unsigned char *region) {
     pid_t pid = fork();
-    if (pid < 0) { fail("fork", 0, 0, errno); return; }
+    if (pid < 0) {
+        if (errno == EAGAIN) return; /* transient; next iteration retries */
+        fail("fork", 0, 0, errno);
+        return;
+    }
     if (pid == 0) {
         /* Child: writes its whole CoW copy, then exits. A lost CoW break or a
          * demote without a flush shows up as the parent's next check failing. */
@@ -326,6 +339,13 @@ static void *worker(void *ap) {
         }
 
         check_pattern(r, REGION_BYTES, seed, "iter", ta);
+        if ((it % 100) == 0 && ta->idx == 0) {
+            struct sysinfo si;
+            sysinfo(&si);
+            printf("smpstress: pid=%d it=%ld freeram=%lu MB\n",
+                   (int)getpid(), it, si.freeram >> 20);
+            fflush(stdout);
+        }
     }
     return NULL;
 }

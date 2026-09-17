@@ -934,20 +934,25 @@ fn fill_file_pages(
         if let Some(frame) = filled {
             FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
             if share_this {
-                // Two references, in this order. The first is **this mapping's**:
-                // the page was installed through `map_and_track_pte`, which
-                // counts VAs in this address space and takes no global
-                // reference, and teardown frees each distinct frame once through
-                // `free_page` — which decrements. Without it, the first process
-                // to exit would free a frame the cache still publishes and every
-                // later mapper would be handed a recycled page as file content.
-                // The second is the cache's own, taken inside `insert`.
+                // Two references cover this frame, and both are already in
+                // place without another `cow_ref_inc` here: the mapping's own
+                // — `populate_file_page_by_inode` installed it through
+                // `map_and_track_pte`, which takes the reference its teardown
+                // will drop — and the cache's own, taken inside `insert`.
+                // An explicit third increment stood here until 2026-09-17 and
+                // leaked one reference per freshly filled shared page: munmap
+                // and the next write's `invalidate_inode` each dropped one of
+                // three, stranding the frame at count 1 forever. Ten minutes
+                // of `cargo build -j4` rewrote enough files to strand ~2.5 GiB
+                // and push the guest to the OOM floor (the SMP=4 ring-3 `#UD`
+                // in AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md). The AArch64
+                // original never had it — its fill carries the allocation
+                // reference into `adopt_user_frame(frame, owns_ref=true)`.
                 //
                 // `insert` may decline (over cap, or a peer published the same
-                // page first). That is not an error and needs no undo: the frame
-                // stays private with exactly the one reference this mapping
-                // holds, which teardown balances.
-                akuma_pmm::cow_ref_inc(frame.addr);
+                // page first). That is not an error and needs no undo: the
+                // frame stays private with exactly the one reference this
+                // mapping holds, which teardown balances.
                 akuma_fpcache::insert(file.mount_id, file.inode, offset, frame, true);
             }
         }
