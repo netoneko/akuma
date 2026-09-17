@@ -317,6 +317,85 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
         .collect()
 }
 
+/// Put `region` into `regions` at its place in address order.
+///
+/// # The region-list invariant
+///
+/// **A process's region list is kept sorted by `start_va`, and regions never
+/// overlap.** Every mutator in this crate preserves that —
+/// [`inherit_mmap_regions_for_cow_child`] maps over its input in order,
+/// [`mprotect_eager_regions_in_range`] drains in order and emits each region's
+/// pieces ascending, [`detach_eager_regions_in_range`] leaves survivors in the
+/// slot they came from — and both kernels insert through this function.
+///
+/// It is worth maintaining because it turns three linear scans into binary
+/// searches, and those scans are most of what a build-heavy process pays the
+/// kernel. Measured in-guest 2026-09-17 on amd64, one `rustc` compiling
+/// `zerocopy` with a 4 400-region list: 81 k `mmap` at 27 us and 73 k `munmap`
+/// at 42 us were **98 % of its in-kernel time**, and the fault path walked the
+/// same list once per page fault, 86 k times, where `[PSTATS]` could not even
+/// see it. See `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §8-§9.
+///
+/// `partition_point` is a binary search and the `insert` it feeds shifts only
+/// what sits above the new region — nothing at all in the common case, since
+/// both kernels' placers hand out the top of the arena unless a hole was freed.
+///
+/// `<` and not `<=`: regions never overlap, so no two share a `start_va` and the
+/// two spellings can only differ on a list that is already broken.
+pub fn insert_region_sorted(regions: &mut alloc::vec::Vec<MmapRegion>, region: MmapRegion) {
+    let at = regions.partition_point(|r| r.start_va < region.start_va);
+    regions.insert(at, region);
+}
+
+/// The index of the region containing `va`, or `None`.
+///
+/// The binary-search form of `regions.iter().position(|r| r.contains(va))`, which
+/// is what the fault path used to do — once per page fault, against every region
+/// the process held. Relies on the sorted invariant documented on
+/// [`insert_region_sorted`].
+#[must_use]
+pub fn region_index_containing(regions: &[MmapRegion], va: usize) -> Option<usize> {
+    // The only candidate is the last region starting at or below `va`: regions
+    // do not overlap, so nothing starting above `va` can contain it.
+    let at = regions.partition_point(|r| r.start_va <= va).checked_sub(1)?;
+    regions[at].contains(va).then_some(at)
+}
+
+/// Where a range-clipping walk has to start, given the sorted invariant.
+///
+/// The last region starting at or below `range_start` may extend into the range,
+/// so it is the first candidate; everything before it ends at or below
+/// `range_start` and cannot overlap. Callers stop as soon as they reach a region
+/// starting at or past `range_end`.
+fn first_candidate_for_range(regions: &[MmapRegion], range_start: usize) -> usize {
+    regions.partition_point(|r| r.start_va <= range_start).saturating_sub(1)
+}
+
+/// The slice of `regions` that can overlap `[range_start, range_end)`.
+///
+/// The sorted invariant turned into something a caller can use directly, for the
+/// callers that want to *ask* about a range rather than clip it — `munmap`'s
+/// "does this range name a file at all?" pass being the one that motivated it,
+/// which was a scan of every region on a syscall that almost never touches one.
+///
+/// Still a superset, not an exact answer: the first element may end at or below
+/// `range_start`, so callers keep their own overlap test. It is the **bound**
+/// that matters, not the filtering.
+#[must_use]
+pub fn regions_overlapping(
+    regions: &[MmapRegion],
+    range_start: usize,
+    range_end: usize,
+) -> &[MmapRegion] {
+    if range_end <= range_start || regions.is_empty() {
+        return &[];
+    }
+    let first = first_candidate_for_range(regions, range_start);
+    let rest = &regions[first..];
+    let len = rest.partition_point(|r| r.start_va < range_end);
+    &rest[..len]
+}
+
 /// Apply `new_prot` to exactly `[range_start, range_end)`, **splitting** any
 /// region the range only partly covers.
 ///
@@ -452,12 +531,46 @@ pub fn detach_eager_regions_in_range(
     if range_end <= range_start {
         return pieces;
     }
-    let mut i = 0usize;
+    // Sorted (see `insert_region_sorted`), so the walk neither starts at 0 nor
+    // runs to the end: it starts at the last region that could reach into the
+    // range and stops at the first one starting past it. That is the difference
+    // between O(regions) and O(log regions + overlaps) per `munmap`, and
+    // `munmap` was 42 us a call against a 4 400-region list.
+    // O(1) guard against the realistic way the invariant breaks: a writer that
+    // **appends**. That leaves exactly the last pair out of order, so noticing it
+    // costs one comparison, and re-sorting here costs one call instead of a
+    // wrong unmap. It is worth the line because the failure is silent and
+    // expensive — a missed `mremap` site (amd64, caught 2026-09-17) made the
+    // searches answer for the wrong region and wedged an in-guest `rustc` with
+    // no panic, no fault and no log line.
+    //
+    // **It is a guard, not a proof.** Two appends in ascending order leave the
+    // last pair sorted and the list still broken. The invariant's real
+    // enforcement is that every writer goes through `insert_region_sorted`, the
+    // `debug_assert` above, and this crate's host tests; this only converts the
+    // commonest mistake from a wedge into a slower call.
+    let n = regions.len();
+    if n >= 2 && regions[n - 2].start_va > regions[n - 1].start_va {
+        regions.sort_unstable_by_key(|r| r.start_va);
+    }
+    // After the guard, so what this catches is breakage the guard *cannot* heal —
+    // two or more appends that happen to leave the last pair in order. In a
+    // release kernel that case is a wrong unmap; in a host test it is this line.
+    debug_assert!(
+        regions.windows(2).all(|w| w[0].start_va <= w[1].start_va),
+        "region list must be sorted by start_va — see insert_region_sorted",
+    );
+    let mut i = first_candidate_for_range(regions, range_start);
     while i < regions.len() {
         let reg_start = regions[i].start_va;
         let reg_pages = regions[i].pages;
         let reg_end = reg_start + reg_pages * crate::PAGE_SIZE;
-        if reg_start >= range_end || reg_end <= range_start {
+        // Sorted, so every region after this one starts at or past it: the walk
+        // is done, not merely skipping this one.
+        if reg_start >= range_end {
+            break;
+        }
+        if reg_end <= range_start {
             i += 1;
             continue;
         }
@@ -1123,6 +1236,127 @@ mod file_backing_tests {
             &mut regions, 0x1_0000_0000, 0x1_0000_0000 + 8 * 4 * PAGE);
         assert_eq!(pieces.len(), 8, "every region should have been clipped");
         assert!(regions.is_empty(), "nothing should survive a full-range unmap");
+    }
+
+    /// The clipping walk starts from a binary search, so it has to find a region
+    /// that is neither first nor last — and stop without walking to the end.
+    ///
+    /// Both halves are silent when wrong: starting too late skips a region that
+    /// should have been unmapped (its frames leak and its record outlives the
+    /// mapping), stopping too early does the same, and starting too early only
+    /// costs an overlap test. So the assertion is that a range in the *middle* of
+    /// a long list clips exactly the regions it covers and leaves the rest alone.
+    #[test]
+    fn split_finds_a_middle_range_without_walking_the_list() {
+        let mut regions: alloc::vec::Vec<MmapRegion> =
+            (0..64).map(|i| region(0x1_0000_0000 + i * 4 * PAGE, 4)).collect();
+        // Cover regions 30 and 31 exactly, and half of 29 and of 32.
+        let start = 0x1_0000_0000 + 29 * 4 * PAGE + 2 * PAGE;
+        let end = 0x1_0000_0000 + 32 * 4 * PAGE + 2 * PAGE;
+        let pieces = detach_eager_regions_in_range(&mut regions, start, end);
+        assert_eq!(pieces.len(), 4, "29 (tail half), 30, 31, 32 (head half)");
+        // 64 regions in; 29 and 32 survive as halves, 30 and 31 are gone.
+        assert_eq!(regions.len(), 62);
+        assert!(regions.windows(2).all(|w| w[0].start_va < w[1].start_va));
+        // Nothing outside the range moved or shrank.
+        assert_eq!(regions[0].pages, 4);
+        assert_eq!(regions[28].pages, 4);
+        assert_eq!(regions[29].pages, 2, "region 29 keeps its head half");
+        assert_eq!(regions[30].pages, 2, "region 32 keeps its tail half");
+        assert_eq!(regions[61].pages, 4);
+    }
+
+    /// An appended region — the invariant broken the way it actually gets broken —
+    /// is noticed and healed rather than mis-clipped.
+    #[test]
+    fn split_heals_an_appended_region() {
+        let mut regions = alloc::vec![
+            region(0x1_0000_0000, 2),
+            region(0x1_0000_4000, 2),
+            region(0x1_0000_8000, 2),
+        ];
+        // What a writer that calls `push` instead of `insert_region_sorted` does:
+        // a low region on the end. Without the guard the binary search below
+        // would not find it and the unmap would silently do nothing.
+        regions.push(region(0x1_0000_2000, 2));
+        let pieces = detach_eager_regions_in_range(&mut regions, 0x1_0000_2000, 0x1_0000_4000);
+        assert_eq!(pieces.len(), 1, "the appended region must still be found");
+        assert_eq!(regions.len(), 3);
+        assert!(regions.windows(2).all(|w| w[0].start_va < w[1].start_va));
+    }
+
+    /// `regions_overlapping` returns a superset of the overlap and nothing more:
+    /// checked against the linear filter it replaced, as an oracle.
+    ///
+    /// A bound that is too *tight* silently drops a region — for its first
+    /// caller that means `munmap` deciding a range names no file when it does,
+    /// leaving an inode pinned for the life of the process, which is exactly the
+    /// outage §6 of the amd64 build-slowness doc records. So the test asserts
+    /// containment, not equality.
+    #[test]
+    fn overlap_window_contains_every_real_overlap() {
+        let regions: alloc::vec::Vec<MmapRegion> =
+            (0..32).map(|i| region(0x1_0000_0000 + i * 4 * PAGE, 2)).collect();
+        // Every start/end pair on a grid finer than the regions themselves.
+        // `e > s` only: an EMPTY range overlaps nothing, which the function says
+        // and the naive filter below does not — it compares `start_va < re` and
+        // `end > rs`, both true for a zero-width range inside a region. The
+        // empty case is asserted separately at the bottom.
+        for s in 0..40 {
+            for e in s + 1..40 {
+                let (rs, re) = (0x1_0000_0000 + s * PAGE, 0x1_0000_0000 + e * PAGE);
+                let want: alloc::vec::Vec<usize> = regions
+                    .iter()
+                    .filter(|r| r.start_va < re && r.start_va + r.pages * PAGE > rs)
+                    .map(|r| r.start_va)
+                    .collect();
+                let got: alloc::vec::Vec<usize> =
+                    regions_overlapping(&regions, rs, re).iter().map(|r| r.start_va).collect();
+                for va in &want {
+                    assert!(got.contains(va), "missed {va:#x} for [{rs:#x},{re:#x})");
+                }
+            }
+        }
+        assert!(regions_overlapping(&regions, 0x1_0000_0000, 0x1_0000_0000).is_empty());
+        assert!(regions_overlapping(&[], 0, 1).is_empty());
+    }
+
+    /// A range below everything, and a range above everything, both clip nothing.
+    ///
+    /// The `saturating_sub(1)` that picks the first candidate makes the
+    /// below-everything case index 0, which must still not match.
+    #[test]
+    fn split_outside_the_list_clips_nothing() {
+        let mut regions: alloc::vec::Vec<MmapRegion> =
+            (0..8).map(|i| region(0x1_0000_0000 + i * 4 * PAGE, 4)).collect();
+        assert_eq!(detach_eager_regions_in_range(&mut regions, 0x0_F000_0000, 0x0_F001_0000).len(), 0);
+        assert_eq!(detach_eager_regions_in_range(&mut regions, 0x2_0000_0000, 0x2_0001_0000).len(), 0);
+        assert_eq!(regions.len(), 8);
+    }
+
+    /// `region_index_containing` answers exactly what the linear scan it replaced
+    /// answered, for every page of a list with a hole in it.
+    ///
+    /// Checked against the predecessor as an oracle rather than against expected
+    /// values: a wrong answer here does not crash, it serves a fault from the
+    /// wrong region — the same reason `maps_skip_lookup_check` is written this
+    /// way in `amd64/src/fd.rs`.
+    #[test]
+    fn region_lookup_matches_the_scan_it_replaced() {
+        let regions = alloc::vec![
+            region(0x1_0000_0000, 2),
+            region(0x1_0000_3000, 1),   // one-page hole below this one
+            region(0x1_0000_4000, 3),
+        ];
+        for i in 0..12 {
+            let va = 0x1_0000_0000 + i * PAGE + 0x40; // mid-page, not just the base
+            let want = regions.iter().position(|r| r.contains(va));
+            assert_eq!(region_index_containing(&regions, va), want, "va #{i}");
+        }
+        // Below the first region, and past the last.
+        assert_eq!(region_index_containing(&regions, 0x0_FFFF_F000), None);
+        assert_eq!(region_index_containing(&regions, 0x1_0001_0000), None);
+        assert_eq!(region_index_containing(&[], 0x1_0000_0000), None);
     }
 
     /// Clipping the head shortens the data behind the survivor as well as

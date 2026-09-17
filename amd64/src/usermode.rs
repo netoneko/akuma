@@ -3074,6 +3074,31 @@ pub fn current_process() -> Option<&'static akuma_exec::process::Process> {
     akuma_exec::process::current_thread_own_process().map(|(_pid, p)| p)
 }
 
+/// Run `f` with the region list **and** the process's `mmap` placement cursor.
+///
+/// The sibling of [`with_current_regions`], and it exists because the cursor and
+/// the list have to be read and updated under the same hold: two cores placing
+/// at once must not both read the same cursor, find the same gap and record two
+/// regions at one address. `mm::find_free_va_from` reads it, the placement
+/// writes it, and the region insert that makes the choice real all happen inside
+/// one closure.
+///
+/// The cursor is `ProcessMemory::next_mmap` — the AArch64 kernel's own
+/// per-process mmap cursor, which this target had simply never used. Reusing it
+/// rather than adding a field is what keeps `fork` correct for free: that kernel
+/// already copies it to the child (`process::mod`'s two `next_mmap.store` lines),
+/// and a child that inherited an empty cursor would re-walk its parent's whole
+/// address space on its first `mmap`.
+pub fn with_current_regions_and_cursor<R>(
+    f: impl FnOnce(&mut Vec<MmapRegion>, &core::sync::atomic::AtomicUsize) -> R,
+) -> Option<R> {
+    let p = current_mm_process()?;
+    let _irq = akuma_primitives::irq::IrqGuard::new();
+    let cursor = &p.memory.next_mmap;
+    let mut regions = p.mmap_regions.lock();
+    Some(f(&mut regions, cursor))
+}
+
 /// Run `f` with the running process's `mmap` region list, under its lock.
 ///
 /// # The lock is held for the whole closure

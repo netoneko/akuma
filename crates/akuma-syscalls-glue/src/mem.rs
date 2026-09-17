@@ -687,7 +687,14 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // writeback), so this is the anonymous case only.
     let region = MmapRegion::owned_with_prot(mmap_addr, frames, page_prot);
     let region = if plan.shared_anon { region.shared_anon() } else { region };
-    proc.vm_with_regions(|r| r.push(region));
+    // Inserted in address order, not appended: the region list is kept sorted so
+    // `munmap`'s clip-and-split and the fault path can binary-search it rather
+    // than walk it. `akuma_mmap::insert_region_sorted` documents the invariant
+    // (reached here through `akuma_exec`, which re-exports what that crate owns).
+    // This kernel places from a bump cursor plus a free list, so the cursor case
+    // lands at the end and the `insert` shifts nothing; only a reused hole moves
+    // anything, and that is the case the ordering exists to serve.
+    proc.vm_with_regions(|r| akuma_exec::process::insert_region_sorted(r, region));
 
     mmap_addr as u64
 }
@@ -801,7 +808,10 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             Some(p) => MmapRegion::owned_with_prot(new_addr, new_frames, p),
             None => MmapRegion::owned(new_addr, new_frames),
         };
-        proc.vm_with_regions(|r| r.push(region));
+        // Sorted insert — `mremap` lands its new region wherever the placer put
+        // it, which is not necessarily above every existing one. See the note at
+        // the `mmap` site above.
+        proc.vm_with_regions(|r| akuma_exec::process::insert_region_sorted(r, region));
 
         let mut found_eager = false;
         // Remove the old region under the lock, then unmap/free its frames after

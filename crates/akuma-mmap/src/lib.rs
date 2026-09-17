@@ -71,7 +71,8 @@ mod types;
 pub use frame::PhysFrame;
 pub use region::{
     FileBacking, MmapRegion, detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child,
-    mprotect_eager_regions_in_range,
+    insert_region_sorted, mprotect_eager_regions_in_range, region_index_containing,
+    regions_overlapping,
 };
 pub mod span;
 

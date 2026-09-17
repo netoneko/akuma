@@ -259,18 +259,85 @@ fn find_free_va(regions: &mut [MmapRegion], pages: usize) -> Option<usize> {
 /// `va_placement_check` walks a thousand-region staircase — the shape that used
 /// to cost one full pass per region — and checks the scan touched each region at
 /// most once. Nothing in the kernel proper reads it.
+/// [`find_free_va`], but starting the search at `hint` and wrapping once.
+///
+/// # Why there is a cursor at all
+///
+/// First-fit from [`MMAP_BASE`] is O(regions before the first adequate gap), and
+/// for the process this placer exists to serve that is O(all of them): `rustc`
+/// grows a dense arena, so every gap low down is either absent or too small and
+/// the scan walks to the end. Measured in-guest 2026-09-17 with the per-call sort
+/// gone, that walk was **~18 us of a 26 us `mmap`**, 80 000 times per crate.
+///
+/// The cursor is the same answer the AArch64 kernel already uses, and it reuses
+/// that kernel's field — `ProcessMemory::next_mmap`, which exists, is per
+/// process, and is already carried across `fork`. It is a **hint, not a
+/// contract**: any value is safe, because a wrong one only costs a wasted first
+/// pass. Values outside the window are clamped to `MMAP_BASE`, which is what
+/// makes reusing a field initialised for the other kernel's VA layout sound.
+///
+/// # What this gives up, and why that is the right trade
+///
+/// Exact lowest-address first-fit. A hole below the cursor is not reused until
+/// the cursor wraps. That is a *weaker* guarantee than the scan's and a
+/// **stronger** property than the bump allocator this replaced: that one was
+/// global across every process and never reused anything, so a 64 MiB mapping in
+/// one program consumed address space for all of them. Here the window is per
+/// process, 112 TiB wide, and every byte comes back on the wrap — which also
+/// means a freed address is recycled later than first-fit would recycle it, so a
+/// stale pointer keeps faulting for longer rather than landing in a live mapping.
+///
+/// The wrap is what keeps it correct under pressure: if the pass from `hint`
+/// finds nothing, the second pass from `MMAP_BASE` sees everything the first
+/// skipped, and only then is it `ENOMEM`.
+fn find_free_va_from(
+    regions: &mut [MmapRegion],
+    pages: usize,
+    hint: usize,
+) -> (Option<usize>, usize) {
+    let hint = if (MMAP_BASE..MMAP_TOP).contains(&hint) { hint } else { MMAP_BASE };
+    let (found, examined) = find_free_va_scan_from(regions, pages, hint);
+    if found.is_some() || hint == MMAP_BASE {
+        return (found, examined);
+    }
+    // Wrap: everything the first pass skipped is below `hint`.
+    let (found, more) = find_free_va_scan_from(regions, pages, MMAP_BASE);
+    (found, examined + more)
+}
+
 fn find_free_va_scan(regions: &mut [MmapRegion], pages: usize) -> (Option<usize>, usize) {
+    find_free_va_scan_from(regions, pages, MMAP_BASE)
+}
+
+fn find_free_va_scan_from(
+    regions: &mut [MmapRegion],
+    pages: usize,
+    start: usize,
+) -> (Option<usize>, usize) {
     let Some(len) = pages.checked_mul(PAGE_SIZE as usize) else {
         return (None, 0);
     };
-    // Sorted on arrival is the steady state; checking costs one linear pass with
-    // no moves, against a sort that moved 4 400 elements per call.
-    if !regions.windows(2).all(|w| w[0].start_va <= w[1].start_va) {
+    // Sorted on arrival is the steady state, maintained by every writer through
+    // `akuma_mmap::insert_region_sorted`. This was a full `windows(2)` pass —
+    // correct, and itself O(regions) on the path the sort was removed from, which
+    // is most of what was left of `mmap` once the cursor below skipped the scan:
+    // measured at ~1.65 ns/region, 7.3 us of a 4 400-region call.
+    //
+    // Now the same O(1) guard `detach_eager_regions_in_range` uses, and the same
+    // caveat applies — it catches a writer that appended, which is how this
+    // invariant actually gets broken, and not two appends that land in order.
+    let n = regions.len();
+    if n >= 2 && regions[n - 2].start_va > regions[n - 1].start_va {
         regions.sort_unstable_by_key(|r| r.start_va);
     }
-    let mut cand = MMAP_BASE;
+    let mut cand = start;
     let mut examined = 0usize;
-    for r in regions.iter() {
+    // Sorted, so the regions that end at or below `start` can bound no gap at or
+    // after it: binary-search past them instead of walking them. This is the
+    // cursor's actual payoff — without it, starting the scan later would still
+    // cost a pass over everything before it.
+    let first = regions.partition_point(|r| r.start_va + r.len_bytes() <= start);
+    for r in &regions[first..] {
         let Some(end) = cand.checked_add(len) else {
             return (None, examined);
         };
@@ -301,27 +368,12 @@ fn find_free_va_scan(regions: &mut [MmapRegion], pages: usize) -> (Option<usize>
 
 /// Put `region` into `regions` at its place in address order.
 ///
-/// **Inserted, not appended.** [`find_free_va`] is a first-fit scan and needs the
-/// list sorted; it used to buy that with a full `sort_unstable_by_key` per
-/// `mmap`, and this is half of paying for it once here instead — the other half
-/// is `akuma_mmap::detach_eager_regions_in_range`, which puts `munmap`'s
-/// survivors back where the region was rather than on the end. With both, the
-/// list is sorted on arrival and the placer's sort never runs.
-///
-/// `partition_point` is a binary search, and the `insert` it feeds is a
-/// `memmove` of whatever sits above the new region — **zero elements in the
-/// common case**, because first-fit returns a low gap only when one was freed
-/// and otherwise places at the top of the arena, which is the end of the list.
-/// That is what makes this cheaper than the sort it replaces rather than the
-/// same cost moved: the sort touched all 4 400 regions on every call.
-///
-/// `<` and not `<=`: regions never overlap, so no two share a `start_va` and the
-/// two spellings can only differ on a list that is already broken — but `<` is
-/// the one that keeps equal keys in insertion order, which is what a reader
-/// checking this against `sort_unstable_by_key`'s (unstable) result should see.
+/// Thin forward to `akuma_mmap::insert_region_sorted`, which owns the region-list
+/// sorted invariant and documents it; kept as a named function here because the
+/// boot-suite `va_placement_check` asserts against it and because [`find_free_va`]
+/// three functions up is the reason this target needs the invariant at all.
 fn insert_region_sorted(regions: &mut Vec<MmapRegion>, region: MmapRegion) {
-    let at = regions.partition_point(|r| r.start_va < region.start_va);
-    regions.insert(at, region);
+    akuma_mmap::insert_region_sorted(regions, region);
 }
 
 /// Is the caller a slotted user task with an address space of its own?
@@ -452,8 +504,22 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         want
     } else {
         // Without `MAP_FIXED` an address is a hint, and hints are advisory.
-        let Some(found) = usermode::with_current_regions(|regions| find_free_va(regions, pages))
-            .flatten()
+        //
+        // Cursor and list under one hold: see `with_current_regions_and_cursor`.
+        // The cursor is advanced past the placement so the next `mmap` starts
+        // where this one ended instead of re-walking the arena from `MMAP_BASE`.
+        let Some(found) = usermode::with_current_regions_and_cursor(|regions, cursor| {
+            let hint = cursor.load(core::sync::atomic::Ordering::Relaxed);
+            let placed = find_free_va_from(regions, pages, hint).0;
+            if let Some(base) = placed {
+                cursor.store(
+                    base.saturating_add(byte_len),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            placed
+        })
+        .flatten()
         else {
             return errno::ENOMEM;
         };
@@ -846,7 +912,14 @@ pub fn fault_in(addr: u64) -> bool {
     // opens is closed by the BKL: `idt.rs` takes it for the whole servicing
     // window, and a peer's `munmap` is a syscall, which cannot run without it.
     let Some((prot, file)) = usermode::with_current_regions(|regions| {
-        let region = regions.iter().find(|r| r.contains(page))?;
+        // Binary search, not a scan: this runs once per **page fault**, and a
+        // `rustc` mid-build holds ~4 400 regions and takes ~86 000 faults
+        // compiling one small crate. It is also the one hot walk `[PSTATS]`
+        // cannot see, because faults are counted there but never timed.
+        // Relies on the sorted invariant `akuma_mmap::insert_region_sorted`
+        // documents and every mutator in that crate preserves.
+        let idx = akuma_mmap::region_index_containing(regions, page)?;
+        let region = &regions[idx];
         let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
         if prot.is_none() {
             return None; // a reservation, or a guard page: a real fault
@@ -1281,7 +1354,11 @@ fn unmap_range(start: usize, end: usize) {
         // the reconciliation below costs a scan of the region list per live pin,
         // so it is worth one overlap pass to skip it. A region that has no
         // `file` never contributed a pin.
-        let unmaps_a_file = regions.iter().any(|r| {
+        // Bounded by the sorted invariant: only the regions that can overlap are
+        // examined, not the whole list. This was a full scan per `munmap`, which
+        // is the second of the two O(regions) walks that made `munmap` cost 42 us
+        // against a 4 400-region list (the other was the clip itself).
+        let unmaps_a_file = akuma_mmap::regions_overlapping(regions, start, end).iter().any(|r| {
             r.file.is_some() && r.start_va < end && r.start_va.saturating_add(r.len_bytes()) > start
         });
         let _pieces: Vec<_> = akuma_mmap::detach_eager_regions_in_range(regions, start, end);
@@ -1495,7 +1572,13 @@ pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u6
             .iter()
             .find(|r| r.start_va == old_addr)
             .and_then(MmapRegion::recorded_prot);
-        regions.push(match old_prot {
+        // Sorted insert, like every other writer — `mremap`'s new base comes from
+        // `find_free_va` and is not necessarily above every existing region, so
+        // appending here is exactly what breaks the invariant the fault path and
+        // `munmap` now binary-search against. Missing this one site was enough to
+        // wedge an in-guest `rustc`: the searches silently answer for the wrong
+        // region on an unsorted list.
+        insert_region_sorted(regions, match old_prot {
             Some(prot) => MmapRegion::inherited_with_prot(base, new_pages, prot),
             None => MmapRegion::inherited(base, new_pages),
         });
@@ -2104,6 +2187,45 @@ fn va_placement_check(t: &mut Suite) {
         sorted_check.len() as u64,
         5,
     );
+    // The cursor. `find_free_va_from` starts at the hint and wraps once, so the
+    // three cases that matter are: it honours the hint, it does NOT hand back a
+    // hole below the hint while space remains above, and it finds that hole
+    // anyway once there is nowhere else to go. The third is what makes the
+    // relaxation safe rather than a slow leak of address space.
+    let mut cursor_case = [region(MMAP_BASE, 1), region(MMAP_BASE + 2 * PG, 1)];
+    t.check_eq(
+        "mmap va: a hint past a hole places above it, not in it",
+        find_free_va_from(&mut cursor_case, 1, MMAP_BASE + 3 * PG).0.unwrap_or(0) as u64,
+        (MMAP_BASE + 3 * PG) as u64,
+    );
+    t.check_eq(
+        "mmap va: a hint below the hole still takes the hole",
+        find_free_va_from(&mut cursor_case, 1, MMAP_BASE).0.unwrap_or(0) as u64,
+        (MMAP_BASE + PG) as u64,
+    );
+    // A hint outside the window is a hint, not a fault: clamped to the base.
+    t.check_eq(
+        "mmap va: an out-of-window hint is clamped to the base",
+        find_free_va_from(&mut cursor_case, 1, 0).0.unwrap_or(0) as u64,
+        (MMAP_BASE + PG) as u64,
+    );
+    // The wrap. One region covering everything from the hint to the top leaves
+    // no gap above it, so the second pass has to look below the hint and find
+    // the one-page hole there — without the wrap this is a spurious `ENOMEM`.
+    let top_pages = (MMAP_TOP - (MMAP_BASE + 2 * PG)) / PG;
+    let mut wrap_case = [region(MMAP_BASE, 1), region(MMAP_BASE + 2 * PG, top_pages)];
+    t.check_eq(
+        "mmap va: a hint with no room above it wraps and finds the hole below",
+        find_free_va_from(&mut wrap_case, 1, MMAP_BASE + 4 * PG).0.unwrap_or(0) as u64,
+        (MMAP_BASE + PG) as u64,
+    );
+    // And when there genuinely is nothing, the wrap does not invent an address.
+    let mut full_case = [region(MMAP_BASE, (MMAP_TOP - MMAP_BASE) / PG)];
+    t.check(
+        "mmap va: a full address space is ENOMEM after the wrap, not a bad address",
+        find_free_va_from(&mut full_case, 1, MMAP_BASE + 4 * PG).0.is_none(),
+    );
+
     t.check(
         "mmap va: the scan is one pass, not one pass per region",
         examined <= N,

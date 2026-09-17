@@ -886,7 +886,11 @@ pub fn alloc_mmap(size: usize) -> usize {
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     if let Some(proc) = lookup_process_shared(pid) {
-        proc.vm_with_regions(|r| r.push(MmapRegion::owned(start_va, frames)));
+        // Sorted insert: the region list is kept in address order so `munmap`'s
+        // clip-and-split and the fault path can binary-search it. See
+        // `akuma_mmap::insert_region_sorted`, which documents the invariant and
+        // names every writer that has to hold it.
+        proc.vm_with_regions(|r| insert_region_sorted(r, MmapRegion::owned(start_va, frames)));
     }
 }
 
@@ -1344,7 +1348,10 @@ pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Pr
 /// (`eager_region_flags_for_page_fault`, `update_eager_region_flags`,
 /// `munmap_lazy_regions_in_range`, …) stay here: each resolves a process and takes
 /// `vm_lock` before it can touch a region list.
-pub use akuma_mmap::{detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child};
+pub use akuma_mmap::{
+    detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child, insert_region_sorted,
+    region_index_containing,
+};
 
 /// Protection recorded for the **eager** mmap region covering `va`, if any.
 ///

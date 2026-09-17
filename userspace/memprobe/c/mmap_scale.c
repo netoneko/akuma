@@ -20,8 +20,17 @@
  * Akuma/amd64, Akuma/aarch64 and on real Linux as the reference arm — the rule
  * §7 of that doc paid for ("measure with one binary or do not measure").
  *
- * Every number reported is a MINIMUM over `repeat` passes: contention only ever
- * adds, so the minimum is the closest thing to the cost of the work itself.
+ * Every number reported is a MINIMUM: contention only ever adds, so the minimum
+ * is the closest thing to the cost of the work itself.
+ *
+ * The minimum is taken over GROUPS of `GROUP` calls, not over whole buckets, and
+ * that is not a detail. Timing a 250-call bucket as one bracket and taking the
+ * best of `repeat` passes assumes a pass exists in which the whole bucket ran
+ * undisturbed — false under QEMU TCG, where the first version of this probe
+ * reported buckets alternating between 1.5 us and 25 us with no relation to the
+ * region count at all, and a `growth=16.9x` that was purely which bucket got
+ * unlucky last. Ten calls per bracket is short enough that most brackets escape
+ * preemption and long enough to amortise the two clock reads.
  *
  * usage: mmap_scale [regions] [repeat]
  */
@@ -35,6 +44,8 @@
 #define PAGE 4096
 #define MAX_REGIONS 8192
 #define BUCKET 250
+/* Calls per timing bracket — see the note on minima in the header. */
+#define GROUP 10
 
 static long long now_ns(void)
 {
@@ -68,31 +79,33 @@ int main(int argc, char **argv)
 		/* Grow: one single-page anonymous mapping at a time. The shape
 		 * musl's mallocng produces, and the shape `rustc` accumulates. */
 		for (b = 0; b < nb; b++) {
-			long long t0 = now_ns(), t1;
-			for (i = 0; i < BUCKET; i++) {
-				int idx = b * BUCKET + i;
-				slots[idx] = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
-						  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-				if (slots[idx] == MAP_FAILED) { slots[idx] = NULL; failed++; }
-			}
-			t1 = now_ns();
-			{
-				long long per = (t1 - t0) / BUCKET;
+			for (i = 0; i < BUCKET; i += GROUP) {
+				long long t0 = now_ns(), t1, per;
+				int j;
+				for (j = 0; j < GROUP; j++) {
+					int idx = b * BUCKET + i + j;
+					slots[idx] = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+							  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+					if (slots[idx] == MAP_FAILED) { slots[idx] = NULL; failed++; }
+				}
+				t1 = now_ns();
+				per = (t1 - t0) / GROUP;
 				if (mmap_min[b] < 0 || per < mmap_min[b]) mmap_min[b] = per;
 			}
 		}
 		/* Shrink, highest bucket first, so each `munmap` is measured
 		 * against a region list still holding everything below it. */
 		for (b = nb - 1; b >= 0; b--) {
-			long long t0 = now_ns(), t1;
-			for (i = 0; i < BUCKET; i++) {
-				int idx = b * BUCKET + i;
-				if (slots[idx]) munmap(slots[idx], PAGE);
-				slots[idx] = NULL;
-			}
-			t1 = now_ns();
-			{
-				long long per = (t1 - t0) / BUCKET;
+			for (i = 0; i < BUCKET; i += GROUP) {
+				long long t0 = now_ns(), t1, per;
+				int j;
+				for (j = 0; j < GROUP; j++) {
+					int idx = b * BUCKET + i + j;
+					if (slots[idx]) munmap(slots[idx], PAGE);
+					slots[idx] = NULL;
+				}
+				t1 = now_ns();
+				per = (t1 - t0) / GROUP;
 				if (munmap_min[b] < 0 || per < munmap_min[b]) munmap_min[b] = per;
 			}
 		}
