@@ -91,8 +91,6 @@ static void check_pattern(const unsigned char *p, size_t n, uint64_t seed,
     }
 }
 
-static int file_fd = -1;
-static unsigned char *file_map;
 
 static void setup_file(void) {
     int fd = open(FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -111,17 +109,22 @@ static void *exec_churner(void *arg) {
     (void)arg;
     long n = 0;
     time_t t0 = time(NULL);
-    while (time(NULL) - t0 < RUN_SECS && !g_fail) {
+    /* Iteration cap, not just the clock: under full TCG saturation the guest
+     * clock lags host time enough that a clock-only bound drags on. */
+    while (n < 4000 && time(NULL) - t0 < RUN_SECS && !g_fail) {
         pid_t pid = fork();
         if (pid < 0) { fail("exec-fork", 0, 0, errno); return NULL; }
         if (pid == 0) {
-            char *argv[] = {"/bin/hello", NULL};
+            char *argv[] = {"hello", NULL};
             execv("/bin/hello", argv);
             _exit(127);
         }
         int st = 0;
         waitpid(pid, &st, 0);
-        if (st != 0) { fail("exec-status", n, 0, st); return NULL; }
+        /* /bin/hello is the tree's self-check ELF: 0x7F means every probe
+         * bit passed (its own argv/env/auxv/regpreservation checks), not a
+         * plain exit-0 binary. */
+        if (st != 0x7f << 8) { fail("exec-status", n, 0x7f << 8, st); return NULL; }
         n++;
     }
     printf("exec-churner pid=%d execs=%ld\n", (int)getpid(), n);
@@ -349,9 +352,10 @@ int main(void) {
                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (ta[t].ballast == MAP_FAILED) { fail("mmap-ballast", 0, 0, errno); _exit(1); }
             }
-            /* one dedicated file checker per worker */
-            pthread_t fc;
+            /* one dedicated file checker + one exec churner per worker */
+            pthread_t fc, ec;
             pthread_create(&fc, NULL, file_checker, NULL);
+            pthread_create(&ec, NULL, exec_churner, NULL);
             for (int a0 = 0; a0 < NT; a0++)
                 for (int a1 = 0; a1 < NT; a1++)
                     ta[a0].peers[a1] = &ta[a1];
@@ -362,6 +366,7 @@ int main(void) {
                 pthread_join(th[t], &ret);
             g_stop = 1;
             pthread_join(fc, &ret);
+            pthread_join(ec, &ret);
             printf("worker pid=%d done fail=%d\n", (int)getpid(), g_fail);
             fflush(stdout);
             _exit(g_fail ? 42 : 0);
