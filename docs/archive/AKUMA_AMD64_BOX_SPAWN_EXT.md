@@ -1,11 +1,15 @@
-# amd64: wiring the box/container syscalls, and three real bugs in a spawn path nothing had ever exercised
+# amd64: wiring the box/container syscalls, and five real bugs in code paths nothing had ever exercised
 
 **Date:** 2026-09-17
-**Status:** in progress, **uncommitted** (on top of the user's own "amd64 containers"
-checkpoint commit, `cbbe1a6a`) — the user drives commits on this repo. First-boot
-`register_box`/`spawn_ext`/`waitpid` verified working end to end with a real
-process on local QEMU. A second, distinct crash on a *second* invocation in the
-same boot is open and not yet investigated — see "What's left".
+**Status:** in progress, **uncommitted** (on top of the user's own checkpoint
+commits, `cbbe1a6a`/`74f95a22`) — the user drives commits on this repo.
+Kernel-side: first-boot `register_box`/`spawn_ext`/`waitpid` verified working
+end to end with a real process on local QEMU (a second, distinct crash on a
+*second* invocation in the same boot is open — see "What's left"). Userspace:
+the real `box` CLI now builds for amd64, and a real `box pull
+curlimages/curl` + `box run` gets all the way through registry fetch, TLS,
+layer extraction, `register_box` and the overlay `mount_in_ns` on real
+hardware — see "Exercising it for real" below for where it stops and why.
 **Trigger:** continuing the same day's `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`
 work, the user asked what actually blocks amd64 from having real "boxes"
 (containers) the way AArch64 does, and then to wire it.
@@ -269,6 +273,7 @@ agent was using the Firecracker/bare-metal box in parallel) — `amd64/run.sh`,
 | **Attempt 4** (bugs 1+2+3b only, no 3a): same probe | identical silent crash to attempt 3 — this is the basis for not claiming 3b alone was sufficient |
 | **Attempt 5** (bugs 1+2+3a+3b, i.e. everything above): same probe, **first boot, first call** | `register_box(900, root=/box-jail)` → `Ok`; `spawn_ext` into box 900 → real pid (60) + real `stdout_fd`; `waitpid` → real exit status (not a hang, not a crash) |
 | **Attempt 6**: same probe run a **second time** in the **same boot**, without a reboot | silent full QEMU exit again — a **distinct, unrelated crash**, not yet investigated (see "What's left") |
+| **Real KVM**: boot suite only, on the trashcan box's Firecracker personality (`FC_HOST=root@192.168.1.123`, `FC_DIR=akuma-claude-verify` — a directory of its own, chosen so this run cannot collide with the unrelated `firecracker --config-file /root/akuma-fc.json` process another agent had running on the same box at the time; ssh-config port trap and workaround as described in `AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`) | **723 passed, 0 failed** — the same QEMU-vs-Firecracker delta as that earlier doc (no `FC_NET`, so net-dependent checks don't run), no regression from real hardware. **Does not exercise `spawn_ext`/`register_box`**, since neither is in `dispatch_smoke_test` yet (see "What's left") — this confirms everything *else* this session touched (the six dispatch arms compiling and not disturbing anything) is fine on real silicon, not that boxes work there. |
 
 The attempt-5 child process itself exited 1 — its own isolation self-checks
 (`open("/inside.txt")`, `open("/outside.txt")` expecting `ENOENT`,
@@ -380,6 +385,198 @@ Run from the scratch directory, not `userspace/` — this family has no
 existing probe tree the way `userspace/epollprobe/` does, matching the same
 call made in `AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
 
+## Exercising it for real: the actual `box` CLI, not a syscall probe
+
+The user asked, reasonably, for more than a hand-rolled probe: run real `box`
+commands, pull a real image, run something in it. This surfaced two more real
+bugs — neither in the kernel this time — and got further than expected before
+hitting a third, pre-existing, already-documented wall.
+
+### `box`/`herd` already build for amd64 — they were just never staged
+
+`userspace/build.sh` is aarch64-only (hardcodes `target/aarch64-unknown-none`
+throughout), but `amd64/mkdisk.sh` has carried its own **separate**,
+best-effort loop since before this session — `for prog in paws httpd herd
+hget wall; do cargo build -p "$prog" --target x86_64-unknown-none --release
+...; done` — because `libakuma` itself was already ported to `x86_64-unknown-none`
+for those five programs. `box` was never in that list. Tried directly:
+
+```
+cd userspace && cargo build -p box --target x86_64-unknown-none --release
+```
+
+**Builds clean**, no source changes needed — every one of `box`'s dependencies
+(`libakuma`, `libakuma-tls`, `akuma-tar`, `picojson`) was already portable,
+`libakuma-tls` in particular already proven by `hget` (in-process TLS; see
+`amd64-bare-metal-loop.md`'s note that busybox `wget https://` is broken here
+but `hget` is not). Added `box` to `mkdisk.sh`'s loop and its `bin/box`
+debugfs-write, same shape as the other five.
+
+### Bug 4: `box`'s own syscall numbers were AArch64's, unconditionally
+
+First real command tried, `box pull curlimages/curl`, **worked** — real
+registry, real auth token, real TLS, real layer download and extraction, on
+this session's QEMU rig with plain internet access through its default slirp
+NAT. `box run --rm --entrypoint curl curlimages-curl --version` then failed:
+
+```
+box run: overlay mount failed: errno 22
+```
+
+Diagnosed by temporarily making every `SYSCALL_DEBUG_INFO_ENABLED`-gated print
+in `container.rs` unconditional (that feature needs `akuma-syscalls`'s
+`debug-info` forwarded too, and neither is wired into `amd64/Cargo.toml`, so
+this was faster than plumbing a new feature through for one debug session)
+and rebuilding. The kernel printed:
+
+```
+[mount] DEBUG replace_box_root box=15767881396069755807 err=NotFound
+```
+
+`NotFound` here means the box's namespace was **never created** —
+`register_box` never actually ran, even though `box`'s own output showed no
+error from it. The reason: `userspace/box/src/sys.rs` defines its own raw
+syscall number constants —
+
+```rust
+pub const SYSCALL_SPAWN_EXT: u64 = 315;
+pub const SYSCALL_REGISTER_BOX: u64 = 316;
+pub const SYSCALL_KILL_BOX: u64 = 317;
+pub const SYSCALL_SET_BOX_STACK: u64 = 324;
+```
+
+— which are the **AArch64** numbers, sent bare. `libakuma` itself already has
+a complete, correct, per-architecture table for exactly these
+(`libakuma::syscall::{SPAWN_EXT, REGISTER_BOX, KILL_BOX, ...}`, `#[cfg]`-selected
+between an `aarch64_nr` module using bare numbers and an `x86_64_nr` module
+adding `AKUMA_PRIVATE_BASE` (`0x1000`) — the same offset this session's earlier
+mount/umount2 and spawn_ext work already relies on). `box`'s own module doc
+even states the intent this violated: *"This is the only place in userspace
+that should restate [the syscall numbers]... previously box and herd each
+wrote their own copy, and nothing checked that they still agreed."* — true of
+`box` vs `herd`, but `box` itself had drifted from `libakuma`, the one place
+it should have deferred to instead of restating.
+
+**Consequence, and why it was invisible:** every one of `box`'s four
+register_box/kill_box/spawn_ext/set_box_stack call sites in
+`userspace/box/src/sys.rs` discards the syscall's return value entirely (`libakuma::syscall(...)`,
+result unused). Sent as bare `316` on amd64, the kernel's `AKUMA_PRIVATE_BASE`
+check (`nr >= 0x1000`) never even recognizes it as a private call — it falls
+through to the ordinary Linux syscall decode, matches nothing, and hits the
+generic unknown-number fallback:
+
+```
+[syscall] no row for x86_64 nr=316 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+```
+
+silently, with nothing downstream ever checking. `spawn_ext` happened to work
+anyway in this session's earlier probe because that probe called the raw
+syscall number directly and correctly (`AKUMA_PRIVATE_BASE + 315`); `box`
+itself never did.
+
+**Fix, in two parts:**
+1. `userspace/libakuma/src/lib.rs`: added `SET_BOX_STACK` to both the
+   `aarch64_nr` and `x86_64_nr` tables (`324` and `AKUMA_PRIVATE_BASE + 324`
+   respectively) — libakuma already had `SPAWN_EXT`/`REGISTER_BOX`/`KILL_BOX`
+   correctly, `SET_BOX_STACK` was the one number nobody had put there yet.
+2. `userspace/box/src/sys.rs`: replaced the four local `pub const SYSCALL_*`
+   definitions with `use libakuma::syscall::{KILL_BOX as SYSCALL_KILL_BOX,
+   REGISTER_BOX as SYSCALL_REGISTER_BOX, SET_BOX_STACK as
+   SYSCALL_SET_BOX_STACK, SPAWN_EXT as SYSCALL_SPAWN_EXT};` — aliased rather
+   than renamed at every call site, to keep the diff to the declarations only.
+
+Verified: `cargo build -p box --target x86_64-unknown-none --release` and
+`--release` (aarch64) both clean; `cargo test -p box --lib
+--no-default-features` 95/95 pass including `sys::tests::matches_the_kernels_abi`
+(the `SpawnOptions` layout pin, untouched by this fix); `herd` (which also
+consumes `boxlib::sys`) builds clean on both targets.
+
+The temporary unconditional debug prints in `container.rs` were reverted to
+their proper `SYSCALL_DEBUG_INFO_ENABLED` gate, except the one that actually
+found this bug — kept permanently, still gated, because "which `FsError`
+variant" is exactly the information the next person needs and the file had
+been silently folding it into a bare `EINVAL`.
+
+### Bug 5: the OCI platform selector never considered a second architecture
+
+With bug 4 fixed, `box pull curlimages/curl` + `box run` got substantially
+further: `register_box` succeeded, the overlay `mount_in_ns` succeeded, and
+`box` printed `box: running '/usr/bin/curl' in curlimages-curl-... (1 layers,
+ID=...)` — then:
+
+```
+box run: failed to spawn /usr/bin/curl
+```
+
+Checked the actual downloaded binary's ELF header
+(`od -An -tx1 -N20 .../usr/bin/curl`) before assuming anything: `e_machine`
+read `3e 00` — `EM_X86_64`, the *right* architecture. So this was not the
+same class of bug — until re-running from scratch (fresh pull, fresh
+container) showed a **different** config digest each time
+(`e01ac4ff...` then `370bbf80...`), which does not happen for a real
+content-addressed digest unless the two pulls fetched genuinely different
+platform manifests. Checked `userspace/box/src/manifest.rs` directly:
+
+```rust
+const ARCH: [&str; 2] = ["arm64", "aarch64"];
+```
+
+Hardcoded, unconditionally, for `select_platform_digest`'s manifest-list
+lookup. **Every `box pull` on amd64 had been silently fetching the ARM64
+layer of every image** — the first `curl` binary this session ever actually
+tried to run (before bug 4 was found) was genuinely an AArch64 ELF, and the
+kernel correctly refused to exec it; that failure read as "something is wrong
+with spawn_ext" right up until the ELF header was actually checked.
+
+**Fix:** `#[cfg(target_arch = "aarch64")]`/`#[cfg(target_arch = "x86_64")]`
+split, `["amd64", "x86_64"]` for the latter — real registries use `amd64`
+(Docker Hub's own convention), not `x86_64`, for this platform string. Also
+updated the function's doc comment and error message, which both named
+`arm64` specifically. Verified: builds clean both targets, 95/95 host tests
+unaffected (the host test target on this dev machine is `aarch64-apple-darwin`,
+so the existing `arm64`-expecting test fixtures still exercise the
+`aarch64_nr`-shaped branch unchanged).
+
+Re-verified end to end after both fixes: `box pull curlimages/curl` fetches a
+**different**, correct config digest; the downloaded `/usr/bin/curl` reads
+`e_machine = EM_X86_64` and `e_type = ET_DYN` (a PIE or dynamically-linked
+binary); `register_box` and the overlay mount both succeed exactly as before.
+
+### The wall: a pre-existing, already-documented gap, not a new bug
+
+`box run --rm --entrypoint curl curlimages-curl --version` (and, separately, `box
+pull busybox && box run --rm busybox /bin/busybox echo hello`) both now reach
+actual ELF execution and then hit:
+
+```
+[PANIC] amd64/src/exec_runtime.rs:421
+        amd64: ExecRuntime::resolve_file_id was called but is not wired yet
+        (no mount table to give an id from). A syscall folded into
+        akuma-syscalls-glue has reached a subsystem this target still serves
+        from amd64/src. See amd64/src/exec_runtime.rs.
+```
+
+This is **not new** — it is one of the three `not_wired!` stubs the
+epoll/eventfd session's own header count already tracked (`resolve_file_id`,
+`read_at_by_inode`, `rump_socket_clone_ref` — see
+`AKUMA_AMD64_EPOLL_EVENTFD_FOLD.md`'s exec_runtime.rs section), hit for the
+first time by real traffic because nothing had ever exercised a code path
+that needs a file identity (mount id + inode) for a demand-paged/shared ELF
+image on this target before. Both `curl` (a PIE/dynamic binary) and `busybox`
+(pulled via a completely different path — a fresh multi-layer image) hit the
+identical panic, which is why this reads as a real, general amd64 gap in
+file-identity-keyed exec/paging rather than something specific to one image.
+**Per the user's own instruction this session** ("if box grab command does
+not work mark it in the report and move on to testing other stuff"), the same
+treatment applies here: noted, not chased further this session — it is a
+pre-existing, already-scoped gap (giving amd64 a real mount-table-backed file
+identity), not a regression from anything touched today, and `box grab`
+itself was never reached to test.
+
+QEMU was killed cleanly (`kill` on its own pid) after this panic, per the
+`-no-reboot` convention — the guest halts rather than resetting, so nothing
+further could be tried in that boot anyway.
+
 ## What's left
 
 - **Attempt 6's crash is a separate, open bug.** Same probe, same boot, run
@@ -409,20 +606,34 @@ call made in `AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
   must be `Some` for the channel-registration step to succeed, the same
   `io_setup` caveat from `AKUMA_AMD64_EPOLL_EVENTFD_FOLD.md`), so it cannot
   run from the boot task the way `mount`'s could.
-- **Firecracker/bare-metal verification** — deliberately not attempted this
-  session; another agent was using that box for unrelated work, and the user
-  asked explicitly to stay on local QEMU. Once attempt 6 and the isolation
-  check are closed out, this is the natural next verification step, following
-  `AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`'s already-proven recipe for reaching
-  that box's Ubuntu/Firecracker personality.
-- **`box run` / `herd` end to end on amd64** — the user's actual target
-  ("verify that boxes via box/herd work the same way as on aarch64"). Not
-  attempted yet: `box`/`herd` are real userspace binaries with real OCI image
-  handling, overlay mounts and process supervision on top of everything
-  above; this session's probe exercises only the two kernel primitives
-  (`register_box`, `spawn_ext`) directly. Cross-building and running the real
-  `box`/`herd` binaries against this kernel is the next real milestone once
-  the two open items above are closed.
+- **`ExecRuntime::resolve_file_id` is the real next kernel-side blocker for
+  `box run`.** Not a box-specific bug — it is amd64's own long-standing gap
+  (giving this target a real mount-table-backed file identity, so a
+  demand-paged/shared ELF image can be keyed by `(mount, inode)` the way
+  `akuma-fpcache` and the shared-page machinery expect). Both `curl` (a
+  dynamic/PIE binary) and `busybox` (a completely different image) hit the
+  identical panic, which is why this reads as general rather than
+  image-specific. `amd64/src/exec_runtime.rs` names the other two stubs still
+  in the same state (`read_at_by_inode`, `rump_socket_clone_ref`).
+- **Firecracker/bare-metal verification of the *real `box` CLI*.** The boot
+  suite (which doesn't exercise `spawn_ext`/`register_box`/`box` at all) was
+  already confirmed clean on the trashcan box's Firecracker/KVM personality
+  earlier this session, isolated to its own `FC_DIR` so it didn't collide
+  with another agent's concurrent, unrelated use of that box. The `box
+  pull`/`box run` sequence above, and whatever resolving `resolve_file_id`
+  eventually unblocks, has only been run on local QEMU per the user's
+  explicit instruction this session ("keep working with local qemu") — that
+  instruction covered this specific work, so bare-metal/Firecracker
+  verification of `box` itself is still open.
+- **Attempt 6's crash and the isolation self-check** (both bulleted just
+  above) are about the raw `spawn_ext`/`register_box` **syscalls** directly,
+  from the C probe — orthogonal to bugs 4/5, which were entirely in `box`'s
+  own userspace code and are now fixed. Both remain exactly as open as
+  before this update.
+- **`herd` on amd64** — builds clean (verified this session) but not run.
+  `box`'s own bugs 4/5 likely apply equally to anything in `herd` that
+  restates a private syscall number rather than using `libakuma::syscall::*`;
+  worth an audit once `resolve_file_id` stops blocking real execs.
 - **`set_box_stack(box_id, 1)`'s silent no-op** on this target (see above) —
   a real divergence, not urgent, not fixed.
 

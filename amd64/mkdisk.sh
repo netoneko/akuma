@@ -80,7 +80,15 @@ SSHD=""
 HERD=""
 HGET=""
 WALL=""
-for prog in paws httpd herd hget wall; do
+BOX=""
+# `box` — the OCI/container CLI (`register_box`/`spawn_ext` from userspace),
+# added once `sc-containers` and the `spawn_ext`/box syscall arms existed on
+# this target (`docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`). It builds for
+# `x86_64-unknown-none` with no changes of its own — every one of its
+# dependencies (`libakuma`, `libakuma-tls`, `akuma-tar`, `picojson`) was
+# already ported by the five programs above it, `hget` in particular already
+# proving the in-process TLS `box pull` needs.
+for prog in paws httpd herd hget wall box; do
     if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
         found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
         [ "$prog" = paws ] && PAWS="$found"
@@ -88,6 +96,7 @@ for prog in paws httpd herd hget wall; do
         [ "$prog" = herd ] && HERD="$found"
         [ "$prog" = hget ] && HGET="$found"
         [ "$prog" = wall ] && WALL="$found"
+        [ "$prog" = box ] && BOX="$found"
     fi
 done
 
@@ -203,6 +212,7 @@ done
 # exists instead of a staged `curl` — busybox `wget https://` needs a
 # `socketpair` and an `ssl_client` binary, neither of which this target has.
 [ -n "$HGET" ] && "$DEBUGFS" -w -R "write $HGET bin/hget" "$IMG" >/dev/null 2>&1
+[ -n "$BOX" ] && "$DEBUGFS" -w -R "write $BOX bin/box" "$IMG" >/dev/null 2>&1
 # `wall`: a line straight to the framebuffer/serial console via the Akuma-private
 # `console_notify` syscall (kernel feature `console-notify`, default-on for this
 # target). The HP box has a screen and no keyboard, so this is how an ssh
@@ -610,4 +620,4 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # rather than inventing a different convention.
 "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
 
-echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"
+echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -n "$BOX" ] && echo ", /bin/box")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"

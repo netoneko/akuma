@@ -383,7 +383,19 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         return match akuma_vfs_glue::replace_box_root(box_id, fs) {
             Ok(()) => Ok(0),
             Err(akuma_vfs_glue::FsError::PermissionDenied) => Err(EPERM),
-            Err(_) => Err(EINVAL),
+            Err(e) => {
+                // Worth naming rather than folding silently into `EINVAL`:
+                // `FsError::NotFound` here means `register_box` never actually
+                // ran for this `box_id` (its namespace was never created), a
+                // real amd64 incident this print caught
+                // (`docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`) — the caller
+                // had sent `register_box`'s *AArch64* syscall number
+                // unmodified and gotten a silent `ENOSYS` nothing checked.
+                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+                    akuma_primitives::safe_print!(128, "[mount] replace_box_root box={} err={:?}\n", box_id, e);
+                }
+                Err(EINVAL)
+            }
         };
     }
 

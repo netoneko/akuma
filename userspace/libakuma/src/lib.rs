@@ -207,6 +207,8 @@ pub mod syscall {
         pub const FCHMODAT: u64 = 53;
         pub const CLONE: u64 = 220;
         pub const WAIT4: u64 = 260;
+        /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
+        pub const SET_BOX_STACK: u64 = 324;
     }
 
     /// The x86_64 numbering.
@@ -282,6 +284,8 @@ pub mod syscall {
         pub const FCHMODAT: u64 = 268;
         pub const CLONE: u64 = 56;
         pub const WAIT4: u64 = 61;
+        /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
+        pub const SET_BOX_STACK: u64 = AKUMA_PRIVATE_BASE + 324;
     }
 }
 

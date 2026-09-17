@@ -39,10 +39,23 @@ pub struct SpawnOptions {
     pub env_len: usize,
 }
 
-pub const SYSCALL_SPAWN_EXT: u64 = 315;
-pub const SYSCALL_REGISTER_BOX: u64 = 316;
-pub const SYSCALL_KILL_BOX: u64 = 317;
-pub const SYSCALL_SET_BOX_STACK: u64 = 324;
+// Aliased from `libakuma::syscall` rather than restated as bare numbers: those
+// are the *AArch64* numbers, and are wrong by `AKUMA_PRIVATE_BASE` (0x1000) on
+// x86_64 — `libakuma` already carries both tables (it has to, to make its own
+// syscalls work on either target) and is the one place these numbers should
+// come from. Restating them here bare cost every one of these four calls
+// silent ENOSYS on amd64: sent as the plain AArch64 number, they landed far
+// below `AKUMA_PRIVATE_BASE`, matched nothing in the neutral syscall table
+// either, and hit that table's generic "unknown number" fallback — with the
+// return value unchecked at every call site below, so `box run` proceeded as
+// if registration had succeeded and failed much later, confusingly, at the
+// overlay mount (`EINVAL` from a namespace that was never created).
+// `docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`.
+#[cfg(feature = "akuma")]
+use libakuma::syscall::{
+    KILL_BOX as SYSCALL_KILL_BOX, REGISTER_BOX as SYSCALL_REGISTER_BOX,
+    SET_BOX_STACK as SYSCALL_SET_BOX_STACK, SPAWN_EXT as SYSCALL_SPAWN_EXT,
+};
 
 #[cfg(feature = "akuma")]
 mod calls {

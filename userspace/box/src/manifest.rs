@@ -14,9 +14,18 @@ use alloc::vec::Vec;
 
 use crate::json::{self, Value};
 
-/// The architecture Akuma runs. Registries spell it `arm64`; some older images
-/// say `aarch64`.
+/// The architecture Akuma runs, spelled the way registries name it in a
+/// platform manifest. This used to be a single hardcoded AArch64 list — the
+/// amd64 port's own `box pull` silently fetched the **arm64** layer of every
+/// image (`ARCH` never noticed there was a second target), and the kernel
+/// correctly refused to exec the wrong-machine-type ELF that produced
+/// (`docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`). Two spellings per
+/// architecture because registries are inconsistent: `arm64`/`aarch64`, and
+/// Docker Hub's own convention is `amd64` for x86_64 Linux (not `x86_64`).
+#[cfg(target_arch = "aarch64")]
 const ARCH: [&str; 2] = ["arm64", "aarch64"];
+#[cfg(target_arch = "x86_64")]
+const ARCH: [&str; 2] = ["amd64", "x86_64"];
 const OS: &str = "linux";
 
 /// A platform manifest: one config blob plus the layers, base-first.
@@ -39,7 +48,8 @@ pub fn is_manifest_list(doc: &str) -> bool {
         || json::exists(doc, &["manifests"])
 }
 
-/// The digest of the `linux/arm64` entry in a manifest list.
+/// The digest of the entry matching this target's `ARCH`/`OS` in a manifest
+/// list.
 ///
 /// Manifest lists also carry attestation entries whose platform is
 /// `unknown/unknown`; matching on both architecture *and* os skips those.
@@ -72,7 +82,7 @@ pub fn select_platform_digest(doc: &str) -> Result<String, String> {
     })
     .map_err(|e| alloc::format!("malformed manifest list: {:?}", e))?;
 
-    matched.ok_or_else(|| String::from("no linux/arm64 manifest found in manifest list"))
+    matched.ok_or_else(|| alloc::format!("no linux/{} manifest found in manifest list", ARCH[0]))
 }
 
 /// The config and layer digests of a platform manifest.
