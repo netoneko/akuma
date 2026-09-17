@@ -182,7 +182,7 @@ per-site counters: fill-inc=653587, insert-inc=653587, invalidate-dec=653568, mu
 fix is the deletion of that one `cow_ref_inc`; post-fix, 16,000 rewrites run
 flat at 2552 MB and the full smpstress file churn no longer drains.
 
-### Cause 2 — REPRODUCED, still open: fork's share pass races a sibling thread's faults
+### Cause 2 — FIXED (2026-09-17): fork's share pass raced a sibling thread's faults
 
 With the leak fixed, the full smpstress still drained PMM to its floor —
 and bisecting the worker shape (`execleak2` mode `w`/`w4`, below) isolated
@@ -200,11 +200,56 @@ such workers, in about a minute — no memory pressure required
 The first is the aarch64 Defect-B signature (a pointer field in a live page
 read back as null → write through `NULL+0x30`); the second is a process
 that **jumped to NULL** — the same terminal as the cargo `#UD` (execute a
-page that cannot hold code). 66k frames sit stuck in the CoW ledger
-afterwards. So the SMP=4 crash is a **fork-share-pass vs concurrent
-sibling-fault race** — lost PTE demotes or lost refcounts — and the OOM
-floor from cause 1 was almost certainly what made it rare enough to look
-like a 1-in-N, ten-minute event.
+page that cannot hold code). 66k frames sat stuck in the CoW ledger
+afterwards.
+
+**Root cause.** The `no-bkl-process` carve-out — whose design record is
+`crates/akuma-exec/src/process/bkl_guard.rs` — drops the BKL around
+`fork_process` step 4, so the share pass's safety does not come from the
+BKL. It comes from the **owner's address-space lock**, held across a walk
+whose per-page transition is `read PTE → cow_ref_inc → demote` as one atom,
+and it is sound only because the CoW fault handler takes *the same lock*
+for its break (aarch64's handler does: `owner.address_space.lock()` in
+`src/exceptions.rs`, bkl_guard.rs constraint 3). The amd64 port skipped
+both halves of that contract:
+
+- `idt.rs`'s `cow_write_fault` serviced the break through a raw-CR3
+  `new_shared` view with **no address-space lock at all**, so it interleaved
+  with the BKL-free fork walk: fork reads leaf=X → the sibling's fault breaks
+  X (`cow_ref_dec` → freed or remapped to Y) → fork incs the stale X and maps
+  it into the child. Refcounts stranded (the 66k ledger), frames freed while
+  still mapped — which surfaces as the freed-then-recycled-page corruption
+  class: `cr2=0x30`, `rip=0x0`, and the ten-minute cargo `#UD`.
+- `usermode.rs`'s `share_parent_memory_into` locked `parent.address_space` —
+  the **forking thread's** `Process`. For a `CLONE_THREAD` sibling fork that
+  is a shared-L0 view under a **fresh lock** nothing else in the system takes
+  (bkl_guard.rs constraint 1), so the hold excluded nothing.
+
+**Fix** (three edits, no locking added anywhere else):
+
+- `amd64/src/idt.rs` `cow_write_fault`: resolve the owner via
+  `address_space_owner_pid_for_fault()` → `lookup_process_shared()` and take
+  the owner's AS lock for the whole servicing window — read → decide →
+  rewrite → refcount → ledger swap is one critical section against the share
+  pass. The Copy arm's ledger swap moved inside that hold, replacing
+  `cow_swap_frame` (which additionally had the own-vs-tgid bug: it edited a
+  sibling thread's throwaway view ledger, not the leader's).
+- `amd64/src/usermode.rs` `share_parent_memory_into`: lock
+  `lookup_process_shared(parent.tgid)`'s address space — the thread-group
+  leader owns the live L0, and `tgid` is the leader's pid — so fork pass, CoW
+  fault, and `madvise`/`munmap` (via `with_current_address_space`) all
+  serialize on one lock object.
+- `cow_swap_frame` deleted (single caller folded in).
+
+No lock-order inversion: fork's hold never waits for the BKL (that is the
+carve-out's point), and every other AS-lock taker holds BKL→AS. A `None`
+owner (kernel root, ring-0 self-test) proceeds unlocked exactly as before.
+
+Verification so far: boot suite + clippy clean on the amd64 target, host
+tests green (identical pre/post warning counts on the host clippy — the 183
+warnings are pre-existing and unrelated). The `w4g` FC A/B and the
+`cargo -j4` SMP=4 retime are the remaining gates — the repro fires in ~1
+minute, so a red run means this fix is wrong, fast.
 
 ### The probes (`userspace/amd64/{smpstress,execleak,execleak2}/`)
 
