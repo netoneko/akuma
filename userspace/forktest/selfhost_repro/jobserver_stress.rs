@@ -279,7 +279,7 @@ impl InstrBarrier {
 extern "C" {
     fn getpid() -> i32;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> i32;
 }
 
 // §7.12 found the original stall-gated watchdog an unreliable narrator: its
@@ -296,7 +296,7 @@ fn spawn_barrier_watchdog(bar: Arc<InstrBarrier>, done: Arc<AtomicBool>) -> thre
     thread::spawn(move || {
         let pid = unsafe { getpid() };
         let path = format!("/root/wd_{}.log\0", pid);
-        let fd = unsafe { open(path.as_ptr(), 0o1101 /* O_WRONLY|O_CREAT|O_TRUNC */, 0o666) };
+        let fd = unsafe { openat(-100 /* AT_FDCWD */, path.as_ptr(), 0o1101 /* O_WRONLY|O_CREAT|O_TRUNC */, 0o666) };
         let poll_ms: u64 = 1000;
         loop {
             thread::sleep(Duration::from_millis(poll_ms));

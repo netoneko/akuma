@@ -541,7 +541,26 @@ extern "C" fn netpoll_daemon() -> ! {
             crate::smp::cpu_index_u32(),
             akuma_bkl::sync::HOLD_TAG_NETPOLL,
         );
+        // **The drain runs BKL-free** — the AArch64 carve-out, mirrored.
+        // `kernel-glue`'s `netpoll_drain_step` established it there: every
+        // piece of state the drain touches (`NETWORK`, transitively
+        // `SOCKET_TABLE`) sits behind its own `PreemptGuard`-protected lock —
+        // which is exactly what this target's forwarded `no-bkl-network`
+        // feature arms — so the BKL buys the drain nothing. Measured
+        // 2026-09-17: at `SMP=4` this daemon's near-continuous BKL ownership
+        // starved every other core's syscall entry into a `[BKL] stuck`
+        // storm (owner=1 tag=503) and sshd never answered. A one-core guest
+        // cannot see this; the metal and any SMP>1 Firecracker run can.
+        //
+        // Scoped to the drain alone, exactly as `netpoll_drain_step` scopes
+        // its window: NOT across the park below — a park inside a dropped
+        // window broke the resume protocol at SMP (measured: `[SWITCH
+        // BADFRAME]` then `#PF` fetch from 0x0 on the resuming slot). The
+        // park's own BKL-held `hlt` is made harmless by `allow_tick`, which
+        // now releases the lock across the halt like `idle_loop` does.
+        akuma_bkl::bkl::dropped_window_open();
         let polls = drain_step();
+        akuma_bkl::bkl::dropped_window_close();
         NETPOLL_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Keep trying SNTP until the wall clock is set. `sync_tick` is a no-op
         // once synced and self-rate-limits otherwise, so this costs a relaxed

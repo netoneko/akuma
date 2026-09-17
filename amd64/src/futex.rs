@@ -175,9 +175,26 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         // below returns at once.
         // Without this the deadline below is unreachable whenever every other
         // runnable task is also spinning in the kernel: `uptime_us` is the
-        // LAPIC tick counter, a syscall runs with `IF` clear, and only the idle
-        // loop re-enables it. `allow_tick`'s own comment has the measurement.
-        crate::sched::allow_tick();
+        // LAPIC tick counter, a syscall runs with `IF` clear, and only the
+        // idle loop re-enables it. `allow_tick`'s own comment has the
+        // measurement.
+        //
+        // **Timed waits only.** The hlt costs one LAPIC tick (10 ms) per
+        // loop iteration, and the loop runs it *before* the wake test — so an
+        // untimed waiter paid a full tick on the way in and another after
+        // every wake, on a core where the waker is runnable and cannot run
+        // until the hlt ends. With `block_current` descheduling properly and
+        // `sched::wake` recording `wake_pending`, an untimed wait needs no
+        // interrupt window at all: park, waker runs, resume, re-check. Every
+        // pthread condvar/jobserver round-trip was two ticks of pure latency;
+        // a self-host rustc build spent its wall clock here, not in the
+        // compiler (measured 2026-09-17: a 100 s `akuma-exec` rebuild billed
+        // its rustc 90 ms of CPU). A *timed* wait still needs the window —
+        // its deadline is read off `uptime_us`, which does not advance while
+        // `IF` is clear — so the hlt stays for that arm.
+        if deadline_at != deadline::NEVER {
+            crate::sched::allow_tick();
+        }
         // Off the table is the wake. Checked with `iter` rather than `queue()`
         // or `locate_and_take` because those two allocate; this borrows.
         // SAFETY: raw-pointer access under the BKL.

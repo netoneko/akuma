@@ -552,7 +552,12 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         unmap_range(base, base + byte_len);
         return errno::ENOMEM;
     }
-    if pages >= 16 {
+    if pages >= 16 && MMAP_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        // TEMPORARY instrumentation (2026-09-13), now gated: this fired on
+        // every mapping of 16 pages or more, and rustc mmaps constantly — an
+        // in-guest build wrote hundreds of these lines to the UART *while
+        // compiling*. The print, not the timing, was the cost; `rdtsc` is a
+        // few cycles and stays. Flip `mm::MMAP_TRACE` for the A/B.
         let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         let hz = crate::lapic::tsc_hz();
         let us = if hz != 0 { dt / (hz / 1_000_000) } else { 0 };
@@ -782,6 +787,13 @@ pub static FILE_PAGES_FILLED: core::sync::atomic::AtomicU64 =
 pub static FILE_PAGES_SHARED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Enables the `[mmap-t]` per-mapping timing print (see `fill_file_pages`).
+/// Off by default: the print fired on every ≥16-page mmap and an in-guest
+/// rustc build flooded the UART with it while compiling. Same shape as
+/// `usermode::SYSCALL_TRACE` — a diagnostics toggle, not a test-only gate.
+pub static MMAP_TRACE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// How many pages one file fault brings in.
 ///
 /// A fault costs a `#PF`, a region-list walk and an ext2 call whose cost is
@@ -922,20 +934,25 @@ fn fill_file_pages(
         if let Some(frame) = filled {
             FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
             if share_this {
-                // Two references, in this order. The first is **this mapping's**:
-                // the page was installed through `map_and_track_pte`, which
-                // counts VAs in this address space and takes no global
-                // reference, and teardown frees each distinct frame once through
-                // `free_page` — which decrements. Without it, the first process
-                // to exit would free a frame the cache still publishes and every
-                // later mapper would be handed a recycled page as file content.
-                // The second is the cache's own, taken inside `insert`.
+                // Two references cover this frame, and both are already in
+                // place without another `cow_ref_inc` here: the mapping's own
+                // — `populate_file_page_by_inode` installed it through
+                // `map_and_track_pte`, which takes the reference its teardown
+                // will drop — and the cache's own, taken inside `insert`.
+                // An explicit third increment stood here until 2026-09-17 and
+                // leaked one reference per freshly filled shared page: munmap
+                // and the next write's `invalidate_inode` each dropped one of
+                // three, stranding the frame at count 1 forever. Ten minutes
+                // of `cargo build -j4` rewrote enough files to strand ~2.5 GiB
+                // and push the guest to the OOM floor (the SMP=4 ring-3 `#UD`
+                // in AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md). The AArch64
+                // original never had it — its fill carries the allocation
+                // reference into `adopt_user_frame(frame, owns_ref=true)`.
                 //
                 // `insert` may decline (over cap, or a peer published the same
-                // page first). That is not an error and needs no undo: the frame
-                // stays private with exactly the one reference this mapping
-                // holds, which teardown balances.
-                akuma_pmm::cow_ref_inc(frame.addr);
+                // page first). That is not an error and needs no undo: the
+                // frame stays private with exactly the one reference this
+                // mapping holds, which teardown balances.
                 akuma_fpcache::insert(file.mount_id, file.inode, offset, frame, true);
             }
         }

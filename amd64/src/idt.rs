@@ -921,6 +921,14 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
         crate::smp::bkl_enter();
     }
 
+    // Count the serviced fault into the current process's `[PSTATS]` record
+    // (aarch64 gets this through glue's fault accounting; this target's fault
+    // path is its own). One relaxed add per fault; `inc_pagefault(1)` also
+    // bumps `pagefault_pages`, whose unit here is one 4 KiB page per fault.
+    if let Some(p) = crate::usermode::current_process() {
+        p.syscall_stats.inc_pagefault(1);
+    }
+
     // Demand paging for ring 3, from the per-address-space region table
     // (`mm::fault_in`). A not-present fault inside a mapping this process has
     // been given gets a zeroed frame at the region's own protection; anything
@@ -1074,9 +1082,9 @@ fn describe_page_fault(code: PageFaultCode) {
 /// that names an existing L0 and whose ledger **owns nothing**, so it frees
 /// nothing when it drops. Nothing here allocates a page table either — every
 /// arm rewrites a leaf that is already present — so the view's throwaway ledger
-/// never has anything to lose. The *real* ledger update is
-/// [`crate::usermode::cow_swap_frame`], against the running process, which is
-/// where a replaced frame has to be recorded.
+/// never has anything to lose. The *real* ledger update happens against the
+/// **owner** process under the hold taken below, which is where a replaced
+/// frame has to be recorded.
 fn faulting_address_space() -> akuma_mmu::UserAddressSpace {
     // `new_shared` cannot fail on this target — it allocates nothing — but it
     // returns `Option` because the shared callers in `akuma-exec` are written
@@ -1102,6 +1110,37 @@ fn cow_write_fault(addr: u64) -> bool {
     use akuma_cow::{CowAction, CowFault};
 
     let page = (addr as usize) & !0xfff;
+
+    // **The owner's address-space lock, for the whole servicing window.**
+    //
+    // The AArch64 handler has always done its CoW break under
+    // `owner.address_space.lock()` (`bkl_guard.rs` constraint 3); this target's
+    // port skipped the lock, and that was the fork-vs-sibling-thread race:
+    // `fork_process`'s share pass runs with the BKL **dropped** (`no-bkl-process`
+    // is compiled in on this target), holding the owner's lock across a walk
+    // whose every page is `read PTE → cow_ref_inc → demote` as one atom against
+    // exactly this handler. Unlocked, the two interleaved: fork read a leaf
+    // naming frame X, a sibling's fault broke X (`cow_ref_dec` → freed or
+    // re-shared), fork then inc'd the stale X and mapped it into the child —
+    // refcounts stranded (66k frames stuck in the CoW ledger in the repro),
+    // frames freed while still mapped, and the freed-then-recycled page
+    // surfaced as `#PF write to cr2=0x30` / `#PF fetch from rip=0x0` under a
+    // `cargo -j4` self-host build.
+    //
+    // Taking the same lock fork holds makes the handler's
+    // read-PTE → decide → rewrite → refcount → ledger swap one critical section
+    // against the share pass, which is the same serialization the AArch64 side
+    // has had since the `no-bkl-process` carve-out landed. `fork`'s hold never
+    // waits for the BKL (that is the carve-out's point), so a fault spinning
+    // here — BKL held — cannot invert against it.
+    //
+    // `None` — a kernel root, ring-0 self-test, or not-yet-registered task —
+    // proceeds unlocked, exactly as this function always did: there is no fork
+    // walk racing those tables.
+    let owner = akuma_exec::process::address_space_owner_pid_for_fault()
+        .and_then(akuma_exec::process::lookup_process_shared);
+    let mut owner_as = owner.map(|p| p.address_space.lock());
+
     let mut faulted = faulting_address_space();
     let Some((prot, marked)) = faulted.pte_prot(page) else {
         return false; // not mapped — not a CoW break
@@ -1170,10 +1209,16 @@ fn cow_write_fault(addr: u64) -> bool {
             if akuma_pmm::cow_ref_dec(pa) {
                 akuma_pmm::free_page(pa, 0);
             }
-            // The private copy is tracked by this process's ledger so teardown
+            // The private copy is tracked by the owner's ledger so teardown
             // gives it back; the frame it replaced was removed from the ledger
-            // by the same call that decremented above.
-            crate::usermode::cow_swap_frame(pa, fresh);
+            // by the same two lines. Under the hold taken at the top of this
+            // function — the successor of `cow_swap_frame`, which locked the
+            // *faulting thread's own* `Process` (a fresh-lock `new_shared` view
+            // for a `CLONE_THREAD` sibling) after the PTE was already rewritten.
+            if let Some(space) = owner_as.as_deref_mut() {
+                let _ = space.remove_user_frame(akuma_mmap::PhysFrame::new(pa));
+                space.track_user_frame(akuma_mmap::PhysFrame::new(fresh));
+            }
             COW_COPIES.fetch_add(1, Ordering::Relaxed);
             true
         }
@@ -1235,6 +1280,32 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     serial::puts(" pid=");
     serial::put_dec(u64::from(crate::usermode::current_pid()));
     serial::puts(" — killing the process\n");
+    // Post-mortem at the OOM floor: a ring-3 kill under memory pressure is
+    // only diagnosable from these numbers (found 2026-09-17, when the
+    // file-page-cache reference leak drained the guest to `pmm_free=0` and
+    // every downstream symptom — the SMP=4 `#UD`, the dead network — was
+    // downstream of that). A boot with no NIC never reaches
+    // `mem_watch_tick`, so the counters ride the fault line itself.
+    serial::puts("  [memwatch-at-kill] pmm_free=");
+    serial::put_dec(akuma_pmm::free_count() as u64);
+    serial::puts(" fpcache_len=");
+    serial::put_dec(akuma_fpcache::len() as u64);
+    serial::puts(" fpcache_cap=");
+    serial::put_dec(akuma_fpcache::cap() as u64);
+    serial::puts(" cow_ref_frames=");
+    serial::put_dec(akuma_pmm::cow_ref_count() as u64);
+    serial::puts("\n");
+    {
+        // Hit/miss/evict/inval: distinguishes "the cache ate the RAM" (len
+        // pinned at cap, evictions churning) from "a mapper leaked refs"
+        // (len small, `cow_ref_frames` huge) — the two look identical from
+        // `pmm_free=0` alone.
+        let mut buf = [0u8; 160];
+        let mut pos = 0usize;
+        let mut w = akuma_primitives::console::FmtBuf { buf: &mut buf, pos: &mut pos };
+        akuma_fpcache::stats_line(&mut w);
+        serial::puts(core::str::from_utf8(&buf[..pos]).unwrap_or("[fpcache stats]\n"));
+    }
     crate::usermode::kill_current_from_fault(SIGSEGV);
 }
 

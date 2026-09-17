@@ -842,6 +842,17 @@ extern "C" fn syscall_handler(
     // fault, so this one line is what makes `tag=` name the holder's syscall.
     akuma_bkl::sync::set_holder_tag(crate::smp::cpu_index_u32(), nr);
     CALLS.fetch_add(1, Ordering::Relaxed);
+    // Per-process syscall counters — the `[PSTATS]` machinery, aarch64 parity
+    // (`akuma-kernel-glue` bumps the same counters through the `akuma-syscalls`
+    // excursion hooks; this target's dispatcher is its own, so the bump lives
+    // here). Counts are exact. Times are the LAPIC tick — 10 ms, so a syscall
+    // shorter than that folds to 0 — which is the point: the 30 s sweep sorts
+    // by time, so what surfaces is where the *wall clock* went, i.e. the
+    // blocking syscalls, not the leaf-traffic ones.
+    let stats_t0 = crate::lapic::ticks();
+    if let Some(p) = current_process() {
+        p.syscall_stats.inc(nr);
+    }
     let trace = SYSCALL_TRACE.load(Ordering::Relaxed);
     // Entry line: a syscall that blocks forever has no result line, so the
     // entry line is what names it (a bring-up aid — without it a hang inside
@@ -924,6 +935,13 @@ extern "C" fn syscall_handler(
     } else {
         syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
     };
+    if let Some(p) = current_process() {
+        p.syscall_stats.add_time_us(
+            nr,
+            crate::lapic::ticks().saturating_sub(stats_t0)
+                * u64::from(crate::lapic::US_PER_TICK_TARGET),
+        );
+    }
     if trace {
         serial::puts("[sc] cpu=");
         serial::put_dec(crate::smp::cpu_index() as u64);
@@ -2889,7 +2907,20 @@ fn share_parent_memory_into(
     // parent's residency; it has to be one hold, because a demote that
     // published halfway would leave the parent writable on pages the child
     // already shares.
-    let mut parent_as = parent.address_space.lock();
+    // The **owner's** lock, not `parent.address_space` — `bkl_guard.rs`
+    // constraint 1, which this hook's first cut ignored. `fork_process` runs
+    // step 4 with the BKL dropped (`no-bkl-process`), so this hold is what
+    // serializes the walk against the CoW fault handler, which takes the same
+    // lock for its whole break (`cow_write_fault` in `idt.rs`) and against
+    // `madvise`/`munmap`, which take it through `with_current_address_space`.
+    // All three must name the *same* lock object: the thread-group leader's,
+    // whose `ProcAddressSpace` owns the live L0. `parent` is the forking
+    // thread's `Process` — for a worker-thread fork (`CLONE_THREAD` sibling)
+    // that is a shared-L0 view under a **fresh** lock nothing else in the
+    // system takes, and the hold above would exclude nothing. The owner is the
+    // leader, and `tgid` is the leader's pid on both kernels.
+    let owner = akuma_exec::process::lookup_process_shared(parent.tgid).unwrap_or(parent);
+    let mut parent_as = owner.address_space.lock();
     // The child inherits the parent's file mappings — including the pages of
     // them nobody has faulted yet — so it must inherit their claim on the
     // files. Without this the child's demand-paged mappings are kept alive only
@@ -3109,25 +3140,6 @@ pub fn with_current_address_space<R>(f: impl FnOnce(&mut akuma_mmu::UserAddressS
     // freed out from under it. Ask the owner.
     let p = current_mm_process()?;
     Some(f(&mut p.address_space.lock()))
-}
-
-/// A copy-on-write break replaced `old` with `new` in the running process:
-/// update its ledger so teardown frees what it actually holds.
-///
-/// Without this the private copy is untracked (leaked at exit, forever) and the
-/// shared frame is still claimed by a process that no longer maps it (freed
-/// twice, or freed while a sibling still reads it). Both are silent, and both
-/// arrive long after the fault that caused them.
-///
-/// `remove_user_frame` reporting "last reference" is ignored on purpose: the
-/// fault handler has already done the `cow_ref_dec` and freed the frame if that
-/// was its call to make. This only edits the per-process ledger.
-pub fn cow_swap_frame(old: usize, new: usize) {
-    if let Some(p) = current_process() {
-        let ledger = p.address_space.lock();
-        let _ = ledger.remove_user_frame(akuma_mmap::PhysFrame::new(old));
-        ledger.track_user_frame(akuma_mmap::PhysFrame::new(new));
-    }
 }
 
 /// How many process slots this target has.

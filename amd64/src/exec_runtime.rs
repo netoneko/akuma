@@ -563,6 +563,14 @@ fn config() -> ExecConfig {
 pub fn init() {
     let rt = runtime();
     akuma_exec::runtime::register(rt, config());
+    // `[PSTATS]` parity: aarch64 enables the per-process counters through
+    // `kernel-glue`'s `kernel_main`; this target's boot is its own, so the
+    // enable lives here. Without it `dump_running_process_stats` returns
+    // before printing and the counters this kernel now bumps in
+    // `syscall_handler`/`page_fault_dispatch` are never read.
+    akuma_exec::process::enable_process_syscall_stats(
+        akuma_config::PROCESS_SYSCALL_STATS,
+    );
     // **Pid 1 is init's on this target and is not drawn from the counter.**
     // `usermode::current_pid` answers 1 for the boot task, and `run_init`
     // registers under it, so the first allocation must be 2 or the first real
