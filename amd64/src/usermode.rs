@@ -956,10 +956,10 @@ extern "C" fn syscall_handler(
     // resume on another core, and while KVM and this machine both present an
     // invariant, synchronised TSC, a kernel that assumes it cannot be read
     // backwards is one errata away from a wildly wrong duration.
-    if let (Some(t0), Some(t1)) = (stats_t0, crate::lapic::tsc_uptime_us()) {
-        if let Some(p) = current_process() {
-            p.syscall_stats.add_time_us(nr, t1.saturating_sub(t0));
-        }
+    if let (Some(t0), Some(t1)) = (stats_t0, crate::lapic::tsc_uptime_us())
+        && let Some(p) = current_process()
+    {
+        p.syscall_stats.add_time_us(nr, t1.saturating_sub(t0));
     }
     if trace {
         serial::puts("[sc] cpu=");

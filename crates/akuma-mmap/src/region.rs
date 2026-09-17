@@ -470,64 +470,78 @@ pub fn detach_eager_regions_in_range(
         // Split the frame vector in step with the extent. `filter_map(next)`
         // tolerates the CoW-inherited case (`frames` empty): every piece then
         // carries its page count and no frames, which is exactly right.
-        let reg = regions.remove(i);
-        let prot = reg.prot;
+        //
+        // Taken out of the slot rather than by removing the region, because the
+        // region usually stays: a clip at either edge leaves one survivor, and
+        // that survivor can reuse the slot the original occupied.
+        let prot = regions[i].prot;
         // A partial unmap changes extent, not identity: both survivors are still the
         // same `MAP_SHARED|MAP_ANONYMOUS` object if the original was.
-        let shared_anon = reg.shared_anon;
+        let shared_anon = regions[i].shared_anon;
         // A partial unmap changes extent, not what the region states about itself.
-        let prot_recorded = reg.prot_recorded;
+        let prot_recorded = regions[i].prot_recorded;
         // Nor where the region sits in its file — but the surviving *tail*
         // starts further in, by everything the head and the clip took.
-        let file = reg.file;
-        let mut it = reg.frames.into_iter();
+        let file = regions[i].file;
+        let mut it = core::mem::take(&mut regions[i].frames).into_iter();
         let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
         let mid: alloc::vec::Vec<PhysFrame> = (0..clip_pages).filter_map(|_| it.next()).collect();
         let tail: alloc::vec::Vec<PhysFrame> = it.collect();
 
         // Survivors keep the protection of the region they came from: a partial
-        // unmap changes extent, not permission. Both lie entirely outside
-        // [range_start, range_end), so re-examining them costs one overlap test
-        // and cannot loop.
+        // unmap changes extent, not permission.
         //
-        // **They go back where the region they came from was**, not on the end.
-        // Both are carved out of the region that was at slot `i` and so belong
-        // at `i` and `i + 1` in address order; appending them instead left the
-        // list scrambled in proportion to how much `munmap` a process did.
+        // **They stay where the region they came from was**, in address order,
+        // rather than being appended. Both are carved out of the extent that was
+        // in slot `i`, so that is where they belong — and the list stays sorted,
+        // which is the property `amd64`'s first-fit placer needs.
         //
-        // That is a correctness-neutral property here — nothing in this crate
-        // reads the list in order — and it was load-bearing for the one caller
-        // that does. `amd64`'s `find_free_va` is a first-fit scan that needs
-        // address order, so it sorted the list itself on every `mmap`; with the
-        // order destroyed by every `munmap`, that sort stopped being the
-        // adaptive linear re-confirm its comment claimed and became real work.
-        // Measured 2026-09-17 in an in-guest `cargo build -p zerocopy`: 4 400
-        // regions, 18 % of calls arriving unsorted, **468 us of a 483 us
-        // `mmap`** inside `sort_unstable_by_key` — 74 % of `rustc`'s wall clock.
+        // That matters because it had none. `find_free_va` is a first-fit scan,
+        // so it sorted the list itself on every `mmap`; with the order destroyed
+        // by every partial `munmap`, that sort stopped being the adaptive linear
+        // re-confirm its comment claimed and became real work. Measured
+        // 2026-09-17 in an in-guest `cargo build -p zerocopy`: 4 400 regions,
+        // 18 % of calls arriving unsorted, **468 us of a 483 us `mmap`** inside
+        // `sort_unstable_by_key` — 74 % of `rustc`'s wall clock.
         // See docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md §8.
-        let mut inserted = 0usize;
+        //
+        // It is also **strictly less shifting than the `remove`-and-`push` it
+        // replaces**, which is what makes it free for the AArch64 kernel — that
+        // one calls this too (`akuma-syscalls-glue`'s `munmap`) and gets no
+        // benefit from the ordering, because it places from a bump cursor and a
+        // free list and never scans this list for a gap. The old shape shifted
+        // the tail once unconditionally (`Vec::remove`); this one shifts it only
+        // for a middle split, which produces two survivors, or for a whole-region
+        // unmap, which produces none. A clip at either edge now moves nothing.
+        let mut next = i;
         if head_pages > 0 {
-            regions.insert(i, MmapRegion {
-                start_va: reg_start, pages: head_pages, frames: head, prot,
-                shared_anon, prot_recorded, file });
-            inserted += 1;
+            regions[i].pages = head_pages;
+            regions[i].frames = head;
+            next += 1;
         }
         if tail_pages > 0 {
-            regions.insert(i + inserted, MmapRegion {
+            let tail_region = MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail, prot,
                 shared_anon, prot_recorded,
-                file: file.map(|f| f.advance(head_pages + clip_pages)) });
-            inserted += 1;
+                file: file.map(|f| f.advance(head_pages + clip_pages)) };
+            if next == i {
+                regions[i] = tail_region;
+            } else {
+                regions.insert(next, tail_region);
+            }
+            next += 1;
+        }
+        if next == i {
+            // Wholly inside the range: no survivor, so the slot goes.
+            regions.remove(i);
         }
         if clip_pages > 0 {
             pieces.push((clip_start, clip_pages, mid));
         }
-        // `remove(i)` shifted the next candidate into slot `i`, and any survivor
-        // re-inserted ahead of it shifted it back: step over exactly those.
-        // Skipping them is not just an optimisation — both lie outside the
-        // range, so re-examining them would be two wasted overlap tests per
-        // split, and advancing is what keeps this a single pass.
-        i += inserted;
+        // Step over the survivors. They lie outside [range_start, range_end) by
+        // construction, so re-examining them could only waste overlap tests —
+        // and `remove` above already shifted the next candidate into `i`.
+        i = next;
     }
     pieces
 }

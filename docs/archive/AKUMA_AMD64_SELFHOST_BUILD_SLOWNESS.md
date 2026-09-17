@@ -489,17 +489,20 @@ boot+probe+teardown inside one shell invocation. Raw logs:
    It still gates re-timing: the aarch64 self-host baseline (44 s clean
    build) had four cores, and this run shows SMP builds are survivable but
    not yet dependable.
-3. **Attribute the rest in-guest** with the new PSTATS counters: run a build,
-   then read the 30 s `[PSTATS]` block (per-syscall counts, coarse times —
-   blocking syscalls are the ones that surface — and `pf=` fault counts).
+3. ~~**Attribute the rest in-guest** with the new PSTATS counters~~ — **done,
+   §8.** Read that section's "`[PSTATS]` first had to stop being a sampler"
+   before trusting any earlier `[PSTATS]` number in this doc: the timings were
+   10 ms-tick samples until 2026-09-17, they only print at `SMP≥2`, and an
+   `nrN` entry is a raw **x86_64** number while a *named* one is asm-generic.
    rustc's `/proc/<pid>/stat` utime/minflt are stubs on this target (both
-   read 0 mid-compile); PSTATS is the working instrument now. **First
-   attribution is in (§ the -j4 run): rustc spends ~44 % of its wall
-   in-kernel, almost all of it in `read`** — the read path, not codegen.
-4. Remaining audit levers, now ranked by that attribution: **virtio-blk
-   `read_bytes` temp-Vec double-copy** and **ext2 per-page block
-   re-derivation** first (they tax every one of those 62 k reads), then
-   shared zero page for anonymous read faults; the
+   read 0 mid-compile); PSTATS is the working instrument.
+4. Remaining audit levers. **The `-j1` ranking above no longer holds** (2026-09-17):
+   with the §8 sort fixed, a `zerocopy` compile's whole measured syscall and
+   fault budget is ~1 s of 18 s, and `read` is not in it — the 62 k-read
+   attribution was from the `-j4` kernel build, a different workload that reads
+   far more source. Re-attribute against the target workload before picking
+   between **virtio-blk `read_bytes` temp-Vec double-copy**, **ext2 per-page
+   block re-derivation** and the shared zero page for anonymous read faults; the
    syscall-entry opt-out bitmap (aarch64 `SYSCALL_BKL_OPTOUT_SEED`) — the
    *mechanism* ports as-is, but each seed needs its amd64 handler audited
    (e.g. `futex` cannot be seeded until `WAITERS` stops naming the BKL as its
@@ -725,9 +728,11 @@ time, because a boot suite cannot time anything reliably:
   a page twice or drops a run, and renders a plausible-looking file — so the
   predecessor is the only thing that can catch it.
 
-**Still to do: re-time the build.** This removes the wall; it does not by
-itself produce the timing number §"Iterate" item 3 wants. A fresh FC boot with
-fixes #1-#5 and a clean `cargo build` is what closes that out. The wedged
+~~**Still to do: re-time the build.**~~ **Done — §8** (2026-09-17). The wall is
+gone: `zerocopy` compiles in 63 s where it had never finished. Re-timing it is
+also what turned up the *second*, larger cost in this same function — the
+`sort_unstable_by_key` this fix left in, which the paragraph below calls
+adaptive and which is not, because `munmap` re-orders the list between calls. The wedged
 2026-09-17 guest is still up (kill it before reusing the rig — see "Status and
 next steps"), and the `-j4` silent wedge above is a separate, still-open bug.
 
@@ -978,6 +983,235 @@ Boot suite 752/752, clippy clean.
 `--seq-mb=N` on the probe is what makes this measurable at all: a working set
 that fits the cap reports the hit path however big the cap is, so the default
 2 MiB pass cannot tell a 16 MB cache from a 384 MB one.
+
+### 8. FIXED (2026-09-17): `find_free_va` sorted 4 400 regions on **every** `mmap`, and that was 74 % of `rustc`
+
+*This is the §5 follow-through: §5 removed the O(n²) restart and the `zerocopy`
+wall went with it, but nobody had re-timed the build. Timing it turned up a
+second, larger cost in the same function.*
+
+**The §5 regression gate passes.** `cargo build -p zerocopy --target
+x86_64-unknown-none --release --offline -j1`, in-guest, FC 1 vCPU / 6144 MB,
+`/tmp/ktarget` on ext2: **63 s**, against "never completed in 15+ minutes"
+before §5. The stall is gone.
+
+#### Same binary on both sides — and here "both sides" means both *kernels*
+
+63 s is not a number that means anything on its own, and the arm that gives it
+one is cheap and had not been run: the guest image carries a complete
+`x86_64-unknown-linux-musl` toolchain, so the **same `cargo` and `rustc`
+binaries can build the same source on the box's own Ubuntu side**, in a chroot
+on a copy of the guest's root image. Same CPU, same files, same toolchain; the
+only variable left is the kernel underneath.
+
+| | `zerocopy` `-j1`, min of 3 |
+|---|---|
+| Linux (bare, `taskset -c 0`) | **8.8 s** |
+| Akuma/amd64 (FC, 1 vCPU) | **63 s** |
+| Akuma/amd64, after this fix | **18.3 s** |
+
+Pinning the Linux arm to one CPU changes nothing (8.80 s against 8.84 s), which
+rules out the obvious objection that the host arm simply had four cores.
+
+Three traps in setting that chroot up, all of which read as "the kernel is
+broken" rather than "the harness is":
+
+- **The image's binaries have no `x` bit.** Akuma's ext2 does not check it;
+  Linux does, and `chroot` answers `Permission denied` for `/bin/sh`, which
+  looks exactly like a mount option.
+- **`/dev/null` does not exist in the image.** `cargo` redirects its `rustc -vV`
+  probe there and fails with `could not execute process rustc -vV (never
+  executed) / No such file or directory` — a message that names `rustc`, so the
+  first four attempts went looking at `PATH`, at `RUSTC`, and at the musl
+  loader, all of which were fine.
+- The ssh key the harnesses expect (`target/…/amd64-ssh-test-key`) had been
+  cleaned away; the image's `authorized_keys` is a file on the image, so a new
+  key can simply be appended to it while nothing is booted.
+
+#### `[PSTATS]` first had to stop being a sampler
+
+`[PSTATS]` timed syscalls with `lapic::ticks()` — the **10 ms** LAPIC tick. The
+note in `usermode.rs` argued that was the point: a syscall shorter than a tick
+folds to 0, the sweep sorts by time, so what surfaces is where the wall clock
+went. That is true of a *blocking* syscall and false of a frequent short one,
+and the difference is not rounding — a 7 µs `mmap` is charged a full 10 ms
+whenever a tick lands inside it, so the reported time is an unbiased estimator
+with a standard error of one whole tick per sample. It read 8.27 s for `mmap`
+against a per-call cost the probe put at 7.7 µs (0.45 s), and **nothing in the
+number says which of the two is wrong**.
+
+Switched to `lapic::tsc_uptime_us()`, the resolution this target already has
+(`clock_gettime` moved onto it in §2). Cost is one `rdtsc` plus a 128-bit
+mul/div at each end, ~40 cycles, against a syscall floor three orders up. It
+returns `None` while the TSC is uncalibrated, and the epilogue then adds
+nothing rather than a fabricated duration.
+
+Two more things about `[PSTATS]` on this target that cost time to find:
+
+- **It only prints from `idle_loop`, which is the *secondary core's* entry
+  (`smp.rs:755`).** At `SMP=1` nothing ever enters it and the sweep never runs,
+  however long a process lives. Attribution runs need `SMP≥2`; `-j1` with two
+  vCPUs is the right shape, since the second core only has to idle. (The
+  exit-time dump in `akuma-exec` is in `return_to_kernel`, which is the AArch64
+  exit path — amd64 does not take it, so a process exiting prints nothing.)
+- **The syscall numbers are counted at two sites under two numbering schemes.**
+  `amd64/src/usermode.rs` counts the raw **x86_64** number; `akuma-syscalls-glue`
+  counts the **asm-generic** one for everything that reaches glue. The name
+  table is asm-generic only. So an entry printed **with a name is correct**, and
+  an entry printed as **`nrN` is a raw x86_64 number** — `nr9`/`nr11` are
+  `mmap`/`munmap`, `nr228` is `clock_gettime`. A reader who assumes one scheme
+  will find `sshd` calling `ptrace` 16 352 times.
+
+With TSC timing, one `rustc` over a 29.92 s window:
+
+```
+[PSTATS] PID 85 (rustc) 29.92s: 112599 syscalls in_kernel=22761ms pgfault=67465
+  | nr9=58520(20362ms) nr11=53347(2309ms) fcntl=23(49ms) …
+```
+
+**20.4 s of a 29.9 s window inside `mmap` — 68 % of wall, 89 % of all
+in-kernel time, at 348 µs per call.** 99.3 % of this process's syscalls are
+`mmap`/`munmap`.
+
+#### What it was not
+
+Two candidates were measured and rejected before the real one was found, and
+both are worth keeping because both are plausible and both are wrong:
+
+- **Eager population.** `plan()` makes a private anonymous mapping eager unless
+  it exceeds `MMAP_EAGER_MAX_PAGES` (16), and musl's mallocng maps groups at or
+  under that, so *every* one of `rustc`'s 58 k mappings took the eager path —
+  and `mem_fault_cost` prices one eager page at 14.0 µs against a lazy 0.64 µs
+  (Linux's eager premium for the same arm is **32 ns**). It looked certain.
+  Forcing `EAGER_MAX_PAGES = 0` so every private anonymous mapping is lazy
+  changed the build time by **nothing** (1 m 02 s against 1 m 03 s), and
+  `mmap`'s share stayed at 74 %. Reverted.
+- **Page faults.** 67 k of them, and they are not in `in_kernel` at all. They
+  are also fine: `mem_fault_cost` puts a demand fault at 1 532 ns against
+  Linux's 1 291 ns, and a CoW fault at 2 401 ns against 1 823 ns.
+
+#### The probe that under-measured by 60x, and why
+
+`userspace/memprobe/c/mmap_scale.c` (new here) mmaps one page at a time and
+reports the per-call cost bucketed by how many mappings the process already
+holds. One static musl binary for both architectures and for Linux.
+
+| regions held | Akuma `mmap` | Linux `mmap` |
+|---|---|---|
+| 0 | 1 656 ns | 937 ns |
+| 3 750 | **16 720 ns** | 927 ns |
+
+Exactly linear — `1 656 ns + 4.02 ns x regions` — against a Linux line that is
+flat to within noise. A real defect, and **not this one**: at the ~2 000 regions
+`/proc/<pid>/maps` showed for a live `rustc` it predicts 8 µs, not 348 µs.
+
+The probe under-measures because its grow phase **never unmaps**, so the region
+list it hands the placer is always already in address order — the best case for
+an adaptive sort, and the case `rustc` is never in. *A probe that reproduces the
+shape of the workload but not its history can be linear, correct, and off by a
+factor of 60.*
+
+#### Root cause: the sort, and the two appenders that made it necessary
+
+Phase timing inside `sys_mmap` (temporary `[mmap-prof]`, 8 192-call averages)
+put it beyond doubt — and note the growth, which is what a region-count theory
+cannot explain and a *disorder* theory can:
+
+```
+[mmap-prof] calls=8192  avg_total_us=34  avg_lookup_us=0 avg_place_us=33  avg_sort_us=31  avg_regions=424  unsorted_pct=25
+[mmap-prof] calls=81920 avg_total_us=483 avg_lookup_us=0 avg_place_us=483 avg_sort_us=468 avg_regions=4400 unsorted_pct=18
+```
+
+**468 µs of a 483 µs `mmap` was `sort_unstable_by_key`** — 97 % of the call. The
+process-table lookup every entry pays is 0 µs; the scan §5 rewrote is ~15 µs.
+
+§5 left the sort in with this justification:
+
+> `sort_unstable_by_key` is pattern-defeating quicksort: in place, **no
+> allocation** … and adaptive, so the sorted list this leaves behind costs a
+> linear pass to re-confirm on the next call rather than a full sort.
+
+The first half is true. The second is only true **if nothing re-orders the list
+between two calls**, and two things did:
+
+1. `sys_mmap` appended each new region with `regions.push` — out of order
+   whenever first-fit placed it in a freed hole rather than at the top.
+2. `akuma_mmap::detach_eager_regions_in_range` — `munmap`'s clip-and-split —
+   `remove`d the region it clipped and `push`ed its survivors onto the **end**,
+   so every partial unmap moved a low-address region to the back.
+
+`rustc` interleaves ~53 k `munmap`s with ~58 k `mmap`s compiling one small
+crate, and the list arriving at the placer averaged **4 400 regions, 18 % of
+calls out of order**. The cost grows as the build runs because the disorder
+does.
+
+#### The fix
+
+Three parts, and the first two are what make the third safe:
+
+- **`detach_eager_regions_in_range` keeps its survivors in place.** The head
+  reuses the slot the original occupied (`pages`/`frames` assigned in place,
+  `start_va` is already right); a tail goes at `i + 1`, or into the slot itself
+  when there is no head; a region wholly inside the range is removed. This is
+  **strictly less shifting than the `remove`-and-`push` it replaces** — the old
+  shape shifted the list tail once unconditionally, this one shifts only for a
+  middle split or a whole-region unmap, and a clip at either edge now moves
+  nothing. That matters because **the AArch64 kernel calls this function too**
+  (`akuma-syscalls-glue`'s `munmap`) and gets no benefit from the ordering: it
+  places from a bump cursor and a free list (`ProcessMemory::next_mmap` /
+  `free_regions`) and never scans this list for a gap. Ordering is free for it
+  rather than a tax.
+- **`insert_region_sorted`** (amd64) puts a new region at its address via
+  `partition_point` instead of appending. The `insert` shifts nothing in the
+  common case, because first-fit returns a low gap only when one was freed and
+  otherwise places at the end of the list.
+- **The placer sorts only if the list is not already sorted** — a `windows(2)`
+  pass with no moves. The sort is **kept rather than replaced by a debug
+  assertion**, deliberately: the invariant is an optimisation, and a future
+  writer who appends should get a slow placer, not a wrong one. An optimisation
+  that quietly becomes a correctness requirement is how this cost arrived.
+
+#### Result
+
+| | `zerocopy` `-j1`, min of 3, FC 1 vCPU / 6 GB |
+|---|---|
+| before | 63 s |
+| after | **18.3 s** — **3.4x** |
+| Linux reference | 8.8 s (gap 7.2x -> 2.1x) |
+
+Boot suite **730 passed / 0 failed at SMP=1** and **740 / 0 at SMP=4** (both +2
+over the pre-fix count: the two new self-tests). Host tests 1 455 / 0, clippy
+clean on the amd64 target and on `akuma-mmap`.
+
+Pinned by tests that assert **shape, not time**, because a boot suite cannot
+time anything and because a list that silently goes out of order is not slower
+here — it is slower on the *next* `mmap`, in another process, minutes later:
+
+- `akuma-mmap` host tests `split_keeps_the_list_in_address_order` (head+tail and
+  tail-only splits) and `split_visits_every_region_once` (the loop has to step
+  over what it inserted; getting that wrong silently skips a region).
+- amd64 boot-suite checks `mmap va: insertion keeps the region list in address
+  order` and `… keeps every region`, fed out-of-order inserts including one
+  landing in a hole in the middle.
+
+#### Open, and measured here
+
+- **`munmap` costs 13.2 µs at `SMP=2` against 1.97 µs at `SMP=1`** (probe base,
+  same kernel) — a TLB-shootdown IPI per unmap. Linux is 1.46 µs flat. At 53 k
+  unmaps per `rustc` that is ~0.6 s per core beyond the first, and it is the
+  next thing to look at for SMP builds.
+- **`mmap` is still linear in region count** at 4.02 ns/region (the §5 scan,
+  now the whole of placement). At 4 400 regions that is ~18 µs a call. A
+  per-address-space cursor — what AArch64 already does — is the fix; it did not
+  matter next to a 468 µs sort and it is the leading term now. The same
+  `mmap_scale` binary on AArch64 (QEMU TCG) is **flat**: 1 248–1 584 ns from 0
+  to 3 750 regions, slope −0.24 ns/region. That is the bump cursor plus free
+  list, and it is also why none of §8 is an AArch64 speedup — only the shared
+  `detach_eager_regions_in_range` change reaches that kernel, and there it is
+  behaviour-neutral and slightly cheaper.
+- The remaining 2.1x against Linux is **not** syscalls: with `mmap` fixed the
+  measured syscall and fault budget accounts for ~1 s of the 18 s.
+
 
 ## Background
 

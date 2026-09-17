@@ -323,6 +323,70 @@ reclaiming, such a mapping fails with `ENOMEM` rather than silently
 downgrading to `MAP_PRIVATE` semantics (a downgrade some earlier `go build`
 traces logged — see Background).
 
+## Placement: the region list is kept in address order
+
+The two kernels place a mapping differently and only one of them scans.
+**AArch64** places from a per-process bump cursor plus a free list
+(`ProcessMemory::next_mmap` / `free_regions`) and never looks at the region
+list for a gap. **amd64** has no cursor: `find_free_va` (`amd64/src/mm.rs`) is a
+first-fit scan over `mmap_regions`, which needs the list in address order.
+
+Since 2026-09-17 that order is an **invariant maintained by every writer**,
+not something the placer re-establishes:
+
+- `amd64`'s `insert_region_sorted` puts a new region at its address
+  (`partition_point` + `insert`) instead of appending.
+- `akuma_mmap::detach_eager_regions_in_range` — `munmap`'s clip-and-split,
+  called by **both** kernels — leaves its survivors in the slot the clipped
+  region occupied instead of pushing them onto the end.
+- `find_free_va` sorts **only if the list is not already sorted**. The sort is
+  kept rather than replaced by a debug assertion on purpose: a future writer
+  who appends then gets a slow placer, never a wrong one.
+
+**Why this is worth a section.** The placer used to sort the whole list on every
+`mmap`, justified as adaptive-and-therefore-linear on an already-sorted list.
+Both appenders above broke that assumption, and `rustc` interleaves ~53 k
+`munmap`s with ~58 k `mmap`s compiling one small crate: measured in-guest, the
+list averaged **4 400 regions with 18 % of calls arriving out of order**, and
+the sort was **468 µs of a 483 µs `mmap` — 74 % of `rustc`'s entire wall
+clock**. Removing it took an in-guest `cargo build -p zerocopy -j1` from 63 s to
+18.3 s. If you add a writer to a region list, keep it sorted.
+
+The ordering is free for AArch64 rather than a tax: the in-place survivor
+handling shifts the list **less** than the `remove`-and-`push` it replaced.
+
+### `mmap_scale` — placement cost against region count
+
+`userspace/memprobe/c/mmap_scale.c`, one static musl binary for both
+architectures and for Linux (the rule the rest of this family follows). It mmaps
+one page at a time and reports the per-call minimum bucketed by how many
+mappings the process already holds, so a placement cost that is linear in the
+region count shows up as a slope:
+
+```
+/tmp/mmap_scale 4000 3      # regions, repeats; minimum wins
+```
+
+Measured 2026-09-17, Akuma/amd64 under Firecracker: `1 656 ns + 4.02 ns x
+regions_held`, against a Linux line flat at ~930 ns. That residual linearity is
+the first-fit scan itself and is **still open** — a per-address-space cursor is
+the fix, which is what AArch64 already has: the same binary on AArch64 (QEMU
+TCG) is flat at 1 248–1 584 ns over the same 0–3 750 range, slope −0.24
+ns/region. **Compare the shape across kernels, never the nanoseconds** — those
+two arms ran under different hypervisors, and flat-vs-linear is the whole
+finding.
+
+Under TCG the occasional bucket reads 17–24 µs where its neighbours read 1.4 µs:
+that is preemption, not placement. The probe takes the minimum *per bucket*
+across repeats, so a bucket unlucky in every pass keeps its outlier — raise
+`repeat` before believing a lone spike.
+
+**Read its limits before trusting it.** Its grow phase never unmaps, so the list
+it hands the placer is always already sorted — the best case for an adaptive
+sort, and a case a real workload is never in. That is exactly why it priced the
+defect above at 8 µs when it was 468 µs: a probe can reproduce the *shape* of a
+workload and miss its *history*, and be linear, correct and off by 60x.
+
 ## Feature notes
 
 `mem.rs` is always compiled in (no `sc-*` gate; see
@@ -343,3 +407,9 @@ the error-code quirks above, not missing syscalls.
   `sys_mmap`.
 - `archive/BUN_MEMORY_STUDY.md`, `archive/TCC_LOW_MEMORY.md` — per-binary mmap
   behavior studies.
+- `archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §5 and §8 — amd64's
+  first-fit placer: the O(n²) restart (§5) and the per-call sort over a list
+  `munmap` kept re-ordering (§8), which between them were most of an in-guest
+  `rustc`. §8 also documents the `[PSTATS]` traps on amd64 — tick-quantised
+  timings before 2026-09-17, no output at all below `SMP=2`, and syscall
+  numbers counted under two different numbering schemes in the same line.

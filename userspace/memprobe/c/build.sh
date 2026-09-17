@@ -13,14 +13,33 @@
 #   userspace/memprobe/c/build.sh --push-lima  fc    # + push to a Lima VM
 set -euo pipefail
 cd "$(dirname "$0")"
-# Two probes, and the split is deliberate: `mem_op_cost` arms never fault or
-# allocate, `mem_fault_cost` arms do nothing else. Mixing them would put the
-# PMM's variance on top of a decode measurement.
-PROBES="mem_op_cost mem_fault_cost"
+# Three probes, and the split is deliberate: `mem_op_cost` arms never fault or
+# allocate, `mem_fault_cost` arms do nothing else, and `mmap_scale` measures the
+# one thing neither can see — how the cost of a call scales with how many
+# mappings the process already holds. Mixing any two would put one's variance on
+# top of the other's measurement.
+PROBES="mem_op_cost mem_fault_cost mmap_scale"
+# Both architectures, on the `userspace/ext2probe/c/build.sh` pattern and for the
+# same reason: the amd64 kernel is the one these were written to measure, and a
+# probe that only builds for aarch64 cannot be run against it. aarch64 binaries
+# land beside the sources (where they always have); x86_64 ones go in `x86_64/`,
+# so the two never overwrite each other.
+ARCHES="${ARCHES:-aarch64 x86_64}"
 
-for OUT in $PROBES; do
-  aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o "$OUT" "$OUT.c"
-  echo "built $PWD/$OUT ($(wc -c < "$OUT") bytes)"
+for ARCH in $ARCHES; do
+  CC="$ARCH-linux-musl-gcc"
+  if ! command -v "$CC" >/dev/null 2>&1; then
+    echo "note: $CC not found — skipping $ARCH (brew install FiloSottile/musl-cross/musl-cross)" >&2
+    continue
+  fi
+  OUTDIR="."
+  [ "$ARCH" = "x86_64" ] && OUTDIR="x86_64"
+  mkdir -p "$OUTDIR"
+  for OUT in $PROBES; do
+    [ -f "$OUT.c" ] || continue
+    "$CC" -static -O2 -Wall -Wextra -o "$OUTDIR/$OUT" "$OUT.c"
+    echo "built $PWD/$OUTDIR/$OUT ($(wc -c < "$OUTDIR/$OUT") bytes, $ARCH)"
+  done
 done
 
 case "${1:-}" in
