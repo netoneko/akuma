@@ -378,10 +378,31 @@ pub fn init_vfs() {
     // Same formula as the shared path, deliberately not a second policy: the
     // ceiling is `akuma_config::FSCACHE_CEILING_MB` and the RAM term is the
     // PMM's own count, so the two kernels size the cache identically.
+    //
+    // **Bounded by the kernel heap as well as by RAM**, which the shared formula
+    // is not and does not need to be. On AArch64 the block cache is one tenant of
+    // a heap that grows; here it lives inside a *fixed* `mem::HEAP_SIZE`, so
+    // `min(RAM/8, ceiling)` alone let the cache claim 384 MB of 512 MB and left
+    // the rest of the kernel 128 MB. That is fine until something asks for a big
+    // contiguous block: `execve` reads the whole binary into the heap on this
+    // target, and `rust-lld` — the linker the kernel's own build finishes with —
+    // is **158 MB**. Measured 2026-09-18, an in-guest `cargo build -p akuma-amd64`
+    // died at `[ALLOC FAIL] requested=65536 heap_total=512MB heap_used=510MB`
+    // one allocation after `[HEAP] 505MB used (alloc=165777608 bytes)`.
+    //
+    // A quarter of the heap is the bound, so the cache can never be the reason a
+    // large allocation has nowhere to go. It is deliberately *not* expressed as
+    // "leave N bytes free": the thing to protect against is a single request the
+    // size of a linker, and a fraction scales with the heap while a constant
+    // would go stale the moment `HEAP_SIZE` moves.
     {
         let ram_bytes = akuma_pmm::total_count().saturating_mul(4096);
         let ceiling = akuma_config::FSCACHE_CEILING_MB * 1024 * 1024;
-        akuma_ext2::set_cache_cap_bytes(core::cmp::min(ram_bytes / 8, ceiling));
+        let heap_share = crate::mem::HEAP_SIZE / 4;
+        akuma_ext2::set_cache_cap_bytes(core::cmp::min(
+            core::cmp::min(ram_bytes / 8, ceiling),
+            heap_share,
+        ));
     }
 
     akuma_vfs_glue::init();

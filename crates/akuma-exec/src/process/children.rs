@@ -1350,7 +1350,7 @@ pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Pr
 /// `vm_lock` before it can touch a region list.
 pub use akuma_mmap::{
     detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child, insert_region_sorted,
-    region_index_containing,
+    region_index_containing, regions_overlapping,
 };
 
 /// Protection recorded for the **eager** mmap region covering `va`, if any.

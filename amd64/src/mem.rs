@@ -49,7 +49,7 @@ use crate::serial;
 /// bump. The real ceiling is [`PHYSMAP_LIMIT`] (4 GiB — `boot.s` maps only the
 /// first four): using the full 16 GiB needs more page directories there and is
 /// tracked in `docs/archive/AKUMA_SELF_HEALING_PORT.md`.
-const HEAP_SIZE: usize = 512 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 
 const PAGE_SIZE: usize = 4096;
 

@@ -1471,11 +1471,23 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let total_pages = unmap_len / 4096;
     // Compute the eager-membership mask first (vm_lock), so the `as_lock` window below
     // is pure page-table work with no nested lock ordering to reason about.
-    let mut skip = alloc::vec::Vec::with_capacity(total_pages);
-    for i in 0..total_pages {
-        let va = addr + i * 4096;
-        skip.push(proc.vm_with_regions(|r| r.iter().any(|reg| reg.contains(va))));
-    }
+    // One lock hold, and the membership test looks only at the regions that can
+    // overlap this range. It used to take `vm_lock` **per page** and scan the
+    // whole region list inside each hold — O(pages x regions) with a lock
+    // acquire per page, on a list a build-heavy process grows into four figures.
+    // `regions_overlapping` is the sorted invariant's range query; a region
+    // containing a `va` inside this range necessarily overlaps it, so narrowing
+    // to the window cannot change an answer.
+    let skip: alloc::vec::Vec<bool> = proc
+        .vm_with_regions(|r| {
+            let window = akuma_exec::process::regions_overlapping(r, addr, addr + unmap_len);
+            (0..total_pages)
+                .map(|i| {
+                    let va = addr + i * 4096;
+                    window.iter().any(|reg| reg.contains(va))
+                })
+                .collect()
+        });
     let mut to_free = alloc::vec::Vec::new();
     proc.with_address_space(|aspace| {
         for (i, &skipped) in skip.iter().enumerate() {
