@@ -70,22 +70,23 @@
 //! only allocators it has. The pipe hooks were wired in slice 4 and the socket
 //! hooks in slice 7, each at its own field with that argument restated.
 //!
-//! **Three `not_wired!` stubs are left** — it was 16 when the C2 plan was
+//! **One `not_wired!` stub is left** — it was 16 when the C2 plan was
 //! written, seven once `unix_sock_*` wired with `socketpair` (2026-09-12, a
 //! count this header went stale on and stayed at nine through), four once
-//! `eventfd_*`/`epoll_destroy` wired behind `sc-eventfd`/`sc-epoll`, and three
-//! once `pidfd_close` wired behind `sc-pidfd` — and they divide cleanly, each
-//! saying which:
+//! `eventfd_*`/`epoll_destroy` wired behind `sc-eventfd`/`sc-epoll`, three
+//! once `pidfd_close` wired behind `sc-pidfd`, and one once `resolve_file_id`/
+//! `read_at_by_inode` wired for real (2026-09-17, `AKUMA_AMD64_BOX_SPAWN_EXT.md`
+//! — C1 step 4a's mount table made "the subsystem does not exist here" stop
+//! being true, and the panic that reasoning justified started firing for
+//! real the first time something exercised it: `box run` spawning a
+//! demand-paged ELF into a box):
 //!
 //! - **not built for this target** — `rump_socket_clone_ref`. Rump is not
 //!   built for amd64 at all, and never will be by this file's own business.
-//! - **the subsystem does not exist here** — `resolve_file_id` and
-//!   `read_at_by_inode`, which name a file by `(mount id, inode)`; this target
-//!   has one filesystem and no mount table.
 //!
-//! None of the three still says "C2", and that is the point of having gone
-//! through them: a stub whose stated reason is a *step* stops being true when
-//! the step lands, and nothing in the type system notices.
+//! That none of these still says "C2" is the point of having gone through
+//! them: a stub whose stated reason is a *step* stops being true when the
+//! step lands, and nothing in the type system notices.
 //!
 //! **`flock_release` left the list 2026-09-09, and not by being implemented.**
 //! Its stated reason — this target dispatches no `flock(2)` — was true, and
@@ -408,18 +409,29 @@ fn runtime() -> ExecRuntime {
         // partial reads) then behave here as they do on AArch64.
         read_at: |path, off, buf| bkl_free_io(|| crate::fs::read_at(path, off, buf).map_err(|_| -1)),
 
-        // ── still not wired: the **inode**-addressed read surface (C2) ────
-        // These two are the lazy/prefault path and they are a different
-        // question from `read_at` above: they name a file by `(mount id,
-        // inode)`, and this target has no mount table to give an id from —
-        // `KernelFile::new` leaves the inode 0 ("read by path") precisely
-        // because there is one filesystem here. Answering with an invented
-        // pair would be the `[0,0,0,0]` zero-page class of bug, the one case
-        // in this tree where a stub returning `Err` was itself the defect
-        // (`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`). So: panic, and
-        // wire them for real when this target has a mount table to key on.
-        resolve_file_id: |_| not_wired!("resolve_file_id", "no mount table to give an id from"),
-        read_at_by_inode: |_, _, _, _| not_wired!("read_at_by_inode", "no mount table to give an id from"),
+        // ── wired: the **inode**-addressed read surface ───────────────────
+        // These name a file by `(mount id, inode)`, and until C1 step 4a this
+        // target genuinely had no mount table to give an id from — the reason
+        // this pair was `not_wired!` rather than a stub returning `Err`:
+        // answering with an invented pair would be the exact `[0,0,0,0]`
+        // zero-page class of bug PREFAULT_INODE_STUB_ZERO_PAGES.md found on
+        // AArch64, where a *silently wrong* answer here left a zeroed page
+        // installed and never re-checked. A hard panic was the safe half of
+        // that lesson while there was nothing real to answer with.
+        //
+        // C1 step 4a gave this target `akuma_vfs_glue`'s real global mount
+        // table — the same one `mount`/`umount2`/every `*at` syscall this
+        // target folds into glue already resolves paths through
+        // (`AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`) — so there is now a real id
+        // to give, and these forward to the identical, unmodified functions
+        // AArch64 has always used. First real caller found by `box run`
+        // actually spawning a demand-paged ELF image into a box
+        // (`AKUMA_AMD64_BOX_SPAWN_EXT.md`) — nothing on this target had ever
+        // reached this hook before.
+        resolve_file_id: |path| bkl_free_io(|| akuma_vfs_glue::resolve_file_id(path).ok_or(-1)),
+        read_at_by_inode: |path, inode, off, buf| {
+            bkl_free_io(|| akuma_vfs_glue::read_at_by_inode(path, inode, off, buf).map_err(|_| -1))
+        },
 
         // ── wired 5b slice 4 ──────────────────────────────────────────────
         // `akuma-exec` calls this from `clear_child_tid` on process exit —

@@ -194,11 +194,14 @@ pub struct LoadedImage {
 ///
 /// [`akuma_elf::load_elf`] maps every page of every `PT_LOAD` up front.
 /// `load_elf_from_path` would register demand-paged lazy regions instead, and
-/// this target cannot use it: its two file-reading hooks (`read_at`,
-/// `resolve_file_id`) are `exec_runtime.rs` category-3 stubs that panic naming
-/// themselves, and its `#PF` handler pages from `Process::regions`
-/// (`akuma-mmap`) rather than from `akuma-exec`'s lazy-region table. Both are
-/// C2's to fold.
+/// this target still cannot use it — but not for the reason once written
+/// here: both file-reading hooks (`read_at`, wired in C2 slice 7; `resolve_file_id`,
+/// wired 2026-09-17 once C1 step 4a gave this target a real mount table to key
+/// on — `AKUMA_AMD64_BOX_SPAWN_EXT.md`) are real now, not `exec_runtime.rs`
+/// stubs. What is still true is that this target's own `#PF` handler pages
+/// from `Process::regions` (`akuma-mmap`), not from `akuma-exec`'s lazy-region
+/// table — the two file-reading hooks were never the only thing blocking this,
+/// and fixing them alone does not unblock it.
 pub fn load(image: &[u8]) -> Result<(UserAddressSpace, LoadedImage), &'static str> {
     let loaded = akuma_elf::load_elf::<UserAddressSpace>(image, None).map_err(|e| elf_err(&e))?;
 
