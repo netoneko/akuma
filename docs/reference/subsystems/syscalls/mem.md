@@ -430,6 +430,28 @@ sort, and a case a real workload is never in. That is exactly why it priced the
 defect above at 8 µs when it was 468 µs: a probe can reproduce the *shape* of a
 workload and miss its *history*, and be linear, correct and off by 60x.
 
+## Cache caps live inside the kernel heap on amd64
+
+A rule that is a property of the **amd64** kernel and not of the AArch64 one, so
+it is easy to port a formula across and get it wrong: on amd64 the kernel heap is
+a fixed `mem::HEAP_SIZE` (512 MB), carved once at boot. Anything sized as a
+fraction of *RAM* is therefore sized against the wrong quantity — `min(RAM/8,
+FSCACHE_CEILING_MB)` gives the ext2 block cache 384 MB of that 512 MB on a 6 GB
+guest, and leaves 128 MB for the rest of the kernel.
+
+That matters because `execve` on this target holds the **whole binary** in one
+heap allocation while it loads (it reads in 64 KiB chunks and reserves fallibly,
+but the reservation is the full file). `rust-lld` is 158 MB, so an in-guest
+`cargo build` of the kernel died at `[ALLOC FAIL] requested=65536
+heap_total=512MB heap_used=510MB` one allocation after the exec image was
+reserved.
+
+So the ext2 cap is `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)`. **If you add
+another heap-resident cache here, bound it against `HEAP_SIZE` too** — a
+fraction, not a "leave N bytes free" constant, so it tracks the heap if that
+moves. The streaming-`execve` fix that would remove the need for the headroom is
+not done: `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §10.
+
 ## Feature notes
 
 `mem.rs` is always compiled in (no `sc-*` gate; see

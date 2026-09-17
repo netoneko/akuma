@@ -484,11 +484,11 @@ boot+probe+teardown inside one shell invocation. Raw logs:
 1. ~~CR3-skip~~, ~~futex hlt~~, ~~netpoll/allow_tick BKL~~ — **landed, see
    above**. The FC guest runs the fixed kernel; the pre-fix binary is kept as
    `akuma-amd64.pre-c3skip`.
-2. **Root-cause the `-j4` silent wedge and its kill-class precursor**
-   (open item above; the original `#UD`/OOM shape is fixed — causes 1 and 2).
-   It still gates re-timing: the aarch64 self-host baseline (44 s clean
-   build) had four cores, and this run shows SMP builds are survivable but
-   not yet dependable.
+2. **Root-cause the `-j4` silent wedge** — **the top open item, and now the
+   only thing between here and a fast in-guest kernel build** (§10). The
+   "kill-class precursor" framing is retired: the 2026-09-18 capture has no kill
+   at all, an idle vCPU, and two `rustc` processes present at `0:00` CPU that
+   were never scheduled. Read §10 before the older account here.
 3. ~~**Attribute the rest in-guest** with the new PSTATS counters~~ — **done,
    §8.** Read that section's "`[PSTATS]` first had to stop being a sampler"
    before trusting any earlier `[PSTATS]` number in this doc: the timings were
@@ -1355,6 +1355,115 @@ append-healing guard). Clippy clean on both kernels and on `akuma-mmap`.
   measured syscall and fault budget is ~2 s.
 - `munmap` still carries a TLB-shootdown IPI per call at SMP>1 — 13.2 us against
   1.97 us at SMP=1, measured on the same kernel.
+
+
+### 10. The full kernel build: two blockers found, one fixed (2026-09-18)
+
+*§9 got `zerocopy` to 13.2 s. The goal behind it is the whole in-guest kernel
+build, and pointing the rig at that turned up three things — one of them a rig
+defect that had been quietly making the measurement impossible.*
+
+#### The guest's own source tree did not compile
+
+`cargo build -p akuma-amd64` in the guest failed with two `E0425`s:
+`lapic.rs:174` calling `crate::sched::note_tick_sample` and `net.rs:828` calling
+`crate::sched::tick_profile`, neither of which exists in the guest's `sched.rs`.
+
+Not a code bug — a **partially synced tree**. `/src/akuma/amd64/src/lapic.rs`
+was dated 2026-09-17 and `sched.rs` 2026-09-12: an earlier session copied some
+amd64 sources into the image and missed one. Every `-j4` run in this doc stopped
+short of `akuma-amd64` itself (the wedge, or a crash, came first), so nothing
+had ever compiled the kernel crate in there and the breakage stayed invisible.
+
+Repaired by mounting the image with the guest down and `rsync -a --exclude
+vendor` of `amd64/` and `crates/` from the box's tree (~12 MB). **`rsync -a`
+preserves mtimes, which is what you want here**: cargo then rebuilds only the
+crates whose contents actually changed, instead of the whole graph.
+
+The lesson is the one `docs/` already carries about partial copies, in a new
+place: *the image is a build input, and it drifts*. If an in-guest build fails
+with a missing symbol, suspect the image before the code.
+
+#### FIXED: the ext2 block cache was sized against RAM, inside a fixed heap
+
+With the tree buildable, `-j1` died:
+
+```
+[HEAP] 505MB used (alloc=165777608 bytes)
+[ALLOC FAIL] requested=65536 heap_total=512MB heap_used=510MB (99%) peak=510MB
+[OOM] allocation of 65536 bytes failed
+```
+
+`165 777 608` is exactly the size of
+`/usr/local/rust/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld` — the
+linker the kernel's own build finishes with. **`execve` on this target holds the
+whole image in one kernel-heap `Vec`.** It reads it in 64 KiB chunks and
+reserves it fallibly (`try_reserve_exact`, see `fs.rs`'s "exec-side image read"),
+so the 158 MB reservation itself succeeded; what failed was the next 64 KB
+allocation after it.
+
+It had room to fail because of §7's cache change. `akuma-ext2`'s cap was set to
+`min(RAM/8, FSCACHE_CEILING_MB)` — correct on AArch64, where the heap grows, and
+wrong here, where the heap is a fixed `mem::HEAP_SIZE` of 512 MB. At 6 GB of
+guest RAM that formula gives **384 MB of cache inside a 512 MB heap**, leaving
+128 MB for everything else including a 158 MB exec.
+
+The cap now also takes `HEAP_SIZE / 4`. A fraction rather than "leave N bytes
+free", because the thing being protected against is a single request the size of
+a linker, and a constant would go stale the first time `HEAP_SIZE` moved.
+
+**The underlying defect is still open**: `execve` should stream `PT_LOAD`
+segments into user pages rather than hold the whole file. The cap makes a 158 MB
+binary fit; a 400 MB one would not, and `librustc_driver.so` in this very image
+is 311 MB (it is `mmap`ped lazily, not exec'd, which is why it does not blow up
+today).
+
+#### Result: the kernel builds itself again
+
+`cargo build -p akuma-amd64 --target x86_64-unknown-none --release --offline
+-j1`, FC 1 vCPU / 6144 MB, **incremental** (3 crates — the ones the re-sync
+actually changed): **1 m 18 s, rc=0**. That is the first time this doc records
+the amd64 kernel crate compiling in-guest at all.
+
+#### Still open, and it is the thing between here and a fast build: the `-j4` wedge
+
+Reproduced on the current kernel at SMP=4 `-j4`: all progress stops after ~27
+crates, ~4 minutes in. The new capture **contradicts the one in § "The `-j4`
+verification run"**, which blamed a `#GP`/SIGSEGV kill pair and cargo waiting on
+a child that had died:
+
+- **The guest vCPU is 7 % busy** over a 21 s host-side sample. Nothing is
+  running; this is not a livelock or a slow crate.
+- **The children are still there.** `ps` shows `rustc --crate-name
+  akuma_primitives` (pid 69) and a `zerocopy` build script (pid 71), both at
+  **`0:00` CPU** — created and never scheduled. `cargo` itself has 0:14 and is
+  waiting.
+- **No kill of any kind**: no `#GP`, no `#UD`, no SIGSEGV, no "killed by
+  signal", no `[PANIC]`, no `[BKL] stuck`, no OOM.
+- The only console output is a `[TRAMP-MISMATCH]` burst, every line naming
+  `tid=14` and `table scan found 69` — the stuck `rustc` — while the
+  `THREAD_PID_MAP=` value climbs with each newly created process.
+
+So the shape is **a process that exists but is never scheduled**, not a process
+that died unnoticed. `SMP=1`/`-j1` does not reproduce it.
+
+This is what gates a fast in-guest kernel build: `-j1` is reliable and slow,
+`-j4` is the only way to a ten-minute build, and it wedges.
+
+#### SMP costs money when the jobs do not use it
+
+`zerocopy` `-j1` on the fixed kernel, min of 3, same image and kernel, only
+`vcpu_count` changed:
+
+| SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|
+| **13.24 s** | 13.80 s | 16.62 s |
+
+**+26 % at SMP=4 for a single-job build.** The extra cores do no work and cost
+real time: a TLB-shootdown IPI per `munmap` (`mmap_scale` on the same kernel
+puts the `munmap` floor at 1.97 µs at SMP=1 against 13.2 µs at SMP=2) plus BKL
+contention. Worth knowing before reading any SMP>1 number in this doc as a
+regression.
 
 
 ## Background

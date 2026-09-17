@@ -143,6 +143,19 @@ pub fn unregister_process(pid: Pid) -> bool {
                     crate::safe_print!(112, "[unregister] pid={} stale tid={} now owned by pid={}\n",
                         pid, tid, slot_owner.unwrap_or(0));
                 }
+                // TEMPORARY (2026-09-18): the `None` arm, which is the one that
+                // terminates silently. The comment above argues a missing entry
+                // means "nobody has claimed it" — true on AArch64, where the slot
+                // recycler evicts the map entry. **amd64 claims a TERMINATED slot
+                // directly (`x86_claim_slot`) and does not insert into the map
+                // until publish**, so between claim and publish a live, freshly
+                // claimed slot also reads `None` here — and this terminates it.
+                // Suspected root cause of the `-j4` wedge; this names the killer.
+                if slot_owner.is_none() && tid != crate::threading::current_thread_id() {
+                    crate::safe_print!(112,
+                        "[unregister] pid={} tid={} has NO map owner — terminating anyway\n",
+                        pid, tid);
+                }
                 if tid != current_tid && !recycled {
                     crate::threading::mark_thread_terminated(tid);
                 }

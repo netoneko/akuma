@@ -902,6 +902,15 @@ pub fn idle_loop() -> ! {
                     .is_ok()
             {
                 akuma_exec::process::dump_running_process_stats();
+                // TEMPORARY (2026-09-18): is the `-j4` wedge an orphaned process —
+                // registered and ACTIVE with no live thread, so unschedulable,
+                // unable to exit and never reaped, with its parent's `wait4`
+                // blocked forever? That state is what `table.rs`'s
+                // "Terminating a recycled slot" note describes, and the wedge
+                // matches it exactly: two `rustc` at 0:00 CPU, an idle vCPU and
+                // no crash line. The hook is registered on this target already
+                // and had no reader here, so this is the whole cost of asking.
+                akuma_exec::process::dump_orphan_processes();
             }
         }
         if !threading::x86_yield() {
