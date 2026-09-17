@@ -2977,6 +2977,12 @@ pub fn x86_adopt_running_thread(slot: usize) {
     ON_CPU[slot].store(1, Ordering::SeqCst);
     WAKE_TIMES[slot].store(0, Ordering::SeqCst);
     WOKEN_STATES[slot].store(false, Ordering::SeqCst);
+    // Give this thread a `start_time_us` from the moment it becomes the
+    // running one, same reason as the stamp in `x86_yield_now`: without it, a
+    // thread that is never switched OUT before something reads its CPU time
+    // (or whose first switch-out would otherwise bill from a stale/zero
+    // start) undercounts its very first slice.
+    POOL.lock().slots[slot].start_time_us = (runtime().uptime_us)();
     // No generation bump: an adopted thread is a boot or idle thread, and
     // [`SLOT_GEN`]'s own contract is that slots which never recycle stay at
     // generation 0 forever, so a handle minted for one always validates.
@@ -3244,6 +3250,25 @@ fn x86_yield_now() -> bool {
             idle
         }
     };
+
+    // CPU-time accounting — this arch's arm of what `commit_switch` does for
+    // the generic path (bill `cur`'s elapsed slice into `TOTAL_CPU_TIMES`,
+    // stamp `next`'s `start_time_us`), under the same `POOL` lock
+    // `get_thread_cpu_time`'s live-delta read already takes. Without this,
+    // `x86_yield_now` was the *only* switch path on this target and never
+    // touched `start_time_us` at all: `TOTAL_CPU_TIMES` never accumulated and
+    // the live-delta branch had no start to measure from, so `/proc/<pid>/
+    // stat`'s `utime` (field 14 — what `ps`'s TIME column reads) read 0 for
+    // every amd64 process regardless of how long it had actually run.
+    {
+        let now = (runtime().uptime_us)();
+        let mut pool = POOL.lock();
+        let start = pool.slots[cur].start_time_us;
+        if start > 0 {
+            TOTAL_CPU_TIMES[cur].fetch_add(now.saturating_sub(start), Ordering::Relaxed);
+        }
+        pool.slots[next].start_time_us = now;
+    }
 
     // Only demote a thread that is actually running. A WAITING or TERMINATED
     // one keeps its state — that is the whole reason it is being switched out.

@@ -443,6 +443,154 @@ guest never idles into the `[PSTATS]` sweep).
    (e.g. `futex` cannot be seeded until `WAITERS` stops naming the BKL as its
    safety argument) — only pays at SMP>1, after item 2.
 
+## Continued 2026-09-17 (later the same day): the clock, the block double-copy, and CPU-time accounting
+
+*Investigation continued on `vaporwave` (the Firecracker host) after the fold
+above. Four fixes landed, all in the shared crates both kernels build from
+(`crates/akuma-virtio`, `crates/akuma-threading`) or amd64-only
+(`amd64/src/lapic.rs`, `amd64/src/net.rs`). A fifth item — a new wedge class,
+distinct from the `-j4` one above — was found and is OPEN, not fixed.*
+
+### 1. The clock was never calibrated on `microvm`, and the guess could be off by up to 6x
+
+`lapic::calibrate` measured PIT channel 2's gate/output through legacy port
+`0x61` — board glue, not part of the 8254 itself. QEMU's `microvm` machine
+instantiates an `isa-pit` (`info qtree`: ports 0x40/0x43) but nothing answers
+0x61, so `pit_present()` always failed there and `calibrate` never ran. Every
+timeout on that machine — and every `clock_gettime` — ran on the hardcoded
+`UNCALIBRATED_COUNT` guess, which `start_timer`'s own doc already flagged as
+"~1.6 ms on a KVM guest whose APIC is nominally 1 GHz and ~16 ms on this
+machine's 100 MHz bus. One clock ran 6x fast, the other 1.6x slow, and both
+called it 10 ms."
+
+Fixed by switching calibration to PIT **channel 0**: it is hardwired always-on
+(no gate needed), and the 8254's own read-back command (`0xE2` on the command
+port, decoded in `lapic.rs`) latches a channel's status — OUTPUT bit included
+— onto the data port. That is standard 8254 behaviour, not board glue, so it
+works on `microvm`, on real hardware, and needs no port-0x61 equivalent at
+all. One bug on the way: the first version of the read-back command byte had
+bits 5/4 (count-latch / status-latch) inverted, which *looked* calibrated
+(`CALIBRATED=true`, a plausible-sounding "10 MHz" APIC bus) but was polling a
+live decrementing count register, not a status bit — caught immediately by
+the kernel's own `clock_rate_check` self-test (`lapic: ticks per 50ms (expect
+5) 0` — the exact class of bug that self-test exists to catch). Fixed byte:
+`0b1110_0010`. Verified: LAPIC and TSC both calibrate to **997 MHz** (matches
+the "~1 GHz on a KVM-class guest" the docs already expected), the 50 ms
+cross-check reports exactly 5 ticks, all 747 boot self-tests pass.
+
+### 2. `clock_gettime` moved from 10 ms ticks to TSC resolution
+
+`net::uptime_us()` — what `clock_gettime`, `nanosleep`, futex deadlines and
+every network timeout derive from — was `lapic::ticks() * 10_000`, one LAPIC
+timer IRQ per reading. Now that the TSC is genuinely calibrated (above), it
+reads `lapic::tsc_uptime_us()` first (an `rdtsc` delta scaled by the measured
+Hz, in `u128` to avoid overflow) and falls back to the old tick counter only
+when no PIT was found — the target `usermode.rs`'s own self-test named as the
+`60 s + 45 s` reason a fault-cost probe "is not run, it is not *runnable*":
+"TSC has the resolution the tick clock lacks, and the kernel is where the TSC
+is reachable." `userspace/ext2probe/c/read_syscall_cost` on amd64 went from
+tick-quantized noise (100 µs steps, scaled ~6x wrong per #1) to real numbers:
+`getpid` ~1.1 µs, a 0-byte `read` ~470 ns (the syscall floor), a 4 KiB `read`
+~12-14 µs. All 747 self-tests still pass, including the one that checks
+`clock_gettime` agrees with the kernel's own clock within one tick.
+
+### 3. `read_bytes`/`write_bytes` did an unconditional allocate-and-copy — this doc's own item 4, lever 1
+
+`crates/akuma-virtio/src/block.rs`'s `read_bytes`/`write_bytes` always
+allocated a temp sector-aligned buffer, read/wrote through it, then copied
+into/out of the caller's buffer — even when the caller's `offset` and `len`
+were already sector-aligned, which is **every** ext2 call site: `block_size`
+is 4096, a multiple of `SECTOR_SIZE` (512), so `ext2.rs`'s hot read-fill path
+(`disk_offset`/`run_bytes`, both `block_size` multiples) always qualified.
+`write_bytes` had the worse version of the same bug: a full read-modify-write
+— including the **read** — for a write that replaces the sector wholesale.
+Fixed with a fast path (`offset`/`len` both sector-multiples → straight
+`read_sectors`/`write_sectors` on the caller's buffer, no allocation, no
+extra copy, and for writes no read at all) ahead of the existing slow path,
+which stays for genuinely misaligned callers. Shared code — `akuma-vfs-glue`'s
+`KernelBlockDevice` (both kernels' `BlockDevice` impl for ext2) calls straight
+into it, and `akuma-vfs-glue` is a dependency of the root `akuma` (aarch64)
+package too, confirmed via `Cargo.toml`.
+
+Caveat on verification: `read_syscall_cost`'s own before/after numbers showed
+no difference, and that is expected, not a failed fix — the probe warms the
+file with four full passes before timing anything, so every measured read is
+an **ext2 block-cache hit** and never reaches `read_bytes` at all. The fix
+pays off on the *cold* path (first touch of each block), which is most of
+what a build's "open a source file, open an rlib" pattern is. A clean A/B on
+the **write** side (no warm-cache confound — every `dd`-written block is new)
+did show it: `dd bs=4096 count=2000` (2000 aligned 4 KiB writes) went from
+9.1-9.6 MB/s (3 runs, pre-fix) to 16.1 MB/s (post-fix) on the local `microvm`
+rig.
+
+### 4. `ps`/`top`'s CPU time was not "10 ms-quantized" as a prior doc said — it was exactly, permanently zero
+
+`docs/archive/AKUMA_AMD64_STREAMLINING.md` records amd64 `/proc` CPU-time
+figures as "quantized"; that is no longer what's true, and may never have
+been on the thread-heavy path this build exercises. Direct read of
+`/proc/<pid>/stat` field 14 (`utime` — what `ps`'s TIME column shows) on a
+process alive 9+ minutes read **0**, for every process, always.
+
+Root cause: `crates/akuma-threading/src/lib.rs`'s `x86_yield_now` — the
+**only** context-switch path on this target — never touched
+`TOTAL_CPU_TIMES` or a slot's `start_time_us`. Both are written by
+`commit_switch`, the generic (aarch64) switch path's equivalent step; the
+x86-64 arch-hooks path (`x86_claim_slot`/`x86_publish`/`x86_yield`/
+`x86_adopt_running_thread`, added for this target's cooperative scheduler)
+duplicates everything else `commit_switch` does — `ON_CPU`, `THREAD_STATES`,
+the picked-next dance — but was never given this half. So `TOTAL_CPU_TIMES`
+never accumulated, and `get_thread_cpu_time`'s "still running, add time since
+`start_time_us`" branch never fired because `start_time_us` was never set
+either — the `if start_time > 0` guard skipped it, silently, forever.
+
+Fixed by adding the same two steps `commit_switch` does, at the same two
+points: `x86_yield_now` bills the outgoing thread's elapsed slice into
+`TOTAL_CPU_TIMES` and stamps the incoming thread's `start_time_us`, under the
+same `POOL` lock `get_thread_cpu_time`'s read side already takes;
+`x86_adopt_running_thread` (the boot/idle-thread bootstrap path) stamps its
+own `start_time_us` too, so a thread that never gets switched out before
+something reads its CPU time doesn't undercount its first slice. Verified on
+the local `microvm` rig: `/proc/1/stat` utime went from `0` to `1` (one
+jiffy) after boot; a `busybox yes` loop run for 3 real seconds showed **300**
+jiffies (exactly 3.00 s) via direct `/proc` read, and `ps`'s own TIME column
+correctly rendered `0:03` — both were unconditionally `0:00` before. This is
+architecture-neutral code in a shared crate; the aarch64 build was rebuilt
+clean afterward and is unaffected (the new code is
+`#[cfg(target_arch = "x86_64")]`-gated).
+
+### 5. OPEN: a new wedge class at `vcpu_count=1`, `-j1` — distinct from the `-j4` one above
+
+Attempting to re-time the in-guest self-host build (Firecracker, `vcpu_count:
+1`, `mem_size_mib: 6144`, deliberately matching this doc's own "1-vCPU
+anchor" methodology to avoid the `-j4` SMP wedge) with fixes #1-#4 applied:
+`cargo build --release -p akuma-amd64 --target x86_64-unknown-none -j1
+--offline` compiled 19 of 90 crates in ~9 minutes, then stopped making
+forward progress entirely while compiling `zerocopy` — a small crate that
+compiles in seconds on every other target. Three `ps`-visible rows for that
+one `rustc --crate-name zerocopy` invocation (pids 277/279, plus 278 tagged
+`{ctrl-c}` — rustc's own internal Ctrl-C-watcher thread, reported as a
+**separate `Tgid`** rather than a thread inside 277's, which may itself be a
+real divergence worth checking against how this target's `clone()` maps
+`CLONE_THREAD`) sat at the **same three PIDs, `State: R (running)`, zero
+`build.log` growth** across every check spanning 15+ minutes. No panic, no
+`[Fault]`, no `memwatch-at-kill` anywhere near the stall point in
+`/root/akuma-fc.log` on the host; the `[TRAMP-MISMATCH]` lines in that log
+are all earlier (lines 1183-1268 of 1996), timestamped to ordinary exec churn
+from the ~19 crates that *did* compile, not to the stall.
+
+Two things distinguish this from the documented `-j4` wedge: it is `-j1` /
+single vCPU (no SMP contention to invoke), and `zerocopy` is very likely the
+**first** crate in this dependency graph large enough for rustc to spawn
+parallel codegen-unit worker threads — i.e., possibly the first *genuinely
+multi-threaded* (not multi-process) rustc invocation this specific kernel
+build has ever run to completion. If so, the bug is more likely in
+thread-level (not process-level) synchronization — a futex/condvar wake path
+between rustc's own worker threads — rather than anything fork/exec-shaped.
+Not chased further this session; the FC guest was left running rather than
+killed, in case a live low-level trace becomes possible later. A fresh boot
+with the fixes above and a normal `cargo clean && cargo build` trial is the
+fallback if this needs to be un-blocked without solving it.
+
 ## Background
 
 - `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — the self-host bring-up stages.
