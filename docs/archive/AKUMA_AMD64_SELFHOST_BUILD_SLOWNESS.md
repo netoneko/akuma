@@ -8,6 +8,14 @@ crates with flat memory but still ends in a silent wedge behind a residual
 ring-3 kill pair, and the build remains slow (rustc ≈44 % of wall
 in-kernel, dominated by `read`) — see "The `-j4` verification run" and
 "Iterate" below.*
+*Continued 2026-09-17: four more fixes landed (PIT calibration off the
+port-`0x61` glue `microvm` lacks, TSC-resolution `clock_gettime`, the
+virtio-blk allocate-and-copy on every aligned read/write, and per-process
+CPU time that was unconditionally zero on this target) — see "Continued
+2026-09-17" below. Re-timing hit a NEW, distinct, root-caused-but-unfixed
+wall: `mmap` placement is O(n²) in the region count, so a process doing many
+small mmaps (rustc's own allocator) crawls to a halt once it accumulates
+roughly four figures of regions — §5 of that section.*
 
 ## Question
 
@@ -558,7 +566,7 @@ architecture-neutral code in a shared crate; the aarch64 build was rebuilt
 clean afterward and is unaffected (the new code is
 `#[cfg(target_arch = "x86_64")]`-gated).
 
-### 5. OPEN: a new wedge class at `vcpu_count=1`, `-j1` — distinct from the `-j4` one above
+### 5. OPEN: `find_free_va` is O(n²) per `mmap` call, and a process with ~1000+ regions crawls to a halt
 
 Attempting to re-time the in-guest self-host build (Firecracker, `vcpu_count:
 1`, `mem_size_mib: 6144`, deliberately matching this doc's own "1-vCPU
@@ -566,30 +574,50 @@ anchor" methodology to avoid the `-j4` SMP wedge) with fixes #1-#4 applied:
 `cargo build --release -p akuma-amd64 --target x86_64-unknown-none -j1
 --offline` compiled 19 of 90 crates in ~9 minutes, then stopped making
 forward progress entirely while compiling `zerocopy` — a small crate that
-compiles in seconds on every other target. Three `ps`-visible rows for that
-one `rustc --crate-name zerocopy` invocation (pids 277/279, plus 278 tagged
-`{ctrl-c}` — rustc's own internal Ctrl-C-watcher thread, reported as a
-**separate `Tgid`** rather than a thread inside 277's, which may itself be a
-real divergence worth checking against how this target's `clone()` maps
-`CLONE_THREAD`) sat at the **same three PIDs, `State: R (running)`, zero
-`build.log` growth** across every check spanning 15+ minutes. No panic, no
-`[Fault]`, no `memwatch-at-kill` anywhere near the stall point in
-`/root/akuma-fc.log` on the host; the `[TRAMP-MISMATCH]` lines in that log
-are all earlier (lines 1183-1268 of 1996), timestamped to ordinary exec churn
-from the ~19 crates that *did* compile, not to the stall.
+compiles in seconds on every other target. The three `ps`-visible rows for
+that one `rustc --crate-name zerocopy` invocation (pids 277/279, plus 278
+tagged `{ctrl-c}` — rustc's own internal Ctrl-C-watcher thread, reported as
+a **separate `Tgid`** rather than a thread inside 277's, which may itself be
+a real divergence worth checking against how this target's `clone()` maps
+`CLONE_THREAD`) sat at the same three PIDs, `State: R (running)`, zero
+`build.log` growth across every check spanning 15+ minutes. No panic, no
+`[Fault]`, no `memwatch-at-kill` anywhere near the stall point.
 
-Two things distinguish this from the documented `-j4` wedge: it is `-j1` /
-single vCPU (no SMP contention to invoke), and `zerocopy` is very likely the
-**first** crate in this dependency graph large enough for rustc to spawn
-parallel codegen-unit worker threads — i.e., possibly the first *genuinely
-multi-threaded* (not multi-process) rustc invocation this specific kernel
-build has ever run to completion. If so, the bug is more likely in
-thread-level (not process-level) synchronization — a futex/condvar wake path
-between rustc's own worker threads — rather than anything fork/exec-shaped.
-Not chased further this session; the FC guest was left running rather than
-killed, in case a live low-level trace becomes possible later. A fresh boot
-with the fixes above and a normal `cargo clean && cargo build` trial is the
-fallback if this needs to be un-blocked without solving it.
+**Root cause, found by reading `/proc/277/maps` and the placement code it
+came from.** `/proc/277/maps` itself is the tell: a bounded 64 KB read came
+back in under a second with **1,524 lines** (mostly individual 4 KiB `rw-p`
+regions — one `mmap` per small allocation from rustc's own arena/bump
+allocator), but a 2 MB read (~46k lines, ~30x more data) never returned at
+all inside a 30 s budget — not proportionally slower, catastrophically
+slower. `find_free_va` (`amd64/src/mm.rs:207`, first-fit placement for every
+`mmap`) explains why: its own doc comment says the outer retry loop
+"terminates in at most one pass per region," which is true and also
+incomplete — each of those up-to-`n` outer passes re-scans the **entire**
+`regions` slice from the top (`for r in regions` inside `'outer: loop`), so a
+single `mmap` call against `n` scattered regions costs **O(n²)**, not O(n).
+`/proc/<pid>/maps` rendering walks the same flat, unsorted
+`Vec<MmapRegion>` (`crates/akuma-mmap/src/region.rs`) to format each line,
+which is why reading the file inherits the same blowup. Build progress
+matches exactly: fast and steady while every process's region count was
+small (19 crates in ~9 minutes), then a hard wall the moment one process
+(zerocopy's `rustc`, doing enough small individual allocations to reach
+four-digit region counts within its own address space) crossed into "every
+subsequent `mmap` costs proportional to everything already accumulated."
+Nothing is deadlocked; every call is still completing, just at cost growing
+quadratically with a count that only ever grows for a process like `rustc`.
+
+**Not fixed this session, and deliberately not attempted under time
+pressure.** The real fix is a data-structure change — `akuma-mmap`'s region
+list is a flat, intentionally-unsorted `Vec` everywhere (placement,
+`/proc/maps` rendering, almost certainly `munmap`'s clip-and-split too; see
+the "why no sort" comment at `mm.rs:198` for why it was chosen that way), and
+real Linux uses a red-black/interval tree for exactly this reason (O(log n)
+placement). This crate is shared between both kernels, so the fix needs
+testing on both architectures before it can be trusted — a dedicated session,
+not a tail end of this one. The FC guest was left running rather than killed,
+in case a live low-level trace becomes useful before it is un-wedged. A fresh
+boot with fixes #1-#4 and a normal `cargo clean && cargo build` trial is the
+fallback to get a real timing number without waiting on this fix.
 
 ## Background
 
