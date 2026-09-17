@@ -832,9 +832,9 @@ Linux. Same binary, both under QEMU TCG, SMP=1, 2048 MB, 2 MiB working set:
 | **list_dir** | **1 164** | **7 265** | **0.16x** |
 | delete | 6 426 | 11 437 | 0.56x |
 
-amd64 is faster on every op, including both claimed outliers. **RETRACTED as a
-measurement — do not quote these numbers.** Three defects, any one of which is
-disqualifying:
+amd64 is faster on every op, including both claimed outliers. **That first run
+is RETRACTED as a measurement — quote the clean rerun below instead.** Three
+defects, any one of which is disqualifying:
 
 1. **The arms were not run under the same conditions.** Another agent's QEMU —
    at times a 4-vCPU TCG guest on an 8-performance-core host — was running
@@ -845,14 +845,80 @@ disqualifying:
    `init=`); the amd64 arm ran as init with nothing else in the guest.
 3. **One sample each**, on a workload whose fastest phase is a millisecond.
 
-What survives is only the negative claim, and it survives because it does not
-depend on the magnitudes: a same-binary run does not reproduce anything like
-15x, in either direction, so **the 15x/6.4x is not a property of the read
-path** and no fix should be aimed at it. Establishing what the real ratio is
-needs a quiet host, matched guest environments (run the amd64 arm through `ssh`
-too), and interleaved repeats reported as a minimum rather than a single
-sample — `min` being the right statistic when the noise is other people's CPU
-load, which can only ever add.
+#### The clean rerun — quiet host, five passes, minimum per op
+
+Re-run with the host free of other guests and `--repeat=5`, taking the
+**minimum** across passes. `min` is the right statistic when the noise is other
+load on the machine: contention can only ever *add* time, so the fastest pass is
+the one least contaminated. (The probe repeats internally because a second
+sample would otherwise cost a whole reboot — this kernel has no `init=` on the
+AArch64 side and its amd64 `sshd` answers only its own staged key.)
+
+| op | amd64 | aarch64 | ratio |
+|---|---|---|---|
+| create | 13 828 us | 16 668 us | 0.83x |
+| seq_write | 110 992 | 124 550 | 0.89x |
+| seq_read_cold | 6 118 | 16 190 | 0.38x |
+| **seq_read_warm** | **6 228** | **10 689** | **0.58x** |
+| **list_dir** | **305** | **423** | **0.72x** |
+| delete | 6 297 | 7 548 | 0.83x |
+
+**The 15x and the 6.4x do not reproduce.** amd64 is faster or comparable on
+every op. One asymmetry remains and is stated rather than corrected — the
+aarch64 arm still runs through `ssh` with `herd` and `sshd` on its one vCPU —
+but it biases *against* aarch64, so the negative claim is safe even if the
+margins are not: nothing here is a read-path defect to fix.
+
+**`list_dir` has a warm-up swing that dwarfs the cross-architecture difference**,
+and it is the reason a single sample cannot be trusted for this op at all:
+aarch64 runs 7 006 us on pass 1 and 423 us by pass 3 — **16.6x** — while amd64
+goes 1 189 -> 305 (3.9x). Any one-shot comparison of `list_dir` is measuring
+which pass each side happened to be on.
+
+#### Four execution modes, and what TCG was hiding
+
+Same binary, `--repeat=5`, minimum per op. Two of these are emulated and two
+are not, which turns out to matter far more than the architecture does.
+
+| op | amd64 TCG | amd64 **KVM** (Firecracker, the box) | aarch64 TCG | aarch64 **HVF** (Mac) | aarch64 **KVM** (Lima) |
+|---|---|---|---|---|---|
+| create | 13 828 | **5 056** | 16 668 | 42 918 | 330 044 |
+| seq_write | 110 992 | **35 388** | 124 550 | 549 587 | 3 578 553 |
+| seq_read_cold | 6 118 | **874** | 16 190 | 1 209 | 6 444 |
+| seq_read_warm | 6 228 | **867** | 10 689 | 4 907 | 6 368 |
+| list_dir | 305 | **84** | 423 | 82 | 205 |
+| delete | 6 297 | **2 266** | 7 548 | 35 233 | 166 341 |
+
+Two findings, and the second is the one worth chasing:
+
+1. **amd64 behaves correctly under acceleration.** Every op is faster on KVM
+   than on its own TCG run — 2.7x (create), 3.1x (seq_write), 2.8x (delete),
+   3.6x (list_dir), 7.2x (seq_read). That is what a healthy path looks like when
+   the CPU stops being emulated. Firecracker's variance across five passes is
+   under 10 %, the tightest of any arm here.
+
+2. **aarch64 writes get SLOWER the less emulated the machine is, and reads do
+   not.** `seq_write` goes 124 550 (TCG) -> 549 587 (HVF) -> 3 578 553 (KVM);
+   `create` and `delete` move the same way, while `seq_read` and `list_dir`
+   speed up normally. A path that gets *worse* when the CPU gets ~50x faster is
+   not CPU-bound — it is waiting on wall-clock, and the HVF arm works out at
+   **~1.07 ms per 4 KiB write and ~1.4 ms per unlink**, which is the shape of a
+   synchronous device round-trip per operation. Under TCG the guest is slow
+   enough that the completion has always already happened, so the wait never
+   shows up. **This is an aarch64 write-path finding, not an amd64 one**, and it
+   is invisible to every TCG-based measurement in this document.
+
+Caveats that must travel with the table. The two accelerated arms are on
+**different hardware** (an HP x86 box vs an Apple M-series), so the amd64-KVM
+column and the aarch64-HVF/KVM columns cannot be compared to each other as
+architectures — only each column against its own TCG arm, which is what both
+findings above do. The Lima column is additionally confounded: `lima_aarch64_run.sh`
+mounts the image `snapshot=on` over a read-only host mount, so its writes go to
+an overlay and its absolute numbers are not a clean measure of anything. The HVF
+arm has no such overlay and shows the same direction, which is why finding 2
+rests on HVF rather than Lima. The HVF arm also runs a `no-tests` kernel —
+HVF asserts partway through this kernel's boot suite (`QEMU_HVF_ISV_BUG.md`), so
+there was no choice; the filesystem path is identical either way.
 
 Two traps worth keeping, both of which produce a confident wrong table:
 

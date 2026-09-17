@@ -53,6 +53,13 @@
 static char chunk[SEQ_CHUNK];
 static int csv;
 static size_t seq_bytes = SEQ_BYTES_DEFAULT;
+/* `--repeat=N` runs every phase N times and prints each pass. Take the MINIMUM
+ * across passes, not the mean: the noise here is other load on the host, which
+ * can only ever ADD time, so the fastest pass is the one least contaminated by
+ * it. One sample per boot was the flaw that made the first cross-architecture
+ * table unusable — and on a kernel with no `init=` and no reachable sshd, a
+ * second sample costs a whole reboot unless the probe does it itself. */
+static int repeat = 1;
 
 /* `CLOCK_MONOTONIC`, not `gettimeofday`. A NIC-less boot never runs SNTP, so
  * `CLOCK_REALTIME` is "never synced" and reads a constant 0 — which makes every
@@ -161,6 +168,11 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--csv")) {
             csv = 1;
+        } else if (!strncmp(argv[i], "--repeat=", 9)) {
+            repeat = atoi(argv[i] + 9);
+            if (repeat < 1) {
+                repeat = 1;
+            }
         } else if (!strncmp(argv[i], "--seq-mb=", 9)) {
             seq_bytes = (size_t)atoi(argv[i] + 9) * 1024 * 1024;
         } else {
@@ -178,29 +190,36 @@ int main(int argc, char **argv) {
                seq_bytes);
     }
 
-    emit("create", create_files(dir, BASE_N, FILE_SIZE));
-
     char big[256];
     snprintf(big, sizeof big, "%s/big", dir);
-    emit("seq_write", seq_write(big, seq_bytes));
 
-    /* Cold first, then warm: see the header on why this is two numbers. */
-    size_t got = 0;
-    long long cold = seq_read(big, &got);
-    emit("seq_read_cold", cold);
-    if (got != seq_bytes) {
-        printf("FS_OPS: WARNING seq_read got %zu of %zu bytes\n", got, seq_bytes);
+    for (int pass = 0; pass < repeat; pass++) {
+        if (repeat > 1 && !csv) {
+            printf("FS_OPS: --- pass %d of %d ---\n", pass + 1, repeat);
+        }
+        emit("create", create_files(dir, BASE_N, FILE_SIZE));
+        emit("seq_write", seq_write(big, seq_bytes));
+
+        /* Cold first, then warm: see the header on why this is two numbers.
+         * Only pass 1's "cold" is genuinely cold — later passes rewrote the
+         * file, so its blocks are already resident. Read the cold column from
+         * the first pass and the warm column from the minimum of all. */
+        size_t got = 0;
+        emit("seq_read_cold", seq_read(big, &got));
+        if (got != seq_bytes) {
+            printf("FS_OPS: WARNING seq_read got %zu of %zu bytes\n", got, seq_bytes);
+        }
+        emit("seq_read_warm", seq_read(big, &got));
+
+        int listed = 0;
+        emit("list_dir", list_dir(dir, &listed));
+        if (!csv && pass == 0) {
+            printf("FS_OPS: list_dir saw %d entries\n", listed);
+        }
+
+        emit("delete", delete_files(dir, BASE_N));
+        unlink(big);
     }
-    emit("seq_read_warm", seq_read(big, &got));
-
-    int listed = 0;
-    emit("list_dir", list_dir(dir, &listed));
-    if (!csv) {
-        printf("FS_OPS: list_dir saw %d entries\n", listed);
-    }
-
-    emit("delete", delete_files(dir, BASE_N));
-    unlink(big);
     rmdir(dir);
 
     if (!csv) {
