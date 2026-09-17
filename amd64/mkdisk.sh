@@ -205,6 +205,14 @@ done
 "$DEBUGFS" -w -R "mkdir /bin" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $HELLO bin/hello" "$IMG" >/dev/null 2>&1
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
+# The C ext2 probes (`userspace/ext2probe/c/build.sh`). Static musl, no
+# `libakuma` — which is why they exist: the Rust `ext2probe` beside them does not
+# build for x86_64, so its measurements could not be run on this kernel at all.
+# `pin_reclaim` is the `unlink`-of-a-mapped-file space-leak gate.
+for P in pin_reclaim read_syscall_cost; do
+    SRC="userspace/ext2probe/c/x86_64/$P"
+    [ -f "$SRC" ] && "$DEBUGFS" -w -R "write $SRC bin/$P" "$IMG" >/dev/null 2>&1
+done
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
 [ -n "$HERD" ] && "$DEBUGFS" -w -R "write $HERD bin/herd" "$IMG" >/dev/null 2>&1

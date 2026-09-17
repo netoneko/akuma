@@ -1210,6 +1210,15 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
 /// last address space. A frame the ledger does not track is left alone —
 /// `Process::free` will release it — because freeing it here would be a double
 /// free against that.
+///
+/// There is a **third** thing to release, and it was missing until 2026-09-17:
+/// the `InodePin` a file-backed mapping took to keep its file's blocks alive
+/// across an `unlink`. It lives in the address space, whose `Drop` releases it
+/// on `exec` and exit — which covers the mapping's death only when the whole
+/// address space dies with it. A `munmap` left the claim behind, and once
+/// enough distinct inodes had been mapped to saturate the 1024-slot pin table,
+/// `is_pinned` answered `true` for everything and ext2 stopped freeing blocks
+/// on `unlink` at all. See `retain_mapped_inode_pins`.
 fn unmap_range(start: usize, end: usize) {
     if end <= start {
         return;
@@ -1218,7 +1227,27 @@ fn unmap_range(start: usize, end: usize) {
     // walk below takes the address-space lock and the PMM. Lock order is
     // regions -> address space everywhere in this module.
     let _ = usermode::with_current_regions(|regions| {
+        // Does the doomed range name a file at all? Almost no `munmap` does, and
+        // the reconciliation below costs a scan of the region list per live pin,
+        // so it is worth one overlap pass to skip it. A region that has no
+        // `file` never contributed a pin.
+        let unmaps_a_file = regions.iter().any(|r| {
+            r.file.is_some() && r.start_va < end && r.start_va.saturating_add(r.len_bytes()) > start
+        });
         let _pieces: Vec<_> = akuma_mmap::detach_eager_regions_in_range(regions, start, end);
+        if unmaps_a_file {
+            // The pins are per *inode*, so which ones to drop can only be
+            // decided against the survivors: a program that maps one shared
+            // object once per segment unmaps three regions and must keep the pin
+            // until the third goes. Inside the region hold, which is the
+            // established order (`with_current_address_space`: regions ->
+            // address space, never the other way).
+            let _ = usermode::with_current_address_space(|uas| {
+                uas.retain_mapped_inode_pins(|inode| {
+                    regions.iter().any(|r| r.file.is_some_and(|f| f.inode == inode))
+                });
+            });
+        }
     });
 
     // One descent, clearing each leaf and dropping this address space's claim on

@@ -679,8 +679,89 @@ fixes #1-#5 and a clean `cargo build` is what closes that out. The wedged
 2026-09-17 guest is still up (kill it before reusing the rig — see "Status and
 next steps"), and the `-j4` silent wedge above is a separate, still-open bug.
 
+### 6. FIXED (2026-09-17): `munmap` never released the file mapping's `InodePin`, so `unlink` stopped returning blocks
+
+*Found by a cross-architecture probe sweep, not by this investigation: amd64 was
+slower than aarch64 on every filesystem op, and alongside those ratios sat a
+**correctness** divergence — `ext2probe`'s `reclaim[pinned]` phase returned
+**0 %** of deleted bytes on amd64 against **85 %** on aarch64.*
+
+A file-backed mapping takes an `akuma_primitives::InodePin` on the inode, and
+ext2 will not free a pinned inode's blocks on `unlink` — it defers them, which
+is correct, because the mapping is still reading them. So the pin has to be
+released when the mapping goes away.
+
+On this target it never was. `pin_mapped_inode` (`amd64/src/mm.rs`'s
+`pin_mapping_inode` → `akuma_mmu::UserAddressSpace`) had **no release half at
+all**. Its own doc comment explains why the pins live in the address space:
+"this struct dies exactly when the mappings do — on `exec` and on exit". That is
+true of the *address space* and false of an individual mapping. `unmap_range`
+released the pages and the region records and left the claim on the file behind,
+so every distinct inode a process had ever mapped stayed pinned for the life of
+the process.
+
+**Why that is an outage and not a slow leak.** The pin table has 1024 slots.
+Past saturation `is_pinned` answers `true` for *every* inode, so ext2 defers
+every `unlink`'s block free onto a 256-slot list — and that list then never
+drains, because the pins that would release it are held by a process that is
+still running. A long-lived process that maps and unmaps files (which is every
+build tool, and `ld.so` on every exec) walks the filesystem into "no `unlink`
+frees anything". AArch64 does not have the bug: its pin rides inside
+`LazySource::File` in the lazy region and dies with the region.
+
+**Fix** — `akuma_mmu::UserAddressSpace::retain_mapped_inode_pins` (x86_64 half,
+beside `pin_mapped_inode`), called from `unmap_range` inside the existing region
+hold. It takes a *predicate*, not an inode, and that is what makes it correct
+rather than approximately correct: a pin is per inode and per address space, one
+mapping may go while three others still name the same file (`ld.so` maps a
+shared object once per segment), and only the surviving region list can say
+whether the last one has gone. Guarded by a cheap overlap pass — almost no
+`munmap` touches a file mapping, and a region with no `file` never contributed a
+pin. Lock order is unchanged: regions → address space, as
+`with_current_address_space` documents.
+
+**A/B, local QEMU TCG, same rootfs image copied per arm**
+(`scripts/benchmarks/pin_reclaim_ab.sh`):
+
+| phase | pre-fix | post-fix |
+|---|---|---|
+| `unpinned` (control — nothing maps them) | 16640 KB consumed, **100 % back** | 16640 KB, **100 % back** |
+| `pinned` (unlink while mapped) | 19212 KB consumed, 12 KB back — **0 %** | 19212 KB, 16400 KB back — **85 %** |
+
+The control is the half that makes the other half mean anything: it is green on
+*both* arms, so the filesystem frees normally and the defect is specifically the
+pin/deferral interaction. 85 % is the AArch64 number exactly; the residual is
+directory and group metadata, which is why the probe's threshold is 80.
+
+**The probe** is `userspace/ext2probe/c/pin_reclaim.c` — a C restatement of the
+Rust `ext2probe`'s `reclaim_pinned` phase, written because that probe is a
+`libakuma` binary and `libakuma` does not build for x86_64, so the one
+measurement that distinguishes the two kernels could not be run on the kernel
+that was failing it. Static musl, so the same binary runs on either
+architecture and on real Linux as a reference arm; staged into the image by
+`amd64/mkdisk.sh`, built by `userspace/ext2probe/c/build.sh`.
+
+Three harness traps paid for here, all of which report a clean kernel that was
+never tested:
+
+- **`amd64/run.sh` runs `cargo build` before it boots**, so staging a kernel
+  binary at the target path does not pin it — the build overwrites it from the
+  working tree and both arms run the same kernel. The first baseline arm scored
+  `OK` for exactly this reason. `pin_reclaim_ab.sh` drives QEMU directly.
+- **`INITARGS` is argv[1..]**, not argv[0] — the kernel supplies the program
+  name. `INITARGS=pin_reclaim,/tmp` made `/tmp` argv[2] and `pin_reclaim` the
+  probe's root directory, so it created nothing and measured nothing.
+- **A probe that measures nothing must not score a pass.** `0` bytes returned of
+  `0` consumed is 100 % by arithmetic. The probe reports `INCONCLUSIVE` as a
+  third verdict and exits non-zero on it, the same rule `scripts/mem_suite.py`
+  applies. That is what caught the third trap: the control phase wrote
+  `PLAIN_SIZE` bytes out of a buffer sized `PINNED_SIZE`, the kernel rejected
+  the overread, every control file was empty — and a probe that scored
+  INCONCLUSIVE as OK would have reported a working control that never ran.
+
 ## Background
 
+- `docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md` — the AArch64 original of §6's leak.
 - `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — the self-host bring-up stages.
 - `docs/runbooks/selfhost-kernel-build.md` — aarch64 self-host procedure,
   detach/poll mechanics, and the aarch64 baseline numbers (44 s clean build).

@@ -3482,7 +3482,7 @@ impl UserAddressSpace {
     /// *mapping* rather than per *file* is how it saturates — a saturated pin
     /// table answers "pinned" for everything and stalls the filesystem's
     /// deferred frees, which is a failure this tree has already had once
-    /// (`docs/archive/EXT2_UNLINK_LEAK.md`).
+    /// (`docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md`).
     ///
     /// `inode == 0` means "no inode identity", and pins nothing.
     pub fn pin_mapped_inode(&mut self, inode: u32) {
@@ -3490,6 +3490,35 @@ impl UserAddressSpace {
             return;
         }
         self.mapping_pins.push(akuma_primitives::InodePin::new(inode));
+    }
+
+    /// Drop every pin whose inode `still_mapped` no longer answers `true` for.
+    ///
+    /// **The release half of [`pin_mapped_inode`](Self::pin_mapped_inode), and
+    /// for a year there was none.** The pins live in this struct because it
+    /// "dies exactly when the mappings do — on `exec` and on exit"; that is true
+    /// of the *address space* and false of an individual mapping, so a
+    /// `munmap` released the pages and kept the claim on the file. A long-lived
+    /// process that maps and unmaps files — every `ld.so`, every build tool —
+    /// accumulated one permanent pin per distinct inode it had ever mapped.
+    ///
+    /// The visible failure is a space leak, not a memory one, and it needs the
+    /// pin table to saturate before it shows: past its 1024 slots `is_pinned`
+    /// answers `true` for *every* inode, so ext2 defers every `unlink`'s block
+    /// free onto a 256-slot list that then never drains, because the pins that
+    /// would release it are held by a process that is still running.
+    /// `ext2probe`'s `reclaim[pinned]` phase measured **0 %** of deleted bytes
+    /// returned on this target against 85 % on AArch64 — which does not have the
+    /// bug, because its pin rides inside `LazySource::File` in the lazy region
+    /// and dies with the region.
+    ///
+    /// Taking the predicate rather than an inode is what makes this correct
+    /// rather than approximately correct: a pin is per *inode* and per address
+    /// space, one mapping may be unmapped while three others still name the same
+    /// file (`ld.so` maps one shared object once per segment), and only the
+    /// caller's surviving region list can answer whether the last one has gone.
+    pub fn retain_mapped_inode_pins(&mut self, still_mapped: impl Fn(u32) -> bool) {
+        self.mapping_pins.retain(|p| still_mapped(p.inode()));
     }
 
     /// Take the same pins `other` holds — a `fork` child inherits its parent's
