@@ -1200,10 +1200,9 @@ here — it is slower on the *next* `mmap`, in another process, minutes later:
   same kernel) — a TLB-shootdown IPI per unmap. Linux is 1.46 µs flat. At 53 k
   unmaps per `rustc` that is ~0.6 s per core beyond the first, and it is the
   next thing to look at for SMP builds.
-- **`mmap` is still linear in region count** at 4.02 ns/region (the §5 scan,
-  now the whole of placement). At 4 400 regions that is ~18 µs a call. A
-  per-address-space cursor — what AArch64 already does — is the fix; it did not
-  matter next to a 468 µs sort and it is the leading term now. The same
+- ~~**`mmap` is still linear in region count** at 4.02 ns/region~~ — **§9**:
+  the per-address-space cursor landed, slope 4.02 -> 1.65 ns/region. What is
+  left of it is the residual scan past the cursor. The same
   `mmap_scale` binary on AArch64 (QEMU TCG) is **flat**: 1 248–1 584 ns from 0
   to 3 750 regions, slope −0.24 ns/region. That is the bump cursor plus free
   list, and it is also why none of §8 is an AArch64 speedup — only the shared
@@ -1211,6 +1210,151 @@ here — it is slower on the *next* `mmap`, in another process, minutes later:
   behaviour-neutral and slightly cheaper.
 - The remaining 2.1x against Linux is **not** syscalls: with `mmap` fixed the
   measured syscall and fault budget accounts for ~1 s of the 18 s.
+
+
+### 9. FIXED (2026-09-17): four O(n) walks over the region list, and a linear `find` per page fault
+
+*§8's follow-through. With the sort gone, `[PSTATS]` — now a stopwatch — put
+`mmap` at 27 us and `munmap` at 42 us against a 4 400-region list, together **98 %
+of `rustc`'s in-kernel time**. Both are scans of the same list, and so is a
+lookup on the fault path that `[PSTATS]` cannot see at all.*
+
+#### What was walking the list
+
+| walk | when | what it cost |
+|---|---|---|
+| `find_free_va`'s first-fit scan | every `mmap` | ~18 us of a 26 us call |
+| `find_free_va`'s `windows(2)` sorted-check | every `mmap` | ~7 us (1.65 ns/region) |
+| `detach_eager_regions_in_range` | every `munmap` | O(regions), **both kernels** |
+| `unmap_range`'s "does this range name a file?" | every `munmap` | O(regions) |
+| `regions.iter().find(\|r\| r.contains(page))` | every **page fault** | O(regions), 86 k times |
+
+The last one is the one to notice: page faults are *counted* in `[PSTATS]` and
+never *timed*, so this walk was invisible to the instrument that found everything
+else. It was found by reading the fault path after the syscall numbers stopped
+explaining the wall clock.
+
+#### The invariant, promoted
+
+§8 made the region list sorted on amd64 to kill the per-`mmap` sort. That is
+enough to make every walk above a binary search, so the invariant moved into
+`akuma-mmap` as `insert_region_sorted`, documented there, with
+`region_index_containing` (fault lookup) and `regions_overlapping` (range
+queries) as the two searches built on it. **Both kernels now maintain it**:
+AArch64's `mmap`/`mremap` sites in `akuma-syscalls-glue` and
+`record_mmap_region` in `akuma-exec` insert in order rather than appending.
+
+Everything else in `akuma-mmap` already preserved order and needed no change —
+`inherit_mmap_regions_for_cow_child` maps over its input, `mprotect_eager_regions_in_range`
+drains in order and emits each region's pieces ascending, and fork copies the
+parent's snapshot in order.
+
+#### The placement cursor
+
+The first-fit scan is O(regions before the first adequate gap), which for a
+process growing a dense arena is all of them. `find_free_va_from` starts at a
+per-process cursor and **wraps once** to `MMAP_BASE` if that finds nothing.
+
+It reuses `ProcessMemory::next_mmap` — the AArch64 kernel's own per-process mmap
+cursor, which this target had never used. Reusing it rather than adding a field
+is what makes `fork` correct for free: that kernel already copies it to the
+child, and a child inheriting an empty cursor would re-walk its parent's whole
+address space on its first `mmap`. Values outside this target's window are
+clamped, which is what makes sharing a field initialised for the other kernel's
+VA layout sound.
+
+**What it gives up** is exact lowest-address first-fit: a hole below the cursor
+waits for the wrap. That is weaker than the scan and *stronger* than the global
+bump allocator this file replaced in the first place — that one was global
+across every process and never reused anything. It also recycles a freed address
+later than first-fit would, so a stale pointer keeps faulting for longer instead
+of landing in a live mapping.
+
+#### The wedge this caused, and the guard that came out of it
+
+Making the searches depend on sortedness turns a missed writer from *slow* into
+*wrong*. Two were missed — `mremap`'s `push` on amd64 and `record_mmap_region`
+on AArch64 — and the result was an in-guest `rustc` that stopped making progress
+with **no panic, no fault and no log line**: the §5 wall, reintroduced by a
+different mechanism. It took a build to find because nothing else looks at a
+4 000-region list.
+
+So `detach_eager_regions_in_range` carries two things:
+
+- a **`debug_assert`** that the list is sorted — host tests only;
+- an **O(1) guard** that notices the last pair out of order and re-sorts. That
+  is exactly the shape a writer that appends leaves behind, so it converts the
+  commonest mistake from a wedge into one slower call. It is **a guard, not a
+  proof**: two appends in ascending order leave the last pair sorted and the
+  list still broken. Real enforcement is that every writer goes through
+  `insert_region_sorted`.
+
+The same O(1) guard replaced the placer's `windows(2)` pass, which was itself
+O(regions) on the path the sort had just been removed from.
+
+#### Result
+
+`cargo build -p zerocopy --target x86_64-unknown-none --release --offline -j1`,
+in-guest, FC 6144 MB, min of 3:
+
+| | amd64 |
+|---|---|
+| §8 (sorted list, sort skipped) | 18.3 s |
+| + binary-searched split, fault lookup and file-overlap pass | 16.4 s |
+| + placement cursor, O(1) sorted-check | **15.1 s** |
+| (start of the session, post-§5) | 63 s |
+| Linux, same `rustc` binary, same box | 8.8 s |
+
+**4.2x cumulative; the gap to Linux goes 7.2x -> 1.7x.**
+
+`mmap_scale` on amd64, per-call placement cost against regions held: the slope
+goes **4.02 -> 1.65 ns/region** with the cursor alone, and the 3 750-region
+bucket **16 720 -> 7 600 ns**.
+
+#### AArch64, measured
+
+AArch64 never paid the sort (it places from a bump cursor and a free list), but
+it walks the same list on `munmap`. A/B against a worktree at the pre-§9 commit,
+same binary, same host, same probe:
+
+| regions held | `munmap` before | `munmap` after |
+|---|---|---|
+| 0 | 3 000 ns | 2 600 ns |
+| 750 | 8 300 ns | 2 400 ns |
+| 2 500 | 8 400 ns | 2 900 ns |
+| 3 750 | **8 400 ns** | **2 400 ns** |
+
+**3.5x at 3 750 regions, and flat instead of climbing.** `mmap` is unchanged
+(1 200-1 600 ns, already flat). Boot suite 311 PASSED / 0 FAILED.
+
+#### The probe had to be fixed first
+
+`mmap_scale` originally timed a 250-call bucket as one bracket and took the best
+of `repeat` passes. That assumes a pass exists in which the whole bucket ran
+undisturbed — false under QEMU TCG, where it reported buckets alternating
+between 1.5 us and 25 us with no relation to region count and a `growth=16.9x`
+that was purely which bucket got unlucky last. It now times **groups of 10**:
+short enough that most brackets escape preemption, long enough to amortise the
+two clock reads. That is what turned the AArch64 numbers above from noise into a
+flat line. *A benchmark that cannot resolve the effect is not a null result.*
+
+#### Verification
+
+amd64 boot suite **735 passed / 0 failed at SMP=1**, **745 / 0 at SMP=4** (+5
+over §8: the placement-cursor self-tests, which cover the hint being honoured,
+a hole below the hint being skipped, an out-of-window hint being clamped, the
+wrap finding that hole when there is no room above, and a full address space
+answering `ENOMEM` rather than a bad address). AArch64 boot suite 311 / 0. Host
+tests 1 460 / 0 (`akuma-mmap` 68, including an oracle test for
+`regions_overlapping` against the filter it replaced, and one for the
+append-healing guard). Clippy clean on both kernels and on `akuma-mmap`.
+
+#### Open
+
+- The remaining 1.7x against Linux is **not syscalls**: at 15 s the whole
+  measured syscall and fault budget is ~2 s.
+- `munmap` still carries a TLB-shootdown IPI per call at SMP>1 — 13.2 us against
+  1.97 us at SMP=1, measured on the same kernel.
 
 
 ## Background

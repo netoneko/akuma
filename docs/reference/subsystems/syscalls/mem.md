@@ -331,29 +331,58 @@ The two kernels place a mapping differently and only one of them scans.
 list for a gap. **amd64** has no cursor: `find_free_va` (`amd64/src/mm.rs`) is a
 first-fit scan over `mmap_regions`, which needs the list in address order.
 
-Since 2026-09-17 that order is an **invariant maintained by every writer**,
-not something the placer re-establishes:
+Since 2026-09-17 that order is an **invariant maintained by every writer, on
+both kernels**, and it is what lets every walk over the list be a binary search.
+`akuma_mmap::insert_region_sorted` owns it and documents it; the writers are
+amd64's `mmap`/`mremap`, AArch64's `mmap`/`mremap` (`akuma-syscalls-glue`) and
+`akuma_exec::process::record_mmap_region`. Everything else in `akuma-mmap`
+already preserved order: `inherit_mmap_regions_for_cow_child` maps over its
+input, `mprotect_eager_regions_in_range` drains in order and emits each region's
+pieces ascending, `detach_eager_regions_in_range` leaves survivors in the slot
+the clipped region occupied, and fork copies the parent's snapshot in order.
 
-- `amd64`'s `insert_region_sorted` puts a new region at its address
-  (`partition_point` + `insert`) instead of appending.
-- `akuma_mmap::detach_eager_regions_in_range` — `munmap`'s clip-and-split,
-  called by **both** kernels — leaves its survivors in the slot the clipped
-  region occupied instead of pushing them onto the end.
-- `find_free_va` sorts **only if the list is not already sorted**. The sort is
-  kept rather than replaced by a debug assertion on purpose: a future writer
-  who appends then gets a slow placer, never a wrong one.
+What the invariant buys, all of it previously O(regions):
+
+| search | replaces | on |
+|---|---|---|
+| `region_index_containing` | `iter().find(\|r\| r.contains(va))` | every **page fault** |
+| `regions_overlapping` | a filtered scan of the whole list | `munmap`'s file-overlap pass |
+| `detach_eager_regions_in_range`'s windowed walk | a walk from index 0 to the end | every `munmap`, **both kernels** |
+| `find_free_va_from`'s cursor + `partition_point` | first-fit from `MMAP_BASE` | every amd64 `mmap` |
+
+**A missed writer is a wrong answer, not a slow one**, and that cost an in-guest
+`rustc` wedged with no panic and no log line (two `push` sites survived the first
+pass). Two defences, in this order: `detach_eager_regions_in_range` heals a list
+whose **last pair** is out of order — the shape an appending writer leaves — in
+O(1), and then `debug_assert`s the rest, which host tests see and a release
+kernel does not. The guard is not a proof: two appends that land in ascending
+order defeat it. If you add a writer, use `insert_region_sorted`.
 
 **Why this is worth a section.** The placer used to sort the whole list on every
 `mmap`, justified as adaptive-and-therefore-linear on an already-sorted list.
-Both appenders above broke that assumption, and `rustc` interleaves ~53 k
-`munmap`s with ~58 k `mmap`s compiling one small crate: measured in-guest, the
-list averaged **4 400 regions with 18 % of calls arriving out of order**, and
-the sort was **468 µs of a 483 µs `mmap` — 74 % of `rustc`'s entire wall
-clock**. Removing it took an in-guest `cargo build -p zerocopy -j1` from 63 s to
-18.3 s. If you add a writer to a region list, keep it sorted.
+Two appenders broke that assumption, and `rustc` interleaves ~53 k `munmap`s
+with ~58 k `mmap`s compiling one small crate: measured in-guest, the list
+averaged **4 400 regions with 18 % of calls arriving out of order**, and the sort
+was **468 µs of a 483 µs `mmap` — 74 % of `rustc`'s entire wall clock**. With
+that and the four walks above, an in-guest `cargo build -p zerocopy -j1` went
+**63 s -> 15.1 s** on amd64 against a Linux reference of 8.8 s.
 
-The ordering is free for AArch64 rather than a tax: the in-place survivor
-handling shifts the list **less** than the `remove`-and-`push` it replaced.
+The ordering is not a tax on AArch64 and is a win there too: the in-place
+survivor handling shifts the list **less** than the `remove`-and-`push` it
+replaced, and its `munmap` — which walked the same list — went from 8.4 µs to
+2.4 µs at 3 750 regions, flat instead of climbing.
+
+### The amd64 placement cursor
+
+`find_free_va_from` starts at a per-process cursor and wraps once to `MMAP_BASE`
+if that finds nothing. The cursor is `ProcessMemory::next_mmap`, the field the
+AArch64 placer already uses, so `fork` inheritance came for free; values outside
+this target's window are clamped, which is what makes sharing it sound.
+
+It gives up exact lowest-address first-fit — a hole below the cursor waits for
+the wrap — which is weaker than the scan and stronger than the global bump
+allocator that preceded both. A freed address is also recycled *later*, so a
+stale pointer keeps faulting rather than landing in a live mapping.
 
 ### `mmap_scale` — placement cost against region count
 
@@ -367,19 +396,33 @@ region count shows up as a slope:
 /tmp/mmap_scale 4000 3      # regions, repeats; minimum wins
 ```
 
-Measured 2026-09-17, Akuma/amd64 under Firecracker: `1 656 ns + 4.02 ns x
-regions_held`, against a Linux line flat at ~930 ns. That residual linearity is
-the first-fit scan itself and is **still open** — a per-address-space cursor is
-the fix, which is what AArch64 already has: the same binary on AArch64 (QEMU
-TCG) is flat at 1 248–1 584 ns over the same 0–3 750 range, slope −0.24
-ns/region. **Compare the shape across kernels, never the nanoseconds** — those
-two arms ran under different hypervisors, and flat-vs-linear is the whole
-finding.
+Measured 2026-09-17 on Akuma/amd64 under Firecracker, before and after the
+placement cursor:
 
-Under TCG the occasional bucket reads 17–24 µs where its neighbours read 1.4 µs:
-that is preemption, not placement. The probe takes the minimum *per bucket*
-across repeats, so a bucket unlucky in every pass keeps its outlier — raise
-`repeat` before believing a lone spike.
+| | slope | cost at 3 750 regions |
+|---|---|---|
+| first-fit from `MMAP_BASE` | 4.02 ns/region | 16 720 ns |
+| with the cursor | **1.65 ns/region** | **7 600 ns** |
+| Linux | flat | ~930 ns |
+| AArch64 (bump cursor + free list) | flat | ~1 400 ns |
+
+**Compare the shape across kernels, never the nanoseconds** — those arms ran
+under different hypervisors, and flat-vs-linear is the finding. The residual
+amd64 slope is what is left of the scan after the cursor skips most of it.
+
+**Read the probe's limits before trusting it.** Its grow phase never unmaps, so
+the list it hands the placer is always already sorted — the best case for an
+adaptive sort, and a case a real workload is never in. That is exactly why it
+priced the §8 defect at 8 µs when it was 468 µs: a probe can reproduce the
+*shape* of a workload and miss its *history*, and be linear, correct and off by
+60x. It also cannot see the fault-path or `munmap` walks unless you read the
+`munmap` column, which is why the numbers that actually drove §9 came from
+`[PSTATS]` on a real build.
+
+It times **groups of 10 calls** and takes the minimum, which matters under TCG:
+timing a whole 250-call bucket and taking the best pass assumes some pass ran the
+bucket undisturbed, and the first version of the probe reported buckets
+alternating 1.5 µs / 25 µs with no relation to region count as a result.
 
 **Read its limits before trusting it.** Its grow phase never unmaps, so the list
 it hands the placer is always already sorted — the best case for an adaptive
