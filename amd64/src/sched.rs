@@ -1546,10 +1546,27 @@ pub fn allow_tick() {
     // behaviour it has always had.
     if crate::lapic::timer_running() {
         ALLOW_TICK_HALTS.fetch_add(1, Ordering::Relaxed);
+        // Release the BKL across the halt. Every caller sits in a loop that
+        // re-checks its own exit condition after this returns (the futex
+        // wait's membership test, `schedule_blocking`'s deadline/wake
+        // re-read), so a peer that took the lock meanwhile and woke us is
+        // handled by the re-check — that re-check is the contract, the same
+        // one `idle_loop`'s release-around-`hlt` uses. Holding the lock
+        // through the halt is what turned an SMP>1 boot into a `[BKL] stuck`
+        // storm: the netpoll daemon parked BKL-held between laps and the
+        // three peer cores spun on `bkl_enter` until sshd never answered
+        // (measured 2026-09-17, Firecracker `vcpu_count=4`).
+        let held = crate::smp::bkl_held();
+        if held {
+            crate::smp::bkl_leave();
+        }
         // SAFETY: interrupts on for exactly the `hlt`, then off again — the
         // same bracket `idle_loop` uses.
         unsafe {
             core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+        }
+        if held {
+            crate::smp::bkl_enter();
         }
     } else {
         ALLOW_TICK_SPINS.fetch_add(1, Ordering::Relaxed);

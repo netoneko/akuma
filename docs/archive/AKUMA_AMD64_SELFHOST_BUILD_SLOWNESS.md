@@ -73,37 +73,80 @@ Already fine (checked, do not re-litigate): munmap/mprotect TLB strategy
 readahead, futex park/wake protocol, 10 ms LAPIC tick handler, console
 silence on hot paths.
 
-## The fix (this worktree)
+## The fixes (this worktree)
 
-`amd64/src/sched.rs` `hook_switch_to`: activate only when
-`want != paging::active_root()`.
+Three landed, each verified by the 707-test boot suite under local QEMU TCG
+and then by anchor re-timing on the FC box:
 
-Why this is sound and not the bug the old comment feared: the old comment
-worried that "same CR3 value" could be a *recycled* frame — a freed root
-reissued to the next process. That hazard is closed upstream: `akuma-mmu`'s
-`free_or_defer_as_frames` refuses to free an L0 that any core's live CR3
-(`any_core_on_l0`, fed by `publish_l0_begin`/`publish_l0_end`, which amd64's
-`paging::activate` calls on **every** write) or any saved context still
-references — it parks the frames for a later drain instead. So equality
-between `want` and this core's live CR3 proves the root was never freed under
-us: it is the same live address space and there is nothing to flush. The
-`[SWITCH FREED-CR3]` tripwire still runs on every switch-in.
+1. **CR3-skip on same-root context switches** (`amd64/src/sched.rs`
+   `hook_switch_to`): activate only when `want != paging::active_root()`.
+   Sound because `akuma-mmu`'s L0-free liveness gate refuses to free a root
+   any core's live CR3 references (see the in-file comment). **102 s → 83.5 s
+   (−18%).**
+2. **Untimed futex waits no longer `hlt` before their wake check**
+   (`amd64/src/futex.rs` `wait`): the loop's `allow_tick()` ran before the
+   membership test, costing every untimed wait 1–2 LAPIC ticks (10 ms each)
+   of pure latency on a core whose waker was runnable. Timed waits keep the
+   window — their deadline reads `uptime_us`, which does not advance while
+   `IF` is clear. **83.5 s → 77.9 s (−7%).**
+3. **`allow_tick` releases the BKL across the `hlt`** (`amd64/src/sched.rs`),
+   and **the netpoll drain runs BKL-free** (`amd64/src/net.rs`
+   `netpoll_daemon`, scoped exactly like `kernel-glue`'s
+   `netpoll_drain_step`). Together these fix the SMP>1 boot: at
+   `vcpu_count=4` the netpoll daemon's near-continuous BKL ownership put all
+   peer cores into a `[BKL] stuck` storm (owner=1 tag=503) and sshd never
+   answered; with the fix the 4-vCPU guest boots and serves ssh with **zero**
+   stuck lines. Two dead ends documented for the next person: parking
+   *inside* a dropped window breaks the resume protocol at SMP
+   (`[SWITCH BADFRAME]` → `#PF` fetch from 0x0), which is why the window is
+   scoped to the drain alone and the park is made harmless instead.
 
-Verified: `cargo build -p akuma-amd64` clean; clippy clean; **boot suite
-707 passed / 0 failed** under local QEMU TCG, zero `FREED-CR3` /
-`SWITCH NO-BKL` tripwires, suite exercising 107 scheduler parks.
+Along the way, aarch64-parity instrumentation this target lacked: per-process
+syscall counters + coarse per-syscall times + page-fault counts
+(`ProcessSyscallStats`, bumped in `syscall_handler` and
+`page_fault_dispatch`, dumped by a 30 s sweep in `idle_loop` — no PSTATS
+existed on amd64 before), and the `[mmap-t]` per-mapping timing print is now
+behind `mm::MMAP_TRACE` (it fired on every ≥16-page mmap; an in-guest build
+flooded the UART with it while compiling).
 
-**A/B on real hardware (2026-09-17, FC guest, kernel rebuilt from this
-worktree, md5 `f5797fe3`)**: the anchor `cargo build -p akuma-exec
---release --offline -j1` went **102 s → 83.5 s** wall (two trials 83.88 /
-83.54 s, ±0.3 s; prior-kernel figure was a single trial on the stale 0.0.7
-boot, so treat the delta as ~18% ± a few). Same-root switches no longer
-flush. **A ~2.5x kernel residual remains** (83.5 s vs 3 s host; ~10x is
-hardware). Candidates 3–5 below are the remaining levers, and the first
-at-home action is a *non-invasive* utime/wall attribution: this session's
-`/proc` scan sampler cost ~30% of the CPU by itself (60 pids × per-cat cost
-every 2 s) and its utime reads came back 0 — sample one known rustc pid on
-a long interval, or get per-pid CPU out of the kernel instead.
+**Anchor is now 77.9 s (−24% total) at 1 vCPU.** Host A/B says building *for*
+amd64 costs the same as aarch64 (15.9 vs 15.7 s), so the remaining gap is
+runtime; rustc's own `-Z time-passes` in-guest puts it in codegen/LLVM
+(60 s + 45 s of the total).
+
+## Probe A/B (`scripts/benchmarks/selfhost_probe_ab.sh`)
+
+Same binary, same knobs, both guests
+(`userspace/forktest/c_stress/jobserver_stress.{aarch64,x86_64}`):
+
+| phase | aarch64 devbox (4 cores HVF) | amd64 FC (1 old vCPU) |
+|---|---|---|
+| all phases | 1 s | 307 s (spawn-join dominates) |
+| condvar, 5M requests | 4 s | 3 s |
+| park, 3M iters | 1 s | <1 s |
+
+The condvar/park phases are userspace-atomic-bound (uncontended std
+Mutex/Condvar never enters the kernel) — they measure the cores, not the
+kernel; the kernel-relevant phases are spawn-join and the barrier. Portability
+traps the script now handles: rust's x86_64 musl target defaults to
+**static-pie**, which the amd64 loader SIGSEGVs on (build with
+`-C relocation-model=static`); the amd64 rootfs's busybox has no `base64`
+applet link; and a nested ssh re-splits multi-word remote commands at every
+shell layer, so guest scripts must travel as staged files.
+
+## Open: SMP=4 build load kills the guest (new, unreproduced-in-detail)
+
+With the BKL fixes in, a `cargo build -j4` at 4 vCPUs ran ~10 minutes and
+then died: a **ring-3 `#UD`** (rip=0x1009266a0, cs=0x23 — a userspace
+process fetched an invalid opcode, i.e. executed a page that should not hold
+that) followed by the guest leaving the network (`10.0.2.15` ARPs dead,
+console shows the exception dump and nothing after). This is the
+"reads serving zeros under memory pressure" family from the aarch64
+self-host history (§5.1a-era rustc ICEs). Console evidence saved on the FC
+host as **`/root/akuma-fc2.crash-smp4-ud.log`**. Until root-caused, treat
+`vcpu_count>1` + parallel builds on amd64 as unstable; the FC box is
+restored to its original `vcpu_count=1` with the fixed kernel
+(md5 `5b394360…`).
 
 ## What the profiling sessions turned up along the way
 
@@ -129,38 +172,28 @@ a long interval, or get per-pid CPU out of the kernel instead.
   counters; `mkdisk.sh`'s "still broken" comment is stale). Caveats: stime is
   always 0 (no user/kernel split), idle ticks derived, 10 ms quantization.
 
-## Iterate (the at-home plan)
+## Iterate (what is left)
 
-1. ~~Rebuild + reboot the FC guest from this worktree's kernel~~ **done**
-   (kernel staged over the old one; pre-fix copy kept on the FC host as
-   `akuma-amd64.pre-c3skip` for instant rollback).
-2. ~~Re-time the anchor~~ **done — 83.5 s, see above.**
-3. **Probe A/B** — `scripts/benchmarks/selfhost_probe_ab.sh` works on both
-   arms. Same binary, same knobs (`userspace/forktest/selfhost_repro/
-   jobserver_stress.rs`, binaries in `userspace/forktest/c_stress/`):
-   aarch64 devbox (4 cores HVF) = all phases 1 s, condvar-5M 4 s, park-3M
-   1 s; amd64 FC (1 old vCPU) = all phases 307 s (spawn-join dominates),
-   condvar-5M 3 s, park-3M <1 s. The condvar/park phases are
-   userspace-atomic-bound (uncontended std Mutex/Condvar never enters the
-   kernel), so they measure the *cores*, not the kernel — the kernel-relevant
-   phases are spawn-join and the barrier. Two portability traps hit on the
-   way, both now handled in the script: rust's x86_64 musl target defaults
-   to **static-pie**, which the amd64 loader SIGSEGVs on — build probes with
-   `-C relocation-model=static`; and the amd64 rootfs has busybox without a
-   `base64` applet link, so binary pushes go through `busybox base64 -d`.
-   Also: a nested ssh (laptop→HP box→guest) re-splits multi-word remote
-   commands at each shell layer — guest scripts must travel as staged files
-   (`cat > /_probe_ab.sh`), never as inline text.
-4. **Attribute the rest in-guest**: `-Z self-profile` on akuma-exec (writes
-   `.events`, pull out and open in profiler.firefox.com), and a *non-invasive*
-   CPU-time/wall split — the `/proc` scan sampler in this session cost ~30%
-   of the guest's CPU and its utime reads came back 0 (fields 14/15 read 0
-   even for a process mid-compile; worth checking `akuma-procfs`'s amd64
-   stat rendering before trusting it). Sample one known rustc pid on a long
-   interval instead, or read the counters kernel-side.
-5. If the wedge recurs: Firecracker has no gdbstub, so the console tripwires
-   (`[SWITCH FREED-CR3]`, `[BKL] stuck`, PSTATS) and the saved console log
-   are the evidence path.
+1. ~~CR3-skip~~, ~~futex hlt~~, ~~netpoll/allow_tick BKL~~ — **landed, see
+   above**. The FC guest runs the fixed kernel; the pre-fix binary is kept as
+   `akuma-amd64.pre-c3skip`.
+2. **Root-cause the SMP=4 ring-3 `#UD`** (open item above) — it gates the
+   biggest remaining lever, which is not a kernel change at all: rustc is
+   single-threaded at `vcpu_count=1`, and the aarch64 self-host baseline
+   (44 s clean build) had four cores. Once SMP builds are stable, re-time the
+   anchor at `-j4`/4 vCPUs.
+3. **Attribute the rest in-guest** with the new PSTATS counters: run a build,
+   then read the 30 s `[PSTATS]` block (per-syscall counts, coarse times —
+   blocking syscalls are the ones that surface — and `pf=` fault counts).
+   rustc's `/proc/<pid>/stat` utime/minflt are stubs on this target (both
+   read 0 mid-compile); PSTATS is the working instrument now.
+4. Remaining audit levers if PSTATS shows fault/read domination: shared zero
+   page for anonymous read faults; virtio-blk `read_bytes` temp-Vec; the
+   syscall-entry opt-out bitmap (aarch64 `SYSCALL_BKL_OPTOUT_SEED`) — the
+   *mechanism* ports as-is, but each seed needs its amd64 handler audited
+   (e.g. `futex` cannot be seeded until `WAITERS` stops naming the BKL as its
+   safety argument), and at 1 vCPU the uncontended BKL is cheap, so this pays
+   only at SMP>1 — do it after item 2.
 
 ## Background
 
