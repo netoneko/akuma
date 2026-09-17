@@ -489,21 +489,45 @@ pub fn detach_eager_regions_in_range(
         // unmap changes extent, not permission. Both lie entirely outside
         // [range_start, range_end), so re-examining them costs one overlap test
         // and cannot loop.
+        //
+        // **They go back where the region they came from was**, not on the end.
+        // Both are carved out of the region that was at slot `i` and so belong
+        // at `i` and `i + 1` in address order; appending them instead left the
+        // list scrambled in proportion to how much `munmap` a process did.
+        //
+        // That is a correctness-neutral property here — nothing in this crate
+        // reads the list in order — and it was load-bearing for the one caller
+        // that does. `amd64`'s `find_free_va` is a first-fit scan that needs
+        // address order, so it sorted the list itself on every `mmap`; with the
+        // order destroyed by every `munmap`, that sort stopped being the
+        // adaptive linear re-confirm its comment claimed and became real work.
+        // Measured 2026-09-17 in an in-guest `cargo build -p zerocopy`: 4 400
+        // regions, 18 % of calls arriving unsorted, **468 us of a 483 us
+        // `mmap`** inside `sort_unstable_by_key` — 74 % of `rustc`'s wall clock.
+        // See docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md §8.
+        let mut inserted = 0usize;
         if head_pages > 0 {
-            regions.push(MmapRegion {
+            regions.insert(i, MmapRegion {
                 start_va: reg_start, pages: head_pages, frames: head, prot,
                 shared_anon, prot_recorded, file });
+            inserted += 1;
         }
         if tail_pages > 0 {
-            regions.push(MmapRegion {
+            regions.insert(i + inserted, MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail, prot,
                 shared_anon, prot_recorded,
                 file: file.map(|f| f.advance(head_pages + clip_pages)) });
+            inserted += 1;
         }
         if clip_pages > 0 {
             pieces.push((clip_start, clip_pages, mid));
         }
-        // `remove(i)` shifted the next candidate into slot `i`; do not advance.
+        // `remove(i)` shifted the next candidate into slot `i`, and any survivor
+        // re-inserted ahead of it shifted it back: step over exactly those.
+        // Skipping them is not just an optimisation — both lie outside the
+        // range, so re-examining them would be two wasted overlap tests per
+        // split, and advancing is what keeps this a single pass.
+        i += inserted;
     }
     pieces
 }
@@ -949,6 +973,12 @@ mod file_backing_tests {
             .file_backed(file)
     }
 
+    /// A plain anonymous region — the shape the ordering tests below care about,
+    /// where only the extent matters.
+    fn region(start_va: usize, pages: usize) -> MmapRegion {
+        MmapRegion::inherited_with_prot(start_va, pages, crate::Prot::RO_NO_EXEC)
+    }
+
     /// A page wholly inside the file's data reads a whole page from it; the page
     /// straddling EOF reads the part that exists; past EOF reads nothing.
     #[test]
@@ -1030,6 +1060,55 @@ mod file_backing_tests {
         assert_eq!(regions[0].file.map(|f| f.offset), Some(0x8000));
         assert_eq!(regions[1].file.map(|f| f.offset), Some(0x8000 + 3 * PAGE));
         assert_eq!(regions[1].file_page_source(0x1_0000_3000), Some((0x8000 + 3 * PAGE, PAGE)));
+    }
+
+    /// A split puts its survivors back **where the region was**, so a list that
+    /// was in address order still is afterwards.
+    ///
+    /// This is the property `amd64`'s first-fit placer needs and did not have.
+    /// Survivors used to be appended, so every partial `munmap` moved a
+    /// low-address region to the end of the list, and the `sort_unstable_by_key`
+    /// that `find_free_va` runs per `mmap` stopped being the adaptive linear
+    /// re-confirm its comment assumed. Asserted on the *shape* rather than a
+    /// time, the same way `va_placement_check` asserts the scan's bound: a
+    /// timing test cannot run in a boot suite, and this is what the timing was
+    /// a consequence of. See AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md §8.
+    #[test]
+    fn split_keeps_the_list_in_address_order() {
+        // Four abutting regions; punch a hole in the middle of the second and
+        // of the last, so both the head-and-tail and the tail-only shapes run.
+        let mut regions = alloc::vec![
+            region(0x1_0000_0000, 4),
+            region(0x1_0000_4000, 4),
+            region(0x1_0000_8000, 4),
+            region(0x1_0000_C000, 4),
+        ];
+        detach_eager_regions_in_range(&mut regions, 0x1_0000_5000, 0x1_0000_6000);
+        assert!(regions.windows(2).all(|w| w[0].start_va < w[1].start_va),
+                "head+tail split left the list out of order: {:?}",
+                regions.iter().map(|r| r.start_va).collect::<alloc::vec::Vec<_>>());
+        detach_eager_regions_in_range(&mut regions, 0x1_0000_C000, 0x1_0000_D000);
+        assert!(regions.windows(2).all(|w| w[0].start_va < w[1].start_va),
+                "tail-only split left the list out of order: {:?}",
+                regions.iter().map(|r| r.start_va).collect::<alloc::vec::Vec<_>>());
+        // And the split still did what it is for: 4 + 5 extents, no overlap.
+        assert_eq!(regions.len(), 5);
+    }
+
+    /// A split still visits every region exactly once.
+    ///
+    /// The insert above shifts the unexamined tail of the list, so the loop has
+    /// to step over what it inserted. Getting that wrong does not crash — it
+    /// re-tests two regions that cannot match, or worse skips one that can — so
+    /// the observable is that a range spanning *every* region clips all of them.
+    #[test]
+    fn split_visits_every_region_once() {
+        let mut regions: alloc::vec::Vec<MmapRegion> =
+            (0..8).map(|i| region(0x1_0000_0000 + i * 4 * PAGE, 4)).collect();
+        let pieces = detach_eager_regions_in_range(
+            &mut regions, 0x1_0000_0000, 0x1_0000_0000 + 8 * 4 * PAGE);
+        assert_eq!(pieces.len(), 8, "every region should have been clipped");
+        assert!(regions.is_empty(), "nothing should survive a full-range unmap");
     }
 
     /// Clipping the head shortens the data behind the survivor as well as

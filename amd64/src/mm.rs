@@ -216,13 +216,34 @@ const EAGER_MAX_PAGES: usize = akuma_config::MMAP_EAGER_MAX_PAGES;
 /// `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §5 is the hunt.
 ///
 /// `sort_unstable_by_key` is pattern-defeating quicksort: in place, **no
-/// allocation** — which is the whole objection above, and it does not apply — and
-/// adaptive, so the sorted list this leaves behind costs a linear pass to
-/// re-confirm on the next call rather than a full sort. Sorting the caller's list
-/// is sound because nothing reads it in order: regions never overlap (`MAP_FIXED`
-/// unmaps its range first, every other placement comes from here), so the
-/// `find(|r| r.contains(va))` lookups elsewhere in this module have at most one
-/// answer whatever order they walk in.
+/// allocation** — which is the whole objection above, and it does not apply.
+/// Sorting the caller's list is sound because nothing reads it in order: regions
+/// never overlap (`MAP_FIXED` unmaps its range first, every other placement comes
+/// from here), so the `find(|r| r.contains(va))` lookups elsewhere in this module
+/// have at most one answer whatever order they walk in.
+///
+/// # Why it hardly ever sorts any more (2026-09-17)
+///
+/// The sentence that used to stand here — "adaptive, so the sorted list this
+/// leaves behind costs a linear pass to re-confirm on the next call rather than a
+/// full sort" — was the most expensive assumption in this file. It is only true
+/// if nothing *re-orders* the list between two calls, and two things did: this
+/// module appended each new region at the end, and `munmap`'s clip-and-split
+/// appended its survivors there too, so every partial unmap moved a low region to
+/// the back. `rustc` interleaves ~53 000 `munmap`s with ~58 000 `mmap`s in one
+/// `zerocopy` compile, and the list it handed this function averaged **4 400
+/// regions with 18 % of calls arriving unsorted**.
+///
+/// Measured in-guest 2026-09-17, per `mmap`: 483 us total, of which 468 us was
+/// this sort — **97 % of the call, and 74 % of `rustc`'s entire wall clock**.
+/// Both appenders now insert in address order (`detach_eager_regions_in_range`
+/// puts survivors back where the region was; the placement below inserts at its
+/// own address), so the list is sorted on arrival and this reduces to the
+/// `windows(2)` check. The sort is kept rather than replaced by a debug
+/// assertion because a future writer that appends is then merely slow, not
+/// wrong — the invariant is an optimisation, and an optimisation that becomes a
+/// correctness requirement when nobody is looking is how this cost got here.
+/// `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §8.
 ///
 /// The scan is then a single pass. `cand` is the high-water mark of every region
 /// seen so far, and because the list is sorted, the first region starting at or
@@ -242,7 +263,11 @@ fn find_free_va_scan(regions: &mut [MmapRegion], pages: usize) -> (Option<usize>
     let Some(len) = pages.checked_mul(PAGE_SIZE as usize) else {
         return (None, 0);
     };
-    regions.sort_unstable_by_key(|r| r.start_va);
+    // Sorted on arrival is the steady state; checking costs one linear pass with
+    // no moves, against a sort that moved 4 400 elements per call.
+    if !regions.windows(2).all(|w| w[0].start_va <= w[1].start_va) {
+        regions.sort_unstable_by_key(|r| r.start_va);
+    }
     let mut cand = MMAP_BASE;
     let mut examined = 0usize;
     for r in regions.iter() {
@@ -272,6 +297,31 @@ fn find_free_va_scan(regions: &mut [MmapRegion], pages: usize) -> (Option<usize>
     } else {
         (Some(cand), examined)
     }
+}
+
+/// Put `region` into `regions` at its place in address order.
+///
+/// **Inserted, not appended.** [`find_free_va`] is a first-fit scan and needs the
+/// list sorted; it used to buy that with a full `sort_unstable_by_key` per
+/// `mmap`, and this is half of paying for it once here instead — the other half
+/// is `akuma_mmap::detach_eager_regions_in_range`, which puts `munmap`'s
+/// survivors back where the region was rather than on the end. With both, the
+/// list is sorted on arrival and the placer's sort never runs.
+///
+/// `partition_point` is a binary search, and the `insert` it feeds is a
+/// `memmove` of whatever sits above the new region — **zero elements in the
+/// common case**, because first-fit returns a low gap only when one was freed
+/// and otherwise places at the top of the arena, which is the end of the list.
+/// That is what makes this cheaper than the sort it replaces rather than the
+/// same cost moved: the sort touched all 4 400 regions on every call.
+///
+/// `<` and not `<=`: regions never overlap, so no two share a `start_va` and the
+/// two spellings can only differ on a list that is already broken — but `<` is
+/// the one that keeps equal keys in insertion order, which is what a reader
+/// checking this against `sort_unstable_by_key`'s (unstable) result should see.
+fn insert_region_sorted(regions: &mut Vec<MmapRegion>, region: MmapRegion) {
+    let at = regions.partition_point(|r| r.start_va < region.start_va);
+    regions.insert(at, region);
 }
 
 /// Is the caller a slotted user task with an address space of its own?
@@ -468,7 +518,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         pin_mapping_inode(file.inode);
         region = region.file_backed(file);
     }
-    usermode::with_current_regions(|regions| regions.push(region));
+    usermode::with_current_regions(|regions| insert_region_sorted(regions, region));
 
     if lazy_file.is_some() {
         // Nothing is allocated and nothing is read. `fault_in` fills pages from
@@ -1996,10 +2046,11 @@ fn va_placement_check(t: &mut Suite) {
         (MMAP_BASE + 6 * PG) as u64,
     );
 
-    // Order-independence. The list is not *kept* sorted — `detach` pushes
-    // survivors onto the end — so the placer must give the same answer whatever
-    // order it is handed the regions in. It gets there by sorting; this is the
-    // case that says it actually does, rather than assuming its input.
+    // Order-independence. The list IS kept sorted now (`insert_region_sorted`
+    // here, order-preserving survivors in `akuma_mmap`), and the placer skips
+    // its sort when it already is — so this is the case that says the skip is a
+    // skip and not a *requirement*. A future writer who appends must get a slow
+    // placer, never a wrong one.
     let mut reversed = [region(MMAP_BASE + 4 * PG, 2), region(MMAP_BASE, 2)];
     t.check_eq(
         "mmap va: the answer does not depend on region order",
@@ -2033,6 +2084,25 @@ fn va_placement_check(t: &mut Suite) {
         "mmap va: a 1000-region staircase places past the last step",
         placed.unwrap_or(0) as u64,
         (MMAP_BASE + (2 * N - 1) * PG) as u64,
+    );
+    // The invariant the sort-skip rests on: every insertion keeps the list in
+    // address order, including one that lands in a freed hole in the middle.
+    // Asserted on shape rather than time for the same reason as the line above —
+    // and this is the half a timing test could not see anyway, because a list
+    // that silently goes out of order is not slower here, it is slower on the
+    // *next* `mmap`, in a different process, minutes later.
+    let mut sorted_check: Vec<MmapRegion> = Vec::new();
+    for va in [4usize, 0, 8, 2, 6] {
+        insert_region_sorted(&mut sorted_check, region(MMAP_BASE + va * PG, 1));
+    }
+    t.check(
+        "mmap va: insertion keeps the region list in address order",
+        sorted_check.windows(2).all(|w| w[0].start_va < w[1].start_va),
+    );
+    t.check_eq(
+        "mmap va: insertion keeps every region",
+        sorted_check.len() as u64,
+        5,
     );
     t.check(
         "mmap va: the scan is one pass, not one pass per region",

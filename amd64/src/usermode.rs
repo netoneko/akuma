@@ -845,11 +845,28 @@ extern "C" fn syscall_handler(
     // Per-process syscall counters — the `[PSTATS]` machinery, aarch64 parity
     // (`akuma-kernel-glue` bumps the same counters through the `akuma-syscalls`
     // excursion hooks; this target's dispatcher is its own, so the bump lives
-    // here). Counts are exact. Times are the LAPIC tick — 10 ms, so a syscall
-    // shorter than that folds to 0 — which is the point: the 30 s sweep sorts
-    // by time, so what surfaces is where the *wall clock* went, i.e. the
-    // blocking syscalls, not the leaf-traffic ones.
-    let stats_t0 = crate::lapic::ticks();
+    // here). Counts are exact. Times are the **TSC**, microsecond resolution.
+    //
+    // This read the 10 ms LAPIC tick until 2026-09-17, and the note here said
+    // that was the point: a syscall shorter than a tick folds to 0, the sweep
+    // sorts by time, so what surfaces is where the wall clock went. That is
+    // true of a *blocking* syscall and false of a frequent short one, and the
+    // difference is not a rounding error — it inverts the answer. A 7 us
+    // `mmap` is charged a full 10 ms whenever a tick happens to land inside
+    // it, so its reported time is `calls x 10 ms x P(tick lands in it)`, which
+    // is an unbiased estimator of total time with a standard error of one
+    // whole tick per sample. At 59 043 `mmap` calls per `rustc` that read 8.27
+    // s against a per-call cost measured (`userspace/memprobe/c/mmap_scale.c`)
+    // at 7.7 us — 0.45 s — and there is no way to tell from the number alone
+    // which of the two is wrong. `tsc_uptime_us` is the resolution this target
+    // already has (`clock_gettime` moved onto it, see this file's
+    // `fault_cost_tests`); the cost is one `rdtsc` plus a 128-bit mul/div at
+    // each end, ~40 cycles, against a syscall floor three orders up.
+    //
+    // `None` while the TSC is uncalibrated (no PIT to measure it against): the
+    // epilogue then adds nothing rather than a fabricated duration, the same
+    // rule `tsc_uptime_us` itself follows.
+    let stats_t0 = crate::lapic::tsc_uptime_us();
     if let Some(p) = current_process() {
         p.syscall_stats.inc(nr);
     }
@@ -935,12 +952,14 @@ extern "C" fn syscall_handler(
     } else {
         syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
     };
-    if let Some(p) = current_process() {
-        p.syscall_stats.add_time_us(
-            nr,
-            crate::lapic::ticks().saturating_sub(stats_t0)
-                * u64::from(crate::lapic::US_PER_TICK_TARGET),
-        );
+    // `saturating_sub` rather than a plain one: a syscall that blocks can
+    // resume on another core, and while KVM and this machine both present an
+    // invariant, synchronised TSC, a kernel that assumes it cannot be read
+    // backwards is one errata away from a wildly wrong duration.
+    if let (Some(t0), Some(t1)) = (stats_t0, crate::lapic::tsc_uptime_us()) {
+        if let Some(p) = current_process() {
+            p.syscall_stats.add_time_us(nr, t1.saturating_sub(t0));
+        }
     }
     if trace {
         serial::puts("[sc] cpu=");

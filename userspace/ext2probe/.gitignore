@@ -1,2 +1,5 @@
 c/read_syscall_cost
 c/pin_reclaim
+c/fs_ops_cost
+c/x86_64
+c/aarch64
