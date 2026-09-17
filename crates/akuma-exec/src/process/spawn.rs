@@ -568,10 +568,22 @@ pub fn spawn_process_with_channel_ext(
         // slot bound and bail out as "`[proc] ring-3 entry with no slot`" on
         // amd64, silently on AArch64 only because that target's `bind_child_task`
         // is a no-op it never needed either way.
-        let bound = crate::process::table::with_process(pid, |p| {
+        // Set outside any lock `bind_child_task` itself might need: this
+        // target's implementation walks the `SPAWN` table and takes the BKL,
+        // and `with_process`'s callback runs under `PROCESS_TABLE`'s own
+        // exclusive lock (`with_active_mut`) — a different, narrower guard
+        // than the `&'static` shared borrow `lookup_process_shared` hands
+        // fork's own first-run window (see `run_registered_process`, and
+        // `AKUMA_EXEC_AUDIT.md` §6.E group 2 for why that split exists at
+        // all). Calling a heavier, lock-taking hook from inside the narrower
+        // lock is a lock-order hazard fork's call site never has, because
+        // fork calls `bind_child_task` on a `Box<Process>` that is not yet
+        // registered in the table at all.
+        let _ = crate::process::table::with_process(pid, |p| {
             p.thread_id = Some(tid);
-            (runtime().bind_child_task)(tid, p, ChildKind::Process)
         });
+        let bound = lookup_process_shared(pid)
+            .map(|p| (runtime().bind_child_task)(tid, p, ChildKind::Process));
 
         match bound {
             Some(Ok(())) => {

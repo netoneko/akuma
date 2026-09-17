@@ -4755,7 +4755,24 @@ pub fn bind_child_task(
     }
     crate::thread::clear_group_exiting(slot);
     crate::thread::clear_group_exit_status(slot);
-    crate::sched::seed_proc_slot(task_slot, slot);
+    // `seed_proc_slot` alone leaves `UserCtx::thread_slot` untouched. Every
+    // OTHER caller of this task-slot claim is a `fork`/`vfork`/`clone` child
+    // reached through `spawn_user_thread_initializing`'s two-phase claim,
+    // which never hands out a slot a `clone` thread is still occupying — the
+    // pool's own bookkeeping keeps those two kinds of slot apart in practice.
+    // `spawn_ext` is the first caller that claims a slot through the
+    // *one-phase* `spawn_user_thread_fn_for_process` primitive instead, which
+    // has no `bind_child_task`-shaped seed step of its own at all, so this is
+    // the only place anything for this target resets `thread_slot` for a
+    // process bind. Left stale, a recycled slot's old `clone` value would send
+    // `enter_ring3` down the `crate::thread::run_thread` branch for a plain
+    // process. Added alongside the `spawn.rs` lock-ordering fix
+    // (`docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`) that actually resolved the
+    // silent full-VM crash `spawn_ext` hit before both landed — this line's
+    // own effect was not isolated from that one, so treat it as a real
+    // correctness fix (a process is never a thread) rather than a proven
+    // independent cause.
+    crate::sched::seed_thread_slots(task_slot, slot, crate::thread::NO_THREAD);
     Ok(())
 }
 
