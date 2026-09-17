@@ -196,31 +196,81 @@ const EAGER_MAX_PAGES: usize = akuma_config::MMAP_EAGER_MAX_PAGES;
 /// something was explicitly unmapped from, so an address is recycled long after
 /// it went away rather than immediately.
 ///
-/// # Why no sort and no allocation
+/// # Why it sorts, and why that is still no allocation
 ///
-/// The region list is not kept in address order (`detach_eager_regions_in_range`
-/// pushes survivors onto the end), so a gap scan would have to sort — which
-/// means a `Vec` per `mmap`, on the path a program allocating memory takes. This
-/// walks instead: propose a candidate, and on an overlap jump the candidate to
-/// the end of whatever it hit. `cand` strictly increases on every restart, so
-/// the loop terminates in at most one pass per region.
-fn find_free_va(regions: &[MmapRegion], pages: usize) -> Option<usize> {
-    let len = pages.checked_mul(PAGE_SIZE as usize)?;
+/// The region list is not *kept* in address order (`detach_eager_regions_in_range`
+/// pushes survivors onto the end), so this sorts it before scanning. The first
+/// version refused to — "a gap scan would have to sort, which means a `Vec` per
+/// `mmap`, on the path a program allocating memory takes" — and walked instead:
+/// propose a candidate, and on an overlap jump the candidate past whatever it hit
+/// and **restart the walk**. `cand` strictly increases on every restart, so that
+/// terminated "in at most one pass per region", which is true, is what the doc
+/// comment said, and reads like a linear bound. It is O(n²) per call.
+///
+/// That cost is invisible until a process accumulates four figures of regions and
+/// is then the whole machine. The in-guest self-host build stopped making forward
+/// progress compiling `zerocopy`: its `rustc` had ~1500 mappings, mostly
+/// single-page (musl's mallocng `mmap`s one group at a time), every one of its
+/// `State: R` threads was still running and every `mmap` was still completing —
+/// each one paying for every mapping the process had ever made.
+/// `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §5 is the hunt.
+///
+/// `sort_unstable_by_key` is pattern-defeating quicksort: in place, **no
+/// allocation** — which is the whole objection above, and it does not apply — and
+/// adaptive, so the sorted list this leaves behind costs a linear pass to
+/// re-confirm on the next call rather than a full sort. Sorting the caller's list
+/// is sound because nothing reads it in order: regions never overlap (`MAP_FIXED`
+/// unmaps its range first, every other placement comes from here), so the
+/// `find(|r| r.contains(va))` lookups elsewhere in this module have at most one
+/// answer whatever order they walk in.
+///
+/// The scan is then a single pass. `cand` is the high-water mark of every region
+/// seen so far, and because the list is sorted, the first region starting at or
+/// past `cand + len` proves every byte below it is free.
+fn find_free_va(regions: &mut [MmapRegion], pages: usize) -> Option<usize> {
+    find_free_va_scan(regions, pages).0
+}
+
+/// [`find_free_va`], plus how many regions the scan looked at.
+///
+/// The count is the complexity assertion, and it exists because a boot suite can
+/// demand bounded *work* where it cannot reliably time anything:
+/// `va_placement_check` walks a thousand-region staircase — the shape that used
+/// to cost one full pass per region — and checks the scan touched each region at
+/// most once. Nothing in the kernel proper reads it.
+fn find_free_va_scan(regions: &mut [MmapRegion], pages: usize) -> (Option<usize>, usize) {
+    let Some(len) = pages.checked_mul(PAGE_SIZE as usize) else {
+        return (None, 0);
+    };
+    regions.sort_unstable_by_key(|r| r.start_va);
     let mut cand = MMAP_BASE;
-    'outer: loop {
-        let end = cand.checked_add(len)?;
+    let mut examined = 0usize;
+    for r in regions.iter() {
+        let Some(end) = cand.checked_add(len) else {
+            return (None, examined);
+        };
         if end > MMAP_TOP {
-            return None;
+            return (None, examined);
         }
-        for r in regions {
-            let start = r.start_va;
-            let stop = start.saturating_add(r.len_bytes());
-            if cand < stop && end > start {
-                cand = stop;
-                continue 'outer;
-            }
+        examined += 1;
+        // Sorted, so every region after this one starts at or past it: one that
+        // begins at or past the candidate's end proves the gap below is clear.
+        if r.start_va >= end {
+            return (Some(cand), examined);
         }
-        return Some(cand);
+        // Otherwise the candidate moves past this region's end. `max` is what
+        // covers a region lying entirely *below* the candidate — a `MAP_FIXED`
+        // mapping under `MMAP_BASE`, or one an earlier region already subsumed —
+        // which must not drag the candidate backwards.
+        cand = cand.max(r.start_va.saturating_add(r.len_bytes()));
+    }
+    let Some(end) = cand.checked_add(len) else {
+        return (None, examined);
+    };
+    if end > MMAP_TOP {
+        (None, examined)
+    } else {
+        (Some(cand), examined)
     }
 }
 
@@ -1889,52 +1939,84 @@ fn va_placement_check(t: &mut Suite) {
 
     t.check_eq(
         "mmap va: an empty space places at the base",
-        find_free_va(&[], 4).unwrap_or(0) as u64,
+        find_free_va(&mut [], 4).unwrap_or(0) as u64,
         MMAP_BASE as u64,
     );
 
     // One region at the base: the next mapping goes immediately after it, not
     // at some bumped-past address.
-    let one = [region(MMAP_BASE, 4)];
+    let mut one = [region(MMAP_BASE, 4)];
     t.check_eq(
         "mmap va: the next mapping abuts the first",
-        find_free_va(&one, 1).unwrap_or(0) as u64,
+        find_free_va(&mut one, 1).unwrap_or(0) as u64,
         (MMAP_BASE + 4 * PG) as u64,
     );
 
     // A hole between two regions is reused if the request fits, and skipped if
     // it does not. This is the whole difference from the bump allocator, both
     // directions asserted.
-    let holed = [region(MMAP_BASE, 2), region(MMAP_BASE + 4 * PG, 2)];
+    let mut holed = [region(MMAP_BASE, 2), region(MMAP_BASE + 4 * PG, 2)];
     t.check_eq(
         "mmap va: a 2-page hole is reused by a 2-page request",
-        find_free_va(&holed, 2).unwrap_or(0) as u64,
+        find_free_va(&mut holed, 2).unwrap_or(0) as u64,
         (MMAP_BASE + 2 * PG) as u64,
     );
     t.check_eq(
         "mmap va: a 2-page hole is skipped by a 3-page request",
-        find_free_va(&holed, 3).unwrap_or(0) as u64,
+        find_free_va(&mut holed, 3).unwrap_or(0) as u64,
         (MMAP_BASE + 6 * PG) as u64,
     );
 
-    // Order-independence. The list is not kept sorted — `detach` pushes
+    // Order-independence. The list is not *kept* sorted — `detach` pushes
     // survivors onto the end — so the placer must give the same answer whatever
-    // order it walks the regions in. A gap scan that assumed sorted input would
-    // pass the case above and fail this one.
-    let reversed = [region(MMAP_BASE + 4 * PG, 2), region(MMAP_BASE, 2)];
+    // order it is handed the regions in. It gets there by sorting; this is the
+    // case that says it actually does, rather than assuming its input.
+    let mut reversed = [region(MMAP_BASE + 4 * PG, 2), region(MMAP_BASE, 2)];
     t.check_eq(
         "mmap va: the answer does not depend on region order",
-        find_free_va(&reversed, 2).unwrap_or(0) as u64,
+        find_free_va(&mut reversed, 2).unwrap_or(0) as u64,
         (MMAP_BASE + 2 * PG) as u64,
+    );
+
+    // A region below the window must not drag the candidate backwards. Only
+    // `MAP_FIXED` can make one, and `rustc`'s own image is exactly that shape.
+    let mut low = [region(0x3010_0000, 4), region(MMAP_BASE, 2)];
+    t.check_eq(
+        "mmap va: a region under the base does not move the candidate",
+        find_free_va(&mut low, 1).unwrap_or(0) as u64,
+        (MMAP_BASE + 2 * PG) as u64,
+    );
+
+    // The shape that made this O(n²): a staircase of single-page regions with a
+    // single-page hole between each pair, which is what a process `mmap`ing one
+    // small allocation at a time accumulates. Handed in reversed, so the sort is
+    // doing real work rather than confirming an order the builder produced.
+    //
+    // The assertion is on *work*, not on wall time — a boot suite cannot time
+    // anything reliably, but it can demand the scan look at each region at most
+    // once. Before the sort this walk cost N passes of N regions; the placement
+    // it arrives at is the same one, which is the other half of the check.
+    const N: usize = 1000;
+    let mut staircase: Vec<MmapRegion> =
+        (0..N).rev().map(|i| region(MMAP_BASE + i * 2 * PG, 1)).collect();
+    let (placed, examined) = find_free_va_scan(&mut staircase, 2);
+    t.check_eq(
+        "mmap va: a 1000-region staircase places past the last step",
+        placed.unwrap_or(0) as u64,
+        (MMAP_BASE + (2 * N - 1) * PG) as u64,
+    );
+    t.check(
+        "mmap va: the scan is one pass, not one pass per region",
+        examined <= N,
     );
 
     // The window is finite and the refusal is `None`, not a wrapped address.
     t.check(
         "mmap va: a request larger than the window has no placement",
-        find_free_va(&[], MMAP_VA_SPAN / PG + 1).is_none(),
+        find_free_va(&mut [], MMAP_VA_SPAN / PG + 1).is_none(),
     );
     t.check(
         "mmap va: a page count that would overflow has no placement",
-        find_free_va(&[], usize::MAX).is_none(),
+        find_free_va(&mut [], usize::MAX).is_none(),
     );
 }

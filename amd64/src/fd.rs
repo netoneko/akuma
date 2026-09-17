@@ -2018,7 +2018,15 @@ pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
             .collect::<Vec<MapRow>>()
     })?;
     let mut rows = regions;
-    let extents: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.1)).collect();
+    // Sorted because `collect_leaf_runs` binary-searches it: the region list
+    // itself is in no particular order, and a linear "is this page already
+    // covered?" test per leaf is the second half of the `mmap` blowup in
+    // `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §5 — reading a
+    // 1500-region process's `maps` cost 1500 comparisons for every one of its
+    // resident pages, which is why a 64 KB read of the file returned in under a
+    // second and a 2 MB read of the same file never returned at all.
+    let mut extents: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.1)).collect();
+    extents.sort_unstable();
     let leaves = akuma_exec::process::with_process(pid, |p| {
         collect_leaf_runs(&p.address_space.lock(), &extents)
     })?;
@@ -2028,6 +2036,10 @@ pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
 }
 
 /// Present user leaves outside every extent in `skip`, coalesced into runs.
+///
+/// `skip` must be **sorted by start**, which [`covered_by`] relies on; the
+/// extents in it never overlap (regions do not — `MAP_FIXED` unmaps its range
+/// before it records one, and every other placement comes from `find_free_va`).
 ///
 /// `for_each_user_leaf` visits in ascending VA order (it walks each level's
 /// indices upward), which is what makes a single-pass coalesce correct rather
@@ -2041,7 +2053,7 @@ fn collect_leaf_runs(uas: &akuma_mmu::UserAddressSpace, skip: &[(usize, usize)])
     let mut run: Option<MapRow> = None;
     uas.for_each_user_leaf(|leaf| {
         let (va, prot) = (leaf.va, leaf.prot);
-        if !prot.user || skip.iter().any(|&(s, e)| va >= s && va < e) {
+        if !prot.user || covered_by(skip, va) {
             // Flush across a gap a region already covers, so a mapping either
             // side of it is not merged through it.
             if let Some(r) = run.take() {
@@ -2066,6 +2078,54 @@ fn collect_leaf_runs(uas: &akuma_mmu::UserAddressSpace, skip: &[(usize, usize)])
         rows.push(r);
     }
     rows
+}
+
+/// Does any extent in the sorted, non-overlapping `skip` contain `va`?
+///
+/// `partition_point` lands one past the last extent starting at or below `va`,
+/// so the only extent that can contain it is the one before that — the reason
+/// this is O(log n) rather than the linear `any` it replaced.
+fn covered_by(skip: &[(usize, usize)], va: usize) -> bool {
+    match skip.partition_point(|&(s, _)| s <= va).checked_sub(1) {
+        Some(i) => va < skip[i].1,
+        None => false,
+    }
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// [`covered_by`] must answer exactly what the linear scan it replaced answered.
+///
+/// The swap is invisible when it is wrong. A `/proc/<pid>/maps` that loses a hit
+/// prints a page twice — once from its region and once as a leaf run — and one
+/// that gains a hit silently drops a run; both render a plausible-looking file,
+/// and the only reader that would notice is a person reading it. So the search
+/// is checked against its own predecessor as an oracle, page by page across the
+/// shapes the real extent list has: an extent at the very first address, two
+/// abutting extents, a one-page hole, a wide one, and the space either side of
+/// the whole list.
+fn maps_skip_lookup_check(t: &mut Suite) {
+    const PG: usize = 4096;
+    let base = 0x1_0000_0000usize;
+    // Out of order on the way in, because the caller is what sorts: this is the
+    // case that says the sort is load-bearing rather than incidental.
+    let mut skip = [
+        (base + 8 * PG, base + 12 * PG),
+        (base, base + PG),
+        (base + 2 * PG, base + 3 * PG),
+        (base + 3 * PG, base + 4 * PG),
+    ];
+    skip.sort_unstable();
+    let mut agreed = true;
+    for i in 0..20usize {
+        let va = (base - 2 * PG) + i * PG;
+        let oracle = skip.iter().any(|&(s, e)| va >= s && va < e);
+        agreed &= covered_by(&skip, va) == oracle;
+    }
+    t.check("proc: the maps skip lookup agrees with a linear scan", agreed);
+    t.check(
+        "proc: an empty skip list covers nothing",
+        !covered_by(&[], base),
+    );
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -2581,6 +2641,7 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         }
 
         proc_consistency_check(t);
+        maps_skip_lookup_check(t);
 
         // `/proc/mounts` + `statfs`, the pair `busybox df` needs. `df` reads
         // the file to learn what to ask about, then calls `statfs` once per

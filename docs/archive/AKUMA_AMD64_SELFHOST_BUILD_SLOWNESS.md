@@ -12,10 +12,12 @@ in-kernel, dominated by `read`) — see "The `-j4` verification run" and
 port-`0x61` glue `microvm` lacks, TSC-resolution `clock_gettime`, the
 virtio-blk allocate-and-copy on every aligned read/write, and per-process
 CPU time that was unconditionally zero on this target) — see "Continued
-2026-09-17" below. Re-timing hit a NEW, distinct, root-caused-but-unfixed
-wall: `mmap` placement is O(n²) in the region count, so a process doing many
-small mmaps (rustc's own allocator) crawls to a halt once it accumulates
-roughly four figures of regions — §5 of that section.*
+2026-09-17" below. Re-timing hit a NEW, distinct wall: `mmap` placement was
+O(n²) in the region count, so a process doing many small mmaps (rustc's own
+allocator) crawled to a halt once it accumulated roughly four figures of
+regions — §5 of that section. **Fixed 2026-09-17** (§5's "The fix"): the
+placer sorts and scans once, and `/proc/<pid>/maps` binary-searches the same
+extents instead of scanning them per page.*
 
 ## Question
 
@@ -566,7 +568,7 @@ architecture-neutral code in a shared crate; the aarch64 build was rebuilt
 clean afterward and is unaffected (the new code is
 `#[cfg(target_arch = "x86_64")]`-gated).
 
-### 5. OPEN: `find_free_va` is O(n²) per `mmap` call, and a process with ~1000+ regions crawls to a halt
+### 5. FIXED (2026-09-17): `find_free_va` was O(n²) per `mmap` call, and a process with ~1000+ regions crawled to a halt
 
 Attempting to re-time the in-guest self-host build (Firecracker, `vcpu_count:
 1`, `mem_size_mib: 6144`, deliberately matching this doc's own "1-vCPU
@@ -606,18 +608,76 @@ subsequent `mmap` costs proportional to everything already accumulated."
 Nothing is deadlocked; every call is still completing, just at cost growing
 quadratically with a count that only ever grows for a process like `rustc`.
 
-**Not fixed this session, and deliberately not attempted under time
-pressure.** The real fix is a data-structure change — `akuma-mmap`'s region
-list is a flat, intentionally-unsorted `Vec` everywhere (placement,
-`/proc/maps` rendering, almost certainly `munmap`'s clip-and-split too; see
-the "why no sort" comment at `mm.rs:198` for why it was chosen that way), and
-real Linux uses a red-black/interval tree for exactly this reason (O(log n)
-placement). This crate is shared between both kernels, so the fix needs
-testing on both architectures before it can be trusted — a dedicated session,
-not a tail end of this one. The FC guest was left running rather than killed,
-in case a live low-level trace becomes useful before it is un-wedged. A fresh
-boot with fixes #1-#4 and a normal `cargo clean && cargo build` trial is the
-fallback to get a real timing number without waiting on this fix.
+#### The fix (2026-09-17, same day)
+
+**It sorts.** `find_free_va` now calls `sort_unstable_by_key(|r| r.start_va)`
+on the caller's list and scans it **once**: `cand` is the high-water mark of
+every region seen so far, and because the list is sorted, the first region
+starting at or past `cand + len` proves every byte below it is free. The
+restart — `continue 'outer`, which re-entered the walk at the top of the list
+— is gone.
+
+Two things the paragraph above got wrong, and they are why this was a small
+change rather than the dedicated session it was scoped as:
+
+- **The objection to sorting does not hold.** The `mm.rs:198` comment ruled it
+  out because "a gap scan would have to sort — which means a `Vec` per `mmap`,
+  on the path a program allocating memory takes". `sort_unstable_by_key` is
+  pattern-defeating quicksort: **in place, no allocation**. It is also
+  adaptive, so the sorted list each call leaves behind costs a linear pass to
+  re-confirm on the next one rather than a full sort — the steady state is
+  O(n), not O(n log n).
+- **`find_free_va` is not shared, and neither is the region list's use of it.**
+  It is amd64-only. The AArch64 kernel does not place this way at all: it
+  carries a per-process bump cursor plus a free list
+  (`akuma_exec::process::ProcessMemory::next_mmap` / `free_regions`), and
+  `MMAP_BASE`/`find_free_va` appear nowhere in `src/`. `akuma-mmap` — the
+  shared crate — was not touched, so there was no cross-architecture exposure
+  to test for.
+
+Sorting the caller's list is sound because nothing reads it in order. Regions
+never overlap: `MAP_FIXED` `unmap_range`s its target before it records
+anything, and every other placement comes from `find_free_va` itself — so the
+`find(|r| r.contains(va))` lookups in `fault_in` and `dontneed_range` have at
+most one answer whatever order they walk in.
+
+**`/proc/<pid>/maps` was a second, independent quadratic** in the same file,
+and the reason the 64 KB read returned in under a second while the 2 MB read
+never returned. `collect_leaf_runs` (`amd64/src/fd.rs`) asked
+`skip.iter().any(...)` — a linear scan of every region extent — **once per
+resident page**, so rendering the file cost O(regions × pages). `pid_map_rows`
+now sorts the extents (they are non-overlapping, for the reason above) and the
+lookup is a `partition_point` binary search.
+
+**Verification.** Boot suite under local QEMU TCG (`-M microvm`, SMP=1):
+**752 passed, 0 failed** — §1's 747 plus the five new checks below. Clippy
+clean on the amd64 target with and without
+`no-tests`; the full host test suite green (`akuma-mmap` 61/61 among them,
+unchanged because the crate was not touched). `cat /proc/self/maps` under the
+fixed kernel renders the expected four ascending rows (text, data, mmap arena,
+stack).
+
+Both fixes are pinned by self-tests that assert the *shape* rather than a
+time, because a boot suite cannot time anything reliably:
+
+- `find_free_va_scan` returns the number of regions the scan examined, and
+  `va_placement_check` walks a **1000-region staircase** — single-page regions
+  with a single-page hole between each pair, the shape `rustc` accumulates —
+  handed in reversed, then checks the placement is right *and* that the scan
+  touched each region at most once. The old walk cost 1000 passes of 1000
+  regions on that input.
+- `maps_skip_lookup_check` runs the binary search against the linear scan it
+  replaced as an **oracle**, page by page, over an out-of-order extent list
+  containing an extent at the first address, two abutting extents, a one-page
+  hole and a wide one. A wrong answer here does not crash anything — it prints
+  a page twice or drops a run, and renders a plausible-looking file — so the
+  predecessor is the only thing that can catch it.
+
+**Still to do: re-time the build.** This removes the wall; it does not by
+itself produce the timing number §"Iterate" item 3 wants. A fresh FC boot with
+fixes #1-#5 and a clean `cargo build` is what closes that out. The wedged
+2026-09-17 guest is still up (kill it before reusing the rig — see "Status and
+next steps"), and the `-j4` silent wedge above is a separate, still-open bug.
 
 ## Background
 
