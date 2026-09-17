@@ -1117,6 +1117,40 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 serial::puts(" <<<\n");
                 0
             }
+            // The box family — Akuma-private 315-318/324/325, forwarded raw to
+            // `akuma-syscalls-glue` (`sc-containers`, on by default here since
+            // the `mount`/`umount2` pass). Every one of these already has a
+            // real, arch-neutral implementation the AArch64 kernel's `box`/
+            // `herd` use today; nothing here does anything but hand the same
+            // six raw argument words across. `fork_process`'s
+            // `Process::inherit_from` already copies `box_id`/`namespace` from
+            // parent to child on **this** target too (shared `akuma-exec`
+            // code, unmodified), so a process born into a box via `spawn_ext`
+            // stays in it across every `fork`/`clone` its descendants make —
+            // there was no separate propagation step to add.
+            //
+            // `spawn_ext(path, options_ptr, options_len)` — `SpawnOptions`'s
+            // `box_id` field is what a boxed process is actually born with;
+            // plain `sys_spawn`(301) above always births box 0, on purpose,
+            // and stays that way.
+            315 => to_glue_raw(akuma_syscalls_linux::nr::SPAWN_EXT, [a1, a2, a3, 0, 0, 0]),
+            // `register_box(id, name_ptr, name_len, root_ptr, root_len, primary_pid)`.
+            316 => to_glue_raw(akuma_syscalls_linux::nr::REGISTER_BOX, [a1, a2, a3, a4, a5, a6]),
+            // `kill_box(box_id)`.
+            317 => to_glue_raw(akuma_syscalls_linux::nr::KILL_BOX, [a1, 0, 0, 0, 0, 0]),
+            // `reattach(pid, force)` — `box grab`'s terminal-takeover primitive.
+            318 => to_glue_raw(akuma_syscalls_linux::nr::REATTACH, [a1, a2, 0, 0, 0, 0]),
+            // `set_box_stack(box_id, stack)` — `stack == 1` (NetBSD rump) is a
+            // real no-op refusal on this target: amd64 has no `akuma-rump`
+            // dependency at all, so nothing on this kernel can ever answer as
+            // a rump box's network stack. `stack == 0` (smoltcp, the only
+            // stack amd64 has) is a genuine accept.
+            324 => to_glue_raw(akuma_syscalls_linux::nr::SET_BOX_STACK, [a1, a2, 0, 0, 0, 0]),
+            // `mount_in_ns(box_id, target_ptr, target_len, fstype_ptr, fstype_len, data_ptr)`
+            // — composes a box's namespace mounts from box 0, before anything
+            // runs in it. See `container.rs`'s own header for why this is
+            // never a boxed process's own call to make.
+            325 => to_glue_raw(akuma_syscalls_linux::nr::MOUNT_IN_NS, [a1, a2, a3, a4, a5, a6]),
             _ => errno::ENOSYS,
         };
     }

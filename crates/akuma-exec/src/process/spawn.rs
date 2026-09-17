@@ -12,7 +12,7 @@ use crate::process::table::{register_process};
 use crate::process::children::{lookup_process_shared, current_terminal_state};
 use crate::process::lifecycle::LifecycleGuard;
 
-use super::{Process, enter_user_mode_checked, read_current_pid, get_box_name};
+use super::{ChildKind, Process, read_current_pid, get_box_name};
 
 /// Longest `#!` line honoured, matching Linux's `BINPRM_BUF_SIZE`.
 ///
@@ -549,31 +549,59 @@ pub fn spawn_process_with_channel_ext(
         let tid = crate::threading::current_thread_id();
 
         // Update thread_id in the registered process (Arc clone in the closure
-        // is refcount-only — no allocation).
-        if let Some(ch) = crate::process::table::with_process(pid, |p| {
+        // is refcount-only — no allocation), and bind whatever per-task-slot
+        // state this target's `enter_user` needs but this crate has no concept
+        // of (`ExecRuntime::bind_child_task` — amd64's `CR3` root and `SPAWN`
+        // row; AArch64 has nothing to do here).
+        //
+        // `fork_process` calls this from the *parent*, before the child's
+        // thread slot can possibly run, because its spawn primitive
+        // (`spawn_user_thread_initializing`) publishes the slot as READY only
+        // after binding completes. This path's primitive
+        // (`spawn_user_thread_fn_for_process`) has no such two-phase gate — the
+        // closure IS the child, already running, the moment it starts — so the
+        // bind has to happen here, as this thread's own first action, before
+        // `THREAD_PID_MAP` publishes it (the same ordering `bind_child_task`'s
+        // contract requires) and before anything below reads the state it
+        // seeds. Missing this made every `spawn_ext`-created process — which is
+        // every boxed process — reach `run_registered_process` with no task
+        // slot bound and bail out as "`[proc] ring-3 entry with no slot`" on
+        // amd64, silently on AArch64 only because that target's `bind_child_task`
+        // is a no-op it never needed either way.
+        let bound = crate::process::table::with_process(pid, |p| {
             p.thread_id = Some(tid);
-            spawn_channel.clone()
-        }) {
-            // Register in THREAD_PID_MAP so on_thread_cleanup can reap this
-            // process when the thread slot is recycled.  Without this, the
-            // process becomes a permanent zombie. The wrapper also refreshes
-            // the per-thread identity cache (same critical section).
-            crate::process::table::thread_pid_map_insert(tid, pid);
+            (runtime().bind_child_task)(tid, p, ChildKind::Process)
+        });
 
-            // Move the channel registration to the correct TID
-            remove_channel(0);
-            register_channel(tid, ch);
+        match bound {
+            Some(Ok(())) => {
+                // Register in THREAD_PID_MAP so on_thread_cleanup can reap this
+                // process when the thread slot is recycled.  Without this, the
+                // process becomes a permanent zombie. The wrapper also refreshes
+                // the per-thread identity cache (same critical section).
+                crate::process::table::thread_pid_map_insert(tid, pid);
 
-            // Execute the process (already in the table)
-            run_registered_process(pid);
-        } else {
-            log::debug!("[Process] FATAL: PID {} disappeared during spawn", pid);
-            // Mark terminated BEFORE parking: the scheduler then switches away permanently
-            // (reconciling the BKL to the next thread) instead of this thread busy-spinning
-            // in `yield_now` holding the Big Kernel Lock forever, which freezes every peer
-            // core under shared-kernel SMP.
-            crate::threading::mark_current_terminated();
-            loop { crate::threading::yield_now(); }
+                // Move the channel registration to the correct TID
+                remove_channel(0);
+                register_channel(tid, spawn_channel);
+
+                // Execute the process (already in the table)
+                run_registered_process(pid);
+            }
+            Some(Err(e)) => {
+                log::debug!("[Process] FATAL: bind_child_task failed for PID {}: {}", pid, e);
+                crate::threading::mark_current_terminated();
+                loop { crate::threading::yield_now(); }
+            }
+            None => {
+                log::debug!("[Process] FATAL: PID {} disappeared during spawn", pid);
+                // Mark terminated BEFORE parking: the scheduler then switches away permanently
+                // (reconciling the BKL to the next thread) instead of this thread busy-spinning
+                // in `yield_now` holding the Big Kernel Lock forever, which freezes every peer
+                // core under shared-kernel SMP.
+                crate::threading::mark_current_terminated();
+                loop { crate::threading::yield_now(); }
+            }
         }
     })
     .map_err(|e| format!("Failed to spawn thread: {}", e))?;
@@ -587,11 +615,10 @@ pub fn spawn_process_with_channel_ext(
 
 /// Execute a process that is already registered in the PROCESS_TABLE
 pub(crate) fn run_registered_process(pid: Pid) -> ! {
-    // `prepare_for_execution`, `address_space.activate()` and
-    // `enter_user_mode_checked` are all `&self` — `Process::state` and the I/O
-    // reset flags became atomics (`AKUMA_EXEC_AUDIT.md` §6.E group 2a) — so this
-    // first-run window reaches its process through a safe shared borrow instead
-    // of `with_process_exclusive`.
+    // `prepare_for_execution`, `address_space.activate()` and `runtime().enter_user`
+    // are all `&self` — `Process::state` and the I/O reset flags became atomics
+    // (`AKUMA_EXEC_AUDIT.md` §6.E group 2a) — so this first-run window reaches
+    // its process through a safe shared borrow instead of `with_process_exclusive`.
     let Some(proc) = lookup_process_shared(pid) else {
         // Reached only if the process vanished between spawn and first run.
         panic!("Process not found in run_registered_process");
@@ -606,9 +633,18 @@ pub(crate) fn run_registered_process(pid: Pid) -> ! {
     // Now safe to enable IRQs - TTBR0 is set to user tables
     (runtime().enable_irqs)();
 
-    // Enter user mode via ERET - this never returns
+    // Enter user mode — this never returns. `Process::run` (the fork/exec
+    // resume path) goes through the same `enter_user` hook; this bare-called
+    // `akuma_el0_entry::enter_user_mode_checked` directly instead, which is an
+    // AArch64-only `eret` and panics as "on a host build" on every other
+    // target. Silent on AArch64 only because that target's registered
+    // `enter_user` hook happens to BE that same function
+    // (`crate::runtime::Runtime::enter_user`'s own doc comment) — on amd64,
+    // whose hook is its own `usermode.rs` entry mechanism, `spawn_ext`-created
+    // processes (and so every boxed process, since box entry is `spawn_ext`)
+    // panicked the instant they tried to run at all.
     let ctx = proc.image.lock().context;
-    enter_user_mode_checked(&ctx)
+    (runtime().enter_user)(&ctx)
 }
 
 #[cfg(test)]
