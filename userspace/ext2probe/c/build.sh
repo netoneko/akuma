@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PROBES="read_syscall_cost pin_reclaim"
+PROBES="read_syscall_cost pin_reclaim fs_ops_cost"
 ARCHES="${1:-aarch64 x86_64}"
 
 for ARCH in $ARCHES; do

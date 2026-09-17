@@ -403,6 +403,58 @@ guest never idles into the `[PSTATS]` sweep).
   the pre-investigation binary is backed up beside it as
   `akuma-amd64.pre-smpstress`.
 
+### Cross-arch TCG comparison (2026-09-17) — the read path is the gap
+
+Same probe binaries built from the same sources, both kernels under QEMU
+TCG, SMP=4, same args. `ext2probe 25 4` (before-pass numbers):
+
+| op | amd64 | aarch64 | ratio |
+|---|---:|---:|---:|
+| create | 279,984 µs | 134,123 µs | 2.1× |
+| seq_write (2 MiB) | 88,639 µs | 51,962 µs | 1.7× |
+| **seq_read (2 MiB)** | **5,661 µs** | **375 µs** | **15×** |
+| list_dir | 2,432 µs | 382 µs | 6.4× |
+| delete | 90,988 µs | 50,063 µs | 1.8× |
+| mass delete | 3640 files/s | 6396 files/s | 1.8× |
+
+`read_syscall_cost` (8 MiB warm `/tmp/rsc.bin`; medians, 100×100):
+
+| arm | aarch64 | amd64 | ratio |
+|---|---:|---:|---:|
+| getpid (syscall floor) | 140 ns | 1,170 ns | 8.4× |
+| null read (len=0) | 250 ns | 490 ns | 2.0× |
+| zero 4 KiB | 450 ns | 8,610 ns | 19× |
+| zero 64 KiB | 2,920 ns | 122,100 ns | 42× |
+| file pread 4 KiB | 820 ns | 15,360 ns | 19× |
+| file pread 64 KiB | 6,370 ns | 147,620 ns | 23× |
+
+Reading: the syscall *entry* floor is 8× (TCG x86 entry/swapgs cost —
+present on every call but small in absolute terms). The killer is the
+**data-movement path**: `zero 64 KiB` moves no filesystem data at all —
+syscall + fill of the user buffer — and amd64 pays 122 µs for what aarch64
+does in 2.9 µs (~540 MB/s vs ~22 GB/s). The per-byte cost, not the syscall
+count, is what made rustc spend 258 s in-kernel on 62 k reads. Whatever the
+amd64 `copy_to_user`/user-buffer fill does (byte-wise loop? no ERMS
+`rep movsb`? per-page fault churn?), it is ~40× off aarch64's, and fixing
+it is worth more than every other lever combined. Note the amd64 numbers
+are *per-call linear* in length (zero 8K ≈ 2× zero 4K), so this is a
+throughput problem, not per-syscall overhead.
+
+One correctness divergence rode along: `ext2probe` pinned-reclaim returned
+**0 %** of deleted mapped-file bytes on amd64 vs **85 %** on aarch64 —
+`ext2probe: SPACE LEAK (unlink of a MAPPED file did not return its blocks
+— pin/deferral leak)`. Verdict otherwise `NO REGRESSION` on both.
+
+Probe mechanics for amd64 INIT-runs: `read_syscall_cost` needs
+`/tmp/rsc.bin` to already exist (`busybox dd if=/dev/zero of=/tmp/rsc.bin
+bs=1M count=8` first — via the sshd image, since bare INIT boots have no
+shell); disk built with `sh amd64/mkdisk.sh /tmp/probe-disk.img 128` plus
+debugfs injection of `probes/{ext2probe,read_syscall_cost,execleak2}`;
+ssh auth takes `-i target/x86_64-unknown-none/release/amd64-ssh-test-key`.
+Beware: backgrounded QEMU processes are reaped between tool calls — run
+boot+probe+teardown inside one shell invocation. Raw logs:
+`logs/j4-wedge-20260917/` and `/tmp/probe-runs/` (session-local).
+
 ## What the profiling sessions turned up along the way
 
 - **aarch64 devbox thread-spawn cap + temporary fork exhaustion.** A process
@@ -759,9 +811,112 @@ never tested:
   the overread, every control file was empty — and a probe that scored
   INCONCLUSIVE as OK would have reported a working control that never ran.
 
+### 7. The amd64-is-slower-at-filesystem-ops premise did NOT reproduce — and the one real defect behind it (2026-09-17)
+
+*Prompted by a cross-architecture probe sweep reporting amd64 slower on every
+ext2 op under TCG SMP=4, with `seq_read` **15x** and `list_dir` **6.4x** called
+out as dramatic outliers. Neither reproduces.*
+
+**Measure with one binary or do not measure.** That sweep compared two different
+probes — the Rust `ext2probe` builds only for aarch64 — so the ratio included
+whatever the two programs did differently. `userspace/ext2probe/c/fs_ops_cost.c`
+is the same phases as one static musl binary that runs on both kernels and on
+Linux. Same binary, both under QEMU TCG, SMP=1, 2048 MB, 2 MiB working set:
+
+| op | amd64 | aarch64 | ratio |
+|---|---|---|---|
+| create | 14 328 us | 24 065 us | 0.60x |
+| seq_write | 110 590 | 199 400 | 0.55x |
+| seq_read_cold | 6 334 | 22 171 | 0.29x |
+| **seq_read_warm** | **6 186** | **16 881** | **0.37x** |
+| **list_dir** | **1 164** | **7 265** | **0.16x** |
+| delete | 6 426 | 11 437 | 0.56x |
+
+amd64 is faster on every op, including both claimed outliers. **RETRACTED as a
+measurement — do not quote these numbers.** Three defects, any one of which is
+disqualifying:
+
+1. **The arms were not run under the same conditions.** Another agent's QEMU —
+   at times a 4-vCPU TCG guest on an 8-performance-core host — was running
+   throughout, and the two arms ran about five minutes apart, so they saw
+   *different* background load rather than the same one.
+2. **The guest environments differ.** The aarch64 arm ran through `ssh` on a
+   devbox with `herd` and `sshd` sharing its one TCG vCPU (that kernel has no
+   `init=`); the amd64 arm ran as init with nothing else in the guest.
+3. **One sample each**, on a workload whose fastest phase is a millisecond.
+
+What survives is only the negative claim, and it survives because it does not
+depend on the magnitudes: a same-binary run does not reproduce anything like
+15x, in either direction, so **the 15x/6.4x is not a property of the read
+path** and no fix should be aimed at it. Establishing what the real ratio is
+needs a quiet host, matched guest environments (run the amd64 arm through `ssh`
+too), and interleaved repeats reported as a minimum rather than a single
+sample — `min` being the right statistic when the noise is other people's CPU
+load, which can only ever add.
+
+Two traps worth keeping, both of which produce a confident wrong table:
+
+- **A TCG cross-architecture ratio has a floor well above 1.0.** An x86_64 guest
+  on an ARM host is translated instruction-by-instruction; an aarch64 guest on
+  the same host is nearly a pass-through. Only *relative* standouts within one
+  run mean anything.
+- **`gettimeofday` reads `CLOCK_REALTIME`, which is 0 on a NIC-less boot** (no
+  SNTP, so "never synced"). The probe's first run reported every phase as `0 us`
+  and a complete, plausible-looking table. It uses `CLOCK_MONOTONIC` now.
+
+#### The real defect the sweep led to: amd64's ext2 block cache was 16 MB
+
+Reading the read path to explain the (non-existent) gap found one anyway.
+`akuma_ext2::set_cache_cap_bytes` is called from `akuma_vfs_glue::fs::init` —
+the **AArch64** mount path. This target mounts ext2 itself, and `amd64/src/fs.rs`
+had picked up that path's `fpcache_init` call and its inode-freed hook (both
+with comments explaining exactly why they had to be restated here) but **not
+this one**. So `CACHE_CAP_BYTES` kept `akuma-ext2`'s `DEFAULT_CACHE_CAP_BYTES`:
+16 MB, a value whose own doc comment says it is sized for `cargo test`. AArch64
+runs `min(RAM/8, akuma_config::FSCACHE_CEILING_MB)` — 384 MB where there is RAM
+for it.
+
+It is invisible to any benchmark with a small working set, which is why it
+survived: 2 MiB fits in 16 MB, every read is a hit either way. It is a *build*
+that pays — `rustc` reading rlibs has a working set in the hundreds of
+megabytes, which is the shape `BKL_RUSTC_SCALING_BASELINE.md` sized the ceiling
+against.
+
+**A/B, 32 MB working set** — which is the point: it crosses the old cap.
+
+Unlike the retracted table above, this comparison survives a noisy host, and
+the reason is worth stating because it is the general rule. The two arms differ
+in **one kernel constant** and nothing else, and they were run *both* ways:
+concurrently — where they share the same background load at the same instant by
+construction — and serially back to back. Concurrent gave 830 823 -> 205 262 us
+(4.0x), serial gave the table below (3.8x). Two methodologies with opposite
+contention properties agreeing to within 5 % is what makes the read result
+trustworthy on a host that was not quiet.
+
+| op | cap = 16 MB | cap = min(RAM/8, 384 MB) |
+|---|---|---|
+| seq_read_cold | 382 118 us | **98 421 us — 3.9x** |
+| seq_read_warm | 373 252 us | **98 829 us — 3.8x** |
+| seq_write | 2 052 456 | 2 180 738 (6 % slower) |
+| create | 14 564 | 14 166 |
+| delete | 7 139 | 8 539 (20 % slower) |
+| list_dir | 1 576 | 1 281 |
+
+The read win is ~3.9x and reproduced under both methodologies. The write and
+delete regressions are **one sample each, on a contended host**, and 6 % / 20 %
+is exactly the size that contention produces — they are not separable from
+noise and must not be reported as a regression without repeats. A bigger cache
+holding more dirty blocks is a plausible mechanism if they turn out to be real.
+Boot suite 752/752, clippy clean.
+
+`--seq-mb=N` on the probe is what makes this measurable at all: a working set
+that fits the cap reports the hit path however big the cap is, so the default
+2 MiB pass cannot tell a 16 MB cache from a 384 MB one.
+
 ## Background
 
 - `docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md` — the AArch64 original of §6's leak.
+- `docs/archive/BKL_RUSTC_SCALING_BASELINE.md` — where §7's 384 MB ceiling comes from.
 - `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — the self-host bring-up stages.
 - `docs/runbooks/selfhost-kernel-build.md` — aarch64 self-host procedure,
   detach/poll mechanics, and the aarch64 baseline numbers (44 s clean build).

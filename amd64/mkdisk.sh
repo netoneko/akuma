@@ -209,7 +209,7 @@ done
 # `libakuma` — which is why they exist: the Rust `ext2probe` beside them does not
 # build for x86_64, so its measurements could not be run on this kernel at all.
 # `pin_reclaim` is the `unlink`-of-a-mapped-file space-leak gate.
-for P in pin_reclaim read_syscall_cost; do
+for P in pin_reclaim read_syscall_cost fs_ops_cost; do
     SRC="userspace/ext2probe/c/x86_64/$P"
     [ -f "$SRC" ] && "$DEBUGFS" -w -R "write $SRC bin/$P" "$IMG" >/dev/null 2>&1
 done

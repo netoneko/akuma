@@ -358,6 +358,32 @@ pub fn init_vfs() {
         akuma_fpcache::init(akuma_pmm::total_count() * 4096);
     }
 
+    // **The ext2 block cache's cap, which this target was never setting.**
+    //
+    // Same story as the `fpcache_init` call above and the same root cause —
+    // `akuma_vfs_glue::fs::init` is the AArch64 mount path and this target
+    // mounts ext2 itself — but this one was missed, so `CACHE_CAP_BYTES` kept
+    // `akuma-ext2`'s `DEFAULT_CACHE_CAP_BYTES`: **16 MB**, a value whose own
+    // doc comment says it is sized for `cargo test` ("large enough to exercise
+    // eviction, small enough for host tests"). The AArch64 kernel runs
+    // `min(RAM/8, FSCACHE_CEILING_MB)` — 384 MB on a box with the RAM for it.
+    //
+    // Invisible on anything with a small working set: a 2 MiB file fits in
+    // 16 MB, so every read is a hit either way and no benchmark that stays
+    // under the cap can see the difference. It is a build that pays — `rustc`
+    // reading rlibs has a working set in the hundreds of megabytes, which is
+    // the shape `docs/archive/BKL_RUSTC_SCALING_BASELINE.md` measured the
+    // ceiling against in the first place.
+    //
+    // Same formula as the shared path, deliberately not a second policy: the
+    // ceiling is `akuma_config::FSCACHE_CEILING_MB` and the RAM term is the
+    // PMM's own count, so the two kernels size the cache identically.
+    {
+        let ram_bytes = akuma_pmm::total_count().saturating_mul(4096);
+        let ceiling = akuma_config::FSCACHE_CEILING_MB * 1024 * 1024;
+        akuma_ext2::set_cache_cap_bytes(core::cmp::min(ram_bytes / 8, ceiling));
+    }
+
     akuma_vfs_glue::init();
 
     // 5b slice 3: mount the real `ProcFilesystem`.
