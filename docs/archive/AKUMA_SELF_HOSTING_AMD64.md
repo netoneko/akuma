@@ -2010,6 +2010,15 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   login shell; and `nca` one-shot and interactive against **z.ai**
    │   (`glm-5.3-flash`), streaming deltas and reporting cost.
    │
+   ├──► **What is still not working**, and two of the three are not this
+   │   kernel: `api.z.ai` is unreachable from here by **rustls** (hangs) and
+   │   by **libakuma-tls** (handshake fails) while OpenSSL completes the same
+   │   exchange in 1 s — one box, three stacks, three outcomes; `meow`'s
+   │   repetition loop is its **tool payload** tipping the model over,
+   │   reproduced with the box nowhere in the path; and `busybox --install`
+   │   needs `link(2)`, which is undispatched and whose shared implementation
+   │   copies rather than links. `AMD64_TRASHCAN_ISSUES.md` §§5-7.
+   │
    └──► **The loop had no Ubuntu in it either.** Two of the three
         kernels booted this day were pushed from the laptop straight
         into Akuma (`hpbox.akuma_push` — `cat >` over the session

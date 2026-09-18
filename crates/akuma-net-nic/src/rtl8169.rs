@@ -513,14 +513,6 @@ impl Rtl8169Device {
             // Wall-clock first, lap count only as the pre-clock fallback. The
             // two must not both be able to fire, or a bring-up spin would kick
             // on laps while the clock says receive is healthy.
-            // `MPC` advancing is the other half of the evidence: frames the
-            // chip dropped because no descriptor was free. Read per lap so a
-            // stall that raises no `RDU` is still caught.
-            let mpc = self.nic.snapshot().mpc;
-            if mpc != self.last_mpc {
-                self.rx_backpressure = true;
-                self.last_mpc = mpc;
-            }
             let quiet = match (now_us(), self.last_rx_us) {
                 (Some(now), Some(last)) => now.saturating_sub(last) >= STALL_QUIET_US,
                 (Some(now), None) => {
@@ -533,7 +525,22 @@ impl Rtl8169Device {
                 (None, _) => self.idle_laps >= STALL_LAPS,
             };
             // Quiet **and** the chip complaining. Either alone is normal.
-            let stalled = quiet && self.rx_backpressure;
+            //
+            // `MPC` is the other half of the evidence — frames the chip dropped
+            // for want of a descriptor — and it is sampled **only once the
+            // quiet window has already elapsed**, never per lap. `snapshot()`
+            // is eleven MMIO reads, and this is the receive poll loop: putting
+            // them on the ordinary idle path costs eleven PCI transactions
+            // thousands of times a second, under the BKL, to answer a question
+            // that only matters after five seconds of silence.
+            let stalled = quiet && {
+                let mpc = self.nic.snapshot().mpc;
+                if mpc != self.last_mpc {
+                    self.rx_backpressure = true;
+                    self.last_mpc = mpc;
+                }
+                self.rx_backpressure
+            };
             if stalled {
                 self.stalls += 1;
                 self.idle_laps = 0;

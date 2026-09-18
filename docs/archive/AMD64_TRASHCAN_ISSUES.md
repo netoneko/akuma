@@ -4,6 +4,12 @@
 Firecracker/QEMU stand-ins. **Stability: C** — these are active, and at least one
 has had its "root cause" overturned twice.
 
+As of 2026-09-19 §§1-4 are fixed and §§5-7 are open. Two of the entries here are
+**not kernel bugs at all** (§4 a client timeout, §6 a model and its tool
+payload) and they are kept in this file on purpose: both presented as "the box
+is broken", and the record of how each was pushed off the kernel is the part
+worth having next time.
+
 This is the **investigation log**. It was carved out of
 [`AKUMA_FROM_SCRATCH.md`](AKUMA_FROM_SCRATCH.md) on 2026-09-18: that document is
 the *aspirational manual* for building the system on the metal, and a goal that
@@ -282,9 +288,11 @@ keypress an event instead of part of a line.
 
 ## 4. `nca`: `[custom stream error: error decoding response body]` against z.ai
 
-**Status: ROOT-CAUSED 2026-09-19 — it is not the kernel.** `nca`'s own HTTP
+**Status: FIXED 2026-09-19 — but it was not the whole story.** `nca`'s own HTTP
 client gives up on a stream that goes quiet, and `reqwest` reports that as a
-body error.
+body error. That is a real bug and the fix below is proven. It is **not** why
+z.ai is unusable from this box today — see §5, which the fix uncovered by
+removing the error that had been masking it.
 
 `crates/core/src/provider/custom.rs` built its client with
 `.read_timeout(Duration::from_secs(60))`. That is an **inter-read** timeout: it
@@ -326,6 +334,24 @@ killing an idle connection. It was the harness. The tell was the timestamps: the
 client failed *immediately*, not after the gap. **Check that a repro reproduces
 the timing, not just the message.**
 
+### Not this either: "the account is being throttled"
+
+With the timeout raised, z.ai returned **nothing at all** — no error, no tokens,
+for five minutes — and the first guess was rate limiting from the volume of test
+requests. It was wrong twice over, and the second correction is the useful one:
+
+* The account is healthy. Asked directly from a laptop, `glm-5.3-flash` answers
+  in **2.5 s** on `https://api.z.ai/api/coding/paas/v4/chat/completions` and in
+  **3.9 s** on `https://api.z.ai/api/anthropic/v1/messages`.
+* The `429 {"code":"1113","message":"Insufficient balance or no resource
+  package"}` that looked like proof of throttling came from asking the **wrong
+  endpoint**: a Coding Plan key gets 1113 on the pay-as-you-go
+  `/api/paas/v4` even with an active plan. Reading it as a billing problem
+  cost a guess.
+* And the box was holding a **stale API key** — a different md5 from the
+  current one. Refreshing it changed nothing, which is what moved the
+  investigation to §5.
+
 ### Not this: the 240 s ssh disconnect
 
 Long commands over ssh to the box return `rc=255` at almost exactly **240 s**
@@ -340,9 +366,194 @@ test.
 
 ---
 
-## 5. What works on the metal as of 2026-09-19
+## 5. TLS to `api.z.ai` — two of three stacks cannot talk to it. **OPEN**
 
-Kernel `020b4f16` plus §§1-3. All over ssh to the box's own hardware:
+**Status: OPEN 2026-09-19.** With §4 fixed and a current API key, `nca` still
+gets nothing from z.ai. The failure is **per TLS stack**, not per network, and
+that is what makes it worth writing down:
+
+| from the box, to `api.z.ai:443` | result |
+|---|---|
+| TCP connect (`busybox nc`) | instant |
+| **OpenSSL/musl** (`git ls-remote https://api.z.ai/`) | **1 s, a real HTTP 404 comes back** — full handshake, request and response |
+| **rustls** (`nca`, tokio) | `connected to 8.2…` and then **nothing**, indefinitely |
+| **libakuma-tls** (`hget`, `meow`) | **TLS handshake failed** in 1 s |
+
+The controls matter as much as the rows: `hget` reaches **github** over TLS
+perfectly, `git` moves 20 MB from github, and every one of these runs on the
+same box, the same NIC and the same LAN. So the path, the NIC and this kernel's
+TCP are all fine *for this peer* — OpenSSL proves the whole exchange works.
+Something about that server's handshake defeats the other two stacks, and the
+two fail differently: one errors, one hangs.
+
+Next instruments, in order of cost: the handshake as OpenSSL sees it
+(`git ls-remote` works, so the certificate chain and the cipher suite are
+obtainable from the box), then `meow --debug` for libakuma-tls's own refusal,
+then the kernel's `strace` boot flag against `nca` to see whether the socket is
+being read at all during the stall.
+
+**Do not re-derive the ruled-out parts.** §4's table covers the client timeout,
+and a 70 s mid-stream silence over plain HTTP on the LAN is delivered intact —
+so "idle connections get dropped" is answered and the answer is no.
+
+---
+
+## 6. `meow`'s repetition loop is the tool payload, not this machine
+
+**Status: NOT A KERNEL BUG, root-caused 2026-09-19.** `meow` answering a plain
+question with the same paragraph over and over — the symptom that opened this
+whole thread — reproduces **laptop to `mlx_lm.server`, with the box nowhere in
+the path**.
+
+The request `meow` actually sends was captured by putting a logging proxy in
+front of the inference server (`logproxy.py` in the session scratchpad; `meow`
+stages its body in a temp file it does not leave behind, so sitting in the path
+is the only reliable way to see it). Replaying that exact JSON:
+
+| request | result |
+|---|---|
+| as `meow` sends it — system prompt + **17 tools** | 12 005 chars, **degenerate** |
+| …plus `temperature: 0.7` | 12 001 chars, **degenerate** |
+| same prompt, **tools removed** | 930 chars in 7.9 s, fine |
+| bare prompt, no system prompt, no tools | 1 207 chars in 8.3 s, fine |
+
+Per tool, each sent alone with the same prompt: `FileMove`, `FileReadLines` and
+`CodeSearch` each degenerate on their own; `FileEdit` does not; the first eight
+(`FileRead`/`Write`/`Append`/`Exists`/`List`/`Delete`/`FolderCreate`/`FileCopy`)
+are fine together. So it is not a count threshold and not one malformed entry —
+several of the definitions tip `Qwen3-Coder-30B` over by themselves.
+
+**Sampling is not the cause**, which is worth stating because it is the obvious
+first guess: `meow` sends **no** sampling parameter at all
+(`"stream":true,"max_tokens":16384,"tools":…` and nothing else), so the server's
+default applies — but forcing `temperature: 0.7` degenerates just as hard. There
+is also no config knob for one, which is a gap worth closing independently.
+
+The runaway guard in `userspace/meow/src/api/client.rs` is therefore working as
+designed: `Stream cut off: model stuck in a repetition loop` at 8 KB is it
+correctly ending a stream that really has gone degenerate. **The guard is not
+the bug and neither is this kernel** — check the model and the tool payload
+before either.
+
+---
+
+## 7. `busybox --install` — `link(2)` is not dispatched
+
+**Status: OPEN, with a working alternative.** Every applet reports
+`Function not implemented`:
+
+```
+busybox: /usr/bin/[: Function not implemented
+busybox: /sbin/acpid: Function not implemented
+```
+
+That is `ENOSYS`. Plain `busybox --install` makes **hard links**, so it calls
+`link(2)` — x86_64 **86**, one of the legacy spellings with no asm-generic twin
+(the class `amd64/src/usermode.rs` keeps a shim list for: `open`, `stat`,
+`unlink` 87, `symlink` 88, `readlink` 89 …). 86 has no arm, so it falls through
+to `_ => errno::ENOSYS`. Confirmed directly: `busybox ln /bin/hello /tmp/x`
+gives `Function not implemented`, while `ln -s` creates a real symlink.
+
+**Use `busybox --install -s`** — symlinks, 402 applets, works today.
+
+**Wiring 86 is not a one-liner, and that is the point.**
+`akuma-syscalls-glue`'s `sys_linkat` **copies the file**: it `read_file`s the
+source and `write_file`s the destination. There is no hard-link primitive in the
+VFS or in `akuma-ext2` for it to call. Dispatching 86 to it would make
+`busybox --install` write ~400 copies of a 1.1 MB binary and call them links —
+a silent wrong answer, and `link(2)`'s callers use it precisely for the identity
+and atomicity semantics a copy does not have. A real implementation needs a
+directory entry pointing at an existing inode, `links_count` incremented, and
+`unlink` decrementing it and freeing only at zero.
+
+---
+
+## 7b. The NIC watchdog fix bricked the boot, and the process is the lesson
+
+**Status: self-inflicted 2026-09-19, fixed in source, cost a walk to the
+machine.** Recorded because the defect is one line and the way it reached the
+metal is the part worth not repeating.
+
+§2-era work left the RTL8169 stall watchdog firing on an idle link (`[rtl]
+stall #3: kick misc 0x3f -> 0x3f mpc=0` — no missed packets, and the kick
+changed nothing). The fix was to require evidence from the chip before calling
+silence a stall: `INT_RDU` latched, or `MPC` advancing. Correct as far as it
+goes. But the `MPC` read was placed on the **ordinary idle path**:
+
+```rust
+let mpc = self.nic.snapshot().mpc;   // every lap, before deciding anything
+```
+
+`snapshot()` is **eleven MMIO register reads**. This is the receive poll loop —
+thousands of laps a second, under the BKL — so that is eleven PCI transactions
+per lap to answer a question that only matters after five seconds of silence.
+The box booted into it and never came back: no ping, port 22 and 2222 both
+closed. Networking comes up before `sshd` does, so a poll loop that cannot keep
+up never reaches a state anyone can log into.
+
+**The fix** is to sample `MPC` only once the quiet window has already elapsed —
+`quiet && { …read MPC… }` — so the reads happen on quiet laps only, and never
+on the path that is actually moving packets.
+
+### This already happened once, on AArch64
+
+[`AKUMA_NET_ISSUES.md`](AKUMA_NET_ISSUES.md) §11.7, "Measurement discipline this
+section cost us to learn", ends with:
+
+> **Instrument with O(1) counters.** `iter().count()` per poll made the meter a
+> material part of what it measured — ~0.9 us/poll at 128 slots, ~14 us at 2048,
+> which inflated the first 2048-slot experiment.
+
+Same loop, same class of mistake, one architecture earlier. The difference is
+only in what the per-lap work costs: an in-memory `count()` inflated a
+*measurement*, while eleven MMIO reads across a PCI bus took out the *machine*.
+So the rule generalises past instrumentation — **nothing goes on the per-lap
+path that the lap does not need**, and a device register is the most expensive
+thing you can put there.
+
+The runbook's first rule is to grep `docs/archive/` before forming a theory. It
+is worth reading as also covering the code you are about to write: this entry
+existed, and finding it took one `grep` *after* the box was already dark.
+
+### What let it through
+
+Every gate this tree has was green on the kernel that bricked the boot:
+`cargo check`, `clippy`, and **1463 host tests passing**. None of them execute
+the poll loop, and **no host test can see a livelock** — the failure is a
+timing property of code running against real MMIO.
+
+The runbook already prescribes the answer and it was skipped:
+
+```
+fast lane  ->  amd64_trials.py      (local QEMU + the box's Firecracker, no reboot)
+   then    ->  hpbox.stage()
+   then    ->  the metal
+```
+
+**A change to a driver hot path or the poll loop must go through the fast lane
+first** — with one honest caveat, added after running it: **the fast lane would
+not have caught *this* one.** Both of its targets are virtio (local QEMU is
+`-M microvm`, the box's Firecracker likewise), and `rtl8169.rs` is behind a
+feature only bare metal enables, so the changed code does not execute on either.
+The corrected kernel passes the local trial **767/0 in 29 s**; the kernel that
+bricked the box would very likely have passed it too. For this one file the
+metal is the only target that runs the code, which makes reasoning about per-lap
+cost the *only* defence there is — and is why §11.7 above is the load-bearing
+part of this entry rather than the process note.
+
+For everything else on this target the ordering still holds: Not because the metal is precious, but because it is the one target
+with no remote way back: `/boot/akuma-amd64` *is* the default GRUB entry, so a
+kernel that cannot serve ssh can only be replaced by someone standing at the
+machine. The second menu entry, `Akuma/amd64 (known good)`, exists for exactly
+this and is what recovers it — along with `/boot/akuma-amd64.prev`, which the
+install step writes every time.
+
+---
+
+## 8. What works on the metal as of 2026-09-19
+
+Kernel `020b4f16` plus §§1-3 and §3b. All over ssh to the box's own hardware.
+What is **not** here is z.ai (§5) and hard links (§7).
 
 * `git clone` over HTTPS — §1b.
 * `meow -c` against an mlx server on the LAN: 657 ms to first token. The
@@ -359,11 +570,15 @@ Kernel `020b4f16` plus §§1-3. All over ssh to the box's own hardware:
   that reads with `poll_input_event` — but busybox is the shell the box is
   actually used through, and it reads with `read(2)`, which is why it kept
   working throughout and makes the control half of that diagnosis.
-* `nca` one-shot against **z.ai** (`glm-5.3-flash`, anthropic-compatible):
-  `nca --no-tui --stream ndjson -p …` streams `TokensStreamed` deltas and
-  reports cost. It must be run from `/`, because `config.local.toml` is looked
-  up at `<cwd>/.nca/`, and `HOME` is unset on this target (nca logs
-  `workspace data migration skipped error=HOME is not set` and carries on).
+* `nca` itself runs, one-shot and in its full-screen mode, and streams fine
+  from a **LAN** provider (`TokensStreamed` deltas, cost reported). Against
+  **z.ai** it no longer errors but returns nothing — that is §5, and it is the
+  one thing on this list that does not work.
+
+  Two operational notes either way: run `nca` **from `/`**, because
+  `config.local.toml` is looked up at `<cwd>/.nca/` and `HOME` is unset on this
+  target (nca logs `workspace data migration skipped error=HOME is not set` and
+  carries on); and run anything long **detached**, per §4's ssh note.
 
 Two things it still reports and neither is fatal: `IPC disabled: socket bind
 failed: Address family not supported by protocol (os error 97)` — nca's AF_UNIX

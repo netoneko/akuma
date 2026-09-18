@@ -199,6 +199,35 @@ fast lane  →  amd64_trials.py            (no reboot, ~minutes)
    then    →  hpbox.reboot_to("akuma")   (the metal, ~a minute each way)
 ```
 
+**This ordering is a rule, not a suggestion, for anything touching a driver hot
+path or the poll loop.** `/boot/akuma-amd64` is the *default* GRUB entry, so a
+kernel that cannot serve ssh is only replaceable by someone standing at the
+machine. And the gates you have cannot catch it: measured 2026-09-19, a kernel
+that livelocked the receive poll loop — eleven MMIO reads per idle lap, added by
+a one-line diagnostic — passed `cargo check`, `clippy` and **1463 host tests**,
+then booted into silence (no ping, 22 and 2222 closed). No host test executes
+that loop, and a livelock is a timing property of code running against real
+MMIO. `AMD64_TRASHCAN_ISSUES.md` §7b.
+
+Recovery, at the machine: the GRUB menu's second entry, **`Akuma/amd64 (known
+good)`**, boots `/boot/akuma-amd64.good`; `install`'s own `/boot/akuma-amd64.prev`
+is the previous kernel.
+
+**And know what the fast lane does *not* cover.** Both of its targets are
+virtio — local QEMU is `-M microvm` with virtio-MMIO, the box's Firecracker is
+virtio too — so **neither one runs `crates/akuma-net-nic/src/rtl8169.rs` at
+all**. That driver is behind the `rtl8169` feature, which only amd64 bare metal
+enables, and the Realtek exists on exactly one machine. Measured 2026-09-19: the
+corrected kernel passes the local trial **767/0 in 29 s**, and the kernel that
+bricked the box would very likely have passed it too, because the changed code
+never executed.
+
+So for that file the fast lane proves it *builds and boots*, nothing more, and
+there is no test anywhere that would have caught the livelock. The defence is to
+reason about cost at the call site before writing the line — see
+`AMD64_TRASHCAN_ISSUES.md` §7b and `AKUMA_NET_ISSUES.md` §11.7 — and to keep
+changes to the driver small enough to review on that basis.
+
 Going straight to the metal for a change the fast lane would have caught is the
 single most expensive habit in this loop.
 
