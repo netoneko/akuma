@@ -259,9 +259,37 @@ pub fn sys_sendto(fd: u64, buf: u64, len: u64, dest_addr: u64) -> u64 {
     let Some(idx) = fd::socket_index(fd) else {
         return errno::ENOTSOCK;
     };
-    if dest_addr != 0 && akuma_net::socket::is_udp_socket(idx) {
-        let Some(dest) = sockaddr_in_from_user(dest_addr, size_of::<SockAddrIn>() as u64) else {
-            return errno::EINVAL;
+    if akuma_net::socket::is_udp_socket(idx) {
+        // **A null `dest_addr` on a UDP socket means "the peer `connect(2)`
+        // recorded", not "fall through to the TCP path".**
+        //
+        // Until 2026-09-18 the guard here was `dest_addr != 0 && is_udp`, so
+        // `send(2)` — which musl compiles to `sendto(fd, .., NULL, 0)` — fell
+        // into `send()` below, the *stream* path, and came back `EBADF` on a
+        // perfectly good connected UDP socket. `write(2)` on the same fd
+        // worked, because that goes through `akuma-syscalls-glue`, which has
+        // always consulted `udp_default_peer`. One fd, two answers.
+        //
+        // The dispatcher's comment in `usermode.rs` explains why it was never
+        // noticed: musl's resolver "never `connect()`s its query socket — it
+        // addresses every nameserver by hand on each `sendto`". True of musl,
+        // and **false of c-ares**, which is what `curl` and `git` resolve
+        // through — so DNS failed for them while `nslookup` and `getaddrinfo`
+        // both worked. That divergence is the whole bug.
+        //
+        // `EDESTADDRREQ` when there is no peer, which is what Linux answers and
+        // what glue already answered; `EBADF` sent c-ares looking at its own
+        // descriptor bookkeeping.
+        let dest = if dest_addr != 0 {
+            let Some(d) = sockaddr_in_from_user(dest_addr, size_of::<SockAddrIn>() as u64) else {
+                return errno::EINVAL;
+            };
+            d
+        } else {
+            let Some(peer) = akuma_net::socket::udp_default_peer(idx) else {
+                return errno::EDESTADDRREQ;
+            };
+            peer
         };
         let Some(data) = fd::copy_in(buf, len) else {
             return errno::EFAULT;

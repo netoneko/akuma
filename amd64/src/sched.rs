@@ -269,7 +269,7 @@ fn hook_switch_to(from: usize, to: usize) {
     unsafe {
         let m = machines();
 
-        let want = match (*m)[to].space_root {
+        let mut want = match (*m)[to].space_root {
             0 => KERNEL_ROOT.load(Ordering::Relaxed),
             root => root,
         };
@@ -278,19 +278,54 @@ fn hook_switch_to(from: usize, to: usize) {
         // path has already handed back to the PMM is a dead address space one
         // `mov cr3` away from being live again: the frame is reissued as
         // something else, its PML4 slot 511 stops naming the kernel's PDPT, and
-        // the very next kernel access faults not-present from ring 0. Print the
-        // pair BEFORE the install, so a log names the culprit slot rather than
-        // only the core that died on it.
+        // the very next kernel access faults not-present from ring 0.
+        //
+        // # Why this reports and demotes rather than reporting and proceeding
+        //
+        // Both halves of the original destroyed their own evidence, and the
+        // only capture this bug has is what that cost: a photograph of `[SWIT`
+        // and a cold machine (`proposals/AMD64_SWITCH_FREED_CR3_UAF.md`).
+        //
+        // * The message was seven `serial::puts` calls, and `serial::LOCK` is
+        //   per call — so a peer core lands between two of them, and a core
+        //   that dies mid-report truncates it mid-word. One `StackWriter` and a
+        //   single flush, the rule `idt::dump_user_registers_and_memory`
+        //   already states for the same reason.
+        // * It then fell through into the `mov cr3` below, which is the
+        //   *fatal* step: a reissued root triple-faults the box the moment ring
+        //   0 touches anything, and recovery is a power cycle at the machine.
+        //   So the root is not installed. The slot is demoted to the kernel
+        //   root, which maps every page ring 0 touches and — since
+        //   `paging::drop_identity_map` cleared PML4 slot 0 — nothing at all in
+        //   the lower half. A user thread resuming on it takes an ordinary
+        //   not-present fault at its first ring-3 instruction and dies with a
+        //   `SIGSEGV`; a kernel thread is unaffected. One process for the
+        //   machine is the trade, and it keeps the next occurrence readable
+        //   over ssh instead of on a camera.
+        //
+        // `space_root` is zeroed with it so the slot settles on the kernel root
+        // rather than re-tripping on every later switch-in, and the counter is
+        // asserted zero by the boot suite ([`freed_cr3_trips`]).
         if akuma_mmu::l0_recently_freed(want & L0_BASE_MASK) {
-            serial::puts("[SWITCH FREED-CR3] root=0x");
-            serial::put_hex(want);
-            serial::puts(" from_slot=");
-            serial::put_dec(from as u64);
-            serial::puts(" to_slot=");
-            serial::put_dec(to as u64);
-            serial::puts(" core=");
-            serial::put_dec(smp::cpu_index() as u64);
-            serial::puts("\n");
+            let n = FREED_CR3_TRIPS.fetch_add(1, Ordering::Relaxed);
+            if n < CANARY_REPORT_LIMIT {
+                let mut w = akuma_primitives::console::StackWriter::<192>::new();
+                let _ = core::fmt::write(
+                    &mut w,
+                    format_args!(
+                        "[SWITCH FREED-CR3] root={:#x} from_slot={} to_slot={} \
+                         core={} state={} demoted=kernel-root\n",
+                        want,
+                        from,
+                        to,
+                        smp::cpu_index(),
+                        threading::get_thread_state(to),
+                    ),
+                );
+                w.flush();
+            }
+            (*m)[to].space_root = 0;
+            want = KERNEL_ROOT.load(Ordering::Relaxed);
         }
         // Skip only when this core already walks exactly this root. The skip is
         // sound because of the liveness gate, not because of the comparison:
@@ -414,12 +449,33 @@ fn hook_can_run(slot: usize) -> bool {
 /// PDPT, and the next kernel access after the `mov cr3` faults not-present from
 /// ring 0, inside the context switch.
 ///
-/// Slot `0` never blocks: that is [`kernel_root`]'s spelling, not an address
-/// space. Every other state is a blocker on purpose, exactly as the AArch64
-/// scan documents — a FREE or INITIALIZING slot's root is overwritten by the
-/// next spawn and a TERMINATED one's by [`finish`], both of which release the
-/// deferred frames at the next drain, so treating them as references costs a
-/// short deferral where trusting the state machine costs the machine.
+/// Root `0` never blocks: that is [`kernel_root`]'s spelling, not an address
+/// space. INITIALIZING, READY, RUNNING and WAITING slots all block, as the
+/// AArch64 scan documents — the cost of a wrong "no" is the machine, the cost
+/// of a wrong "yes" is a short deferral.
+///
+/// # The one carve-out, and why it is a proof rather than a guess
+///
+/// A slot that is TERMINATED or FREE **and not `ON_CPU`** is skipped. That is
+/// not trusting the state machine; it is the two facts that make the number in
+/// its `space_root` unreachable:
+///
+/// * `akuma_threading::x86_pick_next` picks only READY and RUNNING slots, and
+///   skips any slot with `ON_CPU` set. So such a slot cannot be switched *in*.
+/// * The only route out of TERMINATED/FREE is `x86_claim_slot`, and every
+///   caller of it writes `space_root` before publishing the slot —
+///   [`prepare_task_slot`] zeroes it, then [`spawn_unpublished`],
+///   [`set_task_space_root`] or [`register_idle_task`] supply the real one.
+///
+/// So the value cannot reach a `mov cr3` without being overwritten first. The
+/// AArch64 twin gets this for free — its recycler zeroes the saved context on
+/// the TERMINATED→FREE transition — and **this target has no such recycler**:
+/// `x86_claim_slot` takes a TERMINATED slot directly, so a dead slot keeps its
+/// last `space_root` until some later spawn happens to pick it. Blocking on
+/// that pinned a dead process's entire frame set (measured: 413 pages in one
+/// boot-suite stage, `redirect: teardown leaks nothing`) for as long as no
+/// spawn reused the slot — parked rather than lost, but on a 1 GiB box the
+/// difference is academic.
 ///
 /// Bounded, lock-free, no heap: it runs inside the free gate, which the idle
 /// loop's reclaim reaches with the BKL held.
@@ -432,8 +488,25 @@ fn any_task_on_space_root(l0_base: u64) -> Option<(usize, u8)> {
     // purpose — a slot that acquires this root *after* the scan cannot be a
     // problem, because acquiring it requires a live `UserAddressSpace`, whose
     // existence is what forbids the drop running this scan.
-    (0..MAX_TASKS).find(|&i| unsafe { (*machines())[i].space_root & L0_BASE_MASK == l0 })
+    (0..MAX_TASKS)
+        .find(|&i| {
+            let named = unsafe { (*machines())[i].space_root & L0_BASE_MASK == l0 };
+            named && slot_can_install(i)
+        })
         .map(|i| (i, threading::get_thread_state(i)))
+}
+
+/// Can slot `i` still install its `space_root` in `CR3`? See
+/// [`any_task_on_space_root`], which is the only caller and carries the
+/// argument. Read state *before* `ON_CPU`: a slot that goes TERMINATED between
+/// the two reads is still reported as installable, which is the safe direction.
+fn slot_can_install(i: usize) -> bool {
+    use akuma_exec_core::thread::thread_state;
+    let state = threading::get_thread_state(i);
+    if state != thread_state::TERMINATED && state != thread_state::FREE {
+        return true;
+    }
+    threading::on_cpu_flag(i)
 }
 
 /// Register this target's machine effects with the scheduler. Called once, from
@@ -445,6 +518,43 @@ fn register_hooks() {
     // thread: the gate has to be correct from the first address space, not from
     // the first one that dies.
     threading::register_saved_root_probe(any_task_on_space_root);
+    // …and the layer that *asks* it. `akuma-mmu`'s free gate does not call
+    // `akuma_threading::any_saved_ctx_on_l0` directly — it reads a `SchedHooks`
+    // table registered by `akuma_exec::init`, and **this target never calls
+    // that function**: `exec_runtime::init` registers the runtime table, the
+    // process counters and the ELF hooks and stops there, "each further hook
+    // explicitly when a step starts depending on it". This is that step, and it
+    // was missed when the saved-root probe landed on 2026-09-12: the probe was
+    // registered one crate down and nothing above it ever asked, so
+    // `akuma_mmu::any_saved_ctx_on_l0` kept answering `None` from its
+    // unregistered cell and the gate's second arm stayed exactly as dead as the
+    // hardcoded `None` it replaced — on **both** the free path
+    // (`free_or_defer_as_frames`) and the drain (`take_one_ready_ttbr_free`),
+    // which is the pair the AArch64 fix needed. That is the hole `[SWITCH
+    // FREED-CR3]` fell through on 2026-09-18
+    // (`proposals/AMD64_SWITCH_FREED_CR3_UAF.md`): a process dies while a
+    // sibling thread is parked off-CPU with its root still in `space_root`,
+    // `any_core_on_l0` sees no *live* CR3 on it, nobody asks about the saved
+    // one, and the L0 goes back to the PMM under a slot that will install it.
+    //
+    // Registered here, beside the probe it makes reachable, rather than in
+    // `exec_runtime::init`: the gate has to be correct from the first address
+    // space, and `sched::init` is the earliest point where all three
+    // implementations exist.
+    //
+    // The third field is not a freebie either. `current_thread_is_terminated`
+    // unregistered reads as "no thread is terminal", which lets a *dying*
+    // thread run a multi-thousand-page drain it can be reaped out of mid-loop,
+    // orphaning the entry it had already removed from the list — the self-host
+    // heap leak (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`). The collectors
+    // that keep the parked list short without it are the ones AArch64 uses and
+    // this target already has: the idle loop's reclaim, and every address-space
+    // drop that is not itself on a terminal thread.
+    akuma_mmu::register_sched_hooks(akuma_mmu::SchedHooks {
+        any_saved_ctx_on_l0: threading::any_saved_ctx_on_l0,
+        note_current_expected_l0: threading::note_current_expected_l0,
+        current_thread_is_terminated: threading::current_thread_is_terminated,
+    });
     threading::register_x86_arch_hooks(threading::X86ArchHooks {
         switch_to: hook_switch_to,
         current_slot: smp::current_task,
@@ -1445,6 +1555,21 @@ static SWITCH_WITHOUT_BKL: AtomicU64 = AtomicU64::new(0);
 #[must_use]
 pub fn switches_without_bkl() -> u64 {
     SWITCH_WITHOUT_BKL.load(Ordering::Relaxed)
+}
+
+/// Switch-ins whose slot named a page-table root the PMM already has back — the
+/// F8 tripwire in [`hook_switch_to`]. `0` is the expected value.
+///
+/// A non-zero count means the address-space free gate let an L0 go while a task
+/// slot was still carrying it, and the switch **demoted** the slot to the kernel
+/// root instead of installing it. The process concerned is dead either way; the
+/// difference is that the machine is not.
+static FREED_CR3_TRIPS: AtomicU64 = AtomicU64::new(0);
+
+/// How many switch-ins hit the freed-root tripwire. See [`FREED_CR3_TRIPS`].
+#[must_use]
+pub fn freed_cr3_trips() -> u64 {
+    FREED_CR3_TRIPS.load(Ordering::Relaxed)
 }
 
 /// Kernel-stack canary failures seen this boot (`0` is the expected value).

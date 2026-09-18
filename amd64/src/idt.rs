@@ -1894,6 +1894,17 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
         crate::sched::switches_without_bkl(),
         0,
     );
+    // The F8 tripwire's tally. Non-zero means the address-space free gate let an
+    // L0 go while a task slot still named it and the switch had to demote that
+    // slot to the kernel root — the `[SWITCH FREED-CR3]` use-after-free
+    // (`proposals/AMD64_SWITCH_FREED_CR3_UAF.md`). Asserted rather than printed
+    // because the demotion makes the failure survivable, and a survivable
+    // failure is one a boot can otherwise scroll past.
+    t.check_eq(
+        "debug: no switch installed a freed page-table root",
+        crate::sched::freed_cr3_trips(),
+        0,
+    );
     // Informational, deliberately not an equality: `yield_now` taking the lock
     // for a caller that had none is the guard working, not a fault. It is
     // printed so a boot says how often the kernel's wait loops reach the

@@ -166,6 +166,54 @@ def send_files(paths, repo=".", touch=True):
     return 0, f"sent {len(sent)} file(s): " + ", ".join(sent)
 
 
+def akuma_push(local, remote, timeout=600, verify=True):
+    """Copy one local file to `remote` **on Akuma**, and prove it arrived.
+
+    :func:`send_files` is the Ubuntu-side transport and always writes under
+    `/root/akuma`; this is the missing half. Since 2026-09-18 Akuma is the GRUB
+    default, so the box is usually *only* reachable as Akuma — and there is no
+    `scp` here (no sftp subsystem in `userspace/sshd`), so a plain `cat >` over
+    the session channel is the whole mechanism.
+
+    **Raw bytes, not base64.** The channel is 8-bit clean on the way *in*; what
+    is not clean is the way *out* — it turns LF into CRLF, measured at one extra
+    byte per 256 (`docs/runbooks/amd64-bare-metal-loop.md`). So a file can be
+    written correctly and can never be read back byte-exactly, which is why
+    `verify` hashes with the box's own `md5sum` instead of comparing what `cat`
+    sends home.
+
+    No `chmod`: this kernel's ext2 ignores modes, so a file written to `/bin`
+    is executable by arriving there.
+
+    Returns ``(rc, message)``.
+    """
+    import hashlib
+    import os
+
+    try:
+        with open(local, "rb") as fh:
+            body = fh.read()
+    except OSError as exc:
+        return 1, f"{local}: {exc}"
+
+    parent = os.path.dirname(remote) or "/"
+    r = subprocess.run(
+        AK + [f"mkdir -p {parent}; cat > {remote}"],
+        input=body, capture_output=True, timeout=timeout,
+    )
+    if r.returncode != 0:
+        return r.returncode, f"{remote}: {r.stderr.decode(errors='replace').strip()}"
+    if not verify:
+        return 0, f"{remote}: {len(body)} bytes"
+
+    want = hashlib.md5(body).hexdigest()
+    rc, out, err = akuma(f"md5sum {remote}", timeout=timeout)
+    got = out.split()[0] if out.split() else ""
+    if got != want:
+        return 1, f"{remote}: md5 {got or '(none)'} != {want} ({err.strip()})"
+    return 0, f"{remote}: {len(body)} bytes, md5 {want}"
+
+
 def sync_from_git(rev=None, branch=None, timeout=300):
     """Make the box's tree exactly `rev` by fetching and hard-resetting.
 

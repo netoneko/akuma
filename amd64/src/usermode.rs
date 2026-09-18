@@ -1577,6 +1577,20 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // not tell success from a refused connection.
         Syscall::Getsockopt => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         Syscall::Shutdown => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `getsockname`/`getpeername` answered **`ENOSYS`** here until
+        // 2026-09-18 — no arm at all, native or glue. Glue has implemented both
+        // for as long as AArch64 has had sockets (`net::dispatch_getsockname`,
+        // which also serves AF_UNIX), so this is a missing hop rather than
+        // missing code, exactly like `Getsockopt` above.
+        //
+        // Found by a probe replaying c-ares' resolver sequence: it is one of
+        // three things `curl`/`git` needed on a *connected* UDP socket that
+        // this target did not answer. An `ENOSYS` from a syscall a library
+        // treats as infallible is worse than an error — it reads as "this
+        // kernel is broken" rather than "that failed", which is the same trap
+        // `AKUMA_AMD64_MEMORY_CLOSEOUT.md` §"the errno, not the feature"
+        // records for `madvise`.
+        Syscall::Getsockname | Syscall::Getpeername => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `exit` (60) and `exit_group` (231) are the same call for a
         // single-threaded process and emphatically not for a threaded one:
         // `exit` ends the calling thread, `exit_group` ends every thread in the

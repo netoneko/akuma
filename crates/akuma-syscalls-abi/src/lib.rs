@@ -512,6 +512,14 @@ syscall_table! {
     Setsockopt => SETSOCKOPT = 54,  nr::SETSOCKOPT;
     Getsockopt => GETSOCKOPT = 55,  nr::GETSOCKOPT;
     Shutdown   => SHUTDOWN   = 48,  nr::SHUTDOWN;
+    /// Both absent from this table until 2026-09-18, so amd64 answered
+    /// `ENOSYS` while `akuma-syscalls-glue` had implemented them all along.
+    /// c-ares calls them on its resolver socket, and a library that treats a
+    /// syscall as infallible reads `ENOSYS` as "this kernel is broken" — which
+    /// is part of why `curl`/`git` could not resolve a name that `nslookup`
+    /// and `getaddrinfo` both resolved fine.
+    Getsockname => GETSOCKNAME = 51,  nr::GETSOCKNAME;
+    Getpeername => GETPEERNAME = 52,  nr::GETPEERNAME;
 
     // ── time ───────────────────────────────────────────────────────────────
     // `gettimeofday`(96), `settimeofday`(164) and `time`(201) are x86-only and

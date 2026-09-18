@@ -169,6 +169,10 @@ fn path_is_dir(path: &str) -> bool {
 pub mod errno {
     pub const EBADF: u64 = (-9i64) as u64;
     pub const ENOTSOCK: u64 = (-88i64) as u64;
+    /// `sendto` with no destination on a socket that has no connected
+    /// peer. Linux's answer, and c-ares acts on it correctly where it
+    /// treated `EBADF` as its own descriptor bookkeeping being wrong.
+    pub const EDESTADDRREQ: u64 = (-89i64) as u64;
     pub const EAFNOSUPPORT: u64 = (-97i64) as u64;
     pub const ENOENT: u64 = (-2i64) as u64;
     pub const EFAULT: u64 = (-14i64) as u64;

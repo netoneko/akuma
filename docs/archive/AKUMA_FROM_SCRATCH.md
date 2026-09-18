@@ -70,10 +70,20 @@ Each of these is a *test*, not an assumption. None has been run.
    | `/etc/resolv.conf` | clone **hangs** at 0:00 CPU, no error |
    | CA bundle (`ca-certificates.crt`) | clone **fails with a TLS error** — git verifies github's certificate in its own stack |
 
-   Stage both on sdb1 before concluding anything about git's TLS support. If it
-   still fails after that, the fallbacks are `git://`, a bundle fetched with
-   `bootstrap/bin/hget`, or `git -c http.sslVerify=false` — decide after
-   measuring, not before.
+   Stage both on sdb1 before concluding anything about git's TLS support.
+
+   > **ROOT-CAUSED and FIXED the same day, and it was not TLS — it was the
+   > kernel.** `/etc/resolv.conf` was present and correct the whole time, and
+   > `nslookup github.com` resolved fine. `curl` and `git` use **c-ares**, which
+   > `connect()`s its UDP socket where musl's resolver does not, and three
+   > syscalls on that connected path were wrong: `send()` answered `EBADF`
+   > (a null `sendto` destination fell into the TCP path) and
+   > `getsockname`/`getpeername` answered `ENOSYS`. Full account:
+   > [`AKUMA_AMD64_DNS_CONNECTED_UDP.md`](AKUMA_AMD64_DNS_CONNECTED_UDP.md).
+   >
+   > So this step's real lesson is the diagnostic, not the fallback list:
+   > **`nslookup` working proves nothing about whether `git` can resolve.**
+   > The CA-bundle row above is still untested — it simply never got reached.
 2. **Submodule size — measured, and it is a non-issue.** The received wisdom is
    "the vendored submodules are ~37 GB, never copy the tree". The *rule* is right
    for the wrong reason, and the number is wrong. Measured 2026-09-18:
