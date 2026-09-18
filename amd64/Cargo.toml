@@ -38,6 +38,32 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-
 # (`DEFAULT_CACHE_CAP_BYTES`); the kernel never calls `set_cache_cap_bytes`.
 fs-cache = ["akuma-ext2/fs-cache"]
 
+# PMM forensics for the SMP corruption hunt. OFF by default and meant to be
+# turned on for a hunt build, the way `akuma-pmm`'s own `pmm-instr` is.
+#
+# It turns on the three `PmmConfig` booleans this target has always passed as
+# `false`: the UAF quarantine (`[PMM-UAF]` — a freed frame is poisoned, parked
+# and verified on the way out), the premature-free check (`[PMM-PREMATURE]` — a
+# frame freed while a live address space still maps it) and the CoW ledger,
+# which is what lets either report name the culprit instead of only the thread.
+# The quarantine also enables the **resurrection** detector (`[PMM-RESURRECT]`):
+# a `cow_ref_inc` that takes the first reference to a frame still parked in
+# quarantine, i.e. a freed frame about to be handed out as live data.
+#
+# Why it is worth having here. On AArch64 this exact instrument is what cracked
+# the `-j4` self-host corruption after six mechanisms had been eliminated by
+# guessing: `sys_munmap` was freeing the frame its *region record* named rather
+# than the one the live PTE held, ~11,000 times per build
+# (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §8). The amd64 failure measured
+# 2026-09-18 — `rustc` killed by `#PF ... cr2=0x34`, a near-NULL read, and the
+# bare-metal one at `cr2=0x00004d5f4e4f4964`, ASCII — is that same
+# reads-serving-wrong-bytes family.
+#
+# Cost, which is why it is not default: every free poisons a page and parks it
+# in a 512-entry ring instead of returning it, and the premature-free check
+# walks for a surviving mapper on every free.
+pmm-forensics = []
+
 # The remaining BKL carve-outs, forwarded to mirror the AArch64 root kernel's
 # `smp-shared` (which has carried all of them since 2026-08). Each is audited
 # code on AArch64 with a runtime kill switch in `akuma_bkl::policy`; amd64

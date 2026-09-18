@@ -276,15 +276,35 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     }
     serial::puts("ok\n");
 
-    // The PMM's two registration hooks. Every feature is off and every reclaim
-    // hook is a no-op that reclaims nothing: this kernel has no page cache, no
-    // retired-process list and no CoW, so a hook that pretended otherwise would
-    // be reporting progress it did not make and could spin the OOM path forever.
+    // The PMM's two registration hooks.
+    //
+    // The three config booleans were `false` on the grounds — written when this
+    // port had neither — that "this kernel has no page cache, no
+    // retired-process list and no CoW". All three of those are now false
+    // statements: CoW fork is `akuma_cow` in `idt.rs`, the file-page cache is
+    // `akuma_fpcache` in `fs.rs`, and the `drain_retired` hook three lines
+    // below is live. So the flags are a **choice about cost**, not a statement
+    // about capability, and `pmm-forensics` is how you make the other choice.
+    //
+    // What that feature buys, and why it is worth a rebuild: `[PMM-UAF]`,
+    // `[PMM-PREMATURE]` and `[PMM-RESURRECT]` are the instruments that cracked
+    // the analogous AArch64 `-j4` corruption after six mechanisms had been
+    // eliminated by guessing (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §8).
+    // This target's open SMP=4 failures are the same family — a `rustc` killed
+    // by a near-NULL read, and a bare-metal one whose `cr2` is ASCII — and
+    // until now the detector for it has been compiled in and switched off.
+    //
+    // One call site, reached by both entry points (`init` delegates here), so
+    // this cannot go the way of the `exec_runtime::init` divergence that was
+    // green on both fast-lane rigs and dead on the metal.
     akuma_pmm::register_config(akuma_pmm::PmmConfig {
-        cow_ref_ledger: false,
-        pmm_uaf_quarantine: false,
-        pmm_premature_free_check: false,
+        cow_ref_ledger: cfg!(feature = "pmm-forensics"),
+        pmm_uaf_quarantine: cfg!(feature = "pmm-forensics"),
+        pmm_premature_free_check: cfg!(feature = "pmm-forensics"),
     });
+    if cfg!(feature = "pmm-forensics") {
+        serial::puts("  pmm:  forensics ON (quarantine + premature-free + CoW ledger)\n");
+    }
     akuma_pmm::register_hooks(akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
         // 5b slice 1: the pressure ladder's retired-process rung. Same

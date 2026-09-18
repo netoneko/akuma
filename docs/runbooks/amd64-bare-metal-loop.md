@@ -416,6 +416,68 @@ has one definition across both transports. In particular a **silent probe is
 never a pass** — that rule was learned the hard way and a second copy of it is a
 second place to get it wrong.
 
+### The SMP=4 `-j4` build wedge — the cheap repro
+
+The wedge that blocks a fast in-guest build reproduces on **one crate**, not
+on the 95-crate build it was found with, and it is deterministic:
+
+```bash
+scripts/benchmarks/amd64_fc_build_matrix.py                 # 1x1, 1x4, 4x1, 4x4
+scripts/benchmarks/amd64_fc_build_matrix.py --cells 4x4     # just the bad cell
+```
+
+Measured 2026-09-18 (`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §12): `zerocopy`
+builds fine at **vcpu=1 `-j4`** and at **vcpu=4 `-j1`**, and wedges at
+**vcpu=4 `-j4`**. Several processes and several cores are each necessary and
+neither is sufficient, so any probe living in a single process — which is all
+of `mtstress` below — cannot reach it.
+
+At the wedge, `ps` in the guest shows `cargo` with CPU time and every `rustc`
+and every one of their threads at **0:00**: created, never scheduled. Do not
+go looking for a `[BKL] stuck` storm; there is not one, and its absence is
+what tells this apart from the ssh/apk wedge in the table above.
+
+The harness reports a cell that does not finish as **WEDGE**, never as a slow
+pass, and collects the evidence on the spot from a second connection: the
+host-side vCPU busy fraction (~7 %, i.e. nothing is running rather than
+something spinning), the guest's `ps`, the console tail and a grep of `dmesg`
+for the switch/BKL/trampoline tripwires.
+
+### `mtstress` — the multi-threaded probe
+
+```bash
+scripts/benchmarks/amd64_mtstress_run.py                 # linux, then vcpu 1 and 4
+scripts/benchmarks/amd64_mtstress_run.py --modes p       # corruption arm alone
+```
+
+One process, many threads, one address space: pointer integrity (self-pointers,
+reported as ASCII as well as hex, because the bare-metal `cr2` *was* text),
+shootdown churn, thread-pool churn, a heartbeat watchdog, and a fault-kill
+reaping arm. It runs the same static musl binary **on the box's Ubuntu first**
+and refuses to report on Akuma if that arm does not pass — which caught its own
+startup race on the first run, in exactly the shape of the bug being hunted.
+
+As of 2026-09-18 it passes on Linux and on Akuma at vcpu=1 and vcpu=4. It is a
+regression gate and an eliminator, not a reproducer.
+
+### The PMM forensics build
+
+```bash
+cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+      --features pmm-forensics
+```
+
+Turns on `[PMM-UAF]` (quarantine: every freed frame poisoned, parked and
+verified on the way out), `[PMM-PREMATURE]` and `[PMM-RESURRECT]`, plus the
+CoW ledger that lets those reports name a culprit. This is the instrument that
+cracked the analogous AArch64 `-j4` corruption (`SELFHOST_ZERO_PAGE_HUNT.md`
+§8). Off by default because every free now poisons a page and parks it.
+
+The boot log says `pmm: forensics ON (...)`, which is how a run proves which
+kernel it was — worth checking, because the default and forensics builds write
+the **same** binary path and cargo will not relink when you switch back if the
+other feature set's artifact is still fresh.
+
 ### The ring-3 workload check
 
 The boot suite runs under `BypassValidationGuard` on init's own task, so it

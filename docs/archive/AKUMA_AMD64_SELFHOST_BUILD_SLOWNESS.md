@@ -1686,6 +1686,198 @@ authorises it too. Both are true on the box now, and `ssh akuma` works from the
 laptop.
 
 
+### 12. The wedge, cornered: both variables are necessary, and it is not the free path (2026-09-18)
+
+*§11 left three symptoms and a guess that they were one bug in "multi-threaded
+user processes at SMP>1". This session measured the variables separately,
+reproduced the wedge twice on a **single-crate** build, and eliminated the
+mechanism the AArch64 ancestor turned out to be.*
+
+#### The matrix: neither variable alone is enough
+
+`scripts/benchmarks/amd64_fc_build_matrix.py` builds one crate in the box's
+Firecracker guest across an SMP x jobs matrix. `zerocopy`,
+`x86_64-unknown-none`, `--release --offline`, `cargo clean -p` before each
+cell, kernel at `bb65c927`, guest 6144 MiB:
+
+| vcpu | jobs | outcome | wall | cargo's own |
+|---|---|---|---|---|
+| 1 | 1 | PASS | 32.1 s | 31.29 s |
+| 1 | 4 | PASS | 13.6 s | 12.95 s |
+| 4 | 1 | PASS | 17.4 s | 16.79 s |
+| **4** | **4** | **WEDGE** | 600 s (budget) | — |
+
+**Several processes alone do not wedge it; several cores alone do not wedge
+it; together they do.** That is the first time the two have been separated,
+and it retires "is it just SMP?" and "is it just job concurrency?" in one
+table.
+
+Two readings to be careful about. The 1x1 cell ran first after a boot and
+paid a cold block cache, so its 32.1 s is not evidence that `-j4` is faster
+than `-j1` at one core — do not quote that pair. The 4x1-against-1x4 gap
+(17.4 s against 13.6 s) is the same +26 %-ish SMP tax §10 measured, and that
+one is real.
+
+**This is now the cheap repro.** §10 needed 95 crates and ~27 of them to get
+here; `zerocopy` alone reaches it in about ten minutes, and the wedging unit
+is `zerocopy`'s **build script**, which is two `rustc` invocations. Both
+attempts wedged, so it is deterministic rather than a 1-in-N.
+
+#### What a wedged guest looks like, from two runs
+
+Run 1 (default kernel). The console carries a kill:
+
+```
+[Fault] #PF page fault in ring 3 on cpu 0 err=0x0000000000000004
+        rip=0x00000001028d0b20 rsp=0x000000011d3b7e40
+        cr2=0x0000000000000034 cr3=0x0000000023862000 task=16 pid=64
+        — killing the process
+```
+
+`cr2=0x34` is a **near-NULL read** — a null struct pointer plus a field
+offset — and `pid=64` is the `rustc` running the build script. Alongside it:
+8 `[TRAMP-MISMATCH]` lines and, notably, **zero `[BKL] stuck`**. The storm
+that has accompanied every previous SMP=4 incident on this target is simply
+absent, so the `[BKL] stuck` family and this wedge are not the same thing.
+
+Run 2 (the forensics kernel below). Same wedge, vCPU 7.0 %, 7
+`[TRAMP-MISMATCH]` — and **no kill of any kind**. What `ps` shows is the
+better evidence:
+
+```
+    1 0     0:08 /bin/sshd
+   60 0     0:24 cargo build -p zerocopy ... -j4
+   61 0     0:00 {futures-timer} cargo build ...
+   62 0     0:00 cargo build ...
+   63 0     0:00 cargo build ...
+   64 0     0:00 rustc --crate-name build_script_build ...
+   65 0     0:00 {ctrl-c} rustc --crate-name build_script_build ...
+   67 0     0:00 rustc --crate-name build_script_build ...
+   68 0     0:00 {coordinator} rustc --crate-name build_script_build ...
+```
+
+**Two `rustc` processes and both their threads, every one at 0:00 CPU**, with
+`cargo` the only thing that ever ran. Not one of them has been scheduled
+once. That is §10's "created and never scheduled" shape, now with the thread
+names visible, and it is the dominant shape: run 1's kill is the exception,
+not the rule, and may well be downstream.
+
+So the ordering of the two open symptoms should be inverted from §11's. The
+primary failure is **runnable tasks that no core ever picks**. The near-NULL
+kill is a second thing that sometimes happens on the way.
+
+#### Eliminated: the free path. `[PMM-UAF]` and friends stay silent
+
+`amd64/src/mem.rs` passed `PmmConfig { cow_ref_ledger: false,
+pmm_uaf_quarantine: false, pmm_premature_free_check: false }` with a comment
+justifying it: *"this kernel has no page cache, no retired-process list and no
+CoW"*. **All three of those are now untrue** — CoW fork is `akuma_cow` in
+`idt.rs`, the file-page cache is `akuma_fpcache` in `fs.rs`, and the
+`drain_retired` hook three lines below the config is live. The flags had
+quietly become a cost decision wearing a capability comment, and what they
+switch off is the instrument that cracked the analogous AArch64 bug:
+`SELFHOST_ZERO_PAGE_HUNT.md` §8's `sys_munmap` freeing the frame its *region
+record* named instead of the one the live PTE held, ~11,000 times per build,
+found by `[PMM-UAF]` in one boot after six mechanisms had been eliminated by
+guessing.
+
+They are now behind `--features pmm-forensics` on `akuma-amd64`, off by
+default (every free poisons a page and parks it in a 512-entry ring; the
+premature-free check walks for a surviving mapper on every free). One call
+site, reached by both entry points, so it cannot go the way of the
+`exec_runtime::init` divergence. The build prints
+`pmm: forensics ON (quarantine + premature-free + CoW ledger)`, which is what
+lets a run prove which kernel it was — the boot log of the run below carries
+that line.
+
+**Result: zero `PMM-` reports across a full reproduced wedge.** No
+`[PMM-UAF]`, no `[PMM-PREMATURE]`, no `[PMM-RESURRECT]`. So the amd64 wedge
+is **not** the AArch64 free-path family.
+
+The honest caveat: the wedge arrives early — during a build script, a few
+seconds of real work — so the number of frees before it is small, and this
+clears the free path *up to the wedge point* rather than in general. It does
+not clear the bare-metal `cr2=0x00004d5f4e4f4964` corruption at 24 crates,
+which happens far later and has never been run under this instrument. Run
+the metal with `pmm-forensics` before treating that one as cleared too.
+
+#### `mtstress`: a calibrated probe that does **not** reproduce it
+
+`userspace/amd64/mtstress/mtstress.c` is the LLD-shaped probe §11 asked for —
+one process, many threads, one address space — with five arms: pointer
+integrity (self-pointers, and the report prints the bad word as ASCII because
+the bare-metal `cr2` *was* ASCII), shootdown churn, thread-pool churn, a
+heartbeat watchdog for "created and never scheduled" seen from inside, and a
+fault-kill reaping arm that forks a multi-threaded child, kills it with the
+same near-NULL write, and waits with a deadline.
+
+Driven by `scripts/benchmarks/amd64_mtstress_run.py`, which runs the same
+static musl binary on the box's own Ubuntu first.
+
+| arm | verdict |
+|---|---|
+| linux (calibration) | PASS |
+| akuma FC vcpu=1 | PASS |
+| akuma FC vcpu=4 | PASS |
+
+120 s, 4 threads, all arms. **It does not reproduce the bug**, and that is
+worth recording rather than tuning away: the matrix says several *processes*
+are necessary, and every arm of this probe lives in one. A single-process
+probe cannot reach this failure however hard it churns. What the run does buy
+is the elimination of the simple stories — sibling-thread shootdowns, pointer
+corruption under thread churn, and fault-killed multi-threaded children going
+unreaped are each fine in isolation at SMP=4.
+
+**The calibration arm earned its keep on its first run.** On Linux the probe
+reported 62 findings, all `peer-self-pointer ... got=0` — its own race:
+`main` mmaps every arena before creating any thread, so a thread reads a
+peer's arena before that peer has filled it and sees legitimate zero pages.
+A start barrier fixed it. Had that arm been skipped, the probe would have
+reported "null pointers under SMP" against Akuma and been believed, because
+it is precisely the shape being hunted.
+
+#### Also: §11's `nosmp` LLD control never actually ran
+
+§11 recorded as "untested, and honestly so" whether `rust-lld`'s default
+threading also crashes at `nosmp`. The box still held the attempt
+(`/root/lldctl2.sh`, `/tmp/a.err`, `/tmp/b.err`), and **both arms died
+identically** before reaching the question:
+
+```
+rust-lld: error: duplicate symbol: main
+>>> defined at hello.9466052f020585b9-cgu.0
+>>> defined at hello.cdb25a3e6f7aad39-cgu.0
+```
+
+The object glob picked up two `hello` build's `.rcgu.o` files, so neither the
+threaded nor the `--threads=1` arm linked the kernel at all. The control is
+invalid and **§11's question is still open**. Pin the object list to one
+crate's `out` directory before re-running it.
+
+#### Next, in order
+
+1. **Dump every thread slot's `(state, ON_CPU, LAST_CORE)` at wedge time.**
+   This is the one instrument the "never scheduled" shape needs and it does
+   not exist on this target: `akuma_threading::x86_slot_debug(slot)` already
+   returns `(state, on_cpu)` and has exactly one caller (`net.rs:1234`). The
+   hypothesis it tests is specific — `x86_pick_next` skips any candidate whose
+   `ON_CPU` is non-zero, so a slot whose gate was left set is **permanently
+   unpickable**, which would present as a task created and never run, only at
+   SMP>1, and more often the more slots are recycled. All three match.
+2. **Read `x86_yield_now`'s gate ordering against that.** It clears
+   `ON_CPU[cur]` **before** `x86_switch_context` moves the stack, and the
+   whole safety argument is the comment's "no other core can observe that
+   until this core releases the kernel lock". That is weaker than the AArch64
+   original, which clears the gate from the vector asm *after* `mov sp, x0`
+   (`SMP_SHARED_ONCPU_GATE.md` §3). The kernel already doubts it: there is a
+   `SWITCH_WITHOUT_BKL` counter and a `[SWITCH NO-BKL]` report for the case
+   where the lock is not in fact held, and `x86_check_incoming_frame` carries
+   a `[SWITCH FRAME MOVED]` report that fired once already — "a thread's saved
+   frame moving while the switch that is about to restore it looks on".
+3. Then the bare metal with `pmm-forensics`, for the `cr2`-is-ASCII
+   corruption at 24 crates, which this session did not reach.
+
+
 ## Background
 
 - `docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md` — the AArch64 original of §6's leak.
