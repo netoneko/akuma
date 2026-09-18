@@ -1105,8 +1105,59 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 }
                 0
             }
-            313 => crate::fd::sys_poll_input_event(a1, a2, a3),
+            // `poll_input_event(buf, len, timeout_us)` — Akuma-private 313.
+            //
+            // **Glue's arm whenever this process has a channel**, which since
+            // the console channel landed is every process an ssh session or the
+            // serial console runs. It has to be: `crate::fd`'s local copy reads
+            // the **UART** (`crate::input::getb`), and an ssh session's
+            // keystrokes are in its `ProcessChannel`, not on the serial line —
+            // so `paws` printed its prompt and then ignored everything typed at
+            // it, and `meow`'s TUI blocked on its terminal-size probe before it
+            // ever painted a frame. Both looked like the program hanging.
+            // Glue's version also honours `timeout_us`, which the local one
+            // takes and ignores (`_timeout_us`) — and that timeout is what a
+            // TUI's frame tick *is*: `meow` polls with 50 ms and redraws when
+            // it expires, so an untimed wait freezes the screen between
+            // keystrokes even once the bytes arrive.
+            //
+            // The local arm stays for the two cases glue cannot serve: a
+            // redirected fd 0 that is a pipe, and a process with no channel at
+            // all (glue answers `ENOMEM` for that, which would be a regression
+            // rather than a fix).
+            313 => {
+                if akuma_exec::process::current_channel().is_some() {
+                    to_glue_raw(akuma_syscalls_linux::nr::POLL_INPUT_EVENT, [a1, a2, a3, 0, 0, 0])
+                } else {
+                    crate::fd::sys_poll_input_event(a1, a2, a3)
+                }
+            }
             303 => sys_waitpid(a1, a2, a3),
+            // The **terminal family** — Akuma-private 307-312 and 314, all of
+            // them glue's, all of them `ENOSYS` here until 2026-09-19.
+            //
+            // That is what the `meow` TUI screenshot was: `set_cursor_position`
+            // returned `ENOSYS`, so the footer printed **wherever the cursor
+            // happened to be** and every 50 ms frame tick appended another copy
+            // of it down the screen instead of repainting one row. With
+            // `set_terminal_attributes` missing too the session never left
+            // cooked mode, so input was line-buffered and echoed by the kernel
+            // on top of that. A full-screen program cannot work without these;
+            // it can only *appear* to, which is how a harness that reads the
+            // transcript scores it as a pass.
+            //
+            // Every one has a real implementation in `term.rs` that reads or
+            // writes this process's `ProcessChannel` and its `TerminalState` —
+            // the same pair arm 313 was folded onto above, and the same reason:
+            // on this target the channel is what `sshd` and the console both
+            // speak, and glue is where the line discipline lives. Gated on the
+            // channel for 313's reason: without one there is no terminal, and
+            // answering `ENOSYS` there is what these did yesterday.
+            307 | 308 | 309 | 310 | 311 | 312 | 314
+                if akuma_exec::process::current_channel().is_some() =>
+            {
+                to_glue_raw(nr - AKUMA_PRIVATE_BASE, [a1, a2, a3, 0, 0, 0])
+            }
             // `uptime()` — microseconds since boot, matching
             // `akuma_syscalls_time::sys_uptime` on the AArch64 side. `herd`'s
             // whole supervision loop is keyed on it (restart delays, start

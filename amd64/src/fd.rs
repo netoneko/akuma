@@ -1254,10 +1254,30 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
 /// `u64::MAX` (wait forever). Ignoring a finite timeout would be wrong, so it is
 /// recorded here rather than silently treated as infinite — the first caller
 /// that passes one is the one that has to implement it.
-pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
+pub fn sys_poll_input_event(buf: u64, len: u64, timeout_us: u64) -> u64 {
     if len == 0 {
         return 0;
     }
+    // The **fallback** arm since the `poll_input_event` fold: `usermode.rs`
+    // sends every process that has a `ProcessChannel` — an ssh session, the
+    // serial console — to `akuma-syscalls-glue`, which reads that channel.
+    // What is left here is a redirected fd 0 that is a pipe, and a process with
+    // no channel at all.
+    //
+    // `timeout_us` is honoured on both paths, and used to be dropped on the
+    // floor (the parameter was `_timeout_us`). A caller's timeout is not a
+    // nicety: it is how a TUI gets a frame tick — `meow` polls with 50 ms and
+    // repaints when it expires — and how its terminal-size probe gives up and
+    // falls back to 100x25 instead of waiting for a cursor report no one will
+    // send. `0` means one non-blocking look; `u64::MAX` means wait forever,
+    // which is what an interactive shell asks for.
+    let deadline = match timeout_us {
+        0 => Some(0),
+        u64::MAX => None,
+        t => Some(crate::net::uptime_us().saturating_add(t)),
+    };
+    let expired = |d: Option<u64>| d.is_some_and(|dl| crate::net::uptime_us() >= dl);
+
     // A spawned child (an interactive `sshd` shell) reads its keystrokes from
     // its stdin pipe, which `sshd` feeds from the SSH channel — not the UART.
     // Yield while waiting so `sshd` and the netpoll daemon keep running.
@@ -1284,11 +1304,19 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
                     if akuma_exec::process::should_interrupt_blocking_syscall() {
                         return errno::EINTR;
                     }
+                    if expired(deadline) {
+                        return 0;
+                    }
                     // A park, not a yield: an interactive shell waiting on a
                     // keystroke is the longest wait in this kernel and used to
-                    // be its busiest loop.
+                    // be its busiest loop. With a deadline it is a *timed*
+                    // park, so the tick that wakes it is the caller's own
+                    // timeout rather than the next keystroke.
                     if !crate::pipe::check_set_reader(pipe_id) {
-                        crate::sched::block_current();
+                        match deadline {
+                            Some(dl) => crate::sched::block_until_deadline(dl),
+                            None => crate::sched::block_current(),
+                        }
                     }
                 }
             }
@@ -1297,6 +1325,9 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
     loop {
         if let Some(b) = crate::input::getb() {
             return copy_to_user(buf, &[b]);
+        }
+        if expired(deadline) {
+            return 0;
         }
         // A yield, not a bare spin: this task holds the Big Kernel Lock, and a
         // shell waiting for a keypress must not hold every other core's syscalls

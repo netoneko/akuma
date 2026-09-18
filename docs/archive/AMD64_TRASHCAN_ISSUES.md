@@ -145,6 +145,125 @@ Network, DNS and TLS are **proven good** on the kernel that shows the hang. The
 wake path is **proven live**. What is unexplained is where git's first helper
 command goes, and why `git remote-https` parks in `read` rather than `wait4`.
 
+---
+
+## 1b. Bare-metal confirmation of §1
+
+**Status: CONFIRMED 2026-09-19 on the metal**, not only in the Firecracker
+guest. Kernel `020b4f16` + the fix, booted from `/boot/akuma-amd64` on the box's
+own ext2 root, self-tests **775 passed / 0 failed**:
+
+| | result |
+|---|---|
+| `git ls-remote https://github.com/octocat/Hello-World` | **1 s**, real refs |
+| `git clone --depth=1` the same repo | **1 s**, 29 files |
+| `git clone --depth=1 https://github.com/git/git` | **42 s**, **4852 files**, `git status` clean |
+
+The last row is the one worth keeping: a ~20 MB packfile fetched over TLS,
+indexed, and checked out onto the USB root, with `git status` clean afterwards.
+
+---
+
+## 2. `resolve_host` fails for an IP literal
+
+**Status: FIXED 2026-09-19.** Found by `meow`, which could not reach an
+inference server on the LAN while `busybox wget` reached the same address
+perfectly — the tell that the two use different resolvers.
+
+`meow --debug` names it exactly:
+
+```
+[meow:debug] resolving 192.168.1.203:8080
+[meow:debug] connect error (attempt 0): DNS resolution failed for: 192.168.1.203
+```
+
+**"Fixed where?" again.** The AArch64 resolver has always short-circuited
+`localhost` and a dotted quad — twice, in fact, once inside
+`akuma_net::dns::resolve_host` and once inside `resolve_host_blocking`.
+`amd64/src/dns.rs::resolve_a` is a *separate* A-record client (written because
+`smoltcp_net::dns_query` hung on this target, §3.30 of
+`AKUMA_FIRECRACKER_AMD64.md`) and it had neither. So `resolve_host("192.168.1.203")`
+went out and asked a resolver for an A record **named** `192.168.1.203`, got
+NXDOMAIN, and returned `ENOENT`.
+
+It only bites `no_std` programs: anything on musl (busybox, git, `nca`) resolves
+for itself and never issues this syscall. Everything on `libakuma` — `meow`,
+`hget`, anything using `libakuma-tls` — goes through it.
+
+**The fix:** `akuma_net::dns::resolve_literal(host) -> Option<[u8; 4]>`, one
+implementation, called by all three sites. Host-tested in `akuma-net`, including
+the near misses that must still reach a resolver (`192.168.1`, `192.168.1.256`,
+`192.168.1.203:8080`).
+
+---
+
+## 3. `poll_input_event` read the UART, so every TUI was dead over ssh
+
+**Status: FIXED 2026-09-19.** `meow` and `nca`'s full-screen modes did not work
+on this target, and neither did `paws`: the shell printed its banner and its
+prompt and then ignored everything typed at it, while `busybox sh -i` and `cat`
+on the same ssh session worked normally.
+
+That split is the whole diagnosis. `read(2)` on fd 0 goes through
+`akuma-syscalls-glue`'s `Stdin` arm, which reads the process's
+`ProcessChannel` — the thing `sshd` actually feeds. `poll_input_event` had a
+**local copy** in `amd64/src/fd.rs` that, for anything that was not a pipe,
+looped on `crate::input::getb()` — the **serial port**. An ssh session's
+keystrokes are never there. `meow`'s TUI blocked on its terminal-size probe
+before painting a single frame; `paws` blocked on its first keystroke.
+
+The same function also took `_timeout_us` and dropped it. That is not cosmetic:
+the timeout **is** a TUI's frame tick (`meow` polls with 50 ms and repaints when
+it expires) and it is what lets the terminal-size probe give up after 500 ms and
+fall back to 100x25 instead of waiting for a cursor report nobody will send.
+
+**The fix:** `amd64/src/usermode.rs` arm 313 hands the call to
+`akuma-syscalls-glue`'s `sys_poll_input_event` whenever the process has a
+channel — the shared implementation AArch64 has always used, which reads the
+channel, honours the timeout, registers an input waker and re-resolves the
+channel across a `box grab`. The local arm stays for the two cases glue answers
+`ENOMEM` for — a redirected fd 0 that is a pipe, and a process with no channel —
+and now honours `timeout_us` on both of its paths too.
+
+**Verified on the metal, over `ssh -tt`:**
+
+| | before | after |
+|---|---|---|
+| `paws`, typing `echo PAWS-OK` | prompt, then nothing | runs it, prints `PAWS-OK` |
+| `meow` TUI | 14 bytes (the size probe), then dead | full layout, streams a reply, `/quit` exits |
+| `nca` TUI | — | ratatui layout, streamed **"Paris"** from z.ai, `out:44 $0.0007` |
+
+---
+
+## 4. What works on the metal as of 2026-09-19
+
+Kernel `020b4f16` plus §§1-3. All over ssh to the box's own hardware:
+
+* `git clone` over HTTPS — §1b.
+* `meow -c` against an mlx server on the LAN: 657 ms to first token. The
+  repetition-loop guard fires on the prompt that started this whole thread
+  ("what do you know about this operating system where the agent runs") —
+  `Stream cut off: model stuck in a repetition loop` at 8 KB / 32 s, instead of
+  printing forever.
+* `meow` TUI and `nca` TUI, both interactive — launched from **inside the login
+  shell**, which is busybox (`/etc/sshd/sshd.conf` says `shell = /bin/sh`, set
+  that way by `amd64/mkdisk.sh` since 2026-09-05; `paws` is on the disk but is
+  nothing's default here). A bare `ssh -tt` session typed at human speed runs
+  `echo`/`busybox`/`uname`/`exit` normally, `meow` paints over it and `/quit`
+  returns to the prompt. `paws` is what *found* §3 — it is the smallest program
+  that reads with `poll_input_event` — but busybox is the shell the box is
+  actually used through, and it reads with `read(2)`, which is why it kept
+  working throughout and makes the control half of that diagnosis.
+* `nca` one-shot against **z.ai** (`glm-5.3-flash`, anthropic-compatible):
+  `nca --no-tui --stream ndjson -p …` streams `TokensStreamed` deltas and
+  reports cost. It must be run from `/`, because `config.local.toml` is looked
+  up at `<cwd>/.nca/`, and `HOME` is unset on this target (nca logs
+  `workspace data migration skipped error=HOME is not set` and carries on).
+
+Two things it still reports and neither is fatal: `IPC disabled: socket bind
+failed: Address family not supported by protocol (os error 97)` — nca's AF_UNIX
+control socket — and an `nca` process that outlives its one-shot turn.
+
 ## Background
 
 - [`AKUMA_FROM_SCRATCH.md`](AKUMA_FROM_SCRATCH.md) — the goal this blocks; §3

@@ -6,8 +6,14 @@
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** **the quest is answered — on 2026-09-13 the guest built this
-kernel**, and on **2026-09-18 it does so in parallel, repeatably, and to a
-fixed point.** `cargo build --release` for the amd64 kernel ran to completion
+kernel**, on **2026-09-18 it does so in parallel, repeatably, and to a
+fixed point**, and **on 2026-09-18 the metal reached that fixed point too**
+(gen-3 byte-identical to gen-2, built inside it, with GRUB pointed at a kernel
+on Akuma's own root so no Ubuntu is in the loop —
+`AKUMA_AMD64_BARE_METAL_SELFHOST.md`). Since **2026-09-19** the box is also
+usable *as* a workstation: `git clone` over HTTPS, and `meow`/`nca` in both
+one-shot and full-screen modes (`AMD64_TRASHCAN_ISSUES.md` §§1-4).
+`cargo build --release` for the amd64 kernel ran to completion
 inside Akuma/amd64 under Firecracker on 09-13: 94 crates, 7 m 53 s, `rc=0`, and
 a 2 895 920-byte `ET_EXEC` x86-64 image with a PVH note at the end of it.
 
@@ -1912,7 +1918,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         2 m 44 s". Nothing in the second half is new capability — it is
         all *correctness under concurrency* plus three ceilings.
    ▼
- [09-18] ═══ YOU ARE HERE ═══ IT BUILDS ITSELF IN PARALLEL, TO A FIXED POINT
+ [09-18] ═══ IT BUILDS ITSELF IN PARALLEL, TO A FIXED POINT ═══ (in the guest)
    │
    ├──► **Parallel.** Clean 137-crate kernel build in the guest:
    │   `-j1` 226.5 s, `-j4` ~178 s, **`-j8` ~164 s** (4 vCPU). Five
@@ -1924,35 +1930,116 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   to itself** (md5 `22c696a9…`). That is the check that separates
    │   "the build runs" from "the build is right".
    │
-   └──► **Still the guest.** Every number above is Firecracker on the
-        trashcan's Ubuntu personality. The metal has not built a kernel
-        since §11's `nosmp` run (95 crates, **22 m 54 s** — 6.2x the
-        guest, and it is the USB root, not the CPU).
+   └──► **Still the guest, for a few more hours.** Every number above is
+        Firecracker on the trashcan's Ubuntu personality; at this point
+        the metal had not built a kernel since §11's `nosmp` run (95
+        crates, **22 m 54 s** — 6.2x the guest, and it is the USB root,
+        not the CPU). That is what the next block closes.
    ▼
- [NEXT] ═══ COMPLETE SELF-HOSTING ═══ BUILD ON THE METAL, REBOOT INTO IT
+ [09-18 late] ═══ COMPLETE SELF-HOSTING ═══ REACHED, ON THE METAL
    │
-   ├──► The loop to close, with no Ubuntu in it: **boot Akuma on the
-   │   metal → build the kernel there → install it → `reboot(2)` →
-   │   come back up on the kernel you just built → build it again and
-   │   compare.** AArch64 has this (`KERNEL_DROPOFF`, raw block fd +
-   │   `reboot(2)`, `selfhost-kernel-build.md` § "Swap the running
-   │   kernel in place"); amd64 has no equivalent — installing a kernel
-   │   still means GRUB, arranged from Ubuntu.
+   ├──► The loop above closed the same night, with no Ubuntu in it:
+   │   **boot Akuma on the metal → `kbuild` → `install_kernel_amd64.sh`
+   │   → `reboot -f` → come back up on what you just built → build it
+   │   again and compare.** What made it possible was deleting the
+   │   install step rather than porting `KERNEL_DROPOFF`: GRUB already
+   │   does `insmod ext2` and `sdb1` is Akuma's own root, so installing
+   │   a kernel is `cp … /boot/akuma-amd64` — no ESP, no flatten
+   │   (multiboot2 parses the ELF), no capacity ceiling, and this kernel
+   │   never needs the vfat it does not have.
    │
-   ├──► **Known to be in the way**, each already characterised:
-   │   the USB root at 14.5 s/crate (storage, §11 D); `rust-lld`'s
-   │   default thread pool, worked around with `--threads=1` in rig
-   │   state and **untested since the fault-race fix**; SMP=4 on the
-   │   metal, where §11 last saw `rustc` dereference a pointer
-   │   overwritten with ASCII; and the fact that an Akuma that cannot
-   │   spawn `/bin/sh` or does not hold your key has no way back except
-   │   a power cycle.
+   ├──► **The fixed point, on real silicon:**
    │
-   └──► The bar is the same one this box just cleared in the guest, on
-        the metal instead: a **fixed point** — gen-2 byte-identical to
-        gen-1 — reached without the Ubuntu personality touching the
-        kernel in between.
-
+   │   | generation | md5 | built by | wall |
+   │   |---|---|---|---|
+   │   | gen-1 | `6dd8ba18…` | the old 512 MiB-heap kernel | 1398 s, link failed |
+   │   | bootstrap | `bb0add8a…` | laptop cross-build, carries the heap fix | — |
+   │   | **gen-2** | `a4075621…` | the bootstrap, on the metal | **640 s** |
+   │   | **gen-3** | **`a4075621…`** | **gen-2, on the metal** | **632 s** |
+   │
+   │   Gen-3 byte-identical to gen-2, built inside it. The heap was the
+   │   bottleneck and 512 MiB → 1 GiB was worth 3.3x.
+   │
+   └──► And the consequence that reshapes the loop: `GRUB_DEFAULT` is
+        now **`Akuma/amd64`**, not a `grub-reboot` one-shot. `reboot -f`
+        from Akuma comes back to Akuma, so the cycle is build → install
+        → reboot with nothing to arm. The price is that **Akuma cannot
+        put the box back on Ubuntu** — grub.cfg and the ESP are on
+        filesystems it does not have — so that is a keypress at the
+        machine.
+   ▼
+ [09-19] ═══ YOU ARE HERE ═══ THE BOX IS A WORKSTATION, NOT A BUILD TARGET
+   │
+   │   Self-hosting was reached; **using** the machine was not. Three
+   │   defects stood between "it builds its own kernel" and "you can
+   │   work on it", and every one of them was the port's signature
+   │   failure — a fix that had landed in AArch64-only code.
+   │
+   ├──► **`git clone` over HTTPS hung.** `execve` never closed
+   │   `FD_CLOEXEC` descriptors here: `Process::close_cloexec_fds` is
+   │   shared code with exactly one caller, glue's `sys_execve`, which
+   │   is the AArch64 path. git's `start_command` learns that its child
+   │   exec'd by reading EOF on a notify pipe whose write end the exec
+   │   is supposed to close — so git blocked in `read(7)` forever and
+   │   never sent `capabilities`. Four distinct causes had worn that one
+   │   signature; this was the fourth. Now: **`git clone --depth=1
+   │   https://github.com/git/git` = 42 s, 4852 files, `git status`
+   │   clean**, on the metal.
+   │
+   ├──► **`resolve_host` NXDOMAIN'd on an IP literal.** `akuma_net::dns`
+   │   has always short-circuited `localhost` and a dotted quad — twice,
+   │   even — and `amd64/src/dns.rs::resolve_a` (a separate A-record
+   │   client, written because `smoltcp_net::dns_query` hung here) had
+   │   neither. Only `no_std` callers could see it: musl resolves for
+   │   itself. One `akuma_net::dns::resolve_literal` now, host-tested.
+   │
+   ├──► **`poll_input_event` read the UART, so every TUI was dead over
+   │   ssh.** `read(2)` on fd 0 goes through glue's `Stdin` arm and the
+   │   `ProcessChannel` sshd feeds; amd64 kept a **local copy** of
+   │   `poll_input_event` looping on `crate::input::getb()` — the serial
+   │   port — and dropped `timeout_us` on the floor, which is a TUI's
+   │   frame tick. Arm 313 now folds onto glue whenever the process has
+   │   a channel. `paws` was the probe; busybox never noticed, because
+   │   it reads with `read(2)` — that split *was* the diagnosis.
+   │
+   ├──► **What the box does now**, all over ssh to its own hardware:
+   │   `git clone`; `meow` at **657 ms to first token** against an mlx
+   │   server on the LAN, with the repetition-loop guard cutting a
+   │   degenerate stream at 8 KB / 32 s instead of printing forever;
+   │   **`meow`'s TUI and `nca`'s TUI**, both launched from the busybox
+   │   login shell; and `nca` one-shot and interactive against **z.ai**
+   │   (`glm-5.3-flash`), streaming deltas and reporting cost.
+   │
+   └──► **The loop had no Ubuntu in it either.** Two of the three
+        kernels booted this day were pushed from the laptop straight
+        into Akuma (`hpbox.akuma_push` — `cat >` over the session
+        channel, md5-verified, since there is no sftp subsystem),
+        `cp`'d to `/boot/akuma-amd64` and `reboot -f`'d. Ubuntu built
+        the first one and was not touched again.
+   ▼
+ [NEXT] ═══ FROM SCRATCH ═══ THE USERLAND, AND THE METAL'S SPEED
+   │
+   ├──► **`AKUMA_FROM_SCRATCH.md`'s remaining half.** The kernel builds
+   │   itself — but from a tree staged onto sdb1 with `--exclude .git`
+   │   (§4: that is why a metal-built kernel reports `unknown` for its
+   │   sha). Now that `git clone` works there, the box can fetch its own
+   │   sources instead of being handed them. What has never been done on
+   │   the metal at all is the **userland** — clone and build
+   │   `userspace/` on the box, so nothing in the running system came
+   │   from a cross-build.
+   │
+   ├──► **Speed.** The metal's fixed point was `kbuild -c -j 1`: 95
+   │   crates in **640 s / 632 s**, about **6.7 s per crate**. The guest
+   │   does **1.2 s** per crate at `-j8`. So the remaining gap is ~5x and
+   │   it is *parallelism*, not the device — §2 measures storage as under
+   │   2.3x of a 6.2x. `nosmp` is the deterministic build and is **not
+   │   reachable remotely**; SMP=4 on the metal is where §11 last saw
+   │   `rustc` dereference a pointer overwritten with ASCII.
+   │
+   └──► **Carried, unconfirmed:** the 60 s stream-end stall
+        (`AKUMA_AMD64_STREAM_END_STALL.md`) — the RTL8169 watchdog was
+        recalibrated and the 14-byte final chunk identified as
+        `data: [DONE]`, but neither is proven to be the cause.
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -2099,20 +2186,19 @@ parity with what the AArch64 self-host already proves.
   │     `git archive` dropping the vendored fonts, and MAX_ARGV    │
   │     256 < cargo's 300-argument rustc line. See the walk's      │
   │     "YOU ARE HERE".                                            │
-  │   ◐ **somewhere to put a toolchain** — 2026-09-10, half done;  │
-  │     still open, and now the ONLY thing D is missing: the       │
-  │     build above did not run on the metal's 64 GB root.         │
-  │     The metal mounts its 64 GB persistent root again (`fs:     │
-  │     ext2 mounted on /dev/sda1`, 641 passed / 0 failed, ~63 GB  │
-  │     free) once the drive is in a **USB 3.0** socket —          │
-  │     BOT-over-xHCI works at SuperSpeed only. `apk` works here,  │
-  │     so the toolchain is `apk add rust cargo`, not a prepared   │
-  │     image as on AArch64. **But it stalls again under use**     │
-  │     (`transfer timeout: CBW`, unrecoverable, root reads dead   │
-  │     for the boot) — which is why the RAM image path exists at  │
-  │     all. **The xHCI recovery gap is now on D's critical path:**│
-  │     Set TR Dequeue Pointer + the BOT reset. See                │
-  │     AKUMA_AMD64_USB_XHCI.md § "It stalls again under use".     │
+  │   ✔ **a toolchain on the metal — DONE 2026-09-18.** The box    │
+  │     builds on its own 64 GB USB root: gen-2 640 s, gen-3 632   │
+  │     s, byte-identical (AKUMA_AMD64_BARE_METAL_SELFHOST.md).    │
+  │     The toolchain is `apk add rust cargo`, not a prepared      │
+  │     image as on AArch64. Two things landed first: the drive in │
+  │     a **USB 3.0** socket (BOT-over-xHCI is SuperSpeed only)    │
+  │     and the **xHCI stall recovery** (09-12) — `SET_TR_DEQUEUE` │
+  │     issued TRB type 15, which is *Stop Endpoint*, so the       │
+  │     dequeue move never moved and each retry queued behind the  │
+  │     corpse. Storage is still the cost, not the CPU: ~23 min at │
+  │     `-j1` vs the guest's ~178 s at `-j4`; §2 measures the      │
+  │     device as under 2.3x of that. AKUMA_AMD64_USB_XHCI.md §    │
+  │     "the dequeue move never moved".                            │
   │   file-backed + lazy mmap  ← B1/B2 (rustc mmaps rlibs)         │
   │   threads + futex          ← A1/A2 (rayon, jobserver)          │
   │   wait4, pipes, signals    ← A2 (cargo -j, SIGINT)             │

@@ -212,6 +212,19 @@ fn parse_response(resp: &[u8], id: u16) -> ParseResult {
 /// an `NXDOMAIN` — see [`resolvers`] for why a configured resolver that answers
 /// some names and not others is a real case here.
 pub fn resolve_a(hostname: &str, timeout_us: u64) -> Option<[u8; 4]> {
+    // `localhost` and a dotted-quad literal are answers, not questions. The
+    // AArch64 resolver has always short-circuited both inside
+    // `akuma_net::dns::resolve_host_blocking`; this module never did, so
+    // `resolve_host("192.168.1.203")` went out and asked a resolver for an A
+    // record *named* `192.168.1.203`, got NXDOMAIN, and returned `ENOENT`.
+    // Every `no_std` program that resolves through the syscall rather than musl
+    // -- `meow` and anything else on `libakuma` -- then reported "DNS
+    // resolution failed" for a LAN peer `busybox wget` reached perfectly.
+    // Shared with the AArch64 path so the two cannot drift again.
+    if let Some(ip) = akuma_net::dns::resolve_literal(hostname) {
+        return Some(ip);
+    }
+
     let mut query_buf = [0u8; MAX_PACKET];
     // The uptime reading doubles as the query ID's low bits — good enough
     // entropy for "do not accept a stale reply to a different query".
