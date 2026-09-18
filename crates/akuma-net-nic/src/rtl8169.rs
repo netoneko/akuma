@@ -233,11 +233,48 @@ impl Rings for Rtl8169Rings {
 }
 
 /// The Realtek NIC behind [`ExternalDevice::Rtl8169`](crate::ExternalDevice).
-/// Consecutive fruitless receive laps before the stall dump fires. The poll
-/// loop runs into the hundreds of thousands per second, so this is a second or
-/// two of genuine silence — long enough not to fire on an idle link between
-/// broadcasts, short enough to catch the failure while it is fresh.
+/// Consecutive fruitless receive laps before the stall dump fires — the
+/// **fallback** horizon, used only until the clock seam is registered.
+///
+/// This used to be the only horizon, and the comment it carried ("the poll loop
+/// runs into the hundreds of thousands per second, so this is a second or two
+/// of genuine silence") stopped being true on the target that has this chip.
+/// `amd64`'s `netpoll_daemon` parks for one LAPIC tick whenever a lap moved
+/// nothing (`NETPOLL_IDLE_PARK_US`), so an idle receive lap now runs about
+/// **100 times a second, not hundreds of thousands** — and 2,000,000 of them is
+/// five and a half hours, not two seconds. The recovery below therefore never
+/// fired in practice after boot: the one time it was observed
+/// (`[rtl] STALL #1 after 2000000 idle laps`, quoted in
+/// `docs/archive/AKUMA_AMD64_STREAM_END_STALL.md`) was during *bring-up*, while
+/// the loop was still busy-spinning, which is exactly why the calibration
+/// breaking afterwards went unnoticed.
+///
+/// A lap count cannot express "two seconds" on a loop whose rate is a scheduling
+/// decision, so the real horizon is [`STALL_QUIET_US`] and this only covers the
+/// window before `uptime_us` is available.
 const STALL_LAPS: u32 = 2_000_000;
+
+/// `uptime_us`, or `None` before the runtime seam is registered (early boot and
+/// host tests). The stall watch measures against this; `None` means fall back
+/// to the lap count, never to a bogus zero.
+#[inline]
+fn now_us() -> Option<u64> {
+    akuma_primitives::net_runtime::try_runtime().map(|rt| (rt.uptime_us)())
+}
+
+/// How long receive may stay silent before the recovery fires, in microseconds.
+///
+/// Wall-clock, so it means the same thing whether the poll loop is spinning
+/// through bring-up or parked at one lap per tick — which is the whole point of
+/// replacing the lap count.
+///
+/// Five seconds rather than the two the lap count was meant to express: the
+/// kick resets the ring cursor, so a frame the chip has written but the driver
+/// has not yet read is lost across it, and on a quiet link that is a cost paid
+/// for nothing. The crate's own bring-up note — "on any real LAN this climbs
+/// within seconds from broadcast traffic alone" — is what makes five seconds
+/// still a stall rather than an idle link.
+const STALL_QUIET_US: u64 = 5_000_000;
 
 /// How many stalls are reported on the console before the recovery goes quiet.
 ///
@@ -255,8 +292,13 @@ pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
     /// Lap counter for the periodic PHY sample.
     link_poll: u32,
-    /// Consecutive laps that produced no frame.
+    /// Consecutive laps that produced no frame. Only consulted while
+    /// [`Self::last_rx_us`] is `None` — see [`STALL_LAPS`].
     idle_laps: u32,
+    /// `uptime_us` at the last frame that actually came off the ring, or `None`
+    /// before the clock seam exists / before the first frame. This is what the
+    /// stall watch measures against; the lap counter is the fallback.
+    last_rx_us: Option<u64>,
     /// How many stalls have been seen. The full ring dump prints on the first
     /// one only — once is a diagnosis, sixteen lines every two seconds is a
     /// screen nobody can read — and the recovery attempt is capped at
@@ -296,6 +338,7 @@ impl Rtl8169Device {
             nic,
             link_poll: 0,
             idle_laps: 0,
+            last_rx_us: None,
             stalls: 0,
             rx_scratch: [0; BUF_LEN],
             tx_scratch: [0; BUF_LEN],
@@ -446,14 +489,30 @@ impl Rtl8169Device {
         // says about itself the moment it stops, once, and then never again.
         let Some(n) = self.nic.receive(&mut self.rx_scratch) else {
             self.idle_laps = self.idle_laps.saturating_add(1);
-            if self.idle_laps >= STALL_LAPS {
+            // Wall-clock first, lap count only as the pre-clock fallback. The
+            // two must not both be able to fire, or a bring-up spin would kick
+            // on laps while the clock says receive is healthy.
+            let stalled = match (now_us(), self.last_rx_us) {
+                (Some(now), Some(last)) => now.saturating_sub(last) >= STALL_QUIET_US,
+                (Some(now), None) => {
+                    // Clock up but nothing received yet: start the window here
+                    // rather than at boot, so a late-arriving link does not
+                    // count its own bring-up as silence.
+                    self.last_rx_us = Some(now);
+                    false
+                }
+                (None, _) => self.idle_laps >= STALL_LAPS,
+            };
+            if stalled {
                 self.stalls += 1;
                 self.idle_laps = 0;
+                self.last_rx_us = now_us();
                 self.on_stall();
             }
             return None;
         };
         self.idle_laps = 0;
+        self.last_rx_us = now_us();
         // Only reached when a frame really came off the ring, so this counts
         // wire arrivals. The virtio path bumps the same counter in `device.rs`;
         // until 2026-09-05 this one bumped nothing, so `rx_counters()` read a

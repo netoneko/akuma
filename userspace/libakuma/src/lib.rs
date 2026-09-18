@@ -197,6 +197,9 @@ pub mod syscall {
         pub const KILL_BOX: u64 = 317;
         pub const REATTACH: u64 = 318;
         pub const UPTIME: u64 = 319;
+        /// asm-generic `getpid`. See [`super::super::getpid`] for why the
+        /// number lives here rather than as a literal at the call site.
+        pub const GETPID: u64 = 172;
         pub const SET_TID_ADDRESS: u64 = 96;
         pub const EXIT_GROUP: u64 = 94;
         pub const SET_TPIDR_EL0: u64 = 320;
@@ -274,6 +277,10 @@ pub mod syscall {
         pub const KILL_BOX: u64 = AKUMA_PRIVATE_BASE + 317;
         pub const REATTACH: u64 = AKUMA_PRIVATE_BASE + 318;
         pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;
+        /// x86_64 `getpid` is **39**, not the asm-generic 172 — 172 is `iopl`
+        /// here. The kernel agrees: `akuma-syscalls-abi` has
+        /// `Getpid => GETPID = 39, nr::GETPID`.
+        pub const GETPID: u64 = 39;
         pub const SET_TID_ADDRESS: u64 = 218;
         pub const EXIT_GROUP: u64 = 231;
         pub const SET_TPIDR_EL0: u64 = AKUMA_PRIVATE_BASE + 320;
@@ -361,16 +368,36 @@ pub struct ProcessInfo {
     pub _reserved: [u8; 1008],
 }
 
-/// Get the current process ID
+/// Get the current process ID.
 ///
-/// Reads from the kernel-provided process info page.
-/// With the `linux-abi` feature, uses the Linux getpid syscall (172) instead,
-/// because the Akuma process-info page at 0x1000 is unmapped on standard Linux.
+/// Reads from the kernel-provided process info page at [`PROCESS_INFO_ADDR`]
+/// (0x1000) — **except** where that page does not exist, in which case it is a
+/// syscall.
+///
+/// Two cases take the syscall, for the same reason:
+///
+/// * The `linux-abi` feature — the page is not a thing on standard Linux.
+/// * **`target_arch = "x86_64"`, unconditionally.** The amd64 kernel does not
+///   map it: `amd64/src/usermode.rs` states `process_info_phys: 0` — "the
+///   ProcessInfo page is **not mapped, not allocated, and not missed**" —
+///   reasoning about the *kernel's* `read_current_pid`, which on that target
+///   resolves identity through `THREAD_PID_MAP` instead. That reasoning is
+///   correct for the kernel and silently wrong for userspace, which reads the
+///   user VA directly. Measured 2026-09-18: a cross-built `hello` faulted at
+///   its first `getpid()` with `#PF … rip=0x4000c4 cr2=0x1000` — the literal
+///   `movl 0x1000, %r15d` — before printing anything. Every libakuma binary
+///   built for this target hit it, which is why it read as "meow is broken"
+///   rather than as one missing page.
+///
+/// The number comes from [`syscall::GETPID`], not a literal. It used to be a
+/// hard-coded `172` — the asm-generic number — which on x86_64 is `iopl`, so
+/// enabling `linux-abi` to dodge the unmapped page would have traded a page
+/// fault for a call into the I/O-privilege syscall.
 #[inline]
 pub fn getpid() -> u32 {
-    #[cfg(feature = "linux-abi")]
-    { syscall(172, 0, 0, 0, 0, 0, 0) as u32 }
-    #[cfg(not(feature = "linux-abi"))]
+    #[cfg(any(feature = "linux-abi", target_arch = "x86_64"))]
+    { syscall(syscall::GETPID, 0, 0, 0, 0, 0, 0) as u32 }
+    #[cfg(not(any(feature = "linux-abi", target_arch = "x86_64")))]
     unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid }
 }
 

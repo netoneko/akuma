@@ -141,3 +141,83 @@ other two.
   turn "we think this is the kernel" into proof in one command.
 - [`AKUMA_AMD64_DNS_CONNECTED_UDP.md`](AKUMA_AMD64_DNS_CONNECTED_UDP.md) — the
   resolver fixes this sits downstream of.
+
+---
+
+## 7. 2026-09-18: the terminator identified, and candidate 1 patched
+
+**Status: candidate 1 is fixed. The 60 s stall is not confirmed closed** — that
+needs a run on the box, and the two captures §4 asks for are still the way to
+prove it.
+
+### 7.1 The 14-byte chunk is `data: [DONE]\n\n`
+
+§2 records the stalled chunk as "the 14-byte terminator" without saying what it
+contains. It is the SSE sentinel: `"data: [DONE]\n\n"` is exactly 14 bytes. That
+matters because it is *not* part of the answer — every byte of the model's
+response has already arrived by then, and the only thing waiting on it is a
+client that treats the sentinel as the end of stream.
+
+Two consequences:
+
+* It explains why only the **last** segment stalls, and why the body is always
+  "complete and correct when it finally lands". Nothing is lost because nothing
+  was still owed.
+* It is separable from the kernel bug. `userspace/meow` now ends a stream on a
+  non-null `choices[0].finish_reason` as well as on `[DONE]`
+  (`src/api/client.rs`, `parse_streaming_line`), so the answer is complete and
+  returned before the late chunk is even due. `nca` cannot be fixed this way —
+  hyper is failing at the *chunked-body* layer, below SSE — so for nca the
+  kernel-side defect is still the whole story.
+
+### 7.2 The receive-stall watchdog had stopped being a watchdog
+
+§4's candidate 1 was "the known RTL8169 receive stall … a stalled RX ring that
+recovers on a timer is the shape of this bug". The recovery exists —
+`Rtl8169Device::on_stall` → `Nic::kick_receiver` — and it was **unreachable in
+practice on this target**, which no one had noticed because the one time it was
+seen firing was during bring-up.
+
+`crates/akuma-net-nic/src/rtl8169.rs` armed it off a lap count:
+
+```rust
+const STALL_LAPS: u32 = 2_000_000;   // "a second or two of genuine silence"
+```
+
+That comment was true when it was written and is not true now.
+`amd64/src/net.rs`'s `netpoll_daemon` parks for one LAPIC tick whenever a lap
+moved nothing (`NETPOLL_IDLE_PARK_US`, added for the idle-CPU fix), so an idle
+receive lap runs about **100 times a second, not hundreds of thousands**.
+2,000,000 of them is **five and a half hours**. After boot the watchdog could
+not fire.
+
+The `[rtl] STALL #1 after 2000000 idle laps` line quoted in §4 is from the
+bring-up window, while the loop was still busy-spinning — which is exactly why
+the calibration breaking afterwards was invisible.
+
+**Fix:** the horizon is wall-clock now (`STALL_QUIET_US = 5_000_000`), measured
+from the last frame that actually came off the ring, with the lap count kept
+only as the pre-clock fallback. A lap count cannot express "two seconds" on a
+loop whose rate is a scheduling decision.
+
+Five seconds rather than the two the lap count meant to express: `kick_receiver`
+resets the ring cursor, so a frame the chip has written and the driver has not
+yet read is lost across it. The crate's own bring-up note — "on any real LAN
+this climbs within seconds from broadcast traffic alone" — is what makes five
+seconds still a stall rather than an idle link.
+
+### 7.3 Why this is a candidate and not yet a root cause
+
+The mechanism it would complete: the ring goes dry, an arriving segment is
+dropped for want of a descriptor (`MPC` counts it), the peer retransmits on the
+standard backoff ladder (1+2+4+8+16+32 = 63 s, against a measured 63.0–63.3 s
+total on a stream whose content ends at ~3.0 s), and by the time a retransmit
+lands the driver has drained the ring. That fits the timing, the ~2-in-3 hit
+rate, and "only the final segment" — but **none of it is measured**, and a
+5.5-hour watchdog cannot by itself produce a 60 s delay. The watchdog being
+broken is a real defect either way; whether it is *this* defect is what §4's two
+captures decide.
+
+Check `MPC` (it is already in `Nic::snapshot`) in the stalled run: a non-zero
+missed-packet count is the difference between "the ring dropped it" and "it
+never arrived".
