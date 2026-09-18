@@ -6,9 +6,51 @@
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
 **Status:** **the quest is answered — on 2026-09-13 the guest built this
-kernel.** `cargo build --release` for the amd64 kernel ran to completion inside
-Akuma/amd64 under Firecracker: 94 crates, 7 m 53 s, `rc=0`, and a 2 895 920-byte
-`ET_EXEC` x86-64 image with a PVH note at the end of it. Trunks A, B and C all
+kernel**, and on **2026-09-18 it does so in parallel, repeatably, and to a
+fixed point.** `cargo build --release` for the amd64 kernel ran to completion
+inside Akuma/amd64 under Firecracker on 09-13: 94 crates, 7 m 53 s, `rc=0`, and
+a 2 895 920-byte `ET_EXEC` x86-64 image with a PVH note at the end of it.
+
+> **Update 2026-09-18 — parallel, faster, and self-reproducing.**
+>
+> | | 2026-09-13 | 2026-09-18 | change |
+> |---|---|---|---|
+> | jobs that work | `-j1` only | **`-j1` … `-j8`** | `-j4`/`-j8` went from wedge/crash to green |
+> | clean build, single job | 473 s / 94 crates | **226.5 s / 137 crates** | **−52 % wall on a 46 % larger graph** |
+> | …per crate | 5.03 s | 1.65 s | **−67 %** (3.0x) |
+> | best cell, per crate | 5.03 s | **1.20 s** (`-j8`, 164 s) | **−76 %** (4.2x) |
+> | fastest whole-kernel build | 7 m 53 s | **2 m 44 s** (`-j8`) | **−65 %** (2.9x) |
+>
+> The wall-clock rows understate it: the graph grew from 94 to 137 crates
+> between the two dates, so the per-crate rows are the honest comparison. The
+> 2026-09-18 numbers are at `vcpu_count=4`, which §10 of the slowness doc
+> measured as costing **+26 %** for a *single-job* build against SMP=1 — so the
+> `-j1` figure is, if anything, pessimistic.
+>
+> **What changed, in the order it mattered:** a demand-fault race that let two
+> cores install two frames over one page (the reason every SMP>1 build died in
+> ~2 s), a futex `EINTR` hole that turned that death into a 600 s silence, an
+> O(n²) `mmap` placer, the block-layer double copy, TSC-resolution timekeeping,
+> and a 64-pipe machine ceiling that presented as `could not exec the linker
+> \`cc\``. All of it is
+> `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §9-§19.
+>
+> **And it reaches a fixed point.** The guest-built kernel boots (768 passed /
+> 0 failed at 4 vCPU) and the kernel *it* builds is byte-identical to itself
+> (md5 `22c696a9…`, 3 389 240 B) — the check that separates "the build runs"
+> from "the build is right".
+>
+> Correction to this doc's own arithmetic: the line below reads 7 m 53 s against
+> the box's Linux at 1 m 09 s as "the guest is ~30-50x slower". **Those two
+> numbers divide to 6.9x.** The 30-50x figure belongs to the single-crate
+> `akuma-exec` anchor, not to the whole-graph build.
+>
+> The full arc — every recorded in-guest timing from the 09-13 build to now,
+> the single-crate anchors that moved first, the gap to the box's own Linux
+> (6.9x → 2.3x at equal jobs), and what each era was limited by — is
+> `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §20.
+>
+> Procedure: [`docs/runbooks/selfhost-kernel-build-amd64.md`](../runbooks/selfhost-kernel-build-amd64.md). Trunks A, B and C all
 landed (C3, the clock, closed C on 2026-09-12 — `AKUMA_AMD64_C3_CLOCK.md`), and
 box D fell to the last three walls: the idle spin, the unvendored fonts and
 `MAX_ARGV`. What is *not* done is the same thing it has been since 09-10 — the

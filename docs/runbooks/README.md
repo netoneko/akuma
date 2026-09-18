@@ -40,7 +40,8 @@ Start from the symptom or task on the left.
 | A write fault SIGSEGVs a page whose `[WPF]` line says `ap_rw=true` | The write was legal and the fault was stale — some other thread had already repaired the page. **Re-fixed 2026-08-30**: the absorb now re-checks after the fault-slot wait and at the SIGSEGV delivery point too (the entry-time check alone lost races to the repair). §12 of the same audit; the repair is `stale_write_fault_absorbed` in `akuma-exceptions`; storm repro `c_stress/cowstale hammer` |
 | A VM feels slow / unresponsive under parallel load, or an in-VM build crawls | The console may be the bottleneck — three per-event traces were unconditional until 2026-08-08 and cost 270 KB/s: [`../archive/SERIAL_TRACE_TRAFFIC_AUDIT.md`](../archive/SERIAL_TRACE_TRAFFIC_AUDIT.md). Histogram the log before blaming the kernel |
 | Debugging SSH latency / echo / terminal sizing | [`debug-ssh-latency.md`](debug-ssh-latency.md) |
-| Self-hosting (compiling the kernel inside Akuma) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
+| Self-hosting (compiling the kernel inside Akuma) — **AArch64** | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
+| Self-hosting on **amd64** (Firecracker guest on the HP box) | [`selfhost-kernel-build-amd64.md`](selfhost-kernel-build-amd64.md) — the one-command gate, the image-drift step that fakes a compile error, timings (`-j8` ~164 s, the fastest cell), and the fixed-point check |
 | Swapping the running kernel for a freshly built one without touching the host (`KERNEL_DROPOFF` + raw block fd + `reboot(2)`) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) § "Swap the running kernel in place" |
 | Running a Docker image with `box run` | [`run-docker-image.md`](run-docker-image.md) |
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |

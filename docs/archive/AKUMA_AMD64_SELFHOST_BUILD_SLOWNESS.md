@@ -2718,9 +2718,27 @@ lines, zero `[ISIG-MISS]`.** The `-j4` gate itself is unmoved by the fix
 - **Not the shell.** `busybox` does exactly what it does on Linux; it is the
   kernel that gave two sessions one termios.
 
-The guess in the report ("something in signal delivery or whatever") was right
-about *where* to look and one layer too deep: the signal was never raised, so
-nothing downstream of it could have been at fault.
+#### The report's guesses, scored
+
+The symptom arrived as *"if `^C` does not break `tail -f` it might be something
+in signal delivery or whatever"*, alongside *"check futex work too"*. Worth
+scoring, because the hit rate is the useful part and two of the three were
+wrong in a way that would have cost a day each to chase:
+
+| guess | verdict | what settled it |
+|---|---|---|
+| **`^C` does not break `tail -f`** | **RIGHT, and it was a real defect** | reproduced on the second ssh session of every boot; `-n 3` on the probe |
+| it is **signal delivery** | **wrong** | `kill -INT` on a `sleep 60` parked in `nanosleep` kills it in **1.2 s** — delivery, the wake of a parked thread, and `EINTR` all work |
+| check the **futex** work | **wrong, and not involved** | nothing on this path touches the futex table; §13's `EINTR` fix stands unrelated |
+
+The failure was one layer *above* all three: the signal was never raised at all,
+because the terminal the kernel consulted said `ISIG` was off. Everything
+downstream of that was working the whole time, which is why "it must be signal
+delivery" is the natural reading and why the `[ISIG-MISS]` tripwire — which
+distinguishes *declined* from *never arrived* — is the thing that made the
+difference. **When a signal "does not arrive", measure delivery directly before
+believing it: a `kill` from a second session is one command and it eliminates
+the whole downstream half.**
 
 
 ### 17. The fixed point: the kernel the guest built builds itself, byte-identically (2026-09-18)
@@ -2834,6 +2852,148 @@ The high-water at cap 64 is **66**. `at_capacity()` samples the live count
 creators can land a few over. That is fine — the number is a policy, not an
 invariant anything indexes — but it means a check for "exactly the cap" in a
 future test would be wrong.
+
+
+### 19. Where the build time actually is now — the scaling table, and what it is against (2026-09-18)
+
+Clean 137-crate `cargo build -p akuma-amd64 --target x86_64-unknown-none
+--release --offline`, Firecracker guest at `vcpu_count=4`, 6144 MB, host-timed,
+all on one kernel and one source tree:
+
+| jobs | wall | vs `-j1` |
+|---|---|---|
+| `-j1` | 226.5 s | — |
+| `-j2` | 233.6 s | **+3 % (slower)** |
+| `-j4` | 174.6 / 178 / 174 / 182.6 / 189.6 s → **~178 s** | −21 % |
+| `-j8` | 163.0 / 165.0 s → **~164 s** | **−28 %** |
+
+**Eight jobs on four cores buy 1.39x.** That is the headline of this table and
+it is not a good number — an ideal 4-core machine would be near 4x, and the host
+gets ~2.8 cores of parallelism out of the same graph. The build is dominated by
+something that does not parallelise: the BKL and the filesystem, in some
+proportion this table cannot separate.
+
+`-j1` and `-j2` are **one run each**, and their 3 % gap is inside the spread the
+five `-j4` runs show (174-190 s, ±4.5 %), so read it as *"a second job returns
+nothing measurable"* and not as "two jobs are slower than one". The `-j4` and
+`-j8` gains are outside that spread and are real.
+
+**So the remaining win is scaling, not per-job speed.** The per-job path has had
+five rounds of work (§1-§9) and is now fast enough that four more jobs add 28 %.
+
+#### Against what this doc previously recorded
+
+Two prior numbers, and both comparisons need their caveat stated or they
+flatter this one:
+
+| measurement | then | now | change |
+|---|---|---|---|
+| in-guest clean build, **single job** (`AKUMA_SELF_HOSTING_AMD64.md`, 2026-09-13) | **473 s** / 94 crates | **226.5 s** / 137 crates | **−52 % wall on a 46 % larger graph** |
+| the same, **per crate** | 5.03 s | 1.65 s | **−67 %** (3.0x) |
+| best cell available, per crate | 5.03 s (`-j1` was the only one that worked) | **1.20 s** (`-j8`) | **−76 %** (4.2x) |
+| in-guest clean `-j1`, SMP=1, 95 crates (§11's table) | 223 s → 2.35 s/crate | 1.65 s/crate | **−30 %** |
+
+Caveats, in the direction that matters:
+
+- **The graph grew.** 94 → 137 crates between those dates, so every wall-clock
+  comparison above understates the per-crate improvement; the per-crate rows are
+  the honest ones.
+- **Today's `-j1` runs at 4 vCPU**, and §10 measured a single-job build paying
+  **+26 %** for SMP=4 over SMP=1. So the like-for-like `-j1` figure against
+  §11's SMP=1 number is better than the −30 % shown.
+- `AKUMA_SELF_HOSTING_AMD64.md`'s status line reads the 473 s against the box's
+  own Linux (69 s for the same graph, single-job) as "the guest is ~30-50x
+  slower". **Its own two numbers divide to 6.9x**, not 30-50x; the larger figure
+  belongs to the single-crate `akuma-exec` anchor in §"Measurements" above, not
+  to the whole-graph build. Corrected here rather than left to be re-derived.
+
+#### What is not in these numbers
+
+`-j8` needs `MAX_PIPES` ≥ ~128 (§18) and every cell needs §14's demand-fault
+race fix — before it, this table could not be taken at all: the 4x4 cell died in
+2.2 s and the 4x8 cell would have died sooner.
+
+
+### 20. The whole arc, earliest to latest (2026-09-13 → 2026-09-18)
+
+Every in-guest amd64 build timing this tree has on record, in order. All of it
+is the same Firecracker guest on the same box, and — checked, because it would
+invalidate the comparison — `/tmp/ktarget` (the 09-13 target dir) and
+`/src/akuma/target` (today's) are on the **same ext2 root disk**; the guest has
+no tmpfs.
+
+#### A. The whole kernel graph
+
+| date | state of the kernel | crates | jobs / vCPU | wall | **s/crate** |
+|---|---|---|---|---|---|
+| **09-13** | first in-guest kernel build that finished at all | 94 | `-j1`, 1 vCPU | **473 s** | **5.03** |
+| 09-18 (earlier) | after §1-§9: CR3-skip, futex `hlt`, PIT/TSC clock, block double-copy, O(n²) `mmap` placer | 95 | `-j1`, SMP=1 | **223 s** | **2.35** |
+| 09-18 (this session) | after §14's demand-fault race fix | 137 | `-j1`, 4 vCPU | 226.5 s | 1.65 |
+| 09-18 | — same kernel, more jobs (first `-j4` that ever finished) | 137 | `-j4`, 4 vCPU | 189.6 s | 1.38 |
+| 09-18 | — repeats of that cell | 137 | `-j4`, 4 vCPU | 174.6 s | 1.27 |
+| 09-18 | after §18's `MAX_PIPES` 64 → 256 | 137 | **`-j8`, 4 vCPU** | **163.0 s** | **1.19** |
+| 09-18 | §17's generation 2 — built *inside* the self-built kernel | 137 | `-j4`, 4 vCPU | 177 s | 1.29 |
+
+**5.03 → 1.19 s/crate: −76 %, a 4.2x speedup, in five days.** Read the last
+three rows as one kernel measured at three job counts, not as three
+improvements; the kernel changed at the rows that name a fix.
+
+The wall-clock column is the one to quote carefully — the graph went 94 → 137
+crates (+46 %) over the same five days, so 473 s → 163 s understates it at
+−65 % where the per-crate figure says −76 %.
+
+#### B. The single-crate anchors that got there
+
+The whole-graph number moved because two much cheaper measurements did:
+
+| anchor | before | after | step |
+|---|---|---|---|
+| `akuma-exec` rebuild, `-j1` | 102 s | 83.5 s | CR3-skip on same-root switches (−18 %) |
+| " | 83.5 s | **77.9 s** | untimed futex waits stop `hlt`-ing first (−7 %) |
+| `zerocopy`, `-j1` | *never finished in 15+ min* | 63 s | §5: `find_free_va` was O(n²) in region count |
+| " | 63 s | 18.3 s | §8: it sorted 4 400 regions on **every** `mmap` — 74 % of `rustc` |
+| " | 18.3 s | **15.1 s** | §9: binary-searched lookups + placement cursor |
+| " | 15.1 s | **13.24 s** | §10, SMP=1 |
+
+`zerocopy` against the same `rustc` on the box's Linux: **8.8 s**, so that gap
+went **7.2x → 1.5x**.
+
+#### C. Against Linux on the same physical box
+
+| | s/crate | guest / host |
+|---|---|---|
+| box's own Linux, 94 crates, `-j1` | 0.73 | 1.0x |
+| Akuma guest, 09-13, `-j1` | 5.03 | **6.9x** |
+| Akuma guest, 09-18, `-j1` | 1.65 | **2.3x** |
+| Akuma guest, 09-18, `-j8` | 1.19 | **1.6x** |
+
+(The last row is not like-for-like — it is Akuma at 8 jobs against Linux at 1 —
+and it is kept because it is the number that matters in practice: *how long do I
+wait for a kernel*. The honest kernel-to-kernel comparison is the `-j1` row.)
+
+#### D. Bare metal, for contrast — still the outlier
+
+| | crates | wall | s/crate |
+|---|---|---|---|
+| Firecracker guest, `-j1`, image on the internal SSD (09-18) | 95 | 223 s | 2.35 |
+| bare metal, `nosmp`, root on the USB disk (§11, 09-18) | 95 | **1 374 s** | **14.5** |
+
+**6.2x, on the same physical machine**, and it is storage rather than the
+kernel: the guest reads its root through a file on Ubuntu's ext4/SSD, so the
+host page cache sits in front of every block, while the metal reads a USB disk
+with nothing in front of it but this kernel's own ext2 block cache. Untested
+since §14 — every number in A, B and C is the guest.
+
+#### What each era was actually limited by
+
+1. **09-13 → 09-17: per-syscall and per-fault cost.** TLB flushes, a 10 ms
+   clock, a double copy per block, and an `mmap` placer that was quadratic.
+2. **09-17 → 09-18 morning: correctness at SMP>1.** Not speed at all — every
+   parallel build died or wedged, so `-j1` was the only cell that existed.
+3. **09-18: resource ceilings.** A 64-pipe machine limit that presented as a
+   broken linker.
+4. **Now: scaling.** 8 jobs on 4 cores buy 1.39x (§19). The per-job path is
+   done; what remains is whatever serialises — the BKL and the filesystem.
 
 
 ## Background
