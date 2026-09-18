@@ -466,6 +466,29 @@ pub use crate::box_registry::access as box_access;
 /// rate-limited `[ISIG]` trace in [`write_to_process_stdin`].
 static INTR_TRACES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// An INTR byte reached a process's stdin and was **not** turned into a signal.
+///
+/// The positive trace (`[ISIG]`, below) says a `^C` became a `SIGINT`. Its
+/// absence says nothing at all on its own — the byte may never have arrived —
+/// which is exactly the hole that made "`^C` does not interrupt `tail -f` on
+/// amd64" cost a session to attribute: keystrokes plainly reached the shell, so
+/// the write path was working, and the silence had to be read as evidence
+/// before it could be. This is that evidence, and it names which of the two
+/// preconditions failed.
+///
+/// Shares `INTR_TRACES`' budget: one interactive session sends one INTR per
+/// keystroke and a stuck client must not be able to flood the console.
+fn intr_miss(pid: Pid, data: &[u8], why: &str, lflag: u32) {
+    // 0x03 rather than `cc[VINTR]`: in the "not a terminal" case there is no
+    // terminal state to read one from, and every caller of this path has the
+    // RFC default anyway.
+    if data.contains(&0x03)
+        && INTR_TRACES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8
+    {
+        crate::safe_print!(112, "[ISIG-MISS] pid={} {} lflag={:#x}\n", pid, why, lflag);
+    }
+}
+
 /// Write data to a process's stdin, returning how many bytes were accepted.
 ///
 /// This is a **short write**, not all-or-nothing: the channel's stdin buffer is
@@ -527,9 +550,19 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
                 Filtered::Unfiltered(data)
             }
         } else {
+            // ISIG cleared by the program itself (`raw` mode): the byte is
+            // data, correctly. Traced anyway, because "^C did nothing" reaches
+            // a reader as one symptom and has three causes, and the other two
+            // are defects. See `intr_miss`.
+            intr_miss(pid, data, "ISIG clear", ts.lflag);
             Filtered::Unfiltered(data)
         }
     } else {
+        // No channel, or a channel that is not a terminal — a plain `exec`
+        // pipe. `^C` here is a byte by construction, which is right for a
+        // non-pty session and *wrong* for a `pty-req` one whose channel never
+        // got `set_terminal(true)`.
+        intr_miss(pid, data, "not a terminal", 0);
         Filtered::Unfiltered(data)
     };
     let original_len = data.len();

@@ -3893,18 +3893,43 @@ fn register_exec_process(
     // **Is this process attached to the console?**
     //
     // Hoisted out of the struct literal because two fields below depend on the
-    // answer, and the answer is a property of the fd table: a descriptor 0 that
-    // is a `FileDescriptor::Stdin` names the serial line (`fd::console_end`'s
-    // descriptor spelling), while a spawned child's fd 0 is a `PipeRead` from
-    // `fd::bind_stdio` and a `fork` child's is whatever its parent's was. So
-    // `init` on the serial line and its descendants are console-attached;
-    // everything `sshd` spawns is not, which is exactly the split the two
-    // fields want.
+    // answer: a descriptor 0 that is a `FileDescriptor::Stdin` names the serial
+    // line (`fd::console_end`'s descriptor spelling), so `init` on the serial
+    // line and its descendants are console-attached and everything `sshd`
+    // spawns is not — which is exactly the split the two fields want.
+    //
+    // **`channel.is_none()` is half the test and used not to be, and the fd
+    // half stopped being sufficient the day the pipes were retired.** The note
+    // here said "a spawned child's fd 0 is a `PipeRead` from `fd::bind_stdio`",
+    // and that was true until C2 slice 6 gave a spawned child the shared
+    // `SharedFdTable::with_stdio()` — whose fd 0 **is** `Stdin`. From then on
+    // every `sys_spawn` child answered this test `true` and silently took the
+    // console's *shared* `TerminalState` instead of the fresh one `sys_spawn`
+    // passes `None` for and its own comment promises.
+    //
+    // What that cost, measured 2026-09-18: `busybox`'s line editor puts the
+    // terminal in raw mode for each prompt (`ISIG` clear) and restores the
+    // flags it read at startup before running a foreground job. Session 1 read
+    // cooked flags, restored cooked, and `^C` killed its job. It then left the
+    // *shared* cell raw, so **session 2 read raw flags as its "initial" state**
+    // and restored raw — `ISIG` never came back, and `^C` was a `0x03` byte for
+    // the rest of the guest's life, in every session, on both this target's
+    // kernels of session stdio. `[ISIG-MISS]` in
+    // `akuma_exec::process::write_to_process_stdin` is the tripwire that names
+    // it; `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §16 has the
+    // trace.
+    //
+    // A process that carries its **own** channel is a session, not the console,
+    // whatever its fd table says — so ask that first. The second field this
+    // gates (`console::set_attached_pid`) was wrong for the same reason and in
+    // the same direction: the serial line's keystrokes were being addressed to
+    // the newest `ssh` session's shell.
     let fds = fds.unwrap_or_else(|| alloc::sync::Arc::new(SharedFdTable::with_stdio()));
-    let console_attached = matches!(
-        fds.table.lock().get(&0),
-        Some(akuma_exec::process::FileDescriptor::Stdin)
-    );
+    let console_attached = channel.is_none()
+        && matches!(
+            fds.table.lock().get(&0),
+            Some(akuma_exec::process::FileDescriptor::Stdin)
+        );
 
     let proc = Box::new(Process {
         pid,
@@ -5691,6 +5716,101 @@ pub fn winsize_to_child_test(t: &mut Suite) {
         "winsize: and names nobody once the descriptor is closed",
         crate::fd::table_get(stdout_fd).is_none(),
     );
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// A spawned session's line discipline is **its own**, not the console's.
+///
+/// The defect this pins, live-found 2026-09-18 on the Firecracker self-host
+/// guest: `register_exec_process` decided "is this process attached to the
+/// serial console?" from its fd table alone, and the day spawned children
+/// started carrying `SharedFdTable::with_stdio()` (fd 0 = `Stdin`, the console's
+/// own spelling) every `sys_spawn` child began answering yes — so each `ssh`
+/// session's shell was handed the **console's shared `TerminalState`** rather
+/// than the fresh one `sys_spawn` passes `None` for.
+///
+/// Nothing failed at spawn time. It failed one session later: `busybox`'s line
+/// editor sets raw mode per prompt and restores the flags it read at *startup*,
+/// so session 1 left the shared cell raw, session 2 read raw as its "cooked"
+/// baseline, and `ISIG` was gone for the rest of the boot — `^C` never
+/// interrupted a foreground job again. See
+/// `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §16.
+///
+/// The check is written the way the bug presents: dirty the *console's* state
+/// the way a departing session leaves it, then spawn and read the child's. A
+/// child that shares the cell reports the dirt; a child with its own reports
+/// the default. Sharing the `Arc` is the thing under test, so this cannot be
+/// replaced by comparing pointers — `Arc::ptr_eq` would pass a kernel that
+/// copied the console's *values* into a private cell, which is also wrong.
+pub fn session_terminal_is_private_test(t: &mut Suite) {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+    const ISIG: u32 = 0x1;
+
+    if crate::fs::read_file("/bin/hello").is_err() {
+        t.note("session-term: /bin/hello not on the disk; skipped", 0);
+        return;
+    }
+    let Some(console_ts) = crate::console::terminal_state() else {
+        t.note("session-term: no console terminal state; skipped", 0);
+        return;
+    };
+
+    // What a session leaves behind when its shell exits from a prompt.
+    let saved = {
+        let mut ts = console_ts.lock();
+        let was = ts.lflag;
+        ts.lflag &= !ISIG;
+        was
+    };
+
+    let path = b"/bin/hello\0";
+    let arg0 = b"hello\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    // `SPAWN_FLAG_PTY`: the session shape, the one whose `^C` must be a signal.
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, SPAWN_FLAG_PTY);
+    if !t.check("session-term: spawned a pty child", r < ERRNO_FLOOR) {
+        console_ts.lock().lflag = saved;
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+
+    let child_lflag = akuma_exec::process::with_process(pid, |p| p.terminal_state.lock().lflag);
+    t.check(
+        "session-term: the child's ISIG is set though the console's is not",
+        child_lflag.is_some_and(|l| l & ISIG != 0),
+    );
+
+    // And the reverse direction: what the child does to its terminal must not
+    // reach the console's. (A shell going raw for its prompt is exactly this
+    // write.)
+    // Zero, not "clear ISIG": the console's cell already has `ISIG` clear
+    // above, so clearing it again is a no-op a *shared* cell would also pass.
+    // A value neither cell can be holding is what makes this discriminate.
+    akuma_exec::process::with_process(pid, |p| p.terminal_state.lock().lflag = 0);
+    t.check(
+        "session-term: the child going raw leaves the console's state alone",
+        console_ts.lock().lflag == (saved & !ISIG),
+    );
+
+    console_ts.lock().lflag = saved;
+
+    // Drain and reap, the shape `winsize_to_child_test` ends with.
+    let mut sink = [0u8; 256];
+    let mut spins = 0;
+    loop {
+        spins += 1;
+        if spins > 500_000 {
+            break;
+        }
+        let _ = crate::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
 }
 
 #[cfg(not(feature = "no-tests"))]

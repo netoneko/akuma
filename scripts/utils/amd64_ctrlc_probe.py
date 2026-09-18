@@ -63,6 +63,14 @@ DEFAULT_KEY = os.path.join(
 GO = "GO"
 BACK = "BACK"
 
+# The file `tail -f` follows. It is **created by the trial**, not assumed:
+# these images are not a distro and do not all carry the obvious candidates —
+# measured 2026-09-18, `/etc/passwd` is absent from the Firecracker self-host
+# image, so `tail` exited instantly with "can't open" and the probe scored a
+# job that never ran as KILLED. `job_blocked` below is the guard that makes
+# that unscoreable rather than green.
+TAIL_PATH = "/tmp/ctrlc-probe.log"
+
 
 def _drain(fd, buf, deadline):
     """Read whatever is available until `deadline`, appending to `buf`.
@@ -88,7 +96,8 @@ def _count(transcript, marker):
     return len(re.findall(re.escape(marker), transcript))
 
 
-def trial(host, port, key, delay, sleep_secs, timeout, verbose):
+def trial(host, port, key, delay, sleep_secs, timeout, verbose, job="sleep",
+          tail_path=TAIL_PATH):
     """One measurement. Returns (killed, seconds, transcript)."""
     argv = [
         "ssh", "-tt",
@@ -119,7 +128,17 @@ def trial(host, port, key, delay, sleep_secs, timeout, verbose):
             if not _drain(fd, buf, settle):
                 break
 
-        cmd = f"echo {GO}; sleep {sleep_secs}; echo NOTREACHED\n"
+        # Two jobs, because they park in different places and only the
+        # second is the reported symptom. `sleep` parks in `nanosleep` once and
+        # ends by itself; `tail -f` loops forever (busybox falls back to a
+        # read+`nanosleep` poll here — this kernel answers `inotify_add_watch`
+        # with `ENOSYS`) and never ends, so a `^C` that does not land means the
+        # session is stuck until the hard timeout rather than merely late.
+        if job == "tail":
+            cmd = (f"echo {GO}; echo x > {tail_path}; tail -f {tail_path}; "
+                   f"echo NOTREACHED\n")
+        else:
+            cmd = f"echo {GO}; sleep {sleep_secs}; echo NOTREACHED\n"
         os.write(fd, cmd.encode())
 
         # `GO` twice: once echoed by the terminal as we typed it, once printed
@@ -132,7 +151,7 @@ def trial(host, port, key, delay, sleep_secs, timeout, verbose):
             if not _drain(fd, buf, hard_deadline):
                 break
         if t_go is None:
-            return (False, float("nan"), "".join(buf))
+            return (False, float("nan"), "".join(buf), False)
 
         # Wait, then interrupt, then immediately ask the shell to speak. The
         # `echo BACK` is typed while the job still owns the terminal; it sits in
@@ -141,6 +160,11 @@ def trial(host, port, key, delay, sleep_secs, timeout, verbose):
         wake = t_go + delay
         while time.monotonic() < wake:
             _drain(fd, buf, wake)
+        # Did the job actually block? `NOTREACHED` printed *before* the
+        # interrupt means it ended by itself — a missing file, a busybox
+        # without the applet — and nothing after this point would be
+        # measuring `^C` at all.
+        job_blocked = _count("".join(buf), "NOTREACHED") < 2
         os.write(fd, b"\x03")
         time.sleep(0.2)
         os.write(fd, f"echo {BACK}\n".encode())
@@ -158,10 +182,20 @@ def trial(host, port, key, delay, sleep_secs, timeout, verbose):
         # The job was killed if the shell came back well before the sleep would
         # have ended. Half the sleep is a wide margin on purpose: the failing
         # case overshoots by ~25 s, so nothing near the boundary is ambiguous.
-        killed = t_back is not None and elapsed < (sleep_secs / 2.0)
+        if job == "tail":
+            # `tail -f` has no end of its own, so the shell speaking again at
+            # all is the whole verdict — there is no "it finished normally"
+            # case to tell apart from a kill. Except when the job never
+            # blocked, which is not a verdict at all.
+            killed = t_back is not None and job_blocked
+        else:
+            killed = t_back is not None and elapsed < (sleep_secs / 2.0)
+        # A job that ended on its own is not evidence either way, whichever
+        # job it was.
+        killed = killed and job_blocked
         if verbose:
             sys.stderr.write(transcript + "\n")
-        return (killed, elapsed, transcript)
+        return (killed, elapsed, transcript, job_blocked)
     finally:
         try:
             os.write(fd, b"\nexit\n")
@@ -190,6 +224,12 @@ def main():
                     help="how long the foreground job sleeps")
     ap.add_argument("--timeout", type=float, default=90.0,
                     help="hard cap on one trial")
+    ap.add_argument("--tail-path", default=TAIL_PATH,
+                    help="file the `tail` job creates and follows")
+    ap.add_argument("--job", choices=("sleep", "tail"), default="sleep",
+                    help="what the foreground job is: a bounded `sleep` "
+                         "(default) or an endless `tail -f`, the reported "
+                         "symptom")
     ap.add_argument("-n", "--trials", type=int, default=1)
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="dump each transcript to stderr")
@@ -201,11 +241,11 @@ def main():
 
     ok = True
     for i in range(args.trials):
-        killed, secs, transcript = trial(
+        killed, secs, transcript, blocked = trial(
             args.host, args.port, args.key, args.delay, args.sleep,
-            args.timeout, args.verbose)
+            args.timeout, args.verbose, args.job, args.tail_path)
         notreached = "NOTREACHED" in transcript.replace("echo NOTREACHED", "")
-        verdict = "KILLED" if killed else "SURVIVED"
+        verdict = "KILLED" if killed else ("SURVIVED" if blocked else "NO-JOB")
         isig = transcript.count("[ISIG]")
         print(f"trial {i + 1}/{args.trials}: {verdict} after {secs:.1f}s"
               f"  (NOTREACHED printed: {notreached}"

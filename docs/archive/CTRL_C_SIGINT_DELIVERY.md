@@ -188,3 +188,27 @@ call site).
 - `userspace/sshd/docs/LIMITATIONS.md` — "Signals the shell handles are not
   signal deaths" explains why busybox `sh` receiving `SIGINT` directly
   (the first, wrong fix) looked like nothing happened rather than an error.
+
+## Later (2026-09-18): the same symptom on amd64, one layer up
+
+The mechanism this document installs is intact and was never the problem, but
+it has a precondition — `ISIG` set in the *session's* `TerminalState` — and on
+the amd64 kernel every `sys_spawn` child was handed the **console's shared**
+state instead of a fresh one. `busybox`'s line editor leaves that cell in raw
+mode when a session ends, so the next session read raw as its baseline and
+`ISIG` never came back: `^C` worked in the first `ssh` session after a reboot
+and in none after it.
+
+Two things to carry back here:
+
+- **"No `[ISIG]` line" is not evidence on its own**, because the byte may never
+  have reached the line discipline. `write_to_process_stdin` now also prints
+  `[ISIG-MISS] pid=… <why> lflag=…` when an INTR byte arrives and is *not*
+  turned into a signal, which is the reading that separates "never arrived"
+  from "arrived and was declined".
+- The §5 verification recipe here — `tail -f` over `ssh -tt`, by eye — passes on
+  a kernel with this bug, because it is run once. Run it **twice in two
+  sessions**; `scripts/utils/amd64_ctrlc_probe.py -n 3` does that and times it.
+
+`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §16 has the traces, the
+A/B and the fix.

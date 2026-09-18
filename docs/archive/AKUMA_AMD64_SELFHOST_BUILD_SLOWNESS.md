@@ -2538,6 +2538,185 @@ build now gets 133 crates further.
   which is this bug, and why a forensics build reproduced it without comment.
 
 
+### 15. GREEN (2026-09-18): the `-j4` self-host build finishes, and §14's residual was the image
+
+*§14 ended with `cargo build -p akuma-amd64 -j4` at `SMP=4` getting 133 of 137
+crates and then failing, twice identically, on `error[E0531]: cannot find
+… PIDFD_SEND_SIGNAL in module nr`. It is not a code defect and it was never
+going to reproduce on the laptop: `nr::PIDFD_SEND_SIGNAL` has been in the tree
+since `ddda5c01` (2026-09-17). The **guest image's copy of the source** predated
+it.*
+
+`/src/akuma` inside `akuma-fc-rust.img` is a build input that drifts — §10 says
+so about `sched.rs` and this is the same trap one crate further along. The
+repair is §10's:
+
+```sh
+# guest down, image mounted at /mnt/fcrust
+for d in crates amd64 src; do
+  rsync -a --delete --exclude vendor --exclude target /root/akuma/$d/ /mnt/fcrust/src/akuma/$d/
+done
+cp /root/akuma/{Cargo.toml,build.rs,clippy.toml} /mnt/fcrust/src/akuma/
+```
+
+**Do not carry `Cargo.lock` across with it, and do not `cargo vendor` to make it
+fit.** The image's lock and its `vendor/` are one pair (measured here: the image
+wants syn 2.0.114 / quote 1.0.44 / proc-macro2 1.0.106 where the checkout's lock
+wants 2.0.111 / 1.0.42 / 1.0.103), and the lock is the only file in that sync
+whose partner is rig state. Syncing the sources alone leaves the pair intact;
+§11 records the same trap from the other direction on the bare-metal root.
+
+With the tree matching the kernel, the self-host gate at the cell that used to
+wedge for 600 s:
+
+| what | cell | outcome |
+|---|---|---|
+| `akuma-amd64`, `--clean-all`, whole dependency graph | 4 vCPU x `-j4` | **PASS, 189.6 s, rc=0** |
+
+That is 137 crates from a cleaned `target/`, in a Firecracker guest, on four
+cores, at `-j4` — the thing §10 called "what gates a fast in-guest kernel
+build". `scripts/benchmarks/amd64_fc_build_matrix.py --crate akuma-amd64
+--clean-all --cells 4x4` is the gate; it reboots the guest per cell, so the
+console log it leaves behind is that cell's alone (§14's trap).
+
+### 16. `^C` over `ssh` worked exactly once per boot — the console's line discipline was every session's (2026-09-18)
+
+*Reported as "`^C` does not break `tail -f`", with the guess that it was signal
+delivery or futex. Signal delivery is fine and the futex path is not involved:
+`kill -INT` on a `sleep 60` parked in `nanosleep` kills it in **1.2 s**,
+measured in this same guest. What was broken is upstream of any signal — the
+kernel was correctly declining to raise one.*
+
+#### The probe scored a job that never ran, and that is the first finding
+
+`scripts/utils/amd64_ctrlc_probe.py` gained a `--job tail` mode to match the
+report, following `/etc/passwd`. That file **is not in this image**, so `tail`
+exited instantly with `can't open`, the shell ran the next command, and the
+probe reported `KILLED after 3.3s` — a green reading of a `^C` that was never
+tested. The mode now creates the file it follows and refuses to score a trial
+whose job printed its post-job marker *before* the interrupt (`NO-JOB`, a third
+outcome beside KILLED and SURVIVED). Same family as `mem_suite.py` refusing to
+score a silent probe as a pass.
+
+#### The tripwire that turned silence into evidence
+
+`write_to_process_stdin` prints `[ISIG]` when it turns an INTR byte into a
+`SIGINT`. A run with the bug produced **zero** of them — which says nothing on
+its own, because the byte may never have arrived, and keystrokes plainly *were*
+arriving (the typed command line ran). `intr_miss` is the other half, and it
+costs one branch on a path that already tests for the INTR byte:
+
+```
+[ISIG-MISS] pid=59 ISIG clear lflag=0x8a30
+```
+
+`0x8a30` is `0x8a3b` with `ISIG|ICANON|ECHO` cleared — raw mode. The kernel was
+right to deliver the byte as data; the terminal said the program wanted it.
+
+#### What the terminal flags did, session by session
+
+A temporary trace on the `TCSETS` arm (`amd64/src/fd.rs`), one line per set:
+
+```
+[TCSETS] pid=57 lflag 0x8a3b -> 0x8a30     session 1: raw, for the line editor
+[TCSETS] pid=57 lflag 0x8a30 -> 0x8a3b     restored to cooked before the job
+[ISIG]   pid=57 fg_pgid=57 sig=2 members=1 ^C -> SIGINT -> job dies. Correct.
+[TCSETS] pid=57 lflag 0x8a3b -> 0x8a30     raw again for the next prompt
+                                           ... and the session ends, raw
+[TCSETS] pid=59 lflag 0x8a30 -> 0x8a30     session 2 STARTS raw
+[ISIG-MISS] pid=59 ISIG clear lflag=0x8a30
+```
+
+`busybox`'s line editor puts the terminal in raw mode per prompt and restores
+**the flags it read when it started**. Session 2 read raw as its baseline, so
+its "restore to cooked" restored raw, and `ISIG` never came back — for that
+session and every session after it, for the life of the guest. One session per
+boot worked, which is exactly why this survived: the first `ssh` anyone opens
+after a reboot behaves.
+
+#### The bug: `console_attached` was a question about the fd table, and the fd table changed
+
+`register_exec_process` decides whether a process is the serial console's by
+looking at its fd 0:
+
+```rust
+let console_attached = matches!(fds.table.lock().get(&0), Some(FileDescriptor::Stdin));
+```
+
+with a note saying "a spawned child's fd 0 is a `PipeRead` from
+`fd::bind_stdio`, so everything `sshd` spawns is not". That was true when it was
+written. **C2 slice 6 retired the pipes** and gave a spawned child
+`SharedFdTable::with_stdio()`, whose fd 0 *is* `FileDescriptor::Stdin` — so every
+`sys_spawn` child started answering `true`, and took the branch below it:
+
+```rust
+terminal_state: term
+    .or_else(|| console_attached.then(crate::console::terminal_state).flatten())
+    .unwrap_or_else(|| Arc::new(Spinlock::new(default_terminal_state()))),
+```
+
+`sys_spawn` passes `None` for `term` and its comment promises "a spawned child
+gets a **fresh** terminal state, deliberately". The `or_else` in between quietly
+made it the console's **shared** one instead. Nothing failed at spawn time;
+sessions simply began inheriting each other's termios.
+
+The same flag has a second consumer, wrong in the same direction and unnoticed:
+`console::set_attached_pid(pid)`, so the serial line's keystrokes were being
+addressed to the newest `ssh` session's shell.
+
+#### The fix
+
+One clause, and it is a statement about what a console is:
+
+```rust
+let console_attached = channel.is_none()
+    && matches!(fds.table.lock().get(&0), Some(FileDescriptor::Stdin));
+```
+
+A process that carries its **own** `ProcessChannel` is a session, whatever its
+fd table says; only `init` on the serial line and its `fork` descendants (which
+pass no channel and inherit their parent's terminal `Arc`) are the console's.
+The `unwrap_or_else` below then does what `sys_spawn` always intended.
+
+#### A/B and the boot-suite check
+
+`session_terminal_is_private_test` (`amd64/src/usermode.rs`, run from
+`boot.rs` beside `winsize_to_child_test`) dirties the **console's** state the
+way a departing session leaves it, spawns a `SPAWN_FLAG_PTY` child, and reads
+the child's. Written that way on purpose: `Arc::ptr_eq` would pass a kernel that
+copied the console's values into a private cell, which is also wrong.
+
+| arm | `console_attached` | boot suite | live `^C`, 5 consecutive sessions |
+|---|---|---|---|
+| A | fd-table only (pre-fix) | **FAIL** — "the child's ISIG is set though the console's is not" | session 1 KILLED, sessions 2-5 SURVIVED |
+| B | `channel.is_none() && …` | 771 passed, 0 failed | **5 of 5 KILLED, ~3.2 s each** (`tail -f` and `sleep` alike) |
+
+Both jobs matter: `tail -f` polls (`inotify_add_watch` is `ENOSYS` here, so
+busybox falls back to read+`nanosleep`) and `sleep` is one long park, so they
+fail differently if the interrupt is lost rather than never raised.
+
+Verified once more in the state that produced the report — three trials run
+immediately after a full `--clean-all -j4` build of the kernel in the same
+guest, with every pid in the high hundreds: **3 of 3 KILLED, three `[ISIG]`
+lines, zero `[ISIG-MISS]`.** The `-j4` gate itself is unmoved by the fix
+(§15's 189.6 s, then 182.6 s with it in), and the boot suite is 771 passed.
+
+#### What this was not, and how that was settled cheaply
+
+- **Not signal delivery.** `kill -INT` on a `sleep 60` from a second `ssh`
+  connection: dead in 1.2 s. A thread parked in `nanosleep` for 60 s is woken by
+  `pend_signal_for_thread`'s `wake()` and takes the `EINTR` on the next pass —
+  which is `sys_nanosleep`'s loop working as written.
+- **Not the futex path.** Nothing in this reaches it; §13's `EINTR` fix stands
+  on its own and is unrelated.
+- **Not the shell.** `busybox` does exactly what it does on Linux; it is the
+  kernel that gave two sessions one termios.
+
+The guess in the report ("something in signal delivery or whatever") was right
+about *where* to look and one layer too deep: the signal was never raised, so
+nothing downstream of it could have been at fault.
+
+
 ## Background
 
 - `docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md` — the AArch64 original of §6's leak.
