@@ -115,7 +115,45 @@ busybox env LD_LIBRARY_PATH=/usr/local/rust/lib /usr/local/rust/bin/rustc \
   toolchain. Re-run step 3 after any of those, or keep a copy of the staged
   image and point the config at that.
 * **Keep Firecracker at 1 vCPU** while using the toolchain: CoW fork is SMP=1
-  only on this target, and every compiler spawns.
+  only on this target, and every compiler spawns. **This holds on bare metal
+  too** — `nosmp` on the command line — and 2026-09-18 put three signatures on
+  it, all from the same in-guest kernel build at SMP=4:
+
+  | what you see | where |
+  |---|---|
+  | `error: linking with rust-lld failed: signal: 11 (SIGSEGV)` at the final link | deterministic, 3/3 |
+  | `rustc` killed by a `#PF` whose `cr2` is **ASCII** (`0x00004d5f4e4f4964` = `dION_M`) — a pointer overwritten with string data | ~24 crates in |
+  | build reaches 95/95 crates then stops forever, vCPU idle, children present at `0:00` CPU | Firecracker `-j4` |
+
+  The common factor is **multi-threaded user processes**, which is what makes
+  the linker the cheapest reproducer: `rust-lld` is multi-threaded by default,
+  and re-running the exact invocation with `--threads=1` links cleanly (`rc=0`)
+  where the default crashes (`rc=142`). LLD prints its own argv in the crash
+  dump, so the failing command can be replayed straight out of the build log. If
+  you must build with SMP on, put `-C link-arg=--threads=1` in the
+  `x86_64-unknown-none` rustflags — it gets you past the link, but not past the
+  `rustc` corruption above.
+
+## Staging the **bare-metal** root instead of the guest image
+
+This procedure targets the Firecracker guest's `root.img`. The bare-metal root
+(`/dev/sdb1` on the Ubuntu side, `/dev/sda1` to Akuma) is a different filesystem
+and had only `x86_64-unknown-linux-musl` in its `lib/rustlib/`, so a kernel build
+there dies at the second crate with **`E0463: can't find crate for core`**. The
+rlibs must come from the *same* rustc build, so a laptop's nightly will not do.
+With Ubuntu up:
+
+```sh
+mount /dev/sdb1 /mnt/ak
+mount -o loop /root/akuma-fc-rust.img /mnt/fcrust
+rsync -a /mnt/fcrust/usr/local/rust/ /mnt/ak/usr/local/rust/   # both targets
+umount /mnt/fcrust /mnt/ak
+```
+
+The source tree and its `vendor/` are staged separately — see
+[`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) "Rules that cost time to
+learn", which also covers why `vendor/` must be produced by `cargo vendor`
+against the checkout rather than copied out of the guest image.
 
 ## Background
 

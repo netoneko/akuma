@@ -135,6 +135,74 @@ caller reading only stdout sees an empty success.
 
 ## Rules that cost time to learn
 
+- **Before you reboot out of Ubuntu, prove the laptop's key is in the
+  *persistent root's* `authorized_keys`.** Three files drift apart and only one
+  of them is the one sshd reads:
+
+  | file | who reads it |
+  |---|---|
+  | the local checkout's `target/…/amd64-ssh-test-key` | the laptop's `~/.ssh/config` `akuma` alias — and `target/` cleaning silently regenerates it |
+  | the RAM image's `/etc/sshd/authorized_keys` | only when `root=/dev/sda1` is absent or the USB root fails to mount |
+  | **`sdb1`'s `/etc/sshd/authorized_keys`** | **sshd, whenever `root=/dev/sda1` boots** |
+
+  Check by string, not by assumption, with Ubuntu still up:
+
+  ```sh
+  K=/root/akuma/target/x86_64-unknown-none/release/amd64-ssh-test-key
+  mount /dev/sdb1 /mnt/ak
+  grep -qF "$(ssh-keygen -y -f $K | awk '{print $2}')" /mnt/ak/etc/sshd/authorized_keys && echo OK
+  ```
+
+  Get it wrong and port 2222 answers `SSH-2.0-Akuma_0.1` while nothing can log
+  in, with Ubuntu down and no way back but the power button. That is survivable
+  — `grub-reboot` arms a **one-shot** entry, so the next boot returns to Ubuntu
+  on its own — but it costs a trip to the machine. Happened 2026-09-18 with a key
+  whose private half existed only on the box's Ubuntu disk.
+
+- **Staging the bare-metal root for a self-host build: source from git,
+  `vendor/` from `cargo vendor`, toolchain from the Firecracker image.** Two
+  things bite here. The toolchain on `sdb1` shipped only
+  `x86_64-unknown-linux-musl`, so `cargo build -p akuma-amd64` died at the second
+  crate with `E0463: can't find crate for core` — and the rlibs must come from
+  the *same* rustc build, so a laptop's nightly will not do. And **`vendor/` and
+  the `replace-with = "vendored-sources"` block are not in git**: copy a tree out
+  of the image and you import the image's `Cargo.lock` with it, which will not
+  match a freshly vendored set (measured: syn 2.0.114 in the image against
+  2.0.111 in the checkout). Vendor against the checkout instead — the box has
+  network. With Ubuntu up:
+
+  ```sh
+  mount /dev/sdb1 /mnt/ak
+  mount -o loop /root/akuma-fc-rust.img /mnt/fcrust
+  rsync -a --delete --exclude target --exclude .git --exclude vendor \
+        /root/akuma/ /mnt/ak/root/akuma/
+  cd /root/akuma && cargo vendor --versioned-dirs /mnt/ak/root/akuma/vendor
+  # append [source.crates-io] replace-with = "vendored-sources" to
+  # /mnt/ak/root/akuma/.cargo/config.toml, then the toolchain:
+  rsync -a /mnt/fcrust/usr/local/rust/ /mnt/ak/usr/local/rust/
+  umount /mnt/fcrust /mnt/ak
+  ```
+
+- **Building the kernel on the metal needs `--threads=1` for LLD while SMP is
+  on.** `rust-lld` is multi-threaded by default and SIGSEGVs linking this kernel
+  at SMP>1 — deterministically, 3/3, at the very end of a ~20 minute build. It is
+  not the linker's 158 MB size: replaying the same invocation with `--threads=1`
+  links cleanly. `/root/akuma/.cargo/config.toml` on the bare-metal root carries
+  it in the `x86_64-unknown-none` rustflags. Run builds with `kbuild` (on the
+  box, `/bin/kbuild`), which sets the rest of the environment.
+
+  It is also the cheapest known harness for the SMP concurrency bug: one
+  multi-threaded process, a deterministic crash, and LLD prints its own argv in
+  the crash dump so the failing command can be replayed straight from the build
+  log.
+
+- **Test a rootfs change by `chroot`, not by rebooting.** Mount an executable
+  copy of the Firecracker image, bind-mount the bare-metal tree into it, and
+  build one crate. That catches a broken vendor set or a missing target in
+  seconds, where a reboot costs a GRUB round trip — and a walk to the machine if
+  the ssh key turns out wrong. (`sdb1`'s own files carry no exec bit, because
+  Akuma's ext2 ignores modes, so you cannot `chroot` into it directly.)
+
 - **The USB disk must be in a USB 3.0 socket.** This kernel's BOT-over-xHCI
   path works at **SuperSpeed** and has never worked at High Speed. In a USB 2.0
   socket the drive enumerates fine and `READ CAPACITY` returns the right sector
@@ -476,6 +544,7 @@ channel instead.
 | pings to `192.168.1.220` time out | `.220` is only the **pre-DHCP fallback**; a lease overrides it. The probe line says the real address |
 | every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. Since 2026-09-06 the kernel also defends itself: `xhci::quiesce_all` clears `BUS_MASTER` on every boot right after the PCI scan, and `xhci::shutdown` runs before the machine reset. Neither can save the boot whose image was *already* corrupted during load, so the power cycle stays the recovery |
 | the box wedges under ssh/apk bursts at SMP=4 — `[BKL] stuck` storm, then `[TLB] stuck: N peer(s) unacked`, then dead to ssh | not a lock bug: a ring-0 page fault inside `akuma_threading_x86_switch_context` kills one core, `fatal()` halts it, and the dead core never acknowledges the next TLB shootdown — the munmap sender then spins forever holding the BKL. `sshd: failed to spawn '/bin/sh'` (exec failing off a degraded transport) is the late-stage signature. Reproduced in QEMU (`SMP=4` + ring-3 churn); `fatal()` now dumps a 64-word stack for symbolization, and the metal's dump stays on the screen to photograph. **See `docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`** |
+| `tail -f <file>` ignores `^C` — the session is stuck until you kill it from another shell | Observed 2026-09-18 on the metal with `tail -f /root/kbuild.log`. **Not the general `^C`-over-ssh path**, which works (see "The `^C`-over-ssh check" above) — it is specifically a reader parked in `tail -f`'s follow loop. Unverified which half is at fault: the signal not being delivered to a task blocked that way, or the blocking syscall not returning `EINTR` so busybox never runs its handler. Workaround: **`kbuild -w`**, which polls the log with `sleep` instead of blocking in a follow loop — that is why the script avoids `tail -f`; or read a bounded `tail -n 40`. To get out of a stuck one, open a second ssh and `kill` the `tail` |
 | a "disarmed" GRUB entry still drove the USB controller | until 2026-09-06 the xHCI self-test was gated only on the controller being *present*, so dropping `root=/dev/sda1` stopped the kernel mounting the disk but not bringing the controller up. There was no way to boot that kernel without driving it. **Fixed** — the bring-up now needs `usb` or `root=/dev/sda1` on the command line, and says so in the verdict when it skips |
 
 ## The spare disk (persistence — USB/xHCI, working)

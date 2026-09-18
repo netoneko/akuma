@@ -1054,13 +1054,32 @@ Two more things about `[PSTATS]` on this target that cost time to find:
   vCPUs is the right shape, since the second core only has to idle. (The
   exit-time dump in `akuma-exec` is in `return_to_kernel`, which is the AArch64
   exit path — amd64 does not take it, so a process exiting prints nothing.)
-- **The syscall numbers are counted at two sites under two numbering schemes.**
-  `amd64/src/usermode.rs` counts the raw **x86_64** number; `akuma-syscalls-glue`
-  counts the **asm-generic** one for everything that reaches glue. The name
-  table is asm-generic only. So an entry printed **with a name is correct**, and
-  an entry printed as **`nrN` is a raw x86_64 number** — `nr9`/`nr11` are
-  `mmap`/`munmap`, `nr228` is `clock_gettime`. A reader who assumes one scheme
-  will find `sshd` calling `ptrace` 16 352 times.
+- **The syscall numbers are counted at two sites under two numbering schemes,
+  and the name is looked up by index regardless of which site wrote it.**
+  `amd64/src/usermode.rs` counts the raw **x86_64** number (`usermode.rs`'s
+  `syscall_stats.inc(nr)` at syscall entry); `akuma-syscalls-glue` counts the
+  **asm-generic** one for everything that reaches glue
+  (`akuma-syscalls-glue/src/lib.rs`). Both write the same per-process array, and
+  `syscall_name` maps **asm-generic** numbers only.
+
+  So on this target **one syscall appears twice**, once at each number, and the
+  printed name is always the asm-generic name of whichever index it landed on.
+  Three consequences, and the third is the trap:
+
+  1. An entry printed as **`nrN` is a raw x86_64 number** whose value has no
+     asm-generic name — `nr9`/`nr11` are `mmap`/`munmap`, `nr228` is
+     `clock_gettime`.
+  2. An entry at an asm-generic index is named correctly.
+  3. **An x86_64 number that happens to be a valid asm-generic number is printed
+     under the wrong name, and looks perfectly plausible.** `sshd`'s
+     `unlinkat=16352(55650ms)` beside `nanosleep=16352(56403ms)` is one syscall:
+     `nanosleep` is x86_64 35, and asm-generic 35 is `unlinkat`. The equal counts
+     are the tell. Likewise a `cargo` blocked in `futex` (x86_64 202) reads as
+     **`accept`**, because asm-generic 202 is `accept`.
+
+  **Decode before concluding.** An earlier reading of this doc's own `-j4` data
+  put `rustc` "almost all in `read`"; asm-generic 63 is `read` and x86_64 63 is
+  `uname`, and the two readings are not remotely the same finding.
 
 With TSC timing, one `rustc` over a 29.92 s window:
 
@@ -1464,6 +1483,173 @@ real time: a TLB-shootdown IPI per `munmap` (`mmap_scale` on the same kernel
 puts the `munmap` floor at 1.97 µs at SMP=1 against 13.2 µs at SMP=2) plus BKL
 contention. Worth knowing before reading any SMP>1 number in this doc as a
 regression.
+
+
+### 11. Bare metal: the rig now self-hosts (2026-09-18)
+
+*The Firecracker number wanted a bare-metal counterpart — same kernel, same
+source, no hypervisor. Two rig defects stood in the way; both are fixed, and the
+recipe below is what the partition now holds.*
+
+**`E0463`: no `core` for `x86_64-unknown-none`.** The bare-metal root
+(`/dev/sdb1` on the Ubuntu side, `/dev/sda1` to Akuma — a 64 GB ext2 partition
+on the USB disk) carried a rust toolchain at `/usr/local/rust` whose
+`lib/rustlib/` held **only `x86_64-unknown-linux-musl`**. That builds host
+binaries and proc macros; it cannot build the kernel. 949 MB against the metal's
+778 MB, and this was most of the difference.
+
+It cannot be papered over from a laptop: the rlibs must come from the *same*
+rustc build, and the box is `1.100.0-nightly (0fc141305 2026-09-11)`.
+
+**Vendor from git, not from the image.** The first attempt copied the whole tree
+out of the Firecracker image. That is wrong twice over: `vendor/` and the
+`[source.crates-io] replace-with = "vendored-sources"` block are **not in git**
+— they are rig state — so copying the image's tree also imports the image's
+*Cargo.lock*, and the two drift. Measured here: the image's `vendor/` carried
+syn 2.0.114 / quote 1.0.44 / proc-macro2 1.0.106 where the checkout's lock wants
+2.0.111 / 1.0.42 / 1.0.103, so the pair would not resolve offline at all.
+
+The box has network, so it vendors against its own checkout and the two cannot
+disagree:
+
+```sh
+mount /dev/sdb1 /mnt/ak
+mount -o loop /root/akuma-fc-rust.img /mnt/fcrust
+# 1. source from git, protecting the two rig-state paths
+rsync -a --delete --exclude target --exclude .git --exclude vendor \
+      /root/akuma/ /mnt/ak/root/akuma/
+# 2. vendor against THIS checkout's Cargo.lock (19 MB, not the image's 44 MB)
+cd /root/akuma && cargo vendor --versioned-dirs /mnt/ak/root/akuma/vendor
+# 3. the offline block, appended to .cargo/config.toml (not in git)
+# 4. the toolchain, for the missing bare-metal target
+rsync -a /mnt/fcrust/usr/local/rust/ /mnt/ak/usr/local/rust/
+umount /mnt/fcrust /mnt/ak
+```
+
+**Verified without rebooting.** `chroot` into an executable copy of the
+Firecracker image with the bare-metal tree bind-mounted over it, and build the
+crate that had failed:
+
+```
+Compiling akuma-cpu v0.1.0 (/bm/crates/akuma-cpu)
+Finished `release` profile [optimized] target(s) in 2.84s     rc=0
+```
+
+That is the same trick §8 used for the Linux reference arm, and it is the cheap
+way to test a rootfs change: a reboot of this box costs a round trip through
+GRUB and, if the ssh key is wrong, a walk to the machine.
+
+State of the partition afterwards: `/root/akuma` at `33577243`, `vendor/` 19 MB
+matching its `Cargo.lock` byte for byte, offline config, `/root/.cargo`,
+toolchain with both targets, 57 GB free.
+
+#### Then the link died: **LLD's threading, not its size**
+
+With the toolchain fixed, the build ran all the way to the end and stopped
+there, three times out of three:
+
+```
+error: linking with `rust-lld` failed: signal: 11 (SIGSEGV)
+```
+
+`rust-lld` is 158 MB and this target's `execve` holds a whole binary in the
+kernel heap (§10), so "the linker is too big" is the obvious guess and it is
+wrong. The same build **links fine under Firecracker at SMP=1**; the metal was
+booted SMP=4.
+
+Settled without rebuilding anything, by replaying the exact invocation. LLD
+prints its own argv in the crash dump, so the command is in the build log:
+
+```sh
+ARGS=$(sed 's/.*Program arguments: rust-lld //' /root/lld_cmd.txt)
+$LLD $ARGS                 # rc=142, stack dump
+$LLD $ARGS --threads=1     # rc=0, 3 364 832-byte kernel
+```
+
+**LLD is multi-threaded by default**, and its thread pool is what this kernel
+cannot survive at SMP>1 — the same family as the `-j4` wedge above, reached by a
+different route. It is also why the failure looked like two different bugs: the
+first run reported `rc=139` (cargo relaying SIGSEGV) and the second `rc=101`
+(cargo reporting a link failure); both are the same linker crash.
+
+The rig carries `-C link-arg=--threads=1` in `/root/akuma/.cargo/config.toml`'s
+`x86_64-unknown-none` rustflags. **Rig state, not source** — the same argument as
+`vendor/` and the offline block: it is a workaround for a kernel defect, and
+putting it in `build.rs` would bake that defect into the repo. Note the cost of
+that placement: rustflags are part of every crate's fingerprint, so adding it
+rebuilds the whole graph once. `build.rs`'s `rustc-link-arg-bins` would have
+invalidated only the kernel binary, and is the better home if this ever becomes
+permanent.
+
+This is the lever for the `-j4` wedge too. The wedge needed four concurrent
+`rustc` processes; this needs one multi-threaded process. A single linker
+reproducing it in ~20 minutes with a deterministic, replayable command line is a
+far cheaper harness than a 95-crate build.
+
+#### And with the linker fixed, `rustc` corrupts instead — `cr2` is ASCII
+
+With `--threads=1` in the rustflags the build no longer dies at the link. It
+dies earlier, at **24 crates**, and the kernel names the victim:
+
+```
+#PF: not-present read from ring 3
+[Fault] #PF page fault in ring 3 on cpu 3 err=0x0000000000000004
+        rip=0x00000000300469c6 rsp=0x00007fffffff72c8
+        cr2=0x00004d5f4e4f4964 cr3=0x0000000040707000
+        task=10 pid=14304 — killing the process
+```
+
+**`cr2 = 0x00004d5f4e4f4964` is not a pointer, it is text**: little-endian, those
+bytes are `d I O N _ M` — the tail of something like `…SION_M…`. A pointer in
+`rustc`'s address space was overwritten with string data and then dereferenced.
+That is memory *corruption*, not a wild read, and it is the kernel's to answer
+for: the same binaries build cleanly at SMP=1.
+
+Alongside it in the same ring buffer: **245 `[BKL] stuck` lines** and a
+continuous `[TRAMP-MISMATCH]` storm with pids in the 16 000s (the build spawns
+that many processes), each naming a tid whose `THREAD_PID_MAP` owner has moved
+on while a table scan still finds the old one.
+
+So SMP>1 on this target has at least three faces, and they are probably one bug:
+
+| symptom | where seen |
+|---|---|
+| processes created, never scheduled, build wedges | Firecracker SMP=4 `-j4` (§10) |
+| `rust-lld` SIGSEGV at the final link | bare metal SMP=4, deterministic |
+| `rustc` dereferences a pointer overwritten with ASCII | bare metal SMP=4, 24 crates in |
+
+All three involve **multi-threaded user processes**, which is the thing SMP=1
+never exercises concurrently. That is the next investigation, and the linker is
+the cheapest entry point into it.
+
+#### The trap that cost a power cycle: stage a key you actually hold
+
+`amd64/mkdisk.sh` stages `target/x86_64-unknown-none/release/amd64-ssh-test-key.pub`
+into the RAM image, and with `root=/dev/sda1` **sshd reads the persistent root's**
+`/etc/sshd/authorized_keys` instead. Those are two different files, and the
+laptop's `~/.ssh/config` `akuma` alias points at a *third* thing — the key file
+in the local checkout, which `target/` cleaning removes and rebuilds.
+
+All three drifted apart here. A key was generated **on the box** to get into the
+Firecracker guest and appended to the persistent root; its private half stayed on
+the box's Ubuntu disk. Booting bare metal then took Ubuntu down and with it the
+only copy of the private key — port 2222 answered `SSH-2.0-Akuma_0.1` and nothing
+could authenticate. Recovery was a power cycle (harmless: `grub-reboot` arms a
+**one-shot** entry, so the next boot returns to Ubuntu by itself).
+
+**The rule this earns:** before rebooting the box out of Ubuntu, verify that the
+key on the laptop is in the persistent root's `authorized_keys` — by string, not
+by assumption:
+
+```sh
+K=/root/akuma/target/x86_64-unknown-none/release/amd64-ssh-test-key
+mount /dev/sdb1 /mnt/ak
+grep -qF "$(ssh-keygen -y -f $K | awk '{print $2}')" /mnt/ak/etc/sshd/authorized_keys && echo OK
+```
+
+and make that same key the one `mkdisk.sh` stages, so the RAM-image fallback
+authorises it too. Both are true on the box now, and `ssh akuma` works from the
+laptop.
 
 
 ## Background

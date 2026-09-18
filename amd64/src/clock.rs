@@ -186,13 +186,49 @@ pub fn sync_status() -> (SyncOutcome, u64) {
 }
 
 /// Try SNTP once if the clock is not already set. Cheap to call every netpoll
-/// lap: it returns immediately when synced or when the retry interval has not
-/// elapsed. This is what makes the clock **set itself** even when the boot-time
-/// one-shot ([`sync_via_sntp`]) ran before DHCP finished or lost its datagram —
-/// "synced once at boot or never" was the old contract and it left the HP box
-/// at epoch 0 every time the lease was slow.
+/// lap: it returns immediately when synced, when the interface has no address
+/// yet, or when the retry interval has not elapsed. This is what makes the
+/// clock **set itself** even when the boot-time one-shot ([`sync_via_sntp`])
+/// ran before DHCP finished or lost its datagram — "synced once at boot or
+/// never" was the old contract and it left the HP box at epoch 0 every time
+/// the lease was slow.
+///
+/// # It waits for an address, because it cannot work without one
+///
+/// Retrying before DHCP has bound is not merely early, it is **guaranteed to
+/// fail and expensive to fail**: `attempt_sntp` resolves [`NTP_HOST`] against
+/// two configured resolvers, and with no source address every query runs to its
+/// full timeout. Measured on the HP box 2026-09-18, booted with `skiptests` so
+/// the only caller was this one:
+///
+/// ```text
+///   dns: 1.1.1.1: no reply before timeout
+///   dns: 8.8.8.8: no reply before timeout
+///   dns: no resolver answered
+///   clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+///   ... twice more ...
+/// [SmolNet] DHCP configured
+/// [SmolNet] IP: 192.168.1.123/24
+/// ```
+///
+/// Three full DNS round-trip timeouts burned before the lease arrived, on the
+/// netpoll thread — the same thread that has to drive the DHCP exchange. The
+/// clock depends on the network, so it waits for the network.
+///
+/// `interface_snapshot` answers `0.0.0.0` for "up but unaddressed", which its
+/// own doc names as the before-DHCP case. Deliberately **not** gated on "DHCP
+/// configured": a statically addressed kernel never emits that and would then
+/// never set its clock. The question is whether there is a source address, not
+/// how it was obtained.
+///
+/// Checked *before* the rate limit rather than after, so the first attempt
+/// fires on the first lap after the address lands instead of waiting out a
+/// retry interval that elapsed while there was nothing to try.
 pub fn sync_tick() {
     if is_synced() {
+        return;
+    }
+    if akuma_net::smoltcp_net::interface_snapshot().ip == [0, 0, 0, 0] {
         return;
     }
     if crate::net::uptime_us() < NEXT_RETRY_US.load(Ordering::Relaxed) {
