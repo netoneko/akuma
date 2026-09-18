@@ -64,6 +64,34 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # walks for a surviving mapper on every free.
 pmm-forensics = []
 
+# Placement forensics for `sys_mmap`, off by default and meant for a hunt build
+# the way `pmm-forensics` is.
+#
+# It answers one question the rest of the kernel cannot be asked cheaply: **is
+# the address `mmap` just chose actually free?** Every automatic placement is
+# checked, before anything is populated, against three things that must all
+# agree that it is:
+#
+# * no existing **region record** overlaps it (`[MM-OVERLAP]`),
+# * no **present PTE** already covers it (`[MM-LIVEPTE]`),
+# * the region list `find_free_va_scan_from` binary-searches is genuinely
+#   **sorted** (`[MM-UNSORTED]`) — the placer's `partition_point` and its
+#   "the first region starting past `cand + len` proves the gap" shortcut are
+#   both wrong on an unsorted list, and the O(1) guard in the scan only
+#   inspects the last two entries.
+#
+# Why this is worth a feature. A placement that overlaps a live mapping is
+# silent at the moment it happens and surfaces much later as the *program's*
+# memory being wrong — on this target, as musl's mallocng `hlt`ing on its own
+# corrupt in-band metadata with no kernel diagnostic of any kind
+# (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §14). It is the exact
+# shape `pmm-forensics` cannot see, because every frame involved is correctly
+# owned and correctly refcounted; only the *address* is wrong.
+#
+# Cost, which is why it is not default: one region-list pass and one range walk
+# per `mmap`, on a path `rustc` takes ~58 000 times per crate.
+mm-forensics = []
+
 # The remaining BKL carve-outs, forwarded to mirror the AArch64 root kernel's
 # `smp-shared` (which has carried all of them since 2026-08). Each is audited
 # code on AArch64 with a runtime kill switch in `akuma_bkl::policy`; amd64

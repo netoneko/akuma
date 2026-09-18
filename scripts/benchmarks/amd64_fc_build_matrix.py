@@ -184,7 +184,7 @@ def wedge_evidence(vcpus):
     return ev
 
 
-def run_cell(crate, vcpus, jobs, budget, target):
+def run_cell(crate, vcpus, jobs, budget, target, clean_all=False):
     """One (vcpus, jobs) cell. Returns a result dict."""
     res = {"vcpus": vcpus, "jobs": jobs, "outcome": "?", "seconds": None}
 
@@ -200,9 +200,17 @@ def run_cell(crate, vcpus, jobs, budget, target):
         return res
     res["boot_seconds"] = round(boot_s, 1)
 
-    # Clean only this crate, so the cell measures the crate and not the graph.
-    guest(f"{GUEST_ENV} cd {GUEST_SRC} && "
-          f"cargo clean -p {crate} --release --target {target}", timeout=180)
+    # Clean only this crate, so the cell measures the crate and not the graph —
+    # unless `--clean-all` asked for the whole graph, which is what turns this
+    # harness into a self-host gate: `--crate akuma-amd64 --clean-all` rebuilds
+    # every dependency the kernel has and is the "does `cargo` work at SMP>1"
+    # question in full, where one crate is only the cheap repro of it.
+    if clean_all:
+        guest(f"{GUEST_ENV} cd {GUEST_SRC} && cargo clean --release --target {target}",
+              timeout=600)
+    else:
+        guest(f"{GUEST_ENV} cd {GUEST_SRC} && "
+              f"cargo clean -p {crate} --release --target {target}", timeout=180)
 
     build = (f"{GUEST_ENV} cd {GUEST_SRC} && cargo build -p {crate} "
              f"--target {target} --release --offline -j{jobs}")
@@ -249,6 +257,10 @@ def main():
     ap.add_argument("--budget", type=int, default=600,
                     help="seconds before a cell is called WEDGE (default 600)")
     ap.add_argument("--repeat", type=int, default=1)
+    ap.add_argument("--clean-all", action="store_true",
+                    help="clean the whole target dir before each cell, not just "
+                         "--crate: builds the crate's entire dependency graph, "
+                         "which is the self-host gate rather than the repro")
     a = ap.parse_args()
 
     if hpbox.which_system() != "ubuntu":
@@ -261,7 +273,7 @@ def main():
         for rep in range(a.repeat):
             tag = f"vcpu={vcpus} -j{jobs}" + (f" rep{rep + 1}" if a.repeat > 1 else "")
             print(f"--- {a.crate}: {tag} ...", flush=True)
-            r = run_cell(a.crate, vcpus, jobs, a.budget, a.target)
+            r = run_cell(a.crate, vcpus, jobs, a.budget, a.target, a.clean_all)
             r["rep"] = rep + 1
             results.append(r)
             print(f"    {r['outcome']}"

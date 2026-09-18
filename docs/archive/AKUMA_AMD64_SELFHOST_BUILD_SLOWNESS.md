@@ -2210,6 +2210,13 @@ the same afternoon on it.
 
 #### Next, in order
 
+> **Answered 2026-09-18 by §14.** Item 1 is solved: the corruption is a second
+> demand fault on an already-populated anonymous page, which replaced it with a
+> freshly zeroed frame. The `rip`s below are not a "corrupt pointer or corrupt
+> `%fs`" — every one of them is a `hlt`, i.e. musl's own `assert()` firing on
+> the metadata in that page. Items 2 and 3 were hypotheses about a *stall*, and
+> there is no stall left to explain; they are retired unless one reappears.
+
 1. **The heap corruption in `rustc`.** Now the headline, because the wedge that
    hid it is gone — and it reproduces in ~2 s, inside musl's allocator (above).
    The fixed run faulted **two threads of one process on two cores at once**:
@@ -2242,6 +2249,293 @@ the same afternoon on it.
    `project_futex_wake_tgid_pthread_join` already fixed once, on the other
    kernel.
 4. The bare metal with `pmm-forensics`, still not reached — §12's item 3.
+
+
+### 14. SOLVED (2026-09-18): a second demand fault on the same anonymous page replaced it with zeros
+
+*§13 left `rustc` dying ~2 s into every `cargo` build at `SMP>=2`, with a
+`rip` in `ld-musl`'s allocator and the note that "whether those are one
+corruption or two is the next question". They were one. The cause is four
+lines of missing guard in this target's own demand-paging path, and the
+`-j4` `cargo` build at `SMP>=2` now runs to completion where every single run
+used to die in ~2 s.*
+
+#### First: every "mysterious `#GP` in the allocator" is a `hlt`
+
+§13 resolved three faulting `rip`s to `aligned_alloc + {0xce, 0x678, 0x775}`
+and read them as three points in one block of allocator code. Disassembling
+the guest's own `ld-musl-x86_64.so.1` at those offsets says something much
+more specific — **all three are the instruction `f4`, `hlt`**:
+
+```
+   465de:  49 8b 48 f0     mov  -0x10(%r8),%rcx      ; rcx = base->meta
+   465e2:  49 83 e8 10     sub  $0x10,%r8            ; r8  = base
+   465e6:  4c 3b 41 10     cmp  0x10(%rcx),%r8       ; meta->mem == base ?
+   465ea:  74 01           je   465ed
+   465ec:  f4              hlt                       ; <-- the "#GP"
+```
+
+musl's `mallocng` compiles `assert()` to `a_crash()`, which on x86_64 is
+`hlt` — privileged, so in ring 3 it is `#GP(0)` with no error code and no
+faulting address. Every one of these reports is therefore **the allocator
+catching its own corrupt in-band metadata and deliberately crashing**, not
+the kernel losing a pointer. The `#PF err=0x4 cr2=0x10` variant is the same
+assertion one instruction earlier, with `base->meta` reading as NULL so that
+`meta->mem` at offset `0x10` faults instead.
+
+That reframes the hunt completely: the question is not "which pointer went
+wild" but "**which bytes of this process's own memory are wrong, and how did
+they get that way**".
+
+#### The matrix, re-measured — the threshold is 2x2, not 4x4
+
+§12's matrix was taken on a kernel where the failing cell *wedged for 600 s*;
+with §13's `EINTR` fix the same cell reports a `SIGSEGV` in ~2 s, which makes
+the whole matrix affordable again. It is sharper than §12 could see:
+
+| vcpu | jobs | outcome | wall |
+|---|---|---|---|
+| 1 | 1 | PASS | 14.3 s |
+| 1 | 4 | PASS | 14.1 s |
+| 4 | 1 | PASS | 17.9 s |
+| **2** | **2** | **ERROR** | **2.0 s** |
+| 2 | 4 | ERROR | 2.1 s |
+| 4 | 2 | ERROR | 2.6 s |
+| 4 | 4 | ERROR | 2.2 s |
+
+§12's "both variables are necessary" stands and tightens: **two cores and two
+concurrent jobs is already enough**, and neither alone is ever enough however
+far it is pushed. Four cores running one `rustc` — which is itself
+multi-threaded, 18 live user threads by the time it dies — is green.
+
+#### Four eliminations, each with its own instrument
+
+Cheap to state, and each cost a run:
+
+- **The PMM's frame lifecycle.** A `--features pmm-forensics` kernel (UAF
+  quarantine, premature-free check, CoW ledger) reproduced the failure
+  identically and emitted **not one** `[PMM-UAF]`, `[PMM-PREMATURE]` or
+  `[PMM-RESURRECT]` line. Every frame involved is correctly owned and
+  correctly refcounted.
+- **The shared file-page cache.** Built with
+  `SHARED_FILE_PAGES_ENABLED = false`; the fault line confirms the arm
+  (`fpcache_len=0 fpcache_cap=0`, `[FPCACHE] entries=0/0`). Same crash, same
+  `rip`, same `task=17 pid=64`. The one mechanism that shares physical frames
+  *between address spaces* is not it.
+- **`mmap` handing back an address that is not free.** New: `--features
+  mm-forensics` checks every placement, before anything is populated, against
+  the region list (`[MM-OVERLAP]`), the page table (`[MM-LIVEPTE]`) and the
+  sorted invariant the placer binary-searches (`[MM-UNSORTED]`). 5 459
+  placements checked in the failing build, **zero** reports.
+- **A stale peer-core translation after a CoW break.** `cowstale` passes 5/5
+  at `SMP=4` with ~6 M reader checks and 0 reader faults per run — the
+  2026-09-06 open issue in `AKUMA_AMD64_SMP_SHARED_UNBLOCK.md` really was
+  closed by `shootdown.rs`.
+
+#### What decided it: the bytes, and that they were zeros and not poison
+
+`user_fault` now dumps the ring-3 register file and, for every register that
+looks like a mapped user address, 48 bytes around it — read through the page
+table rather than through `uaccess`, so a dying thread cannot fault inside its
+own post-mortem. The answer arrived on the first run:
+
+```
+[Fault] #PF ... err=0x4 rip=0x102c0aa26 cr2=0x0 cr3=0x2075f000 task=14 pid=64
+  [regs] rax=0x11dad2030 ... rdx=0x0 ... rdi=0x11d6ea998 rbp=0x11d6ea998 r8=0x0
+  [mem] rax=0x11dad2030: 0000000000000000 0002a00000000000 0000000000000000 ...
+  [mem] rdi=0x11d6ea998: 0000000000000000 0000000000000000 0000000000000000 ...
+```
+
+Memory that should hold a structure reads back as **zeros**, and the program
+dereferenced the null it loaded out of it. That is the
+`SELFHOST_ZERO_PAGE_HUNT.md` signature and `cowstale`'s malignant case both,
+so the next question is which: *a freed frame read through a stale mapping*,
+or *a fresh zeroed frame put where data used to be*.
+
+The PMM's quarantine answers it for free. A freed frame is filled with
+`POISON_MAGIC ^ pa` (`0xFEEDFACE...`) and parked. Re-run under
+`pmm-forensics`: the corrupt region still reads **zeros, not poison**, and the
+UAF detector stays silent. So nothing was freed. The page is genuinely,
+freshly zeroed — which is what this kernel does to a page it is about to hand
+to ring 3 for the first time.
+
+#### The bug
+
+`mm::populate_page` — the anonymous demand-paging fill — allocates a frame,
+zeroes it, and maps it. It never asks whether anything is already there:
+
+```rust
+let (pte, cow) = pte_prot_for(prot, frame);
+if usermode::with_current_address_space(|uas| {
+    uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
+}) != Some(true)
+```
+
+and `map_and_track_pte` **overwrites a present leaf without asking**.
+
+Two cores do take the same fault. The page is absent when each of them traps;
+`idt.rs` takes the BKL for the *servicing* window, which serialises the two
+handlers but not the two traps. So core A faults, is served, returns to ring 3
+and writes; core B — whose fault was already delivered — is then served
+against a page that has become present in between, allocates a second frame,
+zeroes it, and installs it over A's. Everything A wrote is gone, the old frame
+is orphaned, and because that frame is still tracked by the ledger and still
+refcounted, **no PMM instrument can see it**. That is exactly why a full
+forensics build ran the failure to completion without a complaint.
+
+`fill_file_pages` has always known about this — its loop opens with
+`is_current_user_range_mapped` and the comment *"A peer filled the very page
+this fault is about. Present is present"*. The anonymous path never grew the
+same guard, and anonymous memory is where the heap lives.
+
+It is not this kernel's discovery either: the AArch64 side serialises demand
+paging per page for precisely this reason
+(`akuma-exceptions`' `fault_slot_hold`: *"prevent races when multiple
+`CLONE_VM` threads fault on the same page"*). The amd64 port inherited the
+region table and the fill paths and not the mutual exclusion.
+
+#### The fix
+
+One critical section instead of two steps. `install_filled_page` does the
+presence test and the map **inside the same address-space hold**, so a peer
+cannot land between them — the same serialisation, and the same reason,
+as the owner's lock `cow_write_fault` takes:
+
+```rust
+fn install_filled_page(va: usize, frame: PhysFrame, pte: PteProt, cow: bool) -> PageInstall {
+    usermode::with_current_address_space(|uas| {
+        if uas.pte_prot(va).is_some() {
+            PageInstall::Raced
+        } else if uas.map_and_track_pte(va, frame, pte, cow) {
+            PageInstall::Mapped
+        } else {
+            PageInstall::Failed
+        }
+    })
+    .unwrap_or(PageInstall::Failed)
+}
+```
+
+`Raced` is deliberately a **third** outcome and not folded into either of the
+others. It is a *success* — the page is present, which is all the faulting
+instruction was waiting for, so reporting failure would turn a served fault
+into a `SIGSEGV` — whose frame the caller no longer owns, so reporting success
+would publish a freed frame into the shared file-page cache. All five install
+sites go through it: the anonymous fill, the two file fills, the eager `mmap`
+fan-out, and `map_shared_file_page` (which arrives holding a cache reference
+and would otherwise strand the previous mapper's).
+
+The fill itself stays outside the hold at every caller: a file read takes the
+descriptor table, and taking that underneath the address-space lock would be
+the one place in the module where the two are ordered that way.
+
+#### It fires once per build, and once was enough
+
+`[MM] fault race #N` prints on the first occurrence and every 4096th.
+A whole 4x4 `zerocopy` build produces **exactly one**:
+
+```
+[MM] fault race #1 (va=0x11d918000) — page already served by a peer
+```
+
+That is the shape of the whole investigation. One event per build, in the
+mmap arena where `mallocng`'s groups and the thread stacks live, silently
+replacing a live heap page with zeros — and one is enough, because the process
+that owns that page is `rustc` and the bytes it lost were its allocator's.
+A 1-in-a-build race presented as a 6-out-of-6 deterministic failure.
+
+Note the counter reported by the boot suite is **0**, and will stay 0: the
+boot suite is not concurrent. An instrument whose only reading is taken where
+the phenomenon cannot occur is not evidence, which is why the milestone line
+exists.
+
+#### A/B/A, one binary pair, everything else equal
+
+The B arm is the tree as it stands. The A arm is the same tree with the two
+presence tests — and nothing else — disabled (`if false && uas.pte_prot(va)…`),
+so the comparison is the guard and not the refactor around it.
+
+| arm | guard | vcpu x jobs | outcome |
+|---|---|---|---|
+| B | on | 4 x 4 | **PASS 17.6 s** |
+| A | off | 4 x 4 | ERROR 2.2 s |
+| B | on | 4 x 4 | **PASS 17.4 s** |
+
+and the full matrix on the fixed kernel, default features:
+
+| vcpu | jobs | before | after |
+|---|---|---|---|
+| 1 | 4 | PASS 14.1 s | PASS 13.7 s |
+| 4 | 1 | PASS 17.9 s | PASS 17.2 s |
+| 2 | 2 | **ERROR 2.0 s** | **PASS 14.5 s** |
+| 4 | 4 | **ERROR 2.2 s** | **PASS 17.6 s** |
+
+#### What is kept
+
+- `mm-forensics` (`amd64/Cargo.toml`) — the placement checks above, with
+  `PLACEMENTS_CHECKED` reported on the fault line as their positive control.
+  They found nothing this time and that *is* their result: the family is
+  eliminated rather than untested, and the next placement bug reports itself.
+- `dump_user_registers_and_memory` in `idt::user_fault` — the register file and
+  48 bytes around every register that could be a user pointer. This is what
+  turned "a `#GP` somewhere in the allocator" into "these bytes are zeros",
+  and it cost one run.
+- `mm::PAGE_FAULT_RACES` + the `[MM] fault race #N` milestone line, and
+  `demand_paging_report`'s note for it.
+- `mm::FILE_FILL_SHORT` + `[FILL-SHORT]`, added while looking at the residual
+  below. `populate_file_page_by_inode`'s `want` is already clamped to what the
+  file has from that offset, so a short read there cannot be "past EOF" — the
+  bytes exist and the filesystem did not hand them over, and the page keeps its
+  zeros for the shortfall. It was being discarded. This is the AArch64 kernel's
+  `[FILL-SHORT]` tripwire, which `SELFHOST_ZERO_PAGE_HUNT.md` §12-§15 records as
+  presenting exactly as "`rustc` cannot find something in a dependency's
+  metadata". `check`ed rather than `note`d in the boot suite: unlike the race
+  counter, this one needs no concurrency to happen.
+
+#### The self-host build, and one residual
+
+`--clean-all` on the kernel itself, `SMP=4 -j4` in the guest: **133 of 137
+crates in 127 s**, where the same cell used to wedge for 600 s and then (with
+§13's fix) die in 2 s. It is not yet fully green — the run ends on
+
+```
+error[E0531]: cannot find unit struct, unit variant or constant
+              `PIDFD_SEND_SIGNAL` in module `nr`
+```
+
+— at the same crate, at the same line, in **both** of two repeats. That
+repeatability is the useful fact: this is not the old failure wearing new
+clothes. The old one was a `SIGSEGV` from a corrupted heap, at a `rip` that
+moved around; this is `rustc` completing normally and reporting a name
+resolution failure, identically, twice.
+
+**A `-j1` comparison here is easy to get wrong, and this section got it wrong
+once.** `cargo build -p akuma-syscalls-glue -j1` in the same guest succeeds —
+but that builds glue with its *default* features, and the failing arm is behind
+`#[cfg(feature = "sc-pidfd")]`, which only `akuma-amd64`'s feature set turns on.
+The arm was compiled out, so the build proved nothing. The control that means
+something is the same `--clean-all` build of `akuma-amd64` at **1x1**, and it is
+the one to run before concluding anything about this.
+
+Whatever it turns out to be, do not read it as "the fix did not work": the
+failure it replaced was a `SIGSEGV` at 2 s in **every single run**, and this
+build now gets 133 crates further.
+
+#### Traps
+
+- **A boot-suite reading of a concurrency counter is not a reading.** The suite
+  reports `PAGE_FAULT_RACES` as 0 and always will; the race needs two cores and
+  two processes and the suite has neither. The milestone console line exists
+  because the number that matters can only be taken after a real build.
+- **`amd64-fc-run.sh` truncates `/root/akuma-fc.log` on every boot**, and the
+  matrix harness boots per cell. Grepping the log after a multi-cell run reads
+  only the *last* cell — which, if that cell was `1x4`, is single-core and
+  cannot contain the evidence. Measured here: a clean 4-cell run reported zero
+  races and the 4x4 rerun immediately afterwards reported one.
+- **`pmm-forensics` being silent is a real result and a narrow one.** It proves
+  the *frame* lifecycle is sound. It says nothing about a frame that is
+  correctly allocated, correctly tracked and mapped over the top of another —
+  which is this bug, and why a forensics build reproduced it without comment.
 
 
 ## Background

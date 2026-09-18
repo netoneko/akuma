@@ -800,7 +800,7 @@ extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         }
         // No handler: Linux's default for `SIGTRAP` is to terminate, which is
         // what `user_fault` does here — the process, not the kernel.
-        user_fault("#DB debug (ring 3, no handler)", f, None);
+        user_fault("#DB debug (ring 3, no handler)", f, None, None);
     }
     let n = RING0_DEBUG_TRAPS.fetch_add(1, Ordering::Relaxed);
     if n < RING0_DEBUG_REPORT_LIMIT {
@@ -1032,7 +1032,7 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
             return;
         }
         describe_page_fault(code);
-        user_fault("#PF page fault", &pf.frame, Some(code.raw()));
+        user_fault("#PF page fault", &pf.frame, Some(code.raw()), Some(regs));
     }
     describe_page_fault(code);
     fatal("#PF page fault", &pf.frame, Some(code.raw()));
@@ -1230,6 +1230,103 @@ pub static COW_COPIES: AtomicU64 = AtomicU64::new(0);
 pub static COW_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub static COW_RETRIES: AtomicU64 = AtomicU64::new(0);
 
+/// The faulting thread's register file, plus the bytes around every register
+/// that could be a user pointer.
+///
+/// # Why a fault report needs the memory and not just the registers
+///
+/// The 2026-09-18 `-j4` failure is a **`hlt` in ring 3** — musl's `mallocng`
+/// compiles `assert()` to `a_crash()`, which is `hlt`, so every `rip` this
+/// target reported as a mysterious `#GP` at `ld-musl+0x46xxx` is the allocator
+/// catching its own corrupt in-band metadata. Which assertion does not narrow
+/// it far enough: `get_meta` checks `meta->mem == base`, and the answer that
+/// separates the remaining explanations is what the bytes at `base` actually
+/// **are**. All zeros means the page was replaced or re-zeroed under the
+/// process; plausible-but-wrong pointers mean a write landed in a frame its
+/// writer no longer owned, or a second mapping is live at the same address.
+/// The registers alone cannot tell those apart, and by the time anything else
+/// can look the process is dead.
+///
+/// Read through the page table rather than through [`crate::uaccess`]: this
+/// runs on a dying thread and must not itself fault, so a VA with no
+/// translation is reported as such instead of being demand-paged. The same
+/// reason `translate` walks rather than trusting a shadow record.
+fn dump_user_registers_and_memory(regs: &TrapRegs) {
+    use core::fmt::Write as _;
+
+    let mut w = akuma_primitives::console::StackWriter::<512>::new();
+    let _ = writeln!(
+        w,
+        "  [regs] rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}\n\
+         \x20        rsi={:#018x} rdi={:#018x} rbp={:#018x} r8 ={:#018x}\n\
+         \x20        r9 ={:#018x} r10={:#018x} r11={:#018x} r12={:#018x}\n\
+         \x20        r13={:#018x} r14={:#018x} r15={:#018x}",
+        regs.rax, regs.rbx, regs.rcx, regs.rdx,
+        regs.rsi, regs.rdi, regs.rbp, regs.r8,
+        regs.r9, regs.r10, regs.r11, regs.r12,
+        regs.r13, regs.r14, regs.r15,
+    );
+    w.flush();
+
+    // The four `mallocng`'s `get_meta` uses: `rax`/`rdi` hold the chunk
+    // pointer on the two code paths observed, `r8` the group base it derived
+    // and `rcx` the `struct meta *` it read out of the group header. Dumped in
+    // that order so a reader can follow the same chain the allocator did.
+    let space = faulting_address_space();
+    for (name, val) in [
+        ("rax", regs.rax),
+        ("rdi", regs.rdi),
+        ("r8 ", regs.r8),
+        ("rcx", regs.rcx),
+    ] {
+        dump_user_qwords(&space, name, val);
+    }
+}
+
+/// 48 bytes around `val`, as six qwords, when `val` looks like a mapped user
+/// address. Silent for anything else — a register holding a small integer is
+/// the common case and printing it would bury the ones that matter.
+///
+/// Starts one 16-byte unit **below** the pointer, because that is where
+/// `mallocng` keeps what it is about to read: the slot offset at `p-2`, the
+/// group's `meta` pointer at `base-16`.
+fn dump_user_qwords(space: &akuma_mmu::UserAddressSpace, name: &str, val: u64) {
+    use core::fmt::Write as _;
+
+    let start = (val as usize) & !0xf;
+    let Some(start) = start.checked_sub(16) else { return };
+    if !(0x1000..0x0000_8000_0000_0000).contains(&start) {
+        return;
+    }
+    let mut w = akuma_primitives::console::StackWriter::<256>::new();
+    let _ = write!(w, "  [mem] {name}={val:#x}:");
+    let mut any = false;
+    for i in 0..6usize {
+        let va = start + i * 8;
+        let page = va & !0xfff;
+        match space.translate(page) {
+            Some(pa) => {
+                // SAFETY: `pa` is a live frame of this address space reached
+                // through the physmap, and exactly eight aligned bytes inside
+                // the page `translate` resolved are read.
+                let q = unsafe {
+                    crate::phys::phys_ptr::<u64>(((pa & !0xfff) as u64) + (va & 0xfff) as u64)
+                        .read_volatile()
+                };
+                let _ = write!(w, " {q:016x}");
+                any = true;
+            }
+            None => {
+                let _ = write!(w, " <unmapped>");
+            }
+        }
+    }
+    let _ = writeln!(w);
+    if any {
+        w.flush();
+    }
+}
+
 /// A fault taken **in ring 3** that no handler wanted: report it and kill the
 /// process, not the core.
 ///
@@ -1253,7 +1350,12 @@ pub static COW_RETRIES: AtomicU64 = AtomicU64::new(0);
 /// `userspace/forktest/c_stress/eager_mprotect_probe.c` — whose entire job is
 /// to assert that an `mprotect` downgrade produces a `SIGSEGV` — could never
 /// pass, which `amd64_mem_trials.py` recorded as an expected failure.
-fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+fn user_fault(
+    vector: &str,
+    frame: &InterruptStackFrame,
+    error_code: Option<u64>,
+    regs: Option<&TrapRegs>,
+) -> ! {
     // **One flush, not twenty `puts`.** `serial::LOCK` is per call, so a peer
     // core faulting at the same moment lands between two of them and shreds
     // both lines. That is not hypothetical here: the 2026-09-18 `-j4` run
@@ -1293,14 +1395,19 @@ fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>
     // downstream of that). A boot with no NIC never reaches
     // `mem_watch_tick`, so the counters ride the fault line itself.
     let _ = core::fmt::write(&mut w, format_args!(
-        "  [memwatch-at-kill] pmm_free={} fpcache_len={} fpcache_cap={} cow_ref_frames={}\n",
+        "  [memwatch-at-kill] pmm_free={} fpcache_len={} fpcache_cap={} cow_ref_frames={} mmap_checked={} anon_races={}\n",
         akuma_pmm::free_count(), akuma_fpcache::len(), akuma_fpcache::cap(),
-        akuma_pmm::cow_ref_count()));
+        akuma_pmm::cow_ref_count(),
+        crate::mm::PLACEMENTS_CHECKED.load(Ordering::Relaxed),
+        crate::mm::PAGE_FAULT_RACES.load(Ordering::Relaxed)));
     // Hit/miss/evict/inval: distinguishes "the cache ate the RAM" (len pinned
     // at cap, evictions churning) from "a mapper leaked refs" (len small,
     // `cow_ref_frames` huge) — the two look identical from `pmm_free=0` alone.
     akuma_fpcache::stats_line(&mut w);
     w.flush();
+    if let Some(regs) = regs {
+        dump_user_registers_and_memory(regs);
+    }
     crate::usermode::kill_current_from_fault(SIGSEGV);
 }
 
@@ -1351,7 +1458,7 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut
         if delivered {
             return;
         }
-        user_fault("#GP general protection", &pf.frame, Some(pf.error_code));
+        user_fault("#GP general protection", &pf.frame, Some(pf.error_code), Some(regs));
     }
     fatal("#GP general protection", &pf.frame, Some(pf.error_code));
 }

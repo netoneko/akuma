@@ -376,6 +376,118 @@ fn insert_region_sorted(regions: &mut Vec<MmapRegion>, region: MmapRegion) {
     akuma_mmap::insert_region_sorted(regions, region);
 }
 
+/// `mm-forensics`: prove the range `sys_mmap` is about to hand back is free.
+///
+/// Three independent readings of "free", because the interesting failures are
+/// the ones where they disagree:
+///
+/// * **`[MM-UNSORTED]`** — the region list is not in address order. The placer
+///   binary-searches it (`partition_point`) and terminates its scan on "the
+///   first region starting at or past `cand + len` proves the gap below is
+///   clear"; both are wrong on an unsorted list, and the O(1) guard inside the
+///   scan only compares the last two entries, so a list disordered anywhere
+///   else passes it. Reported before the other two, because it explains them.
+/// * **`[MM-OVERLAP]`** — a region record already covers part of the range.
+/// * **`[MM-LIVEPTE]`** — a present PTE already covers part of the range, which
+///   a region check cannot see: pages are mapped here that no region ever
+///   claimed (an ELF image under a `MAP_FIXED`, `unmap_range`'s own note), and
+///   a lost region record shows up as this and nothing else.
+///
+/// A `MAP_FIXED` placement is checked too. It is allowed to *replace*, but
+/// `unmap_range` has already retired what it replaced by the time this runs, so
+/// the range must be clear for it as well — a fixed mapping that still finds
+/// something there means the teardown missed it.
+///
+/// Reports and carries on rather than halting: the corruption this hunts is
+/// already loose by the time a later program notices it, and one line naming
+/// the address is worth more than a dead machine. Each report is a single
+/// [`StackWriter`](akuma_primitives::console::StackWriter) flush, for the reason
+/// `idt::user_fault` states — two cores reporting at once through several
+/// `puts` shred each other's lines.
+#[cfg(feature = "mm-forensics")]
+fn check_placement_free(base: usize, byte_len: usize, fixed: bool) {
+    use core::fmt::Write as _;
+
+    PLACEMENTS_CHECKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let end = base.saturating_add(byte_len);
+    let kind = if fixed { "fixed" } else { "auto" };
+
+    let overlap = usermode::with_current_regions(|regions| {
+        let unsorted = regions
+            .windows(2)
+            .position(|w| w[0].start_va > w[1].start_va);
+        let hit = regions
+            .iter()
+            .find(|r| r.start_va < end && r.start_va.saturating_add(r.len_bytes()) > base)
+            .map(|r| (r.start_va, r.len_bytes()));
+        (unsorted, hit, regions.len())
+    });
+    let Some((unsorted, hit, n_regions)) = overlap else {
+        return; // no process: nothing placed anything
+    };
+
+    if let Some(at) = unsorted {
+        let mut w = akuma_primitives::console::StackWriter::<256>::new();
+        let _ = writeln!(
+            w,
+            "[MM-UNSORTED] region list out of order at index {at} of {n_regions} \
+             (pid={}, placing {kind} 0x{base:x}..0x{end:x})",
+            crate::usermode::current_pid()
+        );
+        w.flush();
+    }
+
+    if let Some((r_start, r_len)) = hit {
+        let mut w = akuma_primitives::console::StackWriter::<256>::new();
+        let _ = writeln!(
+            w,
+            "[MM-OVERLAP] {kind} placement 0x{base:x}..0x{end:x} overlaps region \
+             0x{r_start:x}..0x{:x} (pid={}, {n_regions} regions)",
+            r_start.saturating_add(r_len),
+            crate::usermode::current_pid()
+        );
+        w.flush();
+    }
+
+    // The page table's own answer. Counted rather than listed: a range that is
+    // wholly live would otherwise print thousands of lines.
+    let mut live = 0usize;
+    let mut first_live = 0usize;
+    let _ = usermode::with_current_address_space(|uas| {
+        uas.for_each_leaf_in_range(base, end, |leaf| {
+            if live == 0 {
+                first_live = leaf.va;
+            }
+            live += 1;
+        });
+    });
+    if live != 0 {
+        let mut w = akuma_primitives::console::StackWriter::<256>::new();
+        let _ = writeln!(
+            w,
+            "[MM-LIVEPTE] {kind} placement 0x{base:x}..0x{end:x} already has {live} \
+             present page(s), first at 0x{first_live:x} (pid={})",
+            crate::usermode::current_pid()
+        );
+        w.flush();
+    }
+}
+
+/// How many placements [`check_placement_free`] has inspected.
+///
+/// The positive control, and it is not optional: an instrument that reports
+/// nothing has two readings — "no overlap happened" and "the check never ran" —
+/// and a hunt that cannot tell them apart has learned nothing. Reported on the
+/// fault line, which is the one place a failing run is guaranteed to reach.
+pub static PLACEMENTS_CHECKED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// The compiled-out half. An empty body rather than a `cfg` at the call site so
+/// the check cannot be forgotten when a second placement path appears.
+#[cfg(not(feature = "mm-forensics"))]
+#[inline(always)]
+fn check_placement_free(_base: usize, _byte_len: usize, _fixed: bool) {}
+
 /// Is the caller a slotted user task with an address space of its own?
 ///
 /// The one question every effect in this module is gated on. It is asked
@@ -571,6 +683,12 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         None
     };
 
+    // `mm-forensics`: is `base` actually free? Nothing else in the kernel asks,
+    // and a placement that overlaps a live mapping is silent until the program's
+    // own memory turns out to be wrong. Before the record goes in, so the region
+    // being placed is not itself the overlap that is reported.
+    check_placement_free(base, byte_len, fixed);
+
     let mut region = MmapRegion::inherited_with_prot(base, pages, region_prot);
     if plan.shared_anon {
         region = region.shared_anon();
@@ -682,7 +800,13 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
                 }
                 for j in 0..CHUNK_PAGES {
                     let src = &buf[j * PAGE_SIZE as usize..(j + 1) * PAGE_SIZE as usize];
-                    if populate_file_page_from(va + j * PAGE_SIZE as usize, region_prot, src).is_none() {
+                    // `Raced` is not a failure: a peer core populated this
+                    // page while the chunk was being read, and its copy is the
+                    // one that counts. Only `Failed` stops the batch.
+                    if matches!(
+                        populate_file_page_from(va + j * PAGE_SIZE as usize, region_prot, src),
+                        FilledPage::Failed
+                    ) {
                         batch_failed = true;
                         break;
                     }
@@ -767,20 +891,184 @@ fn populate_page(va: usize, prot: Prot) -> bool {
     // it is used anyway so there is one answer to "what bits does this region
     // get" rather than two that could drift.
     let (pte, cow) = pte_prot_for(prot, frame);
-    // The allocation and the zeroing are outside the address-space hold; only
-    // the PTE edit and the ledger entry are inside it. `map_and_track_pte`
-    // records the frame before it maps and untracks it if the map fails, which
-    // is the `track_anon_frame` this used to do afterwards — and getting the
-    // order that way round is what stops a failed map leaving the ledger
-    // claiming a page nothing points at.
-    if usermode::with_current_address_space(|uas| {
-        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
-    }) != Some(true)
-    {
-        akuma_pmm::free_page(frame, 0);
-        return false;
+    match install_filled_page(va, PhysFrame::new(frame), pte, cow) {
+        PageInstall::Mapped => true,
+        // A peer core filled this page while this fault was in flight. Its
+        // frame holds the real contents; give ours back and report the fault
+        // served, because it is — the instruction re-executes against a page
+        // that is present, which is all it was waiting for.
+        PageInstall::Raced => {
+            akuma_pmm::free_page(frame, 0);
+            note_fault_race(va);
+            true
+        }
+        // Out of page-table memory, or no process. Unchanged.
+        PageInstall::Failed => {
+            akuma_pmm::free_page(frame, 0);
+            false
+        }
     }
-    true
+}
+
+/// What [`install_filled_page`] decided.
+///
+/// Three outcomes, because "a peer core got there first" is a **success** with
+/// a frame to give back and not a failure — a caller that treats it as failure
+/// turns a served fault into a `SIGSEGV`.
+enum PageInstall {
+    /// This frame is now the page at `va`.
+    Mapped,
+    /// A page was already present at `va`; nothing was changed and the caller
+    /// still owns its frame.
+    Raced,
+    /// Nothing was mapped: no address space, or no memory for a page table.
+    Failed,
+}
+
+/// Publish a freshly filled frame at `va` — **unless something is already
+/// there**.
+///
+/// # The presence test is the point, and it has to be inside the hold
+///
+/// [`akuma_mmu::UserAddressSpace::map_and_track_pte`] overwrites a present leaf
+/// without asking. So a second fault on a page a peer core has already filled
+/// does not merely waste a frame: it replaces the live translation, and the data
+/// the process wrote through the first one is gone. For an anonymous page the
+/// replacement is *zeroed*, which is how the damage presents — a heap word that
+/// reads back as 0.
+///
+/// Nothing reports it. The orphaned frame is still tracked by the ledger and
+/// still refcounted, so the PMM's UAF quarantine and its premature-free check
+/// both stay silent; a `pmm-forensics` build of this kernel ran the failing
+/// build to completion without a single complaint while the corruption happened
+/// (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §14).
+///
+/// Two cores really do take that fault. The page is absent when each of them
+/// traps, and the BKL serialises only the *servicing*: both faults are
+/// delivered, then serviced one after the other, and the second arrives at a
+/// page that became present in between. `fill_file_pages` has always known this
+/// — "A peer filled the very page this fault is about. Present is present" — and
+/// tested `is_current_user_range_mapped` before filling. That test is **outside**
+/// any hold, so it narrows the window rather than closing it; this closes it, by
+/// making the test and the map one critical section against a peer doing the
+/// same thing. Same serialisation, and the same reason, as the owner's lock
+/// `cow_write_fault` takes.
+///
+/// The fill stays outside the hold at every caller — a file read takes the
+/// descriptor table, and taking that underneath the address-space lock would be
+/// the one place in this module where the two are ordered that way.
+fn install_filled_page(va: usize, frame: PhysFrame, pte: PteProt, cow: bool) -> PageInstall {
+    usermode::with_current_address_space(|uas| {
+        if uas.pte_prot(va).is_some() {
+            PageInstall::Raced
+        } else if uas.map_and_track_pte(va, frame, pte, cow) {
+            PageInstall::Mapped
+        } else {
+            PageInstall::Failed
+        }
+    })
+    .unwrap_or(PageInstall::Failed)
+}
+
+/// [`install_filled_page`] for the fill paths that hand a frame back, plus the
+/// frame's disposal on the two outcomes where it is no longer wanted.
+///
+/// The [`FilledPage`] distinction is load-bearing at exactly one call site:
+/// `fill_file_pages` must not put a frame it no longer owns into the shared
+/// file-page cache (so `Raced` is not `Mapped`) and must not stop reading ahead
+/// because a peer beat it to one page (so `Raced` is not `Failed`).
+fn install_or_release(
+    va: usize,
+    frame: usize,
+    pte: PteProt,
+    cow: bool,
+) -> FilledPage {
+    match install_filled_page(va, PhysFrame::new(frame), pte, cow) {
+        PageInstall::Mapped => FilledPage::Mapped(PhysFrame::new(frame)),
+        PageInstall::Raced => {
+            akuma_pmm::free_page(frame, 0);
+            note_fault_race(va);
+            FilledPage::Raced
+        }
+        PageInstall::Failed => {
+            akuma_pmm::free_page(frame, 0);
+            FilledPage::Failed
+        }
+    }
+}
+
+/// What a file fill did with its page.
+///
+/// `Raced` is deliberately not folded into either of the others: it is a
+/// **success** (the page is present) whose frame the caller no longer owns (so
+/// it must not be published to the file-page cache). Collapsing it into
+/// `Mapped` would insert a freed frame into the cache; collapsing it into
+/// `Failed` would turn a served fault into a `SIGSEGV`.
+enum FilledPage {
+    Mapped(PhysFrame),
+    Raced,
+    Failed,
+}
+
+/// File-mapping page fills that got fewer bytes than the file was known to
+/// hold — see the call site for why that is never legitimate.
+///
+/// Steady-state zero. A non-zero reading is wrong bytes in a mapped file page,
+/// which is the quietest failure this module has: nothing errors, nothing
+/// faults, and the first thing anyone sees is a compiler failing to find a
+/// symbol in a crate it just read.
+pub static FILE_FILL_SHORT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Count one short fill, and say so on the first and every 1024th.
+fn note_fill_short(va: usize, want: usize, got: usize) {
+    let n = FILE_FILL_SHORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(1024) {
+        let mut w = akuma_primitives::console::StackWriter::<128>::new();
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!("[FILL-SHORT] #{n} va=0x{va:x} want={want} got={got}\n"),
+        );
+        w.flush();
+    }
+}
+
+/// Demand faults that arrived at a page a peer core had already filled.
+///
+/// Anonymous **and** file-backed — every caller of [`install_filled_page`]
+/// bumps it, because the hazard is the same one at all of them.
+///
+/// Kept permanently, and reported by [`demand_paging_report`], because the
+/// quantity is the evidence: this counter is the population that used to have
+/// its page silently replaced (with zeros, on the anonymous path), and a build
+/// that reports zero of them has not proved the race is gone so much as failed
+/// to run into it. Same argument as [`FILE_PAGES_SHARED`] — an arm that is
+/// never taken is invisible in every other measurement.
+pub static PAGE_FAULT_RACES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Count one, and say so on the first and then every 4096th.
+///
+/// The counter alone is not enough evidence and the reason is specific: the
+/// boot suite reports it, the boot suite is not concurrent, and it therefore
+/// reports **0** on a kernel where the race fires thousands of times under the
+/// load that matters. A run that only ever sees that 0 cannot tell "the guard
+/// is working" from "the guard is dead code", which is the difference the whole
+/// fix turns on. A line on the console can be read after a `cargo` build, by
+/// `dmesg` or off the host-side log, without a fault to carry it.
+///
+/// Milestones rather than every occurrence: it fires per page, and a line per
+/// page would be its own denial of service on the console.
+fn note_fault_race(va: usize) {
+    let n = PAGE_FAULT_RACES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(4096) {
+        let mut w = akuma_primitives::console::StackWriter::<128>::new();
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!("[MM] fault race #{n} (va=0x{va:x}) — page already served by a peer\n"),
+        );
+        w.flush();
+    }
 }
 
 /// Allocate, **fill from a file**, map and record one page at `va`.
@@ -834,14 +1122,21 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
     // The file read is deliberately **outside** the address-space hold: it takes
     // the descriptor table, and taking that lock underneath this one would be
     // the only place in this module where the two are ordered that way.
-    if usermode::with_current_address_space(|uas| {
-        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
-    }) != Some(true)
-    {
-        akuma_pmm::free_page(frame, 0);
-        return false;
+    match install_filled_page(va, PhysFrame::new(frame), pte, cow) {
+        PageInstall::Mapped => true,
+        // A peer served this page first. `true`, not `false`: the page is
+        // present, which is what the caller asked for. See
+        // [`install_filled_page`].
+        PageInstall::Raced => {
+            akuma_pmm::free_page(frame, 0);
+            note_fault_race(va);
+            true
+        }
+        PageInstall::Failed => {
+            akuma_pmm::free_page(frame, 0);
+            false
+        }
     }
-    true
 }
 
 /// Allocate, **fill from an already-read buffer**, map and record one page.
@@ -851,8 +1146,10 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
 /// cost is paid per chunk instead of per page. Same rules: freshly allocated
 /// frame (no stale contents), PTE edit and ledger entry under the
 /// address-space hold, frame freed on a failed map.
-fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> Option<PhysFrame> {
-    let frame = akuma_pmm::alloc_page()?;
+fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> FilledPage {
+    let Some(frame) = akuma_pmm::alloc_page() else {
+        return FilledPage::Failed;
+    };
     // SAFETY: a fresh PMM frame, reached through the physmap, and no other
     // reference to it exists until it is mapped below.
     let page = unsafe {
@@ -865,14 +1162,7 @@ fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> Option<PhysFram
     page[..n].copy_from_slice(&src[..n]);
     page[n..].fill(0);
     let (pte, cow) = pte_prot_for(prot, frame);
-    if usermode::with_current_address_space(|uas| {
-        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
-    }) != Some(true)
-    {
-        akuma_pmm::free_page(frame, 0);
-        return None;
-    }
-    Some(PhysFrame::new(frame))
+    install_or_release(va, frame, pte, cow)
 }
 
 /// Service a not-present fault at `addr` from the region table — demand paging.
@@ -1104,7 +1394,7 @@ fn fill_file_pages(
             }
             None => populate_file_page_by_inode(va, prot, file, offset, from_file),
         };
-        if let Some(frame) = filled {
+        if let FilledPage::Mapped(frame) = filled {
             FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
             if share_this {
                 // Two references cover this frame, and both are already in
@@ -1129,7 +1419,11 @@ fn fill_file_pages(
                 akuma_fpcache::insert(file.mount_id, file.inode, offset, frame, true);
             }
         }
-        let ok = filled.is_some();
+        // `Raced` is a success with nothing to publish: the page is present,
+        // but this address space no longer owns the frame, so it must not go
+        // into the shared cache above (that is why the `if let` is on `Mapped`
+        // alone) and it must not be reported as a failure here.
+        let ok = !matches!(filled, FilledPage::Failed);
         if va == page {
             faulting_page_ok = ok;
         }
@@ -1152,19 +1446,28 @@ fn fill_file_pages(
 /// executing from.
 fn map_shared_file_page(va: usize, prot: Prot, frame: PhysFrame) -> bool {
     let (pte, cow) = pte_prot_for(prot, frame.addr);
+    // `(mapped, release, raced)`. `release` says the cache's reference is
+    // surplus and must be given back; `raced` is reported outside the hold.
     let outcome = usermode::with_current_address_space(|uas| {
+        // **A present leaf is never overwritten** — [`install_filled_page`] has
+        // the argument, and it applies here with one extra consequence: this
+        // path arrives holding a *file-page cache* reference, so overwriting
+        // would strand the reference belonging to whatever was mapped before.
+        if uas.pte_prot(va).is_some() {
+            return (true, true, true);
+        }
         // `true` — the caller's reference. `adopt_user_frame` reports it back as
         // *surplus* when this address space already held the frame at another
         // VA, because teardown frees each distinct frame exactly once and a
         // second reference for a second VA would never be balanced.
         let surplus = uas.adopt_user_frame(frame, true);
         if uas.map_page_pte(va, frame.addr, pte, cow) {
-            (true, surplus)
+            (true, surplus, false)
         } else {
             // Nothing was mapped, so this address space is not a mapper: undo
             // the adoption and hand the reference back.
             let _ = uas.remove_user_frame(frame);
-            (false, true)
+            (false, true, false)
         }
     });
     match outcome {
@@ -1174,9 +1477,12 @@ fn map_shared_file_page(va: usize, prot: Prot, frame: PhysFrame) -> bool {
             akuma_pmm::free_page(frame.addr, 0);
             false
         }
-        Some((mapped, release)) => {
+        Some((mapped, release, raced)) => {
             if release {
                 akuma_pmm::free_page(frame.addr, 0);
+            }
+            if raced {
+                note_fault_race(va);
             }
             mapped
         }
@@ -1195,8 +1501,10 @@ fn populate_file_page_by_inode(
     file: FileBacking,
     offset: usize,
     from_file: usize,
-) -> Option<PhysFrame> {
-    let frame = akuma_pmm::alloc_page()?;
+) -> FilledPage {
+    let Some(frame) = akuma_pmm::alloc_page() else {
+        return FilledPage::Failed;
+    };
     // SAFETY: a fresh PMM frame, reached through the physmap, and no other
     // reference to it exists until it is mapped below.
     let page = unsafe {
@@ -1206,22 +1514,31 @@ fn populate_file_page_by_inode(
     // past EOF and of nothing else.
     page.fill(0);
     let want = from_file.min(PAGE_SIZE as usize);
-    if want > 0
-        && crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, &mut page[..want])
-            .is_none()
-    {
-        akuma_pmm::free_page(frame, 0);
-        return None;
+    if want > 0 {
+        match crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, &mut page[..want]) {
+            None => {
+                akuma_pmm::free_page(frame, 0);
+                return FilledPage::Failed;
+            }
+            // **A short read here is never legitimate.** `want` is already
+            // clamped to what the *file* has from this offset
+            // (`FileBacking::filesz` via `page_source`), so unlike the
+            // whole-page reads elsewhere in this module, "past EOF" is not an
+            // explanation: the bytes exist and the filesystem did not hand them
+            // over. The page keeps its zeros for the shortfall and the mapping
+            // silently serves them, which is the `[FILL-SHORT]` failure the
+            // AArch64 kernel tripwires for the same reason
+            // (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §12-§15: it presents as
+            // `rustc` failing to find something in a dependency's metadata, not
+            // as an I/O error). Reported, not made fatal — a `SIGSEGV` here
+            // would replace wrong bytes with a dead build, and the counter is
+            // what says whether it happens at all.
+            Some(got) if got < want => note_fill_short(va, want, got),
+            Some(_) => {}
+        }
     }
     let (pte, cow) = pte_prot_for(prot, frame);
-    if usermode::with_current_address_space(|uas| {
-        uas.map_and_track_pte(va, PhysFrame::new(frame), pte, cow)
-    }) != Some(true)
-    {
-        akuma_pmm::free_page(frame, 0);
-        return None;
-    }
-    Some(PhysFrame::new(frame))
+    install_or_release(va, frame, pte, cow)
 }
 
 /// Demand-page every lazy page covering `[start, start + len)` so a **kernel**
@@ -2081,6 +2398,22 @@ pub fn demand_paging_report(t: &mut Suite) {
     t.note(
         "mmap: pages filled from a file (readahead included)",
         FILE_PAGES_FILLED.load(Ordering::Relaxed),
+    );
+    // The double-fault race [`populate_page`] closes. Noted rather than
+    // `check`ed in either direction: a boot suite is not concurrent enough to
+    // guarantee a hit, and a zero here means "this boot did not race", not
+    // "the guard is unnecessary". On a `cargo -j2` build at `SMP>=2` it is
+    // thousands.
+    t.note(
+        "mmap: demand faults a peer had already served",
+        PAGE_FAULT_RACES.load(Ordering::Relaxed),
+    );
+    // Unlike the race counter above, this one is `check`ed: a short fill is
+    // never legitimate at this call site (see `note_fill_short`), it needs no
+    // concurrency to happen, and the boot suite maps real files.
+    t.check(
+        "mmap: no file page was filled short",
+        FILE_FILL_SHORT.load(Ordering::Relaxed) == 0,
     );
 }
 
