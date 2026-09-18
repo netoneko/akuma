@@ -513,6 +513,19 @@ interrupted. It drives a real `pty.fork()` because `ssh -tt`'s `pty-req` is what
 sets `SPAWN_FLAG_PTY`, and without that the session has no terminal-backed
 channel and the kernel's ISIG branch is unreachable.
 
+**Always `-n 3`, never `-n 1`, and that is not belt-and-braces.** Each trial is
+its own ssh session, and the bug this check exists for
+(`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §16) made the **first session of a
+boot pass and every later one fail** — sessions shared one `TerminalState` and
+the first one left it in raw mode. A single trial after a reboot is the one
+arrangement that cannot see it.
+
+Two job shapes, and they fail differently: `--job sleep` (the default) is one
+long park, `--job tail` is a `tail -f` poll loop. A third verdict, `NO-JOB`,
+means the foreground command exited on its own and the trial scored nothing —
+which is what happens when the file `tail` follows is absent, and what the probe
+used to report as `KILLED`.
+
 **Believe the metal, not QEMU, for anything timed in guest seconds.** This
 target's `uptime_us` is `lapic::ticks() * 10_000`, and under TCG that counter
 runs about **six times wall-clock** — measured 2026-09-11, guest `sleep 10`
@@ -614,7 +627,7 @@ channel instead.
 | pings to `192.168.1.220` time out | `.220` is only the **pre-DHCP fallback**; a lease overrides it. The probe line says the real address |
 | every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. Since 2026-09-06 the kernel also defends itself: `xhci::quiesce_all` clears `BUS_MASTER` on every boot right after the PCI scan, and `xhci::shutdown` runs before the machine reset. Neither can save the boot whose image was *already* corrupted during load, so the power cycle stays the recovery |
 | the box wedges under ssh/apk bursts at SMP=4 — `[BKL] stuck` storm, then `[TLB] stuck: N peer(s) unacked`, then dead to ssh | not a lock bug: a ring-0 page fault inside `akuma_threading_x86_switch_context` kills one core, `fatal()` halts it, and the dead core never acknowledges the next TLB shootdown — the munmap sender then spins forever holding the BKL. `sshd: failed to spawn '/bin/sh'` (exec failing off a degraded transport) is the late-stage signature. Reproduced in QEMU (`SMP=4` + ring-3 churn); `fatal()` now dumps a 64-word stack for symbolization, and the metal's dump stays on the screen to photograph. **See `docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`** |
-| `tail -f <file>` ignores `^C` — the session is stuck until you kill it from another shell | Observed 2026-09-18 on the metal with `tail -f /root/kbuild.log`. **Not the general `^C`-over-ssh path**, which works (see "The `^C`-over-ssh check" above) — it is specifically a reader parked in `tail -f`'s follow loop. Unverified which half is at fault: the signal not being delivered to a task blocked that way, or the blocking syscall not returning `EINTR` so busybox never runs its handler. Workaround: **`kbuild -w`**, which polls the log with `sleep` instead of blocking in a follow loop — that is why the script avoids `tail -f`; or read a bounded `tail -n 40`. To get out of a stuck one, open a second ssh and `kill` the `tail` |
+| `tail -f <file>` ignores `^C` — the session is stuck until you kill it from another shell | **ROOT-CAUSED and FIXED 2026-09-18.** Not `tail`'s follow loop, and not signal delivery (`kill -INT` on a parked `sleep 60` kills it in 1.2 s). Every `sys_spawn` child was handed the **console's shared `TerminalState`** instead of a fresh one, because `register_exec_process` decided "is this the serial console?" from fd 0 alone and spawned children now carry `SharedFdTable::with_stdio()` (fd 0 = `Stdin`, the console's own spelling). `busybox`'s line editor goes raw per prompt and restores the flags it read **at startup**, so session 1 left the shared cell raw and session 2 adopted raw as its baseline — `ISIG` gone for the rest of the boot. That is also why the "`^C`-over-ssh check" above passed: it is run **once**, in the first session after a reboot. Fixed by `console_attached = channel.is_none() && …`; pinned by `session_terminal_is_private_test` in the boot suite. Tell, if it ever comes back: `[ISIG-MISS]` on the console with **no** `[ISIG]` line. `kbuild -w` is no longer needed for this reason (it is still the better way to watch a long build). [`../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) §16 |
 | a "disarmed" GRUB entry still drove the USB controller | until 2026-09-06 the xHCI self-test was gated only on the controller being *present*, so dropping `root=/dev/sda1` stopped the kernel mounting the disk but not bringing the controller up. There was no way to boot that kernel without driving it. **Fixed** — the bring-up now needs `usb` or `root=/dev/sda1` on the command line, and says so in the verdict when it skips |
 
 ## The spare disk (persistence — USB/xHCI, working)

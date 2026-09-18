@@ -1814,7 +1814,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         exist.
         docs: RUST_TOOLCHAIN_AMD64.md § session 5
    ▼
- [09-13] ═══ YOU ARE HERE ═══ THE KERNEL BUILT ITSELF
+ [09-13] ═══ MILESTONE ═══ THE KERNEL BUILT ITSELF
    │
    ├──► **Akuma/amd64 compiled its own kernel, inside itself**, under
    │   Firecracker on the trashcan:
@@ -1867,7 +1867,93 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         the box's own Linux builds the same 94-crate graph single-job in
         **1 m 09 s** — the guest is ~30-50x slower. That gap is the next
         thing worth attacking, and it is **no longer the idle spin**.
+        [**corrected 09-18:** those two numbers divide to **6.9x**, not
+        30-50x. The 30-50x belongs to the single-crate `akuma-exec`
+        anchor, not to the whole graph.]
         code: `amd64/src/loader.rs` § `MAX_ARGV` / `MAX_ENVP`
+   ▼
+ [09-14 … 09-16] ═══ THE BREAK ═══ THREE DAYS, NO COMMITS
+   │
+   └──► `e30fda99` ("bump version to 0.0.8", 09-13 22:24) is the last
+        commit of the milestone, and the next one is `8d4306fb`
+        ("more syscall work for amd64") at **09-17 01:09** — a **75-hour
+        gap**. Recorded because the timeline above otherwise reads as one
+        continuous push, and the shape of what follows depends on it:
+        the work resumed on a *branch*, against a milestone that had had
+        time to settle.
+   ▼
+ [09-17 → 09-18] ═══ branch `amd64-cleanup-and-improvements` ═══ 40 COMMITS IN 40 h
+   │
+   ├──► **Night 1 (09-17 01:09 → 05:33)** — syscalls and containers, the
+   │   surface a real build needs: `ddda5c01` "more syscalls" (which is
+   │   where `PIDFD_SEND_SIGNAL` entered the tree, and which §15 later
+   │   watched a stale guest image fail to see), containers, and the
+   │   `smpstress` probe.
+   │
+   ├──► **Day (09-17 11:25 → 18:36)** — profiling. The worktree
+   │   `profiling/amd64-build-slow` ran its own investigation and came
+   │   back as merge `e5ba8298`; that is
+   │   `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §1-§4.
+   │
+   ├──► **Night 2 (09-17 19:39 → 09-18 04:14)** — the clock calibration
+   │   (`ab460fd5`, `ea7abc5f`) and then **seven consecutive `mmap`
+   │   commits**. That run is §5-§9: `find_free_va` was O(n²), then
+   │   sorted 4 400 regions on every call (74 % of `rustc`), then walked
+   │   the list four more ways. `zerocopy`: *never finished* → 63 s →
+   │   15.1 s.
+   │
+   ├──► **Day 2 (09-18 10:33 → 17:33)** — "more smp fixes", four
+   │   commits, and they are the ones that made parallelism exist:
+   │   §13's futex `EINTR` hole (600 s of silence became a 2 s error),
+   │   §14's demand-fault race (**two cores installing two frames over
+   │   one page** — one event per build, and it was `rustc`'s heap),
+   │   §16's session terminal state, and §18's pipe ceiling.
+   │
+   └──► The shape: the break sits exactly between "it built itself once,
+        single-job, in 7 m 53 s" and "it builds itself at `-j8` in
+        2 m 44 s". Nothing in the second half is new capability — it is
+        all *correctness under concurrency* plus three ceilings.
+   ▼
+ [09-18] ═══ YOU ARE HERE ═══ IT BUILDS ITSELF IN PARALLEL, TO A FIXED POINT
+   │
+   ├──► **Parallel.** Clean 137-crate kernel build in the guest:
+   │   `-j1` 226.5 s, `-j4` ~178 s, **`-j8` ~164 s** (4 vCPU). Five
+   │   consecutive green `-j4` runs; `-j8` needed `MAX_PIPES` 64 → 256.
+   │   Per crate this is **5.03 s → 1.19 s, −76 %** against 09-13.
+   │
+   ├──► **To a fixed point.** The guest-built kernel boots (768 passed /
+   │   0 failed at 4 vCPU) and the kernel *it* builds is **byte-identical
+   │   to itself** (md5 `22c696a9…`). That is the check that separates
+   │   "the build runs" from "the build is right".
+   │
+   └──► **Still the guest.** Every number above is Firecracker on the
+        trashcan's Ubuntu personality. The metal has not built a kernel
+        since §11's `nosmp` run (95 crates, **22 m 54 s** — 6.2x the
+        guest, and it is the USB root, not the CPU).
+   ▼
+ [NEXT] ═══ COMPLETE SELF-HOSTING ═══ BUILD ON THE METAL, REBOOT INTO IT
+   │
+   ├──► The loop to close, with no Ubuntu in it: **boot Akuma on the
+   │   metal → build the kernel there → install it → `reboot(2)` →
+   │   come back up on the kernel you just built → build it again and
+   │   compare.** AArch64 has this (`KERNEL_DROPOFF`, raw block fd +
+   │   `reboot(2)`, `selfhost-kernel-build.md` § "Swap the running
+   │   kernel in place"); amd64 has no equivalent — installing a kernel
+   │   still means GRUB, arranged from Ubuntu.
+   │
+   ├──► **Known to be in the way**, each already characterised:
+   │   the USB root at 14.5 s/crate (storage, §11 D); `rust-lld`'s
+   │   default thread pool, worked around with `--threads=1` in rig
+   │   state and **untested since the fault-race fix**; SMP=4 on the
+   │   metal, where §11 last saw `rustc` dereference a pointer
+   │   overwritten with ASCII; and the fact that an Akuma that cannot
+   │   spawn `/bin/sh` or does not hold your key has no way back except
+   │   a power cycle.
+   │
+   └──► The bar is the same one this box just cleared in the guest, on
+        the metal instead: a **fixed point** — gen-2 byte-identical to
+        gen-1 — reached without the Ubuntu personality touching the
+        kernel in between.
 
 ```
 
