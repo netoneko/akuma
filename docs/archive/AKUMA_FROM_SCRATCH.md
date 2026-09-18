@@ -84,6 +84,38 @@ Each of these is a *test*, not an assumption. None has been run.
    > So this step's real lesson is the diagnostic, not the fallback list:
    > **`nslookup` working proves nothing about whether `git` can resolve.**
    > The CA-bundle row above is still untested — it simply never got reached.
+   >
+   > **2026-09-18, later: the symptom came back, and it is a THIRD cause.**
+   > Same three processes, same 0:00 CPU. The DNS fix is not regressed — it is
+   > verified working on the kernel that shows this: `/root/probes/resprobe2`
+   > passes every connected-UDP step (errno=0 throughout), and `git`'s **own
+   > helper**, driven by hand, does the entire job in under 8 s —
+   > `printf 'capabilities\nlist\n' | GIT_CURL_VERBOSE=1
+   > /usr/libexec/git-core/git-remote-https origin <url>` resolves github.com,
+   > connects to 20.217.135.5:443, completes a TLS 1.3 handshake and returns
+   > response headers.
+   >
+   > What hangs is `git` ↔ helper. Under `GIT_TRACE=1` the trace stops dead at
+   > `start_command: git-remote-https` and `GIT_CURL_VERBOSE=1` yields **zero**
+   > curl lines, with no outbound socket for the whole hang — the helper is
+   > started and never receives its command. Both sides sit `State: R` at 0:00,
+   > i.e. runnable-and-idle, not `D`.
+   >
+   > Ruled out with numbers rather than reasoning: pipe exhaustion
+   > (`[PIPES] live=4 high=16 refused=0 cap=256` in the idle report) and a
+   > general fork/exec wedge (`( ls; ls )` grandchildren and `git --version`
+   > both fine). Candidate to test first: the lost-wakeup mechanism the runbook's
+   > OPEN "ssh needs one extra event" entry lists — a pipe reader never woken by
+   > the first write deadlocks exactly like this.
+   >
+   > **So this row's lesson has a second half: the 0:00-across-three-processes
+   > signature now has three distinct causes** (a hung resolver, the SMP wedge,
+   > and this), and it discriminates none of them. Drive the helper by hand
+   > before blaming the network — it separates all three in one command.
+   > Caveat on the evidence: the box had ~10 stuck git processes that `kill -9`
+   > would not clear when this was narrowed, so re-run it on a fresh boot.
+   > Why those processes never went away:
+   > [`AKUMA_AMD64_NO_SLOT_RECYCLER.md`](AKUMA_AMD64_NO_SLOT_RECYCLER.md) §3.1.
 2. **Submodule size — measured, and it is a non-issue.** The received wisdom is
    "the vendored submodules are ~37 GB, never copy the tree". The *rule* is right
    for the wrong reason, and the number is wrong. Measured 2026-09-18:

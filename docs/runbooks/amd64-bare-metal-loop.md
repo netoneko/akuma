@@ -7,6 +7,37 @@ The HP 500-502nj ("the trashcan", "the dumpster", "vaporwave") is one box that
 boots two systems. This is how to change kernel code and see the result on real
 silicon, from a laptop, with no keyboard and no photographs.
 
+## Before you debug anything here: **grep `docs/archive/` first**
+
+This target is a *port*, so most of what breaks on it has already broken once on
+AArch64 and been written up. Searching the archive is not the thorough option,
+it is the **cheap** one — and skipping it has cost real time more than once,
+including twice on 2026-09-18 alone.
+
+```sh
+ls docs/archive | grep -i <subsystem>        # git, pipe, socket, tls, futex, cow …
+grep -rln -i "<the exact symptom string>" docs/archive
+```
+
+Two things make this worth doing *before* forming a theory:
+
+- **The symptom usually already has a name, and often more than one cause.**
+  `git clone` hanging with three processes at 0:00 CPU is written up in
+  `AKUMA_FROM_SCRATCH.md` §3.1 — which by now lists **three** distinct causes for
+  that one signature and a one-command test that separates them. Re-deriving
+  that from scratch took an hour; reading it takes two minutes.
+- **A prior fix may be real *and* the bug still present**, because the fix landed
+  in AArch64-only code. That is this target's characteristic failure, not a rare
+  one: the `[SWITCH FREED-CR3]` use-after-free was a gate whose second arm was
+  registered by a function amd64 never calls
+  (`AKUMA_AMD64_SWITCH_FREED_CR3_UAF.md`). So when the archive says "fixed",
+  the next question is **"fixed where?"** — check whether the code is in a shared
+  crate or behind `akuma-kernel-glue` / `akuma_vfs_glue::fs::init`, neither of
+  which amd64 goes through.
+
+`docs/README.md`'s symptom matrix is the index; its amd64 rows are near the top.
+
+
 ## The two personalities
 
 | | address | how to reach it |
