@@ -225,39 +225,53 @@ impl SharedFdTable {
         loop {
             let entry = with_irqs_disabled(|| self.table.lock().pop_first());
             let Some((fd_num, fd)) = entry else { break };
-            match fd {
-                FileDescriptor::File(f) => {
-                    (runtime().flock_release)(&f.path, holder, fd_num);
-                }
-                FileDescriptor::Socket(idx) => {
-                    (runtime().remove_socket)(idx);
-                }
-                FileDescriptor::ChildStdout(child_pid) => {
-                    remove_child_channel(child_pid);
-                }
-                FileDescriptor::PipeWrite(pipe_id) => {
-                    (runtime().pipe_close_write)(pipe_id);
-                }
-                FileDescriptor::PipeRead(pipe_id) => {
-                    (runtime().pipe_close_read)(pipe_id);
-                }
-                FileDescriptor::UnixSocket { rx, tx, sock } => {
-                    (runtime().pipe_close_read)(rx);
-                    (runtime().pipe_close_write)(tx);
-                    (runtime().unix_sock_close)(sock);
-                }
-                FileDescriptor::EventFd(efd_id) => {
-                    (runtime().eventfd_close)(efd_id);
-                }
-                FileDescriptor::EpollFd(epoll_id) => {
-                    (runtime().epoll_destroy)(epoll_id);
-                }
-                FileDescriptor::PidFd(pidfd_id) => {
-                    (runtime().pidfd_close)(pidfd_id);
-                }
-                _ => {}
-            }
+            release_fd_entry(fd_num, fd, holder);
         }
+    }
+}
+
+/// Drop the one reference `fd_num` held, by variant.
+///
+/// Factored out of [`SharedFdTable::close_all`] so the **exec close-on-exec
+/// sweep** can release through the same list rather than a second copy of it.
+/// A second copy is exactly how this went wrong once already: the AArch64
+/// execve in `akuma-syscalls-glue` spells its own arms inline, and the amd64
+/// execve — which had no sweep at all — could not borrow them.
+///
+/// `holder` identifies the fd table for `flock_release`; pass the
+/// `&SharedFdTable` as `*const _ as usize`, which is what `close_all` does.
+pub fn release_fd_entry(fd_num: u32, fd: FileDescriptor, holder: usize) {
+    match fd {
+        FileDescriptor::File(f) => {
+            (runtime().flock_release)(&f.path, holder, fd_num);
+        }
+        FileDescriptor::Socket(idx) => {
+            (runtime().remove_socket)(idx);
+        }
+        FileDescriptor::ChildStdout(child_pid) => {
+            remove_child_channel(child_pid);
+        }
+        FileDescriptor::PipeWrite(pipe_id) => {
+            (runtime().pipe_close_write)(pipe_id);
+        }
+        FileDescriptor::PipeRead(pipe_id) => {
+            (runtime().pipe_close_read)(pipe_id);
+        }
+        FileDescriptor::UnixSocket { rx, tx, sock } => {
+            (runtime().pipe_close_read)(rx);
+            (runtime().pipe_close_write)(tx);
+            (runtime().unix_sock_close)(sock);
+        }
+        FileDescriptor::EventFd(efd_id) => {
+            (runtime().eventfd_close)(efd_id);
+        }
+        FileDescriptor::EpollFd(epoll_id) => {
+            (runtime().epoll_destroy)(epoll_id);
+        }
+        FileDescriptor::PidFd(pidfd_id) => {
+            (runtime().pidfd_close)(pidfd_id);
+        }
+        _ => {}
     }
 }
 
@@ -385,6 +399,29 @@ impl Process {
             self.fds.cloexec.lock().clear();
             closed
         })
+    }
+
+    /// Close every close-on-exec descriptor **and drop the references they
+    /// held** — the whole of what POSIX `execve` owes its fd table.
+    ///
+    /// [`Self::close_cloexec_fds`] only removes the *names*; the caller is then
+    /// obliged to release each entry, and a caller that forgets leaks one
+    /// reference per fd. That is not a hypothetical: the amd64 `execve` had no
+    /// sweep at all, so a child's `FD_CLOEXEC` pipe write end survived the exec
+    /// and its reader never saw EOF. `git` hangs on exactly that — it closes
+    /// the parent's end of `start_command`'s notify pipe and blocks in
+    /// `read()`, waiting for the EOF that a successful exec is supposed to
+    /// produce. See `docs/archive/AMD64_TRASHCAN_ISSUES.md` §1.
+    ///
+    /// Call this at the POSIX point of no return — **after** the image is
+    /// committed, never before: a failed `execve` must leave the fd table
+    /// untouched, or a libstd fork+exec child loses the very pipe it would
+    /// report the failure on.
+    pub fn close_cloexec_fds_releasing(&self) {
+        let holder = Arc::as_ptr(&self.fds) as usize;
+        for (fd_num, entry) in self.close_cloexec_fds() {
+            release_fd_entry(fd_num, entry, holder);
+        }
     }
 
     /// Get a reference to the shared fd table (for direct access in sys_close_range, etc.)

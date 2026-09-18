@@ -126,6 +126,23 @@ fn note_live(n: usize) {
 }
 
 /// `[PIPES] live=N high=N refused=N cap=N` — one line, no allocation.
+///
+/// Followed by [`glue::pipe::pipe_dump`]'s per-pipe breakdown, which this target
+/// had never called: the only call sites were in `akuma-kernel-glue`, which is
+/// the **AArch64** glue, so the one diagnostic that separates the two causes of
+/// a parked reader was unreachable here. The summary line cannot do it — a
+/// `live=5` is the same number whether the readers are starved or exonerated.
+///
+/// What it decides, from `pipe_dump`'s own header:
+///
+/// * `bytes>0` with a parked reader => a genuine **lost wakeup** in the kernel.
+/// * `bytes=0`, reader parked, `writers>0` => the kernel is behaving; nobody
+///   wrote.
+/// * `bytes=0`, reader parked, **`writers=0`** => the reader is at EOF and the
+///   writer reference was dropped while a live process still holds that end —
+///   which is the `git clone` hang of `AMD64_TRASHCAN_ISSUES.md` §1, where a
+///   helper's stdin reported EOF immediately with `git` still holding the write
+///   end open.
 pub fn report() {
     akuma_primitives::safe_print!(
         96,
@@ -135,6 +152,7 @@ pub fn report() {
         PIPE_REFUSALS.load(core::sync::atomic::Ordering::Relaxed),
         MAX_PIPES,
     );
+    glue::pipe_dump();
 }
 
 /// `true` once [`MAX_PIPES`] are live.

@@ -53,69 +53,18 @@ the other.
 Each of these is a *test*, not an assumption. None has been run.
 
 1. **`git clone` over HTTPS from inside Akuma.** `git` 2.54.0 is installed on the
-   metal and works locally.
+   metal and works locally. The clone must fetch this repo and its submodules
+   without an Ubuntu round trip — everything below depends on it.
 
-   **First attempt, 2026-09-18: hung — no DNS.** `git clone --depth=1
-   https://github.com/netoneko/akuma.git` sat with three processes
-   (`git clone`, `git remote-https`, `git-remote-https`) at **0:00 CPU across
-   12 s**. That signature is worth knowing because it is *blocked on I/O*, not
-   the SMP wedge — which also shows 0:00 but with `cargo`/`rustc` and after real
-   work. A hung resolver looks exactly like a stuck clone.
+   **Status: DONE 2026-09-19.** `git clone --depth=1` of this repo completes in
+   the Firecracker guest in ~21 s — 1617 files checked out, `git status` clean,
+   HEAD at the `v0.0.8` tag. A small-repo clone takes 6.4 s and `ls-remote`
+   1.2 s.
 
-   The bare-metal root needs the same two things the `box` rootfs needed for DNS
-   and HTTPS, and they are separate failures:
-
-   | missing | symptom |
-   |---|---|
-   | `/etc/resolv.conf` | clone **hangs** at 0:00 CPU, no error |
-   | CA bundle (`ca-certificates.crt`) | clone **fails with a TLS error** — git verifies github's certificate in its own stack |
-
-   Stage both on sdb1 before concluding anything about git's TLS support.
-
-   > **ROOT-CAUSED and FIXED the same day, and it was not TLS — it was the
-   > kernel.** `/etc/resolv.conf` was present and correct the whole time, and
-   > `nslookup github.com` resolved fine. `curl` and `git` use **c-ares**, which
-   > `connect()`s its UDP socket where musl's resolver does not, and three
-   > syscalls on that connected path were wrong: `send()` answered `EBADF`
-   > (a null `sendto` destination fell into the TCP path) and
-   > `getsockname`/`getpeername` answered `ENOSYS`. Full account:
-   > [`AKUMA_AMD64_DNS_CONNECTED_UDP.md`](AKUMA_AMD64_DNS_CONNECTED_UDP.md).
-   >
-   > So this step's real lesson is the diagnostic, not the fallback list:
-   > **`nslookup` working proves nothing about whether `git` can resolve.**
-   > The CA-bundle row above is still untested — it simply never got reached.
-   >
-   > **2026-09-18, later: the symptom came back, and it is a THIRD cause.**
-   > Same three processes, same 0:00 CPU. The DNS fix is not regressed — it is
-   > verified working on the kernel that shows this: `/root/probes/resprobe2`
-   > passes every connected-UDP step (errno=0 throughout), and `git`'s **own
-   > helper**, driven by hand, does the entire job in under 8 s —
-   > `printf 'capabilities\nlist\n' | GIT_CURL_VERBOSE=1
-   > /usr/libexec/git-core/git-remote-https origin <url>` resolves github.com,
-   > connects to 20.217.135.5:443, completes a TLS 1.3 handshake and returns
-   > response headers.
-   >
-   > What hangs is `git` ↔ helper. Under `GIT_TRACE=1` the trace stops dead at
-   > `start_command: git-remote-https` and `GIT_CURL_VERBOSE=1` yields **zero**
-   > curl lines, with no outbound socket for the whole hang — the helper is
-   > started and never receives its command. Both sides sit `State: R` at 0:00,
-   > i.e. runnable-and-idle, not `D`.
-   >
-   > Ruled out with numbers rather than reasoning: pipe exhaustion
-   > (`[PIPES] live=4 high=16 refused=0 cap=256` in the idle report) and a
-   > general fork/exec wedge (`( ls; ls )` grandchildren and `git --version`
-   > both fine). Candidate to test first: the lost-wakeup mechanism the runbook's
-   > OPEN "ssh needs one extra event" entry lists — a pipe reader never woken by
-   > the first write deadlocks exactly like this.
-   >
-   > **So this row's lesson has a second half: the 0:00-across-three-processes
-   > signature now has three distinct causes** (a hung resolver, the SMP wedge,
-   > and this), and it discriminates none of them. Drive the helper by hand
-   > before blaming the network — it separates all three in one command.
-   > Caveat on the evidence: the box had ~10 stuck git processes that `kill -9`
-   > would not clear when this was narrowed, so re-run it on a fresh boot.
-   > Why those processes never went away:
-   > [`AKUMA_AMD64_NO_SLOT_RECYCLER.md`](AKUMA_AMD64_NO_SLOT_RECYCLER.md) §3.1.
+   It took four passes to get here because one symptom had four causes. The last
+   was `execve` not closing `FD_CLOEXEC` descriptors on amd64, which hung `git`
+   on the EOF its `start_command` notify pipe was supposed to produce. History
+   and evidence: [`AMD64_TRASHCAN_ISSUES.md`](AMD64_TRASHCAN_ISSUES.md) §1.
 2. **Submodule size — measured, and it is a non-issue.** The received wisdom is
    "the vendored submodules are ~37 GB, never copy the tree". The *rule* is right
    for the wrong reason, and the number is wrong. Measured 2026-09-18:

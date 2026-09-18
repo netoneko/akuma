@@ -4605,6 +4605,30 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
     // opens. `/proc/<pid>/exe` reports it.
     proc.image.lock().name = new_name;
 
+    // Image replacement committed — *now* close the close-on-exec descriptors.
+    // POSIX's point of no return: a successful `execve` closes every
+    // `FD_CLOEXEC` fd, and a failed one (every `return errno::*` above) leaves
+    // them untouched, which is why this sits after the install rather than
+    // before it.
+    //
+    // **This target had no sweep at all**, and the cost was not a leak — it was
+    // a hang. `git`'s `start_command` creates a notify pipe whose write end is
+    // `FD_CLOEXEC`, forks, closes the parent's copy of that end, and then
+    // *blocks in `read()`* on the read end: a successful exec closes the
+    // child's copy, the pipe runs out of writers, and the read returns EOF,
+    // which is how the parent learns the exec worked. With the write end
+    // surviving the exec there is no EOF, so `git` never returns from that read
+    // and never sends `capabilities` to the helper it just started — both sides
+    // parked, the helper on a stdin nobody will write.
+    //
+    // Traced 2026-09-18: `nr=3 a1=0x8` (close 8) then `nr=0 a1=0x7` (read 7),
+    // never returning, with the per-pipe dump showing `bytes=0 writers>0` on
+    // every live pipe. The AArch64 kernel has done this since its own
+    // `execve` was written (`akuma-syscalls-glue`'s `sys_execve`); the sweep is
+    // shared code and this call site is what was missing.
+    // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §1.
+    proc.close_cloexec_fds_releasing();
+
     // A new program in an existing slot starts with a clean group: a stale
     // `exit_group` flag from the image just replaced would kill its first
     // thread at its first syscall.
