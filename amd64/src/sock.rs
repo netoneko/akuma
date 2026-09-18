@@ -32,7 +32,31 @@ use crate::fd::{self, errno};
 /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
 const SOCK_TYPE_MASK: u64 = 0xf;
 
+/// `SOCK_NONBLOCK` / `SOCK_CLOEXEC`, the two flag bits `type` carries above
+/// [`SOCK_TYPE_MASK`]. asm-generic values, identical on both architectures.
+const SOCK_NONBLOCK: u64 = 0o4000; // 0x800
+const SOCK_CLOEXEC: u64 = 0o2000000; // 0x80000
+
 /// `socket(domain, type, protocol)`.
+///
+/// **The flag bits in `type` are applied, not merely masked off.** They were
+/// parsed away by [`SOCK_TYPE_MASK`] and dropped until 2026-09-18, which made
+/// every socket blocking however it was asked for — and that is not a cosmetic
+/// divergence from Linux, it is why **DNS did not work for anything linked
+/// against musl** on this target.
+///
+/// musl's resolver (`__res_msend`) opens its UDP socket with
+/// `SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC`, sends to each nameserver, and then
+/// relies on the socket being non-blocking. Handed a blocking one it parks in
+/// `recvfrom` forever, so `git clone` and `curl` hung or reported "could not
+/// contact DNS servers" — while busybox `nslookup`, which builds its own query
+/// and does not use the libc resolver, resolved the same name perfectly. That
+/// split is the diagnostic: **`nslookup` working while `curl` does not means the
+/// resolver path, not the network.**
+///
+/// The AArch64 side has applied both flags since it was written
+/// (`akuma_syscalls_glue::net::sys_socket`); this is the same code, and the
+/// setters are the shared `Process` ones, so the two cannot drift again.
 pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
     if domain != AF_INET as u64 {
         // AF_UNIX would be `akuma-net-unix`, which is a separate crate and a
@@ -51,6 +75,16 @@ pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
         akuma_net::socket::remove_socket(idx);
         return errno::EMFILE;
     };
+    // Both sets are keyed by fd number and read back through `fd::cur_table`;
+    // `Process` owns the store so `fcntl` and this agree by construction.
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
+        if ty & SOCK_CLOEXEC != 0 {
+            proc.set_cloexec(fd as u32);
+        }
+        if ty & SOCK_NONBLOCK != 0 {
+            proc.set_nonblock(fd as u32);
+        }
+    }
     fd
 }
 
@@ -471,6 +505,21 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     // A bad family must be refused rather than treated as IPv4.
     t.check_eq("sock: a non-AF_INET family is refused", sys_socket(10, 1, 0), errno::EAFNOSUPPORT);
     t.check_eq("sock: a bad socket type is EINVAL", sys_socket(AF_INET as u64, 99, 0), errno::EINVAL);
+
+    // `SOCK_NONBLOCK`/`SOCK_CLOEXEC` must be APPLIED, not just masked off the
+    // type. Dropping them made every socket blocking, which is what stopped
+    // musl's resolver working (see `sys_socket`) — DNS failed for `curl` and
+    // `git` while busybox `nslookup` succeeded, because only the libc resolver
+    // asks for a non-blocking socket. A plain socket must NOT come back marked,
+    // or this would pass on a kernel that marks everything.
+    let plain = sys_socket(AF_INET as u64, SOCK_DGRAM as u64, 0);
+    if plain < 0x8000_0000 {
+        t.check("sock: a plain socket is not O_NONBLOCK", !fd::is_nonblocking(plain));
+    }
+    let nb = sys_socket(AF_INET as u64, SOCK_DGRAM as u64 | SOCK_NONBLOCK, 0);
+    if t.check("sock: SOCK_NONBLOCK socket() returns a descriptor", nb < 0x8000_0000) {
+        t.check("sock: SOCK_NONBLOCK is applied to the fd", fd::is_nonblocking(nb));
+    }
 
     // bind to a port, then listen. The sockaddr goes through the same
     // user-memory path a real caller uses, byte order included.

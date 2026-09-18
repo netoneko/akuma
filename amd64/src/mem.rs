@@ -59,12 +59,15 @@ pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 /// `akuma_kernel_glue::compute_heap_size` is `(ram/8).clamp(64 MB, 256 MB)`, and
 /// 256 MB is *smaller* than this target's existing 512 MB — so adopting it would
 /// be a regression, not a unification. The reason the two differ is real:
-/// `amd64/src/fd.rs` caches **every open file's entire contents** in a heap
-/// `Vec` (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`), so `execve` of `rust-lld`
-/// costs 158 MB of heap, and `Vec` doubling makes the transient peak ~3x the
-/// file. AArch64 has no equivalent demand on its heap. When that proposal lands
-/// and files stop living in the heap, this whole rule should go away rather than
-/// be retuned.
+/// this target's `execve` reads the **whole image** into the kernel heap
+/// (`usermode.rs`'s `read_image`), so exec'ing `rust-lld` — 158 MB — costs that
+/// much heap in one allocation. AArch64 has no equivalent demand on its heap.
+///
+/// (Ordinary `read`/`write` no longer do this: `fd.rs` stopped caching file
+/// contents in C2 slice 5 and now streams in `MAX_IO` chunks. Note
+/// `proposals/AMD64_FD_WHOLE_FILE_HEAP.md` still says "Status: open" and is
+/// stale on that point — `execve` is the remaining whole-file consumer, and it
+/// is the one that sets this floor.)
 ///
 /// # Why a step and not a fraction
 ///

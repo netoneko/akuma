@@ -223,7 +223,38 @@ across it fails for a reason that is not a bug.
 
 ---
 
-## 4. The result
+## 4. The result — the fixed point, on the metal
+
+**Generation 3 is byte-identical to generation 2**, built inside it, on the
+machine, with no hypervisor and no Ubuntu in the cycle:
+
+```
+cmp  /root/ktarget/.../out/akuma_amd64  /boot/akuma-amd64   →  IDENTICAL
+     3 397 936 bytes,  md5 a40756211f4bd9c63f34d7be1ac679c7,  both
+built by: Akuma akuma 0.0.8 unknown-release-smp-shared x86_64
+```
+
+| generation | md5 | built by | wall |
+|---|---|---|---|
+| gen-1 | `6dd8ba18…` | the old 512 MiB-heap kernel | 1398 s, link failed (hand-relinked) |
+| bootstrap | `bb0add8a…` | laptop cross-build, carries §5's heap fix | — |
+| **gen-2** | `a4075621…` | the bootstrap, on the metal | **640 s** |
+| **gen-3** | **`a4075621…`** | **gen-2, on the metal** | **632 s** |
+
+**Two checks that stop this being a false positive**, because comparing a file
+to itself is the easy way to fake this result:
+
+- `cmp`, not just `md5sum` — byte-for-byte.
+- `kbuild -c` **wipes `/root/ktarget`** before building, so gen-2's artifact
+  cannot have survived at the path gen-3 was read from. The 632 s from-scratch
+  time for 95 crates corroborates it; an incremental no-op build takes seconds.
+
+The harness reported `LINK rc=1` on that run and it is **not** a failure: the
+build succeeded outright (`DONE rc=0 crates=95`), so there was no `rust-lld`
+crash dump to replay and the script's unconditional relink step found an empty
+argument file. Worth knowing before reading the logs.
+
+### The earlier result, kept because it is the one that proved the loop
 
 Gen-1, built on the metal at SMP=4 and installed from inside Akuma:
 
