@@ -42,7 +42,8 @@ Start from the symptom or task on the left.
 | Debugging SSH latency / echo / terminal sizing | [`debug-ssh-latency.md`](debug-ssh-latency.md) |
 | Self-hosting (compiling the kernel inside Akuma) — **AArch64** | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
 | Self-hosting on **amd64** (Firecracker guest on the HP box) | [`selfhost-kernel-build-amd64.md`](selfhost-kernel-build-amd64.md) — the one-command gate, the image-drift step that fakes a compile error, timings (`-j8` ~164 s, the fastest cell), and the fixed-point check |
-| Swapping the running kernel for a freshly built one without touching the host (`KERNEL_DROPOFF` + raw block fd + `reboot(2)`) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) § "Swap the running kernel in place" |
+| Self-hosting on **amd64 bare metal** (the HP box itself, no hypervisor) | [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) § "Self-hosting on the metal" — GRUB reads the kernel off Akuma's **own ext2 root**, so installing one is a `cp`; plus why `reboot -f` no longer returns you to Ubuntu |
+| Swapping the running kernel for a freshly built one without touching the host (`KERNEL_DROPOFF` + raw block fd + `reboot(2)`) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) § "Swap the running kernel in place" — **AArch64 only**; the amd64 equivalent needs none of that machinery (row above) |
 | Running a Docker image with `box run` | [`run-docker-image.md`](run-docker-image.md) |
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |

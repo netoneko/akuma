@@ -1647,8 +1647,11 @@ or the toolchain.
 | Firecracker, SMP=1, image on the internal SSD | **3 m 43 s** |
 | bare metal, `nosmp`, root on the USB disk | **22 m 54 s** |
 
-**6.2x, and it is almost certainly storage, not the CPU** — it is the same
-physical machine. The Firecracker guest reads its root through a file on
+**6.2x** — on the same physical machine. (**Corrected 2026-09-18:** "almost
+certainly storage" was the guess here and it measured wrong — the device is only
+1.4–2.3x; the rest is the 128 MB ext2 block cache. The last sentence of this
+paragraph anticipated the right experiment; `AKUMA_AMD64_BARE_METAL_SELFHOST.md`
+§2 ran it.) The Firecracker guest reads its root through a file on
 Ubuntu's ext4/SSD, so the *host's* page cache sits in front of every block; the
 metal reads a USB disk with nothing in front of it but this kernel's own 128 MB
 ext2 block cache. Worth confirming before optimising anything on the metal: an
@@ -2978,11 +2981,20 @@ wait for a kernel*. The honest kernel-to-kernel comparison is the `-j1` row.)
 | Firecracker guest, `-j1`, image on the internal SSD (09-18) | 95 | 223 s | 2.35 |
 | bare metal, `nosmp`, root on the USB disk (§11, 09-18) | 95 | **1 374 s** | **14.5** |
 
-**6.2x, on the same physical machine**, and it is storage rather than the
-kernel: the guest reads its root through a file on Ubuntu's ext4/SSD, so the
-host page cache sits in front of every block, while the metal reads a USB disk
-with nothing in front of it but this kernel's own ext2 block cache. Untested
-since §14 — every number in A, B and C is the guest.
+**6.2x, on the same physical machine.** Untested since §14 — every number in A,
+B and C is the guest.
+
+> **Corrected 2026-09-18 by `AKUMA_AMD64_BARE_METAL_SELFHOST.md` §2.** This
+> paragraph read "it is storage rather than the kernel", and that attribution is
+> wrong as stated. Measured directly with `dd` and `O_DIRECT`, the USB root is
+> **1.4–1.5x** the internal disk sequentially and **2.3x** on 4 KiB random — so
+> the *device* accounts for at most 2.3x of the 6.2x. The rest is **cache
+> residency**, which is the same mechanism named below but is a tunable rather
+> than a hardware limit: Ubuntu's page cache fronts the guest's root image with
+> gigabytes, while the metal had only Akuma's own ext2 block cache — pinned at
+> **128 MB** by the `HEAP_SIZE/4` term of
+> `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)` on a 16 GiB machine. Do not
+> optimise the disk on the strength of the 6.2x; the headroom is in the cache.
 
 #### What each era was actually limited by
 

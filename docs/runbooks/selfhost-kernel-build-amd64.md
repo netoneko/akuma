@@ -164,3 +164,9 @@ Measured 2026-09-18: generation 2 is byte-identical to generation 1
 - [`../archive/AKUMA_SELF_HOSTING_AMD64.md`](../archive/AKUMA_SELF_HOSTING_AMD64.md) — the bring-up order that reached the first in-guest build.
 - [`stage-rust-toolchain-amd64.md`](stage-rust-toolchain-amd64.md) — putting the toolchain in the image in the first place.
 - [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the same box, booted as Akuma instead of Ubuntu.
+- [`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md)
+  — **the same loop without the hypervisor.** Read it before assuming this page's
+  numbers transfer: the metal builds at `-j1` because `-j4` still SIGSEGVs there
+  (this guest has been green at `-j4` since §14), the link needs
+  `--threads=1` that this guest has never needed, and installing a kernel is a
+  `cp` onto Akuma's own ext2 root rather than anything image-shaped.

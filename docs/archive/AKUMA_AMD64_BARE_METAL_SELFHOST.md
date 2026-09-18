@@ -113,6 +113,24 @@ reproduce where §11's equivalent cost a 23-minute build. §14's fix took the
 Firecracker guest from "dies in 2.0 s at 2 vCPU × 2 jobs" to a green `-j4` fixed
 point; **the metal is still not green**, on identical source.
 
+**Do not read that as "the guest is immune."** Count what the guest's evidence
+actually is: §19 and §17 record roughly **ten** clean full builds (`-j1` ×1,
+`-j2` ×1, `-j4` ×5, `-j8` ×2, plus §17's generation 2) and **zero** failures.
+Ten clean runs bound the guest's per-build failure rate at something under ~10%
+— they cannot establish zero. The metal's rate is **3 failures in 4 builds**.
+
+So the defensible statement is *one bug whose window is far easier to hit on the
+metal*, not a metal-only defect. The mechanism that would explain a gap this
+size: Firecracker's 4 vCPUs are host **threads** on a 4-core box that is also
+running Ubuntu, so they are often not executing at the same instant, while the
+metal's 4 cores genuinely are — every time. A race with a tight window is hit far
+more often under real parallelism, which is also why §11 met it on the metal
+first and why §14's fix looked complete from inside the guest.
+
+The experiment that would settle it is repeated `amd64_fc_build_matrix.py` runs
+looking for a rare guest failure. Note it needs the **Ubuntu** personality, which
+is behind physical access to the GRUB menu now (see §5.1).
+
 **There is no `[Fault]` line, and that is expected, not evidence of health.**
 `amd64/src/idt.rs:990` hands a ring-3 fault to `deliver_fault_signal` *before*
 reaching `user_fault`, and Rust's std installs a `SIGSEGV` handler for
@@ -125,9 +143,30 @@ hunting the wrong thing.
 `kbuild -c -j 1`, SMP=4: **all 95 crates compiled, 23 m 18 s, clean** — then
 `error: linking with 'rust-lld' failed: signal: 11 (SIGSEGV)`.
 
-So one job across four cores compiles fine; it is a *single multi-threaded
-process* that dies. The `-j4` crash and the LLD crash are at least independently
-triggerable.
+So that run compiled fine across four cores with one job, and died in a *single
+multi-threaded process*.
+
+> **Corrected the same day, by the gen-2 attempt.** This section originally read
+> "the `-j4` crash and the LLD crash are at least independently triggerable",
+> inferred from that one clean `-j1` compile. **`-j1` crashes too** — the second
+> `-j1` build died at 35 crates with `rc=139`, the same signature as `-j4`. The
+> clean 95-crate run was luck, not a property of `-j1`.
+>
+> | cell | outcome | crates reached |
+> |---|---|---|
+> | `-j4` | `rc=139` | 30, 22 |
+> | `-j1` | `rc=139` | 35 |
+> | `-j1` | survived | 95 (gen-1) |
+>
+> So the variable is **rate, not kind**, and §11's original guess — one bug about
+> multi-threaded user processes at SMP>1 — is better supported than the split
+> was. `rustc` is itself ~18 threads, so `-j1` already exercises it; `-j4` only
+> supplies more. Treat the LLD crash as very likely the *same* defect reached by
+> a cheaper, deterministic route, not a second one.
+>
+> The generalisable trap: a single clean run of a *probabilistic* failure is not
+> evidence that a variable is protective. It took one counter-example to delete
+> the conclusion.
 
 #### `--threads=1` is NOT stale — measured, not assumed
 
@@ -177,18 +216,40 @@ with `--exclude .git` (§11's recipe), so a metal-built kernel reports `unknown`
 `git` itself **is** on the metal (2.54.0); the sha is absent because the repo is,
 not because the tool is.
 
-Keep it that way. A live sha would change between generations whenever HEAD moved
-and break byte-identity **by design**, turning the fixed-point test into a false
-negative. The identity that matters is the md5.
+A *live* sha would be worse than none: it changes between generations whenever
+HEAD moves, so byte-identity breaks **by design** and the fixed-point test
+becomes a false negative. The identity that matters is the md5.
+
+Provenance is restored without that hazard by `AKUMA_SHA_OVERRIDE`, added
+2026-09-18 to `crates/akuma-syscalls-glue/build.rs` — it wins over `git`, falls
+back to it, and falls back to `unknown`:
+
+```sh
+AKUMA_SHA_OVERRIDE=9e97d726 kbuild -c -j 1     # uname reports the source commit
+```
+
+**It must be constant for a given source tree.** A generation counter, a
+timestamp or anything else that moves between two builds of the same sources
+reintroduces exactly the false negative above. Stamp the commit the sources came
+from, and nothing else.
 
 ---
 
 ## 5. Open, in the order worth attacking
 
-1. **The `-j4` compile race at SMP>1 on the metal.** The only thing between this
-   loop and a ~3x speedup: the guest gets 137 crates in ~178 s at `-j4`, the metal
-   takes ~23 min at `-j1`, and §2 shows the device explains under 2.3x of that.
-   Repro is ~5 minutes.
+1. **The compile-phase crash at SMP>1 on the metal.** Not `-j4`-specific (see
+   §3's correction): `-j1` dies too, just less often, so this is not merely a
+   speed problem — **a 23-minute build is a coin flip**, which is what stopped
+   the gen-2 fixed point rather than anything about the loop's mechanics. It is
+   also the only thing between this loop and a ~3x speedup: the guest gets 137
+   crates in ~178 s at `-j4`, the metal takes ~23 min at `-j1`, and §2 shows the
+   device explains under 2.3x of that. Repro at `-j4` is ~5 minutes.
+
+   **`nosmp` is the deterministic build (§11) and is *not reachable remotely***:
+   it needs a GRUB cmdline edit, and with the kernel and menu as they now stand
+   Akuma cannot write ext4 or vfat. Anyone planning to fall back to it needs
+   physical access to the machine, or should change the cmdline *before* leaving
+   Ubuntu.
 2. **LLD's thread pool at SMP>1.** Deterministic, replayable from a build log,
    one multi-threaded process — the cheapest harness in the tree for whatever
    §3's first item is.
