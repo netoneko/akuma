@@ -883,14 +883,18 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
 /// counter here and is now `akuma-pipes`' own.
 pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
     // **The `MAX_PIPES` preamble.** Glue's `pipe_create` is a `BTreeMap` with
-    // no ceiling; this target keeps one because each pipe is up to 64 KiB of
-    // kernel buffer on a userspace request (`crate::pipe::MAX_PIPES`). The
+    // no ceiling; this target keeps one so a runaway cannot take the kernel
+    // heap a pipe at a time. What that costs and what a real workload needs is
+    // measured on `crate::pipe::MAX_PIPES` — do not restate the per-pipe cost
+    // here, the version of this comment that did was wrong about it. The
     // `sys_spawn` path gates through `crate::pipe::alloc`; this is the same
     // gate for the `pipe2(2)` path.
     if crate::pipe::at_capacity() {
         return errno::ENFILE;
     }
-    akuma_syscalls_glue::pipe::sys_pipe2(fds, flags as u32)
+    let r = akuma_syscalls_glue::pipe::sys_pipe2(fds, flags as u32);
+    crate::pipe::note_created();
+    r
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a

@@ -61,16 +61,35 @@ pub type PipeId = usize;
 /// How many pipes can exist at once.
 ///
 /// The table is a `BTreeMap` and would grow without bound; this is the cap the
-/// fixed `[Slot; 64]` array that predates it imposed for free. It is kept, and
-/// deliberately small, for the reason that array's own comment gave: each pipe
-/// is up to 64 KiB of kernel buffer allocated on a userspace request, and a
-/// number this size means a leak announces itself instead of being absorbed.
-/// A shell pipeline takes one per `|`, on top of two per live ssh session.
+/// fixed `[Slot; 64]` array that predates it imposed for free.
+///
+/// **Raised 64 -> 256 on 2026-09-18, and both halves of the old number's
+/// justification turned out to be wrong.** It said "each pipe is up to 64 KiB
+/// of kernel buffer allocated on a userspace request" — but
+/// `akuma_pipe::Pipe::with_capacity` starts with an **empty `VecDeque`** and
+/// the capacity is a *limit*, not an allocation, so an idle pipe costs its
+/// struct and nothing else. And it said a number this small means "a leak
+/// announces itself instead of being absorbed" — which it does not: a refusal
+/// and a leak look identical from outside, and what actually announces a leak
+/// is [`report`]'s high-water mark, which did not exist.
+///
+/// What a real workload needs, measured in the Firecracker self-host guest:
+/// a clean 137-crate `cargo build -j4` peaks at **39** live pipes and drains
+/// to **0**; the same build at `-j8` peaks at 66 and was refused twice, which
+/// `std` reports from a *spawn* as `ENFILE` — "Too many open files in system"
+/// — and cargo as `could not exec the linker \`cc\``. 256 covers `-j8` with
+/// room, and its worst case (every pipe full at 64 KiB) is 16 MiB against
+/// `mem::HEAP_SIZE`'s 512 MB.
+///
+/// The cap is **soft by one race**: `at_capacity` samples before
+/// `glue::pipe_create`, which has no ceiling of its own, so concurrent
+/// creators can land a few over it. That is why the measured high-water is 66
+/// against a cap of 64 rather than exactly 64, and it is fine — the number is
+/// a policy, not an invariant anything indexes.
 ///
 /// **A policy, not a table rule**, which is why it lives here and the shared
-/// table does not have one: the AArch64 kernel runs workloads (a `-j4`
-/// self-host build) whose pipe count this would refuse outright.
-pub const MAX_PIPES: usize = 64;
+/// table does not have one.
+pub const MAX_PIPES: usize = 256;
 
 /// The wake effect this kernel registers with the shared table.
 ///
@@ -81,6 +100,43 @@ pub fn wake_sink(tid: usize, _handle: akuma_exec::threading::WakeHandle) {
     crate::sched::wake(tid);
 }
 
+/// The most pipes that have ever been live at once, and how many requests
+/// [`MAX_PIPES`] has refused.
+///
+/// [`MAX_PIPES`]' own comment says the number is deliberately small "so a leak
+/// announces itself" — but nothing measured it, so what a real workload
+/// actually needs was unknown and a refusal was indistinguishable from a leak.
+/// These two numbers tell them apart: a high-water mark that sits near the cap
+/// and a refusal count that moves is *demand*; a high-water mark that climbs
+/// monotonically across a workload that ends is a *leak*. Reported by
+/// [`report`] in the 30 s idle block.
+static PIPE_HIGH_WATER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static PIPE_REFUSALS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Re-read the live count after a create this module did not make itself
+/// (`fd::sys_pipe2` hands the create to glue).
+pub fn note_created() {
+    note_live(glue::pipe_live_count());
+}
+
+fn note_live(n: usize) {
+    PIPE_HIGH_WATER.fetch_max(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `[PIPES] live=N high=N refused=N cap=N` — one line, no allocation.
+pub fn report() {
+    akuma_primitives::safe_print!(
+        96,
+        "[PIPES] live={} high={} refused={} cap={}\n",
+        glue::pipe_live_count(),
+        PIPE_HIGH_WATER.load(core::sync::atomic::Ordering::Relaxed),
+        PIPE_REFUSALS.load(core::sync::atomic::Ordering::Relaxed),
+        MAX_PIPES,
+    );
+}
+
 /// `true` once [`MAX_PIPES`] are live.
 ///
 /// The preamble `fd::sys_pipe2` runs before handing `pipe2` to glue, whose
@@ -88,14 +144,25 @@ pub fn wake_sink(tid: usize, _handle: akuma_exec::threading::WakeHandle) {
 /// path gates through [`alloc`] instead.
 #[must_use]
 pub fn at_capacity() -> bool {
-    glue::pipe_live_count() >= MAX_PIPES
+    let live = glue::pipe_live_count();
+    note_live(live);
+    if live >= MAX_PIPES {
+        PIPE_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
 }
 
 /// Claim a fresh pipe with one reader end and one writer end, or `None` once
 /// [`MAX_PIPES`] are live — which callers report as `ENFILE`: the *machine* is
 /// out of pipes, not this process out of descriptors.
 pub fn alloc() -> Option<PipeId> {
-    (glue::pipe_live_count() < MAX_PIPES).then(|| glue::pipe_create() as PipeId)
+    if at_capacity() {
+        return None;
+    }
+    let id = glue::pipe_create() as PipeId;
+    note_live(glue::pipe_live_count());
+    Some(id)
 }
 
 /// One more open file description names this end — `dup`, or a `fork`

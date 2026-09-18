@@ -2,7 +2,13 @@
 
 *Investigation of 2026-09-16/17, worktree `profiling/amd64-build-slow`,
 folded to the main tree 2026-09-17 (merge e5ba8298).*
-*Status: the 1-vCPU anchor landed (77.9 s, −24 %) and both SMP=4 crash
+*Status (2026-09-18, §15-§17): **`-j4` at `SMP=4` is green and the self-host
+has a fixed point.** A clean 137-crate `cargo build -p akuma-amd64` in the
+Firecracker guest takes ~185 s, the kernel it produces boots (768 passed at
+4 vCPU), and the kernel *it* builds is byte-identical to itself. The sections
+below are the road there, in order; each one's "still open" is answered by a
+later one, so read §14-§17 before acting on §10-§13's next-steps.*
+*Earlier status: the 1-vCPU anchor landed (77.9 s, −24 %) and both SMP=4 crash
 causes are fixed and FC-verified; the `-j4` run survives ~50 min / 31
 crates with flat memory but still ends in a silent wedge behind a residual
 ring-3 kill pair, and the build remains slow (rustc ≈44 % of wall
@@ -2715,6 +2721,119 @@ lines, zero `[ISIG-MISS]`.** The `-j4` gate itself is unmoved by the fix
 The guess in the report ("something in signal delivery or whatever") was right
 about *where* to look and one layer too deep: the signal was never raised, so
 nothing downstream of it could have been at fault.
+
+
+### 17. The fixed point: the kernel the guest built builds itself, byte-identically (2026-09-18)
+
+*§15 got `-j4` green, which proves the build **runs**. It does not prove the
+build is **right** — a kernel that produces a subtly wrong binary compiles just
+as happily. The cheap check for that is the one a bootstrapping compiler uses:
+take the output, run it, and build again.*
+
+Three steps, no new tooling:
+
+```sh
+# 1. out of the guest, byte for byte (md5 checked on both ends — a pty would
+#    have mangled it; this ssh has no -t)
+$SSH "cat /src/akuma/target/x86_64-unknown-none/release/akuma-amd64" > /root/akuma-selfbuilt-fc
+# 2. boot it, 4 vCPU, same rootfs, its own FC config and log
+# 3. build the kernel again inside it, -j4, from a cleaned target/
+```
+
+| generation | built by | size | md5 | boot suite |
+|---|---|---|---|---|
+| 1 | the box-built kernel, in-guest `-j4` | 3 389 240 B | `22c696a9…` | — |
+| 2 | **generation 1**, in-guest `-j4`, 177 s | 3 389 240 B | **`22c696a9…`** | — |
+| — | generation 1 booting at `vcpu_count=4` | | | **768 passed, 0 failed** |
+
+Generation 2 is byte-identical to generation 1. That is the fixed point: the
+compiler, the linker, the filesystem, the page cache and the scheduler
+underneath them all produce the same 3.4 MB of output whether the kernel running
+the build came from the Ubuntu side or from Akuma itself.
+
+(768, not §16's 771: the guest's source tree predates
+`session_terminal_is_private_test`, which is three checks. A suite count that
+moves between a host-built and a guest-built kernel is worth reading before
+celebrating — here it is accounted for.)
+
+#### What this retires from §11
+
+The bare-metal section added `-C link-arg=--threads=1` to the rig's rustflags
+and called LLD's default thread pool "the thing this kernel cannot survive at
+SMP>1". **The Firecracker guest's `.cargo/config.toml` has never carried that
+flag**, so every build in §15-§17 — three clean 137-crate builds, each ending in
+a real `rust-lld` link — ran the pool multi-threaded on four cores and linked
+correctly. Whatever LLD did to the metal in §11, the guest does not reproduce it
+on today's kernel, and §14's demand-fault race is the obvious candidate for
+what it actually was.
+
+The bare-metal arm is still **untested** on this kernel and the workaround is
+still in that root's config. Removing it is a one-line change to rig state and a
+23-minute build, and it now has a prior worth acting on rather than a guess.
+
+
+### 18. `-j8` was `ENFILE` at a 64-pipe machine ceiling, and the ceiling's stated cost was wrong (2026-09-18)
+
+*With `-j4` green (§15) the obvious next question is how much parallelism this
+kernel will take. `-j8` failed in 8 s, three times, at a build-script link.*
+
+What cargo says is `error: could not compile \`proc-macro2\` (build script)`,
+which reads like a toolchain problem. The note two lines further in is the whole
+story:
+
+```
+error: could not exec the linker `cc`
+  = note: Too many open files in system (os error 23)
+```
+
+`ENFILE`, not `EMFILE` — **the machine**, not the process. And it comes out of a
+*spawn*, because `std`'s `Command::spawn` makes its pipes before it `exec`s, so
+a pipe ceiling presents as a linker that cannot be launched.
+
+#### Demand or leak — the instrument that was missing
+
+`amd64::pipe::MAX_PIPES` was 64, and its comment justified that in two ways,
+both of which turn out not to hold:
+
+- *"each pipe is up to 64 KiB of kernel buffer allocated on a userspace
+  request"* — `akuma_pipe::Pipe::with_capacity` starts with an **empty
+  `VecDeque`**. The capacity is a limit, not an allocation; an idle pipe costs
+  its struct.
+- *"a number this size means a leak announces itself instead of being
+  absorbed"* — it does not. From outside, a refusal and a leak look identical,
+  which is exactly the ambiguity that had to be resolved before touching the
+  number. (The leak that comment was written for is real and fixed:
+  `proposals/AMD64_SPAWN_PIPE_LEAK.md`, one pipe per `sys_spawn`, found with a
+  temporary `pipe_live_count()` print.)
+
+So the temporary print became permanent: `[PIPES] live=N high=N refused=N
+cap=N` in the 30 s idle block, with a high-water mark and a refusal count.
+A high-water that climbs across a workload that ends is a leak; one that sits
+under the cap with refusals moving is demand.
+
+| clean 137-crate build | outcome | high-water | refused | live after |
+|---|---|---|---|---|
+| `-j4`, cap 64 | PASS 178 s | **39** | 0 | **0** |
+| `-j8`, cap 64 | **fail 8 s** | 66 | 2 | 0 |
+| `-j8`, cap 256 | **PASS 163 s** | **75** | 0 | **0** |
+| `-j4`, cap 256 | PASS 174 s | 41 | 0 | 0 |
+
+Demand, unambiguously: every run drains to zero, and the peak scales with the
+job count (~10 pipes per job). `MAX_PIPES` is now **256** — worst case 16 MiB
+against `mem::HEAP_SIZE`'s 512 MB, and only if every pipe is simultaneously
+full.
+
+`-j8` on four vCPUs is also **the fastest cell measured** (163 s against
+`-j4`'s 174 s): the jobs block on the filesystem often enough that
+oversubscription pays.
+
+#### One wrinkle worth knowing: the cap is soft by one race
+
+The high-water at cap 64 is **66**. `at_capacity()` samples the live count
+*before* `glue::pipe_create`, which has no ceiling of its own, so concurrent
+creators can land a few over. That is fine — the number is a policy, not an
+invariant anything indexes — but it means a check for "exactly the cap" in a
+future test would be wrong.
 
 
 ## Background

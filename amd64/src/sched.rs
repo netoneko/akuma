@@ -964,6 +964,11 @@ pub fn idle_loop() -> ! {
                 crate::futex::dump_waiters();
                 akuma_primitives::safe_print!(96,
                     "[SLOT] stale-fs windows closed: {}\n", stale_fs_windows());
+                // `MAX_PIPES` is machine-wide and small on purpose; this is
+                // the reading that says whether a workload is near it. A
+                // `-j8` self-host build refuses at it (`ENFILE`, which `std`
+                // reports as "Too many open files in system" from a *spawn*).
+                crate::pipe::report();
             }
         }
         if !threading::x86_yield() {
