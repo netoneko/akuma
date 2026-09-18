@@ -1,7 +1,5 @@
 # amd64: the unlock tree to self-hosting
 
-test commit
-
 **Date:** 2026-09-07
 **Scope:** the dependency order among the amd64 work items — scheduler port,
 `akuma-mmap` adoption, the `akuma-mmu` x86 surface, and the `usermode.rs` fold —

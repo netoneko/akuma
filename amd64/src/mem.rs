@@ -51,6 +51,64 @@ use crate::serial;
 /// tracked in `docs/archive/AKUMA_SELF_HEALING_PORT.md`.
 pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 
+/// The heap on a machine with enough RAM to afford a bigger one: **1 GiB when
+/// the machine reports ≥ 8 GiB usable**, [`HEAP_SIZE`] otherwise.
+///
+/// # Why this is not the shared formula
+///
+/// `akuma_kernel_glue::compute_heap_size` is `(ram/8).clamp(64 MB, 256 MB)`, and
+/// 256 MB is *smaller* than this target's existing 512 MB — so adopting it would
+/// be a regression, not a unification. The reason the two differ is real:
+/// `amd64/src/fd.rs` caches **every open file's entire contents** in a heap
+/// `Vec` (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`), so `execve` of `rust-lld`
+/// costs 158 MB of heap, and `Vec` doubling makes the transient peak ~3x the
+/// file. AArch64 has no equivalent demand on its heap. When that proposal lands
+/// and files stop living in the heap, this whole rule should go away rather than
+/// be retuned.
+///
+/// # Why a step and not a fraction
+///
+/// A fraction of RAM would read better and be wrong here: the heap is carved
+/// from a region below [`PHYSMAP_LIMIT`] (4 GiB — `boot.s` maps only the first
+/// four), so RAM above that ceiling cannot back it however much of it there is.
+/// A step says exactly what it means — "big machine, bigger heap" — and cannot
+/// scale into a number the physmap cannot serve.
+///
+/// The caller must still treat this as a *request*: see `init_reserving`, which
+/// falls back to [`HEAP_SIZE`] when no reachable region can hold it, because a
+/// machine that boots today must not stop booting for want of a bigger heap.
+pub const HEAP_SIZE_LARGE: usize = 1024 * 1024 * 1024;
+
+/// RAM at or above which [`HEAP_SIZE_LARGE`] is requested.
+pub const LARGE_HEAP_RAM_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The heap size to *request* for a machine reporting `usable_ram` bytes.
+///
+/// Pure, so the policy can be read and tested without booting.
+#[must_use]
+pub const fn heap_size_for(usable_ram: u64) -> usize {
+    if usable_ram >= LARGE_HEAP_RAM_THRESHOLD {
+        HEAP_SIZE_LARGE
+    } else {
+        HEAP_SIZE
+    }
+}
+
+/// The heap size this boot actually got, for code that runs after `init_reserving`.
+///
+/// `HEAP_SIZE` is no longer the answer — it is only the floor — and the one
+/// consumer that reads it late (`fs.rs`'s block-cache quarter-rule) would
+/// silently under-size the cache by half on a big machine if it kept using the
+/// constant.
+static HEAP_BYTES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(HEAP_SIZE);
+
+/// Bytes of heap this boot brought up.
+#[must_use]
+pub fn heap_size() -> usize {
+    HEAP_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 const PAGE_SIZE: usize = 4096;
 
 unsafe extern "C" {
@@ -198,12 +256,29 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
         }
     }
     let roomiest = roomiest.expect("regions > 0");
-    let heap_home = match kernel_home {
-        Some(k) if k.floor.saturating_add(HEAP_SIZE as u64) < k.end => k,
-        _ => roomiest,
+    // Ask for the large heap on a large machine — but a *request*, never a
+    // demand. Wanting more heap must not turn a machine that boots today into
+    // one that does not, so if no reachable region can hold the larger size we
+    // retry at `HEAP_SIZE` before letting the "does not fit" diagnostic below
+    // fire. The same preference order applies at either size: beside the kernel
+    // when that fits, the roomiest region otherwise.
+    let fits = |u: Usable, want: usize| u.floor.saturating_add(want as u64) < u.end;
+    let pick = |want: usize| -> Option<(Usable, usize)> {
+        match kernel_home {
+            Some(k) if fits(k, want) => Some((k, want)),
+            _ if fits(roomiest, want) => Some((roomiest, want)),
+            _ => None,
+        }
     };
+    let (heap_home, heap_bytes) = pick(heap_size_for(machine.usable_ram()))
+        .or_else(|| pick(HEAP_SIZE))
+        // Nothing fits at either size. Keep the historical choice so the
+        // explicit diagnostic below reports against the same region it always
+        // did, rather than this change altering what a failing boot prints.
+        .unwrap_or((roomiest, HEAP_SIZE));
+    HEAP_BYTES.store(heap_bytes, core::sync::atomic::Ordering::Relaxed);
     let heap_start = heap_home.floor as usize;
-    let heap_end = heap_start + HEAP_SIZE;
+    let heap_end = heap_start + heap_bytes;
 
     // Print the map BEFORE the check that uses it. A "does not fit" message
     // with no sizes in it says only that something is wrong, which is the least
@@ -254,7 +329,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     serial::puts("\n  heap: 0x");
     serial::put_hex(heap_start as u64);
     serial::puts(" + ");
-    serial::put_dec((HEAP_SIZE / 1024 / 1024) as u64);
+    serial::put_dec((heap_bytes / 1024 / 1024) as u64);
     serial::puts(" MiB ... ");
 
     if (heap_end as u64) >= heap_home.end {
@@ -268,7 +343,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
 
     // The allocator hands out pointers, so it must be given the *virtual*
     // address of the heap. Everything else here is physical.
-    if let Err(e) = akuma_alloc::init(phys_to_virt(heap_start as u64) as usize, HEAP_SIZE) {
+    if let Err(e) = akuma_alloc::init(phys_to_virt(heap_start as u64) as usize, heap_bytes) {
         serial::puts("FAILED: ");
         serial::puts(e);
         serial::puts("\n");
@@ -344,7 +419,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     }
     // The heap was carved out before the PMM existed and is inside one of the
     // regions just described, so it has to be taken back explicitly.
-    akuma_pmm::reserve_range(heap_start, HEAP_SIZE);
+    akuma_pmm::reserve_range(heap_start, heap_bytes);
 
     serial::puts("  pmm:  ");
     serial::put_dec((akuma_pmm::total_count() * PAGE_SIZE / 1024 / 1024) as u64);

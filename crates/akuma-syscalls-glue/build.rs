@@ -62,15 +62,36 @@ fn main() {
     // something purely so a crate could read it, and nothing else in the tree
     // reads either variable. There is still exactly one `git rev-parse` in the
     // build — the binary's emission was deleted in the same change.
-    let git_sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    // `AKUMA_SHA_OVERRIDE` wins, for a tree that has no `.git` to ask.
+    //
+    // The bare-metal amd64 root stages its sources with `--exclude .git`
+    // (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §11), so a kernel
+    // the box builds *itself* reported `unknown` and lost its provenance — `git`
+    // is installed there, the repository simply is not.
+    //
+    // **It must be a value that is constant for a given source tree, not a
+    // build counter.** Self-hosting is verified by building the kernel inside
+    // itself and comparing md5 with the generation that built it; anything that
+    // changes between two builds of the same source — a generation number, a
+    // timestamp, a live `HEAD` that moved — makes those bytes differ by design
+    // and turns the fixed-point test into a false negative. Stamp the commit the
+    // sources came from, and nothing else.
+    let git_sha = std::env::var("AKUMA_SHA_OVERRIDE")
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rerun-if-env-changed=AKUMA_SHA_OVERRIDE");
     println!("cargo:rustc-env=AKUMA_GIT_SHA={git_sha}");
 
     // Re-run when HEAD moves, so the SHA cannot go stale behind a cache hit.

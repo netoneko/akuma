@@ -398,7 +398,11 @@ pub fn init_vfs() {
     {
         let ram_bytes = akuma_pmm::total_count().saturating_mul(4096);
         let ceiling = akuma_config::FSCACHE_CEILING_MB * 1024 * 1024;
-        let heap_share = crate::mem::HEAP_SIZE / 4;
+        // `mem::heap_size()`, not the `HEAP_SIZE` constant: the heap is sized
+        // from RAM at boot now (1 GiB on a machine reporting >= 8 GiB), and the
+        // constant is only the floor. Reading the constant here would silently
+        // hold the cache at 128 MB on exactly the machines that can afford 256.
+        let heap_share = crate::mem::heap_size() / 4;
         akuma_ext2::set_cache_cap_bytes(core::cmp::min(
             core::cmp::min(ram_bytes / 8, ceiling),
             heap_share,

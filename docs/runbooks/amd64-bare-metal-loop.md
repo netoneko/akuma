@@ -25,10 +25,78 @@ Host checking is off for `akuma` on purpose: **sshd generates a new host key
 every boot and nothing persists it**, so the fingerprint changes by design and a
 `known_hosts` entry would be wrong rather than reassuring.
 
-## The cycle
+## Since 2026-09-18: Akuma is the GRUB **default**, and there is no remote way back
+
+`GRUB_DEFAULT="Akuma/amd64"`, not a `grub-reboot` one-shot. Two consequences, and
+the second one costs a walk to the machine if you forget it:
+
+- **`reboot -f` from Akuma comes back to Akuma.** That is the point — it is what
+  collapses the self-host loop to build → install → reboot, with no Ubuntu round
+  trip and nothing to arm (see "Self-hosting on the metal" below).
+- **Akuma cannot put the box back on Ubuntu.** `grub.cfg` and `grubenv` live on
+  sda2 (ext4) and the ESP is vfat; **this kernel has neither filesystem**, so
+  there is no command you can ssh in and run. Getting to Ubuntu means picking it
+  from the GRUB menu at the machine — `GRUB_TIMEOUT=10`,
+  `GRUB_TIMEOUT_STYLE=menu`, so it is one keypress, but it is a *physical* one.
+
+So `hpbox.reboot_to("ubuntu")` **no longer works** (its docstring predates this
+and still says a consumed one-shot returns you to Ubuntu). Everything else in
+`hpbox` is unaffected. To restore the old arrangement, set `GRUB_DEFAULT=0` in
+`/etc/default/grub` from Ubuntu and `update-grub`.
+
+The second entry, `Akuma/amd64 (known good)`, boots `/boot/akuma-amd64.good` —
+the last kernel known to work. It exists because a self-built kernel now
+overwrites the default one. There were deliberately *never* two Akuma entries
+before; that rule came from `grub-reboot` one-shots resolving to the wrong entry,
+and selecting the default **by title** removes that mechanism.
+
+## Self-hosting on the metal: install a kernel from inside Akuma
+
+The kernel and the RAM recovery image live on **Akuma's own ext2 partition**
+(`sdb1` to Ubuntu, `/dev/sda1` here), and GRUB reads them from there:
 
 ```
-ssh akuma "reboot -f"          # Akuma resets itself -> Ubuntu (GRUB default)
+search --no-floppy --file --set=root /boot/akuma-amd64
+multiboot2 /boot/akuma-amd64 init=/bin/sshd root=/dev/sda1
+module2 /boot/root.img rootfs
+```
+
+So installing a kernel is an ordinary file write on a normal filesystem:
+
+```sh
+kbuild -c -j 1                                   # build in the guest
+scripts/install_kernel_amd64.sh                  # -> /boot/akuma-amd64, md5-verified
+/bin/busybox reboot -f                           # up on what you just built
+```
+
+`install_kernel_amd64.sh` refuses an ELF with **no multiboot2 header** and
+re-reads what it wrote. Both matter more here than they would with a one-shot:
+this is the *default* entry, so a bad install means the box comes up at the GRUB
+prompt.
+
+Why this is smaller than the AArch64 equivalent: there, QEMU's `-kernel` *is* the
+bootloader, so `KERNEL_DROPOFF` needs a raw block device, a flattened image, and
+lives with a fixed drive capacity that can `ENOSPC` onto the live file. Here GRUB
+already speaks ext2 and multiboot2 parses the ELF, so none of that exists. The
+GRUB config is **immutable rig state**: the path is fixed once, only the file's
+contents change, and Akuma never needs vfat or ext4.
+
+**Two traps when setting this up** (both cost time on 2026-09-18):
+
+- `search --file` must match exactly one filesystem. `/boot/akuma-amd64` on sdb1
+  is deliberately *not* `/boot/akuma/akuma-amd64` on sda2.
+- `update-grub` runs every **executable** file in `/etc/grub.d/`, so a `cp`
+  backup of `45_akuma` (mode 755 preserved) is sourced as a live GRUB script and
+  produces a second entry with the same title. Keep backups outside that
+  directory.
+
+Full record, with the measurements:
+[`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md).
+
+## The cycle (laptop-driven kernel development)
+
+```
+ssh akuma "reboot -f"          # NOTE: now returns to Akuma, not Ubuntu
    ... hpbox.deploy()                       # box lands on a commit + your patch
    ... cargo build -p akuma-amd64 --target x86_64-unknown-none --release
    ... sh amd64/mkdisk.sh
@@ -628,6 +696,7 @@ channel instead.
 | every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. Since 2026-09-06 the kernel also defends itself: `xhci::quiesce_all` clears `BUS_MASTER` on every boot right after the PCI scan, and `xhci::shutdown` runs before the machine reset. Neither can save the boot whose image was *already* corrupted during load, so the power cycle stays the recovery |
 | the box wedges under ssh/apk bursts at SMP=4 — `[BKL] stuck` storm, then `[TLB] stuck: N peer(s) unacked`, then dead to ssh | not a lock bug: a ring-0 page fault inside `akuma_threading_x86_switch_context` kills one core, `fatal()` halts it, and the dead core never acknowledges the next TLB shootdown — the munmap sender then spins forever holding the BKL. `sshd: failed to spawn '/bin/sh'` (exec failing off a degraded transport) is the late-stage signature. Reproduced in QEMU (`SMP=4` + ring-3 churn); `fatal()` now dumps a 64-word stack for symbolization, and the metal's dump stays on the screen to photograph. **See `docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`** |
 | `tail -f <file>` ignores `^C` — the session is stuck until you kill it from another shell | **ROOT-CAUSED and FIXED 2026-09-18.** Not `tail`'s follow loop, and not signal delivery (`kill -INT` on a parked `sleep 60` kills it in 1.2 s). Every `sys_spawn` child was handed the **console's shared `TerminalState`** instead of a fresh one, because `register_exec_process` decided "is this the serial console?" from fd 0 alone and spawned children now carry `SharedFdTable::with_stdio()` (fd 0 = `Stdin`, the console's own spelling). `busybox`'s line editor goes raw per prompt and restores the flags it read **at startup**, so session 1 left the shared cell raw and session 2 adopted raw as its baseline — `ISIG` gone for the rest of the boot. That is also why the "`^C`-over-ssh check" above passed: it is run **once**, in the first session after a reboot. Fixed by `console_attached = channel.is_none() && …`; pinned by `session_terminal_is_private_test` in the boot suite. Tell, if it ever comes back: `[ISIG-MISS]` on the console with **no** `[ISIG]` line. `kbuild -w` is no longer needed for this reason (it is still the better way to watch a long build). [`../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) §16 |
+| **OPEN (2026-09-18):** an interactive `ssh` session needs **one extra event to register the previous one** — you press Enter, nothing happens; the next keystroke makes the Enter take effect | Not root-caused. Observed on the metal at SMP=4 during a self-host build, so load is a suspected but unconfirmed factor. The input is not lost — it arrives one event late — and **two mechanisms produce exactly that symptom; do not assume either**. (a) *Lost wakeup*: the byte is queued but the reader is not woken by it, so it runs on the next event (the delayed-first-byte / unarmed-edge family in `docs/archive/`). (b) *Short drain*: the reader **is** woken and does read, but consumes less than is available and leaves a residue, so the pipeline sits permanently one event behind (the shape `sshd`'s aarch64 drain bug had). (c) *Contention, and no input bug at all*: it was seen while four cores were in a `[BKL] stuck` storm, and a reader simply scheduled late looks identical from a terminal. **Test (c) first — it is the only one that can make this a non-issue**, and the other two are only worth instrumenting if the symptom survives on an idle box. If it does, the cheap discriminator between (a) and (b) is to **paste several characters at once**: all landing together but one event late means the pipeline is one behind — a drain/latch problem; arriving one per subsequent keystroke means the reader consumes one unit per wake. Note this is a *different* fault from the `^C`/`ISIG` bug two rows up, which was fixed 2026-09-18 and was about `TerminalState` sharing, not readiness; do not assume that fix regressed. Cheapest next probes, in order: (1) does it reproduce on an **idle** box, which separates load from the mechanism; (2) does it reproduce under the **local QEMU / `qrun2.sh`** rigs, which costs no reboot; (3) `scripts/utils/amd64_ctrlc_probe.py --job tail`, whose poll-loop job shape is the one that exercises repeated readiness edges rather than one long park. Instrument where the wake is armed for the session channel's input side before reading anything else |
 | a "disarmed" GRUB entry still drove the USB controller | until 2026-09-06 the xHCI self-test was gated only on the controller being *present*, so dropping `root=/dev/sda1` stopped the kernel mounting the disk but not bringing the controller up. There was no way to boot that kernel without driving it. **Fixed** — the bring-up now needs `usb` or `root=/dev/sda1` on the command line, and says so in the verdict when it skips |
 
 ## The spare disk (persistence — USB/xHCI, working)
