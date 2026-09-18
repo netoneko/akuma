@@ -1254,58 +1254,53 @@ pub static COW_RETRIES: AtomicU64 = AtomicU64::new(0);
 /// to assert that an `mprotect` downgrade produces a `SIGSEGV` — could never
 /// pass, which `amd64_mem_trials.py` recorded as an expected failure.
 fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
-    serial::puts("\n[Fault] ");
-    serial::puts(vector);
-    serial::puts(" in ring 3 on cpu ");
-    serial::put_dec(crate::smp::cpu_index() as u64);
+    // **One flush, not twenty `puts`.** `serial::LOCK` is per call, so a peer
+    // core faulting at the same moment lands between two of them and shreds
+    // both lines. That is not hypothetical here: the 2026-09-18 `-j4` run
+    // faulted two threads of one process on two cores at once and produced
+    //
+    //   [Fault] #GP general protection#GP general protection in ring 3 on cpu 1
+    //   … pmm_free=1380940 fpcache_len=138094041633 …
+    //
+    // — two `pmm_free` values interleaved into one unusable number, in the
+    // report whose whole purpose is those numbers. Same fix, same reason, as
+    // `sched.rs`'s `[SWITCH NO-BKL]`.
+    let mut w = akuma_primitives::console::StackWriter::<512>::new();
+    let _ = core::fmt::write(&mut w, format_args!(
+        "\n[Fault] {} in ring 3 on cpu {}", vector, crate::smp::cpu_index()));
     if let Some(code) = error_code {
-        serial::puts(" err=0x");
-        serial::put_hex(code);
+        let _ = core::fmt::write(&mut w, format_args!(" err=0x{code:016x}"));
     }
-    serial::puts(" rip=0x");
-    serial::put_hex(frame.rip);
-    serial::puts(" rsp=0x");
-    serial::put_hex(frame.rsp);
-    serial::puts(" cr2=0x");
-    serial::put_hex(read_cr2());
     // The wrong-root diagnostic for the `cowstale` race
     // (`docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md` § "The open issue"):
     // which root is actually active, which task slot is published on this
     // core, and which process pid the slot maps to. A reader that sees bss as
     // zeros names its root here — compare against the fork child's.
-    serial::puts(" cr3=0x");
-    serial::put_hex(crate::paging::active_root());
-    serial::puts(" task=");
-    serial::put_dec(crate::smp::current_task() as u64);
-    serial::puts(" pid=");
-    serial::put_dec(u64::from(crate::usermode::current_pid()));
-    serial::puts(" — killing the process\n");
+    //
+    // `cr2` is the faulting *address* only for a `#PF`. A `#GP` rejects its
+    // operand before translation and leaves whatever the last page fault put
+    // there, so it is labelled rather than presented as this fault's address.
+    let _ = core::fmt::write(&mut w, format_args!(
+        " rip=0x{:016x} rsp=0x{:016x} cr2=0x{:016x}{} cr3=0x{:016x} task={} pid={}\n",
+        frame.rip, frame.rsp, read_cr2(),
+        if error_code.is_some() && vector.starts_with("#GP") { "(stale)" } else { "" },
+        crate::paging::active_root(), crate::smp::current_task(),
+        crate::usermode::current_pid()));
     // Post-mortem at the OOM floor: a ring-3 kill under memory pressure is
     // only diagnosable from these numbers (found 2026-09-17, when the
     // file-page-cache reference leak drained the guest to `pmm_free=0` and
     // every downstream symptom — the SMP=4 `#UD`, the dead network — was
     // downstream of that). A boot with no NIC never reaches
     // `mem_watch_tick`, so the counters ride the fault line itself.
-    serial::puts("  [memwatch-at-kill] pmm_free=");
-    serial::put_dec(akuma_pmm::free_count() as u64);
-    serial::puts(" fpcache_len=");
-    serial::put_dec(akuma_fpcache::len() as u64);
-    serial::puts(" fpcache_cap=");
-    serial::put_dec(akuma_fpcache::cap() as u64);
-    serial::puts(" cow_ref_frames=");
-    serial::put_dec(akuma_pmm::cow_ref_count() as u64);
-    serial::puts("\n");
-    {
-        // Hit/miss/evict/inval: distinguishes "the cache ate the RAM" (len
-        // pinned at cap, evictions churning) from "a mapper leaked refs"
-        // (len small, `cow_ref_frames` huge) — the two look identical from
-        // `pmm_free=0` alone.
-        let mut buf = [0u8; 160];
-        let mut pos = 0usize;
-        let mut w = akuma_primitives::console::FmtBuf { buf: &mut buf, pos: &mut pos };
-        akuma_fpcache::stats_line(&mut w);
-        serial::puts(core::str::from_utf8(&buf[..pos]).unwrap_or("[fpcache stats]\n"));
-    }
+    let _ = core::fmt::write(&mut w, format_args!(
+        "  [memwatch-at-kill] pmm_free={} fpcache_len={} fpcache_cap={} cow_ref_frames={}\n",
+        akuma_pmm::free_count(), akuma_fpcache::len(), akuma_fpcache::cap(),
+        akuma_pmm::cow_ref_count()));
+    // Hit/miss/evict/inval: distinguishes "the cache ate the RAM" (len pinned
+    // at cap, evictions churning) from "a mapper leaked refs" (len small,
+    // `cow_ref_frames` huge) — the two look identical from `pmm_free=0` alone.
+    akuma_fpcache::stats_line(&mut w);
+    w.flush();
     crate::usermode::kill_current_from_fault(SIGSEGV);
 }
 

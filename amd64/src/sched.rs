@@ -257,6 +257,13 @@ fn current() -> usize {
 /// - `fxsave` of `from` before `fxrstor` of `to`, for the reason [`FxArea`]
 ///   gives.
 fn hook_switch_to(from: usize, to: usize) {
+    // Switch-in bookkeeping, before any of the machine effects: this is the one
+    // point every resume of every slot passes through, so a slot with
+    // `SWITCH_INS == 0` provably never ran. See [`dump_slot_table`].
+    if to < MAX_TASKS {
+        SWITCH_INS[to].fetch_add(1, Ordering::Relaxed);
+        LAST_CORE[to].store(smp::cpu_index() as u32, Ordering::Relaxed);
+    }
     // SAFETY: raw-pointer access to the machine table under the BKL. `from` and
     // `to` are crate slot indices, which are in range by construction.
     unsafe {
@@ -302,10 +309,31 @@ fn hook_switch_to(from: usize, to: usize) {
         // resume inside its own syscall and read it on the way back to ring 3.
         smp::set_current_uctx(&raw mut (*m)[to].uctx);
 
+        // **Unconditionally, exactly as `%gs` below.** `IA32_FS_BASE` is one
+        // register per *core*, so skipping the write when the incoming task has
+        // no base of its own does not leave `%fs` "unset" — it leaves the
+        // outgoing thread's TLS pointer live for whoever runs next. That is the
+        // argument the `%gs` line already makes, one line down, and the
+        // asymmetry looks like an oversight rather than a decision: nothing in
+        // ring 0 reads `%fs` (the kernel's per-CPU block is `%gs`), so writing
+        // 0 for a kernel or not-yet-`arch_prctl`'d task costs one `wrmsr` and
+        // takes away a stale user base.
+        //
+        // The window it closes: a freshly `execve`d main thread starts with
+        // `UserCtx::fs_base == 0` and does not call `arch_prctl(ARCH_SET_FS)`
+        // until musl's `__init_tp`. Every instruction of `ld-musl` before that
+        // used to run on whatever TLS base the previous thread on this core
+        // left behind — another process's, in another address space.
+        // Suspected in the `-j4` `#GP` at `rip=0x3004_65ec`, which is inside
+        // `ld-musl` (`INTERP_BASE` is `0x3000_0000`); see
+        // `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13.
         let fs = (*m)[to].uctx.fs_base;
-        if fs != 0 {
-            crate::usermode::set_fs_base(fs);
+        if fs == 0 && (*m)[from].uctx.fs_base != 0 && !(*m)[to].idle {
+            // How often the window was actually open. A zero here would have
+            // retired the hypothesis without a boot.
+            STALE_FS_WINDOWS.fetch_add(1, Ordering::Relaxed);
         }
+        crate::usermode::set_fs_base(fs);
         crate::usermode::set_user_gs_base((*m)[to].uctx.gs_base);
 
         // The switch's whole cross-core safety argument is `x86_yield_now`'s:
@@ -668,6 +696,19 @@ static WAKES: AtomicU64 = AtomicU64::new(0);
 /// the drift that C1 step 3's first arm found the hard way.
 pub fn install_untimed_park_backstop() {
     threading::set_untimed_park_backstop_us(BACKSTOP_US);
+    // Registered here because this is the one initialiser both boot protocols
+    // reach, and a hook installed on only one of them is the drift C1 step 3
+    // found the hard way.
+    //
+    // **What it fixes.** `crate::thread::teardown` purges the futex table of a
+    // thread's tid, and until 2026-09-18 that was the only purge on this
+    // target — so it covered exactly the threads that leave ring 3 normally. A
+    // thread killed by a fault, by a group-fatal signal, or by a deferred kill
+    // that never reached a boundary stayed queued on its futex key after death,
+    // and `x86_claim_slot` handed its slot to a new thread that inherited the
+    // entry. `FUTEX_WAKE(uaddr, 1)` then spends itself on the corpse and the
+    // live waiter sleeps on. See `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13.
+    threading::set_slot_purge_callback(crate::futex::purge_task);
 }
 
 /// How many times a thread has parked.
@@ -844,6 +885,10 @@ pub fn init() {
 /// started.
 pub fn register_idle_task(cpu: usize) -> Option<usize> {
     let slot = threading::x86_claim_slot()?;
+    // This path does not go through `prepare_task_slot`, so it clears the
+    // per-occupant counters itself. Low slots have usually been through the
+    // boot self-tests by the time SMP bring-up runs.
+    reset_slot_counters(slot);
     // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
     // nothing can schedule it.
     unsafe {
@@ -911,6 +956,14 @@ pub fn idle_loop() -> ! {
                 // no crash line. The hook is registered on this target already
                 // and had no reader here, so this is the whole cost of asking.
                 akuma_exec::process::dump_orphan_processes();
+                // TEMPORARY (2026-09-18), §12 lever 1: the "created and never
+                // scheduled" shape needs the picker's own view, not `ps`'s.
+                dump_slot_table();
+                // §13: and once the slot table says "WAITING in futex", the
+                // next question is *which* futex — that is this.
+                crate::futex::dump_waiters();
+                akuma_primitives::safe_print!(96,
+                    "[SLOT] stale-fs windows closed: {}\n", stale_fs_windows());
             }
         }
         if !threading::x86_yield() {
@@ -1196,6 +1249,191 @@ fn yield_tag_name(tag: u32) -> &'static str {
 
 /// Context switches taken without the BKL — the invariant `x86_yield_now`'s
 /// `ON_CPU` argument rests on. `0` is the expected value.
+/// How many times each slot has been switched **in**, and by which core last.
+///
+/// Written in [`hook_switch_to`], the single point every resume passes through
+/// — a kernel thread's first entry, a ring-3 thread's, and every one after. A
+/// slot with `SWITCH_INS == 0` has therefore never executed a single
+/// instruction, which is the distinction `ps` cannot draw: its `TIME` column is
+/// `m:ss`, so a process that ran for 40 ms and one that was never given the CPU
+/// both read `0:00`, and the `-j4` wedge hangs on telling those apart
+/// (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §12).
+///
+/// `LAST_CORE` is `NO_CPU` until the first switch-in, so it doubles as the
+/// never-ran flag's witness rather than reading as core 0.
+static SWITCH_INS: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// See [`SWITCH_INS`].
+static LAST_CORE: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(NO_CPU) }; MAX_TASKS];
+
+/// The last syscall number each slot *entered*, and how many it has entered in
+/// all. `u32::MAX` = none yet.
+///
+/// Entry, not exit, and that is the point: a slot in `thread_state::WAITING` is
+/// parked *inside* the call recorded here, so the pair `(state, LAST_SYSCALL)`
+/// names where a thread is stuck without a stack walk. `SYSCALL_ENTRIES` is the
+/// control — `0` means the thread never reached ring 3's syscall entry at all,
+/// which together with `SWITCH_INS == 0` is the difference between "never
+/// scheduled" and "scheduled once and died in userspace".
+///
+/// Recorded by [`note_syscall_entry`], from `usermode::syscall_handler`.
+static LAST_SYSCALL: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(u32::MAX) }; MAX_TASKS];
+
+/// See [`LAST_SYSCALL`].
+static SYSCALL_ENTRIES: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Zero every per-slot forensic counter for `slot`.
+///
+/// Called wherever a slot changes occupant. These counters are per *thread*,
+/// not per slot index, and the whole question they answer — "was this one ever
+/// scheduled, did it ever reach a syscall?" — is answered with the previous
+/// occupant's numbers if they are not cleared. Measured on the instrument's
+/// first boot: the three idle threads reported 11 syscalls each, ending in
+/// `exit_group`, left behind by the boot self-tests' tasks in the same low
+/// slots. `akuma_threading::x86_claim_slot` clears the picker's own tallies for
+/// the same reason.
+fn reset_slot_counters(slot: usize) {
+    if slot < MAX_TASKS {
+        SWITCH_INS[slot].store(0, Ordering::Relaxed);
+        LAST_CORE[slot].store(NO_CPU, Ordering::Relaxed);
+        LAST_SYSCALL[slot].store(u32::MAX, Ordering::Relaxed);
+        SYSCALL_ENTRIES[slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Record that the running slot has entered syscall `nr`. Two relaxed stores on
+/// the syscall entry path; see [`LAST_SYSCALL`] for why this is worth them.
+pub fn note_syscall_entry(nr: u64) {
+    let slot = smp::current_task();
+    if slot < MAX_TASKS {
+        LAST_SYSCALL[slot].store(nr as u32, Ordering::Relaxed);
+        SYSCALL_ENTRIES[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Every live slot, with the four facts that separate the ways a task can fail
+/// to run. Allocation-free, bounded, BKL-held callers only.
+///
+/// # How to read a line
+///
+/// ```text
+/// [SLOT] 64 st=1 gate=0 ins=0 core=- pick=0/1720043/0 wake=0 woken=0 gen=3 \
+///        root=0x23862000 flags=--- pin=- pid=64
+/// ```
+///
+/// - `st` is `akuma_exec_core::thread::thread_state` (0 FREE, 1 READY,
+///   2 RUNNING, 3 TERMINATED, 4 INITIALIZING, 5 WAITING).
+/// - `gate` is `ON_CPU`: non-zero means some core claims to be standing on that
+///   stack. `gate=1` on a slot that no core is running is a **leaked gate**, and
+///   `x86_pick_next` will skip it forever.
+/// - `ins` is [`SWITCH_INS`]. `ins=0` is "never scheduled, ever".
+/// - `pick` is `hits/skipped-for-gate/skipped-for-pinning` from the picker
+///   itself. `0/large/0` with `gate=1` is the leaked-gate hypothesis proven;
+///   `0/0/0` means the picker never even considered the slot, so the fault is
+///   in `st` — upstream of the scheduler.
+/// - `wake`/`woken` are the deadline and waker flag for a `WAITING` slot:
+///   `st=5 wake=0` is a thread that only a waker can release, i.e. the shape a
+///   lost `futex`/pipe wakeup leaves behind.
+///
+/// The four rows to look for, in the order they answer the question: a slot
+/// with `ins=0 pick=0/N/0` (leaked gate), `ins=0 pick=0/0/0 st=4` (published
+/// late or never), `ins=0 pick=0/0/0 st=5` (parked before it ever ran — which
+/// cannot happen, and would mean the state machine is the bug), and
+/// `ins>0 st=5 wake=0` (ran, parked, lost its wakeup).
+pub fn dump_slot_table() {
+    use akuma_primitives::safe_print;
+    // Census first, so the one-line answer survives even if the per-slot lines
+    // are torn by a peer core's console writes.
+    let mut by_state = [0u32; 6];
+    let mut gated = 0u32;
+    let mut gated_dead = 0u32;
+    for slot in 0..MAX_TASKS {
+        let (state, gate) = akuma_threading::x86_slot_debug(slot);
+        by_state[usize::from(state).min(5)] += 1;
+        if gate != 0 {
+            gated += 1;
+            // A gate on a slot no core can be running: FREE or TERMINATED. This
+            // is the leak, counted on its own because one of these is enough to
+            // matter and it would otherwise hide among the running cores'.
+            if state == 0 || state == 3 {
+                gated_dead += 1;
+            }
+        }
+    }
+    safe_print!(192,
+        "[SLOT] census core={} free={} ready={} running={} term={} init={} wait={} \
+gated={} gated_dead={}\n",
+        smp::cpu_index(), by_state[0], by_state[1], by_state[2], by_state[3],
+        by_state[4], by_state[5], gated, gated_dead);
+    for slot in 0..MAX_TASKS {
+        let (state, gate) = akuma_threading::x86_slot_debug(slot);
+        let ins = SWITCH_INS[slot].load(Ordering::Relaxed);
+        // Print what can still be the bug.
+        //
+        // A FREE slot with no gate is finished business — after a build most of
+        // the table is exactly that, and without this filter the handful of
+        // lines that matter arrive buried in 500 that do not. A *gated* dead
+        // slot is the opposite: it is a leaked gate, the thing this dump was
+        // built to find.
+        //
+        // **TERMINATED is never filtered when a pid still names the slot.** A
+        // dead thread that some process still claims is the `pthread_join`
+        // corpse: the joiner is parked on `clear_child_tid` and the thread it
+        // is waiting for has already died, so the only thing that could have
+        // woken it — `thread::teardown`'s write-and-wake — either never ran or
+        // ran against the wrong key. That state is invisible from `ps`, which
+        // lists processes, and it is what the second `-j4` wedge of 2026-09-18
+        // turned out to contain: six TERMINATED slots and one live thread.
+        let claimed = akuma_exec::process::pid_for_thread(slot).is_some();
+        if state == 0 && gate == 0 {
+            continue;
+        }
+        if state == 3 && gate == 0 && !claimed {
+            continue;
+        }
+        let (hits, skip_gate, skip_pin) = akuma_threading::x86_slot_pick_counts(slot);
+        let (wake, woken, slot_gen) = akuma_threading::x86_slot_wait_debug(slot);
+        let core = LAST_CORE[slot].load(Ordering::Relaxed);
+        // SAFETY: raw-pointer read of the machine table under the BKL, the same
+        // discipline `hook_can_run` uses; `slot` is in range by the loop bound.
+        let (root, daemon, idle, pinned) = unsafe {
+            let m = &(*machines())[slot];
+            (m.space_root, m.daemon, m.idle, m.pinned)
+        };
+        let pid = akuma_exec::process::pid_for_thread(slot);
+        debug_assert_eq!(claimed, pid.is_some());
+        let sc = LAST_SYSCALL[slot].load(Ordering::Relaxed);
+        // `-1`, not `4294967295`: the sentinel has to read as "never called one"
+        // at a glance, next to a column of small syscall numbers.
+        let sc_show: i64 = if sc == u32::MAX { -1 } else { i64::from(sc) };
+        let sc_n = SYSCALL_ENTRIES[slot].load(Ordering::Relaxed);
+        // Where it parked — `akuma-threading`'s `#[track_caller]` record. The
+        // file is trimmed to its basename: the full path is up to 60 characters
+        // of `crates/akuma-…/src/`, and the line is already unambiguous.
+        let (park_file, park_line) = akuma_threading::park_site(slot)
+            .map_or(("-", 0), |(f, l)| (f.rsplit('/').next().unwrap_or(f), l));
+        safe_print!(288,
+            "[SLOT] {} st={} gate={} ins={} core={} pick={}/{}/{} wake={} woken={} \
+sc={} scn={} gen={} root=0x{:x} daemon={} idle={} pin={} park={}:{} pid={:?}\n",
+            slot, state, gate, ins, core, hits, skip_gate, skip_pin, wake, woken,
+            sc_show, sc_n, slot_gen, root, u8::from(daemon), u8::from(idle), pinned,
+            park_file, park_line, pid);
+    }
+    safe_print!(96, "[SLOT] --- end ---\n");
+}
+
+/// Switches into a non-idle task with no TLS base of its own, from one that had
+/// one — the window the unconditional `%fs` restore in [`hook_switch_to`]
+/// closes. Diagnostics only; reported by the boot suite.
+static STALE_FS_WINDOWS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a switch handed a task a `%fs` it did not own. See
+/// [`STALE_FS_WINDOWS`].
+#[must_use]
+pub fn stale_fs_windows() -> u64 {
+    STALE_FS_WINDOWS.load(Ordering::Relaxed)
+}
+
 static SWITCH_WITHOUT_BKL: AtomicU64 = AtomicU64::new(0);
 
 /// Switches taken without the kernel lock held (`0` is the expected value).
@@ -1280,6 +1518,7 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     paint_canary(trap_base);
     let trap_top = (trap_base + STACK_SIZE) & !0xf;
 
+    reset_slot_counters(slot);
     // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
     // nothing runs on it.
     unsafe {

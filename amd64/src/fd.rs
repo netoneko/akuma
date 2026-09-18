@@ -1265,6 +1265,17 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
                 Some(0) => return 0, // EOF — the client closed the channel
                 Some(_) => return copy_to_user(buf, &one),
                 None => {
+                    // The same hole the futex wait loop had until 2026-09-18:
+                    // an **untimed** park whose only exit is data arriving. A
+                    // process killed while one of its threads sits here — a
+                    // group-fatal signal from a sibling's fault, a `kill(2)`,
+                    // a `pthread_kill` — never reaches a syscall return, and
+                    // the syscall return is where the group exit status is
+                    // read. Checked before the park and after the read, so a
+                    // byte that arrived first still wins.
+                    if akuma_exec::process::should_interrupt_blocking_syscall() {
+                        return errno::EINTR;
+                    }
                     // A park, not a yield: an interactive shell waiting on a
                     // keystroke is the longest wait in this kernel and used to
                     // be its busiest loop.

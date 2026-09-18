@@ -3669,6 +3669,36 @@ pub fn resolve_thread_process(tid: usize) -> Option<Pid> {
     map_pid.or(scan_pid)
 }
 
+/// How many [`entry_point_trampoline`] bail-outs have been reported, and the
+/// ceiling on reports. Bounded because the failure that produces one tends to
+/// produce many, and a console storm is how a kernel loses the line that
+/// mattered — the same discipline `[ORPHAN-KILL]` follows above.
+static TRAMP_BAIL_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// Total bail-outs, by reason, for a caller that wants the tally after the
+/// report ceiling has been reached.
+static TRAMP_BAILS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Say that thread `tid` was spawned and abandoned before it ran, and why.
+fn tramp_bail_report(tid: usize, why: &str) {
+    TRAMP_BAILS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if TRAMP_BAIL_REPORTS.fetch_add(1, Ordering::Relaxed) < 64 {
+        crate::safe_print!(160,
+            "[TRAMP-BAIL] tid={} reason={} pid={:?} — thread abandoned before its \
+first instruction\n",
+            tid, why, table::pid_for_thread(tid));
+    }
+}
+
+/// How many threads [`entry_point_trampoline`] has abandoned before their first
+/// user instruction. `0` is the healthy value; anything else is a spawn that
+/// was paid for and thrown away, and for the `pre-terminated` reason it is also
+/// a process left with no thread.
+#[must_use]
+pub fn trampoline_bail_count() -> u64 {
+    TRAMP_BAILS_TOTAL.load(Ordering::Relaxed)
+}
+
 pub extern "C" fn entry_point_trampoline() -> ! {
     let tid = crate::threading::current_thread_id();
     if lifecycle_trace_on() {
@@ -3681,9 +3711,19 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     let proc = resolve_thread_process(tid).and_then(table::active_process_ref);
 
     if proc.is_none() || crate::threading::is_thread_terminated(tid) {
-        if proc.is_none() {
-            log::debug!("[process] FATAL: No process found for thread {}", tid);
-        }
+        // Loud, and both reasons named. This branch abandons a thread that was
+        // spawned and never ran a user instruction, and — for the
+        // `is_thread_terminated` half — it leaves the *process* registered and
+        // ACTIVE with no live thread: unschedulable, unable to exit, never
+        // reaped, and its parent's `wait4` blocked on it forever. That is the
+        // orphan shape three separate investigations have landed on
+        // (`GRACE_EXPIRED_HARD_KILL_ORPHANS.md`,
+        // `J4_TWO_FAILURES_BEHIND_ORPHANS.md`,
+        // `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §12) and until now it was
+        // reported by a `log::debug!` on one of the two paths and by nothing at
+        // all on the other. A silent bail here reads downstream as "the
+        // scheduler never picked it", which is a different bug.
+        tramp_bail_report(tid, if proc.is_none() { "no-process" } else { "pre-terminated" });
         crate::threading::mark_current_terminated();
         loop { crate::threading::yield_now(); }
     }
@@ -3710,6 +3750,11 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     }
     
     if proc.exited.load(Ordering::Relaxed) {
+        // Benign compared with the two above — the process really is finished,
+        // so nothing is waiting on this thread — but silent all the same, and a
+        // spawn that lands here is still a spawn whose cost was paid for
+        // nothing. Counted so its rate can be compared against the other two.
+        tramp_bail_report(tid, "process-exited");
         crate::threading::mark_current_terminated();
         loop { crate::threading::yield_now(); }
     }

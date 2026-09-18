@@ -45,6 +45,8 @@ use akuma_syscalls_sync::key::{self, Namespace};
 use akuma_syscalls_sync::op::{self, Action};
 use akuma_syscalls_sync::table::{Key, MATCH_ANY, WaiterId, WaiterTable};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::fd::errno;
 use crate::serial;
 
@@ -56,8 +58,14 @@ use crate::serial;
 /// `purge` hook exists for — [`purge_task`] is called from thread teardown so a
 /// recycled slot can never inherit a dead thread's queue entry and absorb a
 /// wake meant for someone else.
+///
+/// The second field is the uptime the entry was made, carried for diagnostics
+/// only ([`dump_waiters`]) and deliberately not part of any decision. It is
+/// what separates "five threads stalled at the same instant" — one lost wake —
+/// from "they piled up over a minute", which is an ordinary lock convoy, and
+/// the two are indistinguishable from the table's contents alone.
 #[derive(Clone, Copy)]
-struct Waiter(usize);
+struct Waiter(usize, u64);
 
 impl WaiterId for Waiter {
     fn tid(self) -> usize {
@@ -165,7 +173,8 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         return errno::EAGAIN;
     }
     // SAFETY: raw-pointer access under the BKL; see `WAITERS`.
-    unsafe { (*waiters()).enqueue(key, Waiter(me), bitset) };
+    unsafe { (*waiters()).enqueue(key, Waiter(me, crate::net::uptime_us()), bitset) };
+    WAIT_ENQUEUES.fetch_add(1, Ordering::Relaxed);
 
     loop {
         // Arm the park before the membership test. A `FUTEX_WAKE` that dequeues
@@ -215,6 +224,37 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
             let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
             return errno::EINTR;
         }
+        // **And the leader's route out, which the line above cannot be.**
+        //
+        // `should_leave_now` returns `false` for the main thread by
+        // construction — `thread::drain` is called *by* the leader and must not
+        // interrupt itself — and it reads `GROUP_EXIT`, which only `exit_group`
+        // and `drain` ever set. Neither is on the path a *fault* takes:
+        // `signal::notify_group_of_thread_fatal` records a group exit status
+        // and calls `deliver_signal`, on the stated understanding that "every
+        // group member's next syscall return takes this exit". A leader parked
+        // in an untimed `FUTEX_WAIT` has no next syscall return, so it never
+        // took it — and since the loop's only other exits are a dequeue and a
+        // deadline it does not have, it parked forever.
+        //
+        // That is the `-j4` wedge, measured end to end 2026-09-18
+        // (`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13): a rustc worker `#GP`s,
+        // its siblings die, and the leader sits on `pthread_join`'s futex for
+        // the whole 600 s budget while `cargo`'s `wait4` waits on a process
+        // that can never exit. `[BKL] stuck` silent, no leaked scheduler gate,
+        // nothing in `ps` but a row at `0:00`.
+        //
+        // `should_interrupt_blocking_syscall` is the predicate every blocking
+        // arm in `akuma-syscalls-glue` already consults, and it **takes** the
+        // interrupted flag rather than peeking, so this cannot become an
+        // `EINTR` storm. `EINTR` is also what Linux returns here; musl retries
+        // it, and the retry is what carries the thread through the syscall
+        // epilogue where `group_exit_status` is waiting for it.
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
+            // SAFETY: raw-pointer access under the BKL.
+            let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
+            return errno::EINTR;
+        }
         if deadline::expired(deadline_at, crate::net::uptime_us()) {
             // `remove_anywhere`, not `dequeue(key, ..)`: a `FUTEX_REQUEUE` may
             // have moved this waiter behind its back, and dequeuing from the
@@ -251,9 +291,102 @@ fn wake(uaddr: u64, val: u32, mask: u32, private: bool) -> u64 {
     let key: Key = (namespace(private), uaddr as usize);
     // SAFETY: raw-pointer access under the BKL.
     let woken = unsafe { (*waiters()).wake(key, val, mask) };
+    WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if woken.is_empty() {
+        // A wake that found nobody. **Not by itself a bug** — the overwhelmingly
+        // common case is an uncontended mutex unlock, where musl calls
+        // `FUTEX_WAKE` because it cannot know there is no waiter. It earns a
+        // counter because the *ratio* is the diagnostic: a process whose threads
+        // are all parked while empty wakes keep arriving is a key mismatch (the
+        // waiter is queued under a different `(tgid, uaddr)` than the waker
+        // computes), which looks identical from `ps` to a userspace deadlock and
+        // is a kernel bug where the other is not.
+        WAKE_EMPTY.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WOKEN_TOTAL.fetch_add(woken.len() as u64, Ordering::Relaxed);
+    }
     resume(&woken);
     woken.len() as u64
 }
+
+/// `FUTEX_WAKE` calls, calls that found no waiter, waiters actually woken, and
+/// `FUTEX_WAIT` enqueues. See [`dump_waiters`] for how to read them.
+static WAKE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// See [`WAKE_CALLS`].
+static WAKE_EMPTY: AtomicU64 = AtomicU64::new(0);
+/// See [`WAKE_CALLS`].
+static WOKEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// See [`WAKE_CALLS`].
+static WAIT_ENQUEUES: AtomicU64 = AtomicU64::new(0);
+
+/// Every queued futex waiter, by key, plus the wake tallies.
+///
+/// # Why this exists
+///
+/// The slot table (`sched::dump_slot_table`) says a thread is `WAITING` and
+/// that its last syscall was `futex`. It cannot say *which* futex, and that is
+/// the whole remaining question for the `-j4` wedge: five threads of one
+/// address space parked in an untimed `FUTEX_WAIT`, waking on the scheduler's
+/// backstop every half second, re-testing membership and re-parking, with no
+/// new syscall between (`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13).
+///
+/// Two very different faults produce that, and the key is what tells them
+/// apart. If all the parked threads sit on **one** key with nobody outside it
+/// to unlock, it is an ordinary userspace deadlock — possibly downstream of an
+/// earlier dropped wake, but not a live kernel bug. If they sit on keys whose
+/// `tgid` differs while sharing one address space, or if `WAKE_EMPTY` is
+/// climbing against a table that is not empty, the waker and the waiter
+/// disagree about the key and the kernel is losing wakes.
+///
+/// Allocation-free and bounded: borrows through [`WaiterTable::iter`] and
+/// prints at most [`DUMP_KEY_LIMIT`] keys.
+pub fn dump_waiters() {
+    let (calls, empty, woken, enq) = (
+        WAKE_CALLS.load(Ordering::Relaxed),
+        WAKE_EMPTY.load(Ordering::Relaxed),
+        WOKEN_TOTAL.load(Ordering::Relaxed),
+        WAIT_ENQUEUES.load(Ordering::Relaxed),
+    );
+    akuma_primitives::safe_print!(160,
+        "[FUTEX] wakes={} empty={} woken={} enqueues={}\n", calls, empty, woken, enq);
+    let now = crate::net::uptime_us();
+    // SAFETY: raw-pointer read under the BKL, the same discipline every other
+    // reader of this table uses.
+    let t = unsafe { &*waiters() };
+    let mut keys = 0usize;
+    for (key, q) in t.iter() {
+        if q.is_empty() {
+            continue;
+        }
+        keys += 1;
+        if keys > DUMP_KEY_LIMIT {
+            continue;
+        }
+        // One line per key, the tids inline. A queue longer than eight is
+        // truncated rather than wrapped — the interesting case is a handful of
+        // threads, and an unbounded line is how a console loses the next one.
+        let mut w = akuma_primitives::console::StackWriter::<224>::new();
+        let _ = core::fmt::write(&mut w, format_args!(
+            "[FUTEX] key tgid={} uaddr=0x{:x} waiters={} tids=", key.0, key.1, q.len()));
+        for (h, bits) in q.iter().take(8) {
+            // `tid/bitset@age-in-ms`. The age is the diagnostic: see `Waiter`.
+            let _ = core::fmt::write(&mut w, format_args!(
+                "{}/{:#x}@{}ms ", h.tid(), bits, now.saturating_sub(h.1) / 1000));
+        }
+        let _ = core::fmt::write(&mut w, format_args!("\n"));
+        w.flush();
+    }
+    if keys > DUMP_KEY_LIMIT {
+        akuma_primitives::safe_print!(96,
+            "[FUTEX] ... {} more non-empty keys\n", keys - DUMP_KEY_LIMIT);
+    }
+    if keys == 0 {
+        akuma_primitives::safe_print!(64, "[FUTEX] no queued waiters\n");
+    }
+}
+
+/// How many keys [`dump_waiters`] prints before summarising the rest.
+const DUMP_KEY_LIMIT: usize = 24;
 
 /// Tell the scheduler to look at every waiter the table just took off a queue.
 ///

@@ -2792,11 +2792,14 @@ fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
         // resume one stack — and allowed here: the boot thread is pinned to the
         // boot core, and each idle thread to its own, which `can_run` answers.
         if ON_CPU[candidate].load(Ordering::Acquire) != 0 {
+            PICK_SKIP_ONCPU[candidate].fetch_add(1, Ordering::Relaxed);
             continue;
         }
         if !(hooks.can_run)(candidate) {
+            PICK_SKIP_CANRUN[candidate].fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        PICK_HITS[candidate].fetch_add(1, Ordering::Relaxed);
         return Some(candidate);
     }
     None
@@ -3031,9 +3034,42 @@ pub fn x86_claim_slot() -> Option<usize> {
             // with the dead process's signal. Only `ON_CPU` is kept below,
             // because this claim path owns it directly.
             scrub_thread_slot(slot);
+            // Drop per-tid registrations held outside this crate — on x86_64
+            // that is the futex waiter table — before the slot can be used.
+            //
+            // **This is the x86 half of a hook that had no x86 half at all.**
+            // The other kernel reaches [`SLOT_PURGE_CALLBACK`] twice: from
+            // `mark_thread_terminated`, and from the slot recycler. This target
+            // uses neither — it claims a `TERMINATED` slot here, directly — so
+            // until 2026-09-18 nothing ever purged, and a thread that died
+            // without running `amd64::thread::teardown` (a fault kill, a
+            // group-fatal signal, a deferred kill that never reached its
+            // boundary) left its tid queued on a futex key forever. The next
+            // occupant of the slot inherits it, and a `FUTEX_WAKE(uaddr, 1)`
+            // then pops the *stale* entry, counts it toward `max_wake` and
+            // leaves the real waiter parked — the lost wakeup behind the `-j4`
+            // wedge (`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13). The same
+            // trap as `amd64::thread::teardown`'s `set_cleanup_callback` note,
+            // which reasoned about that hook and not about this one.
+            //
+            // Holds none of this module's locks here, so the hook may take its
+            // own — the same context the two AArch64 sites document.
+            if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
+                purge(slot);
+            }
             WAKE_TIMES[slot].store(0, Ordering::SeqCst);
             WOKEN_STATES[slot].store(false, Ordering::SeqCst);
             ON_CPU[slot].store(0, Ordering::SeqCst);
+            // The picker tallies are per *occupant*, not per slot. Without this
+            // they accumulate across every rebirth, and the one question they
+            // exist to answer — "was this thread ever picked?" — comes back
+            // with the previous occupant's answer. Caught on the instrument's
+            // first boot: three idle threads reported syscalls they had not
+            // made, because low slots are recycled by the boot self-tests
+            // before SMP bring-up claims them.
+            PICK_HITS[slot].store(0, Ordering::Relaxed);
+            PICK_SKIP_ONCPU[slot].store(0, Ordering::Relaxed);
+            PICK_SKIP_CANRUN[slot].store(0, Ordering::Relaxed);
             // The generation is what makes a `WakeHandle` for the *previous*
             // occupant inert. Bumped here — under the winning CAS, before
             // anything can hold a handle to the new occupant — which is the
@@ -3131,6 +3167,83 @@ pub fn x86_slot_is_live(slot: usize) -> bool {
 #[must_use]
 pub fn x86_slot_is_waiting(slot: usize) -> bool {
     slot < MAX_THREADS && THREAD_STATES[slot].load(Ordering::Acquire) == thread_state::WAITING
+}
+
+/// Per-slot tally of [`x86_pick_next`] outcomes: skipped because another core
+/// holds the on-CPU gate, skipped because [`X86ArchHooks::can_run`] said no,
+/// and returned as the pick.
+///
+/// # Why per-slot, and why all three
+///
+/// A thread that is created and never scheduled is invisible from outside: it
+/// looks the same whether the picker never *considered* it (its state is not
+/// `READY`), considered and rejected it for a gate a peer core left set, or
+/// rejected it for pinning. Those are three unrelated bugs. A global counter
+/// says a skip happened; only a per-slot one says *which slot* is the one
+/// nothing will ever run, which is the whole question
+/// (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §12).
+///
+/// `PICK_HITS` is the control: a slot with zero hits and a large
+/// `PICK_SKIP_ONCPU` is a leaked gate; zero of both means the scan never got
+/// past the state test and the fault is upstream of the picker entirely.
+///
+/// `u64` rather than `u32` on purpose — a wrapped counter reads as "never
+/// skipped", which is exactly the answer being hunted. Relaxed: these are read
+/// long after the fact by a diagnostic, never to make a decision.
+#[cfg(target_arch = "x86_64")]
+static PICK_SKIP_ONCPU: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// See [`PICK_SKIP_ONCPU`].
+#[cfg(target_arch = "x86_64")]
+static PICK_SKIP_CANRUN: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// See [`PICK_SKIP_ONCPU`].
+#[cfg(target_arch = "x86_64")]
+static PICK_HITS: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// `(picked, skipped for the on-CPU gate, skipped for pinning)` for `slot`.
+/// Diagnostics only; see [`PICK_SKIP_ONCPU`] for how to read the triple.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_slot_pick_counts(slot: usize) -> (u64, u64, u64) {
+    if slot >= MAX_THREADS {
+        return (0, 0, 0);
+    }
+    (
+        PICK_HITS[slot].load(Ordering::Relaxed),
+        PICK_SKIP_ONCPU[slot].load(Ordering::Relaxed),
+        PICK_SKIP_CANRUN[slot].load(Ordering::Relaxed),
+    )
+}
+
+/// `(wake deadline in us, woken flag, slot generation)` for `slot`.
+///
+/// The other half of [`x86_slot_debug`]: a `WAITING` slot is a lost wakeup or a
+/// dead timer depending on whether it carries a deadline, and whether that
+/// deadline is in the past. A deadline of `0` means "no timeout — only a waker
+/// can release this", which is the shape a lost `futex`/pipe wake leaves
+/// behind; a deadline already passed means [`x86_wake_pass`] is not running.
+/// The generation distinguishes a fresh occupant from the slot's previous one.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_slot_wait_debug(slot: usize) -> (u64, bool, u64) {
+    if slot >= MAX_THREADS {
+        return (0, false, 0);
+    }
+    (
+        WAKE_TIMES[slot].load(Ordering::Relaxed),
+        WOKEN_STATES[slot].load(Ordering::Relaxed),
+        SLOT_GEN[slot].load(Ordering::Relaxed),
+    )
 }
 
 /// `(thread state, on-cpu gate)` for `slot`, for diagnostics only.
@@ -5365,6 +5478,57 @@ pub fn untimed_park_backstop_wakes() -> u64 {
 /// The spelling every "wait until something happens" arm uses, in place of a
 /// bare `schedule_blocking(u64::MAX)`. Unregistered it *is* that call, so a
 /// target that installs no backstop is unchanged.
+/// Where each thread last parked, as a `&'static Location` stored as a pointer.
+/// `0` = it has never parked.
+///
+/// # Why a source location and not a tag
+///
+/// A parked thread's *state* says it is waiting and its last syscall number
+/// says which call it entered, and between them those two still do not say
+/// where in the kernel it stopped: a `futex` syscall parks in the wait loop, in
+/// a demand-paging read of `uaddr`, and (via a wake that dequeued it) nowhere
+/// at all. The `-j4` wedge turned on exactly that gap — four threads reported
+/// `WAITING` with `sc=futex` while the futex table held no entry for any of
+/// them (`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13), which is a combination
+/// no amount of reading either column can explain.
+///
+/// `#[track_caller]` on the two park entry points is what makes this free of
+/// per-call-site bookkeeping: every existing caller is covered, including the
+/// twenty-odd blocking arms in `akuma-syscalls-glue` that never go through a
+/// target's own `sched` module.
+static PARK_SITES: [AtomicUsize; MAX_THREADS] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Record the caller of a park entry point against `tid`. See [`PARK_SITES`].
+#[track_caller]
+fn note_park_site(tid: usize) {
+    if tid < MAX_THREADS {
+        let loc: &'static core::panic::Location<'static> = core::panic::Location::caller();
+        PARK_SITES[tid].store(core::ptr::from_ref(loc) as usize, Ordering::Relaxed);
+    }
+}
+
+/// `(file, line)` of `tid`'s last park, or `None` if it has never parked.
+#[must_use]
+pub fn park_site(tid: usize) -> Option<(&'static str, u32)> {
+    if tid >= MAX_THREADS {
+        return None;
+    }
+    let p = PARK_SITES[tid].load(Ordering::Relaxed);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY: the only writer is `note_park_site`, which stores a
+    // `&'static Location<'static>` obtained from `Location::caller()`. A
+    // `Location` is compiled into the binary's read-only data and lives for the
+    // whole program, so the pointer is valid for `'static` and never dangles.
+    let loc: &'static core::panic::Location<'static> = unsafe { &*(p as *const _) };
+    Some((loc.file(), loc.line()))
+}
+
+#[track_caller]
 pub fn park_indefinitely() {
     let backstop = UNTIMED_PARK_BACKSTOP_US.load(Ordering::Relaxed);
     if backstop == 0 {
@@ -5440,8 +5604,10 @@ mod untimed_park_backstop_tests {
     }
 }
 
+#[track_caller]
 pub fn schedule_blocking(wake_time_us: u64) {
     let tid = current_thread_id();
+    note_park_site(tid);
 
     // Check if we were already woken (sticky wake)
     if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {

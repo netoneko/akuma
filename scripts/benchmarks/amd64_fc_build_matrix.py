@@ -140,6 +140,35 @@ def wedge_evidence(vcpus):
         ev[name] = (out or err).strip()[:2000]
     rc, out, _ = hpbox.ubuntu(f"tail -c 4000 {FC_LOG}", timeout=60)
     ev["console_tail"] = out.strip()[-2500:]
+    # The scheduler's own view of every live slot (`sched::dump_slot_table`,
+    # 2026-09-18). Read from the host-side console log, never from the guest's
+    # `dmesg`: that is a 64 KiB ring and one dump is a few KiB, so the guest
+    # would show the last dump and nothing to compare it against. Two blocks are
+    # taken, not one — a counter that has *not* moved between them is the whole
+    # point, and a single snapshot cannot say that.
+    rc, out, _ = hpbox.ubuntu(
+        f"grep -aE '\\[SLOT\\]|\\[FUTEX\\]' {FC_LOG} | tail -n 400", timeout=60)
+    # A block runs from one census line to the next — **not** to `--- end ---`,
+    # because `futex::dump_waiters` prints after the slot table and its lines
+    # are half the answer (`§13`: the slot table says "WAITING in futex", the
+    # futex lines say on which key and for how long).
+    blocks, cur = [], []
+    for ln in out.splitlines():
+        if "census" in ln:
+            if cur:
+                blocks.append(cur)
+            cur = [ln]
+        elif cur:
+            cur.append(ln)
+    if cur:
+        blocks.append(cur)
+    rc, out, _ = hpbox.ubuntu(
+        f"grep -aE 'TRAMP-BAIL|PROC-ORPHAN|TRAMP-MISMATCH|ORPHAN-KILL|"
+        f"DRAIN INCOMPLETE|NO map owner|unregister' {FC_LOG} "
+        f"| tail -n 60", timeout=60)
+    ev["orphan_lines"] = out.strip()[-4000:]
+    ev["slot_blocks"] = len(blocks)
+    ev["slot_table"] = "\n".join("\n".join(b) for b in blocks[-2:])
     # The counters this kernel already keeps for exactly this bug. `dmesg` is a
     # 64 KiB ring, so a long wedge can have overwritten the boot — grep, and
     # report absence as absence rather than as zero.
@@ -147,6 +176,8 @@ def wedge_evidence(vcpus):
     marks = [ln for ln in out.splitlines()
              if re.search(r"SWITCH NO-BKL|SWITCH BADFRAME|SWITCH FRAME MOVED|"
                           r"SWITCH FREED-CR3|BKL\] stuck|TRAMP-MISMATCH|"
+                          r"TRAMP-BAIL|PROC-ORPHAN|ORPHAN-KILL|"
+                          r"DRAIN INCOMPLETE|NO map owner|"
                           r"CANARY|PANIC", ln)]
     ev["tripwires"] = marks[-40:]
     ev["tripwire_count"] = len(marks)
@@ -243,6 +274,10 @@ def main():
                       else "    vCPU busy: unreadable", flush=True)
                 print(f"    tripwire lines in dmesg: {ev.get('tripwire_count')}",
                       flush=True)
+                census = [ln for ln in (ev.get("slot_table") or "").splitlines()
+                          if "census" in ln]
+                print("    " + (census[-1] if census else "no slot census captured"),
+                      flush=True)
 
     print("\n=== %s, in the box's Firecracker guest ===" % a.crate)
     print(f"{'vcpu':>5} {'jobs':>5} {'outcome':>8} {'wall':>8} {'cargo':>8}")
@@ -263,6 +298,10 @@ def main():
                 for ln in ev.get("tripwires", []):
                     print("   ", ln[:160])
                 print("  console tail:\n", (ev.get("console_tail") or "")[-1200:])
+                print("  orphan / trampoline lines:\n",
+                      ev.get("orphan_lines") or "(none)")
+                print(f"  slot-table dumps seen: {ev.get('slot_blocks')}")
+                print("  last two slot tables:\n", ev.get("slot_table") or "(none)")
 
     return 0 if all(r["outcome"] == "PASS" for r in results) else 1
 

@@ -841,6 +841,10 @@ extern "C" fn syscall_handler(
     // was not). Holding the BKL implies passing through here or through a
     // fault, so this one line is what makes `tag=` name the holder's syscall.
     akuma_bkl::sync::set_holder_tag(crate::smp::cpu_index_u32(), nr);
+    // Per-slot, for `sched::dump_slot_table`: the pair `(thread state, this)`
+    // says where a parked thread is parked, which the `[BKL]` tag above cannot
+    // — that one is per *core* and names whoever last held the lock.
+    crate::sched::note_syscall_entry(nr);
     CALLS.fetch_add(1, Ordering::Relaxed);
     // Per-process syscall counters — the `[PSTATS]` machinery, aarch64 parity
     // (`akuma-kernel-glue` bumps the same counters through the `akuma-syscalls`

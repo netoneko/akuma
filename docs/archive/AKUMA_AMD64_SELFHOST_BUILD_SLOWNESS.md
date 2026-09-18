@@ -1688,6 +1688,15 @@ laptop.
 
 ### 12. The wedge, cornered: both variables are necessary, and it is not the free path (2026-09-18)
 
+> **Corrected 2026-09-18 by §13.** The matrix, the cheap repro and the
+> free-path elimination below all stand. The *characterisation* does not: this
+> section calls the primary failure "runnable tasks that no core ever picks",
+> and the instrument it asks for in next-step 1 was built and says the
+> opposite — every wedged thread is `WAITING` in `futex`, scheduled about once
+> a second, with no leaked `ON_CPU` gate anywhere. Read §13 before acting on
+> the next-steps list here; items 1 and 2 are answered and item 2's hypothesis
+> is retired.
+
 *§11 left three symptoms and a guess that they were one bug in "multi-threaded
 user processes at SMP>1". This session measured the variables separately,
 reproduced the wedge twice on a **single-crate** build, and eliminated the
@@ -1876,6 +1885,363 @@ crate's `out` directory before re-running it.
    frame moving while the switch that is about to restore it looks on".
 3. Then the bare metal with `pmm-forensics`, for the `cr2`-is-ASCII
    corruption at 24 crates, which this session did not reach.
+
+
+### 13. The wedge is a futex stall, not a scheduler starvation — §12's premise was wrong (2026-09-18)
+
+*§12 named the primary failure "runnable tasks that no core ever picks" and
+made the scheduler the next place to look. The instrument it asked for was
+built, and it says the opposite: every wedged thread is **parked**, every one
+of them in `futex`, and the scheduler is picking them roughly once a second
+and has never lost a gate.*
+
+#### The instrument
+
+Three things that did not exist on this target, all printed from the idle
+loop's existing 30 s `[PSTATS]` block:
+
+- **`sched::dump_slot_table`** — one line per live slot, with the four facts
+  that separate the ways a task can fail to run: the thread state, the `ON_CPU`
+  gate, a **switch-in count** (`ins`), and the picker's own per-slot tally of
+  hits / skipped-for-gate / skipped-for-pinning. Plus the last syscall each slot
+  *entered* (`sc`) and how many it has entered (`scn`), recorded in
+  `usermode::syscall_handler`.
+- **`futex::dump_waiters`** — every queued waiter by `(tgid, uaddr)` key, with
+  each waiter's age, and the `FUTEX_WAKE` tallies including wakes that found
+  nobody.
+- **`scripts/benchmarks/amd64_slot_report.py`** — reads two consecutive blocks
+  and prints the **difference**, which is the only form in which these numbers
+  answer the question.
+
+**`ins` and `scn` together are the whole finding, and `ps` cannot express
+either.** `ps`'s `TIME` column is `m:ss`, so a thread scheduled 600 times that
+parks immediately each time reads `0:00` exactly like a thread that has never
+run — which is how "created and never scheduled" survived two sessions.
+
+The instrument also caught a defect in itself on its first boot, which is worth
+recording because the same mistake is available to anything per-slot here: the
+counters are per **occupant**, not per slot index, and without a reset at
+`x86_claim_slot`/`prepare_task_slot` they accumulate across every rebirth. Three
+idle threads reported eleven syscalls each, ending in `exit_group`, left behind
+by the boot self-tests' tasks in the same low slots. Uncorrected, `ins = 0`
+would have been read as "never scheduled" for a slot that had been recycled.
+
+#### What a wedged guest actually contains
+
+Same cell as §12 (`zerocopy`, vcpu=4, `-j4`), same outcome — WEDGE at the 600 s
+budget, vCPU 8.2 % — and the last two 30 s blocks differ like this:
+
+```
+ slot        pid    state         sc gate       ins   +ins       scn    +scn
+    0       None  WAITING          -    1     18486   +678         0      +0   boot thread
+    1       None  RUNNING          -    1     58841  +2966         0      +0   idle, core 1
+    2       None  RUNNING          -    1     58504  +2946         0      +0   idle, core 2
+    3       None  RUNNING          -    1     59664  +2977         0      +0   idle, core 3
+    5    Some(1)  WAITING  nanosleep    0    177668  +8930    709533  +35720   sshd
+    7   Some(60)  WAITING      futex    0      1213    +59     22652    +472   cargo
+    8   Some(61)  WAITING      futex    0       595    +30        79      +0
+    9   Some(62)  WAITING      futex    0       595    +30        24      +0
+   10   Some(63)  WAITING   recvfrom    0       594    +30        24      +0
+   11   Some(64)  WAITING      futex    0       602    +30       186      +0   rustc
+   12   Some(65)  WAITING      futex    0       594    +30         7      +0
+   13   Some(66)  WAITING      futex    0       654    +30     18596      +0
+   14   Some(67)  WAITING      futex    0       596    +30        11      +0
+   15   Some(68)  WAITING      futex    0       599    +30        35      +0
+
+leaked on-CPU gates: none
+```
+
+Read it in this order:
+
+1. **`st` is `WAITING` (5), not `READY`.** No thread in the system is runnable
+   and unpicked. The starvation hypothesis has nothing to stand on.
+2. **`gate=0` on every user thread, and `gated_dead=0` in all twenty census
+   lines.** The leaked-`ON_CPU` hypothesis §12 put first is dead. The four set
+   gates are the boot thread and the three idle threads, which hold them because
+   they are running.
+3. **`+ins` is ~30 per 30 s and `+scn` is exactly 0.** Each of these threads is
+   scheduled about once a second, runs, and makes no syscall. That is the
+   signature of the untimed-park backstop (`akuma_threading`'s
+   `UNTIMED_PARK_BACKSTOP_US`) releasing a waiter, the futex wait loop
+   re-testing its table membership, finding itself still queued, and parking
+   again. Forever: the loop's only other exits are a dequeue and
+   `should_leave_now`.
+4. **`sc=202` is `futex`** on eight of the nine user threads, and `sc` is the
+   last syscall *entered*, so a `WAITING` thread is parked inside it.
+5. The two address spaces are `0x208a4000` (cargo, four threads) and
+   `0x23864000` (rustc, five threads). Both are entirely parked.
+
+`cargo` is the one thing still moving — 472 syscalls in the last 30 s — so the
+guest is not frozen, it is deadlocked around the futex table. sshd answers ssh
+throughout, which is why `ps` works at all.
+
+#### What this retires
+
+- **"Created and never scheduled" is wrong**, and §10, §11 and §12 all lean on
+  it. The threads were scheduled hundreds of times each. Nothing in the
+  scheduler was ever the suspect the shape suggested.
+- **The `ON_CPU` gate ordering question (§12 next-step 2) is moot for this
+  bug.** It may still be worth tightening on its own merits — amd64 clears the
+  gate before the stack moves where AArch64 clears it after `mov sp, x0` — but
+  no gate was leaked in a full reproduced wedge, and `[SWITCH NO-BKL]`,
+  `[SWITCH FRAME MOVED]` and `[BKL] stuck` were all silent (`tripwire lines in
+  dmesg: 0`).
+- **The orphaned-process hypothesis is eliminated too.** `[PROC-ORPHAN]` — the
+  hook the previous session wired into this same idle-loop block — printed
+  **zero** lines, as did `[unregister] … has NO map owner`, the suspected
+  `x86_claim_slot`-window killer. Every process has a live thread; the threads
+  are simply asleep. Eight `[TRAMP-MISMATCH]` lines do appear, at the same rate
+  as §12's, and remain unexplained but are evidently survivable.
+
+#### Also closed: three silent bail-outs in the spawn trampoline
+
+`entry_point_trampoline` abandons a thread before its first user instruction in
+three places — no process resolved, the thread already `TERMINATED`, the process
+already exited — and each ended in `mark_current_terminated(); loop { yield_now()
+}`. One carried a `log::debug!`; the other two were completely silent. The
+middle one also leaves the **process** registered with no live thread, which is
+the orphan shape three separate investigations have landed on. They now report
+`[TRAMP-BAIL] tid=… reason=…`, bounded at 64 lines, with a `trampoline_bail_count()`
+for the tally after that. This is a diagnostic gap closed, not a fix: on the run
+above the count was zero.
+
+#### The root cause: a group-fatal kill that cannot reach a parked leader
+
+The second 4x4 wedge of the day carried the line the first did not:
+
+```
+[Fault] #GP general protection in ring 3 on cpu 0 err=0x0
+        rip=0x00000000300465ec rsp=0x11d3b7810 cr2=0x10
+        cr3=0x000000002383d000 task=16 pid=64 — killing the process
+```
+
+`cr3=0x2383d000` is `rustc`'s address space and `pid=64` its tgid. A worker
+thread `#GP`ed. Ten minutes later the slot table said `term=6 wait=9`: six of
+`rustc`'s threads dead, **and the leader still parked in `futex`, queued on one
+key for 563 s**, with `[FUTEX] wakes=` frozen at 13 820 for the whole wedge —
+not one `FUTEX_WAKE` issued by anybody, in either direction.
+
+So "killing the process" killed the workers and left the leader asleep. The
+process can never exit, so `cargo`'s `wait4` never returns, so the build hangs.
+
+The mechanism is three functions that each behave exactly as documented:
+
+1. `idt::user_fault` → `usermode::kill_current_from_fault` →
+   `signal::notify_group_of_thread_fatal`, which records a **group exit
+   status** and calls `deliver_signal(tgid, sig)`. Its own comment states the
+   contract: *"every group member's next syscall return takes this exit"*.
+2. `signal.rs`'s syscall-return epilogue honours that, unconditionally and
+   ahead of every disposition — which is what stops a leader with a `SIGSEGV`
+   handler (rustc installs one) from *handling* the notification and living on.
+   That half was fixed on 2026-09-13 and works.
+3. `futex::wait`'s park loop has exactly three exits: dequeued, deadline
+   passed, or `thread::should_leave_now()`.
+
+**A leader parked in an untimed `FUTEX_WAIT` has no next syscall return**, so
+(1)'s contract is never discharged and (2) never runs. And (3) cannot save it,
+for two independent reasons: `should_leave_now()` returns `false` for the main
+thread *by construction* — `thread::drain` is called by the leader and must not
+interrupt itself — and it reads `GROUP_EXIT`, which only `exit_group` and
+`drain` ever set, neither of which is on a fault's path. The deadline is
+`NEVER`. So the loop is closed, and the 1 s untimed-park backstop faithfully
+wakes the thread every second to re-confirm that it is still stuck — which is
+the `+ins 30 / +scn 0` signature above.
+
+#### The fix
+
+One check, beside the `should_leave_now` arm it cannot substitute for:
+
+```rust
+if akuma_exec::process::should_interrupt_blocking_syscall() {
+    let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
+    return errno::EINTR;
+}
+```
+
+That is the predicate every blocking arm in `akuma-syscalls-glue` already
+consults, and the one `deliver_signal` actually sets. It **takes** the
+interrupted flag rather than peeking, so it cannot become an `EINTR` storm;
+`EINTR` is what Linux returns from an interrupted `FUTEX_WAIT`; and musl's
+retry is precisely what carries the thread through the syscall epilogue where
+`group_exit_status` is waiting for it.
+
+`fd.rs`'s console/stdin read loop had the identical hole — an untimed park
+whose only exit is a byte arriving — and got the identical check. That one is
+not on the build path; it is the shape an interactive `sshd` session hangs in
+when its process is killed while waiting for a keystroke.
+
+#### The A/B: 600 s of silence becomes 2.2 s of error
+
+Same harness, same crate, kernel rebuilt with the one check:
+
+| vcpu | jobs | before | after |
+|---|---|---|---|
+| 4 | 1 | PASS 17.4 s | **PASS 17.4 s** — unchanged |
+| 4 | 4 | WEDGE 600 s | **ERROR 2.2 s** |
+| 4 | 4 | WEDGE 600 s | **ERROR 2.2 s** |
+
+and what cargo now says, which it could never say before:
+
+```
+rustc --crate-name build_script_build … (signal: 11, SIGSEGV: invalid memory reference)
+```
+
+Deterministic both ways: two wedges before, two reported crashes after, and the
+healthy cell unmoved to the tenth of a second. **The bug that took 600 s to
+observe now reproduces in 2.2 s and prints its own name.**
+
+**What this does not fix.** The `#GP` itself. With this change `rustc` dies
+with a `SIGSEGV` the build *reports* instead of a 600 s silence, which is a
+much better failure and a bisectable one, but it is still a failure. The
+faulting `rip=0x300465ec` is in the dynamic loader's range and is a different
+site from §12's `#PF cr2=0x34 rip=0x1028d0b20`; whether those are one
+corruption or two is the next question.
+
+#### Two more defects found on the way, both fixed
+
+- **The futex waiter table was never purged on this target except from
+  `thread::teardown`.** `akuma-threading` reaches `SLOT_PURGE_CALLBACK` from
+  `mark_thread_terminated` and from its slot recycler; amd64 uses neither — it
+  claims a `TERMINATED` slot directly in `x86_claim_slot` — and registered no
+  callback at all. A thread that died without running `teardown` (a fault kill,
+  a group-fatal signal) left its tid queued on a futex key forever, and the next
+  occupant of its slot inherited the entry, where a `FUTEX_WAKE(uaddr, 1)` would
+  spend itself on the corpse. `amd64::sched::install_untimed_park_backstop` now
+  registers `futex::purge_task`, and `x86_claim_slot` runs the hook. Exactly the
+  trap `thread::teardown`'s own comment describes for `set_cleanup_callback` —
+  reasoned about for that hook and not for this one.
+- **Three silent bail-outs in `entry_point_trampoline`** (§13 above), now
+  `[TRAMP-BAIL]`.
+
+#### Where the crash actually is: musl's allocator
+
+With the wedge gone the crash reproduces in **2.0–2.3 s**, which made the next
+three steps affordable in one sitting.
+
+**First the console had to be made readable.** `idt::user_fault` printed its
+report with ~20 separate `serial::puts` calls, and `serial::LOCK` is per call,
+so two cores faulting at once shredded both lines into each other:
+
+```
+[Fault] #GP general protection#GP general protection in ring 3 on cpu 1 …
+  [memwatch-at-kill] pmm_free=1380940 fpcache_len=138094041633 …
+```
+
+— two `pmm_free` values interleaved into one meaningless number, in the report
+whose entire purpose is those numbers. It is now a single `StackWriter` flush,
+the same fix and the same reason as `sched.rs`'s `[SWITCH NO-BKL]`. (It also
+labels `cr2` `(stale)` on a `#GP`, which rejects its operand before translation
+and leaves whatever the last page fault put there.)
+
+**Then the rip resolved.** `INTERP_BASE` on this target is `0x3000_0000`
+(`loader.rs`), so a `rip` of `0x3004_6xxx` is `ld-musl-x86_64.so.1 + 0x46xxx`.
+Mount the guest image on the Ubuntu side and ask:
+
+```
+mount -o ro,loop /root/akuma-fc-rust.img /mnt/fcimg
+nm -D --defined-only /mnt/fcimg/lib/ld-musl-x86_64.so.1
+```
+
+| observed rip | resolves to |
+|---|---|
+| `0x3004_65ec` | `aligned_alloc + 0xce` |
+| `0x3004_6b96` | `aligned_alloc + 0x678` |
+| `0x3004_6c93` | `aligned_alloc + 0x775` |
+
+**Every fault is inside musl's allocator** — `aligned_alloc` is the last
+exported symbol before the mallocng internals, so these are three points in the
+same block of allocator code, within `0x6a7` bytes of each other. And the
+clean report says what kind:
+
+```
+[Fault] #PF page fault in ring 3 on cpu 0 err=0x4 rip=0x30046c93
+        cr2=0x0000000000000010 cr3=0x23840000 task=13 pid=64
+  [memwatch-at-kill] pmm_free=1379502 fpcache_len=39618 cow_ref_frames=52191
+```
+
+`err=0x4` is a user-mode **read of a not-present page** and `cr2=0x10` is a
+**null pointer plus a field offset** — `meta->area` is at `0x10` in mallocng's
+`struct meta`. So: rustc's heap metadata contains a null where a pointer
+belongs. Not memory pressure — `pmm_free` is 1.38 M pages.
+
+That places the remaining bug squarely in **what the kernel hands a
+multi-threaded process's heap**: `mmap`/`munmap`/`mremap` of the anonymous
+groups mallocng allocates, the CoW fork that precedes them, or the mutual
+exclusion mallocng's own lock depends on. It is no longer a scheduler question
+at all.
+
+Two sub-hypotheses eliminated on the spot:
+
+- **Anonymous pages are zeroed.** `mm::populate_page` and `idt.rs`'s lazy arm
+  both `write_bytes(.., 0, 4096)` before mapping, so "a recycled frame handed
+  over with the previous owner's bytes" — the story §11's ASCII-in-`cr2` on
+  bare metal suggests — is not happening on this path.
+- **`%fs` was not it** (below), though looking cost a real bug.
+
+#### Found while looking: `%fs` was restored conditionally, 642 times a boot
+
+`hook_switch_to` restored the incoming task's TLS base only when it had one:
+
+```rust
+let fs = (*m)[to].uctx.fs_base;
+if fs != 0 { crate::usermode::set_fs_base(fs); }
+crate::usermode::set_user_gs_base((*m)[to].uctx.gs_base);   // unconditional
+```
+
+`IA32_FS_BASE` is one register per **core**, so skipping the write does not
+leave `%fs` unset — it leaves the *outgoing* thread's TLS pointer live for
+whoever runs next. The `%gs` line one row below makes exactly that argument
+("a stale user value would follow a thread that never set one onto another
+core"); the asymmetry reads as an oversight. The window it leaves open is real:
+a freshly `execve`d main thread starts with `fs_base == 0` and does not call
+`arch_prctl(ARCH_SET_FS)` until musl's `__init_tp`, so every instruction of
+`ld-musl` before that ran on whatever TLS base the previous thread left on that
+core — from another address space.
+
+Now unconditional, with a counter for how often the window was open.
+**642 times in one boot.** Nothing in ring 0 reads `%fs` (the kernel's per-CPU
+block is `%gs`), so writing 0 for a kernel or not-yet-`arch_prctl`'d task costs
+one `wrmsr` and takes a stale base away.
+
+It is **not** the cause of the mallocng crash: ERROR at 2.1 s and 2.3 s with the
+fix, ERROR at 2.2 s and 2.2 s without, and 4x1 PASS at 17.4 s throughout. Kept
+on its own merits, and recorded here so the next investigation does not spend
+the same afternoon on it.
+
+#### Next, in order
+
+1. **The heap corruption in `rustc`.** Now the headline, because the wedge that
+   hid it is gone — and it reproduces in ~2 s, inside musl's allocator (above).
+   The fixed run faulted **two threads of one process on two cores at once**:
+
+   ```
+   cpu 1  err=0  rip=0x300465ec  rsp=0x11d3b7b20  cr2=0x10          cr3=0x2383f000 task=16 pid=64
+   cpu 0  err=0  rip=0x30046b96  rsp=0x11d809250  cr2=0x11d9e5190   cr3=0x2383f000 task=17 pid=64
+   ```
+
+   Same `cr3`, two tasks, two `rip`s 0x5aa apart in one code region, and
+   `0x300465ec` is the *same* address the previous run faulted at. `err=0` on a
+   `#GP` means a non-canonical operand or a null segment, not a missing page —
+   so this is a corrupt pointer or a corrupt `%fs`, in a region both threads
+   are executing at once. (`cr2` is stale on a `#GP` and should be ignored.)
+2. **Which futex, and how old.** `futex::dump_waiters` prints the
+   `(tgid, uaddr)` keys with per-waiter ages and the `wakes/empty/woken`
+   tallies; it went in after the run above and the next 4x4 cell carries it.
+   Two readings to separate: all nine threads on **one** key with nobody
+   outside it is a userspace deadlock (possibly downstream of an earlier
+   dropped wake); waiters whose `tgid` differs inside one address space, or
+   `empty` climbing against a non-empty table, is the kernel losing wakes.
+3. **`pthread_join` is the first suspect** for anything that still stalls.
+   An untimed `FUTEX_WAIT` on musl's
+   `&t->detach_state` is released only by the exiting thread's
+   `clear_child_tid` write-and-wake, which on this target lives in
+   `thread::teardown` — reached when a thread returns from ring 3 normally and
+   **not** obviously reached when it dies by a deferred kill or a fault. A
+   thread that dies without `teardown` hangs its joiner forever with no futex
+   evidence at all, and that is the AArch64 bug
+   `project_futex_wake_tgid_pthread_join` already fixed once, on the other
+   kernel.
+4. The bare metal with `pmm-forensics`, still not reached — §12's item 3.
 
 
 ## Background
