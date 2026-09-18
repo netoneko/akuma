@@ -2980,6 +2980,21 @@ wait for a kernel*. The honest kernel-to-kernel comparison is the `-j1` row.)
 |---|---|---|---|
 | Firecracker guest, `-j1`, image on the internal SSD (09-18) | 95 | 223 s | 2.35 |
 | bare metal, `nosmp`, root on the USB disk (§11, 09-18) | 95 | **1 374 s** | **14.5** |
+| bare metal, **SMP=4** `-j1`, 512 MiB heap / 128 MB cache (09-18, gen-1) | 95 | 1 398 s | 14.7 |
+| bare metal, **SMP=4** `-j1`, **1 GiB heap / 256 MB cache** (09-18, gen-2) | 95 | **640 s** | **6.7** |
+
+The last two rows are the same machine, same source, same cell — **only the
+kernel heap differs**, and with it the ext2 block cache (`HEAP_SIZE/4` was the
+binding term of `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)` on a 16 GiB box).
+**2.2x**, and the build that had never once reached a successful link, linked.
+Note also that SMP=4 `-j1` (14.7) matches `nosmp` (14.5) almost exactly: four
+cores buy a single-job build nothing here, which is the same finding as §10's
+"+26% for SMP" seen from the other side.
+
+`AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 has the crossover table and the reason
+this is the first lever to reach for on any new machine: the heap is the only
+term in that `min` that does **not** scale with RAM, so on a big box it binds
+silently, and only on the workload that notices.
 
 **6.2x, on the same physical machine.** Untested since §14 — every number in A,
 B and C is the guest.
@@ -3004,8 +3019,16 @@ B and C is the guest.
    parallel build died or wedged, so `-j1` was the only cell that existed.
 3. **09-18: resource ceilings.** A 64-pipe machine limit that presented as a
    broken linker.
-4. **Now: scaling.** 8 jobs on 4 cores buy 1.39x (§19). The per-job path is
-   done; what remains is whatever serialises — the BKL and the filesystem.
+4. **09-18, in the guest: scaling.** 8 jobs on 4 cores buy 1.39x (§19). The
+   per-job path is done; what remains is whatever serialises — the BKL and the
+   filesystem.
+5. **09-18, on the metal: a cache starved by a constant.** Every number above is
+   the guest, and the metal turned out to be limited by something the guest
+   never was — a hard-coded 512 MiB `HEAP_SIZE` capping the ext2 block cache at
+   128 MB on a 16 GiB machine. Fixing that was 2.2x on the whole build and made
+   the link stop failing. Era 4's "the per-job path is done" was true *of the
+   guest*; it was not true of the metal, and the difference was one constant.
+   [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](AKUMA_AMD64_BARE_METAL_SELFHOST.md)
 
 
 ## Background

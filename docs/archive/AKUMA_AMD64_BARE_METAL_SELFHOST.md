@@ -94,10 +94,19 @@ itself on that flag.
 
 ---
 
-## 3. SMP on the metal: two different concurrency failures, not one
+## 3. SMP on the metal: the compile race, and a link failure that was not what it looked like
 
-§11 saw two failures at SMP=4 and suspected they were one bug. Re-measured after
-§14's demand-fault race fix, they separate cleanly.
+§11 saw two failures at SMP=4 and suspected they were one bug. This section was
+written arguing they separate; **both of its separating arguments were then
+disproved by measurement on the same day**, and the inline corrections below are
+the substance rather than errata:
+
+- the compile crash is **not** `-j4`-specific (`-j1` crashes too), and
+- the link crash is **not** about LLD's threading (a bigger kernel heap fixed it
+  with threading left on).
+
+Read §11's original instinct as the better one. What survives here is the
+evidence, which is worth having either way.
 
 ### The compile phase fails with concurrent *processes*
 
@@ -129,7 +138,7 @@ first and why §14's fix looked complete from inside the guest.
 
 The experiment that would settle it is repeated `amd64_fc_build_matrix.py` runs
 looking for a rare guest failure. Note it needs the **Ubuntu** personality, which
-is behind physical access to the GRUB menu now (see §5.1).
+is behind physical access to the GRUB menu now (see §6.1).
 
 **There is no `[Fault]` line, and that is expected, not evidence of health.**
 `amd64/src/idt.rs:990` hands a ring-3 fault to `deliver_fault_signal` *before*
@@ -187,6 +196,26 @@ rust-lld -flavor gnu <174 objects> -T/root/akuma/amd64/linker.ld … --threads=1
 Same objects, same command, same machine, one variable, ~20 seconds. This is a
 controlled A/B, not a retry that happened to work.
 
+> **Corrected the same day, by §5.** The A/B above is sound and reproducible;
+> the *conclusion drawn from it* — "LLD's thread pool is what this kernel cannot
+> survive at SMP>1" — was too strong. With the kernel heap raised from 512 MiB
+> to 1 GiB (§5), the **same build linked cleanly with default multi-threaded
+> LLD**, rustflags unchanged and `--threads=1` still absent.
+>
+> So the defensible statement is that **LLD's crash is memory-pressure
+> sensitive**, not that its threading is intrinsically fatal here. `rust-lld` is
+> 158 MB and this target's `execve` holds a whole binary in the kernel heap
+> (§6.4), so at 512 MiB — with the block cache taking 128 MB of it — the linker
+> was running against the edge; `--threads=1` presumably narrowed a window
+> rather than removing a defect. `-C link-arg=--threads=1` is therefore **not
+> needed on a 1 GiB-heap kernel**, and should not be re-added without
+> re-measuring.
+>
+> The generalisable trap, and it is the second time in this document: a clean
+> controlled A/B tells you the flag *changed the outcome*. It does not tell you
+> *why*, and the mechanism you assume is the part that later measurement
+> overturns.
+
 **Do not "fix" this by putting `--threads=1` into rustflags before comparing
 generations.** rustflags feed cargo's `-C metadata` hash, which feeds symbol
 hashes, so that change alters the output bytes — and a gen-1/gen-2 comparison
@@ -235,7 +264,45 @@ from, and nothing else.
 
 ---
 
-## 5. Open, in the order worth attacking
+## 5. The heap was the bottleneck, and it was worth 3.3x
+
+`HEAP_SIZE` was a hard-coded **512 MiB on a 16 321 MiB machine**. The ext2 block
+cache is `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)`, so the heap quarter was
+binding at **128 MB** where the policy wanted 384 MB — on precisely the workload
+`amd64/src/fs.rs`'s own comment names: *"`rustc` reading rlibs has a working set
+in the hundreds of megabytes."*
+
+Sized from RAM instead (`heap_size_for`: 1 GiB at ≥ 8 GiB usable, 512 MiB
+otherwise, as a **request** that falls back if no region below `PHYSMAP_LIMIT`
+can hold it), the cache reaches 256 MB. Same source, same cell (`-j1`, SMP=4),
+same machine — only the heap differs:
+
+| elapsed | 512 MiB heap / 128 MB cache | 1 GiB heap / 256 MB cache |
+|---|---|---|
+| 188 s | 15 crates | **35** |
+| 339 s | 25 crates | **82** |
+| 490 s | 33 crates | **95** |
+| total | **1398 s, and the link then failed** | **640 s, clean, linked** |
+
+**2.2x on the completed build, ~3.3x at the crossover** — and the build that had
+never once linked, linked. Two conclusions follow, and both correct earlier
+sections:
+
+- §2 said the metal/guest gap was cache residency rather than the device. This
+  is the confirmation: doubling the cache moved the build more than the entire
+  measured device gap (1.4–2.3x) could have accounted for.
+- §3's `--threads=1` finding needed the correction now inline there.
+
+The `HEAP_SIZE/4` rule itself is **right and should stay**: `execve` loads whole
+binaries into the heap, `rust-lld` is 158 MB, and a cache free to take 384 MB of
+a 512 MB heap is how you get `[ALLOC FAIL] heap_total=512MB heap_used=510MB`. The
+bug was the fixed 512 MiB, not the fraction.
+
+**This is the lever to reach for first on any new machine**: the heap is the only
+term in that `min` that does not scale with RAM, so on a big box it is the one
+that binds, silently, on the only workload that notices.
+
+## 6. Open, in the order worth attacking
 
 1. **The compile-phase crash at SMP>1 on the metal.** Not `-j4`-specific (see
    §3's correction): `-j1` dies too, just less often, so this is not merely a
@@ -267,7 +334,20 @@ from, and nothing else.
    file is held twice — once as bounded, evicting blocks, once as an unbounded
    per-fd copy that is the file's authoritative in-memory image (hence the
    write-back at `close`). Heap use scales with the sum of all open files rather
-   than with a cap. When that lands, §5.3's rule should be deleted, not retuned.
+   than with a cap. When that lands, §5's rule should be deleted, not retuned.
+
+   > **Wrong as written — corrected the same day.** `fd.rs` stopped caching file
+   > contents in **C2 slice 5**; its module header now reads "Contents are **not**
+   > cached any more", descriptors carry an empty buffer, and reads/writes stream
+   > in `MAX_IO` chunks at a heap cost of one 64 KiB chunk. What survives is the
+   > **`execve`** half: `usermode.rs`'s `read_image` reads the whole image, so
+   > exec'ing `rust-lld` costs 158 MB in one allocation, and *that* is what sets
+   > the floor §5's rule protects.
+   >
+   > The paragraph above was written from the proposal, which still says
+   > `**Status:** open` and is stale. **Fix that status before anyone plans work
+   > against it** — a stale "open" wastes a session exactly as a stale "FIXED"
+   > does, and it produced this error within an hour of the doc being written.
 5. **Interactive ssh input arrives one event late** — see the runbook's
    "Known-broken" table. Three candidate mechanisms and the discriminators are
    recorded there; test the contention one first, because it is the only one that
