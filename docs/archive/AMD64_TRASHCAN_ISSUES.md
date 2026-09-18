@@ -235,6 +235,51 @@ and now honours `timeout_us` on both of its paths too.
 
 ---
 
+## 3b. …and the rest of the terminal family was `ENOSYS`
+
+**Status: FIXED 2026-09-19.** §3 made the TUIs *reachable*. They were still
+wrong, and the screenshot is the whole bug report: `meow`'s footer printed
+**once per 50 ms frame tick, scrolling down the screen**, dozens of copies of
+`[Provider: mlx] [Model: …] [MEOW] awaiting user input...` instead of one row
+repainted in place.
+
+`amd64/src/usermode.rs`'s Akuma-private match implemented 300, 301, 302, 303,
+313, 315-319, 322, 324-326 — and **nothing between 307 and 314**. Everything
+else in that range fell through to `_ => errno::ENOSYS`:
+
+| | | what its absence looks like |
+|---|---|---|
+| 307 | `set_terminal_attributes` | no raw mode: the session stays cooked, so input is line-buffered and the kernel echoes it on top of the layout |
+| 308 | `get_terminal_attributes` | nothing to restore on exit |
+| **309** | **`set_cursor_position`** | **the screenshot** — the footer prints wherever the cursor happens to be |
+| 310/311 | `hide_cursor`/`show_cursor` | the caret flickers through every repaint |
+| 312 | `clear_screen` | the TUI opens on top of whatever was there |
+| 314 | `get_cpu_stats` | — |
+
+All seven have real implementations in `akuma-syscalls-glue`'s `term.rs`, over
+the same `ProcessChannel` + `TerminalState` pair §3 folded arm 313 onto. They
+are now folded the same way and for the same reason, gated on the process
+having a channel.
+
+**The lesson is about the test, not the kernel.** §3's verification drove the
+TUI over a pty and scored it on its *transcript* — the layout appeared, a reply
+streamed, `/quit` exited — and every one of those is true of a TUI that cannot
+position its cursor. The repeated footer was **in that capture**, and the
+harness filtered it out as noise. A full-screen program has to be judged on the
+escape sequences it emits, not on the words:
+
+| | before | after |
+|---|---|---|
+| `ESC[r;cH` cursor positioning | 0 from the syscall path | **1980** in 25 s |
+| hide/show-cursor pairs | 0 | **326 / 327** — one per footer paint |
+| rows the footer paints to (41-row terminal) | wherever the cursor was | **37-41**, 744 paints at row 41 |
+| one keystroke, no Enter | ignored (cooked) | redraws, renders the character |
+
+That last row is `set_terminal_attributes` working: raw mode is what makes a
+keypress an event instead of part of a line.
+
+---
+
 ## 4. What works on the metal as of 2026-09-19
 
 Kernel `020b4f16` plus §§1-3. All over ssh to the box's own hardware:

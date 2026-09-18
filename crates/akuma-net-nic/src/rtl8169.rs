@@ -299,6 +299,21 @@ pub struct Rtl8169Device {
     /// before the clock seam exists / before the first frame. This is what the
     /// stall watch measures against; the lap counter is the fallback.
     last_rx_us: Option<u64>,
+    /// Has the chip told us it *could not take a frame* since the last one it
+    /// gave us? `INT_RDU` latched, or `MPC` advanced.
+    ///
+    /// **Silence is not a stall**, and separating the two is the whole point of
+    /// this flag. The wall-clock window alone fired on an idle LAN — measured
+    /// on the box 2026-09-19, `[rtl] stall #3: kick misc 0x3f -> 0x3f mpc=0`:
+    /// no missed packets, and the kick changed nothing, because there was
+    /// nothing wrong. A link with nothing to deliver looks exactly like a dead
+    /// receiver from the ring's side, and an LLM stream is quiet for tens of
+    /// seconds at a time between bursts. Only the chip can tell them apart, and
+    /// it does: `RDU` means the ring ran dry with a frame waiting, and `MPC`
+    /// counts frames dropped for want of a descriptor.
+    rx_backpressure: bool,
+    /// `MPC` as of the last lap, to notice it advancing.
+    last_mpc: u32,
     /// How many stalls have been seen. The full ring dump prints on the first
     /// one only — once is a diagnosis, sixteen lines every two seconds is a
     /// screen nobody can read — and the recovery attempt is capped at
@@ -339,6 +354,8 @@ impl Rtl8169Device {
             link_poll: 0,
             idle_laps: 0,
             last_rx_us: None,
+            rx_backpressure: false,
+            last_mpc: 0,
             stalls: 0,
             rx_scratch: [0; BUF_LEN],
             tx_scratch: [0; BUF_LEN],
@@ -460,6 +477,10 @@ impl Rtl8169Device {
             C.rx_isr_seen.fetch_or(u32::from(isr), Ordering::Relaxed);
             if isr & akuma_net_rtl8169::regs::INT_RDU != 0 {
                 C.rx_ring_dry.fetch_add(1, Ordering::Relaxed);
+                // The ring ran dry with the chip wanting to hand a frame over.
+                // That, not the passage of time, is what makes the quiet below
+                // a stall.
+                self.rx_backpressure = true;
             }
         }
 
@@ -492,7 +513,15 @@ impl Rtl8169Device {
             // Wall-clock first, lap count only as the pre-clock fallback. The
             // two must not both be able to fire, or a bring-up spin would kick
             // on laps while the clock says receive is healthy.
-            let stalled = match (now_us(), self.last_rx_us) {
+            // `MPC` advancing is the other half of the evidence: frames the
+            // chip dropped because no descriptor was free. Read per lap so a
+            // stall that raises no `RDU` is still caught.
+            let mpc = self.nic.snapshot().mpc;
+            if mpc != self.last_mpc {
+                self.rx_backpressure = true;
+                self.last_mpc = mpc;
+            }
+            let quiet = match (now_us(), self.last_rx_us) {
                 (Some(now), Some(last)) => now.saturating_sub(last) >= STALL_QUIET_US,
                 (Some(now), None) => {
                     // Clock up but nothing received yet: start the window here
@@ -503,6 +532,8 @@ impl Rtl8169Device {
                 }
                 (None, _) => self.idle_laps >= STALL_LAPS,
             };
+            // Quiet **and** the chip complaining. Either alone is normal.
+            let stalled = quiet && self.rx_backpressure;
             if stalled {
                 self.stalls += 1;
                 self.idle_laps = 0;
@@ -513,6 +544,9 @@ impl Rtl8169Device {
         };
         self.idle_laps = 0;
         self.last_rx_us = now_us();
+        // A frame came off the ring, so whatever backpressure the chip reported
+        // has been relieved; the next stall must produce its own evidence.
+        self.rx_backpressure = false;
         // Only reached when a frame really came off the ring, so this counts
         // wire arrivals. The virtio path bumps the same counter in `device.rs`;
         // until 2026-09-05 this one bumped nothing, so `rx_counters()` read a
