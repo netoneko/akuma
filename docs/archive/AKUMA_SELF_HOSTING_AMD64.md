@@ -12,7 +12,7 @@ fixed point**, and **on 2026-09-18 the metal reached that fixed point too**
 on Akuma's own root so no Ubuntu is in the loop —
 `AKUMA_AMD64_BARE_METAL_SELFHOST.md`). Since **2026-09-19** the box is also
 usable *as* a workstation: `git clone` over HTTPS, and `meow`/`nca` in both
-one-shot and full-screen modes (`AMD64_TRASHCAN_ISSUES.md` §§1-4).
+one-shot and full-screen modes (`AMD64_TRASHCAN_ISSUES.md` §§1-5).
 `cargo build --release` for the amd64 kernel ran to completion
 inside Akuma/amd64 under Firecracker on 09-13: 94 crates, 7 m 53 s, `rc=0`, and
 a 2 895 920-byte `ET_EXEC` x86-64 image with a PVH note at the end of it.

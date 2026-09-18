@@ -280,7 +280,67 @@ keypress an event instead of part of a line.
 
 ---
 
-## 4. What works on the metal as of 2026-09-19
+## 4. `nca`: `[custom stream error: error decoding response body]` against z.ai
+
+**Status: ROOT-CAUSED 2026-09-19 — it is not the kernel.** `nca`'s own HTTP
+client gives up on a stream that goes quiet, and `reqwest` reports that as a
+body error.
+
+`crates/core/src/provider/custom.rs` built its client with
+`.read_timeout(Duration::from_secs(60))`. That is an **inter-read** timeout: it
+restarts on every byte, and expires when 60 s pass with none. A streaming chat
+completion is exactly the shape that trips it — a few tokens, the model thinks,
+the rest — and `glm-5.3-flash` through z.ai is sparse enough from this box to
+cross it. Both failing runs died **116 s and 119 s** after the request, having
+streamed a little first.
+
+**The measurement**, with a server on the LAN that pauses mid-stream on purpose
+(`gapserver.py` in the session scratchpad — SSE, chunked, plain HTTP):
+
+| mid-stream gap | server side | `nca` |
+|---|---|---|
+| 40 s | `stream complete`, connection healthy | received it all |
+| 70 s | `stream complete`, connection healthy | `"Before the gap. "` then **the error** |
+
+The server finishing normally is the whole point: nothing closed, nothing reset,
+no truncation. The client stopped listening at 60 s.
+
+**Fixed** by one named constant, `provider::STREAM_READ_TIMEOUT_SECS = 300`,
+used by all five providers — they all carried the same `60`.
+
+### Why this cost a session, and what to do differently
+
+**The error message names the wrong layer.** "error decoding response body"
+reads as *the server sent something malformed*, which sends you to TLS, chunked
+framing and the network stack. Three things were ruled out before the client was
+even suspected: `git clone` moves 20 MB over HTTPS from a WAN host (so TLS and
+the WAN path are fine), `nca` streams a 400-word answer from a LAN server (so
+`nca`'s stack and long streams are fine), and an 18 KB `POST` to httpbin takes
+1 s (so a large request body over a high-RTT link is fine).
+
+**And a test server can fake this exact bug.** The first version of
+`gapserver.py` sent `Transfer-Encoding: chunked` and then wrote unframed bytes.
+`hyper` reported `error decoding response body` — the symptom under
+investigation — and the server saw a broken pipe, which looked like the box
+killing an idle connection. It was the harness. The tell was the timestamps: the
+client failed *immediately*, not after the gap. **Check that a repro reproduces
+the timing, not just the message.**
+
+### Not this: the 240 s ssh disconnect
+
+Long commands over ssh to the box return `rc=255` at almost exactly **240 s**
+(measured: 150/180/210 s fine, 240 s dead, twice). That is **the local ssh
+client**, not the box: `~/.ssh/config` sets `ServerAliveInterval 60` and
+`ServerAliveCountMax` defaults to 3, so the fourth unanswered probe lands at
+240 s. `userspace/sshd` does answer `SSH_MSG_GLOBAL_REQUEST` — when it gets to
+read one; it is not servicing the transport while a session command runs. Run
+anything long **detached** (`( cmd > log 2>&1 ) &`, then read the log), which is
+also what keeps a session teardown from being confused with the failure under
+test.
+
+---
+
+## 5. What works on the metal as of 2026-09-19
 
 Kernel `020b4f16` plus §§1-3. All over ssh to the box's own hardware:
 
