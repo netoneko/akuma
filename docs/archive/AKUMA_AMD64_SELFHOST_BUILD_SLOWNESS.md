@@ -1622,6 +1622,40 @@ All three involve **multi-threaded user processes**, which is the thing SMP=1
 never exercises concurrently. That is the next investigation, and the linker is
 the cheapest entry point into it.
 
+#### `nosmp` settles it: the metal builds its own kernel
+
+Same disk, same toolchain, same tree, same kernel binary — only `nosmp` added to
+the command line:
+
+```
+Finished `release` profile [optimized] target(s) in 22m 52s
+-rw-r--r-- 1 0 0 3364832 /root/ktarget/x86_64-unknown-none/release/akuma-amd64
+```
+
+**rc=0, 95 crates, 22 m 54 s.** Every SMP=4 failure above disappears at one core,
+which is what makes SMP the variable rather than the USB disk, the linker's size
+or the toolchain.
+
+| | clean 95-crate `-j1` build |
+|---|---|
+| Firecracker, SMP=1, image on the internal SSD | **3 m 43 s** |
+| bare metal, `nosmp`, root on the USB disk | **22 m 54 s** |
+
+**6.2x, and it is almost certainly storage, not the CPU** — it is the same
+physical machine. The Firecracker guest reads its root through a file on
+Ubuntu's ext4/SSD, so the *host's* page cache sits in front of every block; the
+metal reads a USB disk with nothing in front of it but this kernel's own 128 MB
+ext2 block cache. Worth confirming before optimising anything on the metal: an
+in-guest build is the wrong place to look for a 6x that a `dd` would show.
+
+**Untested, and honestly so:** whether `rust-lld`'s default threading also
+crashes at `nosmp`. It could not be checked cheaply — `rustc` deletes its
+`.rcgu.o` files after a successful link, so replaying the link needs them
+regenerated, and regenerating them with default threading means taking
+`--threads=1` out of the rustflags, which invalidates every crate's fingerprint
+and costs the whole 23 minutes again. The prior is that it is SMP-only (one core
+cannot run LLD's pool concurrently), but it is a prior, not a measurement.
+
 #### The trap that cost a power cycle: stage a key you actually hold
 
 `amd64/mkdisk.sh` stages `target/x86_64-unknown-none/release/amd64-ssh-test-key.pub`

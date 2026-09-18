@@ -183,6 +183,14 @@ caller reading only stdout sees an empty success.
   umount /mnt/fcrust /mnt/ak
   ```
 
+- **Build the kernel on the metal with `nosmp`.** A clean 95-crate
+  `cargo build -p akuma-amd64 -j1` completes in **22 m 54 s** at one core
+  (`kbuild -c`). At SMP=4 it does not complete at all — see the next rule. For
+  reference the same build is **3 m 43 s** in the Firecracker guest at SMP=1;
+  that gap is storage, not the CPU (it is the same machine — the guest's root is
+  a file on Ubuntu's SSD with the host page cache in front of it, the metal's is
+  a USB disk).
+
 - **Building the kernel on the metal needs `--threads=1` for LLD while SMP is
   on.** `rust-lld` is multi-threaded by default and SIGSEGVs linking this kernel
   at SMP>1 — deterministically, 3/3, at the very end of a ~20 minute build. It is
