@@ -283,6 +283,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-tls-host"
+version = "0.1.0"
+dependencies = [
+ "embedded-io",
+ "embedded-io-adapters",
+ "embedded-tls",
+ "env_logger",
+ "log",
+ "rand",
+ "rand_core",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,19 +343,6 @@ dependencies = [
  "sha2",
  "signature",
  "typenum",
-]
-
-[[package]]
-name = "embtls-host"
-version = "0.1.0"
-dependencies = [
- "embedded-io",
- "embedded-io-adapters",
- "embedded-tls",
- "env_logger",
- "log",
- "rand",
- "rand_core",
 ]
 
 [[package]]

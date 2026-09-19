@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and run embtls-host on THIS machine.
+# Build and run embed-tls-host on THIS machine.
 #
 # The wrapper exists for one reason: cargo walks UP from the crate directory
 # collecting config, and `userspace/.cargo/config.toml` pins

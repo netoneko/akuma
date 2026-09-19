@@ -411,7 +411,7 @@ things produced that, neither of them TLS:
 
 `libakuma-tls` fails with `TlsError::DecodeError`, and **this reproduces on a
 macOS laptop with no Akuma in the path** — see
-[`../../userspace/libakuma-tls/probes/embtls-host/`](../../userspace/libakuma-tls/probes/embtls-host/),
+[`../../userspace/embed-tls-host/`](../../userspace/embed-tls-host/),
 which is the control arm §5 never had:
 
 ```
@@ -501,7 +501,7 @@ Measured, same box, same kernel:
 |---|---|---|
 | `hget https://api.z.ai/api/anthropic/v1/messages` | `decode error` | **`HTTP error: 401`** — full handshake + request + response |
 | `hget https://api.z.ai/api/coding/paas/v4/chat/completions` | `decode error` | **`HTTP error: 401`** |
-| `embtls-host` (laptop, both gate hosts) | 1 of 2 FAIL | **`2 host(s), 0 failed`**, `api.z.ai` in 622–671 ms |
+| `embed-tls-host` (laptop, both gate hosts) | 1 of 2 FAIL | **`2 host(s), 0 failed`**, `api.z.ai` in 622–671 ms |
 | `hget https://api.github.com/` (control) | works | works |
 | `hget https://z.ai/` (apex) | `protocol_version` | `protocol_version` — unchanged, and genuinely the peer's |
 

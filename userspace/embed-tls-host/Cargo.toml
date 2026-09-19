@@ -1,5 +1,5 @@
 [package]
-name = "embtls-host"
+name = "embed-tls-host"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -20,7 +20,7 @@ publish = false
 # program. Same opt-out `userspace/nca` and the nettest probes use.
 
 [[bin]]
-name = "embtls-host"
+name = "embed-tls-host"
 path = "src/main.rs"
 
 [dependencies]

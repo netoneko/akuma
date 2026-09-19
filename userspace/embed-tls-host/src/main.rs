@@ -1,4 +1,4 @@
-//! embtls-host — `libakuma-tls`'s handshake, on the development host.
+//! embed-tls-host — `libakuma-tls`'s handshake, on the development host.
 //!
 //! One question: **when our TLS stack cannot reach a server, is that our TLS
 //! stack or is it Akuma?** This runs the same `embedded-tls` version, the same
