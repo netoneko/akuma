@@ -143,6 +143,95 @@ contents change, and Akuma never needs vfat or ext4.
 Full record, with the measurements:
 [`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md).
 
+## Working **on** the box: its own checkout, toolchain and cargo cache
+
+Since 2026-09-19 the Akuma partition carries a development environment, not just
+a staged rootfs, and the intended loop is the one in
+[`../archive/AKUMA_FROM_SCRATCH.md`](../archive/AKUMA_FROM_SCRATCH.md) §8 —
+edit, build, install, reboot, commit, with nothing outside the machine involved.
+
+| | path (as Akuma sees it) |
+|---|---|
+| the repository | `/src/github.com/netoneko/akuma` — a full clone, `origin` over https |
+| the toolchain | `/usr/local/rust` (nightly musl, `x86_64-unknown-{none,linux-musl}`, `rust-src`) |
+| the cargo cache | `/root/.cargo` — an ordinary registry cache, **not** `vendor/` |
+| box-local cargo config | `/root/.cargo/config.toml` |
+| the environment | `/etc/akuma-dev.env`, sourced by `/etc/profile` and by every wrapper |
+
+```sh
+kbuild -c -j 1        # kernel -> /root/ktarget   (-c cleans; that is the trial)
+ubuild                # userspace -> /root/utarget (paws httpd herd hget wall box sshd)
+mbuild                # meow      -> /root/mtarget
+kinstall              # /boot/akuma-amd64, multiboot2-checked and md5-verified
+/bin/busybox reboot -f
+```
+
+Four things about that environment, each of which cost time to establish:
+
+- **A session has no environment at all.** sshd sets `TERM` and nothing else, so
+  `ssh akuma 'cargo build'` finds no `cargo`. The wrappers source
+  `/etc/akuma-dev.env` themselves; do the same (`. /etc/akuma-dev.env`) before
+  running cargo or rustc by hand. `LD_LIBRARY_PATH` is not optional —
+  `rustc` is a 9 KB shim that finds `librustc_driver` through `$ORIGIN`, and
+  musl resolves `$ORIGIN` by reading `/proc/self/exe`, which this kernel lacks.
+- **Build from the manifest directory.** Cargo reads `.cargo/config.toml` from
+  the *working directory*, not from `--manifest-path`. Get it wrong and the
+  kernel's `relocation-model`/`code-model` silently vanish and the link fails
+  with `relocation R_X86_64_32 cannot be used against symbol '_start'`.
+- **Nothing the rig needs lives in the checkout**, so `git status` stays clean
+  and the box can diff and commit exactly what it changed. The `--threads=1`
+  lld flag and the host linker are in `/root/.cargo/config.toml`; build output
+  goes to `/root/{k,u,m}target`.
+- **Proc macros need `/usr/local/bin/ld.lld`.** They link as musl dylibs
+  against `-lc`/`-lgcc_s`, there is no `cc`, and cargo does not apply
+  `rustflags` to host units — the wrapper is the only place the `-L` paths fit.
+  If a build dies with `can't find crate for thiserror_impl`, that is this.
+
+`hpbox.restage_disk()` excludes `/src`, `/root`, `/usr/local` and `/boot` for
+this reason; anything else you add to the partition by hand is *not* protected
+from its `--delete`.
+
+### Staging or repairing it, from Ubuntu
+
+The partition is just a filesystem when Ubuntu is up, so all of this is done
+with `mount /dev/sdb1 /mnt/ak` — **and `umount` it before booting Akuma**, or
+two kernels write one ext2.
+
+**Do the work with the box's own toolchain, not Ubuntu's.** Copy Akuma's musl
+loader to `/lib/ld-musl-x86_64.so.1` on the Ubuntu side and every binary on the
+partition runs there:
+
+```sh
+cp /mnt/ak/lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1   # once
+export LD_LIBRARY_PATH=/mnt/ak/usr/local/rust/lib:/mnt/ak/usr/lib:/mnt/ak/lib
+export PATH=/mnt/ak/usr/local/rust/bin:$PATH
+export HOME=/mnt/ak/root CARGO_HOME=/mnt/ak/root/.cargo CARGO_TARGET_DIR=/root/prime-target
+cd /mnt/ak/src/github.com/netoneko/akuma && cargo fetch --locked   # prime the cache
+cargo build -p akuma-amd64 --target x86_64-unknown-none --release --offline -j8
+```
+
+That is the *exact* cargo, rustc and cache the box will use, at Ubuntu's speed
+and with Ubuntu's network — which is what makes it worth doing here rather than
+guessing. `libgcc_s.so.1` lives in the partition's `/usr/lib`, hence the third
+`LD_LIBRARY_PATH` entry. Keep `CARGO_TARGET_DIR` on **Ubuntu's** disk: those
+artifacts carry absolute paths and are useless to the box.
+
+Four failures to expect, three of which are silent about their real cause
+([`../archive/AKUMA_FROM_SCRATCH.md`](../archive/AKUMA_FROM_SCRATCH.md) §9 has
+the measurements):
+
+| what you see | what it is |
+|---|---|
+| `only metadata stub found for rlib dependency 'core'`, on crate 3 of 137 | a **truncated toolchain copy**. `libcore.rmeta` for `x86_64-unknown-none` must be tens of MB (68 MB), not 209 KB, and `liballoc`/`libcompiler_builtins` must be there. `._*` files in the tree mean it came off a Mac. Reinstall with `rustup toolchain install nightly-<date>-x86_64-unknown-linux-musl --profile minimal --force-non-host -c rust-src -t x86_64-unknown-none` and rsync it whole |
+| `can't find crate for 'thiserror_impl'` (or any proc macro) | the **host linker**. Proc macros are musl dylibs needing `-lc`/`-lgcc_s`; there is no `cc`, and cargo does **not** apply `target.*.rustflags` to host units, so the `-L` paths only fit inside the linker itself: `/usr/lib/lib{c,gcc_s}.so` plus the `/usr/local/bin/ld.lld` wrapper. The file must be *named* `ld.lld` — rustc picks the linker flavour from the name |
+| `relocation R_X86_64_32 cannot be used against symbol '_start'` | built from the **wrong cwd**. Cargo finds `.cargo/config.toml` from the working directory, not from `--manifest-path`, so the kernel's `relocation-model`/`code-model` were never applied |
+| a submodule directory containing only `.git`, while `git submodule status` says it is clean | the objects were fetched and the worktree never checked out. `git submodule update --init` does nothing here because the SHA already matches — it needs **`--force`**. Without `crates/akuma-fbcon/vendor/spleen` the kernel does not build at all |
+
+Staged and verified this way on 2026-09-19, all `--offline`: the kernel in
+**52 s at `-j8` (3 411 960 B)**, every userspace member, and **`meow` for
+`x86_64-unknown-none` (246 KB)** — the first amd64 meow, which
+`amd64/mkdisk.sh` does not stage yet.
+
 ## The cycle (laptop-driven kernel development)
 
 ```
@@ -229,8 +318,17 @@ that loop, and a livelock is a timing property of code running against real
 MMIO. `AMD64_TRASHCAN_ISSUES.md` §7b.
 
 Recovery, at the machine: the GRUB menu's second entry, **`Akuma/amd64 (known
-good)`**, boots `/boot/akuma-amd64.good`; `install`'s own `/boot/akuma-amd64.prev`
-is the previous kernel.
+good)`**, boots `/boot/akuma-amd64.good`. `install_kernel_amd64.sh` also keeps
+`/boot/akuma-amd64.prev` — the kernel it just overwrote, saved on every install
+since 2026-09-19 (it was documented here before it existed). `.prev` is *a*
+kernel; `.good` is a **verified** one, and only the second is worth trusting
+blind.
+
+**From inside Akuma you cannot pick an entry — but you can change what the
+default entry loads**, because it names a path on a filesystem this kernel owns.
+So the self-rescue, for anything short of a kernel that will not boot, is a `cp`:
+`cp -f /boot/akuma-amd64.good /boot/akuma-amd64 && sync && /bin/busybox reboot -f`.
+Only "it does not come up at all" needs the menu, and therefore a person.
 
 **And know what the fast lane does *not* cover.** Both of its targets are
 virtio — local QEMU is `-M microvm` with virtio-MMIO, the box's Firecracker is

@@ -12,6 +12,8 @@ Start from the symptom or task on the left.
 | Booting a VM and connecting via SSH | [`boot-and-connect.md`](boot-and-connect.md) |
 | Changing Akuma/amd64 and testing it on the **real HP box**, hands-off | [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the two-personality ssh trap, `reboot -f`, the three KVM rigs, and the known-broken list (`date` 1970 → "certificate not trusted", pipes, `ps`, `wget https`) |
 | Not sure whether a devbox userspace process is actually hung or just slow | [`diagnose-hung-userspace-process.md`](diagnose-hung-userspace-process.md) — start here before kernel tracing or gdb |
+| Working **inside** Akuma on the HP box — its own checkout, toolchain, cargo cache and `kbuild`/`ubuild`/`mbuild`/`kinstall` | [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) § "Working **on** the box" — a session has no environment, cargo reads its config from the *cwd*, and proc macros need the `ld.lld` wrapper |
+| Adding **Intel HDA audio** to Akuma/amd64 (the on-box agent's brief) | [`add-intel-hda-audio.md`](add-intel-hda-audio.md) — the existing `/dev/dsp` seam to reuse, the QEMU `-device intel-hda` fast lane, and the bring-up order |
 | Putting a nightly Rust toolchain inside the Akuma/amd64 guest | [`stage-rust-toolchain-amd64.md`](stage-rust-toolchain-amd64.md) — musl host, `--force-non-host`, loop-mount the image; and the `LD_LIBRARY_PATH`/`$ORIGIN` trap that makes `rustc` unable to find its own `.so` |
 | Building the devbox image | [`build-devbox.md`](build-devbox.md) |
 | Building the `extreme-size` (4 MB floor) image | [`build-extreme-size.md`](build-extreme-size.md) |

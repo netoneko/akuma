@@ -611,6 +611,10 @@ def restage_disk(keep_keys=True, timeout=600):
     test key, so any key added by hand is lost. `keep_keys` saves that file
     first and merges back any line the image does not have.
 
+    `/src`, `/root`, `/usr/local` and `/boot` are **excluded** from the delete:
+    they are the box's own development environment and the kernel GRUB boots,
+    neither of which is in `root.img`. See the comment on the rsync below.
+
     Ubuntu sees the partition as **`sdb1`** (its own disk is `sda`); Akuma sees
     the same partition as `sda1`, because it enumerates only the USB one. Every
     confusing moment in this loop has started with mixing those two up.
@@ -634,7 +638,17 @@ def restage_disk(keep_keys=True, timeout=600):
         'mount -o loop,ro /boot/akuma/root.img /mnt/rimg\n'
         'mount /dev/sdb1 /mnt/akvol\n'
         'cp -f /mnt/akvol/etc/sshd/authorized_keys /tmp/ak_keys.save 2>/dev/null || true\n'
-        'rsync -aH --delete /mnt/rimg/ /mnt/akvol/\n'
+        # --delete makes the two identical, which is the point — but the
+        # partition is no longer only a staged rootfs. Since 2026-09-19 it also
+        # carries the box's own development environment (the git checkout at
+        # /src, the nightly toolchain, the cargo cache at /root/.cargo) and the
+        # kernel GRUB boots (/boot/akuma-amd64 + its .good fallback). None of
+        # that is in root.img, so without these excludes one restage deletes
+        # hours of staging AND the kernel the default GRUB entry loads, leaving
+        # a box that comes up at the GRUB prompt.
+        'rsync -aH --delete '
+        '--exclude /src/ --exclude /root/ --exclude /usr/local/ --exclude /boot/ '
+        '/mnt/rimg/ /mnt/akvol/\n'
         + merge +
         'printf "staged from /boot/akuma/root.img by rsync -aH --delete on %s\\n'
         'RE-STAGE after a fresh userspace build.\\n" "$(date -Is)" '

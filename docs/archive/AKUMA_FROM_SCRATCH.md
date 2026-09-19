@@ -1,6 +1,9 @@
 # Akuma From Scratch — the trashbox dev cycle with no Ubuntu in the middle
 
-**Status:** IN PROGRESS as of 2026-09-18 — the clone step is being run by hand now. **Machine:** the HP 500-502nj bare metal.
+**Status:** IN PROGRESS as of 2026-09-19 — the box now holds the repository, the
+toolchain and a cargo cache of its own (§9), and the goal has been restated as
+the full loop: build, **patch**, reboot, continue (§8). **Machine:** the HP
+500-502nj bare metal.
 **Prerequisite met today:** the box builds, installs and boots its own kernel,
 and generation 3 is byte-identical to generation 2
 (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`).
@@ -20,9 +23,9 @@ independent:
 
 | thing | where it comes from today | why it matters |
 |---|---|---|
-| **the source tree** | `rsync` from Ubuntu's `/root/akuma`, staged with `--exclude .git` | the box has no repository, so it cannot fetch, diff, branch or report what it built — and `AKUMA_GIT_SHA` falls back to `unknown` |
-| **`vendor/`** | `cargo vendor` run on Ubuntu | the box cannot resolve a dependency change without leaving Akuma |
-| **all of userland** | `amd64/mkdisk.sh` on Ubuntu, `rsync`'d onto sdb1 | `/bin/sh`, `/bin/sshd`, `herd`, `box` — the box runs binaries it cannot rebuild |
+| ~~**the source tree**~~ | ~~`rsync` from Ubuntu's `/root/akuma`, staged with `--exclude .git`~~ | **CLOSED 2026-09-19 — §9.** The partition carries a full `git clone` at `/src/github.com/netoneko/akuma` |
+| ~~**`vendor/`**~~ | ~~`cargo vendor` run on Ubuntu~~ | **CLOSED 2026-09-19 — §9.** Replaced by an ordinary cargo cache at `/root/.cargo`, not a vendor directory |
+| **all of userland** | `amd64/mkdisk.sh` on Ubuntu, `rsync`'d onto sdb1 | `/bin/sh`, `/bin/sshd`, `herd`, `box` — the box runs binaries it cannot rebuild. Every one of them **builds** on the box now (§9), but none has been installed from a box-built copy yet |
 
 That last row is the sharp one. **A machine that can rebuild its kernel but not
 its shell is not self-hosting; it is a very good cross-compilation target.**
@@ -145,6 +148,33 @@ Roughly half of ~10-minute builds die. An autonomous agent loop runs for hours,
 and no retry logic above the corruption fixes the corruption beneath it. **Treat
 that race as the gate on "truly autonomous", not as something to work around.**
 
+**And the gate is wider than that one race.** Before the autonomous experiment —
+an agent driving the loop unattended for hours — **two whole areas of this
+target need to be severely stabilized, not merely working once**:
+
+- **Networking.** An agent's session is continuous HTTPS: model calls, `git
+  fetch`/`push`, and long-lived TLS connections that must survive minutes of
+  silence and then resume. On bare metal that traffic goes through
+  `crates/akuma-net-nic/src/rtl8169.rs`, a driver **no host test and neither
+  fast-lane target ever executes** (both are virtio), on a machine where a
+  one-line diagnostic in the poll loop livelocked the box on 2026-09-19. DNS
+  alone has already had a four-cause investigation
+  ([`AKUMA_AMD64_DNS_CONNECTED_UDP.md`](AKUMA_AMD64_DNS_CONNECTED_UDP.md)). A
+  dropped connection is not a tidy failure for an agent: it is a half-written
+  patch and a loop that cannot report what it did.
+- **Processes and threads.** A build is thousands of `fork`/`execve`/`clone`
+  cycles and an agent adds thousands more (every tool call is a process). The
+  known-open list here is not short — the SMP user-process corruption above,
+  the thread-lifecycle paths
+  ([`AKUMA_AMD64_THREAD_LIFECYCLE.md`](AKUMA_AMD64_THREAD_LIFECYCLE.md)), and
+  the process table that still **panics** when it fills rather than applying
+  backpressure.
+
+Both have the same property that makes them gates rather than chores: they fail
+*probabilistically*, hours in, and the failure destroys the evidence. Autonomy
+multiplies exactly that. Measure both with something that runs for hours before
+handing the machine to an agent that runs for hours.
+
 The probe aimed at it is `userspace/amd64/fbstress/` — concurrent demand faults
 on *file-backed* pages shared between processes through `akuma-fpcache`, plus CoW
 on those pages. It is the shape `rustc` has and `mtstress` does not, and — worth
@@ -208,6 +238,123 @@ from a repository the machine cloned itself, is the increment.
    `unknown` on its own, which is the cheap proof the repository is real.
 6. Userland: `herd`, `box`, `sshd`, then `nca`.
 7. Only then NCA + GLM driving the loop.
+
+## 8. The goal, restated: **patch itself, reboot, and continue**
+
+Building its own kernel is done (2026-09-18) and is, on its own, a smaller claim
+than it sounds: a machine can compile a byte-identical copy of what it is
+already running and still be a cross-compilation target with extra steps. The
+proof that matters is the **loop**, not the artifact:
+
+> The box holds the repository. It changes the source, builds the change,
+> installs it, reboots into it, and picks the work back up — **with nothing
+> outside the machine involved in any of those five steps.**
+
+Written as the cycle it has to close:
+
+```sh
+# inside Akuma, on the metal, with no Ubuntu and no laptop in the path
+cd /src/github.com/netoneko/akuma
+vi <a file>                      # or an agent edits it
+kbuild -j 1                      # build the change
+kinstall                         # /boot/akuma-amd64, md5-verified
+/bin/busybox reboot -f           # up on what it just wrote
+git commit -am "…" && git push   # report what it changed
+#  … and the next iteration starts here, on the new kernel
+```
+
+Four properties make that a real claim rather than a demo, and each is a thing
+to check rather than assume:
+
+1. **The change is authored where it is built.** A patch that arrives from the
+   laptop proves the compiler works, not the machine. `git status` must be
+   clean before the edit and show exactly the edit after it — which is why
+   nothing the rig needs (cargo config, target dirs, wrapper scripts) lives in
+   the checkout.
+2. **The reboot is unattended.** `GRUB_DEFAULT="Akuma/amd64"`, so `reboot -f`
+   returns to Akuma. Nothing arms anything.
+3. **The work survives the reboot.** The checkout, the toolchain, the cargo
+   cache and the build output are all on the partition the kernel boots from,
+   so iteration `n+1` starts with everything iteration `n` produced.
+4. **A failed iteration is recoverable without the loop.**
+   `/boot/akuma-amd64.good` is the only remote-free way back, and it is worth
+   exactly as much as the kernel behind it — promote it after a boot that
+   passed its self-tests, never at install time.
+
+**The first real exercise of this loop is Intel HDA audio**
+([`../runbooks/add-intel-hda-audio.md`](../runbooks/add-intel-hda-audio.md)),
+driven by meow + GLM on the box. It was chosen because it is a *new* subsystem
+rather than a patch to an existing one — a driver for hardware only this machine
+has (`8086:8c20` at `00:1b.0`), which no host test and no QEMU fast lane can
+fully stand in for — and because "did it work?" is answerable by a human in one
+second, from across the room, without reading a log.
+
+The gate in §5 has not moved, and it is wider than the SMP race: **networking
+and the process/thread paths both need to be severely stabilized on amd64
+before the autonomous version of this is attempted at all.** Closing the loop
+by hand is worth doing now regardless — every iteration is a trial of exactly
+those paths, run by someone who can tell a kernel bug from an agent mistake.
+Handing the same loop to an agent before then produces neither the driver nor a
+usable bug report.
+
+## 9. What is on the partition now (2026-09-19)
+
+Staged from Ubuntu with `sdb1` mounted at `/mnt/ak`. Three of these were
+**blockers that had not been found yet** — the box could not have built anything
+as it stood that morning.
+
+| | where | note |
+|---|---|---|
+| the repository | `/src/github.com/netoneko/akuma` | full clone (not shallow), `amd64-cleanup-and-improvements` @ `894ec53b`, `origin` over https |
+| submodules | `crates/akuma-fbcon/vendor/spleen`, `userspace/meow`, `userspace/nca/native-cli-ai` | objects had been fetched but **three worktrees were empty** — `git submodule update --init` reported nothing to do because the recorded SHA already matched; `--force` is what checks the files out. Without `spleen` the kernel does not build at all (`akuma-fbcon`'s `build.rs` bakes the BDF) |
+| toolchain | `/usr/local/rust` | nightly `1.100.0-nightly (420ed2a0c 2026-09-18)`, musl host, targets `x86_64-unknown-{none,linux-musl}`, **plus `rust-src`** |
+| cargo cache | `/root/.cargo` | ~1 GB, an ordinary registry cache (`cache/` + extracted `src/` + the one git dependency), **not** a vendor directory. Primed for the kernel workspace, `userspace/`, `meow` and `nca` |
+| cargo config | `/root/.cargo/config.toml` | box-local: `--threads=1` for lld, and the host linker below. Deliberately **not** in the checkout, so the tree stays `git status` clean |
+| env + wrappers | `/etc/akuma-dev.env`, `/etc/profile`, `/bin/{kbuild,ubuild,mbuild,kinstall}` | sshd sets no environment for a session, so every wrapper sources the env itself |
+| git identity | `/etc/gitconfig` (and `/root/.gitconfig`) | system-wide because a session has no `HOME` unless a wrapper sets one |
+
+**Trap 1 — the toolchain was silently truncated.** `libcore.rmeta` for
+`x86_64-unknown-none` was **209 KB where it should be 68 MB**, and `liballoc`
+and `libcompiler_builtins` were missing outright; the tree was also littered
+with 163-byte `._*` AppleDouble stubs, so it had been copied from the Mac. The
+failure this produces names the wrong thing entirely — *"only metadata stub
+found for `rlib` dependency `core`"*, on crate 3 of 137. Fixed by installing the
+same nightly through `rustup` on Ubuntu and rsyncing it whole. **Check
+`ls -la …/x86_64-unknown-none/lib/` after any toolchain copy**: four files, and
+`libcore.rmeta` is tens of megabytes.
+
+**Trap 2 — proc macros could not have linked.** `syn`, `quote`,
+`thiserror-impl`, `enumn` and `zerocopy-derive` build as musl **dylibs** and
+need `-lc` and `-lgcc_s`. There is no `cc` on this root, and cargo does **not**
+apply `target.<triple>.rustflags` to host units, so no flag can carry the `-L`
+paths. The fix is `/usr/lib/lib{c,gcc_s}.so` (musl's `libc.so` *is* the loader)
+plus `/usr/local/bin/ld.lld`, a wrapper that injects `-L/usr/lib -L/lib` and is
+named `ld.lld` because **rustc infers the linker flavour from the file name**.
+
+**Trap 3 — cwd, not `--manifest-path`.** Cargo discovers `.cargo/config.toml`
+from the *working directory*. Building the kernel from anywhere but the manifest
+directory drops `relocation-model=static` / `code-model=kernel` and the link
+dies with `relocation R_X86_64_32 cannot be used against symbol '_start'` —
+which reads as a code fault and is not one. `kbuild` `cd`s for you.
+
+**And a hazard the staging created:** `hpbox.restage_disk()` is
+`rsync -aH --delete` from `root.img` onto this partition, which would have
+deleted all of the above *and* `/boot/akuma-amd64`. It now excludes `/src`,
+`/root`, `/usr/local` and `/boot`.
+
+Verified from Ubuntu, using the partition's own toolchain and cache (the box's
+musl binaries run there through a symlinked `/lib/ld-musl-x86_64.so.1`), all
+`--offline`:
+
+| | result |
+|---|---|
+| `akuma-amd64`, `x86_64-unknown-none`, `-j8` | **3 411 960 B ELF, 52 s** |
+| `userspace`: `paws httpd herd hget wall box sshd ssh` | all built |
+| `meow` for `x86_64-unknown-none` | **built — 246 KB**; the agent has never had an amd64 binary before, and `amd64/mkdisk.sh` does not stage one yet |
+
+What that does **not** prove: none of it has been run on the box itself yet.
+The first `kbuild` inside Akuma is the real check, and the three traps above are
+the reason it would not have worked that morning.
 
 ## Background
 

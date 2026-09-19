@@ -49,6 +49,16 @@ fi
 SZ=$(wc -c < "$ELF")
 echo "install_kernel_amd64.sh: $ELF ($SZ bytes) -> $DEST"
 
+# Keep the kernel we are about to overwrite as `.prev`. `.good` is the *verified*
+# fallback and is promoted by hand after a boot that passed its self-tests
+# (docs/runbooks/amd64-bare-metal-loop.md); `.prev` is simply the one that was
+# there a moment ago, which is what you want after installing two kernels in a
+# row without rebooting between them. Both are GRUB-reachable by editing the
+# menu entry's path; neither costs anything but 3 MB.
+if [ -f "$DEST" ]; then
+    cp -f "$DEST" "$DEST.prev" || echo "install_kernel_amd64.sh: warning — could not save $DEST.prev" >&2
+fi
+
 cp -f "$ELF" "$DEST"
 sync
 
