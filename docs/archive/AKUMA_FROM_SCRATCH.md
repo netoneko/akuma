@@ -327,9 +327,23 @@ same nightly through `rustup` on Ubuntu and rsyncing it whole. **Check
 `thiserror-impl`, `enumn` and `zerocopy-derive` build as musl **dylibs** and
 need `-lc` and `-lgcc_s`. There is no `cc` on this root, and cargo does **not**
 apply `target.<triple>.rustflags` to host units, so no flag can carry the `-L`
-paths. The fix is `/usr/lib/lib{c,gcc_s}.so` (musl's `libc.so` *is* the loader)
-plus `/usr/local/bin/ld.lld`, a wrapper that injects `-L/usr/lib -L/lib` and is
-named `ld.lld` because **rustc infers the linker flavour from the file name**.
+paths.
+
+The first fix was a shell wrapper named `ld.lld` that injected
+`-L/usr/lib -L/lib`. It worked on Ubuntu and **failed on the box**, which is
+trap 2b and the more interesting half:
+
+> **`execve` on this kernel does not understand `#!`.** rustc execs the linker
+> directly and got `Exec format error (os error 8)`; busybox runs the identical
+> file because a *shell* retries a non-ELF itself. So `/bin/kbuild` works and
+> the same script as a linker cannot. Anything a build reaches by `execve` —
+> a linker, a `build.rs` helper, a cargo `runner` — must be a real ELF here.
+
+The fix that holds is to move the libraries onto the search path lld already
+has rather than to wrap the linker: musl's `libc.so` (which *is* the loader)
+and `libgcc_s.so` copied into
+`lib/rustlib/x86_64-unknown-linux-musl/lib` and its `self-contained/`, with
+`linker = ".../bin/gcc-ld/ld.lld"` — the distribution's own ELF.
 
 **Trap 3 — cwd, not `--manifest-path`.** Cargo discovers `.cargo/config.toml`
 from the *working directory*. Building the kernel from anywhere but the manifest

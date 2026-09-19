@@ -157,6 +157,8 @@ edit, build, install, reboot, commit, with nothing outside the machine involved.
 | the cargo cache | `/root/.cargo` — an ordinary registry cache, **not** `vendor/` |
 | box-local cargo config | `/root/.cargo/config.toml` |
 | the environment | `/etc/akuma-dev.env`, sourced by `/etc/profile` and by every wrapper |
+| the wrappers' source | [`scripts/box/`](../../scripts/box/) in this repo — installed by `cp`, never authored on the machine, so the rig is rebuildable from a checkout |
+| the agent | `/bin/meow` (built here for `x86_64-unknown-none`), configured against z.ai in `/etc/meow/config` — `meow -c '<prompt>'` for one shot |
 
 ```sh
 kbuild -c -j 1        # kernel -> /root/ktarget   (-c cleans; that is the trial)
@@ -166,7 +168,7 @@ kinstall              # /boot/akuma-amd64, multiboot2-checked and md5-verified
 /bin/busybox reboot -f
 ```
 
-Four things about that environment, each of which cost time to establish:
+Five things about that environment, each of which cost time to establish:
 
 - **A session has no environment at all.** sshd sets `TERM` and nothing else, so
   `ssh akuma 'cargo build'` finds no `cargo`. The wrappers source
@@ -182,10 +184,22 @@ Four things about that environment, each of which cost time to establish:
   and the box can diff and commit exactly what it changed. The `--threads=1`
   lld flag and the host linker are in `/root/.cargo/config.toml`; build output
   goes to `/root/{k,u,m}target`.
-- **Proc macros need `/usr/local/bin/ld.lld`.** They link as musl dylibs
-  against `-lc`/`-lgcc_s`, there is no `cc`, and cargo does not apply
-  `rustflags` to host units — the wrapper is the only place the `-L` paths fit.
-  If a build dies with `can't find crate for thiserror_impl`, that is this.
+- **Proc macros link as musl dylibs and need `-lc`/`-lgcc_s`,** and there is no
+  `cc` here. The linker is the toolchain's own
+  `lib/rustlib/x86_64-unknown-linux-musl/bin/gcc-ld/ld.lld`
+  (`/root/.cargo/config.toml`), and the two libraries are **copies of musl's
+  `libc.so` — which is the loader — and `libgcc_s.so`, placed in
+  `lib/rustlib/x86_64-unknown-linux-musl/lib` and its `self-contained/`**, i.e.
+  on the search path lld already has. They cannot be reached with a flag:
+  cargo does not apply `rustflags` to host units. A build that dies with
+  `can't find crate for thiserror_impl` is this.
+- **The linker cannot be a shell wrapper, because `execve` here does not
+  understand `#!`.** A script exec'd by anything other than a shell fails with
+  `Exec format error`, and rustc execs the linker directly — so
+  `could not exec the linker …: Exec format error (os error 8)` is the kernel,
+  not the path. Measured 2026-09-19, which is why the `-L` problem above is
+  solved by moving files rather than by wrapping the linker. The same limit
+  applies to any `#!` script a build script tries to run.
 
 `hpbox.restage_disk()` excludes `/src`, `/root`, `/usr/local` and `/boot` for
 this reason; anything else you add to the partition by hand is *not* protected
@@ -223,7 +237,8 @@ the measurements):
 | what you see | what it is |
 |---|---|
 | `only metadata stub found for rlib dependency 'core'`, on crate 3 of 137 | a **truncated toolchain copy**. `libcore.rmeta` for `x86_64-unknown-none` must be tens of MB (68 MB), not 209 KB, and `liballoc`/`libcompiler_builtins` must be there. `._*` files in the tree mean it came off a Mac. Reinstall with `rustup toolchain install nightly-<date>-x86_64-unknown-linux-musl --profile minimal --force-non-host -c rust-src -t x86_64-unknown-none` and rsync it whole |
-| `can't find crate for 'thiserror_impl'` (or any proc macro) | the **host linker**. Proc macros are musl dylibs needing `-lc`/`-lgcc_s`; there is no `cc`, and cargo does **not** apply `target.*.rustflags` to host units, so the `-L` paths only fit inside the linker itself: `/usr/lib/lib{c,gcc_s}.so` plus the `/usr/local/bin/ld.lld` wrapper. The file must be *named* `ld.lld` — rustc picks the linker flavour from the name |
+| `can't find crate for 'thiserror_impl'` (or any proc macro) | the **host linker**. Proc macros are musl dylibs needing `-lc`/`-lgcc_s`; there is no `cc`, and cargo does **not** apply `target.*.rustflags` to host units, so no flag can add a `-L`. Copy musl's `libc.so` (the loader) and `libgcc_s.so` into `lib/rustlib/x86_64-unknown-linux-musl/lib` **and** its `self-contained/`, where lld already looks, and point `linker` at `…/bin/gcc-ld/ld.lld`. On Ubuntu a shell wrapper injecting `-L` also works; **on the box it cannot** — next row |
+| `could not exec the linker …: Exec format error (os error 8)` | **`execve` on this kernel does not understand `#!`.** The linker was a shell script; rustc execs it directly and only a *shell* falls back to interpreting scripts itself (which is why `/bin/kbuild` runs fine and the same file as a linker does not). Anything a build invokes by `execve` must be a real ELF |
 | `relocation R_X86_64_32 cannot be used against symbol '_start'` | built from the **wrong cwd**. Cargo finds `.cargo/config.toml` from the working directory, not from `--manifest-path`, so the kernel's `relocation-model`/`code-model` were never applied |
 | a submodule directory containing only `.git`, while `git submodule status` says it is clean | the objects were fetched and the worktree never checked out. `git submodule update --init` does nothing here because the SHA already matches — it needs **`--force`**. Without `crates/akuma-fbcon/vendor/spleen` the kernel does not build at all |
 

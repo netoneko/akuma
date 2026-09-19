@@ -205,6 +205,10 @@ Each step is a thing you can *see*, and none of them needs the step after it.
   functions of their inputs: they belong in `crates/akuma-hda` with tests that
   run on the laptop (`cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`).
   Anything that touches MMIO stays behind them.
+- **A helper you write must be run as `sh helper.sh`, not as `./helper.sh`.**
+  This kernel's `execve` does not understand `#!`, so a script is only
+  executable when a shell is the thing starting it. Nothing you hand to
+  `execve` — or to a build script, or to cargo as a `runner` — can be a script.
 - **Kernel changes need kernel tests.** Add a boot-suite check the way
   `src/process_tests.rs`'s audio test does it (`audio::is_available()` →
   `audio::play(&pcm)`), so a silent regression shows up in the tally.
@@ -222,8 +226,14 @@ kbuild -j 1 && kinstall && /bin/busybox reboot -f
 # 3. the node is there only because a device answered
 ls -l /dev/dsp
 
-# 4. the whole path, end to end
-wavplay /path/to/16bit-48k.wav        # audible sound, and `echo $?` = 0
+# 4. the client. `wavplay` is a userspace workspace member and has never been
+#    built for this target; build and install it like any other:
+ubuild wavplay && cp -f /root/utarget/x86_64-unknown-none/release/wavplay /bin/
+
+# 5. the whole path, end to end. There is no WAV on this box — make one
+#    (44-byte header + PCM) or fetch one with `hget`; keep it small and
+#    16-bit/48 kHz stereo so nothing in the path has to convert.
+wavplay /tmp/test.wav                 # audible sound, and `echo $?` = 0
 ```
 
 A run that prints `[HDA] ready` and plays silence is **not** a pass — say so and
