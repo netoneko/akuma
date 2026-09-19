@@ -468,24 +468,77 @@ if [ -f "$BB" ]; then
     # linked here is simply not available on that machine — there is no second
     # way in to add it. Each name costs one directory entry and no space.
     #
-    # `reboot`/`halt`/`poweroff` are the ones worth calling out: `reboot(2)` is
+    # 2026-09-19: linked EVERY applet this exact binary defines (`busybox
+    # --list` on the box, 400 names) rather than a hand-picked ~80 — the
+    # curated list was cutting off things nobody had noticed missing yet
+    # (`patch`, `xxd`, `sha1sum`, `less`'s friends, the whole `ip`/`ipaddr`
+    # family, `su`, `passwd`, …) for no saving worth the surprise. Most of the
+    # extra names will simply error at runtime (no `/etc/passwd`, no module
+    # loader, no `/dev` nodes for the storage/mtd tools) — that is a
+    # capability gap, not a reason to withhold the *name*, and costs nothing
+    # to leave linked.
+    #
+    # Two names are deliberately EXCLUDED even though this binary defines
+    # them: `httpd` and `wall` both collide with a dedicated Akuma-native
+    # `/bin/{httpd,wall}` staged later in this script (its own server, its own
+    # `console_notify` syscall) — the later `write` clobbers a same-name
+    # hardlink either way, so this is belt-and-suspenders against a future
+    # reordering silently swapping the real binary for busybox's much thinner
+    # stand-in. `sh` stays: nothing else provides it.
+    #
+    # `reboot`/`halt`/`poweroff` are still worth calling out: `reboot(2)` is
     # wired (`amd64/src/reboot.rs`), so they are how that box gets shut down
     # cleanly from a session instead of by holding its power button.
     #
-    # NOT here: anything needing a pipeline or a redirect. busybox `sh` runs
-    # plain commands on this target but `cmd | cmd` fails — fds 0/1/2 are not
-    # entries in `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them
-    # cannot work. That is a real gap, not a missing applet.
+    # A gap no applet list fixes: anything needing a pipeline or a redirect.
+    # busybox `sh` runs plain commands on this target but `cmd | cmd` fails —
+    # fds 0/1/2 are not entries in `fd.rs`'s table (`FIRST_FILE_FD = 3`), so
+    # `dup2` onto them cannot work. Regenerate this list with
+    # `busybox --list | sort -u` against a fresh `$BB` if the pinned
+    # `BB_VER` above ever changes.
     for applet in \
-        sh ash uname ls cat echo pwd env printf test true false yes seq expr \
-        cut head tail wc find grep sed awk sort uniq tr xargs tee \
-        basename dirname readlink realpath \
-        mkdir rmdir rm cp mv ln touch chmod chown stat du df sync \
-        date sleep uptime free ps kill top id whoami hostname which dmesg \
-        more less vi hexdump od strings cmp diff md5sum sha256sum \
-        tar gzip gunzip zcat \
-        wget ifconfig route netstat nslookup ping nc ntpd \
-        mount umount reboot halt poweroff; do
+        [ [[ acpid add-shell addgroup adduser adjtimex ar arch arp arping \
+        ascii ash awk base32 base64 basename bc blkdiscard blkid blockdev \
+        bootchartd brctl bunzip2 bzcat bzip2 cal cat chat chattr chgrp chmod \
+        chown chpasswd chpst chroot chrt chvt cksum clear cmp comm conspy cp \
+        cpio crc32 crond crontab cryptpw cttyhack cut date dc dd deallocvt \
+        delgroup deluser depmod devmem df dhcprelay diff dirname dmesg dnsd \
+        dnsdomainname dos2unix dpkg dpkg-deb du dumpkmap dumpleases echo ed \
+        egrep eject env envdir envuidgid expand expr factor fakeidentd \
+        fallocate false fatattr fbset fbsplash fdflush fdformat fdisk \
+        fgconsole fgrep find findfs flash_eraseall flash_lock flash_unlock \
+        flashcp flock fold free freeramdisk fsck fsck.minix fsfreeze fstrim \
+        fsync ftpd ftpget ftpput fuser getopt getty grep groups gunzip gzip \
+        halt hd hdparm head hexdump hexedit hostid hostname hush hwclock \
+        i2cdump i2cget i2cset i2ctransfer id ifconfig ifenslave ifplugd inetd \
+        init inotifyd insmod install ionice iostat ip ipaddr ipcalc ipcrm \
+        ipcs iplink ipneigh iproute iprule iptunnel kbd_mode kill killall \
+        killall5 klogd last less link linux32 linux64 linuxrc ln loadfont \
+        loadkmap logger login logname losetup lpd lpq lpr ls lsattr lsmod \
+        lsof lspci lsscsi lsusb lzcat lzma lzop lzopcat makedevs makemime man \
+        md5sum mdev mesg microcom mim mkdir mkdosfs mke2fs mkfifo mkfs.ext2 \
+        mkfs.minix mkfs.reiser mkfs.vfat mknod mkpasswd mkswap mktemp modinfo \
+        modprobe more mount mountpoint mpstat mt mv nameif nbd-client nc \
+        netstat nice nl nmeter nohup nologin nproc nsenter nslookup ntpd nuke \
+        od openvt partprobe passwd paste patch pgrep pidof ping ping6 \
+        pipe_progress pivot_root pkill pmap popmaildir poweroff powertop \
+        printenv printf ps pscan pstree pwd pwdx raidautorun rdate rdev \
+        readlink readprofile realpath reboot reformime remove-shell renice \
+        reset resize resume rev rm rmdir rmmod route rpm rpm2cpio rtcwake \
+        run-init run-parts runlevel runsv runsvdir rx script scriptreplay sed \
+        sendmail seq setarch setconsole setfattr setfont setkeycodes \
+        setlogcons setpriv setserial setsid setuidgid sh sha1sum sha256sum \
+        sha3sum sha512sum showkey shred shuf slattach sleep smemcap softlimit \
+        sort split ssl_client start-stop-daemon stat strings stty su sulogin \
+        sum sv svc svlogd svok swapoff swapon switch_root sync sysctl syslogd \
+        tac tail tar taskset tc tcpsvd tee telnet telnetd test tftp tftpd \
+        time timeout top touch tr traceroute traceroute6 true truncate ts tty \
+        ttysize tunctl tune2fs ubiattach ubidetach ubimkvol ubirename \
+        ubirmvol ubirsvol ubiupdatevol udhcpc udhcpc6 udhcpd udpsvd uevent \
+        umount uname uncompress unexpand uniq unix2dos unlink unlzma unlzop \
+        unshare unxz unzip uptime users usleep uudecode uuencode vconfig vi \
+        vlock volname w watch watchdog wc wget which who whoami whois xargs \
+        xxd xz xzcat yes zcat zcip; do
         "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
     done
 fi

@@ -666,15 +666,30 @@ the numbers above showed there is no slow case to confuse it with.
 
 **Two traps in running it on this box**, both of which cost time here:
 
-* **Do not launch it as `( cmd; cmd ) &`.** A subshell containing two execs
-  wedges this kernel (a pre-existing bug, `AKUMA_AMD64_WAIT4_OWNERSHIP`), and
-  two overlapping instances also overwrite each other's `run$i.log`.
-* **A backgrounded run's stdout is lost.** Launched with `sh nca-trials 4 >
-  log &` from an ssh command, the redirect target stays **0 bytes** even though
-  the per-run `nca` logs fill up normally — the writes go nowhere once the
-  launching session ends. Run it in the foreground, sized to fit inside the 240 s
-  ssh client cutoff (§4), or read the per-run logs in `/root/.nca-trials/`
-  instead of the tally.
+* **A backgrounded run does not survive the ssh session, and its children become
+  zombies.** Launched as `sh nca-trials 4 > log &` from an ssh command, the
+  redirect target stays **0 bytes** while the per-run `nca` logs fill normally:
+  the wrapper shell is killed at session teardown before it prints its first
+  tally line, and the `nca` children it had already spawned are orphaned. Because
+  pid 1 is `/bin/sshd` and does not `wait()` on orphans, each one then sits as a
+  zombie for the life of the boot — 17 of them after one session, clearable only
+  by reboot
+  ([`AKUMA_AMD64_NO_SLOT_RECYCLER.md`](AKUMA_AMD64_NO_SLOT_RECYCLER.md)
+  § Appendix). Run it in the foreground, sized to fit inside the 240 s ssh client
+  cutoff (§4), or read the per-run logs in `/root/.nca-trials/` instead of the
+  tally.
+* **Two overlapping instances overwrite each other's `run$i.log`**, which is its
+  own way to get a confusing result — launch one at a time.
+
+  **Corrected 2026-09-19:** an earlier version of this note blamed
+  `( cmd; cmd ) &` for "wedging this kernel", citing
+  `AKUMA_AMD64_WAIT4_OWNERSHIP`. That was wrong twice: that bug is **fixed**
+  (2026-09-08, verified on the metal), and these processes had *exited* — they
+  were zombies, so nothing was stuck. Session teardown plus a missing orphan
+  reaper explains all of it, and no kernel bug is needed. A `State: Z` census
+  (`awk '{print $3}' /proc/*/stat`) is what separates "wedged" from "dead and
+  unreaped", and it should be the first check, because the two look identical in
+  `ps`.
 
 Also seen and not chased: `nca` logs `IPC disabled: socket bind failed: Address
 family not supported by protocol (os error 97)` on every start. That is

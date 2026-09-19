@@ -88,7 +88,7 @@ The kernel and the RAM recovery image live on **Akuma's own ext2 partition**
 
 ```
 search --no-floppy --file --set=root /boot/akuma-amd64
-multiboot2 /boot/akuma-amd64 init=/bin/sshd root=/dev/sda1
+multiboot2 /boot/akuma-amd64 init=/bin/herd root=/dev/sda1
 module2 /boot/root.img rootfs
 ```
 
@@ -465,12 +465,12 @@ and the PIT-based clock calibration on real timing.
 ## Boot options
 
 ```
-multiboot2 /boot/akuma/akuma-amd64 init=/bin/sshd netprobe
+multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 ```
 
 | token | effect |
 |---|---|
-| `init=<path>` | what runs after the self-tests. `/bin/sshd` direct rather than `/bin/herd` — herd drains a service's stdout into a log file, so a supervised sshd fails *invisibly* on a framebuffer-only console |
+| `init=<path>` | what runs after the self-tests. **`/bin/herd` since 2026-09-19** (was `/bin/sshd` direct) — herd is now the default GRUB entry's init, supervising `sshd` (restart on crash/exit) with `httpd` staged `available` but not enabled. The original reason for going direct — herd drains a service's stdout into a log file, so a supervised sshd's crash doesn't show up on the framebuffer — is still true, but it isn't a dead end: `/var/log/herd/sshd.log` sits on the same ext2 partition (`sdb1` from Ubuntu), so a crash is readable by rebooting to Ubuntu and mounting it, with no working ssh required. `INIT=/bin/sshd` still boots the old direct way for a one-off if herd itself is under suspicion |
 | `skiptests` | skip the ~200-check self-test suite, go straight to `init`. Still does the `init_*` calls the suite happens to also perform. For a trusted build, cuts a chunk off every reboot |
 | `netprobe` | a live NIC status line every 2 s from inside the netpoll daemon. **Off by default now — `dmesg` over ssh replaces it and it scrolled the TV** |
 | `nosmp` | single core. Quietens the `[BKL] stuck: cpu N …` chatter while cornering something |
