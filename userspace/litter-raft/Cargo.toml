@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "litter-raft"
+version = "0.1.0"
+edition = "2021"
+
+# no_std + alloc, zero dependencies — see src/lib.rs. `std` is pulled in only
+# under `cfg(test)`, which is what makes `cargo test` here a genuine native
+# macOS run: meow itself can't do that (raw Linux syscalls throughout
+# libakuma), but this crate has no libakuma dependency at all, so it's the one
+# piece of the litter that can be host-tested directly instead of through the
+# aarch64-linux-musl-in-Docker path every other meow test needs.
+[dependencies]
