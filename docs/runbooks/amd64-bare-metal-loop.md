@@ -160,6 +160,11 @@ edit, build, install, reboot, commit, with nothing outside the machine involved.
 | the wrappers' source | [`scripts/box/`](../../scripts/box/) in this repo — installed by `cp`, never authored on the machine, so the rig is rebuildable from a checkout |
 | the agent | `/bin/meow` (built here for `x86_64-unknown-none`), configured against z.ai in `/etc/meow/config` — `meow -c '<prompt>'` for one shot |
 
+Measured 2026-09-19, running the whole loop on the machine: `kbuild -j 1` from
+a cold `/root/ktarget` is **12 m 16 s** for 95 crates, `kinstall` + `reboot -f`
+puts ssh back **48 s** later, and the kernel that comes up reports its own
+branch in `uname` (`0.0.8 13bd1595-release-smp-shared`) and passes **775/0**.
+
 ```sh
 kbuild -c -j 1        # kernel -> /root/ktarget   (-c cleans; that is the trial)
 ubuild                # userspace -> /root/utarget (paws httpd herd hget wall box sshd)

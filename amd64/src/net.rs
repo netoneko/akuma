@@ -260,6 +260,71 @@ pub fn rng_fill_checked(buf: &mut [u8]) -> bool {
     true
 }
 
+/// One lap of a socket waiter that has nothing to do — `NetRuntime::blocking_relax`.
+///
+/// **Not `yield_now`, and the difference is the whole point.** `akuma-net`'s
+/// `wait_park` states the contract this hook has to meet: the relax "DROPS the
+/// Big Kernel Lock across the wait … so a peer's async-main poller can drive
+/// the RX that satisfies `condition`", and it names what happens otherwise —
+/// "a plain `yield_now` would spin holding it, freezing every peer core — the
+/// meow->LLM `connect`+recv wedge". This target supplied that plain `yield_now`
+/// until 2026-09-19, so it had the wedge the comment describes.
+///
+/// `yield_now` cannot meet the contract on this kernel and it is not a bug in
+/// `yield_now`: it opens a 4-`pause` drop window, **re-takes the lock**, and
+/// then switches with it held (`sched.rs`, "the switch requires the BKL"), which
+/// is correct for a yield and useless for a wait. A socket waiter that has
+/// nothing to do must be *off* the lock for as long as it has nothing to do,
+/// because the thread that will give it something — the netpoll daemon — needs
+/// the lock to run.
+///
+/// What it measured like: a request whose server thinks for ~5 s before sending
+/// its first byte (a model completion) would stall the whole box. `meow` sat in
+/// state `R` burning 33 s of CPU on a 5-second call, the TLS transport
+/// (`libakuma-tls`, which retries `WouldBlock` with no sleep by design, on the
+/// premise that "the kernel already blocks") span through it, and the stream
+/// ended in `TlsError(IoError)`. Four of ten one-line prompts failed that way,
+/// one of them five times in a row — while the *same* TLS stack fetched
+/// github and a 401 from the *same* host cleanly every time, because neither
+/// response has a multi-second silent window for the livelock to form in.
+///
+/// `allow_tick` is exactly the primitive: drop the BKL, `sti; hlt`, take it
+/// back — added 2026-09-17 for the sibling case (the netpoll daemon parking
+/// BKL-held, which produced the same `[BKL] stuck` storm). No `yield_now`
+/// first, matching the AArch64 net path, where removing the yield measured
+/// +27 % req/s (`akuma_threading::blocking_relax_net`). The waiter wakes on the
+/// next tick or any device interrupt and `wait_until` re-checks its condition
+/// per lap, which is the re-check contract `allow_tick` requires of its callers.
+fn net_blocking_relax() {
+    // **The timer check is not an optimisation — it is the whole safety
+    // argument, and leaving it out bricked the box on 2026-09-19.**
+    //
+    // `allow_tick` only *halts* (and only a halt releases the lock) when
+    // `lapic::timer_running()`. With the timer stopped it falls back to
+    // `sti; nop; cli` — a one-instruction window that **keeps the BKL held**,
+    // which is strictly worse here than the `yield_now` this replaced, because
+    // `yield_now` at least opens a drop window and switches. A socket waiter
+    // spinning on a held lock starves the netpoll daemon that would satisfy it,
+    // so the wait can never end: a livelock with no exit.
+    //
+    // The boot path is exactly where the timer is off. `boot::self_tests` calls
+    // `lapic::stop_timer()` and restarts it only around the SNTP sync (see the
+    // netpoll-lap check below), and the clock bootstrap resolves `pool.ntp.org`
+    // in that window. Measured, on the metal: a permanent
+    // `[BKL] stuck: owner=2 waiter=1/3/4 tag=502` storm with
+    // `dns: no resolver answered` — a box that prints forever, serves nothing,
+    // and needs a power cycle. The console was the only evidence; ssh never
+    // came up.
+    //
+    // So: halt when a halt is available, and otherwise do exactly what this
+    // target did before, rather than something new and worse.
+    if crate::lapic::timer_running() {
+        crate::sched::allow_tick();
+    } else {
+        crate::sched::yield_now();
+    }
+}
+
 /// The twelve `NetRuntime` hooks this target fills — see the module header for
 /// why most collapse to yields and no-ops on a one-core, no-IRQ machine.
 fn net_runtime() -> NetRuntime {
@@ -267,10 +332,7 @@ fn net_runtime() -> NetRuntime {
         uptime_us,
         utc_seconds,
         yield_now: crate::sched::yield_now,
-        // A yield: it switches to any runnable task, and when there is none it
-        // drops the BKL for a moment so the other cores' syscalls get in — which
-        // is exactly what "relax while blocked" has to mean under one lock.
-        blocking_relax: crate::sched::yield_now,
+        blocking_relax: net_blocking_relax,
         park_until,
         current_waker: noop_waker,
         current_core_id: crate::smp::cpu_index_u32,

@@ -32,9 +32,12 @@ should read it the same way — it is the orientation, not the design.
 > as if you will resume with no memory: the git log, the doc you are keeping and
 > the console are the only things that survive.
 >
-> Do not force-push and do not rewrite history. When you are done, write
+> **Commit locally; do not push.** This machine has no git credential and that
+> is deliberate — your work stays on `why-are-we-here-just-to-suffer` here until
+> a human collects it. Do not try to add a credential, do not change the remote,
+> do not rewrite history, and never force anything. When you are done, write
 > `docs/reference/subsystems/drivers/hda.md` and add a row to the
-> `docs/README.md` symptom matrix.
+> `docs/README.md` symptom matrix — as commits, like everything else.
 >
 > Read "Before you start", "The seam", "The bring-up order" and "Rules you must
 > not break" below before writing any code.

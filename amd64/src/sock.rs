@@ -17,8 +17,11 @@
 //!
 //! Every call is made in **blocking** mode. `akuma-net`'s wait loop
 //! (`akuma-net-yarn`) drives the poll from inside, and this target's
-//! `NetRuntime::blocking_relax` is a `yield_now`, so a blocked socket hands the
-//! CPU to the round-robin rather than spinning. `O_NONBLOCK` is not plumbed
+//! `NetRuntime::blocking_relax` **drops the BKL across a `hlt`**
+//! (`net::net_blocking_relax`), so a waiting socket is off the lock while it
+//! waits and the netpoll daemon can run. It was a plain `yield_now` until
+//! 2026-09-19, which holds the lock across the wait and wedged any request
+//! with a multi-second silent window — see that function's comment. `O_NONBLOCK` is not plumbed
 //! through yet: there is no `fcntl`, so nothing can ask for it.
 
 use akuma_net::socket::socket_const::{AF_INET, SOCK_DGRAM, SOCK_STREAM};

@@ -366,9 +366,43 @@ musl binaries run there through a symlinked `/lib/ld-musl-x86_64.so.1`), all
 | `userspace`: `paws httpd herd hget wall box sshd ssh` | all built |
 | `meow` for `x86_64-unknown-none` | **built — 246 KB**; the agent has never had an amd64 binary before, and `amd64/mkdisk.sh` does not stage one yet |
 
-What that does **not** prove: none of it has been run on the box itself yet.
-The first `kbuild` inside Akuma is the real check, and the three traps above are
-the reason it would not have worked that morning.
+### 9.1 The loop, run end to end on the metal — 2026-09-19
+
+Not a rehearsal from Ubuntu: every step below happened inside Akuma, over ssh,
+on the machine itself.
+
+| step | result |
+|---|---|
+| `git fetch origin` from the box | 3.1 s, under build load |
+| branch `why-are-we-here-just-to-suffer` off the pushed head | `13bd1595`, `git status` clean |
+| `kbuild -j 1` | **EXIT=0, 95 crates, 12 m 16 s**, 3 412 096 B |
+| `kinstall` | md5 `811d0401…` verified on read-back; `/boot/akuma-amd64.prev` written (first real use of that path) |
+| `/bin/busybox reboot -f` | back on ssh in **48 s** |
+| the kernel it came up on | `uname`: `0.0.8 13bd1595-release-smp-shared` — **the branch's own SHA**, and `/boot/akuma-amd64` is the md5 it just built |
+| self-tests | **775 passed, 0 failed** |
+| `meow -c '…'` against z.ai | answered, streaming, first token in 5.9 s |
+| `.good` promoted | after the boot passed, not at install time |
+
+So: **build → install → reboot → still working, with nothing outside the
+machine in the path.** That is §8's claim, demonstrated by hand. What it does
+**not** yet show is the same loop driven by the agent rather than by a person,
+which is what §5's gates are about.
+
+Two notes for whoever compares binaries next: the self-built kernel is **not**
+byte-identical to the one it replaced (3 412 096 vs 3 411 472 B) and should not
+be — the box's `--threads=1` rustflag feeds cargo's `-C metadata` hash, so a
+fixed-point check has to hold rustflags constant. And `kbuild` at `-j 1` took
+12 m 16 s here against the ~23 min the earlier record gives; the heap is 1 GiB
+now.
+
+**`git push` from the box does not work, and as of 2026-09-19 that is a
+decision rather than a gap.** `origin` is plain https and the machine holds no
+credential (no `.git-credentials`, no helper), so the box commits locally and a
+human collects the branch. Keeping it that way bounds what an agent on this
+machine can reach: it can change this machine and nothing else. The loop in §8
+is unaffected — "report what it changed" is satisfied by the git log on the
+partition — but anything that assumes the box can publish has to route through
+a person until that call is revisited.
 
 ## Background
 
