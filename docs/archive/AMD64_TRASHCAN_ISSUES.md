@@ -365,38 +365,322 @@ also what keeps a session teardown from being confused with the failure under
 test.
 
 ---
+## 5. TLS to `api.z.ai` — **root-caused 2026-09-19. Not a kernel bug, and not rustls.**
 
-## 5. TLS to `api.z.ai` — two of three stacks cannot talk to it. **OPEN**
+**Status: the kernel is exonerated; one real defect remains and it is in
+`libakuma-tls`.** The table below replaces the one that stood here, which said
+"two of three stacks cannot talk to it" and pointed at the kernel. Two of its
+three rows were measurement artifacts.
 
-**Status: OPEN 2026-09-19.** With §4 fixed and a current API key, `nca` still
-gets nothing from z.ai. The failure is **per TLS stack**, not per network, and
-that is what makes it worth writing down:
+Measured on kernel `72b71add`, against the **real** API endpoints:
 
-| from the box, to `api.z.ai:443` | result |
+| from the box, to `api.z.ai` | result |
 |---|---|
-| TCP connect (`busybox nc`) | instant |
-| **OpenSSL/musl** (`git ls-remote https://api.z.ai/`) | **1 s, a real HTTP 404 comes back** — full handshake, request and response |
-| **rustls** (`nca`, tokio) | `connected to 8.2…` and then **nothing**, indefinitely |
-| **libakuma-tls** (`hget`, `meow`) | **TLS handshake failed** in 1 s |
+| **OpenSSL** (`curl`) | 401 in 1.1 s (`/api/anthropic/v1/messages`), 2.6 s (`/api/coding/...`), HTTP/2 |
+| **rustls, sync** (`nettest-std tls`) | handshake 880 ms, 301, body intact |
+| **rustls, async — nca's exact stack** (`nettest-reqwest post`) | 401 in **823 ms** and **1820 ms** |
+| **nca itself** | answers from `glm-5.3-flash` (see §5.3) |
+| **libakuma-tls** (`hget`, `meow`) | **`decode error`** — the one real failure, §5.2 |
 
-The controls matter as much as the rows: `hget` reaches **github** over TLS
-perfectly, `git` moves 20 MB from github, and every one of these runs on the
-same box, the same NIC and the same LAN. So the path, the NIC and this kernel's
-TCP are all fine *for this peer* — OpenSSL proves the whole exchange works.
-Something about that server's handshake defeats the other two stacks, and the
-two fail differently: one errors, one hangs.
+### 5.1 Why rustls looked broken, and was not
 
-Next instruments, in order of cost: the handshake as OpenSSL sees it
-(`git ls-remote` works, so the certificate chain and the cipher suite are
-obtainable from the box), then `meow --debug` for libakuma-tls's own refusal,
-then the kernel's `strace` boot flag against `nca` to see whether the socket is
-being read at all during the stall.
+The old row read "`connected to 8.2…` and then **nothing**, indefinitely". Two
+things produced that, neither of them TLS:
 
-**Do not re-derive the ruled-out parts.** §4's table covers the client timeout,
-and a 70 s mid-stream silence over plain HTTP on the LAN is delivered intact —
-so "idle connections get dropped" is answered and the answer is no.
+* **The test URL was wrong.** `https://api.z.ai/` is not an API endpoint: it is a
+  301 to `https://z.ai/model-api`, a marketing page on a **different host**
+  (`8.216.131.225`). `reqwest` follows redirects, `curl` without `-L` does not,
+  so the two clients were never talking to the same server. Following it costs
+  **10.7 s even for curl**, and the async probe measured **27.1 s and 27.7 s**
+  first-byte on that URL — repeatable to within 600 ms, which is what made it
+  look like a kernel timer. Against the real endpoints the same binary is under
+  two seconds. **A URL that redirects cross-host cannot be a transport probe.**
+* **The sync/async comparison was not controlled.** `nettest-std` filters the
+  resolved address list to IPv4 (`resolve()` in `stdlib/src/main.rs`) and
+  `reqwest` does not, and `api.z.ai` is dual-stack (AAAA `240b:4001:139:…`,
+  A `8.217.100.151`/`8.217.233.95`) while the `api.github.com` control is
+  IPv4-only. So "sync works, async hangs" had a second explanation available.
+  It turned out not to be that either — `socket(AF_INET6)` returns
+  `EAFNOSUPPORT` immediately (`akuma-syscalls-glue`'s `sys_socket`: `domain != 2`)
+  and `dmesg` recorded **zero** such rejections across a stalled run, so no IPv6
+  socket was ever attempted — but the axis was uncontrolled for a session.
+  `stdlib/Cargo.toml` promises the runtime is the only difference from the
+  reqwest probe. It is not; the address filter is a second one.
 
----
+### 5.2 The real defect: `embedded-tls` rejects a handshake over an unknown group — **FIXED**
+
+`libakuma-tls` fails with `TlsError::DecodeError`, and **this reproduces on a
+macOS laptop with no Akuma in the path** — see
+[`../../userspace/libakuma-tls/probes/embtls-host/`](../../userspace/libakuma-tls/probes/embtls-host/),
+which is the control arm §5 never had:
+
+```
+[embtls] api.z.ai             FAIL  decode error  (DecodeError)
+[embtls] api.github.com       OK    handshake_ms=34
+[embtls] z.ai                 FAIL  handshake aborted by peer  (HandshakeAborted(Fatal, ProtocolVersion))
+```
+
+The handshake gets as far as **EncryptedExtensions**, where the server sends a
+`supported_groups` hint. `openssl s_client -groups P-256 -trace` decodes it:
+
+```
+extension_type=supported_groups(10), length=14
+  ecdh_x25519 (29)   secp256r1 (23)   ecdh_x448 (30)
+  secp521r1 (25)     secp384r1 (24)   UNKNOWN (41)
+```
+
+`41` = `0x0029` = `curveSM2`, the Chinese national curve — OpenSSL 3.6 does not
+name it either. `embedded-tls`'s `NamedGroup::parse` returns
+`ParseError::InvalidData` for any value outside its ten, the extension-group
+macro turns that into `DecodeError`, and the connection dies — **over a purely
+informational list, after `secp256r1` had already been agreed.** RFC 8446
+requires unknown values in such a list to be ignored.
+
+Three things make this general rather than a z.ai quirk, and they are the reason
+this is worth fixing rather than routing around:
+
+* **`embedded-tls` offers only `Secp256r1`**, hardcoded
+  (`handshake/client_hello.rs:108`) — and the server sends this hint precisely
+  *because* our offer is not its preference. With OpenSSL's default groups the
+  server sends **no** `supported_groups` at all, which is why `api.github.com`
+  and every other host we reach has been fine. So we trip the trigger on every
+  modern server and survive only when its group list happens to be entirely
+  within `embedded-tls`'s ten.
+* **0.19 does not fix it.** The port was made and run on 2026-09-19: 0.19 adds
+  the three post-quantum hybrids (`0x11EB`/`0x11EC`/`0x11ED`), still has
+  `_ => Err(ParseError::InvalidData)`, and still offers only `Secp256r1`. It
+  fails **identically**. (It also needs `embedded-io` 0.7 and moves verification
+  into a `CryptoProvider`, so the upgrade is not free.)
+* **`z.ai` (the apex, not `api.`) is a separate failure**: a real
+  `protocol_version` alert from the peer, i.e. it will not do TLS 1.3 with our
+  offer at all. Fixing the group parse will not fix that host.
+
+**Fixed 2026-09-19** in `netoneko/embedded-tls`, and the stack moved 0.17 -> 0.19
+at the same time. `SupportedGroups::parse` now skips code points it does not
+recognize instead of failing the list.
+
+The fork now has two branches and the distinction matters:
+
+| branch | what it is | used by |
+|---|---|---|
+| `main` (`cb11222`) | upstream latest + the fix, merged forward | tracking only |
+| **`akuma-0.19` (`6721038`)** | upstream `ec5f0d5` (0.19.0, crates.io deps only) + module visibility + the fix | **what `userspace/Cargo.toml` pins** |
+
+**Do not point the build at `main`.** One commit after `ec5f0d5` upstream
+"Port[ed] to embassy-crypto", which replaces p256/aes-gcm/sha2/rand_core with
+`embassy-crypto` — a **git dependency on the embassy monorepo** at a pinned rev —
+and moves the RNG from a value handed to `TlsContext` to an ambient one the
+application installs. Neither suits a no_std userspace whose randomness is a
+`getrandom` syscall, and an ambient RNG nobody installed fails by yielding no
+entropy, which is the worst failure mode a TLS stack has. Upstream published no
+`v0.17`/`v0.19` tags either (newest is `v0.16.2`), which is why both branches pin
+commits rather than tags.
+
+Upstream has meanwhile made the certificate and certificate_verify **fields**
+public itself, so the fork's original verifier patch has shrunk to two lines —
+`pub mod extensions` / `pub mod handshake` — kept for a future Phase 2 verifier.
+
+What the 0.19 move cost in `libakuma-tls`, none of it optional: `embedded-io`
+0.6 -> 0.7 (whose `Error` now requires `core::error::Error`, so `TransportError`
+needed `Display` — written as a `&'static str` per kind, not a `{:?}`),
+`NoVerify` as a type argument becoming `UnsecureProvider` as a value (same
+don't-verify behaviour, verification having moved into the `CryptoProvider`), and
+one new `TlsError::InvalidPrivateKey` variant to name. The change is confined to *reading* — `NamedGroup` stays a
+closed enum, so an unknown group can never be encoded or selected for key
+exchange, it is only left out of a list we read for information. Four unit tests
+pin it, including that the buffer position still ends past the whole list when
+entries were dropped (getting that wrong would be a subtler version of the same
+bug). Consumed through `[patch.crates-io]` in `userspace/Cargo.toml` — note **`userspace/`**,
+not the repo root: the root `Cargo.toml` has an empty `[patch.crates-io]` with an
+embedded-tls comment, but the root workspace has no `embedded-tls` in its
+lockfile at all, so a patch there would have done nothing.
+
+Measured, same box, same kernel:
+
+| | before | after |
+|---|---|---|
+| `hget https://api.z.ai/api/anthropic/v1/messages` | `decode error` | **`HTTP error: 401`** — full handshake + request + response |
+| `hget https://api.z.ai/api/coding/paas/v4/chat/completions` | `decode error` | **`HTTP error: 401`** |
+| `embtls-host` (laptop, both gate hosts) | 1 of 2 FAIL | **`2 host(s), 0 failed`**, `api.z.ai` in 622–671 ms |
+| `hget https://api.github.com/` (control) | works | works |
+| `hget https://z.ai/` (apex) | `protocol_version` | `protocol_version` — unchanged, and genuinely the peer's |
+
+**A fork was already there and nobody was using it.** `netoneko/embedded-tls`
+existed since 2025-12-30 with one commit exposing handshake/extensions types for
+a custom verifier — and **nothing in the tree references those types**, the root
+`Cargo.toml`'s `[patch.crates-io]` section is two comment lines with no entry
+("After creating the branch, replace with your actual commit hash"), and
+`userspace/Cargo.lock` resolved `embedded-tls` from the registry. So the fork was
+carrying an unused change while the build ignored it. Worth checking before
+concluding that a patch means taking on something new.
+
+Two traps found while working this out:
+
+* **`selfhost_vendor/embedded-tls` is not a fork.** It is hand-edited files
+  inside a `cargo vendor` output (116 crates) that is **gitignored** and wired to
+  no build — no `vendored-sources` reference exists anywhere in the tree. The
+  edits are invisible to git and one `cargo vendor` from deletion. Its
+  `.cargo-checksum.json` was updated to match, so cargo would not have objected
+  either.
+* **Upgrading does not fix it.** Upstream `main` still has
+  `_ => Err(ParseError::InvalidData)`, so this is an open upstream bug worth a
+  PR, not version lag. The fork's `main` is 1 ahead / 49 behind upstream; syncing
+  is a separate hygiene task that would also drag in `embedded-io` 0.7 and the
+  `CryptoProvider` API change.
+
+The other half of the fix is that the failure now has a name at the call site:
+`libakuma_tls::tls_error_name` (`lib.rs`) maps every `TlsError` variant, unpacks
+the two alert-carrying ones, and `hget` prints it instead of the flat string
+"TLS handshake failed" that all three consumers used to print. That string is
+the single biggest reason this took a session: `InsufficientSpace` (the buffer
+bug of `TLS_BUFFER_TRUNCATION_FIX.md`), `InvalidCipherSuite` and this
+`DecodeError` demand completely different fixes and were indistinguishable.
+
+### 5.4 `meow` against z.ai over the OpenAI-compatible endpoint — works
+
+Once §5.2 landed, `meow` reaches z.ai too, and it **streams**. Verified
+2026-09-19 with an identical prompt through both clients:
+
+| client | first byte | total | chunks |
+|---|---|---|---|
+| `curl` (OpenSSL) | 4.92 s | 5.42 s | 118 SSE chunks |
+| `meow` (libakuma-tls) | 5.86 s | 6.08 s | streamed over 222 ms |
+
+Worth stating because a first look said otherwise: a short answer reported
+`First: 13645ms | Stream: 1ms`, which reads like the whole body arriving at once
+after a long stall. It was neither — that answer simply fitted a single TLS
+record, and the 13.6 s was model latency. **Comparing a client against `curl`
+requires the same prompt**; with different prompts the numbers are not evidence
+of anything.
+
+`/etc/meow/config` (meow's own INI format, not TOML):
+
+```
+current_provider=zai
+current_model=glm-5.3-flash
+
+[provider:zai]
+base_url=https://api.z.ai/api/coding/paas/v4
+api_key=<the key>
+```
+
+Two things about that `base_url`:
+
+* meow appends `/chat/completions` to it (`build_request_path`), giving
+  `/api/coding/paas/v4/chat/completions` — the path `curl` gets a clean 401 from.
+* **Not `/api/paas/v4`**: a Coding Plan key gets `429` code `1113` ("Insufficient
+  balance or no resource package") on the pay-as-you-go path even with an active
+  plan (§4).
+
+`meow` is its own workspace root, so it does **not** inherit
+`userspace/Cargo.toml`'s `[patch.crates-io]` even though it depends on
+`libakuma-tls` by path — its own `Cargo.toml` needs the same pinned rev, or it
+silently builds the shipped TLS stack against unpatched `embedded-tls` and fails
+on `api.z.ai` while `hget` succeeds.
+
+Fixed in passing: `--debug` printed the request URL as `base_url + path`, and
+`path` already contains the base URL's path component, so it showed
+`https://api.z.ai/api/coding/paas/v4/api/coding/paas/v4/chat/completions` for a
+perfectly correct request. Display-only, but it reads as a URL-building bug that
+is not there, in the one line whose whole job is to say where the request went.
+
+### 5.5 Console output contends with the network on the BKL — mechanism, magnitude unmeasured
+
+**The mechanism is in the code, not a guess (2026-09-19).** Observed informally
+that writing `dmesg` to the screen appears to disturb networking. It does not
+need an experiment to explain, only a read:
+
+1. **Every amd64 syscall takes the BKL at entry, unconditionally.**
+   `amd64/src/usermode.rs` calls `crate::smp::bkl_enter()` at both dispatch
+   sites, and that is `akuma_bkl::bkl::enter_kernel()` with no condition on it.
+   **This target has no per-syscall opt-out bitmap** — AArch64 has one
+   (`akuma_bkl::policy`, the seven `no-bkl-*` phase toggles plus the bitmap);
+   the only policy hook amd64 consults is `exec_bkl_drop_enabled`. So the
+   carve-outs that make AArch64's `write` cheap do not exist here.
+2. **So `write(1, …)` renders glyphs while holding the BKL.** The console on this
+   machine is the framebuffer (`akuma-fbcon`), there is no UART, and drawing a
+   scrolling screenful is slow work — all of it inside the lock.
+3. **The network path needs that same lock, and is already known to lose on it.**
+   `amd64/src/net.rs:560` records: "Measured 2026-09-17: at `SMP=4` this daemon's
+   near-continuous BKL ownership starved every other core's syscall entry into a
+   `[BKL] stuck`". The drain itself was carved out for exactly this reason
+   (`dropped_window_open`/`close` around it), but the daemon still needs the lock
+   around that window.
+4. And an arriving packet here waits for the next `netpoll` lap because **there is
+   no NIC interrupt on this target** (`amd64/src/net.rs:433`), so delaying the lap
+   delays delivery directly rather than merely slowing a copy.
+
+So "printing to the screen hurts the network" is the expected behaviour of this
+design, not a surprise. What is **not** measured is the magnitude — whether a
+`dmesg` dump costs milliseconds or seconds of receive latency — and that is the
+only open question here.
+
+To measure it, keep the console out of the measurement: drive both arms over ssh
+and compare first-byte times, once quiet and once with a large `dmesg` looping to
+the framebuffer.
+
+```sh
+# quiet arm, then the noisy arm, same request both times
+curl -sS -o /dev/null -w 'ttfb=%{time_starttransfer}\n' https://api.github.com/
+# noisy arm: start the console flood on the box first, detached, then repeat
+```
+
+If it reproduces at a scale worth fixing, the fix is the one AArch64 already has:
+a per-syscall opt-out so a `write` to the console is not a BKL excursion. That is
+a phase of `BKL_FINE_GRAINED_LOCKING_PLAN.md` this target has never adopted, and
+it is the same root as [`AKUMA_AMD64_STREAM_END_STALL.md`](AKUMA_AMD64_STREAM_END_STALL.md)
+if that turns out to be contention rather than a lost wakeup.
+
+### 5.3 `nca` against z.ai works, intermittently
+
+With the real config — `/.nca/config.local.toml`, `compatibility = "anthropic"`,
+`base_url = https://api.z.ai/api/anthropic`, `glm-5.3-flash` — `nca` answers.
+**Note the config path**: `HOME` is empty on this box, so `~` resolves to `/` and
+`/root/.nca/config.toml` is *not* what nca reads. Editing the wrong one and
+concluding anything from the result is a trap that cost a run here.
+
+What is left is intermittency, and it is **bimodal** rather than slow. Measured
+2026-09-19 on kernel `72b71add`, one-shot `nca -p` with `--no-resume`:
+
+| | |
+|---|---|
+| when it works | the answer is printed **8–12 s** after start |
+| when it does not | **nothing at all**, out to `nca`'s own 300 s read timeout |
+| observed rate | 3 of 6 runs answered; no middle case in either direction |
+
+The stall begins *after* the transport is up: the log always reaches
+`connecting to 8.217.100.151:443`, `connected`, and
+`Context window target for glm-5.3-flash` (~8 s in), and then either the answer
+appears within seconds or never. So it is not the handshake, not DNS and not the
+endpoint — it is the streamed body, i.e. the
+[`AKUMA_AMD64_STREAM_END_STALL.md`](AKUMA_AMD64_STREAM_END_STALL.md) family, and
+that document is where it belongs.
+
+The harness is
+[`../../scripts/probes/nca_stream_trials.sh`](../../scripts/probes/nca_stream_trials.sh).
+It waits for the process to **exit** and prints elapsed ms beside the verdict,
+because `nca` waits up to `STREAM_READ_TIMEOUT_SECS` (300 s, §4) and a harness
+that samples for 75 s cannot tell a stalled stream from a slow one — on
+2026-09-19 a 75 s sample scored a run as a failure on exactly that basis, before
+the numbers above showed there is no slow case to confuse it with.
+
+**Two traps in running it on this box**, both of which cost time here:
+
+* **Do not launch it as `( cmd; cmd ) &`.** A subshell containing two execs
+  wedges this kernel (a pre-existing bug, `AKUMA_AMD64_WAIT4_OWNERSHIP`), and
+  two overlapping instances also overwrite each other's `run$i.log`.
+* **A backgrounded run's stdout is lost.** Launched with `sh nca-trials 4 >
+  log &` from an ssh command, the redirect target stays **0 bytes** even though
+  the per-run `nca` logs fill up normally — the writes go nowhere once the
+  launching session ends. Run it in the foreground, sized to fit inside the 240 s
+  ssh client cutoff (§4), or read the per-run logs in `/root/.nca-trials/`
+  instead of the tally.
+
+Also seen and not chased: `nca` logs `IPC disabled: socket bind failed: Address
+family not supported by protocol (os error 97)` on every start. That is
+`sys_socket`'s `domain != 2` arm refusing AF_UNIX — glue has
+`sys_socket_unix` for it, so this is a dispatch gap on this target rather than a
+missing feature. It degrades gracefully and is unrelated to z.ai.
 
 ## 6. `meow`'s repetition loop is the tool payload, not this machine
 

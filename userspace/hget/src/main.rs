@@ -51,7 +51,11 @@ pub extern "C" fn main() {
             print(match &e {
                 libakuma_tls::Error::DnsError => "DNS resolution failed",
                 libakuma_tls::Error::ConnectionError(m) => m.as_str(),
-                libakuma_tls::Error::TlsError(_) => "TLS handshake failed",
+                // Not "TLS handshake failed": the variant IS the diagnosis, and
+                // collapsing it is what left `api.z.ai` unexplained for a
+                // session while OpenSSL talked to the same host from the same
+                // box (`docs/archive/AMD64_TRASHCAN_ISSUES.md` §5).
+                libakuma_tls::Error::TlsError(t) => libakuma_tls::tls_error_name(t),
                 libakuma_tls::Error::HttpError(m) => m.as_str(),
                 libakuma_tls::Error::InvalidUrl => "invalid URL",
                 libakuma_tls::Error::IoError => "I/O error",

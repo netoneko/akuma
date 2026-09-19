@@ -6,9 +6,14 @@ edition = "2021"
 [dependencies]
 libakuma = { path = "../libakuma" }
 
-# TLS (blocking mode)
-embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
-embedded-io = { version = "0.6", default-features = false }
+# TLS (blocking mode).
+#
+# 0.19 via the `netoneko/embedded-tls` fork -- see `[patch.crates-io]` in
+# `userspace/Cargo.toml` for why the fork exists. `embedded-io` must move to 0.7
+# with it: 0.19 depends on 0.7 and the `Read`/`Write` impls in `transport.rs`
+# only satisfy `TlsConnection`'s bounds if both agree on the trait's version.
+embedded-tls = { version = "0.19", default-features = false, features = ["alloc"] }
+embedded-io = { version = "0.7", default-features = false }
 
 # Crypto for RNG trait
 rand_core = { version = "0.6", default-features = false }

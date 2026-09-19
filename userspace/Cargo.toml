@@ -96,3 +96,42 @@ codegen-units = 1      # better cross-unit optimization under LTO, smaller outpu
 strip = true           # drop symbol tables from the shipped ELF
 overflow-checks = false # no checked-arith branches; reduces code size and frame depth
 
+# `embedded-tls` comes from our fork, pinned by revision.
+#
+# The fork is upstream `main` (0.19.0) plus exactly two deviations:
+#
+# 1. `pub mod extensions` / `pub mod handshake`, so a `TlsVerifier` can be
+#    implemented outside the crate without pulling in webpki/ring. This predates
+#    the kernel's built-in SSH server being removed (2026-08-10) and is kept
+#    deliberately. Upstream has since made the certificate and
+#    certificate_verify *fields* public itself, so that part of the original
+#    patch is gone and only the module visibility is still ours.
+# 2. `SupportedGroups::parse` skips code points it does not recognize, as
+#    RFC 8446 §4.2.7 and §9.3 require. Without it every `hget`/`meow`/`box`
+#    handshake to `api.z.ai` died with `TlsError::DecodeError`, because that
+#    server's advisory group list ends with `0x0029` (`curveSM2`) — *after*
+#    secp256r1 had already been agreed.
+#
+# Upgrading does not remove the need for (2): upstream `main` still has the same
+# `_ => Err(ParseError::InvalidData)`. The fix exists upstream only inside the
+# unmerged PR #188 (TLS 1.3 server support, 52 files), and issue #163 tracks the
+# gap — so our implementation is copied from that PR line for line, including the
+# `NamedGroup::of` split, to merge trivially if it ever lands.
+#
+# `rev`, not `branch`: a moving branch would silently change what the kernel's
+# TLS stack is built from between one build and the next.
+#
+# The rev is on the fork's `akuma-0.19` branch, based on upstream `ec5f0d5` —
+# version 0.19.0 with all-crates.io dependencies — and **deliberately not on the
+# fork's `main`**, which tracks upstream latest. One commit after `ec5f0d5`
+# upstream "Port[ed] to embassy-crypto", replacing p256/aes-gcm/sha2/rand_core
+# with `embassy-crypto`, a **git dependency on the embassy monorepo** at a pinned
+# rev, and moving the RNG from a value passed to `TlsContext` to an ambient one
+# the application installs. Neither is wanted here: this is a no_std userspace
+# whose randomness is a `getrandom` syscall, and an ambient RNG that nobody
+# installed fails by producing no entropy — the worst failure mode a TLS stack
+# has. Upstream published no v0.17/v0.19 git tags (the newest is v0.16.2), which
+# is why this pins a commit rather than a tag.
+# `docs/archive/AMD64_TRASHCAN_ISSUES.md` §5.2.
+[patch.crates-io]
+embedded-tls = { git = "https://github.com/netoneko/embedded-tls", rev = "6721038ba5874587b432fd82011168e85fa166b5" }

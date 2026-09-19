@@ -28,11 +28,18 @@
 # worthless if the probe and nca were built by different compilers against
 # different libcs.
 #
-#   ./build-musl.sh            # all four probes
+#   ./build-musl.sh            # all four probes, aarch64
 #   ./build-musl.sh std        # just nettest-std
 #   ./build-musl.sh reqwest    # just nettest-reqwest
 #   ./build-musl.sh connect    # just nettest-connect
 #   ./build-musl.sh unix       # just nettest-unix
+#
+#   ARCH=x86_64 ./build-musl.sh std        # -> bootstrap/bin/nettest-std.x86_64
+#
+# `ARCH` selects the machine the probe RUNS on. aarch64 output keeps its bare
+# name (populate_disk.sh and every doc name it that way); anything else gets an
+# arch suffix, so the two cannot overwrite each other in `bootstrap/bin/` and be
+# mistaken for one another later.
 #
 # After building: scripts/populate_disk.sh copies bootstrap/bin/* into /bin.
 set -euo pipefail
@@ -40,12 +47,50 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 OUT_DIR="$REPO_ROOT/bootstrap/bin"
-TARGET="aarch64-unknown-linux-musl"
+
+# Which machine the probe will run ON, not which one builds it. `ARCH=x86_64`
+# (or a full triple in `NETTEST_TARGET`) is what makes these probes usable on
+# the amd64 bare-metal box; the default stays aarch64 so every existing caller
+# is unaffected.
+#
+# This was hardcoded to aarch64 until 2026-09-19, and the cost was concrete:
+# `docs/archive/AMD64_TRASHCAN_ISSUES.md` §5 needs exactly the comparison
+# `stdlib/Cargo.toml` describes — sync rustls against async rustls on ONE url —
+# and could not run it, because the one x86-64 `nettest-reqwest` on that box was
+# built by hand outside the repo and no `nettest-std` existed for it at all. A
+# probe that cannot be built for the machine under test is not a probe.
+case "${ARCH:-${NETTEST_ARCH:-aarch64}}" in
+    aarch64|arm64)  ARCH_TRIPLE="aarch64-unknown-linux-musl" ;;
+    x86_64|amd64)   ARCH_TRIPLE="x86_64-unknown-linux-musl" ;;
+    *) echo "error: ARCH must be aarch64 or x86_64 (got '${ARCH:-$NETTEST_ARCH}')" >&2; exit 2 ;;
+esac
+TARGET="${NETTEST_TARGET:-$ARCH_TRIPLE}"
+
+# The musl cross prefix and the cargo env var names all derive from the triple,
+# which is what stops a future third target being added in one place and missed
+# in another. Both spellings replace dashes with underscores, because a shell
+# cannot `export` a name containing one — `CC_x86_64-unknown-linux-musl=...` is
+# rejected as "not a valid identifier", and the cc crate reads the underscored
+# form, which is the spelling this script used when it was aarch64-only.
+CROSS="${TARGET%%-*}-linux-musl"
+TARGET_ENV="$(echo "$TARGET" | tr 'a-z-' 'A-Z_')"
+TARGET_VAR="$(echo "$TARGET" | tr '-' '_')"
+
+# Where each probe's output lands. Named separately because the built path
+# includes the triple, and a stale binary from the OTHER architecture sitting in
+# `bootstrap/bin/` under the same name is exactly the confusion this script
+# exists to prevent — so the arch is in the copied name too, with the aarch64
+# spelling kept unsuffixed for compatibility with populate_disk.sh and every
+# doc that names it.
+case "$TARGET" in
+    aarch64-*) SUFFIX="" ;;
+    *)         SUFFIX=".${TARGET%%-*}" ;;
+esac
 
 want="${1:-all}"
 
-command -v aarch64-linux-musl-gcc >/dev/null 2>&1 || {
-    echo "error: aarch64-linux-musl-gcc not found (brew install FiloSottile/musl-cross/musl-cross)" >&2
+command -v "${CROSS}-gcc" >/dev/null 2>&1 || {
+    echo "error: ${CROSS}-gcc not found (brew install FiloSottile/musl-cross/musl-cross)" >&2
     exit 1
 }
 rustup target list --installed 2>/dev/null | grep -qx "$TARGET" || {
@@ -56,23 +101,27 @@ rustup target list --installed 2>/dev/null | grep -qx "$TARGET" || {
 # Same cross-compilation environment userspace/nca/build.rs exports. aws-lc-rs
 # (rustls' default crypto provider, and what nca's Cargo.lock resolves) shells
 # out to cc/ar for its C core, so these are load-bearing for the reqwest probe.
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
-export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
-export CXX_aarch64_unknown_linux_musl=aarch64-linux-musl-g++
-export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
+export "CARGO_TARGET_${TARGET_ENV}_LINKER=${CROSS}-gcc"
+export "CC_${TARGET_VAR}=${CROSS}-gcc"
+export "CXX_${TARGET_VAR}=${CROSS}-g++"
+export "AR_${TARGET_VAR}=${CROSS}-ar"
 
 build_one() {
     local dir="$1" bin="$2"
     # Braces are load-bearing: bash treats the trailing multibyte character as
     # part of an unbraced variable name and dies with "TARGET…: unbound variable".
     echo "[nettest] building $bin ($dir) for ${TARGET}..."
-    ( cd "$SCRIPT_DIR/$dir" && cargo build --release )
+    # `--target` explicitly, rather than relying on the crate's
+    # `.cargo/config.toml` `[build] target`: that pins the DEFAULT machine
+    # (aarch64) and this is how the other one gets selected. The linker and the
+    # `-static` rustflags for both triples are declared in that same file.
+    ( cd "$SCRIPT_DIR/$dir" && cargo build --release --target "$TARGET" )
     local built="$SCRIPT_DIR/$dir/target/$TARGET/release/$bin"
     [ -f "$built" ] || { echo "BUILD FAILED: $built missing" >&2; exit 1; }
     mkdir -p "$OUT_DIR"
-    cp "$built" "$OUT_DIR/$bin"
-    chmod +x "$OUT_DIR/$bin"
-    echo "[nettest] -> $OUT_DIR/$bin ($(wc -c < "$OUT_DIR/$bin" | tr -d ' ') bytes)"
+    cp "$built" "$OUT_DIR/${bin}${SUFFIX}"
+    chmod +x "$OUT_DIR/${bin}${SUFFIX}"
+    echo "[nettest] -> $OUT_DIR/${bin}${SUFFIX} ($(wc -c < "$OUT_DIR/${bin}${SUFFIX}" | tr -d ' ') bytes)"
 }
 
 case "$want" in

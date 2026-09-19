@@ -52,6 +52,32 @@ impl TransportError {
     }
 }
 
+/// `embedded_io::Error` requires `core::error::Error` as of embedded-io 0.7,
+/// which in turn requires `Display`.
+///
+/// Written as a `&'static str` per kind and a bare `write_str`, not a `{:?}` of
+/// the `ErrorKind`: this is a kernel-adjacent no_std userspace and the
+/// formatting machinery a derived or debug-based impl pulls in is exactly what
+/// the tree avoids on error paths. See the same reasoning at
+/// `libakuma_tls::tls_error_name` and in `hget`'s own error printing.
+impl core::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self.kind {
+            embedded_io::ErrorKind::TimedOut => "timed out",
+            embedded_io::ErrorKind::ConnectionRefused => "connection refused",
+            embedded_io::ErrorKind::ConnectionReset => "connection reset",
+            embedded_io::ErrorKind::ConnectionAborted => "connection aborted",
+            embedded_io::ErrorKind::NotConnected => "not connected",
+            embedded_io::ErrorKind::BrokenPipe => "broken pipe",
+            embedded_io::ErrorKind::InvalidInput => "invalid input",
+            embedded_io::ErrorKind::InvalidData => "invalid data",
+            _ => "transport error",
+        })
+    }
+}
+
+impl core::error::Error for TransportError {}
+
 impl embedded_io::Error for TransportError {
     fn kind(&self) -> embedded_io::ErrorKind {
         self.kind
