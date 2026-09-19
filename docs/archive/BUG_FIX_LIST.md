@@ -9,34 +9,35 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1102
-- **Docs contributing at least one fix:** 328
+- **Total distinct fixes counted:** 1161
+- **Docs contributing at least one fix:** 339
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 163 | 14.8% | 25 |
-| Memory & Virtual Memory | 161 | 14.6% | 52 |
-| Scheduler & Process Management | 126 | 11.4% | 38 |
-| SMP & Locking | 117 | 10.6% | 46 |
-| Networking | 66 | 6.0% | 24 |
-| Userspace Apps & Libraries | 37 | 3.4% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 2.4% | 6 |
-| Toolchain & Self-Hosting | 55 | 5.0% | 9 |
-| SSH | 39 | 3.5% | 18 |
-| VFS & Filesystem | 105 | 9.5% | 34 |
-| Boot & Drivers | 79 | 7.2% | 12 |
-| Signals & Exceptions | 27 | 2.5% | 10 |
-| Misc / Cross-cutting | 41 | 3.7% | 15 |
-| Console & Terminal | 36 | 3.3% | 13 |
-| Containers | 24 | 2.2% | 6 |
-| **Total** | **1102** | **100.0%** | **328** |
+| Syscall / ABI Compatibility Audits | 169 | 14.6% | 26 |
+| Memory & Virtual Memory | 164 | 14.1% | 53 |
+| Scheduler & Process Management | 126 | 10.9% | 38 |
+| SMP & Locking | 117 | 10.1% | 46 |
+| Networking | 74 | 6.4% | 27 |
+| Userspace Apps & Libraries | 37 | 3.2% | 20 |
+| Rump Kernel & Syscall Proxy | 26 | 2.2% | 6 |
+| Toolchain & Self-Hosting | 82 | 7.1% | 12 |
+| SSH | 39 | 3.4% | 18 |
+| VFS & Filesystem | 105 | 9.0% | 34 |
+| Boot & Drivers | 79 | 6.8% | 12 |
+| Signals & Exceptions | 27 | 2.3% | 10 |
+| Misc / Cross-cutting | 48 | 4.1% | 16 |
+| Console & Terminal | 36 | 3.1% | 13 |
+| Containers | 32 | 2.8% | 8 |
+| **Total** | **1161** | **100.0%** | **339** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
 - 44 — `docs/archive/GOLANG_MISSING_SYSCALLS.md`
 - 21 — `docs/archive/AKUMA_FIRECRACKER_AMD64.md`
 - 21 — `docs/archive/GO_FORK_EXEC_FIXES.md`
+- 20 — `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`
 - 20 — `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`
 - 20 — `docs/archive/GOLANG_IPC.md`
 - 18 — `docs/archive/DASH_MISSING_SYSCALLS.md`
@@ -48,7 +49,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (163 fixes, 25 docs)
+## Syscall / ABI Compatibility Audits (169 fixes, 26 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -226,7 +227,15 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md
 - the amd64 syscall path clobbered **six** registers the Linux x86_64 ABI preserves: `syscall_entry` shuffled the argument registers into System V positions and `call`ed an `extern "C"` Rust handler, under which `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` are caller-saved, so every one came back holding whatever the handler left in it — invisible for five stages, and visible the moment a program was compiled by a compiler instead of assembled by the kernel
 
-## Memory & Virtual Memory (161 fixes, 52 docs)
+### docs/archive/AKUMA_AMD64_EPOLL_EVENTFD_FOLD.md
+- `struct epoll_event` is `__attribute__((packed))` **only on x86_64** (12 bytes, no pad before `data`) while `akuma-syscalls-linux`'s struct is the 16-byte aarch64 shape unconditionally, so `epoll_ctl`'s argument and `epoll_wait`'s output array were marshalled at the wrong stride on every call — `data.fd` came back `0` — fixed with a packed `EpollEventX86` used only at the two user-memory boundaries, every step in between left in the 16-byte shape on both architectures
+- the same wrong stride sized the copy-out and its `validate_user_ptr` bound, so `ready_count * 16` bytes were written into a caller's real `maxevents * 12`-byte array once more than three-quarters of the requested slots were simultaneously ready (reasoned from the copy math, not reproduced — the bound only checks the destination is mapped, never that it matches the caller's allocation); `EPOLL_EVENT_SIZE` is arch-conditional now
+- the whole epoll/eventfd family answered `ENOSYS` on amd64 although `akuma-syscalls-glue` implemented it — table rows and dispatch arms, plus the eventfd/epoll teardown hooks that were `not_wired!`
+- `timerfd_create`/`settime`/`gettime` and `pidfd_open` were undispatched for the same reason, and `pidfd_close` was a `not_wired!` stub that panicked once a `FileDescriptor::PidFd` could exist; `pidfd_open`'s number is the **same on both architectures** (every syscall added since ~5.1 is), which a `syscall_table!` row cannot express — it asserts the two disagree — so those get a third dispatch category rather than a forced row
+- `pidfd_send_signal` (424) had no implementation in glue at all; written over the same tracked-pid table and `deliver_signal` that `kill(2)` uses, with `flags != 0` rejected `EINVAL`
+- the `sc-aio` and SysV message-queue families were undispatched; `io_setup`'s asm-generic number is **0**, the number `read` claims on x86_64, so a transposed hop there would have compiled to a working `read(2)` fed an `nr_events`/`ctx_idp` pair rather than to `ENOSYS`
+
+## Memory & Virtual Memory (164 fixes, 53 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -494,6 +503,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/POST_EXIT_PMM_RECLAIM.md
 - the 2026-09-03 "terminated thread must not drain" gate turned **all three** exit-path reclaim sites into no-ops by construction — each calls `drain_retired` immediately after marking its own thread terminated — so `retired_reclaim_ab` had been a standing failure on `main`, measuring `0p` on both arms with a slot stuck `RETIRED`; the gate's hazard is real, so the fix pins the reaper (preemption disabled + a reaper pin) instead of skipping the sweep
+
+### docs/archive/AKUMA_AMD64_SWITCH_FREED_CR3_UAF.md
+- `[SWITCH FREED-CR3]`, the page-table use-after-free that killed the bare-metal box: amd64 never registered `akuma_mmu::SchedHooks`, and that cell **degrades to `None` when unregistered**, so the address-space free gate's saved-context arm silently answered "nobody" on both the free and drain paths — a thread parked off-CPU with a dead process's root in its `space_root` could not stop that L0 going back to the PMM, and the next switch-in installed a reissued frame as CR3 (`kill -9` on a process blocked in a syscall is the reproducing shape)
+- registering those hooks then parked 413 pages: the saved-root probe's own doc comment claimed a TERMINATED slot's root is always overwritten by `finish()`, which is true only of the normal exit path, and this target claims TERMINATED slots directly (no recycler) — fixed with a carve-out proved from the picker and the claim path rather than assumed, a slot that is TERMINATED or FREE and not `ON_CPU` cannot install its `space_root`
+- the tripwire destroyed its own evidence twice over: the message was seven separate `serial::puts` calls, shreddable by a peer core and truncatable by a dying one, and it then fell through into the `mov cr3` it was reporting — now one `StackWriter::<192>` flush, and the slot is demoted to the kernel root so the thread takes an ordinary `SIGSEGV` instead of taking the machine; `freed_cr3_trips()` is asserted zero by the boot suite
 
 ## Scheduler & Process Management (126 fixes, 38 docs)
 
@@ -921,7 +935,7 @@ aren't recorded anywhere else.)
 - `sys_accept`'s `*addrlen` and `sys_recvmsg`'s `msg_namelen` were bare `write_volatile`s the SMAP sweep had missed, and no self-test calls `accept` with a non-null `addrlen` — under SMP the resulting `#PF` killed a core that held the BKL and the other three spun on `[BKL] stuck … owner 3` forever
 - `kmain_mb2` built its `MachineDescription` from the memory map alone, so on the one machine that really has four cores it would have said "no MADT — single core"; the loader's multiboot2 ACPI tag is the only way in under UEFI. The first rig run then found the BSP parking in `halt`/`cycle_forever` still holding the lock at depth 1, with every AP's next tick spinning on it
 
-## Networking (66 fixes, 24 docs)
+## Networking (74 fixes, 27 docs)
 
 ### docs/archive/AKUMA_NET_SPLIT.md
 - `VirtioSmoltcpDevice::receive` built its tx token as `unsafe { &mut *(&raw mut *self) }` while the rx token was live, so two `&mut` to the same device existed at once — UB by the language's rules independently of whether the NIC raced them. The fix is a reorder, and works because `take_rx_frame` returns a raw pointer whose provenance is the BSS frame arena rather than `self`; `LoopbackAwareDevice::receive` had already solved the same problem 200 lines below
@@ -1037,6 +1051,20 @@ aren't recorded anywhere else.)
 - a single-resolver client has no way past an uplink resolver that answers some names and NXDOMAINs others (measured: this box's resolver NXDOMAINs `example.com` while resolving `pool.ntp.org`); `resolve_a` walks the configured server then `1.1.1.1` and `8.8.8.8`, moving on for a timeout *or* an NXDOMAIN/SERVFAIL/empty answer
 - `clock::sync_via_sntp()` ran exactly once, right after `settle_for_dhcp`, so a lease that was not ready in time or one lost datagram left the machine at the epoch **forever** — which makes every TLS certificate not-yet-valid and `apk` report `server certificate not trusted`; `sync_tick()` retries from the netpoll daemon, rate-limited
 - scrolling the framebuffer console redrew a near-full screen per printed line, which on a television reads as a tear sweeping down the picture; mitigated by scrolling 8 rows at a time (the real fix, a RAM shadow or a WC-aware block copy, is still open)
+
+### docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md
+- `sys_socket` masked `SOCK_NONBLOCK`/`SOCK_CLOEXEC` out of `type` and never applied them, so every amd64 socket was blocking however it was asked for (the self-test also asserts a plain socket is *not* marked, or it would pass on a kernel that marks everything)
+- `sendto(…, NULL, 0)` on a **connected** UDP socket fell through the `dest_addr != 0` guard into the TCP sender and came back `EBADF` — which tells c-ares its own descriptor bookkeeping is wrong rather than that a send failed — while `write(2)` on the same descriptor worked, because glue has always consulted `udp_default_peer`; the no-peer case answers `EDESTADDRREQ` now, as Linux and glue both do
+- `getsockname` was `ENOSYS` on amd64 — not missing code but a missing `syscall_table!` row for a call glue had implemented for as long as AArch64 has had sockets
+- `getpeername` was `ENOSYS` for the identical reason; both now route to glue's `dispatch_getsockname`, which serves AF_UNIX too
+
+### docs/archive/AKUMA_AMD64_MEOW_TLS_STALL.md
+- amd64's `NetRuntime::blocking_relax` was a plain `yield_now`, which opens a short pause window, **re-takes the BKL** and switches with it held — so a socket waiter with nothing to do sat on the lock the netpoll daemon needed, the wedge `akuma-net`'s park arm names in its own comment; pointed at `sched::allow_tick` (drop the lock, `sti; hlt`, take it back), zero `[BKL] stuck` lines in a 4-vCPU boot that previously stormed
+- the first version of that fix called `allow_tick` unconditionally, and it falls back to `sti; nop; cli` — **keeping the lock held** — when the LAPIC timer is stopped, which is exactly the boot path's state while SNTP resolves `pool.ntp.org`; the box came up serving nothing with one owner stuck forever, so the shipped version tests `timer_running()` and falls back to `yield_now`
+
+### docs/archive/AKUMA_AMD64_STREAM_END_STALL.md
+- the RTL8169 receive-stall watchdog armed off a lap count (`STALL_LAPS = 2_000_000`, calibrated when the poll loop busy-spun); once `netpoll_daemon` gained its one-tick idle park an idle lap runs ~100 times a second, so the horizon had silently become **5.5 hours** and the recovery could not fire after boot — it is wall-clock now (`STALL_QUIET_US`), measured from the last frame actually taken off the ring, with the lap count kept only as the pre-clock fallback
+- `meow` ended a stream only on the SSE `[DONE]` sentinel, which is the 14-byte chunk that arrives late; it now also ends on a non-null `choices[0].finish_reason`, so the answer completes before the late chunk is due (`nca` cannot be fixed this way — hyper fails below SSE, at the chunked-body layer)
 
 ## Userspace Apps & Libraries (37 fixes, 20 docs)
 
@@ -1159,7 +1187,7 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (55 fixes, 9 docs)
+## Toolchain & Self-Hosting (82 fixes, 12 docs)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -1235,6 +1263,39 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_SELF_HOSTING_AMD64.md
 - `MAX_ARGV` was 256 and one `cargo`-generated `rustc` command line for this kernel's own graph is **300 arguments**, so the in-guest self-host build stopped at `E2BIG` with cargo reporting `could not compile` and no diagnostic at all — raising the cap first needed the initial-stack word block off the 32 KiB kernel stack, where it was an array sized by the caps inside an `execve` frame; it is a fallible heap `Vec` sized to the call now
 - the staged source tree had no vendored fonts, because `git archive` skips submodules, so `akuma-fbcon`'s build script panicked in the guest
+
+### docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md
+- every context switch reloaded CR3 even when the next task shares the outgoing task's root, flushing the TLB for nothing — `hook_switch_to` activates only when `want != active_root()`, sound because the L0-free gate refuses to free a root any core's live CR3 references (anchor 102 s → 83.5 s)
+- untimed futex waits ran the loop's `allow_tick()` **before** the membership test, so every wait cost 1-2 LAPIC ticks (10 ms each) of pure latency on a core whose waker was already runnable; timed waits keep the window, since their deadline reads `uptime_us`, which does not advance while `IF` is clear
+- `allow_tick` held the BKL across its `hlt` and the netpoll drain ran lock-held, so at 4 vCPUs the daemon's near-continuous ownership put every peer core into a `[BKL] stuck` storm and sshd never answered — the drain is a scoped dropped window now and the park is made harmless rather than moved inside one (parking *inside* a dropped window breaks the resume protocol at SMP: `[SWITCH BADFRAME]` then an instruction fetch from 0)
+- `fill_file_pages`'s miss arm took a third `cow_ref_inc` on top of the allocation's and the file-page cache's own, so **one reference was stranded per freshly filled shared file page** and the frame could never be freed; every `write(2)` invalidates that inode's entries, so a rewriting workload re-stranded on every rewrite — ~2.5 GiB gone over a ten-minute `-j4` build, `pmm_free=0`, and every downstream symptom from `EAGAIN` to a dead network
+- fork's BKL-free share pass raced a sibling thread's CoW break: amd64's `cow_write_fault` serviced the break through a raw-CR3 view with **no address-space lock at all** (AArch64's handler takes the owner's, which is the whole reason the carve-out is sound), and `share_parent_memory_into` locked the *forking thread's* `Process` — for a `CLONE_THREAD` sibling that is a fresh lock nothing else takes — so fork incremented a stale leaf and mapped it into the child; refcounts stranded (66k frames), frames freed while still mapped, `cr2=0x30` and `rip=0x0` deaths
+- the LAPIC/TSC were never calibrated on QEMU `microvm`: calibration gated on PIT channel 2 through port `0x61`, which is board glue nothing answers there, so every timeout and every `clock_gettime` ran on a hardcoded guess up to **6x** off — switched to channel 0 and the 8254's own read-back command, which needs no board glue; the first read-back byte had the latch bits inverted and *looked* calibrated, caught immediately by the kernel's own `clock_rate_check` self-test
+- `uptime_us()` — what `clock_gettime`, `nanosleep`, futex deadlines and every network timeout derive from — was `lapic::ticks() * 10_000`, i.e. 10 ms granularity; it reads a calibrated `rdtsc` delta now and falls back to the tick counter only where no PIT was found
+- `akuma-virtio`'s `read_bytes`/`write_bytes` always allocated a sector-aligned temp buffer and copied through it, and `write_bytes` additionally did a full read-modify-write **including the read** for a write that replaces the sector wholesale — for sector-aligned callers, which is every ext2 call site; a fast path takes aligned requests straight to `read_sectors`/`write_sectors` (aligned 4 KiB writes 9.1-9.6 → 16.1 MB/s)
+- `/proc/<pid>/stat`'s CPU time on amd64 was not "10 ms-quantized" as a prior doc recorded — it was exactly and permanently zero, so `ps`/`top` reported no CPU time at all
+- `find_free_va` re-scanned the **entire** region list from the top on each collision, making a single `mmap` O(n²) against `n` scattered regions; a `rustc` with ~1500 of them stopped making forward progress altogether (`zerocopy` never finished in 15+ minutes) and a 2 MB read of `/proc/<pid>/maps` never returned
+- `munmap` never released a file mapping's `InodePin` — `pin_mapping_inode` had no release half at all — and the pin table has 1024 slots, past which `is_pinned` answers true for *every* inode and ext2 defers every `unlink`'s block free onto a list that then never drains; `ext2probe`'s pinned-reclaim phase returned 0 % of deleted bytes against AArch64's 85 %, fixed with a predicate-taking `retain_mapped_inode_pins` called from `unmap_range` (a predicate, not an inode, because one file is mapped by several regions)
+- amd64's ext2 block cache stayed at `akuma-ext2`'s 16 MB default — a value whose own comment says it is sized for `cargo test` — because `set_cache_cap_bytes` is called from the AArch64 mount path only, and this target mounts ext2 itself
+- with the O(n²) restart gone, `find_free_va` still **sorted** its 4 400-region list on every single `mmap` call, which timed at 74 % of `rustc`'s in-kernel time
+- four more O(n) walks over the same list — the first-fit scan, the `windows(2)` sorted check, `detach_eager_regions_in_range` (on **both** kernels) and `unmap_range`'s "does this range name a file?" — plus a linear `regions.iter().find()` on **every page fault**, which `[PSTATS]` counts and never times, so it was invisible to the instrument that found the rest
+- sizing the ext2 cache from RAM (`min(RAM/8, FSCACHE_CEILING_MB)`) is correct where the heap grows and wrong on a target with a fixed `HEAP_SIZE`: at 6 GB of guest RAM it took 384 MB of a 512 MB heap and `execve` — which holds a whole image in one kernel-heap `Vec` — OOM'd reading the 158 MB `rust-lld`; the cap takes a `HEAP_SIZE / 4` term now (the underlying defect, that `execve` does not stream `PT_LOAD` segments, stays open)
+- amd64's futex wait loop had no interrupt check at all, so a thread parked in an untimed `FUTEX_WAIT` never saw a group exit or a signal — the 1 s untimed-park backstop faithfully woke it every second to re-confirm it was stuck, and a `-j4` build stalled for 600 s in silence where it now reports an error in 2 s; `fd.rs`'s console/stdin read loop had the identical hole, which is how an interactive session hangs when its process is killed mid-keystroke
+- two cores demand-faulting the same anonymous page each installed a frame, the second **replacing the first's contents with zeros** — the presence test and the map were two steps, where AArch64 serialises demand paging per page for exactly this reason; `rustc` died ~2 s into every `cargo` build at SMP≥2 (every "mysterious `#GP` in the allocator" was musl's `mallocng` catching its own corrupt metadata and executing `hlt`). Fixed with one `install_filled_page` critical section and a deliberate third `Raced` outcome, since reporting failure would turn a served fault into a `SIGSEGV` and reporting success would publish a frame the caller no longer owns
+- every `sys_spawn` child was handed the **console's shared** `TerminalState` instead of a private one, so busybox's line editor left raw mode set and the next session inherited it: `^C` worked in the first ssh session after a reboot and in none after it, and `console::set_attached_pid` addressed the serial line's keystrokes to the newest session's shell; a process carrying its own `ProcessChannel` is a session now, whatever its fd table says
+- `MAX_PIPES` was 64 and `std`'s `Command::spawn` makes its pipes before it execs, so `-j8` failed in 8 s as "could not exec the linker `cc`: Too many open files in system" — `ENFILE`, the machine ceiling, not the process; both justifications in the constant's own comment were wrong (a pipe's capacity is a limit, not an allocation, and from outside a refusal and a leak look identical), so the count is instrumented and the ceiling raised
+- the `^C` probe's `tail` mode followed `/etc/passwd`, which is not in that image, so `tail` exited instantly, the shell ran the next command and the probe scored `KILLED` — a green reading of an interrupt that was never tested; it creates the file it follows now and refuses to score a trial whose job printed its post-job marker before the interrupt (`NO-JOB`, a third outcome)
+
+### docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md
+- `HEAP_SIZE` was a hardcoded 512 MiB on a 16 GB machine, and the ext2 block cache is `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)`, so the heap quarter bound the cache to 128 MB on precisely the workload the code's own comment names (`rustc` reading rlibs); sized from RAM as a falling-back request, the completed build went 1398 s → 640 s and the link that had never once succeeded did
+- `update-grub` executes every *executable* file in `/etc/grub.d/`, so backing up `45_akuma` with `cp` (which preserves mode 755) produced **two menu entries both titled `Akuma/amd64`** — re-creating the boot-entry ambiguity that had already cost an hour on 09-05; backups belong outside that directory
+
+### docs/archive/AKUMA_FROM_SCRATCH.md
+- the staged toolchain was silently truncated — `libcore.rmeta` for `x86_64-unknown-none` at 209 KB where it should be 68 MB, `liballoc` and `libcompiler_builtins` missing, AppleDouble stubs throughout — and the failure names the wrong thing entirely ("only metadata stub found for `rlib` dependency `core`", on crate 3 of 137); reinstalled through `rustup` and rsynced whole
+- three submodule worktrees on the box were **empty** while their objects were present, and `git submodule update --init` reported nothing to do because the recorded SHA already matched — `--force` is what checks the files out, and without `spleen` the kernel does not build at all, since `akuma-fbcon`'s build script bakes the BDF
+- proc-macro crates build as musl **dylibs** needing `-lc`/`-lgcc_s`, and cargo does not apply `target.<triple>.rustflags` to host units, so nothing could carry the `-L`; the first fix — a shell wrapper named `ld.lld` — worked on Ubuntu and failed on the box, because **`execve` on this kernel does not understand `#!`** (busybox runs the same file only because a shell retries a non-ELF itself), so the libraries were moved onto the search path lld already has instead
+- cargo discovers `.cargo/config.toml` from the **working directory**, so building the kernel from anywhere but its manifest directory silently drops `relocation-model=static`/`code-model=kernel` and the link dies with `relocation R_X86_64_32 cannot be used against symbol '_start'`, which reads as a code fault and is not one
+- `hpbox.restage_disk()` is `rsync -aH --delete` from `root.img` onto the box's root partition, which would have deleted the checkout, the toolchain, the cargo cache **and `/boot/akuma-amd64`**; it excludes `/src`, `/root`, `/usr/local` and `/boot` now
 
 ## SSH (39 fixes, 18 docs)
 
@@ -1649,7 +1710,7 @@ aren't recorded anywhere else.)
 - the exception stub saved ten registers — right for a *serviced* fault, not enough to *deliver* one: a handler is handed `uc_mcontext` and `rt_sigreturn` puts it back, so `rbx`/`r12`-`r15` (already reused by the dispatcher's own Rust frames) would have returned into garbage; all fifteen are saved as `TrapRegs` now
 - a signal could not reach a compute-bound program at all until delivery was added to the LAPIC tick — with the opposite alignment arithmetic to the exception stubs (no error code means no padding push) and gated on `from_user`, which is what proves the interrupted code holds no BKL
 
-## Misc / Cross-cutting (41 fixes, 15 docs)
+## Misc / Cross-cutting (48 fixes, 16 docs)
 
 ### docs/archive/AKUMA_ENTRY_EXTRACTION.md
 (The `akuma-entry` split itself is a refactor and is not counted; these are the two defects it surfaced. The `with_boot_identity_fdt` change — mapping and range-checking the DTB pointer instead of vouching for it by comment — is a hardening with no observed failure, and is not counted either.)
@@ -1739,6 +1800,15 @@ aren't recorded anywhere else.)
 ### docs/archive/REDUCING_PLATFORM_DEPENDENCY.md
 - §1.5: `akuma-mmap` held the PTE permission vocabulary (`flags`/`user_flags`) as literal AArch64 descriptor bits in the crate that is meant not to know that — its *code* was portable and its *data* was not, and `cargo check --target x86_64-unknown-none` passes, so amd64 could have adopted it and got silently wrong answers (the two architectures' masks share zero bits, and AArch64's `AP_MASK` lands on x86's Dirty and PAT); what lives there now is the opaque `Prot` token
 
+### docs/archive/AMD64_TRASHCAN_ISSUES.md
+- `execve` on amd64 never closed `FD_CLOEXEC` descriptors — `Process::close_cloexec_fds` is shared code whose single caller is glue's `sys_execve`, the AArch64 path — so the write end of git's notify pipe survived into the exec'd image, the read never returned EOF and `git clone` over HTTPS blocked in `read(7)` forever; fixed at the POSIX point of no return (after `install_image` commits, never before) with a `close_cloexec_fds_releasing` that drops the references and not merely the names
+- `resolve_host` returned `ENOENT` for an IP literal: `akuma_net::dns` has short-circuited `localhost` and a dotted quad twice over, and amd64's separate `resolve_a` client had neither, so `meow` could not reach a LAN inference server that `busybox wget` reached perfectly — only `no_std` callers can see it, since musl resolves for itself. One host-tested `resolve_literal` now, called by all three sites
+- `poll_input_event` had a local amd64 copy that looped on the **serial port** for anything that was not a pipe, where an ssh session's keystrokes never are, and dropped `timeout_us` on the floor — which is a TUI's frame tick; every full-screen program (`meow`, `nca`, `paws`) was dead over ssh while `busybox sh` was fine, because it reads with `read(2)`. Arm 313 folds onto glue whenever the process has a channel
+- the rest of the terminal family — `set_terminal_attributes`, `get_terminal_attributes`, `set_cursor_position`, `hide_cursor`/`show_cursor`, `clear_screen`, `get_cpu_stats` — was `ENOSYS` on amd64 although glue's `term.rs` implements all seven, so a reachable TUI still could not position its cursor: `meow`'s footer printed once per 50 ms frame down the screen, and without raw mode the kernel echoed line-buffered input over the layout
+- `embedded-tls` failed every handshake with `api.z.ai` as `DecodeError`, reproducible on a laptop with no Akuma in the path: the server's **informational** `supported_groups` list contains `41` (`curveSM2`), `NamedGroup::parse` returns `InvalidData` for anything outside its ten, and the extension macro turns that into a fatal decode — after `secp256r1` had already been agreed, where RFC 8446 requires unknown values to be ignored. Fixed in the `netoneko/embedded-tls` fork's `akuma-0.19` branch (skip unrecognized code points, with a test pinning that the buffer still ends past the whole list), consumed through `userspace/Cargo.toml`'s `[patch.crates-io]` — the root one has no `embedded-tls` in its lockfile, so a patch there does nothing
+- all three TLS consumers printed the same flat "TLS handshake failed" for failures demanding completely different fixes (`InsufficientSpace`, `InvalidCipherSuite`, `DecodeError`), which is the single biggest reason the above cost a session; `libakuma_tls::tls_error_name` maps every variant and unpacks the two alert-carrying ones
+- the RTL8169 stall watchdog was given a chip-evidence test whose cost was never asked about — `snapshot()` is eleven MMIO reads, on a receive-poll loop that laps thousands of times a second under the BKL — and the box booted into it unreachable, twice: the retry moved the reads behind the `quiet` window, which is true on *every* lap once it passes on an idle link. `MPC` is deleted from the poll path; `INT_RDU` already arrives in the `ISR` harvested every lap and is the better signal. Every gate was green on both dark kernels, and neither fast-lane target runs this driver (both virtio)
+
 ## Console & Terminal (36 fixes, 13 docs)
 
 ### docs/archive/VEC_AUDIT.md
@@ -1805,7 +1875,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_CONSOLE_NONBLOCK_READ.md
 - `read_console` had no `O_NONBLOCK` test at all, and `fd::sys_read`'s preamble claims a bound `Stdin` before glue's arm (which does have one) is ever reached — so the `ssh` client's pump parked inside the kernel on its **first** `read(0)` and never serviced its socket: remote echo, prompts and keepalives all stopped, which reads as a dead terminal rather than a blocked read
 
-## Containers (24 fixes, 6 docs)
+## Containers (32 fixes, 8 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -1845,7 +1915,21 @@ aren't recorded anywhere else.)
 
 ---
 
+### docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md
+- `run_registered_process` — the first ring-3 entry of every `spawn_ext`-created process — called `enter_user_mode_checked` **directly** instead of the registered `ExecRuntime::enter_user` hook, and that function is AArch64's raw `eret` with a `panic!` stub for every other target, so the first real `spawn_ext` on amd64 hit "enter_user_mode_checked on a host build" verbatim
+- `spawn_ext`'s spawn primitive is one-phase (the closure *is* the child, already running), so there is no parent-side window in which `bind_child_task` could seed `UserCtx::proc_slot` the way fork's two-phase primitive allows — `enter_ring3` then refused with `[proc] ring-3 entry with no slot` and hung; the child binds itself as its own first action now
+- the fix for that called `bind_child_task` from inside `with_process`'s callback, i.e. a lock-taking hook underneath `PROCESS_TABLE`'s exclusive lock, where fork's own call is safe only because its child is not yet registered at all; the plain field write stays inside the short hold and the hook moved out, reached through `lookup_process_shared`
+- `bind_child_task`'s `ChildKind::Process` arm seeded only `proc_slot`, leaving `UserCtx::thread_slot` whatever the previous occupant of that task slot had left — harmless for every two-phase caller and not for this one, where `enter_ring3` read a stale slot and branched into the **thread-exit teardown path** for a process that had not run an instruction (guest gone, triple fault); it seeds both explicitly now, stating that a process is never a thread
+- `userspace/box` compiled AArch64's syscall numbers unconditionally, so on amd64 `box run` reported `overlay mount failed: errno 22` from a number that means something else entirely on this architecture
+- `box`'s OCI platform selector was a hardcoded `["arm64", "aarch64"]`, so **every `box pull` on amd64 had been silently fetching the ARM64 layer of every image** — caught by two pulls of the same image producing different config digests, which a content-addressed digest cannot do; split per `target_arch`, with `["amd64", "x86_64"]` because registries use Docker Hub's platform string
+- `ExecRuntime::resolve_file_id`/`read_at_by_inode` were still `not_wired!` panics justified by "no mount table to give an id from", which stopped being true when C1 step 4a gave this target the same global mount table — nothing had exercised the panic until `box run` loaded a >1 MiB binary through the demand-paged loader; both forward to the unmodified `akuma-vfs-glue` functions now, and `box run` fails gracefully where it used to panic the kernel (the fault path's own `lazy_regions` gap behind it is recorded as a separate, open porting task)
+
+### docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md
+- `mount(2)`/`umount2(2)` answered `ENOSYS` on amd64 although `akuma-syscalls-glue`'s `container.rs` implements both: the family needed `syscall_table!` rows, dispatch arms, and the `akuma-vfs-glue/sc-containers` feature forward that amd64's own manifest had never defined (the root manifest does it for the AArch64 binary), without which the crate does not compile as a whole
+
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-09-19 (the `amd64-cleanup-and-improvements` branch — the bare-metal self-host and the workstation work, 63 commits, 15 archive docs touched — ahead of merging it). Two of those docs carry no counted fix. AKUMA_AMD64_NO_SLOT_RECYCLER is **Status: open, not started** by its own header: an audit of the four gaps that follow from amd64 claiming TERMINATED thread slots directly (no `TERMINATED → FREE` transition, so no recycler runs), written because the `[SWITCH FREED-CR3]` fix worked *around* it — that fix's own carve-out is counted under AKUMA_AMD64_SWITCH_FREED_CR3_UAF above, and this doc's appendix (nothing reaps an orphaned zombie when pid 1 is `sshd`) proposes two candidate fixes and lands neither. AKUMA_AMD64_BKL_NETWORKING is a read of the call path answering "does networking take the BKL?" (yes, unconditionally, and more than AArch64 does — this target has no per-syscall opt-out bitmap); its §4 numbering hazard is explicitly "currently latent, not live" and the A/B it prescribes is left unrun. Two already-listed docs were re-checked for content added here: CTRL_C_SIGINT_DELIVERY gained a 2026-09-18 section, but it is a pointer — the session-terminal-state defect it describes is counted under AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS §16, where the traces, the A/B and the fix are, and the `[ISIG-MISS]` tripwire it adds here is an instrument rather than a fix; AKUMA_SELF_HOSTING_AMD64 gained ~240 lines of walk-so-far timeline covering 09-18/09-19, every entry of which cross-references a fix counted under one of the eleven new subsections above, so its own count is unchanged.
 
 Also scanned 2026-09-13 (the `i-am-about-to-regret-this-joke-down-the-line` branch — the amd64 port, 284 commits, 92 archive docs — ahead of closing it). Thirteen of those docs carry no counted fix. Seven are port records with no defect attached: AKUMA_MMU_TLB_TARGET_VOCABULARY (a `TlbTarget`/`TlbFlush` vocabulary that changes no behaviour on the day it lands), AKUMA_MMU_X86_ADDRESS_SPACE, AKUMA_THREADING_X86_SWITCH and AKUMA_USER_ACCESS_X86_FIXUP's own half (new x86_64 arms for types that had none — the two real defects that pass surfaced there are counted above under Memory & Virtual Memory), AKUMA_USER_SPACE_LEDGER (a frame-ledger extraction with 14 host tests, no defect), AKUMA_AMD64_TEST_GATING (a `no-tests` feature so `cloc` stops reporting `amd64/src` as 0.0% test — no behaviour changed) and AMD64_CRATE_REUSE_AUDIT (by its own header, "process, not a defect. Nothing shipped broken"). Four are folds whose substance is a deletion: AKUMA_AMD64_EXECVE_RETURNS (a second `sysret` path so `execve` returns into the new image; `run_process` becomes one entry and one exit), AKUMA_AMD64_PIPE_TABLE_UNIFICATION (two instances of one `PipeTable` become one — the duplicate id space was a *scheduled* defect, live only once `close` folded, and it never did), AKUMA_AMD64_SPAWN_ROW_STDIO (`Spawn::stdout_pipe` deleted as a second copy of a fact the fd table already held) and AKUMA_AMD64_RING3_SEAM_SLICE4 (the fork memory pass gets an architecture hook; the AArch64 lift is byte-for-byte behaviour-preserving). Two are 5b slices that moved a structure without fixing one: AKUMA_AMD64_STEP5B_SLICE2_LIFECYCLE and AKUMA_AMD64_STEP5B_SLICE3_PROCFS (both record what *nearly* broke — a blank `ps`, a deleted `init_entry()` — caught before landing). FIRECRACKER_PORT moved from `proposals/` to `docs/archive/` on this branch and is the design record for a port carried out elsewhere; its one bug, the `GICD_IROUTER` aliasing, is counted under GICD_IROUTER_ALIASING. Five already-listed docs were re-checked for content added here: AKUMA_EXTRACT_MMAP gained only a supersession note (its PTE-permission vocabulary moved back down to `akuma_mmu::types`, counted under REDUCING_PLATFORM_DEPENDENCY above), AKUMA_FIRECRACKER_KVM, AKUMA_FIRECRACKER_TERRAFORM and GICD_IROUTER_ALIASING gained only path updates for that move, and DEVBOX_ISSUES gained **Issues 28 and 29** (`box grab` reportedly broken again; `dmesg` readable from inside a box) which are both **Status: OPEN**, so its count is unchanged.
 

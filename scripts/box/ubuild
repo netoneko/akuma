@@ -1,0 +1,29 @@
+#!/bin/sh
+# ubuild — build Akuma's own userspace for this target, inside Akuma.
+#
+#   ubuild [member…]        default: paws httpd herd hget wall box
+#
+# `sshd` (and the `ssh` client from the same package) is built separately
+# because it needs --no-default-features --features akuma: `fork-sessions` is a
+# default feature and this target's sshd runs the single-process cooperative
+# executor. Mirrors amd64/mkdisk.sh, which is the source of truth for the flags.
+#
+# Binaries land in $CARGO_TARGET_DIR (default /root/utarget). Installing one is
+# a cp onto /bin — the same mechanism scripts/install_kernel_amd64.sh uses for
+# the kernel, and the same rule applies: keep a .bak of anything you overwrite
+# that you still need to log in with (/bin/sshd, /bin/sh, /bin/herd).
+set -e
+. /etc/akuma-dev.env
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/root/utarget}; export CARGO_TARGET_DIR
+cd "$AKUMA_SRC/userspace"
+
+if [ $# -gt 0 ]; then
+    ARGS=""
+    for m in "$@"; do ARGS="$ARGS -p $m"; done
+    exec cargo build --release --target x86_64-unknown-none --offline $ARGS
+fi
+
+cargo build --release --target x86_64-unknown-none --offline \
+    -p paws -p httpd -p herd -p hget -p wall -p box
+exec cargo build --release --target x86_64-unknown-none --offline \
+    -p sshd --no-default-features --features akuma

@@ -12,7 +12,12 @@ fixed point**, and **on 2026-09-18 the metal reached that fixed point too**
 on Akuma's own root so no Ubuntu is in the loop —
 `AKUMA_AMD64_BARE_METAL_SELFHOST.md`). Since **2026-09-19** the box is also
 usable *as* a workstation: `git clone` over HTTPS, and `meow`/`nca` in both
-one-shot and full-screen modes (`AMD64_TRASHCAN_ISSUES.md` §§1-5).
+one-shot and full-screen modes, against z.ai as well as the LAN
+(`AMD64_TRASHCAN_ISSUES.md` §§1-5). **Later the same day the whole loop ran
+inside the machine** — clone, branch, `kbuild`, `kinstall`, `reboot -f`, back
+up on its own SHA (`AKUMA_FROM_SCRATCH.md` §9.1). What has not happened yet is
+the loop driven by an **agent** rather than a person; that is the walk's
+"[NEXT]".
 `cargo build --release` for the amd64 kernel ran to completion
 inside Akuma/amd64 under Firecracker on 09-13: 94 crates, 7 m 53 s, `rc=0`, and
 a 2 895 920-byte `ET_EXEC` x86-64 image with a PVH note at the end of it.
@@ -1968,7 +1973,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         filesystems it does not have — so that is a keypress at the
         machine.
    ▼
- [09-19] ═══ YOU ARE HERE ═══ THE BOX IS A WORKSTATION, NOT A BUILD TARGET
+ [09-19 early] ═══ THE BOX IS A WORKSTATION ═══ NOT A BUILD TARGET
    │
    │   Self-hosting was reached; **using** the machine was not. Three
    │   defects stood between "it builds its own kernel" and "you can
@@ -2026,16 +2031,145 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         `cp`'d to `/boot/akuma-amd64` and `reboot -f`'d. Ubuntu built
         the first one and was not touched again.
    ▼
- [NEXT] ═══ FROM SCRATCH ═══ THE USERLAND, AND THE METAL'S SPEED
+ [09-19 late] ═══ YOU ARE HERE ═══ IT PATCHES ITSELF; THE AGENT IS NEXT
    │
-   ├──► **`AKUMA_FROM_SCRATCH.md`'s remaining half.** The kernel builds
-   │   itself — but from a tree staged onto sdb1 with `--exclude .git`
-   │   (§4: that is why a metal-built kernel reports `unknown` for its
-   │   sha). Now that `git clone` works there, the box can fetch its own
-   │   sources instead of being handed them. What has never been done on
-   │   the metal at all is the **userland** — clone and build
-   │   `userspace/` on the box, so nothing in the running system came
-   │   from a cross-build.
+   ├──► **The loop closed by hand, with nothing outside the machine.**
+   │   `git fetch` on the box (3.1 s, under build load), a branch off the
+   │   pushed head, `kbuild -j 1` — **95 crates, 12 m 16 s, EXIT=0** —
+   │   `kinstall` (md5 verified on read-back; `/boot/akuma-amd64.prev`
+   │   written for the first time), `reboot -f`, ssh back in **48 s**, and
+   │   `uname` reporting **the branch's own SHA**. 775 passed / 0 failed,
+   │   then `meow -c` against z.ai answered in 5.9 s on the kernel it had
+   │   just built. `.good` promoted *after* the boot passed, never at
+   │   install time.
+   │   The partition carries the repository itself now: a full clone at
+   │   `/src/github.com/netoneko/akuma`, a 1 GB cargo cache (an ordinary
+   │   registry cache, **not** a `vendor/`), the nightly at
+   │   `/usr/local/rust`, and `kbuild`/`ubuild`/`mbuild`/`kinstall` as real
+   │   ELFs — **`execve` here does not understand `#!`**, so a shell script
+   │   can be a wrapper and cannot be a linker. Three staging traps went
+   │   first: a `libcore.rmeta` copied off the Mac at 209 KB instead of
+   │   68 MB (the error names `core`, not the copy), proc-macro dylibs with
+   │   no `-lc`/`-lgcc_s` on a search path cargo will not extend for host
+   │   units, and `.cargo/config.toml` discovered from the **cwd** rather
+   │   than the manifest. And `hpbox.restage_disk()` — `rsync -aH --delete`
+   │   — would have erased all of it plus `/boot`; it excludes them now.
+   │   **`git push` does not work, and that is a decision**: `origin` is
+   │   plain https and the box holds no credential, so it can change itself
+   │   and nothing else. A human collects the branch.
+   │                        docs: AKUMA_FROM_SCRATCH.md §9, §9.1
+   │
+   ├──► **z.ai answers — and the kernel was exonerated.** The table that
+   │   said "one box, three TLS stacks, three outcomes" had two rows that
+   │   were measurement artifacts: `https://api.z.ai/` is a cross-host 301
+   │   to a marketing page (10.7 s even for `curl`, 27 s for the async
+   │   probe — repeatable to 600 ms, which is what made it look like a
+   │   kernel timer), and the sync arm filtered the address list to IPv4
+   │   while the async one did not. **A URL that redirects cross-host
+   │   cannot be a transport probe.**
+   │   The one real defect is in `embedded-tls` and reproduces on a laptop
+   │   with no Akuma in the path: the server's *informational*
+   │   `supported_groups` hint carries `41` = `curveSM2`, and
+   │   `NamedGroup::parse` fails the whole list on any code point outside
+   │   its ten — after `secp256r1` had already been agreed, which RFC 8446
+   │   says to ignore. Fixed in `netoneko/embedded-tls` branch
+   │   **`akuma-0.19`** (pin that, never `main`: upstream's next commit
+   │   moves to a git-dep `embassy-crypto` with an ambient RNG), which is
+   │   also the 0.17 → 0.19 move. `hget` against both z.ai endpoints:
+   │   `decode error` → **401**, i.e. a completed handshake. `meow` streams
+   │   `glm-5.3-flash`; `nca` answers and reports cost.
+   │   The other half of the fix is that the failure now has a **name** —
+   │   `libakuma_tls::tls_error_name` — because three unrelated bugs had
+   │   all printed the same "TLS handshake failed".
+   │                        docs: AMD64_TRASHCAN_ISSUES.md §5
+   │
+   ├──► **The socket wait was holding the BKL.** `akuma-net`'s park arm
+   │   states the contract in its own comment — a wait must *drop* the
+   │   lock — and amd64 supplied a plain `yield_now`, which re-takes it and
+   │   switches with it held. So a waiter with nothing to do sat on the
+   │   lock the netpoll daemon needed. Pointed at `sched::allow_tick`:
+   │   **zero `[BKL] stuck` lines** in a 4-vCPU boot that used to storm.
+   │   **The first version of that fix bricked the box**: `allow_tick`
+   │   falls back to `sti; nop; cli` when the timer is stopped, which keeps
+   │   the lock held — and the boot path (self-tests, then SNTP resolving
+   │   `pool.ntp.org`) is precisely where the timer is off. The shipped
+   │   version tests `timer_running()` first, so its worst case is the old
+   │   behaviour rather than a new one.
+   │                        docs: AKUMA_AMD64_MEOW_TLS_STALL.md §4, §4a
+   │
+   ├──► **Two dark boots in one day, out of one line.** The RTL8169 stall
+   │   watchdog was made to demand evidence from the chip before calling
+   │   silence a stall — right signal, cost never asked about: `snapshot()`
+   │   is **eleven MMIO reads**, on a receive-poll loop that laps thousands
+   │   of times a second. The box came up unreachable, and networking comes
+   │   up before `sshd`, so there was nothing to log in to. The retry moved
+   │   the reads behind the quiet window — and `quiet` is true on *every*
+   │   lap once it passes on an idle link, which is this machine's normal
+   │   state. Same symptom, same walk to the machine. `MPC` is deleted from
+   │   the poll path now; `INT_RDU` already arrives in the `ISR` every lap
+   │   for free and is the better signal anyway. Every gate was green on
+   │   both dark kernels — `cargo check`, clippy, 1463 host tests — and
+   │   **neither fast-lane target runs this driver at all** (both are
+   │   virtio, the Realtek exists on one machine), so for this one file
+   │   reasoning about per-lap cost is the only defence there is.
+   │                        docs: AMD64_TRASHCAN_ISSUES.md §7b
+   │
+   └──► **The free gate's second arm had never been wired.**
+        `[SWITCH FREED-CR3]`, read off a photograph of the framebuffer,
+        and the machine gone. `akuma-mmu`'s address-space free gate asks
+        two questions; the second reaches through a `Registered` cell that
+        **degrades to `None` when nothing registers it**, and amd64 never
+        calls `akuma_exec::init`. So the x86 saved-root probe written on
+        09-12 was reachable by nobody, and a thread parked off-CPU with a
+        dead process's root still in its `space_root` could not stop that
+        root going back to the PMM — `kill -9` on a process blocked in a
+        syscall is the shape that reproduces it. Registering the hooks then
+        parked **413 pages**, because this target claims TERMINATED slots
+        directly and a thread killed by a fault never zeroes its root;
+        hence the carve-out, which is a proof rather than a guess — a slot
+        that is TERMINATED or FREE and not `ON_CPU` cannot install
+        anything. The tripwire also stopped destroying its own evidence:
+        one `StackWriter` flush instead of seven `puts` shredded by peer
+        cores, and a demote to the kernel root instead of falling through
+        into the `mov cr3`.
+                          docs: AKUMA_AMD64_SWITCH_FREED_CR3_UAF.md,
+                                AKUMA_AMD64_NO_SLOT_RECYCLER.md
+   ▼
+ [NEXT] ═══ THE FIRST PATCH WRITTEN ON THE BOX ═══
+   │
+   ├──► **GLM writes a kernel patch, on the metal.** Every step of the
+   │   loop above was driven by a person; the next iteration is `meow` +
+   │   GLM on the box driving it — edit, `kbuild`, `kinstall`, `reboot
+   │   -f`, continue on the new kernel. The chosen first patch is **Intel
+   │   HDA audio** (`runbooks/add-intel-hda-audio.md`), picked because it
+   │   is a *new* subsystem rather than an edit to an existing one, for
+   │   hardware only this machine has (`8086:8c20` at `00:1b.0`) that no
+   │   host test and no QEMU fast lane can stand in for, and because "did
+   │   it work?" is answerable by a human in one second from across the
+   │   room. Precedent, dated: GLM-4.7 wrote the first program authored
+   │   *inside* Akuma on 2026-08-22 and patched the tty layer on 08-25 —
+   │   both in a **guest**, on AArch64, from a tree supplied from outside.
+   │   The metal, from a repository the machine cloned itself, is the
+   │   increment.
+   │
+   ├──► **The gate, and it has not moved.** `AKUMA_FROM_SCRATCH.md` §5:
+   │   the SMP user-process corruption is not fixed — at SMP=4 on the
+   │   metal roughly half of ten-minute builds die `rc=139`, and **`-j1`
+   │   is not protective** (35 crates in, once). Two areas need to be
+   │   *severely* stabilized before the unattended version is attempted at
+   │   all, not merely to have worked once: **networking** (an agent's
+   │   session is hours of HTTPS over a driver no test and no fast-lane
+   │   target executes) and **processes/threads** (a build is thousands of
+   │   `fork`/`execve`/`clone`, and every tool call is one more). Both
+   │   fail probabilistically, hours in, and destroy their own evidence —
+   │   which is exactly what autonomy multiplies. `userspace/amd64/
+   │   fbstress/` is the probe aimed at it, and it is also `llama.cpp`'s
+   │   shape: many threads over one large file-backed `mmap`.
+   │
+   ├──► **The userland is still borrowed.** `/bin/sh`, `sshd`, `herd` and
+   │   `box` all *build* on the box now (§9) and **not one has been
+   │   installed from a box-built copy**. A machine that can rebuild its
+   │   kernel but not its shell is a very good cross-compilation target.
    │
    ├──► **Speed.** The metal's fixed point was `kbuild -c -j 1`: 95
    │   crates in **640 s / 632 s**, about **6.7 s per crate**. The guest
@@ -2048,7 +2182,10 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    └──► **Carried, unconfirmed:** the 60 s stream-end stall
         (`AKUMA_AMD64_STREAM_END_STALL.md`) — the RTL8169 watchdog was
         recalibrated and the 14-byte final chunk identified as
-        `data: [DONE]`, but neither is proven to be the cause.
+        `data: [DONE]`, but neither is proven to be the cause. `nca`
+        against z.ai is the live symptom and it is **bimodal**: 3 runs of
+        6 answer in 8-12 s, the other 3 print nothing at all out to its
+        300 s timeout, with no middle case in either direction.
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*

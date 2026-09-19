@@ -1,0 +1,8 @@
+#!/bin/sh
+# kinstall — install the kernel kbuild just produced onto /boot/akuma-amd64.
+# A thin wrapper so the procedure stays in git: the script it runs is the
+# repository's, and it verifies the multiboot2 header and re-reads what it wrote.
+# Does NOT reboot. `/bin/busybox reboot -f` yourself once it exits 0.
+set -e
+. /etc/akuma-dev.env
+exec sh "$AKUMA_SRC/scripts/install_kernel_amd64.sh" "$@"

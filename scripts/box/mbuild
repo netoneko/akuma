@@ -1,0 +1,16 @@
+#!/bin/sh
+# mbuild — build meow (the agent) for this target, inside Akuma.
+#
+# meow is its own cargo workspace (userspace/meow), so it inherits none of
+# userspace/.cargo/config.toml. On AArch64 userspace/build.sh gives it
+# -Z build-std=core,alloc and -C panic=immediate-abort for size; here it is
+# built plainly first — get it running, then shrink it, and measure the
+# difference rather than assuming the aarch64 flags transfer.
+#
+# Binary: $CARGO_TARGET_DIR/x86_64-unknown-none/release/meow (default
+# /root/mtarget). Install with `cp … /bin/meow`.
+set -e
+. /etc/akuma-dev.env
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/root/mtarget}; export CARGO_TARGET_DIR
+cd "$AKUMA_SRC/userspace/meow"
+exec cargo build --release --target x86_64-unknown-none --offline "$@"

@@ -1,0 +1,40 @@
+#!/bin/sh
+# kbuild — build the Akuma/amd64 kernel, inside Akuma, on the bare-metal box.
+#
+#   kbuild [-c] [-j N] [-p PKG] [--online] [extra cargo args…]
+#     -c        cargo clean first (that is the trial; an incremental green
+#               build proves much less)
+#     -j N      jobs, default 1 — SMP is on and -j4 has corrupted this build
+#     -p PKG    package, default akuma-amd64
+#     --online  drop --offline (needed only after adding a dependency)
+#
+# Output lands in $CARGO_TARGET_DIR (default /root/ktarget), which is where
+# scripts/install_kernel_amd64.sh looks by default. Keeping it out of the
+# checkout is deliberate: the tree stays `git status` clean.
+#
+# docs/runbooks/amd64-bare-metal-loop.md
+set -e
+. /etc/akuma-dev.env
+
+JOBS=1; PKG=akuma-amd64; CLEAN=0; OFFLINE=--offline
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c) CLEAN=1; shift ;;
+        -j) JOBS="$2"; shift 2 ;;
+        -p) PKG="$2"; shift 2 ;;
+        --online) OFFLINE=""; shift ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        *) break ;;
+    esac
+done
+
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/root/ktarget}; export CARGO_TARGET_DIR
+
+# cwd MUST be the manifest directory: cargo discovers .cargo/config.toml from
+# the working directory, not from --manifest-path. Build from elsewhere and the
+# kernel's relocation-model/code-model flags are silently missing, and the link
+# fails with "relocation R_X86_64_32 cannot be used against symbol '_start'".
+cd "$AKUMA_SRC"
+
+[ "$CLEAN" = 1 ] && cargo clean --release --target x86_64-unknown-none
+exec cargo build -p "$PKG" --target x86_64-unknown-none --release $OFFLINE -j"$JOBS" "$@"
