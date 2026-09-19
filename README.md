@@ -191,10 +191,6 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 | `akuma-rump` | NetBSD rump-kernel sysproxy client |
 | `akuma-smp` | Multikernel core coordination (descriptor, MPSC inbox) |
 
-`akuma-ssh-crypto` moved to `userspace/` in 2026-08 — its only consumer is
-`userspace/sshd`. `akuma-ssh`, `akuma-shell` and `akuma-editor` were deleted
-with the in-kernel SSH server they served.
-
 ## Project Layout
 
 ```
