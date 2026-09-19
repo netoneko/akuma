@@ -21,6 +21,17 @@ CLI:  python3 scripts/utils/hpbox.py which        # 'ubuntu' | 'akuma' | 'unknow
       python3 scripts/utils/hpbox.py patch [path…]  # send local diff, apply there
       python3 scripts/utils/hpbox.py ramdisk [GiB]  # target/ on tmpfs (rotational root)
       python3 scripts/utils/hpbox.py ramdisk-sync   # copy tmpfs target/ back to disk
+      python3 scripts/utils/hpbox.py rz  '<cmd>'  # run on the Ryzen laptop
+
+A second, unrelated machine lives in this module too: the **Ryzen laptop**
+(`pop-os`, AMD Ryzen 7 8845HS, Pop!_OS) — the host `crates/akuma-ryzen-amd64`
+and `docs/reference/firecracker-amd64/` are named after and measured on. One
+system, no dual personality, reachable directly — no `-F /dev/null` trap, no
+port split. It runs Ollama (stable models) and is the Firecracker host for the
+`userspace/meow` litter-raft deployment (`userspace/meow/docs/LITTER_RAFT_LOOP.md`
+"Deployment topology"). Found on the LAN 2026-09-20 as `192.168.1.126` — DHCP,
+so re-resolve by hostname if the address ever stops answering rather than
+assuming the box moved.
 """
 
 import subprocess
@@ -39,6 +50,28 @@ UB = [
 ]
 # Akuma: the config alias already carries port, user, key and no host checking.
 AK = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "akuma"]
+
+# The Ryzen laptop: one machine, one OS, the ordinary laptop user account.
+RYZEN_HOST = "192.168.1.126"
+RZ = [
+    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR", f"netoneko@{RYZEN_HOST}",
+]
+
+
+def ryzen(cmd, timeout=120):
+    """Run `cmd` on the Ryzen laptop. Returns (rc, stdout, stderr).
+
+    Plain user account, no root — `sudo` on this box needs an interactive
+    password this module cannot supply, so anything requiring it (rebinding
+    Ollama's listen address, installing to system paths) has to be handed to
+    the user rather than scripted here. Docker (`docker` group, no sudo) is
+    the escape hatch used for network setup instead — see `amd64/net-setup.sh`.
+    """
+    r = subprocess.run(RZ + [cmd], capture_output=True, text=True,
+                       errors="replace", timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
 
 
 def ubuntu(cmd, timeout=300):
@@ -731,6 +764,11 @@ def _main(argv):
         return rc
     if cmd in ("ub", "ubuntu"):
         rc, o, e = ubuntu(" ".join(rest))
+        sys.stdout.write(o)
+        sys.stderr.write(e)
+        return rc
+    if cmd in ("rz", "ryzen"):
+        rc, o, e = ryzen(" ".join(rest))
         sys.stdout.write(o)
         sys.stderr.write(e)
         return rc
