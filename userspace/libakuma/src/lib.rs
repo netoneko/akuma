@@ -212,6 +212,13 @@ pub mod syscall {
         pub const WAIT4: u64 = 260;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
         pub const SET_BOX_STACK: u64 = 324;
+        /// Real Linux asm-generic numbers, used only by the `linux-abi`
+        /// `spawn_full` (see below) to build a process the way Linux actually
+        /// wants one built — `fork`+`pipe2`+`dup3`+`execve` — since Akuma's own
+        /// `SPAWN` (301, above) is a single private syscall a real Linux kernel
+        /// has no handler for at all.
+        pub const EXECVE: u64 = 221;
+        pub const DUP3: u64 = 24;
     }
 
     /// The x86_64 numbering.
@@ -1865,13 +1872,15 @@ pub fn spawn_with_env(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, e
 /// pointers into the `String`s built below; those `String`s must outlive the
 /// syscall, so they are named locals (`args_terminated`, `env_terminated`) and
 /// not temporaries inside the loops that take their addresses.
-fn spawn_full(
+/// Build the NUL-terminated argv/envp pointer arrays both `spawn_full` bodies
+/// need. Returns the owned `String`s alongside the pointer `Vec`s built from
+/// them — the caller must keep the strings alive exactly as long as the
+/// pointers are used (into the `SPAWN` syscall, or across `fork`+`execve`).
+fn build_argv_envp(
     path: &str,
     args: Option<&[&str]>,
-    stdin: Option<&[u8]>,
     env: &[&str],
-    flags: u64,
-) -> Option<SpawnResult> {
+) -> (alloc::string::String, alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<*const u8>, alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<*const u8>) {
     // argv[0] is the path; the caller's args follow. NUL-terminated copies,
     // because the kernel reads C strings and `&str` is not one.
     let path_terminated = alloc::format!("{}\0", path);
@@ -1894,6 +1903,20 @@ fn spawn_full(
         envp.push(s.as_ptr());
     }
     envp.push(core::ptr::null());
+
+    (path_terminated, args_terminated, argv, env_terminated, envp)
+}
+
+#[cfg(not(feature = "linux-abi"))]
+fn spawn_full(
+    path: &str,
+    args: Option<&[&str]>,
+    stdin: Option<&[u8]>,
+    env: &[&str],
+    flags: u64,
+) -> Option<SpawnResult> {
+    let (path_terminated, _args_terminated, argv, _env_terminated, envp) = build_argv_envp(path, args, env);
+
     // A NULL `envp` and a pointer to a lone NULL both mean "empty environment"
     // to every kernel here; pass NULL for the empty case so the wire form is
     // exactly what the pre-`spawn_full` wrappers sent.
@@ -1921,6 +1944,70 @@ fn spawn_full(
     let pid = (result & 0xFFFF_FFFF) as u32;
     let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
     Some(SpawnResult { pid, stdout_fd })
+}
+
+/// `linux-abi` process spawn: Akuma's own `SPAWN` (301) is a single private
+/// syscall bundling fork+exec+pipe setup that has no handler on a real Linux
+/// kernel at all — every call returned `None`, silently breaking every
+/// `Shell` tool invocation under `linux-net` until this was found by actually
+/// running one (`uname -a` failed identically to `sleep`, which is what
+/// pointed at `spawn()` itself rather than at busybox/symlink handling).
+///
+/// Built from the real Linux primitives instead: `pipe2` to capture the
+/// child's stdout, [`fork`] (already a genuine `CLONE` syscall — this part
+/// was never broken), `dup3` to move the pipe's write end onto the child's
+/// fd 1, then `execve`. `stdin` and `flags` (pty) are not wired up on this
+/// path — nothing in meow calls `spawn_with_stdin`/`spawn_pty` today, and
+/// adding a second pipe / pty allocation for callers that don't exist yet
+/// would be exactly the kind of speculative code this tree avoids.
+#[cfg(feature = "linux-abi")]
+fn spawn_full(
+    path: &str,
+    args: Option<&[&str]>,
+    _stdin: Option<&[u8]>,
+    env: &[&str],
+    _flags: u64,
+) -> Option<SpawnResult> {
+    let (path_terminated, _args_terminated, argv, _env_terminated, envp) = build_argv_envp(path, args, env);
+    let envp_arg = if env.is_empty() { core::ptr::null() } else { envp.as_ptr() };
+
+    let mut pipe_fds = [0i32, 0i32];
+    if pipe(&mut pipe_fds) < 0 {
+        return None;
+    }
+    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+    match fork() {
+        Ok(ForkResult::Child) => {
+            // dup3 onto STDOUT, then the original write fd is redundant —
+            // close both it and the read end, which this side never uses.
+            syscall(syscall::DUP3, write_fd as u64, fd::STDOUT as u64, 0, 0, 0, 0);
+            close(write_fd);
+            close(read_fd);
+            syscall(
+                syscall::EXECVE,
+                path_terminated.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp_arg as u64,
+                0, 0, 0,
+            );
+            // execve only returns on failure. There is no parent left to
+            // report to and no stdout hooked up to print through — exit with
+            // a shell-convention "command not found" code, matching what
+            // `run_and_capture`'s caller already treats 127 as meaning
+            // (see tools::shell::resolve_binary's "not found" framing).
+            exit(127);
+        }
+        Ok(ForkResult::Parent(pid)) => {
+            close(write_fd);
+            Some(SpawnResult { pid, stdout_fd: read_fd as u32 })
+        }
+        Err(_) => {
+            close(read_fd);
+            close(write_fd);
+            None
+        }
+    }
 }
 
 /// Kill a process by PID
@@ -2112,6 +2199,7 @@ impl WaitStatus {
 ///
 /// Returns `None` if the child is still running or does not exist (the same
 /// two-cases-in-one-value limitation [`waitpid`] has always had).
+#[cfg(not(feature = "linux-abi"))]
 pub fn waitpid_status(pid: u32) -> Option<WaitStatus> {
     let mut status: u32 = 0;
     let result = syscall(
@@ -2129,6 +2217,35 @@ pub fn waitpid_status(pid: u32) -> Option<WaitStatus> {
         None
     } else {
         Some(WaitStatus { pid: result as u32, raw: status })
+    }
+}
+
+/// `linux-abi`: Akuma's own `WAITPID` (303) is, like `SPAWN`, a private
+/// syscall number a real Linux kernel has no handler for — every call fell
+/// into this function's own `(result as i64) < 0 => None` branch, which is
+/// indistinguishable from "child still running", so `tools::shell::drain_child`
+/// polled it in a loop that could never see a fast-exiting child finish and
+/// always ran to its 30-second give-up timeout. Built from real Linux
+/// `wait4(pid, ..., WNOHANG, NULL)` instead — non-blocking on the *specific*
+/// pid, keeping this function's existing "`None` = still running" contract
+/// that `drain_child`'s polling loop already relies on.
+#[cfg(feature = "linux-abi")]
+pub fn waitpid_status(pid: u32) -> Option<WaitStatus> {
+    const WNOHANG: u64 = 1;
+    let mut status: u32 = 0;
+    let ret = syscall(
+        syscall::WAIT4,
+        pid as u64,
+        &mut status as *mut u32 as u64,
+        WNOHANG,
+        0, 0, 0,
+    ) as i64;
+
+    if ret > 0 {
+        Some(WaitStatus { pid: ret as u32, raw: status })
+    } else {
+        // 0 = still running; negative = error (e.g. no such child).
+        None
     }
 }
 

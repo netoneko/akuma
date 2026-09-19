@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "litter-wire"
+version = "0.1.0"
+edition = "2021"
+
+# no_std + alloc, one dependency (nojson) instead of picojson-for-reading plus
+# a hand-rolled writer: nojson does both directions off one JSON model
+# (`DisplayJson` to write, `TryFrom<RawJsonValue>` to read), has zero
+# dependencies of its own, no unsafe (`#![forbid(unsafe_code)]`), no macros,
+# and genuinely nested JSON (an array of *objects*, not the flatten-to-strings
+# workaround an earlier version of this crate needed to stay inside a
+# hand-rolled flat-object reader). `std` is pulled in only under `cfg(test)`
+# via nojson's own default `std` feature, disabled here — same shape as
+# `litter-raft`'s Cargo.toml, so `cargo test` is a genuine native run on
+# macOS: this crate has no libakuma dependency, so it's the wire format's own
+# host-testable half, shared by `meow` (no_std, over
+# `libakuma::net::TcpStream`) and `litter-hub` (std, over
+# `std::net::TcpStream`) so the two ends of the wire cannot independently
+# drift.
+[dependencies]
+nojson = { version = "0.3", default-features = false }
