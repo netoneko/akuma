@@ -100,6 +100,25 @@ scripts/install_kernel_amd64.sh                  # -> /boot/akuma-amd64, md5-ver
 /bin/busybox reboot -f                           # up on what you just built
 ```
 
+**Promote `.good` after a kernel proves itself, not when you install it.**
+`Akuma/amd64 (known good)` is the only remote-free way back, and it is worth
+exactly as much as the kernel sitting behind it. On 2026-09-19 it was three
+weeks stale: recovering onto it worked, but it landed the box on a kernel
+without that day's `git clone`, DNS, `poll_input_event` and terminal fixes, so
+every one of them had to be reinstalled before work could resume.
+
+The promotion is one copy, and the ordering is the whole point — **boot it,
+verify it, then promote**:
+
+```sh
+# on Akuma, after a reboot that came back and passed its self-tests
+cp -f /boot/akuma-amd64 /boot/akuma-amd64.good && sync
+```
+
+Promoting at install time instead would have overwritten the fallback with the
+kernel that was about to hang, which is the one thing the entry exists to
+prevent.
+
 `install_kernel_amd64.sh` refuses an ELF with **no multiboot2 header** and
 re-reads what it wrote. Both matter more here than they would with a one-shot:
 this is the *default* entry, so a bad install means the box comes up at the GRUB

@@ -4,7 +4,7 @@
 Firecracker/QEMU stand-ins. **Stability: C** — these are active, and at least one
 has had its "root cause" overturned twice.
 
-As of 2026-09-19 §§1-4 are fixed and §§5-7 are open. Two of the entries here are
+As of 2026-09-19 §§1-4 are fixed, §§5-7 are open, and §7b is an incident report rather than a defect of this machine's. Two of the entries here are
 **not kernel bugs at all** (§4 a client timeout, §6 a model and its tool
 payload) and they are kept in this file on purpose: both presented as "the box
 is broken", and the record of how each was pushed off the kernel is the part
@@ -468,17 +468,18 @@ directory entry pointing at an existing inode, `links_count` incremented, and
 
 ---
 
-## 7b. The NIC watchdog fix bricked the boot, and the process is the lesson
+## 7b. The NIC watchdog fix bricked the boot — **twice**
 
-**Status: self-inflicted 2026-09-19, fixed in source, cost a walk to the
-machine.** Recorded because the defect is one line and the way it reached the
-metal is the part worth not repeating.
+**Status: self-inflicted 2026-09-19. Two dark boots, two trips to the machine.**
+The defect is one line; the reason it shipped twice is the part worth keeping.
 
 §2-era work left the RTL8169 stall watchdog firing on an idle link (`[rtl]
 stall #3: kick misc 0x3f -> 0x3f mpc=0` — no missed packets, and the kick
 changed nothing). The fix was to require evidence from the chip before calling
-silence a stall: `INT_RDU` latched, or `MPC` advancing. Correct as far as it
-goes. But the `MPC` read was placed on the **ordinary idle path**:
+silence a stall: `INT_RDU` latched, or `MPC` advancing. The *signal* was right.
+The **cost** was never asked about.
+
+### Break 1 — the read on the idle path
 
 ```rust
 let mpc = self.nic.snapshot().mpc;   // every lap, before deciding anything
@@ -486,14 +487,51 @@ let mpc = self.nic.snapshot().mpc;   // every lap, before deciding anything
 
 `snapshot()` is **eleven MMIO register reads**. This is the receive poll loop —
 thousands of laps a second, under the BKL — so that is eleven PCI transactions
-per lap to answer a question that only matters after five seconds of silence.
-The box booted into it and never came back: no ping, port 22 and 2222 both
-closed. Networking comes up before `sshd` does, so a poll loop that cannot keep
-up never reaches a state anyone can log into.
+per lap to answer a question that matters once every five seconds. The box
+booted into it and never came back: no ping, 22 and 2222 both closed.
+Networking comes up before `sshd` does, so a poll loop that cannot keep up never
+reaches a state anyone can log in to.
 
-**The fix** is to sample `MPC` only once the quiet window has already elapsed —
-`quiet && { …read MPC… }` — so the reads happen on quiet laps only, and never
-on the path that is actually moving packets.
+### Break 2 — the fix that was not one
+
+The reads were then moved behind the quiet window and shipped again:
+
+```rust
+let stalled = quiet && { let mpc = self.nic.snapshot().mpc; /* … */ };
+```
+
+**`quiet` is true on every lap once the window passes.** Nothing clears it while
+there is no backpressure — `last_rx_us` is only refreshed when a frame arrives
+or a stall fires — so on an idle link, which is this machine's normal state, the
+eleven reads came back *permanently*, five seconds after boot. Same symptom,
+same walk to the machine.
+
+The comment shipped above that line read "never per lap". It was written from
+intent rather than from the code, and asserting the property instead of checking
+it is what sent a second dark kernel to the one target with no remote recovery.
+**A claim in a comment is not a test.** The first patch was reasoned about; the
+second was rushed *because* the first had already cost something — which is
+backwards. A failure that costs a physical trip is the moment to slow down.
+
+### The fix: deleted, not relocated
+
+`MPC` is gone from the poll path entirely. `INT_RDU` already arrives in the
+`ISR` that `take_interrupts()` harvests **every lap regardless**, so the
+evidence costs nothing — and it is the better signal anyway: `RDU` means "the
+ring ran dry with a frame waiting", which is exactly the condition being
+detected. `MPC` added nothing that justified a register read.
+
+The idle path is now: one saturating add, the `now_us()` that was already there
+in the kernel which ran all afternoon, and one bool test. **The delta against
+the last known-working build is a boolean** — which is the kind of argument that
+should have been available before either of the two bad kernels was installed.
+
+| kernel | change on the idle path | result |
+|---|---|---|
+| `65f00daf` | — | fine all afternoon, 775/0 |
+| `30f1588c` | 11 MMIO reads per lap | **dark** |
+| `dbde1114` | 11 MMIO reads per lap, 5 s after boot | **dark** |
+| `50db3fc2` | one bool | to be verified |
 
 ### This already happened once, on AArch64
 
@@ -515,14 +553,36 @@ The runbook's first rule is to grep `docs/archive/` before forming a theory. It
 is worth reading as also covering the code you are about to write: this entry
 existed, and finding it took one `grep` *after* the box was already dark.
 
-### What let it through
+### What let it through, both times
 
-Every gate this tree has was green on the kernel that bricked the boot:
+Every gate this tree has was green on both kernels that bricked the boot:
 `cargo check`, `clippy`, and **1463 host tests passing**. None of them execute
-the poll loop, and **no host test can see a livelock** — the failure is a
-timing property of code running against real MMIO.
+the poll loop, and **no host test can see a livelock** — the failure is a timing
+property of code running against real MMIO.
 
-The runbook already prescribes the answer and it was skipped:
+Nor would the fast lane have caught it, which is the uncomfortable part: local
+QEMU is `-M microvm` with virtio-MMIO and the box's Firecracker is virtio too,
+so **neither target runs `rtl8169.rs` at all** — the driver is behind a feature
+only bare metal enables, and the Realtek exists on exactly one machine. Measured
+after the fact: the corrected kernel passes the local trial **767/0 in 22 s**,
+and both dark kernels would almost certainly have passed it too.
+
+So for this one file there is no test anywhere that substitutes for reading the
+code. What was available, and skipped: asking what a call costs on a loop that
+runs thousands of times a second, and the `grep docs/archive/` the runbook opens
+with — §11.7 below was already in the tree and took one `grep` to find *after*
+the box was dark.
+
+Recovery cost more than it should have, too: `Akuma/amd64 (known good)` pointed
+at a **three-week-old** kernel, so each recovery landed the box without that
+day's `git clone`, DNS, `poll_input_event` and terminal fixes, all of which had
+to be reinstalled before work could resume. `.good` is worth exactly as much as
+the kernel behind it — the runbook now says to promote it **after a kernel
+proves itself**, never at install time (promoting at install would have
+overwritten the fallback with the kernel about to hang).
+
+For everything that *is* reachable by the fast lane, the runbook already
+prescribes the order and it was skipped:
 
 ```
 fast lane  ->  amd64_trials.py      (local QEMU + the box's Firecracker, no reboot)

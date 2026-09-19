@@ -300,7 +300,9 @@ pub struct Rtl8169Device {
     /// stall watch measures against; the lap counter is the fallback.
     last_rx_us: Option<u64>,
     /// Has the chip told us it *could not take a frame* since the last one it
-    /// gave us? `INT_RDU` latched, or `MPC` advanced.
+    /// gave us? Set from `INT_RDU`, which the per-lap `take_interrupts()`
+    /// already reads — deliberately **not** from `MPC`, which would cost an
+    /// MMIO read on a path that must stay free.
     ///
     /// **Silence is not a stall**, and separating the two is the whole point of
     /// this flag. The wall-clock window alone fired on an idle LAN — measured
@@ -312,8 +314,6 @@ pub struct Rtl8169Device {
     /// it does: `RDU` means the ring ran dry with a frame waiting, and `MPC`
     /// counts frames dropped for want of a descriptor.
     rx_backpressure: bool,
-    /// `MPC` as of the last lap, to notice it advancing.
-    last_mpc: u32,
     /// How many stalls have been seen. The full ring dump prints on the first
     /// one only — once is a diagnosis, sixteen lines every two seconds is a
     /// screen nobody can read — and the recovery attempt is capped at
@@ -355,7 +355,6 @@ impl Rtl8169Device {
             idle_laps: 0,
             last_rx_us: None,
             rx_backpressure: false,
-            last_mpc: 0,
             stalls: 0,
             rx_scratch: [0; BUF_LEN],
             tx_scratch: [0; BUF_LEN],
@@ -526,21 +525,23 @@ impl Rtl8169Device {
             };
             // Quiet **and** the chip complaining. Either alone is normal.
             //
-            // `MPC` is the other half of the evidence — frames the chip dropped
-            // for want of a descriptor — and it is sampled **only once the
-            // quiet window has already elapsed**, never per lap. `snapshot()`
-            // is eleven MMIO reads, and this is the receive poll loop: putting
-            // them on the ordinary idle path costs eleven PCI transactions
-            // thousands of times a second, under the BKL, to answer a question
-            // that only matters after five seconds of silence.
-            let stalled = quiet && {
-                let mpc = self.nic.snapshot().mpc;
-                if mpc != self.last_mpc {
-                    self.rx_backpressure = true;
-                    self.last_mpc = mpc;
-                }
-                self.rx_backpressure
-            };
+            // The evidence is [`Self::rx_backpressure`], set from the `RDU` bit
+            // of the `ISR` this loop **already** harvests every lap, so it costs
+            // nothing. `MPC` would be the other half of it, and reading it here
+            // is what took the box down twice on 2026-09-19: `snapshot()` is
+            // eleven MMIO reads, and there is no "occasionally" on this path.
+            // Gating it behind `quiet` looked like it fixed that and did not —
+            // `quiet` is true on **every** lap once the window passes, and
+            // nothing clears it while there is no backpressure, so the reads
+            // came back permanently five seconds after boot. An idle link is
+            // the normal state of this machine.
+            //
+            // So: no register reads here at all. `RDU` alone is a sound stall
+            // signal — it is precisely "the ring ran dry with a frame waiting",
+            // which is the thing being detected. See
+            // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §7b and
+            // `AKUMA_NET_ISSUES.md` §11.7.
+            let stalled = quiet && self.rx_backpressure;
             if stalled {
                 self.stalls += 1;
                 self.idle_laps = 0;
