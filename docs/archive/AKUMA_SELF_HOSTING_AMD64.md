@@ -2907,6 +2907,15 @@ not ruled out with evidence from a live boot.
 
 ## The "BKL storm wedge" was neither a wedge nor the BKL: the RX ring cursor desynced (2026-09-20, resolved)
 
+> **Corrected 2026-09-20, later the same day** — see § "`netprobe`: the answer
+> was a command-line flag away the whole time". The headline here is half
+> right: the box was healthy and deaf, and that part stands. But "the RX ring
+> cursor desynced" is only **one of two** faults, and it is not the one that
+> was blocking by the end. The other halts the receiver after exactly one
+> ring's worth of frames with the cursor perfectly in step. Nothing below was
+> measured with `netprobe` on, which is why it reads more confident than the
+> evidence allowed.
+
 The section above left the first failed boot "not established" — whether it
 would have cleared on its own or was a genuine stall. It was neither. The
 machine was **healthy and deaf**, and the `[BKL] stuck … tag=502` storm was the
@@ -3129,3 +3138,243 @@ and `Waiter`'s timestamp field do not rot — all four are `deny(dead_code)`
 failures the moment the call disappears — and the optimiser drops the branch:
 neither `[FUTEX] wakes=` nor `[PIPES] live=` survives in the linked image.
 Flip either const to `true` to get it back.
+
+## Root cause: a restarted receiver rewinds, the cursor does not (2026-09-20)
+
+> **Corrected 2026-09-20, later the same day.** This describes mode A
+> correctly and the host test for it is real and passing. It is **not** the
+> root cause of the failures that were actually blocking the box: those had
+> `cursor=0/16` with every descriptor chip-owned, `rx=16`, and needed the
+> receiver restarted rather than the cursor moved. The claim in "Still open"
+> that the two earlier recoveries were "most likely" the `INT_RDU` arm is now
+> **confirmed** — `blind_kicks=0` on a boot with `rx=16` proves the `blind` arm
+> has never fired at all.
+
+The section above left "why does the cursor desync" open and the repair as a
+5-second stall handler. Both are now closed, and the fault **reproduces as a
+host test** — no box required.
+
+### The mechanism
+
+The receive ring is two independent pointers chasing each other around 16
+descriptors, with one ownership bit each:
+
+- `OWN=1` — the chip's: *here is an empty buffer, fill it*.
+- `OWN=0` — the chip wrote a frame and handed it back.
+
+The chip fills in order and clears `OWN`. The driver walks its **own** cursor,
+and `Nic::receive` inspects **only the slot under that cursor**:
+
+```rust
+let i = self.rx.cursor();
+if self.mem.rx_desc(i).owned_by_chip() {
+    return None;           // gives up here
+}
+```
+
+Nothing in hardware keeps the two aligned. And the chip **latches `RDSAR` and
+resumes from the ring base whenever its receiver is stopped and started** —
+which is not a guess: `kick_receiver` resets the driver's cursor to 0 in the
+same breath as restating `RDSAR`, precisely because it knows this.
+
+So anything *else* that restarts the receiver rewinds the chip to slot 0 and
+leaves the cursor where it was. `receive` then asks a slot the chip will not
+fill next, and the answer is `None` for the rest of the boot while a completed
+frame sits one wrap away. Measured twice on the HP box, identical both times:
+
+```
+cursor=15/16   rx[0] OWN=0, FS+LS, len 154   rx[1..15] OWN=1
+mpc=0   rxdv_gated=0   cr=0x0c
+```
+
+`mpc=0` is what rules out the obvious alternative: MPC counts frames dropped
+for want of a descriptor, so the chip had **not** overrun a slow driver. The
+chip was healthy and armed. The driver was reading the wrong slot.
+
+### Why a scan is safe where advancing is not
+
+`advance` is a *consumption* — it re-posts the descriptor it leaves — so
+walking it past a chip-owned slot hands the chip back a buffer it is about to
+write into, breaking lockstep in the direction `receive` cannot recover from.
+
+`Nic::resync_rx_cursor` touches **no descriptor**. It scans from `cursor+1`
+(ring order is FIFO order, so the slot the chip filled first after wrapping is
+found first), and moves the cursor only onto a descriptor the chip has already
+completed — where `OWN=0` means exactly one thing, an unconsumed frame, because
+the driver re-posts on consumption and so can never leave a stale one.
+
+It is also strictly cheaper than the kick: no MMIO, the receiver is not
+stopped, and nothing in flight is lost across it.
+
+### The repair is in the receive lap, not the stall handler
+
+Leaving it to `on_stall` was wrong twice: it waits out a five-second window,
+**and it only runs if the stall arms at all** — which on several boots it did
+not, leaving the box deaf for a whole boot with the frame one wrap away.
+
+```rust
+if self.idle_laps >= RESYNC_AFTER_IDLE_LAPS          // 64
+    && self.idle_laps.is_multiple_of(RESYNC_SCAN_LAPS)   // 64
+    && let Some(i) = self.nic.resync_rx_cursor()
+```
+
+Affordable because it reads **descriptors, not registers** — the per-lap cost
+`AMD64_TRASHCAN_ISSUES.md` §7b forbids is MMIO, and there is none here. A
+desync cannot appear on a lap that delivered a frame, so a busy link never
+scans at all. Repair latency goes from `STALL_QUIET_US` (5 s) to milliseconds.
+
+`counters::rx_resyncs` is kept separate from `rx_kicks` deliberately: a kick
+says the *chip* needed restarting, a resync says only that the driver's idea of
+where it was had drifted. **A climbing `rx_resyncs` with `rx_kicks` flat is the
+signature of something rewinding the receiver underneath us** — which is the
+remaining open question, and the counter is how it gets answered.
+
+### It is a host test now
+
+`model::FakeChip` gained `restart_receiver()` — resetting its RX index to 0, as
+toggling `CR_RE` does on silicon. That is the one behaviour the model was
+missing, and without it the bug could not be expressed:
+
+```
+a_restarted_receiver_desyncs_the_cursor_and_resync_repairs_it ... ok
+resync_invents_nothing_when_the_ring_is_empty ... ok
+```
+
+The first asserts the desync genuinely **hides** the frame (`receive` returns
+`None` with a frame present) before asserting the repair — without that the
+test would pass while proving nothing. The second is the safety property: with
+every descriptor chip-owned there is nothing to repair, and a resync that moved
+the cursor anyway would break lockstep the unrecoverable way.
+
+### Still open
+
+- **What restarts the receiver.** The repair is cause-independent, which is why
+  it is worth having, but the rewind itself is unexplained. `rx_resyncs` is the
+  instrument.
+- **The two earlier "recoveries" are still unattributed.** They printed
+  `STALL #1 after 2000000 idle laps` and most likely came from the pre-existing
+  `INT_RDU` arm, not from anything added that day.
+
+## `netprobe`: the answer was a command-line flag away the whole time (2026-09-20)
+
+**Read this section before the two above it.** Both were written from absence
+of evidence and both are partly wrong; the corrections are marked inline there.
+
+### The flag
+
+`amd64/src/net.rs:731` — `static PROBE_ON: AtomicBool = AtomicBool::new(false)`,
+set by the **`netprobe`** kernel command-line flag (`boot.rs:574`). The GRUB
+entry was:
+
+```
+multiboot2 /boot/akuma-amd64 init=/bin/herd root=/dev/sda1
+```
+
+So a purpose-built NIC diagnostic — one that `enable_probe()` deliberately
+prints *immediately before `run_init`* so it lands at the bottom of a boot log
+"on a machine whose console is a television being photographed" — was off, and
+hours went into inferring from silence what it would have said outright.
+
+Adding ` netprobe` to that line (default entry only; `.good` left pristine, and
+the backup kept **outside** `/etc/grub.d/` because `update-grub` executes
+everything in there) produced the whole diagnosis on the next boot.
+
+### What it said
+
+```
+[rtl] STALL #1 after 2000000 idle laps (rx=16 frames, blind_kicks=0)
+[rtl] cr=0x0c isr=0x0000 imr=0x002f rcr=0x0002c70e mpc=0 misc=0x3f
+      rxdv_gated=0 cursor=0/16
+[rtl] rdsar=0x00000000005b7500
+[rtl]  rx[0..14] cmdstat=0x80000800      <- OWN, 2048, posted
+[rtl]  rx[15]    cmdstat=0xc0000800      <- OWN, 2048, EOR
+[rtl] kick: misc 0x3f -> 0x3f (gate was clear)
+  nic:  rx_desc va=0xffffffff805b7500 pa=0x00000000005b7500
+[probe] link=up/1000M/full ip=192.168.1.123/24 dhcp=leased clk=set
+[probe]   rx=306 tx=115 drop=0 isr=0x4095 dry=5 kicks=1 polls=280 irq=0 laps=7290
+```
+
+Five things, each of which kills a theory that had been live for hours:
+
+- **`rx=16`.** Exactly `RING_LEN`. One ring's worth, then nothing. This is the
+  signature this file's own comment already named — *"`rx` climbed to exactly
+  16 — `RING_LEN`, one ring's worth — and then never moved again"* — and it is
+  the fault, stated in one number.
+- **`rdsar` == `rx_desc pa`**, both `0x5b7500`. The "chip is DMA'ing where the
+  driver never looks" hypothesis — the one the bring-up dump exists to catch,
+  and which had **never actually been checked** — is dead.
+- **`cursor=0/16` with every descriptor chip-owned.** The cursor wrapped
+  correctly. **This boot was not a desync**, which is why `resync_rx_cursor`
+  returned `None` and printed nothing: the gate was right and there was nothing
+  to repair. So there are *two* distinct faults, not one (below).
+- **`isr=0x0000` at the stall, `0x4095` accumulated, `dry=5`.** `RDU` was
+  raised and acknowledged five times, and the receiver **did not resume**.
+- **`link=up/1000M/full`.** The PHY reads up. An earlier section here
+  speculated the carrier sample read down and that this was why the `blind` arm
+  never fired — wrong, and `blind_kicks=0` gives the real reason: `rx=16` means
+  `rx_seen` is true, so `blind` was false by construction.
+
+### Two faults, not one
+
+| | mode A | mode B |
+|---|---|---|
+| `cursor` | `15/16` | `0/16` |
+| ring | a completed frame waiting at `rx[0]` | every descriptor chip-owned |
+| `rx=` | (unmeasured — the counter did not exist yet) | **16**, exactly one ring |
+| repair | `resync_rx_cursor` — move the cursor | `kick_receiver` — restart the receiver |
+
+Mode A is the chip resuming from the ring base after a restart the driver did
+not perform, leaving the cursor a wrap behind. Mode B is the receiver halting
+after one ring and not restarting itself.
+
+### Mode B's root cause: acking `RDU` does not restart this receiver
+
+`take_interrupts` acknowledges `ISR` every lap, and the comment beside it says
+why: *"`RDU` … the chip raises it the moment the ring runs dry and does not
+resume taking frames until it is cleared, which `take_interrupts` does by
+writing the observed bits straight back."*
+
+`dry=5` says that happened five times. `rx` stayed at 16. **So the ack is
+necessary and not sufficient** — on this part the receiver has to be
+*restarted*, which is the `CR_RE` toggle inside `kick_receiver`. One kick, and
+`rx` went 16 → 30 → 43 → … → 306, DHCP leased, clock set, ssh at 61.4 s.
+
+`kicks=1` for the rest of the boot: it did not recur.
+
+### What is still fragile
+
+The repair is right; the **detection** is not. Mode B was caught by
+`STALL #1 after 2000000 idle laps` — the pre-clock lap fallback — and only
+because the loop was still busy-spinning. Once the loop settles (`laps=7290`
+over 115 s, i.e. ~63/s) two million laps is *nine hours*.
+
+The evidence for a better trigger is already in the dump: **`RDU` raised while
+every descriptor is chip-owned** is not a stall to be suspected after a
+timeout, it is the chip stating that it ran dry against a ring that is fully
+posted. That is a kick condition on sight, with no window at all. That is the
+next change, and it is the one that would have made every deaf boot in this
+session recover in milliseconds.
+
+### Attribution, finally settled
+
+`blind_kicks=0` with `rx=16`. The `blind` arm added earlier that day has
+**never fired**, on any boot. Every recovery observed all session came from the
+pre-existing `INT_RDU` → `rx_backpressure` arm. The caveat flagged when that
+patch landed was correct and should have been resolved by measurement then,
+not four kernels later.
+
+### Unexplained, recorded rather than guessed
+
+`rcr=0x0002c70e`, where the driver writes `RCR_VALUE = 0xc70e`. Bit 17 is set
+by the chip, not by us, and it was absent (`rcr=0x0000c70e`) in the mode-A
+dumps. Noted because it is the only register difference between the two modes;
+no claim is made about what it means.
+
+### The rig lesson
+
+`netprobe` should be **on by default on this machine**. It costs one line every
+two seconds on a box whose console is otherwise the only channel when the
+network is down — which is the exact state it describes — and its absence cost
+more than its output ever will. The counters it prints (`rx`, `dry`, `kicks`,
+`polls`, `laps`, `irq`) are the difference between a diagnosis and a session of
+inference from silence.

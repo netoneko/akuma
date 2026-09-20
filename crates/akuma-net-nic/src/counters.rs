@@ -38,6 +38,15 @@ pub(crate) struct CounterBlock {
     /// A number that keeps climbing is the machine staying reachable *despite*
     /// a bug, not evidence there isn't one.
     pub(crate) rx_kicks: AtomicUsize,
+    /// How many times the receive cursor was found disagreeing with the chip
+    /// and moved back into step, without touching a descriptor.
+    ///
+    /// Distinct from [`Self::rx_kicks`] on purpose: a kick restarts the
+    /// receiver and is evidence the *chip* needed restarting; a resync only
+    /// repairs the driver's own idea of where it is, and a climbing count here
+    /// with `rx_kicks` flat says the chip is fine and something keeps rewinding
+    /// it underneath us.
+    pub(crate) rx_resyncs: AtomicUsize,
     pub(crate) rx_isr_seen: core::sync::atomic::AtomicU32,
     /// The link, as the driver last read it from the PHY, packed so a reader
     /// needs no lock: bit 0 up, bits 1..3 speed (1/2/3 = 10/100/1000), bit 3
@@ -60,6 +69,7 @@ pub(crate) static C: CounterBlock = CounterBlock {
     tx_frames_sent: AtomicUsize::new(0),
     rx_ring_dry: AtomicUsize::new(0),
     rx_kicks: AtomicUsize::new(0),
+    rx_resyncs: AtomicUsize::new(0),
     rx_isr_seen: core::sync::atomic::AtomicU32::new(0),
     link_state: core::sync::atomic::AtomicU8::new(0),
     canary_hi: AtomicUsize::new(CANARY_VALUE),

@@ -263,6 +263,21 @@ const STALL_LAPS: u32 = 2_000_000;
 /// counter within seconds.
 const STALL_LAPS_UNSTARTED: u32 = 20_000;
 
+/// How many consecutive frameless laps before the cursor is suspected of having
+/// drifted. A desync cannot appear on a lap that delivered a frame, so any
+/// non-zero value is safe; this one keeps a busy link from ever scanning.
+const RESYNC_AFTER_IDLE_LAPS: u32 = 64;
+
+/// How often to scan once suspected. The scan is at most one ring of
+/// descriptor reads, so this bounds the idle cost at a sixty-fourth of that,
+/// while repairing within milliseconds instead of [`STALL_QUIET_US`]'s five
+/// seconds.
+const RESYNC_SCAN_LAPS: u32 = 64;
+
+/// Console reports before the resync goes quiet. The repair itself is never
+/// capped — same trade as [`MAX_STALL_REPORTS`], for the same reason.
+const MAX_RESYNC_REPORTS: usize = 5;
+
 /// `uptime_us`, or `None` before the runtime seam is registered (early boot and
 /// host tests). The stall watch measures against this; `None` means fall back
 /// to the lap count, never to a bogus zero.
@@ -617,6 +632,38 @@ impl Rtl8169Device {
         // Stall watch. Receive dying at a ring boundary with no error bit set
         // has now cost three rounds of theorising; this dumps what the chip
         // says about itself the moment it stops, once, and then never again.
+        // Repair a drifted cursor *here*, not in the stall handler. The chip
+        // resumes from the ring base whenever its receiver restarts, so
+        // anything that restarts it without the driver's knowledge leaves the
+        // two disagreeing — and `receive` only ever inspects the slot under
+        // the cursor, so the disagreement is permanent rather than transient.
+        // Reproduced as a host test in
+        // `akuma-net-rtl8169/tests/bringup.rs::a_restarted_receiver_desyncs…`.
+        //
+        // Leaving this to `on_stall` was wrong twice over: it waits out a
+        // five-second window, and it only runs if the stall arms at all — which
+        // on 2026-09-20 it repeatedly did not, leaving the box deaf for a whole
+        // boot with a completed frame one wrap away.
+        //
+        // Affordable because it reads **descriptors**, not registers: the
+        // per-lap cost §7b forbids is MMIO, and there is none here. Still on a
+        // cadence, and only once the ring has been quiet for a while, so a busy
+        // link never pays for it — a desync cannot appear on a lap that
+        // delivered a frame.
+        if self.idle_laps >= RESYNC_AFTER_IDLE_LAPS
+            && self.idle_laps.is_multiple_of(RESYNC_SCAN_LAPS)
+            && let Some(i) = self.nic.resync_rx_cursor()
+        {
+            C.rx_resyncs.fetch_add(1, Ordering::Relaxed);
+            if C.rx_resyncs.load(Ordering::Relaxed) <= MAX_RESYNC_REPORTS {
+                crate::safe_print!(
+                    112,
+                    "[rtl] resync: cursor -> {} after {} idle laps\n",
+                    i, self.idle_laps
+                );
+            }
+        }
+
         let Some(n) = self.nic.receive(&mut self.rx_scratch) else {
             self.idle_laps = self.idle_laps.saturating_add(1);
             // Wall-clock first, lap count only as the pre-clock fallback. The
