@@ -5,6 +5,37 @@ Stability grade: **B** for §6 below (live-reproduced on the trashcan,
 doc (§1-5 remain the original static audit, unconfirmed by a runtime
 measurement).
 
+## 2026-09-20 (later): fix validated live; a second, separate wedge suspect
+## opened the same day
+
+The `yield_now()` fix above was deployed to the trashcan and **held through the
+same trigger that used to wedge the box**: a stalled LLM HTTP call during which
+the box stayed ssh-reachable and responsive. That part is confirmed closed.
+
+Two new findings from the same session, both recorded here because they
+surfaced through this incident's stack:
+
+1. **`kill -9` on a llama-server *thread* wearing a process costume wedged the
+   box** a second time (same banner-exchange-timeout signature). On amd64,
+   `ps` shows cloned threads as their own PID rows (check
+   `/proc/<pid>/status` `Tgid` before assuming a real duplicate), and `kill`
+   on a thread-PID is suspected of hitting an unsafe teardown path —
+   **unconfirmed**, needs a controlled experiment; see
+   [`AKUMA_AMD64_NO_SLOT_RECYCLER.md`](AKUMA_AMD64_NO_SLOT_RECYCLER.md).
+   Until understood: treat any `kill -9` on this box as an experiment.
+2. **The on-box llama-server was removed from the picture entirely** —
+   sherlock's provider now points at an externally hosted backend on the LAN
+   (the `yard` Mac, `192.168.1.203:8081`), which also sidesteps the server-side
+   single-slot stall (a stuck request queues every later one forever behind
+   it, `--parallel 1`). The BKL story and the backend story were never the
+   same bug; this makes them not even the same machine.
+
+See also [`AMD64_SPAWNED_THREAD_NEVER_RUNS.md`](AMD64_SPAWNED_THREAD_NEVER_RUNS.md)
+— updated the same day: the raft-thread death is now localized to the first
+`write(2)` from a clone-spawned thread, i.e. **a second amd64 kernel bug
+candidate**, and `meow`'s litter hub now serves degraded-but-working from its
+main loop.
+
 ## 2026-09-20: live-confirmed, and a fix for the `yield_now` half — not the
 ## whole picture
 

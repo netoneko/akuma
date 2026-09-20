@@ -830,11 +830,28 @@ extern "C" fn syscall_handler(
     a5: u64,
     a6: u64,
 ) -> u64 {
+    // THREAD-WRITE TRACE, pre-BKL (temporary, 2026-09-20): if this prints
+    // for the litter child but `[wp>]` (in `sys_write`, post-dispatch) does
+    // not, the child is wedged INSIDE `bkl_enter` — the BKL handoff. If this
+    // never prints either, the child was never scheduled again after its
+    // first quantum — a scheduler bug, not a lock one.
+    if nr == 1 && let Some(p) = current_process() && p.tgid != p.pid {
+        serial::puts("[wp0>] pre-bkl thread write task=");
+        serial::put_dec(crate::sched::current_task() as u64);
+        serial::puts("\n");
+    }
     // Ring 3 does not hold the Big Kernel Lock; kernel code does. Taken here,
     // released at the bottom unless this syscall is the one that leaves ring 3
     // for good — that path returns into kernel code (`run_process`) which
     // expects to hold it.
     crate::smp::bkl_enter();
+    // THREAD-WRITE TRACE stage 1: past bkl_enter. Never printed while [wp0>]
+    // did ⇒ wedged inside bkl_enter itself.
+    if nr == 1 && let Some(p) = current_process() && p.tgid != p.pid {
+        serial::puts("[wp1>] post-bkl task=");
+        serial::put_dec(crate::sched::current_task() as u64);
+        serial::puts("\n");
+    }
     // BKL-hold attribution (the AArch64 glue does this at every kernel entry;
     // amd64 never had it, so every `[BKL] stuck` line on the metal read
     // `tag=511` and named nothing — the profiler was on, the announcement
@@ -2520,6 +2537,25 @@ fn owns_non_console_channel() -> bool {
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
 
+    // THREAD-WRITE TRACE (temporary, 2026-09-20): the litter raft child dies
+    // inside its first write(2) while the same write from the process leader
+    // is fine (RAFT_STAGE=1 forever, userspace/amd64/writeprobe passes). A
+    // write from a *thread* of a process — tid != tgid, i.e. this process's
+    // own registered Process is not the leader's — announces itself here, so
+    // dmesg shows whether the child's write ever reaches dispatch and what
+    // happens next. Remove once the never-runs thread is understood.
+    if let Some(p) = current_process() {
+        if p.tgid != p.pid {
+            serial::puts("[wp>] thread write task=");
+            serial::put_dec(crate::sched::current_task() as u64);
+            serial::puts(" fd=");
+            serial::put_dec(fd);
+            serial::puts(" len=");
+            serial::put_dec(len);
+            serial::puts("\n");
+        }
+    }
+
     // See the header: first, and by both spellings — **unless this process's
     // stdout belongs to a channel of its own**, which is what an `ssh` session's
     // child has had since its stdio stopped being pipes (2026-09-11). Its fd 1
@@ -2541,7 +2577,15 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         if let Some(e) = crate::fd::write_mode_refusal(fd) {
             return e;
         }
-        return akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize);
+        let r = akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize);
+        if let Some(p) = current_process() {
+            if p.tgid != p.pid {
+                serial::puts("[wp>] thread write returned ");
+                serial::put_dec(r);
+                serial::puts("\n");
+            }
+        }
+        return r;
     }
     // An unbound 1 or 2, or a bound `Stdout`/`Stderr`: the console, full stop.
     if len > MAX_WRITE {

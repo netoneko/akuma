@@ -152,6 +152,19 @@ thread reports.
 
 ## 7. Next
 
+> **2026-09-20 status, end of session.** Item 1 is done and answered:
+> reproduces on bare metal (this doc's "bare metal does not reproduce" was
+> wrong), localized to the first `write(2)` from the spawned thread —
+> [`AMD64_SPAWNED_THREAD_NEVER_RUNS.md`](AMD64_SPAWNED_THREAD_NEVER_RUNS.md)
+> §0. Meanwhile the trashcan side is **operational degraded**: sherlock serves
+> its litter from the main loop (serve-as-you-wait hook), replies land in
+> shared history, and its provider is the external `yard` backend
+> (`192.168.1.203:8081`), not the on-box llama-server (removed — it wedged the
+> box and stalled all slots). Cross-litter relay is still down because the
+> raft thread is the thing that never survives its first write. Item 2 (the
+> unbounded probe connect) is still open. This session also established the
+> backends should not run on the same box as the swarm in the first place.
+
 1. Narrow the spawned thread with a staged counter (that document's §6), then
    vary the guest's vCPU count — bare metal with four cores does not reproduce
    it.

@@ -677,6 +677,20 @@ impl KernelLock {
             }
             spins = spins.wrapping_add(1);
             total_spins = total_spins.wrapping_add(1);
+            // WAIT-STATE SAMPLE: only after a FULL SECOND of spinning (2^20
+            // spins), power-of-two steps — a waiter that is merely contended
+            // never prints, so the console bandwidth survives. The 2026-09-20
+            // lesson: an unconditional print here flood-wedged the box (every
+            // uncontended acquire passes the wait loop's first iteration).
+            if total_spins >= 1_048_576 && total_spins.is_power_of_two() {
+                akuma_primitives::console::print_args_if_registered::<128>(format_args!(
+                    "[bkls>] core={} ticket={} serving={} owner={} spins={}\n",
+                    me, my_ticket,
+                    self.now_serving.load(Ordering::Acquire),
+                    self.owner.load(Ordering::Relaxed),
+                    total_spins
+                ));
+            }
             if spins == SPIN_WARN_THRESHOLD {
                 spins = 0;
                 log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);

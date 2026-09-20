@@ -1,12 +1,49 @@
 # meow's spawned thread starts and never runs — Firecracker guest, amd64
 
-**Status: OPEN, narrowed to a few instructions.** Found 2026-09-20 on the Ryzen
-Firecracker guest (Akuma/amd64, 1 vCPU) while chasing a litter hub that accepted
-TCP connections and answered none of them. **This document was first written
-around a different theory — "only the first write per iteration lands" — and
-that theory was an artefact of my own instrumentation being in the wrong
-function. §5 keeps the mistake, because it cost four rounds and would cost them
-again.**
+**Status: OPEN, but §6's measurement is done and it answered.** Found
+2026-09-20 on the Ryzen Firecracker guest (Akuma/amd64, 1 vCPU) while chasing a
+litter hub that accepted TCP connections and answered none of them. **This
+document was first written around a different theory — "only the first write
+per iteration lands" — and that theory was an artefact of my own
+instrumentation being in the wrong function. §5 keeps the mistake, because it
+cost four rounds and would cost them again.**
+
+## 0. 2026-09-20 (later): localized to the first `write(2)`; reproduces on
+## bare metal; the litter works degraded around it
+
+The §6 plan was executed, and the same-day bare-metal run turned "narrowed to a
+few instructions" into "narrowed to one syscall":
+
+- **`RAFT_STAGE` instrumentation** (four atomics: 1 = entered `raft_entry`,
+  2 = survived the first log write, 3 = `RAFT_CTX` loaded, 4 = entered the
+  loop, reported by the main thread's tick log) reads **`stage=1` forever, on
+  the trashcan** — 4 bare-metal cores, no hypervisor. §3's "specific to this
+  guest" was wrong; it reproduces on bare metal. The child sets `RAFT_ALIVE`
+  (its first store) and never survives its first `raft_logf!` — a plain
+  `write(2)` to an already-open fd. **Working hypothesis: a second amd64
+  kernel bug — `write(2)` from a `clone`-spawned thread fails or kills the
+  thread.** Same-day earlier boot logs show the identical signature (`alive=true`,
+  zero ticks, no child log lines), so it was never guest-specific.
+- **The main-thread wedge had a different cause and is fixed.** Earlier the
+  same day the *main* loop also stopped ticking; that turned out to be the
+  **non-`linux-net` build's Akuma-custom syscall path** — `meow` built for
+  `x86_64-unknown-none` with `RESOLVE_HOST`/`UPTIME` wedged where the
+  `linux-net` build (standard Linux socket/clock syscalls, now in
+  `default` features) runs fine on the same kernel. The agent loop ticks
+  normally under the linux-net build.
+- **The litter now works degraded, single-threaded**, via three mitigations in
+  `userspace/meow` (all landed 2026-09-20): the leader registers a **drain
+  hook** so hub client calls *serve as they wait* (`serve::deadline`'s
+  `IO_POLL_HOOK` — without it every tool call inside an LLM turn deadlocked on
+  its own 5 s deadline, and refused connects hit a full smoltcp backlog); a
+  **2048-token cap** on live turns (a reasoning model burned 16384 tokens of
+  unrendered `reasoning_content` = 17 minutes of main-thread deafness); and a
+  **120 s stream-stall deadline** in the HTTP client. End-to-end verified on
+  the trashcan: send → wake → turn → `SendMessage` → shared history →
+  `litter observe`. What still does NOT work: raft relay/probes (dead child),
+  so **cross-litter relay is down** until the child survives.
+- The doc's own §2 claim "the hub then answers nobody" is now only true
+  *during* a turn; between turns the main loop drains every tick.
 
 ## 1. What is actually happening
 
