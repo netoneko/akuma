@@ -891,13 +891,28 @@ impl<'a> HttpStreamTls<'a> {
         );
         self.tls.write_all(header.as_bytes())?;
 
+        // Send exactly `content_length` bytes, and fail loudly if the body
+        // runs short. Breaking on any non-positive read treated an error the
+        // same as EOF, which sends a truncated body under a correct
+        // Content-Length — the server then sees well-framed, incomplete
+        // JSON and answers 500. A request we cannot finish is better
+        // reported here than diagnosed from the far end's parse error.
         let mut buf = [0u8; 8192];
-        loop {
+        let mut sent = 0usize;
+        while sent < content_length {
             let n = libakuma::read_fd(body_fd, &mut buf);
-            if n <= 0 {
-                break;
+            if n < 0 {
+                return Err(Error::IoError);
             }
-            self.tls.write_all(&buf[..n as usize])?;
+            if n == 0 {
+                break; // genuine EOF
+            }
+            let n = n as usize;
+            self.tls.write_all(&buf[..n])?;
+            sent += n;
+        }
+        if sent != content_length {
+            return Err(Error::IoError);
         }
         self.tls.flush()?;
         Ok(())
