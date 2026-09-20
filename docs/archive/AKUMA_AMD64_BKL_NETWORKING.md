@@ -5,6 +5,60 @@ Stability grade: **B** for §6 below (live-reproduced on the trashcan,
 doc (§1-5 remain the original static audit, unconfirmed by a runtime
 measurement).
 
+## 2026-09-20 (evening): the starvation mechanism measured, with lock-internal
+## numbers
+
+The `meow` litter's raft thread (see
+[`AMD64_SPAWNED_THREAD_NEVER_RUNS.md`](AMD64_SPAWNED_THREAD_NEVER_RUNS.md) §0)
+gave this doc's family a live specimen: a userspace thread that starves for
+the kernel for its whole life, on bare metal, reproducibly per boot. The
+`[bkls>]` wait-state sampler (temporary instrumentation in
+`akuma-bkl`'s `KernelLock::acquire`, printing `(core, ticket, serving, owner,
+spins)` after 2^20 spins, power-of-two steps) named the shape:
+
+```
+[bkls>] core=2 ticket=1059743 serving=1059742 owner=1 spins=2097152
+[bkls>] core=4 ticket=1059745 serving=1059742 owner=1 spins=4194304
+[bkls>] core=3 ticket=1059744 serving=1059742 owner=1 spins=16777216
+[BKL] stuck: owner=1 waiter=4 tag=501
+net: netpoll daemon entered … netprobe enabled
+suite: guest microseconds elapsed 21888253
+```
+
+**Core 1 (BSP) holds the BKL for the whole boot self-test suite and
+netprobe/netpoll bring-up — 21.9 seconds measured — while cores 2-4 spin
+IRQs-off on tickets 743/744/745.** `serving` frozen at 742 under `owner=1`:
+the lost-ticket self-heal correctly does not fire (the lock is owned, not
+leaked), so there is **no recovery path for "the owner is alive but
+monopolizing"** — and `backstop releases: 0` says none ever ran. `tag=501`
+(`HOLD_TAG_IRQ`) because the hold was entered from tick/self-test context and
+no syscall re-tagged the core: the holder's attribution is a 22-second-old
+stale stamp.
+
+Consequences, all measured the same day:
+
+- The `tag=501` stuck storms chronic from startup are this monopoly plus its
+  netpoll/probe successors — long kernel stretches on one core with the BKL
+  held, other cores ticket-starving in 10M-spin (`SPIN_WARN_THRESHOLD`) beats.
+- A userspace thread woken during a hold has **no core that can run it**:
+  cores 2-4 are spinning with interrupts off, core 1 is in the hold. Whether
+  the raft child starves before its first syscall entry or inside
+  `bkl_enter` is decided by where in the race it was born — both were
+  observed (`[wp0>]` counts 1 vs 0 across boots), one root.
+
+**Fix direction (OPEN):** amd64 needs the Phase-7 carve-out discipline its
+AArch64 sibling got — no kernel stretch may hold the BKL across more than a
+few milliseconds. The primitives exist (`bkl_drop_window`,
+`bkl_run_unlocked`); the boot suite, netprobe and the netpoll loop need
+periodic drops, and the chronic holds need a bounded-hold assertion so the
+next 22-second monopoly fails a test instead of starving a litter.
+
+Methodology notes for the next person: an unconditional print inside
+`acquire`'s wait loop flood-wedged the box (every uncontended acquire passes
+the loop's first iteration — the fast path only skips reentrant ones); sample
+only after ≥2^20 spins. And `meow`'s litter meanwhile serves degraded from
+its main loop — see the thread-runs doc §0 for the serve-as-you-wait hook.
+
 ## 2026-09-20 (later): fix validated live; a second, separate wedge suspect
 ## opened the same day
 
