@@ -51,6 +51,7 @@ pub mod link;
 pub mod mdio;
 pub mod regs;
 pub mod ring;
+pub mod stall;
 
 #[cfg(any(test, feature = "model"))]
 pub mod model;

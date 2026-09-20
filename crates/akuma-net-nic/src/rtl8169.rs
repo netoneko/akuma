@@ -32,6 +32,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 
 use akuma_net_rtl8169::desc::Desc;
 use akuma_net_rtl8169::ring::RX_BUF_SIZE;
+use akuma_net_rtl8169::stall::{self, StallArm};
 use akuma_net_rtl8169::{Nic, Regs, Rings};
 use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
@@ -317,6 +318,51 @@ const LINK_SAMPLE_LAPS: u32 = 1024;
 /// (~20 s at [`STALL_QUIET_US`]) before the expensive one is tried.
 const BLIND_REINIT_EVERY: u32 = 4;
 
+/// How long a receiver that **has** produced frames may stay silent before it
+/// is treated as stalled.
+///
+/// This is the horizon for the case with no other evidence at all, and the one
+/// that had no arm until 2026-09-20: frames arrived, the receiver stopped, and
+/// the chip stayed quiet — `rx_seen` had retired [`StallArm::Blind`] for the
+/// boot, and a receiver taking nothing off the wire can never raise `RDU`
+/// again, so [`StallArm::Backpressure`] could not arm either. The box sat deaf
+/// with `kicks=0` and every recovery in this file intact and unreachable.
+///
+/// Ten seconds. The number is a judgement about *this LAN*, and the crate's own
+/// bring-up note is what sets it: broadcast traffic alone climbs the receive
+/// counter within seconds on any real network, so ten seconds of total silence
+/// is already a fault rather than a quiet moment. It was a minute for one
+/// build and that was too generous — the box is off the network for every
+/// second of the window, and the escalation to a full re-init is four windows
+/// further out again.
+///
+/// Still twice [`STALL_QUIET_US`], because this arm has no evidence beyond the
+/// passage of time while that one has the chip's own `RDU` report. Being wrong
+/// costs one restarted receiver — a frame the chip has written and the driver
+/// has not yet read — so the floor is "long enough that a working LAN always
+/// beats it", not "as short as possible".
+const STALL_SILENT_US: u64 = 10_000_000;
+
+/// Silence between *subsequent* [`StallArm::Silent`] firings.
+///
+/// Slow to first accuse a quiet link of being broken, quick to retry once it
+/// has proved itself pathological. Without the asymmetry the recovery cadence
+/// would be the accusation threshold, and the escalation to a full re-init
+/// (every [`BLIND_REINIT_EVERY`] attempts) would land four minutes after the
+/// first one — on a box that is off the network for every second of it.
+const STALL_SILENT_RETRY_US: u64 = STALL_QUIET_US;
+
+/// The horizons above, as the shape [`stall::decide`] takes. The numbers stay
+/// here because they are statements about this poll loop and this link; the
+/// *order* the arms are tested in lives in the crate, where it has tests.
+const STALL_POLICY: stall::StallPolicy = stall::StallPolicy {
+    quiet_us: STALL_QUIET_US,
+    silent_us: STALL_SILENT_US,
+    silent_retry_us: STALL_SILENT_RETRY_US,
+    laps_unstarted: STALL_LAPS_UNSTARTED,
+    laps: STALL_LAPS,
+};
+
 
 pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
@@ -365,6 +411,11 @@ pub struct Rtl8169Device {
     /// How many recoveries the "nothing has ever arrived" suspicion has spent.
     /// Counted for the console line, never used as a limit.
     blind_kicks: u32,
+    /// How many times the [`StallArm::Silent`] arm has fired. Separate from
+    /// [`Self::blind_kicks`] so the two recoveries stay tellable apart in a log
+    /// and escalate independently — attribution between arms has already cost a
+    /// session's worth of uncertainty once.
+    silent_kicks: u32,
     /// The copy-out receive path's target, handed up to smoltcp as an
     /// `RxToken`. smoltcp may build a reply through a `TxToken` **while that
     /// token is live**, so the transmit path stages in `tx_scratch` instead.
@@ -405,6 +456,7 @@ impl Rtl8169Device {
             link_up: l.up,
             rx_seen: false,
             blind_kicks: 0,
+            silent_kicks: 0,
             rx_scratch: [0; BUF_LEN],
             tx_scratch: [0; BUF_LEN],
         })
@@ -669,86 +721,87 @@ impl Rtl8169Device {
             // Wall-clock first, lap count only as the pre-clock fallback. The
             // two must not both be able to fire, or a bring-up spin would kick
             // on laps while the clock says receive is healthy.
-            let quiet = match (now_us(), self.last_rx_us) {
-                (Some(now), Some(last)) => now.saturating_sub(last) >= STALL_QUIET_US,
+            let silent_us = match (now_us(), self.last_rx_us) {
+                (Some(now), Some(last)) => Some(now.saturating_sub(last)),
                 (Some(now), None) => {
                     // Clock up but nothing received yet: start the window here
                     // rather than at boot, so a late-arriving link does not
                     // count its own bring-up as silence.
                     self.last_rx_us = Some(now);
-                    false
+                    Some(0)
                 }
-                // Before the clock seam exists, the lap count is all there is
-                // — and [`STALL_LAPS`] is two million, which is only quick
-                // while the loop is busy-spinning through bring-up. The two
-                // boots that recovered on 2026-09-20 both did so on this arm
-                // during exactly that spin; a boot whose loop settles to one
-                // lap per tick first would wait tens of minutes instead.
-                //
-                // So while **nothing has ever arrived**, use a far smaller
-                // threshold. The expensive judgement the big number protects —
-                // "is this link idle or broken?" — does not apply yet: a
-                // receiver that has produced nothing at all since bring-up is
-                // not idle, it has never started.
-                (None, _) if !self.rx_seen => self.idle_laps >= STALL_LAPS_UNSTARTED,
-                (None, _) => self.idle_laps >= STALL_LAPS,
+                // No clock yet, so there is no silence to measure and
+                // `decide` falls back to `idle_laps` — which is why the lap
+                // count travels with it. That fallback is why [`STALL_LAPS`]
+                // and [`STALL_LAPS_UNSTARTED`] are two orders of magnitude
+                // apart: two million laps is quick only while the loop is
+                // busy-spinning through bring-up (the two boots that recovered
+                // on 2026-09-20 both did so during exactly that spin), and a
+                // loop that has settled to one lap per tick would wait hours.
+                (None, _) => None,
             };
-            // Quiet **and** the chip complaining. Either alone is normal.
+            // Which arm fires, and in what order, is `akuma_net_rtl8169::stall`
+            // — it has host tests, including one for each conflict, because a
+            // test that sets one condition at a time passes under every
+            // ordering. What stays here are the three rules that constrain
+            // *this loop* rather than the decision:
             //
-            // The evidence is [`Self::rx_backpressure`], set from the `RDU` bit
-            // of the `ISR` this loop **already** harvests every lap, so it costs
-            // nothing. `MPC` would be the other half of it, and reading it here
-            // is what took the box down twice on 2026-09-19: `snapshot()` is
-            // eleven MMIO reads, and there is no "occasionally" on this path.
-            // Gating it behind `quiet` looked like it fixed that and did not —
-            // `quiet` is true on **every** lap once the window passes, and
-            // nothing clears it while there is no backpressure, so the reads
-            // came back permanently five seconds after boot. An idle link is
-            // the normal state of this machine.
-            //
-            // So: no register reads here at all. `RDU` alone is a sound stall
-            // signal — it is precisely "the ring ran dry with a frame waiting",
-            // which is the thing being detected. See
+            // **No register reads on this path.** The inputs are `rx_seen`, the
+            // `RDU` bit of the `ISR` the loop already harvests every lap, and a
+            // clock — all free. `MPC` would be better evidence and reading it
+            // here took the box down twice on 2026-09-19: `snapshot()` is
+            // eleven MMIO reads and there is no "occasionally" on a per-lap
+            // path. Gating it behind the quiet window looked like a fix and was
+            // not — the window is open on *every* lap once it passes, so the
+            // reads came back permanently five seconds after boot. See
             // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §7b and
             // `AKUMA_NET_ISSUES.md` §11.7.
-            // `RDU` is the evidence-backed arm: the ring ran dry with a frame
-            // waiting. It cannot fire when the receiver never started, because
-            // a chip that is taking nothing off the wire has nothing to report
-            // — so the recovery for a gated receiver was unreachable in exactly
-            // the case it exists for. `blind` is the second arm: carrier is up,
-            // the window has passed, and **not one frame has ever arrived**.
-            // On any real LAN that is already wrong; the crate's own bring-up
-            // note is that broadcast traffic alone climbs the counter within
-            // seconds.
             //
-            // **Not capped**, for the same reason the `RDU` arm is not: this is
-            // what keeps the machine on the network, and a receiver that has
-            // never started still needs starting. It was capped at three for
-            // one boot on 2026-09-20 and that was wrong — one boot recovered on
-            // the first kick and the next did not recover at all, and a cap
-            // makes "the recovery does not work" indistinguishable from "the
-            // recovery was allowed three tries". On this box the difference is
-            // a person walking to the machine. Retry cadence is
-            // [`STALL_QUIET_US`], because `on_stall` restarts that window;
-            // printing is capped by [`MAX_STALL_REPORTS`], which is how this
-            // file already makes that trade.
-            // **Not** gated on `link_up`. It was, for one boot on 2026-09-20,
-            // and that is what made the whole arm unreachable: the carrier
-            // reading comes from a periodic `PHYSTATUS` sample, and on this box
-            // no boot has ever printed the `link up: re-armed receiver` line
-            // that a `down -> up` edge produces — so there is no evidence the
-            // sample reads `up` here at all. Gating a receive recovery on the
-            // PHY means trusting the one register whose report is in question,
-            // and a boot where it reads `down` can then never recover.
+            // **The recovery is never capped**, only its printing
+            // ([`MAX_STALL_REPORTS`]). It is what keeps the machine on the
+            // network, and a chip that needs restarting every minute still
+            // needs restarting. It was capped at three for one boot on
+            // 2026-09-20 and that was wrong: one boot recovered on the first
+            // kick and the next did not recover at all, and a cap makes "the
+            // recovery does not work" indistinguishable from "the recovery was
+            // allowed three tries". On this box the difference is a person
+            // walking to the machine.
             //
-            // `!rx_seen` is the whole condition it needs, and it is a stronger
-            // statement than carrier: not one frame since bring-up. A link that
-            // really is down loses nothing by having its ring cursor reset.
-            let blind = !self.rx_seen;
-            let stalled = quiet && (self.rx_backpressure || blind);
-            if stalled {
-                if blind && !self.rx_backpressure {
-                    self.blind_kicks += 1;
+            // **Not gated on `link_up`.** It was, for one boot on 2026-09-20,
+            // and that made the whole thing unreachable: carrier comes from a
+            // periodic `PHYSTATUS` sample, and no boot on this box has ever
+            // printed the `link up: re-armed receiver` line a `down -> up` edge
+            // produces, so there is no evidence the sample reads `up` here at
+            // all. Gating a receive recovery on the PHY means trusting the one
+            // register whose report is in question. A link that really is down
+            // loses nothing by having its ring cursor reset.
+            let arm = stall::decide(
+                &STALL_POLICY,
+                &stall::StallInputs {
+                    rx_seen: self.rx_seen,
+                    backpressure: self.rx_backpressure,
+                    silent_us,
+                    idle_laps: self.idle_laps,
+                    silent_fired: self.silent_kicks > 0,
+                },
+            );
+            if arm != StallArm::None {
+                match arm {
+                    StallArm::Blind => self.blind_kicks += 1,
+                    StallArm::Silent => self.silent_kicks += 1,
+                    _ => {}
+                }
+                // Its own line, once: a `Silent` recovery and an `RDU` one are
+                // different faults with the same repair, and a log that cannot
+                // tell them apart is what made this arm take a whole session to
+                // find. `on_stall` below prints the shared detail.
+                if arm == StallArm::Silent && self.silent_kicks == 1 {
+                    crate::safe_print!(
+                        120,
+                        "[rtl] SILENT: no frame for {} us with no RDU (rx={} frames) - receiver stopped\n",
+                        STALL_SILENT_US,
+                        C.rx_frames_received.load(Ordering::Relaxed)
+                    );
                 }
                 self.stalls += 1;
                 self.idle_laps = 0;
@@ -772,12 +825,30 @@ impl Rtl8169Device {
                 // It prints its own line so the two recoveries stay tellable
                 // apart in a log — attribution between the `RDU` arm and this
                 // one already cost a session's worth of uncertainty.
-                if blind && !self.rx_backpressure && self.blind_kicks.is_multiple_of(BLIND_REINIT_EVERY) {
+                //
+                // `Silent` escalates on the same ladder and for the same
+                // reason: it also means nothing is arriving, so there is
+                // nothing in flight to throw away.
+                let (escalate, which, n) = match arm {
+                    StallArm::Blind => (
+                        self.blind_kicks.is_multiple_of(BLIND_REINIT_EVERY),
+                        "blind",
+                        self.blind_kicks,
+                    ),
+                    StallArm::Silent => (
+                        self.silent_kicks.is_multiple_of(BLIND_REINIT_EVERY),
+                        "silent",
+                        self.silent_kicks,
+                    ),
+                    _ => (false, "", 0),
+                };
+                if escalate {
                     let r = self.nic.init();
                     crate::safe_print!(
                         104,
-                        "[rtl] blind #{}: full re-init -> {}\n",
-                        self.blind_kicks,
+                        "[rtl] {} #{}: full re-init -> {}\n",
+                        which,
+                        n,
                         if r.is_ok() { "ok" } else { "FAILED" }
                     );
                 }
