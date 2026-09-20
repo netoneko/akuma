@@ -288,6 +288,16 @@ const MAX_STALL_REPORTS: u32 = 5;
 /// How many receive laps between PHY samples. See [`Rtl8169Device::take_rx_frame`].
 const LINK_SAMPLE_LAPS: u32 = 1024;
 
+/// How many times the recovery may fire on suspicion alone — that is, because
+/// **no frame has ever arrived**, rather than because the chip reported `RDU`.
+///
+/// Bounded, and the bound is the point. `RDU`-driven kicks are evidence-backed
+/// and uncapped (a chip that needs restarting every few seconds still needs
+/// restarting); this path has no evidence beyond silence, so on the one link
+/// that is genuinely up and genuinely idle it must stop rather than reset the
+/// ring cursor forever.
+const MAX_BLIND_KICKS: u32 = 3;
+
 pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
     /// Lap counter for the periodic PHY sample.
@@ -319,6 +329,22 @@ pub struct Rtl8169Device {
     /// screen nobody can read — and the recovery attempt is capped at
     /// [`MAX_KICKS`] so a chip that will not restart cannot bury the log.
     stalls: u32,
+    /// What the last PHY sample said about carrier.
+    ///
+    /// Kept so the periodic sample can see a **down -> up edge**, which is the
+    /// one moment this chip needs the receiver re-armed: `init` clears
+    /// `MISC_RXDV_GATED` once, before the link is up, and the hardware can
+    /// re-gate across the transition. Nothing else re-clears it.
+    link_up: bool,
+    /// Has a single frame ever come off the ring since bring-up?
+    ///
+    /// Deliberately separate from [`Self::last_rx_us`], which the stall watch
+    /// sets to "now" the first time it sees a clock so that bring-up silence is
+    /// not counted against the chip — so it cannot answer this question.
+    rx_seen: bool,
+    /// Recoveries spent on the "nothing has ever arrived" suspicion. Capped at
+    /// [`MAX_BLIND_KICKS`].
+    blind_kicks: u32,
     /// The copy-out receive path's target, handed up to smoltcp as an
     /// `RxToken`. smoltcp may build a reply through a `TxToken` **while that
     /// token is live**, so the transmit path stages in `tx_scratch` instead.
@@ -356,6 +382,9 @@ impl Rtl8169Device {
             last_rx_us: None,
             rx_backpressure: false,
             stalls: 0,
+            link_up: l.up,
+            rx_seen: false,
+            blind_kicks: 0,
             rx_scratch: [0; BUF_LEN],
             tx_scratch: [0; BUF_LEN],
         })
@@ -502,6 +531,31 @@ impl Rtl8169Device {
                 akuma_net_rtl8169::Speed::Unknown => 0,
             };
             crate::counters::set_link_state(l.up, mbit, l.full_duplex);
+
+            // A **down -> up edge** re-arms the receiver, and nothing else
+            // does. `init` clears `MISC_RXDV_GATED` exactly once, and it runs
+            // before the link is up: measured on the HP box 2026-09-20, this
+            // part negotiates ~3 s after the PHY is touched (Ubuntu's own
+            // `r8169` log: `Link is Down` 63.806 s -> `Link is Up - 1Gbps/Full`
+            // 66.736 s), while Akuma reaches `init` far sooner. The hardware
+            // can re-gate RXDV across that transition, and the result is a
+            // receiver that is off for the rest of the boot while transmit
+            // carries on — which is invisible from this side and reads exactly
+            // like a dead LAN.
+            //
+            // One MMIO burst, on the edge only. The per-lap register reads that
+            // this path must never regain are what took the box down twice on
+            // 2026-09-19 (`AMD64_TRASHCAN_ISSUES.md` §7b).
+            if l.up && !self.link_up {
+                let (before, after) = self.nic.kick_receiver();
+                crate::safe_print!(
+                    120,
+                    "[rtl] link up: re-armed receiver (misc 0x{:08x} -> 0x{:08x}, gate was {})\n",
+                    before, after,
+                    if before & akuma_net_rtl8169::regs::MISC_RXDV_GATED != 0 { "SET" } else { "clear" }
+                );
+            }
+            self.link_up = l.up;
         }
 
         // Stall watch. Receive dying at a ring boundary with no error bit set
@@ -541,8 +595,21 @@ impl Rtl8169Device {
             // which is the thing being detected. See
             // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §7b and
             // `AKUMA_NET_ISSUES.md` §11.7.
-            let stalled = quiet && self.rx_backpressure;
+            // `RDU` is the evidence-backed arm: the ring ran dry with a frame
+            // waiting. It cannot fire when the receiver never started, because
+            // a chip that is taking nothing off the wire has nothing to report
+            // — so the recovery for a gated receiver was unreachable in exactly
+            // the case it exists for. `blind` is the second arm: carrier is up,
+            // the window has passed, and **not one frame has ever arrived**.
+            // On any real LAN that is already wrong; the crate's own bring-up
+            // note is that broadcast traffic alone climbs the counter within
+            // seconds. Capped, because silence is suspicion and not evidence.
+            let blind = !self.rx_seen && self.link_up && self.blind_kicks < MAX_BLIND_KICKS;
+            let stalled = quiet && (self.rx_backpressure || blind);
             if stalled {
+                if blind && !self.rx_backpressure {
+                    self.blind_kicks += 1;
+                }
                 self.stalls += 1;
                 self.idle_laps = 0;
                 self.last_rx_us = now_us();
@@ -555,6 +622,9 @@ impl Rtl8169Device {
         // A frame came off the ring, so whatever backpressure the chip reported
         // has been relieved; the next stall must produce its own evidence.
         self.rx_backpressure = false;
+        // ...and the receiver has demonstrably started, which retires the
+        // `blind` arm for the rest of the boot.
+        self.rx_seen = true;
         // Only reached when a frame really came off the ring, so this counts
         // wire arrivals. The virtio path bumps the same counter in `device.rs`;
         // until 2026-09-05 this one bumped nothing, so `rx_counters()` read a
