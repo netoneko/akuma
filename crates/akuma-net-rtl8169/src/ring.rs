@@ -65,6 +65,19 @@ impl RxRing {
         self.next = (self.next + 1) & (self.len - 1);
     }
 
+    /// Point the cursor at `i`, without consuming or re-posting anything.
+    ///
+    /// For **re-synchronising** with a chip that has restarted: the receiver
+    /// latches `RDSAR` and resumes from the ring base whenever it is stopped
+    /// and started, so a restart the driver did not perform leaves the chip at
+    /// slot 0 and the cursor wherever it had got to. Every other cursor move
+    /// goes through [`Self::advance`], which is a *consumption*; this one
+    /// asserts nothing about the descriptor it lands on and is the only way to
+    /// move the cursor backwards.
+    pub const fn seek(&mut self, i: usize) {
+        self.next = i & (self.len - 1);
+    }
+
     /// Whether index `i` is the last entry, and so must carry [`desc::EOR`].
     #[must_use]
     pub const fn is_last(&self, i: usize) -> bool {

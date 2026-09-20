@@ -252,6 +252,54 @@ impl<R: Regs, M: Rings> Nic<R, M> {
         None
     }
 
+    /// Which receive descriptor the driver will inspect next.
+    ///
+    /// Exposed because the cursor's disagreement with the chip *is* the fault
+    /// this driver has to detect; a number the tests cannot read is a number
+    /// the tests cannot assert about.
+    #[must_use]
+    pub const fn rx_cursor(&self) -> usize {
+        self.rx.cursor()
+    }
+
+    /// Move the receive cursor to the oldest descriptor the chip has completed,
+    /// **without disturbing a single descriptor**. Returns the index if it
+    /// moved.
+    ///
+    /// [`Self::receive`] gives up the moment the descriptor under the cursor is
+    /// chip-owned, which is correct while the two agree and is a permanent
+    /// stall once they do not: measured on the HP box 2026-09-20, the cursor
+    /// sat at 15 while a complete 154-byte frame waited at slot 0, and every
+    /// lap for the rest of the boot asked slot 15 the same question.
+    ///
+    /// Why a scan is safe when advancing is not. `advance` is a *consumption* —
+    /// it re-posts the descriptor it leaves, so walking it past a chip-owned
+    /// slot would hand the chip back a buffer it is about to write into and
+    /// break lockstep in the other direction. This reads and moves nothing but
+    /// the cursor, and it only ever lands on a descriptor the chip has already
+    /// finished with, where `OWN=0` means exactly one thing: an unconsumed
+    /// frame (the driver re-posts on consumption, so it can never mean a stale
+    /// one).
+    ///
+    /// Cheaper than [`Self::kick_receiver`], and strictly better where it
+    /// works: no MMIO, no stopping the receiver, and nothing in flight is lost
+    /// across it. It is not a substitute for the kick when the chip's receiver
+    /// is genuinely wedged — it only repairs the *disagreement*.
+    pub fn resync_rx_cursor(&mut self) -> Option<usize> {
+        let len = self.rx.len();
+        let start = self.rx.cursor();
+        // From cursor+1 forward, so the slot the chip filled first after
+        // wrapping is the one found first — ring order is FIFO order.
+        for step in 1..len {
+            let i = (start + step) & (len - 1);
+            if !self.mem.rx_desc(i).owned_by_chip() {
+                self.rx.seek(i);
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Hand back every transmit descriptor the chip has finished with.
     ///
     /// Returns how many were reclaimed.

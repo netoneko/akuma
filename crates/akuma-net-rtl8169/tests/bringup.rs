@@ -349,3 +349,53 @@ fn misconfigured_rings_are_refused() {
         _ => panic!("wrong variant"),
     }
 }
+
+/// The 2026-09-20 bare-metal fault, reproduced: the chip restarts and resumes
+/// from the ring base while the driver's cursor stays where it was, so
+/// `receive` asks a slot the chip will not fill next and a completed frame
+/// waits forever one wrap away.
+#[test]
+fn a_restarted_receiver_desyncs_the_cursor_and_resync_repairs_it() {
+    let chip = FakeChip::new();
+    let mut nic = Nic::probe(chip.port(), chip.port()).unwrap();
+    nic.init().unwrap();
+
+    // Consume a few frames so the cursor is no longer at the ring base.
+    let mut buf = [0u8; MAX_FRAME];
+    for _ in 0..RX_LEN - 1 {
+        assert!(chip.deliver(&[0xAA; MIN_FRAME]));
+        assert!(nic.receive(&mut buf).is_some());
+    }
+    assert_eq!(nic.rx_cursor(), RX_LEN - 1, "cursor should have walked");
+
+    // The chip restarts and rewinds; the driver is not told.
+    chip.restart_receiver();
+    assert!(chip.deliver(&[0xBB; MIN_FRAME]), "chip writes the ring base");
+
+    // This is the stall: a frame is present, and `receive` cannot see it
+    // because it only ever looks under the cursor.
+    assert!(
+        nic.receive(&mut buf).is_none(),
+        "the desync must actually hide the frame, or this test proves nothing"
+    );
+
+    // The repair moves the cursor and nothing else.
+    assert_eq!(nic.resync_rx_cursor(), Some(0));
+    let n = nic.receive(&mut buf).expect("the waiting frame is now reachable");
+    assert_eq!(&buf[..n], &[0xBB; MIN_FRAME][..n]);
+}
+
+/// The safety property: with every descriptor owned by the chip there is
+/// nothing to repair, and a resync that moved the cursor anyway would break
+/// lockstep in the direction `receive` cannot recover from — it would re-post
+/// buffers the chip is about to write into.
+#[test]
+fn resync_invents_nothing_when_the_ring_is_empty() {
+    let chip = FakeChip::new();
+    let mut nic = Nic::probe(chip.port(), chip.port()).unwrap();
+    nic.init().unwrap();
+
+    let before = nic.rx_cursor();
+    assert_eq!(nic.resync_rx_cursor(), None);
+    assert_eq!(nic.rx_cursor(), before, "the cursor must not move");
+}

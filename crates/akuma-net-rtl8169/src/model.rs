@@ -315,6 +315,25 @@ impl FakeChip {
         true
     }
 
+    /// Restart the receiver, as toggling `CR_RE` does on the real chip.
+    ///
+    /// The chip latches `RDSAR` when the receiver starts, so a restart resumes
+    /// from the **ring base** rather than from wherever it had got to. That is
+    /// not a modelling liberty — it is why
+    /// [`Nic::kick_receiver`](crate::Nic::kick_receiver) resets the driver's
+    /// cursor to 0 in the same breath as restating `RDSAR`.
+    ///
+    /// It matters because anything *else* that restarts the receiver — a link
+    /// transition, the chip's own error recovery — rewinds the chip and leaves
+    /// the driver's cursor where it was, and the two then disagree forever.
+    /// Observed on the HP box 2026-09-20: cursor at 15, a complete frame
+    /// waiting at slot 0, and every lap for the rest of the boot asking slot 15.
+    /// Without this the model cannot produce that state and the repair for it
+    /// cannot be tested.
+    pub fn restart_receiver(&self) {
+        self.state.borrow_mut().rx_cursor = 0;
+    }
+
     /// Frames the model has transmitted.
     pub fn wire(&self) -> core::cell::Ref<'_, Wire> {
         core::cell::Ref::map(self.state.borrow(), |s| &s.wire)

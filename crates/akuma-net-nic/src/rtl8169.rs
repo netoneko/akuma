@@ -254,6 +254,15 @@ impl Rings for Rtl8169Rings {
 /// window before `uptime_us` is available.
 const STALL_LAPS: u32 = 2_000_000;
 
+/// [`STALL_LAPS`], for the case where **no frame has arrived since bring-up**.
+///
+/// Two orders of magnitude smaller, because it is answering a different and
+/// much easier question. `STALL_LAPS` has to avoid calling a quiet link broken;
+/// this one only fires while the receiver has never produced anything, which no
+/// working link on a LAN does for long — broadcast traffic alone climbs the
+/// counter within seconds.
+const STALL_LAPS_UNSTARTED: u32 = 20_000;
+
 /// `uptime_us`, or `None` before the runtime seam is registered (early boot and
 /// host tests). The stall watch measures against this; `None` means fall back
 /// to the lap count, never to a bogus zero.
@@ -423,19 +432,57 @@ impl Rtl8169Device {
         // The full picture once; after that a single line; after
         // `MAX_STALL_REPORTS`, nothing at all — but the kick still happens.
         if self.stalls > 1 {
+            // Cheapest repair first. If the chip and the cursor have merely
+            // drifted apart, moving the cursor costs no MMIO, does not stop
+            // the receiver and loses nothing in flight — so there is no reason
+            // to reach for the kick until it has failed.
+            if let Some(i) = self.nic.resync_rx_cursor() {
+                if self.stalls <= MAX_STALL_REPORTS {
+                    crate::safe_print!(
+                        112,
+                        "[rtl] stall #{}: resync -> cursor {} (frame was waiting)\n",
+                        self.stalls, i
+                    );
+                }
+                return;
+            }
             let s = self.nic.snapshot();
             let (before, after) = self.nic.kick_receiver();
             if self.stalls <= MAX_STALL_REPORTS {
                 crate::safe_print!(
-                    120,
-                    "[rtl] stall #{}: kick misc 0x{:08x} -> 0x{:08x} mpc={} cr=0x{:02x}\n",
-                    self.stalls, before, after, s.mpc, s.cr
+                    128,
+                    "[rtl] stall #{}: kick misc 0x{:08x} -> 0x{:08x} mpc={} cr=0x{:02x} rx={}\n",
+                    self.stalls, before, after, s.mpc, s.cr,
+                    C.rx_frames_received.load(Ordering::Relaxed)
                 );
             }
             return;
         }
         let s = self.nic.snapshot();
-        crate::safe_print!(96, "[rtl] STALL #1 after {} idle laps\n", STALL_LAPS);
+        // `rx=` is the number that decides what this fault *is*, and it was
+        // missing for the whole 2026-09-20 investigation. `OWN=1` in a dump
+        // means both "never filled" and "filled, consumed, re-posted", so a
+        // ring of `OWN=1` descriptors cannot say whether the driver consumed a
+        // ring's worth or nothing at all:
+        //
+        //   rx == 0            -> the cursor advanced without ever consuming;
+        //                         the bug is in bring-up's post/advance.
+        //   rx == ring length  -> the driver consumed a ring's worth and the
+        //                         chip then rewound to the ring base under it;
+        //                         the bug is in whatever restarted the
+        //                         receiver without resynchronising the cursor.
+        //
+        // The second is what `kick_receiver` already assumes — it resets the
+        // cursor precisely because restarting the receiver sends the chip back
+        // to slot 0 — and what this file's own note describes: "`rx` climbed to
+        // exactly 16 — `RING_LEN`, one ring's worth — and then never moved".
+        crate::safe_print!(
+            120,
+            "[rtl] STALL #1 after {} idle laps (rx={} frames, blind_kicks={})\n",
+            STALL_LAPS,
+            C.rx_frames_received.load(Ordering::Relaxed),
+            self.blind_kicks
+        );
         crate::safe_print!(
             128,
             "[rtl] cr=0x{:02x} isr=0x{:04x} imr=0x{:04x} rcr=0x{:08x} mpc={} misc=0x{:08x} rxdv_gated={} cursor={}/{}\n",
@@ -455,6 +502,19 @@ impl Rtl8169Device {
                 "[rtl]  rx[{}] cmdstat=0x{:08x} buf=0x{:08x}{:08x}\n",
                 i, d.cmdstat, d.buf_hi, d.buf_lo
             );
+        }
+
+        // Repair the disagreement before restarting anything. The dump above is
+        // the evidence and has already been printed, so trying this first costs
+        // nothing diagnostically — and where it works it is the better fix,
+        // because `kick_receiver` throws away whatever the chip has in flight.
+        if let Some(i) = self.nic.resync_rx_cursor() {
+            crate::safe_print!(
+                112,
+                "[rtl] resync -> cursor {} (a completed descriptor was waiting)\n",
+                i
+            );
+            return;
         }
 
         // Then try to restart it, and say whether the gate was actually set.
@@ -571,6 +631,19 @@ impl Rtl8169Device {
                     self.last_rx_us = Some(now);
                     false
                 }
+                // Before the clock seam exists, the lap count is all there is
+                // — and [`STALL_LAPS`] is two million, which is only quick
+                // while the loop is busy-spinning through bring-up. The two
+                // boots that recovered on 2026-09-20 both did so on this arm
+                // during exactly that spin; a boot whose loop settles to one
+                // lap per tick first would wait tens of minutes instead.
+                //
+                // So while **nothing has ever arrived**, use a far smaller
+                // threshold. The expensive judgement the big number protects —
+                // "is this link idle or broken?" — does not apply yet: a
+                // receiver that has produced nothing at all since bring-up is
+                // not idle, it has never started.
+                (None, _) if !self.rx_seen => self.idle_laps >= STALL_LAPS_UNSTARTED,
                 (None, _) => self.idle_laps >= STALL_LAPS,
             };
             // Quiet **and** the chip complaining. Either alone is normal.
@@ -612,7 +685,19 @@ impl Rtl8169Device {
             // [`STALL_QUIET_US`], because `on_stall` restarts that window;
             // printing is capped by [`MAX_STALL_REPORTS`], which is how this
             // file already makes that trade.
-            let blind = !self.rx_seen && self.link_up;
+            // **Not** gated on `link_up`. It was, for one boot on 2026-09-20,
+            // and that is what made the whole arm unreachable: the carrier
+            // reading comes from a periodic `PHYSTATUS` sample, and on this box
+            // no boot has ever printed the `link up: re-armed receiver` line
+            // that a `down -> up` edge produces — so there is no evidence the
+            // sample reads `up` here at all. Gating a receive recovery on the
+            // PHY means trusting the one register whose report is in question,
+            // and a boot where it reads `down` can then never recover.
+            //
+            // `!rx_seen` is the whole condition it needs, and it is a stronger
+            // statement than carrier: not one frame since bring-up. A link that
+            // really is down loses nothing by having its ring cursor reset.
+            let blind = !self.rx_seen;
             let stalled = quiet && (self.rx_backpressure || blind);
             if stalled {
                 if blind && !self.rx_backpressure {
