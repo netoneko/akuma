@@ -62,6 +62,53 @@ case where the console is a television being photographed.
 | `rx_desc pa=` vs a stall dump's `rdsar=` | whether the chip is writing where the driver reads. Invisible until catastrophic, and it went unchecked for a whole session |
 | `dry=` climbing, `rx` flat | `RDU` raised and acknowledged and the receiver still not resuming |
 | `link=up/1000M/full` | the PHY, so a carrier theory can be killed in one line |
+| **`kicks=0` with `rx` frozen** | **the stall detector never armed.** Not "the recovery failed" — the recovery never ran. Before the `Silent` arm below this was the normal outcome, and it is why a deaf box stayed deaf until somebody walked to it |
+
+### The `Silent` arm: a receiver that started, then stopped (2026-09-20)
+
+**Symptom.** `rx=` frozen at a small number (16 = `RING_LEN` is the classic),
+`tx=` climbing, `dhcp=pending`, and the box unreachable at **both** `.123` and
+the static `.220`. Ubuntu on the same machine, same cable, same switch, leases
+fine — which is what proves it is the driver and not the network.
+
+**Why it used to be permanent.** The stall watch had two arms and this fault is
+neither:
+
+* `Backpressure` — the chip raised `RDU` ("the ring ran dry with a frame
+  waiting"). A receiver that has *stopped* takes nothing off the wire, so it has
+  nothing to report and can never raise it again.
+* `Blind` — not one frame since bring-up. `on_rx_frame` sets `rx_seen = true`,
+  which retires this arm **for the rest of the boot**, on the first frame.
+
+So a receiver that delivered a few frames and then stopped disarmed both
+detectors on the way, and `kicks=` stayed at `0` while every recovery in the
+file — resync, kick, full re-init — sat intact and unreachable.
+
+**The third arm.** `Silent`: frames arrived, then stopped, and the chip is not
+complaining. Ten seconds of total silence (`STALL_SILENT_US`), then five between
+retries, escalating to a full `init()` every fourth attempt. The decision lives
+in `akuma-net-rtl8169::stall` with host tests — including one per *conflict*,
+because a test that sets one condition at a time passes under every ordering.
+
+**Measured on the box, first boot with the arm (at a 60 s horizon):**
+
+```
+[rtl] SILENT: no frame for 60000000 us with no RDU (rx=16 frames) - receiver stopped
+[probe] rx=357 tx=101 dry=5 kicks=1 ip=192.168.1.123/24 dhcp=leased dns=1.1.1.1 clk=set
+```
+
+One detection, one kick, full recovery, and the lease arrived on its own. The
+horizon is 10 s rather than 60 s because the box is off the network for every
+second of the window — a minute was measurably too generous.
+
+Full record, including the four theories the evidence killed on the way:
+[`../archive/AMD64_RTL8169_SILENT_STALL.md`](../archive/AMD64_RTL8169_SILENT_STALL.md).
+
+**So `kicks=` is the number to read first.** `kicks=0` next to a frozen `rx=`
+means no arm fired and the fault is in the *detection*; `kicks=` climbing with
+`rx=` still flat means detection works and the *recovery* is insufficient, which
+is a different and more interesting problem — go to the stall dump's `rdsar=`
+against the bring-up `rx_desc pa=`.
 
 **It was off by default and that cost a session.** Every `[rtl]` line in the
 driver is gated behind a stall condition that may never arm, so their absence
