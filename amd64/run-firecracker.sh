@@ -8,12 +8,27 @@
 # observable difference is where the boot block lands — QEMU 0x1580,
 # Firecracker 0x6000 — which is why kmain prints that address.
 #
-#   FC_HOST=user@host amd64/run-firecracker.sh
+#   FC_HOST=user@host amd64/run-firecracker.sh                  # kernel + a fresh disk
+#   FC_HOST=user@host FC_KEEP_DISK=1 amd64/run-firecracker.sh   # kernel only
 #
 # Everything it writes lives under one directory on the host (FC_DIR, default
 # ~/akuma), including a standalone `run.sh` so the VM can be re-launched there
 # without this script or the dev machine.
+#
+# **The first form replaces the host's `disk.img`, `akuma-vm.json` and
+# `run.sh`.** That is right for a scratch host and wrong for one somebody has
+# configured. The second form writes the kernel ELF and nothing else. See the
+# note on `FC_KEEP_DISK` below.
 set -e
+
+# Which of the tunables the caller actually set, captured before the `${X:-…}`
+# defaults below make every one of them non-empty. `FC_KEEP_DISK` reports the
+# ones it is about to ignore, and reporting a *default* as ignored would be
+# three lines of noise on every run — which is how a real warning stops being
+# read. `${X+set}` is "was it set", including to the empty string.
+for _v in VCPUS MEMORY INIT FC_NET DISK; do
+    eval "_SET_$_v=\${$_v+set}"
+done
 
 HERE=$(dirname "$0")
 cd "$HERE/.."
@@ -49,6 +64,26 @@ INIT="${INIT:-/bin/paws}"
 # Defaults to the ext2 root image, rebuilt from the just-compiled guest ELF.
 # `DISK=none` boots with no drive, which is the pre-Stage-M shape and still valid.
 DISK="${DISK:-}"
+# FC_KEEP_DISK=1 stages the KERNEL ONLY and touches nothing else the host owns:
+# no image is built, `disk.img` is left alone, and **`akuma-vm.json` and
+# `run.sh` are left alone too** — the host's own launcher is used as it stands.
+#
+# **Use this against any host whose setup is configured.** The default path
+# rebuilds a 128 MB rootfs and scps it over `$FC_DIR/disk.img`, *and* regenerates
+# the VM config from this script's templates — so vcpus, memory, networking and
+# `init=` all revert to this script's defaults (`INIT` is `/bin/paws`, which is
+# not what a herd-supervised host wants). On a box someone staged, both halves
+# are destructive.
+#
+# `DISK=none` is NOT the alternative — that means "no drive at all", so the
+# guest comes up with no rootfs. Cost the Ryzen laptop's disk on 2026-09-20;
+# see `docs/runbooks/amd64-bare-metal-loop.md` § "Rules that cost time to learn".
+#
+# Because the host's config is used verbatim, `VCPUS`/`MEMORY`/`INIT`/`FC_NET`
+# are **ignored** in this mode — the script says so rather than appearing to
+# honour them. Change those on the host's own `akuma-vm.json`, or drop
+# `FC_KEEP_DISK` and pass the full set.
+FC_KEEP_DISK="${FC_KEEP_DISK:-}"
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 
 SSH="ssh -o StrictHostKeyChecking=no -i $FC_KEY"
@@ -57,6 +92,43 @@ cargo build -p akuma-amd64 --target x86_64-unknown-none --release
 
 $SSH "$FC_HOST" "mkdir -p ~/$FC_DIR"
 scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$KERNEL" "$FC_HOST:$FC_DIR/akuma-amd64"
+
+# ── FC_KEEP_DISK: the kernel is the only thing this script is allowed to write ──
+#
+# An early exit rather than a branch threaded through the staging below, because
+# the point is that none of that staging runs. Everything past this block writes
+# something the host owns.
+if [ -n "$FC_KEEP_DISK" ]; then
+    # Refuse rather than boot something subtly different. "Keep the host's
+    # setup" is only meaningful if the host has one, and the three files below
+    # are what that means; a missing `disk.img` would otherwise boot diskless
+    # and a missing `akuma-vm.json` would have nothing to boot from at all.
+    for f in disk.img akuma-vm.json run.sh; do
+        if ! $SSH "$FC_HOST" "test -f \$HOME/$FC_DIR/$f"; then
+            echo "FC_KEEP_DISK=1 but $FC_HOST:$FC_DIR/$f does not exist" >&2
+            echo "  (that host has no staged setup to keep — run without" >&2
+            echo "   FC_KEEP_DISK once to create one, on a host you may overwrite)" >&2
+            exit 1
+        fi
+    done
+    # Say what is being dropped. An env var that looks honoured and is not is
+    # how you conclude a change did nothing when it was never applied.
+    # `if`, not `[ … ] && echo`: under `set -e` the false branch of an AND-list
+    # is the exit status of the loop body, and that is not worth reasoning about.
+    for v in VCPUS MEMORY INIT FC_NET DISK; do
+        eval "was=\${_SET_$v:-}"
+        eval "val=\${$v:-}"
+        if [ "$was" = set ]; then
+            echo "note: $v=$val ignored — FC_KEEP_DISK=1 uses the host's akuma-vm.json"
+        fi
+    done
+    echo "keeping $FC_HOST:$FC_DIR/{disk.img,akuma-vm.json,run.sh} as they are"
+    # `|| rc=$?` so a non-zero from the guest's launcher is reported rather than
+    # tripping `set -e` on the way to reporting it.
+    rc=0
+    $SSH "$FC_HOST" "cd ~/$FC_DIR && TIMEOUT=$TIMEOUT ./run.sh" || rc=$?
+    exit "$rc"
+fi
 
 # The drives array, built here so the JSON below stays a fixed template.
 DRIVES_JSON="[]"

@@ -485,6 +485,72 @@ caller reading only stdout sees an empty success.
 
 ## Rules that cost time to learn
 
+- **Never let a deploy rebuild a disk that is already configured.** Both hosts
+  have a staged disk that is worth more than the kernel you are pushing, and on
+  both the default path replaces it. This cost a restore on the Ryzen box on
+  2026-09-20.
+
+  | host | what overwrites the disk | the safe path |
+  |---|---|---|
+  | **Ryzen laptop** (Firecracker) | `amd64/run-firecracker.sh` with no `DISK=` **rebuilds a fresh 128 MB `amd64-root.img` and scps it over `~/akuma/disk.img`** | `FC_KEEP_DISK=1`, which stages only the ELF and leaves `disk.img` and `akuma-vm.json` alone |
+  | **trashcan, Ubuntu side** | `hpbox.restage_disk()` — `rsync -aH --delete` from `root.img` onto `sdb1` | only restage when you actually changed userspace, and read its excludes first |
+
+  `DISK=none` is **not** the safe path on the Ryzen box: it means "no drive at
+  all", so the guest boots with no rootfs. It is a different thing from "keep
+  the one that is there".
+
+  **What `FC_KEEP_DISK=1` guarantees**: the ELF is the *only* thing written to
+  the host. `disk.img`, `akuma-vm.json` and `run.sh` are all left as they are,
+  and the host's own `run.sh` is what launches the VM. It refuses if any of
+  those three is missing rather than booting something subtly different — a host
+  with no staged setup has nothing to keep, and "keep it" and "there is none"
+  must not read alike.
+
+  The corollary is that `VCPUS`, `MEMORY`, `INIT`, `FC_NET` and `DISK` are
+  **ignored** in this mode, because the host's JSON is the configuration. The
+  script prints a `note:` line for each one you set, so a value that is not
+  being honoured says so instead of looking applied. To change any of them, edit
+  the host's `akuma-vm.json`, or drop `FC_KEEP_DISK` and pass the full set.
+
+  This matters more than it sounds: the default `INIT` is `/bin/paws`, so a
+  herd-supervised host restaged by the default path comes back running the wrong
+  init. Read the host's config before you touch anything:
+
+  ```sh
+  ssh "$FC_HOST" 'cat ~/akuma/akuma-vm.json'
+  ```
+
+  `restage_disk` already excludes `/src`, `/root`, `/usr/local` and `/boot` —
+  those excludes exist because a restage once deleted the box's whole
+  development environment *and* the kernel the default GRUB entry loads.
+  Everything outside them is still deleted, including anything you added to
+  `/bin` or `/etc` by hand. `keep_keys=True` rescues exactly one file,
+  `etc/sshd/authorized_keys`, and nothing else.
+
+- **A Firecracker guest flushes dirty pages to its backing file when it stops,
+  so restoring that file under a running VM does not stick.** Measured
+  2026-09-20: `cp backup disk.img` while the VM was live, then `kill -TERM`, and
+  the file no longer matched the backup — the guest's page cache landed on top
+  of the restore. Order is **stop the VM, then restore, then verify by md5**:
+
+  ```sh
+  kill -TERM "$(pgrep -f 'firecracker.*akuma-vm.json')"
+  cd ~/akuma && cp -f disk.img.bak-<stamp> disk.img && sync
+  md5sum disk.img disk.img.bak-<stamp>     # must match before you boot
+  ```
+
+  Restoring while it runs is also actively harmful — you are rewriting the
+  backing file of a VM that has it open and is still serving.
+
+- **Back up the *running* artefact before you replace it, not the one on disk
+  with a plausible name.** `~/akuma/akuma-amd64.bak-<stamp>` on the Ryzen box was
+  hours older than the kernel the live VM had actually booted, and overwriting
+  `akuma-amd64` without a fresh copy destroyed the only way to A/B a regression
+  against the kernel that had been running. One `cp -f akuma-amd64
+  akuma-amd64.prev` first is the whole fix. The metal has the same shape and the
+  same answer: `cp -f /boot/akuma-amd64 /boot/akuma-amd64.prev` before pushing.
+
+
 - **Before you reboot out of Ubuntu, prove the laptop's key is in the
   *persistent root's* `authorized_keys`.** Three files drift apart and only one
   of them is the one sshd reads:
