@@ -1034,6 +1034,20 @@ pub fn idle_loop() -> ! {
             crate::smp::cpu_index_u32(),
             akuma_bkl::sync::HOLD_TAG_IDLE,
         );
+        // **The idle thread no longer holds the BKL while idling** (2026-09-20).
+        // It used to run the whole loop at its born-holding depth and only
+        // release across the `hlt` — and the wake-side `bkl_enter` re-ticketed
+        // it at the back of the queue every tick, where the on-CPU local CAS
+        // spin beat every remote waiter: idle threads kept re-winning
+        // ownership they were not using, and once won, only the next halt
+        // ever released it. The frozen-`serving` storm in
+        // `docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` (2026-09-20) is that
+        // shape with three secondary idle threads queueing behind a BSP hold.
+        // Now the lock is taken only around the protected work below, and the
+        // halt runs bare — `x86_yield`'s switch path takes the BKL itself for
+        // lockless callers (the SSH-wedge fix), and nothing here touches
+        // BKL-protected state outside the bracket.
+        smp::bkl_enter();
         // 5b slice 1: the idle loop is reclaim site 2 (`process::reclaim`'s
         // vetted list). Every exit's terminal drain (`run_process`) and the
         // boot drive loop's `yield_now` keep the RETIRED set near-empty while
@@ -1124,7 +1138,8 @@ pub fn idle_loop() -> ! {
             unsafe {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
             }
-            smp::bkl_enter();
+        } else {
+            smp::bkl_leave();
         }
     }
 }

@@ -639,8 +639,18 @@ extern "C" fn netpoll_daemon() -> ! {
         // load per lap in the common case. It is here, not in a task of its own,
         // for the same reason the probe is: one fewer thing the scheduler has to
         // keep alive, and it runs exactly when the network is being driven.
+        // **The SNTP retry and the memory watchdog run BKL-free too** (2026-09-20).
+        // They sit after the drain's `dropped_window_close`, so a lap whose
+        // `sync_tick` attempted SNTP held the BKL across the whole attempt —
+        // up to the 2.5 s retry budget — while every other core's syscall
+        // entry ticketed behind it. Same carve-out argument as the drain:
+        // everything these two touch (`NETWORK`, the socket table, the clock
+        // atomics) sits behind its own lock. Scoped, NOT across the park — a
+        // park inside a dropped window broke the resume protocol at SMP.
+        akuma_bkl::bkl::dropped_window_open();
         crate::clock::sync_tick();
         mem_watch_tick();
+        akuma_bkl::bkl::dropped_window_close();
         NETPOLL_TICKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let laps = NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if PROBE_ON.load(core::sync::atomic::Ordering::Relaxed) {

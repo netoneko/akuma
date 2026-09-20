@@ -751,7 +751,10 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     serial::put_dec(u64::from(lapic::apic_id()));
     serial::puts(")\n");
 
-    bkl_enter();
+    // No standing BKL hold: `idle_loop` takes the lock around its protected
+    // work and runs the halt bare (2026-09-20). The old `bkl_enter()` here was
+    // the permanent depth-1 baseline that made every idle thread a lifetime
+    // lock owner — the frozen-`serving` starvation storm's root.
     sched::idle_loop()
 }
 

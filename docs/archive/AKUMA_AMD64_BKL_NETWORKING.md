@@ -67,6 +67,55 @@ serves degraded from its main loop — see the thread-runs doc §0 for the
 serve-as-you-wait hook. `/boot/akuma-amd64.good` on the trashcan is the
 known-good recovery.
 
+## 2026-09-20 (night): the frozen owner is a PARKED task — the reconcile gap
+
+Further fix attempts narrowed the mechanism to its structural core. What the
+night's boots established:
+
+- **Idle-thread churn removed** (`sched.rs` `idle_loop`, `smp.rs` secondary
+  boot): the idle thread no longer holds a lifetime depth-1 — it takes the
+  lock around its protected work and halts bare. Necessary hygiene (the wake-
+  side re-ticket made every idle core win ownership it wasn't using), but not
+  the cure.
+- **The real shape**: `[BKL] stuck: owner=2 waiter=1/3/4 tag=502` with
+  `serving` frozen at the owner's ticket for millions of spins, the `[SLOT]`
+  dump showing the owner-side thread `st=5` (WAITING), and the litter child's
+  trace showing `wp0` AND `wp1` (it acquired, then queued *inside* the write
+  path behind the frozen owner). **The owner is a task parked mid-syscall** —
+  futex wait, pipe wait, a blocking write — which left `owner` set on its
+  core for the whole sleep.
+
+Why it *can't* just release: on amd64 the cooperative switch
+(`x86_yield_now`) requires the caller to hold the BKL — that is the
+[`AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`](AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md)
+fix, whose own doc records the structural fix (Linux-style `prev` handoff,
+`ON_CPU[prev]` cleared after the switch returns) as **deliberately not yet
+done**. So a parked syscall holds the lock for as long as it sleeps; its core
+free-rides on the reentrant fast path; every other core's acquires queue
+behind a hold whose release depends on the sleeper waking; and the waker's
+syscall needs the lock it is starved of. aarch64 solved this family with
+`reconcile_for_spsr` at every IRQ eret epilogue ("BKL held iff core is in
+kernel", `akuma-bkl/src/bkl.rs`) plus the dropped-window ledger — **amd64 has
+no reconcile**.
+
+**The fix (next session, in order):**
+1. Linux-style `prev` handoff in `x86_yield_now`/`x86_pick_next` so the
+   switch is safe without the caller holding the lock (closes the SSH-wedge
+   fragility *and* unlocks everything below);
+2. release-across-park: `block_current`/`schedule_blocking` leave before the
+   park, re-enter on resume — with the dropped-window ledger ported for
+   callers already inside a deliberate window;
+3. a reconcile in the amd64 ring-3 return paths (syscall exit, `enter_user`,
+   IRQ epilogues) mirroring `reconcile_for_spsr`, so "held iff in kernel"
+   becomes an invariant rather than an accretion of per-site brackets;
+4. then re-test the litter: the child should pass `RAFT_STAGE` 1→4 the same
+   boot.
+
+Interim mitigations that stay: meow's serve-as-you-wait hooks
+(`AMD64_SPAWNED_THREAD_NEVER_RUNS.md` §0), the `[bkls>]` sampler
+(syscall-context only, ≥2^20 spins) and `bkl: longest waiter spins this boot`
+suite note as the regression tripwire.
+
 ## 2026-09-20 (later): fix validated live; a second, separate wedge suspect
 ## opened the same day
 

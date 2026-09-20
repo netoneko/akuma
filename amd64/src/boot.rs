@@ -617,5 +617,11 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     t.note("sched: thread slots reaped", akuma_threading::x86_reaps());
 
     t.note("suite: guest microseconds elapsed", crate::net::uptime_us().saturating_sub(suite_start_us));
+    // **Bounded-hold tripwire** (`akuma-bkl`'s `MAX_WAIT_SPINS`). A healthy
+    // ticket lock serves a waiter in microseconds; six figures of spins means
+    // some holder kept the BKL across a seconds-long kernel stretch and every
+    // other core sat IRQ-masked behind it. Compared against the previous
+    // boot's note by eye — an order-of-magnitude jump is the regression.
+    t.note("bkl: longest waiter spins this boot", akuma_bkl::sync::max_wait_spins());
     Verdict { passed: t.report() }
 }

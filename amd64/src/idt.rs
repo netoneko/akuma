@@ -1593,23 +1593,6 @@ extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
     let from_user = unsafe { (*frame).cs & 3 } == 3;
     // A tick can land inside a `stac` window; the scheduler must not inherit it.
     crate::uaccess::clac_if_enabled();
-    // BKL-OWNERSHIP WATCHDOG (temporary, 2026-09-20): every 64th tick, a core
-    // that OWNS the BKL reports which task it is running. Ownership that
-    // survives task switches and ring-3 crossings on one core is the
-    // missed-`bkl_leave` signature behind the chronic `tag=501` starvation
-    // storms (the litter raft child is their most visible victim).
-    {
-        let idx = crate::smp::cpu_index_u32() as usize;
-        if crate::smp::ticks_on(idx) & 0x3F == 0 && crate::smp::bkl_held() {
-            serial::puts("[bklw>] core=");
-            serial::put_dec(idx as u64);
-            serial::puts(" task=");
-            serial::put_dec(crate::sched::current_task() as u64);
-            serial::puts(" user=");
-            serial::put_dec(from_user as u64);
-            serial::puts("\n");
-        }
-    }
     crate::lapic::on_tick();
     // **Pending signals, for a tick that interrupted ring 3.** The third and
     // last place a signal is looked at, after a syscall return and a fault —

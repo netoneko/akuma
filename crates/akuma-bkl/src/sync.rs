@@ -70,6 +70,22 @@ pub fn reset_contention_spins() {
 /// log lines nobody greps. Read via [`kernel_lock_recoveries`].
 static KERNEL_LOCK_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 
+/// The longest wait any core has spun in [`KernelLock::acquire`] this boot, in
+/// spin iterations. A tripwire, not a statistic: the fair ticket lock should
+/// serve a waiter in microseconds, so anything past ~a million spins means
+/// some holder kept the lock across a kernel stretch measured in *seconds* —
+/// the shape that starves freshly-woken userspace threads (the litter raft
+/// child, `docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 §). Read
+/// via [`max_wait_spins`] and noted at the end of the boot self-test suite.
+static MAX_WAIT_SPINS: AtomicU64 = AtomicU64::new(0);
+
+/// The longest `acquire` wait this boot (see [`MAX_WAIT_SPINS`]). The boot
+/// suite notes it; a jump order-of-magnitude over the previous boot's value
+/// is the early warning that a new long-hold path landed.
+pub fn max_wait_spins() -> u64 {
+    MAX_WAIT_SPINS.load(Ordering::Relaxed)
+}
+
 /// Snapshot the BKL ticket-recovery counter (see [`KERNEL_LOCK_RECOVERIES`]). Healthy runs
 /// keep this at 0.
 pub fn kernel_lock_recoveries() -> u64 {
@@ -682,6 +698,9 @@ impl KernelLock {
             // never prints, so the console bandwidth survives. The 2026-09-20
             // lesson: an unconditional print here flood-wedged the box (every
             // uncontended acquire passes the wait loop's first iteration).
+            if total_spins > MAX_WAIT_SPINS.load(Ordering::Relaxed) {
+                MAX_WAIT_SPINS.store(total_spins, Ordering::Relaxed);
+            }
             if total_spins >= 1_048_576 && total_spins.is_power_of_two() {
                 akuma_primitives::console::print_args_if_registered::<128>(format_args!(
                     "[bkls>] core={} ticket={} serving={} owner={} spins={}\n",
