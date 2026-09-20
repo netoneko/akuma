@@ -38,6 +38,44 @@ Two things make this worth doing *before* forming a theory:
 `docs/README.md`'s symptom matrix is the index; its amd64 rows are near the top.
 
 
+## Boot it with `netprobe`. Not optional on this machine.
+
+`GRUB_DEFAULT="Akuma/amd64"`'s entry in `/etc/grub.d/45_akuma` carries
+` netprobe` on its `multiboot2` line. Keep it there.
+
+It turns on `amd64/src/net.rs`'s `print_probe_line` plus the NIC's DMA layout,
+and `enable_probe()` prints them **immediately before `run_init`** so they land
+at the bottom of the log rather than scrolling off — written for exactly the
+case where the console is a television being photographed.
+
+```
+  nic:  rx_desc va=0xffffffff805b7500 pa=0x00000000005b7500
+[probe] t=115s ticks=9639(cal) link=up/1000M/full ip=192.168.1.123/24 dhcp=leased clk=set
+[probe]   rx=306 tx=115 drop=0 isr=0x4095 dry=5 kicks=1 polls=280 irq=0 laps=7290
+```
+
+| reading | what it settles |
+|---|---|
+| `polls=` / `laps=` climbing | the receive loop is running — so driver silence is its own gating, not a dead loop |
+| `rx=16` exactly | the receiver halted after one `RING_LEN` and needs **restarting**; acking `RDU` is not enough on this part |
+| `rx=0` | nothing has ever been received — a different fault from a stalled ring |
+| `rx_desc pa=` vs a stall dump's `rdsar=` | whether the chip is writing where the driver reads. Invisible until catastrophic, and it went unchecked for a whole session |
+| `dry=` climbing, `rx` flat | `RDU` raised and acknowledged and the receiver still not resuming |
+| `link=up/1000M/full` | the PHY, so a carrier theory can be killed in one line |
+
+**It was off by default and that cost a session.** Every `[rtl]` line in the
+driver is gated behind a stall condition that may never arm, so their absence
+means nothing on its own. `[probe]` is unconditional once the flag is set.
+Turning it on produced the whole diagnosis on the next boot:
+[`../archive/AKUMA_SELF_HOSTING_AMD64.md`](../archive/AKUMA_SELF_HOSTING_AMD64.md)
+§ "`netprobe`: the answer was a command-line flag away the whole time".
+
+Editing that file: **keep backups outside `/etc/grub.d/`** — `update-grub` runs
+every executable there, so a mode-755 `cp` becomes a second menu entry with the
+same title. Change the default entry only; leave `Akuma/amd64 (known good)`
+pristine, since it is the remote-free way back and a diagnostic has no business
+in it.
+
 ## The two personalities
 
 | | address | how to reach it |
