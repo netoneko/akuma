@@ -371,15 +371,18 @@ fn hook_switch_to(from: usize, to: usize) {
         crate::usermode::set_fs_base(fs);
         crate::usermode::set_user_gs_base((*m)[to].uctx.gs_base);
 
-        // The switch's whole cross-core safety argument is `x86_yield_now`'s:
-        // `ON_CPU` is cleared for the outgoing thread *before* the stack moves,
-        // and "no other core can observe that until this core releases the
-        // kernel lock". That is only an argument if the lock is in fact held
-        // here — and if it ever is not, a peer's `x86_pick_next` can take the
-        // outgoing thread's slot while this core is still standing on its
-        // stack, which is two cores on one stack and every symptom the ssh/apk
-        // wedge has. Assert it where the claim is used rather than where it is
-        // written.
+        // The switch's cross-core safety argument changed 2026-09-20: it used
+        // to be "`ON_CPU` is cleared before the stack moves, and no peer can
+        // observe that until this core releases the kernel lock" — an argument
+        // that only held when the lock was in fact held, which is what made
+        // every switch require the BKL and every parked-mid-syscall task own
+        // it for its whole sleep (the frozen-`serving` storm). Now the
+        // outgoing thread's `ON_CPU` gate STAYS SET through the switch
+        // (prev-handoff, `x86_yield_now`), a peer's picker skips gated
+        // threads, and a lockless switch is safe by the gate alone — which is
+        // what lets `block_current`/`block_until_deadline` release across the
+        // sleep. The counter stays as telemetry: a non-zero value is expected
+        // on any box where something parks, not a wedge signature.
         if !smp::bkl_held() {
             let n = SWITCH_WITHOUT_BKL.fetch_add(1, Ordering::Relaxed);
             if n < CANARY_REPORT_LIMIT {
@@ -886,6 +889,16 @@ pub fn block_current() {
     // crate's since 4b batch 3a — see [`BACKSTOP_US`] for why they had to be.
     // This function keeps only [`BLOCKS`], which counts *this kernel's own*
     // parks and is what `sched: threads parked` reports.
+    //
+    // 2026-09-20, REVERTED: releasing the BKL across the park wedged the box
+    // at the netpoll daemon's first parks (`[SWITCH NO-BKL] from=4 …
+    // via=block_until_deadline` then silence, reproducible twice). The park
+    // machinery (`publish_waiting_and_take_pending_wake`, `x86_wake_pass`,
+    // the POOL accounting in the switch) was built with the parker holding
+    // the lock; the prev-handoff made the *switch* safe lockless but the
+    // publish/wake protocol around it was not audited. The prev-handoff and
+    // the pick-claim CAS stay; this release comes back only after that audit
+    // (`AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night § fix step 2).
     threading::park_indefinitely();
 }
 
@@ -898,6 +911,7 @@ pub fn block_current() {
 pub fn block_until_deadline(deadline_us: u64) {
     note_yield(3);
     BLOCKS.fetch_add(1, Ordering::Relaxed);
+    // Park-release reverted — see [`block_current`] (2026-09-20).
     threading::schedule_blocking(deadline_us);
 }
 

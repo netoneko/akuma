@@ -2799,6 +2799,21 @@ fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
             PICK_SKIP_CANRUN[candidate].fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        // **The gate is the claim** (2026-09-20). Switches no longer hold the
+        // BKL (prev-handoff above; parks release across the sleep), so two
+        // cores can scan the same READY candidate concurrently — the old
+        // "picks were serialized by the caller's lock" safety is gone. The
+        // 0→1 CAS makes exactly one scanner the winner; the loser moves on.
+        // This also closes a pre-existing race: a task readied by its waker
+        // (state RUNNING, gate 0, still off-CPU) was pickable on two cores at
+        // once under the old scan-then-return.
+        if ON_CPU[candidate]
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            PICK_SKIP_ONCPU[candidate].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         PICK_HITS[candidate].fetch_add(1, Ordering::Relaxed);
         return Some(candidate);
     }
@@ -3467,12 +3482,26 @@ fn x86_wake_pass() {
 /// parked, or it terminated) and there is nothing else, this core's idle thread
 /// takes over; a core must always have somewhere to go.
 ///
-/// `ON_CPU` is what keeps two cores off one stack. It is cleared for the
-/// outgoing thread before the switch, but no other core can observe that until
-/// this core releases the kernel lock, which the incoming thread does only
-/// after the switch has completed.
+/// `ON_CPU` is what keeps two cores off one stack. The 2026-09-20 protocol is
+/// the aarch64 one (Linux-style `prev` handoff): the outgoing thread's gate
+/// **stays set through the switch** — a peer's picker skips gated threads, so
+/// the outgoing slot cannot be stolen even when the switch runs with no BKL
+/// held — and the gate is cleared once the outgoing stack is provably dead:
+/// immediately after the switch returns on the incoming stack
+/// ([`rust_switch_finished`] below), or at this function's entry otherwise
+/// (the fresh-task trampoline never returns here, so its predecessor's gate
+/// clears at the next scheduler entry — bounded by one tick). The old
+/// protocol — clear-before-switch, hidden by the caller's BKL — is what made
+/// every switch require the lock, which is what made a task parked mid-syscall
+/// own the lock for its whole sleep and freeze `serving` behind it
+/// (`docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night).
 #[cfg(target_arch = "x86_64")]
 fn x86_yield_now() -> bool {
+    // Prev-handoff cleanup, first thing: whatever gate this core is still
+    // carrying belongs to a thread whose stack is now dead (we are running,
+    // here, after its switch). No-op when there is no pending gate.
+    rust_switch_finished();
+
     // Before the pick, not after: a thread whose deadline just passed has to be
     // a candidate for *this* scan, or a core with nothing else runnable parks
     // and the timeout is served a tick late at best.
@@ -3529,8 +3558,16 @@ fn x86_yield_now() -> bool {
         Ordering::Relaxed,
     );
     THREAD_STATES[next].store(thread_state::RUNNING, Ordering::Release);
-    ON_CPU[cur].store(0, Ordering::Release);
-    ON_CPU[next].store(1, Ordering::Release);
+    // Prev-handoff: the OUTGOING gate stays set across the switch — this is
+    // what a peer's picker reads to skip us. Record it per-core for the
+    // cleanup, which runs either right after the switch returns below or, for
+    // a fresh task that never returns here, at that task's first scheduler
+    // entry (the `rust_switch_finished()` at the top of this function).
+    // `next`'s gate is already set — the pick's CAS claimed it.
+    let core = bkl::current_core_id() as usize;
+    if core < MAX_CORES {
+        PER_CORE_OFFCPU[core].store(cur, Ordering::SeqCst);
+    }
     (hooks.transfer_lock_depth)(cur, next);
     (hooks.set_current_slot)(next);
     // Every machine effect, with `cur` still current and before the stack moves.
@@ -3545,6 +3582,11 @@ fn x86_yield_now() -> bool {
     unsafe {
         x86_switch_context(get_context_mut(cur), get_context(next));
     }
+    // The only way here is on the INCOMING thread's stack — `cur`'s stack went
+    // dead in the swap above, so its gate can drop now (a fresh task never
+    // returns here; its predecessor's gate clears at the task's first
+    // scheduler entry instead).
+    rust_switch_finished();
     true
 }
 

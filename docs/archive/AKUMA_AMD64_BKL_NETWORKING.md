@@ -99,13 +99,28 @@ kernel", `akuma-bkl/src/bkl.rs`) plus the dropped-window ledger — **amd64 has
 no reconcile**.
 
 **The fix (next session, in order):**
-1. Linux-style `prev` handoff in `x86_yield_now`/`x86_pick_next` so the
-   switch is safe without the caller holding the lock (closes the SSH-wedge
-   fragility *and* unlocks everything below);
-2. release-across-park: `block_current`/`schedule_blocking` leave before the
-   park, re-enter on resume — with the dropped-window ledger ported for
-   callers already inside a deliberate window;
-3. a reconcile in the amd64 ring-3 return paths (syscall exit, `enter_user`,
+1. ~~Linux-style `prev` handoff in `x86_yield_now`/`x86_pick_next`~~ **LANDED
+   2026-09-20 night** — the outgoing gate stays set through the switch, the
+   pick *claims* by a 0→1 CAS on the gate (two lockless pickers can no longer
+   take one candidate; this also closed a pre-existing waker/picker
+   double-run race), and `rust_switch_finished()` clears the predecessor's
+   gate post-return and at every scheduler entry. `hook_transfer_lock_depth`
+   was already a no-op — the "per-thread hold depth" in `Machine`'s doc
+   comment never existed on this target.
+2. ~~Release-across-park~~ **ATTEMPTED AND REVERTED the same night**:
+   `block_current`/`block_until_deadline` leaving before the park and
+   re-entering after wedged the box reproducibly at the netpoll daemon's
+   first parks (`[SWITCH NO-BKL] from=4 to=1 core=1
+   via=block_until_deadline`, then silence, twice, power-cycle recovery).
+   The switch itself was safe lockless — the wedges came *after* four
+   successful lockless park switches — so the suspect is the park
+   machinery's own protocol: `publish_waiting_and_take_pending_wake`,
+   `x86_wake_pass`, and the switch's POOL accounting were all written with
+   the parker holding the BKL, and the waker's side of the sticky-wake
+   handshake was serialized by that same lock. Audit those three before
+   reattempting; the bracket code is in this doc's history and trivial to
+   re-add.
+3. A reconcile in the amd64 ring-3 return paths (syscall exit, `enter_user`,
    IRQ epilogues) mirroring `reconcile_for_spsr`, so "held iff in kernel"
    becomes an invariant rather than an accretion of per-site brackets;
 4. then re-test the litter: the child should pass `RAFT_STAGE` 1→4 the same
