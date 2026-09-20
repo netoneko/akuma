@@ -69,7 +69,7 @@ pub fn init() -> Result<(), FsError> {
     //    `BKL_VFS_CARVE_OUT.md` §11.4), so a blocked waiter drives the very sweep that
     //    frees it. Unregistered it degrades to a plain spin, which is why host tests and
     //    early boot need no hook.
-    akuma_exec::threading::set_slot_reap_callback(crate::ext2::reap_dead_thread);
+    akuma_exec::threading::set_slot_reap_callback(crate::reap_dead_thread);
     akuma_locks_rw::register_backstop(|| {
         akuma_exec::threading::reclaim_terminated_slots();
     });

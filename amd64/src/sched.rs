@@ -1040,6 +1040,21 @@ pub fn idle_loop() -> ! {
         // processes die; this is the collector that runs when nothing else
         // does — the regime where the cooldown has always elapsed.
         akuma_exec::process::reclaim::drain_retired_if_requested();
+        // The thread-slot half of the same idea, and it landed much later: until
+        // the reaper this target performed no `TERMINATED → FREE` transition at
+        // all, so the two hooks that have to fire while a tid is dead — the BKL
+        // dropped-window reset and the orphaned-lock reap — had no caller
+        // (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`).
+        //
+        // **This is the timeliness half only.** An idle-loop collector does not
+        // run while the system is busy, which is exactly when dead slots pile
+        // up, so it is deliberately not the thing correctness rests on:
+        // `x86_claim_slot` performs the same releases itself before handing a
+        // slot to its next occupant, and `fs::install_reap_hooks` registers a
+        // waiter-side backstop for the mount case. What this adds is that a box
+        // which goes quiet does not sit on a dead thread's ext2 write lock until
+        // something happens to want its slot.
+        threading::x86_reap_terminated_slots();
         // `[PSTATS]` sweep, aarch64 parity — `kernel-glue`'s `kernel_main` runs
         // the same 30 s block; this target's idle loop is the equivalent
         // nothing-else-is-running point. Each `hlt` below wakes on ~one tick,
@@ -2476,4 +2491,100 @@ pub fn user_context_smoke_test(t: &mut Suite) {
     );
 
     abandon_unpublished(slot);
+}
+
+/// The slot reaper: a dead slot is released and carried to `FREE`, a live one
+/// is not.
+///
+/// # What this is actually testing
+///
+/// Not "does the sweep run" — that a pass returns a number proves nothing. The
+/// two things that were missing on this target and are silent when wrong
+/// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`):
+///
+/// - **The BKL dropped-window depth is cleared.** A thread killed between a
+///   `dropped_window_open` and its close leaves the depth standing, and because
+///   the ledger is tid-indexed the next occupant of the slot inherits it —
+///   running its kernel excursions BKL-free while believing it holds the lock.
+///   The staging opens a window on a *foreign* tid (the ledger's own
+///   test hook), which is the shape a thread killed mid-window leaves.
+/// - **Only dead slots are touched.** The control slot stays `INITIALIZING`
+///   with a window of its own open, and the assertion that its depth survives
+///   is what keeps the first assertion from being vacuous: if the staging never
+///   set a depth at all, "the dead one reads 0" would pass for the wrong reason.
+///
+/// Needs no tick and runs no task — both slots are claimed unpublished, so
+/// nothing can be executing on either.
+#[cfg(not(feature = "no-tests"))]
+pub fn reaper_smoke_test(t: &mut Suite) {
+    /// Never runs: neither slot is ever published.
+    extern "C" fn unreachable_entry() -> ! {
+        finish();
+    }
+
+    let (Some(dead), Some(live)) = (
+        spawn_in_space_unpublished(unreachable_entry, 0),
+        spawn_in_space_unpublished(unreachable_entry, 0),
+    ) else {
+        t.check("reaper: two unpublished slots claimed", false);
+        return;
+    };
+
+    // `dead` reaches the state a killed thread leaves behind; `live` stays
+    // INITIALIZING, i.e. claimed and about to be used by somebody.
+    abandon_unpublished(dead);
+    #[cfg(kernel_smp_shared)]
+    {
+        akuma_bkl::bkl::dropped_window_open_for_tid_test(dead);
+        akuma_bkl::bkl::dropped_window_open_for_tid_test(live);
+    }
+
+    let before = threading::x86_reaps();
+    let moved = threading::x86_reap_terminated_slots();
+    t.check("reaper: the sweep moved at least the abandoned slot", moved >= 1);
+    t.check_eq(
+        "reaper: the counter advanced by what the sweep reported",
+        threading::x86_reaps() - before,
+        moved as u64,
+    );
+    t.check_eq(
+        "reaper: a reaped slot is FREE",
+        u64::from(threading::get_thread_state(dead)),
+        u64::from(akuma_exec_core::thread::thread_state::FREE),
+    );
+    t.check_eq(
+        "reaper: a claimed slot is left alone",
+        u64::from(threading::get_thread_state(live)),
+        u64::from(akuma_exec_core::thread::thread_state::INITIALIZING),
+    );
+
+    #[cfg(kernel_smp_shared)]
+    {
+        // `reset` returns the prior depth, so a second clear reads what the
+        // reap left. Zero means the reap did it; the control says the staging
+        // was real.
+        t.check_eq(
+            "reaper: the dead slot's BKL dropped-window depth was cleared",
+            u64::from(akuma_bkl::bkl::clear_dropped_windows_for_dead_thread(dead)),
+            0,
+        );
+        t.check_eq(
+            "reaper: ... and the claimed slot's was not",
+            u64::from(akuma_bkl::bkl::clear_dropped_windows_for_dead_thread(live)),
+            1,
+        );
+    }
+
+    // `FREE` is what makes the sweep idempotent: without it every pass would
+    // re-run the hooks over every dead slot until something reused it. A second
+    // sweep must leave this one alone. (Its *count* is not assertable — another
+    // core's thread may legitimately have died in between.)
+    let _ = threading::x86_reap_terminated_slots();
+    t.check_eq(
+        "reaper: a second sweep leaves a reaped slot alone",
+        u64::from(threading::get_thread_state(dead)),
+        u64::from(akuma_exec_core::thread::thread_state::FREE),
+    );
+
+    abandon_unpublished(live);
 }

@@ -398,6 +398,7 @@ pub fn run_threading_tests() -> bool {
     // Orphaned lock recovery tests
     run_test!(test_thread_terminated_detection, "thread_terminated_detection");
     run_test!(test_ext2_orphaned_lock_recovery, "ext2_orphaned_lock_recovery");
+    run_test!(test_reap_registry_is_populated, "reap_registry_is_populated");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -9532,6 +9533,32 @@ pub fn test_ext2_orphaned_lock_recovery() -> bool {
     }
     console::print("    OK: try_write() succeeded after recovery\n");
     
+    console::print("  Result: PASS\n");
+    true
+}
+
+/// Test: the orphaned-lock sweep has something to sweep.
+///
+/// The test above proves the *recovery algorithm* works, on a lock it creates
+/// itself. This proves the thing that algorithm is useless without: that the
+/// real root mount is actually enrolled in `akuma_vfs_glue`'s registry, so a
+/// reap reaches it.
+///
+/// Worth its own test because the two are independent and only one of them has
+/// ever been wrong. The amd64 kernel had every hook registered and an **empty**
+/// registry for months — its root is a different instantiation of
+/// `Ext2Filesystem` than the registry could hold, so nothing was ever recorded
+/// and `reap_dead_thread` swept nothing, which is indistinguishable from working
+/// at every observation point except this one
+/// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3). The registry is shared
+/// between the two kernels now; this is the AArch64 half of the same check.
+pub fn test_reap_registry_is_populated() -> bool {
+    console::print("\n[TEST] orphaned-lock sweep registry is populated\n");
+    let n = akuma_vfs_glue::reapable_mount_count();
+    if n == 0 {
+        console::print("    FAIL: no mount enrolled — a reap would sweep nothing\n");
+        return false;
+    }
     console::print("  Result: PASS\n");
     true
 }
