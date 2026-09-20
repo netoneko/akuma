@@ -44,6 +44,18 @@ few instructions" into "narrowed to one syscall":
   so **cross-litter relay is down** until the child survives.
 - The doc's own §2 claim "the hub then answers nobody" is now only true
   *during* a turn; between turns the main loop drains every tick.
+- **2026-09-20 (night) — root cause found one level down; child still dead.**
+  The child is a victim, not a patient: the amd64 BKL has no park release and
+  no eret reconcile, so a task parked mid-syscall freezes `owner` on its core
+  for its whole sleep and every other core starves behind it — full mechanism,
+  measured numbers, and the landed/reverted fix state live in
+  [`AKUMA_AMD64_BKL_NETWORKING.md`](AKUMA_AMD64_BKL_NETWORKING.md) §
+  2026-09-20 (night). The switch-protocol half (prev-handoff gate + pick
+  claim) landed and boots clean on bare metal; the park-release half wedged
+  and was reverted pending an audit of
+  `publish_waiting_and_take_pending_wake` / `x86_wake_pass` / the switch's
+  POOL accounting. The child reaches `stage=1` on every boot; stages 2-6 and
+  the relay stay gated on that audit plus the ring-3 reconcile.
 
 ## 1. What is actually happening
 

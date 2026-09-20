@@ -100,13 +100,17 @@ no reconcile**.
 
 **The fix (next session, in order):**
 1. ~~Linux-style `prev` handoff in `x86_yield_now`/`x86_pick_next`~~ **LANDED
-   2026-09-20 night** — the outgoing gate stays set through the switch, the
+   AND BARE-METAL-VERIFIED 2026-09-20 night** (kernel `477450d0…`, boots
+   clean, suite passes, no power-cycle) — the outgoing gate stays set through
+   the switch, the
    pick *claims* by a 0→1 CAS on the gate (two lockless pickers can no longer
    take one candidate; this also closed a pre-existing waker/picker
    double-run race), and `rust_switch_finished()` clears the predecessor's
    gate post-return and at every scheduler entry. `hook_transfer_lock_depth`
    was already a no-op — the "per-thread hold depth" in `Machine`'s doc
-   comment never existed on this target.
+   comment never existed on this target. Not sufficient alone: the child
+   still starves and the longest-waiter tripwire still reads ~17M spins, as
+   expected — the frozen owner is the parked task, which is step 2.
 2. ~~Release-across-park~~ **ATTEMPTED AND REVERTED the same night**:
    `block_current`/`block_until_deadline` leaving before the park and
    re-entering after wedged the box reproducibly at the netpoll daemon's
