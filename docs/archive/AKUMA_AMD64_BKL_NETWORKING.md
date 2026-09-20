@@ -25,15 +25,17 @@ net: netpoll daemon entered … netprobe enabled
 suite: guest microseconds elapsed 21888253
 ```
 
-**Core 1 (BSP) holds the BKL for the whole boot self-test suite and
-netprobe/netpoll bring-up — 21.9 seconds measured — while cores 2-4 spin
-IRQs-off on tickets 743/744/745.** `serving` frozen at 742 under `owner=1`:
-the lost-ticket self-heal correctly does not fire (the lock is owned, not
-leaked), so there is **no recovery path for "the owner is alive but
+**During the boot self-test suite and netprobe/netpoll bring-up, core 1 (BSP)
+holds the BKL across multi-second stretches — waiters on cores 2-4 sampled at
+2M/4M/16.7M spins with `serving` frozen at the BSP's ticket — and the storm
+recurs throughout the suite** (the suite's own 21.9 s duration is the window
+these samples were taken in, not the length of one hold; earlier boots showed
+the same storm shape with different ticket numbers). `serving` frozen under
+`owner=1`: the lost-ticket self-heal correctly does not fire (the lock is
+owned, not leaked), so there is **no recovery path for "the owner is alive but
 monopolizing"** — and `backstop releases: 0` says none ever ran. `tag=501`
 (`HOLD_TAG_IRQ`) because the hold was entered from tick/self-test context and
-no syscall re-tagged the core: the holder's attribution is a 22-second-old
-stale stamp.
+no syscall re-tagged the core: the holder's attribution is a stale stamp.
 
 Consequences, all measured the same day:
 
@@ -53,11 +55,17 @@ few milliseconds. The primitives exist (`bkl_drop_window`,
 periodic drops, and the chronic holds need a bounded-hold assertion so the
 next 22-second monopoly fails a test instead of starving a litter.
 
-Methodology notes for the next person: an unconditional print inside
-`acquire`'s wait loop flood-wedged the box (every uncontended acquire passes
-the loop's first iteration — the fast path only skips reentrant ones); sample
-only after ≥2^20 spins. And `meow`'s litter meanwhile serves degraded from
-its main loop — see the thread-runs doc §0 for the serve-as-you-wait hook.
+Methodology notes for the next person, both bought with a hard-locked box:
+an unconditional print inside `acquire`'s wait loop flood-wedged it (every
+uncontended acquire passes the loop's first iteration — the fast path only
+skips reentrant ones), and a serial print from the **timer-IRQ context**
+(`[bklw>]` watchdog) locked two boots harder — the console path is not
+MP-safe against IRQ-context writers, and the torn-character spew plus total
+lock followed. Sample only from syscall context, only after ≥2^20 spins, and
+put nothing on the serial line from an IRQ frame. `meow`'s litter meanwhile
+serves degraded from its main loop — see the thread-runs doc §0 for the
+serve-as-you-wait hook. `/boot/akuma-amd64.good` on the trashcan is the
+known-good recovery.
 
 ## 2026-09-20 (later): fix validated live; a second, separate wedge suspect
 ## opened the same day

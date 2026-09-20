@@ -355,6 +355,23 @@ pub struct Verdict {
 /// function is not purely a suite, and a build without it still needs what it
 /// sets up. [`late_init`] is that subset, in this order.
 #[cfg(not(feature = "no-tests"))]
+/// The suite's console emit, with a BKL drop at every check boundary.
+///
+/// The boot thread runs the whole suite as one kernel stretch, and the BSP
+/// owns the BKL for all of it (owner never clears — every BSP acquire after
+/// the first is the reentrant fast path). Measured 2026-09-20 with the
+/// `akuma-bkl` wait-state sampler: cores 2-4 ticketed behind one BSP hold and
+/// spun 2M/4M/16.7M iterations while `netprobe`/netpoll brought the stack up —
+/// ~22 s of suite — and any userspace thread woken in that window (the litter
+/// raft child) starves with no core to run on. Dropping at every check
+/// boundary caps the BSP's hold to one check's length; the cost is one
+/// release/re-ticket per printed line, on a path that is prints-dominated
+/// anyway.
+pub fn suite_emit(s: &str) {
+    crate::serial::puts(s);
+    crate::smp::bkl_drop_window();
+}
+
 pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     let flag = |name: &str| cx.cmdline.split_ascii_whitespace().any(|w| w == name);
 

@@ -444,7 +444,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         cycle_forever(have_net)
     }
 
-    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
+    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", crate::boot::suite_emit);
 
     // The whole suite, shared with the PVH entry point.
     //

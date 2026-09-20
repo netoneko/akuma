@@ -300,7 +300,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     }
 
     #[cfg(not(feature = "no-tests"))]
-    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
+    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", crate::boot::suite_emit);
 
     // The whole suite, shared with the multiboot2 entry point. It was written
     // out separately in both until 2026-09-07, and the two lists had drifted —
