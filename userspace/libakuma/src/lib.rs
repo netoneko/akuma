@@ -1709,6 +1709,93 @@ pub fn print(s: &str) {
     write(fd::STDOUT, s.as_bytes());
 }
 
+/// A fixed-size formatting buffer for paths that must not allocate.
+///
+/// `format!` on a diagnostic path is the thing this replaces. The kernel's rule
+/// (`docs/reference/subsystems/console.md` § "Printing rules") is that a
+/// diagnostic which needs a healthy heap to report on the heap is the wrong
+/// shape for the job; the same applies to a userspace program with two threads,
+/// where every `format!` from a background thread is an allocation racing the
+/// main one. The kernel answers this with `safe_print!`; userspace had no
+/// equivalent, so this is it — **one** implementation, deliberately, because the
+/// audit behind that rule found eight hand-rolled `struct Buf + impl Write`
+/// copies in the kernel and removing them was the remediation.
+///
+/// Writes past `N` are **dropped, not panicked on**: a truncated diagnostic is
+/// worth more than an abort inside a diagnostic.
+pub struct FixedBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Default for FixedBuf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> FixedBuf<N> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { buf: [0u8; N], len: 0 }
+    }
+
+    /// What has been written so far, as a string. Always valid UTF-8: a write
+    /// that would split a character is dropped whole (see [`core::fmt::Write`]).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // SAFETY-free: only whole `&str` writes land in `buf`, so the prefix is
+        // valid UTF-8 by construction. `from_utf8` keeps that checked rather
+        // than asserted, since this runs on error paths.
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for FixedBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = N.saturating_sub(self.len);
+        if s.len() > room {
+            // Truncate at a character boundary, and report success: a caller
+            // that cannot allocate also cannot usefully handle this error, and
+            // `write!` ignoring it would otherwise abort the whole line.
+            let mut cut = room;
+            while cut > 0 && !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.buf[self.len..self.len + cut].copy_from_slice(&s.as_bytes()[..cut]);
+            self.len += cut;
+            return Ok(());
+        }
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+        Ok(())
+    }
+}
+
+/// `print!` with no heap: formats into an `N`-byte stack buffer and writes once.
+///
+///     safe_print!(120, "[raft] tick {} served={}\n", tick, served);
+#[macro_export]
+macro_rules! safe_print {
+    ($n:expr, $($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let mut __b = $crate::FixedBuf::<$n>::new();
+        let _ = write!(__b, $($arg)*);
+        $crate::print(__b.as_str());
+    }};
+}
+
+/// [`safe_print!`] aimed at an already-open fd rather than stdout.
+#[macro_export]
+macro_rules! safe_write {
+    ($fd:expr, $n:expr, $($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let mut __b = $crate::FixedBuf::<$n>::new();
+        let _ = write!(__b, $($arg)*);
+        $crate::write_fd($fd, __b.as_str().as_bytes());
+    }};
+}
+
 /// Print a string to stdout with a newline
 #[inline(always)]
 pub fn println(s: &str) {
