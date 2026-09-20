@@ -314,10 +314,6 @@ extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
     fatal("#DE divide error", &frame, None);
 }
 
-extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    fatal("#UD invalid opcode", &frame, None);
-}
-
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
     // Diverging by signature: `iretq` from a double fault is not architecturally
     // defined to work, so there is nothing to return to.
@@ -837,6 +833,106 @@ fn write_dr6(v: u64) {
     unsafe {
         core::arch::asm!("mov dr6, {}", in(reg) v, options(nomem, nostack, preserves_flags));
     }
+}
+
+// `#UD` — vector 6, no error code, same shape as `#DB` above and for the same
+// reason: a ring-3 `#UD` must be able to redirect into a `SIGILL` handler (or,
+// with none installed, kill just that process), which needs the full
+// `TrapRegs` and a rewritable return address. The generated `x86-interrupt`
+// stub this vector used before could only halt the machine — proven live
+// 2026-09-20, where `llama-server`'s OpenBLAS runtime dispatch executed an
+// instruction the vCPU does not actually expose (Firecracker, 4 vCPUs) and
+// took the whole guest down instead of just that one process, reproducing the
+// same wedge seen on bare metal. A ring-3 `#UD` has no "disarm and continue"
+// story the way a stray `#DB` does — the instruction bytes really are bad —
+// so ring 0 still falls through to `fatal`.
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global invalid_opcode_entry
+invalid_opcode_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rdi, [rsp + 120]             /* &InterruptStackFrame */
+    lea rsi, [rsp]                   /* &TrapRegs */
+    call invalid_opcode_dispatch
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+"#
+);
+
+unsafe extern "C" {
+    /// The vector-6 entry point, installed in the IDT by [`init`].
+    fn invalid_opcode_entry();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn invalid_opcode_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    akuma_bkl::sync::set_core_tag_transient(
+        crate::smp::cpu_index_u32(),
+        akuma_bkl::sync::HOLD_TAG_FAULT,
+    );
+    // SAFETY: the stub passes a pointer into the current stack, to the frame
+    // the CPU just pushed; it is live and exclusively ours until `iretq`.
+    let f = unsafe { &mut *frame };
+    if f.cs & 3 == 3 {
+        crate::uaccess::clac_if_enabled();
+        // SAFETY: as in `general_protection_dispatch`, and the BKL for the
+        // same reason.
+        let regs = unsafe { &mut *regs };
+        let took = !crate::smp::bkl_held();
+        if took {
+            crate::smp::bkl_enter();
+        }
+        let delivered = crate::signal::deliver_fault_signal(
+            f, regs, SIGILL, crate::signal::segv::SI_KERNEL, 0,
+        );
+        if took {
+            crate::smp::bkl_leave();
+        }
+        if delivered {
+            return;
+        }
+        // No handler: Linux's default for `SIGILL` is to terminate, which is
+        // what `user_fault` does here — the process, not the kernel.
+        user_fault("#UD invalid opcode (ring 3, no handler)", f, None, Some(regs));
+    }
+    fatal("#UD invalid opcode", f, None);
 }
 
 fixable_exception_entry!("page_fault_entry", "page_fault_dispatch");
@@ -1417,6 +1513,9 @@ const SIGSEGV: u32 = 11;
 /// `SIGTRAP`, the signal a ring-3 `#DB` is.
 const SIGTRAP: u32 = 5;
 
+/// `SIGILL`, the signal a ring-3 `#UD` is.
+const SIGILL: u32 = 4;
+
 /// `#GP` — fatal, except inside the user-copy loop.
 ///
 /// A **non-canonical** address (bit 47 not sign-extended into 48..63) is not a
@@ -1611,7 +1710,7 @@ pub fn init() {
         install_exception_stubs_with_code(idt);
         (*idt)[0].set(divide_error as usize);
         (*idt)[1].set(debug_entry as usize);
-        (*idt)[6].set(invalid_opcode as usize);
+        (*idt)[6].set(invalid_opcode_entry as usize);
         (*idt)[8].set(double_fault as usize);
         // The hand-assembled entries; see the module header.
         (*idt)[13].set(general_protection_entry as usize);

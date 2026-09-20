@@ -276,6 +276,14 @@ syscall_table! {
     /// `None` at the boundary. x86-only `chmod`(90) has no asm-generic twin and
     /// stays a shim, narrowing to [`Self::Fchmodat`] with `AT_FDCWD`.
     Chdir      => CHDIR      = 80,  nr::CHDIR;
+    /// `fchdir` — added 2026-09-20 after `apk add`'s busybox/llama.cpp
+    /// post-install hooks each died with `fchdir: Function not implemented`
+    /// under Firecracker on amd64: the implementation
+    /// (`akuma_syscalls_glue::fs::sys_fchdir`) was already wired into the
+    /// dispatch table (`nr::FCHDIR`), same gap as [`Self::Chdir`] before it —
+    /// the number just had no variant here, so `from_x86_64(81)` answered
+    /// `None` before glue was ever reached.
+    Fchdir     => FCHDIR     = 81,  nr::FCHDIR;
     /// x86_64 91, asm-generic 52. Same session as [`Self::Chdir`] — the arm was
     /// `ENOSYS` while glue's `sys_fchmod` and the ext2 mode bits behind it were
     /// real, and `git` chmods every file it writes.
@@ -1001,6 +1009,8 @@ mod tests {
     fn cwd_and_mode_rows() {
         assert_eq!(Syscall::Chdir.to_x86_64(), 80);
         assert_eq!(Syscall::Chdir.to_aarch64(), nr::CHDIR);
+        assert_eq!(Syscall::Fchdir.to_x86_64(), 81);
+        assert_eq!(Syscall::Fchdir.to_aarch64(), nr::FCHDIR);
         assert_eq!(Syscall::Fchmod.to_x86_64(), 91);
         assert_eq!(Syscall::Fchmod.to_aarch64(), nr::FCHMOD);
         assert_eq!(Syscall::Fchmodat.to_x86_64(), 268);

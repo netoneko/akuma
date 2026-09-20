@@ -1543,6 +1543,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // further wiring. x86-only `chmod`(90) arrives as the `Fchmodat` shim
         // in the legacy block above.
         Syscall::Chdir => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        // `fchdir(fd)` — added 2026-09-20 alongside the `akuma-syscalls-abi`
+        // row: the abi table alone was not enough, because this match has no
+        // catch-all forwarding to glue (see `_ => errno::ENOSYS` below) — a
+        // decodable `Syscall` still needs its own arm here or it falls into
+        // that default. Same glue fn as `Chdir` reaches (`sys_fchdir`), just
+        // keyed by fd instead of a path pointer.
+        Syscall::Fchdir => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         Syscall::Fchmod => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         Syscall::Fchmodat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `close(fd)` — **served by glue** (4b batch 2b). Two prerequisites had
