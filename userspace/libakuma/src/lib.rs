@@ -300,6 +300,15 @@ pub mod syscall {
         pub const WAIT4: u64 = 61;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
         pub const SET_BOX_STACK: u64 = AKUMA_PRIVATE_BASE + 324;
+        /// Real x86_64 numbers for the `linux-abi` `spawn_full` path, the
+        /// twins of the aarch64 pair above. These are the *x86_64* spellings
+        /// (59 / 292), NOT the asm-generic ones (221 / 24) — on x86_64, 221
+        /// is `fadvise64` and 24 is `sched_yield`, so borrowing the aarch64
+        /// numbers here would dispatch to the wrong handler rather than fail
+        /// loudly. Absent until 2026-09-20, which is what made
+        /// `--features linux-net` a build error on this target.
+        pub const EXECVE: u64 = 59;
+        pub const DUP3: u64 = 292;
     }
 }
 

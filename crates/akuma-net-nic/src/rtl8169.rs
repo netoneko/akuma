@@ -288,15 +288,11 @@ const MAX_STALL_REPORTS: u32 = 5;
 /// How many receive laps between PHY samples. See [`Rtl8169Device::take_rx_frame`].
 const LINK_SAMPLE_LAPS: u32 = 1024;
 
-/// How many times the recovery may fire on suspicion alone — that is, because
-/// **no frame has ever arrived**, rather than because the chip reported `RDU`.
-///
-/// Bounded, and the bound is the point. `RDU`-driven kicks are evidence-backed
-/// and uncapped (a chip that needs restarting every few seconds still needs
-/// restarting); this path has no evidence beyond silence, so on the one link
-/// that is genuinely up and genuinely idle it must stop rather than reset the
-/// ring cursor forever.
-const MAX_BLIND_KICKS: u32 = 3;
+/// How many failed blind recoveries before the whole chip is re-initialised
+/// rather than merely kicked. Four, so the cheap recovery gets a fair run
+/// (~20 s at [`STALL_QUIET_US`]) before the expensive one is tried.
+const BLIND_REINIT_EVERY: u32 = 4;
+
 
 pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
@@ -342,8 +338,8 @@ pub struct Rtl8169Device {
     /// sets to "now" the first time it sees a clock so that bring-up silence is
     /// not counted against the chip — so it cannot answer this question.
     rx_seen: bool,
-    /// Recoveries spent on the "nothing has ever arrived" suspicion. Capped at
-    /// [`MAX_BLIND_KICKS`].
+    /// How many recoveries the "nothing has ever arrived" suspicion has spent.
+    /// Counted for the console line, never used as a limit.
     blind_kicks: u32,
     /// The copy-out receive path's target, handed up to smoltcp as an
     /// `RxToken`. smoltcp may build a reply through a `TxToken` **while that
@@ -603,8 +599,20 @@ impl Rtl8169Device {
             // the window has passed, and **not one frame has ever arrived**.
             // On any real LAN that is already wrong; the crate's own bring-up
             // note is that broadcast traffic alone climbs the counter within
-            // seconds. Capped, because silence is suspicion and not evidence.
-            let blind = !self.rx_seen && self.link_up && self.blind_kicks < MAX_BLIND_KICKS;
+            // seconds.
+            //
+            // **Not capped**, for the same reason the `RDU` arm is not: this is
+            // what keeps the machine on the network, and a receiver that has
+            // never started still needs starting. It was capped at three for
+            // one boot on 2026-09-20 and that was wrong — one boot recovered on
+            // the first kick and the next did not recover at all, and a cap
+            // makes "the recovery does not work" indistinguishable from "the
+            // recovery was allowed three tries". On this box the difference is
+            // a person walking to the machine. Retry cadence is
+            // [`STALL_QUIET_US`], because `on_stall` restarts that window;
+            // printing is capped by [`MAX_STALL_REPORTS`], which is how this
+            // file already makes that trade.
+            let blind = !self.rx_seen && self.link_up;
             let stalled = quiet && (self.rx_backpressure || blind);
             if stalled {
                 if blind && !self.rx_backpressure {
@@ -614,6 +622,33 @@ impl Rtl8169Device {
                 self.idle_laps = 0;
                 self.last_rx_us = now_us();
                 self.on_stall();
+
+                // Escalation. `kick_receiver` restates `RDSAR` and resets the
+                // driver's cursor, which is enough when the two merely drifted
+                // apart — measured 2026-09-20, one boot came back on the first
+                // one. The next boot did not come back at all, so there is a
+                // state it does not reach, and the next bigger hammer is the
+                // bring-up sequence itself: `init` resets the chip, repopulates
+                // the rings and rewrites both ring bases.
+                //
+                // Only from the `blind` arm, and only once several kicks have
+                // failed: this throws away anything in flight, which is the
+                // wrong trade for a link that is passing traffic. It cannot be
+                // the wrong trade here, because `!rx_seen` means nothing has
+                // arrived since bring-up.
+                //
+                // It prints its own line so the two recoveries stay tellable
+                // apart in a log — attribution between the `RDU` arm and this
+                // one already cost a session's worth of uncertainty.
+                if blind && !self.rx_backpressure && self.blind_kicks.is_multiple_of(BLIND_REINIT_EVERY) {
+                    let r = self.nic.init();
+                    crate::safe_print!(
+                        104,
+                        "[rtl] blind #{}: full re-init -> {}\n",
+                        self.blind_kicks,
+                        if r.is_ok() { "ok" } else { "FAILED" }
+                    );
+                }
             }
             return None;
         };

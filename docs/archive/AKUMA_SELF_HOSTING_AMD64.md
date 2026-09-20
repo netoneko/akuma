@@ -2904,3 +2904,228 @@ not ruled out with evidence from a live boot.
   means and why it exists.
 - `docs/archive/AKUMA_AMD64_NETPOLL_LAPS_ZERO.md` — the boot-SNTP rate-limit
   bug this session was checking DHCP against when it paused.
+
+## The "BKL storm wedge" was neither a wedge nor the BKL: the RX ring cursor desynced (2026-09-20, resolved)
+
+The section above left the first failed boot "not established" — whether it
+would have cleared on its own or was a genuine stall. It was neither. The
+machine was **healthy and deaf**, and the `[BKL] stuck … tag=502` storm was the
+documented-benign idle pattern doing exactly what its doc says it does.
+
+### What the console actually said
+
+A photograph of the failing boot, read line by line:
+
+```
+clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+[BKL] stuck: owner=3 waiter=4 tag=502 (aff0+1)          <- HOLD_TAG_IDLE, benign
+[PSTATS] PID 19 (/bin/sshd) 32.25s: 30721 syscalls (952/s)
+         nanosleep=10230(32122ms) nr43=10230(3ms) …
+[SLOT] census core=2 free=504 ready=0 running=3 term=0 init=0 wait=5
+```
+
+- `ready=0` — nothing runnable. Idle, not livelocked.
+- `pmm=3783346free/4178255tot` — 3.78 M of 4.18 M pages free. Not OOM.
+- `nr43=10230` paired 1:1 with `nanosleep=10230`, 32.1 s of nanosleep across a
+  32.25 s lifetime. x86_64 43 is `accept`. **sshd had bound, listened, and was
+  accept-polling every ~3 ms.** Nothing ever arrived.
+
+So every "wedge" symptom was one fault: the box could not receive.
+
+### Measuring it from outside: transmit worked, receive did not
+
+| probe | `.220` | `.123` | control `.1` |
+|---|---|---|---|
+| Ryzen `ping` + `ip neigh` | `INCOMPLETE` | `INCOMPLETE` | `lladdr … REACHABLE` |
+| Mac TCP connect | `EHOSTDOWN` 0.00 s | — | `REFUSED` (RST) 0.05 s |
+| `/24` ping sweep | silent | silent | answers |
+
+Yet the Mac's ARP cache **gained** `192.168.1.220 → 60:02:92:61:4e:73` at
+t≈38 s of the Akuma boot, having been `incomplete` at t≈22 s. The box has no
+way to appear there except by broadcasting its own ARP request for the gateway,
+which the SNTP/DNS attempt to `1.1.1.1` makes it do. Transmit worked; receive
+did not.
+
+**Do not read "no ssh on .123" as a wedge.** `.123` is only ever the DHCP
+lease. `amd64/src/net.rs:393` sets `BARE_METAL_STATIC_V4 = 192.168.1.220`, and
+`crates/akuma-net/src/smoltcp_net/init.rs:105` installs it **at bring-up,
+before DHCP runs**. With no RX there is no lease, so the box sits on `.220`
+for the whole boot while every tool in the loop knocks on `.123`. Probe both.
+
+### The fault
+
+The diagnostic that finally printed:
+
+```
+[rtl] cr=0x0c isr=0x0010 imr=0x002f rcr=0x0000c70e mpc=0 misc=0x0000003f
+      rxdv_gated=0 cursor=15/16
+[rtl]  rx[0]  cmdstat=0x3801c09a buf=0x5a7f80   <- OWN clear, FS+LS, len 154
+[rtl]  rx[1..14] cmdstat=0x80000800             <- OWN set, empty
+[rtl]  rx[15] cmdstat=0xc0000800                <- OWN set, empty, EOR
+[rtl] kick: misc 0x3f -> 0x3f (gate was clear)
+```
+
+`cursor=15/16`: the driver was inspecting slot **15**. The chip had written a
+154-byte frame into slot **0** and handed it back. `take_rx_frame` only ever
+looks at its own cursor, saw 15 still chip-owned, and reported "nothing
+arrived" — for the rest of the boot. Transmit uses a separate ring and was
+untouched, which is the one-directional signature above.
+
+`rxdv_gated=0` and `mpc=0` are what make this conclusive: the receiver was
+never gated off, and the MAC never dropped a frame for want of a descriptor.
+**Nothing was wrong with the chip.** The driver was reading the wrong slot.
+
+The recovery is the last line of `Nic::kick_receiver`
+(`crates/akuma-net-rtl8169/src/driver.rs:324`):
+
+```rust
+self.rx = RxRing::new(self.mem.rx_ring_len());
+```
+
+which puts the cursor back to 0, where the frame was. Everything unwound at
+once: `clock: synced via SNTP` → `[SmolNet] DHCP configured` → `IP:
+192.168.1.123/24` → ssh at 63.2 s.
+
+### Why it stayed broken: the recovery was unreachable in its own failure case
+
+`crates/akuma-net-nic/src/rtl8169.rs` gated the whole stall path on evidence a
+dead receiver cannot produce:
+
+```rust
+let stalled = quiet && self.rx_backpressure;     // before
+```
+
+`rx_backpressure` is set in exactly one place, from `INT_RDU` — *"the ring ran
+dry with a frame waiting"*. When **nothing arrives at all**, no `RDU` is
+raised, so `on_stall()` never ran: no dump, and no `kick_receiver()`. The
+recovery for a stopped receiver could only fire while the receiver was partly
+working.
+
+That is a consequence of a real earlier fix, not carelessness: reading `MPC`
+on every lap is what livelocked the box twice on 2026-09-19
+(`AMD64_TRASHCAN_ISSUES.md` §7b), so every register read was removed from the
+lap and `RDU` alone was kept. Sound for "ring ran dry", blind for "receiver
+never started".
+
+The change adds a second arm that needs no register read:
+
+```rust
+let blind = !self.rx_seen && self.link_up && self.blind_kicks < MAX_BLIND_KICKS;
+let stalled = quiet && (self.rx_backpressure || blind);
+```
+
+`rx_seen` is deliberately separate from `last_rx_us`, which the stall watch
+sets to "now" on first seeing a clock so bring-up silence is not counted
+against the chip — so it cannot answer "has anything *ever* arrived".
+
+**It was capped at three, and that was wrong.** The next boot after the
+recovering one did not come back at all, and with a cap there is no way to read
+that: "the recovery does not work" and "the recovery was allowed three tries"
+produce the same silent box. The cap is gone. That matches what the file
+already says about the `RDU` arm — *"the recovery itself is **not** capped — it
+is what keeps the machine on the network"* — and only the printing is bounded,
+by `MAX_STALL_REPORTS`. The cost of being wrong is nil in the direction that
+matters: `!rx_seen` means not one frame since bring-up, so a kick against a
+genuinely idle link resets a cursor with nothing behind it.
+
+Every fourth blind recovery now escalates from `kick_receiver` to a full
+`Nic::init` — chip reset, rings repopulated, both ring bases rewritten — on the
+reasoning that a boot which does not come back on the first kick has reached a
+state the cheap recovery does not cover. It prints its own line
+(`[rtl] blind #N: full re-init -> ok`) so the two recoveries stay tellable
+apart in a log; attribution between the `RDU` arm and the blind one already
+cost a session's worth of uncertainty and should not cost another.
+
+A link `down -> up` edge also re-arms the receiver now, on the sample the lap
+already takes. That was written for a gate theory the dump then refuted
+(`rxdv_gated=0`); it is kept because it costs one MMIO burst on a transition
+only, and it did not fire on the recovering boot.
+
+### What is NOT established
+
+- **Attribution.** The stall snapshot shows `isr=0x0010` = `INT_RDU`, so the
+  pre-existing `rx_backpressure` arm may have fired on its own. Three unpatched
+  boots stayed deaf and one patched boot recovered — but the **next** patched
+  boot did not recover either, so one kick is demonstrably not always enough
+  and the single recovery cannot carry much weight. The A/B was never run.
+- **Whether the recovery works at all.** As of the uncapped + escalating
+  version this is open. What is *not* open is the diagnosis: `cursor=15/16`
+  against a frame in `rx[0]` is not an inference.
+- **Root cause of the desync.** The kick papers over it. Why the cursor and the
+  chip disagree is untouched, and `AKUMA_AMD64_STREAM_END_STALL.md` describes
+  this chip writing completions outside the ring it was given — plausibly the
+  same fault.
+- **Why it started.** The box's own mtimes put a *working* Akuma network at
+  01:13–01:16 on 2026-09-20 (`/etc/{network,udhcpc,apk/world}`, i.e. `apk add`
+  writes), in an Akuma session entered from Ubuntu at 21:06 the evening before.
+  So "a warm reboot from Ubuntu always breaks it" is **wrong** — that exact
+  transition worked. Something changed between 01:16 and 04:37 and this
+  investigation did not find it.
+
+### Kernel identity is irrelevant — three of them failed identically
+
+| kernel | built from | result |
+|---|---|---|
+| `akuma-amd64` (cats-everywhere) | `c3f1eeac` + | deaf, 5 min |
+| `akuma-amd64.good` | pre-`8f63e2ad`, Sep 19 20:13 | deaf, 5 min |
+| `main` (`a8b51962`) | includes `8f63e2ad` | deaf, 5 min |
+| `main` + the RX patch | | **ssh at 63.2 s** |
+
+This also clears the three fixes in `AKUMA_AMD64_UD_CRASH_CONTAINMENT.md` and
+the `socket_bind` `EADDRINUSE` check in `8cdfe773`, both of which were
+suspected during the session. `8cdfe773` is Sep 20 03:18 and `.good` is Sep 19
+20:13, so `.good` cannot contain it; and `socket_bind` walks the userspace fd
+table, which neither the `dhcpv4::Socket` nor ICMP echo ever passes through.
+
+### Models verified on bare metal
+
+With RX alive, all three staged models served real `/v1/chat/completions`
+traffic from `/bin/llama-server` (the vendored build,
+`userspace/llama.cpp/docs/AMD64_BUILD.md`):
+
+| model | load | completion | output |
+|---|---|---|---|
+| `smollm2-135m` | < 2 s | 1.1 s | `Blue, Green, Red` |
+| `smollm2-360m` | 47 s | 2.3 s | `Red, Blue, Green` |
+| `qwen2.5-0.5b` | 50 s | 6.8 s | `Red, Yellow, Blue` |
+
+### One server, several slots — not one server per agent
+
+The first native litter-yard attempt gave each of three agents its own
+`llama-server`, on top of one already running from the model test: four model
+loads at once on a four-core box. ICMP stopped answering and sshd could not
+finish a banner exchange; the box needed a manual restart. Note the shape,
+because it is **not** the RX fault and must not be read as one — `:2222`
+accepted TCP and got partway into the handshake before dying, which means the
+stack was alive and the netpoll thread was starved.
+
+`llama-server --parallel N` does this properly: the queueing happens inside one
+process instead of as CPU contention between four.
+
+### Background
+
+- `docs/archive/AKUMA_AMD64_STREAM_END_STALL.md` — this chip writing
+  completions outside its ring; likely the same root cause as the desync.
+- `docs/archive/AMD64_TRASHCAN_ISSUES.md` §7b — why no register reads may
+  return to the receive lap.
+- `docs/archive/BKL_VFS_CARVE_OUT.md` §18 — `tag=502` = `HOLD_TAG_IDLE`.
+
+### Console budget: `[FUTEX]` and `[PIPES]` are off (2026-09-20)
+
+Both were added 2026-09-18 for the `-j4` wedge, which is root-caused and fixed
+(`docs/archive/` — the KTG stale-tid exit stamp). They fire from the same
+30-second PSTATS block in `amd64/src/sched.rs` and what they cost now is
+console.
+
+That cost is not cosmetic on this target. **The console is the debugger here**
+— it is the only channel left when the network is down, which is precisely the
+state worth reading — and `[rtl]`'s stall dump is nineteen lines that have to
+survive next to them.
+
+They are gated on `const DUMP_FUTEX_WAITERS/DUMP_PIPE_TABLE: bool = false`
+rather than commented out or given `#[allow(dead_code)]`. The calls stay
+type-checked and count as uses, so `dump_waiters`, `DUMP_KEY_LIMIT`, `report`
+and `Waiter`'s timestamp field do not rot — all four are `deny(dead_code)`
+failures the moment the call disappears — and the optimiser drops the branch:
+neither `[FUTEX] wakes=` nor `[PIPES] live=` survives in the linked image.
+Flip either const to `true` to get it back.

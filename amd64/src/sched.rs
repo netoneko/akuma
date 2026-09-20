@@ -1048,6 +1048,21 @@ pub fn idle_loop() -> ! {
         {
             static LAST_PSTATS_US: core::sync::atomic::AtomicU64 =
                 core::sync::atomic::AtomicU64::new(0);
+            // Both OFF since 2026-09-20. `[FUTEX]` and `[PIPES]` were added
+            // for the `-j4` wedge and that is root-caused and fixed; what they
+            // cost now is console. On this target the console IS the debugger —
+            // it is the only channel left when the network is down, which is
+            // exactly the state worth reading — and these two push the lines
+            // that matter off the top. `[rtl]`'s stall dump is nineteen lines
+            // and has to survive beside them.
+            //
+            // `const` rather than `#[allow(dead_code)]` on four items: the
+            // calls stay type-checked and count as uses, so `dump_waiters`,
+            // `DUMP_KEY_LIMIT`, `report` and `Waiter`'s timestamp field do not
+            // rot, and the optimiser deletes the branch outright. Flip either
+            // to `true` to get it back.
+            const DUMP_FUTEX_WAITERS: bool = false;
+            const DUMP_PIPE_TABLE: bool = false;
             const PSTATS_INTERVAL_US: u64 = 30_000_000;
             let now_us = crate::net::uptime_us();
             let last = LAST_PSTATS_US.load(Ordering::Relaxed);
@@ -1071,14 +1086,19 @@ pub fn idle_loop() -> ! {
                 dump_slot_table();
                 // §13: and once the slot table says "WAITING in futex", the
                 // next question is *which* futex — that is this.
-                crate::futex::dump_waiters();
+                //
+                if DUMP_FUTEX_WAITERS {
+                    crate::futex::dump_waiters();
+                }
                 akuma_primitives::safe_print!(96,
                     "[SLOT] stale-fs windows closed: {}\n", stale_fs_windows());
                 // `MAX_PIPES` is machine-wide and small on purpose; this is
                 // the reading that says whether a workload is near it. A
                 // `-j8` self-host build refuses at it (`ENFILE`, which `std`
                 // reports as "Too many open files in system" from a *spawn*).
-                crate::pipe::report();
+                if DUMP_PIPE_TABLE {
+                    crate::pipe::report();
+                }
             }
         }
         if !threading::x86_yield() {
