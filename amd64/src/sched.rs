@@ -2071,13 +2071,36 @@ pub fn yield_now() {
     // unlocked": these are wait loops with no other way to make progress, and a
     // kernel thread spinning in ring 0 is only *asked* to reschedule by the
     // tick, never forced — so refusing to switch would livelock them.
+    //
+    // **Except a thread inside a deliberately-dropped-BKL window
+    // (`akuma_bkl::bkl::dropped_window_open`, e.g. a blocking network
+    // recv/send under `no-bkl-network`).** That thread does not merely
+    // "not hold the BKL right now" the way a ring-3-return caller doesn't —
+    // it has asked, by name, not to hold it until it explicitly closes the
+    // window. Taking it here anyway is the AArch64 `[BKL] stuck` regression
+    // (`docs/archive/BKL_VFS_CARVE_OUT.md` §8) reached from this target's
+    // scheduler instead of an eret epilogue: AArch64 fixed it with
+    // `reconcile_for_spsr` consulting the same ledger at the eret boundary;
+    // this target has no eret boundary to hook (`smp.rs`'s note on why
+    // `reconcile_for_spsr` "has no amd64 counterpart" is true for the
+    // syscall entry/exit boundary, but this cooperative-yield boundary is a
+    // different thing it didn't cover). Because the BKL is core-scoped and
+    // reentrant, "take it for the switch" here does not release until THIS
+    // thread is scheduled back in — and every other thread that runs on this
+    // core in between inherits the hold for free, so a wait loop that never
+    // becomes ready (a stalled HTTP read, measured live 2026-09-20: a hung
+    // `chat_once` response held `[BKL] stuck: owner=N` for 27+ seconds and
+    // starved sshd's own accept/banner to death) pins the whole core, and
+    // every peer core spinning on `bkl_enter` behind it, for as long as the
+    // condition stays false — not for one scheduling slice.
     let held = smp::bkl_held();
-    if !held {
+    let bkl_free_by_choice = akuma_bkl::bkl::in_dropped_window();
+    if !held && !bkl_free_by_choice {
         YIELDS_THAT_TOOK_BKL.fetch_add(1, Ordering::Relaxed);
         smp::bkl_enter();
     }
     threading::yield_now();
-    if !held {
+    if !held && !bkl_free_by_choice {
         // The lock belongs to the core and travels with it across the switch,
         // so this core holds it again now whoever resumed us handed it over.
         smp::bkl_leave();

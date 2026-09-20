@@ -1,6 +1,75 @@
 # amd64: does networking take the BKL?
 
-Stability grade: **C** (fresh static audit, 2026-09-19, no runtime measurement).
+Stability grade: **B** for §6 below (live-reproduced on the trashcan,
+2026-09-20) and the fix that landed for it; **C** for everything else in this
+doc (§1-5 remain the original static audit, unconfirmed by a runtime
+measurement).
+
+## 2026-09-20: live-confirmed, and a fix for the `yield_now` half — not the
+## whole picture
+
+This audit's prediction happened for real, on the trashcan, from a completely
+unplanned trigger: `meow litter live`'s `chat_once` blocked on a `read(2)`
+from a local llama.cpp server whose `/v1/chat/completions` response never
+completed (client-observed independently with a plain `wget POST` against the
+same endpoint — same hang, no meow involved). The console showed a **sustained**
+`[BKL] stuck: owner=4 waiter=3/1 tag=501` storm — the same owner, repeating
+across 27+ seconds of `[probe]` ticks — while `ssh` to the box timed out
+*during the banner exchange* (sshd could not even greet a new connection) and
+the RTL8169 driver cycled `[rtl] silent #36/#40/#44: full re-init -> ok`
+repeatedly, almost certainly from its own poll loop being starved behind the
+same lock. The box did not recover on its own; it needed a physical power
+cycle.
+
+**The mechanism found, which this doc's §1-3 did not name:** `read(2)` on a
+socket fd (as opposed to `sock.rs`'s dedicated `recvfrom`/`sendto`, see the
+correction below) folds into the **shared** `akuma_syscalls_glue::fs::sys_read`
+(`amd64/src/fd.rs:989`), whose `Socket` arm *does* wrap the blocking
+`socket_recv` call in `NetBklGuard`/`dropped_window_open()` — the same carve-
+out AArch64 uses, correctly ported. The gap was one level up, in the
+scheduler's own cooperative yield: `amd64/src/sched.rs`'s `yield_now()` (the
+function `blocking_relax`/`wait_until`'s park loop calls every lap) checked
+only `smp::bkl_held()` before deciding whether to acquire the BKL "just for
+the switch" — it did not check whether the yielding thread was inside a
+*deliberately*-dropped-BKL window. Because the BKL is core-scoped and
+reentrant (`amd64/src/smp.rs`'s own design note), "take it for the switch,
+give it back when this thread resumes" holds the lock for **every thread that
+runs on that core in between**, for as long as the yielding thread stays
+parked — which, for a wait loop whose condition never becomes true, is
+unbounded. This is the exact bug class AArch64's `reconcile_for_spsr` +
+per-thread dropped-window ledger were built to close
+(`docs/archive/BKL_VFS_CARVE_OUT.md` §8) — reached here through the
+scheduler's explicit-call switch boundary instead of an eret epilogue, which
+`amd64/src/smp.rs`'s note that AArch64's `reconcile_for_spsr` "has no amd64
+counterpart and needs none" does not cover (that note is correct for the
+*syscall entry/exit* boundary; the cooperative-yield boundary is a different
+thing).
+
+**The fix** (`amd64/src/sched.rs`, `yield_now()`): added a
+`akuma_bkl::bkl::in_dropped_window()` check alongside the existing
+`bkl_held()` one, so a thread already inside a dropped-BKL window is left
+alone — mirroring `reconcile_for_spsr`'s `release = target_is_el0 ||
+note_preserved_window()` logic, adapted for this target's boundary. Verified:
+compiles clean for `x86_64-unknown-none`; the local QEMU/TCG fast lane
+(`scripts/utils/amd64_trials.py --local-only`) passes 730/731 both with and
+without the change (the one failure, `mmap: the lazy path was actually
+taken`, is pre-existing and unrelated); staged onto the trashcan's own
+checkout via `git apply` + `kbuild` for a real-hardware retest of the
+triggering scenario.
+
+**What this fix does NOT touch — §1's own finding stands.** `amd64/src/sock.rs`
+still has no BKL guard of any kind, confirmed unchanged by this pass. A thread
+blocked inside `sock.rs`'s native `sendto`/`recvfrom`/`accept`/`connect` never
+calls `dropped_window_open()` in the first place — it holds the BKL the whole
+time via the unconditional `bkl_enter()` at syscall entry (§1), and the
+`yield_now()` fix above has nothing to check, since `in_dropped_window()` is
+false and `held` is true throughout. **So there are two separate amd64 gaps,
+not one**: the scheduler not honoring an existing carve-out (fixed here) and
+`sock.rs` never having a carve-out to honor (§1-3, still open). A client using
+plain `read(2)`/`write(2)` on a socket fd (this incident's actual path) gets
+the fix; one using `recv(2)`/`send(2)`/`recvfrom(2)`/`sendto(2)` explicitly
+does not, and would need `NetBklGuard`-equivalent wiring added to `sock.rs`
+itself — the gap §1-5 already describe in detail.
 
 ## Answer
 
