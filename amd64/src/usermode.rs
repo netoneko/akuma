@@ -4462,6 +4462,40 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
     let Ok(path) = core::str::from_utf8(&path_bytes) else {
         return errno::EINVAL;
     };
+    // Against the process's own directory — see [`process_relative_path`].
+    let path = process_relative_path(path);
+
+    let argv_owned = {
+        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
+            return crate::fd::errno::E2BIG;
+        };
+        if v.is_empty() {
+            v.push(path_bytes.clone());
+        }
+        v
+    };
+    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
+        return crate::fd::errno::E2BIG;
+    };
+
+    do_execve(slot, path, argv_owned, envp_owned)
+}
+
+/// The image-loading half of `execve`, split out so a `#!` script can recurse
+/// into it with the interpreter's path and a rebuilt argv — same shape as
+/// `sys_execve`'s split into this and [`sys_execve`] itself, and the same
+/// split AArch64's `akuma-syscalls-glue::proc` already has
+/// (`sys_execve`/`do_execve`). `slot` is threaded through rather than
+/// recomputed: it names the *calling task*, which a shebang hop does not
+/// change.
+fn do_execve(
+    slot: usize,
+    path: alloc::string::String,
+    argv_owned: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    envp_owned: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> u64 {
+    use crate::fd::errno;
+
     // The image read runs BKL-free per `EXEC_BKL_DROP_ENABLED` — on a USB disk
     // whose transfer stalled, this read is the multi-second BKL hold behind the
     // `[BKL] stuck` storm of 2026-09-11 (`exec_runtime.rs` § "The exec-side
@@ -4480,26 +4514,56 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
     // wrapper is a link) and lifts the 16 MiB cap through chunked `read_at`,
     // which is what a 42 MB `cc1` needs
     // (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
-    // Against the process's own directory — see [`process_relative_path`].
-    let path = process_relative_path(path);
-    let path = path.as_str();
-    let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image(path)) {
+    let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image(&path)) {
         Ok(image) => image,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
     };
 
-    let argv_owned = {
-        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
-            return crate::fd::errno::E2BIG;
+    // `#!interpreter [arg]` — added 2026-09-20; this target had never had any
+    // shebang handling and handed the raw script bytes straight to the ELF
+    // loader, which rejected them as `ENOEXEC` (docs/README.md's symptom
+    // matrix, "execve of a `#!` script fails with Exec format error"). A shell
+    // hides this by retrying a non-ELF child itself, so it only showed up the
+    // moment something else — `rustc` execing its linker, `apk`'s hooks —
+    // called `execve` directly. Same parser and argv-construction rule as the
+    // AArch64 kernel's `akuma-syscalls-glue::proc::exec_shebang`, both
+    // host-tested in `akuma-exec`'s `shebang_tests`, so the two cannot drift.
+    if image.len() >= 2 && image[0] == b'#' && image[1] == b'!' {
+        let head = &image[..image.len().min(akuma_exec::process::SHEBANG_MAX)];
+        let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(head) else {
+            return errno::ENOENT;
         };
-        if v.is_empty() {
-            v.push(path_bytes.clone());
+        // Owned, before `image` (which `interpreter`/`shebang_arg` borrow) is
+        // dropped — the recursive `do_execve` below may `eret` on success and
+        // abandon every frame here, so nothing large may still be borrowed.
+        let interp_argv0 = alloc::string::String::from(interpreter);
+        let interp_arg = shebang_arg.map(alloc::string::String::from);
+        drop(image);
+
+        // Symlink-resolved, like the AArch64 side: a `#!/bin/sh` reached
+        // through a symlink must still load the real interpreter, and
+        // `interp_argv0` (as written in the `#!` line) stays what argv[0]
+        // becomes — collapsing the two loses the interpreter's identity for a
+        // multi-call binary that dispatches on argv[0] (busybox).
+        let interp_path = akuma_vfs_glue::resolve_symlinks(&interp_argv0);
+
+        let mut new_argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = akuma_exec::process::shebang_hop(
+            &interp_argv0,
+            interp_arg.as_deref(),
+            &path,
+            &[],
+        )
+        .into_iter()
+        .map(alloc::string::String::into_bytes)
+        .collect();
+        if argv_owned.len() > 1 {
+            new_argv.extend(argv_owned.into_iter().skip(1));
         }
-        v
-    };
-    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
-        return crate::fd::errno::E2BIG;
-    };
+        drop(path);
+
+        return do_execve(slot, interp_path, new_argv, envp_owned);
+    }
+
     let argv_refs: alloc::vec::Vec<&[u8]> =
         argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
     let envp_refs: alloc::vec::Vec<&[u8]> =
@@ -4535,7 +4599,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
     // registration: `image.name` is what `/proc/<pid>/exe` reports, and
     // `argv[0]` is a name the caller chose rather than something that opens.
     // `ps` is unaffected — `akuma_procfs::ProcStat::comm` takes the basename.
-    let new_name = alloc::string::String::from(path);
+    let new_name = path;
 
     let pid = current_pid();
     let new_root = next.space.ttbr0();
