@@ -6,10 +6,11 @@ rather than closing it. Nothing here is a regression — it is a divergence that
 has been true since the x86 scheduler was written, and it was written down
 because a second bug had already come out of it.
 
-**Status (2026-09-20): three of the four gaps are closed; §3.1 is not.** The
-reaper exists — see §8 for what landed, what it is verified against, and what
-is deliberately still open. Read §3 as the statement of the problem, not as the
-current state of the tree.
+**Status (2026-09-20): three of the four gaps are closed and CONFIRMED ON
+HARDWARE; §3.1 is not.** The reaper exists, and it has been run on the
+bare-metal box and under Firecracker/KVM as well as in QEMU — §8.4 has the
+numbers. Read §3 as the statement of the problem, not as the current state of
+the tree; §8 is what landed and what is deliberately still open.
 
 Everything below is verified against the tree at `308580a2` plus the UAF fix.
 File:line references are to that state; check them before trusting them.
@@ -438,8 +439,72 @@ every one of them sat `TERMINATED` with its hooks unfired until something
 happened to want its slot. A `0` on a box that has run processes means no
 collector is calling the sweep, which is the original bug returning.
 
-**Not yet run on the metal or under Firecracker** (`--remote-only`). Everything
-above is QEMU/TCG.
+#### Confirmed on hardware, 2026-09-20
+
+Everything above is QEMU/TCG. The fix was then deployed to both x86 machines,
+built from the merge commit `0930831a`:
+
+| | result | reaped |
+|---|---|---|
+| **HP 500-502nj, bare metal** (`smp-shared`, USB/ext2 root, real workload) | **739 passed, 0 failed** | 15 |
+| **Ryzen 7 8845HS, Firecracker/KVM** (1 vcpu, `init=/bin/herd`) | 770 passed, **5 failed — none of them the kernel** | 2 |
+
+**The bare-metal line is the one that matters**, and specifically this check in
+it:
+
+```
+fs: the root mount is enrolled for orphaned-lock recovery   [OK]
+```
+
+That root is `Ext2Filesystem<RootDevice>` over a **USB partition** — the exact
+instantiation the old concrete-typed registry could not hold, on the exact
+machine where the gap was silent. §8.3 is closed on the hardware it was broken
+on, not by inference from a target where the types happen to line up.
+
+The box came back serving its real workload (`herd`, `llama-server` on
+smollm2-135m, two `meow-live litter live`, `sshd`), so this is not a boot-suite-
+only result.
+
+**The five Ryzen failures are its rootfs, not this change.** All five report
+`got 0x7f` — exit **127**, command not found:
+
+```
+execve: `sh -c "uname -a"` exited 0        [FAIL] got 0x7f want 0x0
+proc:   `readlink /proc/self/exe` exited 0 [FAIL] got 0x7f want 0x0
+```
+
+That disk has no `uname` and no `readlink`; `execve: sh spawned` passes, so
+`/bin/sh` is there and runs. The metal's disk carries full busybox and passes
+all five. Worth writing down because `exited 0 [FAIL]` reads like a process-
+lifecycle bug and is a missing applet — **check the status byte for `0x7f`
+before blaming the kernel.**
+
+Detector sweep over the metal's `dmesg` after the workload had been running:
+
+| pattern | count |
+|---|---|
+| `[TLB] stuck`, `PMM-RESURRECT`, `WILD-`, `SGI-S FREED-L0`, `PMM-UAF` | **0** each |
+| `TRAMP-MISMATCH` | **0** |
+| `[BKL] stuck` | 189 — the known `tag=511`-family storm (`PAGE_TABLE_UAF_BKL_STORM.md`), load-driven, with `llama-server` pegging a core |
+
+`TRAMP-MISMATCH` at zero is **not** evidence that §3.1 is fixed — it is not, and
+this was a different workload from the clean build that produced the three lines
+in §3.1. It is recorded because that counter going *up* is how the leaked
+`Process` becomes visible, so a baseline of zero is worth having.
+
+Deployment notes, because two of them cost something:
+
+- `amd64/run-firecracker.sh` **rebuilds and scps a fresh 128 MB `disk.img`** by
+  default. On a host whose disk is already configured that is destructive, and
+  there is no flag for "keep the remote disk" — stage the ELF by hand and reuse
+  the host's own `run.sh`.
+- A Firecracker guest **flushes dirty pages to its backing file on shutdown**, so
+  restoring that file while the VM is still running does not stick. Stop the VM,
+  then restore.
+- `.good` on the metal was promoted to the *previously running, proven* kernel
+  before installing, not to the new one. Promote after a kernel has earned it;
+  `Akuma/amd64 (known good)` is the only remote-free way back and is worth
+  exactly as much as what sits behind it.
 
 ### 8.5 One thing a reader should check before trusting this
 
@@ -447,6 +512,15 @@ The AArch64 kernel should be untouched: every addition to `akuma-threading` is
 under `#[cfg(target_arch = "x86_64")]`, and the one change to an existing
 function is inside `x86_finish_current`. That is a structural argument, not a
 measurement — the `.text` was not diffed against a baseline build.
+
+The AArch64 side is **not** wholly untouched, and the exception is deliberate:
+`akuma-vfs`'s `Filesystem` trait gained two defaulted methods, `akuma-ext2`
+overrides them, and `akuma_vfs_glue::mount_with` now enrols every mount in the
+reap registry — so the AArch64 kernel's registry moved out from under it too
+(§8.3). It builds and clippies clean and carries the same
+`reap_registry_is_populated` self-test, but **it has not been booted since**.
+That is the gap in this record: the hardware confirmation above is both x86
+machines and neither AArch64 one.
 
 ### 8.6 The registry was the whole of §3.4, and the first fix got it backwards
 
