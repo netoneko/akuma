@@ -163,6 +163,24 @@ struct ServiceConfig {
     /// environment, which is what makes the kernel apply its own default — so an
     /// existing service's environment is byte-identical to before this existed.
     env: Vec<String>,
+    /// Working directory for the service, or empty to inherit herd's (`/`).
+    ///
+    /// Akuma's `SPAWN` syscall carries no working directory, so a child gets
+    /// whatever herd's own is — and for a supervisor started as `init` that is
+    /// `/`. Some programs care a great deal: llama.cpp scans for its ggml
+    /// backend libraries relative to the working directory, and from `/` that
+    /// walk descends into whatever large trees the root holds. Measured
+    /// 2026-09-20 on the bare-metal box, `llama-server` issued 4480 `stat` and
+    /// 140 `getdents64` calls while opening its model **zero** times, then sat
+    /// there with no listener and one second of CPU. It reads exactly like a
+    /// model loading slowly, and it is a directory walk.
+    ///
+    /// Passed through `SPAWN_EXT`'s `SpawnOptions.cwd`, which is the only spawn
+    /// that carries one. A `chdir` in herd before a plain `spawn` does *not*
+    /// work — the child does not inherit our cwd, the kernel assigns it the
+    /// one in the options (`/` by default) — and the failure is silent, so it
+    /// is worth stating: a `pwd` oneshot printed `/` either way.
+    workdir: String,
     /// Multikernel core pin (docs/MULTIKERNEL.md §10, CORE_AWARE_SCHEDULING.md). 0 =
     /// unpinned / BSP (current behavior: spawn locally on core 0). Non-zero = run this
     /// service on that secondary core's kernel: herd hands the kernel the command path in
@@ -190,6 +208,7 @@ impl Default for ServiceConfig {
             mount_fs: Vec::new(),
             start_delay_ms: 0,
             oneshot: false,
+            workdir: String::new(),
             core: 0,
         }
     }
@@ -516,6 +535,8 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 "oneshot" => {
                     config.oneshot = value == "true" || value == "1";
                 }
+                // Both spellings, because both are the obvious one to reach for.
+                "workdir" | "working_dir" => config.workdir = String::from(value),
                 // Repeatable: each line adds one variable. The `split_once('=')`
                 // above takes the FIRST `=`, so the value keeps any further ones
                 // (`env = DSN=host=db port=5432` is one entry, spaces and all).
@@ -1026,14 +1047,41 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     } else {
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
-        match service_env(&[], &config.env) {
-            Some(env) => {
-                let refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
-                spawn_with_env(&config.command, args_opt, None, &refs)
+        if config.workdir.is_empty() {
+            match service_env(&[], &config.env) {
+                Some(env) => {
+                    let refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
+                    spawn_with_env(&config.command, args_opt, None, &refs)
+                }
+                // No `env =` lines: keep the plain spawn, so an unboxed
+                // service's environment is exactly what it was before this
+                // feature existed.
+                None => spawn(&config.command, args_opt),
             }
-            // No `env =` lines: keep the plain spawn, so an unboxed service's
-            // environment is exactly what it was before this feature existed.
-            None => spawn(&config.command, args_opt),
+        } else {
+            // `workdir` is set, so this has to go through `SPAWN_EXT`, which is
+            // the only spawn that carries one.
+            //
+            // A chdir around the plain spawn does **not** work and looks like it
+            // should: the child does not inherit our working directory, the
+            // kernel gives it the one in `SpawnOptions` (defaulting to `/`).
+            // Measured 2026-09-20 with a `pwd` oneshot — it printed `/` with the
+            // chdir in place, which is exactly the answer a no-op produces.
+            let env = service_env(&[], &config.env);
+            let mut options = sys::SpawnOptions {
+                cwd_ptr: config.workdir.as_ptr() as u64,
+                cwd_len: config.workdir.len(),
+                root_dir_ptr: 0,
+                root_dir_len: 0,
+                args_ptr: 0,
+                args_len: 0,
+                stdin_ptr: 0,
+                stdin_len: 0,
+                box_id: 0,
+                env_ptr: 0,
+                env_len: 0,
+            };
+            sys::spawn_ext_env(&config.command, args_opt, env.as_deref(), None, &mut options)
         }
     };
 
