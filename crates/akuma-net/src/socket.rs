@@ -981,9 +981,44 @@ pub fn connect_outcome(waited: Result<(), i32>, state: Option<tcp::State>) -> Re
     }
 }
 
+/// Whether `sock` already occupies `port` in the same protocol's port space
+/// as `wants_tcp` (TCP and UDP are separate namespaces on real Linux, and
+/// stay separate here). A `Stream` socket that has only `bind()`-ed (not yet
+/// `listen()`-ing) still claims the port, same as Linux.
+#[cfg(feature = "smoltcp")]
+fn occupies_port(sock: &KernelSocket, wants_tcp: bool, port: u16) -> bool {
+    match &sock.inner {
+        SocketType::Listener { local_port, .. } => wants_tcp && *local_port == port,
+        SocketType::Stream(_) => wants_tcp && sock.bind_port == Some(port),
+        SocketType::Datagram { .. } => !wants_tcp && sock.bind_port == Some(port),
+    }
+}
+
 #[cfg(feature = "smoltcp")]
 pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     with_table(|table| {
+        // An explicit (non-zero) port must be exclusive to one live socket —
+        // real Linux refuses a second `bind()` on a port already claimed with
+        // `EADDRINUSE`. This table never checked, so N processes each racing
+        // to `bind()` the same TCP port (e.g. meow's litter-raft "whoever
+        // binds wins the coordinator role") all "won": every bind succeeded,
+        // handing out N independent listening handles on the one port with
+        // smoltcp dispatching incoming connections between them arbitrarily.
+        // Port 0 ("pick one for me") is exempt — `alloc_ephemeral_port`
+        // below is what keeps those unique.
+        if addr.port != 0 {
+            let wants_tcp = matches!(table.get(idx), Some(Some(s)) if matches!(s.inner, SocketType::Stream(_)));
+            for (other_idx, slot) in table.iter().enumerate() {
+                if other_idx == idx {
+                    continue;
+                }
+                if let Some(other) = slot
+                    && occupies_port(other, wants_tcp, addr.port)
+                {
+                    return Err(libc_errno::EADDRINUSE);
+                }
+            }
+        }
         if let Some(Some(sock)) = table.get_mut(idx) {
             // Port 0 means "pick one for me", and it means that for TCP exactly as
             // it does for UDP. The TCP arm used to store the literal 0, so the next
