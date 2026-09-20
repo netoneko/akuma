@@ -4,9 +4,10 @@
 **Scope:** `amd64/src/idt.rs` (vector 6), `amd64/src/usermode.rs` (`sys_execve`/`sys_fchdir`
 dispatch), `crates/akuma-syscalls-abi`.
 **Status:** `#UD` containment, `fchdir`, and `execve` shebang support all fixed
-and verified live. The workload that found the first two — `llama-server`
-under Firecracker — still does not reach the point of serving HTTP traffic;
-see §4, left open.
+and verified live. The workload that found the first two — the Alpine `apk`
+package of `llama-server` — never got past the same `#UD`, contained or not;
+a **vendored, compile-time-dispatched build** of the same program does serve
+real HTTP traffic on this target. See §4.
 
 ## 1. How this was found
 
@@ -137,8 +138,9 @@ what argv a `#!` line produces.
   produces fully functional symlinks. Not investigated further — out of this
   session's scope, and a fresh disk that never passed through the broken
   pre-`fchdir` state would never hit it.
-- **`llama-server` still does not serve traffic.** With both fixes live, it
-  was launched against a real model
+- **The `apk`-packaged `llama-server` still does not serve traffic** — this is
+  narrower than it first looked, and the correction is below.  With both
+  fixes live, the Alpine package was launched against a real model
   (`bartowski/SmolLM2-135M-Instruct-GGUF`, Q8_0, 144 MiB) with
   `--host 0.0.0.0 --port 8080 -c 512 -t 2 --no-mmap`. The process hit the
   *same* `#UD` shortly after spawning its OpenBLAS thread pool
@@ -148,10 +150,22 @@ what argv a `#!` line produces.
   whole time. A secondary, smaller oddity: the killed PID stayed listed in
   `ps` (and survived `kill -9`) after the group-kill — `psstats`/`ps`
   bookkeeping for a fault-killed multi-threaded process looks incomplete, not
-  investigated further here. **The real blocker is still open**: something in
-  OpenBLAS's runtime CPU dispatch executes an instruction this vCPU (or
-  Akuma's CPUID reporting to it) does not support, and until that is found,
-  `llama-server` cannot come up regardless of the crash-containment fix.
+  investigated further here.
+- **Correction, same session:** the OpenBLAS runtime-dispatch theory was
+  right, and the fix is not "find the one bad instruction" — it's **don't
+  link OpenBLAS at all**. `llama.cpp`'s own GGML CPU backend picks its SIMD
+  kernel at *compile time* from CMake flags (`-DGGML_BLAS=OFF` plus every
+  instruction-set flag explicit rather than left at its surprising
+  `GGML_NATIVE=OFF` default — see `userspace/llama.cpp/docs/AMD64_BUILD.md`
+  for why the default is *not* what it sounds like). Built that way with a
+  musl.cc cross toolchain and `-march=x86-64` (baseline, no runtime CPUID
+  guess to get wrong), the vendored `llama-server` loaded the same model,
+  answered `/health`, and served a real `/v1/chat/completions` request over
+  HTTP — repeatedly, not a one-shot fluke. So: **`llama-server` on
+  amd64/Firecracker works**; what specifically does not is the *Alpine
+  package's* OpenBLAS-linked build, and the crash-containment fix in §2-3 is
+  still worth having regardless — it is what stops any future OpenBLAS-style
+  runtime-dispatch mistake from taking the whole kernel down with it.
 
 ## Background
 

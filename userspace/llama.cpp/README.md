@@ -2,7 +2,14 @@
 
 Static musl AArch64 build of [llama.cpp](https://github.com/ggerganov/llama.cpp) for running LLM inference on Akuma OS. This works — inference runs end-to-end on Akuma with SmolLM2-135M.
 
-## Building
+**amd64 also works** (verified 2026-09-20, `llama-server` under Firecracker,
+real chat completions over HTTP) but is a **manual CMake build, not yet wired
+into this crate's `build.rs`** — different toolchain, different CPU-baseline
+flags, and a reason those flags matter that the Alpine-packaged `apk`
+alternative gets wrong. See
+[`docs/AMD64_BUILD.md`](docs/AMD64_BUILD.md).
+
+## Building (AArch64)
 
 ```bash
 cd userspace
