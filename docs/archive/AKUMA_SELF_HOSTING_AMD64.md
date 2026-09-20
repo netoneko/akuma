@@ -2809,3 +2809,98 @@ Still open, smaller: the shell on the persistent root has no `PATH` (bare
 applet names fail lookup even when the disk is healthy — use full paths),
 and the `644` modes mean this target's exec never checks permission bits
 (observability gap, not a correctness bug today).
+
+## LLM inference lands on amd64; the meow-swarm half is still ahead (2026-09-20)
+
+Motivation: stage a `meow litter live` swarm on the trashcan (cats named after
+small wildcats — bobcat/ocelot/caracal — parallel to the Ryzen swarm's
+tiger/jaguar/panther) serving models via `llama-server`, eventually merged
+into one litter with Ryzen. This session got the LLM-serving half working end
+to end and staged on bare metal; the meow half is intentionally **not**
+started — see "What's deliberately not done" below.
+
+### Three kernel gaps, found chasing one bare-metal wedge
+
+Bare metal wedged solid running the **Alpine `apk` package** of
+`llama-server` (needing a physical power cycle). Reproduced identically under
+Firecracker — proof it was not a hardware/driver issue — and root-caused to a
+ring-3 `#UD` (illegal instruction, OpenBLAS's runtime CPU dispatch picking a
+SIMD kernel this vCPU does not support) that the kernel had no way to contain:
+vector 6 was still the generated `x86-interrupt` handler, which can only
+`fatal()` the whole machine. Fixed the same way `#PF`/`#GP`/`#DB` already
+were — a hand-assembled stub that can deliver `SIGILL` to just the faulting
+process. Chasing the same `apk` session also found `fchdir` missing **two**
+layers deep (a `akuma-syscalls-abi` table row, *and* a `sys_execve`-style
+dispatch arm — the row alone is not sufficient, this target's dispatch has no
+catch-all forward to glue) and `execve` having no `#!` shebang handling at
+all, ported from AArch64's `akuma-syscalls-glue::proc::exec_shebang`/
+`do_execve` split. Full writeup: `docs/archive/AKUMA_AMD64_UD_CRASH_CONTAINMENT.md`.
+
+### The actual fix for `llama-server`: don't link OpenBLAS
+
+The `#UD` containment fix does not, by itself, make the Alpine package serve
+traffic — it still hits the same illegal instruction, just contained now
+instead of taking the kernel with it. What does work is **not building
+against OpenBLAS at all**: `llama.cpp`'s own GGML CPU backend picks its SIMD
+kernel at *compile time* (CMake flags), the same way the AArch64 build in
+`userspace/llama.cpp` already does (`-march=armv8.2-a+fp16+dotprod`,
+`-DGGML_BLAS=OFF`). Built for x86_64 the same way — musl.cc's
+`x86_64-linux-musl-cross` toolchain (Ubuntu's own `musl-tools` has no
+`musl-g++`), `-march=x86-64` baseline, every `GGML_*` SIMD flag explicit
+rather than left at its surprising `GGML_NATIVE=OFF` default (which turns
+several back **on**) — `llama-server` loads a real GGUF model, answers
+`/health`, and serves `/v1/chat/completions` over HTTP, repeatedly, under
+Firecracker. Recipe: `userspace/llama.cpp/docs/AMD64_BUILD.md`. Not yet
+wired into that crate's `build.rs` (hand-run CMake today); the doc lists what
+that porting needs.
+
+### Staged on bare metal, not yet exercised there
+
+With the fixed kernel confirmed on Firecracker, the same three fixes were
+installed to the persistent partition's `/boot/akuma-amd64` (verified
+multiboot2 header + md5 readback, `.prev` kept, `.good` deliberately left
+alone until this kernel proves itself on a real boot) and the vendored
+`llama-server` binary plus three small GGUF models
+(`SmolLM2-135M-Instruct` Q8_0, `SmolLM2-360M-Instruct` Q8_0,
+`Qwen2.5-0.5B-Instruct` Q4_K_M) were copied to `/mnt/ak/bin/` and
+`/mnt/ak/models/` from the Ubuntu side (63 GB partition, plenty of room).
+**Not yet booted successfully with this kernel and verified serving on the
+real box** — the first boot attempt hit a `[BKL] stuck: owner=2 tag=502`
+storm plus `dns:`/`clock: retry` noise on the console and was recovered back
+to Ubuntu by hand rather than waited out. `tag=502` is `HOLD_TAG_IDLE`
+(`crates/akuma-bkl/src/sync.rs`) — a *named*, not a garbage, tag: "a core's
+idle loop holding the BKL," added in `docs/archive/BKL_VFS_CARVE_OUT.md` §18
+specifically so this situation would not read as `unknown`. Whether this
+particular boot would have cleared on its own (matching the documented
+benign pattern) or was a genuine stall is **not established** — it was not
+watched to a verdict. Investigation into whether DHCP's own retry timing
+shares the "rate limit armed at the wrong point" bug class the boot-SNTP fix
+found (`docs/archive/AKUMA_AMD64_NETPOLL_LAPS_ZERO.md`) was underway
+(`crates/akuma-net/src/smoltcp_net/init.rs`/`poll.rs`, the `dhcpv4::Socket`
+wiring) when this session paused. The RTL8169 driver's own stall/recovery
+logic (`crates/akuma-net-nic/src/rtl8169.rs`) is a separate, already-tuned
+5-second wall-clock mechanism and reads as unlikely to be the cause, but was
+not ruled out with evidence from a live boot.
+
+### What's deliberately not done
+
+- **No meow wiring at all** — no herd unit files, no per-cat config, nothing
+  under `userspace/meow` touched. A separate line of work was actively
+  changing `userspace/meow` during this session; the standing instruction was
+  not to interfere.
+- **No Ryzen join.** The original plan's step 5 (point one cat's
+  `litter_static_peers` at Ryzen's `192.168.1.126:7700`) is explicitly
+  deferred — "don't ask it join ryzen just yet, i am working on new version
+  of meow."
+- **No multi-model "talk to each other" demo yet** — blocked on getting a
+  clean, verified bare-metal boot first.
+
+### Background
+
+- `docs/archive/AKUMA_AMD64_UD_CRASH_CONTAINMENT.md` — the three kernel
+  fixes, in full, with verification evidence.
+- `userspace/llama.cpp/docs/AMD64_BUILD.md` — the vendored build recipe.
+- `docs/archive/BKL_VFS_CARVE_OUT.md` §18 — what `HOLD_TAG_IDLE`/`tag=502`
+  means and why it exists.
+- `docs/archive/AKUMA_AMD64_NETPOLL_LAPS_ZERO.md` — the boot-SNTP rate-limit
+  bug this session was checking DHCP against when it paused.
