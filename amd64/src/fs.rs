@@ -459,70 +459,6 @@ pub fn mount_root() -> bool {
     mount_root_on(RootDevice::Virtio(VirtioBlk), "/dev/vda")
 }
 
-/// The ext2 instances the orphaned-lock sweep walks.
-///
-/// # Why this is not `akuma_vfs_glue::ext2`'s registry
-///
-/// That one exists and does the same job, but it is typed
-/// `Weak<Ext2Filesystem<KernelBlockDevice>>` — vfs-glue's own virtio adapter —
-/// and this target mounts `Ext2Filesystem<RootDevice>`, a different
-/// instantiation entirely, because its root can be virtio, a GRUB-placed RAM
-/// image or a USB partition. Registering into that array is not a type error to
-/// be worked around; it is a different set. So this kernel keeps its own, one
-/// `register_for_reap`/[`reap_dead_thread`] pair beside the other four hooks
-/// `akuma_vfs_glue::fs::init` installs and this target installs for itself.
-///
-/// The obvious de-duplication — one registry over a `Weak<dyn …abandon_tid>` —
-/// touches the AArch64 kernel's mount path and is deliberately not in this
-/// change.
-///
-/// `Weak`, not `Arc`, so a registration cannot pin an unmounted filesystem
-/// forever. Four slots to match vfs-glue's, though this target mounts exactly
-/// one ext2 today.
-static EXT2_MOUNTS: spinning_top::Spinlock<[Option<alloc::sync::Weak<RootExt2>>; 4]> =
-    spinning_top::Spinlock::new([const { None }; 4]);
-
-/// This target's one ext2 instantiation.
-type RootExt2 = Ext2Filesystem<RootDevice>;
-
-/// Record a mount for the sweep, reusing a slot whose filesystem has been dropped.
-///
-/// A full table costs orphaned-lock recovery on that one filesystem and nothing
-/// else — the waiter-side backstop still unblocks the system — so it is
-/// reported and ignored rather than failing the mount.
-fn register_for_reap(fs: &Arc<RootExt2>) {
-    let mut slots = EXT2_MOUNTS.lock();
-    for slot in slots.iter_mut() {
-        if slot.as_ref().is_none_or(|w| w.strong_count() == 0) {
-            *slot = Some(Arc::downgrade(fs));
-            return;
-        }
-    }
-    serial::puts("  fs:   WARNING: ext2 mount table full — orphaned-lock recovery is off for this one\n");
-}
-
-/// Release everything the dead thread `tid` held on any mounted ext2 filesystem.
-///
-/// Registered as `akuma_threading::set_slot_reap_callback`, so it runs at the
-/// `TERMINATED → FREE` transition `x86_reap_terminated_slots` performs — where
-/// the tid is genuinely dead and its slot cannot yet be reissued, which is the
-/// contract `RecoverableRwLock::abandon_tid` is written against.
-///
-/// The handles are upgraded into a fixed array and the registry lock dropped
-/// **before** any of them is swept, so the sweep itself holds nothing.
-fn reap_dead_thread(tid: usize) {
-    let mut live: [Option<Arc<RootExt2>>; 4] = [const { None }; 4];
-    {
-        let slots = EXT2_MOUNTS.lock();
-        for (out, slot) in live.iter_mut().zip(slots.iter()) {
-            *out = slot.as_ref().and_then(alloc::sync::Weak::upgrade);
-        }
-    }
-    for fs in live.iter().flatten() {
-        fs.abandon_tid(tid);
-    }
-}
-
 /// Install the two hooks that make a dead thread's ext2 locks recoverable.
 ///
 /// The AArch64 kernel installs these in `akuma_vfs_glue::fs::init`, which this
@@ -530,16 +466,23 @@ fn reap_dead_thread(tid: usize) {
 /// fpcache inode hook and the block-cache cap unset here until each was found
 /// separately. Idempotent: both sinks are set-once.
 ///
-/// 1. **The reap.** `akuma-threading` reports a death; this kernel releases what
-///    it held. Wired only now because until the slot reaper there was no
-///    `TERMINATED → FREE` transition on this target to hang it off
+/// **The mount itself needs no code here.** The sweep's registry is populated by
+/// `akuma_vfs_glue::mount_with`, which both kernels already go through, and it
+/// holds `Weak<dyn Filesystem>` — so it does not care that this target's root is
+/// `Ext2Filesystem<RootDevice>` where the other's is
+/// `Ext2Filesystem<KernelBlockDevice>`. What is left to wire is only *who to
+/// tell*:
+///
+/// 1. **The reap.** `akuma-threading` reports a death; the shared sweep releases
+///    what that thread held. Wired only now because until the slot reaper there
+///    was no `TERMINATED → FREE` transition on this target to hang it off
 ///    (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §3.4).
 /// 2. **The waiter-side backstop.** Any single waiter, alone, can drive the
 ///    sweep that frees it. This is the half that matters under load: the idle
 ///    loop's collector does not run while the box is busy, and a mount wedged
 ///    behind a dead writer is exactly the case where nothing is going idle.
 pub fn install_reap_hooks() {
-    akuma_threading::set_slot_reap_callback(reap_dead_thread);
+    akuma_threading::set_slot_reap_callback(akuma_vfs_glue::reap_dead_thread);
     akuma_locks_rw::register_backstop(|| {
         akuma_threading::x86_reap_terminated_slots();
     });
@@ -572,15 +515,11 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
         serial::puts(" holds no readable ext2 image\n");
         return false;
     };
-    // Orphaned-lock recovery, which this target had none of until the slot
-    // reaper landed. Registered before the mount goes live so no thread can
-    // take a write lock on a filesystem the sweep cannot see.
-    let fs = Arc::new(fs);
-    register_for_reap(&fs);
     // `mount_with` rather than `mount`: without a source the mount has no name
     // to print, and `/proc/mounts` with a `none` in column one is what `df`
-    // shows under `Filesystem`.
-    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, fs) {
+    // shows under `Filesystem`. It is also what enrols this filesystem in the
+    // orphaned-lock sweep — see `install_reap_hooks`.
+    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, Arc::new(fs)) {
         serial::puts("  fs:   could not mount ");
         serial::puts(name);
         serial::puts(" at /: ");
@@ -654,6 +593,19 @@ pub fn smoke_test(t: &mut Suite, mounted: bool) {
     if !t.check("fs: ext2 mounted", mounted) {
         return;
     }
+
+    // **The assertion that would have caught the bug this target actually had.**
+    // Every hook for orphaned-lock recovery can be registered and the set of
+    // filesystems to sweep still be empty — which is what happened here for as
+    // long as the registry was typed to `Ext2Filesystem<KernelBlockDevice>` and
+    // this kernel's root was `Ext2Filesystem<RootDevice>`. A sweep over zero
+    // mounts is indistinguishable from a working one at every other observation
+    // point, so it is checked from the mount side
+    // (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3).
+    t.check(
+        "fs: the root mount is enrolled for orphaned-lock recovery",
+        akuma_vfs_glue::reapable_mount_count() >= 1,
+    );
 
     // Directory listing first. It is the cheapest operation that proves the
     // inode table, the block groups and the directory-entry walk all agree — a

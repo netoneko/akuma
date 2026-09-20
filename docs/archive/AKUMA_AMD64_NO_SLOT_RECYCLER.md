@@ -374,18 +374,24 @@ is `FREE` with nothing left to release.
   *control*: a second slot is left `INITIALIZING` with a window of its own open,
   and its depth must survive the sweep. Without that check, "the dead one reads
   0" would pass even if the staging had never set a depth at all.
-- **§3.4 (orphaned-lock recovery) — closed, with a caveat worth knowing.**
+- **§3.4 (orphaned-lock recovery) — closed, and the registry is now shared.**
   `SLOT_REAP_CALLBACK` and the `akuma-locks-rw` backstop are registered from
-  `fs::mount_root_on`, after `mark_initialized`. **They could not simply reuse
-  `akuma_vfs_glue::ext2`'s registry**, and the reason is not a detail: that
-  registry is typed `Weak<Ext2Filesystem<KernelBlockDevice>>` and this target
+  `fs::install_reap_hooks`, after `mark_initialized`.
+
+  The interesting part is what the sweep walks. `akuma_vfs_glue::ext2`'s
+  registry was typed `Weak<Ext2Filesystem<KernelBlockDevice>>`, and this target
   mounts `Ext2Filesystem<RootDevice>` — a different instantiation, because its
-  root can be virtio, a GRUB-placed RAM image or a USB partition. Registering
-  into it is not a type error to work around; it is a different set, and it
-  would have been **empty on this target** while looking wired. So amd64 keeps
-  its own four-slot registry beside it. The de-duplication — one registry over a
-  `Weak<dyn …abandon_tid>` — touches the AArch64 mount path and is deliberately
-  not in this change.
+  root can be virtio, a GRUB-placed RAM image or a USB partition. **That is not
+  a type error to work around; it is a different set**, and registering into it
+  would have left this kernel with an empty sweep while every hook looked wired.
+
+  The first fix here was a second registry in `amd64/src/fs.rs`. That was the
+  wrong answer, and §8.6 says why. The registry now lives in
+  `akuma_vfs_glue::lib.rs`, holds `Weak<dyn Filesystem>`, and is populated by
+  `mount_with` — the one call both kernels already mount through. Two defaulted
+  methods on `akuma_vfs::Filesystem` carry it: `abandon_tid`, which `Ext2Filesystem<B>`
+  forwards to its inherent one for every `B`, and `needs_tid_reap`, so `/proc`,
+  `/dev` and container binds do not take slots to answer "nothing to release".
 - **§3.1 (`CLEANUP_CALLBACK` / the leaked `Process`) — still open, deliberately.**
   It is the gap this document ranks worst and it is the one left, so the reason
   needs stating. The shared callback retires a `Process` when its last thread
@@ -412,12 +418,13 @@ QEMU/TCG, this worktree, against a measured baseline on the same tree:
 
 | | baseline | with the reaper |
 |---|---|---|
-| `amd64_trials.py --local-only --smp 4` | 732 passed, 1 failed | **739 passed, 1 failed** |
-| `--smp 1` | — | **729 passed, 1 failed** |
+| `amd64_trials.py --local-only --smp 4` | 732 passed, 1 failed | **740 passed, 1 failed** |
+| `--smp 1` | — | **730 passed, 1 failed** |
 
-`+7` is exactly the seven new checks. The one failure is `mmap: the lazy path
-was actually taken`, which fails identically on the baseline — pre-existing on
-this branch, unrelated.
+`+8` is exactly the eight new checks (seven in `sched::reaper_smoke_test`, one
+in `fs::smoke_test`). The one failure is `mmap: the lazy path was actually
+taken`, which fails identically on the baseline — pre-existing on this branch,
+unrelated.
 
 Also green: `cargo test` on the host (1463 passed, 0 failed), clippy `-D
 warnings` on `akuma-threading` and on `akuma-amd64` for
@@ -440,3 +447,38 @@ The AArch64 kernel should be untouched: every addition to `akuma-threading` is
 under `#[cfg(target_arch = "x86_64")]`, and the one change to an existing
 function is inside `x86_finish_current`. That is a structural argument, not a
 measurement — the `.text` was not diffed against a baseline build.
+
+### 8.6 The registry was the whole of §3.4, and the first fix got it backwards
+
+Worth recording because the wrong answer was plausible and shipped first.
+
+**The question "can amd64 just mount the way AArch64 does?" has a real answer,
+and it is no.** `akuma_vfs_glue::ext2::mount_device` builds
+`Ext2Filesystem::new(KernelBlockDevice { idx })` — virtio-blk through
+`akuma_virtio::block`. Two of this target's three roots are not that: a GRUB
+module in RAM and a partition on the USB disk, neither of which that crate can
+name. Conforming the *mount* would mean conforming it only on the VMM path, and
+leaving recovery silently absent on bare metal — the least-tested path, which is
+the worst possible place for a silent gap.
+
+**But the mount was never the problem.** `Ext2Filesystem<B>` implements
+`Filesystem` for every `B`, and *both kernels already hand `Arc<dyn Filesystem>`
+to the same `mount_with`*. The only thing insisting on a concrete type was the
+registry. So the conforming direction is the other one: erase the type
+parameter, and the set becomes one set.
+
+Two things fell out of doing it that way that the duplicate did not give:
+
+- `mount_with` populating the registry means **no kernel has to remember**. The
+  half of this bug that was a missing call rather than a wrong type cannot recur.
+- `reapable_mount_count()` and the boot check `fs: the root mount is enrolled
+  for orphaned-lock recovery`. **This is the assertion that would have caught
+  the original bug**, and nothing else would have: a `reap_dead_thread` over
+  zero mounts returns exactly as it does over four, so an empty registry is
+  invisible from every direction except the mount side. Verified by a negative
+  control — flipping `Ext2Filesystem`'s `needs_tid_reap` to `false` turns that
+  check red and nothing else.
+
+The general lesson, and it is not specific to filesystems: **a registry typed to
+a concrete type is a set that a second instantiation cannot join, and joining it
+fails by being empty rather than by not compiling.**

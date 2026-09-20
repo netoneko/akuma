@@ -142,6 +142,41 @@ pub trait Filesystem: Send + Sync {
     fn exists(&self, path: &str) -> bool;
     fn metadata(&self, path: &str) -> Result<Metadata, FsError>;
 
+    /// Release everything thread `tid` was holding on this filesystem, and
+    /// answer whether anything was. `tid` is dead; this is not a request to
+    /// interrupt it.
+    ///
+    /// # Why this is on `Filesystem` and not somewhere thread-shaped
+    ///
+    /// Orphaned-lock recovery needs a set of "filesystems that might be holding
+    /// a dead thread's lock", and the only handle the mount path has to a
+    /// filesystem is `Arc<dyn Filesystem>`. A registry typed to a *concrete*
+    /// filesystem cannot serve two kernels whose roots are different
+    /// instantiations of the same generic — which is exactly what happened:
+    /// `akuma-vfs-glue`'s registry was `Weak<Ext2Filesystem<KernelBlockDevice>>`
+    /// and the amd64 kernel mounts `Ext2Filesystem<RootDevice>`, so registering
+    /// into it was not a type error to work around but a different set, empty on
+    /// that target while looking wired
+    /// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3).
+    ///
+    /// Defaulted to "nothing to release", which is the truth for every
+    /// filesystem with no recoverable locks — the synthetic ones, and any
+    /// filesystem whose locking cannot outlive a thread.
+    fn abandon_tid(&self, _tid: usize) -> bool {
+        false
+    }
+
+    /// Does this filesystem want [`Self::abandon_tid`] called when a thread
+    /// dies?
+    ///
+    /// The predicate exists so the reap registry holds only filesystems that can
+    /// actually be recovered. Without it every mount — `/proc`, `/dev`, every
+    /// container bind — would take a slot to answer `false`, and a "registry
+    /// full" warning would stop meaning what it says.
+    fn needs_tid_reap(&self) -> bool {
+        false
+    }
+
     fn create_symlink(&self, _link_path: &str, _target: &str) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }

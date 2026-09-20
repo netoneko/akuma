@@ -3266,6 +3266,22 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         "ext2"
     }
 
+    /// The inherent [`Ext2Filesystem::abandon_tid`], reachable through
+    /// `dyn Filesystem`.
+    ///
+    /// The forwarding is the point: it is what lets one registry of
+    /// `Weak<dyn Filesystem>` sweep every ext2 mount in the system regardless of
+    /// which `B` it was built over, which the two kernels do not agree on.
+    fn abandon_tid(&self, tid: usize) -> bool {
+        Self::abandon_tid(self, tid)
+    }
+
+    /// Yes: `Ext2State` is behind a `RecoverableRwLock`, whose whole design is
+    /// that release **is** abandon (`docs/archive/AKUMA_EXT2_CLEANUP.md` §4).
+    fn needs_tid_reap(&self) -> bool {
+        true
+    }
+
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let state = self.read_state();
         let inode_num = self.lookup_path_internal(&state, path)?;

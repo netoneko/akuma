@@ -29,7 +29,7 @@ pub mod proc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -213,6 +213,113 @@ pub fn sync_all_filesystems() -> Result<(), FsError> {
     Ok(())
 }
 
+// ── orphaned-lock recovery: which mounts a dead thread's locks can be on ──────
+
+/// The mounted filesystems that want a dead thread's locks released, for the
+/// sweep [`reap_dead_thread`] performs.
+///
+/// `akuma-locks-rw` owns no global registry on purpose: enumerating locks is the
+/// business of whoever owns them (`docs/archive/AKUMA_EXT2_CLEANUP.md` §4.5). This is
+/// that owner.
+///
+/// **Why not the VFS mount table**, which already enumerates every filesystem and has
+/// the `sync_all` precedent: `MountTable::resolve` hands out a `&dyn Filesystem`
+/// borrowed from the table, so its callers hold [`MOUNT_TABLE`] *across* filesystem
+/// calls. A reaper that took that lock would invert against them — thread A holds the
+/// mount table and blocks in ext2 on a lock the dead thread left held, while the
+/// recycler blocks on the mount table trying to release it. Nothing would ever run
+/// again. This lock is taken only to write a slot at mount and to read the slots at
+/// reap; it never covers device I/O or a filesystem call, so it cannot be part of a
+/// cycle.
+///
+/// **Why `dyn Filesystem` and not a concrete type.** It was
+/// `Weak<Ext2Filesystem<KernelBlockDevice>>` until 2026-09-20, and that is a set the
+/// amd64 kernel cannot join: its root is `Ext2Filesystem<RootDevice>` — an enum over
+/// virtio, a GRUB-placed RAM image and a USB partition, two of which are not block
+/// devices this crate can name. So that kernel had orphaned-lock recovery silently off
+/// while every hook *looked* wired, and the first fix for it was a second registry in
+/// `amd64/src/fs.rs`. One registry over the trait object both kernels already mount
+/// through is the shape that cannot drift again
+/// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3).
+///
+/// `Weak`, not `Arc`, so a registration cannot pin an unmounted filesystem forever.
+const MAX_REAPABLE_MOUNTS: usize = 4;
+static REAPABLE_MOUNTS: Spinlock<[Option<Weak<dyn Filesystem>>; MAX_REAPABLE_MOUNTS]> =
+    Spinlock::new([const { None }; MAX_REAPABLE_MOUNTS]);
+
+/// Record a mount for the sweep, reusing a slot whose filesystem has been dropped.
+///
+/// Called from [`mount_with`], so a filesystem is enrolled by being mounted and no
+/// kernel has to remember to do it — which is the half of the amd64 gap that was a
+/// missing call rather than a wrong type.
+///
+/// Filesystems answering `needs_tid_reap() == false` are skipped: `/proc`, `/dev` and
+/// every container bind would otherwise take a slot to answer "nothing to release",
+/// and the warning below would stop meaning what it says.
+///
+/// A full table is not an error worth failing a mount over — it costs orphaned-lock
+/// recovery on that one filesystem, and the waiter-side backstop still unblocks the
+/// system — so it is reported and ignored.
+fn register_for_reap(fs: &Arc<dyn Filesystem>) {
+    if !fs.needs_tid_reap() {
+        return;
+    }
+    let mut slots = REAPABLE_MOUNTS.lock();
+    for slot in slots.iter_mut() {
+        if slot.as_ref().is_none_or(|w| w.strong_count() == 0) {
+            *slot = Some(Arc::downgrade(fs));
+            return;
+        }
+    }
+    akuma_primitives::safe_print!(
+        128,
+        "[vfs] WARNING: more than {} reapable mounts — orphaned-lock recovery is off for this one\n",
+        MAX_REAPABLE_MOUNTS
+    );
+}
+
+/// Release everything the dead thread `tid` held on any mounted filesystem.
+///
+/// Registered with `akuma_exec::threading::set_slot_reap_callback` (AArch64, from
+/// [`fs::init`]) and `akuma_threading::set_slot_reap_callback` (amd64, from its own
+/// `fs::install_reap_hooks`), so it runs at the TERMINATED→FREE transition where the
+/// tid is known dead and its slot cannot yet be reissued — the contract
+/// `RecoverableRwLock::abandon_tid` is written against.
+///
+/// The upgraded handles are collected into a fixed array and the registry lock is
+/// dropped **before** any of them is swept, so the sweep itself holds nothing.
+/// How many mounts the sweep would currently visit.
+///
+/// Exists to be asserted on at boot. The failure this registry has actually had
+/// is not a wrong sweep but an **empty** one — a kernel whose hooks were all
+/// registered and whose set of filesystems to sweep was silently nil, because
+/// its root was a type the registry could not hold. Nothing about that is
+/// visible from the reap side: `reap_dead_thread` over zero mounts returns
+/// exactly as it does over four. So both kernels check this is non-zero once
+/// the root is mounted, which is the assertion that would have caught it.
+#[must_use]
+pub fn reapable_mount_count() -> usize {
+    REAPABLE_MOUNTS
+        .lock()
+        .iter()
+        .filter(|s| s.as_ref().is_some_and(|w| w.strong_count() > 0))
+        .count()
+}
+
+pub fn reap_dead_thread(tid: usize) {
+    let mut live: [Option<Arc<dyn Filesystem>>; MAX_REAPABLE_MOUNTS] =
+        [const { None }; MAX_REAPABLE_MOUNTS];
+    {
+        let slots = REAPABLE_MOUNTS.lock();
+        for (out, slot) in live.iter_mut().zip(slots.iter()) {
+            *out = slot.as_ref().and_then(Weak::upgrade);
+        }
+    }
+    for fs in live.iter().flatten() {
+        fs.abandon_tid(tid);
+    }
+}
+
 /// [`mount`] recording the mount's `source` (`/dev/vda`, `proc`, …) and
 /// `MS_*` flags. Only `MS_RDONLY` is stored; the kernel's write chokepoints
 /// enforce it as `FsError::ReadOnly`.
@@ -222,6 +329,11 @@ pub fn mount_with(
     flags: u64,
     fs: Arc<dyn Filesystem>,
 ) -> Result<(), FsError> {
+    // Before `MOUNT_TABLE` is taken, so the two locks never nest, and before the
+    // filesystem is reachable, so no thread can take a write lock on a mount the
+    // sweep cannot see. A registration whose mount then fails is harmless: the
+    // caller drops the last `Arc` and the `Weak` slot is reused.
+    register_for_reap(&fs);
     let mut table = MOUNT_TABLE.lock();
     let table = table.as_mut().ok_or(FsError::NotInitialized)?;
     table.mount_with(path, source, flags, fs)
