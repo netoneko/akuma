@@ -881,17 +881,57 @@ fn munmap_void(addr: usize, len: usize) {
     let _ = syscall(syscall::MUNMAP, addr as u64, len as u64, 0, 0, 0, 0);
 }
 
+/// `nanosleep(2)`, in whichever of its two spellings this build's kernel
+/// understands.
+///
+/// Akuma's own `sys_nanosleep` accepts BOTH: it sniffs `a0` and treats
+/// anything below one page as a raw second count, anything above as a
+/// `*const timespec` (`crates/akuma-syscalls-time`). A real Linux kernel
+/// accepts only the pointer, so the raw-register spelling there is an
+/// `EFAULT` — which `sleep` has no return value to report, so **every sleep
+/// silently became a no-op** under `linux-abi`. Measured 2026-09-20 in the
+/// litter yard container: a 1-second tick loop ran ~6400 iterations/second
+/// and four agents pinned 300% CPU, while every `sleep_ms`-based backoff
+/// (the deadline poll loops in particular) degenerated into a hot spin.
+///
+/// `a0 = 0` in the old `sleep_ms` made this worse than a bad pointer: it is
+/// a NULL `timespec`, so the failure was total rather than address-dependent.
+#[inline(never)]
+fn nanosleep_for(seconds: i64, nanos: i64) {
+    #[cfg(feature = "linux-abi")]
+    {
+        // The pointer spelling. Valid on Akuma too (a stack address is never
+        // below a page), but kept behind the feature so the Akuma path stays
+        // byte-for-byte what it has always been.
+        let ts = Timespec { tv_sec: seconds, tv_nsec: nanos };
+        let _ = syscall(
+            syscall::NANOSLEEP,
+            &ts as *const Timespec as u64,
+            0, // rem: no restart-on-signal handling here
+            0, 0, 0, 0,
+        );
+    }
+    #[cfg(not(feature = "linux-abi"))]
+    {
+        let _ = syscall(syscall::NANOSLEEP, seconds as u64, nanos as u64, 0, 0, 0, 0);
+    }
+}
+
 /// Sleep for the specified number of seconds
 #[inline(never)]
 pub fn sleep(seconds: u64) {
-    syscall(syscall::NANOSLEEP, seconds, 0, 0, 0, 0, 0);
+    nanosleep_for(seconds as i64, 0);
 }
 
 /// Sleep for the specified number of milliseconds
 #[inline(never)]
 pub fn sleep_ms(milliseconds: u64) {
-    let nanos = milliseconds.saturating_mul(1_000_000);
-    syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
+    // Split rather than dumping everything into tv_nsec: Linux rejects
+    // tv_nsec >= 1e9 with EINVAL, so a 1500ms sleep in the old shape would
+    // not have slept at all even once the pointer was right.
+    let secs = (milliseconds / 1000) as i64;
+    let nanos = (milliseconds % 1000).saturating_mul(1_000_000) as i64;
+    nanosleep_for(secs, nanos);
 }
 
 // returns microseconds, not milliseconds
