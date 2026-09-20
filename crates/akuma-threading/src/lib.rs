@@ -3054,9 +3054,17 @@ pub fn x86_claim_slot() -> Option<usize> {
             //
             // Holds none of this module's locks here, so the hook may take its
             // own — the same context the two AArch64 sites document.
-            if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
-                purge(slot);
-            }
+            //
+            // Since the reaper landed this is [`x86_release_dead_slot`] — the
+            // futex purge plus the two releases that had no x86 caller at all
+            // (the BKL dropped-window ledger and the orphaned-lock reap). It
+            // runs here as well as in [`x86_reap_terminated_slots`] because the
+            // sweep is a *timeliness* mechanism and this is the *correctness*
+            // one: this is the instant a new occupant arrives, so whatever the
+            // last one left must be gone by now whether or not any collector
+            // happened to run. After a reap the slot is already `FREE` and
+            // every release is a no-op.
+            x86_release_dead_slot(slot);
             WAKE_TIMES[slot].store(0, Ordering::SeqCst);
             WOKEN_STATES[slot].store(false, Ordering::SeqCst);
             ON_CPU[slot].store(0, Ordering::SeqCst);
@@ -3140,9 +3148,138 @@ pub fn x86_finish_current() -> ! {
     let slot = (arch().current_slot)();
     THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::SeqCst);
     WAKE_TIMES[slot].store(0, Ordering::SeqCst);
+    // Drop this tid's futex registrations **now**, not when something next
+    // wants the slot. This is the x86 counterpart of the purge
+    // [`mark_thread_terminated`] performs at the same moment, and it exists for
+    // the same reason its comment gives: for as long as a dead tid sits in
+    // `FUTEX_WAITERS` it is still a wake target, so a `FUTEX_WAKE(uaddr, 1)`
+    // pops the corpse, counts it toward `max_wake` and leaves the live waiter
+    // parked. Until this line the earliest purge on this target was
+    // [`x86_claim_slot`]'s, i.e. "whenever someone happens to want this slot" —
+    // short under a build, unbounded on an idle box
+    // (`AKUMA_AMD64_NO_SLOT_RECYCLER.md` §3.2).
+    //
+    // Safe this early for the reason the AArch64 site states: a queue entry is
+    // of no further use to a terminated thread. Unlike its trap frame or its
+    // stacks, which the `yield_now` loop below still touches and which
+    // therefore stay until the slot is claimed or reaped.
+    if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
+        purge(slot);
+    }
     loop {
         yield_now();
         (arch().allow_tick)();
+    }
+}
+
+/// How many slots [`x86_reap_terminated_slots`] has carried to `FREE`.
+#[cfg(target_arch = "x86_64")]
+static X86_REAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Total slots reaped since boot. Zero on a box that has run user processes
+/// means no collector is calling [`x86_reap_terminated_slots`].
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_reaps() -> u64 {
+    X86_REAPS.load(Ordering::Relaxed)
+}
+
+/// Release what a dead slot's occupant left behind, and carry the slot
+/// `TERMINATED → FREE`.
+///
+/// # The transition this restores
+///
+/// On AArch64 a slot is cleaned when its thread dies; on x86_64 it was cleaned
+/// when the slot was next *claimed*, and `TERMINATED → FREE` never happened at
+/// all ([`x86_claim_slot`] takes a `TERMINATED` slot directly). Everything that
+/// is purely per-slot state survived that — the claim scrubs it — but the two
+/// hooks that have to fire *while the tid is dead and its slot not yet
+/// reissued* had no x86 caller at all, and neither did the BKL ledger reset.
+/// See `docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`.
+///
+/// What it does, in the shared recycler's order:
+///
+/// - **[`bkl::clear_dropped_windows_for_dead_thread`].** The ledger is
+///   tid-indexed. A thread killed between a `dropped_window_open` and its close
+///   leaves the depth standing and the next occupant of the slot inherits it —
+///   running its kernel excursions BKL-free while believing it holds the lock.
+///   `amd64` opens windows in `net.rs` and `exec_runtime.rs`, so this is not
+///   hypothetical here.
+/// - **`SLOT_PURGE_CALLBACK`.** Idempotent, and already fired at death by
+///   [`x86_finish_current`]; repeated here to cover a slot that reached
+///   `TERMINATED` by some other route.
+/// - **`SLOT_REAP_CALLBACK`.** Orphaned-lock recovery: release whatever this
+///   thread died holding. Last, which is exactly the reap contract — the tid is
+///   dead and no new occupant can have taken it yet.
+///
+/// # Why no cooldown
+///
+/// The shared recycler's `thread_cleanup_cooldown_us` exists to guarantee the
+/// thread has left its own kernel stack. `ON_CPU` establishes that directly and
+/// this target already gates on it (the same test [`x86_claim_slot`] makes), so
+/// a settling time would only add latency.
+///
+/// # Racing the claim
+///
+/// The `TERMINATED → INITIALIZING` CAS is the arbiter on both sides: a claim
+/// that wins the slot skips it here, and a reap that wins it makes the claim
+/// look elsewhere. `FREE` is what makes the pass idempotent — without it every
+/// sweep would re-run the hooks over every dead slot until something reused it.
+/// `x86_claim_slot` treats `FREE` and `TERMINATED` alike, and `slot_can_install`'s
+/// `space_root` carve-out covers both, so nothing downstream can tell.
+///
+/// Returns how many slots it moved.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_reap_terminated_slots() -> usize {
+    let mut count = 0;
+    for slot in 1..MAX_THREADS {
+        if THREAD_STATES[slot].load(Ordering::Acquire) != thread_state::TERMINATED {
+            continue;
+        }
+        // The core that switched away may still be executing on this slot's
+        // kernel stack. Don't reap under it; the next pass gets it.
+        if ON_CPU[slot].load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        if THREAD_STATES[slot]
+            .compare_exchange(
+                thread_state::TERMINATED,
+                thread_state::INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            x86_release_dead_slot(slot);
+            THREAD_STATES[slot].store(thread_state::FREE, Ordering::Release);
+            X86_REAPS.fetch_add(1, Ordering::Relaxed);
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The three releases [`x86_reap_terminated_slots`] performs, factored out so
+/// [`x86_claim_slot`] can perform them too.
+///
+/// A collector is a timeliness mechanism, not a correctness one: whether it ran
+/// depends on whether anything called it. A claim is the one moment where
+/// skipping these is guaranteed to hurt, because that is when the next occupant
+/// arrives — so the claim does them itself rather than trusting the sweep.
+/// Running both is free: each is idempotent, and after a reap the slot is
+/// `FREE` with nothing left to release.
+///
+/// Called with the slot `INITIALIZING` under the caller's winning CAS, so no
+/// other core can be claiming or reaping it, and with none of this module's
+/// locks held — the hooks may take their own.
+#[cfg(target_arch = "x86_64")]
+fn x86_release_dead_slot(slot: usize) {
+    let _stale_depth = bkl::clear_dropped_windows_for_dead_thread(slot);
+    if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
+        purge(slot);
+    }
+    if let Some(reap) = SLOT_REAP_CALLBACK.get() {
+        reap(slot);
     }
 }
 

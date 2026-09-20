@@ -2,10 +2,14 @@
 
 **Written:** 2026-09-18, out of the `[SWITCH FREED-CR3]` investigation
 (`AKUMA_AMD64_SWITCH_FREED_CR3_UAF.md` §3), which worked *around* this gap
-rather than closing it. **Status: open, not started.** Nothing here is a
-regression — it is a divergence that has been true since the x86 scheduler was
-written, and it is now written down because a second bug has already come out of
-it.
+rather than closing it. Nothing here is a regression — it is a divergence that
+has been true since the x86 scheduler was written, and it was written down
+because a second bug had already come out of it.
+
+**Status (2026-09-20): three of the four gaps are closed; §3.1 is not.** The
+reaper exists — see §8 for what landed, what it is verified against, and what
+is deliberately still open. Read §3 as the statement of the problem, not as the
+current state of the tree.
 
 Everything below is verified against the tree at `308580a2` plus the UAF fix.
 File:line references are to that state; check them before trusting them.
@@ -317,3 +321,122 @@ Verify with the census above: run something detached, kill its parent, and count
 `State: Z` entries in `/proc/*/stat` field 3. A fix means the count returns to
 zero on its own.
 
+---
+
+## 8. What landed (2026-09-20)
+
+The reaper, on the shape §5 argued for: **not** a call to
+`reclaim_terminated_slots` from somewhere, and not a collector alone.
+
+### 8.1 The transition
+
+`akuma_threading::x86_reap_terminated_slots` walks slots that are `TERMINATED`
+with `ON_CPU == 0`, CASes each to `INITIALIZING` — the same arbiter
+`x86_claim_slot` uses, so a reap and a claim cannot both win a slot — fires the
+releases below, and stores **`FREE`**.
+
+`FREE` is the substance, not a tidiness: it is what makes a sweep idempotent.
+Without it every pass would re-run the hooks over every dead slot until
+something happened to reuse it. Nothing downstream can tell the two states
+apart — `x86_claim_slot` treats them alike by construction, and
+`slot_can_install`'s `space_root` carve-out already covers `FREE` — which is
+exactly the property §5.4 asked a fix to preserve.
+
+No cooldown. The shared recycler's `thread_cleanup_cooldown_us` exists to
+guarantee the thread has left its own kernel stack, and the `ON_CPU` gate
+establishes that directly (§2 said so; this is that entry taken at its word).
+
+### 8.2 Three callers, and why it is not one
+
+§5.1 is the reason: an idle-loop collector does not run while the system is
+busy, which is when dead slots pile up. So the releases fire from three places
+with three different jobs, and only the second is load-bearing for correctness.
+
+| caller | job |
+|---|---|
+| `sched::idle_loop` | timeliness — a box that goes quiet does not sit on a dead thread's ext2 lock until something wants its slot |
+| `x86_claim_slot` | **correctness** — the same releases run before a new occupant arrives, whether or not any collector ran |
+| `akuma_locks_rw::register_backstop` | the waiter-side rescue — a thread blocked on a mount whose writer died drives the sweep that frees it |
+
+Running all three is free: each release is idempotent, and after a reap the slot
+is `FREE` with nothing left to release.
+
+### 8.3 The gaps, one by one
+
+- **§3.2 (futex purge is late) — closed.** `x86_finish_current` now purges at
+  the moment of death, which is where `mark_thread_terminated` does it on the
+  other kernel. The window that was "until the slot is reused" is gone for every
+  thread that reaches that function, and the claim/sweep purge still backstops
+  any that does not.
+- **§3.3 (BKL dropped windows) — closed.**
+  `clear_dropped_windows_for_dead_thread` finally has an x86 caller. The boot
+  self-test is `sched::reaper_smoke_test`, and the assertion that matters is the
+  *control*: a second slot is left `INITIALIZING` with a window of its own open,
+  and its depth must survive the sweep. Without that check, "the dead one reads
+  0" would pass even if the staging had never set a depth at all.
+- **§3.4 (orphaned-lock recovery) — closed, with a caveat worth knowing.**
+  `SLOT_REAP_CALLBACK` and the `akuma-locks-rw` backstop are registered from
+  `fs::mount_root_on`, after `mark_initialized`. **They could not simply reuse
+  `akuma_vfs_glue::ext2`'s registry**, and the reason is not a detail: that
+  registry is typed `Weak<Ext2Filesystem<KernelBlockDevice>>` and this target
+  mounts `Ext2Filesystem<RootDevice>` — a different instantiation, because its
+  root can be virtio, a GRUB-placed RAM image or a USB partition. Registering
+  into it is not a type error to work around; it is a different set, and it
+  would have been **empty on this target** while looking wired. So amd64 keeps
+  its own four-slot registry beside it. The de-duplication — one registry over a
+  `Weak<dyn …abandon_tid>` — touches the AArch64 mount path and is deliberately
+  not in this change.
+- **§3.1 (`CLEANUP_CALLBACK` / the leaked `Process`) — still open, deliberately.**
+  It is the gap this document ranks worst and it is the one left, so the reason
+  needs stating. The shared callback retires a `Process` when its last thread
+  goes; on this target `thread::teardown` hand-rolls that for `clone` threads,
+  and `sys_waitpid` does it for processes. Wiring a *backstop* means deciding
+  what happens when a **main** thread's slot is reaped before its parent has
+  waited — i.e. whether a zombie survives. That is a question about this
+  target's `SPAWN`/`PROCS` bookkeeping, not about slot recycling, and answering
+  it wrongly loses exit statuses silently. §5.2 already says the first step is
+  to trace the thread that skips `teardown`; the `[TRAMP-MISMATCH]` evidence in
+  §3.1 is a live instance to trace, and it has not been traced.
+
+  Note that this is now *less* pressing than §3.1 reads: two of the three
+  symptoms it names — the stale futex entry and the inherited slot state — are
+  covered by the releases above. What is left is the leaked `Process` row.
+
+- **The appendix (nothing reaps an orphaned zombie) — not touched.** It is a
+  userspace change (`userspace/sshd`'s accept loop) plus a kernel question about
+  re-parenting, and shares nothing with the slot reaper but its shape.
+
+### 8.4 Verified
+
+QEMU/TCG, this worktree, against a measured baseline on the same tree:
+
+| | baseline | with the reaper |
+|---|---|---|
+| `amd64_trials.py --local-only --smp 4` | 732 passed, 1 failed | **739 passed, 1 failed** |
+| `--smp 1` | — | **729 passed, 1 failed** |
+
+`+7` is exactly the seven new checks. The one failure is `mmap: the lazy path
+was actually taken`, which fails identically on the baseline — pre-existing on
+this branch, unrelated.
+
+Also green: `cargo test` on the host (1463 passed, 0 failed), clippy `-D
+warnings` on `akuma-threading` and on `akuma-amd64` for
+`x86_64-unknown-none`, the AArch64 `--release` kernel, and the `extreme-size`
+profile.
+
+**The number to read is the note, not the checks.** `sched: thread slots
+reaped` prints at the end of the suite: **11–13** over a boot at `SMP=4`, 2 at
+`SMP=1`. Those are real boot threads, not the self-test's — before this change
+every one of them sat `TERMINATED` with its hooks unfired until something
+happened to want its slot. A `0` on a box that has run processes means no
+collector is calling the sweep, which is the original bug returning.
+
+**Not yet run on the metal or under Firecracker** (`--remote-only`). Everything
+above is QEMU/TCG.
+
+### 8.5 One thing a reader should check before trusting this
+
+The AArch64 kernel should be untouched: every addition to `akuma-threading` is
+under `#[cfg(target_arch = "x86_64")]`, and the one change to an existing
+function is inside `x86_finish_current`. That is a structural argument, not a
+measurement — the `.text` was not diffed against a baseline build.

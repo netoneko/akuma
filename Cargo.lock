@@ -97,6 +97,7 @@ dependencies = [
  "akuma-fbcon",
  "akuma-fpcache",
  "akuma-isolation",
+ "akuma-locks-rw",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-multiboot2",

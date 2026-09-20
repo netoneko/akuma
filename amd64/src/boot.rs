@@ -413,6 +413,9 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // ring-3 register file into it through `akuma-threading`, reads it back and
     // abandons the slot. Outside the LAPIC block for that reason.
     sched::user_context_smoke_test(t);
+    // Beside it for the same reason: it claims two unpublished slots and never
+    // publishes either, so it needs neither a tick nor a running task.
+    sched::reaper_smoke_test(t);
 
     crate::pipe::smoke_test(t);
     // The signal ABI and its two filters. Beside `pipe` rather than with the
@@ -588,6 +591,13 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     t.note("sched: parks over the whole suite", sched::blocks());
     t.note("sched: wakes over the whole suite", sched::wakes());
     t.note("sched: backstop releases (0 is the healthy value)", sched::backstop_wakes());
+    // A note, not a check, for the same reason: how many slots the sweep has
+    // carried `TERMINATED → FREE` depends on how many threads the boot happened
+    // to run and on whether the idle loop got a turn. Worth printing because a
+    // number that stays 0 on a box that has run processes is the signature of
+    // the gap this exists to close — no collector is calling it
+    // (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`).
+    t.note("sched: thread slots reaped", akuma_threading::x86_reaps());
 
     t.note("suite: guest microseconds elapsed", crate::net::uptime_us().saturating_sub(suite_start_us));
     Verdict { passed: t.report() }

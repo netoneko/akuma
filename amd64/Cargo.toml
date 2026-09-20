@@ -423,6 +423,13 @@ akuma-user-access = { path = "../crates/akuma-user-access" }
 # know about, registered as `X86ArchHooks`.
 # `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` calls this A1.
 akuma-threading = { path = "../crates/akuma-threading" }
+# Orphaned-lock recovery for ext2. Only `register_backstop` is named here — the
+# lock type itself is `akuma-ext2`'s business — and only because the backstop is
+# a **waiter-side** rescue: a thread blocked on a mount whose writer died drives
+# the very slot sweep that frees it, which is the half the idle loop's collector
+# cannot cover (it does not run while the box is busy). See
+# `crate::fs::install_reap_hooks`.
+akuma-locks-rw = { path = "../crates/akuma-locks-rw" }
 # **C1**: the shared syscall dispatcher and its per-family implementations —
 # the crate this target's `usermode.rs` is being folded into
 # (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`, step 3 onward).
