@@ -509,3 +509,91 @@ mod listener_backlog_tests {
     }
 }
 
+
+/// The guarded accessors behind the meow `kill -9` wedge
+/// (`userspace/meow/docs/LITTER_EXPERIMENT_PHASE_4.md` §4b).
+///
+/// A `SocketHandle` copied out of the socket table can outlive its socket: a
+/// sibling thread sharing the fd table closes it, `poll()`'s GC removes it
+/// from the `SocketSet`, and the parked waiter's next predicate lap
+/// dereferences a dead handle — which panics inside smoltcp and, on bare
+/// metal, halts the box. `tcp_get`/`udp_get` must answer `None` for a dead
+/// handle instead of panicking, and `Some` for a live one.
+#[cfg(all(test, feature = "smoltcp"))]
+mod guarded_handle_tests {
+    use crate::smoltcp_net::{tcp_get, tcp_get_mut, udp_get, udp_get_mut};
+    use smoltcp::iface::{SocketHandle, SocketSet};
+    use smoltcp::socket::{tcp, udp};
+
+    fn tcp_set() -> (SocketSet<'static>, SocketHandle) {
+        let mut set = SocketSet::new(alloc::vec::Vec::new());
+        let h = set.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+            tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+        ));
+        (set, h)
+    }
+
+    fn udp_set() -> (SocketSet<'static>, SocketHandle) {
+        let mut set = SocketSet::new(alloc::vec::Vec::new());
+        let h = set.add(udp::Socket::new(
+            udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 1], alloc::vec![0u8; 64]),
+            udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 1], alloc::vec![0u8; 64]),
+        ));
+        (set, h)
+    }
+
+    #[test]
+    fn a_live_tcp_handle_reads_through() {
+        let (set, h) = tcp_set();
+        assert_eq!(tcp_get(&set, h, |s| s.state()), Some(tcp::State::Closed));
+    }
+
+    /// The wedge itself: the exact sequence a killed process leaves behind —
+    /// handle minted, socket removed by the close+GC path, waiter's predicate
+    /// runs once more. Without the guard this test PANICS inside smoltcp's
+    /// `get`, which is the whole point of it: a panic here is the bare-metal
+    /// halt that took the trashcan dark.
+    #[test]
+    fn a_removed_tcp_handle_answers_none_not_a_panic() {
+        let (mut set, h) = tcp_set();
+        set.remove(h);
+        assert_eq!(tcp_get(&set, h, |s| s.state()), None);
+        assert_eq!(tcp_get_mut(&mut set, h, |s| s.state()), None);
+    }
+
+    #[test]
+    fn a_removed_udp_handle_answers_none_not_a_panic() {
+        let (mut set, h) = udp_set();
+        set.remove(h);
+        assert_eq!(udp_get(&set, h, |s| s.can_recv()), None);
+        assert_eq!(udp_get_mut(&mut set, h, |s| s.can_send()), None);
+    }
+
+    /// A live handle must still read through the guard — the guard must not
+    /// over-refuse and turn every socket operation into ENETDOWN.
+    #[test]
+    fn a_live_udp_handle_reads_through() {
+        let (set, h) = udp_set();
+        assert_eq!(udp_get(&set, h, |s| s.can_recv()), Some(false));
+    }
+
+    /// Removing a *different* handle must not disturb this one: the guard is a
+    /// membership test, not a bounds check (the old `index < MAX_SOCKETS` shape
+    /// let an in-range dead handle through, which is what the membership test
+    /// replaced in 2026-08-30's `is_valid_handle`).
+    #[test]
+    fn a_sibling_removal_leaves_this_handle_live() {
+        let mut set = SocketSet::new(alloc::vec::Vec::new());
+        let a = set.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+            tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+        ));
+        let b = set.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+            tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+        ));
+        set.remove(a);
+        assert_eq!(tcp_get(&set, b, |s| s.state()), Some(tcp::State::Closed));
+    }
+}

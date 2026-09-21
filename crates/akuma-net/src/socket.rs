@@ -591,11 +591,11 @@ pub fn set_socket_keepalive(idx: usize, enabled: bool) {
         sock.keepalive = enabled;
         with_network(|net| match &sock.inner {
             SocketType::Stream(h) => {
-                net.sockets.get_mut::<tcp::Socket>(*h).set_keep_alive(interval);
+                smoltcp_net::tcp_get_mut(&mut net.sockets, *h, |s| s.set_keep_alive(interval));
             }
             SocketType::Listener { handles, .. } => {
                 for h in handles {
-                    net.sockets.get_mut::<tcp::Socket>(*h).set_keep_alive(interval);
+                    smoltcp_net::tcp_get_mut(&mut net.sockets, *h, |s| s.set_keep_alive(interval));
                 }
             }
             // UDP has no connection to keep alive.
@@ -619,7 +619,9 @@ pub fn socket_keepalive_interval(idx: usize) -> Option<Duration> {
         let SocketType::Stream(h) = sock.inner else {
             return None;
         };
-        with_network(|net| net.sockets.get::<tcp::Socket>(h).keep_alive()).flatten()
+        with_network(|net| smoltcp_net::tcp_get(&net.sockets, h, smoltcp::socket::tcp::Socket::keep_alive))
+            .flatten()
+            .flatten()
     })
 }
 
@@ -1141,17 +1143,18 @@ fn listener_refresh(idx: usize) -> bool {
 
         with_network(|net| {
             for &handle in handles.iter() {
-                let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-                let state = socket.state();
-                if backlog_handle_is_live(state) {
-                    if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
-                        pending = true;
+                smoltcp_net::tcp_get_mut(&mut net.sockets, handle, |socket| {
+                    let state = socket.state();
+                    if backlog_handle_is_live(state) {
+                        if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
+                            pending = true;
+                        }
+                        return;
                     }
-                    continue;
-                }
-                // Dead slot: hand it back to the pool as a fresh listener.
-                socket.abort();
-                let _ = socket.listen(port);
+                    // Dead slot: hand it back to the pool as a fresh listener.
+                    socket.abort();
+                    let _ = socket.listen(port);
+                });
             }
         });
 
@@ -1199,7 +1202,8 @@ pub fn listener_backlog_census(idx: usize) -> Option<(u16, u16, u16)> {
         let SocketType::Listener { handles, .. } = &sock.inner else { return None };
         let mut census = (0u16, 0u16, 0u16);
         for &h in handles {
-            match with_network(|net| net.sockets.get::<tcp::Socket>(h).state()) {
+            match with_network(|net| smoltcp_net::tcp_get(&net.sockets, h, smoltcp::socket::tcp::Socket::state)).flatten()
+            {
                 Some(tcp::State::Listen) => census.0 += 1,
                 Some(s) if backlog_handle_is_live(s) => census.1 += 1,
                 _ => census.2 += 1,
@@ -1223,7 +1227,9 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port, .. }, .. })) = table.get_mut(idx) {
              let port = *local_port;
              for (i, &handle) in handles.iter().enumerate() {
-                let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
+                let state =
+                    with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::state))
+                        .flatten();
                 // `CloseWait` as well as `Established`: the client may have sent
                 // its whole request and closed before anyone got here, and that
                 // request is still sitting in this handle's receive buffer.
@@ -1234,12 +1240,13 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
                         handles.push_back(new_h);
                     }
                     let remote = with_network(|net| {
-                        let socket = net.sockets.get::<tcp::Socket>(h);
-                        socket.remote_endpoint().map(|ep| {
-                            let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr;
-                            SocketAddrV4 { ip: addr.octets(), port: ep.port }
+                        smoltcp_net::tcp_get(&net.sockets, h, |socket| {
+                            socket.remote_endpoint().map(|ep| {
+                                let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr;
+                                SocketAddrV4 { ip: addr.octets(), port: ep.port }
+                            })
                         })
-                    }).flatten().unwrap_or(SocketAddrV4::new([0;4], 0));
+                    }).flatten().flatten().unwrap_or(SocketAddrV4::new([0;4], 0));
                     return Some((h, remote));
                 }
              }
@@ -1325,7 +1332,9 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
     // `InvalidState`. Reporting that as ECONNREFUSED made every such caller
     // (`redis-cli`/hiredis is the reference case) fail against a listener that was
     // up and healthy. POSIX: EISCONN once established, EALREADY while connecting.
-    let Some(state_before) = with_network(|net| net.sockets.get::<tcp::Socket>(h).state()) else {
+    let Some(state_before) =
+        with_network(|net| smoltcp_net::tcp_get(&net.sockets, h, smoltcp::socket::tcp::Socket::state)).flatten()
+    else {
         return Err(libc_errno::ENETDOWN);
     };
     match connect_step(state_before) {
@@ -1338,13 +1347,14 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
     }
 
     let res = with_network(|net| {
-        let socket = net.sockets.get_mut::<tcp::Socket>(h);
-        let cx = net.iface.context();
-        socket.connect(cx,
-            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
-            local_port
-        )
-    });
+        smoltcp_net::tcp_get_mut(&mut net.sockets, h, |socket| {
+            let cx = net.iface.context();
+            socket.connect(cx,
+                (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
+                local_port
+            )
+        })
+    }).flatten();
 
     match res {
         Some(Ok(())) => {},
@@ -1381,12 +1391,16 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
 fn finish_connect_wait(idx: usize, h: SocketHandle) -> Result<(), i32> {
     let waited = wait_until(idx, || {
         with_network(|net| {
-            let socket = net.sockets.get::<tcp::Socket>(h);
-            matches!(socket.state(), tcp::State::Established | tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait)
+            // A sibling sharing the fd table can close this socket while we
+            // park; once the GC removes the handle the raw `get` below would
+            // panic (the meow `kill -9` wedge). Dead handle -> stop waiting.
+            smoltcp_net::tcp_get(&net.sockets, h, |socket| {
+                matches!(socket.state(), tcp::State::Established | tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait)
+            }).unwrap_or(true)
         }).unwrap_or(true)
     }, Some(10_000_000));
 
-    let outcome = connect_outcome(waited, with_network(|net| net.sockets.get::<tcp::Socket>(h).state()));
+    let outcome = connect_outcome(waited, with_network(|net| smoltcp_net::tcp_get(&net.sockets, h, smoltcp::socket::tcp::Socket::state)).flatten());
     if outcome.is_ok() {
         mark_was_connected(idx);
     }
@@ -1449,7 +1463,7 @@ pub fn socket_shutdown(idx: usize, how: i32) -> Result<(), i32> {
     };
 
     if matches!(how, SHUT_WR | SHUT_RDWR) {
-        with_network(|net| net.sockets.get_mut::<tcp::Socket>(handle).close());
+        with_network(|net| smoltcp_net::tcp_get_mut(&mut net.sockets, handle, smoltcp::socket::tcp::Socket::close));
         // Put the FIN on the wire now rather than at the next poll: the whole
         // point of this call is that the peer learns about it promptly.
         smoltcp_net::poll();
@@ -1474,21 +1488,24 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
     }).ok_or(libc_errno::EBADF)?;
 
     if nonblock {
-        let can = with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(false);
+        let can = with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::can_send))
+            .flatten()
+            .unwrap_or(false);
         if !can { return Err(libc_errno::EAGAIN); }
     } else {
         // `sndtimeo` (None = forever) replaces what used to be an unconditional
         // 5 s cap. A blocking write that cannot make room in the transmit
         // buffer must block, not invent an `ETIMEDOUT` the caller never asked
         // for — see `KernelSocket::sndtimeo_us`.
-        wait_until(idx, || with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), sndtimeo)?;
+        wait_until(idx, || with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::can_send)).flatten().unwrap_or(true), sndtimeo)?;
     }
 
     let res = with_network(|net| {
-        let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-        if !socket.can_send() { return Err(libc_errno::EPIPE); }
-        socket.send_slice(buf).map_err(|_| libc_errno::EIO)
-    });
+        smoltcp_net::tcp_get_mut(&mut net.sockets, handle, |socket| {
+            if !socket.can_send() { return Err(libc_errno::EPIPE); }
+            socket.send_slice(buf).map_err(|_| libc_errno::EIO)
+        })
+    }).flatten();
     
     if matches!(res, Some(Ok(_))) {
         with_table(|table| {
@@ -1525,8 +1542,11 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
     let was_connected = with_table(|table| {
         let sock = table.get_mut(idx)?.as_mut()?;
         if !sock.was_connected
-            && with_network(|net| tcp_reached_established(net.sockets.get::<tcp::Socket>(handle).state()))
-                .unwrap_or(false)
+            && with_network(|net| {
+                smoltcp_net::tcp_get(&net.sockets, handle, |s| tcp_reached_established(s.state()))
+            })
+            .flatten()
+            .unwrap_or(false)
         {
             sock.was_connected = true;
         }
@@ -1542,46 +1562,49 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
     if nonblock {
         smoltcp_net::poll();
         let ready = with_network(|net| {
-            let socket = net.sockets.get::<tcp::Socket>(handle);
-            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
-        }).unwrap_or(true);
+            smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
+                tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
+            })
+        }).flatten().unwrap_or(true);
         if !ready { return Err(libc_errno::EAGAIN); }
     } else {
-        wait_until(idx, || with_network(|net| {
-            let socket = net.sockets.get::<tcp::Socket>(handle);
-            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
         // `rcvtimeo` (None = forever) replaces what used to be an unconditional
         // 30 s cap — the one a 35 s-delayed response tripped at 30069 ms, and
         // the one that made a 2 s `SO_RCVTIMEO` fire at 30041 ms. POSIX: a
         // blocking read with no `SO_RCVTIMEO` blocks until data, EOF or a
         // signal.
+        wait_until(idx, || with_network(|net| {
+            smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
+                tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
+            }).unwrap_or(true)
         }).unwrap_or(true), rcvtimeo)?;
     }
 
     let res = with_network(|net| {
-        let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-        if socket.can_recv() {
-            socket.recv(|data| {
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
-                (len, len)
-            }).map_err(|_| libc_errno::EIO)
-        } else if !socket.may_recv() && socket.state() == tcp::State::Closed && was_connected {
-            // A connection that was up and is now `Closed` was ABORTED — reset by
-            // the peer, or given up on by smoltcp's own timeout. A graceful FIN
-            // parks the socket in `CloseWait` and never reaches here, so this is
-            // never a clean end-of-stream and must not be reported as one:
-            // `Ok(0)` would tell an HTTP server "request complete" about a
-            // request that was cut in half.
-            Err(libc_errno::ECONNRESET)
-        } else if !socket.may_recv() && tcp_reached_established(socket.state()) {
-            // Real EOF: the peer closed its write half of a connection that was
-            // up. A socket still in SynSent also answers `!may_recv()`, and
-            // reporting THAT as `Ok(0)` handed the caller an end-of-stream
-            // before the handshake had finished.
-            Ok(0)
-        } else { Err(libc_errno::EAGAIN) }
-    });
+        smoltcp_net::tcp_get_mut(&mut net.sockets, handle, |socket| {
+            if socket.can_recv() {
+                socket.recv(|data| {
+                    let len = data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&data[..len]);
+                    (len, len)
+                }).map_err(|_| libc_errno::EIO)
+            } else if !socket.may_recv() && socket.state() == tcp::State::Closed && was_connected {
+                // A connection that was up and is now `Closed` was ABORTED — reset by
+                // the peer, or given up on by smoltcp's own timeout. A graceful FIN
+                // parks the socket in `CloseWait` and never reaches here, so this is
+                // never a clean end-of-stream and must not be reported as one:
+                // `Ok(0)` would tell an HTTP server "request complete" about a
+                // request that was cut in half.
+                Err(libc_errno::ECONNRESET)
+            } else if !socket.may_recv() && tcp_reached_established(socket.state()) {
+                // Real EOF: the peer closed its write half of a connection that was
+                // up. A socket still in SynSent also answers `!may_recv()`, and
+                // reporting THAT as `Ok(0)` handed the caller an end-of-stream
+                // before the handshake had finished.
+                Ok(0)
+            } else { Err(libc_errno::EAGAIN) }
+        })
+    }).flatten();
 
     if matches!(res, Some(Ok(_))) {
         with_table(|table| {
@@ -1720,8 +1743,9 @@ pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
         let sock = table.get_mut(idx)?.as_mut()?;
         if !sock.was_connected
             && with_network(|net| {
-                tcp_reached_established(net.sockets.get::<tcp::Socket>(handle).state())
+                smoltcp_net::tcp_get(&net.sockets, handle, |s| tcp_reached_established(s.state()))
             })
+            .flatten()
             .unwrap_or(false)
         {
             sock.was_connected = true;
@@ -1730,12 +1754,14 @@ pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
     })
     .unwrap_or(false);
     with_network(|net| {
-        let socket = net.sockets.get::<tcp::Socket>(handle);
-        (
-            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected),
-            socket.can_send(),
-        )
+        smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
+            (
+                tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected),
+                socket.can_send(),
+            )
+        })
     })
+    .flatten()
     .unwrap_or((false, false))
 }
 
@@ -1790,33 +1816,34 @@ pub fn list_sockets() -> Vec<SocketStat> {
             match slot.inner {
                 SocketType::Stream(h) => {
                     with_network(|net| {
-                        let socket = net.sockets.get::<tcp::Socket>(h);
-                        let remote = socket.remote_endpoint().map_or(([0;4], 0), |ep| {
-                            let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr;
-                            (addr.octets(), ep.port)
-                        });
-                        
-                        let tcp_state = match socket.state() {
-                            tcp::State::Closed => "CLOSED",
-                            tcp::State::Listen => "LISTEN",
-                            tcp::State::SynSent => "SYN_SENT",
-                            tcp::State::SynReceived => "SYN_RECV",
-                            tcp::State::Established => "ESTABLISHED",
-                            tcp::State::FinWait1 => "FIN_WAIT1",
-                            tcp::State::FinWait2 => "FIN_WAIT2",
-                            tcp::State::CloseWait => "CLOSE_WAIT",
-                            tcp::State::Closing => "CLOSING",
-                            tcp::State::LastAck => "LAST_ACK",
-                            tcp::State::TimeWait => "TIME_WAIT",
-                        };
+                        smoltcp_net::tcp_get(&net.sockets, h, |socket| {
+                            let remote = socket.remote_endpoint().map_or(([0;4], 0), |ep| {
+                                let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr;
+                                (addr.octets(), ep.port)
+                            });
 
-                        stats.push(SocketStat {
-                            local_port: slot.bind_port.unwrap_or(0),
-                            remote_ip: remote.0,
-                            remote_port: remote.1,
-                            state: tcp_state,
-                            box_id: slot.box_id,
-                            backlog: (0, 0, 0),
+                            let tcp_state = match socket.state() {
+                                tcp::State::Closed => "CLOSED",
+                                tcp::State::Listen => "LISTEN",
+                                tcp::State::SynSent => "SYN_SENT",
+                                tcp::State::SynReceived => "SYN_RECV",
+                                tcp::State::Established => "ESTABLISHED",
+                                tcp::State::FinWait1 => "FIN_WAIT1",
+                                tcp::State::FinWait2 => "FIN_WAIT2",
+                                tcp::State::CloseWait => "CLOSE_WAIT",
+                                tcp::State::Closing => "CLOSING",
+                                tcp::State::LastAck => "LAST_ACK",
+                                tcp::State::TimeWait => "TIME_WAIT",
+                            };
+
+                            stats.push(SocketStat {
+                                local_port: slot.bind_port.unwrap_or(0),
+                                remote_ip: remote.0,
+                                remote_port: remote.1,
+                                state: tcp_state,
+                                box_id: slot.box_id,
+                                backlog: (0, 0, 0),
+                            });
                         });
                     });
                 }
@@ -1825,7 +1852,7 @@ pub fn list_sockets() -> Vec<SocketStat> {
                     let mut pending = 0u16;
                     let mut dead = 0u16;
                     for &h in handles {
-                        match with_network(|net| net.sockets.get::<tcp::Socket>(h).state()) {
+                        match with_network(|net| smoltcp_net::tcp_get(&net.sockets, h, smoltcp::socket::tcp::Socket::state)).flatten() {
                             Some(tcp::State::Listen) => listening += 1,
                             Some(st) if backlog_handle_is_live(st) => pending += 1,
                             _ => dead += 1,

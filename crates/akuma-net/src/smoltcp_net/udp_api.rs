@@ -36,28 +36,29 @@ pub fn udp_socket_create() -> Option<SocketHandle> {
 #[allow(clippy::result_unit_err)]
 pub fn udp_socket_bind(handle: SocketHandle, port: u16) -> Result<(), ()> {
     with_network(|net| {
-        let socket = net.sockets.get_mut::<udp::Socket>(handle);
-        socket.bind(port).map_err(|_| ())
-    }).unwrap_or(Err(()))
+        udp_get_mut(&mut net.sockets, handle, |socket| socket.bind(port).map_err(|_| ()))
+    }).flatten().unwrap_or(Err(()))
 }
 
 #[allow(clippy::result_unit_err)]
 pub fn udp_socket_send(handle: SocketHandle, buf: &[u8], remote: smoltcp::wire::IpEndpoint) -> Result<usize, ()> {
     with_network(|net| {
-        let socket = net.sockets.get_mut::<udp::Socket>(handle);
-        socket.send_slice(buf, remote).map(|()| buf.len()).map_err(|_| ())
-    }).unwrap_or(Err(()))
+        udp_get_mut(&mut net.sockets, handle, |socket| {
+            socket.send_slice(buf, remote).map(|()| buf.len()).map_err(|_| ())
+        })
+    }).flatten().unwrap_or(Err(()))
 }
 
 #[allow(clippy::result_unit_err)]
 pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, smoltcp::wire::IpEndpoint), ()> {
     with_network(|net| {
-        let socket = net.sockets.get_mut::<udp::Socket>(handle);
-        match socket.recv_slice(buf) {
-            Ok((len, meta)) => Ok((len, meta.endpoint)),
-            Err(_) => Err(()),
-        }
-    }).unwrap_or(Err(()))
+        udp_get_mut(&mut net.sockets, handle, |socket| {
+            match socket.recv_slice(buf) {
+                Ok((len, meta)) => Ok((len, meta.endpoint)),
+                Err(_) => Err(()),
+            }
+        })
+    }).flatten().unwrap_or(Err(()))
 }
 
 /// Register `waker` on the **smoltcp socket itself**, so a state change wakes
@@ -88,41 +89,52 @@ pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, s
 /// Both halves are registered: a waiter may be blocked on either direction and
 /// the caller's `condition` closure is opaque to us.
 ///
-/// Returns `false` when the stack is not up, so nothing was registered. The
+/// Returns `false` when the stack is not up, so nothing was registered, and
+/// also when `handle` is no longer in the socket set — a waiter parked on a
+/// handle a sibling just closed (the [`tcp_get`]-documented kill -9 race) must
+/// fall back to its backstop park rather than panic inside the `get_mut`. The
 /// caller still parks — its backstop is exactly the fallback for a wake that
 /// cannot arrive — but it is not a silent no-op.
 #[must_use]
 pub fn register_socket_waker(handle: SocketHandle, is_udp: bool, waker: &core::task::Waker) -> bool {
     with_network(|net| {
         if is_udp {
-            let s = net.sockets.get_mut::<udp::Socket>(handle);
-            s.register_recv_waker(waker);
-            s.register_send_waker(waker);
+            udp_get_mut(&mut net.sockets, handle, |s| {
+                s.register_recv_waker(waker);
+                s.register_send_waker(waker);
+            })
         } else {
-            let s = net.sockets.get_mut::<tcp::Socket>(handle);
-            s.register_recv_waker(waker);
-            s.register_send_waker(waker);
+            tcp_get_mut(&mut net.sockets, handle, |s| {
+                s.register_recv_waker(waker);
+                s.register_send_waker(waker);
+            })
         }
     })
+    .flatten()
     .is_some()
 }
 
 #[must_use]
 pub fn udp_can_recv(handle: SocketHandle) -> bool {
     with_network(|net| {
-        net.sockets.get::<udp::Socket>(handle).can_recv()
-    }).unwrap_or(false)
+        udp_get(&net.sockets, handle, smoltcp::socket::udp::Socket::can_recv)
+    }).flatten().unwrap_or(false)
 }
 
-#[must_use] 
+#[must_use]
 pub fn udp_can_send(handle: SocketHandle) -> bool {
     with_network(|net| {
-        net.sockets.get::<udp::Socket>(handle).can_send()
-    }).unwrap_or(false)
+        udp_get(&net.sockets, handle, smoltcp::socket::udp::Socket::can_send)
+    }).flatten().unwrap_or(false)
 }
 
 pub fn udp_socket_close(handle: SocketHandle) {
     with_network(|net| {
+        // Already gone — a sibling's close won the race. Removing a removed
+        // handle panics inside smoltcp, so this is a guard, not paranoia.
+        if !is_valid_handle(&net.sockets, handle) {
+            return;
+        }
         let socket = net.sockets.get_mut::<udp::Socket>(handle);
         socket.close();
         net.sockets.remove(handle);

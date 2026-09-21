@@ -35,8 +35,71 @@ pub struct TcpStream {
 /// O(live sockets). Every caller is a per-operation or per-connect-sweep path,
 /// never per-packet — `net.connecting` and `net.pending_removal` hold a handful
 /// of entries in practice.
-pub(crate) fn is_valid_handle(sockets: &SocketSet<'static>, handle: SocketHandle) -> bool {
+pub(crate) fn is_valid_handle(sockets: &SocketSet<'_>, handle: SocketHandle) -> bool {
     sockets.iter().any(|(h, _)| h == handle)
+}
+
+// ============================================================================
+// Guarded accessors — the ONLY way to dereference an out-of-table handle
+// ============================================================================
+
+/// Read a TCP socket through `handle`, `None` when the handle is dead.
+///
+/// **Every handle that escaped a `SOCKET_TABLE` entry must come back through
+/// one of these.** A `SocketHandle` copied out of the table (`socket_send`,
+/// `socket_recv`, `finish_connect_wait`, the accept pool, ...) can outlive its
+/// socket: a sibling thread sharing the fd table tears the socket down under
+/// the caller (`kill -9` of a two-threaded process is the repro — meow's raft
+/// thread), `poll()`'s GC then `remove()`s the handle from the `SocketSet`,
+/// and the parked waiter's next predicate lap dereferences a dead handle.
+/// smoltcp's `get`/`get_mut` answer that with a **panic** — "handle does not
+/// refer to a valid socket" — which on bare metal halts the core and takes the
+/// box dark. This is the root cause recorded in
+/// `userspace/meow/docs/LITTER_EXPERIMENT_PHASE_4.md` §4b; the sweeps in
+/// `poll.rs`/`lifecycle.rs` already guarded themselves, the blocking syscall
+/// paths did not.
+///
+/// `None` here is not a corner to widen: the callers already carry
+/// `unwrap_or` fallbacks written for the "network is down" case, and a dead
+/// handle deserves exactly the same answer.
+///
+/// `'a` is written out and tied to the socket's own buffer lifetime so the
+/// single-method closures (`|s| s.state()`) at the call sites typecheck.
+pub(crate) fn tcp_get<'s, 'b, R>(
+    sockets: &'s SocketSet<'b>,
+    handle: SocketHandle,
+    f: impl FnOnce(&'s tcp::Socket<'b>) -> R,
+) -> Option<R> {
+    is_valid_handle(sockets, handle).then(|| f(sockets.get::<tcp::Socket>(handle)))
+}
+
+/// [`tcp_get`] for writers.
+pub(crate) fn tcp_get_mut<'s, 'b, R>(
+    sockets: &'s mut SocketSet<'b>,
+    handle: SocketHandle,
+    f: impl FnOnce(&'s mut tcp::Socket<'b>) -> R,
+) -> Option<R> {
+    is_valid_handle(sockets, handle).then(|| f(sockets.get_mut::<tcp::Socket>(handle)))
+}
+
+/// [`tcp_get`] for a UDP handle. UDP handles go stale the same way —
+/// `udp_socket_close` removes the handle synchronously, so any waiter parked on
+/// `udp_can_recv` across a sibling's close needs the guard too.
+pub(crate) fn udp_get<'s, 'b, R>(
+    sockets: &'s SocketSet<'b>,
+    handle: SocketHandle,
+    f: impl FnOnce(&'s udp::Socket<'b>) -> R,
+) -> Option<R> {
+    is_valid_handle(sockets, handle).then(|| f(sockets.get::<udp::Socket>(handle)))
+}
+
+/// [`udp_get`] for writers.
+pub(crate) fn udp_get_mut<'s, 'b, R>(
+    sockets: &'s mut SocketSet<'b>,
+    handle: SocketHandle,
+    f: impl FnOnce(&'s mut udp::Socket<'b>) -> R,
+) -> Option<R> {
+    is_valid_handle(sockets, handle).then(|| f(sockets.get_mut::<udp::Socket>(handle)))
 }
 
 impl TcpStream {
