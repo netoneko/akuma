@@ -15,6 +15,7 @@ churn. See [`../README.md`](../README.md).
 |---|---|---|
 | Boot / MMU / DTB | [`subsystems/boot.md`](subsystems/boot.md) | B |
 | Memory (PMM, heap, COW) | [`subsystems/memory.md`](subsystems/memory.md) | **C** |
+| amd64 writable `MAP_SHARED` file mappings | [`subsystems/amd64-shared-write-mmap.md`](subsystems/amd64-shared-write-mmap.md) | **C** |
 | Scheduler / threads | [`subsystems/scheduler.md`](subsystems/scheduler.md) | A |
 | SMP (shared-kernel) | [`subsystems/smp-shared.md`](subsystems/smp-shared.md) | **C** |
 | Networking (box model, two stacks) | [`subsystems/networking.md`](subsystems/networking.md) | **C** |

@@ -33,9 +33,13 @@
 //! nobody else can see. This target gives exactly that: each page is allocated,
 //! zeroed, and then overwritten from the file ([`populate_file_page`]).
 //!
-//! One refusal is left: a **writable `MAP_SHARED`** file mapping, whose writes
-//! must reach the file and every other mapper. A private copy would accept the
-//! write and drop it, which is the original objection in its true scope.
+//! A **writable `MAP_SHARED`** file mapping is served since 2026-09-22 — the
+//! last refusal in this family. Writes reach the file by write-back on
+//! `munmap`/`msync`/`MADV_DONTNEED` over demand-paged pages, not by a page
+//! cache; the coherence that a cache would give every mapper is narrowed to
+//! the single-mapper contract. See
+//! `docs/reference/subsystems/amd64-shared-write-mmap.md` for the design and
+//! `MmapRegion::shared_write` for what is and is not promised.
 //!
 //! One pinned divergence comes with it: a mapping never sees a write made to
 //! the file after the `mmap` — `MAP_PRIVATE` leaves that unspecified on Linux
@@ -680,8 +684,9 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // no fd to ask.
     //
     // Gated on the same `akuma_config::MMAP_FILE_BACKED_LAZY` the AArch64 kernel
-    // reads, and `plan.file_lazy_eligible`, which excludes writable `MAP_SHARED`
-    // — refused outright above on this target. A file with no inode identity
+    // reads, and `plan.file_lazy_eligible` — every file mapping, writable
+    // `MAP_SHARED` included since the write-back record gave it a coherent
+    // story without residency. A file with no inode identity
     // (`file_identity` answers `None`) stays eager: there is nothing to fault
     // against.
     let lazy_file: Option<FileBacking> = if akuma_config::MMAP_FILE_BACKED_LAZY
