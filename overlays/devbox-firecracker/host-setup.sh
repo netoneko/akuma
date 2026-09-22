@@ -10,6 +10,11 @@ set -euo pipefail
 INSTANCE="${LIMA_INSTANCE:-fc}"
 CPUS="${LIMA_CPUS:-4}"
 MEM="${LIMA_MEM:-8}"
+# Guest ports Lima exposes on the Mac's LAN interfaces (0.0.0.0), not just
+# its loopback — Lima's default. akuma-miot's mesh nodes (`kot run`, 9944+)
+# live in this VM and must be reachable from other LAN hosts; loopback-only
+# was invisible to them. Everything else keeps the loopback default.
+LAN_PORTS="${LIMA_LAN_PORTS:-9944-9949}"
 
 say() { printf '\033[1;36m[host-setup]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[host-setup] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -45,8 +50,10 @@ else
   # NOTE: limactl buffers ALL output when stdout is not a TTY, so a backgrounded
   # run looks dead while working — and several concurrent runs will race on the
   # same instance and starve each other. Keep this in the foreground.
+  LO="${LAN_PORTS%-*}"; HI="${LAN_PORTS#*-}"
   limactl start -y --name="$INSTANCE" --vm-type=vz --nested-virt \
-      --cpus="$CPUS" --memory="$MEM"
+      --cpus="$CPUS" --memory="$MEM" \
+      --set ".portForwards = [{\"guestPortRange\": [$LO, $HI], \"hostIP\": \"0.0.0.0\"}] + (.portForwards // [])"
 fi
 
 # Both settings must be present; --nested-virt is meaningless without vz.
@@ -55,6 +62,8 @@ grep -qE '^vmType: vz' "$HOME/.lima/$INSTANCE/lima.yaml" \
   || die "instance is not on the vz driver; delete it and re-run: limactl delete $INSTANCE"
 grep -qE '^nestedVirtualization: true' "$HOME/.lima/$INSTANCE/lima.yaml" \
   || die "nestedVirtualization not set; delete it and re-run: limactl delete $INSTANCE"
+grep -qE '^ *hostIP: "?0\.0\.0\.0' "$HOME/.lima/$INSTANCE/lima.yaml" \
+  || die "no LAN port forward ($LAN_PORTS) — an instance from before it existed; delete it and re-run: limactl delete $INSTANCE"
 
 if [ "$(limactl list "$INSTANCE" --format '{{.Status}}' 2>/dev/null)" != "Running" ]; then
   say "starting '$INSTANCE'"

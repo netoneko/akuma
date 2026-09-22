@@ -85,4 +85,6 @@ Background: found from akuma-miot, where ParityDB's `MmapMut` died at
 `crates/miot-store/src/bin/mmapprobe.rs` for the raw-syscall probe that
 pinned the original refusal (which **segfaulted** rather than returning
 `ENOSYS` — the refusal lived inside `plan`'s eager arm, and the probe's
-4th shape never came back).
+4th shape never came back). The full investigation, including the two
+silent-wrong-answer bugs the new path exposed and the probe series that
+eliminated the suspects: [`../../archive/AKUMA_AMD64_SHARED_WRITE_MMAP.md`](../../archive/AKUMA_AMD64_SHARED_WRITE_MMAP.md).

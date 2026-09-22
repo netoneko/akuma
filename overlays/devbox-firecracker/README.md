@@ -60,7 +60,7 @@ Idempotent, run in order.
 
 | Script | Runs on | Does |
 |---|---|---|
-| `host-setup.sh` | macOS | Verifies nested virt, creates the Lima VM, proves `/dev/kvm` and EL2 |
+| `host-setup.sh` | macOS | Verifies nested virt, creates the Lima VM (guest ports 9944-9949 exposed on the Mac's LAN, `LIMA_LAN_PORTS`, for akuma-miot's mesh), proves `/dev/kvm` and EL2 |
 | `guest-setup.sh` | KVM host | Installs Firecracker, creates tap0, starts DHCP, adds NAT |
 | `build.sh` | repo root | Builds `platform-firecracker`, asserts the load address, flattens to `akuma-fc.bin` |
 | `run.sh` | either | Stages files if needed, writes the config, boots, saves the log |
