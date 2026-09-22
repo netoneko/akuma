@@ -36,6 +36,7 @@ deployments rarely did on aarch64.
 | `crates/akuma-syscalls-abi/src/lib.rs` | doc comment: asm-generic `fadvise64` is **223**, not 233 (233 is `madvise`; the code already used 223) | 1a |
 | `overlays/devbox-firecracker/host-setup.sh` | creates the Lima VM with guest ports **9944–9949 forwarded on `0.0.0.0`** (`LIMA_LAN_PORTS`), and refuses an existing instance without that rule | 5 |
 | `overlays/devbox-firecracker/README.md` | the `host-setup.sh` row mentions the LAN ports | 5 |
+| `amd64/mkdisk.sh` | pre-grows `/bin` (`expand_dir` ×2) before linking busybox applets, and fails if `/bin/sh` is missing | a full `/bin` block made `debugfs ln` silently drop every applet from `pwd` on, including `sh` (see the handoff doc) |
 | `overlays/devbox-firecracker/guest-setup.sh` | the "socat already forwarding" check is `pgrep -f '^socat TCP-LISTEN:$SSH_PORT'`, was `pgrep -f 'socat.*$SSH_PORT'` | 5 |
 
 Nothing on the amd64 side changed.
@@ -210,6 +211,16 @@ So finding 3 is specific to the amd64 kernel or that box's NIC path. It's
 not `kot`, and it's not the workload shape.
 
 ## 3. amd64 metal: a `kot` *replica* goes deaf within minutes (open)
+
+> **Superseded by [`AKUMA_AMD64_KOT_REPLICA_WEDGE.md`](AKUMA_AMD64_KOT_REPLICA_WEDGE.md)**
+> (2026-09-23): reproduced on a 1-vCPU amd64 Firecracker guest, so it isn't
+> the Realtek driver. The strongest lead is that **x86_64 `accept4` (288) has
+> no ABI row** and returns ENOSYS. The listener-pool theory below predates
+> that.
+>
+> **Resolved 2026-09-23** — [`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md`](AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md):
+> `accept4` was real but not enough; the wedge was amd64's own
+> `recvfrom`/`sendto` never re-arming the `EPOLLET` edge.
 
 On the trashcan (`ssh akuma`, `22ac34d3-release-smp-shared`), `kot run` as a
 **replica**, reproduced across a reboot:

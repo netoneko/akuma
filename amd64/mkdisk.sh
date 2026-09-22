@@ -496,6 +496,17 @@ if [ -f "$BB" ]; then
     # `dup2` onto them cannot work. Regenerate this list with
     # `busybox --list | sort -u` against a fresh `$BB` if the pinned
     # `BB_VER` above ever changes.
+    # Grow /bin FIRST. `debugfs ln` does not expand a full directory (only
+    # `write` does, through its own retry), and every link here discards its
+    # errors, so once /bin's first 4 KiB block filled — about 270 entries,
+    # crossed when this list went to all 400 applets on 2026-09-19 — every
+    # later name silently failed: everything from `pwd` on, **including
+    # `sh`**. sshd then answered every exec with "failed to spawn '/bin/sh'"
+    # (the ryzen guest's missing /bin/sh in LITTER_TRASHCAN_RYZEN_JOIN.md, and
+    # again 2026-09-22: docs/archive/MIOT_MESH_ON_AKUMA.md). Two blocks is
+    # room for the whole list plus everything staged into /bin after it.
+    "$DEBUGFS" -w -R "expand_dir /bin" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "expand_dir /bin" "$IMG" >/dev/null 2>&1
     for applet in \
         [ [[ acpid add-shell addgroup adduser adjtimex ar arch arp arping \
         ascii ash awk base32 base64 basename bc blkdiscard blkid blockdev \
@@ -541,6 +552,12 @@ if [ -f "$BB" ]; then
         xxd xz xzcat yes zcat zcip; do
         "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
     done
+    # The one link nothing works without: sshd's exec shell and every script.
+    # Checked, not assumed — the loop above cannot report a failure.
+    if ! "$DEBUGFS" -R "stat /bin/sh" "$IMG" 2>/dev/null | grep -q "Inode:"; then
+        echo "mkdisk: /bin/sh was not linked into $IMG — /bin is probably full (debugfs ln cannot expand it)" >&2
+        exit 1
+    fi
 fi
 # akuma-cli (`akuma`), the katakana screensaver. NOT built here and NOT a
 # workspace member: it is a **std** binary (clap, crossterm, rand) from the

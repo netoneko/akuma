@@ -506,6 +506,11 @@ syscall_table! {
     Bind       => BIND       = 49,  nr::BIND;
     Listen     => LISTEN     = 50,  nr::LISTEN;
     Accept     => ACCEPT     = 43,  nr::ACCEPT;
+    /// x86_64 288, asm-generic 242. `accept` with `SOCK_NONBLOCK|SOCK_CLOEXEC`
+    /// in `flags`; mio (so every tokio server) accepts only through this one.
+    /// Missing until 2026-09-23, so tokio's accepts got `ENOSYS` while smoltcp
+    /// completed the handshakes — clients saw TCP connect and no HTTP answer.
+    Accept4    => ACCEPT4    = 288, nr::ACCEPT4;
     Connect    => CONNECT    = 42,  nr::CONNECT;
     Sendto     => SENDTO     = 44,  nr::SENDTO;
     Recvfrom   => RECVFROM   = 45,  nr::RECVFROM;
@@ -880,6 +885,7 @@ mod tests {
             (Syscall::Fsync, 74, 82),
             (Syscall::Fdatasync, 75, 83),
             (Syscall::Fadvise64, 221, 223),
+            (Syscall::Accept4, 288, 242),
         ] {
             assert_eq!(
                 Syscall::from_x86_64(x86),

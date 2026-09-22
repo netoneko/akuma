@@ -175,6 +175,18 @@ pub fn sys_listen(fd: u64, backlog: u64) -> u64 {
 /// Blocking. The new connection gets its own descriptor; the listener keeps
 /// listening.
 pub fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    sys_accept4(fd, addr, addrlen, 0)
+}
+
+/// `accept4(fd, addr, addrlen, flags)`: `accept` plus `SOCK_NONBLOCK` /
+/// `SOCK_CLOEXEC` on the *new* descriptor. Any other bit is `EINVAL`, as on
+/// Linux. The nonblock bit matters more than it looks: tokio registers the
+/// accepted fd with epoll and reads it until `EAGAIN`, so a blocking fd parks
+/// a worker thread inside `read` instead.
+pub fn sys_accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> u64 {
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return errno::EINVAL;
+    }
     let Some(idx) = fd::socket_index(fd) else {
         return errno::ENOTSOCK;
     };
@@ -197,9 +209,28 @@ pub fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> u64 {
             if addrlen != 0 {
                 let _ = crate::uaccess::write_val::<u32>(addrlen, written as u32);
             }
+            if flags != 0
+                && let Some(proc) = akuma_exec::process::current_process_shared()
+            {
+                if flags & SOCK_CLOEXEC != 0 {
+                    proc.set_cloexec(new_fd as u32);
+                }
+                if flags & SOCK_NONBLOCK != 0 {
+                    proc.set_nonblock(new_fd as u32);
+                }
+            }
             new_fd
         }
-        Err(e) => net_err(e),
+        Err(e) => {
+            // Nothing pending: the next connection is a fresh `EPOLLIN` edge
+            // on the listener, and an `EPOLLET` waiter (tokio's accept loop)
+            // must be told about it.
+            let r = net_err(e);
+            if r == errno::EAGAIN {
+                akuma_syscalls_glue::poll::epoll_on_fd_drained(fd as u32);
+            }
+            r
+        }
     }
 }
 
@@ -217,23 +248,67 @@ pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
     }
 }
 
-/// Send on a socket descriptor. Reached from `write` as well as `sendto`.
-pub fn send(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
-    let Some(data) = fd::copy_in(buf, len) else {
-        return errno::EFAULT;
-    };
-    match akuma_net::socket::socket_send(idx, &data, nonblock) {
-        Ok(n) => n as u64,
-        Err(e) => net_err(e),
+/// Re-arm `fd`'s `EPOLLOUT` edge after a TCP send that could not take
+/// everything: an `EAGAIN` or a short write. Glue's `sendto`/`sendmsg` do this
+/// (`poll::epoll_on_fd_write_blocked` says why it hangs without it); these
+/// arms are this target's own, so they have to do it too.
+fn tcp_sent(fd: u64, want: usize, r: Result<usize, i32>) -> u64 {
+    match r {
+        Ok(n) => {
+            if n < want {
+                akuma_syscalls_glue::poll::epoll_on_fd_write_blocked(fd as u32);
+            }
+            n as u64
+        }
+        Err(e) => {
+            let r = net_err(e);
+            if r == errno::EAGAIN {
+                akuma_syscalls_glue::poll::epoll_on_fd_write_blocked(fd as u32);
+            }
+            r
+        }
     }
 }
 
-/// Receive on a socket descriptor. Reached from `read` as well as `recvfrom`.
-pub fn recv(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
+/// Re-arm `fd`'s `EPOLLIN` edge after a TCP receive: after **every** successful
+/// read, and on `EAGAIN`, exactly as glue's `recvfrom`/`recvmsg` do.
+///
+/// Missing until 2026-09-23, and it was the kot wedge. tokio registers every
+/// socket `EPOLLET` and reads through `recv(2)` — `recvfrom`, which this target
+/// serves here rather than in glue — so the first `EPOLLIN` an accepted
+/// connection reported was the last: the edge stayed "already reported"
+/// forever, its task never woke again, the peer's FIN went unread
+/// (`CLOSE_WAIT` piling up in `/proc/net/tcp`), and the listener's backlog
+/// filled with connections nobody accepted until new ones were refused.
+/// `read(2)` goes through glue and always re-armed, which is why `busybox`
+/// and `sshd` never saw it.
+fn tcp_received(fd: u64) {
+    akuma_syscalls_glue::poll::epoll_on_fd_drained(fd as u32);
+}
+
+/// Send on a TCP socket descriptor, for `sendto`.
+fn send(fd: u64, idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
+    let Some(data) = fd::copy_in(buf, len) else {
+        return errno::EFAULT;
+    };
+    tcp_sent(fd, data.len(), akuma_net::socket::socket_send(idx, &data, nonblock))
+}
+
+/// Receive on a TCP socket descriptor, for `recvfrom`.
+fn recv(fd: u64, idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
     let mut data = alloc::vec![0u8; len as usize];
     match akuma_net::socket::socket_recv(idx, &mut data, nonblock) {
-        Ok(n) => fd::copy_out(buf, &data[..n]),
-        Err(e) => net_err(e),
+        Ok(n) => {
+            tcp_received(fd);
+            fd::copy_out(buf, &data[..n])
+        }
+        Err(e) => {
+            let r = net_err(e);
+            if r == errno::EAGAIN {
+                tcp_received(fd);
+            }
+            r
+        }
     }
 }
 
@@ -302,7 +377,7 @@ pub fn sys_sendto(fd: u64, buf: u64, len: u64, dest_addr: u64) -> u64 {
             Err(e) => net_err(e),
         };
     }
-    send(idx, buf, len, fd::is_nonblocking(fd))
+    send(fd, idx, buf, len, fd::is_nonblocking(fd))
 }
 
 /// `recvfrom(fd, buf, len, flags, src_addr, addrlen)`.
@@ -328,7 +403,7 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, src_addr: u64) -> u64 {
             Err(e) => net_err(e),
         };
     }
-    recv(idx, buf, len, fd::is_nonblocking(fd))
+    recv(fd, idx, buf, len, fd::is_nonblocking(fd))
 }
 
 /// Byte offsets into the x86_64 `struct msghdr` — 56 bytes, `{ void
@@ -405,10 +480,7 @@ pub fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
             Err(e) => net_err(e),
         };
     }
-    match akuma_net::socket::socket_send(idx, &data, fd::is_nonblocking(fd)) {
-        Ok(n) => n as u64,
-        Err(e) => net_err(e),
-    }
+    tcp_sent(fd, data.len(), akuma_net::socket::socket_send(idx, &data, fd::is_nonblocking(fd)))
 }
 
 /// See [`sys_sendmsg`]. Scatters the received bytes across `msg_iov` in
@@ -448,8 +520,17 @@ pub fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
         }
     } else {
         match akuma_net::socket::socket_recv(idx, &mut data, fd::is_nonblocking(fd)) {
-            Ok(n) => n,
-            Err(e) => return net_err(e),
+            Ok(n) => {
+                tcp_received(fd);
+                n
+            }
+            Err(e) => {
+                let r = net_err(e);
+                if r == errno::EAGAIN {
+                    tcp_received(fd);
+                }
+                return r;
+            }
         }
     };
 
@@ -561,6 +642,21 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     let r = sys_bind(fd, sa.as_ptr() as u64, 16);
     t.check_eq("sock: bind to port 2222", r, 0);
     t.check_eq("sock: listen", sys_listen(fd, 8), 0);
+
+    // `accept4`: an unknown flag bit is refused before anything is dequeued,
+    // and on a non-blocking listener with nothing pending the answer is
+    // `EAGAIN`. Until 2026-09-23 x86_64 288 had no row at all, so every tokio
+    // accept got `ENOSYS` while smoltcp completed the handshake underneath it.
+    t.check_eq("sock: accept4 with an unknown flag is EINVAL", sys_accept4(fd, 0, 0, 1), errno::EINVAL);
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
+        proc.set_nonblock(fd as u32);
+        t.check_eq(
+            "sock: accept4(SOCK_NONBLOCK|SOCK_CLOEXEC) with nothing pending is EAGAIN",
+            sys_accept4(fd, 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC),
+            errno::EAGAIN,
+        );
+        proc.clear_nonblock(fd as u32);
+    }
 
     // The round trip through the sockaddr encoder must give the port back.
     let mut out = [0u8; 16];
