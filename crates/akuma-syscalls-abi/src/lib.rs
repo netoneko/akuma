@@ -238,7 +238,7 @@ syscall_table! {
     Ftruncate  => FTRUNCATE  = 77,  nr::FTRUNCATE;
     /// `posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM)`. parity-db calls it after
     /// opening every DB file and `try_io!`s the result — an ENOSYS aborts the
-    /// whole open. x86_64 221, asm-generic 233 (`fadvise64`); added 2026-09-22
+    /// whole open. x86_64 221, asm-generic 223 (`fadvise64`; 233 is `madvise`); added 2026-09-22
     /// when the amd64 writable-`MAP_SHARED` work first let parity-db get as
     /// far as its readahead hint. Advisory by Linux's own contract: the
     /// kernel's handler returns 0, since there is no readahead state to tune.

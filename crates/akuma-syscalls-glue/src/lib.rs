@@ -894,6 +894,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FCHOWN => 0,
         nr::TRUNCATE => flat(fs::sys_truncate(args[0], args[1] as i64)),
         nr::FTRUNCATE => fs::sys_ftruncate(args[0] as u32, args[1] as i64),
+        // `posix_fadvise` — advisory by Linux's own contract; no readahead
+        // state to tune, so success. The amd64 dispatcher got this arm
+        // 2026-09-22 (`amd64/src/usermode.rs`, `Syscall::Fadvise64`); this
+        // one didn't, so parity-db's open-time `try_io!` hit ENOSYS and no
+        // ParityDB could be *reopened* on aarch64 (storeprobe stage 6,
+        // docs/archive/MIOT_MESH_ON_AKUMA_2026-09-22.md finding 1).
+        nr::FADVISE64 => 0,
         nr::FALLOCATE => fs::sys_fallocate(args[0] as u32, args[1] as i32, args[2] as i64, args[3] as i64),
         nr::MADVISE => mem::sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         nr::MPROTECT => mem::sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),

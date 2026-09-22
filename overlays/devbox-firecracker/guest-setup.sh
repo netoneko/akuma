@@ -100,7 +100,7 @@ runsh "iptables -C FORWARD -o $TAP -j ACCEPT 2>/dev/null || iptables -A FORWARD 
 
 # SSH forward: lima auto-forwards a guest LISTENING socket to the host, so socat
 # here makes the microVM reachable from macOS at localhost:$SSH_PORT.
-if runsh "pgrep -f 'socat.*$SSH_PORT' >/dev/null 2>&1"; then
+if runsh "pgrep -f '^socat TCP-LISTEN:$SSH_PORT' >/dev/null 2>&1"; then
   say "socat already forwarding $SSH_PORT -> $GUEST_IP:22"
 else
   runsh "command -v socat >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get install -y socat >/dev/null 2>&1)"
