@@ -220,14 +220,18 @@ mod tests {
         assert!(!p.is_shared_writable);
     }
 
-    /// Writable `MAP_SHARED` on a file is the writeback case: eager, and excluded
-    /// from the file lazy path so every page stays resident to be flushed.
+    /// Writable `MAP_SHARED` on a file is the writeback case, and since
+    /// 2026-09-22 it is **lazy-eligible** like any file mapping (parity-db's
+    /// 1 GiB reserves cannot be filled eagerly). Both kernels record it for
+    /// present-page writeback: amd64's `SharedWriteBack`, aarch64's lazy
+    /// `SharedFileMapping`. This test asserted the old rule until then, which
+    /// is how the aarch64 half of that change was missed.
     #[test]
-    fn shared_writable_file_is_eager_and_not_lazy_eligible() {
+    fn shared_writable_file_is_lazy_eligible_and_marked_for_writeback() {
         let p = plan(PROT_READ | PROT_WRITE, MAP_SHARED, 3, 1_000_000, EAGER_MAX);
         assert!(p.is_shared_writable);
         assert!(!p.use_lazy);
-        assert!(!p.file_lazy_eligible);
+        assert!(p.file_lazy_eligible);
         // Read-only MAP_SHARED has no writes to flush, so it stays on the cheap path.
         let ro = plan(PROT_READ, MAP_SHARED, 3, 1_000_000, EAGER_MAX);
         assert!(!ro.is_shared_writable);

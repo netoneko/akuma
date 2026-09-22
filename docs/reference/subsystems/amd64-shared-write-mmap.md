@@ -3,6 +3,14 @@
 **Grade: C** — landed 2026-09-22, verified on bare metal the same day, one
 caller (ParityDB via akuma-miot's `storeprobe`) exercised end to end.
 
+> **aarch64, same day:** the `mmap::plan` change below is *shared*, and it
+> silently broke aarch64. Its lazy-file path never registered shared-writable
+> mappings for write-back, so a clean close lost every write. aarch64 now has
+> the same present-page write-back contract on its own `SharedFileMapping`
+> record (`akuma-syscalls-glue/src/mem.rs`), plus the missing `fadvise64`
+> arm. See [`../../archive/MIOT_MESH_ON_AKUMA.md`](../../archive/MIOT_MESH_ON_AKUMA.md)
+> §1. A change to `mmap::plan` must be checked against **both** dispatchers.
+
 `mmap(MAP_SHARED, PROT_WRITE)` on a regular file used to be `ENOSYS` on this
 target: coherence needs either a page cache or write-back, and neither
 existed. It is now served, without a page cache, by **demand-paged fills plus
