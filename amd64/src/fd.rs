@@ -1153,6 +1153,33 @@ pub fn file_bytes_by_inode(mount_id: u32, inode: u32, offset: usize, dst: &mut [
     fs::read_at_open_file("", mount_id, inode, offset, dst).ok()
 }
 
+/// The full write identity of a regular-file descriptor:
+/// `(path, mount_id, inode, size)`.
+///
+/// [`file_identity`] plus the path, which the writable-`MAP_SHARED` write-back
+/// needs and the demand-page fill does not: a flush resolves the file through
+/// the VFS by name (`akuma_vfs_glue::write_at` has no by-inode form), while a
+/// fault-time fill reads by inode and never needs to name it. The path is the
+/// one the fd was opened through; a rename under a live shared-writable
+/// mapping redirects its flushes to the new name — coherent for the
+/// single-mapper caller this exists for, and called out in
+/// `MmapRegion::shared_write`'s doc.
+#[must_use]
+pub fn file_write_identity(fd: u64) -> Option<(alloc::string::String, u32, u32, usize)> {
+    if dev_node_of(fd).is_some() {
+        return None;
+    }
+    let (path, mount_id, inode) = table_with(fd, |d| match d {
+        FileDescriptor::File(f) => Some((f.path.clone(), f.mount_id(), f.inode())),
+        _ => None,
+    })??;
+    if inode == 0 {
+        return None;
+    }
+    let meta = akuma_vfs_glue::fs::metadata_open_file(&path, mount_id, inode).ok()?;
+    Some((path, mount_id, inode, meta.size as usize))
+}
+
 /// Is `fd` a regular file — something `mmap` can back a mapping with?
 ///
 /// Separate from [`file_bytes_at`] because `mmap` has to refuse a socket, a pipe

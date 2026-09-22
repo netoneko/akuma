@@ -186,6 +186,7 @@ pub const FCHMODAT: u64 = 53;
 pub const FCHOWNAT: u64 = 54;
 pub const FCHOWN: u64 = 55;
 pub const FTRUNCATE: u64 = 46;
+pub const FADVISE64: u64 = 223;
 pub const FALLOCATE: u64 = 47;
 pub const MADVISE: u64 = 233;
 pub const MPROTECT: u64 = 226;

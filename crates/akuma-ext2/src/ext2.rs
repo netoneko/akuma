@@ -3848,24 +3848,55 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
-        let state = self.read_state();
+        // Extension and shrink are both real now (2026-09-22). The old shape
+        // answered `Ok(())` for *extend* — a silent no-op, the exact
+        // "accepted and did nothing" failure this tree's own docs call the
+        // worst answer a syscall can give — and it was load-bearing for more
+        // than bun's shrink: parity-db (`set_len` before every mapping
+        // write), SQLite's journals and any `ftruncate`-extended file got
+        // success and a zero-byte file. Extension allocates zero blocks up
+        // to the new size; shrink keeps the existing free path.
+        let mut state = self.write_state();
         let inode_num = self.lookup_path_internal(&state, path)?;
         let mut inode = self.read_inode(&state, inode_num)?;
-        
+
         // Only allow truncate on regular files
         if inode.type_perms & 0x8000 == 0 {
             return Err(FsError::NotAFile);
         }
-        
-        // For now, only support truncating to existing size or smaller
-        // (shrinking doesn't need to allocate new blocks)
+
         let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
+        let block_size = state.block_size as u64;
+
         if length > current_size {
-            // Extending would require allocating blocks - not implemented
-            // For bun's use case, this is fine (it truncates to shrink)
-            return Ok(());
+            // **Extend.** The bytes between the old EOF and the first new
+            // block boundary (if the old EOF sat mid-block) read as zeros by
+            // contract; a pre-existing partial block keeps its old bytes
+            // before that gap, so the tail of it is zeroed in place rather
+            // than left as whatever a previous life of the file left there.
+            // Every *new* block comes from `ensure_block(_, true)` — a fresh
+            // zeroed allocation. A mid-way ENOSPC leaves the file's size
+            // untouched and returns the error, which is the honest answer
+            // the old `Ok(())` replaced.
+            let mut size = current_size;
+            if size % block_size != 0 {
+                let block_off = (size % block_size) as usize;
+                let zero_len =
+                    core::cmp::min(length - size, (block_size - size % block_size) as u64) as usize;
+                let logical = (size / block_size) as u32;
+                let blk = self.ensure_block(&mut state, &mut inode, logical, false)?;
+                let mut data = self.read_block(&state, blk)?;
+                data[block_off..block_off + zero_len].fill(0);
+                self.write_block(&mut state, blk, &data)?;
+                size += zero_len as u64;
+            }
+            while size < length {
+                let logical = (size / block_size) as u32;
+                self.ensure_block(&mut state, &mut inode, logical, true)?;
+                size += block_size as u64;
+            }
         }
-        
+
         inode.size_lower = length as u32;
         inode.size_upper = (length >> 32) as u32;
         inode.modification_time = self.current_time();

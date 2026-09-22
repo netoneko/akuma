@@ -1484,6 +1484,39 @@ fn user_fault(
         if error_code.is_some() && vector.starts_with("#GP") { "(stale)" } else { "" },
         crate::paging::active_root(), crate::smp::current_task(),
         crate::usermode::current_pid()));
+    // Which mapping, if any, covered the faulting address? A kill that lands
+    // *inside* a recorded region is the kernel's lie (the page should have
+    // been there); one outside it is the program's (wild pointer, or a store
+    // past a mapping's end — the `SIGBUS` shape). Named at the kill, because
+    // a process that is about to die cannot be asked later. Best effort: the
+    // region lock is a plain spinlock and this is the kill path already.
+    {
+        let fa = read_cr2() as usize;
+        if let Some(p) = crate::usermode::current_process() {
+            let regions = p.mmap_regions.lock();
+            let mut covered = false;
+            for r in akuma_mmap::regions_overlapping(&regions, fa, fa + 1) {
+                if r.contains(fa) {
+                    covered = true;
+                    let _ = core::fmt::write(&mut w, format_args!(
+                        "  [Fault-REGION] cr2 inside va={:#x} pages={} file={} sw={}\n",
+                        r.start_va, r.pages, r.file.is_some(), r.shared_write.is_some()));
+                }
+            }
+            if !covered {
+                let _ = core::fmt::write(&mut w, format_args!(
+                    "  [Fault-REGION] cr2 outside every region (n={})\n", regions.len()));
+                for (i, r) in regions.iter().take(8).enumerate() {
+                    let _ = core::fmt::write(&mut w, format_args!(
+                        "  [MR{}] va={:#x} pages={} prot={:?} file={} sw={}\n",
+                        i, r.start_va, r.pages, r.prot, r.file.is_some(), r.shared_write.is_some()));
+                }
+            }
+        } else {
+            let _ = core::fmt::write(&mut w, format_args!(
+                "  [Fault-REGION] no current process for region check\n"));
+        }
+    }
     // Post-mortem at the OOM floor: a ring-3 kill under memory pressure is
     // only diagnosable from these numbers (found 2026-09-17, when the
     // file-page-cache reference leak drained the guest to `pmm_free=0` and

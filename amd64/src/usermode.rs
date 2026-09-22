@@ -1494,6 +1494,16 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // is asm-generic. Handing it `1` meaning `write` would find the *wrong*
     // handler rather than none — so the vocabulary hop happens once, here,
     // through a table whose two halves are round-trip tested against each other.
+    // x86_64 nr 26 is `msync` — routed **before** the shared table because
+    // asm-generic has no msync number at all, and a fake aarch64 twin in the
+    // abi table would break its "a variant only exists if it has a number on
+    // both architectures" invariant to carry a lie. See `mm::sys_msync` for
+    // what it does and `MmapRegion::shared_write` for why it exists at all:
+    // it is the flush `memmap2::MmapMut::flush` compiles to, and without it a
+    // writable `MAP_SHARED` mapping could not be trusted at close.
+    if nr == 26 {
+        return crate::mm::sys_msync(a1, a2);
+    }
     let Some(call) = Syscall::from_x86_64(nr) else {
         report_unknown_syscall(nr);
         return errno::ENOSYS;
@@ -1534,6 +1544,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::SchedGetaffinity => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Umask => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         Syscall::Fsync | Syscall::Fdatasync => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        // `posix_fadvise` — advisory by Linux's own contract, and akuma has
+        // no readahead state to tune, so success is the honest answer rather
+        // than a lie callers die on (parity-db `try_io!`s this). Same shape
+        // as madvise's "unrecognised advice reports success", one level up.
+        Syscall::Fadvise64 => 0,
         // `socketpair(domain, type, protocol, sv)` — glue's AF_UNIX pair, two
         // kernel pipes behind two `FileDescriptor::UnixSocket` entries. It
         // needs no arm of its own here beyond the hop: the descriptors land in

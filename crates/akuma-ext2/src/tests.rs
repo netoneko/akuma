@@ -2370,3 +2370,47 @@ fn guest_image_cache_write_and_rename() {
     let back = fs.read_file("/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz").unwrap();
     assert_eq!(back, body);
 }
+
+/// `ftruncate`'s extend half must actually extend: allocate zero blocks, zero
+/// the tail of the old EOF's block, and update the inode size.
+///
+/// The silent no-op this pins shut answered `Ok(())` for every extension ("not
+/// implemented; bun only shrinks") — and then parity-db called `set_len`
+/// before mapping its files, cargo's flock cache grew, and every caller got
+/// success plus a zero-byte file. Read back through a *fresh* descriptor so
+/// the assertion goes through the inode on disk, not a stale cache.
+#[test]
+fn ftruncate_extends_with_zero_blocks() {
+    let fs = mount_empty();
+    fs.write_file("/grow", b"head").unwrap();
+
+    fs.truncate("/grow", 10 * 1024).unwrap();
+
+    // The inode size moved, visible to metadata.
+    let meta = fs.metadata("/grow").unwrap();
+    assert_eq!(meta.size, 10 * 1024, "the extend must be real, not accepted-and-dropped");
+
+    // The old bytes survive, the gap is zeros, the tail is zeros.
+    let mut buf = vec![0u8; 10 * 1024];
+    let n = fs.read_at("/grow", 0, &mut buf).unwrap();
+    assert_eq!(n, 10 * 1024);
+    assert_eq!(&buf[..4], b"head");
+    assert!(buf[4..10 * 1024].iter().all(|&b| b == 0), "extended bytes must read as zeros");
+
+    // Shrink still shrinks, and frees what it drops.
+    fs.truncate("/grow", 4).unwrap();
+    let meta = fs.metadata("/grow").unwrap();
+    assert_eq!(meta.size, 4);
+    let mut small = [0u8; 8];
+    let n = fs.read_at("/grow", 0, &mut small).unwrap();
+    assert_eq!(n, 4);
+    assert_eq!(&small[..4], b"head");
+
+    // Extend again past the shrink: the same zero-block rule, from a hole.
+    fs.truncate("/grow", 9 * 1024 + 512).unwrap();
+    let mut buf = vec![0u8; 9 * 1024 + 512];
+    let n = fs.read_at("/grow", 0, &mut buf).unwrap();
+    assert_eq!(n, 9 * 1024 + 512);
+    assert_eq!(&buf[..4], b"head");
+    assert!(buf[4..].iter().all(|&b| b == 0));
+}

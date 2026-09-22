@@ -236,6 +236,13 @@ syscall_table! {
     /// `cannot open output file …: Function not implemented` and blamed
     /// itself. Nothing in the guest could link until this row existed.
     Ftruncate  => FTRUNCATE  = 77,  nr::FTRUNCATE;
+    /// `posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM)`. parity-db calls it after
+    /// opening every DB file and `try_io!`s the result — an ENOSYS aborts the
+    /// whole open. x86_64 221, asm-generic 233 (`fadvise64`); added 2026-09-22
+    /// when the amd64 writable-`MAP_SHARED` work first let parity-db get as
+    /// far as its readahead hint. Advisory by Linux's own contract: the
+    /// kernel's handler returns 0, since there is no readahead state to tune.
+    Fadvise64  => FADVISE64  = 221, nr::FADVISE64;
     Readv      => READV      = 19,  nr::READV;
     Writev     => WRITEV     = 20,  nr::WRITEV;
     /// x86_64 32 is `dup` and asm-generic 32 is `flock`; the pair is one of the
@@ -872,6 +879,7 @@ mod tests {
             (Syscall::Pwritev2, 328, 287),
             (Syscall::Fsync, 74, 82),
             (Syscall::Fdatasync, 75, 83),
+            (Syscall::Fadvise64, 221, 223),
         ] {
             assert_eq!(
                 Syscall::from_x86_64(x86),

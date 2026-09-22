@@ -26,8 +26,9 @@ pub struct Plan {
     /// Backed by a file rather than anonymous memory.
     pub is_file_backed: bool,
     /// Writable `MAP_SHARED` on a file: writes through the mapping must become
-    /// visible in the file. Akuma has no unified page cache, so these are mapped
-    /// **eagerly** and written back on `munmap`/`msync`/exit.
+    /// visible in the file. Akuma has no unified page cache, so coherence is
+    /// delivered by write-back on `munmap`/`msync` over demand-paged pages
+    /// (`MmapRegion::shared_write`), not by a shared cache.
     pub is_shared_writable: bool,
     /// Demand-page this mapping instead of allocating every frame up front.
     pub use_lazy: bool,
@@ -35,8 +36,19 @@ pub struct Plan {
     /// being CoW-copied.
     pub shared_anon: bool,
     /// Eligible for the file-backed lazy path, *if* the kernel's
-    /// `MMAP_FILE_BACKED_LAZY` config allows it. A writable `MAP_SHARED` file
-    /// mapping is excluded: it must stay resident so its pages can be written back.
+    /// `MMAP_FILE_BACKED_LAZY` config allows it.
+    ///
+    /// A writable `MAP_SHARED` file mapping is **included** since 2026-09-22 —
+    /// the reverse of the old rule, and the change that makes ParityDB-style
+    /// callers possible at all: such a caller (see parity-db's
+    /// `RESERVE_ADDRESS_SPACE`) maps `len + ~1 GiB` and writes through the
+    /// reserve after growing the file. Eager fill would allocate a full
+    /// gigabyte of zero frames for the reserve and fail; demand paging fills
+    /// each page as it is touched, zero past EOF, exactly Linux's shape. The
+    /// coherence that "stay resident" was buying is delivered the other way —
+    /// per-fault fills read the file's *current* bytes, and the
+    /// `MmapRegion::shared_write` record writes dirty pages back on
+    /// `munmap`/`msync`.
     pub file_lazy_eligible: bool,
 }
 
@@ -71,7 +83,7 @@ pub fn plan(prot: u32, flags: u32, fd: i32, pages: usize, eager_max_pages: usize
         is_shared_writable,
         use_lazy,
         shared_anon: (flags & MAP_SHARED != 0) && !is_file_backed,
-        file_lazy_eligible: is_file_backed && !is_shared_writable,
+        file_lazy_eligible: is_file_backed,
     }
 }
 

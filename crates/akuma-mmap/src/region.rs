@@ -99,6 +99,92 @@ pub struct MmapRegion {
     /// crate docs). The pin is the kernel's to hold; this is the record of
     /// *which* file, not a claim on it.
     pub file: Option<FileBacking>,
+
+    /// A **writable `MAP_SHARED` file mapping**: its pages must be written
+    /// back to the file when they leave the address space (`munmap`, `msync`,
+    /// `madvise(MADV_DONTNEED)`).
+    ///
+    /// Akuma has no unified page cache — the reason this shape was `ENOSYS`
+    /// for so long — so coherence is delivered the other way: the mapping is
+    /// populated **eagerly** (`Plan::is_shared_writable` excludes it from both
+    /// lazy paths), every page stays a private frame this region owns in
+    /// [`frames`](Self::frames), and a *write-back of the whole region* is the
+    /// flush. No dirty-bit tracking: each flush rewrites every in-file page
+    /// from its frame, which is wrong only in I/O spent, never in bytes.
+    ///
+    /// This is a record, not a page cache. Two mappers of one file do not see
+    /// each other's writes until a flush lands (and `read(2)`/`write(2)` on
+    /// the same file see a mapping's writes only after one). What it does
+    /// guarantee is the guarantee `mmap`'s contract actually needs for the
+    /// dominant single-mapper caller (a database mapping its own files):
+    /// *writes through the mapping reach the file*, and a process that
+    /// unmaps (or `msync`s) before inspecting by other means sees its own
+    /// writes. A process **killed** with the mapping live loses writes since
+    /// its last flush — the exit path does not flush; Linux's page cache
+    /// would have.
+    ///
+    /// The path is carried — unlike [`FileBacking`]'s integers-only rule —
+    /// because the write-back has no by-inode route (`read_at_by_inode`
+    /// exists; `write_at_by_inode` does not) and the flush needs *some*
+    /// name the VFS can resolve. A rename under a live shared-writable
+    /// mapping redirects its flushes to the new name, which is coherent
+    /// here only because the mapping is this process's private view; the
+    /// `InodePin` keeps the *blocks* alive across an `unlink` either way.
+    pub shared_write: Option<SharedWriteBack>,
+}
+
+/// The write-back record for a writable `MAP_SHARED` file mapping.
+///
+/// [`FileBacking`] with a path, and none of its `Copy` privilege: a
+/// `String` cannot ride in a `Copy` struct, and [`FileBacking`]'s `Copy` is
+/// load-bearing for the clip/split arithmetic. Kept as a separate `Option`
+/// field rather than widening [`FileBacking`] so every existing integer-only
+/// path keeps compiling untouched — and so the two records answer different
+/// questions without a sum type: `file` is "where do bytes come *from*",
+/// `shared_write` is "where do bytes go *back to*".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedWriteBack {
+    /// Which mount `inode` belongs to. Same rule as [`FileBacking::mount_id`].
+    pub mount_id: u32,
+    /// The inode the mapping was created against. Never `0`.
+    pub inode: u32,
+    /// Byte offset in the file of this region's `start_va`.
+    pub offset: usize,
+    /// The path the mapping was created through — what the flush resolves.
+    pub path: alloc::string::String,
+}
+
+impl SharedWriteBack {
+    /// This record with its first `pages` pages clipped away — the record a
+    /// surviving tail piece needs after a split. Same arithmetic as
+    /// [`FileBacking::advance`].
+    ///
+    /// Deliberately **no** `filesz`, unlike [`FileBacking::advance`]: the
+    /// flush asks the filesystem how big the file is *now*, because the
+    /// whole point of this record is a file that grows under a long-lived
+    /// mapping (parity-db's reserve-then-truncate growth). An EOF snapshot
+    /// taken at `mmap` time would silently exclude everything written into
+    /// the space the file grew into.
+    #[must_use]
+    pub fn advance(&self, pages: usize) -> Self {
+        let bytes = pages.saturating_mul(crate::PAGE_SIZE);
+        Self {
+            mount_id: self.mount_id,
+            inode: self.inode,
+            offset: self.offset.saturating_add(bytes),
+            path: self.path.clone(),
+        }
+    }
+
+    /// The file offset of the page `page_index` pages into this region.
+    ///
+    /// How many of those bytes are in the file is deliberately **not**
+    /// answered from this record — see [`Self::advance`]. The flush asks the
+    /// filesystem for the size at flush time.
+    #[must_use]
+    pub const fn page_file_offset(&self, page_index: usize) -> usize {
+        self.offset.saturating_add(page_index.saturating_mul(crate::PAGE_SIZE))
+    }
 }
 
 /// The file identity and extent behind a demand-paged file mapping.
@@ -191,7 +277,7 @@ impl MmapRegion {
     pub fn owned_with_prot(start_va: usize, frames: Vec<PhysFrame>, prot: Prot) -> Self {
         Self {
             start_va, pages: frames.len(), frames, prot,
-            shared_anon: false, prot_recorded: true, file: None,
+            shared_anon: false, prot_recorded: true, file: None, shared_write: None,
         }
     }
 
@@ -209,7 +295,7 @@ impl MmapRegion {
     pub fn inherited_with_prot(start_va: usize, pages: usize, prot: Prot) -> Self {
         Self {
             start_va, pages, frames: Vec::new(), prot,
-            shared_anon: false, prot_recorded: true, file: None,
+            shared_anon: false, prot_recorded: true, file: None, shared_write: None,
         }
     }
 
@@ -236,6 +322,15 @@ impl MmapRegion {
         self.file = Some(file);
         self
     }
+
+    /// Mark this region as a writable `MAP_SHARED` file mapping. See
+    /// [`MmapRegion::shared_write`].
+    #[must_use]
+    pub fn shared_writable(mut self, sw: SharedWriteBack) -> Self {
+        self.shared_write = Some(sw);
+        self
+    }
+
 
     /// Where the page at `va` gets its bytes: `(file offset, bytes of file data)`.
     ///
@@ -312,6 +407,14 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
             // would serve them as anonymous zeros — a program image full of
             // holes, reported as a `SIGSEGV` or worse as silence.
             inherited.file = r.file;
+            // `shared_write` is deliberately **dropped**, unlike `file`: the
+            // child owns no frames (CoW), so its flush would write nothing —
+            // and if a child write broke CoW into a private frame, flushing
+            // that frame back would be the parent-or-child divergence
+            // reaching the file. The file answers to the mapper that owns
+            // frames; a forked child of a shared-writable mapping flushes
+            // nothing, by construction.
+            inherited.shared_write = None;
             if r.shared_anon { inherited.shared_anon() } else { inherited }
         })
         .collect()
@@ -462,6 +565,11 @@ pub fn mprotect_eager_regions_in_range(
         let old_prot = reg.prot;
         let shared_anon = reg.shared_anon;
         let was_recorded = reg.prot_recorded;
+        // The write-back record follows its pages, like the file backing does:
+        // each piece flushes exactly the file range it covers. A piece made
+        // PROT_NONE keeps its record — an `mprotect` does not unmap, and a
+        // later munmap of the guard must still flush it.
+        let shared_write = reg.shared_write;
         // Each piece keeps its own place in the file: the head starts where the
         // region did, and the two below it start that many pages further in.
         let file = reg.file;
@@ -477,20 +585,23 @@ pub fn mprotect_eager_regions_in_range(
         if head_pages > 0 {
             out.push(MmapRegion {
                 start_va: reg_start, pages: head_pages, frames: head,
-                prot: old_prot, shared_anon, prot_recorded: was_recorded, file });
+                prot: old_prot, shared_anon, prot_recorded: was_recorded, file,
+                shared_write: shared_write.clone() });
         }
         if mid_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_start, pages: mid_pages, frames: mid,
                 prot: new_prot, shared_anon, prot_recorded: true,
-                file: file.map(|f| f.advance(head_pages)) });
+                file: file.map(|f| f.advance(head_pages)),
+                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages)) });
             touched += 1;
         }
         if tail_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail,
                 prot: old_prot, shared_anon, prot_recorded: was_recorded,
-                file: file.map(|f| f.advance(head_pages + mid_pages)) });
+                file: file.map(|f| f.advance(head_pages + mid_pages)),
+                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + mid_pages)) });
         }
     }
     *regions = out;
@@ -596,6 +707,7 @@ pub fn detach_eager_regions_in_range(
         // Nor where the region sits in its file — but the surviving *tail*
         // starts further in, by everything the head and the clip took.
         let file = regions[i].file;
+        let shared_write = regions[i].shared_write.clone();
         let mut it = core::mem::take(&mut regions[i].frames).into_iter();
         let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
         let mid: alloc::vec::Vec<PhysFrame> = (0..clip_pages).filter_map(|_| it.next()).collect();
@@ -636,7 +748,8 @@ pub fn detach_eager_regions_in_range(
             let tail_region = MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail, prot,
                 shared_anon, prot_recorded,
-                file: file.map(|f| f.advance(head_pages + clip_pages)) };
+                file: file.map(|f| f.advance(head_pages + clip_pages)),
+                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + clip_pages)) };
             if next == i {
                 regions[i] = tail_region;
             } else {
@@ -952,6 +1065,68 @@ mod mmap_region_inheritance_tests {
                 assert_eq!(piece.recorded_prot(), None, "neighbours were never named");
             }
         }
+    }
+
+    // ── `shared_write` — the writable `MAP_SHARED` write-back record ─────────
+    //
+    // The record has to survive every reshape a region can go through, or a
+    // flush lands at the wrong file offset (or not at all) and the mapping
+    // silently stops being shared. Same shapes the `file` tests pin, because it
+    // is the same algebra.
+
+    fn swb(path: &str, offset: usize) -> SharedWriteBack {
+        SharedWriteBack {
+            mount_id: 1,
+            inode: 7,
+            offset,
+            path: alloc::string::String::from(path),
+        }
+    }
+
+    #[test]
+    fn shared_write_page_offsets_advance_by_page_index() {
+        let sw = swb("/data/db", 8192);
+        assert_eq!(sw.page_file_offset(0), 8192);
+        assert_eq!(sw.page_file_offset(3), 8192 + 3 * 4096);
+    }
+
+    #[test]
+    fn mprotect_split_advances_shared_write_like_file_backing() {
+        let mut r = alloc::vec![MmapRegion::owned_with_prot(0x1000_0000, frames(6), Prot::RW)];
+        r[0].shared_write = Some(swb("/data/db", 0x10_000));
+        mprotect_eager_regions_in_range(&mut r, 0x1000_2000, 0x1000_4000, Prot::RO);
+        let head = r.iter().find(|x| x.start_va == 0x1000_0000).unwrap();
+        let mid = r.iter().find(|x| x.start_va == 0x1000_2000).unwrap();
+        let tail = r.iter().find(|x| x.start_va == 0x1000_4000).unwrap();
+        // Head keeps the original; mid and tail start 2 and 4 pages in.
+        assert_eq!(head.shared_write.as_ref().unwrap().offset, 0x10_000);
+        assert_eq!(mid.shared_write.as_ref().unwrap().offset, 0x10_000 + 2 * 4096);
+        assert_eq!(tail.shared_write.as_ref().unwrap().offset, 0x10_000 + 4 * 4096);
+    }
+
+    #[test]
+    fn detach_tail_piece_advances_shared_write() {
+        let mut r = alloc::vec![MmapRegion::owned_with_prot(0x1000_0000, frames(6), Prot::RW)];
+        r[0].shared_write = Some(swb("/data/db", 0x20_000));
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_4000);
+        assert_eq!(pieces.len(), 1);
+        // The surviving tail starts 4 pages in: its flush names the bytes it
+        // actually holds, not the ones the unmap dropped.
+        let tail = &r[0];
+        assert_eq!(tail.shared_write.as_ref().unwrap().offset, 0x20_000 + 4 * 4096);
+    }
+
+    #[test]
+    fn cow_child_drops_the_writeback_record_but_keeps_the_file_record() {
+        let mut parent = MmapRegion::owned_with_prot(0x1000_0000, frames(2), Prot::RW);
+        parent.file = Some(FileBacking {
+            mount_id: 1, inode: 7, offset: 0, filesz: 2 * 4096,
+        });
+        parent.shared_write = Some(swb("/data/db", 0));
+        let child = &inherit_mmap_regions_for_cow_child(&[parent.clone()])[0];
+        assert!(child.file.is_some(), "fault-time fills still need the source");
+        assert!(child.shared_write.is_none(),
+            "a child owns no frames; a record here would flush nothing, or worse");
     }
 
     /// Total pages a region list covers, for conservation assertions.

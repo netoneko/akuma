@@ -559,13 +559,31 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // right about the danger and too broad about the remedy — see the module
     // header's "What a file mapping is here".
     if plan.is_file_backed {
-        // Still refused: a **writable `MAP_SHARED`** file mapping. Writes
-        // through it must become visible in the file and to every other mapper,
-        // which needs a write-back path and one shared frame per file page —
-        // that is the page cache, and it is genuinely not here. Serving it as a
-        // private copy would accept the write and silently drop it.
+        // Writable `MAP_SHARED` used to be refused here (`ENOSYS`) — right
+        // about the danger, and the refusal outlived its usefulness: what the
+        // refusal wanted was a page cache, and what ParityDB/`MmapMut` needs
+        // is narrower. Delivered 2026-09-22, per `Plan`'s own documented
+        // design ("mapped eagerly and written back on munmap/msync"): the
+        // mapping is served eager from the file exactly like any other eager
+        // file mapping below, the region carries a
+        // `MmapRegion::shared_write` record, and the flush is whole-region —
+        // no dirty tracking — on `munmap` (`unmap_range`), `msync`
+        // ([`sys_msync`]) and `madvise(MADV_DONTNEED)`
+        // (`dontneed_range`). Coherence caveats live on that record's doc.
+        //
+        // What is still refused, for the reasons the old arm gave:
+        // - an fd not opened for writing (`EACCES`): accepting the mapping
+        //   and dropping the writes would be the silent lie the old comment
+        //   warned about, one layer down;
+        // - a file with no write identity (a `/dev` node, or no path) —
+        //   there is nothing to write back *to*.
         if plan.is_shared_writable {
-            return errno::ENOSYS;
+            if crate::fd::write_mode_refusal(fd).is_some() {
+                return errno::EACCES;
+            }
+            if crate::fd::file_write_identity(fd).is_none() {
+                return errno::EACCES;
+            }
         }
         // Linux requires a page-aligned offset and says `EINVAL` otherwise.
         // Ahead of the descriptor probe because it is decidable from the
@@ -669,6 +687,11 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     let lazy_file: Option<FileBacking> = if akuma_config::MMAP_FILE_BACKED_LAZY
         && plan.file_lazy_eligible
     {
+        // `file_lazy_eligible` is every file mapping since shared-writable
+        // joined it — see the `Plan` field's doc. The recorded `filesz` is
+        // the EOF *at mmap time*; a file that grows under the mapping is
+        // handled at fault time (the fill reads the file's current bytes)
+        // and at flush time (the write-back re-queries the size).
         crate::fd::file_identity(fd).map(|(mount_id, inode, size)| FileBacking {
             mount_id,
             inode,
@@ -683,6 +706,29 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         None
     };
 
+    // The write-back record, for a writable `MAP_SHARED` file mapping. The
+    // flush runs on the *record*, not the fd, so it carries the full identity
+    // (path included — `fd::file_write_identity`) from the start: parity-db
+    // keeps its files open for the mapping's life, but `ld.so`'s habit of
+    // closing the descriptor is one `Drop` ordering away from a flush with
+    // nothing to name, and the record costs one `String` at `mmap` time.
+    // Pinned against `unlink` like the lazy fill's inode: the blocks must
+    // survive until the last flush lands.
+    let shared_write = if plan.is_shared_writable {
+        crate::fd::file_write_identity(fd).map(|(path, mount_id, inode, size)| {
+            pin_mapping_inode(inode);
+            let _ = size;
+            akuma_mmap::SharedWriteBack {
+                mount_id,
+                inode,
+                offset: offset as usize,
+                path,
+            }
+        })
+    } else {
+        None
+    };
+
     // `mm-forensics`: is `base` actually free? Nothing else in the kernel asks,
     // and a placement that overlaps a live mapping is silent until the program's
     // own memory turns out to be wrong. Before the record goes in, so the region
@@ -692,6 +738,9 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     let mut region = MmapRegion::inherited_with_prot(base, pages, region_prot);
     if plan.shared_anon {
         region = region.shared_anon();
+    }
+    if let Some(sw) = shared_write {
+        region = region.shared_writable(sw);
     }
     if let Some(file) = lazy_file {
         // The pin **before** the region is published: from the moment a fault
@@ -1663,6 +1712,22 @@ fn unmap_range(start: usize, end: usize) {
     if end <= start {
         return;
     }
+    // **Flush before anything is detached or freed.** A writable
+    // `MAP_SHARED` region's frames are about to lose their last owner; once
+    // the leaf walk below runs, the bytes exist nowhere but the recycler.
+    // The snapshot takes the region lock and nothing else, the flush takes
+    // the filesystem's locks and does disk I/O with **no** region lock held —
+    // the established regions -> address-space -> PMM order must not grow a
+    // regions -> ext2 edge — and the detach + free below then proceeds
+    // exactly as it did before this existed. A page that faults in after the
+    // snapshot and before the free cannot happen: nothing runs between the
+    // snapshot and the leaf walk but this flush, on this thread.
+    let snapshot = usermode::with_current_regions(|regions| {
+        snapshot_shared_write(regions, start, end)
+    })
+    .unwrap_or_default();
+    flush_shared_write(&snapshot);
+
     // Records first, under the region lock, which is released before the page
     // walk below takes the address-space lock and the PMM. Lock order is
     // regions -> address space everywhere in this module.
@@ -1714,6 +1779,141 @@ fn unmap_range(start: usize, end: usize) {
             LeafAction::Unmap
         });
     });
+}
+
+/// One shared-writable region captured for flushing: everything the write-back
+/// needs except the frames themselves.
+struct WriteBackRegion {
+    path: alloc::string::String,
+    mount_id: u32,
+    inode: u32,
+    /// File offset of the *region's* first page.
+    file_off: usize,
+    start_va: usize,
+    pages: usize,
+}
+
+/// Snapshot every shared-writable region overlapping `[start, end)` — under the
+/// region lock, before any of it can be detached.
+fn snapshot_shared_write(regions: &[akuma_mmap::MmapRegion], start: usize, end: usize) -> Vec<WriteBackRegion> {
+    let mut out: Vec<WriteBackRegion> = Vec::new();
+    for r in akuma_mmap::regions_overlapping(regions, start, end) {
+        if r.start_va >= end {
+            continue;
+        }
+        if let Some(sw) = &r.shared_write {
+            out.push(WriteBackRegion {
+                path: sw.path.clone(),
+                mount_id: sw.mount_id,
+                inode: sw.inode,
+                file_off: sw.offset,
+                start_va: r.start_va,
+                pages: r.pages,
+            });
+        }
+    }
+    out
+}
+
+/// Flush captured regions: walk each region's **present leaves** — not the
+/// region's frame list, which an eager fill does not populate and a CoW break
+/// does not update — and write each in-file page back through the VFS. Runs
+/// with no locks held that the I/O could conflict with: the snapshot is taken
+/// under the region lock, the leaf walk under the address-space lock, one at
+/// a time, and `write_at` happens after both.
+///
+/// A page past `filesz` (the mapping's zero-fill tail) is skipped: there is no
+/// file byte for it to land in, and a store through the mapping beyond EOF is
+/// the one write `mmap`'s contract does not promise. A CoW-broken private copy
+/// of a shared-writable page **is** flushed: the mapping's contract is that
+/// writes through it reach the file, and the fork child that broke sharing
+/// wrote through exactly such a mapping.
+fn flush_shared_write(regions: &[WriteBackRegion]) {
+    let mut jobs: Vec<(alloc::string::String, usize, usize, usize)> = Vec::new(); // (path, off, len, pa)
+    for r in regions {
+        // How big is the file *now*? The mapping may have been created when
+        // the file was a fraction of this — the whole reason the record
+        // carries no EOF snapshot. A page whose bytes land past the current
+        // EOF is skipped: `write_at` would extend the file with it, which is
+        // a decision parity-db-style callers make through `ftruncate`, not
+        // one a flush makes for them.
+        let size = akuma_vfs_glue::fs::metadata_open_file(&r.path, r.mount_id, r.inode)
+            .map(|m| m.size as usize)
+            .unwrap_or(0);
+        let end_va = r.start_va.saturating_add(r.pages * PAGE_SIZE as usize);
+        let _ = usermode::with_current_address_space(|uas| {
+            uas.rewrite_leaves_in_range(r.start_va, end_va, |_ledger, leaf| {
+                if !leaf.prot.user {
+                    return LeafAction::Keep;
+                }
+                let idx = (leaf.va - r.start_va) / PAGE_SIZE as usize;
+                let off = r.file_off + idx * PAGE_SIZE as usize;
+                if off < size {
+                    let left = size - off;
+                    let len = if left > PAGE_SIZE as usize { PAGE_SIZE as usize } else { left };
+                    jobs.push((r.path.clone(), off, len, leaf.pa));
+                }
+                LeafAction::Keep
+            });
+        });
+    }
+    let mut failed = 0usize;
+    for (path, off, len, pa) in &jobs {
+        // SAFETY: `pa` came from a present user leaf, reached through the
+        // physmap — the same access `dontneed_range`'s zeroing uses.
+        let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(*pa as u64), *len) };
+        if akuma_vfs_glue::write_at(path, *off, bytes).is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        serial::puts("[MM-WB] ");
+        serial::put_dec(failed as u64);
+        serial::puts(" of ");
+        serial::put_dec(jobs.len() as u64);
+        serial::puts(" write-back page(s) FAILED\n");
+    }
+}
+
+/// `msync(addr, len, flags)` — the flush half of the writable-`MAP_SHARED`
+/// story, and the call `memmap2::MmapMut::flush` compiles to.
+///
+/// Linux answers `ENOSYS` shape questions here too (`MS_ASYNC` is a no-op
+/// since 2.6.18-ish; `MS_INVALIDATE` we accept and ignore, since there is no
+/// page cache to invalidate *against*). We take the honest route: `flags` is
+/// accepted, the mappings covering `[addr, addr+len)` are written back in
+/// full, synchronously, and `0` is returned. There is no dirty tracking, so
+/// "in full" means every in-file page of the region — I/O spent, never bytes
+/// miswritten. A range touching no shared-writable mapping returns `0`
+/// without I/O, exactly as `munmap` of anonymous memory does.
+///
+/// x86_64 nr 26, routed in `usermode` **before** the shared syscall table:
+/// asm-generic (aarch64) has no `msync` at all, and the abi table's
+/// invariant is "a variant only exists if it has a number on both
+/// architectures" — a fake generic twin would break that invariant to carry
+/// a lie. The aarch64 kernel keeps refusing the mapping shape, so its
+/// programs never need this number either.
+pub fn sys_msync(addr: u64, len: u64) -> u64 {
+    if addr == 0 || !addr.is_multiple_of(PAGE_SIZE) {
+        return errno::EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    // Before any effect, the same rule `sys_mmap`'s ordering comment states:
+    // a caller with no address space is `ESRCH`, decidable ahead of the
+    // region list, and asserted by the boot suite with no process.
+    if !have_address_space() {
+        return errno::ESRCH;
+    }
+    let start = addr as usize;
+    let end = start.saturating_add(len as usize);
+    let snapshot = usermode::with_current_regions(|regions| {
+        snapshot_shared_write(regions, start, end)
+    })
+    .unwrap_or_default();
+    flush_shared_write(&snapshot);
+    0
 }
 
 /// `mprotect(addr, len, prot)`.
@@ -2056,7 +2256,11 @@ fn dontneed_range(start: usize, end: usize) {
 
     // One hold for the whole walk. Lock order is regions -> address space ->
     // PMM, the same direction `fault_in` takes, and nothing takes them the
-    // other way round.
+    // other way round. The flushes a shared-writable page needs before it is
+    // zeroed are **collected** here and written after both locks are gone —
+    // ext2 I/O under the region lock would be a new regions -> disk edge the
+    // rest of this module carefully avoids.
+    let mut flush_after: Vec<(alloc::string::String, u32, u32, usize, usize)> = Vec::new();
     let _ = usermode::with_current_regions(|regions| {
         let _ = usermode::with_current_address_space(|uas| {
         uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
@@ -2071,6 +2275,18 @@ fn dontneed_range(start: usize, end: usize) {
             let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
             if prot.is_none() {
                 return LeafAction::Keep;
+            }
+            // `MADV_DONTNEED` on a writable `MAP_SHARED` file mapping drops
+            // the frame — which on Linux is free, because the page cache
+            // already *has* the writes and a refault reads them back. Here
+            // the frame is the only copy, so dropping it without a flush
+            // would launder the caller's writes out of existence. Collect
+            // the page for the flush after the walk; the zero that follows
+            // is then indistinguishable from Linux's drop-and-refault, since
+            // a refault reads back exactly what was just written.
+            if let Some(sw) = &region.shared_write {
+                let idx = ((va & !(PAGE_SIZE as usize - 1)) - region.start_va) / PAGE_SIZE as usize;
+                flush_after.push((sw.path.clone(), sw.mount_id, sw.inode, sw.offset + idx * PAGE_SIZE as usize, pa));
             }
             match dontneed_page_action(true, akuma_pmm::cow_ref_get(pa)) {
                 // `for_each_leaf_in_range` only reports present pages, so the
@@ -2130,6 +2346,22 @@ fn dontneed_range(start: usize, end: usize) {
         });
         });
     });
+    // After both locks: write back every shared-writable page the walk is
+    // about to zero. The size check is the same one `flush_shared_write`
+    // makes — pages past the file's current end have nothing to land in.
+    for (path, mount_id, inode, off, pa) in &flush_after {
+        let size = akuma_vfs_glue::fs::metadata_open_file(path, *mount_id, *inode)
+            .map(|m| m.size as usize)
+            .unwrap_or(0);
+        if *off >= size {
+            continue;
+        }
+        let len = if size - *off > PAGE_SIZE as usize { PAGE_SIZE as usize } else { size - *off };
+        // SAFETY: `pa` was a present user leaf when collected, physmap-read
+        // exactly as the zeroing arm above reads it.
+        let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(*pa as u64), len) };
+        let _ = akuma_vfs_glue::write_at(path, *off, bytes);
+    }
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -2165,10 +2397,21 @@ pub fn smoke_test(t: &mut Suite) {
     // The three that remain are all decidable from the arguments, which is why
     // they can be asserted with no process and no open file.
     const MAP_SHARED: u64 = akuma_syscalls_linux::flags::map::MAP_SHARED as u64;
+    // Writable `MAP_SHARED` on a file is **servable** since 2026-09-22 — eager
+    // fill + `MmapRegion::shared_write` + write-back on `munmap`/`msync`
+    // (the refusal this used to assert is gone). What remains decidable from
+    // the arguments with no open file is the refusal of a shared-writable
+    // request on a descriptor that cannot be a write identity: same fd 5, no
+    // process, `EACCES` from the identity probe before anything is placed.
     t.check_eq(
-        "mmap: a writable MAP_SHARED file mapping is still ENOSYS",
+        "mmap: a writable MAP_SHARED file mapping on a non-file fd is EACCES",
         sys_mmap(0, 4096, u64::from(PROT_WRITE) | 1, MAP_SHARED, 5, 0),
-        errno::ENOSYS,
+        errno::EACCES,
+    );
+    t.check_eq(
+        "mmap: msync is served, not ENOSYS (nr 26 routed before the table)",
+        sys_msync(0x1000_0000, 4096),
+        errno::ESRCH,
     );
     t.check_eq(
         "mmap: a file mapping at an unaligned offset is EINVAL",
