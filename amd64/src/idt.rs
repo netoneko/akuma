@@ -42,6 +42,26 @@
 //! **No hardware interrupts.** Vectors 32+ are unmapped and the PIC is not even
 //! masked; `IF` has been 0 since `boot.s`, so nothing can arrive. A timer means
 //! LAPIC setup, and that is a later stage.
+//!
+//! # Every hand-written entry clears `DF` (2026-09-23)
+//!
+//! Exception and interrupt delivery clears `TF`, `RF`, `NT`, `VM` and (through
+//! an interrupt gate) `IF`. It does **not** clear the direction flag, and the
+//! SysV ABI only promises `DF=0` at a *call* — so a fault delivered mid
+//! `std; rep movsb; cld` (musl's x86_64 `memmove`, verbatim) enters the kernel
+//! with `DF=1`, and so does an IRQ that lands inside the kernel's own
+//! `memmove`, which uses the same sequence. Every `memcpy`/`memset` this kernel
+//! links is a `rep` string op, so from that point on each one runs *backwards*
+//! from its base: the demand-page `write_bytes` and the CoW `copy_nonoverlapping`
+//! in [`page_fault_dispatch`] scribble the previous physical frame — whichever
+//! heap page, page table or kernel stack that happens to be. rustc emits `cld`
+//! in every `x86-interrupt` prologue for exactly this reason; the five
+//! `global_asm!` entries (`fixable_exception_entry!` ×2, `timer_entry`,
+//! `debug_entry`, `invalid_opcode_entry`, and `shootdown_entry` next door) did
+//! not, and `syscall_entry` is covered by `DF` in `IA32_FMASK`. Each dispatcher
+//! now reports if it ever runs with `DF` set (`trap_entry_df_seen`, pinned to 0
+//! by `user_copy_smoke_test`). Add an entry stub, add the `cld`.
+//! `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`.
 
 use crate::paging::{self, MemAttr, PageFaultCode, PteProt};
 use crate::phys::phys_ptr;
@@ -549,6 +569,15 @@ macro_rules! fixable_exception_entry {
             "    je 1f\n",
             "    clac\n",
             "1:\n",
+            /* DF is NOT among the flags the CPU clears on exception delivery,
+             * and the interrupted code may have set it: musl's x86_64 memmove
+             * is `std; rep movsb; cld`, and a fault on any byte of that copy
+             * arrives here with DF=1. Every kernel memcpy/memset is a `rep`
+             * string op, so without this the dispatcher's page zero and CoW
+             * copy run BACKWARDS from their base into the previous frame.
+             * rustc emits the same `cld` in every `x86-interrupt` prologue;
+             * hand-written entries have to say it (`trap_entry_df_seen`). */
+            /* AB-NEGATIVE */
             "    lea rdi, [rsp + 128]\n",         /* &PageFaultFrame: the error code slot */
             "    lea rsi, [rsp]\n",               /* &TrapRegs */
             "    call ", $dispatch, "\n",
@@ -628,6 +657,7 @@ timer_entry:
     push r13
     push r14
     push r15
+    cld                              /* see fixable_exception_entry!: DF survives delivery */
     lea rdi, [rsp + 120]             /* &InterruptStackFrame */
     lea rsi, [rsp]                   /* &TrapRegs */
     call timer_dispatch
@@ -687,6 +717,7 @@ debug_entry:
     push r13
     push r14
     push r15
+    cld                              /* see fixable_exception_entry!: DF survives delivery */
     lea rdi, [rsp + 120]             /* &InterruptStackFrame */
     lea rsi, [rsp]                   /* &TrapRegs */
     call debug_dispatch
@@ -737,6 +768,31 @@ pub fn ring0_debug_traps() -> u64 {
     RING0_DEBUG_TRAPS.load(Ordering::Relaxed)
 }
 
+/// Dispatchers that ran with the direction flag set (`0` is the expected
+/// value). See the module header: delivery does not clear `DF`, every kernel
+/// `memcpy`/`memset` is a `rep` string op, and the hand-written entry stubs
+/// each `cld` before calling out. This is the tripwire for the stub that
+/// forgets — read once per entry, two instructions and a never-taken branch.
+static TRAP_ENTRY_DF_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// First statement of every hand-written entry's dispatcher.
+#[inline]
+pub fn note_trap_entry_flags() {
+    let flags: u64;
+    // SAFETY: reads `rflags` through the stack and restores `rsp`; no memory
+    // the compiler knows about is touched.
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    if flags & (1 << 10) != 0 {
+        TRAP_ENTRY_DF_SEEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Entries whose dispatcher saw `DF=1` this boot (`0` is the expected value).
+#[must_use]
+pub fn trap_entry_df_seen() -> u64 {
+    TRAP_ENTRY_DF_SEEN.load(Ordering::Relaxed)
+}
+
 /// `#DB` — and the reason this kernel needs one at all.
 ///
 /// Vector 1 fires on a single-step (`RFLAGS.TF`), a hardware breakpoint, or a
@@ -767,6 +823,7 @@ pub fn ring0_debug_traps() -> u64 {
 /// them, so a stale `BS` would misattribute the next trap.
 #[unsafe(no_mangle)]
 extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    note_trap_entry_flags();
     akuma_bkl::sync::set_core_tag_transient(
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
@@ -870,6 +927,7 @@ invalid_opcode_entry:
     push r13
     push r14
     push r15
+    cld                              /* see fixable_exception_entry!: DF survives delivery */
     lea rdi, [rsp + 120]             /* &InterruptStackFrame */
     lea rsi, [rsp]                   /* &TrapRegs */
     call invalid_opcode_dispatch
@@ -903,6 +961,7 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 extern "C" fn invalid_opcode_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    note_trap_entry_flags();
     akuma_bkl::sync::set_core_tag_transient(
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
@@ -969,6 +1028,7 @@ unsafe extern "C" {
 /// and this must be free to edit the frame — see the module header.
 #[unsafe(no_mangle)]
 extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    note_trap_entry_flags();
     // BKL-hold attribution: stamp the core's cache for this transient
     // excursion (the interrupted thread keeps its own tag — see
     // `set_core_tag_transient`), so a hold inside fault service names
@@ -1560,6 +1620,7 @@ const SIGILL: u32 = 4;
 /// `#GP` is never "not mapped yet".
 #[unsafe(no_mangle)]
 extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    note_trap_entry_flags();
     akuma_bkl::sync::set_core_tag_transient(
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
@@ -1614,6 +1675,7 @@ unsafe extern "C" {
 /// See `sched::preempt_if_needed` for why.
 #[unsafe(no_mangle)]
 extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    note_trap_entry_flags();
     // BKL-hold attribution: a tick that lands mid-hold is the IRQ/scheduler,
     // not the interrupted thread (transient stamp; the thread's tag survives).
     akuma_bkl::sync::set_core_tag_transient(
@@ -1995,6 +2057,60 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
     if let Some(pa) = paging::unmap_page(LAZY_VA as usize) {
         akuma_pmm::free_page(pa as usize, 0);
     }
+
+    // 7. the direction flag does not leak into the kernel. musl's x86_64
+    //    `memmove` is `std; rep movsb; cld`, so a fault on any byte of an
+    //    overlapping copy — into a CoW page, a lazy page — is delivered with
+    //    `DF=1`, and delivery does not clear it. Every kernel memcpy/memset is
+    //    a `rep` string op: without the stub's `cld`, the demand-page zero this
+    //    fault triggers runs *backwards* out of the fresh frame's base into the
+    //    previous physical frame. One asm block, so `DF` is clear again before
+    //    any Rust code runs; interrupts masked, so the fault under test is the
+    //    only entry taken with the flag set. The page below the fresh frame
+    //    cannot be checked from here; what can is that the dispatcher never
+    //    saw `DF` (the tripwire) and the fresh page is zero end to end.
+    //    `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`.
+    const DF_VA: u64 = LAZY_VA + 4096; // same tables as case 6: nothing new retained
+    arm_lazy(DF_VA, 4096);
+    let df_before = trap_entry_df_seen();
+    let demand_before = DEMAND_FAULTS.load(Ordering::Relaxed);
+    let irq = akuma_cpu::daif::save_and_mask_irq();
+    let first: u8;
+    // SAFETY: `DF` is set and cleared inside the one block, so the ABI's
+    // "clear on exit" holds; the load is from the armed lazy region, which the
+    // #PF handler maps (zeroed) before re-executing it.
+    unsafe {
+        core::arch::asm!(
+            "std",
+            "mov {b}, byte ptr [{p}]",
+            "cld",
+            p = in(reg) DF_VA,
+            b = out(reg_byte) first,
+            options(nostack),
+        );
+    }
+    akuma_cpu::daif::restore(irq);
+    disarm_lazy();
+    let mut zeroed = first == 0;
+    if let Some(pa) = paging::unmap_page(DF_VA as usize) {
+        // SAFETY: the frame the fault just mapped, reached through the physmap,
+        // not yet freed.
+        let page = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(pa), 4096) };
+        zeroed &= page.iter().all(|&b| b == 0);
+        akuma_pmm::free_page(pa as usize, 0);
+    } else {
+        zeroed = false;
+    }
+    t.check(
+        "trap entry: a fault taken with DF set was demand-paged",
+        DEMAND_FAULTS.load(Ordering::Relaxed) == demand_before + 1,
+    );
+    t.check("trap entry: the page it zeroed is zero end to end (the zeroing ran forwards)", zeroed);
+    t.check_eq(
+        "trap entry: no dispatcher ran with the direction flag set",
+        trap_entry_df_seen() - df_before,
+        0,
+    );
 
     // Exactly four fixups: cases 2, 3, 4 (#PF) and 5 (#GP). Case 6 must not
     // have counted.

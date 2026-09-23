@@ -128,6 +128,7 @@ pub fn service_pending() {
 /// module header for why that is load-bearing.
 #[unsafe(no_mangle)]
 extern "C" fn shootdown_dispatch(_frame: *const idt::InterruptStackFrame) {
+    idt::note_trap_entry_flags();
     service_pending();
     crate::lapic::eoi();
 }
@@ -292,6 +293,7 @@ shootdown_entry:
     push r10
     push r11
     sub rsp, 8
+    cld                              /* see idt.rs fixable_exception_entry!: DF survives delivery */
     lea rdi, [rsp + 88]              /* &InterruptStackFrame */
     call shootdown_dispatch
     add rsp, 8
