@@ -577,7 +577,7 @@ macro_rules! fixable_exception_entry {
              * copy run BACKWARDS from their base into the previous frame.
              * rustc emits the same `cld` in every `x86-interrupt` prologue;
              * hand-written entries have to say it (`trap_entry_df_seen`). */
-            /* AB-NEGATIVE */
+            "    cld\n",
             "    lea rdi, [rsp + 128]\n",         /* &PageFaultFrame: the error code slot */
             "    lea rsi, [rsp]\n",               /* &TrapRegs */
             "    call ", $dispatch, "\n",
