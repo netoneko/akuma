@@ -224,6 +224,11 @@ async fn run_exec_session(
         return bridge_process(stream, session, res.pid, res.stdout_fd, session.pty_requested).await;
     }
 
+    // Neither could be spawned — exec itself is what is broken. Last resort:
+    // paws in this process, which needs no exec (`builtin-paws`).
+    #[cfg(feature = "builtin-paws")]
+    return run_builtin_paws(stream, session, &shell_path, Some(cmd_str)).await;
+    #[cfg(not(feature = "builtin-paws"))]
     fail_spawn(stream, session, &shell_path, "exec").await
 }
 
@@ -304,6 +309,11 @@ async fn run_shell_session(
         return bridge_process(stream, session, res.pid, res.stdout_fd, true).await;
     }
 
+    // Neither could be spawned — exec itself is what is broken. Last resort:
+    // paws in this process, which needs no exec (`builtin-paws`).
+    #[cfg(feature = "builtin-paws")]
+    return run_builtin_paws(stream, session, &shell_path, None).await;
+    #[cfg(not(feature = "builtin-paws"))]
     fail_spawn(stream, session, &shell_path, "shell").await
 }
 
@@ -361,7 +371,9 @@ fn try_emergency_shell(
 
 /// Report a shell-spawn failure to both the log and the client, then end the
 /// session cleanly. Reached only after [`try_emergency_shell`] has also
-/// failed (or is compiled out).
+/// failed (or is compiled out). With `builtin-paws` there is always a
+/// session to fall back to, so this is compiled out too.
+#[cfg(not(feature = "builtin-paws"))]
 async fn fail_spawn(
     stream: &mut SshStream,
     session: &mut SshSession,
@@ -377,6 +389,152 @@ async fn fail_spawn(
     // Synthesised as a clean exit: nothing was ever spawned, so there is no
     // signal to report.
     send_exit_report(stream, session, WaitStatus { pid: 0, raw: (127 << 8) }).await
+}
+
+/// Last-resort session: the paws shell run **inside this process**
+/// (`builtin-paws`), for when neither the configured shell nor `/bin/paws`
+/// could be spawned — i.e. exec itself is what broke, so any fallback that is
+/// one more spawn fails for the same reason. The point is a prompt that can
+/// still diagnose and, above all, `reboot`: that is `reboot(2)` issued from
+/// here, with nothing exec'd (`paws::Flow::Reboot`).
+///
+/// Builtins only, and nothing in it may block: on amd64 this is the
+/// single-process cooperative executor, so a stalled command stalls every
+/// session (see `paws::Mode::Embedded`). `command` is `Some` for an `exec`
+/// request (`ssh host 'reboot'` works too) and `None` for an interactive shell.
+#[cfg(feature = "builtin-paws")]
+async fn run_builtin_paws(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    shell_path: &str,
+    command: Option<&str>,
+) -> Result<(), NetError> {
+    use paws::{Buf, Edit, Flow, LineEditor, Mode, Out};
+
+    eprintln(&format!(
+        "[SSH] '{}' and the emergency shell both failed to spawn — running built-in paws in-process",
+        shell_path
+    ));
+    // An interactive session is cooked like the spawned-shell path, which
+    // always takes a pty; an exec is cooked only if the client asked for one.
+    let pty = command.is_none() || session.pty_requested;
+    let mut out = Buf::new(pty);
+
+    if let Some(cmd) = command {
+        let flow = paws::execute_line(cmd, Mode::Embedded, &mut out);
+        send_paws_output(stream, session, &mut out, pty).await?;
+        let code = match flow {
+            Flow::Continue(s) | Flow::Exit(s) => s,
+            Flow::Reboot => paws_reboot(stream, session, pty).await?,
+        };
+        return send_exit_report(stream, session, WaitStatus { pid: 0, raw: ((code as u32) & 0xff) << 8 }).await;
+    }
+
+    out.line(&format!(
+        "sshd: '{shell_path}' and /bin/paws could not be spawned; this is paws running inside sshd."
+    ));
+    out.line("Builtins only, nothing is exec'd. `reboot` reboots directly.");
+    paws::banner(&mut out);
+    paws::prompt(&mut out);
+    send_paws_output(stream, session, &mut out, pty).await?;
+
+    set_nonblocking(stream.as_raw_fd(), true);
+    let mut editor = LineEditor::new();
+    let mut window_credit: u32 = 0;
+    const WINDOW_ADJUST_THRESHOLD: u32 = 64 * 1024;
+
+    let code = 'session: loop {
+        let mut did_io = false;
+        let mut ssh_buf = [0u8; 512];
+        match stream.try_read(&mut ssh_buf) {
+            Ok(0) => break 0, // peer closed its write side
+            Ok(n) => {
+                did_io = true;
+                session.input_buffer.extend_from_slice(&ssh_buf[..n]);
+            }
+            Err(_) => {} // EAGAIN
+        }
+
+        // Drained every iteration, not only after a fresh read — the same
+        // reason as in `bridge_process`: data can already be buffered.
+        while let Some((msg_type, payload)) = process_encrypted_packet(session) {
+            did_io = true;
+            if msg_type == SSH_MSG_CHANNEL_DATA {
+                let mut offset = 0;
+                let _recipient = read_u32(&payload, &mut offset);
+                let Some(data) = read_string(&payload, &mut offset) else { continue };
+                window_credit += data.len() as u32;
+                for &byte in data {
+                    match editor.feed(byte, &mut out) {
+                        Edit::Pending => continue,
+                        Edit::Eof => {
+                            send_paws_output(stream, session, &mut out, pty).await?;
+                            break 'session 0;
+                        }
+                        Edit::Interrupt => {}
+                        Edit::Line(line) => match paws::execute_line(line.trim(), Mode::Embedded, &mut out) {
+                            Flow::Continue(_) => {}
+                            Flow::Exit(code) => {
+                                send_paws_output(stream, session, &mut out, pty).await?;
+                                break 'session code;
+                            }
+                            Flow::Reboot => {
+                                send_paws_output(stream, session, &mut out, pty).await?;
+                                paws_reboot(stream, session, pty).await?;
+                            }
+                        },
+                    }
+                    paws::prompt(&mut out);
+                }
+                send_paws_output(stream, session, &mut out, pty).await?;
+            } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
+                break 'session 0;
+            }
+            // window-change: nothing to resize — the builtins don't ask.
+        }
+
+        if window_credit >= WINDOW_ADJUST_THRESHOLD {
+            send_window_adjust(stream, session, window_credit).await?;
+            window_credit = 0;
+        }
+        if !did_io {
+            crate::yield_now().await;
+        }
+    };
+    send_exit_report(stream, session, WaitStatus { pid: 0, raw: ((code as u32) & 0xff) << 8 }).await
+}
+
+/// `reboot` from the built-in shell. Only returns if `reboot(2)` failed (e.g.
+/// `EPERM` outside box 0), with the status to report.
+#[cfg(feature = "builtin-paws")]
+async fn paws_reboot(stream: &mut SshStream, session: &mut SshSession, pty: bool) -> Result<i32, NetError> {
+    println("[SSH] built-in paws: reboot requested");
+    send_channel_data(stream, session, &cook_output(b"paws: rebooting...\n", pty)).await?;
+    let rc = reboot();
+    // Only reachable on failure — a successful reboot(2) never returns.
+    let msg = format!("paws: reboot failed, errno {}\n", -rc);
+    send_channel_data(stream, session, &cook_output(msg.as_bytes(), pty)).await?;
+    Ok(1)
+}
+
+/// Send and clear what the built-in shell has written, in packets well under
+/// the 32 KiB maximum a client must accept (RFC 4254 §5.1 via RFC 4253 §6.1).
+#[cfg(feature = "builtin-paws")]
+async fn send_paws_output(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    out: &mut paws::Buf,
+    pty: bool,
+) -> Result<(), NetError> {
+    let truncated = out.truncated;
+    let bytes = out.take();
+    for chunk in bytes.chunks(16 * 1024) {
+        send_channel_data(stream, session, &cook_output(chunk, pty)).await?;
+    }
+    if truncated {
+        send_channel_data(stream, session, &cook_output(b"\n[paws: output truncated at 1 MiB]\n", pty)).await?;
+    }
+    Ok(())
 }
 
 /// `\n` → `\r\n` for a client PTY, byte-identical passthrough otherwise. A PTY

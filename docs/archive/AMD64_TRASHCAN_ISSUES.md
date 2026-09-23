@@ -4,7 +4,7 @@
 Firecracker/QEMU stand-ins. **Stability: C** — these are active, and at least one
 has had its "root cause" overturned twice.
 
-As of 2026-09-19 §§1-4 are fixed, §§5-7 are open, and §7b is an incident report rather than a defect of this machine's. Two of the entries here are
+As of 2026-09-19 §§1-4 are fixed, §§5-7 are open, and §7b is an incident report rather than a defect of this machine's. §9 (2026-09-24, herd not restarting a killed `sshd`) is open. Two of the entries here are
 **not kernel bugs at all** (§4 a client timeout, §6 a model and its tool
 payload) and they are kept in this file on purpose: both presented as "the box
 is broken", and the record of how each was pushed off the kernel is the part
@@ -942,6 +942,70 @@ What is **not** here is z.ai (§5) and hard links (§7).
 Two things it still reports and neither is fatal: `IPC disabled: socket bind
 failed: Address family not supported by protocol (os error 97)` — nca's AF_UNIX
 control socket — and an `nca` process that outlives its one-shot turn.
+
+---
+
+## 9. herd did not restart a killed `sshd` — **OPEN (2026-09-24)**
+
+**Symptom.** On the metal (kernel `ca859980`, `init=/bin/herd`), `kill 20`
+against the herd-supervised `sshd` left the box with **no sshd at all**: port
+2222 refused connections for over 3 minutes and never came back, while the
+machine was plainly alive (ping answered, `kot` still served 9944). Recovery was
+a reset at the machine, because sshd is the only remote way in. The kill was
+issued detached from an ssh session (`nohup sh -c "sleep 2; kill 20" &`), to
+activate a freshly swapped `/bin/sshd`.
+
+**Not the configuration.** `/etc/herd/enabled/sshd.conf` (identical in
+`available/`) is
+
+```
+command = /bin/sshd
+restart = true
+restart_delay = 2000
+```
+
+and herd's own policy restarts this exit whichever way it is classified:
+`userspace/herd/src/exit.rs::classify` treats a signal death as a failure →
+`Restart` (`max_retries` is unset, so unlimited), and even a clean exit →
+`Stopped` is revived by `start_stopped_services` (`herd/src/main.rs`).
+
+**herd never tried.** `/var/log/herd/sshd.log` spans both boots (it was not
+rotated; `sshd.log.old` is from 17:51). The killed boot's sshd logged
+`[SSHD] Listening on 0.0.0.0:2222...` at line 424, and the next line of any
+kind from a new sshd is this boot's `Starting userspace SSH server...` at 761,
+glued onto the truncated end of the previous boot's last write
+(`[SSH Keys[SSHD] Starting …`). No `Starting`, and no failed bind, in between:
+herd never spawned a replacement. So the exit was most likely **never observed**
+— a missed reap, not a policy decision. Suspects, unverified: herd's reap of a
+child killed by a *non-parent* (the killer was a grandchild of sshd itself, via
+the session's `sh`), and the amd64 reparent / `wait4(-1)` path that the
+orphan-reaping fix (reparent missed the child-channel registry; herd gained a
+`wait4(-1)` sweep) touched. herd writes nothing to disk about its own decisions,
+so the framebuffer was the only place it could have said anything.
+
+**Second, smaller observation in the same log.** Lines 54-69, from an *earlier*
+restart that herd did perform, show five
+`Failed to bind to 0.0.0.0:2222: … AddrInUse` retries before `Listening` — the
+dead sshd's listener stays bound for ~10 s (5 × `restart_delay`). Harmless with
+unlimited retries, but it is why a restart looks slow, and with a `max_retries`
+ceiling it would turn into a permanent `Failed`.
+
+**Mitigation in place since this incident.** sshd's new `builtin-paws` feature
+(on for amd64: `amd64/mkdisk.sh`, `scripts/box/ubuild`) runs paws *inside* sshd
+when neither `/bin/sh` nor `/bin/paws` can be spawned, with a `reboot` that is a
+direct `reboot(2)` — so a box whose exec path breaks can still be rebooted over
+ssh. It does nothing for *this* failure: with no sshd process there is nothing to
+fall back inside.
+
+**Next step.** Reproduce in the local amd64 QEMU rig, which costs no reboot of
+the box: `INIT=/bin/herd` on a `mkdisk.sh` image (herd + sshd enabled), then
+`ssh … 'nohup sh -c "sleep 2; kill $(pidof sshd)" &'` and watch whether herd
+respawns it. If it does not, instrument herd's reap loop before theorising. Also
+worth having regardless: herd logging its own start/exit/restart decisions to
+`/var/log/herd/herd.log`, so the next occurrence is readable without a screen.
+
+**Until fixed: do not restart sshd on the metal by killing it.** Swap the binary
+by rename and let the next reboot pick it up, or `reboot -f`.
 
 ## Background
 

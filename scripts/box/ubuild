@@ -29,4 +29,4 @@ fi
 cargo build --release --target x86_64-unknown-none --offline \
     -p paws -p httpd -p herd -p hget -p wall -p box
 exec cargo build --release --target x86_64-unknown-none --offline \
-    -p sshd --no-default-features --features akuma,emergency-paws
+    -p sshd --no-default-features --features akuma,emergency-paws,builtin-paws

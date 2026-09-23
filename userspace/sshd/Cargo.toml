@@ -36,6 +36,19 @@ akuma = ["dep:libakuma"]
 # session", not "session on a different binary").
 emergency-paws = []
 
+# OFF by default. The fallback AFTER `emergency-paws`: when neither the
+# configured shell nor `/bin/paws` can be spawned — exec itself is what broke
+# (a failing USB root, a `/bin` that lost its links) — run paws *inside this
+# process* instead of ending the session. Builtins only, nothing exec'd, and
+# `reboot` is a direct `reboot(2)` from sshd, so a box whose disk has gone bad
+# can still be rebooted over ssh. `emergency-paws` can't cover that case: it is
+# one more spawn, and fails for the same reason the first one did. See
+# `run_builtin_paws` in `src/protocol.rs` and `userspace/paws/src/lib.rs`.
+#
+# Enabled for amd64 (`amd64/mkdisk.sh`, `scripts/box/ubuild`), the target that
+# has no other remote way back. Costs the paws command set in sshd's image.
+builtin-paws = ["akuma", "dep:paws"]
+
 # Serve each connection from its own forked process instead of as one future in
 # a single-process cooperative executor. Buys fault isolation (a panic aborts
 # one session, not the server) and real multi-core use, at the cost of a process
@@ -90,6 +103,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] 
 rand_core = { version = "0.6", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 spinning_top = "0.3"
+# Only with `builtin-paws`: the paws shell as a library, run in-process.
+paws = { path = "../paws", optional = true }
 
 [profile.release]
 panic = "abort"

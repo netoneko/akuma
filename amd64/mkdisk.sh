@@ -164,7 +164,7 @@ fi
 # by a full `/bin` directory (see the `expand_dir` comment below) is exactly
 # what leaves a session with "failed to spawn '/bin/sh'" and nothing else to
 # try.
-if (cd userspace && cargo build -q -p sshd --no-default-features --features akuma,emergency-paws \
+if (cd userspace && cargo build -q -p sshd --no-default-features --features akuma,emergency-paws,builtin-paws \
         --target x86_64-unknown-none --release 2>/dev/null); then
     SSHD=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name sshd -type f | head -1)
     # The **client**, from the same package's second `[[bin]]`. `cargo build -p

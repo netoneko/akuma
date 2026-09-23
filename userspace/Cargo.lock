@@ -848,6 +848,7 @@ dependencies = [
  "embedded-io-async 0.6.1",
  "hmac",
  "libakuma",
+ "paws",
  "rand_core",
  "sha2",
  "spinning_top",
