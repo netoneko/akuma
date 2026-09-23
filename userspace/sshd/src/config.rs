@@ -28,9 +28,12 @@ pub struct SshdConfig {
     pub disable_key_verification: bool,
     /// Path to the shell spawned for both interactive (`shell` channel
     /// request) and one-shot (`exec` channel request, `-c <cmd>`) sessions.
-    /// There is no built-in fallback shell — this must be a real executable
-    /// on disk. Defaults to busybox's `/bin/sh` (a devbox/bootstrap image
-    /// always symlinks `/bin/sh` to busybox; see `scripts/populate_disk.sh`).
+    /// Must be a real executable on disk. Defaults to busybox's `/bin/sh` (a
+    /// devbox/bootstrap image always symlinks `/bin/sh` to busybox; see
+    /// `scripts/populate_disk.sh`). If this can't be spawned at all, the
+    /// `emergency-paws` build feature (default on) retries once against
+    /// `/bin/paws`, Akuma's own built-in shell — see `try_emergency_shell` in
+    /// `src/protocol.rs`.
     pub shell: String,
     /// Extra argv passed to the spawned shell, after the shell path. Used to
     /// drive multicall binaries (busybox/toybox/armybox) whose applet is

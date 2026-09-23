@@ -47,6 +47,14 @@ const DEFAULT_MAX_RETRIES: u32 = 0;
 /// Herd directories
 const HERD_ENABLED_DIR: &str = "/etc/herd/enabled";
 const HERD_AVAILABLE_DIR: &str = "/etc/herd/available";
+/// `herd start`/`herd stop` drop a `<svc>.start`/`<svc>.stop` marker file here;
+/// the running daemon polls it every supervisor loop tick (~100ms) — much
+/// faster than the 20s config reload `enable`/`disable` ride along on, since a
+/// stop is meant to take the process down NOW, not whenever the next reload
+/// happens to land. There is no other channel between a CLI invocation and the
+/// long-running daemon (no socket, no signal) — this is that channel, and it
+/// is deliberately as dumb as the enabled/available directories already are.
+const HERD_CONTROL_DIR: &str = "/etc/herd/control";
 
 /// The enabled-config directory the daemon loads from. Defaults to
 /// [`HERD_ENABLED_DIR`], but a `--enabled-dir <path>` argument overrides it — so a SECOND herd
@@ -94,6 +102,28 @@ fn ensure_directories() {
         print(HERD_LOG_DIR);
         print("\n");
     }
+
+    // Create /etc/herd/control
+    if !mkdir_p(HERD_CONTROL_DIR) {
+        print("[herd] Warning: Failed to create ");
+        print(HERD_CONTROL_DIR);
+        print("\n");
+    }
+}
+
+/// Discard any leftover `herd start`/`herd stop` markers from a previous boot.
+/// They describe transient runtime intent for a daemon instance that no
+/// longer exists — a stale `.stop` for a service that's enabled would halt it
+/// the moment this fresh daemon came up, which is not what a reboot means.
+fn clear_stale_control_files() {
+    let Some(dir) = read_dir(HERD_CONTROL_DIR) else { return };
+    let names: Vec<String> = dir.map(|e| e.name).collect();
+    for name in names {
+        if name.ends_with(".start") || name.ends_with(".stop") {
+            let path = format!("{}/{}", HERD_CONTROL_DIR, name);
+            libakuma::unlink(&path);
+        }
+    }
 }
 
 // ============================================================================
@@ -110,6 +140,12 @@ enum ServiceState {
     /// (re)started — unlike `Stopped`, which `start_stopped_services` brings back up.
     /// A reboot re-runs it (fresh herd, fresh state); a config reload preserves it.
     Completed,
+    /// Administratively stopped via `herd stop <svc>`. Unlike `Stopped` — which
+    /// `start_stopped_services` revives on the very next pass — a `Halted` service
+    /// stays down until `herd start <svc>` (or a reboot, which starts from fresh
+    /// state) brings it back. Config reload does not clear it: a service disabled
+    /// via `herd stop` should not come back just because the 20s reload ran.
+    Halted,
 }
 
 // ============================================================================
@@ -406,6 +442,22 @@ pub extern "C" fn main() {
                 }
                 exit(0);
             }
+            "start" => {
+                if let Some(name) = service_name {
+                    cmd_start(name);
+                } else {
+                    print("Usage: herd start <service>\n");
+                }
+                exit(0);
+            }
+            "stop" => {
+                if let Some(name) = service_name {
+                    cmd_stop(name);
+                } else {
+                    print("Usage: herd stop <service>\n");
+                }
+                exit(0);
+            }
             "log" => {
                 if let Some(name) = service_name {
                     cmd_log(name);
@@ -433,6 +485,8 @@ pub extern "C" fn main() {
 
     let mut state = HerdState::new();
 
+    clear_stale_control_files();
+
     // Initial config load
     reload_config(&mut state);
 
@@ -455,6 +509,9 @@ fn supervisor_loop(mut state: HerdState) {
 
         // 3. Handle pending restarts
         process_pending_restarts(&mut state, now_ms);
+
+        // 3a. Apply any `herd start`/`herd stop` requests dropped since the last tick.
+        process_control_commands(&mut state);
 
         // 3b. Start any stopped services whose (optional) start delay has elapsed.
         start_stopped_services(&mut state, now_ms);
@@ -1111,6 +1168,18 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
 }
 
 fn stop_service(state: &mut HerdState, name: &str) {
+    kill_service_to(state, name, ServiceState::Stopped);
+}
+
+/// Administrative stop (`herd stop <svc>`): kills the running process like
+/// [`stop_service`], but lands on [`ServiceState::Halted`] instead of
+/// `Stopped` so `start_stopped_services` does not revive it on the very next
+/// pass. See [`ServiceState::Halted`].
+fn halt_service(state: &mut HerdState, name: &str) {
+    kill_service_to(state, name, ServiceState::Halted);
+}
+
+fn kill_service_to(state: &mut HerdState, name: &str, target: ServiceState) {
     if let Some(svc) = state.services.get_mut(name) {
         if let Some(pid) = svc.pid {
             // Must carry a real signal: `libakuma::kill` hardcodes sig 0, which
@@ -1125,8 +1194,68 @@ fn stop_service(state: &mut HerdState, name: &str) {
         }
         svc.pid = None;
         svc.stdout_fd = None;
-        svc.state = ServiceState::Stopped;
+        svc.state = target;
         svc.restart_at_ms = None;
+    }
+}
+
+// ============================================================================
+// Start/Stop Control Files
+// ============================================================================
+
+/// Apply any `<svc>.start`/`<svc>.stop` marker files `herd start`/`herd stop`
+/// (a separate CLI invocation) dropped in [`HERD_CONTROL_DIR`] since the last
+/// tick. Each marker is consumed (unlinked) whether or not it could be
+/// applied, so a request for an unknown service doesn't retrigger forever.
+fn process_control_commands(state: &mut HerdState) {
+    let Some(dir) = read_dir(HERD_CONTROL_DIR) else { return };
+
+    let mut starts: Vec<String> = Vec::new();
+    let mut stops: Vec<String> = Vec::new();
+    for entry in dir {
+        if let Some(name) = entry.name.strip_suffix(".start") {
+            starts.push(String::from(name));
+        } else if let Some(name) = entry.name.strip_suffix(".stop") {
+            stops.push(String::from(name));
+        }
+    }
+
+    for name in stops {
+        let path = format!("{}/{}.stop", HERD_CONTROL_DIR, name);
+        libakuma::unlink(&path);
+        if state.services.contains_key(&name) {
+            print("[herd] Stop requested for ");
+            print(&name);
+            print("\n");
+            halt_service(state, &name);
+        } else {
+            print("[herd] Cannot stop '");
+            print(&name);
+            print("': not enabled\n");
+        }
+    }
+
+    for name in starts {
+        let path = format!("{}/{}.start", HERD_CONTROL_DIR, name);
+        libakuma::unlink(&path);
+        match state.services.get(&name).map(|svc| svc.config.clone()) {
+            Some(config) => {
+                print("[herd] Start requested for ");
+                print(&name);
+                print("\n");
+                if let Some(svc) = state.services.get_mut(&name) {
+                    svc.restart_count = 0;
+                }
+                start_service(state, &name, &config);
+            }
+            None => {
+                print("[herd] Cannot start '");
+                print(&name);
+                print("': not enabled — run 'herd enable ");
+                print(&name);
+                print("' first\n");
+            }
+        }
     }
 }
 
@@ -1409,6 +1538,8 @@ fn print_usage() {
     print("  config <svc>   Show service configuration\n");
     print("  enable <svc>   Enable a service\n");
     print("  disable <svc>  Disable a service\n");
+    print("  start <svc>    Start an enabled service now (no reload wait)\n");
+    print("  stop <svc>     Stop a running service now, without disabling it\n");
     print("  log <svc>      Show service log\n");
     print("  help           Show this help\n");
     print("\n");
@@ -1575,6 +1706,51 @@ fn cmd_disable(name: &str) {
         print("'\n");
     } else {
         print("Error: Failed to delete ");
+        print(&path);
+        print("\n");
+    }
+}
+
+/// Drop a `<name>.start` marker in [`HERD_CONTROL_DIR`] for the running
+/// daemon to pick up on its next tick (~100ms). Unlike `herd enable`, this
+/// does not touch `/etc/herd/enabled/` — the service must already be enabled,
+/// since that's where its config comes from.
+fn cmd_start(name: &str) {
+    let enabled_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
+    if read_file_bytes(&enabled_path).is_none() {
+        print("Service '");
+        print(name);
+        print("' is not enabled. Run 'herd enable ");
+        print(name);
+        print("' first.\n");
+        return;
+    }
+
+    let path = format!("{}/{}.start", HERD_CONTROL_DIR, name);
+    if write_file(&path, b"") {
+        print("Start requested for '");
+        print(name);
+        print("'. Applied by the running daemon within ~100ms.\n");
+    } else {
+        print("Error: Failed to write control file at ");
+        print(&path);
+        print("\n");
+    }
+}
+
+/// Drop a `<name>.stop` marker in [`HERD_CONTROL_DIR`]. The service stays
+/// enabled (it will start again on the next reboot) — this only asks the
+/// running daemon to kill the process and stop restarting it until `herd
+/// start` or a reboot brings it back. Use `herd disable` to also remove it
+/// from `/etc/herd/enabled/`.
+fn cmd_stop(name: &str) {
+    let path = format!("{}/{}.stop", HERD_CONTROL_DIR, name);
+    if write_file(&path, b"") {
+        print("Stop requested for '");
+        print(name);
+        print("'. Applied by the running daemon within ~100ms.\n");
+    } else {
+        print("Error: Failed to write control file at ");
         print(&path);
         print("\n");
     }

@@ -112,6 +112,7 @@ fn execute_single_command(line: &str) {
         "free" => cmd_free(),
         "find" => cmd_find(&args),
         "grep" => cmd_grep(&args),
+        "reboot" => cmd_reboot(),
         "top" => execute_external(&args), // Use external top if available
         "dash" | "sh" => execute_external_reattach(&args),
         _ => execute_external(&args),
@@ -276,7 +277,7 @@ fn cmd_help() {
     println("Embedded utilities:");
     println("  ls, cat, cp, mv, rm, mkdir, rmdir, touch, echo");
     println("  pwd, cd, uname, uptime, sleep, clear, whoami");
-    println("  find, grep, pkg");
+    println("  find, grep, pkg, reboot");
     println("\nShell features:");
     println("  Pipelines:  cmd1 | cmd2");
     println("  Redirect:   cmd > file, cmd >> file");
@@ -420,6 +421,23 @@ fn cmd_sleep(args: &[String]) {
     if args.len() < 2 { return; }
     let sec: u64 = args[1].parse().unwrap_or(0);
     sleep(sec);
+}
+
+/// `reboot` — calls `reboot(2)` directly, with no external binary in the
+/// path. This is what makes it safe to rely on as the *last* recovery
+/// command: if `/bin/busybox` (or whatever `reboot`/`halt` normally shells
+/// out to) is missing or corrupted, this still works, because there is
+/// nothing here to exec — `libakuma::reboot()` is a raw syscall. paws is
+/// sshd's `emergency-paws` fallback shell (see `userspace/sshd/src/protocol.rs`),
+/// so this is also the reboot button available when the configured login
+/// shell itself can't be spawned.
+fn cmd_reboot() {
+    println("paws: rebooting...");
+    let rc = reboot();
+    // Only reachable on failure — a successful reboot(2) never returns.
+    print("paws: reboot failed, errno ");
+    print_dec((-rc) as usize);
+    println("");
 }
 
 /// `free` — total/used/free RAM straight from `sysinfo(2)` (syscall 179).

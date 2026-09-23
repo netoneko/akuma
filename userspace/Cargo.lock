@@ -50,6 +50,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-boot"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-cpu"
 version = "0.1.0"
 
@@ -557,6 +561,7 @@ dependencies = [
 name = "libakuma"
 version = "0.1.0"
 dependencies = [
+ "akuma-boot",
  "embedded-io-async 0.6.1",
  "talc",
 ]

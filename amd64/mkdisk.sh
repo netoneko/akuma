@@ -158,8 +158,13 @@ fi
 # sshd, WITHOUT `fork-sessions` (a default feature): this target has no `fork`,
 # so the cooperative single-process executor is the only one that runs. `akuma`
 # is kept — it is what pulls in `libakuma` and its `net-async` — but the default
-# set that also brings `fork-sessions` is dropped.
-if (cd userspace && cargo build -q -p sshd --no-default-features --features akuma \
+# set that also brings `fork-sessions` is dropped. `emergency-paws` is re-added
+# explicitly for the same reason `akuma` is: `--no-default-features` drops it
+# too, and this is the build most likely to need it — a `/bin/sh` link dropped
+# by a full `/bin` directory (see the `expand_dir` comment below) is exactly
+# what leaves a session with "failed to spawn '/bin/sh'" and nothing else to
+# try.
+if (cd userspace && cargo build -q -p sshd --no-default-features --features akuma,emergency-paws \
         --target x86_64-unknown-none --release 2>/dev/null); then
     SSHD=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name sshd -type f | head -1)
     # The **client**, from the same package's second `[[bin]]`. `cargo build -p
@@ -505,6 +510,11 @@ if [ -f "$BB" ]; then
     # (the ryzen guest's missing /bin/sh in LITTER_TRASHCAN_RYZEN_JOIN.md, and
     # again 2026-09-22: docs/archive/MIOT_MESH_ON_AKUMA.md). Two blocks is
     # room for the whole list plus everything staged into /bin after it.
+    # Since 2026-09-23, sshd's `emergency-paws` feature (on above) retries
+    # against `/bin/paws` when the configured shell can't be spawned at all —
+    # a safety net for exactly this failure mode recurring in some *new* way,
+    # not a reason to be less careful about `/bin` staging.
+    # See proposals/AMD64_SPAWN_PIPE_LEAK.md "Follow-up".
     "$DEBUGFS" -w -R "expand_dir /bin" "$IMG" >/dev/null 2>&1
     "$DEBUGFS" -w -R "expand_dir /bin" "$IMG" >/dev/null 2>&1
     for applet in \

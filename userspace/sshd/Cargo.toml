@@ -17,8 +17,24 @@ path = "src/client/main.rs"
 # `--no-default-features` drops libakuma so `cargo test --lib` can link against
 # a std host target — libakuma defines #[panic_handler] and #[global_allocator],
 # which collide with std's. See src/lib.rs.
-default = ["akuma", "fork-sessions"]
+default = ["akuma", "fork-sessions", "emergency-paws"]
 akuma = ["dep:libakuma"]
+
+# ON by default. If the configured shell (`sshd.conf`'s `shell`, default
+# busybox's `/bin/sh`) fails to spawn at all — missing binary, corrupted disk,
+# a bad `--shell` override — retry once against `/bin/paws`
+# (`userspace/paws`), Akuma's own minimal built-in shell, instead of dropping
+# the session straight to `fail_spawn`'s "no built-in shell to fall back to"
+# error. `paws` ships on every image `sshd` does, is 8 RO-mapped pages (vs
+# busybox's 265, `docs/reference/userspace-layout.md`), and carries its own
+# `reboot` builtin that needs no further exec — so a session that would
+# otherwise dead-end still gets a prompt to diagnose the real problem from, or
+# to reboot straight from. See `try_emergency_shell` in `src/protocol.rs`.
+#
+# Off only for a build that must guarantee it never runs anything but the
+# configured shell (a hardened image where "no shell" should mean "no
+# session", not "session on a different binary").
+emergency-paws = []
 
 # Serve each connection from its own forked process instead of as one future in
 # a single-process cooperative executor. Buys fault isolation (a panic aborts

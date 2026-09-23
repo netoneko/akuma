@@ -21,3 +21,9 @@ linux-abi = []
 [dependencies]
 talc = "4"
 embedded-io-async = { version = "0.6", default-features = false, optional = true }
+# `reboot(2)`'s magic/cmd constants — shared with both kernels' `sc-reboot`
+# decode (`crates/akuma-syscalls-glue/src/reboot.rs`, `amd64/src/reboot.rs`)
+# rather than a second hardcoded copy here. `default-features = false` drops
+# the `psci` feature (and its `akuma-psci` dependency, AArch64 `smc`/`hvc`
+# asm) — userspace only ever *issues* the syscall, never performs the reset.
+akuma-boot = { path = "../../crates/akuma-boot", default-features = false }

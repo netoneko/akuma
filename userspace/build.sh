@@ -136,9 +136,12 @@ build_member() {
         # the wrong trade — see docs/runbooks/build-extreme-size.md.
         #
         # --no-default-features drops `akuma` too, so re-add it: it is what
-        # links libakuma, and the binary cannot build without it.
+        # links libakuma, and the binary cannot build without it. Re-add
+        # `emergency-paws` as well — this is the extreme-size/memory-
+        # constrained profile, where a session that can't spawn its shell has
+        # the least other recovery available.
         echo "  (sshd: fork-sessions DISABLED via SSHD_FORK_SESSIONS=0 — cooperative executor)"
-        cargo build --release -p sshd --no-default-features --features akuma
+        cargo build --release -p sshd --no-default-features --features akuma,emergency-paws
     else
         cargo build --release -p "$m"
     fi

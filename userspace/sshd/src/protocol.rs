@@ -150,8 +150,10 @@ impl SshSession {
 /// interactive `shell` request). Spawns the configured shell with `-c <cmd>`
 /// and pumps it through the same `bridge_process` used for interactive
 /// sessions, so exit-on-child-exit / stdin-forwarding / stdout-draining
-/// behave identically. There is no built-in fallback — a spawn failure ends
-/// the session with an error message.
+/// behave identically. If the configured shell can't be spawned at all,
+/// [`try_emergency_shell`] retries against the built-in `paws` (see
+/// `emergency-paws` in `Cargo.toml`); only if that also fails does the
+/// session end with an error message ([`fail_spawn`]).
 /// The environment a session's child is spawned with, as `KEY=VALUE` strings.
 ///
 /// `TERM` only, and only for a client that asked for a pty — the same rule
@@ -192,11 +194,7 @@ async fn run_exec_session(
     // non-interactive `ssh host 'cmd'` must not have its output cooked.
     let env = session_env(session);
     let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
-    let res = if session.pty_requested {
-        spawn_pty(&shell_path, Some(&arg_refs), &env_refs)
-    } else {
-        spawn_with_env(&shell_path, Some(&arg_refs), None, &env_refs)
-    };
+    let res = spawn_shell(&shell_path, Some(&arg_refs), &env_refs, session.pty_requested);
     if let Some(res) = res {
         if session.pty_requested {
             set_terminal_size(
@@ -207,6 +205,25 @@ async fn run_exec_session(
         }
         return bridge_process(stream, session, res.pid, res.stdout_fd, session.pty_requested).await;
     }
+
+    // Same emergency fallback as the interactive path, with paws's own `-c`
+    // handling (not `shell_args` — those select an applet in the *configured*
+    // multicall shell, which has nothing to do with paws).
+    let emergency_args = ["-c", cmd_str];
+    if let Some((res, used_path)) =
+        try_emergency_shell(&shell_path, Some(&emergency_args), &env_refs, session.pty_requested)
+    {
+        if session.pty_requested {
+            set_terminal_size(
+                res.stdout_fd as i32,
+                session.term_width as u16,
+                session.term_height as u16,
+            );
+        }
+        println(&format!("[SSH] Spawned emergency shell: {}", used_path));
+        return bridge_process(stream, session, res.pid, res.stdout_fd, session.pty_requested).await;
+    }
+
     fail_spawn(stream, session, &shell_path, "exec").await
 }
 
@@ -243,8 +260,9 @@ fn build_banner() -> String {
     welcome
 }
 
-/// Interactive `shell` channel request. There is no built-in fallback shell
-/// — a spawn failure ends the session with an error message.
+/// Interactive `shell` channel request. A spawn failure retries against the
+/// built-in emergency shell ([`try_emergency_shell`]) before the session ends
+/// with an error message.
 async fn run_shell_session(
     stream: &mut SshStream,
     session: &mut SshSession,
@@ -276,11 +294,74 @@ async fn run_shell_session(
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
         return bridge_process(stream, session, res.pid, res.stdout_fd, true).await;
     }
+
+    // The configured shell couldn't be spawned at all — try the built-in
+    // emergency shell (paws) before giving up. No-op (returns None) with
+    // `emergency-paws` off, or when `shell_path` already was `/bin/paws`.
+    if let Some((res, used_path)) = try_emergency_shell(&shell_path, None, &env_refs, true) {
+        set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
+        println(&format!("[SSH] Spawned emergency shell: {}", used_path));
+        return bridge_process(stream, session, res.pid, res.stdout_fd, true).await;
+    }
+
     fail_spawn(stream, session, &shell_path, "shell").await
 }
 
+/// Spawn `path` as the session's shell, choosing the pty or plain-pipe path
+/// the same way `run_shell_session`/`run_exec_session` already did inline —
+/// factored out so [`try_emergency_shell`] can retry with a different path
+/// without duplicating the pty/no-pty branch.
+fn spawn_shell(path: &str, args: Option<&[&str]>, env_refs: &[&str], pty: bool) -> Option<SpawnResult> {
+    if pty {
+        spawn_pty(path, args, env_refs)
+    } else {
+        spawn_with_env(path, args, None, env_refs)
+    }
+}
+
+/// Emergency fallback for when the *configured* shell can't be spawned at
+/// all — a missing `/bin/sh`, a corrupted binary, a `--shell` override that
+/// points nowhere. Retries once against `/bin/paws`, Akuma's own minimal
+/// built-in shell (`docs/reference/userspace-layout.md`), so a session that
+/// would otherwise dead-end at `fail_spawn`'s "no built-in shell to fall back
+/// to" gets a working prompt instead — including `paws`'s `reboot` builtin,
+/// which needs no further exec if the disk really is the problem.
+///
+/// Gated on the `emergency-paws` feature (default on); skips the retry when
+/// the configured shell already *was* `/bin/paws`, since `spawn_shell` above
+/// already tried exactly that path and failed for the same reason a second
+/// attempt would.
+#[cfg(feature = "emergency-paws")]
+fn try_emergency_shell(
+    configured_shell: &str,
+    args: Option<&[&str]>,
+    env_refs: &[&str],
+    pty: bool,
+) -> Option<(SpawnResult, &'static str)> {
+    const EMERGENCY_SHELL: &str = "/bin/paws";
+    if configured_shell == EMERGENCY_SHELL {
+        return None;
+    }
+    eprintln(&format!(
+        "[SSH] '{}' failed to spawn — retrying with the built-in emergency shell {}",
+        configured_shell, EMERGENCY_SHELL
+    ));
+    spawn_shell(EMERGENCY_SHELL, args, env_refs, pty).map(|res| (res, EMERGENCY_SHELL))
+}
+
+#[cfg(not(feature = "emergency-paws"))]
+fn try_emergency_shell(
+    _configured_shell: &str,
+    _args: Option<&[&str]>,
+    _env_refs: &[&str],
+    _pty: bool,
+) -> Option<(SpawnResult, &'static str)> {
+    None
+}
+
 /// Report a shell-spawn failure to both the log and the client, then end the
-/// session cleanly (no built-in shell to fall back to).
+/// session cleanly. Reached only after [`try_emergency_shell`] has also
+/// failed (or is compiled out).
 async fn fail_spawn(
     stream: &mut SshStream,
     session: &mut SshSession,

@@ -219,6 +219,8 @@ pub mod syscall {
         /// has no handler for at all.
         pub const EXECVE: u64 = 221;
         pub const DUP3: u64 = 24;
+        /// asm-generic `reboot(2)`. See [`super::super::reboot`].
+        pub const REBOOT: u64 = 142;
     }
 
     /// The x86_64 numbering.
@@ -309,6 +311,11 @@ pub mod syscall {
         /// `--features linux-net` a build error on this target.
         pub const EXECVE: u64 = 59;
         pub const DUP3: u64 = 292;
+        /// Real x86_64 `reboot(2)` — **169**, not the asm-generic 142 (which is
+        /// `s390_pci_mmio_write`-adjacent territory on this arch, not reboot).
+        /// `amd64/src/usermode.rs` dispatches `Syscall::Reboot` straight to
+        /// `crate::reboot::sys_reboot`. See [`super::super::reboot`].
+        pub const REBOOT: u64 = 169;
     }
 }
 
@@ -2180,6 +2187,35 @@ pub const SIGTERM: u32 = 15;
 
 /// `SIGKILL` — uncatchable.
 pub const SIGKILL: u32 = 9;
+
+/// Request a whole-machine restart via `reboot(2)` — the same magic/cmd musl's
+/// `reboot()` wrapper sends. Both kernels decode it through the shared,
+/// host-tested `akuma_boot::decode` (`crates/akuma-syscalls-glue/src/reboot.rs`
+/// on AArch64, `amd64/src/reboot.rs` on x86_64), so this is the one call a
+/// userspace program needs — no `/bin/busybox reboot` or any other on-disk
+/// binary required, which is the point: it works even when nothing else on
+/// the disk can be exec'd. `paws`'s `reboot` builtin (`userspace/paws`) is the
+/// first caller — an emergency shell's reboot command that needs no working
+/// filesystem beyond the one it's already running from.
+///
+/// Only box 0 (the host, not a container) may reboot the machine; every other
+/// caller gets `-EPERM`.
+///
+/// Does not return on success — the kernel syncs every mounted filesystem and
+/// resets. A returned value always means the call failed: negate it for the
+/// errno (`EPERM` if this process isn't box 0; `EINVAL` should never happen,
+/// since the magic/cmd here are the exact ones the kernel's decoder accepts).
+pub fn reboot() -> i32 {
+    syscall(
+        syscall::REBOOT,
+        u64::from(akuma_boot::MAGIC1),
+        u64::from(akuma_boot::MAGIC2),
+        u64::from(akuma_boot::CMD_RESTART),
+        0,
+        0,
+        0,
+    ) as i32
+}
 
 /// Reattach I/O to a target process. `force` mirrors `screen -d`: if the
 /// target already has a live holder (a previous `reattach` caller that hasn't

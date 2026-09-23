@@ -4,9 +4,12 @@
 #   ubuild [member…]        default: paws httpd herd hget wall box
 #
 # `sshd` (and the `ssh` client from the same package) is built separately
-# because it needs --no-default-features --features akuma: `fork-sessions` is a
-# default feature and this target's sshd runs the single-process cooperative
-# executor. Mirrors amd64/mkdisk.sh, which is the source of truth for the flags.
+# because it needs --no-default-features --features akuma,emergency-paws:
+# `fork-sessions` is a default feature and this target's sshd runs the
+# single-process cooperative executor, but `emergency-paws` (the /bin/paws
+# fallback when the configured shell can't be spawned) is re-added — dropping
+# it here would silently disable it on the one target it matters most for.
+# Mirrors amd64/mkdisk.sh, which is the source of truth for the flags.
 #
 # Binaries land in $CARGO_TARGET_DIR (default /root/utarget). Installing one is
 # a cp onto /bin — the same mechanism scripts/install_kernel_amd64.sh uses for
@@ -26,4 +29,4 @@ fi
 cargo build --release --target x86_64-unknown-none --offline \
     -p paws -p httpd -p herd -p hget -p wall -p box
 exec cargo build --release --target x86_64-unknown-none --offline \
-    -p sshd --no-default-features --features akuma
+    -p sshd --no-default-features --features akuma,emergency-paws
