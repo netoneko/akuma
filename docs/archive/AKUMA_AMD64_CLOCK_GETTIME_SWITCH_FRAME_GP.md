@@ -1,6 +1,20 @@
 # Akuma/amd64: `#GP` in `sys_clock_gettime`, a corrupted switch frame on the console pump daemon's slot
 
-**Grade: C — active risk, STILL OPEN.** Root cause not confirmed; this is a
+> **Correction, 2026-09-23 — ROOT-CAUSED and FIXED, and not by any of the
+> three theories below.** A second capture the next night (a ring-0 `#PF` in
+> the CoW refcount BTree with `rflags` bit 10 — **`DF`** — set) showed the
+> hand-written trap entry stubs never cleared the direction flag, so any fault
+> delivered mid-`std; rep movsb` (musl's `memmove`) ran every kernel
+> `memcpy`/`memset` *backwards* into the previous allocation or frame. That is
+> exactly Theory C's geometry — the neighbour's *top* end scribbled while the
+> victim's base canary stays clean — with the writer it could not name. Fix,
+> tripwire, boot-suite check and A/B evidence:
+> [`AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`](AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md).
+> The rest of this document is the reconstruction as written; its symbol
+> decode and the "two cores, one stack" fragility it points at remain valid.
+
+**Grade: C — active risk, STILL OPEN** *(as of 2026-09-22; see the correction
+above)*. Root cause not confirmed; this is a
 forensic reconstruction from a single photographed console dump plus static
 analysis (disassembly, symbol resolution, source reading) against today's
 build. Nothing here has been reproduced yet. Picked up again 2026-09-22.
