@@ -8667,7 +8667,7 @@ fn test_orphan_reparented_to_init() {
     // `parent_pid` is not what decides reapability, and this kernel's fork does
     // not fill it in.)
     let before: alloc::vec::Vec<u32> = akuma_exec::process::children_of(1);
-    let args: &[&str] = &["sh", "-c", "/bin/busybox sleep 2 & exit 0"];
+    let args: &[&str] = &["sh", "-c", "/bin/busybox sleep 3 & /bin/busybox sleep 1; exit 0"];
     let (_t, shell_ch, shell_pid) =
         match process::spawn_process_with_channel("/bin/busybox", Some(args), None) {
             Ok(r) => r,

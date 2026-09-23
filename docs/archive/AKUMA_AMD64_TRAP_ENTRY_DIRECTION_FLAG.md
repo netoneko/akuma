@@ -215,11 +215,28 @@ service pids by `waitpid_status(pid)`.
 **Fix, both halves:**
 
 - Kernel (shared): `akuma_exec::process::reparent_children_to(dying, new_parent)`
-  moves the registry entries *and* the table rows; amd64's exit path calls it.
-  Host test `reparent_moves_registry_entries_so_the_new_parent_can_wait`
-  (an already-exited child moves too and is what init's next `wait4(-1)`
-  finds). AArch64 has **no** reparenting site at all — its orphans are the
-  same debt, unaddressed here.
+  moves the registry entries *and* the table rows. Called from amd64's exit
+  path (`spawn_record_exit`), from glue's `sys_exit_group` for every member of
+  the dying thread group (the AArch64 route — see below), and from the two
+  kill paths in `akuma-exec`'s `signal.rs`. Host test
+  `reparent_moves_registry_entries_so_the_new_parent_can_wait` (an
+  already-exited child moves too and is what init's next `wait4(-1)` finds).
+- **AArch64 had the same hole, later the same day.** It had no reparenting
+  site at all. Two things about where the call had to go: (1) `return_to_kernel`
+  is the wrong place — on the `exit_group` route `current_process_shared()` is
+  already gone when it runs, so a hook there never fired (three boot cycles to
+  learn that); the call sits in glue's `sys_exit_group`, right after the
+  child-channel notify. (2) `return_to_kernel`'s *fall-off/fault* routes keep
+  their existing policy of **killing** forked children (`[ORPHAN-KILL]`,
+  `kill_child_processes*`) — untouched, so a segfaulting parent's children still
+  die as before; only the normal `exit_group` route now reparents instead of
+  abandoning. Boot test `test_orphan_reparented_to_init`
+  (`src/process_tests.rs`): `sh -c 'sleep 3 & sleep 1; exit 0'`, then the
+  sleeper must be a registry child of 1 and reapable once it exits. It reads
+  the registry through the new `children_of(parent)`, not the table — the table
+  `parent_pid` is not what decides reapability. Boot suite: 312 PASSED, 0
+  FAILED (`MEMORY=2048 INSTANCE=5 cargo run --release`; below 2 GB HVF
+  asserts `(isv)` on an unrelated test, `docs/archive/QEMU_HVF_ISV_BUG.md`).
 - herd: `check_process_exits` now ends with a `wait_any()` (`wait4(-1,
   WNOHANG)`) sweep. A *service* pid that comes back from the sweep is routed
   through the normal exit handling, because a pid reaped once can never be
@@ -227,14 +244,17 @@ service pids by `waitpid_status(pid)`.
 
 **Evidence.** QEMU `-M microvm`, `SMP=4`, `init=/bin/herd`, both halves: an
 orphaned `sleep 1` and a `SIGTERM`ed `nc -l` both left `ps` within seconds,
-`zombies=0`, two `[herd] reaped 1 orphaned process(es)` lines, suite still
-`792 passed, 0 failed`. Deployed to the box the same night: kernel
-`70afa8c7…` at `/boot/akuma-amd64` (previous kept as `.prev`), herd
-`1b163b25…` at `/bin/herd` (previous as `/bin/herd.prev`); both take effect at
-the next reboot, which was left to the operator because kot was live.
+`zombies=0`, `[herd] reaped 2 orphaned process(es)` / `reaped 1 …` lines,
+suite still `792 passed, 0 failed`. Deployed to the box the same night, final
+binaries: kernel `192f6b4c…` at `/boot/akuma-amd64` (the 2026-09-22 kernel is
+`.prev`), herd `eb037539…` at `/bin/herd` (`/bin/herd.prev` kept); both take
+effect at the next reboot, left to the operator because kot was live.
 
-(`libakuma::print_dec` emits a stray NUL before the digits — `reaped \0 1` in
-the serial capture — pre-existing, not touched.)
+`libakuma::print_dec` used to emit a stray NUL before the digits (`reaped \0 1`
+in the first serial capture): its fill loop decremented one slot past the first
+digit and printed from there. Fixed the same night (fill from `buf.len()`,
+`i -= 1` before the store); the `reaped 2 orphaned process(es)` line above is
+the after.
 
 ## Rules this adds
 

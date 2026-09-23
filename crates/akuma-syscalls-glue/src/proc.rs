@@ -471,6 +471,19 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if tgid != pid {
             notify_child_channel_exited(tgid, code);
         }
+        // Children outliving the group go to init — in BOTH views of parenthood
+        // (`reparent_children_to`: the child-channel registry that `wait4(-1)`
+        // reads, and the table row). `fork` records the *forking thread's* pid
+        // as the parent, so every member of the group is a possible parent.
+        // Until 2026-09-23 nothing on this route reparented at all: an orphan
+        // kept its dead parent, init's `wait4(-1)` answered `ECHILD`, and it
+        // was a zombie for the life of the boot. It lives here and not in
+        // `return_to_kernel` because that function's own teardown never runs
+        // for this route — `current_process_shared()` is already gone by then.
+        // `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`.
+        for member in akuma_exec::process::collect_pids(|p| p.tgid == tgid) {
+            let _ = akuma_exec::process::reparent_children_to(member, 1);
+        }
         vfork_complete(pid);
 
         // Terminate the calling thread — exit_group() must never return to EL0.
