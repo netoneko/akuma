@@ -1930,6 +1930,11 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // SIGCHLD. Must run first so the guard sees the un-exited channel.
     if let Some(pid) = pid {
         publish_child_exit(pid, exit_code);
+        // Children outliving us go to init — in BOTH views of parenthood
+        // (`reparent_children_to`). Until 2026-09-23 this kernel had no
+        // reparenting at all, so an orphan's `wait4` owner stayed a dead pid
+        // and it was a zombie for the life of the boot.
+        let _ = reparent_children_to(pid, 1);
     }
 
     // Set exit code on ProcessChannel if registered for this thread
@@ -2224,6 +2229,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     // `has_exited` guard; covers the fault-exit fall-off-the-end path).
     if let Some(pid) = pid {
         publish_child_exit(pid, exit_code);
+        let _ = reparent_children_to(pid, 1); // see `return_to_kernel`
     }
 
     if let Some(channel) = remove_channel(tid) {

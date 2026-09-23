@@ -132,6 +132,8 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // a defensive `kill -9` on an already-reaped zombie does not overwrite the
     // real exit code or raise a duplicate SIGCHLD.
     crate::process::publish_child_exit(pid, -9);
+    // A killed parent's children go to init, in both views of parenthood.
+    let _ = crate::process::reparent_children_to(pid, 1);
 
     // Remove and notify the thread channel, terminate the thread.
     //
@@ -185,6 +187,7 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     // Notify the CHILD channel so the parent's wait4 unblocks, and raise
     // SIGCHLD (e.g. `kill -9 <child>` from a shell must wake its `wait`).
     crate::process::publish_child_exit(pid, exit_code);
+    let _ = crate::process::reparent_children_to(pid, 1);
 
     // Same staleness hazard as `kill_process` — see the comment there.
     if let Some(tid) = thread_id

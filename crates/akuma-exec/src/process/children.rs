@@ -232,6 +232,20 @@ pub fn has_children(parent_pid: Pid) -> bool {
     })
 }
 
+/// The registry's children of `parent_pid` — the set `wait4(-1)` from that
+/// parent draws on. Allocates one `Vec`; for tests and diagnostics, not for a
+/// hot path.
+pub fn children_of(parent_pid: Pid) -> Vec<Pid> {
+    with_irqs_disabled(|| {
+        CHILD_CHANNELS
+            .lock()
+            .iter()
+            .filter(|(_, (_, ppid))| *ppid == parent_pid)
+            .map(|(&pid, _)| pid)
+            .collect()
+    })
+}
+
 /// Hand every child of `dying` to `new_parent` — Linux's reparent-to-init at
 /// exit — in **both** places that answer "whose child is this": the process
 /// table's `parent_pid` (what `/proc/<pid>/status` shows) and this registry

@@ -422,6 +422,9 @@ pub fn run_all_tests() {
     // Test waitid WNOHANG with no children returns ECHILD
     test_waitid_stub();
 
+    // Orphans are reparented to init in both views of parenthood (2026-09-23)
+    test_orphan_reparented_to_init();
+
     // Test POSIX exec signal-reset invariant (signal_actions + sigaltstack cleared on exec)
     test_signal_reset_on_exec();
 
@@ -8643,6 +8646,106 @@ fn test_signal_ignore_preserved_on_exec() {
             "[Test] signal_ignore_preserved FAILED: SIG_IGN was not preserved after exec\n",
         );
     }
+}
+
+/// An orphan is reparented to init in **both** views of parenthood (2026-09-23).
+///
+/// `sh -c '/bin/busybox sleep 2 & exit 0'`: the shell forks a sleeper and exits
+/// first. Afterwards the sleeper's *registry* parent must be 1 — that is what
+/// `wait4(-1)` / `has_children` / `is_child_of_group` consult — and once it
+/// exits it must be reapable as init's child. Before the fix this kernel had no
+/// reparenting at all (amd64 rewrote only the table row), so the sleeper's
+/// owner stayed the dead shell and it was a zombie for the life of the boot.
+/// `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md` § "orphans were
+/// unreapable".
+fn test_orphan_reparented_to_init() {
+    if crate::fs::read_file("/bin/busybox").is_err() {
+        console::print("[Test] orphan reparented to init SKIPPED (no /bin/busybox)\n");
+        return;
+    }
+    // The registry view — what `wait4(-1)` from init draws on. (The table's
+    // `parent_pid` is not what decides reapability, and this kernel's fork does
+    // not fill it in.)
+    let before: alloc::vec::Vec<u32> = akuma_exec::process::children_of(1);
+    let args: &[&str] = &["sh", "-c", "/bin/busybox sleep 2 & exit 0"];
+    let (_t, shell_ch, shell_pid) =
+        match process::spawn_process_with_channel("/bin/busybox", Some(args), None) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::safe_print!(96, "[Test] orphan reparented to init SKIPPED (spawn failed: {})\n", e);
+                return;
+            }
+        };
+    // While the shell lives, catch its forked sleeper in the registry.
+    let mut seen_child: Option<u32> = None;
+    let t0 = crate::timer::uptime_us();
+    while !shell_ch.has_exited() {
+        if seen_child.is_none() {
+            seen_child = akuma_exec::process::children_of(shell_pid).first().copied();
+        }
+        if crate::timer::uptime_us().saturating_sub(t0) > 10_000_000 {
+            console::print("[Test] orphan reparented to init FAILED (shell did not exit in 10s)\n");
+            return;
+        }
+        akuma_exec::threading::yield_now();
+    }
+
+    // The sleeper is the one new registry child of init.
+    let mut orphan: Option<u32> = None;
+    let t1 = crate::timer::uptime_us();
+    while orphan.is_none() && crate::timer::uptime_us().saturating_sub(t1) < 3_000_000 {
+        for pid in akuma_exec::process::children_of(1) {
+            if pid != shell_pid && !before.contains(&pid) {
+                orphan = Some(pid);
+            }
+        }
+        akuma_exec::threading::yield_now();
+    }
+    let Some(orphan) = orphan else {
+        let seen_parent_now = seen_child.and_then(akuma_exec::process::parent_pid_of);
+        let seen_alive = seen_child.is_some_and(|p| process::lookup_process_shared(p).is_some());
+        crate::safe_print!(
+            160,
+            "[Test] orphan reparented to init FAILED (no new registry child of init; shell={} child_seen={:?} its_parent_now={:?} alive={} init_children={})\n",
+            shell_pid, seen_child, seen_parent_now, seen_alive, akuma_exec::process::children_of(1).len()
+        );
+        return;
+    };
+
+    // The registry view — what init's wait4(-1) reads.
+    let registry_parent = akuma_exec::process::parent_pid_of(orphan);
+    let waitable = akuma_exec::process::has_children(1)
+        && akuma_exec::process::is_child_of_group(orphan, 1)
+        && !akuma_exec::process::is_child_of_group(orphan, shell_pid);
+    if registry_parent != Some(1) || !waitable {
+        crate::safe_print!(
+            128,
+            "[Test] orphan reparented to init FAILED (pid {} registry parent {:?}, waitable={})\n",
+            orphan, registry_parent, waitable
+        );
+        return;
+    }
+
+    // Once it exits, init's wait4(-1) path must be able to reap it; do exactly
+    // what that path does so the slot does not stay a zombie for the suite.
+    let Some(och) = akuma_exec::process::get_child_channel(orphan) else {
+        console::print("[Test] orphan reparented to init FAILED (orphan has no child channel)\n");
+        return;
+    };
+    let t2 = crate::timer::uptime_us();
+    while !och.has_exited() {
+        if crate::timer::uptime_us().saturating_sub(t2) > 8_000_000 {
+            console::print("[Test] orphan reparented to init FAILED (sleeper did not exit in 8s)\n");
+            return;
+        }
+        akuma_exec::threading::yield_now();
+    }
+    for pid in [orphan, shell_pid] {
+        akuma_exec::process::clear_lazy_regions(pid);
+        let _ = akuma_exec::process::unregister_process(pid);
+        akuma_exec::process::reap_child_channel(pid);
+    }
+    console::print("[Test] orphan reparented to init PASSED\n");
 }
 
 /// Minimal waitid coverage check: confirms sys_waitid (syscall 95) is wired up.

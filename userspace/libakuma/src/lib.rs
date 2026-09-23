@@ -2920,22 +2920,23 @@ pub fn print_hex(val: usize) {
 /// Print a usize as decimal
 pub fn print_dec(val: usize) {
     const DEC_CHARS: &[u8; 10] = b"0123456789";
-    let mut buf = [0u8; 20];
+    let mut buf = [0u8; 20]; // usize::MAX is 20 digits
     let mut v = val;
-    let mut i = 19;
+    let mut i = buf.len();
 
     if v == 0 {
         print("0");
         return;
     }
 
-    while v > 0 {
+    // Fill from the right; `i` ends ON the first digit. The previous version
+    // decremented past it and printed `buf[i..]` from one slot too early, so
+    // every number went out with a leading NUL byte (`reaped \0 1` in a serial
+    // capture) — fixed 2026-09-23.
+    while v > 0 && i > 0 {
+        i -= 1;
         buf[i] = DEC_CHARS[v % 10];
         v /= 10;
-        if i == 0 {
-            break;
-        }
-        i -= 1;
     }
 
     if let Ok(s) = core::str::from_utf8(&buf[i..]) {
