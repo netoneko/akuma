@@ -181,34 +181,60 @@ with `.prev` = the 2026-09-22 kernel. Not yet promoted to `.good`.
   kernel, before this fix was installed; that event is unexplained and should
   be re-tried on the new kernel before being filed anywhere.
 
-## Found while checking process/socket cleanup on the new kernel (2026-09-23, open)
+## Found while checking process/socket cleanup on the new kernel (2026-09-23) — orphans were unreapable; FIXED
 
 Probed over ssh on the box after the deploy, with `busybox nc -l` as the
 victim. Sockets themselves clean up: a listener's row leaves `/proc/net/tcp`
-when its process dies (even by `SIGKILL`), a client blocked on it reads EOF,
-and re-binding the same port works every time. Two things do **not**:
+when its process dies, a client blocked on it reads EOF, and re-binding the
+same port works every time. What did not clean up was the **process**: every
+killed or orphaned process stayed in `ps` — 11 of them in state `Z`, `PPid: 1`,
+after one evening — each holding a task slot, and each stale row one more
+`[TRAMP-MISMATCH] tid=N THREAD_PID_MAP=… but table scan found <zombie pid>`
+line on the console.
 
-1. **`SIGTERM` does not terminate a process blocked in a TCP read.** `nc` with
-   a live client connected stayed in state `R` for seconds after `kill <pid>`;
-   `kill -9` ended it at once. A `sleep` and an idle listener (blocked in
-   `accept`) both died on `SIGTERM`, so this is the socket *read* wait
-   specifically (`amd64/src/sock.rs::recv` → `akuma_net::socket::socket_recv`
-   → `wait_until`, whose interrupt hook is `should_interrupt_blocking_syscall`).
-   `kill(2)` on this target goes through glue (`Syscall::Kill => to_glue`);
-   which side fails to mark or wake the parked reader was not run down. This is
-   the shape of "herd stops kot, kot's workers keep their sockets, the new kot
-   cannot serve" — herd sends `SIGTERM`.
-2. **Orphans reparented to pid 1 are never reaped.** herd reaps only its own
-   service pids (`waitpid_status(pid)`, `userspace/herd/src/main.rs:1169`),
-   never `waitpid(-1)`. Every grandchild that outlives its parent and then exits
-   sits in state `Z` with `PPid: 1` forever — 11 of them on the box after this
-   session's probes — each holding a task slot. `sched::finish()` recycling
-   (2026-09-06) does not apply to a zombie, so this is the slow road back to
-   `sh: can't fork`. Fix is userspace: a `waitpid(-1, WNOHANG)` sweep in herd's
-   loop (the kernel is right not to auto-reap init's children).
+**A false lead first, recorded because it cost two hours:** `nc` with a live
+client read `R` in `/proc/<pid>/stat` for seconds after `SIGTERM`, which looked
+like "the socket read ignores signals". It does not. The kernel log on the box
+had `[signal] pid=251 killed by signal 15 (default action)` for every one of
+them, and the strace-enabled QEMU guest showed the parked `accept` returning
+`EINTR` and the default action running. Under the BKL load kot generates the
+transition to `Z` simply lags a few seconds. (Two probe traps on the way:
+`[ -d /proc/<pid> ]` is true for **any** pid on this `/proc`, and
+`pkill -f`/`ps | grep` match the ssh session's own `sh -c` line and kill it.)
 
-A probe caveat that cost a round: **`[ -d /proc/<pid> ]` is true for any pid**
-on this kernel's `/proc` synthesis; test liveness with `cat /proc/<pid>/stat`.
+**The real defect — two views of parenthood.** On exit, amd64 reparents the
+dying process's children to pid 1 by rewriting `Process.parent_pid` in the
+table (`usermode.rs`). But `wait4(-1)`, `has_children`, `is_child_of_group`,
+`find_exited_child` and `raise_sigchld_for_parent` all read
+`akuma_exec::process::children`'s **child-channel registry**, which kept the
+dead parent. So init's `wait4(-1, WNOHANG)` asked `has_children(1)`, got
+"none", answered `ECHILD`, and no orphan on this target was ever reapable —
+not by herd, not by anyone. herd never tried anyway: it reaps only its own
+service pids by `waitpid_status(pid)`.
+
+**Fix, both halves:**
+
+- Kernel (shared): `akuma_exec::process::reparent_children_to(dying, new_parent)`
+  moves the registry entries *and* the table rows; amd64's exit path calls it.
+  Host test `reparent_moves_registry_entries_so_the_new_parent_can_wait`
+  (an already-exited child moves too and is what init's next `wait4(-1)`
+  finds). AArch64 has **no** reparenting site at all — its orphans are the
+  same debt, unaddressed here.
+- herd: `check_process_exits` now ends with a `wait_any()` (`wait4(-1,
+  WNOHANG)`) sweep. A *service* pid that comes back from the sweep is routed
+  through the normal exit handling, because a pid reaped once can never be
+  waited for again. Prints `[herd] reaped N orphaned process(es)`.
+
+**Evidence.** QEMU `-M microvm`, `SMP=4`, `init=/bin/herd`, both halves: an
+orphaned `sleep 1` and a `SIGTERM`ed `nc -l` both left `ps` within seconds,
+`zombies=0`, two `[herd] reaped 1 orphaned process(es)` lines, suite still
+`792 passed, 0 failed`. Deployed to the box the same night: kernel
+`70afa8c7…` at `/boot/akuma-amd64` (previous kept as `.prev`), herd
+`1b163b25…` at `/bin/herd` (previous as `/bin/herd.prev`); both take effect at
+the next reboot, which was left to the operator because kot was live.
+
+(`libakuma::print_dec` emits a stray NUL before the digits — `reaped \0 1` in
+the serial capture — pre-existing, not touched.)
 
 ## Rules this adds
 

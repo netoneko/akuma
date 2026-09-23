@@ -232,6 +232,45 @@ pub fn has_children(parent_pid: Pid) -> bool {
     })
 }
 
+/// Hand every child of `dying` to `new_parent` — Linux's reparent-to-init at
+/// exit — in **both** places that answer "whose child is this": the process
+/// table's `parent_pid` (what `/proc/<pid>/status` shows) and this registry
+/// (what `wait4(-1)`, [`has_children`], [`is_child_of_group`],
+/// [`find_exited_child`] and [`raise_sigchld_for_parent`] read).
+///
+/// Until 2026-09-23 the amd64 exit path rewrote only the table row. init's
+/// `wait4(-1, WNOHANG)` then asked `has_children(1)`, found nothing here,
+/// and answered `ECHILD` — so every orphan on that target was a zombie for the
+/// life of the boot, each holding a task slot: a service's workers after
+/// `herd disable`, a `nohup … &` whose ssh session ended, a pipeline whose
+/// shell left first. Eleven of them on the bare-metal box after one evening
+/// (`docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md` § "Found while
+/// checking process/socket cleanup"). Two views of parenthood is the bug; this
+/// is the one function that moves both. Returns how many registry entries
+/// moved. A child that has already exited moves too, and the new parent's
+/// next `wait4(-1)` finds it through [`find_exited_child`].
+pub fn reparent_children_to(dying: Pid, new_parent: Pid) -> usize {
+    let moved = with_irqs_disabled(|| {
+        let mut map = CHILD_CHANNELS.lock();
+        let mut n = 0usize;
+        for (_, ppid) in map.values_mut() {
+            if *ppid == dying {
+                *ppid = new_parent;
+                n += 1;
+            }
+        }
+        n
+    });
+    // Two passes rather than a mutation inside `for_each_process`, which hands
+    // out `&Process`. The `Vec` is empty for a process with no children — nearly
+    // all of them — and `Vec::new` does not allocate until something is pushed,
+    // so the common exit path stays allocation-free.
+    for orphan in crate::process::collect_pids(|p| p.parent_pid == dying) {
+        crate::process::with_process(orphan, |p| p.parent_pid = new_parent);
+    }
+    moved
+}
+
 /// Get channel for the current thread (used by syscall handlers)
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
     if let Some(proc) = current_process_shared() {
@@ -1745,6 +1784,45 @@ mod child_channel_drain_tests {
     #[test]
     fn is_child_of_group_unregistered_pid_is_not_a_child() {
         assert!(!is_child_of_group(0x7000_0041, 0x7000_0042));
+    }
+
+    #[test]
+    fn reparent_moves_registry_entries_so_the_new_parent_can_wait() {
+        // The amd64 orphan-zombie bug: reparenting rewrote only the process
+        // table, so init's `wait4(-1)` — which reads THIS registry — answered
+        // ECHILD and orphans were never reapable.
+        let dying: Pid = 0x7000_0051;
+        let init: Pid = 0x7000_0052;
+        let live: Pid = 0x7000_0053;
+        let dead: Pid = 0x7000_0054;
+        let unrelated: Pid = 0x7000_0055;
+        let other_parent: Pid = 0x7000_0056;
+
+        register_child_channel(live, Arc::new(ProcessChannel::new()), dying);
+        let dead_ch = Arc::new(ProcessChannel::new());
+        dead_ch.set_exited(3); // already a zombie when its parent dies
+        register_child_channel(dead, dead_ch, dying);
+        register_child_channel(unrelated, Arc::new(ProcessChannel::new()), other_parent);
+
+        assert!(!has_children(init), "precondition: init has no children yet");
+        assert_eq!(reparent_children_to(dying, init), 2, "both of the dying parent's children move");
+
+        assert!(has_children(init), "init now has children to wait for");
+        assert!(!has_children(dying), "the dead parent has none left");
+        assert!(is_child_of_group(live, init), "wait4(<live>) from init is permitted");
+        assert!(!is_child_of_group(live, dying), "and no longer from the dead parent");
+        assert_eq!(parent_pid_of(dead), Some(init));
+        assert_eq!(parent_pid_of(unrelated), Some(other_parent), "other parents' children untouched");
+        // The already-exited child is what init's next wait4(-1) reaps.
+        let (found, ch) = find_exited_child(init).expect("the zombie is findable by init");
+        assert_eq!(found, dead);
+        assert_eq!(ch.exit_code(), 3);
+        // Reparenting an idempotent second time moves nothing.
+        assert_eq!(reparent_children_to(dying, init), 0);
+
+        remove_child_channel(live);
+        remove_child_channel(dead);
+        remove_child_channel(unrelated);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use alloc::vec::Vec;
 
 use libakuma::{
     print, exit, open, read_fd, write_fd, close, fstat, lseek,
-    open_flags, seek_mode, spawn, spawn_with_env, kill_signal, waitpid_status, read_dir, uptime,
-    sleep_ms, mkdir_p, SpawnResult, SIGTERM,
+    open_flags, seek_mode, spawn, spawn_with_env, kill_signal, waitpid_status, wait_any, read_dir,
+    uptime, sleep_ms, mkdir_p, SpawnResult, SIGTERM,
 };
 
 use boxlib::json;
@@ -1174,6 +1174,40 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
                 }
             }
         }
+    }
+
+    // Orphans. herd is pid 1, so every process whose parent died is
+    // reparented to it — a service's worker children after `herd disable`
+    // killed the service, a `nohup … &` from an ssh session that ended, a
+    // pipeline whose shell left first. The targeted waits above never ask
+    // about those, so each one sat in `Z` forever holding a task slot: 11 of
+    // them on the bare-metal box after one evening of probes
+    // (`docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md` § "Found while
+    // checking process/socket cleanup"), and every stale row is one more
+    // `[TRAMP-MISMATCH]` line. init reaps; the kernel is right not to do it
+    // for us. `wait4(-1, WNOHANG)` until it has nothing left.
+    //
+    // A *service* pid can come back from this sweep too, if it exited between
+    // its targeted wait and here. Route it through the same exit handling: a
+    // pid reaped once can never be waited for again, so dropping it would leave
+    // the service marked Running with a pid that no longer exists.
+    let mut orphans = 0usize;
+    while let Some(status) = wait_any() {
+        let owner = state.services.iter()
+            .find(|(_, svc)| svc.state == ServiceState::Running && svc.pid == Some(status.pid))
+            .map(|(name, _)| name.clone());
+        match owner {
+            Some(name) => {
+                let how = Exit { signaled: status.signaled(), exit_code: status.exit_code() };
+                exited.push((name, how, status.shell_code()));
+            }
+            None => orphans += 1,
+        }
+    }
+    if orphans > 0 {
+        print("[herd] reaped ");
+        print_dec(orphans);
+        print(" orphaned process(es)\n");
     }
 
     for (name, how, reported_code) in exited {

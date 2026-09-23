@@ -5345,19 +5345,13 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
             p.exited.store(true, core::sync::atomic::Ordering::Release);
         });
         // Reparent this process's children onto init, the way Linux does at
-        // exit — on the same table that answers the wait, so a child cannot be
-        // reparented in one view and orphaned in the other.
-        //
-        // Two passes rather than a mutation inside `for_each_process`, which
-        // hands out `&Process`: writing through that reference would need a
-        // const-to-mut cast, and `with_process` is the accessor that exists so
-        // it does not have to be. The `Vec` is empty for a process with no
-        // children — which is nearly all of them — and `Vec::new` does not
-        // allocate until something is pushed, so the common exit path stays
-        // allocation-free.
-        for orphan in akuma_exec::process::collect_pids(|p| p.parent_pid == dying) {
-            akuma_exec::process::with_process(orphan, |p| p.parent_pid = 1);
-        }
+        // exit — in BOTH views of parenthood. This used to rewrite only the
+        // table row's `parent_pid`, while `wait4(-1)` / `has_children` /
+        // `is_child_of_group` read the child-channel registry, which kept the
+        // dead parent: init's `wait4(-1, WNOHANG)` answered `ECHILD`, and every
+        // orphan on this target was a zombie until reboot (2026-09-23,
+        // `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`).
+        let _ = akuma_exec::process::reparent_children_to(dying, 1);
     }
     // Outside the `unsafe` block and after the status is recorded, both
     // deliberately: a woken parent re-runs its wait immediately, and it must
