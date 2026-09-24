@@ -503,6 +503,54 @@ that binds, silently, on the only workload that notices.
    `/bin/herd` `084ee1a1…`; the pre-fix files stay as `.prev`. After the
    reboot herd sat at ~99 syscalls/s with `pgfault=0`, sleeping and reloading
    every 20 s; kot started once, replayed, and followed the mesh's leader.
+7. **`herd stop` stops nothing on amd64, and a SIGTERM'd kot never finishes
+   exiting — found 2026-09-24 on the metal, neither fixed.** Found while
+   restarting kot (akuma-miot's mesh node) to pick up a new `kot.conf`: four
+   `env =` lines giving its Bash tool the toolchain
+   (`PATH=/usr/local/bin:/usr/local/rust/bin:/usr/bin:/bin`,
+   `LD_LIBRARY_PATH=/usr/local/rust/lib:/usr/lib:/lib`, `HOME=/root`,
+   `CARGO_HOME=/root/.cargo` — what `scripts/box/akuma-dev.env` sets for
+   `kbuild`; an Akuma process inherits only what its spawner passes, and
+   `/etc/profile` is login-shell-only). On herd `084ee1a1…`, kernel
+   `a4e462e2…`.
+
+   - **The private kill syscall is a stub.** `herd stop kot` did everything
+     right on herd's side — the control file landed, the daemon logged
+     `[herd] Stop requested for kot` within its ~100 ms tick, called
+     `kill_signal(pid, SIGTERM)`, marked the service `Halted` and dropped the
+     pid. kot kept running (port 9944 still answered 4 s later, `/proc/20/stat`
+     `R`, no `[signal]` line). libakuma's `kill_signal` issues Akuma-private
+     `KILL` (`0x1000 + 302`) on x86_64, and amd64 dispatches that as
+     `302 => 0` (`amd64/src/usermode.rs`) — "accepted as a no-op success"
+     because sshd sends SIGHUP/SIGTERM to a session shell at teardown and,
+     when that was written, "there is nothing here to deliver a signal to".
+     There is now: Linux `kill` (x86_64 62, what busybox `kill` uses) delivers.
+     Consequence: **`herd stop` and `herd disable` have never stopped a service
+     on amd64** — herd forgets the pid and the process runs on unsupervised,
+     and a following `herd start` would launch a second copy beside it (for
+     kot: same port, same ParityDB directory). Fix: dispatch 302 through the
+     same path as 62 — which also makes sshd's teardown SIGHUP real, the Linux
+     behaviour, so check a session's children after.
+   - **A SIGTERM'd kot never finished exiting.** With herd's stop a no-op,
+     `busybox kill -TERM 20` from ssh: the kernel logged
+     `[signal] pid=20 killed by signal 15 (default action)` (and pid 22, a
+     tokio worker), port 9944 closed, and `[PSTATS]` stopped listing pid 20
+     (its `exited` flag is set). But **two minutes later** `/proc/20/stat`
+     still read `R`, `ps` still listed it (CPU time back to `0:00`, every
+     worker row gone), and herd's orphan sweep never reaped it — so its channel
+     was never marked exited either. Not yet investigated; the likeliest spot
+     is `run_process`'s epilogue, parked in `thread::drain` on a thread that
+     did not take the signal. The `README.md` symptom row's "the `Z`
+     transition lags under BKL load" does not cover minutes.
+     **Why it matters beyond the zombie:** kot's store is ParityDB over
+     writable `MAP_SHARED` mappings, which this kernel writes back at
+     teardown. Starting a new kot while the old one's teardown is still
+     pending risks the old write-back landing on files the new one has
+     written since — so it was **not** restarted; the box was rebooted
+     instead. Repro candidate for the Firecracker rig (`/root/leakrepro` on
+     the box's Ubuntu): a multi-threaded service parked in `epoll_pwait` /
+     `accept` (kot's shape), SIGTERM it, watch whether its row ever becomes
+     `Z` and whether init can reap it.
 
 ---
 
