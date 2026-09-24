@@ -22,6 +22,8 @@ CLI:  python3 scripts/utils/hpbox.py which        # 'ubuntu' | 'akuma' | 'unknow
       python3 scripts/utils/hpbox.py ramdisk [GiB]  # target/ on tmpfs (rotational root)
       python3 scripts/utils/hpbox.py ramdisk-sync   # copy tmpfs target/ back to disk
       python3 scripts/utils/hpbox.py rz  '<cmd>'  # run on the Ryzen laptop
+      python3 scripts/utils/hpbox.py --ip 192.168.1.120 which  # DHCP moved it
+      HPBOX_IP=192.168.1.120 python3 scripts/utils/hpbox.py ...  # same, via env
 
 A second, unrelated machine lives in this module too: the **Ryzen laptop**
 (`pop-os`, AMD Ryzen 7 8845HS, Pop!_OS) — the host `crates/akuma-ryzen-amd64`
@@ -34,22 +36,47 @@ so re-resolve by hostname if the address ever stops answering rather than
 assuming the box moved.
 """
 
+import os
 import subprocess
 import sys
 import time
 
-IP = "192.168.1.123"
+# The usual address, NOT a guarantee. DHCP normally hands both personalities
+# .123, but on 2026-09-24 Ubuntu came up at .120 (`vaporwave.lan`) and every
+# call here reported the box "Host is down" while it was up and answering.
+# Override with `HPBOX_IP=<addr>` or `--ip <addr>` (CLI), or `set_ip()` when
+# imported. `arp -a | grep vaporwave` finds Ubuntu's current lease.
+DEFAULT_IP = "192.168.1.123"
+IP = os.environ.get("HPBOX_IP") or DEFAULT_IP
 SSH_KEY = "target/x86_64-unknown-none/release/amd64-ssh-test-key"
 
-# Ubuntu: ignore ~/.ssh/config entirely, port 22.
-UB = [
-    "ssh", "-F", "/dev/null",
-    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
-    "-p", "22", f"root@{IP}",
-]
-# Akuma: the config alias already carries port, user, key and no host checking.
-AK = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "akuma"]
+UB = []
+AK = []
+
+
+def set_ip(ip):
+    """Point both personalities at `ip`. Rebuilds `UB` and `AK` in place of the
+    module globals every helper reads at call time, so it works after import."""
+    global IP, UB, AK
+    IP = ip
+    # Ubuntu: ignore ~/.ssh/config entirely, port 22.
+    UB = [
+        "ssh", "-F", "/dev/null",
+        "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
+        "-p", "22", f"root@{IP}",
+    ]
+    # Akuma: the config alias already carries port, user, key and no host
+    # checking. Its HostName is only replaced when overridden — a command-line
+    # `-o HostName=` wins over the alias's, and the rest of the alias still
+    # applies.
+    AK = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20"]
+    if IP != DEFAULT_IP:
+        AK += ["-o", f"HostName={IP}"]
+    AK += ["akuma"]
+
+
+set_ip(IP)
 
 # The Ryzen laptop: one machine, one OS, the ordinary laptop user account.
 RYZEN_HOST = "192.168.1.126"
@@ -748,6 +775,9 @@ def reboot_to(system, budget_s=360):
 
 
 def _main(argv):
+    if len(argv) >= 2 and argv[0] == "--ip":
+        set_ip(argv[1])
+        argv = argv[2:]
     if not argv:
         print(__doc__)
         return 2
