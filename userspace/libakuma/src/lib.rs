@@ -3,7 +3,7 @@
 //! Provides syscall wrappers and runtime support for user programs.
 
 #![no_std]
-#![feature(alloc_error_handler)]
+#![cfg_attr(not(feature = "host-test"), feature(alloc_error_handler))]
 #![deny(warnings)]
 
 extern crate alloc;
@@ -14,7 +14,9 @@ pub mod net;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(target_arch = "aarch64")]
+// Not under `host-test` (see Cargo.toml): a program's unit tests are linked by
+// std, which brings its own entry, and `.section` here is ELF syntax.
+#[cfg(all(target_arch = "aarch64", not(feature = "host-test")))]
 core::arch::global_asm!(
     r#"
     .section .text._start
@@ -41,7 +43,7 @@ core::arch::global_asm!(
 // * `call` pushes a return address, so `libakuma_init` cannot be branched to and
 //   fallen through from — which the aarch64 arm gets away with because `bl`
 //   writes `x30` rather than memory.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "host-test")))]
 core::arch::global_asm!(
     r#"
     .section .text._start
@@ -2678,6 +2680,9 @@ pub fn read_dir(path: &str) -> Option<ReadDir> {
 // fixed: nothing sets the constant to `false`, so there was no live use case
 // to preserve. See `docs/archive/LIBAKUMA_AUDIT.md` item 13.
 
+// Unregistered under `host-test` (std's allocator serves a host test binary),
+// so the whole module is dead there — and this crate denies warnings.
+#[cfg_attr(feature = "host-test", allow(dead_code))]
 mod allocator {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ptr;
@@ -2849,7 +2854,9 @@ mod allocator {
         }
     }
 
-    #[global_allocator]
+    // Under `host-test` std's allocator serves the test binary; this one would
+    // issue Akuma `mmap` syscalls to the host kernel.
+    #[cfg_attr(not(feature = "host-test"), global_allocator)]
     pub static ALLOCATOR: HybridAllocator = HybridAllocator::new();
 
     pub fn total_allocated_bytes() -> usize {
@@ -2889,7 +2896,9 @@ pub fn allocation_count() -> usize {
     allocator::alloc_count()
 }
 
-/// Custom allocation error handler - prints stats and exits
+/// Custom allocation error handler - prints stats and exits (std's, under
+/// `host-test`).
+#[cfg(not(feature = "host-test"))]
 #[alloc_error_handler]
 fn alloc_error(_layout: core::alloc::Layout) -> ! {
     // Print OOM message and memory stats using stack-based formatting
@@ -2980,7 +2989,8 @@ pub fn print_dec(val: usize) {
     }
 }
 
-/// Panic handler for user programs
+/// Panic handler for user programs (std's, under `host-test`).
+#[cfg(not(feature = "host-test"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     eprint("PANIC!\n");

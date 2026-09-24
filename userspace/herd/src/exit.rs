@@ -62,7 +62,10 @@ pub enum Outcome {
     Restart,
     /// The retry ceiling is spent.
     Failed,
-    /// Nothing more to do. `start_stopped_services` may revive it later.
+    /// Nothing more to do: the service stays down (herd's `Exited` state) until
+    /// `herd start` or a reboot. It must **not** land in the "not started yet"
+    /// state, which `start_stopped_services` revives on the next pass — that
+    /// was a no-delay restart loop for every clean or `restart = false` exit.
     Stopped,
 }
 

@@ -461,28 +461,48 @@ that binds, silently, on the only workload that notices.
    | G | old | fixed | 391,448 → 390,910 | 17 | 5 |
    | H (silent svc + orphans) | fixed | fixed | 390,942 → 374,509 | 0 | 5 (was 0) |
 
-   Installed on the metal's `sdb1` the same day (`/boot/akuma-amd64` md5
-   `e3a301b8…`, `/bin/herd` `6a85a1d0…`; the pre-fix files are `.prev`), **not
-   yet booted there**. `uname` still says `8b4decf2`: the fix was uncommitted
-   when built, so identify it by md5.
+   **Two more bugs the same rig found — both FIXED the same day:**
 
-   **Still open, found by the same rig:**
-
-   - **Orphans of a dead *thread* are never reparented** (run H: ~64 MB/min
-     gone with herd's own `pgfault` at 0, and herd never once prints
+   - **Orphans of a dead *thread* were never reparented** (run H: ~64 MB/min
+     gone with herd's own `pgfault` at 0, and herd never once printed
      `reaped`). On Akuma every thread has its own pid, and a child spawned from
      a worker thread records *that* pid as its parent — the metal's leftover
      zombie was `sh` with `PPid: 23`, a kot tokio worker. amd64's exit path
-     (`usermode.rs`, `reparent_children_to(dying, 1)`) moves only `dying`'s
-     own children; glue's `exit_group` path walks every member of the group.
-     A slow leak, not a fast one, but unbounded.
-   - **herd revives `restart = false` services anyway.** Observed in the same
-     rig: a service exiting 7 was started again 72 times in 110 s on the old
-     herd. With herd no longer parked in `read` it is much worse — a
-     `restart = false` one-shot (`busybox seq`, exit 0) ran **~700 times in
-     85 s** in runs E–G. Not a leak (memory flat), but a real misbehaviour.
-     Likely cause, not yet confirmed: the exit lands in `Stopped`, and
-     `start_stopped_services` starts every `Stopped` service.
+     moved only the leader's children (`spawn_record_exit`'s
+     `reparent_children_to(dying, 1)`); glue's `exit_group` path already walked
+     the group. **Fix:** `run_process` captures every pid with the dying
+     process's `tgid` *before* `thread::drain` retires them, and reparents each
+     one's children after `spawn_record_exit`; `kill_process` /
+     `kill_process_with_signal` (`akuma-exec`) do the same through the new
+     `reparent_group_children_to`.
+   - **herd revived `restart = false` services anyway**: an exit that is not a
+     scheduled restart (clean, or `restart = false`) landed in `Stopped`, which
+     means "not started yet", and `start_stopped_services` launched it on the
+     next pass with no delay — a service exiting 7 re-ran 72 times in 110 s,
+     and a one-shot `busybox seq` ran ~700 times in 85 s once herd stopped
+     parking. **Fix:** a new `ServiceState::Exited` — stays down until `herd
+     start` or a reboot, preserved across the 20 s reload.
+
+   | run | kernel | herd | orphans reaped | pmm free, 29 s → 89 s | notes |
+   |---|---|---|---|---|---|
+   | E2 (burst) | all fixes | all fixes | — | 391,445 → 391,429 | `burst` ran **once**, then "stays down" |
+   | H2 (orphans, restart=true) | all fixes | all fixes | **24 of 25** | 390,940 → 390,162 | flat |
+   | K (control) | first fix only | all fixes | 0 | 390,941 → 382,083 | ~35 MB/min, the orphan leak |
+
+   **herd's own logic is host-testable now.** libakuma grew a `host-test`
+   feature dropping the four items that cannot link against std (`_start`
+   `global_asm!` — ELF `.section`, which Mach-O rejects — `#[global_allocator]`,
+   `#[panic_handler]`, `#[alloc_error_handler]`), enabled only as herd's
+   dev-dependency (resolver 2 keeps it out of the shipped binary; the built
+   ELF still enters at `mov rdi, rsp; and rsp, -16`). The sweep, the stdout
+   drain and the exit-state mapping are pure functions with 9 tests:
+   `cargo test --bin herd --target <host triple>`.
+
+   **Deployed and validated on the metal**, same day: `/boot/akuma-amd64` md5
+   `a4e462e2…` (`uname`: `2a9b2aef-release-smp-shared`, an uncommitted tree),
+   `/bin/herd` `084ee1a1…`; the pre-fix files stay as `.prev`. After the
+   reboot herd sat at ~99 syscalls/s with `pgfault=0`, sleeping and reloading
+   every 20 s; kot started once, replayed, and followed the mesh's leader.
 
 ---
 

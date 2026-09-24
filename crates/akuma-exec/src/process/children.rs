@@ -308,6 +308,26 @@ pub fn reparent_children_to(dying: Pid, new_parent: Pid) -> usize {
     moved
 }
 
+/// [`reparent_children_to`] for a whole thread group, when `pid` is its leader.
+///
+/// Every thread has a pid of its own, and a child records the *spawning
+/// thread's* pid as its parent, so a dying multi-threaded process's children
+/// are spread across its members. Reparenting only the leader's left the rest
+/// as zombies with a dead thread for a parent — nobody could `wait` for them
+/// (found 2026-09-24 on amd64 with kot's tokio workers). A non-leader `pid`
+/// moves only its own children: the group, and its other threads, live on.
+pub fn reparent_group_children_to(pid: Pid, new_parent: Pid) -> usize {
+    let tgid = find_process(|p| if p.pid == pid { Some(p.tgid) } else { None }).unwrap_or(pid);
+    if tgid != pid {
+        return reparent_children_to(pid, new_parent);
+    }
+    let mut members = crate::process::collect_pids(|p| p.tgid == tgid);
+    if !members.contains(&pid) {
+        members.push(pid);
+    }
+    members.into_iter().map(|m| reparent_children_to(m, new_parent)).sum()
+}
+
 /// Get channel for the current thread (used by syscall handlers)
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
     if let Some(proc) = current_process_shared() {

@@ -17,6 +17,16 @@ net-async = ["dep:embedded-io-async"]
 # a standard Linux target (e.g. aarch64-unknown-linux-musl) to avoid a segfault
 # on the unmapped low page. Currently gates: getpid() → syscall 172.
 linux-abi = []
+# Let a program's own unit tests link libakuma on a std host. Drops exactly the
+# four items that make that impossible: the `_start` entry (ELF `.section`
+# syntax, which a Mach-O assembler rejects outright), `#[global_allocator]`
+# (backed by Akuma's mmap — a host test would issue raw syscalls), and
+# `#[panic_handler]` / `#[alloc_error_handler]` (both collide with std's). Everything else still compiles, so
+# the program's pure logic is testable; **calling** a syscall wrapper from a
+# test is still wrong — on a host it is a real syscall with an Akuma number.
+# Enable it only from `[dev-dependencies]` (resolver 2 keeps dev-only features
+# out of the shipped binary): see `userspace/herd/Cargo.toml`.
+host-test = []
 
 [dependencies]
 talc = "4"

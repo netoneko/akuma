@@ -3425,6 +3425,20 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // `waitpid` never observes the child as reaped while its fds are still
     // charged against the shared table.
     let exit_fds = current_process().map(|p| p.fds.clone());
+    // Every pid in this thread group, captured **before** `thread::drain` can
+    // retire the threads' rows. Each thread has a pid of its own here, and a
+    // child records the *spawning thread's* pid as its parent — so a
+    // multi-threaded process's children are mostly its workers' children
+    // (kot's tokio workers running `sh -c`), and `spawn_record_exit`'s
+    // `reparent_children_to(dying, 1)` covers only the leader's. Without this
+    // every such child outlived its process as an orphan nobody could `wait`
+    // for: a zombie with `PPid` of a dead thread for the life of the boot
+    // (2026-09-24, `docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6
+    // item 6). Glue's `sys_exit_group` walks the group the same way.
+    let group_members: Vec<u32> = current_process().map_or_else(Vec::new, |p| {
+        let tgid = p.tgid;
+        akuma_exec::process::collect_pids(|q| q.tgid == tgid)
+    });
     // Every thread of this process, gone, before anything downstream can reap.
     // `sys_waitpid` retires the `Process` — and with it the page tables, which
     // the reclaim then frees — once this task is `Finished`, so a sibling still
@@ -3437,6 +3451,9 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     }
     if idx >= SPAWN_SLOT_BASE {
         spawn_record_exit(idx, status as i32);
+    }
+    for member in group_members {
+        let _ = akuma_exec::process::reparent_children_to(member, 1);
     }
     // Drop this task's entry in the **per-thread** channel registry, the way
     // the AArch64 exit epilogue does (`process/mod.rs`'s `remove_channel(tid)`

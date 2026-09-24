@@ -3,8 +3,11 @@
 //! A process supervisor that manages background services.
 //! Named "herd" because herding cats is an apt metaphor for managing processes.
 
-#![no_std]
-#![no_main]
+// std and the test harness's own entry under `cargo test --bin herd`; see the
+// `[dev-dependencies]` note in Cargo.toml.
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(test, allow(dead_code))]
 
 extern crate alloc;
 
@@ -146,6 +149,33 @@ enum ServiceState {
     /// state) brings it back. Config reload does not clear it: a service disabled
     /// via `herd stop` should not come back just because the 20s reload ran.
     Halted,
+    /// Ran, exited, and its policy says not to restart it — a clean exit, or any
+    /// exit with `restart = false` ([`Outcome::Stopped`]). Stays down until
+    /// `herd start <svc>` or a reboot; a config reload preserves it.
+    ///
+    /// This used to land in `Stopped`, which means "not started yet", so
+    /// `start_stopped_services` launched it again on the very next pass with no
+    /// delay at all: a `restart = false` one-shot ran ~700 times in 85 s
+    /// (2026-09-24, `docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 6).
+    Exited,
+}
+
+impl ServiceState {
+    /// The state an exit's [`Outcome`] puts a service in.
+    const fn after(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Completed => Self::Completed,
+            Outcome::Restart => Self::PendingRestart,
+            Outcome::Failed => Self::Failed,
+            Outcome::Stopped => Self::Exited,
+        }
+    }
+
+    /// Whether [`start_stopped_services`] launches a service in this state on
+    /// its next pass — "not started yet", and nothing else.
+    const fn started_by_start_pass(self) -> bool {
+        matches!(self, Self::Stopped)
+    }
 }
 
 // ============================================================================
@@ -389,7 +419,7 @@ impl HerdState {
 // Entry Point
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub extern "C" fn main() {
     // Ensure required directories exist
     ensure_directories();
@@ -746,7 +776,7 @@ fn start_stopped_services(state: &mut HerdState, now_ms: u64) {
     // time we see the service so a 0-delay service still starts immediately.
     let mut to_start: Vec<(String, ServiceConfig)> = Vec::new();
     for (name, svc) in state.services.iter_mut() {
-        if svc.state != ServiceState::Stopped {
+        if !svc.state.started_by_start_pass() {
             continue;
         }
         if svc.config.start_delay_ms > 0 {
@@ -1285,22 +1315,29 @@ fn nonblocking_stdout(fd: u32) -> u32 {
 /// service that writes faster than herd reads must not keep it in this loop.
 const MAX_READS_PER_PASS: usize = 64;
 
+/// Everything `read` has buffered, until EAGAIN (< 0) or EOF (0), at most
+/// [`MAX_READS_PER_PASS`] reads. The fd is non-blocking, so an empty channel
+/// costs one syscall rather than parking herd. `read` is `read_fd` in herd and
+/// a fake in the tests.
+fn drain_readable(mut read: impl FnMut(&mut [u8]) -> isize) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    for _ in 0..MAX_READS_PER_PASS {
+        let n = read(&mut buf);
+        if n <= 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n as usize]);
+    }
+    data
+}
+
 fn poll_all_stdout(state: &mut HerdState) {
     let mut outputs: Vec<(String, Vec<u8>)> = Vec::new();
 
     for (name, svc) in state.services.iter() {
         if let Some(fd) = svc.stdout_fd {
-            // Until EAGAIN (< 0) or EOF (0): the fd is non-blocking, so an empty
-            // channel costs one syscall rather than parking herd.
-            let mut data = Vec::new();
-            let mut buf = [0u8; 4096];
-            for _ in 0..MAX_READS_PER_PASS {
-                let n = read_fd(fd as i32, &mut buf);
-                if n <= 0 {
-                    break;
-                }
-                data.extend_from_slice(&buf[..n as usize]);
-            }
+            let data = drain_readable(|buf| read_fd(fd as i32, buf));
             if !data.is_empty() {
                 outputs.push((name.clone(), data));
             }
@@ -1316,6 +1353,49 @@ fn poll_all_stdout(state: &mut HerdState) {
 // ============================================================================
 // Exit Handling
 // ============================================================================
+
+/// Most `wait4(-1)` reaps one orphan sweep takes before leaving the rest to the
+/// next tick.
+const MAX_ORPHAN_REAPS: usize = 256;
+
+/// What one [`sweep_reaped`] pass found.
+#[derive(Debug, PartialEq, Eq)]
+struct Sweep {
+    /// Reaped pids that were not a running service's.
+    orphans: usize,
+    /// The pid that came back a second time and ended the sweep, if one did.
+    repeated: Option<u32>,
+}
+
+/// Drain `next` (`wait4(-1, WNOHANG)`, as `(pid, how, shell code)`) into
+/// `exited` for pids `running_service` names, counting the rest as orphans.
+///
+/// Terminates whatever `next` does: at its `None`, at the first pid it returns
+/// twice, or after [`MAX_ORPHAN_REAPS`]. And a service already in `exited` is
+/// never pushed again — the leak this replaced was exactly one dead service
+/// returned ~900 k times a second and pushed every time.
+fn sweep_reaped(
+    exited: &mut Vec<(String, Exit, i32)>,
+    running_service: impl Fn(u32) -> Option<String>,
+    mut next: impl FnMut() -> Option<(u32, Exit, i32)>,
+) -> Sweep {
+    let mut sweep = Sweep { orphans: 0, repeated: None };
+    let mut seen: Vec<u32> = Vec::new();
+    while seen.len() < MAX_ORPHAN_REAPS {
+        let Some((pid, how, code)) = next() else { break };
+        if seen.contains(&pid) {
+            sweep.repeated = Some(pid);
+            break;
+        }
+        seen.push(pid);
+        match running_service(pid) {
+            Some(name) if exited.iter().any(|(n, _, _)| *n == name) => {}
+            Some(name) => exited.push((name, how, code)),
+            None => sweep.orphans += 1,
+        }
+    }
+    sweep
+}
 
 fn check_process_exits(state: &mut HerdState, now_ms: u64) {
     // Reap with waitpid_status, not waitpid: the latter returns WEXITSTATUS only,
@@ -1360,33 +1440,29 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
     // §6 item 6). So a pid seen twice ends the sweep, a service is recorded
     // at most once, and the sweep stops after `MAX_ORPHAN_REAPS` regardless —
     // anything left is picked up on the next tick.
-    const MAX_ORPHAN_REAPS: usize = 256;
-    let mut orphans = 0usize;
-    let mut seen: Vec<u32> = Vec::new();
-    while seen.len() < MAX_ORPHAN_REAPS {
-        let Some(status) = wait_any() else { break };
-        if seen.contains(&status.pid) {
-            print("[herd] Warning: wait4 returned pid ");
-            print_dec(status.pid as usize);
-            print(" twice; ending the orphan sweep\n");
-            break;
-        }
-        seen.push(status.pid);
-        let owner = state.services.iter()
-            .find(|(_, svc)| svc.state == ServiceState::Running && svc.pid == Some(status.pid))
-            .map(|(name, _)| name.clone());
-        match owner {
-            Some(name) if exited.iter().any(|(n, _, _)| *n == name) => {}
-            Some(name) => {
+    let services = &state.services;
+    let sweep = sweep_reaped(
+        &mut exited,
+        |pid| {
+            services.iter()
+                .find(|(_, svc)| svc.state == ServiceState::Running && svc.pid == Some(pid))
+                .map(|(name, _)| name.clone())
+        },
+        || {
+            wait_any().map(|status| {
                 let how = Exit { signaled: status.signaled(), exit_code: status.exit_code() };
-                exited.push((name, how, status.shell_code()));
-            }
-            None => orphans += 1,
-        }
+                (status.pid, how, status.shell_code())
+            })
+        },
+    );
+    if let Some(pid) = sweep.repeated {
+        print("[herd] Warning: wait4 returned pid ");
+        print_dec(pid as usize);
+        print(" twice; ending the orphan sweep\n");
     }
-    if orphans > 0 {
+    if sweep.orphans > 0 {
         print("[herd] reaped ");
-        print_dec(orphans);
+        print_dec(sweep.orphans);
         print(" orphaned process(es)\n");
     }
 
@@ -1412,12 +1488,13 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
                 max_retries: svc.config.max_retries,
             };
 
-            match classify(policy, svc.restart_count, how) {
+            let outcome = classify(policy, svc.restart_count, how);
+            svc.state = ServiceState::after(outcome);
+            match outcome {
                 // A oneshot service ran its single time: move it to the terminal
                 // Completed state (never restarted — start_stopped_services only
                 // revives Stopped), regardless of exit code. A reboot runs it again.
                 Outcome::Completed => {
-                    svc.state = ServiceState::Completed;
                     svc.restart_count = 0;
                     print("[herd] Oneshot service ");
                     print(&name);
@@ -1426,20 +1503,22 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
                 Outcome::Restart => {
                     svc.restart_count += 1;
                     svc.restart_at_ms = Some(now_ms + svc.config.restart_delay_ms);
-                    svc.state = ServiceState::PendingRestart;
                     print("[herd] Scheduling restart for ");
                     print(&name);
                     print("\n");
                 }
                 Outcome::Failed => {
-                    svc.state = ServiceState::Failed;
                     print("[herd] Service ");
                     print(&name);
                     print(" failed after max retries\n");
                 }
                 Outcome::Stopped => {
-                    svc.state = ServiceState::Stopped;
                     svc.restart_count = 0;
+                    print("[herd] Service ");
+                    print(&name);
+                    print(" stays down (exit policy); `herd start ");
+                    print(&name);
+                    print("` to run it again\n");
                 }
             }
         }
@@ -1828,5 +1907,139 @@ fn cmd_log(name: &str) {
             print(name);
             print("'\n");
         }
+    }
+}
+
+// ============================================================================
+// Tests — `cargo test --bin herd --target <host>` (see Cargo.toml). Pure logic
+// only: every libakuma wrapper is a raw Akuma syscall, which a host test must
+// never reach.
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn died(code: i32) -> Exit {
+        Exit::code(code)
+    }
+
+    #[test]
+    fn sweep_ends_when_wait4_returns_the_same_pid_forever() {
+        // The 2026-09-24 leak: `wait4(-1)` handed back one dead, still-buffered
+        // service on every call and the old loop never stopped.
+        let mut exited = Vec::new();
+        let mut calls = 0;
+        let sweep = sweep_reaped(
+            &mut exited,
+            |pid| (pid == 20).then(|| String::from("kot")),
+            || {
+                calls += 1;
+                Some((20, died(134), 134))
+            },
+        );
+        assert_eq!(sweep.repeated, Some(20));
+        assert_eq!(calls, 2, "the second sighting ends it");
+        assert_eq!(exited.len(), 1, "and the service is recorded once");
+    }
+
+    #[test]
+    fn sweep_never_records_a_service_the_targeted_wait_already_did() {
+        let mut exited = vec![(String::from("kot"), died(1), 1)];
+        let mut once = Some((20, died(1), 1));
+        let sweep = sweep_reaped(&mut exited, |_| Some(String::from("kot")), || once.take());
+        assert_eq!(exited.len(), 1);
+        assert_eq!(sweep, Sweep { orphans: 0, repeated: None });
+    }
+
+    #[test]
+    fn sweep_counts_orphans_and_stops_at_the_cap() {
+        let mut exited = Vec::new();
+        let mut next_pid = 100u32;
+        let sweep = sweep_reaped(
+            &mut exited,
+            |_| None,
+            || {
+                next_pid += 1;
+                Some((next_pid, died(0), 0))
+            },
+        );
+        assert_eq!(sweep.orphans, MAX_ORPHAN_REAPS, "an endless supply is cut off");
+        assert!(exited.is_empty());
+    }
+
+    #[test]
+    fn sweep_stops_at_echild() {
+        let mut exited = Vec::new();
+        let mut queue = vec![(7, died(0), 0), (8, died(2), 2)];
+        let sweep = sweep_reaped(
+            &mut exited,
+            |pid| (pid == 8).then(|| String::from("svc")),
+            || queue.pop(),
+        );
+        assert_eq!(sweep, Sweep { orphans: 1, repeated: None });
+        assert_eq!(exited, vec![(String::from("svc"), died(2), 2)]);
+    }
+
+    #[test]
+    fn drain_reads_until_eagain() {
+        let mut chunks = vec![-11isize, 3, 5]; // popped from the back: 5, 3, EAGAIN
+        let mut reads = 0;
+        let data = drain_readable(|buf| {
+            reads += 1;
+            let n = chunks.pop().unwrap_or(-11);
+            if n > 0 {
+                buf[..n as usize].fill(b'x');
+            }
+            n
+        });
+        assert_eq!(data.len(), 8);
+        assert_eq!(reads, 3, "one read past the data, to see EAGAIN");
+    }
+
+    #[test]
+    fn drain_stops_at_eof() {
+        let mut first = true;
+        let data = drain_readable(|buf| {
+            if core::mem::take(&mut first) {
+                buf[0] = b'z';
+                1
+            } else {
+                0
+            }
+        });
+        assert_eq!(data, b"z");
+    }
+
+    #[test]
+    fn drain_is_bounded_for_a_writer_faster_than_herd() {
+        let mut reads = 0;
+        let data = drain_readable(|buf| {
+            reads += 1;
+            buf.len() as isize
+        });
+        assert_eq!(reads, MAX_READS_PER_PASS);
+        assert_eq!(data.len(), MAX_READS_PER_PASS * 4096);
+    }
+
+    #[test]
+    fn no_exit_outcome_is_restarted_by_the_start_pass() {
+        // `restart = false` and clean exits used to land in `Stopped` — "not
+        // started yet" — and were launched again on the very next pass.
+        for outcome in [Outcome::Completed, Outcome::Restart, Outcome::Failed, Outcome::Stopped] {
+            assert!(
+                !ServiceState::after(outcome).started_by_start_pass(),
+                "{outcome:?} must not be revived by start_stopped_services"
+            );
+        }
+        assert_eq!(ServiceState::after(Outcome::Stopped), ServiceState::Exited);
+        assert!(ServiceState::Stopped.started_by_start_pass(), "a fresh service still starts");
+    }
+
+    #[test]
+    fn restart_false_exit_stays_down() {
+        let policy = Policy { oneshot: false, restart: false, max_retries: 0 };
+        let state = ServiceState::after(classify(policy, 0, died(7)));
+        assert_eq!(state, ServiceState::Exited);
     }
 }

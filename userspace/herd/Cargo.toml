@@ -24,3 +24,12 @@ libakuma = { path = "../libakuma", optional = true }
 # box-id convention (`boxlib::spec::box_id_for`) — herd never spawns `box`
 # itself, and stays off `pull` (TLS, tar, the registry client) entirely.
 boxlib = { package = "box", path = "../box", default-features = false }
+
+# The binary's own unit tests (`src/main.rs`'s `mod tests`) link libakuma on the
+# host with `host-test`, which drops its `_start`, allocator and panic handler.
+# A dev-dependency, so resolver 2 never turns the feature on for the shipped
+# binary:
+#
+#   cargo test --bin herd --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+[dev-dependencies]
+libakuma = { path = "../libakuma", features = ["host-test"] }
