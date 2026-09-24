@@ -34,6 +34,10 @@ pub enum ExternalDevice {
     Rtl8169(crate::rtl8169::Rtl8169Device),
     /// No wire — loopback only.
     Absent,
+    /// A scripted wire for host tests: frames queued here are what
+    /// `take_rx_frame` hands up, in order.
+    #[cfg(test)]
+    Scripted(tests::Wire),
 }
 
 /// One-slot staging buffer for [`ExternalDevice::Absent`]: `TxToken::consume`
@@ -72,6 +76,8 @@ impl ExternalDevice {
             #[cfg(feature = "rtl8169")]
             Self::Rtl8169(d) => d.mac_address(),
             Self::Absent => [0; 6],
+            #[cfg(test)]
+            Self::Scripted(_) => [0x02, 0, 0, 0, 0, 1],
         }
     }
 
@@ -85,6 +91,8 @@ impl ExternalDevice {
                 caps.max_transmission_unit = 1514;
                 caps
             }
+            #[cfg(test)]
+            Self::Scripted(_) => DeviceCapabilities::default(),
         }
     }
 
@@ -94,6 +102,8 @@ impl ExternalDevice {
             #[cfg(feature = "rtl8169")]
             Self::Rtl8169(d) => d.take_rx_frame(),
             Self::Absent => None,
+            #[cfg(test)]
+            Self::Scripted(w) => w.take(),
         }
     }
 
@@ -121,6 +131,8 @@ impl ExternalDevice {
                 C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
                 res
             }
+            #[cfg(test)]
+            Self::Scripted(_) => fill(&mut alloc::vec![0u8; len]),
         }
     }
 }
@@ -128,11 +140,14 @@ impl ExternalDevice {
 // Loopback-Aware Device Wrapper
 // ============================================================================
 
-/// Check if an Ethernet frame is destined for loopback (127.x.x.x).
+/// Check if an Ethernet frame carries a loopback (127.x.x.x) address.
 ///
-/// Inspects the `EtherType` and the relevant IP address field:
-/// - ARP (0x0806): target protocol address at bytes [38:42]
-/// - IPv4 (0x0800): destination IP at bytes [30:34]
+/// Inspects the `EtherType` and the relevant IP address fields:
+/// - ARP (0x0806): sender protocol address at byte 28, target at byte 38
+/// - IPv4 (0x0800): source IP at byte 26, destination at byte 30
+///
+/// Used in both directions: on TX a match is diverted into the internal ring,
+/// and on RX a match *from the wire* is a martian and is dropped.
 fn is_loopback_frame(frame: &[u8]) -> bool {
     if frame.len() < 14 {
         return false;
@@ -179,6 +194,26 @@ static LOOPBACK_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub fn loopback_drop_count() -> usize {
     LOOPBACK_DROP_COUNT.load(Ordering::Relaxed)
 }
+
+/// Frames from the wire dropped as martians: a 127/8 source or destination
+/// (IPv4), or a 127/8 sender or target (ARP), on the external device.
+///
+/// Nothing legitimate produces one — `127/8` never leaves a host — so a
+/// non-zero count is a misconfigured peer or someone probing. Always on,
+/// unlike `nicstat`, because it is the evidence the filter is doing its job.
+static MARTIAN_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[must_use]
+pub fn martian_drop_count() -> usize {
+    MARTIAN_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Martians [`LoopbackAwareDevice::receive`] discards in one call before
+/// reporting "nothing to receive" instead. Each discard consumes a real frame
+/// from the device, so the loop already ends when the wire goes quiet; this
+/// only stops a sustained stream of them from holding `NETWORK` for a whole
+/// ring's worth of drops per call. The frames behind it are taken next lap.
+const MARTIAN_DROPS_PER_RECEIVE: usize = 16;
 
 /// A fixed-capacity ring of loopback frames, replacing what used to be a
 /// `VecDeque<Vec<u8>>`.
@@ -326,8 +361,32 @@ impl Device for LoopbackAwareDevice {
             // trip, and `receive` drains these ahead of the wire.
             FrameSource::Loopback(frame, len)
         } else {
-            let (ptr, len) = self.external.take_rx_frame()?;
-            FrameSource::External(ptr, len)
+            let mut dropped = 0;
+            loop {
+                let (ptr, len) = self.external.take_rx_frame()?;
+                // Drop martians. The interface owns `127.0.0.1/8` alongside the
+                // NIC's address, so smoltcp accepts a frame addressed to it
+                // whichever device it arrived on; Linux refuses one on a
+                // non-loopback device (`ip_route_input`, absent
+                // `route_localnet`), and until 2026-09-25 this handed it up
+                // unchecked — so `127.0.0.1` as a peer or bound address proved
+                // nothing about where a connection came from
+                // (`docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md`).
+                //
+                // SAFETY: the same frame `FrameSource::External` below hands
+                // up, under the same contract; the borrow ends at the end of
+                // this statement, before the next `take_rx_frame` releases the
+                // slot.
+                let martian = is_loopback_frame(unsafe { core::slice::from_raw_parts(ptr, len) });
+                if !martian {
+                    break FrameSource::External(ptr, len);
+                }
+                MARTIAN_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                dropped += 1;
+                if dropped == MARTIAN_DROPS_PER_RECEIVE {
+                    return None;
+                }
+            }
         };
 
         let tx = LoopbackAwareTxToken {
@@ -412,5 +471,112 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
             nicstat::record_loopback(frame.len());
             true
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{martian_drop_count, ExternalDevice, LoopbackAwareDevice, MARTIAN_DROPS_PER_RECEIVE};
+    use smoltcp::phy::{Device, RxToken};
+    use smoltcp::time::Instant;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// A wire that delivers the frames queued on it, in order. `held` is the
+    /// frame last handed up, kept alive until the next `take` the way a real
+    /// NIC's ring slot is.
+    pub struct Wire {
+        queue: VecDeque<Vec<u8>>,
+        held: Vec<u8>,
+    }
+
+    impl Wire {
+        pub(crate) fn take(&mut self) -> Option<(*mut u8, usize)> {
+            self.held = self.queue.pop_front()?;
+            Some((self.held.as_mut_ptr(), self.held.len()))
+        }
+    }
+
+    /// `MARTIAN_DROP_COUNT` is a process-wide static and `cargo test` runs
+    /// tests on threads, so every test that reads a delta holds this.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn device(frames: impl IntoIterator<Item = Vec<u8>>) -> LoopbackAwareDevice {
+        LoopbackAwareDevice::new(ExternalDevice::Scripted(Wire {
+            queue: frames.into_iter().collect(),
+            held: Vec::new(),
+        }))
+    }
+
+    /// A minimal Ethernet + IPv4 header, enough for `is_loopback_frame`.
+    fn ipv4(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        let mut f = vec![0u8; 34];
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[26..30].copy_from_slice(&src);
+        f[30..34].copy_from_slice(&dst);
+        f
+    }
+
+    fn arp(sender: [u8; 4], target: [u8; 4]) -> Vec<u8> {
+        let mut f = vec![0u8; 42];
+        f[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+        f[28..32].copy_from_slice(&sender);
+        f[38..42].copy_from_slice(&target);
+        f
+    }
+
+    /// What `receive` hands up next, as bytes.
+    fn next(dev: &mut LoopbackAwareDevice) -> Option<Vec<u8>> {
+        let (rx, _tx) = dev.receive(Instant::ZERO)?;
+        Some(rx.consume(<[u8]>::to_vec))
+    }
+
+    const LAN: [u8; 4] = [192, 168, 1, 50];
+    const NIC: [u8; 4] = [192, 168, 1, 120];
+
+    /// The defect's second layer: a frame from the wire addressed to (or
+    /// claiming to come from) 127/8 was handed up unchecked, and smoltcp
+    /// accepted it because the interface owns `127.0.0.1/8`.
+    #[test]
+    fn a_loopback_frame_from_the_wire_is_dropped_and_counted() {
+        let _g = SERIAL.lock().unwrap();
+        let before = martian_drop_count();
+        let good = ipv4(LAN, NIC);
+        let mut dev = device([
+            ipv4(LAN, [127, 0, 0, 1]),
+            ipv4([127, 0, 0, 1], NIC),
+            arp(LAN, [127, 0, 0, 1]),
+            arp([127, 0, 0, 1], NIC),
+            good.clone(),
+        ]);
+        assert_eq!(next(&mut dev), Some(good), "the martians are skipped, not the frame behind them");
+        assert_eq!(martian_drop_count() - before, 4);
+        assert_eq!(next(&mut dev), None);
+    }
+
+    #[test]
+    fn ordinary_traffic_is_untouched() {
+        let _g = SERIAL.lock().unwrap();
+        let before = martian_drop_count();
+        let frames = [ipv4(LAN, NIC), arp(LAN, NIC), ipv4(LAN, [255, 255, 255, 255])];
+        let mut dev = device(frames.clone());
+        for f in frames {
+            assert_eq!(next(&mut dev), Some(f));
+        }
+        assert_eq!(martian_drop_count(), before);
+    }
+
+    /// A sustained stream of martians gives up the call rather than draining
+    /// the whole ring under `NETWORK`; the frame behind them arrives next call.
+    #[test]
+    fn a_burst_of_martians_is_bounded_per_call() {
+        let _g = SERIAL.lock().unwrap();
+        let good = ipv4(LAN, NIC);
+        let mut frames: Vec<_> =
+            (0..MARTIAN_DROPS_PER_RECEIVE).map(|_| ipv4(LAN, [127, 0, 0, 1])).collect();
+        frames.push(good.clone());
+        let mut dev = device(frames);
+        assert_eq!(next(&mut dev), None);
+        assert_eq!(next(&mut dev), Some(good));
     }
 }

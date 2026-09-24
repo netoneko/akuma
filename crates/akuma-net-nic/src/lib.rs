@@ -63,7 +63,7 @@ pub mod rtl8169;
 pub use device::{VirtioSmoltcpDevice, VirtioRxToken, VirtioTxToken, RX_BUFFER_LEN};
 pub use loopback::{
     ExternalDevice, LoopbackAwareDevice, LoopbackAwareRxToken, LoopbackAwareTxToken,
-    loopback_drop_count,
+    loopback_drop_count, martian_drop_count,
 };
 #[cfg(feature = "rtl8169")]
 pub use rtl8169::Rtl8169Device;

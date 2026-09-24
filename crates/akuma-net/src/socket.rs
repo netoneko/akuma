@@ -187,6 +187,17 @@ pub enum SocketType {
 pub struct KernelSocket {
     pub inner: SocketType,
     pub bind_port: Option<u16>,
+    /// The address `bind()` asked for; `[0; 4]` (`INADDR_ANY`) when it named
+    /// none or there was no `bind()` at all.
+    ///
+    /// This did not exist until 2026-09-25: `bind` kept only the port, every
+    /// listener was a smoltcp `listen(port)` (any address), and a server that
+    /// bound `127.0.0.1` so that only the box could reach it — herd's
+    /// unauthenticated control socket among them — answered the LAN
+    /// (`docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md`). It now reaches
+    /// smoltcp through [`listen_endpoint`] on every listen, UDP bind and
+    /// connect, and scopes `EADDRINUSE` through [`bind_addrs_overlap`].
+    pub bind_ip: [u8; 4],
     pub box_id: u64,
     /// `TCP_NODELAY` option (disable Nagle's algorithm)
     pub tcp_nodelay: bool,
@@ -248,6 +259,7 @@ impl KernelSocket {
         Some(Self {
             inner: SocketType::Stream(handle),
             bind_port: None,
+            bind_ip: INADDR_ANY,
             box_id,
             tcp_nodelay: true,  // We disable Nagle by default
             keepalive: false,
@@ -268,6 +280,7 @@ impl KernelSocket {
         Some(Self {
             inner: SocketType::Datagram { handle, peer: None },
             bind_port: None,
+            bind_ip: INADDR_ANY,
             box_id,
             tcp_nodelay: false,
             keepalive: false,
@@ -282,7 +295,7 @@ impl KernelSocket {
     }
 
     #[must_use] 
-    pub fn new_listener(port: u16, backlog: usize) -> Option<Self> {
+    pub fn new_listener(ip: [u8; 4], port: u16, backlog: usize) -> Option<Self> {
         let actual_backlog = backlog.min(MAX_BACKLOG);
         let mut handles = VecDeque::new();
         
@@ -290,7 +303,7 @@ impl KernelSocket {
             if let Some(handle) = smoltcp_net::socket_create() {
                 with_network(|net| {
                     let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-                    let _ = socket.listen(port);
+                    let _ = socket.listen(listen_endpoint(ip, port));
                 });
                 handles.push_back(handle);
             }
@@ -305,6 +318,7 @@ impl KernelSocket {
         Some(Self {
             inner: SocketType::Listener { local_port: port, handles, backlog: actual_backlog },
             bind_port: Some(port),
+            bind_ip: ip,
             box_id,
             tcp_nodelay: true,
             keepalive: false,
@@ -872,6 +886,61 @@ pub fn bind_port_for(requested: u16, ephemeral: impl FnOnce() -> u16) -> u16 {
     if requested == 0 { ephemeral() } else { requested }
 }
 
+/// `INADDR_ANY`: a bind that names no address.
+pub const INADDR_ANY: [u8; 4] = [0, 0, 0, 0];
+
+/// The smoltcp endpoint for a socket bound to `ip:port`: `addr: None` for
+/// [`INADDR_ANY`], which matches every address the interface owns, and the
+/// address itself otherwise, which matches only that one.
+///
+/// The `None` arm used to be the only one — every listener was
+/// `listen(port)` whatever `bind()` had said, so `bind("127.0.0.1:N")`
+/// answered a SYN to the NIC's address exactly as `bind("0.0.0.0:N")` does
+/// (`docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md`). smoltcp's
+/// `tcp::Socket::accepts` compares a listening socket's `addr` against the
+/// segment's destination, so naming it here is the whole of the TCP fix.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn listen_endpoint(ip: [u8; 4], port: u16) -> smoltcp::wire::IpListenEndpoint {
+    let addr = (ip != INADDR_ANY)
+        .then(|| smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(ip)));
+    smoltcp::wire::IpListenEndpoint { addr, port }
+}
+
+/// Whether two binds of one port in one protocol collide.
+///
+/// They do when they name the same address, or either is the wildcard, which
+/// overlaps everything — Linux's rule without `SO_REUSEADDR`/`SO_REUSEPORT`,
+/// neither of which this stack honours.
+///
+/// So `127.0.0.1:N` and `192.168.1.120:N` coexist, and `0.0.0.0:N` refuses
+/// both. The port-only check that preceded this (2026-09-20,
+/// `docs/archive/AKUMA_NET_BIND_NO_ADDRINUSE.md`) refused the first pair too,
+/// because the table had nowhere to keep an address to compare.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn bind_addrs_overlap(a: [u8; 4], b: [u8; 4]) -> bool {
+    a == b || a == INADDR_ANY || b == INADDR_ANY
+}
+
+/// Whether `bind()` may name `ip`, given whether the interface owns it.
+///
+/// `INADDR_ANY` always may. Anything else must be an address the interface
+/// actually holds, or the bind is `EADDRNOTAVAIL` — Linux's answer, and the
+/// only honest one here: smoltcp drops any IPv4 packet whose destination the
+/// interface does not own before a socket sees it, so a listener on such an
+/// address could never be reached. The bind used to succeed and quietly
+/// listen on every address instead.
+///
+/// **Pinned divergence:** Linux lets a socket bind any address in `127/8`,
+/// because `lo` carries a `/8` local route. Here the interface holds exactly
+/// `127.0.0.1`, so `127.0.0.2` is `EADDRNOTAVAIL` — correct about what this
+/// stack can deliver, and different from Linux.
+#[cfg(feature = "smoltcp")]
+pub fn bind_addr_check(ip: [u8; 4], iface_owns: impl FnOnce([u8; 4]) -> bool) -> Result<(), i32> {
+    if ip == INADDR_ANY || iface_owns(ip) { Ok(()) } else { Err(libc_errno::EADDRNOTAVAIL) }
+}
+
 /// What `connect(2)` must do next, given the socket's current TCP state.
 ///
 /// The redial case is the whole reason this exists: the standard non-blocking
@@ -983,21 +1052,29 @@ pub fn connect_outcome(waited: Result<(), i32>, state: Option<tcp::State>) -> Re
     }
 }
 
-/// Whether `sock` already occupies `port` in the same protocol's port space
+/// Whether `sock` already occupies `ip:port` in the same protocol's port space
 /// as `wants_tcp` (TCP and UDP are separate namespaces on real Linux, and
 /// stay separate here). A `Stream` socket that has only `bind()`-ed (not yet
-/// `listen()`-ing) still claims the port, same as Linux.
+/// `listen()`-ing) still claims the port, same as Linux. Addresses collide by
+/// [`bind_addrs_overlap`].
 #[cfg(feature = "smoltcp")]
-fn occupies_port(sock: &KernelSocket, wants_tcp: bool, port: u16) -> bool {
-    match &sock.inner {
+fn occupies_port(sock: &KernelSocket, wants_tcp: bool, ip: [u8; 4], port: u16) -> bool {
+    let same_port = match &sock.inner {
         SocketType::Listener { local_port, .. } => wants_tcp && *local_port == port,
         SocketType::Stream(_) => wants_tcp && sock.bind_port == Some(port),
         SocketType::Datagram { .. } => !wants_tcp && sock.bind_port == Some(port),
-    }
+    };
+    same_port && bind_addrs_overlap(sock.bind_ip, ip)
 }
 
 #[cfg(feature = "smoltcp")]
 pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
+    // Before the table lock, not under it: `NETWORK` nests inside
+    // `SOCKET_TABLE` elsewhere (`socket_listen`), but there is no reason to
+    // hold both for a read of the interface's address list.
+    bind_addr_check(addr.ip, |ip| {
+        with_network(|net| net.iface.has_ip_addr(smoltcp::wire::Ipv4Address::from(ip))).unwrap_or(false)
+    })?;
     with_table(|table| {
         // An explicit (non-zero) port must be exclusive to one live socket —
         // real Linux refuses a second `bind()` on a port already claimed with
@@ -1015,7 +1092,7 @@ pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
                     continue;
                 }
                 if let Some(other) = slot
-                    && occupies_port(other, wants_tcp, addr.port)
+                    && occupies_port(other, wants_tcp, addr.ip, addr.port)
                 {
                     return Err(libc_errno::EADDRINUSE);
                 }
@@ -1031,8 +1108,9 @@ pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
             // bind now also gets a real ephemeral port instead of listening on 0.
             let port = bind_port_for(addr.port, alloc_ephemeral_port);
             sock.bind_port = Some(port);
+            sock.bind_ip = addr.ip;
             if let SocketType::Datagram { handle, .. } = &sock.inner {
-                smoltcp_net::udp_socket_bind(*handle, port).map_err(|()| libc_errno::EINVAL)?;
+                smoltcp_net::udp_socket_bind(*handle, addr.ip, port).map_err(|()| libc_errno::EINVAL)?;
             }
             Ok(())
         } else {
@@ -1048,7 +1126,9 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
             return Err(libc_errno::EBADF);
         }
         
-        let port = table[idx].as_ref().unwrap().bind_port.ok_or(libc_errno::EINVAL)?;
+        let sock = table[idx].as_ref().unwrap();
+        let port = sock.bind_port.ok_or(libc_errno::EINVAL)?;
+        let ip = sock.bind_ip;
         
         if let Some(sock) = table[idx].take() {
             match sock.inner {
@@ -1074,7 +1154,7 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
                 _ => {}
             }
 
-            KernelSocket::new_listener(port, backlog).map_or(Err(libc_errno::ENOMEM), |new_sock| {
+            KernelSocket::new_listener(ip, port, backlog).map_or(Err(libc_errno::ENOMEM), |new_sock| {
                 table[idx] = Some(new_sock);
                 Ok(())
             })
@@ -1136,9 +1216,10 @@ fn listener_refresh(idx: usize) -> bool {
     with_table(|table| {
         let Some(Some(KernelSocket {
             inner: SocketType::Listener { handles, local_port, backlog },
+            bind_ip,
             ..
         })) = table.get_mut(idx) else { return };
-        let port = *local_port;
+        let endpoint = listen_endpoint(*bind_ip, *local_port);
         let want = *backlog;
 
         with_network(|net| {
@@ -1153,7 +1234,7 @@ fn listener_refresh(idx: usize) -> bool {
                     }
                     // Dead slot: hand it back to the pool as a fresh listener.
                     socket.abort();
-                    let _ = socket.listen(port);
+                    let _ = socket.listen(endpoint);
                 });
             }
         });
@@ -1163,7 +1244,7 @@ fn listener_refresh(idx: usize) -> bool {
         while handles.len() < want {
             let Some(new_h) = smoltcp_net::socket_create() else { break };
             with_network(|net| {
-                let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(port);
+                let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(endpoint);
             });
             handles.push_back(new_h);
         }
@@ -1224,8 +1305,8 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
     }
 
     let (handle, addr) = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port, .. }, .. })) = table.get_mut(idx) {
-             let port = *local_port;
+        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port, .. }, bind_ip, .. })) = table.get_mut(idx) {
+             let endpoint = listen_endpoint(*bind_ip, *local_port);
              for (i, &handle) in handles.iter().enumerate() {
                 let state =
                     with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::state))
@@ -1236,7 +1317,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
                 if matches!(state, Some(tcp::State::Established | tcp::State::CloseWait)) {
                     let h = handles.remove(i).unwrap();
                     if let Some(new_h) = smoltcp_net::socket_create() {
-                        with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(port); });
+                        with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(endpoint); });
                         handles.push_back(new_h);
                     }
                     let remote = with_network(|net| {
@@ -1258,6 +1339,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
     let new_sock = KernelSocket { 
         inner: SocketType::Stream(handle), 
         bind_port: None,
+        bind_ip: INADDR_ANY,
         box_id: current_box_id,
         tcp_nodelay: true,
         keepalive: false,
@@ -1299,7 +1381,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
                     if sock.bind_port.is_none() {
                         let port = alloc_ephemeral_port();
                         sock.bind_port = Some(port);
-                        let _ = smoltcp_net::udp_socket_bind(*handle, port);
+                        let _ = smoltcp_net::udp_socket_bind(*handle, INADDR_ANY, port);
                     }
                     return Ok(());
                 }
@@ -1307,10 +1389,10 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         });
     }
 
-    let (h, bound_port): (SocketHandle, Option<u16>) = with_table(|table| {
+    let (h, bound_port, bound_ip): (SocketHandle, Option<u16>, [u8; 4]) = with_table(|table| {
         if let Some(Some(sock)) = table.get(idx)
             && let SocketType::Stream(handle) = sock.inner {
-                return Some((handle, sock.bind_port));
+                return Some((handle, sock.bind_port, sock.bind_ip));
             }
         None
     }).ok_or(libc_errno::EBADF)?;
@@ -1351,7 +1433,9 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
             let cx = net.iface.context();
             socket.connect(cx,
                 (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
-                local_port
+                // A bound address is the source, as on Linux; unbound lets
+                // smoltcp pick the one that routes to `addr`.
+                listen_endpoint(bound_ip, local_port)
             )
         })
     }).flatten();
@@ -1630,7 +1714,7 @@ pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usi
             if bind_port.is_none() {
                 let port = alloc_ephemeral_port();
                 *bind_port = Some(port);
-                let _ = smoltcp_net::udp_socket_bind(*handle, port);
+                let _ = smoltcp_net::udp_socket_bind(*handle, INADDR_ANY, port);
             }
             Some(*handle)
         } else {

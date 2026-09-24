@@ -34,9 +34,12 @@ pub fn udp_socket_create() -> Option<SocketHandle> {
 }
 
 #[allow(clippy::result_unit_err)]
-pub fn udp_socket_bind(handle: SocketHandle, port: u16) -> Result<(), ()> {
+pub fn udp_socket_bind(handle: SocketHandle, ip: [u8; 4], port: u16) -> Result<(), ()> {
+    // `ip` narrows the socket to datagrams addressed to it, exactly as a TCP
+    // listener's endpoint does — see `crate::socket::listen_endpoint`.
+    let endpoint = crate::socket::listen_endpoint(ip, port);
     with_network(|net| {
-        udp_get_mut(&mut net.sockets, handle, |socket| socket.bind(port).map_err(|_| ()))
+        udp_get_mut(&mut net.sockets, handle, |socket| socket.bind(endpoint).map_err(|_| ()))
     }).flatten().unwrap_or(Err(()))
 }
 

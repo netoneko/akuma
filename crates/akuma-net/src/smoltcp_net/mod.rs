@@ -56,7 +56,7 @@ use akuma_net_nic::nic::Nic;
 pub use akuma_net_nic::Rtl8169Device;
 pub use akuma_net_nic::{VirtioSmoltcpDevice, LoopbackAwareDevice, ExternalDevice,
     LoopbackAwareRxToken, LoopbackAwareTxToken, VirtioRxToken, VirtioTxToken,
-    RX_BUFFER_LEN, loopback_drop_count, nic_irq_ack, nic_irq_count, nic_slot,
+    RX_BUFFER_LEN, loopback_drop_count, martian_drop_count, nic_irq_ack, nic_irq_count, nic_slot,
     NIC_SLOT_NONE, canaries_intact, counter_block_addr, isr_history, link_state,
     rx_counters, tx_drop_count, tx_frames_sent};
 use akuma_primitives::TakeOnce;

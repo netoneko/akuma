@@ -38,7 +38,7 @@ pub fn try_bootstrap_clock() -> Result<(), &'static str> {
     // (network init just finished, IRQs aren't unmasked yet), so there's no
     // ephemeral-port allocator to share and no conflict to avoid.
     const NTP_CLIENT_LOCAL_PORT: u16 = 49123;
-    akuma_net::smoltcp_net::udp_socket_bind(handle, NTP_CLIENT_LOCAL_PORT)
+    akuma_net::smoltcp_net::udp_socket_bind(handle, akuma_net::socket::INADDR_ANY, NTP_CLIENT_LOCAL_PORT)
         .map_err(|()| "could not bind the boot-time sync socket")?;
 
     let remote = smoltcp::wire::IpEndpoint::new(

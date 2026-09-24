@@ -376,8 +376,16 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
         Some(i) => i,
         None => return EBADF,
     };
-    let port = socket::with_socket(idx, |s| s.bind_port.unwrap_or(0)).unwrap_or(0);
-    let local_ip = akuma_net::smoltcp_net::get_local_ip();
+    let (port, bound_ip) = socket::with_socket(idx, |s| (s.bind_port.unwrap_or(0), s.bind_ip))
+        .unwrap_or((0, socket::INADDR_ANY));
+    // A socket bound to a specific address reports that address. An unbound or
+    // wildcard one keeps reporting the NIC's, which is what this always did
+    // (Linux would say 0.0.0.0 for a wildcard listener).
+    let local_ip = if bound_ip == socket::INADDR_ANY {
+        akuma_net::smoltcp_net::get_local_ip()
+    } else {
+        bound_ip
+    };
     let sa = SockAddrIn {
         sin_family: 2,
         sin_port: port.to_be(),

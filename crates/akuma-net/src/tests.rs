@@ -597,3 +597,115 @@ mod guarded_handle_tests {
         assert_eq!(tcp_get(&set, b, |s| s.state()), Some(tcp::State::Closed));
     }
 }
+
+/// `bind()` honours the address it is given
+/// (`docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md`).
+///
+/// Until 2026-09-25 `bind` kept only the port and every listener was a smoltcp
+/// `listen(port)`, so a socket bound to `127.0.0.1` accepted a SYN addressed
+/// to the NIC — herd's unauthenticated control socket answered the LAN. The
+/// pure rules come first; the last three tests run a real smoltcp interface,
+/// because the claim that an endpoint address gates a SYN is smoltcp's, and
+/// is worth proving rather than asserting.
+#[cfg(all(test, feature = "smoltcp"))]
+mod bind_address_tests {
+    use crate::socket::{bind_addr_check, bind_addrs_overlap, libc_errno, listen_endpoint, INADDR_ANY};
+    use smoltcp::iface::{Config, Interface, SocketSet};
+    use smoltcp::phy::{Loopback, Medium};
+    use smoltcp::socket::tcp;
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+
+    const LO: [u8; 4] = [127, 0, 0, 1];
+    const NIC: [u8; 4] = [10, 0, 0, 2];
+    const PORT: u16 = 7117;
+
+    #[test]
+    fn the_wildcard_listens_everywhere_and_an_address_only_there() {
+        assert_eq!(listen_endpoint(INADDR_ANY, PORT).addr, None);
+        assert_eq!(
+            listen_endpoint(LO, PORT).addr,
+            Some(IpAddress::Ipv4(Ipv4Address::from(LO))),
+        );
+        assert_eq!(listen_endpoint(LO, PORT).port, PORT);
+    }
+
+    /// Linux's rule: same address, or either side the wildcard.
+    #[test]
+    fn binds_collide_only_when_their_addresses_overlap() {
+        assert!(!bind_addrs_overlap(LO, NIC), "127.0.0.1:N and <nic>:N coexist");
+        assert!(bind_addrs_overlap(LO, LO));
+        assert!(bind_addrs_overlap(INADDR_ANY, LO), "0.0.0.0:N then 127.0.0.1:N is EADDRINUSE");
+        assert!(bind_addrs_overlap(NIC, INADDR_ANY), "and in the other order");
+        assert!(bind_addrs_overlap(INADDR_ANY, INADDR_ANY));
+    }
+
+    #[test]
+    fn an_address_the_interface_does_not_own_is_eaddrnotavail() {
+        let owns = |ip: [u8; 4]| ip == LO || ip == NIC;
+        assert_eq!(bind_addr_check(INADDR_ANY, |_| false), Ok(()), "the wildcard never asks");
+        assert_eq!(bind_addr_check(LO, owns), Ok(()));
+        assert_eq!(bind_addr_check(NIC, owns), Ok(()));
+        assert_eq!(bind_addr_check([10, 0, 0, 3], owns), Err(libc_errno::EADDRNOTAVAIL));
+        // The pinned divergence: Linux accepts any 127/8 address.
+        assert_eq!(bind_addr_check([127, 0, 0, 2], owns), Err(libc_errno::EADDRNOTAVAIL));
+    }
+
+    /// One interface owning both `127.0.0.1/8` and a NIC address, as
+    /// `smoltcp_net::init` builds it, over smoltcp's own loopback device.
+    fn rig() -> (Interface, Loopback, SocketSet<'static>) {
+        let mut dev = Loopback::new(Medium::Ethernet);
+        let hw = EthernetAddress([0x02, 0, 0, 0, 0, 1]);
+        let mut iface = Interface::new(Config::new(hw.into()), &mut dev, Instant::ZERO);
+        iface.update_ip_addrs(|a| {
+            a.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::from(NIC)), 24)).unwrap();
+            a.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::from(LO)), 8)).unwrap();
+        });
+        (iface, dev, SocketSet::new(alloc::vec::Vec::new()))
+    }
+
+    fn tcp_socket() -> tcp::Socket<'static> {
+        tcp::Socket::new(
+            tcp::SocketBuffer::new(alloc::vec![0u8; 1024]),
+            tcp::SocketBuffer::new(alloc::vec![0u8; 1024]),
+        )
+    }
+
+    /// Listen on `bound:PORT`, dial `dialled:PORT` from the same interface,
+    /// and report whether the listener took the connection.
+    fn reaches(bound: [u8; 4], dialled: [u8; 4]) -> bool {
+        let (mut iface, mut dev, mut set) = rig();
+        let mut listener = tcp_socket();
+        listener.listen(listen_endpoint(bound, PORT)).unwrap();
+        let l = set.add(listener);
+        let c = set.add(tcp_socket());
+        set.get_mut::<tcp::Socket>(c)
+            .connect(iface.context(), (IpAddress::Ipv4(Ipv4Address::from(dialled)), PORT), 49152)
+            .unwrap();
+        for ms in 0..200 {
+            iface.poll(Instant::from_millis(ms), &mut dev, &mut set);
+        }
+        set.get::<tcp::Socket>(l).state() == tcp::State::Established
+    }
+
+    /// The control: a wildcard listener is reachable on both addresses. If
+    /// this fails the rig is broken, not the fix.
+    #[test]
+    fn a_wildcard_listener_answers_on_every_address() {
+        assert!(reaches(INADDR_ANY, LO));
+        assert!(reaches(INADDR_ANY, NIC));
+    }
+
+    /// The defect: a loopback listener answered a SYN to the NIC's address.
+    #[test]
+    fn a_loopback_listener_does_not_answer_the_nic_address() {
+        assert!(reaches(LO, LO));
+        assert!(!reaches(LO, NIC), "127.0.0.1:N must not accept a SYN to <nic>:N");
+    }
+
+    #[test]
+    fn an_interface_listener_does_not_answer_loopback() {
+        assert!(reaches(NIC, NIC));
+        assert!(!reaches(NIC, LO));
+    }
+}
