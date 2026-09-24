@@ -383,6 +383,106 @@ that binds, silently, on the only workload that notices.
    "Known-broken" table. Three candidate mechanisms and the discriminators are
    recorded there; test the contention one first, because it is the only one that
    makes it a non-issue.
+6. **herd (PID 1) eats all physical memory after a chatty service dies —
+   root-caused, reproduced and FIXED 2026-09-24 (kernel and herd, each
+   sufficient alone; see "Fixed" at the end of this item).** On the metal, ~20 min
+   after a boot on `67a9a4b5` with the herd from `ca859980`, `free -h` read:
+
+   ```
+                 total        used        free      shared  buff/cache   available
+   Mem:          15.9G       15.4G        1.4M           0      516.8M      161.1M
+   ```
+
+   By then every exec segfaulted (the page fault behind it had no frame to
+   use), sshd fell back to builtin-only paws, and kot (the akuma-miot mesh
+   node, a herd service) was dead and never restarted. `/proc/<pid>/status`
+   says `VmRSS: 0` for every process, so nothing in userspace could name the
+   culprit; `[PSTATS]` could: PID 1's `pgfault` rose **2,182,670 pages** in
+   120 s while `pmm` free fell **2,186,942** — the same number — at ~900 k
+   syscalls/s.
+
+   **The mechanism, three pieces, each harmless alone:**
+
+   - `sys_wait4` (`akuma-syscalls-glue/src/proc.rs`) returns a pid as reaped,
+     but `reap_child_channel` (`akuma-exec/src/process/children.rs`) **keeps
+     the registry entry while the child's stdout still holds unread data**. So
+     the next `wait4(-1)` finds the same exited child and returns it again,
+     indefinitely. A kernel bug: `wait4` must never hand back one pid twice.
+   - herd's orphan sweep (`5a2b6cc7`, `while let Some(status) = wait_any()`)
+     loops until `wait4` has nothing left — which, given the above, is never.
+     The pid is a still-`Running` service, so every pass does
+     `exited.push((name.clone(), …))`: an unbounded `Vec`, ~80 B per pass, one
+     new page per ~50 passes — the measured ratio. It never reaches its
+     `sleep_ms`, so nothing else herd does (restarts, reloads, log drains)
+     happens again.
+   - The unread data is guaranteed by herd itself: it drains at most 1 KiB per
+     service per pass, and a pass only happens when **every** service has
+     written something — `poll_all_stdout`'s `read_fd` on a `ChildStdout` fd
+     **blocks** (no `O_NONBLOCK`; the glue arm parks until data or exit). With
+     a quiet sshd beside it, herd advanced about once per ssh session, and
+     kot's backlog was large when it died.
+
+   **Reproduced** under Firecracker on the box's Ubuntu (4 vCPU, 2 GiB, the
+   metal's own kernel `37bd1301…` and `/bin/herd` `1a07c71d…`, images in
+   `/root/leakrepro/`): one service that prints and exits
+   (`busybox seq 1 5000`, ~24 KB). 25 s after it started, herd had made
+   16.8 M `wait4` calls, taken 390,667 page faults, and left `pmm=0` free;
+   `Service burst exited` never printed. Controls in the same directory:
+   with only a silent service, herd simply parks in `read` forever (`[SLOT]`
+   `sc=0 park=akuma-syscalls-glue/src/fs.rs:665`), on this kernel, on the
+   Sep-21 `.good` kernel and with the Sep-19 herd alike — that half is old.
+
+   **Reading PSTATS on amd64:** `syscall_name` labels numbers from the
+   *aarch64* table and a syscall is counted under both its x86_64 and its
+   canonical number, so one call shows up as a pair with equal counts: herd's
+   `getdents64` + `wait4` pair is x86_64 `wait4` (61) alone, and
+   `unlinkat` + `nanosleep` is `nanosleep` (35).
+
+   **Fixed**, both halves, each verified alone and together under the same
+   Firecracker rig (`/root/leakrepro/matrix.sh` on the box's Ubuntu, runs
+   D–H):
+
+   - (a) **kernel** — `reap_child_channel` keeps a still-buffered entry for
+     its `ChildStdout` reader but rewrites its parent to `REAPED_PARENT`
+     (`Pid::MAX`), so no `wait*` can find it again. Host test
+     `reaping_a_buffered_child_keeps_its_output_but_not_the_child`. Covers
+     both reapers: glue's `wait4` and amd64's private `sys_waitpid` (#303,
+     through `reap_exec_process`).
+   - (b) **herd** — service stdout is `O_NONBLOCK` (`nonblocking_stdout`) and
+     `poll_all_stdout` drains to `EAGAIN` (≤ 64 × 4 KiB per service per pass);
+     the orphan sweep ends on a repeated pid, records a service once, and
+     stops after 256 reaps a tick.
+
+   | run | kernel | herd | pmm free, 29 s → 89 s | herd `pgfault` | reloads |
+   |---|---|---|---|---|---|
+   | D | old | old | 391,448 → **0** | 390,667 | 1 |
+   | E | fixed | fixed | 391,447 → 390,909 | 17 | 5 |
+   | F | fixed | old | 391,447 → 390,399 | 18 | 5 |
+   | G | old | fixed | 391,448 → 390,910 | 17 | 5 |
+   | H (silent svc + orphans) | fixed | fixed | 390,942 → 374,509 | 0 | 5 (was 0) |
+
+   Installed on the metal's `sdb1` the same day (`/boot/akuma-amd64` md5
+   `e3a301b8…`, `/bin/herd` `6a85a1d0…`; the pre-fix files are `.prev`), **not
+   yet booted there**. `uname` still says `8b4decf2`: the fix was uncommitted
+   when built, so identify it by md5.
+
+   **Still open, found by the same rig:**
+
+   - **Orphans of a dead *thread* are never reparented** (run H: ~64 MB/min
+     gone with herd's own `pgfault` at 0, and herd never once prints
+     `reaped`). On Akuma every thread has its own pid, and a child spawned from
+     a worker thread records *that* pid as its parent — the metal's leftover
+     zombie was `sh` with `PPid: 23`, a kot tokio worker. amd64's exit path
+     (`usermode.rs`, `reparent_children_to(dying, 1)`) moves only `dying`'s
+     own children; glue's `exit_group` path walks every member of the group.
+     A slow leak, not a fast one, but unbounded.
+   - **herd revives `restart = false` services anyway.** Observed in the same
+     rig: a service exiting 7 was started again 72 times in 110 s on the old
+     herd. With herd no longer parked in `read` it is much worse — a
+     `restart = false` one-shot (`busybox seq`, exit 0) ran **~700 times in
+     85 s** in runs E–G. Not a leak (memory flat), but a real misbehaviour.
+     Likely cause, not yet confirmed: the exit lands in `Stopped`, and
+     `start_stopped_services` starts every `Stopped` service.
 
 ---
 

@@ -978,7 +978,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                 match spawn_res {
                     Some(SpawnResult { pid, stdout_fd }) => {
                         svc.pid = Some(pid);
-                        svc.stdout_fd = Some(stdout_fd);
+                        svc.stdout_fd = Some(nonblocking_stdout(stdout_fd));
                         svc.state = ServiceState::Running;
                         svc.restart_at_ms = None;
                         print("[herd] Started ");
@@ -1146,7 +1146,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         Some(SpawnResult { pid, stdout_fd }) => {
             if let Some(svc) = state.services.get_mut(name) {
                 svc.pid = Some(pid);
-                svc.stdout_fd = Some(stdout_fd);
+                svc.stdout_fd = Some(nonblocking_stdout(stdout_fd));
                 svc.state = ServiceState::Running;
                 svc.restart_at_ms = None;
                 print("[herd] Started ");
@@ -1263,15 +1263,46 @@ fn process_control_commands(state: &mut HerdState) {
 // Output Polling
 // ============================================================================
 
+/// Make a freshly spawned service's stdout non-blocking, so draining it can
+/// never park the supervisor.
+///
+/// A `ChildStdout` read with nothing buffered **blocks** until the child writes
+/// or exits (`akuma-syscalls-glue`'s read arm) unless the fd is `O_NONBLOCK`.
+/// Without this, one quiet service (sshd between connections) froze the whole
+/// loop inside `poll_all_stdout`: no restarts, no reloads, and — because each
+/// pass drained only 1 KiB — a chatty neighbour's output piling up in its
+/// channel. That backlog is what turned the orphan sweep's `wait4` loop into
+/// a machine-wide memory leak on 2026-09-24
+/// (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 6).
+fn nonblocking_stdout(fd: u32) -> u32 {
+    if libakuma::set_nonblocking(fd as i32, true) < 0 {
+        print("[herd] Warning: could not make a service stdout non-blocking\n");
+    }
+    fd
+}
+
+/// Upper bound on reads per service per pass: drain what is buffered, but a
+/// service that writes faster than herd reads must not keep it in this loop.
+const MAX_READS_PER_PASS: usize = 64;
+
 fn poll_all_stdout(state: &mut HerdState) {
     let mut outputs: Vec<(String, Vec<u8>)> = Vec::new();
 
     for (name, svc) in state.services.iter() {
         if let Some(fd) = svc.stdout_fd {
-            let mut buf = [0u8; 1024];
-            let n = read_fd(fd as i32, &mut buf);
-            if n > 0 {
-                outputs.push((name.clone(), buf[..n as usize].to_vec()));
+            // Until EAGAIN (< 0) or EOF (0): the fd is non-blocking, so an empty
+            // channel costs one syscall rather than parking herd.
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            for _ in 0..MAX_READS_PER_PASS {
+                let n = read_fd(fd as i32, &mut buf);
+                if n <= 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n as usize]);
+            }
+            if !data.is_empty() {
+                outputs.push((name.clone(), data));
             }
         }
     }
@@ -1320,12 +1351,32 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
     // its targeted wait and here. Route it through the same exit handling: a
     // pid reaped once can never be waited for again, so dropping it would leave
     // the service marked Running with a pid that no longer exists.
+    //
+    // **Bounded, and never trusting `wait4` to make progress.** A reaped pid
+    // must never come back, but on 2026-09-24 one did (a kernel bug, since
+    // fixed in `reap_child_channel`): the same dead service ~900 k times a
+    // second, each pass pushing onto `exited`, until the machine had no
+    // physical memory left (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`
+    // §6 item 6). So a pid seen twice ends the sweep, a service is recorded
+    // at most once, and the sweep stops after `MAX_ORPHAN_REAPS` regardless —
+    // anything left is picked up on the next tick.
+    const MAX_ORPHAN_REAPS: usize = 256;
     let mut orphans = 0usize;
-    while let Some(status) = wait_any() {
+    let mut seen: Vec<u32> = Vec::new();
+    while seen.len() < MAX_ORPHAN_REAPS {
+        let Some(status) = wait_any() else { break };
+        if seen.contains(&status.pid) {
+            print("[herd] Warning: wait4 returned pid ");
+            print_dec(status.pid as usize);
+            print(" twice; ending the orphan sweep\n");
+            break;
+        }
+        seen.push(status.pid);
         let owner = state.services.iter()
             .find(|(_, svc)| svc.state == ServiceState::Running && svc.pid == Some(status.pid))
             .map(|(name, _)| name.clone());
         match owner {
+            Some(name) if exited.iter().any(|(n, _, _)| *n == name) => {}
             Some(name) => {
                 let how = Exit { signaled: status.signaled(), exit_code: status.exit_code() };
                 exited.push((name, how, status.shell_code()));

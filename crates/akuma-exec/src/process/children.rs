@@ -187,17 +187,40 @@ pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
 /// can arrive — an empty buffer stays empty, and a non-empty one only shrinks as
 /// the reader drains it. Returns `true` if the channel was removed, `false` if it
 /// was kept (data still buffered) or was absent.
+///
+/// # A kept entry is no longer anybody's child
+///
+/// Keeping the entry for its stdout must not keep the *child*: every caller has
+/// just handed this pid back from a `wait*` as reaped, and a reaped pid that
+/// `find_exited_child` can still find is returned again by the next
+/// `wait4(-1)` — forever, since the buffer only drains if someone reads it. So
+/// the kept entry's parent is rewritten to [`REAPED_PARENT`], which no process
+/// is: `get_child_channel` (the `ChildStdout` reader) still finds it by pid,
+/// while `find_exited_child`, `has_children`, `is_child_of_group` and
+/// `parent_pid_of`'s callers all stop seeing it.
+///
+/// Found 2026-09-24 on the bare-metal amd64 box: herd's orphan sweep
+/// (`while let Some(_) = wait_any()`) got a dead, still-buffered service back
+/// ~900 k times a second and grew a `Vec` until every physical page was gone
+/// (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 6).
 pub fn reap_child_channel(child_pid: Pid) -> bool {
     with_irqs_disabled(|| {
         let mut map = CHILD_CHANNELS.lock();
-        let has_data = matches!(map.get(&child_pid), Some((ch, _)) if ch.has_stdout_data());
-        if has_data {
-            false
-        } else {
-            map.remove(&child_pid).is_some()
+        match map.get_mut(&child_pid) {
+            Some((ch, ppid)) if ch.has_stdout_data() => {
+                *ppid = REAPED_PARENT;
+                false
+            }
+            Some(_) => map.remove(&child_pid).is_some(),
+            None => false,
         }
     })
 }
+
+/// The parent recorded for a child that has been reaped but whose channel is
+/// kept for a `ChildStdout` reader still draining it (see
+/// [`reap_child_channel`]). No process has this pid, so no `wait*` can find it.
+pub const REAPED_PARENT: Pid = Pid::MAX;
 
 /// Find any exited child of the given parent. Returns (child_pid, channel).
 pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> {
@@ -1837,6 +1860,36 @@ mod child_channel_drain_tests {
         remove_child_channel(live);
         remove_child_channel(dead);
         remove_child_channel(unrelated);
+    }
+
+    #[test]
+    fn reaping_a_buffered_child_keeps_its_output_but_not_the_child() {
+        // The herd memory-eater: `wait4(-1)` reported this child reaped, but
+        // the entry stayed (its stdout was not drained) and `find_exited_child`
+        // returned it again on every following call — a `while wait_any()`
+        // loop never ended.
+        let parent: Pid = 0x7000_0061;
+        let buffered: Pid = 0x7000_0062;
+        let drained: Pid = 0x7000_0063;
+
+        let ch = Arc::new(ProcessChannel::new());
+        ch.write(b"last words\n");
+        ch.set_exited(1);
+        register_child_channel(buffered, ch, parent);
+        let empty = Arc::new(ProcessChannel::new());
+        empty.set_exited(0);
+        register_child_channel(drained, empty, parent);
+
+        assert!(!reap_child_channel(buffered), "kept: it has unread output");
+        assert!(reap_child_channel(drained), "an empty one is removed");
+        assert!(find_exited_child(parent).is_none(), "a reaped pid is never returned twice");
+        assert!(!has_children(parent), "so the next wait4(-1) answers ECHILD");
+        assert!(!is_child_of_group(buffered, parent), "wait4(<pid>) on it is ECHILD too");
+        let kept = get_child_channel(buffered).expect("the ChildStdout reader still finds it");
+        assert_eq!(kept.read_all(), b"last words\n");
+        assert!(get_child_channel(drained).is_none());
+
+        remove_child_channel(buffered);
     }
 
     #[test]
