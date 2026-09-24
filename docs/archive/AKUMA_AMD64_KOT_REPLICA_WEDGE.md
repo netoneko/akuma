@@ -181,6 +181,13 @@ killed the old `miot node` by PID, sshd on the metal box kept authenticating
 but every exec returned status 241 until a power cycle. Let herd restart
 things; don't `kill` by hand there.
 
+> **Correction (2026-09-24):** the "every exec returned 241" half of this is
+> root-caused and fixed, and it was neither `kill -9` nor a thread-PID. 241 is a
+> SIGTERM death. The kill took out a kot worker, which stamped kot's process slot
+> with a group death status that `sys_spawn` never cleared, so every later spawn
+> into that slot died of SIGTERM. See
+> [`AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`](AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md).
+
 ## The rig: ryzen Firecracker guest (cheap to reboot)
 
 This is the place to iterate. A reboot is a process restart, with no

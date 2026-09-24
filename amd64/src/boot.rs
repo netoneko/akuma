@@ -539,6 +539,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::socketpair_smoke_test(t);
     usermode::fdprobe_test(t);
     usermode::spawn_test(t);
+    usermode::spawn_stale_group_state_test(t);
     usermode::winsize_to_child_test(t);
     usermode::session_terminal_is_private_test(t);
     usermode::wait4_ownership_test(t);

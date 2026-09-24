@@ -3557,6 +3557,31 @@ extern "C" fn proc_entry() -> ! {
 fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
     let task_slot = crate::sched::spawn_in_space_unpublished(proc_entry, root)?;
     crate::sched::seed_proc_slot(task_slot, proc_slot);
+    // **A new process in this slot starts with a clean group.** Both flags are
+    // indexed by process slot, and slots are recycled: `sys_spawn` takes the
+    // lowest free SPAWN row, so the slot a dead process just vacated is the
+    // very next one handed out. Until 2026-09-24 only the `fork` path cleared
+    // them, and a spawn inherited whatever the previous occupant left:
+    //
+    // - `GROUP_EXIT_STATUS` — a multithreaded process whose worker died by a
+    //   default-action signal (`notify_group_of_thread_fatal`) stamps
+    //   `-(sig)` here. `deliver_pending` checks it before anything else, so
+    //   every later spawn into the slot exited at its first syscall return as
+    //   that signal. The captured case: `kot` (tokio, many workers) took a
+    //   `SIGTERM` from herd or a `kill <pid>`, a worker died of it, and from
+    //   then on **every** exec on the box returned 241 (`-15 & 0xff`) with no
+    //   output until a power cycle — `sshd`'s shells, herd's restarts of kot
+    //   itself.
+    // - `GROUP_EXIT` — left set by any multithreaded `exit_group`. Harmless to
+    //   a single-threaded successor (the main thread never tests it), but
+    //   every thread a threaded successor creates would leave ring 3 at its
+    //   first syscall.
+    //
+    // Cleared here rather than at each caller because this is the one claim
+    // every non-`fork` process goes through (`sys_spawn`, init, the self-tests).
+    // Regression: `spawn_stale_group_state_test`.
+    crate::thread::clear_group_exiting(proc_slot);
+    crate::thread::clear_group_exit_status(proc_slot);
     Some(task_slot)
 }
 
@@ -5414,7 +5439,8 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
 ///
 /// Non-blocking regardless of `options`: `sshd`'s bridge polls it every tick and
 /// must keep draining the child's stdout while it waits. Returns `pid` and
-/// writes the wait status (`exit_code << 8`) once the child has exited, `0`
+/// writes the wait status (`encode_wait_status`: `code << 8`, or `WTERMSIG` for
+/// a signal death) once the child has exited, `0`
 /// while it is still running, `-ESRCH` for an unknown pid.
 pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     use crate::fd::errno;
@@ -5485,7 +5511,14 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     // now; the last `Arc` out drops it, and a reap has no bookkeeping to do.
 
     if status_ptr != 0 {
-        let raw = ((u64::from((code as u32) & 0xff)) << 8) as i32;
+        // Glue's encoder, the one `wait4` uses: a negative code is a signal
+        // death (`-(sig)`) and must read back as `WIFSIGNALED`. This used to be
+        // `(code & 0xff) << 8` for everything, which reported a `SIGTERM` death
+        // as a clean `exit(241)` — to `sshd` (which then sent `exit-status 241`
+        // rather than `exit-signal TERM`) and to herd, whose `signaled()` never
+        // fired. That is what hid the stale `GROUP_EXIT_STATUS` kill
+        // (`spawn_process_task`) behind a meaningless-looking exit code.
+        let raw = akuma_syscalls_glue::proc::encode_wait_status(code) as i32;
         // A bad `status` pointer loses the status, not the reap: the child is
         // already gone and `wait4` reporting its pid is the useful half.
         let _ = crate::uaccess::write_val::<i32>(status_ptr, raw);
@@ -5724,6 +5757,82 @@ pub fn spawn_test(t: &mut Suite) {
         "spawn: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
+    );
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// **A spawn does not inherit the previous occupant's group death.**
+///
+/// The bug this pins: `GROUP_EXIT_STATUS` and `GROUP_EXIT` are indexed by
+/// process slot, only `fork` cleared them, and `sys_spawn` hands out the lowest
+/// free slot — the one a dead process just vacated. After a multithreaded
+/// process lost a worker to a default-action `SIGTERM` (kot, stopped by herd or
+/// `kill <pid>`), every later spawn into that slot exited at its first syscall
+/// return as `SIGTERM`: exit 241, no output, until a power cycle. See
+/// `spawn_process_task`.
+///
+/// Reproduced directly rather than through a threaded victim: poison the exact
+/// slot `sys_spawn` will pick next with what `notify_group_of_thread_fatal` and
+/// a threaded `exit_group` leave behind, then spawn `/bin/hello`. Without the
+/// clear the child is reported `WIFSIGNALED` with `WTERMSIG == 15`.
+pub fn spawn_stale_group_state_test(t: &mut Suite) {
+    const HELLO_ALL_OK: u64 = 0x7F;
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+    const SIGTERM: u32 = 15;
+
+    sweep_reaped_spawn_rows();
+    // The same search `sys_spawn` runs, so the poison lands where the child will.
+    let next = {
+        // SAFETY: raw-pointer read under the BKL.
+        let spawn = unsafe { &*spawn_table() };
+        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| spawn[s - SPAWN_SLOT_BASE].is_none())
+    };
+    let Some(next) = next else {
+        t.check("stale group: a free spawn slot to poison", false);
+        return;
+    };
+    crate::thread::set_group_exit_status(next, (-(SIGTERM as i32)) as u32);
+    crate::thread::set_group_exiting(next);
+
+    let path = b"/bin/hello\0";
+    let arg0 = b"hello\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    if !t.check("stale group: sys_spawn returned a handle", r < ERRNO_FLOOR) {
+        crate::thread::clear_group_exit_status(next);
+        crate::thread::clear_group_exiting(next);
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    t.check_eq(
+        "stale group: the child took the poisoned slot",
+        spawn_row_of(pid).map_or(u64::MAX, |off| (off + SPAWN_SLOT_BASE) as u64),
+        next as u64,
+    );
+    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+
+    let mut buf = [0u8; 64];
+    let mut st: i32 = -1;
+    let mut reaped = false;
+    for _ in 0..500_000u32 {
+        let _ = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            reaped = true;
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
+    t.check("stale group: the child was reaped", reaped);
+    // Two checks, so a failure says which half broke: a signal death here is
+    // the stale-status kill itself; a wrong exit code with no signal is
+    // something else.
+    t.check_eq("stale group: the child was not killed by a signal", u64::from((st as u32) & 0x7f), 0);
+    t.check_eq(
+        "stale group: and ran to its own exit status",
+        ((st >> 8) & 0xff) as u64,
+        HELLO_ALL_OK,
     );
 }
 
