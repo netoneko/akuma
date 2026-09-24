@@ -16,8 +16,14 @@ one-shot and full-screen modes, against z.ai as well as the LAN
 (`AMD64_TRASHCAN_ISSUES.md` §§1-5). **Later the same day the whole loop ran
 inside the machine** — clone, branch, `kbuild`, `kinstall`, `reboot -f`, back
 up on its own SHA (`AKUMA_FROM_SCRATCH.md` §9.1). What has not happened yet is
-the loop driven by an **agent** rather than a person; that is the walk's
-"[NEXT]".
+the loop driven by an **agent** rather than a person.
+**2026-09-20 → 09-24** the workstation also became a **seat**: `meow`'s litter and then akuma-miot's `kot` chain ran on it, found a
+run of kernel bugs no probe had (RTL8169 receive, BKL-held parks, `EPOLLET`
+re-arm, a trap entry that never cleared `DF`, unreapable orphans), and on 09-24
+it holds one of seven seats in **the teahouse** — a mesh across two kernels,
+two architectures, home and AWS (`../akuma-miot/docs/TEAHOUSE.md`). What is
+left is that setup on this kernel **collectively, partly autonomously and on
+a variety of platforms**; that is the walk's "YOU ARE HERE".
 `cargo build --release` for the amd64 kernel ran to completion
 inside Akuma/amd64 under Firecracker on 09-13: 94 crates, 7 m 53 s, `rc=0`, and
 a 2 895 920-byte `ET_EXEC` x86-64 image with a PVH note at the end of it.
@@ -668,7 +674,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > > (`AKUMA_AMD64_SPAWN_ROW_STDIO.md`). `wait4` has been glue's since seam
 > > slice 3. What is left of C1 is the **lifecycle unification** (§4 option 2
 > > of the seam prompt) and the **`ProcessChannel`** item; see the walk's
-> > "YOU ARE HERE".
+> > 09-11 boxes (the "YOU ARE HERE" this pointed at has moved on).
 >
 > **A third thing came out of writing those, and it is not in this chart:** the
 > two comments authorising the absence of a TLB shootdown both state
@@ -2031,7 +2037,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         `cp`'d to `/boot/akuma-amd64` and `reboot -f`'d. Ubuntu built
         the first one and was not touched again.
    ▼
- [09-19 late] ═══ YOU ARE HERE ═══ IT PATCHES ITSELF; THE AGENT IS NEXT
+ [09-19 late] ═══ IT PATCHES ITSELF ═══ THE AGENT IS NEXT
    │
    ├──► **The loop closed by hand, with nothing outside the machine.**
    │   `git fetch` on the box (3.1 s, under build load), a branch off the
@@ -2135,57 +2141,213 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
                           docs: AKUMA_AMD64_SWITCH_FREED_CR3_UAF.md,
                                 AKUMA_AMD64_NO_SLOT_RECYCLER.md
    ▼
- [NEXT] ═══ THE FIRST PATCH WRITTEN ON THE BOX ═══
+ [09-20] ═══ THE LITTER MOVES ONTO THE METAL ═══ AND THE LOAD FINDS THE BUGS
    │
-   ├──► **GLM writes a kernel patch, on the metal.** Every step of the
-   │   loop above was driven by a person; the next iteration is `meow` +
-   │   GLM on the box driving it — edit, `kbuild`, `kinstall`, `reboot
-   │   -f`, continue on the new kernel. The chosen first patch is **Intel
-   │   HDA audio** (`runbooks/add-intel-hda-audio.md`), picked because it
-   │   is a *new* subsystem rather than an edit to an existing one, for
-   │   hardware only this machine has (`8086:8c20` at `00:1b.0`) that no
-   │   host test and no QEMU fast lane can stand in for, and because "did
-   │   it work?" is answerable by a human in one second from across the
-   │   room. Precedent, dated: GLM-4.7 wrote the first program authored
-   │   *inside* Akuma on 2026-08-22 and patched the tty layer on 08-25 —
-   │   both in a **guest**, on AArch64, from a tree supplied from outside.
-   │   The metal, from a repository the machine cloned itself, is the
-   │   increment.
+   │   `meow`'s litter — resident agents, an in-meow hub, a hand-rolled
+   │   raft subset (`userspace/meow`, branch `swarm`: `docs/LITTER_*.md`)
+   │   — was deployed on the trashcan and on the Ryzen Firecracker guest.
+   │   An agent fleet is a load no benchmark had applied: hours of
+   │   sockets, threads and restarts. It found kernel bugs faster than
+   │   any probe written for the purpose.
    │
-   ├──► **The gate, and it has not moved.** `AKUMA_FROM_SCRATCH.md` §5:
-   │   the SMP user-process corruption is not fixed — at SMP=4 on the
-   │   metal roughly half of ten-minute builds die `rc=139`, and **`-j1`
-   │   is not protective** (35 crates in, once). Two areas need to be
-   │   *severely* stabilized before the unattended version is attempted at
-   │   all, not merely to have worked once: **networking** (an agent's
-   │   session is hours of HTTPS over a driver no test and no fast-lane
-   │   target executes) and **processes/threads** (a build is thousands of
-   │   `fork`/`execve`/`clone`, and every tool call is one more). Both
+   ├──► **The receiver that went deaf, three ways.** The RTL8169 stall
+   │   watch was disarmed by the first frame (a new `Silent` arm, as
+   │   host-tested logic in `akuma-net-rtl8169::stall`); it was blind to a
+   │   receiver that never started (a `blind` arm); and a restarted
+   │   receiver rewinds while the cursor does not (`resync_rx_cursor`,
+   │   scanned from the idle lap with no MMIO).
+   │                        docs: AMD64_RTL8169_SILENT_STALL.md, this
+   │                              doc's 2026-09-20 sections
+   │
+   ├──► **The BKL, held by a parked thread.** `sched::yield_now` took the
+   │   lock "just for the switch" inside a dropped window, so a socket
+   │   `read(2)` that never completed kept the core's lock for everything
+   │   that ran there — sshd could not send its banner. Fixed, plus a
+   │   Linux-style `prev` handoff and an idle loop that stopped owning the
+   │   lock for life. **Release-across-park was tried and reverted** the
+   │   same night: it wedged the netpoll daemon's first parks.
+   │                        docs: AKUMA_AMD64_BKL_NETWORKING.md
+   │
+   ├──► **`bind()` never returned `EADDRINUSE`**, on either kernel, so
+   │   meow's bind-race hub election had three winners. **A ring-3 `#UD`
+   │   halted the machine** (OpenBLAS picking a SIMD kernel this CPU lacks,
+   │   in Alpine's `llama-server`); contained now, alongside `fchdir` and
+   │   `#!` for `execve`. `llama-server` serves HTTP here once it is built
+   │   without OpenBLAS. **The thread-slot reaper landed** — three of the
+   │   four gaps of amd64 never taking a slot through `FREE`.
+   │                        docs: AKUMA_NET_BIND_NO_ADDRINUSE.md,
+   │                              AKUMA_AMD64_UD_CRASH_CONTAINMENT.md,
+   │                              AKUMA_AMD64_NO_SLOT_RECYCLER.md §8
+   │
+   └──► **What did not work: two Akuma litters did not join.** A thread
+        `clone`d by meow dies at its first `write(2)` — on the metal as
+        well as in the guest — so the guest's hub could never serve.
+        Found beside it and still open: herd starting a service twice,
+        herd's `workdir` triple-faulting through `SPAWN_EXT`, and two Akuma
+        boxes unable to reach each other across proxy-ARP.
+                          docs: LITTER_TRASHCAN_RYZEN_JOIN.md,
+                                AMD64_SPAWNED_THREAD_NEVER_RUNS.md
+   ▼
+ [09-21] ═══ A LAPTOP'S HUB, A METAL PEER ═══ AND THE CHAIN BEGINS
+   │
+   ├──► **Phase 4 routed around the broken spawn path.** The Ryzen laptop
+   │   ran meow as a plain Linux process — hub and leader, on
+   │   `gemma3:27b` — and the trashcan's Akuma joined it as a *client*
+   │   only, so it never had to serve a socket from a spawned thread.
+   │                        docs: userspace/meow (branch `swarm`)
+   │                              docs/LITTER_EXPERIMENT_PHASE_4.md
+   │
+   ├──► **`kill -9` on a litter agent took the box dark.** A photograph
+   │   of the console had the panic: a sibling thread parked in
+   │   `wait_until` held a raw smoltcp handle that `poll()` then freed, and
+   │   `SocketSet::get` panics on a dead handle. ~20 sites go through
+   │   guarded accessors now, pinned by host tests.
+   │                        docs: AMD64_SMOLTCP_STALE_HANDLE_KILL9_WEDGE.md
+   │
+   └──► **The coordination left meow.** `../akuma-miot` was created the
+        same day: `kot`, a chain node whose runtime is a FRAME pallet
+        compiled as native Rust (no wasm), with the task lifecycle as a
+        pure host-tested state machine. The litter's hand-rolled raft
+        became a chain with a ledger.
+                          docs: ../akuma-miot/docs/RESULTS.md
+   ▼
+ [09-22] ═══ A DATABASE ON THE METAL ═══
+   │
+   ├──► **`kot` keeps its chain in ParityDB, and ParityDB needs a
+   │   writable `MAP_SHARED`.** amd64 refused that by design; the
+   │   refusal was hiding an ext2 `truncate` that answered `Ok` for an
+   │   extend without growing the file, and a missing `posix_fadvise`
+   │   row. AArch64 had its own pair: no `fadvise64` arm, and lazy
+   │   shared-writable mappings that were never written back. Found by
+   │   akuma-miot's `storeprobe`, which had shipped for weeks and never
+   │   been run.
+   │                        docs: AKUMA_AMD64_SHARED_WRITE_MMAP.md,
+   │                              MIOT_MESH_ON_AKUMA.md
+   │
+   ├──► **A full `/bin` deleted `/bin/sh`.** `mkdisk.sh` linked ~400
+   │   busybox applets with `debugfs ln`, which cannot grow a full
+   │   directory and whose errors were discarded — so every name from
+   │   `pwd` on went missing, `sh` among them, and sshd answered every
+   │   session with `failed to spawn '/bin/sh'`. It pre-grows `/bin` now
+   │   and fails loudly when `sh` is absent.
+   │
+   └──► **A `#GP` in `sys_clock_gettime`**, photographed off the TV:
+        three theories, none confirmed. The next night explained it.
+                          docs: AKUMA_AMD64_CLOCK_GETTIME_SWITCH_FRAME_GP.md
+   ▼
+ [09-23] ═══ THE BACKWARDS memcpy ═══ FIVE CATS
+   │
+   ├──► **Every hand-written trap entry forgot `cld`.** The second photo
+   │   was a ring-0 `#PF` with `rflags` bit 10 — `DF` — set. A fault taken
+   │   mid-`std; rep movsb` (musl's `memmove`) ran every kernel
+   │   `memcpy`/`memset` *backwards* into the previous allocation. That
+   │   is both photographed deaths, and the geometry the `#GP` doc had
+   │   reconstructed without being able to name the writer. One `cld` per
+   │   stub, a tripwire, a boot-suite case; deployed that night.
+   │                        docs: AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md
+   │
+   ├──► **No orphan was ever reapable**, on either kernel: exit reparented
+   │   the process table and not the child-channel registry that
+   │   `wait4(-1)` reads. Fixed in `akuma-exec` for both, plus a
+   │   `wait4(-1)` sweep in herd.
+   │                        docs: AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md
+   │
+   └──► **A `kot` node went deaf within minutes.** amd64 serves `recv`/
+        `send` from its own `sock.rs`, which never re-armed `EPOLLET` —
+        and tokio reads with `recv`, so each connection got exactly one
+        edge. Plus a missing `accept4` row. Both amd64 seats rejoined, and
+        the fleet was five cats. Still open: a `kot` worker on the metal
+        spinning on `writev` at ~650 k calls/s.
+                          docs: AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md
+   ▼
+ [09-24] ═══ THE TEAHOUSE (茶馆) ═══ SEVEN CATS, ONE POT
+   │
+   ├──► **Seven members on one genesis: five at home, two on AWS.**
+   │   Three seats run Akuma — **bare-metal amd64** (the trashcan, `meow`
+   │   on GLM), **Firecracker on real KVM** (amd64, `sora`) and
+   │   **Firecracker nested inside a Lima VM on macOS** (arm64, `mimi`) —
+   │   beside four Linux seats, two of them `systemd-nspawn` containers
+   │   on one EC2 `t4g.nano`. Two kernels, two architectures, one chain.
+   │   Named by the litter itself: asked "teahouse or treehouse?", the
+   │   two AWS cats both chose *teahouse*.
+   │
+   ├──► **What ran live, on chain.** A message from every member in one
+   │   session. mTLS pinned to genesis keys across the public internet,
+   │   no VPN. Elections across the WAN: the primary moved yuki → tama →
+   │   shiro → tama → shiro → yuki (terms 2-8) with no operator. And
+   │   tools that return their results: `meow` ran `Bash` `uname -a` on
+   │   this machine from inside the mesh and got back
+   │   `Akuma akuma 0.0.8 77b14780-release-smp-shared x86_64`.
+   │
+   ├──► **The honest limits are this kernel's.** The fleet was never all
+   │   on one build at once, and **the Akuma members are the fragile
+   │   three of seven**: the trashcan stops spawning processes
+   │   (`failed to spawn '/bin/sh'`) until power-cycled, `mimi`'s herd
+   │   lists `kot` and never starts it, and `sora` answers ping and
+   │   nothing else. Quorum is 4 of 7, so with the three Akuma seats down
+   │   the teahouse runs at exactly quorum.
+   │
+   └──► **A rescue that needs no exec — and the gap it cannot cover.**
+        The same day sshd gained `builtin-paws`: when neither `/bin/sh`
+        nor `/bin/paws` can be spawned it runs paws *inside* sshd,
+        builtins only, with `reboot` as a direct `reboot(2)`. Verified
+        under QEMU with both spawns forced to fail (exec, interactive, and
+        a `reboot` that reset the VM), then deployed to the trashcan and
+        exercised on a second port before the swap. Activating it found
+        the next hole: herd did not restart the killed sshd, and nothing
+        else on the box could take a command. Power cycle; the new sshd
+        came up at boot.
+                          docs: ../akuma-miot/docs/TEAHOUSE.md,
+                                AMD64_TRASHCAN_ISSUES.md §9
+   ▼
+ [NOW] ═══ YOU ARE HERE ═══ THE TEAHOUSE ON AKUMA: COLLECTIVE, PARTLY AUTONOMOUS, PORTABLE
+   │
+   │   The last step is not another feature. It is this setup running on
+   │   **this kernel**, together, for days — carried in part by the cats
+   │   themselves — and deployable to more machines than it happens to
+   │   run on today.
+   │
+   ├──► **Collectively: every Akuma seat holds its seat.** Today the three
+   │   Akuma members are the three that fall over. The bar is the Linux
+   │   seats' bar: days, not minutes, with no power cycle. The known
+   │   blockers are all written down — the `clone`d thread that dies at
+   │   its first `write(2)` (`AMD64_SPAWNED_THREAD_NEVER_RUNS.md`), the
+   │   `writev` spin (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md` §6.1), herd
+   │   restarting and duplicating services (`AMD64_TRASHCAN_ISSUES.md` §9,
+   │   `HERD_DUPLICATE_SERVICE_PROCESSES.md`), and whatever stops the
+   │   trashcan spawning processes. Behind them is the gate that has not
+   │   moved since 09-19 (`AKUMA_FROM_SCRATCH.md` §5): **networking** and
+   │   **processes/threads** must be *severely* stabilized, because both
    │   fail probabilistically, hours in, and destroy their own evidence —
-   │   which is exactly what autonomy multiplies. `userspace/amd64/
-   │   fbstress/` is the probe aimed at it, and it is also `llama.cpp`'s
-   │   shape: many threads over one large file-backed `mmap`.
+   │   which is exactly what an always-on fleet multiplies.
    │
-   ├──► **The userland is still borrowed.** `/bin/sh`, `sshd`, `herd` and
-   │   `box` all *build* on the box now (§9) and **not one has been
-   │   installed from a box-built copy**. A machine that can rebuild its
-   │   kernel but not its shell is a very good cross-compilation target.
+   ├──► **To some degree autonomously: the cats carry part of the loop.**
+   │   The step this box was headed for on 09-19 is still the first
+   │   milestone: GLM on the metal writing a kernel patch — edit,
+   │   `kbuild`, `kinstall`, `reboot -f`, continue on the new kernel —
+   │   with **Intel HDA audio** (`runbooks/add-intel-hda-audio.md`) as the
+   │   chosen first patch: a new subsystem, on hardware only this machine
+   │   has, whose success a human can judge from across the room. Beyond
+   │   one patch: the teahouse's task ledger handing work to whichever
+   │   seat can do it, and recovery without a person — `builtin-paws`'s
+   │   `reboot` is the first piece, and a supervisor that actually
+   │   restarts what it supervises is the next.
    │
-   ├──► **Speed.** The metal's fixed point was `kbuild -c -j 1`: 95
-   │   crates in **640 s / 632 s**, about **6.7 s per crate**. The guest
-   │   does **1.2 s** per crate at `-j8`. So the remaining gap is ~5x and
-   │   it is *parallelism*, not the device — §2 measures storage as under
-   │   2.3x of a 6.2x. `nosmp` is the deterministic build and is **not
-   │   reachable remotely**; SMP=4 on the metal is where §11 last saw
-   │   `rustc` dereference a pointer overwritten with ASCII.
+   ├──► **Portably: deploy to a variety of platforms.** Akuma already
+   │   holds three seat shapes — bare-metal amd64, Firecracker on KVM
+   │   (amd64), Firecracker nested in a Lima VM on macOS (arm64). The AWS
+   │   seats are Linux in containers. The goal is that a seat's kernel is
+   │   a deployment choice: one procedure per platform, recorded like
+   │   `docs/runbooks/deploy-aws-node.md` in akuma-miot, rather than a
+   │   bring-up per machine.
    │
-   └──► **Carried, unconfirmed:** the 60 s stream-end stall
-        (`AKUMA_AMD64_STREAM_END_STALL.md`) — the RTL8169 watchdog was
-        recalibrated and the 14-byte final chunk identified as
-        `data: [DONE]`, but neither is proven to be the cause. `nca`
-        against z.ai is the live symptom and it is **bimodal**: 3 runs of
-        6 answer in 8-12 s, the other 3 print nothing at all out to its
-        300 s timeout, with no middle case in either direction.
+   └──► **Carried from 09-19, unchanged.** The userland is still borrowed
+        — `/bin/sh`, `sshd`, `herd` and `box` all *build* on the box and
+        none has been installed from a box-built copy. The metal still
+        builds at ~6.7 s per crate against the guest's 1.2 s, a gap that
+        is parallelism rather than the device. And the 60 s stream-end
+        stall (`AKUMA_AMD64_STREAM_END_STALL.md`) is unconfirmed and still
+        bimodal.
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
@@ -2331,7 +2493,7 @@ parity with what the AArch64 self-host already proves.
   │     three walls were the idle spin (`sti; nop; cli` → `hlt`),  │
   │     `git archive` dropping the vendored fonts, and MAX_ARGV    │
   │     256 < cargo's 300-argument rustc line. See the walk's      │
-  │     "YOU ARE HERE".                                            │
+  │     [09-13] box.                                               │
   │   ✔ **a toolchain on the metal — DONE 2026-09-18.** The box    │
   │     builds on its own 64 GB USB root: gen-2 640 s, gen-3 632   │
   │     s, byte-identical (AKUMA_AMD64_BARE_METAL_SELFHOST.md).    │

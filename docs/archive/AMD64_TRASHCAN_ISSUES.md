@@ -983,6 +983,14 @@ orphan-reaping fix (reparent missed the child-channel registry; herd gained a
 `wait4(-1)` sweep) touched. herd writes nothing to disk about its own decisions,
 so the framebuffer was the only place it could have said anything.
 
+**Seen before, on another box.** `MIOT_MESH_ON_AKUMA.md` §5 (2026-09-22)
+records the Firecracker guest's Sep-17 `herd` **not respawning `kot`** after it
+exited on an `ENOSYS`, "despite `restart = true`" — written off then as an old
+binary. A herd with the `wait4(-1)` sweep was installed on the metal on
+2026-09-23 (`AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`, `/bin/herd` md5
+`eb037539…`); **whether the herd that missed this exit was that one was not
+checked** — do that first when picking this up (`md5sum /bin/herd`).
+
 **Second, smaller observation in the same log.** Lines 54-69, from an *earlier*
 restart that herd did perform, show five
 `Failed to bind to 0.0.0.0:2222: … AddrInUse` retries before `Listening` — the
