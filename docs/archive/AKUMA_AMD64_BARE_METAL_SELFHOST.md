@@ -531,8 +531,19 @@ that binds, silently, on the only workload that notices.
      kot: same port, same ParityDB directory). Fix: dispatch 302 through the
      same path as 62 — which also makes sshd's teardown SIGHUP real, the Linux
      behaviour, so check a session's children after.
-     **Fixed 2026-09-24** exactly so (`302 => to_glue_raw(nr::KILL, …)`), not
-     yet validated on the metal. herd's side changed with it: `herd stop` now
+     **Fixed 2026-09-24** exactly so (`302 => to_glue_raw(nr::KILL, …)`).
+     Validated the same evening on `ryzen-akuma-amd64` (Firecracker, kernel
+     `b4a55330`, herd `3ceaab93…`): `herd stop kot` answered
+     `stopped kot (pid 86): killed by signal 15` in 0.9 s, the multi-threaded
+     kot fully gone, then `herd start kot` started one copy and a second
+     `start` answered `already running`. Not yet on the metal (the trashcan
+     still runs `2a9b2aef`).
+     Found on that guest before the redeploy: after 41 h up, **herd (PID 1)
+     was parked in the kernel at `fs.rs:665`** for ~78 000 s (`[SLOT] 3 …
+     park=fs.rs:665 pid=Some(1)`, `in_kernel=78605751ms`), no kot, network
+     dead, sshd alone. Console log kept as
+     `ryzen:~/akuma/boot.log.herd-wedge-20260924`, disk as
+     `disk.img.bak-20260924-herd-kill`. Not investigated. herd's side changed with it: `herd stop` now
      reaches the daemon over `127.0.0.1:7117` instead of a marker file, and
      SIGTERMs, SIGKILLs after 3 s, and reaps before it answers; a pid it
      cannot reap is held as `stopping_pid` and blocks `herd start`

@@ -16,11 +16,11 @@ for Akuma — deliberately small, config-file driven, and `no_std` (musl libc vi
 - **Related docs:** [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md)
   (pinning services to multikernel cores) and the kernel's
   `docs/MULTIKERNEL.md`.
-- **Known issue (proposed fix, not implemented):**
-  [`docs/SIGNAL_EXIT_HANDLING.md`](docs/SIGNAL_EXIT_HANDLING.md) — a
-  signal-killed service is misread as a clean `exit 0`, so it restarts without
-  delay or a retry ceiling; and `stop_service`'s `kill` is a no-op that leaves
-  the process running.
+- **Signal deaths and `kill`:**
+  [`docs/SIGNAL_EXIT_HANDLING.md`](docs/SIGNAL_EXIT_HANDLING.md) — why exits are
+  reaped with `waitpid_status` and stops use `kill_signal` (fixed 2026-08-08).
+  On amd64 the private `kill` syscall was a no-op until 2026-09-24, so `herd
+  stop` needs a kernel from that date or later to stop anything there.
 
 ---
 
@@ -30,15 +30,21 @@ Run with no arguments (or `herd daemon`), it becomes a foreground supervisor:
 
 1. **Ensures its directories exist** — `/etc/herd/enabled`, `/etc/herd/available`,
    `/var/log/herd`.
-2. **Loads config** — reads every `*.conf` in `/etc/herd/enabled` and builds an
+2. **Opens its control socket** — `127.0.0.1:7117`, non-blocking, for `herd
+   start`/`herd stop` (see [CLI](#cli)).
+3. **Loads config** — reads every `*.conf` in `/etc/herd/enabled` and builds an
    in-memory service table.
-3. **Starts enabled services** — spawns each, honoring any per-service start delay.
-4. **Supervises forever** in a ~100 ms poll loop:
+4. **Starts enabled services** — spawns each, honoring any per-service start delay.
+5. **Supervises forever** in a ~100 ms poll loop:
    - drains each running service's stdout into `/var/log/herd/<svc>.log`
      (with rotation at 32 KB),
    - reaps exited children (`waitpid`) and applies restart policy,
+   - reaps orphans (`wait4(-1, WNOHANG)`, bounded): herd is pid 1, so every
+     process whose parent died is reparented to it,
    - fires due restarts,
-   - reloads config every 20 s (picking up newly enabled / disabled services).
+   - answers pending `herd start`/`herd stop` connections,
+   - reloads config every 20 s (picking up newly enabled / disabled services;
+     a disabled one is stopped and reaped like `herd stop`).
 
 Run with a subcommand, it's a thin CLI for managing service config files instead
 (see [CLI](#cli)).
@@ -91,6 +97,8 @@ restart       = true     # restart on non-zero exit (default true)
 | `stack` | `""`/`smoltcp`/`rump` | `""` | Network stack for the box. `rump` routes the box's `AF_INET` through its `rump_server` via the kernel sysproxy client. |
 | `join_box` | name | *(none)* | Spawn into an **existing** box (by name) instead of registering a new one. Implies `boxed = true`. The target box must already exist and be stack-marked by its owner service. |
 | `mount` | space-separated | *(none)* | Filesystems to mount in the box's namespace before spawning. Only `proc` (→ `/proc`) and `tmpfs` (→ `/tmp`). A fresh-root box has no `/proc` otherwise — sshd's interactive bridge needs `/proc/<pid>/fd/0`. |
+| `env` | `KEY=VALUE`, repeatable | *(none)* | One environment variable per line; the value may contain spaces and `=`. Overrides by name the bundle's `process.env`, or `DEFAULT_ENV` otherwise. With no `env` lines the kernel's default environment applies unchanged. |
+| `workdir` / `working_dir` | path | *(inherit `/`)* | Working directory, passed through `SPAWN_EXT` (a `chdir` in herd would not reach the child). |
 | `core` | u32 | `0` (BSP) | Run the service on a specific multikernel secondary core. `0`/unset = spawn locally on the BSP (default). Non-zero = herd calls `core_init(N, command)` so core N's kernel spawns it locally (no cross-core spawn, no local pid). Mutually exclusive with boxes. See [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md). |
 
 ---
@@ -98,37 +106,38 @@ restart       = true     # restart on non-zero exit (default true)
 ## Service lifecycle
 
 Each supervised service moves through these states (`Completed` only applies to
-`oneshot` services):
+`oneshot` services; `Halted` and `Exited` are left only by `herd start` or a
+reboot):
 
-```
-            start_service (spawn ok)
-  Stopped ───────────────────────────▶ Running
-     ▲                                    │
-     │ clean exit (code 0, or restart=false)│ child exits
-     │                                    ▼
-     │                          ┌──── exit code != 0 && restart ────┐
-     │                          │                                   │
-     │            max_retries hit│                    within retries│
-     └──────────◀── Failed ◀─────┘                                  ▼
-                                                            PendingRestart
-                                                                   │
-                                              restart_at_ms elapsed │
-                                                                   ▼
-                                                              (re)start
-```
+| From | Event | To |
+|---|---|---|
+| Stopped | supervisor pass (after `start_delay`) | Running, or Failed if the spawn fails |
+| Running | exits, `oneshot` | Completed |
+| Running | exits cleanly, or any exit with `restart = false` | Exited |
+| Running | exits non-zero, `restart`, retries left | PendingRestart |
+| Running | exits non-zero, `max_retries` reached | Failed |
+| PendingRestart | `restart_delay` elapsed | Running |
+| any | `herd stop` (process killed and reaped) | Halted |
+| Exited / Halted / Failed / Stopped | `herd start` | Running |
+| any | removed from `enabled/` at a config reload | stopped, reaped, dropped |
 
-- **Stopped** — known but not running (freshly loaded, cleanly exited, or disabled).
+- **Stopped** — known but not started yet. The next supervisor pass starts it.
 - **Running** — spawned; herd holds its pid + a stdout fd it polls.
+- **Exited** — ran and exited, and its policy says not to restart it (a clean
+  exit, or any exit with `restart = false`). Stays down.
+- **Halted** — stopped by `herd stop`. Stays down; a config reload does not
+  clear it.
 - **PendingRestart** — exited non-zero, waiting out `restart_delay` before respawn.
   The retry **always uses the same config** (including, in future, the same
   `core` pin — never a different one).
 - **Failed** — spawn failed, or restarts exhausted (`max_retries` reached), or a
   misconfiguration (e.g. an unreadable OCI bundle).
 
-A **clean exit** (code 0, or any exit when `restart = false`) returns the service
-to **Stopped** and resets the restart counter — and a Stopped service is brought
-back up by the next supervisor pass. To run something **once**, set `oneshot = true`:
-on exit it goes to **Completed** (terminal, never restarted) instead of Stopped.
+A **clean exit** (code 0, or any exit when `restart = false`) moves the service
+to **Exited** and resets the restart counter. Until 2026-09-24 it went to
+Stopped, which the next pass restarted immediately — a `restart = false`
+one-shot ran ~700 times in 85 s. To run something **once** on every boot, set
+`oneshot = true`: on exit it goes to **Completed** (terminal) instead.
 
 ---
 

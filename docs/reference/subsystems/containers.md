@@ -107,9 +107,16 @@ spawns + supervises each service. Config schema (`ServiceConfig`, `main.rs:115-1
 | `env` | [] | **repeatable**: one `env = KEY=VALUE` per line. See below |
 | `core` | 0 | core pin via the `core_init` syscall (mutually exclusive with `boxed`); the kernel side is now a permanent `ENOSYS` stub — the one-kernel-per-core multikernel it activated was removed, see `docs/archive/TRIM_FAT_MULTIKERNEL.md` — so herd treats it as unavailable on every current build |
 
-**Lifecycle:** service starts → runs → on exit: `oneshot` → `Completed`; else
-`restart` → respawn after `restart_delay_ms`, up to `max_retries`. `herd status`
-lists services + states.
+**Lifecycle:** service starts → runs → on exit: `oneshot` → `Completed`; a
+clean exit or `restart = false` → `Exited` (stays down); else respawn after
+`restart_delay_ms`, up to `max_retries`, then `Failed`. `herd status` lists the
+enabled services (not their runtime state).
+
+**Control:** `herd start <svc>` / `herd stop <svc>` talk to the daemon over
+loopback TCP `127.0.0.1:7117` (amd64 has no AF_UNIX), one request line and one
+`ok …`/`err …` reply. `stop` SIGTERMs, SIGKILLs after 3 s, reaps, then answers,
+leaving the service `Halted`. Full table and states:
+`userspace/herd/README.md` § "Service lifecycle" and § CLI.
 
 > `restart_delay` / `restart_delay_ms` and `start_delay` / `start_delay_ms` are
 > both accepted. Until 2026-08-20 the parser matched only the un-suffixed
