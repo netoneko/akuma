@@ -531,6 +531,12 @@ that binds, silently, on the only workload that notices.
      kot: same port, same ParityDB directory). Fix: dispatch 302 through the
      same path as 62 — which also makes sshd's teardown SIGHUP real, the Linux
      behaviour, so check a session's children after.
+     **Fixed 2026-09-24** exactly so (`302 => to_glue_raw(nr::KILL, …)`), not
+     yet validated on the metal. herd's side changed with it: `herd stop` now
+     reaches the daemon over `127.0.0.1:7117` instead of a marker file, and
+     SIGTERMs, SIGKILLs after 3 s, and reaps before it answers; a pid it
+     cannot reap is held as `stopping_pid` and blocks `herd start`
+     (`userspace/herd/README.md` § CLI).
    - **A SIGTERM'd kot never finished exiting.** With herd's stop a no-op,
      `busybox kill -TERM 20` from ssh: the kernel logged
      `[signal] pid=20 killed by signal 15 (default action)` (and pid 22, a

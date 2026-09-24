@@ -1166,10 +1166,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // already in the past.
             319 => crate::net::uptime_us(),
             326 => sys_close_child_stdin(a1),
-            // `kill` is accepted as a no-op success: `sshd` sends SIGHUP/SIGTERM
-            // to a session's shell on teardown, and there is nothing here to
-            // deliver a signal to, but failing the call makes it log an error.
-            302 => 0,
+            // `kill(pid, sig)` — Akuma-private 302, what libakuma's
+            // `kill_signal` issues. Glue's `nr::KILL` arm is the same
+            // `proc::sys_kill` that Linux `kill` (62, `Syscall::Kill` below)
+            // reaches, so the two spellings deliver identically.
+            //
+            // This was `302 => 0` — a no-op success, from when this target had
+            // nothing to deliver a signal to — until 2026-09-24. So `herd stop`
+            // and `herd disable` never stopped a service here: herd dropped the
+            // pid and the process ran on unsupervised
+            // (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 7).
+            // sshd's session-teardown SIGHUP/SIGTERM is now real too, which is
+            // the Linux behaviour.
+            302 => to_glue_raw(akuma_syscalls_linux::nr::KILL, [a1, a2, 0, 0, 0, 0]),
             // `console_notify(ptr, len)` — Akuma-private 322, feature
             // `console-notify` (default-on for this target). Prints a
             // caller-supplied line straight to the framebuffer/serial console,

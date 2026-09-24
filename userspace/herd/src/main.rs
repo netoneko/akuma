@@ -19,8 +19,9 @@ use alloc::vec::Vec;
 use libakuma::{
     print, exit, open, read_fd, write_fd, close, fstat, lseek,
     open_flags, seek_mode, spawn, spawn_with_env, kill_signal, waitpid_status, wait_any, read_dir,
-    uptime, sleep_ms, mkdir_p, SpawnResult, SIGTERM,
+    uptime, sleep_ms, mkdir_p, SpawnResult, SIGKILL, SIGTERM,
 };
+use libakuma::net::{ErrorKind, TcpListener, TcpStream};
 
 use boxlib::json;
 use boxlib::spec::{self, box_id_for};
@@ -50,14 +51,38 @@ const DEFAULT_MAX_RETRIES: u32 = 0;
 /// Herd directories
 const HERD_ENABLED_DIR: &str = "/etc/herd/enabled";
 const HERD_AVAILABLE_DIR: &str = "/etc/herd/available";
-/// `herd start`/`herd stop` drop a `<svc>.start`/`<svc>.stop` marker file here;
-/// the running daemon polls it every supervisor loop tick (~100ms) — much
-/// faster than the 20s config reload `enable`/`disable` ride along on, since a
-/// stop is meant to take the process down NOW, not whenever the next reload
-/// happens to land. There is no other channel between a CLI invocation and the
-/// long-running daemon (no socket, no signal) — this is that channel, and it
-/// is deliberately as dumb as the enabled/available directories already are.
-const HERD_CONTROL_DIR: &str = "/etc/herd/control";
+/// `herd start`/`herd stop` reach the running daemon over this loopback TCP
+/// socket: one request line in (`stop kot\n`), one reply line back
+/// (`ok stopped kot (pid 20): killed by signal 15\n` or `err …`), then close.
+/// The CLI waits for the reply, so it reports what actually happened instead of
+/// "requested".
+///
+/// Loopback TCP rather than an AF_UNIX path because the amd64 kernel has no
+/// AF_UNIX (`amd64/src/sock.rs::sys_socket` answers `EAFNOSUPPORT`) and herd
+/// runs on both kernels.
+///
+/// This replaced `/etc/herd/control/<svc>.{start,stop}` marker files, which the
+/// daemon listed on every 100 ms tick — `openat`/`fstat`/`getdents64`/`close`
+/// for a directory that was almost always empty — and which could not carry an
+/// answer back. The listener is non-blocking, so an idle tick costs one
+/// `accept` returning `EAGAIN`.
+const HERD_CONTROL_ADDR: &str = "127.0.0.1:7117";
+
+/// How long a stopped service gets to exit after SIGTERM before SIGKILL.
+const STOP_TERM_GRACE_MS: u64 = 3_000;
+
+/// How long after SIGKILL herd keeps trying to reap before giving up and
+/// leaving the pid to the orphan sweep (see [`SupervisedProcess::stopping_pid`]).
+const STOP_KILL_GRACE_MS: u64 = 2_000;
+
+/// Reap-poll interval while a stop waits for the process to exit.
+const STOP_POLL_MS: u64 = 20;
+
+/// How long a control connection gets to send its request line.
+const CONTROL_READ_TIMEOUT_MS: u64 = 1_000;
+
+/// Upper bound on control connections served per supervisor tick.
+const MAX_CONTROL_REQUESTS_PER_TICK: usize = 8;
 
 /// The enabled-config directory the daemon loads from. Defaults to
 /// [`HERD_ENABLED_DIR`], but a `--enabled-dir <path>` argument overrides it — so a SECOND herd
@@ -104,28 +129,6 @@ fn ensure_directories() {
         print("[herd] Warning: Failed to create ");
         print(HERD_LOG_DIR);
         print("\n");
-    }
-
-    // Create /etc/herd/control
-    if !mkdir_p(HERD_CONTROL_DIR) {
-        print("[herd] Warning: Failed to create ");
-        print(HERD_CONTROL_DIR);
-        print("\n");
-    }
-}
-
-/// Discard any leftover `herd start`/`herd stop` markers from a previous boot.
-/// They describe transient runtime intent for a daemon instance that no
-/// longer exists — a stale `.stop` for a service that's enabled would halt it
-/// the moment this fresh daemon came up, which is not what a reboot means.
-fn clear_stale_control_files() {
-    let Some(dir) = read_dir(HERD_CONTROL_DIR) else { return };
-    let names: Vec<String> = dir.map(|e| e.name).collect();
-    for name in names {
-        if name.ends_with(".start") || name.ends_with(".stop") {
-            let path = format!("{}/{}", HERD_CONTROL_DIR, name);
-            libakuma::unlink(&path);
-        }
     }
 }
 
@@ -374,6 +377,13 @@ struct SupervisedProcess {
     /// from `config.start_delay_ms` the first time we consider starting it.
     start_at_ms: Option<u64>,
     log_size: usize,
+    /// A pid `herd stop` signalled but could not reap, even after SIGKILL — a
+    /// SIGTERM'd multi-threaded kot on amd64 has stayed un-reapable for minutes
+    /// (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 7). The
+    /// orphan sweep clears it when the pid is finally reaped; until then
+    /// `herd start` refuses, because a second copy beside a half-dead first
+    /// (same port, same on-disk store) is worse than no copy.
+    stopping_pid: Option<u32>,
 }
 
 impl SupervisedProcess {
@@ -388,6 +398,7 @@ impl SupervisedProcess {
             restart_at_ms: None,
             start_at_ms: None,
             log_size: 0,
+            stopping_pid: None,
         }
     }
 }
@@ -403,6 +414,9 @@ struct HerdState {
     /// program per core (core_init overwrites the pending program), so herd must reject a
     /// second service pinned to an already-claimed core rather than silently clobber it.
     pinned_cores: BTreeMap<u32, String>,
+    /// The `herd start`/`herd stop` listener on [`HERD_CONTROL_ADDR`], or
+    /// `None` if it could not be opened (the daemon still supervises).
+    control: Option<TcpListener>,
 }
 
 impl HerdState {
@@ -411,6 +425,7 @@ impl HerdState {
             services: BTreeMap::new(),
             last_config_reload_ms: 0,
             pinned_cores: BTreeMap::new(),
+            control: None,
         }
     }
 }
@@ -473,20 +488,18 @@ pub extern "C" fn main() {
                 exit(0);
             }
             "start" => {
-                if let Some(name) = service_name {
-                    cmd_start(name);
-                } else {
+                let Some(name) = service_name else {
                     print("Usage: herd start <service>\n");
-                }
-                exit(0);
+                    exit(1);
+                };
+                exit(if cmd_start(name) { 0 } else { 1 });
             }
             "stop" => {
-                if let Some(name) = service_name {
-                    cmd_stop(name);
-                } else {
+                let Some(name) = service_name else {
                     print("Usage: herd stop <service>\n");
-                }
-                exit(0);
+                    exit(1);
+                };
+                exit(if cmd_stop(name) { 0 } else { 1 });
             }
             "log" => {
                 if let Some(name) = service_name {
@@ -515,7 +528,7 @@ pub extern "C" fn main() {
 
     let mut state = HerdState::new();
 
-    clear_stale_control_files();
+    state.control = open_control_socket();
 
     // Initial config load
     reload_config(&mut state);
@@ -540,8 +553,8 @@ fn supervisor_loop(mut state: HerdState) {
         // 3. Handle pending restarts
         process_pending_restarts(&mut state, now_ms);
 
-        // 3a. Apply any `herd start`/`herd stop` requests dropped since the last tick.
-        process_control_commands(&mut state);
+        // 3a. Answer any `herd start`/`herd stop` connections since the last tick.
+        serve_control(&mut state);
 
         // 3b. Start any stopped services whose (optional) start delay has elapsed.
         start_stopped_services(&mut state, now_ms);
@@ -761,7 +774,10 @@ fn reload_config(state: &mut HerdState) {
         print("[herd] Stopping and removing disabled service: ");
         print(&name);
         print("\n");
-        stop_service(state, &name);
+        let reply = stop_service(state, &name);
+        print("[herd] ");
+        print(&reply.msg);
+        print("\n");
         state.services.remove(&name);
     }
 }
@@ -1197,96 +1213,318 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     }
 }
 
-fn stop_service(state: &mut HerdState, name: &str) {
-    kill_service_to(state, name, ServiceState::Stopped);
+/// The answer to a control request: `ok` decides the CLI's exit status, `msg`
+/// is what it prints (and what the daemon logs).
+struct Reply {
+    ok: bool,
+    msg: String,
 }
 
-/// Administrative stop (`herd stop <svc>`): kills the running process like
-/// [`stop_service`], but lands on [`ServiceState::Halted`] instead of
-/// `Stopped` so `start_stopped_services` does not revive it on the very next
-/// pass. See [`ServiceState::Halted`].
-fn halt_service(state: &mut HerdState, name: &str) {
-    kill_service_to(state, name, ServiceState::Halted);
+impl Reply {
+    fn ok(msg: String) -> Self {
+        Self { ok: true, msg }
+    }
+
+    fn err(msg: String) -> Self {
+        Self { ok: false, msg }
+    }
 }
 
-fn kill_service_to(state: &mut HerdState, name: &str, target: ServiceState) {
-    if let Some(svc) = state.services.get_mut(name) {
-        if let Some(pid) = svc.pid {
-            // Must carry a real signal: `libakuma::kill` hardcodes sig 0, which
-            // the kernel treats as an existence probe and never delivers — so
-            // this used to leave the process running, unsupervised, while herd
-            // marked the service Stopped and start_stopped_services spawned a
-            // second copy.
-            let _ = kill_signal(pid, SIGTERM);
+/// Config-reload removal of a disabled service: kill and reap it, like
+/// [`halt_service`], landing on `Stopped` (the entry is removed right after).
+fn stop_service(state: &mut HerdState, name: &str) -> Reply {
+    kill_service_to(state, name, ServiceState::Stopped)
+}
+
+/// Administrative stop (`herd stop <svc>`): kills and reaps the running
+/// process like [`stop_service`], but lands on [`ServiceState::Halted`]
+/// instead of `Stopped` so `start_stopped_services` does not revive it on the
+/// very next pass. See [`ServiceState::Halted`].
+fn halt_service(state: &mut HerdState, name: &str) -> Reply {
+    kill_service_to(state, name, ServiceState::Halted)
+}
+
+/// How [`terminate`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Termination {
+    /// Reaped, as `(how, shell code)`; `escalated` if it took SIGKILL.
+    Reaped { how: Exit, code: i32, escalated: bool },
+    /// The signal was refused (no such process) and there was nothing to reap.
+    Gone,
+    /// Still not reapable after SIGKILL and both grace periods.
+    Stuck,
+}
+
+/// SIGTERM, wait up to [`STOP_TERM_GRACE_MS`] for the process to be reapable,
+/// then SIGKILL and wait up to [`STOP_KILL_GRACE_MS`] more.
+///
+/// `signal` is `kill_signal(pid, _)`, `reap` a non-blocking `waitpid` of the
+/// same pid, `elapsed_ms` the time since the stop began and `nap` the poll
+/// sleep — all effects, so the escalation is host-tested.
+///
+/// Blocks the supervisor for at most the two grace periods. That is the point:
+/// the old stop signalled, forgot the pid and returned, so herd could not say
+/// whether the process was gone, and a `herd start` right after it would launch
+/// a second copy beside the first.
+fn terminate(
+    mut signal: impl FnMut(u32) -> i32,
+    mut reap: impl FnMut() -> Option<(Exit, i32)>,
+    mut elapsed_ms: impl FnMut() -> u64,
+    mut nap: impl FnMut(),
+) -> Termination {
+    if signal(SIGTERM) < 0 {
+        // Already dead and waiting to be reaped refuses a signal too.
+        return match reap() {
+            Some((how, code)) => Termination::Reaped { how, code, escalated: false },
+            None => Termination::Gone,
+        };
+    }
+    let mut escalated = false;
+    loop {
+        if let Some((how, code)) = reap() {
+            return Termination::Reaped { how, code, escalated };
         }
-        if let Some(fd) = svc.stdout_fd {
+        let t = elapsed_ms();
+        if !escalated && t >= STOP_TERM_GRACE_MS {
+            escalated = true;
+            let _ = signal(SIGKILL);
+        } else if t >= STOP_TERM_GRACE_MS + STOP_KILL_GRACE_MS {
+            return Termination::Stuck;
+        }
+        nap();
+    }
+}
+
+fn kill_service_to(state: &mut HerdState, name: &str, target: ServiceState) -> Reply {
+    let Some(svc) = state.services.get_mut(name) else {
+        return Reply::err(format!("{name}: not enabled"));
+    };
+    let pid = svc.pid.take();
+    let stdout_fd = svc.stdout_fd.take();
+    let was_stopping = svc.stopping_pid;
+    svc.state = target;
+    svc.restart_at_ms = None;
+
+    let Some(pid) = pid else {
+        if let Some(fd) = stdout_fd {
             close(fd as i32);
         }
-        svc.pid = None;
-        svc.stdout_fd = None;
-        svc.state = target;
-        svc.restart_at_ms = None;
+        return Reply::ok(match was_stopping {
+            Some(old) => format!("{name}: not running (pid {old} from an earlier stop has still not exited)"),
+            None => format!("{name}: not running"),
+        });
+    };
+
+    let begin = uptime();
+    let outcome = terminate(
+        // Must carry a real signal: `libakuma::kill` hardcodes sig 0, which the
+        // kernel treats as an existence probe and never delivers.
+        |sig| kill_signal(pid, sig),
+        || {
+            waitpid_status(pid).map(|status| {
+                (Exit { signaled: status.signaled(), exit_code: status.exit_code() }, status.shell_code())
+            })
+        },
+        || uptime().saturating_sub(begin) / 1000,
+        || sleep_ms(STOP_POLL_MS),
+    );
+
+    // Keep whatever it wrote on the way out.
+    if let Some(fd) = stdout_fd {
+        let data = drain_readable(|buf| read_fd(fd as i32, buf));
+        close(fd as i32);
+        append_to_log(state, name, &data);
+    }
+
+    let Some(svc) = state.services.get_mut(name) else {
+        return Reply::err(format!("{name}: vanished while stopping"));
+    };
+    match outcome {
+        Termination::Reaped { how, code, escalated } => {
+            svc.last_exit_code = Some(code);
+            let ended = if how.signaled {
+                format!("killed by signal {}", code - 128)
+            } else {
+                format!("exited with code {code}")
+            };
+            let forced = if escalated {
+                format!(", after ignoring SIGTERM for {} s", STOP_TERM_GRACE_MS / 1000)
+            } else {
+                String::new()
+            };
+            Reply::ok(format!("stopped {name} (pid {pid}): {ended}{forced}"))
+        }
+        Termination::Gone => Reply::ok(format!("stopped {name}: pid {pid} was already gone")),
+        Termination::Stuck => {
+            svc.stopping_pid = Some(pid);
+            Reply::err(format!(
+                "{name}: pid {pid} has not exited {} s after SIGKILL; herd reaps it when it does, \
+                 and `herd start {name}` refuses until then",
+                STOP_KILL_GRACE_MS / 1000
+            ))
+        }
+    }
+}
+
+/// `herd start <svc>`: start a service that is not running, clearing a `Halted`
+/// or `Exited` state and the restart count.
+fn control_start(state: &mut HerdState, name: &str) -> Reply {
+    // Enabled since the last 20 s reload: pick it up now rather than make the
+    // caller wait for one.
+    if !state.services.contains_key(name) {
+        reload_config(state);
+    }
+    let Some(svc) = state.services.get_mut(name) else {
+        return Reply::err(format!("{name}: not enabled; run `herd enable {name}` first"));
+    };
+    if let Some(old) = svc.stopping_pid {
+        return Reply::err(format!(
+            "{name}: pid {old} from the last stop has not exited yet; not starting a second copy"
+        ));
+    }
+    if svc.state == ServiceState::Running {
+        return Reply::ok(match svc.pid {
+            Some(pid) => format!("{name}: already running (pid {pid})"),
+            None => format!("{name}: already running on core {}", svc.config.core),
+        });
+    }
+    svc.restart_count = 0;
+    let config = svc.config.clone();
+    start_service(state, name, &config);
+
+    match state.services.get(name).map(|svc| (svc.state, svc.pid)) {
+        Some((ServiceState::Running, Some(pid))) => Reply::ok(format!("started {name} (pid {pid})")),
+        Some((ServiceState::Running | ServiceState::Completed, None)) => {
+            Reply::ok(format!("started {name} on core {}", config.core))
+        }
+        _ => Reply::err(format!("{name}: failed to start; see the console and `herd log {name}`")),
     }
 }
 
 // ============================================================================
-// Start/Stop Control Files
+// Control Socket
 // ============================================================================
 
-/// Apply any `<svc>.start`/`<svc>.stop` marker files `herd start`/`herd stop`
-/// (a separate CLI invocation) dropped in [`HERD_CONTROL_DIR`] since the last
-/// tick. Each marker is consumed (unlinked) whether or not it could be
-/// applied, so a request for an unknown service doesn't retrigger forever.
-fn process_control_commands(state: &mut HerdState) {
-    let Some(dir) = read_dir(HERD_CONTROL_DIR) else { return };
+/// A `herd start`/`herd stop` request line.
+#[derive(Debug, PartialEq, Eq)]
+enum Request<'a> {
+    Start(&'a str),
+    Stop(&'a str),
+}
 
-    let mut starts: Vec<String> = Vec::new();
-    let mut stops: Vec<String> = Vec::new();
-    for entry in dir {
-        if let Some(name) = entry.name.strip_suffix(".start") {
-            starts.push(String::from(name));
-        } else if let Some(name) = entry.name.strip_suffix(".stop") {
-            stops.push(String::from(name));
-        }
+/// `start <svc>` or `stop <svc>`, whitespace-separated, nothing else.
+fn parse_request(line: &str) -> Option<Request<'_>> {
+    let mut words = line.split_whitespace();
+    let verb = words.next()?;
+    let name = words.next()?;
+    if words.next().is_some() || name.contains('/') {
+        return None;
     }
+    match verb {
+        "start" => Some(Request::Start(name)),
+        "stop" => Some(Request::Stop(name)),
+        _ => None,
+    }
+}
 
-    for name in stops {
-        let path = format!("{}/{}.stop", HERD_CONTROL_DIR, name);
-        libakuma::unlink(&path);
-        if state.services.contains_key(&name) {
+/// The wire form of a reply: `ok <msg>\n` / `err <msg>\n`.
+fn encode_reply(reply: &Reply) -> String {
+    format!("{} {}\n", if reply.ok { "ok" } else { "err" }, reply.msg)
+}
+
+/// Split a received reply back into `(ok, msg)`. Anything that is not one of
+/// the two tags is reported as a failure, verbatim.
+fn decode_reply(wire: &str) -> (bool, &str) {
+    let line = wire.trim_end_matches('\n');
+    if let Some(msg) = line.strip_prefix("ok ") {
+        (true, msg)
+    } else if let Some(msg) = line.strip_prefix("err ") {
+        (false, msg)
+    } else {
+        (false, line)
+    }
+}
+
+/// Bind [`HERD_CONTROL_ADDR`], non-blocking. A listener that cannot be made
+/// non-blocking is dropped rather than kept: a blocking `accept` would park the
+/// whole supervisor until someone ran `herd start`.
+fn open_control_socket() -> Option<TcpListener> {
+    let listener = match TcpListener::bind(HERD_CONTROL_ADDR) {
+        Ok(l) => l,
+        Err(_) => {
+            print("[herd] Warning: cannot listen on ");
+            print(HERD_CONTROL_ADDR);
+            print("; `herd start`/`herd stop` will not reach this daemon\n");
+            return None;
+        }
+    };
+    if listener.set_nonblocking(true).is_err() {
+        print("[herd] Warning: control socket cannot be made non-blocking; closing it\n");
+        return None;
+    }
+    Some(listener)
+}
+
+/// Answer the control connections pending since the last tick, each in full:
+/// read its request, act on it, write the reply, close.
+fn serve_control(state: &mut HerdState) {
+    for _ in 0..MAX_CONTROL_REQUESTS_PER_TICK {
+        let Some(listener) = state.control.as_ref() else { return };
+        // `WouldBlock` is the idle case; any other error is retried next tick.
+        let Ok((stream, _)) = listener.try_accept() else { return };
+        let reply = match read_request_line(&stream) {
+            Some(line) => handle_request(state, &line),
+            None => Reply::err(String::from("no request received")),
+        };
+        let _ = stream.write_all(encode_reply(&reply).as_bytes());
+    }
+}
+
+fn handle_request(state: &mut HerdState, line: &str) -> Reply {
+    let reply = match parse_request(line) {
+        Some(Request::Stop(name)) => {
             print("[herd] Stop requested for ");
-            print(&name);
+            print(name);
             print("\n");
-            halt_service(state, &name);
-        } else {
-            print("[herd] Cannot stop '");
-            print(&name);
-            print("': not enabled\n");
+            halt_service(state, name)
         }
-    }
+        Some(Request::Start(name)) => {
+            print("[herd] Start requested for ");
+            print(name);
+            print("\n");
+            control_start(state, name)
+        }
+        None => Reply::err(format!("bad request {line:?}; expected `start <svc>` or `stop <svc>`")),
+    };
+    print("[herd] ");
+    print(&reply.msg);
+    print("\n");
+    reply
+}
 
-    for name in starts {
-        let path = format!("{}/{}.start", HERD_CONTROL_DIR, name);
-        libakuma::unlink(&path);
-        match state.services.get(&name).map(|svc| svc.config.clone()) {
-            Some(config) => {
-                print("[herd] Start requested for ");
-                print(&name);
-                print("\n");
-                if let Some(svc) = state.services.get_mut(&name) {
-                    svc.restart_count = 0;
+/// The first line a control client sends, waiting at most
+/// [`CONTROL_READ_TIMEOUT_MS`] — a client that connects and says nothing must
+/// not stall the supervisor.
+fn read_request_line(stream: &TcpStream) -> Option<String> {
+    let _ = libakuma::set_nonblocking(stream.as_raw_fd(), true);
+    let begin = uptime();
+    let mut buf = [0u8; 256];
+    let mut len = 0;
+    while len < buf.len() && !buf[..len].contains(&b'\n') {
+        match stream.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if uptime().saturating_sub(begin) / 1000 >= CONTROL_READ_TIMEOUT_MS {
+                    return None;
                 }
-                start_service(state, &name, &config);
+                sleep_ms(5);
             }
-            None => {
-                print("[herd] Cannot start '");
-                print(&name);
-                print("': not enabled — run 'herd enable ");
-                print(&name);
-                print("' first\n");
-            }
+            Err(_) => return None,
         }
     }
+    let text = core::str::from_utf8(&buf[..len]).ok()?;
+    text.lines().next().map(|l| String::from(l.trim()))
 }
 
 // ============================================================================
@@ -1441,6 +1679,7 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
     // at most once, and the sweep stops after `MAX_ORPHAN_REAPS` regardless —
     // anything left is picked up on the next tick.
     let services = &state.services;
+    let mut reaped: Vec<u32> = Vec::new();
     let sweep = sweep_reaped(
         &mut exited,
         |pid| {
@@ -1450,11 +1689,24 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
         },
         || {
             wait_any().map(|status| {
+                reaped.push(status.pid);
                 let how = Exit { signaled: status.signaled(), exit_code: status.exit_code() };
                 (status.pid, how, status.shell_code())
             })
         },
     );
+    // A pid `herd stop` gave up on (`stopping_pid`) comes back here as an
+    // "orphan" once it finally exits; that is what lets `herd start` run again.
+    for (name, svc) in state.services.iter_mut() {
+        if let Some(pid) = svc.stopping_pid.filter(|p| reaped.contains(p)) {
+            svc.stopping_pid = None;
+            print("[herd] reaped ");
+            print(name);
+            print("'s stopped pid ");
+            print_dec(pid as usize);
+            print("\n");
+        }
+    }
     if let Some(pid) = sweep.repeated {
         print("[herd] Warning: wait4 returned pid ");
         print_dec(pid as usize);
@@ -1669,7 +1921,7 @@ fn print_usage() {
     print("  enable <svc>   Enable a service\n");
     print("  disable <svc>  Disable a service\n");
     print("  start <svc>    Start an enabled service now (no reload wait)\n");
-    print("  stop <svc>     Stop a running service now, without disabling it\n");
+    print("  stop <svc>     Stop and reap a running service now, without disabling it\n");
     print("  log <svc>      Show service log\n");
     print("  help           Show this help\n");
     print("\n");
@@ -1841,49 +2093,58 @@ fn cmd_disable(name: &str) {
     }
 }
 
-/// Drop a `<name>.start` marker in [`HERD_CONTROL_DIR`] for the running
-/// daemon to pick up on its next tick (~100ms). Unlike `herd enable`, this
-/// does not touch `/etc/herd/enabled/` — the service must already be enabled,
-/// since that's where its config comes from.
-fn cmd_start(name: &str) {
-    let enabled_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
-    if read_file_bytes(&enabled_path).is_none() {
-        print("Service '");
-        print(name);
-        print("' is not enabled. Run 'herd enable ");
-        print(name);
-        print("' first.\n");
-        return;
-    }
-
-    let path = format!("{}/{}.start", HERD_CONTROL_DIR, name);
-    if write_file(&path, b"") {
-        print("Start requested for '");
-        print(name);
-        print("'. Applied by the running daemon within ~100ms.\n");
-    } else {
-        print("Error: Failed to write control file at ");
-        print(&path);
-        print("\n");
-    }
+/// Start an enabled service now, and wait for the daemon to say it did.
+fn cmd_start(name: &str) -> bool {
+    send_control("start", name)
 }
 
-/// Drop a `<name>.stop` marker in [`HERD_CONTROL_DIR`]. The service stays
-/// enabled (it will start again on the next reboot) — this only asks the
-/// running daemon to kill the process and stop restarting it until `herd
-/// start` or a reboot brings it back. Use `herd disable` to also remove it
-/// from `/etc/herd/enabled/`.
-fn cmd_stop(name: &str) {
-    let path = format!("{}/{}.stop", HERD_CONTROL_DIR, name);
-    if write_file(&path, b"") {
-        print("Stop requested for '");
-        print(name);
-        print("'. Applied by the running daemon within ~100ms.\n");
-    } else {
-        print("Error: Failed to write control file at ");
-        print(&path);
-        print("\n");
+/// Stop a running service now: the daemon sends SIGTERM (SIGKILL after
+/// [`STOP_TERM_GRACE_MS`]), reaps it, and only then answers. The service stays
+/// enabled, so a reboot starts it again; `herd disable` also removes it from
+/// `/etc/herd/enabled/`.
+fn cmd_stop(name: &str) -> bool {
+    send_control("stop", name)
+}
+
+/// Send one request to the running daemon on [`HERD_CONTROL_ADDR`] and print
+/// its reply. Returns whether the daemon reported success.
+fn send_control(verb: &str, name: &str) -> bool {
+    let stream = match TcpStream::connect(HERD_CONTROL_ADDR) {
+        Ok(s) => s,
+        Err(_) => {
+            print("Error: cannot reach the herd daemon on ");
+            print(HERD_CONTROL_ADDR);
+            print(" (is it running?)\n");
+            return false;
+        }
+    };
+    let request = format!("{verb} {name}\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        print("Error: failed to send the request to the herd daemon\n");
+        return false;
     }
+    // A stop answers only once the process is reaped, so this can take up to
+    // both grace periods.
+    let mut wire: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 512];
+    while let Ok(n) = stream.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        wire.extend_from_slice(&buf[..n]);
+    }
+    let text = core::str::from_utf8(&wire).unwrap_or("");
+    if text.is_empty() {
+        print("Error: the herd daemon closed the connection without a reply\n");
+        return false;
+    }
+    let (ok, msg) = decode_reply(text);
+    if !ok {
+        print("Error: ");
+    }
+    print(msg);
+    print("\n");
+    ok
 }
 
 fn cmd_log(name: &str) {
@@ -2034,6 +2295,76 @@ mod tests {
         }
         assert_eq!(ServiceState::after(Outcome::Stopped), ServiceState::Exited);
         assert!(ServiceState::Stopped.started_by_start_pass(), "a fresh service still starts");
+    }
+
+    /// Drive [`terminate`] against a process that becomes reapable at
+    /// `reapable_at` ms (never, if `None`), with `nap` advancing a fake clock.
+    fn run_terminate(reapable_at: Option<u64>, signal_ok: bool) -> (Termination, Vec<u32>) {
+        use core::cell::Cell;
+        let clock = Cell::new(0u64);
+        let mut sent = Vec::new();
+        let t = terminate(
+            |sig| {
+                sent.push(sig);
+                if signal_ok { 0 } else { -3 }
+            },
+            || reapable_at.filter(|at| clock.get() >= *at).map(|_| (Exit::signal(), 143)),
+            || clock.get(),
+            || clock.set(clock.get() + STOP_POLL_MS),
+        );
+        (t, sent)
+    }
+
+    #[test]
+    fn stop_reaps_a_process_that_honours_sigterm() {
+        let (t, sent) = run_terminate(Some(100), true);
+        assert_eq!(t, Termination::Reaped { how: Exit::signal(), code: 143, escalated: false });
+        assert_eq!(sent, vec![SIGTERM]);
+    }
+
+    #[test]
+    fn stop_escalates_to_sigkill_after_the_grace_period() {
+        let (t, sent) = run_terminate(Some(STOP_TERM_GRACE_MS + 60), true);
+        assert!(matches!(t, Termination::Reaped { escalated: true, .. }));
+        assert_eq!(sent, vec![SIGTERM, SIGKILL], "SIGKILL exactly once");
+    }
+
+    #[test]
+    fn stop_gives_up_on_a_process_that_never_becomes_reapable() {
+        // amd64's SIGTERM'd multi-threaded kot, 2026-09-24.
+        let (t, sent) = run_terminate(None, true);
+        assert_eq!(t, Termination::Stuck);
+        assert_eq!(sent, vec![SIGTERM, SIGKILL]);
+    }
+
+    #[test]
+    fn stop_of_a_vanished_pid_neither_waits_nor_escalates() {
+        let (t, sent) = run_terminate(None, false);
+        assert_eq!(t, Termination::Gone);
+        assert_eq!(sent, vec![SIGTERM]);
+        // ...but one that already exited is still reaped.
+        let (t, _) = run_terminate(Some(0), false);
+        assert!(matches!(t, Termination::Reaped { escalated: false, .. }));
+    }
+
+    #[test]
+    fn requests_parse() {
+        assert_eq!(parse_request("stop kot"), Some(Request::Stop("kot")));
+        assert_eq!(parse_request("  start   sshd \r"), Some(Request::Start("sshd")));
+        assert_eq!(parse_request("stop"), None);
+        assert_eq!(parse_request("stop kot now"), None);
+        assert_eq!(parse_request("restart kot"), None);
+        assert_eq!(parse_request("stop ../kot"), None);
+        assert_eq!(parse_request(""), None);
+    }
+
+    #[test]
+    fn replies_round_trip() {
+        let ok = encode_reply(&Reply::ok(String::from("stopped kot (pid 20): exited with code 0")));
+        assert_eq!(decode_reply(&ok), (true, "stopped kot (pid 20): exited with code 0"));
+        let err = encode_reply(&Reply::err(String::from("kot: not enabled")));
+        assert_eq!(decode_reply(&err), (false, "kot: not enabled"));
+        assert_eq!(decode_reply("garbage"), (false, "garbage"), "an untagged reply is a failure");
     }
 
     #[test]

@@ -169,12 +169,38 @@ herd <command> [args]
   config <svc>          Print a service's config (checks enabled/ then available/).
   enable <svc>          Copy available/<svc>.conf into enabled/.
   disable <svc>         Remove enabled/<svc>.conf.
+  start <svc>           Start an enabled service now (no reload wait).
+  stop <svc>            Stop and reap a running service now, without disabling it.
   log <svc>             Print /var/log/herd/<svc>.log.
   help | --help | -h    Usage.
 ```
 
 Note: `enable`/`disable` only edit the config files. A running daemon picks the
 change up on its next 20 s config reload; a fresh boot picks it up at start.
+
+`start`/`stop` talk to the running daemon over a loopback TCP socket,
+`127.0.0.1:7117` (`HERD_CONTROL_ADDR`) — loopback TCP rather than AF_UNIX
+because the amd64 kernel has no AF_UNIX. The CLI sends one line (`stop kot`),
+the daemon acts on it and answers `ok <msg>` / `err <msg>`, and the CLI prints
+the message and exits 0 / 1. So the reply says what happened, not that a
+request was queued:
+
+- **`stop`** sends SIGTERM, waits up to 3 s for the process to be reapable,
+  then SIGKILL and up to 2 s more, reaps it, and only then replies — e.g.
+  `stopped kot (pid 20): killed by signal 15`. The service is left `Halted`, so
+  it is not restarted until `herd start` or a reboot. If the pid still cannot
+  be reaped after SIGKILL, herd says so, keeps it as the service's
+  `stopping_pid`, and reaps it in the orphan sweep when it finally exits.
+- **`start`** refuses while such a pid is outstanding (a second copy beside a
+  half-dead first shares its port and its on-disk store), answers `already
+  running` for a running service, and re-reads `/etc/herd/enabled/` first for a
+  service it does not know yet, so `herd enable x && herd start x` works
+  without waiting for the reload.
+
+A daemon that cannot bind the port logs a warning and supervises as before;
+the CLI then reports it cannot reach the daemon. Until 2026-09-24 this channel
+was `/etc/herd/control/<svc>.{start,stop}` marker files, listed on every
+100 ms tick.
 
 ---
 
