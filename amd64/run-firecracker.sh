@@ -84,6 +84,22 @@ DISK="${DISK:-}"
 # honour them. Change those on the host's own `akuma-vm.json`, or drop
 # `FC_KEEP_DISK` and pass the full set.
 FC_KEEP_DISK="${FC_KEEP_DISK:-}"
+# FC_RESTART=1 (implies FC_KEEP_DISK) is for a host whose guest *runs*, not one
+# that gets test boots: the ryzen laptop, where the guest is a herd-supervised
+# kot member launched as `TIMEOUT=0 ./run.sh` and left up. There the default
+# ending — `./run.sh` under a 20 s timeout, in the foreground — would stop a
+# service after 20 s. Instead:
+#
+#   1. the kernel it replaces is kept as `akuma-amd64.prev`,
+#   2. the guest running from `$FC_DIR` is stopped — a hard power-off, since
+#      `run.sh` launches with `--no-api` and Firecracker has no other way to
+#      stop it, so sync the guest first if what it's writing matters,
+#   3. `run.sh` is relaunched detached with `TIMEOUT=0`, and the script waits
+#      for herd's first "Started" line in `boot.log`, then prints the tail.
+#
+#   FC_HOST=netoneko@ryzen FC_RESTART=1 amd64/run-firecracker.sh
+FC_RESTART="${FC_RESTART:-}"
+[ -n "$FC_RESTART" ] && FC_KEEP_DISK=1
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 
 SSH="ssh -o StrictHostKeyChecking=no -i $FC_KEY"
@@ -91,6 +107,11 @@ SSH="ssh -o StrictHostKeyChecking=no -i $FC_KEY"
 cargo build -p akuma-amd64 --target x86_64-unknown-none --release
 
 $SSH "$FC_HOST" "mkdir -p ~/$FC_DIR"
+if [ -n "$FC_RESTART" ]; then
+    # `cp`, not `mv`: the running guest already has its kernel in memory, but
+    # a copy leaves the file in place if the scp below fails.
+    $SSH "$FC_HOST" "cd ~/$FC_DIR && { [ ! -f akuma-amd64 ] || cp -p akuma-amd64 akuma-amd64.prev; }"
+fi
 scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$KERNEL" "$FC_HOST:$FC_DIR/akuma-amd64"
 
 # ── FC_KEEP_DISK: the kernel is the only thing this script is allowed to write ──
@@ -123,6 +144,36 @@ if [ -n "$FC_KEEP_DISK" ]; then
         fi
     done
     echo "keeping $FC_HOST:$FC_DIR/{disk.img,akuma-vm.json,run.sh} as they are"
+    if [ -n "$FC_RESTART" ]; then
+        # Only the Firecracker whose cwd is this $FC_DIR — a host can run
+        # others. Its `run.sh` parent exits on its own once the pipe closes.
+        # The relaunch is `setsid nohup … < /dev/null`: detached from this
+        # ssh session, and with no terminal for serial input to stop it
+        # (see the SIGTTIN note in run.sh).
+        $SSH "$FC_HOST" "sh -s" <<EOSH
+set -e
+cd ~/$FC_DIR
+for p in \$(pgrep -u "\$(id -un)" -x firecracker); do
+    if [ "\$(readlink /proc/\$p/cwd)" = "\$(pwd)" ]; then
+        echo "stopping guest (firecracker pid \$p)"
+        kill "\$p"
+        for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "\$p" 2>/dev/null || break; sleep 1; done
+        kill -9 "\$p" 2>/dev/null || true
+    fi
+done
+# Aside, not left for tee to truncate: the wait below greps boot.log, and
+# the old boot's "Started" lines would end it before the new one began.
+[ ! -f boot.log ] || mv boot.log boot.log.prev
+TIMEOUT=0 setsid nohup ./run.sh >/dev/null 2>&1 < /dev/null &
+echo "relaunched: TIMEOUT=0 ./run.sh (log: ~/$FC_DIR/boot.log)"
+for _ in \$(seq 1 60); do
+    grep -a -q '\[herd\] Started' boot.log 2>/dev/null && break
+    sleep 2
+done
+tail -20 boot.log
+EOSH
+        exit 0
+    fi
     # `|| rc=$?` so a non-zero from the guest's launcher is reported rather than
     # tripping `set -e` on the way to reporting it.
     rc=0

@@ -1,14 +1,24 @@
 # A socket bound to `127.0.0.1` accepts connections from the network
 
-**Status: FIXED in the kernel 2026-09-25 (host-tested; not yet re-probed on a
-box), found 2026-09-24.** The cause is in `crates/akuma-net`, which both
+**Status: FIXED in the kernel 2026-09-25, found 2026-09-24. Verified on one
+of the three boxes.** The cause is in `crates/akuma-net`, which both
 kernels share, so it applied to amd64 and AArch64, on metal and under
 Firecracker. Both layers are fixed — fix-plan steps 3 and 4, see
 [§ What was done](#what-was-done-2026-09-25). The herd stopgaps (steps 1 and
 2) were not done, since the kernel fix makes them unnecessary for this
-exposure. The on-box probe in [§ How to verify a fix](#how-to-verify-a-fix)
-is still to be run on the three machines. This file records the evidence, the
-two layers of the cause, the fix plan, and what was done.
+exposure. This file records the evidence, the two layers of the cause, the
+fix plan, and what was done.
+
+**On-box probe, 2026-09-25:** the ryzen Firecracker guest (`192.168.1.50`),
+booted on `c9586004` with its disk unchanged. From the Mac, `nc -z
+192.168.1.50 7117` is **closed** (it was open on `b4a55330`). In the guest,
+`herd start kot` still reaches the daemon over loopback (`kot: already
+running`). kot's own `0.0.0.0:9944` still answers, and the guest rejoined
+the akuma-miot mesh. **Not yet probed:** the HP box (`.120`) and the Lima
+AArch64 guest, which still run older kernels. **Seen on the same boot and
+not explained:** its self-test went from `797 passed, 0 failed` on the
+previous kernel to `794 passed, 3 FAILED`, all three
+`spawn: the child's registered table holds fd 0/1/2 as Stdin/Stdout/Stderr`.
 
 ## Symptom
 
