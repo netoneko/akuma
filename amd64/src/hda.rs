@@ -274,14 +274,14 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
 /// First conversation with codec 0: vendor ID (0xF00) + root node count (0xF04).
 fn codec_probe(regs: &mut MmioRegs) {
     codec_link_init(regs);
-    match codec_send(regs, 0xF000_0000) {
+    match codec_send(regs, 0x000F_0000) {
         Some(v) => {
             serial::puts("[HDA] codec0 vendor=0x");
             serial::put_hexn(u64::from(v), 8);
         }
         None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
     }
-    match codec_send(regs, 0xF040_0000) {
+    match codec_send(regs, 0x000F_0004) {
         Some(v) => {
             serial::puts(" nodes=0x");
             serial::put_hexn(u64::from(v), 8);
@@ -304,7 +304,7 @@ fn codec_ici_probe(regs: &mut MmioRegs, verb: u32) {
     let rirbwp = regs.r16(0x58);
     let rintcnt = regs.r16(0x5A);
     let rirbctl = regs.r16(0x5C);
-    let rirbsts = regs.r16(0x7D);
+    let rirbsts = regs.r16(0x5D);
     serial::puts("[HDA] cmdpath corbwp=");
     serial::put_hexn(corbwp as u64, 4);
     serial::puts(" corbrp=");
