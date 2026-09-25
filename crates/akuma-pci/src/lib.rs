@@ -57,6 +57,7 @@ pub mod class {
     pub const MASS_STORAGE: u8 = 0x01;
     pub const NETWORK: u8 = 0x02;
     pub const DISPLAY: u8 = 0x03;
+    pub const MULTIMEDIA: u8 = 0x04;
     pub const BRIDGE: u8 = 0x06;
     pub const SERIAL_BUS: u8 = 0x0c;
 }
@@ -67,6 +68,8 @@ pub mod subclass {
     pub const SATA: u8 = 0x06;
     /// `class::NETWORK`
     pub const ETHERNET: u8 = 0x00;
+    /// `class::MULTIMEDIA`
+    pub const AUDIO: u8 = 0x03;
     /// `class::BRIDGE`
     pub const PCI_TO_PCI: u8 = 0x04;
     /// `class::SERIAL_BUS`
@@ -182,6 +185,15 @@ impl Header {
     #[must_use]
     pub fn is_ethernet(&self) -> bool {
         self.is_class(class::NETWORK, subclass::ETHERNET)
+    }
+
+    /// An audio controller — class 0x04 (multimedia), subclass 0x03. The
+    /// vendor match (Intel `0x8086`) stays at the call site: `is_audio` alone
+    /// would also answer yes for the GPU's HDMI audio function (10de:0fbc at
+    /// 01:00.1 on the bare-metal rig).
+    #[must_use]
+    pub fn is_audio(&self) -> bool {
+        self.is_class(class::MULTIMEDIA, subclass::AUDIO)
     }
 
     #[must_use]
