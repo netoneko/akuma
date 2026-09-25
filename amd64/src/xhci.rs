@@ -204,11 +204,20 @@ fn ticks_ms(ms: u64) -> u64 {
 }
 
 /// Busy-wait `us` microseconds.
+///
+/// Every poll in this driver — command completion, each bulk phase, the
+/// recovery ladder — waits through here, so this is where the TLB-shootdown
+/// assist goes. The driver runs IRQ-masked (syscall context) and, on the exec
+/// and file-read paths, **with the BKL dropped**, so a stalled phase used to
+/// be up to 10 s in which this core could acknowledge nobody's shootdown; the
+/// BKL holder waiting on it froze every other core for as long as the disk
+/// did (`crate::shootdown::masked_wait_assist`).
 fn spin_us(us: u64) {
     let target = tsc_hz() / 1_000_000 * us;
     // SAFETY: RDTSC is unprivileged and present on all x86_64.
     let start = unsafe { core::arch::x86_64::_rdtsc() };
     while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < target {
+        crate::shootdown::masked_wait_assist();
         core::hint::spin_loop();
     }
 }
@@ -312,6 +321,22 @@ struct Xhci {
 }
 
 static XHCI: Spinlock<Option<Xhci>> = Spinlock::new(None);
+
+/// Take [`XHCI`], servicing TLB shootdowns while it is contended.
+///
+/// A plain `XHCI.lock()` spins IRQ-masked inside `spinning_top` with no hook,
+/// and the holder can be another core polling a stalled transfer for seconds
+/// with the BKL dropped — so a *second* disk reader was a second core that
+/// could never acknowledge a shootdown. Same reason as [`spin_us`]'s assist.
+fn lock_xhci() -> spinning_top::guard::SpinlockGuard<'static, Option<Xhci>> {
+    loop {
+        if let Some(g) = XHCI.try_lock() {
+            return g;
+        }
+        crate::shootdown::masked_wait_assist();
+        core::hint::spin_loop();
+    }
+}
 
 fn r32(base: usize, off: usize) -> u32 {
     // SAFETY: `base` is the mapped xHCI BAR window; `off` is inside a register
@@ -554,7 +579,7 @@ enum RingField {
 /// Probe, reset, run the controller, enumerate the one SuperSpeed device, and
 /// configure its bulk endpoints. `Ok(())` leaves the block device usable.
 pub fn init() -> Result<(), &'static str> {
-    if XHCI.lock().is_some() {
+    if lock_xhci().is_some() {
         return Ok(());
     }
 
@@ -805,7 +830,7 @@ pub fn init() -> Result<(), &'static str> {
     serial::put_dec(x.block_count * u64::from(x.block_len) / (1024 * 1024));
     serial::puts(" MiB\n");
 
-    *XHCI.lock() = Some(x);
+    *lock_xhci() = Some(x);
     Ok(())
 }
 
@@ -850,7 +875,7 @@ pub fn quiesce_all() {
 /// reboot — the same crash-loop [`quiesce_all`] describes, just earned by a
 /// bring-up that worked. Safe to call when the driver never initialised.
 pub fn shutdown() {
-    if let Some(x) = XHCI.lock().take() {
+    if let Some(x) = lock_xhci().take() {
         halt_controller(x.op);
     }
     // Belt and braces: `quiesce_all` needs no lock and no successful bring-up,
@@ -1849,20 +1874,20 @@ fn request_sense(x: &mut Xhci) -> Result<akuma_usb_storage::RequestSense, &'stat
 
 #[must_use]
 pub fn is_initialized() -> bool {
-    XHCI.lock().is_some()
+    lock_xhci().is_some()
 }
 
 /// Capacity in 512-byte sectors (the block device's own unit).
 #[must_use]
 pub fn capacity_sectors() -> Option<u64> {
-    let g = XHCI.lock();
+    let g = lock_xhci();
     let x = g.as_ref()?;
     Some(x.block_count * u64::from(x.block_len) / 512)
 }
 
 /// Read `buf.len()` bytes from byte `offset` on the whole disk.
 pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
-    let mut g = XHCI.lock();
+    let mut g = lock_xhci();
     let x = g.as_mut().ok_or("xHCI not initialised")?;
     let bl = x.block_len as usize;
     if bl == 0 {
@@ -1891,7 +1916,7 @@ pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
 /// Write `data.len()` bytes at byte `offset` on the whole disk. A partial block
 /// at either end is read-modify-written.
 pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
-    let mut g = XHCI.lock();
+    let mut g = lock_xhci();
     let x = g.as_mut().ok_or("xHCI not initialised")?;
     let bl = x.block_len as usize;
     if bl == 0 {

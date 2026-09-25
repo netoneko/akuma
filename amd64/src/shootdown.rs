@@ -35,6 +35,11 @@
 //! either requires the BKL, which the sender holds. Every peer therefore
 //! acknowledges; the wait terminates.
 //!
+//! **Except for a fifth state, which this list missed until 2026-09-25**: kernel
+//! code running IRQ-masked with the BKL *deliberately dropped* — the exec and
+//! file-read carve-outs polling the xHCI disk. Those loops call
+//! [`masked_wait_assist`]; see it for the wedge the omission caused.
+//!
 //! # Why the handler takes no lock
 //!
 //! A peer can be running ring 3 while the sender — holding the BKL — edits
@@ -178,13 +183,21 @@ pub fn wait_for_acks() {
     let generation = GEN.load(core::sync::atomic::Ordering::Acquire);
     let mut spins: u32 = 0;
     let mut remaining = peers;
+    // Which peers are missing, by cpu index. The count alone ("1 peer(s)")
+    // cannot say whether the silent core is one of the `[BKL] stuck` waiters
+    // (which would mean the spin assist is broken) or a core that is in
+    // neither place (an IRQ-masked wait outside the BKL) — the 2026-09-25
+    // captures needed exactly that distinction and had to infer it.
+    let mut missing: u64;
     while remaining > 0 {
         remaining = 0;
+        missing = 0;
         for (idx, acked) in ACKED.iter().enumerate().take(peers) {
             if idx != me
                 && acked.load(core::sync::atomic::Ordering::Acquire) < generation
             {
                 remaining += 1;
+                missing |= 1u64 << (idx & 63);
             }
         }
         if remaining == 0 {
@@ -210,6 +223,10 @@ pub fn wait_for_acks() {
             serial::put_dec(remaining as u64);
             serial::puts(" peer(s) unacked, generation=");
             serial::put_dec(generation);
+            serial::puts(" sender=");
+            serial::put_dec(me as u64);
+            serial::puts(" missing=0x");
+            serial::put_hex(missing);
             serial::puts("\n");
         }
         core::hint::spin_loop();
@@ -225,6 +242,35 @@ pub fn wait_for_acks() {
 /// generation actually arrived.
 pub fn bkl_spin_assist() {
     service_pending();
+}
+
+/// The same assist, for an IRQ-masked wait that is **not** the BKL's.
+///
+/// The deadlock argument above lists four states a peer can be in while the
+/// sender waits, and it was missing a fifth: **kernel code running with the
+/// BKL deliberately dropped.** Syscalls run with `IF` clear, and the exec and
+/// file-read carve-outs (`exec_runtime::bkl_free_io`) release the BKL around
+/// disk I/O so a slow drive cannot freeze the other cores. On the metal that
+/// I/O is the xHCI driver, which *polls*: a USB bulk phase may spin for its
+/// full 10 s budget, then again for each retry and recovery step. A core
+/// there takes no IPI and is not in the ticket wait, so it never acks. A BKL
+/// holder that broadcasts in the meantime (`munmap`, `tag=11`) spins in
+/// [`wait_for_acks`] for as long as the disk takes, and every other core
+/// queues behind it for the BKL. That is the wedge photographed on the HP box
+/// 2026-09-25: `[TLB] stuck: 1 peer(s) unacked` and `[BKL] stuck: owner=3
+/// tag=11`, with `[xhci] transfer timeout` interleaved.
+///
+/// Call it from every poll loop that can run IRQ-masked outside the BKL for
+/// longer than a shootdown should take. Servicing here is equivalent to the
+/// IPI being delivered at this instruction, which is exactly what `IF=1`
+/// would have done, so it is sound wherever the IPI would be. Before the APs
+/// are up there is no sender and no per-CPU block to read on some paths, so
+/// it does nothing then.
+#[inline]
+pub fn masked_wait_assist() {
+    if smp::online_cpus() > 1 {
+        service_pending();
+    }
 }
 
 #[cfg(not(feature = "no-tests"))]

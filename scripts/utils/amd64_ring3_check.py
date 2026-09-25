@@ -51,6 +51,11 @@ What it checks, and why each part is there:
   second rung is the C3 property itself: `gettimeofday`, `time(2)` and
   `clock_gettime(CLOCK_REALTIME)` must be one clock, which on this target they
   were not — two anchors, each internally plausible.
+* **`/probes/trapprobe`** — four rungs, the probe that pins ring-3 `#DE` and
+  `#SS` (2026-09-25). Those vectors used to halt the whole machine; a heap bug
+  in one program (kot's musl `free`, non-canonical `rbp`) took the HP box down.
+  Followed by an ssh round-trip, because the failure being pinned is a guest
+  that stops answering.
 
 # Usage
 
@@ -195,13 +200,13 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
-    for probe in ("grandfork", "sigprobe", "clockprobe"):
+    for probe in ("grandfork", "sigprobe", "clockprobe", "trapprobe"):
         subprocess.run([CC, "-static", "-O2", "-o", str(OUTDIR / probe),
                         str(PROBE_SRC / f"{probe}.c")], check=True)
     if not os.path.exists(IMG):
         subprocess.run(["sh", os.path.join(REPO, "amd64", "mkdisk.sh"), IMG, "128"],
                        cwd=REPO, check=True, capture_output=True)
-    inject_local(IMG, OUTDIR, ["grandfork", "sigprobe", "clockprobe"])
+    inject_local(IMG, OUTDIR, ["grandfork", "sigprobe", "clockprobe", "trapprobe"])
 
     proc, lines = boot(a.smp, a.ssh_port, a.http_port)
     ok = True
@@ -265,6 +270,16 @@ def main(argv=None):
         print(f"clockprobe: rc={rc}")
         print("\n".join("  | " + l for l in cp.strip().splitlines()[-14:]))
         ok = ok and rc == 0
+
+        rc, tp = ssh(a.ssh_port, "/probes/trapprobe", timeout=60)
+        print(f"trapprobe: rc={rc}")
+        print("\n".join("  | " + l for l in tp.strip().splitlines()[-8:]))
+        ok = ok and rc == 0
+        # A kernel that halted on the trap cannot answer this; one that
+        # killed only the child can.
+        rc, alive = ssh(a.ssh_port, "echo __ALIVE__", timeout=30)
+        print(f"after trapprobe: {'alive' if '__ALIVE__' in alive else 'DEAD'}")
+        ok = ok and "__ALIVE__" in alive
     finally:
         if not a.keep:
             if proc.poll() is None:

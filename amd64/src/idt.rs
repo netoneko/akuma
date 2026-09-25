@@ -330,10 +330,6 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     crate::halt();
 }
 
-extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
-    fatal("#DE divide error", &frame, None);
-}
-
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
     // Diverging by signature: `iretq` from a double fault is not architecturally
     // defined to work, so there is nothing to return to.
@@ -407,18 +403,13 @@ exception_stubs! {
     vec_br  =  5, "#BR bound range";
     vec_nm  =  7, "#NM device not available";
     vec_cso =  9, "#CSO coprocessor segment overrun";
-    vec_mf  = 16, "#MF x87 floating point";
     vec_mc  = 18, "#MC machine check";
-    vec_xm  = 19, "#XM SIMD floating point";
     vec_ve  = 20, "#VE virtualization";
     vec_hv  = 28, "#HV hypervisor injection";
 }
 
 exception_stubs_with_code! {
     vec_ts  = 10, "#TS invalid TSS";
-    vec_np  = 11, "#NP segment not present";
-    vec_ss  = 12, "#SS stack fault";
-    vec_ac  = 17, "#AC alignment check";
     vec_cp  = 21, "#CP control protection";
     vec_vc  = 29, "#VC VMM communication";
     vec_sx  = 30, "#SX security exception";
@@ -853,7 +844,7 @@ extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         }
         // No handler: Linux's default for `SIGTRAP` is to terminate, which is
         // what `user_fault` does here — the process, not the kernel.
-        user_fault("#DB debug (ring 3, no handler)", f, None, None);
+        user_fault("#DB debug (ring 3, no handler)", f, None, None, SIGSEGV);
     }
     let n = RING0_DEBUG_TRAPS.fetch_add(1, Ordering::Relaxed);
     if n < RING0_DEBUG_REPORT_LIMIT {
@@ -989,7 +980,7 @@ extern "C" fn invalid_opcode_dispatch(frame: *mut InterruptStackFrame, regs: *mu
         }
         // No handler: Linux's default for `SIGILL` is to terminate, which is
         // what `user_fault` does here — the process, not the kernel.
-        user_fault("#UD invalid opcode (ring 3, no handler)", f, None, Some(regs));
+        user_fault("#UD invalid opcode (ring 3, no handler)", f, None, Some(regs), SIGSEGV);
     }
     fatal("#UD invalid opcode", f, None);
 }
@@ -1188,7 +1179,7 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
             return;
         }
         describe_page_fault(code);
-        user_fault("#PF page fault", &pf.frame, Some(code.raw()), Some(regs));
+        user_fault("#PF page fault", &pf.frame, Some(code.raw()), Some(regs), SIGSEGV);
     }
     describe_page_fault(code);
     fatal("#PF page fault", &pf.frame, Some(code.raw()));
@@ -1511,6 +1502,7 @@ fn user_fault(
     frame: &InterruptStackFrame,
     error_code: Option<u64>,
     regs: Option<&TrapRegs>,
+    sig: u32,
 ) -> ! {
     // **One flush, not twenty `puts`.** `serial::LOCK` is per call, so a peer
     // core faulting at the same moment lands between two of them and shreds
@@ -1597,7 +1589,7 @@ fn user_fault(
     if let Some(regs) = regs {
         dump_user_registers_and_memory(regs);
     }
-    crate::usermode::kill_current_from_fault(SIGSEGV);
+    crate::usermode::kill_current_from_fault(sig);
 }
 
 /// The signal a ring-3 fault raises.
@@ -1651,9 +1643,211 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut
         if delivered {
             return;
         }
-        user_fault("#GP general protection", &pf.frame, Some(pf.error_code), Some(regs));
+        user_fault("#GP general protection", &pf.frame, Some(pf.error_code), Some(regs), SIGSEGV);
     }
     fatal("#GP general protection", &pf.frame, Some(pf.error_code));
+}
+
+// ---------------------------------------------------------------------------
+// Ring-3-survivable exceptions (2026-09-25)
+// ---------------------------------------------------------------------------
+//
+// `#DE`, `#NP`, `#SS`, `#AC`, `#MF` and `#XM` were generated `x86-interrupt`
+// stubs that went straight to `fatal`, so a *program* taking one halted the
+// machine. That was photographed on the HP box: kot's musl `free` read a
+// garbage `meta` pointer from a corrupted heap group and dereferenced it as
+// `cmp rcx, [rbp+0x10]` (mallocng `get_meta`). A non-canonical address with
+// `rbp`/`rsp` as the base register is `#SS`, not `#GP`, so the one process's
+// heap corruption took all five cores down. The dump itself was wrong as well:
+// those stubs never `swapgs`, so from ring 3 `gs` was the program's and the
+// `core=`/`task_slot=` line was missing.
+//
+// Each now enters through a stub that saves `TrapRegs` and `swapgs`es on a
+// ring-3 origin, like `#UD`, and becomes the signal Linux raises for it:
+// `SIGFPE` for `#DE`/`#MF`/`#XM`, `SIGBUS` for `#NP`/`#SS`/`#AC`
+// (`arch/x86/kernel/traps.c`). No handler means the default action, which
+// kills the process, not the kernel. From ring 0 it is still `fatal`.
+//
+// `#BP` and `#OF` are not here. Their gates are DPL 0, so an `int3`/`into`
+// from ring 3 arrives as `#GP`, which is already a `SIGSEGV`.
+
+/// `SIGBUS`, what Linux raises for a ring-3 `#NP`, `#SS` or `#AC`.
+const SIGBUS: u32 = 7;
+/// `SIGFPE`, what Linux raises for a ring-3 `#DE`, `#MF` or `#XM`.
+const SIGFPE: u32 = 8;
+/// `FPE_INTDIV`: integer divide by zero (or `INT_MIN / -1`, the same `#DE`).
+const FPE_INTDIV: i32 = 1;
+/// `BUS_ADRALN`: invalid address alignment.
+const BUS_ADRALN: i32 = 1;
+
+/// Shared body: ring 3 → the signal (or the process's death), ring 0 → `fatal`.
+///
+/// Same shape as [`invalid_opcode_dispatch`]: `clac`, BKL around the
+/// delivery because it edits the process's signal state, and `user_fault`
+/// when the program has no handler, the signal is blocked, or the frame could
+/// not be built.
+fn ring3_exception(
+    label: &str,
+    f: &mut InterruptStackFrame,
+    regs: *mut TrapRegs,
+    error_code: Option<u64>,
+    sig: u32,
+    si_code: i32,
+) {
+    note_trap_entry_flags();
+    if f.cs & 3 == 3 {
+        akuma_bkl::sync::set_core_tag_transient(
+            crate::smp::cpu_index_u32(),
+            akuma_bkl::sync::HOLD_TAG_FAULT,
+        );
+        crate::uaccess::clac_if_enabled();
+        // SAFETY: the stub passes a pointer to the register block it just
+        // pushed on this stack; it is live and exclusively ours until `iretq`.
+        let regs = unsafe { &mut *regs };
+        let took = !crate::smp::bkl_held();
+        if took {
+            crate::smp::bkl_enter();
+        }
+        let delivered = crate::signal::deliver_fault_signal(f, regs, sig, si_code, 0);
+        if took {
+            crate::smp::bkl_leave();
+        }
+        if delivered {
+            return;
+        }
+        user_fault(label, f, error_code, Some(regs), sig);
+    }
+    fatal(label, f, error_code);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn segment_not_present_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    // SAFETY: the stub's frame pointer, live until `iretq`.
+    let pf = unsafe { &mut *frame };
+    let code = pf.error_code;
+    ring3_exception("#NP segment not present", &mut pf.frame, regs, Some(code), SIGBUS,
+        crate::signal::segv::SI_KERNEL);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn stack_segment_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    // SAFETY: as above.
+    let pf = unsafe { &mut *frame };
+    let code = pf.error_code;
+    ring3_exception("#SS stack fault", &mut pf.frame, regs, Some(code), SIGBUS,
+        crate::signal::segv::SI_KERNEL);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn alignment_check_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+    // SAFETY: as above.
+    let pf = unsafe { &mut *frame };
+    let code = pf.error_code;
+    ring3_exception("#AC alignment check", &mut pf.frame, regs, Some(code), SIGBUS, BUS_ADRALN);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn divide_error_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    // SAFETY: the stub's frame pointer, live until `iretq`.
+    let f = unsafe { &mut *frame };
+    ring3_exception("#DE divide error", f, regs, None, SIGFPE, FPE_INTDIV);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn x87_fp_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    // SAFETY: as above.
+    let f = unsafe { &mut *frame };
+    ring3_exception("#MF x87 floating point", f, regs, None, SIGFPE,
+        crate::signal::segv::SI_KERNEL);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn simd_fp_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    // SAFETY: as above.
+    let f = unsafe { &mut *frame };
+    ring3_exception("#XM SIMD floating point", f, regs, None, SIGFPE,
+        crate::signal::segv::SI_KERNEL);
+}
+
+// Error-code vectors reuse the `#GP`/`#PF` stub: same frame layout, and a
+// dispatcher that edits the frame only to redirect into a signal handler.
+fixable_exception_entry!("segment_not_present_entry", "segment_not_present_dispatch");
+fixable_exception_entry!("stack_segment_entry", "stack_segment_dispatch");
+fixable_exception_entry!("alignment_check_entry", "alignment_check_dispatch");
+
+/// The no-error-code counterpart, `#UD`'s stub parameterised: 40 bytes from
+/// the CPU plus 120 of registers are both `≡ 8 (mod 16)`, so `rsp` is aligned
+/// at the `call` with no padding push (see `timer_entry`).
+macro_rules! trap_entry_no_code {
+    ($entry:literal, $dispatch:literal) => {
+        core::arch::global_asm!(concat!(
+            "    .section .text\n",
+            ".global ", $entry, "\n",
+            $entry, ":\n",
+            "    test qword ptr [rsp + 8], 3\n",
+            "    jz 1f\n",
+            "    swapgs\n",
+            "1:\n",
+            "    push rax\n",
+            "    push rbx\n",
+            "    push rcx\n",
+            "    push rdx\n",
+            "    push rsi\n",
+            "    push rdi\n",
+            "    push rbp\n",
+            "    push r8\n",
+            "    push r9\n",
+            "    push r10\n",
+            "    push r11\n",
+            "    push r12\n",
+            "    push r13\n",
+            "    push r14\n",
+            "    push r15\n",
+            "    cld\n",                          /* see fixable_exception_entry!: DF survives delivery */
+            "    lea rdi, [rsp + 120]\n",         /* &InterruptStackFrame */
+            "    lea rsi, [rsp]\n",               /* &TrapRegs */
+            "    call ", $dispatch, "\n",
+            "    pop r15\n",
+            "    pop r14\n",
+            "    pop r13\n",
+            "    pop r12\n",
+            "    pop r11\n",
+            "    pop r10\n",
+            "    pop r9\n",
+            "    pop r8\n",
+            "    pop rbp\n",
+            "    pop rdi\n",
+            "    pop rsi\n",
+            "    pop rdx\n",
+            "    pop rcx\n",
+            "    pop rbx\n",
+            "    pop rax\n",
+            "    test qword ptr [rsp + 8], 3\n",
+            "    jz 2f\n",
+            "    swapgs\n",
+            "2:\n",
+            "    iretq\n",
+        ));
+    };
+}
+
+trap_entry_no_code!("divide_error_entry", "divide_error_dispatch");
+trap_entry_no_code!("x87_fp_entry", "x87_fp_dispatch");
+trap_entry_no_code!("simd_fp_entry", "simd_fp_dispatch");
+
+unsafe extern "C" {
+    /// Vector 0, installed by [`init`].
+    fn divide_error_entry();
+    /// Vector 11, installed by [`init`].
+    fn segment_not_present_entry();
+    /// Vector 12, installed by [`init`].
+    fn stack_segment_entry();
+    /// Vector 16, installed by [`init`].
+    fn x87_fp_entry();
+    /// Vector 17, installed by [`init`].
+    fn alignment_check_entry();
+    /// Vector 19, installed by [`init`].
+    fn simd_fp_entry();
 }
 
 unsafe extern "C" {
@@ -1803,13 +1997,20 @@ pub fn init() {
         }
         install_exception_stubs(idt);
         install_exception_stubs_with_code(idt);
-        (*idt)[0].set(divide_error as usize);
+        (*idt)[0].set(divide_error_entry as usize);
         (*idt)[1].set(debug_entry as usize);
         (*idt)[6].set(invalid_opcode_entry as usize);
         (*idt)[8].set(double_fault as usize);
         // The hand-assembled entries; see the module header.
         (*idt)[13].set(general_protection_entry as usize);
         (*idt)[14].set(page_fault_entry as usize);
+        // Ring-3-survivable exceptions: a signal for the program, `fatal`
+        // only from ring 0. See `ring3_exception`.
+        (*idt)[11].set(segment_not_present_entry as usize);
+        (*idt)[12].set(stack_segment_entry as usize);
+        (*idt)[16].set(x87_fp_entry as usize);
+        (*idt)[17].set(alignment_check_entry as usize);
+        (*idt)[19].set(simd_fp_entry as usize);
     }
     load();
 }
