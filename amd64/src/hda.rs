@@ -8,7 +8,7 @@
 //! virtio.
 
 use crate::serial;
-use akuma_hda::Regs16;
+use akuma_hda::{Regs16, RegsW16};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Intel's vendor id. The NVIDIA HDMI audio function is class 04:03 too, so
@@ -31,6 +31,13 @@ impl Regs16 for MmioRegs {
     }
 }
 
+
+impl RegsW16 for MmioRegs {
+    fn w16(&self, offset: usize, value: u16) {
+        // SAFETY: BAR0 mapping as above; the reset path writes STATE0 only.
+        unsafe { (self.base.add(offset) as *mut u16).write_volatile(value) }
+    }
+}
 /// Whether discovery found and decoded the controller (M2's suite hook).
 #[allow(dead_code)] // wired into the boot suite with the next milestone
 pub fn discovered() -> bool {
@@ -107,5 +114,27 @@ pub fn init() {
         DISCOVERED.store(true, Ordering::Relaxed);
     } else {
         serial::puts(" version=0xffff — BAR0 not decoded; everything after is noise\n");
+    }
+
+    // Bring-up step 2 (runbook): controller reset. CRST self-clears; the
+    // wait is a bounded spin, because the boot suite runs before the tick
+    // and a hung poll must not hang the boot. The post-reset re-read of the
+    // version is the M2 deliverable — it separates a decode artifact from a
+    // controller answer.
+    let spin = || {
+        for _ in 0..2000 {
+            core::hint::spin_loop();
+        }
+    };
+    if akuma_hda::reset(&regs, 1 << 20, spin) {
+        if let Some(post) = akuma_hda::discover(&regs) {
+            serial::puts("[HDA] post-reset version=");
+            serial::put_dec(u64::from(post.vmaj));
+            serial::puts(".");
+            serial::put_dec(u64::from(post.vmin));
+            serial::puts("\n");
+        }
+    } else {
+        serial::puts("[HDA] CRST did not self-clear - controller not reset\n");
     }
 }

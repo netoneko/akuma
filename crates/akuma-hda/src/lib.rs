@@ -21,6 +21,9 @@ pub mod reg {
     pub const VMIN: usize = 0x02;
     /// Major version (8-bit).
     pub const VMAJ: usize = 0x03;
+    /// STATE0 - the reset-and-status word; CRST (bit 0) is the
+    /// controller reset; it self-clears when the reset completes.
+    pub const STATE0: usize = 0x08;
 }
 
 /// How the pure half reads a 16-bit register. Implemented over mapped MMIO by
@@ -30,8 +33,16 @@ pub trait Regs16 {
     fn r16(&self, offset: usize) -> u16;
 }
 
-/// `GCAP`, decoded. Field order in `raw` (bit 0 first): 64OK, NS, BSS, ISS,
-/// OSS — the spec's packing, not the print order.
+/// How the pure half writes a 16-bit register. Separate from [`Regs16`]
+/// so read-only fakes stay one-method, and so the reset path states
+/// its needs in the type it takes.
+pub trait RegsW16: Regs16 {
+    /// Write the 16-bit register at byte `offset`.
+    fn w16(&self, offset: usize, value: u16);
+}
+
+/// GCAP, decoded. Field order in raw (bit 0 first): 64OK, NS, BSS, ISS,
+/// OSS - the spec packing, not the print order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GCap {
     /// The raw 16-bit register.
@@ -81,6 +92,10 @@ pub struct Info {
 /// The runbook's discovery gate: a version of `0xffff` means the BAR is not
 /// mapped, and "everything after this is noise".
 #[must_use]
+/// `STATE0.CRST` — set to begin a controller reset; self-clears when
+/// the controller and its codecs are ready again.
+pub const CRST: u16 = 1;
+
 pub fn version_is_noise(vmaj: u8, vmin: u8) -> bool {
     vmaj == 0xff && vmin == 0xff
 }
@@ -93,16 +108,32 @@ pub fn version_is_noise(vmaj: u8, vmin: u8) -> bool {
 pub fn discover<R: Regs16 + ?Sized>(regs: &R) -> Option<Info> {
     let gcap = GCap { raw: regs.r16(reg::GCAP) };
     let vmin = (regs.r16(reg::VMIN) & 0xff) as u8;
-    let vmaj = (regs.r16(reg::VMAJ) >> 8) as u8;
+    let vmaj = (regs.r16(reg::VMAJ) & 0xff) as u8;
     if version_is_noise(vmaj, vmin) {
         return None;
     }
     Some(Info { gcap, vmaj, vmin })
 }
 
+/// Reset the controller: set `CRST`, poll until it self-clears.
+/// `wait` is one delay unit — the caller decides what a unit is, so
+/// the crate stays free of timing. Returns `false` on timeout.
+pub fn reset<R: RegsW16 + ?Sized>(regs: &R, polls: usize, wait: impl Fn()) -> bool {
+    let st = regs.r16(reg::STATE0);
+    regs.w16(reg::STATE0, st | CRST);
+    for _ in 0..polls {
+        wait();
+        if regs.r16(reg::STATE0) & CRST == 0 {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
 
     /// A register file in a box, so the decode is testable off-metal.
     struct FakeRegs {
@@ -158,5 +189,48 @@ mod tests {
         assert!(discover(&r).is_none());
         assert!(version_is_noise(0xff, 0xff));
         assert!(!version_is_noise(0x01, 0x00));
+    }
+
+    /// A fake that holds CRST until the wait callback self-clears it, so the
+    /// reset handshake is testable without hardware. `Cell`, because the wait
+    /// closure and the register file share it without borrowing.
+    struct FakeReset {
+        state: Cell<u16>,
+    }
+
+    impl Regs16 for FakeReset {
+        fn r16(&self, _offset: usize) -> u16 {
+            self.state.get()
+        }
+    }
+
+    impl RegsW16 for FakeReset {
+        fn w16(&self, _offset: usize, value: u16) {
+            self.state.set(value);
+        }
+    }
+
+    #[test]
+    fn reset_sets_crst_and_waits_for_self_clear() {
+        // STATE0 starts with unrelated bits set; reset must OR CRST in,
+        // preserve them, and return true once CRST self-clears.
+        let f = FakeReset { state: Cell::new(0x42) };
+        let mut waits = 0;
+        assert!(reset(&f, 100, || {
+            waits += 1;
+            if waits == 3 {
+                f.state.set(0x42); // the controller finishes on the third wait
+            }
+        }));
+        assert_eq!(waits, 3);
+        assert_eq!(f.state.get(), 0x42);
+    }
+
+    #[test]
+    fn reset_times_out_when_crst_never_clears() {
+        let f = FakeReset { state: Cell::new(0x00) };
+        assert!(!reset(&f, 5, || { f.state.set(f.state.get() | CRST); }));
+        // CRST stuck: the timeout leaves it set — the caller reports and
+        // leaves the controller alone rather than hanging the boot.
     }
 }
