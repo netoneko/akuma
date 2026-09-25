@@ -1641,11 +1641,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // Glue's `sys_sendto`/`sys_recvfrom` test the family themselves and
         // serve AF_UNIX from `unixsock`; the hop is here so `crate::sock` stays
         // the smoltcp implementation rather than growing a second family.
-        Syscall::Sendto | Syscall::Recvfrom if crate::fd::is_unix_socket(a1) => {
+        Syscall::Sendto if crate::fd::is_unix_socket(a1) => {
             to_glue(call, [a1, a2, a3, a4, a5, a6])
         }
         Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3, a5),
-        Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3, a5),
+        // Both families, then the busy-loop tripwire: the 2026-09-25 kot spin
+        // was ~720k `recvfrom`/s from one thread and no log named the socket.
+        Syscall::Recvfrom => {
+            let unix = crate::fd::is_unix_socket(a1);
+            let r = if unix {
+                to_glue(call, [a1, a2, a3, a4, a5, a6])
+            } else {
+                crate::sock::sys_recvfrom(a1, a2, a3, a5)
+            };
+            crate::sock::recv_spin_tripwire(a1, a3, a4, r, unix);
+            r
+        }
         Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
         // `getsockopt`/`shutdown` never had a native `crate::sock` arm at all —
         // unlike `Setsockopt`/`Sendto`, there is no "second family" to avoid

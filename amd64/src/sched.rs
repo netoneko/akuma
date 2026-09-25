@@ -1106,6 +1106,15 @@ pub fn idle_loop() -> ! {
             // to `true` to get it back.
             const DUMP_FUTEX_WAITERS: bool = false;
             const DUMP_PIPE_TABLE: bool = false;
+            // OFF since 2026-09-25, for the same reason plus a worse one: this
+            // block runs in the idle loop **with the BKL held**, and on
+            // Firecracker every serial byte is a VM exit. The `[SLOT]` table
+            // is ~20 lines, so each 30 s sweep made the other core spin on the
+            // lock for tens of ms — three `[bkls>]` lines (1M/2M/4M spins) per
+            // interval, 4394 of them in one 12 h boot, which read as a stall.
+            // [PSTATS] stays: it is the one of these that is read routinely.
+            const DUMP_ORPHANS: bool = false;
+            const DUMP_SLOT_TABLE: bool = false;
             const PSTATS_INTERVAL_US: u64 = 30_000_000;
             let now_us = crate::net::uptime_us();
             let last = LAST_PSTATS_US.load(Ordering::Relaxed);
@@ -1123,18 +1132,24 @@ pub fn idle_loop() -> ! {
                 // matches it exactly: two `rustc` at 0:00 CPU, an idle vCPU and
                 // no crash line. The hook is registered on this target already
                 // and had no reader here, so this is the whole cost of asking.
-                akuma_exec::process::dump_orphan_processes();
+                if DUMP_ORPHANS {
+                    akuma_exec::process::dump_orphan_processes();
+                }
                 // TEMPORARY (2026-09-18), §12 lever 1: the "created and never
                 // scheduled" shape needs the picker's own view, not `ps`'s.
-                dump_slot_table();
+                if DUMP_SLOT_TABLE {
+                    dump_slot_table();
+                }
                 // §13: and once the slot table says "WAITING in futex", the
                 // next question is *which* futex — that is this.
                 //
                 if DUMP_FUTEX_WAITERS {
                     crate::futex::dump_waiters();
                 }
-                akuma_primitives::safe_print!(96,
-                    "[SLOT] stale-fs windows closed: {}\n", stale_fs_windows());
+                if DUMP_SLOT_TABLE {
+                    akuma_primitives::safe_print!(96,
+                        "[SLOT] stale-fs windows closed: {}\n", stale_fs_windows());
+                }
                 // `MAX_PIPES` is machine-wide and small on purpose; this is
                 // the reading that says whether a workload is near it. A
                 // `-j8` self-host build refuses at it (`ENFILE`, which `std`

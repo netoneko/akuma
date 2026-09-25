@@ -30,6 +30,8 @@ use akuma_net::socket::{SockAddrIn, SocketAddrV4};
 use akuma_selftest::Suite;
 
 use crate::fd::{self, errno};
+use crate::sched::MAX_TASKS;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// `SOCK_STREAM`/`SOCK_DGRAM` are the low bits of `type`, which also carries
 /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
@@ -404,6 +406,95 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, src_addr: u64) -> u64 {
         };
     }
     recv(fd, idx, buf, len, fd::is_nonblocking(fd))
+}
+
+/// A thread whose `recvfrom` keeps answering the same non-positive result this
+/// fast is looping on it — no caller that parks does this.
+const RECV_SPIN_CALLS: u32 = 50_000;
+/// …within this long of the streak's first call. A healthy tokio socket
+/// returns `EAGAIN` once per readiness event, and an idle connection can
+/// collect 100k of those over a day; the window is what separates that from
+/// the 2026-09-25 spin (~720k/s).
+const RECV_SPIN_WINDOW_US: u64 = 1_000_000;
+/// At most one report per task per this long, so a spin that never ends costs
+/// one console line a minute rather than the console.
+const RECV_SPIN_REPORT_EVERY_US: u64 = 60_000_000;
+
+// Per-task streak state, each row touched only by the task in that slot, so
+// `Relaxed` throughout. A recycled slot inherits a streak at worst, and the
+// fd/result/window checks restart it on the new occupant's first call.
+static SPIN_FD: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(u64::MAX) }; MAX_TASKS];
+static SPIN_RET: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+static SPIN_START_US: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+static SPIN_COUNT: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+static SPIN_REPORTED_US: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Busy-loop tripwire for `recvfrom`, called by the dispatcher after either
+/// family has answered `r`.
+///
+/// Built for the 2026-09-25 kot wedge on the Ryzen Firecracker guest: one
+/// tokio worker went from ~126 syscalls/s to ~720k `recvfrom`/s and never
+/// parked again, and nothing in the log said which socket or which answer.
+/// This prints both, plus the state `socket_recv` decides from
+/// ([`akuma_net::socket::TcpRecvSnapshot`]). Positive results are data and
+/// never count — a bulk transfer is not a spin. Heap-free.
+pub fn recv_spin_tripwire(fd: u64, len: u64, flags: u64, r: u64, unix: bool) {
+    let t = crate::sched::current_task();
+    if t >= MAX_TASKS {
+        return;
+    }
+    if r != 0 && !errno::is_err(r) {
+        SPIN_COUNT[t].store(0, Ordering::Relaxed);
+        return;
+    }
+    let now = crate::net::uptime_us();
+    let same = SPIN_FD[t].load(Ordering::Relaxed) == fd
+        && SPIN_RET[t].load(Ordering::Relaxed) == r
+        && now.saturating_sub(SPIN_START_US[t].load(Ordering::Relaxed)) <= RECV_SPIN_WINDOW_US;
+    if !same {
+        SPIN_FD[t].store(fd, Ordering::Relaxed);
+        SPIN_RET[t].store(r, Ordering::Relaxed);
+        SPIN_START_US[t].store(now, Ordering::Relaxed);
+        SPIN_COUNT[t].store(1, Ordering::Relaxed);
+        return;
+    }
+    let n = SPIN_COUNT[t].load(Ordering::Relaxed).saturating_add(1);
+    SPIN_COUNT[t].store(n, Ordering::Relaxed);
+    if n != RECV_SPIN_CALLS {
+        return;
+    }
+    let last = SPIN_REPORTED_US[t].load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < RECV_SPIN_REPORT_EVERY_US {
+        return;
+    }
+    SPIN_REPORTED_US[t].store(now, Ordering::Relaxed);
+    let elapsed = now.saturating_sub(SPIN_START_US[t].load(Ordering::Relaxed));
+    akuma_primitives::tprint!(192,
+        "[recv-spin] pid={} task={} fd={} ret={} len={} flags={:#x} calls={} in {}us family={}\n",
+        crate::usermode::current_pid(), t, fd, r.cast_signed(), len, flags, n, elapsed,
+        if unix { "unix" } else { "inet" });
+    if unix {
+        return;
+    }
+    let Some(idx) = fd::socket_index(fd) else {
+        akuma_primitives::safe_print!(64, "[recv-spin]   fd {} is not a socket\n", fd);
+        return;
+    };
+    if akuma_net::socket::is_udp_socket(idx) {
+        akuma_primitives::safe_print!(96,
+            "[recv-spin]   udp idx={} nonblock={}\n", idx, fd::is_nonblocking(fd));
+        return;
+    }
+    if let Some(s) = akuma_net::socket::tcp_recv_snapshot(idx) {
+        akuma_primitives::safe_print!(256,
+            "[recv-spin]   tcp idx={} {} {}.{}.{}.{}:{} local={} can_recv={} may_recv={} \
+rxq={} was_connected={} recv_shutdown={} handle_live={} nonblock={}\n",
+            idx, s.state, s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3],
+            s.remote_port, s.local_port, s.can_recv, s.may_recv, s.recv_queue,
+            s.was_connected, s.recv_shutdown, s.handle_live, fd::is_nonblocking(fd));
+    } else {
+        akuma_primitives::safe_print!(64, "[recv-spin]   idx={} is a listener\n", idx);
+    }
 }
 
 /// Byte offsets into the x86_64 `struct msghdr` — 56 bytes, `{ void

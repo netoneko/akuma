@@ -1849,8 +1849,96 @@ pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
     .unwrap_or((false, false))
 }
 
+/// Everything a "this read keeps returning at once" report needs about one TCP
+/// socket, read without polling or changing anything.
+///
+/// For a caller's diagnostics only — a busy-loop tripwire. Each field is one
+/// of the inputs `socket_recv`'s early returns decide on: `recv_shutdown` is
+/// the `Ok(0)` before any smoltcp state is read, `handle_live == false` is the
+/// `ENETDOWN` fallback, and `state`/`can_recv`/`may_recv`/`was_connected` pick
+/// between data, `ECONNRESET`, EOF and `EAGAIN`.
+// Each bool is one independent input to `socket_recv`'s decision, printed as
+// such; packing them would only make the report harder to read.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug)]
+pub struct TcpRecvSnapshot {
+    pub state: &'static str,
+    pub remote_ip: [u8; 4],
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub can_recv: bool,
+    pub may_recv: bool,
+    pub recv_queue: usize,
+    pub was_connected: bool,
+    pub recv_shutdown: bool,
+    /// `false` when the table names a handle smoltcp no longer holds.
+    pub handle_live: bool,
+}
+
+#[cfg(feature = "smoltcp")]
+const fn tcp_state_name(state: tcp::State) -> &'static str {
+    match state {
+        tcp::State::Closed => "CLOSED",
+        tcp::State::Listen => "LISTEN",
+        tcp::State::SynSent => "SYN_SENT",
+        tcp::State::SynReceived => "SYN_RECV",
+        tcp::State::Established => "ESTABLISHED",
+        tcp::State::FinWait1 => "FIN_WAIT1",
+        tcp::State::FinWait2 => "FIN_WAIT2",
+        tcp::State::CloseWait => "CLOSE_WAIT",
+        tcp::State::Closing => "CLOSING",
+        tcp::State::LastAck => "LAST_ACK",
+        tcp::State::TimeWait => "TIME_WAIT",
+    }
+}
+
+/// [`TcpRecvSnapshot`] of stream socket `idx`, or `None` if `idx` is not one.
+#[must_use]
+#[cfg(feature = "smoltcp")]
+pub fn tcp_recv_snapshot(idx: usize) -> Option<TcpRecvSnapshot> {
+    let (handle, local_port, was_connected, recv_shutdown) = with_table(|table| {
+        let sock = table.get(idx)?.as_ref()?;
+        match sock.inner {
+            SocketType::Stream(h) => {
+                Some((h, sock.bind_port.unwrap_or(0), sock.was_connected, sock.recv_shutdown))
+            }
+            _ => None,
+        }
+    })?;
+    let mut snap = TcpRecvSnapshot {
+        state: "GONE",
+        remote_ip: [0; 4],
+        remote_port: 0,
+        local_port,
+        can_recv: false,
+        may_recv: false,
+        recv_queue: 0,
+        was_connected,
+        recv_shutdown,
+        handle_live: false,
+    };
+    with_network(|net| {
+        smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
+            snap.state = tcp_state_name(socket.state());
+            if let Some(ep) = socket.remote_endpoint() {
+                let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr;
+                snap.remote_ip = addr.octets();
+                snap.remote_port = ep.port;
+            }
+            if let Some(ep) = socket.local_endpoint() {
+                snap.local_port = ep.port;
+            }
+            snap.can_recv = socket.can_recv();
+            snap.may_recv = socket.may_recv();
+            snap.recv_queue = socket.recv_queue();
+            snap.handle_live = true;
+        })
+    });
+    Some(snap)
+}
+
 /// Get the default peer for a connected UDP socket
-#[must_use] 
+#[must_use]
 #[cfg(feature = "smoltcp")]
 pub fn udp_default_peer(idx: usize) -> Option<SocketAddrV4> {
     with_table(|table| {
@@ -1906,19 +1994,7 @@ pub fn list_sockets() -> Vec<SocketStat> {
                                 (addr.octets(), ep.port)
                             });
 
-                            let tcp_state = match socket.state() {
-                                tcp::State::Closed => "CLOSED",
-                                tcp::State::Listen => "LISTEN",
-                                tcp::State::SynSent => "SYN_SENT",
-                                tcp::State::SynReceived => "SYN_RECV",
-                                tcp::State::Established => "ESTABLISHED",
-                                tcp::State::FinWait1 => "FIN_WAIT1",
-                                tcp::State::FinWait2 => "FIN_WAIT2",
-                                tcp::State::CloseWait => "CLOSE_WAIT",
-                                tcp::State::Closing => "CLOSING",
-                                tcp::State::LastAck => "LAST_ACK",
-                                tcp::State::TimeWait => "TIME_WAIT",
-                            };
+                            let tcp_state = tcp_state_name(socket.state());
 
                             stats.push(SocketStat {
                                 local_port: slot.bind_port.unwrap_or(0),
