@@ -254,6 +254,33 @@ pub fn map_bar(bar: Bar, len: u64) -> Option<*mut u8> {
 
 /// Print the enumerated devices — the amd64 equivalent of an `lspci`, worth
 /// having every bare-metal boot for the same reason `machine::report` is.
+/// The whole 256-byte config image, for capability walks the stored
+/// header cannot answer.
+pub fn config_space(addr: Address) -> [u8; 256] {
+    let mut out = [0u8; 256];
+    read_config_space(addr, &mut out);
+    out
+}
+
+/// Read a config-space word via its containing dword.
+pub fn read_u16_config(addr: Address, offset: u8) -> u16 {
+    let d = read_u32(addr, offset & !3);
+    if offset & 2 != 0 { (d >> 16) as u16 } else { d as u16 }
+}
+
+/// Write a config-space word as a dword read-modify-write, so the
+/// neighbouring half is untouched.
+pub fn write_u16_config(addr: Address, offset: u8, value: u16) {
+    let base = offset & !3;
+    let mut d = read_u32(addr, base);
+    if offset & 2 != 0 {
+        d = (d & 0x0000_ffff) | (u32::from(value) << 16);
+    } else {
+        d = (d & 0xffff_0000) | u32::from(value);
+    }
+    write_u32(addr, base, d);
+}
+
 pub fn report() {
     let n = device_count();
     serial::puts("  pci:  ");

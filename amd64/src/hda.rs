@@ -75,6 +75,30 @@ pub fn init() {
         return;
     }
     crate::pci::enable(addr, true);
+
+    // Bring-up step 3 (runbook): power. The controller boots in D0
+    // normally, but a warm reboot can leave D3hot, where MMIO reads
+    // answer 0xff — exactly the version=255.0 shape seen in M2. Find
+    // the PCI PM capability (id 0x01), read PMCSR, and if it is not
+    // D0, write D0 back and wait out the 10 ms D3hot->D0 transition
+    // before anyone touches BAR0.
+    let cfg = crate::pci::config_space(addr);
+    for cap in akuma_pci::capabilities(&cfg, dev.header.capabilities_pointer) {
+        if cap.id == akuma_pci::capability_id::POWER_MANAGEMENT {
+            let pmcsr = crate::pci::read_u16_config(addr, cap.offset + 4);
+            let state = akuma_pci::pm::power_state(pmcsr);
+            serial::puts("[HDA] PMCSR=");
+            serial::put_dec(u64::from(state));
+            if state != akuma_pci::pm::D0 {
+                crate::pci::write_u16_config(addr, cap.offset + 4,
+                    pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
+                for _ in 0..20_000 { core::hint::spin_loop(); }
+                serial::puts(" -> 0 (D0 written)");
+            }
+            serial::puts("\n");
+            break;
+        }
+    }
     let Some(bar) = dev.bars.into_iter().next().flatten() else {
         serial::puts("[HDA] BAR0 absent\n");
         return;

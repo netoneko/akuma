@@ -105,6 +105,22 @@ pub mod capability_id {
     pub const MSI_X: u8 = 0x11;
 }
 
+/// PCI power management (capability 0x01) — the PMCSR decode.
+pub mod pm {
+    /// `PMCSR[1:0]` — the power state the function is in.
+    pub const POWER_STATE_MASK: u16 = 0b11;
+    /// `D0` — fully on. The only state MMIO is guaranteed live in.
+    pub const D0: u8 = 0;
+    /// `D3hot` — off minus aux power. MMIO reads answer 0xff.
+    pub const D3HOT: u8 = 3;
+
+    /// The power state `pmcsr` encodes.
+    #[must_use]
+    pub fn power_state(pmcsr: u16) -> u8 {
+        (pmcsr & POWER_STATE_MASK) as u8
+    }
+}
+
 /// The type-0 (non-bridge) PCI configuration header — the first 64 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
