@@ -207,10 +207,10 @@ static mut RIRB_RING: RirbRing = RirbRing([0; 256]);
 fn codec_link_init(regs: &mut MmioRegs) {
     unsafe {
         let cb = akuma_primitives::addr::virt_to_phys(
-            (&raw mut CORB_RING) as *mut [u32; 256] as usize,
+            (&raw mut CORB_RING.0) as *mut [u32; 256] as usize,
         ) as u32;
         let rb = akuma_primitives::addr::virt_to_phys(
-            (&raw mut RIRB_RING) as *mut [u64; 256] as usize,
+            (&raw mut RIRB_RING.0) as *mut [u64; 256] as usize,
         ) as u32;
         regs.w16(0x4C, 0x0000); // CORBCTL: stop while reprogramming
         regs.w16(0x4A, 0x8000); // CORBRP: read-pointer reset
@@ -236,8 +236,8 @@ fn codec_link_init(regs: &mut MmioRegs) {
 /// Send one verb (CAd<<28 | NID<<20 | verb<<8 | payload), poll RIRB.
 fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
     unsafe {
-        let corb = (&raw mut CORB_RING).cast::<u32>();
-        let rirb = (&raw mut RIRB_RING).cast::<u64>();
+        let corb = (&raw mut CORB_RING.0).cast::<u32>();
+        let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
         let wp = (regs.r16(0x48) & 0x00ff) as usize;
         let np = (wp % 255) + 1;
         corb.add(np).write_volatile(verb);
@@ -276,5 +276,56 @@ fn codec_probe(regs: &mut MmioRegs) {
         }
         None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
     }
+        codec_ici_probe(regs, 0xF00000);
     serial::puts("\n");
+}
+
+/// Immediate command interface probe (M7d): no DMA, bypasses CORB/RIRB
+/// entirely — bisects "rings broken" vs "link/codec broken". Also dumps
+/// the command-path registers so the capture shows the stall point.
+/// Map per Linux ICH6: ICW 0x60 (dword), IRR 0x64 (dword), IRS 0x68
+/// (bit0 ICBUSY, bit1 IRV valid).
+fn codec_ici_probe(regs: &mut MmioRegs, verb: u32) {
+    let corbwp = regs.r16(0x48);
+    let corbrp = regs.r16(0x4A);
+    let corbctl = regs.r16(0x4C);
+    let rirbwp = regs.r16(0x78);
+    let rintcnt = regs.r16(0x7A);
+    let rirbctl = regs.r16(0x7C);
+    let rirbsts = regs.r16(0x7D);
+    serial::puts("[HDA] cmdpath corbwp=");
+    serial::put_hexn(corbwp as u64, 4);
+    serial::puts(" corbrp=");
+    serial::put_hexn(corbrp as u64, 4);
+    serial::puts(" corbctl=");
+    serial::put_hexn(corbctl as u64, 4);
+    serial::puts(" rirbwp=");
+    serial::put_hexn(rirbwp as u64, 4);
+    serial::puts(" rintcnt=");
+    serial::put_hexn(rintcnt as u64, 4);
+    serial::puts(" rirbctl=");
+    serial::put_hexn(rirbctl as u64, 4);
+    serial::puts(" rirbsts=");
+    serial::put_hexn(rirbsts as u64, 4);
+    serial::puts("\n");
+    regs.w16(0x60, (verb & 0xffff) as u16);
+    regs.w16(0x62, (verb >> 16) as u16);
+    regs.w16(0x68, 1);
+    let mut tries: usize = 0;
+    let mut s = regs.r16(0x68);
+    while s & 1 != 0 && tries < 200000 {
+        s = regs.r16(0x68);
+        tries += 1;
+    }
+    if s & 1 != 0 {
+        serial::puts("[HDA] ICI: timeout waiting for busy clear\n");
+    } else if s & 2 != 0 {
+        let lo = regs.r16(0x64) as u32;
+        let hi = regs.r16(0x66) as u32;
+        serial::puts("[HDA] ICI response: ");
+        serial::put_hexn(((hi << 16) | lo) as u64, 8);
+        serial::puts("\n");
+    } else {
+        serial::puts("[HDA] ICI: busy cleared, no result valid\n");
+    }
 }
