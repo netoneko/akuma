@@ -215,6 +215,7 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x4C, 0x0000); // CORBCTL: stop while reprogramming
         regs.w16(0x4A, 0x8000); // CORBRP: read-pointer reset
         regs.w16(0x4A, 0x0000); // CORBRP: clear
+        regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries (spec: program size before RUN)
         regs.w16(0x48, 0x0000); // CORBWP = 0
         regs.w16(0x40, (cb & 0xffff) as u16);
         regs.w16(0x42, (cb >> 16) as u16);
@@ -229,6 +230,17 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x7E, 0x0002); // RIRBSIZE: 256 entries
         regs.w16(0x7C, 0x0001); // RIRBCTL: DMA enable
         regs.w16(0x4C, 0x0001); // CORBCTL: run
+        serial::puts("[HDA] postinit corbsize=");
+        serial::put_hexn(regs.r16(0x4E) as u64, 4);
+        serial::puts(" rirbsize=");
+        serial::put_hexn(regs.r16(0x7E) as u64, 4);
+        serial::puts(" rintcnt=");
+        serial::put_hexn(regs.r16(0x7A) as u64, 4);
+        serial::puts(" rirbctl=");
+        serial::put_hexn(regs.r16(0x7C) as u64, 4);
+        serial::puts(" corbsts=");
+        serial::put_hexn(regs.r16(0x4D) as u64, 4);
+        serial::puts("\n");
     }
     serial::puts("[HDA] CORB/RIRB enabled\n");
 }
