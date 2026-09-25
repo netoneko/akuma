@@ -96,6 +96,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-fbcon",
  "akuma-fpcache",
+ "akuma-hda",
  "akuma-isolation",
  "akuma-locks-rw",
  "akuma-mmap",
@@ -304,6 +305,10 @@ dependencies = [
  "akuma-cpu",
  "akuma-primitives",
 ]
+
+[[package]]
+name = "akuma-hda"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-isolation"
