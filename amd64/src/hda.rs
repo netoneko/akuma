@@ -228,7 +228,7 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x54, 0x0000);
         regs.w16(0x5A, 0x0001); // RINTCNT = 1
         regs.w16(0x5E, 0x0002); // RIRBSIZE: 256 entries
-        regs.w16(0x5C, 0x0001); // RIRBCTL: DMA enable
+        regs.w16(0x5C, 0x0002); // RIRBCTL: DMA enable
         regs.w16(0x4C, 0x0002); // CORBCTL: RUN (bit1); bit0 is CORBRPRST pointer-reset - that bug held CORB in reset
         serial::puts("[HDA] postinit corbsize=");
         serial::put_hexn(regs.r16(0x4E) as u64, 4);
