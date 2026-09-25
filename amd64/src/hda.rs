@@ -197,7 +197,7 @@ pub fn init() {
 // Rings are static .bss DMA buffers, xhci dma_buf style; bus address
 // via virt_to_phys (no IOMMU on this target). Offsets per Linux ICH6
 // map: CORBWP 0x48, CORBRP 0x4A, CORBCTL 0x4C, CORBSIZE 0x4E;
-// RIRB 0x70/0x74, RIRBWP 0x78, RINTCNT 0x7A, RIRBCTL 0x7C, SIZE 0x7E.
+// RIRB 0x50/0x54, RIRBWP 0x58, RINTCNT 0x5A, RIRBCTL 0x5C, SIZE 0x5E.
 // ===================================================================
 struct CorbRing([u32; 256]);
 static mut CORB_RING: CorbRing = CorbRing([0; 256]);
@@ -221,23 +221,23 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x42, (cb >> 16) as u16);
         regs.w16(0x44, 0x0000); // upper base = 0 (<4GB)
         regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries
-        regs.w16(0x78, 0x8000); // RIRBWP: reset
-        regs.w16(0x78, 0x0000);
-        regs.w16(0x70, (rb & 0xffff) as u16);
-        regs.w16(0x72, (rb >> 16) as u16);
-        regs.w16(0x74, 0x0000);
-        regs.w16(0x7A, 0x0001); // RINTCNT = 1
-        regs.w16(0x7E, 0x0002); // RIRBSIZE: 256 entries
-        regs.w16(0x7C, 0x0001); // RIRBCTL: DMA enable
+        regs.w16(0x58, 0x8000); // RIRBWP: reset
+        regs.w16(0x58, 0x0000);
+        regs.w16(0x50, (rb & 0xffff) as u16);
+        regs.w16(0x52, (rb >> 16) as u16);
+        regs.w16(0x54, 0x0000);
+        regs.w16(0x5A, 0x0001); // RINTCNT = 1
+        regs.w16(0x5E, 0x0002); // RIRBSIZE: 256 entries
+        regs.w16(0x5C, 0x0001); // RIRBCTL: DMA enable
         regs.w16(0x4C, 0x0002); // CORBCTL: RUN (bit1); bit0 is CORBRPRST pointer-reset - that bug held CORB in reset
         serial::puts("[HDA] postinit corbsize=");
         serial::put_hexn(regs.r16(0x4E) as u64, 4);
         serial::puts(" rirbsize=");
-        serial::put_hexn(regs.r16(0x7E) as u64, 4);
+        serial::put_hexn(regs.r16(0x5E) as u64, 4);
         serial::puts(" rintcnt=");
-        serial::put_hexn(regs.r16(0x7A) as u64, 4);
+        serial::put_hexn(regs.r16(0x5A) as u64, 4);
         serial::puts(" rirbctl=");
-        serial::put_hexn(regs.r16(0x7C) as u64, 4);
+        serial::put_hexn(regs.r16(0x5C) as u64, 4);
         serial::puts(" corbsts=");
         serial::put_hexn(regs.r16(0x4D) as u64, 4);
         serial::puts("\n");
@@ -254,10 +254,10 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
         let np = (wp % 255) + 1;
         corb.add(np).write_volatile(verb);
         regs.w16(0x48, np as u16);
-        let start = regs.r16(0x78) & 0x00ff;
+        let start = regs.r16(0x58) & 0x00ff;
         let mut n = 0;
         loop {
-            let rwp = regs.r16(0x78) & 0x00ff;
+            let rwp = regs.r16(0x58) & 0x00ff;
             if rwp != start {
                 let rp = (start as usize % 255) + 1;
                 let resp = rirb.add(rp).read_volatile();
@@ -301,9 +301,9 @@ fn codec_ici_probe(regs: &mut MmioRegs, verb: u32) {
     let corbwp = regs.r16(0x48);
     let corbrp = regs.r16(0x4A);
     let corbctl = regs.r16(0x4C);
-    let rirbwp = regs.r16(0x78);
-    let rintcnt = regs.r16(0x7A);
-    let rirbctl = regs.r16(0x7C);
+    let rirbwp = regs.r16(0x58);
+    let rintcnt = regs.r16(0x5A);
+    let rirbctl = regs.r16(0x5C);
     let rirbsts = regs.r16(0x7D);
     serial::puts("[HDA] cmdpath corbwp=");
     serial::put_hexn(corbwp as u64, 4);
