@@ -15,15 +15,21 @@ usable *as* a workstation: `git clone` over HTTPS, and `meow`/`nca` in both
 one-shot and full-screen modes, against z.ai as well as the LAN
 (`AMD64_TRASHCAN_ISSUES.md` §§1-5). **Later the same day the whole loop ran
 inside the machine** — clone, branch, `kbuild`, `kinstall`, `reboot -f`, back
-up on its own SHA (`AKUMA_FROM_SCRATCH.md` §9.1). What has not happened yet is
-the loop driven by an **agent** rather than a person.
+up on its own SHA (`AKUMA_FROM_SCRATCH.md` §9.1). **On 09-25 an agent drove
+that loop**: `meow`, GLM-5.3 running under `kot` on the box, ran `kbuild`,
+`kinstall` and `reboot -f`, came back on the new kernel and promoted it to
+`.good`. The kernel was unmodified, though. No agent has yet *written* the
+change it builds.
 **2026-09-20 → 09-24** the workstation also became a **seat**: `meow`'s litter and then akuma-miot's `kot` chain ran on it, found a
 run of kernel bugs no probe had (RTL8169 receive, BKL-held parks, `EPOLLET`
 re-arm, a trap entry that never cleared `DF`, unreapable orphans), and on 09-24
 it holds one of seven seats in **the teahouse** — a mesh across two kernels,
 two architectures, home and AWS (`../akuma-miot/docs/TEAHOUSE.md`). What is
 left is that setup on this kernel **collectively, partly autonomously and on
-a variety of platforms**; that is the walk's "YOU ARE HERE".
+a variety of platforms**. After 09-25 the next rung is concrete: cats that
+**submit patches**, and several of them working **one task together**
+instead of one cat working while the others watch. That is the walk's
+"YOU ARE HERE".
 `cargo build --release` for the amd64 kernel ran to completion
 inside Akuma/amd64 under Firecracker on 09-13: 94 crates, 7 m 53 s, `rc=0`, and
 a 2 895 920-byte `ET_EXEC` x86-64 image with a PVH note at the end of it.
@@ -2300,38 +2306,150 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
                           docs: ../akuma-miot/docs/TEAHOUSE.md,
                                 AMD64_TRASHCAN_ISSUES.md §9
    ▼
- [NOW] ═══ YOU ARE HERE ═══ THE TEAHOUSE ON AKUMA: COLLECTIVE, PARTLY AUTONOMOUS, PORTABLE
+ [09-25] ═══ THE CAT BUILDS ITS OWN KERNEL ═══ AND BOOTS INTO IT
    │
-   │   The last step is not another feature. It is this setup running on
-   │   **this kernel**, together, for days — carried in part by the cats
-   │   themselves — and deployable to more machines than it happens to
-   │   run on today.
+   │   All times UTC, from meow's own transcript
+   │   (`/root/.akuma/kot/dumpster-akuma-amd64.transcript.jsonl` on the
+   │   box, 360 records) and task list (`….tasks.json`, L1-L9).
    │
-   ├──► **Collectively: every Akuma seat holds its seat.** Today the three
-   │   Akuma members are the three that fall over. The bar is the Linux
-   │   seats' bar: days, not minutes, with no power cycle. The known
-   │   blockers are all written down — the `clone`d thread that dies at
-   │   its first `write(2)` (`AMD64_SPAWNED_THREAD_NEVER_RUNS.md`), the
-   │   `writev` spin (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md` §6.1), herd
-   │   restarting and duplicating services (`AMD64_TRASHCAN_ISSUES.md` §9,
-   │   `HERD_DUPLICATE_SERVICE_PROCESSES.md`), and whatever stops the
-   │   trashcan spawning processes. Behind them is the gate that has not
-   │   moved since 09-19 (`AKUMA_FROM_SCRATCH.md` §5): **networking** and
-   │   **processes/threads** must be *severely* stabilized, because both
-   │   fail probabilistically, hours in, and destroy their own evidence —
-   │   which is exactly what an always-on fleet multiplies.
+   ├──► **First try: the wrong runbook, then the SIGSEGV.** Asked at 01:38
+   │   to build the kernel in `/src/github.com/netoneko/akuma` "after
+   │   checking the runbooks", meow found `selfhost-kernel-build-amd64.md`.
+   │   That is the laptop-driven Firecracker procedure, so it planned
+   │   `hpbox.deploy()` from inside the box `hpbox` deploys *to*. Root
+   │   corrected it at 07:21 and it ran `kbuild -c -j 1`. At 699 s it hit
+   │   `Segmentation fault` right after `Compiling ab_glyph v0.2.32`:
+   │   exit 139 and no ELF. This is the rc=139 that kills about half of
+   │   long builds here (`AKUMA_FROM_SCRATCH.md` §5), met by an agent
+   │   for the first time. It reported with an artifact and a message, and
+   │   stopped as told: no retry, no install. That report is on-chain
+   │   artifact **#2**, and it is accurate. It even calls the crash
+   │   "environment flakiness … rather than a code defect" instead of
+   │   blaming the build.
    │
-   ├──► **To some degree autonomously: the cats carry part of the loop.**
-   │   The step this box was headed for on 09-19 is still the first
-   │   milestone: GLM on the metal writing a kernel patch — edit,
-   │   `kbuild`, `kinstall`, `reboot -f`, continue on the new kernel —
-   │   with **Intel HDA audio** (`runbooks/add-intel-hda-audio.md`) as the
-   │   chosen first patch: a new subsystem, on hardware only this machine
-   │   has, whose success a human can judge from across the room. Beyond
-   │   one patch: the teahouse's task ledger handing work to whichever
-   │   seat can do it, and recovery without a person — `builtin-paws`'s
-   │   `reboot` is the first piece, and a supervisor that actually
-   │   restarts what it supervises is the next.
+   ├──► **A runbook written for the cat.** `runbooks/build-kernel-on-box.md`
+   │   landed in `3504e9ab` (12:13). It gives the on-box agent five
+   │   commands and the rules around them:
+   │   - run bare `kbuild` and never pass `-j`
+   │   - give it at least 20 minutes
+   │   - check that the ELF exists
+   │   - install only when asked
+   │   - promote `.good` only after the reboot
+   │   It was written because on 09-24 meow spent five turns on recon and
+   │   never called `Bash`. meow picked it up by `ls -lat`-ing
+   │   `docs/runbooks/` for whatever was new, and listed the differences
+   │   from the old flow in task L5 before running anything.
+   │
+   ├──► **Second try, by the runbook: built, installed, booted, promoted.**
+   │   `kbuild` at 12:25 exited 0: `Finished … in 3m 00s`, a
+   │   3 460 232-byte ELF, md5 `3d39f6ac…`. That was **incremental**, not
+   │   clean: 9 crates, over the cache a human `kbuild` had left at 11:33.
+   │   meow then waited for an explicit go ("let's kinstall/reboot",
+   │   12:54) and re-read step 3 of the runbook. `kinstall` checked the
+   │   md5 and kept `.prev`, and `busybox reboot -f` ran at 12:55:30. The
+   │   kernel was up at 12:56:02 and meow's `kot` was back on the chain at
+   │   12:56:53. Before rebooting, meow had written its own post-reboot
+   │   checklist into task L9 ("if conversation lost"), and it resumed from
+   │   that. `uname` moved from `c9586004` to `3504e9ab`, and
+   │   `/boot/akuma-amd64.good` was promoted at 12:59. GLM-5.3 on the box
+   │   issued every command from build to promotion. The human's part was
+   │   two sentences of approval. The kernel it booted carries both fixes
+   │   from `AMD64_THREE_CRASHES_2026-09-25.md`, so this was also the
+   │   first time those fixes ran on the metal.
+   │
+   ├──► **Weaker than it looked, in two places.**
+   │   - **The boot-suite check passed by absence.**
+   │     `dmesg | grep -E 'passed|failed'` printed *nothing*, and meow
+   │     read "nothing" as "no failures" and promoted. The box's `dmesg`
+   │     ring holds about 640 lines, and `[probe]`/`[bkls>]` refill it
+   │     within minutes. Ten minutes after this boot the ring had no
+   │     boot-time line left in it at all, so the suite summary most
+   │     likely rotated out before the check ran. The kernel is probably
+   │     fine, since it has been serving ssh and `kot` since. But the
+   │     `.good` promotion rested on a check that cannot fail, and the
+   │     runbook needs one that can.
+   │   - **Nothing was edited.** Root summed the day up as "now we know
+   │     that kernel can be compiled and edited by the tea house staff".
+   │     "Compiled", yes: compiled, installed and booted. "Edited", no:
+   │     the build is `3504e9ab` exactly as a human committed it.
+   │
+   ├──► **The success reports are less accurate than the failure report.**
+   │   On-chain artifacts **#3** (build) and **#4** (post-reboot) are what
+   │   the litter and the operator actually read. The transcript
+   │   contradicts each of them:
+   │   - **#3 blames itself for the first crash**, wrongly. It says
+   │     attempt 1 "broke rules 1, 2 and 3" by passing `-j 1`, using `-c`
+   │     and budgeting too little time, and calls the runbook's `-j4`
+   │     linker SIGSEGV "exactly my attempt-1 failure mode". But `-c -j 1`
+   │     was root's exact instruction, with an 1800 s timeout the build
+   │     never came near. A duplicate `-j` fails in the first second, not
+   │     at 699 s. And the crash was rustc, mid-graph, at `-j1`, not the
+   │     linker at `-j4`. This is the rc=139 corruption, and #3 buries it
+   │     under a lesson about reading runbooks.
+   │   - **#3 says "fresh cache, same commit"** for the 3m 00s build. The
+   │     cache came from a human's 11:33 build, and 9 crates recompiled,
+   │     so the sources had changed.
+   │   - **#4 is headed "all green"** and gives the reboot as "~12:31"
+   │     and the box as "up ~25 minutes post-reboot". The reboot was at
+   │     12:55:30. The checks ran at 12:58:57, about three minutes into
+   │     the boot. And its "zero failure lines" is the empty `grep`
+   │     described above.
+   │   The pattern: when the run failed, meow reported what the tools
+   │   printed; when it succeeded, it wrote a story. That is one
+   │   more reason reviewers should read the commits and the tool output
+   │   (exit codes, md5s, timestamps, the suite's own count) rather than
+   │   a cat's retelling of them. And `.good` should be promoted only on
+   │   a check that can fail.
+   │
+   └──► **One cat worked; the litter watched.** kuro, tama and sora
+        replied to each update, and kuro twice described the reboot in
+        the first person ("Rebooting now as planned") while meow was the
+        one rebooting. No other seat read the build log, checked the md5
+        or reviewed the install. The ledger carried messages about the
+        work and never the work itself.
+                          docs: runbooks/build-kernel-on-box.md,
+                                AMD64_THREE_CRASHES_2026-09-25.md,
+                                on-chain artifacts #2-#4 (`kot artifact N`),
+                                ../akuma-miot/HANDOFF.md § "Watching the
+                                litter (2026-09-25)"
+   ▼
+ [NOW] ═══ YOU ARE HERE ═══ FROM ONE CAT BUILDING TO THE LITTER PATCHING
+   │
+   │   An agent can now take a kernel from source to its own boot loader
+   │   and come back up on it. Two things are still missing: the change
+   │   being the agent's own, and the work being the teahouse's rather
+   │   than one seat's.
+   │
+   ├──► **Next: cats submit patches.** The 09-25 loop built a commit a
+   │   human wrote. The next rung is the metal cat writing the change
+   │   itself and committing it. The box gets git access for that later.
+   │   The first patch is still **Intel HDA audio**
+   │   (`runbooks/add-intel-hda-audio.md`): a new subsystem, on hardware
+   │   only this box has, whose success a human can judge from across
+   │   the room.
+   │
+   ├──► **Next: the litter works one task together.** Today one cat does
+   │   the work and the other six narrate it. Once the metal cat's
+   │   commits are in git, the other seats **pull them and review them**.
+   │   The review is the collective part, done on the code rather than
+   │   on anyone's description of it.
+   │
+   ├──► **Still the gate: every Akuma seat holds its seat.** A litter
+   │   working together multiplies the cost of a seat that drops, and the
+   │   three Akuma seats are still the three that drop. The known
+   │   blockers:
+   │   - the `clone`d thread that dies at its first `write(2)`
+   │     (`AMD64_SPAWNED_THREAD_NEVER_RUNS.md`)
+   │   - the `writev` spin (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md` §6.1)
+   │   - herd restarting and duplicating services
+   │     (`AMD64_TRASHCAN_ISSUES.md` §9, `HERD_DUPLICATE_SERVICE_PROCESSES.md`)
+   │   - a trashcan that stops spawning processes
+   │   - the rc=139 that killed the first build
+   │   Behind all of them is the gate from 09-19 (`AKUMA_FROM_SCRATCH.md`
+   │   §5): networking and processes/threads fail probabilistically, hours
+   │   in, and destroy their own evidence. Recovery without a person
+   │   started with `builtin-paws`'s `reboot`. A supervisor that restarts
+   │   what it supervises is the next piece.
    │
    ├──► **Portably: deploy to a variety of platforms.** Akuma already
    │   holds three seat shapes — bare-metal amd64, Firecracker on KVM
