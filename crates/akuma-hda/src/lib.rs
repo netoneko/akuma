@@ -107,8 +107,13 @@ pub fn version_is_noise(vmaj: u8, vmin: u8) -> bool {
 #[must_use]
 pub fn discover<R: Regs16 + ?Sized>(regs: &R) -> Option<Info> {
     let gcap = GCap { raw: regs.r16(reg::GCAP) };
-    let vmin = (regs.r16(reg::VMIN) & 0xff) as u8;
-    let vmaj = (regs.r16(reg::VMAJ) & 0xff) as u8;
+    // One aligned halfword at 0x02: VMIN (byte 2) | VMAJ<<8 (byte 3).
+    // Reading r16(0x03) instead is unaligned - it crosses the dword
+    // boundary and real MMIO decoders answer 0xff, which is where
+    // three boots of version=255.0 came from.
+    let vv = regs.r16(reg::VMIN);
+    let vmin = (vv & 0xff) as u8;
+    let vmaj = (vv >> 8) as u8;
     if version_is_noise(vmaj, vmin) {
         return None;
     }

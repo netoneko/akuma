@@ -86,23 +86,17 @@ pub fn init() {
     for cap in akuma_pci::capabilities(&cfg, dev.header.capabilities_pointer) {
         if cap.id == akuma_pci::capability_id::POWER_MANAGEMENT {
             let pmcsr = crate::pci::read_u16_config(addr, cap.offset + 4);
-            let state = akuma_pci::pm::power_state(pmcsr);
             serial::puts("[HDA] PMCSR=");
-            serial::put_dec(u64::from(state));
-            // M4: unconditional power cycle. PMCSR said D0 yet VMAJ
-            // reads 0xff and CRST stays set — a warm reboot can wedge
-            // the controller in a state the PMCSR bits do not describe.
-            // A D3hot round-trip is the spec's full logic reset.
-            crate::pci::write_u16_config(addr, cap.offset + 4,
-                pmcsr | akuma_pci::pm::POWER_STATE_MASK);
-            for _ in 0..4_000_000 { core::hint::spin_loop(); }
-            crate::pci::write_u16_config(addr, cap.offset + 4,
-                pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
-            for _ in 0..40_000_000 { core::hint::spin_loop(); }
-            serial::puts("[HDA] PMCSR=");
-            serial::put_dec(u64::from(akuma_pci::pm::power_state(
-                crate::pci::read_u16_config(addr, cap.offset + 4))));
-            serial::puts("\n");
+            serial::put_dec(u64::from(akuma_pci::pm::power_state(pmcsr)));
+            // M4 taught: a forced D3hot round-trip on a D0 device wedges
+            // it fully (every BAR0 byte then answers 0xff). Cycle only
+            // when PMCSR actually says otherwise.
+            if akuma_pci::pm::power_state(pmcsr) != akuma_pci::pm::D0 {
+                crate::pci::write_u16_config(addr, cap.offset + 4,
+                    pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
+                for _ in 0..20_000_000 { core::hint::spin_loop(); }
+                serial::puts(" -> D0 written");
+            }
             serial::puts("\n");
             break;
         }

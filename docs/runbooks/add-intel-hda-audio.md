@@ -284,3 +284,24 @@ a VMM boot has a flag to set, a firmware boot does not.
   is a proof of.
 - `crates/akuma-virtio/src/audio.rs`, `userspace/wavplay/src/main.rs` — the
   existing device and the existing client.
+
+## Challenges (2026-09-25, M2-M5)
+
+- **Unaligned MMIO reads lie.** `r16(0x03)` for VMAJ crosses the dword
+  boundary; real decoders answer 0xff while aligned neighbours (GCAP at 0x00)
+  decode honestly. Three boots printed version=255.0 from this. The fix is one
+  aligned halfword at 0x02: VMIN low byte, VMAJ high.
+- **A forced D3hot round-trip on a healthy D0 controller wedges it** — every
+  BAR0 byte then reads 0xff, and CRST can never self-clear. PMCSR said D0 all
+  along; the cycle was fixing a state the device was not in. Power-cycle only
+  when PMCSR actually reports otherwise.
+- **The console ring washes in ~3.5 minutes** under PSTATS/[probe]/[bkls>]
+  spam, far faster than an agent wakes after a reboot. A herd one-shot
+  (`hda-capture.conf` -> `/root/hda-capture.sh`) dumps the ring to
+  `/root/dmesg-boot-*.txt` seconds after boot — every finding above is read
+  from those files, not from a live ring.
+- **The box's pipes corrupt tooling**: greps match and print nothing, results
+  interleave, `git push`/`pack-objects` die on EBADF after ~26MB pipe writes,
+  agent processes restart mid-session, and tool calls occasionally duplicate
+  themselves (two kbuilds then race in /root/ktarget and the link dies on a
+  missing .rcgu.o). Backups on disk before every edit; one build at a time.
