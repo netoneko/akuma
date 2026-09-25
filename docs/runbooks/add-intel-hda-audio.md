@@ -305,3 +305,5 @@ a VMM boot has a flag to set, a firmware boot does not.
   agent processes restart mid-session, and tool calls occasionally duplicate
   themselves (two kbuilds then race in /root/ktarget and the link dies on a
   missing .rcgu.o). Backups on disk before every edit; one build at a time.
+
+- M6: CRST is software-driven (HDA 1.0a §4.3) — write 0, poll reads 0, write 1, poll reads 1. M2 polled for a self-clear the spec never promises; the controller sat in reset forever while STATESTS already answered (0x0001). Lesson: quote the spec section, then write the poll.

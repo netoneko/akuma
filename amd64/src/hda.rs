@@ -159,11 +159,11 @@ pub fn init() {
         serial::puts(" version=0xffff — BAR0 not decoded; everything after is noise\n");
     }
 
-    // Bring-up step 2 (runbook): controller reset. CRST self-clears; the
-    // wait is a bounded spin, because the boot suite runs before the tick
-    // and a hung poll must not hang the boot. The post-reset re-read of the
-    // version is the M2 deliverable — it separates a decode artifact from a
-    // controller answer.
+// Bring-up step 2 (runbook): controller reset per HDA 1.0a §4.3 — CRST is
+// software-driven: write 0, poll for 0, write 1, poll for 1. Both polls
+// are bounded so a hung controller cannot hang the boot; the post-reset
+// version re-read separates a decode artifact from a controller answer.
+// (M2 assumed CRST self-clears — wrong; see runbook Challenges.)
     let spin = || {
         for _ in 0..2000 {
             core::hint::spin_loop();
@@ -178,7 +178,7 @@ pub fn init() {
             serial::puts("\n");
         }
     } else {
-        serial::puts("[HDA] CRST did not self-clear - controller not reset\n");
+        serial::puts("[HDA] CRST handshake failed - controller not reset\n");
     }
     serial::puts("[HDA] dump-post00:");
     for i in 0..8 {

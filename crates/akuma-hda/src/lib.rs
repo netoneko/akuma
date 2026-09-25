@@ -22,7 +22,7 @@ pub mod reg {
     /// Major version (8-bit).
     pub const VMAJ: usize = 0x03;
     /// GCTL - the reset-and-status word; CRST (bit 0) is the
-    /// controller reset; it self-clears when the reset completes.
+    /// controller reset; software clears it to enter reset and sets it to exit (§4.3).
     pub const GCTL: usize = 0x08;
 }
 
@@ -92,8 +92,8 @@ pub struct Info {
 /// The runbook's discovery gate: a version of `0xffff` means the BAR is not
 /// mapped, and "everything after this is noise".
 #[must_use]
-/// `GCTL.CRST` — set to begin a controller reset; self-clears when
-/// the controller and its codecs are ready again.
+/// `GCTL.CRST` — software-driven controller reset bit: clear to enter,
+/// set to exit (HDA 1.0a §4.3).
 pub const CRST: u16 = 1;
 
 pub fn version_is_noise(vmaj: u8, vmin: u8) -> bool {
@@ -120,15 +120,30 @@ pub fn discover<R: Regs16 + ?Sized>(regs: &R) -> Option<Info> {
     Some(Info { gcap, vmaj, vmin })
 }
 
-/// Reset the controller: set `CRST`, poll until it self-clears.
-/// `wait` is one delay unit — the caller decides what a unit is, so
-/// the crate stays free of timing. Returns `false` on timeout.
+/// Reset the controller per HDA 1.0a §4.3: CRST is software-driven,
+/// not self-clearing. Phase 1 — clear CRST (enter reset), poll until
+/// it reads 0. Phase 2 — set CRST (exit reset), poll until it reads 1.
+/// `wait` is one delay unit (the crate stays timing-free); the caller
+/// should budget units for the ~25 µs controller recovery. Returns
+/// `false` when either phase times out.
 pub fn reset<R: RegsW16 + ?Sized>(regs: &R, polls: usize, wait: impl Fn()) -> bool {
     let st = regs.r16(reg::GCTL);
+    regs.w16(reg::GCTL, st & !CRST);
+    let mut entered = false;
+    for _ in 0..polls {
+        if regs.r16(reg::GCTL) & CRST == 0 {
+            entered = true;
+            break;
+        }
+        wait();
+    }
+    if !entered {
+        return false;
+    }
     regs.w16(reg::GCTL, st | CRST);
     for _ in 0..polls {
         wait();
-        if regs.r16(reg::GCTL) & CRST == 0 {
+        if regs.r16(reg::GCTL) & CRST != 0 {
             return true;
         }
     }
@@ -216,26 +231,34 @@ mod tests {
     }
 
     #[test]
-    fn reset_sets_crst_and_waits_for_self_clear() {
-        // GCTL starts with unrelated bits set; reset must OR CRST in,
-        // preserve them, and return true once CRST self-clears.
+    fn reset_full_software_cycle() {
+        // CRST is software-driven (HDA 1.0a §4.3): phase 1 clears it
+        // (enter reset), phase 2 sets it (exit reset). The fake starts
+        // out of reset with unrelated bits set; reset must preserve them.
         let f = FakeReset { state: Cell::new(0x42) };
         let mut waits = 0;
         assert!(reset(&f, 100, || {
             waits += 1;
-            if waits == 3 {
-                f.state.set(0x42); // the controller finishes on the third wait
-            }
         }));
-        assert_eq!(waits, 3);
-        assert_eq!(f.state.get(), 0x42);
+        assert_eq!(f.state.get(), 0x43); // 0x42 kept, CRST now set
+        assert!(waits <= 200);
+    }
+
+    struct Stuck<F>(F);
+    impl<F: Regs16> Regs16 for Stuck<F> {
+        fn r16(&self, o: usize) -> u16 {
+            self.0.r16(o)
+        }
+    }
+    impl<F: RegsW16> RegsW16 for Stuck<F> {
+        fn w16(&self, _o: usize, _v: u16) {}
     }
 
     #[test]
-    fn reset_times_out_when_crst_never_clears() {
-        let f = FakeReset { state: Cell::new(0x00) };
-        assert!(!reset(&f, 5, || { f.state.set(f.state.get() | CRST); }));
-        // CRST stuck: the timeout leaves it set — the caller reports and
-        // leaves the controller alone rather than hanging the boot.
+    fn reset_times_out_when_hw_refuses_to_enter() {
+        // A wedged controller that never reads CRST low must surface as
+        // a false return, not a boot hang — phase 1 timeout path.
+        let f = Stuck(FakeReset { state: Cell::new(CRST | 0x40) });
+        assert!(!reset(&f, 5, || {}));
     }
 }
