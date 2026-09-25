@@ -98,11 +98,11 @@ pub fn init() {
         serial::puts(".");
         serial::put_dec(u64::from(info.vmin));
         serial::puts(" oss=");
-        serial::put_dec(u64::from(info.gcap.output_streams));
+        serial::put_dec(u64::from(info.gcap.output_streams()));
         serial::puts(" iss=");
-        serial::put_dec(u64::from(info.gcap.input_streams));
+        serial::put_dec(u64::from(info.gcap.input_streams()));
         serial::puts(" bss=");
-        serial::put_dec(u64::from(info.gcap.bidirectional_streams));
+        serial::put_dec(u64::from(info.gcap.bidirectional_streams()));
         serial::puts("\n");
         DISCOVERED.store(true, Ordering::Relaxed);
     } else {
