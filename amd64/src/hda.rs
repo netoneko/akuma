@@ -288,7 +288,7 @@ fn codec_probe(regs: &mut MmioRegs) {
         }
         None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
     }
-        codec_ici_probe(regs, 0xF00000);
+        codec_ici_probe(regs, 0x000F0000);
     serial::puts("\n");
 }
 
