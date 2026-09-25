@@ -1,0 +1,10 @@
+[package]
+name = "akuma-hda"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Intel HD Audio register decode: GCAP bitfields and the VMAJ/VMIN version gate — host-tested, no MMIO. The metal half (PCI walk, BAR0 map, the console line) lives in the amd64 target's hda.rs."
+
+[lints]
+workspace = true
+
+[dependencies]

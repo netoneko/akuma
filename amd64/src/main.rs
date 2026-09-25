@@ -79,6 +79,7 @@ mod fs;
 mod futex;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
+mod hda;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]
@@ -262,6 +263,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         pci::scan();
         pci::report();
         xhci::quiesce_all();
+        hda::init();
     }
 
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
