@@ -124,7 +124,7 @@ pub fn init() {
     serial::put_hexn(u64::from(did), 4);
     serial::puts(" bar0=0x");
     serial::put_hex(bar_addr);
-    let regs = MmioRegs { base };
+    let mut regs = MmioRegs { base };
 
     // M4 diagnostic: the raw first 32 bytes of BAR0, before anything
     // else interprets them — which bytes answer 0xff is the whole
@@ -187,6 +187,92 @@ pub fn init() {
         serial::put_hexn(u64::from(w & 0xff), 2);
         serial::puts(" ");
         serial::put_hexn(u64::from(w >> 8), 2);
+    }
+    serial::puts("\n");
+    codec_probe(&mut regs);
+}
+
+// ===================================================================
+// M7: codec command engine — CORB/RIRB (HDA 1.0a §4.4/§4.5).
+// Rings are static .bss DMA buffers, xhci dma_buf style; bus address
+// via virt_to_phys (no IOMMU on this target). Offsets per Linux ICH6
+// map: CORBWP 0x48, CORBRP 0x4A, CORBCTL 0x4C, CORBSIZE 0x4E;
+// RIRB 0x70/0x74, RIRBWP 0x78, RINTCNT 0x7A, RIRBCTL 0x7C, SIZE 0x7E.
+// ===================================================================
+static mut CORB_RING: [u32; 256] = [0; 256];
+static mut RIRB_RING: [u64; 256] = [0; 256];
+
+fn codec_link_init(regs: &mut MmioRegs) {
+    unsafe {
+        let cb = akuma_primitives::addr::virt_to_phys(
+            (&raw mut CORB_RING) as *mut [u32; 256] as usize,
+        ) as u32;
+        let rb = akuma_primitives::addr::virt_to_phys(
+            (&raw mut RIRB_RING) as *mut [u64; 256] as usize,
+        ) as u32;
+        regs.w16(0x4C, 0x0000); // CORBCTL: stop while reprogramming
+        regs.w16(0x4A, 0x8000); // CORBRP: read-pointer reset
+        regs.w16(0x4A, 0x0000); // CORBRP: clear
+        regs.w16(0x48, 0x0000); // CORBWP = 0
+        regs.w16(0x40, (cb & 0xffff) as u16);
+        regs.w16(0x42, (cb >> 16) as u16);
+        regs.w16(0x44, 0x0000); // upper base = 0 (<4GB)
+        regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries
+        regs.w16(0x78, 0x8000); // RIRBWP: reset
+        regs.w16(0x78, 0x0000);
+        regs.w16(0x70, (rb & 0xffff) as u16);
+        regs.w16(0x72, (rb >> 16) as u16);
+        regs.w16(0x74, 0x0000);
+        regs.w16(0x7A, 0x0001); // RINTCNT = 1
+        regs.w16(0x7E, 0x0002); // RIRBSIZE: 256 entries
+        regs.w16(0x7C, 0x0001); // RIRBCTL: DMA enable
+        regs.w16(0x4C, 0x0001); // CORBCTL: run
+    }
+    serial::puts("[HDA] CORB/RIRB enabled\n");
+}
+
+/// Send one verb (CAd<<28 | NID<<20 | verb<<8 | payload), poll RIRB.
+fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
+    unsafe {
+        let corb = (&raw mut CORB_RING).cast::<u32>();
+        let rirb = (&raw mut RIRB_RING).cast::<u64>();
+        let wp = (regs.r16(0x48) & 0x00ff) as usize;
+        let np = (wp % 255) + 1;
+        corb.add(np).write_volatile(verb);
+        regs.w16(0x48, np as u16);
+        let start = regs.r16(0x78) & 0x00ff;
+        let mut n = 0;
+        loop {
+            let rwp = regs.r16(0x78) & 0x00ff;
+            if rwp != start {
+                let rp = (start as usize % 255) + 1;
+                let resp = rirb.add(rp).read_volatile();
+                return Some(resp as u32);
+            }
+            n += 1;
+            if n > 2_000_000 {
+                return None;
+            }
+        }
+    }
+}
+
+/// First conversation with codec 0: vendor ID (0xF00) + root node count (0xF04).
+fn codec_probe(regs: &mut MmioRegs) {
+    codec_link_init(regs);
+    match codec_send(regs, 0xF000_0000) {
+        Some(v) => {
+            serial::puts("[HDA] codec0 vendor=0x");
+            serial::put_hexn(u64::from(v), 8);
+        }
+        None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
+    }
+    match codec_send(regs, 0xF040_0000) {
+        Some(v) => {
+            serial::puts(" nodes=0x");
+            serial::put_hexn(u64::from(v), 8);
+        }
+        None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
     }
     serial::puts("\n");
 }

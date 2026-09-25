@@ -24,6 +24,17 @@ pub mod reg {
     /// GCTL - the reset-and-status word; CRST (bit 0) is the
     /// controller reset; software clears it to enter reset and sets it to exit (§4.3).
     pub const GCTL: usize = 0x08;
+// --- CORB/RIRB ring registers (Intel HDA 1.0a ICH6 map) ---
+pub const CORB_BASE: u16 = 0x40;
+pub const CORB_WP: u16 = 0x48;
+pub const CORB_RP: u16 = 0x4A;
+pub const CORB_CTL: u16 = 0x4C;
+pub const CORB_STS: u16 = 0x4D;
+pub const RIRB_BASE: u16 = 0x70;
+pub const RIRB_WP: u16 = 0x74;
+pub const RIRB_INT_CNT: u16 = 0x76;
+pub const RIRB_CTL: u16 = 0x7C;
+pub const RIRB_STS: u16 = 0x7E;
 }
 
 /// How the pure half reads a 16-bit register. Implemented over mapped MMIO by

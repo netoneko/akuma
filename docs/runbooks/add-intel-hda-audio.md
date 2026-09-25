@@ -313,3 +313,8 @@ a VMM boot has a flag to set, a firmware boot does not.
 - Evidence against: M5 boot showed GCTL stuck at 0x0001 after write+poll-for-clear, with GCAP/STATESTS perfectly healthy — hardware was fine, the *sequence* was wrong.
 - HDA 1.0a §4.3 reality: write GCTL.CRST=0 → poll reads 0 (controller in reset) → write CRST=1 → poll reads 1 (out of reset) → wait 25us (codec link ramp). STATESTS is only valid after exit.
 - Result: 9d1bcfee boots print `post-reset version=1.0` and STATESTS=0x0001 (codec #0 alive).
+
+### 21:50 — the async-edit race, and what it taught
+- **Assumption:** tool calls execute in issue-order and complete before the next begins.
+- **Evidence:** lib.rs clobbered to `}` mid-edit while two duplicate-spawned kbuilds raced one /root/ktarget; r59 re-applied the same E0596 fix I had just applied. Root confirmed: "the tools are async... I'll make the edits linear".
+- **Consequence:** one self-contained command per turn; `git checkout` before every edit chain; no shared temp files; cancel strays before writes; verify balance + commit + build only after a quiet `Running` list.
