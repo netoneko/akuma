@@ -199,7 +199,9 @@ pub fn init() {
 // map: CORBWP 0x48, CORBRP 0x4A, CORBCTL 0x4C, CORBSIZE 0x4E;
 // RIRB 0x70/0x74, RIRBWP 0x78, RINTCNT 0x7A, RIRBCTL 0x7C, SIZE 0x7E.
 // ===================================================================
+#[repr(align(128))]
 static mut CORB_RING: [u32; 256] = [0; 256];
+#[repr(align(128))]
 static mut RIRB_RING: [u64; 256] = [0; 256];
 
 fn codec_link_init(regs: &mut MmioRegs) {
