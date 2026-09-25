@@ -1351,6 +1351,24 @@ fn cow_write_fault(addr: u64) -> bool {
                 akuma_pmm::free_page(fresh, 0);
                 return false;
             }
+            // **Every core, before the old frame can go.** `map_page_pte`'s
+            // `invlpg` is this core's only. A sibling thread on another core
+            // still holds the read-only translation to `pa` from before the
+            // break, and a read through it faults on nothing: it keeps reading
+            // the old frame while this thread's writes land in `fresh`, and
+            // once the `cow_ref_dec` below frees `pa`, it reads whatever the
+            // PMM put there next. That was kot on the trashcan (2026-09-25):
+            // every `Bash` tool call is a `posix_spawn`, served here as a CoW
+            // fork of a four-core tokio process, and within minutes a worker
+            // read a task-state word from before its `NOTIFIED` bit was set
+            // (`assertion failed: next.is_notified()`, SIGABRT) or a pointer
+            // from a recycled frame (`#PF` write to `cr2=0x8`, SIGSEGV).
+            // AArch64's break has always flushed `AllCores` here
+            // (`akuma-exceptions`), and `flush_tlb_page`'s x86 arm names this
+            // path as its caller; this is the call that was never made. The
+            // guard waits for every peer's acknowledgement as it drops, so the
+            // free below cannot overtake a peer that has not flushed.
+            let _ = akuma_mmu::flush_tlb_page(page, akuma_mmu::TlbTarget::AllCores);
             // The old frame loses this address space. Only the last holder
             // frees it — the whole point of the count.
             if akuma_pmm::cow_ref_dec(pa) {
