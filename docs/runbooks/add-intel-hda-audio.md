@@ -242,6 +242,39 @@ wavplay /tmp/test.wav                 # audible sound, and `echo $?` = 0
 A run that prints `[HDA] ready` and plays silence is **not** a pass — say so and
 keep the step open.
 
+## Postmortem (2026-09-25): the step-1 print that never ran
+
+M1 wired `hda::init()` into the PVH entry point only, inside the block
+gated on the `pci` command-line flag. The dev box boots through GRUB —
+the multiboot2 entry point — whose command line is `init=/bin/herd
+root=/dev/sda1 netprobe`: no `pci` token, so that block (scan, report,
+xHCI quiesce, HDA) never executed on this machine. Nothing was wrong
+with the driver; its call site was on the wrong path.
+
+Each assumption, next to the evidence that tested it, in arrival order:
+
+- *Assumption: the kernel that booted is not the kernel we built.*
+  Held — `uname` carried the merge commit and `/boot` md5 matched
+  `ktarget`. Not the cause.
+- *Assumption: the print ran but the log was lost.* Broken — a `herd`
+  one-shot (`hda-capture`, `/etc/herd/enabled/`) now dumps the full
+  ring to `/root/dmesg-boot-*.txt` within seconds of boot, and that
+  dump carries the PCI census with no `[HDA]` line anywhere.
+- *Assumption: the box has no PCI, so a missing print is a missing
+  device.* Broken — the census lists 15 functions including
+  `00:1b.0 8086:8c20 class 04/03/00` and the NVIDIA HDMI audio at
+  `01:00.1 10de:0fbc`. Same scan is why the Realtek NIC at `03:00.0`
+  works with no flag: firmware boots always have PCI.
+- *Assumption: the census proves `hda::init()` ran.* Broken — on this
+  path the census comes from `multiboot2.rs` scanning unconditionally
+  at boot; `hda::init()` simply had no call site there.
+
+Fix: `multiboot2.rs` calls `crate::hda::init()` after
+`mem::init_reserving` and `boot::install_shared_sinks` — BAR mapping
+allocates frames — unconditionally and best-effort, like its
+neighbours. The PVH path keeps its `pci`-flagged call site unchanged:
+a VMM boot has a flag to set, a firmware boot does not.
+
 ## Background
 
 - [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the box, the loop,
