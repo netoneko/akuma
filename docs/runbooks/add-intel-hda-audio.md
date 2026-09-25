@@ -307,3 +307,9 @@ a VMM boot has a flag to set, a firmware boot does not.
   missing .rcgu.o). Backups on disk before every edit; one build at a time.
 
 - M6: CRST is software-driven (HDA 1.0a §4.3) — write 0, poll reads 0, write 1, poll reads 1. M2 polled for a self-clear the spec never promises; the controller sat in reset forever while STATESTS already answered (0x0001). Lesson: quote the spec section, then write the poll.
+
+### CRST is software-driven, not a strobe (M6)
+- Assumption (M2): "CRST self-clears" (copied mental model from self-clearing status bits).
+- Evidence against: M5 boot showed GCTL stuck at 0x0001 after write+poll-for-clear, with GCAP/STATESTS perfectly healthy — hardware was fine, the *sequence* was wrong.
+- HDA 1.0a §4.3 reality: write GCTL.CRST=0 → poll reads 0 (controller in reset) → write CRST=1 → poll reads 1 (out of reset) → wait 25us (codec link ramp). STATESTS is only valid after exit.
+- Result: 9d1bcfee boots print `post-reset version=1.0` and STATESTS=0x0001 (codec #0 alive).
