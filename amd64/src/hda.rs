@@ -34,7 +34,7 @@ impl Regs16 for MmioRegs {
 
 impl RegsW16 for MmioRegs {
     fn w16(&self, offset: usize, value: u16) {
-        // SAFETY: BAR0 mapping as above; the reset path writes STATE0 only.
+        // SAFETY: BAR0 mapping as above; the reset path writes GCTL only.
         unsafe { (self.base.add(offset) as *mut u16).write_volatile(value) }
     }
 }
@@ -89,12 +89,20 @@ pub fn init() {
             let state = akuma_pci::pm::power_state(pmcsr);
             serial::puts("[HDA] PMCSR=");
             serial::put_dec(u64::from(state));
-            if state != akuma_pci::pm::D0 {
-                crate::pci::write_u16_config(addr, cap.offset + 4,
-                    pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
-                for _ in 0..20_000 { core::hint::spin_loop(); }
-                serial::puts(" -> 0 (D0 written)");
-            }
+            // M4: unconditional power cycle. PMCSR said D0 yet VMAJ
+            // reads 0xff and CRST stays set — a warm reboot can wedge
+            // the controller in a state the PMCSR bits do not describe.
+            // A D3hot round-trip is the spec's full logic reset.
+            crate::pci::write_u16_config(addr, cap.offset + 4,
+                pmcsr | akuma_pci::pm::POWER_STATE_MASK);
+            for _ in 0..4_000_000 { core::hint::spin_loop(); }
+            crate::pci::write_u16_config(addr, cap.offset + 4,
+                pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
+            for _ in 0..40_000_000 { core::hint::spin_loop(); }
+            serial::puts("[HDA] PMCSR=");
+            serial::put_dec(u64::from(akuma_pci::pm::power_state(
+                crate::pci::read_u16_config(addr, cap.offset + 4))));
+            serial::puts("\n");
             serial::puts("\n");
             break;
         }
@@ -123,6 +131,23 @@ pub fn init() {
     serial::puts(" bar0=0x");
     serial::put_hex(bar_addr);
     let regs = MmioRegs { base };
+
+    // M4 diagnostic: the raw first 32 bytes of BAR0, before anything
+    // else interprets them — which bytes answer 0xff is the whole
+    // question when one register decodes and its neighbour does not.
+    for line_off in [0x0usize, 0x10] {
+        serial::puts("[HDA] dump");
+        serial::put_hexn(line_off as u64, 2);
+        serial::puts(":");
+        for i in 0..8 {
+            let w = regs.r16(line_off + i * 2);
+            serial::puts(" ");
+            serial::put_hexn(u64::from(w & 0xff), 2);
+            serial::puts(" ");
+            serial::put_hexn(u64::from(w >> 8), 2);
+        }
+        serial::puts("\n");
+    }
     if let Some(info) = akuma_hda::discover(&regs) {
         serial::puts(" version=");
         serial::put_dec(u64::from(info.vmaj));
@@ -161,4 +186,13 @@ pub fn init() {
     } else {
         serial::puts("[HDA] CRST did not self-clear - controller not reset\n");
     }
+    serial::puts("[HDA] dump-post00:");
+    for i in 0..8 {
+        let w = regs.r16(i * 2);
+        serial::puts(" ");
+        serial::put_hexn(u64::from(w & 0xff), 2);
+        serial::puts(" ");
+        serial::put_hexn(u64::from(w >> 8), 2);
+    }
+    serial::puts("\n");
 }

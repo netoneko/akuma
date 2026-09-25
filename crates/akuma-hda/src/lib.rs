@@ -21,9 +21,9 @@ pub mod reg {
     pub const VMIN: usize = 0x02;
     /// Major version (8-bit).
     pub const VMAJ: usize = 0x03;
-    /// STATE0 - the reset-and-status word; CRST (bit 0) is the
+    /// GCTL - the reset-and-status word; CRST (bit 0) is the
     /// controller reset; it self-clears when the reset completes.
-    pub const STATE0: usize = 0x08;
+    pub const GCTL: usize = 0x08;
 }
 
 /// How the pure half reads a 16-bit register. Implemented over mapped MMIO by
@@ -92,7 +92,7 @@ pub struct Info {
 /// The runbook's discovery gate: a version of `0xffff` means the BAR is not
 /// mapped, and "everything after this is noise".
 #[must_use]
-/// `STATE0.CRST` — set to begin a controller reset; self-clears when
+/// `GCTL.CRST` — set to begin a controller reset; self-clears when
 /// the controller and its codecs are ready again.
 pub const CRST: u16 = 1;
 
@@ -119,11 +119,11 @@ pub fn discover<R: Regs16 + ?Sized>(regs: &R) -> Option<Info> {
 /// `wait` is one delay unit — the caller decides what a unit is, so
 /// the crate stays free of timing. Returns `false` on timeout.
 pub fn reset<R: RegsW16 + ?Sized>(regs: &R, polls: usize, wait: impl Fn()) -> bool {
-    let st = regs.r16(reg::STATE0);
-    regs.w16(reg::STATE0, st | CRST);
+    let st = regs.r16(reg::GCTL);
+    regs.w16(reg::GCTL, st | CRST);
     for _ in 0..polls {
         wait();
-        if regs.r16(reg::STATE0) & CRST == 0 {
+        if regs.r16(reg::GCTL) & CRST == 0 {
             return true;
         }
     }
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn reset_sets_crst_and_waits_for_self_clear() {
-        // STATE0 starts with unrelated bits set; reset must OR CRST in,
+        // GCTL starts with unrelated bits set; reset must OR CRST in,
         // preserve them, and return true once CRST self-clears.
         let f = FakeReset { state: Cell::new(0x42) };
         let mut waits = 0;
