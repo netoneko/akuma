@@ -113,6 +113,54 @@ pub fn kernel_lock_lost_ticket_recoveries() -> u64 {
     KERNEL_LOCK_LOST_TICKET_RECOVERIES.load(Ordering::Relaxed)
 }
 
+/// Which stuck episode last printed a `[BKL] stuck` line: `(owner << 32) | now_serving`,
+/// `u64::MAX` before the first. One long hold with three cores waiting on it used to
+/// print a line per waiter every [`SPIN_WARN_THRESHOLD`] spins, plus each waiter's
+/// `[bkls>]` samples, interleaved byte-by-byte on the console: on the trashcan
+/// (2026-09-25) that filled the 64 KiB `dmesg` ring in ~16 s, so a kot death a minute
+/// earlier had already scrolled out. An episode is a hold, and a hold is one
+/// `(owner, now_serving)` pair, so the first waiter to hit the threshold reports it and
+/// the rest are counted in [`STUCK_SUPPRESSED`], printed with the next line that does go
+/// out. Racing reporters are harmless: `swap` lets exactly one see a new key.
+static STUCK_REPORTED: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `[BKL] stuck` lines folded into an episode already reported (see [`STUCK_REPORTED`]).
+static STUCK_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Total `[BKL] stuck` lines suppressed as repeats of a reported episode this boot.
+pub fn kernel_lock_stuck_suppressed() -> u64 {
+    STUCK_SUPPRESSED.load(Ordering::Relaxed)
+}
+
+fn stuck_episode(owner: u32, serving: u32) -> u64 {
+    (u64::from(owner) << 32) | u64::from(serving)
+}
+
+/// `Some(folded)` if this waiter should print the line for `episode`: it's the first to
+/// report it. `folded` is how many were suppressed since the last line that printed.
+/// `None` when the episode is already reported (and counts this one as suppressed).
+///
+/// An episode that goes on still prints every [`STUCK_REPRINT_EVERY`] folds: a permanent
+/// wedge is one endless episode, and `scripts/j4_selfhost_campaign.py` tells a
+/// `BKL_STORM` from a `SILENT_WEDGE` by counting these lines (> 20). Deduplicated to
+/// the letter, a storm would read as silent.
+fn claim_stuck_report(episode: u64) -> Option<u64> {
+    if STUCK_REPORTED.swap(episode, Ordering::Relaxed) == episode {
+        let folded = STUCK_FOLDED.fetch_add(1, Ordering::Relaxed) + 1;
+        if folded >= STUCK_REPRINT_EVERY {
+            STUCK_FOLDED.store(0, Ordering::Relaxed);
+            return Some(folded);
+        }
+        STUCK_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(STUCK_FOLDED.swap(0, Ordering::Relaxed))
+}
+
+/// See [`claim_stuck_report`]: one line in this many, for an episode that doesn't end.
+const STUCK_REPRINT_EVERY: u64 = 8;
+/// Suppressed since the last `[BKL] stuck` line that printed; reset by each one.
+static STUCK_FOLDED: AtomicU64 = AtomicU64::new(0);
+
 // --- PreemptGuard ---------------------------------------------------------------
 
 /// RAII guard that disables scheduler preemption (and, under the BKL-drop
@@ -701,7 +749,13 @@ impl KernelLock {
             if total_spins > MAX_WAIT_SPINS.load(Ordering::Relaxed) {
                 MAX_WAIT_SPINS.store(total_spins, Ordering::Relaxed);
             }
-            if total_spins >= 1_048_576 && total_spins.is_power_of_two() {
+            // Only the waiter next in line samples: the others are waiting on the
+            // same hold one place further back, and saying so again from each of them
+            // is what flooded the console (see `STUCK_REPORTED`).
+            if total_spins >= 1_048_576
+                && total_spins.is_power_of_two()
+                && my_ticket == self.now_serving.load(Ordering::Relaxed).wrapping_add(1)
+            {
                 akuma_primitives::console::print_args_if_registered::<128>(format_args!(
                     "[bkls>] core={} ticket={} serving={} owner={} spins={}\n",
                     me, my_ticket,
@@ -712,7 +766,7 @@ impl KernelLock {
             }
             if spins == SPIN_WARN_THRESHOLD {
                 spins = 0;
-                log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);
+                log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me, self.now_serving.load(Ordering::Relaxed));
             }
             #[cfg(all(target_os = "none", target_arch = "x86_64"))]
             spin_assist();
@@ -870,7 +924,7 @@ impl KernelLock {
             spins = spins.wrapping_add(1);
             if spins == SPIN_WARN_THRESHOLD {
                 spins = 0;
-                log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);
+                log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me, self.now_serving.load(Ordering::Relaxed));
             }
             core::hint::spin_loop();
         }
@@ -891,7 +945,10 @@ impl KernelLock {
 
 /// Diagnostic: log when the Big Kernel Lock is stuck spinning (a cross-core deadlock
 /// canary). Stack-buffered to avoid heap use in an IRQ-masked context.
-fn log_kernel_lock_stuck(owner: u32, me: u32) {
+fn log_kernel_lock_stuck(owner: u32, me: u32, serving: u32) {
+    let Some(folded) = claim_stuck_report(stuck_episode(owner, serving)) else {
+        return;
+    };
     // Attribute the hold: what the owner core was doing when it last entered the kernel
     // (tag: syscall nr, 500=fault, 501=IRQ/scheduler, 511=unknown; see the profiler above).
     // Only meaningful while `set_profiling(true)` — otherwise reads as 511 — but always
@@ -904,8 +961,10 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
     // `print_args_if_registered` first: a contended acquire can run before/without a
     // registered runtime (host unit tests drive `KernelLock` directly), and a diagnostic
     // must never be the thing that panics.
-    akuma_primitives::console::print_args_if_registered::<96>(format_args!(
-        "[BKL] stuck: owner={owner} waiter={me} tag={tag} (aff0+1)\n"
+    // `folded`: lines from other waiters (or later rounds of this one) on episodes
+    // already reported, since the last line. `stuck: owner=` stays the grep key.
+    akuma_primitives::console::print_args_if_registered::<112>(format_args!(
+        "[BKL] stuck: owner={owner} waiter={me} tag={tag} serving={serving} folded={folded} (aff0+1)\n"
     ));
 }
 
@@ -1112,6 +1171,25 @@ mod thread_tag_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One stuck hold is one line, not one per waiter per round, but a hold that never
+    /// ends keeps a heartbeat, so a wedge still counts as a storm (`STUCK_REPORTED`).
+    /// The only test touching these statics, so the sequence below is its own.
+    #[test]
+    fn a_stuck_episode_is_reported_once_then_every_eighth_fold() {
+        let a = stuck_episode(3, 0xdead_0001);
+        let b = stuck_episode(3, 0xdead_0002);
+        assert!(claim_stuck_report(a).is_some(), "the first waiter on a new episode reports it");
+        let before = kernel_lock_stuck_suppressed();
+        for i in 1..STUCK_REPRINT_EVERY {
+            assert_eq!(claim_stuck_report(a), None, "fold {i} of the same hold is quiet");
+        }
+        assert_eq!(kernel_lock_stuck_suppressed() - before, STUCK_REPRINT_EVERY - 1);
+        assert_eq!(claim_stuck_report(a), Some(STUCK_REPRINT_EVERY), "a hold that goes on prints again, with the count");
+        assert_eq!(claim_stuck_report(a), None);
+        assert_eq!(claim_stuck_report(b), Some(1), "a new hold prints at once, carrying what was folded");
+        assert_ne!(stuck_episode(1, 7), stuck_episode(2, 7), "owner is part of the key");
+    }
 
     #[test]
     fn kernel_lock_acquire_release_single_core() {
