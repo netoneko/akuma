@@ -1,7 +1,7 @@
 # A socket bound to `127.0.0.1` accepts connections from the network
 
-**Status: FIXED in the kernel 2026-09-25, found 2026-09-24. Verified on one
-of the three boxes.** The cause is in `crates/akuma-net`, which both
+**Status: FIXED in the kernel 2026-09-25, found 2026-09-24. Verified on two
+of the three boxes (ryzen Firecracker guest, HP box metal).** The cause is in `crates/akuma-net`, which both
 kernels share, so it applied to amd64 and AArch64, on metal and under
 Firecracker. Both layers are fixed — fix-plan steps 3 and 4, see
 [§ What was done](#what-was-done-2026-09-25). The herd stopgaps (steps 1 and
@@ -14,11 +14,18 @@ booted on `c9586004` with its disk unchanged. From the Mac, `nc -z
 192.168.1.50 7117` is **closed** (it was open on `b4a55330`). In the guest,
 `herd start kot` still reaches the daemon over loopback (`kot: already
 running`). kot's own `0.0.0.0:9944` still answers, and the guest rejoined
-the akuma-miot mesh. **Not yet probed:** the HP box (`.120`) and the Lima
-AArch64 guest, which still run older kernels. **Seen on the same boot and
-not explained:** its self-test went from `797 passed, 0 failed` on the
-previous kernel to `794 passed, 3 FAILED`, all three
+the akuma-miot mesh. **Same day, the HP box on metal** (`192.168.1.120`,
+RTL8169, installed with `install_kernel_amd64.sh` and `reboot -f`, `.good`
+left as it was): `:7117` **closed** from the Mac, `herd start kot` over
+loopback still works, and kot rejoined the mesh. So the RX-path change is
+fine on the one NIC the fast lane doesn't run. **Not yet probed:** the Lima
+AArch64 guest, still on an older kernel. **Seen on both boots and not
+explained:** the self-test went from `797 passed, 0 failed` on the previous
+kernel to `794 passed, 3 FAILED` (ryzen) and `748 passed, 3 FAILED` (metal).
+The same three every time:
 `spawn: the child's registered table holds fd 0/1/2 as Stdin/Stdout/Stderr`.
+Boots and services are otherwise normal. Don't promote this kernel to
+`.good` until that's understood.
 
 ## Symptom
 
@@ -197,6 +204,37 @@ burst is bounded per call.
 - **On a box** (still to do): from another machine, `nc -z -w 4 <box> 7117` must fail,
   while `herd start <svc>` on the box still works. Repeat on all three rows
   of the table above; the Lima guest is probed from `fc`, not the LAN.
+- **Under QEMU, A/B** (2026-09-25; fixed `c9586004` against pre-fix
+  `d763cf1a`, same disk, both architectures). The guest NIC sits on a QEMU hub
+  with the SLIRP netdev and a `-netdev socket,udp=` port, so a host script can
+  put raw Ethernet frames on the guest's wire. SLIRP `hostfwd` connections
+  arrive addressed to `10.0.2.15`, which makes them "the network" for layer 1.
+  Evidence for layer 2 is `/proc/net/tcp`'s `BACKLOG` column: a half-open
+  handshake moves a handle from listening to pending. Injected SYNs use an
+  unused source (`10.0.2.77`), because the SLIRP gateway would reset the
+  SYN-ACK and empty the backlog before it can be read.
+
+  | check | AArch64 fixed | AArch64 pre-fix | amd64 fixed | amd64 pre-fix |
+  |---|---|---|---|---|
+  | `127.0.0.1` listener reached via NIC address | no | **yes** | no (herd `:7117`, RST) | **yes** (herd replied `err nosuchservice: …`) |
+  | control: `0.0.0.0` / NIC-address listener reached | yes | yes | yes (sshd) | yes |
+  | `127.0.0.1:N` + `10.0.2.15:N` coexist | yes | **no** | not run | not run |
+  | `0.0.0.0:N` over a specific bind | `EADDRINUSE` | `EADDRINUSE` | `EADDRINUSE` | `EADDRINUSE` |
+  | bind `10.9.9.9` (unowned) | `EADDRNOTAVAIL` | **succeeds, listens** | `EADDRNOTAVAIL` | **succeeds, listens** |
+  | injected SYN to dst `127.0.0.1` | dropped | **accepted** (`0/1/0`) | dropped | **accepted** (`7/1/0`) |
+  | control: injected SYN to `10.0.2.15` | accepted | accepted | accepted | accepted |
+  | injected SYN from src `127.0.0.1` | dropped | dropped | not run | not run |
+
+  The last row doesn't show the fix working: smoltcp already refuses a
+  segment from a loopback source. The live layer-2 hole was the destination.
+  amd64 used herd's own non-blocking listener, and the checks marked "not
+  run" were skipped, because there a blocking `accept` in a busybox `nc -l`
+  wedges sshd on both kernels. Also seen on both kernels under QEMU only, so
+  not caused by this fix: an in-guest TCP connect to `127.0.0.1` mostly times
+  out (busybox `nc`: 0/8 connects on AArch64 pre-fix, 1/8 fixed), and the
+  herd CLI hung or reported `cannot reach the herd daemon` on amd64. Real
+  boxes don't show it: `herd start kot` over loopback works on the ryzen
+  guest and the HP box, as recorded above.
 
 ## Found how
 
