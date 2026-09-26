@@ -61,6 +61,8 @@ pub const AFMT_S16_LE: i32 = 0x00000010;
 /// OSS format: unsigned 8-bit PCM.
 #[cfg_attr(any(not(feature = "sound"), feature = "platform-firecracker"), allow(dead_code))]
 pub const AFMT_U8: i32 = 0x00000008;
+pub const AFMT_S24_LE: i32 = 0x00010000;
+pub const AFMT_S32_LE: i32 = 0x01000000;
 
 // ============================================================================
 // Feature ON: real driver
@@ -239,8 +241,8 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_SETFMT`: set sample format from an AFMT_* code.
     pub fn set_format_oss(fmt: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (fmt == 16 || fmt == 8 || fmt == 24 || fmt == 32) { return Ok(()); }
-        if crate::audio::hda_backend::up() { return if fmt == AFMT_S16_LE || fmt == 24 || fmt == 32 { Ok(()) } else { Err(AudioError::InvalidParam) }; }
+        if crate::audio::hda_backend::up() && (fmt == AFMT_S16_LE || fmt == AFMT_U8 || fmt == AFMT_S24_LE || fmt == AFMT_S32_LE) { return Ok(()); }
+        if crate::audio::hda_backend::up() { return if fmt == AFMT_S16_LE || fmt == AFMT_U8 || fmt == AFMT_S24_LE || fmt == AFMT_S32_LE { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         let format = match fmt {
             AFMT_S16_LE => PcmFormat::S16,
             AFMT_U8 => PcmFormat::U8,
