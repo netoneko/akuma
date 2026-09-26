@@ -465,6 +465,7 @@ fn codec_scan_widgets(regs: &mut MmioRegs) {
     }
     serial::puts("[HDA] M8 scan done\n");
     unsafe { codec_raw_scan(regs); }
+    m9_beep(regs);
         m8_raw_scan(regs);
 }
 
@@ -558,4 +559,64 @@ unsafe fn codec_raw_scan(regs: &mut MmioRegs) {
         nid += 1;
     }
     serial::puts("[HDA] M8b raw scan done\n");
+}
+
+// ---- M9a: hardcoded ALC662 + stream DMA beep (root block 36078) ----
+static mut BEEP_BUF: [u8; 192000] = [0; 192000]; // 1s of 48k/16-bit/stereo
+#[repr(align(128))]
+struct BeepBdl([u64; 4]); // 2 BDL entries x 16 bytes; only entry 0 used
+static mut BEEP_BDL: BeepBdl = BeepBdl([0; 4]);
+
+pub fn m9_beep(regs: &mut MmioRegs) {
+    unsafe {
+        // 440Hz square, 48k frames/s stereo; half-period in frames
+        let half = 54444u32 / 440; // ~123 frames? no: 48000/440/2 = 54
+        let halff = 48000u32 / 440 / 2;
+        let mut i = 0usize;
+        while i < 192000 {
+            let frame = (i / 4) as u32;
+            let s: i16 = if frame % halff < halff / 2 { 8000 } else { -8000 };
+            let b = s.to_le_bytes();
+            BEEP_BUF[i] = b[0];
+            BEEP_BUF[i + 1] = b[1];
+            BEEP_BUF[i + 2] = b[0];
+            BEEP_BUF[i + 3] = b[1];
+            i += 4;
+        }
+        let _ = half;
+        let buf_phys = akuma_primitives::addr::virt_to_phys((&raw mut BEEP_BUF) as usize) as u64;
+        let bdl_phys = akuma_primitives::addr::virt_to_phys((&raw mut BEEP_BDL) as usize) as u64;
+        // BDL entry 0 (16 bytes = 2 u64): [addr_lo|addr_hi, len|IOC<<63]
+        BEEP_BDL.0[0] = buf_phys;
+        BEEP_BDL.0[1] = 192000u64;
+        // hardcoded ALC662 verbs (best effort; emulator may drop them)
+        codec_send_ici(regs, 0x00022011); // DAC nid 0x02 conv-format: 48k/16/stereo
+        codec_send_ici(regs, 0x000233b0); // DAC nid 0x02 amp: unmute gain
+        codec_send_ici(regs, 0x001b70c0); // HP pin nid 0x1b widget-ctl EAPD
+        serial::puts("[HDA] M9: verbs sent, SD0 setup\n");
+        // SDI0 @0x100: stop+reset stream first
+        regs.w16(0x100, 0);
+        regs.w16(0x102, 0x0010); // STRST=1
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        regs.w16(0x102, 0x0001); // STRST cleared itself, STRM=1
+        // CBL = 192000 (32-bit @0x108) via two halfwords
+        regs.w16(0x108, 0xee00);
+        regs.w16(0x10a, 0x0002);
+        regs.w16(0x10c, 0x0000); // LVI = entries-1 = 0
+        regs.w16(0x118, (bdl_phys & 0xffff) as u16);
+        regs.w16(0x11a, ((bdl_phys >> 16) & 0xffff) as u16);
+        regs.w16(0x11c, ((bdl_phys >> 32) & 0xffff) as u16);
+        regs.w16(0x11e, 0);
+        let lp0 = regs.r16(0x104);
+        regs.w16(0x100, 1); // RUN
+        for _ in 0..4_000_000 { core::hint::spin_loop(); }
+        let lp1 = regs.r16(0x104);
+        serial::puts("[HDA] M9 LPIB: 0x");
+        serial::put_hexn(lp0 as u64, 4);
+        serial::puts(" -> 0x");
+        serial::put_hexn(lp1 as u64, 4);
+        serial::puts("\n");
+        if lp1 != lp0 { serial::puts("[HDA] M9: DMA ALIVE - stream running\n"); }
+        else { serial::puts("[HDA] M9: LPIB frozen\n"); }
+    }
 }
