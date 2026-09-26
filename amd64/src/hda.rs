@@ -596,9 +596,9 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         serial::puts("[HDA] M9: verbs sent, SD0 setup\n");
         // SDI0 @0x100: stop+reset stream first
         regs.w16(0x100, 0);
-        regs.w16(0x102, 0x0010); // STRST=1
+        regs.w16(0x102, 0x2000); // SRST=1 (bit13 high half)
         for _ in 0..1000 { core::hint::spin_loop(); }
-        regs.w16(0x102, 0x0001); // STRST cleared itself, STRM=1
+        regs.w16(0x102, 0x2010); // SRST=0 + STRM=1
         // CBL = 192000 (32-bit @0x108) via two halfwords
         regs.w16(0x108, 0xee00);
         regs.w16(0x10a, 0x0002);
@@ -608,7 +608,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x11c, ((bdl_phys >> 32) & 0xffff) as u16);
         regs.w16(0x11e, 0);
         let lp0 = regs.r16(0x104);
-        regs.w16(0x100, 1); // RUN
+        regs.w16(0x100, 2); // RUN=bit1
         for _ in 0..4_000_000 { core::hint::spin_loop(); }
         let lp1 = regs.r16(0x104);
         serial::puts("[HDA] M9 LPIB: 0x");
