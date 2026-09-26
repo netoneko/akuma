@@ -598,7 +598,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x100, 0);
         regs.w16(0x102, 0x2000); // SRST=1 (bit13 high half)
         for _ in 0..1000 { core::hint::spin_loop(); }
-        regs.w16(0x102, 0x2010); // SRST=0 + STRM=1
+        regs.w16(0x102, 0x0001); // SRST=0 + STRM=1
         // CBL = 192000 (32-bit @0x108) via two halfwords
         regs.w16(0x108, 0xee00);
         regs.w16(0x10a, 0x0002);
@@ -616,7 +616,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         serial::puts(" cbl=0x");
         serial::put_hexn((regs.r16(0x108) as u64) | ((regs.r16(0x10A) as u64) << 16), 8);
         serial::puts(" lvi=0x");
-        serial::put_hexn(regs.r16(0x10C) as u64, 4);
+        serial::put_hexn(regs.r16(0x10E) as u64, 4);
         serial::puts(" bdl=0x");
         serial::put_hexn((regs.r16(0x118) as u64) | ((regs.r16(0x11A) as u64) << 16), 8);
         serial::puts(" lpib=0x");
