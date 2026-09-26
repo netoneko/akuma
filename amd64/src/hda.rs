@@ -421,6 +421,7 @@ fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
                     serial::puts("[HDA] ici resp: ");
                     serial::put_hexn(resp as u64, 8);
                     serial::puts("\n");
+                    regs.w16(0x68, 2); // IRV w1c clear before next cmd
                     return Some(resp);
                 }
                 return None;
