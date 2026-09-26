@@ -281,7 +281,7 @@ fn codec_probe(regs: &mut MmioRegs) {
         }
         None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
     }
-    match codec_send(regs, 0x000F_0004) {
+    match codec_send(regs, 0x000F_0400) {
         Some(v) => {
             serial::puts(" nodes=0x");
             serial::put_hexn(u64::from(v), 8);
@@ -319,6 +319,10 @@ fn codec_ici_probe(regs: &mut MmioRegs, verb: u32) {
     serial::put_hexn(rirbctl as u64, 4);
     serial::puts(" rirbsts=");
     serial::put_hexn(rirbsts as u64, 4);
+    serial::puts(" rirblbase=");
+    serial::put_hexn(((regs.r16(0x52) as u64) << 16) | (regs.r16(0x50) as u64), 8);
+    serial::puts(" corblbase=");
+    serial::put_hexn(((regs.r16(0x42) as u64) << 16) | (regs.r16(0x40) as u64), 8);
     serial::puts("\n");
     regs.w16(0x60, (verb & 0xffff) as u16);
     regs.w16(0x62, (verb >> 16) as u16);
