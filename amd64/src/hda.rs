@@ -416,8 +416,9 @@ fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
         while n < 5_000_000 {
             let irs = regs.r16(0x68);
             if irs & 0x0001 == 0 {
-                if irs & 0x0002 != 0 {
+                if true { // IRV stale-sets between calls on this silicon; BUSY-clear is the real signal
                     let resp = (regs.r16(0x64) as u32) | ((regs.r16(0x66) as u32) << 16);
+        regs.w16(0x68, 2); // IRV w1c after read (stale IRV poisoned call#2)
                     serial::puts("[HDA] ici resp: ");
                     serial::put_hexn(resp as u64, 8);
                     serial::puts("\n");
