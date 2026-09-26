@@ -592,6 +592,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         BEEP_BDL.0[1] = 192000u64;
         // hardcoded ALC662 verbs (best effort; emulator may drop them)
         codec_send_ici(regs, 0x00022011); // DAC nid 0x02 conv-format: 48k/16/stereo
+        codec_send_ici(regs, 0x00200210); // DAC nid 0x02 stream=1 ch=0
         codec_send_ici(regs, 0x000233b0); // DAC nid 0x02 amp: unmute gain
         codec_send_ici(regs, 0x001b70c0); // HP pin nid 0x1b widget-ctl EAPD
         serial::puts("[HDA] M9: verbs sent, SD0 setup\n");
@@ -599,7 +600,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x100, 0);
         regs.w16(0x102, 0x2000); // SRST=1 (bit13 high half)
         for _ in 0..1000 { core::hint::spin_loop(); }
-        regs.w16(0x102, 0x0001); // SRST=0 + STRM=1
+        regs.w16(0x102, 0x0010); // STRM=1 (bits 23:20 high half), SRST=0
         // CBL = 192000 (32-bit @0x108) via two halfwords
         regs.w16(0x108, 0xee00);
         regs.w16(0x10a, 0x0002);
@@ -609,8 +610,8 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x11c, ((bdl_phys >> 32) & 0xffff) as u16);
         regs.w16(0x11e, 0);
         let lp0 = regs.r16(0x104);
-        regs.w16(0x100, 2); // RUN=bit1
         regs.w16(0x112, 0x0011); // M9a4: FMT 48k/16-bit/stereo
+        regs.w16(0x100, 2); // RUN=bit1 (after FMT, spec order)
         serial::puts("[HDA] M9a4 lvi@10C="); serial::put_hexn(regs.r16(0x10C) as u64, 4); serial::puts(" fifow@10E="); serial::put_hexn(regs.r16(0x10E) as u64, 4); serial::puts(" fmt@112="); serial::put_hexn(regs.r16(0x112) as u64, 4); serial::puts("\n");
         serial::puts("[HDA] SD0 dump: ctl=0x");
         serial::put_hexn(regs.r16(0x100) as u64, 4);
@@ -667,4 +668,57 @@ fn m9a5_bcis(regs: &mut MmioRegs) {
     serial::puts("[HDA] M9a5 BCIS count=");
     serial::put_hexn(n as u64, 2);
     serial::puts("\n");
+}
+
+// ===== Stage 1: /dev/dsp kernel API (feeds the proven SD0 engine) =====
+// Global MMIO base captured by init()/m9_beep(); a small config record for
+// the glue layer to read; and dsp_write(): blocking single-buffer playback.
+#[allow(dead_code)]
+pub static mut HDA_BASE: usize = 0;
+#[allow(dead_code)]
+pub struct DspInfo { pub rate: u32, pub channels: u16, pub fmt: u16 }
+#[allow(dead_code)]
+pub static mut HDA_DSP: DspInfo = DspInfo { rate: 48000, channels: 2, fmt: 0x0011 };
+
+#[allow(dead_code)]
+pub fn hda_dsp_available() -> bool {
+    unsafe { HDA_BASE != 0 }
+}
+
+// Configure stream format (rate only matters to userspace here; the codec
+// was already programmed to 48k/16/2 by the beep bring-up).
+#[allow(dead_code)]
+pub fn hda_dsp_set_rate(rate: u32) { unsafe { HDA_DSP.rate = rate; } }
+
+// Blocking write: copy into BEEP_BUF (64KiB), arm BDL entry 0 (len = n,
+// IOC on last), ensure RUN, wait for BCIS, w1c. Buffer larger than 64KiB
+// is truncated by the caller (fd layer re-chunks into periods).
+#[allow(dead_code)]
+pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
+    let n = if data.len() > 192000 { 192000 } else { data.len() };
+    if n == 0 { return 0; }
+    unsafe {
+        let b = HDA_BASE;
+        if b == 0 { return 0; }
+        let mut i = 0usize;
+        while i < n { BEEP_BUF[i] = data[i]; i += 1; }
+        // stop stream while re-arming
+        let mut ctl = MmioRegs { base: b as *mut u8 };
+        ctl.w16(0x100, 0); // RUN off
+        let pa = (&raw const BEEP_BUF) as *const u8 as usize;
+        let ph = akuma_primitives::addr::virt_to_phys(pa);
+        BEEP_BDL.0[0] = ph as u64;
+        BEEP_BDL.0[1] = ((n as u64) << 32) | 1; // IOC=1, len=n
+        ctl.w16(0x118, (ph & 0xffff) as u16); ctl.w16(0x11A, ((ph >> 16) & 0xffff) as u16); // BDL base lo/hi
+        ctl.w16(0x10E, 0); // LVI=0 -> one entry
+        ctl.w16(0x103, 4); // w1c BCIS
+        ctl.w16(0x100, 2); // RUN
+        let mut spins = 0u32;
+        while spins < 200_000_000 {
+            let sts = ctl.r16(0x103);
+            if sts & 4 != 0 { ctl.w16(0x103, 4); break; }
+            spins += 1;
+        }
+        n
+    }
 }
