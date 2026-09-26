@@ -464,6 +464,7 @@ fn codec_scan_widgets(regs: &mut MmioRegs) {
         nid += 1;
     }
     serial::puts("[HDA] M8 scan done\n");
+        m8_raw_scan(regs);
 }
 
 fn codec_read_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
@@ -499,4 +500,29 @@ fn hda_scan2(regs: &mut MmioRegs) {
         nid += 1;
     }
     serial::puts("[HDA] M8raw done\n");
+}
+
+// M8b: raw unfiltered dump - every nid's responses, no zeros filtered out.
+fn m8_raw_scan(regs: &mut MmioRegs) {
+    serial::puts("[HDA] M8b raw scan nid 1..0x1f (0xF0C | 0xF1C)\n");
+    let mut nid = 1u32;
+    while nid <= 0x1f {
+        let caps = codec_read_ici(regs, nid << 20 | 0xF0C00);
+        let cfg = codec_read_ici(regs, nid << 20 | 0xF1C00);
+        serial::puts("[HDA] nid ");
+        serial::put_hexn(nid as u64, 2);
+        serial::puts(" caps=");
+        match caps {
+            Some(v) => serial::put_hexn(v as u64, 8),
+            None => serial::puts("none"),
+        }
+        serial::puts(" cfg=");
+        match cfg {
+            Some(v) => serial::put_hexn(v as u64, 8),
+            None => serial::puts("none"),
+        }
+        serial::puts("\n");
+        nid += 1;
+    }
+    serial::puts("[HDA] M8b raw scan done\n");
 }
