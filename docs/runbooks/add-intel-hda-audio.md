@@ -342,3 +342,15 @@ Next steps (in order):
 2. M8 enumeration: AFG lookup via root-node subnode count, then widget walk; cross-check every verb through ICI in parallel with CORB/RIRB.
 3. M9 stream: DMA position buffer (watch it — 0x70-0x74 is exactly the region the old wrong RIRB map pointed at), BDLE in its own aligned page, SDFMT, then SDCTL RUN.
 4. /dev/dsp client, wavplay, tokyo_rider_enter_omegashima.wav acceptance.
+
+## Status: what is done (root block 35782)
+
+**Working on metal (verified in boot captures):**
+- M1 PCI discovery: 8086:8c20 found (class 04/03), BAR0 mapped 0xf7210000, GCAP=0x4401 (4 out / 4 in), version 1.0 (aligned read at 0x02)
+- M6 controller reset: HDA 1.0a §4.3 two-phase CRST (write 0 → poll 0 → write 1 → poll 1) — exits reset, STATESTS=0x0001 (codec 0 alive on link)
+- M7 CORB: hardware fetches verbs from ring DMA (corbwp/corbrp advance in lockstep); RIRB delivery works (rirbwp advances, RINTFL sets) but response latency exceeds any busy-poll budget, so verbs ride the Immediate Command Interface
+- M7 ICI path (codec_send_ici): IRS=1 trigger, BUSY-clear-only gate — codec0 answers vendor ID 0x10EC0662 (Realtek ALC662) every boot
+
+**Emulator findings:** answers every verb instantly; vendor-ID implemented, node-count (0xF04) and widget reads return 0 — M8 raw scan maps full verb coverage. Single-byte reads at odd offsets return 0xff (unaligned MMIO trap); aligned reads honest.
+
+**Pending:** M8 widget enumeration (raw scan in flight) → M9 /dev/dsp + wavplay (root's headphones test; fixtures at bootstrap/music/ + /bin/wavplay, never committed per root block 29409).
