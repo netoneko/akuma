@@ -297,6 +297,8 @@ fn codec_probe(regs: &mut MmioRegs) {
         None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
     }
         codec_ici_probe(regs, 0x000F0000);
+        codec_ici_probe(regs, 0x000F0400);
+        codec_scan_widgets(regs); // M7m: node-count via proven fn - emulator verb-coverage test
         codec_ring_dump(regs);
     serial::puts("\n");
 }
@@ -432,4 +434,50 @@ fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
         serial::puts("[HDA] ici busy timeout\n");
         None
     }
+}
+
+// M8: brute widget/pin scan — emulator answers verbs but 0xF04 says no subnodes,
+// so walk nid range directly and look for anything that answers nonzero.
+fn codec_scan_widgets(regs: &mut MmioRegs) {
+    serial::puts("[HDA] M8 scan: pin caps (0xF0C) nid 2..0x20\n");
+    let mut nid = 2u32;
+    while nid <= 0x20 {
+        let verb = (nid << 20) | (0xF0C << 8);
+        if let Some(v) = codec_read_ici(regs, verb) {
+            if v != 0 {
+                serial::puts("[HDA] M8 nid 0x");
+                serial::put_hexn(nid as u64, 2);
+                serial::puts(" pin_caps=0x");
+                serial::put_hexn(v as u64, 8);
+                serial::puts("\n");
+                let cfg = codec_read_ici(regs, (nid << 20) | (0xF1C << 8));
+                if let Some(c) = cfg {
+                    serial::puts("[HDA] M8 nid 0x");
+                    serial::put_hexn(nid as u64, 2);
+                    serial::puts(" cfg_default=0x");
+                    serial::put_hexn(c as u64, 8);
+                    serial::puts("\n");
+                }
+            }
+        }
+        nid += 1;
+    }
+    serial::puts("[HDA] M8 scan done\n");
+}
+
+fn codec_read_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
+    regs.w16(0x60, (verb & 0xffff) as u16);
+    regs.w16(0x62, (verb >> 16) as u16);
+    regs.w16(0x68, 1);
+    let mut n = 0u32;
+    while n < 20000000u32 {
+        let irs = regs.r16(0x68);
+        if irs & 0x0001 == 0 {
+            let lo = regs.r16(0x64) as u32;
+            let hi = regs.r16(0x66) as u32;
+            return Some((hi << 16) | lo);
+        }
+        n += 1;
+    }
+    None
 }
