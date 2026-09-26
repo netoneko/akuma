@@ -239,8 +239,8 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_SETFMT`: set sample format from an AFMT_* code.
     pub fn set_format_oss(fmt: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (fmt == 16 || fmt == 8) { return Ok(()); }
-        if crate::audio::hda_backend::up() { return if fmt == AFMT_S16_LE { Ok(()) } else { Err(AudioError::InvalidParam) }; }
+        if crate::audio::hda_backend::up() && (fmt == 16 || fmt == 8 || fmt == 24 || fmt == 32) { return Ok(()); }
+        if crate::audio::hda_backend::up() { return if fmt == AFMT_S16_LE || fmt == AFMT_S24_LE || fmt == AFMT_S32_LE { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         let format = match fmt {
             AFMT_S16_LE => PcmFormat::S16,
             AFMT_U8 => PcmFormat::U8,
