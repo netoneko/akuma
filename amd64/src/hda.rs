@@ -289,6 +289,7 @@ fn codec_probe(regs: &mut MmioRegs) {
         None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
     }
         codec_ici_probe(regs, 0x000F0000);
+        codec_ring_dump(regs);
     serial::puts("\n");
 }
 
@@ -343,5 +344,52 @@ fn codec_ici_probe(regs: &mut MmioRegs, verb: u32) {
         serial::puts("\n");
     } else {
         serial::puts("[HDA] ICI: busy cleared, no result valid\n");
+    }
+}
+
+// M7g probe: discriminate response-writeback vs verb-fetch vs late-delivery.
+// 1) dump ring memory (are our verbs in the DRAM the controller reads? did ANY
+//    response land in RIRB memory without RIRBWP moving?), 2) late re-poll of
+//    rirbwp/rirbsts after ~100ms, 3) CAd1 verb: unresponsive codec - does the
+//    controller auto-generate a no-response entry?
+fn codec_ring_dump(regs: &mut MmioRegs) {
+    unsafe {
+        serial::puts("[HDA] ringdump corb[1..3]:");
+        let corb = (&raw mut CORB_RING).cast::<u32>();
+        let mut i = 1usize;
+        while i < 4 {
+            serial::puts(" ");
+            serial::put_hexn(corb.add(i).read_volatile() as u64, 8);
+            i += 1;
+        }
+        serial::puts("\n[HDA] ringdump rirb[0..2] hi:lo:");
+        let rirb = (&raw mut RIRB_RING).cast::<u64>();
+        let mut j = 0usize;
+        while j < 2 {
+            let e = rirb.add(j).read_volatile();
+            serial::puts(" ");
+            serial::put_hexn(e >> 32, 8);
+            serial::puts(":");
+            serial::put_hexn(e & 0xFFFF_FFFF, 8);
+            j += 1;
+        }
+        serial::puts("\n");
+        let mut n = 0usize;
+        while n < 20_000_000 { core::hint::spin_loop(); n += 1; }
+        serial::puts("[HDA] late rirbwp=");
+        serial::put_hexn(regs.r16(0x58) as u64, 4);
+        serial::puts(" rirbsts=");
+        serial::put_hexn(regs.r16(0x5D) as u64, 4);
+        serial::puts("\n");
+        match codec_send(regs, 0x100F_0000) {
+            Some(r) => {
+                serial::puts("[HDA] cad1 response: ");
+                serial::put_hexn(r as u64, 8);
+                serial::puts("\n[HDA] after-cad1 rirbwp=");
+            }
+            None => serial::puts("[HDA] cad1: no RIRB response\n[HDA] after-cad1 rirbwp="),
+        }
+        serial::put_hexn(regs.r16(0x58) as u64, 4);
+        serial::puts("\n");
     }
 }
