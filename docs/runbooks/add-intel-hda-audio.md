@@ -318,3 +318,27 @@ a VMM boot has a flag to set, a firmware boot does not.
 - **Assumption:** tool calls execute in issue-order and complete before the next begins.
 - **Evidence:** lib.rs clobbered to `}` mid-edit while two duplicate-spawned kbuilds raced one /root/ktarget; r59 re-applied the same E0596 fix I had just applied. Root confirmed: "the tools are async... I'll make the edits linear".
 - **Consequence:** one self-contained command per turn; `git checkout` before every edit chain; no shared temp files; cancel strays before writes; verify balance + commit + build only after a quiet `Running` list.
+
+## Plan evaluation (2026-09-26, M1-M7 done, M7g probe pending metal)
+
+Where the plan met reality (assumption -> evidence -> correction):
+
+1. M1 boot path: plan assumed the `pci`-flagged block in main.rs runs. Evidence: boot banner `cmd: init=/bin/herd root=/dev/sda1 netprobe` (no pci flag); census prints anyway via the multiboot2/GRUB path. Correction: wire init where execution actually is (multiboot2, after mem::init_reserving + install_shared_sinks so map_bar has frames).
+2. M2 CRST: plan said CRST self-clears. Evidence: poll timed out while GCTL held the written value. Correction per HDA 1.0a §4.3: CRST is software-driven, two phases (write 0 -> poll 0 -> write 1 -> poll 1 -> settle).
+3. M3/M4 power: PMCSR read 0 (already D0); a forced D3->D0 cycle WEDGED the controller (all-ff reads) until cold reset. Lesson: never cycle power unconditionally.
+4. M5 MMIO width: unaligned u16 at offset 0x03 read 0xff while aligned neighbors read real data (GCAP 0x4401). Correction: read the aligned halfword at 0x02 (VMIN low, VMAJ high). version=1.0, honest.
+5. M7 offsets: CORB 0x40-0x4E right; RIRB is NOT 0x7x (reserved; writes vanish, reads 0) — real homes 0x50-0x5E. Evidence: reads all-zero despite writes; after moving, rintcnt/rirbctl/rirbsize hold values.
+6. M7 enables: CORBCTL bit0 is the CORBRP reset strobe, RUN is bit1 (0x2) — with 0x1 the engine stays in reset (corbrp frozen). RIRBCTL likewise: DMAEN is bit1 (0x2), bit0 is IRQ enable. Evidence: corbwp==corbrp==2 only after 0x2.
+7. M7 verbs: command field is bits [19:8]; 0xF00000 decoded to CAd 0xF (nonexistent). Vendor-ID = 0x000F_0000; node-count = 0x000F_0400 (parm in [7:0]). Immediate-command interface (ICW 0x60/IRR 0x64/IRS 0x68) answered 10ec0662 = Realtek ALC662 — the codec link is ALIVE and ICI is the oracle for every future verb.
+8. Open problem: RIRB delivers nothing (rirbwp=0, rirbsts=0) with spec-correct programming and CORB consuming. M7g probe (commit 1558279e, this branch) discriminates on next boot: ring-memory dump (did responses land without WP moving?), 100ms late re-poll, and a CAd1 verb (does the controller auto-generate no-response entries?).
+
+Gaps between doc and box:
+- "Host tests" cannot run here (no host-std rust target) — that is how the VMAJ decode bug and verb-encoding bugs survived until metal.
+- The verify section's `(/dev/dsp)` end state needs M8 (widget/pin enumeration, verbs 0xF00/0xF04/0xF0C/0xF1C on the AFG) and M9 (stream descriptors 0x80+, DMA position 0x70-0x74, BDLE ring, SDFMT 48k/16-bit/stereo, SDCTL RUN) — unstarted.
+- Tooling: async edit races corrupted source twice mid-build (root is making edits linear). Until then: single-actor gated chains, verify-before-commit.
+
+Next steps (in order):
+1. kinstall + reboot the M7g kernel; read the ringdump verdict -> either fix RIRB writeback or declare ICI-only and move on.
+2. M8 enumeration: AFG lookup via root-node subnode count, then widget walk; cross-check every verb through ICI in parallel with CORB/RIRB.
+3. M9 stream: DMA position buffer (watch it — 0x70-0x74 is exactly the region the old wrong RIRB map pointed at), BDLE in its own aligned page, SDFMT, then SDCTL RUN.
+4. /dev/dsp client, wavplay, tokyo_rider_enter_omegashima.wav acceptance.
