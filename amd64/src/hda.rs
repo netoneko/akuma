@@ -609,6 +609,19 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x11e, 0);
         let lp0 = regs.r16(0x104);
         regs.w16(0x100, 2); // RUN=bit1
+        serial::puts("[HDA] SD0 dump: ctl=0x");
+        serial::put_hexn(regs.r16(0x100) as u64, 4);
+        serial::puts(" sts=0x");
+        serial::put_hexn(regs.r16(0x102) as u64, 4);
+        serial::puts(" cbl=0x");
+        serial::put_hexn((regs.r16(0x108) as u64) | ((regs.r16(0x10A) as u64) << 16), 8);
+        serial::puts(" lvi=0x");
+        serial::put_hexn(regs.r16(0x10C) as u64, 4);
+        serial::puts(" bdl=0x");
+        serial::put_hexn((regs.r16(0x118) as u64) | ((regs.r16(0x11A) as u64) << 16), 8);
+        serial::puts(" lpib=0x");
+        serial::put_hexn(regs.r16(0x104) as u64, 4);
+        serial::puts("\n");
         for _ in 0..4_000_000 { core::hint::spin_loop(); }
         let lp1 = regs.r16(0x104);
         serial::puts("[HDA] M9 LPIB: 0x");
