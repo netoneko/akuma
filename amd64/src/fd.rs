@@ -1497,8 +1497,18 @@ const STAT_SIZE: usize = core::mem::size_of::<akuma_syscalls_abi::stat::X8664>()
 /// this target has always reported `S_IFCHR` for it, which is what `isatty(3)`
 /// on those numbers needs. A *bound* Stdin/Stdout/Stderr goes to glue, which
 /// gives the richer answer (`st_rdev` = `makedev(136, 0)`, the pts major).
+///
+/// **Only with no registered process.** A registered process starts with
+/// 0/1/2 bound (`SharedFdTable::with_stdio`), so an unbound 0/1/2 there is one
+/// it *closed*, and Linux says `EBADF`. Answering `S_IFCHR` broke every
+/// `git push` from the trashcan (2026-09-26): `pack-objects --stdout` closes
+/// fd 1 itself, then git's `run_builtin` epilogue asks `fstat(1)` — `EBADF`
+/// means "already closed, done"; a character device sends it on to
+/// `fclose(stdout)`, whose `close(1)` is `EBADF`, and git dies with `close
+/// failed on standard output: Bad file descriptor` after writing the whole
+/// pack.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    if console_end(fd).is_some() && !is_bound(fd) {
+    if crate::usermode::current_process().is_none() && console_end(fd).is_some() && !is_bound(fd) {
         // `S_IFCHR | 0620`, size 0 — the answer the old `encode_stat` gave, in
         // the x86_64 layout the converter also produces.
         let g = akuma_syscalls_linux::Stat {
@@ -2472,6 +2482,18 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("fd: read of the console's write end is EBADF",
         sys_read(out_fd, buf.as_mut_ptr() as u64, 1), errno::EBADF);
     t.check_eq("fd: closing the console descriptors", sys_close(out_fd) | sys_close(in_fd), 0);
+
+    // A registered process's **closed** 0/1/2 is `EBADF`, not the by-number
+    // console — see [`sys_fstat`]'s header (git's `run_builtin` epilogue).
+    // fd 2 rather than 1, parked and put back so the row keeps its stdio.
+    let saved = sys_dup(2);
+    if t.check("fd: dup of the row's fd 2", saved >= FIRST_FILE_FD as u64 && saved < MAX_FDS as u64) {
+        sys_close(2);
+        t.check_eq("fd: fstat on a closed fd 2 is EBADF",
+            sys_fstat(2, st.as_mut_ptr() as u64), errno::EBADF);
+        t.check_eq("fd: fd 2 put back", sys_dup2(saved, 2), 2);
+        sys_close(saved);
+    }
 
 
     let fd = sys_openat(0, path.as_ptr() as u64, 0, 0);

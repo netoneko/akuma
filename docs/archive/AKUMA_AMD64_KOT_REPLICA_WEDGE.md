@@ -108,6 +108,9 @@ and no outbound HTTP.
      `reconcile_for_spsr`.
 
   Also landed and verified: `yield_now`'s BKL drop window.
+  (Its dropped-window exception, which let a thread switch without the lock, was
+  removed 2026-09-26 after two `[SWITCH NO-BKL] … via=yield_now` hangs:
+  [`AKUMA_AMD64_BKL_NETWORKING.md`](AKUMA_AMD64_BKL_NETWORKING.md) 2026-09-26.)
 
 ## Leads, ranked by how much of the symptom each explains
 
