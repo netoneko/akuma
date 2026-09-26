@@ -466,6 +466,7 @@ fn codec_scan_widgets(regs: &mut MmioRegs) {
     serial::puts("[HDA] M8 scan done\n");
     unsafe { codec_raw_scan(regs); }
     m9_beep(regs);
+    m9a5_bcis(regs);
         m8_raw_scan(regs);
 }
 
@@ -635,4 +636,35 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         else { serial::puts("[HDA] M9a4 sts-after="); serial::put_hexn(regs.r16(0x102) as u64, 4); serial::puts("\n");
         serial::puts("[HDA] M9: LPIB frozen\n"); }
     }
+}
+
+// M9a5: BCIS counting probe - proves CONTINUOUS dma playback (not one completion)
+fn m9a5_bcis(regs: &mut MmioRegs) {
+    let mut n: u32 = 0;
+    let mut i: u32 = 0;
+    while i < 10 {
+        let mut d: u32 = 0;
+        while d < 8000000 { d += 1; }
+        let sts = regs.r16(0x103);
+        if sts & 0x0004 != 0 {
+            n += 1;
+            regs.w16(0x103, 0x0004); // w1c BCIS
+        }
+        serial::puts("[HDA] M9a5 t=");
+        serial::put_hexn(i as u64, 1);
+        serial::puts(" sts=");
+        serial::put_hexn(sts as u64, 4);
+        serial::puts(" lpib=");
+        serial::put_hexn(((regs.r16(0x104) as u64) | ((regs.r16(0x106) as u64) << 16)), 8);
+        unsafe {
+            serial::puts(" buf=");
+            serial::put_hexn(BEEP_BUF[0] as u64, 2);
+            serial::put_hexn(BEEP_BUF[96000] as u64, 2);
+        }
+        serial::puts("\n");
+        i += 1;
+    }
+    serial::puts("[HDA] M9a5 BCIS count=");
+    serial::put_hexn(n as u64, 2);
+    serial::puts("\n");
 }
