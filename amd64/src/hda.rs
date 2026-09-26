@@ -203,6 +203,7 @@ struct CorbRing([u32; 256]);
 static mut CORB_RING: CorbRing = CorbRing([0; 256]);
 struct RirbRing([u64; 256]);
 static mut RIRB_RING: RirbRing = RirbRing([0; 256]);
+static mut RPOS: usize = 0;
 
 fn codec_link_init(regs: &mut MmioRegs) {
     unsafe {
@@ -254,17 +255,24 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
         let np = (wp % 255) + 1;
         corb.add(np).write_volatile(verb);
         regs.w16(0x48, np as u16);
-        let start = regs.r16(0x58) & 0x00ff;
-        let mut n = 0;
+        let mut n = 0u32;
         loop {
-            let rwp = regs.r16(0x58) & 0x00ff;
-            if rwp != start {
-                let rp = (start as usize % 255) + 1;
-                let resp = rirb.add(rp).read_volatile();
-                return Some(resp as u32);
+            let rwp = (regs.r16(0x58) & 0x00ff) as usize;
+            if rwp != RPOS {
+                let mut k = 0usize;
+                while k < 4 {
+                    let e = rirb.add(k).read_volatile();
+                    let hi = (e >> 32) as u32;
+                    if (hi & 0x0000_0001) != 0 && ((hi >> 26) & 0x0000_0003) == 0 {
+                        regs.w16(0x5D, 0x0001);
+                        return Some(e as u32);
+                    }
+                    k += 1;
+                }
+                RPOS = rwp;
             }
             n += 1;
-            if n > 2_000_000 {
+            if n > 50_000_000 {
                 return None;
             }
         }
