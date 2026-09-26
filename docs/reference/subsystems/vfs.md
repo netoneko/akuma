@@ -250,7 +250,7 @@ umount2".
 | `/proc/<pid>/cmdline` | argv |
 | `/proc/<pid>/fd/` | fd listing + `/proc/<pid>/fd/<n>` symlinks |
 | `/proc/self/…` | resolves to the calling process's pid (see below) |
-| `/proc/cores` | static single-row table (`0 online bsp`) |
+| `/proc/cores` | one `N online bsp\|ap` row per core the kernel brought up — was a static `0 online bsp` until 2026-09-26, and amd64 additionally never forwarded `akuma-vfs-glue/smp-shared`, so its `/proc/stat` had one `cpu0` row on a four-core box |
 | `/proc/boxes` | box listing |
 | `/proc/mounts` | the caller's mount set (its namespace if boxed, the global table on the host) — `crate::vfs::render_mounts`, added 2026-08-24 |
 | `/proc/filesystems` | supported fstypes, one per line: `ext2`/`proc`/`tmpfs`, plus `overlay` under `sc-containers` — added 2026-08-24 |
@@ -264,7 +264,13 @@ umount2".
 real**, off the same per-thread microsecond counter the custom `/bin/top`
 binary's CORE column already reads via `sys_get_cpu_stats`
 (`akuma_exec::threading::get_thread_cpu_time`; bucketed by core in `proc.rs`'s
-`cpu_time_snapshot`). There is no user/kernel-time split tracked, so all busy
+`cpu_time_snapshot`). The bucketing key is `LAST_CORE`, which **every switch
+path must stamp**: AArch64's `commit_switch` always did, but amd64's x86 arm
+(`x86_yield_now`) did not until 2026-09-26, and every `cpuN` row there read 0
+busy. The row count is `active_core_count`, which needs `kernel_smp_shared` on
+this crate. A kernel that forgets to forward `akuma-vfs-glue/smp-shared` (amd64
+did, until the same date) gets a single `cpu0` row with no build error
+(`archive/AMD64_PROC_REPORTS_ONE_CORE.md`). There is no user/kernel-time split tracked, so all busy
 time lands in `utime`/the `user` field; `idle` is derived as
 `wall_time_per_core - busy_time`, which is enough for busybox `top`'s %CPU
 (computed from two reads' deltas) to move correctly. Before 2026-08-25 neither

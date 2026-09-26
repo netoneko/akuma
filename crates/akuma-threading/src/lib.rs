@@ -3548,6 +3548,14 @@ fn x86_yield_now() -> bool {
         }
         pool.slots[next].start_time_us = now;
     }
+    // And the other half of `commit_switch`'s bookkeeping: which core `next`
+    // is about to run on. Without it every slot stayed at the 0xFF "never
+    // scheduled" sentinel, so `/proc/stat`'s per-core bucketing
+    // (`akuma-vfs-glue`'s `cpu_time_snapshot`) billed nothing to any `cpuN`
+    // row and `top`'s CORE column had nothing to show. `current_core_id` is
+    // amd64's `PerCpu::index` (0 = BSP), the same index `LAST_CORE` uses on
+    // AArch64 — not a LAPIC id.
+    LAST_CORE[next].store(bkl::current_core_id() as u8, Ordering::Relaxed);
 
     // Only demote a thread that is actually running. A WAITING or TERMINATED
     // one keeps its state — that is the whole reason it is being switched out.
