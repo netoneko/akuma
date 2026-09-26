@@ -412,7 +412,6 @@ fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
     unsafe {
         regs.w16(0x60, (verb & 0xffff) as u16); regs.w16(0x62, (verb >> 16) as u16);
         regs.w16(0x68, 1); // IRS=1 trigger, hw clears when done
-        regs.w16(0x68, 1);
         let mut n = 0u32;
         while n < 5_000_000 {
             let irs = regs.r16(0x68);
