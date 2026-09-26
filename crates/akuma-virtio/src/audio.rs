@@ -233,6 +233,7 @@ mod imp {
 
     /// True once a sound device has been found and initialized.
     pub fn is_available() -> bool {
+    if crate::audio::hda_backend::up() { return true; }
         SOUND_DEVICE.lock().is_some()
     }
 
@@ -280,6 +281,7 @@ mod imp {
 
     /// Play (blocking) a buffer of PCM frames matching the current params.
     pub fn play(frames: &[u8]) -> Result<usize, AudioError> {
+    if crate::audio::hda_backend::up() { return Ok(crate::audio::hda_backend::play(frames)); }
         let guard = SOUND_DEVICE.lock();
         let dev = guard.as_ref().ok_or(AudioError::NotInitialized)?;
         dev.play(frames)
@@ -307,6 +309,7 @@ mod imp {
     }
     #[must_use]
     pub fn is_available() -> bool {
+    if crate::audio::hda_backend::up() { return true; }
         false
     }
     pub fn set_format_oss(_fmt: i32) -> Result<(), AudioError> {
@@ -319,9 +322,48 @@ mod imp {
         Err(AudioError::NotInitialized)
     }
     pub fn play(_frames: &[u8]) -> Result<usize, AudioError> {
+    if crate::audio::hda_backend::up() { return Ok(crate::audio::hda_backend::play(_frames)); }
         Err(AudioError::NotInitialized)
     }
     pub fn stop() {}
 }
 
 pub use imp::{init, is_available, play, set_channels, set_format_oss, set_rate, stop};
+
+// --- HDA backend registry (meow): bin registers fn ptrs at boot; facade fns
+// dispatch here first so /dev/dsp works on bare metal (no virtio-sound).
+pub mod hda_backend {
+    pub type WriteFn = unsafe extern "Rust" fn(*const u8, usize) -> usize;
+    pub type StopFn = unsafe extern "Rust" fn();
+    static mut UP: bool = false;
+    static mut WRITE: Option<WriteFn> = None;
+    static mut STOP: Option<StopFn> = None;
+    #[allow(static_mut_refs)]
+    pub fn register(w: WriteFn, s: StopFn) {
+        unsafe {
+            WRITE = Some(w);
+            STOP = Some(s);
+            UP = true;
+        }
+    }
+    pub fn up() -> bool {
+        unsafe { *core::ptr::addr_of!(UP) }
+    }
+    pub fn play(buf: &[u8]) -> usize {
+        unsafe {
+            let p = core::ptr::addr_of!(WRITE);
+            match *p {
+                Some(f) => f(buf.as_ptr(), buf.len()),
+                None => 0,
+            }
+        }
+    }
+    pub fn stop() {
+        unsafe {
+            let p = core::ptr::addr_of!(STOP);
+            if let Some(f) = *p {
+                f();
+            }
+        }
+    }
+}

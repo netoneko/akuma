@@ -727,3 +727,11 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
         n
     }
 }
+
+// --- /dev/dsp backend trampolines (meow): registered into akuma_virtio::audio
+pub unsafe extern "Rust" fn hda_dsp_tramp_write(p: *const u8, n: usize) -> usize {
+    hda_dsp_write(core::slice::from_raw_parts(p, n))
+}
+pub unsafe extern "Rust" fn hda_dsp_tramp_stop() {
+    hda_dsp_tramp_stop();
+}
