@@ -609,6 +609,8 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x11e, 0);
         let lp0 = regs.r16(0x104);
         regs.w16(0x100, 2); // RUN=bit1
+        regs.w16(0x112, 0x0011); // M9a4: FMT 48k/16-bit/stereo
+        serial::puts("[HDA] M9a4 lvi@10C="); serial::put_hexn(regs.r16(0x10C) as u64, 4); serial::puts(" fifow@10E="); serial::put_hexn(regs.r16(0x10E) as u64, 4); serial::puts(" fmt@112="); serial::put_hexn(regs.r16(0x112) as u64, 4); serial::puts("\n");
         serial::puts("[HDA] SD0 dump: ctl=0x");
         serial::put_hexn(regs.r16(0x100) as u64, 4);
         serial::puts(" sts=0x");
@@ -630,6 +632,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         serial::put_hexn(lp1 as u64, 4);
         serial::puts("\n");
         if lp1 != lp0 { serial::puts("[HDA] M9: DMA ALIVE - stream running\n"); }
-        else { serial::puts("[HDA] M9: LPIB frozen\n"); }
+        else { serial::puts("[HDA] M9a4 sts-after="); serial::put_hexn(regs.r16(0x102) as u64, 4); serial::puts("\n");
+        serial::puts("[HDA] M9: LPIB frozen\n"); }
     }
 }
