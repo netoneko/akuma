@@ -674,12 +674,16 @@ fn m9a5_bcis(regs: &mut MmioRegs) {
 // Global MMIO base captured by init()/m9_beep(); a small config record for
 // the glue layer to read; and dsp_write(): blocking single-buffer playback.
 #[allow(dead_code)]
+#[allow(dead_code)]
 pub static mut HDA_BASE: usize = 0;
+#[allow(dead_code)]
 #[allow(dead_code)]
 pub struct DspInfo { pub rate: u32, pub channels: u16, pub fmt: u16 }
 #[allow(dead_code)]
+#[allow(dead_code)]
 pub static mut HDA_DSP: DspInfo = DspInfo { rate: 48000, channels: 2, fmt: 0x0011 };
 
+#[allow(dead_code)]
 #[allow(dead_code)]
 pub fn hda_dsp_available() -> bool {
     unsafe { HDA_BASE != 0 }
@@ -687,6 +691,7 @@ pub fn hda_dsp_available() -> bool {
 
 // Configure stream format (rate only matters to userspace here; the codec
 // was already programmed to 48k/16/2 by the beep bring-up).
+#[allow(dead_code)]
 #[allow(dead_code)]
 pub fn hda_dsp_set_rate(rate: u32) { unsafe { HDA_DSP.rate = rate; } }
 
