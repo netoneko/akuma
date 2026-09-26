@@ -282,14 +282,14 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
 /// First conversation with codec 0: vendor ID (0xF00) + root node count (0xF04).
 fn codec_probe(regs: &mut MmioRegs) {
     codec_link_init(regs);
-    match codec_send(regs, 0x000F_0000) {
+    match codec_send_ici(regs, 0x000F_0000) {
         Some(v) => {
             serial::puts("[HDA] codec0 vendor=0x");
             serial::put_hexn(u64::from(v), 8);
         }
         None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
     }
-    match codec_send(regs, 0x000F_0400) {
+    match codec_send_ici(regs, 0x000F_0400) {
         Some(v) => {
             serial::puts(" nodes=0x");
             serial::put_hexn(u64::from(v), 8);
@@ -399,5 +399,34 @@ fn codec_ring_dump(regs: &mut MmioRegs) {
         }
         serial::put_hexn(regs.r16(0x58) as u64, 4);
         serial::puts("\n");
+    }
+}
+
+/// M7i: ICI-backed command path — the immediate command interface answers
+/// synchronously on this silicon (two independent 10ec0662 confirmations),
+/// while emulated RIRB delivery latency exceeds every poll budget tried
+/// (2M, 50M). CORB/RIRB engine stays for the production DMA pass; verbs
+/// route through ICI until then. Layout: ICW 0x60, IRR 0x64, IRS 0x68
+/// (bit0 BUSY, bit1 VALID).
+fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
+    unsafe {
+        regs.w16(0x60, (verb & 0xffff) as u16); regs.w16(0x62, (verb >> 16) as u16);
+        let mut n = 0u32;
+        while n < 5_000_000 {
+            let irs = regs.r16(0x68);
+            if irs & 0x0001 == 0 {
+                if irs & 0x0002 != 0 {
+                    let resp = (regs.r16(0x64) as u32) | ((regs.r16(0x66) as u32) << 16);
+                    serial::puts("[HDA] ici resp: ");
+                    serial::put_hexn(resp as u64, 8);
+                    serial::puts("\n");
+                    return Some(resp);
+                }
+                return None;
+            }
+            n += 1;
+        }
+        serial::puts("[HDA] ici busy timeout\n");
+        None
     }
 }
