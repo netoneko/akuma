@@ -239,6 +239,7 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_SETFMT`: set sample format from an AFMT_* code.
     pub fn set_format_oss(fmt: i32) -> Result<(), AudioError> {
+        if crate::audio::hda_backend::up() && (fmt == 16 || fmt == 8) { return Ok(()); }
         if crate::audio::hda_backend::up() { return if fmt == AFMT_S16_LE { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         let format = match fmt {
             AFMT_S16_LE => PcmFormat::S16,
@@ -253,6 +254,7 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_CHANNELS`: set channel count.
     pub fn set_channels(channels: i32) -> Result<(), AudioError> {
+        if crate::audio::hda_backend::up() && (1..=2).contains(&channels) { return Ok(()); }
         if crate::audio::hda_backend::up() { return if (1..=2).contains(&channels) { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         if !(1..=8).contains(&channels) {
             return Err(AudioError::InvalidParam);
@@ -265,6 +267,7 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_SPEED`: set sample rate in Hz.
     pub fn set_rate(rate_hz: i32) -> Result<(), AudioError> {
+        if crate::audio::hda_backend::up() && (rate_hz == 44100 || rate_hz == 48000) { return Ok(()); }
         if crate::audio::hda_backend::up() { return if rate_hz == 44100 || rate_hz == 48000 { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         let rate = match rate_hz {
             8000 => PcmRate::Rate8000,
