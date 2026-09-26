@@ -464,6 +464,7 @@ fn codec_scan_widgets(regs: &mut MmioRegs) {
         nid += 1;
     }
     serial::puts("[HDA] M8 scan done\n");
+    unsafe { codec_raw_scan(regs); }
         m8_raw_scan(regs);
 }
 
@@ -522,6 +523,38 @@ fn m8_raw_scan(regs: &mut MmioRegs) {
             None => serial::puts("none"),
         }
         serial::puts("\n");
+        nid += 1;
+    }
+    serial::puts("[HDA] M8b raw scan done\n");
+}
+// M8b: raw scan, no filter - print every nid response to find what the emulator actually implements
+unsafe fn codec_raw_scan(regs: &mut MmioRegs) {
+    serial::puts("[HDA] M8b raw scan nid 1..0x20: caps(0xF0C)= type(0xF08)= cfg(0xF1C)=\n");
+    let mut nid = 1usize;
+    while nid <= 0x20 {
+        let verb = 0x000F_0C00 | ((nid as u32) << 20);
+        match codec_read_ici(regs, verb) {
+            Some(v) => {
+                serial::puts("    nid ");
+                serial::put_hexn(nid as u64, 2);
+                serial::puts(": caps=");
+                serial::put_hexn(v as u64, 8);
+                let vt = 0x000F_0800 | ((nid as u32) << 20);
+                let t = codec_read_ici(regs, vt).unwrap_or(0xDEAD_BEEF);
+                serial::puts(" type=");
+                serial::put_hexn(t as u64, 8);
+                let vc = 0x000F_1C00 | ((nid as u32) << 20);
+                let c = codec_read_ici(regs, vc).unwrap_or(0xDEAD_BEEF);
+                serial::puts(" cfg=");
+                serial::put_hexn(c as u64, 8);
+                serial::puts("\n");
+            }
+            None => {
+                serial::puts("    nid ");
+                serial::put_hexn(nid as u64, 2);
+                serial::puts(": None\n");
+            }
+        }
         nid += 1;
     }
     serial::puts("[HDA] M8b raw scan done\n");
