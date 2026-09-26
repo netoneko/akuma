@@ -297,6 +297,7 @@ fn codec_probe(regs: &mut MmioRegs) {
         None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
     }
         codec_ici_probe(regs, 0x000F0000);
+        hda_scan2(regs);
         codec_ici_probe(regs, 0x000F0400);
         codec_scan_widgets(regs); // M7m: node-count via proven fn - emulator verb-coverage test
         codec_ring_dump(regs);
@@ -480,4 +481,22 @@ fn codec_read_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
         n += 1;
     }
     None
+}
+fn hda_scan2(regs: &mut MmioRegs) {
+    serial::puts("[HDA] M8raw: pin caps 0xF0C raw, nid 2..0x20\n");
+    let mut nid = 2u32;
+    while nid <= 0x20 {
+        let verb = (nid << 20) | 0x000F_0C00;
+        let r = codec_read_ici(regs, verb);
+        serial::puts("[HDA] M8raw nid=");
+        serial::put_hexn(nid as u64, 2);
+        serial::puts(" resp=");
+        match r {
+            Some(v) => serial::put_hexn(v as u64, 8),
+            None => serial::puts("none"),
+        }
+        serial::puts("\n");
+        nid += 1;
+    }
+    serial::puts("[HDA] M8raw done\n");
 }
