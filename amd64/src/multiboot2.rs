@@ -377,6 +377,9 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // device bring-up on this path: a miss prints one line and boots on.
     crate::hda::init();
         unsafe { akuma_virtio::audio::hda_backend::register(crate::hda::hda_dsp_tramp_write, crate::hda::hda_dsp_tramp_stop); } // M9b: /dev/dsp backend
+        crate::serial::puts("[HDA] dsp backend registered up=");
+        crate::serial::put_hexn(akuma_virtio::audio::hda_backend::up() as u64, 1);
+        crate::serial::puts("\n");
 
     // The root filesystem. With `root=/dev/sda1` on the command line, bring up
     // the xHCI + USB mass-storage stack and mount the persistent partition; on
