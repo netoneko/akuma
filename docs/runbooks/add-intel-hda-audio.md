@@ -360,3 +360,7 @@ Next steps (in order):
 Final acceptance on bare metal: `wavplay bootstrap/music/tokyo_rider_enter_omegashima.wav` → "playing (44100 Hz, 2 ch, 24-bit) / done / exit=0". Full chain proven on the real ALC662: PCI discovery (8086:8c20) → controller reset (CRST is software-driven, §4.3) → codec command path (ICI + CORB/RIRB both round-trip) → SD0 DMA (BCIS 10/10 ticks, LPIB unimplemented on this silicon) → /dev/dsp char device (open + full OSS ioctl negotiation) → audio through the jack.
 
 Last three bugs (all in commit 8cc9c5c3): /dev/dsp write path read HDA_BASE that was never captured (stored at m9_beep now); tramp_stop recursed infinitely on close (the box hangs root kept seeing); wavplay hardcoded the aarch64 ioctl syscall number (29) instead of x86_64's 16 — arch-split via cfg.
+
+## M9-blocking: real-time playback (final, 2026-09-27)
+
+Paced blocking writes on kernel 6060962e: 24->16-bit conversion + tsc-based real-time pacing (88200 B/s stereo). Full song (9MB, ~9 min) played end-to-end on metal; wavplay blocks while playing, exits "done". All boxes green: OSS negotiation, /dev/dsp write path, DMA ring re-arm per chunk.
