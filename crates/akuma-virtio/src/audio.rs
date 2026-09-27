@@ -321,12 +321,15 @@ mod imp {
         false
     }
     pub fn set_format_oss(_fmt: i32) -> Result<(), AudioError> {
+        if crate::audio::hda_backend::up() && (_fmt == 0x10 || _fmt == 8 || _fmt == 0x10000 || _fmt == 0x8000) { return Ok(()); }
         Err(AudioError::NotInitialized)
     }
     pub fn set_channels(_channels: i32) -> Result<(), AudioError> {
+        if crate::audio::hda_backend::up() && (1..=2).contains(&_channels) { return Ok(()); }
         Err(AudioError::NotInitialized)
     }
     pub fn set_rate(_rate_hz: i32) -> Result<(), AudioError> {
+        if crate::audio::hda_backend::up() && (_rate_hz == 44100 || _rate_hz == 48000) { return Ok(()); }
         Err(AudioError::NotInitialized)
     }
     pub fn play(_frames: &[u8]) -> Result<usize, AudioError> {
