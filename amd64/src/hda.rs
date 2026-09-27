@@ -569,6 +569,7 @@ struct BeepBdl([u64; 4]); // 2 BDL entries x 16 bytes; only entry 0 used
 static mut BEEP_BDL: BeepBdl = BeepBdl([0; 4]);
 
 pub fn m9_beep(regs: &mut MmioRegs) {
+    unsafe { HDA_BASE = regs.base as usize; } // capture base for /dev/dsp backend
     unsafe {
         // 440Hz square, 48k frames/s stereo; half-period in frames
         let half = 54444u32 / 440; // ~123 frames? no: 48000/440/2 = 54
@@ -733,5 +734,5 @@ pub unsafe extern "Rust" fn hda_dsp_tramp_write(p: *const u8, n: usize) -> usize
     hda_dsp_write(core::slice::from_raw_parts(p, n))
 }
 pub unsafe extern "Rust" fn hda_dsp_tramp_stop() {
-    hda_dsp_tramp_stop();
+    unsafe { if HDA_BASE != 0 { MmioRegs { base: HDA_BASE as *mut u8 }.w16(0x100, 0); } } // RUN off (was: infinite recursion!)
 }

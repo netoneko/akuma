@@ -17,6 +17,9 @@
 use libakuma::{arg, argc, close, exit, open, print, read_fd, syscall, write_fd};
 
 // ---- syscall / ioctl constants (mirror src/audio.rs) -----------------------
+#[cfg(target_arch = "x86_64")]
+const IOCTL: u64 = 16;
+#[cfg(target_arch = "aarch64")]
 const IOCTL: u64 = 29;
 const O_RDONLY: u32 = 0;
 const SNDCTL_DSP_SPEED: u32 = 0xC004_5002;
