@@ -699,35 +699,6 @@ pub fn hda_dsp_set_rate(rate: u32) { unsafe { HDA_DSP.rate = rate; } }
 // Blocking write: copy into BEEP_BUF (64KiB), arm BDL entry 0 (len = n,
 // IOC on last), ensure RUN, wait for BCIS, w1c. Buffer larger than 64KiB
 // is truncated by the caller (fd layer re-chunks into periods).
-#[allow(dead_code)]
-pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
-    let n = if data.len() > 192000 { 192000 } else { data.len() };
-    if n == 0 { return 0; }
-    unsafe {
-        let b = HDA_BASE;
-        if b == 0 { return 0; }
-        let mut i = 0usize;
-        while i < n { BEEP_BUF[i] = data[i]; i += 1; }
-        // stop stream while re-arming
-        let mut ctl = MmioRegs { base: b as *mut u8 };
-        ctl.w16(0x100, 0); // RUN off
-        let pa = (&raw const BEEP_BUF) as *const u8 as usize;
-        let ph = akuma_primitives::addr::virt_to_phys(pa);
-        BEEP_BDL.0[0] = ph as u64;
-        BEEP_BDL.0[1] = ((n as u64) << 32) | 1; // IOC=1, len=n
-        ctl.w16(0x118, (ph & 0xffff) as u16); ctl.w16(0x11A, ((ph >> 16) & 0xffff) as u16); // BDL base lo/hi
-        ctl.w16(0x10E, 0); // LVI=0 -> one entry
-        ctl.w16(0x103, 4); // w1c BCIS
-        ctl.w16(0x100, 2); // RUN
-        let mut spins = 0u32;
-        while spins < 200_000_000 {
-            let sts = ctl.r16(0x103);
-            if sts & 4 != 0 { ctl.w16(0x103, 4); break; }
-            spins += 1;
-        }
-        n
-    }
-}
 
 // --- /dev/dsp backend trampolines (meow): registered into akuma_virtio::audio
 pub unsafe extern "Rust" fn hda_dsp_tramp_write(p: *const u8, n: usize) -> usize {
@@ -735,4 +706,62 @@ pub unsafe extern "Rust" fn hda_dsp_tramp_write(p: *const u8, n: usize) -> usize
 }
 pub unsafe extern "Rust" fn hda_dsp_tramp_stop() {
     unsafe { if HDA_BASE != 0 { MmioRegs { base: HDA_BASE as *mut u8 }.w16(0x100, 0); } } // RUN off (was: infinite recursion!)
+}
+#[allow(dead_code)]
+pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
+    // M9-blocking: pace playback at real time. data is 24-bit stereo PCM
+    // (44100 Hz, 3-byte LE samples from the WAV) -> convert to 16-bit and
+    // chunk it into the 192000-byte ring, waiting real microseconds between
+    // chunks so the file plays at true duration.
+    unsafe {
+        let b = HDA_BASE;
+        if b == 0 { return 0; }
+        let mut ctl = MmioRegs { base: b as *mut u8 };
+        // 16-bit stereo @44100Hz: 88200 bytes/s. Chunk = full ring.
+        const CHUNK: usize = 192000; // bytes per DMA round (even)
+        const RATE: u64 = 88200;     // bytes per second
+        let mut off = 0usize;
+        let t0 = crate::lapic::tsc_uptime_us().unwrap_or(0);
+        let mut played_us: u64 = 0;
+        while off < data.len() {
+            let src = &data[off..];
+            // convert 24-bit LE -> 16-bit LE into BEEP_BUF
+            let mut o = 0usize;
+            let mut i = 0usize;
+            while i + 3 <= src.len() && o + 2 <= CHUNK {
+                let s24 = (src[i] as u32) | ((src[i+1] as u32) << 8) | ((src[i+2] as u32) << 16);
+                // sign-extend 24 -> 32 then take top 16 (simple, quiet-ish but valid)
+                let s32 = ((s24 << 8) as i32) >> 16;
+                BEEP_BUF[o] = (s32 & 0xff) as u8;
+                BEEP_BUF[o+1] = ((s32 >> 8) & 0xff) as u8;
+                o += 2; i += 3;
+            }
+            let n = o;
+            if n == 0 { break; }
+            // (re)arm single-entry BDL
+            ctl.w16(0x100, 0); // RUN off
+            let pa = (&raw const BEEP_BUF) as *const u8 as usize;
+            let ph = akuma_primitives::addr::virt_to_phys(pa);
+            BEEP_BDL.0[0] = ph as u64;
+            BEEP_BDL.0[1] = ((n as u64) << 32) | 1; // len=n, IOC=1
+            ctl.w16(0x118, (ph & 0xffff) as u16);
+            ctl.w16(0x11A, ((ph >> 16) & 0xffff) as u16);
+            ctl.w16(0x10E, 0);   // LVI=0: one entry
+            ctl.w16(0x103, 4);   // w1c BCIS
+            ctl.w16(0x100, 2);   // RUN
+            // wait real time for this chunk: n bytes at RATE bytes/s
+            let want_us = (n as u64) * 1_000_000 / RATE;
+            let target = t0 + played_us + want_us;
+            loop {
+                let now = crate::lapic::tsc_uptime_us().unwrap_or(target);
+                if now >= target { break; }
+                let sts = ctl.r16(0x103);
+                if sts & 4 != 0 { ctl.w16(0x103, 4); }
+            }
+            played_us += want_us;
+            off += i; // consumed i source bytes (24-bit)
+        }
+        ctl.w16(0x100, 0); // RUN off at end
+        data.len()
+    }
 }
