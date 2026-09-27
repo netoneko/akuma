@@ -354,3 +354,9 @@ Next steps (in order):
 **Emulator findings:** answers every verb instantly; vendor-ID implemented, node-count (0xF04) and widget reads return 0 — M8 raw scan maps full verb coverage. Single-byte reads at odd offsets return 0xff (unaligned MMIO trap); aligned reads honest.
 
 **Pending:** M8 widget enumeration (raw scan in flight) → M9 /dev/dsp + wavplay (root's headphones test; fixtures at bootstrap/music/ + /bin/wavplay, never committed per root block 29409).
+
+## Status: M9 COMPLETE — wavplay passes end-to-end (2026-09-27)
+
+Final acceptance on bare metal: `wavplay bootstrap/music/tokyo_rider_enter_omegashima.wav` → "playing (44100 Hz, 2 ch, 24-bit) / done / exit=0". Full chain proven on the real ALC662: PCI discovery (8086:8c20) → controller reset (CRST is software-driven, §4.3) → codec command path (ICI + CORB/RIRB both round-trip) → SD0 DMA (BCIS 10/10 ticks, LPIB unimplemented on this silicon) → /dev/dsp char device (open + full OSS ioctl negotiation) → audio through the jack.
+
+Last three bugs (all in commit 8cc9c5c3): /dev/dsp write path read HDA_BASE that was never captured (stored at m9_beep now); tramp_stop recursed infinitely on close (the box hangs root kept seeing); wavplay hardcoded the aarch64 ioctl syscall number (29) instead of x86_64's 16 — arch-split via cfg.
