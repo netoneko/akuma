@@ -384,3 +384,12 @@ re-config in hda_dsp_write) still shows GET_STREAM=0x0000 and GET_AMP
 out=0x80 (muted) in the same boot log — that path re-mutes/re-unbinds;
 next step is to make it re-bind (0x02270610) and re-unmute after the FMT
 switch, then re-run wavplay.
+  ceb6a3a3: verb nibble-layout fix — nid belongs in bits 27:20; old words hit
+  phantom widgets 0x22/0x23 (and the GET_AMP "check" re-read a muted
+  phantom DAC). DAC out-amp now truly unmuted with gain 0x3B. Metal:
+  48k/16 and full 3.4-min 44.1k/24 track play end-to-end, readbacks
+  unmuted. NOTE: headphones still silent at Kirill's end as of this
+  commit — DMA+codec chain now provably clean (bind=0x0010, amp unmuted,
+  pin 0xc3, stream runs to completion); next suspect is the DAC->pin
+  audio selector/mixer routing (ALC662 nid 0x0C mixer + connect-sel on
+  0x14/0x1b) and the L/R amp index split, then physical jack choice.
