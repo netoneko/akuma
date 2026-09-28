@@ -596,14 +596,14 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         // amp payload had the MUTE bit set: codec sat factory-muted with
         // stream tag 0, i.e. guaranteed silence on real silicon.
         codec_send_ici(regs, 0x02202011); // SET_CONV_FMT nid2: 48k/16/stereo
-        codec_send_ici(regs, 0x00270610); // SET_CONV_STREAM nid2: stream=1 ch=0
+        codec_send_ici(regs, 0x02270610); // SET_CONV_STREAM nid2: stream=1 ch=0 (nid was 0!)
         codec_send_ici(regs, 0x0230b000); // SET_AMP nid2 out: L+R unmute, gain 0
         codec_send_ici(regs, 0x023b7000); // SET_AMP nid1b in: L+R unmute, gain 0
         codec_send_ici(regs, 0x01b707c3); // SET_PIN_WIDGET_CTRL nid1b: HP-drive+EAPD
         // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
-        let ga = codec_send_ici(regs, 0x002b0100); // GET_AMP nid2 out (unmuted gain0 => bit7=0)
+        let ga = codec_send_ici(regs, 0x022b0100); // GET_AMP nid2 out (was nid0!)
         serial::puts("[HDA] M9c GET_AMP nid2 out=0x"); serial::put_hexn(ga.unwrap_or(0) as u64, 2); serial::puts("\n");
-        let gs = codec_send_ici(regs, 0x00270600); // GET_CONV_STREAM nid2 (expect 0x10)
+        let gs = codec_send_ici(regs, 0x022f0600); // GET_CONV_STREAM nid2 (was nid0!)
         serial::puts("[HDA] M9c GET_STREAM nid2=0x"); serial::put_hexn(gs.unwrap_or(0) as u64, 4); serial::puts("\n");
         let gp = codec_send_ici(regs, 0x01bf0700); // GET_PIN_CTRL nid1b (expect 0xc3)
         serial::puts("[HDA] M9c GET_PINCTRL nid1b=0x"); serial::put_hexn(gp.unwrap_or(0) as u64, 2); serial::puts("\n");
@@ -617,17 +617,17 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         regs.w16(0x102, 0x2000); // SRST=1 (bit13 high half)
         for _ in 0..1000 { core::hint::spin_loop(); }
         regs.w16(0x102, 0x0010); // STRM=1 (bits 23:20 high half), SRST=0
-        // CBL = 176400 = 1s @ 44.1k/16/stereo (32-bit @0x108) via two halfwords
-        regs.w16(0x108, 0xb000);
+        // CBL = 192000 = BDL entry len (was 176400, mismatch → DESE)
+        regs.w16(0x108, 0xee00);
         regs.w16(0x10a, 0x0002);
-        regs.w16(0x10c, 0x0000); // LVI = entries-1 = 0
+        regs.w16(0x110, 0x0000); // LVI = entries-1 = 0 (0x10C was CBL hi!)
         regs.w16(0x118, (bdl_phys & 0xffff) as u16);
         regs.w16(0x11a, ((bdl_phys >> 16) & 0xffff) as u16);
         regs.w16(0x11c, ((bdl_phys >> 32) & 0xffff) as u16);
         regs.w16(0x11e, 0);
         let lp0 = regs.r16(0x104);
-        regs.w16(0x112, 0x4011); // M9c: FMT 44.1k/16-bit/stereo
-        regs.w16(0x100, 2); // RUN=bit1 (after FMT, spec order)
+        regs.w16(0x114, 0x4011); // SDFMT @0x114: 44.1k/16-bit/stereo (0x112 = RO FIFOW!)
+        regs.w16(0x100, 0x12); // CTL: STRM=1 (bits7:4) | RUN (was 2 = stream 0!)
         serial::puts("[HDA] M9a4 lvi@10C="); serial::put_hexn(regs.r16(0x10C) as u64, 4); serial::puts(" fifow@10E="); serial::put_hexn(regs.r16(0x10E) as u64, 4); serial::puts(" fmt@112="); serial::put_hexn(regs.r16(0x112) as u64, 4); serial::puts("\n");
         serial::puts("[HDA] SD0 dump: ctl=0x");
         serial::put_hexn(regs.r16(0x100) as u64, 4);
@@ -636,7 +636,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         serial::puts(" cbl=0x");
         serial::put_hexn((regs.r16(0x108) as u64) | ((regs.r16(0x10A) as u64) << 16), 8);
         serial::puts(" lvi=0x");
-        serial::put_hexn(regs.r16(0x10E) as u64, 4);
+        serial::put_hexn(regs.r16(0x110) as u64, 4);
         serial::puts(" bdl=0x");
         serial::put_hexn((regs.r16(0x118) as u64) | ((regs.r16(0x11A) as u64) << 16), 8);
         serial::puts(" lpib=0x");
@@ -735,7 +735,8 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
         // M9c: re-point codec+SD0 at 44.1k (m9_beep left the 48k pair).
         ctl.w16(0x100, 0); // RUN off while changing FMT
         codec_send_ici(&mut ctl, 0x02204011); // SET_CONV_FMT nid2: 44.1k/16/stereo
-        ctl.w16(0x112, 0x4011); // SD0 FMT: 44.1k/16-bit/stereo
+        ctl.w16(0x114, 0x4011); // SDFMT @0x114: 44.1k/16-bit/stereo (0x112 = RO FIFOW!)
+        ctl.w16(0x100, 0x12); // STRM=1 (bits 7:4) | RUN (plain 2 = untagged!)
         // 16-bit stereo @44100Hz: 88200 bytes/s. Chunk = full ring.
         const CHUNK: usize = 192000; // bytes per DMA round (even)
         const RATE: u64 = 176400; // 24-bit source bytes/s (out is 16-bit)     // bytes per second
@@ -765,11 +766,11 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
             BEEP_BDL.0[1] = n as u64; // same encoding as the working beep: len in low dword
             ctl.w16(0x118, (ph & 0xffff) as u16);
             ctl.w16(0x11A, ((ph >> 16) & 0xffff) as u16);
-            ctl.w16(0x10E, 0);   // LVI=0: one entry
-            ctl.w16(0x108, (n & 0xffff) as u16); // M9c: CBL = this chunk's bytes
+            ctl.w16(0x110, 0);   // LVI=0: one entry (0x10E was RO FIFOW hi!)
+            ctl.w16(0x108, (n & 0xffff) as u16); // CBL = this chunk's bytes
             ctl.w16(0x10A, (n >> 16) as u16);
             ctl.w16(0x103, 4);   // w1c BCIS
-            ctl.w16(0x100, 2);   // RUN
+            ctl.w16(0x100, 0x12); // STRM=1 | RUN
             // wait real time for this chunk: n bytes at RATE bytes/s
             let want_us = (n as u64) * 1_000_000 / RATE;
             let target = t0 + played_us + want_us;
