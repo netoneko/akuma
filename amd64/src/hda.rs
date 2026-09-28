@@ -735,6 +735,7 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
         // M9c: re-point codec+SD0 at 44.1k (m9_beep left the 48k pair).
         ctl.w16(0x100, 0); // RUN off while changing FMT
         codec_send_ici(&mut ctl, 0x02204011); // SET_CONV_FMT nid2: 44.1k/16/stereo
+        codec_send_ici(&mut ctl, 0x02270610); // re-bind stream 1 after FMT switch
         ctl.w16(0x114, 0x4011); // SDFMT @0x114: 44.1k/16-bit/stereo (0x112 = RO FIFOW!)
         ctl.w16(0x100, 0x12); // STRM=1 (bits 7:4) | RUN (plain 2 = untagged!)
         // 16-bit stereo @44100Hz: 88200 bytes/s. Chunk = full ring.
@@ -771,6 +772,7 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
             ctl.w16(0x10A, (n >> 16) as u16);
             ctl.w16(0x103, 4);   // w1c BCIS
             ctl.w16(0x100, 0x12); // STRM=1 | RUN
+            codec_send_ici(&mut ctl, 0x02270610); // keep converter bound (RUN cycling can drop it)
             // wait real time for this chunk: n bytes at RATE bytes/s
             let want_us = (n as u64) * 1_000_000 / RATE;
             let target = t0 + played_us + want_us;
