@@ -140,6 +140,22 @@ The experiment that would settle it is repeated `amd64_fc_build_matrix.py` runs
 looking for a rare guest failure. Note it needs the **Ubuntu** personality, which
 is behind physical access to the GRUB menu now (see §6.1).
 
+> **Added 2026-09-29 — a second guest host, not a metal result.** The Ubuntu
+> personality turned out not to be needed: the same experiment ran on the
+> **Ryzen 7 8845HS**'s Firecracker (16 hardware threads, otherwise idle, so the
+> guest's four vCPUs can genuinely run at the same instant — the property this
+> section blames for the metal's rate). Current kernel (`0e331f5`), 4 vCPU,
+> **21 fresh-boot `-j 4` runs, 21 PASS** (11 at 4 GiB, 10 at 6 GiB with the whole
+> `target/` wiped), 1m 26s–1m 31s each, no `[Fault]`, no SIGSEGV. That is a guest on KVM and this section's metal
+> numbers stand unchanged; what it does is make "the guest only passes because
+> its vCPUs are time-sliced" less likely, since these were not. It does not make
+> it false — different CPU, virtio-blk instead of USB, 4–6 GiB instead of 16, and
+> runs 2–11 rebuilt 79 of the graph's 95 `Compiling` units (`kbuild -c` leaves
+> host units; the ten 6 GiB runs wipe everything and rebuild all 95).
+> Details, caveats and the rig:
+> [`../runbooks/selfhost-kernel-build-amd64.md`](../runbooks/selfhost-kernel-build-amd64.md)
+> § "Second rig: ryzen".
+
 **There is no `[Fault]` line, and that is expected, not evidence of health.**
 `amd64/src/idt.rs:990` hands a ring-3 fault to `deliver_fault_signal` *before*
 reaching `user_fault`, and Rust's std installs a `SIGSEGV` handler for
