@@ -597,17 +597,17 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         // stream tag 0, i.e. guaranteed silence on real silicon.
         codec_send_ici(regs, 0x02202011); // SET_CONV_FMT nid2: 48k/16/stereo
         codec_send_ici(regs, 0x02270610); // SET_CONV_STREAM nid2: stream=1 ch=0 (nid was 0!)
-        codec_send_ici(regs, 0x0230b000); // SET_AMP nid2 out: L+R unmute, gain 0
-        codec_send_ici(regs, 0x023b7000); // SET_AMP nid1b in: L+R unmute, gain 0
+        // Amp verbs: V=0xB, payload = (in?0x4000)|(L?0x2000)|(R?0x1000)|(idx<<8)|(mute0x80|gain).
+        // DAC nid 0x02 out-amp: unmute L+R, gain 0x3B (~ -1.5dB, ALC662 max is 0x3F=0dB… (873 chars in all)
         codec_send_ici(regs, 0x01b707c3); // SET_PIN_WIDGET_CTRL nid1b: HP-drive+EAPD
         // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
-        let ga = codec_send_ici(regs, 0x022b0100); // GET_AMP nid2 out (was nid0!)
+        let ga = codec_send_ici(regs, 0x002b0100); // GET_AMP nid2 out
         serial::puts("[HDA] M9c GET_AMP nid2 out=0x"); serial::put_hexn(ga.unwrap_or(0) as u64, 2); serial::puts("\n");
-        let gs = codec_send_ici(regs, 0x022f0600); // GET_CONV_STREAM nid2 (was nid0!)
+        let gs = codec_send_ici(regs, 0x002f0600); // GET_CONV_STREAM nid2
         serial::puts("[HDA] M9c GET_STREAM nid2=0x"); serial::put_hexn(gs.unwrap_or(0) as u64, 4); serial::puts("\n");
         let gp = codec_send_ici(regs, 0x01bf0700); // GET_PIN_CTRL nid1b (expect 0xc3)
         serial::puts("[HDA] M9c GET_PINCTRL nid1b=0x"); serial::put_hexn(gp.unwrap_or(0) as u64, 2); serial::puts("\n");
-        let gi = codec_send_ici(regs, 0x023bb000); // GET_AMP nid1b in
+        let gi = codec_send_ici(regs, 0x01b3b000); // GET_AMP nid1b out (V=0xB nid1b)
         serial::puts("[HDA] M9c GET_AMP nid1b in=0x"); serial::put_hexn(gi.unwrap_or(0) as u64, 2); serial::puts("\n");
         let gc = codec_send_ici(regs, 0x01bf50c0); // GET_CFG_DEFAULT nid1b (jack presence!)
         serial::puts("[HDA] M9c GET_CFG nid1b=0x"); serial::put_hexn(gc.unwrap_or(0) as u64, 8); serial::puts("\n");
