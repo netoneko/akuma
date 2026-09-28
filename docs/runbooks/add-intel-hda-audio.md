@@ -364,3 +364,23 @@ Last three bugs (all in commit 8cc9c5c3): /dev/dsp write path read HDA_BASE that
 ## M9-blocking: real-time playback (final, 2026-09-27)
 
 Paced blocking writes on kernel 6060962e: 24->16-bit conversion + tsc-based real-time pacing (88200 B/s stereo). Full song (9MB, ~9 min) played end-to-end on metal; wavplay blocks while playing, exits "done". All boxes green: OSS negotiation, /dev/dsp write path, DMA ring re-arm per chunk.
+
+## M10 (2026-09-28, meow): 44.1k music silence — five bugs fixed, DAC bind proven
+
+Metal forensics on hda-capture.log after M9c found /dev/dsp music was
+silent while the 48k beep path worked. Fixed in 80e1381e:
+
+1. SET_CONV_STREAM verb carried nid 0 (root) — converter never bound to
+   stream 1. Now nid 2 (0x02270610). GET readbacks (amp/stream) same fix;
+   the old "GET_STREAM" verb 0x706 was actually SET-stream-0 (unbind).
+2. SD FMT written to RO FIFOW @0x112; real SDFMT is @0x114.
+3. CBL programmed 176400 vs BDL entry 192000 -> DESE, DMA abort. Now 192000.
+4. LVI written @0x10C (CBL high half); real LVI is @0x110.
+5. RUN written as plain 2, no STRM tag in CTL bits 7:4 (now 0x12).
+
+Verified on metal: boot log now shows GET_STREAM nid2=0x0010 after beep
+init (bound) and BCIS ticks advance. Open: the second M9c cluster (44.1k
+re-config in hda_dsp_write) still shows GET_STREAM=0x0000 and GET_AMP
+out=0x80 (muted) in the same boot log — that path re-mutes/re-unbinds;
+next step is to make it re-bind (0x02270610) and re-unmute after the FMT
+switch, then re-run wavplay.
