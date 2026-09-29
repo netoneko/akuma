@@ -611,12 +611,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         let gp = codec_send_ici(regs, 0x01bf0700); // GET_PIN_CTRL nid1b (expect 0xc3)
         serial::puts("[HDA] M9c GET_PINCTRL nid1b=0x"); serial::put_hexn(gp.unwrap_or(0) as u64, 2); serial::puts("\n");
         let gi = codec_send_ici(regs, 0x01b3b000); // GET_AMP nid1b out (V=0xB nid1b)
-        serial::puts("[HDA] M9c GET_AMP nid1b out=0x"); serial::put_hexn(gi.unwrap_or(0) as u64, 2); serial::puts("\n");
-        // Pin output amp exists but reads unpowered: SET_AMP nid1b out —
-        // payload 0x8000 = output-amp bit, 0x3000 = L+R, mute=0, gain 0x3B.
-        codec_send_ici(regs, 0x01b3b03b);
-        let gi2 = codec_send_ici(regs, 0x01b3b000); // re-read: expect 0x3B
-        serial::puts("[HDA] M9c GET_AMP nid1b out2=0x"); serial::put_hexn(gi2.unwrap_or(0) as u64, 2); serial::puts("\n");
+        serial::puts("[HDA] M9c GET_AMP nid1b in=0x"); serial::put_hexn(gi.unwrap_or(0) as u64, 2); serial::puts("\n");
         let gc = codec_send_ici(regs, 0x01bf50c0); // GET_CFG_DEFAULT nid1b (jack presence!)
         serial::puts("[HDA] M9c GET_CFG nid1b=0x"); serial::put_hexn(gc.unwrap_or(0) as u64, 8); serial::puts("\n");
         let gx = codec_send_ici(regs, 0x01bf0c00); // GET_CONNECT_SEL nid1b: which mixer input feeds the pin
@@ -745,8 +740,7 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
         // M9c: re-point codec+SD0 at 44.1k (m9_beep left the 48k pair).
         ctl.w16(0x100, 0); // RUN off while changing FMT
         codec_send_ici(&mut ctl, 0x02204011); // SET_CONV_FMT nid2: 44.1k/16/stereo
-        codec_send_ici(&mut ctl, 0x00270610); // re-bind stream 1 after FMT switch (canonical nid 0x02!)
-        codec_send_ici(&mut ctl, 0x023b013b); // re-unmute+gain DAC out-amp (0x706-adjacent SET_AMP path)
+        codec_send_ici(&mut ctl, 0x02270610); // re-bind stream 1 after FMT switch
         ctl.w16(0x114, 0x4011); // SDFMT @0x114: 44.1k/16-bit/stereo (0x112 = RO FIFOW!)
         ctl.w16(0x100, 0x12); // STRM=1 (bits 7:4) | RUN (plain 2 = untagged!)
         // 16-bit stereo @44100Hz: 88200 bytes/s. Chunk = full ring.
@@ -783,7 +777,7 @@ pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
             ctl.w16(0x10A, (n >> 16) as u16);
             ctl.w16(0x103, 4);   // w1c BCIS
             ctl.w16(0x100, 0x12); // STRM=1 | RUN
-            codec_send_ici(&mut ctl, 0x00270610); // keep converter bound (RUN cycling can drop it)
+            codec_send_ici(&mut ctl, 0x02270610); // keep converter bound (RUN cycling can drop it)
             // wait real time for this chunk: n bytes at RATE bytes/s
             let want_us = (n as u64) * 1_000_000 / RATE;
             let target = t0 + played_us + want_us;
