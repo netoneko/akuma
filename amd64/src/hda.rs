@@ -41,6 +41,18 @@ impl RegsW16 for MmioRegs {
         unsafe { (self.base.add(offset) as *mut u32).write_volatile(value) }
     }
 }
+
+impl MmioRegs {
+    fn w32(&self, offset: usize, value: u32) {
+        // SAFETY: BAR0 mapping as above; CORBLBASE/UBASE, RIRBLBASE/UBASE.
+        unsafe { (self.base.add(offset) as *mut u32).write_volatile(value) }
+    }
+    #[allow(dead_code)] // debug: read back 32-bit registers
+    fn r32(&self, offset: usize) -> u32 {
+        // SAFETY: BAR0 mapping as above.
+        unsafe { (self.base.add(offset) as *const u32).read_volatile() }
+    }
+}
 /// Whether discovery found and decoded the controller (M2's suite hook).
 #[allow(dead_code)] // wired into the boot suite with the next milestone
 pub fn discovered() -> bool {
@@ -221,18 +233,12 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x4A, 0x0000); // CORBRP: clear
         regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries (spec: program size before RUN)
         regs.w16(0x48, 0x0000); // CORBWP = 0
-        regs.w16(0x40, (cb & 0xffff) as u16);
-        regs.w16(0x42, (cb >> 16) as u16);
-        regs.w32(0x44, 0x00000000); // CORBUBASE: full 32-bit write (16-bit halves don't stick!)
-        regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries
-        regs.w16(0x58, 0x8000); // RIRBWP: reset
-        regs.w16(0x58, 0x0000);
-        regs.w16(0x50, (rb & 0xffff) as u16);
-        regs.w16(0x52, (rb >> 16) as u16);
-        regs.w32(0x54, 0x00000000); // RIRBUBASE: full 32-bit write
+        regs.w32(0x40, cb); // CORBLBASE(+UBASE) as one 32-bit write - 16-bit half-writes don't stick on the upper half
+        regs.w32(0x50, rb); // RIRBLBASE(+UBASE) likewise
         regs.w16(0x5A, 0x0001); // RINTCNT = 1
         regs.w16(0x5E, 0x0002); // RIRBSIZE: 256 entries
-        regs.w16(0x5C, 0x0003); // RIRBCTL: RIRBDMAEN(bit0) + RINTCTL(bit1); 0x0002 alone left DMA off - no response could ever land
+        regs.w16(0x5A, 0x00FF); // RINTCNT: accept up to 255 responses before IRQ-gated stall
+        regs.w16(0x5C, 0x0003); // RIRBCTL: IRQ_EN(bit0) + DMA_EN(bit1) per intel-hda-defs.h
         regs.w16(0x4C, 0x0002); // CORBCTL: RUN (bit1); bit0 is CORBRPRST pointer-reset - that bug held CORB in reset
         serial::puts("[HDA] postinit corbsize=");
         serial::put_hexn(regs.r16(0x4E) as u64, 4);
@@ -259,48 +265,50 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
     unsafe {
         let corb = (&raw mut CORB_RING.0).cast::<u32>();
         let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
-        // The RIRB read pointer is bytes 0-1 of the 4-byte RIRBWP; we track
-        // how many entries we've consumed (incl. unsolicited) in RPOS.
-        let old_rp = RPOS;
+        let old_rp = (regs.r16(0x58) & 0x00ff) as usize; // RIRBWP = hw write pos (QEMU: read-only WP, write wmask=RST only)
         let wp = (regs.r16(0x48) & 0x00ff) as usize;
         let np = (wp % 255) + 1;
         corb.add(np).write_volatile(verb);
-        regs.w16(0x48, np as u16); // publish; controller bumps CORBRP and DMAs the verb
-        let mut dbg = 0u32;
-        let _ = &mut dbg;
+        regs.w16(0x48, np as u16); // publish; controller bumps CORBRP, DMAs verb, fills RIRB
         let mut n = 0u32;
         loop {
-            let rwp = (regs.r16(0x58) & 0x00ff) as usize; // RIRBWP: hw write pos
+            let rwp = (regs.r16(0x58) & 0x00ff) as usize;
             if rwp != old_rp {
                 // consume every new entry in order; ours is the last one
                 let mut k = (old_rp + 1) % 256;
+                let mut resp: Option<u32> = None;
                 loop {
                     let e = rirb.add(k).read_volatile();
-                    let resp = e as u32;
                     let ex = (e >> 32) as u32;
                     let cad = (ex >> 28) & 0x0f; // EX dword bits [31:28] (was [3:0] - wrong!)
                     let unsol = (ex >> 4) & 0x01; // EX bit [4]: unsolicited response
+                    if k == rwp {
+                        // entry the HW WP points at: ours if CAd matches and not unsolicited
+                        if unsol == 0 && cad == (verb >> 28) & 0x0f {
+                            resp = Some(e as u32);
+                        }
+                        break;
+                    }
                     if unsol == 1 {
-                        // stray/unsolicited entry: skip it, it is NOT our answer
-                        // (this off-by-one zeroed every readback after the first!)
-                        if k == rwp { RPOS = rwp; return None; }
+                        // stray/unsolicited entry before WP: skip, it is NOT our answer
                         k = (k + 1) % 256;
                         continue;
                     }
-                    if k == rwp && cad == (verb >> 28) & 0x0f {
-                        RPOS = rwp;
-                        return Some(resp);
-                    }
-                    if k == rwp {
-                        // reached hw WP without a matching CAd - treat as no answer
-                        RPOS = rwp;
-                        return None;
+                    if cad == (verb >> 28) & 0x0f {
+                        resp = Some(e as u32);
+                        break;
                     }
                     k = (k + 1) % 256;
                 }
+                // consumer handshake: w1c RINTFL (QEMU: intel_hda_set_rirb_sts
+                // resets rirb_count and resumes CORB). Real hardware advances
+                // RIRBWP itself here; QEMU masks writes to the RST bit only.
+                regs.w16(0x5d, 0x0001);
+                RPOS = rwp;
+                return resp;
             }
             n += 1;
-            if n > 50_000_000 {
+            if n > 2_000_000 {
                 return None;
             }
         }
@@ -322,6 +330,14 @@ fn codec_probe(regs: &mut MmioRegs) {
             }
         }
         None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
+    }
+    unsafe {
+        let corb = (&raw mut CORB_RING.0).cast::<u32>();
+        let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
+        serial::puts(" corb[1]=0x");
+        serial::put_hexn(corb.add(1).read_volatile() as u64, 8);
+        serial::puts(" rirb[1]=0x");
+        serial::put_hexn(rirb.add(1).read_volatile(), 16);
     }
     match codec_send(regs, 0x000F_0400) {
         Some(v) => {
