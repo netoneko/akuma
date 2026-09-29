@@ -615,7 +615,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         let gc = codec_send_ici(regs, 0x01bf50c0); // GET_CFG_DEFAULT nid1b (jack presence!)
         serial::puts("[HDA] M9c GET_CFG nid1b=0x"); serial::put_hexn(gc.unwrap_or(0) as u64, 8); serial::puts("\n");
         let gx = codec_send_ici(regs, 0x01bf0c00); // GET_CONNECT_SEL nid1b: which mixer input feeds the pin
-        serial::puts("[HDA] M9c GET_CONNSE… (289 chars in all)
+        serial::puts("[HDA] M9c GET_CONNSEL nid1b=0x"); serial::put_hexn(gx.unwrap_or(0) as u64, 2); serial::puts("\n");
         serial::puts("[HDA] M9: verbs sent, SD0 setup\n");
         // SDI0 @0x100: stop+reset stream first
         regs.w16(0x100, 0);
