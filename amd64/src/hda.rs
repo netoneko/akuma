@@ -598,11 +598,13 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         codec_send_ici(regs, 0x02202011); // SET_CONV_FMT nid2: 48k/16/stereo
         codec_send_ici(regs, 0x02270610); // SET_CONV_STREAM nid2: stream=1 ch=0 (nid was 0!)
         // Amp verbs: V=0xB, payload = (in?0x4000)|(L?0x2000)|(R?0x1000)|(idx<<8)|(mute0x80|gain).
-        // DAC nid 0x02 out-amp: unmute L+R, gain 0x3B (~ -1.5dB, ALC662 max is 0x3F=0dB… (873 chars in all)
-        // Jack detection says the plug is in nid 0x1b (cfg 0221401f: HP-out,
-        // 3.5mm, present) — but the DAC's hardwired route on ALC662 is
-        // DAC 0x02 -> mixer 0x0c -> 0x14 (line-out). Nid 0x1b hangs off mixer
-        // 0x0e (INPUT2 path) … (905 chars in all)
+        // alsa-info ground truth: DAC 0x02 amp nsteps=0x57, Ubuntu audible at 0x38;
+        // gain 0 on any amp = MAX attenuation (silent). Mixer 0x0c input amp feeds
+        // HP pin 0x1b at connection index 0 (conn list 0x0c* 0x0d 0x0e).
+        codec_send_ici(regs, 0x0023b138); // SET_AMP nid2 out: L+R unmute, gain 0x38 (Ubuntu level)
+        codec_send_ici(regs, 0x00c3b138); // SET_AMP nid0c in(idx0): L+R unmute, gain 0x38 (mixer stage)
+        // Jack detection: plug is in nid 0x1b (cfg 0221401f: HP-out, 3.5mm, present).
+        // (alsa-info: 0x1b actually hangs off mixer 0x0c, conn idx 0 - the old 0x0e route was wrong).
         // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
         let ga = codec_send_ici(regs, 0x002b0100); // GET_AMP nid2 out
         serial::puts("[HDA] M9c GET_AMP nid2 out=0x"); serial::put_hexn(ga.unwrap_or(0) as u64, 2); serial::puts("\n");
