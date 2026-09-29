@@ -635,6 +635,7 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         let gs2 = codec_send_ici(regs, 0x002f0600); // re-GET stream tag AFTER SD0 setup (proves bind stuck)
         serial::puts("[HDA] M9c GET_STREAM nid2 late=0x"); serial::put_hexn(gs2.unwrap_or(0) as u64, 4); serial::puts("\n");
         // Jack detection: plug is in nid 0x1b (cfg 0221401f: HP-out, 3.5mm, present).
+        codec_send_ici(regs, 0x01b701c3); // SET_PIN_VREF nid1b: 0xc3 = OUT-enable | HP-drive | VREF50 (alsa-info parity)
         // (alsa-info: 0x1b actually hangs off mixer 0x0c, conn idx 0 - the old 0x0e route was wrong).
         // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
         let ga = codec_send_ici(regs, 0x002b0100); // GET_AMP nid2 out
