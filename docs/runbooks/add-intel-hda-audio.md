@@ -408,3 +408,7 @@ switch, then re-run wavplay.
   (bound), GET_PINCTRL nid1b=0xc0, GET_AMP nid2 out=0x00 (unmuted), pin amp
   ampless by design (0x00). tokyo_rider (204.6s) plays end-to-end, 3m03 wall.
 - Open: audible check pending (root); next lever if silent: SET_PIN_VREF 0x1b.
+- VREF build (8d295eb3): SET_PIN_VREF 0x1b = 0xc3 (OUT|HP-drive|VREF50) added per
+  alsa-info; tokyo_rider plays 3m04 wall; both sine and track run with verified
+  codec state. Audible verdict from root pending; next lead after that: widget
+  power-state D0 on the 0x20/0x0c/0x0b cluster.
