@@ -50,6 +50,9 @@ pub trait Regs16 {
 pub trait RegsW16: Regs16 {
     /// Write the 16-bit register at byte `offset`.
     fn w16(&self, offset: usize, value: u16);
+    /// Write a 32-bit register (CORBUBASE/RIRBUBASE need this: the
+    /// controller ignores 16-bit half-writes to the upper-base regs).
+    fn w32(&self, offset: usize, value: u32);
 }
 
 /// GCAP, decoded. Field order in raw (bit 0 first): 64OK, NS, BSS, ISS,

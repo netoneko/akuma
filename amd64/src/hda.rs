@@ -37,6 +37,9 @@ impl RegsW16 for MmioRegs {
         // SAFETY: BAR0 mapping as above; the reset path writes GCTL only.
         unsafe { (self.base.add(offset) as *mut u16).write_volatile(value) }
     }
+    fn w32(&self, offset: usize, value: u32) {
+        unsafe { (self.base.add(offset) as *mut u32).write_volatile(value) }
+    }
 }
 /// Whether discovery found and decoded the controller (M2's suite hook).
 #[allow(dead_code)] // wired into the boot suite with the next milestone
@@ -220,13 +223,13 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x48, 0x0000); // CORBWP = 0
         regs.w16(0x40, (cb & 0xffff) as u16);
         regs.w16(0x42, (cb >> 16) as u16);
-        regs.w16(0x44, 0x0000); // upper base = 0 (<4GB)
+        regs.w32(0x44, 0x00000000); // CORBUBASE: full 32-bit write (16-bit halves don't stick!)
         regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries
         regs.w16(0x58, 0x8000); // RIRBWP: reset
         regs.w16(0x58, 0x0000);
         regs.w16(0x50, (rb & 0xffff) as u16);
         regs.w16(0x52, (rb >> 16) as u16);
-        regs.w16(0x54, 0x0000);
+        regs.w32(0x54, 0x00000000); // RIRBUBASE: full 32-bit write
         regs.w16(0x5A, 0x0001); // RINTCNT = 1
         regs.w16(0x5E, 0x0002); // RIRBSIZE: 256 entries
         regs.w16(0x5C, 0x0003); // RIRBCTL: RIRBDMAEN(bit0) + RINTCTL(bit1); 0x0002 alone left DMA off - no response could ever land
