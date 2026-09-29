@@ -393,3 +393,18 @@ switch, then re-run wavplay.
   pin 0xc3, stream runs to completion); next suspect is the DAC->pin
   audio selector/mixer routing (ALC662 nid 0x0C mixer + connect-sel on
   0x14/0x1b) and the L/R amp index split, then physical jack choice.
+
+## M11 - CORB/RIRB brought up, true readbacks on metal (2026-09-29)
+- ICI (immediate) interface is unreliable on 8c20: SET verbs silently dropped,
+  GETs return stale/zero. All codec I/O now goes through CORB/RIRB.
+- Fixes in this milestone (cats/meow/amd64-audio @ b9c34703):
+  - RIRBCTL must set bit0 (RIRBDMAEN); CORBCTL RPRST is active-high reset.
+  - Ring bases need full 32-bit writes; 16-bit halves to UBASE never stick.
+  - RIRBWP must be snapshotted BEFORE publishing the CORB verb.
+  - EX dword CAd lives in bits [31:28] (not [3:0]); skip UR-flagged entries
+    (unsolicited) or every later readback is off-by-one zeros.
+  - RINTCNT=0xff + w1c RINTFL handshake per send (tama, QEMU-verified).
+- Verified metal readbacks: GET_CONV_FMT nid2=0x0031, GET_STREAM nid2=0x0010
+  (bound), GET_PINCTRL nid1b=0xc0, GET_AMP nid2 out=0x00 (unmuted), pin amp
+  ampless by design (0x00). tokyo_rider (204.6s) plays end-to-end, 3m03 wall.
+- Open: audible check pending (root); next lever if silent: SET_PIN_VREF 0x1b.
