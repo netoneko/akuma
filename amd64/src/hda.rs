@@ -621,6 +621,15 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         // alsa-info ground truth: DAC 0x02 amp nsteps=0x57, Ubuntu audible at 0x38;
         // gain 0 on any amp = MAX attenuation (silent). Mixer 0x0c input amp feeds
         // HP pin 0x1b at connection index 0 (conn list 0x0c* 0x0d 0x0e).
+        // Power-state: force D0 on AFG + the playback widgets (GET/SET_POWER verb 0xF05/0x705).
+        let pw = codec_send_ici(regs, 0x00ff0500); // GET_POWER nid1 (AFG)
+        serial::puts("[HDA] M9c GET_POWER nid1=0x"); serial::put_hexn(pw.unwrap_or(0) as u64, 2); serial::puts("\n");
+        codec_send_ici(regs, 0x00170500); // SET_POWER nid1 = D0
+        codec_send_ici(regs, 0x00270500); // SET_POWER nid2 (DAC) = D0
+        codec_send_ici(regs, 0x00c70500); // SET_POWER nid0c (mixer) = D0
+        codec_send_ici(regs, 0x00b70500); // SET_POWER nid0b (mixer) = D0
+        codec_send_ici(regs, 0x01b70500); // SET_POWER nid1b (HP pin) = D0
+        codec_send_ici(regs, 0x01470500); // SET_POWER nid14 (spk pin) = D0
         codec_send_ici(regs, 0x0023b138); // SET_AMP nid2 out: L+R unmute, gain 0x38 (Ubuntu level)
         codec_send_ici(regs, 0x00c3b138); // SET_AMP nid0c in(idx0): L+R unmute, gain 0x38 (mixer stage)
         // Pin ctrl: OUT+HP enable (0xC0) | VREF 0x3 → 0xC3, plus EAPD BTLR=0x3
