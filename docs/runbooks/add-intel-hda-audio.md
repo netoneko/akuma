@@ -412,3 +412,8 @@ switch, then re-run wavplay.
   alsa-info; tokyo_rider plays 3m04 wall; both sine and track run with verified
   codec state. Audible verdict from root pending; next lead after that: widget
   power-state D0 on the 0x20/0x0c/0x0b cluster.
+- D0 build (7ead2fdb): explicit SET_POWER D0 on AFG(0x01), DAC(0x02), mixers
+  (0x0b/0x0c), pins (0x14/0x1b) before amp/pin verbs; GET_POWER nid1 reads D0
+  at boot on 8c20. Playback verified end-to-end again. Both formats complete.
+  Two listening windows run; root verdict pending (may be host-side output
+  device). tama's QEMU audible run will cross-check the same code path.
