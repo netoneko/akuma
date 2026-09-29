@@ -610,6 +610,10 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         codec_send_ici(regs, 0x014707c3); // SET_PIN_CTRL nid14: 0xC3 (line-out companion)
         codec_send_ici(regs, 0x01b70c03); // SET_EAPD nid1b: BTLR=0x3
         codec_send_ici(regs, 0x01470c03); // SET_EAPD nid14: BTLR=0x3
+        let gf = codec_send_ici(regs, 0x002a0000); // GET_CONV_FMT nid2 (12-bit verb 0xA)
+        serial::puts("[HDA] M9c GET_CONV_FMT nid2=0x"); serial::put_hexn(gf.unwrap_or(0) as u64, 4); serial::puts("\n");
+        let gs2 = codec_send_ici(regs, 0x002f0600); // re-GET stream tag AFTER SD0 setup (proves bind stuck)
+        serial::puts("[HDA] M9c GET_STREAM nid2 late=0x"); serial::put_hexn(gs2.unwrap_or(0) as u64, 4); serial::puts("\n");
         // Jack detection: plug is in nid 0x1b (cfg 0221401f: HP-out, 3.5mm, present).
         // (alsa-info: 0x1b actually hangs off mixer 0x0c, conn idx 0 - the old 0x0e route was wrong).
         // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
@@ -619,6 +623,8 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         serial::puts("[HDA] M9c GET_STREAM nid2=0x"); serial::put_hexn(gs.unwrap_or(0) as u64, 4); serial::puts("\n");
         let gp = codec_send_ici(regs, 0x01bf0700); // GET_PIN_CTRL nid1b (expect 0xc3)
         serial::puts("[HDA] M9c GET_PINCTRL nid1b=0x"); serial::put_hexn(gp.unwrap_or(0) as u64, 2); serial::puts("\n");
+        // Pin 0x1b has NO output amp (ALC662 jack pins are ampless) — readback 0x00 is
+        // correct and NOT the problem; the mute chain is DAC(0x02)+mixer(0x0c), both set.
         let gi = codec_send_ici(regs, 0x01b3b000); // GET_AMP nid1b out (V=0xB nid1b)
         serial::puts("[HDA] M9c GET_AMP nid1b out=0x"); serial::put_hexn(gi.unwrap_or(0) as u64, 2); serial::puts("\n");
         let gc = codec_send_ici(regs, 0x01bf50c0); // GET_CFG_DEFAULT nid1b (jack presence!)
