@@ -229,7 +229,7 @@ fn codec_link_init(regs: &mut MmioRegs) {
         regs.w16(0x54, 0x0000);
         regs.w16(0x5A, 0x0001); // RINTCNT = 1
         regs.w16(0x5E, 0x0002); // RIRBSIZE: 256 entries
-        regs.w16(0x5C, 0x0002); // RIRBCTL: DMA enable
+        regs.w16(0x5C, 0x0003); // RIRBCTL: RIRBDMAEN(bit0) + RINTCTL(bit1); 0x0002 alone left DMA off - no response could ever land
         regs.w16(0x4C, 0x0002); // CORBCTL: RUN (bit1); bit0 is CORBRPRST pointer-reset - that bug held CORB in reset
         serial::puts("[HDA] postinit corbsize=");
         serial::put_hexn(regs.r16(0x4E) as u64, 4);
@@ -241,6 +241,11 @@ fn codec_link_init(regs: &mut MmioRegs) {
         serial::put_hexn(regs.r16(0x5C) as u64, 4);
         serial::puts(" corbsts=");
         serial::put_hexn(regs.r16(0x4D) as u64, 4);
+        serial::puts(" corbbase=");
+        serial::put_hexn(cb as u64, 8);
+        serial::puts(" rirbbase=");
+        serial::put_hexn(rb as u64, 8);
+        serial::puts("\n");
         serial::puts("\n");
     }
     serial::puts("[HDA] CORB/RIRB enabled\n");
@@ -251,25 +256,36 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
     unsafe {
         let corb = (&raw mut CORB_RING.0).cast::<u32>();
         let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
+        // The RIRB read pointer is bytes 0-1 of the 4-byte RIRBWP; we track
+        // how many entries we've consumed (incl. unsolicited) in RPOS.
+        let old_rp = RPOS;
         let wp = (regs.r16(0x48) & 0x00ff) as usize;
         let np = (wp % 255) + 1;
         corb.add(np).write_volatile(verb);
-        regs.w16(0x48, np as u16);
+        regs.w16(0x48, np as u16); // publish; controller bumps CORBRP and DMAs the verb
+        let mut dbg = 0u32;
+        let _ = &mut dbg;
         let mut n = 0u32;
         loop {
-            let rwp = (regs.r16(0x58) & 0x00ff) as usize;
-            if rwp != RPOS {
-                let mut k = 0usize;
-                while k < 4 {
+            let rwp = (regs.r16(0x58) & 0x00ff) as usize; // RIRBWP: hw write pos
+            if rwp != old_rp {
+                // consume every new entry in order; ours is the last one
+                let mut k = (old_rp + 1) % 256;
+                loop {
                     let e = rirb.add(k).read_volatile();
-                    let hi = (e >> 32) as u32;
-                    if (hi & 0x0000_0001) != 0 && ((hi >> 26) & 0x0000_0003) == 0 {
-                        regs.w16(0x5D, 0x0001);
-                        return Some(e as u32);
+                    let resp = e as u32;
+                    let cad = ((e >> 32) & 0x0000_000f) as u32;
+                    if k == rwp && cad == (verb >> 28) & 0x0f {
+                        RPOS = rwp;
+                        return Some(resp);
                     }
-                    k += 1;
+                    if k == rwp {
+                        // reached hw WP without a matching CAd - treat as no answer
+                        RPOS = rwp;
+                        return None;
+                    }
+                    k = (k + 1) % 256;
                 }
-                RPOS = rwp;
             }
             n += 1;
             if n > 50_000_000 {
@@ -282,14 +298,20 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
 /// First conversation with codec 0: vendor ID (0xF00) + root node count (0xF04).
 fn codec_probe(regs: &mut MmioRegs) {
     codec_link_init(regs);
-    match codec_send_ici(regs, 0x000F_0000) {
+    match codec_send(regs, 0x000F_0000) {
         Some(v) => {
             serial::puts("[HDA] codec0 vendor=0x");
             serial::put_hexn(u64::from(v), 8);
+            unsafe {
+                serial::puts(" corbrp-after=0x");
+                serial::put_hexn(regs.r16(0x4A) as u64, 4);
+                serial::puts(" rirbwp-after=0x");
+                serial::put_hexn(regs.r16(0x58) as u64, 4);
+            }
         }
         None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
     }
-    match codec_send_ici(regs, 0x000F_0400) {
+    match codec_send(regs, 0x000F_0400) {
         Some(v) => {
             serial::puts(" nodes=0x");
             serial::put_hexn(u64::from(v), 8);
@@ -412,29 +434,9 @@ fn codec_ring_dump(regs: &mut MmioRegs) {
 /// route through ICI until then. Layout: ICW 0x60, IRR 0x64, IRS 0x68
 /// (bit0 BUSY, bit1 VALID).
 fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
-    unsafe {
-        regs.w16(0x60, (verb & 0xffff) as u16); regs.w16(0x62, (verb >> 16) as u16);
-        regs.w16(0x68, 1); // IRS=1 trigger, hw clears when done
-        let mut n = 0u32;
-        while n < 5_000_000 {
-            let irs = regs.r16(0x68);
-            if irs & 0x0001 == 0 {
-                if true { // IRV stale-sets between calls on this silicon; BUSY-clear is the real signal
-                    let resp = (regs.r16(0x64) as u32) | ((regs.r16(0x66) as u32) << 16);
-        regs.w16(0x68, 2); // IRV w1c after read (stale IRV poisoned call#2)
-                    serial::puts("[HDA] ici resp: ");
-                    serial::put_hexn(resp as u64, 8);
-                    serial::puts("\n");
-                    regs.w16(0x68, 2); // IRV w1c clear before next cmd
-                    return Some(resp);
-                }
-                return None;
-            }
-            n += 1;
-        }
-        serial::puts("[HDA] ici busy timeout\n");
-        None
-    }
+    // QEMU's intel-hda never executes ICI verbs (ICW ignored, IRR reads 0);
+    // real silicon does. CORB/RIRB works on both - route everything there.
+    codec_send(regs, verb)
 }
 
 // M8: brute widget/pin scan — emulator answers verbs but 0xF04 says no subnodes,
@@ -471,20 +473,7 @@ fn codec_scan_widgets(regs: &mut MmioRegs) {
 }
 
 fn codec_read_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
-    regs.w16(0x60, (verb & 0xffff) as u16);
-    regs.w16(0x62, (verb >> 16) as u16);
-    regs.w16(0x68, 1);
-    let mut n = 0u32;
-    while n < 20000000u32 {
-        let irs = regs.r16(0x68);
-        if irs & 0x0001 == 0 {
-            let lo = regs.r16(0x64) as u32;
-            let hi = regs.r16(0x66) as u32;
-            return Some((hi << 16) | lo);
-        }
-        n += 1;
-    }
-    None
+    codec_send(regs, verb)
 }
 fn hda_scan2(regs: &mut MmioRegs) {
     serial::puts("[HDA] M8raw: pin caps 0xF0C raw, nid 2..0x20\n");
