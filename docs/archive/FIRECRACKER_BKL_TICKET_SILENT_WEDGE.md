@@ -12,6 +12,17 @@ scheduler, switch path and BKL call sites differ (see §6).
 high host CPU; the wedge itself was not reproduced on demand, only caught mid-flight
 and killed.
 
+> **Update 2026-09-29 — leading hypothesis, not a resolution.** A live amd64 sighting
+> on ryzen with the same outward shape (both vCPUs pegged, console silent) was caught
+> with its RIPs: a two-core `NETWORK` ↔ `SOCKET_TABLE` deadlock, IRQs masked, no
+> diagnostic on either lock — exactly the "busy loop with no diagnostic on it" §3
+> concludes must exist. `akuma-net` is shared with this AArch64 kernel, so the same
+> inversion was live here. Nothing in *this* sighting's log distinguishes it (no RIP
+> was captured), so this stays **open** until a sighting shows it or the fix soaks.
+> See [`CONNECT_TIMEOUT_LOCK_INVERSION.md`](CONNECT_TIMEOUT_LOCK_INVERSION.md); its §8
+> also suggests the `[bkls>]` lines may be a suspend artifact, and §10 is the
+> host-side procedure that closes §4's "no debugger" gap.
+
 **One line:** both vCPUs of a Firecracker-hosted akuma kernel sat at ~91% CPU each for
 **19.5+ hours** with **zero new console output**, and the evidence rules out the
 obvious explanation (a permanent spin in the instrumented `KernelLock::acquire` wait

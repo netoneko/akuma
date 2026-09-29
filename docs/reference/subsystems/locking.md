@@ -403,6 +403,18 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   (`test_process_channel_write_bounded_backpressure`;
   [`EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`](../../../userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md)
   §7.2.)
+- **`akuma-net` lock order is `SOCKET_TABLE` → `NETWORK`, never the reverse — and
+  nothing under `NETWORK` may call into `crate::socket`.** `poll()` holds `NETWORK`
+  for its whole lap, so anything it needs from the socket table must be *collected*
+  inside and *done* after release (the `DhcpReport` and `ExpiredConnects` patterns).
+  Both are plain spinlocks that mask IRQs and have **no stuck-lock diagnostic**, so a
+  violation is not a slow path or a `[BKL] stuck` line: it is two cores silently at
+  100% with an empty console. `poll()`'s connect-timeout sweep called
+  `mark_connect_timed_out` (→ `SOCKET_TABLE`) from inside its `NETWORK` section for 40
+  days and deadlocked a Firecracker guest on resume from a host suspend. Audit method:
+  brace-match every `with_network(…)` body for a socket-table call — 63 sites, one
+  violation. Fixed 2026-09-29, not yet live-validated
+  ([`CONNECT_TIMEOUT_LOCK_INVERSION.md`](../../archive/CONNECT_TIMEOUT_LOCK_INVERSION.md)).
 
 ## Syscall → lock map
 
