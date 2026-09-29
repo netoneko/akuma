@@ -1032,12 +1032,22 @@ impl Filesystem for ProcFilesystem {
         // /proc/cores — kept for herd's benefit: it used to list per-core lifecycle state
         // under the removed one-kernel-per-core multikernel
         // (docs/archive/TRIM_FAT_MULTIKERNEL.md). Every core now runs the same shared
-        // kernel, so this is a static single-row table.
+        // kernel, so every row is `online`: one per core the kernel brought up
+        // (`active_core_count`, the same count `/proc/stat`'s `cpuN` rows use),
+        // core 0 as `bsp` and the rest `ap`. Until 2026-09-26 this was a static
+        // `0 online bsp` on every build, so a four-core box read as one.
         if path == "cores" {
             if current_box_id != 0 {
                 return Err(FsError::NotFound);
             }
-            return Ok(b"core state role\n0 online bsp\n".to_vec());
+            let cores = active_core_count();
+            let mut out = String::with_capacity(16 + 12 * cores);
+            out.push_str("core state role\n");
+            for i in 0..cores {
+                let role = if i == 0 { "bsp" } else { "ap" };
+                let _ = writeln!(out, "{i} online {role}");
+            }
+            return Ok(out.into_bytes());
         }
 
         if path == "net/tcp" {

@@ -28,7 +28,7 @@ default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd",
 # the remaining phases are deliberately NOT forwarded yet: this target's net
 # syscalls are its own `net.rs`, and each further phase needs its own audit +
 # A/B before it lands here.
-smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "no-bkl-network", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-vfs-glue/smp-shared","akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "no-bkl-network", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
 # The ext2 block cache forwarded to the aarch64 default (root Cargo.toml has
 # `fs-cache` in `default` since 2026-08-02). Without it this target runs the
 # 64-slot FIFO ring, which a single ssh session thrashes: every connection

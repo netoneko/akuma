@@ -27,6 +27,9 @@ pub fn poll() -> bool {
     // Filled inside the critical section, emitted once it has been released.
     let mut dhcp_report: Option<DhcpReport> = None;
     let mut corrupt_handles: u32 = 0;
+    // Connects past `CONNECT_TIMEOUT_US`, found inside the critical section and
+    // dealt with after it — see `expire_connects`.
+    let mut expired = ExpiredConnects::new();
     let socket_state_changed = {
         // Hold preemption disabled for the whole NETWORK critical section so the
         // spinlock is never stranded across a context switch (fatal under the
@@ -162,32 +165,19 @@ pub fn poll() -> bool {
             // is no longer shaking hands — connected, reset, or closed — so the
             // deadline never applies to an established connection. See
             // `CONNECT_TIMEOUT_US`.
-            let mut i = 0;
-            while i < net.connecting.len() {
-                let (handle, started_at) = net.connecting[i];
-                if !is_valid_handle(&net.sockets, handle) {
-                    net.connecting.swap_remove(i);
-                    continue;
-                }
-                if net.sockets.get::<tcp::Socket>(handle).state() != tcp::State::SynSent {
-                    net.connecting.swap_remove(i);
-                    continue;
-                }
-                if now_us.saturating_sub(started_at) > CONNECT_TIMEOUT_US {
-                    // `abort()` moves it to `Closed`, which surfaces to the
-                    // caller as `EPOLLHUP`. The socket is flagged first so
-                    // `SO_ERROR` can answer `ETIMEDOUT` rather than the
-                    // `ECONNREFUSED` a plain `Closed` would imply — a connect
-                    // that was never answered is not a connect that was refused,
-                    // and telling them apart is the difference between reading a
-                    // log correctly and not.
-                    crate::socket::mark_connect_timed_out(handle);
-                    net.sockets.get_mut::<tcp::Socket>(handle).abort();
-                    net.connecting.swap_remove(i);
-                    continue;
-                }
-                i += 1;
-            }
+            //
+            // This only *collects* the expired handles. Flagging the socket
+            // (`mark_connect_timed_out`) takes `SOCKET_TABLE`, and taking it here
+            // would be NETWORK -> SOCKET_TABLE — the reverse of every other path
+            // (`listener_refresh`, `socket_can_recv_tcp`, ...), an AB-BA deadlock
+            // that pegged both vCPUs of a Firecracker guest on 2026-09-29. The
+            // flag and the abort are done by `expire_connects` once NETWORK is
+            // released. `sweep_connecting` is handed `connecting` and a state
+            // probe and nothing else, so it cannot reach the socket table.
+            expired = sweep_connecting(&mut net.connecting, now_us, |h| {
+                is_valid_handle(&net.sockets, h)
+                    .then(|| net.sockets.get::<tcp::Socket>(h).state())
+            });
 
             // Publish the set size: `iface.poll()` above walks all of it, so this
             // is the scaling term behind `poll_us`.
@@ -214,6 +204,8 @@ pub fn poll() -> bool {
     // NETWORK lock is released here — safe to acquire SOCKET_TABLE.
     // Acquiring SOCKET_TABLE while holding NETWORK causes AB-BA deadlock
     // with socket_can_recv_tcp et al. which hold SOCKET_TABLE→NETWORK.
+    // The connect-timeout sweep above once did exactly that; it now defers to here.
+    expire_connects(&expired);
     //
     // The console is the same hazard and belongs in the same paragraph: printing
     // takes `CONSOLE_LOCK`, so a `log::` call inside the section above would
@@ -266,6 +258,105 @@ pub fn poll() -> bool {
     socket_state_changed
 }
 
+/// Most connect timeouts one `poll()` lap hands to [`expire_connects`]. A fixed
+/// array, not a `Vec`: this runs on every poll and must not allocate. An entry
+/// that does not fit stays in `connecting` and is picked up by the next lap, so
+/// the cap bounds the work per lap and never drops a timeout.
+const EXPIRED_CONNECTS_MAX: usize = 8;
+
+/// The `SynSent` sockets [`sweep_connecting`] found past their deadline.
+pub(crate) struct ExpiredConnects {
+    handles: [Option<SocketHandle>; EXPIRED_CONNECTS_MAX],
+    len: usize,
+}
+
+impl ExpiredConnects {
+    pub(crate) const fn new() -> Self {
+        Self { handles: [None; EXPIRED_CONNECTS_MAX], len: 0 }
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == EXPIRED_CONNECTS_MAX
+    }
+
+    fn push(&mut self, handle: SocketHandle) {
+        self.handles[self.len] = Some(handle);
+        self.len += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = SocketHandle> + '_ {
+        self.handles[..self.len].iter().flatten().copied()
+    }
+}
+
+/// Retire `connecting` entries that are no longer handshaking and collect the
+/// ones past [`CONNECT_TIMEOUT_US`].
+///
+/// Runs **inside** the `NETWORK` critical section, so it is given the list and a
+/// state probe and nothing else — no `SOCKET_TABLE`, by construction. `state_of`
+/// answers `None` for a dead handle. An entry leaves the list the moment its
+/// socket is no longer `SynSent` (connected, reset, closed), so the deadline
+/// never applies to an established connection.
+pub(crate) fn sweep_connecting(
+    connecting: &mut Vec<(SocketHandle, u64)>,
+    now_us: u64,
+    mut state_of: impl FnMut(SocketHandle) -> Option<tcp::State>,
+) -> ExpiredConnects {
+    let mut expired = ExpiredConnects::new();
+    let mut i = 0;
+    while i < connecting.len() {
+        let (handle, started_at) = connecting[i];
+        if state_of(handle) != Some(tcp::State::SynSent) {
+            connecting.swap_remove(i);
+            continue;
+        }
+        if now_us.saturating_sub(started_at) > CONNECT_TIMEOUT_US && !expired.is_full() {
+            expired.push(handle);
+            connecting.swap_remove(i);
+            continue;
+        }
+        i += 1;
+    }
+    expired
+}
+
+/// Flag each expired connect, then abort it. Called with **no** lock held.
+///
+/// The order is the point. `abort()` moves the socket to `Closed`, which a
+/// reader sees as `EPOLLHUP` and, through `SO_ERROR`, as `ECONNREFUSED` — unless
+/// the socket is already flagged, in which case it is `ETIMEDOUT`. A connect that
+/// was never answered is not one that was refused, so the flag must be visible
+/// **before** the abort: flag under `SOCKET_TABLE`, then abort under `NETWORK`,
+/// each lock taken alone. Between the two the socket is still `SynSent`, so the
+/// abort re-checks the state and a connect that completed in the gap is left
+/// alone and un-flagged.
+fn expire_connects(expired: &ExpiredConnects) {
+    if expired.len == 0 {
+        return;
+    }
+    for handle in expired.iter() {
+        crate::socket::mark_connect_timed_out(handle);
+    }
+    let aborted = with_network(|net| {
+        let mut aborted = [false; EXPIRED_CONNECTS_MAX];
+        for (k, handle) in expired.iter().enumerate() {
+            if is_valid_handle(&net.sockets, handle)
+                && net.sockets.get::<tcp::Socket>(handle).state() == tcp::State::SynSent
+            {
+                net.sockets.get_mut::<tcp::Socket>(handle).abort();
+                aborted[k] = true;
+            }
+        }
+        aborted
+    })
+    .unwrap_or([false; EXPIRED_CONNECTS_MAX]);
+    for (k, handle) in expired.iter().enumerate() {
+        if !aborted[k] {
+            crate::socket::clear_connect_timed_out(handle);
+        }
+    }
+}
+
 pub fn with_network<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut NetworkState) -> R,
@@ -279,4 +370,87 @@ where
     mark_release();
     drop(guard);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `SocketHandle`s (opaque; only a `SocketSet` mints them) paired with
+    /// the state the test wants each to report.
+    fn handles(n: usize) -> Vec<SocketHandle> {
+        let mut set = SocketSet::new(Vec::new());
+        (0..n)
+            .map(|_| {
+                let rx = tcp::SocketBuffer::new(vec![0u8; 16]);
+                let tx = tcp::SocketBuffer::new(vec![0u8; 16]);
+                set.add(tcp::Socket::new(rx, tx))
+            })
+            .collect()
+    }
+
+    const T0: u64 = 1_000;
+
+    #[test]
+    fn only_expired_synsent_entries_are_collected() {
+        let h = handles(2);
+        let mut connecting = vec![(h[0], T0), (h[1], T0 + CONNECT_TIMEOUT_US)];
+        let now = T0 + CONNECT_TIMEOUT_US + 1;
+        let e = sweep_connecting(&mut connecting, now, |_| Some(tcp::State::SynSent));
+        assert_eq!(e.iter().collect::<Vec<_>>(), vec![h[0]]);
+        // h[1] was started 1 us before `now`: still handshaking, still tracked.
+        assert_eq!(connecting, vec![(h[1], T0 + CONNECT_TIMEOUT_US)]);
+    }
+
+    #[test]
+    fn deadline_is_strictly_greater_than() {
+        let h = handles(1);
+        let mut connecting = vec![(h[0], T0)];
+        let e = sweep_connecting(&mut connecting, T0 + CONNECT_TIMEOUT_US, |_| {
+            Some(tcp::State::SynSent)
+        });
+        assert_eq!(e.len, 0);
+        assert_eq!(connecting.len(), 1);
+    }
+
+    #[test]
+    fn settled_and_dead_entries_are_retired_without_being_collected() {
+        let h = handles(3);
+        let mut connecting = vec![(h[0], T0), (h[1], T0), (h[2], T0)];
+        let e = sweep_connecting(&mut connecting, T0 + 10 * CONNECT_TIMEOUT_US, |handle| {
+            if handle == h[0] {
+                Some(tcp::State::Established)
+            } else if handle == h[1] {
+                Some(tcp::State::Closed)
+            } else {
+                None // dead handle
+            }
+        });
+        // Long past the deadline, but none is SynSent: nothing to time out.
+        assert_eq!(e.len, 0);
+        assert_eq!(connecting.len(), 0);
+    }
+
+    #[test]
+    fn overflow_stays_tracked_for_the_next_lap() {
+        let n = EXPIRED_CONNECTS_MAX + 3;
+        let h = handles(n);
+        let mut connecting: Vec<_> = h.iter().map(|&x| (x, T0)).collect();
+        let now = T0 + CONNECT_TIMEOUT_US + 1;
+
+        let first = sweep_connecting(&mut connecting, now, |_| Some(tcp::State::SynSent));
+        assert_eq!(first.len, EXPIRED_CONNECTS_MAX);
+        assert_eq!(connecting.len(), 3, "the surplus must not be dropped");
+
+        let second = sweep_connecting(&mut connecting, now, |_| Some(tcp::State::SynSent));
+        assert_eq!(second.len, 3);
+        assert_eq!(connecting.len(), 0);
+
+        // Every handle was reported exactly once across the two laps.
+        let mut seen: Vec<_> = first.iter().chain(second.iter()).collect();
+        seen.sort();
+        let mut want = h;
+        want.sort();
+        assert_eq!(seen, want);
+    }
 }

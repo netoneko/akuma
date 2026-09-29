@@ -469,16 +469,34 @@ pub fn socket_add_waker(idx: usize, waker: Waker) {
 
 /// Flag the socket owning `handle` as having timed out mid-connect.
 ///
-/// Called from `smoltcp_net::poll()`'s `SynSent` sweep just before it aborts the
-/// socket. Linear over the socket table, but only ever on the timeout path.
+/// Called from `smoltcp_net::poll()` (`expire_connects`) just before it aborts
+/// the socket. Linear over the socket table, but only ever on the timeout path.
+///
+/// Takes `SOCKET_TABLE`, so it must be called with **no** lock held — in
+/// particular not under `NETWORK`, which is the reverse of the documented
+/// SOCKET_TABLE -> NETWORK order. `poll()` used to call it from inside its
+/// `NETWORK` section and deadlocked against `listener_refresh`
+/// (`docs/archive/CONNECT_TIMEOUT_LOCK_INVERSION.md`).
 #[cfg(feature = "smoltcp")]
 pub fn mark_connect_timed_out(handle: SocketHandle) {
+    set_connect_timed_out(handle, true);
+}
+
+/// Undo [`mark_connect_timed_out`] for a connect that completed in the gap
+/// between the flag and the abort. Same locking rule: no lock held.
+#[cfg(feature = "smoltcp")]
+pub(crate) fn clear_connect_timed_out(handle: SocketHandle) {
+    set_connect_timed_out(handle, false);
+}
+
+#[cfg(feature = "smoltcp")]
+fn set_connect_timed_out(handle: SocketHandle, value: bool) {
     with_table(|table| {
         for slot in table.iter_mut().flatten() {
             if let SocketType::Stream(h) = slot.inner
                 && h == handle
             {
-                slot.connect_timed_out = true;
+                slot.connect_timed_out = value;
                 return;
             }
         }

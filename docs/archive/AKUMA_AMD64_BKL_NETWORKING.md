@@ -135,6 +135,70 @@ Interim mitigations that stay: meow's serve-as-you-wait hooks
 (syscall-context only, ≥2^20 spins) and `bkl: longest waiter spins this boot`
 suite note as the regression tripwire.
 
+## 2026-09-26: the `yield_now` dropped-window exception is removed
+
+**What changed.** `amd64/src/sched.rs`'s `yield_now()` no longer skips taking the
+BKL for a thread inside a dropped window (`akuma_bkl::bkl::in_dropped_window()`).
+Every cooperative switch now happens with the lock held again: a caller that
+does not hold it takes it for the switch and gives it back once it resumes. That
+is the same shape `block_current`/`block_until_deadline` returned to when
+release-across-park was reverted on 2026-09-20 night. The window's owner still
+resumes without the lock, because `bkl_leave` runs right after the switch.
+
+**Why.** Two amd64 bare-metal hangs on 2026-09-26 ended the same way as that
+reverted experiment:
+
+```
+[herd] Reloading config...
+[probe] t=65s ...  /  [probe] t=67s ...
+[SWITCH NO-BKL] from=4 to=2 core=2 via=yield_now
+<silence: the 2 s netpoll probe never prints again>
+```
+
+That exception made `yield_now` a second route to the lockless switch the
+revert had closed. The prev-handoff (step 1 above) makes the *stacks* safe: the
+outgoing gate stays set, so no peer resumes the same stack. It does nothing for
+the *resumed* thread. That thread was switched out holding the core's BKL, since
+every other switch-out holds it, and it carries on as if it still does. The step 2
+audit list (`publish_waiting_and_take_pending_wake`, `x86_wake_pass`, the switch's
+POOL accounting) is code written on that assumption. Which code the resumed slot 2
+was actually running is **not established**, and neither is who slot 4 was (the
+earlier sightings were netpoll; netpoll itself yields only *outside* its windows,
+so a ring-3 socket `read(2)`'s wait loop is the likelier caller).
+
+The boot suite's `debug: every context switch held the kernel lock`
+(`amd64/src/idt.rs`) asserts `switches_without_bkl() == 0` and always did. It
+passed only because nothing in the suite yields inside a dropped window. The
+`hook_switch_to` comment saying a non-zero count was "expected telemetry" was
+corrected in the same change.
+
+**The cost, stated rather than hidden: this may bring back the stalled-peer wedge
+below.** The exception was that incident's fix, and it held through the original
+trigger in one live retest. Two things weaken that record: the explanation given
+for it (below) does not hold as stated, and the retest ran **before** the
+prev-handoff landed that night, so the switch it allowed without the lock was
+the "two cores, one stack" kind at the time. Still, the retest is the only
+measurement there is. **Re-run the stalled-peer trigger** (a `read(2)` on a socket
+whose peer never answers, e.g. a `wget POST` to an endpoint that hangs) on the
+metal with this change and watch for a `[BKL] stuck: owner=N` storm with one fixed
+owner. If it comes back, the fix has to keep switches locked, and the likelier
+target is the parked-holder problem (step 2/3 above), not the yield.
+
+**Where the old explanation goes wrong.** It says that taking the lock for the
+switch "holds the lock for every thread that runs on that core in between". The
+lock does pass to whichever thread resumes on the core, but that thread gives it
+up at its own normal points (`yield_now`'s `bkl_leave`, syscall exit, idle's
+halt). The hold only goes unbounded if the resumed thread is one that keeps the
+lock for its whole sleep. That is the parked-mid-syscall holder in step 2, and
+`tag=501` (scheduler) on the storm fits it better than the yield does.
+
+Verified for this change: `cargo build -p akuma-amd64 --target
+x86_64-unknown-none --release` clean; `scripts/utils/amd64_trials.py --local-only
+--smp 4` **800 passed, 0 failed**, including `debug: every context switch held the
+kernel lock`. That lane does not exercise a yield inside a dropped window, so it
+shows nothing broke. It does not show the hang is gone: that takes the metal,
+running the ring-3 socket-read workload that was live when the photos were taken.
+
 ## 2026-09-20 (later): fix validated live; a second, separate wedge suspect
 ## opened the same day
 
@@ -206,7 +270,9 @@ counterpart and needs none" does not cover (that note is correct for the
 *syscall entry/exit* boundary; the cooperative-yield boundary is a different
 thing).
 
-**The fix** (`amd64/src/sched.rs`, `yield_now()`): added a
+**The fix** (`amd64/src/sched.rs`, `yield_now()`) — **REMOVED 2026-09-26**; it
+allowed switches without the lock, which ended in two silent hangs; see the 2026-09-26
+section above: added a
 `akuma_bkl::bkl::in_dropped_window()` check alongside the existing
 `bkl_held()` one, so a thread already inside a dropped-BKL window is left
 alone — mirroring `reconcile_for_spsr`'s `release = target_is_el0 ||

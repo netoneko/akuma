@@ -158,6 +158,89 @@ Measured 2026-09-18: generation 2 is byte-identical to generation 1
 | `[ISIG-MISS]` | a `^C` arrived and raised no signal (§16) |
 | `[BKL] stuck`, `[SWITCH BADFRAME]`, `[TRAMP-BAIL]` | none of these should appear during a build |
 
+## Second rig: ryzen (Firecracker on the Ryzen 7 8845HS) — 2026-09-29
+
+The first self-host build on the Ryzen's Firecracker, and the first time this
+gate ran anywhere but the HP box. Everything is built **on ryzen itself**: the
+source is a `git clone --depth 1 --branch even-more-cats` of the public repo,
+the toolchain comes from rustup on ryzen, and the image is made there by
+`amd64/mkdisk.sh` — nothing large crosses the wifi. Scripts and the recipe:
+[`scripts/benchmarks/ryzen_fc/`](../../scripts/benchmarks/ryzen_fc/README.md)
+(`stage1` → `stage2` → `stage3`, then `jrun`/`batch`).
+
+| | |
+|---|---|
+| guest | 4 vCPU / 4096 MiB, `init=/bin/herd`, own tap `tapsh` (host `10.0.2.2/24`, guest `10.0.2.15`), disk `/home/netoneko/akuma-selfhost/selfhost.img` (4 GiB, 1.3 GiB used) |
+| kernel it runs | built natively on ryzen from `0e331f5`; `uname` = `0e331f5-release-smp-shared`, md5 `88822d83346e…` |
+| toolchain in the guest | `nightly-x86_64-unknown-linux-musl`, `rustc 1.101.0-nightly (d080e7dff 2026-09-27)` |
+| **the live guest** | a different VM (`akuma-vm.json`, `tap0`, 2 vCPU / 2 GiB, runs kot). **Never touched** — `fcrun.sh` matches only `selfhost-vm.json` |
+
+**Result: 21 fresh-boot `-j 4` runs, 21 PASS, rc=0** (kernel `0e331f5`, 4 vCPU):
+
+| set | runs | guest RAM | clean | cargo `Finished` | `Compiling` lines |
+|---|---|---|---|---|---|
+| A | 1–11 | 4096 MiB | `kbuild -c` (run 1 on an empty `target/`) | 1m 26s – 1m 28s | 95 (run 1), 79 (2–11) |
+| B | 101–110 | 6144 MiB | **whole `/root/ktarget` wiped** (`CLEAN_ALL=1`) | ~1m 31s (host-timed 100–101 s) | 95 in all ten |
+
+(Host-timed figures are the driver's 10 s poll step.) Across all 21: **0**
+`[Fault]` lines, **0** `SIGSEGV`/`signal: 11`, **0** `[TLB] stuck`. Set B is the
+whole-graph gate; the six extra seconds against set A are the 16 host units set A
+kept.
+
+What every run also printed, so the next reader does not re-investigate it:
+
+| console line | per run | reading |
+|---|---|---|
+| `[BKL] stuck: owner=N waiter=M tag=11 …` | **exactly 27, in all 11 runs** | `tag=11` is x86_64 `munmap` (the raw number — same holder as photo 6227 in [`AMD64_THREE_CRASHES_2026-09-25`](../archive/AMD64_THREE_CRASHES_2026-09-25.md)), so a shootdown that is slow under contention but *completes*. **The constant 27 is not explained**: the reporter folds by episode (`STUCK_REPORTED`, `akuma-bkl/src/sync.rs`), it is not a hard cap I could find, and a timing-dependent count landing on one value eleven times deserves a look |
+| `[MM] fault race #1` | 1 | §14's demand-fault race, one per build, as documented |
+| `[TRAMP-MISMATCH]` | 6–9 | the stale-`thread_id` rows of `AKUMA_AMD64_NO_SLOT_RECYCLER.md`; not a defect |
+
+**What this does and does not show.**
+
+* It is a **Firecracker guest on KVM, not bare metal.** It says nothing about the
+  HP box's failing `-j4` (`AKUMA_AMD64_BARE_METAL_SELFHOST.md` §3). It does bear on
+  that section's explanation: the metal was said to lose more because a 4-core
+  box shared with Ubuntu leaves the guest's vCPUs unable to run at the same
+  instant. Ryzen has 16 hardware threads and was otherwise idle, so all four
+  vCPUs *can* run simultaneously — and 11/11 still pass. That weakens the
+  parallelism explanation a little; it does not remove it (different CPU, virtio-blk
+  rather than USB, 4 GiB of guest RAM against 16, and the 512 MiB kernel heap).
+* **Passes bound the failure rate, they do not remove it.** Zero of 21 puts the
+  95 % upper bound near 13 % per build (zero of the 10 whole-graph runs alone:
+  near 26 %) — the same trap §3 of that document records.
+* **`kbuild -c` cleans only `target/x86_64-unknown-none`.** Run 1 (empty
+  `target/`) printed 95 `Compiling` lines; runs 2–11 printed **79**, because 16
+  host-side units (proc macros, build scripts) survive under `target/release`.
+  95 `Compiling` lines *is* the whole graph — cargo's progress bar counts **137
+  units**, which includes build-script runs, and reading that 137 as a crate
+  count was this section's first mistake (corrected 2026-09-29). Runs 101+ set
+  `CLEAN_ALL=1`, which wipes the whole `/root/ktarget` first
+  (`amd64_fc_build_matrix.py --clean-all` semantics) and also prints 95.
+* Not done: a fixed-point compare (the guest's kernel was built by a newer musl
+  nightly than the gnu one that built the running kernel, so the md5s would
+  differ for a reason that is not a bug), `-j8`, and a 2 GiB guest matching the
+  live one. Set B ran at 6 GiB only because `llama-server` (7.3 GB) had been
+  stopped; that RAM is the one variable that differs from the first batch.
+
+Traps this rig cost a run each:
+
+- **`kill -9` of the previous Firecracker does not release the tap at once.**
+  Relaunching immediately fails with `Open tap device failed … Resource busy`
+  and a guest that never boots. `fcrun.sh` now waits for the process to be gone
+  and sleeps 3 s.
+- **`pkill -f 'jrun.sh 1'` in an ssh command that itself contains `./jrun.sh 1`
+  kills the ssh shell** (exit 255, nothing done). Use the `jrun.s[h]` trick or a
+  separate call.
+- **ryzen's wifi drops** (its kernel log shows `wlp2s0: Connection to AP lost`
+  repeatedly from 00:22; ~4 min unreachable, uptime unbroken, no OOM). Detached
+  runs survive it; anything tied to the ssh session does not.
+- **Memory is shared with `llama-server`** (7.3 GB resident on this host,
+  `llama-ryzen-linux-amd64.service`, the kot LLM backend). With it running, 4 GiB
+  is the ceiling for this rig; with it stopped (`systemctl stop`, done for set B)
+  6 GiB as on the HP box fits.
+- **The disk is at 96 %** (8 GB free): the image is 1.3 GiB used, the toolchain
+  946 MB in `~netoneko/.rustup`.
+
 ## Background
 
 - [`../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) — every fix and measurement behind this page.

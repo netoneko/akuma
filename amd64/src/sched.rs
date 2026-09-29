@@ -380,9 +380,14 @@ fn hook_switch_to(from: usize, to: usize) {
         // outgoing thread's `ON_CPU` gate STAYS SET through the switch
         // (prev-handoff, `x86_yield_now`), a peer's picker skips gated
         // threads, and a lockless switch is safe by the gate alone — which is
-        // what lets `block_current`/`block_until_deadline` release across the
-        // sleep. The counter stays as telemetry: a non-zero value is expected
-        // on any box where something parks, not a wedge signature.
+        // what was meant to let `block_current`/`block_until_deadline` release
+        // across the sleep. That release was reverted the same night, and
+        // `yield_now`'s dropped-window exception on 2026-09-26: both ended in
+        // this report followed by silence, because the *resumed* thread was
+        // switched out holding the core's lock and is owed it back — the gate
+        // makes the stacks safe, not the thread's assumptions. So a non-zero
+        // count is a wedge signature again, and the boot suite asserts zero
+        // (`idt.rs`, "every context switch held the kernel lock").
         if !smp::bkl_held() {
             let n = SWITCH_WITHOUT_BKL.fetch_add(1, Ordering::Relaxed);
             if n < CANARY_REPORT_LIMIT {
@@ -2116,35 +2121,26 @@ pub fn yield_now() {
     // kernel thread spinning in ring 0 is only *asked* to reschedule by the
     // tick, never forced — so refusing to switch would livelock them.
     //
-    // **Except a thread inside a deliberately-dropped-BKL window
-    // (`akuma_bkl::bkl::dropped_window_open`, e.g. a blocking network
-    // recv/send under `no-bkl-network`).** That thread does not merely
-    // "not hold the BKL right now" the way a ring-3-return caller doesn't —
-    // it has asked, by name, not to hold it until it explicitly closes the
-    // window. Taking it here anyway is the AArch64 `[BKL] stuck` regression
-    // (`docs/archive/BKL_VFS_CARVE_OUT.md` §8) reached from this target's
-    // scheduler instead of an eret epilogue: AArch64 fixed it with
-    // `reconcile_for_spsr` consulting the same ledger at the eret boundary;
-    // this target has no eret boundary to hook (`smp.rs`'s note on why
-    // `reconcile_for_spsr` "has no amd64 counterpart" is true for the
-    // syscall entry/exit boundary, but this cooperative-yield boundary is a
-    // different thing it didn't cover). Because the BKL is core-scoped and
-    // reentrant, "take it for the switch" here does not release until THIS
-    // thread is scheduled back in — and every other thread that runs on this
-    // core in between inherits the hold for free, so a wait loop that never
-    // becomes ready (a stalled HTTP read, measured live 2026-09-20: a hung
-    // `chat_once` response held `[BKL] stuck: owner=N` for 27+ seconds and
-    // starved sshd's own accept/banner to death) pins the whole core, and
-    // every peer core spinning on `bkl_enter` behind it, for as long as the
-    // condition stays false — not for one scheduling slice.
+    // **No exception for a thread inside a dropped-BKL window** (a blocking
+    // network recv/send under `no-bkl-network`), REMOVED 2026-09-26. Letting
+    // such a thread switch lockless was the same lockless switch
+    // [`block_current`] reverted on 2026-09-20, reached through this door
+    // instead: the thread it resumes was switched out holding the core's lock
+    // and carries on believing it still does. Two metal hangs ended exactly
+    // like the reverted experiment's — `[SWITCH NO-BKL] from=4 to=2 core=2
+    // via=yield_now`, then silence (the netpoll probe stopped mid-cadence).
+    // The window's owner is unaffected: `bkl_leave` below puts the lock back
+    // after the switch, so it resumes as unlocked as it asked to be. The
+    // starvation that exception was added for (a hung `chat_once` read
+    // holding `[BKL] stuck: owner=N` for 27+ s, 2026-09-20) needs a fix that
+    // does not switch without the lock.
     let held = smp::bkl_held();
-    let bkl_free_by_choice = akuma_bkl::bkl::in_dropped_window();
-    if !held && !bkl_free_by_choice {
+    if !held {
         YIELDS_THAT_TOOK_BKL.fetch_add(1, Ordering::Relaxed);
         smp::bkl_enter();
     }
     threading::yield_now();
-    if !held && !bkl_free_by_choice {
+    if !held {
         // The lock belongs to the core and travels with it across the switch,
         // so this core holds it again now whoever resumed us handed it over.
         smp::bkl_leave();
