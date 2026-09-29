@@ -603,6 +603,13 @@ pub fn m9_beep(regs: &mut MmioRegs) {
         // HP pin 0x1b at connection index 0 (conn list 0x0c* 0x0d 0x0e).
         codec_send_ici(regs, 0x0023b138); // SET_AMP nid2 out: L+R unmute, gain 0x38 (Ubuntu level)
         codec_send_ici(regs, 0x00c3b138); // SET_AMP nid0c in(idx0): L+R unmute, gain 0x38 (mixer stage)
+        // Pin ctrl: OUT+HP enable (0xC0) | VREF 0x3 → 0xC3, plus EAPD BTLR=0x3
+        // (SET_EAPD 0x70C) on both pins — ALC boards keep the jack amp
+        // tri-stated without EAPD, even when everything else reads correct.
+        codec_send_ici(regs, 0x01b707c3); // SET_PIN_CTRL nid1b: 0xC3
+        codec_send_ici(regs, 0x014707c3); // SET_PIN_CTRL nid14: 0xC3 (line-out companion)
+        codec_send_ici(regs, 0x01b70c03); // SET_EAPD nid1b: BTLR=0x3
+        codec_send_ici(regs, 0x01470c03); // SET_EAPD nid14: BTLR=0x3
         // Jack detection: plug is in nid 0x1b (cfg 0221401f: HP-out, 3.5mm, present).
         // (alsa-info: 0x1b actually hangs off mixer 0x0c, conn idx 0 - the old 0x0e route was wrong).
         // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
