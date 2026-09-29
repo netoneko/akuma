@@ -277,7 +277,16 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
                 loop {
                     let e = rirb.add(k).read_volatile();
                     let resp = e as u32;
-                    let cad = ((e >> 32) & 0x0000_000f) as u32;
+                    let ex = (e >> 32) as u32;
+                    let cad = (ex >> 28) & 0x0f; // EX dword bits [31:28] (was [3:0] - wrong!)
+                    let unsol = (ex >> 4) & 0x01; // EX bit [4]: unsolicited response
+                    if unsol == 1 {
+                        // stray/unsolicited entry: skip it, it is NOT our answer
+                        // (this off-by-one zeroed every readback after the first!)
+                        if k == rwp { RPOS = rwp; return None; }
+                        k = (k + 1) % 256;
+                        continue;
+                    }
                     if k == rwp && cad == (verb >> 28) & 0x0f {
                         RPOS = rwp;
                         return Some(resp);
