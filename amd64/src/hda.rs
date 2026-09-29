@@ -265,7 +265,10 @@ fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
     unsafe {
         let corb = (&raw mut CORB_RING.0).cast::<u32>();
         let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
-        let old_rp = (regs.r16(0x58) & 0x00ff) as usize; // RIRBWP = hw write pos (QEMU: read-only WP, write wmask=RST only)
+        // NOTE: RIRBWP read here is the WP *after the previous send* — but the
+        // controller advances WP only when IT writes the response. Snapshot the
+        // WP *before* publishing our verb (that's where the new answer will land +1).
+        let old_rp = (regs.r16(0x58) & 0x00ff) as usize;
         let wp = (regs.r16(0x48) & 0x00ff) as usize;
         let np = (wp % 255) + 1;
         corb.add(np).write_volatile(verb);
