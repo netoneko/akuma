@@ -19,7 +19,11 @@ up on its own SHA (`AKUMA_FROM_SCRATCH.md` §9.1). **On 09-25 an agent drove
 that loop**: `meow`, GLM-5.3 running under `kot` on the box, ran `kbuild`,
 `kinstall` and `reboot -f`, came back on the new kernel and promoted it to
 `.good`. The kernel was unmodified, though. No agent has yet *written* the
-change it builds.
+change it builds. **09-30: the loop stands independent of the agents.** The
+swarm's attempt at the audio driver failed, and the same box and the same loop
+(`kbuild`, `kinstall`, `reboot -f`, `git push`) carried the rewrite that
+worked; the failure was in our custom tooling, model and oversight, not in
+self-hosting (`AKUMA_AMD64_BARE_METAL_SELFHOST.md` §7).
 **2026-09-20 → 09-24** the workstation also became a **seat**: `meow`'s litter and then akuma-miot's `kot` chain ran on it, found a
 run of kernel bugs no probe had (RTL8169 receive, BKL-held parks, `EPOLLET`
 re-arm, a trap entry that never cleared `DF`, unreapable orphans), and on 09-24
@@ -2500,13 +2504,21 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │     closed with nobody having heard sound. Every automated check the
    │     swarm had was blind to a silent output.
    │
-   ├──► **What the failure does not show.** The loop worked throughout —
-   │   `kbuild -j 1` (2 to 2.5 min incremental), `kinstall`, `reboot -f`,
-   │   `git push` from the trashcan — and so did the cat that built and
-   │   booted its own kernel on 09-25 (above). What failed was everything
-   │   around the loop: the oracle, the gates and the model. So this says
-   │   nothing against an agent editing and rebuilding the kernel on the
-   │   machine it runs on. It only says this run was set up badly.
+   ├──► **What the failure does not show, and what it does.** The loop
+   │   worked throughout — `kbuild -j 1` (2 to 2.5 min incremental),
+   │   `kinstall`, `reboot -f`, `git push` from the trashcan — and so did
+   │   the cat that built and booted its own kernel on 09-25 (above). What
+   │   failed was everything around the loop: the oracle, the gates and the
+   │   model. **Admitted plainly: the full self-hosting development loop
+   │   works, and it works regardless of how badly our own custom tooling
+   │   (meow, kot, the litter, a low-reasoning GLM) behaved on top of it.**
+   │   The loop is a property of the kernel and the box; the swarm was a
+   │   property of the harness. The same task, on the same loop, can be
+   │   done with a more established agent harness and a more capable model,
+   │   or with stricter human oversight of every "verified" — and the
+   │   rewrite below is that: an interactive session with the user in the
+   │   loop, not the swarm's tooling or model, which finished what the
+   │   swarm could not.
    ▼
  [09-30] ═══ THE REWRITE ═══ IT PLAYS
    │

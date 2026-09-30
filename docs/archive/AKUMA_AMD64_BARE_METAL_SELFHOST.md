@@ -694,6 +694,19 @@ throughout, an incremental kernel build took 2 to 2.5 minutes, and the rewrite
 used the same loop for every metal iteration. What changed was everything around
 it.
 
+**Admission: the full self-hosting development loop works, independent of the
+failures of our own custom tooling.** Edit, build on the box, install, reboot
+into the new kernel, check, push from the box: every step held while the
+experiment around it did not. The things that failed here (meow, kot, the
+litter, GLM-5.3-flash at low reasoning, a runbook whose rules were not gates)
+are our own harness and model choices, and none of them is part of the
+self-hosting claim. The same task can be done with a more established agent
+harness and a more capable model, or under stricter human oversight of every
+claimed result, and the rewrite (`AKUMA_AMD64_HDA_REWRITE.md`) is that: one
+interactive session with the user in the loop, not the swarm's tooling or
+model, on this same loop for every metal iteration. It finished the task the
+swarm could not.
+
 ---
 
 ## Background
