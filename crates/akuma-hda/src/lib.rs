@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 //! Intel HD Audio controller — the pure register half.
 //!
 //! Split the same way `akuma-pci` splits from the target's `pci.rs`: this
@@ -11,8 +12,12 @@
 //! version registers, nothing else. Reset (CRST), codecs and streams join in
 //! later steps, each behind the same `Regs16` seam.
 
+pub mod codec;
+pub mod stream;
+pub mod verb;
+
 /// The byte offset of a register, from the HDA specification's controller
-/// register map. BAR0 points at the start of it.
+/// register map (Intel HDA 1.0a §3.3). BAR0 points at the start of it.
 pub mod reg {
     /// Global capabilities — stream counts, serial data lines, 64-bit support.
     pub const GCAP: usize = 0x00;
@@ -24,17 +29,78 @@ pub mod reg {
     /// GCTL - the reset-and-status word; CRST (bit 0) is the
     /// controller reset; software clears it to enter reset and sets it to exit (§4.3).
     pub const GCTL: usize = 0x08;
-// --- CORB/RIRB ring registers (Intel HDA 1.0a ICH6 map) ---
-pub const CORB_BASE: u16 = 0x40;
-pub const CORB_WP: u16 = 0x48;
-pub const CORB_RP: u16 = 0x4A;
-pub const CORB_CTL: u16 = 0x4C;
-pub const CORB_STS: u16 = 0x4D;
-pub const RIRB_BASE: u16 = 0x70;
-pub const RIRB_WP: u16 = 0x74;
-pub const RIRB_INT_CNT: u16 = 0x76;
-pub const RIRB_CTL: u16 = 0x7C;
-pub const RIRB_STS: u16 = 0x7E;
+    /// STATESTS — one bit per codec address that answered the link wake-up
+    /// (write-1-to-clear).
+    pub const STATESTS: usize = 0x0E;
+    /// INTCTL — global interrupt enable; left zero (this driver polls).
+    pub const INTCTL: usize = 0x20;
+
+    /// CORB lower base address (32-bit, 128-byte aligned).
+    pub const CORBLBASE: usize = 0x40;
+    /// CORB upper base address (32-bit).
+    pub const CORBUBASE: usize = 0x44;
+    /// CORB write pointer (16-bit, entry index in `[7:0]`).
+    pub const CORBWP: usize = 0x48;
+    /// CORB read pointer (16-bit; bit 15 is the reset strobe).
+    pub const CORBRP: usize = 0x4A;
+    /// CORB control (8-bit; bit 1 = RUN).
+    pub const CORBCTL: usize = 0x4C;
+    /// CORB status (8-bit).
+    pub const CORBSTS: usize = 0x4D;
+    /// CORB size (8-bit; `[1:0]` = 0/1/2 for 2/16/256 entries, `[7:4]` = caps).
+    pub const CORBSIZE: usize = 0x4E;
+    /// RIRB lower base address (32-bit, 128-byte aligned).
+    pub const RIRBLBASE: usize = 0x50;
+    /// RIRB upper base address (32-bit).
+    pub const RIRBUBASE: usize = 0x54;
+    /// RIRB write pointer (16-bit; bit 15 is the reset strobe).
+    pub const RIRBWP: usize = 0x58;
+    /// Response interrupt count (16-bit; 0 means 256).
+    pub const RINTCNT: usize = 0x5A;
+    /// RIRB control (8-bit; bit 0 = response IRQ enable, bit 1 = DMA enable).
+    pub const RIRBCTL: usize = 0x5C;
+    /// RIRB status (8-bit; bit 0 = RINTFL, bit 2 = RIRBOIS; write 1 to clear).
+    pub const RIRBSTS: usize = 0x5D;
+    /// RIRB size (8-bit).
+    pub const RIRBSIZE: usize = 0x5E;
+    /// Immediate command output (32-bit).
+    pub const ICW: usize = 0x60;
+    /// Immediate response input (32-bit).
+    pub const IRR: usize = 0x64;
+    /// Immediate command status (16-bit; bit 0 = ICB busy, bit 1 = IRV valid).
+    pub const IRS: usize = 0x68;
+
+    /// First stream descriptor. Input descriptors come first (`GCAP.ISS` of
+    /// them), then output; each is [`SD_STRIDE`] bytes.
+    pub const SD_BASE: usize = 0x80;
+    /// Bytes between stream descriptors.
+    pub const SD_STRIDE: usize = 0x20;
+    /// Stream descriptor: control, 3 bytes (`[1]` RUN, `[0]` SRST, `[23:20]` tag).
+    pub const SD_CTL: usize = 0x00;
+    /// Stream descriptor: status, 1 byte at +3 (`[2]` BCIS, `[3]` FIFOE, `[4]` DESE).
+    pub const SD_STS: usize = 0x03;
+    /// Stream descriptor: link position in buffer, 32-bit.
+    pub const SD_LPIB: usize = 0x04;
+    /// Stream descriptor: cyclic buffer length in bytes, 32-bit.
+    pub const SD_CBL: usize = 0x08;
+    /// Stream descriptor: last valid BDL index, 16-bit.
+    pub const SD_LVI: usize = 0x0C;
+    /// Stream descriptor: FIFO watermark, 16-bit.
+    pub const SD_FIFOW: usize = 0x0E;
+    /// Stream descriptor: FIFO size, 16-bit, read-only.
+    pub const SD_FIFOS: usize = 0x10;
+    /// Stream descriptor: stream format, 16-bit.
+    pub const SD_FMT: usize = 0x12;
+    /// Stream descriptor: BDL base address, lower 32 bits (128-byte aligned).
+    pub const SD_BDPL: usize = 0x18;
+    /// Stream descriptor: BDL base address, upper 32 bits.
+    pub const SD_BDPU: usize = 0x1C;
+
+    /// Byte offset of output stream descriptor `n`, given `GCAP.ISS`.
+    #[must_use]
+    pub const fn output_sd(iss: u8, n: u8) -> usize {
+        SD_BASE + SD_STRIDE * (iss as usize + n as usize)
+    }
 }
 
 /// How the pure half reads a 16-bit register. Implemented over mapped MMIO by
@@ -74,16 +140,15 @@ impl GCap {
     pub fn input_streams(&self) -> u8 {
         ((self.raw >> 8) & 0xf) as u8
     }
-    /// Bidirectional streams supported (`raw[7:4]`).
+    /// Bidirectional streams supported (`raw[7:3]`, five bits).
     #[must_use]
     pub fn bidirectional_streams(&self) -> u8 {
-        ((self.raw >> 4) & 0xf) as u8
+        ((self.raw >> 3) & 0x1f) as u8
     }
-    /// Serial data signals out (`raw[3:1]`) — codec count territory, M2's
-    /// business, decoded now so the print can grow without a re-derive.
+    /// Serial data out signals, `NSDO` (`raw[2:1]`): 0, 1, 2 = one, two, four.
     #[must_use]
     pub fn serial_data_signals(&self) -> u8 {
-        ((self.raw >> 1) & 0x7) as u8
+        ((self.raw >> 1) & 0x3) as u8
     }
     /// Whether the controller takes 64-bit DMA addresses (`raw[0]`).
     #[must_use]
@@ -103,13 +168,13 @@ pub struct Info {
     pub vmin: u8,
 }
 
-/// The runbook's discovery gate: a version of `0xffff` means the BAR is not
-/// mapped, and "everything after this is noise".
-#[must_use]
 /// `GCTL.CRST` — software-driven controller reset bit: clear to enter,
 /// set to exit (HDA 1.0a §4.3).
 pub const CRST: u16 = 1;
 
+/// The runbook's discovery gate: a version of `0xffff` means the BAR is not
+/// mapped, and "everything after this is noise".
+#[must_use]
 pub fn version_is_noise(vmaj: u8, vmin: u8) -> bool {
     vmaj == 0xff && vmin == 0xff
 }
@@ -134,13 +199,14 @@ pub fn discover<R: Regs16 + ?Sized>(regs: &R) -> Option<Info> {
     Some(Info { gcap, vmaj, vmin })
 }
 
-/// Reset the controller per HDA 1.0a §4.3: CRST is software-driven,
-/// not self-clearing. Phase 1 — clear CRST (enter reset), poll until
+/// Reset the controller per HDA 1.0a §4.3.
+///
+/// CRST is software-driven, not self-clearing. Phase 1 — clear CRST (enter reset), poll until
 /// it reads 0. Phase 2 — set CRST (exit reset), poll until it reads 1.
 /// `wait` is one delay unit (the crate stays timing-free); the caller
 /// should budget units for the ~25 µs controller recovery. Returns
 /// `false` when either phase times out.
-pub fn reset<R: RegsW16 + ?Sized>(regs: &R, polls: usize, wait: impl Fn()) -> bool {
+pub fn reset<R: RegsW16 + ?Sized>(regs: &R, polls: usize, mut wait: impl FnMut()) -> bool {
     let st = regs.r16(reg::GCTL);
     regs.w16(reg::GCTL, st & !CRST);
     let mut entered = false;
@@ -190,20 +256,22 @@ mod tests {
 
     #[test]
     fn gcap_bitfields_decode() {
-        // 4 out, 4 in, 0 bidi, 1 serial line, 64-bit ok: (4<<12)|(4<<8)|1.
+        // The trashcan's 8-series controller: 4 out, 4 in, 0 bidi, one serial
+        // data line (NSDO 0), 64-bit ok: (4<<12)|(4<<8)|1.
         let g = GCap { raw: 0x4401 };
         assert_eq!(g.output_streams(), 4);
         assert_eq!(g.input_streams(), 4);
         assert_eq!(g.bidirectional_streams(), 0);
-        assert_eq!(g.serial_data_signals(), 1);
+        assert_eq!(g.serial_data_signals(), 0);
         assert!(g.supports_64bit());
 
-        // Everything maxed: 15/15/15, NS=7, 64-bit off.
+        // Fields maxed: 15/15, BSS is five bits wide (0xF6 >> 3 = 30), NSDO 3,
+        // 64-bit off.
         let g = GCap { raw: 0xfff6 };
         assert_eq!(g.output_streams(), 15);
         assert_eq!(g.input_streams(), 15);
-        assert_eq!(g.bidirectional_streams(), 15);
-        assert_eq!(g.serial_data_signals(), 7);
+        assert_eq!(g.bidirectional_streams(), 30);
+        assert_eq!(g.serial_data_signals(), 3);
         assert!(!g.supports_64bit());
     }
 
@@ -242,6 +310,7 @@ mod tests {
         fn w16(&self, _offset: usize, value: u16) {
             self.state.set(value);
         }
+        fn w32(&self, _offset: usize, _value: u32) {}
     }
 
     #[test]
@@ -266,6 +335,7 @@ mod tests {
     }
     impl<F: RegsW16> RegsW16 for Stuck<F> {
         fn w16(&self, _o: usize, _v: u16) {}
+        fn w32(&self, _o: usize, _v: u32) {}
     }
 
     #[test]

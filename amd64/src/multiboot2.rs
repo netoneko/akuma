@@ -369,17 +369,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // See `boot::install_shared_sinks`.
     crate::boot::install_shared_sinks();
 
-    // Intel HDA discovery, bring-up step 1 (runbook add-intel-hda-audio.md).
-    // The PVH path gates this on the `pci` cmdline flag (see `kmain`); a
-    // firmware boot always has PCI — the scan above already found it — so it
-    // runs unconditionally here. It sits after `mem::init_reserving` because
-    // `map_bar` allocates frames, and it is best-effort like every other
-    // device bring-up on this path: a miss prints one line and boots on.
-    crate::hda::init();
-        unsafe { akuma_virtio::audio::hda_backend::register(crate::hda::hda_dsp_tramp_write, crate::hda::hda_dsp_tramp_stop); } // M9b: /dev/dsp backend
-        crate::serial::puts("[HDA] dsp backend registered up=");
-        crate::serial::put_hexn(akuma_virtio::audio::hda_backend::up() as u64, 1);
-        crate::serial::puts("\n");
+    // Intel HDA (runbook add-intel-hda-audio.md). The PVH path gates this on
+    // the `pci` cmdline flag (see `kmain`); a firmware boot always has PCI —
+    // the scan above already found it — so it runs unconditionally here. It
+    // sits after `mem::init_reserving` because `map_bar` allocates frames, and
+    // it is best-effort like every other device bring-up on this path: a miss
+    // prints one line and boots on. `hdatest` plays a one-second tone.
+    crate::hda::init(info.cmdline().split_ascii_whitespace().any(|t| t == "hdatest"));
 
     // The root filesystem. With `root=/dev/sda1` on the command line, bring up
     // the xHCI + USB mass-storage stack and mount the persistent partition; on

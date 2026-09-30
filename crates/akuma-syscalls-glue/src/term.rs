@@ -52,19 +52,6 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         FIONBIO => {
             let mut val: i32 = 0;
-            if cmd == 0x8004500b {
-                let fmts: i32 = 0x01010018;
-                if write_user_val(arg, &fmts).is_err() { return EFAULT; }
-                return 0;
-            }
-            if cmd == 0x00005000 || cmd == 0xc0045004 {
-                return 0;
-            }
-            if cmd == 0x80045004 {
-                let blk: i32 = 4096;
-                if write_user_val(arg, &blk).is_err() { return EFAULT; }
-                return 0;
-            }
             if read_user_into(&mut val, arg).is_err() {
                 return EFAULT;
             }
@@ -168,27 +155,13 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return ENOMEM,
             }
         }
-        SNDCTL_DSP_SPEED | SNDCTL_DSP_SETFMT | SNDCTL_DSP_CHANNELS | 0x8004_500b => {
-            if cmd == 0x8004_500b { let fmts: i32 = 0x10 | 0x1000 | 0x1_0000; if write_user_val(arg, &fmts).is_err() { return EFAULT; } return 0; }
+        SNDCTL_DSP_SPEED | SNDCTL_DSP_SETFMT | SNDCTL_DSP_CHANNELS => {
             // OSS audio params on /dev/dsp. arg is *mut i32 (in/out): the desired
             // value in, the accepted value out (we accept what was requested).
             if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevDsp)) {
                 return ENOTTY; // not a dsp fd
             }
             let mut val: i32 = 0;
-            if cmd == 0x8004500b {
-                let fmts: i32 = 0x01010018;
-                if write_user_val(arg, &fmts).is_err() { return EFAULT; }
-                return 0;
-            }
-            if cmd == 0x00005000 || cmd == 0xc0045004 {
-                return 0;
-            }
-            if cmd == 0x80045004 {
-                let blk: i32 = 4096;
-                if write_user_val(arg, &blk).is_err() { return EFAULT; }
-                return 0;
-            }
             if read_user_into(&mut val, arg).is_err() {
                 return EFAULT;
             }

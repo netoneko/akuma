@@ -263,7 +263,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         pci::scan();
         pci::report();
         xhci::quiesce_all();
-        hda::init();
+        hda::init(machine::flag(hvm_start_info, "hdatest"));
     }
 
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from

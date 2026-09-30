@@ -1,841 +1,1029 @@
-//! Intel HDA bring-up, step 1 (the runbook's "Discovery"): find the
-//! controller, map BAR0, print GCAP, gate on the version register.
+//! Intel HD Audio playback — the metal half.
 //!
-//! The register decode is `akuma-hda`'s (host-tested, no MMIO); this module
-//! is the metal half — the PCI walk, the BAR map and one console line:
-//! `[HDA] 8086:8c20 bar0=0x… version=1.0 oss=N iss=N bss=N`.
-//! Nothing else happens here in M1; the userspace seam still points at
-//! virtio.
+//! `akuma-hda` (host-tested, `forbid(unsafe_code)`) decides *what* to say: the
+//! verb words, the codec's widget graph and the route from an output pin to a
+//! DAC, the stream format word, PCM conversion and the ring's arithmetic. This
+//! module owns what cannot be host-tested: the BAR0 mapping, the CORB/RIRB and
+//! stream DMA memory, and the registers.
+//!
+//! ## DMA contract
+//!
+//! The CORB, RIRB, buffer descriptor list and PCM ring are `static`s in `.bss`
+//! (the device never sees a caller's buffer). A buffer is the device's from the
+//! moment its address is published — CORBWP for a verb, `RUN` for the ring —
+//! until the matching completion: RIRBWP moving, or `LPIB` having passed a
+//! ring byte. x86 DMA is cache-coherent, so ordering is a `fence`, not a flush.
+//!
+//! ## What the first bring-up got wrong
+//!
+//! It hand-assembled verbs as hex literals with the node id one nibble too high
+//! (so it configured a widget 0x22 that does not exist), wrote the stream
+//! format at `SD+0x14` (reserved; `SDnFMT` is `+0x12`) and the last-valid-index
+//! at `SD+0x10` (`SDnFIFOS`, read-only; `SDnLVI` is `+0x0C`), converted 24-bit
+//! audio that `wavplay` had already converted to 16, and accepted any
+//! rate/format/channel ioctl without remembering it. Every readback it used to
+//! declare success read a phantom. See `docs/runbooks/add-intel-hda-audio.md`.
 
 use crate::serial;
-use akuma_hda::{Regs16, RegsW16};
-use core::sync::atomic::{AtomicBool, Ordering};
+use akuma_hda::codec::{self, Kind, PinRole, VerbBus, VerbList};
+use akuma_hda::stream::{self, PlayRing, SampleFormat};
+use akuma_hda::{reg, verb, Regs16, RegsW16};
+use core::sync::atomic::{fence, Ordering};
+use spinning_top::Spinlock;
 
 /// Intel's vendor id. The NVIDIA HDMI audio function is class 04:03 too, so
 /// the walk matches class **and** vendor or it brings up the wrong chip.
 const INTEL: u16 = 0x8086;
 
-/// Step 1 outcome, for the M2 boot-suite check.
-static DISCOVERED: AtomicBool = AtomicBool::new(false);
+/// Stream tag used for playback (1..=15; 0 means "unbound").
+const TAG: u8 = 1;
+/// The DAC amplifier's level as a percentage of its 0 dB step. 64 is the level
+/// Linux left this machine's ALC662 at when it was audible.
+const DAC_PCT: u8 = 64;
 
-/// MMIO window over BAR0 — the `Regs16` the pure crate decodes through.
-struct MmioRegs {
+/// Ring geometry: 8 fragments of 8 KiB (64 KiB, ~371 ms of 44.1 kHz stereo).
+const NFRAG: usize = 8;
+const FRAG: usize = 8192;
+const RING_BYTES: usize = NFRAG * FRAG;
+/// Bytes kept between the write point and the hardware's read point.
+const GUARD: u32 = 1024;
+
+// ---------------------------------------------------------------------------
+// DMA memory
+// ---------------------------------------------------------------------------
+
+#[repr(C, align(128))]
+struct Corb([u32; 256]);
+#[repr(C, align(128))]
+struct Rirb([u64; 256]);
+#[repr(C, align(128))]
+struct Bdl([[u32; 4]; NFRAG]);
+#[repr(C, align(4096))]
+struct Ring([u8; RING_BYTES]);
+
+static mut CORB: Corb = Corb([0; 256]);
+static mut RIRB: Rirb = Rirb([0; 256]);
+static mut BDL: Bdl = Bdl([[0; 4]; NFRAG]);
+static mut RING: Ring = Ring([0; RING_BYTES]);
+
+fn phys<T>(p: *mut T) -> u64 {
+    akuma_primitives::addr::virt_to_phys(p as usize) as u64
+}
+
+// ---------------------------------------------------------------------------
+// MMIO
+// ---------------------------------------------------------------------------
+
+/// BAR0. Every access is naturally aligned and exactly the register's width;
+/// the controller answers `0xff` to a halfword read that straddles a dword.
+struct Mmio {
     base: *mut u8,
 }
 
-impl Regs16 for MmioRegs {
-    fn r16(&self, offset: usize) -> u16 {
-        // SAFETY: `base` is the BAR0 mapping from `pci::map_bar` (16 KiB;
-        // this reads three halfwords at 0x00/0x02/0x04), volatile only.
-        unsafe { (self.base.add(offset) as *const u16).read_volatile() }
+// SAFETY: `base` is a device mapping with no thread affinity; all access goes
+// through the `HDA` lock or happens single-threaded at boot.
+unsafe impl Send for Mmio {}
+
+impl Mmio {
+    fn r8(&self, off: usize) -> u8 {
+        // SAFETY: `off` is inside the 16 KiB BAR0 mapping `init` created.
+        unsafe { self.base.add(off).read_volatile() }
+    }
+    fn w8(&self, off: usize, v: u8) {
+        // SAFETY: as `r8`.
+        unsafe { self.base.add(off).write_volatile(v) }
+    }
+    fn r32(&self, off: usize) -> u32 {
+        // SAFETY: as `r8`; `off` is 4-aligned at every call site.
+        unsafe { (self.base.add(off) as *const u32).read_volatile() }
     }
 }
 
-
-impl RegsW16 for MmioRegs {
-    fn w16(&self, offset: usize, value: u16) {
-        // SAFETY: BAR0 mapping as above; the reset path writes GCTL only.
-        unsafe { (self.base.add(offset) as *mut u16).write_volatile(value) }
-    }
-    fn w32(&self, offset: usize, value: u32) {
-        unsafe { (self.base.add(offset) as *mut u32).write_volatile(value) }
+impl Regs16 for Mmio {
+    fn r16(&self, off: usize) -> u16 {
+        // SAFETY: as `r8`; `off` is 2-aligned at every call site.
+        unsafe { (self.base.add(off) as *const u16).read_volatile() }
     }
 }
 
-impl MmioRegs {
-    fn w32(&self, offset: usize, value: u32) {
-        // SAFETY: BAR0 mapping as above; CORBLBASE/UBASE, RIRBLBASE/UBASE.
-        unsafe { (self.base.add(offset) as *mut u32).write_volatile(value) }
+impl RegsW16 for Mmio {
+    fn w16(&self, off: usize, v: u16) {
+        // SAFETY: as `r16`.
+        unsafe { (self.base.add(off) as *mut u16).write_volatile(v) }
     }
-    #[allow(dead_code)] // debug: read back 32-bit registers
-    fn r32(&self, offset: usize) -> u32 {
-        // SAFETY: BAR0 mapping as above.
-        unsafe { (self.base.add(offset) as *const u32).read_volatile() }
+    fn w32(&self, off: usize, v: u32) {
+        // SAFETY: as `r32`.
+        unsafe { (self.base.add(off) as *mut u32).write_volatile(v) }
     }
 }
-/// Whether discovery found and decoded the controller (M2's suite hook).
-#[allow(dead_code)] // wired into the boot suite with the next milestone
-pub fn discovered() -> bool {
-    DISCOVERED.load(Ordering::Relaxed)
+
+// ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+fn now_us() -> Option<u64> {
+    crate::lapic::tsc_uptime_us()
 }
 
-/// Walk the bus for the Intel HDA controller and, if found, map and print.
-pub fn init() {
-    // Census: every 04:03 function, so the console shows the NVIDIA HDMI
-    // function was seen — and that skipping it was a choice, not blindness.
-    crate::pci::for_each(|d| {
-        if d.header.is_audio() {
-            serial::puts("  [HDA] audio class ");
-            serial::put_hexn(u64::from(d.header.vendor_id), 4);
-            serial::puts(":");
-            serial::put_hexn(u64::from(d.header.device_id), 4);
-            serial::puts("\n");
-        }
-    });
-
-    // `find_class` returns the first 04:03 in scan order — on this box the
-    // Intel controller at 00:1b.0 walks before the GPU's HDMI at 01:00.1.
-    // The census above is what proves that if it ever stops being true.
-    let Some(dev) = crate::pci::find_class(
-        akuma_pci::class::MULTIMEDIA,
-        akuma_pci::subclass::AUDIO,
-    ) else {
-        serial::puts("[HDA] no audio-class function on the bus\n");
-        return;
-    };
-    let addr = dev.addr;
-    let (vid, did) = (dev.header.vendor_id, dev.header.device_id);
-    if vid != INTEL {
-        serial::puts("[HDA] first 04:03 is not Intel (HDMI) — walk order changed, fix me\n");
-        return;
-    }
-    crate::pci::enable(addr, true);
-
-    // Bring-up step 3 (runbook): power. The controller boots in D0
-    // normally, but a warm reboot can leave D3hot, where MMIO reads
-    // answer 0xff — exactly the version=255.0 shape seen in M2. Find
-    // the PCI PM capability (id 0x01), read PMCSR, and if it is not
-    // D0, write D0 back and wait out the 10 ms D3hot->D0 transition
-    // before anyone touches BAR0.
-    let cfg = crate::pci::config_space(addr);
-    for cap in akuma_pci::capabilities(&cfg, dev.header.capabilities_pointer) {
-        if cap.id == akuma_pci::capability_id::POWER_MANAGEMENT {
-            let pmcsr = crate::pci::read_u16_config(addr, cap.offset + 4);
-            serial::puts("[HDA] PMCSR=");
-            serial::put_dec(u64::from(akuma_pci::pm::power_state(pmcsr)));
-            // M4 taught: a forced D3hot round-trip on a D0 device wedges
-            // it fully (every BAR0 byte then answers 0xff). Cycle only
-            // when PMCSR actually says otherwise.
-            if akuma_pci::pm::power_state(pmcsr) != akuma_pci::pm::D0 {
-                crate::pci::write_u16_config(addr, cap.offset + 4,
-                    pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
-                for _ in 0..20_000_000 { core::hint::spin_loop(); }
-                serial::puts(" -> D0 written");
-            }
-            serial::puts("\n");
-            break;
-        }
-    }
-    let Some(bar) = dev.bars.into_iter().next().flatten() else {
-        serial::puts("[HDA] BAR0 absent\n");
-        return;
-    };
-    let bar_addr = match bar {
-        akuma_pci::Bar::Memory { address, .. } => address,
-        akuma_pci::Bar::Io { .. } => {
-            serial::puts("[HDA] BAR0 decoded as I/O ports — not an HDA MMIO BAR\n");
-            return;
-        }
-    };
-    let (size, _) = crate::pci::probe_bar_size(addr, 0);
-    let Some(base) = crate::pci::map_bar(bar, size.max(0x4000)) else {
-        serial::puts("[HDA] BAR0 map failed\n");
-        return;
-    };
-
-    serial::puts("[HDA] ");
-    serial::put_hexn(u64::from(vid), 4);
-    serial::puts(":");
-    serial::put_hexn(u64::from(did), 4);
-    serial::puts(" bar0=0x");
-    serial::put_hex(bar_addr);
-    let mut regs = MmioRegs { base };
-
-    // M4 diagnostic: the raw first 32 bytes of BAR0, before anything
-    // else interprets them — which bytes answer 0xff is the whole
-    // question when one register decodes and its neighbour does not.
-    for line_off in [0x0usize, 0x10] {
-        serial::puts("[HDA] dump");
-        serial::put_hexn(line_off as u64, 2);
-        serial::puts(":");
-        for i in 0..8 {
-            let w = regs.r16(line_off + i * 2);
-            serial::puts(" ");
-            serial::put_hexn(u64::from(w & 0xff), 2);
-            serial::puts(" ");
-            serial::put_hexn(u64::from(w >> 8), 2);
-        }
-        serial::puts("\n");
-    }
-    if let Some(info) = akuma_hda::discover(&regs) {
-        serial::puts(" version=");
-        serial::put_dec(u64::from(info.vmaj));
-        serial::puts(".");
-        serial::put_dec(u64::from(info.vmin));
-        serial::puts(" oss=");
-        serial::put_dec(u64::from(info.gcap.output_streams()));
-        serial::puts(" iss=");
-        serial::put_dec(u64::from(info.gcap.input_streams()));
-        serial::puts(" bss=");
-        serial::put_dec(u64::from(info.gcap.bidirectional_streams()));
-        serial::puts("\n");
-        DISCOVERED.store(true, Ordering::Relaxed);
-    } else {
-        serial::puts(" version=0xffff — BAR0 not decoded; everything after is noise\n");
-    }
-
-// Bring-up step 2 (runbook): controller reset per HDA 1.0a §4.3 — CRST is
-// software-driven: write 0, poll for 0, write 1, poll for 1. Both polls
-// are bounded so a hung controller cannot hang the boot; the post-reset
-// version re-read separates a decode artifact from a controller answer.
-// (M2 assumed CRST self-clears — wrong; see runbook Challenges.)
-    let spin = || {
-        for _ in 0..2000 {
-            core::hint::spin_loop();
-        }
-    };
-    if akuma_hda::reset(&regs, 1 << 20, spin) {
-        if let Some(post) = akuma_hda::discover(&regs) {
-            serial::puts("[HDA] post-reset version=");
-            serial::put_dec(u64::from(post.vmaj));
-            serial::puts(".");
-            serial::put_dec(u64::from(post.vmin));
-            serial::puts("\n");
-        }
-    } else {
-        serial::puts("[HDA] CRST handshake failed - controller not reset\n");
-    }
-    serial::puts("[HDA] dump-post00:");
-    for i in 0..8 {
-        let w = regs.r16(i * 2);
-        serial::puts(" ");
-        serial::put_hexn(u64::from(w & 0xff), 2);
-        serial::puts(" ");
-        serial::put_hexn(u64::from(w >> 8), 2);
-    }
-    serial::puts("\n");
-    codec_probe(&mut regs);
+/// A bounded wait. Uses the TSC when it is calibrated and a spin count when it
+/// is not, so no loop in this file can outlive its budget on either path.
+struct Wait {
+    t0: Option<u64>,
+    spins: u64,
+    us: u64,
 }
 
-// ===================================================================
-// M7: codec command engine — CORB/RIRB (HDA 1.0a §4.4/§4.5).
-// Rings are static .bss DMA buffers, xhci dma_buf style; bus address
-// via virt_to_phys (no IOMMU on this target). Offsets per Linux ICH6
-// map: CORBWP 0x48, CORBRP 0x4A, CORBCTL 0x4C, CORBSIZE 0x4E;
-// RIRB 0x50/0x54, RIRBWP 0x58, RINTCNT 0x5A, RIRBCTL 0x5C, SIZE 0x5E.
-// ===================================================================
-struct CorbRing([u32; 256]);
-static mut CORB_RING: CorbRing = CorbRing([0; 256]);
-struct RirbRing([u64; 256]);
-static mut RIRB_RING: RirbRing = RirbRing([0; 256]);
-static mut RPOS: usize = 0;
-
-fn codec_link_init(regs: &mut MmioRegs) {
-    unsafe {
-        let cb = akuma_primitives::addr::virt_to_phys(
-            (&raw mut CORB_RING.0) as *mut [u32; 256] as usize,
-        ) as u32;
-        let rb = akuma_primitives::addr::virt_to_phys(
-            (&raw mut RIRB_RING.0) as *mut [u64; 256] as usize,
-        ) as u32;
-        regs.w16(0x4C, 0x0000); // CORBCTL: stop while reprogramming
-        regs.w16(0x4A, 0x8000); // CORBRP: read-pointer reset
-        regs.w16(0x4A, 0x0000); // CORBRP: clear
-        regs.w16(0x4E, 0x0002); // CORBSIZE: 256 entries (spec: program size before RUN)
-        regs.w16(0x48, 0x0000); // CORBWP = 0
-        regs.w32(0x40, cb); // CORBLBASE(+UBASE) as one 32-bit write - 16-bit half-writes don't stick on the upper half
-        regs.w32(0x50, rb); // RIRBLBASE(+UBASE) likewise
-        regs.w16(0x5A, 0x0001); // RINTCNT = 1
-        regs.w16(0x5E, 0x0002); // RIRBSIZE: 256 entries
-        regs.w16(0x5A, 0x00FF); // RINTCNT: accept up to 255 responses before IRQ-gated stall
-        regs.w16(0x5C, 0x0003); // RIRBCTL: IRQ_EN(bit0) + DMA_EN(bit1) per intel-hda-defs.h
-        regs.w16(0x4C, 0x0002); // CORBCTL: RUN (bit1); bit0 is CORBRPRST pointer-reset - that bug held CORB in reset
-        serial::puts("[HDA] postinit corbsize=");
-        serial::put_hexn(regs.r16(0x4E) as u64, 4);
-        serial::puts(" rirbsize=");
-        serial::put_hexn(regs.r16(0x5E) as u64, 4);
-        serial::puts(" rintcnt=");
-        serial::put_hexn(regs.r16(0x5A) as u64, 4);
-        serial::puts(" rirbctl=");
-        serial::put_hexn(regs.r16(0x5C) as u64, 4);
-        serial::puts(" corbsts=");
-        serial::put_hexn(regs.r16(0x4D) as u64, 4);
-        serial::puts(" corbbase=");
-        serial::put_hexn(cb as u64, 8);
-        serial::puts(" rirbbase=");
-        serial::put_hexn(rb as u64, 8);
-        serial::puts("\n");
-        serial::puts("\n");
+impl Wait {
+    fn new(us: u64) -> Self {
+        Self { t0: now_us(), spins: 0, us }
     }
-    serial::puts("[HDA] CORB/RIRB enabled\n");
+    /// `true` once the budget is spent.
+    fn expired(&mut self) -> bool {
+        self.spins += 1;
+        match self.t0 {
+            Some(t0) => now_us().is_some_and(|n| n.saturating_sub(t0) > self.us),
+            None => self.spins > self.us * 200,
+        }
+    }
 }
 
-/// Send one verb (CAd<<28 | NID<<20 | verb<<8 | payload), poll RIRB.
-fn codec_send(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
-    unsafe {
-        let corb = (&raw mut CORB_RING.0).cast::<u32>();
-        let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
-        // NOTE: RIRBWP read here is the WP *after the previous send* — but the
-        // controller advances WP only when IT writes the response. Snapshot the
-        // WP *before* publishing our verb (that's where the new answer will land +1).
-        let old_rp = (regs.r16(0x58) & 0x00ff) as usize;
-        let wp = (regs.r16(0x48) & 0x00ff) as usize;
-        let np = (wp % 255) + 1;
-        corb.add(np).write_volatile(verb);
-        regs.w16(0x48, np as u16); // publish; controller bumps CORBRP, DMAs verb, fills RIRB
-        let mut n = 0u32;
+fn delay_us(us: u64) {
+    let mut w = Wait::new(us);
+    while !w.expired() {
+        core::hint::spin_loop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Console helpers (no allocation: `serial` writes straight to the port)
+// ---------------------------------------------------------------------------
+
+fn p(s: &str) {
+    serial::puts(s);
+}
+fn hx(v: u64, nibbles: u32) {
+    serial::put_hexn(v, nibbles);
+}
+fn dec(v: u64) {
+    serial::put_dec(v);
+}
+
+// ---------------------------------------------------------------------------
+// The controller
+// ---------------------------------------------------------------------------
+
+struct Hda {
+    regs: Mmio,
+    /// Codec address (lowest set bit of STATESTS).
+    cad: u8,
+    /// CORB/RIRB unusable; verbs go through the immediate command registers.
+    use_ici: bool,
+    /// RIRB entries consumed so far (the index we last saw RIRBWP at).
+    rirb_rp: u8,
+    /// Offset of output stream descriptor 0.
+    sd: usize,
+    /// DACs that carry the stream (unique).
+    dacs: [u8; 4],
+    ndacs: usize,
+    // Playback parameters (what `/dev/dsp` last asked for).
+    rate: u32,
+    channels: u8,
+    fmt: SampleFormat,
+    // Playback state.
+    configured: bool,
+    running: bool,
+    /// LPIB never moved: account for playback by time instead.
+    time_mode: bool,
+    /// The first DAC's supported PCM sizes/rates (parameter 0xA); 0 = unknown.
+    pcm: u32,
+    ring: PlayRing,
+    t_run: u64,
+    t_obs: u64,
+    underruns: u32,
+    /// May the write loop `yield_now`? False at boot, before the scheduler runs.
+    may_yield: bool,
+    /// The codec's widget graph, kept for `dump_state`.
+    graph: Option<codec::Graph>,
+    /// The state dump has run at the first `RUN`.
+    dumped_running: bool,
+}
+
+/// The controller once `init` succeeded. `/dev/dsp` exists exactly when the
+/// backend below is registered, which happens after this is filled.
+static HDA: Spinlock<Option<Hda>> = Spinlock::new(None);
+
+impl Hda {
+    // ---- command transport ------------------------------------------------
+
+    /// Bring up the CORB and RIRB (HDA 1.0a §4.4, the sequence Linux's
+    /// `azx_init_cmd_io` uses). `false` if the rings will not start.
+    fn rings_init(&mut self) -> bool {
+        let r = &self.regs;
+        r.w8(reg::CORBCTL, 0);
+        r.w8(reg::RIRBCTL, 0);
+        let mut w = Wait::new(2_000);
+        while (r.r8(reg::CORBCTL) & 2 != 0 || r.r8(reg::RIRBCTL) & 2 != 0) && !w.expired() {}
+
+        // 256-entry rings, if the controller supports them (size cap bit 6).
+        if r.r8(reg::CORBSIZE) & 0x40 == 0 || r.r8(reg::RIRBSIZE) & 0x40 == 0 {
+            p("[HDA] rings: no 256-entry support\n");
+            return false;
+        }
+        r.w8(reg::CORBSIZE, 0x02);
+        r.w8(reg::RIRBSIZE, 0x02);
+
+        let (cb, rb) = (phys(&raw mut CORB), phys(&raw mut RIRB));
+        r.w32(reg::CORBLBASE, cb as u32);
+        r.w32(reg::CORBUBASE, (cb >> 32) as u32);
+        r.w32(reg::RIRBLBASE, rb as u32);
+        r.w32(reg::RIRBUBASE, (rb >> 32) as u32);
+
+        // CORB read pointer reset: set the strobe, wait for it to read back,
+        // clear it, wait for that to read back.
+        r.w16(reg::CORBRP, 0x8000);
+        let mut w = Wait::new(2_000);
+        while r.r16(reg::CORBRP) & 0x8000 == 0 && !w.expired() {}
+        r.w16(reg::CORBRP, 0);
+        let mut w = Wait::new(2_000);
+        while r.r16(reg::CORBRP) & 0x8000 != 0 && !w.expired() {}
+        r.w16(reg::CORBWP, 0);
+
+        r.w16(reg::RIRBWP, 0x8000);
+        self.rirb_rp = 0;
+        r.w16(reg::RINTCNT, 0xFF);
+        r.w8(reg::RIRBSTS, 0x05);
+        r.w8(reg::RIRBCTL, 0x03); // DMA enable + response IRQ (INTCTL stays 0: no interrupt)
+        r.w8(reg::CORBCTL, 0x02); // RUN
+        let mut w = Wait::new(2_000);
+        while (r.r8(reg::CORBCTL) & 2 == 0 || r.r8(reg::RIRBCTL) & 2 == 0) && !w.expired() {}
+        r.r8(reg::CORBCTL) & 2 != 0 && r.r8(reg::RIRBCTL) & 2 != 0
+    }
+
+    fn send_corb(&mut self, v: u32) -> Option<u32> {
+        let r = &self.regs;
+        let wp = (r.r16(reg::CORBWP) & 0xFF) as usize;
+        let np = (wp + 1) & 0xFF;
+        // SAFETY: `np` < 256; the controller reads this slot only after the
+        // CORBWP write below publishes it.
+        unsafe { (&raw mut CORB.0).cast::<u32>().add(np).write_volatile(v) };
+        fence(Ordering::SeqCst);
+        r.w16(reg::CORBWP, np as u16);
+
+        let mut w = Wait::new(50_000);
         loop {
-            let rwp = (regs.r16(0x58) & 0x00ff) as usize;
-            if rwp != old_rp {
-                // consume every new entry in order; ours is the last one
-                let mut k = (old_rp + 1) % 256;
-                let mut resp: Option<u32> = None;
-                loop {
-                    let e = rirb.add(k).read_volatile();
+            let rwp = (r.r16(reg::RIRBWP) & 0xFF) as u8;
+            if rwp != self.rirb_rp {
+                fence(Ordering::SeqCst);
+                let mut resp = None;
+                let mut k = self.rirb_rp;
+                while k != rwp {
+                    k = k.wrapping_add(1);
+                    // SAFETY: `k` < 256; the controller wrote this entry before
+                    // advancing RIRBWP past it.
+                    let e = unsafe { (&raw mut RIRB.0).cast::<u64>().add(usize::from(k)).read_volatile() };
                     let ex = (e >> 32) as u32;
-                    let cad = (ex >> 28) & 0x0f; // EX dword bits [31:28] (was [3:0] - wrong!)
-                    let unsol = (ex >> 4) & 0x01; // EX bit [4]: unsolicited response
-                    if k == rwp {
-                        // entry the HW WP points at: ours if CAd matches and not unsolicited
-                        if unsol == 0 && cad == (verb >> 28) & 0x0f {
-                            resp = Some(e as u32);
-                        }
-                        break;
+                    if ex & 0x10 != 0 {
+                        continue; // unsolicited: not the answer to what we sent
                     }
-                    if unsol == 1 {
-                        // stray/unsolicited entry before WP: skip, it is NOT our answer
-                        k = (k + 1) % 256;
-                        continue;
-                    }
-                    if cad == (verb >> 28) & 0x0f {
+                    if resp.is_none() {
                         resp = Some(e as u32);
-                        break;
                     }
-                    k = (k + 1) % 256;
                 }
-                // consumer handshake: w1c RINTFL (QEMU: intel_hda_set_rirb_sts
-                // resets rirb_count and resumes CORB). Real hardware advances
-                // RIRBWP itself here; QEMU masks writes to the RST bit only.
-                regs.w16(0x5d, 0x0001);
-                RPOS = rwp;
+                self.rirb_rp = rwp;
+                r.w8(reg::RIRBSTS, 0x05);
                 return resp;
             }
-            n += 1;
-            if n > 2_000_000 {
+            if w.expired() {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Immediate command interface: one verb at a time, no DMA. The fallback
+    /// Linux takes when the rings will not answer.
+    fn send_ici(&mut self, v: u32) -> Option<u32> {
+        let r = &self.regs;
+        let mut w = Wait::new(5_000);
+        while r.r16(reg::IRS) & 1 != 0 {
+            if w.expired() {
+                return None;
+            }
+        }
+        r.w16(reg::IRS, 0x02); // clear a stale IRV (write 1 to clear)
+        r.w32(reg::ICW, v);
+        r.w16(reg::IRS, 0x01); // ICB: go
+        let mut w = Wait::new(50_000);
+        loop {
+            let s = r.r16(reg::IRS);
+            if s & 1 == 0 && s & 2 != 0 {
+                return Some(r.r32(reg::IRR));
+            }
+            if w.expired() {
                 return None;
             }
         }
     }
-}
 
-/// First conversation with codec 0: vendor ID (0xF00) + root node count (0xF04).
-fn codec_probe(regs: &mut MmioRegs) {
-    codec_link_init(regs);
-    match codec_send(regs, 0x000F_0000) {
-        Some(v) => {
-            serial::puts("[HDA] codec0 vendor=0x");
-            serial::put_hexn(u64::from(v), 8);
-            unsafe {
-                serial::puts(" corbrp-after=0x");
-                serial::put_hexn(regs.r16(0x4A) as u64, 4);
-                serial::puts(" rirbwp-after=0x");
-                serial::put_hexn(regs.r16(0x58) as u64, 4);
+    fn run(&mut self, list: &VerbList) -> usize {
+        let mut failed = 0;
+        for &v in list.as_slice() {
+            if self.send(v).is_none() {
+                failed += 1;
             }
         }
-        None => serial::puts("[HDA] codec0: no RIRB response to vendor verb"),
+        failed
     }
-    unsafe {
-        let corb = (&raw mut CORB_RING.0).cast::<u32>();
-        let rirb = (&raw mut RIRB_RING.0).cast::<u64>();
-        serial::puts(" corb[1]=0x");
-        serial::put_hexn(corb.add(1).read_volatile() as u64, 8);
-        serial::puts(" rirb[1]=0x");
-        serial::put_hexn(rirb.add(1).read_volatile(), 16);
-    }
-    match codec_send(regs, 0x000F_0400) {
-        Some(v) => {
-            serial::puts(" nodes=0x");
-            serial::put_hexn(u64::from(v), 8);
-        }
-        None => serial::puts("[HDA] codec0: no RIRB response to node-count verb"),
-    }
-        codec_ici_probe(regs, 0x000F0000);
-        hda_scan2(regs);
-        codec_ici_probe(regs, 0x000F0400);
-        codec_scan_widgets(regs); // M7m: node-count via proven fn - emulator verb-coverage test
-        codec_ring_dump(regs);
-    serial::puts("\n");
-}
 
-/// Immediate command interface probe (M7d): no DMA, bypasses CORB/RIRB
-/// entirely — bisects "rings broken" vs "link/codec broken". Also dumps
-/// the command-path registers so the capture shows the stall point.
-/// Map per Linux ICH6: ICW 0x60 (dword), IRR 0x64 (dword), IRS 0x68
-/// (bit0 ICBUSY, bit1 IRV valid).
-fn codec_ici_probe(regs: &mut MmioRegs, verb: u32) {
-    let corbwp = regs.r16(0x48);
-    let corbrp = regs.r16(0x4A);
-    let corbctl = regs.r16(0x4C);
-    let rirbwp = regs.r16(0x58);
-    let rintcnt = regs.r16(0x5A);
-    let rirbctl = regs.r16(0x5C);
-    let rirbsts = regs.r16(0x5D);
-    serial::puts("[HDA] cmdpath corbwp=");
-    serial::put_hexn(corbwp as u64, 4);
-    serial::puts(" corbrp=");
-    serial::put_hexn(corbrp as u64, 4);
-    serial::puts(" corbctl=");
-    serial::put_hexn(corbctl as u64, 4);
-    serial::puts(" rirbwp=");
-    serial::put_hexn(rirbwp as u64, 4);
-    serial::puts(" rintcnt=");
-    serial::put_hexn(rintcnt as u64, 4);
-    serial::puts(" rirbctl=");
-    serial::put_hexn(rirbctl as u64, 4);
-    serial::puts(" rirbsts=");
-    serial::put_hexn(rirbsts as u64, 4);
-    serial::puts(" rirblbase=");
-    serial::put_hexn(((regs.r16(0x52) as u64) << 16) | (regs.r16(0x50) as u64), 8);
-    serial::puts(" corblbase=");
-    serial::put_hexn(((regs.r16(0x42) as u64) << 16) | (regs.r16(0x40) as u64), 8);
-    serial::puts("\n");
-    regs.w16(0x60, (verb & 0xffff) as u16);
-    regs.w16(0x62, (verb >> 16) as u16);
-    regs.w16(0x68, 1);
-    let mut tries: usize = 0;
-    let mut s = regs.r16(0x68);
-    while s & 1 != 0 && tries < 200000 {
-        s = regs.r16(0x68);
-        tries += 1;
-    }
-    if s & 1 != 0 {
-        serial::puts("[HDA] ICI: timeout waiting for busy clear\n");
-    } else if s & 2 != 0 {
-        let lo = regs.r16(0x64) as u32;
-        let hi = regs.r16(0x66) as u32;
-        serial::puts("[HDA] ICI response: ");
-        serial::put_hexn(((hi << 16) | lo) as u64, 8);
-        serial::puts("\n");
-    } else {
-        serial::puts("[HDA] ICI: busy cleared, no result valid\n");
-    }
-}
+    // ---- stream -------------------------------------------------------------
 
-// M7g probe: discriminate response-writeback vs verb-fetch vs late-delivery.
-// 1) dump ring memory (are our verbs in the DRAM the controller reads? did ANY
-//    response land in RIRB memory without RIRBWP moving?), 2) late re-poll of
-//    rirbwp/rirbsts after ~100ms, 3) CAd1 verb: unresponsive codec - does the
-//    controller auto-generate a no-response entry?
-fn codec_ring_dump(regs: &mut MmioRegs) {
-    unsafe {
-        serial::puts("[HDA] ringdump corb[1..3]:");
-        let corb = (&raw mut CORB_RING).cast::<u32>();
-        let mut i = 1usize;
-        while i < 4 {
-            serial::puts(" ");
-            serial::put_hexn(corb.add(i).read_volatile() as u64, 8);
-            i += 1;
-        }
-        serial::puts("\n[HDA] ringdump rirb[0..2] hi:lo:");
-        let rirb = (&raw mut RIRB_RING).cast::<u64>();
-        let mut j = 0usize;
-        while j < 2 {
-            let e = rirb.add(j).read_volatile();
-            serial::puts(" ");
-            serial::put_hexn(e >> 32, 8);
-            serial::puts(":");
-            serial::put_hexn(e & 0xFFFF_FFFF, 8);
-            j += 1;
-        }
-        serial::puts("\n");
-        let mut n = 0usize;
-        while n < 20_000_000 { core::hint::spin_loop(); n += 1; }
-        serial::puts("[HDA] late rirbwp=");
-        serial::put_hexn(regs.r16(0x58) as u64, 4);
-        serial::puts(" rirbsts=");
-        serial::put_hexn(regs.r16(0x5D) as u64, 4);
-        serial::puts("\n");
-        match codec_send(regs, 0x100F_0000) {
-            Some(r) => {
-                serial::puts("[HDA] cad1 response: ");
-                serial::put_hexn(r as u64, 8);
-                serial::puts("\n[HDA] after-cad1 rirbwp=");
+    /// Reset the stream descriptor and program it for the current parameters,
+    /// and bind the DACs to it. The stream is left stopped.
+    fn stream_setup(&mut self) -> bool {
+        let Some(fw) = stream::format_word(self.rate, 16, 2) else { return false };
+        let r = &self.regs;
+        let sd = self.sd;
+        r.w8(sd + reg::SD_CTL, 0);
+        let mut w = Wait::new(2_000);
+        while r.r8(sd + reg::SD_CTL) & 2 != 0 && !w.expired() {}
+        // Stream reset: SRST high (wait for it to stick), then low.
+        r.w8(sd + reg::SD_CTL, 1);
+        let mut w = Wait::new(2_000);
+        while r.r8(sd + reg::SD_CTL) & 1 == 0 && !w.expired() {}
+        r.w8(sd + reg::SD_CTL, 0);
+        let mut w = Wait::new(2_000);
+        while r.r8(sd + reg::SD_CTL) & 1 != 0 && !w.expired() {}
+
+        // SAFETY: the stream is stopped, so the device is not reading the BDL.
+        unsafe {
+            let ring = phys(&raw mut RING);
+            for i in 0..NFRAG {
+                BDL.0[i] = stream::bdl_entry(ring + (i * FRAG) as u64, FRAG as u32, true);
             }
-            None => serial::puts("[HDA] cad1: no RIRB response\n[HDA] after-cad1 rirbwp="),
         }
-        serial::put_hexn(regs.r16(0x58) as u64, 4);
-        serial::puts("\n");
+        let bdl = phys(&raw mut BDL);
+        fence(Ordering::SeqCst);
+        r.w8(sd + reg::SD_STS, 0x1C); // clear BCIS | FIFOE | DESE
+        r.w32(sd + reg::SD_BDPL, bdl as u32);
+        r.w32(sd + reg::SD_BDPU, (bdl >> 32) as u32);
+        r.w32(sd + reg::SD_CBL, RING_BYTES as u32);
+        r.w16(sd + reg::SD_LVI, (NFRAG - 1) as u16);
+        r.w16(sd + reg::SD_FMT, fw);
+        r.w8(sd + reg::SD_CTL + 2, TAG << 4); // stream tag, bits 23:20
+
+        let mut l = VerbList::new();
+        for i in 0..self.ndacs {
+            codec::stream_verbs(self.dacs[i], TAG, fw, &mut l);
+        }
+        let failed = self.run(&l);
+        self.ring = PlayRing::new(RING_BYTES as u32);
+        self.running = false;
+        self.time_mode = false;
+        self.configured = true;
+        failed == 0
     }
-}
 
-/// M7i: ICI-backed command path — the immediate command interface answers
-/// synchronously on this silicon (two independent 10ec0662 confirmations),
-/// while emulated RIRB delivery latency exceeds every poll budget tried
-/// (2M, 50M). CORB/RIRB engine stays for the production DMA pass; verbs
-/// route through ICI until then. Layout: ICW 0x60, IRR 0x64, IRS 0x68
-/// (bit0 BUSY, bit1 VALID).
-fn codec_send_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
-    // QEMU's intel-hda never executes ICI verbs (ICW ignored, IRR reads 0);
-    // real silicon does. CORB/RIRB works on both - route everything there.
-    codec_send(regs, verb)
-}
+    fn stream_run(&mut self) {
+        self.regs.w8(self.sd + reg::SD_CTL, 0x02);
+        self.running = true;
+        self.t_run = now_us().unwrap_or(0);
+        self.t_obs = self.t_run;
+        if !self.dumped_running {
+            self.dumped_running = true;
+            delay_us(20_000);
+            let lpib = self.regs.r32(self.sd + reg::SD_LPIB);
+            let sts = self.regs.r8(self.sd + reg::SD_STS);
+            p("[HDA] first RUN: lpib=");
+            dec(u64::from(lpib));
+            p(" sts=0x");
+            hx(u64::from(sts), 2);
+            p(" ctl=0x");
+            hx(u64::from(self.regs.r32(self.sd + reg::SD_CTL) & 0x00FF_FFFF), 6);
+            p("\n");
+            dump_state(self, "while running");
+        }
+    }
 
-// M8: brute widget/pin scan — emulator answers verbs but 0xF04 says no subnodes,
-// so walk nid range directly and look for anything that answers nonzero.
-fn codec_scan_widgets(regs: &mut MmioRegs) {
-    serial::puts("[HDA] M8 scan: pin caps (0xF0C) nid 2..0x20\n");
-    let mut nid = 2u32;
-    while nid <= 0x20 {
-        let verb = (nid << 20) | (0xF0C << 8);
-        if let Some(v) = codec_read_ici(regs, verb) {
-            if v != 0 {
-                serial::puts("[HDA] M8 nid 0x");
-                serial::put_hexn(nid as u64, 2);
-                serial::puts(" pin_caps=0x");
-                serial::put_hexn(v as u64, 8);
-                serial::puts("\n");
-                let cfg = codec_read_ici(regs, (nid << 20) | (0xF1C << 8));
-                if let Some(c) = cfg {
-                    serial::puts("[HDA] M8 nid 0x");
-                    serial::put_hexn(nid as u64, 2);
-                    serial::puts(" cfg_default=0x");
-                    serial::put_hexn(c as u64, 8);
-                    serial::puts("\n");
+    fn stream_stop(&mut self) {
+        self.regs.w8(self.sd + reg::SD_CTL, 0);
+        self.running = false;
+        self.configured = false;
+    }
+
+    /// Fold the hardware position into the ring.
+    fn observe(&mut self) {
+        let now = now_us().unwrap_or(0);
+        if self.time_mode {
+            let bps = u64::from(self.rate) * 4;
+            let pos = (now.saturating_sub(self.t_run) * bps / 1_000_000) % RING_BYTES as u64;
+            self.ring.observe(pos as u32);
+        } else {
+            self.ring.observe(self.regs.r32(self.sd + reg::SD_LPIB));
+            // LPIB frozen 60 ms after RUN: this controller's position register
+            // is not to be trusted; fall back to the clock.
+            if self.ring.consumed() == 0 && now.saturating_sub(self.t_run) > 60_000 && self.t_run != 0 {
+                p("[HDA] LPIB not advancing; pacing by clock\n");
+                self.time_mode = true;
+            }
+        }
+        self.t_obs = now;
+    }
+
+    /// One lap of the ring, in µs.
+    fn lap_us(&self) -> u64 {
+        RING_BYTES as u64 * 1_000_000 / (u64::from(self.rate) * 4)
+    }
+
+    fn idle(&self) {
+        if self.may_yield {
+            crate::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Queue PCM. Blocks (yielding) while the ring is full; returns the number
+    /// of bytes consumed from `data` (all of it, less a trailing partial frame).
+    fn write(&mut self, data: &[u8]) -> usize {
+        let mut src = data;
+        let mut tmp = [0u8; 2048];
+        while !src.is_empty() {
+            if !self.configured && !self.stream_setup() {
+                p("[HDA] stream setup failed\n");
+                return data.len() - src.len();
+            }
+            if self.running {
+                // A lap missed while nobody was writing loses count of the
+                // position (LPIB only says where in the ring the hardware is),
+                // and either way the hardware is replaying stale bytes.
+                let missed = now_us().unwrap_or(0).saturating_sub(self.t_obs) > self.lap_us();
+                self.observe();
+                if self.ring.underrun() || missed {
+                    self.underruns += 1;
+                    self.stream_stop();
+                    continue;
                 }
             }
-        }
-        nid += 1;
-    }
-    serial::puts("[HDA] M8 scan done\n");
-    unsafe { codec_raw_scan(regs); }
-    m9_beep(regs);
-    m9a5_bcis(regs);
-        m8_raw_scan(regs);
-}
-
-fn codec_read_ici(regs: &mut MmioRegs, verb: u32) -> Option<u32> {
-    codec_send(regs, verb)
-}
-fn hda_scan2(regs: &mut MmioRegs) {
-    serial::puts("[HDA] M8raw: pin caps 0xF0C raw, nid 2..0x20\n");
-    let mut nid = 2u32;
-    while nid <= 0x20 {
-        let verb = (nid << 20) | 0x000F_0C00;
-        let r = codec_read_ici(regs, verb);
-        serial::puts("[HDA] M8raw nid=");
-        serial::put_hexn(nid as u64, 2);
-        serial::puts(" resp=");
-        match r {
-            Some(v) => serial::put_hexn(v as u64, 8),
-            None => serial::puts("none"),
-        }
-        serial::puts("\n");
-        nid += 1;
-    }
-    serial::puts("[HDA] M8raw done\n");
-}
-
-// M8b: raw unfiltered dump - every nid's responses, no zeros filtered out.
-fn m8_raw_scan(regs: &mut MmioRegs) {
-    serial::puts("[HDA] M8b raw scan nid 1..0x1f (0xF0C | 0xF1C)\n");
-    let mut nid = 1u32;
-    while nid <= 0x1f {
-        let caps = codec_read_ici(regs, nid << 20 | 0xF0C00);
-        let cfg = codec_read_ici(regs, nid << 20 | 0xF1C00);
-        serial::puts("[HDA] nid ");
-        serial::put_hexn(nid as u64, 2);
-        serial::puts(" caps=");
-        match caps {
-            Some(v) => serial::put_hexn(v as u64, 8),
-            None => serial::puts("none"),
-        }
-        serial::puts(" cfg=");
-        match cfg {
-            Some(v) => serial::put_hexn(v as u64, 8),
-            None => serial::puts("none"),
-        }
-        serial::puts("\n");
-        nid += 1;
-    }
-    serial::puts("[HDA] M8b raw scan done\n");
-}
-// M8b: raw scan, no filter - print every nid response to find what the emulator actually implements
-unsafe fn codec_raw_scan(regs: &mut MmioRegs) {
-    serial::puts("[HDA] M8b raw scan nid 1..0x20: caps(0xF0C)= type(0xF08)= cfg(0xF1C)=\n");
-    let mut nid = 1usize;
-    while nid <= 0x20 {
-        let verb = 0x000F_0C00 | ((nid as u32) << 20);
-        match codec_read_ici(regs, verb) {
-            Some(v) => {
-                serial::puts("    nid ");
-                serial::put_hexn(nid as u64, 2);
-                serial::puts(": caps=");
-                serial::put_hexn(v as u64, 8);
-                let vt = 0x000F_0800 | ((nid as u32) << 20);
-                let t = codec_read_ici(regs, vt).unwrap_or(0xDEAD_BEEF);
-                serial::puts(" type=");
-                serial::put_hexn(t as u64, 8);
-                let vc = 0x000F_1C00 | ((nid as u32) << 20);
-                let c = codec_read_ici(regs, vc).unwrap_or(0xDEAD_BEEF);
-                serial::puts(" cfg=");
-                serial::put_hexn(c as u64, 8);
-                serial::puts("\n");
+            let space = self.ring.space(GUARD) & !3;
+            if space < 4 {
+                self.idle();
+                continue;
             }
-            None => {
-                serial::puts("    nid ");
-                serial::put_hexn(nid as u64, 2);
-                serial::puts(": None\n");
+            let room = space.min(tmp.len());
+            let (ci, co) = stream::to_s16_stereo(self.fmt, self.channels, src, &mut tmp[..room]);
+            if co == 0 {
+                break; // less than one whole frame left: drop it
+            }
+            let (off, first, second) = self.ring.reserve(co);
+            // SAFETY: `reserve` handed out `[off, off+first)` and `[0, second)`,
+            // which `space` proved the hardware has already consumed.
+            unsafe {
+                let base = (&raw mut RING.0).cast::<u8>();
+                core::ptr::copy_nonoverlapping(tmp.as_ptr(), base.add(off), first);
+                core::ptr::copy_nonoverlapping(tmp.as_ptr().add(first), base, second);
+            }
+            src = &src[ci..];
+            if !self.running && self.ring.buffered() >= (RING_BYTES / 2) as u64 {
+                fence(Ordering::SeqCst);
+                self.stream_run();
             }
         }
-        nid += 1;
-    }
-    serial::puts("[HDA] M8b raw scan done\n");
-}
-
-// ---- M9a: hardcoded ALC662 + stream DMA beep (root block 36078) ----
-static mut BEEP_BUF: [u8; 192000] = [0; 192000]; // 1s of 48k/16-bit/stereo
-#[repr(align(128))]
-struct BeepBdl([u64; 4]); // 2 BDL entries x 16 bytes; only entry 0 used
-static mut BEEP_BDL: BeepBdl = BeepBdl([0; 4]);
-
-pub fn m9_beep(regs: &mut MmioRegs) {
-    unsafe { HDA_BASE = regs.base as usize; } // capture base for /dev/dsp backend
-    unsafe {
-        // 440Hz square, 48k frames/s stereo; half-period in frames
-        let half = 54444u32 / 440; // ~123 frames? no: 48000/440/2 = 54
-        let halff = 48000u32 / 440 / 2;
-        let mut i = 0usize;
-        while i < 192000 {
-            let frame = (i / 4) as u32;
-            let s: i16 = if frame % halff < halff / 2 { 8000 } else { -8000 };
-            let b = s.to_le_bytes();
-            BEEP_BUF[i] = b[0];
-            BEEP_BUF[i + 1] = b[1];
-            BEEP_BUF[i + 2] = b[0];
-            BEEP_BUF[i + 3] = b[1];
-            i += 4;
-        }
-        let _ = half;
-        let buf_phys = akuma_primitives::addr::virt_to_phys((&raw mut BEEP_BUF) as usize) as u64;
-        let bdl_phys = akuma_primitives::addr::virt_to_phys((&raw mut BEEP_BDL) as usize) as u64;
-        // BDL entry 0 (16 bytes = 2 u64): [addr_lo|addr_hi, len|IOC<<63]
-        BEEP_BDL.0[0] = buf_phys;
-        BEEP_BDL.0[1] = 192000u64;
-        // M9c: hardcoded ALC662 verbs — canonical (nid<<20)|(verb<<8)|payload.
-        // Old block was nibble-short (nid field = 0) + a GET instead of SET +
-        // amp payload had the MUTE bit set: codec sat factory-muted with
-        // stream tag 0, i.e. guaranteed silence on real silicon.
-        codec_send_ici(regs, 0x02202011); // SET_CONV_FMT nid2: 48k/16/stereo
-        codec_send_ici(regs, 0x02270610); // SET_CONV_STREAM nid2: stream=1 ch=0 (nid was 0!)
-        // Amp verbs: V=0xB, payload = (in?0x4000)|(L?0x2000)|(R?0x1000)|(idx<<8)|(mute0x80|gain).
-        // alsa-info ground truth: DAC 0x02 amp nsteps=0x57, Ubuntu audible at 0x38;
-        // gain 0 on any amp = MAX attenuation (silent). Mixer 0x0c input amp feeds
-        // HP pin 0x1b at connection index 0 (conn list 0x0c* 0x0d 0x0e).
-        // Power-state: force D0 on AFG + the playback widgets (GET/SET_POWER verb 0xF05/0x705).
-        let pw = codec_send_ici(regs, 0x00ff0500); // GET_POWER nid1 (AFG)
-        serial::puts("[HDA] M9c GET_POWER nid1=0x"); serial::put_hexn(pw.unwrap_or(0) as u64, 2); serial::puts("\n");
-        codec_send_ici(regs, 0x00170500); // SET_POWER nid1 = D0
-        codec_send_ici(regs, 0x00270500); // SET_POWER nid2 (DAC) = D0
-        codec_send_ici(regs, 0x00c70500); // SET_POWER nid0c (mixer) = D0
-        codec_send_ici(regs, 0x00b70500); // SET_POWER nid0b (mixer) = D0
-        codec_send_ici(regs, 0x01b70500); // SET_POWER nid1b (HP pin) = D0
-        codec_send_ici(regs, 0x01470500); // SET_POWER nid14 (spk pin) = D0
-        codec_send_ici(regs, 0x0023b138); // SET_AMP nid2 out: L+R unmute, gain 0x38 (Ubuntu level)
-        codec_send_ici(regs, 0x00c3b138); // SET_AMP nid0c in(idx0): L+R unmute, gain 0x38 (mixer stage)
-        // Pin ctrl: OUT+HP enable (0xC0) | VREF 0x3 → 0xC3, plus EAPD BTLR=0x3
-        // (SET_EAPD 0x70C) on both pins — ALC boards keep the jack amp
-        // tri-stated without EAPD, even when everything else reads correct.
-        codec_send_ici(regs, 0x01b707c3); // SET_PIN_CTRL nid1b: 0xC3
-        codec_send_ici(regs, 0x014707c3); // SET_PIN_CTRL nid14: 0xC3 (line-out companion)
-        codec_send_ici(regs, 0x01b70c03); // SET_EAPD nid1b: BTLR=0x3
-        codec_send_ici(regs, 0x01470c03); // SET_EAPD nid14: BTLR=0x3
-        let gf = codec_send_ici(regs, 0x002a0000); // GET_CONV_FMT nid2 (12-bit verb 0xA)
-        serial::puts("[HDA] M9c GET_CONV_FMT nid2=0x"); serial::put_hexn(gf.unwrap_or(0) as u64, 4); serial::puts("\n");
-        let gs2 = codec_send_ici(regs, 0x002f0600); // re-GET stream tag AFTER SD0 setup (proves bind stuck)
-        serial::puts("[HDA] M9c GET_STREAM nid2 late=0x"); serial::put_hexn(gs2.unwrap_or(0) as u64, 4); serial::puts("\n");
-        // Jack detection: plug is in nid 0x1b (cfg 0221401f: HP-out, 3.5mm, present).
-        codec_send_ici(regs, 0x01b701c3); // SET_PIN_VREF nid1b: 0xc3 = OUT-enable | HP-drive | VREF50 (alsa-info parity)
-        // (alsa-info: 0x1b actually hangs off mixer 0x0c, conn idx 0 - the old 0x0e route was wrong).
-        // GET readbacks: the boot log itself proves the state took (spec 7.3.3).
-        let ga = codec_send_ici(regs, 0x002b0100); // GET_AMP nid2 out
-        serial::puts("[HDA] M9c GET_AMP nid2 out=0x"); serial::put_hexn(ga.unwrap_or(0) as u64, 2); serial::puts("\n");
-        let gs = codec_send_ici(regs, 0x002f0600); // GET_CONV_STREAM nid2
-        serial::puts("[HDA] M9c GET_STREAM nid2=0x"); serial::put_hexn(gs.unwrap_or(0) as u64, 4); serial::puts("\n");
-        let gp = codec_send_ici(regs, 0x01bf0700); // GET_PIN_CTRL nid1b (expect 0xc3)
-        serial::puts("[HDA] M9c GET_PINCTRL nid1b=0x"); serial::put_hexn(gp.unwrap_or(0) as u64, 2); serial::puts("\n");
-        // Pin 0x1b has NO output amp (ALC662 jack pins are ampless) — readback 0x00 is
-        // correct and NOT the problem; the mute chain is DAC(0x02)+mixer(0x0c), both set.
-        let gi = codec_send_ici(regs, 0x01b3b000); // GET_AMP nid1b out (V=0xB nid1b)
-        serial::puts("[HDA] M9c GET_AMP nid1b out=0x"); serial::put_hexn(gi.unwrap_or(0) as u64, 2); serial::puts("\n");
-        let gc = codec_send_ici(regs, 0x01bf50c0); // GET_CFG_DEFAULT nid1b (jack presence!)
-        serial::puts("[HDA] M9c GET_CFG nid1b=0x"); serial::put_hexn(gc.unwrap_or(0) as u64, 8); serial::puts("\n");
-        let gx = codec_send_ici(regs, 0x01bf0c00); // GET_CONNECT_SEL nid1b: which mixer input feeds the pin
-        serial::puts("[HDA] M9c GET_CONNSEL nid1b=0x"); serial::put_hexn(gx.unwrap_or(0) as u64, 2); serial::puts("\n");
-        serial::puts("[HDA] M9: verbs sent, SD0 setup\n");
-        // SDI0 @0x100: stop+reset stream first
-        regs.w16(0x100, 0);
-        regs.w16(0x102, 0x2000); // SRST=1 (bit13 high half)
-        for _ in 0..1000 { core::hint::spin_loop(); }
-        regs.w16(0x102, 0x0010); // STRM=1 (bits 23:20 high half), SRST=0
-        // CBL = 192000 = BDL entry len (was 176400, mismatch → DESE)
-        regs.w16(0x108, 0xee00);
-        regs.w16(0x10a, 0x0002);
-        regs.w16(0x110, 0x0000); // LVI = entries-1 = 0 (0x10C was CBL hi!)
-        regs.w16(0x118, (bdl_phys & 0xffff) as u16);
-        regs.w16(0x11a, ((bdl_phys >> 16) & 0xffff) as u16);
-        regs.w16(0x11c, ((bdl_phys >> 32) & 0xffff) as u16);
-        regs.w16(0x11e, 0);
-        let lp0 = regs.r16(0x104);
-        regs.w16(0x114, 0x4011); // SDFMT @0x114: 44.1k/16-bit/stereo (0x112 = RO FIFOW!)
-        regs.w16(0x100, 0x12); // CTL: STRM=1 (bits7:4) | RUN (was 2 = stream 0!)
-        serial::puts("[HDA] M9a4 lvi@10C="); serial::put_hexn(regs.r16(0x10C) as u64, 4); serial::puts(" fifow@10E="); serial::put_hexn(regs.r16(0x10E) as u64, 4); serial::puts(" fmt@112="); serial::put_hexn(regs.r16(0x112) as u64, 4); serial::puts("\n");
-        serial::puts("[HDA] SD0 dump: ctl=0x");
-        serial::put_hexn(regs.r16(0x100) as u64, 4);
-        serial::puts(" sts=0x");
-        serial::put_hexn(regs.r16(0x102) as u64, 4);
-        serial::puts(" cbl=0x");
-        serial::put_hexn((regs.r16(0x108) as u64) | ((regs.r16(0x10A) as u64) << 16), 8);
-        serial::puts(" lvi=0x");
-        serial::put_hexn(regs.r16(0x110) as u64, 4);
-        serial::puts(" bdl=0x");
-        serial::put_hexn((regs.r16(0x118) as u64) | ((regs.r16(0x11A) as u64) << 16), 8);
-        serial::puts(" lpib=0x");
-        serial::put_hexn(regs.r16(0x104) as u64, 4);
-        serial::puts("\n");
-        for _ in 0..4_000_000 { core::hint::spin_loop(); }
-        let lp1 = regs.r16(0x104);
-        serial::puts("[HDA] M9 LPIB: 0x");
-        serial::put_hexn(lp0 as u64, 4);
-        serial::puts(" -> 0x");
-        serial::put_hexn(lp1 as u64, 4);
-        serial::puts("\n");
-        if lp1 != lp0 { serial::puts("[HDA] M9: DMA ALIVE - stream running\n"); }
-        else { serial::puts("[HDA] M9a4 sts-after="); serial::put_hexn(regs.r16(0x102) as u64, 4); serial::puts("\n");
-        serial::puts("[HDA] M9: LPIB frozen\n"); }
-    }
-}
-
-// M9a5: BCIS counting probe - proves CONTINUOUS dma playback (not one completion)
-fn m9a5_bcis(regs: &mut MmioRegs) {
-    let mut n: u32 = 0;
-    let mut i: u32 = 0;
-    while i < 10 {
-        let mut d: u32 = 0;
-        while d < 8000000 { d += 1; }
-        let sts = regs.r16(0x103);
-        if sts & 0x0004 != 0 {
-            n += 1;
-            regs.w16(0x103, 0x0004); // w1c BCIS
-        }
-        serial::puts("[HDA] M9a5 t=");
-        serial::put_hexn(i as u64, 1);
-        serial::puts(" sts=");
-        serial::put_hexn(sts as u64, 4);
-        serial::puts(" lpib=");
-        serial::put_hexn(((regs.r16(0x104) as u64) | ((regs.r16(0x106) as u64) << 16)), 8);
-        unsafe {
-            serial::puts(" buf=");
-            serial::put_hexn(BEEP_BUF[0] as u64, 2);
-            serial::put_hexn(BEEP_BUF[96000] as u64, 2);
-        }
-        serial::puts("\n");
-        i += 1;
-    }
-    serial::puts("[HDA] M9a5 BCIS count=");
-    serial::put_hexn(n as u64, 2);
-    serial::puts("\n");
-}
-
-// ===== Stage 1: /dev/dsp kernel API (feeds the proven SD0 engine) =====
-// Global MMIO base captured by init()/m9_beep(); a small config record for
-// the glue layer to read; and dsp_write(): blocking single-buffer playback.
-#[allow(dead_code)]
-#[allow(dead_code)]
-pub static mut HDA_BASE: usize = 0;
-#[allow(dead_code)]
-#[allow(dead_code)]
-pub struct DspInfo { pub rate: u32, pub channels: u16, pub fmt: u16 }
-#[allow(dead_code)]
-#[allow(dead_code)]
-pub static mut HDA_DSP: DspInfo = DspInfo { rate: 48000, channels: 2, fmt: 0x0011 };
-
-#[allow(dead_code)]
-#[allow(dead_code)]
-pub fn hda_dsp_available() -> bool {
-    unsafe { HDA_BASE != 0 }
-}
-
-// Configure stream format (rate only matters to userspace here; the codec
-// was already programmed to 48k/16/2 by the beep bring-up).
-#[allow(dead_code)]
-#[allow(dead_code)]
-pub fn hda_dsp_set_rate(rate: u32) { unsafe { HDA_DSP.rate = rate; } }
-
-// Blocking write: copy into BEEP_BUF (64KiB), arm BDL entry 0 (len = n,
-// IOC on last), ensure RUN, wait for BCIS, w1c. Buffer larger than 64KiB
-// is truncated by the caller (fd layer re-chunks into periods).
-
-// --- /dev/dsp backend trampolines (meow): registered into akuma_virtio::audio
-pub unsafe extern "Rust" fn hda_dsp_tramp_write(p: *const u8, n: usize) -> usize {
-    hda_dsp_write(core::slice::from_raw_parts(p, n))
-}
-pub unsafe extern "Rust" fn hda_dsp_tramp_stop() {
-    unsafe { if HDA_BASE != 0 { MmioRegs { base: HDA_BASE as *mut u8 }.w16(0x100, 0); } } // RUN off (was: infinite recursion!)
-}
-#[allow(dead_code)]
-pub unsafe fn hda_dsp_write(data: &[u8]) -> usize {
-    // M9-blocking: pace playback at real time. data is 24-bit stereo PCM
-    // (44100 Hz, 3-byte LE samples from the WAV) -> convert to 16-bit and
-    // chunk it into the 192000-byte ring, waiting real microseconds between
-    // chunks so the file plays at true duration.
-    unsafe {
-        let b = HDA_BASE;
-        if b == 0 { return 0; }
-        let mut ctl = MmioRegs { base: b as *mut u8 };
-        // M9c: re-point codec+SD0 at 44.1k (m9_beep left the 48k pair).
-        ctl.w16(0x100, 0); // RUN off while changing FMT
-        codec_send_ici(&mut ctl, 0x02204011); // SET_CONV_FMT nid2: 44.1k/16/stereo
-        codec_send_ici(&mut ctl, 0x02270610); // re-bind stream 1 after FMT switch
-        ctl.w16(0x114, 0x4011); // SDFMT @0x114: 44.1k/16-bit/stereo (0x112 = RO FIFOW!)
-        ctl.w16(0x100, 0x12); // STRM=1 (bits 7:4) | RUN (plain 2 = untagged!)
-        // 16-bit stereo @44100Hz: 88200 bytes/s. Chunk = full ring.
-        const CHUNK: usize = 192000; // bytes per DMA round (even)
-        const RATE: u64 = 176400; // 24-bit source bytes/s (out is 16-bit)     // bytes per second
-        let mut off = 0usize;
-        let t0 = crate::lapic::tsc_uptime_us().unwrap_or(0);
-        let mut played_us: u64 = 0;
-        while off < data.len() {
-            let src = &data[off..];
-            // convert 24-bit LE -> 16-bit LE into BEEP_BUF
-            let mut o = 0usize;
-            let mut i = 0usize;
-            while i + 3 <= src.len() && o + 2 <= CHUNK {
-                let s24 = (src[i] as u32) | ((src[i+1] as u32) << 8) | ((src[i+2] as u32) << 16);
-                // sign-extend 24 -> 32 then take top 16 (simple, quiet-ish but valid)
-                let s32 = ((s24 << 8) as i32) >> 16;
-                BEEP_BUF[o] = (s32 & 0xff) as u8;
-                BEEP_BUF[o+1] = ((s32 >> 8) & 0xff) as u8;
-                o += 2; i += 3;
-            }
-            let n = o;
-            if n == 0 { break; }
-            // (re)arm single-entry BDL
-            ctl.w16(0x100, 0); // RUN off
-            let pa = (&raw const BEEP_BUF) as *const u8 as usize;
-            let ph = akuma_primitives::addr::virt_to_phys(pa);
-            BEEP_BDL.0[0] = ph as u64;
-            BEEP_BDL.0[1] = n as u64; // same encoding as the working beep: len in low dword
-            ctl.w16(0x118, (ph & 0xffff) as u16);
-            ctl.w16(0x11A, ((ph >> 16) & 0xffff) as u16);
-            ctl.w16(0x110, 0);   // LVI=0: one entry (0x10E was RO FIFOW hi!)
-            ctl.w16(0x108, (n & 0xffff) as u16); // CBL = this chunk's bytes
-            ctl.w16(0x10A, (n >> 16) as u16);
-            ctl.w16(0x103, 4);   // w1c BCIS
-            ctl.w16(0x100, 0x12); // STRM=1 | RUN
-            codec_send_ici(&mut ctl, 0x02270610); // keep converter bound (RUN cycling can drop it)
-            // wait real time for this chunk: n bytes at RATE bytes/s
-            let want_us = (n as u64) * 1_000_000 / RATE;
-            let target = t0 + played_us + want_us;
-            loop {
-                let now = crate::lapic::tsc_uptime_us().unwrap_or(target);
-                if now >= target { break; }
-                let sts = ctl.r16(0x103);
-                if sts & 4 != 0 { ctl.w16(0x103, 4); }
-            }
-            played_us += want_us;
-            off += i; // consumed i source bytes (24-bit)
-        }
-        ctl.w16(0x100, 0); // RUN off at end
         data.len()
     }
+
+    /// Append `bytes` of digital silence (16-bit stereo zeros) to the ring,
+    /// waiting for space as `write` does.
+    fn push_silence(&mut self, mut bytes: usize) {
+        while bytes > 0 && self.configured {
+            if self.running {
+                self.observe();
+            }
+            let n = self.ring.space(GUARD).min(bytes) & !3;
+            if n < 4 {
+                self.idle();
+                continue;
+            }
+            let (off, first, second) = self.ring.reserve(n);
+            // SAFETY: as in `write`; the spans are ones `space` proved consumed.
+            unsafe {
+                let base = (&raw mut RING.0).cast::<u8>();
+                core::ptr::write_bytes(base.add(off), 0, first);
+                core::ptr::write_bytes(base, 0, second);
+            }
+            bytes -= n;
+            if !self.running && self.ring.buffered() >= (RING_BYTES / 2) as u64 {
+                fence(Ordering::SeqCst);
+                self.stream_run();
+            }
+        }
+    }
+
+    /// Play out what is buffered and stop the stream.
+    fn drain(&mut self) {
+        if !self.configured {
+            return;
+        }
+        // The position register runs ahead of what has left the converter
+        // (an emulated controller by a whole buffer, real silicon by its FIFO
+        // and the DAC pipeline): stopping the moment it reaches the last real
+        // sample truncates the tail. 100 ms of silence behind the audio costs
+        // nothing on a path that runs once, at close.
+        self.push_silence(self.rate as usize * 4 / 10);
+        if !self.running && self.ring.buffered() > 0 {
+            fence(Ordering::SeqCst);
+            self.stream_run();
+        }
+        if self.running {
+            let mut w = Wait::new(self.lap_us() + 200_000);
+            loop {
+                self.observe();
+                if self.ring.underrun() || w.expired() {
+                    break;
+                }
+                self.idle();
+            }
+        }
+        self.stream_stop();
+    }
+}
+
+impl VerbBus for Hda {
+    fn send(&mut self, v: u32) -> Option<u32> {
+        let v = verb::with_cad(v, self.cad);
+        if self.use_ici { self.send_ici(v) } else { self.send_corb(v) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bring-up
+// ---------------------------------------------------------------------------
+
+fn kind_name(k: Kind) -> &'static str {
+    match k {
+        Kind::OutputConverter => "dac",
+        Kind::InputConverter => "adc",
+        Kind::Mixer => "mixer",
+        Kind::Selector => "selector",
+        Kind::Pin => "pin",
+        Kind::Other(_) => "other",
+        Kind::Absent => "-",
+    }
+}
+
+fn role_name(r: PinRole) -> &'static str {
+    match r {
+        PinRole::LineOut => "line-out",
+        PinRole::Speaker => "speaker",
+        PinRole::Headphone => "headphone",
+    }
+}
+
+/// Print the widget graph once — the runbook's step 4, which is where a wrong
+/// turn is silent.
+fn print_graph(g: &codec::Graph) {
+    p("[HDA] graph: afg=0x");
+    hx(u64::from(g.afg), 2);
+    p(" widgets=");
+    dec(u64::from(g.count));
+    p("\n");
+    for w in g.iter() {
+        if matches!(w.kind, Kind::Other(_)) {
+            continue;
+        }
+        p("[HDA]   ");
+        hx(u64::from(w.nid), 2);
+        p(" ");
+        p(kind_name(w.kind));
+        if w.kind == Kind::Pin {
+            p(" cfg=");
+            hx(u64::from(w.pin_cfg), 8);
+            if let Some(role) = w.output_role() {
+                p(" ");
+                p(role_name(role));
+            }
+        }
+        if w.nconn > 0 {
+            p(" <-");
+            for c in &w.conn[..usize::from(w.nconn)] {
+                p(" ");
+                hx(u64::from(*c), 2);
+            }
+        }
+        p("\n");
+    }
+}
+
+/// Read back and print what the codec actually holds for every DAC, mixer and
+/// output pin — the evidence that separates "the verbs were wrong" from "the
+/// verbs were right and the analog side is somewhere we have not looked".
+fn dump_state(h: &mut Hda, when: &str) {
+    let Some(g) = h.graph.take() else { return };
+    p("[HDA] state ");
+    p(when);
+    p(":\n");
+    let gpio = h.send(verb::get_param(g.afg, verb::param::GPIO_COUNT)).unwrap_or(0);
+    p("[HDA]   afg power=0x");
+    hx(u64::from(h.send(verb::get_power(g.afg)).unwrap_or(0xFFFF)), 2);
+    p(" gpios=");
+    dec(u64::from(gpio & 0xFF));
+    p(" data=0x");
+    hx(u64::from(h.send(verb::get_gpio_data(g.afg)).unwrap_or(0xFFFF)), 2);
+    p(" enable=0x");
+    hx(u64::from(h.send(verb::get_gpio_enable(g.afg)).unwrap_or(0xFFFF)), 2);
+    p(" dir=0x");
+    hx(u64::from(h.send(verb::get_gpio_dir(g.afg)).unwrap_or(0xFFFF)), 2);
+    p("\n");
+    for w in g.iter() {
+        let interesting = match w.kind {
+            Kind::OutputConverter | Kind::Mixer => true,
+            Kind::Pin => w.output_role().is_some(),
+            _ => false,
+        };
+        if !interesting {
+            continue;
+        }
+        p("[HDA]   ");
+        hx(u64::from(w.nid), 2);
+        p(" ");
+        p(kind_name(w.kind));
+        p(" pwr=0x");
+        hx(u64::from(h.send(verb::get_power(w.nid)).unwrap_or(0xFFFF)), 2);
+        if w.kind == Kind::OutputConverter {
+            p(" stream=0x");
+            hx(u64::from(h.send(verb::get_stream(w.nid)).unwrap_or(0xFFFF)), 2);
+            p(" fmt=0x");
+            hx(u64::from(h.send(verb::get_conv_fmt(w.nid)).unwrap_or(0xFFFF)), 4);
+        }
+        if w.kind == Kind::Pin {
+            p(" ctl=0x");
+            hx(u64::from(h.send(verb::get_pin_ctrl(w.nid)).unwrap_or(0xFFFF)), 2);
+            p(" eapd=0x");
+            hx(u64::from(h.send(verb::get_eapd(w.nid)).unwrap_or(0xFFFF)), 2);
+            p(" sense=0x");
+            hx(u64::from(h.send(verb::get_pin_sense(w.nid)).unwrap_or(0xFFFF)), 8);
+        }
+        if w.nconn > 1 && w.kind != Kind::Mixer {
+            p(" sel=");
+            dec(u64::from(h.send(verb::get_conn_sel(w.nid)).unwrap_or(0xFF)));
+        }
+        if w.has_out_amp() {
+            p(" out=");
+            hx(u64::from(h.send(verb::get_amp(w.nid, true, true, 0)).unwrap_or(0xFFFF)), 2);
+            p("/");
+            hx(u64::from(h.send(verb::get_amp(w.nid, true, false, 0)).unwrap_or(0xFFFF)), 2);
+        }
+        if w.has_in_amp() {
+            p(" in[");
+            for i in 0..w.nconn.max(1) {
+                if i > 0 {
+                    p(" ");
+                }
+                hx(u64::from(h.send(verb::get_amp(w.nid, false, true, i)).unwrap_or(0xFFFF)), 2);
+            }
+            p("]");
+        }
+        p("\n");
+    }
+    h.graph = Some(g);
+}
+
+fn print_verify(h: &mut Hda, pin: u8, dac: u8) {
+    let stream = h.send(verb::get_stream(dac)).unwrap_or(0xFFFF);
+    let fmt = h.send(verb::get_conv_fmt(dac)).unwrap_or(0xFFFF);
+    let amp = h.send(verb::get_amp(dac, true, true, 0)).unwrap_or(0xFFFF);
+    let pctl = h.send(verb::get_pin_ctrl(pin)).unwrap_or(0xFFFF);
+    let pow = h.send(verb::get_power(dac)).unwrap_or(0xFFFF);
+    p("[HDA] verify dac 0x");
+    hx(u64::from(dac), 2);
+    p(": stream=0x");
+    hx(u64::from(stream), 2);
+    p(" fmt=0x");
+    hx(u64::from(fmt), 4);
+    p(" amp=0x");
+    hx(u64::from(amp), 2);
+    p(" power=0x");
+    hx(u64::from(pow), 2);
+    p("  pin 0x");
+    hx(u64::from(pin), 2);
+    p(" ctl=0x");
+    hx(u64::from(pctl), 2);
+    p("\n");
+}
+
+/// Find the Intel HDA controller, bring it and its codec up, and register
+/// `/dev/dsp`. Best-effort: on any failure it prints one line and returns, and
+/// the box boots without sound. `selftest` plays a one-second tone through the
+/// same write path `wavplay` uses.
+pub fn init(selftest: bool) {
+    let Some(dev) = crate::pci::find_class(akuma_pci::class::MULTIMEDIA, akuma_pci::subclass::AUDIO) else {
+        p("[HDA] no audio-class function on the bus\n");
+        return;
+    };
+    // The census: on the trashcan the NVIDIA HDMI function is class 04:03 too.
+    crate::pci::for_each(|d| {
+        if d.header.is_audio() {
+            p("[HDA] audio function ");
+            hx(u64::from(d.header.vendor_id), 4);
+            p(":");
+            hx(u64::from(d.header.device_id), 4);
+            p("\n");
+        }
+    });
+    let addr = dev.addr;
+    if dev.header.vendor_id != INTEL {
+        p("[HDA] first 04:03 function is not Intel; leaving audio off\n");
+        return;
+    }
+    crate::pci::enable(addr, true);
+
+    // Power: a healthy controller is already D0. Cycling D3->D0 on one that is
+    // wedges it (every BAR0 byte then reads 0xff), so only ever write D0 back
+    // when PMCSR says it is something else.
+    let cfg = crate::pci::config_space(addr);
+    for cap in akuma_pci::capabilities(&cfg, dev.header.capabilities_pointer) {
+        if cap.id == akuma_pci::capability_id::POWER_MANAGEMENT {
+            let pmcsr = crate::pci::read_u16_config(addr, cap.offset + 4);
+            if akuma_pci::pm::power_state(pmcsr) != akuma_pci::pm::D0 {
+                crate::pci::write_u16_config(addr, cap.offset + 4, pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
+                delay_us(10_000);
+                p("[HDA] PCI power state was not D0; wrote D0\n");
+            }
+            break;
+        }
+    }
+
+    let Some(bar) = dev.bars.into_iter().next().flatten() else {
+        p("[HDA] BAR0 absent\n");
+        return;
+    };
+    let (size, _) = crate::pci::probe_bar_size(addr, 0);
+    let Some(base) = crate::pci::map_bar(bar, size.max(0x4000)) else {
+        p("[HDA] BAR0 map failed\n");
+        return;
+    };
+    let regs = Mmio { base };
+    let Some(info) = akuma_hda::discover(&regs) else {
+        p("[HDA] BAR0 reads 0xffff: not decoded\n");
+        return;
+    };
+    p("[HDA] ");
+    hx(u64::from(dev.header.vendor_id), 4);
+    p(":");
+    hx(u64::from(dev.header.device_id), 4);
+    p(" version=");
+    dec(u64::from(info.vmaj));
+    p(".");
+    dec(u64::from(info.vmin));
+    p(" oss=");
+    dec(u64::from(info.gcap.output_streams()));
+    p(" iss=");
+    dec(u64::from(info.gcap.input_streams()));
+    p(" 64bit=");
+    dec(u64::from(info.gcap.supports_64bit()));
+    p("\n");
+    if info.gcap.output_streams() == 0 {
+        p("[HDA] no output streams\n");
+        return;
+    }
+
+    // Reset, then wait for the codecs to announce themselves (they need
+    // ~521 us after the link comes up, and STATESTS is only valid after that).
+    if !akuma_hda::reset(&regs, 1 << 16, || delay_us(1)) {
+        p("[HDA] CRST handshake failed\n");
+        return;
+    }
+    regs.w32(reg::INTCTL, 0);
+    delay_us(1_000);
+    let mut w = Wait::new(100_000);
+    let mut states = regs.r16(reg::STATESTS) & 0x7FFF;
+    while states == 0 && !w.expired() {
+        states = regs.r16(reg::STATESTS) & 0x7FFF;
+    }
+    if states == 0 {
+        p("[HDA] no codec answered the link wake-up\n");
+        return;
+    }
+    regs.w16(reg::STATESTS, states);
+    let cad = states.trailing_zeros() as u8;
+    p("[HDA] codec address ");
+    dec(u64::from(cad));
+    p(" (statests 0x");
+    hx(u64::from(states), 4);
+    p(")\n");
+
+    let mut h = Hda {
+        regs,
+        cad,
+        use_ici: false,
+        rirb_rp: 0,
+        sd: reg::output_sd(info.gcap.input_streams(), 0),
+        dacs: [0; 4],
+        ndacs: 0,
+        rate: 44_100,
+        channels: 2,
+        fmt: SampleFormat::S16,
+        configured: false,
+        running: false,
+        time_mode: false,
+        pcm: 0,
+        ring: PlayRing::new(RING_BYTES as u32),
+        t_run: 0,
+        t_obs: 0,
+        underruns: 0,
+        may_yield: false,
+        graph: None,
+        dumped_running: false,
+    };
+
+    // Transport: the rings, else the immediate command registers.
+    let ring_ok = h.rings_init();
+    let vendor = if ring_ok { h.send(verb::get_param(0, verb::param::VENDOR_ID)) } else { None };
+    let vendor = match vendor {
+        Some(v) if v != 0 => Some(v),
+        _ => {
+            p("[HDA] CORB/RIRB silent; trying the immediate command interface\n");
+            h.use_ici = true;
+            h.send(verb::get_param(0, verb::param::VENDOR_ID)).filter(|v| *v != 0)
+        }
+    };
+    let Some(vendor) = vendor else {
+        p("[HDA] codec does not answer verbs on either path\n");
+        return;
+    };
+    p("[HDA] codec vendor/device 0x");
+    hx(u64::from(vendor), 8);
+    p(if h.use_ici { " via ICI\n" } else { " via CORB/RIRB\n" });
+
+    let Some(g) = codec::discover(&mut h) else {
+        p("[HDA] no audio function group\n");
+        return;
+    };
+    print_graph(&g);
+
+    // Route every connected output pin to a DAC, headphones first.
+    let mut list = VerbList::new();
+    codec::afg_verbs(&g, &mut list);
+    let mut first_pin = 0u8;
+    for want in [PinRole::Headphone, PinRole::LineOut, PinRole::Speaker] {
+        for w in g.iter().filter(|w| w.output_role() == Some(want)) {
+            let Some(path) = codec::find_path(&g, w.nid, &h.dacs[..h.ndacs]) else {
+                p("[HDA] pin 0x");
+                hx(u64::from(w.nid), 2);
+                p(": no route to a DAC\n");
+                continue;
+            };
+            codec::path_verbs(&g, &path, DAC_PCT, &mut list);
+            p("[HDA] route ");
+            p(role_name(want));
+            p(":");
+            for i in 0..usize::from(path.len) {
+                p(" ");
+                hx(u64::from(path.nid[i]), 2);
+            }
+            p("\n");
+            if first_pin == 0 {
+                first_pin = w.nid;
+            }
+            let dac = path.converter();
+            if !h.dacs[..h.ndacs].contains(&dac) && h.ndacs < h.dacs.len() {
+                h.dacs[h.ndacs] = dac;
+                h.ndacs += 1;
+            }
+        }
+    }
+    if h.ndacs == 0 {
+        p("[HDA] no output route found\n");
+        return;
+    }
+    let failed = h.run(&list);
+    if failed != 0 {
+        p("[HDA] verbs without a response: ");
+        dec(failed as u64);
+        p("\n");
+    }
+    // Read back what the codec says it holds, using the same encoders.
+    let dac0 = h.dacs[0];
+    h.pcm = h.send(verb::get_param(dac0, verb::param::PCM)).unwrap_or(0);
+    p("[HDA] dac pcm caps 0x");
+    hx(u64::from(h.pcm), 8);
+    p("\n");
+    if h.stream_setup() {
+        print_verify(&mut h, first_pin, dac0);
+    } else {
+        p("[HDA] stream setup failed\n");
+        return;
+    }
+    h.stream_stop();
+    h.graph = Some(g);
+    dump_state(&mut h, "after init");
+
+    *HDA.lock() = Some(h);
+    akuma_virtio::audio::hda_backend::register(akuma_virtio::audio::hda_backend::Ops {
+        write: dsp_write,
+        stop: dsp_stop,
+        set_rate: dsp_set_rate,
+        set_format: dsp_set_format,
+        set_channels: dsp_set_channels,
+    });
+    p("[HDA] ready (/dev/dsp)\n");
+
+    if selftest {
+        tone(1_000);
+    }
+}
+
+/// Play `ms` of a 440 Hz triangle wave through the `/dev/dsp` write path.
+fn tone(ms: u32) {
+    p("[HDA] selftest tone\n");
+    let mut buf = [0u8; 4096];
+    let frames_total = 44_100 * ms / 1000;
+    let mut done = 0u32;
+    let mut phase = 0u32;
+    while done < frames_total {
+        let n = ((frames_total - done) as usize).min(buf.len() / 4);
+        for f in 0..n {
+            // Triangle, period 100 frames (441 Hz at 44.1 kHz), +-8000.
+            let x = (phase % 100) as i32;
+            let s = (if x < 50 { x * 320 - 8000 } else { (100 - x) * 320 - 8000 }) as i16;
+            buf[f * 4..f * 4 + 2].copy_from_slice(&s.to_le_bytes());
+            buf[f * 4 + 2..f * 4 + 4].copy_from_slice(&s.to_le_bytes());
+            phase += 1;
+        }
+        dsp_write(&buf[..n * 4]);
+        done += n as u32;
+    }
+    dsp_stop();
+    p("[HDA] selftest tone done\n");
+}
+
+// ---------------------------------------------------------------------------
+// /dev/dsp backend (registered into `akuma_virtio::audio::hda_backend`)
+// ---------------------------------------------------------------------------
+
+fn dsp_write(data: &[u8]) -> usize {
+    match HDA.lock().as_mut() {
+        Some(h) => {
+            h.may_yield = crate::usermode::current_process().is_some();
+            h.write(data)
+        }
+        None => 0,
+    }
+}
+
+fn dsp_stop() {
+    if let Some(h) = HDA.lock().as_mut() {
+        h.may_yield = crate::usermode::current_process().is_some();
+        h.drain();
+        if h.underruns != 0 {
+            p("[HDA] playback underruns: ");
+            dec(u64::from(h.underruns));
+            p("\n");
+            h.underruns = 0;
+        }
+    }
+}
+
+/// Apply a parameter change: anything already buffered plays out first, and the
+/// stream is re-set-up on the next write.
+fn with_params(f: impl FnOnce(&mut Hda) -> bool) -> bool {
+    match HDA.lock().as_mut() {
+        Some(h) => {
+            h.may_yield = crate::usermode::current_process().is_some();
+            h.drain();
+            f(h)
+        }
+        None => false,
+    }
+}
+
+fn dsp_set_rate(rate: i32) -> bool {
+    with_params(|h| {
+        let r = rate as u32;
+        if stream::format_word(r, 16, 2).is_none() || (h.pcm != 0 && !stream::pcm_supports(h.pcm, r, 16)) {
+            return false;
+        }
+        h.rate = r;
+        true
+    })
+}
+
+fn dsp_set_format(fmt: i32) -> bool {
+    with_params(|h| match SampleFormat::from_oss(fmt) {
+        Some(f) => {
+            h.fmt = f;
+            true
+        }
+        None => false,
+    })
+}
+
+fn dsp_set_channels(ch: i32) -> bool {
+    with_params(|h| {
+        if (1..=2).contains(&ch) {
+            h.channels = ch as u8;
+            true
+        } else {
+            false
+        }
+    })
 }

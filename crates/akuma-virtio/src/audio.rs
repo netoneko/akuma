@@ -61,7 +61,9 @@ pub const AFMT_S16_LE: i32 = 0x00000010;
 /// OSS format: unsigned 8-bit PCM.
 #[cfg_attr(any(not(feature = "sound"), feature = "platform-firecracker"), allow(dead_code))]
 pub const AFMT_U8: i32 = 0x00000008;
+/// OSS format: signed 24-bit little-endian PCM, packed to 3 bytes per sample.
 pub const AFMT_S24_LE: i32 = 0x00010000;
+/// OSS format: signed 32-bit little-endian PCM.
 pub const AFMT_S32_LE: i32 = 0x01000000;
 
 // ============================================================================
@@ -235,14 +237,11 @@ mod imp {
 
     /// True once a sound device has been found and initialized.
     pub fn is_available() -> bool {
-    if crate::audio::hda_backend::up() { return true; }
         SOUND_DEVICE.lock().is_some()
     }
 
     /// OSS `SNDCTL_DSP_SETFMT`: set sample format from an AFMT_* code.
     pub fn set_format_oss(fmt: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (fmt == AFMT_S16_LE || fmt == AFMT_U8 || fmt == AFMT_S24_LE || fmt == AFMT_S32_LE) { return Ok(()); }
-        if crate::audio::hda_backend::up() { return if fmt == AFMT_S16_LE || fmt == AFMT_U8 || fmt == AFMT_S24_LE || fmt == AFMT_S32_LE { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         let format = match fmt {
             AFMT_S16_LE => PcmFormat::S16,
             AFMT_U8 => PcmFormat::U8,
@@ -256,8 +255,6 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_CHANNELS`: set channel count.
     pub fn set_channels(channels: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (1..=2).contains(&channels) { return Ok(()); }
-        if crate::audio::hda_backend::up() { return if (1..=2).contains(&channels) { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         if !(1..=8).contains(&channels) {
             return Err(AudioError::InvalidParam);
         }
@@ -269,8 +266,6 @@ mod imp {
 
     /// OSS `SNDCTL_DSP_SPEED`: set sample rate in Hz.
     pub fn set_rate(rate_hz: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (rate_hz == 44100 || rate_hz == 48000) { return Ok(()); }
-        if crate::audio::hda_backend::up() { return if rate_hz == 44100 || rate_hz == 48000 { Ok(()) } else { Err(AudioError::InvalidParam) }; }
         let rate = match rate_hz {
             8000 => PcmRate::Rate8000,
             11025 => PcmRate::Rate11025,
@@ -289,7 +284,6 @@ mod imp {
 
     /// Play (blocking) a buffer of PCM frames matching the current params.
     pub fn play(frames: &[u8]) -> Result<usize, AudioError> {
-    if crate::audio::hda_backend::up() { return Ok(crate::audio::hda_backend::play(frames)); }
         let guard = SOUND_DEVICE.lock();
         let dev = guard.as_ref().ok_or(AudioError::NotInitialized)?;
         dev.play(frames)
@@ -317,64 +311,125 @@ mod imp {
     }
     #[must_use]
     pub fn is_available() -> bool {
-    if crate::audio::hda_backend::up() { return true; }
         false
     }
     pub fn set_format_oss(_fmt: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (_fmt == 0x10 || _fmt == 8 || _fmt == 0x10000 || _fmt == 0x8000) { return Ok(()); }
         Err(AudioError::NotInitialized)
     }
     pub fn set_channels(_channels: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (1..=2).contains(&_channels) { return Ok(()); }
         Err(AudioError::NotInitialized)
     }
     pub fn set_rate(_rate_hz: i32) -> Result<(), AudioError> {
-        if crate::audio::hda_backend::up() && (_rate_hz == 44100 || _rate_hz == 48000) { return Ok(()); }
         Err(AudioError::NotInitialized)
     }
     pub fn play(_frames: &[u8]) -> Result<usize, AudioError> {
-    if crate::audio::hda_backend::up() { return Ok(crate::audio::hda_backend::play(_frames)); }
         Err(AudioError::NotInitialized)
     }
     pub fn stop() {}
 }
 
-pub use imp::{init, is_available, play, set_channels, set_format_oss, set_rate, stop};
+pub use imp::init;
 
-// --- HDA backend registry (meow): bin registers fn ptrs at boot; facade fns
-// dispatch here first so /dev/dsp works on bare metal (no virtio-sound).
+// ============================================================================
+// Backend override: a platform whose sound hardware is not virtio-snd
+// ============================================================================
+
+/// A `/dev/dsp` backend registered by the platform, taking the place of
+/// virtio-snd. The bare-metal amd64 kernel registers Intel HDA here; it has no
+/// virtio-sound device, and the seam (`open`/`write`/`ioctl` in the syscall
+/// glue) only ever calls the six functions below, so one dispatch point is all
+/// it takes — no `cfg` inside the drivers and no second copy of the seam.
+///
+/// The functions are plain safe `fn` pointers; the platform owns whatever
+/// state and locking they need.
 pub mod hda_backend {
-    pub type WriteFn = unsafe extern "Rust" fn(*const u8, usize) -> usize;
-    pub type StopFn = unsafe extern "Rust" fn();
-    static mut UP: bool = false;
-    static mut WRITE: Option<WriteFn> = None;
-    static mut STOP: Option<StopFn> = None;
-    #[allow(static_mut_refs)]
-    pub fn register(w: WriteFn, s: StopFn) {
-        unsafe {
-            WRITE = Some(w);
-            STOP = Some(s);
-            UP = true;
-        }
+    use spinning_top::Spinlock;
+
+    /// The five operations a backend provides.
+    #[derive(Clone, Copy)]
+    pub struct Ops {
+        /// Queue PCM for playback; blocks while the device is full. Returns the
+        /// bytes consumed (0 is an error).
+        pub write: fn(&[u8]) -> usize,
+        /// Play out what is queued and stop.
+        pub stop: fn(),
+        /// `SNDCTL_DSP_SPEED`: `true` if the rate is supported (and now set).
+        pub set_rate: fn(i32) -> bool,
+        /// `SNDCTL_DSP_SETFMT`: `true` if the `AFMT_*` code is supported.
+        pub set_format: fn(i32) -> bool,
+        /// `SNDCTL_DSP_CHANNELS`: `true` if the channel count is supported.
+        pub set_channels: fn(i32) -> bool,
     }
+
+    static OPS: Spinlock<Option<Ops>> = Spinlock::new(None);
+
+    /// Install the backend. Later calls replace it.
+    pub fn register(ops: Ops) {
+        *OPS.lock() = Some(ops);
+    }
+
+    /// The registered backend, if any. Copied out so callers run it unlocked.
+    #[must_use]
+    pub fn ops() -> Option<Ops> {
+        *OPS.lock()
+    }
+
+    /// Whether a backend is registered.
+    #[must_use]
     pub fn up() -> bool {
-        unsafe { *core::ptr::addr_of!(UP) }
+        OPS.lock().is_some()
     }
-    pub fn play(buf: &[u8]) -> usize {
-        unsafe {
-            let p = core::ptr::addr_of!(WRITE);
-            match *p {
-                Some(f) => f(buf.as_ptr(), buf.len()),
-                None => 0,
-            }
-        }
+}
+
+fn backend_result(ok: bool) -> Result<(), AudioError> {
+    if ok { Ok(()) } else { Err(AudioError::InvalidParam) }
+}
+
+/// True if a sound device (virtio-snd or a registered backend) is present.
+#[must_use]
+pub fn is_available() -> bool {
+    hda_backend::up() || imp::is_available()
+}
+
+/// OSS `SNDCTL_DSP_SETFMT`.
+pub fn set_format_oss(fmt: i32) -> Result<(), AudioError> {
+    match hda_backend::ops() {
+        Some(b) => backend_result((b.set_format)(fmt)),
+        None => imp::set_format_oss(fmt),
     }
-    pub fn stop() {
-        unsafe {
-            let p = core::ptr::addr_of!(STOP);
-            if let Some(f) = *p {
-                f();
-            }
-        }
+}
+
+/// OSS `SNDCTL_DSP_CHANNELS`.
+pub fn set_channels(channels: i32) -> Result<(), AudioError> {
+    match hda_backend::ops() {
+        Some(b) => backend_result((b.set_channels)(channels)),
+        None => imp::set_channels(channels),
+    }
+}
+
+/// OSS `SNDCTL_DSP_SPEED`.
+pub fn set_rate(rate_hz: i32) -> Result<(), AudioError> {
+    match hda_backend::ops() {
+        Some(b) => backend_result((b.set_rate)(rate_hz)),
+        None => imp::set_rate(rate_hz),
+    }
+}
+
+/// Play (blocking) a buffer of PCM frames matching the current params.
+pub fn play(frames: &[u8]) -> Result<usize, AudioError> {
+    match hda_backend::ops() {
+        Some(b) => match (b.write)(frames) {
+            0 if !frames.is_empty() => Err(AudioError::IoError),
+            n => Ok(n),
+        },
+        None => imp::play(frames),
+    }
+}
+
+/// Stop playback (`close` on `/dev/dsp`).
+pub fn stop() {
+    match hda_backend::ops() {
+        Some(b) => (b.stop)(),
+        None => imp::stop(),
     }
 }
