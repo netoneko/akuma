@@ -2466,6 +2466,61 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         is parallelism rather than the device. And the 60 s stream-end
         stall (`AKUMA_AMD64_STREAM_END_STALL.md`) is unconfirmed and still
         bimodal.
+   ▼
+ [09-25 → 09-29] ═══ THE SWARM TAKES THE AUDIO DRIVER ═══ AND FAILS
+   │
+   │   The task: an Intel HDA driver (`runbooks/add-intel-hda-audio.md`),
+   │   written by the cats on the trashcan itself — meow on the metal,
+   │   tama on ryzen, GLM `glm-5.3-flash` at low reasoning — with the
+   │   build → install → reboot loop above as the whole experiment. About
+   │   90 commits in five days; "M9 COMPLETE" on 09-27; the headphones
+   │   silent throughout; tokens exhausted on 09-29.
+   │
+   ├──► **The experiment failed. Three causes, and the loop is not one of
+   │   them** (full account: `AKUMA_AMD64_BARE_METAL_SELFHOST.md` §7):
+   │   - **Improper tooling.** The box's pipes and console corrupted tool
+   │     use (greps that printed nothing, duplicated tool calls racing two
+   │     `kbuild`s in one target dir, source clobbered mid-edit); no host
+   │     toolchain, so the pure crate's host tests never compiled and
+   │     nobody saw; a console ring that washed faster than an agent woke;
+   │     and no emulator with a recording audio backend, the cheapest
+   │     oracle available, ruled out by the brief.
+   │   - **Weak models.** Verb words hand-assembled as hex with the NID one
+   │     nibble too high (a widget that does not exist), then "verified" by
+   │     reading the same phantom back; cargo-culted findings written into
+   │     the runbook and built on ("`LPIB` unimplemented on this silicon");
+   │     registers written at offsets never read from the spec; milestones
+   │     closed on evidence that could not distinguish a working driver from
+   │     a broken one.
+   │   - **Lackluster testing practices, not enforced — by the author of the
+   │     process, Kirill.** The runbook said the right things (host-test the
+   │     pure half; add a boot-suite check; "plays silence is not a pass")
+   │     and none of them was a gate: nothing failed when the host tests did
+   │     not compile, when no kernel test existed, or when a milestone was
+   │     closed with nobody having heard sound. Every automated check the
+   │     swarm had was blind to a silent output.
+   │
+   ├──► **What the failure does not show.** The loop worked throughout —
+   │   `kbuild -j 1` (2 to 2.5 min incremental), `kinstall`, `reboot -f`,
+   │   `git push` from the trashcan — and so did the cat that built and
+   │   booted its own kernel on 09-25 (above). What failed was everything
+   │   around the loop: the oracle, the gates and the model. A verdict on
+   │   "an agent that edits and rebuilds the kernel on the machine it runs
+   │   on" this is not; a verdict on how this run was set up it is.
+   ▼
+ [09-30] ═══ THE REWRITE ═══ IT PLAYS
+   │
+   └──► One interactive session on the same box, same loop. Read the
+        driver against the specification and threw it out from the verbs
+        down; put the pure half in `akuma-hda` behind 31 host tests; used
+        QEMU's `intel-hda` with a WAV-recording backend as the oracle
+        (sample-exact, no reboot); on the metal a state dump ruled out the
+        codec in one boot and pointed at DMA. The blocker was one PCI
+        config bit the swarm never touched: **firmware left no-snoop
+        enabled**, so the DAC was fed stale zeros with every register
+        reading healthy. Cleared as Linux does; `tokyo_rider` audible the
+        same day, then a killed-player loop fixed at the fd-release hook.
+        (`AKUMA_AMD64_HDA_REWRITE.md`)
 ```
 
 The shape worth naming: days 1–2 *consumed* shared crates, day 3 *proved*
