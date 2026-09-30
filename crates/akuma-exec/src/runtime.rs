@@ -167,6 +167,11 @@ pub struct ExecRuntime {
     pub unix_sock_clone_ref: fn(u32),
     pub epoll_destroy: fn(u32),
     pub pidfd_close: fn(u32),
+    /// A `/dev/dsp` descriptor was released — by `close`, or by the process
+    /// dying without one. Stops the sound device: an audio ring is cyclic and
+    /// free-running, so a player killed mid-song otherwise leaves the hardware
+    /// replaying its last few hundred milliseconds until the next open.
+    pub dsp_close: fn(),
     /// Release whatever `flock(2)` lock `(holder, fd)` — the `usize` is the
     /// calling process's `SharedFdTable` `Arc` pointer, see `src/syscall/flock.rs`
     /// — holds on `path`, if any. A no-op if it holds none.

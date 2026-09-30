@@ -271,6 +271,9 @@ pub fn release_fd_entry(fd_num: u32, fd: FileDescriptor, holder: usize) {
         FileDescriptor::PidFd(pidfd_id) => {
             (runtime().pidfd_close)(pidfd_id);
         }
+        FileDescriptor::DevDsp => {
+            (runtime().dsp_close)();
+        }
         _ => {}
     }
 }

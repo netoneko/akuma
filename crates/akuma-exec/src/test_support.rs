@@ -109,6 +109,7 @@ pub fn ensure_test_runtime() {
         unix_sock_clone_ref: |_| {},
         epoll_destroy: |_| {},
         pidfd_close: |_| {},
+        dsp_close: || {},
         flock_release: |_, _, _| {},
         resolve_symlinks: |_| alloc::string::String::new(),
         file_size: |_| Ok(0),

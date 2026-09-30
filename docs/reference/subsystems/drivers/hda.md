@@ -6,9 +6,10 @@ Source: `crates/akuma-hda` (pure, host-tested, `forbid(unsafe_code)`),
 Bring-up history and the failed first attempt: the runbook
 [`../../../runbooks/add-intel-hda-audio.md`](../../../runbooks/add-intel-hda-audio.md).
 
-> **Stability: C.** Rewritten 2026-09-30 against the specification. Verified
-> sample-for-sample under QEMU's emulated controller; the real ALC662 on the
-> trashcan is the open question until someone has *heard* it.
+> **Stability: B.** Rewritten 2026-09-30 against the specification. Verified
+> sample-for-sample under QEMU's emulated controller, and **heard** on the
+> trashcan's ALC662 (front headphone jack) the same day: a 3 s test tone and the
+> 3-minute `tokyo_rider` track both play cleanly.
 
 ## Shape
 
@@ -62,6 +63,23 @@ either driver.
 * Pin VREF is `[2:0]` of `SET_PIN_WIDGET_CONTROL`; verb `0x701` is *connection
   select*.
 
+## The bug that kept the metal silent for days: no-snoop
+
+Firmware left **`DEVC` (PCI config 0x78) bit 11, no-snoop enable, set**
+(`devc 0x0800` in the boot log). With it set, controller DMA does not snoop the
+CPU caches, so a ring the CPU had just filled was read from stale RAM: the
+stream ran, the codec was bound and unmuted, every register read back correctly,
+and the DAC was fed zeros. The first attempt saw it as "`LPIB` frozen /
+unimplemented on this silicon"; it was the DMA engine not getting real data.
+
+Linux's `azx_init_pci` clears it, and clears `TCSEL` (config 0x44, `[2:0]`,
+route all traffic through traffic class 0). `init` does both and prints the
+before/after values (`[HDA] pci tcsel .. devc ..`). The driver also flushes
+(`clflush`) every span it writes for the device to read, and the span the device
+writes for it to read (RIRB, position buffer), so ordering does not depend on
+the snoop bit. **If a future machine is silent with a healthy-looking stream,
+read that `[HDA] pci` line first.**
+
 ## Behaviour
 
 * `init(selftest)` runs at boot (multiboot2 path unconditionally, PVH path with
@@ -72,10 +90,27 @@ either driver.
 * Every connected output pin (headphone, line-out, speaker) is routed to a DAC
   and enabled; DACs share stream tag 1. The DAC amp is set to 64 % of its 0 dB
   step (`DAC_PCT`) — the level Linux left this machine at when it was audible.
+* Position comes from `LPIB`; if that has not moved 60 ms after `RUN` the
+  driver moves to the DMA position buffer (`DPLBASE`, enabled at init), then to
+  the clock. The boot log names the switch.
+* The state dump (`[HDA] state after init`) prints, for every DAC, mixer and
+  output pin: power, stream/format, pin control, EAPD, jack presence
+  (`sense=0x80000000` means a plug is in), connection select, and every amp
+  (`80` = muted, `00` = unmuted at gain 0). Read it before suspecting anything
+  Realtek-specific.
 * `write` blocks (yielding) while the ring is full. Underrun (the hardware caught
   up with the writer) or a missed lap stops and restarts the stream cleanly.
   If `LPIB` does not advance within 60 ms of `RUN`, playback is paced by the
   TSC instead (logged once).
+* **The ring is cyclic and free-running**: the hardware never stops on its own.
+  A player killed mid-song (Ctrl-C) never reaches `close`, and until 2026-09-30
+  the controller kept replaying the last ~370 ms until the next open ("it
+  jitters and keeps going"). Fixed at the root: `release_fd_entry` in
+  `akuma-exec` has a `FileDescriptor::DevDsp` arm calling
+  `ExecRuntime::dsp_close` (`= akuma_virtio::audio::stop` on both kernels), so
+  the stream stops however the descriptor dies. Consumed ring spans are also
+  zeroed as they are observed, so a stall between writes plays silence rather
+  than stale audio.
 * `close` (`stop`) appends 100 ms of silence, waits for the ring to drain and
   stops the stream — the position register runs ahead of the converter, and
   stopping at the last real sample truncates the tail.

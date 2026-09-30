@@ -1,6 +1,22 @@
 # Add Intel HDA audio to Akuma/amd64 — the brief for the on-box agent
 
-**Stability: C.** Nothing here has been built yet. This is the task brief for
+> **2026-09-30 correction — read this first.** The "M9 COMPLETE", "M10" and
+> "M11" sections below record a driver that *reported* success on the metal
+> while producing no sound, and the readbacks they cite as proof read a
+> phantom widget. The driver was rewritten against the specification and is now
+> audible on the trashcan. What was actually wrong, in the order it mattered:
+> **(1) PCI no-snoop was enabled by firmware and never cleared**, so DMA fed the
+> DAC stale zeros; **(2)** verb words had the NID one nibble too high (widget
+> 0x22, which does not exist); **(3)** `SDnFMT`/`SDnLVI` were written at reserved
+> or read-only offsets; **(4)** 24-bit audio was converted a second time after
+> `wavplay` had converted it; **(5)** `/dev/dsp` rate/format/channels were
+> accepted and discarded; **(6)** a killed player left the ring looping. Current
+> design and the register facts: [`../reference/subsystems/drivers/hda.md`](../reference/subsystems/drivers/hda.md).
+> The lesson that generalises: a "verified readback" is only evidence if the
+> verb that produced it is known to address a real widget — and `LPIB` frozen
+> next to a healthy stream is a DMA problem until proven otherwise.
+
+**Stability: C (brief only — see the correction above).** Nothing here has been built yet. This is the task brief for
 the agent (meow + GLM) that will write the driver **on the trashcan itself**,
 from the checkout at `/src/github.com/netoneko/akuma`.
 

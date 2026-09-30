@@ -373,6 +373,10 @@ fn runtime() -> ExecRuntime {
         pidfd_close: akuma_syscalls_glue::pidfd::pidfd_close,
         #[cfg(not(feature = "sc-pidfd"))]
         pidfd_close: |_| not_wired!("pidfd_close", "sc-pidfd is not in this target's feature set"),
+        // `/dev/dsp` is real here (Intel HDA registers a backend at boot), and a
+        // killed player never reaches `close`: stop the ring when the fd table
+        // lets go of the descriptor. A no-op when no backend is registered.
+        dsp_close: akuma_virtio::audio::stop,
         // **A stated no-op, not a panic** — and the distinction is the whole
         // reason this changed.
         //

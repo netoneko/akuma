@@ -244,8 +244,6 @@ struct Hda {
     may_yield: bool,
     /// The codec's widget graph, kept for `dump_state`.
     graph: Option<codec::Graph>,
-    /// The state dump has run at the first `RUN`.
-    dumped_running: bool,
 }
 
 /// The controller once `init` succeeded. `/dev/dsp` exists exactly when the
@@ -436,29 +434,6 @@ impl Hda {
         self.running = true;
         self.t_run = now_us().unwrap_or(0);
         self.t_obs = self.t_run;
-        if !self.dumped_running {
-            self.dumped_running = true;
-            // Sample the stream's own registers over the first 150 ms: does the
-            // controller fetch the ring (BCIS after the first fragment, a
-            // position that moves), and does the DMA position buffer agree?
-            for _ in 0..5 {
-                delay_us(30_000);
-                let sts = self.regs.r8(self.sd + reg::SD_STS);
-                p("[HDA] +30ms lpib=");
-                dec(u64::from(self.regs.r32(self.sd + reg::SD_LPIB)));
-                p(" posbuf=");
-                dec(u64::from(self.posbuf()));
-                p(" sts=0x");
-                hx(u64::from(sts), 2);
-                p(" ctl=0x");
-                hx(u64::from(self.regs.r32(self.sd + reg::SD_CTL) & 0x00FF_FFFF), 6);
-                p(" fifos=");
-                dec(u64::from(self.regs.r16(self.sd + reg::SD_FIFOS)));
-                p("\n");
-                self.regs.w8(self.sd + reg::SD_STS, 0x1C);
-            }
-            dump_state(self, "while running");
-        }
     }
 
     fn stream_stop(&mut self) {
@@ -478,6 +453,33 @@ impl Hda {
         }
     }
 
+    /// Zero the ring bytes the hardware consumed between totals `from` and `to`.
+    ///
+    /// The ring is cyclic and the hardware never stops on its own: when the
+    /// writer goes away (a killed player never reaches `close`) it laps the
+    /// ring forever. Leaving played audio in the ring makes that a stuttering
+    /// replay of the last few hundred milliseconds; leaving zeros makes it
+    /// silence. The bytes behind the play position are ones the hardware has
+    /// already fetched, and the writer cannot reach them yet (it stops
+    /// `GUARD` short of a full lap), so this races with neither.
+    fn silence_consumed(&mut self, from: u64, to: u64) {
+        let n = (to - from).min(RING_BYTES as u64) as usize;
+        if n == 0 {
+            return;
+        }
+        let off = (from % RING_BYTES as u64) as usize;
+        let first = n.min(RING_BYTES - off);
+        // SAFETY: both spans are inside the static ring (`off + first` <=
+        // RING_BYTES, `n - first` <= off).
+        unsafe {
+            let base = (&raw mut RING.0).cast::<u8>();
+            core::ptr::write_bytes(base.add(off), 0, first);
+            core::ptr::write_bytes(base, 0, n - first);
+            flush(base.add(off), first);
+            flush(base, n - first);
+        }
+    }
+
     /// Fold the hardware position into the ring.
     fn observe(&mut self) {
         let now = now_us().unwrap_or(0);
@@ -489,7 +491,11 @@ impl Hda {
                 ((now.saturating_sub(self.t_run) * bps / 1_000_000) % RING_BYTES as u64) as u32
             }
         };
+        let before = self.ring.consumed();
         self.ring.observe(pos);
+        if self.pos_src != PosSrc::Clock {
+            self.silence_consumed(before, self.ring.consumed());
+        }
         // A source that has not moved 60 ms after RUN does not work on this
         // controller: move to the next.
         if self.running && self.ring.consumed() == 0 && self.pos_src != PosSrc::Clock
@@ -936,7 +942,6 @@ pub fn init(selftest: bool) {
         underruns: 0,
         may_yield: false,
         graph: None,
-        dumped_running: false,
     };
 
     // Transport: the rings, else the immediate command registers.
