@@ -2504,9 +2504,9 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   `kbuild -j 1` (2 to 2.5 min incremental), `kinstall`, `reboot -f`,
    │   `git push` from the trashcan — and so did the cat that built and
    │   booted its own kernel on 09-25 (above). What failed was everything
-   │   around the loop: the oracle, the gates and the model. A verdict on
-   │   "an agent that edits and rebuilds the kernel on the machine it runs
-   │   on" this is not; a verdict on how this run was set up it is.
+   │   around the loop: the oracle, the gates and the model. So this says
+   │   nothing against an agent editing and rebuilding the kernel on the
+   │   machine it runs on. It only says this run was set up badly.
    ▼
  [09-30] ═══ THE REWRITE ═══ IT PLAYS
    │

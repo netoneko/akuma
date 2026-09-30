@@ -596,9 +596,9 @@ five days, about 90 commits on `amd64-audio`, and ran out of tokens with the
 headphones silent. The same task was finished in one interactive session on the
 same box (`AKUMA_AMD64_HDA_REWRITE.md`): the swarm's driver was discarded from
 the verbs down and rewritten. This section records why the experiment failed,
-because "an agent that edits and rebuilds the kernel on the machine it runs on"
-is the point of `AKUMA_FROM_SCRATCH.md` and this result must not be read as a
-verdict on that goal — **it was a verdict on how this run was set up.**
+because an agent that edits and rebuilds the kernel on the machine it runs on
+is the point of `AKUMA_FROM_SCRATCH.md`, and this failure is no evidence
+against that goal — **the run was set up badly.**
 
 Scope: this is about the HDA task. The swarm's other work was not audited here.
 
