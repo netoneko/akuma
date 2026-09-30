@@ -587,6 +587,115 @@ that binds, silently, on the only workload that notices.
 
 ---
 
+## 7. The on-box agent swarm experiment (2026-09-25 to 09-30): it failed, and why
+
+**Outcome: the experiment did not produce a working driver.** The task was the
+Intel HDA driver (`add-intel-hda-audio.md`); the agents (meow on the trashcan
+itself, with tama on ryzen, all on GLM `glm-5.3-flash` at low reasoning) ran for
+five days, about 90 commits on `amd64-audio`, and ran out of tokens with the
+headphones silent. The same task was finished in one interactive session on the
+same box (`AKUMA_AMD64_HDA_REWRITE.md`): the swarm's driver was discarded from
+the verbs down and rewritten. This section records why the experiment failed,
+because "an agent that edits and rebuilds the kernel on the machine it runs on"
+is the point of `AKUMA_FROM_SCRATCH.md` and this result must not be read as a
+verdict on that goal — **it was a verdict on how this run was set up.**
+
+Scope: this is about the HDA task. The swarm's other work was not audited here.
+
+### Timeline
+
+| date | what happened |
+|---|---|
+| 09-25 | M1–M5: PCI discovery, reset, power. The `pci`-flag postmortem, the D3hot wedge, the unaligned-MMIO `version=255.0` misread. First useful loop: `kbuild`, `kinstall`, `reboot -f`. |
+| 09-26 | M7–M9a: command engine, widget scan, first "beep". Widget words hand-assembled as hex; `LPIB` frozen from the first stream test and never explained. |
+| 09-27 | "**M9 COMPLETE** — wavplay passes end-to-end on metal". Nobody had heard sound; "complete" meant the DMA ran and `wavplay` exited 0. |
+| 09-28 | M10: "five bugs fixed, DAC bind proven" — the fixes were real bugs, and the proof read a phantom widget. Headphones silent. |
+| 09-29 | M11: CORB/RIRB, then SET_PIN_VREF, then D0 power states, each chasing the silence in the codec. tama proposes a QEMU rig on ryzen (`akuma-miot/docs/HDA_DEBUG_QEMU.md`): "nothing here is built yet". Tokens run out. |
+| 09-30 | Rewrite. QEMU WAV capture sample-exact, then metal, then audible after one PCI config write the swarm never made. |
+
+### Why it failed
+
+**1. Improper tooling.** The agents worked on a machine whose own tools lied to
+them, with no second opinion available:
+
+- *The box's console and pipes corrupted tool use* (runbook, "Challenges"):
+  greps that matched and printed nothing, interleaved results, `git push` dying
+  on `EBADF`, agent processes restarting mid-session, **tool calls that
+  duplicated themselves** so two `kbuild`s raced in one target directory, and
+  edits landing out of order until `lib.rs` was clobbered to `}` and the same
+  fix was applied twice. The runbook's answer was "one command per turn".
+- *No host toolchain on the box.* "Host tests cannot run here (no host-std rust
+  target) — that is how the VMAJ decode bug and verb-encoding bugs survived
+  until metal." The pure-logic crate was written to be host-tested and its tests
+  **never compiled** (fakes missing a trait method; a closure bound too strict);
+  nobody could see that from the box, and nobody ran them elsewhere.
+- *The console ring washed in ~3.5 minutes*, faster than an agent woke after a
+  reboot; the workaround (`hda-capture`) helped but every observation was
+  still a full reboot of the machine the agent lived on.
+- *No emulator in the loop until it was too late.* The runbook said "do not go
+  looking for an emulator". An emulated controller with a recording audio
+  backend turned out to be the cheapest, most decisive oracle available (it
+  produced a sample-exact check in seconds, with no reboot), and it was three
+  days away from the agents' first line of code.
+
+**2. Weak models.** GLM-5.3-flash at low reasoning could write Rust that
+compiles and could follow a bring-up brief, and could not do the thing this task
+needed most: distrust its own evidence.
+
+- It **hand-assembled verb words as hex literals** with the NID one nibble too
+  high, so it configured a widget that does not exist — and then *read back the
+  same phantom* and reported "unmuted", "bound", "verified". That inference
+  (readback matches, therefore state is real) is exactly the check a stronger
+  model, or a person, asks "does that widget exist?" about.
+- It **cargo-culted** conclusions: "`LPIB` is unimplemented on this silicon"
+  (it was the DMA not delivering), "ICI is unreliable on 8c20" (it was sending to
+  the phantom), "EX dword CAd lives in bits 31:28" (a misread stale entry). Each
+  was written into the runbook as a finding and then built on.
+- It **wrote to the wrong registers by copying offsets it had not read from the
+  spec** (`SDnFMT` at a reserved offset, `SDnLVI` at a read-only one) and, when
+  the result did not move, wrote a *comment explaining why the hardware was
+  different* instead of re-reading the spec.
+- It **declared milestones complete on weak evidence** ("M9 COMPLETE") and moved
+  the goalposts when told otherwise, rather than treating "no one has heard it"
+  as an open item.
+
+**3. Lackluster testing practices, not enforced.** The process that surrounded
+the agents named good practices and enforced none of them. Kirill, who wrote the
+process, did not enforce them either:
+
+- The runbook's own rules — "put the pure logic in the crate and host-test it",
+  "kernel changes need kernel tests", "a run that prints `[HDA] ready` and plays
+  silence is **not** a pass — say so and keep the step open" — were exactly right
+  and were **not gates**. Nothing failed when the host tests did not compile,
+  when no boot-suite check existed, or when a milestone was closed without
+  sound.
+- "Works" was never defined operationally. The acceptance test was `wavplay …;
+  echo $?` and a human's ears, and the human was not in the loop for the 45
+  intermediate kernels. The result was a driver that *passed every automated
+  check that existed* — every one of which was blind to a silent output.
+- No check on the checks. Nothing asked whether a passing readback could have
+  passed against a device that did not exist. The rewrite made that a property
+  of the code (a host test asserts no verb is ever sent to a widget the graph
+  lacks); the swarm's version had no such test, so every gate it had was
+  satisfiable by a wrong driver.
+
+### What this does and does not show
+
+It shows that an agent loop on the metal needs, before it starts: **an
+independent oracle** (an emulator that records output, or a Linux box to diff
+against), **a way to run the host tests somewhere**, **one tool call at a time**
+until the transport is trustworthy, **gates that fail** (compile the host tests;
+no milestone closed without the user-visible check), and **a model strong enough
+to be suspicious of a green readback** — or a person reviewing every "verified".
+
+It does not show that the self-hosted loop is unsound: the loop itself
+(`kbuild -j 1`, `kinstall`, `reboot -f`, and `git push` from the trashcan) worked
+throughout, an incremental kernel build took 2 to 2.5 minutes, and the rewrite
+used the same loop for every metal iteration. What changed was everything around
+it.
+
+---
+
 ## Background
 
 - [`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md)
