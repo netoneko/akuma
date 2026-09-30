@@ -69,6 +69,10 @@ pub mod reg {
     pub const IRR: usize = 0x64;
     /// Immediate command status (16-bit; bit 0 = ICB busy, bit 1 = IRV valid).
     pub const IRS: usize = 0x68;
+    /// DMA position buffer lower base (32-bit, 128-byte aligned; bit 0 enables).
+    pub const DPLBASE: usize = 0x70;
+    /// DMA position buffer upper base (32-bit).
+    pub const DPUBASE: usize = 0x74;
 
     /// First stream descriptor. Input descriptors come first (`GCAP.ISS` of
     /// them), then output; each is [`SD_STRIDE`] bytes.

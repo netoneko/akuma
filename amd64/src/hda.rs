@@ -61,6 +61,13 @@ struct Bdl([[u32; 4]; NFRAG]);
 #[repr(C, align(4096))]
 struct Ring([u8; RING_BYTES]);
 
+/// The DMA position buffer: one 8-byte slot per stream descriptor, the first
+/// word being the stream's position. Written by the controller, so it is
+/// always read after a cache-line flush.
+#[repr(C, align(128))]
+struct PosBuf([u32; 32]);
+
+static mut POSBUF: PosBuf = PosBuf([0; 32]);
 static mut CORB: Corb = Corb([0; 256]);
 static mut RIRB: Rirb = Rirb([0; 256]);
 static mut BDL: Bdl = Bdl([[0; 4]; NFRAG]);
@@ -68,6 +75,25 @@ static mut RING: Ring = Ring([0; RING_BYTES]);
 
 fn phys<T>(p: *mut T) -> u64 {
     akuma_primitives::addr::virt_to_phys(p as usize) as u64
+}
+
+/// Write back and evict the cache lines covering `[p, p+len)`, then fence.
+///
+/// Linux clears the controller's no-snoop enable (see `init`), after which
+/// device DMA is coherent with the CPU caches. If the platform ignores that,
+/// a ring the CPU just filled is still in cache and the DAC reads stale RAM:
+/// a stream that "runs" perfectly and plays silence. Flushing costs a line per
+/// 64 bytes and makes the ordering independent of the snoop bit.
+fn flush(p: *const u8, len: usize) {
+    let mut a = (p as usize) & !63;
+    let end = p as usize + len;
+    while a < end {
+        // SAFETY: `clflush` on an address inside one of this file's statics.
+        unsafe { core::arch::x86_64::_mm_clflush(a as *const u8) };
+        a += 64;
+    }
+    // SAFETY: a fence has no memory-safety requirements.
+    unsafe { core::arch::x86_64::_mm_mfence() };
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +198,16 @@ fn dec(v: u64) {
 // The controller
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PosSrc {
+    /// `SDnLPIB`, the link position register.
+    Lpib,
+    /// The DMA position buffer in memory.
+    PosBuf,
+    /// Nothing reports position: derive it from the clock.
+    Clock,
+}
+
 struct Hda {
     regs: Mmio,
     /// Codec address (lowest set bit of STATESTS).
@@ -192,8 +228,12 @@ struct Hda {
     // Playback state.
     configured: bool,
     running: bool,
-    /// LPIB never moved: account for playback by time instead.
-    time_mode: bool,
+    /// Where playback position comes from. Starts at `Lpib`; a source that has
+    /// not moved 60 ms after `RUN` is replaced by the next one.
+    pos_src: PosSrc,
+    /// Index of output stream 0 among all stream descriptors (its slot in the
+    /// DMA position buffer).
+    sd_index: usize,
     /// The first DAC's supported PCM sizes/rates (parameter 0xA); 0 = unknown.
     pcm: u32,
     ring: PlayRing,
@@ -265,7 +305,11 @@ impl Hda {
         let np = (wp + 1) & 0xFF;
         // SAFETY: `np` < 256; the controller reads this slot only after the
         // CORBWP write below publishes it.
-        unsafe { (&raw mut CORB.0).cast::<u32>().add(np).write_volatile(v) };
+        unsafe {
+            let slot = (&raw mut CORB.0).cast::<u32>().add(np);
+            slot.write_volatile(v);
+            flush(slot.cast::<u8>(), 4);
+        }
         fence(Ordering::SeqCst);
         r.w16(reg::CORBWP, np as u16);
 
@@ -280,7 +324,11 @@ impl Hda {
                     k = k.wrapping_add(1);
                     // SAFETY: `k` < 256; the controller wrote this entry before
                     // advancing RIRBWP past it.
-                    let e = unsafe { (&raw mut RIRB.0).cast::<u64>().add(usize::from(k)).read_volatile() };
+                    let e = unsafe {
+                        let slot = (&raw mut RIRB.0).cast::<u64>().add(usize::from(k));
+                        flush(slot.cast::<u8>(), 8);
+                        slot.read_volatile()
+                    };
                     let ex = (e >> 32) as u32;
                     if ex & 0x10 != 0 {
                         continue; // unsolicited: not the answer to what we sent
@@ -362,7 +410,7 @@ impl Hda {
             }
         }
         let bdl = phys(&raw mut BDL);
-        fence(Ordering::SeqCst);
+        flush((&raw const BDL).cast::<u8>(), core::mem::size_of::<Bdl>());
         r.w8(sd + reg::SD_STS, 0x1C); // clear BCIS | FIFOE | DESE
         r.w32(sd + reg::SD_BDPL, bdl as u32);
         r.w32(sd + reg::SD_BDPU, (bdl >> 32) as u32);
@@ -378,7 +426,7 @@ impl Hda {
         let failed = self.run(&l);
         self.ring = PlayRing::new(RING_BYTES as u32);
         self.running = false;
-        self.time_mode = false;
+        self.pos_src = PosSrc::Lpib;
         self.configured = true;
         failed == 0
     }
@@ -390,16 +438,25 @@ impl Hda {
         self.t_obs = self.t_run;
         if !self.dumped_running {
             self.dumped_running = true;
-            delay_us(20_000);
-            let lpib = self.regs.r32(self.sd + reg::SD_LPIB);
-            let sts = self.regs.r8(self.sd + reg::SD_STS);
-            p("[HDA] first RUN: lpib=");
-            dec(u64::from(lpib));
-            p(" sts=0x");
-            hx(u64::from(sts), 2);
-            p(" ctl=0x");
-            hx(u64::from(self.regs.r32(self.sd + reg::SD_CTL) & 0x00FF_FFFF), 6);
-            p("\n");
+            // Sample the stream's own registers over the first 150 ms: does the
+            // controller fetch the ring (BCIS after the first fragment, a
+            // position that moves), and does the DMA position buffer agree?
+            for _ in 0..5 {
+                delay_us(30_000);
+                let sts = self.regs.r8(self.sd + reg::SD_STS);
+                p("[HDA] +30ms lpib=");
+                dec(u64::from(self.regs.r32(self.sd + reg::SD_LPIB)));
+                p(" posbuf=");
+                dec(u64::from(self.posbuf()));
+                p(" sts=0x");
+                hx(u64::from(sts), 2);
+                p(" ctl=0x");
+                hx(u64::from(self.regs.r32(self.sd + reg::SD_CTL) & 0x00FF_FFFF), 6);
+                p(" fifos=");
+                dec(u64::from(self.regs.r16(self.sd + reg::SD_FIFOS)));
+                p("\n");
+                self.regs.w8(self.sd + reg::SD_STS, 0x1C);
+            }
             dump_state(self, "while running");
         }
     }
@@ -410,20 +467,40 @@ impl Hda {
         self.configured = false;
     }
 
+    /// The position-buffer slot for the output stream.
+    fn posbuf(&self) -> u32 {
+        // SAFETY: `sd_index` < 16, so the slot is inside the 128-byte static;
+        // the controller writes it, hence the flush before the read.
+        unsafe {
+            let slot = (&raw mut POSBUF.0).cast::<u32>().add(self.sd_index * 2);
+            flush(slot.cast::<u8>(), 4);
+            slot.read_volatile()
+        }
+    }
+
     /// Fold the hardware position into the ring.
     fn observe(&mut self) {
         let now = now_us().unwrap_or(0);
-        if self.time_mode {
-            let bps = u64::from(self.rate) * 4;
-            let pos = (now.saturating_sub(self.t_run) * bps / 1_000_000) % RING_BYTES as u64;
-            self.ring.observe(pos as u32);
-        } else {
-            self.ring.observe(self.regs.r32(self.sd + reg::SD_LPIB));
-            // LPIB frozen 60 ms after RUN: this controller's position register
-            // is not to be trusted; fall back to the clock.
-            if self.ring.consumed() == 0 && now.saturating_sub(self.t_run) > 60_000 && self.t_run != 0 {
-                p("[HDA] LPIB not advancing; pacing by clock\n");
-                self.time_mode = true;
+        let pos = match self.pos_src {
+            PosSrc::Lpib => self.regs.r32(self.sd + reg::SD_LPIB),
+            PosSrc::PosBuf => self.posbuf(),
+            PosSrc::Clock => {
+                let bps = u64::from(self.rate) * 4;
+                ((now.saturating_sub(self.t_run) * bps / 1_000_000) % RING_BYTES as u64) as u32
+            }
+        };
+        self.ring.observe(pos);
+        // A source that has not moved 60 ms after RUN does not work on this
+        // controller: move to the next.
+        if self.running && self.ring.consumed() == 0 && self.pos_src != PosSrc::Clock
+            && now.saturating_sub(self.t_run) > 60_000 && self.t_run != 0
+        {
+            if self.pos_src == PosSrc::Lpib && self.posbuf() != 0 {
+                p("[HDA] LPIB not advancing; using the DMA position buffer\n");
+                self.pos_src = PosSrc::PosBuf;
+            } else {
+                p("[HDA] no position source advancing; pacing by clock\n");
+                self.pos_src = PosSrc::Clock;
             }
         }
         self.t_obs = now;
@@ -481,6 +558,8 @@ impl Hda {
                 let base = (&raw mut RING.0).cast::<u8>();
                 core::ptr::copy_nonoverlapping(tmp.as_ptr(), base.add(off), first);
                 core::ptr::copy_nonoverlapping(tmp.as_ptr().add(first), base, second);
+                flush(base.add(off), first);
+                flush(base, second);
             }
             src = &src[ci..];
             if !self.running && self.ring.buffered() >= (RING_BYTES / 2) as u64 {
@@ -509,6 +588,8 @@ impl Hda {
                 let base = (&raw mut RING.0).cast::<u8>();
                 core::ptr::write_bytes(base.add(off), 0, first);
                 core::ptr::write_bytes(base, 0, second);
+                flush(base.add(off), first);
+                flush(base, second);
             }
             bytes -= n;
             if !self.running && self.ring.buffered() >= (RING_BYTES / 2) as u64 {
@@ -736,6 +817,24 @@ pub fn init(selftest: bool) {
     }
     crate::pci::enable(addr, true);
 
+    // What Linux's `azx_init_pci` does for every Intel controller: route all
+    // controller traffic through traffic class 0 (config 0x44 TCSEL[2:0]) and
+    // turn off no-snoop (config 0x78 DEVC bit 11), so that device DMA is
+    // coherent with the CPU caches. Firmware may leave either set.
+    let tcsel = crate::pci::read_u16_config(addr, 0x44);
+    let devc = crate::pci::read_u16_config(addr, 0x78);
+    crate::pci::write_u16_config(addr, 0x44, tcsel & !0x7);
+    crate::pci::write_u16_config(addr, 0x78, devc & !(1 << 11));
+    p("[HDA] pci tcsel 0x");
+    hx(u64::from(tcsel), 4);
+    p("->0x");
+    hx(u64::from(crate::pci::read_u16_config(addr, 0x44)), 4);
+    p(" devc 0x");
+    hx(u64::from(devc), 4);
+    p("->0x");
+    hx(u64::from(crate::pci::read_u16_config(addr, 0x78)), 4);
+    p("\n");
+
     // Power: a healthy controller is already D0. Cycling D3->D0 on one that is
     // wedges it (every BAR0 byte then reads 0xff), so only ever write D0 back
     // when PMCSR says it is something else.
@@ -793,6 +892,10 @@ pub fn init(selftest: bool) {
         return;
     }
     regs.w32(reg::INTCTL, 0);
+    // DMA position buffer (an independent view of stream position).
+    let pb = phys(&raw mut POSBUF);
+    regs.w32(reg::DPUBASE, (pb >> 32) as u32);
+    regs.w32(reg::DPLBASE, (pb as u32) | 1);
     delay_us(1_000);
     let mut w = Wait::new(100_000);
     let mut states = regs.r16(reg::STATESTS) & 0x7FFF;
@@ -824,7 +927,8 @@ pub fn init(selftest: bool) {
         fmt: SampleFormat::S16,
         configured: false,
         running: false,
-        time_mode: false,
+        pos_src: PosSrc::Lpib,
+        sd_index: usize::from(info.gcap.input_streams()),
         pcm: 0,
         ring: PlayRing::new(RING_BYTES as u32),
         t_run: 0,
