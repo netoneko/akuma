@@ -55,48 +55,28 @@ const TARGET_ROWS: usize = 48;
 
 /// Fraction of each dimension left blank at the edges, as a divisor.
 ///
-/// `1/24` is a little over 4 %, which covers the overscan of every television
-/// that still does it. On a monitor it costs a small border and nothing else.
-const MARGIN_DIVISOR: usize = 24;
+/// `1/128` is under 1 %: a hair of border so text never touches the bezel. It was
+/// `1/24` (about 4 %) until 2026-10-01, which is what a television that still
+/// overscans needs and what a monitor or a modern TV in PC mode only wastes — on a
+/// 4K screen that is 160 pixels of dead space down the left edge. The margin is
+/// adjustable at run time (`CSI ? 9001 ; x ; y h`, [`Console::set_margin`]), so a
+/// screen that does crop its edges can have the old inset back.
+const MARGIN_DIVISOR: usize = 128;
 
 /// How many `;`-separated numbers a CSI sequence keeps. A colour change such as
 /// `ESC [ 1 ; 38 ; 2 ; r ; g ; b ; 48 ; 2 ; r ; g ; b m` carries twelve; the rest
 /// are counted and dropped.
 const CSI_PARAMS: usize = 16;
 
-/// Bytes of an `ESC ]` string kept, enough to recognise the colour queries
-/// (`10;?` / `11;?`) a TUI sends at start-up and answer them.
-const OSC_KEEP: usize = 8;
+/// Bytes of an `ESC ]` string the parser keeps. Enough for the colour queries
+/// (`10;?` / `11;?`) a TUI sends at start-up; a window title is longer and is
+/// simply truncated, which is harmless.
+const PARSER_OSC: usize = 64;
 
 /// Bytes of pending terminal reply (cursor position, device attributes, colour
 /// query answers) the console holds for its owner to take. A reply that does not
 /// fit is dropped whole: half an escape sequence typed into a shell is worse.
 const REPLY_CAP: usize = 48;
-
-/// Where [`Console::write_byte`]'s escape-sequence parser is.
-///
-/// A program on this console is an ordinary Unix program and writes to it as to a
-/// terminal: busybox's line editor moves the cursor with `ESC [ n D`, a TUI draws
-/// a whole screen with cursor addressing, erases, colours and scroll regions.
-/// Without this every one of those bytes was drawn as a glyph.
-///
-/// A fixed-size enum and no heap: this runs per byte, under the console lock, on
-/// the path that has to keep working when the allocator does not.
-#[derive(Clone, Copy)]
-enum Esc {
-    Ground,
-    /// Saw `ESC`; the next byte says what kind of sequence this is.
-    Escape,
-    /// `ESC (`, `ESC )`, `ESC #`...: one more byte follows and means nothing here.
-    Swallow,
-    /// Inside `ESC [`. `count` is the number of `;` seen, `private` is set by a
-    /// `?`/`<`/`=`/`>` prefix (`?` selects DEC private modes; the others are
-    /// parsed and ignored).
-    Csi { params: [u16; CSI_PARAMS], count: usize, private: u8 },
-    /// Inside an `ESC ]`/`ESC P`/... string, swallowed up to `BEL` or `ESC \`;
-    /// the first [`OSC_KEEP`] bytes are kept.
-    Str { buf: [u8; OSC_KEEP], len: usize },
-}
 
 // ---------------------------------------------------------------------------
 // Cells and colour
@@ -210,23 +190,10 @@ fn rgb_to_palette(r: u8, g: u8, b: u8) -> u8 {
     if dist(palette(gray)) < dist(palette(cube)) { gray } else { cube }
 }
 
-// ---------------------------------------------------------------------------
-// UTF-8
-// ---------------------------------------------------------------------------
-
-/// The decoder's state between bytes: the code point so far, how many
-/// continuation bytes are still owed, and the smallest value the finished
-/// sequence may have (anything lower is an overlong encoding).
-#[derive(Clone, Copy)]
-struct Utf8 {
-    acc: u32,
-    need: u8,
-    min: u32,
-}
-
-const UTF8_IDLE: Utf8 = Utf8 { acc: 0, need: 0, min: 0 };
-
 /// A scrolling text console.
+// Four independent terminal modes (autowrap, cursor visibility, alternate screen,
+// pending geometry report); a bitset would only hide them.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Console<S: Surface> {
     surface: S,
     font: &'static Font,
@@ -247,8 +214,10 @@ pub struct Console<S: Surface> {
     origin_y: usize,
     fg: Rgb,
     bg: Rgb,
-    esc: Esc,
-    utf8: Utf8,
+    /// The escape-sequence parser (`vte`): UTF-8 decoding and every CSI/OSC/ESC state.
+    /// An `Option` only so [`Console::write_byte`] can take it out while the
+    /// console it drives is borrowed.
+    parser: Option<vte::Parser<PARSER_OSC>>,
     pen: Pen,
     /// Cursor saved by `ESC 7` / `CSI s`.
     saved: (usize, usize, Pen),
@@ -267,6 +236,9 @@ pub struct Console<S: Surface> {
     cursor: Option<(usize, usize)>,
     reply: [u8; REPLY_CAP],
     reply_len: usize,
+    /// The grid changed size under the program (a new margin); see
+    /// [`Console::take_geometry`].
+    geometry_dirty: bool,
 }
 
 impl<S: Surface> Console<S> {
@@ -328,8 +300,7 @@ impl<S: Surface> Console<S> {
             origin_y: my,
             fg: Rgb::TEXT,
             bg: Rgb::BLACK,
-            esc: Esc::Ground,
-            utf8: UTF8_IDLE,
+            parser: Some(vte::Parser::new_with_size()),
             pen: PEN_DEFAULT,
             saved: (0, 0, PEN_DEFAULT),
             top: 0,
@@ -341,6 +312,7 @@ impl<S: Surface> Console<S> {
             cursor: None,
             reply: [0; REPLY_CAP],
             reply_len: 0,
+            geometry_dirty: false,
         })
     }
 
@@ -495,12 +467,49 @@ impl<S: Surface> Console<S> {
         self.bot = nr - 1;
     }
 
+    /// Move the text area in from the screen edges by `mx` pixels left and right and
+    /// `my` top and bottom.
+    ///
+    /// The grid is **recomputed** — a smaller margin is more columns and rows — and
+    /// the screen is cleared, because every cell moved. The printing area goes back
+    /// to the whole grid. Clamped to a quarter of each dimension. The new size is
+    /// reported once through [`Console::take_geometry`] so the program on the
+    /// console can be told (`stty size`).
+    pub fn set_margin(&mut self, mx: usize, my: usize) {
+        self.hide_cursor();
+        let (w, h) = (self.surface.width(), self.surface.height());
+        let (mx, my) = (mx.min(w / 4), my.min(h / 4));
+        let (cw, ch) = (self.font.width() * self.scale, self.font.height() * self.scale);
+        self.cols = (w.saturating_sub(2 * mx) / cw).clamp(1, MAX_COLS);
+        self.rows = (h.saturating_sub(2 * my) / ch).clamp(1, MAX_ROWS);
+        self.vcols = self.cols;
+        self.vrows = self.rows;
+        self.origin_x = mx;
+        self.origin_y = my;
+        self.clear_screen();
+        self.geometry_dirty = true;
+    }
+
+    /// The printing area as `(rows, columns)` if it changed since the last call
+    /// (a new margin), `None` otherwise. The console's owner polls this and tells
+    /// the program on the console its new size.
+    pub fn take_geometry(&mut self) -> Option<(usize, usize)> {
+        core::mem::take(&mut self.geometry_dirty).then_some((self.vrows, self.vcols))
+    }
+
     /// Paint the whole surface — not just the text area — and reset the cursor.
     ///
     /// The whole surface on purpose: the margin is part of what proves the
     /// framebuffer is being written at all, and on a first bring-up "the screen
     /// changed colour" is the entire signal.
     pub fn clear(&mut self) {
+        self.clear_screen();
+        self.parser = Some(vte::Parser::new_with_size());
+    }
+
+    /// [`Console::clear`] without touching the parser — what a sequence handled
+    /// *by* the parser has to use.
+    fn clear_screen(&mut self) {
         let (w, h) = (self.surface.width(), self.surface.height());
         self.surface.fill(0, 0, w, h, self.bg);
         // Filled in place rather than assigned from a fresh array: the array
@@ -511,8 +520,6 @@ impl<S: Surface> Console<S> {
         }
         self.col = 0;
         self.row = 0;
-        self.esc = Esc::Ground;
-        self.utf8 = UTF8_IDLE;
         self.pen = PEN_DEFAULT;
         self.top = 0;
         self.bot = self.vrows - 1;
@@ -574,67 +581,22 @@ impl<S: Surface> Console<S> {
     }
 
     /// Write one byte: UTF-8 text, `\n \r \t \b`, and the escape sequences a shell
-    /// or a TUI uses (see [`Esc`]).
+    /// or a TUI uses.
     ///
-    /// Plain ASCII output — which is all the kernel's own messages are — goes
-    /// through exactly as before.
+    /// The bytes go through `vte`'s parser, which decodes UTF-8 and recognises every
+    /// CSI/OSC/ESC/DCS sequence; the console only acts on what it dispatches (see
+    /// the [`vte::Perform`] impl below). Plain ASCII output — which is all the
+    /// kernel's own messages are — comes out exactly as before.
     pub fn write_byte(&mut self, b: u8) {
         self.hide_cursor();
-        match self.esc {
-            Esc::Ground => self.ground(b),
-            Esc::Escape => self.escape(b),
-            Esc::Swallow => self.esc = Esc::Ground,
-            Esc::Str { mut buf, mut len } => match b {
-                0x07 => self.finish_string(&buf[..len]),
-                // `ESC \` is the string terminator; going through `Escape`
-                // consumes the `\` as the two-byte sequence it is.
-                0x1b => {
-                    self.finish_string(&buf[..len]);
-                    self.esc = Esc::Escape;
-                }
-                _ => {
-                    if len < OSC_KEEP {
-                        buf[len] = b;
-                        len += 1;
-                    }
-                    self.esc = Esc::Str { buf, len };
-                }
-            },
-            Esc::Csi { mut params, mut count, mut private } => {
-                match b {
-                    b'0'..=b'9' => {
-                        let p = &mut params[count.min(CSI_PARAMS - 1)];
-                        *p = p.saturating_mul(10).saturating_add(u16::from(b - b'0')).min(9999);
-                    }
-                    // `:` separates sub-parameters (`38:2::r:g:b`); treated as `;`.
-                    b';' | b':' => count = (count + 1).min(CSI_PARAMS - 1),
-                    b'<'..=b'?' => private = b,
-                    // Intermediates (`ESC [ ! p`): part of the sequence, no meaning.
-                    0x20..=0x2f => {}
-                    0x40..=0x7e => {
-                        self.esc = Esc::Ground;
-                        self.csi(b, &params, count, private);
-                        return;
-                    }
-                    // CAN and SUB abort a sequence; any other control byte is
-                    // executed by a real terminal mid-sequence and ignored here.
-                    0x18 | 0x1a => {
-                        self.esc = Esc::Ground;
-                        return;
-                    }
-                    _ => {}
-                }
-                self.esc = Esc::Csi { params, count, private };
-            }
-        }
+        let mut parser = self.parser.take().unwrap_or_else(vte::Parser::new_with_size);
+        parser.advance(&mut Performer(self), &[b]);
+        self.parser = Some(parser);
     }
 
+    /// An `ESC <byte>` sequence with no intermediates.
     fn escape(&mut self, b: u8) {
-        self.esc = Esc::Ground;
         match b {
-            b'[' => self.esc = Esc::Csi { params: [0; CSI_PARAMS], count: 0, private: 0 },
-            b']' | b'P' | b'_' | b'^' | b'X' => self.esc = Esc::Str { buf: [0; OSC_KEEP], len: 0 },
-            b'(' | b')' | b'*' | b'+' | b'#' | b'%' => self.esc = Esc::Swallow,
             // DECSC / DECRC.
             b'7' => self.saved = (self.row, self.col, self.pen),
             b'8' => self.restore_cursor(),
@@ -657,19 +619,17 @@ impl<S: Surface> Console<S> {
         }
     }
 
-    /// An `ESC ]` string ended: answer the two colour queries, ignore the rest
+    /// An `ESC ]` command ended: answer the two colour queries, ignore the rest
     /// (window titles, hyperlinks, ...).
-    fn finish_string(&mut self, s: &[u8]) {
-        self.esc = Esc::Ground;
-        let (which, c) = match s {
-            b"11;?" => (b'1', self.bg),
-            b"10;?" => (b'0', self.fg),
+    fn osc(&mut self, params: &[&[u8]]) {
+        let (which, c) = match params {
+            [b"11", b"?"] => (b'1', self.bg),
+            [b"10", b"?"] => (b'0', self.fg),
             _ => return,
         };
         // OSC 1x ; rgb:RRRR/GGGG/BBBB ST — each channel as 16 bits, 8 repeated.
         let mut out = [0u8; 40];
-        let head = b"\x1b]1";
-        out[..3].copy_from_slice(head);
+        out[..3].copy_from_slice(b"\x1b]1");
         out[3] = which;
         out[4..9].copy_from_slice(b";rgb:");
         let mut n = 9;
@@ -691,25 +651,12 @@ impl<S: Surface> Console<S> {
         self.reply_push(&out[..n]);
     }
 
-    fn ground(&mut self, b: u8) {
-        // A multi-byte UTF-8 sequence in progress.
-        if self.utf8.need > 0 {
-            if b & 0xC0 == 0x80 {
-                self.utf8.acc = (self.utf8.acc << 6) | u32::from(b & 0x3F);
-                self.utf8.need -= 1;
-                if self.utf8.need == 0 {
-                    let cp = self.utf8.acc;
-                    let valid = cp >= self.utf8.min && cp <= 0x10_FFFF && !(0xD800..=0xDFFF).contains(&cp);
-                    self.put_cp(if valid { cp } else { u32::from(TOFU) });
-                }
-                return;
-            }
-            // A broken sequence: show it, then treat this byte afresh.
-            self.utf8 = UTF8_IDLE;
-            self.put_cp(u32::from(TOFU));
-        }
+    /// A C0 control byte.
+    fn control(&mut self, b: u8) {
         match b {
-            b'\n' => self.newline(),
+            // LF, VT and FF all move down (and, as always on this console, home
+            // the column: the kernel's own messages end in a bare `\n`).
+            b'\n' | 0x0B | 0x0C => self.newline(),
             b'\r' => self.col = 0,
             b'\t' => {
                 let next = ((self.col / 8 + 1) * 8).min(self.vcols);
@@ -720,16 +667,8 @@ impl<S: Surface> Console<S> {
             // Non-destructive, as on a terminal: the erase is the space the
             // line discipline writes next (`\b \b`), not the backspace.
             0x08 => self.col = self.col.saturating_sub(1),
-            0x1b => self.esc = Esc::Escape,
-            // BEL has no sound to make and DEL no glyph; the font would draw
-            // both as the replacement box.
-            0x07 | 0x7f => {}
-            0x00..=0x7e => self.put_cp(u32::from(b)),
-            0xC2..=0xDF => self.utf8 = Utf8 { acc: u32::from(b & 0x1F), need: 1, min: 0x80 },
-            0xE0..=0xEF => self.utf8 = Utf8 { acc: u32::from(b & 0x0F), need: 2, min: 0x800 },
-            0xF0..=0xF4 => self.utf8 = Utf8 { acc: u32::from(b & 0x07), need: 3, min: 0x1_0000 },
-            // A stray continuation byte, or a lead that can never be valid.
-            _ => self.put_cp(u32::from(TOFU)),
+            // BEL, SO/SI, NUL and the rest: nothing to draw.
+            _ => {}
         }
     }
 
@@ -874,6 +813,22 @@ impl<S: Surface> Console<S> {
             b'l' => false,
             _ => return,
         };
+        // `CSI ? 9001 ; x ; y h` — this console's own: set the screen margin to `x`
+        // pixels left/right and `y` top/bottom (`y` defaults to `x`); `l` restores
+        // the default. Private modes take their parameters as a mode list, so this
+        // one is read before the loop and ends it.
+        if params[0] == 9001 {
+            if on {
+                let x = usize::from(params[1]);
+                let y = if count >= 2 { usize::from(params[2]) } else { x };
+                self.set_margin(x, y);
+            } else {
+                let (w, h) = (self.surface.width(), self.surface.height());
+                let (mx, my) = Self::auto_margin(w, h);
+                self.set_margin(mx, my);
+            }
+            return;
+        }
         for &mode in &params[..=count.min(CSI_PARAMS - 1)] {
             match mode {
                 7 => self.autowrap = on,
@@ -1397,6 +1352,59 @@ impl<S: Surface> Console<S> {
     /// The surface, for a caller that wants to draw around the text.
     pub const fn surface_mut(&mut self) -> &mut S {
         &mut self.surface
+    }
+}
+
+/// The `vte` side: the parser calls these as it recognises text and sequences.
+struct Performer<'a, S: Surface>(&'a mut Console<S>);
+
+impl<S: Surface> vte::Perform for Performer<'_, S> {
+    fn print(&mut self, c: char) {
+        self.0.put_cp(u32::from(c));
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.0.control(byte);
+    }
+
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
+        // A sequence the parser had to truncate, or an action beyond ASCII, is
+        // not one this console knows.
+        let Ok(action) = u8::try_from(action) else { return };
+        if ignore {
+            return;
+        }
+        // `?`, `<`, `=` and `>` arrive as the first intermediate (the private
+        // marker). Any other intermediate (`CSI ! p`, `CSI SP q`) makes it a
+        // different sequence from the one the final byte names, so it is dropped.
+        let private = match intermediates {
+            [] => 0,
+            [m @ (b'?' | b'<' | b'=' | b'>')] => *m,
+            _ => return,
+        };
+        // Flatten sub-parameters into one list (`38:2::r:g:b` reads as `38;2;;r;g;b`).
+        let mut flat = [0u16; CSI_PARAMS];
+        let mut n = 0;
+        for sub in params {
+            for &v in sub {
+                if n < CSI_PARAMS {
+                    flat[n] = v;
+                    n += 1;
+                }
+            }
+        }
+        self.0.csi(action, &flat, n.saturating_sub(1), private);
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        // `ESC ( B` and friends select character sets: no meaning here.
+        if intermediates.is_empty() && !ignore {
+            self.0.escape(byte);
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.0.osc(params);
     }
 }
 

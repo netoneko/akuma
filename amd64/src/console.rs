@@ -343,8 +343,10 @@ pub fn pump_once() -> bool {
 
     // Output has gone quiet: put the cursor where typing will land. Idempotent
     // and `try_lock`ed, so doing it on every idle lap costs a comparison.
-    if !moved {
-        crate::multiboot2::cursor_idle();
+    if !moved && let Some((rows, cols)) = crate::multiboot2::cursor_idle() {
+        // The console's grid changed under the program (a new screen margin):
+        // `stty size` and `TIOCGWINSZ` must say so.
+        set_size(rows, cols);
     }
 
     moved

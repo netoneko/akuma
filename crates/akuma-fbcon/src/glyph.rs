@@ -20,51 +20,21 @@
 //!
 //! A terminal cell is one, two or — for combining marks and joiners — zero
 //! columns wide, and a program laying out a screen assumes the terminal agrees.
-//! [`width`] is the console's answer: East Asian wide and emoji are 2, so a line
-//! containing an emoji stays aligned with the rest of the frame even though the
-//! console cannot draw a colour emoji and shows a box in its place.
+//! [`width`] is the console's answer (from `unicode-width`): East Asian wide and
+//! emoji are 2, so a line containing an emoji stays aligned with the rest of the
+//! frame even though the console cannot draw a colour emoji and shows a box in its
+//! place.
 
 /// How many columns `cp` occupies: 0 (combining mark, joiner, variation
 /// selector), 1, or 2 (East Asian wide, emoji).
+///
+/// From the `unicode-width` crate's Unicode tables — a hand-written range list
+/// was the first version and was never going to track Unicode. A control
+/// character (which the parser never prints) and anything the tables do not know
+/// count as one column.
 #[must_use]
-pub const fn width(cp: u32) -> usize {
-    match cp {
-        // Zero-width: combining marks, joiners, direction/format controls,
-        // variation selectors.
-        0x0300..=0x036F
-        | 0x1AB0..=0x1AFF
-        | 0x1DC0..=0x1DFF
-        | 0x200B..=0x200F
-        | 0x2028..=0x202E
-        | 0x2060..=0x2064
-        | 0x20D0..=0x20FF
-        | 0xFE00..=0xFE0F
-        | 0xFE20..=0xFE2F
-        | 0xE0100..=0xE01EF => 0,
-        // East Asian wide and fullwidth.
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x20000..=0x3FFFD => 2,
-        // Emoji and pictographs that terminals draw two cells wide.
-        0x1F300..=0x1F64F | 0x1F680..=0x1F6FF | 0x1F900..=0x1F9FF | 0x1FA70..=0x1FAFF => 2,
-        // The BMP emoji with default emoji presentation.
-        0x231A | 0x231B | 0x23E9..=0x23EC | 0x23F0 | 0x23F3 | 0x25FD | 0x25FE | 0x2614
-        | 0x2615 | 0x2648..=0x2653 | 0x267F | 0x2693 | 0x26A1 | 0x26AA | 0x26AB | 0x26BD
-        | 0x26BE | 0x26C4 | 0x26C5 | 0x26CE | 0x26D4 | 0x26EA | 0x26F2 | 0x26F3 | 0x26F5
-        | 0x26FA | 0x26FD | 0x2705 | 0x270A | 0x270B | 0x2728 | 0x274C | 0x274E
-        | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797 | 0x27B0 | 0x27BF | 0x2B1B | 0x2B1C
-        | 0x2B50 | 0x2B55 => 2,
-        _ => 1,
-    }
+pub fn width(cp: u32) -> usize {
+    char::from_u32(cp).and_then(unicode_width::UnicodeWidthChar::width).unwrap_or(1)
 }
 
 /// What a code point is drawn with, when not from the font.

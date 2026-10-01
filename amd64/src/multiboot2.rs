@@ -215,12 +215,17 @@ pub fn set_fb_trace(on: bool) {
 /// says why). `try_lock`, not `lock`: this runs every idle tick from a daemon,
 /// and a tick that lands while a printer holds the console should skip a frame
 /// of cursor rather than queue behind it. The next lap draws it.
-pub fn cursor_idle() {
-    if let Some(mut g) = CONSOLE.try_lock()
-        && let Some(c) = g.as_mut()
-    {
-        c.0.show_cursor();
-    }
+///
+/// **Also reports a changed grid**: a program can change the screen margin
+/// (`CSI ? 9001 ; x ; y h`), which changes how many rows and columns there are.
+/// The new `(rows, columns)` comes back here, once, and the pump tells the console's
+/// terminal state, so `stty size` and every program asking `TIOCGWINSZ` follow.
+pub fn cursor_idle() -> Option<(u16, u16)> {
+    let mut g = CONSOLE.try_lock()?;
+    let c = &mut g.as_mut()?.0;
+    c.show_cursor();
+    let (rows, cols) = c.take_geometry()?;
+    Some((u16::try_from(rows).ok()?, u16::try_from(cols).ok()?))
 }
 
 /// The framebuffer console's grid as `(rows, columns)`, or `None` without one.
@@ -237,6 +242,22 @@ pub fn fb_grid() -> Option<(u16, u16)> {
     let g = CONSOLE.lock();
     let c = &g.as_ref()?.0;
     Some((u16::try_from(c.rows()).ok()?, u16::try_from(c.cols()).ok()?))
+}
+
+/// Apply `/etc/console.conf`'s text to the framebuffer console (margin, printing
+/// area; `fbcon::config`) and return the `(rows, columns)` now in force, or `None`
+/// without a framebuffer console.
+///
+/// Called once from `run_init`, after the root filesystem is mounted, so a machine's
+/// screen setup is a file on its own disk rather than a boot-loader edit. A margin
+/// change clears the screen (every cell moved); a printing-area change keeps what is
+/// inside it. Blocking `lock`, for the reason [`fb_grid`] gives.
+pub fn fb_apply_config(text: &str) -> Option<(u16, u16)> {
+    let cfg = akuma_fbcon::config::ConsoleConfig::parse(text);
+    let mut g = CONSOLE.lock();
+    let c = &mut g.as_mut()?.0;
+    let (rows, cols) = if cfg.is_empty() { (c.rows(), c.cols()) } else { c.apply_config(&cfg) };
+    Some((u16::try_from(rows).ok()?, u16::try_from(cols).ok()?))
 }
 
 /// Bytes the framebuffer console wants typed back into the program on the
@@ -276,6 +297,7 @@ pub fn fb_summary() {
     let mut g = CONSOLE.lock();
     let Some(c) = g.as_mut() else { return };
     let (cols, rows, scale) = (c.0.max_cols(), c.0.max_rows(), c.0.scale());
+    let (vcols, vrows) = (c.0.cols(), c.0.rows());
     let (fw, fh) = (c.0.font().width(), c.0.font().height());
     let (mx, my) = c.0.margin();
     let (w, h, pitch, bpp) = {
@@ -305,6 +327,13 @@ pub fn fb_summary() {
     serial::put_dec(mx as u64);
     serial::puts(",");
     serial::put_dec(my as u64);
+    // The printing area, when `/etc/console.conf` or `stty` narrowed it.
+    if (vcols, vrows) != (cols, rows) {
+        serial::puts(" view ");
+        serial::put_dec(vcols as u64);
+        serial::puts("x");
+        serial::put_dec(vrows as u64);
+    }
     serial::puts("\n");
 }
 

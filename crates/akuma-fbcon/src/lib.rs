@@ -45,7 +45,9 @@
 //! edge and show the rest, a habit inherited from analogue broadcast that HDMI
 //! never fully shook. Text drawn at `x = 0` can simply not be on the screen,
 //! and the failure looks exactly like "the kernel printed nothing".
-//! [`Console::auto_margin`] insets by about 4 %.
+//! [`Console::auto_margin`] insets by under 1 % by default (it was 4 % — a monitor
+//! or a TV in PC mode only wastes that), and the margin can be changed at run time
+//! for a screen that does crop (`CSI ? 9001 ; x ; y h`).
 //!
 //! `#![forbid(unsafe_code)]`: the crate never touches the framebuffer itself. It
 //! writes through a [`Surface`], and the one unsafe thing in the system — a
@@ -55,6 +57,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod console;
 pub mod font;
 pub mod glyph;

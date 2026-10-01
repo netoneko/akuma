@@ -8275,6 +8275,16 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // and every program asking `TIOCGWINSZ` see the framebuffer grid, not a
     // default 24x80), and the one-line geometry summary at the end of the boot
     // log. No framebuffer (PVH, serial) leaves the 24x80 default alone.
+    //
+    // **`/etc/console.conf` first**: a machine's own screen setup — margin, and how
+    // much of the screen the console uses (`cols = 50%` for the left half) — is read
+    // from its filesystem here, so the size reported below is the one in force.
+    // Absent or unreadable is the normal case and changes nothing.
+    if let Ok(conf) = crate::fs::read_file("/etc/console.conf")
+        && let Ok(text) = core::str::from_utf8(&conf)
+    {
+        let _ = crate::multiboot2::fb_apply_config(text);
+    }
     if let Some((rows, cols)) = crate::multiboot2::fb_grid() {
         crate::console::set_size(rows, cols);
         crate::multiboot2::fb_summary();

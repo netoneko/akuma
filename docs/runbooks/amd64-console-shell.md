@@ -101,14 +101,27 @@ anything beyond cursor-left/erase was drawn as text.
 | replies | cursor position (`CSI 6 n`), device attributes (`CSI c`), foreground/background colour queries — typed back into the program by the console pump, so busybox no longer waits at every prompt and a TUI learns the colours |
 | not drawn | colour emoji (a two-column outlined box), Cyrillic/Greek/CJK glyphs (width is right, the glyph is a box), combining accents |
 
-**Why not a crate?** `vte` (parser) and `unicode-width` are `no_std`, and are in the
-local cargo cache. They were not adopted because the box builds kernels **offline
-from a primed cache** (`kbuild`), so a new dependency is also a change to what must
-be fetched onto the box, and because `akuma-fbcon` is deliberately dependency-free
-and `forbid(unsafe_code)`. The parser is ~200 lines and every sequence has a host
-test. `unicode-width` is the one worth revisiting if `glyph::width` proves wrong for
-a character. No crate provides a no-alloc *screen model*: `vt100`,
-`alacritty_terminal` and `termwiz` all need `std`/`alloc`.
+**Crates.** Two crates do the parts that should not be hand-written (adopted
+2026-10-01, replacing a first hand-rolled parser and width table):
+
+- **`vte` 0.15** — the escape-sequence parser (Alacritty's): UTF-8 decoding and every
+  CSI/OSC/ESC/DCS state. Built with `default-features = false`, which makes it
+  `no_std` and allocation-free; its default `std` feature would pull `memchr/std`,
+  and `std` does not exist for the kernel's `x86_64-unknown-none` (so `vte` 0.14,
+  whose `memchr` is not optional, **cannot** be used here).
+- **`unicode-width` 0.2** — 0/1/2 column widths from the Unicode tables.
+
+Their licences (`Apache-2.0 OR MIT`, `MIT OR Apache-2.0`, and the `arrayvec` and
+`memchr` they pull in) are permissive and compatible with this repository's
+BSD-2-Clause; they are used under MIT and their notices are in
+[`crates/akuma-fbcon/THIRD_PARTY_LICENSES.md`](../../crates/akuma-fbcon/THIRD_PARTY_LICENSES.md)
+(regenerate it when a version changes). **Cost to know about:** the box builds
+offline from a primed cargo cache, so a kernel build on the box needs these four
+crates fetched into `/root/.cargo` first (`cargo fetch` from `/src/.../akuma`, from
+Ubuntu or with network). `cargo build` prints a harmless future-incompatibility note
+for `memchr` on the nightly toolchain (both 2.8.0 and 2.8.3). No crate provides a
+no-alloc *screen model* — `vt100`, `alacritty_terminal` and `termwiz` all need
+`std`/`alloc` — so the grid, colours, scrolling and drawing are `akuma-fbcon`'s own.
 
 ## Screen size: what `stty size` says, and what you can set
 
@@ -130,8 +143,33 @@ wrapping described a terminal that was not on the glass. Now:
   it — so late.sh can run in the left part of the screen with the rest left alone.
   Values larger than the screen are clamped and `stty size` reports what is in
   force. Put it in `/etc/console.rc` (sourced by the console shell via `$ENV`) to
-  make it stick: `stty cols 73 rows 41`. Reset with the full size from `[fb]`.
+  make it stick per shell, or use `/etc/console.conf` (below) for the boot itself. Reset with the full size from `[fb]`.
   The anchor is the top left; a window elsewhere is not supported.
+
+### Per-machine setup: `/etc/console.conf` (read at boot)
+
+```text
+# /etc/console.conf on the trashcan: the left half of the screen, no dead border.
+margin = 0
+cols = 50%
+```
+
+| key | meaning | forms |
+|---|---|---|
+| `margin` | pixels between the text and the screen edge (the default is about 0.8 %) | `0`, `24`, `24,12` |
+| `cols` / `rows` | the printing area, anchored top-left | `73`, `50%` |
+
+Read by `run_init` after the root filesystem mounts and before the console's size is
+reported, so `stty size`, the shell and everything it runs see the area in force; the
+boot log's last line says what happened (`[fb] ... margin 0,0 view 78x41`). A
+percentage is of what the screen holds *after* the margin. Unknown keys, bad values
+and comments are ignored — a typo costs a setting, never a boot. **It is a per-machine
+file**: `mkdisk.sh` does not stage one, so QEMU images keep the full screen; edit it on
+the box (`vi /etc/console.conf`, then `reboot`). A margin change clears the screen.
+
+Live, without a reboot: `stty cols 73 rows 41` (area), or `printf '\033[?9001;0;0h'`
+(margin in pixels; `\033[?9001l` restores the default — it changes the grid, and
+`stty size` follows within a lap).
 
 ## The keyboard
 

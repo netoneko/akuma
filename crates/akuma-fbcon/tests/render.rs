@@ -406,7 +406,9 @@ fn neither_font_reaching_the_target_still_takes_the_better_grid() {
 #[test]
 fn the_font_falls_back_only_on_a_screen_that_needs_it() {
     type C = Console<MemSurface>;
-    for (w, h) in [(640, 480), (800, 600), (1024, 768)] {
+    // 1024x768 used to be here: the 4 % margin cost it the 80 columns. With the
+    // margin under 1 % it reaches 84x31 in the default face, which is the point.
+    for (w, h) in [(640, 480), (800, 600)] {
         assert_eq!(
             C::choose_font(w, h).name(),
             FALLBACK_FONT.name(),
@@ -414,7 +416,7 @@ fn the_font_falls_back_only_on_a_screen_that_needs_it() {
             C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
         );
     }
-    for (w, h) in [(1280, 720), (1280, 1024), (1920, 1080), (1920, 1200), (3840, 2160)] {
+    for (w, h) in [(1024, 768), (1280, 720), (1280, 1024), (1920, 1080), (1920, 1200), (3840, 2160)] {
         assert_eq!(
             C::choose_font(w, h).name(),
             DEFAULT_FONT.name(),
@@ -1111,6 +1113,81 @@ fn drawing_never_escapes_the_surface_with_every_new_feature() {
     con.write_str_bytes("\x1b[?1049h\x1b[2;3r\r\n\r\n\r\n\x1b[?1049l");
     con.set_view(3, 3);
     con.write_str_bytes("wrap wrap wrap 中中中");
+    con.show_cursor();
+    assert_eq!(con.into_surface().out_of_bounds, 0);
+}
+
+// ---------------------------------------------------------------------------
+// The margin: small by default, adjustable at run time.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_default_margin_is_under_one_percent() {
+    let (mx, my) = Console::<MemSurface>::auto_margin(3840, 2160);
+    assert!(mx < 3840 / 100 && my < 2160 / 100, "{mx},{my}");
+    assert!(mx > 0, "but not zero: text must not touch the bezel");
+}
+
+#[test]
+fn a_smaller_margin_is_more_columns() {
+    let mut con = Console::new(MemSurface::new(1920, 1080)).unwrap();
+    let before = (con.cols(), con.rows());
+    con.set_margin(0, 0);
+    assert!(con.cols() >= before.0 && con.rows() >= before.1, "{before:?} -> {}x{}", con.cols(), con.rows());
+    con.set_margin(200, 100);
+    assert!(con.cols() < before.0 && con.rows() < before.1);
+}
+
+#[test]
+fn text_is_drawn_at_the_new_origin() {
+    let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_fg(Rgb::WHITE);
+    con.clear();
+    con.set_margin(0, 0);
+    assert_eq!(con.margin(), (0, 0));
+    con.write_str_bytes("M");
+    let s = con.into_surface();
+    // With no margin the glyph's ink starts in the cell at the very corner.
+    let ink_in_corner_cell = (0..24).any(|y| (0..12).any(|x| s.at(x, y) != Rgb::BLACK));
+    assert!(ink_in_corner_cell);
+}
+
+#[test]
+fn a_margin_change_clears_the_screen_and_is_reported_once() {
+    let mut con = term();
+    con.write_str_bytes("old text");
+    assert_eq!(con.take_geometry(), None, "nothing changed yet");
+    con.set_margin(0, 0);
+    assert_eq!(row_text(&con, 0), "", "every cell moved, so the screen is cleared");
+    assert_eq!(con.cursor(), (0, 0));
+    let g = con.take_geometry().expect("reported");
+    assert_eq!(g, (con.rows(), con.cols()));
+    assert_eq!(con.take_geometry(), None, "once");
+}
+
+#[test]
+fn the_margin_escape_sets_and_restores_it() {
+    let mut con = term();
+    let default = (con.cols(), con.rows());
+    con.write_str_bytes("\x1b[?9001;0;0h");
+    assert_eq!(con.margin(), (0, 0));
+    assert!(con.cols() >= default.0);
+    con.write_str_bytes("\x1b[?9001;30h"); // y defaults to x
+    assert_eq!(con.margin(), (30, 30));
+    con.write_str_bytes("\x1b[?9001l");
+    let (w, h) = (640, 400);
+    assert_eq!(con.margin(), Console::<MemSurface>::auto_margin(w, h));
+    // The parser carried on after a handler that cleared the screen.
+    con.write_str_bytes("ok");
+    assert_eq!(row_text(&con, 0), "ok");
+}
+
+#[test]
+fn an_absurd_margin_is_clamped_and_never_draws_outside() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[?9001;9999;9999h");
+    assert!(con.cols() >= 1 && con.rows() >= 1);
+    con.write_str_bytes("text that wraps and wraps and wraps ─●→");
     con.show_cursor();
     assert_eq!(con.into_surface().out_of_bounds, 0);
 }

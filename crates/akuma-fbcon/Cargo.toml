@@ -8,6 +8,15 @@ description = "A text console over a linear framebuffer: anti-aliased bitmap fon
 workspace = true
 
 [dependencies]
+# Terminal escape-sequence parser (Paul Williams' state machine, as used by
+# Alacritty): UTF-8 decoding and every CSI/OSC/ESC/DCS state, tested far beyond
+# what a hand-rolled one gets. `no_std` and allocation-free with default features
+# off — `std` would pull `memchr/std`, which does not exist for the kernel's
+# `x86_64-unknown-none`. Licence: Apache-2.0 OR MIT.
+vte = { version = "0.15", default-features = false }
+# Display width of a character: 0 (combining), 1, or 2 (East Asian wide, emoji),
+# from the Unicode tables. Licence: MIT OR Apache-2.0.
+unicode-width = { version = "0.2", default-features = false }
 
 [build-dependencies]
 # Rasterizing a TrueType outline is the one job here that is not worth writing
