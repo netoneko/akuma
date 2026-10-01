@@ -590,6 +590,21 @@ fn spin_assist() {
     }
 }
 
+/// The same assist for IRQ-masked spins on locks that are **not** the BKL's.
+///
+/// `akuma_mmu::set_shootdown_hooks` argues the shootdown wait is bounded
+/// because the sender holds the BKL, the outermost lock. The BKL carve-outs
+/// (`no-bkl-process`, `-mm`, `-vfs`, `-drivers`) make that false: a core can be
+/// IRQ-masked on an inner lock — the address-space lock above all — while the
+/// sender holds that lock waiting for this core's acknowledgement. Any such
+/// spin calls this each iteration. A no-op off x86 bare metal and before the
+/// kernel registers the hook.
+#[inline]
+pub fn masked_spin_assist() {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    spin_assist();
+}
+
 impl KernelLock {
     /// A free lock.
     pub const fn new() -> Self {

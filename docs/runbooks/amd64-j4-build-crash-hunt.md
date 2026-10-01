@@ -1,11 +1,83 @@
 # amd64 `-j4` self-host build: what is known, and how to attempt it on the trashcan
 
-**Stability: B.** The ryzen numbers are measured; the metal half is a checklist
-for a run that has **not happened yet** — nothing here was executed on the HP box.
+**Stability: B.** Both rigs now have measured `-j4` numbers on the same source
+(2026-09-30, §1a). The metal half was a checklist until that day; §3 is still the
+pre-flight for repeating it.
 
 The question: does `kbuild -c -j 4` at SMP=4 finish on the machine, or does it die
 the way [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md)
 §3 recorded (3 of 4 builds `rc=139`, at 22–35 crates)? Two rigs have data.
+
+## 1a. Latest result (2026-09-30, `main` = `e6d8657b`): good, not parity
+
+**Short version.** Self-hosting on amd64 is now at AArch64's *stability* under a
+hypervisor and **not yet** on the metal. The 2026-09-18 metal signature — `rc=139`
+SIGSEGV at 20–35 crates, 3 builds in 4 — did **not** recur in 10 builds (0
+SIGSEGV, 0 `[Fault]`, 0 `[TLB] stuck`). But **3 of the 10 failed**, all the same
+way: `execve` of `rust-lld` returned `EIO`, early in the build. The metal is also
+slower at `-j4` than it was at `-j1`. Nothing here is parity with AArch64.
+
+| rig | kernel | what ran | result |
+|---|---|---|---|
+| **ryzen**, Firecracker, 4 vCPU / 4 GiB | `e6d8657` built on ryzen, md5 `9791d5a02e2e` | 10 fresh-boot `kbuild -c -j 4`, whole `/root/ktarget` wiped each time (`CLEAN_ALL=1`) | **10 of 10 PASS**, 90 s each, 0 `[Fault]`, 0 SIGSEGV, 0 `[TLB] stuck`; 27 `[BKL] stuck` per run, unchanged. **31 of 31** with the 21 from 2026-09-29 |
+| **HP box, bare metal**, SMP=4, 16 GiB, USB root | `0b800634` (one commit behind `main`: the HDA stream-release fix, `amd64/src/hda.rs` only; it contains `2d073ca0` and `0e331f5`, so §1's "known hang" gap is closed) | 10 x `rm -rf /root/ktarget; kbuild -c -j 4` via `scripts/benchmarks/amd64_metal_j4_loop.sh` | **7 PASS, 3 FAIL** (all three `EIO` at `execve`); 0 SIGSEGV |
+
+Metal runs (96 `Compiling` lines on a pass — the graph is 96 since `akuma-hda`
+joined it, not the 95 of the older numbers):
+
+| run | verdict | wall | crates | `[BKL] stuck` | note |
+|---|---|---|---|---|---|
+| 1 | PASS | 874 s | 96 | 458 | |
+| 2 | PASS | 836 s | 96 | 494 | |
+| 3 | PASS | 843 s | 96 | 555 | |
+| 4 | **FAIL** `rc=101` | 337 s | 33 | 271 | `could not exec rust-lld: I/O error (os error 5)`, `akuma-config` build script |
+| 5 | PASS | 905 s | 96 | 652 | |
+| 6 | PASS | 872 s | 96 | 581 | |
+| 7 | **FAIL** `rc=101` | 291 s | 29 | 202 | same, `zerocopy-derive` (proc macro) |
+| 8 | **FAIL** `rc=101` | 380 s | 33 | 281 | same, two links (`akuma-config`, `zerocopy-derive`) |
+| 9 | PASS | 885 s | 96 | 594 | |
+| 10 | PASS | 881 s | 96 | 574 | |
+
+**Reading the metal failures.** All three are `lld-wrapper: could not exec
+rust-lld: I/O error (os error 5)`, all linking a **host unit** (build script or
+proc macro) in the first ~30 crates, at 291–380 s. No `rc=139`, no `[Fault]`. It is
+`EIO` from `execve`: `amd64/src/usermode.rs`'s exec path reads the whole image with
+`fs::read_image` under `bkl_free_io`, and a failed read of a cache-cold binary
+comes back as `IoError` and is reported as `EIO` — the layer the call-site comment
+ties to the USB-stall `[BKL] stuck` storm of 2026-09-11.
+
+What is and is not established:
+
+* **Established:** the signature is identical in 3 of 3 and always at the same
+  phase — the first links of the build, when `rust-lld` (used once per link, and
+  large) is cache-cold and up to four `rustc`s exec it at once. `-j1` builds never
+  showed it (2026-09-19: 12m 16s, gen-2/gen-3 clean), and ryzen (virtio-blk) never
+  does.
+* **Hypotheses, none tested:** (a) concurrent cold reads of the same image through
+  the BKL-free `read_image` path race, and the USB disk's latency widens the
+  window; (b) a USB transfer error surfacing as `IoError`. (b) is **not excluded**
+  — the batch that produced these ten runs sampled dmesg for
+  `Fault|SIGSEGV|BKL|TLB|...` but **not** `xhci`/`usb`, so its `signals` files
+  cannot say either way, and the one full `dmesg` read (during run 5) held no
+  `xhci`/`usb` line after the ring had washed. The script in the tree now also
+  matches `xhci|usb|transfer|EIO|I/O err` (the copy at `/root/j4loop.sh` on the box
+  is the old one — re-copy it before the next batch).
+* **Not established:** whether it is one bug; its rate (3 of 10, 95 % interval
+  roughly 7–65 %); whether it is reachable on ryzen at all.
+
+What this changes, and what it does not:
+
+* **Changes:** `-j4` on the metal is no longer a compile-phase SIGSEGV coin-flip —
+  0 of 10 against 2 of 2 on 2026-09-18 (95 % upper bound on a SIGSEGV rate at 10
+  clean runs ≈ 26 %, so it is bounded, not removed).
+* **Does not change:** a build that loses 3 of 10 to a storage-path `EIO` is not at
+  AArch64's standard, where the self-host gate passes without a device caveat.
+* **Speed:** passing runs took **836–905 s** (mean ≈ 871 s) at `-j4` against
+  **632–640 s** at `-j1` (2026-09-19). More jobs made it *slower*. The guest does
+  the same graph in 90 s. The likely cost is the contended BKL and the USB disk
+  (hundreds of `[BKL] stuck` episodes per pass against 27 on ryzen); not profiled.
+* **The two rigs' counts are not comparable:** `[BKL] stuck` was exactly 27 on ryzen
+  and 202–652 on the metal; the USB root is the obvious difference.
 
 ## 1. Where things stand (2026-09-29)
 
@@ -23,6 +95,12 @@ difference from the metal (CPU, virtio-blk vs USB, 4–6 GiB vs 16, no xHCI)
 stands. It does **not** say the metal is fixed.
 
 ### The two trees are not the same kernel
+
+> **Resolved 2026-09-30.** The box now runs `0b800634`, which contains `2d073ca0`
+> and `0e331f5` (checked: `git merge-base --is-ancestor`, and the box's
+> `amd64/src/sched.rs` has the `REMOVED 2026-09-26` text and no
+> `bkl_free_by_choice`). The section below records the 2026-09-29 state and why
+> `97fd2d10` was not a fair `-j4` subject; it is kept as history.
 
 The trashcan, when checked on 2026-09-29, ran **`97fd2d10`** ("last fix from meow",
 built on the box at 21:37 UTC, `uname` = `97fd2d10-release-smp-shared`). That commit
@@ -79,7 +157,7 @@ a whole-graph gate wipes the target dir first.
 
 ```sh
 # on the box (through a session that survives a few minutes — see the harness notes below)
-rm -rf /root/ktarget                    # whole-graph: 95 `Compiling` lines, not 79
+rm -rf /root/ktarget                    # whole-graph: 96 `Compiling` lines (95 before akuma-hda), not 79
 kbuild -c -j 4 > /root/kbuild-j4-1.out  # stdout only; see the redirect note below
 ```
 
@@ -111,8 +189,9 @@ md5 and `uname`, and the console counters below. What the ryzen guest printed on
 | `[TLB] stuck`, `[Fault]`, `signal: 11` | 0 | any of these on the box is news |
 
 Timing to expect: ~1m 30s on the ryzen guest at `-j4`. The metal built the
-95-crate graph in **632–640 s at `-j1`** (SMP=4, 1 GiB heap) — so `-j4` there is a
-new number, not a known one.
+95-crate graph in **632–640 s at `-j1`** (SMP=4, 1 GiB heap) and, measured
+2026-09-30, the 96-crate graph in **836–874 s at `-j4`** (§1a) — slower, not
+faster. A `-j4` metal run under ~10 min would be news.
 
 ## 4. Reading a failure
 
@@ -131,6 +210,7 @@ killed silently. "No `[Fault]`" is not "the kernel killed nothing".
 | build reaches N/N then stops, `cargo` has CPU, every `rustc` at `0:00` | the untimed-`FUTEX_WAIT` leader (fixed 2026-09-18); a lost wake-up if it recurs | `sched::dump_slot_table`, `futex::dump_waiters`, `scripts/benchmarks/amd64_slot_report.py` (diff two 30 s blocks — one dump misleads) |
 | `[BKL] stuck` **storm** then `[TLB] stuck: N peer(s) unacked`, dead to ssh | shootdown never acked: a core in IRQ-masked xHCI polling with the BKL dropped | `AMD64_THREE_CRASHES_2026-09-25.md` §1 — **the fix exists in the tree and was never verified on the metal**. This is the one to expect if the USB disk stalls |
 | `[xhci] transfer timeout` before any of the above | the drive, not the scheduler | `AKUMA_AMD64_USB_XHCI.md`; USB 3.0 socket rule in the bare-metal runbook |
+| `lld-wrapper: could not exec rust-lld: I/O error (os error 5)`, `rc=101`, no SIGSEGV | `execve`'s `read_image` returned `IoError` → `EIO` on a cache-cold binary; 3 of 10 metal runs on 2026-09-30 (§1a), all linking a host unit in the first ~30 crates. **Cause not confirmed**; the code comment at the exec site ties this layer to USB transfer stalls | capture `dmesg` *immediately* (the ring washes in ~3.5 min — `amd64_metal_j4_loop.sh` samples it every 15 s for this), look for `[xhci] transfer timeout` (add `xhci`/`transfer` to the sampler's pattern first), check whether the same binary `execve`s again at once |
 | `rust-lld … signal: 11` at the final link | memory pressure (`[ALLOC FAIL]`) or the same defect by a cheaper route | replay the printed argv with `--threads=1` (the 20 s A/B in bare-metal §3) |
 | zero-page / `cr2` reads all zero (not `0xFEEDFACE`) under `pmm-forensics` | a freshly zeroed page put where data was — the §14 double-populate shape | `--features mm-forensics` / `pmm-forensics` build; **as of 2026-09-18 the metal had never run under `pmm-forensics`** |
 
@@ -144,8 +224,16 @@ Firecracker guest.
 
 ## 5. Left open
 
-* **The metal `-j4` question itself** — this runbook's whole point; no run on the
-  box has happened with the current tree.
+* **The metal `-j4` question, partly answered (2026-09-30, §1a).** The `rc=139`
+  signature did not recur in 10 builds; 3 of 10 died of `EIO` at `execve` of
+  `rust-lld`, always in the first ~30 crates. Open: concurrent cold-read race vs
+  xHCI/USB error (look for `[xhci] transfer timeout` the moment it happens; try
+  pre-warming `rust-lld` with `cat > /dev/null` before the build — if that removes
+  the failures it is the cold read, and it is also a workaround), why `-j4` is
+  slower than `-j1` there, and a larger sample.
+* **Metal under a whole-graph wipe with the serial/`dmesg` captured per run** —
+  done by `scripts/benchmarks/amd64_metal_j4_loop.sh`; it exists because the
+  ring washes before anyone reads it.
 * **The constant 27** `[BKL] stuck` lines: the reporter folds by episode
   (`STUCK_REPORTED`, `akuma-bkl/src/sync.rs`), it is not a hard cap I found, and an
   event driven by timing landing on one value 21 times deserves a look.
@@ -164,8 +252,9 @@ not assume:
 
 1. `uname -a` and `md5sum /boot/akuma-amd64` are the kernel you meant to test
    (and match the running one; a self-build overwrites the file at that path).
-2. `rm -rf /root/ktarget` preceded the run, and the output has **95** `Compiling`
-   lines (79 means host units were reused).
+2. `rm -rf /root/ktarget` preceded the run, and the output has **96** `Compiling`
+   lines since `akuma-hda` joined the graph (95 before; 79/80 means host units
+   were reused).
 3. The run's console log was captured *before* anything else touched the box.
 4. The same source tree has a ryzen result, or the difference is stated.
 
@@ -176,6 +265,7 @@ for re-running it.
 ## Background
 
 * [`selfhost-kernel-build-amd64.md`](selfhost-kernel-build-amd64.md) — the HP-box Firecracker gate and the ryzen section.
+* `scripts/benchmarks/amd64_metal_j4_loop.sh` — the on-box batch driver (copy to `/root/j4loop.sh`, run with `sh`, detached); `scripts/benchmarks/ryzen_fc/` — the ryzen one.
 * [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the box, its rules, "The SMP=4 `-j4` build wedge — the cheap repro".
 * [`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md) — the metal's `-j4`/LLD failures and the heap fix.
 * [`../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) — §§12–14, the wedge, the double-populate race, the `hlt` trick.

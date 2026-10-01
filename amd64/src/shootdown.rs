@@ -216,6 +216,13 @@ pub fn wait_for_acks() {
         if crate::idt::fatal_in_progress() {
             crate::halt();
         }
+        // Acknowledge anything addressed to *this* core while waiting. A sender
+        // that is IRQ-masked (every `as_lock` hold) takes no IPI, and a second
+        // sender — `fork`'s BKL-free flush against a BKL-held `munmap` — would
+        // otherwise wait on this core's ack while this core waits on its.
+        // Equivalent to the IPI landing here; own slot only, so it cannot
+        // acknowledge the generation being waited on.
+        service_pending();
         spins += 1;
         if spins == STUCK_REPORT_SPINS {
             spins = 0;

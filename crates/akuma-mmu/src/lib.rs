@@ -846,8 +846,18 @@ impl Drop for TlbFlush {
 // ticket wait itself — which is precisely the one state that cannot make
 // progress, and why `akuma_bkl`'s acquire loop services pending shootdowns
 // inline. With those covered, every peer reaches the IPI and acknowledges; the
-// wait is bounded. A peer IRQ-masked on the *address-space* lock cannot
-// happen: taking that lock requires the BKL the sender holds.
+// wait is bounded.
+//
+// **Correction 2026-10-01: the BKL is not the outermost lock on amd64.** The
+// `no-bkl-process`/`-mm`/`-vfs`/`-drivers` carve-outs let a core run kernel code
+// with the BKL dropped, and `fork`'s share pass takes the owner's *address-space*
+// lock that way — the same lock a `munmap` sender holds across this wait. A peer
+// IRQ-masked on it took no IPI and was in no BKL ticket wait, so it never
+// acknowledged (`[TLB] stuck ... missing=` naming a core that is not a
+// `[BKL] stuck` waiter). Two assists close it: `ProcAddressSpace::lock` spins
+// through `akuma_bkl::sync::masked_spin_assist`, and the wait itself services its
+// own mailbox. Any new IRQ-masked spin on an inner lock must do the same.
+// `docs/archive/AMD64_TLB_STUCK_AS_LOCK_2026-10-01.md`.
 // ---------------------------------------------------------------------------
 
 /// Broadcast a shootdown to every peer that could hold a stale translation.

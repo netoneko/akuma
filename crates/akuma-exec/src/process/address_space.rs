@@ -99,6 +99,24 @@ impl ProcAddressSpace {
         self.shared.load(Ordering::Relaxed)
     }
 
+    /// `inner.lock()` that keeps acknowledging TLB shootdowns while it waits.
+    ///
+    /// A `munmap` sender holds this lock across `wait_for_acks`, and `fork`'s
+    /// BKL-free share pass takes it without the BKL, so a plain spin here —
+    /// IRQ-masked, no IPI — is a core that can never acknowledge the sender
+    /// that holds the lock it waits for. Servicing the mailbox inline is
+    /// equivalent to the IPI landing at this instruction.
+    #[inline]
+    fn lock_inner(&self) -> SpinlockGuard<'_, UserAddressSpace> {
+        loop {
+            if let Some(g) = self.inner.try_lock() {
+                return g;
+            }
+            akuma_bkl::sync::masked_spin_assist();
+            core::hint::spin_loop();
+        }
+    }
+
     // ── locked access to the address space itself ──────────────────────────
 
     /// Take `as_lock` (with IRQs masked on `kernel_smp_shared`) and return a
@@ -113,7 +131,7 @@ impl ProcAddressSpace {
         #[cfg(kernel_smp_shared)]
         let irq = crate::runtime::IrqGuard::new();
         AddressSpaceGuard {
-            guard: self.inner.lock(),
+            guard: self.lock_inner(),
             #[cfg(kernel_smp_shared)]
             _irq: irq,
         }
@@ -146,61 +164,61 @@ impl ProcAddressSpace {
     /// [`UserAddressSpace::activate`].
     #[inline]
     pub fn activate(&self) {
-        self.inner.lock().activate();
+        self.lock_inner().activate();
     }
 
     /// [`UserAddressSpace::translate`].
     #[inline]
     pub fn translate(&self, va: usize) -> Option<usize> {
-        self.inner.lock().translate(va)
+        self.lock_inner().translate(va)
     }
 
     /// [`UserAddressSpace::is_mapped`].
     #[inline]
     pub fn is_mapped(&self, va: usize) -> bool {
-        self.inner.lock().is_mapped(va)
+        self.lock_inner().is_mapped(va)
     }
 
     /// [`UserAddressSpace::is_range_mapped`].
     #[inline]
     pub fn is_range_mapped(&self, va_start: usize, len: usize) -> bool {
-        self.inner.lock().is_range_mapped(va_start, len)
+        self.lock_inner().is_range_mapped(va_start, len)
     }
 
     /// [`UserAddressSpace::resident_pages`].
     #[inline]
     pub fn resident_pages(&self) -> usize {
-        self.inner.lock().resident_pages()
+        self.lock_inner().resident_pages()
     }
 
     /// [`UserAddressSpace::tracks_user_frame`].
     #[inline]
     pub fn tracks_user_frame(&self, pa: usize) -> bool {
-        self.inner.lock().tracks_user_frame(pa)
+        self.lock_inner().tracks_user_frame(pa)
     }
 
     /// [`UserAddressSpace::user_frame_count`].
     #[inline]
     pub fn user_frame_count(&self) -> usize {
-        self.inner.lock().user_frame_count()
+        self.lock_inner().user_frame_count()
     }
 
     /// [`UserAddressSpace::user_frame_total_refs`].
     #[inline]
     pub fn user_frame_total_refs(&self) -> usize {
-        self.inner.lock().user_frame_total_refs()
+        self.lock_inner().user_frame_total_refs()
     }
 
     /// [`UserAddressSpace::page_table_frame_count`].
     #[inline]
     pub fn page_table_frame_count(&self) -> usize {
-        self.inner.lock().page_table_frame_count()
+        self.lock_inner().page_table_frame_count()
     }
 
     /// [`UserAddressSpace::read_l3_page_entry`].
     #[inline]
     pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
-        self.inner.lock().read_l3_page_entry(va)
+        self.lock_inner().read_l3_page_entry(va)
     }
 
     /// [`UserAddressSpace::invalidate_icache_for_page_va`]. One-shot: callers
@@ -208,7 +226,7 @@ impl ProcAddressSpace {
     /// on their guard instead (see `src/exceptions.rs`).
     #[inline]
     pub fn invalidate_icache_for_page_va(&self, va: usize) {
-        self.inner.lock().invalidate_icache_for_page_va(va);
+        self.lock_inner().invalidate_icache_for_page_va(va);
     }
 
     // NOTE: the *mutating* frame-tracking ops (`track_user_frame`,
@@ -236,7 +254,7 @@ impl ProcAddressSpace {
         let old = {
             #[cfg(kernel_smp_shared)]
             let _irq = crate::runtime::IrqGuard::new();
-            core::mem::replace(&mut *self.inner.lock(), uas)
+            core::mem::replace(&mut *self.lock_inner(), uas)
         };
         self.ttbr0.store(ttbr0, Ordering::Relaxed);
         self.shared.store(shared, Ordering::Relaxed);

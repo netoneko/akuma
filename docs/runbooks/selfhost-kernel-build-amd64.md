@@ -222,6 +222,22 @@ What every run also printed, so the next reader does not re-investigate it:
   live one. Set B ran at 6 GiB only because `llama-server` (7.3 GB) had been
   stopped; that RAM is the one variable that differs from the first batch.
 
+### Re-run on `main` (`e6d8657`), 2026-09-30: 10 of 10, and the metal
+
+Same rig, refreshed rather than rebuilt: the clone moved to `main`, the kernel was
+rebuilt natively on ryzen (md5 `9791d5a02e2e`), and `crates/ amd64/ src/` plus the
+root manifests were `rsync`ed into `selfhost.img` (the image's `Cargo.lock` and
+`.cargo/config.toml` left alone; the only lock change was the new path crate
+`akuma-hda`, so the vendor directory still resolved). Guest 4 vCPU / 4 GiB,
+`llama-server` left running, `CLEAN_ALL=1`, `batch.sh 201 210 4`.
+
+**10 of 10 PASS, 90 s each, 96 `Compiling` lines, 0 `[Fault]`, 0 SIGSEGV, 0
+`[TLB] stuck`**, 27 `[BKL] stuck` and 1 `[MM] fault race` in every run, 5–11
+`[TRAMP-MISMATCH]` — all as before. With the 21 above that is 31 of 31 on this
+rig (95 % upper bound ≈ 9 %). The matching bare-metal batch, and why it is *not*
+a parity result, is in
+[`amd64-j4-build-crash-hunt.md`](amd64-j4-build-crash-hunt.md) § 1a.
+
 Traps this rig cost a run each:
 
 - **`kill -9` of the previous Firecracker does not release the tap at once.**
@@ -249,7 +265,10 @@ Traps this rig cost a run each:
 - [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the same box, booted as Akuma instead of Ubuntu.
 - [`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md)
   — **the same loop without the hypervisor.** Read it before assuming this page's
-  numbers transfer: the metal builds at `-j1` because `-j4` still SIGSEGVs there
-  (this guest has been green at `-j4` since §14), the link needs
+  numbers transfer: the metal built at `-j1` because `-j4` SIGSEGVed there
+  (**2026-09-30: no longer the case** — `-j4` completed 7 of 10 runs,
+  slower than `-j1`, three lost to an `execve` `EIO`; see
+  [`amd64-j4-build-crash-hunt.md`](amd64-j4-build-crash-hunt.md) § 1a;
+  this guest has been green at `-j4` since §14), the link needs
   `--threads=1` that this guest has never needed, and installing a kernel is a
   `cp` onto Akuma's own ext2 root rather than anything image-shaped.

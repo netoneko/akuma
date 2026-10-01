@@ -96,6 +96,19 @@ itself on that flag.
 
 ## 3. SMP on the metal: the compile race, and a link failure that was not what it looked like
 
+> **Correction, 2026-09-30.** "The metal is still not green" and the 3-in-4 failure
+> rate below are **superseded**. On `main` (`e6d8657b`; running kernel `0b800634`,
+> which carries the `yield_now` and demand-fault fixes of 2026-09-18/26) clean
+> `kbuild -c -j 4` runs on this box, with `/root/ktarget` wiped each time, **did
+> not reproduce `rc=139`** in 10 builds: 7 passed (836–905 s), 3 failed at 29–33
+> crates with `could not exec rust-lld: I/O error (os error 5)` — `EIO` at
+> `execve`, always a host-unit link early in the build, a different failure
+> (cause unconfirmed: cold-read race or USB). It is **not parity**: `-j4` was
+> slower than the `-j1` figure in §4, and ten clean-of-SIGSEGV runs bound the
+> old rate (≈26 %), they do not retire it. Numbers and the reading:
+> [`../runbooks/amd64-j4-build-crash-hunt.md`](../runbooks/amd64-j4-build-crash-hunt.md)
+> § 1a. The evidence below is unchanged.
+
 §11 saw two failures at SMP=4 and suspected they were one bug. This section was
 written arguing they separate; **both of its separating arguments were then
 disproved by measurement on the same day**, and the inline corrections below are
@@ -351,7 +364,9 @@ that binds, silently, on the only workload that notices.
 
 ## 6. Open, in the order worth attacking
 
-1. **The compile-phase crash at SMP>1 on the metal.** Not `-j4`-specific (see
+1. **The compile-phase crash at SMP>1 on the metal.** *(2026-09-30: did not recur in
+   10 `-j4` runs on `main` — see §3's correction; the open question is now
+   the `EIO` at `execve` (3 of 10), and the `-j4` slowdown.)* Not `-j4`-specific (see
    §3's correction): `-j1` dies too, just less often, so this is not merely a
    speed problem — **a 23-minute build is a coin flip**, which is what stopped
    the gen-2 fixed point rather than anything about the loop's mechanics. It is
