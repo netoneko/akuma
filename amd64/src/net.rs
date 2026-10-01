@@ -932,6 +932,9 @@ pub fn settle_for_dhcp(budget_ms: u64) -> bool {
     let deadline = uptime_us() + budget_ms * 1000;
     while uptime_us() < deadline {
         drain_step();
+        // The one place a quiet boot's splash can be animated from: this loop never
+        // yields, so the splash daemon is starved here. A no-op unless one is up.
+        crate::splash::pulse();
         if akuma_net::smoltcp_net::is_dhcp_configured() {
             return true;
         }

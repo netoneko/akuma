@@ -38,17 +38,49 @@ use spinning_top::Spinlock;
 
 use crate::{banner, serial};
 
-/// Milliseconds between frames.
-const TICK_MS: u64 = 50;
+/// Milliseconds between frames. A frame costs ~43 ms on the trashcan (the framebuffer is
+/// mapped uncached: 71 MB/s), so 50 ms here was an 86% duty cycle that slowed the very
+/// boot it decorates; 150 ms leaves about three quarters of the time to the boot.
+const TICK_MS: u64 = 150;
 /// A splash this old means the console shell never came: show the log instead.
 const TIMEOUT_MS: u64 = 90_000;
 /// How much of the log tail a crash or timeout writes to the screen.
 const REPLAY_BYTES: usize = 6_000;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Frames drawn; time is `FRAMES * TICK_MS`, which needs no clock (the LAPIC timer
-/// that `uptime_us` reads is not running for the first seconds of a boot).
+/// The TSC when the splash began, and when the last frame was drawn. Time is TSC
+/// based — not a frame count, and not `uptime_us` (the LAPIC timer behind it is not
+/// running for the first seconds of a boot) — so the colour keeps moving however the
+/// frames get scheduled.
+static START_TSC: AtomicU64 = AtomicU64::new(0);
+static LAST_TSC: AtomicU64 = AtomicU64::new(0);
+/// A frame is being drawn: a second drawer (the daemon, a boot wait loop, a log line)
+/// skips rather than queue behind it.
+static DRAWING: AtomicBool = AtomicBool::new(false);
+/// Frames drawn, and the TSC cycles they took in total and at worst, for the one line
+/// `dmesg` gets when the splash ends — the measurement behind any framebuffer-speed work.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
+static DRAW_CYCLES: AtomicU64 = AtomicU64::new(0);
+static DRAW_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// The TSC rate; before the LAPIC calibration has run, a guess (a frame's *rate* is
+/// all this affects, and the guess is the same order as any machine this runs on).
+fn tsc_hz() -> u64 {
+    match crate::lapic::tsc_hz() {
+        0 => 3_000_000_000,
+        hz => hz,
+    }
+}
+
+fn rdtsc() -> u64 {
+    // SAFETY: RDTSC is unprivileged and present on every x86_64.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Milliseconds since the splash began.
+fn elapsed_ms() -> u64 {
+    rdtsc().wrapping_sub(START_TSC.load(Ordering::Relaxed)) / (tsc_hz() / 1000).max(1)
+}
 static PHASE: AtomicU8 = AtomicU8::new(0);
 /// Set once the animation daemon exists. Before it, the status line is redrawn from
 /// [`note_byte`] as each message completes; after it, the daemon redraws every frame.
@@ -79,8 +111,14 @@ pub fn active() -> bool {
 
 /// Say what boot is doing now (an index into [`PHASES`]); shown on the status line.
 pub fn phase(n: u8) {
-    PHASE.store(n.min(PHASES.len() as u8 - 1), Ordering::Relaxed);
+    let n = n.min(PHASES.len() as u8 - 1);
+    PHASE.store(n, Ordering::Relaxed);
+    // When each phase began, for the `[boot]` line (`elapsed_ms() + 1` so 0 means unset).
+    PHASE_MS[usize::from(n)].store(elapsed_ms() + 1, Ordering::Relaxed);
 }
+
+/// Milliseconds (+1) from the splash's start to the start of each [`PHASES`] entry.
+static PHASE_MS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Feed the splash a byte of the kernel's own output (called from `serial`, whatever
 /// the quiet policy hides): the latest complete line becomes the splash's last status
@@ -104,7 +142,7 @@ pub fn note_byte(b: u8) {
             drop(l);
             // Until the daemon exists nothing else will redraw: do it now.
             if !DAEMON.load(Ordering::Acquire) {
-                draw(FRAMES.load(Ordering::Relaxed));
+                frame();
             }
         }
         0x20..=0x7E => {
@@ -121,14 +159,52 @@ pub fn note_byte(b: u8) {
 /// Start the quiet boot: hide the kernel's messages from the screen and draw the
 /// first frame. Call once, right after the framebuffer console exists.
 pub fn begin() {
+    PHASE_MS[0].store(1, Ordering::Relaxed);
+    let now = rdtsc();
+    START_TSC.store(now, Ordering::Relaxed);
+    LAST_TSC.store(now, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Release);
     serial::set_fb_quiet(true);
-    draw(0);
+    frame();
 }
 
-/// Draw the frame for `frames` frames in.
-fn draw(frames: u64) {
-    let t_ms = frames * TICK_MS;
+/// Draw one frame now, unless one is already being drawn.
+fn frame() {
+    if DRAWING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let t0 = rdtsc();
+    LAST_TSC.store(t0, Ordering::Relaxed);
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    draw(elapsed_ms());
+    let took = rdtsc().wrapping_sub(t0);
+    DRAW_CYCLES.fetch_add(took, Ordering::Relaxed);
+    DRAW_MAX_CYCLES.fetch_max(took, Ordering::Relaxed);
+    DRAWING.store(false, Ordering::Release);
+}
+
+/// Draw a frame if one is due. **Cheap when it is not** (an atomic load, a `rdtsc`
+/// and a compare), so the long synchronous waits of a boot — the xHCI bring-up, the
+/// DHCP settle — call it from their own loops: a daemon cannot animate through them
+/// (the boot task never yields there, and a second task touching the network stack
+/// at that point is what `net::settle_for_dhcp` warns about), but the boot task can
+/// draw a frame itself every [`TICK_MS`].
+pub fn pulse() {
+    if !active() {
+        return;
+    }
+    let due = tsc_hz() / 1000 * TICK_MS;
+    if rdtsc().wrapping_sub(LAST_TSC.load(Ordering::Relaxed)) >= due {
+        if elapsed_ms() > TIMEOUT_MS {
+            crash();
+            return;
+        }
+        frame();
+    }
+}
+
+/// Draw the frame `t_ms` into the splash.
+fn draw(t_ms: u64) {
     let (title, uname, kernel, status);
     let mut a = StackWriter::<80>::new();
     let mut b = StackWriter::<96>::new();
@@ -154,22 +230,9 @@ fn draw(frames: u64) {
     crate::multiboot2::fb_splash_frame(banner::ART, &[title, uname, kernel, status, e.as_str()], t_ms);
 }
 
-/// One animation step. Called by the daemon.
-fn tick() {
-    if !active() {
-        return;
-    }
-    let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if n * TICK_MS > TIMEOUT_MS {
-        crash();
-        return;
-    }
-    draw(n);
-}
-
 extern "C" fn splash_daemon() -> ! {
     loop {
-        tick();
+        pulse();
         let idle = !active();
         // Parked for a second once it has ended; for a frame while it runs. The
         // `timer_running` guard is the pump's: against a clock that does not move,
@@ -203,6 +266,36 @@ pub fn end_for_console() {
     if let Some((rows, cols)) = crate::multiboot2::fb_splash_end(conf.as_deref(), true) {
         crate::console::set_size(rows, cols);
     }
+    // For `dmesg` only: did the animation actually run? (A boot that spends its time in
+    // waits that never call `pulse` shows a still frame, and this says so.)
+    // How long the machine took to come up, from the moment the console exists (so after
+    // firmware and GRUB, which this cannot see) to the shell's prompt, and where it went.
+    let mut b = StackWriter::<160>::new();
+    let _ = write!(b, "[boot] shell after {} ms (", elapsed_ms());
+    for (i, name) in PHASES.iter().enumerate() {
+        let at = PHASE_MS[i].load(Ordering::Relaxed);
+        if at > 0 {
+            let _ = write!(b, "{}{} +{}", if i == 0 { "" } else { ", " }, name, at - 1);
+        }
+    }
+    let _ = write!(b, ")\n");
+    serial::klog_only(b.as_str());
+    let mut w = StackWriter::<96>::new();
+    let frames = FRAMES.load(Ordering::Relaxed).max(1);
+    let per_ms = (tsc_hz() / 1000).max(1);
+    let _ = write!(
+        w,
+        "[splash] ended after {} ms: {} frames, draw avg {} us max {} us\n",
+        elapsed_ms(),
+        frames,
+        DRAW_CYCLES.load(Ordering::Relaxed) / frames * 1000 / per_ms,
+        DRAW_MAX_CYCLES.load(Ordering::Relaxed) * 1000 / per_ms,
+    );
+    serial::klog_only(w.as_str());
+    // The banner goes on the screen the shell is about to have, before its prompt:
+    // the quiet boot hid the one `run_init` prints, and a machine that boots to a
+    // prompt should still say what it is.
+    banner::print_visible();
 }
 
 /// `run_init` found an init that will not spawn a console shell (anything but

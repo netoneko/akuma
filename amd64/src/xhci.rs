@@ -236,6 +236,10 @@ fn spin_us(us: u64) {
     let start = unsafe { core::arch::x86_64::_rdtsc() };
     while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < target {
         crate::shootdown::masked_wait_assist();
+        // The USB bring-up is the longest synchronous stretch of a boot before the
+        // scheduler runs: let a quiet boot's splash draw a frame from here (a no-op
+        // unless one is due and up).
+        crate::splash::pulse();
         core::hint::spin_loop();
     }
 }

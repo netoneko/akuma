@@ -163,6 +163,10 @@ impl Surface for Framebuffer {
     }
 }
 
+/// TSC cycles the boot-time full-screen clear took (see `kmain_mb2`); reported by
+/// [`fb_summary`] once the TSC rate is known.
+static CLEAR_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The framebuffer console, once there is one.
 ///
 /// A `Spinlock<Option<..>>` for the same reason the root filesystem is: there
@@ -362,6 +366,21 @@ pub fn fb_summary() {
         serial::puts("x");
         serial::put_dec(vrows as u64);
     }
+    // How fast the screen can be written: the whole-surface fill at boot, in ms and as
+    // megabytes a second. A framebuffer mapped uncached is the usual cause of a slow one.
+    let hz = crate::lapic::tsc_hz();
+    let cycles = CLEAR_CYCLES.load(core::sync::atomic::Ordering::Relaxed);
+    if hz > 0 && cycles > 0 {
+        let us = cycles * 1_000_000 / hz;
+        let bytes = (w * h * bpp) as u64;
+        serial::puts(" clear ");
+        serial::put_dec(us / 1000);
+        serial::puts(".");
+        serial::put_dec(us % 1000 / 100);
+        serial::puts("ms = ");
+        serial::put_dec(bytes * 1_000_000 / us.max(1) / 1_000_000);
+        serial::puts("MB/s");
+    }
     serial::puts("\n");
 }
 
@@ -434,7 +453,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         };
         let con = &mut con.0;
         con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
+        // Timed: a full-screen fill is the one operation whose cost is purely "how fast
+        // can this machine write to its framebuffer", reported on the `[fb]` line.
+        // SAFETY: RDTSC is unprivileged and present on every x86_64.
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
         con.clear();
+        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        CLEAR_CYCLES.store(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
         // Which font and grid the console actually chose. `Console::choose_font`
         // takes that decision from the framebuffer size at runtime — IBM Plex Mono
         // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose

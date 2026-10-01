@@ -46,3 +46,35 @@ pub fn print() {
     serial::puts(RELEASE_SUFFIX);
     serial::puts("\n\n");
 }
+
+/// [`print`] for a console that is being kept quiet: the same banner (the mark, the
+/// version line) plus the `uname -a` line, written through the **console's own**
+/// output path, which the quiet policy does not hide.
+///
+/// A quiet boot (`splash`) hides `run_init`'s [`print`]; the splash ends just before
+/// the shell starts, and this puts the banner on the cleared screen above its prompt.
+pub fn print_visible() {
+    let put = |s: &str| {
+        for b in s.bytes() {
+            if b == b'\n' {
+                serial::putb_tty(b'\r');
+            }
+            serial::putb_tty(b);
+        }
+    };
+    put("\n");
+    for line in ART.lines() {
+        put(line);
+        put("\n");
+    }
+    put("\n  ");
+    put(VERSION_DESC);
+    put("  ");
+    put(RELEASE);
+    put(RELEASE_SUFFIX);
+    put("\n  Akuma akuma ");
+    put(RELEASE);
+    put(" ");
+    put(akuma_syscalls_glue::version::BUILD_ID);
+    put(" x86_64\n\n");
+}
