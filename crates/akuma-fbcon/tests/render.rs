@@ -416,13 +416,46 @@ fn the_font_falls_back_only_on_a_screen_that_needs_it() {
             C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
         );
     }
-    for (w, h) in [(1024, 768), (1280, 720), (1280, 1024), (1920, 1080), (1920, 1200), (3840, 2160)] {
+    for (w, h) in [(1024, 768), (1280, 720), (1280, 1024), (1920, 1080), (1920, 1200)] {
         assert_eq!(
             C::choose_font(w, h).name(),
             DEFAULT_FONT.name(),
             "{w}x{h} fell back at {:?}",
             C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
         );
+    }
+}
+
+/// Where the default font would be drawn doubled (scale 2) the console uses the HD
+/// cut instead: the same cell on the glass, so the grid must not change, and the
+/// scale is 1 -- glyphs rasterized at 24x48, not 12x24 with every pixel repeated.
+#[test]
+fn a_4k_screen_gets_the_hd_cut_with_the_same_grid() {
+    type C = Console<MemSurface>;
+    let (w, h) = (3840, 2160);
+    assert_eq!(C::auto_scale(DEFAULT_FONT, h), 2, "premise: the default would be doubled");
+    let font = C::choose_font(w, h);
+    assert_eq!(font.name(), akuma_fbcon::console::HD_FONT.name());
+    assert_eq!((font.width(), font.height()), (2 * DEFAULT_FONT.width(), 2 * DEFAULT_FONT.height()));
+    assert_eq!(C::auto_scale(font, h), 1);
+    let old = C::grid_for(DEFAULT_FONT, w, h, 2).unwrap();
+    assert_eq!(C::grid_for(font, w, h, 1).unwrap(), old, "the grid moved");
+    assert_eq!(old, (157, 44));
+}
+
+/// The HD cut is the same typeface, not a different one: every ASCII glyph's ink
+/// footprint, scaled down 2x, lands where the 12x24 glyph's does (within a pixel).
+#[test]
+fn the_hd_cut_has_the_same_shapes_as_the_default() {
+    let (sd, hd) = (DEFAULT_FONT, akuma_fbcon::console::HD_FONT);
+    for c in (0x21u32..0x7F).filter(|&c| char::from_u32(c).is_some_and(char::is_alphanumeric)) {
+        let mass = |f: &akuma_fbcon::font::Font| -> f64 {
+            f.cell_cp(c).iter().map(|&v| f64::from(v)).sum::<f64>() / 255.0 / (f.width() * f.height()) as f64
+        };
+        let (a, b) = (mass(sd), mass(hd));
+        // Ink fraction of the cell agrees to within ~35%: the HD cut carries the
+        // coverage boost, so it is a little heavier on edges, never lighter.
+        assert!(b >= a * 0.95 && b <= a * 1.35, "{c:#x}: ink {a:.3} vs {b:.3}");
     }
 }
 

@@ -207,6 +207,33 @@ present 2 MiB entry, or more than two ragged ends. The console works at the old 
 the splash backs off to 150 ms by itself. Rollback of the whole change:
 `cp -f /boot/akuma-amd64.prev /boot/akuma-amd64` (the pre-WC kernel).
 
+## Font crispness: the HD cut (2026-10-01, verified on the trashcan)
+
+On a 4K screen the default font (IBM Plex Mono, 12x24) used to be drawn at **scale 2**: a
+half-resolution bitmap with every pixel repeated as 2x2, so curves showed stair-steps.
+`Console::choose_font` now picks **`HD_FONT` (`IBM_PLEX_MONO_HD`, 24x48)** whenever the default
+would be at scale 2 — the same face rasterized from the outlines at the real size by
+`crates/akuma-fbcon/build.rs`, drawn at scale 1. The cell on the glass and the grid are
+unchanged (157x44 at 3840x2160; pinned by `a_4k_screen_gets_the_hd_cut_with_the_same_grid`), so
+text density does not move. Other resolutions keep the 12x24 / Spleen choice exactly as before.
+
+- The HD table carries a mild coverage curve (`HD_COVERAGE_GAMMA = 0.8` in `build.rs`): the
+  console blends in sRGB space, which renders light-on-dark text a touch thin; partial coverage
+  is boosted, solid/empty pixels are not. Set it to `1.0` for the plain rasterization.
+- Cost: the kernel image grew by about 1.2 MB (the 24x48 coverage table, 4x the 12x24 one).
+  The table is only linked where the font is named, which is every console build.
+- To change the density later: change `TARGET_ROWS` in `console.rs` or bake another size in
+  `build.rs` (`PlexSize`), nothing else assumes a cell width.
+- **Metal, 2026-10-01:** boot log `font: IBM Plex Mono HD 24x48 scale 1 -> 157x44 cells`;
+  `wc on`; shell after 9644 ms (was 9411); `[splash] draw avg` 5.0 ms (was 3.1 ms with the
+  doubled 12x24 — scale 1 writes per pixel through `put`; still ~8x better than the uncached
+  43 ms). Judged "much better" on the TV. Open: merging runs of background pixels into
+  `fill`s in `draw_glyph`'s `sc == 1` path would bring the frame cost back down.
+- Rollback kernels on the box: `/boot/akuma-amd64.prev` (write-combining, doubled font),
+  `/boot/akuma-amd64.pre-wc` (uncached).
+- Look at it without the metal: `tests/dump.rs` pattern — render a `Console` into RAM at
+  `with_font_and_scale(.., HD_FONT, 1)` vs `(DEFAULT_FONT, 2)` and write a PPM.
+
 ## Screen size: what `stty size` says, and what you can set
 
 The framebuffer's grid is fixed at boot: the console picks a font and an integer

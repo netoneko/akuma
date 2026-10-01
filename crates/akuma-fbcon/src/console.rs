@@ -17,6 +17,12 @@ use crate::{Rgb, Surface};
 /// The font a [`Console`] uses when the framebuffer can afford it.
 pub const DEFAULT_FONT: &Font = &font::IBM_PLEX_MONO;
 
+/// [`DEFAULT_FONT`] baked at twice the size (24x48), for a screen where the console
+/// would otherwise draw the 12x24 table at scale 2. Same cell on the glass, but the
+/// glyphs are rasterized from the outlines at that size rather than being a
+/// half-resolution bitmap with each pixel doubled -- smooth curves, real stems.
+pub const HD_FONT: &Font = &font::IBM_PLEX_MONO_HD;
+
 /// The font used instead when [`DEFAULT_FONT`]'s cell is too big for the screen.
 ///
 /// Half the height of the default, so it buys back rows on a framebuffer where
@@ -366,15 +372,21 @@ impl<S: Surface> Console<S> {
         let grid = |f: &'static Font| {
             Self::grid_for(f, width, height, Self::auto_scale(f, height))
         };
-        match (grid(DEFAULT_FONT), grid(FALLBACK_FONT)) {
-            (Some((cols, rows)), _) if cols >= MIN_COLS && rows >= MIN_ROWS => DEFAULT_FONT,
+        // The default font, drawn at its own pixel size when the scale would be 2:
+        // [`HD_FONT`] is the same face and the same cell on the glass, with every
+        // glyph rasterized at that size instead of doubled. Its own `auto_scale` is
+        // 1 across the whole range where the default's is 2 (heights 1728..3455),
+        // so the grid is unchanged.
+        let default = if Self::auto_scale(DEFAULT_FONT, height) == 2 { HD_FONT } else { DEFAULT_FONT };
+        match (grid(default), grid(FALLBACK_FONT)) {
+            (Some((cols, rows)), _) if cols >= MIN_COLS && rows >= MIN_ROWS => default,
             // Nothing to fall back to, including the case where neither font
             // fits at all -- `new` then returns `None`, which is the honest
             // answer and the one the caller can act on.
-            (_, None) => DEFAULT_FONT,
+            (_, None) => default,
             (None, Some(_)) => FALLBACK_FONT,
             (Some((dc, dr)), Some((fc, fr))) => {
-                if fc * fr > dc * dr { FALLBACK_FONT } else { DEFAULT_FONT }
+                if fc * fr > dc * dr { FALLBACK_FONT } else { default }
             }
         }
     }

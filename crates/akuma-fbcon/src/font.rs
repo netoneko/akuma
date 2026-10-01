@@ -1,11 +1,15 @@
 //! The console fonts, as tables of per-pixel coverage.
 //!
-//! Two are baked in and the console picks one at construction:
+//! Three are baked in and the console picks one at construction:
 //!
 //! - [`IBM_PLEX_MONO`] — 12x24, the default. An outline font rasterized with
 //!   anti-aliasing, which is what a face drawn for screens needs to look like
 //!   itself. © IBM Corp., SIL OFL 1.1; full text in
 //!   `vendor/ibm-plex-mono/LICENSE.txt`.
+//! - [`IBM_PLEX_MONO_HD`] — the same face baked at 24x48 for screens where the
+//!   console would draw the 12x24 table at scale 2 (a 4K television). Real
+//!   outline-rasterized curves at that size instead of a doubled bitmap; see
+//!   `build.rs` for the mild coverage curve it carries.
 //! - [`SPLEEN`] — 8x16, by Frederic Cambus. A monospaced bitmap font designed
 //!   for consoles and shipped in OpenBSD base; BSD-2-Clause, full text in
 //!   `vendor/spleen/LICENSE`. Half the cell of the default, so it is what to
@@ -37,6 +41,7 @@
 //! nothing else, since nothing here or in [`crate::Console`] assumes a width.
 
 include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono.rs"));
+include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono_hd.rs"));
 include!(concat!(env!("OUT_DIR"), "/spleen.rs"));
 
 /// A fixed-cell font: one coverage value per pixel, one cell per baked code point.

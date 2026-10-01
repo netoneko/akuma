@@ -106,7 +106,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    emit(&ibm_plex_mono(), &out);
+    emit(&ibm_plex_mono(&PLEX_SD), &out);
+    emit(&ibm_plex_mono(&PLEX_HD), &out);
     emit(&spleen(), &out);
 }
 
@@ -121,6 +122,19 @@ fn main() {
 /// Spleen uses would narrow every glyph by a third and undo the reason for
 /// preferring an outline font in the first place.
 const PLEX_WIDTH: usize = 12;
+/// The HD cut: the same face baked at exactly twice the size, for a screen where the
+/// console would otherwise draw the 12x24 table pixel-doubled (see `Console::choose_font`).
+/// Hinting-free outlines scale linearly, so this is the same fit with a bigger `PxScale`
+/// -- stems are real 2-4 pixel strokes with their own anti-aliasing instead of a
+/// half-resolution bitmap with every pixel repeated.
+const PLEX_HD_WIDTH: usize = 24;
+const PLEX_HD_HEIGHT: usize = 48;
+/// Coverage exponent for the HD cut: `c' = 255 * (c/255)^HD_COVERAGE_GAMMA`.
+/// The console blends in sRGB space, which renders light text on a dark ground a little
+/// thin (the edge pixel is darker than the true linear mix would be). A mild boost to
+/// partial coverage compensates, without touching solid (255) or empty (0) pixels.
+/// 1.0 turns it off.
+const HD_COVERAGE_GAMMA: f32 = 0.8;
 /// Pixels down one IBM Plex Mono cell.
 ///
 /// Shorter than the face's own line height, which is 1.32 em and would spend
@@ -148,8 +162,38 @@ const INK_FLOOR: u8 = 16;
 /// left of the cell, `y` from the baseline, before the cell offset is applied.
 type Drawn = Vec<(i32, i32, u8)>;
 
+/// One size of IBM Plex Mono to bake.
+struct PlexSize {
+    ident: &'static str,
+    stem: &'static str,
+    name: &'static str,
+    width: usize,
+    height: usize,
+    /// See [`HD_COVERAGE_GAMMA`]; 1.0 leaves coverage untouched.
+    gamma: f32,
+}
+
+const PLEX_SD: PlexSize = PlexSize {
+    ident: "IBM_PLEX_MONO",
+    stem: "ibm_plex_mono",
+    name: "IBM Plex Mono",
+    width: PLEX_WIDTH,
+    height: PLEX_HEIGHT,
+    gamma: 1.0,
+};
+
+const PLEX_HD: PlexSize = PlexSize {
+    ident: "IBM_PLEX_MONO_HD",
+    stem: "ibm_plex_mono_hd",
+    name: "IBM Plex Mono HD",
+    width: PLEX_HD_WIDTH,
+    height: PLEX_HD_HEIGHT,
+    gamma: HD_COVERAGE_GAMMA,
+};
+
 /// Rasterize IBM Plex Mono into a cell table.
-fn ibm_plex_mono() -> Face {
+fn ibm_plex_mono(size: &PlexSize) -> Face {
+    let (plex_width, plex_height) = (size.width, size.height);
     println!("cargo:rerun-if-changed={PLEX_TTF}");
     let data = fs::read(PLEX_TTF).unwrap_or_else(|e| {
         panic!(
@@ -167,7 +211,7 @@ fn ibm_plex_mono() -> Face {
     // look like a deliberately airy font rather than a bug. Solve for the
     // scale that puts the advance on exactly one cell width instead.
     let advance = monospace_advance(&font);
-    let px = PLEX_WIDTH as f32 * (font.ascent_unscaled() - font.descent_unscaled()) / advance;
+    let px = plex_width as f32 * (font.ascent_unscaled() - font.descent_unscaled()) / advance;
 
     // Rasterized once, up front, because placement has to know where the ink
     // landed before it can decide where the ink goes.
@@ -182,50 +226,59 @@ fn ibm_plex_mono() -> Face {
         .take((LAST - FIRST + 1) as usize)
         .map(|g| g.clone().expect("IBM Plex Mono lacks a printable ASCII glyph"))
         .collect();
-    let (off_x, off_y, ink_w, ink_h) = place(&ascii);
+    let (off_x, off_y, ink_w, ink_h) = place(&ascii, plex_width, plex_height);
 
     let cells_n = cell_count();
-    let mut cells = vec![0u8; cells_n * PLEX_WIDTH * PLEX_HEIGHT];
-    let replace = replacement(PLEX_WIDTH, PLEX_HEIGHT);
+    let mut cells = vec![0u8; cells_n * plex_width * plex_height];
+    let replace = replacement(plex_width, plex_height);
     for (index, glyph) in drawn.iter().enumerate() {
-        let base = index * PLEX_WIDTH * PLEX_HEIGHT;
+        let base = index * plex_width * plex_height;
         let Some(glyph) = glyph else {
-            cells[base..base + PLEX_WIDTH * PLEX_HEIGHT].copy_from_slice(&replace);
+            cells[base..base + plex_width * plex_height].copy_from_slice(&replace);
             continue;
         };
         let is_ascii = index < (LAST - FIRST + 1) as usize;
         for &(gx, gy, coverage) in glyph {
             let (x, y) = (gx + off_x, gy + off_y);
             let inside =
-                x >= 0 && y >= 0 && (x as usize) < PLEX_WIDTH && (y as usize) < PLEX_HEIGHT;
+                x >= 0 && y >= 0 && (x as usize) < plex_width && (y as usize) < plex_height;
             // Strict for ASCII (a clipped letter is a font bug); lenient beyond it.
             assert!(
                 inside || coverage < INK_FLOOR || !is_ascii,
                 "code point index {index} puts {coverage}/255 of ink at ({x},{y}), outside its \
-                 {PLEX_WIDTH}x{PLEX_HEIGHT} cell; widen the cell rather than clipping a glyph"
+                 {plex_width}x{plex_height} cell; widen the cell rather than clipping a glyph"
             );
             if inside {
-                cells[base + y as usize * PLEX_WIDTH + x as usize] = coverage;
+                cells[base + y as usize * plex_width + x as usize] = boost(coverage, size.gamma);
             }
         }
     }
-    let last = (cells_n - 1) * PLEX_WIDTH * PLEX_HEIGHT;
+    let last = (cells_n - 1) * plex_width * plex_height;
     cells[last..].copy_from_slice(&replace);
 
     Face {
-        ident: "IBM_PLEX_MONO",
-        stem: "ibm_plex_mono",
-        name: "IBM Plex Mono",
+        ident: size.ident,
+        stem: size.stem,
+        name: size.name,
         origin: "vendor/ibm-plex-mono/IBMPlexMono-Regular.ttf (SIL OFL 1.1)",
         fit: format!(
             "Rasterized at a {px:.1}-pixel `PxScale`, chosen so the face's {advance:.0}-unit \
-             advance lands on exactly {PLEX_WIDTH} pixels. Printable ASCII inks \
-             {ink_w}x{ink_h} of the cell and is centred in it."
+             advance lands on exactly {plex_width} pixels. Printable ASCII inks \
+             {ink_w}x{ink_h} of the cell and is centred in it. Coverage exponent {gamma}.",
+            gamma = size.gamma
         ),
-        width: PLEX_WIDTH,
-        height: PLEX_HEIGHT,
+        width: plex_width,
+        height: plex_height,
         cells,
     }
+}
+
+/// Apply the coverage exponent; solid and empty pixels are fixed points.
+fn boost(coverage: u8, gamma: f32) -> u8 {
+    if (gamma - 1.0).abs() < f32::EPSILON || coverage == 0 || coverage == 255 {
+        return coverage;
+    }
+    ((f32::from(coverage) / 255.0).powf(gamma) * 255.0).round().clamp(1.0, 254.0) as u8
 }
 
 /// Rasterize one code point at the origin, in pen coordinates.
@@ -295,7 +348,7 @@ fn monospace_advance(font: &FontRef<'_>) -> f32 {
 /// cover accents and diacritics that no code point below `0x7F` reaches, and
 /// laying the cell out from them spends a sixth of it on rows that are always
 /// blank.
-fn place(drawn: &[Drawn]) -> (i32, i32, usize, usize) {
+fn place(drawn: &[Drawn], cell_w: usize, cell_h: usize) -> (i32, i32, usize, usize) {
     let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
     let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
     for &(x, y, coverage) in drawn.iter().flatten() {
@@ -310,13 +363,13 @@ fn place(drawn: &[Drawn]) -> (i32, i32, usize, usize) {
 
     let (ink_w, ink_h) = ((max_x - min_x + 1) as usize, (max_y - min_y + 1) as usize);
     assert!(
-        ink_w <= PLEX_WIDTH && ink_h <= PLEX_HEIGHT,
+        ink_w <= cell_w && ink_h <= cell_h,
         "printable ASCII inks {ink_w}x{ink_h} pixels, which does not fit a \
-         {PLEX_WIDTH}x{PLEX_HEIGHT} cell; widen the cell rather than clipping a glyph"
+         {cell_w}x{cell_h} cell; widen the cell rather than clipping a glyph"
     );
 
-    let slack_x = i32::try_from(PLEX_WIDTH - ink_w).expect("cell wider than an i32");
-    let slack_y = i32::try_from(PLEX_HEIGHT - ink_h).expect("cell taller than an i32");
+    let slack_x = i32::try_from(cell_w - ink_w).expect("cell wider than an i32");
+    let slack_y = i32::try_from(cell_h - ink_h).expect("cell taller than an i32");
     (slack_x / 2 - min_x, slack_y / 2 - min_y, ink_w, ink_h)
 }
 
