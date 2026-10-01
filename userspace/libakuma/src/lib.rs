@@ -1989,6 +1989,25 @@ pub fn spawn_pty(path: &str, args: Option<&[&str]>, env: &[&str]) -> Option<Spaw
     spawn_full(path, args, None, env, SPAWN_FLAG_PTY)
 }
 
+/// The child is **the machine's console process**: it reads the keyboard and
+/// draws on the screen, with the console's own line discipline, instead of
+/// getting a pipe or a session channel of its own. Honoured only by the amd64
+/// kernel (the one whose console is an input device); the AArch64 kernel
+/// ignores the bit and spawns an ordinary piped child. Keep in sync with
+/// `SPAWN_FLAG_CONSOLE` in `amd64/src/usermode.rs`.
+pub const SPAWN_FLAG_CONSOLE: u64 = 2;
+
+/// Spawn a child attached to the machine's console (see [`SPAWN_FLAG_CONSOLE`]).
+///
+/// Only a process that is itself attached to the console may do this — `init`,
+/// and `herd` running as init — and anything else gets `None` (`EPERM`).
+/// The returned `stdout_fd` is the exit-status handle, not the child's output:
+/// that is on the screen. `env` is the child's whole environment; pass `&[]`
+/// for none.
+pub fn spawn_console(path: &str, args: Option<&[&str]>, env: &[&str]) -> Option<SpawnResult> {
+    spawn_full(path, args, None, env, SPAWN_FLAG_CONSOLE)
+}
+
 /// Spawn a child process with stdin data
 ///
 /// Returns SpawnResult on success with child PID and stdout FD.

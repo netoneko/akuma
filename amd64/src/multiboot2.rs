@@ -193,6 +193,21 @@ pub fn mirror_byte(byte: u8) {
     }
 }
 
+/// Draw the framebuffer console's cursor, if there is a framebuffer console.
+///
+/// Called by the console pump on a lap that moved nothing — i.e. when output has
+/// gone quiet — and never from the output path (`fbcon::Console::show_cursor`
+/// says why). `try_lock`, not `lock`: this runs every idle tick from a daemon,
+/// and a tick that lands while a printer holds the console should skip a frame
+/// of cursor rather than queue behind it. The next lap draws it.
+pub fn cursor_idle() {
+    if let Some(mut g) = CONSOLE.try_lock()
+        && let Some(c) = g.as_mut()
+    {
+        c.0.show_cursor();
+    }
+}
+
 /// Long-mode entry for a GRUB/multiboot2 boot, called from `boot.s`.
 ///
 /// Deliberately parallel to [`crate::kmain`], and in the same order, because
@@ -572,10 +587,12 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
             .find_map(|t| t.strip_prefix("initargs="))
             .map(|v| v.split(',').filter(|s| !s.is_empty()).collect())
             .unwrap_or_default();
-        // NOTE: stdout reaches the screen through the mirror, but STDIN IS NOT
-        // CONNECTED — this board's keyboard is USB with no HID stack, so an
-        // interactive shell prints its prompt and then blocks on a read nothing
-        // can satisfy. Expected, and the next gap.
+        // stdout reaches the screen through the mirror, and stdin is the i8042
+        // (`kbd`, the firmware's USB emulation) through `console`'s pump, which
+        // `run_init` starts. A program that reads fd 0 here gets the keyboard
+        // — but only the one `init=` names: under `init=/bin/herd` it is herd's
+        // `console = true` service that is attached, because herd's other
+        // services get pipes (`docs/runbooks/amd64-console-shell.md`).
         crate::usermode::run_init(path, &args);
     }
 }

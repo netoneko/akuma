@@ -5102,6 +5102,12 @@ pub fn bind_child_task(
 /// Spawn flag bits (Akuma's own SPAWN ABI, arg6). Keep in sync with
 /// `libakuma::SPAWN_FLAG_PTY` and glue's constant of the same name.
 const SPAWN_FLAG_PTY: u64 = 1;
+/// The child **is the console's process**: it gets the console's channel and its
+/// shared line discipline instead of a session channel of its own, so its fd 0
+/// reads the keyboard and its fd 1/2 draw on the screen. Keep in sync with
+/// `libakuma::SPAWN_FLAG_CONSOLE`. Ignored by the AArch64 kernel, which has no
+/// console input device to hand over.
+const SPAWN_FLAG_CONSOLE: u64 = 2;
 
 /// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.
 ///
@@ -5142,6 +5148,22 @@ pub fn sys_spawn(
     use crate::fd::errno;
 
     let pty = (flags & SPAWN_FLAG_PTY) != 0;
+    let console = (flags & SPAWN_FLAG_CONSOLE) != 0;
+
+    // **Who may ask for the console.** A console child reads the keyboard, so
+    // this is a grab on an input device, and the answer is the same one
+    // `console_attached` gives for a process: only something already attached to
+    // the console may hand it on. `init` and `herd` are; an `sshd` session's
+    // shell carries its own channel and is not, so a login cannot take the
+    // keyboard from the TV by asking.
+    if console {
+        let attached = akuma_exec::process::current_process_shared()
+            .and_then(|p| p.channel.clone())
+            .is_some_and(|ch| crate::console::is_console_channel(&ch));
+        if !attached {
+            return errno::EPERM;
+        }
+    }
 
     let Some(path_bytes) = user_cstr(path_ptr, 256) else {
         return errno::EFAULT;
@@ -5238,13 +5260,24 @@ pub fn sys_spawn(
     // session split across a channel and a pipe has its echo land where nothing
     // reads. There is no drain to add — there is a parallel implementation to
     // delete, which is what this is.
-    let channel = alloc::sync::Arc::new(akuma_exec::process::ProcessChannel::new());
-    // `is_terminal()` is what glue's `Stdin` arm selects cooked input on, what
-    // gates `/dev/tty`, and what `write_to_process_stdin`'s ISIG branch reads —
-    // so `SPAWN_FLAG_PTY` decides whether `^C` is a signal or a byte. A plain
-    // `spawn` (herd's services, the boot suite's `run_sh_capture`) is a pipe and
-    // must not have its stream cooked.
-    channel.set_terminal(pty);
+    //
+    // **Except for a console child, which has none** — `channel` is `None` and
+    // `register_exec_process` reads that, together with fd 0 being `Stdin`, as
+    // "this is the console's process" and hands it `console::channel()` and the
+    // shared `TerminalState`. The exit channel it registers for `wait4` is then
+    // a fresh one that nothing writes to, so the `ChildStdout` the caller gets
+    // back reads EOF at exit and nothing before it — the right shape for a
+    // supervisor, whose child's output is on the screen, not in a pipe.
+    let channel = (!console).then(|| {
+        let ch = alloc::sync::Arc::new(akuma_exec::process::ProcessChannel::new());
+        // `is_terminal()` is what glue's `Stdin` arm selects cooked input on, what
+        // gates `/dev/tty`, and what `write_to_process_stdin`'s ISIG branch reads —
+        // so `SPAWN_FLAG_PTY` decides whether `^C` is a signal or a byte. A plain
+        // `spawn` (herd's services, the boot suite's `run_sh_capture`) is a pipe and
+        // must not have its stream cooked.
+        ch.set_terminal(pty);
+        ch
+    });
 
     // Seed the child's stdin, if the caller supplied any (`spawn_with_stdin`).
     //
@@ -5254,7 +5287,9 @@ pub fn sys_spawn(
     // interactive shell or an `exec` channel — it feeds them through
     // `/proc/<pid>/fd/0` and ends them with `close_child_stdin` — so this is the
     // in-kernel callers' path only.
-    if stdin_ptr != 0 && stdin_len != 0
+    if let Some(channel) = &channel
+        && stdin_ptr != 0
+        && stdin_len != 0
         && let Some(seed) = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024))
     {
         channel.write_stdin(&seed);
@@ -5307,7 +5342,7 @@ pub fn sys_spawn(
         // two concurrent sessions must not share one. Same rule as the AArch64
         // `pty` spawn (`akuma-exec`'s `spawn.rs`).
         None,
-        Some(channel),
+        channel,
     );
 
     // **The session's foreground process group.**

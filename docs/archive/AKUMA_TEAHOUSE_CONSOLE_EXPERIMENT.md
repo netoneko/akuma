@@ -1,7 +1,14 @@
 # The teahouse builds a TV console — experiment record (opened 2026-10-01)
 
-**Status: PLANNED — nothing below the "Prep done" line has been run on a live
-member yet.** This page is the plan and the log. Where a fact is unverified it
+**Status (2026-10-01 evening): PAUSED — the cats never started building; the
+feature is being done directly by a Claude Code session instead.** **Update 2026-10-01 late: that
+session built it and deployed it to the trashcan — see the last log entry and
+[`../runbooks/amd64-console-shell.md`](../runbooks/amd64-console-shell.md); the
+on-TV acceptance is the user's to confirm.** The cats
+(meow, tama) posted plans that the user approved, then both hit Kimi's 5-hour
+usage limit and were put to sleep (log below). This page stays as the record of
+the swarm attempt and of the Kimi findings; the console-shell work itself moves
+to whatever doc/commits that session produces. Where a fact is unverified it
 says so; update the log as steps happen and date any correction.
 
 ## Why this experiment
@@ -285,3 +292,63 @@ draft, at 2228 bytes, was refused `TooLong`.
   token/thinking-effort hypotheses. The planned test then reads as a price per
   call in percent: tiny call, ~100k-token call, and the same with
   `thinking.effort: low`. Nothing decided until it runs.
+- 2026-10-01 evening — **swarm attempt stopped by the user** ("tired of this
+  swarm"). Cats stay asleep (`MIOT_ASLEEP`, `*.pre-asleep` backups on meow and
+  tama); nothing redeployed. akuma-miot has uncommitted fixes that stay useful
+  if the teahouse is revived: `KIMI_CONTEXT_WINDOW` 1,048,576 and
+  `kot --no-local-nag`. The TV-console feature (`/bin/sh` visible on the TV,
+  keystrokes from the keyboard, no ssh) is handed to a single Claude Code
+  session; the acceptance is unchanged. Facts that session should start from
+  (read from the tree, not run): `amd64/src/console.rs` already owns the
+  console `ProcessChannel` + shared `TerminalState`, and `pump_once` bridges
+  `input::getb()` (keyboard) in and the line discipline's echo out to the
+  serial/framebuffer; `usermode::run_init` registers init as pid 1 and starts
+  that pump; `init=` on the boot command line selects the program (herd by
+  default, which starts sshd, not a shell).
+- 2026-10-01 late — **TV console shell built by one Claude Code session (no
+  swarm), deployed to the trashcan, awaiting the user's look at the screen.**
+  Everything below says where it was checked; "not verified" means exactly that.
+  - **The gap (hypothesis confirmed, under QEMU).** With `init=/bin/herd` on the
+    unmodified tree, `scripts/utils/amd64_console_probe.py` typed three commands
+    on the serial console and got **nothing back — not even echo** (log: 0 bytes
+    after the `-- running /bin/herd --` line). Control: the same harness with
+    `INIT=/bin/busybox` (init *is* `sh`) passed 3/3, so the harness can see a
+    working console and the silence was real. Cause: herd's services are
+    spawned with a pipe channel (`sys_spawn`), so none is console-attached, and
+    `init` (herd) never reads fd 0.
+  - **The change** (uncommitted): `SPAWN_FLAG_CONSOLE` in amd64 `sys_spawn`
+    (child gets the console channel + shared `TerminalState`; `EPERM` unless the
+    caller is itself console-attached), `libakuma::spawn_console`, herd's
+    `console = true`, `console.conf` staged by `mkdisk.sh`; `kbd.rs` Backspace
+    `0x08` -> `0x7f` (VERASE); `akuma-fbcon` gained `\b`, a CSI subset
+    (`A B C D G H f J K`, rest parsed and dropped) and an idle-time block cursor
+    (`multiboot2::cursor_idle`, called by the pump on a lap that moved nothing).
+    Design chosen over `init=/bin/sh` (kills herd/sshd) and a kernel-spawned
+    shell (needs a GRUB-line edit the box cannot do from Akuma).
+  - **Verified under QEMU `microvm` (input via the 16550, so NOT `kbd.rs`, NOT
+    the framebuffer):** with the console service, `init=/bin/herd` passes: command
+    output, `$0` = `/bin/sh`, a pipeline, line editing with DEL (`echo BAD<DEL>x3GOOD`
+    prints `GOOD`), and `^C` killing `sleep 100` with the shell surviving. Boot
+    suite 790 passed / 0 failed. **Host tests:** `cargo test -p akuma-fbcon`
+    44 passed (22 new: BS, CSI, split sequences, clamping, erase on the glass,
+    cursor); `cargo test -p herd --lib` 7 passed; `cargo clippy` adds no warnings
+    to the touched files (26 pre-existing in `hda.rs`/`ext2.rs`/`mm.rs`, same
+    count on a stash). The full workspace test run was not repeated.
+  - **Deployed to the box:** `/bin/herd` and `/boot/akuma-amd64` replaced (md5
+    verified after write; backups `/bin/herd.pre-console`,
+    `/boot/akuma-amd64.pre-console`, which is also `.prev`; `.good` untouched and
+    **not promoted**), `/etc/herd/enabled/console.conf` written, `reboot -f`. The
+    box returned on `ccacd28e-release-smp-shared` (it had been running
+    `0b800634` and the user had to restart it once for a hang), `herd status`
+    lists `console`, and `ps` shows `/bin/sh` (pid 20, child of herd) with
+    ~0.3 % CPU over 10 s — it is parked, not spinning. A line injected from ssh
+    through `/proc/20/fd/0` returned `rc=0` (that proves the write was accepted;
+    **its echo on the TV is not something an ssh session can see**).
+  - **NOT verified:** anything on the real screen (prompt, cursor, glyph
+    placement after erase/redraw), the real keyboard through the firmware's PS/2
+    emulation, `^C` and Backspace from that keyboard, and whether `[BKL] stuck`
+    lines (28 within the first minute of the new boot, `kot` also running) are
+    benign contention or the hang the user hit on the old kernel. None of these
+    can be settled from ssh. The on-TV checklist is the runbook's Verify section.
+  - **Known gaps:** no arrow/function keys (`kbd.rs`); busybox's `ESC[6n` query
+    is swallowed unanswered; colours ignored.

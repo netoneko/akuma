@@ -645,6 +645,25 @@ if [ -n "$HERD" ]; then
         "$DEBUGFS" -w -R "write $TMP/herd-sshd.conf etc/herd/available/sshd.conf" "$IMG" >/dev/null 2>&1
     fi
 
+    # console: enabled. **The shell on the screen** — `console = true` makes herd
+    # spawn it with `SPAWN_FLAG_CONSOLE`, so it reads the machine's keyboard and
+    # draws on its framebuffer through the console's own line discipline. Without
+    # it `init=/bin/herd` leaves the TV showing the boot log and nothing that
+    # reads the keyboard, because herd's other services get pipes, not the
+    # console (`docs/runbooks/amd64-console-shell.md`). It restarts on exit, so
+    # `exit` gives a fresh prompt rather than a dead screen.
+    #
+    # `TERM=linux`: the framebuffer console implements the Linux-console subset
+    # of ANSI (cursor moves, erase, no colour) — `xterm`, herd's default, would
+    # invite sequences it does not draw. Needs busybox, which is what `/bin/sh`
+    # is; a tree without it stages no console service rather than one that
+    # fails and restarts forever.
+    if [ -f "$BB" ]; then
+        printf 'command = /bin/sh\nconsole = true\nrestart = true\nrestart_delay = 1000\nenv = TERM=linux\n' > "$TMP/herd-console.conf"
+        "$DEBUGFS" -w -R "write $TMP/herd-console.conf etc/herd/enabled/console.conf" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "write $TMP/herd-console.conf etc/herd/available/console.conf" "$IMG" >/dev/null 2>&1
+    fi
+
     # httpd: available, not enabled. Something to `herd enable httpd` over the
     # ssh session the service above is there to provide.
     if [ -n "$HTTPD" ]; then

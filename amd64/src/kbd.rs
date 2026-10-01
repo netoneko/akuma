@@ -59,10 +59,20 @@ static MODS: AtomicU8 = AtomicU8::new(0);
 /// able to say "readable" without consuming the key.
 static PENDING: AtomicU16 = AtomicU16::new(0);
 
+/// What the Backspace key sends: DEL, as every terminal's does, and the
+/// line discipline's own `VERASE` (`c_cc[2] = 0x7f`).
+///
+/// This was `0x08` (`^H`) until 2026-10-01, which a raw-mode line editor such as
+/// busybox's accepts but a cooked-mode read does not: with `ICANON` set only
+/// `VERASE` erases, so Backspace at a plain `read(0)` — the boot's
+/// `init=/bin/sh`, or any program that does not edit its own line — inserted a
+/// literal `^H` instead of deleting a character.
+const BACKSPACE: u8 = 0x7F;
+
 /// Set-1 make codes to ASCII, unshifted. 0 = no character (a modifier, a
 /// function key, or nothing).
 const PLAIN: [u8; 0x59] = [
-    0, 0x1B, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0x08, b'\t',
+    0, 0x1B, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', BACKSPACE, b'\t',
     b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\r', 0, b'a', b's',
     b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\', b'z', b'x', b'c', b'v',
     b'b', b'n', b'm', b',', b'.', b'/', 0, b'*', 0, b' ', 0, 0, 0, 0, 0, 0,
@@ -72,7 +82,7 @@ const PLAIN: [u8; 0x59] = [
 
 /// The same keys with Shift held.
 const SHIFTED: [u8; 0x59] = [
-    0, 0x1B, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0x08, b'\t',
+    0, 0x1B, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', BACKSPACE, b'\t',
     b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\r', 0, b'A', b'S',
     b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|', b'Z', b'X', b'C', b'V',
     b'B', b'N', b'M', b'<', b'>', b'?', 0, b'*', 0, b' ', 0, 0, 0, 0, 0, 0,

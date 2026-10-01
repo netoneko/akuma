@@ -313,6 +313,12 @@ pub fn pump_once() -> bool {
         moved = true;
     }
 
+    // Output has gone quiet: put the cursor where typing will land. Idempotent
+    // and `try_lock`ed, so doing it on every idle lap costs a comparison.
+    if !moved {
+        crate::multiboot2::cursor_idle();
+    }
+
     moved
 }
 

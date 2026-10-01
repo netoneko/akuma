@@ -532,3 +532,263 @@ fn write_macro_works() {
     let s = con.into_surface();
     assert!(s.count(Rgb::TEXT) > 0, "formatted output drew nothing");
 }
+
+// ---------------------------------------------------------------------------
+// The shell's half of the contract: backspace and the ANSI subset busybox's line
+// editor writes. Each test types what a shell types and then asks the console
+// what it believes is on the screen (`cell_at`) *and*, where it matters, what is
+// actually on the surface — a grid that says "blank" over pixels that still
+// show a glyph is the failure that only a TV would reveal.
+// ---------------------------------------------------------------------------
+
+fn term() -> Console<MemSurface> {
+    let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_fg(Rgb::WHITE);
+    con.clear();
+    con
+}
+
+fn row_text(con: &Console<MemSurface>, row: usize) -> String {
+    let cols = con.cols();
+    (0..cols).map(|c| char::from(con.cell_at(row, c))).collect::<String>().trim_end().to_string()
+}
+
+/// Prove the pixels agree with the grid for every cell of `row`.
+fn assert_row_on_glass(con: Console<MemSurface>, row: usize) {
+    let (cols, font) = (con.cols(), con.font());
+    let want: Vec<u8> = (0..cols).map(|c| con.cell_at(row, c)).collect();
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    for (c, &b) in want.iter().enumerate() {
+        assert_glyph_at(&s, font, b, mx + c * font.width(), my + row * font.height(), Rgb::WHITE, Rgb::BLACK);
+    }
+}
+
+#[test]
+fn backspace_moves_left_without_erasing() {
+    let mut con = term();
+    con.write_str_bytes("abc\x08");
+    assert_eq!(con.cursor(), (0, 2));
+    assert_eq!(row_text(&con, 0), "abc", "BS alone must not erase");
+}
+
+#[test]
+fn the_line_disciplines_erase_sequence_erases() {
+    // ECHOE: backspace, space, backspace.
+    let mut con = term();
+    con.write_str_bytes("abc\x08 \x08");
+    assert_eq!(con.cursor(), (0, 2));
+    assert_eq!(row_text(&con, 0), "ab");
+    assert_row_on_glass(con, 0);
+}
+
+#[test]
+fn backspace_at_column_zero_stays_put() {
+    let mut con = term();
+    con.write_str_bytes("\x08\x08");
+    assert_eq!(con.cursor(), (0, 0));
+}
+
+#[test]
+fn escape_sequences_are_never_drawn() {
+    let mut con = term();
+    con.write_str_bytes("a\x1b[31mb\x1b[0m\x1b[?25h\x1b[?2004hc\x1b]0;title\x07d\x1bce");
+    assert_eq!(row_text(&con, 0), "abcde");
+}
+
+#[test]
+fn a_sequence_split_across_writes_still_parses() {
+    // The console sees one byte per call, and the pump hands it whatever a lap
+    // moved — a sequence cut anywhere must not leak its tail as text.
+    let mut con = term();
+    con.write_str_bytes("xy\x1b");
+    con.write_str_bytes("[");
+    con.write_str_bytes("1");
+    con.write_str_bytes("D");
+    con.write_str_bytes("Z");
+    assert_eq!(row_text(&con, 0), "xZ");
+}
+
+#[test]
+fn cursor_left_and_right_move_by_the_count_and_default_to_one() {
+    let mut con = term();
+    con.write_str_bytes("0123456789\x1b[3D");
+    assert_eq!(con.cursor(), (0, 7));
+    con.write_str_bytes("\x1b[D");
+    assert_eq!(con.cursor(), (0, 6));
+    con.write_str_bytes("\x1b[0D"); // 0 means 1
+    assert_eq!(con.cursor(), (0, 5));
+    con.write_str_bytes("\x1b[2C");
+    assert_eq!(con.cursor(), (0, 7));
+    con.write_str_bytes("\x1b[999C");
+    assert_eq!(con.cursor(), (0, con.cols() - 1), "clamped, not wrapped");
+    con.write_str_bytes("\x1b[999D");
+    assert_eq!(con.cursor(), (0, 0));
+}
+
+#[test]
+fn erase_to_end_of_line_keeps_what_is_left_of_the_cursor() {
+    let mut con = term();
+    con.write_str_bytes("hello world\x1b[6D\x1b[K");
+    assert_eq!(row_text(&con, 0), "hello");
+    assert_eq!(con.cursor(), (0, 5), "erasing does not move the cursor");
+    assert_row_on_glass(con, 0);
+}
+
+#[test]
+fn erase_variants_of_k() {
+    let mut con = term();
+    con.write_str_bytes("abcdef\x1b[3D\x1b[1K");
+    assert_eq!(row_text(&con, 0), "    ef", "1K erases up to and including the cursor");
+    con.write_str_bytes("\x1b[2K");
+    assert_eq!(row_text(&con, 0), "");
+}
+
+#[test]
+fn erase_to_end_of_screen_is_what_a_prompt_redraw_uses() {
+    let mut con = term();
+    con.write_str_bytes("one\r\ntwo\r\nthree\x1b[A\x1b[A\r\x1b[2C\x1b[J");
+    assert_eq!(con.cursor(), (0, 2));
+    assert_eq!(row_text(&con, 0), "on");
+    assert_eq!(row_text(&con, 1), "");
+    assert_eq!(row_text(&con, 2), "");
+}
+
+#[test]
+fn clear_screen_and_home() {
+    let mut con = term();
+    con.write_str_bytes("junk\r\nmore\x1b[2J\x1b[Hok");
+    assert_eq!(row_text(&con, 0), "ok");
+    assert_eq!(row_text(&con, 1), "");
+    assert_eq!(con.cursor(), (0, 2));
+}
+
+#[test]
+fn absolute_positioning_is_one_based_and_clamped() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[3;5Hx");
+    assert_eq!(con.cell_at(2, 4), b'x');
+    con.write_str_bytes("\x1b[;;H");
+    assert_eq!(con.cursor(), (0, 0));
+    con.write_str_bytes("\x1b[500;500H");
+    assert_eq!(con.cursor(), (con.rows() - 1, con.cols() - 1));
+}
+
+#[test]
+fn a_cursor_move_from_a_pending_wrap_starts_at_the_last_column() {
+    let mut con = term();
+    let cols = con.cols();
+    for _ in 0..cols {
+        con.write_byte(b'x');
+    }
+    assert_eq!(con.cursor(), (0, cols), "the deferred-wrap state");
+    con.write_str_bytes("\x1b[D");
+    assert_eq!(con.cursor(), (0, cols - 2));
+}
+
+#[test]
+fn cancel_aborts_a_sequence() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[12\x18ok");
+    assert_eq!(row_text(&con, 0), "ok");
+}
+
+#[test]
+fn ordinary_output_is_untouched_by_the_parser() {
+    // The kernel's own output is the whole of what this console showed until a
+    // shell was attached; it must come out exactly as it did.
+    let mut con = term();
+    con.write_str_bytes("[ ok ] boot: 100% {x} <y> 1;2 [3]\n\ttab");
+    assert_eq!(row_text(&con, 0), "[ ok ] boot: 100% {x} <y> 1;2 [3]");
+    assert_eq!(row_text(&con, 1), "        tab");
+}
+
+#[test]
+fn escape_handling_never_draws_outside_the_surface() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[9999;9999H\x1b[J\x1b[1J\x1b[2K\x1b[999Cx\x1b[999Bx");
+    assert_eq!(con.into_surface().out_of_bounds, 0);
+}
+
+// ---------------------------------------------------------------------------
+// The cursor: drawn on request, taken down by the next byte, never a stale one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_cursor_is_the_cell_with_its_colours_swapped() {
+    let mut con = term();
+    con.write_str_bytes("ab");
+    con.show_cursor();
+    let font = con.font();
+    let (cols_px, rows_px) = (font.width(), font.height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    // Column 2 holds nothing: a swapped blank is a solid block of foreground.
+    for y in 0..rows_px {
+        for x in 0..cols_px {
+            assert_eq!(s.at(mx + 2 * cols_px + x, my + y), Rgb::WHITE, "block pixel ({x},{y})");
+        }
+    }
+    // And column 1's `b` is untouched.
+    assert_glyph_at(&s, font, b'b', mx + cols_px, my, Rgb::WHITE, Rgb::BLACK);
+}
+
+#[test]
+fn the_next_byte_takes_the_cursor_down_before_drawing() {
+    let mut con = term();
+    con.show_cursor();
+    con.write_byte(b'x');
+    assert_eq!(row_text(&con, 0), "x");
+    // Column 0 was under the cursor and now holds `x`; column 1 must be plain
+    // background, not a leftover block.
+    assert_row_on_glass(con, 0);
+}
+
+#[test]
+fn showing_the_cursor_twice_draws_once() {
+    let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.clear();
+    con.show_cursor();
+    let writes = con.surface_mut().writes;
+    con.show_cursor();
+    assert_eq!(con.surface_mut().writes, writes, "idempotent: the idle lap must be free");
+}
+
+#[test]
+fn the_cursor_follows_a_move_without_leaving_a_ghost() {
+    let mut con = term();
+    con.write_str_bytes("abc");
+    con.show_cursor();
+    con.write_str_bytes("\x08\x08"); // hides, then moves left twice
+    con.show_cursor();
+    assert_eq!(con.cursor(), (0, 1));
+    let font = con.font();
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    // `c` at column 2 was under the first cursor: it must be a plain `c` again.
+    assert_glyph_at(&s, font, b'c', mx + 2 * font.width(), my, Rgb::WHITE, Rgb::BLACK);
+    // `b` at column 1 is under the cursor now: solid-ish inverse, not plain.
+    assert_ne!(s.at(mx + font.width(), my), Rgb::BLACK);
+}
+
+#[test]
+fn a_cursor_after_a_full_line_sits_on_the_last_column() {
+    let mut con = term();
+    let cols = con.cols();
+    for _ in 0..cols {
+        con.write_byte(b'x');
+    }
+    con.show_cursor(); // pending-wrap state: col == cols
+    assert_eq!(con.into_surface().out_of_bounds, 0);
+}
+
+#[test]
+fn a_cursor_survives_a_scroll() {
+    let mut con = term();
+    con.show_cursor();
+    for _ in 0..con.rows() + 3 {
+        con.write_str_bytes("line\n");
+    }
+    con.show_cursor();
+    assert_eq!(con.into_surface().out_of_bounds, 0);
+}

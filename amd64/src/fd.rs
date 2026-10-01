@@ -175,6 +175,9 @@ pub mod errno {
     pub const EDESTADDRREQ: u64 = (-89i64) as u64;
     pub const EAFNOSUPPORT: u64 = (-97i64) as u64;
     pub const ENOENT: u64 = (-2i64) as u64;
+    /// The caller is not allowed to do this — `spawn`'s `SPAWN_FLAG_CONSOLE`
+    /// from a process that is not itself on the console.
+    pub const EPERM: u64 = (-1i64) as u64;
     pub const EFAULT: u64 = (-14i64) as u64;
     pub const EINVAL: u64 = (-22i64) as u64;
     pub const EMFILE: u64 = (-24i64) as u64;

@@ -58,6 +58,34 @@ const TARGET_ROWS: usize = 48;
 /// that still does it. On a monitor it costs a small border and nothing else.
 const MARGIN_DIVISOR: usize = 24;
 
+/// How many `;`-separated numbers a CSI sequence keeps. The sequences a shell's
+/// line editor writes carry at most two (`ESC [ row ; col H`); the rest are
+/// counted and dropped.
+const CSI_PARAMS: usize = 4;
+
+/// Where [`Console::write_byte`]'s escape-sequence parser is.
+///
+/// A shell on this console is an ordinary Unix program and writes to it as to a
+/// terminal: busybox's line editor moves the cursor with `ESC [ n D`, clears
+/// with `ESC [ J`, and backspaces with `\b`. Without this every one of those
+/// bytes was drawn as a glyph, which is the difference between a prompt and a
+/// prompt that fills with `[D[D[J` the first time a key is pressed.
+///
+/// A fixed-size enum and no buffer: this runs per byte, under the console lock,
+/// on the path that has to keep working when the allocator does not.
+#[derive(Clone, Copy)]
+enum Esc {
+    Ground,
+    /// Saw `ESC`; the next byte says what kind of sequence this is.
+    Escape,
+    /// Inside `ESC [`. `count` is the number of `;` seen, `private` is set by a
+    /// `?`/`<`/`=`/`>` prefix (`ESC [ ? 25 h` and friends — mode switches this
+    /// console has no modes for, so they are parsed and ignored).
+    Csi { params: [u16; CSI_PARAMS], count: usize, private: bool },
+    /// Inside an `ESC ]`/`ESC P`/... string, swallowed up to `BEL` or `ESC \`.
+    Str,
+}
+
 /// A scrolling text console.
 pub struct Console<S: Surface> {
     surface: S,
@@ -72,6 +100,10 @@ pub struct Console<S: Surface> {
     origin_y: usize,
     fg: Rgb,
     bg: Rgb,
+    esc: Esc,
+    /// The cell the cursor is drawn on right now, if it is drawn at all. See
+    /// [`Console::show_cursor`].
+    cursor: Option<(usize, usize)>,
 }
 
 impl<S: Surface> Console<S> {
@@ -129,6 +161,8 @@ impl<S: Surface> Console<S> {
             origin_y: my,
             fg: Rgb::TEXT,
             bg: Rgb::BLACK,
+            esc: Esc::Ground,
+            cursor: None,
         })
     }
 
@@ -251,6 +285,9 @@ impl<S: Surface> Console<S> {
         }
         self.col = 0;
         self.row = 0;
+        self.esc = Esc::Ground;
+        // The fill above painted over it; there is nothing left to erase.
+        self.cursor = None;
     }
 
     /// Fill the entire surface with one colour, leaving the grid alone.
@@ -263,8 +300,63 @@ impl<S: Surface> Console<S> {
         self.surface.fill(0, 0, w, h, color);
     }
 
-    /// Write one byte, honouring `\n`, `\r` and `\t`.
+    /// Write one byte, honouring `\n`, `\r`, `\t`, `\b` and the small subset of
+    /// ANSI escape sequences a shell's line editor uses (see [`Esc`]).
+    ///
+    /// Everything else — including control bytes the font draws as a box — is
+    /// drawn as before, so the kernel's own output, which never contains an
+    /// escape, is byte-for-byte what it was.
     pub fn write_byte(&mut self, b: u8) {
+        self.hide_cursor();
+        match self.esc {
+            Esc::Ground => self.ground(b),
+            Esc::Escape => {
+                self.esc = match b {
+                    b'[' => Esc::Csi { params: [0; CSI_PARAMS], count: 0, private: false },
+                    b']' | b'P' | b'_' | b'^' | b'X' => Esc::Str,
+                    // A two-byte sequence (`ESC c`, `ESC 7`, `ESC =`, ...): none
+                    // has a meaning here, and none may be drawn.
+                    _ => Esc::Ground,
+                };
+            }
+            Esc::Str => match b {
+                0x07 => self.esc = Esc::Ground,
+                // `ESC \` is the string terminator; going through `Escape`
+                // consumes the `\` as the two-byte sequence it is.
+                0x1b => self.esc = Esc::Escape,
+                _ => {}
+            },
+            Esc::Csi { mut params, mut count, mut private } => {
+                match b {
+                    b'0'..=b'9' => {
+                        let p = &mut params[count.min(CSI_PARAMS - 1)];
+                        *p = p.saturating_mul(10).saturating_add(u16::from(b - b'0')).min(9999);
+                    }
+                    b';' => count = (count + 1).min(CSI_PARAMS - 1),
+                    b'<'..=b'?' => private = true,
+                    // Intermediates (`ESC [ ! p`): part of the sequence, no meaning.
+                    0x20..=0x2f => {}
+                    0x40..=0x7e => {
+                        self.esc = Esc::Ground;
+                        if !private {
+                            self.csi(b, &params);
+                        }
+                        return;
+                    }
+                    // CAN and SUB abort a sequence; any other control byte is
+                    // executed by a real terminal mid-sequence and ignored here.
+                    0x18 | 0x1a => {
+                        self.esc = Esc::Ground;
+                        return;
+                    }
+                    _ => {}
+                }
+                self.esc = Esc::Csi { params, count, private };
+            }
+        }
+    }
+
+    fn ground(&mut self, b: u8) {
         match b {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,
@@ -274,8 +366,141 @@ impl<S: Surface> Console<S> {
                     self.put_char(b' ');
                 }
             }
+            // Non-destructive, as on a terminal: the erase is the space the
+            // line discipline writes next (`\b \b`), not the backspace.
+            0x08 => self.col = self.col.saturating_sub(1),
+            0x1b => self.esc = Esc::Escape,
+            // BEL has no sound to make and DEL no glyph; the font would draw
+            // both as the replacement box.
+            0x07 | 0x7f => {}
             _ => self.put_char(b),
         }
+    }
+
+    /// Execute one finished `ESC [ params final` sequence.
+    ///
+    /// Positions are clamped, never wrapped or scrolled: a program that moves
+    /// the cursor off the grid gets the nearest edge, as on a terminal.
+    fn csi(&mut self, final_byte: u8, params: &[u16; CSI_PARAMS]) {
+        // A cursor sitting one past the last column is a deferred wrap, not a
+        // position; every movement below starts from the last real column.
+        let last_col = self.cols - 1;
+        let last_row = self.rows - 1;
+        let col = self.col.min(last_col);
+        let p = |i: usize| usize::from(params[i]);
+        // Movement counts treat 0 like "absent" and mean 1, per ECMA-48.
+        let n = |i: usize| p(i).max(1);
+        match final_byte {
+            b'A' => {
+                self.row = self.row.saturating_sub(n(0));
+                self.col = col;
+            }
+            b'B' => {
+                self.row = (self.row + n(0)).min(last_row);
+                self.col = col;
+            }
+            b'C' => self.col = (col + n(0)).min(last_col),
+            b'D' => self.col = col.saturating_sub(n(0)),
+            b'G' => self.col = (n(0) - 1).min(last_col),
+            b'd' => self.row = (n(0) - 1).min(last_row),
+            b'H' | b'f' => {
+                self.row = (n(0) - 1).min(last_row);
+                self.col = (n(1) - 1).min(last_col);
+            }
+            b'J' => match p(0) {
+                0 => {
+                    self.blank(self.row, col, self.cols);
+                    for r in self.row + 1..self.rows {
+                        self.blank(r, 0, self.cols);
+                    }
+                }
+                1 => {
+                    for r in 0..self.row {
+                        self.blank(r, 0, self.cols);
+                    }
+                    self.blank(self.row, 0, col + 1);
+                }
+                2 | 3 => {
+                    for r in 0..self.rows {
+                        self.blank(r, 0, self.cols);
+                    }
+                }
+                _ => {}
+            },
+            b'K' => match p(0) {
+                0 => self.blank(self.row, col, self.cols),
+                1 => self.blank(self.row, 0, col + 1),
+                2 => self.blank(self.row, 0, self.cols),
+                _ => {}
+            },
+            // `m` (colours) and every sequence this console has no use for.
+            _ => {}
+        }
+    }
+
+    /// Draw the cursor: the cell under it, colours swapped.
+    ///
+    /// **Not drawn by [`Console::write_byte`], on purpose.** A block cursor
+    /// that follows every byte is two extra cell blits per character — one to
+    /// erase, one to draw — on a surface where each pixel is an uncached write,
+    /// and the boot log is thousands of lines. So the caller says when output
+    /// has gone quiet (the console pump does, on an idle lap) and the cursor
+    /// appears then; the next byte written takes it down again before touching
+    /// anything. Idempotent: a cursor already drawn where it should be costs one
+    /// comparison, which is what lets that idle call run every lap.
+    ///
+    /// On the television this is what says *where typing will land* — without it
+    /// a prompt is indistinguishable from output, and a screen that has stopped
+    /// scrolling cannot be told apart from one that is waiting for you.
+    pub fn show_cursor(&mut self) {
+        // A deferred wrap parks `col` one past the end; the cursor sits on the
+        // last real cell, which is where a terminal draws it too.
+        let at = (self.row, self.col.min(self.cols - 1));
+        if self.cursor == Some(at) {
+            return;
+        }
+        self.hide_cursor();
+        let byte = self.grid[at.0][at.1];
+        self.draw_cell_in(at.0, at.1, byte, self.bg, self.fg);
+        self.cursor = Some(at);
+    }
+
+    /// Take the cursor down, restoring the cell it covered. A no-op if it is not
+    /// drawn. Called first by [`Console::write_byte`], so nothing ever draws
+    /// over — or scrolls — a stale cursor.
+    pub fn hide_cursor(&mut self) {
+        if let Some((r, c)) = self.cursor.take() {
+            let byte = self.grid[r][c];
+            self.draw_cell_in(r, c, byte, self.fg, self.bg);
+        }
+    }
+
+    /// Blank `row`'s cells `from..to`, redrawing only those that were not
+    /// already blank — the same economy [`Console::scroll`] has, for the same
+    /// reason: every pixel is an uncached write to video memory.
+    fn blank(&mut self, row: usize, from: usize, to: usize) {
+        for c in from..to.min(self.cols) {
+            if self.grid[row][c] != b' ' {
+                self.grid[row][c] = b' ';
+                self.draw_cell(row, c, b' ');
+            }
+        }
+    }
+
+    /// Where the next character lands, as `(row, column)`.
+    #[must_use]
+    pub const fn cursor(&self) -> (usize, usize) {
+        (self.row, self.col)
+    }
+
+    /// The character the console believes is at `(row, col)`.
+    ///
+    /// The grid is what scrolling and erasing work from, so this is the
+    /// console's own account of the screen — what a test, or a caller that wants
+    /// to know what is on the glass, can ask without reading video memory.
+    #[must_use]
+    pub const fn cell_at(&self, row: usize, col: usize) -> u8 {
+        self.grid[row][col]
     }
 
     /// Write a string.
@@ -358,6 +583,12 @@ impl<S: Surface> Console<S> {
     /// memory, so a multiply that only matters on an edge should not be paid
     /// for the interior.
     fn draw_cell(&mut self, row: usize, col: usize, byte: u8) {
+        self.draw_cell_in(row, col, byte, self.fg, self.bg);
+    }
+
+    /// [`Console::draw_cell`] in colours the caller names — the cursor is the
+    /// one cell drawn with them swapped.
+    fn draw_cell_in(&mut self, row: usize, col: usize, byte: u8, fg: Rgb, bg: Rgb) {
         let (fw, fh) = (self.font.width(), self.font.height());
         let cell_w = fw * self.scale;
         let cell_h = fh * self.scale;
@@ -368,9 +599,9 @@ impl<S: Surface> Console<S> {
         for gy in 0..fh {
             for gx in 0..fw {
                 let color = match cell[gy * fw + gx] {
-                    0x00 => self.bg,
-                    0xFF => self.fg,
-                    coverage => self.bg.blend(self.fg, coverage),
+                    0x00 => bg,
+                    0xFF => fg,
+                    coverage => bg.blend(fg, coverage),
                 };
                 let px = x0 + gx * self.scale;
                 let py = y0 + gy * self.scale;

@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use libakuma::{
     print, exit, open, read_fd, write_fd, close, fstat, lseek,
-    open_flags, seek_mode, spawn, spawn_with_env, kill_signal, waitpid_status, wait_any, read_dir,
+    open_flags, seek_mode, spawn, spawn_console, spawn_with_env, kill_signal, waitpid_status, wait_any, read_dir,
     uptime, sleep_ms, mkdir_p, SpawnResult, SIGKILL, SIGTERM,
 };
 use libakuma::net::{ErrorKind, TcpListener, TcpStream};
@@ -250,6 +250,15 @@ struct ServiceConfig {
     /// one in the options (`/` by default) — and the failure is silent, so it
     /// is worth stating: a `pwd` oneshot printed `/` either way.
     workdir: String,
+    /// Give the service **the console** instead of a pipe: it reads the keyboard
+    /// and writes the screen through the console's own line discipline. One
+    /// service per machine can meaningfully have it — it is what puts a login
+    /// shell on the television of a box with no ssh. Needs the amd64 kernel's
+    /// `SPAWN_FLAG_CONSOLE` and herd running as init; elsewhere the spawn is
+    /// refused (`Failed to start`) or the flag ignored, never silently wrong.
+    /// Takes precedence over `workdir`, which the plain-spawn syscall cannot
+    /// carry, and does not combine with a box.
+    console: bool,
     /// Multikernel core pin (docs/MULTIKERNEL.md §10, CORE_AWARE_SCHEDULING.md). 0 =
     /// unpinned / BSP (current behavior: spawn locally on core 0). Non-zero = run this
     /// service on that secondary core's kernel: herd hands the kernel the command path in
@@ -278,6 +287,7 @@ impl Default for ServiceConfig {
             start_delay_ms: 0,
             oneshot: false,
             workdir: String::new(),
+            console: false,
             core: 0,
         }
     }
@@ -637,6 +647,7 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 // Both spellings, because both are the obvious one to reach for.
                 "workdir" | "working_dir" => config.workdir = String::from(value),
+                "console" => config.console = value == "true" || value == "1" || value == "yes",
                 // Repeatable: each line adds one variable. The `split_once('=')`
                 // above takes the FIRST `=`, so the value keeps any further ones
                 // (`env = DSN=host=db port=5432` is one entry, spaces and all).
@@ -1150,7 +1161,21 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     } else {
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
-        if config.workdir.is_empty() {
+        if config.console {
+            // The console's process. The child's output is on the screen, so the
+            // `stdout_fd` that comes back is only the exit-status handle: herd's
+            // drain finds nothing in it and the service gets no log file, which
+            // is the point — a shell's prompt is not log material.
+            //
+            // The environment is composed even with no `env =` line, unlike a
+            // plain service: no environment at all would reach a shell as no
+            // `PATH`, `HOME` or `TERM`, and this child is the one a person types
+            // into.
+            let base: Vec<String> = spec::DEFAULT_ENV.iter().map(|s| String::from(*s)).collect();
+            let env = spec::compose_env(&base, &config.env);
+            let refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
+            spawn_console(&config.command, args_opt, &refs)
+        } else if config.workdir.is_empty() {
             match service_env(&[], &config.env) {
                 Some(env) => {
                     let refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
