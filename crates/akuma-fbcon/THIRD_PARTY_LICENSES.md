@@ -17,6 +17,7 @@ advertising clause; Apache-2.0 patent terms are not triggered because MIT is cho
 | [`unicode-width`](https://github.com/unicode-rs/unicode-width) | 0.2.2 | MIT OR Apache-2.0 | Display width of a character (0, 1 or 2 columns). |
 | [`arrayvec`](https://github.com/bluss/arrayvec) | 0.7.8 | MIT OR Apache-2.0 | Fixed-capacity vector `vte` uses for its OSC buffer (no allocation). |
 | [`memchr`](https://github.com/BurntSushi/memchr) | 2.8.3 | Unlicense OR MIT | Byte search `vte` uses to skip plain text. |
+| [GNU Unifont](https://unifoundry.com/unifont/) 18.0.01 | OFL-1.1 (dual-licensed with GPLv2+ and the Font Embedding Exception; **used under the OFL**) | The 16x16 CJK/kana/Hangul glyphs and the 8x16 Greek/Cyrillic/Vietnamese fallback (`vendor/unifont/`). Repacked 1-bit; nothing else changed. |
 | [Noto Emoji](https://github.com/googlefonts/noto-emoji) images | commit e20cbc2 | Apache-2.0 (image resources); OFL-1.1 (the repository's root `LICENSE`, for the fonts) | The ~650 colour emoji the console draws (`vendor/noto-emoji/`). **Modified**: downscaled to 24x24 and quantised to RGBA4444. |
 
 ## vte 0.15.0 — LICENSE-MIT
@@ -160,3 +161,17 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
 ```
 
 (`vendor/noto-emoji/NOTICE-APACHE-HEADER.txt` is the upstream header verbatim.)
+
+## GNU Unifont (vendored data, not a crate)
+
+`vendor/unifont/wide-16.bin` and `narrow-8.bin` are repacked glyphs from GNU Unifont
+18.0.01 (`scripts/bake_unifont.py`; provenance in `vendor/unifont/PROVENANCE.txt`).
+Unifont's own copyright line reads: "Copyright (C) 1998-2026 Roman Czyborra, Paul Hardy,
+Qianqian Fang, Andrew Miller, Johnnie Weaver, David Corbett, Ælla Chiana Moskopp,
+Rebecca Bettencourt, Minseo Lee, Ho-Seok Ee, et al. License: SIL Open Font License
+version 1.1 and GPLv2+: GNU GPL version 2 or later with the GNU Font Embedding
+Exception." This project relies on the **OFL 1.1** alternative only; its text (with that
+copyright line) is `vendor/unifont/LICENSE-OFL-1.1.txt`. The OFL's conditions — keep the
+notice, do not sell the font by itself, do not use a Reserved Font Name for a modified
+version — are met: the data is embedded in a kernel, with the notice, and is not
+distributed as a font.

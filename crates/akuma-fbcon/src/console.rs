@@ -11,6 +11,7 @@ use core::fmt;
 use crate::font::{self, Font};
 use crate::emoji;
 use crate::glyph;
+use crate::unifont;
 use crate::{Rgb, Surface};
 
 /// The font a [`Console`] uses when the framebuffer can afford it.
@@ -393,6 +394,29 @@ impl<S: Surface> Console<S> {
         let want = font.height() * TARGET_ROWS;
         let s = (height + want / 2) / want;
         if s == 0 { 1 } else { s }
+    }
+
+    /// Draw `text` (ASCII) at grid position `(row, col)` in the colours given,
+    /// **without touching the grid** — a decoration that is not part of the
+    /// terminal's contents, so it does not scroll, is not erased by an escape
+    /// sequence, and is gone on the next [`Console::clear`]. What the boot splash
+    /// is drawn with. Clipped to the physical grid.
+    pub fn draw_text_rgb(&mut self, row: usize, col: usize, text: &str, fg: Rgb, bg: Rgb) {
+        if row >= self.rows {
+            return;
+        }
+        for (i, b) in text.bytes().enumerate() {
+            if col + i >= self.cols {
+                break;
+            }
+            self.draw_glyph(row, col + i, u32::from(b), false, fg, bg);
+        }
+    }
+
+    /// The background colour (what [`Console::clear`] fills with).
+    #[must_use]
+    pub const fn background(&self) -> Rgb {
+        self.bg
     }
 
     /// The font this console draws in.
@@ -1351,6 +1375,18 @@ impl<S: Surface> Console<S> {
             return;
         }
 
+        // A CJK character: Unifont's 16x16 bitmap, at the largest whole multiple
+        // that fits the two-cell box (3x on the usual 48x48), centred.
+        if wide && let Some(g) = unifont::glyph(cp) {
+            self.surface.fill(x0, y0, span, ch, bg);
+            let f = (span / unifont::SIZE).min(ch / unifont::SIZE).max(1);
+            let side = unifont::SIZE * f;
+            let (ox, oy) = (x0 + span.saturating_sub(side) / 2, y0 + ch.saturating_sub(side) / 2);
+            let surface = &mut self.surface;
+            unifont::paint(g, f, &mut |x, y, w, h| surface.fill(ox + x, oy + y, w, h, fg));
+            return;
+        }
+
         // A character wider than one cell has no glyph here: an outlined box over
         // both cells, so the layout stays right and the gap is visible.
         if wide || cp == u32::from(TOFU_WIDE) {
@@ -1396,6 +1432,20 @@ impl<S: Surface> Console<S> {
                 }
             }
             None => {
+                // A script the text font lacks (Greek, Cyrillic, Vietnamese...): Unifont's
+                // 8x16 bitmap at a whole multiple of its size — 3x in the usual 24x48 cell.
+                if cp >= 0x180
+                    && !self.font.draws(cp)
+                    && let Some(g) = unifont::narrow(cp)
+                {
+                    self.surface.fill(x0, y0, cw, ch, bg);
+                    let f = (cw / unifont::NARROW_WIDTH).min(ch / unifont::SIZE).max(1);
+                    let (gw, gh) = (unifont::NARROW_WIDTH * f, unifont::SIZE * f);
+                    let (ox, oy) = (x0 + cw.saturating_sub(gw) / 2, y0 + ch.saturating_sub(gh) / 2);
+                    let surface = &mut self.surface;
+                    unifont::paint_narrow(g, f, &mut |x, y, w, h| surface.fill(ox + x, oy + y, w, h, fg));
+                    return;
+                }
                 let cell = self.font.cell_cp(cp);
                 for gy in 0..fh {
                     for gx in 0..fw {

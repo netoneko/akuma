@@ -5378,6 +5378,13 @@ pub fn sys_spawn(
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn { pid, exec_slot: task_slot });
     }
 
+    // A quiet boot's splash hands the screen to the shell **before** the child can
+    // be scheduled — it is cleared here, so the first prompt lands on a clean
+    // console, not under an animation.
+    if console {
+        crate::splash::end_for_console();
+    }
+
     // Last, as in `sys_fork`: identity and stdio in place before anything can
     // schedule the child.
     crate::sched::publish_task(task_slot);
@@ -8280,8 +8287,17 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // much of the screen the console uses (`cols = 50%` for the left half) — is read
     // from its filesystem here, so the size reported below is the one in force.
     // Absent or unreadable is the normal case and changes nothing.
+    //
+    // During a quiet boot the splash is on the screen and applying a margin would
+    // clear it, so the text is held until the splash ends (`splash::end_for_console`).
+    // An init that will not spawn a console shell (`herd` does; a bare shell is the
+    // console itself) has nothing to wait for, so the splash ends here.
+    if !path.ends_with("herd") {
+        crate::splash::end_for_init();
+    }
     if let Ok(conf) = crate::fs::read_file("/etc/console.conf")
         && let Ok(text) = core::str::from_utf8(&conf)
+        && !crate::splash::defer_config(text)
     {
         let _ = crate::multiboot2::fb_apply_config(text);
     }

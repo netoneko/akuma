@@ -63,6 +63,8 @@ pub mod emoji;
 pub mod font;
 pub mod glyph;
 pub mod format;
+pub mod splash;
+pub mod unifont;
 
 pub use console::Console;
 pub use format::PixelFormat;
@@ -99,6 +101,29 @@ impl Rgb {
     pub const BAD: Self = Self::new(0xE0, 0x50, 0x50);
     /// Headings and framing.
     pub const ACCENT: Self = Self::new(0x60, 0xA0, 0xE0);
+
+    /// A colour from hue (degrees, any value — it wraps), saturation and value
+    /// (each 0..=255). Integer arithmetic only; the splash screen's colour wheel.
+    #[must_use]
+    #[allow(clippy::many_single_char_names)] // r/g/b/p/q/t/f: the standard HSV formulae
+    pub const fn from_hsv(hue: u32, sat: u8, val: u8) -> Self {
+        let h = hue % 360;
+        let (s, v) = (sat as u32, val as u32);
+        let region = h / 60;
+        let f = (h % 60) * 255 / 60; // position within the region, 0..=255
+        let p = v * (255 - s) / 255;
+        let q = v * (255 - s * f / 255) / 255;
+        let t = v * (255 - s * (255 - f) / 255) / 255;
+        let (r, g, b) = match region {
+            0 => (v, t, p),
+            1 => (q, v, p),
+            2 => (p, v, t),
+            3 => (p, q, v),
+            4 => (t, p, v),
+            _ => (v, p, q),
+        };
+        Self::new(r as u8, g as u8, b as u8)
+    }
 
     /// `self` mixed toward `fg`, where `coverage` 0 is all `self` and 255 all
     /// `fg`.

@@ -126,6 +126,15 @@ impl Font {
         self.index_of(cp).is_some()
     }
 
+    /// Does this font really draw `cp` — it is in the table **and** is not the
+    /// replacement box standing in for a glyph the face lacks? (The tables are
+    /// generated with the box in every slot the typeface had no glyph for, so
+    /// [`Font::has`] alone cannot say.)
+    #[must_use]
+    pub fn draws(&self, cp: u32) -> bool {
+        self.has(cp) && self.cell_cp(cp) != self.cell_cp(u32::MAX)
+    }
+
     /// One glyph's coverage, row-major, [`Font::width`] * [`Font::height`] bytes.
     ///
     /// A code point the font does not carry gives the replacement box.

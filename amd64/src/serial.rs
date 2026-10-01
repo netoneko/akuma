@@ -128,6 +128,29 @@ pub fn klog_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
     klog_lock().map_or(0, |r| r.snapshot_from(skip, out))
 }
 
+/// Write the last `max` bytes of the `dmesg` ring to the framebuffer console,
+/// bypassing the quiet policy: what a crash or a stuck quiet boot shows, so the
+/// television explains itself. Starts at a line boundary.
+pub fn replay_klog_tail_to_fb(max: usize) {
+    let mut skip = klog_len().saturating_sub(max);
+    let mut buf = [0u8; 256];
+    let mut at_line_start = skip == 0;
+    loop {
+        let n = klog_snapshot_from(skip, &mut buf);
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if !at_line_start {
+                at_line_start = b == b'\n';
+                continue;
+            }
+            crate::multiboot2::mirror_byte(b);
+        }
+        skip += n;
+    }
+}
+
 /// Total bytes currently retrievable from [`klog_snapshot_from`]. For
 /// `SYSLOG_ACTION_SIZE_UNREAD` / `SIZE_BUFFER`.
 #[must_use]
@@ -281,7 +304,9 @@ static FATAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// has it — in which case the caller must not print at all.
 #[must_use]
 pub fn begin_fatal() -> bool {
-    // The dump is for the screen too: see `FB_QUIET`.
+    // The dump is for the screen too: see `FB_QUIET` — and a boot splash gives way
+    // to it (best effort, never waiting on the console).
+    crate::splash::crash();
     FB_QUIET.store(false, Ordering::Release);
     FATAL_ACTIVE.swap(true, Ordering::AcqRel)
 }
@@ -374,6 +399,8 @@ fn putb_raw_m(byte: u8, mirror: bool) {
     // Keep a copy for `dmesg` (see `KLOG`). First, so a byte survives even if
     // the mirror or the port below hangs.
     klog_push(byte);
+    // A quiet boot's splash shows the latest message (`splash::note_byte`).
+    crate::splash::note_byte(byte);
 
     // Mirror to the framebuffer console, if one is up.
     //

@@ -20,16 +20,16 @@ pub const RELEASE: &str = akuma_syscalls_glue::version::RELEASE;
 
 /// What this target appends to [`RELEASE`], so a banner on the HP box's
 /// television says which of the two kernels is up.
-const RELEASE_SUFFIX: &str = "-amd64";
+pub const RELEASE_SUFFIX: &str = "-amd64";
 
 /// `uname -v` — the longer description, same source as above.
-pub const VERSION_DESC: &str = "Akuma/amd64 (x86_64 bring-up)";
+pub const VERSION_DESC: &str = "Akuma/amd64";
 
 /// Akuma's mark, the 40-column cut — a local copy of `src/akuma_40.txt`, the
 /// same art `userspace/sshd` prints on an interactive login (its own
 /// `akuma_40.txt`). Kept here rather than reaching across the source tree, the
 /// way sshd's copy is.
-const ART: &str = include_str!("akuma_40.txt");
+pub const ART: &str = include_str!("akuma_40.txt");
 
 /// Print [`ART`] then the version line. `run_init` calls this on both boot
 /// paths just before the init program starts.

@@ -100,7 +100,8 @@ anything beyond cursor-left/erase was drawn as text.
 | editing | cursor addressing, erase line/screen/characters, insert/delete characters and lines, scroll regions, scroll up/down, repeat, save/restore cursor, the alternate screen (cleared on entry and exit — the old screen is not kept) |
 | replies | cursor position (`CSI 6 n`), device attributes (`CSI c`), foreground/background colour queries — typed back into the program by the console pump, so busybox no longer waits at every prompt and a TUI learns the colours |
 | emoji | ~650 colour emoji (Noto Emoji, downscaled to 24x24 and drawn smoothly into their two cells): faces, hands, hearts, symbols, animals, food, objects, coloured circles and squares. Sequences are one picture two columns wide — `❤️` (VS16), skin tones and `ZWJ` joins collapse into the base emoji, so a frame laid out for the sequence's width stays aligned. One *not* in the baked set shows as an outlined two-column box (the layout stays right). Add one by editing `WANT` in `crates/akuma-fbcon/scripts/bake_emoji.py` and re-running it |
-| not drawn | Cyrillic/Greek/CJK glyphs (width is right, the glyph is a box), combining accents, flags, and emoji outside the baked set |
+| scripts | Latin, Latin Extended-A, **Greek and Cyrillic** (Plex Mono has almost no Greek and a third of Cyrillic missing, so the gap is filled from Unifont's 8x16 glyphs), Latin Extended-B, IPA, Vietnamese; **CJK, kana and Hangul** (`U+3000-30FF`, `4E00-9FFF`, `AC00-D7A3`, `FF01-FF60`) as real characters from GNU Unifont's 16x16 bitmaps, two columns wide. Both are drawn at a whole multiple of their size (3x in the usual 24x48 cell — crisp, no resampling). About 1 MB of the kernel image is the CJK table |
+| not drawn | skin-tone colours (the base emoji is shown), Arabic/Hebrew/Indic (needs shaping or right-to-left), combining accents, flags, CJK extensions outside the BMP table, and emoji outside the baked set |
 
 **Crates.** Two crates do the parts that should not be hand-written (adopted
 2026-10-01, replacing a first hand-rolled parser and width table):
@@ -123,6 +124,26 @@ Ubuntu or with network). `cargo build` prints a harmless future-incompatibility 
 for `memchr` on the nightly toolchain (both 2.8.0 and 2.8.3). No crate provides a
 no-alloc *screen model* — `vt100`, `alacritty_terminal` and `termwiz` all need
 `std`/`alloc` — so the grid, colours, scrolling and drawing are `akuma-fbcon`'s own.
+
+## Quiet boot: the splash (2026-10-01)
+
+A `no-tests` kernel hides the boot log from the TV and shows **the Akuma mark, glowing
+and shifting colour, on the left**, with the banner line, `uname -a`, the kernel version
+(commit and profile), an uptime and **the latest line the kernel printed** beneath it.
+The mark is the same `akuma_40.txt` the banner prints; the colour is a diagonal hue wave
+with a slow brightness swell, dense characters washing toward white (`akuma_fbcon::splash`).
+
+| | |
+|---|---|
+| on | default for a `no-tests` build; `quiet` on the command line for any build |
+| off | `fbverbose` on the command line (the old scrolling log, diagnostics and all) |
+| ends | when the console shell spawns (the screen is cleared and the shell has it) — or at `run_init` if init is not `herd` |
+| ends **and shows the log** | on a panic, a fatal exception or `halt()`, or after 90 s with no console shell: quiet is lifted and the last ~6 KB of the log is written to the screen. A failed boot is never hidden |
+| diagnosing a hang | the last status line is the latest message the kernel printed, updated even before the animation starts, so a stuck boot still says where it stopped; everything is also in `dmesg` |
+| `/etc/console.conf` | read at `run_init` but **applied when the splash ends** (a margin change clears the screen) |
+
+`(x86_64 bring-up)` is gone from the banner and the splash. The animation costs about
+one frame of drawing every 50 ms during the first seconds of boot.
 
 ## Screen size: what `stty size` says, and what you can set
 

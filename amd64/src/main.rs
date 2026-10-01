@@ -141,6 +141,7 @@ mod thread;
 mod uas;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
+mod splash;
 mod xhci;
 
 #[cfg(target_arch = "x86_64")]
@@ -395,6 +396,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 /// `wfi` that `akuma_cpu::park_core` emits on AArch64, and burning a host core
 /// at 100% is how a QEMU run gets mistaken for a hang.
 pub fn halt() -> ! {
+    // A halt is a failed boot: if a quiet boot's splash is up, show the log instead.
+    splash::crash();
     // A core that stops must not take the Big Kernel Lock with it: the others
     // keep running (a fault on one core is reported, not spread), and after a
     // failed verdict they idle quietly instead of spinning in their tick
@@ -423,6 +426,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     {
         // A panic is for the screen: give the framebuffer back to every writer
         // before saying anything (`serial::set_fb_quiet`).
+        splash::crash();
         serial::set_fb_quiet(false);
         serial::puts("\n[PANIC] ");
         if let Some(loc) = info.location() {

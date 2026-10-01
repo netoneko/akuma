@@ -372,6 +372,7 @@ pub fn suite_emit(s: &str) {
     crate::smp::bkl_drop_window();
 }
 
+#[cfg(not(feature = "no-tests"))]
 pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     let flag = |name: &str| cx.cmdline.split_ascii_whitespace().any(|w| w == name);
 

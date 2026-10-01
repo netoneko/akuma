@@ -16,6 +16,8 @@ const GROUPS: &[(&str, u32, u32)] = &[
     ("ASCII", 0x20, 0x7E),
     ("Latin-1", 0xA0, 0xFF),
     ("Latin Ext-A", 0x100, 0x17F),
+    ("Greek", 0x370, 0x3FF),
+    ("Cyrillic", 0x400, 0x52F),
     ("punctuation 2010-2027", 0x2010, 0x2027),
     ("guillemets etc 2030-203A", 0x2030, 0x203A),
     ("euro", 0x20AC, 0x20AC),
@@ -77,4 +79,15 @@ fn a_glyph_beyond_ascii_is_not_blank_and_not_the_box() {
     assert!(a_acute.iter().any(|&c| c > 0), "á drew nothing");
     assert_ne!(a_acute, font::IBM_PLEX_MONO.cell_cp(0x10_FFFF));
     assert_ne!(a_acute, font::IBM_PLEX_MONO.cell_cp(u32::from(b'a')), "á must differ from a");
+}
+
+#[test]
+fn russian_and_greek_text_is_covered_by_the_font_or_the_unifont_fallback() {
+    // Plex Mono as vendored lacks Greek and part of Cyrillic; the console falls back
+    // to Unifont's narrow glyphs for exactly those. Every letter must be one or the other.
+    for cp in "Привет мир ЁёЖж αβγδ ΑΒΓΔ ƒəɛ Việt".chars().map(|c| c as u32).filter(|&c| c != 0x20) {
+        let covered = font::IBM_PLEX_MONO.draws(cp) || akuma_fbcon::unifont::narrow(cp).is_some();
+        assert!(covered, "U+{cp:04X} is drawn by neither the font nor Unifont");
+    }
+    assert!(!font::IBM_PLEX_MONO.draws(0x3B1), "(this is why the fallback exists)");
 }

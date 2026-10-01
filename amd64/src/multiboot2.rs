@@ -260,6 +260,34 @@ pub fn fb_apply_config(text: &str) -> Option<(u16, u16)> {
     Some((u16::try_from(rows).ok()?, u16::try_from(cols).ok()?))
 }
 
+/// Draw one frame of the boot splash (`akuma_fbcon::splash`). `try_lock`: a frame
+/// that finds the console busy is simply skipped.
+pub fn fb_splash_frame(art: &str, info: &[&str], t_ms: u64) {
+    let Some(mut g) = CONSOLE.try_lock() else { return };
+    if let Some(c) = g.as_mut() {
+        akuma_fbcon::splash::paint(&mut c.0, art, info, t_ms);
+    }
+}
+
+/// End the splash: clear the screen, apply `conf` (the text of `/etc/console.conf`)
+/// if given, and return the printing area `(rows, columns)` now in force.
+///
+/// `blocking` is `false` on the crash path (see `splash::crash`): if the console is
+/// busy, skip the clear rather than wait for it — the log replay that follows draws
+/// over whatever is there.
+pub fn fb_splash_end(conf: Option<&str>, blocking: bool) -> Option<(u16, u16)> {
+    let mut g = if blocking { CONSOLE.lock() } else { CONSOLE.try_lock()? };
+    let c = &mut g.as_mut()?.0;
+    c.clear();
+    if let Some(text) = conf {
+        let cfg = akuma_fbcon::config::ConsoleConfig::parse(text);
+        if !cfg.is_empty() {
+            c.apply_config(&cfg);
+        }
+    }
+    Some((u16::try_from(c.rows()).ok()?, u16::try_from(c.cols()).ok()?))
+}
+
 /// Bytes the framebuffer console wants typed back into the program on the
 /// console — answers to cursor-position, device-attribute and colour queries
 /// (`fbcon::Console::take_reply`). Copied into `out`; returns the count.
@@ -416,6 +444,21 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         (con.font().name(), con.font().width(), con.font().height(), con.cols(), con.rows(), con.scale())
     };
     ega_text(2, "console up");
+
+    // **Quiet boot**, decided now and started before the first message below so none
+    // of them reaches the screen: the splash instead of a scrolling log. On by
+    // default for a `no-tests` build (the build for a machine that is used), `quiet`
+    // forces it on for any build, `fbverbose` forces it off. Everything still goes to
+    // `dmesg`, and a crash or a boot that never reaches the console brings the log
+    // back (`splash`).
+    {
+        let cmd = info.cmdline();
+        let has = |w: &str| cmd.split_ascii_whitespace().any(|t| t == w);
+        serial::set_fb_verbose(has("fbverbose"));
+        if (cfg!(feature = "no-tests") || has("quiet")) && !has("fbverbose") {
+            crate::splash::begin();
+        }
+    }
 
     // FROM HERE, `serial::puts` REACHES THE SCREEN. `serial::putb` mirrors into
     // the console above, so everything below -- the kernel's own diagnostics,
@@ -684,6 +727,9 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
 /// whose own tests failed is a way to spend an hour debugging the wrong layer.
 fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
     let cmdline = info.cmdline();
+    // The scheduler and the timer exist now: the splash can animate.
+    crate::splash::spawn_daemon();
+    crate::splash::phase(1);
     if have_net {
         // The wall clock, and the order it has to happen in.
         //
@@ -720,6 +766,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
     crate::serial::set_fb_verbose(cmdline.split_ascii_whitespace().any(|t| t == "fbverbose"));
 
     if run_shell {
+        crate::splash::phase(2);
         let path = init_path(cmdline);
         // `initargs=a,b,c`, comma-separated as on the PVH path: `init=/bin/busybox
         // initargs=uname,-a` runs one applet and exits.

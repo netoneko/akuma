@@ -398,4 +398,21 @@ draft, at 2228 bytes, was refused `TooLong`.
   (Noto Emoji, 24x24 RGBA4444, 758 KB, kernel 3.95 -> 4.71 MB), a bilinear scaler,
   and sequence handling (VS16, ZWJ, skin tones). **Licence caveat recorded:** the
   Noto repository's README says the images are Apache-2.0 but its root LICENSE is the
-  OFL; both texts ship with the data. 141 fbcon host tests. Not yet seen on the TV.
+  OFL; both texts ship with the data. 141 fbcon host tests. **Verified on the real TV (user photo, same night):** emoji are
+  recognisable colour pictures two cells wide, `❤️`/skin-tone/ZWJ sequences collapse to one
+  picture and keep the columns aligned; known gaps: skin tones are not drawn (the base emoji
+  shows), CJK is an outlined box, and anything printed before the console shell spawns
+  (self-tests, first herd lines, the `[probe]` line) is still on the TV.
+- 2026-10-01 night (later) — **quiet boot splash + real Greek/Cyrillic/CJK.** Splash:
+  the `akuma_40.txt` mark animated with a hue wave and a breathing swell, plus banner,
+  `uname -a`, kernel/commit and uptime and the latest boot line, drawn from a daemon;
+  default for `no-tests`, `quiet`/`fbverbose` override; ends when the console shell
+  spawns, and on a crash/halt/90 s timeout lifts quiet and replays the log tail.
+  `(x86_64 bring-up)` dropped from the banner. **`no-tests` did not build for amd64:**
+  an earlier commit had inserted `suite_emit` between `self_tests` and its
+  `#[cfg(not(feature = "no-tests"))]`; fixed. Glyphs: Plex Mono as vendored has 1 of 144
+  Greek and ~2/3 of Cyrillic, so Unifont's 8x16 glyphs fill the gaps; CJK/kana/Hangul
+  from Unifont's 16x16 (1 MB). Both draw at an exact 3x on the TV's 24x48 cell.
+  `vte`, `unicode-width`, Noto emoji and Unifont notices are in
+  `crates/akuma-fbcon/THIRD_PARTY_LICENSES.md`. Host-rendered images of the splash and a
+  Unicode sample were inspected; **not yet seen on the TV**.

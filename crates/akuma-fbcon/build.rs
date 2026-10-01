@@ -24,7 +24,7 @@
 //! is generated from the file by `build.rs`, never hand-written.
 //!
 //! Which code points are emitted is [`RANGES`]: printable ASCII, Latin-1,
-//! Latin Extended-A, general punctuation, arrows, geometric shapes and a few
+//! Latin Extended-A, Greek, Cyrillic, general punctuation, arrows, geometric shapes and a few
 //! symbols — enough for a TUI such as late.sh. **Box drawing, block elements and
 //! Braille are deliberately not here**: the console draws those itself, per cell,
 //! because a font's line glyphs leave gaps at the cell edge once they are scaled
@@ -51,6 +51,8 @@ const RANGES: &[(u32, u32)] = &[
     (0x0020, 0x007E), // printable ASCII
     (0x00A0, 0x00FF), // Latin-1 Supplement
     (0x0100, 0x017F), // Latin Extended-A (Polish, Czech, Turkish, ...)
+    (0x0370, 0x03FF), // Greek and Coptic
+    (0x0400, 0x052F), // Cyrillic and Cyrillic Supplement
     (0x2010, 0x2027), // dashes, quotes, bullet, ellipsis
     (0x2030, 0x203A), // per mille, primes, guillemets
     (0x20AC, 0x20AC), // euro
