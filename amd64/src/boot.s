@@ -576,7 +576,11 @@ __pdpt_kern: .skip 4096
  *
  * PDS comes from `phys.rs`'s `PHYSMAP_PDS`. At 64 that is 256 KiB of .bootbss,
  * which is NOLOAD — it costs nothing in the image on disk and pushes the rest
- * of the kernel up by that much. */
+ * of the kernel up by that much.
+ *
+ * `.globl` because `multiboot2.rs` re-types the framebuffer's PDEs
+ * write-combining (`map_wc`). */
+.globl __pd0
 __pd0:       .skip 4096 * {PDS}
 
 /* The page-table root a secondary core enables paging on: the kernel's PML4

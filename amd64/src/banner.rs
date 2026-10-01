@@ -47,31 +47,46 @@ pub fn print() {
     serial::puts("\n\n");
 }
 
-/// [`print`] for a console that is being kept quiet: the same banner (the mark, the
-/// version line) plus the `uname -a` line, written through the **console's own**
-/// output path, which the quiet policy does not hide.
+/// [`print`] for a console that is being kept quiet: the mark **in colour** plus the
+/// `uname -a` line, written straight to the framebuffer console (not through
+/// `serial`, so the thirty-odd kilobytes of colour escapes stay out of `dmesg`).
 ///
 /// A quiet boot (`splash`) hides `run_init`'s [`print`]; the splash ends just before
 /// the shell starts, and this puts the banner on the cleared screen above its prompt.
+/// The colours are the splash's wave frozen at the moment the boot finished, so each
+/// boot's cat is a slightly different one. The version line is not repeated: `uname`
+/// carries it.
 pub fn print_visible() {
-    let put = |s: &str| {
+    use akuma_fbcon::splash::art_color;
+
+    fn put(s: &str) {
         for b in s.bytes() {
             if b == b'\n' {
-                serial::putb_tty(b'\r');
+                crate::multiboot2::mirror_byte(b'\r');
             }
-            serial::putb_tty(b);
+            crate::multiboot2::mirror_byte(b);
         }
-    };
-    put("\n");
-    for line in ART.lines() {
-        put(line);
-        put("\n");
     }
-    put("\n  ");
-    put(VERSION_DESC);
-    put("  ");
-    put(RELEASE);
-    put(RELEASE_SUFFIX);
+
+    let t_ms = crate::splash::elapsed_ms();
+    put("\n");
+    for (y, line) in ART.lines().enumerate() {
+        let mut last = None;
+        for (x, ch) in line.bytes().enumerate() {
+            if ch != b' ' {
+                let c = art_color(ch, x, y, t_ms);
+                // Only when the colour changes: runs of one character share it.
+                if last != Some((c.r, c.g, c.b)) {
+                    let mut w = akuma_primitives::console::StackWriter::<24>::new();
+                    let _ = core::fmt::Write::write_fmt(&mut w, format_args!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b));
+                    put(w.as_str());
+                    last = Some((c.r, c.g, c.b));
+                }
+            }
+            crate::multiboot2::mirror_byte(ch);
+        }
+        put("\x1b[0m\n");
+    }
     put("\n  Akuma akuma ");
     put(RELEASE);
     put(" ");

@@ -579,7 +579,9 @@ fn walk_in(root: u64, va: usize) -> Walk {
 pub fn translate_in(root: u64, va: usize) -> Option<u64> {
     match walk_in(root, va) {
         Walk::Missing => None,
-        Walk::Large(entry, size) => Some((entry & ADDR_MASK) + (va as u64 & (size - 1))),
+        // `& !(size - 1)`: bit 12 of a large-page entry is the PAT bit, not an
+        // address bit (the framebuffer's PDEs carry it, `multiboot2::map_wc`).
+        Walk::Large(entry, size) => Some((entry & ADDR_MASK & !(size - 1)) + (va as u64 & (size - 1))),
         Walk::Leaf(entry) => Some((entry & ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1))),
     }
 }

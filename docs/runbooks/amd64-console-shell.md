@@ -142,8 +142,52 @@ with a slow brightness swell, dense characters washing toward white (`akuma_fbco
 | diagnosing a hang | the last status line is the latest message the kernel printed, updated even before the animation starts, so a stuck boot still says where it stopped; everything is also in `dmesg` |
 | `/etc/console.conf` | read at `run_init` but **applied when the splash ends** (a margin change clears the screen) |
 
-`(x86_64 bring-up)` is gone from the banner and the splash. The animation costs about
-one frame of drawing every 50 ms during the first seconds of boot.
+`(x86_64 bring-up)` is gone from the banner and the splash.
+
+**What animates it.** Not a task alone: the boot task sits in long synchronous waits (xHCI
+bring-up, the DHCP settle) where the scheduler never runs the splash daemon, so
+`splash::pulse()` is called from those loops and draws a frame itself when one is due
+(TSC-timed, every `tick_ms()` — three times the last frame's cost, clamped to 50–150 ms; the daemon covers the rest). A first version
+animated only from the daemon and the cat sat still for the whole boot.
+
+**After the splash** the screen is cleared, `console.conf` applies, and the banner is
+printed again *in colour* (the splash's colour wave frozen at the moment boot finished, so
+every boot's cat differs) with the `uname -a` line, above the prompt. The version line is
+not repeated there.
+
+**Measure it** — `dmesg | grep -a '\[fb\]\|\[boot\]\|\[splash\]'`:
+
+```
+[fb] 3840x2160 ... clear 461.4ms = 71MB/s       a full-screen fill at boot
+[boot] shell after 16032 ms (starting +0, network +6680, starting services +14680)
+[splash] ended after 16033 ms: 201 frames, draw avg 43298 us max 43505 us
+```
+
+`[boot]` runs from when the console exists (it cannot see firmware or GRUB) to the shell.
+Trashcan, 2026-10-01: **16 s**, of which 6.7 s is hardware bring-up before `boot_to_init`
+and **8.0 s is the DHCP settle spending its whole `SETTLE_BUDGET_MS`** — DHCP did not
+lease inside it (`DHCP did not settle`; it configured about 20 s after boot), so the shell
+waited eight seconds for nothing. `71 MB/s` for a framebuffer clear and 43 ms for a splash
+frame meant the framebuffer was **uncached**: `boot.s` maps it write-back, but the
+firmware's MTRR says UC for that range and UC wins.
+
+**Write-combining (2026-10-01, UNVERIFIED ON METAL).** `multiboot2::map_wc` programs PAT
+entry 4 (`IA32_PAT`, MSR 0x277) to WC on the boot CPU — and on every AP, from
+`smp::ap_entry64` via `pat_init_ap` — then sets the PAT bit (bit 12) on the 2 MiB PDEs
+wholly inside the framebuffer in `boot.s`'s `__pd0`. The two ragged ends are split into
+4 KiB PTEs (two static pages, `SPLIT_PT`) so neighbouring MMIO keeps its type. PAT=WC
+beats MTRR=UC (SDM Table 11-7). `Framebuffer::fill` now writes a row at a time (`rep stosd`;
+plain stores for ≤8 pixels), and `Framebuffer::flush` (`sfence`) is called per newline, after
+each splash frame/clear and from `cursor_idle`, because a partly filled WC buffer is not
+guaranteed to drain on its own. Scrolling needed no change: `Console` already diffs its RAM
+grid and never reads video memory, so a row-copy path would only add reads. The `[fb]` line now
+says `wc on`/`wc off`; `off` means no PAT or an unexpected PDE and the old UC speed.
+The splash interval is adaptive (`tick_ms`), so it falls toward 50 ms only if frames are cheap.
+
+Local checks: `no-tests` build, clippy, `akuma-fbcon` host tests, `amd64_console_probe.py`
+(PVH, **no framebuffer — `map_wc` is not exercised there**). Needs the metal (or KVM OVMF+GRUB,
+`/root/ovmf5.sh`, which TCG cannot stand in for since it ignores memory types) to confirm: expect
+`wc on`, `clear` well above 71 MB/s, `draw avg` far below 43 ms.
 
 ## Screen size: what `stty size` says, and what you can set
 

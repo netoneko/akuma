@@ -38,10 +38,14 @@ use spinning_top::Spinlock;
 
 use crate::{banner, serial};
 
-/// Milliseconds between frames. A frame costs ~43 ms on the trashcan (the framebuffer is
-/// mapped uncached: 71 MB/s), so 50 ms here was an 86% duty cycle that slowed the very
-/// boot it decorates; 150 ms leaves about three quarters of the time to the boot.
-const TICK_MS: u64 = 150;
+/// Fastest and slowest interval between frames. The actual one adapts to what the
+/// last frame cost ([`tick_ms`]): on an uncached framebuffer a frame was ~43 ms
+/// (71 MB/s), so a fixed 50 ms was an 86% duty cycle that slowed the very boot it
+/// decorates. With the framebuffer write-combining (`multiboot2::map_wc`) frames are
+/// cheap and the interval falls to [`MIN_TICK_MS`]; if that mapping ever fails the
+/// splash backs off by itself instead of eating the boot.
+const MIN_TICK_MS: u64 = 50;
+const MAX_TICK_MS: u64 = 150;
 /// A splash this old means the console shell never came: show the log instead.
 const TIMEOUT_MS: u64 = 90_000;
 /// How much of the log tail a crash or timeout writes to the screen.
@@ -62,6 +66,15 @@ static DRAWING: AtomicBool = AtomicBool::new(false);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static DRAW_CYCLES: AtomicU64 = AtomicU64::new(0);
 static DRAW_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// What the most recent frame cost, in TSC cycles; 0 before the first.
+static LAST_COST: AtomicU64 = AtomicU64::new(0);
+
+/// Interval until the next frame: three times the last frame's cost (a duty cycle of
+/// at most a quarter), clamped to `MIN_TICK_MS..=MAX_TICK_MS`.
+fn tick_ms() -> u64 {
+    let per_ms = (tsc_hz() / 1000).max(1);
+    (LAST_COST.load(Ordering::Relaxed) / per_ms * 3).clamp(MIN_TICK_MS, MAX_TICK_MS)
+}
 
 /// The TSC rate; before the LAPIC calibration has run, a guess (a frame's *rate* is
 /// all this affects, and the guess is the same order as any machine this runs on).
@@ -78,7 +91,7 @@ fn rdtsc() -> u64 {
 }
 
 /// Milliseconds since the splash began.
-fn elapsed_ms() -> u64 {
+pub fn elapsed_ms() -> u64 {
     rdtsc().wrapping_sub(START_TSC.load(Ordering::Relaxed)) / (tsc_hz() / 1000).max(1)
 }
 static PHASE: AtomicU8 = AtomicU8::new(0);
@@ -180,6 +193,7 @@ fn frame() {
     let took = rdtsc().wrapping_sub(t0);
     DRAW_CYCLES.fetch_add(took, Ordering::Relaxed);
     DRAW_MAX_CYCLES.fetch_max(took, Ordering::Relaxed);
+    LAST_COST.store(took, Ordering::Relaxed);
     DRAWING.store(false, Ordering::Release);
 }
 
@@ -188,12 +202,12 @@ fn frame() {
 /// DHCP settle — call it from their own loops: a daemon cannot animate through them
 /// (the boot task never yields there, and a second task touching the network stack
 /// at that point is what `net::settle_for_dhcp` warns about), but the boot task can
-/// draw a frame itself every [`TICK_MS`].
+/// draw a frame itself every [`tick_ms`].
 pub fn pulse() {
     if !active() {
         return;
     }
-    let due = tsc_hz() / 1000 * TICK_MS;
+    let due = tsc_hz() / 1000 * tick_ms();
     if rdtsc().wrapping_sub(LAST_TSC.load(Ordering::Relaxed)) >= due {
         if elapsed_ms() > TIMEOUT_MS {
             crash();
@@ -238,7 +252,7 @@ extern "C" fn splash_daemon() -> ! {
         // `timer_running` guard is the pump's: against a clock that does not move,
         // a deadline never arrives.
         if crate::lapic::timer_running() {
-            let wait = if idle { 1_000_000 } else { TICK_MS * 1000 };
+            let wait = if idle { 1_000_000 } else { tick_ms() * 1000 };
             crate::sched::block_until_deadline(crate::net::uptime_us() + wait);
         } else {
             crate::sched::yield_now();

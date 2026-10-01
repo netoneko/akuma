@@ -416,3 +416,12 @@ draft, at 2228 bytes, was refused `TooLong`.
   `vte`, `unicode-width`, Noto emoji and Unifont notices are in
   `crates/akuma-fbcon/THIRD_PARTY_LICENSES.md`. Host-rendered images of the splash and a
   Unicode sample were inspected; **not yet seen on the TV**.
+- 2026-10-01 night (on the TV): the splash looked right but **the cat did not change
+  colour** — the daemon is starved during the synchronous waits, and the splash ended a
+  second after it first ran. Fixed by `splash::pulse()` from the xHCI and DHCP wait
+  loops on a TSC clock. The same kernel measured the real costs: boot to shell **16 s**
+  (6.7 s bring-up, 8 s DHCP settle that never leased in time), framebuffer clear
+  **71 MB/s** and a splash frame **43 ms** (UC mapping, per-pixel volatile `put`), so the
+  frame interval went 50 -> 150 ms (50 ms was an 86% duty cycle on the boot it
+  decorated). The post-splash banner now drops the version line and paints the cat in
+  the splash's colours.

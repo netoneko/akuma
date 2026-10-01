@@ -78,13 +78,18 @@ fn ega_text(row: usize, s: &str) {
 ///
 /// # Cache attributes
 ///
-/// The boot page tables map this range write-back, which for device memory
-/// would normally be wrong. It is not: the firmware's MTRRs already describe
-/// everything above the top of usable DRAM as uncacheable, and the effective
-/// memory type is the **stronger** of the MTRR and page-table types. The writes
-/// reach the device whatever the PTE says — and are slow for the same reason,
-/// which is why the console scales a small font up rather than drawing at
-/// native 4K.
+/// `boot.s` maps this range write-back, which for device memory would normally be
+/// wrong. It was harmless but slow: the firmware's MTRRs describe everything above
+/// the top of usable DRAM as uncacheable, and **UC in the MTRR wins over WB in the
+/// PTE**, so every pixel store was its own uncached bus write -- measured on the
+/// HP box as 71 MB/s for a full-screen clear and 43 ms for one splash frame.
+///
+/// [`map_wc`] re-types the framebuffer's own pages write-combining through the PAT
+/// (`PAT=WC` beats `MTRR=UC` or `WB` in Intel SDM Table 11-7), so stores gather in the
+/// CPU's write-combining buffers and leave as full-line bursts. A WC buffer is
+/// **not** guaranteed to drain promptly: [`Framebuffer::flush`] (`sfence`) is called
+/// where output goes quiet, or the last glyph can sit in the CPU indefinitely.
+/// Reads are still never issued -- `Console` keeps its text in RAM.
 struct Framebuffer {
     base: *mut u8,
     pitch: usize,
@@ -132,6 +137,52 @@ impl Surface for Framebuffer {
         self.height
     }
 
+    /// Row-wise fill. For 32 bpp a row is written with `rep stosd` (or a few plain
+    /// stores when it is short -- a scaled glyph pixel is 2-4 wide and the string
+    /// instruction's start-up costs more than the stores); other depths take the
+    /// per-pixel default. Clipped to the surface like `put`.
+    #[allow(clippy::cast_ptr_alignment, clippy::many_single_char_names)]
+    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, color: Rgb) {
+        let x1 = x.saturating_add(w).min(self.width);
+        let y1 = y.saturating_add(h).min(self.height);
+        if x >= x1 || y >= y1 {
+            return;
+        }
+        if self.bytes_per_pixel != 4 {
+            for yy in y..y1 {
+                for xx in x..x1 {
+                    self.put(xx, yy, color);
+                }
+            }
+            return;
+        }
+        let px = self.format.encode(color);
+        let n = x1 - x;
+        for row in y..y1 {
+            // SAFETY: x < x1 <= width and row < y1 <= height, so the span
+            // `[offset, offset + 4n)` lies inside `pitch * height` bytes of the
+            // mapping `new` checked. The direction flag is clear (SysV ABI), so
+            // `stosd` ascends; `rep stosd` stores `n` dwords of `eax` at `rdi`.
+            unsafe {
+                let p = self.base.add(row * self.pitch + x * 4);
+                if n <= 8 {
+                    let p = p.cast::<u32>();
+                    for i in 0..n {
+                        p.add(i).write_volatile(px);
+                    }
+                } else {
+                    core::arch::asm!(
+                        "rep stosd",
+                        inout("rdi") p => _,
+                        inout("rcx") n => _,
+                        in("eax") px,
+                        options(nostack, preserves_flags),
+                    );
+                }
+            }
+        }
+    }
+
     // `base` is a page-aligned framebuffer address and `offset` a multiple of
     // the pixel size, so the cast never misaligns; clippy cannot see that.
     #[allow(clippy::cast_ptr_alignment)]
@@ -161,6 +212,169 @@ impl Surface for Framebuffer {
             }
         }
     }
+}
+
+impl Framebuffer {
+    /// Drain this core's write-combining buffers to the device.
+    ///
+    /// `sfence` orders and flushes WC stores; ordinary stores and `lock`ed
+    /// instructions do not reliably do it. Cheap when nothing is pending.
+    #[allow(clippy::unused_self)] // a method so call sites say which surface they drained
+    fn flush(&self) {
+        // SAFETY: `sfence` has no operands and no effect beyond store ordering.
+        unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write-combining the framebuffer
+// ---------------------------------------------------------------------------
+
+const IA32_PAT: u32 = 0x277;
+/// PAT memory-type encoding for write-combining.
+const PAT_WC: u64 = 0x01;
+/// The PAT entry we repurpose: index 4, selected by `PAT=1, PCD=0, PWT=0`. Firmware
+/// resets it to WB, and **nothing in this kernel sets the PAT bit in any entry**, so
+/// no existing mapping changes type. (Entries 0-3 -- the ones PWT/PCD pick -- are not
+/// touched at all.)
+const PAT_INDEX: u32 = 4;
+/// Bit 12 of a 2 MiB PDE / bit 7 of a 4 KiB PTE: the PAT selector bit.
+const PDE_PAT: u64 = 1 << 12;
+const PTE_PAT: u64 = 1 << 7;
+const PDE_LARGE_PRESENT: u64 = 0x81;
+const TWO_MIB: u64 = 1 << 21;
+
+unsafe extern "C" {
+    /// `boot.s`'s page directories, one per GiB, contiguous: entry `i` maps
+    /// `[i * 2 MiB, (i + 1) * 2 MiB)`. In `.bootbss`, whose VMA is its LMA, so the
+    /// symbol's address is physical. Shared by the identity map and the physmap, and
+    /// by every kernel root and every AP, which copy only the PML4.
+    static __pd0: u8;
+}
+
+/// A 4 KiB page-table page, for splitting a 2 MiB PDE that the framebuffer only
+/// partly covers.
+#[repr(C, align(4096))]
+struct PtPage(core::cell::UnsafeCell<[u64; 512]>);
+
+// SAFETY: written only by `map_wc`, once, on the boot CPU before any other core is
+// running; afterwards the CPU's page walker is the only reader.
+unsafe impl Sync for PtPage {}
+
+/// Spare page tables: a framebuffer has at most two partly-covered 2 MiB ends.
+static SPLIT_PT: [PtPage; 2] = [const { PtPage(core::cell::UnsafeCell::new([0; 512])) }; 2];
+
+/// Did [`map_wc`] succeed? APs read this to know whether to program their own PAT.
+static WC_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// CPUID.01H:EDX bit 16.
+fn pat_supported() -> bool {
+    core::arch::x86_64::__cpuid(1).edx & (1 << 16) != 0
+}
+
+/// Make PAT entry [`PAT_INDEX`] write-combining on **this** core. The PAT MSR is
+/// per-core, so every core that may touch the framebuffer needs this, and a core
+/// that skips it would see the WC-marked pages as write-back (and, under a UC MTRR,
+/// UC) -- slow but not wrong.
+fn pat_set_wc_this_cpu() {
+    let (lo, hi): (u32, u32);
+    // SAFETY: reading IA32_PAT has no side effects; PAT support was checked.
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") IA32_PAT, out("eax") lo, out("edx") hi,
+                         options(nomem, nostack, preserves_flags));
+    }
+    let mut pat = (u64::from(hi) << 32) | u64::from(lo);
+    let shift = PAT_INDEX * 8;
+    pat = (pat & !(0xFF << shift)) | (PAT_WC << shift);
+    // SAFETY: rewrites one PAT byte to a valid encoding (WC) and keeps the other
+    // seven as firmware left them. No live mapping selects entry 4 (see
+    // `PAT_INDEX`), so no translation changes type under us.
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") IA32_PAT, in("eax") pat as u32,
+                         in("edx") (pat >> 32) as u32, options(nostack, preserves_flags));
+    }
+}
+
+/// Called by each AP early in `ap_entry64`: join the BSP's PAT setting.
+pub fn pat_init_ap() {
+    if WC_ON.load(core::sync::atomic::Ordering::Acquire) {
+        pat_set_wc_this_cpu();
+    }
+}
+
+/// Re-type the physical range `[phys, phys + len)` write-combining in the boot
+/// page tables. Returns whether it took.
+///
+/// Only the framebuffer's own pages change type. A 2 MiB PDE wholly inside the
+/// range just gets the PAT bit; one it covers only partly (the ragged ends -- a
+/// 3840x2160x4 framebuffer is 16.9 MiB) is split into 512 4 KiB PTEs, with the PAT
+/// bit on exactly the pages that overlap the range, using [`SPLIT_PT`]. The
+/// neighbouring MMIO in that 2 MiB window keeps the type it had.
+///
+/// # Contract
+/// Boot CPU, before any AP is started (the TLB shootdown is local `invlpg`), with
+/// `phys + len` at most `MAPPED_LIMIT` (checked by `Framebuffer::new`).
+fn map_wc(phys: u64, len: u64) -> bool {
+    if len == 0 || !pat_supported() {
+        return false;
+    }
+    let end = phys + len;
+    // Every PDE in range must be a present 2 MiB entry, or nothing is touched.
+    let pd = crate::phys::phys_ptr::<u64>((&raw const __pd0) as u64);
+    let (first, last) = ((phys / TWO_MIB) as usize, ((end - 1) / TWO_MIB) as usize);
+    let splits = [first, last].iter().filter(|&&i| {
+        let base = i as u64 * TWO_MIB;
+        !(phys <= base && end >= base + TWO_MIB)
+    }).count();
+    let splits = if first == last { splits.min(1) } else { splits };
+    // SAFETY: indices are below 512 * PHYSMAP_PDS (end <= 4 GiB), so inside `__pd0`.
+    let all_large = (first..=last).all(|i| unsafe { pd.add(i).read_volatile() } & PDE_LARGE_PRESENT == PDE_LARGE_PRESENT);
+    if !all_large || splits > SPLIT_PT.len() {
+        return false;
+    }
+
+    pat_set_wc_this_cpu();
+
+    let mut next_pt = 0;
+    for i in first..=last {
+        let base = i as u64 * TWO_MIB;
+        // SAFETY: as above.
+        let slot = unsafe { pd.add(i) };
+        // SAFETY: as above.
+        let old = unsafe { slot.read_volatile() };
+        if phys <= base && end >= base + TWO_MIB {
+            // SAFETY: setting the PAT selector on a live large PDE re-types its 2 MiB
+            // (entry 4 = WC), nothing else.
+            unsafe { slot.write_volatile(old | PDE_PAT) };
+        } else {
+            let pt = SPLIT_PT[next_pt].0.get().cast::<u64>();
+            next_pt += 1;
+            let flags = old & 0xFFF & !0x80; // keep P/RW; drop PS
+            for j in 0..512u64 {
+                let pa = base + j * 4096;
+                let in_range = pa + 4096 > phys && pa < end;
+                // SAFETY: `pt` is this static's 512 entries; `j` < 512.
+                unsafe {
+                    pt.add(j as usize).write_volatile(pa | flags | if in_range { PTE_PAT } else { 0 });
+                }
+            }
+            let pt_phys = pt as u64 - crate::phys::KERNEL_VMA;
+            // The PT is complete before the PDE points at it (x86 stores retire in
+            // order; the compiler fence stops reordering the volatile pair).
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            // SAFETY: replaces a live large PDE by a table mapping the same 2 MiB
+            // identically except for the PAT bit on the framebuffer's pages.
+            unsafe { slot.write_volatile(pt_phys | flags) };
+        }
+        // SAFETY: invalidates the (large-page) translation of this window on this
+        // core; other cores are not running yet (contract above).
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) PHYSMAP_BASE + base,
+                             options(nostack, preserves_flags));
+        }
+    }
+    WC_ON.store(true, core::sync::atomic::Ordering::Release);
+    true
 }
 
 /// TSC cycles the boot-time full-screen clear took (see `kmain_mb2`); reported by
@@ -194,6 +408,11 @@ unsafe impl Send for FbConsole {}
 pub fn mirror_byte(byte: u8) {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.0.write_byte(byte);
+        // Per line, not per byte: a drain waits for the device. A trailing partial
+        // line is flushed by `cursor_idle` when output goes quiet.
+        if byte == b'\n' {
+            c.0.surface_mut().flush();
+        }
     } else if FB_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
         // SAFETY: port 0xE9 is QEMU's `isa-debugcon` and nothing on real PC
         // hardware; the flag that gets us here is a development one.
@@ -228,6 +447,7 @@ pub fn cursor_idle() -> Option<(u16, u16)> {
     let mut g = CONSOLE.try_lock()?;
     let c = &mut g.as_mut()?.0;
     c.show_cursor();
+    c.surface_mut().flush();
     let (rows, cols) = c.take_geometry()?;
     Some((u16::try_from(rows).ok()?, u16::try_from(cols).ok()?))
 }
@@ -270,6 +490,7 @@ pub fn fb_splash_frame(art: &str, info: &[&str], t_ms: u64) {
     let Some(mut g) = CONSOLE.try_lock() else { return };
     if let Some(c) = g.as_mut() {
         akuma_fbcon::splash::paint(&mut c.0, art, info, t_ms);
+        c.0.surface_mut().flush();
     }
 }
 
@@ -283,6 +504,7 @@ pub fn fb_splash_end(conf: Option<&str>, blocking: bool) -> Option<(u16, u16)> {
     let mut g = if blocking { CONSOLE.lock() } else { CONSOLE.try_lock()? };
     let c = &mut g.as_mut()?.0;
     c.clear();
+    c.surface_mut().flush();
     if let Some(text) = conf {
         let cfg = akuma_fbcon::config::ConsoleConfig::parse(text);
         if !cfg.is_empty() {
@@ -366,6 +588,7 @@ pub fn fb_summary() {
         serial::puts("x");
         serial::put_dec(vrows as u64);
     }
+    serial::puts(if WC_ON.load(core::sync::atomic::Ordering::Relaxed) { " wc on" } else { " wc off" });
     // How fast the screen can be written: the whole-surface fill at boot, in ms and as
     // megabytes a second. A framebuffer mapped uncached is the usual cause of a slow one.
     let hz = crate::lapic::tsc_hz();
@@ -436,7 +659,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // Colour before glyphs: the smallest proof that address, pitch and pixel
     // format are all right, with no font and almost no stack involved.
     let (w, h) = (surface.width(), surface.height());
+    // Write-combining first: every pixel store after this is cheap, including the
+    // first fill. The result is on the `[fb]` line (`wc on|off`).
+    map_wc(fb.addr, fb.size_bytes());
     surface.fill(0, 0, w, h, Rgb::new(0x30, 0x00, 0x50));
+    surface.flush();
 
     // Built **straight into the static** rather than into a local first. The
     // console owns its whole character grid (about 54 KiB: code point, colours and
@@ -458,6 +685,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         // SAFETY: RDTSC is unprivileged and present on every x86_64.
         let t0 = unsafe { core::arch::x86_64::_rdtsc() };
         con.clear();
+        con.surface_mut().flush(); // so the time includes draining the WC buffers
         let t1 = unsafe { core::arch::x86_64::_rdtsc() };
         CLEAR_CYCLES.store(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
         // Which font and grid the console actually chose. `Console::choose_font`
@@ -927,6 +1155,7 @@ fn cycle_forever(keep_scheduling: bool) -> ! {
             let band_h = (h / 14).max(8);
             let band_y = h.saturating_sub(my + band_h);
             s.fill(mx, band_y, w.saturating_sub(mx * 2), band_h, palette[i % palette.len()]);
+            s.flush();
         }
         i += 1;
         for _ in 0..CYCLE_SPINS {
