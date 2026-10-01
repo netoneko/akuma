@@ -1,12 +1,20 @@
 # A shell on the trashcan's TV — `/bin/sh` on the console, no ssh
 
-**Stability: B.** The path from a keystroke to a command is verified under QEMU.
-The real keyboard and the real screen are verified only by someone looking at the
-machine — see [Verify](#verify), which says which claim each check settles.
+**Stability: B.** Verified on the real box 2026-10-01: the USB keyboard types into
+the shell on the TV (the boot log shows the real key reports decoding). `^C` and
+`exit` from the *physical* keyboard are covered by QEMU only. See
+[Verify](#verify), which says which claim each check settles.
 
 The HP box's only console is the framebuffer GRUB hands the kernel, and its only
-local input is a USB keyboard that firmware presents as an i8042 (`kbd.rs`).
-Since 2026-10-01 a login shell runs on that console beside `sshd`.
+local input is a USB keyboard that **the kernel drives natively over xHCI**
+(`amd64/src/xhci.rs`). Since 2026-10-01 a login shell runs on that console
+beside `sshd`.
+
+> **Do not rely on the firmware's PS/2 emulation (`kbd.rs`).** It was the first
+> design and it does not work on this box: the emulation belongs to the
+> firmware's USB stack and ends at the xHCI bring-up's `BIOS handoff` + `HCRST`
+> (the keyboard's lights go out there), and the i8042 status byte then sits at a
+> constant `0x7c` with no data. See "The keyboard" below.
 
 ## What is running
 
@@ -28,7 +36,9 @@ and the TV showed the boot log and then nothing. The fix is one more service:
 | `console = true` | `userspace/herd/src/main.rs` | spawns the service with `SPAWN_FLAG_CONSOLE` and a full environment (`PATH`, `HOME`, `TERM`) |
 | `SPAWN_FLAG_CONSOLE` (2) | `amd64/src/usermode.rs` `sys_spawn` | the child gets **no** channel of its own, so `register_exec_process` attaches it to the console channel and the shared `TerminalState` — exactly what `init` gets. Refused (`EPERM`) unless the **caller** is itself console-attached, so an ssh session cannot take the keyboard |
 | the pump | `amd64/src/console.rs` | keyboard -> line discipline (`^C` -> `SIGINT`) -> the shell; the shell's echo -> screen |
-| Backspace = `0x7f` | `amd64/src/kbd.rs` | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
+| native USB keyboard | `amd64/src/xhci.rs` `init_keyboard` / `keyboard_poll` | a **second xHCI slot** beside the disk's: enumerate the boot-keyboard interface, `SET_CONFIGURATION`, Configure Endpoint (interrupt IN), `SET_PROTOCOL(boot)`, keep one 8-byte report in flight; decode with `akuma-usb`'s `BootKeyboardDecoder` into a key FIFO that `input::getb` drains. Reports are taken in `Xhci::next_event`, the one place events are consumed, so a disk read cannot swallow one |
+| Backspace = `0x7f` | `amd64/src/kbd.rs`, `akuma-usb` keymap | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
+| quiet framebuffer | `amd64/src/serial.rs` `set_fb_quiet` | once the console shell is spawned the TV shows the shell and its echo only; `[probe]`/`[herd]`/`[BKL]`/`[PSTATS]` stay in `dmesg`; a panic or fatal exception reopens it; boot flag `fbverbose` disables it. Console traffic uses `putb_tty`; pid 1's (`herd`'s) writes do not |
 | ANSI subset | `crates/akuma-fbcon/src/console.rs` | busybox's line editor emits `\b`, `ESC[nD`, `ESC[J`, `ESC[K`; they used to be drawn as glyphs |
 | cursor | same, + `multiboot2::cursor_idle` | a block, drawn when output goes quiet, removed by the next byte |
 
@@ -61,15 +71,57 @@ typed line does not contain, so a reflected echo cannot pass. Run the **control*
 once when you change the harness: a probe that has never been seen to pass proves
 nothing about a silent boot.
 
-What QEMU does **not** prove: the i8042 path (`microvm` has none — input arrives
-on the serial port), the real keyboard, and any pixel on a real screen. The
-framebuffer console's parsing is host-tested
-(`cargo test -p akuma-fbcon`, which renders into memory and checks pixels).
+Three rigs, each proving a different link:
+
+| rig | command | proves | does not prove |
+|---|---|---|---|
+| serial | `amd64_console_probe.py` | spawn attach, pump, line discipline, shell, echo, the TV quiet policy (via `fbtrace`) | any keyboard, any pixel |
+| emulated i8042 | `amd64_console_probe.py --kbd` | `kbd.rs` decode (needs the controller's translation on) | firmware emulation |
+| **USB** | `amd64_console_probe.py --usb` | the xHCI keyboard driver end to end: `q35` + `qemu-xhci` + USB disk (root) + `usb-kbd`, typed with `sendkey` — the same boot shape as the box | the real keyboard's descriptors, the firmware handoff, the real screen |
+
+The framebuffer console's parsing is host-tested (`cargo test -p akuma-fbcon`,
+which renders into memory and checks pixels).
+
+## The keyboard
+
+**Where it must be plugged in.** The driver sees only a keyboard on a port the
+**xHCI** controller owns. In Akuma's boot the front keyboard port is
+`[xhci] port 8 USB2` (full speed); a port the firmware leaves on an EHCI
+controller keeps the keyboard lit but is invisible to this driver. The test is
+the log, not the lights: `dmesg | grep xhci` must show `[xhci] keyboard up on
+port N`.
+
+```
+[xhci] port 8 USB2 connected PORTSC=0x000206e1 PLS=7 not-enabled   <- before reset
+[xhci] .. find USB keyboard
+[xhci] kbd slot 2 port 8 speed 1
+[xhci] kbd interface 0 ep 0x81 mps 64 bInterval 1
+[xhci] keyboard up on port 8
+[xhci] kbd report len=8 mod=0x00 keys=0b 00 00 00 00 00   <- first 24 reports, per key edge
+```
+
+| what the log says | what it means |
+|---|---|
+| no `[xhci] port N USB2 connected` besides the disk | the keyboard is on a port the xHCI does not own — move it |
+| `no USB keyboard: …` after `[init]` | enumeration failed; the line names the step (`Address Device`, `Configure Endpoint`, `no HID boot keyboard interface`) |
+| `kbd control cc=…` | a control transfer was refused; `cc` is the xHCI completion code |
+| `kbd interrupt-IN cc=…`, then `giving up` | the endpoint halted and 4 reset attempts did not bring it back |
+| `keyboard up` but no `kbd report` lines while you type | the endpoint is armed and the keyboard is silent: wrong interface (a gaming keyboard exposes several), or it ignored `SET_PROTOCOL(boot)` and sends a non-boot layout |
+
+**Why this is not `kbd.rs`.** Measured 2026-10-01 on the box: the lights went out
+"after a brief moment on boot" (the BIOS handoff + `HCRST`), and with the
+keyboard on a port the firmware kept, the i8042 status byte was a constant `0x7c`
+over minutes of typing (`[kbd] polls=… st=0x7c or=0x7c scancodes=0`). QEMU's
+emulated i8042 decodes correctly (and showed that `kbd.rs` assumed translated
+set-1 scancodes; a raw set-2 controller needs the translation bit set). The
+heartbeat and the first-48-scancodes log in `kbd.rs` stay, so "is the emulation
+there?" is a `dmesg` away.
 
 ## Verify
 
 On the **TV**, after a boot (an ssh answer says nothing about this):
 
+0. **Keyboard port** — `ssh akuma 'dmesg' | grep xhci` shows `keyboard up on port N` (and the keyboard's lights are back on after the boot-time dip). *(Settles: the driver found and configured the keyboard.)*
 1. **A prompt** — `/ #` appears after the `[herd] Started console` line, with a
    solid block cursor after it. *(Settles: the service started and the screen shows it.)*
 2. **Keys** — type `echo hello` and Enter: the characters appear as you type and
@@ -93,8 +145,13 @@ this one.
 
 ## Known limits
 
-- No arrow keys, Home/End or function keys (`kbd.rs` drops extended scancodes);
-  history and cursor-left editing are unavailable. Backspace works.
+- No arrow keys, Home/End or function keys (`akuma-usb`'s keymap emits no escape
+  sequences); history and cursor-left editing are unavailable. Backspace works.
+- A keyboard on an EHCI-routed port is not driven (no EHCI controller driver;
+  the split-transaction builders exist in `akuma-usb::ehci`, unwired).
+- No hot-plug: unplugging halts the interrupt endpoint (four recovery attempts,
+  then it gives up); replug needs a reboot.
+- The key FIFO is 64 bytes and drops on overflow, like a tty input queue.
 - busybox sends `ESC[6n` (cursor-position query) at each prompt and the console
   does not answer it; the shell proceeds after its own short timeout.
 - Colours are ignored (`ESC[…m` is parsed and dropped).

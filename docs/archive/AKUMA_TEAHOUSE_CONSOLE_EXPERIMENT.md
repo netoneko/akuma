@@ -352,3 +352,21 @@ draft, at 2228 bytes, was refused `TooLong`.
     can be settled from ssh. The on-TV checklist is the runbook's Verify section.
   - **Known gaps:** no arrow/function keys (`kbd.rs`); busybox's `ESC[6n` query
     is swallowed unanswered; colours ignored.
+- 2026-10-01 evening — **the keyboard, and the TV filter.** (1) The user's real
+  keyboard showed nothing: lights off after the xHCI bring-up, and on a different
+  port a constant i8042 status `0x7c` with no data. QEMU found a separate
+  `kbd.rs` assumption (translated set-1; QEMU delivers raw set 2). Conclusion: the
+  firmware PS/2 emulation is gone on this box, so (2) a native xHCI keyboard driver
+  was written and **enumerated on the metal** (`kbd slot 2 port 8 speed 1`,
+  `keyboard up on port 8`); QEMU `q35` + `qemu-xhci` + `usb-kbd` passes typing,
+  Backspace and `^C`. (3) Diagnostics no longer scroll on the TV once the console
+  shell runs (`serial::set_fb_quiet`; `fbverbose` restores them; panics/fatal
+  dumps reopen the screen); verified via the `fbtrace` stand-in (herd lines reach
+  it before the prompt, none after). Details and the port-placement rule:
+  [`../runbooks/amd64-console-shell.md`](../runbooks/amd64-console-shell.md).
+- 2026-10-01 late — **accepted on the TV by the user** ("now i see it works"):
+  the real USB keyboard types into the console shell. The log confirms the real
+  reports (`h`=`0x0b`, `e`=`0x08`, Backspace=`0x2a`). Items still unchecked by
+  anyone: `^C` and `exit` from the physical keyboard (QEMU covers them), and the
+  `[BKL] stuck` lines (18 within two minutes of the last boot, `kot` running),
+  which are unrelated to this work and unresolved. `.good` was **not** promoted.

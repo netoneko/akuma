@@ -38,11 +38,15 @@
 //! the metal box across reboots for exactly this reason; `halt_controller` on
 //! every error path is the other half of the fix.
 //!
-//! # One device
+//! # Two devices: the disk, and (since 2026-10-01) the keyboard
 //!
-//! On this box `XUSB2PRM = 0`, so xHCI only ever sees SuperSpeed devices, and
-//! the USB-to-SATA enclosure is the only one. One slot, one BOT interface, two
-//! bulk endpoints — the statics are singular, not arrays.
+//! The disk is the original single-device design: one slot, one BOT interface,
+//! two bulk endpoints, singular statics. The keyboard is a **second slot beside
+//! it** with its own `KBD_*` statics, enumerated after the disk by
+//! [`init_keyboard`] (see "The USB keyboard" below). *Correction to what this
+//! header used to say:* `XUSB2PRM = 0` is what **Linux** reads; in Akuma's own
+//! boot the firmware routes the keyboard to the xHCI (`port 8 USB2`), so xHCI
+//! does see a USB 2.0 device here.
 
 use core::sync::atomic::{Ordering, compiler_fence};
 

@@ -745,6 +745,9 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 | `nosmp` | single core. Quietens the `[BKL] stuck: cpu N …` chatter while cornering something |
 | `ip=<addr>[/<prefix>][,<gw>[,<dns>]]` | override the built-in `192.168.1.220` for one boot |
 | `strace` | trace every syscall (framebuffer only) |
+| `fbverbose` | keep kernel and service diagnostics (`[herd]`, `[BKL]`, `[PSTATS]`, `[probe]`) **on the TV** even with a console shell running. Off by default since 2026-10-01: once `herd`'s `console` service spawns, `serial::set_fb_quiet` keeps the framebuffer for the shell and its echo, and a panic or fatal exception reopens it. `dmesg` always has everything. Use this when the TV is the only way to see a hang — [`amd64-console-shell.md`](amd64-console-shell.md) |
+| `pci` + `usbroot` | **PVH/QEMU only** (`-M q35`): scan PCI, and mount `/dev/sda1` from the xHCI USB disk the way `root=/dev/sda1` does on the metal. With `-device qemu-xhci -device usb-storage -device usb-kbd` this is the only off-metal rig for the USB stack and keyboard — `scripts/utils/amd64_console_probe.py --usb` |
+| `fbtrace` | PVH only: send what the framebuffer *would* show to QEMU's port-`0xE9` debug console (`FBTRACE=<file> sh amd64/run.sh`), because that machine has no framebuffer and the quiet policy is otherwise unobservable |
 
 `root=/dev/sda1` needs the drive in a **USB 3.0** socket — see the first rule in
 "Rules that cost time to learn". Without that it silently boots the RAM image

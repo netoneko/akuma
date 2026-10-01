@@ -1186,3 +1186,34 @@ write (the `write(2)` flush at `close` runs BKL-held for the whole flush),
 per the context-switch analysis in
 `AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`. Nothing froze; noted, not
 fixed here.
+
+## The keyboard (2026-10-01) — it was on the xHCI after all
+
+**Correction.** The notes above (and `AKUMA_AMD64_ON_HP_500_502NJ.md`) say the
+keyboard is on EHCI and can never be on xHCI because `XUSB2PRM = 0`. That is what
+**Linux** reads. In Akuma's own boot the xHCI bring-up lists it:
+`[xhci] port 8 USB2 connected PORTSC=0x000206e1 PLS=7 not-enabled` (speed bits 1 =
+full speed; the same line the 2026-09 doc saw vanish when the keyboard was
+unplugged). The firmware routes it to the xHCI for pre-OS use.
+
+**Consequence.** `BIOS handoff` + `HCRST` (needed for the root disk) end the
+firmware's SMM PS/2 emulation: the keyboard's lights went out "after a brief
+moment on boot" (user, 2026-10-01), and `kbd.rs` — which reads that emulation —
+had nothing to read. On a port the firmware left on an EHCI controller the lights
+stayed on but the i8042 status byte was a constant `0x7c` for minutes of typing
+(`[kbd] polls=7500 st=0x7c or=0x7c scancodes=0`).
+
+**Fix.** Drive it natively: `xhci::init_keyboard` (second slot, own rings,
+interrupt-IN endpoint, one 8-byte report in flight) with events routed in
+`Xhci::next_event`. New pure pieces: `EndpointConfig.interval` /
+`max_esit_payload` (periodic endpoints need both; control/bulk pass 0) and
+`akuma_xhci::interrupt_interval` (xHCI Interval is an exponent, not `bInterval`;
+5 host tests). Verified under QEMU `q35` (`amd64_console_probe.py --usb`: typing,
+Backspace, `^C`) and enumerated on the metal: `kbd slot 2 port 8 speed 1`,
+`interface 0 ep 0x81 mps 64 bInterval 1`, `keyboard up on port 8`.
+
+**Verified on the metal (user, 2026-10-01 evening):** typing on the real keyboard
+reaches the TV shell. The boot log shows the reports decoding: usage `0x0b` -> `h`,
+`0x08` -> `e`, `0x2a` -> Backspace, each followed by the console's echo/erase.
+Known divergence from the 2026-09 plan: no EHCI driver was written — a keyboard
+on an EHCI-routed port is not driven (it keeps its lights but is invisible here).

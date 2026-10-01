@@ -1,7 +1,17 @@
 //! i8042 PS/2 keyboard, polled.
 //!
-//! The reference machine's keyboard is USB and this kernel has no USB stack —
-//! and yet the keyboard's LEDs are lit when Akuma runs, because the *firmware*
+//! **Superseded on the reference machine (2026-10-01).** This reads the firmware's
+//! PS/2 emulation, which ends when `xhci::init` takes the controller (BIOS handoff
+//! + `HCRST`), and on that box the i8042 status byte sits at `0x7c` and never
+//! delivers a byte. The keyboard there is driven natively by `xhci::init_keyboard`
+//! and reaches the console through `input::getb`. This module remains for
+//! machines where the emulation is live (QEMU `pc`/`q35` with `-device i8042`,
+//! firmware that keeps SMM legacy support on) and logs the first raw scancodes
+//! and a poll heartbeat to `dmesg` (`[kbd] ...`) so "is the emulation there?" is
+//! answerable over ssh. The original reasoning follows.
+//!
+//! The reference machine's keyboard is USB and this kernel had no USB stack —
+//! and yet the keyboard's LEDs were lit when Akuma ran, because the *firmware*
 //! brought USB up. PC firmware has, since the first USB keyboards, presented
 //! them to a USB-unaware OS through the one interface every PC OS knows: the
 //! i8042 keyboard controller at ports `0x60`/`0x64`, with an SMM handler
