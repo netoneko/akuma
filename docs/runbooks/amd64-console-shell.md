@@ -171,7 +171,7 @@ waited eight seconds for nothing. `71 MB/s` for a framebuffer clear and 43 ms fo
 frame meant the framebuffer was **uncached**: `boot.s` maps it write-back, but the
 firmware's MTRR says UC for that range and UC wins.
 
-**Write-combining (2026-10-01, UNVERIFIED ON METAL).** `multiboot2::map_wc` programs PAT
+**Write-combining (2026-10-01, verified on the trashcan).** `multiboot2::map_wc` programs PAT
 entry 4 (`IA32_PAT`, MSR 0x277) to WC on the boot CPU — and on every AP, from
 `smp::ap_entry64` via `pat_init_ap` — then sets the PAT bit (bit 12) on the 2 MiB PDEs
 wholly inside the framebuffer in `boot.s`'s `__pd0`. The two ragged ends are split into
@@ -184,10 +184,28 @@ grid and never reads video memory, so a row-copy path would only add reads. The 
 says `wc on`/`wc off`; `off` means no PAT or an unexpected PDE and the old UC speed.
 The splash interval is adaptive (`tick_ms`), so it falls toward 50 ms only if frames are cheap.
 
-Local checks: `no-tests` build, clippy, `akuma-fbcon` host tests, `amd64_console_probe.py`
-(PVH, **no framebuffer — `map_wc` is not exercised there**). Needs the metal (or KVM OVMF+GRUB,
-`/root/ovmf5.sh`, which TCG cannot stand in for since it ignores memory types) to confirm: expect
-`wc on`, `clear` well above 71 MB/s, `draw avg` far below 43 ms.
+**Measured on the trashcan, same boot, before → after:**
+
+| | UC (before) | WC (after) |
+|---|---|---|
+| `[fb]` full-screen clear | 461.4 ms = 71 MB/s | **10.9 ms = 3026 MB/s** (42x) |
+| `[splash]` draw avg / max | 43.3 ms / 43.5 ms | **3.1 ms / 3.3 ms** (14x) |
+| splash frames in the boot | 201 (150 ms tick) | 315 (50 ms tick) |
+| `[boot]` shell after | 16032 ms | **9411 ms** |
+
+`[fb]` now reads `... wc on clear 10.9ms = 3026MB/s`. (`pitch 16384 (NOT width*bpp)` on
+this box is just row padding: 3840x4 = 15360. Not a shear.) The shell time fell mostly
+because the splash stopped stealing the boot task's time, and the long waits are now short
+(`network +1052` ms, was +6680).
+
+Checks without the metal: `no-tests` build, clippy, `akuma-fbcon` host tests,
+`amd64_console_probe.py` (PVH, **no framebuffer — `map_wc` is not exercised there**; TCG
+ignores memory types, so only KVM or the metal can show the speedup).
+
+**If `wc off` ever appears:** no PAT (CPUID.1:EDX bit 16), or a framebuffer PDE that is not a
+present 2 MiB entry, or more than two ragged ends. The console works at the old UC speed and
+the splash backs off to 150 ms by itself. Rollback of the whole change:
+`cp -f /boot/akuma-amd64.prev /boot/akuma-amd64` (the pre-WC kernel).
 
 ## Screen size: what `stty size` says, and what you can set
 
