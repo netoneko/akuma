@@ -51,6 +51,7 @@ use akuma_primitives::mmio::MmioReg;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_usb::descriptor::{self, TransferType};
+use akuma_usb::hid::{BootKeyboardDecoder, BootReport};
 use akuma_usb_storage::{Cbw, Csw, CswStatus, Direction, cdb};
 use akuma_xhci::context::{self, EndpointConfig, EpType, SlotConfig};
 use akuma_xhci::regs::{self, CapabilityRegisters, PortSc, crcr, intr, op, rt, usbcmd, usbsts};
@@ -97,6 +98,14 @@ static mut INPUT_CTX: Aligned64<2048> = Aligned64([0; 2048]);
 static mut EP0_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
 static mut BULK_IN_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
 static mut BULK_OUT_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
+// The keyboard's slot: its own device context, EP0 ring and interrupt-IN ring,
+// and the buffer the controller writes each 8-byte boot report into. Separate
+// from the disk's statics above so the keyboard can be brought up (and fail)
+// without touching a byte of the disk path.
+static mut KBD_DEV_CTX: Aligned64<2048> = Aligned64([0; 2048]);
+static mut KBD_EP0_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
+static mut KBD_INT_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
+static mut KBD_REPORT: Aligned64<64> = Aligned64([0; 64]);
 static mut CTRL_BUF: Aligned4K<512> = Aligned4K([0; 512]);
 static mut CBW_BUF: Aligned64<64> = Aligned64([0; 64]);
 static mut CSW_BUF: Aligned64<64> = Aligned64([0; 64]);
@@ -120,6 +129,8 @@ enum Ring {
     Ep0,
     BulkIn,
     BulkOut,
+    KbdEp0,
+    KbdInt,
 }
 
 fn ring_ptr(r: Ring) -> (*mut [u32; 4], usize) {
@@ -130,6 +141,8 @@ fn ring_ptr(r: Ring) -> (*mut [u32; 4], usize) {
         Ring::Ep0 => ((&raw mut EP0_RING).cast(), XFER_TRBS),
         Ring::BulkIn => ((&raw mut BULK_IN_RING).cast(), XFER_TRBS),
         Ring::BulkOut => ((&raw mut BULK_OUT_RING).cast(), XFER_TRBS),
+        Ring::KbdEp0 => ((&raw mut KBD_EP0_RING).cast(), XFER_TRBS),
+        Ring::KbdInt => ((&raw mut KBD_INT_RING).cast(), XFER_TRBS),
     }
 }
 
@@ -160,6 +173,7 @@ macro_rules! dma_buf {
 dma_buf!(input_ctx, input_ctx_mut, INPUT_CTX, 2048);
 dma_buf!(scratch_arr, scratch_arr_mut, SCRATCH_ARR, SCRATCH_PAGES * 8);
 dma_buf!(ctrl_buf, ctrl_buf_mut, CTRL_BUF, 512);
+dma_buf!(kbd_report, kbd_report_mut, KBD_REPORT, 64);
 dma_buf!(cbw_buf, cbw_buf_mut, CBW_BUF, 64);
 dma_buf!(csw_buf, csw_buf_mut, CSW_BUF, 64);
 dma_buf!(sense_buf, sense_buf_mut, SENSE_BUF, 64);
@@ -300,6 +314,13 @@ struct Xhci {
 
     slot: u8,
     port: u8,
+    /// Kept from bring-up so the keyboard can be enumerated afterwards, on a
+    /// port the disk did not take.
+    max_ports: u8,
+    protocols: ProtocolMap,
+    /// The USB keyboard's slot, once [`init_keyboard`] has found one. `None`
+    /// means the event router below passes every event through untouched.
+    kbd: Option<Kbd>,
 
     ep0: ProducerRing,
     bulk_in: ProducerRing,
@@ -387,14 +408,31 @@ impl Xhci {
     }
 
     /// Dequeue one event, advancing `ERDP`.
+    ///
+    /// **The one place events are consumed, which is why the keyboard's are
+    /// handled here.** Every wait loop in this driver — a command, a disk
+    /// transfer, a recovery — pulls events through this function and throws away
+    /// the ones that are not its own ("discarded transfer event"). A keyboard
+    /// report arriving while a disk read is in flight would be one of those, and
+    /// the keystroke would vanish *and* the keyboard's endpoint would never be
+    /// re-armed. So the interrupt-IN completions are taken and acted on here
+    /// before any caller sees them, and the callers' loops are unchanged.
     fn next_event(&mut self) -> Option<Event> {
-        let idx = self.events.dequeue_index();
-        let raw = ring_mut(Ring::Event)[idx];
-        let ev = self.events.poll(raw)?;
-        let new_idx = self.events.dequeue_index();
-        let erdp = (self.events_phys + (new_idx as u64) * 16) | intr::ERDP_EHB;
-        w64(self.rt + rt::interrupter(0), intr::ERDP, erdp);
-        Some(ev)
+        loop {
+            let idx = self.events.dequeue_index();
+            let raw = ring_mut(Ring::Event)[idx];
+            let ev = self.events.poll(raw)?;
+            let new_idx = self.events.dequeue_index();
+            let erdp = (self.events_phys + (new_idx as u64) * 16) | intr::ERDP_EHB;
+            w64(self.rt + rt::interrupter(0), intr::ERDP, erdp);
+            if let Event::Transfer { completion_code, slot, endpoint_dci, residual, trb_pointer, .. } = ev
+                && self.kbd.as_ref().is_some_and(|k| k.slot == slot && k.int_dci == endpoint_dci)
+            {
+                self.kbd_event(completion_code, residual, trb_pointer);
+                continue;
+            }
+            return Some(ev);
+        }
     }
 
     /// Push `td` onto a transfer ring, ring the slot doorbell for `dci`, wait
@@ -783,6 +821,9 @@ pub fn init() -> Result<(), &'static str> {
             events_phys,
             slot: 0,
             port: 0,
+            max_ports,
+            protocols,
+            kbd: None,
             ep0: ProducerRing::new(XFER_TRBS),
             bulk_in: ProducerRing::new(XFER_TRBS),
             bulk_in_dci: 0,
@@ -1143,6 +1184,8 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
                 tr_dequeue_phys: ring_phys(Ring::Ep0),
                 dequeue_cycle: true,
                 average_trb_length: 8,
+                interval: 0,
+                max_esit_payload: 0,
             },
         )],
         0,
@@ -1213,6 +1256,8 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
                     tr_dequeue_phys: ring_phys(Ring::Ep0),
                     dequeue_cycle: true,
                     average_trb_length: 8,
+                    interval: 0,
+                    max_esit_payload: 0,
                 },
             ),
             (
@@ -1224,6 +1269,8 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
                     tr_dequeue_phys: ring_phys(Ring::BulkIn),
                     dequeue_cycle: true,
                     average_trb_length: 3072,
+                    interval: 0,
+                    max_esit_payload: 0,
                 },
             ),
             (
@@ -1235,6 +1282,8 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
                     tr_dequeue_phys: ring_phys(Ring::BulkOut),
                     dequeue_cycle: true,
                     average_trb_length: 3072,
+                    interval: 0,
+                    max_esit_payload: 0,
                 },
             ),
         ],
@@ -1943,6 +1992,467 @@ pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
         done += take;
     }
     Ok(())
+}
+
+// ===========================================================================
+// The USB keyboard
+// ===========================================================================
+//
+// Why this exists: the console's keyboard used to be the firmware's PS/2
+// emulation (`kbd.rs`). That emulation belongs to the firmware's own USB stack
+// and ends the moment this driver takes the controller (BIOS handoff + `HCRST`
+// in `init`) — measured 2026-10-01: the keyboard's lights went out during the
+// xHCI bring-up, and on a port the firmware does not emulate the i8042 status
+// byte sits at `0x7c` and never delivers a byte. So the keyboard has to be
+// driven natively, by the controller this driver already runs.
+//
+// Shape: a second slot beside the disk's, with its own device context, EP0 ring
+// and interrupt-IN ring (`KBD_*` statics), enumerated *after* the disk so it can
+// never stop the disk coming up. One 8-byte HID boot report is kept in flight on
+// the interrupt endpoint; its completion is taken in [`Xhci::next_event`] (the
+// one place events are consumed), decoded by `akuma-usb`'s host-tested
+// `BootKeyboardDecoder`, and pushed into [`KEYS`], which `input::getb` drains.
+// The console pump polls ([`keyboard_poll`]) once a lap — the controller is
+// polled, not interrupt-driven, like everything else here.
+
+/// The USB keyboard's per-device state, held in [`Xhci::kbd`].
+struct Kbd {
+    slot: u8,
+    ep0: ProducerRing,
+    int: ProducerRing,
+    /// The interrupt-IN endpoint's DCI, **0 until it is configured** — which is
+    /// what keeps [`Xhci::next_event`]'s router off this slot's EP0 events
+    /// during enumeration.
+    int_dci: u8,
+    /// Bytes requested per report (the endpoint's `wMaxPacketSize`, at most 64).
+    report_len: u32,
+    decoder: BootKeyboardDecoder,
+    /// Reports delivered, for the first few lines of diagnostics.
+    reports: u32,
+    /// Recoveries attempted; at [`KBD_MAX_RECOVERIES`] the endpoint is left dead
+    /// rather than resetting forever.
+    recoveries: u8,
+}
+
+const KBD_MAX_RECOVERIES: u8 = 4;
+/// Reports logged to `dmesg` (`[xhci] kbd report ...`) before going quiet.
+const KBD_REPORT_LOG_CAP: u32 = 24;
+
+/// Typed bytes waiting for `input::getb`. A fixed ring: this is filled under the
+/// `XHCI` lock and drained outside it, on the console path, which must not
+/// allocate.
+struct KeyFifo {
+    buf: [u8; 64],
+    head: usize,
+    len: usize,
+}
+
+impl KeyFifo {
+    const fn new() -> Self {
+        Self { buf: [0; 64], head: 0, len: 0 }
+    }
+    /// A full queue drops the new byte, as a tty input queue does.
+    fn push(&mut self, b: u8) {
+        if self.len < self.buf.len() {
+            let tail = (self.head + self.len) % self.buf.len();
+            self.buf[tail] = b;
+            self.len += 1;
+        }
+    }
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let b = self.buf[self.head];
+        self.head = (self.head + 1) % self.buf.len();
+        self.len -= 1;
+        Some(b)
+    }
+}
+
+static KEYS: Spinlock<KeyFifo> = Spinlock::new(KeyFifo::new());
+static KBD_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+impl Xhci {
+    /// A control transfer on the **keyboard's** EP0. As [`Xhci::control`], for the
+    /// other slot: the data stage lands in `CTRL_BUF`, and the wait loop goes
+    /// through [`Xhci::next_event`] like every other.
+    fn kbd_control(
+        &mut self,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        w_length: u16,
+    ) -> Result<u32, &'static str> {
+        let slot = self.kbd.as_ref().ok_or("no keyboard slot")?.slot;
+        let dir = if w_length == 0 {
+            ControlDir::NoData
+        } else if bm_request_type & 0x80 != 0 {
+            ControlDir::In
+        } else {
+            ControlDir::Out
+        };
+        let pkt = trb::setup_packet(bm_request_type, b_request, w_value, w_index, w_length);
+        let mut td: [[u32; 4]; 3] = [[0; 4]; 3];
+        let mut n = 0;
+        td[n] = trb::setup_stage(pkt, dir);
+        n += 1;
+        if w_length != 0 {
+            td[n] = trb::data_stage(phys_of(ctrl_buf().as_ptr()), u32::from(w_length), dir, false);
+            n += 1;
+        }
+        td[n] = trb::status_stage(dir, true);
+        n += 1;
+
+        let base = ring_phys(Ring::KbdEp0);
+        let mut last = 0u64;
+        for &t in &td[..n] {
+            let k = self.kbd.as_mut().ok_or("no keyboard slot")?;
+            let e = k.ep0.enqueue(t, base);
+            last = e.trb_phys;
+            let r = ring_mut(Ring::KbdEp0);
+            r[e.index] = e.trb;
+            if let Some(link) = e.link {
+                r[XFER_TRBS - 1] = link;
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        w32(self.db, regs::db::doorbell(usize::from(slot)), regs::db::endpoint_target(1));
+
+        let start = tsc();
+        loop {
+            if let Some(Event::Transfer { completion_code, slot: s, endpoint_dci, residual, trb_pointer, .. }) =
+                self.next_event()
+                && s == slot
+                && endpoint_dci == 1
+                && trb_pointer == last
+            {
+                if completion_code != cc::SUCCESS && completion_code != cc::SHORT_PACKET {
+                    puthex("  [xhci] kbd control cc=", u32::from(completion_code));
+                    return Err("keyboard control transfer error");
+                }
+                return Ok(u32::from(w_length).saturating_sub(residual));
+            }
+            if tsc().wrapping_sub(start) > control_budget() {
+                serial::puts("  [xhci] kbd control timeout\n");
+                return Err("keyboard control timeout");
+            }
+            spin_us(10);
+        }
+    }
+
+    /// Put one report-sized Normal TRB on the interrupt-IN ring and ring its
+    /// doorbell. Exactly one is ever outstanding.
+    fn kbd_queue(&mut self) {
+        let Some(k) = self.kbd.as_mut() else { return };
+        if k.int_dci == 0 {
+            return;
+        }
+        let base = ring_phys(Ring::KbdInt);
+        let td = trb::normal(phys_of(kbd_report().as_ptr()), k.report_len, true);
+        let e = k.int.enqueue(td, base);
+        let r = ring_mut(Ring::KbdInt);
+        r[e.index] = e.trb;
+        if let Some(link) = e.link {
+            r[XFER_TRBS - 1] = link;
+        }
+        let (slot, dci) = (k.slot, k.int_dci);
+        compiler_fence(Ordering::SeqCst);
+        w32(self.db, regs::db::doorbell(usize::from(slot)), regs::db::endpoint_target(dci));
+    }
+
+    /// A completion on the keyboard's interrupt-IN endpoint, called from
+    /// [`Xhci::next_event`]. Decode, deliver, re-arm.
+    fn kbd_event(&mut self, code: u8, residual: u32, _trb: u64) {
+        if code == cc::SUCCESS || code == cc::SHORT_PACKET {
+            // Volatile: the controller wrote this buffer by DMA.
+            let mut raw = [0u8; 8];
+            for (i, b) in raw.iter_mut().enumerate() {
+                // SAFETY: `KBD_REPORT` is a live 64-byte `.bss` DMA static.
+                *b = unsafe { core::ptr::read_volatile(kbd_report().as_ptr().add(i)) };
+            }
+            let Some(k) = self.kbd.as_mut() else { return };
+            let got = k.report_len.saturating_sub(residual);
+            if k.reports < KBD_REPORT_LOG_CAP {
+                serial::puts("  [xhci] kbd report len=");
+                serial::put_dec(u64::from(got));
+                serial::puts(" mod=0x");
+                serial::put_hexn(u64::from(raw[0]), 2);
+                serial::puts(" keys=");
+                for b in &raw[2..8] {
+                    serial::put_hexn(u64::from(*b), 2);
+                    serial::puts(" ");
+                }
+                serial::puts("\n");
+            }
+            k.reports = k.reports.saturating_add(1);
+            if got >= 8
+                && let Some(report) = BootReport::parse(&raw)
+            {
+                k.decoder.feed(&report, |c| KEYS.lock().push(c));
+            }
+            self.kbd_queue();
+            return;
+        }
+        // An error completion. Say which, and try to bring the endpoint back a
+        // bounded number of times: a halted interrupt endpoint ignores its
+        // doorbell for ever, which reads as "the keyboard died".
+        puthex("  [xhci] kbd interrupt-IN cc=", u32::from(code));
+        let Some(k) = self.kbd.as_mut() else { return };
+        if k.recoveries >= KBD_MAX_RECOVERIES {
+            serial::puts("  [xhci] kbd: giving up on the interrupt endpoint\n");
+            return;
+        }
+        k.recoveries += 1;
+        let (slot, dci) = (k.slot, k.int_dci);
+        let dq = ring_phys(Ring::KbdInt) + (k.int.enqueue_index() as u64) * 16;
+        let cycle = k.int.cycle();
+        // Reset Endpoint (halted -> stopped), then point the dequeue at the next
+        // free slot and re-arm. Failures here are logged and left: this is a
+        // keyboard, not the root disk.
+        let _ = self.command(trb::reset_endpoint(slot, dci), "kbd reset endpoint");
+        let _ = self.command(trb::set_tr_dequeue_pointer(slot, dci, dq, cycle), "kbd set tr dequeue");
+        self.kbd_queue();
+    }
+}
+
+/// Find the keyboard on a port the disk did not take and start its report
+/// stream. Called once, after [`init`]. An `Err` costs the keyboard and nothing
+/// else — the disk is already up and untouched.
+pub fn init_keyboard() -> Result<(), &'static str> {
+    let mut g = lock_xhci();
+    let x = g.as_mut().ok_or("xHCI not initialised")?;
+    if x.kbd.is_some() {
+        return Ok(());
+    }
+    step("find USB keyboard");
+    let mut last_err = "no connected USB 2.0 device other than the disk";
+    for p in 1..=x.max_ports {
+        let psc = PortSc(r32(x.op, op::portsc(p)));
+        if p == x.port || !psc.connected() || x.protocols.is_superspeed(p) {
+            continue;
+        }
+        match kbd_try_port(x, p) {
+            Ok(()) => {
+                KBD_UP.store(true, Ordering::Release);
+                serial::puts("  [xhci] keyboard up on port ");
+                serial::put_dec(u64::from(p));
+                serial::puts("\n");
+                return Ok(());
+            }
+            Err(e) => {
+                serial::puts("  [xhci] port ");
+                serial::put_dec(u64::from(p));
+                serial::puts(" is not a usable keyboard: ");
+                serial::puts(e);
+                serial::puts("\n");
+                last_err = e;
+                kbd_release_slot(x);
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Give a half-built keyboard slot back, so the next candidate port gets a fresh
+/// one.
+fn kbd_release_slot(x: &mut Xhci) {
+    if let Some(k) = x.kbd.take() {
+        let _ = x.command(trb::disable_slot(k.slot), "kbd disable slot");
+        dcbaa_mut()[usize::from(k.slot)] = 0;
+    }
+}
+
+fn kbd_try_port(x: &mut Xhci, port: u8) -> Result<(), &'static str> {
+    reset_port(x.op, port, false)?;
+    spin_us(20_000); // settle (USB 2.0 §7.1.7.3)
+    let psc = PortSc(r32(x.op, op::portsc(port)));
+    let speed = Speed::from_field(psc.speed_field()).ok_or("unknown port speed")?;
+    // 8 until the device says otherwise: a full-speed device may have an 8-byte
+    // EP0, and a context claiming 64 makes its first control transfer fail.
+    // High speed is always 64.
+    let mut ep0_mps: u16 = if speed == Speed::High { 64 } else { 8 };
+
+    let slot_type = x.protocols.slot_type(port);
+    let (code, slot) = x.command(trb::enable_slot(slot_type), "kbd enable slot")?;
+    if code != cc::SUCCESS || slot == 0 || u32::from(slot) >= 64 {
+        return Err("Enable Slot failed");
+    }
+    // Fresh rings and context for this attempt.
+    for r in [Ring::KbdEp0, Ring::KbdInt] {
+        for t in ring_mut(r) {
+            *t = [0; 4];
+        }
+        ring_mut(r)[XFER_TRBS - 1] = trb::link(ring_phys(r), true);
+    }
+    // SAFETY: `KBD_DEV_CTX` is a live `.bss` DMA static; lock held.
+    unsafe { core::slice::from_raw_parts_mut((&raw mut KBD_DEV_CTX).cast::<u8>(), 2048).fill(0) };
+    dcbaa_mut()[usize::from(slot)] = phys_of((&raw const KBD_DEV_CTX).cast::<u8>());
+    x.kbd = Some(Kbd {
+        slot,
+        ep0: ProducerRing::new(XFER_TRBS),
+        int: ProducerRing::new(XFER_TRBS),
+        int_dci: 0,
+        report_len: 8,
+        decoder: BootKeyboardDecoder::new(),
+        reports: 0,
+        recoveries: 0,
+    });
+    serial::puts("  [xhci] kbd slot ");
+    serial::put_dec(u64::from(slot));
+    serial::puts(" port ");
+    serial::put_dec(u64::from(port));
+    serial::puts(" speed ");
+    serial::put_dec(u64::from(psc.speed_field()));
+    serial::puts("\n");
+
+    let ep0 = |mps: u16| EndpointConfig {
+        ep_type: EpType::Control,
+        max_packet_size: mps,
+        max_burst: 0,
+        tr_dequeue_phys: ring_phys(Ring::KbdEp0),
+        dequeue_cycle: true,
+        average_trb_length: 8,
+        interval: 0,
+        max_esit_payload: 0,
+    };
+    let slot_cfg = |entries: u8| SlotConfig {
+        route_string: 0,
+        speed: speed as u8,
+        root_hub_port: port,
+        context_entries: entries,
+    };
+    let input_phys = phys_of(input_ctx().as_ptr());
+
+    write_input_context(
+        x.context_bytes,
+        context::add_flag(0) | context::add_flag(1),
+        slot_cfg(1),
+        &[(1, ep0(ep0_mps))],
+        0,
+    );
+    let (code, _) = x.command(trb::address_device(input_phys, slot, false), "kbd address device")?;
+    if code != cc::SUCCESS {
+        puthex("  [xhci] kbd Address Device cc=", u32::from(code));
+        return Err("Address Device failed");
+    }
+
+    // The device's real EP0 packet size is byte 7 of the device descriptor.
+    x.kbd_control(0x80, 6, 0x0100, 0, 8)?;
+    let real_mps = u16::from(ctrl_buf()[7]);
+    if real_mps != 0 && real_mps != ep0_mps && speed != Speed::High {
+        ep0_mps = real_mps;
+        // Evaluate Context carries only the EP0 change (A1).
+        write_input_context(x.context_bytes, context::add_flag(1), slot_cfg(1), &[(1, ep0(ep0_mps))], 0);
+        let (code, _) =
+            x.command(trb::evaluate_context(input_phys, slot), "kbd evaluate context")?;
+        if code != cc::SUCCESS {
+            puthex("  [xhci] kbd Evaluate Context cc=", u32::from(code));
+            return Err("Evaluate Context failed");
+        }
+    }
+
+    // The configuration descriptor, whole.
+    x.kbd_control(0x80, 6, 0x0200, 0, 9)?;
+    let total = u16::from_le_bytes([ctrl_buf()[2], ctrl_buf()[3]]);
+    let want = total.clamp(9, 512);
+    x.kbd_control(0x80, 6, 0x0200, 0, want)?;
+    let mut cfg = [0u8; 512];
+    cfg[..usize::from(want)].copy_from_slice(&ctrl_buf()[..usize::from(want)]);
+    let kb = descriptor::find_boot_keyboard(&cfg[..usize::from(want)]).ok_or("no HID boot keyboard interface")?;
+    serial::puts("  [xhci] kbd interface ");
+    serial::put_dec(u64::from(kb.interface_number));
+    serial::puts(" ep 0x");
+    serial::put_hexn(u64::from(kb.endpoint_address), 2);
+    serial::puts(" mps ");
+    serial::put_dec(u64::from(kb.endpoint_max_packet_size));
+    serial::puts(" bInterval ");
+    serial::put_dec(u64::from(kb.endpoint_interval));
+    serial::puts("\n");
+
+    x.kbd_control(0x00, 9, u16::from(kb.configuration_value), 0, 0)?;
+
+    // Configure Endpoint: A0 plus the one interrupt-IN endpoint, never A1.
+    let dci = context::dci(kb.endpoint_address);
+    let mps = kb.endpoint_max_packet_size & 0x7ff;
+    write_input_context(
+        x.context_bytes,
+        context::configure_endpoint_add_flags(&[dci]),
+        slot_cfg(dci),
+        &[(
+            dci,
+            EndpointConfig {
+                ep_type: EpType::InterruptIn,
+                max_packet_size: mps,
+                max_burst: 0,
+                tr_dequeue_phys: ring_phys(Ring::KbdInt),
+                dequeue_cycle: true,
+                average_trb_length: 8,
+                interval: akuma_xhci::interrupt_interval(speed, kb.endpoint_interval),
+                max_esit_payload: mps,
+            },
+        )],
+        kb.configuration_value,
+    );
+    let (code, _) = x.command(trb::configure_endpoint(input_phys, slot, false), "kbd configure endpoint")?;
+    if code != cc::SUCCESS {
+        puthex("  [xhci] kbd Configure Endpoint cc=", u32::from(code));
+        return Err("Configure Endpoint failed");
+    }
+    {
+        let k = x.kbd.as_mut().ok_or("no keyboard slot")?;
+        k.report_len = u32::from(mps.clamp(8, 64));
+        k.int_dci = dci;
+    }
+
+    // Boot protocol, best effort: most keyboards already default to a boot-
+    // compatible layout, and a device that rejects the request would halt EP0 —
+    // which nothing here needs again.
+    let _ = x.kbd_control(0x21, 0x0B, 0, u16::from(kb.interface_number), 0);
+
+    x.kbd_queue();
+    Ok(())
+}
+
+/// Service the controller's event ring for the keyboard, without waiting.
+///
+/// Called by the console pump once a lap. `try_lock`: if the disk path holds the
+/// controller it is already draining the event ring through the same router, so
+/// skipping a lap loses nothing.
+pub fn keyboard_poll() {
+    if !KBD_UP.load(Ordering::Acquire) {
+        return;
+    }
+    // IRQs off for the whole hold. The disk path takes this lock **IRQ-masked**
+    // and spins on it (`lock_xhci`); the pump runs with IRQs on, so a tick
+    // landing while it holds the lock would switch to a thread that spins for a
+    // holder that cannot run again until it does — on one core, for ever. Held
+    // for at most sixteen events, so the mask is short.
+    let _irq = akuma_primitives::irq::IrqGuard::new();
+    let Some(mut g) = XHCI.try_lock() else { return };
+    let Some(x) = g.as_mut() else { return };
+    for _ in 0..16 {
+        if x.next_event().is_none() {
+            break;
+        }
+    }
+}
+
+/// Take one typed byte from the USB keyboard, polling the controller first.
+#[must_use]
+pub fn keyboard_getb() -> Option<u8> {
+    if !KBD_UP.load(Ordering::Acquire) {
+        return None;
+    }
+    keyboard_poll();
+    KEYS.lock().pop()
+}
+
+/// Is a typed byte waiting? Non-destructive, and does not poll.
+#[must_use]
+pub fn keyboard_has_byte() -> bool {
+    KBD_UP.load(Ordering::Acquire) && KEYS.lock().len > 0
 }
 
 // ===========================================================================

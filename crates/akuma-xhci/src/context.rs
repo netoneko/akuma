@@ -139,15 +139,24 @@ pub struct EndpointConfig {
     /// Average TRB Length hint (xHCI §4.14.1.1) — 8 for control, a typical
     /// transfer size for bulk. Non-zero is required.
     pub average_trb_length: u16,
+    /// The Interval field (xHCI §6.2.3.6): the endpoint is serviced every
+    /// `2^interval` microframes (125 µs). **0 for control and bulk.** For an
+    /// interrupt endpoint use [`interrupt_interval`] — it is not `bInterval`.
+    pub interval: u8,
+    /// Max ESIT Payload (xHCI §6.2.3.8): bytes moved per service interval, which
+    /// the controller reserves bandwidth for. **0 for control and bulk**;
+    /// required non-zero for a periodic endpoint on real silicon, where a zero
+    /// is a bandwidth refusal rather than "no reservation".
+    pub max_esit_payload: u16,
 }
 
 impl EndpointConfig {
     /// The 8 dwords of the Endpoint Context.
     #[must_use]
     pub fn build(&self) -> [u32; 8] {
-        // dword 0: EP State 0, Mult 0, MaxPStreams 0, LSA 0, Interval 0,
-        //          Max ESIT Payload Hi 0.
-        let dword0 = 0u32;
+        // dword 0: EP State 0, Mult 0, MaxPStreams 0, LSA 0, Interval (23:16),
+        //          Max ESIT Payload Hi (31:24).
+        let dword0 = (u32::from(self.interval) << 16) | ((u32::from(self.max_esit_payload) >> 16) << 24);
         // dword 1: CErr = 3 (bits 2:1), EP Type (bits 5:3), Max Burst Size
         //          (bits 15:8), Max Packet Size (bits 31:16).
         let dword1 = (3u32 << 1)
@@ -158,8 +167,8 @@ impl EndpointConfig {
         let ptr = (self.tr_dequeue_phys & !0xf) | u64::from(self.dequeue_cycle);
         let dword2 = ptr as u32;
         let dword3 = (ptr >> 32) as u32;
-        // dword 4: Average TRB Length (bits 15:0), Max ESIT Payload Lo 0.
-        let dword4 = u32::from(self.average_trb_length);
+        // dword 4: Average TRB Length (bits 15:0), Max ESIT Payload Lo (31:16).
+        let dword4 = u32::from(self.average_trb_length) | (u32::from(self.max_esit_payload) << 16);
         [dword0, dword1, dword2, dword3, dword4, 0, 0, 0]
     }
 }

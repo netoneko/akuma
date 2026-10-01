@@ -308,7 +308,9 @@ pub fn pump_once() -> bool {
             break;
         }
         for &b in &outbuf[..n] {
-            crate::serial::putb(b);
+            // `putb_tty`: the echo is the console's own traffic and must reach
+            // the screen while diagnostics are kept off it.
+            crate::serial::putb_tty(b);
         }
         moved = true;
     }

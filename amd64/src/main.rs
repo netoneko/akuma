@@ -272,7 +272,16 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // The filesystem, on top of that disk. Both are best-effort: a machine with
     // no drive still boots, which is what `DISK=none` and every stage before
     // Stage M did.
-    let have_fs = have_disk && fs::mount_root();
+    //
+    // `usbroot` (with `pci`): mount `/dev/sda1` from the xHCI USB disk, as the
+    // bare-metal path does for `root=/dev/sda1` — so a `q35` guest with
+    // `-device qemu-xhci -device usb-storage` boots the same way the box does,
+    // which is the only place the USB keyboard driver can be tried off the metal.
+    let have_fs = if have_pci && machine::flag(hvm_start_info, "usbroot") {
+        multiboot2::try_usb_root()
+    } else {
+        have_disk && fs::mount_root()
+    };
 
     // Networking, after the heap (the stack allocates) and after the virtio
     // window is set (the NIC is another slot in the same array the disk came
@@ -368,6 +377,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             if have_net {
                 lapic::start_timer();
             }
+            serial::set_fb_verbose(machine::flag(hvm_start_info, "fbverbose"));
+            multiboot2::set_fb_trace(machine::flag(hvm_start_info, "fbtrace"));
             if machine::flag(hvm_start_info, "strace") {
                 usermode::SYSCALL_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
             }
@@ -410,6 +421,9 @@ pub fn halt() -> ! {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
+        // A panic is for the screen: give the framebuffer back to every writer
+        // before saying anything (`serial::set_fb_quiet`).
+        serial::set_fb_quiet(false);
         serial::puts("\n[PANIC] ");
         if let Some(loc) = info.location() {
             serial::puts(loc.file());

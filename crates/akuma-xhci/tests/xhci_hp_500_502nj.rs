@@ -473,6 +473,8 @@ fn endpoint_context_ep0_and_bulk_in() {
         tr_dequeue_phys: 0x4_0000,
         dequeue_cycle: true,
         average_trb_length: 8,
+        interval: 0,
+        max_esit_payload: 0,
     }
     .build();
     // dword 1: CErr=3 (bits 2:1), EP type 4 (bits 5:3), max packet 512 (bits 31:16).
@@ -491,6 +493,8 @@ fn endpoint_context_ep0_and_bulk_in() {
         tr_dequeue_phys: 0x5_0000,
         dequeue_cycle: true,
         average_trb_length: 3072,
+        interval: 0,
+        max_esit_payload: 0,
     }
     .build();
     assert_eq!((bulk_in[1] >> 3) & 0x7, EpType::BulkIn as u32);

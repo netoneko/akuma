@@ -281,6 +281,8 @@ static FATAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// has it — in which case the caller must not print at all.
 #[must_use]
 pub fn begin_fatal() -> bool {
+    // The dump is for the screen too: see `FB_QUIET`.
+    FB_QUIET.store(false, Ordering::Release);
     FATAL_ACTIVE.swap(true, Ordering::AcqRel)
 }
 
@@ -313,8 +315,62 @@ pub fn fatal_dec(val: u64) {
     put_dec_digits_raw(val);
 }
 
+/// Is the framebuffer being kept for the console shell?
+///
+/// Set once a console shell is running (`set_fb_quiet`): from then on the TV
+/// shows what that shell and the line discipline print, and **nothing the kernel
+/// or a service says about itself** — `[probe]`, `[BKL]`, `[PSTATS]`, `[herd]`.
+/// Those are diagnostics for `dmesg`, and a screen that scrolls them every few
+/// seconds under the prompt is a screen nobody can type on. A panic or a fatal
+/// exception clears it again (`begin_fatal`, `set_fb_quiet(false)`): a crash is
+/// the one thing that has to reach a screen with nobody watching `dmesg`.
+///
+/// Only the *framebuffer mirror* is gated. `klog_push` (what `dmesg` reads) and
+/// the UART are untouched.
+static FB_QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Set by the `fbverbose` boot flag: never go quiet, for debugging on the
+/// metal where the TV is the only thing that shows a hang.
+static FB_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Keep the framebuffer for the console shell (`true`), or give it back to
+/// every writer (`false`). `true` is ignored under `fbverbose`.
+pub fn set_fb_quiet(quiet: bool) {
+    FB_QUIET.store(quiet && !FB_VERBOSE.load(Ordering::Relaxed), Ordering::Release);
+}
+
+/// Honour the `fbverbose` boot flag. Call before any console shell starts.
+pub fn set_fb_verbose(verbose: bool) {
+    FB_VERBOSE.store(verbose, Ordering::Relaxed);
+    if verbose {
+        FB_QUIET.store(false, Ordering::Release);
+    }
+}
+
+/// Does an ordinary writer's byte reach the framebuffer right now?
+fn fb_open() -> bool {
+    !FB_QUIET.load(Ordering::Acquire) || fatal_active()
+}
+
+/// [`putb`] for **console traffic** — the shell's output and the line
+/// discipline's echo — which reaches the framebuffer even while it is kept quiet
+/// for diagnostics. Same lock, same `dmesg` copy, same silence during a fatal
+/// dump as [`putb`]; the only difference is the mirror.
+pub fn putb_tty(byte: u8) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    putb_raw_m(byte, true);
+}
+
 /// [`putb`] without the lock, for callers that hold it across a whole string.
 fn putb_raw(byte: u8) {
+    putb_raw_m(byte, fb_open());
+}
+
+/// [`putb_raw`] with the mirror decided by the caller.
+fn putb_raw_m(byte: u8, mirror: bool) {
     // Keep a copy for `dmesg` (see `KLOG`). First, so a byte survives even if
     // the mirror or the port below hangs.
     klog_push(byte);
@@ -327,7 +383,9 @@ fn putb_raw(byte: u8) {
     // forgiving, not a guarantee. Drawing before the wait means a machine whose
     // absent port ever read 0 would still have said what it was about to hang
     // on.
-    crate::multiboot2::mirror_byte(byte);
+    if mirror {
+        crate::multiboot2::mirror_byte(byte);
+    }
 
     if !PRESENT.load(Ordering::Relaxed) {
         return;

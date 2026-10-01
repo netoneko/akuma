@@ -219,9 +219,67 @@ fn decode(sc: u8) -> Option<u8> {
     Some(c)
 }
 
+/// How many raw scancodes [`log_scancode`] reports before going quiet.
+const SCANCODE_LOG_CAP: u32 = 48;
+
+static SCANCODES_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Report the first [`SCANCODE_LOG_CAP`] raw scancodes of the boot to `dmesg`.
+///
+/// **Whether the firmware's emulation delivers anything at all** is the question
+/// a dark television cannot answer and an `ssh` session can: press a key, then
+/// `dmesg | grep '\[kbd\]'`. A `[kbd] sc=0x1e` line means bytes reached the
+/// controller and the fault, if any, is above this; no line means the emulation
+/// is not there (the USB controller was reset, the keyboard is on a port the
+/// firmware does not emulate, or SMM legacy support is off). Capped so a stuck
+/// key cannot flood the 64 KiB ring; and the framebuffer never shows it, because
+/// `set_fb_quiet` keeps diagnostics off the TV while the shell is up.
+fn log_scancode(sc: u8) {
+    if SCANCODES_SEEN.fetch_add(1, Ordering::Relaxed) < SCANCODE_LOG_CAP {
+        crate::serial::puts("[kbd] sc=0x");
+        crate::serial::put_hexn(u64::from(sc), 2);
+        crate::serial::puts("\n");
+    }
+}
+
+/// Polls between heartbeat lines, and how many lines in all.
+const HEARTBEAT_EVERY: u32 = 1500;
+const HEARTBEAT_LINES: u32 = 12;
+
+static POLLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static STATUS_OR: AtomicU8 = AtomicU8::new(0);
+
+/// Passive proof of life for the polling loop, for `dmesg`.
+///
+/// "No `[kbd]` scancode lines" has two very different causes: the controller
+/// never has data (the firmware's emulation is not running on this boot), or the
+/// loop that should read it is not running at all. This separates them: `polls`
+/// is how many times this ran, `st` the status byte it just read, and `or` the OR
+/// of **every** status byte seen so far — bit 0 (`output full`) ever set means
+/// bytes did arrive, and any bit other than the idle ones moving means the
+/// controller is live. Read-only: no command is sent. Capped, and off the TV
+/// like all diagnostics (`serial::set_fb_quiet`).
+fn heartbeat() {
+    let st = status();
+    STATUS_OR.fetch_or(st, Ordering::Relaxed);
+    let n = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(HEARTBEAT_EVERY) && n / HEARTBEAT_EVERY <= HEARTBEAT_LINES {
+        crate::serial::puts("[kbd] polls=");
+        crate::serial::put_dec(u64::from(n));
+        crate::serial::puts(" st=0x");
+        crate::serial::put_hexn(u64::from(st), 2);
+        crate::serial::puts(" or=0x");
+        crate::serial::put_hexn(u64::from(STATUS_OR.load(Ordering::Relaxed)), 2);
+        crate::serial::puts(" scancodes=");
+        crate::serial::put_dec(u64::from(SCANCODES_SEEN.load(Ordering::Relaxed)));
+        crate::serial::puts("\n");
+    }
+}
+
 /// Pull scancodes off the controller until one decodes to a byte, or the
 /// buffer is empty.
 fn pump() -> Option<u8> {
+    heartbeat();
     for _ in 0..64 {
         let st = status();
         if st & STS_OUTPUT_FULL == 0 {
@@ -233,6 +291,7 @@ fn pump() -> Option<u8> {
         if st & STS_FROM_AUX != 0 {
             continue; // the mouse; not ours
         }
+        log_scancode(sc);
         if let Some(c) = decode(sc) {
             return Some(c);
         }

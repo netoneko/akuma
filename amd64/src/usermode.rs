@@ -2586,6 +2586,14 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     // Fault-safe since 2026-09-05: a bad `buf` is EFAULT, not a halt. Chunked
     // through a stack buffer so the copy is one `rep movsb` per 256 bytes rather
     // than a recovered fault per byte, and so nothing here allocates.
+    //
+    // **Who is talking decides whether the TV sees it.** While a console shell
+    // owns the framebuffer (`serial::set_fb_quiet`), pid 1 — `herd`, whose
+    // `[herd] Started …` lines are supervisor chatter — is held to `dmesg`, and
+    // everything else on the console channel (the shell and what it runs) is
+    // shown. When no shell is running nothing is quiet and both paths are the
+    // same, so `init=/bin/sh` still prints.
+    let to_tv = current_pid() != 1;
     let mut chunk = [0u8; 256];
     let mut done = 0u64;
     while done < len {
@@ -2594,7 +2602,11 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
             return if done == 0 { EFAULT } else { done };
         }
         for &byte in &chunk[..n] {
-            serial::putb(byte);
+            if to_tv {
+                serial::putb_tty(byte);
+            } else {
+                serial::putb(byte);
+            }
         }
         done += n as u64;
     }
@@ -5381,6 +5393,11 @@ pub fn sys_spawn(
     // `ChildStdout(pid)` arm (this file's `child_pipe_set_winsize` shim existed
     // only because a `PipeRead` does not name a child), and `close(2)` drops the
     // child-channel registration through glue's own arm.
+    // The console shell exists, so the framebuffer is its now: from here the TV
+    // shows the shell and not the kernel's diagnostics (`serial::FB_QUIET`).
+    if console {
+        serial::set_fb_quiet(true);
+    }
     let stdout_fd = crate::fd::install_child_stdout(pid);
     if crate::fd::errno::is_err(stdout_fd) {
         // The child is already running; it will just write into a channel nobody
@@ -8254,6 +8271,17 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // console checks (`fd::console_nonblock_test`) are written against an idle
     // line — starting it there would add a second reader of the hardware for no
     // gain, since no test types.
+    // The USB keyboard, if the xHCI controller is up (a USB root disk, or the
+    // `usb` flag): enumerate it before the pump starts reading input, so the
+    // first lap already has a keyboard. A failure costs the keyboard only — the
+    // log says which step, and the serial console still works.
+    if crate::xhci::is_initialized()
+        && let Err(e) = crate::xhci::init_keyboard()
+    {
+        serial::puts("  [init] no USB keyboard: ");
+        serial::puts(e);
+        serial::puts("\n");
+    }
     if !crate::console::spawn_pump() {
         serial::puts("  [init] WARNING: no task slot for the console pump — the console will not deliver input\n");
     }

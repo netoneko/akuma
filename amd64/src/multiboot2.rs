@@ -190,7 +190,22 @@ unsafe impl Send for FbConsole {}
 pub fn mirror_byte(byte: u8) {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.0.write_byte(byte);
+    } else if FB_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: port 0xE9 is QEMU's `isa-debugcon` and nothing on real PC
+        // hardware; the flag that gets us here is a development one.
+        unsafe { crate::port::outb(0xE9, byte) };
     }
+}
+
+/// Where the bytes the framebuffer **would** get go when there is no
+/// framebuffer: QEMU's debug port, so a PVH boot (which has none) can show what
+/// the quiet policy lets through (`serial::set_fb_quiet`). Set by the `fbtrace`
+/// boot flag; `FBTRACE=<file> sh amd64/run.sh` wires the other end.
+static FB_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turn the `fbtrace` stand-in on. See [`FB_TRACE`].
+pub fn set_fb_trace(on: bool) {
+    FB_TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Draw the framebuffer console's cursor, if there is a framebuffer console.
@@ -577,6 +592,9 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
             crate::net::enable_probe();
         }
     }
+    // `fbverbose`: keep diagnostics on the TV even with a console shell, for
+    // debugging a hang on the metal. See `serial::set_fb_quiet`.
+    crate::serial::set_fb_verbose(cmdline.split_ascii_whitespace().any(|t| t == "fbverbose"));
 
     if run_shell {
         let path = init_path(cmdline);
@@ -612,7 +630,7 @@ fn init_path(cmdline: &str) -> &str {
 /// Bring up the xHCI + USB mass-storage stack, sanity-check `/dev/sda`'s MBR,
 /// and mount `sda1` as the root filesystem. `false` on any failure — the caller
 /// falls back to the RAM image.
-fn try_usb_root() -> bool {
+pub fn try_usb_root() -> bool {
     if let Err(e) = crate::xhci::init() {
         serial::puts("  fs:   xHCI/USB disk: ");
         serial::puts(e);

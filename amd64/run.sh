@@ -154,6 +154,10 @@ if [ "$DISK" != "none" ]; then
     fi
     CMDLINE="virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 init=$INIT"
     [ -n "$INITARGS" ] && CMDLINE="$CMDLINE initargs=$INITARGS"
+    # FBTRACE=<file> sends what the framebuffer WOULD show to <file> (QEMU's
+    # port-0xE9 debug console): this machine has no framebuffer, and without
+    # one the console's quiet policy (`serial::set_fb_quiet`) is unobservable.
+    [ -n "$FBTRACE" ] && CMDLINE="$CMDLINE fbtrace"
     # STRACE=1 prints every syscall the init program makes — a bring-up aid.
     [ -n "$STRACE" ] && CMDLINE="$CMDLINE strace"
 fi
@@ -178,6 +182,7 @@ exec qemu-system-x86_64 \
     $NIC \
     ${CMDLINE:+-append "$CMDLINE"} \
     $GDB_ARGS \
+    ${FBTRACE:+-chardev file,id=fbtrace,path=$FBTRACE -device isa-debugcon,iobase=0xe9,chardev=fbtrace} \
     -serial mon:stdio \
     -display none \
     -no-reboot \

@@ -25,6 +25,7 @@ is `NO BOOT`, never a pass.
 import argparse
 import os
 import select
+import socket
 import subprocess
 import sys
 import time
@@ -47,20 +48,153 @@ CASES = [
 INTERRUPT = ("sleep 100", "echo AFT""ER-INT", "AFTER-INT")
 
 
+def usb_command(repo, mon_path, fbtrace):
+    """The q35 + xHCI command line, after building the kernel and a USB disk.
+
+    The disk is `amd64/mkdisk.sh`'s raw ext2 image behind a 1 MiB MBR gap with
+    partition 1 at LBA 2048 — the layout `xhci::mbr_looks_right` demands, i.e.
+    the trashcan's. The USB disk is declared **before** the keyboard so it lands
+    on the lower root-hub port: `find_and_reset_port` takes the first connected
+    port, and a keyboard there would be tried as the disk.
+    """
+    subprocess.run(["cargo", "build", "-p", "akuma-amd64", "--target", "x86_64-unknown-none", "--release"],
+                   cwd=repo, check=True)
+    ext2 = os.path.join(repo, "target/x86_64-unknown-none/release/amd64-root.img")
+    subprocess.run(["sh", "amd64/mkdisk.sh", ext2, "128"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+    usb = os.path.join(repo, "target/x86_64-unknown-none/release/amd64-usb.img")
+    with open(ext2, "rb") as f:
+        body = f.read()
+    mbr = bytearray(512)
+    mbr[446 + 4] = 0x83                                   # Linux
+    mbr[446 + 8:446 + 12] = (2048).to_bytes(4, "little")  # start LBA
+    mbr[446 + 12:446 + 16] = (len(body) // 512).to_bytes(4, "little")
+    mbr[510:512] = b"\x55\xaa"
+    with open(usb, "wb") as f:
+        f.write(mbr)
+        f.write(b"\0" * (2048 * 512 - 512))
+        f.write(body)
+    kernel = os.path.join(repo, "target/x86_64-unknown-none/release/akuma-amd64")
+    return [
+        "qemu-system-x86_64", "-M", "q35,i8042=off", "-cpu", "max", "-m", "2048", "-smp", "1",
+        "-kernel", kernel, "-append", "init=/bin/herd pci usbroot fbtrace",
+        "-device", "qemu-xhci,id=xhci",
+        "-drive", f"id=u0,file={usb},if=none,format=raw",
+        "-device", "usb-storage,bus=xhci.0,drive=u0",
+        "-device", "usb-kbd,bus=xhci.0",
+        "-chardev", f"file,id=fbtrace,path={fbtrace}",
+        "-device", "isa-debugcon,iobase=0xe9,chardev=fbtrace",
+        "-serial", "mon:stdio", "-display", "none", "-no-reboot",
+        "-monitor", f"unix:{mon_path},server,nowait",
+    ]
+
+
+def run_kbd(args, mon_path, buf, pump, wait_for) -> int:
+    """Type with `sendkey` and require the shell to answer.
+
+    Every key goes through QEMU's emulated i8042 as a set-1 scancode, so what is
+    exercised is `kbd.rs`'s decode (shift, ctrl, backspace) and the console pump —
+    the part of the real keyboard path that does not depend on firmware.
+    """
+    time.sleep(1)
+    mon = socket.socket(socket.AF_UNIX)
+    mon.connect(mon_path)
+    mon.settimeout(2)
+    try:
+        mon.recv(4096)
+    except OSError:
+        pass
+
+    def keys(*names):
+        for n in names:
+            mon.sendall(f"sendkey {n}\n".encode())
+            time.sleep(0.15)
+            try:
+                mon.recv(4096)
+            except OSError:
+                pass
+
+    def text(t):
+        out = []
+        for ch in t:
+            out.append({" ": "spc", "$": "shift-4", "(": "shift-9", ")": "shift-0",
+                        "*": "shift-8", "-": "minus"}.get(ch, ch))
+        keys(*out)
+
+    failures = 0
+
+    def expect(label, marker, budget=40):
+        nonlocal failures
+        ok = wait_for(marker, budget, mark) >= 0
+        print(f"  {'ok  ' if ok else 'FAIL'}  {label}")
+        failures += 0 if ok else 1
+
+    # `$((6*7))` — the typed line cannot contain 42, so only the shell can print it.
+    mark = len(buf)
+    text("echo $((6*7))")
+    keys("ret")
+    expect("typed `echo $((6*7))` on the keyboard -> 42", b"\n42")
+    # Backspace (0x7f): type 99, erase both, type 5*9 -> 45.
+    mark = len(buf)
+    text("echo $((99")
+    keys("backspace", "backspace")
+    text("5*9))")
+    keys("ret")
+    expect("Backspace erases (echo $((99<BS><BS>5*9)) -> 45)", b"\n45")
+    # ^C: sleep 100, interrupt, then a command must still run.
+    mark = len(buf)
+    text("sleep 100")
+    keys("ret")
+    time.sleep(3)
+    keys("ctrl-c")
+    time.sleep(1)
+    text("echo $((6*8))")
+    keys("ret")
+    expect("Ctrl-C interrupts sleep 100 and the shell survives -> 48", b"\n48")
+    raw = bytes(buf)
+    print(f"  info  [kbd] scancode lines in the serial log: {raw.count(b'[kbd] sc=')}")
+    print("RESULT:", "PASS" if failures == 0 else f"FAIL ({failures})")
+    return 0 if failures == 0 else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default="/tmp/amd64-console-probe.log")
     ap.add_argument("--boot-timeout", type=int, default=600)
     ap.add_argument("--cmd-timeout", type=int, default=60)
     ap.add_argument("--ready", default="-- running ", help="line that means init started")
+    ap.add_argument("--kbd", action="store_true",
+                    help="type through an emulated i8042 (QEMU `sendkey`) instead of the serial port: "
+                         "exercises kbd.rs scancode decode + the pump, not the firmware")
+    ap.add_argument("--usb", action="store_true",
+                    help="boot q35 with a USB root disk and a USB keyboard (qemu-xhci), the way the "
+                         "trashcan boots; implies --kbd. Exercises the native xHCI keyboard driver")
     ap.add_argument("--settle", type=float, default=8.0, help="seconds to let init print before typing")
     args = ap.parse_args()
 
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     env = dict(os.environ)
     env.setdefault("INIT", "/bin/herd")
+    # What the framebuffer would show, via QEMU's port-0xE9 debug console (this
+    # machine has no framebuffer; see `serial::set_fb_quiet`).
+    fbtrace = args.log + ".fbtrace"
+    if os.path.exists(fbtrace):
+        os.remove(fbtrace)
+    env["FBTRACE"] = fbtrace
+    if args.usb:
+        args.kbd = True
+    extra = []
+    # AF_UNIX paths are capped near 104 bytes, so not next to the log.
+    mon_path = f"/tmp/akmon{os.getpid()}.sock"
+    if args.kbd:
+        if os.path.exists(mon_path):
+            os.remove(mon_path)
+        extra = ["-device", "i8042", "-monitor", f"unix:{mon_path},server,nowait"]
+    if args.usb:
+        cmd = usb_command(repo, mon_path, fbtrace)
+    else:
+        cmd = ["sh", "amd64/run.sh", *extra]
     p = subprocess.Popen(
-        ["sh", "amd64/run.sh"], cwd=repo, env=env,
+        cmd, cwd=repo, env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     log = open(args.log, "wb")
@@ -98,6 +232,8 @@ def main() -> int:
         while pump(0.5):
             pass
         failures = 0
+        if args.kbd:
+            return run_kbd(args, mon_path, buf, pump, wait_for)
         for line, marker in CASES:
             mark = len(buf)
             p.stdin.write(line.encode().decode("unicode_escape").encode("latin1") + b"\r")
@@ -127,9 +263,38 @@ def main() -> int:
         ok = wait_for(marker.encode(), args.cmd_timeout, mark) >= 0
         print(f"  {'ok  ' if ok else 'FAIL'}  ^C interrupts `{job}` and the shell survives")
         failures += 0 if ok else 1
+        # The TV filter. herd prints `[herd] Reloading config...` every 20 s, so
+        # wait for one more after the prompt: it must be in the serial log (it
+        # is what there is to hide) and absent from what the "TV" received.
+        # Everything the shell printed must be on the TV.
+        start = len(buf)
+        wait_for(b"[herd] Reloading config", 45, start)
+        time.sleep(1)
+        while pump(0.3):
+            pass
+        tv = open(fbtrace, "rb").read()
+        prompt = tv.find(b"/ # ")
+        after = tv[prompt:] if prompt >= 0 else b""
+        serial_after = bytes(buf[buf.find(b"/ # "):]) if b"/ # " in buf else b""
+        ok = prompt >= 0
+        print(f"  {'ok  ' if ok else 'FAIL'}  TV received the shell prompt")
+        failures += 0 if ok else 1
+        ok = b"[herd] Reloading config" in serial_after
+        print(f"  {'ok  ' if ok else 'FAIL'}  control: serial log has herd chatter after the prompt")
+        failures += 0 if ok else 1
+        for tag in (b"[herd]", b"[BKL]", b"[bkls>]", b"[PSTATS]", b"[probe]"):
+            ok = tag not in after
+            print(f"  {'ok  ' if ok else 'FAIL'}  TV has no {tag.decode()} after the prompt")
+            failures += 0 if ok else 1
+        for m in (b"AKUMAPROBE42", b"GOODX", b"AFTER-INT"):
+            ok = m in after
+            print(f"  {'ok  ' if ok else 'FAIL'}  TV shows shell output {m.decode()}")
+            failures += 0 if ok else 1
         print("RESULT:", "PASS" if failures == 0 else f"FAIL ({failures})")
         return 0 if failures == 0 else 1
     finally:
+        if args.kbd and os.path.exists(mon_path):
+            os.remove(mon_path)
         p.terminate()
         try:
             p.wait(timeout=10)

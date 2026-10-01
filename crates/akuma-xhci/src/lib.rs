@@ -108,3 +108,72 @@ impl Speed {
         }
     }
 }
+
+/// The xHCI **Interval** field for an interrupt endpoint (xHCI §6.2.3.6): the
+/// endpoint is polled every `2^value` microframes of 125 µs.
+///
+/// It is not the descriptor's `bInterval`, and the conversion is where an
+/// interrupt endpoint most often goes wrong silently — a device that answers
+/// 125 µs polls works and burns bandwidth, one given a 1-second interval works
+/// and feels broken.
+///
+/// * **Low/Full speed**: `bInterval` is milliseconds (frames), so the period is
+///   `bInterval * 8` microframes, rounded **down** to a power of two and
+///   clamped to 3..=10 (1 ms .. 128 ms), as Linux does.
+/// * **High/Super speed**: `bInterval` is already an exponent, `2^(bInterval-1)`
+///   microframes, so the field is `bInterval - 1`, clamped to 0..=15.
+///
+/// A `bInterval` of 0 (illegal for interrupt) is treated as 1.
+#[must_use]
+pub fn interrupt_interval(speed: Speed, b_interval: u8) -> u8 {
+    let b = b_interval.max(1);
+    match speed {
+        Speed::Low | Speed::Full => {
+            let micro = u32::from(b) * 8;
+            let exp = 31 - micro.leading_zeros();
+            exp.clamp(3, 10) as u8
+        }
+        Speed::High | Speed::Super => (b - 1).min(15),
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    #[test]
+    fn full_speed_one_ms_is_eight_microframes() {
+        assert_eq!(interrupt_interval(Speed::Full, 1), 3);
+    }
+
+    #[test]
+    fn full_speed_rounds_down_to_a_power_of_two() {
+        // 10 ms = 80 microframes -> 64 (2^6), not 128.
+        assert_eq!(interrupt_interval(Speed::Full, 10), 6);
+        assert_eq!(interrupt_interval(Speed::Full, 8), 6);
+        assert_eq!(interrupt_interval(Speed::Full, 16), 7);
+    }
+
+    #[test]
+    fn full_speed_is_clamped_to_the_spec_range() {
+        assert_eq!(interrupt_interval(Speed::Full, 255), 10);
+        assert_eq!(interrupt_interval(Speed::Low, 255), 10);
+        assert_eq!(interrupt_interval(Speed::Full, 0), 3, "0 is illegal; treated as 1");
+    }
+
+    #[test]
+    fn high_speed_is_already_an_exponent() {
+        assert_eq!(interrupt_interval(Speed::High, 1), 0);
+        assert_eq!(interrupt_interval(Speed::High, 4), 3);
+        assert_eq!(interrupt_interval(Speed::High, 16), 15);
+        assert_eq!(interrupt_interval(Speed::Super, 255), 15);
+    }
+
+    #[test]
+    fn a_full_speed_keyboard_polls_at_least_every_128_ms() {
+        for b in 1..=255u8 {
+            let e = interrupt_interval(Speed::Full, b);
+            assert!((3..=10).contains(&e), "bInterval {b} -> {e}");
+        }
+    }
+}
