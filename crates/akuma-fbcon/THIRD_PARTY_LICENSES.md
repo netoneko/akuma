@@ -17,6 +17,7 @@ advertising clause; Apache-2.0 patent terms are not triggered because MIT is cho
 | [`unicode-width`](https://github.com/unicode-rs/unicode-width) | 0.2.2 | MIT OR Apache-2.0 | Display width of a character (0, 1 or 2 columns). |
 | [`arrayvec`](https://github.com/bluss/arrayvec) | 0.7.8 | MIT OR Apache-2.0 | Fixed-capacity vector `vte` uses for its OSC buffer (no allocation). |
 | [`memchr`](https://github.com/BurntSushi/memchr) | 2.8.3 | Unlicense OR MIT | Byte search `vte` uses to skip plain text. |
+| [Noto Emoji](https://github.com/googlefonts/noto-emoji) images | commit e20cbc2 | Apache-2.0 (image resources); OFL-1.1 (the repository's root `LICENSE`, for the fonts) | The ~650 colour emoji the console draws (`vendor/noto-emoji/`). **Modified**: downscaled to 24x24 and quantised to RGBA4444. |
 
 ## vte 0.15.0 — LICENSE-MIT
 
@@ -133,3 +134,29 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
+
+## Noto Emoji images (vendored data, not a crate)
+
+`vendor/noto-emoji/` holds a downscaled subset of Google's Noto Emoji PNGs
+(`emoji-24.index`, `emoji-24.rgba4444`; regenerate with `scripts/bake_emoji.py`).
+Provenance, the exact upstream commit, and the list of emoji requested but absent
+upstream are in `vendor/noto-emoji/PROVENANCE.txt`.
+
+**Licence.** The upstream repository is ambiguous: its README says the image
+resources are Apache-2.0 and links `./LICENSE`, but the root `LICENSE` is the SIL
+Open Font License 1.1 (for the fonts), and the Apache text sits in `2D/svg/LICENSE`.
+Both texts are shipped beside the data (`LICENSE-APACHE-2.0.txt`,
+`LICENSE-OFL-1.1.txt`) so that either reading is satisfied; both are permissive and
+compatible with this project's BSD-2-Clause. As Apache-2.0 section 4 requires, the
+files carry this notice that they were **changed** (resized from 128x128 to 24x24 and
+quantised), and the upstream notice is kept:
+
+```text
+Copyright 2013 Google, Inc. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+```
+
+(`vendor/noto-emoji/NOTICE-APACHE-HEADER.txt` is the upstream header verbatim.)

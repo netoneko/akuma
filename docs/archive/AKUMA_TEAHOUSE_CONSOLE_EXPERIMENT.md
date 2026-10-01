@@ -391,3 +391,11 @@ draft, at 2228 bytes, was refused `TooLong`.
   tests (23 new this round). **Not verified on the real TV at the time of writing**:
   glyph quality, late.sh itself, and the pump delivering replies — QEMU has no
   framebuffer, so the draw path is tested on the host and the wiring by `fbtrace`.
+- 2026-10-01 night — **late.sh looks right; emoji next.** The user's second TV
+  photo: frames close, colours and the selected-message highlight render, nothing
+  overlaps; "half screen works great" (`/etc/console.conf`: `margin = 0`,
+  `cols = 50%`). Remaining: emoji were outlined boxes. Added ~650 colour emoji
+  (Noto Emoji, 24x24 RGBA4444, 758 KB, kernel 3.95 -> 4.71 MB), a bilinear scaler,
+  and sequence handling (VS16, ZWJ, skin tones). **Licence caveat recorded:** the
+  Noto repository's README says the images are Apache-2.0 but its root LICENSE is the
+  OFL; both texts ship with the data. 141 fbcon host tests. Not yet seen on the TV.

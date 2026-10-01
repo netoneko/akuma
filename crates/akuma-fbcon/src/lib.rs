@@ -59,6 +59,7 @@
 
 pub mod config;
 pub mod console;
+pub mod emoji;
 pub mod font;
 pub mod glyph;
 pub mod format;

@@ -1,0 +1,14 @@
+Noto Emoji images, downscaled by scripts/bake_emoji.py (MODIFIED: resized from
+128x128 to 24x24 and quantised to RGBA4444).
+
+Source:  https://github.com/googlefonts/noto-emoji  commit e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e
+Path:    2D/png/128/emoji_uXXXX.png
+Licence: Apache License 2.0 (LICENSE-APACHE-2.0.txt; the repository's own header notice is NOTICE-APACHE-HEADER.txt, from 2D/svg/LICENSE,
+         which covers the image resources), (c) Google LLC.
+         NOTE: the repository's README says "Tools and most image resources are under the
+         Apache license" and links ./LICENSE, but the root LICENSE is the SIL OFL 1.1 (for the
+         fonts); GitHub reports the repository as OFL-1.1. The two texts are both shipped here
+         (LICENSE-APACHE-2.0.txt, LICENSE-OFL-1.1.txt) so that either reading is satisfied.
+         Both are permissive and compatible with this project's BSD-2-Clause. Changes made:
+         downscaled to 24x24 and quantised to RGBA4444 (Apache-2.0 section 4(b)).
+Count:   658 emoji; 5 requested but absent upstream: U+1F394, U+1F395, U+1F398, U+1F39C, U+1F39D

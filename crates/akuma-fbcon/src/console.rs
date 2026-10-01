@@ -9,6 +9,7 @@
 use core::fmt;
 
 use crate::font::{self, Font};
+use crate::emoji;
 use crate::glyph;
 use crate::{Rgb, Surface};
 
@@ -95,6 +96,11 @@ const F_BG: u8 = 32;
 const CONT: u16 = 0xFFFF; // the right half of a two-column character
 const TOFU: u16 = 0xFFFD; // a character that cannot be stored (invalid UTF-8)
 const TOFU_WIDE: u16 = 0xFFFE; // one beyond the BMP and two columns wide (emoji)
+/// A cell holding emoji picture `n` stores `EMOJI_BASE + n` as its code point. The
+/// surrogate range is used because it can never be a real character (the parser
+/// never yields one), so no text can collide with it; there is room for 2048.
+const EMOJI_BASE: u16 = 0xD800;
+const _: () = assert!(emoji::count() <= 0x800, "more emoji than the surrogate range holds");
 
 /// One screen cell: what is shown, and the colours and flags it is shown in.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -239,6 +245,13 @@ pub struct Console<S: Surface> {
     /// The grid changed size under the program (a new margin); see
     /// [`Console::take_geometry`].
     geometry_dirty: bool,
+    /// Where the last character went, and whether it was an emoji picture — what an
+    /// emoji *sequence* (VS16, ZWJ, a skin-tone modifier) is glued to.
+    last_cell: Option<(usize, usize)>,
+    last_emoji: bool,
+    /// A zero-width joiner was just seen: the emoji after it joins the previous one
+    /// and is not drawn.
+    swallow: bool,
 }
 
 impl<S: Surface> Console<S> {
@@ -313,6 +326,9 @@ impl<S: Surface> Console<S> {
             reply: [0; REPLY_CAP],
             reply_len: 0,
             geometry_dirty: false,
+            last_cell: None,
+            last_emoji: false,
+            swallow: false,
         })
     }
 
@@ -1048,7 +1064,11 @@ impl<S: Surface> Console<S> {
     /// two-column character as U+FFFF.
     #[must_use]
     pub fn cell_at(&self, row: usize, col: usize) -> char {
-        char::from_u32(u32::from(self.grid[row][col].cp)).unwrap_or('\u{FFFD}')
+        let cp = self.grid[row][col].cp;
+        // An emoji picture reads back as the emoji it is.
+        let n = usize::from(cp.wrapping_sub(EMOJI_BASE));
+        let real = if n < emoji::count() { emoji::codepoint(n) } else { u32::from(cp) };
+        char::from_u32(real).unwrap_or('\u{FFFD}')
     }
 
     /// Write a string.
@@ -1115,6 +1135,26 @@ impl<S: Surface> Console<S> {
     /// character the console cannot store (beyond the BMP) is kept as a marker so
     /// it still occupies the right number of columns.
     fn put_cp(&mut self, cp: u32) {
+        // Emoji sequences are one picture two columns wide, however many code
+        // points spell them: a program lays its frame out for that, so the console
+        // must take the same space — and not draw the pieces separately.
+        match cp {
+            // ZWJ: the emoji after it is part of the one before.
+            0x200D => {
+                self.swallow = self.last_emoji;
+                return;
+            }
+            // VS16: the character before it asks for its emoji form (`❤` -> `❤️`).
+            0xFE0F => return self.emoji_presentation(),
+            // A skin-tone modifier is part of the emoji before it.
+            0x1F3FB..=0x1F3FF if self.last_emoji => return,
+            _ => {}
+        }
+        if core::mem::take(&mut self.swallow)
+            && (emoji::index_of(cp).is_some() || glyph::width(cp) == 2)
+        {
+            return;
+        }
         let w = glyph::width(cp);
         if w == 0 {
             return;
@@ -1133,7 +1173,11 @@ impl<S: Surface> Console<S> {
         if w == 2 {
             self.detach_wide(row, col + 1);
         }
-        let stored = if cp > 0xFFFE {
+        // A two-column character with a baked picture is stored as that picture.
+        let picture = emoji::index_of(cp).filter(|_| w == 2);
+        let stored = if let Some(i) = picture {
+            EMOJI_BASE + i as u16
+        } else if cp > 0xFFFE {
             if w == 2 { TOFU_WIDE } else { TOFU }
         } else {
             cp as u16
@@ -1147,6 +1191,28 @@ impl<S: Surface> Console<S> {
         self.paint(row, col, false);
         self.col += w;
         self.last_cp = cp;
+        self.last_cell = Some((row, col));
+        self.last_emoji = picture.is_some();
+    }
+
+    /// VS16 after a narrow character that has an emoji picture: widen it into the
+    /// picture, two columns, and move the cursor past it. Anything else (no picture,
+    /// already wide, the cursor moved since, no room) is left alone.
+    fn emoji_presentation(&mut self) {
+        let Some((row, col)) = self.last_cell else { return };
+        let cell = self.grid[row][col];
+        let Some(i) = emoji::index_of(u32::from(cell.cp)) else { return };
+        if self.row != row || self.col != col + 1 || col + 1 >= self.vcols {
+            return;
+        }
+        self.detach_wide(row, col + 1);
+        self.grid[row][col].cp = EMOJI_BASE + i as u16;
+        let mut right = self.grid[row][col];
+        right.cp = CONT;
+        self.grid[row][col + 1] = right;
+        self.paint(row, col, false);
+        self.col = col + 2;
+        self.last_emoji = true;
     }
 
     /// Before overwriting `(row, col)`: if it is half of a two-column character,
@@ -1278,6 +1344,13 @@ impl<S: Surface> Console<S> {
         let y0 = self.origin_y + row * ch;
         let span = if wide { 2 * cw } else { cw };
 
+        // An emoji picture, two cells wide.
+        let marker = cp.wrapping_sub(u32::from(EMOJI_BASE));
+        if wide && (marker as usize) < emoji::count() {
+            self.draw_emoji(x0, y0, span, ch, marker as usize, bg);
+            return;
+        }
+
         // A character wider than one cell has no glyph here: an outlined box over
         // both cells, so the layout stays right and the gap is visible.
         if wide || cp == u32::from(TOFU_WIDE) {
@@ -1342,6 +1415,22 @@ impl<S: Surface> Console<S> {
                 }
             }
         }
+    }
+
+    /// Draw emoji picture `idx` into the `span` x `ch` box at `(x0, y0)`: the
+    /// background, then the picture, square and centred, smoothly scaled and blended
+    /// onto it.
+    fn draw_emoji(&mut self, x0: usize, y0: usize, span: usize, ch: usize, idx: usize, bg: Rgb) {
+        self.surface.fill(x0, y0, span, ch, bg);
+        let side = span.min(ch);
+        let (ox, oy) = (x0 + (span - side) / 2, y0 + (ch - side) / 2);
+        let surface = &mut self.surface;
+        emoji::paint(idx, side, side, &mut |x, y, [r, g, b], a| {
+            if a > 0 {
+                let c = Rgb::new(r, g, b);
+                surface.put(ox + x, oy + y, if a == 255 { c } else { bg.blend(c, a) });
+            }
+        });
     }
 
     /// Give the surface back.

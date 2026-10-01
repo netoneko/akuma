@@ -99,7 +99,8 @@ anything beyond cursor-left/erase was drawn as text.
 | colour | SGR: 16, 256-colour and truecolor (stored as the nearest palette entry), bold, dim, underline, reverse; erase keeps the background |
 | editing | cursor addressing, erase line/screen/characters, insert/delete characters and lines, scroll regions, scroll up/down, repeat, save/restore cursor, the alternate screen (cleared on entry and exit — the old screen is not kept) |
 | replies | cursor position (`CSI 6 n`), device attributes (`CSI c`), foreground/background colour queries — typed back into the program by the console pump, so busybox no longer waits at every prompt and a TUI learns the colours |
-| not drawn | colour emoji (a two-column outlined box), Cyrillic/Greek/CJK glyphs (width is right, the glyph is a box), combining accents |
+| emoji | ~650 colour emoji (Noto Emoji, downscaled to 24x24 and drawn smoothly into their two cells): faces, hands, hearts, symbols, animals, food, objects, coloured circles and squares. Sequences are one picture two columns wide — `❤️` (VS16), skin tones and `ZWJ` joins collapse into the base emoji, so a frame laid out for the sequence's width stays aligned. One *not* in the baked set shows as an outlined two-column box (the layout stays right). Add one by editing `WANT` in `crates/akuma-fbcon/scripts/bake_emoji.py` and re-running it |
+| not drawn | Cyrillic/Greek/CJK glyphs (width is right, the glyph is a box), combining accents, flags, and emoji outside the baked set |
 
 **Crates.** Two crates do the parts that should not be hand-written (adopted
 2026-10-01, replacing a first hand-rolled parser and width table):
