@@ -47,7 +47,19 @@ use spinning_top::Spinlock;
 use akuma_exec::process::ProcessChannel;
 use akuma_terminal::TerminalState;
 
-/// The console's `ProcessChannel`: keyboard bytes in `stdin_buffer`, the line
+/// Tell the console's line discipline how big the screen is, in `(rows, cols)`.
+///
+/// What `TIOCGWINSZ` then answers for every console-attached process — see
+/// `multiboot2::fb_grid`. A no-op before [`init`].
+pub fn set_size(rows: u16, cols: u16) {
+    if let Some(term) = terminal_state() {
+        let mut ts = term.lock();
+        ts.term_height = rows;
+        ts.term_width = cols;
+    }
+}
+
+/// The console channel, or `None` before [`init`].: keyboard bytes in `stdin_buffer`, the line
 /// discipline's echo in `buffer`.
 ///
 /// `None` until [`init`], which `boot::wire_console_and_syscalls` calls at the

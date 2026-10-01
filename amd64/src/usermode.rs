@@ -8271,6 +8271,14 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // console checks (`fd::console_nonblock_test`) are written against an idle
     // line — starting it there would add a second reader of the hardware for no
     // gain, since no test types.
+    // The screen's real size into the console's terminal state (so `stty size`
+    // and every program asking `TIOCGWINSZ` see the framebuffer grid, not a
+    // default 24x80), and the one-line geometry summary at the end of the boot
+    // log. No framebuffer (PVH, serial) leaves the 24x80 default alone.
+    if let Some((rows, cols)) = crate::multiboot2::fb_grid() {
+        crate::console::set_size(rows, cols);
+        crate::multiboot2::fb_summary();
+    }
     // The USB keyboard, if the xHCI controller is up (a USB root disk, or the
     // `usb` flag): enumerate it before the pump starts reading input, so the
     // first lap already has a keyboard. A failure costs the keyboard only — the

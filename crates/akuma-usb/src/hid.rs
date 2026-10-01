@@ -326,15 +326,23 @@ impl BootReport {
 
 /// Turns a stream of boot reports into a stream of typed bytes.
 ///
-/// Emits on the key-down edge only: a key present in this report but not the
-/// last one. A held key does not repeat — key repeat, if ever wanted, is a
-/// timer layered on top, the same division of labour `kbd.rs` leaves to the
-/// PS/2 keyboard's own hardware repeat. Caps Lock is tracked here because the
-/// host, not the keyboard, owns that state under the boot protocol.
+/// Emits on the key-down edge: a key present in this report but not the last
+/// one. Navigation keys emit their escape sequence ([`keymap::usage_to_sequence`]),
+/// so one press can be several bytes. **A USB boot keyboard does not repeat a
+/// held key** (the PS/2 one did, in hardware), so the decoder remembers the last
+/// key pressed and [`BootKeyboardDecoder::repeat`] re-emits it; *when* to call it
+/// is the caller's clock — this crate has none. Caps Lock is tracked here because
+/// the host, not the keyboard, owns that state under the boot protocol.
 #[derive(Debug, Clone)]
 pub struct BootKeyboardDecoder {
     prev_keys: [u8; 6],
     caps: bool,
+    mods: u8,
+    /// Usage of the most recent key that produced output and is still down, or 0.
+    held: u8,
+    /// Bumped on every new press that produced output, so a caller can restart
+    /// its repeat-delay timer without comparing key codes.
+    press_seq: u32,
 }
 
 impl Default for BootKeyboardDecoder {
@@ -346,7 +354,7 @@ impl Default for BootKeyboardDecoder {
 impl BootKeyboardDecoder {
     #[must_use]
     pub const fn new() -> Self {
-        Self { prev_keys: [0; 6], caps: false }
+        Self { prev_keys: [0; 6], caps: false, mods: 0, held: 0, press_seq: 0 }
     }
 
     #[must_use]
@@ -354,16 +362,53 @@ impl BootKeyboardDecoder {
         self.caps
     }
 
-    /// Feed one report; `emit` is called, in key-slot order, with the ASCII
-    /// byte of each newly-pressed key that maps to one.
+    /// Is a key that would repeat currently held?
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.held != 0
+    }
+
+    /// Changes whenever a new key press produces output; see the field.
+    #[must_use]
+    pub fn press_seq(&self) -> u32 {
+        self.press_seq
+    }
+
+    /// Emit the bytes one key produces. `true` if it produced any.
+    fn emit_key(usage: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
+        if let Some(seq) = keymap::usage_to_sequence(usage) {
+            for &b in seq {
+                emit(b);
+            }
+            return true;
+        }
+        let shift = mods & keymap::MOD_SHIFT != 0;
+        let ctrl = mods & keymap::MOD_CTRL != 0;
+        if let Some(c) = keymap::usage_to_ascii(usage, shift, ctrl, caps) {
+            emit(c);
+            return true;
+        }
+        false
+    }
+
+    /// Re-emit the held key, with the modifiers held *now*. Nothing if no key
+    /// that produces output is down — a held Shift alone never repeats.
+    pub fn repeat(&self, mut emit: impl FnMut(u8)) {
+        if self.held != 0 {
+            Self::emit_key(self.held, self.mods, self.caps, &mut emit);
+        }
+    }
+
+    /// Feed one report; `emit` is called, in key-slot order, with each byte of
+    /// each newly-pressed key that maps to output.
     pub fn feed(&mut self, report: &BootReport, mut emit: impl FnMut(u8)) {
         if report.rolled_over() {
             // Can't tell which key is new; drop this report's keys but leave
             // `prev_keys` so the eventual release still resolves.
             return;
         }
-        let shift = report.shift();
-        let ctrl = report.ctrl();
+        self.mods = report.modifiers;
+        let mut pressed = 0u8;
         for &k in &report.keys {
             if k == 0 || k == keymap::USAGE_ERROR_ROLL_OVER {
                 continue;
@@ -375,10 +420,16 @@ impl BootKeyboardDecoder {
                 self.caps = !self.caps;
                 continue;
             }
-            if let Some(c) = keymap::usage_to_ascii(k, shift, ctrl, self.caps) {
-                emit(c);
+            if Self::emit_key(k, self.mods, self.caps, &mut emit) {
+                pressed = k;
             }
         }
         self.prev_keys = report.keys;
+        if pressed != 0 {
+            self.held = pressed;
+            self.press_seq = self.press_seq.wrapping_add(1);
+        } else if self.held != 0 && !report.keys.contains(&self.held) {
+            self.held = 0;
+        }
     }
 }

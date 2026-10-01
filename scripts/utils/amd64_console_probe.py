@@ -40,6 +40,9 @@ CASES = [
     # Line editing: type BAD, erase it with DEL (0x7f — what kbd.rs's Backspace
     # sends), type GOOD. Only the edited line can print GOODX.
     ('echo BAD\x7f\x7f\x7fGOOD""X', "GOODX"),
+    # `stty rows/cols` on the console must stick (TIOCSWINSZ used to be dropped).
+    # The typed line has no "30 90"; only `stty size`'s answer does.
+    ("stty rows 30 cols 90; stty size", "30 90"),
 ]
 
 # `^C` must kill the foreground job and leave the shell alive: start a 100 s
@@ -150,6 +153,32 @@ def run_kbd(args, mon_path, buf, pump, wait_for) -> int:
     text("echo $((6*8))")
     keys("ret")
     expect("Ctrl-C interrupts sleep 100 and the shell survives -> 48", b"\n48")
+    # Up arrow = shell history: run once, press Up + Enter, the answer comes again.
+    # The recalled line cannot contain "\n54", only a second execution can.
+    text("echo $((6*9))")
+    keys("ret")
+    time.sleep(2)
+    mark = len(buf)
+    keys("up")
+    keys("ret")
+    expect("Up arrow recalls the previous command (history) -> 54 again", b"\n54")
+    # Left arrow edits mid-line: type `echo $((9*9)`, Left, `)` -> `echo $((9*9))`.
+    mark = len(buf)
+    text("echo $((9*9)")
+    keys("left")
+    text(")")
+    keys("ret")
+    expect("Left arrow edits inside the line -> 81", b"\n81")
+    # Software repeat: type a junk line, hold Backspace long enough to clear all of
+    # it, then type a fresh command. Without repeat only ONE character is erased,
+    # the junk stays on the line, and the answer is not a bare "56".
+    mark = len(buf)
+    text("echo zzzzzzzzzzzzzzzzzzzz")
+    mon.sendall(b"sendkey backspace 2500\n")
+    time.sleep(3.5)
+    text("echo $((7*8))")
+    keys("ret")
+    expect("holding Backspace repeats and clears the line -> 56", b"\n56")
     raw = bytes(buf)
     print(f"  info  [kbd] scancode lines in the serial log: {raw.count(b'[kbd] sc=')}")
     print("RESULT:", "PASS" if failures == 0 else f"FAIL ({failures})")

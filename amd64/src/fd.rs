@@ -2064,7 +2064,31 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
         // the size of its *own* console is describing a terminal this target
         // does not own, and the size that matters comes from `sshd` on the
         // parent's descriptor, which never reaches this arm ([`sys_ioctl`]).
-        TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
+        // `stty rows N cols M` (and any program resizing its terminal) is now
+        // **kept**, in the process's own `TerminalState` — for a console process
+        // that is the console's shared one, so the next `stty size` and the
+        // shell's line editor see it. It does not resize the framebuffer's grid,
+        // which is fixed at boot; it tells programs how much of it to use, e.g.
+        // `stty rows 30 cols 90` to stay inside a region of the screen that works.
+        TIOCSWINSZ => {
+            if arg == 0 {
+                return Some(errno::EFAULT);
+            }
+            let mut w = [0u8; 8];
+            if !crate::uaccess::read_bytes(arg, &mut w) {
+                return Some(errno::EFAULT);
+            }
+            let (rows, cols) = (u16::from_le_bytes([w[0], w[1]]), u16::from_le_bytes([w[2], w[3]]));
+            if rows != 0 && cols != 0
+                && let Some(ts) = akuma_exec::process::current_terminal_state()
+            {
+                let mut ts = ts.lock();
+                ts.term_height = rows;
+                ts.term_width = cols;
+            }
+            0
+        }
+        TIOCSPGRP | TIOCSCTTY => 0,
         TIOCGPGRP => {
             if arg != 0 && errno::is_err(copy_to_user(arg, &1i32.to_le_bytes())) {
                 return Some(errno::EFAULT);

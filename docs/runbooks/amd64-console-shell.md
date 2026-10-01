@@ -38,6 +38,7 @@ and the TV showed the boot log and then nothing. The fix is one more service:
 | the pump | `amd64/src/console.rs` | keyboard -> line discipline (`^C` -> `SIGINT`) -> the shell; the shell's echo -> screen |
 | native USB keyboard | `amd64/src/xhci.rs` `init_keyboard` / `keyboard_poll` | a **second xHCI slot** beside the disk's: enumerate the boot-keyboard interface, `SET_CONFIGURATION`, Configure Endpoint (interrupt IN), `SET_PROTOCOL(boot)`, keep one 8-byte report in flight; decode with `akuma-usb`'s `BootKeyboardDecoder` into a key FIFO that `input::getb` drains. Reports are taken in `Xhci::next_event`, the one place events are consumed, so a disk read cannot swallow one |
 | Backspace = `0x7f` | `amd64/src/kbd.rs`, `akuma-usb` keymap | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
+| arrows + key repeat | `crates/akuma-usb` keymap/decoder, `xhci::keyboard_poll` | navigation keys emit Linux-console escape sequences; a USB boot keyboard never repeats a held key, so the decoder remembers the held key and the pump re-emits it after 400 ms every 35 ms. Backspace is `0x7f` here too (the USB keymap still said `0x08` until 2026-10-01) |
 | quiet framebuffer | `amd64/src/serial.rs` `set_fb_quiet` | once the console shell is spawned the TV shows the shell and its echo only; `[probe]`/`[herd]`/`[BKL]`/`[PSTATS]` stay in `dmesg`; a panic or fatal exception reopens it; boot flag `fbverbose` disables it. Console traffic uses `putb_tty`; pid 1's (`herd`'s) writes do not |
 | ANSI subset | `crates/akuma-fbcon/src/console.rs` | busybox's line editor emits `\b`, `ESC[nD`, `ESC[J`, `ESC[K`; they used to be drawn as glyphs |
 | cursor | same, + `multiboot2::cursor_idle` | a block, drawn when output goes quiet, removed by the next byte |
@@ -81,6 +82,25 @@ Three rigs, each proving a different link:
 
 The framebuffer console's parsing is host-tested (`cargo test -p akuma-fbcon`,
 which renders into memory and checks pixels).
+
+## Screen size: what `stty size` says, and what you can set
+
+The framebuffer's grid is fixed at boot: the console picks a font and an integer
+scale so the screen holds about 48 text rows, then insets every edge by 1/24 of
+the screen (overscan). Before 2026-10-01 the console's terminal state said **24x80
+whatever the grid was**, so `stty size`, `ls`'s columns and the line editor's
+wrapping described a terminal that was not on the glass. Now:
+
+- `run_init` copies the real grid into the console's terminal state, so
+  **`stty size`** prints the framebuffer's `rows cols`.
+- A **`[fb]` line** is printed at the end of the boot log (and so is in `dmesg`):
+  `[fb] 1920x1080 pitch 7680 (= width*bpp) bpp 32 cell 12x24 grid 150x42 margin 80,45`.
+  A pitch that is `NOT width*bpp` explains sheared lines; a grid taller than the
+  visible area explains a blank band.
+- **`stty rows N cols M`** is kept (it used to be accepted and dropped). It does
+  not resize the grid — that is fixed — it tells programs how much of it to use,
+  e.g. to stay inside the part of a TV that works. Reset with `stty rows <R> cols <C>`
+  from `stty size`/`[fb]`.
 
 ## The keyboard
 
@@ -145,8 +165,9 @@ this one.
 
 ## Known limits
 
-- No arrow keys, Home/End or function keys (`akuma-usb`'s keymap emits no escape
-  sequences); history and cursor-left editing are unavailable. Backspace works.
+- No function keys (F1..F12) and no modified cursor keys (Ctrl-Left etc.).
+  Arrows, Home/End, Insert/Delete and PageUp/PageDown work (2026-10-01) as the
+  Linux-console escape sequences, so ash has history (Up/Down) and mid-line editing.
 - A keyboard on an EHCI-routed port is not driven (no EHCI controller driver;
   the split-transaction builders exist in `akuma-usb::ehci`, unwired).
 - No hot-plug: unplugging halts the interrupt endpoint (four recovery attempts,

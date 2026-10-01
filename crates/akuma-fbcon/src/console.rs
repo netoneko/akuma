@@ -241,6 +241,12 @@ impl<S: Surface> Console<S> {
         (width / MARGIN_DIVISOR, height / MARGIN_DIVISOR)
     }
 
+    /// The overscan inset in pixels, `(x, y)`: where the text area starts.
+    #[must_use]
+    pub const fn margin(&self) -> (usize, usize) {
+        (self.origin_x, self.origin_y)
+    }
+
     /// Columns of text.
     #[must_use]
     pub const fn cols(&self) -> usize {

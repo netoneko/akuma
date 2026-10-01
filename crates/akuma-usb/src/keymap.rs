@@ -8,8 +8,12 @@
 //!   table, so Shift+CapsLock on a letter is lowercase).
 //! * Ctrl+letter is the control character a terminal sends — Ctrl-C is `0x03`,
 //!   Ctrl-D `0x04` (EOF to the line discipline).
-//! * Function keys, navigation keys and the modifiers themselves produce no
-//!   byte (`None`); only Delete maps, to `0x7F`.
+//! * Backspace is `0x7F` (DEL), what a terminal sends and the line discipline's
+//!   `VERASE` — it was `0x08` until 2026-10-01, which a raw-mode line editor
+//!   accepts and a cooked-mode `read(0)` does not.
+//! * Arrow and navigation keys are the escape sequences a Linux console / xterm
+//!   sends ([`usage_to_sequence`]), so a shell's line editor gets history and
+//!   cursor movement. Function keys and the modifiers produce nothing.
 //!
 //! The keypad rows assume Num Lock is on (digits, not arrows) — this target
 //! has no Num Lock LED and no reason to track the state.
@@ -46,11 +50,11 @@ static PLAIN: [u8; TABLE_LEN] = [
     // 0x10
     b'm', b'n', b'o', b'p', b'q', b'r', b's', b't', b'u', b'v', b'w', b'x', b'y', b'z', b'1', b'2',
     // 0x20
-    b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'\r', 0x1B, 0x08, b'\t', b' ', b'-', b'=', b'[',
+    b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'\r', 0x1B, 0x7F, b'\t', b' ', b'-', b'=', b'[',
     // 0x30
     b']', b'\\', b'\\', b';', b'\'', b'`', b',', b'.', b'/', 0, 0, 0, 0, 0, 0, 0,
     // 0x40
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     // 0x50
     0, 0, 0, 0, b'/', b'*', b'-', b'+', b'\r', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
     // 0x60
@@ -64,16 +68,39 @@ static SHIFTED: [u8; TABLE_LEN] = [
     // 0x10
     b'M', b'N', b'O', b'P', b'Q', b'R', b'S', b'T', b'U', b'V', b'W', b'X', b'Y', b'Z', b'!', b'@',
     // 0x20
-    b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'\r', 0x1B, 0x08, b'\t', b' ', b'_', b'+', b'{',
+    b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'\r', 0x1B, 0x7F, b'\t', b' ', b'_', b'+', b'{',
     // 0x30
     b'}', b'|', b'|', b':', b'"', b'~', b'<', b'>', b'?', 0, 0, 0, 0, 0, 0, 0,
     // 0x40
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     // 0x50
     0, 0, 0, 0, b'/', b'*', b'-', b'+', b'\r', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
     // 0x60
     b'8', b'9', b'0', b'.', b'|', 0, 0, 0,
 ];
+
+/// The escape sequence a navigation key sends, or `None` for any other key.
+///
+/// The Linux console / xterm "normal cursor key" forms, which busybox's line
+/// editor and every full-screen program understand: arrows `ESC [ A..D`,
+/// Home/End `ESC [ H`/`F`, and `ESC [ n ~` for Insert, Delete, PageUp, PageDown.
+/// Modified forms (Ctrl-Left and friends) are not generated.
+#[must_use]
+pub fn usage_to_sequence(usage: u8) -> Option<&'static [u8]> {
+    Some(match usage {
+        0x4F => b"\x1b[C", // Right
+        0x50 => b"\x1b[D", // Left
+        0x51 => b"\x1b[B", // Down
+        0x52 => b"\x1b[A", // Up
+        0x4A => b"\x1b[H", // Home
+        0x4D => b"\x1b[F", // End
+        0x49 => b"\x1b[2~", // Insert
+        0x4C => b"\x1b[3~", // Delete
+        0x4B => b"\x1b[5~", // PageUp
+        0x4E => b"\x1b[6~", // PageDown
+        _ => return None,
+    })
+}
 
 /// One key-usage code to the byte a terminal would receive, or `None` for a
 /// key that produces no text (a modifier, a function key, an unmapped code).

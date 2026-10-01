@@ -223,6 +223,67 @@ pub fn cursor_idle() {
     }
 }
 
+/// The framebuffer console's grid as `(rows, columns)`, or `None` without one.
+///
+/// What the shell should report for `TIOCGWINSZ`: until 2026-10-01 the console's
+/// terminal state said 24x80 whatever the screen was, so `stty size`, `ls`'s
+/// column layout and the line editor's wrapping all described a terminal that was
+/// not the one on the glass. A blocking `lock`, not `try_lock`: this runs once, from
+/// `run_init`, and other cores are printing diagnostics through the same lock at
+/// that moment — the first version used `try_lock`, lost that race on the box, and
+/// silently did nothing.
+#[must_use]
+pub fn fb_grid() -> Option<(u16, u16)> {
+    let g = CONSOLE.lock();
+    let c = &g.as_ref()?.0;
+    Some((u16::try_from(c.rows()).ok()?, u16::try_from(c.cols()).ok()?))
+}
+
+/// One `[fb]` line with everything needed to tell *which kind* of "part of the
+/// screen does not work" this is: the framebuffer GRUB handed over (width,
+/// height, pitch, depth), the cell and scale the console chose, the grid, and the
+/// overscan margin. A pitch that is not `width * bytes_per_pixel` (sheared lines)
+/// and a grid taller than the visible area (a blank band) look different here.
+///
+/// Printed at the **end** of the boot log so it is the last thing above the
+/// prompt and survives in `dmesg` — the `font:` line at the top scrolls off the
+/// screen and out of the 64 KiB ring within minutes.
+pub fn fb_summary() {
+    let mut g = CONSOLE.lock();
+    let Some(c) = g.as_mut() else { return };
+    let (cols, rows, scale) = (c.0.cols(), c.0.rows(), c.0.scale());
+    let (fw, fh) = (c.0.font().width(), c.0.font().height());
+    let (mx, my) = c.0.margin();
+    let (w, h, pitch, bpp) = {
+        let f = c.0.surface_mut();
+        (f.width, f.height, f.pitch, f.bytes_per_pixel)
+    };
+    drop(g);
+    serial::puts("[fb] ");
+    serial::put_dec(w as u64);
+    serial::puts("x");
+    serial::put_dec(h as u64);
+    serial::puts(" pitch ");
+    serial::put_dec(pitch as u64);
+    serial::puts(" (");
+    serial::puts(if pitch == w * bpp { "= width*bpp" } else { "NOT width*bpp" });
+    serial::puts(") bpp ");
+    serial::put_dec(bpp as u64 * 8);
+    serial::puts(" cell ");
+    serial::put_dec((fw * scale) as u64);
+    serial::puts("x");
+    serial::put_dec((fh * scale) as u64);
+    serial::puts(" grid ");
+    serial::put_dec(cols as u64);
+    serial::puts("x");
+    serial::put_dec(rows as u64);
+    serial::puts(" margin ");
+    serial::put_dec(mx as u64);
+    serial::puts(",");
+    serial::put_dec(my as u64);
+    serial::puts("\n");
+}
+
 /// Long-mode entry for a GRUB/multiboot2 boot, called from `boot.s`.
 ///
 /// Deliberately parallel to [`crate::kmain`], and in the same order, because

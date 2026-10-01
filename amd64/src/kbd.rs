@@ -1,8 +1,8 @@
 //! i8042 PS/2 keyboard, polled.
 //!
 //! **Superseded on the reference machine (2026-10-01).** This reads the firmware's
-//! PS/2 emulation, which ends when `xhci::init` takes the controller (BIOS handoff
-//! + `HCRST`), and on that box the i8042 status byte sits at `0x7c` and never
+//! PS/2 emulation, which ends when `xhci::init` takes the controller (the BIOS
+//! handoff and `HCRST`), and on that box the i8042 status byte sits at `0x7c` and never
 //! delivers a byte. The keyboard there is driven natively by `xhci::init_keyboard`
 //! and reaches the console through `input::getb`. This module remains for
 //! machines where the emulation is live (QEMU `pc`/`q35` with `-device i8042`,

@@ -370,3 +370,12 @@ draft, at 2228 bytes, was refused `TooLong`.
   anyone: `^C` and `exit` from the physical keyboard (QEMU covers them), and the
   `[BKL] stuck` lines (18 within two minutes of the last boot, `kot` running),
   which are unrelated to this work and unresolved. `.good` was **not** promoted.
+- 2026-10-01 night — **screen size and arrows.** `stty size` said 24 80 (the
+  default `TerminalState`, not the grid); now `run_init` copies the framebuffer grid
+  in, `TIOCSWINSZ` on the console is kept instead of dropped, and a `[fb]` geometry
+  line ends the boot log. USB keyboard: arrows/Home/End/Ins/Del/PgUp/PgDn as
+  Linux-console sequences, Backspace `0x7f` in the USB keymap (it was `0x08`), and
+  software key repeat (400 ms / 35 ms). QEMU `--usb` passes Up-arrow history, Left-arrow
+  mid-line editing, and a held Backspace clearing a line; `akuma-usb` has 11 new
+  host tests. The user's report that "half the screen does not work" is **not yet
+  diagnosed** — the `[fb]` line is there to tell pitch/overscan/grid problems apart.

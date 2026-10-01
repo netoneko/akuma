@@ -2036,7 +2036,19 @@ struct Kbd {
     /// Recoveries attempted; at [`KBD_MAX_RECOVERIES`] the endpoint is left dead
     /// rather than resetting forever.
     recoveries: u8,
+    /// Software key repeat — a USB boot keyboard never repeats a held key, so the
+    /// pump does it from `keyboard_poll`. The decoder's press counter last seen
+    /// (a change restarts the delay), and the TSC stamps of the press and of the
+    /// last repeat.
+    press_seen: u32,
+    held_at: u64,
+    repeat_at: u64,
 }
+
+/// Held this long before a key starts repeating, then repeats at the period
+/// below — the usual ~400 ms / ~30 Hz.
+const KBD_REPEAT_DELAY_MS: u64 = 400;
+const KBD_REPEAT_PERIOD_MS: u64 = 35;
 
 const KBD_MAX_RECOVERIES: u8 = 4;
 /// Reports logged to `dmesg` (`[xhci] kbd report ...`) before going quiet.
@@ -2195,6 +2207,11 @@ impl Xhci {
                 && let Some(report) = BootReport::parse(&raw)
             {
                 k.decoder.feed(&report, |c| KEYS.lock().push(c));
+                if k.decoder.press_seq() != k.press_seen {
+                    k.press_seen = k.decoder.press_seq();
+                    k.held_at = tsc();
+                    k.repeat_at = k.held_at;
+                }
             }
             self.kbd_queue();
             return;
@@ -2302,6 +2319,9 @@ fn kbd_try_port(x: &mut Xhci, port: u8) -> Result<(), &'static str> {
         decoder: BootKeyboardDecoder::new(),
         reports: 0,
         recoveries: 0,
+        press_seen: 0,
+        held_at: 0,
+        repeat_at: 0,
     });
     serial::puts("  [xhci] kbd slot ");
     serial::put_dec(u64::from(slot));
@@ -2439,6 +2459,18 @@ pub fn keyboard_poll() {
     for _ in 0..16 {
         if x.next_event().is_none() {
             break;
+        }
+    }
+    // Software repeat: a key still down after the delay re-emits at the period.
+    if let Some(k) = x.kbd.as_mut()
+        && k.decoder.held()
+    {
+        let now = tsc();
+        if now.wrapping_sub(k.held_at) > ticks_ms(KBD_REPEAT_DELAY_MS)
+            && now.wrapping_sub(k.repeat_at) > ticks_ms(KBD_REPEAT_PERIOD_MS)
+        {
+            k.repeat_at = now;
+            k.decoder.repeat(|c| KEYS.lock().push(c));
         }
     }
 }
