@@ -379,3 +379,15 @@ draft, at 2228 bytes, was refused `TooLong`.
   mid-line editing, and a held Backspace clearing a line; `akuma-usb` has 11 new
   host tests. The user's report that "half the screen does not work" is **not yet
   diagnosed** — the `[fb]` line is there to tell pitch/overscan/grid problems apart.
+- 2026-10-01 night — **late.sh on the TV looked wrong; the console grew up.** The
+  user photographed `ssh late.sh` from the console shell: every `│ ─ ●` was three
+  boxes (non-ASCII UTF-8 drawn byte by byte), popups overwrote leftovers (erase,
+  insert/delete and repeat were not implemented), and everything was monochrome.
+  `akuma-fbcon` now decodes UTF-8, bakes Latin-1/Latin Ext-A/punctuation, draws
+  box/block/Braille/shapes procedurally (host tests render them and check joins),
+  tracks per-cell colour/attributes, implements the editing and scroll-region
+  sequences and the terminal's replies, and has an adjustable printing area
+  (`stty cols N rows M` narrows it; `ENV=/etc/console.rc` makes it stick). 69 host
+  tests (23 new this round). **Not verified on the real TV at the time of writing**:
+  glyph quality, late.sh itself, and the pump delivering replies — QEMU has no
+  framebuffer, so the draw path is tested on the host and the wiring by `fbtrace`.

@@ -239,6 +239,30 @@ pub fn fb_grid() -> Option<(u16, u16)> {
     Some((u16::try_from(c.rows()).ok()?, u16::try_from(c.cols()).ok()?))
 }
 
+/// Bytes the framebuffer console wants typed back into the program on the
+/// console — answers to cursor-position, device-attribute and colour queries
+/// (`fbcon::Console::take_reply`). Copied into `out`; returns the count.
+///
+/// `try_lock`: the pump calls this every lap, and a lap that finds the console
+/// busy simply asks again next time. A reply is not lost by waiting.
+pub fn fb_take_reply(out: &mut [u8]) -> usize {
+    let Some(mut g) = CONSOLE.try_lock() else { return 0 };
+    g.as_mut().map_or(0, |c| c.0.take_reply(out))
+}
+
+/// Restrict printing to the top-left `cols` x `rows` of the screen
+/// (`fbcon::Console::set_view`), returning the size actually in force — the
+/// request clamped to what the screen holds, which is what `TIOCGWINSZ` must then
+/// report. `None` with no framebuffer console.
+///
+/// A blocking `lock`: this is an `ioctl`, not the pump, and the answer matters.
+pub fn fb_set_view(cols: u16, rows: u16) -> Option<(u16, u16)> {
+    let mut g = CONSOLE.lock();
+    let c = &mut g.as_mut()?.0;
+    c.set_view(usize::from(cols), usize::from(rows));
+    Some((u16::try_from(c.rows()).ok()?, u16::try_from(c.cols()).ok()?))
+}
+
 /// One `[fb]` line with everything needed to tell *which kind* of "part of the
 /// screen does not work" this is: the framebuffer GRUB handed over (width,
 /// height, pitch, depth), the cell and scale the console chose, the grid, and the
@@ -251,7 +275,7 @@ pub fn fb_grid() -> Option<(u16, u16)> {
 pub fn fb_summary() {
     let mut g = CONSOLE.lock();
     let Some(c) = g.as_mut() else { return };
-    let (cols, rows, scale) = (c.0.cols(), c.0.rows(), c.0.scale());
+    let (cols, rows, scale) = (c.0.max_cols(), c.0.max_rows(), c.0.scale());
     let (fw, fh) = (c.0.font().width(), c.0.font().height());
     let (mx, my) = c.0.margin();
     let (w, h, pitch, bpp) = {
@@ -338,21 +362,30 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     let (w, h) = (surface.width(), surface.height());
     surface.fill(0, 0, w, h, Rgb::new(0x30, 0x00, 0x50));
 
-    let Some(mut con) = Console::new(surface) else {
-        ega_text(2, "FAIL: framebuffer too small for a console");
-        crate::halt();
+    // Built **straight into the static** rather than into a local first. The
+    // console owns its whole character grid (about 54 KiB: code point, colours and
+    // flags per cell), and a named local plus the moves around it are copies of
+    // that on a boot stack with no guard page beneath it. `Option::map` writes the
+    // wrapper in place of the construction, and everything after goes through the
+    // lock guard.
+    let (fname, fw, fh, fcols, frows, fscale) = {
+        let mut slot = CONSOLE.lock();
+        *slot = Console::new(surface).map(FbConsole);
+        let Some(con) = slot.as_mut() else {
+            ega_text(2, "FAIL: framebuffer too small for a console");
+            crate::halt();
+        };
+        let con = &mut con.0;
+        con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
+        con.clear();
+        // Which font and grid the console actually chose. `Console::choose_font`
+        // takes that decision from the framebuffer size at runtime — IBM Plex Mono
+        // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose
+        // only output IS this console, "what am I looking at" was a question only
+        // answerable by re-deriving the arithmetic from the mode GRUB happened to
+        // pick. Now the console says so itself, in itself.
+        (con.font().name(), con.font().width(), con.font().height(), con.cols(), con.rows(), con.scale())
     };
-    con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
-    con.clear();
-    // Which font and grid the console actually chose. `Console::choose_font`
-    // takes that decision from the framebuffer size at runtime — IBM Plex Mono
-    // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose
-    // only output IS this console, "what am I looking at" was a question only
-    // answerable by re-deriving the arithmetic from the mode GRUB happened to
-    // pick. Now the console says so itself, in itself.
-    let (fname, fw, fh) = (con.font().name(), con.font().width(), con.font().height());
-    let (fcols, frows, fscale) = (con.cols(), con.rows(), con.scale());
-    *CONSOLE.lock() = Some(FbConsole(con));
     ega_text(2, "console up");
 
     // FROM HERE, `serial::puts` REACHES THE SCREEN. `serial::putb` mirrors into

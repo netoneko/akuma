@@ -9,6 +9,7 @@
 use core::fmt;
 
 use crate::font::{self, Font};
+use crate::glyph;
 use crate::{Rgb, Surface};
 
 /// The font a [`Console`] uses when the framebuffer can afford it.
@@ -40,9 +41,9 @@ const MIN_ROWS: usize = 24;
 /// A 4K screen at the smallest scale this crate will choose is under this; the
 /// grid is a fixed array because a kernel console must not depend on an
 /// allocator that may be what broke.
-pub const MAX_COLS: usize = 256;
+pub const MAX_COLS: usize = 160;
 /// Tallest grid the console will use.
-pub const MAX_ROWS: usize = 72;
+pub const MAX_ROWS: usize = 56;
 
 /// Target number of text rows [`Console::auto_scale`] aims for.
 ///
@@ -58,41 +59,187 @@ const TARGET_ROWS: usize = 48;
 /// that still does it. On a monitor it costs a small border and nothing else.
 const MARGIN_DIVISOR: usize = 24;
 
-/// How many `;`-separated numbers a CSI sequence keeps. The sequences a shell's
-/// line editor writes carry at most two (`ESC [ row ; col H`); the rest are
-/// counted and dropped.
-const CSI_PARAMS: usize = 4;
+/// How many `;`-separated numbers a CSI sequence keeps. A colour change such as
+/// `ESC [ 1 ; 38 ; 2 ; r ; g ; b ; 48 ; 2 ; r ; g ; b m` carries twelve; the rest
+/// are counted and dropped.
+const CSI_PARAMS: usize = 16;
+
+/// Bytes of an `ESC ]` string kept, enough to recognise the colour queries
+/// (`10;?` / `11;?`) a TUI sends at start-up and answer them.
+const OSC_KEEP: usize = 8;
+
+/// Bytes of pending terminal reply (cursor position, device attributes, colour
+/// query answers) the console holds for its owner to take. A reply that does not
+/// fit is dropped whole: half an escape sequence typed into a shell is worse.
+const REPLY_CAP: usize = 48;
 
 /// Where [`Console::write_byte`]'s escape-sequence parser is.
 ///
-/// A shell on this console is an ordinary Unix program and writes to it as to a
-/// terminal: busybox's line editor moves the cursor with `ESC [ n D`, clears
-/// with `ESC [ J`, and backspaces with `\b`. Without this every one of those
-/// bytes was drawn as a glyph, which is the difference between a prompt and a
-/// prompt that fills with `[D[D[J` the first time a key is pressed.
+/// A program on this console is an ordinary Unix program and writes to it as to a
+/// terminal: busybox's line editor moves the cursor with `ESC [ n D`, a TUI draws
+/// a whole screen with cursor addressing, erases, colours and scroll regions.
+/// Without this every one of those bytes was drawn as a glyph.
 ///
-/// A fixed-size enum and no buffer: this runs per byte, under the console lock,
-/// on the path that has to keep working when the allocator does not.
+/// A fixed-size enum and no heap: this runs per byte, under the console lock, on
+/// the path that has to keep working when the allocator does not.
 #[derive(Clone, Copy)]
 enum Esc {
     Ground,
     /// Saw `ESC`; the next byte says what kind of sequence this is.
     Escape,
+    /// `ESC (`, `ESC )`, `ESC #`...: one more byte follows and means nothing here.
+    Swallow,
     /// Inside `ESC [`. `count` is the number of `;` seen, `private` is set by a
-    /// `?`/`<`/`=`/`>` prefix (`ESC [ ? 25 h` and friends — mode switches this
-    /// console has no modes for, so they are parsed and ignored).
-    Csi { params: [u16; CSI_PARAMS], count: usize, private: bool },
-    /// Inside an `ESC ]`/`ESC P`/... string, swallowed up to `BEL` or `ESC \`.
-    Str,
+    /// `?`/`<`/`=`/`>` prefix (`?` selects DEC private modes; the others are
+    /// parsed and ignored).
+    Csi { params: [u16; CSI_PARAMS], count: usize, private: u8 },
+    /// Inside an `ESC ]`/`ESC P`/... string, swallowed up to `BEL` or `ESC \`;
+    /// the first [`OSC_KEEP`] bytes are kept.
+    Str { buf: [u8; OSC_KEEP], len: usize },
 }
+
+// ---------------------------------------------------------------------------
+// Cells and colour
+// ---------------------------------------------------------------------------
+
+/// Cell flag bits.
+const F_BOLD: u8 = 1;
+const F_DIM: u8 = 2;
+const F_UNDER: u8 = 4;
+const F_REVERSE: u8 = 8;
+/// `fg` / `bg` hold a palette index (otherwise: the console's default colours).
+const F_FG: u8 = 16;
+const F_BG: u8 = 32;
+
+/// Code-point markers a cell can hold instead of a character.
+const CONT: u16 = 0xFFFF; // the right half of a two-column character
+const TOFU: u16 = 0xFFFD; // a character that cannot be stored (invalid UTF-8)
+const TOFU_WIDE: u16 = 0xFFFE; // one beyond the BMP and two columns wide (emoji)
+
+/// One screen cell: what is shown, and the colours and flags it is shown in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cell {
+    cp: u16,
+    fg: u8,
+    bg: u8,
+    flags: u8,
+}
+
+const BLANK: Cell = Cell { cp: 0x20, fg: 0, bg: 0, flags: 0 };
+
+/// The colours and flags the next character will be drawn with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pen {
+    fg: u8,
+    bg: u8,
+    flags: u8,
+}
+
+const PEN_DEFAULT: Pen = Pen { fg: 0, bg: 0, flags: 0 };
+
+/// The 16 ANSI colours, chosen to sit with this crate's own palette
+/// ([`Rgb::GOOD`], [`Rgb::WARN`], [`Rgb::BAD`], [`Rgb::ACCENT`]).
+const ANSI16: [(u8, u8, u8); 16] = [
+    (0x1C, 0x20, 0x28), // 0 black
+    (0xE0, 0x50, 0x50), // 1 red
+    (0x50, 0xD0, 0x60), // 2 green
+    (0xE0, 0xC0, 0x40), // 3 yellow
+    (0x60, 0xA0, 0xE0), // 4 blue
+    (0xC0, 0x70, 0xD0), // 5 magenta
+    (0x50, 0xC8, 0xD0), // 6 cyan
+    (0xC8, 0xD0, 0xD8), // 7 white
+    (0x60, 0x68, 0x70), // 8 bright black
+    (0xF0, 0x80, 0x80), // 9
+    (0x80, 0xF0, 0x90), // 10
+    (0xF0, 0xD8, 0x70), // 11
+    (0x90, 0xC0, 0xF0), // 12
+    (0xE0, 0xA0, 0xF0), // 13
+    (0x90, 0xE0, 0xE8), // 14
+    (0xEE, 0xEE, 0xEE), // 15
+];
+
+/// A level of the xterm 6x6x6 colour cube.
+const fn cube_level(n: u8) -> u8 {
+    if n == 0 { 0 } else { 55 + 40 * n }
+}
+
+/// An xterm-256 palette index as a colour.
+fn palette(idx: u8) -> Rgb {
+    match idx {
+        0..=15 => {
+            let (r, g, b) = ANSI16[usize::from(idx)];
+            Rgb::new(r, g, b)
+        }
+        16..=231 => {
+            let i = idx - 16;
+            Rgb::new(cube_level(i / 36), cube_level((i / 6) % 6), cube_level(i % 6))
+        }
+        _ => {
+            let v = 8 + 10 * (idx - 232);
+            Rgb::new(v, v, v)
+        }
+    }
+}
+
+/// The nearest xterm-256 index to an RGB colour: how a truecolor request
+/// (`38;2;r;g;b`) is stored in a one-byte cell. Nearest of the colour cube and the
+/// grey ramp, by squared distance.
+fn rgb_to_palette(r: u8, g: u8, b: u8) -> u8 {
+    let level = |v: u8| -> u8 {
+        // Nearest of 0, 95, 135, 175, 215, 255.
+        let mut best = 0u8;
+        let mut best_d = u32::MAX;
+        for n in 0..6u8 {
+            let d = u32::from(v.abs_diff(cube_level(n)));
+            if d < best_d {
+                best_d = d;
+                best = n;
+            }
+        }
+        best
+    };
+    let (ri, gi, bi) = (level(r), level(g), level(b));
+    let cube = 16 + 36 * ri + 6 * gi + bi;
+    let dist = |c: Rgb| {
+        let d = |a: u8, b: u8| u32::from(a.abs_diff(b)).pow(2);
+        d(r, c.r) + d(g, c.g) + d(b, c.b)
+    };
+    let avg = ((u32::from(r) + u32::from(g) + u32::from(b)) / 3) as u8;
+    let gi = if avg < 8 { 0 } else { ((u32::from(avg) - 8 + 5) / 10).min(23) as u8 };
+    let gray = 232 + gi;
+    if dist(palette(gray)) < dist(palette(cube)) { gray } else { cube }
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8
+// ---------------------------------------------------------------------------
+
+/// The decoder's state between bytes: the code point so far, how many
+/// continuation bytes are still owed, and the smallest value the finished
+/// sequence may have (anything lower is an overlong encoding).
+#[derive(Clone, Copy)]
+struct Utf8 {
+    acc: u32,
+    need: u8,
+    min: u32,
+}
+
+const UTF8_IDLE: Utf8 = Utf8 { acc: 0, need: 0, min: 0 };
 
 /// A scrolling text console.
 pub struct Console<S: Surface> {
     surface: S,
     font: &'static Font,
-    grid: [[u8; MAX_COLS]; MAX_ROWS],
+    grid: [[Cell; MAX_COLS]; MAX_ROWS],
+    /// The **physical** grid the screen holds.
     cols: usize,
     rows: usize,
+    /// The **printing area**: the part of the grid text wraps and scrolls inside,
+    /// anchored at the top left. Equal to the physical grid until
+    /// [`Console::set_view`] narrows it — which is how a part of the screen that
+    /// does not work, or a part reserved for something else, is left alone.
+    vcols: usize,
+    vrows: usize,
     col: usize,
     row: usize,
     scale: usize,
@@ -101,9 +248,25 @@ pub struct Console<S: Surface> {
     fg: Rgb,
     bg: Rgb,
     esc: Esc,
+    utf8: Utf8,
+    pen: Pen,
+    /// Cursor saved by `ESC 7` / `CSI s`.
+    saved: (usize, usize, Pen),
+    /// Scroll region, inclusive row numbers within the printing area.
+    top: usize,
+    bot: usize,
+    autowrap: bool,
+    cursor_hidden: bool,
+    /// An application is using the "alternate screen" (`CSI ? 1049 h`): it owns
+    /// the whole screen, so scrolling is one line at a time, as it expects.
+    alt: bool,
+    /// The last character printed, for `CSI n b` (repeat).
+    last_cp: u32,
     /// The cell the cursor is drawn on right now, if it is drawn at all. See
     /// [`Console::show_cursor`].
     cursor: Option<(usize, usize)>,
+    reply: [u8; REPLY_CAP],
+    reply_len: usize,
 }
 
 impl<S: Surface> Console<S> {
@@ -146,14 +309,18 @@ impl<S: Surface> Console<S> {
         let (cols, rows) = Self::grid_for(font, w, h, scale)?;
 
         // The grid is the console's whole reason to exist (video memory is
-        // never read back), and it is built once, at boot, on the boot stack.
+        // never read back), and it is built once, at boot, on a stack of 256 KiB
+        // (`boot.s`): about 54 KiB of cells here, so a handful of moves is
+        // survivable and a hundred would not be.
         #[allow(clippy::large_stack_arrays)]
         Some(Self {
             surface,
             font,
-            grid: [[b' '; MAX_COLS]; MAX_ROWS],
+            grid: [[BLANK; MAX_COLS]; MAX_ROWS],
             cols,
             rows,
+            vcols: cols,
+            vrows: rows,
             col: 0,
             row: 0,
             scale,
@@ -162,7 +329,18 @@ impl<S: Surface> Console<S> {
             fg: Rgb::TEXT,
             bg: Rgb::BLACK,
             esc: Esc::Ground,
+            utf8: UTF8_IDLE,
+            pen: PEN_DEFAULT,
+            saved: (0, 0, PEN_DEFAULT),
+            top: 0,
+            bot: rows - 1,
+            autowrap: true,
+            cursor_hidden: false,
+            alt: false,
+            last_cp: 0x20,
             cursor: None,
+            reply: [0; REPLY_CAP],
+            reply_len: 0,
         })
     }
 
@@ -247,15 +425,30 @@ impl<S: Surface> Console<S> {
         (self.origin_x, self.origin_y)
     }
 
-    /// Columns of text.
+    /// Columns of text in the **printing area** — what a program should lay out
+    /// for. Equal to [`Console::max_cols`] until [`Console::set_view`] narrows it.
     #[must_use]
+    #[allow(clippy::misnamed_getters)] // the *view*, deliberately: see `set_view`
     pub const fn cols(&self) -> usize {
+        self.vcols
+    }
+
+    /// Rows of text in the printing area.
+    #[must_use]
+    #[allow(clippy::misnamed_getters)] // the *view*, deliberately: see `set_view`
+    pub const fn rows(&self) -> usize {
+        self.vrows
+    }
+
+    /// Columns the screen physically holds.
+    #[must_use]
+    pub const fn max_cols(&self) -> usize {
         self.cols
     }
 
-    /// Rows of text.
+    /// Rows the screen physically holds.
     #[must_use]
-    pub const fn rows(&self) -> usize {
+    pub const fn max_rows(&self) -> usize {
         self.rows
     }
 
@@ -275,6 +468,33 @@ impl<S: Surface> Console<S> {
         self.bg = bg;
     }
 
+    /// Restrict printing to the top-left `cols` x `rows` of the screen.
+    ///
+    /// Text wraps at `cols` and scrolls at `rows`, and every cell outside is
+    /// blanked and stays blank — so what a program sees as the terminal is exactly
+    /// the part of the screen that is used, and the rest can be dead, covered, or
+    /// kept for something else. Clamped to `1..=` the physical grid. Content inside
+    /// the new area is kept; the cursor and any scroll region are pulled back
+    /// inside it.
+    pub fn set_view(&mut self, cols: usize, rows: usize) {
+        self.hide_cursor();
+        let (nc, nr) = (cols.clamp(1, self.cols), rows.clamp(1, self.rows));
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                if (r >= nr || c >= nc) && self.grid[r][c] != BLANK {
+                    self.grid[r][c] = BLANK;
+                    self.paint(r, c, false);
+                }
+            }
+        }
+        self.vcols = nc;
+        self.vrows = nr;
+        self.row = self.row.min(nr - 1);
+        self.col = self.col.min(nc);
+        self.top = 0;
+        self.bot = nr - 1;
+    }
+
     /// Paint the whole surface — not just the text area — and reset the cursor.
     ///
     /// The whole surface on purpose: the margin is part of what proves the
@@ -287,11 +507,15 @@ impl<S: Surface> Console<S> {
         // literal is a temporary the size of the whole grid, and this runs on a
         // boot stack that has no guard page beneath it.
         for row in &mut self.grid {
-            row.fill(b' ');
+            row.fill(BLANK);
         }
         self.col = 0;
         self.row = 0;
         self.esc = Esc::Ground;
+        self.utf8 = UTF8_IDLE;
+        self.pen = PEN_DEFAULT;
+        self.top = 0;
+        self.bot = self.vrows - 1;
         // The fill above painted over it; there is nothing left to erase.
         self.cursor = None;
     }
@@ -306,31 +530,75 @@ impl<S: Surface> Console<S> {
         self.surface.fill(0, 0, w, h, color);
     }
 
-    /// Write one byte, honouring `\n`, `\r`, `\t`, `\b` and the small subset of
-    /// ANSI escape sequences a shell's line editor uses (see [`Esc`]).
+    /// Take the bytes the console wants sent **back to the program**: the answer
+    /// to a cursor-position request (`CSI 6 n`), a device-attributes query
+    /// (`CSI c`) or a colour query (`OSC 10;?` / `OSC 11;?`).
     ///
-    /// Everything else — including control bytes the font draws as a box — is
-    /// drawn as before, so the kernel's own output, which never contains an
-    /// escape, is byte-for-byte what it was.
+    /// A terminal answers these on the same line the program reads its keys from,
+    /// so the owner of the console must type the bytes into the program's input.
+    /// Without it busybox's line editor waits out a timeout at every prompt asking
+    /// where the cursor is, and a TUI waits to learn the terminal's colours.
+    /// Returns how many bytes were copied into `out` (0 if none pending).
+    pub fn take_reply(&mut self, out: &mut [u8]) -> usize {
+        let n = self.reply_len.min(out.len());
+        out[..n].copy_from_slice(&self.reply[..n]);
+        self.reply.copy_within(n..self.reply_len, 0);
+        self.reply_len -= n;
+        n
+    }
+
+    fn reply_push(&mut self, bytes: &[u8]) {
+        if self.reply_len + bytes.len() <= REPLY_CAP {
+            self.reply[self.reply_len..self.reply_len + bytes.len()].copy_from_slice(bytes);
+            self.reply_len += bytes.len();
+        }
+    }
+
+    /// Append a decimal number to the reply being built in `buf`.
+    fn push_dec(buf: &mut [u8], len: &mut usize, mut v: usize) {
+        let mut tmp = [0u8; 8];
+        let mut n = 0;
+        loop {
+            tmp[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 || n == tmp.len() {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            buf[*len] = tmp[n];
+            *len += 1;
+        }
+    }
+
+    /// Write one byte: UTF-8 text, `\n \r \t \b`, and the escape sequences a shell
+    /// or a TUI uses (see [`Esc`]).
+    ///
+    /// Plain ASCII output — which is all the kernel's own messages are — goes
+    /// through exactly as before.
     pub fn write_byte(&mut self, b: u8) {
         self.hide_cursor();
         match self.esc {
             Esc::Ground => self.ground(b),
-            Esc::Escape => {
-                self.esc = match b {
-                    b'[' => Esc::Csi { params: [0; CSI_PARAMS], count: 0, private: false },
-                    b']' | b'P' | b'_' | b'^' | b'X' => Esc::Str,
-                    // A two-byte sequence (`ESC c`, `ESC 7`, `ESC =`, ...): none
-                    // has a meaning here, and none may be drawn.
-                    _ => Esc::Ground,
-                };
-            }
-            Esc::Str => match b {
-                0x07 => self.esc = Esc::Ground,
+            Esc::Escape => self.escape(b),
+            Esc::Swallow => self.esc = Esc::Ground,
+            Esc::Str { mut buf, mut len } => match b {
+                0x07 => self.finish_string(&buf[..len]),
                 // `ESC \` is the string terminator; going through `Escape`
                 // consumes the `\` as the two-byte sequence it is.
-                0x1b => self.esc = Esc::Escape,
-                _ => {}
+                0x1b => {
+                    self.finish_string(&buf[..len]);
+                    self.esc = Esc::Escape;
+                }
+                _ => {
+                    if len < OSC_KEEP {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                    self.esc = Esc::Str { buf, len };
+                }
             },
             Esc::Csi { mut params, mut count, mut private } => {
                 match b {
@@ -338,15 +606,14 @@ impl<S: Surface> Console<S> {
                         let p = &mut params[count.min(CSI_PARAMS - 1)];
                         *p = p.saturating_mul(10).saturating_add(u16::from(b - b'0')).min(9999);
                     }
-                    b';' => count = (count + 1).min(CSI_PARAMS - 1),
-                    b'<'..=b'?' => private = true,
+                    // `:` separates sub-parameters (`38:2::r:g:b`); treated as `;`.
+                    b';' | b':' => count = (count + 1).min(CSI_PARAMS - 1),
+                    b'<'..=b'?' => private = b,
                     // Intermediates (`ESC [ ! p`): part of the sequence, no meaning.
                     0x20..=0x2f => {}
                     0x40..=0x7e => {
                         self.esc = Esc::Ground;
-                        if !private {
-                            self.csi(b, &params);
-                        }
+                        self.csi(b, &params, count, private);
                         return;
                     }
                     // CAN and SUB abort a sequence; any other control byte is
@@ -362,14 +629,92 @@ impl<S: Surface> Console<S> {
         }
     }
 
+    fn escape(&mut self, b: u8) {
+        self.esc = Esc::Ground;
+        match b {
+            b'[' => self.esc = Esc::Csi { params: [0; CSI_PARAMS], count: 0, private: 0 },
+            b']' | b'P' | b'_' | b'^' | b'X' => self.esc = Esc::Str { buf: [0; OSC_KEEP], len: 0 },
+            b'(' | b')' | b'*' | b'+' | b'#' | b'%' => self.esc = Esc::Swallow,
+            // DECSC / DECRC.
+            b'7' => self.saved = (self.row, self.col, self.pen),
+            b'8' => self.restore_cursor(),
+            // IND, NEL, RI.
+            b'D' => self.index(),
+            b'E' => {
+                self.col = 0;
+                self.index();
+            }
+            b'M' => self.reverse_index(),
+            // RIS: full reset.
+            b'c' => {
+                self.clear();
+                self.autowrap = true;
+                self.cursor_hidden = false;
+                self.alt = false;
+            }
+            // Keypad modes and the rest: no meaning here, and none may be drawn.
+            _ => {}
+        }
+    }
+
+    /// An `ESC ]` string ended: answer the two colour queries, ignore the rest
+    /// (window titles, hyperlinks, ...).
+    fn finish_string(&mut self, s: &[u8]) {
+        self.esc = Esc::Ground;
+        let (which, c) = match s {
+            b"11;?" => (b'1', self.bg),
+            b"10;?" => (b'0', self.fg),
+            _ => return,
+        };
+        // OSC 1x ; rgb:RRRR/GGGG/BBBB ST — each channel as 16 bits, 8 repeated.
+        let mut out = [0u8; 40];
+        let head = b"\x1b]1";
+        out[..3].copy_from_slice(head);
+        out[3] = which;
+        out[4..9].copy_from_slice(b";rgb:");
+        let mut n = 9;
+        for (i, v) in [c.r, c.g, c.b].into_iter().enumerate() {
+            for _ in 0..2 {
+                for nib in [v >> 4, v & 15] {
+                    out[n] = b"0123456789abcdef"[usize::from(nib)];
+                    n += 1;
+                }
+            }
+            if i < 2 {
+                out[n] = b'/';
+                n += 1;
+            }
+        }
+        out[n] = 0x1b;
+        out[n + 1] = b'\\';
+        n += 2;
+        self.reply_push(&out[..n]);
+    }
+
     fn ground(&mut self, b: u8) {
+        // A multi-byte UTF-8 sequence in progress.
+        if self.utf8.need > 0 {
+            if b & 0xC0 == 0x80 {
+                self.utf8.acc = (self.utf8.acc << 6) | u32::from(b & 0x3F);
+                self.utf8.need -= 1;
+                if self.utf8.need == 0 {
+                    let cp = self.utf8.acc;
+                    let valid = cp >= self.utf8.min && cp <= 0x10_FFFF && !(0xD800..=0xDFFF).contains(&cp);
+                    self.put_cp(if valid { cp } else { u32::from(TOFU) });
+                }
+                return;
+            }
+            // A broken sequence: show it, then treat this byte afresh.
+            self.utf8 = UTF8_IDLE;
+            self.put_cp(u32::from(TOFU));
+        }
         match b {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,
             b'\t' => {
-                let next = (self.col / 8 + 1) * 8;
-                while self.col < next.min(self.cols) {
-                    self.put_char(b' ');
+                let next = ((self.col / 8 + 1) * 8).min(self.vcols);
+                while self.col < next {
+                    self.put_cp(0x20);
                 }
             }
             // Non-destructive, as on a terminal: the erase is the space the
@@ -379,7 +724,12 @@ impl<S: Surface> Console<S> {
             // BEL has no sound to make and DEL no glyph; the font would draw
             // both as the replacement box.
             0x07 | 0x7f => {}
-            _ => self.put_char(b),
+            0x00..=0x7e => self.put_cp(u32::from(b)),
+            0xC2..=0xDF => self.utf8 = Utf8 { acc: u32::from(b & 0x1F), need: 1, min: 0x80 },
+            0xE0..=0xEF => self.utf8 = Utf8 { acc: u32::from(b & 0x0F), need: 2, min: 0x800 },
+            0xF0..=0xF4 => self.utf8 = Utf8 { acc: u32::from(b & 0x07), need: 3, min: 0x1_0000 },
+            // A stray continuation byte, or a lead that can never be valid.
+            _ => self.put_cp(u32::from(TOFU)),
         }
     }
 
@@ -387,11 +737,18 @@ impl<S: Surface> Console<S> {
     ///
     /// Positions are clamped, never wrapped or scrolled: a program that moves
     /// the cursor off the grid gets the nearest edge, as on a terminal.
-    fn csi(&mut self, final_byte: u8, params: &[u16; CSI_PARAMS]) {
+    fn csi(&mut self, final_byte: u8, params: &[u16; CSI_PARAMS], count: usize, private: u8) {
+        if private == b'?' {
+            return self.private_mode(final_byte, params, count);
+        }
+        if private != 0 {
+            // `CSI > c` and friends: parsed, no answer.
+            return;
+        }
         // A cursor sitting one past the last column is a deferred wrap, not a
         // position; every movement below starts from the last real column.
-        let last_col = self.cols - 1;
-        let last_row = self.rows - 1;
+        let last_col = self.vcols - 1;
+        let last_row = self.vrows - 1;
         let col = self.col.min(last_col);
         let p = |i: usize| usize::from(params[i]);
         // Movement counts treat 0 like "absent" and mean 1, per ECMA-48.
@@ -401,13 +758,21 @@ impl<S: Surface> Console<S> {
                 self.row = self.row.saturating_sub(n(0));
                 self.col = col;
             }
-            b'B' => {
+            b'B' | b'e' => {
                 self.row = (self.row + n(0)).min(last_row);
                 self.col = col;
             }
-            b'C' => self.col = (col + n(0)).min(last_col),
+            b'C' | b'a' => self.col = (col + n(0)).min(last_col),
             b'D' => self.col = col.saturating_sub(n(0)),
-            b'G' => self.col = (n(0) - 1).min(last_col),
+            b'E' => {
+                self.row = (self.row + n(0)).min(last_row);
+                self.col = 0;
+            }
+            b'F' => {
+                self.row = self.row.saturating_sub(n(0));
+                self.col = 0;
+            }
+            b'G' | b'`' => self.col = (n(0) - 1).min(last_col),
             b'd' => self.row = (n(0) - 1).min(last_row),
             b'H' | b'f' => {
                 self.row = (n(0) - 1).min(last_row);
@@ -415,32 +780,202 @@ impl<S: Surface> Console<S> {
             }
             b'J' => match p(0) {
                 0 => {
-                    self.blank(self.row, col, self.cols);
-                    for r in self.row + 1..self.rows {
-                        self.blank(r, 0, self.cols);
+                    self.blank(self.row, col, self.vcols);
+                    for r in self.row + 1..self.vrows {
+                        self.blank(r, 0, self.vcols);
                     }
                 }
                 1 => {
                     for r in 0..self.row {
-                        self.blank(r, 0, self.cols);
+                        self.blank(r, 0, self.vcols);
                     }
                     self.blank(self.row, 0, col + 1);
                 }
                 2 | 3 => {
-                    for r in 0..self.rows {
-                        self.blank(r, 0, self.cols);
+                    for r in 0..self.vrows {
+                        self.blank(r, 0, self.vcols);
                     }
                 }
                 _ => {}
             },
             b'K' => match p(0) {
-                0 => self.blank(self.row, col, self.cols),
+                0 => self.blank(self.row, col, self.vcols),
                 1 => self.blank(self.row, 0, col + 1),
-                2 => self.blank(self.row, 0, self.cols),
+                2 => self.blank(self.row, 0, self.vcols),
                 _ => {}
             },
-            // `m` (colours) and every sequence this console has no use for.
+            // ECH: erase n characters, in place.
+            b'X' => self.blank(self.row, col, (col + n(0)).min(self.vcols)),
+            // ICH / DCH: shift the rest of the line right / left.
+            b'@' => self.shift_cells(col, n(0), true),
+            b'P' => self.shift_cells(col, n(0), false),
+            // IL / DL: insert / delete lines within the scroll region.
+            b'L' if (self.top..=self.bot).contains(&self.row) => {
+                self.scroll_down(self.row, self.bot, n(0));
+                self.col = 0;
+            }
+            b'M' if (self.top..=self.bot).contains(&self.row) => {
+                self.scroll_up(self.row, self.bot, n(0));
+                self.col = 0;
+            }
+            // SU / SD.
+            b'S' => self.scroll_up(self.top, self.bot, n(0)),
+            b'T' => self.scroll_down(self.top, self.bot, n(0)),
+            // REP: repeat the last character.
+            b'b' => {
+                let cp = self.last_cp;
+                for _ in 0..n(0).min(self.vcols * 2) {
+                    self.put_cp(cp);
+                }
+            }
+            // DECSTBM: set the scroll region, home the cursor.
+            b'r' => {
+                let top = n(0) - 1;
+                let bot = if p(1) == 0 { last_row } else { (p(1) - 1).min(last_row) };
+                if top < bot {
+                    self.top = top;
+                    self.bot = bot;
+                    self.row = 0;
+                    self.col = 0;
+                }
+            }
+            b's' => self.saved = (self.row, self.col, self.pen),
+            b'u' => self.restore_cursor(),
+            b'm' => self.sgr(params, count),
+            // DSR and DA: the answers go to the program that asked.
+            b'n' => match p(0) {
+                5 => self.reply_push(b"\x1b[0n"),
+                6 => {
+                    let mut out = [0u8; 24];
+                    out[..2].copy_from_slice(b"\x1b[");
+                    let mut len = 2;
+                    Self::push_dec(&mut out, &mut len, self.row + 1);
+                    out[len] = b';';
+                    len += 1;
+                    Self::push_dec(&mut out, &mut len, col + 1);
+                    out[len] = b'R';
+                    len += 1;
+                    self.reply_push(&out[..len]);
+                }
+                _ => {}
+            },
+            b'c' if p(0) == 0 => self.reply_push(b"\x1b[?1;2c"),
+            // Every sequence this console has no use for.
             _ => {}
+        }
+    }
+
+    /// `CSI ? Pm h` / `l` — DEC private modes. Only the few that change what is
+    /// drawn are acted on; mouse, bracketed paste and the rest are accepted and
+    /// ignored.
+    fn private_mode(&mut self, final_byte: u8, params: &[u16; CSI_PARAMS], count: usize) {
+        let on = match final_byte {
+            b'h' => true,
+            b'l' => false,
+            _ => return,
+        };
+        for &mode in &params[..=count.min(CSI_PARAMS - 1)] {
+            match mode {
+                7 => self.autowrap = on,
+                25 => self.cursor_hidden = !on,
+                // The alternate screen. Entering clears and homes (the previous
+                // screen cannot be kept — that would cost a second grid); leaving
+                // clears again and gives back the saved cursor.
+                47 | 1047 | 1049 => {
+                    if on {
+                        self.saved = (self.row, self.col, self.pen);
+                    }
+                    self.alt = on;
+                    for r in 0..self.vrows {
+                        self.blank(r, 0, self.vcols);
+                    }
+                    self.top = 0;
+                    self.bot = self.vrows - 1;
+                    if on {
+                        self.row = 0;
+                        self.col = 0;
+                    } else {
+                        self.restore_cursor();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn restore_cursor(&mut self) {
+        let (r, c, pen) = self.saved;
+        self.row = r.min(self.vrows - 1);
+        self.col = c.min(self.vcols);
+        self.pen = pen;
+    }
+
+    /// `CSI Pm m` — Select Graphic Rendition.
+    fn sgr(&mut self, params: &[u16; CSI_PARAMS], count: usize) {
+        let n = count.min(CSI_PARAMS - 1) + 1;
+        let mut i = 0;
+        while i < n {
+            let code = params[i];
+            i += 1;
+            match code {
+                0 => self.pen = PEN_DEFAULT,
+                1 => self.pen.flags |= F_BOLD,
+                2 => self.pen.flags |= F_DIM,
+                4 => self.pen.flags |= F_UNDER,
+                7 => self.pen.flags |= F_REVERSE,
+                21 | 22 => self.pen.flags &= !(F_BOLD | F_DIM),
+                24 => self.pen.flags &= !F_UNDER,
+                27 => self.pen.flags &= !F_REVERSE,
+                30..=37 => {
+                    self.pen.fg = (code - 30) as u8;
+                    self.pen.flags |= F_FG;
+                }
+                90..=97 => {
+                    self.pen.fg = (code - 90) as u8 + 8;
+                    self.pen.flags |= F_FG;
+                }
+                39 => self.pen.flags &= !F_FG,
+                40..=47 => {
+                    self.pen.bg = (code - 40) as u8;
+                    self.pen.flags |= F_BG;
+                }
+                100..=107 => {
+                    self.pen.bg = (code - 100) as u8 + 8;
+                    self.pen.flags |= F_BG;
+                }
+                49 => self.pen.flags &= !F_BG,
+                38 | 48 => {
+                    // `5;n` (palette) or `2;r;g;b` (truecolor, stored as the nearest
+                    // palette entry).
+                    let idx = match params.get(i).copied() {
+                        Some(5) if i + 1 < n => {
+                            let v = params[i + 1].min(255) as u8;
+                            i += 2;
+                            Some(v)
+                        }
+                        Some(2) if i + 3 < n => {
+                            let v = rgb_to_palette(
+                                params[i + 1].min(255) as u8,
+                                params[i + 2].min(255) as u8,
+                                params[i + 3].min(255) as u8,
+                            );
+                            i += 4;
+                            Some(v)
+                        }
+                        _ => None,
+                    };
+                    if let Some(v) = idx {
+                        if code == 38 {
+                            self.pen.fg = v;
+                            self.pen.flags |= F_FG;
+                        } else {
+                            self.pen.bg = v;
+                            self.pen.flags |= F_BG;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -459,15 +994,17 @@ impl<S: Surface> Console<S> {
     /// a prompt is indistinguishable from output, and a screen that has stopped
     /// scrolling cannot be told apart from one that is waiting for you.
     pub fn show_cursor(&mut self) {
+        if self.cursor_hidden {
+            return;
+        }
         // A deferred wrap parks `col` one past the end; the cursor sits on the
         // last real cell, which is where a terminal draws it too.
-        let at = (self.row, self.col.min(self.cols - 1));
+        let at = (self.row, self.col.min(self.vcols - 1));
         if self.cursor == Some(at) {
             return;
         }
         self.hide_cursor();
-        let byte = self.grid[at.0][at.1];
-        self.draw_cell_in(at.0, at.1, byte, self.bg, self.fg);
+        self.paint(at.0, at.1, true);
         self.cursor = Some(at);
     }
 
@@ -476,19 +1013,67 @@ impl<S: Surface> Console<S> {
     /// over — or scrolls — a stale cursor.
     pub fn hide_cursor(&mut self) {
         if let Some((r, c)) = self.cursor.take() {
-            let byte = self.grid[r][c];
-            self.draw_cell_in(r, c, byte, self.fg, self.bg);
+            self.paint(r, c, false);
         }
     }
 
+    /// The cell erase operations leave behind: blank, in the pen's background
+    /// (so a coloured bar erased to end of line stays a coloured bar).
+    fn blank_cell(&self) -> Cell {
+        Cell { cp: 0x20, fg: 0, bg: self.pen.bg, flags: self.pen.flags & F_BG }
+    }
+
     /// Blank `row`'s cells `from..to`, redrawing only those that were not
-    /// already blank — the same economy [`Console::scroll`] has, for the same
+    /// already blank — the same economy [`Console::scroll_up`] has, for the same
     /// reason: every pixel is an uncached write to video memory.
-    fn blank(&mut self, row: usize, from: usize, to: usize) {
+    fn blank(&mut self, row: usize, mut from: usize, mut to: usize) {
+        to = to.min(self.vcols);
+        // Never leave half a two-column character behind.
+        if from > 0 && from < self.cols && self.grid[row][from].cp == CONT {
+            from -= 1;
+        }
+        if to < self.cols && self.grid[row][to].cp == CONT {
+            to += 1;
+        }
+        let blank = self.blank_cell();
         for c in from..to.min(self.cols) {
-            if self.grid[row][c] != b' ' {
-                self.grid[row][c] = b' ';
-                self.draw_cell(row, c, b' ');
+            if self.grid[row][c] != blank {
+                self.grid[row][c] = blank;
+                self.paint(row, c, false);
+            }
+        }
+    }
+
+    /// ICH (`right`) / DCH: move the cells from `col` to the end of the line by
+    /// `n`, filling the gap with blanks.
+    fn shift_cells(&mut self, col: usize, n: usize, right: bool) {
+        let w = self.vcols;
+        if col >= w {
+            return;
+        }
+        let n = n.min(w - col);
+        let blank = self.blank_cell();
+        let row = self.row;
+        let old = self.grid[row];
+        for c in col..w {
+            let next = if right {
+                if c >= col + n { old[c - n] } else { blank }
+            } else if c + n < w {
+                old[c + n]
+            } else {
+                blank
+            };
+            self.grid[row][c] = next;
+        }
+        // A two-column character cut in half by the shift is blanked.
+        for c in 0..w {
+            if self.grid[row][c].cp == CONT && (c == 0 || self.grid[row][c - 1].cp == CONT) {
+                self.grid[row][c] = BLANK;
+            }
+        }
+        for c in col..w {
+            if self.grid[row][c] != old[c] {
+                self.paint(row, c, false);
             }
         }
     }
@@ -503,10 +1088,12 @@ impl<S: Surface> Console<S> {
     ///
     /// The grid is what scrolling and erasing work from, so this is the
     /// console's own account of the screen — what a test, or a caller that wants
-    /// to know what is on the glass, can ask without reading video memory.
+    /// to know what is on the glass, can ask without reading video memory. A
+    /// character beyond the BMP shows as U+FFFD, and the right half of a
+    /// two-column character as U+FFFF.
     #[must_use]
-    pub const fn cell_at(&self, row: usize, col: usize) -> u8 {
-        self.grid[row][col]
+    pub fn cell_at(&self, row: usize, col: usize) -> char {
+        char::from_u32(u32::from(self.grid[row][col].cp)).unwrap_or('\u{FFFD}')
     }
 
     /// Write a string.
@@ -519,14 +1106,42 @@ impl<S: Surface> Console<S> {
     /// End the current line.
     pub fn newline(&mut self) {
         self.col = 0;
-        if self.row + 1 == self.rows {
-            self.scroll();
-        } else {
+        self.index();
+    }
+
+    /// Move down a row, scrolling the region if the cursor is on its last row.
+    fn index(&mut self) {
+        if self.row == self.bot {
+            // The whole screen scrolling under a log is jumped several rows at a
+            // time (see [`Console::SCROLL_ROWS`]); anything that has set a scroll
+            // region, or owns the alternate screen, is scrolled one row, which is
+            // what such a program counts on.
+            let whole = self.top == 0 && self.bot == self.vrows - 1 && !self.alt;
+            if whole {
+                let shift = Self::SCROLL_ROWS.min(self.vrows - 1);
+                self.scroll_up(0, self.vrows - 1, shift);
+                // The line that triggered this scroll moved up by `shift`; the
+                // next goes just below it, leaving `shift` blank rows to fill
+                // before the next scroll.
+                self.row = self.vrows - shift;
+            } else {
+                self.scroll_up(self.top, self.bot, 1);
+            }
+        } else if self.row + 1 < self.vrows {
             self.row += 1;
         }
     }
 
-    /// How many rows a single [`scroll`](Self::scroll) advances by.
+    /// RI: up a row, scrolling the region down if the cursor is on its first.
+    fn reverse_index(&mut self) {
+        if self.row == self.top {
+            self.scroll_down(self.top, self.bot, 1);
+        } else {
+            self.row = self.row.saturating_sub(1);
+        }
+    }
+
+    /// How many rows a single implicit scroll of the whole screen advances by.
     ///
     /// One row per scroll means a scroll on *every* line once output reaches the
     /// bottom, and each scroll rewrites almost the whole screen cell by cell,
@@ -538,16 +1153,64 @@ impl<S: Surface> Console<S> {
     /// rather than constant without leaving a distractingly large gap.
     pub const SCROLL_ROWS: usize = 8;
 
-    fn put_char(&mut self, b: u8) {
-        if self.col == self.cols {
-            self.newline();
+    /// Put one character at the cursor and advance it.
+    ///
+    /// Two-column characters take two cells (the second marked [`CONT`]) and wrap
+    /// early if only one is left; zero-width ones are not drawn at all. A
+    /// character the console cannot store (beyond the BMP) is kept as a marker so
+    /// it still occupies the right number of columns.
+    fn put_cp(&mut self, cp: u32) {
+        let w = glyph::width(cp);
+        if w == 0 {
+            return;
         }
-        self.grid[self.row][self.col] = b;
-        self.draw_cell(self.row, self.col, b);
-        self.col += 1;
+        if self.col + w > self.vcols {
+            if self.autowrap {
+                self.col = 0;
+                self.index();
+            } else {
+                self.col = self.vcols - w;
+            }
+        }
+        let (row, col) = (self.row, self.col);
+        // Writing into one half of a two-column character blanks the other half.
+        self.detach_wide(row, col);
+        if w == 2 {
+            self.detach_wide(row, col + 1);
+        }
+        let stored = if cp > 0xFFFE {
+            if w == 2 { TOFU_WIDE } else { TOFU }
+        } else {
+            cp as u16
+        };
+        let mut cell = Cell { cp: stored, fg: self.pen.fg, bg: self.pen.bg, flags: self.pen.flags };
+        self.grid[row][col] = cell;
+        if w == 2 {
+            cell.cp = CONT;
+            self.grid[row][col + 1] = cell;
+        }
+        self.paint(row, col, false);
+        self.col += w;
+        self.last_cp = cp;
     }
 
-    /// Shift the grid up one row, re-drawing only the cells that changed.
+    /// Before overwriting `(row, col)`: if it is half of a two-column character,
+    /// blank the other half.
+    fn detach_wide(&mut self, row: usize, col: usize) {
+        if col >= self.cols {
+            return;
+        }
+        if self.grid[row][col].cp == CONT && col > 0 {
+            self.grid[row][col - 1] = BLANK;
+            self.paint(row, col - 1, false);
+        } else if col + 1 < self.cols && self.grid[row][col + 1].cp == CONT {
+            self.grid[row][col + 1] = BLANK;
+            self.paint(row, col + 1, false);
+        }
+    }
+
+    /// Scroll rows `top..=bot` up by `n`, blanking the vacated rows, re-drawing
+    /// only the cells that changed.
     ///
     /// The obvious implementation shifts the grid and then redraws every cell,
     /// and on a large screen that is ruinous: at 3840x2160 the grid is over
@@ -559,62 +1222,168 @@ impl<S: Surface> Console<S> {
     /// proportional to the text rather than to the screen. Console output is
     /// mostly short lines on a wide grid, so the great majority of cells are
     /// blank both before and after and need no writes at all.
-    fn scroll(&mut self) {
-        let shift = Self::SCROLL_ROWS.min(self.rows - 1);
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                let next = if r + shift < self.rows {
-                    self.grid[r + shift][c]
-                } else {
-                    b' '
-                };
-                if self.grid[r][c] != next {
-                    self.grid[r][c] = next;
-                    self.draw_cell(r, c, next);
-                }
+    fn scroll_up(&mut self, top: usize, bot: usize, n: usize) {
+        let n = n.min(bot + 1 - top);
+        let blank = self.blank_cell();
+        for r in top..=bot {
+            self.replace_row(r, (r + n <= bot).then_some(r + n), blank);
+        }
+    }
+
+    /// Scroll rows `top..=bot` down by `n`: the mirror of [`Console::scroll_up`].
+    fn scroll_down(&mut self, top: usize, bot: usize, n: usize) {
+        let n = n.min(bot + 1 - top);
+        let blank = self.blank_cell();
+        for r in (top..=bot).rev() {
+            self.replace_row(r, (r >= top + n).then(|| r - n), blank);
+        }
+    }
+
+    /// Rewrite row `r` of the grid from row `source` (or all `blank` if none), then
+    /// draw the cells that changed. Two passes: the width of a character is read
+    /// from its right neighbour, so the whole row has to be in place before any
+    /// cell is drawn.
+    fn replace_row(&mut self, r: usize, source: Option<usize>, blank: Cell) {
+        let mut changed = [false; MAX_COLS];
+        for c in 0..self.vcols {
+            let next = source.map_or(blank, |src| self.grid[src][c]);
+            changed[c] = self.grid[r][c] != next;
+            self.grid[r][c] = next;
+        }
+        for (c, &ch) in changed.iter().enumerate().take(self.vcols) {
+            if ch {
+                self.paint(r, c, false);
             }
         }
-        // The line that triggered this scroll sat on the last row and has moved
-        // up to `rows - 1 - shift`; the next line goes just below it, leaving
-        // `shift` blank rows at the bottom to fill before the next scroll.
-        self.row = self.rows - shift;
+    }
+
+    // -----------------------------------------------------------------------
+    // Drawing
+    // -----------------------------------------------------------------------
+
+    /// The colours a cell is drawn in: its own where it sets them, the console's
+    /// defaults otherwise, then bold, dim and reverse applied.
+    fn resolve(&self, cell: Cell) -> (Rgb, Rgb) {
+        let mut fg = if cell.flags & F_FG != 0 { palette(cell.fg) } else { self.fg };
+        let bg = if cell.flags & F_BG != 0 { palette(cell.bg) } else { self.bg };
+        if cell.flags & F_BOLD != 0 {
+            fg = if cell.flags & F_FG == 0 {
+                Rgb::WHITE
+            } else if cell.fg < 8 {
+                palette(cell.fg + 8)
+            } else {
+                fg
+            };
+        }
+        if cell.flags & F_DIM != 0 {
+            fg = bg.blend(fg, 140);
+        }
+        if cell.flags & F_REVERSE != 0 { (bg, fg) } else { (fg, bg) }
+    }
+
+    /// Draw the cell at `(row, col)`; `invert` swaps its colours (the cursor).
+    ///
+    /// The right half of a two-column character draws nothing: the left half
+    /// painted both.
+    fn paint(&mut self, row: usize, col: usize, invert: bool) {
+        let cell = self.grid[row][col];
+        if cell.cp == CONT {
+            return;
+        }
+        let (mut fg, mut bg) = self.resolve(cell);
+        if invert {
+            core::mem::swap(&mut fg, &mut bg);
+        }
+        let wide = col + 1 < self.cols && self.grid[row][col + 1].cp == CONT;
+        self.draw_glyph(row, col, u32::from(cell.cp), wide, fg, bg);
+        if cell.flags & F_UNDER != 0 {
+            let cw = self.font.width() * self.scale;
+            let ch = self.font.height() * self.scale;
+            let x0 = self.origin_x + col * cw;
+            let y0 = self.origin_y + row * ch;
+            let span = if wide { 2 * cw } else { cw };
+            self.surface.fill(x0, y0 + ch - 2 * self.scale, span, self.scale, fg);
+        }
     }
 
     /// Blit one glyph, background included, so a redraw needs no prior clear.
     ///
-    /// Each font pixel carries a coverage value, and a partly-covered one is
-    /// drawn as a mix of the two colours (see [`Rgb::blend`]). The two ends of
-    /// that range are the overwhelming majority of pixels in any glyph and are
-    /// taken without arithmetic — every pixel here is a write to uncached video
-    /// memory, so a multiply that only matters on an edge should not be paid
-    /// for the interior.
-    fn draw_cell(&mut self, row: usize, col: usize, byte: u8) {
-        self.draw_cell_in(row, col, byte, self.fg, self.bg);
-    }
+    /// Characters come from three places, in this order: [`glyph`]'s procedural
+    /// drawing (box, blocks, Braille, shapes — exact at any scale), the font, and
+    /// the replacement box. Each font pixel carries a coverage value, and a
+    /// partly-covered one is drawn as a mix of the two colours (see
+    /// [`Rgb::blend`]); the two ends of that range are the overwhelming majority
+    /// of pixels and are taken without arithmetic — every pixel here is a write to
+    /// uncached video memory, so a multiply that only matters on an edge should
+    /// not be paid for the interior.
+    fn draw_glyph(&mut self, row: usize, col: usize, cp: u32, wide: bool, fg: Rgb, bg: Rgb) {
+        let (fw, fh, sc) = (self.font.width(), self.font.height(), self.scale);
+        let (cw, ch) = (fw * sc, fh * sc);
+        let x0 = self.origin_x + col * cw;
+        let y0 = self.origin_y + row * ch;
+        let span = if wide { 2 * cw } else { cw };
 
-    /// [`Console::draw_cell`] in colours the caller names — the cursor is the
-    /// one cell drawn with them swapped.
-    fn draw_cell_in(&mut self, row: usize, col: usize, byte: u8, fg: Rgb, bg: Rgb) {
-        let (fw, fh) = (self.font.width(), self.font.height());
-        let cell_w = fw * self.scale;
-        let cell_h = fh * self.scale;
-        let x0 = self.origin_x + col * cell_w;
-        let y0 = self.origin_y + row * cell_h;
-        let cell = self.font.cell(byte);
+        // A character wider than one cell has no glyph here: an outlined box over
+        // both cells, so the layout stays right and the gap is visible.
+        if wide || cp == u32::from(TOFU_WIDE) {
+            self.surface.fill(x0, y0, span, ch, bg);
+            let (ix, iy) = (cw / 6, ch / 6);
+            let (bx, by, bw, bh) = (x0 + ix, y0 + iy, span - 2 * ix, ch - 2 * iy);
+            let t = sc.max(1);
+            self.surface.fill(bx, by, bw, t, fg);
+            self.surface.fill(bx, by + bh - t, bw, t, fg);
+            self.surface.fill(bx, by, t, bh, fg);
+            self.surface.fill(bx + bw - t, by, t, bh, fg);
+            return;
+        }
 
-        for gy in 0..fh {
-            for gx in 0..fw {
-                let color = match cell[gy * fw + gx] {
-                    0x00 => bg,
-                    0xFF => fg,
-                    coverage => bg.blend(fg, coverage),
-                };
-                let px = x0 + gx * self.scale;
-                let py = y0 + gy * self.scale;
-                if self.scale == 1 {
-                    self.surface.put(px, py, color);
-                } else {
-                    self.surface.fill(px, py, self.scale, self.scale, color);
+        match glyph::kind(cp) {
+            Some(glyph::Kind::Shape) => {
+                for gy in 0..ch {
+                    for gx in 0..cw {
+                        let cov = glyph::shape_coverage(cp, gx, gy, cw, ch).unwrap_or(0);
+                        let color = match cov {
+                            0 => bg,
+                            255 => fg,
+                            c => bg.blend(fg, c),
+                        };
+                        self.surface.put(x0 + gx, y0 + gy, color);
+                    }
+                }
+            }
+            Some(kind) => {
+                self.surface.fill(x0, y0, cw, ch, bg);
+                let surface = &mut self.surface;
+                match kind {
+                    glyph::Kind::Box => glyph::paint_box(cp, cw, ch, &mut |x, y, w, h| {
+                        surface.fill(x0 + x, y0 + y, w, h, fg);
+                    }),
+                    glyph::Kind::Block => glyph::paint_block(cp, cw, ch, &mut |x, y, w, h, shade| {
+                        let c = if shade == 255 { fg } else { bg.blend(fg, shade) };
+                        surface.fill(x0 + x, y0 + y, w, h, c);
+                    }),
+                    _ => glyph::paint_braille(cp, cw, ch, &mut |x, y, w, h| {
+                        surface.fill(x0 + x, y0 + y, w, h, fg);
+                    }),
+                }
+            }
+            None => {
+                let cell = self.font.cell_cp(cp);
+                for gy in 0..fh {
+                    for gx in 0..fw {
+                        let color = match cell[gy * fw + gx] {
+                            0x00 => bg,
+                            0xFF => fg,
+                            coverage => bg.blend(fg, coverage),
+                        };
+                        let px = x0 + gx * sc;
+                        let py = y0 + gy * sc;
+                        if sc == 1 {
+                            self.surface.put(px, py, color);
+                        } else {
+                            self.surface.fill(px, py, sc, sc, color);
+                        }
+                    }
                 }
             }
         }

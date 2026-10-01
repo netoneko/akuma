@@ -2067,9 +2067,11 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
         // `stty rows N cols M` (and any program resizing its terminal) is now
         // **kept**, in the process's own `TerminalState` — for a console process
         // that is the console's shared one, so the next `stty size` and the
-        // shell's line editor see it. It does not resize the framebuffer's grid,
-        // which is fixed at boot; it tells programs how much of it to use, e.g.
-        // `stty rows 30 cols 90` to stay inside a region of the screen that works.
+        // shell's line editor see it. And for the console it is **the printing
+        // area**: text wraps and scrolls inside the top-left `cols` x `rows` of the
+        // screen and nothing is drawn outside it — `stty rows 30 cols 90` to stay
+        // inside a part of the screen that works, or to leave the rest for
+        // something else. The grid itself is fixed at boot; this narrows it.
         TIOCSWINSZ => {
             if arg == 0 {
                 return Some(errno::EFAULT);
@@ -2082,6 +2084,15 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
             if rows != 0 && cols != 0
                 && let Some(ts) = akuma_exec::process::current_terminal_state()
             {
+                // On **the console's** terminal this also narrows the printing
+                // area on the screen, and what is stored is what is in force (the
+                // request clamped to the screen), so `stty size` never claims a
+                // size the glass does not have.
+                let (rows, cols) = if crate::console::is_console_terminal(&ts) {
+                    crate::multiboot2::fb_set_view(cols, rows).unwrap_or((rows, cols))
+                } else {
+                    (rows, cols)
+                };
                 let mut ts = ts.lock();
                 ts.term_height = rows;
                 ts.term_width = cols;

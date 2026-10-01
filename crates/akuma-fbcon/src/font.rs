@@ -19,13 +19,16 @@
 //! # The table
 //!
 //! One byte per pixel, `0x00` for untouched and `0xFF` for solid, row-major
-//! within a cell, in code-point order from `FIRST` through `LAST`. A byte
-//! outside that range renders as the replacement box on the end of the table
-//! rather than as whatever follows it — a console that silently draws garbage
-//! for a stray byte is worse than one that draws a visible box.
+//! within a cell, in the order of the generated range list (printable ASCII,
+//! Latin-1, Latin Extended-A, punctuation, arrows, shapes, a few symbols — see
+//! `build.rs`). A code point outside those ranges renders as the replacement box
+//! on the end of the table rather than as whatever follows it — a console that
+//! silently draws garbage for a stray character is worse than one that draws a
+//! visible box. Box drawing, block elements and Braille are not in the tables:
+//! the console draws those itself.
 //!
-//! Coverage rather than bits costs eight times the bytes (27 KB for IBM Plex
-//! Mono, 12 KB for Spleen) and buys two things: an outline font that does not
+//! Coverage rather than bits costs eight times the bytes (about 170 KB for IBM
+//! Plex Mono and 75 KB for Spleen over the current ranges) and buys two things: an outline font that does not
 //! have visibly uneven stems, and one drawing path in [`crate::Console`] rather
 //! than one per font. Only the font the kernel actually names is linked.
 //!
@@ -36,17 +39,30 @@
 include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono.rs"));
 include!(concat!(env!("OUT_DIR"), "/spleen.rs"));
 
-/// A fixed-cell font: one coverage value per pixel, one cell per code point.
+/// A fixed-cell font: one coverage value per pixel, one cell per baked code point.
 pub struct Font {
     name: &'static str,
     width: usize,
     height: usize,
-    first: u8,
-    last: u8,
-    /// `(last - first + 2)` cells of `width * height` bytes. The extra cell on
-    /// the end is the replacement box, so an out-of-range byte is an index
-    /// rather than a branch into a separate array.
+    /// Inclusive `(first, last)` code-point ranges, in the order their cells are
+    /// stored. The generator and this lookup walk the same list, so the order is
+    /// part of the table's format.
+    ranges: &'static [(u32, u32)],
+    /// One cell of `width * height` bytes per code point in `ranges`, then the
+    /// replacement box. An absent code point is an index rather than a branch
+    /// into a separate array.
     cells: &'static [u8],
+}
+
+/// Cells a range list covers.
+const fn cells_in(ranges: &[(u32, u32)]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < ranges.len() {
+        n += (ranges[i].1 - ranges[i].0 + 1) as usize;
+        i += 1;
+    }
+    n
 }
 
 impl Font {
@@ -54,26 +70,24 @@ impl Font {
     ///
     /// # Panics
     ///
-    /// At compile time, if the table is not one cell per code point plus a
-    /// replacement. The generator and this constructor have to agree about the
-    /// layout and there is no way to check it later — a short table would read
+    /// At compile time, if the table is not one cell per code point in `ranges`
+    /// plus a replacement. The generator and this constructor have to agree about
+    /// the layout and there is no way to check it later — a short table would read
     /// past its end at runtime, in a kernel, on the path that reports failures.
     #[must_use]
     pub const fn new(
         name: &'static str,
         width: usize,
         height: usize,
-        first: u8,
-        last: u8,
+        ranges: &'static [(u32, u32)],
         cells: &'static [u8],
     ) -> Self {
         assert!(width > 0 && height > 0, "a font with no pixels in a cell");
-        assert!(first <= last, "a font whose range runs backwards");
         assert!(
-            cells.len() == (last as usize - first as usize + 2) * width * height,
+            cells.len() == (cells_in(ranges) + 1) * width * height,
             "the generated table is not one cell per code point plus a replacement"
         );
-        Self { name, width, height, first, last, cells }
+        Self { name, width, height, ranges, cells }
     }
 
     /// What to call this font in a boot message.
@@ -94,19 +108,41 @@ impl Font {
         self.height
     }
 
+    /// The cell index of `cp`, or `None` if no table holds it.
+    fn index_of(&self, cp: u32) -> Option<usize> {
+        let mut base = 0usize;
+        for &(first, last) in self.ranges {
+            if cp >= first && cp <= last {
+                return Some(base + (cp - first) as usize);
+            }
+            base += (last - first + 1) as usize;
+        }
+        None
+    }
+
+    /// Does this font carry a glyph for `cp`? (`false` means the replacement box.)
+    #[must_use]
+    pub fn has(&self, cp: u32) -> bool {
+        self.index_of(cp).is_some()
+    }
+
     /// One glyph's coverage, row-major, [`Font::width`] * [`Font::height`] bytes.
     ///
-    /// A byte outside the font's range gives the replacement box.
+    /// A code point the font does not carry gives the replacement box.
     #[must_use]
-    pub fn cell(&self, byte: u8) -> &'static [u8] {
-        let index = if byte < self.first || byte > self.last {
-            (self.last - self.first + 1) as usize
-        } else {
-            (byte - self.first) as usize
-        };
+    pub fn cell_cp(&self, cp: u32) -> &'static [u8] {
+        let index = self.index_of(cp).unwrap_or_else(|| cells_in(self.ranges));
         let size = self.width * self.height;
         let start = index * size;
         &self.cells[start..start + size]
+    }
+
+    /// [`Font::cell_cp`] for a single byte, as Latin-1: `0x20..=0x7E` is ASCII,
+    /// `0xA0..=0xFF` Latin-1, the rest the replacement box. Kept for callers that
+    /// hold bytes, not code points.
+    #[must_use]
+    pub fn cell(&self, byte: u8) -> &'static [u8] {
+        self.cell_cp(u32::from(byte))
     }
 
     /// How much of pixel `(x, y)` of `byte`'s glyph is ink, from 0 to 255.
@@ -116,9 +152,15 @@ impl Font {
     /// has nothing left to print with.
     #[must_use]
     pub fn coverage(&self, byte: u8, x: usize, y: usize) -> u8 {
+        self.coverage_cp(u32::from(byte), x, y)
+    }
+
+    /// [`Font::coverage`] by code point.
+    #[must_use]
+    pub fn coverage_cp(&self, cp: u32, x: usize, y: usize) -> u8 {
         if x >= self.width || y >= self.height {
             return 0;
         }
-        self.cell(byte)[y * self.width + x]
+        self.cell_cp(cp)[y * self.width + x]
     }
 }

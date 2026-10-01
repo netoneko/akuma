@@ -57,6 +57,7 @@
 
 pub mod console;
 pub mod font;
+pub mod glyph;
 pub mod format;
 
 pub use console::Console;

@@ -59,6 +59,13 @@ pub fn set_size(rows: u16, cols: u16) {
     }
 }
 
+/// Is `ts` the console's own terminal state — the one every console-attached
+/// process shares — rather than a session's private one?
+#[must_use]
+pub fn is_console_terminal(ts: &Arc<Spinlock<TerminalState>>) -> bool {
+    TERM.lock().as_ref().is_some_and(|t| Arc::ptr_eq(t, ts))
+}
+
 /// The console channel, or `None` before [`init`].: keyboard bytes in `stdin_buffer`, the line
 /// discipline's echo in `buffer`.
 ///
@@ -276,6 +283,13 @@ pub fn pump_once() -> bool {
             }
             None => break,
         }
+    }
+    // The framebuffer console's answers to the program's terminal queries
+    // (`ESC[6n` and friends) are typed in exactly like keys: a terminal replies on
+    // the line the program reads. Without this busybox's line editor waits out a
+    // timeout at every prompt, and a TUI waits to learn the terminal's colours.
+    if n < inbuf.len() {
+        n += crate::multiboot2::fb_take_reply(&mut inbuf[n..]);
     }
     if n > 0 {
         // **Through the shared line discipline, not into the FIFO.**

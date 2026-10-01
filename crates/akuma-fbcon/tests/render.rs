@@ -143,12 +143,14 @@ fn an_unmapped_byte_draws_the_replacement_box() {
     for font in [DEFAULT_FONT, &font::SPLEEN] {
         let box_glyph = font.cell(0x00);
         assert!(box_glyph.iter().any(|&c| c != 0), "the replacement box is blank");
-        for byte in [0x00, 0x1F, 0x7F, 0x80, 0xFF] {
+        // 0x80..=0x9F are C1 controls and 0xA0.. is Latin-1 now, so `0xFF` is `ÿ`.
+        for byte in [0x00, 0x1F, 0x7F, 0x80, 0x9F] {
             assert_eq!(font.cell(byte), box_glyph, "byte {byte:#04x} in {}", font.name());
         }
         // ...and the code points that *are* mapped keep their own glyphs.
         assert_ne!(font.cell(b' '), box_glyph);
         assert_ne!(font.cell(b'~'), box_glyph);
+        assert_ne!(font.cell(0xFF), box_glyph, "ÿ is a real glyph now");
     }
 }
 
@@ -550,13 +552,13 @@ fn term() -> Console<MemSurface> {
 
 fn row_text(con: &Console<MemSurface>, row: usize) -> String {
     let cols = con.cols();
-    (0..cols).map(|c| char::from(con.cell_at(row, c))).collect::<String>().trim_end().to_string()
+    (0..cols).map(|c| con.cell_at(row, c)).collect::<String>().trim_end().to_string()
 }
 
 /// Prove the pixels agree with the grid for every cell of `row`.
 fn assert_row_on_glass(con: Console<MemSurface>, row: usize) {
     let (cols, font) = (con.cols(), con.font());
-    let want: Vec<u8> = (0..cols).map(|c| con.cell_at(row, c)).collect();
+    let want: Vec<u8> = (0..cols).map(|c| con.cell_at(row, c) as u8).collect();
     let s = con.into_surface();
     let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
     for (c, &b) in want.iter().enumerate() {
@@ -592,7 +594,7 @@ fn backspace_at_column_zero_stays_put() {
 #[test]
 fn escape_sequences_are_never_drawn() {
     let mut con = term();
-    con.write_str_bytes("a\x1b[31mb\x1b[0m\x1b[?25h\x1b[?2004hc\x1b]0;title\x07d\x1bce");
+    con.write_str_bytes("a\x1b[31mb\x1b[0m\x1b[?25h\x1b[?2004hc\x1b]0;title\x07d\x1b=e");
     assert_eq!(row_text(&con, 0), "abcde");
 }
 
@@ -667,7 +669,7 @@ fn clear_screen_and_home() {
 fn absolute_positioning_is_one_based_and_clamped() {
     let mut con = term();
     con.write_str_bytes("\x1b[3;5Hx");
-    assert_eq!(con.cell_at(2, 4), b'x');
+    assert_eq!(con.cell_at(2, 4), 'x');
     con.write_str_bytes("\x1b[;;H");
     assert_eq!(con.cursor(), (0, 0));
     con.write_str_bytes("\x1b[500;500H");
@@ -789,6 +791,326 @@ fn a_cursor_survives_a_scroll() {
     for _ in 0..con.rows() + 3 {
         con.write_str_bytes("line\n");
     }
+    con.show_cursor();
+    assert_eq!(con.into_surface().out_of_bounds, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Unicode, attributes, wide characters, scrolling regions, replies, the view.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn utf8_text_is_decoded_not_drawn_byte_by_byte() {
+    // Before 2026-10-01 every byte of a multi-byte character was its own box.
+    let mut con = term();
+    con.write_str_bytes("café ─ ● naïve · Łódź");
+    assert_eq!(row_text(&con, 0), "café ─ ● naïve · Łódź");
+}
+
+#[test]
+fn utf8_split_across_writes_still_decodes() {
+    let mut con = term();
+    for b in "é─".bytes() {
+        con.write_byte(b);
+    }
+    assert_eq!(row_text(&con, 0), "é─");
+    assert_eq!(con.cursor(), (0, 2), "two characters, two columns");
+}
+
+#[test]
+fn invalid_utf8_shows_one_box_per_fault_and_recovers() {
+    let mut con = term();
+    for b in [b'a', 0xC3, b'b', 0xFF, b'c', 0xE2, 0x94] {
+        con.write_byte(b);
+    }
+    con.write_byte(b'd'); // the truncated 3-byte sequence is broken by 'd'
+    let t = row_text(&con, 0);
+    assert_eq!(t.chars().filter(|&c| c == '\u{FFFD}').count(), 3, "{t:?}");
+    assert!(t.starts_with('a') && t.contains('b') && t.contains('c') && t.ends_with('d'));
+}
+
+#[test]
+fn overlong_and_surrogate_encodings_are_refused() {
+    let mut con = term();
+    for b in [0xC0, 0x80, 0xED, 0xA0, 0x80] {
+        con.write_byte(b);
+    }
+    let t = row_text(&con, 0);
+    assert!(t.chars().all(|c| c == '\u{FFFD}'), "{t:?}");
+}
+
+#[test]
+fn a_wide_character_takes_two_columns_and_wraps_early() {
+    let mut con = term();
+    con.write_str_bytes("中");
+    assert_eq!(con.cursor(), (0, 2));
+    assert_eq!(con.cell_at(0, 0), '中');
+    assert_eq!(con.cell_at(0, 1), '\u{FFFF}', "the right half is a continuation");
+    // One column left on the line: a wide character wraps instead of splitting.
+    let mut con = term();
+    let cols = con.cols();
+    for _ in 0..cols - 1 {
+        con.write_byte(b'x');
+    }
+    con.write_str_bytes("中");
+    assert_eq!(con.cursor(), (1, 2), "wrapped to the next line");
+}
+
+#[test]
+fn an_emoji_keeps_the_line_aligned() {
+    let mut con = term();
+    con.write_str_bytes("a😂b");
+    // a, the emoji (2 columns), b: b lands in column 3.
+    assert_eq!(con.cursor(), (0, 4));
+    assert_eq!(con.cell_at(0, 3), 'b');
+}
+
+#[test]
+fn zero_width_characters_take_no_column() {
+    let mut con = term();
+    con.write_str_bytes("a\u{200D}\u{FE0F}b");
+    assert_eq!(row_text(&con, 0), "ab");
+}
+
+#[test]
+fn overwriting_half_a_wide_character_blanks_the_other_half() {
+    let mut con = term();
+    con.write_str_bytes("中\r");
+    con.write_byte(b'x'); // lands on the left half
+    assert_eq!(con.cell_at(0, 0), 'x');
+    assert_eq!(con.cell_at(0, 1), ' ', "the orphaned right half is blank");
+}
+
+#[test]
+fn box_drawing_is_drawn_without_gaps_between_cells() {
+    // A horizontal rule across five cells must be one unbroken run of pixels.
+    let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_fg(Rgb::WHITE);
+    con.clear();
+    con.write_str_bytes("─────");
+    let font = con.font();
+    let (cw, ch) = (font.width(), font.height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    let y = (0..ch).find(|&y| s.at(mx, my + y) == Rgb::WHITE).expect("a line");
+    for x in 0..5 * cw {
+        assert_eq!(s.at(mx + x, my + y), Rgb::WHITE, "gap at x={x}");
+    }
+}
+
+#[test]
+fn a_filled_circle_and_an_arrow_are_drawn_not_boxed() {
+    let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_fg(Rgb::WHITE);
+    con.clear();
+    con.write_str_bytes("●→");
+    let font = con.font();
+    let (cw, ch) = (font.width(), font.height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    let ink = |c: usize| {
+        (0..ch).flat_map(|y| (0..cw).map(move |x| (x, y)))
+            .filter(|&(x, y)| s.at(mx + c * cw + x, my + y) != Rgb::BLACK)
+            .count()
+    };
+    assert!(ink(0) > 40, "● drew {} pixels", ink(0));
+    assert!(ink(1) > 12, "→ drew {} pixels", ink(1));
+    // The replacement box is a hollow rectangle: its centre is empty. A disc's is not.
+    let (cx, cy) = (mx + cw / 2, my + ch * 55 / 100);
+    assert_eq!(s.at(cx, cy), Rgb::WHITE, "● is solid in the middle");
+}
+
+#[test]
+fn colours_and_attributes_are_stored_per_cell() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[31mR\x1b[0mn\x1b[1mB\x1b[0m");
+    let font = con.font();
+    let (cw, ch) = (font.width(), font.height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    let s = &s;
+    let brightest = |col: usize| {
+        (0..ch).flat_map(|y| (0..cw).map(move |x| s.at(mx + col * cw + x, my + y)))
+            .max_by_key(|c| u32::from(c.r) + u32::from(c.g) + u32::from(c.b)).unwrap()
+    };
+    assert_eq!(brightest(0), Rgb::new(0xE0, 0x50, 0x50), "ESC[31m is the palette red");
+    assert_ne!(brightest(1), Rgb::new(0xE0, 0x50, 0x50), "ESC[0m ends it");
+    assert_eq!(brightest(2), Rgb::WHITE, "bold default text is bright");
+}
+
+#[test]
+fn reverse_video_swaps_foreground_and_background() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[7m \x1b[0m");
+    let (cw, ch) = (con.font().width(), con.font().height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    // A reversed space is a solid block of the foreground colour.
+    for y in 0..ch {
+        for x in 0..cw {
+            assert_eq!(s.at(mx + x, my + y), Rgb::WHITE, "({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn truecolor_is_mapped_to_the_nearest_palette_entry() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[38;2;255;0;0mX\x1b[38;5;21mY");
+    let (cw, ch) = (con.font().width(), con.font().height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    let s = &s;
+    let top = |col: usize| {
+        (0..ch).flat_map(|y| (0..cw).map(move |x| s.at(mx + col * cw + x, my + y)))
+            .max_by_key(|c| u32::from(c.r) + u32::from(c.g) + u32::from(c.b)).unwrap()
+    };
+    assert_eq!(top(0), Rgb::new(255, 0, 0), "pure red is cube entry 196");
+    assert_eq!(top(1), Rgb::new(0, 0, 255), "palette 21 is pure blue");
+}
+
+#[test]
+fn erase_characters_insert_and_delete_work_in_place() {
+    let mut con = term();
+    con.write_str_bytes("abcdef\x1b[4D\x1b[2X"); // erase 2 at column 2
+    assert_eq!(row_text(&con, 0), "ab  ef");
+    let mut con = term();
+    con.write_str_bytes("abcdef\x1b[4D\x1b[2@"); // insert 2 blanks at column 2
+    assert_eq!(row_text(&con, 0), "ab  cdef");
+    let mut con = term();
+    con.write_str_bytes("abcdef\x1b[4D\x1b[2P"); // delete 2 at column 2
+    assert_eq!(row_text(&con, 0), "abef");
+}
+
+#[test]
+fn repeat_repeats_the_last_character() {
+    let mut con = term();
+    con.write_str_bytes("─\x1b[4b");
+    assert_eq!(row_text(&con, 0), "─────");
+}
+
+#[test]
+fn insert_and_delete_line_shift_the_rows_below() {
+    let mut con = term();
+    con.write_str_bytes("one\r\ntwo\r\nthree\x1b[2;1H\x1b[L");
+    assert_eq!(row_text(&con, 1), "");
+    assert_eq!(row_text(&con, 2), "two");
+    assert_eq!(row_text(&con, 3), "three");
+    con.write_str_bytes("\x1b[M");
+    assert_eq!(row_text(&con, 1), "two");
+    assert_eq!(row_text(&con, 2), "three");
+}
+
+#[test]
+fn a_scroll_region_scrolls_only_its_rows_one_at_a_time() {
+    let mut con = term();
+    con.write_str_bytes("top\x1b[2;4r"); // rows 2..4 scroll; row 1 does not
+    con.write_str_bytes("\x1b[2;1Hr2\r\nr3\r\nr4\r\nr5");
+    assert_eq!(row_text(&con, 0), "top", "outside the region: untouched");
+    assert_eq!(row_text(&con, 1), "r3");
+    assert_eq!(row_text(&con, 2), "r4");
+    assert_eq!(row_text(&con, 3), "r5", "scrolled by exactly one row");
+}
+
+#[test]
+fn save_and_restore_cursor() {
+    let mut con = term();
+    con.write_str_bytes("ab\x1b7\r\n\r\nxx\x1b8Z");
+    assert_eq!(con.cell_at(0, 2), 'Z');
+    let mut con = term();
+    con.write_str_bytes("ab\x1b[s\x1b[3;3H\x1b[uZ");
+    assert_eq!(con.cell_at(0, 2), 'Z');
+}
+
+#[test]
+fn the_alternate_screen_clears_on_entry_and_exit() {
+    let mut con = term();
+    con.write_str_bytes("shell$ ");
+    con.write_str_bytes("\x1b[?1049h");
+    assert_eq!(row_text(&con, 0), "", "entry clears");
+    con.write_str_bytes("\x1b[1;1Hfull screen app");
+    con.write_str_bytes("\x1b[?1049l");
+    assert_eq!(row_text(&con, 0), "", "exit clears");
+    assert_eq!(con.cursor(), (0, 7), "the cursor comes back");
+}
+
+#[test]
+fn the_terminal_answers_cursor_position_and_device_queries() {
+    let mut con = term();
+    con.write_str_bytes("abc\x1b[6n");
+    let mut out = [0u8; 32];
+    let n = con.take_reply(&mut out);
+    assert_eq!(&out[..n], b"\x1b[1;4R", "row 1, column 4");
+    assert_eq!(con.take_reply(&mut out), 0, "taken once");
+    con.write_str_bytes("\x1b[c");
+    let n = con.take_reply(&mut out);
+    assert_eq!(&out[..n], b"\x1b[?1;2c");
+    con.write_str_bytes("\x1b[5n");
+    let n = con.take_reply(&mut out);
+    assert_eq!(&out[..n], b"\x1b[0n");
+}
+
+#[test]
+fn the_terminal_answers_a_background_colour_query() {
+    let mut con = term();
+    con.write_str_bytes("\x1b]11;?\x07");
+    let mut out = [0u8; 48];
+    let n = con.take_reply(&mut out);
+    let s = core::str::from_utf8(&out[..n]).unwrap();
+    assert!(s.starts_with("\x1b]11;rgb:") && s.ends_with("\x1b\\"), "{s:?}");
+    // Other OSC strings (titles) get no answer.
+    con.write_str_bytes("\x1b]0;a title\x07");
+    assert_eq!(con.take_reply(&mut out), 0);
+}
+
+#[test]
+fn the_printing_area_wraps_and_scrolls_inside_the_view() {
+    let mut con = term();
+    con.set_view(10, 5);
+    assert_eq!((con.cols(), con.rows()), (10, 5));
+    con.write_str_bytes("0123456789ABC");
+    assert_eq!(row_text(&con, 0), "0123456789");
+    assert_eq!(row_text(&con, 1), "ABC", "wrapped at column 10, not the screen edge");
+    for _ in 0..9 {
+        con.write_str_bytes("\r\nline");
+    }
+    assert!(con.cursor().0 < 5, "scrolled inside five rows");
+}
+
+#[test]
+fn narrowing_the_view_blanks_what_is_outside_it_on_the_glass() {
+    let mut con = term();
+    let cols = con.cols();
+    for r in 0..3 {
+        con.write_str_bytes(&format!("{}\r\n", "x".repeat(cols)));
+        let _ = r;
+    }
+    con.set_view(20, 2);
+    let (cw, ch) = (con.font().width(), con.font().height());
+    let s = con.into_surface();
+    let (mx, my) = Console::<MemSurface>::auto_margin(s.w, s.h);
+    // A pixel in column 30 (outside the view) and in row 2 (outside) is background.
+    assert_eq!(s.at(mx + 30 * cw + cw / 2, my + ch / 2), Rgb::BLACK, "right of the view");
+    assert_eq!(s.at(mx + 2, my + 2 * ch + ch / 2), Rgb::BLACK, "below the view");
+}
+
+#[test]
+fn a_view_larger_than_the_screen_is_clamped() {
+    let mut con = term();
+    let (c, r) = (con.max_cols(), con.max_rows());
+    con.set_view(10_000, 10_000);
+    assert_eq!((con.cols(), con.rows()), (c, r));
+    con.set_view(0, 0);
+    assert_eq!((con.cols(), con.rows()), (1, 1));
+}
+
+#[test]
+fn drawing_never_escapes_the_surface_with_every_new_feature() {
+    let mut con = term();
+    con.write_str_bytes("\x1b[7m中😂─●→✓\x1b[0m\x1b[9999;9999H中\x1b[999@\x1b[999P\x1b[999L\x1b[999M\x1b[999S\x1b[999T");
+    con.write_str_bytes("\x1b[?1049h\x1b[2;3r\r\n\r\n\r\n\x1b[?1049l");
+    con.set_view(3, 3);
+    con.write_str_bytes("wrap wrap wrap 中中中");
     con.show_cursor();
     assert_eq!(con.into_surface().out_of_bounds, 0);
 }

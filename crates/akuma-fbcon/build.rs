@@ -23,10 +23,13 @@
 //! to reach. Spleen stays a submodule — its repo is small. Either way the table
 //! is generated from the file by `build.rs`, never hand-written.
 //!
-//! Only `0x20..=0x7E` is emitted. Both fonts carry far more — Spleen has
-//! Latin-1, box drawing and Braille; IBM Plex Mono has most of Latin and
-//! Cyrillic — and a kernel console that cannot decode UTF-8 has no way to reach
-//! any of it.
+//! Which code points are emitted is [`RANGES`]: printable ASCII, Latin-1,
+//! Latin Extended-A, general punctuation, arrows, geometric shapes and a few
+//! symbols — enough for a TUI such as late.sh. **Box drawing, block elements and
+//! Braille are deliberately not here**: the console draws those itself, per cell,
+//! because a font's line glyphs leave gaps at the cell edge once they are scaled
+//! and anti-aliased, and a box that does not close is worse than no box. A code
+//! point in [`RANGES`] that a face has no glyph for gets the replacement box.
 
 use std::collections::HashMap;
 use std::env;
@@ -36,12 +39,40 @@ use std::path::{Path, PathBuf};
 
 use ab_glyph::{Font as _, FontRef, point};
 
-/// First code point emitted.
-const FIRST: u8 = 0x20;
-/// Last code point emitted.
-const LAST: u8 = 0x7E;
-/// Cells in a table: one per code point, plus the replacement box on the end.
-const CELLS: usize = (LAST - FIRST + 2) as usize;
+/// First printable ASCII code point — the range the cell is *laid out* from.
+const FIRST: u32 = 0x20;
+/// Last printable ASCII code point.
+const LAST: u32 = 0x7E;
+
+/// Every range baked into the tables, in the order their cells are stored.
+/// `font.rs` looks a code point up by walking exactly this list, so the order is
+/// part of the format: the generated `.rs` carries a copy.
+const RANGES: &[(u32, u32)] = &[
+    (0x0020, 0x007E), // printable ASCII
+    (0x00A0, 0x00FF), // Latin-1 Supplement
+    (0x0100, 0x017F), // Latin Extended-A (Polish, Czech, Turkish, ...)
+    (0x2010, 0x2027), // dashes, quotes, bullet, ellipsis
+    (0x2030, 0x203A), // per mille, primes, guillemets
+    (0x20AC, 0x20AC), // euro
+    (0x2190, 0x21FF), // arrows
+    (0x25A0, 0x25FF), // geometric shapes: squares, circles, triangles
+    (0x2605, 0x2606), // stars
+    (0x2660, 0x2667), // card suits
+    (0x266A, 0x266B), // musical notes
+    (0x2713, 0x2718), // check and cross marks
+    (0x2726, 0x2727), // four-pointed stars
+];
+
+/// Cells in a table: one per code point in [`RANGES`], plus the replacement box
+/// on the end.
+fn cell_count() -> usize {
+    RANGES.iter().map(|&(a, b)| (b - a + 1) as usize).sum::<usize>() + 1
+}
+
+/// Every baked code point, in table order.
+fn code_points() -> impl Iterator<Item = u32> {
+    RANGES.iter().flat_map(|&(a, b)| a..=b)
+}
 
 /// The vendored IBM Plex Mono file, and the one weight the console uses.
 const PLEX_TTF: &str = "vendor/ibm-plex-mono/IBMPlexMono-Regular.ttf";
@@ -64,7 +95,8 @@ struct Face {
     width: usize,
     /// Pixels down one cell.
     height: usize,
-    /// [`CELLS`] cells of `width * height` coverage bytes, row-major.
+    /// One cell per code point in [`RANGES`] plus the replacement, each
+    /// `width * height` coverage bytes, row-major.
     cells: Vec<u8>,
 }
 
@@ -137,29 +169,46 @@ fn ibm_plex_mono() -> Face {
 
     // Rasterized once, up front, because placement has to know where the ink
     // landed before it can decide where the ink goes.
-    let drawn: Vec<Drawn> = (FIRST..=LAST).map(|c| rasterize(&font, c, px)).collect();
-    let (off_x, off_y, ink_w, ink_h) = place(&drawn);
+    //
+    // `None` for a code point this face has no glyph for: it gets the replacement
+    // box below. Placement is fitted from **ASCII alone** — what a cell is sized
+    // for — so a tall accented capital or a wide arrow is clipped to the cell
+    // rather than shrinking the alphabet to make room for it.
+    let drawn: Vec<Option<Drawn>> = code_points().map(|c| rasterize(&font, c, px)).collect();
+    let ascii: Vec<Drawn> = drawn
+        .iter()
+        .take((LAST - FIRST + 1) as usize)
+        .map(|g| g.clone().expect("IBM Plex Mono lacks a printable ASCII glyph"))
+        .collect();
+    let (off_x, off_y, ink_w, ink_h) = place(&ascii);
 
-    let mut cells = vec![0u8; CELLS * PLEX_WIDTH * PLEX_HEIGHT];
+    let cells_n = cell_count();
+    let mut cells = vec![0u8; cells_n * PLEX_WIDTH * PLEX_HEIGHT];
+    let replace = replacement(PLEX_WIDTH, PLEX_HEIGHT);
     for (index, glyph) in drawn.iter().enumerate() {
         let base = index * PLEX_WIDTH * PLEX_HEIGHT;
+        let Some(glyph) = glyph else {
+            cells[base..base + PLEX_WIDTH * PLEX_HEIGHT].copy_from_slice(&replace);
+            continue;
+        };
+        let is_ascii = index < (LAST - FIRST + 1) as usize;
         for &(gx, gy, coverage) in glyph {
             let (x, y) = (gx + off_x, gy + off_y);
             let inside =
                 x >= 0 && y >= 0 && (x as usize) < PLEX_WIDTH && (y as usize) < PLEX_HEIGHT;
+            // Strict for ASCII (a clipped letter is a font bug); lenient beyond it.
             assert!(
-                inside || coverage < INK_FLOOR,
-                "code point {:#04x} puts {coverage}/255 of ink at ({x},{y}), outside its \
-                 {PLEX_WIDTH}x{PLEX_HEIGHT} cell; widen the cell rather than clipping a glyph",
-                index as u8 + FIRST
+                inside || coverage < INK_FLOOR || !is_ascii,
+                "code point index {index} puts {coverage}/255 of ink at ({x},{y}), outside its \
+                 {PLEX_WIDTH}x{PLEX_HEIGHT} cell; widen the cell rather than clipping a glyph"
             );
             if inside {
                 cells[base + y as usize * PLEX_WIDTH + x as usize] = coverage;
             }
         }
     }
-    cells[(CELLS - 1) * PLEX_WIDTH * PLEX_HEIGHT..]
-        .copy_from_slice(&replacement(PLEX_WIDTH, PLEX_HEIGHT));
+    let last = (cells_n - 1) * PLEX_WIDTH * PLEX_HEIGHT;
+    cells[last..].copy_from_slice(&replace);
 
     Face {
         ident: "IBM_PLEX_MONO",
@@ -181,11 +230,14 @@ fn ibm_plex_mono() -> Face {
 ///
 /// Empty for a code point the font draws nothing for — space has no contours,
 /// so it has no outline and its cell stays blank.
-fn rasterize(font: &FontRef<'_>, c: u8, px: f32) -> Drawn {
-    let id = font.glyph_id(char::from(c));
-    assert_ne!(id.0, 0, "IBM Plex Mono has no glyph for code point {c:#04x}");
+fn rasterize(font: &FontRef<'_>, c: u32, px: f32) -> Option<Drawn> {
+    let ch = char::from_u32(c)?;
+    let id = font.glyph_id(ch);
+    if id.0 == 0 {
+        return None;
+    }
     let Some(glyph) = font.outline_glyph(id.with_scale_and_position(px, point(0.0, 0.0))) else {
-        return Drawn::new();
+        return Some(Drawn::new());
     };
 
     // `draw` reports coordinates relative to the bounding box, which is where
@@ -204,7 +256,7 @@ fn rasterize(font: &FontRef<'_>, c: u8, px: f32) -> Drawn {
             ink.push((origin.x as i32 + x, origin.y as i32 + y, coverage));
         }
     });
-    ink
+    Some(ink)
 }
 
 /// The one advance width every emitted glyph shares.
@@ -216,7 +268,7 @@ fn rasterize(font: &FontRef<'_>, c: u8, px: f32) -> Drawn {
 fn monospace_advance(font: &FontRef<'_>) -> f32 {
     let mut advance: Option<f32> = None;
     for c in FIRST..=LAST {
-        let this = font.h_advance_unscaled(font.glyph_id(char::from(c)));
+        let this = font.h_advance_unscaled(font.glyph_id(char::from_u32(c).expect("ASCII")));
         match advance {
             None => advance = Some(this),
             Some(first) => assert!(
@@ -290,20 +342,25 @@ fn spleen() -> Face {
     let (width, height, glyphs) = parse_bdf(&text);
     assert_eq!(width, 8, "spleen-8x16.bdf is meant to be eight pixels wide");
 
-    let mut cells = vec![0u8; CELLS * width * height];
-    for c in FIRST..=LAST {
-        let rows = glyphs
-            .get(&u32::from(c))
-            .unwrap_or_else(|| panic!("spleen-8x16.bdf has no glyph for code point {c:#04x}"));
-        assert_eq!(rows.len(), height, "glyph {c:#04x} is not {height} rows");
-        let base = (c - FIRST) as usize * width * height;
-        for (y, bits) in rows.iter().enumerate() {
-            for x in 0..width {
-                cells[base + y * width + x] = if bits & (0x80 >> x) != 0 { 0xFF } else { 0x00 };
+    let cells_n = cell_count();
+    let mut cells = vec![0u8; cells_n * width * height];
+    let replace = replacement(width, height);
+    for (index, c) in code_points().enumerate() {
+        let base = index * width * height;
+        if let Some(rows) = glyphs.get(&c) {
+            assert_eq!(rows.len(), height, "glyph {c:#04x} is not {height} rows");
+            for (y, bits) in rows.iter().enumerate() {
+                for x in 0..width {
+                    cells[base + y * width + x] = if bits & (0x80 >> x) != 0 { 0xFF } else { 0x00 };
+                }
             }
+        } else {
+            assert!(c > LAST, "spleen-8x16.bdf has no glyph for ASCII {c:#04x}");
+            cells[base..base + width * height].copy_from_slice(&replace);
         }
     }
-    cells[(CELLS - 1) * width * height..].copy_from_slice(&replacement(width, height));
+    let last = (cells_n - 1) * width * height;
+    cells[last..].copy_from_slice(&replace);
 
     Face {
         ident: "SPLEEN",
@@ -383,7 +440,7 @@ fn quad(text: &str) -> (usize, usize, i32, i32) {
 // Shared
 // ---------------------------------------------------------------------------
 
-/// The cell drawn for a byte outside `FIRST..=LAST`: a hollow box.
+/// The cell drawn for a code point no table holds: a hollow box.
 ///
 /// Drawn here rather than typed out as bits so it comes out at whatever size
 /// the font is, and so that no glyph anywhere in this crate is a hand-written
@@ -412,7 +469,7 @@ fn replacement(width: usize, height: usize) -> Vec<u8> {
 fn emit(face: &Face, out: &Path) {
     assert_eq!(
         face.cells.len(),
-        CELLS * face.width * face.height,
+        cell_count() * face.width * face.height,
         "{} produced a table of the wrong size",
         face.name
     );
@@ -421,6 +478,10 @@ fn emit(face: &Face, out: &Path) {
 
     let (ident, name, origin, fit) = (face.ident, face.name, face.origin, &face.fit);
     let (width, height, stem) = (face.width, face.height, face.stem);
+    let mut ranges = String::new();
+    for &(a, b) in RANGES {
+        let _ = write!(ranges, "(0x{a:04X}, 0x{b:04X}), ");
+    }
     let mut rs = String::new();
     let _ = write!(
         rs,
@@ -434,8 +495,7 @@ fn emit(face: &Face, out: &Path) {
          \x20   \"{name}\",\n\
          \x20   {width},\n\
          \x20   {height},\n\
-         \x20   0x{FIRST:02X},\n\
-         \x20   0x{LAST:02X},\n\
+         \x20   &[{ranges}],\n\
          \x20   include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{stem}.bin\")),\n\
          );\n"
     );

@@ -43,6 +43,9 @@ CASES = [
     # `stty rows/cols` on the console must stick (TIOCSWINSZ used to be dropped).
     # The typed line has no "30 90"; only `stty size`'s answer does.
     ("stty rows 30 cols 90; stty size", "30 90"),
+    # The console shell sources /etc/console.rc ($ENV): where the printing area is set.
+    ('echo RC${AKUMA_CONSOLE_RC}', "RCloaded"),
+    ("echo T$TERM", "Txterm-256color"),
 ]
 
 # `^C` must kill the foreground job and leave the shell alive: start a 100 s

@@ -653,13 +653,19 @@ if [ -n "$HERD" ]; then
     # console (`docs/runbooks/amd64-console-shell.md`). It restarts on exit, so
     # `exit` gives a fresh prompt rather than a dead screen.
     #
-    # `TERM=linux`: the framebuffer console implements the Linux-console subset
-    # of ANSI (cursor moves, erase, no colour) — `xterm`, herd's default, would
-    # invite sequences it does not draw. Needs busybox, which is what `/bin/sh`
+    # `TERM=xterm-256color`: the framebuffer console implements the xterm subset a
+    # TUI uses (cursor addressing, erase/insert/delete, scroll regions, SGR with
+    # 256 colours and truecolor mapped to the palette, the alternate screen, cursor
+    # reports) — see `crates/akuma-fbcon`. Needs busybox, which is what `/bin/sh`
     # is; a tree without it stages no console service rather than one that
     # fails and restarts forever.
     if [ -f "$BB" ]; then
-        printf 'command = /bin/sh\nconsole = true\nrestart = true\nrestart_delay = 1000\nenv = TERM=linux\n' > "$TMP/herd-console.conf"
+        printf 'command = /bin/sh\nconsole = true\nrestart = true\nrestart_delay = 1000\nenv = TERM=xterm-256color\nenv = ENV=/etc/console.rc\n' > "$TMP/herd-console.conf"
+        # Sourced by the console shell (ash reads $ENV when interactive). The place
+        # to choose the printing area on the TV: `stty cols N rows M` narrows it to
+        # the top-left N x M cells and programs lay out for that.
+        printf '# Sourced by the console shell on the TV (ENV=/etc/console.rc).\n#\n# The text grid is what `stty size` prints. To use only the top-left part of the\n# screen -- a part that works, or room for something else -- narrow it:\n#\n#   stty cols 73 rows 41\n#\nAKUMA_CONSOLE_RC=loaded\nexport AKUMA_CONSOLE_RC\n' > "$TMP/console.rc"
+        "$DEBUGFS" -w -R "write $TMP/console.rc etc/console.rc" "$IMG" >/dev/null 2>&1
         "$DEBUGFS" -w -R "write $TMP/herd-console.conf etc/herd/enabled/console.conf" "$IMG" >/dev/null 2>&1
         "$DEBUGFS" -w -R "write $TMP/herd-console.conf etc/herd/available/console.conf" "$IMG" >/dev/null 2>&1
     fi

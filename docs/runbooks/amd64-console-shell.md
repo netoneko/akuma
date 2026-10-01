@@ -28,7 +28,8 @@ and the TV showed the boot log and then nothing. The fix is one more service:
     console = true
     restart = true
     restart_delay = 1000
-    env = TERM=linux
+    env = TERM=xterm-256color
+    env = ENV=/etc/console.rc
 ```
 
 | piece | where | what it does |
@@ -83,6 +84,32 @@ Three rigs, each proving a different link:
 The framebuffer console's parsing is host-tested (`cargo test -p akuma-fbcon`,
 which renders into memory and checks pixels).
 
+## What the TV console can draw (2026-10-01)
+
+`crates/akuma-fbcon` is a small terminal emulator, enough to run a TUI such as
+late.sh over `ssh` from the console shell. Before this the console was an ASCII-only
+teletype: every byte of a multi-byte character was drawn as its own box, and
+anything beyond cursor-left/erase was drawn as text.
+
+| area | what it does |
+|---|---|
+| UTF-8 | decoded (overlong, surrogate and truncated sequences show one box each); characters are one, two (CJK, emoji) or zero (combining, joiners) columns wide, so a line with an emoji stays aligned |
+| fonts | IBM Plex Mono and Spleen baked for printable ASCII, Latin-1, Latin Extended-A (Polish, Czech...), punctuation, a few symbols — `build.rs` `RANGES` |
+| drawn, not fonted | box drawing `U+2500..257F`, block elements `2580..259F` and Braille `2800..28FF` are painted per cell from the cell size, so frames close at any scale; arrows, `● ○ ■ □ ▲ ▶ ▼ ◀ ◆ ✓ ✗` likewise (`glyph.rs`) |
+| colour | SGR: 16, 256-colour and truecolor (stored as the nearest palette entry), bold, dim, underline, reverse; erase keeps the background |
+| editing | cursor addressing, erase line/screen/characters, insert/delete characters and lines, scroll regions, scroll up/down, repeat, save/restore cursor, the alternate screen (cleared on entry and exit — the old screen is not kept) |
+| replies | cursor position (`CSI 6 n`), device attributes (`CSI c`), foreground/background colour queries — typed back into the program by the console pump, so busybox no longer waits at every prompt and a TUI learns the colours |
+| not drawn | colour emoji (a two-column outlined box), Cyrillic/Greek/CJK glyphs (width is right, the glyph is a box), combining accents |
+
+**Why not a crate?** `vte` (parser) and `unicode-width` are `no_std`, and are in the
+local cargo cache. They were not adopted because the box builds kernels **offline
+from a primed cache** (`kbuild`), so a new dependency is also a change to what must
+be fetched onto the box, and because `akuma-fbcon` is deliberately dependency-free
+and `forbid(unsafe_code)`. The parser is ~200 lines and every sequence has a host
+test. `unicode-width` is the one worth revisiting if `glyph::width` proves wrong for
+a character. No crate provides a no-alloc *screen model*: `vt100`,
+`alacritty_terminal` and `termwiz` all need `std`/`alloc`.
+
 ## Screen size: what `stty size` says, and what you can set
 
 The framebuffer's grid is fixed at boot: the console picks a font and an integer
@@ -97,10 +124,14 @@ wrapping described a terminal that was not on the glass. Now:
   `[fb] 1920x1080 pitch 7680 (= width*bpp) bpp 32 cell 12x24 grid 150x42 margin 80,45`.
   A pitch that is `NOT width*bpp` explains sheared lines; a grid taller than the
   visible area explains a blank band.
-- **`stty rows N cols M`** is kept (it used to be accepted and dropped). It does
-  not resize the grid — that is fixed — it tells programs how much of it to use,
-  e.g. to stay inside the part of a TV that works. Reset with `stty rows <R> cols <C>`
-  from `stty size`/`[fb]`.
+- **`stty cols N rows M` sets the printing area** (it used to be accepted and
+  dropped). Text wraps and scrolls inside the top-left N x M cells, **nothing is
+  drawn outside it** (the rest is blanked and stays blank), and programs lay out for
+  it — so late.sh can run in the left part of the screen with the rest left alone.
+  Values larger than the screen are clamped and `stty size` reports what is in
+  force. Put it in `/etc/console.rc` (sourced by the console shell via `$ENV`) to
+  make it stick: `stty cols 73 rows 41`. Reset with the full size from `[fb]`.
+  The anchor is the top left; a window elsewhere is not supported.
 
 ## The keyboard
 
@@ -173,9 +204,7 @@ this one.
 - No hot-plug: unplugging halts the interrupt endpoint (four recovery attempts,
   then it gives up); replug needs a reboot.
 - The key FIFO is 64 bytes and drops on overflow, like a tty input queue.
-- busybox sends `ESC[6n` (cursor-position query) at each prompt and the console
-  does not answer it; the shell proceeds after its own short timeout.
-- Colours are ignored (`ESC[…m` is parsed and dropped).
+- (Cursor-position queries are answered now — see "What the TV console can draw".)
 - One console shell. Two programs reading the console share one input queue.
 
 ## Background
