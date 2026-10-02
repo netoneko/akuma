@@ -144,6 +144,46 @@ pub fn group_exit_status(proc_slot: usize) -> Option<u32> {
         .filter(|&s| s != 0)
 }
 
+/// Bit set in a [`GROUP_EXIT_STATUS`] word when the group is ending by a
+/// **voluntary `exit_group(code)`**, the low byte then being the code. Without
+/// it the word is `-(sig)` — a death by signal — which is negative, so the two
+/// can never be confused, and `code == 0` stays distinguishable from "no group
+/// exit in progress" (a zero word).
+pub const GROUP_EXIT_CODE_FLAG: u32 = 0x4000_0000;
+
+/// **`exit_group` from a thread that is not the leader.**
+///
+/// The leader's `run_process` epilogue is the only place a group dies on this
+/// target (`drain`, the fd sweep, the `SPAWN` row, the parent's status), and
+/// the calling thread leaves through `run_thread`, which does none of that. When
+/// the caller *is* the leader that is fine; when it is not, the leader has to be
+/// told, or it sits where it was and the group never ends.
+///
+/// That is not exotic: a Rust program that runs `main` on a spawned big-stack
+/// thread leaves its original thread in `pthread_join`'s untimed
+/// `FUTEX_WAIT`, and `std::process::exit` from that thread is an `exit_group`.
+/// `goose --version` printed its version and then never exited — the leader
+/// parked on the join futex for good, the parent's `wait4` with it
+/// (2026-10-03, trashcan).
+///
+/// The route out is the one a fatal signal in a sibling already takes
+/// ([`set_group_exit_status`] + an interrupt, read at the leader's next syscall
+/// return by `signal::deliver_pending`), minus the signal: the status word
+/// carries the exit code, and the interrupt is `request_thread_kill` + `wake`,
+/// which is what every blocking arm's `should_interrupt_blocking_syscall`
+/// already reads. The leader's slot is resolved through `thread_for_pid`, never
+/// `Process::thread_id`, because a recorded slot may have been recycled.
+///
+/// Siblings other than the leader are not touched here: once the leader is out,
+/// its epilogue's [`drain`] reaches them as it always has.
+pub fn exit_group_from_thread(proc_slot: usize, tgid: u32, code: u64) {
+    set_group_exit_status(proc_slot, GROUP_EXIT_CODE_FLAG | (code as u32 & 0xff));
+    if let Some(leader) = akuma_exec::process::thread_for_pid(tgid) {
+        akuma_threading::request_thread_kill(leader);
+        crate::sched::wake(leader);
+    }
+}
+
 /// Clear the group death status when a slot is rebound to a new process —
 /// same reasoning as [`clear_group_exiting`], which this is cleared beside.
 pub fn clear_group_exit_status(proc_slot: usize) {

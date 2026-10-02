@@ -286,6 +286,10 @@ impl UserCtx {
     }
 }
 
+/// `AF_UNIX`'s value in `socket(2)`'s `domain` — the one family this target
+/// serves from `akuma-syscalls-glue` rather than `crate::sock`.
+const AF_UNIX: u64 = 1;
+
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
@@ -1035,6 +1039,23 @@ pub fn exit_current_from_signal(sig: u32) {
     }
 }
 
+/// Leave ring 3 as `exit_group(code)` does: mark the group exiting and set
+/// `leave`, which the syscall return path reads. The same three lines
+/// [`exit_current_from_signal`] has for a death by signal, with a plain code.
+pub fn exit_current_with_code(code: u64) {
+    crate::thread::set_group_exiting(current_proc_slot());
+    EXIT_STATUS.store(code, Ordering::Relaxed);
+    // SAFETY: single core, interrupts off inside a syscall. The running task's
+    // context is what `syscall_entry` will read on the way out, and only this
+    // task can be inside a syscall.
+    unsafe {
+        let uctx = crate::smp::current_uctx();
+        if !uctx.is_null() {
+            (*uctx).leave = 1;
+        }
+    }
+}
+
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     use crate::fd::errno;
 
@@ -1615,11 +1636,23 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `new_address` and is deliberately not passed: this target does not
         // support `MREMAP_FIXED`, and the decision crate does not decode it.
         Syscall::Mremap => crate::mm::sys_mremap(a1, a2, a3, a4),
+        // **AF_UNIX first, then the native stack** — same rule as `Sendto`/
+        // `Recvfrom` below. `socket(AF_UNIX, …)` used to answer `EAFNOSUPPORT`
+        // here (nca's IPC listener, `os error 97`); glue's `unixsock` has always
+        // been compiled in and serves `bind`/`listen`/`accept`/`connect` for the
+        // descriptors it hands out, so the family is decided by the domain at
+        // `socket` and by the descriptor everywhere after.
+        Syscall::Socket if a1 == AF_UNIX => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Socket => crate::sock::sys_socket(a1, a2, a3),
+        Syscall::Bind if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Bind => crate::sock::sys_bind(a1, a2, a3),
+        Syscall::Listen if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         Syscall::Listen => crate::sock::sys_listen(a1, a2),
+        Syscall::Accept if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Accept => crate::sock::sys_accept(a1, a2, a3),
+        Syscall::Accept4 if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         Syscall::Accept4 => crate::sock::sys_accept4(a1, a2, a3, a4),
+        Syscall::Connect if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Connect => crate::sock::sys_connect(a1, a2, a3),
         // `a5` is the destination/source `struct sockaddr *` — Linux's 5th
         // argument, which the entry asm's shuffle keeps (only the 6th,
@@ -1692,17 +1725,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // the second, so conflating them makes the first thread to finish take
         // the whole process with it.
         Syscall::ExitGroup => {
-            crate::thread::set_group_exiting(current_proc_slot());
-            EXIT_STATUS.store(a1, Ordering::Relaxed);
-            // SAFETY: single core, interrupts off inside a syscall. The
-            // running task's context is what `syscall_entry` will read on the
-            // way out, and only this task can be inside a syscall.
-            unsafe {
-                let uctx = crate::smp::current_uctx();
-                if !uctx.is_null() {
-                    (*uctx).leave = 1;
-                }
+            // From a thread that is not the leader, the leader must be told as
+            // well — see `thread::exit_group_from_thread`.
+            if !crate::thread::current_is_main()
+                && let Some(p) = akuma_exec::process::current_process_shared()
+            {
+                crate::thread::exit_group_from_thread(current_proc_slot(), p.tgid, a1);
             }
+            exit_current_with_code(a1);
             a1
         }
         Syscall::Exit => {

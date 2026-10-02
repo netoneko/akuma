@@ -465,6 +465,13 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
     // death bypasses.
     let slot = crate::usermode::current_proc_slot();
     if let Some(status) = crate::thread::group_exit_status(slot) {
+        // A voluntary `exit_group(code)` from a sibling thread — no signal, so
+        // no `exit_current_from_signal` (whose status is `-(sig)`).
+        if status & crate::thread::GROUP_EXIT_CODE_FLAG != 0 {
+            let code = u64::from(status & 0xff);
+            crate::usermode::exit_current_with_code(code);
+            return code;
+        }
         let sig = status.cast_signed().wrapping_neg() as u32;
         crate::usermode::exit_current_from_signal(sig);
         return signal_status(sig);

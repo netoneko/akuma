@@ -204,8 +204,8 @@ install's output before rebooting.
 ## 8. Open items
 
 1. ~~Install the staged kernel; confirm on the metal.~~ Done (§ 7).
-2. ~~Goose~~ fixed (§ 9). Still to decide: whether `F_SETLK` should track real locks (it always succeeds, so
-   cross-process exclusion does not exist), and re-check `goose --version` and its TUI.
+2. ~~Goose~~ fixed (§ 9, § 13: `--version` hang, interactive session verified). Still to decide: whether `F_SETLK`
+   should track real locks (it always succeeds, so cross-process exclusion does not exist).
 3. `opencode --version` hang, uninvestigated.
 4. `RUSAGE_CHILDREN` / `cutime`; killed children report 0 CPU in `wait4`.
 5. `loadavg`; the `State` field; per-CPU bucketing. (Starvation baseline: done, § 5.)
@@ -216,8 +216,8 @@ install's output before rebooting.
    write from offset 0 and overwrite its siblings (seen as a garbled results file; `>>` per command is the
    workaround). Not investigated.
 10. `[E2-EOF] inode=… caller believed the file extended past off?` from the ext2 layer during SQLite WAL activity.
-11. nca: the items under "OPEN" in `userspace/nca/docs/ISSUES.md` (no keyboard scroll in the TUI, run-together
-    tool previews, no `AF_UNIX`, exit abort).
+11. nca: the items under "OPEN" in `userspace/nca/docs/ISSUES.md` (run-together tool previews; the exit abort and
+    keyboard scroll and `AF_UNIX` are closed — § 13).
 8. Four surviving processes after `kill -9` on the box (pids 32 and 4188, the `nca` build script and `rustc`) — a
    zombie shell from the first timed-out download (pid 49) also persisted. Cause unknown.
 
@@ -322,3 +322,39 @@ Anthropic-style endpoint (`/coding/v1/messages`, either auth header) works and r
 | `/usr/local/bin/goose`, `goose-kimi` | working; old DB moved to `/root/goose-old-db/` |
 | test servers | `scripts/net_delay_server.py` (HTTP 18080, TLS 18443) and a logging proxy (18090) were run on the Mac, not left on the box |
 | test binaries on the box | `/tmp/nt/nettest-reqwest{,2}`, `/tmp/lk/{t,sqlite3,pp,fx,fx2}` (in `/tmp`) |
+
+## 13. 2026-10-03: `exit_group` from a non-leader thread, AF_UNIX, nca PageUp/PageDown
+
+**`goose --version` printed `1.52.0` and never exited.** Not a tokio worker, not SQLite, not the epoll thread it first
+looked like. Method, because the first three theories were wrong: `/proc/<pid>/syscalls` (leader only), then a
+temporary per-process `SYSCALL_TRACE` (goose + its workers, to the console ring — `dmesg`), then
+`sched::dump_slot_table()` on the periodic tick. The trace showed the thread that ran `main` call `exit_group(0)` and
+return, while `[exit-diag]` markers proved the **leader never reached `run_process`'s epilogue**; the slot table put the
+leader (`pid=13`, a different slot from the `exit_group` caller) in an untimed `FUTEX_WAIT`. Rust's goose runs `main` on a
+spawned thread (`goose-cli-main`) and joins it; `std::process::exit` from that thread is `exit_group`, which set
+`GROUP_EXIT` and `leave` for *the calling thread only*. On this target a group dies only through the leader's epilogue
+(`drain`, fd sweep, `SPAWN` row), and `should_leave_now()` is false for the leader by construction, so nothing ever told it.
+The same bug is why `nca run` ended in exit 134 / hung and why `timeout … goose --version` never returned.
+
+**Fix** (`amd64/src/thread.rs` `exit_group_from_thread`, `signal.rs` `deliver_pending`, `usermode.rs`
+`exit_current_with_code`): a non-main `exit_group` records the code in `GROUP_EXIT_STATUS` (new `GROUP_EXIT_CODE_FLAG`
+bit, so code 0 is distinguishable from "none" and a signal death `-(sig)` stays negative), then
+`request_thread_kill` + `sched::wake` on the leader — resolved through `thread_for_pid`, never `Process::thread_id`. The
+leader's blocking arm returns `EINTR`, `deliver_pending` reads the status and leaves with the code. Siblings are reached by
+the leader's existing `drain`. **Verified on the metal:** `userspace/forktest/c_stress/groupexit_thread.c` rc=3 in all
+three leader-parked modes (join futex, `read(pipe)`, `epoll_wait(-1)`) with a `pause()`d sibling; `goose --version` 2.9 s,
+exit 0; `goose-kimi run` → `pong` in 5 s; interactive `goose session` renders, answers, exits 0 on ^C^C;
+`nca run` exit 0 (was 134).
+
+**AF_UNIX.** `socket(AF_UNIX, …)` answered `EAFNOSUPPORT`; only `socketpair` was routed to glue's `unixsock`. The
+`socket` arm now sends `AF_UNIX` there and `bind`/`listen`/`accept`/`accept4`/`connect` follow the descriptor
+(`fd::is_unix_socket`) — the same "AF_UNIX first, then the native stack" shape as `sendto`/`recvfrom`.
+`userspace/forktest/c_stress/unixsock_amd64.c`: 14/14 on the metal (STREAM+DGRAM socket, path bind is `S_IFSOCK`,
+listen, `getsockname`, epoll on the listener, accept4, a forked client's connect + round trip, connect-to-nothing fails,
+abstract bind). nca's IPC listener binds (`/tmp/nca/session-*.sock`); `IPC disabled … os error 97` is gone.
+
+**nca PageUp/PageDown** (`crates/tui/src/tui/app.rs`, composer key handler): one page less a line, same follow-tail rules
+as the mouse wheel. Driven through a pty from the laptop (`ssh -tt`, ESC `[5~`/`[6~` after a 150-line reply): PageUp
+redraws earlier lines (1–23 …), PageDown returns to the tail. Not verified on the TV's own keyboard.
+
+Still open: `F_SETLK` is a no-op; `opencode --version`; nca run-together tool previews.

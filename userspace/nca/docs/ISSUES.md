@@ -102,13 +102,12 @@ mode = "bypass-permissions"                # accept-edits is what `nca run` defa
 - Each `run` makes two requests: a short context-window probe, then the streamed chat. A one-shot exits
   with `134` (SIGABRT) at shutdown — the tokio-runtime teardown panic below — after the work is done.
 
-## OPEN: no keyboard scrolling in the TUI
+## FIXED 2026-10-03: keyboard scrolling in the TUI
 
-The transcript scrolls with the **mouse wheel** only (`MouseEventKind::ScrollUp/Down`, 3 lines per notch);
-`End` jumps to the bottom when the composer is empty. `PageUp` / `PageDown` and `Up` / `Down` are not bound
-on the transcript (the arrow keys only act inside popups) — although the kernel's USB keymap does send
-`PageUp` as `ESC [ 5 ~`. On the TV console there is no wheel, so scrolled-off output cannot be reached.
-The binding belongs in the composer's key handler in `crates/tui/src/tui/app.rs`.
+`PageUp` / `PageDown` now scroll the transcript by a page less one line (`crates/tui/src/tui/app.rs`, the composer's key
+handler beside `End`), with the same follow-tail rules as the mouse wheel: PageUp stops following, PageDown past the end
+resumes it. The kernel's USB keymap sends them as `ESC [ 5 ~` / `ESC [ 6 ~`. Arrow keys still act only inside popups.
+Checked over a pty from the laptop; not on the TV's own keyboard.
 
 ## OPEN: smaller things seen on the box
 
@@ -116,12 +115,11 @@ The binding belongs in the composer's key handler in `crates/tui/src/tui/app.rs`
   `.cargo/.git/.gitignore.gitmodulesCLAUDE.mdCargo.lock…` — the newline between entries is dropped when the
   preview is built (`truncate(&output.output, 120)` in `tui/state.rs`'s `ToolCallCompleted` handler is the
   suspect; not traced).
-- **`IPC disabled: … Address family not supported by protocol (os error 97)`**: no `AF_UNIX` listener on
-  the amd64 kernel, so `nca attach` / `status` against a running session cannot work there. One-shot runs
-  and the TUI are unaffected.
-- **Exit abort (`134`)**: the `tokio-rt-worker` `Option::unwrap()` panic on runtime shutdown recorded in
-  `../../../docs/archive/NCA_MISSING_SYSCALLS.md` §7 is still there; with `panic = "abort"` it ends the
-  process by signal after the session is complete.
+- ~~**`IPC disabled: … os error 97`**~~ — fixed 2026-10-03: the amd64 kernel now serves `socket(AF_UNIX)` /
+  `bind` / `listen` / `accept` / `connect`; the session socket appears as `/tmp/nca/session-*.sock`.
+- **Exit abort (`134`)**: not seen on 2026-10-03 after the `exit_group`-from-a-thread fix (`nca run` exits 0;
+  `../../../docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md` § 13). The `tokio-rt-worker` panic in
+  `../../../docs/archive/NCA_MISSING_SYSCALLS.md` §7 may be the same bug; re-check before closing it.
 - **Glyphs**: `⏵`-style symbols in the status line draw as `▯` — the framebuffer font lacks them.
 
 

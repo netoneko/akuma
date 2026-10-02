@@ -64,8 +64,9 @@ const SOCK_CLOEXEC: u64 = 0o2000000; // 0x80000
 /// setters are the shared `Process` ones, so the two cannot drift again.
 pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
     if domain != AF_INET as u64 {
-        // AF_UNIX would be `akuma-net-unix`, which is a separate crate and a
-        // separate table; refusing is honest rather than pretending.
+        // Not AF_INET. AF_UNIX never reaches here: `usermode`'s `Socket` arm
+        // sends `AF_UNIX` to glue's `unixsock` (a separate table) first, so
+        // this is every *other* family, which this stack does not serve.
         return errno::EAFNOSUPPORT;
     }
     let kind = match (ty & SOCK_TYPE_MASK) as i32 {
