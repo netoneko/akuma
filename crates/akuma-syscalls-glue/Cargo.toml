@@ -24,6 +24,7 @@ akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 akuma-syscalls-net = { path = "../akuma-syscalls-net" }
 akuma-syscalls-log = { path = "../akuma-syscalls-log" }
 akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
+akuma-reclock = { path = "../akuma-reclock" }
 akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }
 akuma-syscalls-sync = { path = "../akuma-syscalls-sync" }
 akuma-syscalls-time = { path = "../akuma-syscalls-time" }

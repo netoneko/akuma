@@ -1,0 +1,10 @@
+[package]
+name = "akuma-reclock"
+version = "0.1.0"
+edition = "2024"
+description = "POSIX advisory record locks (fcntl F_SETLK/F_SETLKW/F_GETLK): the per-file range table, conflict test, split/merge on unlock, and release-by-owner. Pure state — the syscall, the user copies and the blocking wait stay in akuma-syscalls-glue."
+
+[lints]
+workspace = true
+
+[dependencies]

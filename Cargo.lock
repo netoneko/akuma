@@ -45,6 +45,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-psci",
+ "akuma-reclock",
  "akuma-rump",
  "akuma-syscalls",
  "akuma-syscalls-glue",
@@ -513,6 +514,10 @@ name = "akuma-psci"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-reclock"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-rump"
 version = "0.1.0"
 
@@ -574,6 +579,7 @@ dependencies = [
  "akuma-pipes",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-reclock",
  "akuma-syscalls",
  "akuma-syscalls-ipc",
  "akuma-syscalls-linux",

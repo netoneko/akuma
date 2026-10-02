@@ -121,6 +121,7 @@ pub mod log;
 pub mod msgqueue;
 pub mod fs;
 pub mod flock;
+mod recordlock;
 pub mod mem;
 mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).

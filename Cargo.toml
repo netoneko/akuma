@@ -59,6 +59,7 @@ default-members = [
     "crates/akuma-vfs-glue",
     "crates/akuma-syscalls-ipc",
     "crates/akuma-syscalls-log",
+    "crates/akuma-reclock",
     "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
@@ -864,6 +865,7 @@ akuma-syscalls-poll = { path = "crates/akuma-syscalls-poll" }
 # is a function of the argument bits alone, which is what keeps it a leaf beside
 # `-sync` and `-poll` rather than a dependant of `akuma-exec`.
 akuma-syscalls-mem = { path = "crates/akuma-syscalls-mem" }
+akuma-reclock = { path = "crates/akuma-reclock" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

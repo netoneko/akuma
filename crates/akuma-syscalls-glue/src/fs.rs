@@ -2903,15 +2903,8 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
         // `SQLITE_PROTOCOL` ("locking protocol", code 15): goose could not open its
         // session database at all. Only `l_type` (offset 0 on both ABIs) is written,
         // as POSIX specifies for the unlocked case.
-        F_GETLK => {
-            if arg == 0
-                || write_user_val(arg, &akuma_syscalls_linux::flags::fcntl::F_UNLCK).is_err()
-            {
-                return EFAULT;
-            }
-            0
-        }
-        F_SETLK | F_SETLKW => 0,
+        // Real POSIX record locks now — `recordlock` (table: `akuma-reclock`).
+        F_GETLK | F_SETLK | F_SETLKW => super::recordlock::sys_fcntl_lock(fd, cmd, arg),
         F_SETOWN | F_GETOWN => 0,
         _ => {
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {

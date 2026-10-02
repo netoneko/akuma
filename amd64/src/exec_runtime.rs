@@ -403,7 +403,11 @@ fn runtime() -> ExecRuntime {
         // This is the last hook `close_all` needs before the refcount
         // authority can move to the table at all — see
         // `docs/archive/AKUMA_AMD64_4B_PREREQUISITES.md` § "the flip".
-        flock_release: |_path, _holder, _fd| {},
+        // Wired 2026-10-03: `close_all()` calls this for every `File` entry, and it
+        // is now the release point for POSIX `fcntl` record locks as well as
+        // `flock` (`recordlock::release_file`). A no-op here meant a process that
+        // died holding a lock held it forever — goose's SQLite WAL locks.
+        flock_release: akuma_syscalls_glue::flock::flock_release,
 
         // ── wired C2 slice 7 ──────────────────────────────────────────────
         // The **path-addressed** read. `fs::read_at` is what slice 5 rebuilt

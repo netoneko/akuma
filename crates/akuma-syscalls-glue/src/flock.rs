@@ -58,6 +58,10 @@ static FLOCK_TABLE: Spinlock<BTreeMap<String, FlockEntry>> = Spinlock::new(BTree
 /// `write_count` leaks this codebase has hit before
 /// (`crates/akuma-exec/src/process/fd.rs`'s own `close_all` doc comment).
 pub fn flock_release(path: &str, holder: usize, fd: u32) {
+    // POSIX record locks ride the same teardown calls: closing any descriptor
+    // for a file drops the process's `fcntl` locks on it, and exit (`close_all`
+    // calls this per fd) drops the rest. See `recordlock`.
+    super::recordlock::release_file(path, holder);
     akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = FLOCK_TABLE.lock();
         if let Some(entry) = table.get_mut(path) {
