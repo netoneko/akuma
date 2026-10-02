@@ -29,6 +29,26 @@ git submodule update --init userspace/nca/native-cli-ai
 userspace/build.sh --nca-only
 ```
 
+### amd64 (the bare-metal box)
+
+`build.rs` builds for the arch of the package it is built as (`CARGO_CFG_TARGET_ARCH`),
+which from this tree is always `aarch64` because the repo-root `.cargo/config.toml` sets
+`[build] target = "aarch64-unknown-none"`. Override with `NCA_ARCH=x86_64`; the amd64
+binary is installed as `bootstrap/bin/nca-x86_64`, never over the AArch64 `nca`. With no
+`<arch>-linux-musl-gcc` on `PATH` (a native box) it leaves the compiler and linker to the
+host's own cargo config. On the trashcan, inside Akuma:
+
+```sh
+. /etc/akuma-dev.env
+cd /src/github.com/netoneko/akuma/userspace/nca
+NCA_ARCH=x86_64 cargo build --release -j2      # then cp bootstrap/bin/nca-x86_64 /usr/local/bin/nca
+```
+
+It needs `apk add linux-headers` (aws-lc-sys probes `linux/random.h`) and a kernel with
+the `F_GETFL` access-mode fix (2026-10-02) — before it, `ar` fails on every archive and
+the `ring`/`aws-lc-sys` build scripts die with `ar: …a: invalid operation`
+(`docs/reference/subsystems/syscalls/fs.md`).
+
 Requires the musl AArch64 cross toolchain (`aarch64-linux-musl-gcc`) and
 the `aarch64-unknown-linux-musl` Rust target:
 

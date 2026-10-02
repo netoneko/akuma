@@ -99,6 +99,19 @@ fn main() {
     // `.git/HEAD` here would name `crates/akuma-syscalls-glue/.git/HEAD`, which
     // does not exist, and the staleness would be silent.
     let git_dir = std::path::Path::new("../../.git");
+    // `.git/HEAD` only changes on a checkout, and the branch ref is only tracked
+    // when it is a LOOSE file at the moment this script runs — cargo freezes the
+    // path list it saw. A ref that was in `packed-refs` then (as it can be right
+    // after a `git gc`/clone) left HEAD as the sole trigger, so every later
+    // commit was invisible and a kernel kept reporting a day-old SHA
+    // (2026-10-02: `uname -v` said 6d9017b1 for e40e50a0). The reflog is appended
+    // to by every commit, checkout and reset, so it is the trigger that cannot go
+    // missing; `packed-refs` covers `git pack-refs`/`gc` rewriting the ref.
+    for tracked in ["logs/HEAD", "packed-refs"] {
+        if git_dir.join(tracked).exists() {
+            println!("cargo:rerun-if-changed=../../.git/{tracked}");
+        }
+    }
     if git_dir.join("HEAD").exists() {
         println!("cargo:rerun-if-changed=../../.git/HEAD");
         if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD"))

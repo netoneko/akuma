@@ -256,6 +256,12 @@ wrapping described a terminal that was not on the glass. Now:
   force. Put it in `/etc/console.rc` (sourced by the console shell via `$ENV`) to
   make it stick per shell, or use `/etc/console.conf` (below) for the boot itself. Reset with the full size from `[fb]`.
   The anchor is the top left; a window elsewhere is not supported.
+- **The Rust/cargo environment** (`PATH` with `/usr/local/rust/bin`, `LD_LIBRARY_PATH`,
+  `CARGO_HOME`, `AKUMA_SRC`) comes from `/etc/akuma-dev.env`, which `/etc/console.rc`
+  sources (`mkdisk.sh` writes that line; on an existing box append
+  `. /etc/akuma-dev.env`). herd gives the console shell only `PATH`/`HOME`/`TERM`, and
+  sshd sets nothing at all, so without this `rustc`/`cargo` are not found or cannot load
+  `librustc_driver`.
 
 ### Per-machine setup: `/etc/console.conf` (read at boot)
 

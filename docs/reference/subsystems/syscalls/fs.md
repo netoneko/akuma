@@ -309,6 +309,16 @@ stay in `container.rs`, correctly gated.
   `F_DUPFD`/`F_DUPFD_CLOEXEC`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are
   fully implemented (cloexec/nonblock bits + fd duplication with pipe
   refcount bumping); any other `cmd` → `EINVAL` (logged as `UNSUPPORTED`).
+  **`F_GETFL` of a regular file reports its access mode and `O_APPEND`**
+  (`akuma_syscalls_linux::flags::fcntl::getfl_status`) plus `O_NONBLOCK` from
+  `F_SETFL`. Until 2026-10-02 it returned only `O_NONBLOCK` or `0`, so every
+  file read back as `O_RDONLY` — which broke GNU `ar` (BFD's `bfd_fdopen` asks
+  about the `mkstemp` fd it is about to write: `ar: x.a: invalid operation`)
+  and so every native C-dependency build on the amd64 box. Still `0`/`O_NONBLOCK`
+  only for non-file fds: a pipe's write end reads back as `O_RDONLY`.
+  `F_GETLK` returns `0` **without writing `l_type = F_UNLCK` back**, so a caller
+  that asks "is anything holding this?" is told yes — a suspect for SQLite WAL's
+  `SQLITE_PROTOCOL` (goose), **unverified**.
 - **`lseek` error selection is fd-type-aware.** A bad fd → `EBADF`; a real
   seekable `File` with a resulting negative offset or unknown `whence` →
   `EINVAL`; a valid-but-non-seekable fd (pipe, socket, tty, eventfd, ...) →
