@@ -783,6 +783,9 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if copy_to_user(buf_ptr, &temp).is_err() {
                         return EFAULT;
                     }
+                    // The counter is zero again (or one lower): the next write is a new
+                    // edge, as with every other drained read.
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
                     return 8;
                 }
                 if nonblock { return EAGAIN; }
@@ -1272,6 +1275,19 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(96, "[eventfd] write via fd={} id={} val={}\n", fd_num, efd_id, val);
                 }
+                // Every write to an eventfd is a fresh `EPOLLIN` EDGE on Linux (each one
+                // does `wake_up_locked_poll(EPOLLIN)`). This kernel derives edges from
+                // readiness *transitions*, and an eventfd nobody reads stays readable, so
+                // without this only the first write ever counted: mio's `Waker` — the
+                // cross-thread wake tokio uses to get a parked reactor thread to run a
+                // task another thread just made runnable — writes and never reads, so
+                // every wake after the first was SUPPRESSED. A multi-threaded tokio
+                // client whose main thread consumes a body the worker reads stalled
+                // after ~0.3 s with its socket buffer full (2026-10-02,
+                // `nettest-reqwest stream …/drip`; nca's model streams hung the same way).
+                // Re-armed BEFORE the write so the scan the write's wake triggers sees a
+                // fresh edge rather than racing the reset.
+                super::poll::epoll_on_fd_drained(fd_num as u32);
                 match super::eventfd::eventfd_write(efd_id, val) {
                     Ok(()) => 8,
                     Err(e) => (-i64::from(e)) as u64,
@@ -2877,8 +2893,25 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             0
         }
-        // Advisory locks: no-op (we have no file locking state)
-        F_GETLK | F_SETLK | F_SETLKW => 0,
+        // Advisory locks: we keep no lock state, so nothing ever conflicts.
+        //
+        // `F_GETLK` must SAY so: Linux rewrites `l_type` to `F_UNLCK` when the
+        // queried range could be locked, and leaves the caller's own request type
+        // there when it could not. Returning 0 with the buffer untouched told every
+        // caller "someone holds this" — SQLite's `unixLockSharedMemory` asks exactly
+        // this of its WAL `-shm` file, took `SQLITE_BUSY`, and surfaced it as
+        // `SQLITE_PROTOCOL` ("locking protocol", code 15): goose could not open its
+        // session database at all. Only `l_type` (offset 0 on both ABIs) is written,
+        // as POSIX specifies for the unlocked case.
+        F_GETLK => {
+            if arg == 0
+                || write_user_val(arg, &akuma_syscalls_linux::flags::fcntl::F_UNLCK).is_err()
+            {
+                return EFAULT;
+            }
+            0
+        }
+        F_SETLK | F_SETLKW => 0,
         F_SETOWN | F_GETOWN => 0,
         _ => {
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {

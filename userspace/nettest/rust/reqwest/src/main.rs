@@ -608,6 +608,16 @@ fn main() {
     }
     .expect("tokio runtime");
 
-    let code = rt.block_on(dispatch(args));
+    // NETTEST_SPAWN=1 runs the whole probe inside ONE spawned task, so the main
+    // thread only waits for the task to finish instead of being woken per chunk.
+    // On a multi-thread runtime that separates "the I/O path stalls" from "the
+    // wake from the connection task to the thread parked in `block_on` is lost"
+    // (2026-10-02, the amd64 stream stall).
+    let code = if env::var("NETTEST_SPAWN").is_ok() {
+        println!("[probe] spawn=1 (whole probe runs inside one spawned task)");
+        rt.block_on(async { tokio::spawn(dispatch(args)).await.expect("probe task") })
+    } else {
+        rt.block_on(dispatch(args))
+    };
     std::process::exit(code);
 }

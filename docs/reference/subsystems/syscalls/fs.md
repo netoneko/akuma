@@ -316,9 +316,16 @@ stay in `container.rs`, correctly gated.
   about the `mkstemp` fd it is about to write: `ar: x.a: invalid operation`)
   and so every native C-dependency build on the amd64 box. Still `0`/`O_NONBLOCK`
   only for non-file fds: a pipe's write end reads back as `O_RDONLY`.
-  `F_GETLK` returns `0` **without writing `l_type = F_UNLCK` back**, so a caller
-  that asks "is anything holding this?" is told yes — a suspect for SQLite WAL's
-  `SQLITE_PROTOCOL` (goose), **unverified**.
+  **`F_GETLK` reports `F_UNLCK`** (only `l_type`, at offset 0 on both ABIs, is
+  written) since 2026-10-02: there is no lock state, so nothing ever conflicts.
+  It used to return `0` with the buffer untouched, which told every caller "someone
+  holds this" — SQLite's `unixLockSharedMemory` asks exactly that of its WAL `-shm`
+  file, took `SQLITE_BUSY`, and surfaced `SQLITE_PROTOCOL` ("locking protocol",
+  code 15): goose could not open its session database. Verified with SQLite 3.53
+  in WAL mode on the metal (journal `wal`, counts, `integrity_check ok`) and goose
+  now runs. **`F_SETLK`/`F_SETLKW` still always succeed**, so two *processes* can
+  hold "the same" lock: fine for a single-process database, wrong for anything
+  that relies on cross-process exclusion.
 - **`lseek` error selection is fd-type-aware.** A bad fd → `EBADF`; a real
   seekable `File` with a resulting negative offset or unknown `whence` →
   `EINVAL`; a valid-but-non-seekable fd (pipe, socket, tty, eventfd, ...) →

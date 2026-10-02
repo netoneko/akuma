@@ -1,5 +1,130 @@
 # nca issues found running on Akuma
 
+> **2026-10-02 session, on the amd64 bare-metal box ("the trashcan").** The entries immediately
+> below came out of getting nca to talk to Kimi Code there. The kernel-side write-up, with the
+> measurements and the dead ends, is
+> [`../../../docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md`](../../../docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md).
+
+## FIXED 2026-10-02 (kernel): a streamed reply stalls after ~0.3 s and sits there
+
+**Symptom.** In the TUI: `streaming 55s … 202s` with a handful of characters, bursts of text after
+long silences, and finally `API request failed: error sending request for url`. Headless: a reasoning
+turn that should take 3 s hung. Kimi was not slow — `curl` against the same endpoint streams 1,200 SSE
+lines in 21 s without a gap.
+
+**Cause: not nca, not the network.** A multi-threaded tokio program on the amd64 kernel lost every
+cross-thread wake after the first. tokio gets a parked reactor thread to run a task that another thread
+made runnable by writing to an `eventfd` that mio registered `EPOLLET`; Linux raises a fresh edge on
+*every* write, but Akuma derives edges from readiness *transitions* and an eventfd nobody reads stays
+readable, so only the first write was ever reported. In nca the main thread consumes the response body
+and hyper's connection task reads the socket on a worker: the first backpressure release woke nobody, the
+socket buffer filled (the peer's window closed at `rq=16384`), and the client sat in one `epoll_pwait`.
+
+**Fix.** `akuma-syscalls-glue`'s `write(eventfd)` re-arms the `EPOLLIN` edge (before the write and its
+wake) and `read(eventfd)` does too. A second, smaller race in the `epoll_pwait` scan — deciding from a copy
+of `last_ready` and writing it back over a concurrent reader's re-arm — is fixed in
+`akuma_syscalls_poll::InterestList::scan_entry`. **Verified on the metal** with the repo's own harness:
+`nettest-reqwest stream <host>/drip/10/1000`, multi-threaded runtime, went from 3/3 stalled (13–957 of 1,001
+chunks, no `RESULT`) to 3/3 complete, plain and TLS.
+
+**Reproducing / bisecting a recurrence.** `scripts/net_delay_server.py` on the host (add `--tls` for HTTPS),
+then on the box `nettest-reqwest stream http://<host>:18080/drip/10/1000`. The axes that localised it:
+`NETTEST_RT=current` (passes) vs `multi` (stalled); `TOKIO_WORKER_THREADS=1` (still stalled);
+`NETTEST_SPAWN=1` — the whole probe inside one spawned task, so no per-chunk wake of the main thread —
+(passed). Plain futex ping-pong tests passed, which is what ruled out futex wake itself.
+
+## FIXED 2026-10-02: reasoning ("thinking") was never shown, on either API
+
+Kimi (and DeepSeek, and others) stream their reasoning before the answer — as `reasoning_content` on the
+OpenAI-style API, as `thinking_delta` blocks on the Anthropic-style one. nca's parsers ignored both, so a
+reasoning turn was minutes of silence. (The 88 s and 90 s gaps in the first TUI session log were measured before the kernel stall above was fixed, so they were probably some of each.)
+
+- `StreamChunk::ReasoningDelta` / `AgentEvent::ReasoningStreamed` carry it. It is **display only**: not
+  added to the assistant message, not saved into the history, never sent back to the model.
+- `openai_compat.rs` reads `delta.reasoning_content` (or `delta.reasoning`); `anthropic_compat.rs` reads
+  `thinking_delta`.
+- TUI: a dimmed italic `thinking` block that grows live (`DisplayBlock::Reasoning`). Headless
+  `nca run`: dim text on **stderr**, so stdout stays the answer alone.
+- **There is no setting for effort.** `enable_thinking` / `--thinking-budget` are only implemented by the
+  MiniMax provider; the Custom provider does not send a `thinking` parameter on either API. Kimi's
+  Anthropic-style endpoint (`<base>/v1/messages`, `compatibility = "anthropic"`) does honour one — checked
+  directly with `curl`, HTTP 200 with `thinking` blocks and signatures, with either an `Authorization:
+  Bearer` or an `x-api-key` header — but nca does not ask for it. Sending it, and echoing the signed
+  thinking blocks back on multi-turn tool use, is the work needed to get an effort control; not done.
+
+## FIXED 2026-10-02: `nca run` exited having printed only part of the answer
+
+After `run_turn` returned, `run` called `stream_task.abort()` at once. The task that prints events and
+writes `<session>.events.jsonl` runs behind the agent, so anything still queued — the end of the
+reasoning, the answer, `MessageReceived`, `SessionEnded` — was thrown away whenever the consumer lagged
+(on a slow console it always does). It looked like a truncated network stream (`17*23 = 17*(`, exit 0) and
+cost an afternoon: hyper had logged the body complete, and the proxied run, whose timing let the printer
+keep up, printed `391`. It now drops the runtime (releasing the event-sender clones, which ends the
+receive loop) and waits up to 5 s for the task before aborting it. The session event log is complete again
+for the same reason.
+
+## FIXED 2026-10-02: `error sending request for url` hid its cause
+
+`reqwest::Error`'s `Display` stops at that sentence; the DNS / connect / TLS / reset / timeout cause is
+the only informative part and is a `source()` away. The Custom, Anthropic and MiniMax providers now format
+the whole chain (`provider::error_chain`, with a test). If it comes back the message should say why.
+
+## Running nca against Kimi Code on the amd64 box (what is configured there)
+
+Nothing to build: the binary is a static musl cross-build (`NCA_ARCH=x86_64`, see `../README.md`), copied
+to `/usr/local/bin/nca`. Config is `/root/.local/share/ncacli/config.toml`, mode 600:
+
+```toml
+[provider]
+default = "custom"
+
+[provider.custom]
+base_url = "https://api.kimi.com/coding"   # nca appends /v1/chat/completions
+model = "kimi-for-coding"
+compatibility = "openai"
+api_key = "…"                              # the key lives here, not in a profile
+temperature = 1.0                          # Kimi rejects any other value: "invalid temperature: only 1 is allowed"
+
+[model]
+default_model = "kimi-for-coding"
+
+[permissions]
+mode = "bypass-permissions"                # accept-edits is what `nca run` defaults to
+```
+
+- **`HOME` must be set** or nca cannot find that file and falls back to MiniMax (`missing MiniMax API key`,
+  `HOME is not set`). sshd gives a session no environment; `NCA_HOME` and `XDG_DATA_HOME` are the only
+  alternatives and are environment variables too. Run from an **empty directory** (`/tmp/work`).
+- Environment overrides win over the file: `NCA_DEFAULT_PROVIDER`, `CUSTOM_PROVIDER_BASE_URL`,
+  `CUSTOM_PROVIDER_MODEL`, `CUSTOM_PROVIDER_API_KEY`, `CUSTOM_PROVIDER_COMPATIBILITY`.
+- **`RUST_LOG` does nothing.** The log filter is `info`, or `debug` for **everything** with `--verbose`
+  (`nca --verbose run …`, which includes hyper's connection and pool lines).
+- Each `run` makes two requests: a short context-window probe, then the streamed chat. A one-shot exits
+  with `134` (SIGABRT) at shutdown — the tokio-runtime teardown panic below — after the work is done.
+
+## OPEN: no keyboard scrolling in the TUI
+
+The transcript scrolls with the **mouse wheel** only (`MouseEventKind::ScrollUp/Down`, 3 lines per notch);
+`End` jumps to the bottom when the composer is empty. `PageUp` / `PageDown` and `Up` / `Down` are not bound
+on the transcript (the arrow keys only act inside popups) — although the kernel's USB keymap does send
+`PageUp` as `ESC [ 5 ~`. On the TV console there is no wheel, so scrolled-off output cannot be reached.
+The binding belongs in the composer's key handler in `crates/tui/src/tui/app.rs`.
+
+## OPEN: smaller things seen on the box
+
+- **Tool-result previews run lines together**: `list_directory` shows
+  `.cargo/.git/.gitignore.gitmodulesCLAUDE.mdCargo.lock…` — the newline between entries is dropped when the
+  preview is built (`truncate(&output.output, 120)` in `tui/state.rs`'s `ToolCallCompleted` handler is the
+  suspect; not traced).
+- **`IPC disabled: … Address family not supported by protocol (os error 97)`**: no `AF_UNIX` listener on
+  the amd64 kernel, so `nca attach` / `status` against a running session cannot work there. One-shot runs
+  and the TUI are unaffected.
+- **Exit abort (`134`)**: the `tokio-rt-worker` `Option::unwrap()` panic on runtime shutdown recorded in
+  `../../../docs/archive/NCA_MISSING_SYSCALLS.md` §7 is still there; with `panic = "abort"` it ends the
+  process by signal after the session is complete.
+- **Glyphs**: `⏵`-style symbols in the status line draw as `▯` — the framebuffer font lacks them.
+
+
 ## FIXED 2026-08-22: `execute_bash`'s timeout doesn't kill the child — it orphans it, and the orphan can block later commands
 
 **First seen:** 2026-08-22, running a self-hosted `cargo build` inside the VM

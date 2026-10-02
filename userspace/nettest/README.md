@@ -34,6 +34,15 @@ made a tokio client park forever without ever sending its request. Details in
 `nettest-reqwest post <url> 64` repeated a dozen times, which is what caught the
 two races.
 
+`nettest-reqwest` also takes `NETTEST_SPAWN=1`, which runs the whole probe inside **one
+spawned task**: on a multi-thread runtime the main thread then only waits for the task to
+finish instead of being woken per chunk. Together with `NETTEST_RT=current|multi` and
+`TOKIO_WORKER_THREADS=n` it separates "the I/O path stalls" from "a cross-thread wake is lost"
+— the bisect that found the `eventfd` edge defect of 2026-10-02
+([`runbooks/debug-delayed-first-byte.md`](../../docs/runbooks/debug-delayed-first-byte.md) row 5).
+The axes that matter for a streamed reply are the `/drip/<total>/<n>` and `/sse/<gap>/<n>` routes of
+`scripts/net_delay_server.py`.
+
 These two probes cut that stack into axes that can be tested one at a time:
 
 | probe / mode | sockets | HTTP | TLS | isolates |

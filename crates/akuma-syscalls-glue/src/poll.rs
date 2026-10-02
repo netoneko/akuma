@@ -18,7 +18,7 @@ use akuma_net_yarn::{Observation, WaitError, WaitMachine, WaitPolicy, WaitStep};
 use akuma_syscalls_poll::readiness::{FdState, readiness};
 use akuma_syscalls_poll::{fdset, pollfd};
 #[cfg(feature = "sc-epoll")]
-use akuma_syscalls_poll::{InterestList, ctl, edge};
+use akuma_syscalls_poll::{InterestList, ctl};
 #[cfg(feature = "sc-epoll")]
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
@@ -823,14 +823,25 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 
             // Level- vs edge-triggered, and what the entry remembers afterwards.
             // See `akuma_syscalls_poll::edge::scan`.
-            let step = edge::scan(entry.events, revents, entry.last_ready);
+            //
+            // Decided and recorded in ONE step against the entry as it is now, not
+            // from the copy taken above: `revents` was probed outside any lock, so
+            // a reader on another core may have drained the socket and called
+            // `epoll_on_fd_drained` since. Deciding from the stale `last_ready` and
+            // then writing `revents` back undid that re-arm, and every later
+            // arrival was SUPPRESSED — a tokio client's stream stalled after ~0.3 s
+            // on the 4-core box (`InterestList::scan_entry` has the whole story).
+            let step = akuma_primitives::irq::with_irqs_disabled(|| {
+                EPOLL_TABLE
+                    .lock()
+                    .get_mut(&epoll_id)
+                    .and_then(|inst| inst.scan_entry(fd, revents))
+            });
+            let Some(step) = step else {
+                continue; // instance or entry vanished while we probed
+            };
 
-            if let Some(record) = step.record {
-                akuma_primitives::irq::with_irqs_disabled(|| {
-                    if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
-                        inst.record_ready(fd, record);
-                    }
-                });
+            if step.record.is_some() {
                 // One line per ready fd, showing whether the edge bookkeeping
                 // let this event through. A lost edge is invisible in every
                 // other trace: the fd stays ready, the watcher stays parked,

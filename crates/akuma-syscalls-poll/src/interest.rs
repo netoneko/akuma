@@ -167,6 +167,43 @@ impl InterestList {
         }
     }
 
+    /// Decide what to report for `fd` from the readiness `revents` a probe just
+    /// returned, **and** remember it — one step, against the entry as it is now.
+    ///
+    /// `None` if `fd` is no longer registered.
+    ///
+    /// # Why this is one call and not `scan` + `record_ready`
+    ///
+    /// The scan probes a socket's readiness outside any lock, so the I/O
+    /// syscalls on another core run concurrently with it, and each one calls
+    /// [`Self::reset_edge`] when it drains the buffer. Deciding from a copy of
+    /// `last_ready` taken before the probe, and then writing `last_ready =
+    /// revents` unconditionally afterwards, lets a scan **undo a reset that
+    /// happened in between**: the reader drained and re-armed, the scan wrote
+    /// "`EPOLLIN` already reported" back over it, and from then on every arrival
+    /// is `revents & !last_ready == 0` — suppressed, forever. The reader that
+    /// would re-arm the edge is the one parked waiting for it.
+    ///
+    /// Reproduced 2026-10-02 on the 4-core bare-metal box: `nettest-reqwest
+    /// stream <host>/drip/10/1000` (a tokio client, edge-triggered mio) took 13
+    /// chunks in 273 ms and then sat in one `epoll_pwait` for the remaining 30 s
+    /// while the server's socket buffer filled and its window closed. nca's
+    /// streamed model replies stalled the same way, which is what a
+    /// single-core QEMU run could never show.
+    ///
+    /// Taking the current `last_ready` here costs one spurious report at worst —
+    /// a probe that saw data a concurrent reader has since consumed reports it
+    /// again, and the reader finds `EAGAIN` and re-arms. A spurious edge is
+    /// allowed; a suppressed one is the hang.
+    pub fn scan_entry(&mut self, fd: u32, revents: u32) -> Option<crate::edge::Scan> {
+        let entry = self.map.get_mut(&fd)?;
+        let step = crate::edge::scan(entry.events, revents, entry.last_ready);
+        if let Some(record) = step.record {
+            entry.last_ready = record;
+        }
+        Some(step)
+    }
+
     /// Clear `bits` from `fd`'s "already reported" mask, if `fd` is registered
     /// **edge-triggered**, so the next time those bits go ready they count as a
     /// fresh edge.

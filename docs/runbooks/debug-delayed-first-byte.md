@@ -43,7 +43,7 @@ categories. None was a lost wakeup.
 
 ## What was already found
 
-Four defects, all fixed 2026-08-17. Knowing their shapes is most of the value
+Four defects, all fixed 2026-08-17, and a fifth found on the amd64 box 2026-10-02. Knowing their shapes is most of the value
 here, because a new hang is likely to rhyme with one of them.
 
 | # | Defect | How it presented | Fix |
@@ -52,8 +52,9 @@ here, because a new hang is likely to rhyme with one of them.
 | 2 | `SO_RCVTIMEO`/`SO_SNDTIMEO` accepted and dropped; no `getsockopt` arm | a 2 s timeout fired at 30041 ms (defect 1's cap), and readback said the option was unset | real `struct timeval` plumbing, zero = forever, readback works |
 | 3 | `EPOLLET` **write** edge never re-armed | a client that filled the 16 KB transmit buffer waited forever for `EPOLLOUT`; intermittent, because `epoll_pwait` flushes the buffer itself before it can observe `can_send()` go false | `epoll_on_fd_write_blocked`, called from `sendto`/`sendmsg`/`write` |
 | 4 | A socket in **`SynSent`** reported read-closed | `EPOLLIN` + `EPOLLRDHUP` and `recv() == Ok(0)` on a connection that had never carried a byte; client parked forever **without sending its request** — ~1 run in 3 | `tcp_reached_established` guards both predicates |
+| 5 | **An `eventfd` that is only ever written stays readable, so only its first `EPOLLET` edge was reported** (2026-10-02, amd64 bare metal) | A multi-threaded tokio client streaming a body took a few chunks in ~0.3 s and then sat in one `epoll_pwait` with its socket buffer full (`Send-Q` on the peer pinned, window closed). nca's model replies stalled and "ended" the same way. Needs the cross-thread wake: `NETTEST_RT=current` and `NETTEST_SPAWN=1` pass, `multi` stalls, `TOKIO_WORKER_THREADS=1` still stalls | `write(eventfd)` and `read(eventfd)` re-arm the `EPOLLIN` edge (`akuma-syscalls-glue/src/fs.rs`); plus a scan-vs-reader race closed in `InterestList::scan_entry`. Verified: `nettest-reqwest stream …/drip/10/1000`, multi-thread, 3/3 complete, plain and TLS |
 
-The four were found in that order, and **the order matters as a warning**:
+The first four were found in that order (the fifth six weeks later, on a different target), and **the order matters as a warning**:
 fixing 3 on its own left the 64 KiB POST still hanging roughly 1 run in 3, which
 is easy to misread as "the fix didn't work" rather than "there is a second race
 here". Two independent races with overlapping symptoms is the situation this

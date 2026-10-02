@@ -1,8 +1,10 @@
 # amd64: staging agent binaries on the trashcan, and the three kernel defects that fell out
 
 **Date:** 2026-10-02 (box on `Akuma/amd64`)
-**Status:** all kernel fixes below are **installed and verified on the metal** (kernel stamped `71bec22c`, md5
-`152e478f…`). `nca` runs end to end against Kimi. `goose` and `opencode` are still broken (§ 2, § 8).
+**Status:** every kernel fix below is **installed and verified on the metal** (kernel `no-tests`, stamp
+`719d3406` + the epoll/eventfd change; see § 7's table for the md5s). `nca` runs end to end against Kimi,
+`goose` now works, a multi-threaded tokio stream no longer stalls. Still open: `opencode`, the TUI items in
+`userspace/nca/docs/ISSUES.md`, and the list in § 8.
 
 The ask began as "set up Rust and cargo in the local (TV) console, stage `opencode`, then try `goose` with Kimi", and
 turned into a build of `nca` on the box. Each step stopped at a kernel behaviour that was wrong, not at a tool.
@@ -56,11 +58,9 @@ Observed, all on the box and later confirmed by the user:
   created). SQLite code 15 is `SQLITE_PROTOCOL`.
 - The `goose tui` shows nothing (user report; not investigated).
 
-**Lead, unverified:** `sys_fcntl` returns `0` for `F_GETLK`/`F_SETLK`/`F_SETLKW` (`akuma-syscalls-glue/src/fs.rs`),
-and for `F_GETLK` it does **not** write `l_type = F_UNLCK` back, so a caller asking "does anything hold this lock?" is
-told yes. SQLite's unix VFS uses exactly those calls. `flock(2)` is a different thing and is not the gap: amd64
-dispatches `Syscall::Flock => 0` (a stub), AArch64 has a real one. The WAL `-shm` file's `mmap` is a second suspect.
-Not tested; `goose` has not been re-run since the `F_GETFL` fix below.
+**Resolved (§ 9):** `F_GETLK` answered "locked" for every query, which is exactly what SQLite's WAL
+shared-memory setup interprets as `SQLITE_BUSY` → `SQLITE_PROTOCOL`. Fixed; goose now starts, answers and
+exits 0. (`goose --version` not exiting and the blank TUI were seen before the fix and not re-checked.)
 
 ## 3. nca on the box: `build.rs` hardcoded aarch64
 
@@ -204,15 +204,20 @@ install's output before rebooting.
 ## 8. Open items
 
 1. ~~Install the staged kernel; confirm on the metal.~~ Done (§ 7).
-2. Goose: re-run after the fix; if `SQLITE_PROTOCOL` persists, make `F_GETLK` write `F_UNLCK` back (and decide whether
-   `F_SETLK` should track real locks), then check the WAL `-shm` mapping. `goose --version` not exiting and the blank
-   TUI are separate.
+2. ~~Goose~~ fixed (§ 9). Still to decide: whether `F_SETLK` should track real locks (it always succeeds, so
+   cross-process exclusion does not exist), and re-check `goose --version` and its TUI.
 3. `opencode --version` hang, uninvestigated.
 4. `RUSAGE_CHILDREN` / `cutime`; killed children report 0 CPU in `wait4`.
 5. `loadavg`; the `State` field; per-CPU bucketing. (Starvation baseline: done, § 5.)
 6. `wc: Interrupted system call` appeared once from a pipeline's `wc -l` in the box shell — an `EINTR` where Linux
    would not return one. Not chased.
 7. A pipe's write end still reports `O_RDONLY` from `F_GETFL`.
+9. **The shared file offset is not shared across `fork`/`exec`.** `for …; do ./cmd; done > out` has every child
+   write from offset 0 and overwrite its siblings (seen as a garbled results file; `>>` per command is the
+   workaround). Not investigated.
+10. `[E2-EOF] inode=… caller believed the file extended past off?` from the ext2 layer during SQLite WAL activity.
+11. nca: the items under "OPEN" in `userspace/nca/docs/ISSUES.md` (no keyboard scroll in the TUI, run-together
+    tool previews, no `AF_UNIX`, exit abort).
 8. Four surviving processes after `kill -9` on the box (pids 32 and 4188, the `nca` build script and `rustc`) — a
    zombie shell from the first timed-out download (pid 49) also persisted. Cause unknown.
 
@@ -236,3 +241,84 @@ install's output before rebooting.
 - Host port 2222 may be in use; `SSH_PORT`/`HTTP_PORT` override it.
 - Check a "stale" answer's origin before explaining it: the version label looked like a different kernel and was a
   build-script fingerprint.
+
+## 9. Goose: `F_GETLK` (SQLite `SQLITE_PROTOCOL`)
+
+The lead from § 2 was right. A probe (`t.c`, static musl, run on the box) gave:
+
+| call | result on the old kernel | Linux |
+|---|---|---|
+| `F_GETLK` on a byte nobody holds | `l_type=1` (`F_WRLCK`: "locked") | `l_type=2` (`F_UNLCK`) |
+| second process `F_SETLK` on a byte the first holds | succeeds | `EAGAIN`/`EACCES` |
+| `F_GETLK` from the second process | `l_type` unchanged, `pid=0` | `F_WRLCK`, `pid=<holder>` |
+| `flock(EX)`, `mmap(MAP_SHARED)` of a file + `pread` | ok | ok |
+
+SQLite's `unixLockSharedMemory` (WAL's `-shm`) calls `F_GETLK` on the DMS byte: `F_UNLCK` means "I am the first
+connection, truncate and carry on"; `F_WRLCK` means "another process holds it" → `SQLITE_BUSY` → reported as
+`SQLITE_PROTOCOL`, code 15. A static SQLite 3.53 shell on the old kernel confirmed the family: `PRAGMA
+journal_mode=WAL; CREATE TABLE t…` then `no such table: t` (non-WAL worked).
+
+**Fix:** `sys_fcntl` answers `F_GETLK` with `F_UNLCK` (writes only `l_type`). `F_SETLK`/`F_SETLKW` are unchanged
+(always succeed), which is the remaining wrong half. **Verified** in the QEMU rig and on the metal: WAL journal,
+`count(*)` 3 then 4 after reopening, `integrity_check` `ok`; then `goose-kimi run --no-session -t "Reply with
+exactly the single word: pong"` printed `pong` and exited 0 (its old database files are in `/root/goose-old-db/`).
+
+## 10. nca streaming: the stall was an eventfd edge, then a printer race
+
+The photographs of the TV showed `streaming 55s … 202s`, bursts of text after 90 s silences and then `error sending
+request`. In order, what was ruled in and out:
+
+1. **Not a kernel network limit.** `curl -N` of a 1,500-token reply streamed 1,200 lines in 21 s, steady; DNS, TLS
+   and the TCP path were fine. A `--verbose` nca run showed the HTTPS connection made and pooled normally.
+2. **Reproduced without Kimi** with nca's own stack (`nettest-reqwest`, tokio + hyper + reqwest + rustls) against
+   `scripts/net_delay_server.py`: `stream …/drip/10/1000` took 13–57 chunks in the first ~0.3 s and then stalled
+   (no `RESULT`; killed at 30–45 s) 4/4 times plain and TLS. **A single-core QEMU rig could not reproduce it** (it
+   needs more than one core — the same run completed there at SMP=4 too).
+3. **The Mac's `netstat` named the side**: `Send-Q 3465` unacknowledged, the server stuck in `FIN_WAIT_1`, shrinking by
+   bytes per probe — the box's receive window was closed because its socket buffer was full and unread.
+4. **A temporary `[epolldiag]` line in the epoll scan** showed the same socket: `rev=0x5 was_last=0x5 report=0x0
+   st=ESTABLISHED can_recv=true rq=16384` — readable, buffer full, edge **suppressed**. No `PRUNE` lines, so the fd
+   was not being dropped from the interest list. (The diagnostic and an earlier hypothesis that the scan's
+   decision-then-record raced a reader's re-arm are both addressed: the race is fixed in `scan_entry` with a host test
+   of the interleaving, but it was **not** the cause of this stall — the fix alone left 4/4 still stalled.)
+5. **The bisect that found it**: `NETTEST_RT=current` completed 1,001/1,001; `multi` stalled; `multi` with
+   `TOKIO_WORKER_THREADS=1` still stalled; **`NETTEST_SPAWN=1` (whole probe inside one spawned task, no per-chunk wake of
+   the main thread) completed 3/3.** So the stall needed a cross-thread wake. Raw `futex` ping-pong with bursts, both
+   `FUTEX_WAIT` and `FUTEX_WAIT_BITSET` (what Rust's `std` uses), lost nothing (4/4 runs, `lost_wakes=0`), and neither did a
+   pthread condvar — so not the futex.
+6. **The cause**: tokio wakes a reactor thread that is parked in `epoll_pwait` by writing an `eventfd` that mio
+   registered `EPOLLET`. Linux raises a fresh edge for every write; this kernel derives edges from readiness
+   *transitions*, and mio never reads the eventfd, so it stays readable and only the first write counted. The consumer
+   (main thread) release of hyper's body backpressure woke nobody, the connection task never read again, the window
+   closed. `read(eventfd)` also never re-armed the edge, unlike every socket/pipe read.
+
+**Fix:** `akuma-syscalls-glue/src/fs.rs` re-arms the `EPOLLIN` edge on every eventfd write (before the write and its
+wake) and after every eventfd read. **Verified on the metal:** `nettest-reqwest stream …/drip/10/1000`, multi-thread:
+3/3 complete plain, 3/3 TLS; the 1 s SSE stream's end-of-body lag (last chunk at 20.2 s, body complete at 26.2 s) is
+gone (20.4 s).
+
+**Then a second, unrelated thing looked like the same problem.** With the stall fixed, `nca run` still ended
+mid-sentence with exit 0 (`340 + 51`, the next piece would be ` = 391`), and `hyper` had logged the body complete. A logging
+proxy on the Mac (adding the key itself, so none crossed the LAN) showed Kimi sending the whole reply in 2.25 s: 19
+reasoning chunks, `391`, `finish=stop`, `[DONE]`. The loss was in nca: `run` aborted its event task right after `run_turn`
+returned, discarding whatever was still queued (see `userspace/nca/docs/ISSUES.md`). The session event log was
+incomplete for the same reason, which is why counting events in it had been misleading. Fixed in nca by draining before
+aborting. `error sending request for url` now prints its cause chain; its cause on the TV runs was not captured.
+
+## 11. Reasoning ("thinking") in nca
+
+Neither of nca's SSE parsers handled Kimi's reasoning, so a reasoning turn was silent. Added for both APIs
+(`reasoning_content`; `thinking_delta`), shown as a dim `thinking` block in the TUI and on stderr in `run`. Kimi's
+Anthropic-style endpoint (`/coding/v1/messages`, either auth header) works and returns `thinking` blocks; there is no
+"effort" setting because nca's Custom provider sends no `thinking` parameter and only MiniMax implements
+`--thinking-budget`. Details: `userspace/nca/docs/ISSUES.md`.
+
+## 12. What changed on the box in this last stretch
+
+| item | state |
+|---|---|
+| kernel | `no-tests` build with `F_GETLK`, the `scan_entry` race fix and the eventfd re-arm; diagnostics removed |
+| `/usr/local/bin/nca` | cross-built on the Mac with reasoning, the error chain and the exit-drain fix (md5 `56911f31…`; previous builds kept as `nca.v2`, `nca.prev`). Verified: 4/4 `nca run` complete in 4–7 s with the answer, `Session ended (Completed)` and the token line |
+| `/usr/local/bin/goose`, `goose-kimi` | working; old DB moved to `/root/goose-old-db/` |
+| test servers | `scripts/net_delay_server.py` (HTTP 18080, TLS 18443) and a logging proxy (18090) were run on the Mac, not left on the box |
+| test binaries on the box | `/tmp/nt/nettest-reqwest{,2}`, `/tmp/lk/{t,sqlite3,pp,fx,fx2}` (in `/tmp`) |

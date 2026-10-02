@@ -90,6 +90,11 @@ pub mod fcntl {
     /// The one `F_SETFD` bit that exists.
     pub const FD_CLOEXEC: u32 = 1;
 
+    /// `struct flock::l_type` values (`F_RDLCK`, `F_WRLCK`, `F_UNLCK`).
+    pub const F_RDLCK: i16 = 0;
+    pub const F_WRLCK: i16 = 1;
+    pub const F_UNLCK: i16 = 2;
+
     /// What `fcntl(F_GETFL)` reports for a regular file opened with `open_flags`.
     ///
     /// The access mode and `O_APPEND` it was opened with, plus `O_NONBLOCK` if

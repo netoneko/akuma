@@ -576,3 +576,63 @@ fn the_poll_and_epoll_bit_values_agree_where_both_define_them() {
     assert_eq!(u32::from(POLLIN.cast_unsigned()), EPOLLIN);
     assert_eq!(u32::from(POLLOUT.cast_unsigned()), EPOLLOUT);
 }
+
+// ── scan_entry: the decision and the record are one step ──────────────────
+
+/// The lost edge, as an interleaving. A scan reports `EPOLLIN`; the reader on
+/// another core drains the socket and re-arms; then a scan that probed readiness
+/// *before* the drain (so it still sees data) comes to decide.
+///
+/// Deciding from a copy of `last_ready` taken before the reset reports nothing
+/// and records `EPOLLIN` — the edge is closed with the buffer empty, and no later
+/// arrival can open it. Deciding against the entry as it is *now* reports a
+/// (spurious) edge, which makes the reader run, hit `EAGAIN` and re-arm.
+#[test]
+fn a_reader_reset_between_probe_and_decision_does_not_close_the_edge() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 7, EPOLLIN | EPOLLET, 0xaaaa);
+
+    // Scan 1: data arrived, edge reported and remembered.
+    let first = list.scan_entry(7, EPOLLIN).expect("registered");
+    assert_eq!(first.report, EPOLLIN);
+
+    // The pre-fix scan copied the entry here ...
+    let stale_copy = list.get(7).expect("registered");
+    assert_eq!(stale_copy.last_ready, EPOLLIN);
+
+    // ... the reader drained the buffer and re-armed ...
+    assert!(list.reset_edge(7, EPOLLIN));
+
+    // ... and the old decision, from the stale copy, suppresses the edge:
+    let old = scan(stale_copy.events, EPOLLIN, stale_copy.last_ready);
+    assert_eq!(old.report, 0, "the pre-fix decision: SUPPRESSED, the hang");
+
+    // The current decision does not.
+    let now = list.scan_entry(7, EPOLLIN).expect("registered");
+    assert_eq!(now.report, EPOLLIN, "a spurious edge is allowed; a lost one is not");
+}
+
+/// After a scan that reported nothing because the socket really was empty, the
+/// next arrival is a fresh edge — the mask follows readiness going away.
+#[test]
+fn scan_entry_records_readiness_going_away_so_the_next_arrival_is_new() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 3, EPOLLIN | EPOLLET, 0);
+    assert_eq!(list.scan_entry(3, EPOLLIN).unwrap().report, EPOLLIN);
+    assert_eq!(list.scan_entry(3, EPOLLIN).unwrap().report, 0, "still ready: not a new edge");
+    assert_eq!(list.scan_entry(3, 0).unwrap().report, 0);
+    assert_eq!(list.get(3).unwrap().last_ready, 0, "going away is recorded");
+    assert_eq!(list.scan_entry(3, EPOLLIN).unwrap().report, EPOLLIN, "a fresh edge");
+}
+
+/// Level-triggered entries report every pass and remember nothing, and an
+/// unregistered fd answers `None`.
+#[test]
+fn scan_entry_leaves_level_triggered_entries_stateless_and_ignores_unknown_fds() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 5, EPOLLIN, 0);
+    assert_eq!(list.scan_entry(5, EPOLLIN).unwrap().report, EPOLLIN);
+    assert_eq!(list.scan_entry(5, EPOLLIN).unwrap().report, EPOLLIN);
+    assert_eq!(list.get(5).unwrap().last_ready, 0);
+    assert!(list.scan_entry(99, EPOLLIN).is_none());
+}
