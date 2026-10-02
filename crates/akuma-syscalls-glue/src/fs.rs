@@ -2858,7 +2858,16 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             0
         }
         F_GETFL => {
-            if proc.is_nonblock(fd) { O_NONBLOCK } else { 0 }
+            // A regular file reports the access mode and O_APPEND it was opened
+            // with (see `getfl_status`); every other kind of fd keeps reporting
+            // only O_NONBLOCK, as before.
+            let nonblock = proc.is_nonblock(fd);
+            match proc.get_fd(fd) {
+                Some(akuma_exec::process::FileDescriptor::File(f)) => {
+                    u64::from(akuma_syscalls_linux::flags::fcntl::getfl_status(f.flags, nonblock))
+                }
+                _ => if nonblock { O_NONBLOCK } else { 0 },
+            }
         }
         F_SETFL => {
             if arg & O_NONBLOCK != 0 {

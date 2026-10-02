@@ -89,6 +89,23 @@ pub mod fcntl {
     pub const F_DUPFD_CLOEXEC: u32 = 1030;
     /// The one `F_SETFD` bit that exists.
     pub const FD_CLOEXEC: u32 = 1;
+
+    /// What `fcntl(F_GETFL)` reports for a regular file opened with `open_flags`.
+    ///
+    /// The access mode and `O_APPEND` it was opened with, plus `O_NONBLOCK` if
+    /// `F_SETFL` has set it since. Every other `open(2)` flag (`O_CREAT`,
+    /// `O_EXCL`, `O_TRUNC`, ...) acts once at open time and is not part of the
+    /// file status flags.
+    ///
+    /// The access mode matters to callers: GNU `ar` (BFD's `bfd_fdopen`) asks
+    /// `F_GETFL` about the `mkstemp` fd it is about to write and fails with
+    /// "invalid operation" if it reads back `O_RDONLY`. This used to return
+    /// `O_NONBLOCK` or `0`, i.e. every fd claimed to be read-only.
+    #[must_use]
+    pub const fn getfl_status(open_flags: u32, nonblock: bool) -> u32 {
+        use super::open::{O_ACCMODE, O_APPEND, O_NONBLOCK};
+        (open_flags & (O_ACCMODE | O_APPEND)) | if nonblock { O_NONBLOCK } else { 0 }
+    }
 }
 
 /// `mmap(2)` `flags`. Values match Linux aarch64.
@@ -277,6 +294,25 @@ mod tests {
     #[test]
     fn o_nonblock_is_0x800() {
         assert_eq!(open::O_NONBLOCK, 0x800);
+    }
+
+    /// `F_GETFL` reports the access mode and `O_APPEND`, and nothing that only
+    /// acts at open time; `O_NONBLOCK` comes from the descriptor's own state.
+    #[test]
+    fn getfl_reports_access_mode_and_append_only() {
+        use fcntl::getfl_status;
+        assert_eq!(getfl_status(open::O_RDONLY, false), open::O_RDONLY);
+        assert_eq!(getfl_status(open::O_WRONLY, false), open::O_WRONLY);
+        assert_eq!(getfl_status(open::O_RDWR, false), open::O_RDWR);
+        // `mkstemp`'s open: O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC reads back O_RDWR.
+        let mkstemp = open::O_RDWR | open::O_CREAT | open::O_EXCL | open::O_CLOEXEC;
+        assert_eq!(getfl_status(mkstemp, false), open::O_RDWR);
+        assert_eq!(
+            getfl_status(open::O_WRONLY | open::O_APPEND | open::O_TRUNC, false),
+            open::O_WRONLY | open::O_APPEND
+        );
+        assert_eq!(getfl_status(open::O_RDONLY, true), open::O_NONBLOCK);
+        assert_eq!(getfl_status(open::O_RDWR, true), open::O_RDWR | open::O_NONBLOCK);
     }
 
     /// The access mode is an enum in the low two bits, not a flag set: nothing

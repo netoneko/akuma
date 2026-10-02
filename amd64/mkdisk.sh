@@ -664,7 +664,7 @@ if [ -n "$HERD" ]; then
         # Sourced by the console shell (ash reads $ENV when interactive). The place
         # to choose the printing area on the TV: `stty cols N rows M` narrows it to
         # the top-left N x M cells and programs lay out for that.
-        printf '# Sourced by the console shell on the TV (ENV=/etc/console.rc).\n#\n# The text grid is what `stty size` prints. The screen setup for a machine (margin,\n# how much of the screen is used) belongs in /etc/console.conf, read at boot; this\n# file is for anything else the TV shell should do on start, e.g.:\n#\n#   stty cols 73 rows 41\n#\nAKUMA_CONSOLE_RC=loaded\nexport AKUMA_CONSOLE_RC\n' > "$TMP/console.rc"
+        printf '# Sourced by the console shell on the TV (ENV=/etc/console.rc).\n#\n# The text grid is what `stty size` prints. The screen setup for a machine (margin,\n# how much of the screen is used) belongs in /etc/console.conf, read at boot; this\n# file is for anything else the TV shell should do on start, e.g.:\n#\n#   stty cols 73 rows 41\n#\nAKUMA_CONSOLE_RC=loaded\nexport AKUMA_CONSOLE_RC\n\n# Rust/cargo environment, same as ssh login shells.\n[ -f /etc/akuma-dev.env ] && . /etc/akuma-dev.env\n' > "$TMP/console.rc"
         "$DEBUGFS" -w -R "write $TMP/console.rc etc/console.rc" "$IMG" >/dev/null 2>&1
         "$DEBUGFS" -w -R "write $TMP/herd-console.conf etc/herd/enabled/console.conf" "$IMG" >/dev/null 2>&1
         "$DEBUGFS" -w -R "write $TMP/herd-console.conf etc/herd/available/console.conf" "$IMG" >/dev/null 2>&1
