@@ -93,6 +93,20 @@ static ACKED: [core::sync::atomic::AtomicU64; MAX_CPUS] =
 static SERVICED: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
 
+/// Per-sender: the peers the sender's last [`broadcast`] addressed, which is the
+/// set its [`wait_for_acks`] waits on. Indexed by the sending core; only that
+/// core reads or writes its slot, on one thread between the send and the wait.
+static TARGET: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Per-sender: the generation its last addressed broadcast carried.
+static TARGET_GEN: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Send shootdowns only to cores running the edited address space. Flip off to
+/// get the old everyone-always behaviour for an A/B.
+static TARGETED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 /// Spins between "the wait is stuck" reports, mirroring the BKL's
 /// `SPIN_WARN_THRESHOLD` cadence. The wait is bounded by the deadlock
 /// argument above; a message here means an assumption behind that argument
@@ -153,17 +167,41 @@ pub fn broadcast() -> bool {
         return false;
     }
     let me = smp::cpu_index();
+    let all: u64 = ((1u64 << peers) - 1) & !(1u64 << me);
+    // Only cores that can hold a translation for the edited space need the IPI.
+    // Every flush call site edits the *current* address space (`invlpg` is only
+    // meaningful for it), so the question is who else has this `CR3` published.
+    // Fall back to everyone when the registry cannot vouch for the sender: its
+    // own root unpublished (an `activate_unpublished` path) or the kernel root.
+    let targets = if TARGETED.load(core::sync::atomic::Ordering::Relaxed)
+        && peers <= akuma_mmu::TTBR_TRACK_CORES
+    {
+        let root = crate::paging::active_root();
+        let on_root = akuma_mmu::cores_on_l0_mask(root);
+        if root == crate::sched::kernel_root() || on_root & (1u64 << me) == 0 {
+            all
+        } else {
+            on_root & all
+        }
+    } else {
+        all
+    };
+    TARGET[me].store(targets, core::sync::atomic::Ordering::Relaxed);
+    if targets == 0 {
+        return false;
+    }
     let generation = GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+    TARGET_GEN[me].store(generation, core::sync::atomic::Ordering::Relaxed);
     // Mailbox first, IPI second: whichever way the peer learns of the
     // generation (delivered IPI, or the BKL assist reading the mailbox), the
     // generation is already visible.
     for (idx, pending) in PENDING.iter().enumerate().take(peers) {
-        if idx != me {
+        if targets & (1u64 << idx) != 0 {
             pending.store(generation, core::sync::atomic::Ordering::Release);
         }
     }
     for idx in 0..peers {
-        if idx != me {
+        if targets & (1u64 << idx) != 0 {
             crate::lapic::send_fixed(smp::lapic_id_of(idx), VECTOR);
         }
     }
@@ -180,7 +218,11 @@ pub fn wait_for_acks() {
         return;
     }
     let me = smp::cpu_index();
-    let generation = GEN.load(core::sync::atomic::Ordering::Acquire);
+    // This sender's own generation, not `GEN`: a later broadcast by another
+    // sender may have excluded a peer this one addressed, and that peer's
+    // acknowledgement would then never reach the newer number.
+    let generation = TARGET_GEN[me].load(core::sync::atomic::Ordering::Relaxed);
+    let targets = TARGET[me].load(core::sync::atomic::Ordering::Relaxed);
     let mut spins: u32 = 0;
     let mut remaining = peers;
     // Which peers are missing, by cpu index. The count alone ("1 peer(s)")
@@ -194,6 +236,7 @@ pub fn wait_for_acks() {
         missing = 0;
         for (idx, acked) in ACKED.iter().enumerate().take(peers) {
             if idx != me
+                && targets & (1u64 << idx) != 0
                 && acked.load(core::sync::atomic::Ordering::Acquire) < generation
             {
                 remaining += 1;

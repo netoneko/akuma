@@ -1209,6 +1209,30 @@ pub fn any_core_on_l0(l0_phys: usize) -> Option<usize> {
     None
 }
 
+/// Bitmask of the cores whose live (or in-flight) root is `l0_phys`, bit `c` for
+/// core `c`. The x86 shootdown's targeting question: which peers can hold a
+/// translation for the address space the sender just edited?
+///
+/// Ends with a full fence so the caller's preceding PTE stores are ordered
+/// before these loads. That is one half of a Dekker pair: a core switching *onto*
+/// the root publishes with a `SeqCst` store (`xchg`) before its `mov cr3`, so
+/// either this scan sees the publish (the core is targeted) or the core's first
+/// walk after the switch sees the edit (nothing stale to flush).
+pub fn cores_on_l0_mask(l0_phys: u64) -> u64 {
+    let l0 = l0_phys & L0_BASE_MASK;
+    if l0 == 0 {
+        return 0;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let mut mask = 0u64;
+    for (c, (active, prev)) in ACTIVE_L0.iter().zip(PREV_L0.iter()).enumerate() {
+        if active.load(Ordering::SeqCst) == l0 || prev.load(Ordering::SeqCst) == l0 {
+            mask |= 1 << c;
+        }
+    }
+    mask
+}
+
 /// Test hook: fake a core's published live L0 (boot-suite self-tests only —
 /// they can't get a peer core to genuinely park its TTBR0 on a test table).
 #[doc(hidden)]
