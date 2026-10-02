@@ -175,6 +175,35 @@ Remaining in the fault path: ~8 µs per file fault is now per-page work
 under one address-space hold; and every fault still takes the BKL for the whole
 window (`fault_bkl_drop_enabled` exists in `akuma-bkl::policy`, unwired on amd64).
 
+## 6b. On the metal (trashcan, 2026-10-02)
+
+Same loop as `amd64-j4-build-crash-hunt.md` §1a (`amd64_metal_j4_loop.sh`, whole
+`/root/ktarget` wiped per run, `kbuild -c -j 4`, SMP=4, 16 GiB, USB root), `kot`
+switched off by the owner. Both kernels built on the Mac, **plain** config (no
+`no-tests`, so both run the boot suite — a boot-time difference only), installed
+by `cp` over `/boot/akuma-amd64`, one reboot each.
+
+| arm | runs | wall | `[BKL] stuck` | verdict |
+|---|---|---|---|---|
+| baseline `67e87042` | 21, 22 | 594 s, 571 s | 55, 49 | PASS, PASS |
+| new `5152981c` | 31, 32 | **177 s, 114 s** | 45, 61 | PASS, PASS |
+| new, `no-tests` (quiet boot) | 33 | 173 s | 42 | PASS |
+
+**~3-5x on the metal** (571-594 s → 114-177 s; the earlier 2026-09-30 batch was
+836-905 s with `kot` running). 0 `[Fault]`, 0 SIGSEGV, 0 `[TLB] stuck`, no `EIO`,
+and no `[exec] read_image: waited` line (the metal's 1 GiB heap never ran short).
+The ryzen guest gained 22-33 %; the metal gained far more because its per-fault
+cost was higher — 510 k file faults each doing a 64 KiB `ext2` read off a USB
+disk that the shared cache made unnecessary. `[BKL] stuck` did **not** fall here
+(42-61 per build against 27 on ryzen before the fix), so metal has a different
+BKL holder still worth naming.
+
+Caveats: two runs per arm; run 21 started with `kot` on and 22 with it off (the
+two differ by 4 %); the faster pair, 114 s vs 177 s, shows cold-vs-warm variance
+the sample cannot size. The kernel left installed is the `no-tests` build
+(6,736,840 B, md5 `189dad3f8117`): **a plain `cargo build` drops quiet boot**
+(`splash` is on by default only for `no-tests`).
+
 ## 7. Still open
 
 * The structural fix is not to hold the whole image: `execve` could map the ELF
