@@ -105,6 +105,9 @@ pub use akuma_vfs_glue::{
     write_file,
 };
 
+/// Ticks (10 ms each) `read_image` waits for heap before giving up: ~20 s.
+const EXEC_HEAP_WAIT_TICKS: u32 = 2000;
+
 /// The exec-side image read.
 ///
 /// `read_file` caps the kernel-side allocation at 16 MiB
@@ -143,8 +146,43 @@ pub fn read_image(path: &str) -> Result<alloc::vec::Vec<u8>, akuma_vfs_glue::FsE
         return Err(FsError::Internal);
     }
     let mut buf = alloc::vec::Vec::new();
-    if buf.try_reserve_exact(size).is_err() {
-        return Err(FsError::Internal);
+    // **A refused reservation is usually other execs' images, not a dead end.**
+    // The whole image is held in the heap until the loader has copied it out, so
+    // three concurrent `rust-lld` links (158 MB each) leave a 512 MiB heap — 128 MB
+    // of it block cache — unable to seat a fourth. That surfaced as `EIO` out of
+    // `execve` (`could not exec rust-lld: I/O error`), at the first links of a
+    // `-j4` build, and got *more* likely the faster the kernel made those links
+    // overlap (`docs/archive/AKUMA_AMD64_TARGETED_SHOOTDOWN.md` §4). The holders
+    // finish in milliseconds and need nothing this thread holds, so wait for them:
+    // yield, then sleep to the next tick (10 ms), up to ~20 s.
+    let mut waited = 0u32;
+    while buf.try_reserve_exact(size).is_err() {
+        if waited >= EXEC_HEAP_WAIT_TICKS {
+            // `Internal` and `IoError` both reach ring 3 as `EIO`, so the errno
+            // cannot say a refused heap reservation from a failed device read —
+            // hence the line. Console only, no allocation.
+            let s = akuma_alloc::stats();
+            serial::puts("[exec] read_image: heap refused ");
+            serial::put_dec(size as u64);
+            serial::puts(" B for ");
+            serial::puts(path);
+            serial::puts(" after waiting (heap=");
+            serial::put_dec(s.heap_size as u64);
+            serial::puts(" allocated=");
+            serial::put_dec(s.allocated as u64);
+            serial::puts(")\n");
+            return Err(FsError::Internal);
+        }
+        waited += 1;
+        crate::sched::yield_now();
+        crate::sched::allow_tick();
+    }
+    if waited > 0 {
+        serial::puts("[exec] read_image: waited ");
+        serial::put_dec(u64::from(waited));
+        serial::puts(" ticks for heap: ");
+        serial::puts(path);
+        serial::puts("\n");
     }
     let mut chunk: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if chunk.try_reserve_exact(CHUNK).is_err() {

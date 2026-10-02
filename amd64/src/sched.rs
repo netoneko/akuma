@@ -1129,6 +1129,29 @@ pub fn idle_loop() -> ! {
                     .is_ok()
             {
                 akuma_exec::process::dump_running_process_stats();
+                {
+                    // Per-fault means, in ns, from the TSC totals `idt` keeps.
+                    let n = crate::idt::FAULT_STATS[0].load(Ordering::Relaxed);
+                    let hz = crate::lapic::tsc_hz();
+                    if n > 0 && hz > 0 {
+                        let ns = |c: u64| (u128::from(c) * 1_000_000_000 / u128::from(hz) / u128::from(n)) as u64;
+                        akuma_primitives::safe_print!(96,
+                            "[FAULTSTAT] n={} bkl_wait={}ns service={}ns\n",
+                            n,
+                            ns(crate::idt::FAULT_STATS[1].load(Ordering::Relaxed)),
+                            ns(crate::idt::FAULT_STATS[2].load(Ordering::Relaxed)));
+                        let nf = crate::mm::FILE_DEMAND_FAULTS.load(Ordering::Relaxed);
+                        if nf > 0 {
+                            let fc = crate::mm::FILE_FAULT_CYCLES.load(Ordering::Relaxed);
+                            akuma_primitives::safe_print!(96,
+                                "[FAULTSTAT] file_faults={} pages={} shared={} file_service={}ns\n",
+                                nf,
+                                crate::mm::FILE_PAGES_FILLED.load(Ordering::Relaxed),
+                                crate::mm::FILE_PAGES_SHARED.load(Ordering::Relaxed),
+                                (u128::from(fc) * 1_000_000_000 / u128::from(hz) / u128::from(nf)) as u64);
+                        }
+                    }
+                }
                 // TEMPORARY (2026-09-18): is the `-j4` wedge an orphaned process —
                 // registered and ACTIVE with no live thread, so unschedulable,
                 // unable to exit and never reaped, with its parent's `wait4`

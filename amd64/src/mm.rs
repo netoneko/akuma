@@ -1279,10 +1279,22 @@ pub fn fault_in(addr: u64) -> bool {
     match file {
         None => populate_page(page, prot),
         Some((file, region_start, region_pages)) => {
-            fill_file_pages(page, prot, file, region_start, region_pages)
+            // SAFETY: `rdtsc` is unprivileged and reads no memory.
+            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            let ok = fill_file_pages(page, prot, file, region_start, region_pages);
+            // SAFETY: as above.
+            let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+            FILE_FAULT_CYCLES.fetch_add(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
+            ok
         }
     }
 }
+
+/// TSC cycles spent in [`fill_file_pages`] on the demand-fault path; with
+/// [`FILE_DEMAND_FAULTS`] this splits `[FAULTSTAT]`'s service time into
+/// file-backed and anonymous.
+pub static FILE_FAULT_CYCLES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// How many faults were served from a file, and how many pages that filled.
 ///
@@ -1345,31 +1357,17 @@ fn fill_file_pages(
     let last = (first + READAHEAD_PAGES).min(region_pages);
 
     // One 64 KiB read for the whole window, fanned out to the frames — the same
-    // amortization the eager fill does, for the same reason. A failed allocation
-    // is not a failed fault: the per-page path below reads straight into each
-    // frame and needs no buffer at all.
-    let mut buf: Option<Vec<u8>> = {
-        let want = (last - first) * PAGE_SIZE as usize;
-        let mut v: Vec<u8> = Vec::new();
-        if v.try_reserve(want).is_ok() {
-            v.resize(want, 0);
-            Some(v)
-        } else {
-            None
-        }
-    };
-    if let Some(b) = buf.as_mut() {
-        let (offset, _) = file.page_source(first);
-        match crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, b) {
-            // The file is gone, or was never readable by inode. Fall back to the
-            // per-page path, which fails the same way and one page at a time.
-            None => buf = None,
-            // Short at EOF, or nothing at all: the rest of the window is
-            // zero-fill, and the buffer must say so rather than keep whatever
-            // `resize` left there.
-            Some(n) => b[n..].fill(0),
-        }
-    }
+    // amortization the eager fill does, for the same reason — **loaded on the
+    // first page that misses the shared cache, not up front.** It used to run
+    // before the loop on every file fault, and on a `-j4` self-host build 95 % of
+    // the pages filled are cache hits that never touch it: 510 k file faults at
+    // ~38 us each (93 % of all fault service time, `[FAULTSTAT]`) were mostly an
+    // allocate + zero + ext2 read of 64 KiB that the loop then ignored. A window
+    // that is all hits now costs no buffer and no read. A failed allocation is
+    // not a failed fault: the per-page path below reads straight into each frame
+    // and needs no buffer at all.
+    let mut buf: Option<Vec<u8>> = None;
+    let mut buf_tried = false;
 
     // **Frame sharing**, the second half of the AArch64 win. Two `rustc`s
     // mapping one `librustc_driver.so` held two physical copies of every page
@@ -1441,6 +1439,28 @@ fn fill_file_pages(
             continue;
         }
 
+        if !buf_tried {
+            buf_tried = true;
+            let want = (last - first) * PAGE_SIZE as usize;
+            let mut v: Vec<u8> = Vec::new();
+            if v.try_reserve(want).is_ok() {
+                v.resize(want, 0);
+                let (window_offset, _) = file.page_source(first);
+                match crate::fd::file_bytes_by_inode(file.mount_id, file.inode, window_offset, &mut v) {
+                    // The file is gone, or was never readable by inode. Fall back
+                    // to the per-page path, which fails the same way and one page
+                    // at a time.
+                    None => {}
+                    // Short at EOF, or nothing at all: the rest of the window is
+                    // zero-fill, and the buffer must say so rather than keep
+                    // whatever `resize` left there.
+                    Some(n) => {
+                        v[n..].fill(0);
+                        buf = Some(v);
+                    }
+                }
+            }
+        }
         let filled = match buf.as_ref() {
             Some(b) => {
                 let at = (idx - first) * PAGE_SIZE as usize;

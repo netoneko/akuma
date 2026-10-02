@@ -166,6 +166,19 @@ static COPY_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 /// regressing to "every mapping happened to be small".
 pub static USER_DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+/// Ring-3 demand-fault cost, in TSC cycles, for the `[FAULTSTAT]` line the
+/// 30 s sweep prints: `[0]` faults serviced by `mm::fault_in`, `[1]` cycles
+/// spent acquiring the BKL for them, `[2]` cycles in `fault_in` itself. Relaxed
+/// adds, three per fault — the question this answers (what does a fault cost,
+/// and how much of it is waiting for the lock) had no instrument.
+pub static FAULT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[inline(always)]
+fn tsc() -> u64 {
+    // SAFETY: unprivileged, reads no memory.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 /// Base of the lazily-backed test region, or 0 if none is armed.
 static LAZY_BASE: AtomicU64 = AtomicU64::new(0);
 /// Length in bytes of the lazily-backed region.
@@ -1063,10 +1076,12 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
     // the syscall path runs its own memory syscalls under. A fault from ring
     // 0 already holds it; `enter_kernel` is reentrant by owner core and this
     // leaves the hold alone.
+    let t_wait = tsc();
     let took_bkl = !crate::smp::bkl_held();
     if took_bkl {
         crate::smp::bkl_enter();
     }
+    let t_held = tsc();
 
     // Count the serviced fault into the current process's `[PSTATS]` record
     // (aarch64 gets this through glue's fault accounting; this target's fault
@@ -1093,6 +1108,10 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
     // be confused with a user region) and before the CoW arm: a page has to be
     // *populated* before anyone can ask whether it is shared.
     if code.not_present() && crate::mm::fault_in(addr) {
+        let t_done = tsc();
+        FAULT_STATS[0].fetch_add(1, Ordering::Relaxed);
+        FAULT_STATS[1].fetch_add(t_held.wrapping_sub(t_wait), Ordering::Relaxed);
+        FAULT_STATS[2].fetch_add(t_done.wrapping_sub(t_held), Ordering::Relaxed);
         USER_DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
         if took_bkl {
             crate::smp::bkl_leave();
