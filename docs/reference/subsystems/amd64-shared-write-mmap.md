@@ -44,6 +44,12 @@ whole-region write-back**:
 
 ## What this does **not** promise
 
+> **2026-10-03: this is now a known, load-bearing gap, not a footnote.** SQLite's WAL index is a `MAP_SHARED` file mapping
+> that several processes must see live; without coherence, multi-process WAL databases corrupt (goose:
+> `database disk image is malformed`). Probe: `userspace/forktest/c_stress/shmcoh.c`; stress:
+> `scripts/benchmarks/sqlite_wal_stress.py`; analysis and fix options:
+> `docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md` § 15.
+
 No page cache means no cross-mapper coherence. Two mappers of one file do not
 see each other's writes until a flush lands; `read(2)`/`write(2)` on the same
 file see a mapping's writes only after one. A process **killed** with the

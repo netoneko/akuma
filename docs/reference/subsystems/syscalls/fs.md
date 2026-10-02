@@ -303,9 +303,17 @@ stay in `container.rs`, correctly gated.
   (`crate::fs::exists` or `is_symlink`) → `0` or `ENOENT`. `R_OK`/`W_OK`/
   `X_OK` bits and `AT_EACCESS` are accepted but never inspected — a caller
   probing for write permission on a read-only mount gets a false "yes".
-- **`fcntl`'s advisory locks are no-op stubs.** `F_GETLK`/`F_SETLK`/
-  `F_SETLKW` all return `0` (success) unconditionally — there is no lock
-  state, so two processes "locking" the same file never actually contend.
+- **`fcntl` record locks are real POSIX locks (since 2026-10-03).**
+  `F_GETLK`/`F_SETLK`/`F_SETLKW` use `crates/akuma-reclock` through
+  `akuma-syscalls-glue/src/recordlock.rs`: owner = the fd table's identity
+  (`CLONE_FILES` threads share it, a `fork` child inherits nothing), keyed by
+  path like `flock`, released when the process closes *any* fd for the file and
+  at exit (via `flock::flock_release` — wired on amd64 too; it was an empty stub
+  there). `F_SETLKW` re-polls every 5 ms. Not done: `EDEADLK`, `F_OFD_*`,
+  `SEEK_END`. Probe: `userspace/forktest/c_stress/fcntl_lock.c`. Before this,
+  several goose processes wrote one SQLite WAL together →
+  `database disk image is malformed`
+  (`docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md` § 14).
   `F_DUPFD`/`F_DUPFD_CLOEXEC`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are
   fully implemented (cloexec/nonblock bits + fd duplication with pipe
   refcount bumping); any other `cmd` → `EINVAL` (logged as `UNSUPPORTED`).
@@ -323,9 +331,9 @@ stay in `container.rs`, correctly gated.
   file, took `SQLITE_BUSY`, and surfaced `SQLITE_PROTOCOL` ("locking protocol",
   code 15): goose could not open its session database. Verified with SQLite 3.53
   in WAL mode on the metal (journal `wal`, counts, `integrity_check ok`) and goose
-  now runs. **`F_SETLK`/`F_SETLKW` still always succeed**, so two *processes* can
-  hold "the same" lock: fine for a single-process database, wrong for anything
-  that relies on cross-process exclusion.
+  now runs. (`F_SETLK`/`F_SETLKW` were still always-succeed until 2026-10-03, see
+  the first paragraph above.) The "no lock state, so nothing ever conflicts"
+  sentence above describes the 2026-10-02 state.
 - **`lseek` error selection is fd-type-aware.** A bad fd → `EBADF`; a real
   seekable `File` with a resulting negative offset or unknown `whence` →
   `EINVAL`; a valid-but-non-seekable fd (pipe, socket, tty, eventfd, ...) →

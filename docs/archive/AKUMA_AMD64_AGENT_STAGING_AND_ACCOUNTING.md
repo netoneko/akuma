@@ -204,8 +204,7 @@ install's output before rebooting.
 ## 8. Open items
 
 1. ~~Install the staged kernel; confirm on the metal.~~ Done (§ 7).
-2. ~~Goose~~ fixed (§ 9, § 13: `--version` hang, interactive session verified). Still to decide: whether `F_SETLK`
-   should track real locks (it always succeeds, so cross-process exclusion does not exist).
+2. ~~Goose~~ fixed (§ 9, § 13: `--version` hang, interactive session verified; § 14: real `fcntl` record locks).
 3. `opencode --version` hang, uninvestigated.
 4. `RUSAGE_CHILDREN` / `cutime`; killed children report 0 CPU in `wait4`.
 5. `loadavg`; the `State` field; per-CPU bucketing. (Starvation baseline: done, § 5.)
@@ -357,4 +356,77 @@ abstract bind). nca's IPC listener binds (`/tmp/nca/session-*.sock`); `IPC disab
 as the mouse wheel. Driven through a pty from the laptop (`ssh -tt`, ESC `[5~`/`[6~` after a 150-line reply): PageUp
 redraws earlier lines (1–23 …), PageDown returns to the tail. Not verified on the TV's own keyboard.
 
-Still open: `F_SETLK` is a no-op; `opencode --version`; nca run-together tool previews.
+Still open: `opencode --version`; nca run-together tool previews. (`F_SETLK` — § 14.)
+
+## 14. 2026-10-03: POSIX record locks, and Python turns out to work
+
+**`database disk image is malformed` in goose.** `F_SETLK`/`F_SETLKW` returned success unconditionally, so nothing excluded
+anything. SQLite's WAL index serialises on byte-range locks in the `-shm` file, and goose runs a main process plus several
+child processes against one `sessions.db`: two wrote the WAL at once, and the next open said `(code: 11) database disk image
+is malformed` (seen on the TV; reproduced after goose was hard-killed mid-write). This was the "`F_SETLK` is a no-op" item
+left open in § 9.
+
+**Fix.** `crates/akuma-reclock` (new, `#![forbid(unsafe_code)]`, 11 host tests including SQLite's WAL reader/exclusive-sweep
+pattern): per-file range table, conflict test, split on partial unlock, merge of adjacent same-kind locks, release by owner.
+`crates/akuma-syscalls-glue/src/recordlock.rs` is the acting half (`struct flock` copy, `l_whence`, `F_SETLKW` poll-wait
+every 5 ms, `EINTR`). **Owner is the fd table's identity** (the same `holder` `flock` uses): `CLONE_FILES` threads share it,
+a `fork` child inherits nothing. **Release rides `flock::flock_release`**, which every fd-teardown path already calls, so
+closing *any* descriptor for a file drops the process's locks on it (POSIX's rule) and exit drops the rest.
+
+**amd64 trap:** `exec_runtime.rs` had `flock_release: |_, _, _| {}` — a deliberate no-op from when this target dispatched no
+`flock`. With real locks that meant a process that died holding one held it forever (the probe's "a holder's exit released
+its lock" check failed on the first deploy). Now wired to glue's function, which also makes `flock` release on exit.
+
+**Verified on the metal:** `userspace/forktest/c_stress/fcntl_lock.c` — 13 checks, 5 fail on the old kernel, all pass on the
+new (refusal across processes, shared reads, disjoint ranges, `F_GETLK` reporting the holder's pid, downgrade, `F_SETLKW`
+blocking ≥250 ms until unlock, close-any-fd release, exit release). Goose then ran three back-to-back sessions on a fresh DB
+with `integrity_check` ok. **Not verified:** a long multi-process goose session end to end at the time of writing.
+Not done: `EDEADLK` detection, `F_OFD_*`, `SEEK_END`; keyed by path, so two paths to one inode do not contend.
+
+**Python works on the box** (found by accident; nobody had checked). Goose, asked to research, installed `uv` and a standalone
+CPython into `/root/.local` — `cpython-3.14.8-linux-x86_64-musl` under `/root/.local/share/uv/python/`. There is no system
+`python3` and nothing on `PATH`; only `uv`/`uvx` are in `/root/.local/bin`. Checked with that interpreter: starts
+(`platform` says `Akuma-0.0.8-x86_64`), `ssl` (OpenSSL 3.5.9), `sqlite3` (WAL mode, `integrity_check` ok — the new locks),
+`threading` (4 threads, join), `subprocess.run`, and HTTPS (`urllib` to `api.github.com`, 200 in 0.1 s). **Not checked:**
+`os.fork` directly, `multiprocessing`, `asyncio` under load, `pip`/wheels with C extensions. To make it a real tool rather
+than a side effect, install it deliberately and put it on `PATH`.
+
+**Seen, not investigated:** `rm -rf` of a fresh `git clone` directory printed `can't remove '.git/hooks': Directory not
+empty` — a directory that still counts as non-empty after its entries were removed (VFS/ext2). Goose's own `git clone`
+also needed a retry the same way.
+
+## 15. 2026-10-03 (later): the locks were necessary, not sufficient — `MAP_SHARED` is not coherent across processes
+
+**What happened.** After § 14's locks landed, a fresh goose DB survived three back-to-back runs, then a long interactive
+research session (≈50 tool calls, one goose process plus extension children) came back `database disk image is malformed`
+again (4 MB WAL, 684 KB main file; preserved at `/root/goose-corrupt3/` on the box). Nobody had killed goose this time. So the
+§ 14 theory ("no locks, so several processes wrote the WAL together") was real but not the whole story.
+
+**Reproduced without goose.** `scripts/benchmarks/sqlite_wal_stress.py` (any python3 in the guest; the box has uv's CPython,
+§ 14): 6 connections in **one process** → `integrity_check` ok; **4 processes** on one WAL database → `database disk image is
+malformed`, with real `fcntl` locks in place.
+
+**Root cause, confirmed by a 40-line probe** (`userspace/forktest/c_stress/shmcoh.c`): two processes `mmap(MAP_SHARED)` one file;
+one writes, the other reads — **neither sees the other's writes** (both lines `NO`). That is the documented design, not a
+regression: `docs/reference/subsystems/amd64-shared-write-mmap.md` § "What this does not promise" — writable `MAP_SHARED` is
+demand-paged fills plus write-back on `munmap`/`msync`, **no page cache, no cross-mapper coherence**. SQLite's WAL index (the
+`-shm` file) is precisely a `MAP_SHARED` file mapping that every connection, in every process, must see live; with one frame
+set per process each process runs on its own private copy of the index and they diverge. (Threads are fine: one address space,
+one mapping.)
+
+**Not yet fixed. Options, with what each costs:**
+1. **A shared writable page cache** (principled). Every mapper of `(mount, inode, page)` maps one physical frame RW; the
+   existing write-back (`SharedWriteBack`, flush walks present leaves) keeps the file current. `akuma-fpcache` already keys
+   frames by `(inode, mount id, file offset)` and refcounts them through the CoW refcount — but only for **read-only** mappings
+   (`fill_file_pages`: `sharing = !region_pte.write && cap > 0`), mapped CoW-marked. The work is a RW, non-CoW share path:
+   fault, `munmap`/exit teardown refcounts, `fork` (a child currently *drops* the record), `msync`/write-back from a shared
+   frame, `read(2)`/`write(2)` coherence with the mapping (not needed for SQLite), and keeping aarch64's separate
+   `SharedFileMapping` in step (`mmap::plan` is shared code — check both dispatchers).
+2. **Special-case `-shm`.** Back `MAP_SHARED` mappings of a path ending in `-shm` with kernel-global frames keyed by path, never
+   flushed to disk. SQLite rebuilds the index from the WAL when no process holds it (the deadman-switch lock byte, which the
+   § 14 locks now answer correctly). Small and low-risk; fixes SQLite only and leaves ParityDB-style users incoherent.
+3. **Workaround only.** Keep goose to one process touching `sessions.db` (e.g. a single `goose serve` under herd). No kernel
+   change; multi-process WAL stays broken for everything else.
+
+**Also seen:** goose's extension children are separate processes (`goose-cli-main` ×4, ~500 futex/s each); whether they
+open the session DB was not established — it is the question that decides whether option 3 would even help.
