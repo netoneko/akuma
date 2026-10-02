@@ -87,7 +87,7 @@ pub use net::{IfConfHdr, MsgHdr, SockAddrHw, Ucred};
 pub use proc::{CloneArgs, Rlimit, Sysinfo};
 pub use signal::{KernelSigaction, SigChld, Siginfo, StackT};
 pub use stat::{Stat, Statfs, Statx, StatxTimestamp, makedev};
-pub use time::{Itimerval, Timespec, Timeval, Timex};
+pub use time::{Itimerval, Rusage, Timespec, Timeval, Timex, Tms};
 
 #[cfg(test)]
 mod tests {

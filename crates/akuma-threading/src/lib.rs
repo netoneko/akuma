@@ -4836,6 +4836,36 @@ pub fn idle_halt() {
 #[cfg(not(target_os = "none"))]
 pub fn idle_halt() {}
 
+/// Take the time the calling thread just spent halted out of its CPU bill.
+///
+/// For a loop that halts with its own instruction rather than [`idle_halt`]'s
+/// `wfi` — amd64's `idle_loop` does `sti; hlt; cli`. The scheduler bills a thread
+/// for its whole residency (`now - start_time_us` at switch-out), so without this
+/// every idle thread is billed for every second it sleeps: on an idle two-core VM
+/// `/proc/stat` read +1208 `user` ticks and +2 `idle` over six seconds, `top`
+/// showed every core pegged, and `idle` could never be anything but ~0.
+///
+/// Call with the uptime sampled just before the halt. Shifts `tid`'s quantum start
+/// forward by exactly the halted time, clamped to now — the same bookkeeping, and
+/// the same reasoning about a tick that already switched away mid-halt, as
+/// [`idle_halt`]. IRQs must be off (the halt's `cli` already made them so), and the
+/// pool lock is only *tried*: a missed credit overbills one quantum, a wait here
+/// would stall the idle thread.
+#[cfg(target_os = "none")]
+pub fn credit_halted_time(tid: usize, entered_us: u64) {
+    let now = (runtime().uptime_us)();
+    let halted = now.saturating_sub(entered_us);
+    if tid < MAX_THREADS && halted > 0 {
+        if let Some(mut pool) = POOL.try_lock() {
+            let shifted = pool.slots[tid].start_time_us.saturating_add(halted);
+            pool.slots[tid].start_time_us = shifted.min(now);
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn credit_halted_time(_tid: usize, _entered_us: u64) {}
+
 /// Cooperative wait for a blocking kernel loop that is polling for external
 /// progress (a child exit, a pipe, …) while holding the Big Kernel Lock.
 ///

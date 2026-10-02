@@ -254,6 +254,30 @@ pub fn for_each_process<F: FnMut(&Process)>(mut f: F) {
     PROCESS_TABLE.for_each_active(|_, p| f(p));
 }
 
+/// CPU time, in microseconds, of every thread in `tgid`'s group that still has a
+/// thread slot — what `getrusage(RUSAGE_SELF)` and `times(2)` report, and what a
+/// child's exit records for `wait4`.
+///
+/// A group is the set of table rows sharing a `tgid` (each `CLONE_THREAD` thread
+/// is its own row). A row whose `thread_id` has been cleared — a zombie, or one a
+/// kill path already detached — contributes nothing, so a child that was killed
+/// reports 0 rather than a number read from a slot someone else may now own.
+///
+/// Allocation-free: this runs on `times`/`getrusage`, which a shell calls after
+/// every command.
+#[must_use]
+pub fn group_cpu_time_us(tgid: Pid) -> u64 {
+    let mut total = 0u64;
+    for_each_process(|p| {
+        if p.tgid == tgid
+            && let Some(tid) = p.thread_id
+        {
+            total = total.saturating_add(crate::threading::get_thread_cpu_time(tid));
+        }
+    });
+    total
+}
+
 /// Iterate all active processes, calling `f` for each. Returns early if `f` returns Some.
 ///
 /// Runs entirely with IRQs disabled — the callback MUST NOT allocate.

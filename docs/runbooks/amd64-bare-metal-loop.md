@@ -258,6 +258,18 @@ kinstall              # /boot/akuma-amd64, multiboot2-checked and md5-verified
 /bin/busybox reboot -f
 ```
 
+**Verify which kernel came up:** `uname -v` ends in the git SHA the kernel was
+stamped with (`6d9017b1-release-smp-shared`) and must equal `git rev-parse
+--short HEAD` of the tree you built. The stamp comes from
+`crates/akuma-syscalls-glue/build.rs`, which cargo only re-runs when a path it
+registered changes. Until 2026-10-02 that was `.git/HEAD` plus the branch ref *if
+it was a loose file at the time*; a ref that sat in `packed-refs` for that run
+froze the list, so a kernel built on a later commit still reported the old SHA
+(a day-old `6d9017b1` for `e40e50a0`). It now also tracks `.git/logs/HEAD`, which
+every commit, checkout and reset appends to. If the label ever disagrees with
+`HEAD` again, compare the binary's md5 against what you pushed before suspecting
+GRUB, and `touch crates/akuma-syscalls-glue/build.rs` to force the stamp.
+
 Five things about that environment, each of which cost time to establish:
 
 - **A session has no environment at all.** sshd sets `TERM` and nothing else, so

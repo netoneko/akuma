@@ -48,7 +48,7 @@ pub use akuma_sntp::{boot, sntp};
 // `akuma_timer::uptime_us` itself, so nothing changed there); the UTC anchor
 // is the one static both kernels write.
 use akuma_primitives::clock::{set_utc_time_us, uptime_us, utc_time_us};
-use akuma_exec::process::user_access::{copy_to_user, read_user_into, write_user_val};
+use akuma_exec::process::user_access::{read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL};
 // The four `Local*` ABI structs this module used to declare — `LocalTimespec`,
@@ -63,7 +63,7 @@ use akuma_primitives::errno::negated::{EFAULT, EINVAL};
 // paths below do unsigned saturating arithmetic on the raw bits — so those
 // sites keep doing exactly that, now through the explicit `bits()`/`from_bits()`
 // reinterpretation rather than through a struct definition that hid it.
-use akuma_syscalls_linux::{Itimerval, Timespec, Timeval, Timex};
+use akuma_syscalls_linux::{Itimerval, Rusage, Timespec, Timeval, Timex, Tms};
 
 // ---------------------------------------------------------------------------
 // ITIMER_REAL / alarm() support
@@ -558,23 +558,51 @@ pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_p
     }
 }
 
-#[must_use] 
-pub fn sys_times(buf_ptr: usize) -> u64 {
-    if buf_ptr != 0 {
-        const TMS_SIZE: usize = 32;
-        let zero = [0u8; TMS_SIZE];
-        if copy_to_user(buf_ptr as u64, &zero).is_err() { return EFAULT; }
+/// CPU time, in microseconds, of the calling process: every thread in its group
+/// (`getrusage(RUSAGE_SELF)` and `times(2)` are per process, not per thread), or
+/// just the calling thread when it has no process row.
+fn current_process_cpu_time_us() -> u64 {
+    match akuma_exec::process::current_process_shared() {
+        Some(p) => akuma_exec::process::group_cpu_time_us(p.tgid),
+        None => akuma_exec::threading::get_thread_cpu_time(
+            akuma_exec::threading::current_thread_id(),
+        ),
     }
-    let uptime_us = uptime_us();
-    uptime_us / 10_000
 }
 
-#[must_use] 
+/// `times(2)`. `tms_utime` is the process's CPU time in 100 Hz ticks (all CPU
+/// time is "user" — there is no user/kernel split); `tms_stime` and the children's
+/// fields are 0. The return value is uptime in ticks.
+#[must_use]
+pub fn sys_times(buf_ptr: usize) -> u64 {
+    if buf_ptr != 0 {
+        let tms = Tms::with_cpu_time_us(current_process_cpu_time_us());
+        if write_user_val(buf_ptr as u64, &tms).is_err() { return EFAULT; }
+    }
+    let uptime_us = uptime_us();
+    uptime_us / Tms::CLK_TCK_US
+}
+
+/// `getrusage(2)`.
+///
+/// `RUSAGE_SELF` is the process's CPU time and `RUSAGE_THREAD` the calling
+/// thread's, both reported as `ru_utime`; every other field is 0.
+/// **`RUSAGE_CHILDREN` is all zeros**: nothing accumulates reaped children's time
+/// into their parent (`wait4`'s own `rusage` does report the child it reaps).
+/// Any other `who` is `EINVAL`, as on Linux.
+#[must_use]
 pub fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
-    const RUSAGE_SIZE: usize = 144;
-    let zero = [0u8; RUSAGE_SIZE];
-    if copy_to_user(usage_ptr as u64, &zero).is_err() { return EFAULT; }
-    let _ = who;
+    let cpu_us = match who {
+        Rusage::RUSAGE_SELF => current_process_cpu_time_us(),
+        Rusage::RUSAGE_THREAD => akuma_exec::threading::get_thread_cpu_time(
+            akuma_exec::threading::current_thread_id(),
+        ),
+        Rusage::RUSAGE_CHILDREN => 0,
+        _ => return EINVAL,
+    };
+    if write_user_val(usage_ptr as u64, &Rusage::with_cpu_time_us(cpu_us)).is_err() {
+        return EFAULT;
+    }
     0
 }
 

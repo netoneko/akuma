@@ -1,7 +1,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
 use crate::runtime::{config, with_irqs_disabled};
@@ -20,6 +20,12 @@ pub struct ProcessChannel {
     exit_code: AtomicI32,
     /// Whether the process has exited
     exited: AtomicBool,
+    /// CPU time the process (its whole thread group) had used when it exited, in
+    /// microseconds. Recorded by [`publish_child_exit`](crate::process::publish_child_exit)
+    /// before `exited` is raised, because the thread slot the number comes from
+    /// can be recycled before the parent reaps the zombie. What `wait4` reports
+    /// in `rusage`.
+    cpu_time_us: AtomicU64,
     /// Interrupt signal (set by Ctrl+C, checked by process)
     interrupted: AtomicBool,
     /// Raw mode flag (true if terminal is in raw mode, false for cooked)
@@ -180,6 +186,7 @@ impl ProcessChannel {
             stdin_buffer: Spinlock::new(VecDeque::new()),
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
+            cpu_time_us: AtomicU64::new(0),
             interrupted: AtomicBool::new(false),
             raw_mode: AtomicBool::new(false),
             stdin_closed: AtomicBool::new(false),
@@ -437,6 +444,18 @@ impl ProcessChannel {
 
         // Wake all pollers waiting for output (EOF/exit is an event)
         self.wake_pollers();
+    }
+
+    /// Record the CPU time the process used (microseconds). Call before
+    /// [`Self::set_exited`] so a reader that sees `has_exited()` sees this too.
+    pub fn set_cpu_time_us(&self, us: u64) {
+        self.cpu_time_us.store(us, Ordering::Release);
+    }
+
+    /// CPU time the process used, in microseconds (valid after `has_exited()`;
+    /// 0 if the exit path could not account it).
+    pub fn cpu_time_us(&self) -> u64 {
+        self.cpu_time_us.load(Ordering::Acquire)
     }
 
     /// Check if the process has exited

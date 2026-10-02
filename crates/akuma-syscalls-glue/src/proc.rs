@@ -998,6 +998,16 @@ fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<Stri
     do_execve(interp_path, new_args, env)
 }
 
+/// Fill `wait4`'s `rusage` for the child being reaped: its CPU time as `ru_utime`
+/// (see [`akuma_syscalls_linux::Rusage`]), everything else 0. A bad pointer is
+/// ignored — the caller already got a zeroed attempt at entry and Linux does not
+/// fail the reap over it either.
+fn report_child_rusage(rusage_ptr: u64, cpu_time_us: u64) {
+    if rusage_ptr != 0 {
+        let _ = write_user_val(rusage_ptr, &akuma_syscalls_linux::Rusage::with_cpu_time_us(cpu_time_us));
+    }
+}
+
 pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
@@ -1047,6 +1057,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     }
                     // Reap the zombie: remove from process table + child channels.
                     // On Linux, waitpid is the only way to reap a zombie.
+                    // The child's CPU time, recorded when its exit was published: the
+                    // thread slot it came from may be recycled by now.
+                    report_child_rusage(rusage_ptr, ch.cpu_time_us());
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
                     akuma_exec::process::reap_child_channel(p);
@@ -1072,6 +1085,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                             return EFAULT;
                         }
                     }
+                    // The child's CPU time, recorded when its exit was published: the
+                    // thread slot it came from may be recycled by now.
+                    report_child_rusage(rusage_ptr, ch.cpu_time_us());
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
                     akuma_exec::process::reap_child_channel(p);
@@ -1114,6 +1130,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     }
                 }
                 // Reap the zombie
+                // The child's CPU time, recorded when its exit was published: the
+                // thread slot it came from may be recycled by now.
+                report_child_rusage(rusage_ptr, ch.cpu_time_us());
                 akuma_exec::process::clear_lazy_regions(child_pid);
                 let _ = akuma_exec::process::unregister_process(child_pid);
                 akuma_exec::process::reap_child_channel(child_pid);
@@ -1144,6 +1163,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     }
                 }
                 // Reap the zombie
+                // The child's CPU time, recorded when its exit was published: the
+                // thread slot it came from may be recycled by now.
+                report_child_rusage(rusage_ptr, ch.cpu_time_us());
                 akuma_exec::process::clear_lazy_regions(child_pid);
                 let _ = akuma_exec::process::unregister_process(child_pid);
                 akuma_exec::process::reap_child_channel(child_pid);

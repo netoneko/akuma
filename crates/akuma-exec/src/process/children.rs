@@ -149,6 +149,11 @@ pub fn raise_sigchld_for_parent(child_pid: Pid, exit_code: i32) {
 pub fn publish_child_exit(child_pid: Pid, exit_code: i32) {
     let published = match get_child_channel(child_pid) {
         Some(ch) if !ch.has_exited() => {
+            // Before `set_exited`: the parent's `wait4` reads this as soon as it
+            // sees the channel exited. The thread slot the time comes from is
+            // still the child's here; it may not be by the time of the reap.
+            let tgid = super::table::with_process(child_pid, |p| p.tgid).unwrap_or(child_pid);
+            ch.set_cpu_time_us(super::table::group_cpu_time_us(tgid));
             ch.set_exited(exit_code);
             true
         }

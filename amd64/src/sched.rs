@@ -1190,11 +1190,16 @@ pub fn idle_loop() -> ! {
         if !threading::x86_yield() {
             smp::bkl_leave();
             IDLE_HALTS.fetch_add(1, Ordering::Relaxed);
+            // The halt is not CPU time: without crediting it back this thread
+            // is billed for every second it sleeps and `/proc/stat` shows no
+            // idle at all (`threading::credit_halted_time`).
+            let halt_started_us = akuma_primitives::clock::uptime_us();
             // SAFETY: interrupts on for exactly the `hlt`, then off again. The
             // timer vector is installed and its handler takes the BKL itself.
             unsafe {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
             }
+            threading::credit_halted_time(threading::current_thread_id(), halt_started_us);
         } else {
             smp::bkl_leave();
         }

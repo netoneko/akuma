@@ -273,7 +273,14 @@ did, until the same date) gets a single `cpu0` row with no build error
 (`archive/AMD64_PROC_REPORTS_ONE_CORE.md`). There is no user/kernel-time split tracked, so all busy
 time lands in `utime`/the `user` field; `idle` is derived as
 `wall_time_per_core - busy_time`, which is enough for busybox `top`'s %CPU
-(computed from two reads' deltas) to move correctly. Before 2026-08-25 neither
+(computed from two reads' deltas) to move correctly. **Read the per-core split
+with suspicion**: it is attributed by `LAST_CORE` (the core a thread last ran
+on), so a migrating thread's whole total jumps between rows and a delta can go
+negative; the aggregate `cpu` line is the trustworthy one. `loadavg` is a hard
+`0.00`, and the `State` field in `/proc/<pid>/stat` reads `R` for nearly every
+process, so neither says anything about contention
+(`syscalls/time.md` § "times / getrusage / wait4 `rusage`" for what is and is not
+accounted). Before 2026-08-25 neither
 file existed at all: busybox `free` errored `can't open '/proc/meminfo'` and
 busybox `top` errored `can't open 'stat'` — not a parsing bug, the files were
 simply missing.

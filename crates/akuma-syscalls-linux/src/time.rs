@@ -158,6 +158,70 @@ pub struct Itimerval {
     pub it_value: Timeval,
 }
 
+/// Linux `struct rusage` (144 bytes), the `getrusage(2)` / `wait4(2)` buffer.
+///
+/// Akuma keeps one CPU-time total per thread and no user/kernel split, so
+/// everything it knows goes in `ru_utime` — the same convention `/proc/stat`
+/// and `/proc/<pid>/stat` already use. Every counter after the two timevals
+/// (`ru_maxrss`, `ru_minflt`, ... `ru_nivcsw`) is reported as 0.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Rusage {
+    pub ru_utime: Timeval,
+    pub ru_stime: Timeval,
+    /// `ru_maxrss` .. `ru_nivcsw`: fourteen `long`s, all unaccounted.
+    pub counters: [i64; 14],
+}
+
+impl Rusage {
+    /// `getrusage(2)` `who` values.
+    pub const RUSAGE_SELF: i32 = 0;
+    pub const RUSAGE_CHILDREN: i32 = -1;
+    pub const RUSAGE_THREAD: i32 = 1;
+
+    /// A `Rusage` whose user time is `cpu_us` microseconds and everything else 0.
+    #[must_use]
+    pub const fn with_cpu_time_us(cpu_us: u64) -> Self {
+        Self {
+            ru_utime: Timeval {
+                tv_sec: (cpu_us / 1_000_000).cast_signed(),
+                tv_usec: (cpu_us % 1_000_000).cast_signed(),
+            },
+            ru_stime: Timeval { tv_sec: 0, tv_usec: 0 },
+            counters: [0; 14],
+        }
+    }
+}
+
+/// Linux `struct tms` (32 bytes, four `clock_t`), the `times(2)` buffer.
+///
+/// `clock_t` is 8 bytes on both 64-bit ABIs. Same convention as [`Rusage`]:
+/// all CPU time is user time, and children's time is 0.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Tms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+impl Tms {
+    /// `sysconf(_SC_CLK_TCK)` as `times(2)` reports it: 100 Hz.
+    pub const CLK_TCK_US: u64 = 10_000;
+
+    /// A `Tms` whose user time is `cpu_us` microseconds, in clock ticks.
+    #[must_use]
+    pub const fn with_cpu_time_us(cpu_us: u64) -> Self {
+        Self {
+            tms_utime: (cpu_us / Self::CLK_TCK_US).cast_signed(),
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        }
+    }
+}
+
 /// aarch64 Linux `struct timex` (`<linux/timex.h>`), 208 bytes.
 ///
 /// Every `long` field is 8 bytes on this ABI, which is why
@@ -206,6 +270,10 @@ const _: () = assert!(core::mem::size_of::<Timeval>() == 16);
 const _: () = assert!(core::mem::offset_of!(Timeval, tv_usec) == 8);
 const _: () = assert!(core::mem::size_of::<Itimerval>() == 32);
 const _: () = assert!(core::mem::offset_of!(Itimerval, it_value) == 16);
+const _: () = assert!(core::mem::size_of::<Rusage>() == 144);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_stime) == 16);
+const _: () = assert!(core::mem::offset_of!(Rusage, counters) == 32);
+const _: () = assert!(core::mem::size_of::<Tms>() == 32);
 const _: () = assert!(core::mem::size_of::<Timex>() == 208);
 // The three padding words, pinned individually: a missing `_pad` is invisible
 // in a size check on some of them but shifts every later field.
@@ -217,6 +285,27 @@ const _: () = assert!(core::mem::offset_of!(Timex, tai) == 160);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `time`/`wait4` print `ru_utime` as `tv_sec` + `tv_usec`: 18.38 s of CPU
+    /// must not come out as 0.00 (the bug this type replaced) or with the
+    /// microseconds in the seconds field.
+    #[test]
+    fn rusage_splits_cpu_time_into_seconds_and_micros() {
+        let r = Rusage::with_cpu_time_us(18_382_500);
+        assert_eq!(r.ru_utime, Timeval { tv_sec: 18, tv_usec: 382_500 });
+        assert_eq!(r.ru_stime, Timeval::default());
+        assert_eq!(r.counters, [0; 14]);
+        assert_eq!(Rusage::with_cpu_time_us(0), Rusage::default());
+    }
+
+    /// `times(2)` counts in 100 Hz ticks, rounding down like `/proc/<pid>/stat`.
+    #[test]
+    fn tms_reports_user_time_in_hundredths() {
+        assert_eq!(Tms::with_cpu_time_us(18_382_500).tms_utime, 1838);
+        assert_eq!(Tms::with_cpu_time_us(9_999).tms_utime, 0);
+        assert_eq!(Tms::with_cpu_time_us(10_000).tms_utime, 1);
+        assert_eq!(Tms::with_cpu_time_us(5_000_000).tms_cutime, 0);
+    }
 
     /// The byte pattern `sync_tests.rs`'s boot test wrote and read back, now a
     /// host test: the field order is what puts `tv_sec` in the low 8 bytes.

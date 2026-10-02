@@ -303,13 +303,41 @@ again. Both are ungated by "did this tick interrupt ring 3" — an `alarm(5)` is
 usually set by a process that then *blocks*, so a check that only ran on
 ring-3 ticks would never fire for the caller it was written for.
 
-## times / getrusage
+## times / getrusage / wait4 `rusage`
 
-`sys_times` (`lib.rs:470`) and `sys_getrusage` (`lib.rs:481`) both zero-fill
-their output struct (`struct tms` 32 B, `struct rusage` 144 B) rather than
-tracking real per-process CPU accounting — good enough for callers that only
-check the syscall succeeds. `sys_times` return value (`uptime_us / 10_000`,
-i.e. clock ticks) is otherwise real.
+Per-process CPU time is real since 2026-10-02 (it was zero-filled before, so
+`time sh -c 'loop'` printed `user 0.00s` for 18 s of CPU). The source is the
+per-thread microsecond counter `/proc/<pid>/stat` already read
+(`akuma_threading::get_thread_cpu_time`), summed over the calling process's
+thread group by `akuma_exec::process::group_cpu_time_us(tgid)` (rows sharing a
+`tgid`; a row with no `thread_id` contributes nothing). **There is no
+user/kernel split, so all of it is `ru_utime` / `tms_utime`**; `ru_stime` and
+every counter after the two timevals (`ru_maxrss` … `ru_nivcsw`) stay 0. Wire
+layouts are `akuma_syscalls_linux::{Rusage, Tms}` with size/offset assertions.
+
+| call | reports |
+|---|---|
+| `times(2)` | `tms_utime` = process CPU in 100 Hz ticks; `tms_stime`/`cutime`/`cstime` = 0; return value = uptime in ticks |
+| `getrusage(RUSAGE_SELF)` | the process's CPU time |
+| `getrusage(RUSAGE_THREAD)` | the calling thread's CPU time |
+| `getrusage(RUSAGE_CHILDREN)` | **all zeros** — nothing accumulates reaped children's time into the parent, so bash's `time` builtin (which diffs `RUSAGE_CHILDREN`) still prints 0; busybox `time` uses `wait4`'s rusage and works |
+| any other `who` | `EINVAL`, as on Linux (used to succeed with zeros) |
+| `wait4(…, rusage)` | the reaped child's CPU time, captured in `publish_child_exit` into `ProcessChannel::cpu_time_us` *before* the channel is marked exited — the child's thread slot can be recycled before the parent reaps the zombie |
+
+A child that exits through a kill path reports 0: those paths clear the row's
+`thread_id` before publishing, and reading a recycled slot would bill someone
+else's time. Verified in QEMU: `time awk` over an 11.25 s loop printed
+`real 11.25s user 11.23s` (was `user 0.00s`).
+
+**Idle is billed honestly on amd64** (`threading::credit_halted_time`, called by
+`sched::idle_loop` around `sti; hlt; cli`). The scheduler bills a thread for its
+whole residency, so before this every secondary core's idle thread was billed for
+every second it slept. aarch64's `idle_halt` always did the equivalent for `wfi`.
+What `/proc/stat` still shows as busy on an idle amd64 box is mostly real: the
+boot thread (tid 0) *is* init's kernel thread and spins while init waits, and
+the netpoll daemon polls by design (measured 2026-10-02 on a 2-core QEMU: tid 0
+billed 100% and tid 1 about 44% across an idle 8 s window). Threads that `hlt` on
+their own (`futex.rs` timed waits) are still billed for the halt.
 
 ## time / uptime
 
