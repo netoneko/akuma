@@ -350,6 +350,10 @@ akuma-mmap = { path = "../crates/akuma-mmap" }
 # mappings — the two are one change, since a cache is only reachable from a path
 # that fills pages one at a time.
 akuma-fpcache = { path = "../crates/akuma-fpcache" }
+# Its writable sibling (2026-10-03): one frame per page of a writable
+# `MAP_SHARED` file mapping, shared by every process that maps it, for as long
+# as any does — the coherence SQLite's WAL index needs. `src/shmpages.rs`.
+akuma-fpcache-rw = { path = "../crates/akuma-fpcache-rw" }
 # The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
 # table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
 # `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own

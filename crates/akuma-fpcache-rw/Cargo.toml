@@ -1,0 +1,10 @@
+[package]
+name = "akuma-fpcache-rw"
+version = "0.1.0"
+edition = "2024"
+description = "The writable sibling of akuma-fpcache: one physical frame per (mount, inode, page) for writable MAP_SHARED file mappings, so every process mapping a file sees every other's stores. Pure table logic and span arithmetic — the lock, the frame refcounts and the physmap copies stay in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]

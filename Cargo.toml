@@ -9,6 +9,7 @@ default-members = [
     "crates/akuma-fdt",
     "crates/akuma-firecracker",
     "crates/akuma-fpcache",
+    "crates/akuma-fpcache-rw",
     "crates/akuma-gic",
     "crates/akuma-psci",
     "crates/akuma-config",

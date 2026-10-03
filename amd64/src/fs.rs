@@ -378,7 +378,11 @@ pub fn init_vfs() {
     // §15). The AArch64 kernel registers it in `akuma_vfs_glue::fs::init`,
     // which this target does not call: it mounts ext2 itself. The other half of
     // invalidation — every mutating VFS entry point — is already shared code.
-    akuma_ext2::init_inode_freed_hook(akuma_fpcache::invalidate_inode);
+    // `shmpages::inode_freed` is `akuma_fpcache::invalidate_inode` plus the
+    // shared writable page table's own leftovers, and registers the VFS
+    // observers that keep that table coherent with `write(2)`.
+    akuma_ext2::init_inode_freed_hook(crate::shmpages::inode_freed);
+    crate::shmpages::init();
 
     // Size the cache from the RAM the PMM actually manages.
     //

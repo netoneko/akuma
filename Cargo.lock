@@ -97,6 +97,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-fbcon",
  "akuma-fpcache",
+ "akuma-fpcache-rw",
  "akuma-hda",
  "akuma-isolation",
  "akuma-locks-rw",
@@ -300,6 +301,10 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-fpcache-rw"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-gic"

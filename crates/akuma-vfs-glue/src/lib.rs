@@ -498,6 +498,12 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     }
     let r = with_fs_write(path, |fs, rel| fs.write_file(rel, data));
     invalidate_file_pages(path);
+    if r.is_ok() {
+        // A whole-file rewrite: everything past the new contents reads zero,
+        // and the contents themselves are a write at 0.
+        notify_mapped_zeroed(path, data.len(), usize::MAX);
+        notify_mapped_write(path, 0, data);
+    }
     r
 }
 
@@ -697,6 +703,9 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
     }
     let r = with_fs_write(path, |fs, rel| fs.write_at(rel, offset, data));
     invalidate_file_pages(path);
+    if let Ok(n) = r {
+        notify_mapped_write(path, offset, &data[..n.min(data.len())]);
+    }
     r
 }
 
@@ -784,6 +793,9 @@ pub fn set_times(path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -
 pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
     let r = with_fs_write(path, |fs, rel| fs.truncate(rel, length));
     invalidate_file_pages(path);
+    if r.is_ok() {
+        notify_mapped_zeroed(path, usize::try_from(length).unwrap_or(usize::MAX), usize::MAX);
+    }
     r
 }
 
@@ -791,6 +803,12 @@ pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
 pub fn fallocate(path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
     let r = with_fs_write(path, |fs, rel| fs.fallocate(rel, mode, offset, len));
     invalidate_file_pages(path);
+    // `FALLOC_FL_PUNCH_HOLE` (0x02) and `FALLOC_FL_ZERO_RANGE` (0x10) make the
+    // range read zero; plain preallocation changes no byte.
+    if r.is_ok() && mode & (0x02 | 0x10) != 0 {
+        let from = usize::try_from(offset).unwrap_or(usize::MAX);
+        notify_mapped_zeroed(path, from, from.saturating_add(usize::try_from(len).unwrap_or(usize::MAX)));
+    }
     r
 }
 
@@ -1324,6 +1342,66 @@ static HOOKS: akuma_primitives::OnceCopy<VfsGlueHooks> = akuma_primitives::OnceC
 /// Install the binary's callbacks. Idempotent, per `OnceCopy`.
 pub fn set_hooks(h: VfsGlueHooks) {
     HOOKS.set(h);
+}
+
+/// Observers for writes to files that a writable `MAP_SHARED` mapping may hold
+/// live in memory — the amd64 kernel's shared writable page table
+/// (`akuma-fpcache-rw`, 2026-10-03).
+///
+/// A unified page cache makes `write(2)` visible through `mmap` because both are
+/// the same page. This tree has no unified cache, so a mapped page and the file
+/// would drift apart the moment anyone wrote the file by descriptor; these
+/// hooks copy each mutation **into** the mapped frames after it lands. SQLite
+/// depends on it: it grows its `-shm` index by `pwrite`-ing one byte per new
+/// page while other processes hold the earlier pages mapped.
+///
+/// Separate from [`VfsGlueHooks`] because only one kernel has the table: the
+/// AArch64 kernel registers nothing, and every call below then costs one
+/// `OnceCopy` load. **Called after the mutation**, with no filesystem lock held.
+#[derive(Clone, Copy)]
+pub struct MappedFileHooks {
+    /// Is anything mapped (or being filled) that a write could need to reach?
+    /// Asked first, so a kernel with no shared-writable mappings pays no path
+    /// resolution per write.
+    pub active: fn() -> bool,
+    /// `data` was written at byte `offset` of `(mount_id, inode)`.
+    pub wrote: fn(mount_id: u32, inode: u32, offset: usize, data: &[u8]),
+    /// Bytes `[from, to)` of `(mount_id, inode)` now read as zero (truncate:
+    /// `to == usize::MAX`; a punched hole otherwise).
+    pub zeroed: fn(mount_id: u32, inode: u32, from: usize, to: usize),
+}
+
+static MAPPED_FILE_HOOKS: akuma_primitives::OnceCopy<MappedFileHooks> = akuma_primitives::OnceCopy::new();
+
+/// Install the mapped-file observers. Idempotent, per `OnceCopy`.
+pub fn set_mapped_file_hooks(h: MappedFileHooks) {
+    MAPPED_FILE_HOOKS.set(h);
+}
+
+/// The registered observers, if any and if they have anything to observe.
+fn mapped_file_hooks() -> Option<MappedFileHooks> {
+    MAPPED_FILE_HOOKS.get().filter(|h| (h.active)())
+}
+
+/// Tell the mapped-file observers that `data` landed at `offset` of `path`.
+fn notify_mapped_write(path: &str, offset: usize, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    if let Some(h) = mapped_file_hooks()
+        && let Some((mount_id, inode)) = resolve_file_id(path)
+    {
+        (h.wrote)(mount_id, inode, offset, data);
+    }
+}
+
+/// Tell the mapped-file observers that `[from, to)` of `path` reads zero now.
+fn notify_mapped_zeroed(path: &str, from: usize, to: usize) {
+    if let Some(h) = mapped_file_hooks()
+        && let Some((mount_id, inode)) = resolve_file_id(path)
+    {
+        (h.zeroed)(mount_id, inode, from, to);
+    }
 }
 
 fn audio_is_available() -> bool {

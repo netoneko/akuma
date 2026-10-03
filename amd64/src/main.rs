@@ -131,6 +131,10 @@ mod signal;
 mod smp;
 #[cfg(target_arch = "x86_64")]
 mod shootdown;
+/// One frame per page of a writable `MAP_SHARED` file mapping, shared by every
+/// mapper — `akuma-fpcache-rw`'s table, locked and refcounted.
+#[cfg(target_arch = "x86_64")]
+mod shmpages;
 #[cfg(target_arch = "x86_64")]
 mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.

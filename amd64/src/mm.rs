@@ -1269,8 +1269,13 @@ pub fn fault_in(addr: u64) -> bool {
             return None; // a reservation, or a guard page: a real fault
         }
         // Extent as well as identity: the readahead below must not run off the
-        // end of the region it started in.
-        Some((prot, region.file.map(|f| (f, region.start_va, region.pages))))
+        // end of the region it started in. And whether the pages are shared
+        // **writable** by identity — a lazy region with a write-back record —
+        // which is a different table and a different fill.
+        Some((
+            prot,
+            region.file.map(|f| (f, region.start_va, region.pages, region.shared_write.is_some())),
+        ))
     })
     .flatten() else {
         return false;
@@ -1278,10 +1283,14 @@ pub fn fault_in(addr: u64) -> bool {
 
     match file {
         None => populate_page(page, prot),
-        Some((file, region_start, region_pages)) => {
+        Some((file, region_start, region_pages, shared_write)) => {
             // SAFETY: `rdtsc` is unprivileged and reads no memory.
             let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-            let ok = fill_file_pages(page, prot, file, region_start, region_pages);
+            let ok = if shared_write {
+                fill_shared_write_pages(page, prot, file, region_start, region_pages)
+            } else {
+                fill_file_pages(page, prot, file, region_start, region_pages)
+            };
             // SAFETY: as above.
             let t1 = unsafe { core::arch::x86_64::_rdtsc() };
             FILE_FAULT_CYCLES.fetch_add(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
@@ -1425,7 +1434,7 @@ fn fill_file_pages(
             // no `ic ivau` counterpart to perform. The AArch64 caller acts on
             // this flag; ignoring it here is a property of the architecture, not
             // an omission.
-            let ok = map_shared_file_page(va, prot, frame);
+            let ok = map_shared_file_page(va, prot, frame, false);
             if ok {
                 FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
                 FILE_PAGES_SHARED.fetch_add(1, Ordering::Relaxed);
@@ -1518,8 +1527,17 @@ fn fill_file_pages(
 /// back. There is no path where it is silently kept: a leaked reference pins a
 /// frame until reboot, and a dropped one frees a page other processes are
 /// executing from.
-fn map_shared_file_page(va: usize, prot: Prot, frame: PhysFrame) -> bool {
-    let (pte, cow) = pte_prot_for(prot, frame.addr);
+fn map_shared_file_page(va: usize, prot: Prot, frame: PhysFrame, identity: bool) -> bool {
+    // A read-only cached page goes through `pte_prot_for` like any other (its
+    // share count is always > 0, so a writable region gets it CoW-marked). A
+    // page of the shared **writable** table is shared by identity: mapped as
+    // the region says, writable, never marked — a write that broke "sharing"
+    // here would be the incoherence that table exists to remove.
+    let (pte, cow) = if identity {
+        (PteProt::from_region(prot), false)
+    } else {
+        pte_prot_for(prot, frame.addr)
+    };
     // `(mapped, release, raced)`. `release` says the cache's reference is
     // surplus and must be given back; `raced` is reported outside the hold.
     let outcome = usermode::with_current_address_space(|uas| {
@@ -1559,6 +1577,140 @@ fn map_shared_file_page(va: usize, prot: Prot, frame: PhysFrame) -> bool {
                 note_fault_race(va);
             }
             mapped
+        }
+    }
+}
+
+/// [`fill_file_pages`] for a **writable `MAP_SHARED`** region: every page comes
+/// from, or goes into, the shared writable page table ([`crate::shmpages`]), so
+/// every process mapping the file maps the same frame (2026-10-03).
+///
+/// Same window and the same "present is present" rule as the read-only fill.
+/// Different in what a page *is*: it is filled from the file's **current**
+/// bytes — the whole page, not clamped by the mapping's `filesz`, which is the
+/// EOF at `mmap` time and wrong for a file that grew since (SQLite grows its
+/// `-shm` and maps the new part in a later `mmap`) — and it is published
+/// before it is mapped, so a peer faulting the same page lands on this frame
+/// rather than filling its own.
+fn fill_shared_write_pages(
+    page: usize,
+    prot: Prot,
+    file: FileBacking,
+    region_start: usize,
+    region_pages: usize,
+) -> bool {
+    use core::sync::atomic::Ordering;
+    FILE_DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+    let first = (page - region_start) / PAGE_SIZE as usize;
+    let last = (first + READAHEAD_PAGES).min(region_pages);
+    let mut faulting_page_ok = false;
+    for idx in first..last {
+        let va = region_start + idx * PAGE_SIZE as usize;
+        if akuma_mmu::is_current_user_range_mapped(va, 1) {
+            if va == page {
+                faulting_page_ok = true;
+            }
+            continue;
+        }
+        let (offset, _) = file.page_source(idx);
+        let key = akuma_fpcache_rw::Key::new(file.mount_id, file.inode, offset);
+        let ok = shared_write_page(va, prot, key);
+        if ok {
+            FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
+        }
+        if va == page {
+            faulting_page_ok = ok;
+        }
+        if !ok {
+            break;
+        }
+    }
+    faulting_page_ok
+}
+
+/// Make page `key` present at `va` from the shared writable page table — a hit
+/// if a peer maps it, otherwise a fill from the file that this call publishes.
+///
+/// # The references
+///
+/// A hit arrives holding a reference taken for this mapping
+/// (`shmpages::lookup_and_ref`). A fill's fresh frame carries the PMM's
+/// implicit single-owner reference, which becomes this mapping's; `publish`
+/// adds the table's own. Either way [`map_shared_file_page`] adopts exactly one
+/// reference into this address space or gives it back, and the speculative
+/// [`crate::shmpages::reap`] afterwards cleans up the one case that leaves an
+/// entry with no mapper: this mapping failed (or lost a present-leaf race)
+/// while every other mapper left.
+///
+/// # The fill race
+///
+/// A `write(2)` that lands between the file read and the publish would find no
+/// frame to copy into, and the page published afterwards would be older than
+/// the file. `fill_begin`/`publish` detect it (the crate's `Generations`) and
+/// the page is read again — bounded, because a bucket shared with a busy
+/// unrelated file can keep moving. After the bound the frame is published
+/// anyway and counted in `FILL_RETRIES`: the window that remains is the one the
+/// code before this table had for every page, permanently.
+fn shared_write_page(va: usize, prot: Prot, key: akuma_fpcache_rw::Key) -> bool {
+    use crate::shmpages::{self, Fill};
+    if let Some(pa) = shmpages::lookup_and_ref(key) {
+        let ok = map_shared_file_page(va, prot, PhysFrame::new(pa), true);
+        shmpages::reap(key, pa);
+        return ok;
+    }
+    let Some(frame) = akuma_pmm::alloc_page() else {
+        return false;
+    };
+    // SAFETY: a fresh PMM frame, reached through the physmap; nothing else can
+    // reach it until it is published below.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize) };
+    const FILL_ATTEMPTS: usize = 8;
+    let mut attempt = 0;
+    let outcome = loop {
+        attempt += 1;
+        let generation = shmpages::fill_begin(key.inode);
+        // Zeroed before every read, never instead of one: zero is the value of
+        // a byte past EOF and of nothing else, and a retry must not keep a
+        // previous attempt's tail.
+        bytes.fill(0);
+        let outcome = crate::fd::file_bytes_by_inode(key.mount_id, key.inode, key.offset, bytes)
+            .map(|_| shmpages::publish(key, frame, (attempt < FILL_ATTEMPTS).then_some(generation)));
+        shmpages::fill_end();
+        if !matches!(outcome, Some(Fill::Stale)) {
+            break outcome;
+        }
+    };
+    match outcome {
+        // The file stopped answering. Nothing was published.
+        None => {
+            akuma_pmm::free_page(frame, 0);
+            false
+        }
+        Some(Fill::Inserted) => {
+            let ok = map_shared_file_page(va, prot, PhysFrame::new(frame), true);
+            shmpages::reap(key, frame);
+            ok
+        }
+        Some(Fill::Existing(pa)) => {
+            // A peer published first: our frame was never referenced, so it
+            // frees outright, and the peer's is the page.
+            akuma_pmm::free_page(frame, 0);
+            let ok = map_shared_file_page(va, prot, PhysFrame::new(pa), true);
+            shmpages::reap(key, pa);
+            ok
+        }
+        // Not shareable (no identity): a private page, exactly as before the
+        // table existed. Unreachable for a lazy region, whose identity was
+        // resolved at `mmap`, and handled rather than assumed.
+        Some(Fill::Refused) => {
+            let (pte, cow) = pte_prot_for(prot, frame);
+            !matches!(install_or_release(va, frame, pte, cow), FilledPage::Failed)
+        }
+        // The loop only leaves on a non-`Stale` outcome; an arm rather than a
+        // panic in the fault handler should that ever stop being true.
+        Some(Fill::Stale) => {
+            akuma_pmm::free_page(frame, 0);
+            false
         }
     }
 }
@@ -1796,14 +1948,60 @@ fn unmap_range(start: usize, end: usize) {
             // this address space does not track is left alone — teardown will
             // release it — because freeing it here would be a double free
             // against that.
-            if ledger.remove_user_frame(PhysFrame::new(leaf.pa))
-                && akuma_pmm::cow_ref_dec(leaf.pa)
-            {
-                akuma_pmm::free_page(leaf.pa, 0);
+            if ledger.remove_user_frame(PhysFrame::new(leaf.pa)) {
+                if akuma_pmm::cow_ref_dec(leaf.pa) {
+                    akuma_pmm::free_page(leaf.pa, 0);
+                } else if let Some(key) = shared_write_key(&snapshot, leaf.va) {
+                    // A page of the shared writable table, still referenced —
+                    // by the table, at least. If this was its last mapping the
+                    // entry goes now, which is safe because the flush above
+                    // already wrote it back: the file is the page's only copy
+                    // from here on. Under the address-space hold, which is
+                    // `shmpages`'s documented order (address space -> table).
+                    crate::shmpages::reap(key, leaf.pa);
+                }
             }
             LeafAction::Unmap
         });
     });
+}
+
+/// The shared writable table's key for `va`, if a captured region maps it
+/// through that table (lazy and shared-writable). A linear scan of the
+/// snapshot, which is empty for every `munmap` that names no such mapping.
+fn shared_write_key(snapshot: &[WriteBackRegion], va: usize) -> Option<akuma_fpcache_rw::Key> {
+    let r = snapshot
+        .iter()
+        .find(|r| r.lazy && va >= r.start_va && va < r.start_va + r.pages * PAGE_SIZE as usize)?;
+    let idx = (va - r.start_va) / PAGE_SIZE as usize;
+    Some(akuma_fpcache_rw::Key::new(r.mount_id, r.inode, r.file_off + idx * PAGE_SIZE as usize))
+}
+
+/// Unmap every writable `MAP_SHARED` file mapping of the current process —
+/// flushing each and releasing its pages from the shared writable table.
+///
+/// For **exit** and **`execve`**, which used to let the address space's `Drop`
+/// free these frames: that flushed nothing (a process killed with the mapping
+/// live lost every write since its last `msync`) and, now that the pages are
+/// shared, would leave each table entry referenced by nobody but the table.
+/// Routing them through [`unmap_range`] gives both paths the `munmap`
+/// behaviour: write back, drop the mapping, reap the entry if it was the last.
+/// Call with the process's other threads already gone, so nothing can fault a
+/// page back in behind the walk.
+///
+/// Allocates one `Vec` of extents, only when such a mapping exists.
+pub fn release_shared_write_mappings() {
+    let extents: Vec<(usize, usize)> = usermode::with_current_regions(|regions| {
+        regions
+            .iter()
+            .filter(|r| r.shared_write.is_some())
+            .map(|r| (r.start_va, r.start_va + r.len_bytes()))
+            .collect()
+    })
+    .unwrap_or_default();
+    for (start, end) in extents {
+        unmap_range(start, end);
+    }
 }
 
 /// One shared-writable region captured for flushing: everything the write-back
@@ -1816,6 +2014,9 @@ struct WriteBackRegion {
     file_off: usize,
     start_va: usize,
     pages: usize,
+    /// Demand-paged (`MmapRegion::file` set), i.e. its pages live in the
+    /// shared writable table rather than as private eager frames.
+    lazy: bool,
 }
 
 /// Snapshot every shared-writable region overlapping `[start, end)` — under the
@@ -1834,6 +2035,7 @@ fn snapshot_shared_write(regions: &[akuma_mmap::MmapRegion], start: usize, end: 
                 file_off: sw.offset,
                 start_va: r.start_va,
                 pages: r.pages,
+                lazy: r.file.is_some(),
             });
         }
     }
@@ -1854,14 +2056,26 @@ fn snapshot_shared_write(regions: &[akuma_mmap::MmapRegion], start: usize, end: 
 /// writes through it reach the file, and the fork child that broke sharing
 /// wrote through exactly such a mapping.
 fn flush_shared_write(regions: &[WriteBackRegion]) {
-    let mut jobs: Vec<(alloc::string::String, usize, usize, usize)> = Vec::new(); // (path, off, len, pa)
-    for r in regions {
+    // `(region index, off, len, pa)` — the index rather than a clone of the
+    // region's path, which used to be one `String` allocated per flushed page
+    // and is now paid on every exit of a process holding such a mapping.
+    let mut jobs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (ri, r) in regions.iter().enumerate() {
         // How big is the file *now*? The mapping may have been created when
         // the file was a fraction of this — the whole reason the record
         // carries no EOF snapshot. A page whose bytes land past the current
         // EOF is skipped: `write_at` would extend the file with it, which is
         // a decision parity-db-style callers make through `ftruncate`, not
         // one a flush makes for them.
+        // Does the recorded path still name **this** file? Not after an
+        // `unlink` (SQLite deletes its `-shm` *before* unmapping it), and after
+        // an unlink-and-recreate it names a different one — which the flush
+        // used to write into, one process's old pages landing in another's
+        // new file. The bytes have nowhere honest to go: an unlinked file's
+        // contents die with its last mapping, as on Linux.
+        if !write_back_target_ok(&r.path, r.mount_id, r.inode) {
+            continue;
+        }
         let size = akuma_vfs_glue::fs::metadata_open_file(&r.path, r.mount_id, r.inode)
             .map(|m| m.size as usize)
             .unwrap_or(0);
@@ -1876,18 +2090,18 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
                 if off < size {
                     let left = size - off;
                     let len = if left > PAGE_SIZE as usize { PAGE_SIZE as usize } else { left };
-                    jobs.push((r.path.clone(), off, len, leaf.pa));
+                    jobs.push((ri, off, len, leaf.pa));
                 }
                 LeafAction::Keep
             });
         });
     }
     let mut failed = 0usize;
-    for (path, off, len, pa) in &jobs {
+    for &(ri, off, len, pa) in &jobs {
         // SAFETY: `pa` came from a present user leaf, reached through the
         // physmap — the same access `dontneed_range`'s zeroing uses.
-        let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(*pa as u64), *len) };
-        if akuma_vfs_glue::write_at(path, *off, bytes).is_err() {
+        let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(pa as u64), len) };
+        if akuma_vfs_glue::write_at(&regions[ri].path, off, bytes).is_err() {
             failed += 1;
         }
     }
@@ -1898,6 +2112,12 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
         serial::put_dec(jobs.len() as u64);
         serial::puts(" write-back page(s) FAILED\n");
     }
+}
+
+/// Does `path` still resolve to `(mount_id, inode)`? See the call in
+/// [`flush_shared_write`]. One path walk per flushed region.
+fn write_back_target_ok(path: &str, mount_id: u32, inode: u32) -> bool {
+    akuma_vfs_glue::resolve_file_id(path) == Some((mount_id, inode))
 }
 
 /// `msync(addr, len, flags)` — the flush half of the writable-`MAP_SHARED`
@@ -1979,13 +2199,21 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     };
 
     let new_prot = Prot::from_prot(prot32);
-    if usermode::with_current_regions(|regions| {
+    // The extents in range that are shared **by identity** — `MAP_SHARED`,
+    // anonymous or file — whose present pages must never come back
+    // CoW-marked (`akuma_fpcache_rw::marks_cow`). Collected under the region
+    // hold, allocating only when there is one; almost every `mprotect` is a
+    // private allocator page and leaves this empty.
+    let Some(identity_shared) = usermode::with_current_regions(|regions| {
         akuma_mmap::mprotect_eager_regions_in_range(regions, start, end, new_prot);
-    })
-    .is_none()
-    {
+        akuma_mmap::regions_overlapping(regions, start, end)
+            .iter()
+            .filter(|r| r.shared_anon || r.shared_write.is_some())
+            .map(|r| (r.start_va, r.start_va + r.len_bytes()))
+            .collect::<Vec<(usize, usize)>>()
+    }) else {
         return errno::ESRCH;
-    }
+    };
 
     // Then the pages that are already present. A lazy page has no PTE to change
     // and does not need one — `fault_in` reads the region, which now says the
@@ -1998,8 +2226,10 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
             if !leaf.prot.user {
                 return LeafAction::Keep;
             }
-            let (want, cow) = pte_prot_for(new_prot, leaf.pa);
-            LeafAction::Reprotect(want, cow)
+            let shared = identity_shared.iter().any(|&(a, b)| leaf.va >= a && leaf.va < b);
+            let want = PteProt::from_region(new_prot);
+            let cow = akuma_fpcache_rw::marks_cow(shared, want.write, akuma_pmm::cow_ref_get(leaf.pa));
+            LeafAction::Reprotect(if cow { PteProt { write: false, ..want } } else { want }, cow)
         });
     });
     0
@@ -2110,20 +2340,40 @@ pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u6
         // nothing" into an explicit `PROT_NONE` is what killed `rustc` on the
         // AArch64 side (`docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`), and
         // `MmapRegion::inherited` is the constructor that states nothing.
-        let old_prot = regions
-            .iter()
-            .find(|r| r.start_va == old_addr)
-            .and_then(MmapRegion::recorded_prot);
+        let old_region = regions.iter().find(|r| r.contains(old_addr));
+        let old_prot = old_region.and_then(MmapRegion::recorded_prot);
+        // **What the mapping is, not only how it is protected** (2026-10-03).
+        // The new region used to carry the protection alone, so a moved file
+        // mapping lost its `file` record — every page not yet faulted in came
+        // back as anonymous zeros — and a moved `MAP_SHARED` one lost its
+        // sharing and its write-back. The records are advanced to `old_addr`'s
+        // place in the old region, since `mremap` may name a mapping's middle.
+        let skip = old_region.map_or(0, |r| (old_addr - r.start_va) / PAGE_SIZE as usize);
+        let file = old_region.and_then(|r| r.file).map(|f| f.advance(skip));
+        let shared_write = old_region
+            .and_then(|r| r.shared_write.as_ref())
+            .map(|sw| sw.advance(skip));
+        let shared_anon = old_region.is_some_and(|r| r.shared_anon);
+        let mut region = match old_prot {
+            Some(prot) => MmapRegion::inherited_with_prot(base, new_pages, prot),
+            None => MmapRegion::inherited(base, new_pages),
+        };
+        if let Some(f) = file {
+            region = region.file_backed(f);
+        }
+        if let Some(sw) = shared_write {
+            region = region.shared_writable(sw);
+        }
+        if shared_anon {
+            region = region.shared_anon();
+        }
         // Sorted insert, like every other writer — `mremap`'s new base comes from
         // `find_free_va` and is not necessarily above every existing region, so
         // appending here is exactly what breaks the invariant the fault path and
         // `munmap` now binary-search against. Missing this one site was enough to
         // wedge an in-guest `rustc`: the searches silently answer for the wrong
         // region on an unsorted list.
-        insert_region_sorted(regions, match old_prot {
-            Some(prot) => MmapRegion::inherited_with_prot(base, new_pages, prot),
-            None => MmapRegion::inherited(base, new_pages),
-        });
+        insert_region_sorted(regions, region);
         Some(base)
     }) else {
         return errno::ENOMEM;
@@ -2285,7 +2535,7 @@ fn dontneed_range(start: usize, end: usize) {
     // zeroed are **collected** here and written after both locks are gone —
     // ext2 I/O under the region lock would be a new regions -> disk edge the
     // rest of this module carefully avoids.
-    let mut flush_after: Vec<(alloc::string::String, u32, u32, usize, usize)> = Vec::new();
+    let mut flush_after: Vec<DontneedFlush> = Vec::new();
     let _ = usermode::with_current_regions(|regions| {
         let _ = usermode::with_current_address_space(|uas| {
         uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
@@ -2311,7 +2561,33 @@ fn dontneed_range(start: usize, end: usize) {
             // a refault reads back exactly what was just written.
             if let Some(sw) = &region.shared_write {
                 let idx = ((va & !(PAGE_SIZE as usize - 1)) - region.start_va) / PAGE_SIZE as usize;
-                flush_after.push((sw.path.clone(), sw.mount_id, sw.inode, sw.offset + idx * PAGE_SIZE as usize, pa));
+                let off = sw.offset + idx * PAGE_SIZE as usize;
+                // A page of the shared writable table (a lazy region): zeroing
+                // it would zero it for **every** mapper. Linux drops this
+                // mapping and leaves the page cache alone, and so does this —
+                // unmap the leaf, drop this address space's claim, and let the
+                // next touch fault the shared page back in. The frame is
+                // released only after the flush below has read it.
+                if region.file.is_some() {
+                    let release = if ledger.remove_user_frame(PhysFrame::new(pa)) {
+                        if akuma_pmm::cow_ref_dec(pa) {
+                            DontneedRelease::Free
+                        } else {
+                            DontneedRelease::Reap(akuma_fpcache_rw::Key::new(sw.mount_id, sw.inode, off))
+                        }
+                    } else {
+                        // Still mapped at another VA here: nothing to give back.
+                        DontneedRelease::Keep
+                    };
+                    flush_after.push(DontneedFlush {
+                        path: sw.path.clone(), mount_id: sw.mount_id, inode: sw.inode, off, pa, release,
+                    });
+                    return LeafAction::Unmap;
+                }
+                flush_after.push(DontneedFlush {
+                    path: sw.path.clone(), mount_id: sw.mount_id, inode: sw.inode, off, pa,
+                    release: DontneedRelease::Keep,
+                });
             }
             match dontneed_page_action(true, akuma_pmm::cow_ref_get(pa)) {
                 // `for_each_leaf_in_range` only reports present pages, so the
@@ -2374,19 +2650,49 @@ fn dontneed_range(start: usize, end: usize) {
     // After both locks: write back every shared-writable page the walk is
     // about to zero. The size check is the same one `flush_shared_write`
     // makes — pages past the file's current end have nothing to land in.
-    for (path, mount_id, inode, off, pa) in &flush_after {
-        let size = akuma_vfs_glue::fs::metadata_open_file(path, *mount_id, *inode)
-            .map(|m| m.size as usize)
-            .unwrap_or(0);
-        if *off >= size {
-            continue;
+    for f in &flush_after {
+        if write_back_target_ok(&f.path, f.mount_id, f.inode) {
+            let size = akuma_vfs_glue::fs::metadata_open_file(&f.path, f.mount_id, f.inode)
+                .map_or(0, |m| m.size as usize);
+            if f.off < size {
+                let len = if size - f.off > PAGE_SIZE as usize { PAGE_SIZE as usize } else { size - f.off };
+                // SAFETY: `pa` was a present user leaf when collected, and is
+                // still a live frame: either it is still mapped (`Keep`), or
+                // its release is deferred to the match below. Physmap-read
+                // exactly as the zeroing arm above reads it.
+                let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(f.pa as u64), len) };
+                let _ = akuma_vfs_glue::write_at(&f.path, f.off, bytes);
+            }
         }
-        let len = if size - *off > PAGE_SIZE as usize { PAGE_SIZE as usize } else { size - *off };
-        // SAFETY: `pa` was a present user leaf when collected, physmap-read
-        // exactly as the zeroing arm above reads it.
-        let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(*pa as u64), len) };
-        let _ = akuma_vfs_glue::write_at(path, *off, bytes);
+        match f.release {
+            DontneedRelease::Keep => {}
+            DontneedRelease::Free => akuma_pmm::free_page(f.pa, 0),
+            DontneedRelease::Reap(key) => crate::shmpages::reap(key, f.pa),
+        }
     }
+}
+
+/// One shared-writable page [`dontneed_range`] writes back after its walk.
+struct DontneedFlush {
+    path: alloc::string::String,
+    mount_id: u32,
+    inode: u32,
+    off: usize,
+    pa: usize,
+    release: DontneedRelease,
+}
+
+/// What [`dontneed_range`] still owes the frame once it has been written back.
+#[derive(Clone, Copy)]
+enum DontneedRelease {
+    /// Still mapped (an eager page about to be zeroed in place, or a table
+    /// page mapped at another VA of this address space).
+    Keep,
+    /// This address space was the frame's only holder; free it.
+    Free,
+    /// A table page this address space stopped mapping; reap the entry if it
+    /// was the last mapping anywhere.
+    Reap(akuma_fpcache_rw::Key),
 }
 
 #[cfg(not(feature = "no-tests"))]

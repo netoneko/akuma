@@ -1622,6 +1622,7 @@ fn user_fault(
     // at cap, evictions churning) from "a mapper leaked refs" (len small,
     // `cow_ref_frames` huge) — the two look identical from `pmm_free=0` alone.
     akuma_fpcache::stats_line(&mut w);
+    crate::shmpages::stats_line(&mut w);
     w.flush();
     if let Some(regs) = regs {
         dump_user_registers_and_memory(regs);

@@ -3049,9 +3049,14 @@ fn share_parent_memory_into(
     let (inherited, shared_ranges) = {
         let _irq = akuma_primitives::irq::IrqGuard::new();
         let parent_regions = parent.mmap_regions.lock();
+        // Writable `MAP_SHARED` file mappings too (2026-10-03): their pages
+        // are one frame per file page for every mapper, so a child shares the
+        // parent's frames exactly as it does a shared anonymous mapping's.
+        // Copy-on-write here was the old answer, and it split the child off
+        // the file the moment either side wrote.
         let shared: Vec<(usize, usize)> = parent_regions
             .iter()
-            .filter(|r| r.shared_anon)
+            .filter(|r| r.shared_anon || r.shared_write.is_some())
             .map(|r| (r.start_va, r.start_va + r.len_bytes()))
             .collect();
         // The child maps every page of every parent region — read-only and
@@ -3061,7 +3066,20 @@ fn share_parent_memory_into(
         // part that has been dropped before: a grandchild whose parent's
         // regions read as zero-length shares nothing and faults on its first
         // touch (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
-        (akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions), shared)
+        let mut inherited = akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions);
+        // The shared crate drops `shared_write` on inheritance, because a
+        // CoW child owns no frames to write back — true on AArch64, whose
+        // fork copies. Here the child maps the **same** frames as the parent
+        // (the share pass below), so it is a mapper like any other: it must
+        // write back on `munmap`/exit and release its table references, and
+        // without the record it would do neither. Index-aligned, because the
+        // inheritance maps over the parent's list in order.
+        for (child, parent) in inherited.iter_mut().zip(parent_regions.iter()) {
+            if parent.shared_write.is_some() && child.start_va == parent.start_va {
+                child.shared_write.clone_from(&parent.shared_write);
+            }
+        }
+        (inherited, shared)
     };
     *child_regions = inherited;
 
@@ -3123,8 +3141,11 @@ fn share_parent_memory_into(
         // parent's own PTE deliberately left alone (`LeafAction::Keep`).
         if shared_ranges.iter().any(|(start, end)| va >= *start && va < *end) {
             let shared_rw = PteProt { write: true, ..leaf.prot };
-            akuma_pmm::cow_ref_inc(frame.addr);
-            child_space.track_user_frame(frame);
+            // One share-count reference per **frame**, not per VA: a frame the
+            // parent maps at two VAs (one file mapped twice) is one reference
+            // the child's teardown gives back once. `adopt_user_frame` is the
+            // ledger's rule for exactly that.
+            let _ = child_space.adopt_user_frame(frame, false);
             if !child_space.map_page_pte(va, pa, shared_rw, false) {
                 if child_space.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
                     akuma_pmm::free_page(frame.addr, 0);
@@ -3508,6 +3529,11 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // only place that ordering can be enforced: the reaper is another process
     // and has no idea threads exist.
     crate::thread::drain(idx);
+    // Writable `MAP_SHARED` file mappings get `munmap`'s treatment before the
+    // address space is dropped: written back, and released from the shared
+    // writable page table. After the drain, so no sibling can fault a page
+    // back in behind it. See `mm::release_shared_write_mappings`.
+    crate::mm::release_shared_write_mappings();
     if let Some(fds) = exit_fds {
         fds.close_all();
     }
@@ -4758,6 +4784,11 @@ fn do_execve(
         serial::puts("  [execve] from a non-leader thread with live siblings; \
                       they are not killed (no leader transfer on this target)\n");
     }
+    // The old image's writable `MAP_SHARED` file mappings die with it: write
+    // them back and release their shared pages now, while the old address
+    // space is still the current one — its `Drop` inside `install_image` would
+    // do neither. Same call the exit epilogue makes.
+    crate::mm::release_shared_write_mappings();
 
     // Built **before** the hold below. `with_process` runs its closure with
     // interrupts disabled and states that it must not allocate on the heap, so
