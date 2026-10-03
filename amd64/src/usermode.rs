@@ -3046,9 +3046,23 @@ fn share_parent_memory_into(
     // shared **by identity** rather than copy-on-write. Both are read out of
     // the parent's list in one hold, before the page walk below, because the
     // walk maps pages and must not run under the region lock.
+    // **The leader's region list, not the forking thread's** (2026-10-03). A
+    // `CLONE_THREAD` thread's own `mmap_regions` is empty by construction —
+    // the address space's regions live on the thread-group leader, which is
+    // what `current_mm_process` resolves for every other memory syscall. A
+    // fork from a worker thread (Python's `subprocess`, tokio's
+    // `spawn_blocking` running `Command`) read the empty list, so the child
+    // inherited **no regions** (its lazy pages faulted as unmapped) and,
+    // worse, no shared ranges: every `MAP_SHARED` page was CoW-demoted in the
+    // parent, whose next write then took a private copy and silently left the
+    // sharing. With SQLite's `-shm` in the shared writable page table, that
+    // private copy was then written back over every other process's live
+    // index — a multi-process WAL database corrupted by any tool call
+    // (`docs/archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md`).
+    let owner = akuma_exec::process::lookup_process_shared(parent.tgid).unwrap_or(parent);
     let (inherited, shared_ranges) = {
         let _irq = akuma_primitives::irq::IrqGuard::new();
-        let parent_regions = parent.mmap_regions.lock();
+        let parent_regions = owner.mmap_regions.lock();
         // Writable `MAP_SHARED` file mappings too (2026-10-03): their pages
         // are one frame per file page for every mapper, so a child shares the
         // parent's frames exactly as it does a shared anonymous mapping's.
@@ -3110,7 +3124,6 @@ fn share_parent_memory_into(
     // that is a shared-L0 view under a **fresh** lock nothing else in the
     // system takes, and the hold above would exclude nothing. The owner is the
     // leader, and `tgid` is the leader's pid on both kernels.
-    let owner = akuma_exec::process::lookup_process_shared(parent.tgid).unwrap_or(parent);
     let mut parent_as = owner.address_space.lock();
     // The child inherits the parent's file mappings — including the pages of
     // them nobody has faulted yet — so it must inherit their claim on the

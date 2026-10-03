@@ -18,11 +18,16 @@
  *  10  4 processes x 50000 atomic increments on one shared word: exact total
  *  11  a child that exits WITHOUT munmap/msync: its store reaches the file
  *  12  unlink, recreate the path, then munmap the old mapping: the new file is untouched
+ *  13  fork from a WORKER THREAD: the parent stays shared with an unrelated mapper, and the
+ *      child sees the mapping (including a page nobody faulted yet). The SQLite-killing case:
+ *      amd64's fork read the forking thread's own (empty) region list, CoW-split the parent off
+ *      its MAP_SHARED pages, and a write-back of that private copy overwrote everyone's -shm.
  *
- * Build: x86_64-linux-musl-gcc -O1 -static -o shmwrite shmwrite.c
+ * Build: x86_64-linux-musl-gcc -O1 -static -pthread -o shmwrite shmwrite.c
  * Exit 0 only if every rung passes. */
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +58,19 @@ static volatile char *map(int fd) {
 static void await(int r) { char x; if (read(r, &x, 1) != 1) { perror("await"); exit(2); } }
 static void signal1(int w) { if (write(w, "x", 1) != 1) { perror("signal"); exit(2); } }
 static int child_ok(pid_t c) { int st; waitpid(c, &st, 0); return WIFEXITED(st) && WEXITSTATUS(st) == 0; }
+
+/* Rung 13's worker: fork from a non-leader thread; the child checks the mapping and writes. */
+static volatile char *t_map;
+static void *fork_from_thread(void *arg) {
+    (void)arg;
+    pid_t c = fork();
+    if (c == 0) {
+        int saw = t_map[0] == 70 && t_map[5 * PG] == 0;   /* page 5: never faulted by anyone */
+        t_map[6 * PG] = 71;
+        _exit(saw ? 0 : 1);
+    }
+    return (void *)(long)child_ok(c);
+}
 
 int main(void) {
     int fd, a2b[2], b2a[2];
@@ -239,6 +257,29 @@ int main(void) {
         verdict(memcmp(buf, "NEWFILE!", 8) == 0 && sz == 8);
         close(nfd);
     }
+
+    /* 13 */
+    rung(13, "fork from a worker thread keeps the parent shared and the child mapped");
+    fd = fresh(); a = map(fd); t_map = a;
+    a[0] = 70;
+    if ((c = fork()) == 0) {                  /* the unrelated peer */
+        int fd2 = open(P, O_RDWR);
+        volatile char *b = map(fd2);
+        (void)b[0];
+        signal1(b2a[1]);
+        await(a2b[0]);
+        _exit(b[0] == 72 && b[6 * PG] == 71 ? 0 : 1);
+    }
+    await(b2a[0]);
+    {
+        pthread_t t; void *thread_child_ok = 0;
+        pthread_create(&t, 0, fork_from_thread, 0);
+        pthread_join(t, &thread_child_ok);
+        a[0] = 72;                            /* after the fork: must still reach the peer */
+        signal1(a2b[1]);
+        verdict(child_ok(c) && thread_child_ok && a[6 * PG] == 71);
+    }
+    munmap((void *)a, LEN); close(fd);
 
     unlink(P);
     printf("shmwrite: %s (%d failing)\n", fails ? "FAIL" : "PASS", fails);
