@@ -430,3 +430,24 @@ one mapping.)
 
 **Also seen:** goose's extension children are separate processes (`goose-cli-main` ×4, ~500 futex/s each); whether they
 open the session DB was not established — it is the question that decides whether option 3 would even help.
+
+**Resolved 2026-10-03 (later still): option 1, plus a second bug it exposed.** Full record:
+[`AKUMA_AMD64_SHARED_WRITABLE_PAGES.md`](AKUMA_AMD64_SHARED_WRITABLE_PAGES.md).
+- **Coherence.** A shared writable page table (`crates/akuma-fpcache-rw` + `amd64/src/shmpages.rs`):
+  every mapper of a file page maps one frame, writable and un-marked, for as long as any maps it.
+  `write(2)`/`ftruncate` are copied into or zeroed in mapped frames; exit and `execve` now write
+  back (they used to drop writes). `shmcoh` prints `YES`/`YES`, and the new 13-rung `shmwrite.c`
+  passes locally (SMP=1 and SMP=4) and on the metal.
+- **Worker-thread fork.** goose *still* corrupted with two concurrent sessions, and the Python
+  stress could not reproduce it until a `spawn` mode forked from inside open transactions. Root
+  cause: `fork` from a non-leader thread read that thread's own, empty, region list. The parent's
+  `MAP_SHARED` pages were CoW-split, and the private `-shm` copy's write-back overwrote every other
+  process's index. Fixed in `usermode.rs::share_parent_memory_into` and A/B-pinned by `shmwrite`
+  rung 13.
+- **Measured on the trashcan:** `sqlite_wal_stress.py` `procs`/`mixed`/`spawn` all `integrity ok`.
+  Six concurrent long goose sessions (74 shell calls) all exit 0 and report their results, with
+  `integrity_check` `ok`. The two pre-fix databases are preserved at `/root/goose-pre-shm/` (ok)
+  and `/root/goose-pre-forkfix/` (corrupt).
+- **Correction to the "Also seen" paragraph above:** whether goose's extension children open the
+  DB no longer matters. Its own processes fork tool calls from worker threads, and that was the
+  live trigger.

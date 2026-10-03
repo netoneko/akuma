@@ -1,7 +1,9 @@
 # Writable `MAP_SHARED` file mappings (amd64)
 
 **Grade: C** — landed 2026-09-22, verified on bare metal the same day, one
-caller (ParityDB via akuma-miot's `storeprobe`) exercised end to end.
+caller (ParityDB via akuma-miot's `storeprobe`) exercised end to end. Made
+coherent across processes 2026-10-03 (§ "Shared between mappers"); SQLite's
+multi-process WAL and concurrent goose sessions verified on the metal.
 
 > **aarch64, same day:** the `mmap::plan` change below is *shared*, and it
 > silently broke aarch64. Its lazy-file path never registered shared-writable
@@ -13,8 +15,9 @@ caller (ParityDB via akuma-miot's `storeprobe`) exercised end to end.
 
 `mmap(MAP_SHARED, PROT_WRITE)` on a regular file used to be `ENOSYS` on this
 target: coherence needs either a page cache or write-back, and neither
-existed. It is now served, without a page cache, by **demand-paged fills plus
-whole-region write-back**:
+existed. It is now served by **demand-paged fills plus whole-region write-back**, and
+since 2026-10-03 the demand-paged pages are **shared between every mapper**
+(§ "Shared between mappers" below):
 
 - `akuma-syscalls-mem::mmap::plan` marks the request `is_shared_writable` and
   — since this change — leaves it `file_lazy_eligible` like every other file
@@ -42,24 +45,59 @@ whole-region write-back**:
 - `madvise`/`msync` flushing does ext2 I/O with no region or address-space
   lock held: the walk collects, the locks drop, then the writes run.
 
+## Shared between mappers (since 2026-10-03)
+
+A lazy shared-writable region (both `file` and `shared_write` set; the normal case) is served from
+the **shared writable page table**: `crates/akuma-fpcache-rw` holds the decisions (host-tested)
+and `amd64/src/shmpages.rs` the lock, the refcounts and the copies. Every process that maps page
+`p` of a file maps **one frame**, writable and never CoW-marked, for as long as any of them maps
+it. That is the coherence SQLite's WAL index (`-shm`) depends on.
+
+- **Lifetime.** An entry exists exactly while some address space maps its frame. The count is the
+  PMM's CoW refcount (`1 + mappers`). `munmap`, exit and `execve` write back, then `reap` the
+  entry once its last mapping goes. Nothing evicts it for capacity.
+- **Fill.** A miss reads the file's *current* page, so a mapping made before the file grew still
+  sees the new bytes, and publishes it. A lost publish race adopts the winner's frame. A
+  `write(2)` that races the fill is caught by per-inode-bucket generations and the page is re-read.
+- **`write(2)`/`pwrite`/`ftruncate`/hole punch** (`akuma_vfs_glue::MappedFileHooks`) are copied
+  into, or zeroed in, every mapped frame they overlap. A write-back, whose source is the frame
+  itself, is skipped.
+- **`fork`** shares these pages by identity, like `MAP_SHARED|MAP_ANONYMOUS`. It reads the
+  **thread-group leader's** region list: until 2026-10-03 a fork from a worker thread read the
+  thread's own, empty, list and CoW-split the parent off every shared page.
+- **`MADV_DONTNEED`** drops the caller's mapping and keeps the page. **`mprotect`** never
+  CoW-marks an identity-shared page. **`mremap`** carries the region's records.
+- **Write-back target.** A flush checks that the recorded path still names the mapping's
+  `(mount, inode)`, and skips if not (SQLite unlinks `-shm` before unmapping it). Before this
+  check, an unlink-and-recreate made the old mapping's flush write into the new file.
+
+Probes: `userspace/forktest/c_stress/shmcoh.c` (two lines, both `YES`) and `shmwrite.c` (13
+rungs, one per path above). Driver: `scripts/utils/amd64_shmwrite_check.py`. Stress:
+`scripts/benchmarks/sqlite_wal_stress.py {procs,mixed,spawn}`. History:
+[`../../archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md`](../../archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md).
+
 ## What this does **not** promise
 
-> **2026-10-03: this is now a known, load-bearing gap, not a footnote.** SQLite's WAL index is a `MAP_SHARED` file mapping
-> that several processes must see live; without coherence, multi-process WAL databases corrupt (goose:
-> `database disk image is malformed`). Probe: `userspace/forktest/c_stress/shmcoh.c`; stress:
-> `scripts/benchmarks/sqlite_wal_stress.py`; analysis and fix options:
-> `docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md` § 15.
+> **Corrected 2026-10-03.** This section used to say "no page cache means no cross-mapper
+> coherence" and, on the same day, that the gap had become load-bearing (SQLite, goose).
+> Mappers are coherent now (above). What is still not promised:
 
-No page cache means no cross-mapper coherence. Two mappers of one file do not
-see each other's writes until a flush lands; `read(2)`/`write(2)` on the same
-file see a mapping's writes only after one. A process **killed** with the
-mapping live loses writes since its last flush — the exit path does not
-flush. Stores past the file's current EOF are dropped by the flush (the
-caller extends with `ftruncate`, which parity-db does). A `fork` child of a
-shared-writable mapping drops the record — it owns no frames, and flushing a
-CoW-broken private copy would push one address space's divergence into the
-file. Pages filled on fault read the file as it is *at fault time*, which is
-what makes file growth under a long-lived mapping work.
+- **`read(2)` does not see a mapping's unflushed stores.** Writes flow file → frames, never
+  frames → file, except by write-back (`munmap`, `msync`, `MADV_DONTNEED`, exit, `execve`).
+- **Read-only and private mappings are not part of the table.** A `PROT_READ` `MAP_SHARED` and
+  any `MAP_PRIVATE` mapping of the same file are served by `akuma-fpcache` or by private fills,
+  and can hold a page older than a peer's shared-writable frame. SQLite with `mmap_size > 0` maps
+  its main database this way. goose's build cannot (`MAX_MMAP_SIZE=0`).
+- **A rename under a live mapping** makes its write-backs skip (the path no longer names the
+  inode). The bytes stay correct in the shared frames while anything maps them and are lost from
+  the file after the last unmap. There is no by-inode write.
+- **Stores past the file's current EOF** are dropped by the write-back. The caller extends with
+  `ftruncate` or `write`, as parity-db and SQLite both do.
+- **A mapping whose fd has no inode identity** stays eager and private, with the single-mapper
+  write-back contract this doc originally described.
+- **AArch64 is a different implementation**: its own `SharedFileMapping` record in
+  `akuma-syscalls-glue/src/mem.rs`, private frames, and its copying fork. None of the above
+  applies there.
 
 ## The three bugs this uncovered (all fixed same day)
 

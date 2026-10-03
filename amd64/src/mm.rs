@@ -35,11 +35,13 @@
 //!
 //! A **writable `MAP_SHARED`** file mapping is served since 2026-09-22 — the
 //! last refusal in this family. Writes reach the file by write-back on
-//! `munmap`/`msync`/`MADV_DONTNEED` over demand-paged pages, not by a page
-//! cache; the coherence that a cache would give every mapper is narrowed to
-//! the single-mapper contract. See
+//! `munmap`/`msync`/`MADV_DONTNEED`/exit over demand-paged pages. **Since
+//! 2026-10-03 those pages are shared**: every mapper of a page maps one frame
+//! from the shared writable page table ([`crate::shmpages`],
+//! `akuma-fpcache-rw`), which is what SQLite's multi-process WAL index needs —
+//! the per-process copies before it corrupted goose's database. See
 //! `docs/reference/subsystems/amd64-shared-write-mmap.md` for the design and
-//! `MmapRegion::shared_write` for what is and is not promised.
+//! `docs/archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md` for how it was found.
 //!
 //! One pinned divergence comes with it: a mapping never sees a write made to
 //! the file after the `mmap` — `MAP_PRIVATE` leaves that unspecified on Linux
@@ -1154,8 +1156,8 @@ fn note_fault_race(va: usize) {
 /// A page cache. Every mapping gets its **own copy** of every page, so two
 /// processes mapping one file hold two sets of frames and a write through
 /// `MAP_PRIVATE` cannot be seen by anyone — which is what `MAP_PRIVATE` means,
-/// so it is correct and merely expensive. `MAP_SHARED` writable is refused in
-/// `sys_mmap` precisely because *that* one needs the sharing to be real.
+/// so it is correct and merely expensive. Writable `MAP_SHARED` needs the
+/// sharing to be real, and gets it from [`fill_shared_write_pages`] instead.
 fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
     let Some(frame) = akuma_pmm::alloc_page() else {
         return false;

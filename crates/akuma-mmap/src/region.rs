@@ -112,9 +112,16 @@ pub struct MmapRegion {
     /// flush. No dirty-bit tracking: each flush rewrites every in-file page
     /// from its frame, which is wrong only in I/O spent, never in bytes.
     ///
-    /// This is a record, not a page cache. Two mappers of one file do not see
-    /// each other's writes until a flush lands (and `read(2)`/`write(2)` on
-    /// the same file see a mapping's writes only after one). What it does
+    /// This is a record, not a page cache. **On amd64 since 2026-10-03 a lazy
+    /// region with this record is served from the shared writable page table
+    /// (`akuma-fpcache-rw`)**: every mapper of a page maps one frame, so
+    /// mappers *are* coherent with each other and `write(2)` is copied into
+    /// the mapped frames; the paragraph below is the eager (no-identity) path
+    /// and the AArch64 kernel, which never sets this field (its record is
+    /// `akuma-syscalls-glue`'s `SharedFileMapping`). There, two mappers of one
+    /// file do not see each other's writes until a flush lands (and
+    /// `read(2)`/`write(2)` on the same file see a mapping's writes only after
+    /// one). What it does
     /// guarantee is the guarantee `mmap`'s contract actually needs for the
     /// dominant single-mapper caller (a database mapping its own files):
     /// *writes through the mapping reach the file*, and a process that
@@ -407,6 +414,9 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
             // would serve them as anonymous zeros — a program image full of
             // holes, reported as a `SIGSEGV` or worse as silence.
             inherited.file = r.file;
+            // (amd64 re-attaches it for the regions it shares by identity at
+            // fork — `usermode.rs::share_parent_memory_into` — because there
+            // the child maps the parent's frames and is a real mapper.)
             // `shared_write` is deliberately **dropped**, unlike `file`: the
             // child owns no frames (CoW), so its flush would write nothing —
             // and if a child write broke CoW into a private frame, flushing
