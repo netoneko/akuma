@@ -2638,6 +2638,90 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(())
     }
 
+    /// Free every data block at logical index `>= first`, and every pointer
+    /// block that is left holding nothing, zeroing the pointers that named them.
+    ///
+    /// The shrink half of `ftruncate`. `truncate_inode` is this with
+    /// `first == 0` plus a size reset, kept separate because it also serves
+    /// unlink and `O_TRUNC`. `sectors_used` follows each free, so the inode
+    /// stays self-consistent for `e2fsck` at every point an error can leave it.
+    fn free_blocks_from(&self, state: &mut Ext2State, inode: &mut Inode, first: u32) -> Result<(), FsError> {
+        let sect = (state.block_size / 512) as u32;
+        let ppb = (state.block_size / 4) as u32;
+
+        for i in (first.min(12) as usize)..12 {
+            let b = inode.direct_blocks[i];
+            if b != 0 {
+                self.free_block(state, b)?;
+                inode.direct_blocks[i] = 0;
+                inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+            }
+        }
+
+        if inode.indirect_block != 0 {
+            let start = first.saturating_sub(12).min(ppb);
+            let mut ind = self.read_block(state, inode.indirect_block)?;
+            let mut changed = false;
+            for j in start..ppb {
+                let b = Self::read_block_ptr(&ind, j as usize);
+                if b != 0 {
+                    self.free_block(state, b)?;
+                    Self::write_block_ptr(&mut ind, j as usize, 0);
+                    inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+                    changed = true;
+                }
+            }
+            if start == 0 {
+                self.free_block(state, inode.indirect_block)?;
+                inode.indirect_block = 0;
+                inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+            } else if changed {
+                self.write_block(state, inode.indirect_block, &ind)?;
+            }
+        }
+
+        if inode.double_indirect_block != 0 {
+            let rel = first.saturating_sub(12 + ppb);
+            let first_i = ((rel / ppb) as usize).min(ppb as usize);
+            let mut dbl = self.read_block(state, inode.double_indirect_block)?;
+            let mut dbl_changed = false;
+            for i in first_i..ppb as usize {
+                let ib = Self::read_block_ptr(&dbl, i);
+                if ib == 0 {
+                    continue;
+                }
+                let start = if i == first_i { rel % ppb } else { 0 };
+                let mut ind = self.read_block(state, ib)?;
+                let mut changed = false;
+                for j in start..ppb {
+                    let b = Self::read_block_ptr(&ind, j as usize);
+                    if b != 0 {
+                        self.free_block(state, b)?;
+                        Self::write_block_ptr(&mut ind, j as usize, 0);
+                        inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+                        changed = true;
+                    }
+                }
+                if start == 0 {
+                    self.free_block(state, ib)?;
+                    Self::write_block_ptr(&mut dbl, i, 0);
+                    inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+                    dbl_changed = true;
+                } else if changed {
+                    self.write_block(state, ib, &ind)?;
+                }
+            }
+            if rel == 0 {
+                self.free_block(state, inode.double_indirect_block)?;
+                inode.double_indirect_block = 0;
+                inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+            } else if dbl_changed {
+                self.write_block(state, inode.double_indirect_block, &dbl)?;
+            }
+        }
+        Ok(())
+    }
+
     fn truncate_inode(&self, state: &mut Ext2State, inode: &mut Inode) -> Result<(), FsError> {
         // Free all direct blocks
         // Indexed, not iterated, and clippy's `needless_range_loop` cannot be
@@ -3868,39 +3952,80 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
         let block_size = state.block_size as u64;
 
-        if length > current_size {
-            // **Extend.** The bytes between the old EOF and the first new
-            // block boundary (if the old EOF sat mid-block) read as zeros by
-            // contract; a pre-existing partial block keeps its old bytes
-            // before that gap, so the tail of it is zeroed in place rather
-            // than left as whatever a previous life of the file left there.
-            // Every *new* block comes from `ensure_block(_, true)` — a fresh
-            // zeroed allocation. A mid-way ENOSPC leaves the file's size
-            // untouched and returns the error, which is the honest answer
-            // the old `Ok(())` replaced.
-            let mut size = current_size;
-            if size % block_size != 0 {
-                let block_off = (size % block_size) as usize;
-                let zero_len =
-                    core::cmp::min(length - size, (block_size - size % block_size) as u64) as usize;
-                let logical = (size / block_size) as u32;
-                let blk = self.ensure_block(&mut state, &mut inode, logical, false)?;
-                let mut data = self.read_block(&state, blk)?;
-                data[block_off..block_off + zero_len].fill(0);
-                self.write_block(&mut state, blk, &data)?;
-                size += zero_len as u64;
+        // A failure partway leaves the inode describing exactly the blocks the
+        // bitmap says it owns: the error path writes the inode back before it
+        // returns. Returning with `?` instead — as this did — left blocks the
+        // bitmap marked allocated that no inode referenced (an extend) or
+        // blocks the bitmap had freed that the inode still pointed at (a
+        // shrink): a leak in the first case, and in the second two files
+        // sharing a block the moment the allocator reused it.
+        let kept_blocks = u32::try_from(current_size.div_ceil(block_size)).unwrap_or(u32::MAX);
+        let result: Result<(), FsError> = (|| {
+            if length > current_size {
+                // **Extend.** The bytes between the old EOF and the first new
+                // block boundary (if the old EOF sat mid-block) read as zeros
+                // by contract; a pre-existing partial block keeps its old
+                // bytes before that gap, so the tail of it is zeroed in place
+                // rather than left as whatever a previous life of the file
+                // left there. Every *new* block comes from
+                // `ensure_block(_, true)` — a fresh zeroed allocation —
+                // **including** a partial block that does not exist yet (a
+                // hole): its leading bytes are file bytes that must read zero,
+                // and a non-zeroing allocation would hand back the block's
+                // previous contents.
+                let mut size = current_size;
+                if size % block_size != 0 {
+                    let block_off = (size % block_size) as usize;
+                    let zero_len =
+                        core::cmp::min(length - size, (block_size - size % block_size) as u64) as usize;
+                    let logical = (size / block_size) as u32;
+                    let blk = self.ensure_block(&mut state, &mut inode, logical, true)?;
+                    let mut data = self.read_block(&state, blk)?;
+                    data[block_off..block_off + zero_len].fill(0);
+                    self.write_block(&mut state, blk, &data)?;
+                    size += zero_len as u64;
+                }
+                while size < length {
+                    let logical = (size / block_size) as u32;
+                    self.ensure_block(&mut state, &mut inode, logical, true)?;
+                    size += block_size as u64;
+                }
+            } else if length < current_size {
+                // **Shrink.** Free what lies wholly past the new EOF, then
+                // zero the tail of the block that holds it: the file may grow
+                // back over those bytes, and they must read as zeros then.
+                let keep = u32::try_from(length.div_ceil(block_size)).unwrap_or(u32::MAX);
+                self.free_blocks_from(&mut state, &mut inode, keep)?;
+                if length % block_size != 0 {
+                    if let Some(blk) = self.get_block_num(&state, &inode, keep - 1)? {
+                        let off = (length % block_size) as usize;
+                        let mut data = self.read_block(&state, blk)?;
+                        data[off..].fill(0);
+                        self.write_block(&state, blk, &data)?;
+                    }
+                }
             }
-            while size < length {
-                let logical = (size / block_size) as u32;
-                self.ensure_block(&mut state, &mut inode, logical, true)?;
-                size += block_size as u64;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            // Undo an extend's allocations (no-op after a shrink's failure),
+            // then publish whatever the inode now holds.
+            if length > current_size {
+                let _ = self.free_blocks_from(&mut state, &mut inode, kept_blocks);
             }
+            let _ = self.write_inode(&state, inode_num, &inode);
+            let _ = self.flush_meta(&mut state);
+            return Err(e);
         }
 
         inode.size_lower = length as u32;
         inode.size_upper = (length >> 32) as u32;
         inode.modification_time = self.current_time();
         self.write_inode(&state, inode_num, &inode)?;
+        // A shrink stages bitmap, group-descriptor and superblock edits that
+        // nothing else would push to disk until the next `sync`.
+        self.flush_meta(&mut state)?;
         Ok(())
     }
 

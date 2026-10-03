@@ -2414,3 +2414,76 @@ fn ftruncate_extends_with_zero_blocks() {
     assert_eq!(&buf[..4], b"head");
     assert!(buf[4..].iter().all(|&b| b == 0));
 }
+
+/// `ftruncate` shrink must free the blocks it drops and must not let them come
+/// back: shrink-then-extend reads **zeros** past the shrink point.
+///
+/// Until 2026-10-03 `truncate` only moved `i_size` on a shrink. The blocks
+/// stayed allocated and referenced (so `e2fsck` reported `i_size is 77824,
+/// should be 98304` on a file a mapped-file stress had shrunk), and a later
+/// extend reused them without zeroing — the old bytes reappeared where POSIX
+/// promises zeros. The earlier test of this name's neighbour asserted only the
+/// size, which is why it passed.
+#[test]
+fn ftruncate_shrink_frees_blocks_and_reextend_reads_zeros() {
+    let fs = mount_empty();
+    let bs = fs.stats().unwrap().block_size as usize;
+    // Large enough to need the singly-indirect block (12 direct blocks).
+    let len = bs * 40;
+    fs.write_file("/shrink", &vec![0xAA; len]).unwrap();
+    let free_full = fs.stats().unwrap().free_blocks;
+
+    fs.truncate("/shrink", 100).unwrap();
+    let free_small = fs.stats().unwrap().free_blocks;
+    // 40 data blocks + 1 indirect block, less the one block that still holds
+    // the 100 surviving bytes.
+    assert_eq!(free_small - free_full, 40, "shrink must give back the dropped blocks (and the indirect block)");
+
+    fs.truncate("/shrink", len as u64).unwrap();
+    let mut buf = vec![0xFFu8; len];
+    assert_eq!(fs.read_at("/shrink", 0, &mut buf).unwrap(), len);
+    assert!(buf[..100].iter().all(|&b| b == 0xAA), "surviving bytes must survive");
+    assert!(
+        buf[100..].iter().all(|&b| b == 0),
+        "bytes past a shrink must read as zeros after the file grows back"
+    );
+
+    // Shrink to a block boundary, and to zero.
+    fs.truncate("/shrink", (bs * 3) as u64).unwrap();
+    fs.truncate("/shrink", 0).unwrap();
+    assert_eq!(fs.stats().unwrap().free_blocks, free_full + 41, "an emptied file holds no blocks");
+}
+
+/// Shrink through every level of the block map: direct, singly indirect and
+/// doubly indirect, to a point inside each, then to zero. The free count must
+/// return to its starting value exactly (no leaked pointer block, no block
+/// freed twice) and the surviving prefix must be intact.
+#[test]
+fn ftruncate_shrink_walks_every_indirection_level() {
+    let fs = mount_empty();
+    let bs = fs.stats().unwrap().block_size as usize;
+    let ppb = bs / 4;
+    let baseline = fs.stats().unwrap().free_blocks;
+    let len = bs * (12 + ppb + 3 * ppb / 2); // well into the doubly-indirect range
+    let pattern: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    fs.write_file("/deep", &pattern).unwrap();
+
+    for &cut in &[len - bs / 2, bs * (12 + ppb + ppb / 2), bs * (12 + ppb + 1) + 7, bs * (12 + ppb), bs * 12 + 1, bs * 5 + 3, 0usize] {
+        fs.truncate("/deep", cut as u64).unwrap();
+        assert_eq!(fs.metadata("/deep").unwrap().size, cut as u64);
+        let mut back = vec![0u8; cut];
+        assert_eq!(fs.read_at("/deep", 0, &mut back).unwrap(), cut);
+        assert_eq!(back, pattern[..cut], "prefix intact after shrinking to {cut}");
+    }
+    assert_eq!(fs.stats().unwrap().free_blocks, baseline, "shrinking to zero returns every block, pointer blocks included");
+
+    // And the file is still usable, with no stale bytes, afterwards.
+    fs.truncate("/deep", len as u64).unwrap();
+    let mut back = vec![0xFFu8; len];
+    fs.read_at("/deep", 0, &mut back).unwrap();
+    assert!(back.iter().all(|&b| b == 0));
+    // No `remove_file` + free-count check here: the inode pin table is a
+    // process-global keyed by inode number, so a parallel test that pins the
+    // same number defers this unlink's free and the count moves for a reason
+    // that is not what this test is about.
+}
