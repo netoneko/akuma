@@ -334,8 +334,9 @@ pub use imp::init;
 // Backend override: a platform whose sound hardware is not virtio-snd
 // ============================================================================
 
-/// A `/dev/dsp` backend registered by the platform, taking the place of
-/// virtio-snd. The bare-metal amd64 kernel registers Intel HDA here; it has no
+/// A `/dev/dsp` backend registered by the platform, in place of virtio-snd.
+///
+/// The bare-metal amd64 kernel registers Intel HDA here; it has no
 /// virtio-sound device, and the seam (`open`/`write`/`ioctl` in the syscall
 /// glue) only ever calls the six functions below, so one dispatch point is all
 /// it takes — no `cfg` inside the drivers and no second copy of the seam.

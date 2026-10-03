@@ -17,14 +17,16 @@ use crate::{Rgb, Surface};
 /// The font a [`Console`] uses when the framebuffer can afford it.
 pub const DEFAULT_FONT: &Font = &font::IBM_PLEX_MONO;
 
-/// [`DEFAULT_FONT`] baked at twice the size (24x48), for a screen where the console
-/// would otherwise draw the 12x24 table at scale 2. Same cell on the glass, but the
+/// [`DEFAULT_FONT`] baked at twice the size (24x48).
+///
+/// For a screen where the console would otherwise draw the 12x24 table at scale 2. Same cell on the glass, but the
 /// glyphs are rasterized from the outlines at that size rather than being a
 /// half-resolution bitmap with each pixel doubled -- smooth curves, real stems.
 pub const HD_FONT: &Font = &font::IBM_PLEX_MONO_HD;
 
-/// The same face at 20x40 — what a screen that would draw [`DEFAULT_FONT`] at
-/// scale 2 gets **by default** since 2026-10-03: 15 % smaller than
+/// The same face at 20x40.
+///
+/// What a screen that would draw [`DEFAULT_FONT`] at scale 2 gets **by default** since 2026-10-03: 15 % smaller than
 /// [`HD_FONT`], for more text on the 4K television (192x54 cells, not 160x45).
 pub const FONT_40: &Font = &font::IBM_PLEX_MONO_40;
 

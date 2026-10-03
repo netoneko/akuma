@@ -130,7 +130,7 @@ pub fn interrupt_interval(speed: Speed, b_interval: u8) -> u8 {
     match speed {
         Speed::Low | Speed::Full => {
             let micro = u32::from(b) * 8;
-            let exp = 31 - micro.leading_zeros();
+            let exp = micro.ilog2();
             exp.clamp(3, 10) as u8
         }
         Speed::High | Speed::Super => (b - 1).min(15),

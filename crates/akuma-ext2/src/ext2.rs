@@ -3977,18 +3977,18 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                 if size % block_size != 0 {
                     let block_off = (size % block_size) as usize;
                     let zero_len =
-                        core::cmp::min(length - size, (block_size - size % block_size) as u64) as usize;
+                        core::cmp::min(length - size, block_size - size % block_size) as usize;
                     let logical = (size / block_size) as u32;
                     let blk = self.ensure_block(&mut state, &mut inode, logical, true)?;
                     let mut data = self.read_block(&state, blk)?;
                     data[block_off..block_off + zero_len].fill(0);
-                    self.write_block(&mut state, blk, &data)?;
+                    self.write_block(&state, blk, &data)?;
                     size += zero_len as u64;
                 }
                 while size < length {
                     let logical = (size / block_size) as u32;
                     self.ensure_block(&mut state, &mut inode, logical, true)?;
-                    size += block_size as u64;
+                    size += block_size;
                 }
             } else if length < current_size {
                 // **Shrink.** Free what lies wholly past the new EOF, then

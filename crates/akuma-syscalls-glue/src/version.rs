@@ -121,6 +121,8 @@ pub(super) fn sys_akuma_get_version() -> u64 {
 }
 
 /// **The build identity — `uname -v`**: `<git-sha>-<profile>`, e.g.
-/// `2a81b72d-release-smp-shared`. The same string `uname(2)` reports, exported so a
+/// `2a81b72d-release-smp-shared`.
+///
+/// The same string `uname(2)` reports, exported so a
 /// banner or a splash screen can print it without a second copy that could drift.
 pub const BUILD_ID: &str = concat!(env!("AKUMA_GIT_SHA"), "-", env!("AKUMA_BUILD_PROFILE"));
