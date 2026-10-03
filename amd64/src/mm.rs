@@ -561,6 +561,12 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     let pages = len.div_ceil(PAGE_SIZE) as usize;
     let plan = akuma_syscalls_mem::mmap::plan(prot32, flags32, fd32, pages, EAGER_MAX_PAGES);
 
+    // `/dev/fb0`: the device's pixels, not a file's bytes — its own path, ahead
+    // of every file-mapping rule below (none of which apply to device memory).
+    if crate::fd::is_dev_fb(fd) {
+        return mmap_framebuffer(addr, len, prot32, flags32, offset);
+    }
+
     // File-backed mappings (2026-09-07). The refusal that used to live here was
     // right about the danger and too broad about the remedy — see the module
     // header's "What a file mapping is here".
@@ -914,6 +920,79 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         serial::puts(" us=");
         serial::put_dec(us);
         serial::puts("\n");
+    }
+    base as u64
+}
+
+/// `mmap` of `/dev/fb0`: map the boot framebuffer into ring 3,
+/// **write-combining**, eagerly.
+///
+/// The bounds and flag rules are `akuma_fbdev::mmap_check` (host-tested):
+/// `MAP_SHARED` only, page-aligned offset, inside the framebuffer, never
+/// executable. Each page is `akuma_mmu::UserAddressSpace::map_device_page`
+/// with `MemAttr::WriteCombine`, which sets the 4 KiB PTE's PAT bit — PAT entry
+/// 4, programmed WC on every core by `multiboot2::map_wc` — so stores from the
+/// program reach the screen at the same ~3 GB/s the console's own clear does,
+/// not the 71 MB/s an uncached mapping gives.
+///
+/// Eager because there is nothing to fault from: the pages exist, and a
+/// 3840x2160x4 screen is 8100 PTEs. The region is recorded like any other so
+/// `munmap`, `mprotect` and `fork` find it; the frames are **not** in the
+/// ledger and carry no share count, which is what keeps every teardown path
+/// from handing device memory to the page allocator (`unmap_range` frees only
+/// what the ledger tracks; `fork` maps a non-write-back leaf verbatim).
+fn mmap_framebuffer(addr: u64, len: u64, prot: u32, flags: u32, offset: u64) -> u64 {
+    use akuma_syscalls_linux::flags::map::{MAP_FIXED, MAP_SHARED};
+    let Some(g) = crate::fbdev::geometry() else { return errno::ENODEV };
+    let shared = flags & MAP_SHARED != 0;
+    let pages = match akuma_fbdev::mmap_check(len, offset, shared, prot & PROT_EXEC != 0, &g) {
+        Ok(p) => p as usize,
+        Err(akuma_fbdev::MapRefusal::Exec) => return errno::EACCES,
+        Err(akuma_fbdev::MapRefusal::Invalid) => return errno::EINVAL,
+    };
+    if !have_address_space() {
+        return errno::ESRCH;
+    }
+    let byte_len = pages * PAGE_SIZE as usize;
+    let base = if flags & MAP_FIXED != 0 {
+        let want = addr as usize;
+        if want.saturating_add(byte_len) > USER_VA_LIMIT {
+            return errno::EINVAL;
+        }
+        unmap_range(want, want + byte_len);
+        want
+    } else {
+        let Some(found) = usermode::with_current_regions_and_cursor(|regions, cursor| {
+            let hint = cursor.load(core::sync::atomic::Ordering::Relaxed);
+            let placed = find_free_va_from(regions, pages, hint).0;
+            if let Some(base) = placed {
+                cursor.store(base.saturating_add(byte_len), core::sync::atomic::Ordering::Relaxed);
+            }
+            placed
+        })
+        .flatten() else {
+            return errno::ENOMEM;
+        };
+        found
+    };
+    let region_prot = Prot::from_prot(prot);
+    usermode::with_current_regions(|regions| {
+        insert_region_sorted(regions, MmapRegion::inherited_with_prot(base, pages, region_prot));
+    });
+    let pte = PteProt::from_region(region_prot);
+    let phys = (g.phys + offset) as usize;
+    let mapped = usermode::with_current_address_space(|uas| {
+        (0..pages).all(|i| {
+            let off = i * PAGE_SIZE as usize;
+            uas.map_device_page(base + off, phys + off, pte, akuma_mmu::MemAttr::WriteCombine)
+        })
+    })
+    .unwrap_or(false);
+    if !mapped {
+        // Out of page-table frames partway: undo all of it. The device pages
+        // are untracked, so the unmap frees nothing but page tables' contents.
+        unmap_range(base, base + byte_len);
+        return errno::ENOMEM;
     }
     base as u64
 }
@@ -2395,19 +2474,26 @@ pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u6
     // it: the walk holds `&mut` on the address space, so the new mapping cannot
     // be installed from inside it. The `Vec` is sized by the source's
     // *residency*, and `mremap` is not the syscall that runs out of memory.
-    let mut moves: Vec<(usize, usize, PteProt, bool)> = Vec::new();
+    let mut moves: Vec<(usize, usize, PteProt, bool, akuma_mmu::MemAttr)> = Vec::new();
     let old_end = old_addr + old_pages * PAGE_SIZE as usize;
     let _ = usermode::with_current_address_space(|uas| {
         uas.rewrite_leaves_in_range(old_addr, old_end, |_ledger, leaf| {
             if !leaf.prot.user {
                 return LeafAction::Keep;
             }
-            moves.push((leaf.va, leaf.pa, leaf.prot, leaf.cow));
+            moves.push((leaf.va, leaf.pa, leaf.prot, leaf.cow, leaf.attr));
             LeafAction::Unmap
         });
-        for &(va, pa, prot, cow) in &moves {
+        for &(va, pa, prot, cow, attr) in &moves {
             let offset = va - old_addr;
-            if !uas.map_page_pte(base + offset, pa, prot, cow) {
+            // A device page keeps its cache type (a moved `/dev/fb0` mapping
+            // stays write-combining); RAM is mapped as before.
+            let moved = if attr == akuma_mmu::MemAttr::WriteBack {
+                uas.map_page_pte(base + offset, pa, prot, cow)
+            } else {
+                uas.map_device_page(base + offset, pa, prot, attr)
+            };
+            if !moved {
                 // Out of page-table frames partway through. The pages already
                 // moved are reachable at the new address and the region record
                 // covers them, so nothing leaks and nothing is lost — the
@@ -2544,6 +2630,12 @@ fn dontneed_range(start: usize, end: usize) {
             let (va, pa) = (leaf.va, leaf.pa);
             // A kernel page in a user range is not ring 3's to zero.
             if !leaf.prot.user {
+                return LeafAction::Keep;
+            }
+            // Device memory (`/dev/fb0`) is not the program's to zero or to
+            // replace with RAM: Linux's DONTNEED on it drops and re-faults the
+            // same pixels, i.e. changes nothing visible. Keep it.
+            if leaf.attr != akuma_mmu::MemAttr::WriteBack {
                 return LeafAction::Keep;
             }
             let Some(region) = regions.iter().find(|r| r.contains(va)) else {

@@ -1605,7 +1605,18 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // error), and the boot suite had to have a **process identity**, since
         // every descriptor-freeing arm in glue resolves
         // `current_process_shared()` first.
-        Syscall::Close => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::Close => {
+            // Closing a `/dev/fb0` descriptor gives the screen back to the
+            // console (`fbdev`). Any one of the owner's descriptors: POSIX
+            // record locks follow the same rule, and a program holding two
+            // `fb0` fds is not a case anything here produces.
+            if crate::fd::is_dev_fb(a1)
+                && let Some(p) = current_process()
+            {
+                crate::fbdev::release(p.tgid);
+            }
+            to_glue(call, [a1, 0, 0, 0, 0, 0])
+        }
         // `lseek(fd, offset, whence)` — **glue's arm behind one preamble**
         // (4b batch 3a): a `/dev` character node, which Linux seeks to the
         // offset asked for and glue answers `0`/`ESPIPE` for. Not routed
@@ -3140,6 +3151,17 @@ fn share_parent_memory_into(
         let (va, pa) = (leaf.va, leaf.pa);
         let frame = PhysFrame::new(pa);
 
+        // A device page (`/dev/fb0`'s write-combining framebuffer) is not PMM
+        // RAM: no share count, no ledger entry, no copy-on-write — the child
+        // simply maps the same device memory the same way. Counting it would
+        // hand the framebuffer to the page allocator when the child exits.
+        if leaf.attr != akuma_mmu::MemAttr::WriteBack {
+            if !child_space.map_device_page(va, pa, leaf.prot, leaf.attr) {
+                ok = false;
+            }
+            return LeafAction::Keep;
+        }
+
         // `MAP_SHARED | MAP_ANONYMOUS`: one object, not two copies.
         //
         // Everything else in an address space is private, so fork demotes it
@@ -3547,6 +3569,10 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // writable page table. After the drain, so no sibling can fault a page
     // back in behind it. See `mm::release_shared_write_mappings`.
     crate::mm::release_shared_write_mappings();
+    // A process that owned `/dev/fb0` hands the screen back as it exits.
+    if let Some(p) = current_process() {
+        crate::fbdev::release(p.tgid);
+    }
     if let Some(fds) = exit_fds {
         fds.close_all();
     }

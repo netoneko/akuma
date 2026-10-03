@@ -341,6 +341,12 @@ pub fn pump_once() -> bool {
         moved = true;
     }
 
+    // A `/dev/fb0` owner that died without reaching its release path gets the
+    // screen taken back here. One atomic load when nobody owns it.
+    if !moved {
+        crate::fbdev::poll_owner();
+    }
+
     // Output has gone quiet: put the cursor where typing will land. Idempotent
     // and `try_lock`ed, so doing it on every idle lap costs a comparison.
     if !moved && let Some((rows, cols)) = crate::multiboot2::cursor_idle() {

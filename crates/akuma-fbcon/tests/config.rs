@@ -45,7 +45,7 @@ fn comments_blank_lines_unknown_keys_and_junk_are_ignored() {
     let c = ConsoleConfig::parse(
         "\n   \n# only a comment\nfont = comic sans\nthis is not a setting\ncols = 40 # trailing comment\n= 5\nrows = banana\n",
     );
-    assert_eq!(c, ConsoleConfig { margin: None, cols: Some(Dim::Cells(40)), rows: None });
+    assert_eq!(c, ConsoleConfig { margin: None, cols: Some(Dim::Cells(40)), rows: None, font_height: None });
 }
 
 #[test]
@@ -104,4 +104,31 @@ fn an_empty_config_changes_nothing() {
     let before = (con.rows(), con.cols(), con.margin());
     con.apply_config(&ConsoleConfig::default());
     assert_eq!((con.rows(), con.cols(), con.margin()), before);
+}
+
+/// `font = 40` and `font = 20x40` name the same cut; garbage is ignored.
+#[test]
+fn font_takes_a_height_or_a_cell() {
+    assert_eq!(ConsoleConfig::parse("font = 40").font_height, Some(40));
+    assert_eq!(ConsoleConfig::parse("font = 20x40").font_height, Some(40));
+    assert_eq!(ConsoleConfig::parse("font = big").font_height, None);
+    assert_eq!(ConsoleConfig::parse("margin = 0").font_height, None);
+}
+
+/// The television's default is the 20x40 cut — 15 % smaller than the 24x48 it
+/// replaced — and `font =` switches cuts with the grid following.
+#[test]
+fn the_4k_default_is_20x40_and_font_switches_cuts() {
+    use akuma_fbcon::console::{FONT_40, HD_FONT};
+    assert!(core::ptr::eq(Console::<Mem>::choose_font(3840, 2160), FONT_40));
+    let mut c = Console::new(Mem(3840, 2160, 0)).expect("console");
+    assert_eq!((c.font().width(), c.font().height()), (20, 40));
+    let (rows40, cols40) = (c.rows(), c.cols());
+    assert!(cols40 > 160, "more columns than the 24x48 cut's 160: got {cols40}");
+    let (rows, cols) = c.apply_config(&ConsoleConfig::parse("font = 48"));
+    assert!(core::ptr::eq(c.font(), HD_FONT));
+    assert!(rows < rows40 && cols < cols40, "48 is bigger: {rows}x{cols} vs {rows40}x{cols40}");
+    let (_, cols32) = c.apply_config(&ConsoleConfig::parse("font = 32"));
+    assert!(cols32 > cols40);
+    assert!(Console::<Mem>::font_by_height(33).is_none());
 }

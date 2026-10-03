@@ -354,6 +354,9 @@ akuma-fpcache = { path = "../crates/akuma-fpcache" }
 # `MAP_SHARED` file mapping, shared by every process that maps it, for as long
 # as any does — the coherence SQLite's WAL index needs. `src/shmpages.rs`.
 akuma-fpcache-rw = { path = "../crates/akuma-fpcache-rw" }
+# `/dev/fb0`'s decisions (ioctl answers, FBIOPUT acceptance, single owner,
+# mmap bounds), host-tested. `src/fbdev.rs` is the device.
+akuma-fbdev = { path = "../crates/akuma-fbdev" }
 # The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
 # table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
 # `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own

@@ -430,17 +430,20 @@ fn the_font_falls_back_only_on_a_screen_that_needs_it() {
 /// cut instead: the same cell on the glass, so the grid must not change, and the
 /// scale is 1 -- glyphs rasterized at 24x48, not 12x24 with every pixel repeated.
 #[test]
-fn a_4k_screen_gets_the_hd_cut_with_the_same_grid() {
+fn a_4k_screen_gets_the_20x40_cut_and_more_text() {
+    // Since 2026-10-03 the 4K default is 15 % smaller than the HD (24x48) cut
+    // it used to pick — more text per screen on the television.
     type C = Console<MemSurface>;
     let (w, h) = (3840, 2160);
     assert_eq!(C::auto_scale(DEFAULT_FONT, h), 2, "premise: the default would be doubled");
     let font = C::choose_font(w, h);
-    assert_eq!(font.name(), akuma_fbcon::console::HD_FONT.name());
-    assert_eq!((font.width(), font.height()), (2 * DEFAULT_FONT.width(), 2 * DEFAULT_FONT.height()));
+    assert_eq!(font.name(), akuma_fbcon::console::FONT_40.name());
+    assert_eq!((font.width(), font.height()), (20, 40));
     assert_eq!(C::auto_scale(font, h), 1);
-    let old = C::grid_for(DEFAULT_FONT, w, h, 2).unwrap();
-    assert_eq!(C::grid_for(font, w, h, 1).unwrap(), old, "the grid moved");
-    assert_eq!(old, (157, 44));
+    let hd = C::grid_for(akuma_fbcon::console::HD_FONT, w, h, 1).unwrap();
+    let now = C::grid_for(font, w, h, 1).unwrap();
+    assert_eq!(hd, (157, 44), "the old grid");
+    assert!(now.0 > hd.0 && now.1 > hd.1, "more cells than {hd:?}: {now:?}");
 }
 
 /// The HD cut is the same typeface, not a different one: every ASCII glyph's ink

@@ -143,6 +143,9 @@ impl Surface for Framebuffer {
     /// per-pixel default. Clipped to the surface like `put`.
     #[allow(clippy::cast_ptr_alignment, clippy::many_single_char_names)]
     fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, color: Rgb) {
+        if FB_MUTED.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let x1 = x.saturating_add(w).min(self.width);
         let y1 = y.saturating_add(h).min(self.height);
         if x >= x1 || y >= y1 {
@@ -187,7 +190,7 @@ impl Surface for Framebuffer {
     // the pixel size, so the cast never misaligns; clippy cannot see that.
     #[allow(clippy::cast_ptr_alignment)]
     fn put(&mut self, x: usize, y: usize, color: Rgb) {
-        if x >= self.width || y >= self.height {
+        if x >= self.width || y >= self.height || FB_MUTED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let px = self.format.encode(color);
@@ -375,6 +378,37 @@ fn map_wc(phys: u64, len: u64) -> bool {
     }
     WC_ON.store(true, core::sync::atomic::Ordering::Release);
     true
+}
+
+/// A program owns the screen through `/dev/fb0` (`crate::fbdev`): every pixel
+/// write the console makes is dropped. The console itself keeps running — bytes
+/// still reach its grid, the cursor still moves — so handing the screen back is
+/// a repaint ([`fb_unmute_and_repaint`]), not a loss of everything printed
+/// meanwhile. Read on every `fill`/`put`; a relaxed load is the whole cost.
+static FB_MUTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stop the console drawing: a `/dev/fb0` owner has the pixels.
+pub fn fb_mute() {
+    FB_MUTED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Give the screen back to the console and redraw it from its grid.
+///
+/// Blocking `lock`: called from `close`/exit and from the console pump, never
+/// from an interrupt or fault path (that is [`fb_force_unmute`]).
+pub fn fb_unmute_and_repaint() {
+    FB_MUTED.store(false, core::sync::atomic::Ordering::Release);
+    let mut g = CONSOLE.lock();
+    if let Some(c) = g.as_mut() {
+        c.0.repaint();
+        c.0.surface_mut().flush();
+    }
+}
+
+/// The crash path's unmute: no lock, no repaint — the fatal dump that follows
+/// draws over whatever the program left, which is the point.
+pub fn fb_force_unmute() {
+    FB_MUTED.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// TSC cycles the boot-time full-screen clear took (see `kmain_mb2`); reported by
@@ -655,6 +689,17 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         ega_text(1, "FAIL: framebuffer lies above the mapped 4 GiB");
         crate::halt();
     };
+    // The same framebuffer, offered to userspace as `/dev/fb0` (`fbdev`).
+    crate::fbdev::register(akuma_fbdev::Geometry {
+        phys: fb.addr,
+        width: fb.width,
+        height: fb.height,
+        pitch: fb.pitch,
+        bpp: u32::from(fb.bpp),
+        red: akuma_fbdev::Channel { pos: fb.format.red_pos, len: fb.format.red_size },
+        green: akuma_fbdev::Channel { pos: fb.format.green_pos, len: fb.format.green_size },
+        blue: akuma_fbdev::Channel { pos: fb.format.blue_pos, len: fb.format.blue_size },
+    });
 
     // Colour before glyphs: the smallest proof that address, pitch and pixel
     // format are all right, with no font and almost no stack involved.

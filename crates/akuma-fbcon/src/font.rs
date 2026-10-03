@@ -42,6 +42,8 @@
 
 include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono.rs"));
 include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono_hd.rs"));
+include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono_32.rs"));
+include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono_40.rs"));
 include!(concat!(env!("OUT_DIR"), "/spleen.rs"));
 
 /// A fixed-cell font: one coverage value per pixel, one cell per baked code point.

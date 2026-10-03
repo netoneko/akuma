@@ -96,6 +96,7 @@ dependencies = [
  "akuma-exec-core",
  "akuma-ext2",
  "akuma-fbcon",
+ "akuma-fbdev",
  "akuma-fpcache",
  "akuma-fpcache-rw",
  "akuma-hda",

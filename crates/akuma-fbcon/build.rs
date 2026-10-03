@@ -108,6 +108,8 @@ fn main() {
 
     emit(&ibm_plex_mono(&PLEX_SD), &out);
     emit(&ibm_plex_mono(&PLEX_HD), &out);
+    emit(&ibm_plex_mono(&PLEX_32), &out);
+    emit(&ibm_plex_mono(&PLEX_40), &out);
     emit(&spleen(), &out);
 }
 
@@ -188,6 +190,29 @@ const PLEX_HD: PlexSize = PlexSize {
     name: "IBM Plex Mono HD",
     width: PLEX_HD_WIDTH,
     height: PLEX_HD_HEIGHT,
+    gamma: HD_COVERAGE_GAMMA,
+};
+
+/// Two cuts between the 12x24 and the 24x48 (2026-10-03): the console on the
+/// 4K television defaults to 20x40 — 15 % smaller than the HD cut, so a goose
+/// session shows 192x54 cells instead of 160x45 — and `/etc/console.conf`'s
+/// `font = 32|40|48|24` picks any of the four (`Console::font_by_height`).
+/// Same gamma as the HD cut: these are drawn at scale 1 too.
+const PLEX_32: PlexSize = PlexSize {
+    ident: "IBM_PLEX_MONO_32",
+    stem: "ibm_plex_mono_32",
+    name: "IBM Plex Mono 16x32",
+    width: 16,
+    height: 32,
+    gamma: HD_COVERAGE_GAMMA,
+};
+
+const PLEX_40: PlexSize = PlexSize {
+    ident: "IBM_PLEX_MONO_40",
+    stem: "ibm_plex_mono_40",
+    name: "IBM Plex Mono 20x40",
+    width: 20,
+    height: 40,
     gamma: HD_COVERAGE_GAMMA,
 };
 

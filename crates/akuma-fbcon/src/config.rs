@@ -59,6 +59,10 @@ pub struct ConsoleConfig {
     pub margin: Option<(usize, usize)>,
     pub cols: Option<Dim>,
     pub rows: Option<Dim>,
+    /// `font = 40` (or `font = 20x40`): the cell height of the baked cut to
+    /// use — 24, 32, 40 or 48 (`Console::font_by_height`). An unknown size is
+    /// ignored.
+    pub font_height: Option<usize>,
 }
 
 impl ConsoleConfig {
@@ -78,6 +82,11 @@ impl ConsoleConfig {
                         let y = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(x);
                         cfg.margin = Some((x, y));
                     }
+                }
+                // The last number is the height: `40` and `20x40` both mean 40.
+                "font" => {
+                    let h = value.rsplit(['x', 'X']).next().unwrap_or(value).trim();
+                    cfg.font_height = h.parse().ok().or(cfg.font_height);
                 }
                 "cols" => cfg.cols = Dim::parse(value).or(cfg.cols),
                 "rows" => cfg.rows = Dim::parse(value).or(cfg.rows),
@@ -101,6 +110,13 @@ impl<S: Surface> Console<S> {
     ///
     /// Returns the printing area now in force as `(rows, columns)`.
     pub fn apply_config(&mut self, cfg: &ConsoleConfig) -> (usize, usize) {
+        // The font first: it decides the cell, which the margin and the
+        // printing area are then measured in.
+        if let Some(font) = cfg.font_height.and_then(Self::font_by_height)
+            && !core::ptr::eq(font, self.font())
+        {
+            self.set_font(font);
+        }
         if let Some((mx, my)) = cfg.margin {
             self.set_margin(mx, my);
         }

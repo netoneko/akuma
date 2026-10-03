@@ -23,6 +23,18 @@ pub const DEFAULT_FONT: &Font = &font::IBM_PLEX_MONO;
 /// half-resolution bitmap with each pixel doubled -- smooth curves, real stems.
 pub const HD_FONT: &Font = &font::IBM_PLEX_MONO_HD;
 
+/// The same face at 20x40 — what a screen that would draw [`DEFAULT_FONT`] at
+/// scale 2 gets **by default** since 2026-10-03: 15 % smaller than
+/// [`HD_FONT`], for more text on the 4K television (192x54 cells, not 160x45).
+pub const FONT_40: &Font = &font::IBM_PLEX_MONO_40;
+
+/// The same face at 16x32, for `font = 32` in `/etc/console.conf`.
+pub const FONT_32: &Font = &font::IBM_PLEX_MONO_32;
+
+/// Every baked cut of the default face, by cell height — what
+/// `/etc/console.conf`'s `font =` chooses among ([`Console::font_by_height`]).
+pub const PLEX_CUTS: [&Font; 4] = [DEFAULT_FONT, FONT_32, FONT_40, HD_FONT];
+
 /// The font used instead when [`DEFAULT_FONT`]'s cell is too big for the screen.
 ///
 /// Half the height of the default, so it buys back rows on a framebuffer where
@@ -49,9 +61,13 @@ const MIN_ROWS: usize = 24;
 /// A 4K screen at the smallest scale this crate will choose is under this; the
 /// grid is a fixed array because a kernel console must not depend on an
 /// allocator that may be what broke.
-pub const MAX_COLS: usize = 160;
+///
+/// 240x68 since 2026-10-03, so the 16x32 cut fills a 3840x2160 screen (the
+/// old 160x56 was exactly 3840/24 and would have clamped every smaller font
+/// back to 24-pixel-wide columns' worth of text). 98 KiB of cells.
+pub const MAX_COLS: usize = 240;
 /// Tallest grid the console will use.
-pub const MAX_ROWS: usize = 56;
+pub const MAX_ROWS: usize = 68;
 
 /// Target number of text rows [`Console::auto_scale`] aims for.
 ///
@@ -377,7 +393,11 @@ impl<S: Surface> Console<S> {
         // glyph rasterized at that size instead of doubled. Its own `auto_scale` is
         // 1 across the whole range where the default's is 2 (heights 1728..3455),
         // so the grid is unchanged.
-        let default = if Self::auto_scale(DEFAULT_FONT, height) == 2 { HD_FONT } else { DEFAULT_FONT };
+        //
+        // Since 2026-10-03 that screen gets [`FONT_40`] instead: 15 % smaller
+        // than the HD cut, more text per screen. `font = 48` in
+        // `/etc/console.conf` brings the HD cut back.
+        let default = if Self::auto_scale(DEFAULT_FONT, height) == 2 { FONT_40 } else { DEFAULT_FONT };
         match (grid(default), grid(FALLBACK_FONT)) {
             (Some((cols, rows)), _) if cols >= MIN_COLS && rows >= MIN_ROWS => default,
             // Nothing to fall back to, including the case where neither font
@@ -517,6 +537,39 @@ impl<S: Surface> Console<S> {
         self.col = self.col.min(nc);
         self.top = 0;
         self.bot = nr - 1;
+    }
+
+    /// The baked cut of the default face whose cell is `height` pixels tall
+    /// (24, 32, 40 or 48), or `None`.
+    #[must_use]
+    pub fn font_by_height(height: usize) -> Option<&'static Font> {
+        PLEX_CUTS.iter().copied().find(|f| f.height() == height)
+    }
+
+    /// Switch to `font` at scale 1 — `/etc/console.conf`'s `font =`.
+    ///
+    /// Like [`Console::set_margin`]: the grid is recomputed for the current
+    /// margin, the screen is cleared (every cell moved), the printing area goes
+    /// back to the whole grid, and the new size is reported once through
+    /// [`Console::take_geometry`]. `false`, with nothing changed, when the font
+    /// would not fit a single cell.
+    pub fn set_font(&mut self, font: &'static Font) -> bool {
+        let (w, h) = (self.surface.width(), self.surface.height());
+        let (mx, my) = (self.origin_x, self.origin_y);
+        let (cw, ch) = (font.width(), font.height());
+        if cw == 0 || ch == 0 || w.saturating_sub(2 * mx) < cw || h.saturating_sub(2 * my) < ch {
+            return false;
+        }
+        self.hide_cursor();
+        self.font = font;
+        self.scale = 1;
+        self.cols = (w.saturating_sub(2 * mx) / cw).clamp(1, MAX_COLS);
+        self.rows = (h.saturating_sub(2 * my) / ch).clamp(1, MAX_ROWS);
+        self.vcols = self.cols;
+        self.vrows = self.rows;
+        self.clear_screen();
+        self.geometry_dirty = true;
+        true
     }
 
     /// Move the text area in from the screen edges by `mx` pixels left and right and

@@ -186,6 +186,7 @@ pub mod errno {
     pub const ENFILE: u64 = (-23i64) as u64;
     pub const ENOTTY: u64 = (-25i64) as u64;
     pub const ENODEV: u64 = (-19i64) as u64;
+    pub const EBUSY: u64 = (-16i64) as u64;
     pub const ENOSYS: u64 = (-38i64) as u64;
     pub const ESRCH: u64 = (-3i64) as u64;
     /// No child to wait for. Distinct from [`ESRCH`] on purpose: a shell tests
@@ -521,6 +522,31 @@ fn dev_node_of(fd: u64) -> Option<&'static str> {
     .flatten()
 }
 
+/// `open("/dev/fb0")`: take the screen for the calling thread group and hand
+/// back a `DevFb` descriptor. See `crate::fbdev`.
+fn open_framebuffer(flags: u32) -> u64 {
+    if crate::fbdev::geometry().is_none() {
+        return errno::ENOENT;
+    }
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return errno::ESRCH;
+    };
+    if let Err(e) = crate::fbdev::open(proc.tgid) {
+        return e;
+    }
+    let fd = proc.alloc_fd(FileDescriptor::DevFb);
+    if flags & open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    u64::from(fd)
+}
+
+/// Is `fd` a `/dev/fb0` descriptor?
+#[must_use]
+pub fn is_dev_fb(fd: u64) -> bool {
+    table_with(fd, |d| matches!(d, FileDescriptor::DevFb)).unwrap_or(false)
+}
+
 /// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
 #[must_use]
 pub fn pipe_write_id(fd: u64) -> Option<usize> {
@@ -716,6 +742,14 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     let Ok(resolved) = akuma_syscalls_glue::fs::resolve_path_at(dirfd as i32, &raw) else {
         return errno::EBADF;
     };
+
+    // `/dev/fb0` is this kernel's own device, not glue's: the screen's owner
+    // is decided here (`fbdev::open`, `EBUSY` for a second process) and the
+    // descriptor is a `DevFb`, which `mmap`, `ioctl`, `fstat` and `close`
+    // recognise. A machine with no boot framebuffer has no node at all.
+    if resolved == "/dev/fb0" {
+        return open_framebuffer(flags);
+    }
 
     // A **block** node is refused rather than served — see the header. A
     // table lookup, no I/O, so it is asked unconditionally.
@@ -1511,6 +1545,20 @@ const STAT_SIZE: usize = core::mem::size_of::<akuma_syscalls_abi::stat::X8664>()
 /// failed on standard output: Bad file descriptor` after writing the whole
 /// pack.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
+    // `/dev/fb0`: a character device, major 29 minor 0, size 0 — what Linux
+    // reports for an fbdev node (the size is `FBIOGET_FSCREENINFO`'s business).
+    if is_dev_fb(fd) {
+        let g = akuma_syscalls_linux::Stat {
+            st_ino: 17,
+            st_mode: 0o020_660,
+            st_nlink: 1,
+            st_rdev: (29 << 8),
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
+    }
     if crate::usermode::current_process().is_none() && console_end(fd).is_some() && !is_bound(fd) {
         // `S_IFCHR | 0620`, size 0 — the answer the old `encode_stat` gave, in
         // the x86_64 layout the converter also produces.
@@ -1885,6 +1933,10 @@ pub fn sys_access(path: u64) -> u64 {
 ///   boot task can be in that state, and `boot_row_register` is the answer the
 ///   suite already uses for it (4b batch 2b).
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
+    // The fbdev requests, on a `/dev/fb0` descriptor only.
+    if is_dev_fb(fd) {
+        return crate::fbdev::ioctl(req as u32, arg);
+    }
     // The by-number/by-descriptor console, plus a `/dev/tty` fd. See the header:
     // the `fd < FIRST_FILE_FD` term is the fake tty and is the reason this
     // preamble exists at all.

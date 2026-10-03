@@ -307,6 +307,8 @@ pub fn begin_fatal() -> bool {
     // The dump is for the screen too: see `FB_QUIET` — and a boot splash gives way
     // to it (best effort, never waiting on the console).
     crate::splash::crash();
+    // A program drawing through `/dev/fb0` does not get to hide a crash.
+    crate::multiboot2::fb_force_unmute();
     FB_QUIET.store(false, Ordering::Release);
     FATAL_ACTIVE.swap(true, Ordering::AcqRel)
 }

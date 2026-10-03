@@ -73,6 +73,9 @@ mod dns;
 mod exec_runtime;
 #[cfg(target_arch = "x86_64")]
 mod fd;
+/// `/dev/fb0`: the boot framebuffer as a Linux fbdev device.
+#[cfg(target_arch = "x86_64")]
+mod fbdev;
 #[cfg(target_arch = "x86_64")]
 mod fs;
 /// `futex(2)`: the effects half, over `akuma-syscalls-sync`'s decisions.
