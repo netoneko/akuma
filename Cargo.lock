@@ -277,6 +277,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-fbdev"
+version = "0.1.0"
+dependencies = [
+ "akuma-syscalls-linux",
+]
+
+[[package]]
 name = "akuma-fdt"
 version = "0.1.0"
 dependencies = [

@@ -2824,6 +2824,11 @@ pub struct Leaf {
     /// software-defined — see [`X86_COW`] and `akuma-cow`, which takes the
     /// marker as its own input for exactly this reason.
     pub cow: bool,
+    /// How the page is cached, decoded from `PWT`/`PCD`/`PAT`. Anything but
+    /// [`MemAttr::WriteBack`] is **not RAM the PMM handed out** — a device
+    /// window such as a `/dev/fb0` mapping — and a caller that refcounts,
+    /// tracks or copies frames (fork, `MADV_DONTNEED`) must leave it alone.
+    pub attr: MemAttr,
 }
 
 /// What [`UserAddressSpace::rewrite_leaves_in_range`] should do with a leaf.
@@ -2918,6 +2923,14 @@ pub enum MemAttr {
     /// method should not have to reinvent this half.
     #[allow(dead_code)]
     Device,
+    /// Write-combining: stores gather in the CPU's WC buffers and leave as
+    /// full-line bursts; reads are uncached. For a framebuffer mapped into ring
+    /// 3 (`/dev/fb0`, 2026-10-03). Encoded as the 4 KiB PTE's **PAT bit (7)**
+    /// with `PWT = PCD = 0`, which selects PAT entry 4 — the entry
+    /// `amd64/src/multiboot2.rs::map_wc` programs to WC on every core. On a core
+    /// where that never happened entry 4 is the firmware's WB, which under the
+    /// framebuffer's UC MTRR is UC: slow, never wrong.
+    WriteCombine,
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -2932,6 +2945,14 @@ const X86_PWT: u64 = 1 << 3;
 const X86_PCD: u64 = 1 << 4;
 #[cfg(any(target_arch = "x86_64", test))]
 const X86_PS: u64 = 1 << 7;
+/// Bit 7 of a **4 KiB leaf** is the PAT selector, not `PS` — the same bit
+/// position means "large page" one level up. Only ever written into a level-1
+/// entry, by [`MemAttr::WriteCombine`].
+#[cfg(any(target_arch = "x86_64", test))]
+const X86_PAT_4K: u64 = 1 << 7;
+/// The cache-type bits of a 4 KiB leaf: what `Reprotect` must carry across.
+#[cfg(any(target_arch = "x86_64", test))]
+const X86_CACHE_MASK: u64 = X86_PWT | X86_PCD | X86_PAT_4K;
 /// No-execute. Requires `EFER.NXE`, which `amd64/src/boot.s` sets alongside
 /// `LME` — without it this is a reserved bit and setting it faults. Any
 /// x86_64 kernel that links this crate without doing the same will fault the
@@ -2962,8 +2983,22 @@ const fn x86_encode(prot: PteProt, attr: MemAttr) -> u64 {
     match attr {
         MemAttr::WriteBack => {}
         MemAttr::Device => bits |= X86_PCD | X86_PWT,
+        MemAttr::WriteCombine => bits |= X86_PAT_4K,
     }
     bits
+}
+
+/// The [`MemAttr`] a 4 KiB leaf's cache bits mean — the inverse of the `attr`
+/// half of [`x86_encode`] for the three shapes it writes. Any other
+/// combination (a PWT-only or PCD-only entry, which nothing here writes) reads
+/// as `Device`: not RAM, so not something a caller may refcount.
+#[cfg(any(target_arch = "x86_64", test))]
+const fn x86_decode_attr(entry: u64) -> MemAttr {
+    match entry & X86_CACHE_MASK {
+        0 => MemAttr::WriteBack,
+        X86_PAT_4K => MemAttr::WriteCombine,
+        _ => MemAttr::Device,
+    }
 }
 
 /// Index into the level-`n` table for `va`. Level 4 = PML4 … level 1 = PT.
@@ -3376,6 +3411,7 @@ fn x86_walk_leaves(
                             user: entry & X86_US != 0,
                         },
                         cow: entry & X86_COW != 0,
+                        attr: x86_decode_attr(entry),
                     };
                     match f(ledger, leaf) {
                         LeafAction::Keep => {}
@@ -3385,7 +3421,13 @@ fn x86_walk_leaves(
                             edited = true;
                         }
                         LeafAction::Reprotect(prot, cow) => {
+                            // Same frame, so the same cache type: keep the old
+                            // entry's PWT/PCD/PAT. Re-encoding as WriteBack
+                            // turned an `mprotect` over a `/dev/fb0` mapping
+                            // into a 40x slower one (WC lost), and would have
+                            // made a device page cacheable.
                             let rewritten = (entry & X86_ADDR_MASK)
+                                | (entry & X86_CACHE_MASK)
                                 | x86_encode(prot, MemAttr::WriteBack)
                                 | if cow { X86_COW } else { 0 };
                             slot.write_volatile(rewritten);
@@ -3712,6 +3754,15 @@ impl UserAddressSpace {
     #[must_use = "`false` means the PTE was NOT installed"]
     pub fn map_page_pte(&mut self, va: usize, pa: usize, prot: PteProt, cow: bool) -> bool {
         x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack, cow, &self.ledger)
+    }
+
+    /// [`map_page_pte`](Self::map_page_pte) with an explicit cache type, for a
+    /// page that is **not PMM RAM** — a device window such as the framebuffer
+    /// behind `/dev/fb0` (`MemAttr::WriteCombine`). Never CoW-marked and never
+    /// tracked: there is no frame to share, count or free.
+    #[must_use = "`false` means the PTE was NOT installed"]
+    pub fn map_device_page(&mut self, va: usize, pa: usize, prot: PteProt, attr: MemAttr) -> bool {
+        x86_map_page_in(self.root as u64, va, pa, prot, attr, false, &self.ledger)
     }
 
     /// [`map_page_pte`](Self::map_page_pte) plus a ledger entry for the frame.
@@ -5315,6 +5366,23 @@ mod x86_encoding_tests {
         assert_eq!(via_u64(user_flags::RX), 0x0000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::RO_NO_EXEC), 0x8000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::NONE), 0x8000_0000_0000_0001);
+    }
+
+    /// Write-combining is the 4 KiB PAT bit alone (PAT entry 4), and every
+    /// attribute decodes back to itself — `Reprotect` and fork both rely on
+    /// reading the type off a live entry.
+    #[test]
+    fn write_combine_is_the_pat_bit_and_attrs_round_trip() {
+        use super::{x86_decode_attr, X86_CACHE_MASK, X86_PAT_4K};
+        let rw = PteProt::from_region(Prot::RW);
+        let wc = x86_encode(rw, MemAttr::WriteCombine);
+        assert_eq!(wc & X86_CACHE_MASK, X86_PAT_4K);
+        assert_eq!(X86_PAT_4K, 1 << 7);
+        assert_eq!(wc & !X86_CACHE_MASK, x86_encode(rw, MemAttr::WriteBack), "only the cache bits differ");
+        for a in [MemAttr::WriteBack, MemAttr::Device, MemAttr::WriteCombine] {
+            assert_eq!(x86_decode_attr(x86_encode(rw, a) | 0x1234_5000), a, "{a:?}");
+        }
+        assert_eq!(wc & X86_COW, 0, "the PAT bit is not the CoW marker");
     }
 
     /// The CoW marker is bit 9 and is not one of the bits `x86_encode` writes —

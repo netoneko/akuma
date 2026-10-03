@@ -90,6 +90,12 @@ const AUDIO_NODES: &[DevNode] = &[
     DevNode { name: "audio", is_block: false, perm: 0o666, major: 14, minor: 4, ino: 15 },
 ];
 
+/// The framebuffer, when the kernel has one to offer (the amd64 kernel booted
+/// through GRUB with a direct-colour mode). Major 29 is Linux's `FB_MAJOR`.
+const FB_NODES: &[DevNode] = &[
+    DevNode { name: "fb0", is_block: false, perm: 0o660, major: 29, minor: 0, ino: 17 },
+];
+
 /// `vda`..`vdd`, gated per-slot on [`DevProbe::block_slots`]. Spelled out
 /// rather than computed so the whole table is static data the lookup can
 /// borrow from. `254` is virtio-blk's major; the minor spacing of 16 mirrors
@@ -110,6 +116,8 @@ const BLOCK_NODES: &[DevNode; MAX_BLOCK_SLOTS] = &[
 pub struct DevProbe {
     /// A virtio-sound device was found at boot (`audio::is_available()`).
     pub audio: bool,
+    /// A framebuffer is available to userspace (`/dev/fb0`).
+    pub framebuffer: bool,
     /// Bit `i` set means block slot `i` is populated, i.e. `vd{a+i}` exists.
     pub block_slots: u8,
     /// The caller runs inside a box (`box_id != 0`).
@@ -150,6 +158,7 @@ fn all_nodes(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
     STATIC_NODES
         .iter()
         .chain(AUDIO_NODES.iter().filter(move |_| probe.audio))
+        .chain(FB_NODES.iter().filter(move |_| probe.framebuffer))
         .chain(
             BLOCK_NODES
                 .iter()
@@ -189,7 +198,7 @@ mod tests {
 
     /// A host probe: sound device present, two disks, not in a box.
     fn host() -> DevProbe {
-        DevProbe { audio: true, block_slots: 0b0011, in_box: false }
+        DevProbe { audio: true, framebuffer: false, block_slots: 0b0011, in_box: false }
     }
 
     /// Collecting is the test's own convenience — the crate itself never does.
@@ -253,7 +262,7 @@ mod tests {
 
     #[test]
     fn inodes_are_unique() {
-        let p = DevProbe { audio: true, block_slots: 0b1111, in_box: false };
+        let p = DevProbe { audio: true, framebuffer: false, block_slots: 0b1111, in_box: false };
         let mut inos: Vec<u64> = list(p).map(|n| n.ino).collect();
         let total = inos.len();
         inos.sort_unstable();
@@ -264,7 +273,7 @@ mod tests {
     /// Every table entry must be reachable by name, or it can never be `stat`ed.
     #[test]
     fn every_listed_node_is_also_lookupable() {
-        let p = DevProbe { audio: true, block_slots: 0b1111, in_box: false };
+        let p = DevProbe { audio: true, framebuffer: false, block_slots: 0b1111, in_box: false };
         for node in list(p) {
             assert_eq!(lookup(p, node.name).as_ref(), Some(node), "{}", node.name);
         }
@@ -272,13 +281,13 @@ mod tests {
 
     #[test]
     fn a_box_gets_no_listing_at_all() {
-        let p = DevProbe { audio: true, block_slots: 0b1111, in_box: true };
+        let p = DevProbe { audio: true, framebuffer: true, block_slots: 0b1111, in_box: true };
         assert_eq!(list(p).count(), 0);
     }
 
     #[test]
     fn a_box_never_sees_host_hardware() {
-        let p = DevProbe { audio: true, block_slots: 0b1111, in_box: true };
+        let p = DevProbe { audio: true, framebuffer: true, block_slots: 0b1111, in_box: true };
         for name in ["vda", "vdb", "vdc", "vdd", "dsp", "audio", "random", "urandom"] {
             assert!(lookup(p, name).is_none(), "{name} must not leak into a box");
         }
@@ -296,5 +305,17 @@ mod tests {
         for name in ["", "vde", "nul", "null/", "net/tap0", "console"] {
             assert!(lookup(host(), name).is_none(), "{name:?} must not resolve");
         }
+    }
+
+    /// `fb0` exists exactly when the kernel says there is a framebuffer, and a
+    /// box never sees it (the `in_box` carve-out).
+    #[test]
+    fn fb0_follows_the_framebuffer_probe() {
+        let with = DevProbe { framebuffer: true, ..Default::default() };
+        let node = lookup(with, "fb0").expect("fb0 with a framebuffer");
+        assert_eq!((node.major, node.minor, node.is_block), (29, 0, false));
+        assert!(names(with).contains(&"fb0"));
+        assert!(lookup(DevProbe::default(), "fb0").is_none());
+        assert!(lookup(DevProbe { in_box: true, ..with }, "fb0").is_none());
     }
 }

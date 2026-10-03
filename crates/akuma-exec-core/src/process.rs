@@ -222,6 +222,11 @@ pub enum FileDescriptor {
     /// virtio-sound output device (`/dev/dsp`). Writes stream PCM frames to the
     /// kernel audio driver; ioctl sets OSS format/channels/rate.
     DevDsp,
+    /// The framebuffer (`/dev/fb0`): the Linux fbdev ioctls and a
+    /// write-combining `mmap` of the pixels. Only the amd64 kernel opens one —
+    /// it is the one with a boot-loader framebuffer — and it holds the screen's
+    /// ownership while any process has it open (2026-10-03).
+    DevFb,
     /// Raw L2 packet device (`/dev/net/tap0`) for the kernel `rump` feature.
     /// `read`/`write` move whole Ethernet frames to/from a dedicated second
     /// virtio-net NIC (bypassing smoltcp). Only ever constructed when the

@@ -10,6 +10,7 @@ default-members = [
     "crates/akuma-firecracker",
     "crates/akuma-fpcache",
     "crates/akuma-fpcache-rw",
+    "crates/akuma-fbdev",
     "crates/akuma-gic",
     "crates/akuma-psci",
     "crates/akuma-config",

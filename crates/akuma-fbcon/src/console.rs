@@ -579,6 +579,25 @@ impl<S: Surface> Console<S> {
         self.cursor = None;
     }
 
+    /// Redraw the whole screen from the grid: background, then every cell.
+    ///
+    /// For a surface that **stopped showing** for a while and kept recording —
+    /// the amd64 kernel mutes its framebuffer while a program owns `/dev/fb0`
+    /// and keeps feeding this console, so the text that arrived meanwhile is in
+    /// the grid and nowhere on the glass. Handing the screen back is this call.
+    /// The cursor is dropped rather than redrawn; the next idle tick
+    /// ([`Console::show_cursor`]) puts it back where the grid says it is.
+    pub fn repaint(&mut self) {
+        let (w, h) = (self.surface.width(), self.surface.height());
+        self.surface.fill(0, 0, w, h, self.bg);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                self.paint(row, col, false);
+            }
+        }
+        self.cursor = None;
+    }
+
     /// Fill the entire surface with one colour, leaving the grid alone.
     ///
     /// For bring-up signalling before there is anything to say: a screen that

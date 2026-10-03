@@ -1,0 +1,11 @@
+[package]
+name = "akuma-fbdev"
+version = "0.1.0"
+edition = "2024"
+description = "The /dev/fb0 decisions: framebuffer geometry -> the fbdev ioctl answers, which FBIOPUT_VSCREENINFO requests are accepted, single-owner open, and what an mmap of the device may ask for. Pure; the device, the page tables and the console mute stay in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

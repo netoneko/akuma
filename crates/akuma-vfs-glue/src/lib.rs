@@ -1042,6 +1042,16 @@ const DEV_DIR: &str = "/dev";
 /// one. Sits next to `/etc/mtab`'s `u64::MAX - 1`, well clear of ext2's range.
 const DEV_DIR_INO: u64 = u64::MAX - 2;
 
+/// Whether the kernel offers `/dev/fb0`. Set once by the amd64 kernel when it
+/// booted with a direct-colour framebuffer; never set on AArch64.
+static FRAMEBUFFER_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Announce that `/dev/fb0` exists (amd64, from boot). The node then appears in
+/// `stat`/`ls /dev`; opening it is the kernel's own `openat` arm.
+pub fn set_framebuffer_present(present: bool) {
+    FRAMEBUFFER_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Live kernel state plus caller identity, assembled for `akuma_vfs::dev`.
 fn dev_probe() -> DevProbe {
     let mut block_slots = 0u8;
@@ -1052,6 +1062,7 @@ fn dev_probe() -> DevProbe {
     }
     DevProbe {
         audio: crate::audio_is_available(),
+        framebuffer: FRAMEBUFFER_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
         block_slots,
         // Boxes get no synthetic /dev — see `DevProbe::in_box` for why, and
         // for the two carve-outs (`null`/`zero` stat, and `/dev/net/tap0`,

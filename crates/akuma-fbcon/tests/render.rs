@@ -1224,3 +1224,19 @@ fn an_absurd_margin_is_clamped_and_never_draws_outside() {
     con.show_cursor();
     assert_eq!(con.into_surface().out_of_bounds, 0);
 }
+
+/// `repaint` restores exactly what the console had drawn — after the surface was
+/// overwritten wholesale, as it is while a program owns `/dev/fb0` — including
+/// text that arrived while nothing reached the screen.
+#[test]
+fn repaint_restores_the_screen_from_the_grid() {
+    let mut con = Console::new(MemSurface::new(640, 400)).expect("console fits");
+    con.write_str_bytes("hello, repaint\r\nsecond \x1b[31mred\x1b[0m line\r\n");
+    let before = con.surface_mut().px.clone();
+    // A program draws over everything.
+    con.flood(Rgb::new(0x12, 0x34, 0x56));
+    assert_ne!(con.surface_mut().px, before);
+    con.repaint();
+    assert_eq!(con.surface_mut().px, before, "repaint must reproduce the drawn screen");
+    assert_eq!(con.surface_mut().out_of_bounds, 0);
+}
