@@ -55,5 +55,5 @@ cursor hide (`ESC[?25l`) and arrow keys all work; `stty size` reports `24 80`.
 
 ## Background
 
-- [`../archive/GOOSE_TOKEN_AUDIT_2026_10_03.md`](../archive/GOOSE_TOKEN_AUDIT_2026_10_03.md) — the same-day look at goose's request logs.
+- [`../archive/GOOSE_TOKEN_AUDIT.md`](../archive/GOOSE_TOKEN_AUDIT.md) — the same-day look at goose's request logs.
 - [`amd64-console-shell.md`](amd64-console-shell.md) — cursor-position replies on the TV console.

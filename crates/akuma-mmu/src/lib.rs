@@ -857,7 +857,7 @@ impl Drop for TlbFlush {
 // `[BKL] stuck` waiter). Two assists close it: `ProcAddressSpace::lock` spins
 // through `akuma_bkl::sync::masked_spin_assist`, and the wait itself services its
 // own mailbox. Any new IRQ-masked spin on an inner lock must do the same.
-// `docs/archive/AMD64_TLB_STUCK_AS_LOCK_2026-10-01.md`.
+// `docs/archive/AMD64_TLB_STUCK_AS_LOCK.md`.
 // ---------------------------------------------------------------------------
 
 /// Broadcast a shootdown to every peer that could hold a stale translation.

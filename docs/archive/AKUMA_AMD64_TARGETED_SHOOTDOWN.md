@@ -223,5 +223,5 @@ the sample cannot size. The kernel left installed is the `no-tests` build
   builds on and the scaling table it answers.
 - `docs/runbooks/selfhost-kernel-build-amd64.md` § "Second rig: ryzen" — the
   27 unexplained `tag=11` lines.
-- `AMD64_TLB_STUCK_AS_LOCK_2026-10-01.md` — the shootdown wait's termination
+- `AMD64_TLB_STUCK_AS_LOCK.md` — the shootdown wait's termination
   argument this change must preserve.
