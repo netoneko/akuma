@@ -368,7 +368,7 @@ BKL carve-outs.
 
 - `archive/MULTITASKING.md`, `archive/CONCURRENCY.md`, `archive/LOCK_REFERENCE.md`.
 - `archive/WAIT_QUEUES.md`, `archive/SYSCALL_BLOCKING.md`.
-- `archive/CONTEXT_SWITCH_FIX_2026.md`, `archive/TTBR0_AND_THREADING_FIXES.md`.
+- `archive/CONTEXT_SWITCH_FIX.md`, `archive/TTBR0_AND_THREADING_FIXES.md`.
 - `archive/CROSS_CORE_THREAD_COLLAPSE.md` — the 2026-08-19 fixes above.
 - `archive/AKUMA_SCHEDULING_EXTRACTION.md` — `crates/akuma-scheduler` (policy
   simulator) and `crates/akuma-kacho` (the shared self-tuning primitives).

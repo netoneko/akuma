@@ -2358,7 +2358,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   `/boot/akuma-amd64.good` was promoted at 12:59. GLM-5.3 on the box
    │   issued every command from build to promotion. The human's part was
    │   two sentences of approval. The kernel it booted carries both fixes
-   │   from `AMD64_THREE_CRASHES_2026-09-25.md`, so this was also the
+   │   from `AMD64_THREE_CRASHES.md`, so this was also the
    │   first time those fixes ran on the metal.
    │
    ├──► **Weaker than it looked, in two places.**
@@ -2412,7 +2412,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         or reviewed the install. The ledger carried messages about the
         work and never the work itself.
                           docs: runbooks/build-kernel-on-box.md,
-                                AMD64_THREE_CRASHES_2026-09-25.md,
+                                AMD64_THREE_CRASHES.md,
                                 on-chain artifacts #2-#4 (`kot artifact N`),
                                 ../akuma-miot/HANDOFF.md § "Watching the
                                 litter (2026-09-25)"

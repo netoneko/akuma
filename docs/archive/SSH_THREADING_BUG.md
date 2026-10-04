@@ -203,7 +203,7 @@ async fn ssh_accept_loop(spawner: Spawner) {
 
 ## Related Issues
 
-- Thread 0 format panic (see CONTEXT_SWITCH_FIX_2026.md) - Fixed with safe_print
+- Thread 0 format panic (see CONTEXT_SWITCH_FIX.md) - Fixed with safe_print
 - Context switch race conditions - Fixed with INITIALIZING state
 - Heap allocation in IRQ context - Fixed with non-allocating prints
 

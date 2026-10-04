@@ -62,6 +62,6 @@ read 60 s, interactive read 10 ms. **Do not raise the 10 ms interactive poll.**
 ## Background
 
 - `archive/SSH_STAGGERING.md`, `archive/SSH_ECHO_LATENCY_FIX.md` — the waker/poll fixes.
-- `archive/SSH_PERFORMANCE_FIX_2026.md`, `archive/SSH_STREAMING_ARCHITECTURE.md`.
+- `archive/SSH_PERFORMANCE_FIX.md`, `archive/SSH_STREAMING_ARCHITECTURE.md`.
 - `archive/SSH_TERMINAL_KEY_TRANSLATION_FIX.md`, `archive/SSH_TERMINAL_SIZE_FIX.md`.
 - `archive/COMMAND_CHAINING_SSH_BUGS.md` (open chaining issues).
