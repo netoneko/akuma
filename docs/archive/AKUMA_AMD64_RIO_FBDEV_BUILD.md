@@ -89,6 +89,96 @@ font package (e.g. a ttf monospace) before first run, or point rio's config
 `fonts.additional_dirs` at a directory of ttf files. rio reads its config
 from `$HOME/.config/rio/config.toml`.
 
+## Input and the console (2026-10-04, second session)
+
+rio renders and takes input now; what was fixed to get there, and what is
+still open. All the debug tooling below lives in the rio fork's
+`rio-window/src/platform_impl/fb/event_loop.rs`.
+
+### Debug tooling
+
+* `/tmp/akuma-fb.log` — the fb platform appends its whole lifecycle trace
+  here unconditionally (loop iterations, every raw tty read, every decoded
+  key, and per-event `handler <name> enter/exit` lines around the client's
+  event handler). This file exists because the console shell cannot be
+  relied on for `VAR=x cmd 2>file` redirection.
+* `AKUMA_FB_DEBUG_INPUT=1` additionally mirrors the trace to stderr.
+* `/tmp/rio-expect.sh` (on the dev host) drives a full rio session over
+  `ssh -tt` with scripted keystrokes — the input path is testable without
+  anyone at the panel.
+* The console shell (the kernel's own) appears not to parse `VAR=x cmd`
+  prefixes or `2>file` redirects — commands that depend on those silently
+  mislaunch. Pass configuration through files, not the command line.
+
+### Bugs found and fixed (all in the forks, all with commits)
+
+1. **Redraw livelock (the big one).** The fb event loop drained its redraw
+   queue with `while let Some = queue.pop_front()`. rio repaints
+   continuously and requests the next redraw from inside the redraw
+   handler, so the drain never ended: after the first frame (which is why
+   rio "looked cool"), AboutToWait, the tty reads and everything else were
+   starved — the window rendered and ignored every key. Fix: drain a
+   `mem::take` snapshot. Any future winit platform must do the same.
+2. **Console read blocks forever with `VMIN=0`.** The kernel console read
+   does not honour the zero-timeout contract (nor, before the fix was
+   tested, did we trust O_NONBLOCK): the first `read(0)` never returned and
+   the loop froze inside the kernel. Fix: tty fd carries O_NONBLOCK
+   (restored on drop) and poll is never called with timeout -1 (33 ms
+   slice). O_NONBLOCK *is* honoured by the console channel — verified: the
+   log shows clean EAGAINs.
+3. **Incomplete escape sequences** (`ESC [` split across reads) decoded as
+   Alt+`[`. The decoder now waits for the CSI/SS3 final byte; unit tests
+   cover the decoder (`cargo test -p rio-window --features fb`, run the
+   test binary on the box — macOS cannot execute musl binaries).
+4. **Clipboard panic** without X11 (rio-vt): nop clipboard under musl.
+5. **No shell**: the box has no `/etc/passwd` and no `$SHELL`, so rio's
+   pty had no shell. Fixed via rio's config:
+   `shell = { program = "/bin/sh" }` in `~/.config/rio/config.toml`
+   (which also sets `[fonts] family = "Source Code Pro"`, size 18, from
+   `apk add font-adobe-source-code-pro`).
+
+### Kernel-side findings (for the kernel repo)
+
+* **A process blocked in a console read can wedge `/proc` readdir
+  system-wide** (observed twice: `ls /proc` over ssh hung until the wedged
+  rio died). Suspicion, not proven — but it happened twice, and both times
+  a frozen console-reader was alive.
+* Console read ignores `VMIN=0`/O_NONBLOCK semantics (blocks
+  uninterruptibly); the same is suspected for pty master reads — this is
+  exactly where rio's still-open issue points (next section).
+
+### Still open: keys reach rio, the shell never echoes (UNRESOLVED)
+
+Symptom: rio renders, takes input (KeyboardInput events confirmed
+delivered — 164 of them in one trace; ctrl+enter even dismisses rio's
+config-error screen), but typed text never appears and the cursor is
+frozen. The remaining suspects, in order:
+
+1. rio's reactor (corcovado, its epoll wrapper) never sees the pty master
+   become readable — epoll semantics on pty masters on this kernel are
+   unverified. The shell's echo would never render.
+2. The pty master write or read blocking (same kernel disease as the
+   console read — the kernel ignores non-blocking semantics on the
+   console, ptys may be the same).
+3. ash spawn failing silently (check for a live ash child of rio-bin).
+
+Next session should start from rio's own log (`--enable-log-file` flag;
+a fresh 34 KB `/tmp/rio.log` was written 2026-10-04 20:55 and never
+examined) and put trace points on the pty write (`messenger.send_write`)
+and the reactor read path.
+
+### Housekeeping notes
+
+* Quit: rio's quit binding is Super+Q, which the console cannot express.
+  Ctrl+D (shell EOF) is the working exit. Consider a rio binding patch.
+* The panel accumulates stacked frozen rio instances if launched repeatedly
+  while one holds `/dev/fb0` (subsequent launches get EBUSY and exit, but
+  wedged ones linger and eventually hang /proc). `pidof rio-bin |
+  xargs -r kill -9` from ssh — but expect it to hang if /proc is wedged;
+  then only a reboot helps.
+* Two pacmans on the panel = the fbcon handback banner drawn twice (two
+  rio lifecycles), not a rio bug.
+
 ## Verification done so far (2026-10-04)
 
 * `cargo check`/`build` of rio for musl: clean (see the fork's git log for
@@ -111,5 +201,5 @@ from `$HOME/.config/rio/config.toml`.
 * Input is keyboard-only (console tty). Mouse would need evdev; there is
   no pointer on the panel anyway.
 * Modifier reporting is per-keystroke recovered from the console encoding
-  (upper-case = shift, control byte = ctrl, ESC prefix = alt); there are no
-  modifier press/release events.
+  (upper-case = shift, control byte = ctrl, ESC prefix = alt); there are
+  no modifier press/release events.
