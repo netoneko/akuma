@@ -2,9 +2,10 @@
 
 **Date:** 2026-10-05. **Found:** bringing up rio on the trashcan panel
 (`AKUMA_AMD64_RIO_FBDEV_BUILD.md`), while iterating on a rio config in a
-throwaway `HOME`. **Status: OPEN — observed once, not reproduced yet.** A
-second, *reproducible* defect turned up while trying: concurrent `O_APPEND`
-writers lose writes (§5).
+throwaway `HOME`. **Status: OPEN — seen a second time 2026-10-05 (§9), on a
+kernel image, with block-level evidence; root cause not found.** The
+*reproducible* defect found alongside it — concurrent `O_APPEND` writers lose
+writes (§5) — is **FIXED** 2026-10-05 (§10).
 
 ## 1. What was seen
 
@@ -139,3 +140,93 @@ processes.
   (hypothesis 1).
 * An e2fsck of the box's disk would show whether blocks are currently
   cross-linked (run it offline).
+
+
+## 9. Second occurrence, 2026-10-05 — a kernel image, caught at block level
+
+While deploying the pty kernel (`AKUMA_AMD64_PTY.md`), on the **old** kernel
+(`94eda586`, ext2 block size 4096, root on the USB disk):
+
+1. `hpbox.akuma_push` wrote an 8 584 272-byte kernel to
+   `/root/akuma-amd64.new` with `cat >` — **over an existing, similar-sized
+   older copy** (so `O_TRUNC`, then ~2 100 fresh block allocations that reuse
+   the just-freed ones). The push's own check, the box's `md5sum`, matched the
+   local file (`19258767…`).
+2. Then, in order: two small files pushed (`/tmp/ptyprobe`, `/tmp/lifeprobe`;
+   the second later re-pushed over itself after being executed), three rounds
+   of the §5 two-appender repro in `/tmp/ext2r` (each starting `: > B`), both
+   probes run.
+3. A few minutes later the same file read back as `449a73dc…`, same size.
+
+Per-block comparison against the local file: **exactly five 4 KiB blocks**
+differ, in two runs — file blocks 1655–1656 and 1659–1661 (offsets
+`0x677000–0x678fff`, `0x67b000–0x67dfff`), all in the **double-indirect** range
+(indirect #0, entries 619–625). Their new contents:
+
+* Four are sparse `0x00`/`0xFF` patterns (~400 non-zero bytes each) that occur
+  nowhere in the new kernel, the probes, or any kernel image kept in `/boot`.
+* One (block 1661) is **this kernel build's own bytes from offset `0x671090`**
+  — not block-aligned. The same font table sits `0xbf70` lower in an older
+  build, so this is what an *older* image would hold at block 1661: stale data
+  of a previous file, at that file's layout.
+* None of it is the appended log text.
+
+What that rules in and out:
+
+* The data was right after the write and wrong after unrelated activity, and
+  the wrong bytes are *old* contents, not another file's *new* writes. The only
+  ext2 path that discards a dirty cached block without writing it is
+  invalidate-on-free (`free_block` → `invalidate_block`), so the leading
+  explanation is a **stale free**: these five block numbers were freed again
+  (or their pointer block reverted) after the new file owned them, the dirty
+  copies were dropped, and the disk's previous contents became the file's.
+  The deferred-free path (`drain_deferred_frees` freeing an unlinked-while-
+  pinned inode's blocks by its *record*, after those blocks were already freed
+  and reallocated) is the first suspect; a stale owned copy of an indirect
+  block written back is the second.
+* The USB mass-storage write path checks every CSW and the transferred length
+  and is serialised under the xHCI lock, so a silent device-level loss is
+  unlikely but not excluded.
+* Not reproduced on the host: `overwrite_of_a_double_indirect_file_survives_eviction`
+  (truncate + unaligned rewrites of a double-indirect file, 32 KiB cache,
+  churn, fresh-mount comparison) and
+  `rewrite_truncate_rename_and_concurrent_append_keep_files_apart` (§8's
+  plan, with `e2fsck -fn` as the oracle) both pass. Neither has pinned inodes
+  or deferred frees, which is the next thing to add.
+
+**Operational consequence, now in the deploy recipe:** an md5 taken right
+after a write proves nothing about the disk — the cache serves the new bytes
+until it evicts them, and GRUB reads the disk. Push a kernel to a **fresh
+name** (no `O_TRUNC` of a large existing file), force eviction by streaming
+more than the cache (`find /root/.cargo /usr -type f | xargs cat`), verify,
+then `mv` it into place and verify again after another eviction. The corrupted
+copy was installed as `/boot/akuma-amd64` for a few minutes before this was
+noticed; it was replaced with the running kernel's image before any reboot.
+
+The streaming eviction turned out to be the wrong tool: ~2.7 GB through `find |
+xargs cat` over USB takes many minutes, and it was stopped. **A reboot is the
+cheap cold-cache check**: the fresh copy, `/boot/akuma-amd64.pty` (written as a
+new file, no `O_TRUNC`), was re-read 39 s after a reboot of the old kernel and
+matched (`19258767…`). The corrupted `/root/akuma-amd64.new` was left on the
+box as evidence (md5 `449a73dc…`, inode 9439; bad file blocks 1655–1656,
+1659–1661).
+
+**Status after this session: the cross-file corruption is NOT fixed.** The
+`O_APPEND` fix (§10) closes hypothesis 2 only; the kernel-image corruption does
+not look like an append race (stale old contents, no appended text), so the
+pty kernel carries the bug too. Handoff: `docs/handoff-ext2-corruption.md`.
+
+## 10. `O_APPEND` fixed (2026-10-05)
+
+`Filesystem::append(path, data) -> (offset, written)`: ext2 implements it in
+`write_locked`, which picks the offset (the size **inside** the state write
+lock) and writes under one hold; glue's `sys_write` uses it for `O_APPEND`
+descriptors instead of `file_size` + `write_at`. Host test
+`concurrent_appends_lose_nothing` (two threads × 150 lines) fails 3/3 on the
+old two-step path and passes on the new one. On the box, old kernel: the §5
+repro gave **273, 271, 264** of 300 (worse than the first measurement — real
+SMP). New kernel (`8bece079`): **300, 300, 300**.
+
+Per-chunk atomicity: `sys_write` still splits a write into 64 KiB chunks, so a
+single `write(2)` larger than that can interleave with another appender
+between chunks. Linux holds the inode lock for the whole call.
