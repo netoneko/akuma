@@ -505,3 +505,39 @@ fn ring_wraps_and_reads_across_the_seam() {
     assert_eq!(&out[..4], &[2, 3, 4, 5]);
     assert!(r.is_empty());
 }
+
+/// What the Akuma `ssh` client asks for (`SET_TERMINAL_ATTRIBUTES` raw): keys
+/// reach the reader at once, byte for byte, with no echo — arrow keys and a
+/// lone Esc included. In cooked mode the same bytes sit in the line buffer
+/// and are echoed back as `^[[A`.
+#[test]
+fn raw_slave_gets_keys_unedited_and_unechoed() {
+    let mut p = open_pair();
+    let mut t = p.termios();
+    t.make_raw();
+    p.set_termios(t);
+    p.master_write(b"\x1b[A").unwrap();
+    p.master_write(b"\r").unwrap();
+    p.master_write(b"\x7f").unwrap();
+    p.master_write(b"\x1b").unwrap();
+    let mut out = [0u8; 16];
+    assert_eq!(p.slave_read(&mut out, false), SlaveRead::Data(6));
+    assert_eq!(&out[..6], b"\x1b[A\r\x7f\x1b");
+    assert!(master_drain(&mut p).is_empty(), "raw: nothing echoed");
+}
+
+#[test]
+fn cooked_slave_buffers_and_echoes_the_same_keys() {
+    let mut p = open_pair();
+    p.master_write(b"\x1b[A").unwrap();
+    assert_eq!(slave_read(&mut p, 16), SlaveRead::Block { timeout_ds: None });
+    assert_eq!(master_drain(&mut p), b"^[[A");
+}
+
+#[test]
+fn make_cooked_undoes_make_raw() {
+    let mut t = Termios::initial();
+    t.make_raw();
+    t.make_cooked();
+    assert_eq!(t, Termios::initial());
+}

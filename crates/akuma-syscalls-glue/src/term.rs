@@ -382,7 +382,20 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
     data.len() as u64
 }
 
-pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
+pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
+    // A pty descriptor has its own termios; the console's state below is the
+    // wrong target for it.
+    let pty = akuma_exec::process::current_process_shared().and_then(|p| match p.get_fd(fd as u32) {
+        Some(
+            akuma_exec::process::FileDescriptor::PtyMaster(n)
+            | akuma_exec::process::FileDescriptor::PtySlave(n),
+        ) => Some(n),
+        _ => None,
+    });
+    if let Some(n) = pty {
+        return super::pty::set_raw_mode(n, (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0, action == 2);
+    }
+
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
         None => return ENOMEM,

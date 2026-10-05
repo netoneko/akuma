@@ -239,6 +239,28 @@ impl Termios {
         }
     }
 
+    /// `cfmakeraw`: what a terminal client (the Akuma `ssh`'s
+    /// `SET_TERMINAL_ATTRIBUTES` raw-mode request) wants of the tty it reads
+    /// keys from — no line editing, no echo, no signal keys, no CR/NL or
+    /// output translation, `read` returns as soon as one byte is there.
+    pub fn make_raw(&mut self) {
+        self.iflag &= !(ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+        self.oflag &= !OPOST;
+        self.lflag &= !(ECHO | ECHOE | ECHOK | ECHONL | ECHOCTL | ECHOKE | ICANON | ISIG | IEXTEN);
+        self.cc[VMIN] = 1;
+        self.cc[VTIME] = 0;
+    }
+
+    /// The inverse of [`Self::make_raw`]: the flags a pty slave starts with.
+    /// (The pair keeps no saved copy, so settings the program had changed
+    /// before going raw are not restored — only the defaults.)
+    pub fn make_cooked(&mut self) {
+        let sane = Self::initial();
+        self.iflag |= sane.iflag & (ICRNL | IXON);
+        self.oflag |= sane.oflag;
+        self.lflag |= sane.lflag;
+    }
+
     /// The wire image `TCGETS` copies out. `c_cc[0]` is at byte **17**: byte
     /// 16 is `c_line`, which is not part of the array.
     #[must_use]

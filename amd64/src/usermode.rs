@@ -1179,6 +1179,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             {
                 to_glue_raw(nr - AKUMA_PRIVATE_BASE, [a1, a2, a3, 0, 0, 0])
             }
+            // `set_terminal_attributes` on a pty descriptor: a process whose
+            // stdin is a pty slave (the `ssh` client run in a terminal
+            // emulator) has no console channel, and the arm above answered it
+            // `ENOSYS` — so the slave stayed cooked. Glue's arm acts on the
+            // pty's own termios when the fd is one.
+            307 if akuma_syscalls_glue::pty::is_pty_fd(a1) => {
+                to_glue_raw(nr - AKUMA_PRIVATE_BASE, [a1, a2, a3, 0, 0, 0])
+            }
             // `uptime()` — microseconds since boot, matching
             // `akuma_syscalls_time::sys_uptime` on the AArch64 side. `herd`'s
             // whole supervision loop is keyed on it (restart delays, start

@@ -491,6 +491,44 @@ fn get_i32(arg: u64) -> Result<i32, u64> {
 /// `None` hands the request to the generic arms (`FIONBIO`, `FIOCLEX`,
 /// `FIONCLEX`, `FIOASYNC`), which are about the descriptor rather than the
 /// terminal; everything else is answered here.
+/// Whether `fd` of the calling process is a pty end (so a terminal request on
+/// it has a terminal even if the process has no console channel).
+#[must_use]
+pub fn is_pty_fd(fd: u64) -> bool {
+    akuma_exec::process::current_process_shared().is_some_and(|p| {
+        matches!(
+            p.get_fd(fd as u32),
+            Some(
+                akuma_exec::process::FileDescriptor::PtyMaster(_)
+                    | akuma_exec::process::FileDescriptor::PtySlave(_)
+            )
+        )
+    })
+}
+
+/// Akuma's `SET_TERMINAL_ATTRIBUTES` raw-mode request on a pty descriptor.
+///
+/// The syscall used to act only on the process's console `TerminalState`, so a
+/// terminal client (the Akuma `ssh`) run inside a pty never made its slave raw:
+/// the line discipline stayed cooked and buffered every key until Enter, echoed
+/// arrows as `^[[A`, and held a lone Esc. `flush_input` is the syscall's
+/// `action == 2` (`TCSAFLUSH`).
+pub fn set_raw_mode(n: u32, raw: bool, flush_input: bool) -> u64 {
+    let done = with_pair(n, |p| {
+        let mut t = p.termios();
+        if raw {
+            t.make_raw();
+        } else {
+            t.make_cooked();
+        }
+        if flush_input {
+            p.flush(true, false);
+        }
+        p.set_termios(t);
+    });
+    if done.is_some() { 0 } else { EIO }
+}
+
 pub fn ioctl(n: u32, master: bool, cmd: u32, arg: u64) -> Option<u64> {
     const FIONBIO: u32 = 0x5421;
     const FIONCLEX: u32 = 0x5450;
