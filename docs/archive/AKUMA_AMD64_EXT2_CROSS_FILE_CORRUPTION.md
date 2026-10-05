@@ -261,3 +261,33 @@ cache acknowledged — and it must be fixed before any on-box verification of
 (after the ext2 flush) and from `sys_reboot` before the reset, plus a
 `Sync`/`Syncfs` row in `akuma-syscalls-abi`. Until then: after a metadata
 change on the box, do not `reboot -f` right away; and treat `.prev` as gone.
+
+## 12. Checkpoint 2026-10-05 (on-box goose session, commit `1c1b8eeb` on `litter/local-console`)
+
+State as found, then verified from the Mac:
+
+* **§11 is implemented, not yet run on the metal.** `BlockDevice::flush` (default no-op),
+  `UsbDisk::flush` -> `xhci::flush` -> SCSI `SYNCHRONIZE CACHE (10)`
+  (`cdb::synchronize_cache_10`, 2 host tests); `Ext2Filesystem::sync` ends at
+  `dev.flush()`; `sync`/`syncfs`/`fsync`/`fdatasync` have real handlers
+  (`akuma-syscalls-glue::fs::{sys_sync,sys_fsync,sys_syncfs}`, rows `Sync`=162 /
+  `Syncfs`=306 in `akuma-syscalls-abi`); `perform_reset` flushes before the reset.
+  `cargo check -p akuma-amd64 --target x86_64-unknown-none --release` and the default
+  AArch64 `cargo check` are clean; `akuma-ext2` (116), `-usb-storage`, `-syscalls-abi`,
+  `-syscalls-linux` host tests pass. The box is still running the *old* kernel
+  (`uname`: `8bece079`).
+* **§9 is still not root-caused.** Goose added a standalone fsck-style walker and
+  `pinned_unlink_deferred_free_and_concurrent_rewrite_keep_blocks_apart` (pins +
+  deferred frees + concurrent appends + a latency-injecting device); it passes, so the
+  host model still does not reproduce the bug.
+* **Audit notes (read-only, no defect pinned):** reads hold the state read lock, writes the
+  write lock, so the `with_block` miss-then-`insert` window cannot race a writer unless the
+  lock itself is bypassed; `ClockBlockCache::insert` never overwrites a resident (possibly
+  dirty) entry. Four of the five bad blocks in §9 look like **bitmap images**
+  (sparse `0x00`/`0xFF`), which points at a bitmap/BGD block number being written over file
+  data (`bitmap_slot`/`flush_meta`) or at the USB write path (a DMA buffer reused across
+  transfers) more than at a stale free. Next probe: `e2fsck -fn` / `debugfs` on the box's
+  `/root/akuma-amd64.new` (inode 9439) and check whether bad file blocks 1655-1656,
+  1659-1661 sit in some group's bitmap range or equal a `bgd.block_bitmap`.
+* Two lines in the checkpoint had lost their newlines (`xhci::write_bytes` signature,
+  a `///` in `akuma-vfs-glue`) — repaired.
