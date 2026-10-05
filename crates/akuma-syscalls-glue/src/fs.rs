@@ -2652,6 +2652,70 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
     }
 }
 
+/// `sync(2)` — flush every mounted filesystem, device write caches included.
+///
+/// This arm did not exist on x86_64 until 2026-10-05 (musl's `sync()` issues
+/// syscall 162 and got `ENOSYS` silently), and the shared AArch64 dispatch
+/// answered it with `Ok` **without doing anything**. Neither kernel had a
+/// durability barrier at all: ext2's write-back cache sat in front of an
+/// adapter whose own acknowledgement meant "in the drive's volatile cache",
+/// and nothing below it ever flushed
+/// (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §11).
+///
+/// Linux returns 0 unconditionally — a `sync` failure is not something
+/// userspace can act on — so per-mount failures go to the console and the
+/// syscall succeeds.
+pub fn sys_sync() -> u64 {
+    // Per-mount failures are unactionable for `sync` (Linux returns 0
+    // unconditionally), so they go to the console and the syscall succeeds.
+    if akuma_vfs_glue::sync_all_filesystems().is_err() {
+        akuma_primitives::safe_print!(128, "[sync] a filesystem failed to flush\n");
+    }
+    0
+}
+
+/// `fsync(2)` — flush the filesystem holding `fd` to media.
+///
+/// Until 2026-10-05 this answered **0 without flushing anything** — a lie
+/// SQLite's `SQLITE_IOERR_FSYNC`-free runs were built on. It is ext2's
+/// `Filesystem::sync` now: the write-back cache out, then the device's own
+/// barrier. `EINVAL` for descriptors with no filesystem behind them (pipes,
+/// sockets — what Linux answers), `EBADF` for unknown fds.
+pub fn sys_fsync(fd: u32) -> u64 {
+    fsync_fd(fd)
+}
+
+/// `syncfs(2)` — the same flush scoped to `fd`'s filesystem, which is the
+/// whole of what `fsync` has ever done here (the flush is filesystem-granular,
+/// not per-file); a separate arm so the ABI distinction is real rather than
+/// aliased.
+pub fn sys_syncfs(fd: u32) -> u64 {
+    fsync_fd(fd)
+}
+
+fn fsync_fd(fd: u32) -> u64 {
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
+    match proc.get_fd(fd) {
+        // By inode and mount id, like `read` — an unlinked-but-open fd's
+        // filesystem must stay flushable after the name is gone.
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            match akuma_vfs_glue::sync_open_file(&f.path, f.mount_id(), f.inode()) {
+                Ok(()) => 0,
+                Err(e) => fs_error_to_errno(e),
+            }
+        }
+        // Nothing of the descriptor's reaches media; success is the honest
+        // answer (Linux: fsync on a pipe is EINVAL, on /dev/null it is 0 —
+        // this target's device fds are all memory-backed).
+        Some(
+            akuma_exec::process::FileDescriptor::DevNull
+            | akuma_exec::process::FileDescriptor::DevZero,
+        ) => 0,
+        Some(_) => EINVAL,
+        None => EBADF,
+    }
+}
+
 pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
     let resolved = if path.starts_with('/') {

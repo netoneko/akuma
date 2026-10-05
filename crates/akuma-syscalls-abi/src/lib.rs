@@ -229,6 +229,21 @@ syscall_table! {
     /// which one SQLite issues is chosen at **runtime** by journal mode — so
     /// "a caller needs it" is already true of the caller that needed `fsync`.
     Fdatasync  => FDATASYNC  = 75,  nr::FDATASYNC;
+    /// Flush every mounted filesystem to its device, device write caches
+    /// included. x86_64 162, asm-generic 81. Added 2026-10-05 with a real
+    /// handler on the same day `fsync` became one: until then **no kernel in
+    /// this tree had any durability barrier at all** — `fsync` answered 0
+    /// without flushing, `sync(2)` had no row on x86_64 (musl's `sync()`
+    /// issues it), and nothing ever sent the USB disk's bridge a SCSI
+    /// `SYNCHRONIZE CACHE`, so a `reboot -f` could lose acknowledged writes in
+    /// the drive's own order
+    /// (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §11).
+    Sync       => SYNC       = 162, nr::SYNC;
+    /// Flush the filesystem holding `fd` (x86_64 306, asm-generic 267).
+    /// `syncfs`'s whole point over `sync` is that it does not sweep every
+    /// mount; glue resolves the fd to its filesystem and syncs exactly that
+    /// one.
+    Syncfs     => SYNCFS     = 306, nr::SYNCFS;
     /// Set a file's length through an open descriptor. Added 2026-09-12: it
     /// had a handler in `akuma-syscalls-glue` and a number in
     /// `akuma-syscalls-linux` and no row here, so `rust-lld` — which creates

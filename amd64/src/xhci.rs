@@ -1972,8 +1972,7 @@ pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
 
 /// Write `data.len()` bytes at byte `offset` on the whole disk. A partial block
 /// at either end is read-modify-written.
-pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
-    let mut g = lock_xhci();
+pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {    let mut g = lock_xhci();
     let x = g.as_mut().ok_or("xHCI not initialised")?;
     let bl = x.block_len as usize;
     if bl == 0 {
@@ -2000,6 +1999,40 @@ pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
         done += take;
     }
     Ok(())
+}
+
+/// The media barrier: SCSI `SYNCHRONIZE CACHE (10)` over the whole medium.
+///
+/// Every `WRITE (10)`'s CSW means "the drive took the command" — the bytes may
+/// still be in its volatile cache, and a reset loses them in the drive's own
+/// order. `reboot` must call this before resetting, and `sync`/`fsync` after
+/// the filesystem's write-back has been pushed out, or a success they report
+/// is a promise about a queue this kernel does not own (corruption doc §11).
+///
+/// `Err` here is **informational, not ignorable-in-silence**: bridges that do
+/// not implement the command answer `ILLEGAL REQUEST`. The device-level
+/// durability the caller wanted does not exist on that hardware, and the
+/// first failure is printed so the gap is visible at the console instead of
+/// being discovered by a lost write.
+pub fn flush() -> Result<(), &'static str> {
+    static FLUSH_UNSUPPORTED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    let mut g = lock_xhci();
+    let x = g.as_mut().ok_or("xHCI not initialised")?;
+    if x.block_len == 0 {
+        return Err("no block length");
+    }
+    match scsi_io(x, cdb::synchronize_cache_10(0, 0), 0) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if !FLUSH_UNSUPPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                serial::puts("  [xhci] SYNCHRONIZE CACHE failed: ");
+                serial::puts(e);
+                serial::puts(" — writes are NOT media-durable on this drive\n");
+            }
+            Err(e)
+        }
+    }
 }
 
 // ===========================================================================

@@ -14,8 +14,9 @@ mod op {
     pub const READ_CAPACITY_10: u8 = 0x25;
     pub const READ_10: u8 = 0x28;
     pub const WRITE_10: u8 = 0x2a;
+    /// SBC-3: force the medium's volatile cache to media.
+    pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 }
-
 fn cmd(cdb_bytes: &[u8], data_len: u32, direction: Direction) -> Command {
     let mut cdb = [0u8; 16];
     cdb[..cdb_bytes.len()].copy_from_slice(cdb_bytes);
@@ -84,4 +85,57 @@ pub fn write_10(lba: u32, blocks: u16, block_len: u32) -> Command {
         u32::from(blocks) * block_len,
         Direction::Out,
     )
+}
+
+/// `SYNCHRONIZE CACHE (10)` — the durability barrier. The drive (and any
+/// bridge behind it) must have its volatile write cache flushed for the given
+/// range before the command reports `Passed`; `blocks == 0` means "from `lba`
+/// to the end of the medium", and `lba == 0` with `blocks == 0` is therefore
+/// the whole medium. No data phase.
+///
+/// Without this, a `WRITE (10)`'s CSW acknowledgement means only "the command
+/// landed" — the bytes may still sit in the drive's volatile cache, and a
+/// reset (which can cut port power) loses them in whatever order the drive
+/// pleases. That is exactly what the 2026-10-05 reboot observed: renames
+/// lost, one freed inode half-persisted
+/// (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §11).
+///
+/// Bridges that do not implement the command answer `ILLEGAL REQUEST`; the
+/// caller decides whether that is fatal (it is not — but it must be *seen*,
+/// because the guarantee it wanted does not exist on that hardware).
+#[must_use]
+pub fn synchronize_cache_10(lba: u32, blocks: u16) -> Command {
+    let l = lba.to_be_bytes();
+    let n = blocks.to_be_bytes();
+    cmd(
+        &[op::SYNCHRONIZE_CACHE_10, 0, l[0], l[1], l[2], l[3], 0, n[0], n[1], 0],
+        0,
+        Direction::None,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synchronize_cache_10_whole_medium_is_lba0_blocks0_no_data() {
+        let c = synchronize_cache_10(0, 0);
+        assert_eq!(c.cdb[0], 0x35);
+        assert_eq!(c.cdb_len, 10);
+        assert_eq!(c.data_len, 0);
+        assert_eq!(c.direction, Direction::None);
+        // LBA (bytes 2..=5) and block count (bytes 7..=8) all zero.
+        assert!(c.cdb[2..=5].iter().all(|&b| b == 0));
+        assert!(c.cdb[7..=8].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn synchronize_cache_10_encodes_lba_and_count_big_endian() {
+        let c = synchronize_cache_10(0x1122_3344, 0x5566);
+        assert_eq!(&c.cdb[2..=5], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(&c.cdb[7..=8], &[0x55, 0x66]);
+        assert_eq!(c.data_len, 0);
+        assert_eq!(c.direction, Direction::None);
+    }
 }

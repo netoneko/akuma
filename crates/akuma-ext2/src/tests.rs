@@ -1495,6 +1495,8 @@ struct RecordingDevice {
     writes: AtomicU64,
     /// `(offset, len)` of every write, in order — for flush-ordering asserts.
     write_log: spinning_top::Spinlock<alloc::vec::Vec<(u64, usize)>>,
+    /// How many times `flush` (the media barrier) was asked for.
+    flushes: AtomicU64,
 }
 
 impl RecordingDevice {
@@ -1508,6 +1510,7 @@ impl RecordingDevice {
             reads: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             write_log: spinning_top::Spinlock::new(alloc::vec::Vec::new()),
+            flushes: AtomicU64::new(0),
         }
     }
 
@@ -1525,6 +1528,10 @@ impl BlockDevice for &RecordingDevice {
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         (**self).write_bytes(offset, data)
+    }
+
+    fn flush(&self) -> Result<(), ()> {
+        (**self).flush()
     }
 }
 
@@ -1549,6 +1556,11 @@ impl BlockDevice for RecordingDevice {
             return Err(());
         }
         inner[off..off + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), ()> {
+        self.flushes.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(())
     }
 }
@@ -2673,4 +2685,498 @@ fn overwrite_of_a_double_indirect_file_survives_eviction() {
         assert!(disk.len() == want.len() && first_bad.is_none(),
             "round {round}: on-disk view differs at {first_bad:?}");
     }
+}
+
+
+// ============================================================================
+// The trashcan's 2026-10-05 stale-block corruption (handoff:
+// docs/runbooks/debug-ext2-corruption.md)
+// ============================================================================
+
+/// Device wrapper that yields inside `read_bytes`, widening the `with_block`
+/// miss window. On the trashcan a read is a USB mass-storage round-trip —
+/// milliseconds — while every cache operation is nanoseconds, so the gap
+/// between "miss, start the device read" and "insert what came back" is
+/// proportionally far wider there than any host test makes it. A yield per
+/// read is the cheap host model of that asymmetry.
+struct UsbLatencyDevice {
+    inner: RecordingDevice,
+}
+
+impl UsbLatencyDevice {
+    fn from_fixture(name: &str) -> Self {
+        Self { inner: RecordingDevice::from_fixture(name) }
+    }
+}
+
+impl BlockDevice for UsbLatencyDevice {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        extern crate std;
+        std::thread::yield_now();
+        self.inner.read_bytes(offset, buf)
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        self.inner.write_bytes(offset, data)
+    }
+}
+
+/// Mounted through `&UsbLatencyDevice` so the device can also back the fresh
+/// mount of the persistence oracle.
+impl BlockDevice for &UsbLatencyDevice {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        (**self).read_bytes(offset, buf)
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        (**self).write_bytes(offset, data)
+    }
+}
+
+/// A minimal independent ext2 walker — the host's `e2fsck -fn` replacement.
+///
+/// Parses superblock/BGD/inode bytes straight from the device (not through the
+/// driver's own structures, so a driver-side record bug cannot hide itself) and
+/// checks the two corruption signatures the trashcan produced:
+///
+/// 1. **no block claimed by two inodes** (cross-file corruption), and
+/// 2. **every claimed block is set in its group's bitmap** (a stale free or a
+///    lost bitmap update leaves a block claimed-but-free, which is exactly what
+///    hands it to the next writer).
+///
+/// Data blocks are collected up to `i_size`; indirect and double-indirect
+/// pointer blocks themselves are claimed too. `e2fsck`-style free-count
+/// reconciliation is out of scope — the two checks above are the incident's.
+fn fsck_style_check(dev: &UsbLatencyDevice) -> Result<(), alloc::string::String> {
+    extern crate std;
+
+    let le32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let le16 = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+
+    let raw = dev.inner.inner.lock();
+    let read_block = |bn: u32, bs: usize| -> Vec<u8> {
+        raw[bn as usize * bs..(bn as usize + 1) * bs].to_vec()
+    };
+
+    let sb = &raw[1024..];
+    let inodes_count = le32(sb, 0) as usize;
+    let first_data_block = le32(sb, 20) as usize;
+    let log_block_size = le32(sb, 24) as usize;
+    let block_size = 1024 << log_block_size;
+    let blocks_per_group = le32(sb, 32) as usize;
+    let inodes_per_group = le32(sb, 40) as usize;
+    let inode_size = le16(sb, 88) as usize;
+    let blocks_count = le32(sb, 4) as usize;
+    let _group_count = (blocks_count - first_data_block + blocks_per_group - 1) / blocks_per_group;
+
+    let bgd_table = (first_data_block + 1) * block_size;
+    let bgd = |g: usize| -> (usize, usize, usize) {
+        let at = bgd_table + g * 32;
+        (
+            le32(&raw, at) as usize,
+            le32(&raw, at + 4) as usize,
+            le32(&raw, at + 8) as usize,
+        )
+    };
+
+    // inode number -> every data/metadata block it claims, in claim order.
+    let mut claims: alloc::collections::BTreeMap<u32, Vec<(u32, u32)>> = Default::default();
+    let ppb = block_size / 4;
+
+    let mut note = |claims: &mut alloc::collections::BTreeMap<u32, Vec<(u32, u32)>>,
+                    ino: u32,
+                    block: u32,
+                    logical: u32| {
+        claims.entry(block).or_default().push((ino, logical));
+    };
+
+    for ino in 1..=inodes_count {
+        let g = (ino - 1) / inodes_per_group;
+        let idx = (ino - 1) % inodes_per_group;
+        let (_, _, inode_table) = bgd(g);
+        let at = inode_table * block_size + idx * inode_size;
+        let mode = le16(&raw, at);
+        let fmt = mode & 0xF000;
+        if fmt == 0 {
+            continue; // free inode
+        }
+        let size = le32(&raw, at + 4) as u64;
+        let ptr_at = at + 40;
+        let ptr = |i: usize| le32(&raw, ptr_at + i * 4);
+
+        let ino_id = ino as u32;
+        // Direct.
+        for i in 0..12.min(size.div_ceil(block_size as u64) as usize) {
+            if ptr(i) != 0 {
+                note(&mut claims, ino_id, ptr(i), i as u32);
+            }
+        }
+        let mut walk_indirect = |bn: u32, base: u32, count: u32, claims: &mut _,
+                                 read_block: &dyn Fn(u32, usize) -> Vec<u8>| {
+            if bn == 0 {
+                return;
+            }
+            note(claims, ino_id, bn, u32::MAX); // the pointer block itself
+            let blk = read_block(bn, block_size);
+            for j in 0..count as usize {
+                let b = le32(&blk, j * 4);
+                if b != 0 {
+                    note(claims, ino_id, b, base + j as u32);
+                }
+            }
+        };
+        let data_blocks = size.div_ceil(block_size as u64) as u32;
+        let single = data_blocks.saturating_sub(12).min(ppb as u32);
+        walk_indirect(ptr(12), 12, single, &mut claims, &read_block);
+        // Double.
+        let dstart = 12 + ppb as u32;
+        let dbl_count = data_blocks.saturating_sub(dstart).min((ppb * ppb) as u32);
+        if ptr(13) != 0 {
+            note(&mut claims, ino_id, ptr(13), u32::MAX);
+            let dbl = read_block(ptr(13), block_size);
+            let mut remaining = dbl_count;
+            for i in 0..ppb {
+                if remaining == 0 {
+                    break;
+                }
+                let ib = le32(&dbl, i * 4);
+                let take = remaining.min(ppb as u32);
+                walk_indirect(ib, dstart + i as u32 * ppb as u32, take, &mut claims, &read_block);
+                remaining -= take;
+            }
+        }
+        if ptr(14) != 0 {
+            return Err(alloc::format!("inode {ino}: triple-indirect present — not expected here"));
+        }
+    }
+
+    // Signature 1: a block claimed twice.
+    for (block, who) in &claims {
+        if who.len() > 1 {
+            let names: alloc::vec::Vec<alloc::string::String> =
+                who.iter().map(|(i, l)| alloc::format!("inode {i} lb {l}")).collect();
+            return Err(alloc::format!(
+                "block {block} claimed by: {}",
+                names.join(", ")
+            ));
+        }
+    }
+
+    // Signature 2: a claimed block not set in its bitmap.
+    let mut bitmap_cache: alloc::collections::BTreeMap<u32, Vec<u8>> = Default::default();
+    let mut bit_set = |bitmap_cache: &mut alloc::collections::BTreeMap<u32, Vec<u8>>,
+                       block: u32|
+     -> bool {
+        let g = (block - first_data_block as u32) / blocks_per_group as u32;
+        let (bitmap_block, _, _) = {
+            let (bb, ib, it) = bgd(g as usize);
+            (bb as u32, ib as u32, it as u32)
+        };
+        let data = bitmap_cache
+            .entry(bitmap_block)
+            .or_insert_with(|| read_block(bitmap_block, block_size));
+        let bit = (block - first_data_block as u32) % blocks_per_group as u32;
+        data[(bit / 8) as usize] & (1 << (bit % 8)) != 0
+    };
+    for &block in claims.keys() {
+        if !bit_set(&mut bitmap_cache, block) {
+            let who = &claims[&block];
+            return Err(alloc::format!(
+                "block {block} claimed by inode {} lb {} but clear in its group {} bitmap",
+                who[0].0, who[0].1, (block - first_data_block as u32) / blocks_per_group as u32,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// §9 of `AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md`, with the two dimensions
+/// the earlier repros were missing (the handoff names both): **inode pins
+/// driving deferred frees**, and **concurrency** — the trashcan is SMP, and the
+/// push, the deploy renames, the appends, the truncations, the probes' reads
+/// and the deferred-free drains all ran at once.
+///
+/// The shape, per the incident record: a kernel image pushed with `cat >`
+/// (O_TRUNC over a similar-sized older copy, then a chunked stream that runs
+/// deep into the double-indirect range); a deploy `mv` over the previous image
+/// (rename-over frees ~2 100 blocks inline); probe binaries renamed over while
+/// still mapped (pin held → the old inode's free is deferred); rounds of
+/// `: > B` plus concurrent `>>` appends; reads interleaved throughout. The
+/// cache is capped small so the eviction the box gets from streaming GBs
+/// through a real build happens here too.
+///
+/// Oracles: the same mount's view after each round, a fresh mount's view (the
+/// disk's truth), and `e2fsck -fn` on the final image.
+#[test]
+fn pinned_unlink_deferred_free_and_concurrent_rewrite_keep_blocks_apart() {
+    extern crate std;
+    use std::sync::Barrier;
+
+    let _serial = pin_test_serial();
+    let dev = UsbLatencyDevice::from_fixture("manyinodes.ext2");
+    let clock = || 1_700_000_000_000_000;
+
+    // Both cache regimes:
+    // - 64 KiB: thousands of evictions, the streaming-a-build-through-the-cache
+    //   regime;
+    // - 4 MiB: the whole fixture stays resident — the box's regime, where
+    //   nothing evicts and the only way a dirty copy dies unflushed is the
+    //   invalidate-on-free rule. If a stale free exists, THIS arm is where it
+    //   shows.
+    let regimes: [Option<usize>; 2] = [Some(64 * 1024), Some(4 * 1024 * 1024)];
+    let rounds: u32 = std::env::var("E2_STRESS_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let appenders: u32 = 2;
+
+    const K_LEN: usize = 896 * 1024; // double-indirect entries to ~628 — the incident's range
+    let image = |seed: u32| -> Vec<u8> {
+        (0..K_LEN as u32).map(|i| (i.wrapping_mul(2_654_435_761).rotate_left(seed) >> 13) as u8).collect()
+    };
+    let probe = |seed: u32| -> Vec<u8> {
+        (0..7 * 1024 + seed as usize * 13).map(|i| (i.wrapping_mul(31) ^ seed as usize) as u8).collect()
+    };
+
+    for regime in regimes {
+        let regime_name = if regime.unwrap() <= 64 * 1024 { "evicting" } else { "resident" };
+        let fs = alloc::sync::Arc::new(
+            Ext2Filesystem::new_with_cache_cap(&dev, clock, regime).unwrap(),
+        );
+        if !fs.exists("/root") {
+            fs.create_dir("/root").unwrap();
+        }
+        // `touch` the append/truncate targets so round 1 starts settled.
+        fs.write_file("/root/log", b"").unwrap();
+        fs.write_file("/root/B", b"").unwrap();
+        let log_inode = fs.resolve_inode("/root/log").unwrap();
+
+        for round in 1..=rounds {
+            let want = image(round);
+            // pusher, deployer, prober, deferrer, appenders ×2, truncator, main.
+            let barrier1 = alloc::sync::Arc::new(Barrier::new(4 + appenders as usize + 2));
+            let barrier2 = barrier1.clone();
+
+            std::thread::scope(|s| {
+                // ── the push: `cat > /root/kernel` (O_TRUNC over the old copy). ──
+                let pusher = {
+                    let fs = fs.clone();
+                    let b1 = barrier1.clone();
+                    let b2 = barrier2.clone();
+                    let want = want.clone();
+                    s.spawn(move || {
+                        // `cat > /root/kernel`: create if missing, else O_TRUNC.
+                        fs.write_file("/root/kernel", b"").unwrap();
+                        b1.wait();
+                        let mut pos = 0;
+                        while pos < want.len() {
+                            let n = (want.len() - pos).min(15 * 1024 + 512);
+                            assert_eq!(fs.write_at("/root/kernel", pos, &want[pos..pos + n]).unwrap(), n);
+                            pos += n;
+                            // The push arrives over ssh: the state lock is free
+                            // in the gaps between chunks, and everyone else
+                            // runs there.
+                            std::thread::yield_now();
+                        }
+                        b2.wait();
+                    })
+                };
+
+                // ── the deploy: a fresh image written, `mv` over the previous. ──
+                let deployer = {
+                    let fs = fs.clone();
+                    let b1 = barrier1.clone();
+                    let b2 = barrier2.clone();
+                    s.spawn(move || {
+                        b1.wait();
+                        let fresh = alloc::format!("/root/kernel.new{round}");
+                        let data = image(round + 100);
+                        let mut pos = 0;
+                        while pos < data.len() {
+                            let n = (data.len() - pos).min(9 * 1024);
+                            assert_eq!(fs.write_at(&fresh, pos, &data[pos..pos + n]).unwrap(), n);
+                            pos += n;
+                        }
+                        fs.rename(&fresh, "/root/kernel.prev").unwrap();
+                        b2.wait();
+                    })
+                };
+
+                // ── the probes: renamed over while still mapped. ──
+                let prober = {
+                    let fs = fs.clone();
+                    let b1 = barrier1.clone();
+                    let b2 = barrier2.clone();
+                    s.spawn(move || {
+                        b1.wait();
+                        for pgen in 0..12u32 {
+                            let name = alloc::format!("/root/probe{}", pgen % 3);
+                            let new = alloc::format!("{name}.new");
+                            let data = probe(pgen);
+                            fs.write_file(&new, &data).unwrap();
+                            let pin = akuma_primitives::InodePin::new(fs.resolve_inode(&new).unwrap());
+                            fs.rename(&new, &name).unwrap();
+                            // Allocating in between runs the drain; the pin
+                            // keeps the queued inode's blocks owned meanwhile.
+                            let _ = fs.write_file(&alloc::format!("/root/churn{pgen}"), b"churn");
+                            std::thread::yield_now();
+                            drop(pin); // mapping gone — the next allocation reclaims it
+                            let _ = fs.write_file("/root/churn", b"c");
+                        }
+                        b2.wait();
+                    })
+                };
+
+                // ── the mapped set: several pins live at once across many
+                // drains. `cargo`'s shape: dozens of mapped files while the
+                // build churns thousands of allocations past the deferral
+                // list, every drain SKIPPING the live entries.
+                let deferrer = {
+                    let fs = fs.clone();
+                    let b1 = barrier1.clone();
+                    let b2 = barrier2.clone();
+                    s.spawn(move || {
+                        b1.wait();
+                        for dgen in 0..6u32 {
+                            let mut pins = alloc::vec::Vec::new();
+                            for k in 0..4u32 {
+                                let name = alloc::format!("/root/map{dgen}{k}");
+                                fs.write_file(&name, &vec![k as u8; 3000 + k as usize * 111]).unwrap();
+                                pins.push(akuma_primitives::InodePin::new(fs.resolve_inode(&name).unwrap()));
+                            }
+                            for k in 0..4u32 {
+                                let name = alloc::format!("/root/map{dgen}{k}");
+                                fs.remove_file(&name).unwrap(); // all queued, all pinned
+                            }
+                            for c in 0..30 {
+                                let _ = fs.write_file(&alloc::format!("/root/mchurn{dgen}{c}"), b"m");
+                                fs.remove_file(&alloc::format!("/root/mchurn{dgen}{c}")).unwrap();
+                            }
+                            drop(pins); // all reclaimable at the next allocation
+                            let _ = fs.write_file("/root/mchurn", b"m");
+                        }
+                        b2.wait();
+                    })
+                };
+
+                // ── the two-appender repro, each append wrapped in the fd's
+                // pin (open → append → close, which is what `echo >>` is). ──
+                let mut append_handles = alloc::vec::Vec::new();
+                for t in 0..appenders {
+                    let fs = fs.clone();
+                    let b1 = barrier1.clone();
+                    let b2 = barrier2.clone();
+                    append_handles.push(s.spawn(move || {
+                        b1.wait();
+                        for i in 0..80 {
+                            // open(2) takes the fd pin; drop = close(2).
+                            let fd_pin = akuma_primitives::InodePin::new(log_inode);
+                            let line = alloc::format!("r{round} t{t} i{i:03} trace trace trace trace\n");
+                            fs.append("/root/log", line.as_bytes()).unwrap();
+                            drop(fd_pin);
+                        }
+                        b2.wait();
+                    }));
+                }
+                let truncator = {
+                    let fs = fs.clone();
+                    let b1 = barrier1.clone();
+                    let b2 = barrier2.clone();
+                    s.spawn(move || {
+                        b1.wait();
+                        for i in 0..40 {
+                            // `: > B` while the appenders are mid-`>>` on the
+                            // same file: the blocks cycle free→allocated with
+                            // the scan hint pulling reallocation to the same
+                            // numbers, under fd-pin churn.
+                            let b_pin = akuma_primitives::InodePin::new(log_inode);
+                            fs.truncate("/root/log", 0).unwrap();
+                            fs.append("/root/log", alloc::format!("B r{round} i{i:02}\n").as_bytes()).unwrap();
+                            drop(b_pin);
+                        }
+                        b2.wait();
+                    })
+                };
+
+                // ── readers, interleaved the whole round: md5s, stat, listings. ──
+                let reader = {
+                    let fs = fs.clone();
+                    s.spawn(move || {
+                        for _ in 0..400 {
+                            let _ = fs.read_dir("/root");
+                            let _ = fs.metadata("/root/kernel");
+                            let _ = fs.read_at("/root/log", 0, &mut [0u8; 512]);
+                            std::thread::yield_now();
+                        }
+                    })
+                };
+
+                barrier1.wait();
+                barrier2.wait();
+                pusher.join().unwrap();
+                deployer.join().unwrap();
+                prober.join().unwrap();
+                deferrer.join().unwrap();
+                for h in append_handles {
+                    h.join().unwrap();
+                }
+                truncator.join().unwrap();
+                reader.join().unwrap();
+            });
+
+            // ── round oracle 1: the same mount serves exactly what was pushed. ──
+            let got = fs.read_file("/root/kernel").unwrap();
+            let first_bad = got.iter().zip(&want).position(|(a, b)| a != b);
+            assert!(
+                got.len() == want.len() && first_bad.is_none(),
+                "{regime_name} round {round}: cached view of the kernel differs at {first_bad:?} (len {} vs {})",
+                got.len(), want.len(),
+            );
+            // ── round oracle 2: the disk's truth, through a fresh mount. ──
+            let fresh = Ext2Filesystem::new_with_cache_cap(&dev, clock, regime).unwrap();
+            let disk = fresh.read_file("/root/kernel").unwrap();
+            let first_bad = disk.iter().zip(&want).position(|(a, b)| a != b);
+            assert!(
+                disk.len() == want.len() && first_bad.is_none(),
+                "{regime_name} round {round}: on-disk view of the kernel differs at {first_bad:?} (len {} vs {})",
+                disk.len(), want.len(),
+            );
+            // ── round oracle 3: no block claimed twice; every claim bitmap-set. ──
+            if let Err(problem) = fsck_style_check(&dev) {
+                panic!("{regime_name} round {round}: {problem}");
+            }
+        }
+    }
+}
+
+/// `sync()` is a media promise, not a cache-internal one: after it, the
+/// device's own barrier must have been asked for. The 2026-10-05 reboot lost
+/// acknowledged writes because nothing below the write-back cache ever
+/// reached the media barrier — `sync(2)` was not even dispatched on amd64,
+/// and the SCSI `SYNCHRONIZE CACHE` that the USB drive's volatile cache needs
+/// did not exist (corruption doc §11). `Filesystem::sync` now ends at
+/// `BlockDevice::flush`.
+#[test]
+fn sync_reaches_the_device_barrier_and_persists() {
+    extern crate std;
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+    fs.create_dir("/root").unwrap();
+
+    let before = dev.flushes.load(AtomicOrdering::Relaxed);
+    fs.write_file("/root/durable", b"must survive a cold read").unwrap();
+    assert_eq!(
+        dev.flushes.load(AtomicOrdering::Relaxed),
+        before,
+        "plain writes push their own blocks but must not claim a media barrier"
+    );
+
+    use akuma_vfs::Filesystem as _;
+    fs.sync().unwrap();
+    assert_eq!(
+        dev.flushes.load(AtomicOrdering::Relaxed),
+        before + 1,
+        "sync() must end at the device's media barrier"
+    );
+
+    // And the promise is real: a fresh mount over the same bytes reads it.
+    let fresh = Ext2Filesystem::new(&dev, || 0).unwrap();
+    assert_eq!(fresh.read_file("/root/durable").unwrap(), b"must survive a cold read");
 }

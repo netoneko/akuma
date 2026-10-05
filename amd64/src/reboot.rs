@@ -41,6 +41,22 @@ static EMPTY_IDT: Idtr = Idtr { limit: 0, base: 0 };
 pub fn perform_reset() -> ! {
     serial::puts("\n[reboot] resetting\n");
 
+    // Media barrier before anything else: the ext2 write-back cache out, then
+    // the disk's own volatile cache (`SYNCHRONIZE CACHE`). A drive that has
+    // only *acknowledged* our WRITE(10)s loses them in its own order when the
+    // reset cuts power — which is how 2026-10-05's `reboot -f` lost renames
+    // and half-persisted a freed inode (corruption doc §11). Failures print
+    // and the reset proceeds anyway: a wedged disk must not wedge the reboot
+    // itself.
+    serial::puts("[reboot] flushing filesystems\n");
+    // Per-mount failures print inside ext2's flush path where they can; here
+    // one line suffices. A failed sync must not strand the reboot — the data
+    // is e2fsck-recoverable, and a wedged disk must not wedge the reset.
+    if akuma_vfs_glue::sync_all_filesystems().is_err() {
+        serial::puts("[reboot] fs sync failed; disk may need e2fsck\n");
+    }
+    let _ = crate::xhci::flush();
+
     // Before the reset, not after: a reset does not stop a bus-master device.
     // An xHCI controller still running here keeps writing its rings into this
     // kernel's `.bss` while the firmware POSTs and the loader unpacks the next

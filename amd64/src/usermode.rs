@@ -1558,6 +1558,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::SchedGetaffinity => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Umask => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         Syscall::Fsync | Syscall::Fdatasync => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        // `sync(2)` takes no arguments; `syncfs(fd)` scopes the flush to the
+        // filesystem holding the descriptor. Both were ENOSYS on this target
+        // until 2026-10-05 — musl's `sync()` silently did nothing, and no
+        // durability barrier existed anywhere below it (corruption doc §11).
+        Syscall::Sync => to_glue(call, [0, 0, 0, 0, 0, 0]),
+        Syscall::Syncfs => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `posix_fadvise` — advisory by Linux's own contract, and akuma has
         // no readahead state to tune, so success is the honest answer rather
         // than a lie callers die on (parity-db `try_io!`s this). Same shape

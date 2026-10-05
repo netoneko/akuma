@@ -4068,7 +4068,13 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         // for an explicit `fsync`/`sync` syscall. Data + inode + bitmap blocks
         // are always written through, so there is nothing else to push.
         let mut state = self.write_state();
-        self.flush_meta(&mut state)
+        self.flush_meta(&mut state)?;
+        // The media barrier, after the writes: `flush_meta`'s device writes are
+        // *acknowledged* by the adapter, which on USB means "in the drive's
+        // volatile cache". Until the device's own `flush` lands, `sync` has
+        // promised a durability the stack does not have — the 2026-10-05
+        // reboot lost acknowledged renames exactly there (corruption doc §11).
+        self.dev.flush().map_err(|_| FsError::IoError)
     }
 
     fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {

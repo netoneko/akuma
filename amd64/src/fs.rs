@@ -220,6 +220,10 @@ impl BlockDevice for VirtioBlk {
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         akuma_virtio::block::write_bytes(offset, data).map_err(|_| ())
     }
+
+    // No `flush`: the default no-op is the honest answer. The cache in front
+    // of the media here is the *host's* (QEMU/Firecracker), which this kernel
+    // cannot reach past; a VMM-backed disk loses nothing to a guest reset.
 }
 
 /// A partition on the USB disk, as something `akuma-ext2` can read.
@@ -245,6 +249,13 @@ impl BlockDevice for UsbDisk {
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         crate::xhci::write_bytes(self.partition_offset + offset, data).map_err(|_| ())
+    }
+
+    /// SCSI `SYNCHRONIZE CACHE (10)`, whole medium. The partition offset is
+    /// irrelevant: the barrier is drive-wide, and `lba 0, blocks 0` asks for
+    /// exactly that.
+    fn flush(&self) -> Result<(), ()> {
+        crate::xhci::flush().map_err(|_| ())
     }
 }
 
@@ -280,6 +291,13 @@ impl BlockDevice for RootDevice {
             Self::Virtio(d) => d.write_bytes(offset, data),
             Self::Ram(d) => d.write_bytes(offset, data),
             Self::Usb(d) => d.write_bytes(offset, data),
+        }
+    }
+
+    fn flush(&self) -> Result<(), ()> {
+        match self {
+            Self::Virtio(_) | Self::Ram(_) => Ok(()),
+            Self::Usb(d) => d.flush(),
         }
     }
 }
