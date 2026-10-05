@@ -345,3 +345,37 @@ claimed-but-free blocks (inodes 14222, 46095, 46187) can still be handed out aga
 **Open:** the dmesg lines for the second owner are capped (80); raise `PRINT_CAP` or add a
 `path` lookup if the full list is wanted. rio on the pty swallowing Esc/Enter/`1` is a
 separate issue, `AKUMA_AMD64_PTY.md` §7.
+
+
+## 14. The damaged-file list (full audit, 2026-10-05, kernel `8f4b013b`, `PRINT_CAP` 400)
+
+`cross_linked=170 claimed_but_free=7 out_of_range=2125` over 100 301 inodes — identical after two
+further immediate `reboot -f` cycles on the barrier kernel (no new damage). The 170 are only
+**65 distinct blocks**, each claimed by 2-10 files: the same low-numbered blocks were handed to
+every new file written during Oct 5 (`akuma-amd64.new` lb 1655-1668 = physical 646998, 647901,
+647946, 648321, 877159, 1002861, 1014549, ...; then FETCH_HEAD, the 3 AM sessions.db-wal,
+`sshd.log`, `fb.log.old`, the pty2 kernel copy all took them as their first blocks).
+
+That fits lost bitmap writes exactly: the bitmap block is rewritten by every `flush_meta`, so it
+is always the *most recently written* block — the one still in the drive's volatile cache when
+`reboot -f` cuts power. Each boot therefore mounted a bitmap that lacked the previous boot's last
+allocations, and the allocator re-issued the same lowest free blocks again, ~10 times in one day.
+(Inference from the pattern; the direct evidence is §13's before/after test.)
+
+**Restage / repair, by kind** (older owner = the damaged one; the last writer of a shared block
+kept its bytes). Do `e2fsck -fy` from Ubuntu **first** (rewriting a cross-linked
+file frees blocks the other owner still uses).
+
+| Kind | Files (inode) | Action |
+|---|---|---|
+| Toolchain / binaries | `/usr/local/rust/lib/librustc_driver-*.so` (3341), `/usr/local/bin/goose` (15687), `/usr/local/bin/nca.v3` (13414), `/usr/libexec/git-core/git-http-fetch` (461), `/bin/du` (2392092), `/bin/gzip` (2392103) | restage from source |
+| Git data | `akuma/.git/objects/pack/pack-651372…` (638), `pack-37769f…` (48452), `…/llama.cpp/…/pack-4df42c…` (2733), `.git/FETCH_HEAD` (2609), `.git/refs/remotes/litter/cats` (13282), `akuma/crates/akuma-kernel-glue/src/lib.rs` (957), `.git/objects/bb` (35279), `akuma-cli-wgpu/.git` (31799) | `git fsck`, refetch, `git checkout -- <file>` |
+| Large data | `bootstrap/music/tokyo_rider_enter_omegashima.wav` (12601) | restore from repo |
+| goose state | `~/.local/share/goose/sessions/sessions.db-wal` (36134), `~/.local/state/goose/logs/cli/2026-10-03` (30969) | the sqlite DB is suspect — restore from `goose-old-db*` or accept loss |
+| Build/cache output | `/root/mtarget/**` (8512, 8515, 8553, 8642, 8646), `nca/native-cli-ai/target/**/{serde_core,chrono,tracing-subscriber}` rmeta (18695, 21847, 23306), `~/.cargo/registry/.../{webpki-roots-1.0.6,windows_x86_64_gnu-0.42.2}` (1689474, 1728559), `/tmp/wgpu/naga/src/valid/interface.rs` (23817) | delete + rebuild/refetch |
+| Disposable | `/root/akuma-amd64.new` (9439), `…splash2` (9499), `/boot/akuma-amd64.pty2` (48412), `/tmp/akuma-wgpu` (46095), `/var/cache/apk/APKINDEX…` (46187), `/var/log/herd/sshd.log` (4112390), `/tmp/akuma-fb.log{,.old}` (48401, 48373), `/tmp/goose-long-1.log` (14205), `/tmp/crt-home/.config/rio/config.toml` (48381), `/root/dmesg-boot-*.txt` (13324, 14213, 14222), `/root/hda-m8b.bak` (13405), `…dumpster-…transcript.jsonl` (12271) | delete (never trust their content) |
+| Orphans | 14 allocated inodes with **no path** (35297, 35335-7, 35340, 36122, 36126, 36252, 36353-4, 48383-6): unlinked-while-pinned files whose deferred free never ran (reboot) | `e2fsck` reclaims them |
+| Claimed-but-free (7) | `dmesg-boot-20260926-103238.txt` (14222) blocks 3223859, 6255665, 3225396; `/tmp/akuma-wgpu` + APKINDEX share 5245051 | fixed by `e2fsck` |
+
+`/boot/akuma-amd64` itself (md5 `8f4b013b…`) is **not** on the list; `akuma-amd64.pty-good` /
+`.audit2` are backups of working kernels.
