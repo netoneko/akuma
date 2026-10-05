@@ -1,0 +1,221 @@
+# Akuma/amd64 on ryzen (bare metal) — what it would take, wifi first
+
+2026-10-06. Assessment only. Nothing on the box was changed: every probe below
+was read-only (`lspci`, `lsusb`, `lsblk`, `parted print`, `efibootmgr -v`,
+`journalctl -k`, sysfs, and `ntfsresize --info --no-action`, which refused and
+modified nothing).
+
+Written in answer to: "install akuma on it on a separate partition, get wifi
+going or better yet usb networking and then work on wifi via that", then
+narrowed to **"can we do wifi with a reboot cycle — temporarily boot Akuma, run
+tests, dump dmesg to disk, reboot back to Linux and keep working there?"**
+
+## Verdict
+
+1. **Yes, the reboot loop is the right way to develop wifi, and it does not need
+   a new partition or USB networking.** systemd-boot's one-shot entry boots
+   Akuma once and comes back to Pop on the next reset with no one at the
+   keyboard (§3). The kernel and a RAM root image can live on the second ESP,
+   which has 3.7 GiB free.
+2. **The box runs systemd-boot, not GRUB.** There is no GRUB line to add next to
+   Windows. Pop!_OS 22.04 boots `\EFI\systemd\systemd-bootx64.efi`;
+   `grub-efi-amd64-bin` is not installed and `grub-mkstandalone` is absent. The
+   equivalent is one standalone `grubx64.efi` (for `multiboot2`) plus one
+   systemd-boot entry file that points at it (§3).
+3. **The real costs are the log sink and a watchdog, not the boot.** Akuma can
+   read the ESP only through GRUB. Once it is running it has no NVMe driver and
+   cannot write vfat, so `dmesg` has to land somewhere else: a USB stick through
+   the existing xHCI mass-storage driver (cheapest), or a new NVMe driver
+   (§4). An unattended loop also needs a hang to end in a reset, which means
+   arming the FCH hardware watchdog (§3).
+4. **Native wifi on this card is a large project: 11–24 sessions with wide
+   error bars** (§5). The card is a Realtek RTL8852CE (`10ec:c852`, `rtw89`,
+   WiFi 6E). Akuma has no 802.11 stack and no kernel crypto. **Decision
+   (user, 2026-10-06): all of it stays in the kernel, with no userspace
+   supplicant.** That reverses the "kernel has no cryptography" line in
+   `CLAUDE.md` for the narrow WPA2 set (§5 W4). On
+   this exact box, Linux's own driver crashes the card's firmware routinely
+   (18,000 `[ERR]fw PC` lines and `SER catches error` this boot).
+5. **USB ethernet is cheap (3–6 sessions)** but optional for the wifi work (§6).
+   It buys an ssh session into Akuma on this box, not a faster loop: every
+   kernel change is still a reboot.
+6. **The persistent partition is Windows' partition, reformatted as ext2**
+   (user's decision, 2026-10-06). `nvme0n1p3`, 279 GiB, so no resizing is
+   needed. ntfsresize had also found that NTFS inconsistent, which no longer
+   matters. GRUB can read the kernel and root image from it on day one. Akuma
+   can write it once it has an NVMe driver (§4b, §7).
+
+## 1. The machine (measured)
+
+| | |
+|---|---|
+| Model | **Lenovo IdeaPad 5 2-in-1 16AHP9** (`83DS`), BIOS `P1CN30WW` 2025-07-10. A **laptop**, Pop!_OS 22.04, kernel 6.17.9 |
+| CPU / RAM | Ryzen 7 8845HS, 8C/16T; 13 GiB visible |
+| Firmware | UEFI, **Secure Boot off** (`SecureBoot` efivar = 0) |
+| Boot | **systemd-boot** on `nvme0n1p6` (2nd ESP, 3.9 GiB, 3.7 GiB free); `loader.conf` = `default Pop_OS-current`, no timeout, so the menu is hidden. Windows Boot Manager is on `nvme0n1p1` |
+| Disk | SK hynix 512 GB **NVMe** `1c5c:1d59`, GPT, no free space: ESP 260M · MSR · **Windows 279 GiB NTFS** · Pop ext4 191 GiB (76% used) · ESP 3.9 GiB · WinRE 2 GiB. No BitLocker (`blkid` reads plain NTFS) |
+| Wifi | **Realtek RTL8852CE** `10ec:c852` sub `17aa:5852`, BAR 1 MiB @ `0x80b00000`, firmware `rtw89/rtw8852c_fw-1.bin` v0.27.122.0, `rfe_type 1`. Bluetooth is the same chip's USB function (`0bda:5852`) |
+| Ethernet | **none**. Wifi is the box's only network today, which is why a Linux-side capture that unloads `rtw89` drops ssh |
+| USB | 4 xHCI controllers, all AMD: `04:00.3` (`15b9`, bus 1/2: 5×USB2 + 2×SS), `04:00.4` (`15ba`, bus 3/4: internal camera), `06:00.3`/`06:00.4` (`15c0`/`15c1`, buses 5–8, USB4-side). 64-bit BARs, all below 4 GiB. Two Type-C ports (`/sys/class/typec/port{0,1}`) |
+| Keyboard | **real i8042** (`AT Translated Set 2 keyboard` on `isa0060/serio0`). The internal keyboard is PS/2 behind the EC, not USB, so `amd64/src/kbd.rs` should work natively. The trashcan never had that |
+| Touch | I2C HID (Goodix touchpad, Wacom pen). Not needed |
+| Display | eDP 1920×1200. The GRUB GOP framebuffer is all `akuma-fbcon` needs; the Radeon 780M is never touched |
+| Serial | **none** (8250 probed `uart:unknown` at all four legacy ports). Same situation as the trashcan |
+| IOMMU | AMD-Vi present (IVRS), Linux uses translated default domain. Whether firmware leaves it on at handoff is **unmeasured**; `amd64/src/xhci.rs` assumes "no IOMMU on this target" |
+
+Also live on this box, and **down for every Akuma cycle**: the Firecracker
+guest (`akuma-vm.json`, tap0, kot), `llama-server`, docker, and the user's own
+sessions.
+
+## 2. What already works on this machine's hardware class
+
+From the trashcan port (`AKUMA_AMD64_ON_HP_500_502NJ.md`,
+`docs/runbooks/amd64-bare-metal-loop.md`): multiboot2 boot from GRUB, GOP
+framebuffer console, ACPI/MADT, LAPIC timer, SMP, a ramdisk root from a
+multiboot2 module (`amd64/src/ramdisk.rs`), polled xHCI with USB mass storage
+and a HID keyboard, `0xCF9`/i8042/triple-fault reboot (`amd64/src/reboot.rs`).
+On an AMD FCH, `0xCF9` is the standard reset port, so reboot should work as-is.
+
+Unknowns that only a first boot will settle:
+
+- **SMP at 16 threads.** The trashcan has 4. Boot `nosmp` first.
+- **xHCI controller choice.** `xhci.rs:633` takes the **first** class
+  `0c03`/prog-if `30` device, which here is `04:00.3`. That controller owns 2 SS
+  ports, so a USB stick has to be in one of those ports. Which physical socket
+  that is has to be measured: plug the stick in under Linux and read `lsusb -t`.
+- **IOMMU at handoff**, as above.
+- The first one or two boots need **someone looking at the screen**. There is no
+  serial port and no network, so the framebuffer is the only output until the
+  log sink works.
+
+## 3. The reboot loop
+
+### Boot path: systemd-boot → standalone GRUB → Akuma
+
+```
+/boot/efi/EFI/akuma/grubx64.efi     # grub-mkstandalone -O x86_64-efi, modules: multiboot2 part_gpt fat
+/boot/efi/EFI/akuma/akuma-amd64     # the kernel (build with --features no-tests? see note)
+/boot/efi/EFI/akuma/root.img        # ext2 RAM root, the test init on it
+/boot/efi/loader/entries/akuma.conf
+    title Akuma/amd64
+    efi   /EFI/akuma/grubx64.efi
+```
+
+The embedded `grub.cfg` is
+`multiboot2 /EFI/akuma/akuma-amd64 init=/bin/<test> skiptests …` followed by
+`module2 /EFI/akuma/root.img`. Cost: `apt install grub-efi-amd64-bin` (binaries
+only; it does **not** touch Pop's boot chain) plus three files on `p6`. Removing
+it means deleting `EFI/akuma/` and `akuma.conf`. Linux's ESP and Windows are
+not touched.
+
+### One cycle
+
+```
+Linux:  build kernel + root.img → copy to /boot/efi/EFI/akuma/
+        bootctl set-oneshot akuma.conf && systemctl reboot
+Akuma:  test init runs the wifi probe, writes dmesg to the log sink, reboot -f
+Linux:  (one-shot consumed → default Pop entry) read the log, iterate
+```
+
+This is **the opposite of the trashcan's arrangement** (Akuma as GRUB default,
+with no remote way back). Here the default stays Pop, and Akuma only runs when
+it is armed. A reset from any cause lands back in Linux. Budget about 1–2 min
+per cycle (firmware POST plus two OS boots). `bootctl set-oneshot` is supported
+by Pop's systemd 249 but **untested on this box**: run it once with the
+Windows entry before relying on it.
+
+### What makes it unattended
+
+- **The Akuma side must always end in a reset.** The test init must finish with
+  `reboot -f` and also enforce its own deadline, so that a stuck userspace probe
+  still reboots. That is a few lines in the probe binary.
+- **A kernel wedge must also end in a reset.** Otherwise someone has to hold the
+  power button. Arm the **AMD FCH watchdog** (the device Linux binds
+  `sp5100_tco` to; `sp5100_tco` is in this box's module list) early in boot,
+  and pet it from the timer tick. Akuma has no watchdog today (no hits in
+  `amd64/src`). Cost: **~1 session**, mostly the FCH register sequence and
+  checking it fires. Until it exists, every cycle needs someone near the
+  machine.
+
+## 4. The log sink: where `dmesg` goes
+
+Akuma cannot write the ESP: it has no vfat and no NVMe driver.
+
+| option | new code | risk | verdict |
+|---|---|---|---|
+| **a. USB stick, ext2** | none if the existing xHCI + BOT driver comes up on an AMD controller; the test init writes `/mnt/dmesg.N` | stick must be in an SS port on `04:00.3`; xHCI bring-up has wedged a box before (`AKUMA_AMD64_XHCI_WEDGED_BOX`, faulted DMA across warm resets) | **do this first** |
+| b. **NVMe driver + the ext2 partition** (ex-Windows `p3`), mounted through `akuma-ext2` like the USB root. dmesg becomes a normal file Linux reads with `mount` | `akuma-nvme`: polled admin + one I/O queue, PRP, read/write. ~2–3 sessions on the `akuma-xhci` pure-crate pattern | it writes to the disk that holds Pop. The driver must hard-refuse any LBA outside `p3`'s GPT bounds, enforced in the driver and not left to the caller | **the target**: no stick, persistent root, self-install. Use (a) only if NVMe slips |
+| c. RAM that survives a warm reset | small | firmware may scrub it; unreliable | no |
+
+## 5. Native wifi on the RTL8852CE: the work, staged for the loop
+
+Every stage produces a dmesg line that says whether it worked, which is exactly
+what the reboot loop delivers. Session counts are rough. This card is among the
+hardest a hobby kernel could pick, and "golden reference from Linux" is the
+only thing that makes it tractable.
+
+| # | stage | done when | sessions |
+|---|---|---|---|
+| W0 | **Golden reference from Linux.** `mmiotrace` of an `rtw89_8852ce` unbind/bind, PCI config, efuse via debugfs, firmware file. This is the method `akuma-net-rtl8169` used. Unbinding drops the box's only network, so it has to be a **local script that rebinds itself**, not an ssh session | a register-level trace of power-on → firmware download → `fw ready` | 1 |
+| W1 | **Power-on + firmware download** in Akuma: PCIe/MAC power sequence, the DMA queue used to push `rtw8852c_fw-1.bin`, wait for the firmware-ready bit | `[rtw] fw ready v0.27.122` | 2–4 |
+| W2 | **Receive:** MAC/BB/RF init (large register tables, liftable as data from Linux `rtw8852c_table.c`; check the SPDX line, rtw89 is believed to be dual GPL/BSD), channel set, RX DMA ring, at least the RF calibration that RX needs | SSIDs and BSSIDs from beacons printed to dmesg | 3–6 |
+| W3 | **Transmit + 802.11 MLME:** TX ring, probe/auth/assoc frames, a station state machine. Test against an **open** AP (a phone hotspot) | associated, DHCP lease over the open network | 2–4 |
+| W4 | **WPA2-PSK, in the kernel** (no userspace supplicant, per the decision above): EAPOL 4-way handshake, HMAC-SHA1 PRF + MIC, AES key unwrap (RFC 3394) for the GTK, key install into the card's CAM so the **hardware** does CCMP. So the kernel needs only SHA-1 and AES-128 block decrypt, in a host-tested `forbid(unsafe_code)` crate with test vectors from the 802.11i annex. The PSK (PBKDF2-SHA1, 4096 iterations) can be computed once on Linux and passed as a 64-hex `psk=` on the cmdline, which keeps PBKDF2 out of the kernel entirely; or compute it at boot, at a cost of about 8k SHA-1 compressions | joins the home network | 2–4 |
+| W5 | **Integration + robustness:** `ExternalDevice::Rtw89` beside `Virtio`/`Rtl8169` in `akuma-net-nic`, netpoll, power save off, firmware-error (SER) recovery. Linux needs SER recovery on this very box | sshd reachable over wifi, survives an hour | 1–3 |
+
+**Total: 11–24 sessions and many dozens of reboot cycles.** W0–W2 can run
+entirely on the reboot loop. W3 onward needs an AP to test against and
+eventually a way to talk to Akuma, which is where §6 helps.
+
+A cheaper wifi path, if the goal is "Akuma on wifi" and not "this card": a USB
+wifi dongle with a small, well-understood chip (MT7601U being the classic
+choice). It reuses the xHCI work in §6 and skips PCIe DMA and the 802.11ax
+tables. W3–W4 are needed either way.
+
+## 6. USB ethernet (optional for wifi, nice for everything else)
+
+| # | stage | sessions |
+|---|---|---|
+| U0 | Existing xHCI driver up on an AMD controller (shared with §4a) | 1–2 |
+| U1 | CDC-ECM class driver: bulk in/out, raw Ethernet per transfer, link via the interrupt EP; `ExternalDevice::UsbEcm`. Pick a **plain single-port RTL8153 dongle** (its second USB configuration is standard CDC-ECM, so no vendor protocol). **Avoid dongles with a built-in hub**: Akuma has no hub driver. Phone USB tethering (NCM) is the alternative, at ~1 more session for NTB framing | 2–4 |
+
+It needs more xHCI slots and the event-ring demux by slot ID (today: one disk
+slot plus one keyboard slot, as singular statics). It gives ssh into Akuma on
+this box. It does **not** remove the reboot from the kernel-change loop.
+
+## 7. The persistent partition: ex-Windows `p3` as ext2
+
+- **Decision (user, 2026-10-06):** reformat `nvme0n1p3` (279 GiB, "Windows-SSD")
+  as ext2 and give it to Akuma. No resizing; the NTFS inconsistency becomes
+  irrelevant. Consequences to accept knowingly: Windows and its recovery
+  (`p4` WinRE) stop working, and Lenovo BIOS updates normally ship as Windows
+  executables (this BIOS is from 2025-07). The Windows Boot Manager entry on
+  `p1` becomes dead and can be removed from systemd-boot.
+- Format it as ext2 in the format `amd64/mkdisk.sh` produces (block size, revision
+  and features `akuma-ext2` supports), not `mkfs.ext2`'s defaults, or
+  check those defaults against the crate first.
+- **Before Akuma can write it:** NVMe driver (§4b). **Before that:** GRUB
+  (with the `ext2` module) loads `akuma-amd64` + `root.img` straight from `p3`
+  and `p6` holds only `grubx64.efi`. Once the driver exists, the root moves
+  from RAM to `p3` itself (`root=` on the cmdline), and Akuma installs its own
+  kernel, as it does on the trashcan.
+
+## Suggested order
+
+1. Linux side: format `p3` ext2, GRUB standalone + `akuma.conf`, test
+   `bootctl set-oneshot` first with the (still present) Windows entry, or with
+   a second Pop entry once Windows is gone. One attended boot of a stock Akuma
+   with `nosmp` (verify framebuffer, i8042 typing, reboot).
+2. Log sink: a USB stick (§4a) for the very first cycles if xHCI comes up
+   cleanly. Otherwise go straight to the NVMe driver (§4b), which is the target
+   anyway. Test init writes dmesg and reboots.
+3. FCH watchdog. From here the loop is unattended.
+4. W0 → W2 on the loop.
+5. Decide on §6 (USB ethernet) and/or a USB wifi dongle before W3.
+
+## Background
+
+- `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`: the same assessment for the trashcan
+- `docs/runbooks/amd64-bare-metal-loop.md`: boot options, xHCI rules, self-install
+- `docs/archive/AKUMA_FIRECRACKER_AMD64.md`, `crates/akuma-ryzen-amd64`: this box as a Firecracker host
+- `docs/archive/LITTER_TRASHCAN_RYZEN_JOIN.md`: ryzen's network role
