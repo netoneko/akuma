@@ -189,3 +189,13 @@ done: `/dev/ptmx` and `/dev/pts` do not appear in `ls /dev` (they are opened by
 name only), rio has not been run against the new kernel (the
 `/tmp/rio-expect.sh` checks in the handoff remain), and Alt has not been tried
 at the panel.
+
+**rio, 2026-10-05, on kernel `8bece079`** (`expect` over `ssh -tt`): rio took
+the real pty path — no `create_context failed`, no pipe-pty fallback in
+`/tmp/akuma-fb.log`; inside rio `tty` = `/dev/pts/0`, `stty size` = `63 239`,
+`vi` started full screen; `SIGTERM` to rio hung up its shell. Not checked:
+the scripted `vi` quit (ESC and `:wq` in one burst; a scripting issue, not
+re-run), `ssh late.sh` inside rio, Alt at the panel. The `/dev/ptmx` +
+`/dev/pts` listing is in the tree and passes `ptyprobe` 38/38 in QEMU, but is
+**not installed on the box**: the install's renames were lost across
+`reboot -f` (corruption doc §11).

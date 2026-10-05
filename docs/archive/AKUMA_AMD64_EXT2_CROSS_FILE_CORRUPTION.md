@@ -230,3 +230,34 @@ SMP). New kernel (`8bece079`): **300, 300, 300**.
 Per-chunk atomicity: `sys_write` still splits a write into 64 KiB chunks, so a
 single `write(2)` larger than that can interleave with another appender
 between chunks. Linux holds the inode lock for the whole call.
+
+## 11. Writes lost across `reboot -f` — no durability barrier at all (2026-10-05)
+
+Deploying the `/dev/pts` kernel: `mv /boot/akuma-amd64 /boot/akuma-amd64.prev
+&& mv /boot/akuma-amd64.pty2 /boot/akuma-amd64 && sync`, md5 of both names
+correct, then `busybox reboot -f` straight away. After the reboot **both
+renames were gone** (the old names pointed at the old inodes again), but
+**part** of the first rename had landed: the inode it replaced (9467, the
+previous `.prev`, an 8.5 MB kernel) now reads as a 2102-byte file dated 1970.
+The filesystem is inconsistent on disk; it needs an offline `e2fsck`.
+
+Two gaps explain it, and neither is ext2's write-back logic (`rename` ends in
+`flush_meta`, so its blocks were handed to the device):
+
+* **`sync(2)` is not dispatched on amd64** — x86_64 162 has no
+  `syscall_table!` row, so `busybox sync` gets `ENOSYS` silently.
+* **Nothing ever sends SCSI `SYNCHRONIZE CACHE`** to the USB disk
+  (`akuma-usb-storage`, `amd64/src/xhci.rs`), and `amd64/src/reboot.rs`
+  flushes nothing before resetting. A USB bridge/drive with a volatile write
+  cache acknowledges a `WRITE(10)` before the data is on the media; a reset
+  (which can cut port power) loses whatever it had not written yet, in its own
+  order — hence "some of the rename, not all of it".
+
+This does **not** explain §9 by itself (no reboot happened there), but it is
+the same class of symptom — the disk ends up with older contents than the
+cache acknowledged — and it must be fixed before any on-box verification of
+§9 can be trusted. Fix shape: a `SYNCHRONIZE CACHE(10)` CDB in
+`akuma-usb-storage`, an `xhci::flush()`, called from `sync`/`syncfs`/`fsync`
+(after the ext2 flush) and from `sys_reboot` before the reset, plus a
+`Sync`/`Syncfs` row in `akuma-syscalls-abi`. Until then: after a metadata
+change on the box, do not `reboot -f` right away; and treat `.prev` as gone.
