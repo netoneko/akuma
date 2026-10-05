@@ -675,7 +675,8 @@ pub fn read_at_open_file(
 }
 
 /// [`metadata`] for an open file description, by the inode `open(2)` bound to it
-/// when there is one and by path otherwise.///
+/// when there is one and by path otherwise.
+///
 /// The `stat` counterpart of [`read_at_open_file`], and it exists for the same
 /// two reasons: it skips a directory walk, and it keeps answering after the fd's
 /// name is gone. Before this, an unlinked-but-open fd could `read` fine while

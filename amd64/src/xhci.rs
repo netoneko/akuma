@@ -1972,7 +1972,8 @@ pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
 
 /// Write `data.len()` bytes at byte `offset` on the whole disk. A partial block
 /// at either end is read-modify-written.
-pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {    let mut g = lock_xhci();
+pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    let mut g = lock_xhci();
     let x = g.as_mut().ok_or("xHCI not initialised")?;
     let bl = x.block_len as usize;
     if bl == 0 {

@@ -5,7 +5,7 @@ use crate::Ext2Filesystem;
 use akuma_vfs::Filesystem;
 
 /// In-memory block device backed by a `Vec<u8>`.
-struct MemBlockDevice {
+pub(crate) struct MemBlockDevice {
     data: spinning_top::Spinlock<Vec<u8>>,
 }
 
@@ -71,7 +71,7 @@ fn mount_populated() -> Ext2Filesystem<MemBlockDevice> {
 /// concurrent pinned unlinks than the list holds" cannot be written against a
 /// filesystem that cannot hold that many files. Built with
 /// `mke2fs -t ext2 -b 1024 -N 2048 -I 128 -O ^resize_inode,^dir_index`.
-fn mount_many_inodes() -> Ext2Filesystem<MemBlockDevice> {
+pub(crate) fn mount_many_inodes() -> Ext2Filesystem<MemBlockDevice> {
     Ext2Filesystem::new(load_fixture("manyinodes.ext2"), || 0).unwrap()
 }
 

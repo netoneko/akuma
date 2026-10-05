@@ -579,7 +579,8 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     // to print, and `/proc/mounts` with a `none` in column one is what `df`
     // shows under `Filesystem`. It is also what enrols this filesystem in the
     // orphaned-lock sweep — see `install_reap_hooks`.
-    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, Arc::new(fs)) {
+    let fs = Arc::new(fs);
+    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, fs.clone()) {
         serial::puts("  fs:   could not mount ");
         serial::puts(name);
         serial::puts(" at /: ");
@@ -590,6 +591,18 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     serial::puts("  fs:   ext2 mounted on ");
     serial::puts(name);
     serial::puts("\n");
+    // `touch /.ext2audit` then reboot: walk every inode and report blocks
+    // claimed twice or claimed-but-free (`[E2-FSCK]` lines, readable with
+    // `dmesg`). The box that shows `docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_
+    // CORRUPTION.md`'s bug has no `e2fsck`. A flag file rather than a cmdline
+    // token because the GRUB entry is not editable from Akuma. Costs a full
+    // inode walk, so it only runs when asked.
+    if akuma_vfs::Filesystem::exists(&*fs, "/.ext2audit") {
+        serial::puts("  fs:   /.ext2audit present — auditing ext2\n");
+        if fs.audit().is_err() {
+            serial::puts("  fs:   ext2 audit hit an I/O error\n");
+        }
+    }
     // The VFS answers now, so the `akuma_vfs_glue::fs` facade — the gate every
     // folded glue fs arm sits behind — may say so. `fs::init` is the AArch64
     // route to this state (virtio-blk check, its own mounts, the fpcache and

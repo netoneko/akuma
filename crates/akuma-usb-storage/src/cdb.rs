@@ -17,6 +17,7 @@ mod op {
     /// SBC-3: force the medium's volatile cache to media.
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 }
+
 fn cmd(cdb_bytes: &[u8], data_len: u32, direction: Direction) -> Command {
     let mut cdb = [0u8; 16];
     cdb[..cdb_bytes.len()].copy_from_slice(cdb_bytes);
