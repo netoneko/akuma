@@ -37,5 +37,5 @@ python3 -m http.server "$PORT" --bind 0.0.0.0 --directory "$OUT" >/dev/null 2>&1
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 sleep 1
-ssh akuma "wget -q -O /tmp/rio http://$HOST_IP:$PORT/rio && chmod +x /tmp/rio && ls -l /tmp/rio"
-echo "on the box: . /etc/akuma-dev.env && /tmp/rio"
+ssh akuma "wget -q -O /bin/rio.new http://$HOST_IP:$PORT/rio && chmod +x /bin/rio.new && mv /bin/rio.new /bin/rio && ls -l /bin/rio"
+echo "on the box: . /etc/akuma-dev.env && /bin/rio"

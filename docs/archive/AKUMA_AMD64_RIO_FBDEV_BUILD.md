@@ -258,13 +258,12 @@ with rio's harness or a 30-line C program (`openpty`, fork `sh -i`, write
 * Quit: rio's quit binding is Super+Q, which the console cannot express.
   Ctrl+D (shell EOF) is the working exit — the shell exits and rio with it
   (verified 2026-10-05). Consider a rio binding patch.
-* `/tmp/rio` on the box is a rio *source checkout*, not the binary; the
-  deployed binary is `/tmp/rio-bin`. `userspace/rio/build.sh` still writes
-  `/tmp/rio` and fails there (wget: "Is a directory") — deploy by fetching
-  to `/tmp/rio-bin` instead until the script is changed.
+* rio is deployed to `/bin/rio` (2026-10-05) by `userspace/rio/build.sh`, next to the
+  other userspace binaries (the older `/tmp/rio-bin` is retired; `/tmp/rio` is a source
+  checkout). The process name is `rio`: `pidof rio | xargs -r kill -9`.
 * The panel accumulates stacked frozen rio instances if launched repeatedly
   while one holds `/dev/fb0` (subsequent launches get EBUSY and exit, but
-  wedged ones linger and eventually hang /proc). `pidof rio-bin |
+  wedged ones linger and eventually hang /proc). `pidof rio |
   xargs -r kill -9` from ssh — but expect it to hang if /proc is wedged;
   then only a reboot helps.
 * Two pacmans on the panel = the fbcon handback banner drawn twice (two
