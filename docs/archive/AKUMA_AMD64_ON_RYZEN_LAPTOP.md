@@ -200,6 +200,36 @@ this box. It does **not** remove the reboot from the kernel-change loop.
   from RAM to `p3` itself (`root=` on the cmdline), and Akuma installs its own
   kernel, as it does on the trashcan.
 
+## 8. Staged 2026-10-06 (not yet booted)
+
+Built **on ryzen** from a fresh clone of `ryzen-wifi` @ `47adf6f5` by
+`scripts/utils/ryzen_metal/build.sh` (as netoneko, ~3 min), installed by
+`scripts/utils/ryzen_metal/install.sh` (root). Work dir `/home/netoneko/akuma-metal`.
+
+| on the ESP (`p6`, `/boot/efi/EFI/akuma/`) | md5 |
+|---|---|
+| `akuma-amd64` — `--features no-tests` (3 test strings vs 23) | `d26083969e7e…` |
+| `akuma-amd64.tests` — plain, runs the self-test suite | `c45b1d0d3113…` |
+| `root.img` — `mkdisk.sh … 512`: herd (sshd + console enabled), busybox, tcc + libtcc1, sshd test key | `1ff588c4359e…` |
+| `grubx64.efi` — `grub-mkstandalone`, menu (5 s): 0 nosmp verbose · 1 self-tests nosmp · 2 SMP · 3 reboot | |
+
+`/boot/efi/loader/entries/akuma.conf` chainloads it; `bootctl list` shows it
+beside the two Pop entries. **Nothing is armed.** Boot once with
+`bootctl set-oneshot akuma.conf && systemctl reboot`.
+
+Changes on the box beyond those files: `grub-common` + `grub-efi-amd64-bin`
+installed, with their `grub-common`/`grub-initrd-fallback` services disabled
+again (they edit a `grubenv` that does not exist under systemd-boot). At the
+user's request, `sora.service` (live Firecracker guest) and `kot.service` are
+stopped and disabled; `systemctl enable --now sora kot` restores them.
+
+Two traps the build hit, both fixed in `build.sh`:
+- **tinycc's pinned commit `4597a962` no longer exists upstream.** repo.or.cz's
+  `mob` was rewritten, so a fetch of any depth fails with "did not contain". It
+  comes from a `git bundle` of a checkout that still has it (`$W/tinycc.bundle`).
+  Without it, `mkdisk.sh` silently stages no `/bin/tcc`.
+- **tcc's `build.rs` passes clang's `-target`**, and ryzen's `cc` is gcc: `CC=clang`.
+
 ## Suggested order
 
 1. Linux side: format `p3` ext2, GRUB standalone + `akuma.conf`, test
