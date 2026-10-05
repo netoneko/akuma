@@ -14,7 +14,10 @@
  * Run:   /tmp/ptyprobe            (it re-executes itself as `ptyprobe winch`,
  *                                  so run it by an absolute path)              */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pty.h>
@@ -96,10 +99,31 @@ static int winch_child(void) {
     return 0;
 }
 
+/* Is `name` an entry of directory `dir`? Reports its d_type through `type`. */
+static int listed(const char *dir, const char *name, int *type) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while ((e = readdir(d)))
+        if (!strcmp(e->d_name, name)) { found = 1; if (type) *type = e->d_type; }
+    closedir(d);
+    return found;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "winch"))
         return winch_child();
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* ---- the nodes ----------------------------------------------------------- */
+    struct stat st0;
+    int ty = -1;
+    CHECK(stat("/dev/ptmx", &st0) == 0 && S_ISCHR(st0.st_mode) && major(st0.st_rdev) == 5 && minor(st0.st_rdev) == 2,
+          "stat /dev/ptmx is char 5:2");
+    CHECK(listed("/dev", "ptmx", NULL), "ls /dev shows ptmx");
+    CHECK(listed("/dev", "pts", &ty) && ty == DT_DIR, "ls /dev shows pts/ as a directory");
+    CHECK(stat("/dev/pts", &st0) == 0 && S_ISDIR(st0.st_mode), "stat /dev/pts is a directory");
 
     /* ---- the device without a shell -------------------------------------- */
     int pm = posix_openpt(O_RDWR | O_NOCTTY);
@@ -112,12 +136,20 @@ int main(int argc, char **argv) {
     CHECK(unlockpt(pm) == 0, "unlockpt");
     ps = open(pn, O_RDWR | O_NOCTTY);
     CHECK(ps >= 0, "slave opens after unlockpt");
+    const char *num = pn + 9;
+    ty = -1;
+    CHECK(listed("/dev/pts", num, &ty) && ty == DT_CHR, "ls /dev/pts shows %s as a char device", num);
+    struct stat sst;
+    CHECK(stat(pn, &sst) == 0 && S_ISCHR(sst.st_mode) && major(sst.st_rdev) == 136, "stat %s is char 136:N", pn);
+    char numcopy[16];
+    snprintf(numcopy, sizeof numcopy, "%s", num);
     close(pm);
     char b[16];
     CHECK(read(ps, b, sizeof b) == 0, "slave reads EOF once the master is closed");
     errno = 0;
     CHECK(write(ps, "x", 1) < 0 && errno == EIO, "slave write is EIO once the master is closed");
     close(ps);
+    CHECK(!listed("/dev/pts", numcopy, NULL), "/dev/pts/%s is gone once both sides are closed", numcopy);
 
     int m, s;
     char name[64];

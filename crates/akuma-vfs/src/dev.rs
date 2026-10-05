@@ -81,6 +81,11 @@ const STATIC_NODES: &[DevNode] = &[
     // entry exists for `stat`/`ls` only — same shape as tap0, opposite reason.
     // Major 5 minor 0 is Linux's TTY_MAJOR/0.
     DevNode { name: "tty",     is_block: false, perm: 0o666, major: 5, minor: 0, ino: 16 },
+    // The pseudo-terminal multiplexer (`akuma-syscalls-glue::pty`). Like `tty`,
+    // `open()` is `sys_openat`'s (it allocates a pair); this entry is for
+    // `stat`/`ls`. Linux's 5:2. Its slaves live in `/dev/pts`, a directory,
+    // which is the VFS layer's to synthesize — this table holds nodes only.
+    DevNode { name: "ptmx",    is_block: false, perm: 0o666, major: 5, minor: 2, ino: 18 },
 ];
 
 /// The two nodes that exist only when a virtio-sound device was found. Both
@@ -317,5 +322,13 @@ mod tests {
         assert!(names(with).contains(&"fb0"));
         assert!(lookup(DevProbe::default(), "fb0").is_none());
         assert!(lookup(DevProbe { in_box: true, ..with }, "fb0").is_none());
+    }
+
+    #[test]
+    fn ptmx_is_always_there_and_is_5_2() {
+        let n = lookup(DevProbe::default(), "ptmx").expect("ptmx needs no hardware");
+        assert_eq!((n.mode(), n.major, n.minor), (0o20666, 5, 2));
+        assert!(names(DevProbe::default()).contains(&"ptmx"));
+        assert!(names(DevProbe { in_box: true, ..Default::default() }).is_empty(), "boxes list nothing");
     }
 }

@@ -3263,6 +3263,8 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
         // hoisted out of the per-entry map: every other directory listing pays
         // one string compare total, not a table lookup per entry.
         let is_dev = akuma_vfs_glue::is_dev_dir(&f.path);
+        // Every entry of `/dev/pts` is a pty slave: a character device.
+        let is_pts = akuma_vfs_glue::is_pts_dir(&f.path);
         let cache: alloc::vec::Vec<akuma_exec::process::types::DirCacheEntry> = dir_entries
             .iter()
             .map(|e| akuma_exec::process::types::DirCacheEntry {
@@ -3271,6 +3273,8 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
                     4
                 } else if e.is_symlink {
                     10
+                } else if is_pts {
+                    akuma_vfs::dev::DT_CHR
                 } else {
                     match is_dev.then(|| akuma_vfs_glue::dev_node_named(&e.name)).flatten() {
                         Some(node) => node.d_type(),

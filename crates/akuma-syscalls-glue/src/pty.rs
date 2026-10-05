@@ -127,6 +127,7 @@ pub fn pty_close(n: u32, master: bool) {
             // is a `free`, not an allocation. Taken out first so the drop is the
             // last thing the locked section does.
             drop(slot.pair.take());
+            akuma_vfs_glue::set_pts_live(n, false);
         }
         Some((hangup, wakes))
     });
@@ -195,6 +196,10 @@ pub fn open_ptmx(flags: u32) -> SysResult {
         let (n, slot) = t.iter_mut().enumerate().find(|(_, s)| s.pair.is_none())?;
         slot.generation = (slot.generation + 1) & 0x00FF_FFFF;
         slot.pair = Some(pair);
+        // `ls /dev/pts` and `stat("/dev/pts/N")` read this. Published under
+        // the table lock (it is one atomic `or`), so a concurrent last-close of
+        // the slot's previous pair cannot clear it after we set it.
+        akuma_vfs_glue::set_pts_live(n as u32, true);
         Some(n as u32)
     });
     // `ENOSPC` is what Linux's devpts says when it runs out of indices.
@@ -257,7 +262,8 @@ pub fn open_ctty(flags: u32) -> Option<SysResult> {
 #[must_use]
 pub fn stat_of(master: bool, n: u32) -> Stat {
     let (ino, mode, rdev) = if master {
-        (0x7074_FFFF, 0o020_666, makedev(5, 2))
+        // Inode 18: the `/dev` table's `ptmx` entry (`akuma_vfs::dev`).
+        (18, 0o020_666, makedev(5, 2))
     } else {
         (0x7074_0000 + u64::from(n), 0o020_620, makedev(136, u64::from(n)))
     };

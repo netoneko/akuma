@@ -452,6 +452,9 @@ pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
     // Synthetic /dev nodes, computed before the on-disk read so a `/dev` that
     // isn't on the image at all still lists. Empty for every other path, and
     // empty inside a box.
+    if is_pts_dir(path) && pts_visible() {
+        return Ok(pts_entries());
+    }
     let dev_entries = dev_entries(path);
 
     let mut entries = match with_fs(path, |fs, rel| fs.read_dir(rel)) {
@@ -748,7 +751,7 @@ pub fn exists(path: &str) -> bool {
     if is_mtab(path) {
         return true;
     }
-    if dev_node(path).is_some() {
+    if dev_node(path).is_some() || pts_metadata(path).is_some() {
         return true;
     }
     if with_fs(path, |fs, rel| Ok(fs.exists(rel))).unwrap_or(false) {
@@ -789,6 +792,9 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
             modified: None,
             accessed: None,
         });
+    }
+    if let Some(m) = pts_metadata(path) {
+        return Ok(m);
     }
     with_fs(path, |fs, rel| fs.metadata(rel)).or_else(|e| dev_dir_metadata(path).ok_or(e))
 }
@@ -1057,6 +1063,82 @@ const DEV_DIR: &str = "/dev";
 /// one. Sits next to `/etc/mtab`'s `u64::MAX - 1`, well clear of ext2's range.
 const DEV_DIR_INO: u64 = u64::MAX - 2;
 
+/// `/dev/pts`: the live pseudo-terminal pairs, bit `N` for `/dev/pts/N`.
+///
+/// The pair table is `akuma-syscalls-glue::pty`, which sits *above* this crate,
+/// so it publishes into this word instead of being asked. 64 bits because the
+/// number space is 64 (`akuma_pty::MAX_PTYS`). Readers want a listing and an
+/// existence answer; a mask gives both with no allocation and no lock.
+static PTS_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Mark `/dev/pts/{n}` as existing or gone (`akuma-syscalls-glue::pty`, at
+/// pair creation and at the pair's last close).
+pub fn set_pts_live(n: u32, live: bool) {
+    if n < 64 {
+        let bit = 1u64 << n;
+        if live {
+            PTS_LIVE.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            PTS_LIVE.fetch_and(!bit, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+const PTS_DIR: &str = "/dev/pts";
+/// Synthetic inode for `/dev/pts`, beside `/dev`'s.
+const PTS_DIR_INO: u64 = u64::MAX - 3;
+
+/// Whether `path` resolves to `/dev/pts` itself.
+#[must_use]
+pub fn is_pts_dir(path: &str) -> bool {
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    if trimmed == PTS_DIR {
+        return true;
+    }
+    !trimmed.starts_with('/') && resolve_absolute(trimmed) == PTS_DIR
+}
+
+/// The live pair `/dev/pts/N` names, for an absolute path.
+fn pts_slot(path: &str) -> Option<u32> {
+    let digits = path.strip_prefix("/dev/pts/")?;
+    if digits.is_empty() || digits.len() > 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    (n < 64 && PTS_LIVE.load(core::sync::atomic::Ordering::Relaxed) & (1 << n) != 0).then_some(n)
+}
+
+/// Neither `/dev/pts` nor its entries exist inside a box, for the reason
+/// `DevProbe::in_box` gives for `/dev`.
+fn pts_visible() -> bool {
+    akuma_exec::process::current_process_shared().is_none_or(|p| p.box_id == 0)
+}
+
+/// `/dev/pts`'s listing: one character-device entry per live pair.
+fn pts_entries() -> Vec<DirEntry> {
+    let mask = PTS_LIVE.load(core::sync::atomic::Ordering::Relaxed);
+    (0..64u32)
+        .filter(|n| mask & (1 << n) != 0)
+        .map(|n| DirEntry { name: alloc::format!("{n}"), is_dir: false, is_symlink: false, size: 0 })
+        .collect()
+}
+
+/// Metadata for `/dev/pts` and `/dev/pts/N`. The slave's numbers (136:N) are
+/// `akuma-syscalls-glue::pty::stat_of`'s, which `stat` uses; this answers the
+/// `metadata` callers (`access`, `exists`, `O_DIRECTORY` checks).
+fn pts_metadata(path: &str) -> Option<Metadata> {
+    if !pts_visible() {
+        return None;
+    }
+    let (is_dir, inode, mode) = if is_pts_dir(path) {
+        (true, PTS_DIR_INO, 0o40755)
+    } else {
+        let n = pts_slot(path)?;
+        (false, 0x7074_0000 + u64::from(n), 0o20620)
+    };
+    Some(Metadata { is_dir, size: 0, inode, mode, created: None, modified: None, accessed: None })
+}
+
 /// Whether the kernel offers `/dev/fb0`. Set once by the amd64 kernel when it
 /// booted with a direct-colour framebuffer; never set on AArch64.
 static FRAMEBUFFER_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1163,14 +1245,19 @@ fn dev_entries(path: &str) -> Vec<DirEntry> {
     if !is_dev_dir(path) {
         return Vec::new();
     }
-    akuma_vfs::dev::list(dev_probe())
+    let probe = dev_probe();
+    let mut entries: Vec<DirEntry> = akuma_vfs::dev::list(probe)
         .map(|node| DirEntry {
             name: String::from(node.name),
             is_dir: false,
             is_symlink: false,
             size: 0,
         })
-        .collect()
+        .collect();
+    if !probe.in_box {
+        entries.push(DirEntry { name: String::from("pts"), is_dir: true, is_symlink: false, size: 0 });
+    }
+    entries
 }
 
 /// Metadata for the `/dev` *directory*, used only when the image has no real
