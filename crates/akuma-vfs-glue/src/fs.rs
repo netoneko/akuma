@@ -266,6 +266,14 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
     crate::write_at(path, offset, data)
 }
 
+/// `O_APPEND` write, atomic against other appenders — see [`crate::append`].
+pub fn append(path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    crate::append(path, data)
+}
+
 
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {

@@ -15,6 +15,7 @@ akuma-net = { path = "../akuma-net", default-features = false }
 akuma-net-unix = { path = "../akuma-net-unix" }
 akuma-net-yarn = { path = "../akuma-net-yarn" }
 akuma-pipes = { path = "../akuma-pipes" }
+akuma-pty = { path = "../akuma-pty" }
 akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-syscalls = { path = "../akuma-syscalls" }

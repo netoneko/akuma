@@ -100,6 +100,13 @@ pub enum FdState {
     /// The raw `/dev/net/tap0` device the rump server's RX kthread blocks on.
     Tap { has_frame: bool },
 
+    /// Either side of a pseudo-terminal pair. `hup` is the *other* side being
+    /// gone — the slave closed (for the master) or the master closed (for the
+    /// slave) — and, like a pipe's, it is unmaskable: it is the only event an
+    /// edge-triggered emulator gets when its shell exits with nothing left to
+    /// read (`akuma_pty::PtyPair::master_poll`).
+    Pty { can_read: bool, can_write: bool, hup: bool },
+
     /// An fd kind with no readiness model — a plain file, most of them.
     /// Reported ready for whatever was asked, which is the POSIX answer for a
     /// regular file and a lie for anything else.
@@ -252,6 +259,18 @@ pub const fn readiness(state: FdState, requested: u32) -> u32 {
             }
             if wants_out {
                 ready |= EPOLLOUT;
+            }
+        }
+
+        FdState::Pty { can_read, can_write, hup } => {
+            if wants_in && can_read {
+                ready |= EPOLLIN;
+            }
+            if wants_out && can_write {
+                ready |= EPOLLOUT;
+            }
+            if hup {
+                ready |= EPOLLHUP;
             }
         }
 

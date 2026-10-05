@@ -136,6 +136,22 @@ pub trait Filesystem: Send + Sync {
         Ok(data.len())
     }
 
+    /// `O_APPEND`: write `data` at the end of the file, returning `(offset it
+    /// landed at, bytes written)`.
+    ///
+    /// **A filesystem that can be written concurrently must override this** so
+    /// that reading the size and writing past it are one critical section.
+    /// This default asks `metadata` and then calls `write_at`, which is two
+    /// steps: two appenders can read the same size and the second overwrites
+    /// the first — the lost-line bug `AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md`
+    /// §5 measured (298 of 300 lines from two `>>` loops). It is kept for the
+    /// in-memory filesystems, which have no concurrent writers in practice.
+    fn append(&self, path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+        let offset = self.metadata(path).map_or(0, |m| m.size as usize);
+        let n = self.write_at(path, offset, data)?;
+        Ok((offset, n))
+    }
+
     fn create_dir(&self, path: &str) -> Result<(), FsError>;
     fn remove_file(&self, path: &str) -> Result<(), FsError>;
     fn remove_dir(&self, path: &str) -> Result<(), FsError>;

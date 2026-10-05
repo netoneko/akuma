@@ -58,7 +58,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 /// Rate-limit counter for the `[KTG-MISMATCH]` tripwire in [`kill_thread_group`].
 static KTG_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
@@ -783,6 +783,17 @@ pub struct Process {
     pub fds: Arc<SharedFdTable>,
     pub thread_id: Option<usize>,
     pub spawner_pid: Option<Pid>,
+    /// The pseudo-terminal this process's session controls, as the encoded
+    /// id `akuma-syscalls-glue`'s pty table hands out (`0` = none — the
+    /// console, a pipe, nothing).
+    ///
+    /// Inherited by `fork`/`clone` and kept across `execve`, like Linux's
+    /// `signal->tty`; cleared by `setsid` and `TIOCNOTTY`, set by `TIOCSCTTY`.
+    /// The id carries the pair's generation, so a value outliving its pair
+    /// (the emulator closed the master and the slot was reused) names nothing
+    /// rather than someone else's terminal. Atomic because `TIOCSCTTY` and
+    /// `setsid` set it on `&self` while peers read it for `/dev/tty`.
+    pub ctty: AtomicU32,
     pub terminal_state: Arc<Spinlock<terminal::TerminalState>>,
     pub box_id: u64,
     pub namespace: Arc<akuma_isolation::Namespace>,
@@ -943,6 +954,7 @@ impl Process {
             stdin: parent.stdin.clone(),   // shared
             stdout: parent.stdout.clone(), // shared
             spawner_pid: parent.spawner_pid,
+            ctty: AtomicU32::new(parent.ctty.load(Ordering::Relaxed)),
             terminal_state: parent.terminal_state.clone(),
             box_id: parent.box_id,
             namespace: parent.namespace.clone(),
@@ -4030,7 +4042,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
-        thread_id: None, spawner_pid: None,
+        thread_id: None, spawner_pid: None, ctty: AtomicU32::new(0),
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: AtomicU64::new(0),

@@ -469,6 +469,10 @@ impl ProcFilesystem {
             FileDescriptor::DevZero => String::from("/dev/zero"),
             FileDescriptor::DevDsp => String::from("/dev/dsp"),
             FileDescriptor::DevFb => String::from("/dev/fb0"),
+            // `ttyname(3)` reads this link: the slave's name is what `tty`,
+            // `ps` and `sshd` print for a pty session.
+            FileDescriptor::PtyMaster(_) => String::from("/dev/ptmx"),
+            FileDescriptor::PtySlave(n) => format!("/dev/pts/{n}"),
             FileDescriptor::Tap { .. } => String::from("/dev/net/tap0"),
             FileDescriptor::RumpSocket { rump_fd, .. } => format!("socket:[rump:{rump_fd}]"),
             FileDescriptor::Stdin => String::from("/dev/stdin"),

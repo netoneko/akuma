@@ -139,38 +139,129 @@ still open. All the debug tooling below lives in the rio fork's
 
 ### Kernel-side findings (for the kernel repo)
 
+Consolidated, with priorities: `AKUMA_AMD64_WGPU_KERNEL_WORK.md`. The ext2
+corruption and the lost `O_APPEND` writes: `AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md`.
+
 * **A process blocked in a console read can wedge `/proc` readdir
   system-wide** (observed twice: `ls /proc` over ssh hung until the wedged
   rio died). Suspicion, not proven — but it happened twice, and both times
   a frozen console-reader was alive.
-* Console read ignores `VMIN=0`/O_NONBLOCK semantics (blocks
-  uninterruptibly); the same is suspected for pty master reads — this is
-  exactly where rio's still-open issue points (next section).
+* Console read ignores `VMIN=0` semantics (fixed on our side with
+  O_NONBLOCK, which the console does honour, and a sliced poll).
+* **No ptys at all** (no `/dev/ptmx`, no `/dev/pts`) — the cause of rio's
+  dead input; spec below.
+* **One terminal state per console session**: interactive children
+  share the console shell's termios (`spawn_inherits_terminal`,
+  `crates/akuma-exec/src/process/spawn.rs`). A raw-mode program killed
+  with SIGKILL leaves the console raw — output loses NL→CRLF ("line
+  breaks are gone") for every later program; `stty sane` repairs it.
+  (Linux behaves the same; Linux shells re-sane the tty at each prompt.)
+  rio's fb platform now heals a raw state it finds at startup (fork
+  349d585).
+* **A shell can hang in its own exit** (once in four runs, 2026-10-05):
+  `sh -i` on pipes (rio's fallback), stdin at EOF after ^D, printed its
+  exit newline; `/proc/<pid>/syscalls` ends with `close(0)` (generic
+  numbering, 57); then `State: R` forever, never a zombie, parent never
+  gets SIGCHLD. Not reproduced deliberately yet.
+* **`SOCK_CLOEXEC` is not honoured** (socketpair fds leak into exec'd
+  children; `pipe2(O_CLOEXEC)` looked fine). rio's pipe pty now closes fds
+  3..1024 in the child.
+* **ext2: a file's data replaced by another file's** after truncating
+  `/tmp/akuma-fb.log` (`: >`) and appending again: the rewritten
+  `/tmp/crt-home/.config/rio/config.toml` held trace text, size 2243 B vs
+  1391 lines. Looks like freed blocks reallocated while still owned.
+  Workaround: rotate with `mv`, never truncate. Investigate in the kernel.
+* **Alt is dropped by the USB keyboard driver** — `crates/akuma-usb/src/hid.rs`
+  `emit_key` consults only Shift/Ctrl. Suggested fix: when `MOD_LALT|MOD_RALT`
+  is held and the key emits a byte, emit `0x1b` first (Linux "meta sends
+  escape"); rio's fb platform already decodes ESC+key as Alt+key.
+* **Orphans are never reaped**: a child whose parent was killed stays a
+  zombie (`State: Z`, `PPid` = the dead parent) — nothing reparents it to
+  init. Killed rio instances and their shells pile up in `ps` this way.
 
-### Still open: keys reach rio, the shell never echoes (UNRESOLVED)
+### Resolved 2026-10-05: keys reached rio, the shell never echoed
 
-Symptom: rio renders, takes input (KeyboardInput events confirmed
-delivered — 164 of them in one trace; ctrl+enter even dismisses rio's
-config-error screen), but typed text never appears and the cursor is
-frozen. The remaining suspects, in order:
+Symptom was: rio renders and takes input, typed text never appears, pink
+cursor frozen. **Cause: the kernel has no ptys.** There is no `/dev/ptmx`
+and no `/dev/pts` (`ls /dev` = `fb0 null random tty urandom zero`; even an
+`ssh -tt` session reports "not a tty"). rio's `forkpty` (default path) or
+`openpty` (`-e <program>` path, which sets `use_fork = false`) failed, and
+rioterm silently substituted a **dead context** — it renders and accepts
+keys with no shell behind it. The error went only to `tracing`, which never
+reaches disk on the box. epoll, the reactor and the input path were fine.
 
-1. rio's reactor (corcovado, its epoll wrapper) never sees the pty master
-   become readable — epoll semantics on pty masters on this kernel are
-   unverified. The shell's echo would never render.
-2. The pty master write or read blocking (same kernel disease as the
-   console read — the kernel ignores non-blocking semantics on the
-   console, ptys may be the same).
-3. ash spawn failing silently (check for a live ash child of rio-bin).
+How it was found: a trace line in rioterm's `create_context` error arm
+(`[ctx] create_context failed, dead context: … forkpty failed using
+/bin/sh`), after `[pty]` trace points in the rio-vt reactor showed the
+reactor thread never started. The earlier "start from rio's own log" lead
+was a dead end: `/tmp/rio.log` is only the expect harness's stderr redirect
+of the fb trace; `--enable-log-file` writes `~/.config/rio/log/rio.log`,
+which has never existed on the box.
 
-Next session should start from rio's own log (`--enable-log-file` flag;
-a fresh 34 KB `/tmp/rio.log` was written 2026-10-04 20:55 and never
-examined) and put trace points on the pty write (`messenger.send_write`)
-and the reactor read path.
+Fixes (rio fork, `main`: 4c747d1, a65ce4a, dd71a2a):
+
+1. **Pipe pty fallback** — `teletypewriter/src/unix/pipe_pty.rs`, musl
+   only, taken only when `forkpty`/`openpty` fail (both creation paths).
+   The shell runs as `sh -i` (when no args are given) on pipes, in its own
+   session (`setsid`); rio's end of the "pty" is one end of an AF_UNIX
+   socketpair, so the reactor/epoll code is untouched; a relay thread plays
+   a cooked line discipline: echo, UTF-8-aware erase, ^U, ^W, ^C → SIGINT to
+   the shell's process group, ^D → EOF on an empty line, ICRNL in, ONLCR
+   out, escape sequences swallowed. Host unit tests:
+   `cargo test -p teletypewriter --lib pipe_pty`. Limits: no tty
+   (`isatty` false in the shell), no job control, no line editing or
+   history, full-screen programs (vi, top, less) do not work.
+2. **fb platform sends `ModifiersChanged` before `KeyboardInput`** (winit's
+   order). rio's `ctrl_seq` reads the modifier state while handling the key;
+   the old order gave every key the previous key's modifiers, so Ctrl+D was
+   sent as nothing.
+3. Trace: `[pty]` lines (each poll wakeup with tokens/readiness, read
+   bytes, writes, queued input, reactor exit reason) and `[ctx]` lines go
+   to `/tmp/akuma-fb.log` with the fb input trace, one `write` per line.
+
+Verified: over the ssh expect harness with and without `-e /bin/sh`
+(prompt `/tmp # `, `ls` echoed and its listing rendered, ^D → shell exits
+with status 0 → rio exits), and by a person at the panel typing on the
+console keyboard (`/tmp/rio-bin -e /bin/sh`).
+
+### Kernel spec: Linux ptys (`/dev/ptmx` + `/dev/pts/N`)
+
+The real fix; with it rio (and any terminal emulator, tmux, script, expect)
+works unmodified, including full-screen programs, and the fallback above is
+never taken. What musl's `openpty`/`forkpty` and rio need, in call order:
+
+| step | call | kernel behaviour needed |
+|---|---|---|
+| allocate | `open("/dev/ptmx", O_RDWR\|O_NOCTTY[\|O_CLOEXEC])` | new pair N; returns the master fd (new `FileDescriptor::PtyMaster(N)`, opened in `openat` beside `/dev/tty` and `/dev/dsp` in `crates/akuma-syscalls-glue/src/fs.rs`) |
+| unlock | `ioctl(master, TIOCSPTLCK, &0)` (0x40045431) | accept; may be a no-op |
+| name | `ioctl(master, TIOCGPTN, &n)` (0x80045430) | write N |
+| slave | `open("/dev/pts/N", O_RDWR\|O_NOCTTY)` | `FileDescriptor::PtySlave(N)`; `/dev/pts` listable is nice-to-have |
+| setup | `tcsetattr(slave)` (TCSETS), `ioctl(slave, TIOCSWINSZ)` | per-pair `TerminalState` (reuse `crates/akuma-terminal`) and winsize |
+| child | `setsid()`; `ioctl(slave, TIOCSCTTY, 0)`; `dup2` slave to 0/1/2 | controlling tty = pair N; `isatty(0)` true; TCGETS/TIOCGWINSZ/TIOCGPGRP/TIOCSPGRP on the slave |
+| master I/O | `read`/`write` on master | write → slave input through the line discipline (`process_canon_input`, echo goes back to the master's read queue); slave write → `translate_output` (ONLCR) → master read queue |
+| nonblocking | `fcntl(O_NONBLOCK)` on master | **must** return EAGAIN (the console channel ignores it — see findings) |
+| readiness | epoll/poll on master, level and edge | EPOLLIN when output queued, EPOLLOUT when input has room; EPOLLHUP + read EIO after the last slave fd closes; re-arm edges on drain (`epoll_on_fd_drained`, the TOKIO_PIPE_EPOLL_HANG lesson) |
+| resize | `ioctl(master, TIOCSWINSZ)` | store and send SIGWINCH to the slave's foreground group |
+| signals | ^C/^Z/^\\ in ISIG mode | SIGINT/SIGTSTP/SIGQUIT to the foreground process group |
+| close | last master close | SIGHUP to the session; slave reads return EOF/EIO |
+
+`crates/akuma-terminal::TerminalState` already implements the line
+discipline (ICRNL, canonical editing, echo, ONLCR, raw mode) and the
+sshd/`SPAWN_FLAG_PTY` channel wiring in `BOX_PTY_INTERACTIVE_SHELL.md` shows
+how a channel becomes a terminal; the missing pieces are the device nodes,
+the master/slave fd types, the ioctls, and readiness. Test from userspace
+with rio's harness or a 30-line C program (`openpty`, fork `sh -i`, write
+`echo hi\n` to the master, poll + read until `hi` comes back).
 
 ### Housekeeping notes
 
 * Quit: rio's quit binding is Super+Q, which the console cannot express.
-  Ctrl+D (shell EOF) is the working exit. Consider a rio binding patch.
+  Ctrl+D (shell EOF) is the working exit — the shell exits and rio with it
+  (verified 2026-10-05). Consider a rio binding patch.
+* `/tmp/rio` on the box is a rio *source checkout*, not the binary; the
+  deployed binary is `/tmp/rio-bin`. `userspace/rio/build.sh` still writes
+  `/tmp/rio` and fails there (wget: "Is a directory") — deploy by fetching
+  to `/tmp/rio-bin` instead until the script is changed.
 * The panel accumulates stacked frozen rio instances if launched repeatedly
   while one holds `/dev/fb0` (subsequent launches get EBUSY and exit, but
   wedged ones linger and eventually hang /proc). `pidof rio-bin |

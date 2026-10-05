@@ -135,6 +135,21 @@ fn a_pipe_at_eof_reports_hup_so_the_eof_transition_is_an_edge() {
     assert_eq!(readiness(has_bytes, EPOLLIN), EPOLLIN);
 }
 
+/// A pseudo-terminal side whose peer is gone reports `EPOLLHUP` whether or
+/// not it was asked for — rio's reactor watches the master edge-triggered and
+/// learns its shell exited from that bit, with nothing left to read
+/// (`akuma_pty::PtyPair::master_poll`). The other two bits are maskable.
+#[test]
+fn a_pty_reports_hup_unmaskably_and_in_out_on_request() {
+    let live = FdState::Pty { can_read: true, can_write: true, hup: false };
+    assert_eq!(readiness(live, EPOLLIN | EPOLLOUT), EPOLLIN | EPOLLOUT);
+    assert_eq!(readiness(live, EPOLLIN), EPOLLIN);
+    assert_eq!(readiness(live, NONE), 0);
+    let hung = FdState::Pty { can_read: true, can_write: false, hup: true };
+    assert_eq!(readiness(hung, NONE), EPOLLHUP);
+    assert_eq!(readiness(hung, EPOLLIN | EPOLLOUT), EPOLLIN | EPOLLHUP);
+}
+
 /// A poll on an fd the calling process does not have is answered
 /// `EPOLLHUP|EPOLLERR`, unmaskably, so the caller cannot block forever on a
 /// number that will never be ready.
@@ -196,6 +211,7 @@ fn no_state_ever_reports_a_registration_only_bit() {
         FdState::Sink,
         FdState::RumpSocket { readable: true },
         FdState::Tap { has_frame: true },
+        FdState::Pty { can_read: true, can_write: true, hup: true },
         FdState::Unmodelled,
     ];
     for s in states {

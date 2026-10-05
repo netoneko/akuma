@@ -32,6 +32,8 @@ pub const MOD_RGUI: u8 = 1 << 7;
 pub const MOD_SHIFT: u8 = MOD_LSHIFT | MOD_RSHIFT;
 /// Either Ctrl held.
 pub const MOD_CTRL: u8 = MOD_LCTRL | MOD_RCTRL;
+/// Either Alt held.
+pub const MOD_ALT: u8 = MOD_LALT | MOD_RALT;
 
 /// Usage code for Caps Lock — a toggle the decoder tracks itself.
 pub const USAGE_CAPS_LOCK: u8 = 0x39;

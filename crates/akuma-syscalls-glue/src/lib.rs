@@ -140,6 +140,7 @@ pub use poll::run_pselect6_eintr_test;
 #[cfg(kernel_tests)]
 pub use fs::run_writev_short_write_tests;
 pub mod pipe;
+pub mod pty;
 pub mod poll;
 pub mod proc;
 /// AF_UNIX sockets — the kernel half.

@@ -88,6 +88,16 @@ pub fn set_wake_sink(f: fn(usize, WakeHandle)) {
     WAKE_SINK.set(f);
 }
 
+/// Wake one waiter through the same sink [`fire`] uses — for a wait set that
+/// is not a pipe's (`super::pty`), so a second table does not bypass the
+/// amd64 kernel's wake accounting. **Call with no lock held.**
+pub(crate) fn fire_one(tid: usize, handle: WakeHandle) {
+    match WAKE_SINK.get() {
+        Some(sink) => sink(tid, handle),
+        None => wake_by_handle(handle),
+    }
+}
+
 /// Make every returned waiter runnable. **Call with no lock held.**
 fn fire(wakes: Wakes<WakeHandle>) {
     match WAKE_SINK.get() {

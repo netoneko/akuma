@@ -375,6 +375,14 @@ impl BootKeyboardDecoder {
     }
 
     /// Emit the bytes one key produces. `true` if it produced any.
+    ///
+    /// **Alt is "meta sends escape"**, as the Linux console and every xterm
+    /// default do: Alt+key is `ESC` followed by the key's byte. A tty byte
+    /// stream has no other way to say Alt, and programs decode `ESC`+key as
+    /// Alt+key (rio's bindings, readline's `M-b`/`M-f`, emacs). It was dropped
+    /// before 2026-10-05 — Alt+S arrived as a bare `s`. Navigation keys keep
+    /// their plain sequences: their Alt forms are xterm's `ESC [1;3A`, which no
+    /// console program here asks for.
     fn emit_key(usage: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
         if let Some(seq) = keymap::usage_to_sequence(usage) {
             for &b in seq {
@@ -385,6 +393,9 @@ impl BootKeyboardDecoder {
         let shift = mods & keymap::MOD_SHIFT != 0;
         let ctrl = mods & keymap::MOD_CTRL != 0;
         if let Some(c) = keymap::usage_to_ascii(usage, shift, ctrl, caps) {
+            if mods & keymap::MOD_ALT != 0 {
+                emit(0x1B);
+            }
             emit(c);
             return true;
         }

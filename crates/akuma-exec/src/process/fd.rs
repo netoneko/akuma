@@ -53,6 +53,8 @@ pub fn clone_fd_refs(entry: &FileDescriptor) {
             (runtime().unix_sock_clone_ref)(*sock);
         }
         FileDescriptor::EventFd(id) => (runtime().eventfd_clone_ref)(*id),
+        FileDescriptor::PtyMaster(n) => (runtime().pty_clone_ref)(*n, true),
+        FileDescriptor::PtySlave(n) => (runtime().pty_clone_ref)(*n, false),
         // Sockets are refcounted like pipes: an fd-table copy is a real
         // reference, so the first close (child exit / exec cloexec sweep /
         // close of a dup) must not destroy the socket under the live fd.
@@ -273,6 +275,12 @@ pub fn release_fd_entry(fd_num: u32, fd: FileDescriptor, holder: usize) {
         }
         FileDescriptor::DevDsp => {
             (runtime().dsp_close)();
+        }
+        FileDescriptor::PtyMaster(n) => {
+            (runtime().pty_close)(n, true);
+        }
+        FileDescriptor::PtySlave(n) => {
+            (runtime().pty_close)(n, false);
         }
         _ => {}
     }

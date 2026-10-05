@@ -172,6 +172,16 @@ pub struct ExecRuntime {
     /// free-running, so a player killed mid-song otherwise leaves the hardware
     /// replaying its last few hundred milliseconds until the next open.
     pub dsp_close: fn(),
+    /// Take one more reference on pseudo-terminal pair `N`'s master (`true`)
+    /// or slave (`false`) side — `fork`'s table copy and every `dup`.
+    ///
+    /// A hook for the pipe hooks' reason: the pty table lives in
+    /// `akuma-syscalls-glue`, which depends on this crate.
+    pub pty_clone_ref: fn(u32, bool),
+    /// Drop one reference on pair `N`'s master (`true`) or slave (`false`)
+    /// side. The last master reference is the terminal's hangup (`SIGHUP` to
+    /// its session); the last reference on both frees the pair.
+    pub pty_close: fn(u32, bool),
     /// Release whatever `flock(2)` lock `(holder, fd)` — the `usize` is the
     /// calling process's `SharedFdTable` `Arc` pointer, see `src/syscall/flock.rs`
     /// — holds on `path`, if any. A no-op if it holds none.

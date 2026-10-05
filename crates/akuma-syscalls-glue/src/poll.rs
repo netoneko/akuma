@@ -625,6 +625,12 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
         akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
             FdState::Sink
         }
+        akuma_exec::process::FileDescriptor::PtyMaster(n) => {
+            super::pty::poll_state(n, true, waker.is_some().then_some(tid))
+        }
+        akuma_exec::process::FileDescriptor::PtySlave(n) => {
+            super::pty::poll_state(n, false, waker.is_some().then_some(tid))
+        }
         // A rump socket (stack=rump box): POLLIN comes from a non-blocking
         // MSG_PEEK probe forwarded to the rump server; POLLOUT is assumed ready
         // (sends are blocking-synchronous through the proxy). This lets a client

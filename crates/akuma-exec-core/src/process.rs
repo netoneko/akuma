@@ -227,6 +227,17 @@ pub enum FileDescriptor {
     /// it is the one with a boot-loader framebuffer — and it holds the screen's
     /// ownership while any process has it open (2026-10-03).
     DevFb,
+    /// The master side of pseudo-terminal pair `N` (`open("/dev/ptmx")`).
+    ///
+    /// Reference-counted like a pipe end — `dup`, `fork` and `close` go through
+    /// `pty_clone_ref`/`pty_close` — because the pair's state (both buffers,
+    /// termios, the window size) lives in `akuma-syscalls-glue`'s pty table
+    /// and must outlive any one descriptor. The number is the `/dev/pts/N`
+    /// index, reused only once neither side has a descriptor left.
+    PtyMaster(u32),
+    /// The slave side of pseudo-terminal pair `N` (`open("/dev/pts/N")`, or
+    /// `/dev/tty` in a session that pair controls).
+    PtySlave(u32),
     /// Raw L2 packet device (`/dev/net/tap0`) for the kernel `rump` feature.
     /// `read`/`write` move whole Ethernet frames to/from a dedicated second
     /// virtio-net NIC (bypassing smoltcp). Only ever constructed when the

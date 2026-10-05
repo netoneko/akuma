@@ -61,6 +61,8 @@ const MOD_CTRL: u8 = 1 << 1;
 const MOD_CAPS: u8 = 1 << 2;
 /// The last scancode was the `0xE0` extended prefix.
 const MOD_E0: u8 = 1 << 3;
+/// Either Alt held (left `0x38`, right `E0 38`).
+const MOD_ALT: u8 = 1 << 4;
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
 static MODS: AtomicU8 = AtomicU8::new(0);
@@ -68,6 +70,9 @@ static MODS: AtomicU8 = AtomicU8::new(0);
 /// has not returned yet: `0x100 | byte`, or 0 for none. `poll(2)` must be
 /// able to say "readable" without consuming the key.
 static PENDING: AtomicU16 = AtomicU16::new(0);
+/// The key byte of an Alt+key, queued behind the `ESC` [`decode`] returned for
+/// it ("meta sends escape"): same encoding as [`PENDING`]. Drained after it.
+static ALT_FOLLOW: AtomicU16 = AtomicU16::new(0);
 
 /// What the Backspace key sends: DEL, as every terminal's does, and the
 /// line discipline's own `VERASE` (`c_cc[2] = 0x7f`).
@@ -103,6 +108,7 @@ const SHIFTED: [u8; 0x59] = [
 const SC_LSHIFT: u8 = 0x2A;
 const SC_RSHIFT: u8 = 0x36;
 const SC_CTRL: u8 = 0x1D;
+const SC_ALT: u8 = 0x38;
 const SC_CAPS: u8 = 0x3A;
 const SC_ENTER: u8 = 0x1C;
 const SC_KP_SLASH: u8 = 0x35;
@@ -187,6 +193,11 @@ fn decode(sc: u8) -> Option<u8> {
             MODS.store(m & !MOD_E0, Ordering::Relaxed);
             return None;
         }
+        SC_ALT => {
+            let m = if released { mods & !MOD_ALT } else { mods | MOD_ALT };
+            MODS.store(m & !MOD_E0, Ordering::Relaxed);
+            return None;
+        }
         SC_CAPS => {
             if !released {
                 MODS.store((mods ^ MOD_CAPS) & !MOD_E0, Ordering::Relaxed);
@@ -225,6 +236,12 @@ fn decode(sc: u8) -> Option<u8> {
     // is 0x04 (EOF to the line discipline), Ctrl-C 0x03.
     if mods & MOD_CTRL != 0 && c.is_ascii_alphabetic() {
         c = c.to_ascii_lowercase() - b'a' + 1;
+    }
+    // Alt+key is `ESC` then the key — the USB decoder's rule
+    // (`akuma_usb::hid`), so both keyboards say Alt the same way.
+    if mods & MOD_ALT != 0 {
+        ALT_FOLLOW.store(0x100 | u16::from(c), Ordering::Relaxed);
+        return Some(0x1B);
     }
     Some(c)
 }
@@ -319,6 +336,10 @@ pub fn getb() -> Option<u8> {
     if pending != 0 {
         return Some(pending as u8);
     }
+    let follow = ALT_FOLLOW.swap(0, Ordering::Relaxed);
+    if follow != 0 {
+        return Some(follow as u8);
+    }
     pump()
 }
 
@@ -329,7 +350,7 @@ pub fn has_byte() -> bool {
     if !present() {
         return false;
     }
-    if PENDING.load(Ordering::Relaxed) != 0 {
+    if PENDING.load(Ordering::Relaxed) != 0 || ALT_FOLLOW.load(Ordering::Relaxed) != 0 {
         return true;
     }
     match pump() {

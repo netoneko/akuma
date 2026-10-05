@@ -415,6 +415,8 @@ pub(crate) fn build_exec_runtime(
         #[cfg(not(feature = "sc-pidfd"))]
         pidfd_close: noop_u32,
         dsp_close: akuma_virtio::audio::stop,
+        pty_clone_ref: crate::syscall::pty::pty_clone_ref,
+        pty_close: crate::syscall::pty::pty_close,
         flock_release: crate::syscall::flock::flock_release,
         resolve_symlinks: |path| crate::vfs::resolve_symlinks(path),
         file_size: |path| crate::fs::file_size(path).map_err(|_| "fs error"),

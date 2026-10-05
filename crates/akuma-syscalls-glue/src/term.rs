@@ -49,6 +49,20 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
 
+    // A pseudo-terminal answers every terminal request itself, from its own
+    // pair rather than the process's console `TerminalState`; only the four
+    // descriptor-level requests (`FIONBIO`, `FIOCLEX`, ...) fall through.
+    let pty = match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::PtyMaster(n)) => Some((n, true)),
+        Some(akuma_exec::process::FileDescriptor::PtySlave(n)) => Some((n, false)),
+        _ => None,
+    };
+    if let Some((n, master)) = pty
+        && let Some(r) = super::pty::ioctl(n, master, cmd, arg)
+    {
+        return r;
+    }
+
     match cmd {
         FIONBIO => {
             let mut val: i32 = 0;
@@ -251,15 +265,22 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return ENOMEM,
             };
             let ts = term_state_lock.lock();
-            let mut kernel_buf = [0u32; 9]; // 4 flags + 5 u32 for 20 bytes CC
+            let mut kernel_buf = [0u32; 9]; // 4 flags + c_line + c_cc[19] = 36 bytes
             kernel_buf[0] = ts.iflag;
             kernel_buf[1] = ts.oflag;
             kernel_buf[2] = ts.cflag;
             kernel_buf[3] = ts.lflag;
-            // `cc` is 20 bytes and lands on `kernel_buf[4..]`'s 5 u32s. Both sides are
-            // kernel memory, so this is a plain slice copy through the same byte view
-            // `copy_to_user_with` uses below — the lengths cannot disagree.
-            as_user_bytes_mut(&mut kernel_buf[4..]).copy_from_slice(&ts.cc);
+            // Byte 16 is `c_line` (0) and `c_cc[0]` is byte **17**. This copied
+            // all 20 bytes of `cc` from byte 16 until 2026-10-05, so every
+            // control character came out one slot early — `stty` showed VERASE
+            // as `intr`'s neighbour, and a program's `c_cc[VMIN]` landed in
+            // `cc[VSWTC]` on the way back in. amd64 answers these two requests
+            // itself (its `console_ioctl` had the right layout and named this
+            // bug); the console read now reads `cc[VMIN]`/`cc[VTIME]`, so the
+            // offset has to be right here too. `akuma_pty::Termios` is the
+            // host-tested statement of the layout.
+            let tail = &mut as_user_bytes_mut(&mut kernel_buf[4..])[1..];
+            tail.copy_from_slice(&ts.cc[..tail.len()]);
             if copy_to_user_with(arg, as_user_bytes(&kernel_buf), Prefault::No).is_err() {
                 return EFAULT;
             }
@@ -285,7 +306,10 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                     ts.iflag, ts.oflag, ts.cflag, ts.lflag);
             }
             
-            ts.cc.copy_from_slice(as_user_bytes(&kernel_buf[4..]));
+            // `c_cc` from byte 17 — see `TCGETS` above. `cc[19]` has no
+            // counterpart in the kernel layout and keeps its value.
+            let tail = &as_user_bytes(&kernel_buf[4..])[1..];
+            ts.cc[..tail.len()].copy_from_slice(tail);
 
             if let Some(ch) = akuma_exec::process::current_channel() {
                 ch.set_raw_mode(!ts.is_canonical());

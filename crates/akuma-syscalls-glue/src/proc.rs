@@ -143,6 +143,8 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
 pub(super) fn sys_setsid() -> u64 {
     if let Some(pid) = akuma_exec::process::with_current_process(|p| {
         p.pgid = p.pid;
+        // A new session has no controlling terminal (`super::pty`).
+        p.ctty.store(0, core::sync::atomic::Ordering::Relaxed);
         p.pid
     }) {
         u64::from(pid)
@@ -911,6 +913,8 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
             #[cfg(feature = "sc-pidfd")]
             akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
+            akuma_exec::process::FileDescriptor::PtyMaster(n) => super::pty::pty_close(n, true),
+            akuma_exec::process::FileDescriptor::PtySlave(n) => super::pty::pty_close(n, false),
             _ => {}
         }
     }

@@ -3338,6 +3338,98 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         Ok(total_read)
     }
+
+    /// The whole of `write_at` and `append`: resolve (creating if missing),
+    /// pick the offset, write, extend the size — under **one** state write
+    /// lock. `offset: None` appends at the size read inside that hold, which is
+    /// what makes `O_APPEND` atomic against a concurrent appender
+    /// (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §5).
+    /// Returns `(offset written at, bytes written)`.
+    fn write_locked(&self, path: &str, offset: Option<usize>, data: &[u8]) -> Result<(usize, usize), FsError> {
+        if data.is_empty() {
+            return Ok((offset.unwrap_or(0), 0));
+        }
+
+        // One write lock for resolve + optional create + data write. Avoids
+        // lookup_path (read) failing with IoError while another thread holds write_state.
+        let mut state = self.write_state();
+
+        let inode_num = match self.lookup_path_internal(&state, path) {
+            Ok(n) => n,
+            Err(FsError::NotFound) => {
+                let (parent_inode, name) = self.lookup_parent_internal(&state, path)?;
+                let inode_num = self.allocate_inode(&mut state, false)?;
+                let now = self.current_time();
+                let mut inode = Inode {
+                    type_perms: DEFAULT_FILE_PERMS,
+                    uid: 0,
+                    size_lower: 0,
+                    access_time: now,
+                    creation_time: now,
+                    modification_time: now,
+                    hard_links: 1,
+                    ..Default::default()
+                };
+                self.write_inode_data(&mut state, inode_num, &mut inode, &[])?;
+                self.add_dir_entry(&mut state, parent_inode, &name, inode_num, FT_REG_FILE)?;
+                inode_num
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut inode = self.read_inode(&state, inode_num)?;
+
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::NotAFile);
+        }
+
+        // `None` is `O_APPEND`: the offset is the size *as of this lock hold*.
+        let offset = offset.unwrap_or(inode.size_lower as usize);
+
+        let block_size = state.block_size;
+        let end = offset + data.len();
+        let mut written = 0usize;
+        let mut pos = offset;
+
+        while pos < end {
+            let logical_block = (pos / block_size) as u32;
+            let offset_in_block = pos % block_size;
+            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+            let full_block = offset_in_block == 0 && chunk == block_size;
+
+            // A partial write reads the block back before patching it, so a
+            // freshly allocated block there MUST be zeroed first; a full-block
+            // write overwrites every byte, so it need not be.
+            let phys_block =
+                self.ensure_block(&mut state, &mut inode, logical_block, !full_block)?;
+
+            if full_block {
+                // Full block write — no need to read first
+                let mut block_data = vec![0u8; block_size];
+                block_data.copy_from_slice(&data[written..written + chunk]);
+                self.write_block(&state, phys_block, &block_data)?;
+            } else {
+                // Partial block — read-modify-write just this one block
+                let mut block_data = self.read_block(&state, phys_block)?;
+                block_data[offset_in_block..offset_in_block + chunk]
+                    .copy_from_slice(&data[written..written + chunk]);
+                self.write_block(&state, phys_block, &block_data)?;
+            }
+
+            pos += chunk;
+            written += chunk;
+        }
+
+        // Update size if we extended the file
+        if end > inode.size_lower as usize {
+            inode.size_lower = end as u32;
+        }
+        inode.modification_time = self.current_time();
+        self.write_inode(&state, inode_num, &inode)?;
+        self.flush_meta(&mut state)?;
+
+        Ok((offset, written))
+    }
 }
 
 
@@ -3506,86 +3598,14 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
-        if data.is_empty() {
-            return Ok(0);
-        }
+        self.write_locked(path, Some(offset), data).map(|(_, n)| n)
+    }
 
-        // One write lock for resolve + optional create + data write. Avoids
-        // lookup_path (read) failing with IoError while another thread holds write_state.
-        let mut state = self.write_state();
-
-        let inode_num = match self.lookup_path_internal(&state, path) {
-            Ok(n) => n,
-            Err(FsError::NotFound) => {
-                let (parent_inode, name) = self.lookup_parent_internal(&state, path)?;
-                let inode_num = self.allocate_inode(&mut state, false)?;
-                let now = self.current_time();
-                let mut inode = Inode {
-                    type_perms: DEFAULT_FILE_PERMS,
-                    uid: 0,
-                    size_lower: 0,
-                    access_time: now,
-                    creation_time: now,
-                    modification_time: now,
-                    hard_links: 1,
-                    ..Default::default()
-                };
-                self.write_inode_data(&mut state, inode_num, &mut inode, &[])?;
-                self.add_dir_entry(&mut state, parent_inode, &name, inode_num, FT_REG_FILE)?;
-                inode_num
-            }
-            Err(e) => return Err(e),
-        };
-
-        let mut inode = self.read_inode(&state, inode_num)?;
-
-        if (inode.type_perms & 0xF000) == S_IFDIR {
-            return Err(FsError::NotAFile);
-        }
-
-        let block_size = state.block_size;
-        let end = offset + data.len();
-        let mut written = 0usize;
-        let mut pos = offset;
-
-        while pos < end {
-            let logical_block = (pos / block_size) as u32;
-            let offset_in_block = pos % block_size;
-            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
-            let full_block = offset_in_block == 0 && chunk == block_size;
-
-            // A partial write reads the block back before patching it, so a
-            // freshly allocated block there MUST be zeroed first; a full-block
-            // write overwrites every byte, so it need not be.
-            let phys_block =
-                self.ensure_block(&mut state, &mut inode, logical_block, !full_block)?;
-
-            if full_block {
-                // Full block write — no need to read first
-                let mut block_data = vec![0u8; block_size];
-                block_data.copy_from_slice(&data[written..written + chunk]);
-                self.write_block(&state, phys_block, &block_data)?;
-            } else {
-                // Partial block — read-modify-write just this one block
-                let mut block_data = self.read_block(&state, phys_block)?;
-                block_data[offset_in_block..offset_in_block + chunk]
-                    .copy_from_slice(&data[written..written + chunk]);
-                self.write_block(&state, phys_block, &block_data)?;
-            }
-
-            pos += chunk;
-            written += chunk;
-        }
-
-        // Update size if we extended the file
-        if end > inode.size_lower as usize {
-            inode.size_lower = end as u32;
-        }
-        inode.modification_time = self.current_time();
-        self.write_inode(&state, inode_num, &inode)?;
-        self.flush_meta(&mut state)?;
-
-        Ok(written)
+    /// `O_APPEND`, atomically: the end of file is read under the same state
+    /// write lock that the write itself runs under, so two appenders cannot
+    /// both pick the same offset. See [`Filesystem::append`].
+    fn append(&self, path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+        self.write_locked(path, None, data)
     }
 
 

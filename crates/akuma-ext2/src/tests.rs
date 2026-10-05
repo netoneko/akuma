@@ -1287,6 +1287,49 @@ fn write_at_file_size_appends_without_overwriting() {
     assert_eq!(&result[initial.len()..], appended);
 }
 
+/// `append` reports where each write landed and never overwrites.
+#[test]
+fn append_lands_at_the_end_and_reports_the_offset() {
+    let fs = mount_empty();
+    assert_eq!(fs.append("/log", b"one\n").unwrap(), (0, 4), "creates the file");
+    assert_eq!(fs.append("/log", b"two\n").unwrap(), (4, 4));
+    assert_eq!(fs.read_file("/log").unwrap(), b"one\ntwo\n");
+}
+
+/// The `O_APPEND` race, on the host: two threads appending lines to one file.
+/// Picking the offset outside the state lock (`metadata` then `write_at`, the
+/// trait's default and what the syscall layer did) loses lines — 298 of 300 on
+/// the trashcan from two shell `>>` loops
+/// (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §5). `append`
+/// must keep every one, intact and unsplit.
+#[test]
+fn concurrent_appends_lose_nothing() {
+    let fs = mount_empty();
+    fs.write_file("/log", b"").unwrap();
+    std::thread::scope(|s| {
+        for t in 0..2u8 {
+            let fs = &fs;
+            s.spawn(move || {
+                for i in 0..150 {
+                    let line = alloc::format!("{t} {i:03} ..........................................\n");
+                    let (_, n) = fs.append("/log", line.as_bytes()).unwrap();
+                    assert_eq!(n, line.len());
+                }
+            });
+        }
+    });
+    let data = fs.read_file("/log").unwrap();
+    let text = core::str::from_utf8(&data).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 300, "every appended line survives");
+    for t in 0..2 {
+        for i in 0..150 {
+            let want = alloc::format!("{t} {i:03} ..........................................");
+            assert!(lines.contains(&want.as_str()), "missing or torn: {want}");
+        }
+    }
+}
+
 #[test]
 fn try_lock_state_succeeds_when_unlocked() {
     let dev = load_fixture("test.ext2");
@@ -2486,4 +2529,148 @@ fn ftruncate_shrink_walks_every_indirection_level() {
     // process-global keyed by inode number, so a parallel test that pins the
     // same number defers this unlink's free and the count moves for a reason
     // that is not what this test is about.
+}
+
+/// The stress plan from `docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md`
+/// §8, as one host test: every round rewrites a config (`O_TRUNC` frees its
+/// blocks and allocates new ones), truncates a log, replaces a 100 KiB file by
+/// writing a new one and renaming it over the old (`wget` + `mv`), then has two
+/// threads append to the log while a third rewrites the config again — the
+/// sequence that, on the trashcan, left the config holding the log's text.
+///
+/// Two oracles. **Content**: every file reads back as exactly what was last
+/// written to it, so a block handed to two inodes shows up as one file's bytes
+/// inside another. **`e2fsck -fn`** on the device image afterwards: blocks
+/// claimed twice, referenced-but-free blocks and bitmap differences are its
+/// bread and butter. The second is skipped (with a note) on a host without
+/// e2fsprogs.
+#[test]
+fn rewrite_truncate_rename_and_concurrent_append_keep_files_apart() {
+    extern crate std;
+    let dev = RecordingDevice::from_fixture("manyinodes.ext2");
+    // A real clock: with `|| 0` every freed inode's `dtime` is 0, which
+    // `e2fsck` reports as "deleted inode has zero dtime" — the fixture's
+    // fault, not the driver's (`remove_dir_zeroes_the_directorys_link_count`).
+    let clock = || 1_700_000_000_000_000;
+    let fs = Ext2Filesystem::new(&dev, clock).unwrap();
+    fs.create_dir("/tmp").unwrap();
+
+    let cfg = |seed: u32| -> Vec<u8> {
+        let mut v = Vec::new();
+        while v.len() < 2300 {
+            v.extend_from_slice(alloc::format!("[cfg {seed}] key{} = \"value\"\n", v.len()).as_bytes());
+        }
+        v
+    };
+    let big = |seed: u32| -> Vec<u8> { (0..100 * 1024u32).map(|i| (i.wrapping_mul(31) ^ seed) as u8).collect() };
+
+    for round in 0..30u32 {
+        fs.write_file("/tmp/cfg", &cfg(round)).unwrap();
+        if fs.exists("/tmp/log") {
+            fs.truncate("/tmp/log", 0).unwrap();
+        }
+        fs.write_file("/tmp/big.new", &big(round)).unwrap();
+        fs.rename("/tmp/big.new", "/tmp/big").unwrap();
+
+        let cfg2 = cfg(round + 1000);
+        std::thread::scope(|s| {
+            for t in 0..2u32 {
+                let fs = &fs;
+                s.spawn(move || {
+                    for i in 0..60 {
+                        let line = alloc::format!("r{round} t{t} i{i:02} trace trace trace trace\n");
+                        fs.append("/tmp/log", line.as_bytes()).unwrap();
+                    }
+                });
+            }
+            let fs = &fs;
+            let cfg2 = &cfg2;
+            s.spawn(move || fs.write_file("/tmp/cfg", cfg2).unwrap());
+        });
+
+        assert_eq!(fs.read_file("/tmp/cfg").unwrap(), cfg2, "round {round}: the config's data was replaced");
+        assert_eq!(fs.read_file("/tmp/big").unwrap(), big(round), "round {round}: the big file's data was replaced");
+        let log = fs.read_file("/tmp/log").unwrap();
+        let text = core::str::from_utf8(&log).expect("the log holds only its own lines");
+        let prefix = alloc::format!("r{round} t");
+        assert_eq!(text.lines().count(), 120, "round {round}: appends lost or log cross-linked");
+        assert!(text.lines().all(|l| l.starts_with(&prefix) && l.ends_with("trace")), "round {round}: a torn or foreign line");
+    }
+
+    // Fresh mount over the same bytes: what reached the device agrees.
+    let fs2 = Ext2Filesystem::new(&dev, clock).unwrap();
+    assert_eq!(fs2.read_file("/tmp/cfg").unwrap(), cfg(29 + 1000));
+
+    let e2fsck = ["/opt/homebrew/opt/e2fsprogs/sbin/e2fsck", "/usr/local/opt/e2fsprogs/sbin/e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+    let Some(e2fsck) = e2fsck else {
+        std::eprintln!("note: e2fsck not found; skipping the on-disk consistency oracle");
+        return;
+    };
+    let img = std::env::temp_dir().join(alloc::format!("akuma-ext2-stress-{}.img", std::process::id()));
+    std::fs::write(&img, &*dev.inner.lock()).unwrap();
+    let out = std::process::Command::new(e2fsck).arg("-fn").arg(&img).output().unwrap();
+    let _ = std::fs::remove_file(&img);
+    assert!(
+        out.status.success(),
+        "e2fsck -fn found problems:\n{}{}",
+        alloc::string::String::from_utf8_lossy(&out.stdout),
+        alloc::string::String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The corruption the trashcan produced on 2026-10-05: an 8.5 MB kernel image
+/// pushed with `cat > file` over an older copy read back correctly, and a few
+/// minutes and some unrelated file activity later five 4 KiB blocks of its
+/// **double-indirect** range held stale contents — the previous copy's bytes,
+/// at the previous copy's offsets. The shape here: a file deep into the
+/// double-indirect range, overwritten by `truncate(0)` and unaligned
+/// sequential writes, with a block cache small enough to evict, then checked
+/// through the same mount *and* a fresh mount of the device (the disk's truth).
+#[test]
+fn overwrite_of_a_double_indirect_file_survives_eviction() {
+    extern crate std;
+    let dev = RecordingDevice::from_fixture("manyinodes.ext2");
+    let clock = || 1_700_000_000_000_000;
+    // 32 KiB of cache on a 1 KiB-block image: thousands of evictions.
+    let fs = Ext2Filesystem::new_with_cache_cap(&dev, clock, Some(32 * 1024)).unwrap();
+    // 1 KiB blocks: 12 direct + 256 indirect = 268 KiB before double-indirect.
+    const LEN: usize = 900 * 1024;
+    let image = |seed: u32| -> Vec<u8> {
+        (0..LEN as u32).map(|i| (i.wrapping_mul(2_654_435_761).rotate_left(seed) >> 13) as u8).collect()
+    };
+    let write_chunked = |path: &str, data: &[u8]| {
+        let mut pos = 0;
+        while pos < data.len() {
+            let n = (data.len() - pos).min(7_000);
+            assert_eq!(fs.write_at(path, pos, &data[pos..pos + n]).unwrap(), n);
+            pos += n;
+        }
+    };
+    fs.create_dir("/root").unwrap();
+    write_chunked("/root/k.new", &image(1));
+    for round in 2..6u32 {
+        // `cat > /root/k.new`: O_TRUNC, then the stream.
+        fs.truncate("/root/k.new", 0).unwrap();
+        let want = image(round);
+        write_chunked("/root/k.new", &want);
+        // Unrelated churn in between, as on the box: small files written,
+        // truncated, appended to and removed.
+        for i in 0..20 {
+            let p = alloc::format!("/root/small{}", i % 4);
+            fs.write_file(&p, &vec![i as u8; 3000 + i * 50]).unwrap();
+            fs.truncate(&p, 0).unwrap();
+            fs.append(&p, b"line\n").unwrap();
+        }
+        let got = fs.read_file("/root/k.new").unwrap();
+        let first_bad = got.iter().zip(&want).position(|(a, b)| a != b);
+        assert!(got.len() == want.len() && first_bad.is_none(),
+            "round {round}: cached view differs at {first_bad:?} (len {} vs {})", got.len(), want.len());
+        let fresh = Ext2Filesystem::new(&dev, clock).unwrap();
+        let disk = fresh.read_file("/root/k.new").unwrap();
+        let first_bad = disk.iter().zip(&want).position(|(a, b)| a != b);
+        assert!(disk.len() == want.len() && first_bad.is_none(),
+            "round {round}: on-disk view differs at {first_bad:?}");
+    }
 }

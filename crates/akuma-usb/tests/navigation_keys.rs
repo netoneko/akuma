@@ -134,3 +134,38 @@ fn ordinary_typing_is_unchanged() {
     feed(&mut d, 0, &[]);
     assert_eq!(feed(&mut d, LSHIFT, &[A]), b"A");
 }
+
+const S: u8 = 0x16;
+const LALT: u8 = 1 << 2;
+const RALT: u8 = 1 << 6;
+const LCTRL: u8 = 1 << 0;
+
+/// "Meta sends escape": Alt+key is ESC then the key, for either Alt.
+#[test]
+fn alt_prefixes_the_key_with_escape() {
+    for alt in [LALT, RALT] {
+        let mut d = BootKeyboardDecoder::new();
+        assert_eq!(feed(&mut d, alt, &[S]), b"\x1bs", "alt mods {alt:#04x}");
+    }
+    let mut d = BootKeyboardDecoder::new();
+    assert_eq!(feed(&mut d, LALT | LSHIFT, &[S]), b"\x1bS", "Alt+Shift+S");
+    let mut d = BootKeyboardDecoder::new();
+    assert_eq!(feed(&mut d, LALT | LCTRL, &[S]), b"\x1b\x13", "Ctrl+Alt+S is ESC ^S");
+}
+
+#[test]
+fn alt_alone_and_alt_with_arrows_add_nothing() {
+    let mut d = BootKeyboardDecoder::new();
+    assert!(feed(&mut d, LALT, &[]).is_empty(), "a modifier alone emits nothing");
+    let mut d = BootKeyboardDecoder::new();
+    assert_eq!(feed(&mut d, LALT, &[UP]), b"\x1b[A");
+}
+
+#[test]
+fn a_held_alt_key_repeats_with_its_escape() {
+    let mut d = BootKeyboardDecoder::new();
+    assert_eq!(feed(&mut d, LALT, &[A]), b"\x1ba");
+    let mut rep = Vec::new();
+    d.repeat(|b| rep.push(b));
+    assert_eq!(rep, b"\x1ba");
+}

@@ -709,6 +709,21 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
     r
 }
 
+/// `O_APPEND` write: at the end of the file as the filesystem sees it inside
+/// its own write lock. Returns `(offset written at, bytes written)`. See
+/// `Filesystem::append` for why this is not `file_size` + [`write_at`].
+pub fn append(path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+    if is_mtab(path) {
+        return Err(FsError::NotSupported);
+    }
+    let r = with_fs_write(path, |fs, rel| fs.append(rel, data));
+    invalidate_file_pages(path);
+    if let Ok((offset, n)) = r {
+        notify_mapped_write(path, offset, &data[..n.min(data.len())]);
+    }
+    r
+}
+
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {
     with_fs_write(path, |fs, rel| fs.create_dir(rel))

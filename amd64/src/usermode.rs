@@ -1388,8 +1388,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // neutral table below.
         57 | 58 => return sys_fork(),
         // `getpgrp()` — x86_64 111, x86-only; asm-generic callers use
-        // `getpgid(0)`. One process, so it is its own group leader.
-        111 => return 1,
+        // `getpgid(0)`, and so does this: 1 outside a pty session, the real
+        // group inside one (see the `Getpgid` arm).
+        111 => return akuma_syscalls_glue::pty::sys_getpgid_gated(0),
         // The x86-only halves of the clock. `clock_settime` (227) and
         // `adjtimex` (159) are in the neutral table; these two are not, and
         // `busybox ntpd -q` reaches for whichever musl offers.
@@ -2184,9 +2185,20 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // that read a real `getpgid` and then `TIOCSPGRP`'d it would move that
         // target, and nothing here has been tested against job control. Fold
         // them when something needs them, with the Ctrl-C gate in hand.
-        Syscall::Getpgid | Syscall::Getsid => 1,
-        // `setpgid`/`setsid` accept and report id 1.
-        Syscall::Setpgid | Syscall::Setsid => 0,
+        //
+        // **Something needed them: a pty session** (2026-10-05). A shell on a
+        // pseudo-terminal does job control against *that* terminal's foreground
+        // group — busybox `ash` loops `killpg(0, SIGTTIN)` until
+        // `tcgetpgrp() == getpgrp()` — so for a process whose session a pty
+        // controls the answers are real, and for everything else (the console
+        // world this comment is about) they are exactly what they were.
+        // `setsid` is real everywhere: it is how a pty child gets a group of
+        // its own before `TIOCSCTTY`, and it detaches from any terminal, which
+        // touches nothing the console reads. `akuma_syscalls_glue::pty`.
+        Syscall::Getpgid => akuma_syscalls_glue::pty::sys_getpgid_gated(a1 as u32),
+        Syscall::Getsid => akuma_syscalls_glue::pty::sys_getsid_gated(a1 as u32),
+        Syscall::Setpgid => akuma_syscalls_glue::pty::sys_setpgid_gated(a1 as u32, a2 as u32),
+        Syscall::Setsid => akuma_syscalls_glue::pty::sys_setsid(),
         // `getcwd(buf, size)` — **glue's arm** (2026-09-12). The local version
         // here predated per-process cwd and hard-coded `/`; since `Chdir`
         // landed above, a `getcwd` that ignored `Process::cwd` would report a
@@ -4297,6 +4309,7 @@ fn register_exec_process(
         // and every `execve`d image.
         thread_id: Some(task_slot),
         spawner_pid: None,
+        ctty: core::sync::atomic::AtomicU32::new(0),
         // A console process gets the console's **shared** line discipline, not a
         // fresh one — one serial line, one set of termios flags, exactly as a
         // tty behaves and as a `fork` child already inherits through `term`.
@@ -5564,6 +5577,14 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
         akuma_exec::process::with_process(dying, |p| {
             p.exit_code.store(status, core::sync::atomic::Ordering::Release);
             p.exited.store(true, core::sync::atomic::Ordering::Release);
+            // And the *reported* state. Nothing on this target read
+            // `Process::state` to decide anything, so it was never set here,
+            // and `/proc/<pid>/status` said `R (running)` for every exited,
+            // unreaped process: a zombie whose parent never waited looked
+            // exactly like "a shell hung in its own exit" (2026-10-05,
+            // `userspace/forktest/c_stress/lifeprobe.c`). Only `/proc`, `ps`
+            // and the load counters read it.
+            p.state.store(akuma_exec::process::ProcessState::Zombie(status));
         });
         // Reparent this process's children onto init, the way Linux does at
         // exit — in BOTH views of parenthood. This used to rewrite only the

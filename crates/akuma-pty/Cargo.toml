@@ -1,0 +1,14 @@
+[package]
+name = "akuma-pty"
+version = "0.1.0"
+edition = "2024"
+description = "Unix98 pseudo-terminals as a pure state machine: one master/slave pair's fixed buffers, the N_TTY line discipline, termios/winsize wire layouts, VMIN/VTIME read decisions, poll readiness and hangup rules. The fd table, the waits, the signals and the user copies stay in the kernel."
+
+[lints]
+workspace = true
+
+# No dependencies, deliberately: waking a waiter and signalling a process group
+# are effects this crate *returns* (`Wakes`, `Signals`) rather than performs —
+# the `akuma-pipes` shape, for the same reason (both are re-entrant hazards
+# inside a spinlock).
+[dependencies]

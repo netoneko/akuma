@@ -377,6 +377,9 @@ fn runtime() -> ExecRuntime {
         // killed player never reaches `close`: stop the ring when the fd table
         // lets go of the descriptor. A no-op when no backend is registered.
         dsp_close: akuma_virtio::audio::stop,
+        // Pseudo-terminals are glue's table on both kernels, like pipes.
+        pty_clone_ref: akuma_syscalls_glue::pty::pty_clone_ref,
+        pty_close: akuma_syscalls_glue::pty::pty_close,
         // **A stated no-op, not a panic** — and the distinction is the whole
         // reason this changed.
         //

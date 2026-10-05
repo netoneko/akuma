@@ -110,6 +110,8 @@ pub fn ensure_test_runtime() {
         epoll_destroy: |_| {},
         pidfd_close: |_| {},
         dsp_close: || {},
+        pty_clone_ref: |_, _| {},
+        pty_close: |_, _| {},
         flock_release: |_, _, _| {},
         resolve_symlinks: |_| alloc::string::String::new(),
         file_size: |_| Ok(0),

@@ -83,6 +83,10 @@ errno_table! {
     ESRCH = 3;
     EINTR = 4;
     EIO = 5;
+    /// "No such device or address": `open("/dev/tty")` by a process with no
+    /// controlling terminal, Linux's answer. Added 2026-10-05 with the
+    /// pseudo-terminals (`akuma-syscalls-glue::pty`).
+    ENXIO = 6;
     E2BIG = 7;
     ENOEXEC = 8;
     EBADF = 9;
@@ -258,6 +262,9 @@ mod tests {
             // (`box grab`'s `-d`/screen-style detach) — never existed under
             // any of the old tables, so it has no history to pin against.
             ("EBUSY", EBUSY, 16),
+            // Added 2026-10-05 for `/dev/tty` with no controlling terminal
+            // (`akuma-syscalls-glue::pty`).
+            ("ENXIO", ENXIO, 6),
         ];
         for &(name, actual, want) in expected {
             assert_eq!(actual, want, "{name} is not the Linux value");

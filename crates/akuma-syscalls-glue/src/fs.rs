@@ -319,6 +319,15 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_primitives::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
     }
 
+    // Pseudo-terminals read through their own module: fixed buffers, no heap
+    // copy of `count` (the arms below allocate one), and the pty's own
+    // `VMIN`/`VTIME`, `O_NONBLOCK` and hangup answers.
+    match fd {
+        akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::read(fd_num as u32, n, true, buf_ptr, count),
+        akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::read(fd_num as u32, n, false, buf_ptr, count),
+        _ => {}
+    }
+
     match fd {
         // `/dev/tty` reads take the exact Stdin path: same channel, same line
         // discipline, same canonical/echo handling. A pager holding both fd 0
@@ -341,6 +350,9 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
 
             let mut kernel_buf = alloc::vec![0u8; count];
+            // The `VTIME` timer of a non-canonical `VMIN == 0` read, armed on
+            // the first pass that finds nothing.
+            let mut vtime_deadline: Option<u64> = None;
 
             loop {
                 // Re-resolve the channel every iteration rather than reusing the
@@ -479,6 +491,34 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return 0;
                 }
 
+                // Non-canonical `VMIN == 0`: Linux's "return what there is" read.
+                // With `VTIME == 0` it is a poll and returns 0 at once — before
+                // the `O_NONBLOCK` check, because that is Linux's order too (an
+                // empty `VMIN=0,VTIME=0` read is 0, never `EAGAIN`). With
+                // `VTIME > 0` it waits at most that many tenths of a second.
+                // This read used to block for the first byte regardless, so a
+                // terminal program that set `VMIN=0` froze inside the kernel
+                // (rio's fb platform, `AKUMA_AMD64_RIO_FBDEV_BUILD.md` finding
+                // 2). `VMIN > 1` still returns at the first byte.
+                if !is_pipe
+                    && let Some(ts_lock) = akuma_exec::process::current_terminal_state()
+                {
+                    let (raw, vmin, vtime) = {
+                        let ts = akuma_exec::sync::lock_bounded(&ts_lock);
+                        (!ts.is_canonical(), ts.cc[akuma_terminal::cc_index::VMIN], ts.cc[akuma_terminal::cc_index::VTIME])
+                    };
+                    if raw && vmin == 0 {
+                        if vtime == 0 {
+                            return 0;
+                        }
+                        let now = akuma_primitives::clock::uptime_us();
+                        let deadline = *vtime_deadline.get_or_insert_with(|| now + u64::from(vtime) * 100_000);
+                        if now >= deadline {
+                            return 0;
+                        }
+                    }
+                }
+
                 if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
                 }
@@ -524,7 +564,10 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     continue;
                 }
 
-                akuma_exec::threading::park_indefinitely();
+                match vtime_deadline {
+                    Some(d) => akuma_exec::threading::schedule_blocking(d),
+                    None => akuma_exec::threading::park_indefinitely(),
+                }
 
                 akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
             }
@@ -967,6 +1010,13 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         match proc.get_fd(fd_num as u32) { Some(e) => (proc.pid, e), None => return EBADF }
     };
 
+    // Pseudo-terminals: see the matching arm in `sys_read`.
+    match fd {
+        akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::write(fd_num as u32, n, true, buf_ptr, count),
+        akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::write(fd_num as u32, n, false, buf_ptr, count),
+        _ => {}
+    }
+
     // write(2) to a real file runs BKL-free. Unlike `sys_read`, the on-disk work here
     // isn't confined to one `match` arm — the match is *inside* the per-chunk loop, and
     // the O_APPEND `file_size` probe below already hits the VFS — so the guard spans the
@@ -981,9 +1031,10 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // `clone_thread` siblings) could both read that same stale position and
     // corrupt each other's writes on disk. `reserve_write_pos` closes the gap by
     // reading and advancing the shared position in one lock hold, before any I/O
-    // — see its doc comment for the reproduction. O_APPEND is unchanged: its
-    // position is still derived from the live file size per write (a separate,
-    // pre-existing race this does not address).
+    // — see its doc comment for the reproduction. O_APPEND does not use it: the
+    // `File` arm below asks the filesystem to append, which picks the offset
+    // inside its own write lock (that race was real and lost writes; fixed
+    // 2026-10-05). The size read here only seeds the published position.
     let mut write_pos = if let akuma_exec::process::FileDescriptor::File(ref f) = fd {
         if f.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
             akuma_vfs_glue::fs::file_size(&f.path).unwrap_or(0) as usize
@@ -1090,7 +1141,22 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
             akuma_exec::process::FileDescriptor::File(ref f) => {
                 let is_append = f.flags & akuma_exec::process::open_flags::O_APPEND != 0;
-                match akuma_vfs_glue::fs::write_at(&f.path, write_pos, buf_slice) {
+                // `O_APPEND` asks the filesystem for "the end" inside its own
+                // write lock, chunk by chunk, and learns where the chunk landed.
+                // `write_pos` (the size read before this loop) is only a guess
+                // for it: another appender can extend the file in between, and
+                // writing at the guess overwrote that appender's bytes — two
+                // `>>` loops of 150 lines left 298
+                // (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §5).
+                let result = if is_append {
+                    akuma_vfs_glue::fs::append(&f.path, buf_slice).map(|(at, n)| {
+                        write_pos = at;
+                        n
+                    })
+                } else {
+                    akuma_vfs_glue::fs::write_at(&f.path, write_pos, buf_slice)
+                };
+                match result {
                     Ok(0) => {
                         // The chunk was non-empty, so zero accepted means a bounded
                         // sink that is currently full. On-disk files never land
@@ -1694,6 +1760,10 @@ pub fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 super::eventfd::eventfd_close(efd_id);
             }
+            // `dup2(slave, 0)` over a pty descriptor is the commonest thing a
+            // `login_tty` does; a missed release here leaks the pair.
+            akuma_exec::process::FileDescriptor::PtyMaster(n) => super::pty::pty_close(n, true),
+            akuma_exec::process::FileDescriptor::PtySlave(n) => super::pty::pty_close(n, false),
             _ => {}
         }
     }
@@ -1774,6 +1844,22 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     let _vfs_bkl = VfsBklGuard::new();
 
     let path = akuma_vfs_glue::resolve_symlinks(&path);
+
+    // Pseudo-terminals (`super::pty`). `/dev/tty` is answered here too when the
+    // caller's session has a pty for a controlling terminal — that pty's slave,
+    // which is what `vi`, `less` and `ssh` open for the keyboard — and falls
+    // through to the console arm below when it does not.
+    if path == "/dev/ptmx" {
+        return super::pty::open_ptmx(flags);
+    }
+    if let Some(n) = super::pty::pts_index(&path) {
+        return super::pty::open_pts(n, flags);
+    }
+    if path == "/dev/tty"
+        && let Some(r) = super::pty::open_ctty(flags)
+    {
+        return r;
+    }
 
     if path == "/dev/null" {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -2097,6 +2183,8 @@ pub fn sys_close(fd: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::DevDsp => {
                     akuma_virtio::audio::stop();
                 }
+                akuma_exec::process::FileDescriptor::PtyMaster(n) => super::pty::pty_close(n, true),
+                akuma_exec::process::FileDescriptor::PtySlave(n) => super::pty::pty_close(n, false),
                 akuma_exec::process::FileDescriptor::File(f) => {
                     let holder = alloc::sync::Arc::as_ptr(&proc.fds) as usize;
                     super::flock::flock_release(&f.path, holder, fd);
@@ -2149,6 +2237,8 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                     super::eventfd::eventfd_close(efd_id);
                 }
+                akuma_exec::process::FileDescriptor::PtyMaster(n) => super::pty::pty_close(n, true),
+                akuma_exec::process::FileDescriptor::PtySlave(n) => super::pty::pty_close(n, false),
                 _ => {}
             }
         }
@@ -2308,6 +2398,14 @@ akuma_exec::process::FileDescriptor::DevTty) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
             0
         }
+        Some(akuma_exec::process::FileDescriptor::PtyMaster(n)) => {
+            stat = super::pty::stat_of(true, n);
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::PtySlave(n)) => {
+            stat = super::pty::stat_of(false, n);
+            0
+        }
         Some(akuma_exec::process::FileDescriptor::PipeRead(_) |
 akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
@@ -2369,6 +2467,18 @@ pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, u64> 
                 st_blksize: 4096,
                 ..Default::default()
             };
+            return 0;
+        }
+        // The pty nodes. `ttyname(3)` compares this against `fstat` of the
+        // descriptor, so both come from `pty::stat_of`.
+        if resolved_path == "/dev/ptmx" {
+            stat = super::pty::stat_of(true, 0);
+            return 0;
+        }
+        if let Some(n) = super::pty::pts_index(&resolved_path)
+            && super::pty::pts_exists(n)
+        {
+            stat = super::pty::stat_of(false, n);
             return 0;
         }
 

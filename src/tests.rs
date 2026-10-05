@@ -3595,7 +3595,7 @@ fn make_test_process(
         lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),
-        thread_id: None, spawner_pid: None,
+        thread_id: None, spawner_pid: None, ctty: core::sync::atomic::AtomicU32::new(0),
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
             akuma_terminal::TerminalState::default(),
         )),

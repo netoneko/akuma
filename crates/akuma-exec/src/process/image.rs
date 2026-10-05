@@ -417,6 +417,7 @@ impl Process {
             thread_id: None,
             // Spawner PID - set when spawned by another process
             spawner_pid: None,
+            ctty: core::sync::atomic::AtomicU32::new(0),
             // Terminal State - default for new processes
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
 
