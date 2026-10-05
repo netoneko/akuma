@@ -96,6 +96,24 @@ do).
   QEMU at SMP=1 and SMP=4.
 - On the trashcan (kernel `8bece079`, 2026-10-05): `ptyprobe` 31/31. rio not yet run against it.
 
+## 7. Known issue: rio on the pty swallows/delays single keys (reported 2026-10-05, OPEN)
+
+Observed by the user running rio on the trashcan panel after the akuma-pty work:
+
+* A lone **Esc** that matches no rio keybind is not passed through to the program
+  running in the pty (ssh in this case).
+* The same for **Enter** and for **`1`**.
+* **`qq`** exits `late.sh`, which exits the rio terminal — the quit sequence
+  appears to be delivered late, and the exit looks *leaked* from the earlier keys
+  rather than caused by the `qq` just typed (user's guess: a stale/buffered exit).
+
+Not investigated. Leads: keys with no rio binding should reach the master side
+immediately — check whether rio's write to the pty master is being held
+(master write path not waking the slave reader, or an edge-triggered `EPOLLOUT`
+on the master not re-arming, the rule in `TOKIO_PIPE_EPOLL_HANG.md`); the delayed
+`qq` points at input sitting in a queue until something later flushes it.
+Repro: rio on the panel, `ssh` inside it, press Esc / Enter / `1`, then `qq`.
+
 ## Background
 
 `AKUMA_AMD64_WGPU_KERNEL_WORK.md`, `AKUMA_AMD64_RIO_FBDEV_BUILD.md`,

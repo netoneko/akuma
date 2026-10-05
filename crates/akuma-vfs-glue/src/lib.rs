@@ -184,14 +184,15 @@ pub fn init() {
 /// box namespace (the same fs may appear in both; `sync` is idempotent, and a
 /// duplicate flush of an already-clean cache is free). Called from
 /// `sys_reboot` before PSCI reset/poweroff — with the ext2 write-back cache,
-/// dirty data otherwise dies with the machine. Collects the `Arc<dyn
-/// Filesystem>` set under the table/namespace locks, then syncs lock-free:
-/// `sync` does real block I/O and must not run under a mount-table lock.
+/// dirty data otherwise dies with the machine — and, since 2026-10-05, from
+/// `sync(2)` itself, which used to have no working arm at all on this tree
+/// (corruption doc §11). Collects the `Arc<dyn Filesystem>` set under the
+/// table/namespace locks, then syncs lock-free: `sync` does real block I/O
+/// and must not run under a mount-table lock.
 ///
-/// Gated on `sc-reboot` because that syscall is its only caller: `extreme-size`
-/// builds `--no-default-features` without it, and an ungated definition is
-/// dead code there (`-D dead-code` fails the build).
-#[cfg(feature = "sc-reboot")]
+/// Was gated on `sc-reboot` while that syscall was its only caller;
+/// `sync(2)`'s ungated arm is a caller on every build now, so the gate (and
+/// its extreme-size dead-code rationale) is gone.
 pub fn sync_all_filesystems() -> Result<(), FsError> {
     let mut seen: Vec<Arc<dyn Filesystem>> = Vec::new();
     {
@@ -730,6 +731,27 @@ pub fn append(path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {
     with_fs_write(path, |fs, rel| fs.create_dir(rel))
+}
+
+/// Flush the filesystem holding an open file description.
+///
+/// `fsync(2)` / `syncfs(2)`. The mount id (not the path) selects the filesystem, exactly as
+/// [`metadata_open_file`] does: an fd's own filesystem must keep answering
+/// after the name is unlinked, and that is the case that matters — `sqlite`
+/// journals and `cargo`'s package database fsync an fd they still hold open.
+pub fn sync_open_file(path: &str, mount_id: u32, inode: u32) -> Result<(), FsError> {
+    if inode == 0 {
+        return sync_path(path);
+    }
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    fs.sync()
+}
+
+/// Flush the filesystem a path resolves to. The path-based form of
+/// [`sync_open_file`], for the fallback arms.
+fn sync_path(path: &str) -> Result<(), FsError> {
+    let resolved = resolve_mount(path).ok_or(FsError::NotFound)?;
+    resolved.fs.sync()
 }
 
 /// Remove a file

@@ -284,10 +284,64 @@ State as found, then verified from the Mac:
   write lock, so the `with_block` miss-then-`insert` window cannot race a writer unless the
   lock itself is bypassed; `ClockBlockCache::insert` never overwrites a resident (possibly
   dirty) entry. Four of the five bad blocks in §9 look like **bitmap images**
-  (sparse `0x00`/`0xFF`), which points at a bitmap/BGD block number being written over file
-  data (`bitmap_slot`/`flush_meta`) or at the USB write path (a DMA buffer reused across
-  transfers) more than at a stale free. Next probe: `e2fsck -fn` / `debugfs` on the box's
+  (sparse `0x00`/`0xFF`), which points at ... **[CORRECTED in §13: wrong — they are other
+  files' live data.]** Next probe: `e2fsck -fn` / `debugfs` on the box's
   `/root/akuma-amd64.new` (inode 9439) and check whether bad file blocks 1655-1656,
   1659-1661 sit in some group's bitmap range or equal a `bgd.block_bitmap`.
 * Two lines in the checkpoint had lost their newlines (`xhci::write_bytes` signature,
   a `///` in `akuma-vfs-glue`) — repaired.
+
+
+## 13. Root cause found: lost bitmap writes across `reboot -f` (2026-10-05)
+
+**Tool.** `Ext2Filesystem::audit()` (`crates/akuma-ext2/src/ext2/audit.rs`) is an in-kernel
+`e2fsck -fn`: it walks every allocated inode and reports a block **claimed twice** and a block
+**claimed but free in the bitmap**, as `[E2-FSCK]` lines (`dmesg`). amd64 runs it at mount when
+`/.ext2audit` exists (`touch /.ext2audit`, reboot; remove the file to stop paying for it — it
+walks ~100k inodes over USB). Two host tests pin it (clean fs = clean; a forced shared block +
+a forced stale free are both reported). `free_block` also refuses a second free of a free
+block now (`[E2-DFREE]`, counter `E2_DOUBLE_FREE`) instead of inflating the free counts.
+
+**What the audit saw on the box** (100 255 inodes): `cross_linked=173`,
+`claimed_but_free=7`, `out_of_range=2125` (the last is the consequence: an *indirect* block that
+is also another file's data block reads as garbage pointers; 173 -> 170 once the resize inode,
+which legitimately overlaps, was skipped).
+
+* The five/eleven bad blocks of §9 are **not** bitmap images and not stale kernel bytes: block
+  1655 of `/root/akuma-amd64.new` held `.git/FETCH_HEAD`, 1659/1663/1668 held goose's
+  `sessions.db` pages. Those blocks are *also* claimed by those files' inodes
+  (`.new` = inode 9439 shares blocks with 2609 = `.git/FETCH_HEAD`, rewritten 01:02, **after**
+  `.new` was written 00:21).
+* The pattern is general, not one file: Sep-26 `dmesg-boot-*.txt` (inodes 14213/14222) share
+  contiguous runs of blocks with the Oct-1 `dumpster-akuma-amd64.transcript.jsonl` (12271, an
+  appended log) and `akuma-amd64.splash2` (9499); `librustc_driver.so`, a 369 MB git pack, a
+  54 MB wav, `nca.v3` and others are on the list. Always **an older file whose blocks a later
+  allocation reused** — the allocator believed those blocks were free.
+
+**Cause (strong inference, one direct test).** The bitmap block for those blocks was not on disk
+as the kernel last wrote it. The old kernel had no durability barrier (§11): `sync` was
+`ENOSYS`, nothing sent `SYNCHRONIZE CACHE`, and every deploy cycle ends in `reboot -f`. A USB
+bridge that acknowledges `WRITE(10)` from a volatile cache loses writes in its own order at
+reset, so the *file data and inode* of a block can reach the media while the *bitmap* update
+does not. The next boot mounts that older bitmap, hands the block out again, and two files own
+it. This also explains why it looked random (it depends on what the drive happened to have
+written) and why it kept happening across weeks of `reboot -f` cycles; it is the same event as
+§11, seen from the allocator's side instead of the rename's.
+
+**Direct test of the fix** (barrier kernel `c8547aa2`, `SYNCHRONIZE CACHE` accepted by this
+drive — no `[xhci] SYNCHRONIZE CACHE failed` line): wrote three 40 MB random files, deleted one,
+`sync`, `reboot -f` **immediately**, no settling delay. After the boot: all md5s intact, the
+deleted file still deleted, the new kernel installed, and `claimed_but_free` still **7** — no
+new lost bit. (A single pass, not a soak; the old kernel's loss was probabilistic. Repeat the
+pass a few times before calling it closed.)
+
+**Not fixed — existing damage.** The 170 cross-links are on disk. The newer owner usually won
+the data, so the *older* file is the damaged one (the Sep-26 dmesg logs, the librustc/packfile
+pages the audit lists). Nothing in-kernel repairs this; `e2fsck -fy` from Ubuntu will (it
+duplicates the blocks per owner). Until then: do not trust `librustc_driver.so`, the llama.cpp
+pack or other long-lived files on that list, and reinstall them before a self-host build. The 7
+claimed-but-free blocks (inodes 14222, 46095, 46187) can still be handed out again.
+
+**Open:** the dmesg lines for the second owner are capped (80); raise `PRINT_CAP` or add a
+`path` lookup if the full list is wanted. rio on the pty swallowing Esc/Enter/`1` is a
+separate issue, `AKUMA_AMD64_PTY.md` §7.

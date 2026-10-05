@@ -220,6 +220,10 @@ impl BlockDevice for VirtioBlk {
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         akuma_virtio::block::write_bytes(offset, data).map_err(|_| ())
     }
+
+    // No `flush`: the default no-op is the honest answer. The cache in front
+    // of the media here is the *host's* (QEMU/Firecracker), which this kernel
+    // cannot reach past; a VMM-backed disk loses nothing to a guest reset.
 }
 
 /// A partition on the USB disk, as something `akuma-ext2` can read.
@@ -245,6 +249,13 @@ impl BlockDevice for UsbDisk {
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         crate::xhci::write_bytes(self.partition_offset + offset, data).map_err(|_| ())
+    }
+
+    /// SCSI `SYNCHRONIZE CACHE (10)`, whole medium. The partition offset is
+    /// irrelevant: the barrier is drive-wide, and `lba 0, blocks 0` asks for
+    /// exactly that.
+    fn flush(&self) -> Result<(), ()> {
+        crate::xhci::flush().map_err(|_| ())
     }
 }
 
@@ -280,6 +291,13 @@ impl BlockDevice for RootDevice {
             Self::Virtio(d) => d.write_bytes(offset, data),
             Self::Ram(d) => d.write_bytes(offset, data),
             Self::Usb(d) => d.write_bytes(offset, data),
+        }
+    }
+
+    fn flush(&self) -> Result<(), ()> {
+        match self {
+            Self::Virtio(_) | Self::Ram(_) => Ok(()),
+            Self::Usb(d) => d.flush(),
         }
     }
 }
@@ -561,7 +579,8 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     // to print, and `/proc/mounts` with a `none` in column one is what `df`
     // shows under `Filesystem`. It is also what enrols this filesystem in the
     // orphaned-lock sweep — see `install_reap_hooks`.
-    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, Arc::new(fs)) {
+    let fs = Arc::new(fs);
+    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, fs.clone()) {
         serial::puts("  fs:   could not mount ");
         serial::puts(name);
         serial::puts(" at /: ");
@@ -572,6 +591,18 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     serial::puts("  fs:   ext2 mounted on ");
     serial::puts(name);
     serial::puts("\n");
+    // `touch /.ext2audit` then reboot: walk every inode and report blocks
+    // claimed twice or claimed-but-free (`[E2-FSCK]` lines, readable with
+    // `dmesg`). The box that shows `docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_
+    // CORRUPTION.md`'s bug has no `e2fsck`. A flag file rather than a cmdline
+    // token because the GRUB entry is not editable from Akuma. Costs a full
+    // inode walk, so it only runs when asked.
+    if akuma_vfs::Filesystem::exists(&*fs, "/.ext2audit") {
+        serial::puts("  fs:   /.ext2audit present — auditing ext2\n");
+        if fs.audit().is_err() {
+            serial::puts("  fs:   ext2 audit hit an I/O error\n");
+        }
+    }
     // The VFS answers now, so the `akuma_vfs_glue::fs` facade — the gate every
     // folded glue fs arm sits behind — may say so. `fs::init` is the AArch64
     // route to this state (virtio-blk check, its own mounts, the fpcache and

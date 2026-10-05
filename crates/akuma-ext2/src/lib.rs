@@ -20,7 +20,7 @@ mod ext2;
 pub use ext2::{
     DEFERRED_DRAIN_CALLS, DEFERRED_DRAIN_FREED, DEFERRED_DRAIN_SKIPPED, DEFERRED_FREE_LEAKED,
     DEFERRED_FREE_PENDING, Ext2Filesystem, cache_occupancy, cache_stats, deferred_free_pending,
-    init_inode_freed_hook, set_cache_cap_bytes,
+    AuditReport, init_inode_freed_hook, set_cache_cap_bytes,
 };
 
 /// Trait abstracting raw block device I/O.
@@ -31,6 +31,19 @@ pub trait BlockDevice: Send + Sync {
 
     /// Write `data` starting at byte offset `offset`.
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()>;
+
+    /// Durability barrier: when this returns, every byte this device has
+    /// acknowledged writing is on stable media. The default is a no-op for
+    /// devices with no volatile write cache between the kernel and the media
+    /// (RAM disks, VMM-backed virtio where the host owns the cache); the USB
+    /// mass-storage path implements it with SCSI `SYNCHRONIZE CACHE (10)`.
+    ///
+    /// Called by [`crate::Ext2Filesystem::sync`] after the write-back cache
+    /// has been pushed out, so `sync(2)`/`fsync(2)`/`reboot` end at a promise
+    /// about the *media*, not about a queue someone else still owns.
+    fn flush(&self) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

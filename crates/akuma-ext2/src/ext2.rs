@@ -49,6 +49,9 @@ use akuma_primitives::Registered;
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
+mod audit;
+pub use audit::AuditReport;
+
 /// Number of block slots in the ring cache. One contiguous backing allocation;
 /// linear-scan lookup is fine at this size (fits in L1).
 #[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
@@ -547,6 +550,10 @@ pub static E2_VERIFY_HITS: core::sync::atomic::AtomicBool =
 /// (pread at end of file) land here too, so this is a *rate* signal: a burst
 /// correlated with `[FILL-SHORT]` is the defect.
 pub static E2_READ_AT_EOF: AtomicUsize = AtomicUsize::new(0);
+
+/// `free_block` calls for a block whose bitmap bit was already clear (ignored,
+/// printed as `[E2-DFREE]` for the first 32).
+pub static E2_DOUBLE_FREE: AtomicUsize = AtomicUsize::new(0);
 
 // ==========================================================================
 // Deferred inode frees — "unlinked but still mapped"
@@ -2165,6 +2172,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         let mut bgd = self.read_bgd_staged(state, group)?;
         let bi = self.bitmap_slot(state, bgd.block_bitmap)?;
+        if !Self::get_bit(&state.bitmap_cache[bi].1, bit) {
+            // Already free: a second free of the same block. Proceeding would
+            // inflate the group/superblock free counts and, worse, pull the scan
+            // hint onto a block that is about to be (or already is) someone
+            // else's. Report and refuse — the signature the 2026-10-05
+            // cross-file corruption hunt is looking for
+            // (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §12).
+            let prev = E2_DOUBLE_FREE.fetch_add(1, Ordering::Relaxed);
+            if prev < 32 {
+                akuma_primitives::safe_print!(160,
+                    "[E2-DFREE] block={} group={} bit={} already free — free ignored\n",
+                    block_num, group, bit);
+            }
+            return Ok(());
+        }
         Self::set_bit(&mut state.bitmap_cache[bi].1, bit, false);
         state.bitmap_cache[bi].2 = true;
 
@@ -2370,6 +2392,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 }
             }
             inode.hard_links = 0;
+            // Linux stamps `dtime` the moment the link count reaches zero; an
+            // inode with no links and no dtime is what `e2fsck` calls "deleted
+            // inode has zero dtime" if the machine dies before the deferred
+            // free runs. The drain stamps it again when it really frees.
+            inode.deletion_time = self.current_time();
             return self.write_inode(state, inode_num, inode);
         }
 
@@ -4068,7 +4095,13 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         // for an explicit `fsync`/`sync` syscall. Data + inode + bitmap blocks
         // are always written through, so there is nothing else to push.
         let mut state = self.write_state();
-        self.flush_meta(&mut state)
+        self.flush_meta(&mut state)?;
+        // The media barrier, after the writes: `flush_meta`'s device writes are
+        // *acknowledged* by the adapter, which on USB means "in the drive's
+        // volatile cache". Until the device's own `flush` lands, `sync` has
+        // promised a durability the stack does not have — the 2026-10-05
+        // reboot lost acknowledged renames exactly there (corruption doc §11).
+        self.dev.flush().map_err(|_| FsError::IoError)
     }
 
     fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {
