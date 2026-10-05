@@ -224,6 +224,32 @@ Verified: over the ssh expect harness with and without `-e /bin/sh`
 with status 0 → rio exits), and by a person at the panel typing on the
 console keyboard (`/tmp/rio-bin -e /bin/sh`).
 
+### Resolved 2026-10-05 (evening): keys on the real pty
+
+With real ptys rio takes `forkpty` and the pipe fallback is not used. Running
+late.sh through `ssh` inside rio then showed Enter sending Ctrl+J, Esc and
+Backspace doing nothing, and `^[[A` echoed over the screen. Causes and fixes
+(details in `AKUMA_AMD64_PTY.md` §7): the fb platform held a lone ESC (now
+flushed as Escape after 400 ms, `ESC_FLUSH_MS`; Esc-then-letter bindings must
+land inside that window), sent Enter as LF and gave Escape no text (rio writes a
+key's text to the pty as is); and the kernel's `SET_TERMINAL_ATTRIBUTES`
+ignored the fd, so `ssh` never made the pty slave raw. Debugging aid kept: the
+`[pty] input NB queued [bytes]` trace line in `/tmp/akuma-fb.log` shows exactly
+what rio wrote. Also: panel font is 32, cursor blink on (`[cursor]` in the
+shipped config; rio defaults to no blink), and `HOME` is empty in ssh sessions —
+`export HOME=/root` (or source `/etc/akuma-dev.env`) before `/bin/rio` or it
+reads no config. rio deploys to `/bin/rio`.
+
+### Images and a full TUI (2026-10-05)
+
+With ptys and raw mode fixed, late.sh over `ssh` inside rio on the panel shows images through
+the **kitty graphics protocol** (inline thumbnail plus a full-size preview popup), photographed
+at the panel. This is the first run of sugarloaf's image path on the wgpu backend, so the
+"`image.wgsl` not rendered under test" gap below is closed for that shader (a `gpu-selftest`
+for it is still worth adding). Known and undiagnosed: slow redraws, and stale or missing cells
+while late.sh scrolls regions (suspects: rio's damage tracking, or the backend's region
+memoization).
+
 ### Kernel spec: Linux ptys (`/dev/ptmx` + `/dev/pts/N`)
 
 The real fix; with it rio (and any terminal emulator, tmux, script, expect)
@@ -285,9 +311,9 @@ with rio's harness or a 30-line C program (`openpty`, fork `sh -i`, write
   path dep `../../akuma-cli-wgpu` becomes a real crate dep).
 * rio's surface semantics under real use: `Rgba16Float`/HDR filter targets
   (librashader builds but is untested on the backend), mipmapped filter
-  chains, `copy_texture_to_texture` call sites, sugarloaf's `image.wgsl` /
+  chains, `copy_texture_to_texture` call sites, sugarloaf's
   `text_shader.wgsl` / filter shaders (they compile and JIT; not rendered
-  under test yet).
+  under test yet; `image.wgsl` has now rendered in real use, see above).
 * Input is keyboard-only (console tty). Mouse would need evdev; there is
   no pointer on the panel anyway.
 * Modifier reporting is per-keystroke recovered from the console encoding

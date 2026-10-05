@@ -96,23 +96,38 @@ do).
   QEMU at SMP=1 and SMP=4.
 - On the trashcan (kernel `8bece079`, 2026-10-05): `ptyprobe` 31/31. rio not yet run against it.
 
-## 7. Known issue: rio on the pty swallows/delays single keys (reported 2026-10-05, OPEN)
+## 7. rio on the pty swallowed/delayed keys (reported 2026-10-05) — two causes, both fixed
 
-Observed by the user running rio on the trashcan panel after the akuma-pty work:
+The report: with rio on the panel and `ssh` (late.sh) inside it, a lone Esc,
+Enter and `1` did nothing, `qq` quit late.sh "leaked" from earlier keys, arrows
+echoed as `^[[A` over the screen, and Backspace and Page Up failed.
 
-* A lone **Esc** that matches no rio keybind is not passed through to the program
-  running in the pty (ssh in this case).
-* The same for **Enter** and for **`1`**.
-* **`qq`** exits `late.sh`, which exits the rio terminal — the quit sequence
-  appears to be delivered late, and the exit looks *leaked* from the earlier keys
-  rather than caused by the `qq` just typed (user's guess: a stale/buffered exit).
+Neither cause was the pty's data path: rio's `[pty] input` trace shows the right
+bytes (e.g. `[27, 91, 65]` for Up).
 
-Not investigated. Leads: keys with no rio binding should reach the master side
-immediately — check whether rio's write to the pty master is being held
-(master write path not waking the slave reader, or an edge-triggered `EPOLLOUT`
-on the master not re-arming, the rule in `TOKIO_PIPE_EPOLL_HANG.md`); the delayed
-`qq` points at input sitting in a queue until something later flushes it.
-Repro: rio on the panel, `ssh` inside it, press Esc / Enter / `1`, then `qq`.
+1. **rio's fb platform** (fork commit `0f98724`). A lone ESC was held in the key
+   buffer until the next byte, which then decoded as Alt+key (`1` became Alt+1,
+   a later `q` became Alt+q = Quit); it is now flushed as Escape after 400 ms.
+   Enter's text was `"\n"` (LF = Ctrl+J to a raw-mode program; the pipe
+   fallback's ICRNL had hidden it) and is now `"\r"`. Escape had no text, so rio
+   wrote nothing for it.
+2. **The kernel ignored `fd` in `SET_TERMINAL_ATTRIBUTES`.** The Akuma `ssh`
+   client goes raw with that private syscall (307) on its stdin, and the handler
+   always changed the *console's* `TerminalState`. Inside a pty the slave stayed
+   cooked: input buffered until Enter, arrows echoed as `^[[A` (ECHOCTL), a lone
+   Esc held, Backspace edited an invisible line. Fix: glue's
+   `sys_set_terminal_attributes` acts on the pair's termios when `fd` is a pty
+   (`pty::set_raw_mode`, via `Termios::make_raw` / `make_cooked`, 3 host tests in
+   `akuma-pty`), and amd64's 307 arm no longer needs a console channel when the
+   fd is a pty (`pty::is_pty_fd`; a process whose stdin is a slave has no
+   channel and got `ENOSYS`). Limits: raw-off restores the default flags, not
+   the program's earlier ones (the pair keeps no saved copy);
+   `GET_TERMINAL_ATTRIBUTES` (308) still reads the console's flags.
+
+Kernel half: host-tested, built for `x86_64-unknown-none`, installed on the
+trashcan as `9fd74c05` (2026-10-05): `ptyprobe` still passes there. The raw-mode
+path itself (`ssh` inside rio: Enter sends, Esc leaves the compose box, no `^[[A`
+echo) has no probe yet and is checked by hand in rio.
 
 ## Background
 
