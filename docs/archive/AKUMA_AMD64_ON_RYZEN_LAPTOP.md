@@ -200,35 +200,32 @@ this box. It does **not** remove the reboot from the kernel-change loop.
   from RAM to `p3` itself (`root=` on the cmdline), and Akuma installs its own
   kernel, as it does on the trashcan.
 
-## 8. Staged 2026-10-06 (not yet booted)
+## 8. Staged and booted, 2026-10-06 — now `overlays/ryzen/`
 
-Built **on ryzen** from a fresh clone of `ryzen-wifi` @ `47adf6f5` by
-`scripts/utils/ryzen_metal/build.sh` (as netoneko, ~3 min), installed by
-`scripts/utils/ryzen_metal/install.sh` (root). Work dir `/home/netoneko/akuma-metal`.
+The staging moved into an overlay: [`overlays/ryzen/`](../../overlays/ryzen/README.md)
+(`send` → `build` → `qemu` rehearsal → `install` → one-shot). Its README has
+the loop, the menu and the details. In short:
 
-| on the ESP (`p6`, `/boot/efi/EFI/akuma/`) | md5 |
-|---|---|
-| `akuma-amd64` — `--features no-tests` (3 test strings vs 23) | `d26083969e7e…` |
-| `akuma-amd64.tests` — plain, runs the self-test suite | `c45b1d0d3113…` |
-| `root.img` — `mkdisk.sh … 512`: herd (sshd + console enabled), busybox, tcc + libtcc1, sshd test key | `1ff588c4359e…` |
-| `grubx64.efi` — `grub-mkstandalone`, menu (5 s): 0 nosmp verbose · 1 self-tests nosmp · 2 SMP · 3 reboot | |
+- **The first metal boot was a black screen.** The kernel refused a framebuffer
+  above a stale 4 GiB `MAPPED_LIMIT` (ryzen's is at `0x4b0000000`) and halted
+  on EGA text, which UEFI cannot show. Fixed. A framebuffer failure, or `nofb`,
+  now boots headless instead of halting.
+- **The QEMU rehearsal (OVMF on ryzen) then found a real memory-safety bug.**
+  UEFI splits the kernel image's range across firmware regions, and the PMM
+  handed out the region holding the kernel's first 6 MiB as free frames. Fixed
+  in `mem::usable_of`, by carving every reserved span out of every region it
+  overlaps. It reproduced on all kernels back to `87f1a7c5`, under KVM and TCG.
+- The framebuffer `console` herd service is removed from this image (user's
+  call). Entry 0 boots `sshd` + an opt-in `autoreboot` (90 s), so an unwatched
+  boot returns to Pop by itself.
 
-`/boot/efi/loader/entries/akuma.conf` chainloads it; `bootctl list` shows it
-beside the two Pop entries. **Nothing is armed.** Boot once with
-`bootctl set-oneshot akuma.conf && systemctl reboot`.
+Build changes on the box since §8's first version: `grub-common` +
+`grub-efi-amd64-bin` installed, their two services disabled; `sora.service` and
+`kot.service` stopped and disabled at the user's request
+(`systemctl enable --now sora kot` restores them).
 
-Changes on the box beyond those files: `grub-common` + `grub-efi-amd64-bin`
-installed, with their `grub-common`/`grub-initrd-fallback` services disabled
-again (they edit a `grubenv` that does not exist under systemd-boot). At the
-user's request, `sora.service` (live Firecracker guest) and `kot.service` are
-stopped and disabled; `systemctl enable --now sora kot` restores them.
-
-Two traps the build hit, both fixed in `build.sh`:
-- **tinycc's pinned commit `4597a962` no longer exists upstream.** repo.or.cz's
-  `mob` was rewritten, so a fetch of any depth fails with "did not contain". It
-  comes from a `git bundle` of a checkout that still has it (`$W/tinycc.bundle`).
-  Without it, `mkdisk.sh` silently stages no `/bin/tcc`.
-- **tcc's `build.rs` passes clang's `-target`**, and ryzen's `cc` is gcc: `CC=clang`.
+The tinycc and `CC=clang` traps from the first build still apply; both are
+handled in `build.sh`.
 
 ## Suggested order
 

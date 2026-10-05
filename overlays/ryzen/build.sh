@@ -1,5 +1,5 @@
 #!/bin/sh
-# ryzen bare metal, step 1 of 2 — run as netoneko on ryzen.
+# overlays/ryzen, step 1 of 2 — run as netoneko on ryzen. (README.md here.)
 #
 # Fresh clone of the public repo, kernel built natively twice (a `no-tests`
 # kernel for daily use, a plain one that runs the self-test suite — the first
@@ -7,6 +7,10 @@
 # Nothing here needs root and nothing outside $W is touched.
 #
 #   BRANCH=ryzen-wifi sh build.sh        # log: $W/build.log
+#
+# Unpushed work: a `$W/local.tar` of working-tree files (paths relative to the
+# repo root) is unpacked over the clone, after checkout and before building.
+# `send.sh` on the laptop makes and ships it.
 #
 # Step 2 (`install.sh`, root) puts the result on the ESP behind systemd-boot.
 # Why this box boots that way: docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md.
@@ -39,6 +43,9 @@ fi
 # tcc's build.rs passes clang's `-target`; ryzen's `cc` is gcc.
 export CC=clang
 git log --oneline -1
+if [ -f $W/local.tar ]; then
+    tar -xf $W/local.tar && tar -tf $W/local.tar   # the list is the record of what differs
+fi
 rustup target add x86_64-unknown-none
 
 K=target/x86_64-unknown-none/release/akuma-amd64
@@ -49,6 +56,22 @@ cp $K $OUT/akuma-amd64
 ls -la $OUT
 
 sh amd64/mkdisk.sh $OUT/root.img 512 || exit 1
+# Delete what remove.list names, then layer this overlay's rootfs/ onto the
+# image: directories first, then files.
+grep -v '^#' overlays/ryzen/remove.list | while read -r f; do
+    [ -n "$f" ] && /sbin/debugfs -w -R "rm $f" $OUT/root.img >/dev/null 2>&1 && echo "overlay: removed $f"
+done
+# Layer this overlay's rootfs/ onto the image: directories first, then files.
+# debugfs `write` refuses to overwrite, so an existing file is removed first.
+DEBUGFS=/sbin/debugfs
+(cd overlays/ryzen/rootfs && find . -mindepth 1 -type d | sed 's|^\./||' | sort) | while read -r d; do
+    $DEBUGFS -w -R "mkdir /$d" $OUT/root.img >/dev/null 2>&1
+done
+(cd overlays/ryzen/rootfs && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
+    $DEBUGFS -w -R "rm /$f" $OUT/root.img >/dev/null 2>&1
+    $DEBUGFS -w -R "write overlays/ryzen/rootfs/$f /$f" $OUT/root.img >/dev/null 2>&1
+    echo "overlay: /$f $($DEBUGFS -R "stat /$f" $OUT/root.img 2>/dev/null | grep -o 'Size: [0-9]*')"
+done
 # The keypair `mkdisk.sh` generated is the only one the image accepts.
 cp target/x86_64-unknown-none/release/amd64-ssh-test-key* $OUT/ 2>/dev/null
 /sbin/debugfs -R "ls /bin" $OUT/root.img 2>/dev/null | tr -s ' ' '\n' | grep -c .

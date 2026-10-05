@@ -116,6 +116,7 @@ const PAGE_SIZE: usize = 4096;
 
 unsafe extern "C" {
     /// End of the linked image including `.bss`, from `linker.ld`.
+    static _kernel_start: u8;
     static _kernel_end: u8;
 }
 
@@ -129,7 +130,7 @@ const fn align_up(v: usize, to: usize) -> usize {
 /// chipset left between them; only the heap's *placement* still picks one, and
 /// it picks the region holding the kernel image when that has room.
 pub fn init(machine: &MachineDescription) -> bool {
-    init_reserving(machine, 0)
+    init_reserving(machine, (0, 0))
 }
 
 /// How a region of RAM ended up being used, for the boot-log accounting.
@@ -148,6 +149,9 @@ enum Fate {
     HeapAndPmm,
     /// Below [`LOW_RAM_FLOOR`] — the BIOS's memory, not ours.
     BelowFloor,
+    /// Wholly inside the kernel image or a loader module. UEFI splits the
+    /// image's range into several regions; see [`usable_of`].
+    Occupied,
     /// More RAM regions than [`akuma_pmm::MAX_RAM_REGIONS`], so this one cannot
     /// be described to the PMM and must not be handed out. No machine here has
     /// ever reported enough regions to reach this.
@@ -162,6 +166,7 @@ impl Fate {
             Self::Pmm => "pmm",
             Self::HeapAndPmm => "heap + pmm",
             Self::BelowFloor => "unused (below the 1 MiB floor)",
+            Self::Occupied => "occupied (kernel image / loader module)",
             Self::Undescribable => "UNUSED (more regions than the PMM can describe)",
             Self::Unreachable => "UNREACHABLE (past the physmap)",
         }
@@ -186,16 +191,18 @@ impl Usable {
     }
 }
 
-/// As [`init`], but keeping the PMM's hands off everything below
-/// `reserve_to` as well.
+/// As [`init`], but keeping the PMM's hands off `reserved` (`[start, end)`,
+/// the loader's modules) as well.
 ///
 /// A multiboot2 boot arrives with the root filesystem already **in RAM**: GRUB
 /// loaded it as a module and told us where. Nothing in the memory map says so —
 /// the loader reports those frames as ordinary available memory — so without
 /// this the PMM would hand out the pages holding the filesystem the kernel is
 /// about to mount, and the corruption would appear later and somewhere else.
-pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
+pub fn init_reserving(machine: &MachineDescription, reserved: (u64, u64)) -> bool {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as u64;
+    let kernel = (core::ptr::addr_of!(_kernel_start) as u64, kernel_end);
+    let taken = [kernel, reserved];
 
     // EVERY REGION IS MANAGED, NOT ONE, and that is the whole of this function.
     //
@@ -230,7 +237,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     let mut span_base = u64::MAX;
     let mut span_end = 0u64;
     let mut ram_total = 0u64;
-    for u in usable_regions(machine, kernel_end, reserve_to).take(akuma_pmm::MAX_RAM_REGIONS) {
+    for u in usable_regions(machine, &taken).take(akuma_pmm::MAX_RAM_REGIONS) {
         span_base = span_base.min(u.base);
         span_end = span_end.max(u.end);
         ram_total += u.end - u.base;
@@ -250,7 +257,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     // decides only where the heap sits, not which memory the machine keeps.
     let mut roomiest: Option<Usable> = None;
     let mut kernel_home: Option<Usable> = None;
-    for u in usable_regions(machine, kernel_end, reserve_to).take(regions) {
+    for u in usable_regions(machine, &taken).take(regions) {
         if roomiest.is_none_or(|r| u.room() > r.room()) {
             roomiest = Some(u);
         }
@@ -293,8 +300,9 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
         let fate = if r.addr >= PHYSMAP_LIMIT {
             Fate::Unreachable
         } else {
-            match usable_of(*r, kernel_end, reserve_to) {
-                None => Fate::BelowFloor,
+            match usable_of(*r, &taken) {
+                None if r.end() <= LOW_RAM_FLOOR => Fate::BelowFloor,
+                None => Fate::Occupied,
                 Some(u) => {
                     let idx = seen;
                     seen += 1;
@@ -406,7 +414,7 @@ pub fn init_reserving(machine: &MachineDescription, reserve_to: u64) -> bool {
     // spoken for. The reverse would reserve pages that are about to be declared
     // free and hand out the kernel image.
     akuma_pmm::init_sparse(span_base as usize, (span_end - span_base) as usize);
-    for u in usable_regions(machine, kernel_end, reserve_to).take(regions) {
+    for u in usable_regions(machine, &taken).take(regions) {
         if akuma_pmm::add_ram(u.base as usize, (u.end - u.base) as usize).is_none() {
             // Cannot happen -- the scan above took at most `MAX_RAM_REGIONS` --
             // but a PMM that is handing out an undescribed region is handing out
@@ -444,19 +452,38 @@ const LOW_RAM_FLOOR: u64 = 0x10_0000;
 /// One RAM region as the kernel can actually use it, or `None` if nothing of it
 /// is left once the physmap, the low floor and whatever already occupies it are
 /// taken off.
-fn usable_of(r: MemRegion, kernel_end: u64, reserve_to: u64) -> Option<Usable> {
+///
+/// `taken` is every `[start, end)` already occupied — the kernel image and the
+/// loader's modules — and **each is carved out of every region it overlaps**.
+/// This used to raise the floor only of the region *containing* `kernel_end`
+/// (and `reserve_to`), which is correct only while the image sits inside one
+/// region. UEFI firmware splits low memory by its own past use, and on OVMF and
+/// on ryzen (2026-10-06) the image at `0x200000..0xb17050` spans
+/// `0x100000 + 7 MiB` and `0x900000 + …`: the first region kept its floor at
+/// 1 MiB, the PMM handed out the kernel's own `.text`/`.data` as free frames,
+/// and the first `fork` from herd overwrote live kernel memory — a `#PF` inside
+/// `talc_alloc` with headless output, a silent triple fault with a framebuffer.
+///
+/// A span that reaches the region's top clips `end` (the part below it stays
+/// usable); one that ends inside the region raises `floor` to its end, giving up
+/// whatever lies below it there, as before. Applied in order, each narrowing
+/// `[floor, end)`.
+fn usable_of(r: MemRegion, taken: &[(u64, u64)]) -> Option<Usable> {
     let base = r.addr.max(LOW_RAM_FLOOR);
-    let end = r.end().min(PHYSMAP_LIMIT);
+    let mut end = r.end().min(PHYSMAP_LIMIT);
     if end <= base {
         return None;
     }
-    // Anything already occupying part of this region raises the floor.
     let mut floor = base;
-    if kernel_end > base && kernel_end < end {
-        floor = floor.max(kernel_end);
-    }
-    if reserve_to > base && reserve_to < end {
-        floor = floor.max(reserve_to);
+    for &(start, stop) in taken {
+        if stop <= start || stop <= floor || start >= end {
+            continue; // empty, or no overlap with what is left
+        }
+        if stop < end {
+            floor = stop;
+        } else {
+            end = start;
+        }
     }
     let floor = align_up(floor as usize, PAGE_SIZE) as u64;
     if floor >= end {
@@ -470,16 +497,15 @@ fn usable_of(r: MemRegion, kernel_end: u64, reserve_to: u64) -> Option<Usable> {
 /// Deliberately an iterator recomputed at each use rather than an array built
 /// once: this runs before the heap exists, so there is nowhere to build one,
 /// and the list is walked three times at boot and never again.
-fn usable_regions(
-    machine: &MachineDescription,
-    kernel_end: u64,
-    reserve_to: u64,
-) -> impl Iterator<Item = Usable> + '_ {
+fn usable_regions<'a>(
+    machine: &'a MachineDescription,
+    taken: &'a [(u64, u64)],
+) -> impl Iterator<Item = Usable> + 'a {
     machine
         .regions()
         .iter()
         .filter(|r| r.is_ram())
-        .filter_map(move |r| usable_of(*r, kernel_end, reserve_to))
+        .filter_map(move |r| usable_of(*r, taken))
 }
 
 #[cfg(not(feature = "no-tests"))]

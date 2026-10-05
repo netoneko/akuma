@@ -40,8 +40,14 @@ use crate::serial;
 /// Where the boot page tables mirror all of physical memory.
 const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
-/// The highest physical address `boot.s` maps.
-const MAPPED_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// The highest physical address `boot.s` maps — the physmap's own limit, not a
+/// copy of it. This was a literal 4 GiB from when `boot.s` mapped four
+/// directories, and stayed 4 GiB after the map grew to [`crate::phys::PHYSMAP_LIMIT`].
+/// A firmware framebuffer above it was then refused and the boot halted on an
+/// EGA text line a UEFI machine cannot display: ryzen's GOP framebuffer is the
+/// Radeon's 64-bit BAR at `0x4b0000000` (18.75 GiB), and the first boot there
+/// was a black screen (2026-10-06, `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`).
+const MAPPED_LIMIT: u64 = crate::phys::PHYSMAP_LIMIT;
 
 /// The legacy colour-text buffer.
 const EGA_TEXT_BASE: u64 = 0xB_8000;
@@ -330,7 +336,8 @@ fn map_wc(phys: u64, len: u64) -> bool {
         !(phys <= base && end >= base + TWO_MIB)
     }).count();
     let splits = if first == last { splits.min(1) } else { splits };
-    // SAFETY: indices are below 512 * PHYSMAP_PDS (end <= 4 GiB), so inside `__pd0`.
+    // SAFETY: indices are below 512 * PHYSMAP_PDS (end <= MAPPED_LIMIT, which is
+    // PHYSMAP_LIMIT), so inside `__pd0`.
     let all_large = (first..=last).all(|i| unsafe { pd.add(i).read_volatile() } & PDE_LARGE_PRESENT == PDE_LARGE_PRESENT);
     if !all_large || splits > SPLIT_PT.len() {
         return false;
@@ -641,6 +648,93 @@ pub fn fb_summary() {
     serial::puts("\n");
 }
 
+/// What [`init_console`] brought up, for the `font:`/`fb:` lines of the banner.
+struct ConsoleUp {
+    fb: akuma_multiboot2::Framebuffer,
+    font: &'static str,
+    fw: usize,
+    fh: usize,
+    fcols: usize,
+    frows: usize,
+    fscale: usize,
+}
+
+/// The firmware framebuffer and the console on it, or why there is none.
+///
+/// **Not having one is not fatal.** Every failure here used to `halt` after an
+/// [`ega_text`] line, which on a UEFI machine (no VGA text memory) is a black
+/// screen with nothing on it — exactly what ryzen's first boot showed
+/// (2026-10-06, framebuffer above the old 4 GiB limit). A kernel that keeps
+/// going headless still reaches `init`, `dmesg` and whatever log sink or
+/// network the machine has, and the reason lands in `dmesg`. Every `CONSOLE`
+/// user already treats "no console" as a no-op.
+fn init_console(info: &BootInfo<'_>) -> Result<ConsoleUp, &'static str> {
+    let Some(fb) = info.framebuffer() else {
+        ega_text(1, "no framebuffer tag: booting headless");
+        return Err("GRUB provided no framebuffer tag");
+    };
+    if !matches!(fb.kind, FramebufferKind::Rgb) {
+        ega_text(1, "framebuffer is not direct-colour: booting headless");
+        return Err("framebuffer is not direct-colour (EGA text mode?)");
+    }
+    let Some(mut surface) = Framebuffer::new(&fb) else {
+        return Err("framebuffer lies above the boot physmap");
+    };
+    // The same framebuffer, offered to userspace as `/dev/fb0` (`fbdev`).
+    crate::fbdev::register(akuma_fbdev::Geometry {
+        phys: fb.addr,
+        width: fb.width,
+        height: fb.height,
+        pitch: fb.pitch,
+        bpp: u32::from(fb.bpp),
+        red: akuma_fbdev::Channel { pos: fb.format.red_pos, len: fb.format.red_size },
+        green: akuma_fbdev::Channel { pos: fb.format.green_pos, len: fb.format.green_size },
+        blue: akuma_fbdev::Channel { pos: fb.format.blue_pos, len: fb.format.blue_size },
+    });
+
+    // Colour before glyphs: the smallest proof that address, pitch and pixel
+    // format are all right, with no font and almost no stack involved.
+    let (w, h) = (surface.width(), surface.height());
+    // Write-combining first: every pixel store after this is cheap, including the
+    // first fill. The result is on the `[fb]` line (`wc on|off`).
+    map_wc(fb.addr, fb.size_bytes());
+    surface.fill(0, 0, w, h, Rgb::new(0x30, 0x00, 0x50));
+    surface.flush();
+
+    // Built **straight into the static** rather than into a local first. The
+    // console owns its whole character grid (about 54 KiB: code point, colours and
+    // flags per cell), and a named local plus the moves around it are copies of
+    // that on a boot stack with no guard page beneath it. `Option::map` writes the
+    // wrapper in place of the construction, and everything after goes through the
+    // lock guard.
+    let (font, fw, fh, fcols, frows, fscale) = {
+        let mut slot = CONSOLE.lock();
+        *slot = Console::new(surface).map(FbConsole);
+        let Some(con) = slot.as_mut() else {
+            return Err("framebuffer too small for a console");
+        };
+        let con = &mut con.0;
+        con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
+        // Timed: a full-screen fill is the one operation whose cost is purely "how fast
+        // can this machine write to its framebuffer", reported on the `[fb]` line.
+        // SAFETY: RDTSC is unprivileged and present on every x86_64.
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        con.clear();
+        con.surface_mut().flush(); // so the time includes draining the WC buffers
+        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        CLEAR_CYCLES.store(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
+        // Which font and grid the console actually chose. `Console::choose_font`
+        // takes that decision from the framebuffer size at runtime — IBM Plex Mono
+        // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose
+        // only output IS this console, "what am I looking at" was a question only
+        // answerable by re-deriving the arithmetic from the mode GRUB happened to
+        // pick. Now the console says so itself, in itself.
+        (con.font().name(), con.font().width(), con.font().height(), con.cols(), con.rows(), con.scale())
+    };
+    ega_text(2, "console up");
+    Ok(ConsoleUp { fb, font, fw, fh, fcols, frows, fscale })
+}
+
 /// Long-mode entry for a GRUB/multiboot2 boot, called from `boot.s`.
 ///
 /// Deliberately parallel to [`crate::kmain`], and in the same order, because
@@ -677,71 +771,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         ega_text(1, "FAIL: information block too short");
         crate::halt();
     };
-    let Some(fb) = info.framebuffer() else {
-        ega_text(1, "FAIL: GRUB provided no framebuffer tag");
-        crate::halt();
+    // `nofb`: do not touch the framebuffer at all — for a machine run as a
+    // headless test target (ryzen's reboot loop, `overlays/ryzen/`).
+    let console = if info.cmdline().split_ascii_whitespace().any(|t| t == "nofb") {
+        Err("`nofb` on the command line")
+    } else {
+        init_console(&info)
     };
-    if !matches!(fb.kind, FramebufferKind::Rgb) {
-        ega_text(1, "FAIL: framebuffer is not direct-colour (EGA text mode?)");
-        crate::halt();
-    }
-    let Some(mut surface) = Framebuffer::new(&fb) else {
-        ega_text(1, "FAIL: framebuffer lies above the mapped 4 GiB");
-        crate::halt();
-    };
-    // The same framebuffer, offered to userspace as `/dev/fb0` (`fbdev`).
-    crate::fbdev::register(akuma_fbdev::Geometry {
-        phys: fb.addr,
-        width: fb.width,
-        height: fb.height,
-        pitch: fb.pitch,
-        bpp: u32::from(fb.bpp),
-        red: akuma_fbdev::Channel { pos: fb.format.red_pos, len: fb.format.red_size },
-        green: akuma_fbdev::Channel { pos: fb.format.green_pos, len: fb.format.green_size },
-        blue: akuma_fbdev::Channel { pos: fb.format.blue_pos, len: fb.format.blue_size },
-    });
-
-    // Colour before glyphs: the smallest proof that address, pitch and pixel
-    // format are all right, with no font and almost no stack involved.
-    let (w, h) = (surface.width(), surface.height());
-    // Write-combining first: every pixel store after this is cheap, including the
-    // first fill. The result is on the `[fb]` line (`wc on|off`).
-    map_wc(fb.addr, fb.size_bytes());
-    surface.fill(0, 0, w, h, Rgb::new(0x30, 0x00, 0x50));
-    surface.flush();
-
-    // Built **straight into the static** rather than into a local first. The
-    // console owns its whole character grid (about 54 KiB: code point, colours and
-    // flags per cell), and a named local plus the moves around it are copies of
-    // that on a boot stack with no guard page beneath it. `Option::map` writes the
-    // wrapper in place of the construction, and everything after goes through the
-    // lock guard.
-    let (fname, fw, fh, fcols, frows, fscale) = {
-        let mut slot = CONSOLE.lock();
-        *slot = Console::new(surface).map(FbConsole);
-        let Some(con) = slot.as_mut() else {
-            ega_text(2, "FAIL: framebuffer too small for a console");
-            crate::halt();
-        };
-        let con = &mut con.0;
-        con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
-        // Timed: a full-screen fill is the one operation whose cost is purely "how fast
-        // can this machine write to its framebuffer", reported on the `[fb]` line.
-        // SAFETY: RDTSC is unprivileged and present on every x86_64.
-        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-        con.clear();
-        con.surface_mut().flush(); // so the time includes draining the WC buffers
-        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
-        CLEAR_CYCLES.store(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
-        // Which font and grid the console actually chose. `Console::choose_font`
-        // takes that decision from the framebuffer size at runtime — IBM Plex Mono
-        // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose
-        // only output IS this console, "what am I looking at" was a question only
-        // answerable by re-deriving the arithmetic from the mode GRUB happened to
-        // pick. Now the console says so itself, in itself.
-        (con.font().name(), con.font().width(), con.font().height(), con.cols(), con.rows(), con.scale())
-    };
-    ega_text(2, "console up");
 
     // **Quiet boot**, decided now and started before the first message below so none
     // of them reaches the screen: the splash instead of a scrolling log. On by
@@ -753,7 +789,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         let cmd = info.cmdline();
         let has = |w: &str| cmd.split_ascii_whitespace().any(|t| t == w);
         serial::set_fb_verbose(has("fbverbose"));
-        if (cfg!(feature = "no-tests") || has("quiet")) && !has("fbverbose") {
+        if console.is_ok() && (cfg!(feature = "no-tests") || has("quiet")) && !has("fbverbose") {
             crate::splash::begin();
         }
     }
@@ -780,29 +816,38 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // which this kernel never does. See `kbd`.
     serial::puts("  kbd: ");
     serial::puts(if crate::kbd::init() { "i8042 present" } else { "no i8042" });
-    serial::puts("\n  font: ");
-    serial::puts(fname);
-    serial::puts(" ");
-    serial::put_dec(fw as u64);
-    serial::puts("x");
-    serial::put_dec(fh as u64);
-    serial::puts(" scale ");
-    serial::put_dec(fscale as u64);
-    serial::puts(" -> ");
-    serial::put_dec(fcols as u64);
-    serial::puts("x");
-    serial::put_dec(frows as u64);
-    serial::puts(" cells");
-    serial::puts("\n  fb:   ");
-    serial::put_dec(u64::from(fb.width));
-    serial::puts("x");
-    serial::put_dec(u64::from(fb.height));
-    serial::puts(" @ ");
-    serial::put_dec(u64::from(fb.bpp));
-    serial::puts("bpp, pitch ");
-    serial::put_dec(u64::from(fb.pitch));
-    serial::puts(", at 0x");
-    serial::put_hex(fb.addr);
+    match &console {
+        Ok(c) => {
+            serial::puts("\n  font: ");
+            serial::puts(c.font);
+            serial::puts(" ");
+            serial::put_dec(c.fw as u64);
+            serial::puts("x");
+            serial::put_dec(c.fh as u64);
+            serial::puts(" scale ");
+            serial::put_dec(c.fscale as u64);
+            serial::puts(" -> ");
+            serial::put_dec(c.fcols as u64);
+            serial::puts("x");
+            serial::put_dec(c.frows as u64);
+            serial::puts(" cells");
+            serial::puts("\n  fb:   ");
+            serial::put_dec(u64::from(c.fb.width));
+            serial::puts("x");
+            serial::put_dec(u64::from(c.fb.height));
+            serial::puts(" @ ");
+            serial::put_dec(u64::from(c.fb.bpp));
+            serial::puts("bpp, pitch ");
+            serial::put_dec(u64::from(c.fb.pitch));
+            serial::puts(", at 0x");
+            serial::put_hex(c.fb.addr);
+        }
+        Err(why) => {
+            serial::puts("\n  fb:   none, headless (");
+            serial::puts(why);
+            serial::puts(")");
+        }
+    }
     serial::puts("\n");
 
     // Descriptor tables, the BSP's per-CPU block, SMAP, then drop the identity
@@ -843,7 +888,12 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // The root filesystem is already in memory, and NOTHING IN THE MEMORY MAP
     // SAYS SO. Reserve it before the physical allocator is told anything.
     let module = info.first_module();
-    let reserve_to = info.modules_end();
+    // Every module, as one span: `mem::usable_of` carves it out of each region
+    // it touches.
+    let reserved = info
+        .modules()
+        .fold((u64::MAX, 0u64), |(lo, hi), m| (lo.min(u64::from(m.start)), hi.max(u64::from(m.end))));
+    let reserved = if reserved.1 == 0 { (0, 0) } else { reserved };
     if let Some(m) = module {
         serial::puts("  mod:  root image at 0x");
         serial::put_hex(u64::from(m.start));
@@ -852,7 +902,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         serial::puts(" KiB\n");
     }
 
-    if !crate::mem::init_reserving(&machine, reserve_to) {
+    if !crate::mem::init_reserving(&machine, reserved) {
         serial::puts("\nAkuma/amd64 - memory bring-up FAILED\n");
         crate::halt();
     }

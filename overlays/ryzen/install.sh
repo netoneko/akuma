@@ -1,5 +1,5 @@
 #!/bin/sh
-# ryzen bare metal, step 2 of 2 — run as root on ryzen, after build.sh.
+# overlays/ryzen, step 2 of 2 — run as root on ryzen, after build.sh.
 #
 # ryzen boots systemd-boot, not GRUB, and systemd-boot cannot load a multiboot2
 # kernel. So: a standalone GRUB EFI binary (config embedded) on the Pop ESP,
@@ -33,38 +33,11 @@ mkdir -p $D
 cp "$OUT/akuma-amd64" "$OUT/akuma-amd64.tests" "$OUT/root.img" $D/
 sync
 
-# Entry 0 is what a one-shot boots with nobody watching; the menu waits 5 s.
-# `fbverbose`: keep kernel diagnostics on the screen — this machine has no
-# serial port and (yet) no network, so the panel is the only output.
-# `nosmp` until a 16-thread boot has been seen to work.
-CFG=$(mktemp)
-cat > $CFG <<'EOF'
-insmod part_gpt
-insmod fat
-insmod multiboot2
-insmod all_video
-search --no-floppy --file --set=root /EFI/akuma/akuma-amd64
-set timeout=5
-set default=0
-menuentry "Akuma/amd64 (nosmp, verbose)" {
-    multiboot2 /EFI/akuma/akuma-amd64 init=/bin/herd nosmp fbverbose
-    module2 /EFI/akuma/root.img
-}
-menuentry "Akuma/amd64 self-tests (nosmp)" {
-    multiboot2 /EFI/akuma/akuma-amd64.tests init=/bin/herd nosmp fbverbose
-    module2 /EFI/akuma/root.img
-}
-menuentry "Akuma/amd64 (SMP)" {
-    multiboot2 /EFI/akuma/akuma-amd64 init=/bin/herd fbverbose
-    module2 /EFI/akuma/root.img
-}
-menuentry "Back to firmware (reboot)" {
-    reboot
-}
-EOF
+# The menu is `grub.cfg` in this overlay, embedded into the EFI binary.
+CFG=$W/akuma/overlays/ryzen/grub.cfg
+[ -f $CFG ] || { echo "missing $CFG" >&2; exit 1; }
 grub-mkstandalone -O x86_64-efi -o $D/grubx64.efi "boot/grub/grub.cfg=$CFG"
 cp $CFG $D/grub.cfg.embedded   # for reading only; the binary carries its own copy
-rm -f $CFG
 
 cat > $ESP/loader/entries/akuma.conf <<'EOF'
 title   Akuma/amd64
