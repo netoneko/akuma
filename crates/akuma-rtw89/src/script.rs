@@ -31,6 +31,13 @@
 //! | `0x21..=0x23` | `off: u32, mask, val` | read until `read & mask == val` ([`POLL_BUDGET_US`]) |
 //! | `0x30` | `us: u32` | wait |
 //! | `0x40` | `len: u16, mac_at: u16, bytes[len]` | send an H2C (header included); if `mac_at != 0xffff`, the card's MAC goes at that offset first |
+//! | `0x41` | `len: u16, n: u8, (kind: u8, at: u16) × n, bytes[len]` | send an H2C after filling in `n` run-time values ([`sub`]: MAC, BSSID, AID, keys) |
+//!
+//! `0x41` is what lets a recording of Linux *joining a network* be replayed
+//! (stage W3/W4): the access point's address, the association id it handed
+//! out and the keys the handshake produced are different every time, and none
+//! of them may sit in the repository. The generator blanks them and records
+//! where they go; [`Vars`] supplies them.
 
 use crate::Bus;
 
@@ -147,8 +154,76 @@ fn read(bus: &mut impl Bus, w: u8, off: u32) -> u32 {
 /// Largest H2C the stream may carry (the CH12 slot less its descriptor).
 pub const H2C_MAX: usize = 2032;
 
-/// Run `seq` against the card, counting into `st`. `mac` replaces the zeroed
-/// MAC address in the H2C commands that carry one.
+/// What `0x41` fills in: one value per [`sub`] kind.
+pub mod sub {
+    /// This station's address (6 bytes).
+    pub const MAC: u8 = 0;
+    /// The access point's address (6 bytes).
+    pub const BSSID: u8 = 1;
+    /// The association id into the low 12 bits of a little-endian u16
+    /// (the address CAM's `AID12`).
+    pub const AID12: u8 = 2;
+    /// The association id with bits 15:14 set, as a PS-Poll's duration field
+    /// carries it (the firmware's PS-Poll template).
+    pub const AID_PSPOLL: u8 = 3;
+    /// The pairwise temporal key (16 bytes, in key order).
+    pub const TK: u8 = 4;
+    /// The group temporal key (16 bytes).
+    pub const GTK: u8 = 5;
+    /// The group key's id into bits 7:6 of one byte (the address CAM's and
+    /// DCTL's key-id field for security entry 2, where the group key goes).
+    pub const GTK_IDX_HI2: u8 = 6;
+}
+
+/// The run-time values a replay may need.
+#[derive(Clone, Copy, Default)]
+pub struct Vars {
+    pub mac: [u8; 6],
+    pub bssid: [u8; 6],
+    pub aid: u16,
+    pub tk: [u8; 16],
+    pub gtk: [u8; 16],
+    pub gtk_idx: u8,
+}
+
+impl core::fmt::Debug for Vars {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Vars(aid {}, gtk idx {})", self.aid, self.gtk_idx)
+    }
+}
+
+impl Vars {
+    /// Fill `kind` at `at` in `c`; `false` if it does not fit.
+    fn fill(&self, c: &mut [u8], kind: u8, at: usize) -> bool {
+        let put = |c: &mut [u8], v: &[u8]| c.get_mut(at..at + v.len()).map(|d| d.copy_from_slice(v)).is_some();
+        match kind {
+            sub::MAC => put(c, &self.mac),
+            sub::BSSID => put(c, &self.bssid),
+            sub::AID12 => match c.get_mut(at..at + 2) {
+                Some(d) => {
+                    let old = u16::from_le_bytes([d[0], d[1]]);
+                    d.copy_from_slice(&((old & 0xf000) | (self.aid & 0x0fff)).to_le_bytes());
+                    true
+                }
+                None => false,
+            },
+            sub::AID_PSPOLL => put(c, &((self.aid & 0x3fff) | 0xc000).to_le_bytes()),
+            sub::TK => put(c, &self.tk),
+            sub::GTK => put(c, &self.gtk),
+            sub::GTK_IDX_HI2 => match c.get_mut(at) {
+                Some(b) => {
+                    *b = (*b & 0x3f) | ((self.gtk_idx & 3) << 6);
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Run `seq` against the card, counting into `st`. `vars` supplies what the
+/// stream left blank: the MAC for `0x40`, everything [`sub`] names for `0x41`.
 ///
 /// # Errors
 ///
@@ -158,7 +233,7 @@ pub const H2C_MAX: usize = 2032;
 pub fn run<B: Bus>(
     bus: &mut B,
     seq: &[u8],
-    mac: [u8; 6],
+    vars: &Vars,
     h2c: &mut impl H2cSink<B>,
     st: &mut Stats,
 ) -> Result<(), Error> {
@@ -218,7 +293,7 @@ pub fn run<B: Bus>(
                 bus.delay_us(us);
                 st.delays_us += u64::from(us);
             }
-            0x40 => {
+            0x40 if op == 0x40 => {
                 let len = usize::from(rd.u16()?);
                 let mac_at = rd.u16()?;
                 let at = rd.at;
@@ -227,7 +302,24 @@ pub fn run<B: Bus>(
                 c.copy_from_slice(body);
                 if mac_at != 0xffff {
                     let m = usize::from(mac_at);
-                    c.get_mut(m..m + 6).ok_or(Error::Corrupt(at))?.copy_from_slice(&mac);
+                    c.get_mut(m..m + 6).ok_or(Error::Corrupt(at))?.copy_from_slice(&vars.mac);
+                }
+                h2c.send(bus, c).map_err(|SendFailed| Error::H2c(st.h2c))?;
+                st.h2c += 1;
+            }
+            0x40 if op == 0x41 => {
+                let len = usize::from(rd.u16()?);
+                let n = usize::from(rd.u8()?);
+                let subs_at = rd.at;
+                rd.take(n * 3)?;
+                let at = rd.at;
+                let body = rd.take(len)?;
+                let c = cmd.get_mut(..len).ok_or(Error::Corrupt(at))?;
+                c.copy_from_slice(body);
+                for s in seq[subs_at..subs_at + n * 3].chunks_exact(3) {
+                    if !vars.fill(c, s[0], usize::from(u16::from_le_bytes([s[1], s[2]]))) {
+                        return Err(Error::Corrupt(subs_at));
+                    }
                 }
                 h2c.send(bus, c).map_err(|SendFailed| Error::H2c(st.h2c))?;
                 st.h2c += 1;
@@ -335,11 +427,41 @@ mod tests {
         let mut bus = Fake { flip_after: Some(4), ..Fake::default() };
         let mut sink = Sink([0; 32], 0);
         let mut st = Stats::default();
-        run(&mut bus, &s, [1, 2, 3, 4, 5, 6], &mut sink, &mut st).unwrap();
+        run(&mut bus, &s, &Vars { mac: [1, 2, 3, 4, 5, 6], ..Vars::default() }, &mut sink, &mut st).unwrap();
         assert_eq!((st.writes, st.checks, st.mismatches, st.polls, st.poll_timeouts, st.h2c), (1, 2, 1, 1, 0, 1));
         assert_eq!(st.first[0], Departure { op: 3, off: 12, want: 5, got: 0 });
         assert_eq!(&sink.0[..10], &[9, 9, 1, 2, 3, 4, 5, 6, 9, 9]);
         assert!(bus.slept >= 250);
+    }
+
+    #[test]
+    fn templated_h2c_fills_every_kind() {
+        let mut s = Vec::new();
+        s.push(0x41);
+        s.extend_from_slice(&30u16.to_le_bytes());
+        let subs: [(u8, u16); 4] = [(sub::BSSID, 0), (sub::AID12, 6), (sub::AID_PSPOLL, 8), (sub::GTK_IDX_HI2, 10)];
+        s.push(subs.len() as u8);
+        for (k, at) in subs {
+            s.push(k);
+            s.extend_from_slice(&at.to_le_bytes());
+        }
+        let mut body = [0u8; 30];
+        body[7] = 0xa0; // bits 15:12 of the AID12 word belong to someone else
+        body[10] = 0x02; // the low bits of the key-id byte too
+        s.extend_from_slice(&body);
+        s.push(0x41); // and one that does not fit
+        s.extend_from_slice(&4u16.to_le_bytes());
+        s.push(1);
+        s.extend_from_slice(&[sub::TK, 0, 0]);
+        s.extend_from_slice(&[0; 4]);
+        s.push(0);
+        let v = Vars { bssid: [0xb0, 1, 2, 3, 4, 5], aid: 0x123, gtk_idx: 2, ..Vars::default() };
+        let mut sink = Sink([0; 32], 0);
+        let mut st = Stats::default();
+        let r = run(&mut Fake::default(), &s, &v, &mut sink, &mut st);
+        assert_eq!(&sink.0[..11], &[0xb0, 1, 2, 3, 4, 5, 0x23, 0xa1, 0x23, 0xc1, 0x82]);
+        assert_eq!(sink.1, 1);
+        assert!(matches!(r, Err(Error::Corrupt(_))));
     }
 
     #[test]
@@ -353,7 +475,7 @@ mod tests {
         s.push(0);
         let mut bus = Fake::default();
         let mut st = Stats::default();
-        run(&mut bus, &s, [0; 6], &mut Sink([0; 32], 0), &mut st).unwrap();
+        run(&mut bus, &s, &Vars::default(), &mut Sink([0; 32], 0), &mut st).unwrap();
         assert_eq!((st.poll_timeouts, st.writes), (1, 1));
     }
 
@@ -363,7 +485,7 @@ mod tests {
         op_w32(&mut s, 8, 7);
         s.truncate(6);
         let mut st = Stats::default();
-        assert_eq!(run(&mut Fake::default(), &s, [0; 6], &mut Sink([0; 32], 0), &mut st), Err(Error::Corrupt(5)));
+        assert_eq!(run(&mut Fake::default(), &s, &Vars::default(), &mut Sink([0; 32], 0), &mut st), Err(Error::Corrupt(5)));
     }
 
     #[test]

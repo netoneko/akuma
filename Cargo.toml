@@ -74,6 +74,7 @@ default-members = [
     "crates/akuma-nvme",
     "crates/akuma-rtw89",
     "crates/akuma-ieee80211",
+    "crates/akuma-wpa",
     "crates/akuma-wifi",
     "crates/akuma-usb-storage",
     "crates/akuma-xhci",

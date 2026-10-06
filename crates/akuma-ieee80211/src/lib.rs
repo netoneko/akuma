@@ -9,6 +9,7 @@
 //! |---|---|
 //! | [`frame`] | frame control, the management header, information elements |
 //! | [`beacon`] | what a beacon or probe response advertises: SSID, channel, RSN |
+//! | [`sta`] | authentication, association, data frames (LLC/SNAP, CCMP header) |
 //!
 //! `no_std`, no allocation, no dependencies, `forbid(unsafe_code)`.
 
@@ -17,6 +18,7 @@
 
 pub mod beacon;
 pub mod frame;
+pub mod sta;
 
 /// A MAC address.
 pub type Addr = [u8; 6];

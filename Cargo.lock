@@ -807,6 +807,10 @@ name = "akuma-wifi"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-wpa"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-xhci"
 version = "0.1.0"
 
