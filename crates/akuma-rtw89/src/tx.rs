@@ -37,9 +37,11 @@
 //! | [`Desc::eapol`] | `QSEL_VO` / `CH_ACH3` | software | EAPOL is a data frame with tid 7 (`rtw89_core_get_qsel`), unencrypted |
 //! | [`Desc::data`] | `QSEL_BE` / `CH_ACH0` | software | CCMP-128 via `Sec`; `agg_en` off — there is no ADDBA session to aggregate into |
 //!
-//! `mac_id` names an address-CAM entry: this station's own (0) for management
-//! frames, the peer's (1) for frames to the access point, as Linux picks it
-//! (`rtw89_core_tx_get_mac_id`) and the recording shows.
+//! `mac_id` names an address-CAM entry. A station's peer entry shares its
+//! interface's mac id (`rtw89_core_sta_add` copies it for
+//! `NL80211_IFTYPE_STATION`), so every frame of a join — management, EAPOL and
+//! data alike — carries the interface's, 0, as all three recorded records do
+//! (`rtw89_core_tx_get_mac_id`).
 
 use crate::Bus;
 use crate::h2c;
@@ -121,6 +123,13 @@ pub struct Desc {
     pub qsel: u8,
     pub ch_dma: u8,
     pub mac_id: u8,
+    /// `wp_offset`, in 8-byte units: 1 for a protected frame — room for the
+    /// security header the chip writes (`rtw89_core_tx_update_sec_key`, with
+    /// the 8852C's `hw_sec_hdr`).
+    pub wp_offset: u8,
+    /// `tid_indicate` (`rtw89_core_get_tid_indicate`): set for the tids that
+    /// are the upper of their access category's pair — 7 (EAPOL) is, 0 is not.
+    pub tid_indicate: bool,
     /// 802.11 header length (QoS field included, LLC excluded) in 2-byte
     /// units — `rtw89_core_tx_update_llc_hdr`. 0 for management frames.
     pub hdr_llc_len: u8,
@@ -132,7 +141,9 @@ pub struct Desc {
     pub hw_ssn_sel: u8,
     /// `hw_seq_mode`: 1 = use `hw_ssn_sel`'s counter.
     pub hw_seq_mode: u8,
-    /// Transmit at `data_rate`, do not fall back (`use_rate` + `dis_data_fb`).
+    /// Transmit at `data_rate`, do not fall back (`use_rate` + `dis_data_fb`):
+    /// management frames only; the others leave the rate to the firmware's
+    /// rate adaptation.
     pub fixed_rate: bool,
     pub data_rate: u16,
     pub sec: Option<Sec>,
@@ -148,6 +159,8 @@ impl Desc {
             qsel: QSEL_MGMT,
             ch_dma: CH_MGMT,
             mac_id,
+            wp_offset: 0,
+            tid_indicate: false,
             hdr_llc_len: 0,
             agg_en: false,
             bk: false,
@@ -169,6 +182,8 @@ impl Desc {
             qsel: QSEL_VO,
             ch_dma: CH_ACH3,
             mac_id,
+            wp_offset: 0,
+            tid_indicate: true,
             hdr_llc_len: 13, // 26 bytes of QoS data header
             agg_en: false,
             bk: false,
@@ -191,6 +206,8 @@ impl Desc {
             qsel: QSEL_BE,
             ch_dma: CH_ACH0,
             mac_id,
+            wp_offset: 1,
+            tid_indicate: false,
             hdr_llc_len: 13,
             agg_en: false,
             bk: false,
@@ -207,7 +224,8 @@ impl Desc {
     #[must_use]
     fn body(&self) -> [u8; 32] {
         let mut b = [0u8; 32];
-        let dw0 = (1u32 << 22) // WD_INFO_EN
+        let dw0 = ((u32::from(self.wp_offset) & 0x1f) << 24) // WP_OFFSET_V1
+            | (1u32 << 22) // WD_INFO_EN
             | ((u32::from(self.ch_dma) & 0xf) << 16) // CHANNEL_DMA
             | ((u32::from(self.hdr_llc_len) & 0x1f) << 11) // HDR_LLC_LEN
             | (1 << 7); // WD_PAGE
@@ -217,6 +235,7 @@ impl Desc {
                 None => 0,
             };
         let dw2 = ((u32::from(self.mac_id) & 0xff) << 24)
+            | (u32::from(self.tid_indicate) << 23)
             | ((u32::from(self.qsel) & 0x3f) << 17)
             | (u32::from(self.pkt_size) & 0x3fff);
         let dw3 = (u32::from(self.seq) & 0xfff)
@@ -236,7 +255,7 @@ impl Desc {
             b[22] = (s.pn >> 32) as u8;
             b[23] = (s.pn >> 40) as u8;
         }
-        let dw7 = (1u32 << 31) // USE_RATE_V1
+        let dw7 = (u32::from(self.fixed_rate) << 31) // USE_RATE_V1
             | ((u32::from(self.data_rate) & 0x1ff) << 16);
         b[28..32].copy_from_slice(&dw7.to_le_bytes());
         b
@@ -373,7 +392,9 @@ impl Ring {
         let frame_at = ring_bytes() + PAGES * PAGE_SIZE + page as usize * FRAME_MAX;
         {
             let mut out = [0u8; WD_LEN];
-            wd_page(&d, u16::from(page), mem_phys + page_at as u64, &mut out);
+            // The address info names the frame; the ring entry (below) names
+            // the page.
+            wd_page(&d, u16::from(page), mem_phys + frame_at as u64, &mut out);
             mem[page_at..page_at + WD_LEN].copy_from_slice(&out);
         }
         mem[frame_at..frame_at + frame.len()].copy_from_slice(frame);
@@ -452,7 +473,9 @@ mod tests {
     /// rate, one address info.
     #[test]
     fn mgmt_desc_matches_the_recording() {
-        let d = Desc::mgmt(0x1e, 0);
+        let d = Desc::mgmt(0x1e, REC_MGMT[3]);
+        assert_eq!(d.wp_offset, REC_MGMT[2]);
+        assert_eq!(u8::from(d.tid_indicate), REC_MGMT[12]);
         assert_eq!(d.qsel, REC_MGMT[4]);
         assert_eq!(d.ch_dma, REC_MGMT[5]);
         assert_eq!(d.hdr_llc_len, REC_MGMT[6]);
@@ -466,7 +489,9 @@ mod tests {
         // Hardware sequence for management frames.
         assert_eq!(d.hw_ssn_sel, 1);
         assert_eq!(d.hw_seq_mode, 1);
-        // Fixed rate: use_rate + dis_data_fb in the info word.
+        // Fixed rate: use_rate in body word 7, dis_data_fb in the info word.
+        assert_eq!(REC_MGMT[10], 1);
+        assert_eq!(dw(&b, 7) >> 31, 1);
         let i = d.info();
         assert_eq!(dw(&i, 0) >> 10 & 1, 1); // DISDATAFB
         assert_eq!(dw(&i, 4) >> 31 & 1, 1); // HW_RTS_EN
@@ -478,8 +503,9 @@ mod tests {
     /// sequence.
     #[test]
     fn eapol_desc_matches_the_recording() {
-        let d = Desc::eapol(0x9b, 1);
+        let d = Desc::eapol(0x9b, REC_EAPOL[3]);
         assert_eq!(d.pkt_size, 155);
+        assert_eq!(d.wp_offset, REC_EAPOL[2]);
         assert_eq!(d.qsel, REC_EAPOL[4]);
         assert_eq!(d.ch_dma, REC_EAPOL[5]);
         assert_eq!(d.hdr_llc_len, REC_EAPOL[6]);
@@ -489,15 +515,20 @@ mod tests {
         assert_eq!(dw(&b, 1) & 0xf, 0); // no SEC_TYPE
         assert_eq!(dw(&b, 4), 0); // no SEC_IV
         assert_eq!(dw(&b, 3) >> 12 & 1, 0); // no AGG_EN: EAPOL never aggregates
-        assert_eq!(dw(&b, 2) >> 24 & 0xff, 1); // the peer's mac id
+        assert_eq!(dw(&b, 2) >> 24 & 0xff, 0); // the interface's mac id
+        assert_eq!(dw(&b, 2) >> 23 & 1, u32::from(REC_EAPOL[12])); // TID_INDICATE: tid 7
+        assert_eq!(dw(&b, 7) >> 31, u32::from(REC_EAPOL[10])); // no USE_RATE: rate adaptation
+        assert_eq!(dw(&d.info(), 0) >> 10 & 1, u32::from(REC_EAPOL[11])); // no DISDATAFB
     }
 
     /// The data class reproduces the recorded encrypted frame, packet number
     /// included, with `agg_en` deliberately off — no ADDBA session exists.
     #[test]
     fn data_desc_matches_the_recording() {
-        let d = Desc::data(62, 1, 2, Sec { cam_idx: 0, keyid: 0, pn: 4 });
+        let d = Desc::data(62, REC_DATA[3], 2, Sec { cam_idx: 0, keyid: 0, pn: 4 });
         assert_eq!(d.qsel, REC_DATA[4]);
+        assert_eq!(d.wp_offset, REC_DATA[2]); // room for the security header
+        assert_eq!(u8::from(d.tid_indicate), REC_DATA[12]);
         assert_eq!(d.ch_dma, REC_DATA[5]);
         assert_eq!(d.hdr_llc_len, REC_DATA[6]);
         let b = d.body();
@@ -507,6 +538,8 @@ mod tests {
         assert_eq!(dw(&b, 3) >> 12 & 1, 0); // no AGG_EN (Linux had one; we have no ADDBA)
         assert_eq!(b[18], REC_DATA[22]); // SEC_IV low byte
         assert_eq!(b[19], 0);
+        assert_eq!(dw(&b, 0) >> 24 & 0x1f, u32::from(REC_DATA[2])); // WP_OFFSET_V1
+        assert_eq!(dw(&b, 7) >> 31, u32::from(REC_DATA[10])); // no USE_RATE
         let i = d.info();
         assert_eq!(dw(&i, 2) >> 8 & 1, 1); // FORCE_KEY_EN
         assert_eq!(dw(&i, 2) & 0xff, 0); // SEC_CAM_IDX = pairwise entry 0
@@ -521,14 +554,14 @@ mod tests {
         let mut p = [0u8; WD_LEN];
         wd_page(&d, 5, 0x2345_6000, &mut p);
         // Body words.
-        assert_eq!(dw(&p, 0), 0x0040_6880); // WD_INFO_EN | HDR_LLC_LEN 13 | WD_PAGE
+        assert_eq!(dw(&p, 0), 0x0140_6880); // WP_OFFSET 1 | WD_INFO_EN | HDR_LLC_LEN 13 | WD_PAGE
         assert_eq!(dw(&p, 1), (1 << 26) | u32::from(SEC_CCMP128));
         assert_eq!(dw(&p, 2), 0x0100_003e); // MACID 1 | TXPKT_SIZE 62
         assert_eq!(dw(&p, 3), 2);
         assert_eq!(dw(&p, 4), 4 << 16);
         assert_eq!(dw(&p, 5), 0);
         assert_eq!(dw(&p, 6), 0);
-        assert_eq!(dw(&p, 7), 1 << 31); // USE_RATE_V1, DATA_RATE 0
+        assert_eq!(dw(&p, 7), 0); // no USE_RATE_V1: data goes at the adapted rate
         // Info words. (Unfixed-rate data: no DISDATAFB.)
         assert_eq!(dw(&p, 8), 0);
         assert_eq!(dw(&p, 10), 1 << 8); // FORCE_KEY_EN, cam 0
@@ -548,6 +581,7 @@ mod tests {
         wd_page(&Desc::mgmt(30, 0), 0, 0x1000, &mut m);
         assert_eq!(dw(&m, 1), 1 << 26);
         assert_eq!(dw(&m, 4), 0);
+        assert_eq!(dw(&m, 7), 1 << 31); // USE_RATE_V1 at CCK 1M
         assert_eq!(u16::from_le_bytes([m[56], m[57]]), 0x8000);
     }
 
@@ -605,9 +639,14 @@ mod tests {
         let wd = &mem[ring_bytes()..ring_bytes() + WD_LEN];
         assert_eq!(dw(wd, 2) & 0x3fff, 100);
         assert_eq!(u16::from_le_bytes([wd[56], wd[57]]), 0x8000); // page 0
-        // The frame went into page 0's frame buffer, whole.
+        // The frame went into page 0's frame buffer, whole, and the page's
+        // address info names that buffer — not the page.
         let at = ring_bytes() + PAGES * PAGE_SIZE;
         assert_eq!(&mem[at..at + 100], &frame[..]);
+        let lo = u64::from(u16::from_le_bytes([wd[66], wd[67]]));
+        let hi = u64::from(u16::from_le_bytes([wd[68], wd[69]]));
+        assert_eq!(hi << 16 | lo, MEM_PHYS + at as u64);
+        assert_eq!(u16::from_le_bytes([wd[64], wd[65]]) & 0x7ff, 100);
     }
 
     /// Pages come back in order as the chip's index passes their entries, and

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One reboot-loop cycle on ryzen, driven from the laptop.
 
-    python3 overlays/ryzen/cycle.py <entry> [--grep PATTERN] [--kernel PATH] [--no-rehearse]
+    python3 overlays/ryzen/cycle.py <entry> [--grep PATTERN] [--log early|dmesg] [--transcript NAME]
+                                    [--kernel PATH] [--no-rehearse]
 
 1. ship the kernel (default: this tree's `no-tests` build,
    `target/x86_64-unknown-none/release/akuma-amd64`) to `$W/out/akuma-amd64`
@@ -10,8 +11,10 @@
    stop unless the guest reset itself and p3 checks clean;
 3. `install.sh`, `arm.sh <entry>` — ryzen boots Akuma once;
 4. wait for Pop to answer again;
-5. print the lines of the boot's `boot-N.early` matching PATTERN (default
-   `\\[rtw\\]`) from p3, mounted read-only.
+5. print the lines of the boot's `boot-N.early` (`--log dmesg`: the full
+   `boot-N.dmesg`, which services that reboot by themselves save) matching
+   PATTERN (default `\\[rtw\\]`) from p3, mounted read-only, and with
+   `--transcript NAME` the service's own `NAME-N.txt`.
 
 Everything goes through `scripts/utils/hpbox.py`: kernel and config as the
 `netoneko` user, everything else as root. Build the kernel first:
@@ -43,6 +46,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("entry", type=int)
     ap.add_argument("--grep", default=r"\[rtw\]")
+    ap.add_argument("--log", choices=("early", "dmesg"), default="early")
+    ap.add_argument("--transcript", default="")
     ap.add_argument("--kernel", default=os.path.join(ROOT, "target/x86_64-unknown-none/release/akuma-amd64"))
     ap.add_argument("--no-rehearse", action="store_true")
     a = ap.parse_args()
@@ -78,9 +83,10 @@ def main():
     else:
         sys.exit("ryzen did not come back in 15 minutes — someone may need to press the power button")
     print(f"back in Pop after {int(time.time() - t0)} s", flush=True)
+    extra = f"cat /mnt/akp3/var/log/ryzen/{a.transcript}-$N.txt; " if a.transcript else ""
     rc, o, e = hpbox.ryzen_root(
         "mkdir -p /mnt/akp3 && mount -o ro /dev/nvme0n1p3 /mnt/akp3 && { N=$(cat /mnt/akp3/var/log/ryzen/count); "
-        f"echo boot-$N; grep -aE '{a.grep}' /mnt/akp3/var/log/ryzen/boot-$N.early; umount /mnt/akp3; }}")
+        f"echo boot-$N; grep -aE '{a.grep}' /mnt/akp3/var/log/ryzen/boot-$N.{a.log}; {extra}umount /mnt/akp3; }}")
     print(o, e)
 
 

@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | none | default | no `/dev/wifi0` node at all |
 //! | simulated | `wifisim` on the command line | `akuma_wifi::sim`: fixed networks, deterministic connect rules — tests the tool, device and protocol anywhere, QEMU included |
-//! | rtw89 | (W1–W4, not yet) | ryzen's RTL8852CE |
+//! | rtw89 | `rtw89wifi` on the command line | ryzen's RTL8852CE, kept up after its bring-up; the station in `rtw89_sta.rs` (stages W3/W4) |
 //!
 //! # Reads: a snapshot per descriptor
 //!
@@ -37,7 +37,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use akuma_wifi::cmd::{self, CmdError};
 use akuma_wifi::sim::SimRadio;
-use akuma_wifi::status::Status;
 use akuma_wifi::IfName;
 use spinning_top::Spinlock;
 
@@ -53,20 +52,30 @@ const SLOTS: usize = 8;
 /// Longest command a single `write` is parsed from.
 const MAX_WRITE: usize = 512;
 
+// In a `static`, one of it: boxing the simulator's status to shrink the enum
+// would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Sim(SimRadio),
+    /// The station daemon owns its status; commands go to its queue.
+    #[cfg(target_arch = "x86_64")]
+    Rtw89,
 }
 
 impl Backend {
-    fn status(&self) -> &Status {
+    fn write_status(&self, out: &mut [u8]) -> Option<usize> {
         match self {
-            Self::Sim(r) => r.status(),
+            Self::Sim(r) => r.status().write(out),
+            #[cfg(target_arch = "x86_64")]
+            Self::Rtw89 => crate::rtw89_sta::write_status(out),
         }
     }
 
     fn apply(&mut self, c: &cmd::Command) {
         match self {
             Self::Sim(r) => r.apply(c),
+            #[cfg(target_arch = "x86_64")]
+            Self::Rtw89 => crate::rtw89_sta::request(c),
         }
     }
 }
@@ -103,6 +112,20 @@ pub fn init(cmdline: &str) {
     }
 }
 
+/// The RTL8852CE station took the card (`rtw89wifi`): it is the radio behind
+/// `/dev/wifi0`, unless `wifisim` already claimed the device.
+#[cfg(target_arch = "x86_64")]
+pub fn register_rtw89() {
+    let mut b = BACKEND.lock();
+    if b.is_some() {
+        serial::puts("  wifi: `wifisim` holds /dev/wifi0; the rtw89 radio stays unreachable\n");
+        return;
+    }
+    *b = Some(Backend::Rtw89);
+    PRESENT.store(true, Ordering::Release);
+    akuma_vfs_glue::set_wifi_present(true);
+}
+
 /// Is there a `/dev/wifi0`?
 #[must_use]
 pub fn present() -> bool {
@@ -135,7 +158,7 @@ pub fn read(tgid: u32, fd: u32, buf: u64, len: usize) -> u64 {
     if slot.len == 0 {
         let b = BACKEND.lock();
         let Some(backend) = b.as_ref() else { return errno::ENODEV };
-        match backend.status().write(&mut slot.buf) {
+        match backend.write_status(&mut slot.buf) {
             Some(n) => {
                 slot.len = n;
                 slot.pos = 0;

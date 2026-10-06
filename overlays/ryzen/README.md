@@ -56,14 +56,14 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | `format-p3.sh --yes-destroy-p3 [size]` | ryzen, root | **destructive**: the root image onto `nvme0n1p3`, grown with `resize2fs`. Refuses unless start/length/PARTUUID match the measured partition and it is unmounted. Done once, 2026-10-06, at 64 GiB |
 | `fetch-firmware.sh` | ryzen, root | `rtw8852c_fw*.bin` from Alpine's `linux-firmware-rtw89` (no dependencies; files are `.zst`, decompressed here) onto p3, with Realtek's licence beside them |
 | `wdt-probe.py` | ryzen, root, from Pop | **read-only** dump of the FCH watchdog and PM registers (`/dev/mem`): decoded? disabled? running? fired? |
-| `cycle.py <entry> [--grep RE]` | laptop | one loop cycle through `hpbox.py`: ship this tree's `no-tests` kernel and `grub.cfg`, rehearse the entry in QEMU (stops if it fails), install, arm, wait for Pop, print matching `boot-N.early` lines from p3 (default `[rtw]`) |
+| `cycle.py <entry> [--grep RE] [--log dmesg] [--transcript NAME]` | laptop | one loop cycle through `hpbox.py`: ship this tree's `no-tests` kernel and `grub.cfg`, rehearse the entry in QEMU (stops if it fails), install, arm, wait for Pop, print matching `boot-N.early` (or `boot-N.dmesg`) lines from p3 (default `[rtw]`), and the service's `NAME-N.txt` |
 | `w0-trace.sh [--check]` | ryzen, root | wifi **W0**: mmiotrace of rtw89 unbind → bind → up → one scan, to `/var/tmp/akuma-w0/<stamp>/`. Detaches into unit `akuma-w0` (drops Pop's wifi ~1–2 min, takes all CPUs but one offline while tracing); NetworkManager is kept off the card so no association or keys enter the trace; every exit path restores the network. `--check` changes nothing |
 | `w2-merge.py <run> [--phase P] [--collapse] [--no-fwdl] [--ts]` | laptop | a W2 run's register accesses, H2Cs and C2Hs in one ordered stream (each H2C anchored to its CH12 doorbell) |
 | `w2-seqgen.py <merged> <out.seq> [--from-fw-ready] [--until-stop] [--mac M]` | laptop | compiles a merged recording into the op stream `akuma_rtw89::script` replays (`crates/akuma-rtw89/seq/up.seq`) |
 | `w0-summary.py <trace> [--dump PHASE]` | laptop | per-phase read/write counts and busiest BAR offsets of a W0 trace; `--dump bind` prints the ordered sequence |
 | `grub.cfg` | — | the menu (5 s), below |
 | `remove.list` | — | paths deleted from the image: the framebuffer `console` service (not wanted here) |
-| `rootfs/` | — | applied to the image: the `autoreboot` and `wifitest` herd services (`etc/herd/available/`) and their scripts (`etc/ryzen/`) |
+| `rootfs/` | — | applied to the image: the `autoreboot`, `wifitest` and `wifijoin` herd services (`etc/herd/available/`) and their scripts (`etc/ryzen/`). **Not** applied to p3 by anything: p3 was formatted from an older image once, so a service a menu entry names on p3 is copied there by hand from Pop (`wifijoin` and `/bin/wifi` were, 2026-10-06) |
 
 ## Menu
 
@@ -79,7 +79,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 7 | **wifi tool test** (`wifisim` + the `wifitest` service): the `wifi` tool against the simulated radio, transcript to `/var/log/ryzen/wifitest-N.txt` | yes |
 | 8 | **wifi W1** (`rtw89`): as 0, plus the RTL8852CE brought up to running firmware and shut down again before `init`; `[rtw]` lines in `boot-N.early` | yes |
 | 9 | **wifi W2** (`rtw89rx`): as 8, then Linux's recorded start replayed and 12 s of receiving on channel 1; a summary per network (OUI, channel, SSID hash, security) in `boot-N.early` | yes |
-| 10 | reboot | — |
+| 10 | **wifi W3/W4** (`rtw89wifi` + the `wifijoin` service): the card kept up as `/dev/wifi0`'s radio, then `wifi connect` joins the best known network in `/etc/wifi` on p3; `[rtw]` lines in `boot-N.dmesg`, the tool's exit status and `/dev/wifi0`'s non-identifying keys in `wifijoin-N.txt` | yes |
+| 11 | reboot | — |
 
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
 `initargs=daemon,--service,…`, which loads exactly the named herd services.

@@ -66,6 +66,8 @@ pub fn perform_reset() -> ! {
     // crash-looping on a kernel that is itself fine. UEFI does not re-initialise
     // a controller the OS claimed, so nothing downstream undoes this for us.
     crate::xhci::shutdown();
+    // The wifi card, if `rtw89wifi` kept it up: the same bus-master hazard.
+    crate::rtw89::shutdown_for_reset();
 
     // 1. Reset-control register. 0x02 selects "system reset" (vs. just CPU),
     //    0x0E requests a full hard reset.

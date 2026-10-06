@@ -586,7 +586,7 @@ mod tests {
     fn running_join4_fills_the_keys_and_group_key_id() {
         let tk = [0x11; 16];
         let gtk = [0x22; 16];
-        let v = Vars { mac: [2; 6], bssid: [3; 6], aid: 4, tk, gtk, gtk_idx: 2, ..Vars::default() };
+        let v = Vars { mac: [2; 6], bssid: [3; 6], aid: 4, tk, gtk, gtk_idx: 2 };
         // The sink above holds one command; capture them all instead.
         struct Capture {
             cmds: [Vec<u8>; 16],

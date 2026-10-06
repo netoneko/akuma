@@ -976,7 +976,8 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     };
 
     // `rtw89` (ryzen): the wifi card up to running firmware, then shut down
-    // again — wifi stage W1. After the root mount: the firmware is a file.
+    // again — wifi stage W1; `rtw89wifi` keeps it up for the station
+    // (W3/W4). After the root mount: the firmware is a file.
     if have_fs {
         crate::rtw89::init(info.cmdline());
     }
@@ -1110,6 +1111,8 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
     // The scheduler and the timer exist now: the splash can animate.
     crate::splash::spawn_daemon();
     crate::splash::phase(1);
+    // The wifi station, if `rtw89wifi` kept the card: it needs the scheduler.
+    crate::rtw89_sta::spawn();
     if have_net {
         // The wall clock, and the order it has to happen in.
         //
