@@ -206,10 +206,12 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
   scanning other channels needs a recorded channel switch). Without
   `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto` says so
   every poll.
-- **No link-loss detection** beyond a deauthentication or disassociation from
-  the access point: a station that simply stops hearing it stays `connected`.
-  Beacons from the joined network are consumed by the firmware's beacon
-  filter after `JOIN4`, so counting them on the host is not the test.
+- **Rejoin is the kernel's job now** (`rtw89wifi`): after a deauthentication,
+  a disassociation or the firmware's beacon-loss report the station rejoins
+  the network it was told to join, at once and then every second until
+  `disconnect`; `wifibackoff` on the command line makes the wait double to
+  30 s instead. Untested on the metal so far: the beacon-loss report's
+  decode (`BCNFLTR_RPT` C2H) follows Linux's `mac.c` but has never fired here.
 - **No signal strength from the real radio**: scan results report `signal=0`
   (the PPDU status reports that carry RSSI are not parsed), so `wifi` picks
   among equal-priority networks by order, not strength.

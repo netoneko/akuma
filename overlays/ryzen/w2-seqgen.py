@@ -39,7 +39,7 @@ ends with the card entering idle power save).
     python3 overlays/ryzen/w2-seqgen.py join.txt crates/akuma-rtw89/seq/joinN.seq \
         --join N --mac <card MAC> --bssid <AP MAC>
 
-Segments of the recorded join (`docs/archive/NEXT_AGENT_RYZEN_WIFI_JOIN.md`),
+Segments of the recorded join (`docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md` § 5.5),
 each replayed by the join task at the point its name says:
 
 | N | starts | ends before | replayed after |

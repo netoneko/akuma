@@ -721,7 +721,7 @@ fn bcnfltr(c2h: &[u8]) -> Option<(u8, i8)> {
         return None;
     }
     let w2 = w(2)?;
-    let dbm = (((w2 >> 16) & 0xff) as i32 - 110).clamp(-128, 127) as i8;
+    let dbm = (i32::from((w2 >> 16) as u8) - 110).clamp(-128, 127) as i8;
     Some((((w2 >> 8) & 3) as u8, dbm))
 }
 

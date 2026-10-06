@@ -417,6 +417,100 @@ older than the tool. `wifijoin` records only the tool's exit status and
 hash SSIDs and cut BSSIDs to the OUI. Driven with
 `cycle.py 10 --log dmesg --transcript wifijoin`.
 
+### 5.5 The join, as built: recording, replay, pieces, rules
+
+Folded in from the W3/W4 handoff (`NEXT_AGENT_RYZEN_WIFI_JOIN.md`, removed
+2026-10-06 once its plan was carried out); § 5.4 is what the metal said.
+
+**The recording.** `JOIN=1 sh overlays/ryzen/w0-trace.sh` traces Linux joining
+the home network: `~/.akuma/w0/20261006-102808` (the best: it has the `txd`,
+`txh`, `txm` and `rxm` probes) and `-102211`, on the Mac. Merge and view with
+`w2-merge.py <run> --phase join --collapse --no-fwdl --ts` and
+`w3-timeline.py`. What it showed:
+
+- Linux goes into idle power save between scans; the final join starts with a
+  full power-on and firmware download, then the start, then the join setup.
+- **Only H2C commands carry the BSSID, the station's MAC or the AID**; no
+  register write does. The station address lives only in the address CAM, so
+  the driver picks its own: `02:41:4b:55:4d:41`. Values *derived* from those
+  addresses ride along in the same commands — the address CAM's SMA/TMA hashes
+  (§ 5.4) — and must follow any substitution.
+- `up.seq` writes no ring bases and un-stops every TX channel at the end, so
+  TX needs ring memory of its own for the channels used (`bringup::Dma::tx_phys`,
+  ACH0/ACH3/CH8).
+
+**The four segments** (`w2-seqgen.py --join N --mac … --bssid …` →
+`crates/akuma-rtw89/seq/join{1..4}.seq`; boundaries found by content):
+
+| N | from | to (exclusive) | replayed | size |
+|---|---|---|---|---|
+| 1 | after the last `R8 0x1e0 = 0xe2` (fw ready) | the first address-CAM H2C carrying the BSSID | at boot, right after `bring_up` | 183 423 B, 29 H2C |
+| 2 | that address-CAM H2C | the authentication frame's TX | before auth | 39 439 B, 9 H2C |
+| 3 | after the association response | the first periodic `OFLD_RSSI` H2C | after the association response | 716 B, 15 H2C |
+| 4 | the first security-CAM H2C | through the `BCNFLTR` H2C | after EAPOL message 4 is on the air | 537 B, 9 H2C |
+
+The card's MAC and the BSSID are blanked wherever they occur and recorded as
+`0x41` substitutions (generation fails if a byte of either survives); the AID
+is patched into the address CAM's `AID12` (byte 44) and the PS-Poll template's
+duration (byte 14); the group key's id into bits 7:6 of the address CAM's
+byte 46 and the DCTL's byte 30 (the recording's AP used id 2). The two
+security-CAM bodies, redacted to zeros in the recording, are synthesized from
+`cam.c` (`[idx, 0, 20, 0, 6, 0, 0, 0, key[16]]`: pairwise entry 0, group entry
+1, CCMP-128). Dropped from every segment: C2Hs, IRQ registers, the RX and TX
+ring index registers (`0x1058..=0x107c`), the periodic `OFLD_RSSI` exchange and
+the later BA_CAM/ADDBA exchange.
+
+**The pieces.**
+
+| piece | does |
+|---|---|
+| `crates/akuma-wpa` | SHA-1, HMAC, the 802.11 PRF, PBKDF2, AES-128, RFC 3394 key wrap; `eapol::Supplicant` (message 1 → 2, message 3 → 4 + keys, group rekey). Host-tested against published vectors and an AP built from the same primitives |
+| `crates/akuma-ieee80211::sta` | auth/assoc request builders (the assoc elements are Linux's own from this card, RSN capabilities 0), auth/assoc/deauth parsers, QoS data frames with LLC/SNAP and room for the CCMP header, the RX data parser |
+| `crates/akuma-rtw89::tx` | the WD page and TX rings, the three frame classes (§ 5.4) |
+| `crates/akuma-rtw89::script` | `Vars`, op `0x41`, `JOIN1..4`, `fix_addr_cam` |
+| `amd64/src/rtw89.rs` | `Card`: the kept card (`restart`, `replay`, `send`, `poll_rx`, filter open/close), `shutdown_for_reset` |
+| `amd64/src/rtw89_sta.rs` | the station daemon, `/dev/wifi0`'s backend: scan, join with retries, rejoin on loss (below) |
+| `overlays/ryzen` | menu entry 10 (`rtw89wifi` + `wifijoin`), `cycle.py --log dmesg --transcript wifijoin` |
+
+**Staying joined.** The station keeps the network it was told to join until
+`disconnect` (or a wrong key / a refusal, which retrying cannot fix). A
+deauthentication or disassociation from the AP, or the firmware's beacon-loss
+report (`BCNFLTR_RPT` C2H, type 0), drops the association and rejoins at once
+from a restarted card; a join that times out is retried after 1 s, every time.
+`wifibackoff` on the command line makes that wait double after each failure,
+to 30 s — off by default, since on this channel the link drops often and
+waiting longer only means being offline longer. The same report's averaged
+RSSI feeds `/dev/wifi0`'s `signal` while joined.
+
+**Rules that hold for all of this work.**
+
+- **Never print, log, commit or write into docs** the home network's name,
+  its passphrase, the router's BSSID or the card's real MAC; it is "the home
+  network". Logs carry SSIDs as FNV-1a hashes (home = `0x2ce1df73`, channel 1,
+  20 MHz, WPA2-PSK CCMP, PMF capable-not-required) and BSSIDs as their OUI.
+- The passphrase lives in `~/.akuma/wifi/<network>` on the Mac, read only to
+  derive the PSK (`PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`), which is
+  staged on p3 as `/etc/wifi/<name>` (mode 0600) and never echoed. Never
+  `cat`/`od` a file you did not create. The kernel never reads that file: the
+  `wifi` tool does and writes `connect wlan0 <ssid-hex> <psk-hex>` to
+  `/dev/wifi0`.
+- Talk to ryzen only through `scripts/utils/hpbox.py`; one metal boot is
+  `python3 overlays/ryzen/cycle.py <entry>` after
+  `cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests`.
+- The Linux source the driver follows is `~/.akuma/src/rtw89` (v6.17, dual
+  GPL-2.0/BSD-3, used under BSD-3; the notice stays in `akuma-rtw89/src/lib.rs`).
+
+**Still to do, in order.**
+
+1. W5, the data path: DHCP over the joined link — `ExternalDevice` in
+   `akuma-net-nic`, or a minimal DHCP probe first. Data frames go on ACH0 as
+   `tx::Desc::data` (CCMP, `wp_offset` 1); whether the frame must carry the
+   CCMP header's space with the 8852C's `hw_sec_hdr` is the first thing to
+   check against `txd` records.
+2. Scanning beyond channel 1 (a recorded channel switch), a deauthentication
+   on `disconnect`, a group-key-only segment for rekeys (today all of `JOIN4`
+   is replayed).
+
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
 | # | stage | sessions |
