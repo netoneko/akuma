@@ -216,7 +216,11 @@ pub fn poll() -> bool {
         POLL_EXITED.fetch_add(1, Ordering::Relaxed);
         result
     };
-    // NETWORK lock is released here — safe to acquire SOCKET_TABLE.
+    // NETWORK lock is released here. A link that meets the stack at frame
+    // queues (`queued`) is told now, not from inside the section, that frames
+    // wait for it: its doorbell wakes another thread.
+    akuma_net_nic::queued::ring_deferred();
+    // Safe to acquire SOCKET_TABLE from here on.
     // Acquiring SOCKET_TABLE while holding NETWORK causes AB-BA deadlock
     // with socket_can_recv_tcp et al. which hold SOCKET_TABLE→NETWORK.
     // The connect-timeout sweep above once did exactly that; it now defers to here.

@@ -34,7 +34,7 @@
 //!
 //! No allocation: fixed slots of [`FRAME_MAX`] bytes, [`SLOTS`] per direction.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use smoltcp::phy::DeviceCapabilities;
 use spinning_top::Spinlock;
@@ -92,9 +92,16 @@ pub struct FrameQueues {
     link_gen: AtomicU32,
     /// Rung after the stack queues a frame ([`FrameQueues::on_transmit`]):
     /// the driver runs on its own schedule, and a frame left for its next
-    /// timed lap waits as long as that lap is away (measured on ryzen: long
-    /// enough for every TCP handshake to time out at its peer).
+    /// timed lap waits as long as that lap is away.
+    ///
+    /// **Never rung where the frame is queued.** That is inside the stack's
+    /// `NETWORK` critical section with preemption off, and waking another
+    /// thread from there wedged ryzen whole (2026-10-06: console, sshd and the
+    /// link all stopped; the watchdog saw ticks, so nothing reset it). The
+    /// queue only sets [`FrameQueues::tx_pending`]; the stack calls
+    /// [`ring_deferred`] once the lock is released.
     tx_doorbell: Spinlock<Option<fn()>>,
+    tx_pending: AtomicBool,
     /// Frames dropped because a queue was full or busy.
     pub rx_dropped: AtomicU32,
     pub tx_dropped: AtomicU32,
@@ -115,6 +122,7 @@ impl FrameQueues {
             mac: Spinlock::new([0; 6]),
             link_gen: AtomicU32::new(0),
             tx_doorbell: Spinlock::new(None),
+            tx_pending: AtomicBool::new(false),
             rx_dropped: AtomicU32::new(0),
             tx_dropped: AtomicU32::new(0),
         }
@@ -125,10 +133,23 @@ impl FrameQueues {
         *self.mac.lock() = mac;
     }
 
-    /// Driver side: `ring` is called (outside every lock here) each time the
-    /// stack queues a frame — typically a wake of the driver's thread.
-    pub fn on_transmit(&self, ring: fn()) {
+    /// Driver side: `ring` is called after the stack has queued frames —
+    /// typically a wake of the driver's thread — from [`ring_deferred`], with
+    /// no lock of the stack's held. This also makes `self` the queues
+    /// [`ring_deferred`] looks at.
+    pub fn on_transmit(&'static self, ring: fn()) {
         *self.tx_doorbell.lock() = Some(ring);
+        *ACTIVE.lock() = Some(self);
+    }
+
+    /// Ring the doorbell if frames were queued since it last rang.
+    pub fn ring_if_pending(&self) {
+        if self.tx_pending.swap(false, Ordering::AcqRel) {
+            let ring = self.tx_doorbell.try_lock().and_then(|d| *d);
+            if let Some(ring) = ring {
+                ring();
+            }
+        }
     }
 
     /// Driver side: the link came up or went away. The stack restarts DHCP
@@ -164,6 +185,19 @@ impl FrameQueues {
             t.head = 0;
             t.count = 0;
         }
+    }
+}
+
+/// The queues whose driver registered a doorbell ([`FrameQueues::on_transmit`]).
+static ACTIVE: Spinlock<Option<&'static FrameQueues>> = Spinlock::new(None);
+
+/// Stack side: ring the registered driver's doorbell if the stack queued
+/// frames for it. Call with no stack lock held — `smoltcp_net::poll` does,
+/// right after releasing `NETWORK`.
+pub fn ring_deferred() {
+    let q = ACTIVE.try_lock().and_then(|a| *a);
+    if let Some(q) = q {
+        q.ring_if_pending();
     }
 }
 
@@ -217,11 +251,8 @@ impl QueuedDevice {
         }
         let ok = self.q.tx.try_lock().is_some_and(|mut t| t.push(&self.tx_scratch[..end]));
         if ok {
-            // Copied out first: the doorbell runs with no lock of ours held.
-            let ring = self.q.tx_doorbell.try_lock().and_then(|d| *d);
-            if let Some(ring) = ring {
-                ring();
-            }
+            // Rung later, outside the stack's lock (`ring_deferred`).
+            self.q.tx_pending.store(true, Ordering::Release);
         } else {
             self.q.tx_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -278,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn the_doorbell_rings_once_per_queued_frame() {
+    fn the_doorbell_rings_after_the_lock_once_for_all_queued_frames() {
         use core::sync::atomic::AtomicU32;
         static RUNG: AtomicU32 = AtomicU32::new(0);
         fn ring() {
@@ -288,8 +319,17 @@ mod tests {
         q.on_transmit(ring);
         let mut dev = QueuedDevice::new(q);
         dev.emit_frame(60, |b| b.fill(1), |_| false);
-        dev.emit_frame(60, |b| b.fill(2), |_| true); // diverted: no frame, no ring
+        dev.emit_frame(60, |b| b.fill(2), |_| false);
+        dev.emit_frame(60, |b| b.fill(3), |_| true); // diverted: no frame
+        // Nothing rings where frames are queued (inside the stack's lock)...
+        assert_eq!(RUNG.load(Ordering::Relaxed), 0);
+        // ...but once, after, for everything queued.
+        q.ring_if_pending();
+        q.ring_if_pending();
         assert_eq!(RUNG.load(Ordering::Relaxed), 1);
+        dev.emit_frame(60, |b| b.fill(4), |_| true);
+        q.ring_if_pending();
+        assert_eq!(RUNG.load(Ordering::Relaxed), 1, "a diverted frame queues nothing");
     }
 
     #[test]
