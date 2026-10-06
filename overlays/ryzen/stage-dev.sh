@@ -97,10 +97,14 @@ OPENAI_BASE_PATH: coding/v1/chat/completions
 CFG
     cat > $P/usr/local/bin/goose-kimi <<'CFG'
 #!/bin/sh
-# goose against Kimi Code. The key is read here, per run, from a 0600 file;
-# it is in no config.
+# goose against Kimi Code. goose ignores OPENAI_API_KEY from the environment on
+# this box (401 on the first request) and reads its file secret store when the
+# keyring is off, so the key is written there, per run, 0600, from the token.
 . /etc/akuma-dev.env
-OPENAI_API_KEY=$(cat /root/.akuma/kimi/token); export OPENAI_API_KEY
+umask 077
+mkdir -p /root/.config/goose
+printf 'OPENAI_API_KEY: %s\n' "$(cat /root/.akuma/kimi/token)" > /root/.config/goose/secrets.yaml
+GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
 exec /usr/local/bin/goose "$@"
 CFG
     chmod 755 $P/usr/local/bin/goose-kimi

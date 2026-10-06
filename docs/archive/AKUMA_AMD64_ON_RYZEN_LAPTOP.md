@@ -649,6 +649,30 @@ the wifi drops them otherwise (two copies of the script collided on apk's lock
 before this was learned). The Kimi key was copied file to file on Pop from the
 kot cat's token; it appears in no log, config or doc.
 
+**Large uploads corrupted on the way out (found 2026-10-06 by goose → Kimi).**
+`curl` to `api.kimi.com` worked for POST bodies up to 7 KB and died at 14 KB
+with `SSL_read: alert bad record mac` after 39 s — an alert *from the server*,
+i.e. our TLS record arrived damaged. goose showed it as "Network error" on every
+chat request (its requests are ~15 KB) and pegged the single core retrying (the
+fans). Cause, found by reading `crates/akuma-rtw89/src/tx.rs` rather than the
+network: the TX channel had **8** WD pages / frame buffers (`PAGES`) and recycles
+one as soon as the chip's ring read index passes it, which can run ahead of the
+chip's DMA read of the page and frame. The stack hands the driver up to 16
+frames per lap (`queued::SLOTS`), so a request of more than ~8 segments
+overwrote buffers the chip had not read yet. Fix: `PAGES = 32` (twice `SLOTS`;
+3 × 59 KB of static DMA memory). This is the **DMA contract the virtio path
+already states** (`crates/akuma-net-nic/src/nic.rs`, `docs/archive/AKUMA_NET_SPLIT.md`):
+a buffer handed to the device is owned by it *until the matching completion* —
+the rtw89 ring freed on a read index instead of a completion. (The first archive
+search looked for the error string only and found nothing; the precedent was
+under "DMA", not under "bad mac" — search for the mechanism, not the symptom.) If it recurs, the better fix is
+to free a page on the chip's TX release report (what Linux does) rather than on
+the ring index — `rpq_status` already counts them, but not per channel.
+Also learned: goose ignores `OPENAI_API_KEY` from the environment here (401
+`Invalid Authentication` on the first request) and reads `secrets.yaml` with
+`GOOSE_DISABLE_KEYRING=1`, so `goose-kimi` writes that 0600 file from the token
+at run time.
+
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
 | # | stage | sessions |

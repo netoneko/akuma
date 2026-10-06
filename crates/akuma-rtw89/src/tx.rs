@@ -52,10 +52,19 @@ pub const WD_LEN: usize = 32 + 24 + 8 + 6;
 /// Bytes of one WD page of channel memory (`RTW89_PCI_TXWD_PAGE_SIZE`): the
 /// page's [`WD_LEN`] of live bytes, the rest padding.
 pub const PAGE_SIZE: usize = 128;
-/// WD pages per channel (`RTW89_PCI_TXWD_NUM_MAX` is 512; eight in-flight
-/// frames is more than a join needs, and the chip fetches entries as they
-/// come).
-pub const PAGES: usize = 8;
+/// WD pages per channel (`RTW89_PCI_TXWD_NUM_MAX` is 512).
+///
+/// A page and its frame buffer are reused once the chip's ring index has moved
+/// past the entry that named them, and that index can run ahead of the chip's
+/// DMA reads of the page and the frame. With **8** pages a burst of more than 8
+/// frames (the stack hands the driver up to `queued::SLOTS` = 16 in one lap)
+/// overwrote buffers still waiting to be read: the card encrypted and sent
+/// whatever was there, TCP's checksum was computed over the original bytes, and
+/// the access point's retransmit machinery — or the TLS record above it —
+/// failed. Seen 2026-10-06 as a 14 KB HTTPS POST dying with `bad record mac`
+/// while 7 KB posts worked. 32 is twice `SLOTS`, so a full burst never reuses a
+/// buffer and the previous lap's frames have had two milliseconds to drain.
+pub const PAGES: usize = 32;
 /// Longest frame one channel accepts, and the most one address-info entry
 /// carries minus what the chip wants back as slack.
 pub const FRAME_MAX: usize = 1600;
