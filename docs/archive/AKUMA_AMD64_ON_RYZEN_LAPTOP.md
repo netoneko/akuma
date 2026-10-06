@@ -33,7 +33,7 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
 | wifi W2 (§5.3) | **done**: the recorded start replayed, 17 networks' beacons on channel 1 (menu entry 9) |
 | wifi W3/W4 (§5.4) | **done**: `rtw89wifi` (menu entry 10) scans, authenticates, associates and completes the WPA2 4-way handshake in the kernel; keys installed, link held (boot 16) |
-| wifi W5 (§5.6) | **ssh over wifi works** (boot 20): DHCP, SNTP, DNS, inbound TCP to sshd on 2222. Outbound TCP to the internet is refused — open |
+| wifi W5 (§5.6) | **done**: DHCP, SNTP, DNS, ssh in on 2222, outbound HTTP to the LAN and the internet; menu entry 12 boots it for use (quiet boot, framebuffer console, stays up) |
 
 ## Verdict
 
@@ -558,14 +558,46 @@ sshd is on **2222**; port 22 answers with a reset. The user's key is in p3's
   start no new process — `sleep`, `dmesg` and `reboot` all failed at once and
   the log saved was empty. It now resets two indices.
 
-**Open (W5):**
+**Outbound TCP, fixed the same night.** Inbound TCP (sshd), DNS and SNTP
+worked, but every outbound `connect` failed — refused at first, timed out
+later. Three things were wrong, found in this order:
 
-- **Outbound TCP is refused.** Inbound TCP (sshd), DNS and SNTP (UDP) work,
-  but `wget` to any internet host fails at once with "connection refused" —
-  `connect()` errors before anything is waited for, so suspect the stack's
-  connect path on this link (route, source address, or the `10.0.2.15`
-  fallback the DHCP client installs while unconfigured — its gateway and DNS
-  are QEMU's), not the radio.
+1. **The link-down address was QEMU's.** With no static config the stack's
+   no-lease fallback was `10.0.2.15` (gateway `10.0.2.2`, DNS `10.0.2.3`). The
+   wifi link now carries a link-local `169.254.65.77/16` with DNS `1.1.1.1`
+   until DHCP answers (`net::WIFI_NO_LEASE_V4`; `ip=` still overrides).
+   Not the cause of the failures, but every log line about it misled.
+2. **The stack's transmits waited for the daemon's timed lap.** The station
+   only drained the stack's queue when its nap ended, so frames queued up and
+   were dropped. `FrameQueues::on_transmit` now registers a doorbell that wakes
+   the daemon — rung by `smoltcp_net::poll` *after* it releases `NETWORK`
+   (`queued::ring_deferred`): the first version rang it from inside the
+   critical section and **wedged the box whole** (sshd and the link stopped
+   while the watchdog, seeing ticks, never fired).
+3. **The root cause: a blocking socket wait starved the station.**
+   `net_blocking_relax`, what `connect`/`recv` call between polls, is a bare
+   `allow_tick` (drop the BKL, `hlt`) with no yield — correct for a NIC the
+   waiter's own `poll()` reads, wrong for a link whose frames only the station
+   daemon moves. Kernel code is not preempted here, so on `nosmp` the
+   daemon lapped **twice in 10 s** while `nc` waited (1000 times otherwise):
+   our SYNs went out, the SYN-ACKs sat in the card's receive ring, the connect
+   timed out. sshd (epoll) and DNS (`poll(2)`) park properly and never saw it.
+   On the wifi link the relax now yields first. After that: the router's page,
+   `example.com`, `example.org`, Firefox's portal check, each in ≤ 1 s.
+
+Diagnosed with the station's own accounting, which stays in: a `[rtw] link:`
+line every minute (data frames by fate, A-MSDUs, TX completion statuses, queue
+drops, TCP SYN/RST counts, daemon laps and the longest gap) and the first 40
+SYN/RST segments logged by port with their IP header checked. A-MSDU frames
+are now taken apart and delivered (`sta::Amsdu`) — none arrived on this AP, but
+the station advertises A-MSDU reception, so another AP may send them.
+
+**Also learned:** the Mac's application firewall drops unsolicited SYNs to an
+unsigned listener without a trace in `netstat` — a LAN test target on the Mac
+proves nothing; the router (TCP 53/80/443) is a reliable one.
+
+**Open:**
+
 - `ping` cannot open a raw socket (`Invalid argument`); not wifi-specific.
 - Signal strength stays 0 until the firmware's beacon-filter report arrives.
 

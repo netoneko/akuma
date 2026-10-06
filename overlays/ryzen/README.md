@@ -22,7 +22,7 @@ Why this shape, and the wifi work it exists for:
 | wifi W1: firmware download (`rtw89`, entry 8) | **works**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again; the fix that got it there was Bus Master on the card's root port (survey doc § 5.2) |
 | wifi W2: receive (`rtw89rx`, entry 9) | **works**: Linux's recorded start replayed (16 815 ops, 52 ms), then 12 s on channel 1: 1604 frames, 17 networks' beacons, the home network's among them (survey doc § 5.3) |
 | wifi W3/W4: the station (`rtw89wifi`, entry 10) | **works**: joins the home network with WPA2-PSK, handshake in the kernel, keys installed (boot 16, survey doc § 5.4) |
-| wifi W5: IP over wifi (entry 11) | **ssh works**: DHCP, SNTP, DNS, `ssh -p 2222 root@<address>` from the Mac (boot 20, survey doc § 5.6); outbound TCP refused (open) |
+| wifi W5: IP over wifi (entries 11, 12) | **works**: DHCP, SNTP, DNS, `ssh -p 2222 root@<address>` from the Mac, outbound HTTP to the LAN and the internet (survey doc § 5.6). Entry 12 is the one to use: quiet boot, framebuffer console, stays up |
 | wifi W0: Linux's bring-up traced | **done**: probe + interface-up through `fw ready` (`w0-trace.sh`, results in the survey doc § 5.1; traces in `~/.akuma/w0/` on the laptop) |
 | wifi control (`/dev/wifi0`, `/etc/wifi`, `wifi`) | **works** against the simulated radio (entry 7, rehearsed); no real radio yet — [`docs/reference/subsystems/wifi.md`](../../docs/reference/subsystems/wifi.md) |
 | network | **wifi** (entry 11): `python3 overlays/ryzen/wifi-ssh.py --key <key>` finds the station by its MAC and runs a command over ssh (port **2222**); the user's key is in p3's `/etc/sshd/authorized_keys`. Every other entry has no network; the log is the channel |

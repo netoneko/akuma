@@ -339,7 +339,7 @@ struct LinkStats {
 /// TCP events logged by port before the trace goes quiet.
 const TCP_TRACE_MAX: u32 = 40;
 /// How often a joined station prints its `[rtw] link:` line.
-const LINK_REPORT_US: u64 = 10_000_000;
+const LINK_REPORT_US: u64 = 60_000_000;
 
 struct Station {
     vars: script::Vars,
@@ -931,12 +931,67 @@ fn trace_tcp(stats: &mut LinkStats, dir: &str, ethertype: u16, ip: &[u8]) {
         serial::puts(" -> ");
         serial::put_dec(u64::from(u16::from_be_bytes([tcp[2], tcp[3]])));
         serial::puts(match (syn, ack, rst) {
-            (true, true, _) => " SYN+ACK\n",
-            (true, false, _) => " SYN\n",
-            (_, _, true) => " RST\n",
-            _ => "\n",
+            (true, true, _) => " SYN+ACK",
+            (true, false, _) => " SYN",
+            (_, _, true) => " RST",
+            _ => "",
         });
+        // The IP header, for a handshake that never completes: lengths,
+        // both checksums, TTL, flags, the two addresses (LAN or public; no
+        // MACs).
+        let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+        serial::puts(" | ip len ");
+        serial::put_dec(total as u64);
+        serial::puts(" of ");
+        serial::put_dec(ip.len() as u64);
+        serial::puts(" ttl ");
+        serial::put_dec(u64::from(ip[8]));
+        serial::puts(" df ");
+        serial::put_dec(u64::from(ip[6] >> 6 & 1));
+        serial::puts(" ipsum ");
+        serial::puts(if ip_checksum_ok(&ip[..ihl]) { "ok" } else { "BAD" });
+        serial::puts(" tcpsum ");
+        serial::puts(match ip.get(..total) {
+            Some(p) if tcp_checksum_ok(p, ihl) => "ok",
+            Some(_) => "BAD",
+            None => "short",
+        });
+        serial::puts(" ");
+        for (k, b) in ip[12..20].iter().enumerate() {
+            serial::put_dec(u64::from(*b));
+            serial::puts(match k {
+                3 => " > ",
+                7 => "\n",
+                _ => ".",
+            });
+        }
     }
+}
+
+/// The one's-complement sum of `b` as 16-bit big-endian words, folded.
+fn csum(b: &[u8], mut acc: u32) -> u16 {
+    for w in b.chunks(2) {
+        acc += u32::from(u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]));
+    }
+    while acc > 0xffff {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    acc as u16
+}
+
+fn ip_checksum_ok(hdr: &[u8]) -> bool {
+    csum(hdr, 0) == 0xffff
+}
+
+/// TCP checksum over the pseudo-header and segment of the IPv4 packet `p`.
+fn tcp_checksum_ok(p: &[u8], ihl: usize) -> bool {
+    let seg = &p[ihl..];
+    let mut acc = 0u32;
+    for w in p[12..20].chunks(2) {
+        acc += u32::from(u16::from_be_bytes([w[0], w[1]]));
+    }
+    acc += 6 + seg.len() as u32;
+    csum(seg, acc) == 0xffff
 }
 
 /// The joined link's counters, one line.

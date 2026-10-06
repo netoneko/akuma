@@ -318,6 +318,20 @@ fn net_blocking_relax() {
     //
     // So: halt when a halt is available, and otherwise do exactly what this
     // target did before, rather than something new and worse.
+    //
+    // **On the wifi link, yield first.** Everything above assumes the waiter's
+    // own `poll()` is what moves frames, which is true of a NIC the stack
+    // reads itself. The wifi station's frames move only when its daemon runs
+    // (`rtw89_sta.rs`, `ExternalDevice::Queued`), and kernel code is not
+    // preempted on this target: a blocking `connect`/`recv` that only halts
+    // keeps the core from that daemon, so its SYN-ACK sits in the card's
+    // receive ring until the connect times out. Measured on ryzen 2026-10-06:
+    // the daemon lapped twice in 10 s while `nc` waited (1000 times
+    // otherwise), and every outbound TCP connect failed while sshd (epoll,
+    // which parks) and DNS (`poll(2)`) worked.
+    if crate::rtw89_sta::is_link() {
+        crate::sched::yield_now();
+    }
     if crate::lapic::timer_running() {
         crate::sched::allow_tick();
     } else {
