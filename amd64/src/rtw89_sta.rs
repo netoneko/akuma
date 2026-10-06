@@ -42,7 +42,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use akuma_ieee80211::beacon;
+use akuma_ieee80211::{beacon, ccmp};
 use akuma_ieee80211::sta::{self, Amsdu, AssocResp, Auth, Data, Goodbye};
 use akuma_rtw89::{rx, script, tx};
 use akuma_wifi::cmd::Command;
@@ -296,6 +296,8 @@ struct Peer {
     /// sequence number of the next.
     pn: u64,
     data_seq: u16,
+    /// The highest CCMP packet number received, per key and TID.
+    replay: ccmp::Replay,
 }
 
 /// The network the station was told to join, kept until `disconnect`: what a
@@ -318,6 +320,9 @@ struct LinkStats {
     /// decrypted by the card (dropped).
     rx_clear: u32,
     rx_undecrypted: u32,
+    /// Protected frames the card decrypted whose packet number was not above
+    /// the last one on that key and TID (dropped as replays).
+    rx_replay: u32,
     /// From the access point but not a data frame we could take apart.
     rx_unparsed: u32,
     delivered: u32,
@@ -655,6 +660,7 @@ impl Station {
             seq: 0,
             keyed: false,
             pn: 0,
+            replay: ccmp::Replay::new(),
             data_seq: 0,
         };
         let deadline = now_us() + HANDSHAKE_MS * 1000;
@@ -792,7 +798,9 @@ impl Station {
                 gone = Some(g.reason);
             } else if let Some(d) = Data::parse(f, true).filter(|d| d.bssid == peer.bssid) {
                 stats.rx_data += 1;
-                if d.ethertype == sta::ETHERTYPE_EAPOL {
+                if d.protected && p.desc.hw_dec && !p.desc.icv_err && !fresh(&mut peer.replay, f, stats) {
+                    // A replayed frame: counted, never looked at.
+                } else if d.ethertype == sta::ETHERTYPE_EAPOL {
                     if step.is_none() {
                         step = Some(peer.supplicant.handle(d.payload, &mut out));
                     }
@@ -811,6 +819,8 @@ impl Station {
                     stats.rx_clear += 1;
                 } else if !p.desc.hw_dec || p.desc.icv_err {
                     stats.rx_undecrypted += 1;
+                } else if !fresh(&mut peer.replay, f, stats) {
+                    // A replayed frame: counted, never looked at.
                 } else {
                     for m in a.subframes() {
                         stats.rx_msdus += 1;
@@ -878,9 +888,20 @@ impl Station {
                 self.vars.gtk = gtk.key;
                 self.vars.gtk_idx = gtk.idx;
                 let _ = card.replay("join4 (group rekey)", script::JOIN4, &self.vars);
+                peer.replay.group_rekeyed();
             }
         }
     }
+}
+
+/// A decrypted protected frame's packet number is above the last on its key
+/// and TID (and is remembered); a frame whose header cannot be read is not.
+fn fresh(replay: &mut ccmp::Replay, frame: &[u8], stats: &mut LinkStats) -> bool {
+    let ok = ccmp::header(frame, true).is_some_and(|rx| replay.accept(&rx));
+    if !ok {
+        stats.rx_replay += 1;
+    }
+    ok
 }
 
 /// One received frame to the stack as Ethernet.
@@ -1006,6 +1027,7 @@ fn link_report(card: &Card, s: &LinkStats) {
     n("/", s.rx_msdus);
     n(" clear ", s.rx_clear);
     n(" undecrypted ", s.rx_undecrypted);
+    n(" replayed ", s.rx_replay);
     n(" unparsed ", s.rx_unparsed);
     n(" -> stack ", s.delivered);
     n(" (dropped ", LINK.rx_dropped.load(Ordering::Relaxed));
