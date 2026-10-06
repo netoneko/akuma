@@ -673,6 +673,56 @@ Also learned: goose ignores `OPENAI_API_KEY` from the environment here (401
 `GOOSE_DISABLE_KEYRING=1`, so `goose-kimi` writes that 0600 file from the token
 at run time.
 
+### 5.8 2026-10-07: what Linux knows, for rio and for the battery
+
+Dumped from Pop onto p3 by `overlays/ryzen/gfx-dump.sh` and
+`overlays/ryzen/acpi-dump.sh` (`/root/gfx/gfx.txt`, `/root/acpi/` — Akuma and
+Kimi read them there). Pop got `acpica-tools edid-decode vulkan-tools mesa-utils
+libdrm-tests fbset` from apt for it. Serial numbers are dropped.
+
+**Graphics (for making rio faster — it renders in software to `/dev/fb0`):**
+
+| | |
+|---|---|
+| GPU | AMD Radeon 780M (Phoenix1, PCI `1002:1900`, rev cc), `04:00.0`, PCIe 4.0 x16 link, driver `amdgpu`; Mesa RADV 25.1.5 = Vulkan 1.4 on Linux |
+| **the framebuffer is the GPU's VRAM aperture** | BAR0 = `0x4b0000000`, 256 MiB, prefetchable — exactly the UEFI GOP framebuffer Akuma maps write-combined. BAR2 `0x80000000` 2 MiB (doorbells), BAR5 `0x80600000` 512 KiB (registers, MMIO), BAR4 I/O `0x1000` |
+| VRAM | 2 GiB carved from system RAM (UMA), **all of it CPU-visible** (`vis_vram` = `vram_total` = 2 GiB), GTT 6.7 GiB; sclk 800 / 1100 / 2700 MHz, mclk 400 / 800 |
+| panel | eDP-1, 340×220 mm, **1920×1200 @ 60 Hz** (pixel clock 168.15 MHz, htotal 2260, vtotal 1240), 8 bpc, XRGB8888 `rgba 8/16,8/8,8/0`, stride 7680 B, 9 216 000 B per frame. Linux's own fb is 1920×1200×32 too (`amdgpudrmfb`); before amdgpu loads it is `simpledrm` on the same GOP buffer |
+| CPU | Ryzen 7 8845HS (Zen 4), 8 cores/16 threads, L2 8 MiB, L3 16 MiB, 14 GiB RAM. **AVX2 and AVX-512** (`avx512f/dq/cd/bw/vl/ifma/vbmi/vbmi2/vnni/bitalg/vpopcntdq/bf16`), `gfni`, `vaes`, `vpclmulqdq`, `sha_ni`, `fsrm`, `erms`. Linux's own software Vulkan (llvmpipe) uses 256-bit vectors here |
+
+What follows for rio, in order of payoff — the first two are measured facts, the
+rest is the reasoning, not yet tried:
+
+1. **Akuma runs `nosmp`; the machine has 16 threads.** A software rasteriser
+   scales across cores almost linearly; SMP on this target is the largest single
+   lever (and the least safe: see the `-j4` notes in the bare-metal runbook).
+2. **Every pixel goes through write-combined VRAM at ~3 GB/s** (`map_wc`/PAT, the
+   71→3026 MB/s result): a full 1920×1200 repaint is 9.2 MB ≈ 3 ms. Repaint only
+   damaged rectangles, and write whole cache lines (64 B) in order — WC
+   buffers flush on a full line, partial lines cost a read-modify-write on the
+   bus.
+3. **Render into ordinary cached RAM, then copy to the aperture in one
+   streaming pass** (non-temporal stores, `movntdq`/AVX-512 `vmovntdq`); reading
+   back from WC memory is uncached and slow, so never blend against the
+   framebuffer.
+4. Use the vector ISA: AVX2 is the safe floor, AVX-512 is present (check `XCR0`
+   — the kernel must enable the ZMM state in `XSETBV` and save/restore it on
+   context switch, which is a kernel change, not a library one).
+5. Real GPU acceleration would need the amdgpu stack (PSP/SMU firmware, GFX
+   ring, memory manager) — not a near-term option; the register BAR and the
+   2 GiB aperture are the only parts that are simple.
+
+**Battery (for the applet; handoff in `docs/handoff-battery-status.md`):** 45
+ACPI tables dumped, raw (`/root/acpi/tables/`) and decompiled (`/root/acpi/asl/`):
+`DSDT`, `SSDT1..26`, `FACP`, `APIC`, `IVRS`, `CRAT`, `HPET`, `MCFG`, `TPM2`,
+`WSMT`, `BGRT`, **`BATB`** (Windows battery table — not the battery's data) and
+no `ECDT`. Linux's reading at the time of the dump (the numbers to match):
+`BAT0` Li-poly, charging, 87 %, voltage 12.973 V (design minimum 11.31 V),
+`power_now` 20.964 W, energy 47.2 / 54.42 Wh full / 57 Wh design, 34 cycles;
+`ACAD` and two UCSI source power-supplies exist. The battery data lives behind
+ACPI methods (`_BIX`, `_BST`) reading the embedded controller, so the next
+step is finding the EC fields in `DSDT.dsl`.
+
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
 | # | stage | sessions |
