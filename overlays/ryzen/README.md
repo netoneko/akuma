@@ -17,9 +17,10 @@ Why this shape, and the wifi work it exists for:
 | one-shot boot, back to Pop by itself | **works**, unattended (boot 2: 184 s outside Linux) |
 | root on NVMe p3 (ex-Windows, 64 GiB ext2), logs in `/var/log/ryzen` | **works**, `e2fsck` clean, even after a hard power-off |
 | framebuffer (1920×1200 at `0x4b0000000`) | works |
-| hardware watchdog (`wdt`, AMD FCH) | written; first metal test in progress |
+| hardware watchdog (`wdt`, AMD FCH) | **works**: a deliberately wedged kernel (`arm.sh 6`) was reset by the chipset in 60 s, `FIRED=1` seen from Pop |
 | RTL8852CE firmware on p3 (`/lib/firmware/rtw89/`) | staged (`fetch-firmware.sh`); nothing loads it yet |
 | network | none, so ssh into Akuma here is not possible; the log is the channel |
+| wifi credentials | `~/.akuma/wifi/<network>` on the laptop holds the passphrase; never copied into the repo, docs or logs |
 
 ## Quick start
 
@@ -113,7 +114,16 @@ once a second from the BSP's timer interrupt and stopped right before an
 orderly reset, so it can never fire during the firmware's POST or Pop's boot.
 `wdttest` refuses to wedge unless the watchdog actually armed.
 
-From Pop, `python3 wdt-probe.py` shows the registers. Firmware leaves the
+**Verified on the metal, 2026-10-06.**
+- A normal boot with `wdt` (entry 0) logged `armed, 60 s, reset on expiry;
+  CONTROL=0x11`. It ran the full 140 s `autoreboot` delay, more than twice the
+  timeout, and returned exactly as without the watchdog (184 s outside Linux).
+  The probe in Pop then showed it stopped.
+- The self-test (entry 6) wedged with interrupts off. Pop was back 97 s later
+  (~35 s firmware/boot + 60 s), with `CONTROL.FIRED = 1` and `COUNT = 0`: the
+  chipset's own record that it reset the machine. `e2fsck` on p3 was clean.
+
+From Pop, `python3 wdt-probe.py` shows the registers (`FIRED` is noted when set). Firmware leaves the
 watchdog decoded-off and stopped but not locked; Linux's own driver accepted it
 (`heartbeat=60 sec`, MMIO `0xFEB00000`).
 

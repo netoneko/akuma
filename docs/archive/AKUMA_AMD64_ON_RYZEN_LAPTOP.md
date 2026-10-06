@@ -28,7 +28,7 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | NVMe driver + `root=/dev/nvme0n1p3` | **done**, verified on the metal (§9) |
 | log sink | **done**: p3, ext2 (64 GiB filesystem inside the 279 GiB partition) |
 | Windows | **gone**: p3 reformatted at the user's request |
-| FCH watchdog (a wedge still needs a hand on the power button) | **next** |
+| FCH watchdog (`wdt`) | **done**: a deliberate wedge was reset by the chipset in 60 s (`FIRED=1`), `overlays/ryzen/README.md` § The watchdog |
 | wifi W0–W5 (§5) | not started |
 
 ## Verdict
@@ -188,6 +188,13 @@ only thing that makes it tractable.
 | W4 | **WPA2-PSK, in the kernel** (no userspace supplicant, per the decision above): EAPOL 4-way handshake, HMAC-SHA1 PRF + MIC, AES key unwrap (RFC 3394) for the GTK, key install into the card's CAM so the **hardware** does CCMP. So the kernel needs only SHA-1 and AES-128 block decrypt, in a host-tested `forbid(unsafe_code)` crate with test vectors from the 802.11i annex. The PSK (PBKDF2-SHA1, 4096 iterations) can be computed once on Linux and passed as a 64-hex `psk=` on the cmdline, which keeps PBKDF2 out of the kernel entirely; or compute it at boot, at a cost of about 8k SHA-1 compressions | joins the home network | 2–4 |
 | W5 | **Integration + robustness:** `ExternalDevice::Rtw89` beside `Virtio`/`Rtl8169` in `akuma-net-nic`, netpoll, power save off, firmware-error (SER) recovery. Linux needs SER recovery on this very box | sshd reachable over wifi, survives an hour | 1–3 |
 
+**Credentials** (for W3/W4): `~/.akuma/wifi/<network>` on the laptop holds that
+network's WPA2 passphrase. It is never copied into
+the repo, a doc, a log or a commit. How it reaches Akuma is a W4 decision. The
+natural shape is a PSK derived from it (PBKDF2) staged onto p3 from Pop, which
+keeps PBKDF2 out of the kernel. That puts a secret on ryzen's disk, so the
+decision is the user's when it comes.
+
 **Total: 11–24 sessions and many dozens of reboot cycles.** W0–W2 can run
 entirely on the reboot loop. W3 onward needs an AP to test against and
 eventually a way to talk to Akuma, which is where §6 helps.
@@ -327,7 +334,7 @@ unmeasured.
 
 1. ~~Boot path, one attended boot~~ (done, §8).
 2. ~~Log sink~~ (done: the NVMe root, §9).
-3. **FCH watchdog.** From here the loop is unattended even when the kernel wedges.
+3. ~~FCH watchdog~~ (done: `amd64/src/watchdog.rs`, verified by a deliberate wedge).
 4. W0 → W2 on the loop.
 5. Decide on §6 (USB ethernet) and/or a USB wifi dongle before W3.
 

@@ -45,7 +45,11 @@ print(f"WDT CONTROL  = 0x{ctl:08x}  run={ctl & 1} fired={(ctl >> 1) & 1} action=
 print(f"WDT COUNT    = 0x{cnt:08x}  ({cnt & 0xffff})")
 if ctl == 0xFFFFFFFF:
     print("verdict: WDT block reads all-ones — not decoded")
-elif (decodeen3 >> 2) & 3 == 3 or (ctl >> 3) & 1:
-    print("verdict: present but DISABLED (firmware) — enabling is a PM write")
+elif (decodeen3 >> 2) & 3 == 3:
+    print("verdict: DISABLED by firmware (DECODEEN3.WATCHDOG_DISABLE) — enabling is a PM write")
+elif not (decodeen >> 7) & 1:
+    print("verdict: idle — decode off (WDT_TMREN=0), so CONTROL reads DISABLED; Akuma's `wdt` (or Linux's sp5100_tco) enables it")
 else:
     print("verdict: present and enabled")
+if (ctl >> 1) & 1 and ctl != 0xFFFFFFFF:
+    print("note: FIRED=1 — the last reset was this watchdog")
