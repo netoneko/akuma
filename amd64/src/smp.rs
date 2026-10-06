@@ -76,6 +76,33 @@ use crate::{gdt, idt, lapic, paging, sched, serial, uaccess, usermode};
 /// per-CPU table is sized for what a devbox is given rather than that ceiling.
 pub const MAX_CPUS: usize = 16;
 
+/// The `smp=N` command-line cap: run at most N CPUs (the BSP plus N-1 APs).
+/// `usize::MAX` — every core the MADT lists, capped by [`MAX_CPUS`] — unless
+/// [`set_cpu_cap_from_cmdline`] saw `smp=N`.
+static CPU_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Parse the `smp=N` cap out of the command line. Call before
+/// [`start_secondaries`]; `nosmp` needs no handling here (its callers never
+/// call), and a bad or zero `N` is ignored.
+pub fn set_cpu_cap_from_cmdline(cmdline: &str) {
+    for t in cmdline.split_ascii_whitespace() {
+        if let Some(n) = t.strip_prefix("smp=") {
+            if let Ok(n) = n.parse::<usize>() {
+                if n >= 1 {
+                    CPU_CAP.store(n, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// The effective `smp=N` cap (see [`set_cpu_cap_from_cmdline`]): how many CPUs
+/// may run, or `usize::MAX` for "every core the MADT lists".
+#[must_use]
+pub fn cpu_cap() -> usize {
+    CPU_CAP.load(Ordering::Relaxed)
+}
+
 /// `IA32_GS_BASE`: the `%gs` base the CPU uses right now.
 const IA32_GS_BASE: u32 = 0xC000_0101;
 /// `IA32_KERNEL_GS_BASE`: the other one — what `swapgs` swaps in.
@@ -590,6 +617,7 @@ fn mailbox_write(pa: u64, v: u64) {
 /// must be stopped on entry (the INIT delay borrows it) and every AP's timer is
 /// running on exit.
 pub fn start_secondaries(madt: Option<&Madt>) -> usize {
+    let cap = CPU_CAP.load(Ordering::Relaxed);
     let Some(madt) = madt else {
         serial::puts("  smp:  no MADT — single core\n");
         return 0;
@@ -629,6 +657,13 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         }
         idx += 1;
         if idx >= MAX_CPUS {
+            break;
+        }
+        // `smp=N` on the command line: N total CPUs, so at most N-1 APs. The
+        // bisect knob for the 16-core BKL wedge of 2026-10-07 (entry 13 froze
+        // with all cores while entry 12 ran clean on one) — and a way to run
+        // rio on a few cores where all sixteen will not come up.
+        if cap != usize::MAX && 1 + started >= cap {
             break;
         }
         let cpu = &PERCPU[idx];

@@ -1001,7 +1001,9 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         ]
     };
     let start_secondaries = || {
-        let nosmp = info.cmdline().split_ascii_whitespace().any(|t| t == "nosmp");
+        let cmdline = info.cmdline();
+        let nosmp = cmdline.split_ascii_whitespace().any(|t| t == "nosmp");
+        crate::smp::set_cpu_cap_from_cmdline(cmdline);
         if !nosmp && crate::smp::trampoline_page_available(&machine, &mb2_keep_out()) {
             crate::smp::start_secondaries(machine.madt.as_ref());
         }

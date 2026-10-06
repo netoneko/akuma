@@ -491,13 +491,15 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // from four cores interleaves into every other line, and taking them out of
     // the picture is the cheapest way to decide whether a fault is cross-core.
     let nosmp = flag("nosmp");
+    smp::set_cpu_cap_from_cmdline(cx.cmdline);
     let expected_aps = if nosmp {
         0
     } else {
+        let cap = smp::cpu_cap();
         cx.machine
             .madt
             .as_ref()
-            .map_or(0, |m| m.cpus().len().saturating_sub(1).min(smp::MAX_CPUS - 1))
+            .map_or(0, |m| m.cpus().len().saturating_sub(1).min(smp::MAX_CPUS - 1).min(cap - 1))
     };
     let started = if nosmp {
         crate::serial::puts("  smp:  nosmp on the command line — single core\n");

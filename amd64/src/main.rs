@@ -324,6 +324,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 (si.addr, si.addr + 4096),
                 (si.cmdline_paddr, si.cmdline_paddr + 4096),
             ];
+            smp::set_cpu_cap_from_cmdline(cmdline);
             if !cmdline.split_ascii_whitespace().any(|w| w == "nosmp")
                 && smp::trampoline_page_available(&machine, &keep_out)
             {
