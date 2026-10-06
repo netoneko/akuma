@@ -129,6 +129,8 @@ mod ramdisk;
 #[cfg(target_arch = "x86_64")]
 mod phys;
 #[cfg(target_arch = "x86_64")]
+mod power;
+#[cfg(target_arch = "x86_64")]
 mod pipe;
 mod polltime;
 #[cfg(target_arch = "x86_64")]
@@ -265,6 +267,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // `/dev/wifi0` (`wifisim`): on this path too, so a VMM guest can test the
     // tool and the device without hardware.
     wifi::init(cmdline);
+    // `/proc/power`: after `mem::init`, because mapping the EC window allocates
+    // page-table frames.
+    power::init(&machine, cmdline);
 
     // The console hook and the `akuma-exec` runtime, shared with the multiboot2
     // entry point. One call because the two used to be two, and the second of

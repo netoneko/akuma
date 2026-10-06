@@ -160,6 +160,8 @@ if [ "$DISK" != "none" ]; then
     [ -n "$FBTRACE" ] && CMDLINE="$CMDLINE fbtrace"
     # STRACE=1 prints every syscall the init program makes — a bring-up aid.
     [ -n "$STRACE" ] && CMDLINE="$CMDLINE strace"
+    # KCMDLINE="a b" appends bare flags (`powersim`, `ecram=0x…`, `wifisim`).
+    [ -n "$KCMDLINE" ] && CMDLINE="$CMDLINE $KCMDLINE"
 fi
 
 # shellcheck disable=SC2086  # these are deliberately word-split

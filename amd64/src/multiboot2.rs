@@ -925,6 +925,10 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // prints one line and boots on. `hdatest` plays a one-second tone.
     crate::hda::init(info.cmdline().split_ascii_whitespace().any(|t| t == "hdatest"));
 
+    // `/proc/power`. After `mem::init_reserving` for the same reason as `hda`:
+    // mapping the EC window allocates page-table frames.
+    crate::power::init(&machine, info.cmdline());
+
     // The root filesystem. With `root=/dev/sda1` on the command line, bring up
     // the xHCI + USB mass-storage stack and mount the persistent partition; on
     // any failure fall back to the RAM image the loader left in memory, which is

@@ -254,6 +254,28 @@ pub fn find_table<M: PhysMem + ?Sized>(m: &M, rsdp: &Rsdp, sig: &[u8; 4]) -> Opt
     found
 }
 
+/// The DSDT, which no root table lists: the FADT (`FACP`) points at it.
+///
+/// ACPI 6.x §5.2.9: the 64-bit `X_DSDT` is at offset 140 of a FADT at least 148
+/// bytes long and wins when non-zero; the 32-bit `DSDT` at offset 40 is the
+/// fallback (and the only one before revision 2). The DSDT is where the AML for
+/// the battery and the embedded controller lives, so anything that wants to read
+/// it — `akuma-power` scans it for the EC's memory window — starts here.
+#[must_use]
+pub fn dsdt<M: PhysMem + ?Sized>(m: &M, rsdp: &Rsdp) -> Option<TableHeader> {
+    let fadt = find_table(m, rsdp, b"FACP")?;
+    let x = if fadt.length >= 148 { read_u64(m, fadt.addr + 140) } else { None };
+    let pa = match x {
+        Some(a) if a != 0 => a,
+        _ => u64::from(read_u32(m, fadt.addr + 40)?),
+    };
+    if pa == 0 {
+        return None;
+    }
+    let t = table_at(m, pa)?;
+    (t.signature == *b"DSDT").then_some(t)
+}
+
 /// Most IOAPICs this will report. One is what both machines have.
 pub const MAX_IOAPICS: usize = 4;
 /// Most CPUs this will report, matching the largest vCPU count measured.

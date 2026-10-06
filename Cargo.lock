@@ -113,6 +113,7 @@ dependencies = [
  "akuma-pipe",
  "akuma-pipes",
  "akuma-pmm",
+ "akuma-power",
  "akuma-primitives",
  "akuma-procfs",
  "akuma-rtw89",
@@ -519,6 +520,10 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-power"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-primitives"

@@ -661,6 +661,16 @@ impl Filesystem for ProcFilesystem {
                 });
             }
 
+            // Battery and AC, where the kernel has a source for them.
+            if crate::power_renderer().is_some() {
+                entries.push(DirEntry {
+                    name: String::from("power"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
+            }
+
             // Add recently-exited PIDs that still have retained syscall logs.
             // This runs AFTER the box filter above and must repeat it — appending
             // the unfiltered list here is what put every host pid into a
@@ -847,6 +857,18 @@ impl Filesystem for ProcFilesystem {
             }
             let n = buf.len().min(data.len() - offset);
             buf[..n].copy_from_slice(&data[offset..offset + n]);
+            return Ok(n);
+        }
+
+        // /proc/power — same shape as the four below: a stack buffer, no `Vec`.
+        if path == "power" && let Some(render) = crate::power_renderer() {
+            let mut scratch = [0u8; 768];
+            let len = render(&mut scratch).min(scratch.len());
+            if offset >= len {
+                return Ok(0);
+            }
+            let n = buf.len().min(len - offset);
+            buf[..n].copy_from_slice(&scratch[offset..offset + n]);
             return Ok(n);
         }
 
@@ -1084,6 +1106,13 @@ impl Filesystem for ProcFilesystem {
             return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
         }
 
+        // /proc/power — the one allocation is the trait boundary's.
+        if path == "power" && let Some(render) = crate::power_renderer() {
+            let mut scratch = [0u8; 768];
+            let len = render(&mut scratch).min(scratch.len());
+            return Ok(scratch[..len].to_vec());
+        }
+
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — system-wide,
         // same visibility as /proc/mounts/filesystems (every box sees them;
         // real Linux containers do too absent a dedicated cgroup shim).
@@ -1281,6 +1310,10 @@ impl Filesystem for ProcFilesystem {
             return current_box_id == 0;
         }
 
+        if path == "power" {
+            return crate::power_renderer().is_some();
+        }
+
         if path == "mounts" || path == "filesystems"
             || path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
             return true;
@@ -1396,6 +1429,20 @@ impl Filesystem for ProcFilesystem {
             } else {
                 0
             };
+            return Ok(Metadata {
+                is_dir: false,
+                size,
+                inode,
+                mode: 0o100444,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        if path == "power" && let Some(render) = crate::power_renderer() {
+            let mut scratch = [0u8; 768];
+            let size = render(&mut scratch).min(scratch.len()) as u64;
             return Ok(Metadata {
                 is_dir: false,
                 size,

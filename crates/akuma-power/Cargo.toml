@@ -1,0 +1,10 @@
+[package]
+name = "akuma-power"
+version = "0.1.0"
+edition = "2024"
+description = "Battery and AC state from an ACPI embedded-controller window: AML region discovery, field decode, /proc/power text."
+
+[lints]
+workspace = true
+
+[dependencies]

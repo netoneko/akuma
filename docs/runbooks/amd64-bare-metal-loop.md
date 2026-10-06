@@ -767,6 +767,8 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 | `nofb` | do not touch the framebuffer: boot headless, everything to `dmesg`. A framebuffer that cannot be used (none, not direct-colour, unmapped) now also means headless rather than a halt |
 | `rtw89` | (multiboot2, after the root mount) bring ryzen's **RTL8852CE** up to running firmware and shut it down again — wifi stage W1; `[rtw]` lines say how far it got — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |
 | `wifisim` | register the **simulated wifi radio** behind `/dev/wifi0` (PVH and multiboot2), for testing the `wifi` tool without hardware — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |
+| `powersim` | serve a **simulated battery** at `/proc/power` (a 120 s discharge/charge cycle in real EC bytes), for testing the battery path where there is no battery — QEMU, the trashcan — [`../archive/AKUMA_ACPI_POWER.md`](../archive/AKUMA_ACPI_POWER.md) |
+| `ecram=0x<pa>` | read the battery from an EC memory window the AML scan did not find (or to investigate a machine); same layout, `valid=0` if it is not an EC — same doc |
 
 `root=/dev/sda1` needs the drive in a **USB 3.0** socket — see the first rule in
 "Rules that cost time to learn". Without that it silently boots the RAM image

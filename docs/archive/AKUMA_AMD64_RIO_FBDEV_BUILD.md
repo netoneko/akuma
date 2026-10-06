@@ -319,3 +319,19 @@ with rio's harness or a 30-line C program (`openpty`, fork `sh -i`, write
 * Modifier reporting is per-keystroke recovered from the console encoding
   (upper-case = shift, control byte = ctrl, ESC prefix = alt); there are
   no modifier press/release events.
+
+## Direction: rio as the whole computing experience (2026-10-07)
+
+The intent is for rio on the panel to be the machine's desktop, not only a
+terminal — which means a **status bar**: clock, battery and AC, wifi, and a
+bell/notification indicator. Rio itself has none (its only chrome is the tab
+bar, which shows titles and the cwd; the Akuma fork has no status-bar code
+either), so the bar is a patch to the fork's fb platform: reserve one row,
+shrink the pty by one row, draw it from a small poller.
+
+The kernel side comes first and is separate work, so the bar only has to read
+files: **`/proc/power`** (battery, AC; shipped 2026-10-07 —
+`docs/archive/AKUMA_ACPI_POWER.md`), `/dev/wifi0` (exists, `key=value`), and the
+clock (`clock_gettime`). The bell needs no kernel support: rio sees `BEL` on its
+own pty and sets the flag itself. Order: ACPI/power exposure on QEMU and the
+trashcan (done) → verify the battery decode on ryzen → the rio bar.

@@ -340,6 +340,7 @@ akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
 # the silent ceiling on a 64 KiB `dmesg`, on the one machine whose console has
 # no scrollback. The ring is host-tested; what stays here is the lock.
 akuma-dmesg = { path = "../crates/akuma-dmesg" }
+akuma-power = { path = "../crates/akuma-power" }
 # The `/proc/<pid>/{stat,status,cmdline}` byte formats, shared with the AArch64
 # kernel's `ProcFilesystem`. That filesystem *compiles* here since C1 step 4a
 # brought `akuma-vfs-glue` in, but it is not mounted: it renders from

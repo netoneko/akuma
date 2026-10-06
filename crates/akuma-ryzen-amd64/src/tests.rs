@@ -419,3 +419,42 @@ fn size_suffixes_are_one_field_spelled_three_ways() {
     assert_eq!(cmdline::parse_size("2G"), Some(2 << 30));
     assert_eq!(cmdline::parse_size("0"), None);
 }
+
+/// A FADT with the DSDT pointer(s) written where ACPI puts them.
+fn fadt_bytes(dsdt32: u32, x_dsdt: u64, len: usize) -> Vec<u8> {
+    let mut b = table_bytes(b"FACP", &alloc::vec![0u8; len - 36]);
+    b[40..44].copy_from_slice(&dsdt32.to_le_bytes());
+    if len >= 148 {
+        b[140..148].copy_from_slice(&x_dsdt.to_le_bytes());
+    }
+    b
+}
+
+fn dsdt_machine(fadt: &[u8]) -> (FakeMem, acpi::Rsdp) {
+    let mut m = FakeMem::default();
+    m.put(0x4000, fadt)
+        .put(0x5000, &xsdt_bytes(&[0x4000]))
+        .put(0x6000, &table_bytes(b"DSDT", &[0x5B, 0x80]));
+    let rsdp = acpi::rsdp_from_bytes(&rsdp_bytes(b"TEST  ", 0x5000)).unwrap();
+    (m, rsdp)
+}
+
+#[test]
+fn the_dsdt_is_found_through_the_fadt() {
+    // 64-bit pointer wins; the 32-bit one is deliberately wrong.
+    let (m, r) = dsdt_machine(&fadt_bytes(0x9999, 0x6000, 244));
+    assert_eq!(acpi::dsdt(&m, &r).map(|t| t.addr), Some(0x6000));
+    // Pre-2.0 FADT, or a zero X_DSDT: the 32-bit pointer.
+    let (m, r) = dsdt_machine(&fadt_bytes(0x6000, 0, 244));
+    assert_eq!(acpi::dsdt(&m, &r).map(|t| t.addr), Some(0x6000));
+    let (m, r) = dsdt_machine(&fadt_bytes(0x6000, 0x7777, 116));
+    assert_eq!(acpi::dsdt(&m, &r).map(|t| t.addr), Some(0x6000));
+}
+
+#[test]
+fn a_dsdt_pointer_at_a_non_dsdt_is_refused() {
+    let (m, r) = dsdt_machine(&fadt_bytes(0x5000, 0, 116)); // points at the XSDT
+    assert_eq!(acpi::dsdt(&m, &r), None);
+    let (m, r) = dsdt_machine(&fadt_bytes(0, 0, 244));
+    assert_eq!(acpi::dsdt(&m, &r), None);
+}

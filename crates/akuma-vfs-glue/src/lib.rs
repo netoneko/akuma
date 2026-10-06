@@ -1171,6 +1171,27 @@ pub fn set_framebuffer_present(present: bool) {
     FRAMEBUFFER_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// The renderer behind `/proc/power`, if this kernel has a power source.
+///
+/// A registered function rather than a [`VfsGlueHooks`] field: that struct is a
+/// literal at every kernel's call site, and a kernel with no battery (every
+/// AArch64 target) should not have to name a hook it can only answer "none" to.
+/// Unregistered, `/proc/power` does not exist — not an empty file, which a
+/// reader would take for "no battery" when the truth is "no way to know".
+static POWER_RENDER: spinning_top::Spinlock<Option<fn(&mut [u8]) -> usize>> =
+    spinning_top::Spinlock::new(None);
+
+/// Register the `/proc/power` renderer: fills the buffer, returns bytes written.
+/// Must not allocate (it runs on every read) and must tolerate a short buffer.
+pub fn set_power_renderer(f: fn(&mut [u8]) -> usize) {
+    *POWER_RENDER.lock() = Some(f);
+}
+
+/// The registered `/proc/power` renderer.
+pub(crate) fn power_renderer() -> Option<fn(&mut [u8]) -> usize> {
+    *POWER_RENDER.lock()
+}
+
 /// Whether the kernel offers `/dev/wifi0`. Set once at boot by a kernel with a
 /// wifi backend (amd64: a radio, or `wifisim`).
 static WIFI_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
