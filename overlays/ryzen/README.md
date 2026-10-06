@@ -53,6 +53,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | `format-p3.sh --yes-destroy-p3 [size]` | ryzen, root | **destructive**: the root image onto `nvme0n1p3`, grown with `resize2fs`. Refuses unless start/length/PARTUUID match the measured partition and it is unmounted. Done once, 2026-10-06, at 64 GiB |
 | `fetch-firmware.sh` | ryzen, root | `rtw8852c_fw*.bin` from Alpine's `linux-firmware-rtw89` (no dependencies; files are `.zst`, decompressed here) onto p3, with Realtek's licence beside them |
 | `wdt-probe.py` | ryzen, root, from Pop | **read-only** dump of the FCH watchdog and PM registers (`/dev/mem`): decoded? disabled? running? fired? |
+| `w0-trace.sh [--check]` | ryzen, root | wifi **W0**: mmiotrace of rtw89 unbind → bind → up → one scan, to `/var/tmp/akuma-w0/<stamp>/`. Detaches into unit `akuma-w0` (drops Pop's wifi ~1–2 min, takes all CPUs but one offline while tracing); NetworkManager is kept off the card so no association or keys enter the trace; every exit path restores the network. `--check` changes nothing |
+| `w0-summary.py <trace> [--dump PHASE]` | laptop | per-phase read/write counts and busiest BAR offsets of a W0 trace; `--dump bind` prints the ordered sequence |
 | `grub.cfg` | — | the menu (5 s), below |
 | `remove.list` | — | paths deleted from the image: the framebuffer `console` service (not wanted here) |
 | `rootfs/` | — | applied to the image: the `autoreboot` and `wifitest` herd services (`etc/herd/available/`) and their scripts (`etc/ryzen/`) |
