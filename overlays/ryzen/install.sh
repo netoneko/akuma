@@ -38,6 +38,9 @@ CFG=$W/akuma/overlays/ryzen/grub.cfg
 [ -f $CFG ] || { echo "missing $CFG" >&2; exit 1; }
 grub-mkstandalone -O x86_64-efi -o $D/grubx64.efi "boot/grub/grub.cfg=$CFG"
 cp $CFG $D/grub.cfg.embedded   # for reading only; the binary carries its own copy
+# The one-shot entry selector the menu reads (`arm.sh <n>`). GRUB rewrites it in
+# place, so it must exist at its full 1 KiB size before GRUB ever sees it.
+[ -f $D/grubenv ] || grub-editenv $D/grubenv create
 
 cat > $ESP/loader/entries/akuma.conf <<'EOF'
 title   Akuma/amd64

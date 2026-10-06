@@ -944,6 +944,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
                 crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
             })
     };
+    // The hardware watchdog (`wdt`), before anything below can hang: the root
+    // mount drives the NVMe or USB controller. Needs the page tables and the
+    // PCI scan, both done above; petting starts with the timer tick.
+    crate::watchdog::init(info.cmdline());
+
     // `root=/dev/nvme0n1pN`: the NVMe disk's GPT partition N (ryzen).
     let want_nvme_root = info
         .cmdline()
@@ -1148,6 +1153,10 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         // — but only the one `init=` names: under `init=/bin/herd` it is herd's
         // `console = true` service that is attached, because herd's other
         // services get pipes (`docs/runbooks/amd64-console-shell.md`).
+        // `wdttest`: prove the watchdog resets a wedged kernel, instead of init.
+        if cmdline.split_ascii_whitespace().any(|t| t == "wdttest") {
+            crate::watchdog::wedge_for_test();
+        }
         crate::usermode::run_init(path, &args);
     }
 }

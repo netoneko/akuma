@@ -69,6 +69,10 @@ pub fn perform_reset() -> ! {
 
     // 1. Reset-control register. 0x02 selects "system reset" (vs. just CPU),
     //    0x0E requests a full hard reset.
+    // The hardware watchdog must not outlive this kernel: still counting, it
+    // would reset the firmware's POST or the next OS's boot. Stopped last, so
+    // a reset that hangs before this point is still caught by it.
+    crate::watchdog::stop();
     // SAFETY: `0xCF9` is the architectural reset-control port on every PC
     //   chipset since ICH; these two writes are its documented reset request.
     unsafe {

@@ -32,6 +32,14 @@ TMO=${2:-240}
 DISP=${3:-bochs}
 set -e
 mkdir -p $Q
+# A rehearsal killed mid-way can leave loop devices on a deleted 477 GiB sparse
+# image, each pinning its written blocks on this disk. Release them first, and
+# again on the way out (see the end).
+release_loops() {
+    while mountpoint -q $Q/mnt; do umount $Q/mnt || break; done
+    for l in $(losetup -a | grep "$Q/" | cut -d: -f1); do losetup -d $l 2>/dev/null || true; done
+}
+release_loops
 if [ "${DISK:-ahci}" = nvme ] && [ "${KEEP:-0}" = 1 ] && [ -f $Q/nvme.img ]; then
     IMG=$Q/nvme.img
     echo "KEEP=1: booting the existing $IMG unchanged"
@@ -79,10 +87,15 @@ cp $OUT/akuma-amd64.tests $OUT/root.img $MNT/EFI/akuma/
 cp ${KERNEL:-$OUT/akuma-amd64} $MNT/EFI/akuma/akuma-amd64
 # The real menu with only `default`/`timeout` changed, so the rehearsal boots
 # exactly the command line the metal will.
-sed -e "s/^set default=.*/set default=$ENTRY/" -e "s/^set timeout=.*/set timeout=0/" \
+# Only the menu timeout changes. The entry is chosen the way `arm.sh` chooses it
+# on the metal — `next_entry` in /EFI/akuma/grubenv — so the rehearsal also
+# proves GRUB consumes it (a `save_env` write to FAT) and boots that entry.
+sed -e "s/^set timeout=.*/set timeout=0/" \
     $W/akuma/overlays/ryzen/grub.cfg > $Q/grub.cfg
 grep -A1 "^menuentry" $Q/grub.cfg | sed -n "$((ENTRY * 3 + 1)),$((ENTRY * 3 + 2))p"
 grub-mkstandalone -O x86_64-efi -o $MNT/EFI/BOOT/BOOTX64.EFI "boot/grub/grub.cfg=$Q/grub.cfg"
+grub-editenv $MNT/EFI/akuma/grubenv create
+[ "$ENTRY" = 0 ] || grub-editenv $MNT/EFI/akuma/grubenv set next_entry=$ENTRY
 sync; umount $MNT
 [ "${DISK:-ahci}" = nvme ] && { losetup -d $LOOP; trap - EXIT; } || trap - EXIT
 fi
@@ -110,7 +123,8 @@ timeout $TMO qemu-system-x86_64 $CPU -M q35 -m ${MEM:-6144} -smp 2 \
     $DRIVE \
     -serial file:$LOG -monitor none -no-reboot
 RC=$?
-set -e
+# Everything after the run is reporting: nothing in it may abort the cleanup
+# at the end (a failed check with `set -e` once leaked a mount and two loops).
 echo "qemu rc=$RC ($( [ $RC = 124 ] && echo 'TIMEOUT: still running at the deadline' || echo 'exited: guest reset or powered off'))"
 grep -a -E "multiboot2 entry|cmd:|  fb:|font:|kbd:|headless|\[herd\]|autoreboot|PANIC|panic|Fault|FAIL|halt" $LOG | head -40
 if [ "${DISK:-ahci}" = nvme ]; then
@@ -138,3 +152,15 @@ if [ "${DISK:-ahci}" = nvme ]; then
     }
     losetup -d $LOOP
 fi
+# Did GRUB consume the one-shot? (ESP = p6 on the NVMe image, the image itself otherwise.)
+if [ "${DISK:-ahci}" = nvme ]; then
+    LOOP=$(losetup -P -f --show $IMG); udevadm settle 2>/dev/null || true
+    for _ in $(seq 50); do [ -b ${LOOP}p6 ] && break; sleep 0.1; done
+    mount -o ro ${LOOP}p6 $Q/mnt
+else
+    mount -o ro,loop $IMG $Q/mnt
+fi
+echo "== grubenv after the boot (next_entry must be empty): $(grub-editenv $Q/mnt/EFI/akuma/grubenv list | tr '\n' ' ')"
+umount $Q/mnt
+[ "${DISK:-ahci}" = nvme ] && losetup -d $LOOP
+release_loops

@@ -151,6 +151,7 @@ mod uas;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod splash;
+mod watchdog;
 mod xhci;
 
 #[cfg(target_arch = "x86_64")]

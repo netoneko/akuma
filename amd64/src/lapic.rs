@@ -173,7 +173,10 @@ pub fn on_tick() {
     // CPU when the tick landed. See `sched::note_tick_sample`.
     crate::sched::note_tick_sample();
     if crate::smp::cpu_index() == 0 {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        // The hardware watchdog (opt-in, `wdt`): the BSP taking timer
+        // interrupts is what keeps the machine from being reset.
+        crate::watchdog::pet(t);
     }
     crate::sched::set_need_resched();
     eoi();
