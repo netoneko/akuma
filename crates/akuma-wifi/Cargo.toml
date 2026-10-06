@@ -1,0 +1,13 @@
+[package]
+name = "akuma-wifi"
+version = "0.1.0"
+edition = "2024"
+description = "The /dev/wifi0 control protocol, shared by the kernel and the `wifi` tool: the command grammar (`scan`/`connect`/`disconnect`, SSIDs and keys hex-encoded), the `key=value` status text both sides read and write, and a deterministic simulated radio so the whole chain is testable before a real driver exists. no_std, no allocation, no dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []

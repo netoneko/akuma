@@ -1,0 +1,26 @@
+[package]
+name = "wifi"
+version = "0.1.0"
+edition = "2024"
+description = "Akuma's wifi manager: known networks in /etc/wifi/<network>, the /dev/wifi0 control device, and `wifi auto` for herd. No supplicant — the kernel does WPA2; this picks the network and hands over the key."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wifi"
+path = "src/main.rs"
+required-features = ["akuma"]
+
+[features]
+default = ["akuma"]
+# The binary needs libakuma (its #[panic_handler]/#[global_allocator] make it
+# unlinkable against std). The library half is host-tested without it:
+#   cargo test -p wifi --lib --no-default-features --target <host>
+akuma = ["dep:libakuma"]
+
+[dependencies]
+libakuma = { path = "../libakuma", optional = true }
+akuma-wifi = { path = "../../crates/akuma-wifi" }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = { version = "0.10", default-features = false }

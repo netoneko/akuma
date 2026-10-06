@@ -1171,6 +1171,16 @@ pub fn set_framebuffer_present(present: bool) {
     FRAMEBUFFER_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the kernel offers `/dev/wifi0`. Set once at boot by a kernel with a
+/// wifi backend (amd64: a radio, or `wifisim`).
+static WIFI_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Announce that `/dev/wifi0` exists. The node then appears in `stat`/`ls /dev`;
+/// opening it is the kernel's own `openat` arm.
+pub fn set_wifi_present(present: bool) {
+    WIFI_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Live kernel state plus caller identity, assembled for `akuma_vfs::dev`.
 fn dev_probe() -> DevProbe {
     let mut block_slots = 0u8;
@@ -1182,6 +1192,7 @@ fn dev_probe() -> DevProbe {
     DevProbe {
         audio: crate::audio_is_available(),
         framebuffer: FRAMEBUFFER_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
+        wifi: WIFI_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
         block_slots,
         // Boxes get no synthetic /dev — see `DevProbe::in_box` for why, and
         // for the two carve-outs (`null`/`zero` stat, and `/dev/net/tap0`,

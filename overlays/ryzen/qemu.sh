@@ -148,6 +148,8 @@ if [ "${DISK:-ahci}" = nvme ]; then
         ls -la $Q/mnt/var/log/ryzen 2>&1
         L=$(ls -t $Q/mnt/var/log/ryzen/boot-*.dmesg 2>/dev/null | head -1)
         [ -n "$L" ] && grep -a -E "nvme|fs: " $L | head -12
+        W=$(ls -t $Q/mnt/var/log/ryzen/wifitest-*.txt 2>/dev/null | head -1)
+        [ -n "$W" ] && { echo "== $W"; cat $W; }
         umount $Q/mnt
     }
     losetup -d $LOOP

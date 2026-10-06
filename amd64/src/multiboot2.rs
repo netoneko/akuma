@@ -948,6 +948,8 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // mount drives the NVMe or USB controller. Needs the page tables and the
     // PCI scan, both done above; petting starts with the timer tick.
     crate::watchdog::init(info.cmdline());
+    // `/dev/wifi0` and its backend (`wifisim` today; the radio later).
+    crate::wifi::init(info.cmdline());
 
     // `root=/dev/nvme0n1pN`: the NVMe disk's GPT partition N (ryzen).
     let want_nvme_root = info

@@ -1,9 +1,11 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-10-06 with
-`python3 scripts/cloc_akuma.py src crates`: **56 of 76 crates** forbid
-`unsafe` (75,527 of 97,266 crate lines, 77.6%; 97.6% of production code lies
-outside any `unsafe` block). New since the last run, and also carrying the ban
+**Grade: A** — regenerated 2026-10-06 (second run that day) with
+`python3 scripts/cloc_akuma.py src crates`: **57 of 77 crates** forbid
+`unsafe` (76307 of 98046 crate lines, 77.8%; 97.6% of production
+code lies outside any `unsafe` block). Added in this run: **`akuma-wifi`**
+(the `/dev/wifi0` protocol and the simulated radio, 0 sites;
+[`subsystems/wifi.md`](subsystems/wifi.md)). Earlier the same day, also carrying the ban
 from its first commit: **`akuma-nvme`** (582 production lines, 0 sites). That is
 the NVMe register/queue/Identify/PRP/GPT logic, with a partition window every
 access is checked against. Its MMIO/DMA half is `amd64/src/nvme.rs`, which

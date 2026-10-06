@@ -261,6 +261,8 @@ akuma-xhci = { path = "../crates/akuma-xhci" }
 # NVMe (ryzen's SSD): register/queue/Identify/PRP/GPT logic, host-tested; the
 # MMIO/DMA half is `src/nvme.rs`.
 akuma-nvme = { path = "../crates/akuma-nvme" }
+# The /dev/wifi0 control protocol (`src/wifi.rs`), shared with `userspace/wifi`.
+akuma-wifi = { path = "../crates/akuma-wifi" }
 # USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
 # driven over `akuma-xhci` by `src/usb_storage.rs`'s BOT helpers in `src/xhci.rs`.
 akuma-usb-storage = { path = "../crates/akuma-usb-storage" }

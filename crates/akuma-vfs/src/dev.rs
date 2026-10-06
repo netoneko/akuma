@@ -101,6 +101,15 @@ const FB_NODES: &[DevNode] = &[
     DevNode { name: "fb0", is_block: false, perm: 0o660, major: 29, minor: 0, ino: 17 },
 ];
 
+/// The wifi control device, when the kernel has a wifi backend (a radio, or the
+/// `wifisim` simulation): `proposals/AKUMA_WIFI_CONTROL.md`. Root-only (`0600`)
+/// because writing to it hands the driver a network key. Major 10 is Linux's
+/// `MISC_MAJOR`; the minor is from its dynamic range, as Linux has no fixed
+/// wifi control node.
+const WIFI_NODES: &[DevNode] = &[
+    DevNode { name: "wifi0", is_block: false, perm: 0o600, major: 10, minor: 242, ino: 19 },
+];
+
 /// `vda`..`vdd`, gated per-slot on [`DevProbe::block_slots`]. Spelled out
 /// rather than computed so the whole table is static data the lookup can
 /// borrow from. `254` is virtio-blk's major; the minor spacing of 16 mirrors
@@ -123,6 +132,8 @@ pub struct DevProbe {
     pub audio: bool,
     /// A framebuffer is available to userspace (`/dev/fb0`).
     pub framebuffer: bool,
+    /// A wifi backend is registered (`/dev/wifi0`).
+    pub wifi: bool,
     /// Bit `i` set means block slot `i` is populated, i.e. `vd{a+i}` exists.
     pub block_slots: u8,
     /// The caller runs inside a box (`box_id != 0`).
@@ -164,6 +175,7 @@ fn all_nodes(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
         .iter()
         .chain(AUDIO_NODES.iter().filter(move |_| probe.audio))
         .chain(FB_NODES.iter().filter(move |_| probe.framebuffer))
+        .chain(WIFI_NODES.iter().filter(move |_| probe.wifi))
         .chain(
             BLOCK_NODES
                 .iter()
@@ -203,7 +215,7 @@ mod tests {
 
     /// A host probe: sound device present, two disks, not in a box.
     fn host() -> DevProbe {
-        DevProbe { audio: true, framebuffer: false, block_slots: 0b0011, in_box: false }
+        DevProbe { audio: true, framebuffer: false, wifi: false, block_slots: 0b0011, in_box: false }
     }
 
     /// Collecting is the test's own convenience — the crate itself never does.
@@ -267,7 +279,7 @@ mod tests {
 
     #[test]
     fn inodes_are_unique() {
-        let p = DevProbe { audio: true, framebuffer: false, block_slots: 0b1111, in_box: false };
+        let p = DevProbe { audio: true, framebuffer: false, wifi: false, block_slots: 0b1111, in_box: false };
         let mut inos: Vec<u64> = list(p).map(|n| n.ino).collect();
         let total = inos.len();
         inos.sort_unstable();
@@ -278,7 +290,7 @@ mod tests {
     /// Every table entry must be reachable by name, or it can never be `stat`ed.
     #[test]
     fn every_listed_node_is_also_lookupable() {
-        let p = DevProbe { audio: true, framebuffer: false, block_slots: 0b1111, in_box: false };
+        let p = DevProbe { audio: true, framebuffer: false, wifi: false, block_slots: 0b1111, in_box: false };
         for node in list(p) {
             assert_eq!(lookup(p, node.name).as_ref(), Some(node), "{}", node.name);
         }
@@ -286,13 +298,13 @@ mod tests {
 
     #[test]
     fn a_box_gets_no_listing_at_all() {
-        let p = DevProbe { audio: true, framebuffer: true, block_slots: 0b1111, in_box: true };
+        let p = DevProbe { audio: true, framebuffer: true, wifi: false, block_slots: 0b1111, in_box: true };
         assert_eq!(list(p).count(), 0);
     }
 
     #[test]
     fn a_box_never_sees_host_hardware() {
-        let p = DevProbe { audio: true, framebuffer: true, block_slots: 0b1111, in_box: true };
+        let p = DevProbe { audio: true, framebuffer: true, wifi: false, block_slots: 0b1111, in_box: true };
         for name in ["vda", "vdb", "vdc", "vdd", "dsp", "audio", "random", "urandom"] {
             assert!(lookup(p, name).is_none(), "{name} must not leak into a box");
         }
@@ -314,6 +326,16 @@ mod tests {
 
     /// `fb0` exists exactly when the kernel says there is a framebuffer, and a
     /// box never sees it (the `in_box` carve-out).
+    #[test]
+    fn wifi0_follows_the_wifi_probe_and_is_root_only() {
+        let with = DevProbe { wifi: true, ..Default::default() };
+        let node = lookup(with, "wifi0").expect("wifi0 with a backend");
+        assert_eq!((node.is_block, node.perm, node.major), (false, 0o600, 10));
+        assert!(names(with).contains(&"wifi0"));
+        assert!(lookup(DevProbe::default(), "wifi0").is_none());
+        assert!(lookup(DevProbe { in_box: true, ..with }, "wifi0").is_none());
+    }
+
     #[test]
     fn fb0_follows_the_framebuffer_probe() {
         let with = DevProbe { framebuffer: true, ..Default::default() };

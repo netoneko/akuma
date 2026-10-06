@@ -31,7 +31,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **56 of the 76 carry `#![forbid(unsafe_code)]`** (2026-10-06) — which crates, and why the
+  **57 of the 77 carry `#![forbid(unsafe_code)]`** (2026-10-06) — which crates, and why the
   other 20 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
@@ -365,7 +365,7 @@ docs/archive/      200+ historical investigation docs. Linked from new docs. Cor
 
 - Reference subsystem docs live in `docs/reference/subsystems/` (memory, scheduler,
   smp, smp-shared, networking, rump-stack, ssh, vfs, containers, exceptions,
-  boot, irq, console, rng, async-fs, config-flags, drivers/),
+  boot, irq, console, rng, async-fs, config-flags, wifi, drivers/),
   with 17 per-family syscall docs under `docs/reference/subsystems/syscalls/`.
 - Linux ABI / musl notes: `docs/reference/abi/`.
 - Build targets: `docs/reference/build-profiles.md`; every feature and env knob:

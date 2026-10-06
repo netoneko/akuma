@@ -19,6 +19,7 @@ Why this shape, and the wifi work it exists for:
 | framebuffer (1920×1200 at `0x4b0000000`) | works |
 | hardware watchdog (`wdt`, AMD FCH) | **works**: a deliberately wedged kernel (`arm.sh 6`) was reset by the chipset in 60 s, `FIRED=1` seen from Pop |
 | RTL8852CE firmware on p3 (`/lib/firmware/rtw89/`) | staged (`fetch-firmware.sh`); nothing loads it yet |
+| wifi control (`/dev/wifi0`, `/etc/wifi`, `wifi`) | **works** against the simulated radio (entry 7, rehearsed); no real radio yet — [`docs/reference/subsystems/wifi.md`](../../docs/reference/subsystems/wifi.md) |
 | network | none, so ssh into Akuma here is not possible; the log is the channel |
 | wifi credentials | `~/.akuma/wifi/<network>` on the laptop holds the passphrase; never copied into the repo, docs or logs |
 
@@ -54,7 +55,7 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | `wdt-probe.py` | ryzen, root, from Pop | **read-only** dump of the FCH watchdog and PM registers (`/dev/mem`): decoded? disabled? running? fired? |
 | `grub.cfg` | — | the menu (5 s), below |
 | `remove.list` | — | paths deleted from the image: the framebuffer `console` service (not wanted here) |
-| `rootfs/` | — | applied to the image: `etc/herd/available/autoreboot.conf` and `etc/ryzen/autoreboot.sh` |
+| `rootfs/` | — | applied to the image: the `autoreboot` and `wifitest` herd services (`etc/herd/available/`) and their scripts (`etc/ryzen/`) |
 
 ## Menu
 
@@ -67,7 +68,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 4 | headless: as 0, plus `nofb` (framebuffer never touched) | yes |
 | 5 | NVMe root p3, SMP | no |
 | 6 | **watchdog self-test** (`wdttest`): arm, then wedge with interrupts off | yes, through the watchdog's reset, about 60 s in |
-| 7 | reboot | — |
+| 7 | **wifi tool test** (`wifisim` + the `wifitest` service): the `wifi` tool against the simulated radio, transcript to `/var/log/ryzen/wifitest-N.txt` | yes |
+| 8 | reboot | — |
 
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
 `initargs=daemon,--service,…`, which loads exactly the named herd services.

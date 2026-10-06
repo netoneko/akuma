@@ -6,7 +6,7 @@
 set -e
 cd "$(git rev-parse --show-toplevel)"
 W=/home/netoneko/akuma-metal
-FILES=$(git ls-files -m -o --exclude-standard -- amd64 crates userspace/herd overlays/ryzen | sort -u)
+FILES=$(git ls-files -m -o --exclude-standard -- amd64 crates userspace/herd userspace/wifi userspace/Cargo.toml userspace/Cargo.lock Cargo.toml Cargo.lock overlays/ryzen | sort -u)
 [ -n "$FILES" ] || { echo "nothing to send"; exit 0; }
 echo "$FILES"
 # shellcheck disable=SC2086

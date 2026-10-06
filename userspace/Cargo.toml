@@ -21,6 +21,7 @@ members = [
     "hello",
     "paws",
     "herd",
+    "wifi",
     "httpd",
     "stackstress",
     "termtest",

@@ -88,7 +88,7 @@ BOX=""
 # dependencies (`libakuma`, `libakuma-tls`, `akuma-tar`, `picojson`) was
 # already ported by the five programs above it, `hget` in particular already
 # proving the in-process TLS `box pull` needs.
-for prog in paws httpd herd hget wall box; do
+for prog in paws httpd herd hget wall box wifi; do
     if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
         found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
         [ "$prog" = paws ] && PAWS="$found"
@@ -97,6 +97,7 @@ for prog in paws httpd herd hget wall box; do
         [ "$prog" = hget ] && HGET="$found"
         [ "$prog" = wall ] && WALL="$found"
         [ "$prog" = box ] && BOX="$found"
+        [ "$prog" = wifi ] && WIFI="$found"
     fi
 done
 
@@ -231,6 +232,10 @@ done
 # target). The HP box has a screen and no keyboard, so this is how an ssh
 # session leaves a note on the display in front of it.
 [ -n "$WALL" ] && "$DEBUGFS" -w -R "write $WALL bin/wall" "$IMG" >/dev/null 2>&1
+# `wifi`: the wifi manager — /etc/wifi/<network> + the kernel's /dev/wifi0
+# (proposals/AKUMA_WIFI_CONTROL.md). Its herd service is staged `available`,
+# not enabled: a box with no wifi backend has no /dev/wifi0 to manage.
+[ -n "$WIFI" ] && "$DEBUGFS" -w -R "write $WIFI bin/wifi" "$IMG" >/dev/null 2>&1
 # `ruststd`: the Rust std probe. Run it with `INIT=/bin/ruststd`.
 [ -n "$RUSTSTD" ] && "$DEBUGFS" -w -R "write $RUSTSTD bin/ruststd" "$IMG" >/dev/null 2>&1
 
@@ -676,6 +681,14 @@ if [ -n "$HERD" ]; then
         printf 'command = /bin/httpd\nrestart = true\n' > "$TMP/herd-httpd.conf"
         "$DEBUGFS" -w -R "write $TMP/herd-httpd.conf etc/herd/available/httpd.conf" "$IMG" >/dev/null 2>&1
     fi
+
+    # wifi: available, not enabled — `herd enable wifi`, or name it with
+    # `--service` (ryzen's unattended entries). A box with no wifi backend has
+    # no /dev/wifi0, so enabling it everywhere would only log "no radio".
+    if [ -n "$WIFI" ]; then
+        printf 'command = /bin/wifi\nargs = auto\nrestart = true\nrestart_delay = 5000\n' > "$TMP/herd-wifi.conf"
+        "$DEBUGFS" -w -R "write $TMP/herd-wifi.conf etc/herd/available/wifi.conf" "$IMG" >/dev/null 2>&1
+    fi
 fi
 # DNS. QEMU's usermode `-netdev user` and Firecracker's `net-setup.sh` tap both
 # answer DNS themselves at `10.0.2.3` (usermode net's fixed proxy address; see
@@ -733,4 +746,4 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # rather than inventing a different convention.
 "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
 
-echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -n "$BOX" ] && echo ", /bin/box")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"
+echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -n "$BOX" ] && echo ", /bin/box")$([ -n "$WIFI" ] && echo ", /bin/wifi")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"

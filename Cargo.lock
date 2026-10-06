@@ -133,6 +133,7 @@ dependencies = [
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
+ "akuma-wifi",
  "akuma-xhci",
  "spinning_top",
 ]
@@ -790,6 +791,10 @@ dependencies = [
  "virtio-drivers",
  "zerocopy",
 ]
+
+[[package]]
+name = "akuma-wifi"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-xhci"

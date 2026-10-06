@@ -1630,6 +1630,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             {
                 crate::fbdev::release(p.tgid);
             }
+            // A `/dev/wifi0` descriptor's read cursor (`crate::wifi`).
+            if crate::fd::is_dev_wifi(a1)
+                && let Some(p) = current_process()
+            {
+                crate::wifi::release(p.tgid, a1 as u32);
+            }
             to_glue(call, [a1, 0, 0, 0, 0, 0])
         }
         // `lseek(fd, offset, whence)` — **glue's arm behind one preamble**
@@ -2622,6 +2628,11 @@ fn owns_non_console_channel() -> bool {
 ///   any blocking arm could fold at all.
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
+
+    // `/dev/wifi0`: command lines for the wifi driver (`crate::wifi`).
+    if crate::fd::is_dev_wifi(fd) {
+        return crate::wifi::write(buf, len as usize);
+    }
 
     // See the header: first, and by both spellings — **unless this process's
     // stdout belongs to a channel of its own**, which is what an `ssh` session's

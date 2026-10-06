@@ -152,6 +152,7 @@ mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod splash;
 mod watchdog;
+mod wifi;
 mod xhci;
 
 #[cfg(target_arch = "x86_64")]
@@ -254,6 +255,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
         halt();
     }
+    // `/dev/wifi0` (`wifisim`): on this path too, so a VMM guest can test the
+    // tool and the device without hardware.
+    wifi::init(cmdline);
 
     // The console hook and the `akuma-exec` runtime, shared with the multiboot2
     // entry point. One call because the two used to be two, and the second of

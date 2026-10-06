@@ -227,6 +227,11 @@ pub enum FileDescriptor {
     /// it is the one with a boot-loader framebuffer — and it holds the screen's
     /// ownership while any process has it open (2026-10-03).
     DevFb,
+    /// The wifi control device (`/dev/wifi0`): text commands in, driver state
+    /// out (`akuma-wifi`, `proposals/AKUMA_WIFI_CONTROL.md`). Only the amd64
+    /// kernel opens one; reads are served per descriptor from a snapshot so
+    /// `cat` sees the state once and then EOF.
+    DevWifi,
     /// The master side of pseudo-terminal pair `N` (`open("/dev/ptmx")`).
     ///
     /// Reference-counted like a pipe end — `dup`, `fork` and `close` go through

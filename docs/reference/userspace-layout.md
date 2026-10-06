@@ -16,6 +16,7 @@ pages — not every member has one).
 | `libakuma-tls` | TLS 1.3 client connections for userspace programs |
 | `apk-tools` | Alpine apk bootstrap tooling (no binary — build.rs deploys bootstrap assets directly) |
 | `herd` | Process supervisor — background services, auto-restart, config in `/etc/herd/` |
+| `wifi` | Wifi manager (amd64): known networks in `/etc/wifi/<network>`, the kernel's `/dev/wifi0`, `wifi auto` as a herd service. No supplicant — the kernel does WPA2. [`../userspace/wifi.md`](../userspace/wifi.md) |
 | `box` | Container manager: `box run` (Docker images on an overlay root), `box pull`, `box open/close/ps/inspect` |
 | `meow` | AI coding assistant — LLM chat client with filesystem/network tool calling |
 | `nca` | Build wrapper for [native-cli-ai](https://github.com/netoneko/native-cli-ai) (submodule); no binary in `/bin` — build.rs deploys to `bootstrap/bin/nca` |

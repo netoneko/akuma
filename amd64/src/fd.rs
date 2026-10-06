@@ -186,6 +186,9 @@ pub mod errno {
     pub const ENFILE: u64 = (-23i64) as u64;
     pub const ENOTTY: u64 = (-25i64) as u64;
     pub const ENODEV: u64 = (-19i64) as u64;
+    pub const EIO: u64 = (-5i64) as u64;
+    /// `/dev/wifi0`: a command verb the device does not know.
+    pub const EOPNOTSUPP: u64 = (-95i64) as u64;
     pub const EBUSY: u64 = (-16i64) as u64;
     pub const ENOSYS: u64 = (-38i64) as u64;
     pub const ESRCH: u64 = (-3i64) as u64;
@@ -541,6 +544,28 @@ fn open_framebuffer(flags: u32) -> u64 {
     u64::from(fd)
 }
 
+/// `open("/dev/wifi0")`: a `DevWifi` descriptor, when a wifi backend exists.
+/// See `crate::wifi`.
+fn open_wifi(flags: u32) -> u64 {
+    if !crate::wifi::present() {
+        return errno::ENOENT;
+    }
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return errno::ESRCH;
+    };
+    let fd = proc.alloc_fd(FileDescriptor::DevWifi);
+    if flags & open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    u64::from(fd)
+}
+
+/// Is `fd` a `/dev/wifi0` descriptor?
+#[must_use]
+pub fn is_dev_wifi(fd: u64) -> bool {
+    table_with(fd, |d| matches!(d, FileDescriptor::DevWifi)).unwrap_or(false)
+}
+
 /// Is `fd` a `/dev/fb0` descriptor?
 #[must_use]
 pub fn is_dev_fb(fd: u64) -> bool {
@@ -749,6 +774,10 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     // recognise. A machine with no boot framebuffer has no node at all.
     if resolved == "/dev/fb0" {
         return open_framebuffer(flags);
+    }
+    // `/dev/wifi0`, likewise this kernel's own: `crate::wifi` serves it.
+    if resolved == "/dev/wifi0" {
+        return open_wifi(flags);
     }
 
     // A **block** node is refused rather than served — see the header. A
@@ -1022,6 +1051,13 @@ pub fn sys_close(fd: u64) -> u64 {
 pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
+    }
+    // `/dev/wifi0`: this descriptor's snapshot of the driver state.
+    if is_dev_wifi(fd) {
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
+            return errno::ESRCH;
+        };
+        return crate::wifi::read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
     }
     akuma_syscalls_glue::fs::sys_read(fd, buf, len.min(MAX_IO) as usize)
 }
@@ -1547,6 +1583,19 @@ const STAT_SIZE: usize = core::mem::size_of::<akuma_syscalls_abi::stat::X8664>()
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     // `/dev/fb0`: a character device, major 29 minor 0, size 0 — what Linux
     // reports for an fbdev node (the size is `FBIOGET_FSCREENINFO`'s business).
+    // `/dev/wifi0`: a misc character device (10, 242), root-only.
+    if is_dev_wifi(fd) {
+        let g = akuma_syscalls_linux::Stat {
+            st_ino: 19,
+            st_mode: 0o020_600,
+            st_nlink: 1,
+            st_rdev: (10 << 8) | 242,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
+    }
     if is_dev_fb(fd) {
         let g = akuma_syscalls_linux::Stat {
             st_ino: 17,

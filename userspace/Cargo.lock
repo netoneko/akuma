@@ -114,6 +114,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-wifi"
+version = "0.1.0"
+
+[[package]]
 name = "allocstress"
 version = "0.1.0"
 dependencies = [
@@ -635,6 +639,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest",
+ "hmac",
+]
+
+[[package]]
 name = "picojson"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -782,6 +796,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]
@@ -950,6 +975,16 @@ name = "wavplay"
 version = "0.1.0"
 dependencies = [
  "libakuma",
+]
+
+[[package]]
+name = "wifi"
+version = "0.1.0"
+dependencies = [
+ "akuma-wifi",
+ "libakuma",
+ "pbkdf2",
+ "sha1",
 ]
 
 [[package]]
