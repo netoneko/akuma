@@ -24,9 +24,12 @@
 //! yield) waiting for input. Scancode **set 1** — the controller's translation
 //! mode, which is what firmware emulation and every PC's power-on state give.
 //!
-//! What it does not do: arrow keys and function keys (dropped), key repeat
+//! What it does not do: function keys (dropped), key repeat
 //! (the keyboard does that itself), LEDs, any command to the keyboard beyond
-//! draining what it has already sent. Enough for a shell.
+//! draining what it has already sent. Extended (0xE0-prefixed) keys — arrows,
+//! Home/End, Insert/Delete, PgUp/PgDn — emit the same escape sequences the
+//! native USB keyboard does (`akuma_usb::keymap`), so both keyboards look
+//! alike to a terminal; a small queue holds the bytes after the first. Enough for a shell.
 //!
 //! # Absent controller
 //!
@@ -114,6 +117,63 @@ const SC_ENTER: u8 = 0x1C;
 const SC_KP_SLASH: u8 = 0x35;
 const SC_E0: u8 = 0xE0;
 const SC_BREAK: u8 = 0x80;
+
+/// Extended (0xE0-prefixed) set-1 make codes to terminal escape sequences —
+/// the same bytes `akuma_usb::keymap` emits, so a program cannot tell which
+/// keyboard a key came from. Same table shape: arrows `ESC [ A..D`,
+/// Home/End `ESC [ H`/`F`, `ESC [ n ~` for Insert, Delete, PgUp, PgDn.
+const EXTENDED: &[(u8, &[u8])] = &[
+    (0x47, b"\x1b[H"), // Home
+    (0x48, b"\x1b[A"), // Up
+    (0x49, b"\x1b[5~"), // PgUp
+    (0x4B, b"\x1b[D"), // Left
+    (0x4D, b"\x1b[C"), // Right
+    (0x4F, b"\x1b[F"), // End
+    (0x50, b"\x1b[B"), // Down
+    (0x51, b"\x1b[6~"), // PgDn
+    (0x52, b"\x1b[2~"), // Insert
+    (0x53, b"\x1b[3~"), // Delete
+];
+
+/// Bytes of escape sequences decoded but not yet returned. A decoded
+/// sequence's first byte comes back from [`decode`] / [`pump`] directly and
+/// the rest wait here; [`getb`] and [`has_byte`] drain this before touching
+/// the controller, so a sequence is never interleaved with a later key.
+/// Lock-free ring, single producer and single consumer (the console poll).
+const Q_CAP: usize = 16;
+static QBUF: [AtomicU8; Q_CAP] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU8 = AtomicU8::new(0);
+    [Z; Q_CAP]
+};
+static Q_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0); // next to pop
+static Q_TAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0); // next to push
+
+/// Queue one slice; drops bytes if (impossibly — the longest sequence is
+/// 4 and one key's bytes are drained before the next is decoded) full.
+fn q_push(bytes: &[u8]) {
+    for &b in bytes {
+        let tail = Q_TAIL.load(Ordering::Relaxed);
+        let head = Q_HEAD.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) >= Q_CAP {
+            return;
+        }
+        QBUF[tail % Q_CAP].store(b, Ordering::Relaxed);
+        Q_TAIL.store(tail.wrapping_add(1), Ordering::Release);
+    }
+}
+
+/// Take one queued byte, if any.
+fn q_pop() -> Option<u8> {
+    let head = Q_HEAD.load(Ordering::Relaxed);
+    let tail = Q_TAIL.load(Ordering::Acquire);
+    if head == tail {
+        return None;
+    }
+    let b = QBUF[head % Q_CAP].load(Ordering::Relaxed);
+    Q_HEAD.store(head.wrapping_add(1), Ordering::Release);
+    Some(b)
+}
 
 fn status() -> u8 {
     // SAFETY: the i8042 status port is fixed by the PC architecture; reading it
@@ -210,13 +270,26 @@ fn decode(sc: u8) -> Option<u8> {
         return None;
     }
     if extended {
-        // Only two extended keys produce a character worth having: keypad
-        // Enter and keypad `/`. Arrows, Home/End, Delete and the like are
-        // dropped rather than turned into escape sequences.
+        // Only two non-sequence extended keys produce a character worth
+        // having: keypad Enter and keypad `/`. Everything else in the table
+        // above goes out as its terminal escape sequence.
         return match code {
             SC_ENTER => Some(b'\r'),
             SC_KP_SLASH => Some(b'/'),
-            _ => None,
+            _ => {
+                if let Some(&(_, seq)) = EXTENDED.iter().find(|&&(c, _)| c == code) {
+                    // Alt+extended-key: the ESC prefix, then the sequence
+                    // (the "meta sends escape" rule, matching plain keys).
+                    if mods & MOD_ALT != 0 {
+                        q_push(&[0x1B]);
+                    }
+                    // first byte now, the rest through the queue
+                    q_push(&seq[1..]);
+                    Some(seq[0])
+                } else {
+                    None
+                }
+            }
         };
     }
     let idx = code as usize;
@@ -303,9 +376,12 @@ fn heartbeat() {
     }
 }
 
-/// Pull scancodes off the controller until one decodes to a byte, or the
-/// buffer is empty.
+/// Pull queued sequence bytes first, then scancodes, until one decodes to a
+/// byte, or everything is empty.
 fn pump() -> Option<u8> {
+    if let Some(b) = q_pop() {
+        return Some(b);
+    }
     heartbeat();
     for _ in 0..64 {
         let st = status();
@@ -332,6 +408,9 @@ pub fn getb() -> Option<u8> {
     if !present() {
         return None;
     }
+    if let Some(b) = q_pop() {
+        return Some(b);
+    }
     let pending = PENDING.swap(0, Ordering::Relaxed);
     if pending != 0 {
         return Some(pending as u8);
@@ -350,7 +429,10 @@ pub fn has_byte() -> bool {
     if !present() {
         return false;
     }
-    if PENDING.load(Ordering::Relaxed) != 0 || ALT_FOLLOW.load(Ordering::Relaxed) != 0 {
+    if PENDING.load(Ordering::Relaxed) != 0
+        || ALT_FOLLOW.load(Ordering::Relaxed) != 0
+        || Q_HEAD.load(Ordering::Relaxed) != Q_TAIL.load(Ordering::Relaxed)
+    {
         return true;
     }
     match pump() {
