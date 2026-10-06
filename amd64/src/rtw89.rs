@@ -277,7 +277,7 @@ pub fn init(cmdline: &str) {
                 LIVE_BAR.store(regs.0, Ordering::Release);
                 LIVE_PCI.store(pack(dev.addr), Ordering::Release);
                 let card = Card::new(regs, dma, ch12, file);
-                crate::rtw89_sta::adopt(card);
+                crate::rtw89_sta::adopt(card, has("wifibackoff"));
                 return;
             }
             if has("rtw89rx") {
@@ -538,11 +538,6 @@ impl Card {
     /// the chip's write pointer in 27:16.
     pub fn rx_idx(&mut self) -> u32 {
         self.regs.read32(rx::RXQ_IDX)
-    }
-
-    /// The RX filter register as it stands.
-    pub fn rx_filter(&mut self) -> u32 {
-        self.regs.read32(RX_FLTR_OPT)
     }
 
     /// `(DMAC_ERR_ISR, HAXI_IDCT)`: the DMA engine's error indications.

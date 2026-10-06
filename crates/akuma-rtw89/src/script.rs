@@ -235,6 +235,45 @@ impl Vars {
     }
 }
 
+/// `H2C_CL_MAC_ADDR_CAM_UPDATE` / `H2C_FUNC_MAC_ADDR_CAM_UPD`: the address
+/// CAM entry (`rtw89_cam_fill_addr_cam_info`).
+const ADDR_CAM: (u8, u8) = (6, 0);
+
+/// Recompute an address-CAM command's two address hashes from the addresses
+/// it now carries. A no-op for every other command.
+///
+/// The entry stores, beside the station address (SMA, bytes 24..30 counting
+/// the 8-byte H2C header) and the peer's (TMA, 30..36), one-byte hashes of
+/// each (`SMA_HASH` byte 18, `TMA_HASH` byte 19): the XOR of the address's
+/// bytes from the first one the entry's address mask covers
+/// (`rtw89_cam_addr_hash`). The hardware matches received frames' addresses
+/// through them, so a replay that fills in a different station address or
+/// BSSID and keeps the recording's hashes builds an entry no frame hits —
+/// the card then drops every frame addressed to the station (measured on
+/// ryzen 2026-10-06: the AP's authentication reply arrived only with the RX
+/// filter opened).
+fn fix_addr_cam(c: &mut [u8]) {
+    if c.len() < 36 {
+        return;
+    }
+    let h0 = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    if (((h0 >> 2) & 0x3f) as u8, ((h0 >> 8) & 0xff) as u8) != ADDR_CAM {
+        return;
+    }
+    // ADDR_MASK bits 5:0 and MASK_SEL bits 7:6 of byte 17 (`RTW89_SMA` 1,
+    // `RTW89_TMA` 2).
+    let mask = c[17] & 0x3f;
+    let start = if mask == 0 { 0 } else { mask.trailing_zeros() as usize };
+    let (sma_start, tma_start) = match c[17] >> 6 {
+        1 => (start, 0),
+        2 => (0, start),
+        _ => (0, 0),
+    };
+    let hash = |a: &[u8]| a.iter().fold(0u8, |h, &b| h ^ b);
+    c[18] = hash(&c[24 + sma_start..30]);
+    c[19] = hash(&c[30 + tma_start..36]);
+}
+
 /// Run `seq` against the card, counting into `st`. `vars` supplies what the
 /// stream left blank: the MAC for `0x40`, everything [`sub`] names for `0x41`.
 ///
@@ -317,6 +356,7 @@ pub fn run<B: Bus>(
                     let m = usize::from(mac_at);
                     c.get_mut(m..m + 6).ok_or(Error::Corrupt(at))?.copy_from_slice(&vars.mac);
                 }
+                fix_addr_cam(c);
                 h2c.send(bus, c).map_err(|SendFailed| Error::H2c(st.h2c))?;
                 st.h2c += 1;
             }
@@ -334,6 +374,7 @@ pub fn run<B: Bus>(
                         return Err(Error::Corrupt(subs_at));
                     }
                 }
+                fix_addr_cam(c);
                 h2c.send(bus, c).map_err(|SendFailed| Error::H2c(st.h2c))?;
                 st.h2c += 1;
             }
@@ -621,6 +662,103 @@ mod tests {
         assert_eq!(cam[46] & 0xc0, 2 << 6);
         assert_eq!(dctl_group[30] & 0xc0, 2 << 6);
         assert_eq!(dctl_pair[30] & 0xc0, 0);
+    }
+
+    /// Every command `seq` sends with `v` filled in, built as [`run`] builds
+    /// it (substitutions, then [`fix_addr_cam`]) — decoded straight from the
+    /// stream, since the recordings poll registers no fake bus can answer.
+    fn sent(seq: &[u8], v: &Vars) -> Vec<Vec<u8>> {
+        let mut rd = Rd { s: seq, at: 0 };
+        let mut out = Vec::new();
+        loop {
+            let op = rd.u8().unwrap();
+            if op == 0 {
+                return out;
+            }
+            let w = op & 3;
+            match op & 0xf0 {
+                0x00 | 0x10 => {
+                    rd.u32().unwrap();
+                    rd.val(w).unwrap();
+                }
+                0x20 => {
+                    rd.u32().unwrap();
+                    rd.val(w).unwrap();
+                    rd.val(w).unwrap();
+                }
+                0x30 => {
+                    rd.u32().unwrap();
+                }
+                0x40 if op == 0x40 => {
+                    let len = usize::from(rd.u16().unwrap());
+                    let mac_at = rd.u16().unwrap();
+                    let mut c = rd.take(len).unwrap().to_vec();
+                    if mac_at != 0xffff {
+                        let m = usize::from(mac_at);
+                        c[m..m + 6].copy_from_slice(&v.mac);
+                    }
+                    fix_addr_cam(&mut c);
+                    out.push(c);
+                }
+                0x40 => {
+                    let len = usize::from(rd.u16().unwrap());
+                    let n = usize::from(rd.u8().unwrap());
+                    let subs = rd.take(n * 3).unwrap().to_vec();
+                    let mut c = rd.take(len).unwrap().to_vec();
+                    for t in subs.as_chunks::<3>().0 {
+                        assert!(v.fill(&mut c, t[0], usize::from(u16::from_le_bytes([t[1], t[2]]))));
+                    }
+                    fix_addr_cam(&mut c);
+                    out.push(c);
+                }
+                _ => panic!("bad op {op:#x}"),
+            }
+        }
+    }
+
+    /// The address hashes follow the addresses: an address-CAM command whose
+    /// station address and BSSID the runtime filled in carries the hashes of
+    /// *those*, not the recording's — in every join segment that has one.
+    #[test]
+    fn address_cam_hashes_follow_the_filled_in_addresses() {
+        let v = Vars { mac: [0x02, 0x41, 0x4b, 0x55, 0x4d, 0x41], bssid: [0xa4, 0x91, 0xb1, 1, 2, 3], aid: 5, ..Vars::default() };
+        let mut seen = 0;
+        for seq in [JOIN1, JOIN2, JOIN3, JOIN4] {
+            for c in sent(seq, &v).iter().filter(|c| c.len() >= 36) {
+                let h0 = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                if ((h0 >> 2) & 0x3f, (h0 >> 8) & 0xff) != (6, 0) {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(&c[24..30], &v.mac, "station address filled in");
+                let x = |a: &[u8]| a.iter().fold(0u8, |h, &b| h ^ b);
+                // These entries have no address mask: the hash covers all six bytes.
+                assert_eq!(c[17] & 0x3f, 0);
+                assert_eq!(c[18], x(&v.mac));
+                assert_eq!(c[19], x(&c[30..36]));
+            }
+        }
+        assert!(seen >= 3, "only {seen} address-CAM commands");
+    }
+
+    /// A masked entry hashes from the first masked byte, of the address the
+    /// mask selects only.
+    #[test]
+    fn address_cam_hash_honours_the_mask() {
+        let mut c = [0u8; 40];
+        c[0..4].copy_from_slice(&(6u32 << 2).to_le_bytes()); // class 6, func 0
+        c[24..30].copy_from_slice(&[1, 2, 4, 8, 16, 32]);
+        c[30..36].copy_from_slice(&[64, 128, 3, 5, 6, 9]);
+        c[17] = (1 << 6) | 0b0000_0100; // MASK_SEL = SMA, mask from byte 2
+        fix_addr_cam(&mut c);
+        assert_eq!(c[18], 4 ^ 8 ^ 16 ^ 32);
+        assert_eq!(c[19], 64 ^ 128 ^ 3 ^ 5 ^ 6 ^ 9);
+        // Not an address-CAM command: untouched.
+        let mut d = c;
+        d[0..4].copy_from_slice(&((6u32 << 2) | (1 << 8)).to_le_bytes());
+        d[18] = 0xee;
+        fix_addr_cam(&mut d);
+        assert_eq!(d[18], 0xee);
     }
 
     /// The bodies of J4's two security-CAM `0x41` commands.

@@ -62,13 +62,34 @@ const MAC: [u8; 6] = [0x02, 0x41, 0x4b, 0x55, 0x4d, 0x41];
 const CHANNEL: u16 = 1;
 /// How long a scan listens: ~24 beacon intervals.
 const SCAN_MS: u64 = 2500;
-/// One authentication or association attempt's wait for the answer.
-const MGMT_REPLY_MS: u64 = 1000;
-const MGMT_TRIES: u32 = 5;
+/// One authentication or association frame's wait for the answer, and how
+/// many times each is sent. Access points answer in milliseconds; on a busy
+/// channel either frame or its answer is lost often enough that one try is
+/// not a join.
+const MGMT_REPLY_MS: u64 = 600;
+const MGMT_TRIES: u32 = 6;
 /// The 4-way handshake, from the association response to message 4. Access
 /// points send message 1 within milliseconds and retry each message about
-/// once a second.
-const HANDSHAKE_MS: u64 = 8000;
+/// once a second, a handful of times.
+const HANDSHAKE_MS: u64 = 10_000;
+/// Whole joins tried per `connect` before it fails: each from a power-cycled
+/// card. Only timeouts are retried — a wrong key or a refusal would only be
+/// answered the same way again.
+const JOIN_ATTEMPTS: u32 = 3;
+/// Rejoin after a lost link or a join that timed out: retried after
+/// [`REJOIN_FIRST_MS`], every time. The link drops often on a crowded
+/// channel, so the station never gives up on a network it was told to join —
+/// only `disconnect` (or a wrong key) ends that. With `wifibackoff` on the
+/// command line ([`BACKOFF`]) the wait doubles after each failure, to
+/// [`REJOIN_MAX_MS`]; off by default.
+const REJOIN_FIRST_MS: u64 = 1000;
+const REJOIN_MAX_MS: u64 = 30_000;
+static BACKOFF: AtomicBool = AtomicBool::new(false);
+/// The firmware's beacon-filter report (`RTW89_MAC_C2H_FUNC_BCNFLTR_RPT`):
+/// category MAC (1), class offload (1), function 0xd. Type 0 in word 2 bits
+/// 9:8 is beacon loss — the firmware stopped hearing the access point; the
+/// report also carries the averaged beacon RSSI (bits 23:16, minus 110 dBm).
+const C2H_BCNFLTR: (u8, u8, u8) = (1, 1, 0x0d);
 /// How often an idle daemon looks at the RX ring and its request.
 const IDLE_MS: u64 = 50;
 /// A join's waits poll the RX ring this often.
@@ -108,7 +129,8 @@ fn put_oui(b: &Bssid) {
 
 /// Take the card `rtw89::init` kept up, and become `/dev/wifi0`'s backend.
 /// The daemon ([`spawn`]) starts once the scheduler runs.
-pub fn adopt(card: Card) {
+pub fn adopt(card: Card, backoff: bool) {
+    BACKOFF.store(backoff, Ordering::Relaxed);
     *CARD.lock() = Some(card);
     if let Some(iface) = IfName::new(b"wlan0") {
         let mut s = Status::no_radio(iface);
@@ -187,7 +209,15 @@ fn park_forever() -> ! {
 
 extern "C" fn daemon() -> ! {
     let Some(mut card) = CARD.lock().take() else { park_forever() };
-    let mut st = Station { vars: script::Vars { mac: MAC, ..script::Vars::default() }, ready: false, dirty: false, peer: None };
+    let mut st = Station {
+        vars: script::Vars { mac: MAC, ..script::Vars::default() },
+        ready: false,
+        dirty: false,
+        peer: None,
+        wanted: None,
+        retry_at: 0,
+        backoff_ms: REJOIN_FIRST_MS,
+    };
     st.start(&mut card, false);
     loop {
         if STOP.load(Ordering::Acquire) {
@@ -197,21 +227,18 @@ extern "C" fn daemon() -> ! {
         match req {
             Some(Command::Scan { .. }) => st.scan(&mut card),
             Some(Command::Connect { ssid, psk, bssid, .. }) => {
-                let outcome = st.join(&mut card, &ssid, psk.as_ref(), bssid);
-                if let Err(e) = outcome {
-                    serial::puts("[rtw] join failed: ");
-                    serial::puts(e.name());
-                    serial::puts("\n");
-                    with_status(|s| {
-                        s.link = Link::Failed;
-                        s.error = e;
-                        s.bssid = [0; 6];
-                        s.chan = 0;
-                    });
-                }
+                st.wanted = Some(Wanted { ssid, psk, bssid });
+                st.backoff_ms = REJOIN_FIRST_MS;
+                st.join_wanted(&mut card);
             }
             Some(Command::Disconnect { .. }) => st.disconnect(),
-            None => st.idle(&mut card),
+            None => {
+                st.idle(&mut card);
+                if st.peer.is_none() && st.wanted.is_some() && now_us() >= st.retry_at {
+                    say("rejoining");
+                    st.join_wanted(&mut card);
+                }
+            }
         }
         nap(IDLE_MS);
     }
@@ -225,8 +252,21 @@ struct Peer {
     seq: u16,
 }
 
+/// The network the station was told to join, kept until `disconnect`: what a
+/// lost link rejoins.
+#[derive(Clone, Copy)]
+struct Wanted {
+    ssid: Ssid,
+    psk: Option<[u8; PSK_LEN]>,
+    bssid: Option<Bssid>,
+}
+
 struct Station {
     vars: script::Vars,
+    wanted: Option<Wanted>,
+    /// When the next rejoin may start (`now_us` clock), and the wait after it.
+    retry_at: u64,
+    backoff_ms: u64,
     /// `JOIN1` ran on the card as it stands.
     ready: bool,
     /// The card holds state from a join attempt; restart it before the next.
@@ -252,9 +292,16 @@ fn security_of(b: &beacon::Bss<'_>) -> Security {
 
 /// Every received 802.11 frame that arrived intact, with its FCS.
 fn frames(card: &mut Card, mut f: impl FnMut(&[u8])) {
+    frames_a1(card, |b, _| f(b));
+}
+
+/// [`frames`], with whether the card's own address match hit for each (the
+/// RX descriptor's `A1_MATCH`): with the filter open the station matches
+/// addresses itself, and this says whether the card would have.
+fn frames_a1(card: &mut Card, mut f: impl FnMut(&[u8], bool)) {
     card.poll_rx(|p: &rx::Packet<'_>| {
         if p.desc.pkt_type == rx::kind::WIFI && !p.desc.crc32_err {
-            f(p.body);
+            f(p.body, p.desc.a1_match);
         }
     });
 }
@@ -358,6 +405,51 @@ impl Station {
         look()
     }
 
+    /// Join [`Station::wanted`]; on a failure worth retrying, schedule the
+    /// next try, on one that is not (wrong key, refused), forget the network.
+    fn join_wanted(&mut self, card: &mut Card) {
+        let Some(w) = self.wanted else { return };
+        match self.join(card, &w.ssid, w.psk.as_ref(), w.bssid) {
+            Ok(()) => self.backoff_ms = REJOIN_FIRST_MS,
+            Err(e) => {
+                serial::puts("[rtw] join failed: ");
+                serial::puts(e.name());
+                with_status(|s| {
+                    s.link = Link::Failed;
+                    s.error = e;
+                    s.bssid = [0; 6];
+                    s.chan = 0;
+                });
+                if matches!(e, JoinError::Timeout | JoinError::NotFound) {
+                    serial::puts("; retrying in ");
+                    serial::put_dec(self.backoff_ms / 1000);
+                    serial::puts(" s\n");
+                    self.retry_at = now_us() + self.backoff_ms * 1000;
+                    if BACKOFF.load(Ordering::Relaxed) {
+                        self.backoff_ms = (self.backoff_ms * 2).min(REJOIN_MAX_MS);
+                    }
+                } else {
+                    serial::puts("; not retrying\n");
+                    self.wanted = None;
+                }
+            }
+        }
+    }
+
+    /// The access point is gone (sent us away, or the firmware stopped
+    /// hearing its beacons): drop the association and rejoin at once — the
+    /// card is restarted first, since it still holds the old peer.
+    fn link_lost(&mut self) {
+        self.peer = None;
+        self.dirty = true;
+        self.retry_at = now_us();
+        self.backoff_ms = REJOIN_FIRST_MS;
+        with_status(|s| {
+            s.link = if self.wanted.is_some() { Link::Associating } else { Link::Down };
+            s.bssid = [0; 6];
+        });
+    }
+
     fn join(&mut self, card: &mut Card, ssid: &Ssid, psk: Option<&[u8; PSK_LEN]>, bssid: Option<Bssid>) -> Joined {
         let bss = self.find(card, ssid, bssid).ok_or(JoinError::NotFound)?;
         let psk = match (bss.security, psk) {
@@ -381,39 +473,47 @@ impl Station {
             s.chan = bss.chan;
             s.security = bss.security;
         });
+        let mut last = JoinError::Timeout;
+        for attempt in 1..=JOIN_ATTEMPTS {
+            if STOP.load(Ordering::Acquire) {
+                break;
+            }
+            say_dec("join attempt", u64::from(attempt));
+            // The filter stays open for the whole join: the station matches
+            // addresses itself, so a card whose address CAM is wrong still
+            // joins — and every reply logs whether the card's match hit.
+            card.open_filter();
+            let r = self.attempt(card, ssid, psk, &bss);
+            card.close_filter();
+            match r {
+                Ok(()) => return Ok(()),
+                Err(JoinError::Timeout) => last = JoinError::Timeout,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
 
+    /// One join from a clean card: `JOIN2`, auth, assoc, `JOIN3`, the
+    /// handshake, `JOIN4`.
+    fn attempt(&mut self, card: &mut Card, ssid: &Ssid, psk: &[u8; PSK_LEN], bss: &Bss) -> Joined {
         if (self.dirty || !self.ready) && !self.start(card, true) {
             return Err(JoinError::Timeout);
         }
         self.dirty = true;
         self.vars.bssid = bss.bssid;
         self.vars.aid = 0;
-        rx_probe(card, "before join2");
         if !card.replay("join2 (prepare)", script::JOIN2, &self.vars) {
             return Err(JoinError::Timeout);
         }
-        rx_probe(card, "after join2");
 
         // Authentication: open system, transaction 1, answered by 2.
         let mut buf = [0u8; 512];
-        let mut answer: Option<u16> = None;
-        for _ in 0..MGMT_TRIES {
-            let len = sta::auth_request(&mut buf, &bss.bssid, &MAC).ok_or(JoinError::Timeout)?;
-            send(card, TX_MGMT, &buf[..len], tx::Desc::mgmt(len as u16, 0))?;
-            let before = card.tx_idx(TX_MGMT);
-            let mut tally = Tally::default();
-            answer = wait_for(card, MGMT_REPLY_MS, |f| {
-                tally.count(f, &bss.bssid);
-                Auth::parse(f)
-                    .filter(|a| a.from == bss.bssid && a.to == MAC && a.transaction == 2)
-                    .map(|a| a.status)
-            });
-            tx_report(card, "auth", before, &tally);
-            if answer.is_some() {
-                break;
-            }
-        }
-        match answer {
+        let len = sta::auth_request(&mut buf, &bss.bssid, &MAC).ok_or(JoinError::Timeout)?;
+        let auth = mgmt_exchange(card, "auth", &buf[..len], &bss.bssid, |f| {
+            Auth::parse(f).filter(|a| a.from == bss.bssid && a.to == MAC && a.transaction == 2).map(|a| a.status)
+        })?;
+        match auth {
             None => {
                 say("auth: no answer");
                 return Err(JoinError::Timeout);
@@ -426,17 +526,12 @@ impl Station {
         }
 
         // Association.
-        let mut resp: Option<AssocResp> = None;
-        for _ in 0..MGMT_TRIES {
-            let len = sta::assoc_request(&mut buf, &bss.bssid, &MAC, ssid.as_bytes(), &sta::ASSOC_TAIL_2G)
-                .ok_or(JoinError::Timeout)?;
-            send(card, TX_MGMT, &buf[..len], tx::Desc::mgmt(len as u16, 0))?;
-            resp = wait_for(card, MGMT_REPLY_MS, |f| AssocResp::parse(f).filter(|r| r.from == bss.bssid && r.to == MAC));
-            if resp.is_some() {
-                break;
-            }
-        }
-        let resp = resp.ok_or_else(|| {
+        let len = sta::assoc_request(&mut buf, &bss.bssid, &MAC, ssid.as_bytes(), &sta::ASSOC_TAIL_2G)
+            .ok_or(JoinError::Timeout)?;
+        let resp = mgmt_exchange(card, "assoc", &buf[..len], &bss.bssid, |f| {
+            AssocResp::parse(f).filter(|r| r.from == bss.bssid && r.to == MAC)
+        })?
+        .ok_or_else(|| {
             say("assoc: no answer");
             JoinError::Timeout
         })?;
@@ -464,9 +559,9 @@ impl Station {
                 return Err(JoinError::Timeout);
             }
             let mut out = [0u8; eapol::HDR_LEN + eapol::MAX_KEY_DATA];
-            let mut step: Option<Result<Action, eapol::Drop>> = None;
+            let mut step: Option<(Result<Action, eapol::Drop>, bool)> = None;
             let mut gone: Option<u16> = None;
-            frames(card, |f| {
+            frames_a1(card, |f, a1| {
                 if step.is_some() {
                     return; // one message per lap; the AP retransmits the rest
                 }
@@ -475,26 +570,37 @@ impl Station {
                 } else if let Some(d) = Data::parse(f, true)
                     .filter(|d| d.bssid == peer.bssid && d.ethertype == sta::ETHERTYPE_EAPOL)
                 {
-                    step = Some(peer.supplicant.handle(d.payload, &mut out));
+                    step = Some((peer.supplicant.handle(d.payload, &mut out), a1));
                 }
             });
             if let Some(reason) = gone {
-                say_dec("deauthenticated during the handshake, reason", u64::from(reason));
+                say_dec("sent away during the handshake, reason", u64::from(reason));
                 return Err(if mic_failures > 0 { JoinError::AuthFailed } else { JoinError::Timeout });
             }
+            let Some((step, a1)) = step else {
+                nap(POLL_MS);
+                continue;
+            };
             match step {
-                None => nap(POLL_MS),
-                Some(Ok(Action::Send(len))) => {
+                Ok(Action::Send(len)) => {
                     send_eapol(card, &mut peer, &out[..len])?;
-                    say("eapol: message 1 answered");
+                    say(if a1 { "eapol: message 1 answered (a1 hit)" } else { "eapol: message 1 answered (a1 MISS)" });
                 }
-                Some(Ok(Action::Complete { len, tk, gtk })) => {
+                Ok(Action::Complete { len, tk, gtk }) => {
+                    let seen = card.rpq_seen;
                     send_eapol(card, &mut peer, &out[..len])?;
+                    // Message 4 goes out in the clear, so it has to be on the
+                    // air before `JOIN4` installs the keys: queued but not yet
+                    // sent, the chip would send it under the new pairwise key
+                    // or not at all, and the access point resends message 3
+                    // (measured on ryzen 2026-10-06, boot 16: twice).
+                    if !wait_released(card, seen, 200) {
+                        say("eapol: message 4 not released within 200 ms; installing keys anyway");
+                    }
                     self.vars.tk = tk;
                     self.vars.gtk = gtk.key;
                     self.vars.gtk_idx = gtk.idx;
-                    let ok = card.replay("join4 (keys)", script::JOIN4, &self.vars);
-                    if !ok {
+                    if !card.replay("join4 (keys)", script::JOIN4, &self.vars) {
                         return Err(JoinError::Timeout);
                     }
                     say_dec("eapol: message 3 answered, keys installed, group key id", u64::from(gtk.idx));
@@ -505,12 +611,12 @@ impl Station {
                     });
                     return Ok(());
                 }
-                Some(Ok(Action::Rekey { .. })) => say("eapol: group message before the pairwise keys; ignored"),
-                Some(Err(eapol::Drop::Mic)) => {
+                Ok(Action::Rekey { .. }) => say("eapol: group message before the pairwise keys; ignored"),
+                Err(eapol::Drop::Mic) => {
                     mic_failures += 1;
                     say("eapol: MIC did not verify (wrong key?)");
                 }
-                Some(Err(e)) => say_dec("eapol: dropped, reason", e as u64),
+                Err(e) => say_dec("eapol: dropped, reason", e as u64),
             }
         }
         say("eapol: handshake timed out");
@@ -521,6 +627,7 @@ impl Station {
     /// built yet): the access point times the station out. The card keeps the
     /// peer until the next join restarts it.
     fn disconnect(&mut self) {
+        self.wanted = None;
         if self.peer.take().is_some() {
             say("disconnected");
         }
@@ -548,7 +655,21 @@ impl Station {
         let mut out = [0u8; eapol::HDR_LEN + eapol::MAX_KEY_DATA];
         let mut step: Option<Result<Action, eapol::Drop>> = None;
         let mut gone: Option<u16> = None;
-        frames(card, |f| {
+        let mut beacon_lost = false;
+        let mut rssi: Option<i8> = None;
+        card.poll_rx(|p: &rx::Packet<'_>| {
+            if p.desc.pkt_type == rx::kind::C2H {
+                match bcnfltr(p.body) {
+                    Some((0, _)) => beacon_lost = true,
+                    Some((_, dbm)) => rssi = Some(dbm),
+                    None => {}
+                }
+                return;
+            }
+            if p.desc.pkt_type != rx::kind::WIFI || p.desc.crc32_err {
+                return;
+            }
+            let f = p.body;
             if let Some(g) = Goodbye::parse(f).filter(|g| g.from == peer.bssid && g.to == MAC) {
                 gone = Some(g.reason);
             } else if step.is_none()
@@ -558,14 +679,25 @@ impl Station {
                 step = Some(peer.supplicant.handle(d.payload, &mut out));
             }
         });
+        if let Some(dbm) = rssi {
+            with_status(|s| s.signal = dbm);
+        }
         if let Some(reason) = gone {
-            say_dec("deauthenticated, reason", u64::from(reason));
-            self.peer = None;
-            with_status(|s| {
-                s.link = Link::Down;
-                s.bssid = [0; 6];
-            });
+            say_dec("sent away by the access point, reason", u64::from(reason));
+            self.link_lost();
             return;
+        }
+        if beacon_lost {
+            say("beacon loss: the firmware stopped hearing the access point");
+            self.link_lost();
+            return;
+        }
+        if let Some(Ok(Action::Complete { len, .. })) = step {
+            // Message 3 again: the access point did not get message 4. The
+            // keys are the ones already installed; only the answer is resent.
+            if send_eapol(card, peer, &out[..len]).is_ok() {
+                say("eapol: message 3 retransmitted; message 4 sent again");
+            }
         }
         if let Some(Ok(Action::Rekey { len, gtk })) = step {
             // The group key is replayed with `JOIN4` whole — the pairwise key
@@ -578,6 +710,19 @@ impl Station {
             }
         }
     }
+}
+
+/// A firmware event, if it is the beacon filter's report: `(type, rssi dBm)`
+/// (type 0 = beacon loss, 1 = RSSI threshold crossed, 2 = notify).
+fn bcnfltr(c2h: &[u8]) -> Option<(u8, i8)> {
+    let w = |i: usize| c2h.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let w0 = w(0)?;
+    if ((w0 & 3) as u8, ((w0 >> 2) & 0x3f) as u8, ((w0 >> 8) & 0xff) as u8) != C2H_BCNFLTR {
+        return None;
+    }
+    let w2 = w(2)?;
+    let dbm = (((w2 >> 16) & 0xff) as i32 - 110).clamp(-128, 127) as i8;
+    Some((((w2 >> 8) & 3) as u8, dbm))
 }
 
 fn send(card: &mut Card, which: usize, frame: &[u8], d: tx::Desc) -> Result<(), JoinError> {
@@ -605,6 +750,67 @@ fn send_eapol(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinE
     send(card, TX_EAPOL, &f[..len], tx::Desc::eapol(len as u16, 0))
 }
 
+/// Wait up to `ms` for a release report past `seen`: the chip has finished
+/// with a frame queued since.
+fn wait_released(card: &mut Card, seen: u32, ms: u64) -> bool {
+    let deadline = now_us() + ms * 1000;
+    while card.rpq_seen == seen {
+        if now_us() >= deadline {
+            return false;
+        }
+        // Received frames are dropped here; the access point resends what
+        // matters.
+        frames(card, |_| {});
+        nap(1);
+    }
+    true
+}
+
+/// Send a management frame and wait for its answer, up to [`MGMT_TRIES`]
+/// times. Logs each try: whether the chip took the frame, what it said became
+/// of it, what was heard meanwhile, and whether the answer hit the card's own
+/// address match.
+fn mgmt_exchange<T>(
+    card: &mut Card,
+    what: &str,
+    frame: &[u8],
+    bssid: &Bssid,
+    mut pick: impl FnMut(&[u8]) -> Option<T>,
+) -> Result<Option<T>, JoinError> {
+    for _ in 0..MGMT_TRIES {
+        if STOP.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let seen = card.rpq_seen;
+        send(card, TX_MGMT, frame, tx::Desc::mgmt(frame.len() as u16, 0))?;
+        let before = card.tx_idx(TX_MGMT);
+        let mut tally = Tally::default();
+        let mut hit = None;
+        let deadline = now_us() + MGMT_REPLY_MS * 1000;
+        let got = loop {
+            let mut got = None;
+            frames_a1(card, |f, a1| {
+                tally.count(f, bssid);
+                if got.is_none() {
+                    got = pick(f);
+                    if got.is_some() {
+                        hit = Some(a1);
+                    }
+                }
+            });
+            if got.is_some() || now_us() >= deadline || STOP.load(Ordering::Acquire) {
+                break got;
+            }
+            nap(POLL_MS);
+        };
+        tx_report(card, what, before, seen, &tally, hit);
+        if got.is_some() {
+            return Ok(got);
+        }
+    }
+    Ok(None)
+}
+
 /// What was heard while waiting for an answer: everything, and what came
 /// from the access point (and of that, management frames addressed to us).
 #[derive(Default)]
@@ -612,13 +818,25 @@ struct Tally {
     frames: u32,
     from_ap: u32,
     mgmt_to_us: u32,
+    /// Frames with us as receiver, whoever sent them.
+    to_us: u32,
+    /// The access point's frames by their first frame-control byte (type and
+    /// subtype; no addresses): up to 8 kinds, with counts.
+    ap_kinds: [(u8, u16); 8],
 }
 
 impl Tally {
     fn count(&mut self, f: &[u8], bssid: &Bssid) {
         self.frames += 1;
+        if f.len() >= 10 && f[4..10] == MAC {
+            self.to_us += 1;
+        }
         if f.len() >= 16 && f[10..16] == *bssid {
             self.from_ap += 1;
+            if let Some(k) = self.ap_kinds.iter_mut().find(|k| k.1 == 0 || k.0 == f[0]) {
+                k.0 = f[0];
+                k.1 += 1;
+            }
             if f[0] & 0x0c == 0 && f[4..10] == MAC {
                 self.mgmt_to_us += 1;
             }
@@ -626,51 +844,9 @@ impl Tally {
     }
 }
 
-/// Diagnostics: is RX alive here? 300 ms as the filter stands, then 300 ms
-/// with it open, each as `entries (wifi/crc/other types/bad)`.
-fn rx_probe(card: &mut Card, at: &str) {
-    serial::puts("[rtw] rx probe ");
-    serial::puts(at);
-    serial::puts(": filter 0x");
-    let f = card.rx_filter();
-    serial::put_hex(u64::from(f));
-    serial::puts(" idx 0x");
-    let i = card.rx_idx();
-    serial::put_hex(u64::from(i));
-    for open in [false, true] {
-        if open {
-            card.open_filter();
-        }
-        let (w0, c0, b0) = (card.rx_types[usize::from(rx::kind::WIFI)], card.rx_crc, card.rx_bad);
-        let all0: u32 = card.rx_types.iter().sum();
-        let deadline = now_us() + 300_000;
-        while now_us() < deadline {
-            card.poll_rx(|_| {});
-            nap(POLL_MS);
-        }
-        if open {
-            card.close_filter();
-        }
-        let all: u32 = card.rx_types.iter().sum::<u32>() - all0;
-        let w = card.rx_types[usize::from(rx::kind::WIFI)] - w0;
-        serial::puts(if open { "; open " } else { "; as is " });
-        serial::put_dec(u64::from(all + card.rx_bad - b0));
-        serial::puts(" (wifi ");
-        serial::put_dec(u64::from(w));
-        serial::puts(", crc ");
-        serial::put_dec(u64::from(card.rx_crc - c0));
-        serial::puts(", other ");
-        serial::put_dec(u64::from(all - w));
-        serial::puts(", bad ");
-        serial::put_dec(u64::from(card.rx_bad - b0));
-        serial::puts(")");
-    }
-    serial::puts("\n");
-}
-
 /// One line per sent frame: did the chip fetch it (its read index moved), what
 /// the release reports said, any DMA error, and what was heard meanwhile.
-fn tx_report(card: &mut Card, what: &str, before: u32, t: &Tally) {
+fn tx_report(card: &mut Card, what: &str, before: u32, seen: u32, t: &Tally, hit: Option<bool>) {
     let after = card.tx_idx(TX_MGMT);
     let (isr, idct) = card.dma_errors();
     serial::puts("[rtw] ");
@@ -679,13 +855,20 @@ fn tx_report(card: &mut Card, what: &str, before: u32, t: &Tally) {
     serial::put_hex(u64::from(before));
     serial::puts(" -> 0x");
     serial::put_hex(u64::from(after));
-    serial::puts(", release reports ");
-    serial::put_dec(u64::from(card.rpq_seen));
-    serial::puts(" last");
-    for b in &card.rpq_last[..24] {
-        serial::puts(" ");
-        serial::put_hexn(u64::from(*b), 2);
-    }
+    // The release report's record (`rtw89_pci_rpp_fmt`) at byte 20 of the
+    // buffer: TX status in bits 15:13 — 0 done (acknowledged), 1 retry
+    // limit, 2 lifetime, 3 dropped.
+    serial::puts(", release reports +");
+    serial::put_dec(u64::from(card.rpq_seen - seen));
+    let rpp = u32::from_le_bytes([card.rpq_last[20], card.rpq_last[21], card.rpq_last[22], card.rpq_last[23]]);
+    serial::puts(" status ");
+    serial::puts(match (rpp >> 13) & 7 {
+        0 => "done",
+        1 => "retry-limit",
+        2 => "lifetime",
+        3 => "dropped",
+        _ => "?",
+    });
     serial::puts(", dmac_err 0x");
     serial::put_hex(u64::from(isr));
     serial::puts(" idct 0x");
@@ -705,22 +888,19 @@ fn tx_report(card: &mut Card, what: &str, before: u32, t: &Tally) {
     serial::put_dec(u64::from(t.from_ap));
     serial::puts(", mgmt to us ");
     serial::put_dec(u64::from(t.mgmt_to_us));
-    serial::puts("\n");
-}
-
-/// Poll the RX ring for up to `ms` until `pick` recognises a frame.
-fn wait_for<T>(card: &mut Card, ms: u64, mut pick: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
-    let deadline = now_us() + ms * 1000;
-    loop {
-        let mut got = None;
-        frames(card, |f| {
-            if got.is_none() {
-                got = pick(f);
-            }
-        });
-        if got.is_some() || now_us() >= deadline || STOP.load(Ordering::Acquire) {
-            return got;
-        }
-        nap(POLL_MS);
+    serial::puts(", to us ");
+    serial::put_dec(u64::from(t.to_us));
+    serial::puts(match hit {
+        None => "; no answer",
+        Some(true) => "; answer a1 hit",
+        Some(false) => "; answer a1 MISS",
+    });
+    serial::puts("; ap fc");
+    for &(fc, n) in t.ap_kinds.iter().filter(|k| k.1 > 0) {
+        serial::puts(" ");
+        serial::put_hexn(u64::from(fc), 2);
+        serial::puts("x");
+        serial::put_dec(u64::from(n));
     }
+    serial::puts("\n");
 }

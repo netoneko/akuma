@@ -105,17 +105,19 @@ fn scan() -> Result<Status, String> {
     Err(String::from("scan did not complete within 10 s"))
 }
 
-/// Join and wait (up to ~20 s) until connected or failed.
+/// Join and wait (up to ~90 s) until connected or failed. A real radio retries
+/// a join that times out (the rtw89 station: three whole attempts, each up to
+/// ~25 s on a bad channel), so the wait covers all of them.
 fn join(n: &Network) -> Result<Status, String> {
     send(&Command::Connect { iface: iface(), ssid: n.ssid, psk: n.psk, bssid: n.bssid })?;
-    for _ in 0..200 {
+    for _ in 0..900 {
         let s = read_status()?;
         if s.ssid == n.ssid && matches!(s.link, Link::Connected | Link::Failed) {
             return Ok(s);
         }
         sleep_ms(100);
     }
-    Err(String::from("no answer from the driver within 20 s"))
+    Err(String::from("no answer from the driver within 90 s"))
 }
 
 // ---------------------------------------------------------------- /etc/wifi

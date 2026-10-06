@@ -32,8 +32,8 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | wifi W0 (§5.1) | **done**: mmiotrace of probe and of interface-up through `fw ready`, `overlays/ryzen/w0-trace.sh` |
 | wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
 | wifi W2 (§5.3) | **done**: the recorded start replayed, 17 networks' beacons on channel 1 (menu entry 9) |
-| wifi W3 (§5.4) | **in progress**: station daemon behind `/dev/wifi0` (`rtw89wifi`, menu entry 10) scans and finds the home network, sends auth (the chip reports it done); no frame received after `JOIN2` |
-| wifi W4–W5 (§5) | not started (code for W4 is written: `akuma-wpa`, `JOIN4`) |
+| wifi W3/W4 (§5.4) | **done**: `rtw89wifi` (menu entry 10) scans, authenticates, associates and completes the WPA2 4-way handshake in the kernel; keys installed, link held (boot 16) |
+| wifi W5 (§5) | next: the data path — DHCP over the joined link |
 
 ## Verdict
 
@@ -326,9 +326,13 @@ Open: the home network's beacons arrived 17 times in 12 s against ~117 sent
 DPK — `rtw8852c_rfk_channel`) when it associates, which the "up" recording
 does not contain. That is W3's first recording.
 
-### 5.4 W3 results, 2026-10-06 evening: the station, and where the join stops
+### 5.4 W3/W4 results, 2026-10-06 evening: the station joins
 
-**The station runs on the metal; authentication gets no answer yet.** Token
+**Akuma joined the home network with WPA2-PSK, the handshake in the kernel
+(boot 16).** Authentication, association (AID 3), message 1 → 2, message
+3 → 4, both keys installed (`JOIN4`, group key id 2), and the link still
+connected 20 s later. The way there is below; the cause that took four boots
+to find was the address CAM's **address hashes**. Token
 `rtw89wifi` (ryzen menu entry 10, herd service `wifijoin`) keeps the card up
 after the firmware download and hands it to `amd64/src/rtw89_sta.rs`, the
 `/dev/wifi0` backend: a daemon that replays the recorded join
@@ -370,13 +374,40 @@ Metal runs (all reached Pop again by themselves, ~93 s outside Linux):
 | 12 | `JOIN1` 18 337 ops in 36.7 ms, 0 poll timeouts (85 checked reads differ: the `0xac` coex scoreboard and calibration readouts, as in W2). Scan: 110 beacons, 22 networks in 2.5 s, **the home network among them** (`ssid#2ce1df73`, ch 1, wpa2-psk). `JOIN2` 4072 ops, 0 timeouts. Auth ×3: no answer → `error=timeout` |
 | 13 | with TX diagnostics: CH8's read index moves 0→1→2→3 with each auth frame, **one release report per frame, status `TX_DONE`** (qsel 0x12, WD seq 0/1/2), no DMA error. A unicast management frame reports done only once acknowledged, so the AP very likely ACKed it. But in the 1.2 s of waiting **the host received nothing at all**, not even the AP's beacons |
 
-So the open question is the receive side after `JOIN2`: either RX stops
-delivering, or frames arrive in a shape the station drops without counting.
-`JOIN2` is almost all baseband/RF work (~1600 writes in `0x10000..0x1f000`,
-five class-16 RF-calibration H2Cs); W2 already saw the home network's beacons
-arrive at a fraction of their rate before any join calibration. Boot 14 adds
-RX counters (every RXQ entry by type, parse failures, FCS errors) and a
-300 ms liveness probe before and after `JOIN2`, filter as-is then open.
+| 14 | RX counters and a 300 ms probe before/after `JOIN2`: RX is alive after `JOIN2` (the PHY keeps reporting PPDUs, 802.11 frames pass with the filter open), but with the station filter **no frame addressed to us** is ever delivered |
+| 15 | auth waits with the RX filter opened as for a scan: **the AP's auth reply arrives and is accepted**; the association reply (filter normal again) does not. The card's own address match was dropping everything sent to the station |
+| 16 | address-CAM hashes recomputed (below), the filter left open for the whole join with the station matching addresses itself, whole-join retries. Auth try 1 unanswered (a busy channel: 111 frames in 600 ms), try 2 accepted with **`A1_MATCH` set** — the card's match works now; assoc accepted; handshake complete; **connected** |
+
+**The root cause: the address hashes.** An address-CAM entry
+(`rtw89_cam_fill_addr_cam_info`) carries, beside the station address (SMA)
+and the peer's (TMA), a one-byte hash of each — the XOR of the address's
+bytes (`rtw89_cam_addr_hash`), bytes 18 and 19 of the H2C. The hardware
+matches received frames through them. The join segments substitute this
+station's address and the AP's BSSID into the recorded commands but kept the
+recording's hashes, of the card's real MAC and the recording's AP: an entry no
+frame could hit. `script::fix_addr_cam` now recomputes both hashes for every
+address-CAM command (class 6, func 0) right before it is sent, honouring the
+entry's address mask; a host test checks every such command in all four
+segments. The same trap waits for any recorded H2C that carries a value
+*derived* from a substituted one: a substitution is only complete once every
+derived field follows it.
+
+**Resilience**, since this channel loses frames routinely: auth and assoc
+are each sent up to 6 times with a 600 ms wait; the handshake gets 10 s;
+a join that times out is retried twice more from a power-cycled card
+(`JOIN_ATTEMPTS`); a deauthentication mid-join ends the attempt; a
+retransmitted message 3 after the join gets message 4 again; and the RX
+filter stays open during the join so a card-side match failure cannot cost a
+join again (the reply's `A1_MATCH` is logged, so such a failure stays
+visible). The `wifi` tool waits 90 s for a join to settle (was 20 s).
+
+**One ordering fix after boot 16:** the AP resent message 3 twice — our
+message 4 was still queued when `JOIN4` installed the keys, so the chip sent
+it under the new pairwise key or not at all. The station now waits for
+message 4's release report (up to 200 ms) before installing the keys.
+Boot 17 confirmed it: joined again, no message 3 resent. Its auth needed
+three tries (203 frames heard in one 600 ms wait), which is what the retries
+are for.
 
 Staged on ryzen for these runs: `/etc/wifi/home` on p3 (PSK derived on the
 Mac from `~/.akuma/wifi/<network>`, piped in, mode 0600, never printed) and

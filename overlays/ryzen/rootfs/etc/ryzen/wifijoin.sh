@@ -24,6 +24,15 @@ keys
 /bin/wifi connect > /dev/null 2>&1
 echo "wifi connect exit $?" >> $L
 keys
+# The driver retries a join on its own; an older tool gives up after 20 s.
+# Wait (up to 90 s) for the driver to settle either way.
+i=0
+while [ $i -lt 90 ] && /bin/busybox grep -q '^state=associating' /dev/wifi0; do
+    /bin/busybox sleep 1
+    i=$((i + 1))
+done
+echo "settled after ${i}s more" >> $L
+keys
 # Still joined a while later? A deauthentication shows in the [rtw] lines.
 /bin/busybox sleep 20
 keys

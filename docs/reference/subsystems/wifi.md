@@ -99,7 +99,7 @@ gets its own cursor. `close` frees it.
 |---|---|---|
 | none | default | **no `/dev/wifi0` node at all** (`open` is `ENOENT`, `ls /dev` omits it) |
 | simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below |
-| rtw89 | `rtw89wifi` (multiboot2 path, after the root mount) | ryzen's RTL8852CE, kept up after its bring-up; `amd64/src/rtw89_sta.rs` is the backend. **Scan works** (the real networks on channel 1, with security); **`connect` does not complete yet**: authentication goes out and is reported done by the chip, but nothing is received after `JOIN2` — survey doc § 5.4. W1 (`rtw89`, firmware) and W2 (`rtw89rx`, receive) are the earlier stages, below |
+| rtw89 | `rtw89wifi` (multiboot2 path, after the root mount) | ryzen's RTL8852CE, kept up after its bring-up; `amd64/src/rtw89_sta.rs` is the backend. **Joins a WPA2-PSK network** (2026-10-06, boot 16): scan, auth, assoc, the 4-way handshake in the kernel, keys installed — survey doc § 5.4. No data path yet (W5). W1 (`rtw89`, firmware) and W2 (`rtw89rx`, receive) are the earlier stages, below |
 
 **The simulated radio** is deterministic: the same networks every boot, scans
 complete at once, and fixed rules for `connect`. A test that passes against it
@@ -201,10 +201,15 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 ## Known gaps
 
-- **The real radio scans but does not join yet** (`rtw89wifi`): nothing is
-  received after `JOIN2`, so authentication times out (survey doc § 5.4).
-  Without `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto`
-  says so every poll.
+- **The real radio joins but carries no traffic yet** (`rtw89wifi`): no
+  DHCP, no IP — W5. Channel 1 only (the channel `JOIN1` leaves the card on;
+  scanning other channels needs a recorded channel switch). Without
+  `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto` says so
+  every poll.
+- **No link-loss detection** beyond a deauthentication or disassociation from
+  the access point: a station that simply stops hearing it stays `connected`.
+  Beacons from the joined network are consumed by the firmware's beacon
+  filter after `JOIN4`, so counting them on the host is not the test.
 - **No signal strength from the real radio**: scan results report `signal=0`
   (the PPDU status reports that carry RSSI are not parsed), so `wifi` picks
   among equal-priority networks by order, not strength.
