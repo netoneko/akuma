@@ -5,6 +5,8 @@
 #
 #   sh w0-trace.sh            # detaches itself (systemd-run), returns at once
 #   sh w0-trace.sh --check    # preflight only: changes nothing
+#   JOIN=1 sh w0-trace.sh     # stage W3: instead of scan + down, let
+#                             # NetworkManager join its network while tracing
 #
 # From the laptop (hpbox.py's root helper; the run itself survives the drop):
 #   python3 -c 'import sys; sys.path.insert(0,"scripts/utils"); import hpbox;
@@ -70,7 +72,8 @@ if [ "${1:-}" = --check ]; then preflight; exit 0; fi
 if [ "${1:-}" != --run ]; then
     preflight
     systemctl reset-failed akuma-w0 2>/dev/null
-    systemd-run --unit=akuma-w0 --collect --property=Type=exec /bin/sh "$(readlink -f "$0")" --run \
+    systemd-run --unit=akuma-w0 --collect --property=Type=exec \
+        --setenv=JOIN="${JOIN:-0}" --setenv=H2C="${H2C:-1}" /bin/sh "$(readlink -f "$0")" --run \
         || die "systemd-run failed"
     echo "w0: running as unit akuma-w0; wifi drops now, back in ~1-2 min."
     echo "w0: then: journalctl -u akuma-w0; ls $OUT_ROOT"
@@ -83,7 +86,11 @@ O=$OUT_ROOT/$(date +%Y%m%d-%H%M%S)
 mkdir -p $O && chmod 700 $OUT_ROOT $O
 exec >>$O/log 2>&1
 log() { echo "$(date +%T.%N | cut -c1-12) $*"; }
-mark() { echo "w0: $*" > $T/trace_marker 2>/dev/null; log "mark: $*"; }
+mark() {
+    echo "w0: $*" > $T/trace_marker 2>/dev/null
+    [ -d "$T/instances/akuma" ] && echo "w0: $*" > $T/instances/akuma/trace_marker 2>/dev/null
+    log "mark: $*"
+}
 # The size to restore. An unexpanded buffer reads back as `7 (expanded: 1408)`,
 # which cannot be written back, so take the expanded figure; and keep the first
 # value ever seen, so a run that failed to restore cannot make its own size the
@@ -92,6 +99,55 @@ mark() { echo "w0: $*" > $T/trace_marker 2>/dev/null; log "mark: $*"; }
 OLD_KB=$(cat $OUT_ROOT/buffer_size_kb.orig)
 PIPE_PID=
 CLEANED=
+
+# Before anything leaves this box: zero the body of every security-CAM H2C
+# (CAT_MAC, class SEC_CAM: the only command that carries a key — the pairwise
+# and group keys of a JOIN run), and every occurrence of the joined network's
+# name (probe-request templates in scan-offload commands). The name is read
+# from NetworkManager here and never written anywhere. A run whose redaction
+# fails deletes its H2C dump rather than keep it.
+redact() {
+    # Every saved wifi profile's SSID, hex, one per argument: not just the
+    # active one (2026-10-06's JOIN run looked up the active connection, got
+    # nothing, and left the name in 4 commands; redacted by hand afterwards).
+    NAMES=""
+    for c in $(nmcli -t -f UUID,TYPE connection show | grep ':802-11-wireless$' | cut -d: -f1); do
+        h=$(nmcli -t -f 802-11-wireless.ssid connection show "$c" 2>/dev/null | cut -d: -f2- | tr -d '\n' | od -An -tx1 | tr -d ' \n')
+        [ -n "$h" ] && NAMES="$NAMES $h"
+    done
+    log "redact: $(echo $NAMES | wc -w) saved network names"
+    if [ "${JOIN:-0}" = 1 ] && [ -z "$NAMES" ]; then rm -f "$1"; log "no names to redact on a JOIN run: h2c dump deleted"; return 1; fi
+    python3 - "$1" $NAMES <<'PY' || { rm -f "$1"; log "redaction failed: h2c dump deleted"; return 1; }
+import re, sys
+path, ssids = sys.argv[1], [bytes.fromhex(h) for h in sys.argv[2:] if len(h) >= 4]
+out, keys, names = [], 0, 0
+for line in open(path, errors="replace"):
+    m = re.search(r"(h2c|c2h|txh|txm|rxm): ", line)
+    if not m:
+        out.append(line); continue
+    words = []
+    for arr in re.findall(r"d\d=\{([^}]*)\}", line):
+        words += [int(w, 16) for w in arr.split(",")]
+    data = bytearray(b"".join(w.to_bytes(8, "little") for w in words))
+    if m.group(1) == "h2c" and len(data) >= 8:
+        h0 = int.from_bytes(data[:4], "little")
+        if h0 & 3 == 1 and (h0 >> 2) & 0x3f == 0xa:
+            data[8:] = bytes(len(data) - 8); keys += 1
+    for ssid in ssids:
+        i = data.find(ssid)
+        while i >= 0:
+            data[i:i + len(ssid)] = bytes(len(ssid)); names += 1
+            i = data.find(ssid, i + 1)
+    it = iter(range(0, len(data), 8))
+    def sub(mm):
+        n = len(mm.group(2).split(","))
+        ws = [hex(int.from_bytes(data[next(it):][:8], "little")) for _ in range(n)]
+        return mm.group(1) + "{" + ",".join(ws) + "}"
+    out.append(re.sub(r"(d\d=)\{([^}]*)\}", sub, line))
+open(path, "w").writelines(out)
+print(f"redacted {keys} sec-cam commands, {names} name occurrences")
+PY
+}
 
 cleanup() {
     [ -n "$CLEANED" ] && return; CLEANED=1
@@ -112,7 +168,14 @@ cleanup() {
     rmdir $I 2>/dev/null
     echo "-:akuma/h2c" >> $T/dynamic_events 2>/dev/null
     echo "-:akuma/c2h" >> $T/dynamic_events 2>/dev/null
-    [ -f $O/h2c.txt ] && gzip -9 $O/h2c.txt
+    echo "-:akuma/txd" >> $T/dynamic_events 2>/dev/null
+    echo "-:akuma/txh" >> $T/dynamic_events 2>/dev/null
+    echo "-:akuma/txm" >> $T/dynamic_events 2>/dev/null
+    echo "-:akuma/rxm" >> $T/dynamic_events 2>/dev/null
+    for w in 8 16 32; do
+        for e in r$w r${w}v w$w; do echo "-:akuma/$e" >> $T/dynamic_events 2>/dev/null; done
+    done
+    [ -f $O/h2c.txt ] && redact $O/h2c.txt && gzip -9 $O/h2c.txt
     echo 1 > $T/tracing_on 2>/dev/null
     echo "$OLD_KB" > $T/buffer_size_kb 2>/dev/null
     log "tracer=$(cat $T/current_tracer) buffer_size_kb=$(cat $T/buffer_size_kb) cpus=$(nproc)"
@@ -172,24 +235,49 @@ echo $TRACE_KB > $T/buffer_size_kb || exit 1
 # instance of their own (`instances/akuma` -> h2c.txt; the mmiotrace tracer's
 # own pipe drops foreign events, found 2026-10-06), timestamped on the same
 # clock as the register accesses. H2C: the first 2 KiB (an x64[64] array is
-# the largest one argument may be); C2H: 512 bytes. Nothing here is a key:
-# NetworkManager is kept off the card, so no association happens and no
-# security CAM entry is ever written.
+# the largest one argument may be); C2H: 512 bytes. Without JOIN=1 nothing
+# here is a key: NetworkManager is kept off the card, so no association
+# happens and no security CAM entry is ever written. With it, see `redact`.
 I=$T/instances/akuma
 H2C_PID=
 if [ "${H2C:-1}" = 1 ]; then
     A=""; for i in 0 1 2 3; do A="$A d$i=+$((i*512))(skb->data):x64[64]"; done
     mkdir -p $I \
-        && echo 8192 > $I/buffer_size_kb \
+        && echo 32768 > $I/buffer_size_kb \
         && echo "f:akuma/h2c rtw89_h2c_tx len=skb->len$A" >> $T/dynamic_events \
         && echo "f:akuma/c2h rtw89_fw_c2h_irqsafe len=c2h->len d0=+0(c2h->data):x64[64]" >> $T/dynamic_events \
+        && echo "f:akuma/txd rtw89_core_fill_txdesc_v1 d0=+0(desc_info):x64[8]" >> $T/dynamic_events \
+        && echo "f:akuma/txh rtw89_core_tx_write len=skb->len d0=+0(skb->data):x64[3]" >> $T/dynamic_events \
+        && echo "f:akuma/txm rtw89_core_tx_write len=skb->len fc=+0(skb->data):u8 d0=+0(skb->data):x64[40]" >> $T/dynamic_events \
+        && echo "f:akuma/rxm rtw89_core_rx len=skb->len fc=+0(skb->data):u8 d0=+0(skb->data):x64[64]" >> $T/dynamic_events \
+        && echo "fc == 0 || fc == 32 || fc == 64 || fc == 176 || fc == 208" > $I/events/akuma/txm/filter \
+        && echo "fc == 16 || fc == 48 || fc == 176 || fc == 208 || fc == 160 || fc == 192" > $I/events/akuma/rxm/filter \
         && { cat $I/trace_pipe > $O/h2c.txt & H2C_PID=$!; } \
         && echo 1 > $I/events/akuma/enable && log "h2c/c2h probes on" || log "h2c/c2h probes FAILED"
 fi
-cat $T/trace_pipe > $O/mmiotrace.txt &
-PIPE_PID=$!
-echo mmiotrace > $T/current_tracer || exit 1
-log "mmiotrace on, cpus=$(nproc)"
+# MMIO=fprobe (the default with JOIN=1): no mmiotrace. Register accesses are
+# fprobe events on the PCI layer's six accessors (`rtw89_pci_ops_{read,write}
+# {8,16,32}`; every rtw89 MMIO goes through one, by function pointer, so none
+# is inlined), a read's value from a second event on its return. All CPUs stay
+# online and accesses cost ~1 µs instead of a page fault each: under mmiotrace
+# every hardware scan timed out (`rtw89_hw_scan_offload failed ret -110`), so
+# NetworkManager never found the network and the JOIN run of 2026-10-06
+# recorded four failed scans and no association.
+if [ "${MMIO:-$([ "${JOIN:-0}" = 1 ] && echo fprobe || echo mmiotrace)}" = fprobe ]; then
+    ok=1
+    for w in 8 16 32; do
+        echo "f:akuma/r$w rtw89_pci_ops_read$w a=addr" >> $T/dynamic_events || ok=0
+        echo "f:akuma/r${w}v rtw89_pci_ops_read$w%return v=\$retval" >> $T/dynamic_events || ok=0
+        echo "f:akuma/w$w rtw89_pci_ops_write$w a=addr v=data" >> $T/dynamic_events || ok=0
+    done
+    echo 1 > $I/events/akuma/enable
+    [ $ok = 1 ] && log "mmio fprobes on, cpus=$(nproc)" || { log "mmio fprobes FAILED"; exit 1; }
+else
+    cat $T/trace_pipe > $O/mmiotrace.txt &
+    PIPE_PID=$!
+    echo mmiotrace > $T/current_tracer || exit 1
+    log "mmiotrace on, cpus=$(nproc)"
+fi
 
 # 4. Unbind, bind: probe (power on, efuse, power off) under the trace.
 mark unbind
@@ -213,6 +301,30 @@ sleep 1
 mark up
 ip link set dev $NEWIF up || log "link up failed"
 sleep 5
+
+# 6J. JOIN=1 (stage W3): give the card back to NetworkManager while still
+# tracing, and record it associating with the remembered network: scan,
+# authentication, association, the 4-way handshake, DHCP. Keys reach the card
+# only as security-CAM H2Cs, which `redact` zeroes; EAPOL frames travel by
+# DMA, and the TX-header probe captures only the first 24 bytes of each frame.
+# Whole frames are captured only for management subtypes, by event filter
+# (`txm`: association/probe requests, authentication, action; `rxm`: their
+# responses, never beacons): no EAPOL frame, which an offline guess at the
+# passphrase would need, is ever captured whole.
+if [ "${JOIN:-0}" = 1 ]; then
+    mark join
+    rm -f $NM_DROPIN
+    nmcli general reload conf
+    i=0
+    # The card's own state: NetworkManager's general state reads
+    # "connected (local only)" off other interfaces long before wifi is up.
+    until nmcli -t -f DEVICE,STATE device | grep -q "^$NEWIF:connected$" || [ $i -ge 60 ]; do sleep 1; i=$((i+1)); done
+    log "join: $(nmcli -t -f DEVICE,STATE device | grep "^$NEWIF:") after ${i}s"
+    sleep 5
+    mark end
+    sleep 1
+    exit 0
+fi
 
 # 6. One scan: channel switching, the RX path. Only the count is kept, since
 # the results are the neighbours' (and our own) network names.

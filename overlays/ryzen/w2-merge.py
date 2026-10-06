@@ -3,6 +3,11 @@
 
     python3 overlays/ryzen/w2-merge.py <run-dir> [--phase up] [--collapse] [--no-fwdl] [--ts]
 
+A run made with `MMIO=fprobe` (the default for `JOIN=1`) has no mmiotrace:
+its register accesses are fprobe events in `h2c.txt.gz` beside the firmware
+messages, on one clock, and are merged by timestamp alone (TXD/TXH lines are
+the TX descriptor inputs and the first 24 bytes of each transmitted frame).
+
 `<run-dir>` is a `w0-trace.sh` output directory holding `mmiotrace.txt.gz` and
 `h2c.txt.gz` (the fprobe dump of every H2C the driver sent and every C2H the
 firmware returned). Both carry timestamps from the same trace clock, so they
@@ -39,6 +44,64 @@ def words_to_bytes(fields):
     return bytes(out)
 
 
+FP = re.compile(r"\[(\d+)\].*?\s(\d+\.\d+): (\w+): (.*)$")
+
+
+def fprobe_stream(d, phase_want, collapse, with_ts, nofwdl, out):
+    """A run made with MMIO=fprobe: everything is in h2c.txt.gz, one clock.
+
+    Register accesses are `r8/r16/r32` (address) followed on the same CPU by
+    `r8v/...` (the value, from the return probe), and `w8/w16/w32`."""
+    pending = {}  # cpu -> (width, addr)
+    phase = "pre"
+    prev = None
+    for line in gzip.open(f"{d}/h2c.txt.gz", "rt", errors="replace"):
+        if "tracing_mark_write: w0: " in line:
+            phase = line.split("w0: ", 1)[1].strip()
+            continue
+        m = FP.search(line)
+        if not m:
+            continue
+        cpu, ts, ev, rest = m.group(1), float(m.group(2)), m.group(3), m.group(4)
+        tail = f" @{ts:.6f}" if with_ts else ""
+        if ev in ("r8", "r16", "r32"):
+            pending[cpu] = (int(ev[1:]), int(re.search(r"a=(\w+)", rest).group(1), 0))
+            continue
+        if ev in ("r8v", "r16v", "r32v"):
+            if cpu not in pending:
+                continue
+            width, addr = pending.pop(cpu)
+            val = int(re.search(r"v=(\w+)", rest).group(1), 0)
+            op = "R"
+        elif ev in ("w8", "w16", "w32"):
+            width = int(ev[1:])
+            addr = int(re.search(r"a=(\w+)", rest).group(1), 0)
+            val = int(re.search(r"v=(\w+)", rest).group(1), 0)
+            op = "W"
+        elif ev in ("h2c", "c2h", "txd", "txh", "txm", "rxm"):
+            if phase != phase_want:
+                continue
+            ln = re.search(r"len=(\d+)", rest)
+            data = words_to_bytes(rest)
+            n = int(ln.group(1)) if ln else len(data)
+            cap = {"h2c": 2048, "c2h": 512, "txh": 24, "txm": 320, "rxm": 512}.get(ev, len(data))
+            if nofwdl and ev == "h2c" and n == 2020 and not _is_h2c_cmd(data):
+                continue
+            out.write(f"{ev.upper()}  {n} {data[:min(n, cap)].hex()}{' ...' if n > cap else ''}{tail}\n")
+            prev = None
+            continue
+        else:
+            continue
+        if phase != phase_want:
+            continue
+        mask = (1 << width) - 1
+        s = f"{op}{width:<3} 0x{addr:05x} = 0x{val & mask:0{width // 4}x}"
+        if collapse and s == prev and op == "R":
+            continue
+        prev = s
+        out.write(s + tail + "\n")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -52,6 +115,10 @@ def main():
     with_ts = "--ts" in args
     nofwdl = "--no-fwdl" in args
     d = args[0]
+    import os
+    if not os.path.exists(f"{d}/mmiotrace.txt.gz"):
+        fprobe_stream(d, phase_want, collapse, with_ts, nofwdl, sys.stdout)
+        return
 
     events = []  # (ts, kind, payload)
     for line in gzip.open(f"{d}/h2c.txt.gz", "rt", errors="replace"):
