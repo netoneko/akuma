@@ -805,6 +805,34 @@ BKL-held loop; either bound the poll, drop the BKL around card I/O (the
 dropped-BKL-window machinery exists for exactly this), or both. Until then
 **entry 13 stays unusable; rio runs on entry 12 (`nosmp`)**.
 
+**Bisected by core count (2026-10-07, late): the wedge needs all 16.** The
+kernel gained an `smp=N` command-line option (`amd64/src/smp.rs`:
+`set_cpu_cap_from_cmdline`; N total CPUs, BSP + N-1 APs), and entry 13 was
+booted at each width on the metal:
+
+| cores | result |
+|---|---|
+| 1 (`nosmp`) | clean — keyboard works (bounded-lock `kbd.rs`), rio usable |
+| 2 | up, stable. Wifi `replayed` 1–2. ~19 `[bkls>]` long BKL holds, mutually owned (each core takes turns as owner/waiter), all self-healed |
+| 4 | up, stable (same profile: ~22 holds) |
+| 8 | up, stable (~20 holds) |
+| 16 | **wedge**, twice: services start, wifi joins, then `[bkls>] core=12 ticket=… serving=…-1 owner=15 spins=1048576→2097152` with **every PID's syscall counts frozen** across successive PSTATS prints. Both times klog never completed a flush, so the dmesg ring (with the FAILED test names) was lost to the power-cycle |
+
+The step from 8 to 16 is where the SMT siblings come online, so the trigger
+is SMT-width-specific — either sibling contention on a per-physical-core
+resource, or waiter pressure finally tripping the BKL lost-ticket path.
+Also caught on the smp=2 boot: `laps … max gap 18446744073708564 ms` — a
+u64 **underflow** in the station daemon's lap timing (`now - last_lap` went
+backward): `now_us()` is not monotonic across cores (unsynchronised TSC).
+Two concrete SMP bugs to hunt: the BKL 16-core wedge and the cross-core
+`now_us()`. The 2 self-test failures under SMP (`physmap: reaches
+PHYSMAP_LIMIT`, `pci: every enumerated function has a real vendor id`) still
+need names read from a surviving dmesg.
+
+Meanwhile the knob is useful in its own right: **rio runs on entry 13 with
+`smp=8`** — 8 software-rasteriser cores, verified up and responsive on the
+metal.
+
 **Font.** The panel config started at `size = 32` (the console-cell match,
 ~40 px lines — huge for real work). 11 (the dev machine's kitty default) is
 too small on a scale-1 1920×1200 panel; **22 is the settled value**
