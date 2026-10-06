@@ -48,10 +48,11 @@ use akuma_rtw89::{rx, script, tx};
 use akuma_wifi::cmd::Command;
 use akuma_wifi::status::{Bss, Error as JoinError, Link, Status};
 use akuma_wifi::{Bssid, IfName, MAX_BSS, PSK_LEN, Security, Ssid};
+use akuma_net::queued::{FRAME_MAX, FrameQueues};
 use akuma_wpa::eapol::{self, Action, Supplicant};
 use spinning_top::Spinlock;
 
-use crate::rtw89::{Card, TX_EAPOL, TX_MGMT, fnv1a};
+use crate::rtw89::{Card, TX_DATA, TX_EAPOL, TX_MGMT, fnv1a};
 use crate::serial;
 
 /// This station's address. The card's own lives in its efuse, but only the
@@ -90,12 +91,22 @@ static BACKOFF: AtomicBool = AtomicBool::new(false);
 /// 9:8 is beacon loss — the firmware stopped hearing the access point; the
 /// report also carries the averaged beacon RSSI (bits 23:16, minus 110 dBm).
 const C2H_BCNFLTR: (u8, u8, u8) = (1, 1, 0x0d);
+/// Power cycles tried before the radio is given up on (see `Station::start`).
+const RESTART_TRIES: u32 = 3;
 /// How often an idle daemon looks at the RX ring and its request.
 const IDLE_MS: u64 = 50;
 /// A join's waits poll the RX ring this often.
 const POLL_MS: u64 = 2;
 
 static CARD: Spinlock<Option<Card>> = Spinlock::new(None);
+/// The link to the network stack (`ExternalDevice::Queued`): received data
+/// frames go in as Ethernet, the stack's frames come out to be sent. Frames
+/// pass only while joined; otherwise transmits are dropped.
+pub static LINK: FrameQueues = FrameQueues::new();
+static ADOPTED: AtomicBool = AtomicBool::new(false);
+/// Frames from the stack each lap of a joined daemon may send, so receive is
+/// never starved by a transmit burst.
+const TX_PER_LAP: usize = 8;
 static STATUS: Spinlock<Option<Status>> = Spinlock::new(None);
 static REQUEST: Spinlock<Option<Command>> = Spinlock::new(None);
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -131,6 +142,8 @@ fn put_oui(b: &Bssid) {
 /// The daemon ([`spawn`]) starts once the scheduler runs.
 pub fn adopt(card: Card, backoff: bool) {
     BACKOFF.store(backoff, Ordering::Relaxed);
+    LINK.set_mac(MAC);
+    ADOPTED.store(true, Ordering::Release);
     *CARD.lock() = Some(card);
     if let Some(iface) = IfName::new(b"wlan0") {
         let mut s = Status::no_radio(iface);
@@ -139,6 +152,14 @@ pub fn adopt(card: Card, backoff: bool) {
     }
     crate::wifi::register_rtw89();
     say("card kept for the station (rtw89wifi); /dev/wifi0 is the radio");
+}
+
+/// Is the wifi station this boot's network link? Then the stack is built on
+/// [`LINK`], and nothing can reach the network until userspace has asked for
+/// a join — DHCP, DNS and the clock all follow the join, not the boot.
+#[must_use]
+pub fn is_link() -> bool {
+    ADOPTED.load(Ordering::Acquire)
 }
 
 /// Start the daemon, if a card was adopted. Called once the scheduler runs.
@@ -212,7 +233,6 @@ extern "C" fn daemon() -> ! {
     let mut st = Station {
         vars: script::Vars { mac: MAC, ..script::Vars::default() },
         ready: false,
-        dirty: false,
         peer: None,
         wanted: None,
         retry_at: 0,
@@ -240,7 +260,9 @@ extern "C" fn daemon() -> ! {
                 }
             }
         }
-        nap(IDLE_MS);
+        // Joined, the daemon is the link's poll loop: a short nap keeps
+        // receive latency at a couple of milliseconds.
+        nap(if st.peer.is_some() { POLL_MS } else { IDLE_MS });
     }
 }
 
@@ -250,6 +272,13 @@ struct Peer {
     supplicant: Supplicant,
     /// Software sequence number for frames of tid 7 (EAPOL).
     seq: u16,
+    /// The pairwise key is in the card: EAPOL goes out encrypted from here
+    /// on, as 802.11 wants a retransmitted message 4 or a group message 2.
+    keyed: bool,
+    /// The CCMP packet number of the last protected frame sent, and the tid-0
+    /// sequence number of the next.
+    pn: u64,
+    data_seq: u16,
 }
 
 /// The network the station was told to join, kept until `disconnect`: what a
@@ -269,8 +298,6 @@ struct Station {
     backoff_ms: u64,
     /// `JOIN1` ran on the card as it stands.
     ready: bool,
-    /// The card holds state from a join attempt; restart it before the next.
-    dirty: bool,
     peer: Option<Peer>,
 }
 
@@ -311,11 +338,25 @@ impl Station {
     /// state in it (`restart`), then replay `JOIN1`.
     fn start(&mut self, card: &mut Card, restart: bool) -> bool {
         self.ready = false;
-        if restart && !card.restart() {
-            say("restart failed");
-            return false;
+        // A power cycle re-downloads the firmware, and the card refuses a
+        // second download in one boot (`FWDL_SECURITY_FAIL`, status 3 — seen
+        // on ryzen 2026-10-06, boot 19). So this runs only when the card is
+        // not up at all, and a refusal is retried a few times rather than
+        // every second for ever.
+        if restart {
+            let mut up = false;
+            for _ in 0..RESTART_TRIES {
+                if card.restart() {
+                    up = true;
+                    break;
+                }
+                nap(200);
+            }
+            if !up {
+                say("restart failed; the radio stays down until a reboot");
+                return false;
+            }
         }
-        self.dirty = false;
         self.peer = None;
         if !card.replay("join1 (start)", script::JOIN1, &self.vars) {
             return false;
@@ -437,11 +478,12 @@ impl Station {
     }
 
     /// The access point is gone (sent us away, or the firmware stopped
-    /// hearing its beacons): drop the association and rejoin at once — the
-    /// card is restarted first, since it still holds the old peer.
+    /// hearing its beacons): drop the association and rejoin at once, on the
+    /// running card (`JOIN2`..`JOIN4` overwrite the old peer's entries).
     fn link_lost(&mut self) {
         self.peer = None;
-        self.dirty = true;
+        LINK.flush_transmit();
+        LINK.link_changed();
         self.retry_at = now_us();
         self.backoff_ms = REJOIN_FIRST_MS;
         with_status(|s| {
@@ -497,10 +539,13 @@ impl Station {
     /// One join from a clean card: `JOIN2`, auth, assoc, `JOIN3`, the
     /// handshake, `JOIN4`.
     fn attempt(&mut self, card: &mut Card, ssid: &Ssid, psk: &[u8; PSK_LEN], bss: &Bss) -> Joined {
-        if (self.dirty || !self.ready) && !self.start(card, true) {
+        // A retry, or a rejoin after a lost link, reuses the running card:
+        // `JOIN2` rewrites the access point's address-CAM entry and `JOIN3`
+        // and `JOIN4` overwrite the rest, as Linux re-authenticates without
+        // powering anything off. Only a card that never came up is restarted.
+        if !self.ready && !self.start(card, true) {
             return Err(JoinError::Timeout);
         }
-        self.dirty = true;
         self.vars.bssid = bss.bssid;
         self.vars.aid = 0;
         if !card.replay("join2 (prepare)", script::JOIN2, &self.vars) {
@@ -551,7 +596,14 @@ impl Station {
             say("no randomness for the SNonce");
             return Err(JoinError::Timeout);
         }
-        let mut peer = Peer { bssid: bss.bssid, supplicant: Supplicant::new(psk, bss.bssid, MAC, snonce, &sta::RSN_IE), seq: 0 };
+        let mut peer = Peer {
+            bssid: bss.bssid,
+            supplicant: Supplicant::new(psk, bss.bssid, MAC, snonce, &sta::RSN_IE),
+            seq: 0,
+            keyed: false,
+            pn: 0,
+            data_seq: 0,
+        };
         let deadline = now_us() + HANDSHAKE_MS * 1000;
         let mut mic_failures = 0u32;
         while now_us() < deadline {
@@ -604,6 +656,9 @@ impl Station {
                         return Err(JoinError::Timeout);
                     }
                     say_dec("eapol: message 3 answered, keys installed, group key id", u64::from(gtk.idx));
+                    peer.keyed = true;
+                    LINK.flush_transmit();
+                    LINK.link_changed();
                     self.peer = Some(peer);
                     with_status(|s| {
                         s.link = Link::Connected;
@@ -628,6 +683,10 @@ impl Station {
     /// peer until the next join restarts it.
     fn disconnect(&mut self) {
         self.wanted = None;
+        LINK.flush_transmit();
+        if self.peer.is_some() {
+            LINK.link_changed();
+        }
         if self.peer.take().is_some() {
             say("disconnected");
         }
@@ -650,6 +709,10 @@ impl Station {
         }
         let Some(peer) = self.peer.as_mut() else {
             frames(card, |_| {});
+            // No link: what the stack sends (DHCP discovers, mostly) has
+            // nowhere to go; it retransmits once there is one.
+            let mut sink = [0u8; FRAME_MAX];
+            while LINK.next_transmit(&mut sink).is_some() {}
             return;
         };
         let mut out = [0u8; eapol::HDR_LEN + eapol::MAX_KEY_DATA];
@@ -657,6 +720,7 @@ impl Station {
         let mut gone: Option<u16> = None;
         let mut beacon_lost = false;
         let mut rssi: Option<i8> = None;
+        let mut delivered = 0u32;
         card.poll_rx(|p: &rx::Packet<'_>| {
             if p.desc.pkt_type == rx::kind::C2H {
                 match bcnfltr(p.body) {
@@ -672,13 +736,43 @@ impl Station {
             let f = p.body;
             if let Some(g) = Goodbye::parse(f).filter(|g| g.from == peer.bssid && g.to == MAC) {
                 gone = Some(g.reason);
-            } else if step.is_none()
-                && let Some(d) = Data::parse(f, true)
-                    .filter(|d| d.bssid == peer.bssid && d.ethertype == sta::ETHERTYPE_EAPOL)
-            {
-                step = Some(peer.supplicant.handle(d.payload, &mut out));
+            } else if let Some(d) = Data::parse(f, true).filter(|d| d.bssid == peer.bssid) {
+                if d.ethertype == sta::ETHERTYPE_EAPOL {
+                    if step.is_none() {
+                        step = Some(peer.supplicant.handle(d.payload, &mut out));
+                    }
+                } else if d.protected && p.desc.hw_dec && !p.desc.icv_err {
+                    // To the stack as Ethernet. Only what the card decrypted:
+                    // a frame in the clear after the keys is not ours to trust.
+                    let mut eth = [0u8; FRAME_MAX];
+                    let n = 14 + d.payload.len();
+                    if n <= FRAME_MAX {
+                        eth[..6].copy_from_slice(&d.da);
+                        eth[6..12].copy_from_slice(&d.sa);
+                        eth[12..14].copy_from_slice(&d.ethertype.to_be_bytes());
+                        eth[14..n].copy_from_slice(d.payload);
+                        if LINK.deliver(&eth[..n]) {
+                            delivered += 1;
+                        }
+                    }
+                }
             }
         });
+        if delivered > 0 {
+            crate::net::wake_netpoll();
+        }
+        // What the stack sent, out as protected data frames.
+        let mut eth = [0u8; FRAME_MAX];
+        for _ in 0..TX_PER_LAP {
+            let Some(n) = LINK.next_transmit(&mut eth) else { break };
+            if n < 14 {
+                continue;
+            }
+            let mut da = [0u8; 6];
+            da.copy_from_slice(&eth[..6]);
+            let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
+            let _ = send_protected(card, peer, &da, ethertype, &eth[14..n]);
+        }
         if let Some(dbm) = rssi {
             with_status(|s| s.signal = dbm);
         }
@@ -741,8 +835,30 @@ fn send(card: &mut Card, which: usize, frame: &[u8], d: tx::Desc) -> Result<(), 
     })
 }
 
-/// An EAPOL frame to the access point: a QoS data frame of tid 7, in the clear.
+/// A protected data frame to `da` through the access point: QoS, tid 0,
+/// the **Protected** bit set and no CCMP header — the 8852C writes the header
+/// from the packet number in the descriptor (`hw_sec_hdr`; the recording's
+/// encrypted frames are `0x4188` with no header space) and encrypts with the
+/// pairwise key in security-CAM entry 0.
+fn send_protected(card: &mut Card, peer: &mut Peer, da: &Bssid, ethertype: u16, payload: &[u8]) -> Result<(), JoinError> {
+    let mut f = [0u8; sta::QOS_HDR_LEN + 8 + FRAME_MAX];
+    let seq = peer.data_seq;
+    let len = sta::data_frame(&mut f, &peer.bssid, &MAC, da, 0, seq, None, ethertype, payload)
+        .ok_or(JoinError::Timeout)?;
+    f[1] |= 0x40; // Protected
+    peer.data_seq = (seq + 1) & 0xfff;
+    peer.pn += 1;
+    let sec = tx::Sec { cam_idx: 0, keyid: 0, pn: peer.pn };
+    send(card, TX_DATA, &f[..len], tx::Desc::data(len as u16, 0, seq, sec))
+}
+
+/// An EAPOL frame to the access point: a QoS data frame of tid 7, in the
+/// clear until the pairwise key is in, protected after.
 fn send_eapol(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinError> {
+    if peer.keyed {
+        let bssid = peer.bssid;
+        return send_protected(card, peer, &bssid, sta::ETHERTYPE_EAPOL, body);
+    }
     let mut f = [0u8; sta::QOS_HDR_LEN + 8 + eapol::HDR_LEN + eapol::MAX_KEY_DATA];
     let len = sta::data_frame(&mut f, &peer.bssid, &MAC, &peer.bssid, 7, peer.seq, None, sta::ETHERTYPE_EAPOL, body)
         .ok_or(JoinError::Timeout)?;

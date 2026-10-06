@@ -32,6 +32,9 @@ pub enum ExternalDevice {
     /// The Realtek RTL8169/8168 (`amd64` bare metal).
     #[cfg(feature = "rtl8169")]
     Rtl8169(crate::rtl8169::Rtl8169Device),
+    /// A link whose driver runs elsewhere and meets the stack at a pair of
+    /// frame queues (`queued`): the amd64 wifi station.
+    Queued(crate::queued::QueuedDevice),
     /// No wire — loopback only.
     Absent,
     /// A scripted wire for host tests: frames queued here are what
@@ -75,9 +78,21 @@ impl ExternalDevice {
             Self::Virtio(d) => d.mac_address(),
             #[cfg(feature = "rtl8169")]
             Self::Rtl8169(d) => d.mac_address(),
+            Self::Queued(d) => d.mac_address(),
             Self::Absent => [0; 6],
             #[cfg(test)]
             Self::Scripted(_) => [0x02, 0, 0, 0, 0, 1],
+        }
+    }
+
+    /// For a link that comes and goes (`Queued`): a counter that moves on
+    /// every up/down, which the stack's poll compares against the last it saw
+    /// to restart DHCP. `None` for a wire that is simply there.
+    #[must_use]
+    pub fn link_generation(&self) -> Option<u32> {
+        match self {
+            Self::Queued(d) => Some(d.link_generation()),
+            _ => None,
         }
     }
 
@@ -86,6 +101,7 @@ impl ExternalDevice {
             Self::Virtio(d) => d.capabilities(),
             #[cfg(feature = "rtl8169")]
             Self::Rtl8169(d) => d.capabilities(),
+            Self::Queued(d) => d.capabilities(),
             Self::Absent => {
                 let mut caps = DeviceCapabilities::default();
                 caps.max_transmission_unit = 1514;
@@ -101,6 +117,7 @@ impl ExternalDevice {
             Self::Virtio(d) => d.take_rx_frame(),
             #[cfg(feature = "rtl8169")]
             Self::Rtl8169(d) => d.take_rx_frame(),
+            Self::Queued(d) => d.take_rx_frame(),
             Self::Absent => None,
             #[cfg(test)]
             Self::Scripted(w) => w.take(),
@@ -117,6 +134,7 @@ impl ExternalDevice {
             Self::Virtio(d) => d.emit_frame(len, fill, divert),
             #[cfg(feature = "rtl8169")]
             Self::Rtl8169(d) => d.emit_frame(len, fill, divert),
+            Self::Queued(d) => d.emit_frame(len, fill, divert),
             Self::Absent => {
                 let end = len.min(LOOPBACK_FRAME_BUF);
                 // SAFETY: single slot, `NETWORK` held so this function is not
@@ -343,6 +361,12 @@ impl LoopbackAwareDevice {
     #[must_use]
     pub fn mac_address(&self) -> [u8; 6] {
         self.external.mac_address()
+    }
+
+    /// [`ExternalDevice::link_generation`] of the wire behind this device.
+    #[must_use]
+    pub fn link_generation(&self) -> Option<u32> {
+        self.external.link_generation()
     }
 }
 

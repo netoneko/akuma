@@ -21,10 +21,11 @@ Why this shape, and the wifi work it exists for:
 | RTL8852CE firmware on p3 (`/lib/firmware/rtw89/`) | staged (`fetch-firmware.sh`); nothing loads it yet |
 | wifi W1: firmware download (`rtw89`, entry 8) | **works**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again; the fix that got it there was Bus Master on the card's root port (survey doc § 5.2) |
 | wifi W2: receive (`rtw89rx`, entry 9) | **works**: Linux's recorded start replayed (16 815 ops, 52 ms), then 12 s on channel 1: 1604 frames, 17 networks' beacons, the home network's among them (survey doc § 5.3) |
-| wifi W3/W4: the station (`rtw89wifi`, entry 10) | **works**: joins the home network with WPA2-PSK, handshake in the kernel, keys installed (boot 16, survey doc § 5.4). No data path yet |
+| wifi W3/W4: the station (`rtw89wifi`, entry 10) | **works**: joins the home network with WPA2-PSK, handshake in the kernel, keys installed (boot 16, survey doc § 5.4) |
+| wifi W5: IP over wifi (entry 11) | **ssh works**: DHCP, SNTP, DNS, `ssh -p 2222 root@<address>` from the Mac (boot 20, survey doc § 5.6); outbound TCP refused (open) |
 | wifi W0: Linux's bring-up traced | **done**: probe + interface-up through `fw ready` (`w0-trace.sh`, results in the survey doc § 5.1; traces in `~/.akuma/w0/` on the laptop) |
 | wifi control (`/dev/wifi0`, `/etc/wifi`, `wifi`) | **works** against the simulated radio (entry 7, rehearsed); no real radio yet — [`docs/reference/subsystems/wifi.md`](../../docs/reference/subsystems/wifi.md) |
-| network | none, so ssh into Akuma here is not possible; the log is the channel |
+| network | **wifi** (entry 11): `python3 overlays/ryzen/wifi-ssh.py --key <key>` finds the station by its MAC and runs a command over ssh (port **2222**); the user's key is in p3's `/etc/sshd/authorized_keys`. Every other entry has no network; the log is the channel |
 | wifi credentials | `~/.akuma/wifi/<network>` on the laptop holds the passphrase; never copied into the repo, docs or logs |
 
 ## Quick start
@@ -57,6 +58,7 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | `format-p3.sh --yes-destroy-p3 [size]` | ryzen, root | **destructive**: the root image onto `nvme0n1p3`, grown with `resize2fs`. Refuses unless start/length/PARTUUID match the measured partition and it is unmounted. Done once, 2026-10-06, at 64 GiB |
 | `fetch-firmware.sh` | ryzen, root | `rtw8852c_fw*.bin` from Alpine's `linux-firmware-rtw89` (no dependencies; files are `.zst`, decompressed here) onto p3, with Realtek's licence beside them |
 | `wdt-probe.py` | ryzen, root, from Pop | **read-only** dump of the FCH watchdog and PM registers (`/dev/mem`): decoded? disabled? running? fired? |
+| `wifi-ssh.py --key KEY [CMD]` | laptop | finds Akuma on the LAN by the station MAC (ping sweep + ARP) and runs CMD over ssh on port 2222; for entry 11 |
 | `cycle.py <entry> [--grep RE] [--log dmesg] [--transcript NAME]` | laptop | one loop cycle through `hpbox.py`: ship this tree's `no-tests` kernel and `grub.cfg`, rehearse the entry in QEMU (stops if it fails), install, arm, wait for Pop, print matching `boot-N.early` (or `boot-N.dmesg`) lines from p3 (default `[rtw]`), and the service's `NAME-N.txt` |
 | `w0-trace.sh [--check]` | ryzen, root | wifi **W0**: mmiotrace of rtw89 unbind → bind → up → one scan, to `/var/tmp/akuma-w0/<stamp>/`. Detaches into unit `akuma-w0` (drops Pop's wifi ~1–2 min, takes all CPUs but one offline while tracing); NetworkManager is kept off the card so no association or keys enter the trace; every exit path restores the network. `--check` changes nothing |
 | `w2-merge.py <run> [--phase P] [--collapse] [--no-fwdl] [--ts]` | laptop | a W2 run's register accesses, H2Cs and C2Hs in one ordered stream (each H2C anchored to its CH12 doorbell) |
@@ -81,7 +83,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 8 | **wifi W1** (`rtw89`): as 0, plus the RTL8852CE brought up to running firmware and shut down again before `init`; `[rtw]` lines in `boot-N.early` | yes |
 | 9 | **wifi W2** (`rtw89rx`): as 8, then Linux's recorded start replayed and 12 s of receiving on channel 1; a summary per network (OUI, channel, SSID hash, security) in `boot-N.early` | yes |
 | 10 | **wifi W3/W4** (`rtw89wifi` + the `wifijoin` service): the card kept up as `/dev/wifi0`'s radio, then `wifi connect` joins the best known network in `/etc/wifi` on p3; `[rtw]` lines in `boot-N.dmesg`, the tool's exit status and `/dev/wifi0`'s non-identifying keys in `wifijoin-N.txt` | yes |
-| 11 | reboot | — |
+| 11 | **wifi W5** (`rtw89wifi` + `wifistay` + `sshd`): joins as entry 10 does, then **stays up 10 minutes** for ssh over wifi; `wifistay-N.txt` gets `/dev/wifi0`'s keys and the DHCP address every 30 s, `boot-N.dmesg` is saved as it goes. Reach it with `python3 overlays/ryzen/wifi-ssh.py --key <key>` (finds the station MAC `02:41:4b:55:4d:41`, ssh on port **2222**) — verified 2026-10-06, boot 20 | yes, after 10 min |
+| 12 | reboot | — |
 
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
 `initargs=daemon,--service,…`, which loads exactly the named herd services.

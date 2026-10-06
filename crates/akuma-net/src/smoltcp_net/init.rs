@@ -165,6 +165,7 @@ fn build(
         dns_handle,
         pending_removal: Vec::new(),
         connecting: Vec::new(),
+        seen_link_gen: None,
     });
 
     NETWORK_READY.store(true, Ordering::Release);

@@ -684,7 +684,7 @@ extern "C" fn netpoll_daemon() -> ! {
 /// (slot 0 means unspawned) and safe when it is not parked — `sched::wake`
 /// records the sticky wake flag rather than losing it, which is what stops a
 /// doorbell rung just before the park from being missed.
-fn wake_netpoll() {
+pub fn wake_netpoll() {
     let slot = NETPOLL_SLOT.load(core::sync::atomic::Ordering::Relaxed);
     if slot != usize::MAX {
         crate::sched::wake(slot);
@@ -1011,6 +1011,16 @@ pub fn init_bare_metal(cmdline: &str) -> bool {
     }
 
     let Some(dev) = crate::pci::find_class(class::NETWORK, subclass::ETHERNET) else {
+        // No Ethernet. The wifi station, if `rtw89wifi` kept the card, is the
+        // link: DHCP on, no pre-DHCP address (nothing here knows the network
+        // it will join).
+        if crate::rtw89_sta::is_link() {
+            serial::puts("  nic:  wifi station (rtw89) — the link comes up when userspace joins\n");
+            let device = akuma_net::ExternalDevice::Queued(akuma_net::queued::QueuedDevice::new(
+                &crate::rtw89_sta::LINK,
+            ));
+            return report_init(akuma_net::init_with_external(net_runtime(), true, device, None));
+        }
         return init_loopback_only();
     };
     serial::puts("  nic:  ");

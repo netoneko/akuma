@@ -33,7 +33,7 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
 | wifi W2 (§5.3) | **done**: the recorded start replayed, 17 networks' beacons on channel 1 (menu entry 9) |
 | wifi W3/W4 (§5.4) | **done**: `rtw89wifi` (menu entry 10) scans, authenticates, associates and completes the WPA2 4-way handshake in the kernel; keys installed, link held (boot 16) |
-| wifi W5 (§5) | next: the data path — DHCP over the joined link |
+| wifi W5 (§5.6) | **ssh over wifi works** (boot 20): DHCP, SNTP, DNS, inbound TCP to sshd on 2222. Outbound TCP to the internet is refused — open |
 
 ## Verdict
 
@@ -502,14 +502,72 @@ RSSI feeds `/dev/wifi0`'s `signal` while joined.
 
 **Still to do, in order.**
 
-1. W5, the data path: DHCP over the joined link — `ExternalDevice` in
-   `akuma-net-nic`, or a minimal DHCP probe first. Data frames go on ACH0 as
-   `tx::Desc::data` (CCMP, `wp_offset` 1); whether the frame must carry the
-   CCMP header's space with the 8852C's `hw_sec_hdr` is the first thing to
-   check against `txd` records.
+1. ~~W5, the data path~~ — done, § 5.6 (outbound TCP still refused).
 2. Scanning beyond channel 1 (a recorded channel switch), a deauthentication
    on `disconnect`, a group-key-only segment for rekeys (today all of `JOIN4`
    is replayed).
+
+### 5.6 W5 results, 2026-10-06 night: ssh into Akuma over its own wifi
+
+**Akuma on ryzen is reachable over wifi** (boot 20, menu entry 11): it joined
+the home network, DHCP gave it an address, the wall clock synced over SNTP,
+DNS resolves, and **`ssh -p 2222 root@<address>` works** — from the Mac,
+through the RTL8852CE, with the WPA2 keys the kernel negotiated. Find the
+address with `overlays/ryzen/wifi-ssh.py --key <key>` (ping-sweeps the /24 and
+looks the station MAC `02:41:4b:55:4d:41` up in the Mac's ARP table). Akuma's
+sshd is on **2222**; port 22 answers with a reset. The user's key is in p3's
+`/etc/sshd/authorized_keys` beside the image's `amd64-ssh-test-key`.
+
+**The data path.**
+
+- `akuma-net-nic::queued`: a NIC that is two fixed frame queues
+  (`FrameQueues`, 16 × 1536 B per direction, `try_lock` only — never spins,
+  since the stack and the driver may share one core). `ExternalDevice::Queued`
+  is the stack's side; the station is the driver's. `net::init_bare_metal`
+  builds the stack on it when there is no Ethernet NIC and `rtw89wifi` kept
+  the card (DHCP on, no static pre-DHCP address).
+- Receive: data frames from the AP that the card decrypted (`hw_dec`, no ICV
+  error) go to the stack as Ethernet (`da`, `sa`, ethertype, payload). The
+  card keeps the CCMP header and MIC (Linux reports `RX_FLAG_DECRYPTED` only);
+  `sta::Data::parse` skips them.
+- Transmit: the stack's frames go out as QoS data, tid 0, **Protected bit set
+  and no CCMP header** — the 8852C writes the header itself (`hw_sec_hdr`; the
+  recording's encrypted frames are `0x4188`, the 62-byte ARP has no header
+  space), from the packet number in the descriptor (`tx::Desc::data`,
+  `wp_offset` 1, security CAM 0). After the keys, EAPOL goes out protected too.
+- **Link changes reach DHCP through an atomic**, not a callback:
+  `FrameQueues::link_changed` bumps a generation on join and loss, and
+  `smoltcp_net::poll` resets the DHCP client when it moves — discovery at once
+  on a join, no stale lease after a rejoin.
+- **Boot does not wait for DHCP on a wifi link** (`boot_to_init`): the link
+  only exists after userspace asks for a join, after `init`. `clock::sync_tick`
+  in the netpoll daemon does SNTP once the interface has an address; on boot
+  20 that was seconds after the join.
+
+**Two failures on the way, both worth remembering:**
+
+- **The card refuses a second firmware download in one boot**
+  (`FWDL_SECURITY_FAIL`, status 3). The first build's join retries
+  power-cycled the card (`Card::restart`) and could never come back. Retries
+  and rejoins now reuse the running card (`JOIN2`..`JOIN4` overwrite the old
+  peer's CAM entries), as Linux re-authenticates without powering anything
+  off. How Linux re-downloads after idle power save without this refusal is
+  open.
+- **A 24 KiB value on a 32 KiB kernel stack**: `flush_transmit` rebuilt the
+  queue by value, right after the keys went in. Boot 19 joined and then could
+  start no new process — `sleep`, `dmesg` and `reboot` all failed at once and
+  the log saved was empty. It now resets two indices.
+
+**Open (W5):**
+
+- **Outbound TCP is refused.** Inbound TCP (sshd), DNS and SNTP (UDP) work,
+  but `wget` to any internet host fails at once with "connection refused" —
+  `connect()` errors before anything is waited for, so suspect the stack's
+  connect path on this link (route, source address, or the `10.0.2.15`
+  fallback the DHCP client installs while unconfigured — its gateway and DNS
+  are QEMU's), not the radio.
+- `ping` cannot open a raw socket (`Invalid argument`); not wifi-specific.
+- Signal strength stays 0 until the firmware's beacon-filter report arrives.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 

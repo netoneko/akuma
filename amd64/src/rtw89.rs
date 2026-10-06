@@ -418,9 +418,7 @@ pub struct Card {
     pub rx_crc: u32,
 }
 
-/// Index into [`Card`]'s TX channels ([`tx::USED`] order). Data (ACH0)
-/// carries nothing until the data path (stage W5).
-#[allow(dead_code)]
+/// Index into [`Card`]'s TX channels ([`tx::USED`] order).
 pub const TX_DATA: usize = 0;
 pub const TX_EAPOL: usize = 1;
 pub const TX_MGMT: usize = 2;

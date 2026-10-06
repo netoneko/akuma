@@ -1128,7 +1128,15 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         // the daemon — see `net::settle_for_dhcp` for why the daemon must be
         // last. `clock::sync_tick` in the daemon keeps retrying if this first
         // attempt did not land.
-        if crate::net::settle_for_dhcp(SETTLE_BUDGET_MS) {
+        //
+        // Not on a wifi link (`rtw89wifi`): there the link exists only once
+        // userspace has asked for a join, which is after `init`, so waiting
+        // here would spend the whole budget on a link that cannot come up
+        // yet. DHCP runs when the join lands, and `clock::sync_tick` (in the
+        // netpoll daemon) does SNTP once the interface has an address.
+        if crate::rtw89_sta::is_link() {
+            serial::puts("  net:  wifi link: DHCP and the wall clock follow the join\n");
+        } else if crate::net::settle_for_dhcp(SETTLE_BUDGET_MS) {
             crate::clock::sync_via_sntp();
         } else {
             serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");

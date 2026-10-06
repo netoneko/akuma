@@ -127,6 +127,9 @@ pub struct NetworkState {
     /// in-flight connects, so it is empty on an idle system and never more than
     /// a few entries deep under load.
     pub connecting: Vec<(SocketHandle, u64)>,
+    /// The device's link generation as of the last poll
+    /// (`LoopbackAwareDevice::link_generation`); a change restarts DHCP.
+    pub seen_link_gen: Option<u32>,
 }
 
 /// Global network stack protected by a Spinlock.

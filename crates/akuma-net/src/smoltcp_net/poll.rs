@@ -45,7 +45,22 @@ pub fn poll() -> bool {
         mark_acquire(NetSite::Poll);
         let result = if let Some(net) = guard.as_mut() {
             let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
-            
+
+            // A link that came up or went away (`queued`'s generation): start
+            // DHCP over, now — a join wants an address at once, not after the
+            // client's backoff, and a rejoin must not keep the old lease.
+            // `reset` also reports a held lease as deconfigured, which the
+            // handler below turns into dropping the address.
+            let generation = net.device.link_generation();
+            if generation != net.seen_link_gen {
+                if net.seen_link_gen.is_some()
+                    && let Some(handle) = net.dhcp_handle
+                {
+                    net.sockets.get_mut::<dhcpv4::Socket>(handle).reset();
+                }
+                net.seen_link_gen = generation;
+            }
+
             let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
             
             // Handle DHCP
