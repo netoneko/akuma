@@ -72,6 +72,7 @@ default-members = [
     "crates/akuma-timer",
     "crates/akuma-usb",
     "crates/akuma-nvme",
+    "crates/akuma-rtw89",
     "crates/akuma-wifi",
     "crates/akuma-usb-storage",
     "crates/akuma-xhci",

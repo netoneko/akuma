@@ -7,7 +7,9 @@ Splits the trace at the script's `MARK w0: <phase>` lines (unbind, bind, up,
 scan, down, end) and, per phase, counts reads and writes and lists the busiest
 registers. Addresses are printed as offsets into the card's BAR (the MAP whose
 physical base the access falls in). `--dump bind` prints that phase's accesses
-in order, one per line: the sequence W1 has to reproduce.
+in order, one per line: the sequence W1 has to reproduce. `--collapse` (with
+`--dump`) folds runs of identical lines into one, which is how
+`crates/akuma-rtw89/tests/golden/w0_up.txt` was made from the "up" phase.
 
 mmiotrace line formats (Documentation/trace/mmiotrace.rst):
     R|W width time map-id phys value pc pid
@@ -28,6 +30,10 @@ def main():
     if not args:
         sys.exit(__doc__)
     dump = None
+    collapse = "--collapse" in args
+    if collapse:
+        args.remove("--collapse")
+    prev = None
     if "--dump" in args:
         i = args.index("--dump")
         dump = args[i + 1]
@@ -55,7 +61,10 @@ def main():
             rw[phase][f[0]] += 1
             regs[phase][(f[0], off)] += 1
             if dump == phase:
-                print(f"{f[0]}{width * 8:<3} 0x{off:05x} = 0x{val:0{width * 2}x}")
+                text = f"{f[0]}{width * 8:<3} 0x{off:05x} = 0x{val:0{width * 2}x}"
+                if not (collapse and text == prev):
+                    print(text)
+                prev = text
     if dump:
         return
     for mid, (base, ln) in maps.items():

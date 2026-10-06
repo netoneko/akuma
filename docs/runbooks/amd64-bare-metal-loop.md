@@ -765,6 +765,7 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 | `wdt` / `wdt=<s>` | arm the **AMD FCH hardware watchdog** (`amd64/src/watchdog.rs`, default 60 s, 10–65535): reset the machine if the BSP takes no timer interrupt for that long. Gated on the chipset (`1022:790b` rev ≥ `0x51`), so the trashcan's Intel board logs "not armed". Stopped before an orderly reset |
 | `wdttest` | arm the watchdog, then wedge with interrupts off instead of starting `init`, to prove the reset fires. **Refuses** (and boots normally) if the watchdog did not arm |
 | `nofb` | do not touch the framebuffer: boot headless, everything to `dmesg`. A framebuffer that cannot be used (none, not direct-colour, unmapped) now also means headless rather than a halt |
+| `rtw89` | (multiboot2, after the root mount) bring ryzen's **RTL8852CE** up to running firmware and shut it down again — wifi stage W1; `[rtw]` lines say how far it got — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |
 | `wifisim` | register the **simulated wifi radio** behind `/dev/wifi0` (PVH and multiboot2), for testing the `wifi` tool without hardware — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |
 
 `root=/dev/sda1` needs the drive in a **USB 3.0** socket — see the first rule in

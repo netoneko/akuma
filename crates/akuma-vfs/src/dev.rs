@@ -126,6 +126,10 @@ const BLOCK_NODES: &[DevNode; MAX_BLOCK_SLOTS] = &[
 ///
 /// Passed in rather than probed here so the table is a pure function — see the
 /// module docs.
+// Four independent facts about the machine and the caller, each gating its own
+// node — not states of one thing, so the enum refactor clippy suggests would
+// only rename them. The fourth (`wifi`) arrived 2026-10-06.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DevProbe {
     /// A virtio-sound device was found at boot (`audio::is_available()`).

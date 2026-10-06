@@ -116,6 +116,9 @@ mod pci;
 /// The `reboot(2)` syscall and the x86 machine reset under it.
 #[cfg(target_arch = "x86_64")]
 mod reboot;
+/// ryzen's RTL8852CE wifi card, up to running firmware (`rtw89`, wifi stage W1).
+#[cfg(target_arch = "x86_64")]
+mod rtw89;
 /// A span of RAM as a block device, so a machine with no storage driver can
 /// still mount the root filesystem its boot loader left in memory.
 mod ramdisk;

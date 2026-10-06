@@ -176,6 +176,42 @@ pub fn enable_full(addr: Address, bus_master: bool, mask_intx: bool) {
     write_u32(addr, 0x04, status | u32::from(cmd));
 }
 
+/// Memory decode and Bus Master Enable on every bridge between `bus` and the
+/// root, as Linux's `pci_enable_device` -> `pci_enable_bridge` does. Returns
+/// the command register of the first bridge (the device's own port) as it was
+/// before, or `None` if no bridge leads to `bus`.
+///
+/// A bridge forwards a device's memory requests upstream only with **its own**
+/// Bus Master Enable set. Firmware sets it on the ports it used and may leave
+/// the rest at `0x0003`: on ryzen the wifi card's root port arrived that way,
+/// so every DMA read the RTL8852CE made was dropped at the port, and its
+/// firmware download stalled with `TXMDA_STUCK` through five metal runs
+/// (2026-10-06, `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md` § 5.2). The
+/// NVMe worked all along because firmware booted through its port. A driver
+/// that sets [`command::BUS_MASTER`] on its device should call this too.
+pub fn enable_bridges_above(mut bus: u8) -> Option<u16> {
+    let mut first = None;
+    // A tree deeper than this would be a loop in a misread topology.
+    for _ in 0..8 {
+        if bus == 0 {
+            break;
+        }
+        let mut port = None;
+        for_each(|d| {
+            if d.header.is_bridge() && (read_u32(d.addr, 0x18) >> 8) as u8 == bus {
+                port = Some(d.addr);
+            }
+        });
+        let addr = port?;
+        let cmd = (read_u32(addr, 0x04) & 0xffff) as u16;
+        first.get_or_insert(cmd);
+        let status = read_u32(addr, 0x04) & 0xffff_0000;
+        write_u32(addr, 0x04, status | u32::from(cmd | command::MEMORY_SPACE | command::BUS_MASTER));
+        bus = addr.bus;
+    }
+    first
+}
+
 /// Stop a device DMA-ing and stop it asserting a legacy interrupt, leaving its
 /// BARs and its decode alone.
 ///

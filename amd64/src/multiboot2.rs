@@ -975,6 +975,12 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         mount_ram()
     };
 
+    // `rtw89` (ryzen): the wifi card up to running firmware, then shut down
+    // again — wifi stage W1. After the root mount: the firmware is a file.
+    if have_fs {
+        crate::rtw89::init(info.cmdline());
+    }
+
     // Networking: the Realtek NIC if this box has one, loopback only otherwise.
     // Either way `socket(AF_INET)` works for `busybox ifconfig` and `127.0.0.1`.
     let have_net = crate::net::init_bare_metal(info.cmdline());

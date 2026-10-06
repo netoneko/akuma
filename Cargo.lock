@@ -114,6 +114,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-procfs",
+ "akuma-rtw89",
  "akuma-ryzen-amd64",
  "akuma-selftest",
  "akuma-sntp",
@@ -538,6 +539,10 @@ version = "0.1.0"
 
 [[package]]
 name = "akuma-reclock"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-rtw89"
 version = "0.1.0"
 
 [[package]]

@@ -1,9 +1,13 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-10-06 (second run that day) with
-`python3 scripts/cloc_akuma.py src crates`: **57 of 77 crates** forbid
-`unsafe` (76307 of 98046 crate lines, 77.8%; 97.6% of production
-code lies outside any `unsafe` block). Added in this run: **`akuma-wifi`**
+**Grade: A** — regenerated 2026-10-06 (third run that day) with
+`python3 scripts/cloc_akuma.py src crates`: **58 of 78 crates** forbid
+`unsafe` (78014 of 99753 crate lines, 78.2%; 97.6% of production
+code lies outside any `unsafe` block). Added in this run: **`akuma-rtw89`**
+(1039 production lines, 0 sites): the RTL8852CE power-on, DMA setup and
+firmware download for wifi stage W1, replayed in host tests against Linux's
+register trace of the same card. Its MMIO/DMA half is `amd64/src/rtw89.rs`
+([`subsystems/wifi.md`](subsystems/wifi.md)). The run before added **`akuma-wifi`**
 (the `/dev/wifi0` protocol and the simulated radio, 0 sites;
 [`subsystems/wifi.md`](subsystems/wifi.md)). Earlier the same day, also carrying the ban
 from its first commit: **`akuma-nvme`** (582 production lines, 0 sites). That is

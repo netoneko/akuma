@@ -30,7 +30,8 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | Windows | **gone**: p3 reformatted at the user's request |
 | FCH watchdog (`wdt`) | **done**: a deliberate wedge was reset by the chipset in 60 s (`FIRED=1`), `overlays/ryzen/README.md` § The watchdog |
 | wifi W0 (§5.1) | **done**: mmiotrace of probe and of interface-up through `fw ready`, `overlays/ryzen/w0-trace.sh` |
-| wifi W1–W5 (§5) | not started |
+| wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
+| wifi W2–W5 (§5) | not started |
 
 ## Verdict
 
@@ -240,6 +241,44 @@ What the trace cannot show: the firmware bytes and every H2C command travel by
 DMA. The busy registers in "up" (`0x1174c` polled 7.2k times, `0x10370`
 read-modify-written 3.4k times, `0x1e0c0`/`0x1f0c0`) are the DMA channel's
 bookkeeping; decoding them against `rtw89/pci.c` is the first job of W1.
+
+### 5.2 W1 results, 2026-10-06
+
+`crates/akuma-rtw89` holds the sequence — every function the 8852C arm of its
+Linux namesake, `forbid(unsafe_code)` — and `amd64/src/rtw89.rs` the PCI,
+BAR, DMA memory and firmware file. Before any metal boot the bring-up already
+**replayed access-for-access against the W0 trace** (`tests/golden_trace.rs`:
+651 register accesses, power-on through `0xe2`, ring base addresses the only
+values not compared), and a simulated chip checked the DMA payload. Seven
+boots of menu entry 8, each rehearsed in QEMU first (no card there: the
+"absent" path), each back in Pop by itself in 175–216 s:
+
+| run | changed | result |
+|---|---|---|
+| 1 | — | power-on, DMA setup, `H2C_PATH_RDY` (`0x23`) all as Linux; the chip fetched the header packet (CH12 index 1/1) but `FWDL_PATH_RDY` never came |
+| 2 | `DevCtl.NoSnoop` cleared; arrival state logged | same. No Snoop was already off; the card arrived exactly as Linux's bind found it |
+| 3 | IOMMU, `DevSta`, ring readback logged | same. AMD-Vi off (`IommuEn` 0), no PCIe errors, the ring entry is at the address the card was given. **`DMAC_ERR_ISR` = `HAXIDMA_ERR_FLAG`** |
+| 4 | RX rings stocked with buffers, as Linux's are; `HAXI_IDCT` logged | same; `HAXI_IDCT` = **`TXMDA_STUCK`** — the TX DMA engine wedged on the packet |
+| 5 | ASPM L1 and CLKREQ# off for the bring-up (`rtw89_pci_link_cfg`'s warning) | same |
+| 6 | **Bus Master Enable on the card's root port**, as Linux's `pci_enable_bridge` does | **`fw ready v0.27.122`**: header accepted `0x27`, 166 packets, `0xe2`, 49.6 ms |
+| 7 | the experiments of runs 2–5 removed, `pci::enable_bridges_above` | confirms run 6 |
+
+**Root cause.** The root port above the card (bus 2) arrived from firmware
+with command `0x0003`: memory and I/O decode on, Bus Master **off**. A bridge
+forwards a device's DMA upstream only with its own Bus Master Enable set, so
+the card fetched nothing. It still advanced its ring index and reported
+"TX DMA stuck" rather than any PCIe error, which is why it took four runs to
+see past the content of the packet. Linux sets bus mastering on every bridge
+above a device it enables; Akuma's `pci::enable_full` never touched bridges,
+and the NVMe and xHCI drivers never needed it because firmware boots through
+their ports. `pci::enable_bridges_above` is the fix, and any new bus-master
+driver on this target should call it.
+
+What W1 deliberately does not do: keep the firmware running. The card is
+shut down (CPU stopped, DMA stopped, MAC powered off, bus mastering off) before
+`init`, so a warm reset never finds a live bus master. W2 starts from here:
+the rest of `rtw89_mac_init` (`sys_init`, `trx_init` with the full quota mode),
+then RX.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 

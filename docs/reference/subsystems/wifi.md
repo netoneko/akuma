@@ -32,7 +32,7 @@ herd ─ "wifi" service (/bin/wifi auto)
          │ reads /etc/wifi/*  (0600)
          │ write "scan wlan0" → read results → choose → write "connect wlan0 <ssid> <psk>"
          ▼
-/dev/wifi0 ── amd64/src/wifi.rs ── backend: simulated radio (`wifisim`) │ rtw89 (to come)
+/dev/wifi0 ── amd64/src/wifi.rs ── backend: simulated radio (`wifisim`) │ rtw89 (W1: firmware runs; not yet a backend)
 ```
 
 ## Where the code is
@@ -99,7 +99,7 @@ gets its own cursor. `close` frees it.
 |---|---|---|
 | none | default | **no `/dev/wifi0` node at all** (`open` is `ENOENT`, `ls /dev` omits it) |
 | simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below |
-| rtw89 | not yet | ryzen's RTL8852CE (W1–W4) |
+| rtw89 | not yet a backend | ryzen's RTL8852CE. **W1 done 2026-10-06**: `rtw89` on the command line powers the card on, downloads its firmware and sees it ready, then shuts it down before `init` — [The radio](#the-radio-rtl8852ce-akuma-rtw89) below. W2 (receive) is next |
 
 **The simulated radio** is deterministic: the same networks every boot, scans
 complete at once, and fixed rules for `connect`. A test that passes against it
@@ -116,6 +116,53 @@ fails later only because a real radio differs.
 These names and the passphrase are the simulator's, fake and public. Real
 network names and passphrases never go in the repo. Real passphrases live on
 the laptop in `~/.akuma/wifi/<network>`.
+
+## The radio: RTL8852CE (`akuma-rtw89`)
+
+Stage W1 of the wifi plan: from a powered-off card to running firmware.
+
+| piece | where | does |
+|---|---|---|
+| the sequence | `crates/akuma-rtw89` (`forbid(unsafe_code)`, host-tested) | power-on (`rtw8852c_pwr_on_func`), the DMA engine's download-mode setup (`dle_init(DLFW)`, H2C flow control, `rtw89_pci_ops_mac_pre_init_ax`), the firmware CPU reset, the download on CH12, the wait for `fw ready`; the firmware container and header parser |
+| the hardware | `amd64/src/rtw89.rs` | finds `10ec:c852`, D0, maps BAR2, **Bus Master on the root port** as well as the card, `.bss` DMA memory, streams the firmware file through `fs::read_at` (never loaded whole), logs `[rtw]` lines, always shuts the card down |
+| the boot token | `rtw89` (multiboot2 path, after the root mount) | ryzen menu entry 8 |
+
+**What a good boot logs** (`boot-N.early` on p3):
+
+```
+[rtw] firmware /lib/firmware/rtw89/rtw8852c_fw-1.bin, 2375560 bytes
+[rtw] root port command was 0x0000000000000003
+[rtw] chip cut 0x0000000000000001
+[rtw] h2c path ready, FW_CTRL 0x0000000000000023
+[rtw] header accepted, FW_CTRL 0x0000000000000027
+[rtw] section packets sent 0x00000000000000a6
+[rtw] fw ready v0.27.122 (cut 1, 166 packets, FW_CTRL 0x00000000000000e2, 49631 us)
+[rtw] card shut down
+```
+
+`WCPU_FW_CTRL` (`0x1e0`) is the handshake: `0x01` download enabled → `0x23`
+H2C path ready → `0x27` header accepted → `0xc3` image in (status 6) →
+`0xe2` **init ready** (status 7). Linux's driver walks the same values (W0
+trace). A failure names the stage, the register and its last value, and dumps
+`DMAC_ERR_ISR` and `HAXI_IDCT` — the DMA engine's own account of what stuck.
+
+**How it is tested.** `tests/golden_trace.rs` replays the whole bring-up
+against Linux's register trace of this very card (`tests/golden/w0_up.txt`,
+651 accesses): every write must match register, width and value, ring base
+addresses excepted. `tests/sim_chip.rs` checks what the trace cannot see — the
+DMA payload: header packet then every section byte in order, slot reuse under a
+slow chip, a garbage ring index, a rejected image, a short read.
+`tests/real_firmware.rs` runs the parser over the real file when
+`AKUMA_RTW89_FW` points at it (166 packets, version 0.27.122.0).
+
+**The trap it hit.** Five metal runs stalled at "header accepted" with the
+register sequence provably identical to Linux's. The card's root port had come
+out of firmware with command `0x0003`: decode on, **Bus Master off**, so every
+DMA read the card made was dropped at the port (`HAXI_IDCT` bit 0,
+`TXMDA_STUCK`). Linux's `pci_enable_device` enables bus mastering on every
+bridge above a device; Akuma's `pci::enable_full` only ever touched the device.
+`pci::enable_bridges_above` now does what Linux does. The NVMe never showed it
+because firmware booted through its port.
 
 ## `/etc/wifi/<network>`
 
@@ -151,8 +198,10 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 ## Known gaps
 
-- **No real radio.** `wifi auto` on a machine without `wifisim` finds no
-  `/dev/wifi0` and says so every poll.
+- **No real radio behind `/dev/wifi0` yet.** The RTL8852CE's firmware runs
+  (W1) but the card is shut down again before `init`; receive (W2) comes next.
+  `wifi auto` on a machine without `wifisim` finds no `/dev/wifi0` and says so
+  every poll.
 - **No `poll(2)` readiness on `/dev/wifi0`.** The tool polls by reading (100 ms
   steps). Readiness-on-state-change is the natural next step once a real radio
   makes state change asynchronously.
@@ -165,4 +214,5 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 - [`proposals/AKUMA_WIFI_CONTROL.md`](../../../proposals/AKUMA_WIFI_CONTROL.md): the design, accepted 2026-10-06
 - [`../../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md): the wifi plan (§ 5) this serves
-- [`../../../overlays/ryzen/README.md`](../../../overlays/ryzen/README.md): the reboot loop and the `wifitest` entry
+- [`../../../overlays/ryzen/README.md`](../../../overlays/ryzen/README.md): the reboot loop, the `wifitest` entry and the `rtw89` entry
+- [`../../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md) § 5.1–5.2: the W0 trace and the W1 metal runs

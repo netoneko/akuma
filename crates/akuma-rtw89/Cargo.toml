@@ -1,0 +1,13 @@
+[package]
+name = "akuma-rtw89"
+version = "0.1.0"
+edition = "2024"
+description = "Pure bring-up logic for the Realtek RTL8852CE (rtw89) wifi card on ryzen: the power-on, DMA-engine and firmware-command-ring sequences behind a register-access trait, the multi-firmware container and header parser, and the firmware download — host-tested against a register trace of Linux doing the same, no card required."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []
