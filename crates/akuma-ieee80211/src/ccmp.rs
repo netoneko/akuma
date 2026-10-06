@@ -154,14 +154,12 @@ mod tests {
         f[0] = if qos { 0x88 } else { 0x08 };
         f[1] = 0x02 | 0x40 | if htc { 0x80 } else { 0 };
         f[4] = da0;
-        let mut at = 24;
-        if qos {
-            f[24] = tid;
-            at = 26;
-        }
-        if htc && qos {
-            at += 4;
-        }
+        f[24] = tid;
+        let at = match (qos, htc) {
+            (false, _) => 24,
+            (true, false) => 26,
+            (true, true) => 30,
+        };
         f[at..at + 8].copy_from_slice(&[pn[0], pn[1], 0, 0x20 | (keyid << 6), pn[2], pn[3], pn[4], pn[5]]);
         f
     }
