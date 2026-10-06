@@ -19,6 +19,7 @@ Why this shape, and the wifi work it exists for:
 | framebuffer (1920×1200 at `0x4b0000000`) | works |
 | hardware watchdog (`wdt`, AMD FCH) | **works**: a deliberately wedged kernel (`arm.sh 6`) was reset by the chipset in 60 s, `FIRED=1` seen from Pop |
 | RTL8852CE firmware on p3 (`/lib/firmware/rtw89/`) | staged (`fetch-firmware.sh`); nothing loads it yet |
+| wifi W0: Linux's bring-up traced | **done**: probe + interface-up through `fw ready` (`w0-trace.sh`, results in the survey doc § 5.1; traces in `~/.akuma/w0/` on the laptop) |
 | wifi control (`/dev/wifi0`, `/etc/wifi`, `wifi`) | **works** against the simulated radio (entry 7, rehearsed); no real radio yet — [`docs/reference/subsystems/wifi.md`](../../docs/reference/subsystems/wifi.md) |
 | network | none, so ssh into Akuma here is not possible; the log is the channel |
 | wifi credentials | `~/.akuma/wifi/<network>` on the laptop holds the passphrase; never copied into the repo, docs or logs |

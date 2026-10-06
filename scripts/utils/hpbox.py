@@ -22,6 +22,7 @@ CLI:  python3 scripts/utils/hpbox.py which        # 'ubuntu' | 'akuma' | 'unknow
       python3 scripts/utils/hpbox.py ramdisk [GiB]  # target/ on tmpfs (rotational root)
       python3 scripts/utils/hpbox.py ramdisk-sync   # copy tmpfs target/ back to disk
       python3 scripts/utils/hpbox.py rz  '<cmd>'  # run on the Ryzen laptop
+      python3 scripts/utils/hpbox.py rzr '<cmd>'  # same, as root (overlays/ryzen)
       python3 scripts/utils/hpbox.py --ip 192.168.1.120 which  # DHCP moved it
       HPBOX_IP=192.168.1.120 python3 scripts/utils/hpbox.py ...  # same, via env
 
@@ -98,6 +99,21 @@ def ryzen(cmd, timeout=120):
     """
     r = subprocess.run(RZ + [cmd], capture_output=True, text=True,
                        errors="replace", timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
+
+
+# The same laptop as root, for the overlays/ryzen scripts (arm, install, the
+# wifi W0 trace). Key login as root is what `ssh ryzen` in ~/.ssh/config does;
+# it is spelled out here so nothing depends on that alias.
+RZ_ROOT = RZ[:-1] + [f"root@{RYZEN_HOST}"]
+
+
+def ryzen_root(cmd, timeout=120, input=None):
+    """Run `cmd` on the Ryzen laptop as root. Returns (rc, stdout, stderr).
+    `input` (str) is fed to the remote command's stdin — e.g. a script body
+    for `cat > /root/x.sh`."""
+    r = subprocess.run(RZ_ROOT + [cmd], capture_output=True, text=True,
+                       errors="replace", timeout=timeout, input=input)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -799,6 +815,11 @@ def _main(argv):
         return rc
     if cmd in ("rz", "ryzen"):
         rc, o, e = ryzen(" ".join(rest))
+        sys.stdout.write(o)
+        sys.stderr.write(e)
+        return rc
+    if cmd in ("rzr", "ryzen-root"):
+        rc, o, e = ryzen_root(" ".join(rest))
         sys.stdout.write(o)
         sys.stderr.write(e)
         return rc

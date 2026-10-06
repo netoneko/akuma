@@ -6,6 +6,11 @@
 #   sh w0-trace.sh            # detaches itself (systemd-run), returns at once
 #   sh w0-trace.sh --check    # preflight only: changes nothing
 #
+# From the laptop (hpbox.py's root helper; the run itself survives the drop):
+#   python3 -c 'import sys; sys.path.insert(0,"scripts/utils"); import hpbox;
+#     print(hpbox.ryzen_root("cat > /root/w0-trace.sh && sh /root/w0-trace.sh",
+#                            input=open("overlays/ryzen/w0-trace.sh").read()))'
+#
 # Rebinding the card takes down ryzen's only network, which takes down the ssh
 # session that started this. So the script detaches into its own systemd unit
 # (`akuma-w0`), and every exit path, including an error, puts the network back
@@ -28,7 +33,10 @@
 # end of the run in `log`. The trace has no SSIDs and no keys (association never
 # happens while tracing; frames arrive by DMA, which mmiotrace cannot see), but
 # it holds the card's efuse, so the MAC address. Fetch from the laptop:
-#   ssh ryzen 'tar -C /var/tmp/akuma-w0 -cf - <stamp>' | tar -C <dir> -xf -
+#   python3 -c 'import sys,subprocess; sys.path.insert(0,"scripts/utils"); import hpbox;
+#     sys.stdout.buffer.write(subprocess.run(hpbox.RZ_ROOT + ["tar -C /var/tmp/akuma-w0 -cf - <stamp>"],
+#     capture_output=True).stdout)' | tar -C <dir> -xf -
+# (not `hpbox.py rzr`: its CLI decodes output as text, which mangles a tar.)
 set -u
 OUT_ROOT=/var/tmp/akuma-w0
 T=/sys/kernel/tracing
@@ -76,7 +84,12 @@ mkdir -p $O && chmod 700 $OUT_ROOT $O
 exec >>$O/log 2>&1
 log() { echo "$(date +%T.%N | cut -c1-12) $*"; }
 mark() { echo "w0: $*" > $T/trace_marker 2>/dev/null; log "mark: $*"; }
-OLD_KB=$(cat $T/buffer_size_kb)
+# The size to restore. An unexpanded buffer reads back as `7 (expanded: 1408)`,
+# which cannot be written back, so take the expanded figure; and keep the first
+# value ever seen, so a run that failed to restore cannot make its own size the
+# "original" of the next run.
+[ -f $OUT_ROOT/buffer_size_kb.orig ] || sed 's/.*expanded: \([0-9]*\).*/\1/' $T/buffer_size_kb > $OUT_ROOT/buffer_size_kb.orig
+OLD_KB=$(cat $OUT_ROOT/buffer_size_kb.orig)
 PIPE_PID=
 CLEANED=
 
@@ -134,7 +147,9 @@ ls -la /sys/kernel/debug/ieee80211/*/rtw89/ > $O/debugfs-list.txt 2>&1
 
 # 2. NetworkManager lets go of the interface: the wifi drops here.
 mkdir -p ${NM_DROPIN%/*}
-printf '[keyfile]\nunmanaged-devices=interface-name:%s\n' "$IF" > $NM_DROPIN
+# By MAC, not name: the rebound card comes back as wlan0 and is renamed a
+# moment later, and a name match would not cover that window.
+printf '[keyfile]\nunmanaged-devices=mac:%s\n' "$(cat /sys/class/net/$IF/address)" > $NM_DROPIN
 nmcli general reload conf
 sleep 3
 log "nm: $(nmcli -t -f DEVICE,STATE device | grep "^$IF:")"
@@ -155,8 +170,14 @@ echo $BDF > /sys/bus/pci/drivers/$DRV/bind || { log "bind refused"; exit 1; }
 i=0; NEWIF=
 while [ $i -lt 20 ]; do NEWIF=$(ls $DEV/net 2>/dev/null | head -n1); [ -n "$NEWIF" ] && break; sleep 1; i=$((i+1)); done
 [ -n "$NEWIF" ] || { log "no interface 20 s after bind"; exit 1; }
-[ "$NEWIF" = "$IF" ] || log "interface came back as $NEWIF"
-sleep 2
+# udev renames wlan0 -> wlp2s0 just after bind; run 1 (2026-10-06) lost the
+# race and `ip link set wlan0 up` found nothing, so the firmware download was
+# never traced. Settle, then take the name again.
+udevadm settle --timeout=10
+sleep 1
+NEWIF=$(ls $DEV/net 2>/dev/null | head -n1)
+log "interface: $NEWIF"
+sleep 1
 
 # 5. Interface up: power on again, MAC init, firmware download, fw ready.
 mark up

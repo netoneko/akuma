@@ -29,7 +29,8 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | log sink | **done**: p3, ext2 (64 GiB filesystem inside the 279 GiB partition) |
 | Windows | **gone**: p3 reformatted at the user's request |
 | FCH watchdog (`wdt`) | **done**: a deliberate wedge was reset by the chipset in 60 s (`FIRED=1`), `overlays/ryzen/README.md` § The watchdog |
-| wifi W0–W5 (§5) | not started |
+| wifi W0 (§5.1) | **done**: mmiotrace of probe and of interface-up through `fw ready`, `overlays/ryzen/w0-trace.sh` |
+| wifi W1–W5 (§5) | not started |
 
 ## Verdict
 
@@ -203,6 +204,42 @@ A cheaper wifi path, if the goal is "Akuma on wifi" and not "this card": a USB
 wifi dongle with a small, well-understood chip (MT7601U being the classic
 choice). It reuses the xHCI work in §6 and skips PCIe DMA and the 802.11ax
 tables. W3–W4 are needed either way.
+
+### 5.1 W0 results, 2026-10-06
+
+`overlays/ryzen/w0-trace.sh`, run twice from Pop (kernel 6.17.9, firmware
+`rtw8852c_fw-1.bin` 0.27.122.0; Pop has no `-2.bin`, which the driver tries
+first). Each run: NetworkManager kept off the card by MAC, mmiotrace on (it
+takes every CPU but one offline), unbind, bind, `ip link set up`, down, trace
+off, network back. Wifi was gone about 25 s per run; association resumed 4 s
+after the trace stopped, so no keys are in it. The traces are on the laptop
+in `~/.akuma/w0/<stamp>/`, outside the repo because the efuse holds the MAC,
+and on ryzen under `/var/tmp/akuma-w0/`. Summarize with
+`overlays/ryzen/w0-summary.py <trace> [--dump PHASE]`.
+
+| phase | reads | writes | what it is |
+|---|---|---|---|
+| bind (probe) | 58,539 | 2,316 | power-on, efuse (50k polls of `0x30`), power-off. Identical across both runs to within polling counts |
+| up | 18,913 | 8,886 | power-on again, MAC init, firmware download, `fw ready` |
+| down | 1 | 1 | — |
+
+Two things the traces settle for W1:
+
+- **Firmware is downloaded at interface-up, not at probe.** Probe reads the
+  file (`request_firmware`) but only parses it. Run 1 missed the download
+  entirely: the rebound card appears as `wlan0` and udev renames it to
+  `wlp2s0` a moment later, so `ip link set wlan0 up` found nothing. The script
+  now waits for `udevadm settle`.
+- **The `fw ready` handshake is visible in `R_AX_WCPU_FW_CTRL` (`0x1e0`)**,
+  status field bits 7:5: `0x01` (driver sets FWDL_EN) → `0x23` (H2C path
+  ready) → `0x27` (download path ready) → `0xc3` (status 6, image accepted;
+  polled ~5.6k times while the firmware boots) → `0xe2` (status 7,
+  **init ready**). That last value is W1's "done when".
+
+What the trace cannot show: the firmware bytes and every H2C command travel by
+DMA. The busy registers in "up" (`0x1174c` polled 7.2k times, `0x10370`
+read-modify-written 3.4k times, `0x1e0c0`/`0x1f0c0`) are the DMA channel's
+bookkeeping; decoding them against `rtw89/pci.c` is the first job of W1.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
