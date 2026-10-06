@@ -44,7 +44,7 @@ use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
 use akuma_rtw89::bringup::{self, Ch12, Dma, RING_BYTES, SLOT};
 use akuma_rtw89::fw::Source;
-use akuma_rtw89::{Bus, h2c, rx, script};
+use akuma_rtw89::{Bus, h2c, rx, script, tx};
 
 use crate::pci;
 use crate::polltime::spin_us;
@@ -86,6 +86,9 @@ static mut RPQ_MEM: Page<4096> = Page([0; 4096]);
 static mut SLOT_MEM: Page<{ SLOT * SLOTS }> = Page([0; SLOT * SLOTS]);
 static mut RXQ_BUF_MEM: Page<{ RX_BUF_BYTES * RX_ENTRIES }> = Page([0; RX_BUF_BYTES * RX_ENTRIES]);
 static mut RPQ_BUF_MEM: Page<{ RPQ_BUF_BYTES * RX_ENTRIES }> = Page([0; RPQ_BUF_BYTES * RX_ENTRIES]);
+/// The TX channels the join transmits on (ACH0, ACH3, CH8), back to back:
+/// each `tx::CHAN_BYTES` of TXBD ring, WD pages and frame buffers.
+static mut TX_MEM: Page<{ 3 * tx::CHAN_BYTES }> = Page([0; 3 * tx::CHAN_BYTES]);
 
 const _: () = assert!(RING_BYTES <= 4096);
 const _: () = assert!(h2c::RX_BUF_SIZE as usize <= RX_BUF_BYTES);
@@ -260,6 +263,16 @@ pub fn init(cmdline: &str) {
         slots,
         idle_phys: phys((&raw const IDLE_MEM).cast()),
         rx_phys: [phys((&raw const RXQ_MEM).cast()), phys((&raw const RPQ_MEM).cast())],
+        tx_phys: {
+            let tx_base = phys((&raw const TX_MEM).cast());
+            // The address-info format carries the frame's bus address in 32
+            // low bits and 4 high ones; this driver only handles the low 32.
+            [0, 1, 2].map(|k| {
+                let at = tx_base + (k as usize * tx::CHAN_BYTES) as u64;
+                assert!(at + tx::CHAN_BYTES as u64 <= 1 << 32, "TX channel memory above 4 GiB");
+                at
+            })
+        },
     };
 
     let t0 = crate::polltime::tsc();
@@ -349,7 +362,7 @@ fn fnv1a(b: &[u8]) -> u32 {
 fn start_and_listen(regs: &mut Regs, dma: &mut Dma<'_>, ch12: &mut Ch12) {
     let t0 = crate::polltime::tsc();
     let mut st = script::Stats::default();
-    let result = script::run(regs, script::UP, [0; 6], &mut Sink { ch12, dma }, &mut st);
+    let result = script::run(regs, script::UP, &script::Vars::default(), &mut Sink { ch12, dma }, &mut st);
     let us = (crate::polltime::tsc() - t0) / (crate::polltime::tsc_hz() / 1_000_000).max(1);
     let ok = match result {
         Ok(()) => true,

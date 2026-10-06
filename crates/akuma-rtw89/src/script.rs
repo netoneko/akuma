@@ -316,7 +316,7 @@ pub fn run<B: Bus>(
                 let body = rd.take(len)?;
                 let c = cmd.get_mut(..len).ok_or(Error::Corrupt(at))?;
                 c.copy_from_slice(body);
-                for s in seq[subs_at..subs_at + n * 3].chunks_exact(3) {
+                for s in seq[subs_at..subs_at + n * 3].as_chunks::<3>().0 {
                     if !vars.fill(c, s[0], usize::from(u16::from_le_bytes([s[1], s[2]]))) {
                         return Err(Error::Corrupt(subs_at));
                     }

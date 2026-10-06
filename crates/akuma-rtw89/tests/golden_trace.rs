@@ -187,6 +187,7 @@ fn bring_up_matches_linux_access_for_access() {
         slots_phys: 0x2_0000,
         idle_phys: 0x3_0000,
         rx_phys: [0x4_0000, 0x5_0000],
+        tx_phys: [0x6_0000, 0x7_0000, 0x8_0000],
     };
     let mut bus = Replay::new();
     let mut steps = 0;
@@ -202,12 +203,17 @@ fn bring_up_matches_linux_access_for_access() {
     assert_eq!(report.fw_ctrl, 0xe2);
     assert!(steps > 0, "the bring-up logged nothing");
 
-    // CH12 points at the ring given; every other TX channel at the idle ring;
-    // RXQ and RPQ at theirs; all high words zero.
+    // CH12 points at the ring given; the join's TX channels at theirs; every
+    // other TX channel at the idle ring; RXQ and RPQ at theirs; all high
+    // words zero.
     let ch12 = regs::TX_RINGS[12].desa_l;
     assert_eq!(bus.ring_bases[&ch12], 0x1_0000);
-    for ring in &regs::TX_RINGS[..12] {
-        assert_eq!(bus.ring_bases[&ring.desa_l], 0x3_0000);
+    for (i, ring) in regs::TX_RINGS[..12].iter().enumerate() {
+        let want = match akuma_rtw89::tx::USED.iter().position(|&u| u == i) {
+            Some(k) => 0x6_0000 + (k as u64) * 0x1_0000,
+            None => 0x3_0000,
+        };
+        assert_eq!(u64::from(bus.ring_bases[&ring.desa_l]), want);
     }
     assert_eq!(bus.ring_bases[&regs::RX_RINGS[0].1], 0x4_0000);
     assert_eq!(bus.ring_bases[&regs::RX_RINGS[1].1], 0x5_0000);

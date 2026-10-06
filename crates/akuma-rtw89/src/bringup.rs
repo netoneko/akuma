@@ -22,6 +22,7 @@ use core::sync::atomic::{Ordering, fence};
 use crate::fw::{self, Image, Source};
 use crate::h2c;
 use crate::regs as r;
+use crate::tx;
 use crate::{Bus, clr8, clr16, clr32, mask16, mask32, poll8, poll32, set8, set32};
 
 /// Bytes of DMA memory per in-flight CH12 packet: descriptor, H2C header and
@@ -98,6 +99,11 @@ pub struct Dma<'a> {
     /// The RX and release-report rings, [`RING_BYTES`] each. Every entry must
     /// already hold a buffer ([`h2c::rx_bd`]), as Linux's do.
     pub rx_phys: [u64; 2],
+    /// Bus addresses of the TX channels the join transmits on, in [`tx::USED`]
+    /// order (ACH0, ACH3, CH8): `pre_init` points those channels' rings at
+    /// them instead of [`Dma::idle_phys`]. Each names a [`tx::CHAN_BYTES`]
+    /// region, ring first.
+    pub tx_phys: [u64; 3],
 }
 
 impl Dma<'_> {
@@ -417,9 +423,17 @@ fn pci_mac_pre_init(bus: &mut impl Bus, dma: &Dma<'_>) -> Result<(), Error> {
     set32(bus, r::TX_ADDRESS_INFO_MODE_SETTING, r::HOST_ADDR_INFO_8B_SEL);
     clr32(bus, r::PKTIN_SETTING, r::WD_ADDR_INFO_LENGTH);
 
-    // ops_reset -> reset_trx_rings
+    // ops_reset -> reset_trx_rings. CH12 gets the command ring; the channels
+    // the join transmits on (tx::USED) get their own TXBD rings; every other
+    // TX channel stays stopped, pointed at the idle ring.
     for (i, ring) in r::TX_RINGS.iter().enumerate() {
-        let base = if i == r::TX_RINGS.len() - 1 { dma.ring_phys } else { dma.idle_phys };
+        let base = if i == r::TX_RINGS.len() - 1 {
+            dma.ring_phys
+        } else if let Some(k) = tx::USED.iter().position(|&u| u == i) {
+            dma.tx_phys[k]
+        } else {
+            dma.idle_phys
+        };
         bus.write16(ring.num, r::RING_LEN);
         bus.write32(ring.bdram, ring.bdram_val);
         bus.write32(ring.desa_l, base as u32);

@@ -185,6 +185,7 @@ impl Buffers {
             slots_phys: SLOTS_PHYS,
             idle_phys: 0x30_0000,
             rx_phys: [0x40_0000, 0x50_0000],
+            tx_phys: [0; 3],
         }
     }
 
