@@ -729,9 +729,11 @@ reading it reproduces Linux's `BAT0` exactly — voltage 13028 mV, remaining
 ACIN bit 0, BTIN bit 1, BTST bits 2-5; design cap `0x84`, design V `0x86`, full
 `0x88`, current `0x8c` s16, remaining `0x8e`, voltage `0x90`, RSOC `0x92`) are in
 `/root/acpi/linux/EC-FIELDS.md` on p3. The ASL-derived offsets goose first wrote
-down are one byte too high on the multi-byte fields. Open: the discharging /
-full / absent status codes (sample on battery), and mapping that page from
-Akuma.
+down are one byte too high on the multi-byte fields. Verified on battery too (3 samples): status
+`0b00000110` = no AC, battery in, BTST 1 = discharging; current is a magnitude
+in both states (sign from BTST); power again equals `POWER_NOW` to the mW
+(47391, 42106, 26107). Open: the *full* and *absent* status codes, and mapping
+that page from Akuma.
 
 ### 5.9 2026-10-07: rio on the panel — arrow keys fixed, font, and the slowness
 
@@ -751,8 +753,57 @@ through a small lock-free SPSC byte queue that `getb`/`has_byte` drain before
 touching the controller, so a sequence is never interleaved with the next key.
 Verified with a host harness that runs the actual `decode()` + queue code
 (I/O stubbed): every sequence checked, plus `a`, keypad Enter → CR and
-Ctrl-D → 0x04 unchanged. A kernel change: reaches the metal through the usual
-`send.sh` → `build.sh` → `install.sh` → `arm.sh 12` loop.
+Ctrl-D → 0x04 unchanged. **Verified on the metal** (entry 12, 2026-10-07):
+panel typing works, arrows reach rio.
+
+**SMP for rio: tried (menu entry 13), two metal boots, wedged both times —
+but for a different reason each time.** Entry 12 without `nosmp` (all 16
+MADT cores).
+
+*Boot 1 (kbd without a lock):* the keyboard was dead — scancodes *did*
+arrive (`[kbd] polls=6000 … scancodes=267`) but none decoded: the i8042
+driver is polled, and with 16 cores several pollers race on ports
+`0x60`/`0x64` — two cores both see "output full", one takes the scancode,
+the other steals the next byte (or the `E0` second byte of an extended
+key's pair). The wifi station joined and carried ssh and HTTPS traffic, but
+its `replayed` counter climbed into the hundreds and the link fell apart.
+
+*Boot 2 (kbd behind a spinlock — first a plain `spinning_top`, then the
+bounded give-up lock from `serial.rs`):* keyboard fixed on `nosmp` (entry
+12, typed on and verified), but entry 13 **froze the whole machine before
+klog's first flush**. The panel photos of the frozen boot tell the story:
+
+* `SELF-TESTS FAILED; starting init anyway` — the boot suite has failures
+  under SMP (names in `dmesg | grep FAILED`, not yet captured).
+* `[bkls>] core=12 ticket=22941287 serving=22941286 owner=15 spins=1048576`
+  then `spins=2097152`, twice, minutes apart — the BKL stall detector
+  reporting a genuine multi-second hold by core 15. The BKL is a fair FIFO
+  ticket lock: per `akuma-bkl`, it *cannot* starve a waiter — a wait this
+  long is a holder that never releases.
+* The PSTATS printer kept ticking (timers alive, which is also why `wdt`
+  never fired — the BSP petted it) but **every PID's syscall counts were
+  frozen across prints**: the entire system was stopped behind the BKL.
+
+Leading theory (unproven until `klog-30` is read off p3): the wifi station
+daemon (`rtw89_sta::daemon`) runs card register polls **with the BKL held**
+and `0 timed out` is its healthy number — if the card stops answering under
+SMP, the daemon spins forever inside a BKL-held poll loop and takes every
+core down with it ("wifi setup interrupted and never recovered"). The two
+freeze symptoms — dead panel keyboard and dead wifi — are then the *same*
+bug: the keyboard path is syscalls (`read`/`poll` need the BKL), so a BKL
+wedge looks exactly like a dead keyboard.
+
+Also fixed along the way, and worth keeping regardless of SMP: the plain
+spinlock was itself a landmine on **any** core count — this kernel preempts
+threads that hold spinlocks, so a preempted holder with an unbounded
+spinner behind it hangs even a single-core boot. `kbd.rs` now uses the
+`serial.rs` bounded lock (give up after `1 << 22` spins, report "no key";
+the scancode stays in the controller and the next poll retries).
+
+Next: read `klog-30` (+ `dmesg | grep FAILED`) off p3 from Linux; name the
+BKL-held loop; either bound the poll, drop the BKL around card I/O (the
+dropped-BKL-window machinery exists for exactly this), or both. Until then
+**entry 13 stays unusable; rio runs on entry 12 (`nosmp`)**.
 
 **Font.** The panel config started at `size = 32` (the console-cell match,
 ~40 px lines — huge for real work). 11 (the dev machine's kitty default) is
@@ -770,9 +821,10 @@ of payoff: turn the CRT filter off (one config line); `nosmp` off — the
 machine has 16 threads and a software rasteriser scales nearly linearly
 (least safe, see the `-j4` notes); damage-rect present instead of
 whole-frame; AVX-512 non-temporal stores for the blit. §5.8 above has the
-hardware numbers behind all of these. The SMP lever ships as menu entry 13
-(`overlays/ryzen/grub.cfg`): entry 12 without `nosmp`, armed with
-`arm.sh 13`.
+hardware numbers behind all of these. The SMP lever shipped as menu entry 13
+(`overlays/ryzen/grub.cfg`) — it boots but kills the keyboard and wifi under
+real concurrency (see above); `nosmp` stays until the i8042 and wifi races
+are fixed.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
