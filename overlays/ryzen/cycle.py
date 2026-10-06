@@ -2,7 +2,7 @@
 """One reboot-loop cycle on ryzen, driven from the laptop.
 
     python3 overlays/ryzen/cycle.py <entry> [--grep PATTERN] [--log early|dmesg] [--transcript NAME]
-                                    [--kernel PATH] [--no-rehearse]
+                                    [--kernel PATH] [--no-rehearse] [--stay]
 
 1. ship the kernel (default: this tree's `no-tests` build,
    `target/x86_64-unknown-none/release/akuma-amd64`) to `$W/out/akuma-amd64`
@@ -15,6 +15,10 @@
    `boot-N.dmesg`, which services that reboot by themselves save) matching
    PATTERN (default `\\[rtw\\]`) from p3, mounted read-only, and with
    `--transcript NAME` the service's own `NAME-N.txt`.
+
+`--stay` is for an entry that stays up (no autoreboot, e.g. 12): ship,
+install and arm only — no rehearsal (the rehearsal needs a guest that resets
+itself) and no wait for Pop.
 
 Everything goes through `scripts/utils/hpbox.py`: kernel and config as the
 `netoneko` user, everything else as root. Build the kernel first:
@@ -50,13 +54,14 @@ def main():
     ap.add_argument("--transcript", default="")
     ap.add_argument("--kernel", default=os.path.join(ROOT, "target/x86_64-unknown-none/release/akuma-amd64"))
     ap.add_argument("--no-rehearse", action="store_true")
+    ap.add_argument("--stay", action="store_true", help="entry stays up: no rehearsal, no wait for Pop")
     a = ap.parse_args()
 
     ship(a.kernel, f"{W}/out/akuma-amd64")
     ship(os.path.join(ROOT, "overlays/ryzen/grub.cfg"), f"{W}/akuma/overlays/ryzen/grub.cfg")
     print("shipped", flush=True)
 
-    if not a.no_rehearse:
+    if not (a.no_rehearse or a.stay):
         rc, o, e = hpbox.ryzen_root(
             f"cd {W}/akuma && DISK=nvme sh overlays/ryzen/qemu.sh {a.entry} 240 std 2>&1 "
             f"| grep -aE 'qemu rc|e2fsck rc|next_entry|panic|PANIC'; "
@@ -68,6 +73,9 @@ def main():
     rc, o, e = hpbox.ryzen_root(f"sh {W}/install.sh 2>&1 | grep DONE; sh {W}/akuma/overlays/ryzen/arm.sh {a.entry}",
                                 timeout=300)
     print(o.strip(), flush=True)
+    if a.stay:
+        print("armed; ryzen boots entry", a.entry, "on its next reboot and stays there", flush=True)
+        return
     t0 = time.time()
     down = False
     while time.time() - t0 < 900:
