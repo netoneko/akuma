@@ -21,6 +21,7 @@ Why this shape, and the wifi work it exists for:
 | RTL8852CE firmware on p3 (`/lib/firmware/rtw89/`) | staged (`fetch-firmware.sh`); nothing loads it yet |
 | wifi W1: firmware download (`rtw89`, entry 8) | **works**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again; the fix that got it there was Bus Master on the card's root port (survey doc § 5.2) |
 | wifi W2: receive (`rtw89rx`, entry 9) | **works**: Linux's recorded start replayed (16 815 ops, 52 ms), then 12 s on channel 1: 1604 frames, 17 networks' beacons, the home network's among them (survey doc § 5.3) |
+| wifi W3: the station (`rtw89wifi`, entry 10) | **partly**: scans on the metal and finds the home network; auth goes out (the chip reports it done) but nothing is received after `JOIN2`, so the join times out (survey doc § 5.4) |
 | wifi W0: Linux's bring-up traced | **done**: probe + interface-up through `fw ready` (`w0-trace.sh`, results in the survey doc § 5.1; traces in `~/.akuma/w0/` on the laptop) |
 | wifi control (`/dev/wifi0`, `/etc/wifi`, `wifi`) | **works** against the simulated radio (entry 7, rehearsed); no real radio yet — [`docs/reference/subsystems/wifi.md`](../../docs/reference/subsystems/wifi.md) |
 | network | none, so ssh into Akuma here is not possible; the log is the channel |

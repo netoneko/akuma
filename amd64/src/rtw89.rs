@@ -411,6 +411,11 @@ pub struct Card {
     /// chip says became of the frames sent (diagnostics for the join).
     pub rpq_seen: u32,
     pub rpq_last: [u8; 32],
+    /// Every RXQ entry taken, by outcome: parsed (by packet type, low 4
+    /// bits), unparsable, and 802.11 frames with a bad FCS.
+    pub rx_types: [u32; 16],
+    pub rx_bad: u32,
+    pub rx_crc: u32,
 }
 
 /// Index into [`Card`]'s TX channels ([`tx::USED`] order). Data (ACH0)
@@ -440,6 +445,9 @@ impl Card {
             saved_filter: None,
             rpq_seen: 0,
             rpq_last: [0; 32],
+            rx_types: [0; 16],
+            rx_bad: 0,
+            rx_crc: 0,
         }
     }
 
@@ -489,8 +497,15 @@ impl Card {
                 core::slice::from_raw_parts((&raw const RXQ_BUF_MEM).cast::<u8>().add(at), RX_BUF_BYTES)
             };
             core::sync::atomic::fence(Ordering::Acquire);
-            if let Ok(p) = rx::parse(buf) {
-                f(&p);
+            match rx::parse(buf) {
+                Ok(p) => {
+                    self.rx_types[usize::from(p.desc.pkt_type & 0xf)] += 1;
+                    if p.desc.pkt_type == rx::kind::WIFI && p.desc.crc32_err {
+                        self.rx_crc += 1;
+                    }
+                    f(&p);
+                }
+                Err(_) => self.rx_bad += 1,
             }
             self.rxq.advance(1);
         }
@@ -517,6 +532,17 @@ impl Card {
     /// the chip's read pointer in 27:16.
     pub fn tx_idx(&mut self, which: usize) -> u32 {
         self.regs.read32(tx::idx_reg(tx::USED[which] as u8))
+    }
+
+    /// The RX ring's index register: the host's read pointer in bits 15:0,
+    /// the chip's write pointer in 27:16.
+    pub fn rx_idx(&mut self) -> u32 {
+        self.regs.read32(rx::RXQ_IDX)
+    }
+
+    /// The RX filter register as it stands.
+    pub fn rx_filter(&mut self) -> u32 {
+        self.regs.read32(RX_FLTR_OPT)
     }
 
     /// `(DMAC_ERR_ISR, HAXI_IDCT)`: the DMA engine's error indications.

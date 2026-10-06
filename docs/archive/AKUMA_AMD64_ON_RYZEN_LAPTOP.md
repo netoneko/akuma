@@ -31,7 +31,9 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | FCH watchdog (`wdt`) | **done**: a deliberate wedge was reset by the chipset in 60 s (`FIRED=1`), `overlays/ryzen/README.md` § The watchdog |
 | wifi W0 (§5.1) | **done**: mmiotrace of probe and of interface-up through `fw ready`, `overlays/ryzen/w0-trace.sh` |
 | wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
-| wifi W2–W5 (§5) | not started |
+| wifi W2 (§5.3) | **done**: the recorded start replayed, 17 networks' beacons on channel 1 (menu entry 9) |
+| wifi W3 (§5.4) | **in progress**: station daemon behind `/dev/wifi0` (`rtw89wifi`, menu entry 10) scans and finds the home network, sends auth (the chip reports it done); no frame received after `JOIN2` |
+| wifi W4–W5 (§5) | not started (code for W4 is written: `akuma-wpa`, `JOIN4`) |
 
 ## Verdict
 
@@ -323,6 +325,66 @@ Open: the home network's beacons arrived 17 times in 12 s against ~117 sent
 (other networks: up to 43). Linux runs more calibration (RX DCK, IQK, TSSI,
 DPK — `rtw8852c_rfk_channel`) when it associates, which the "up" recording
 does not contain. That is W3's first recording.
+
+### 5.4 W3 results, 2026-10-06 evening: the station, and where the join stops
+
+**The station runs on the metal; authentication gets no answer yet.** Token
+`rtw89wifi` (ryzen menu entry 10, herd service `wifijoin`) keeps the card up
+after the firmware download and hands it to `amd64/src/rtw89_sta.rs`, the
+`/dev/wifi0` backend: a daemon that replays the recorded join
+(`script::JOIN1..4`) around the frames it sends itself — scan, auth, assoc,
+`JOIN3`, the 4-way handshake (`akuma_wpa::eapol::Supplicant`), msg 4, `JOIN4`.
+
+Design points, each a decision rather than an accident:
+
+- **Boot replays `JOIN1`, not `up.seq`.** `JOIN1` starts at the last
+  `fw ready` of the join recording and so *is* Linux's whole start plus the
+  interface setup; replaying it after `up.seq` would run the start twice. A
+  failed join leaves a peer in the card, so the next join power-cycles it
+  (`Card::restart`: `shutdown` + `bring_up`) and replays `JOIN1` afresh.
+- **Every frame of a join uses mac id 0.** A station's peer entry shares its
+  interface's mac id (`rtw89_core_sta_add`); all three recorded `txd` records
+  say 0. `tx.rs` had claimed 1 for frames to the AP.
+- **The daemon parks between polls** (`sched::block_until_deadline`) so a
+  `nosmp` box keeps running sshd through a join; the replays are the only busy
+  stretches (~37 ms each).
+- **The reboot path powers the card off** (`rtw89::shutdown_for_reset`, from
+  `reboot.rs`) through its own register view, since the daemon may be parked
+  mid-join on the same core.
+
+Fixed on the way, each by comparing `tx.rs` with Linux's
+`rtw89_core_fill_txdesc_v1` / `rtw89_pci_txwd_submit` and the recorded `txd`
+bytes (host tests now pin all of them to the recording):
+
+| bug | effect |
+|---|---|
+| the address-info entry carried the **WD page's** bus address, not the frame's | the chip would have transmitted the descriptor as the frame |
+| `USE_RATE` set on every frame | EAPOL/data at a forced CCK rate; Linux sets it for management only |
+| `TID_INDICATE` never set | EAPOL (tid 7) recorded with it set |
+| `wp_offset` 0 on protected data | Linux uses 1 (room for the security header the chip writes) |
+
+Metal runs (all reached Pop again by themselves, ~93 s outside Linux):
+
+| boot | what it showed |
+|---|---|
+| 12 | `JOIN1` 18 337 ops in 36.7 ms, 0 poll timeouts (85 checked reads differ: the `0xac` coex scoreboard and calibration readouts, as in W2). Scan: 110 beacons, 22 networks in 2.5 s, **the home network among them** (`ssid#2ce1df73`, ch 1, wpa2-psk). `JOIN2` 4072 ops, 0 timeouts. Auth ×3: no answer → `error=timeout` |
+| 13 | with TX diagnostics: CH8's read index moves 0→1→2→3 with each auth frame, **one release report per frame, status `TX_DONE`** (qsel 0x12, WD seq 0/1/2), no DMA error. A unicast management frame reports done only once acknowledged, so the AP very likely ACKed it. But in the 1.2 s of waiting **the host received nothing at all**, not even the AP's beacons |
+
+So the open question is the receive side after `JOIN2`: either RX stops
+delivering, or frames arrive in a shape the station drops without counting.
+`JOIN2` is almost all baseband/RF work (~1600 writes in `0x10000..0x1f000`,
+five class-16 RF-calibration H2Cs); W2 already saw the home network's beacons
+arrive at a fraction of their rate before any join calibration. Boot 14 adds
+RX counters (every RXQ entry by type, parse failures, FCS errors) and a
+300 ms liveness probe before and after `JOIN2`, filter as-is then open.
+
+Staged on ryzen for these runs: `/etc/wifi/home` on p3 (PSK derived on the
+Mac from `~/.akuma/wifi/<network>`, piped in, mode 0600, never printed) and
+`wifijoin` + `/bin/wifi` copied onto p3, which was formatted from an image
+older than the tool. `wifijoin` records only the tool's exit status and
+`/dev/wifi0`'s non-identifying keys (`wifijoin-N.txt`); the `[rtw]` lines
+hash SSIDs and cut BSSIDs to the OUI. Driven with
+`cycle.py 10 --log dmesg --transcript wifijoin`.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 

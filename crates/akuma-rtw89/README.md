@@ -14,6 +14,8 @@ Linux `rtw89_8852ce`), from powered off to running firmware: wifi stage W1
 | `bringup` | `power_on`/`power_off`, `pre_init` (DMAC download mode, flow control, PCI pre-init), `disable_cpu`/`enable_cpu`, `download`, `wait_fw_ready`, `bring_up`, `shutdown`; `Ch12`, the firmware-command ring, which keeps sending H2Cs after the download |
 | `script` | **W2**: the rest of Linux's start, replayed from a recording (`seq/up.seq`, made by `overlays/ryzen/w2-seqgen.py`): writes, checked reads, polls, delays, H2Cs; counts where the chip departs from the recording |
 | `rx` | **W2**: the RX ring's indices and the RX descriptor (`rtw89_core_query_rxdesc`) |
+| `tx` | **W3**: the WD page (`rtw89_core_fill_txdesc_v1` + `rtw89_pci_txwd_submit`, 8852C) for the three frame classes a join sends — management on CH8, EAPOL on ACH3, CCMP data on ACH0 — and a TX ring's host half; every class's fields checked against a recorded `txd` record |
+| `script::JOIN1..4` | **W3/W4**: the recorded join as four segments (`seq/join{1..4}.seq`, `w2-seqgen.py --join N`), replayed by the station at the points their names say, with MAC, BSSID, AID, keys and the group key's id filled in at run time (`0x41` substitutions) |
 
 Everything goes through the `Bus` trait (8/16/32-bit register reads and writes,
 a delay) and `fw::Source` (read the firmware file at an offset). DMA memory
@@ -62,7 +64,10 @@ recording ran with NetworkManager kept off the card).
 ## On the metal
 
 `overlays/ryzen/cycle.py 8` (menu entry 8) boots it once on ryzen and prints
-the `[rtw]` lines; `cycle.py 9` (`rtw89rx`) adds the replay and 12 s of RX. A good boot ends with
+the `[rtw]` lines; `cycle.py 9` (`rtw89rx`) adds the replay and 12 s of RX;
+`cycle.py 10 --log dmesg --transcript wifijoin` (`rtw89wifi`) runs the station
+and tries to join (as of 2026-10-06 it scans and sends auth, and receives
+nothing after `JOIN2` — survey doc § 5.4). A W1 boot ends with
 `[rtw] fw ready v0.27.122 (cut 1, 166 packets, FW_CTRL 0xe2, ~50000 us)` and
 `[rtw] card shut down`.
 

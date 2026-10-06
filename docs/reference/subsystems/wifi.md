@@ -99,7 +99,7 @@ gets its own cursor. `close` frees it.
 |---|---|---|
 | none | default | **no `/dev/wifi0` node at all** (`open` is `ENOENT`, `ls /dev` omits it) |
 | simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below |
-| rtw89 | not yet a backend | ryzen's RTL8852CE. **W1 done 2026-10-06**: `rtw89` on the command line powers the card on, downloads its firmware and sees it ready, then shuts it down before `init` — [The radio](#the-radio-rtl8852ce-akuma-rtw89) below. **W2 done the same day**: `rtw89rx` replays Linux's recorded start and receives (17 networks' beacons on channel 1). W3 (transmit, join) is next |
+| rtw89 | `rtw89wifi` (multiboot2 path, after the root mount) | ryzen's RTL8852CE, kept up after its bring-up; `amd64/src/rtw89_sta.rs` is the backend. **Scan works** (the real networks on channel 1, with security); **`connect` does not complete yet**: authentication goes out and is reported done by the chip, but nothing is received after `JOIN2` — survey doc § 5.4. W1 (`rtw89`, firmware) and W2 (`rtw89rx`, receive) are the earlier stages, below |
 
 **The simulated radio** is deterministic: the same networks every boot, scans
 complete at once, and fixed rules for `connect`. A test that passes against it
@@ -128,6 +128,7 @@ Stage W1 of the wifi plan: from a powered-off card to running firmware.
 | the boot token | `rtw89` (multiboot2 path, after the root mount) | ryzen menu entry 8 |
 | W2: the start | `akuma_rtw89::script` + `seq/up.seq` | the rest of Linux's `rtw89_core_start` after `fw ready`, **replayed from a recording** of Linux on this card (writes, checked reads, polls, delays, 45 H2Cs); reports where the chip departs from it |
 | W2: receive | `akuma_rtw89::rx`, `akuma-ieee80211` | RXQ entries with their own buffers, the RX descriptor, beacons and probe responses (SSID, channel, RSN); token `rtw89rx`, ryzen menu entry 9 |
+| W3/W4: the station | `amd64/src/rtw89_sta.rs` over `rtw89::Card`, `akuma_rtw89::{tx, script::JOIN1..4}`, `akuma_ieee80211::sta`, `akuma_wpa` | `/dev/wifi0`'s radio: `JOIN1` at start, scan with the RX filter opened, then `JOIN2` → auth → assoc → `JOIN3` → 4-way handshake → msg 4 → `JOIN4` (keys). WPA2-PSK only; open networks answer `unsupported`. Station address `02:41:4b:55:4d:41`. Token `rtw89wifi`, ryzen menu entry 10 |
 
 **What a good boot logs** (`boot-N.early` on p3):
 
@@ -200,10 +201,16 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 ## Known gaps
 
-- **No real radio behind `/dev/wifi0` yet.** The RTL8852CE's firmware runs
-  (W1) but the card is shut down again before `init`; receive (W2) comes next.
-  `wifi auto` on a machine without `wifisim` finds no `/dev/wifi0` and says so
-  every poll.
+- **The real radio scans but does not join yet** (`rtw89wifi`): nothing is
+  received after `JOIN2`, so authentication times out (survey doc § 5.4).
+  Without `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto`
+  says so every poll.
+- **No signal strength from the real radio**: scan results report `signal=0`
+  (the PPDU status reports that carry RSSI are not parsed), so `wifi` picks
+  among equal-priority networks by order, not strength.
+- **`disconnect` sends no deauthentication**; the access point times the
+  station out. A group rekey replays all of `JOIN4` (the pairwise key goes in
+  again unchanged) until a group-only segment is cut from the recording.
 - **No `poll(2)` readiness on `/dev/wifi0`.** The tool polls by reading (100 ms
   steps). Readiness-on-state-change is the natural next step once a real radio
   makes state change asynchronously.

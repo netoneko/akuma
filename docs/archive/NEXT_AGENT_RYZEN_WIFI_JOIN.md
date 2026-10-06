@@ -51,12 +51,14 @@ handshake in the kernel, installs keys in the card, and gets a DHCP lease.
 | `overlays/ryzen/w3-timeline.py` | done: type-only timeline of a join recording |
 | seqgen join mode + `seq/join{1..4}.seq` | **done**: `w2-seqgen.py --join N --mac … --bssid …` emits the four segments (bounds found by content: last fw-ready / first BSSID-carrying ADDR_CAM / auth TXH / assoc-resp RXM / first periodic OFLD_RSSI / first SEC_CAM / BCNFLTR); blanks card MAC and BSSID wherever they appear (`0x41` subs, generation fails if a byte survives), patches AID12 (ADDR_CAM byte 44) and the PS-Poll template's duration (byte 14), the group key's id (bits 7:6 of ADDR_CAM byte 46 and DCTL byte 30 — the recording's AP used id 2), and synthesizes the two redacted SEC_CAM bodies per `cam.c` (`[idx,0,20,0, 6,0,0,0, key@16]`, TK entry 0 / GTK entry 1). Drops C2Hs, IRQ regs, TX-idx regs 0x1058–0x107c and the periodic OFLD_RSSI exchange. `script::{JOIN1..4}` + parse tests + a J4 run test proving key and gtk-id injection. Segment stats: J1 183423 B / 29 H2C, J2 39439 B / 9, J3 716 B / 15, J4 537 B / 9 |
 | `Cargo.toml` | `crates/akuma-wpa` added to default-members |
+| step 3: the station | **written, runs on the metal, does not join yet** (2026-10-06 evening): `amd64/src/rtw89_sta.rs` (daemon, `/dev/wifi0` backend), `rtw89::Card` (kept card, `restart`, `replay`, `send`, `poll_rx`, filter open/close), `rtw89::shutdown_for_reset` from `reboot.rs`, token `rtw89wifi`. Boot replays `JOIN1` directly after `bring_up` (not `up.seq` first: `JOIN1` already contains the start). `tx.rs` fixes: frame address in the address info (was the WD page's), `USE_RATE` management-only, `TID_INDICATE`, `wp_offset` 1 for protected data, mac id 0 for every frame |
+| step 4: metal | **in progress**: `/etc/wifi/home` (PSK, 0600) + `wifijoin` + `/bin/wifi` staged on p3; menu entry 10. Boots 12–13: scan finds the home network; auth ×3 fetched by the chip and released `TX_DONE`; **zero frames received after `JOIN2`**, not even the AP's beacons. Next: boot 14's RX probes (survey doc § 5.4) |
 
 What the next session still owes, in order:
 
 1. ~~Seqgen extension + `join{1..4}.seq`, privacy check, parse tests like
    `recorded_up_sequence_parses_to_the_end`.~~
-2. `amd64/src/rtw89.rs`: keep the card up after `init` as the real
+2. ~~(written; see the state table)~~ `amd64/src/rtw89.rs`: keep the card up after `init` as the real
    `/dev/wifi0` backend (`Backend::Rtw89` in `wifi.rs`); the join task per
    step 3 below. `Dma`'s `tx_phys` is already plumbed; the join task gets
    each channel's memory as `&mut TX_MEM[k * tx::CHAN_BYTES..]` and a

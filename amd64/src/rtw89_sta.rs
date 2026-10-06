@@ -63,8 +63,8 @@ const CHANNEL: u16 = 1;
 /// How long a scan listens: ~24 beacon intervals.
 const SCAN_MS: u64 = 2500;
 /// One authentication or association attempt's wait for the answer.
-const MGMT_REPLY_MS: u64 = 400;
-const MGMT_TRIES: u32 = 3;
+const MGMT_REPLY_MS: u64 = 1000;
+const MGMT_TRIES: u32 = 5;
 /// The 4-way handshake, from the association response to message 4. Access
 /// points send message 1 within milliseconds and retry each message about
 /// once a second.
@@ -388,9 +388,11 @@ impl Station {
         self.dirty = true;
         self.vars.bssid = bss.bssid;
         self.vars.aid = 0;
+        rx_probe(card, "before join2");
         if !card.replay("join2 (prepare)", script::JOIN2, &self.vars) {
             return Err(JoinError::Timeout);
         }
+        rx_probe(card, "after join2");
 
         // Authentication: open system, transaction 1, answered by 2.
         let mut buf = [0u8; 512];
@@ -624,6 +626,48 @@ impl Tally {
     }
 }
 
+/// Diagnostics: is RX alive here? 300 ms as the filter stands, then 300 ms
+/// with it open, each as `entries (wifi/crc/other types/bad)`.
+fn rx_probe(card: &mut Card, at: &str) {
+    serial::puts("[rtw] rx probe ");
+    serial::puts(at);
+    serial::puts(": filter 0x");
+    let f = card.rx_filter();
+    serial::put_hex(u64::from(f));
+    serial::puts(" idx 0x");
+    let i = card.rx_idx();
+    serial::put_hex(u64::from(i));
+    for open in [false, true] {
+        if open {
+            card.open_filter();
+        }
+        let (w0, c0, b0) = (card.rx_types[usize::from(rx::kind::WIFI)], card.rx_crc, card.rx_bad);
+        let all0: u32 = card.rx_types.iter().sum();
+        let deadline = now_us() + 300_000;
+        while now_us() < deadline {
+            card.poll_rx(|_| {});
+            nap(POLL_MS);
+        }
+        if open {
+            card.close_filter();
+        }
+        let all: u32 = card.rx_types.iter().sum::<u32>() - all0;
+        let w = card.rx_types[usize::from(rx::kind::WIFI)] - w0;
+        serial::puts(if open { "; open " } else { "; as is " });
+        serial::put_dec(u64::from(all + card.rx_bad - b0));
+        serial::puts(" (wifi ");
+        serial::put_dec(u64::from(w));
+        serial::puts(", crc ");
+        serial::put_dec(u64::from(card.rx_crc - c0));
+        serial::puts(", other ");
+        serial::put_dec(u64::from(all - w));
+        serial::puts(", bad ");
+        serial::put_dec(u64::from(card.rx_bad - b0));
+        serial::puts(")");
+    }
+    serial::puts("\n");
+}
+
 /// One line per sent frame: did the chip fetch it (its read index moved), what
 /// the release reports said, any DMA error, and what was heard meanwhile.
 fn tx_report(card: &mut Card, what: &str, before: u32, t: &Tally) {
@@ -646,6 +690,15 @@ fn tx_report(card: &mut Card, what: &str, before: u32, t: &Tally) {
     serial::put_hex(u64::from(isr));
     serial::puts(" idct 0x");
     serial::put_hex(u64::from(idct));
+    serial::puts("; rx total ");
+    serial::put_dec(u64::from(card.rx_types.iter().sum::<u32>()));
+    serial::puts(" bad ");
+    serial::put_dec(u64::from(card.rx_bad));
+    serial::puts(" crc ");
+    serial::put_dec(u64::from(card.rx_crc));
+    serial::puts(" idx 0x");
+    let i = card.rx_idx();
+    serial::put_hex(u64::from(i));
     serial::puts("; heard ");
     serial::put_dec(u64::from(t.frames));
     serial::puts(", from ap ");
