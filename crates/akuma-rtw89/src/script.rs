@@ -45,6 +45,19 @@ use crate::Bus;
 /// (and the interface's first channel set, channel 1).
 pub static UP: &[u8] = include_bytes!("../seq/up.seq");
 
+/// The recorded join's four segments (`w2-seqgen.py --join`, boundaries in
+/// its doc comment).
+///
+/// J1 is the post-`fw ready` start and interface setup, J2 the join prep
+/// from the ADDR_CAM that carries the access point's address, J3 what
+/// follows the association response, J4 the key installs and the beacon
+/// filter. Run them in that order at those points, with [`Vars`] filled in
+/// from the association response and the EAPOL handshake.
+pub static JOIN1: &[u8] = include_bytes!("../seq/join1.seq");
+pub static JOIN2: &[u8] = include_bytes!("../seq/join2.seq");
+pub static JOIN3: &[u8] = include_bytes!("../seq/join3.seq");
+pub static JOIN4: &[u8] = include_bytes!("../seq/join4.seq");
+
 /// How long a poll may wait before the replay counts it as timed out and goes
 /// on. Linux's longest poll in the recording finishes in under 3 ms.
 pub const POLL_BUDGET_US: u32 = 50_000;
@@ -492,8 +505,15 @@ mod tests {
     fn recorded_up_sequence_parses_to_the_end() {
         // Every op decodes, the stream ends with END, and it has the shape
         // the generator reported: 45 H2C commands, two carrying the MAC.
-        let mut rd = Rd { s: UP, at: 0 };
-        let (mut h2c, mut mac) = (0, 0);
+        let (h2c40, mac, h2c41, _) = walk(UP);
+        assert_eq!((h2c40 + h2c41, mac), (45, 2));
+    }
+
+    /// Walk a stream's ops, returning `(H2C count, MAC-carrying 0x40 count,
+    /// 0x41 count, total substitutions)`; panics on a malformed op.
+    fn walk(s: &[u8]) -> (usize, usize, usize, usize) {
+        let mut rd = Rd { s, at: 0 };
+        let (mut h2c40, mut mac, mut h2c41, mut subs) = (0, 0, 0, 0);
         loop {
             let op = rd.u8().unwrap();
             if op == 0 {
@@ -515,16 +535,135 @@ mod tests {
                 }
                 0x40 => {
                     let len = usize::from(rd.u16().unwrap());
-                    let at = rd.u16().unwrap();
                     assert!(len <= H2C_MAX);
-                    rd.take(len).unwrap();
-                    h2c += 1;
-                    mac += usize::from(at != 0xffff);
+                    if op == 0x40 {
+                        let at = rd.u16().unwrap();
+                        rd.take(len).unwrap();
+                        h2c40 += 1;
+                        mac += usize::from(at != 0xffff);
+                    } else {
+                        let n = usize::from(rd.u8().unwrap());
+                        for k in rd.take(n * 3).unwrap().as_chunks::<3>().0 {
+                            assert!(k[0] <= sub::GTK_IDX_HI2, "unknown sub kind {}", k[0]);
+                        }
+                        rd.take(len).unwrap();
+                        h2c41 += 1;
+                        subs += n;
+                    }
                 }
                 _ => panic!("bad op {op:#x} at {}", rd.at - 1),
             }
         }
-        assert_eq!(rd.at, UP.len());
-        assert_eq!((h2c, mac), (45, 2));
+        assert_eq!(rd.at, s.len());
+        (h2c40, mac, h2c41, subs)
+    }
+
+    /// The four join segments parse to the end with the shape the generator
+    /// reported, and the key installs' security-CAM bodies are synthesized
+    /// (CCMP-128, temporal key at byte 16) rather than redacted zeros.
+    #[test]
+    fn recorded_join_sequences_parse_to_the_end() {
+        for (seq, h2c41, subs) in
+            [(JOIN1, 29, 1), (JOIN2, 9, 3), (JOIN3, 15, 13), (JOIN4, 9, 12)] {
+            let (_, _, got41, gotsubs) = walk(seq);
+            assert_eq!((got41, gotsubs), (h2c41, subs));
+        }
+        // J4's two security-CAM commands: synthesized bodies, keys blank.
+        // (The stored bodies include the 8-byte H2C header; the command's own
+        // bytes follow it.)
+        let (first, second) = sec_cam_bodies(JOIN4);
+        assert_eq!(&first[8..16], &[0, 0, 20, 0, 6, 0, 0, 0]); // entry 0, len 20, CCMP-128
+        assert_eq!(&second[8..16], &[1, 0, 20, 0, 6, 0, 0, 0]); // entry 1
+        assert!(first[16..32].iter().all(|&b| b == 0));
+        assert!(second[16..32].iter().all(|&b| b == 0));
+    }
+
+    /// Running J4 with a filled [`Vars`] puts the temporal keys into the
+    /// synthesized security-CAM bodies and the group key's id into the
+    /// ADDR_CAM's and DCTL's bits 7:6 — the whole point of the `0x41`
+    /// substitutions.
+    #[test]
+    fn running_join4_fills_the_keys_and_group_key_id() {
+        let tk = [0x11; 16];
+        let gtk = [0x22; 16];
+        let v = Vars { mac: [2; 6], bssid: [3; 6], aid: 4, tk, gtk, gtk_idx: 2, ..Vars::default() };
+        // The sink above holds one command; capture them all instead.
+        struct Capture {
+            cmds: [Vec<u8>; 16],
+            lens: [usize; 16],
+            n: usize,
+        }
+        impl H2cSink<Fake> for Capture {
+            fn send(&mut self, _: &mut Fake, c: &[u8]) -> Result<(), SendFailed> {
+                self.cmds[self.n] = c.to_vec();
+                self.lens[self.n] = c.len();
+                self.n += 1;
+                Ok(())
+            }
+        }
+        let mut cap = Capture { cmds: core::array::from_fn(|_| Vec::new()), lens: [0; 16], n: 0 };
+        let mut bus = Fake::default();
+        let mut st = Stats::default();
+        run(&mut bus, JOIN4, &v, &mut cap, &mut st).unwrap();
+        assert_eq!(st.h2c, 9);
+        let sec: Vec<&Vec<u8>> =
+            (0..cap.n).filter(|&i| cap.cmds[i].len() == 32).map(|i| &cap.cmds[i]).collect();
+        assert_eq!(sec.len(), 2);
+        assert_eq!(&sec[0][16..32], &tk); // pairwise key, entry 0
+        assert_eq!(&sec[1][16..32], &gtk); // group key, entry 1
+        assert_eq!(sec[0][8], 0);
+        assert_eq!(sec[1][8], 1);
+        // The group key's id: bits 7:6 of the ADDR_CAM's and DCTL's key-id
+        // bytes, and nowhere else.
+        let cam = &cap.cmds[7];
+        let dctl_pair = &cap.cmds[2];
+        let dctl_group = &cap.cmds[6];
+        assert_eq!(cam[46] & 0xc0, 2 << 6);
+        assert_eq!(dctl_group[30] & 0xc0, 2 << 6);
+        assert_eq!(dctl_pair[30] & 0xc0, 0);
+    }
+
+    /// The bodies of J4's two security-CAM `0x41` commands.
+    fn sec_cam_bodies(s: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut rd = Rd { s, at: 0 };
+        let mut found = Vec::new();
+        loop {
+            let op = rd.u8().unwrap();
+            if op == 0 {
+                break;
+            }
+            let w = op & 3;
+            match op & 0xf0 {
+                0x00 | 0x10 => {
+                    rd.u32().unwrap();
+                    rd.val(w).unwrap();
+                }
+                0x20 => {
+                    rd.u32().unwrap();
+                    rd.val(w).unwrap();
+                    rd.val(w).unwrap();
+                }
+                0x30 => {
+                    rd.u32().unwrap();
+                }
+                0x40 => {
+                    let len = usize::from(rd.u16().unwrap());
+                    if op == 0x41 {
+                        let n = usize::from(rd.u8().unwrap());
+                        rd.take(n * 3).unwrap();
+                        let body = rd.take(len).unwrap().to_vec();
+                        if body.len() == 32 && body[10] == 20 && body[12] == 6 {
+                            found.push((body[8], body));
+                        }
+                    } else {
+                        rd.u16().unwrap();
+                        rd.take(len).unwrap();
+                    }
+                }
+                _ => panic!("bad op {op:#x} at {}", rd.at - 1),
+            }
+        }
+        assert_eq!(found.len(), 2);
+        (found.remove(0).1, found.remove(0).1)
     }
 }

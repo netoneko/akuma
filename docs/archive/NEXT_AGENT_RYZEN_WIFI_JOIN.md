@@ -49,19 +49,24 @@ handshake in the kernel, installs keys in the card, and gets a DHCP lease.
 | `crates/akuma-rtw89/src/script.rs` | **done, tests run**: `Vars` + op `0x41`; `run()` takes `&Vars` (glue caller updated) |
 | `crates/akuma-rtw89/src/tx.rs` | **done (commit b2b8959e)**: `Desc::{mgmt,eapol,data}` with the recorded classes (mgmt QSEL_MGMT/CH8 hw-seq; EAPOL = tid-7 data → QSEL_VO/ACH3 sw-seq, unencrypted; data QSEL_BE/ACH0, CCMP128 sec_type 6, pairwise cam 0, PN in body words 4–5), `wd_page` (body v1 + info + WP + one address info; frames > 2044 bytes refused), `tx::Ring` over per-channel DMA memory ([`tx::CHAN_BYTES`]: ring + 8 WD pages + 8 frame buffers, FIFO page reclaim from the chip's index register). `bringup::Dma` gained `tx_phys: [u64; 3]` in `tx::USED` = (ACH0, ACH3, CH8) order; `pre_init` points those rings at it; the amd64 glue backs them with `TX_MEM` and asserts < 4 GiB. Host-tested against three recorded `txd` records + ring/kick/reclaim tests; clippy clean |
 | `overlays/ryzen/w3-timeline.py` | done: type-only timeline of a join recording |
+| seqgen join mode + `seq/join{1..4}.seq` | **done**: `w2-seqgen.py --join N --mac … --bssid …` emits the four segments (bounds found by content: last fw-ready / first BSSID-carrying ADDR_CAM / auth TXH / assoc-resp RXM / first periodic OFLD_RSSI / first SEC_CAM / BCNFLTR); blanks card MAC and BSSID wherever they appear (`0x41` subs, generation fails if a byte survives), patches AID12 (ADDR_CAM byte 44) and the PS-Poll template's duration (byte 14), the group key's id (bits 7:6 of ADDR_CAM byte 46 and DCTL byte 30 — the recording's AP used id 2), and synthesizes the two redacted SEC_CAM bodies per `cam.c` (`[idx,0,20,0, 6,0,0,0, key@16]`, TK entry 0 / GTK entry 1). Drops C2Hs, IRQ regs, TX-idx regs 0x1058–0x107c and the periodic OFLD_RSSI exchange. `script::{JOIN1..4}` + parse tests + a J4 run test proving key and gtk-id injection. Segment stats: J1 183423 B / 29 H2C, J2 39439 B / 9, J3 716 B / 15, J4 537 B / 9 |
 | `Cargo.toml` | `crates/akuma-wpa` added to default-members |
 
 What the next session still owes, in order:
 
-1. Seqgen extension + `join{1..4}.seq`, privacy check, parse tests like
-   `recorded_up_sequence_parses_to_the_end`. (`w2-seqgen.py` currently emits
-   `up.seq` only; the merged join stream is reproducible with
-   `python3 overlays/ryzen/w2-merge.py ~/.akuma/w0/20261006-102808 --phase join --no-fwdl`.)
+1. ~~Seqgen extension + `join{1..4}.seq`, privacy check, parse tests like
+   `recorded_up_sequence_parses_to_the_end`.~~
 2. `amd64/src/rtw89.rs`: keep the card up after `init` as the real
    `/dev/wifi0` backend (`Backend::Rtw89` in `wifi.rs`); the join task per
    step 3 below. `Dma`'s `tx_phys` is already plumbed; the join task gets
    each channel's memory as `&mut TX_MEM[k * tx::CHAN_BYTES..]` and a
-   `tx::Ring::new()`.
+   `tx::Ring::new()`. Replay points: `up.seq`, then scan ch1, then `JOIN1`
+   → `JOIN2` → send auth (replay's own TX; the response arrives on the RX
+   ring) → send assoc → `JOIN3` (after the association response RX) →
+   `akuma_wpa::eapol::Supplicant` (msg2 after msg1 RX); when msg3 arrives,
+   replay `JOIN4` (both key installs — mac80211 installs the pairwise key
+   and the msg3-carried GTK before answering), then send msg4. Status lines
+   into `akuma_wifi::status::Status`. Shut the card down on the reboot path.
 3. Join task (`sched::spawn_daemon`, pattern `net.rs` `netpoll_daemon`):
    scan ch1 → J1/J2 → auth → assoc → J3 → `akuma_wpa::eapol::Supplicant`
    → msg4 → J4 → keys. EAPOL frames go out via `Desc::eapol` on the ACH3
