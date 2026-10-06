@@ -43,7 +43,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use akuma_ieee80211::beacon;
-use akuma_ieee80211::sta::{self, AssocResp, Auth, Data, Goodbye};
+use akuma_ieee80211::sta::{self, Amsdu, AssocResp, Auth, Data, Goodbye};
 use akuma_rtw89::{rx, script, tx};
 use akuma_wifi::cmd::Command;
 use akuma_wifi::status::{Bss, Error as JoinError, Link, Status};
@@ -104,9 +104,9 @@ static CARD: Spinlock<Option<Card>> = Spinlock::new(None);
 /// pass only while joined; otherwise transmits are dropped.
 pub static LINK: FrameQueues = FrameQueues::new();
 static ADOPTED: AtomicBool = AtomicBool::new(false);
-/// Frames from the stack each lap of a joined daemon may send, so receive is
-/// never starved by a transmit burst.
-const TX_PER_LAP: usize = 8;
+/// Frames from the stack each lap of a joined daemon may send: the whole
+/// queue ([`akuma_net::queued::SLOTS`]) — receive runs again first anyway.
+const TX_PER_LAP: usize = akuma_net::queued::SLOTS;
 static STATUS: Spinlock<Option<Status>> = Spinlock::new(None);
 static REQUEST: Spinlock<Option<Command>> = Spinlock::new(None);
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -143,6 +143,7 @@ fn put_oui(b: &Bssid) {
 pub fn adopt(card: Card, backoff: bool) {
     BACKOFF.store(backoff, Ordering::Relaxed);
     LINK.set_mac(MAC);
+    LINK.on_transmit(wake_daemon);
     ADOPTED.store(true, Ordering::Release);
     *CARD.lock() = Some(card);
     if let Some(iface) = IfName::new(b"wlan0") {
@@ -201,6 +202,15 @@ pub fn request(c: &Command) {
     }
 }
 
+/// The stack queued a frame: end the daemon's nap now rather than at its
+/// deadline.
+fn wake_daemon() {
+    let slot = SLOT.load(Ordering::Acquire);
+    if slot != usize::MAX {
+        crate::sched::wake(slot);
+    }
+}
+
 /// The reset path is about to power the card off under the daemon: it must
 /// touch it no more.
 pub fn stop() {
@@ -232,6 +242,8 @@ extern "C" fn daemon() -> ! {
     let Some(mut card) = CARD.lock().take() else { park_forever() };
     let mut st = Station {
         vars: script::Vars { mac: MAC, ..script::Vars::default() },
+        stats: LinkStats::default(),
+        next_report: 0,
         ready: false,
         peer: None,
         wanted: None,
@@ -239,10 +251,15 @@ extern "C" fn daemon() -> ! {
         backoff_ms: REJOIN_FIRST_MS,
     };
     st.start(&mut card, false);
+    let mut last_lap = now_us();
     loop {
         if STOP.load(Ordering::Acquire) {
             park_forever();
         }
+        let now = now_us();
+        st.stats.laps += 1;
+        st.stats.max_gap_us = st.stats.max_gap_us.max(now - last_lap);
+        last_lap = now;
         let req = REQUEST.lock().take();
         match req {
             Some(Command::Scan { .. }) => st.scan(&mut card),
@@ -290,8 +307,44 @@ struct Wanted {
     bssid: Option<Bssid>,
 }
 
+/// What the joined link carried, for the periodic `[rtw] link:` line.
+#[derive(Default)]
+struct LinkStats {
+    /// Data frames from the access point, by what became of them.
+    rx_data: u32,
+    rx_amsdu: u32,
+    rx_msdus: u32,
+    /// Not protected after the keys (dropped), or protected but not
+    /// decrypted by the card (dropped).
+    rx_clear: u32,
+    rx_undecrypted: u32,
+    /// From the access point but not a data frame we could take apart.
+    rx_unparsed: u32,
+    delivered: u32,
+    tx: u32,
+    tx_failed: u32,
+    /// TCP handshake and reset events, both ways (counted; the first few are
+    /// logged by port).
+    syn_rx: u32,
+    rst_rx: u32,
+    syn_tx: u32,
+    rst_tx: u32,
+    traced: u32,
+    /// Daemon laps since the last report, and the longest gap between two
+    /// (µs): how long a frame can wait for the station.
+    laps: u32,
+    max_gap_us: u64,
+}
+
+/// TCP events logged by port before the trace goes quiet.
+const TCP_TRACE_MAX: u32 = 40;
+/// How often a joined station prints its `[rtw] link:` line.
+const LINK_REPORT_US: u64 = 10_000_000;
+
 struct Station {
     vars: script::Vars,
+    stats: LinkStats,
+    next_report: u64,
     wanted: Option<Wanted>,
     /// When the next rejoin may start (`now_us` clock), and the wait after it.
     retry_at: u64,
@@ -721,6 +774,7 @@ impl Station {
         let mut beacon_lost = false;
         let mut rssi: Option<i8> = None;
         let mut delivered = 0u32;
+        let stats = &mut self.stats;
         card.poll_rx(|p: &rx::Packet<'_>| {
             if p.desc.pkt_type == rx::kind::C2H {
                 match bcnfltr(p.body) {
@@ -737,25 +791,38 @@ impl Station {
             if let Some(g) = Goodbye::parse(f).filter(|g| g.from == peer.bssid && g.to == MAC) {
                 gone = Some(g.reason);
             } else if let Some(d) = Data::parse(f, true).filter(|d| d.bssid == peer.bssid) {
+                stats.rx_data += 1;
                 if d.ethertype == sta::ETHERTYPE_EAPOL {
                     if step.is_none() {
                         step = Some(peer.supplicant.handle(d.payload, &mut out));
                     }
-                } else if d.protected && p.desc.hw_dec && !p.desc.icv_err {
-                    // To the stack as Ethernet. Only what the card decrypted:
-                    // a frame in the clear after the keys is not ours to trust.
-                    let mut eth = [0u8; FRAME_MAX];
-                    let n = 14 + d.payload.len();
-                    if n <= FRAME_MAX {
-                        eth[..6].copy_from_slice(&d.da);
-                        eth[6..12].copy_from_slice(&d.sa);
-                        eth[12..14].copy_from_slice(&d.ethertype.to_be_bytes());
-                        eth[14..n].copy_from_slice(d.payload);
-                        if LINK.deliver(&eth[..n]) {
+                } else if !d.protected {
+                    stats.rx_clear += 1;
+                } else if !p.desc.hw_dec || p.desc.icv_err {
+                    // To the stack only what the card decrypted: a frame in
+                    // the clear after the keys is not ours to trust.
+                    stats.rx_undecrypted += 1;
+                } else if deliver(&d.da, &d.sa, d.ethertype, d.payload, stats) {
+                    delivered += 1;
+                }
+            } else if let Some(a) = Amsdu::parse(f, true).filter(|a| a.bssid == peer.bssid) {
+                stats.rx_amsdu += 1;
+                if !a.protected {
+                    stats.rx_clear += 1;
+                } else if !p.desc.hw_dec || p.desc.icv_err {
+                    stats.rx_undecrypted += 1;
+                } else {
+                    for m in a.subframes() {
+                        stats.rx_msdus += 1;
+                        if m.ethertype != sta::ETHERTYPE_EAPOL
+                            && deliver(&m.da, &m.sa, m.ethertype, m.payload, stats)
+                        {
                             delivered += 1;
                         }
                     }
                 }
+            } else if f.len() >= 16 && f[10..16] == peer.bssid && f[0] & 0x0c == 0x08 {
+                stats.rx_unparsed += 1;
             }
         });
         if delivered > 0 {
@@ -771,7 +838,17 @@ impl Station {
             let mut da = [0u8; 6];
             da.copy_from_slice(&eth[..6]);
             let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
-            let _ = send_protected(card, peer, &da, ethertype, &eth[14..n]);
+            trace_tcp(stats, "tx", ethertype, &eth[14..n]);
+            stats.tx += 1;
+            if send_protected(card, peer, &da, ethertype, &eth[14..n]).is_err() {
+                stats.tx_failed += 1;
+            }
+        }
+        if now_us() >= self.next_report {
+            self.next_report = now_us() + LINK_REPORT_US;
+            link_report(card, &self.stats);
+            self.stats.laps = 0;
+            self.stats.max_gap_us = 0;
         }
         if let Some(dbm) = rssi {
             with_status(|s| s.signal = dbm);
@@ -804,6 +881,94 @@ impl Station {
             }
         }
     }
+}
+
+/// One received frame to the stack as Ethernet.
+fn deliver(da: &Bssid, sa: &Bssid, ethertype: u16, payload: &[u8], stats: &mut LinkStats) -> bool {
+    let mut eth = [0u8; FRAME_MAX];
+    let n = 14 + payload.len();
+    if n > FRAME_MAX {
+        return false;
+    }
+    eth[..6].copy_from_slice(da);
+    eth[6..12].copy_from_slice(sa);
+    eth[12..14].copy_from_slice(&ethertype.to_be_bytes());
+    eth[14..n].copy_from_slice(payload);
+    trace_tcp(stats, "rx", ethertype, payload);
+    let ok = LINK.deliver(&eth[..n]);
+    if ok {
+        stats.delivered += 1;
+    }
+    ok
+}
+
+/// Count, and for the first [`TCP_TRACE_MAX`] log by port, the TCP segments
+/// that open or reset a connection (`SYN`, `RST`): enough to see a handshake
+/// go wrong without logging a single address.
+fn trace_tcp(stats: &mut LinkStats, dir: &str, ethertype: u16, ip: &[u8]) {
+    if ethertype != sta::ETHERTYPE_IPV4 || ip.len() < 20 || ip[9] != 6 {
+        return;
+    }
+    let ihl = usize::from(ip[0] & 0xf) * 4;
+    let Some(tcp) = ip.get(ihl..ihl + 14) else { return };
+    let flags = tcp[13];
+    let (syn, ack, rst) = (flags & 0x02 != 0, flags & 0x10 != 0, flags & 0x04 != 0);
+    if !syn && !rst {
+        return;
+    }
+    match (dir, syn, rst) {
+        ("rx", true, _) => stats.syn_rx += 1,
+        ("rx", _, true) => stats.rst_rx += 1,
+        (_, true, _) => stats.syn_tx += 1,
+        _ => stats.rst_tx += 1,
+    }
+    if stats.traced < TCP_TRACE_MAX {
+        stats.traced += 1;
+        serial::puts("[rtw] tcp ");
+        serial::puts(dir);
+        serial::puts(" ");
+        serial::put_dec(u64::from(u16::from_be_bytes([tcp[0], tcp[1]])));
+        serial::puts(" -> ");
+        serial::put_dec(u64::from(u16::from_be_bytes([tcp[2], tcp[3]])));
+        serial::puts(match (syn, ack, rst) {
+            (true, true, _) => " SYN+ACK\n",
+            (true, false, _) => " SYN\n",
+            (_, _, true) => " RST\n",
+            _ => "\n",
+        });
+    }
+}
+
+/// The joined link's counters, one line.
+fn link_report(card: &Card, s: &LinkStats) {
+    let n = |label: &str, v: u32| {
+        serial::puts(label);
+        serial::put_dec(u64::from(v));
+    };
+    serial::puts("[rtw] link:");
+    n(" rx data ", s.rx_data);
+    n(" amsdu ", s.rx_amsdu);
+    n("/", s.rx_msdus);
+    n(" clear ", s.rx_clear);
+    n(" undecrypted ", s.rx_undecrypted);
+    n(" unparsed ", s.rx_unparsed);
+    n(" -> stack ", s.delivered);
+    n(" (dropped ", LINK.rx_dropped.load(Ordering::Relaxed));
+    n("); tx ", s.tx);
+    n(" failed ", s.tx_failed);
+    n(" (stack dropped ", LINK.tx_dropped.load(Ordering::Relaxed));
+    n("); released done ", card.rpq_status[0]);
+    n(" retry-limit ", card.rpq_status[1]);
+    n(" lifetime ", card.rpq_status[2]);
+    n(" dropped ", card.rpq_status[3]);
+    n("; tcp syn rx ", s.syn_rx);
+    n(" tx ", s.syn_tx);
+    n(" rst rx ", s.rst_rx);
+    n(" tx ", s.rst_tx);
+    n("; laps ", s.laps);
+    serial::puts(" max gap ");
+    serial::put_dec(s.max_gap_us / 1000);
+    serial::puts(" ms\n");
 }
 
 /// A firmware event, if it is the beacon filter's report: `(type, rssi dBm)`

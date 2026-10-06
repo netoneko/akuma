@@ -397,6 +397,18 @@ const BARE_METAL_STATIC_V4: StaticIpv4 = StaticIpv4 {
     dns: [1, 1, 1, 1],
 };
 
+/// The wifi link's address while it has no lease (before the first join, or
+/// after one lapses): link-local, so it can collide with nothing on whatever
+/// network the station joins, and Cloudflare's resolver, as for Ethernet.
+/// Leaving it unset used to put the stack's QEMU defaults (`10.0.2.15`, DNS
+/// `10.0.2.3`) on ryzen's wifi.
+const WIFI_NO_LEASE_V4: StaticIpv4 = StaticIpv4 {
+    addr: [169, 254, 65, 77],
+    prefix_len: 16,
+    gateway: [169, 254, 0, 1],
+    dns: [1, 1, 1, 1],
+};
+
 /// Parse an `ip=` command-line token into a [`StaticIpv4`].
 ///
 /// `ip=<addr>[/<prefix>][,<gateway>[,<dns>]]` — anything omitted is taken from
@@ -1019,7 +1031,16 @@ pub fn init_bare_metal(cmdline: &str) -> bool {
             let device = akuma_net::ExternalDevice::Queued(akuma_net::queued::QueuedDevice::new(
                 &crate::rtw89_sta::LINK,
             ));
-            return report_init(akuma_net::init_with_external(net_runtime(), true, device, None));
+            // Without a lease the interface carries a link-local address (and
+            // resolves through 1.1.1.1), never `BARE_METAL_STATIC_V4`: a wifi
+            // link may be any network, and that address belongs to another
+            // machine on this one. `ip=` still overrides it.
+            let wifi_v4 = if cmdline.split_ascii_whitespace().any(|t| t.starts_with("ip=")) {
+                static_v4
+            } else {
+                WIFI_NO_LEASE_V4
+            };
+            return report_init(akuma_net::init_with_external(net_runtime(), true, device, Some(wifi_v4)));
         }
         return init_loopback_only();
     };

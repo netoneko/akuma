@@ -260,13 +260,136 @@ impl<'a> Data<'a> {
     }
 }
 
+/// One MSDU out of an A-MSDU, as Ethernet would see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msdu<'a> {
+    pub da: Addr,
+    pub sa: Addr,
+    pub ethertype: u16,
+    pub payload: &'a [u8],
+}
+
+/// A from-DS QoS data frame whose QoS control says **A-MSDU** (bit 7).
+///
+/// Several MSDUs in one frame (802.11-2020 9.3.2.2). The station advertises
+/// A-MSDU reception in its HT capabilities (the association elements are
+/// Linux's), so an access point may bundle frames to it whenever it has more
+/// than one queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Amsdu<'a> {
+    pub bssid: Addr,
+    pub protected: bool,
+    /// The subframes, back to back: `DA(6) SA(6) length(2, big-endian)` then
+    /// the MSDU (LLC/SNAP, ethertype, payload), padded to 4 bytes but the last.
+    body: &'a [u8],
+}
+
+impl<'a> Amsdu<'a> {
+    /// `fcs` and protection as for [`Data::parse`]. `None` for anything that
+    /// is not a from-DS QoS data frame with the A-MSDU bit.
+    #[must_use]
+    pub fn parse(f: &'a [u8], fcs: bool) -> Option<Self> {
+        let f = if fcs { f.get(..f.len().checked_sub(4)?)? } else { f };
+        let h = Hdr::parse(f)?;
+        if h.fc.ty() != TYPE_DATA || h.fc.to_ds() || !h.fc.from_ds() {
+            return None;
+        }
+        let st = h.fc.subtype();
+        if st & 4 != 0 || st & 8 == 0 || *f.get(24)? & 0x80 == 0 {
+            return None;
+        }
+        let mut at = QOS_HDR_LEN;
+        if h.fc.0 & (1 << 15) != 0 {
+            at += 4; // HT control
+        }
+        let protected = h.fc.protected();
+        let mut end = f.len();
+        if protected {
+            at += CCMP_HDR_LEN;
+            end = end.checked_sub(CCMP_MIC_LEN)?;
+        }
+        Some(Self { bssid: h.addr2, protected, body: f.get(at..end)? })
+    }
+
+    /// The MSDUs in order. A malformed subframe ends the walk; the ones before
+    /// it are still yielded. Subframes without LLC/SNAP are skipped.
+    pub fn subframes(&self) -> impl Iterator<Item = Msdu<'a>> + 'a {
+        let mut rest = self.body;
+        core::iter::from_fn(move || {
+            loop {
+                if rest.len() < 14 {
+                    return None;
+                }
+                let mut da = [0u8; 6];
+                let mut sa = [0u8; 6];
+                da.copy_from_slice(&rest[..6]);
+                sa.copy_from_slice(&rest[6..12]);
+                let len = usize::from(u16::from_be_bytes([rest[12], rest[13]]));
+                let msdu = rest.get(14..14 + len)?;
+                let padded = (14 + len + 3) & !3;
+                rest = rest.get(padded..).unwrap_or(&[]);
+                if msdu.len() >= 8 && msdu[..6] == SNAP {
+                    return Some(Msdu {
+                        da,
+                        sa,
+                        ethertype: u16::from_be_bytes([msdu[6], msdu[7]]),
+                        payload: &msdu[8..],
+                    });
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::Ies;
+    extern crate std;
 
     const AP: Addr = [0x02, 1, 2, 3, 4, 5];
     const ME: Addr = [0x02, 9, 8, 7, 6, 5];
+
+    /// An A-MSDU of two MSDUs (the first padded to 4), as an access point
+    /// sends it: from-DS QoS data with the A-MSDU bit, CCMP header and MIC
+    /// still in place (the card decrypts, Linux strips nothing), FCS last.
+    #[test]
+    fn amsdu_yields_each_msdu_and_data_parse_refuses_it() {
+        let mut f = std::vec::Vec::new();
+        f.extend_from_slice(&[0x88, 0x42, 0, 0]); // QoS data, from-DS, protected
+        f.extend_from_slice(&ME); // addr1
+        f.extend_from_slice(&AP); // addr2 = BSSID
+        f.extend_from_slice(&AP); // addr3
+        f.extend_from_slice(&[0, 0]); // seq
+        f.extend_from_slice(&[0x80, 0]); // QoS: A-MSDU present
+        f.extend_from_slice(&[0xaa; 8]); // CCMP header
+        let sub = |f: &mut std::vec::Vec<u8>, da: &Addr, et: u16, payload: &[u8], last: bool| {
+            f.extend_from_slice(da);
+            f.extend_from_slice(&AP);
+            f.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+            f.extend_from_slice(&SNAP);
+            f.extend_from_slice(&et.to_be_bytes());
+            f.extend_from_slice(payload);
+            while !last && f.len() % 4 != 2 {
+                f.push(0); // pad to 4 from the subframe's start (body starts at 34, 34 % 4 = 2)
+            }
+        };
+        sub(&mut f, &ME, ETHERTYPE_IPV4, &[1, 2, 3], false);
+        sub(&mut f, &[0xff; 6], ETHERTYPE_ARP, &[9; 28], true);
+        f.extend_from_slice(&[0xbb; 8]); // MIC
+        f.extend_from_slice(&[0xcc; 4]); // FCS
+        assert!(Data::parse(&f, true).is_none(), "Data::parse leaves A-MSDUs to Amsdu");
+        let a = Amsdu::parse(&f, true).unwrap();
+        assert!(a.protected);
+        assert_eq!(a.bssid, AP);
+        let got: std::vec::Vec<Msdu<'_>> = a.subframes().collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].da, got[0].ethertype, got[0].payload), (ME, ETHERTYPE_IPV4, &[1u8, 2, 3][..]));
+        assert_eq!((got[1].da, got[1].ethertype, got[1].payload.len()), ([0xff; 6], ETHERTYPE_ARP, 28));
+        // A plain QoS data frame is not an A-MSDU.
+        f[24] = 0;
+        assert!(Amsdu::parse(&f, true).is_none());
+    }
 
     #[test]
     fn auth_request_is_linuxs_30_bytes() {

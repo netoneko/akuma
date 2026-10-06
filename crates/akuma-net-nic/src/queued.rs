@@ -90,6 +90,11 @@ pub struct FrameQueues {
     mac: Spinlock<[u8; 6]>,
     /// Bumped on every link up/down ([`FrameQueues::link_changed`]).
     link_gen: AtomicU32,
+    /// Rung after the stack queues a frame ([`FrameQueues::on_transmit`]):
+    /// the driver runs on its own schedule, and a frame left for its next
+    /// timed lap waits as long as that lap is away (measured on ryzen: long
+    /// enough for every TCP handshake to time out at its peer).
+    tx_doorbell: Spinlock<Option<fn()>>,
     /// Frames dropped because a queue was full or busy.
     pub rx_dropped: AtomicU32,
     pub tx_dropped: AtomicU32,
@@ -109,6 +114,7 @@ impl FrameQueues {
             tx: Spinlock::new(Ring::new()),
             mac: Spinlock::new([0; 6]),
             link_gen: AtomicU32::new(0),
+            tx_doorbell: Spinlock::new(None),
             rx_dropped: AtomicU32::new(0),
             tx_dropped: AtomicU32::new(0),
         }
@@ -117,6 +123,12 @@ impl FrameQueues {
     /// The link's MAC, before the stack is built on it.
     pub fn set_mac(&self, mac: [u8; 6]) {
         *self.mac.lock() = mac;
+    }
+
+    /// Driver side: `ring` is called (outside every lock here) each time the
+    /// stack queues a frame — typically a wake of the driver's thread.
+    pub fn on_transmit(&self, ring: fn()) {
+        *self.tx_doorbell.lock() = Some(ring);
     }
 
     /// Driver side: the link came up or went away. The stack restarts DHCP
@@ -204,7 +216,13 @@ impl QueuedDevice {
             return res;
         }
         let ok = self.q.tx.try_lock().is_some_and(|mut t| t.push(&self.tx_scratch[..end]));
-        if !ok {
+        if ok {
+            // Copied out first: the doorbell runs with no lock of ours held.
+            let ring = self.q.tx_doorbell.try_lock().and_then(|d| *d);
+            if let Some(ring) = ring {
+                ring();
+            }
+        } else {
             self.q.tx_dropped.fetch_add(1, Ordering::Relaxed);
         }
         res
@@ -257,6 +275,21 @@ mod tests {
         assert_eq!(Q.tx_dropped.load(Ordering::Relaxed), 1);
         let mut out = [0u8; FRAME_MAX];
         assert_eq!(Q.next_transmit(&mut out), None);
+    }
+
+    #[test]
+    fn the_doorbell_rings_once_per_queued_frame() {
+        use core::sync::atomic::AtomicU32;
+        static RUNG: AtomicU32 = AtomicU32::new(0);
+        fn ring() {
+            RUNG.fetch_add(1, Ordering::Relaxed);
+        }
+        let q: &'static FrameQueues = Box::leak(Box::new(FrameQueues::new()));
+        q.on_transmit(ring);
+        let mut dev = QueuedDevice::new(q);
+        dev.emit_frame(60, |b| b.fill(1), |_| false);
+        dev.emit_frame(60, |b| b.fill(2), |_| true); // diverted: no frame, no ring
+        assert_eq!(RUNG.load(Ordering::Relaxed), 1);
     }
 
     #[test]

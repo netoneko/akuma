@@ -411,6 +411,10 @@ pub struct Card {
     /// chip says became of the frames sent (diagnostics for the join).
     pub rpq_seen: u32,
     pub rpq_last: [u8; 32],
+    /// Release reports by the TX status of their first record
+    /// (`rtw89_pci_rpp_fmt` bits 15:13: 0 done, 1 retry limit, 2 lifetime,
+    /// 3 dropped).
+    pub rpq_status: [u32; 8],
     /// Every RXQ entry taken, by outcome: parsed (by packet type, low 4
     /// bits), unparsable, and 802.11 frames with a bad FCS.
     pub rx_types: [u32; 16],
@@ -443,6 +447,7 @@ impl Card {
             saved_filter: None,
             rpq_seen: 0,
             rpq_last: [0; 32],
+            rpq_status: [0; 8],
             rx_types: [0; 16],
             rx_bad: 0,
             rx_crc: 0,
@@ -518,6 +523,8 @@ impl Card {
             core::sync::atomic::fence(Ordering::Acquire);
             self.rpq_last.copy_from_slice(buf);
             self.rpq_seen += 1;
+            let rpp = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+            self.rpq_status[((rpp >> 13) & 7) as usize] += 1;
             self.rpq.advance(1);
         }
         if r > 0 {
