@@ -3,6 +3,12 @@
 ryzen (IdeaPad 5 2-in-1 16AHP9, Ryzen 7 8845HS) boots Pop!_OS through
 **systemd-boot**. Akuma is a one-shot guest on it: arm it, reboot, and the next
 reset — Akuma's own `reboot -f`, the power button, anything — lands back in Pop.
+**Status, 2026-10-06: working, unattended, with the root on the laptop's own
+NVMe SSD** (p3, ex-Windows, 64 GiB ext2). Arm, reboot, and about 3 minutes later
+Pop is back with `boot-N.early` + `boot-N.dmesg` in `/var/log/ryzen` on p3, and
+`e2fsck` clean. Still missing: a hardware watchdog, so a kernel wedge needs a
+hand on the power button.
+
 Why this shape, and the wifi plan it exists for:
 [`docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../../docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md).
 

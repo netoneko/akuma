@@ -1,6 +1,22 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-09-06 with
+**Grade: A** — regenerated 2026-10-06 with
+`python3 scripts/cloc_akuma.py src crates`: **56 of 76 crates** forbid
+`unsafe` (75,527 of 97,266 crate lines, 77.6%; 97.6% of production code lies
+outside any `unsafe` block). New since the last run, and also carrying the ban
+from its first commit: **`akuma-nvme`** (582 production lines, 0 sites). That is
+the NVMe register/queue/Identify/PRP/GPT logic, with a partition window every
+access is checked against. Its MMIO/DMA half is `amd64/src/nvme.rs`, which
+lives in `amd64/` and is not counted here (`overlays/ryzen/`,
+[`AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md)
+§ 9). Most of the other six new forbidding crates since 2026-09-06
+(`akuma-fbcon`, `akuma-pty`, `akuma-hda`, …) arrived without a regeneration.
+**Open:** the script flags one `unsafe` site each inside three forbidding crates
+(`akuma-net-rtl8169`, `akuma-usb`, `akuma-pci`). `forbid` would not compile a
+real one, so these are counter hits, probably the word in a comment. They have
+not been chased.
+
+The run before, 2026-09-06, also with
 `python3 scripts/cloc_akuma.py src crates` after four extractions in one
 session: **`akuma-dmesg`** (console history + `syslog(2)` decode),
 **`akuma-procfs`** (`/proc/<pid>` byte formats), **`akuma-user-space`** (the

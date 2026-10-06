@@ -1,14 +1,35 @@
 # Akuma/amd64 on ryzen (bare metal) — what it would take, wifi first
 
-2026-10-06. Assessment only. Nothing on the box was changed: every probe below
-was read-only (`lspci`, `lsusb`, `lsblk`, `parted print`, `efibootmgr -v`,
-`journalctl -k`, sysfs, and `ntfsresize --info --no-action`, which refused and
-modified nothing).
+2026-10-06. Began as an assessment made with read-only probes (`lspci`,
+`lsusb`, `lsblk`, `parted print`, `efibootmgr -v`, `journalctl -k`, sysfs, and
+`ntfsresize --info --no-action`, which refused and modified nothing). It was
+then carried out the same day: §8 and §9 record what was built and measured.
+The verdict below is the original assessment, with resolved items marked.
 
 Written in answer to: "install akuma on it on a separate partition, get wifi
 going or better yet usb networking and then work on wifi via that", then
 narrowed to **"can we do wifi with a reboot cycle — temporarily boot Akuma, run
 tests, dump dmesg to disk, reboot back to Linux and keep working there?"**
+
+## Status, 2026-10-06 (end of day)
+
+**Akuma runs on ryzen's metal with its root filesystem on the laptop's own
+NVMe SSD.** It boots one-shot from Pop, reaches userspace, writes its kernel log
+to `/var/log/ryzen` on that disk, resets itself, and Pop reads the log back.
+`e2fsck` is clean, even after a hard power-off mid-run. **The whole cycle has
+run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
+44 s firmware/boot) and left `boot-2.early` + `boot-2.dmesg` on p3.
+
+| | state |
+|---|---|
+| boot path (systemd-boot one-shot → standalone GRUB → multiboot2) | **done**, `overlays/ryzen/` |
+| framebuffer above 4 GiB (`0x4b0000000`) | **fixed**, verified on the panel |
+| PMM handing out the kernel image under UEFI | **fixed**, found by the QEMU rehearsal |
+| NVMe driver + `root=/dev/nvme0n1p3` | **done**, verified on the metal (§9) |
+| log sink | **done**: p3, ext2 (64 GiB filesystem inside the 279 GiB partition) |
+| Windows | **gone**: p3 reformatted at the user's request |
+| FCH watchdog (a wedge still needs a hand on the power button) | **next** |
+| wifi W0–W5 (§5) | not started |
 
 ## Verdict
 
@@ -22,7 +43,8 @@ tests, dump dmesg to disk, reboot back to Linux and keep working there?"**
    `grub-efi-amd64-bin` is not installed and `grub-mkstandalone` is absent. The
    equivalent is one standalone `grubx64.efi` (for `multiboot2`) plus one
    systemd-boot entry file that points at it (§3).
-3. **The real costs are the log sink and a watchdog, not the boot.** Akuma can
+3. *(Log sink resolved 2026-10-06 by the NVMe driver, §9; the watchdog is
+   still open.)* **The real costs are the log sink and a watchdog, not the boot.** Akuma can
    read the ESP only through GRUB. Once it is running it has no NVMe driver and
    cannot write vfat, so `dmesg` has to land somewhere else: a USB stick through
    the existing xHCI mass-storage driver (cheapest), or a new NVMe driver
@@ -139,7 +161,10 @@ Windows entry before relying on it.
 
 ## 4. The log sink: where `dmesg` goes
 
-Akuma cannot write the ESP: it has no vfat and no NVMe driver.
+**Resolved 2026-10-06: option (b)**, the NVMe driver and ex-Windows p3 (§9).
+The USB stick was never needed.
+
+Akuma cannot write the ESP: it has no vfat (and, until §9, had no NVMe driver).
 
 | option | new code | risk | verdict |
 |---|---|---|---|
@@ -185,6 +210,15 @@ this box. It does **not** remove the reboot from the kernel-change loop.
 
 ## 7. The persistent partition: ex-Windows `p3` as ext2
 
+**Done 2026-10-06** with `overlays/ryzen/format-p3.sh --yes-destroy-p3 64G`.
+That is the 512 MiB root image `dd`'d onto p3, `e2fsck`'d, grown with
+`resize2fs` to a **64 GiB** filesystem (the user's choice: quicker checks; it
+grows in place later), and labelled `AKUMA-RYZEN`. This satisfies the
+"mkdisk.sh's format" point below, because it *is* mkdisk.sh's image. The script
+refuses unless start, length and PARTUUID all match the partition measured
+here. The kernel and root image still load from the ESP (p6); the "GRUB reads
+p3" step below was not needed.
+
 - **Decision (user, 2026-10-06):** reformat `nvme0n1p3` (279 GiB, "Windows-SSD")
   as ext2 and give it to Akuma. No resizing; the NTFS inconsistency becomes
   irrelevant. Consequences to accept knowingly: Windows and its recovery
@@ -227,16 +261,73 @@ Build changes on the box since §8's first version: `grub-common` +
 The tinycc and `CC=clang` traps from the first build still apply; both are
 handled in `build.sh`.
 
+## 9. The NVMe root on the metal, 2026-10-06
+
+`crates/akuma-nvme` (pure, `forbid(unsafe_code)`, 21 host tests plus an ignored
+test that parses a real GPT dump) and `amd64/src/nvme.rs` (MMIO/DMA, polled),
+selected with `root=/dev/nvme0n1pN`. What the driver guarantees, and how each
+guarantee was checked:
+
+| property | how it was checked |
+|---|---|
+| touches only the selected partition's LBA range | `Window` checks every offset, and every command's LBA run goes through `Window::absolute`; host tests at the edges and on overflow |
+| the window comes only from a valid GPT | header CRC **and** entry-array CRC; host tests corrupt each one; the parser read ryzen's real table (p3 = LBA 567296..=586518527, the same as `parted`) |
+| writes nothing to a partition without ext2 | the ext2 mount checks the superblock magic before any write; rehearsal `P3=blank`: p3's first 256 MiB were still zeros afterwards |
+| a hung command cannot DMA into reused memory | fail-stop: a timeout disables the controller and turns bus-mastering off; nothing is retried |
+| the next kernel is not hit by stale DMA | `reboot` path: Flush, `CC.SHN` normal shutdown, bus-mastering off |
+
+**Rehearsed before every metal boot** on ryzen itself
+(`overlays/ryzen/qemu.sh DISK=nvme`). QEMU's NVMe device got a sparse 477 GiB
+image with ryzen's exact GPT, so the same LBAs and the same p3 window. OVMF
+booted it from NVMe, the UEFI NVMe driver had the controller enabled, and the
+kernel took it over. Passed: mount and log write; a second boot finding the
+first boot's logs (persistence); p3 as one full-size 279 GiB ext2
+(`e2fsck -fn` clean); and the blank-p3 fallback above.
+
+**On the metal**, in three steps, the first one read-only:
+
+1. *p3 still NTFS.* No log could survive, so `autoreboot` encoded the furthest
+   NVMe stage in its delay. 144 s outside Linux decoded to "GPT read, mount
+   refused": the real controller worked and nothing was written. This side
+   channel is still in `autoreboot.sh` for any boot that cannot reach the disk
+   (`overlays/ryzen/README.md`).
+2. *p3 formatted* (§7).
+3. *NVMe root.* The first log Akuma wrote to the laptop's own disk, read from Pop:
+
+```
+nvme: 1c5c:1d59
+nvme: CAP.TO 20000 ms, MQES 256, DSTRD 0, firmware left CC=0x460001 CSTS=0x1
+nvme: disabled in 0 ms
+nvme: ready in 3 ms
+nvme: SKHynix_HFS512GEJ4X112N fw 51040C31, mdts 256 KiB, vwc yes
+nvme: ns1 476 GiB in 512-byte blocks, 256 blocks per command
+nvme: init total 9 ms
+nvme: p3 = LBA 567296..=586518527 (279 GiB) "Basic data partition"
+fs:   ext2 mounted on /dev/nvme0n1p3
+```
+
+The same log shows the framebuffer at `0x4b0000000`, 1920×1200, cleared in
+1.2 ms (7.4 GB/s with write-combining), and 14096 MiB of RAM, all of it
+managed, with a 1 GiB heap above 4 GiB. That boot was power-cycled by hand
+mid-run; `e2fsck -fn` afterwards was clean.
+
+**The first fully unattended cycle (boot 2).** One-shot armed at 04:49:34; Pop
+was back at 04:52:41 with nobody touching the machine, i.e. 184 s outside
+Linux, which matches the 140 s stage. `boot-2.early` and `boot-2.dmesg` were on
+p3, and `e2fsck -fn` was clean. That is the loop §3 asked for, closed: arm,
+reboot, read the log.
+
+**What the takeover timing settled.** Earlier metal boots ran ~18 s longer
+outside Linux than a RAM-only boot, which looked like an NVMe timeout. The log
+says the takeover takes 9 ms, so the extra time is elsewhere, most likely
+firmware POST re-initialising a controller the OS shut down. That is still
+unmeasured.
+
 ## Suggested order
 
-1. Linux side: format `p3` ext2, GRUB standalone + `akuma.conf`, test
-   `bootctl set-oneshot` first with the (still present) Windows entry, or with
-   a second Pop entry once Windows is gone. One attended boot of a stock Akuma
-   with `nosmp` (verify framebuffer, i8042 typing, reboot).
-2. Log sink: a USB stick (§4a) for the very first cycles if xHCI comes up
-   cleanly. Otherwise go straight to the NVMe driver (§4b), which is the target
-   anyway. Test init writes dmesg and reboots.
-3. FCH watchdog. From here the loop is unattended.
+1. ~~Boot path, one attended boot~~ (done, §8).
+2. ~~Log sink~~ (done: the NVMe root, §9).
+3. **FCH watchdog.** From here the loop is unattended even when the kernel wedges.
 4. W0 → W2 on the loop.
 5. Decide on §6 (USB ethernet) and/or a USB wifi dongle before W3.
 
