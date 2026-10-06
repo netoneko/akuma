@@ -33,6 +33,8 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
 | wifi W2 (§5.3) | **done**: the recorded start replayed, 17 networks' beacons on channel 1 (menu entry 9) |
 | wifi W3/W4 (§5.4) | **done**: `rtw89wifi` (menu entry 10) scans, authenticates, associates and completes the WPA2 4-way handshake in the kernel; keys installed, link held (boot 16) |
+| p3 self-host environment (§5.7) | **staged**: toolchain, clone, rig, goose+Kimi, rio; not yet booted |
+| wifi RX replay protection (§5.7) | **built**, host-tested; not yet on metal |
 | wifi W5 (§5.6) | **done**: DHCP, SNTP, DNS, ssh in on 2222, outbound HTTP to the LAN and the internet; menu entry 12 boots it for use (quiet boot, framebuffer console, stays up) |
 
 ## Verdict
@@ -600,6 +602,52 @@ proves nothing; the router (TCP 53/80/443) is a reliable one.
 
 - `ping` cannot open a raw socket (`Invalid argument`); not wifi-specific.
 - Signal strength stays 0 until the firmware's beacon-filter report arrives.
+
+### 5.7 2026-10-06 night: RX replay protection, and the self-host environment on p3
+
+**RX replay protection (task 1 of the next-session list).** The card decrypts
+and checks the MIC but leaves the CCMP header in the frame, and nothing checked
+that the packet number was *new*: a recorded protected frame could be played
+back. `akuma_ieee80211::ccmp` now reads the PN, TID and key id from the header
+(`ccmp::header`, QoS or not, with or without HT control) and `ccmp::Replay`
+keeps the highest PN accepted per **key and TID** — pairwise (key id 0) and
+group (ids 0..=3, each its own space), non-QoS data counted as TID 0, as in
+mac80211. `rtw89_sta.rs` runs it on every frame the card decrypted, A-MSDUs
+included, before EAPOL or delivery; a group rekey (`JOIN4` replay) resets the
+group counters. The `[rtw] link:` line gained `replayed N`. Host-tested
+(`cargo test -p akuma-ieee80211`: equal/lower refused, PN 0 accepted once, TIDs
+and keys independent, rekey resets only group, header offsets). **Not yet seen on
+metal** — kernel built (`no-tests` and plain), entry 12 not re-armed.
+Caveat for task 2: once A-MPDU/BA is on, any reordering must happen *before* this
+check, or a legitimately reordered frame is dropped as a replay.
+
+**The self-host environment on p3** (the goal: replicate the trashcan's
+self-hosting on ryzen, then use Kimi from inside Akuma). Staged from Pop with
+`overlays/ryzen/stage-dev.sh`, a cousin of
+`scripts/benchmarks/ryzen_fc/stage{2,3}.sh` that writes onto the real partition
+rather than a Firecracker image:
+
+| what | where on p3 |
+|---|---|
+| nightly musl toolchain (`x86_64-unknown-{linux-musl,none}`, `rust-src`, clippy, rustfmt; 1.101.0-nightly 2026-10-05) | `/usr/local/rust`, plus the `libc.so`/`libgcc_s.so` copies lld needs |
+| a shallow clone of `ryzen-wifi` with submodules | `/src/github.com/netoneko/akuma` |
+| Alpine `git make patch less libgcc` + a monospace font | via `apk.static --root`, db at `/lib/apk` |
+| the rig: `/etc/akuma-dev.env`, `/bin/{kbuild,ubuild,mbuild,kinstall}`, `/root/.cargo/config.toml` | from `scripts/box/` |
+| goose 1.52.0 + `goose-kimi` (reads the key from `/root/.akuma/kimi/token`, mode 0600, at run time) + goose config (`openai` provider, `https://api.kimi.com`, `coding/v1/chat/completions`, `kimi-for-coding`) | `/usr/local/bin`, `/root/.config/goose` |
+| rio (musl, `wgpu,fb`) + the panel config | `/bin/rio`, `/root/.config/rio/config.toml` |
+
+No cargo registry is copied: the clone is small and the box fetches crates
+itself (`kbuild --online` the first time, over wifi). Findings: two submodules
+(`rumpkernel/src-netbsd`, `tcc/tinycc`) point at commits their remotes do not
+have, so the clone reports `fatal` for them and leaves the rest intact — the
+kernel build does not need them. `e2fsck -fn` on p3 shows 15 "incorrect
+filetype (was 1, should be 7)" dirents for symlinks written by Akuma's own
+`apk` (the directory-entry type of a created symlink is wrong; contents fine,
+`e2fsck -p` repairs it) — a kernel bug to chase. Long staging steps on this
+laptop must be detached (`setsid nohup … &`) and polled: the ssh session over
+the wifi drops them otherwise (two copies of the script collided on apk's lock
+before this was learned). The Kimi key was copied file to file on Pop from the
+kot cat's token; it appears in no log, config or doc.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 

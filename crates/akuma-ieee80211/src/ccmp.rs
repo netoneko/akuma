@@ -27,9 +27,11 @@ pub struct Rx {
     pub pn: u64,
 }
 
-/// Read the CCMP header of a protected from-DS data frame (QoS or not, with
-/// or without HT control). `None` if the frame is not protected data or is
-/// too short for the header, the Ext IV bit being clear included.
+/// Read the CCMP header of a protected data frame.
+///
+/// QoS or not, with or without HT control. `None` if the frame is not
+/// protected data or is too short for the header, the Ext IV bit being clear
+/// included.
 #[must_use]
 pub fn header(f: &[u8], fcs: bool) -> Option<Rx> {
     let f = if fcs { f.get(..f.len().checked_sub(4)?)? } else { f };
