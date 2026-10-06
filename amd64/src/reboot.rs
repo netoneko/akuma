@@ -56,6 +56,8 @@ pub fn perform_reset() -> ! {
         serial::puts("[reboot] fs sync failed; disk may need e2fsck\n");
     }
     let _ = crate::xhci::flush();
+    // NVMe: flush, normal shutdown, bus mastering off — see `nvme::shutdown`.
+    crate::nvme::shutdown();
 
     // Before the reset, not after: a reset does not stop a bus-master device.
     // An xHCI controller still running here keeps writing its rings into this

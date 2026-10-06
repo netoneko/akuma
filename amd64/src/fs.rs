@@ -259,6 +259,25 @@ impl BlockDevice for UsbDisk {
     }
 }
 
+/// A GPT partition on the NVMe disk (`nvme0n1pN`). Offsets are already
+/// partition-relative: `nvme` holds the window and refuses anything outside it.
+pub struct NvmeDisk;
+
+impl BlockDevice for NvmeDisk {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        crate::nvme::read_bytes(offset, buf).map_err(|_| ())
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        crate::nvme::write_bytes(offset, data).map_err(|_| ())
+    }
+
+    /// NVMe `Flush`: the namespace's volatile write cache, all of it.
+    fn flush(&self) -> Result<(), ()> {
+        crate::nvme::flush().map_err(|_| ())
+    }
+}
+
 /// Whatever the root filesystem is sitting on.
 ///
 /// Three things can be, and they arrive by different routes: a virtio-blk disk
@@ -275,6 +294,8 @@ pub enum RootDevice {
     Ram(crate::ramdisk::RamDisk),
     /// A partition on the USB disk (`sda1`), the persistent root.
     Usb(UsbDisk),
+    /// A GPT partition on the NVMe disk (`nvme0n1pN`) — ryzen's root.
+    Nvme(NvmeDisk),
 }
 
 impl BlockDevice for RootDevice {
@@ -283,6 +304,7 @@ impl BlockDevice for RootDevice {
             Self::Virtio(d) => d.read_bytes(offset, buf),
             Self::Ram(d) => d.read_bytes(offset, buf),
             Self::Usb(d) => d.read_bytes(offset, buf),
+            Self::Nvme(d) => d.read_bytes(offset, buf),
         }
     }
 
@@ -291,6 +313,7 @@ impl BlockDevice for RootDevice {
             Self::Virtio(d) => d.write_bytes(offset, data),
             Self::Ram(d) => d.write_bytes(offset, data),
             Self::Usb(d) => d.write_bytes(offset, data),
+            Self::Nvme(d) => d.write_bytes(offset, data),
         }
     }
 
@@ -298,6 +321,7 @@ impl BlockDevice for RootDevice {
         match self {
             Self::Virtio(_) | Self::Ram(_) => Ok(()),
             Self::Usb(d) => d.flush(),
+            Self::Nvme(d) => d.flush(),
         }
     }
 }

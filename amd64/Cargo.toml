@@ -258,6 +258,9 @@ akuma-hda = { path = "../crates/akuma-hda" }
 # MMIO/DMA half is `src/xhci.rs`. Persistence: the only spare disk is trapped in
 # a USB-to-SATA enclosure (`docs/archive/AKUMA_SELF_HEALING_PORT.md`).
 akuma-xhci = { path = "../crates/akuma-xhci" }
+# NVMe (ryzen's SSD): register/queue/Identify/PRP/GPT logic, host-tested; the
+# MMIO/DMA half is `src/nvme.rs`.
+akuma-nvme = { path = "../crates/akuma-nvme" }
 # USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
 # driven over `akuma-xhci` by `src/usb_storage.rs`'s BOT helpers in `src/xhci.rs`.
 akuma-usb-storage = { path = "../crates/akuma-usb-storage" }

@@ -116,7 +116,6 @@ const PAGE_SIZE: usize = 4096;
 
 unsafe extern "C" {
     /// End of the linked image including `.bss`, from `linker.ld`.
-    static _kernel_start: u8;
     static _kernel_end: u8;
 }
 
@@ -130,7 +129,7 @@ const fn align_up(v: usize, to: usize) -> usize {
 /// chipset left between them; only the heap's *placement* still picks one, and
 /// it picks the region holding the kernel image when that has room.
 pub fn init(machine: &MachineDescription) -> bool {
-    init_reserving(machine, (0, 0))
+    init_reserving(machine, &[])
 }
 
 /// How a region of RAM ended up being used, for the boot-log accounting.
@@ -191,18 +190,31 @@ impl Usable {
     }
 }
 
-/// As [`init`], but keeping the PMM's hands off `reserved` (`[start, end)`,
-/// the loader's modules) as well.
+/// As [`init`], but keeping the PMM's hands off every `[start, end)` in
+/// `reserved` as well — on a multiboot2 boot, the modules and the information
+/// block, both of which the kernel goes on reading after this returns.
 ///
 /// A multiboot2 boot arrives with the root filesystem already **in RAM**: GRUB
 /// loaded it as a module and told us where. Nothing in the memory map says so —
 /// the loader reports those frames as ordinary available memory — so without
 /// this the PMM would hand out the pages holding the filesystem the kernel is
 /// about to mount, and the corruption would appear later and somewhere else.
-pub fn init_reserving(machine: &MachineDescription, reserved: (u64, u64)) -> bool {
+pub fn init_reserving(machine: &MachineDescription, reserved: &[(u64, u64)]) -> bool {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as u64;
-    let kernel = (core::ptr::addr_of!(_kernel_start) as u64, kernel_end);
-    let taken = [kernel, reserved];
+    // From the 1 MiB floor, not from `_kernel_start` (2 MiB): the layout above
+    // has always kept the PMM off everything below `kernel_end`, and the AP
+    // trampoline and loader structures have lived in that MiB on some boots.
+    let kernel = (LOW_RAM_FLOOR, kernel_end);
+    // Fixed capacity: this runs before the heap exists.
+    let mut taken = [(0u64, 0u64); 4];
+    taken[0] = kernel;
+    for (slot, r) in taken[1..].iter_mut().zip(reserved) {
+        *slot = *r;
+    }
+    if reserved.len() > taken.len() - 1 {
+        serial::puts("  [FATAL] more reserved spans than mem::init_reserving holds\n");
+        return false;
+    }
 
     // EVERY REGION IS MANAGED, NOT ONE, and that is the whole of this function.
     //
@@ -272,22 +284,18 @@ pub fn init_reserving(machine: &MachineDescription, reserved: (u64, u64)) -> boo
     // retry at `HEAP_SIZE` before letting the "does not fit" diagnostic below
     // fire. The same preference order applies at either size: beside the kernel
     // when that fits, the roomiest region otherwise.
-    let fits = |u: Usable, want: usize| u.floor.saturating_add(want as u64) < u.end;
-    let pick = |want: usize| -> Option<(Usable, usize)> {
-        match kernel_home {
-            Some(k) if fits(k, want) => Some((k, want)),
-            _ if fits(roomiest, want) => Some((roomiest, want)),
-            _ => None,
-        }
+    let pick = |want: usize| -> Option<(Usable, usize, u64)> {
+        let at = |u: Usable| heap_start_in(u, want as u64, &taken).map(|s| (u, want, s));
+        kernel_home.and_then(at).or_else(|| at(roomiest))
     };
-    let (heap_home, heap_bytes) = pick(heap_size_for(machine.usable_ram()))
+    let (heap_home, heap_bytes, heap_at) = pick(heap_size_for(machine.usable_ram()))
         .or_else(|| pick(HEAP_SIZE))
         // Nothing fits at either size. Keep the historical choice so the
         // explicit diagnostic below reports against the same region it always
         // did, rather than this change altering what a failing boot prints.
-        .unwrap_or((roomiest, HEAP_SIZE));
+        .unwrap_or((roomiest, HEAP_SIZE, roomiest.floor));
     HEAP_BYTES.store(heap_bytes, core::sync::atomic::Ordering::Relaxed);
-    let heap_start = heap_home.floor as usize;
+    let heap_start = heap_at as usize;
     let heap_end = heap_start + heap_bytes;
 
     // Print the map BEFORE the check that uses it. A "does not fit" message
@@ -427,6 +435,14 @@ pub fn init_reserving(machine: &MachineDescription, reserved: (u64, u64)) -> boo
         // Whatever already sits at the bottom of this region: the kernel image,
         // and on a multiboot2 boot the root filesystem GRUB left in RAM.
         akuma_pmm::reserve_range(u.base as usize, (u.floor - u.base) as usize);
+        // And whatever sits inside it: the holes `usable_of` left in place.
+        for &(a, b) in &taken {
+            let lo = a.max(u.floor) & !(PAGE_SIZE as u64 - 1);
+            let hi = align_up(b.min(u.end) as usize, PAGE_SIZE) as u64;
+            if b > a && hi > lo {
+                akuma_pmm::reserve_range(lo as usize, (hi - lo) as usize);
+            }
+        }
     }
     // The heap was carved out before the PMM existed and is inside one of the
     // regions just described, so it has to be taken back explicitly.
@@ -464,10 +480,12 @@ const LOW_RAM_FLOOR: u64 = 0x10_0000;
 /// and the first `fork` from herd overwrote live kernel memory — a `#PF` inside
 /// `talc_alloc` with headless output, a silent triple fault with a framebuffer.
 ///
-/// A span that reaches the region's top clips `end` (the part below it stays
-/// usable); one that ends inside the region raises `floor` to its end, giving up
-/// whatever lies below it there, as before. Applied in order, each narrowing
-/// `[floor, end)`.
+/// A span covering the region's bottom raises `floor` past it; one covering
+/// the top clips `end` below it. A span strictly **inside** `[floor, end)` —
+/// a module or the information block wherever the loader put it — is left in
+/// the region and reserved as a hole by `init_reserving` (`reserve_range`),
+/// and the heap is placed around it (`heap_start_in`): raising the floor past
+/// it would give up everything below it, which can be gigabytes.
 fn usable_of(r: MemRegion, taken: &[(u64, u64)]) -> Option<Usable> {
     let base = r.addr.max(LOW_RAM_FLOOR);
     let mut end = r.end().min(PHYSMAP_LIMIT);
@@ -479,9 +497,9 @@ fn usable_of(r: MemRegion, taken: &[(u64, u64)]) -> Option<Usable> {
         if stop <= start || stop <= floor || start >= end {
             continue; // empty, or no overlap with what is left
         }
-        if stop < end {
+        if start <= floor {
             floor = stop;
-        } else {
+        } else if stop >= end {
             end = start;
         }
     }
@@ -490,6 +508,26 @@ fn usable_of(r: MemRegion, taken: &[(u64, u64)]) -> Option<Usable> {
         return None;
     }
     Some(Usable { base, end, floor })
+}
+
+/// Where in `u` a heap of `want` bytes can start without overlapping any
+/// `taken` span left inside the region, lowest first; `None` if it fits
+/// nowhere. Same strict `<` against `end` the single-span check always used.
+fn heap_start_in(u: Usable, want: u64, taken: &[(u64, u64)]) -> Option<u64> {
+    let mut s = u.floor;
+    'again: loop {
+        let e = s.checked_add(want)?;
+        if e >= u.end {
+            return None;
+        }
+        for &(a, b) in taken {
+            if b > a && a < e && b > s {
+                s = align_up(b as usize, PAGE_SIZE) as u64;
+                continue 'again;
+            }
+        }
+        return Some(s);
+    }
 }
 
 /// Every usable RAM region, in the order the machine reported them.

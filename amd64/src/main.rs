@@ -106,6 +106,7 @@ mod mm;
 mod multiboot2;
 #[cfg(target_arch = "x86_64")]
 mod net;
+mod nvme;
 #[cfg(target_arch = "x86_64")]
 mod paging;
 /// PCI enumeration — how a bare-metal boot finds the USB controllers, the NIC
@@ -122,6 +123,7 @@ mod ramdisk;
 mod phys;
 #[cfg(target_arch = "x86_64")]
 mod pipe;
+mod polltime;
 #[cfg(target_arch = "x86_64")]
 mod port;
 #[cfg(target_arch = "x86_64")]

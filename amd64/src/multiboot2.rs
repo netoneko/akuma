@@ -902,7 +902,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         serial::puts(" KiB\n");
     }
 
-    if !crate::mem::init_reserving(&machine, reserved) {
+    // The information block too: `info` — the command line, the module list —
+    // is read for the rest of this function, long after the PMM starts
+    // handing out frames, and nothing in the memory map marks its pages either.
+    let info_span = (info_phys, info_phys + bytes.len() as u64);
+    if !crate::mem::init_reserving(&machine, &[reserved, info_span]) {
         serial::puts("\nAkuma/amd64 - memory bring-up FAILED\n");
         crate::halt();
     }
@@ -940,11 +944,26 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
                 crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
             })
     };
+    // `root=/dev/nvme0n1pN`: the NVMe disk's GPT partition N (ryzen).
+    let want_nvme_root = info
+        .cmdline()
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("root=/dev/nvme0n1p"))
+        .map(|n| (n.parse::<u32>().ok(), n));
     let have_fs = if want_usb_root && try_usb_root() {
+        true
+    } else if let Some((Some(part), _)) = want_nvme_root
+        && try_nvme_root(part)
+    {
         true
     } else {
         if want_usb_root {
             serial::puts("  fs:   USB root unavailable — using the RAM image\n");
+        }
+        if let Some((_, n)) = want_nvme_root {
+            serial::puts("  fs:   NVMe root nvme0n1p");
+            serial::puts(n);
+            serial::puts(" unavailable — using the RAM image\n");
         }
         mount_ram()
     };
@@ -1166,6 +1185,28 @@ pub fn try_usb_root() -> bool {
         // strip it and recognise the partition as one a filesystem is caching.
         "/dev/sda1",
     )
+}
+
+/// Bring up the NVMe controller, select GPT partition `part` as the only range
+/// it may touch, and mount it as the root filesystem. `false` on any failure —
+/// the caller falls back to the RAM image. Nothing is written unless the
+/// partition already holds a readable ext2 superblock: `mount_root_on` refuses
+/// before any write if it does not.
+fn try_nvme_root(part: u32) -> bool {
+    if let Err(e) = crate::nvme::init().and_then(|()| crate::nvme::open_partition(part)) {
+        serial::puts("  fs:   NVMe: ");
+        serial::puts(e);
+        serial::puts("\n");
+        return false;
+    }
+    // A fixed table of names because the mount keeps a name and this path
+    // must not allocate to make one; partitions past 9 are not expected here.
+    const NAMES: [&str; 9] = [
+        "/dev/nvme0n1p1", "/dev/nvme0n1p2", "/dev/nvme0n1p3", "/dev/nvme0n1p4", "/dev/nvme0n1p5",
+        "/dev/nvme0n1p6", "/dev/nvme0n1p7", "/dev/nvme0n1p8", "/dev/nvme0n1p9",
+    ];
+    let name = NAMES.get(part as usize - 1).copied().unwrap_or("/dev/nvme0n1");
+    crate::fs::mount_root_on(crate::fs::RootDevice::Nvme(crate::fs::NvmeDisk), name)
 }
 
 /// Build the description the rest of the kernel expects, from multiboot2 tags.

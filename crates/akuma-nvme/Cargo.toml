@@ -1,0 +1,13 @@
+[package]
+name = "akuma-nvme"
+version = "0.1.0"
+edition = "2024"
+description = "Pure NVMe layout and bookkeeping for the amd64 bare-metal target: controller register decode, 64-byte submission entries and completion decode with phase tracking, Identify parsing, PRP planning, block chunking, a partition window that refuses out-of-range I/O, and a CRC-checked GPT reader — host-tested, no controller required."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []

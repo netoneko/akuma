@@ -107,6 +107,7 @@ dependencies = [
  "akuma-multiboot2",
  "akuma-net",
  "akuma-net-rtl8169",
+ "akuma-nvme",
  "akuma-pci",
  "akuma-pipe",
  "akuma-pipes",
@@ -481,6 +482,10 @@ version = "0.1.0"
 
 [[package]]
 name = "akuma-not-even-once"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-nvme"
 version = "0.1.0"
 
 [[package]]
