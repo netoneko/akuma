@@ -190,7 +190,7 @@ fn bring_up_matches_linux_access_for_access() {
     };
     let mut bus = Replay::new();
     let mut steps = 0;
-    let report = bringup::bring_up(&mut bus, &mut dma, &mut src, &mut |_: &'static str, _: u32| {
+    let report = bringup::bring_up(&mut bus, &mut dma, &mut bringup::Ch12::new(), &mut src, &mut |_: &'static str, _: u32| {
         steps += 1;
     })
     .unwrap_or_else(|e| panic!("bring-up failed: {e:?} at trace line {}", bus.trace[bus.at].line));

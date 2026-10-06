@@ -20,6 +20,7 @@ Why this shape, and the wifi work it exists for:
 | hardware watchdog (`wdt`, AMD FCH) | **works**: a deliberately wedged kernel (`arm.sh 6`) was reset by the chipset in 60 s, `FIRED=1` seen from Pop |
 | RTL8852CE firmware on p3 (`/lib/firmware/rtw89/`) | staged (`fetch-firmware.sh`); nothing loads it yet |
 | wifi W1: firmware download (`rtw89`, entry 8) | **works**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again; the fix that got it there was Bus Master on the card's root port (survey doc § 5.2) |
+| wifi W2: receive (`rtw89rx`, entry 9) | **works**: Linux's recorded start replayed (16 815 ops, 52 ms), then 12 s on channel 1: 1604 frames, 17 networks' beacons, the home network's among them (survey doc § 5.3) |
 | wifi W0: Linux's bring-up traced | **done**: probe + interface-up through `fw ready` (`w0-trace.sh`, results in the survey doc § 5.1; traces in `~/.akuma/w0/` on the laptop) |
 | wifi control (`/dev/wifi0`, `/etc/wifi`, `wifi`) | **works** against the simulated radio (entry 7, rehearsed); no real radio yet — [`docs/reference/subsystems/wifi.md`](../../docs/reference/subsystems/wifi.md) |
 | network | none, so ssh into Akuma here is not possible; the log is the channel |
@@ -57,6 +58,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | `wdt-probe.py` | ryzen, root, from Pop | **read-only** dump of the FCH watchdog and PM registers (`/dev/mem`): decoded? disabled? running? fired? |
 | `cycle.py <entry> [--grep RE]` | laptop | one loop cycle through `hpbox.py`: ship this tree's `no-tests` kernel and `grub.cfg`, rehearse the entry in QEMU (stops if it fails), install, arm, wait for Pop, print matching `boot-N.early` lines from p3 (default `[rtw]`) |
 | `w0-trace.sh [--check]` | ryzen, root | wifi **W0**: mmiotrace of rtw89 unbind → bind → up → one scan, to `/var/tmp/akuma-w0/<stamp>/`. Detaches into unit `akuma-w0` (drops Pop's wifi ~1–2 min, takes all CPUs but one offline while tracing); NetworkManager is kept off the card so no association or keys enter the trace; every exit path restores the network. `--check` changes nothing |
+| `w2-merge.py <run> [--phase P] [--collapse] [--no-fwdl] [--ts]` | laptop | a W2 run's register accesses, H2Cs and C2Hs in one ordered stream (each H2C anchored to its CH12 doorbell) |
+| `w2-seqgen.py <merged> <out.seq> [--from-fw-ready] [--until-stop] [--mac M]` | laptop | compiles a merged recording into the op stream `akuma_rtw89::script` replays (`crates/akuma-rtw89/seq/up.seq`) |
 | `w0-summary.py <trace> [--dump PHASE]` | laptop | per-phase read/write counts and busiest BAR offsets of a W0 trace; `--dump bind` prints the ordered sequence |
 | `grub.cfg` | — | the menu (5 s), below |
 | `remove.list` | — | paths deleted from the image: the framebuffer `console` service (not wanted here) |
@@ -75,7 +78,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 6 | **watchdog self-test** (`wdttest`): arm, then wedge with interrupts off | yes, through the watchdog's reset, about 60 s in |
 | 7 | **wifi tool test** (`wifisim` + the `wifitest` service): the `wifi` tool against the simulated radio, transcript to `/var/log/ryzen/wifitest-N.txt` | yes |
 | 8 | **wifi W1** (`rtw89`): as 0, plus the RTL8852CE brought up to running firmware and shut down again before `init`; `[rtw]` lines in `boot-N.early` | yes |
-| 9 | reboot | — |
+| 9 | **wifi W2** (`rtw89rx`): as 8, then Linux's recorded start replayed and 12 s of receiving on channel 1; a summary per network (OUI, channel, SSID hash, security) in `boot-N.early` | yes |
+| 10 | reboot | — |
 
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
 `initargs=daemon,--service,…`, which loads exactly the named herd services.

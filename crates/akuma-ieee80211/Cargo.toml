@@ -1,0 +1,13 @@
+[package]
+name = "akuma-ieee80211"
+version = "0.1.0"
+edition = "2024"
+description = "802.11 frames for Akuma's in-kernel wifi station: parsing beacons and probe responses (SSID, channel, RSN), building and parsing the management frames a station needs (probe, authentication, association), data-frame encapsulation, and the station's join state machine. no_std, no allocation, no dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []

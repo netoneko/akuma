@@ -11,7 +11,9 @@ Linux `rtw89_8852ce`), from powered off to running firmware: wifi stage W1
 | `regs` | register offsets and bits, named as Linux's `reg.h`/`pci.h` name them |
 | `fw` | the multi-firmware container (`rtw89_mfw_hdr`), image choice by chip cut, the image header and its sections, the packet plan |
 | `h2c` | CH12's ring entries, the 16-byte packet descriptor, the H2C header, RX ring entries |
-| `bringup` | `power_on`/`power_off`, `pre_init` (DMAC download mode, flow control, PCI pre-init), `disable_cpu`/`enable_cpu`, `download`, `wait_fw_ready`, `bring_up`, `shutdown` |
+| `bringup` | `power_on`/`power_off`, `pre_init` (DMAC download mode, flow control, PCI pre-init), `disable_cpu`/`enable_cpu`, `download`, `wait_fw_ready`, `bring_up`, `shutdown`; `Ch12`, the firmware-command ring, which keeps sending H2Cs after the download |
+| `script` | **W2**: the rest of Linux's start, replayed from a recording (`seq/up.seq`, made by `overlays/ryzen/w2-seqgen.py`): writes, checked reads, polls, delays, H2Cs; counts where the chip departs from the recording |
+| `rx` | **W2**: the RX ring's indices and the RX descriptor (`rtw89_core_query_rxdesc`) |
 
 Everything goes through the `Bus` trait (8/16/32-bit register reads and writes,
 a delay) and `fw::Source` (read the firmware file at an offset). DMA memory
@@ -40,10 +42,27 @@ AKUMA_RTW89_FW=/lib/firmware/rtw89/rtw8852c_fw-1.bin cargo test -p akuma-rtw89 -
   over in exactly the 166 packets Linux sent. Without the variable it passes
   having checked nothing, and says so.
 
+## The recorded start (`seq/up.seq`)
+
+After `fw ready`, Linux's `rtw89_core_start` is ~17 000 register accesses
+and 45 H2Cs. Two recordings of it differ only in the RF calibration
+readouts and the writes computed from them (survey doc § 5.3), so W2 replays
+the recording instead of porting the code that produced it. Regenerate from
+a `w0-trace.sh` run directory:
+
+```bash
+python3 overlays/ryzen/w2-merge.py <run> --phase up --collapse --no-fwdl --ts > up.txt
+python3 overlays/ryzen/w2-seqgen.py up.txt crates/akuma-rtw89/seq/up.seq --from-fw-ready --until-stop --mac <card MAC, 12 hex>
+```
+
+The MAC is zeroed in the stream and filled in at run time. The stream holds
+register values and firmware commands, no keys and no network names (the
+recording ran with NetworkManager kept off the card).
+
 ## On the metal
 
 `overlays/ryzen/cycle.py 8` (menu entry 8) boots it once on ryzen and prints
-the `[rtw]` lines. A good boot ends with
+the `[rtw]` lines; `cycle.py 9` (`rtw89rx`) adds the replay and 12 s of RX. A good boot ends with
 `[rtw] fw ready v0.27.122 (cut 1, 166 packets, FW_CTRL 0xe2, ~50000 us)` and
 `[rtw] card shut down`.
 

@@ -57,6 +57,8 @@ pub enum Stage {
     FwdlPathReady,
     Data,
     FwReady,
+    /// A firmware command after the download.
+    H2c,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,14 +522,45 @@ pub const fn fwdl_status(fw_ctrl: u8) -> u8 {
 /// has not been given would push past what was sent. An index like that reads
 /// as a full ring, and the wait for a free slot ends in [`Error::Poll`] with
 /// the register's value.
-struct Ch12 {
+pub struct Ch12 {
     wp: u16,
     submitted: u32,
 }
 
+impl Default for Ch12 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ch12 {
-    const fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self { wp: 0, submitted: 0 }
+    }
+
+    /// Packets sent so far, download included.
+    #[must_use]
+    pub const fn sent(&self) -> u32 {
+        self.submitted
+    }
+
+    /// Send one firmware command after the download: `cmd` is the H2C
+    /// header and body, as `rtw89_h2c_tx` hands it to the PCI layer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Poll`] if no slot came free, [`Error::DmaTooSmall`] if `cmd`
+    /// does not fit one.
+    pub fn send_h2c(&mut self, bus: &mut impl Bus, dma: &mut Dma<'_>, cmd: &[u8]) -> Result<(), Error> {
+        if cmd.len() + h2c::DESC_LEN > SLOT {
+            return Err(Error::DmaTooSmall);
+        }
+        self.send(bus, dma, Stage::H2c, h2c::TYPE_H2C, |m| {
+            m[..cmd.len()].copy_from_slice(cmd);
+            Some(cmd.len())
+        })
+        .map(drop)
     }
 
     /// Read the index register: `(raw value, packets the chip has not fetched)`.
@@ -589,6 +622,7 @@ impl Ch12 {
 pub fn download(
     bus: &mut impl Bus,
     dma: &mut Dma<'_>,
+    ring: &mut Ch12,
     src: &mut impl Source,
     img: &Image,
     log: &mut impl Log,
@@ -596,7 +630,6 @@ pub fn download(
     if dma.slot_count() == 0 || dma.ring.len() < RING_BYTES {
         return Err(Error::DmaTooSmall);
     }
-    let mut ring = Ch12::new();
 
     // fwdl_check_path_ready(h2c), then the header (__rtw89_fw_download_hdr).
     let v = poll8(bus, r::WCPU_FW_CTRL, 1, FWDL_WAIT_US, |v| v & r::H2C_PATH_RDY != 0)
@@ -665,6 +698,7 @@ pub const fn rejected_reason(status: u8) -> &'static str {
 pub fn bring_up(
     bus: &mut impl Bus,
     dma: &mut Dma<'_>,
+    ring: &mut Ch12,
     src: &mut impl Source,
     log: &mut impl Log,
 ) -> Result<Report, Error> {
@@ -684,7 +718,7 @@ pub fn bring_up(
     log.step("download-mode DMA ready", 0);
     disable_cpu(bus);
     enable_cpu(bus)?;
-    let data_packets = download(bus, dma, src, &img, log)?;
+    let data_packets = download(bus, dma, ring, src, &img, log)?;
     let fw_ctrl = wait_fw_ready(bus)?;
     Ok(Report { cv, image: entry, version: img.version, data_packets, fw_ctrl })
 }

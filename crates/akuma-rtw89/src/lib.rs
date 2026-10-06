@@ -64,6 +64,8 @@ pub mod bringup;
 pub mod fw;
 pub mod h2c;
 pub mod regs;
+pub mod rx;
+pub mod script;
 
 /// The card's register file, as the driver sees it: byte, half-word and word
 /// accesses at offsets into BAR2, plus a way to wait.

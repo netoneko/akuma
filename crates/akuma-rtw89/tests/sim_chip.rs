@@ -211,7 +211,7 @@ fn packets_carry_the_header_then_every_section_byte_in_order() {
     // Enough slots that none is reused: every packet is still in memory after.
     let mut b = Buffers::new(packets + 1);
     let mut chip = Chip::new(packets as u16 + 1);
-    let report = bringup::bring_up(&mut chip, &mut b.dma(), &mut src, &mut no_log).unwrap();
+    let report = bringup::bring_up(&mut chip, &mut b.dma(), &mut bringup::Ch12::new(), &mut src, &mut no_log).unwrap();
     assert_eq!(report.data_packets as usize, packets);
     assert_eq!(bringup::fwdl_status(report.fw_ctrl), 7);
 
@@ -243,7 +243,7 @@ fn a_slow_chip_makes_the_driver_wait_for_a_free_slot() {
     let mut b = Buffers::new(4);
     let mut chip = Chip::new(1 + 41);
     chip.consume_per_read = 1;
-    let report = bringup::bring_up(&mut chip, &mut b.dma(), &mut src, &mut no_log).unwrap();
+    let report = bringup::bring_up(&mut chip, &mut b.dma(), &mut bringup::Ch12::new(), &mut src, &mut no_log).unwrap();
     assert_eq!(report.data_packets, 41);
     assert!(chip.max_in_flight <= 4, "{} packets were in flight on 4 slots", chip.max_in_flight);
 }
@@ -284,7 +284,7 @@ fn a_chip_that_never_consumes_times_out_naming_the_ring() {
     }
     chip.consume_per_read = 1;
     let mut stall = Stall(chip);
-    let err = bringup::bring_up(&mut stall, &mut b.dma(), &mut src, &mut no_log).unwrap_err();
+    let err = bringup::bring_up(&mut stall, &mut b.dma(), &mut bringup::Ch12::new(), &mut src, &mut no_log).unwrap_err();
     assert!(matches!(err, Error::Poll { stage: Stage::Data, reg: regs::CH12_TXBD_IDX, .. }), "{err:?}");
 }
 
@@ -319,7 +319,7 @@ fn an_index_the_chip_was_never_given_reads_as_a_full_ring() {
     let file = firmware(&[100]);
     let mut src: &[u8] = &file;
     let mut b = Buffers::new(4);
-    let err = bringup::bring_up(&mut Ahead(Chip::new(2)), &mut b.dma(), &mut src, &mut no_log).unwrap_err();
+    let err = bringup::bring_up(&mut Ahead(Chip::new(2)), &mut b.dma(), &mut bringup::Ch12::new(), &mut src, &mut no_log).unwrap_err();
     assert_eq!(err, Error::Poll { stage: Stage::HeaderSent, reg: regs::CH12_TXBD_IDX, last: 5 << 16 });
 }
 
@@ -330,7 +330,7 @@ fn a_rejected_image_reports_linux_reason() {
     let mut b = Buffers::new(4);
     let mut chip = Chip::new(2);
     chip.final_status = 2;
-    let err = bringup::bring_up(&mut chip, &mut b.dma(), &mut src, &mut no_log).unwrap_err();
+    let err = bringup::bring_up(&mut chip, &mut b.dma(), &mut bringup::Ch12::new(), &mut src, &mut no_log).unwrap_err();
     assert_eq!(err, Error::Rejected(2));
     assert_eq!(bringup::rejected_reason(2), "fw checksum fail");
 }
@@ -351,7 +351,7 @@ fn a_short_read_mid_download_is_reported_with_the_packet() {
     let mut src = Truncated(&file, cut);
     let mut b = Buffers::new(4);
     let mut chip = Chip::new(4);
-    assert_eq!(bringup::bring_up(&mut chip, &mut b.dma(), &mut src, &mut no_log).unwrap_err(), Error::Read {
+    assert_eq!(bringup::bring_up(&mut chip, &mut b.dma(), &mut bringup::Ch12::new(), &mut src, &mut no_log).unwrap_err(), Error::Read {
         packet: 1
     });
 }

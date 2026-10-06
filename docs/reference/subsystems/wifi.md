@@ -32,7 +32,7 @@ herd ─ "wifi" service (/bin/wifi auto)
          │ reads /etc/wifi/*  (0600)
          │ write "scan wlan0" → read results → choose → write "connect wlan0 <ssid> <psk>"
          ▼
-/dev/wifi0 ── amd64/src/wifi.rs ── backend: simulated radio (`wifisim`) │ rtw89 (W1: firmware runs; not yet a backend)
+/dev/wifi0 ── amd64/src/wifi.rs ── backend: simulated radio (`wifisim`) │ rtw89 (W2: receives; not yet a backend)
 ```
 
 ## Where the code is
@@ -99,7 +99,7 @@ gets its own cursor. `close` frees it.
 |---|---|---|
 | none | default | **no `/dev/wifi0` node at all** (`open` is `ENOENT`, `ls /dev` omits it) |
 | simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below |
-| rtw89 | not yet a backend | ryzen's RTL8852CE. **W1 done 2026-10-06**: `rtw89` on the command line powers the card on, downloads its firmware and sees it ready, then shuts it down before `init` — [The radio](#the-radio-rtl8852ce-akuma-rtw89) below. W2 (receive) is next |
+| rtw89 | not yet a backend | ryzen's RTL8852CE. **W1 done 2026-10-06**: `rtw89` on the command line powers the card on, downloads its firmware and sees it ready, then shuts it down before `init` — [The radio](#the-radio-rtl8852ce-akuma-rtw89) below. **W2 done the same day**: `rtw89rx` replays Linux's recorded start and receives (17 networks' beacons on channel 1). W3 (transmit, join) is next |
 
 **The simulated radio** is deterministic: the same networks every boot, scans
 complete at once, and fixed rules for `connect`. A test that passes against it
@@ -126,6 +126,8 @@ Stage W1 of the wifi plan: from a powered-off card to running firmware.
 | the sequence | `crates/akuma-rtw89` (`forbid(unsafe_code)`, host-tested) | power-on (`rtw8852c_pwr_on_func`), the DMA engine's download-mode setup (`dle_init(DLFW)`, H2C flow control, `rtw89_pci_ops_mac_pre_init_ax`), the firmware CPU reset, the download on CH12, the wait for `fw ready`; the firmware container and header parser |
 | the hardware | `amd64/src/rtw89.rs` | finds `10ec:c852`, D0, maps BAR2, **Bus Master on the root port** as well as the card, `.bss` DMA memory, streams the firmware file through `fs::read_at` (never loaded whole), logs `[rtw]` lines, always shuts the card down |
 | the boot token | `rtw89` (multiboot2 path, after the root mount) | ryzen menu entry 8 |
+| W2: the start | `akuma_rtw89::script` + `seq/up.seq` | the rest of Linux's `rtw89_core_start` after `fw ready`, **replayed from a recording** of Linux on this card (writes, checked reads, polls, delays, 45 H2Cs); reports where the chip departs from it |
+| W2: receive | `akuma_rtw89::rx`, `akuma-ieee80211` | RXQ entries with their own buffers, the RX descriptor, beacons and probe responses (SSID, channel, RSN); token `rtw89rx`, ryzen menu entry 9 |
 
 **What a good boot logs** (`boot-N.early` on p3):
 

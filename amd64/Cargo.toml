@@ -266,6 +266,8 @@ akuma-wifi = { path = "../crates/akuma-wifi" }
 # RTL8852CE (ryzen's wifi) bring-up: power-on, DMA, firmware download, host-tested
 # against Linux's register trace of the card; the MMIO/DMA half is `src/rtw89.rs`.
 akuma-rtw89 = { path = "../crates/akuma-rtw89" }
+# 802.11 frames and the station state machine the rtw89 driver joins with.
+akuma-ieee80211 = { path = "../crates/akuma-ieee80211" }
 # USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
 # driven over `akuma-xhci` by `src/usb_storage.rs`'s BOT helpers in `src/xhci.rs`.
 akuma-usb-storage = { path = "../crates/akuma-usb-storage" }

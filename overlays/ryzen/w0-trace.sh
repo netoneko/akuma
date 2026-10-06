@@ -100,8 +100,19 @@ cleanup() {
     # changing the tracer resets the buffer, unread events with it.
     echo 0 > $T/tracing_on 2>/dev/null
     sleep 2
-    [ -n "$PIPE_PID" ] && kill $PIPE_PID 2>/dev/null
-    echo nop > $T/current_tracer 2>/dev/null
+    [ -n "$PIPE_PID" ] && { kill $PIPE_PID 2>/dev/null; wait $PIPE_PID 2>/dev/null; }
+    # The tracer cannot change while its trace_pipe is open (EBUSY), and a
+    # killed `cat` may not have closed it yet: 2026-10-06 run 3 left
+    # mmiotrace on, and 15 CPUs offline, that way. Retry until it takes.
+    i=0
+    until echo nop > $T/current_tracer 2>/dev/null || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done
+    echo 0 > $I/events/akuma/enable 2>/dev/null
+    sleep 1
+    [ -n "$H2C_PID" ] && kill $H2C_PID 2>/dev/null
+    rmdir $I 2>/dev/null
+    echo "-:akuma/h2c" >> $T/dynamic_events 2>/dev/null
+    echo "-:akuma/c2h" >> $T/dynamic_events 2>/dev/null
+    [ -f $O/h2c.txt ] && gzip -9 $O/h2c.txt
     echo 1 > $T/tracing_on 2>/dev/null
     echo "$OLD_KB" > $T/buffer_size_kb 2>/dev/null
     log "tracer=$(cat $T/current_tracer) buffer_size_kb=$(cat $T/buffer_size_kb) cpus=$(nproc)"
@@ -156,6 +167,25 @@ log "nm: $(nmcli -t -f DEVICE,STATE device | grep "^$IF:")"
 
 # 3. Trace on. The reader must be running before the tracer starts.
 echo $TRACE_KB > $T/buffer_size_kb || exit 1
+# Stage W2: the firmware commands (H2C) and events (C2H) travel by DMA, where
+# mmiotrace cannot see them. Two fprobe events dump their bytes into a trace
+# instance of their own (`instances/akuma` -> h2c.txt; the mmiotrace tracer's
+# own pipe drops foreign events, found 2026-10-06), timestamped on the same
+# clock as the register accesses. H2C: the first 2 KiB (an x64[64] array is
+# the largest one argument may be); C2H: 512 bytes. Nothing here is a key:
+# NetworkManager is kept off the card, so no association happens and no
+# security CAM entry is ever written.
+I=$T/instances/akuma
+H2C_PID=
+if [ "${H2C:-1}" = 1 ]; then
+    A=""; for i in 0 1 2 3; do A="$A d$i=+$((i*512))(skb->data):x64[64]"; done
+    mkdir -p $I \
+        && echo 8192 > $I/buffer_size_kb \
+        && echo "f:akuma/h2c rtw89_h2c_tx len=skb->len$A" >> $T/dynamic_events \
+        && echo "f:akuma/c2h rtw89_fw_c2h_irqsafe len=c2h->len d0=+0(c2h->data):x64[64]" >> $T/dynamic_events \
+        && { cat $I/trace_pipe > $O/h2c.txt & H2C_PID=$!; } \
+        && echo 1 > $I/events/akuma/enable && log "h2c/c2h probes on" || log "h2c/c2h probes FAILED"
+fi
 cat $T/trace_pipe > $O/mmiotrace.txt &
 PIPE_PID=$!
 echo mmiotrace > $T/current_tracer || exit 1
@@ -186,12 +216,15 @@ sleep 5
 
 # 6. One scan: channel switching, the RX path. Only the count is kept, since
 # the results are the neighbours' (and our own) network names.
-# Pop ships no `iw` (checked 2026-10-06); without it nothing can ask for a
+# Pop shipped no `iw` (2026-10-06; installed for W2 the same day); without it nothing can ask for a
 # scan, since NetworkManager is kept off the card, so the phase is skipped.
 if command -v iw >/dev/null; then
     mark scan
-    n=$(timeout 20 iw dev $NEWIF scan 2>&1 | grep -c '^BSS')
-    log "scan: $n BSS"
+    out=$(timeout 20 iw dev $NEWIF scan 2>&1)
+    n=$(printf '%s\n' "$out" | grep -c '^BSS')
+    # An error is iw's one unindented non-BSS line; no network names in it.
+    err=$(printf '%s\n' "$out" | grep -v '^BSS' | grep -v '^[[:space:]]' | head -n1 | cut -c1-80)
+    log "scan: $n BSS${err:+ ($err)}"
     sleep 1
 else
     log "scan: skipped, no iw"

@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dmesg,exec,ext2,firecracker,fpcache,gic,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,procfs,psci,rump,terminal,timer,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dmesg,exec,ext2,firecracker,fpcache,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,procfs,psci,rtw89,rump,terminal,timer,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
@@ -31,7 +31,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **58 of the 78 carry `#![forbid(unsafe_code)]`** (2026-10-06) — which crates, and why the
+  **59 of the 79 carry `#![forbid(unsafe_code)]`** (2026-10-06) — which crates, and why the
   other 20 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in

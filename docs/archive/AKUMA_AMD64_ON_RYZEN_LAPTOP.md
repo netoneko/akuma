@@ -280,6 +280,50 @@ shut down (CPU stopped, DMA stopped, MAC powered off, bus mastering off) before
 the rest of `rtw89_mac_init` (`sys_init`, `trx_init` with the full quota mode),
 then RX.
 
+### 5.3 W2 results, 2026-10-06: receiving, from a recording
+
+**Done on the first metal boot** (menu entry 9, token `rtw89rx`): in 12 s on
+channel 1 the card delivered 1604 802.11 frames (zero CRC errors), 1503 PPDU
+status reports and 56 firmware events, and 17 distinct networks' beacons,
+the home network's among them (matched by SSID hash; the log carries no
+network names and only the OUI of each BSSID).
+
+How, in three steps:
+
+1. **A second trace, with the firmware commands.** `w0-trace.sh` now also
+   dumps every H2C the driver sends and every C2H it receives (two fprobe
+   events on `rtw89_h2c_tx` / `rtw89_fw_c2h_irqsafe`, 2 KiB / 512 B each, into
+   a trace instance of their own — the mmiotrace tracer's pipe silently drops
+   foreign events). `w2-merge.py` puts them in order: the instance's clock
+   runs ~0.75 s off mmiotrace's, so each H2C is anchored to its own CH12
+   doorbell instead (585 H2Cs, 585 doorbells). The run also showed that
+   **after `ip link up` the card enters idle power save**: the "up" phase
+   ends powered off, and the scan phase begins with the whole start again.
+2. **The start is a property of the chip, not of the run.** After `fw ready`
+   Linux makes ~17 000 register accesses and 45 H2Cs in 89 ms: the rest of
+   `mac_init`, the BB/RF tables (which come from the firmware file's
+   elements, not from `rtw8852c_table.c`), BB post-init, coexistence, DM
+   init, the start-time RF calibrations (RCK, DACK, RX DCK) and channel 1.
+   The two starts in one trace (up, and the scan's) differ in **564** of
+   them, all DACK readouts and ~40 writes computed from them. So
+   `w2-seqgen.py` compiles the recording into an op stream (writes, checked
+   reads, polls on the bits that changed, delays from the timestamps, H2Cs
+   with the MAC zeroed) and `akuma_rtw89::script` replays it: 16 815 ops,
+   170 KiB, `crates/akuma-rtw89/seq/up.seq`.
+3. **Receive.** Every RXQ entry gets its own 12 KiB buffer (W1 shared eight),
+   `akuma_rtw89::rx` parses the RX descriptor, the RX filter is opened as
+   mac80211 opens it for a scan, and `akuma-ieee80211` takes the beacons apart.
+
+On the metal the replay took 52.6 ms. Of 4976 checked reads, 91 differed:
+the coexistence scoreboard (`0xac`: Linux's run had Bluetooth up, Akuma has
+no Bluetooth driver) and the DACK readouts, as the two-start comparison
+predicted. No poll timed out.
+
+Open: the home network's beacons arrived 17 times in 12 s against ~117 sent
+(other networks: up to 43). Linux runs more calibration (RX DCK, IQK, TSSI,
+DPK — `rtw8852c_rfk_channel`) when it associates, which the "up" recording
+does not contain. That is W3's first recording.
+
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
 | # | stage | sessions |
