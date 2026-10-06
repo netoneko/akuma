@@ -29,7 +29,7 @@ pub const IDLE_THREAD_IDX: usize = 0;
 
 /// Maximum number of cores for real (shared-kernel) SMP. Used to size the per-core
 /// idle-thread table in the shared scheduler.
-pub const MAX_CORES: usize = 8;
+pub const MAX_CORES: usize = 16;
 
 /// Magic value for Context integrity check
 pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;

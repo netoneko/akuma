@@ -256,7 +256,7 @@ impl<T> core::ops::DerefMut for PreemptBoundedGuard<'_, T> {
 // touches this; the uncontended fast path is unchanged.
 
 /// Max cores tracked by the profiler (matches the kernel's `MAX_CORES`).
-const PROFILE_MAX_CORES: usize = 8;
+const PROFILE_MAX_CORES: usize = 16;
 /// Tag buckets: 0..=499 are syscall numbers (capped), 500 fault, 501 IRQ/scheduler,
 /// 502 idle loop, 503 network poll, 511 unknown. Sized to 512.
 const PROFILE_BUCKETS: usize = 512;
@@ -523,7 +523,7 @@ pub fn reset_wait_by_holder() {
 /// EL1→EL0 crossing, per core).
 /// Cores tracked by [`KernelLock::barged`]. Matches `PROFILE_MAX_CORES`; a core id at or
 /// beyond this falls back to the aggregate-balance compensation in `acquire_no_ticket`.
-const BARGE_MAX_CORES: usize = 8;
+const BARGE_MAX_CORES: usize = 16;
 
 pub struct KernelLock {
     /// `0` = free; otherwise `owner_core_aff0 + 1`. Written by the ticket winner on

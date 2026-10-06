@@ -91,7 +91,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 11 | **wifi W5** (`rtw89wifi` + `wifistay` + `sshd`): joins as entry 10 does, then **stays up 10 minutes** for ssh over wifi; `wifistay-N.txt` gets `/dev/wifi0`'s keys and the DHCP address every 30 s, `boot-N.dmesg` is saved as it goes. Reach it with `python3 overlays/ryzen/wifi-ssh.py --key <key>` (finds the station MAC `02:41:4b:55:4d:41`, ssh on port **2222**) — verified 2026-10-06, boot 20 | yes, after 10 min |
 | 12 | **Akuma on wifi, for use**: quiet boot (splash, no `fbverbose`), the framebuffer console (`console.conf`), `sshd`, `wifi auto` (`wifiauto.conf`) keeping the best known network joined, and `klog` (`klog.conf`: `dmesg` to `/var/log/ryzen/klog-N.dmesg` every 5 s, so a hang leaves its log); **no autoreboot** — it stays up until rebooted. Not rehearsable (`cycle.py` wants a guest that resets itself): ship the kernel, `install.sh`, `arm.sh 12` | no |
 | 13 | **Akuma on wifi, SMP DIAGNOSTIC**: tests kernel + `fbverbose` + `smp=N`. Bisected 2026-10-07: **2/4/8 stable, 16 wedges** (BKL held forever; SMT width is the trigger — details in `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md` §5.9). Edit the `smp=N` in the menuentry (then `install.sh` — it embeds this file) for other widths. **`smp=8` is the usable rio configuration today** | no |
-| 14 | reboot | — |
+| 14 | **Akuma on wifi, 16 cores, for use — the default** (2026-10-07): entry 12's command line with `smp=16` instead of `nosmp`, for rio's software rasteriser. Needs the 16-core table limits (`akuma-bkl`, `akuma-mmu`, `akuma-exec-core`; `docs/archive/AKUMA_AMD64_SMP_WIDTH.md`): before them 9+ cores froze at boot. Held 260 s under a 16-way stress on the metal; not yet soaked for hours. **Fallback: entry 12 (`nosmp`)** | no |
+| 15 | reboot | — |
 
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
 `initargs=daemon,--service,…`, which loads exactly the named herd services.

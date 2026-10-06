@@ -1144,7 +1144,12 @@ pub fn as_trace(args: core::fmt::Arguments) {
 // "not held now" is stable for the dying table, not merely a snapshot.
 
 /// Per-core slots sized for the largest supported SMP configuration.
-pub const TTBR_TRACK_CORES: usize = 8;
+///
+/// 16, not 8, since 2026-10-07: amd64 runs up to `smp::MAX_CPUS` (16) cores and
+/// `ACTIVE_L0[core % TTBR_TRACK_CORES]` made core 8+ overwrite core 0+'s
+/// published root, so the page-table free gate could see a core as off a root it
+/// was running on (`docs/archive/AKUMA_AMD64_SMP_WIDTH.md`).
+pub const TTBR_TRACK_CORES: usize = 16;
 
 const L0_BASE_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
