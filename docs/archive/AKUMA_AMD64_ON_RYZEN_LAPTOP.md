@@ -720,8 +720,59 @@ no `ECDT`. Linux's reading at the time of the dump (the numbers to match):
 `BAT0` Li-poly, charging, 87 %, voltage 12.973 V (design minimum 11.31 V),
 `power_now` 20.964 W, energy 47.2 / 54.42 Wh full / 57 Wh design, 34 cycles;
 `ACAD` and two UCSI source power-supplies exist. The battery data lives behind
-ACPI methods (`_BIX`, `_BST`) reading the embedded controller, so the next
-step is finding the EC fields in `DSDT.dsl`.
+ACPI methods (`_BIX`, `_BST`) reading the embedded controller. **Field map
+verified 2026-10-07** (`overlays/ryzen/ec-sample.sh`, from Pop): the EC's
+memory mirror is readable through `/dev/mem` at physical `0xFEEC2300 + off`, and
+reading it reproduces Linux's `BAT0` exactly — voltage 13028 mV, remaining
+5294 ×10 mWh, full 5442, design 5700, RSOC 97 %, and **current × voltage / 1000 =
+6983 mW = `POWER_NOW`** in all three samples. Offsets (status byte `0x80`:
+ACIN bit 0, BTIN bit 1, BTST bits 2-5; design cap `0x84`, design V `0x86`, full
+`0x88`, current `0x8c` s16, remaining `0x8e`, voltage `0x90`, RSOC `0x92`) are in
+`/root/acpi/linux/EC-FIELDS.md` on p3. The ASL-derived offsets goose first wrote
+down are one byte too high on the multi-byte fields. Open: the discharging /
+full / absent status codes (sample on battery), and mapping that page from
+Akuma.
+
+### 5.9 2026-10-07: rio on the panel — arrow keys fixed, font, and the slowness
+
+First real rio session on this machine, from the panel keyboard. Three things
+came out of it.
+
+**Arrow keys (and Home/End/Delete/PgUp/PgDn) did nothing; fixed.** This box's
+internal keyboard is real PS/2 behind the EC (§ "Hardware"), so keys reach the
+kernel through `amd64/src/kbd.rs` — not the native-USB path the trashcan uses.
+That driver decoded letters, modifiers and Alt fine, but **dropped every
+0xE0-extended key on purpose** ("Arrows, Home/End, Delete and the like are
+dropped"). Fix (2026-10-07, uncommitted in `amd64/src/kbd.rs`): extended keys
+now emit the same terminal escape sequences the USB keymap does (`akuma_usb::
+keymap` — arrows `ESC [ A..D`, Home/End `ESC [ H`/`F`, `ESC [ 2~/3~/5~/6~` for
+Insert/Delete/PgUp/PgDn; Alt+extended-key keeps the "meta sends escape" rule),
+through a small lock-free SPSC byte queue that `getb`/`has_byte` drain before
+touching the controller, so a sequence is never interleaved with the next key.
+Verified with a host harness that runs the actual `decode()` + queue code
+(I/O stubbed): every sequence checked, plus `a`, keypad Enter → CR and
+Ctrl-D → 0x04 unchanged. A kernel change: reaches the metal through the usual
+`send.sh` → `build.sh` → `install.sh` → `arm.sh 12` loop.
+
+**Font.** The panel config started at `size = 32` (the console-cell match,
+~40 px lines — huge for real work). 11 (the dev machine's kitty default) is
+too small on a scale-1 1920×1200 panel; **22 is the settled value**
+(`misc/akuma/config.toml` in the rio fork and the box's
+`/root/.config/rio/config.toml`).
+
+**Slowness: measured shape, work ongoing.** rio renders in software on this
+kernel's single CPU and presents through the WC VRAM aperture. Every present
+is a full 1920×1200 pass: the CRT filter (`crt.rs`, per-pixel map + 3-tap
+blur, `akuma-crt-2-flat` in the config) then a 9.2 MB copy at the measured
+~3 GB/s (≈3 ms). rio repaints continuously (cursor blink 600 ms), so this
+runs even when idle, and each frame blocks the input loop. Levers, in order
+of payoff: turn the CRT filter off (one config line); `nosmp` off — the
+machine has 16 threads and a software rasteriser scales nearly linearly
+(least safe, see the `-j4` notes); damage-rect present instead of
+whole-frame; AVX-512 non-temporal stores for the blit. §5.8 above has the
+hardware numbers behind all of these. The SMP lever ships as menu entry 13
+(`overlays/ryzen/grub.cfg`): entry 12 without `nosmp`, armed with
+`arm.sh 13`.
 
 ## 6. USB ethernet (optional for wifi, nice for everything else)
 
