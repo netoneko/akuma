@@ -117,7 +117,7 @@ fn spin(iterations: u32) {
     }
 }
 
-/// Who asked for the reset — `reboot-trace` feature, off by default.
+/// Who asked for the reset — `reboot-trace` feature, on by default.
 ///
 /// A reset is silent: `Ok(Some(Action::Restart))` goes straight to `0xCF9`, the
 /// in-memory `dmesg` ring dies with the machine, and the only evidence left is

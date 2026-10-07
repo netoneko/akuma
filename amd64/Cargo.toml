@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers"]
+default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers", "reboot-trace"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -39,9 +39,11 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-
 fs-cache = ["akuma-ext2/fs-cache"]
 
 # Record who called `reboot(2)` — pid/tgid/name/argv and the ancestor chain — to
-# the console and `/var/log/reboot-trace.log`, before the reset. OFF by default:
-# it is a diagnostic for "the box reset and nobody knows why" (the next kernel
-# only sees "software wrote 0xE to 0xCF9"). See `amd64/src/reboot.rs`.
+# the console and `/var/log/reboot-trace.log`, before the reset. ON by default
+# (one stack buffer and one file append on a path that is about to reset the
+# machine); remove it from `default` to drop it. A diagnostic for "the box reset
+# and nobody knows why" (the next kernel only sees "software wrote 0xE to
+# 0xCF9"). See `amd64/src/reboot.rs`.
 reboot-trace = []
 
 # PMM forensics for the SMP corruption hunt. OFF by default and meant to be
