@@ -149,6 +149,9 @@ errno_table! {
     /// graceful FIN, which is `read() == 0` — see
     /// `akuma_net::socket::socket_recv`.
     ECONNRESET = 104;
+    /// A `sendmsg` control buffer larger than Linux's `optmem_max` (20480):
+    /// the kernel will not allocate that much ancillary data for one message.
+    ENOBUFS = 105;
     EISCONN = 106;
     ENOTCONN = 107;
     ETIMEDOUT = 110;
@@ -246,6 +249,7 @@ mod tests {
             ("ENETDOWN", ENETDOWN, 100),
             ("ECONNABORTED", ECONNABORTED, 103),
             ("ECONNRESET", ECONNRESET, 104),
+            ("ENOBUFS", ENOBUFS, 105),
             ("EISCONN", EISCONN, 106),
             ("ENOTCONN", ENOTCONN, 107),
             ("ECONNREFUSED", ECONNREFUSED, 111),

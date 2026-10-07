@@ -76,9 +76,54 @@ a rump-only (no-smoltcp) build: `sys_sendmsg`'s `#[cfg(not(smoltcp))]` twin
 still handles AF_UNIX (`EBADF` for anything else), and `epoll`/`ppoll`
 readiness for a `UnixSocket` fd is keyed off the two pipes' own
 readable/writable state (`src/syscall/poll.rs` — see [`poll.md`](poll.md)).
-Approximation to be aware of: this is `SOCK_SEQPACKET` **backed by a byte
-stream**, so message boundaries are not preserved — fine for libstd's single
-fixed-size handshake read, not a conformant SEQPACKET implementation.
+> **Corrected 2026-10-08.** This paragraph used to say `SOCK_SEQPACKET` was
+> "backed by a byte stream" and lost message boundaries. It has not been
+> since the AF_UNIX table landed (`crates/akuma-net-unix`). Each socket has a
+> `UnixTable` entry, and each pipe carries a `Channel` of `Record`s that
+> `SOCK_SEQPACKET` and `SOCK_DGRAM` read whole. Unix `sendmsg`/`recvmsg` also
+> gather and scatter every iovec now (`unix_sendmsg`/`unix_recvmsg` in
+> `crates/akuma-syscalls-glue/src/net.rs`). The `iovs[0]`-only limit below
+> applies to the AF_INET path alone.
+
+## SCM_RIGHTS (2026-10-08)
+
+Unix sockets can pass file descriptors in `sendmsg`'s ancillary data. This
+was added for Chromium, whose IPC passed 628 descriptors while loading one
+Wikipedia page (`userspace/kami/README.md`).
+
+- **Wire format.** `akuma_net_unix::scm` holds the LP64 `cmsghdr` layout,
+  `CMSG_LEN`/`CMSG_SPACE`, parsing (skipping other control types, `EINVAL`
+  for a malformed header or more than 253 fds) and encoding. It is pure and
+  host-tested.
+- **Where descriptors wait.** A descriptor in transit sits in glue's
+  `IN_FLIGHT` table (`unixsock.rs`) under a token. It holds one real
+  reference taken with `clone_fd_refs`, so the sender may close its copy at
+  once. Each `Record` carries the tokens for its own message, never the
+  socket's. Exactly one thing ends each token:
+  - `scm_install` puts it in the receiver's fd table (lowest free numbers,
+    `MSG_CMSG_CLOEXEC` honoured);
+  - `scm_release` closes it, when the receiver's control buffer is too small
+    (Linux's `scm_detach_fds` rule: as many as fit after one header, the rest
+    closed, `MSG_CTRUNC` set), on a plain `read`/`recv` of a message that
+    carried descriptors, or when the channel is torn down unread
+    (`unix_channel_detach`).
+- **Stream reads stop at descriptors.** A `SOCK_STREAM` read stops after the
+  first message that carries descriptors (`UnixTable::stream_read_limit`), as
+  Linux's `unix_stream_read_generic` does. Without the stop, one `recvmsg`
+  could return two messages' descriptors together.
+- **Refused descriptors.** `EpollFd`, `PidFd`, `ChildStdout` and `DevDsp` are
+  refused with `EINVAL`. `release_fd_entry` destroys these but
+  `clone_fd_refs` does not reference them, so an in-flight copy would be a
+  bare alias of the sender's.
+- **Not collected.** A socket sent over itself and never read keeps itself
+  alive; Linux's unix garbage collector exists to break that cycle.
+- **amd64 routing.** amd64 `sendmsg`/`recvmsg` on a unix fd now go to glue
+  (`amd64/src/usermode.rs`). Until 2026-10-08 they went to `crate::sock`,
+  which knows only `AF_INET` and answered `ENOTSOCK`, so plain unix `sendmsg`
+  did not work on that target at all.
+
+Gate: `userspace/forktest/c_stress/chromeprobe.c`. Its seven `SCM_RIGHTS`
+checks pass identically on Linux and on the amd64 kernel under Firecracker.
 
 ## sockaddr / argument validation
 

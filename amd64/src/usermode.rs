@@ -2244,6 +2244,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // correctly reported a UDP reply readable and `recvmsg` came back
         // `ENOSYS`, so `apk`'s own name resolution spun forever. See
         // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
+        //
+        // **AF_UNIX first**, same rule as `Socket`/`Sendto` above: a unix fd
+        // is not a `FileDescriptor::Socket`, so `crate::sock` answered it
+        // `ENOTSOCK` — plain unix `sendmsg` did not work on this target, and
+        // glue's is where `SCM_RIGHTS` lives (Chromium's IPC passes 600+ fds
+        // loading one page).
+        Syscall::Sendmsg if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::Recvmsg if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Sendmsg => crate::sock::sys_sendmsg(a1, a2, a3),
         Syscall::Recvmsg => crate::sock::sys_recvmsg(a1, a2, a3),
         // **The clock family is glue's** (C3, 2026-09-12 —

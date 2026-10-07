@@ -1162,7 +1162,37 @@ pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
 fn unix_sendmsg(fd: u32, msg: &MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
     let dest = super::unixsock::read_dest(msg.msg_name, msg.msg_namelen as usize)?;
     let buf = gather_iovecs(iovs)?;
-    Ok(super::unixsock::unix_sendto(fd, &buf, dest.as_ref(), flags & MSG_DONTWAIT != 0))
+    let anc = read_scm_rights(msg)?;
+    Ok(super::unixsock::unix_sendto_anc(fd, &buf, dest.as_ref(), flags & MSG_DONTWAIT != 0, anc))
+}
+
+/// Linux's `optmem_max` default: the largest control buffer `sendmsg` reads.
+#[cfg(feature = "smoltcp")]
+const MAX_CONTROL: u64 = 20480;
+
+/// The `SCM_RIGHTS` descriptors in a `sendmsg` control buffer, referenced and
+/// ready to ride on the message. No control buffer is no descriptors.
+#[cfg(feature = "smoltcp")]
+fn read_scm_rights(msg: &MsgHdr) -> Result<super::unixsock::InFlight, u64> {
+    if msg.msg_control == 0 || msg.msg_controllen == 0 {
+        return Ok(super::unixsock::InFlight::none());
+    }
+    if msg.msg_controllen > MAX_CONTROL {
+        return Err(ENOBUFS);
+    }
+    let len = msg.msg_controllen as usize;
+    if !validate_user_ptr(msg.msg_control, len) {
+        return Err(EFAULT);
+    }
+    let mut control = alloc::vec![0u8; len];
+    if copy_from_user(&mut control, msg.msg_control).is_err() {
+        return Err(EFAULT);
+    }
+    let fds = akuma_net_unix::scm::parse_rights(&control).map_err(neg_errno)?;
+    if fds.is_empty() {
+        return Ok(super::unixsock::InFlight::none());
+    }
+    super::unixsock::scm_take(&fds)
 }
 
 /// `recvmsg` on an AF_UNIX fd: one framed receive, then scatter across the
@@ -1177,22 +1207,42 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
             None => return Err(ENOMEM),
         }
     };
-    let (ret, truncated) = super::unixsock::unix_recv(
+    let (ret, truncated, mut anc) = super::unixsock::unix_recv_anc(
         fd,
         &mut kbuf,
         flags & MSG_DONTWAIT != 0,
         flags & MSG_PEEK != 0,
     );
     if (ret as i64) < 0 {
+        super::unixsock::scm_release(anc);
         return Ok(ret);
     }
     let n = (ret as usize).min(kbuf.len());
-    let written = scatter_iovecs(iovs, &kbuf[..n])?;
-    // Ancillary data is not implemented (Phase 4), so report none rather than
-    // leaving the caller's `msg_controllen` untouched — a stale non-zero value
-    // would make it parse whatever was in its own buffer as a cmsg header.
-    msg.msg_controllen = 0;
-    msg.msg_flags = if truncated { MSG_TRUNC } else { 0 };
+    let written = match scatter_iovecs(iovs, &kbuf[..n]) {
+        Ok(w) => w,
+        Err(e) => {
+            super::unixsock::scm_release(anc);
+            return Err(e);
+        }
+    };
+
+    // `SCM_RIGHTS`: as many descriptors as the control buffer holds are
+    // installed; the rest are closed and `MSG_CTRUNC` says so (Linux's
+    // `scm_detach_fds`). `msg_controllen` always comes back as what was
+    // written — zero when nothing was — never as the caller's stale value,
+    // which it would otherwise parse as a cmsg header.
+    use akuma_net_unix::scm;
+    let cap = if msg.msg_control == 0 { 0 } else { msg.msg_controllen as usize };
+    let fit = scm::rights_fit(cap, anc.len());
+    let ctrunc = fit < anc.len();
+    super::unixsock::scm_release(anc.split_off(fit));
+    let fds = super::unixsock::scm_install(anc, flags & scm::MSG_CMSG_CLOEXEC != 0);
+    let (control, used) = scm::encode_rights(&fds, cap);
+    if used > 0 && copy_to_user(msg.msg_control, &control).is_err() {
+        return Err(EFAULT);
+    }
+    msg.msg_controllen = used as u64;
+    msg.msg_flags = if truncated { MSG_TRUNC } else { 0 } | if ctrunc { scm::MSG_CTRUNC } else { 0 };
     if write_user_val(msg_ptr, msg).is_err() {
         return Err(EFAULT);
     }

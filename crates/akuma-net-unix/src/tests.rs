@@ -1316,3 +1316,29 @@ mod lifecycle {
         assert!(r.anc_fds.is_empty());
     }
 }
+
+// ---- SCM_RIGHTS on a stream: where a read must stop -----------------------
+
+#[test]
+fn stream_read_stops_after_the_first_descriptor_record() {
+    let mut t = UnixTable::new();
+    t.attach_channel(9);
+    t.commit_write(9, 10, false, Vec::new()); // plain bytes
+    t.commit_write(9, 4, false, alloc::vec![100]); // message A with an fd
+    t.commit_write(9, 6, false, alloc::vec![200]); // message B with an fd
+    // A read may take the plain bytes and all of A, but not B.
+    assert_eq!(t.stream_read_limit(9), Some(14));
+    assert_eq!(t.commit_read(9, 14, false), alloc::vec![100]);
+    assert_eq!(t.stream_read_limit(9), Some(6));
+    assert_eq!(t.commit_read(9, 6, false), alloc::vec![200]);
+    assert_eq!(t.stream_read_limit(9), None);
+}
+
+#[test]
+fn stream_read_limit_none_without_descriptors() {
+    let mut t = UnixTable::new();
+    t.attach_channel(9);
+    t.commit_write(9, 10, false, Vec::new());
+    assert_eq!(t.stream_read_limit(9), None);
+    assert_eq!(t.stream_read_limit(77), None);
+}

@@ -78,6 +78,7 @@ use akuma_net_unix::{
 };
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// The one AF_UNIX table.
 ///
@@ -259,14 +260,131 @@ pub fn unix_sock_clone_ref(sock: u32) {
 /// The returned descriptors are the leak this exists to prevent: they are real
 /// references held by unread records, and dropping the channel without
 /// releasing them is a silent fd leak that nothing in userspace can observe.
-/// Ancillary data is not implemented yet, so the list is always empty today —
-/// the call site exists so that adding `SCM_RIGHTS` cannot forget it.
+/// Released after the table lock is dropped: a released descriptor can be a
+/// pipe or socket whose own teardown comes back through here.
 pub fn unix_channel_detach(pipe_id: u32) {
     let in_flight = with_table(|t| t.detach_channel(pipe_id));
-    debug_assert!(
-        in_flight.is_empty(),
-        "SCM_RIGHTS landed without wiring its teardown"
-    );
+    scm_release(in_flight);
+}
+
+// ============================================================================
+// SCM_RIGHTS: descriptors in flight
+// ============================================================================
+
+/// Descriptors sent with `SCM_RIGHTS` and not yet received, by token.
+///
+/// A [`unix::Record`] carries tokens, not descriptors, so the pure table stays
+/// ignorant of `FileDescriptor`. Each entry here holds one real reference
+/// (taken with `clone_fd_refs` at send time), which is what lets the sender
+/// close its fd right after `sendmsg` returns — the normal pattern — without
+/// the object dying before the receiver has it. Exactly one of three things
+/// ends an entry: [`scm_install`] moves it into a receiver's table, or
+/// [`scm_release`] drops it (receive buffer too small, plain `recv` on a
+/// message that carried fds, or the channel torn down unread).
+///
+/// Not collected: a socket sent over itself and never read keeps itself
+/// alive, which Linux's unix GC exists to break. No caller here does that.
+static IN_FLIGHT: Spinlock<BTreeMap<u32, FileDescriptor>> = Spinlock::new(BTreeMap::new());
+static NEXT_TOKEN: AtomicU32 = AtomicU32::new(1);
+
+fn with_in_flight<R>(f: impl FnOnce(&mut BTreeMap<u32, FileDescriptor>) -> R) -> R {
+    akuma_primitives::irq::with_irqs_disabled(|| f(&mut IN_FLIGHT.lock()))
+}
+
+/// Tokens on their way into a record; released on drop.
+///
+/// So every path in a send that does not reach `commit_write` — `EAGAIN`,
+/// `EPIPE`, a raw-pipe fallback that cannot carry descriptors — gives the
+/// references back without having to remember to.
+pub struct InFlight(Vec<u32>);
+
+impl InFlight {
+    #[must_use]
+    pub fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    fn take(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        scm_release(self.take());
+    }
+}
+
+/// Whether a descriptor can be sent. Refused: the variants that
+/// `release_fd_entry` destroys but `clone_fd_refs` does not reference
+/// (`EpollFd`, `PidFd`, `ChildStdout`, `DevDsp`). Sending one would make the
+/// in-flight copy a bare alias, and releasing it would close the sender's own.
+fn passable(entry: &FileDescriptor) -> bool {
+    !matches!(
+        entry,
+        FileDescriptor::EpollFd(_)
+            | FileDescriptor::PidFd(_)
+            | FileDescriptor::ChildStdout(_)
+            | FileDescriptor::DevDsp
+    )
+}
+
+/// Take a reference to each of the caller's `fds` for an `SCM_RIGHTS` send.
+/// `EBADF` for a closed fd, `EINVAL` for one that cannot be passed; either
+/// way the references already taken are released.
+pub fn scm_take(fds: &[i32]) -> Result<InFlight, u64> {
+    let proc = akuma_exec::process::current_process_shared().ok_or(ENOSYS)?;
+    let mut out = InFlight(Vec::with_capacity(fds.len()));
+    for &fd in fds {
+        let entry = u32::try_from(fd).ok().and_then(|fd| proc.get_fd(fd)).ok_or(EBADF)?;
+        if !passable(&entry) {
+            return Err(EINVAL);
+        }
+        akuma_exec::process::clone_fd_refs(&entry);
+        let token = with_in_flight(|m| {
+            let mut t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+            while t == 0 || m.contains_key(&t) {
+                t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+            }
+            m.insert(t, entry);
+            t
+        });
+        out.0.push(token);
+    }
+    Ok(out)
+}
+
+/// Install received tokens as new fds in the caller's table, lowest numbers
+/// first, as Linux does. Returns the fd numbers in message order.
+pub fn scm_install(tokens: Vec<u32>, cloexec: bool) -> Vec<i32> {
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        scm_release(tokens);
+        return Vec::new();
+    };
+    let mut fds = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        // The reference taken at send time moves into the table as-is.
+        if let Some(entry) = with_in_flight(|m| m.remove(&t)) {
+            let fd = proc.alloc_fd(entry);
+            if cloexec {
+                proc.set_cloexec(fd);
+            }
+            fds.push(fd as i32);
+        }
+    }
+    fds
+}
+
+/// Drop in-flight descriptors that will never be received.
+pub fn scm_release(tokens: Vec<u32>) {
+    for t in tokens {
+        // Removed under the lock, released outside it: the release can close
+        // a pipe whose channel teardown comes back here.
+        if let Some(entry) = with_in_flight(|m| m.remove(&t)) {
+            // No table holds it, so there is no fd number and no flock holder.
+            akuma_exec::process::release_fd_entry(u32::MAX, entry, 0);
+        }
+    }
 }
 
 // ============================================================================
@@ -762,6 +880,13 @@ pub fn listener_ready(fd: u32, tid: Option<usize>) -> Option<bool> {
 /// leave a boundary behind for bytes a failed `pipe_write` never accepted, and
 /// every subsequent record on that channel would be wrong by the shortfall.
 pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
+    unix_send_anc(fd, data, dontwait, InFlight::none())
+}
+
+/// [`unix_send`] carrying `SCM_RIGHTS` descriptors. They ride on the record
+/// for the bytes this call writes; on any path that writes nothing, `anc`'s
+/// drop releases them.
+pub fn unix_send_anc(fd: u32, data: &[u8], dontwait: bool, mut anc: InFlight) -> u64 {
     let Some((_, tx, sock)) = fd_parts(fd) else {
         return ENOTSOCK;
     };
@@ -782,7 +907,7 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
     // `UnixTable::attach_dgram_queue`) — writing through it here would deliver
     // the caller's message back to itself. Route to the recorded peer instead.
     if ty == SockType::Dgram {
-        return unix_sendto(fd, data, None, dontwait);
+        return unix_sendto_anc(fd, data, None, dontwait, anc);
     }
     if wr_shut {
         // Linux also raises SIGPIPE here; `pipe_write` does that for the
@@ -819,7 +944,8 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
                         written
                     );
                 }
-                with_table(|t| t.commit_write(tx, written, plan.push_record, Vec::new()));
+                let fds = anc.take();
+                with_table(|t| t.commit_write(tx, written, plan.push_record, fds));
                 return written as u64;
             }
             Err(e) if e == libc_errno::EAGAIN => {
@@ -848,6 +974,17 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
 /// different name every time, and a receiver that restarts is picked up by the
 /// next send rather than leaving the sender wired to a dead endpoint.
 pub fn unix_sendto(fd: u32, data: &[u8], dest: Option<&UnixName>, dontwait: bool) -> u64 {
+    unix_sendto_anc(fd, data, dest, dontwait, InFlight::none())
+}
+
+/// [`unix_sendto`] carrying `SCM_RIGHTS` descriptors — `sendmsg`'s path.
+pub fn unix_sendto_anc(
+    fd: u32,
+    data: &[u8],
+    dest: Option<&UnixName>,
+    dontwait: bool,
+    anc: InFlight,
+) -> u64 {
     let Some((_, _, sock)) = fd_parts(fd) else {
         return ENOTSOCK;
     };
@@ -858,7 +995,7 @@ pub fn unix_sendto(fd: u32, data: &[u8], dest: Option<&UnixName>, dontwait: bool
     // rump stack never comes up", several layers away from anything that looks
     // like socket code.
     if sock == 0 {
-        return unix_send(fd, data, dontwait);
+        return unix_send_anc(fd, data, dontwait, anc);
     }
     let Some(ty) = with_table(|t| t.get(sock).map(|s| s.ty)) else {
         return EBADF;
@@ -866,7 +1003,7 @@ pub fn unix_sendto(fd: u32, data: &[u8], dest: Option<&UnixName>, dontwait: bool
     if ty != SockType::Dgram {
         // A connection-oriented socket ignores any destination and sends to its
         // peer, which is what Linux does for a connected socket.
-        return unix_send(fd, data, dontwait);
+        return unix_send_anc(fd, data, dontwait, anc);
     }
     // Resolve the queue on every call. A destination that goes away between two
     // sends must fail the second one, not the first.
@@ -881,7 +1018,7 @@ pub fn unix_sendto(fd: u32, data: &[u8], dest: Option<&UnixName>, dontwait: bool
         },
     };
     let nonblock = dontwait || super::net::fd_is_nonblock(fd);
-    deliver_datagram(queue, data, nonblock)
+    deliver_datagram(queue, data, nonblock, anc)
 }
 
 /// Put one whole datagram on `queue`, all-or-nothing.
@@ -889,7 +1026,7 @@ pub fn unix_sendto(fd: u32, data: &[u8], dest: Option<&UnixName>, dontwait: bool
 /// A datagram is never split: [`plan_write`] refuses a partial one because
 /// there is no way to record "two thirds of a message", and the next boundary
 /// would then be wrong by the shortfall for the rest of the channel's life.
-fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool) -> u64 {
+fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool, mut anc: InFlight) -> u64 {
     loop {
         let room = super::pipe::PIPE_CAPACITY
             .saturating_sub(super::pipe::pipe_bytes_available(queue));
@@ -915,7 +1052,8 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool) -> u64 {
                         written
                     );
                 }
-                with_table(|t| t.commit_write(queue, written, true, Vec::new()));
+                let fds = anc.take();
+                with_table(|t| t.commit_write(queue, written, true, fds));
                 return plan.bytes as u64;
             }
             Err(e) if e == libc_errno::EAGAIN => {
@@ -972,19 +1110,30 @@ fn pipe_write_bytes(tx: u32, data: &[u8], nonblock: bool) -> u64 {
 /// `recvmsg` reply. A negated errno is returned in the first element with the
 /// high bit set, so callers check `(n as i64) < 0` as usual.
 pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, bool) {
+    let (n, truncated, anc) = unix_recv_anc(fd, buf, dontwait, peek);
+    // A plain receive has nowhere to put descriptors; Linux closes them.
+    scm_release(anc);
+    (n, truncated)
+}
+
+/// [`unix_recv`] that also returns the `SCM_RIGHTS` tokens of the message(s)
+/// it consumed, for `recvmsg` to install. The caller owns them: install or
+/// release, never drop.
+pub fn unix_recv_anc(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, bool, Vec<u32>) {
     let Some((rx, _, sock)) = fd_parts(fd) else {
-        return (ENOTSOCK, false);
+        return (ENOTSOCK, false, Vec::new());
     };
     if rx == 0 {
-        return (ENOTCONN, false);
+        return (ENOTCONN, false, Vec::new());
     }
     let Some(sock) = (sock != 0).then_some(sock) else {
-        return (pipe_read_bytes(rx, buf, dontwait || super::net::fd_is_nonblock(fd)), false);
+        let n = pipe_read_bytes(rx, buf, dontwait || super::net::fd_is_nonblock(fd));
+        return (n, false, Vec::new());
     };
 
     let (ty, rd_shut) = match with_table(|t| t.get(sock).map(|s| (s.ty, s.shutdown.rd))) {
         Some(v) => v,
-        None => return (EBADF, false),
+        None => return (EBADF, false, Vec::new()),
     };
     // `SHUT_RD` does **not** discard what has already arrived.
     //
@@ -1008,7 +1157,11 @@ pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, b
         // state is how a desync turns into corrupt data rather than a stall.
         let has_work = if ty.is_framed() { front.is_some() } else { avail > 0 };
         if has_work {
-            let plan = plan_read(ty, front, avail, buf.len(), peek);
+            // A stream read stops after the first descriptor-carrying message,
+            // so one `recvmsg` never hands back two messages' fds together.
+            let stop = if ty.is_framed() { None } else { with_table(|t| t.stream_read_limit(rx)) };
+            let buflen = stop.map_or(buf.len(), |s| s.min(buf.len()));
+            let plan = plan_read(ty, front, avail, buflen, peek);
             // Straight into the caller's buffer. An intermediate `Vec` here
             // would be a SECOND heap allocation per receive on top of the
             // bounce `net.rs` already made, on the hottest path this module
@@ -1043,8 +1196,8 @@ pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, b
             }
             // A zero-length datagram moves no bytes but must still be consumed,
             // or the receiver re-reads the same empty record forever.
-            with_table(|t| t.commit_read(rx, consumed, plan.consume_record));
-            return (taken as u64, plan.truncated);
+            let anc = with_table(|t| t.commit_read(rx, consumed, plan.consume_record));
+            return (taken as u64, plan.truncated, anc);
         }
         // Nothing queued. EOF when the peer's write end is truly gone, or when
         // this end has been shut down for reading — "drained" and "at EOF" are
@@ -1052,10 +1205,10 @@ pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, b
         // tokio client park forever on the AF_INET side
         // (docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md).
         if rd_shut || super::pipe::pipe_hup(rx) {
-            return (0, false);
+            return (0, false, Vec::new());
         }
         if nonblock {
-            return (EAGAIN, false);
+            return (EAGAIN, false, Vec::new());
         }
         let tid = akuma_exec::threading::current_thread_id();
         if !super::pipe::pipe_check_set_reader(rx, tid) {

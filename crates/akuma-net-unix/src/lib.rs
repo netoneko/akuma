@@ -78,6 +78,8 @@ use alloc::vec::Vec;
 
 use akuma_primitives::errno as libc_errno;
 
+pub mod scm;
+
 #[cfg(test)]
 mod tests;
 
@@ -1150,6 +1152,28 @@ impl UnixTable {
             ch.records.push_back(Record { len: pending, anc_fds: Vec::new() });
         }
         ch.records.push_back(Record { len: bytes, anc_fds });
+    }
+
+    /// The most a `SOCK_STREAM` read may take before it has to stop: through
+    /// the end of the first record that carries descriptors. `None` when no
+    /// queued record carries any, i.e. the read is bounded only by the bytes.
+    ///
+    /// Linux's `unix_stream_read_generic` stops after the skb that brought
+    /// `SCM_RIGHTS`, so one `recvmsg` never returns two messages' descriptors
+    /// together, and receivers rely on it: Chromium's Mojo channel matches
+    /// handles to messages by arrival. Without the stop a read spanning two
+    /// descriptor-carrying writes would deliver both sets at once.
+    #[must_use]
+    pub fn stream_read_limit(&self, pipe_id: u32) -> Option<usize> {
+        let ch = self.channels.get(&pipe_id)?;
+        let mut limit = ch.pending_bytes;
+        for r in &ch.records {
+            limit += r.len;
+            if !r.anc_fds.is_empty() {
+                return Some(limit);
+            }
+        }
+        None
     }
 
     /// The front record's length, for [`plan_read`].
