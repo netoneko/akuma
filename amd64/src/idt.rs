@@ -128,6 +128,15 @@ impl Entry {
         self.type_attr = 0x8E;
         self.reserved = 0;
     }
+
+    /// As [`Self::set`], with the gate's DPL at 3 (`0xEE`), so a ring-3 `int n`
+    /// naming this vector reaches the handler instead of raising `#GP`. Only
+    /// for vectors a program is *meant* to raise itself — `#BP`, from `int3`.
+    /// DPL governs software `int n` only; a CPU-raised exception ignores it.
+    fn set_user(&mut self, handler: usize) {
+        self.set(handler);
+        self.type_attr = 0xEE;
+    }
 }
 
 /// The `lidt` operand: limit then base, packed.
@@ -411,7 +420,6 @@ macro_rules! exception_stubs_with_code {
 
 exception_stubs! {
     vec_nmi =  2, "#NMI non-maskable interrupt";
-    vec_bp  =  3, "#BP breakpoint";
     vec_of  =  4, "#OF overflow";
     vec_br  =  5, "#BR bound range";
     vec_nm  =  7, "#NM device not available";
@@ -1706,8 +1714,21 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut
 // (`arch/x86/kernel/traps.c`). No handler means the default action, which
 // kills the process, not the kernel. From ring 0 it is still `fatal`.
 //
-// `#BP` and `#OF` are not here. Their gates are DPL 0, so an `int3`/`into`
-// from ring 3 arrives as `#GP`, which is already a `SIGSEGV`.
+// `#BP` is here since 2026-10-08. Its gate was DPL 0, so an `int3` from ring 3
+// arrived as `#GP` (`err=0x1a`: vector 3, IDT) and became a `SIGSEGV`. Every
+// Chromium `CHECK` failure is an `int3` (`__builtin_trap`/`IMMEDIATE_CRASH`),
+// so each looked like a segfault, and a debugger's breakpoint could not work.
+// The gate is DPL 3 now and the program gets `SIGTRAP` with `SI_KERNEL`, as
+// Linux's `do_int3_user` gives it. `#OF` stays out: `into` is `#UD` in 64-bit
+// mode, so nothing in ring 3 can raise vector 4.
+
+/// Vector 3: a ring-3 `int3` becomes `SIGTRAP` through [`ring3_exception`].
+#[unsafe(no_mangle)]
+extern "C" fn breakpoint_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+    // SAFETY: the stub's frame pointer, live until `iretq`.
+    let f = unsafe { &mut *frame };
+    ring3_exception("#BP breakpoint", f, regs, None, SIGTRAP, crate::signal::segv::SI_KERNEL);
+}
 
 /// `SIGBUS`, what Linux raises for a ring-3 `#NP`, `#SS` or `#AC`.
 const SIGBUS: u32 = 7;
@@ -1870,12 +1891,15 @@ macro_rules! trap_entry_no_code {
 }
 
 trap_entry_no_code!("divide_error_entry", "divide_error_dispatch");
+trap_entry_no_code!("breakpoint_entry", "breakpoint_dispatch");
 trap_entry_no_code!("x87_fp_entry", "x87_fp_dispatch");
 trap_entry_no_code!("simd_fp_entry", "simd_fp_dispatch");
 
 unsafe extern "C" {
     /// Vector 0, installed by [`init`].
     fn divide_error_entry();
+    /// Vector 3, installed by [`init`] with a DPL-3 gate.
+    fn breakpoint_entry();
     /// Vector 11, installed by [`init`].
     fn segment_not_present_entry();
     /// Vector 12, installed by [`init`].
@@ -2037,6 +2061,7 @@ pub fn init() {
         install_exception_stubs_with_code(idt);
         (*idt)[0].set(divide_error_entry as usize);
         (*idt)[1].set(debug_entry as usize);
+        (*idt)[3].set_user(breakpoint_entry as usize);
         (*idt)[6].set(invalid_opcode_entry as usize);
         (*idt)[8].set(double_fault as usize);
         // The hand-assembled entries; see the module header.

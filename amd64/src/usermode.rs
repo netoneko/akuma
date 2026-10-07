@@ -2999,7 +2999,26 @@ impl Image {
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
-        let (mut space, img) = loader::load(image)?;
+        Self::with_stack(loader::load(image)?, argv, envp)
+    }
+
+    /// As [`Self::from_elf_argv_envp`], loading the image off the file at
+    /// `path` (symlink-resolved) a window at a time rather than from a copy in
+    /// the heap — what `execve` and `sys_spawn` use (`loader::load_path`).
+    fn from_elf_path_argv_envp(
+        path: &str,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+    ) -> Result<(Self, loader::LoadedImage), &'static str> {
+        Self::with_stack(loader::load_path(path)?, argv, envp)
+    }
+
+    /// Give a loaded image its initial stack.
+    fn with_stack(
+        (mut space, img): (UserAddressSpace, loader::LoadedImage),
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+    ) -> Result<(Self, loader::LoadedImage), &'static str> {
         // `space` drops here on a stack failure, which frees the frames the
         // loader placed along with the page tables it built. That is exactly
         // the `free_all_frames` + `space.free()` pair this arm used to run by
@@ -4643,6 +4662,13 @@ fn exec_load_errno(e: &str) -> u64 {
         // The one string `elf_err` produces for `ElfError::OutOfMemory`.
         return errno::ENOMEM;
     }
+    if e == "File read failed" || e == "Short read" {
+        // `akuma-elf`'s path source: the file stopped reading part-way through
+        // the load (a device error, or a file truncated under it). Before the
+        // loader streamed, the same failure surfaced from the whole-file read
+        // as `EIO`, and it still should.
+        return errno::EIO;
+    }
     if e.contains("interpreter") {
         // "Cannot read interpreter" — the `PT_INTERP` file is missing or
         // unreadable, which is what `./hello` naming `/lib/ld64.so.1` hit.
@@ -4745,15 +4771,16 @@ fn do_execve(
     // `/bin/busybox` (block-cache-hot) ran — which sent the investigation
     // hunting for a broken rootfs.
     //
-    // `read_image`, not `read_file`, since 2026-09-12: it resolves symlinks
-    // (the raw read handed the *link text* to the loader — every apk-installed
-    // wrapper is a link) and lifts the 16 MiB cap through chunked `read_at`,
-    // which is what a 42 MB `cc1` needs
-    // (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
-    let image = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image(&path)) {
-        Ok(image) => image,
+    // Only the head is read here, since 2026-10-08: the loader reads the image
+    // off the file a window at a time (`loader::load_path`), so the binary's
+    // size is no longer a kernel-heap demand (`fs::read_image_head`). The head
+    // read resolves symlinks — the raw read once handed the *link text* to the
+    // loader, and every apk-installed wrapper is a link.
+    let head = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image_head(&path)) {
+        Ok(head) => head,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
     };
+    let image = head.head();
 
     // `#!interpreter [arg]` — added 2026-09-20; this target had never had any
     // shebang handling and handed the raw script bytes straight to the ELF
@@ -4765,8 +4792,8 @@ fn do_execve(
     // AArch64 kernel's `akuma-syscalls-glue::proc::exec_shebang`, both
     // host-tested in `akuma-exec`'s `shebang_tests`, so the two cannot drift.
     if image.len() >= 2 && image[0] == b'#' && image[1] == b'!' {
-        let head = &image[..image.len().min(akuma_exec::process::SHEBANG_MAX)];
-        let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(head) else {
+        let line = &image[..image.len().min(akuma_exec::process::SHEBANG_MAX)];
+        let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(line) else {
             return errno::ENOENT;
         };
         // Owned, before `image` (which `interpreter`/`shebang_arg` borrow) is
@@ -4774,7 +4801,7 @@ fn do_execve(
         // abandon every frame here, so nothing large may still be borrowed.
         let interp_argv0 = alloc::string::String::from(interpreter);
         let interp_arg = shebang_arg.map(alloc::string::String::from);
-        drop(image);
+        drop(head);
 
         // Symlink-resolved, like the AArch64 side: a `#!/bin/sh` reached
         // through a symlink must still load the real interpreter, and
@@ -4805,7 +4832,7 @@ fn do_execve(
     let envp_refs: alloc::vec::Vec<&[u8]> =
         envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
 
-    let (next, ld) = match Image::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
+    let (next, ld) = match Image::from_elf_path_argv_envp(&head.resolved, &argv_refs, &envp_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [execve] load failed: ");
@@ -5350,8 +5377,8 @@ pub fn sys_spawn(
     // shell means the shell's directory.
     let path = process_relative_path(path);
     let path = path.as_str();
-    let image = match crate::fs::read_image(path) {
-        Ok(image) => image,
+    let head = match crate::fs::read_image_head(path) {
+        Ok(head) => head,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
     };
 
@@ -5398,7 +5425,7 @@ pub fn sys_spawn(
         return errno::ENOMEM;
     };
 
-    let (child, img) = match Image::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
+    let (child, img) = match Image::from_elf_path_argv_envp(&head.resolved, &argv_refs, &envp_refs) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [spawn] load failed: ");

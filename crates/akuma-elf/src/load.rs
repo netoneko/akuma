@@ -11,6 +11,7 @@
 //! small binaries are slurped and mapped eagerly, large ones stay on disk and
 //! are demand-paged.
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -74,6 +75,26 @@ pub fn load_elf<A: UserPages>(
     interp_prefix: Option<&str>,
 ) -> Result<LoadedElf<A>, ElfError> {
     load_image(ElfSource::Bytes(elf_data), &MapStrategy::Eager, interp_prefix)
+}
+
+/// Load an ELF binary from a file path, eagerly: every page is allocated and
+/// filled now, exactly as [`load_elf`] does, but the bytes come off the file a
+/// window at a time instead of from a whole-file copy in the kernel heap.
+///
+/// This is the streaming loader the amd64 `execve` uses. Holding the whole
+/// image made the executable's size a kernel-heap demand: Chromium (250 MB)
+/// re-execs itself for its zygote and utility processes, and two copies do not
+/// fit a 512 MiB heap. Here the heap holds the headers and one
+/// [`SEGMENT_READ_WINDOW`] at a time, whatever the file's size.
+///
+/// `path` should already be symlink-resolved; it is read by `VfsHooks::read_at`
+/// once per window, so a file replaced mid-load is read inconsistently, as
+/// with any reader that does not hold the file open.
+pub fn load_elf_eager_from_path<A: UserPages>(
+    path: &str,
+    interp_prefix: Option<&str>,
+) -> Result<LoadedElf<A>, ElfError> {
+    load_image(ElfSource::Path(path), &MapStrategy::Eager, interp_prefix)
 }
 
 /// Load an ELF binary on demand from a file path, registering each PT_LOAD as a
@@ -330,13 +351,25 @@ fn log_segment(what: &str, vaddr: usize, filesz: usize, memsz: usize, flags: u32
 }
 
 
+/// How many file bytes [`map_segment_eager`] reads at once.
+///
+/// One page on the extreme profile, whose interpreter load goes by path to keep
+/// peak heap under 10 KB (see `interp.rs`). 64 KiB everywhere else: a 250 MB
+/// Chromium loaded by path is ~3 800 reads at this size and ~61 000 at one
+/// page, each of which resolves the path again.
+#[cfg(kernel_profile_extreme)]
+const SEGMENT_READ_WINDOW: usize = PAGE_SIZE;
+#[cfg(not(kernel_profile_extreme))]
+const SEGMENT_READ_WINDOW: usize = 64 * 1024;
+
 /// Map one PT_LOAD segment eagerly: allocate each page and copy its file-backed
 /// bytes in.
 ///
 /// Shared by the main-binary loader and the interpreter loader, which is why it
 /// takes `base` rather than assuming zero. Reads go through `ElfSource`, so the
 /// same code serves an in-heap image (borrowed sub-slices, no copy) and a file
-/// on disk (one 4 KB-or-less scratch buffer per page, freed immediately).
+/// on disk (one scratch buffer of at most [`SEGMENT_READ_WINDOW`] bytes live at
+/// a time).
 pub(super) fn map_segment_eager<A: UserPages>(
     src: ElfSource<'_>,
     address_space: &mut A,
@@ -355,6 +388,14 @@ pub(super) fn map_segment_eager<A: UserPages>(
     // the worst place for it.
     let (start_page, num_pages) = span::segment_span(vaddr, memsz);
 
+    // The file bytes arrive through a window of up to `SEGMENT_READ_WINDOW`
+    // bytes, refilled when a page's copy falls outside it, so a path source
+    // costs one `read_at` per window rather than one per page. Consecutive
+    // pages' windows are contiguous in the file (`segment_page_copy`), so each
+    // byte is read once.
+    let mut window: Cow<'_, [u8]> = Cow::Borrowed(&[]);
+    let mut window_start = 0usize;
+
     for i in 0..num_pages {
         let page_va = start_page + i * PAGE_SIZE;
 
@@ -371,10 +412,17 @@ pub(super) fn map_segment_eager<A: UserPages>(
             continue;
         };
 
-        let chunk = src.read_at(offset + src_offset, copy_len)?;
+        if src_offset < window_start || src_offset + copy_len > window_start + window.len() {
+            // `copy_len <= PAGE_SIZE <= SEGMENT_READ_WINDOW` and
+            // `copy_len <= filesz - src_offset`, so the refill always covers it.
+            let want = (filesz - src_offset).min(SEGMENT_READ_WINDOW);
+            window = src.read_at(offset + src_offset, want)?;
+            window_start = src_offset;
+        }
+        let at = src_offset - window_start;
         // `alloc_and_map` above guarantees the page is mapped in this address
         // space, so the write cannot miss.
-        let ok = address_space.write_page_bytes(page_va, dst_offset, &chunk);
+        let ok = address_space.write_page_bytes(page_va, dst_offset, &window[at..at + copy_len]);
         debug_assert!(ok, "segment page {page_va:#x} vanished between map and copy");
     }
 
@@ -590,5 +638,99 @@ mod boundary_tests {
         let pt = [only];
         let f = boundary_extended_filesz(only.0, only.1 - only.0, &pt);
         assert_eq!(f, only.1 - only.0);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    //! `map_segment_eager` reads file bytes through a window of
+    //! `SEGMENT_READ_WINDOW` bytes. These check that every page still receives
+    //! exactly its own bytes — an off-by-one in the refill rule would shift a
+    //! page by a window's worth and still "load". The byte source takes the
+    //! same window path a file source does; only `read_at` differs.
+
+    use super::{SEGMENT_READ_WINDOW, map_segment_eager};
+    use crate::pages::{SegProt, UserPages};
+    use crate::source::ElfSource;
+    use akuma_mmap::PAGE_SIZE;
+    use alloc::collections::BTreeMap;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use elf::abi::{PF_R, PF_W, PT_LOAD};
+    use elf::segment::ProgramHeader;
+
+    struct Pages(BTreeMap<usize, Vec<u8>>);
+
+    impl UserPages for Pages {
+        fn new_space() -> Option<Self> {
+            Some(Self(BTreeMap::new()))
+        }
+        fn alloc_and_map(&mut self, va: usize, _prot: SegProt) -> Result<usize, &'static str> {
+            assert_eq!(va % PAGE_SIZE, 0);
+            assert!(self.0.insert(va, vec![0; PAGE_SIZE]).is_none(), "page mapped twice");
+            Ok(va)
+        }
+        fn write_page_bytes(&mut self, page_va: usize, offset: usize, bytes: &[u8]) -> bool {
+            assert!(offset + bytes.len() <= PAGE_SIZE, "write crosses the page");
+            let Some(p) = self.0.get_mut(&page_va) else { return false };
+            p[offset..offset + bytes.len()].copy_from_slice(bytes);
+            true
+        }
+    }
+
+    fn phdr(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64) -> ProgramHeader {
+        ProgramHeader {
+            p_type: PT_LOAD,
+            p_offset,
+            p_vaddr,
+            p_paddr: 0,
+            p_filesz,
+            p_memsz,
+            p_flags: PF_R | PF_W,
+            p_align: PAGE_SIZE as u64,
+        }
+    }
+
+    /// Load one segment from a patterned file, then compare every byte of its
+    /// pages against what the segment says should be there.
+    fn check(file_off: usize, vaddr: usize, filesz: usize, memsz: usize) {
+        let file: Vec<u8> = (0..file_off + filesz + 64).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut pages = Pages::new_space().unwrap();
+        let mut mapped = BTreeMap::new();
+        let ph = phdr(file_off as u64, vaddr as u64, filesz as u64, memsz as u64);
+        map_segment_eager(ElfSource::Bytes(&file), &mut pages, 0, &ph, &mut mapped).unwrap();
+
+        let first = vaddr & !(PAGE_SIZE - 1);
+        let last = (vaddr + memsz).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        assert_eq!(pages.0.len(), (last - first) / PAGE_SIZE);
+        for (&pva, bytes) in &pages.0 {
+            for (i, &b) in bytes.iter().enumerate() {
+                let va = pva + i;
+                let want = if va >= vaddr && va < vaddr + filesz { file[file_off + va - vaddr] } else { 0 };
+                assert_eq!(b, want, "va {va:#x} (segment {vaddr:#x}+{filesz:#x})");
+            }
+        }
+    }
+
+    #[test]
+    fn page_aligned_segment_across_several_windows() {
+        check(0x1000, 0x40_0000, 3 * SEGMENT_READ_WINDOW + 5 * PAGE_SIZE, 3 * SEGMENT_READ_WINDOW + 5 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn unaligned_segment_with_bss_tail() {
+        // A data segment the way linkers emit it: `p_vaddr` mid-page, file bytes
+        // ending mid-page, `.bss` past them.
+        check(0x2_1a38, 0x42_2a38, 2 * SEGMENT_READ_WINDOW + 0x1234, 2 * SEGMENT_READ_WINDOW + 0x9000);
+    }
+
+    #[test]
+    fn segment_shorter_than_a_page() {
+        check(0x80, 0x10_0f80, 0x100, 0x100);
+    }
+
+    #[test]
+    fn filesz_exactly_one_window() {
+        check(0, 0x50_0000, SEGMENT_READ_WINDOW, SEGMENT_READ_WINDOW + PAGE_SIZE);
     }
 }

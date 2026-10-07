@@ -76,7 +76,11 @@ fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, Elf
     if len == 0 {
         return Ok(Vec::new());
     }
-    let mut buf = alloc::vec![0u8; len];
+    // Fallible: `len` is a window or a header table, but this runs on the exec
+    // path, which must answer ENOMEM under pressure rather than abort.
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).map_err(|_| ElfError::OutOfMemory)?;
+    buf.resize(len, 0);
     let n = (crate::vfs().read_at)(path, offset, &mut buf)
         .map_err(|_| ElfError::InvalidFormat("File read failed"))?;
     if n < len {

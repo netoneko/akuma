@@ -105,104 +105,60 @@ pub use akuma_vfs_glue::{
     write_file,
 };
 
-/// Ticks (10 ms each) `read_image` waits for heap before giving up: ~20 s.
-const EXEC_HEAP_WAIT_TICKS: u32 = 2000;
+/// How much of an executable `execve` reads before deciding how to run it:
+/// enough for a `#!` line (`akuma_exec::process::SHEBANG_MAX`).
+pub const IMAGE_HEAD: usize = akuma_exec::process::SHEBANG_MAX;
 
-/// The exec-side image read.
-///
-/// `read_file` caps the kernel-side allocation at 16 MiB
-/// (`akuma-ext2`'s `read_inode_data`, an OOM guard for a caller that has no
-/// idea how big the file is) — and a real toolchain binary is bigger:
-/// Alpine's `cc1` is **42 MB**, so every `gcc` run died as
-/// `[execve] load failed: Read past end of image`-adjacent `ENOENT` before a
-/// single byte of it was parsed. The exec path knows exactly what it is
-/// reading and how big it is (`metadata` first), so it can afford what the
-/// generic read cannot:
-///
-/// * the path is **symlink-resolved first** — `sys_execve` read the raw path,
-///   so `cc` (a link to `gcc`) handed the loader the *link text* as the image
-///   and `open`'s resolution never ran on this path;
-/// * the bytes arrive through `read_at` in 64 KiB chunks, which never touches
-///   the cap;
-/// * the chunk buffer and the image are reserved **fallibly**
-///   (`try_reserve_exact`) — under memory pressure this returns `Err` and the
-///   exec fails with `ENOMEM`, rather than taking the kernel down in the
-///   allocator. The chunk lives on the **heap**, deliberately: the kernel
-///   stack is 32 KiB (`sched::STACK_SIZE`), so a 64 KiB `[0u8; CHUNK]` local
-///   is a stack smash, not a buffer — the first boot with a stack array died
-///   in `ClockBlockCache::get` with `cr2 = 0x8e`, several frames after the
-///   overflowing write.
-///
-/// 256 MiB is the hard refusal: past it the load is a mistake, not a
-/// binary. `cc1`'s 42 MB sits well inside, with room for `rustc`'s ~70 MB.
-pub fn read_image(path: &str) -> Result<alloc::vec::Vec<u8>, akuma_vfs_glue::FsError> {
-    use akuma_vfs_glue::FsError;
-    const MAX_IMAGE: usize = 256 * 1024 * 1024;
-    const CHUNK: usize = 64 * 1024;
+/// The start of an executable, and the path it was read from.
+pub struct ImageHead {
+    /// `path` with its symlinks resolved — what the loader must read, since a
+    /// link's own bytes are its target's name.
+    pub resolved: alloc::string::String,
+    /// The first `len` bytes of the file (fewer than [`IMAGE_HEAD`] only for a
+    /// shorter file).
+    pub bytes: [u8; IMAGE_HEAD],
+    pub len: usize,
+}
 
+impl ImageHead {
+    #[must_use]
+    pub fn head(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// The exec-side image read: resolve `path` and read its first [`IMAGE_HEAD`]
+/// bytes, which is all `execve` needs before it knows whether the file is a
+/// `#!` script or an ELF image. The ELF loader then reads the image off the
+/// file itself, a window at a time (`loader::load_path`).
+///
+/// # What this replaced (2026-10-08)
+///
+/// `read_image` copied the **whole** executable into one kernel-heap `Vec`
+/// (capped at 256 MiB) and handed it to the loader. That made every exec a
+/// heap demand the size of the binary: three concurrent `rust-lld` links
+/// (158 MB each) had to wait for each other's copies, and Chromium (250 MB),
+/// which re-execs itself, could not hold two on a 512 MiB heap
+/// (`[ALLOC FAIL] requested=249690856`, then `EIO` after a 20 s wait —
+/// `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`). With the loader
+/// streaming, there is no copy to wait for and no size cap.
+///
+/// Kept from it: the path is **symlink-resolved first** (`cc` is a link to
+/// `gcc`, and every apk-installed wrapper is a link), and a missing file is
+/// the VFS's own error rather than a flattened one.
+pub fn read_image_head(path: &str) -> Result<ImageHead, akuma_vfs_glue::FsError> {
     let resolved = resolve_symlinks(path);
     let size = metadata(&resolved)?.size as usize;
-    if size > MAX_IMAGE {
-        return Err(FsError::Internal);
-    }
-    let mut buf = alloc::vec::Vec::new();
-    // **A refused reservation is usually other execs' images, not a dead end.**
-    // The whole image is held in the heap until the loader has copied it out, so
-    // three concurrent `rust-lld` links (158 MB each) leave a 512 MiB heap — 128 MB
-    // of it block cache — unable to seat a fourth. That surfaced as `EIO` out of
-    // `execve` (`could not exec rust-lld: I/O error`), at the first links of a
-    // `-j4` build, and got *more* likely the faster the kernel made those links
-    // overlap (`docs/archive/AKUMA_AMD64_TARGETED_SHOOTDOWN.md` §4). The holders
-    // finish in milliseconds and need nothing this thread holds, so wait for them:
-    // yield, then sleep to the next tick (10 ms), up to ~20 s.
-    let mut waited = 0u32;
-    while buf.try_reserve_exact(size).is_err() {
-        if waited >= EXEC_HEAP_WAIT_TICKS {
-            // `Internal` and `IoError` both reach ring 3 as `EIO`, so the errno
-            // cannot say a refused heap reservation from a failed device read —
-            // hence the line. Console only, no allocation.
-            let s = akuma_alloc::stats();
-            serial::puts("[exec] read_image: heap refused ");
-            serial::put_dec(size as u64);
-            serial::puts(" B for ");
-            serial::puts(path);
-            serial::puts(" after waiting (heap=");
-            serial::put_dec(s.heap_size as u64);
-            serial::puts(" allocated=");
-            serial::put_dec(s.allocated as u64);
-            serial::puts(")\n");
-            return Err(FsError::Internal);
-        }
-        waited += 1;
-        crate::sched::yield_now();
-        crate::sched::allow_tick();
-    }
-    if waited > 0 {
-        serial::puts("[exec] read_image: waited ");
-        serial::put_dec(u64::from(waited));
-        serial::puts(" ticks for heap: ");
-        serial::puts(path);
-        serial::puts("\n");
-    }
-    let mut chunk: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if chunk.try_reserve_exact(CHUNK).is_err() {
-        return Err(FsError::Internal);
-    }
-    chunk.resize(CHUNK, 0);
-    let mut off = 0;
-    while off < size {
-        let want = (size - off).min(CHUNK);
-        let got = read_at(&resolved, off, &mut chunk[..want])?;
+    let mut head = ImageHead { resolved, bytes: [0; IMAGE_HEAD], len: 0 };
+    let want = size.min(IMAGE_HEAD);
+    while head.len < want {
+        let got = read_at(&head.resolved, head.len, &mut head.bytes[head.len..want])?;
         if got == 0 {
-            // The metadata said `size`; the file delivered less. A truncated
-            // image is a different failure from a short one — refuse rather
-            // than let the ELF loader find a zero tail.
-            return Err(FsError::Internal);
+            break;
         }
-        buf.extend_from_slice(&chunk[..got]);
-        off += got;
+        head.len += got;
     }
-    Ok(buf)
+    Ok(head)
 }
 
 /// The virtio-blk device, as something `akuma-ext2` can read.

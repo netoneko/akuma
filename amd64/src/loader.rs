@@ -204,7 +204,31 @@ pub struct LoadedImage {
 /// and fixing them alone does not unblock it.
 pub fn load(image: &[u8]) -> Result<(UserAddressSpace, LoadedImage), &'static str> {
     let loaded = akuma_elf::load_elf::<UserAddressSpace>(image, None).map_err(|e| elf_err(&e))?;
+    finish(loaded)
+}
 
+/// As [`load`], reading the image off the file at `path` a window at a time
+/// ([`akuma_elf::load_elf_eager_from_path`]) instead of from a whole-file copy.
+///
+/// What `execve` and `sys_spawn` use since 2026-10-08. The copy they made
+/// before (`fs::read_image`) put the executable's whole size on the kernel
+/// heap: Chromium is 250 MB and re-execs itself, and its second copy did not
+/// fit a 512 MiB heap (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`).
+/// The mapping stays eager; only where the bytes come from changed. Each read
+/// goes through the `read_at` hook, which drops the BKL around it
+/// (`exec_runtime::bkl_free_io`), so a slow disk still does not hold the lock.
+///
+/// `path` must already be symlink-resolved.
+pub fn load_path(path: &str) -> Result<(UserAddressSpace, LoadedImage), &'static str> {
+    let loaded = akuma_elf::load_elf_eager_from_path::<UserAddressSpace>(path, None)
+        .map_err(|e| elf_err(&e))?;
+    finish(loaded)
+}
+
+/// The checks and the [`LoadedImage`] both loaders share.
+fn finish(
+    loaded: akuma_elf::LoadedElf<UserAddressSpace>,
+) -> Result<(UserAddressSpace, LoadedImage), &'static str> {
     let entry = match loaded.interp {
         // Ring 3 is entered in the linker, which brings the program up itself.
         Some(ref interp) => interp.entry_point as u64,

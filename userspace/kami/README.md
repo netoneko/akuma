@@ -142,6 +142,30 @@ Route 1 is mostly `kami`-side work. Its prerequisites are the kernel's
 `TIOCGWINSZ`/`SIGWINCH` and pty support (task 1 of
 `docs/handoff-kernel-rio-support.md`).
 
+## Future: reading mode (markdown TUI and `.md` output)
+
+Not every use needs pixels. A reading mode would ask Chromium for the page's
+content instead of a screencast, convert it to Markdown, and show it in a
+simple text TUI on the tty, with no `/dev/fb0` (so it also works over ssh and
+inside any terminal pane). The same conversion runs from the CLI with no
+TUI, writing a `.md` file, for example `kami --md https://... > page.md` or
+`kami --md -o page.md https://...`.
+
+Sketch:
+
+- **Extraction**: `Runtime.evaluate` of a small script that walks the
+  readable part of the DOM (`<article>`/`<main>` first, else `<body>` minus
+  `nav`/`header`/`footer`/`aside`/`script`/`style`) and returns a compact
+  tree (headings, paragraphs, lists, links, code and `pre`, block quotes,
+  tables, image alt text). The DOM is post-JavaScript, so pages that build
+  themselves render too.
+- **Conversion**: the tree to Markdown happens in `kami` (Rust, no new
+  dependencies), so it can be host-tested on saved trees in `testdata/`.
+- **TUI**: wrapped to the terminal width (`TIOCGWINSZ`), headings and
+  emphasis via ANSI attributes, numbered links followable by typing the
+  number, the existing scroll keys. It needs no framebuffer, so it is also
+  the cheapest route into a rio pane (below).
+
 ## What Chromium asks of the kernel
 
 From `probe/cdp.py strace` on one Wikipedia load plus a screenshot, in normal

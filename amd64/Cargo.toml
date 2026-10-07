@@ -13,7 +13,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers", "reboot-trace"]
+default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers", "reboot-trace", "linux-file-io"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -37,6 +37,15 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-
 # the USB disk, the one device that stalls. 16 MiB default cap
 # (`DEFAULT_CACHE_CAP_BYTES`); the kernel never calls `set_cache_cap_bytes`.
 fs-cache = ["akuma-ext2/fs-cache"]
+
+# Linux's regular-file read contract: a `read`/`pread` of a regular file
+# returns every byte asked for unless the file ends first (up to Linux's own
+# `MAX_RW_COUNT`), instead of stopping at this target's 64 KiB `MAX_IO`. Served
+# as a loop of 64 KiB glue reads, so the kernel's buffer per call is unchanged.
+# Chromium's V8 snapshot read is what found it (`snapprobe`); see
+# `fd.rs`'s `read_file_full`. Remove it from `default` to get the old clamp
+# back for an A/B.
+linux-file-io = []
 
 # Record who called `reboot(2)` — pid/tgid/name/argv and the ancestor chain — to
 # the console and `/var/log/reboot-trace.log`, before the reset. ON by default
