@@ -700,6 +700,22 @@ pub fn metadata_open_file(path: &str, mount_id: u32, inode: u32) -> Result<Metad
         .or_else(|_| metadata(path))
 }
 
+/// [`write_at`] by inode, for a file that may no longer have a name.
+///
+/// The inode is the one an open file description or a mapping resolved.
+///
+/// The write half of [`read_at_open_file`], with its mount-aliasing caveat:
+/// `mount_id` selects the filesystem. No path-keyed cache is told about the
+/// write (there may be no path); the caller is the shared-mapping write-back,
+/// whose pages are the authority for these bytes until they land.
+pub fn write_at_open_file(mount_id: u32, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    if inode == 0 {
+        return Err(FsError::NotFound);
+    }
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    fs.write_at_by_inode(inode, offset, data)
+}
+
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if is_mtab(path) {
@@ -838,6 +854,37 @@ pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
     invalidate_file_pages(path);
     if r.is_ok() {
         notify_mapped_zeroed(path, usize::try_from(length).unwrap_or(usize::MAX), usize::MAX);
+    }
+    r
+}
+
+/// [`truncate`] for an open file description, which may have lost its name.
+///
+/// By path while the path still names the fd's inode (so every path-keyed
+/// notification runs as before), by inode once it does not — `ftruncate` on an
+/// unlinked-but-open file, which is how Chromium sizes its shared memory
+/// (create, unlink, then size).
+pub fn truncate_open_file(path: &str, mount_id: u32, inode: u32, length: u64) -> Result<(), FsError> {
+    if inode == 0 || resolve_file_id(path) == Some((mount_id, inode)) {
+        return truncate(path, length);
+    }
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    let r = fs.truncate_by_inode(inode, length);
+    if crate::cfg_shared_file_pages_enabled() {
+        akuma_fpcache::invalidate_inode(inode);
+    }
+    r
+}
+
+/// [`fallocate`] for an open file description — see [`truncate_open_file`].
+pub fn fallocate_open_file(path: &str, mount_id: u32, inode: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+    if inode == 0 || resolve_file_id(path) == Some((mount_id, inode)) {
+        return fallocate(path, mode, offset, len);
+    }
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    let r = fs.fallocate_by_inode(inode, mode, offset, len);
+    if crate::cfg_shared_file_pages_enabled() {
+        akuma_fpcache::invalidate_inode(inode);
     }
     r
 }

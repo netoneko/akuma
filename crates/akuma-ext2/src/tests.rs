@@ -3180,3 +3180,58 @@ fn sync_reaches_the_device_barrier_and_persists() {
     let fresh = Ext2Filesystem::new(&dev, || 0).unwrap();
     assert_eq!(fresh.read_file("/root/durable").unwrap(), b"must survive a cold read");
 }
+
+/// The write half of the unlink guarantee: a writable `MAP_SHARED` mapping's
+/// write-back lands on its inode after the file's name is gone (Chromium
+/// unlinks every shared-memory file right after creating it), a later read by
+/// inode sees it, and the write never conjures a name back.
+#[test]
+fn write_at_by_inode_lands_on_an_unlinked_pinned_inode() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/shm", &[0u8; 8192]).unwrap();
+    let inode = fs.resolve_inode("/shm").unwrap();
+    let pin = akuma_primitives::InodePin::new(inode);
+    fs.remove_file("/shm").unwrap();
+
+    assert_eq!(fs.write_at_by_inode(inode, 4096, b"from-child").unwrap(), 10);
+    let mut back = [0u8; 10];
+    assert_eq!(fs.read_at_by_inode(inode, 4096, &mut back).unwrap(), 10);
+    assert_eq!(&back, b"from-child");
+    assert_eq!(fs.metadata_by_inode(inode).unwrap().size, 8192, "an in-bounds write keeps the size");
+    assert!(fs.metadata("/shm").is_err(), "a write by inode must not recreate the name");
+    drop(pin);
+}
+
+#[test]
+fn write_at_by_inode_refuses_a_directory() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.create_dir("/d").unwrap();
+    let inode = fs.resolve_inode("/d").unwrap();
+    assert!(matches!(fs.write_at_by_inode(inode, 0, b"x"), Err(akuma_vfs::FsError::NotAFile)));
+}
+
+/// Chromium's shared-memory order: create, unlink, *then* size it. By path the
+/// `ftruncate` is `ENOENT` and the file stays 0 bytes, so every later
+/// write-back is past EOF and dropped.
+#[test]
+fn truncate_and_fallocate_by_inode_size_an_unlinked_file() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/shm2", &[]).unwrap();
+    let inode = fs.resolve_inode("/shm2").unwrap();
+    let pin = akuma_primitives::InodePin::new(inode);
+    fs.remove_file("/shm2").unwrap();
+
+    fs.truncate_by_inode(inode, 65536).unwrap();
+    assert_eq!(fs.metadata_by_inode(inode).unwrap().size, 65536);
+    let mut z = [1u8; 16];
+    fs.read_at_by_inode(inode, 40000, &mut z).unwrap();
+    assert_eq!(z, [0u8; 16], "an extension reads as zeros");
+
+    fs.fallocate_by_inode(inode, 0, 65536, 4096).unwrap();
+    assert_eq!(fs.metadata_by_inode(inode).unwrap().size, 69632);
+    assert!(fs.metadata("/shm2").is_err(), "neither call may recreate the name");
+    drop(pin);
+}

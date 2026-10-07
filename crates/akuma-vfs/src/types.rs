@@ -292,4 +292,30 @@ pub trait Filesystem: Send + Sync {
     fn metadata_by_inode(&self, _inode: u32) -> Result<Metadata, FsError> {
         Err(FsError::NotSupported)
     }
+
+    /// Write at `offset` into the file `inode` names, by number — the write
+    /// half of [`Filesystem::read_at_by_inode`].
+    ///
+    /// For a write whose file may have **no name** any more: an unlinked file
+    /// still mapped `MAP_SHARED` or still open elsewhere. Its contents live as
+    /// long as any reference does, on Linux, so a writable shared mapping's
+    /// write-back must still land when the path is gone — Chromium unlinks
+    /// every shared-memory file right after creating it.
+    ///
+    /// Never creates: an inode number cannot name a file that does not exist.
+    /// Defaults to `NotSupported`.
+    fn write_at_by_inode(&self, _inode: u32, _offset: usize, _data: &[u8]) -> Result<usize, FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// `ftruncate(2)` by inode, for the same nameless files as
+    /// [`Filesystem::write_at_by_inode`]. Defaults to `NotSupported`.
+    fn truncate_by_inode(&self, _inode: u32, _length: u64) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// `fallocate(2)` by inode. Defaults to `NotSupported`.
+    fn fallocate_by_inode(&self, _inode: u32, _mode: i32, _offset: u64, _len: u64) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
 }

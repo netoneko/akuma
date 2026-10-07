@@ -194,6 +194,19 @@ impl Filesystem for SubdirFs {
     fn metadata_by_inode(&self, inode: u32) -> Result<Metadata, FsError> {
         self.inner.metadata_by_inode(inode)
     }
+
+    /// Forwarded unchanged, for the same reason as `read_at_by_inode`.
+    fn write_at_by_inode(&self, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.inner.write_at_by_inode(inode, offset, data)
+    }
+
+    fn truncate_by_inode(&self, inode: u32, length: u64) -> Result<(), FsError> {
+        self.inner.truncate_by_inode(inode, length)
+    }
+
+    fn fallocate_by_inode(&self, inode: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.inner.fallocate_by_inode(inode, mode, offset, len)
+    }
 }
 
 #[cfg(test)]

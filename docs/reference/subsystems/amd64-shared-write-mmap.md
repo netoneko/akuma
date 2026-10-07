@@ -67,12 +67,22 @@ it. That is the coherence SQLite's WAL index (`-shm`) depends on.
   thread's own, empty, list and CoW-split the parent off every shared page.
 - **`MADV_DONTNEED`** drops the caller's mapping and keeps the page. **`mprotect`** never
   CoW-marks an identity-shared page. **`mremap`** carries the region's records.
-- **Write-back target.** A flush checks that the recorded path still names the mapping's
-  `(mount, inode)`, and skips if not (SQLite unlinks `-shm` before unmapping it). Before this
-  check, an unlink-and-recreate made the old mapping's flush write into the new file.
+- **Write-back target.** A flush writes through the recorded path while that path still names
+  the mapping's `(mount, inode)`. Once it does not (an `unlink`, a rename, or an
+  unlink-and-recreate), it writes **by inode** (`akuma_vfs_glue::fs::write_at_open_file` →
+  `Filesystem::write_at_by_inode`). The mapping's pin keeps the inode alive. Before 2026-10-08 such
+  a flush was skipped. The bytes were then lost as soon as the last *mapper* left, even though a
+  peer still held an fd or a not-yet-faulted mapping. On Linux they live as long as any reference
+  does. Chromium unlinks every shared-memory file right after creating it, so this was its path.
+  Writing by inode also keeps the 2026-10-03 guarantee that an unlink-and-recreate never writes
+  into the *new* file.
+- **`ftruncate`/`fallocate` on an unlinked fd** size the inode, not the path
+  (`truncate_open_file`/`fallocate_open_file`). Chromium creates, unlinks, *then* sizes. By path
+  that was `ENOENT`, the file stayed at 0 bytes, and every later write-back fell past EOF.
 
 Probes: `userspace/forktest/c_stress/shmcoh.c` (two lines, both `YES`) and `shmwrite.c` (13
-rungs, one per path above). Driver: `scripts/utils/amd64_shmwrite_check.py`. Stress:
+rungs, one per path above). `chromeprobe.c` (2026-10-08) adds the case where a file is unlinked
+before being sized, mapped untouched in one process, and written by another that then exits. Driver: `scripts/utils/amd64_shmwrite_check.py`. Stress:
 `scripts/benchmarks/sqlite_wal_stress.py {procs,mixed,spawn}`. History:
 [`../../archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md`](../../archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md).
 
@@ -88,9 +98,10 @@ rungs, one per path above). Driver: `scripts/utils/amd64_shmwrite_check.py`. Str
   any `MAP_PRIVATE` mapping of the same file are served by `akuma-fpcache` or by private fills,
   and can hold a page older than a peer's shared-writable frame. SQLite with `mmap_size > 0` maps
   its main database this way. goose's build cannot (`MAX_MMAP_SIZE=0`).
-- **A rename under a live mapping** makes its write-backs skip (the path no longer names the
-  inode). The bytes stay correct in the shared frames while anything maps them and are lost from
-  the file after the last unmap. There is no by-inode write.
+- ~~**A rename under a live mapping** makes its write-backs skip.~~ **Corrected 2026-10-08:**
+  write-back goes by inode once the path no longer names it (above). What remains: an
+  **overlay** box writes by inode to its upper layer only, so a write-back to a file that lives
+  in a lower layer and has lost its name is refused rather than written into the shared image.
 - **Stores past the file's current EOF** are dropped by the write-back. The caller extends with
   `ftruncate` or `write`, as parity-db and SQLite both do.
 - **A mapping whose fd has no inode identity** stays eager and private, with the single-mapper

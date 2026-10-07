@@ -576,6 +576,25 @@ impl Filesystem for OverlayFs {
         }
         Err(upper_err)
     }
+
+    /// The **upper layer only**. A write by inode cannot copy up — there is no
+    /// path to copy up to — so writing through to a lower layer would modify
+    /// the read-only image every box shares. An inode the upper layer does not
+    /// hold is refused, and the caller's write-back is lost rather than leaked
+    /// into the base.
+    fn write_at_by_inode(&self, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.layer(0).write_at_by_inode(inode, offset, data)
+    }
+
+    /// Upper layer only, for the reason `write_at_by_inode` gives.
+    fn truncate_by_inode(&self, inode: u32, length: u64) -> Result<(), FsError> {
+        self.layer(0).truncate_by_inode(inode, length)
+    }
+
+    /// Upper layer only, for the reason `write_at_by_inode` gives.
+    fn fallocate_by_inode(&self, inode: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.layer(0).fallocate_by_inode(inode, mode, offset, len)
+    }
 }
 
 #[cfg(test)]

@@ -2141,6 +2141,9 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
     // region's path, which used to be one `String` allocated per flushed page
     // and is now paid on every exit of a process holding such a mapping.
     let mut jobs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    // Per region: write back through the path (it still names the inode), or
+    // by inode (it does not). One path walk per region, as before.
+    let mut by_path: Vec<bool> = Vec::with_capacity(regions.len());
     for (ri, r) in regions.iter().enumerate() {
         // How big is the file *now*? The mapping may have been created when
         // the file was a fraction of this — the whole reason the record
@@ -2149,14 +2152,16 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
         // a decision parity-db-style callers make through `ftruncate`, not
         // one a flush makes for them.
         // Does the recorded path still name **this** file? Not after an
-        // `unlink` (SQLite deletes its `-shm` *before* unmapping it), and after
-        // an unlink-and-recreate it names a different one — which the flush
-        // used to write into, one process's old pages landing in another's
-        // new file. The bytes have nowhere honest to go: an unlinked file's
-        // contents die with its last mapping, as on Linux.
-        if !write_back_target_ok(&r.path, r.mount_id, r.inode) {
-            continue;
-        }
+        // `unlink` (SQLite deletes its `-shm` *before* unmapping it, Chromium
+        // every shared-memory file right after creating it), and after an
+        // unlink-and-recreate it names a different one — which the flush used
+        // to write into, one process's old pages landing in another's new
+        // file. Either way the bytes still have an honest home: **the inode**,
+        // which the mapping's pin keeps alive. On Linux an unlinked file's
+        // contents live as long as any fd or mapping does, and a peer that
+        // still holds one and faults the page later must see this write — it
+        // used to see the file's stale bytes (`chromeprobe`'s shmvar c/d).
+        by_path.push(write_back_target_ok(&r.path, r.mount_id, r.inode));
         let size = akuma_vfs_glue::fs::metadata_open_file(&r.path, r.mount_id, r.inode)
             .map(|m| m.size as usize)
             .unwrap_or(0);
@@ -2182,7 +2187,13 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
         // SAFETY: `pa` came from a present user leaf, reached through the
         // physmap — the same access `dontneed_range`'s zeroing uses.
         let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(pa as u64), len) };
-        if akuma_vfs_glue::write_at(&regions[ri].path, off, bytes).is_err() {
+        let r = &regions[ri];
+        let res = if by_path[ri] {
+            akuma_vfs_glue::write_at(&r.path, off, bytes)
+        } else {
+            akuma_vfs_glue::fs::write_at_open_file(r.mount_id, r.inode, off, bytes)
+        };
+        if res.is_err() {
             failed += 1;
         }
     }

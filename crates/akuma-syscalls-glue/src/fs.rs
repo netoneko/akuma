@@ -2617,7 +2617,8 @@ pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
-            match akuma_vfs_glue::fallocate(&f.path, mode, offset as u64, len as u64) {
+            // By inode once the name is gone — see `sys_ftruncate`.
+            match akuma_vfs_glue::fallocate_open_file(&f.path, f.mount_id(), f.inode(), mode, offset as u64, len as u64) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
             }
@@ -2642,7 +2643,9 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
                 akuma_primitives::safe_print!(192, "[FTRUNC-0] pid={} path={}\n",
                     akuma_exec::process::read_current_pid().unwrap_or(0), &f.path);
             }
-            match akuma_vfs_glue::truncate(&f.path, length as u64) {
+            // By inode once the name is gone: Chromium sizes its shared
+            // memory after unlinking it, and by path that was `ENOENT`.
+            match akuma_vfs_glue::truncate_open_file(&f.path, f.mount_id(), f.inode(), length as u64) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
             }

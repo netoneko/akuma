@@ -266,6 +266,15 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
     crate::write_at(path, offset, data)
 }
 
+/// Write by inode, for a file that may have no name. See
+/// [`crate::write_at_open_file`].
+pub fn write_at_open_file(mount_id: u32, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    crate::write_at_open_file(mount_id, inode, offset, data)
+}
+
 /// `O_APPEND` write, atomic against other appenders — see [`crate::append`].
 pub fn append(path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
     if !is_initialized() {
