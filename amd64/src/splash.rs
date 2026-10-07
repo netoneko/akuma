@@ -219,16 +219,15 @@ pub fn pulse() {
 
 /// Draw the frame `t_ms` into the splash.
 fn draw(t_ms: u64) {
-    let (title, uname, kernel, status);
+    let (title, uname, status);
     let mut a = StackWriter::<80>::new();
     let mut b = StackWriter::<96>::new();
-    let mut c = StackWriter::<96>::new();
     let mut d = StackWriter::<80>::new();
     let build = akuma_syscalls_glue::version::BUILD_ID;
-    let (sha, profile) = build.split_once('-').unwrap_or((build, ""));
     let _ = write!(a, "{}  {}{}", banner::VERSION_DESC, banner::RELEASE, banner::RELEASE_SUFFIX);
+    // One kernel-info line: the release and build id (`<sha>-<profile>`) are
+    // both in it, so a second "kernel … commit …" line only repeated them.
     let _ = write!(b, "Akuma akuma {} {} x86_64", banner::RELEASE, build);
-    let _ = write!(c, "kernel  {}   commit {}   {}", banner::RELEASE, sha, profile);
     let phase = PHASES[usize::from(PHASE.load(Ordering::Relaxed))];
     let _ = write!(d, "up {}s - {}", t_ms / 1000, phase);
     // The latest line the kernel printed (trimmed), for the hang-diagnosis job.
@@ -239,9 +238,8 @@ fn draw(t_ms: u64) {
     }
     title = a.as_str();
     uname = b.as_str();
-    kernel = c.as_str();
     status = d.as_str();
-    crate::multiboot2::fb_splash_frame(banner::ART, &[title, uname, kernel, status, e.as_str()], t_ms);
+    crate::multiboot2::fb_splash_frame(banner::ART, &[title, uname, status, e.as_str()], t_ms);
 }
 
 extern "C" fn splash_daemon() -> ! {
