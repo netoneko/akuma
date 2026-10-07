@@ -1,0 +1,20 @@
+[package]
+name = "kami"
+version = "0.1.0"
+edition = "2021"
+description = "紙 (kami, paper): headless Chromium on /dev/fb0 — PNG screencast over CDP, blitted to the framebuffer"
+publish = false
+
+# Standalone: a Linux std binary (cross-built for x86_64-unknown-linux-musl),
+# not a libakuma member of the userspace workspace.
+[workspace]
+
+[dependencies]
+# Both already in userspace/Cargo.lock; nothing new to vet.
+libc = "0.2.180"
+miniz_oxide = "0.8.9"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
