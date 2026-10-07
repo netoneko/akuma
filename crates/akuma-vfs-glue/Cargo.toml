@@ -22,7 +22,7 @@ akuma-pmm = { path = "../akuma-pmm" }
 # The kernel heap, for `/proc/meminfo`'s `Slab:` row and nothing else. That row
 # is the only reading in the system that can see the whole-file-cache bug class:
 # `free`'s numbers come from the PMM and did not move across a 135 MB excursion
-# into it (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a method correction").
+# into it (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "And a method correction").
 akuma-alloc = { path = "../akuma-alloc" }
 akuma-fpcache = { path = "../akuma-fpcache" }
 # Uptime for `/proc/uptime`; `safe_print!`/`tprint!`; `Spinlock`.

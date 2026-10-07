@@ -24,7 +24,7 @@ What it checks, and why each part is there:
 * **`Cached:` from `/proc/meminfo`, before and after** — the **kernel-heap**
   reading. `free` is blind to the entire kernel-heap bug class: across a
   135 MB excursion into `fd.rs`'s whole-file cache, `free` reported the same
-  number before and after (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a
+  number before and after (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "And a
   method correction"). `meminfo`'s `Cached:` column is
   `akuma_alloc::stats().allocated` on this target, i.e. live kernel-heap bytes,
   so it is the witness the fd-cache class needs: every ssh session's file
@@ -248,7 +248,7 @@ def main(argv=None):
             if abs(drift) > a.heap_tolerance:
                 print("  HEAP DRIFT — the kernel heap did not come back; this "
                       "is the class `free` cannot see "
-                      "(AMD64_FD_WHOLE_FILE_HEAP.md)")
+                      "(AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md)")
                 ok = False
         else:
             print("heap:  NO READING — /proc/meminfo had no `Slab:` row. A "

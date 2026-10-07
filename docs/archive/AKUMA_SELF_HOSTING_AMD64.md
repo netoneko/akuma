@@ -579,7 +579,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > grows the buffer by doubling, and `alloc_error_handler` calls `halt()`. This
 > is the "unexplained" signature-B bare-metal ssh lockout; both hand-offs used to
 > say it was not caused by the kernel and have been corrected.
-> `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`.
+> `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`.
 
 > **5b landed in four slices, and `PROCS` is gone (2026-09-08 → 09-09)** —
 > `AKUMA_AMD64_STEP5B_SLICE1_REGISTRATION.md`, `..._SLICE2_LIFECYCLE.md`,

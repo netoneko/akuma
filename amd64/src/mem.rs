@@ -64,10 +64,9 @@ pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 /// much heap in one allocation. AArch64 has no equivalent demand on its heap.
 ///
 /// (Ordinary `read`/`write` no longer do this: `fd.rs` stopped caching file
-/// contents in C2 slice 5 and now streams in `MAX_IO` chunks. Note
-/// `proposals/AMD64_FD_WHOLE_FILE_HEAP.md` still says "Status: open" and is
-/// stale on that point — `execve` is the remaining whole-file consumer, and it
-/// is the one that sets this floor.)
+/// contents in C2 slice 5 and now streams in `MAX_IO` chunks. `execve` is the
+/// remaining whole-file consumer, and it is the one that sets this floor —
+/// `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "The whole-file heap".)
 ///
 /// # Why a step and not a fraction
 ///

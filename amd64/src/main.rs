@@ -195,7 +195,7 @@ static ALLOCATOR: akuma_alloc::KernelAllocator = akuma_alloc::KernelAllocator;
 /// that OOMs here ran while this core held the lock (every fd write path does),
 /// and a halted owner leaves every peer spinning in `[BKL] stuck` forever —
 /// the bare-metal signature-B ssh lockout
-/// (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`). Releasing it degrades the machine
+/// (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`). Releasing it degrades the machine
 /// to N-1 cores instead of stopping it.
 #[cfg(target_arch = "x86_64")]
 #[alloc_error_handler]

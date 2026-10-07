@@ -126,8 +126,7 @@ gets well into browser startup, then:
   512 MiB heap the second copy does not fit (`[ALLOC FAIL]
   requested=249690856`); the exec waits about 20 s and fails `EIO`. A guest
   with ≥ 8 GiB gets the 1 GiB heap and gets past it. The fix is to stream the
-  loader: read headers, then each segment straight into its pages. See
-  `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`.
+  loader: read headers, then each segment straight into its pages. See § "The whole-file heap" below.
 - **crashpad: `posix_spawn chrome_crashpad_handler: ENOENT`.** The file is
   there. musl's `posix_spawn` uses a `CLONE_VM|CLONE_VFORK` child that
   `execve`s. It is not yet known whether this is the path or the vfork-exec.
@@ -146,6 +145,66 @@ gets well into browser startup, then:
 - **Syscalls missing from the x86_64 table** (ENOSYS, non-fatal so far): 40
   `sendfile`, 141 `setpriority`, 239 `get_mempolicy`, 297
   `rt_tgsigqueueinfo`, 444 `landlock_create_ruleset`.
+
+## The whole-file heap (folded in from `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`)
+
+That proposal was the record of an older crash. The second half of it is the
+first blocker above, so it lives here now. It was never tracked in git, and
+every reference to it points here.
+
+**Found 2026-09-08**, from a photograph of the bare-metal box's framebuffer.
+A userspace program that wrote a large file permanently took a core out of the
+machine, and on the box that ended the boot:
+
+```
+[SSH] Exec: /bin/sh ["-c", "echo AK-OK"]
+[OOM] allocation of 268435456 bytes failed
+[BKL] stuck: cpu 0 waiting on owner 3
+```
+
+Afterwards `ping` answered and port 2222 accepted, but ssh died at
+`kex_exchange_identification`. This was the bare-metal "signature B" lockout,
+which two hand-offs had dismissed as "not the kernel under test". It recurred
+"on binaries that answered fine on the previous boot" because the trigger was
+whether that boot wrote a big file. Reproduced on local QEMU by
+`i=0; while [ $i -lt 24 ]; do /bin/busybox cat /bin/apk; i=$((i+1)); done > /bigfile`,
+which gave one buffer doubling `[HEAP-R] … 67108864->134217728` while the
+whole kernel heap tracked that one `Vec`.
+
+**Mechanism.** Three facts composed:
+
+1. `amd64/src/fd.rs`'s `Entry::data` held every open file's **entire
+   contents** in the kernel heap until `close`.
+2. A write grew it with `Vec::resize`, which **doubles**, so writing N bytes
+   briefly needed about 3N of heap.
+3. `alloc_error_handler` **halted the core**, behind the single big kernel
+   lock.
+
+**Status:**
+
+- **The whole-file cache: fixed** (C2 slice 5, recorded 2026-09-18). `fd.rs`
+  caches no contents; reads and writes stream to the VFS in `MAX_IO` (64 KiB)
+  chunks.
+- **The OOM handler: half fixed.** It releases the BKL unconditionally before
+  halting (`amd64/src/main.rs`), so the machine drops to N-1 cores instead of
+  stopping. It still halts the core. Killing the faulting process, as AArch64
+  does, is still to do.
+- **`execve`'s whole-image read: open.** `read_image` holds the whole
+  executable in one heap allocation until the loader has copied it out, capped
+  at 256 MB. That demand is what sets the heap floor (`amd64/src/mem.rs`). Three
+  concurrent `rust-lld` links (158 MB each) already had to wait for each other,
+  and Chromium (250 MB, re-execing itself) cannot fit two on a 512 MiB heap
+  (above). The fix is a streaming loader.
+
+### And a method correction
+
+**`free` cannot see this bug class.** Across the whole 135 MB excursion,
+`free` reported the same 1 564 892 KiB before and after. It watches PMM pages,
+and this was the kernel heap. The ring-3 leak checks that read `free` around
+about 85 process lifetimes are blind to kernel-heap growth. A heap-aware probe
+belongs beside them. It is now the `Slab:` line of `/proc/meminfo`
+(`akuma_alloc::stats().allocated`, live kernel-heap bytes), which
+`scripts/utils/amd64_ring3_check.py` reads before and after its workload.
 
 Background: `userspace/kami/README.md` (the Ubuntu measurements and the
 `strace` summary), `docs/reference/subsystems/syscalls/net.md`,

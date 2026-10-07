@@ -12,7 +12,7 @@ bugs the table work charged and the fix-shaped lesson in each.
 
 ## Slice 1 — the OOM handler stops halting a BKL-holding core
 
-`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` is the crash: `fd.rs`'s `Entry.data`
+`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` is the crash: `fd.rs`'s `Entry.data`
 cached a whole file in the kernel heap and grew it by `resize`'s doubling, so
 one large write needed ~3N of heap at the last doubling, and the amd64
 `alloc_error_handler` answered with `halt()` — permanently removing a core
@@ -45,7 +45,7 @@ host tests clean, clippy clean in all three configurations.
 
 `free` cannot see this whole bug class: across the 135 MB excursion it
 reported the same number before and after, because it watches PMM pages and
-this is the kernel heap (`AMD64_FD_WHOLE_FILE_HEAP.md` § "And a method
+this is the kernel heap (`AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "And a method
 correction").
 
 `/proc/meminfo`'s `Cached:` column is `akuma_alloc::stats().allocated` on this
@@ -252,7 +252,7 @@ short-circuit. One-byte buffer; fixed; **512/0**.
 
 - `proposals/NEXT_AGENT_AMD64_C2_FD.md` — the plan, its baselines, and the
   slice order followed here.
-- `proposals/AMD64_FD_WHOLE_FILE_HEAP.md` — the crash, its ladder, and why
+- `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` — the crash, its ladder, and why
   `free` is blind to it.
 - `docs/archive/AKUMA_AMD64_TLB_SHOOTDOWN.md` — the shootdown, and the BKL
   invariant the fault path carries (visible in the wedge's console).

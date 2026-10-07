@@ -31,7 +31,7 @@
 //! heap for as long as it was open and a write `resize`d that `Vec` — which
 //! doubles. Writing an N-byte file needed ~3N of heap at the last doubling, and
 //! `alloc_error_handler` calls `halt()`, so one large write permanently removed
-//! a core (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`).
+//! a core (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`).
 //!
 //! A descriptor now carries an **empty** buffer and every read and write goes
 //! to the VFS at the cursor in [`MAX_IO`]-bounded chunks (`fs::read_at`,

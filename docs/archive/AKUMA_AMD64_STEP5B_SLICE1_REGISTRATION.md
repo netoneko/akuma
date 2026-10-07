@@ -304,5 +304,5 @@ before assuming it is a scheduler wake.
 - `docs/archive/AKUMA_AMD64_STEP6_ONE_LOADER.md` — the loader fold.
 - `docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md` — why `smp-shared` is
   required here, and the x86 `daif` arm this slice relies on.
-- `proposals/AMD64_FD_WHOLE_FILE_HEAP.md` — still open, and still the reason to
+- `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` — still open, and still the reason to
   read before writing a large file on this target.

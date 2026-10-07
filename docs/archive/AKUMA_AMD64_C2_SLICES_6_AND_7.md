@@ -366,7 +366,7 @@ Ring-3 witnesses, on QEMU **and** on the metal:
 - `proposals/NEXT_AGENT_AMD64_C2_FD.md` — the plan and its slice order.
 - `docs/archive/AKUMA_AMD64_C2_SLICES_1_TO_4.md` — slices 1–5, including the
   zero-length `read_at` probe bug this pass found the mirror image of.
-- `proposals/AMD64_FD_WHOLE_FILE_HEAP.md` — the crash slice 5 removed, and the
+- `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` — the crash slice 5 removed, and the
   ladder re-run here.
 - `docs/archive/AKUMA_AMD64_STEP5B_SLICE3_PROCFS.md` — the `/proc` union, and
   the four reasons slice 7 re-checked.

@@ -135,7 +135,7 @@ including the two the fold gained (`mode`, the negative `dirfd`).
 `scripts/utils/amd64_ring3_check.py` reads the **kernel heap** either side of its
 ssh churn, because `free` is blind to that whole class — the PMM number did not
 move at all across the 135 MB excursion into the whole-file `fd` cache
-(`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a method correction"). It read
+(`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "And a method correction"). It read
 that number out of `/proc/meminfo`'s `Cached:` row, which amd64's own synthetic
 `/proc` rendered as `akuma_alloc::stats().allocated`.
 

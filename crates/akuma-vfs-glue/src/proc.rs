@@ -326,7 +326,7 @@ fn render_stat_system(buf: &mut [u8]) -> usize {
 /// here because it is the only number in the system that can witness a
 /// kernel-heap leak from ring 3: `free` reads the PMM, and the PMM did not move
 /// at all across the 135 MB excursion into amd64's whole-file `fd` cache
-/// (`proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a method correction").
+/// (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "And a method correction").
 /// amd64 used to render that number in `Cached:` from its own synthetic
 /// `/proc`; 4b batch 2c deleted that view in favour of this one, and with it —
 /// silently — the witness, because `Cached:` here is the *file page* cache and

@@ -390,7 +390,7 @@ that binds, silently, on the only workload that notices.
    512 MiB otherwise, as a *request* that falls back if no reachable region below
    `PHYSMAP_LIMIT` (4 GiB) can hold it. This is the lever for §2's cache-residency
    gap.
-4. **`proposals/AMD64_FD_WHOLE_FILE_HEAP.md`** is the reason the heap is under
+4. **`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`** is the reason the heap is under
    pressure at all: `fd.rs` keeps every open file's entire contents in a heap
    `Vec`, *on top of* the same `akuma-ext2` block cache AArch64 uses alone. So the
    file is held twice — once as bounded, evicting blocks, once as an unbounded
@@ -734,5 +734,5 @@ swarm could not.
 - [`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md)
   § "Swap the running kernel in place" — the AArch64 mechanism this is measured
   against.
-- [`../../proposals/AMD64_FD_WHOLE_FILE_HEAP.md`](../../proposals/AMD64_FD_WHOLE_FILE_HEAP.md)
+- [`AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`](AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md) § "The whole-file heap"
   — the whole-file heap cache.

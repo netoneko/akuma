@@ -338,5 +338,5 @@ every AArch64 build, and the AArch64 kernel builds clippy-clean.
   permutation, i.e. vocabulary number two.
 - `docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md` § "batch 3" — the
   `getrandom` entropy seam this batch copies for `/dev/urandom`.
-- `proposals/AMD64_FD_WHOLE_FILE_HEAP.md` § "And a method correction" — why the
+- `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` § "And a method correction" — why the
   ring-3 check reads the kernel heap at all.
