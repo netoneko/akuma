@@ -10,6 +10,8 @@
 //!        [--frames N] [--seconds S] [--chrome-arg ARG]... [URL]
 //!   kami --kill          stop the daemon and its Chromium
 //!
+//! With no URL a fresh tab opens [`HOME`]; an existing tab stays where it is.
+//!
 //! Keys: arrows / PgUp / PgDn / Home / End scroll, Enter / Backspace / Tab /
 //! Esc pass through, other text is typed, Ctrl-R reloads, Ctrl-C or Ctrl-Q
 //! detaches.
@@ -23,6 +25,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use cdp::{escape, event_session, first_page, method, num_field, str_field, Cdp};
+
+/// What a fresh tab opens when no URL is given. A reattach with no URL keeps
+/// whatever the tab is showing.
+const HOME: &str = "https://www.tumblr.com/";
 
 struct Args {
     url: Option<String>,
@@ -308,7 +314,7 @@ fn session(args: &Args) -> io::Result<()> {
     let (target, fresh) = match first_page(&targets) {
         Some(t) => (t, false),
         None => {
-            let url = escape(args.url.as_deref().unwrap_or("about:blank"));
+            let url = escape(args.url.as_deref().unwrap_or(HOME));
             let r = c.call("Target.createTarget", &format!("{{\"url\":\"{url}\"}}"), false)?;
             (str_field(&r, "targetId").ok_or(io::Error::other("no targetId"))?.to_string(), true)
         }

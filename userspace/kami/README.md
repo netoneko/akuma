@@ -18,6 +18,10 @@ kami                                         # later sessions reattach to the sa
 kami --kill                                  # stop Chromium
 ```
 
+With no URL, a fresh tab opens the home page, `https://www.tumblr.com/` (the
+`HOME` constant in `src/main.rs`). Reattaching with no URL keeps whatever the
+tab is showing.
+
 Keys: arrows, PgUp/PgDn and Home/End scroll; Enter, Backspace, Tab and Esc are
 passed through; other text is typed; Ctrl-R reloads; Ctrl-C or Ctrl-Q detaches.
 
@@ -51,6 +55,62 @@ the 2x blit to the 4K mapping takes about 40 ms.
 `probe/` holds the Python harness that produced these numbers: `cdp.py`, a
 pipe-CDP client that runs inside the container from `probe/Dockerfile`, and
 `analyze.py`, which summarises an `strace -f` log.
+
+## Kernel status on Akuma (2026-10-08)
+
+`userspace/forktest/c_stress/chromeprobe.c` checks each of the three things
+below: `SCM_RIGHTS`, cross-process shared files, and the huge `PROT_NONE`
+reservations. Run it on Linux first; that run is the control.
+
+On Linux it passes **16/16**, and since 2026-10-08 it passes **16/16** on the
+amd64 kernel under Firecracker too. Four fixes got it there:
+
+- **`SCM_RIGHTS`** on `AF_UNIX` (`SOCK_STREAM`, `SOCK_SEQPACKET`,
+  `SOCK_DGRAM`). See
+  [`docs/reference/subsystems/syscalls/net.md`](../../docs/reference/subsystems/syscalls/net.md)
+  § "SCM_RIGHTS".
+- **amd64 `sendmsg`/`recvmsg` on a unix fd.** These go to glue now; before,
+  they answered `ENOTSOCK`.
+- **Write-back by inode.** A shared-writable mapping of an unlinked file now
+  keeps a page written by a process that has since exited. See
+  [`docs/reference/subsystems/amd64-shared-write-mmap.md`](../../docs/reference/subsystems/amd64-shared-write-mmap.md).
+- **`ftruncate`/`fallocate` by inode.** Chromium creates its shared-memory
+  file, unlinks it, and only then sizes it. Going by path, that sizing was
+  `ENOENT`.
+
+The 1324 GiB reservation works, but costs about 290 ms against Linux's 0.5 ms,
+nearly all of it in `munmap`.
+
+Not yet run on Akuma: Chromium itself. That is step 3, a `--headless
+--screenshot` smoke test in the Firecracker guest.
+
+## Future: kami in a rio split pane
+
+The goal is to run `kami` inside one of [rio](../rio/build.sh)'s split
+panes, with a browser beside a shell on the same screen, instead of
+`kami` taking over all of `/dev/fb0`. Today it cannot: rio owns `/dev/fb0`
+(the device is single-open), and `kami` assumes it has the whole screen.
+
+Two routes, cheapest first:
+
+1. **An image protocol in the pane's pty.** Rio can draw images that a
+   program prints into its terminal (sixel and the iTerm2 inline-image
+   protocol; check which ones the Akuma build of rio supports). `kami` would
+   get an output mode that skips the framebuffer and writes each screencast
+   frame to stdout in one of those protocols, sized from `TIOCGWINSZ`
+   (rows and columns, times the cell size in pixels). It would re-request the
+   viewport when `SIGWINCH` says the pane was resized. Input already arrives
+   on the tty. Nothing in rio changes. The cost is encoding and parsing every
+   frame through the pty, so it suits reading more than video.
+2. **A shared surface.** Rio composites a pixel buffer that `kami` shares with
+   it, for example a `MAP_SHARED` file passed with `SCM_RIGHTS` (both now work
+   on Akuma), plus a "frame ready" message. That means no encoding and full
+   frame rate, but it needs a small protocol on rio's side, and the
+   `sugarloaf` renderer would have to treat a pane as an image layer.
+
+Route 1 is mostly `kami`-side work. Its prerequisites are the kernel's
+`TIOCGWINSZ`/`SIGWINCH` and pty support (task 1 of
+`docs/handoff-kernel-rio-support.md`).
 
 ## What Chromium asks of the kernel
 
