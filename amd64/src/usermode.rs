@@ -1722,6 +1722,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             crate::sock::recv_spin_tripwire(a1, a3, a4, r, unix);
             r
         }
+        // AF_UNIX first, as for `Sendmsg`: `crate::sock` answered `ENOTSOCK`
+        // for a unix fd, and Chromium's crashpad `CHECK`-crashes the browser
+        // on `setsockopt(SO_PASSCRED)` failing (2026-10-08). Glue accepts the
+        // `SOL_SOCKET` options on a unix socket, as it always has on AArch64.
+        Syscall::Setsockopt if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
         // `getsockopt`/`shutdown` never had a native `crate::sock` arm at all —
         // unlike `Setsockopt`/`Sendto`, there is no "second family" to avoid
@@ -4830,7 +4835,15 @@ fn do_execve(
     // registration: `image.name` is what `/proc/<pid>/exe` reports, and
     // `argv[0]` is a name the caller chose rather than something that opens.
     // `ps` is unaffected — `akuma_procfs::ProcStat::comm` takes the basename.
-    let new_name = path;
+    // **Resolved through symlinks**, so `/proc/<pid>/exe` names the binary
+    // and not the spelling. Chromium starts every child with
+    // `execve("/proc/self/exe", …)` and then finds its own files next to
+    // `readlink("/proc/self/exe")`; recording the literal path made that
+    // `/proc/self/exe` again, the directory `/proc/self`, and the child died
+    // `FATAL: Error loading V8 startup snapshot file` (2026-10-08). Resolved
+    // here, before the swap, `/proc/self` is still the *caller*, whose binary
+    // is exactly what a re-exec of itself runs.
+    let new_name = akuma_vfs_glue::resolve_symlinks(&path);
 
     let pid = current_pid();
     let new_root = next.space.ttbr0();
