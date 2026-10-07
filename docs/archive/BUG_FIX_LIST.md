@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1266
-- **Docs contributing at least one fix:** 367
+- **Total distinct fixes counted:** 1296
+- **Docs contributing at least one fix:** 370
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 182 | 14.4% | 27 |
-| Memory & Virtual Memory | 174 | 13.7% | 56 |
-| Scheduler & Process Management | 138 | 10.9% | 42 |
-| SMP & Locking | 128 | 10.1% | 51 |
-| Networking | 80 | 6.3% | 31 |
-| Userspace Apps & Libraries | 40 | 3.2% | 21 |
-| Rump Kernel & Syscall Proxy | 26 | 2.1% | 6 |
-| Toolchain & Self-Hosting | 89 | 7.0% | 12 |
-| SSH | 39 | 3.1% | 18 |
-| VFS & Filesystem | 113 | 8.9% | 36 |
-| Boot & Drivers | 90 | 7.1% | 14 |
+| Syscall / ABI Compatibility Audits | 189 | 14.6% | 28 |
+| Memory & Virtual Memory | 174 | 13.4% | 56 |
+| Scheduler & Process Management | 138 | 10.6% | 42 |
+| SMP & Locking | 131 | 10.1% | 52 |
+| Networking | 80 | 6.2% | 31 |
+| Userspace Apps & Libraries | 40 | 3.1% | 21 |
+| Rump Kernel & Syscall Proxy | 26 | 2.0% | 6 |
+| Toolchain & Self-Hosting | 89 | 6.9% | 12 |
+| SSH | 39 | 3.0% | 18 |
+| VFS & Filesystem | 113 | 8.7% | 36 |
+| Boot & Drivers | 109 | 8.4% | 15 |
 | Signals & Exceptions | 31 | 2.4% | 12 |
-| Misc / Cross-cutting | 48 | 3.8% | 16 |
-| Console & Terminal | 56 | 4.4% | 17 |
+| Misc / Cross-cutting | 48 | 3.7% | 16 |
+| Console & Terminal | 57 | 4.4% | 17 |
 | Containers | 32 | 2.5% | 8 |
-| **Total** | **1266** | **100.0%** | **367** |
+| **Total** | **1296** | **100.0%** | **370** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -40,16 +40,16 @@ from several subsystems under one write-up.
 - 20 — `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`
 - 20 — `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`
 - 20 — `docs/archive/GOLANG_IPC.md`
+- 19 — `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`
 - 18 — `docs/archive/DASH_MISSING_SYSCALLS.md`
 - 16 — `docs/archive/AKUMA_SELF_HOSTING.md`
 - 15 — `docs/archive/SMP_SHARED.md`
 - 15 — `docs/archive/AKUMA_AMD64_USB_XHCI.md`
 - 14 — `docs/archive/BUN_MEMORY_STUDY.md`
-- 14 — `docs/archive/GIT_MISSING_SYSCALLS.md`
 
 ---
 
-## Syscall / ABI Compatibility Audits (182 fixes, 27 docs)
+## Syscall / ABI Compatibility Audits (189 fixes, 28 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -249,6 +249,15 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `socket(AF_UNIX, …)` answered `EAFNOSUPPORT` on amd64 (only `socketpair` was routed), disabling nca's IPC; `socket`/`bind`/`listen`/`accept`/`accept4`/`connect` now follow the descriptor into glue's `unixsock`
 - `F_SETLK`/`F_SETLKW` succeeded unconditionally, so two goose processes wrote one SQLite WAL at once (`database disk image is malformed`); new `akuma-reclock` implements POSIX record locks released with the last close of any descriptor for the file or at exit, and amd64's `exec_runtime` `flock_release` was a deliberate no-op that left a dead holder's lock held forever
 - `nca run` aborted its event task right after `run_turn` returned and discarded whatever was still queued, ending replies mid-sentence with exit 0; it drains before aborting
+
+### docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md
+- amd64 sent every `sendmsg`/`recvmsg` to the AF_INET socket layer, so a unix fd got `ENOTSOCK` and plain unix `sendmsg` had never worked on the target; the two arms now go "AF_UNIX first" to glue like the rest
+- `SCM_RIGHTS` did not exist (`sendmsg` ignored `msg_control`, `recvmsg` reported `msg_controllen = 0`), so Chromium's 628 passed descriptors per page load went nowhere; `akuma_net_unix::scm` parses and encodes the `cmsghdr`, glue's `IN_FLIGHT` table holds one fd reference per descriptor in transit, `recvmsg` installs them (`MSG_CTRUNC`, `MSG_CMSG_CLOEXEC`), channel teardown closes unread ones, and a `SOCK_STREAM` read stops after the first message carrying descriptors
+- a shared-writable page of an unlinked file was never flushed when its writer exited (the path no longer named the inode), so another mapper refilled the page without the writer's bytes; the flush goes through the new `Filesystem::write_at_by_inode`
+- `ftruncate`/`fallocate` on an unlinked fd answered `ENOENT` (they went by path), leaving Chromium's unlinked shared-memory file at 0 bytes so every write-back fell past EOF; they go by inode once the path no longer names it
+- amd64 `setsockopt` on a unix fd answered `ENOTSOCK` (the same routing hole as `sendmsg`), so crashpad's `SO_PASSCRED` failed and the browser `CHECK`-crashed; it now routes to glue
+- `execve` recorded the literal path as the image name, so a process started via `/proc/self/exe` could read `/proc/self/exe` back as itself; the name is resolved through symlinks before the swap
+- `hpbox.deploy()` reported success when its `git reset` failed inside a status-hiding pipeline, so the box stayed 210 commits back and the patch was applied onto a stale tree; it refuses when the box did not land on the intended commit
 
 ## Memory & Virtual Memory (174 fixes, 56 docs)
 
@@ -767,7 +776,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 0 online bsp
 ` on both kernels, a multikernel leftover; it renders one row per active core now
 
-## SMP & Locking (128 fixes, 51 docs)
+## SMP & Locking (131 fixes, 52 docs)
 
 ### docs/archive/AKUMA_EXEC_AUDIT.md
 (The `akuma-exec` -> `#![forbid(unsafe_code)]` campaign is a refactor and is not counted — see `AKUMA_EXEC_FORBID_UNSAFE.md`; these are the soundness defects it surfaced and fixed. §5b's triplicated `FrameSource` enum + converters is a duplication cleanup with no bug and is not counted; §6.E group 3 turned out to be non-problems and is not counted.)
@@ -1008,6 +1017,11 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_TLB_STUCK_AS_LOCK.md
 - `ProcAddressSpace::lock` masked IRQs and spun with a plain `lock()` while `munmap` held the same `as_lock` across `wait_for_acks`, so a core in `fork`'s BKL-free share pass could never acknowledge the shootdown it was blocking (`[TLB] stuck … missing=0x8`); every acquire now goes through a `try_lock` loop calling `masked_spin_assist()` (fix in tree, root cause inferred, not verified on the metal)
 - `wait_for_acks` never serviced its own mailbox, so two IRQ-masked senders (fork's BKL-free window broadcasts itself) could wait on each other forever; it calls `service_pending()` each spin
+
+### docs/archive/AKUMA_AMD64_SMP_WIDTH.md
+- `KernelLock::barged` was sized for 8 cores, so on core index 8 and up releasing a ticket-free (barge) hold consumed a waiting core's ticket and acquiring one leaked a ticket nobody would hold, wedging every 9+ core boot with `ticket=N serving=N-1` forever; `BARGE_MAX_CORES` and `PROFILE_MAX_CORES` are 16
+- `ACTIVE_L0`/`PREV_L0` were indexed `core % 8`, so core 8 overwrote core 0's published page-table root and the page-table free gate could free a table in use; `TTBR_TRACK_CORES` is 16
+- `VOLUNTARY_SCHEDULE` was indexed `core % 8`, so cores 8-15 shared the reschedule flag with 0-7; `MAX_CORES` is 16
 
 ## Networking (80 fixes, 31 docs)
 
@@ -1664,7 +1678,7 @@ aren't recorded anywhere else.)
 - an extend that failed partway (ENOSPC) returned with `?` before writing the inode, leaving blocks allocated in the bitmap that no inode referenced; the allocations are rolled back and the inode and metadata written before the error returns
 - an extend over a hole in the file's last partial block allocated it with `zero_leaf = false`, so the bytes before the old EOF read as whatever the block held before; now `true`
 
-## Boot & Drivers (90 fixes, 14 docs)
+## Boot & Drivers (109 fixes, 15 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1785,6 +1799,27 @@ aren't recorded anywhere else.)
 - GCAP was decoded wrongly (`BSS` is bits 7:3, `NSDO` 2:1), and the crate's own host tests had never compiled (fakes missing `w32`, `reset` taking `Fn` where the test needed `FnMut`), which is how the offset and verb bugs survived — the box had no host toolchain and treated "cannot run here" as a fact about the tests
 - the driver stopped at the last real sample and truncated the tail, because the position register runs ahead of the converter — found by the QEMU recording oracle (44,100 frames, 0 mismatches after the fix); 100 ms of trailing silence on close
 - a killed player left the cyclic free-running ring looping the last ~370 ms, because only `close` stopped the stream and process exit does not call `close`; zeroing consumed spans could not fix it (it runs in the write loop, and no writer means no observer), so `release_fd_entry` calls `runtime().dsp_close` for `FileDescriptor::DevDsp`, wired to `akuma_virtio::audio::stop` in both kernel tables
+
+### docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md
+- the kernel refused a framebuffer above a stale 4 GiB `MAPPED_LIMIT` and halted on EGA text, so the first metal boot was a black screen; the limit is lifted, and a framebuffer failure or `nofb` boots headless instead of halting
+- under UEFI the PMM handed out the region holding the kernel's first 6 MiB as free frames, because the firmware splits the image's range across regions; `mem::usable_of` carves every reserved span out of every region it overlaps
+- the RTL8852CE firmware download never started (`TXMDA_STUCK`) because the root port above the card arrived with Bus Master off and so forwarded none of its DMA; `pci::enable_bridges_above` sets it, as Linux's `pci_enable_bridge` does
+- the join's address-CAM entries kept the recording's address hashes after the station address and BSSID were substituted, so the card's address match dropped every frame sent to the station; `script::fix_addr_cam` recomputes both hashes before each such command
+- the TX address-info entry carried the WD page's bus address instead of the frame's, so the chip would have transmitted the descriptor as the frame
+- `USE_RATE` was set on every TX frame, forcing EAPOL and data to a CCK rate; it is set for management frames only
+- `TID_INDICATE` was never set on EAPOL frames, which the recording sets
+- `wp_offset` was 0 on protected data where Linux uses 1 (room for the security header the chip writes)
+- join frames used mac id 1 where the recording and `rtw89_core_sta_add` use the interface's mac id 0
+- EAPOL message 4 was still queued when `JOIN4` installed the keys, so the chip sent it under the new pairwise key or not at all and the AP resent message 3; the station waits for message 4's release report first
+- join retries power-cycled the card and could never come back, since it refuses a second firmware download in one boot (`FWDL_SECURITY_FAIL`); retries and rejoins reuse the running card
+- `flush_transmit` rebuilt the queue by value, a 24 KiB temporary on a 32 KiB kernel stack, after which no new process could start; it resets two indices
+- the stack's no-lease fallback on the wifi link was QEMU's `10.0.2.15`, misleading every log line; the link carries a link-local `169.254.65.77/16` until DHCP answers
+- the stack's transmits waited for the station daemon's timed lap and were dropped; `FrameQueues::on_transmit` rings a doorbell, rung after `NETWORK` is released (ringing it inside the critical section wedged the box)
+- a blocking `connect`/`recv` relaxed with a bare `allow_tick` and no yield, so on `nosmp` the station daemon lapped twice in 10 s while the SYN-ACKs sat in the card's ring and every outbound connect timed out; the wifi link's relax now yields first
+- the card decrypted frames but nothing checked the CCMP packet number was new, so a recorded protected frame could be replayed; `ccmp::Replay` tracks the highest PN per key and TID
+- large TLS uploads died with `bad record mac` because the TX channel had 8 WD pages and recycled one when the ring read index passed it, before the chip's DMA read of it, while the stack hands up to 16 frames per lap; `PAGES` is 32
+- the PS/2 keyboard driver dropped every 0xE0-extended key on purpose, so arrows, Home/End, Delete and PgUp/PgDn did nothing in rio; they emit the USB keymap's escape sequences through a lock-free byte queue
+- the polled i8042 driver raced between cores on ports `0x60`/`0x64` and a plain spinlock around it hung even a single-core boot when a holder was preempted; `kbd.rs` uses the bounded give-up lock from `serial.rs`
 
 ## Signals & Exceptions (31 fixes, 12 docs)
 
@@ -1943,7 +1978,7 @@ aren't recorded anywhere else.)
 - all three TLS consumers printed the same flat "TLS handshake failed" for failures demanding completely different fixes (`InsufficientSpace`, `InvalidCipherSuite`, `DecodeError`), which is the single biggest reason the above cost a session; `libakuma_tls::tls_error_name` maps every variant and unpacks the two alert-carrying ones
 - the RTL8169 stall watchdog was given a chip-evidence test whose cost was never asked about — `snapshot()` is eleven MMIO reads, on a receive-poll loop that laps thousands of times a second under the BKL — and the box booted into it unreachable, twice: the retry moved the reads behind the `quiet` window, which is true on *every* lap once it passes on an idle link. `MPC` is deleted from the poll path; `INT_RDU` already arrives in the `ISR` harvested every lap and is the better signal. Every gate was green on both dark kernels, and neither fast-lane target runs this driver (both virtio)
 
-## Console & Terminal (56 fixes, 17 docs)
+## Console & Terminal (57 fixes, 17 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -2022,6 +2057,7 @@ aren't recorded anywhere else.)
 - rio's pty had no shell because the box has no `/etc/passwd` or `$SHELL`; `shell = { program = "/bin/sh" }` in the config
 - with no `/dev/ptmx` rio's `forkpty`/`openpty` failed and rioterm silently substituted a dead context that rendered and took keys with no shell behind it; a musl-only pipe-pty fallback (own session, AF_UNIX socketpair, relay thread playing a cooked line discipline) covers it until the kernel got real ptys
 - the fb platform sent `KeyboardInput` before `ModifiersChanged`, so every key carried the previous key's modifiers and Ctrl+D sent nothing; it sends `ModifiersChanged` first
+- emoji rendered as tofu because with fontconfig gated out `cascade_discover` returns `None` on musl and the box had no emoji font; `font-noto-emoji` is staged and `[fonts] symbol-map` routes the emoji blocks to it (not yet looked at on the panel)
 
 ### docs/archive/AKUMA_AMD64_WGPU_KERNEL_WORK.md
 - the USB keyboard driver (`akuma_usb::hid`) and the PS/2 driver dropped Alt, so Alt+D arrived as `d`; Alt+key now emits `ESC` first (meta sends escape)
@@ -2126,3 +2162,5 @@ Also re-scanned 2026-08-21 (the `improve-portability` branch's archive docs, ahe
 docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FORKTEST_GO_HANG_FIX (its one fix — the `sys_waitid` ECHILD-on-non-child parentage check — is the exact same 2026-07-22 investigation already counted under SMP_SHARED.md's "forktest_parent (Go) hang" entry), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIM_FAT_PART_2, TRIM_FAT_PART_3 (pure component-removal log, no bugfix content — same shape as TRIM_FAT_PART_2), TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
 
 userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/TESTING (duplicate of libakuma-tls TLS fix), crush/IMPLEMENTATION_DETAILS, forktest/IMPLEMENTATION_PLAN, herd/CORE_AWARE_SCHEDULING, httpd/TIMESTAMPS, libakuma/ALLOCATOR_OPTIONS, libakuma/MKDIR_P_IMPROVEMENTS, libakuma/SYSCALLS, libakuma/TERMINAL_SYSCALLS, meow/CONFIG, meow/HOTKEYS, meow/SHELL, meow/TESTING, scratch/LARGE_FILE_CHECKOUT_OPTIMIZATION, scratch/SIDEBAND_PARSER_FIX (duplicate of docs/archive/SIDEBAND_PARSER_FIX.md), sshd/LIMITATIONS, sshd/MIGRATION_SUMMARY, tar/IMPLEMENTATION_PLAN, tar/STREAMING_EXTRACTION, tcc/DISTRIBUTION_PLAN, tcc/IMPLEMENTATION_DETAILS, tcc/IMPLEMENTATION_PLAN, tcc/LIBTCC1.
+
+Also scanned 2026-10-08 (the ryzen laptop, wifi and Chromium work, 4 archive docs added and 1 edited). AKUMA_ACPI_POWER carries no counted fix: it adds `/proc/power` and the DSDT lookup as new capability, and its battery decode is unread on the laptop. Not counted, open by their own text: Chromium's `execve` reading the whole executable into the kernel heap, the crashpad `posix_spawn` `ENOENT`, `int3` from ring 3 arriving as SIGSEGV, `init=` following no symlinks, the missing x86_64 syscalls, the cross-core `now_us()` underflow in the station daemon, and the symlink dirent file type written wrongly by `apk`. The 16-core wedge listed in AKUMA_AMD64_ON_RYZEN_LAPTOP is counted once, under AKUMA_AMD64_SMP_WIDTH, which documents the fix. The whole-file-heap section folded into AKUMA_AMD64_CHROMIUM_KERNEL_WORK only restates fixes already counted (the `fd.rs` whole-file cache, the OOM handler's BKL release, the `Slab:` witness); its `execve` whole-image read is open.
