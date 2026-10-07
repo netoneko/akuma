@@ -132,6 +132,25 @@ pub fn utc_time_us(boot_uptime_us: u64) -> Option<u64> {
     }
 }
 
+/// `CLOCK_REALTIME` as a program sees it: [`utc_time_us`] once the clock is
+/// set, and **time since boot counted from the epoch** until then.
+///
+/// That is Linux's answer for a machine with no RTC — the clock starts at 0 at
+/// boot and advances — and the difference from a constant `0` is not cosmetic.
+/// musl's `mkdtemp`/`mkstemp`/`tmpnam` seed their names from `tv_sec +
+/// tv_nsec` (`__randname`), so a frozen clock makes every attempt produce the
+/// same name: Chromium's `mkdtemp("/tmp/.org.chromium.Chromium.scoped_dir.XXXXXX")`
+/// tried `EAAIAA` 100 times, got `EEXIST` each time, and failed its
+/// ProcessSingleton (2026-10-08, a Firecracker guest with no network for SNTP).
+///
+/// Kernel code that must tell "never synced" from 1970 — a certificate check,
+/// the SNTP retry gate — keeps asking [`utc_time_us`]/[`is_utc_set`].
+#[inline]
+#[must_use]
+pub fn realtime_us(boot_uptime_us: u64) -> u64 {
+    utc_time_us(boot_uptime_us).unwrap_or(boot_uptime_us)
+}
+
 /// Whether the wall clock has ever been set.
 ///
 /// `utc_time_us(..).is_some()` without needing an uptime to pass it — the
@@ -161,6 +180,10 @@ mod tests {
     #[test]
     fn the_utc_anchor_is_unset_then_tracks_uptime() {
         assert_eq!(super::utc_time_us(0), None);
+        // Unset, `CLOCK_REALTIME` is boot-relative and advances, as on Linux
+        // with no RTC — never a constant (musl's temp-name seed).
+        assert_eq!(super::realtime_us(0), 0);
+        assert_eq!(super::realtime_us(1_500_000), 1_500_000);
         assert!(!super::is_utc_set());
 
         // Anchored at uptime 5 s, so reading it back at uptime 5 s is the

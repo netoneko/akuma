@@ -89,6 +89,14 @@ pub fn now_us() -> u64 {
     wall::utc_time_us(crate::net::uptime_us()).unwrap_or(0)
 }
 
+/// `CLOCK_REALTIME` for a program — [`now_us`] once synced, boot-relative
+/// before ([`akuma_primitives::clock::realtime_us`]). What `gettimeofday` and
+/// `time` answer; [`now_us`]'s `0` stays for the kernel's own file timestamps.
+#[must_use]
+pub fn realtime_us() -> u64 {
+    wall::realtime_us(crate::net::uptime_us())
+}
+
 /// As [`now_us`], in whole seconds — for `net.rs`'s `NetRuntime::utc_seconds`
 /// hook, which wants `Option<u64>` seconds rather than `u64` microseconds and
 /// `None` (not `Some(0)`) for "unsynced".

@@ -3212,6 +3212,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             created: Some(inode.creation_time as u64),
             modified: Some(inode.modification_time as u64),
             accessed: Some(inode.access_time as u64),
+            links: None,
         })
     }
 

@@ -889,6 +889,12 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         // parent nor leave the parent's handshake pipe in a coherent state.
         return if e.contains("Failed to load ELF") { ENOEXEC } else { ENOMEM };
     }
+    // `/proc/<pid>/exe` follows the new image (`ProcessImage::exe`). This
+    // kernel never refreshed it, so an exec'd process kept reporting whatever
+    // it was spawned as. `name` (the `comm`) is left as it was.
+    {
+        proc.image.lock().exe.clone_from(&resolved_path);
+    }
 
     // Image replacement committed — *now* close the close-on-exec descriptors.
     // This is the POSIX "point of no return": a successful execve closes every

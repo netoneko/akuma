@@ -74,6 +74,23 @@ pub struct Metadata {
     pub created: Option<u64>,
     pub modified: Option<u64>,
     pub accessed: Option<u64>,
+    /// Hard-link count (`st_nlink`), when the filesystem knows it. `None`
+    /// derives the conventional answer — 2 for a directory, 1 otherwise —
+    /// which is what every `stat` reported before this field existed.
+    ///
+    /// Added 2026-10-08 for `/proc/<pid>/task`, whose link count *is* data:
+    /// Linux reports `2 + threads`, and Chromium's sandbox helper decides
+    /// "single-threaded" by `st_nlink == 3` after a `CHECK_LE(3, nlink)` —
+    /// so the fixed 2 was a `CHECK` failure in every zygote.
+    pub links: Option<u32>,
+}
+
+impl Metadata {
+    /// `st_nlink`: [`Self::links`], or the conventional 2/1 when unknown.
+    #[must_use]
+    pub fn nlink(&self) -> u32 {
+        self.links.unwrap_or(if self.is_dir { 2 } else { 1 })
+    }
 }
 
 /// Filesystem statistics

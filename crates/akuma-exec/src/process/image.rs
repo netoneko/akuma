@@ -396,6 +396,7 @@ impl Process {
             address_space: crate::process::ProcAddressSpace::new(loaded.address_space),
             image: Spinlock::new(crate::process::ProcessImage {
                 name: String::from(name),
+                exe: String::from(name),
                 args: Vec::new(),
                 context: UserContext::new(loaded.entry_point, loaded.sp),
             }),

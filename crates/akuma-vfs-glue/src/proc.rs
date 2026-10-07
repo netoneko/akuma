@@ -109,6 +109,62 @@ fn pid_address_space_file(pid: Pid, name: &str) -> Option<Vec<u8>> {
 /// The bare string `self` is deliberately NOT rewritten: it must stay a symlink so
 /// `readlink("/proc/self")` keeps working.
 fn resolve_self(path: &str) -> alloc::borrow::Cow<'_, str> {
+    let path = resolve_self_only(path);
+    match resolve_task(&path) {
+        Some(aliased) => alloc::borrow::Cow::Owned(aliased),
+        None => path,
+    }
+}
+
+/// The live threads of thread group `tgid` — what `/proc/<tgid>/task` lists.
+/// Empty when `tgid` is not a group leader (a thread's own pid is not a
+/// `task` directory, on Linux either).
+fn task_members(tgid: Pid) -> Vec<Pid> {
+    let mut members = process::collect_pids(|p| {
+        p.tgid == tgid && !p.exited.load(core::sync::atomic::Ordering::Relaxed)
+    });
+    members.sort_unstable();
+    members
+}
+
+/// `<tgid>/task/<tid>[/rest]` → `<tid>[/rest]`, when `tid` is a live thread
+/// of `tgid`.
+///
+/// `/proc/<pid>/task/<tid>/` on Linux is the per-thread view of the same
+/// files `/proc/<tid>/` serves — and here every thread is a `Process` of its
+/// own, so the per-pid renderers already *are* the per-thread ones. Aliasing
+/// the path is the whole implementation: no second copy of `status`, `stat`,
+/// `cmdline`. `<tgid>/task` itself is served beside the per-pid entries.
+///
+/// Added 2026-10-08. There was no `task` directory at all, and Chromium's
+/// sandbox helper `fstatat`s `/proc/self/task/` to count its own threads
+/// (`st_nlink`); the `ENOENT` was a `CHECK` failure in every zygote. Linux
+/// Chromium also reads `/proc/<pid>/task/<tid>/status` ~300 times a page load.
+fn resolve_task(path: &str) -> Option<String> {
+    let mut it = path.splitn(4, '/');
+    let tgid: Pid = it.next()?.parse().ok()?;
+    if it.next()? != "task" {
+        return None;
+    }
+    let tid: Pid = it.next()?.parse().ok()?;
+    if !task_members(tgid).contains(&tid) {
+        return None;
+    }
+    Some(match it.next() {
+        Some(rest) => format!("{tid}/{rest}"),
+        None => format!("{tid}"),
+    })
+}
+
+/// `<tgid>/task` → the group's thread ids, if `path` names one.
+fn task_dir(path: &str) -> Option<Vec<Pid>> {
+    let tgid: Pid = path.strip_suffix("/task")?.parse().ok()?;
+    let members = task_members(tgid);
+    (!members.is_empty()).then_some(members)
+}
+
+/// [`resolve_self`]'s first half: `self/` → the caller's pid.
+fn resolve_self_only(path: &str) -> alloc::borrow::Cow<'_, str> {
     match path.strip_prefix("self/") {
         Some(rest) => match akuma_exec::process::read_current_pid() {
             Some(pid) => alloc::borrow::Cow::Owned(format!("{pid}/{rest}")),
@@ -706,6 +762,17 @@ impl Filesystem for ProcFilesystem {
             return Ok(entries);
         }
 
+        if let Some(members) = task_dir(path) {
+            let tgid: Pid = path.strip_suffix("/task").and_then(|p| p.parse().ok()).unwrap_or(0);
+            if !Self::process_visible(tgid, current_box_id) {
+                return Err(FsError::NotFound);
+            }
+            return Ok(members
+                .into_iter()
+                .map(|tid| DirEntry { name: format!("{tid}"), is_dir: true, is_symlink: false, size: 0 })
+                .collect());
+        }
+
         let parts: Vec<&str> = path.split('/').collect();
 
         if parts.len() == 1 {
@@ -739,6 +806,14 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: false,
                     size: 0,
                 });
+                if !task_members(pid).is_empty() {
+                    pid_entries.push(DirEntry {
+                        name: String::from("task"),
+                        is_dir: true,
+                        is_symlink: false,
+                        size: 0,
+                    });
+                }
                 pid_entries.push(DirEntry {
                     name: String::from("cmdline"),
                     is_dir: false,
@@ -1307,6 +1382,10 @@ impl Filesystem for ProcFilesystem {
             return true; // Root always exists
         }
 
+        if let Some(tgid) = path.strip_suffix("/task").and_then(|p| p.parse::<Pid>().ok()) {
+            return task_dir(path).is_some() && Self::process_visible(tgid, current_box_id);
+        }
+
         if path == "boxes" || path == "cores" {
             return current_box_id == 0;
         }
@@ -1392,6 +1471,25 @@ impl Filesystem for ProcFilesystem {
             h
         };
 
+        // `<tgid>/task`: a directory whose link count is `2 + threads`, as on
+        // Linux — Chromium reads "single-threaded" off `st_nlink == 3`.
+        if let Some(members) = task_dir(path) {
+            let tgid: Pid = path.strip_suffix("/task").and_then(|p| p.parse().ok()).unwrap_or(0);
+            if !Self::process_visible(tgid, caller_box_id()) {
+                return Err(FsError::NotFound);
+            }
+            return Ok(Metadata {
+                is_dir: true,
+                size: 0,
+                inode,
+                mode: 0o40555,
+                created: None,
+                modified: None,
+                accessed: None,
+                links: Some(2 + members.len() as u32),
+            });
+        }
+
         if path.is_empty() {
             return Ok(Metadata {
                 is_dir: true,
@@ -1401,6 +1499,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1416,6 +1515,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1438,6 +1538,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1452,6 +1553,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1473,6 +1575,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1495,6 +1598,7 @@ impl Filesystem for ProcFilesystem {
                         created: None,
                         modified: None,
                         accessed: None,
+                        links: None,
                     });
                 }
         }
@@ -1516,6 +1620,7 @@ impl Filesystem for ProcFilesystem {
                         created: None,
                         modified: None,
                         accessed: None,
+                        links: None,
                     });
                 }
         }
@@ -1533,12 +1638,13 @@ impl Filesystem for ProcFilesystem {
                     let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
                     return Ok(Metadata {
                         is_dir: false,
-                        size: proc.image_name().len() as u64,
+                        size: proc.image_exe().len() as u64,
                         inode,
                         mode: 0o120_777,
                         created: None,
                         modified: None,
                         accessed: None,
+                        links: None,
                     });
                 }
         }
@@ -1552,6 +1658,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1564,6 +1671,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1576,6 +1684,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1588,6 +1697,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1610,6 +1720,7 @@ impl Filesystem for ProcFilesystem {
                 created: None,
                 modified: None,
                 accessed: None,
+                links: None,
             });
         }
 
@@ -1627,6 +1738,7 @@ impl Filesystem for ProcFilesystem {
                         created: None,
                         modified: None,
                         accessed: None,
+                        links: None,
                     });
                 }
                 return Err(FsError::NotFound);
@@ -1655,6 +1767,7 @@ impl Filesystem for ProcFilesystem {
                     created: None,
                     modified: None,
                     accessed: None,
+                    links: None,
                 });
             }
             let pid_exists = Self::process_visible(pid, caller_box_id())
@@ -1686,6 +1799,7 @@ impl Filesystem for ProcFilesystem {
                     created: None,
                     modified: None,
                     accessed: None,
+                    links: None,
                 });
             }
             return Err(FsError::NotFound);
@@ -1735,7 +1849,7 @@ impl Filesystem for ProcFilesystem {
             if !Self::process_visible(pid, caller_box_id()) {
                 return Err(FsError::NotFound);
             }
-            return Ok(proc.image_name());
+            return Ok(proc.image_exe());
         }
 
         if parts.len() == 3 && parts[1] == "fd" {

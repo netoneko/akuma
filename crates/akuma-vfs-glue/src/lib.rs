@@ -814,6 +814,7 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
             created: None,
             modified: None,
             accessed: None,
+            links: None,
         });
     }
     // Device nodes. `Metadata` carries no `rdev`, so `sys_newfstatat` /
@@ -829,6 +830,7 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
             created: None,
             modified: None,
             accessed: None,
+            links: None,
         });
     }
     if let Some(m) = pts_metadata(path) {
@@ -1205,7 +1207,7 @@ fn pts_metadata(path: &str) -> Option<Metadata> {
         let n = pts_slot(path)?;
         (false, 0x7074_0000 + u64::from(n), 0o20620)
     };
-    Some(Metadata { is_dir, size: 0, inode, mode, created: None, modified: None, accessed: None })
+    Some(Metadata { is_dir, size: 0, inode, mode, created: None, modified: None, accessed: None, links: None })
 }
 
 /// Whether the kernel offers `/dev/fb0`. Set once by the amd64 kernel when it
@@ -1378,6 +1380,7 @@ fn dev_dir_metadata(path: &str) -> Option<Metadata> {
         created: None,
         modified: None,
         accessed: None,
+        links: None,
     })
 }
 

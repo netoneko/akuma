@@ -21,5 +21,9 @@ for mode in "" "--no-zygote"; do
   echo "== chromium mode=[$mode] done"
   ls -la /tmp/shot$mode.png
 done
+# The kernel's own ring (syslog(2)), for correlating the run with what the
+# kernel reported: missing syscall rows, faults, OOM, `[sc!]` lines.
+dmesg > /tmp/dmesg.txt 2>&1
+echo "== dmesg: $(wc -l < /tmp/dmesg.txt) lines"
 sync
 echo "== kami-smoke done"

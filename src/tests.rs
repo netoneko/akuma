@@ -3584,7 +3584,7 @@ fn make_test_process(
         pid, pgid: pid, tgid: pid,
         state: akuma_exec::process::AtomicProcessState::new(akuma_exec::process::ProcessState::Ready),
         address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
-        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0) }),
+        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), exe: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0) }),
         parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
         entry_point: core::sync::atomic::AtomicUsize::new(0), memory: mem, process_info_phys: core::sync::atomic::AtomicUsize::new(info_phys),
         cwd: String::from("/"),

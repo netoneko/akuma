@@ -373,6 +373,7 @@ impl Filesystem for MemoryFilesystem {
                 created: Some(*created),
                 modified: Some(*modified),
                 accessed: None,
+                links: None,
             }),
             FsNode::Directory { created, .. } => Ok(Metadata {
                 is_dir: true,
@@ -382,6 +383,7 @@ impl Filesystem for MemoryFilesystem {
                 created: Some(*created),
                 modified: None,
                 accessed: None,
+                links: None,
             }),
         }
     }

@@ -79,6 +79,19 @@ pub fn init_args(start_info_pa: u64, buf: &mut [u8]) -> Option<&str> {
     cmdline_token(start_info_pa, "initargs=", buf)
 }
 
+/// The value of a `strace_nr=` token: a comma-separated list of syscall
+/// numbers whose **successful** calls the `[sc!]` trace prints too
+/// (`usermode::SYSCALL_TRACE_NRS`). `strace_nr=89,267` shows every `readlink`.
+pub fn strace_nrs(start_info_pa: u64, buf: &mut [u8]) -> Option<&str> {
+    cmdline_token(start_info_pa, "strace_nr=", buf)
+}
+
+/// The value of a `strace_pid=` token: the one thread group the full `strace`
+/// trace prints (`usermode::SYSCALL_TRACE_PID`).
+pub fn strace_pid(start_info_pa: u64, buf: &mut [u8]) -> Option<&str> {
+    cmdline_token(start_info_pa, "strace_pid=", buf)
+}
+
 /// Is a bare `flag` token present on the command line? For `strace` (syscall
 /// tracing during bring-up).
 pub fn flag(start_info_pa: u64, flag: &str) -> bool {

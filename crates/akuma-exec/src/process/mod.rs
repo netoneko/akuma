@@ -687,9 +687,24 @@ pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
 /// mutates through `&self` instead of needing a `&mut Process` that
 /// `table::with_process_exclusive` had to synthesise from a raw pointer.
 pub struct ProcessImage {
-    /// `argv[0]`-ish display name. Read as a `Display` arg by `for_each_process`
-    /// diagnostics and `/proc/<pid>/{comm,stat,status}`.
+    /// `argv[0]`-ish display name — Linux's `comm`. Read as a `Display` arg by
+    /// `for_each_process` diagnostics and `/proc/<pid>/{comm,stat,status}`, and
+    /// rewritten by `prctl(PR_SET_NAME)`.
     pub name: String,
+    /// The executable this image was loaded from — what `/proc/<pid>/exe`
+    /// reports. Set when an image is installed (spawn, `execve`) and inherited
+    /// across `fork`; **nothing else writes it**.
+    ///
+    /// Split from [`Self::name`] 2026-10-08. `/proc/<pid>/exe` read `name`, and
+    /// `PR_SET_NAME` writes `name`, so a program that named its main thread
+    /// changed its own executable path. Chromium does exactly that: the browser
+    /// read `/proc/self/exe` as `/usr/lib/chromium/chromium` at startup and as
+    /// `chromium` a few calls later, computed its install directory as `""`,
+    /// and then could not find `chrome_crashpad_handler`, its V8 snapshot, or
+    /// itself (its zygotes `execvp`'d a bare `chromium` through `PATH`). On
+    /// Linux the two are `task->comm` and `mm->exe_file`, and only `execve`
+    /// touches the second.
+    pub exe: String,
     /// The argument vector, for `/proc/<pid>/cmdline`.
     pub args: Vec<String>,
     /// The register state the *first* entry to EL0 `eret`s into. `Copy`, so
@@ -976,6 +991,7 @@ impl Process {
                 let pimg = parent.image.lock();
                 ProcessImage {
                     name: pimg.name.clone(),
+                    exe: pimg.exe.clone(),
                     args: pimg.args.clone(),
                     context: UserContext::default(),
                 }
@@ -1294,6 +1310,12 @@ impl Process {
     /// guard — `/proc/<pid>/{comm,stat,status}`, diagnostics — take a copy.
     pub fn image_name(&self) -> String {
         self.image.lock().name.clone()
+    }
+
+    /// A copy of the executable path, for `/proc/<pid>/exe`. Not
+    /// [`Process::image_name`]: that is the `comm` a program can rename.
+    pub fn image_exe(&self) -> String {
+        self.image.lock().exe.clone()
     }
 
     /// A clone of the argument vector. See [`Process::image_name`].
@@ -4029,6 +4051,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         address_space: ProcAddressSpace::new(addr_space),
         image: Spinlock::new(ProcessImage {
             name: "test".to_string(),
+            exe: "test".to_string(),
             args: Vec::new(),
             context: UserContext::new(0, 0),
         }),

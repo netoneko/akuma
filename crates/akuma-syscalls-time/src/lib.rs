@@ -47,7 +47,7 @@ pub use akuma_sntp::{boot, sntp};
 // the boot-registered monotonic hook (the AArch64 kernel registers
 // `akuma_timer::uptime_us` itself, so nothing changed there); the UTC anchor
 // is the one static both kernels write.
-use akuma_primitives::clock::{set_utc_time_us, uptime_us, utc_time_us};
+use akuma_primitives::clock::{realtime_us, set_utc_time_us, uptime_us, utc_time_us};
 use akuma_exec::process::user_access::{read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL};
@@ -310,7 +310,7 @@ pub fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     let clock_id = clock_id_arg as u32;
 
     let (sec, nsec) = if clock_id == 0 {
-        let us = utc_time_us(uptime_us()).unwrap_or(0);
+        let us = realtime_us(uptime_us());
         ((us / 1_000_000) as u64, ((us % 1_000_000) * 1_000) as u64)
     } else {
         let us = uptime_us();
@@ -423,7 +423,7 @@ pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
 
     // Report current state back. No leap-second/frequency tracking, so every
     // read-only field besides `time` stays at its zeroed default.
-    let now_us = utc_time_us(uptime_us()).unwrap_or(0);
+    let now_us = realtime_us(uptime_us());
     tx.time_sec = (now_us / 1_000_000).cast_signed();
     tx.time_usec = if nano {
         ((now_us % 1_000_000) * 1000).cast_signed()
@@ -607,7 +607,7 @@ pub fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
 }
 
 #[must_use] 
-pub fn sys_time() -> u64 { utc_time_us(uptime_us()).unwrap_or(0) }
+pub fn sys_time() -> u64 { realtime_us(uptime_us()) }
 
 #[must_use] 
 pub fn sys_uptime() -> u64 { uptime_us() }

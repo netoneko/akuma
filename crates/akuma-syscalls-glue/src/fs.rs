@@ -2338,7 +2338,7 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
             // Stat from constants (or forwards cross-core, which must keep the BKL).
             let _vfs_bkl = VfsBklGuard::new();
             if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&f.path, f.mount_id(), f.inode()) {
-                stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
+                stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: meta.nlink(), st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
@@ -2509,7 +2509,7 @@ pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, u64> 
                 st_ino: meta.inode,
                 st_size: meta.size as i64, 
                 st_mode: meta.mode, 
-                st_nlink: if meta.is_dir { 2 } else { 1 },
+                st_nlink: meta.nlink(),
                 st_blksize: 4096,
                 st_blocks: ((meta.size as i64) + 511) / 512,
                 st_atime: meta.accessed.unwrap_or(0) as i64,
@@ -2788,7 +2788,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
             let final_path = if follow { akuma_vfs_glue::resolve_symlinks(&resolved_path) } else { resolved_path };
             if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&final_path, fd_mount, fd_inode) {
                 (meta.mode as u16, meta.inode, meta.size,
-                 if meta.is_dir { 2 } else { 1 },
+                 meta.nlink(),
                  meta.accessed.unwrap_or(0) as i64,
                  meta.modified.unwrap_or(0) as i64,
                  meta.created.unwrap_or(0) as i64,

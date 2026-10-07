@@ -47,6 +47,20 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # back for an A/B.
 linux-file-io = []
 
+# The compile-time syscall debug mode the AArch64 kernel has (root
+# `Cargo.toml`'s `syscall-debug-info`): glue's per-arm `[syscall]` lines and the
+# `[FORK-DBG]`/`[TRAMP]` fork/exec/thread-spawn lifecycle traces
+# (`docs/reference/subsystems/config-flags.md` § Tracing). OFF by default; the
+# same four crates as on AArch64, since glue const-asserts that
+# `akuma-config` and `akuma-syscalls` agree. For "which syscall failed and on
+# what path", the runtime `strace_err` command-line flag is the lighter tool
+# (`usermode.rs`'s `SYSCALL_TRACE_ERRORS`).
+syscall-debug-info = [
+    "dep:akuma-syscalls", "akuma-syscalls/debug-info",
+    "dep:akuma-syscalls-time", "akuma-syscalls-time/debug-info",
+    "akuma-exec/debug-info", "akuma-config/syscall-debug-info",
+]
+
 # Record who called `reboot(2)` — pid/tgid/name/argv and the ancestor chain — to
 # the console and `/var/log/reboot-trace.log`, before the reset. ON by default
 # (one stack buffer and one file append on a path that is about to reset the
@@ -339,6 +353,10 @@ spinning_top = "0.3"
 # from here rather than restated locally so the two kernels cannot be tuned
 # differently by accident; it is the only thing this target takes from the crate.
 akuma-config = { path = "../crates/akuma-config" }
+# Only for `syscall-debug-info`'s feature forwarding: glue depends on both, and
+# a feature can only be switched on through a crate this one names.
+akuma-syscalls = { path = "../crates/akuma-syscalls", optional = true }
+akuma-syscalls-time = { path = "../crates/akuma-syscalls-time", optional = true }
 # `mmap`'s mapping-kind decode and `MAP_FIXED` validation — a pure function of
 # the argument bits, host-tested, with seven pinned divergences from Linux. Used
 # rather than re-derived so this target cannot drift from the AArch64 kernel on

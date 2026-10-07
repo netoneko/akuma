@@ -298,6 +298,129 @@ static CALLS: AtomicU64 = AtomicU64::new(0);
 /// running a program the tree did not compile (busybox).
 pub static SYSCALL_TRACE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Print only the syscalls that **fail** — one `[sc!]` line each, with the
+/// pid, the decoded path arguments and the errno. Turned on by `strace_err` on
+/// the command line.
+///
+/// Added 2026-10-08 for Chromium, whose startup is ~100 000 syscalls across
+/// ~30 processes: [`SYSCALL_TRACE`]'s two lines per call are more serial time
+/// than the run has, and the question was never "what did it call" but "which
+/// call said `ENOENT`, in which process, about which path". One line per
+/// failure, written in one flush so two cores cannot shred it.
+pub static SYSCALL_TRACE_ERRORS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Restrict [`SYSCALL_TRACE`] to one thread group: `strace_pid=<n>` on the
+/// command line (which also turns the trace on). `0` traces everyone.
+///
+/// The full trace over a whole Chromium run is ~200 k lines; the browser
+/// process alone, in the second before it crashes, is what the question needs
+/// once `[sc!]` has named the process.
+pub static SYSCALL_TRACE_PID: AtomicU64 = AtomicU64::new(0);
+
+/// Syscall numbers whose every call — success included — gets an `[sc!]` line,
+/// one bit per number below 512. Set from `strace_nr=` on the command line
+/// ([`trace_nrs_from`]); implies nothing about [`SYSCALL_TRACE_ERRORS`].
+///
+/// The errors-only trace cannot see a call that *succeeds with the wrong
+/// answer*, and that is the shape Chromium's crashpad failure turned out to
+/// have: `execve("chrome_crashpad_handler")` failed because some earlier call
+/// had returned a path without its directory, without failing.
+static SYSCALL_TRACE_NRS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Parse `strace_nr=`'s comma-separated list into [`SYSCALL_TRACE_NRS`].
+/// Numbers that do not parse, or are 512 or more, are ignored.
+pub fn trace_nrs_from(list: &str) {
+    for n in list.split(',').filter_map(|t| t.parse::<u64>().ok()).filter(|&n| n < 512) {
+        SYSCALL_TRACE_NRS[(n / 64) as usize].fetch_or(1 << (n % 64), Ordering::Relaxed);
+    }
+}
+
+fn trace_nr_selected(nr: u64) -> bool {
+    nr < 512 && SYSCALL_TRACE_NRS[(nr / 64) as usize].load(Ordering::Relaxed) & (1 << (nr % 64)) != 0
+}
+
+/// The path-carrying argument(s) of `nr`, as `(first, second)` user pointers.
+///
+/// One table for both traces, so a syscall cannot be decoded in one and not
+/// the other. An `*at` call's dirfd is its `a1`, which both lines print.
+fn trace_paths(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (Option<u64>, Option<u64>) {
+    match nr {
+        // open, stat, lstat, access, execve, chdir, rename, mkdir, rmdir,
+        // creat, link, unlink, symlink, readlink, chmod, chown, lchown,
+        // truncate, statfs, chroot, mknod, utimes
+        2 | 4 | 6 | 21 | 59 | 80 | 83 | 84 | 85 | 87 | 89 | 90 | 92 | 94 | 76 | 137
+        | 161 | 133 | 235 => (Some(a1), None),
+        // rename, link, symlink (target, linkpath)
+        82 | 86 | 88 => (Some(a1), Some(a2)),
+        // openat, mkdirat, mknodat, fchownat, newfstatat, unlinkat, readlinkat,
+        // fchmodat, faccessat, utimensat, execveat, faccessat2, statx
+        257 | 258 | 259 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 322 | 439 | 332 => {
+            (Some(a2), None)
+        }
+        // renameat, linkat, renameat2 (old, new)
+        264 | 265 | 316 => (Some(a2), Some(a4)),
+        // symlinkat (target, newdirfd, linkpath)
+        266 => (Some(a1), Some(a3)),
+        _ => (None, None),
+    }
+}
+
+/// The user string at `ptr` (ASCII prefix, at most 255 bytes) copied into
+/// `buf`, as a `&str` for a print. A bad pointer reads as empty. `read_cstr`
+/// allocates (bounded, 256 B) — acceptable on an opt-in trace, and the helper
+/// `fd::trace_user_cstr` has always used.
+fn trace_cstr(ptr: u64, buf: &mut [u8; 256]) -> &str {
+    let n = crate::uaccess::read_cstr(ptr, 256).map_or(0, |s| {
+        let n = s.iter().take_while(|b| b.is_ascii()).count().min(buf.len());
+        buf[..n].copy_from_slice(&s[..n]);
+        n
+    });
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+/// The `[sc!]` line for a failed syscall — see [`SYSCALL_TRACE_ERRORS`] — or
+/// for any call of a number named by `strace_nr=` ([`SYSCALL_TRACE_NRS`]).
+/// A successful `readlink`/`readlinkat` also shows the target it returned.
+///
+/// One `tprint!`, so the line carries the uptime stamp other traces are
+/// ordered by and two cores cannot shred it. Every argument is decoded into a
+/// stack buffer first.
+fn trace_error(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, r: u64) {
+    let pid = current_process().map_or(0, |p| p.pid);
+    let task = crate::sched::current_task();
+    let failed = r >= 0u64.wrapping_sub(4095);
+    let (p1, p2) = trace_paths(nr, a1, a2, a3, a4);
+    let (mut b1, mut b2, mut b3) = ([0u8; 256], [0u8; 256], [0u8; 256]);
+    let s1 = p1.map_or("", |p| trace_cstr(p, &mut b1));
+    let s2 = p2.map_or("", |p| trace_cstr(p, &mut b2));
+    // The bytes `readlink` wrote: not NUL-terminated, exactly `r` of them.
+    let target = match (nr, failed) {
+        (89, false) => Some(a2),
+        (267, false) => Some(a3),
+        _ => None,
+    }
+    .and_then(|ptr| {
+        let n = (r as usize).min(b3.len());
+        crate::uaccess::read_bytes(ptr, &mut b3[..n]).then_some(n)
+    })
+    .map_or("", |n| {
+        let n = b3[..n].iter().take_while(|c| c.is_ascii()).count();
+        core::str::from_utf8(&b3[..n]).unwrap_or("")
+    });
+    let (sign, val) = if failed { ("-", r.wrapping_neg()) } else { ("", r) };
+    akuma_primitives::tprint!(
+        1024,
+        "[sc!] pid={pid} task={task} nr={nr} a1=0x{a1:x} a2=0x{a2:x} a3=0x{a3:x} -> {sign}{val}{}{s1}{}{}{s2}{}{}{target}{}\n",
+        if p1.is_some() { " \"" } else { "" },
+        if p1.is_some() { "\"" } else { "" },
+        if p2.is_some() { " -> \"" } else { "" },
+        if p2.is_some() { "\"" } else { "" },
+        if target.is_empty() { "" } else { " = \"" },
+        if target.is_empty() { "" } else { "\"" },
+    );
+}
 /// Bytes accepted by `write`, across all processes.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Status the last process exited with.
@@ -878,7 +1001,10 @@ extern "C" fn syscall_handler(
     if let Some(p) = current_process() {
         p.syscall_stats.inc(nr);
     }
-    let trace = SYSCALL_TRACE.load(Ordering::Relaxed);
+    let trace = SYSCALL_TRACE.load(Ordering::Relaxed) && {
+        let only = SYSCALL_TRACE_PID.load(Ordering::Relaxed);
+        only == 0 || current_process().is_some_and(|p| u64::from(p.tgid) == only)
+    };
     // Entry line: a syscall that blocks forever has no result line, so the
     // entry line is what names it (a bring-up aid — without it a hang inside
     // `read` is invisible and reads as "no syscalls at all"). Path-taking
@@ -894,24 +1020,6 @@ extern "C" fn syscall_handler(
         serial::puts(" a1=0x");
         serial::put_hex(a1);
         match nr {
-            // The first-arg-path syscalls: `open`, `stat`, `lstat`, `access`,
-            // `chdir`. All of them answer ENOENT for a path this kernel does
-            // not serve, and without the path in the trace an ENOENT is a
-            // number with nothing attached — which is exactly how long it took
-            // to see that `ps` was failing on `stat("/proc/<pid>")` rather than
-            // on anything to do with `getdents64`.
-            2 | 4 | 6 | 21 | 80 => {
-                serial::puts(" \"");
-                crate::fd::trace_user_cstr(a1);
-                serial::puts("\"");
-            }
-            257 | 258 | 263 | 269 => {
-                serial::puts(" at=");
-                serial::put_dec(a1);
-                serial::puts(" \"");
-                crate::fd::trace_user_cstr(a2);
-                serial::puts("\"");
-            }
             // `clone`'s flag word and `futex`'s op decide everything about the
             // call and neither is legible as a hex blob. Added 2026-09-06 after
             // decoding `a1=0x7d0f00` by hand off a trace was the step that
@@ -929,18 +1037,23 @@ extern "C" fn syscall_handler(
                 serial::puts(" val=");
                 serial::put_dec(a3);
             }
-            264 => {
-                serial::puts(" at=");
-                serial::put_dec(a1);
-                serial::puts(" \"");
-                crate::fd::trace_user_cstr(a2);
-                serial::puts("\" -> at=");
-                serial::put_dec(a3);
-                serial::puts(" \"");
-                crate::fd::trace_user_cstr(a4);
-                serial::puts("\"");
-            }
             _ => {}
+        }
+        // The path arguments, from the table the `[sc!]` line uses too. The
+        // first-arg-path syscalls all answer ENOENT for a path this kernel does
+        // not serve, and without the path an ENOENT is a number with nothing
+        // attached — which is exactly how long it took to see that `ps` was
+        // failing on `stat("/proc/<pid>")` rather than on `getdents64`.
+        let (p1, p2) = trace_paths(nr, a1, a2, a3, a4);
+        if let Some(p) = p1 {
+            serial::puts(" \"");
+            crate::fd::trace_user_cstr(p);
+            serial::puts("\"");
+        }
+        if let Some(p) = p2 {
+            serial::puts(" -> \"");
+            crate::fd::trace_user_cstr(p);
+            serial::puts("\"");
         }
         serial::puts("\n");
     }
@@ -968,6 +1081,17 @@ extern "C" fn syscall_handler(
         && let Some(p) = current_process()
     {
         p.syscall_stats.add_time_us(nr, t1.saturating_sub(t0));
+    }
+    // Linux's error convention: `-4095..=-1`. Anything else is a value (an
+    // `mmap` address is "negative" as an `i64` and is not a failure).
+    // `EAGAIN`, `EINTR` and `ETIMEDOUT` are what a polling, waiting program
+    // returns all day, and none of them is a missing file or a missing row.
+    if (r >= 0u64.wrapping_sub(4095)
+        && SYSCALL_TRACE_ERRORS.load(Ordering::Relaxed)
+        && !matches!(r.wrapping_neg(), 4 | 11 | 110))
+        || trace_nr_selected(nr)
+    {
+        trace_error(nr, a1, a2, a3, a4, r);
     }
     if trace {
         serial::puts("[sc] cpu=");
@@ -1446,7 +1570,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // is always NULL from every real caller and is not consulted.
         96 => {
             if a1 != 0 {
-                let us = crate::clock::now_us();
+                let us = crate::clock::realtime_us();
                 // A user `struct timeval { i64 tv_sec, i64 tv_usec }`.
                 let tv = [(us / 1_000_000).cast_signed(), (us % 1_000_000).cast_signed()];
                 if !crate::uaccess::write_val(a1, tv) {
@@ -1458,7 +1582,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `time(*time_t)` — x86_64 201. Writes through `tloc` when non-null,
         // in addition to the return value, matching `time(2)`'s own contract.
         201 => {
-            let secs = (crate::clock::now_us() / 1_000_000).cast_signed();
+            let secs = (crate::clock::realtime_us() / 1_000_000).cast_signed();
             if a1 != 0 && !crate::uaccess::write_val::<i64>(a1, secs) {
                 return errno::EFAULT;
             }
@@ -2333,7 +2457,27 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::MsgCtl => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::MsgSnd => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         Syscall::MsgRcv => to_glue(call, [a1, a2, a3, a4, a5, 0]),
-        _ => errno::ENOSYS,
+        // `brk(addr)` — x86_64 12. This target has no program break (the
+        // allocators are `mmap`-based and the arm was removed), so the row
+        // decoded and fell into the silent default below: `ENOSYS`, an answer
+        // Linux's `brk` never gives. Linux's answer for a break that cannot
+        // move is the **current break, unchanged**; musl's `__expand_heap`
+        // reads that as "no growth" and falls back to `mmap`, which is what it
+        // did here anyway — now through the documented path. Nothing is mapped.
+        // Found 2026-10-08 by the `[sc!]` trace: 54 `brk -> -ENOSYS` lines in
+        // one Chromium run.
+        Syscall::Brk => current_process().map_or(0, |p| p.get_brk() as u64),
+        // Decoded, but no arm above. Linux has no such answer, so say so: a
+        // row added to `akuma-syscalls-abi` without its arm here used to fall
+        // in silently (`brk` did, and earlier `fchdir`), where an undecoded
+        // number at least prints `no row for`.
+        _ => {
+            akuma_primitives::safe_print!(
+                160,
+                "[syscall] x86_64 nr={nr} decodes to {call:?} but has no dispatch arm — returning ENOSYS\n"
+            );
+            errno::ENOSYS
+        }
     }
 }
 
@@ -4273,6 +4417,7 @@ fn register_exec_process(
         address_space: ProcAddressSpace::new(image.space),
         image: Spinlock::new(ProcessImage {
             name: String::from(name),
+            exe: String::from(name),
             // 5b slice 2: the argument vector, so `/proc/<pid>/cmdline` can be
             // rendered from the registered process rather than from the spawn
             // row. Slice 1 left this empty, which was invisible only because
@@ -5000,8 +5145,13 @@ fn do_execve(
     // The display name is the syscall layer's, on both kernels —
     // `install_image`'s doc says so, because it is the *resolved path* here and
     // `argv[0]` would be a name the caller chose rather than something that
-    // opens. `/proc/<pid>/exe` reports it.
-    proc.image.lock().name = new_name;
+    // opens. `/proc/<pid>/exe` reports `exe`, which only this line and spawn
+    // write — `name` is the `comm` that `prctl(PR_SET_NAME)` may rename later.
+    {
+        let mut img = proc.image.lock();
+        img.exe.clone_from(&new_name);
+        img.name = new_name;
+    }
 
     // Image replacement committed — *now* close the close-on-exec descriptors.
     // POSIX's point of no return: a successful `execve` closes every
