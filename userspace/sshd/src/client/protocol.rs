@@ -26,6 +26,7 @@ use akuma_ssh_crypto::auth::{build_signed_data, parse_key_blob, parse_signature_
 use libakuma::net::{Error as NetError, ErrorKind as NetErrorKind, TcpStream};
 use libakuma::*;
 
+use sshd::client_resilience::ProbeOutcome;
 use sshd::client_wire;
 
 use super::crypto::*;
@@ -78,6 +79,46 @@ const WINDOW_ADJUST_THRESHOLD: u32 = 64 * 1024;
 /// peer to keep to, while still bounding the worst case.
 const MAX_INPUT_BUFFER: usize = 1024 * 1024;
 
+/// Wall-clock ceiling for the whole handshake (version exchange + KEX + auth).
+/// A peer that can't finish inside this window — stalled TCP on a lossy link,
+/// a hung server, a tarpit — is dropped with a clear error instead of holding
+/// the terminal open forever. Based on `uptime()` (monotonic), so it doesn't
+/// drift with RTC changes.
+const HANDSHAKE_TOTAL_TIMEOUT_MS: u64 = 120_000;
+/// How long any single stretch of *silence* from the peer may last during the
+/// handshake. Reset by every received byte, so a genuinely slow but live
+/// server keeps making progress while a dead one is cut off quickly.
+const HANDSHAKE_IDLE_TIMEOUT_MS: u64 = 30_000;
+
+/// Client keepalive: a `keepalive@openssh.com` global request goes out after
+/// this much inbound silence, and the connection is declared dead after
+/// `DEFAULT_ALIVE_COUNT_MAX` consecutive probes with no reply. This is what
+/// keeps NAT/firewall state and lossy wifi links from silently dropping an
+/// idle interactive session, and what turns a dead connection into a clear
+/// error instead of a hung terminal. Tunable at runtime via `SSH_ALIVE_INTERVAL`
+/// (seconds, 0 = off) and `SSH_ALIVE_COUNT_MAX` — same names/units as
+/// OpenSSH's `ServerAliveInterval` / `ServerAliveCountMax`.
+const DEFAULT_ALIVE_INTERVAL_MS: u64 = 15_000;
+const DEFAULT_ALIVE_COUNT_MAX: u32 = 3;
+
+/// How many times `connect()` is attempted before giving up. A single failed
+/// connect on a flaky link is indistinguishable from "the wifi glitched for
+/// 100 ms" — retry with a short backoff before punishing the user.
+const CONNECT_ATTEMPTS: u32 = 3;
+
+/// Auto-reconnect: after a lost session (any error once we've started
+/// connecting), start over — fresh TCP, fresh KEX, fresh auth, fresh channel
+/// — up to this many total attempts (the initial connection counts).
+/// Enabled by default (`SSH_AUTO_RECONNECT=0` turns it off);
+/// `SSH_RECONNECT_ATTEMPTS` overrides the count. The session itself does not
+/// survive server-side, but for an interactive shell on a flapping link a
+/// fresh prompt beats a dead terminal, and for `exec` the command simply
+/// runs again. Delay between attempts grows linearly from
+/// `RECONNECT_DELAY_BASE_MS`, capped at `RECONNECT_DELAY_CAP_MS`.
+const DEFAULT_RECONNECT_ATTEMPTS: u64 = 10;
+const RECONNECT_DELAY_BASE_MS: u64 = 2_000;
+const RECONNECT_DELAY_CAP_MS: u64 = 30_000;
+
 /// Raw mode flags (`akuma_terminal::mode_flags`), duplicated locally the same
 /// way `userspace/termtest` does — libakuma doesn't re-export them.
 mod mode_flags {
@@ -118,11 +159,58 @@ impl core::fmt::Display for ClientError {
     }
 }
 
+/// Entry point: runs the session, auto-reconnecting on failure.
+///
+/// Every error out of `run_once` — connect refused mid-flap, handshake
+/// timeout, keepalive-dead, reset mid-session — is retried from a clean
+/// slate (new TCP connection, new KEX, re-auth, new channel) up to
+/// `DEFAULT_RECONNECT_ATTEMPTS` total attempts, with a linearly growing
+/// delay between them, unless disabled via `SSH_AUTO_RECONNECT=0`. A clean
+/// remote exit (`Ok`) never reconnects.
 pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
+    let max_attempts = if env_u64("SSH_AUTO_RECONNECT").unwrap_or(1) != 0 {
+        env_u64("SSH_RECONNECT_ATTEMPTS")
+            .filter(|a| *a > 0)
+            .unwrap_or(DEFAULT_RECONNECT_ATTEMPTS)
+    } else {
+        1
+    };
+
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        match run_once(&cfg) {
+            Ok(code) => return Ok(code),
+            Err(e) => {
+                if !sshd::client_resilience::should_retry(attempt, max_attempts) {
+                    if max_attempts > 1 {
+                        eprintln(&format!(
+                            "[ssh] giving up after {attempt} attempts; last error: {e}"
+                        ));
+                    }
+                    return Err(e);
+                }
+                let delay = sshd::client_resilience::reconnect_delay_ms(
+                    attempt,
+                    RECONNECT_DELAY_BASE_MS,
+                    RECONNECT_DELAY_CAP_MS,
+                );
+                eprintln(&format!("[ssh] connection lost: {e}"));
+                eprintln(&format!(
+                    "[ssh] reconnecting in {delay}s (attempt {attempt}/{max_attempts})",
+                    delay = delay / 1000,
+                ));
+                sleep_ms(delay);
+            }
+        }
+    }
+}
+
+fn run_once(cfg: &ClientConfig) -> Result<i32, ClientError> {
     let ip = resolve_target(&cfg.host)?;
     let addr = format!("{}:{}", net::format_ip(ip), cfg.port);
     println(&format!("[ssh] connecting to {addr}..."));
-    let stream = TcpStream::connect(&addr)?;
+    let stream = connect_with_retry(&addr)?;
 
     let mut conn = Connection {
         stream,
@@ -131,7 +219,13 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
         input_buffer: Vec::new(),
         own_newkeys_sent: false,
         peer_newkeys_received: false,
+        handshake_deadline: now_ms().saturating_add(HANDSHAKE_TOTAL_TIMEOUT_MS),
     };
+    // The handshake (version line, `recv_packet`) enforces deadlines via
+    // non-blocking reads + `uptime()`, instead of blocking in the kernel
+    // forever on a stalled connection. The interactive pump expects the same
+    // non-blocking mode (that's the mode it used to switch on itself, later).
+    set_nonblocking(conn.stream.as_raw_fd(), true);
 
     let client_version = CLIENT_VERSION[..CLIENT_VERSION.len() - 2].to_vec();
     conn.stream.write_all(CLIENT_VERSION)?;
@@ -373,12 +467,15 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
     if want_pty {
         set_terminal_attributes(fd::STDIN as u64, 0, mode_flags::RAW_MODE_ENABLE);
     }
-    set_nonblocking(conn.stream.as_raw_fd(), true);
     set_nonblocking(fd::STDIN, true);
-    let result = pump(&mut conn, remote_channel, send_window, send_max_packet);
+    let result = pump(&mut conn, &cfg.host, remote_channel, send_window, send_max_packet);
     if want_pty {
         set_terminal_attributes(fd::STDIN as u64, 0, mode_flags::RAW_MODE_DISABLE);
     }
+    // The pump set stdin non-blocking; put it back so anything that reads
+    // stdin after we return (the TOFU prompt on a reconnect attempt, the
+    // next `run_once`'s handshake reads) sees blocking semantics again.
+    set_nonblocking(fd::STDIN, false);
     println("");
     result
 }
@@ -401,6 +498,11 @@ struct Connection {
     /// "handshake done" flag, so this stays correct even if a real server
     /// pipelines its NEWKEYS + first encrypted packet ahead of ours.
     peer_newkeys_received: bool,
+    /// Absolute `now_ms()` ceiling for the handshake phase, set at connect
+    /// time. Only enforced while `recv_packet` / `read_version_line` are in
+    /// use; the interactive pump replaces this coarse guard with the
+    /// keepalive logic (`alive_*`).
+    handshake_deadline: u64,
 }
 
 impl Connection {
@@ -441,17 +543,25 @@ impl Connection {
         }
     }
 
-    /// Blocking: pull more bytes off the socket until at least one full
-    /// packet is available, transparently discarding `SSH_MSG_IGNORE` /
+    /// Pull more bytes off the socket until at least one full packet is
+    /// available, transparently discarding `SSH_MSG_IGNORE` /
     /// `SSH_MSG_DEBUG` / `SSH_MSG_UNIMPLEMENTED` (RFC 4253 permits these
     /// anywhere in the protocol). Used only during the handshake — the
-    /// interactive phase switches to non-blocking + `try_take_packet` so it
-    /// can also service local stdin in the same loop.
+    /// interactive phase switches to `try_take_packet` so it can also
+    /// service local stdin in the same loop.
+    ///
+    /// The socket is non-blocking (set right after connect), so a stalled
+    /// peer is detected via `HANDSHAKE_IDLE_TIMEOUT_MS` /
+    /// `handshake_deadline` rather than blocking in the kernel forever.
     fn recv_packet(&mut self) -> Result<(u8, Vec<u8>), ClientError> {
+        let mut last_activity = now_ms();
         loop {
             while let Some((msg_type, payload)) = self.try_take_packet()? {
                 match msg_type {
-                    SSH_MSG_IGNORE | SSH_MSG_DEBUG | SSH_MSG_UNIMPLEMENTED => continue,
+                    SSH_MSG_IGNORE | SSH_MSG_DEBUG | SSH_MSG_UNIMPLEMENTED => {
+                        last_activity = now_ms();
+                        continue;
+                    }
                     _ => return Ok((msg_type, payload)),
                 }
             }
@@ -461,12 +571,40 @@ impl Connection {
                 )));
             }
             let mut buf = [0u8; 4096];
-            let n = self.stream.read(&mut buf)?;
-            if n == 0 {
-                return Err(ClientError::Msg(String::from("connection closed by peer")));
+            match self.stream.read(&mut buf) {
+                Ok(0) => {
+                    return Err(ClientError::Msg(String::from("connection closed by peer")));
+                }
+                Ok(n) => {
+                    self.input_buffer.extend_from_slice(&buf[..n]);
+                    last_activity = now_ms();
+                }
+                Err(e) if e.kind() == NetErrorKind::WouldBlock => {
+                    self.wait_for_handshake_io(last_activity)?;
+                }
+                Err(e) if e.kind() == NetErrorKind::Interrupted => continue,
+                Err(e) => return Err(ClientError::from(e)),
             }
-            self.input_buffer.extend_from_slice(&buf[..n]);
         }
+    }
+
+    /// Enforce the handshake deadlines while the socket has nothing to give
+    /// us: an overall wall-clock ceiling plus a per-silence idle limit. Sleeps
+    /// a short slice between polls so a stalled handshake doesn't spin.
+    fn wait_for_handshake_io(&self, last_activity: u64) -> Result<(), ClientError> {
+        let now = now_ms();
+        if now >= self.handshake_deadline {
+            return Err(ClientError::Msg(String::from(
+                "handshake timed out — server too slow to complete key exchange and auth",
+            )));
+        }
+        if now.saturating_sub(last_activity) >= HANDSHAKE_IDLE_TIMEOUT_MS {
+            return Err(ClientError::Msg(String::from(
+                "connection stalled during handshake — no data from server",
+            )));
+        }
+        sleep_ms(10);
+        Ok(())
     }
 }
 
@@ -645,19 +783,37 @@ fn expect_channel_reply(
 /// control (channel window + max-packet) is honored on the outbound side,
 /// and inbound window credit is returned once it builds up — both needed for
 /// a well-behaved third-party server, not just this repo's own `sshd`.
+///
+/// Resilience on a lossy link (this whole function is otherwise the place a
+/// bad connection hurts most):
+///
+/// - A client keepalive (`keepalive@openssh.com`, the same request OpenSSH's
+///   client sends) goes out after every `alive_interval` of inbound silence.
+///   Any inbound packet counts as liveness — the reply itself is just one of
+///   the messages the loop already handles/dismisses — but a peer that
+///   answers nothing for `alive_interval * (count_max + 1)` is declared dead
+///   with a clear error instead of leaving a hung terminal.
+/// - `Interrupted` / `TimedOut` read errors don't end the session: they're
+///   transient, and if the peer really is gone the keepalive check finds it
+///   within a bounded time.
 fn pump(
     conn: &mut Connection,
+    host: &str,
     remote_channel: u32,
     mut send_window: u32,
     send_max_packet: u32,
 ) -> Result<i32, ClientError> {
+    let (alive_interval_ms, alive_count_max) = alive_config();
+    let mut keepalive = sshd::client_resilience::Keepalive::new(alive_interval_ms, alive_count_max);
     let mut stdin_pending: Vec<u8> = Vec::new();
     let mut local_input_done = false;
     let mut channel_eof_sent = false;
     let mut recv_credit: u32 = 0;
     let mut exit_code: Option<i32> = None;
+    let mut last_recv = now_ms();
 
     loop {
+        let now = now_ms();
         let mut did_io = false;
 
         if !local_input_done {
@@ -706,9 +862,18 @@ fn pump(
                         "peer sent an oversized or never-completing packet \u{2014} disconnecting",
                     )));
                 }
+                last_recv = now;
+                keepalive.on_bytes();
                 did_io = true;
             }
             Err(e) if e.kind() == NetErrorKind::WouldBlock => {}
+            Err(e)
+                if e.kind() == NetErrorKind::Interrupted || e.kind() == NetErrorKind::TimedOut =>
+            {
+                // Transient — don't kill an interactive session over one bad
+                // syscall. A genuinely dead peer is caught by the keepalive
+                // check below within a bounded time.
+            }
             Err(e) => return Err(ClientError::from(e)),
         }
 
@@ -811,6 +976,29 @@ fn pump(
             recv_credit = 0;
         }
 
+        // Client keepalive on inbound silence: keeps NAT/firewall state warm
+        // and turns a silently-dead connection into a clear error that the
+        // auto-reconnect loop in `run` acts on. Any packet from the peer (the
+        // REQUEST_FAILURE reply to our probe included) resets the tracker in
+        // the read arm above. `SSH_ALIVE_INTERVAL=0` disables this, matching
+        // OpenSSH's "interval 0 = off" convention.
+        if keepalive.due(now, last_recv) {
+            let mut probe = vec![SSH_MSG_GLOBAL_REQUEST];
+            write_string(&mut probe, b"keepalive@openssh.com");
+            probe.push(1); // want_reply — we need *some* answer, content is irrelevant
+            conn.send_payload(&probe)?;
+            last_recv = now; // one probe per interval, not one per tick
+            if let ProbeOutcome::Dead = keepalive.on_probe_sent() {
+                let silent_secs =
+                    alive_interval_ms * (u64::from(alive_count_max) + 1) / 1000;
+                return Err(ClientError::Msg(format!(
+                    "Timeout, server {host} not responding. \
+                     No data received for {silent_secs}s over {} keepalive probes",
+                    keepalive.count_max + 1,
+                )));
+            }
+        }
+
         if should_close {
             // Best-effort: we're returning either way, and a failure here
             // just means the peer already dropped the connection.
@@ -832,6 +1020,56 @@ fn pump(
 // Small local helpers
 // ============================================================================
 
+/// Monotonic milliseconds since boot. `libakuma::uptime()` is µs; all the
+/// deadline/keepalive logic keys off this rather than `time()` because
+/// monotonic time can't jump when the RTC changes.
+fn now_ms() -> u64 {
+    uptime() / 1000
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    libakuma::env(name)?.parse::<u64>().ok()
+}
+
+/// `(keepalive interval ms, give-up-after-missed-probes)` — runtime-tunable
+/// via `SSH_ALIVE_INTERVAL` (seconds, 0 = keepalive disabled) and
+/// `SSH_ALIVE_COUNT_MAX`, falling back to the `DEFAULT_ALIVE_*` constants.
+/// Interval 0 means the caller should skip keepalive entirely.
+fn alive_config() -> (u64, u32) {
+    let interval_ms = env_u64("SSH_ALIVE_INTERVAL")
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(DEFAULT_ALIVE_INTERVAL_MS);
+    let count_max = env_u64("SSH_ALIVE_COUNT_MAX")
+        .map(|c| c.min(u32::MAX as u64) as u32)
+        .unwrap_or(DEFAULT_ALIVE_COUNT_MAX);
+    (interval_ms, count_max)
+}
+
+/// `TcpStream::connect` with retries and a short linear backoff: on a lossy
+/// link a single dropped SYN shouldn't end the session before it starts.
+/// The kernel's `connect()` blocks internally (SYN retransmits included), so
+/// each attempt here already carries the kernel's own timeout; this layers
+/// whole-attempt retries on top for the "attempt itself failed fast" case.
+fn connect_with_retry(addr: &str) -> Result<TcpStream, ClientError> {
+    let mut last_err: Option<NetError> = None;
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match TcpStream::connect(addr) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                if attempt < CONNECT_ATTEMPTS {
+                    eprintln(&format!(
+                        "[ssh] connect attempt {attempt} failed ({}) — retrying",
+                        e.message
+                    ));
+                    sleep_ms(500 * u64::from(attempt));
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(ClientError::Net(last_err.unwrap()))
+}
+
 fn resolve_target(host: &str) -> Result<[u8; 4], ClientError> {
     if let Some(ip) = SocketAddrV4::parse_ip(host) {
         return Ok(ip);
@@ -844,39 +1082,57 @@ fn resolve_target(host: &str) -> Result<[u8; 4], ClientError> {
 fn read_version_line(conn: &mut Connection) -> Result<Vec<u8>, ClientError> {
     const MAX_BANNER_LINES: u32 = 100;
     let mut banner_lines = 0u32;
+    let mut line: Vec<u8> = Vec::new();
+    let mut last_activity = now_ms();
     loop {
-        let mut line = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            let n = conn.stream.read(&mut byte)?;
-            if n == 0 {
+        // Drain what we already have before touching the socket: a server
+        // that pipelines its banner/version line (or its version line and
+        // first packet) into one write leaves bytes in `input_buffer`, and
+        // they must survive into `recv_packet` — consume only up to the
+        // first newline here.
+        while !conn.input_buffer.is_empty() {
+            let b = conn.input_buffer.remove(0);
+            if b == b'\n' {
+                let mut l = core::mem::take(&mut line);
+                if l.last() == Some(&b'\r') {
+                    l.pop();
+                }
+                if l.starts_with(b"SSH-") {
+                    return Ok(l);
+                }
+                banner_lines += 1;
+                if banner_lines > MAX_BANNER_LINES {
+                    return Err(ClientError::Msg(String::from(
+                        "too many lines before the SSH version string \u{2014} giving up",
+                    )));
+                }
+                // RFC 4253 §4.2: a server may send other lines (e.g. a
+                // banner) before its version line — print and keep reading.
+                println(&String::from_utf8_lossy(&l));
+            } else {
+                line.push(b);
+                if line.len() > 1024 {
+                    return Err(ClientError::Msg(String::from("version line too long")));
+                }
+            }
+        }
+        let mut buf = [0u8; 4096];
+        match conn.stream.read(&mut buf) {
+            Ok(0) => {
                 return Err(ClientError::Msg(String::from(
                     "connection closed during version exchange",
                 )));
             }
-            if byte[0] == b'\n' {
-                break;
+            Ok(n) => {
+                conn.input_buffer.extend_from_slice(&buf[..n]);
+                last_activity = now_ms();
             }
-            line.push(byte[0]);
-            if line.len() > 1024 {
-                return Err(ClientError::Msg(String::from("version line too long")));
+            Err(e) if e.kind() == NetErrorKind::WouldBlock => {
+                conn.wait_for_handshake_io(last_activity)?;
             }
+            Err(e) if e.kind() == NetErrorKind::Interrupted => continue,
+            Err(e) => return Err(ClientError::from(e)),
         }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.starts_with(b"SSH-") {
-            return Ok(line);
-        }
-        banner_lines += 1;
-        if banner_lines > MAX_BANNER_LINES {
-            return Err(ClientError::Msg(String::from(
-                "too many lines before the SSH version string \u{2014} giving up",
-            )));
-        }
-        // RFC 4253 §4.2: a server may send other lines (e.g. a banner) before
-        // its version line — print them and keep reading.
-        println(&String::from_utf8_lossy(&line));
     }
 }
 

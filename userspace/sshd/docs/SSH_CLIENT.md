@@ -111,6 +111,19 @@ poll loop (`protocol::pump`) mirroring `sshd`'s own `bridge_process`:
 - Unsolicited `SSH_MSG_GLOBAL_REQUEST`s (e.g. a keepalive) get an
   `SSH_MSG_REQUEST_FAILURE` if they asked for a reply, so a long idle
   session doesn't look unresponsive to a peer that probes for one.
+- The connection is kept alive and dead peers are detected: a
+  `keepalive@openssh.com` probe goes out after 15 s of inbound silence
+  (env `SSH_ALIVE_INTERVAL`, seconds, `0` = off) and the session exits with
+  `Timeout, server <host> not responding.` after 3 unanswered probes
+  (env `SSH_ALIVE_COUNT_MAX`). Connect retries 3× with backoff, and the
+  handshake has a 30 s idle / 120 s total deadline instead of blocking
+  forever. Any failure after that — including the keepalive timeout —
+  triggers an automatic reconnect (fresh TCP/KEX/auth/channel, linear
+  backoff capped at 30 s, 10 attempts total): on by default, off via
+  `SSH_AUTO_RECONNECT=0`, count via `SSH_RECONNECT_ATTEMPTS`. The
+  keepalive/reconnect policy math is host-tested in
+  `sshd::client_resilience`. See
+  [`SSH_CLIENT_RESILIENCE.md`](SSH_CLIENT_RESILIENCE.md).
 
 Raw terminal mode (`akuma_terminal::mode_flags::RAW_MODE_ENABLE`) is only
 entered for a `pty` session (i.e. no command given), and is always restored
