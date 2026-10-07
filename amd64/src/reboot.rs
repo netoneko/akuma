@@ -117,12 +117,143 @@ fn spin(iterations: u32) {
     }
 }
 
+/// Who asked for the reset — `reboot-trace` feature, off by default.
+///
+/// A reset is silent: `Ok(Some(Action::Restart))` goes straight to `0xCF9`, the
+/// in-memory `dmesg` ring dies with the machine, and the only evidence left is
+/// the *next* kernel's "software wrote 0xE" line, which names no one. This
+/// records the caller (pid / tgid / name / argv, then each ancestor up to
+/// [`TRACE_DEPTH`]) to the console — so the ring and any serial capture have
+/// it — and appends it to [`TRACE_PATH`] so it survives the reset.
+///
+/// Allocation: none of its own — the line is rendered into a stack buffer and
+/// names are copied out under the `image` lock. `fs::write_file` allocates
+/// inside the VFS; that is one write on a terminal, once-per-boot path and the
+/// feature is a diagnostic build, not a default one. Best-effort: a failed
+/// write is reported on the console and the reset proceeds regardless.
+#[cfg(feature = "reboot-trace")]
+mod trace {
+    use crate::serial;
+
+    pub const TRACE_PATH: &str = "/var/log/reboot-trace.log";
+    const TRACE_DEPTH: usize = 6;
+    const CAP: usize = 768;
+    /// Longest `argv` rendering kept per process.
+    const ARGV_MAX: usize = 96;
+
+    struct Buf {
+        b: [u8; CAP],
+        n: usize,
+    }
+
+    impl Buf {
+        fn push_bytes(&mut self, s: &[u8]) {
+            let room = CAP - self.n;
+            let k = s.len().min(room);
+            self.b[self.n..self.n + k].copy_from_slice(&s[..k]);
+            self.n += k;
+        }
+        fn push_str(&mut self, s: &str) {
+            self.push_bytes(s.as_bytes());
+        }
+        fn push_dec(&mut self, mut v: u64) {
+            let mut tmp = [0u8; 20];
+            let mut i = tmp.len();
+            loop {
+                i -= 1;
+                tmp[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            self.push_bytes(&tmp[i..]);
+        }
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.b[..self.n]).unwrap_or("[reboot-trace] <non-utf8>\n")
+        }
+    }
+
+    fn describe(buf: &mut Buf, p: &akuma_exec::process::Process) {
+        buf.push_str(" pid=");
+        buf.push_dec(u64::from(p.pid));
+        buf.push_str(" tgid=");
+        buf.push_dec(u64::from(p.tgid));
+        buf.push_str(" ppid=");
+        buf.push_dec(u64::from(p.parent_pid));
+        let img = p.image.lock();
+        buf.push_str(" name=");
+        buf.push_str(&img.name);
+        buf.push_str(" argv=");
+        let start = buf.n;
+        for (i, a) in img.args.iter().enumerate() {
+            if i != 0 {
+                buf.push_str(" ");
+            }
+            buf.push_str(a);
+            if buf.n - start >= ARGV_MAX {
+                buf.n = start + ARGV_MAX;
+                buf.push_str("...");
+                break;
+            }
+        }
+    }
+
+    /// `cmd` is the raw `reboot(2)` command word.
+    pub fn record(cmd: u64) {
+        let mut buf = Buf { b: [0; CAP], n: 0 };
+        buf.push_str("[reboot-trace] cmd=");
+        buf.push_dec(cmd);
+        match crate::usermode::current_process() {
+            None => buf.push_str(" caller=<kernel/no process>"),
+            Some(me) => {
+                buf.push_str(" caller:");
+                describe(&mut buf, me);
+                let mut ppid = me.parent_pid;
+                for _ in 0..TRACE_DEPTH {
+                    if ppid == 0 {
+                        break;
+                    }
+                    let Some(par) = akuma_exec::process::lookup_process_shared(ppid) else {
+                        break;
+                    };
+                    buf.push_str("\n[reboot-trace]   <-");
+                    describe(&mut buf, par);
+                    if par.parent_pid == ppid {
+                        break;
+                    }
+                    ppid = par.parent_pid;
+                }
+            }
+        }
+        buf.push_str("\n");
+        serial::puts(buf.as_str());
+
+        // Append: size, then write at the end. A missing file is created.
+        let res = match akuma_vfs_glue::fs::file_size(TRACE_PATH) {
+            Ok(sz) => akuma_vfs_glue::fs::write_at(TRACE_PATH, sz as usize, buf.as_str().as_bytes())
+                .map(|_| ()),
+            Err(_) => akuma_vfs_glue::fs::write_file(TRACE_PATH, buf.as_str().as_bytes()),
+        };
+        if res.is_err() {
+            serial::puts("[reboot-trace] could not write /var/log/reboot-trace.log\n");
+        }
+    }
+}
+
 /// `reboot(magic1, magic2, cmd, arg)` — x86_64 syscall 169.
 ///
 /// `arg` (the `LINUX_REBOOT_CMD_RESTART2` string) is ignored: there is no
 /// bootloader command to hand it to.
 pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> u64 {
-    match decode(magic1 as u32, magic2 as u32, cmd as u32) {
+    let decoded = decode(magic1 as u32, magic2 as u32, cmd as u32);
+    // Only a request that will actually act is worth a record: a rejected or
+    // no-op call neither resets nor halts.
+    #[cfg(feature = "reboot-trace")]
+    if matches!(decoded, Ok(Some(Action::Restart | Action::PowerOff))) {
+        trace::record(cmd);
+    }
+    match decoded {
         Err(_) | Ok(None) => errno::EINVAL,
         Ok(Some(Action::Noop)) => 0,
         Ok(Some(Action::PowerOff)) => {

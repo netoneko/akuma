@@ -38,6 +38,12 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-
 # (`DEFAULT_CACHE_CAP_BYTES`); the kernel never calls `set_cache_cap_bytes`.
 fs-cache = ["akuma-ext2/fs-cache"]
 
+# Record who called `reboot(2)` — pid/tgid/name/argv and the ancestor chain — to
+# the console and `/var/log/reboot-trace.log`, before the reset. OFF by default:
+# it is a diagnostic for "the box reset and nobody knows why" (the next kernel
+# only sees "software wrote 0xE to 0xCF9"). See `amd64/src/reboot.rs`.
+reboot-trace = []
+
 # PMM forensics for the SMP corruption hunt. OFF by default and meant to be
 # turned on for a hunt build, the way `akuma-pmm`'s own `pmm-instr` is.
 #
