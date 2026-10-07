@@ -13,7 +13,7 @@
 #      from Pop's rustup into /mnt/p3/usr/local/rust, and the two musl `.so`
 #      copies lld needs (docs/runbooks/amd64-bare-metal-loop.md, "Four failures");
 #   3. Alpine packages onto p3 with apk-tools-static --root: libgcc git make
-#      patch less + a monospace font for rio;
+#      patch less + a monospace font and an emoji font for rio;
 #   4. the box rig from the clone at /src/github.com/netoneko/akuma:
 #      /etc/akuma-dev.env, /bin/{kbuild,ubuild,mbuild,kinstall}, and the
 #      box-local /root/.cargo/config.toml (lld --threads=1, the host linker);
@@ -50,7 +50,7 @@ if [ ! -x $STAGE/apk.static ]; then
     curl -sS -o $STAGE/apk-static.apk $base/$f
     (cd $STAGE && tar xzf apk-static.apk sbin/apk.static 2>/dev/null; mv sbin/apk.static apk.static)
 fi
-$STAGE/apk.static --root $P --no-scripts --no-cache add libgcc git make patch less font-adobe-source-code-pro
+$STAGE/apk.static --root $P --no-scripts --no-cache add libgcc git make patch less font-adobe-source-code-pro font-noto-emoji
 # Same layout as scripts/benchmarks/ryzen_fc/stage3.sh (the Firecracker guest's
 # image): the loader doubles as libc.so, and the host linker finds both on
 # /usr/lib as well as in lld's own search path.

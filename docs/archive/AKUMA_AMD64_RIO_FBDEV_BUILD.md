@@ -26,7 +26,8 @@ is unaffected):
   falls back to a RAM sink when there is no panel.
 * **sugarloaf fonts**: per-codepoint fontconfig discovery (`font/linux.rs`)
   and the `yeslogic-fontconfig-sys` dep are musl-gated out — no fontconfig on
-  the box. Unmatched codepoints render as tofu. `font-kit` is vendored
+  the box. Unmatched codepoints render as tofu (emoji included: see
+  "Bugs found and fixed" item 6 for the `symbol-map` workaround). `font-kit` is vendored
   (`extra/font-kit`, `[patch.crates-io]`): on musl its `SystemSource` is the
   plain filesystem walk (the code path Android uses), so fonts come from
   whatever is in `/usr/share/fonts` — Alpine packages work (`apk add` a
@@ -136,6 +137,29 @@ still open. All the debug tooling below lives in the rio fork's
    `shell = { program = "/bin/sh" }` in `~/.config/rio/config.toml`
    (which also sets `[fonts] family = "Source Code Pro"`, size 18, from
    `apk add font-adobe-source-code-pro`).
+6. **Emoji render as tofu** (found 2026-10-07 on the ryzen box). Root cause is
+   the one named under "sugarloaf fonts" above: with fontconfig gated out,
+   `FontLibrary::cascade_discover` (`sugarloaf/src/font/mod.rs`) returns `None`
+   on musl, so a codepoint no *registered* font covers is tofu. The box had
+   only Source Code Pro (+ rio's bundled Cascadia Code NF) and no emoji font
+   at all, and no earlier fallback attempt exists in either repo. Fix, config
+   only: `apk add font-noto-emoji` (puts `NotoColorEmoji.ttf`, a **CBDT/CBLC
+   colour-bitmap** font, in `/usr/share/fonts/noto/`) and route the emoji
+   blocks to it in `[fonts]`:
+   `symbol-map = [ { start = "1F000", end = "1FAFF", font-family = "Noto Color Emoji" } ]`
+   (bare hex, parsed by `parse_unicode`). A `symbol-map` hit outranks the
+   primary font, so the range is kept to the emoji blocks; `2600-27BF` is
+   left out because Source Code Pro covers some of it. Staged by
+   `overlays/ryzen/stage-dev.sh` (package) and `misc/akuma/config.toml` in the
+   rio fork (config); applied by hand to the live ryzen box, original saved as
+   `/root/.config/rio/config.toml.bak-emoji`.
+   **NOT verified visually**: the font installs and the config parses
+   (`tomllib`), but nobody has looked at the panel. QEMU cannot show it (the
+   PVH machine has no framebuffer; `fbtrace` only echoes the console). If it
+   still shows tofu, suspect first that rio's swash path does not rasterise
+   CBDT through this wgpu backend, then the family name (`fc-list` is not on
+   the box; the name is the font's name table, "Noto Color Emoji"). Rio must
+   be restarted to pick up the config.
 
 ### Kernel-side findings (for the kernel repo)
 
