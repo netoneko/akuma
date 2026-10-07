@@ -444,9 +444,19 @@ Two synthetic interfaces are reported, matching the one real smoltcp interface
 (`LoopbackAwareDevice` handles both addresses at the device layer, not two
 NICs): `lo` (127.0.0.1/8, fixed) and `eth0` (live IP/netmask/MAC/MTU via
 `akuma_net::smoltcp_net::interface_snapshot()`). `/proc/net/dev`
-(`src/vfs/proc.rs`) reports both with all-zero byte/packet counters — this
-kernel doesn't track per-interface traffic stats, and `0` is what any idle
-interface already shows, not a placeholder.
+(`crates/akuma-vfs-glue/src/proc.rs`, shared with the amd64 kernel) reports real
+bytes, packets and drops per interface since 2026-10-07. Until then every field
+was a literal `0`, so `ifconfig` could not tell a NIC moving nothing from one
+moving thousands of frames a second. The counters are
+`akuma_net::ifstats` (`crates/akuma-net-nic/src/ifstats.rs`): relaxed atomics,
+no allocation, counted in `LoopbackAwareDevice` — the one place every frame
+passes — so virtio, the Realtek and the wifi `Queued` link all get them with no
+per-driver code. `eth0` counts frames the stack received off the wire (after the
+127/8 martian filter, whose drops are `rx drop`) and frames handed to the
+device (`tx drop` is the driver's own refusal, where it reports one); `lo` counts
+the loopback ring, RX and TX equal. The errs/fifo/frame/colls/carrier columns
+are untracked and stay `0`. Verified on the ryzen metal: `ifconfig eth0` went
+from RX 55 / TX 33 packets to RX 99 / TX 72 across one DNS lookup.
 
 `src/syscall/term.rs` dispatches `SIOCGIFCONF` / `SIOCGIFFLAGS` / `SIOCGIFADDR`
 / `SIOCGIFNETMASK` / `SIOCGIFBRDADDR` / `SIOCGIFMTU` / `SIOCGIFHWADDR` to

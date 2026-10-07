@@ -82,6 +82,25 @@ pub struct Interface {
     pub mtu: u32,
     /// `IFF_*` bits.
     pub flags: i16,
+    /// What `/proc/net/dev` reports. Zero until the kernel fills it with
+    /// [`Interface::with_stats`].
+    pub stats: IfStats,
+}
+
+/// One interface's `/proc/net/dev` counters. The columns the kernel does not
+/// track (fifo, frame, compressed, multicast, colls, carrier, errs) stay `0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IfStats {
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_drop: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_drop: u64,
+}
+
+impl IfStats {
+    pub const ZERO: Self = Self { rx_bytes: 0, rx_packets: 0, rx_drop: 0, tx_bytes: 0, tx_packets: 0, tx_drop: 0 };
 }
 
 impl Interface {
@@ -97,6 +116,7 @@ impl Interface {
             mac: [0; 6],
             mtu: 65536,
             flags: iff::LOOPBACK,
+            stats: IfStats::ZERO,
         }
     }
 
@@ -116,7 +136,15 @@ impl Interface {
             mac,
             mtu,
             flags: iff::ETHERNET,
+            stats: IfStats::ZERO,
         }
+    }
+
+    /// This interface with its counters set.
+    #[must_use]
+    pub const fn with_stats(mut self, stats: IfStats) -> Self {
+        self.stats = stats;
+        self
     }
 }
 
@@ -219,10 +247,11 @@ pub fn siocgifconf_capacity(ifaces: &[Interface], cap: usize) -> usize {
 
 /// Write `/proc/net/dev`.
 ///
-/// The header plus one all-zero-counter row per interface, in the exact column
-/// layout `net/core/net-procfs.c` produces (16 numeric fields; this kernel
-/// keeps no per-interface counters, and `0` is what an idle interface shows
-/// anyway).
+/// The header plus one row per interface, in the exact column layout
+/// `net/core/net-procfs.c` produces (16 numeric fields). Bytes, packets and
+/// drops come from [`Interface::stats`]; the other columns are not tracked and
+/// read `0`. `busybox ifconfig` takes its `RX packets:` / `RX bytes:` lines
+/// from here.
 ///
 /// # Errors
 ///
@@ -237,7 +266,8 @@ pub fn write_proc_net_dev<W: Write>(ifaces: &[Interface], w: &mut W) -> core::fm
         writeln!(
             w,
             "{name:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            f.stats.rx_bytes, f.stats.rx_packets, 0, f.stats.rx_drop, 0, 0, 0, 0,
+            f.stats.tx_bytes, f.stats.tx_packets, 0, f.stats.tx_drop, 0, 0, 0, 0
         )?;
     }
     Ok(())
@@ -257,6 +287,24 @@ mod tests {
         let z = Interface::ethernet([1, 2, 3, 4], 0, [0; 6], 1500);
         assert_eq!(z.netmask, [0, 0, 0, 0]);
         assert_eq!(z.broadcast, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn proc_net_dev_prints_the_counters() {
+        let eth = Interface::ethernet([10, 0, 2, 15], 24, [0; 6], 1500).with_stats(IfStats {
+            rx_bytes: 1234, rx_packets: 12, rx_drop: 3, tx_bytes: 5678, tx_packets: 56, tx_drop: 4,
+        });
+        extern crate std;
+        let mut out = std::string::String::new();
+        write_proc_net_dev(&[Interface::loopback(), eth], &mut out).unwrap();
+        let row: std::vec::Vec<&str> = out.lines().nth(3).unwrap().split_whitespace().collect();
+        assert_eq!(row[0], "eth0:");
+        // face: rx bytes packets errs drop fifo frame comp multi | tx bytes packets errs drop ...
+        assert_eq!(&row[1..5], ["1234", "12", "0", "3"]);
+        assert_eq!(&row[9..13], ["5678", "56", "0", "4"]);
+        assert_eq!(row.len(), 17);
+        let lo: std::vec::Vec<&str> = out.lines().nth(2).unwrap().split_whitespace().collect();
+        assert_eq!(&lo[1..3], ["0", "0"]);
     }
 
     #[test]

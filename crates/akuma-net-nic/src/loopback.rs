@@ -403,6 +403,7 @@ impl Device for LoopbackAwareDevice {
                 // slot.
                 let martian = is_loopback_frame(unsafe { core::slice::from_raw_parts(ptr, len) });
                 if !martian {
+                    crate::ifstats::record_wire_rx(len);
                     break FrameSource::External(ptr, len);
                 }
                 MARTIAN_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -485,7 +486,8 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let ring = self.loopback;
-        self.external.emit_frame(len, f, |frame| {
+        let mut looped = false;
+        let res = self.external.emit_frame(len, f, |frame| {
             // Frames addressed to 127.x never reach the wire: copy them into the
             // internal ring, which `receive` drains ahead of the device.
             if !is_loopback_frame(frame) {
@@ -493,8 +495,14 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
             }
             ring.push(frame);
             nicstat::record_loopback(frame.len());
+            crate::ifstats::record_loopback(frame.len());
+            looped = true;
             true
-        })
+        });
+        if !looped {
+            crate::ifstats::record_wire_tx(len);
+        }
+        res
     }
 }
 

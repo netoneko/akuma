@@ -45,6 +45,7 @@ pub use akuma_primitives::safe_print;
 
 pub mod counters;
 pub mod frames;
+pub mod ifstats;
 pub mod nic;
 pub mod nicstat;
 pub mod irq;

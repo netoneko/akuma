@@ -227,6 +227,15 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
   - A join that times out out, or a lost link, forgets the cached scan result
     for that SSID, so the next try rescans instead of going back to the channel
     the AP just left.
+  - **Measured at `smp=8`, 2026-10-07** (ryzen entry 14, kernel with the channel
+    segments): joined and stayed `connected` for 40+ minutes with
+    `failed 0 / retry-limit 0 / dropped 0` on the `[rtw] link:` line. `curl`
+    downloads from the Mac (64 MB files) ran at **~110–125 KB/s in total**,
+    one stream or four (each of four got ~30 KB/s), so the ceiling is the link,
+    not parallelism. It was on channel 1 with `signal=0`; whether the cause is
+    the channel, the channel-1 calibrations or the RX path is untested.
+    Still seen at `smp=8`: `[bkls>]` long holds (owner core 6) and the
+    `max gap 1844…` `now_us` underflow.
   - Known cost: on the odd channels (3, 5, 7, 9, 11, 13) the last poll of the
     segment (register `0xac`, the bit Linux sees set — `0x...8b` vs our `0x...03`)
     times out after 108 ms; RX and the join work regardless. Open: what that

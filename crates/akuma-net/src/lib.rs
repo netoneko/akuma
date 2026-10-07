@@ -32,7 +32,7 @@ pub use akuma_primitives::safe_print;
 // that crate's docs and docs/archive/AKUMA_NET_SPLIT.md §5.1c.
 //
 // Re-exported at the old paths so the kernel's call sites did not move.
-pub use akuma_net_nic::{frames, nic, nicstat, queued};
+pub use akuma_net_nic::{frames, ifstats, nic, nicstat, queued};
 #[cfg(feature = "net-noalloc")]
 pub use akuma_net_nic::virtio_rings;
 

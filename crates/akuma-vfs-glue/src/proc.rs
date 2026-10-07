@@ -1159,16 +1159,17 @@ impl Filesystem for ProcFilesystem {
         // this file to enumerate devices before it can print anything, and its
         // ioctl-based fallback (`SIOCGIFCONF`) is a struct-layout guess this
         // sidesteps entirely. Only `lo` and `eth0` exist (`docs/reference/subsystems/networking.md`);
-        // this kernel doesn't track byte/packet counters per interface, so
-        // every field is `0` — a legitimate value ifconfig already prints for
-        // any idle interface, not a placeholder that reads as broken.
+        // bytes, packets and drops are real since 2026-10-07
+        // (`akuma_net::ifstats`, counted in `LoopbackAwareDevice`); the other
+        // columns are untracked and read `0`.
         if path == "net/dev" {
             // The column layout is `akuma-syscalls-net`, shared with the
-            // `SIOCGIFCONF` path and the amd64 port. Only the names are read
-            // here — this kernel keeps no per-interface counters.
+            // `SIOCGIFCONF` path and the amd64 port. The counters are
+            // `akuma_net::ifstats`, counted where every frame passes.
+            let (lo, wire) = akuma_net::ifstats::snapshot();
             let ifaces = [
-                akuma_syscalls_net::Interface::loopback(),
-                akuma_syscalls_net::Interface::ethernet([0; 4], 0, [0; 6], 0),
+                akuma_syscalls_net::Interface::loopback().with_stats(if_stats(lo)),
+                akuma_syscalls_net::Interface::ethernet([0; 4], 0, [0; 6], 0).with_stats(if_stats(wire)),
             ];
             let mut out = String::new();
             let _ = akuma_syscalls_net::write_proc_net_dev(&ifaces, &mut out);
@@ -1781,5 +1782,17 @@ impl Filesystem for ProcFilesystem {
         }
 
         false
+    }
+}
+
+/// `akuma_net::ifstats` counts into `/proc/net/dev`'s columns.
+fn if_stats(c: akuma_net::ifstats::Counts) -> akuma_syscalls_net::IfStats {
+    akuma_syscalls_net::IfStats {
+        rx_bytes: c.rx_bytes,
+        rx_packets: c.rx_packets,
+        rx_drop: c.rx_drop,
+        tx_bytes: c.tx_bytes,
+        tx_packets: c.tx_packets,
+        tx_drop: c.tx_drop,
     }
 }
