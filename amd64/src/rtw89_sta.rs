@@ -40,7 +40,7 @@
 //! box. The replays themselves are bounded busy stretches (`JOIN1` is the
 //! longest, ~0.2 s).
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use akuma_ieee80211::{beacon, ccmp};
 use akuma_ieee80211::sta::{self, Amsdu, AssocResp, Auth, Data, Goodbye};
@@ -110,6 +110,16 @@ const TX_PER_LAP: usize = akuma_net::queued::SLOTS;
 static STATUS: Spinlock<Option<Status>> = Spinlock::new(None);
 static REQUEST: Spinlock<Option<Command>> = Spinlock::new(None);
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Signature of the access points the last scan printed (see `scan`).
+static LAST_SCAN_SIG: AtomicU32 = AtomicU32::new(0);
+/// Consecutive failed joins. A dark link retries every second; only the 1st,
+/// 2nd, 4th, 8th... attempt is logged, so the lines that came before the loss
+/// stay in the log ring.
+static FAILS: AtomicU32 = AtomicU32::new(0);
+
+fn loud(n: u32) -> bool {
+    n <= 1 || n.is_power_of_two()
+}
 static SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn say(what: &str) {
@@ -272,7 +282,9 @@ extern "C" fn daemon() -> ! {
             None => {
                 st.idle(&mut card);
                 if st.peer.is_none() && st.wanted.is_some() && now_us() >= st.retry_at {
-                    say("rejoining");
+                    if loud(FAILS.load(Ordering::Relaxed)) {
+                        say("rejoining");
+                    }
                     st.join_wanted(&mut card);
                 }
             }
@@ -464,12 +476,22 @@ impl Station {
             nap(POLL_MS);
         }
         card.close_filter();
-        serial::puts("[rtw] scan: ");
-        serial::put_dec(u64::from(beacons));
-        serial::puts(" beacons, ");
-        serial::put_dec(n as u64);
-        serial::puts(" networks\n");
+        // A rejoining station scans every second: the report is printed only
+        // when the set of access points changed, or it fills the log ring and
+        // pushes out whatever made the link drop.
+        let mut sig = n as u32;
         for b in &found[..n] {
+            sig = (sig ^ fnv1a(&b.bssid)).wrapping_mul(0x0100_0193);
+        }
+        let changed = LAST_SCAN_SIG.swap(sig, Ordering::Relaxed) != sig;
+        if changed {
+            serial::puts("[rtw] scan: ");
+            serial::put_dec(u64::from(beacons));
+            serial::puts(" beacons, ");
+            serial::put_dec(n as u64);
+            serial::puts(" networks\n");
+        }
+        for b in found[..n].iter().filter(|_| changed) {
             serial::puts("[rtw]   bss ");
             put_oui(&b.bssid);
             serial::puts(" ch ");
@@ -509,10 +531,20 @@ impl Station {
     fn join_wanted(&mut self, card: &mut Card) {
         let Some(w) = self.wanted else { return };
         match self.join(card, &w.ssid, w.psk.as_ref(), w.bssid) {
-            Ok(()) => self.backoff_ms = REJOIN_FIRST_MS,
+            Ok(()) => {
+                FAILS.store(0, Ordering::Relaxed);
+                self.backoff_ms = REJOIN_FIRST_MS;
+            }
             Err(e) => {
-                serial::puts("[rtw] join failed: ");
-                serial::puts(e.name());
+                let n = FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                let loud = loud(n);
+                if loud {
+                    serial::puts("[rtw] join failed: ");
+                    serial::puts(e.name());
+                    serial::puts(" (consecutive ");
+                    serial::put_dec(u64::from(n));
+                    serial::puts(")");
+                }
                 with_status(|s| {
                     s.link = Link::Failed;
                     s.error = e;
@@ -520,14 +552,20 @@ impl Station {
                     s.chan = 0;
                 });
                 if matches!(e, JoinError::Timeout | JoinError::NotFound) {
-                    serial::puts("; retrying in ");
-                    serial::put_dec(self.backoff_ms / 1000);
-                    serial::puts(" s\n");
+                    if loud {
+                        serial::puts("; retrying in ");
+                        serial::put_dec(self.backoff_ms / 1000);
+                        serial::puts(" s\n");
+                    }
                     self.retry_at = now_us() + self.backoff_ms * 1000;
                     if BACKOFF.load(Ordering::Relaxed) {
                         self.backoff_ms = (self.backoff_ms * 2).min(REJOIN_MAX_MS);
                     }
                 } else {
+                    if !loud {
+                        serial::puts("[rtw] join failed: ");
+                        serial::puts(e.name());
+                    }
                     serial::puts("; not retrying\n");
                     self.wanted = None;
                 }
@@ -865,30 +903,33 @@ impl Station {
         }
         if let Some(reason) = gone {
             say_dec("sent away by the access point, reason", u64::from(reason));
+            link_report(card, &self.stats);
             self.link_lost();
             return;
         }
         if beacon_lost {
             say("beacon loss: the firmware stopped hearing the access point");
+            link_report(card, &self.stats);
             self.link_lost();
             return;
         }
         if let Some(Ok(Action::Complete { len, .. })) = step {
             // Message 3 again: the access point did not get message 4. The
             // keys are the ones already installed; only the answer is resent.
-            if send_eapol(card, peer, &out[..len]).is_ok() {
-                say("eapol: message 3 retransmitted; message 4 sent again");
+            if send_eapol_clear(card, peer, &out[..len]).is_ok() {
+                say("eapol: message 3 retransmitted; message 4 sent again, in the clear");
             }
         }
         if let Some(Ok(Action::Rekey { len, gtk })) = step {
-            // The group key is replayed with `JOIN4` whole — the pairwise key
-            // goes in again unchanged. A group-only segment would be exact;
-            // nobody has cut one from the recording yet.
+            // Only the group half of `JOIN4` is replayed: the pairwise key
+            // and the beacon filter stay as they are.
             if send_eapol(card, peer, &out[..len]).is_ok() {
                 self.vars.gtk = gtk.key;
                 self.vars.gtk_idx = gtk.idx;
-                let _ = card.replay("join4 (group rekey)", script::JOIN4, &self.vars);
+                link_report(card, &self.stats);
+                let _ = card.replay("join4 (group rekey)", script::JOIN4_GROUP, &self.vars);
                 peer.replay.group_rekeyed();
+                link_report(card, &self.stats);
             }
         }
     }
@@ -1101,6 +1142,14 @@ fn send_eapol(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinE
         let bssid = peer.bssid;
         return send_protected(card, peer, &bssid, sta::ETHERTYPE_EAPOL, body);
     }
+    send_eapol_clear(card, peer, body)
+}
+
+/// An EAPOL frame in the clear whatever the key state. A retransmitted message
+/// 4 goes this way: an access point that never got the first one has not
+/// installed the pairwise key (it does so on receiving message 4), so a
+/// protected reply is unreadable to it and it gives up with a deauthentication.
+fn send_eapol_clear(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinError> {
     let mut f = [0u8; sta::QOS_HDR_LEN + 8 + eapol::HDR_LEN + eapol::MAX_KEY_DATA];
     let len = sta::data_frame(&mut f, &peer.bssid, &MAC, &peer.bssid, 7, peer.seq, None, sta::ETHERTYPE_EAPOL, body)
         .ok_or(JoinError::Timeout)?;

@@ -57,6 +57,10 @@ pub static JOIN1: &[u8] = include_bytes!("../seq/join1.seq");
 pub static JOIN2: &[u8] = include_bytes!("../seq/join2.seq");
 pub static JOIN3: &[u8] = include_bytes!("../seq/join3.seq");
 pub static JOIN4: &[u8] = include_bytes!("../seq/join4.seq");
+/// A group rekey: the group half of `JOIN4` (security-CAM entry 1, the DCTL and
+/// ADDR_CAM that carry the group key's id), without the pairwise key or the
+/// beacon filter. Cut from `JOIN4` by `overlays/ryzen/w2-join4-group.py`.
+pub static JOIN4_GROUP: &[u8] = include_bytes!("../seq/join4g.seq");
 
 /// How long a poll may wait before the replay counts it as timed out and goes
 /// on. Linux's longest poll in the recording finishes in under 3 ms.
@@ -662,6 +666,22 @@ mod tests {
         assert_eq!(cam[46] & 0xc0, 2 << 6);
         assert_eq!(dctl_group[30] & 0xc0, 2 << 6);
         assert_eq!(dctl_pair[30] & 0xc0, 0);
+    }
+
+    /// The group rekey segment sends the group key and nothing of the pairwise
+    /// one: three commands, the group key's id in the DCTL and ADDR_CAM.
+    #[test]
+    fn join4_group_is_the_group_half_only() {
+        let v = Vars { mac: [2; 6], bssid: [3; 6], aid: 4, tk: [0x11; 16], gtk: [0x22; 16], gtk_idx: 2 };
+        let cmds = sent(JOIN4_GROUP, &v);
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0].len(), 32);
+        assert_eq!(cmds[0][8], 1); // security-CAM entry 1
+        assert_eq!(&cmds[0][16..32], &v.gtk);
+        assert_eq!(cmds[1][30] & 0xc0, 2 << 6);
+        assert_eq!(cmds[2][46] & 0xc0, 2 << 6);
+        assert!(!cmds.iter().any(|c| c.windows(16).any(|w| w == v.tk)));
+        walk(JOIN4_GROUP);
     }
 
     /// Every command `seq` sends with `v` filled in, built as [`run`] builds

@@ -201,7 +201,7 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 ## Known gaps
 
-- **Channel 1 only** (`rtw89wifi`) (the channel `JOIN1` leaves the card on;
+- **Channel 1 only** (`rtw89wifi`) — **and the home access point moves.** Boot 46 (2026-10-07) scanned for 5 minutes and never saw it: Pop was associated to it on **channel 11** at that moment (it had been on 1 for every earlier boot). An AP that re-picks its channel is the likeliest reading of "wifi goes dark" and of klog-45's `not-found` rejoins. Pinning the router to channel 1 works around it; the real fix is a recorded channel switch (the channel `JOIN1` leaves the card on;
   scanning other channels needs a recorded channel switch). Without
   `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto` says so
   every poll.
@@ -215,8 +215,22 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
   (the PPDU status reports that carry RSSI are not parsed), so `wifi` picks
   among equal-priority networks by order, not strength.
 - **`disconnect` sends no deauthentication**; the access point times the
-  station out. A group rekey replays all of `JOIN4` (the pairwise key goes in
-  again unchanged) until a group-only segment is cut from the recording.
+  station out.
+- **Group rekey** replays `JOIN4_GROUP` (`seq/join4g.seq`, cut from `JOIN4` by
+  `overlays/ryzen/w2-join4-group.py` 2026-10-07): the group key's CAM entry,
+  DCTL and ADDR_CAM, not the pairwise key or the beacon filter. Not yet
+  verified on the metal across a real rekey.
+- **A retransmitted message 4 goes out in the clear** (2026-10-07). Before, it
+  was protected once the pairwise key was in; ryzen boots 34/38/39/44 show the
+  AP resending message 3 three times and then deauthenticating with reason 2.
+  Hypothesis, not yet confirmed on the metal: an AP that missed the first
+  message 4 has not installed the key and cannot read a protected one.
+- **A dark link is logged sparsely.** Scan reports print only when the set of
+  access points changes, and `rejoining` / `join failed` only on the 1st, 2nd,
+  4th, 8th... consecutive failure, so a minute of retries no longer wraps
+  `klog`'s 64 KB ring over the lines that preceded the loss (klog-45 had).
+  `[rtw] link:` is also printed at every rekey, deauthentication and beacon
+  loss. The per-attempt `join2` diff lines are still printed.
 - **No `poll(2)` readiness on `/dev/wifi0`.** The tool polls by reading (100 ms
   steps). Readiness-on-state-change is the natural next step once a real radio
   makes state change asynchronously.
