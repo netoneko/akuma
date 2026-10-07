@@ -57,9 +57,11 @@ pub static JOIN1: &[u8] = include_bytes!("../seq/join1.seq");
 pub static JOIN2: &[u8] = include_bytes!("../seq/join2.seq");
 pub static JOIN3: &[u8] = include_bytes!("../seq/join3.seq");
 pub static JOIN4: &[u8] = include_bytes!("../seq/join4.seq");
-/// A group rekey: the group half of `JOIN4` (security-CAM entry 1, the DCTL and
-/// ADDR_CAM that carry the group key's id), without the pairwise key or the
-/// beacon filter. Cut from `JOIN4` by `overlays/ryzen/w2-join4-group.py`.
+/// A group rekey: the group half of `JOIN4`.
+///
+/// Security-CAM entry 1 and the DCTL and ADDR_CAM that carry the group key's
+/// id, without the pairwise key or the beacon filter. Cut from `JOIN4` by
+/// `overlays/ryzen/w2-join4-group.py`.
 pub static JOIN4_GROUP: &[u8] = include_bytes!("../seq/join4g.seq");
 
 /// One channel switch per 2.4 GHz channel, 1..=13 (`overlays/ryzen/w2-chans.py`
