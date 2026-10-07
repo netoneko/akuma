@@ -467,6 +467,15 @@ single most expensive habit in this loop.
 
 ### Getting the source onto the box
 
+> **The box can only reset to a commit it can fetch** (2026-10-07). `deploy()` picks the newest
+> local commit that exists on *any* remote, so a commit pushed only to the private `litter`
+> remote is chosen, and the box (which fetches `origin` over HTTPS with no credentials) cannot
+> reach it. The reset failed silently, the box stayed 210 commits back, and the patch was applied
+> to that old tree. Two Firecracker runs measured a kernel nobody had written. `deploy()` now
+> refuses when the reset does not land. To carry the commits over, use a bundle:
+> `git bundle create k.bundle HEAD ^<box head>`, copy it with `cat` over ssh, then on the box run
+> `git fetch /tmp/k.bundle HEAD:refs/heads/laptop-head`, and deploy again.
+
 **`hpbox.deploy()`.** One call, and it handles the case that used to need
 judgement — a fix that is neither pushed nor committed:
 

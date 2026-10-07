@@ -400,6 +400,17 @@ def deploy(repo=".", branch=None, timeout=600,
     if rc not in (0, None):
         return rc, f"reset failed: {(out + err).strip()}"
     landed = (out + err).strip().splitlines()[-1] if (out + err).strip() else base[:7]
+    # `git reset` failing does not fail this command (its status is `tail`'s),
+    # so check where the box actually is. The case that bit: `base` existed
+    # only on a remote the box cannot fetch (a private one), the reset said
+    # "unknown revision", the box stayed 210 commits back, and the patch below
+    # — computed against `base` — applied onto that old tree. Two Firecracker
+    # runs then measured a kernel nobody had written (2026-10-07). Carry the
+    # commits over by bundle instead: `git bundle create x HEAD ^<box head>`,
+    # copy, `git fetch x HEAD:refs/heads/laptop-head` on the box.
+    if not landed.startswith(base[:7]):
+        return 1, (f"reset to {base[:7]} did not land (box is at '{landed}'): the box cannot "
+                   f"fetch that commit — bundle it over, see the comment here")
 
     # Everything else: unpushed commits + the working tree, as one patch.
     diff = git("diff", base).stdout
