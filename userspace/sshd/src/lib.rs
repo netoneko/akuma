@@ -18,5 +18,6 @@
 
 extern crate alloc;
 
+pub mod client_resilience;
 pub mod client_wire;
 pub mod wire;
