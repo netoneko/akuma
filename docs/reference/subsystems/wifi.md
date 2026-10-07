@@ -201,10 +201,44 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 ## Known gaps
 
-- **Channel 1 only** (`rtw89wifi`) — **and the home access point moves.** Boot 46 (2026-10-07) scanned for 5 minutes and never saw it: Pop was associated to it on **channel 11** at that moment (it had been on 1 for every earlier boot). An AP that re-picks its channel is the likeliest reading of "wifi goes dark" and of klog-45's `not-found` rejoins. Pinning the router to channel 1 works around it; the real fix is a recorded channel switch (the channel `JOIN1` leaves the card on;
-  scanning other channels needs a recorded channel switch). Without
-  `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto` says so
-  every poll.
+- **2.4 GHz only** (`rtw89wifi`; channels 1–13). **The home access point
+  moves**, and the station follows it (2026-10-07, **verified on the metal**: boot 47's
+  entry 10 swept all 13 channels and heard 24 networks; entry 12 then joined
+  the home AP on **channel 11** on attempt 1, auth and assoc accepted, ssh over
+  wifi, a group rekey ran). Boot 46 scanned for 5 minutes on channel 1 and
+  never saw an AP that Pop was associated to on channel 11; an AP that re-picks
+  its channel is the likeliest reading of "wifi goes dark" and of klog-45's
+  `not-found` rejoins. What exists now:
+  - `crates/akuma-rtw89/seq/chan01..13.seq`: Linux's own `set_channel` for each
+    channel, recorded with `CHAN=1 sh overlays/ryzen/w0-trace.sh` (monitor mode,
+    `iw set channel N`; register-only, no H2C, nothing private) and compiled by
+    `overlays/ryzen/w2-chans.py`. Each segment writes the whole channel state
+    (channel fields, TX power tables, RX gain offsets), not a delta: two walks in
+    different orders ended on the same register values bar a few calibration
+    read-backs, so visit order does not matter. ~13 KB each.
+  - `Station::sweep` listens channel by channel (`SCAN_DWELL_MS` = 300 ms, 600 ms on the first four,
+    ~5 s for all 13) in `script::scan_order`: the network's last channel
+    first (`Wanted::chan`, set on every successful join), then 1, 6, 11, then the
+    rest. A targeted sweep (`find`) stops on the channel it hears the network on.
+    Associated, it listens on the current channel only — leaving it would drop
+    the link.
+  - `attempt` switches to the AP's channel before `JOIN2` and **again after
+    it**: `JOIN2`'s last write to `0x19fe4` puts channel 1 back in that register.
+  - A join that times out out, or a lost link, forgets the cached scan result
+    for that SSID, so the next try rescans instead of going back to the channel
+    the AP just left.
+  - Known cost: on the odd channels (3, 5, 7, 9, 11, 13) the last poll of the
+    segment (register `0xac`, the bit Linux sees set — `0x...8b` vs our `0x...03`)
+    times out after 108 ms; RX and the join work regardless. Open: what that
+    bit is, and whether the other 'differ' checks (calibration read-backs) matter.
+  - Boot 47's entry 10 (one `wifi connect`, no retry) missed the AP at 350 ms
+    dwell although it was at -51 dBm: that is why the first four channels get 600 ms.
+  - Not covered: 5/6 GHz and channel 14. The RF calibrations `JOIN2` carries
+    were recorded on channel 1 and are not redone per channel (Linux's channel
+    segments contain no calibration of their own); whether that costs
+    sensitivity or TX quality on channel 11 is unmeasured until the metal run.
+  Without `rtw89wifi` or `wifisim` there is no `/dev/wifi0`, and `wifi auto`
+  says so every poll.
 - **Rejoin is the kernel's job now** (`rtw89wifi`): after a deauthentication,
   a disassociation or the firmware's beacon-loss report the station rejoins
   the network it was told to join, at once and then every second until

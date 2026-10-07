@@ -5,6 +5,8 @@
 #
 #   sh w0-trace.sh            # detaches itself (systemd-run), returns at once
 #   sh w0-trace.sh --check    # preflight only: changes nothing
+#   CHAN=1 sh w0-trace.sh     # channel switching: monitor mode, `iw set channel`
+#                             # over CHANS (default 1..13), a mark per channel
 #   JOIN=1 sh w0-trace.sh     # stage W3: instead of scan + down, let
 #                             # NetworkManager join its network while tracing
 #
@@ -73,7 +75,7 @@ if [ "${1:-}" != --run ]; then
     preflight
     systemctl reset-failed akuma-w0 2>/dev/null
     systemd-run --unit=akuma-w0 --collect --property=Type=exec \
-        --setenv=JOIN="${JOIN:-0}" --setenv=H2C="${H2C:-1}" /bin/sh "$(readlink -f "$0")" --run \
+        --setenv=JOIN="${JOIN:-0}" --setenv=CHAN="${CHAN:-0}" --setenv=CHANS="${CHANS:-1 2 3 4 5 6 7 8 9 10 11 12 13}" --setenv=H2C="${H2C:-1}" /bin/sh "$(readlink -f "$0")" --run \
         || die "systemd-run failed"
     echo "w0: running as unit akuma-w0; wifi drops now, back in ~1-2 min."
     echo "w0: then: journalctl -u akuma-w0; ls $OUT_ROOT"
@@ -263,7 +265,7 @@ fi
 # every hardware scan timed out (`rtw89_hw_scan_offload failed ret -110`), so
 # NetworkManager never found the network and the JOIN run of 2026-10-06
 # recorded four failed scans and no association.
-if [ "${MMIO:-$([ "${JOIN:-0}" = 1 ] && echo fprobe || echo mmiotrace)}" = fprobe ]; then
+if [ "${MMIO:-$([ "${JOIN:-0}" = 1 ] || [ "${CHAN:-0}" = 1 ] && echo fprobe || echo mmiotrace)}" = fprobe ]; then
     ok=1
     for w in 8 16 32; do
         echo "f:akuma/r$w rtw89_pci_ops_read$w a=addr" >> $T/dynamic_events || ok=0
@@ -298,9 +300,29 @@ log "interface: $NEWIF"
 sleep 1
 
 # 5. Interface up: power on again, MAC init, firmware download, fw ready.
+# CHAN=1 (channel switching): the interface comes up in monitor mode, where
+# `iw set channel` makes mac80211 call rtw89's own set_channel with no
+# association, scan offload or keys involved. Stage "chan" below walks
+# $CHANS (default 1..13) and marks each, so the recording splits per channel.
+if [ "${CHAN:-0}" = 1 ]; then
+    command -v iw >/dev/null || { log "CHAN=1 needs iw"; exit 1; }
+    iw dev $NEWIF set type monitor || { log "monitor mode refused"; exit 1; }
+fi
 mark up
 ip link set dev $NEWIF up || log "link up failed"
 sleep 5
+
+# 6C. CHAN=1: walk the channels. Nothing here is a network name or a key.
+if [ "${CHAN:-0}" = 1 ]; then
+    for c in ${CHANS:-1 2 3 4 5 6 7 8 9 10 11 12 13}; do
+        mark "chan $c"
+        iw dev $NEWIF set channel $c || log "set channel $c failed"
+        sleep 1
+    done
+    mark end
+    sleep 1
+    exit 0
+fi
 
 # 6J. JOIN=1 (stage W3): give the card back to NetworkManager while still
 # tracing, and record it associating with the remembered network: scan,

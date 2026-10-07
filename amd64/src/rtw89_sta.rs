@@ -9,7 +9,7 @@
 //! | step | what | replayed / sent |
 //! |---|---|---|
 //! | start | the post-firmware start and interface setup | `JOIN1` (this station's address filled in) |
-//! | scan | every beacon on the channel for [`SCAN_MS`] | RX filter opened, then put back |
+//! | scan | every beacon, channel by channel, [`SCAN_DWELL_MS`] each | RX filter opened, then put back |
 //! | prepare | coex, RF calibration, channel, the AP's address CAM entry | `JOIN2` |
 //! | authenticate | open system, transaction 1 → 2 | management frame on CH8 |
 //! | associate | request (Linux's own elements for this card) → response, AID | management frame on CH8 |
@@ -60,9 +60,16 @@ use crate::serial;
 /// driver picks one: locally administered, `"AKUMA"` in ASCII after the `02`.
 const MAC: [u8; 6] = [0x02, 0x41, 0x4b, 0x55, 0x4d, 0x41];
 /// The channel `JOIN1` leaves the card on (the recording joined on 1).
-const CHANNEL: u16 = 1;
-/// How long a scan listens: ~24 beacon intervals.
-const SCAN_MS: u64 = 2500;
+const CHANNEL: u8 = 1;
+/// How long a scan listens on each channel, and on the first [`SCAN_LIKELY`]
+/// of them (the network's last channel, then 1, 6, 11 — where an access point
+/// is almost always found): ~3 and ~6 beacon intervals. Frames are lost often
+/// enough that three beacons miss a network (boot 47: an AP at -51 dBm on
+/// channel 11 went unheard at 350 ms). A full sweep is ~5 s; one that finds the
+/// network it came for stops at that channel.
+const SCAN_DWELL_MS: u64 = 300;
+const SCAN_DWELL_LIKELY_MS: u64 = 600;
+const SCAN_LIKELY: usize = 4;
 /// One authentication or association frame's wait for the answer, and how
 /// many times each is sent. Access points answer in milliseconds; on a busy
 /// channel either frame or its answer is lost often enough that one try is
@@ -255,6 +262,7 @@ extern "C" fn daemon() -> ! {
         stats: LinkStats::default(),
         next_report: 0,
         ready: false,
+        chan: CHANNEL,
         peer: None,
         wanted: None,
         retry_at: 0,
@@ -274,7 +282,7 @@ extern "C" fn daemon() -> ! {
         match req {
             Some(Command::Scan { .. }) => st.scan(&mut card),
             Some(Command::Connect { ssid, psk, bssid, .. }) => {
-                st.wanted = Some(Wanted { ssid, psk, bssid });
+                st.wanted = Some(Wanted { ssid, psk, bssid, chan: 0 });
                 st.backoff_ms = REJOIN_FIRST_MS;
                 st.join_wanted(&mut card);
             }
@@ -319,6 +327,10 @@ struct Wanted {
     ssid: Ssid,
     psk: Option<[u8; PSK_LEN]>,
     bssid: Option<Bssid>,
+    /// The channel it was last joined on (0: never): where a rejoin looks
+    /// first, since an access point that re-picks its channel is the usual
+    /// reason a rejoin fails.
+    chan: u8,
 }
 
 /// What the joined link carried, for the periodic `[rtw] link:` line.
@@ -368,6 +380,8 @@ struct Station {
     backoff_ms: u64,
     /// `JOIN1` ran on the card as it stands.
     ready: bool,
+    /// The channel the card is tuned to (`JOIN1` leaves it on [`CHANNEL`]).
+    chan: u8,
     peer: Option<Peer>,
 }
 
@@ -387,6 +401,22 @@ fn security_of(b: &beacon::Bss<'_>) -> Security {
     }
 }
 
+/// Drop every scan result for `ssid`: its access point may have changed
+/// channel, and the next join must look for it rather than trust the last scan.
+fn forget_network(ssid: &Ssid) {
+    with_status(|s| {
+        let (mut k, mut i) = (0, 0);
+        while i < s.nbss {
+            if s.bss[i].ssid != *ssid {
+                s.bss[k] = s.bss[i];
+                k += 1;
+            }
+            i += 1;
+        }
+        s.nbss = k;
+    });
+}
+
 /// Every received 802.11 frame that arrived intact, with its FCS.
 fn frames(card: &mut Card, mut f: impl FnMut(&[u8])) {
     frames_a1(card, |b, _| f(b));
@@ -404,6 +434,23 @@ fn frames_a1(card: &mut Card, mut f: impl FnMut(&[u8], bool)) {
 }
 
 impl Station {
+    /// Tune the card to 2.4 GHz channel `ch` by replaying Linux's switch to it
+    /// (`script::CHAN`), then drop what the RX ring held from the old one.
+    /// `false` for a channel the recordings do not cover, or a replay that
+    /// went wrong.
+    fn set_channel(&mut self, card: &mut Card, ch: u8) -> bool {
+        if ch == self.chan {
+            return true;
+        }
+        let Some(seq) = script::chan(ch) else { return false };
+        if !card.replay("chan (switch)", seq, &self.vars) {
+            return false;
+        }
+        self.chan = ch;
+        frames(card, |_| {});
+        true
+    }
+
     /// Bring the card to "started, not joined": restart it if a join left
     /// state in it (`restart`), then replay `JOIN1`.
     fn start(&mut self, card: &mut Card, restart: bool) -> bool {
@@ -432,6 +479,7 @@ impl Station {
             return false;
         }
         self.ready = true;
+        self.chan = CHANNEL;
         with_status(|s| {
             if s.link == Link::NoRadio {
                 s.link = Link::Down;
@@ -440,9 +488,17 @@ impl Station {
         true
     }
 
-    /// Listen for [`SCAN_MS`] with the RX filter open; the results replace the
-    /// status's.
+    /// Listen on every channel in turn; the results replace the status's.
     fn scan(&mut self, card: &mut Card) {
+        self.sweep(card, None);
+    }
+
+    /// Listen for beacons channel by channel in [`script::scan_order`] — the
+    /// wanted network's last channel first — [`SCAN_DWELL_MS`] each. With a
+    /// `target` the sweep stops on the channel it is heard on. Associated, the
+    /// radio cannot leave the access point's channel without dropping the
+    /// link, so it listens there only.
+    fn sweep(&mut self, card: &mut Card, target: Option<(&Ssid, Option<Bssid>)>) {
         if !self.ready && !self.start(card, true) {
             with_status(|s| s.scans += 1);
             return;
@@ -451,29 +507,51 @@ impl Station {
         if was != Link::Connected {
             with_status(|s| s.link = Link::Scanning);
         }
+        let mut order = [0u8; script::CHAN_COUNT];
+        let mut count = script::scan_order(self.wanted.map_or(0, |w| w.chan), &mut order);
+        if self.peer.is_some() {
+            order[0] = self.chan;
+            count = 1;
+        }
         let mut found = [Bss::EMPTY; MAX_BSS];
         let mut n = 0;
         let mut beacons = 0u32;
+        let mut hit = false;
         card.open_filter();
-        let deadline = now_us() + SCAN_MS * 1000;
-        while now_us() < deadline && !STOP.load(Ordering::Acquire) {
-            frames(card, |f| {
-                let Some(b) = beacon::parse(f, true) else { return };
-                beacons += 1;
-                if found[..n].iter().any(|e| e.bssid == b.bssid) || n >= MAX_BSS {
-                    return;
+        'sweep: for (i, &ch) in order[..count].iter().enumerate() {
+            if STOP.load(Ordering::Acquire) {
+                break;
+            }
+            if !self.set_channel(card, ch) {
+                continue;
+            }
+            let dwell = if i < SCAN_LIKELY { SCAN_DWELL_LIKELY_MS } else { SCAN_DWELL_MS };
+            let deadline = now_us() + dwell * 1000;
+            while now_us() < deadline && !STOP.load(Ordering::Acquire) {
+                frames(card, |f| {
+                    let Some(b) = beacon::parse(f, true) else { return };
+                    beacons += 1;
+                    if found[..n].iter().any(|e| e.bssid == b.bssid) || n >= MAX_BSS {
+                        return;
+                    }
+                    let Some(ssid) = Ssid::new(b.ssid) else { return };
+                    // A beacon names its own channel; a neighbouring one can
+                    // be heard from the next channel over.
+                    found[n] = Bss {
+                        ssid,
+                        bssid: b.bssid,
+                        chan: b.channel.map_or(u16::from(ch), u16::from),
+                        signal: 0,
+                        security: security_of(&b),
+                    };
+                    hit |= target.is_some_and(|(t, want)| *t == ssid && want.is_none_or(|w| w == b.bssid));
+                    n += 1;
+                });
+                if hit {
+                    break 'sweep;
                 }
-                let Some(ssid) = Ssid::new(b.ssid) else { return };
-                found[n] = Bss {
-                    ssid,
-                    bssid: b.bssid,
-                    chan: b.channel.map_or(CHANNEL, u16::from),
-                    signal: 0,
-                    security: security_of(&b),
-                };
-                n += 1;
-            });
-            nap(POLL_MS);
+                nap(POLL_MS);
+            }
         }
         card.close_filter();
         // A rejoining station scans every second: the report is printed only
@@ -522,7 +600,7 @@ impl Station {
         if let Some(b) = look() {
             return Some(b);
         }
-        self.scan(card);
+        self.sweep(card, Some((ssid, bssid)));
         look()
     }
 
@@ -534,6 +612,10 @@ impl Station {
             Ok(()) => {
                 FAILS.store(0, Ordering::Relaxed);
                 self.backoff_ms = REJOIN_FIRST_MS;
+                let chan = STATUS.lock().as_ref().map_or(0, |s| s.chan);
+                if let (Some(w), Ok(c)) = (self.wanted.as_mut(), u8::try_from(chan)) {
+                    w.chan = c;
+                }
             }
             Err(e) => {
                 let n = FAILS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -578,6 +660,11 @@ impl Station {
     /// running card (`JOIN2`..`JOIN4` overwrite the old peer's entries).
     fn link_lost(&mut self) {
         self.peer = None;
+        // The access point may have moved: the cached scan result would send
+        // the rejoin to the channel it just left. Rescan, hint channel first.
+        if let Some(w) = self.wanted {
+            forget_network(&w.ssid);
+        }
         LINK.flush_transmit();
         LINK.link_changed();
         self.retry_at = now_us();
@@ -629,6 +716,7 @@ impl Station {
                 Err(e) => return Err(e),
             }
         }
+        forget_network(ssid);
         Err(last)
     }
 
@@ -644,8 +732,20 @@ impl Station {
         }
         self.vars.bssid = bss.bssid;
         self.vars.aid = 0;
+        let chan = u8::try_from(bss.chan).ok().filter(|c| script::chan(*c).is_some()).ok_or(JoinError::Unsupported)?;
+        if !self.set_channel(card, chan) {
+            return Err(JoinError::Timeout);
+        }
         if !card.replay("join2 (prepare)", script::JOIN2, &self.vars) {
             return Err(JoinError::Timeout);
+        }
+        if chan != CHANNEL {
+            // `JOIN2`'s last write to 0x19fe4 puts channel 1 back in that one
+            // register: switch again, from the card's point of view.
+            self.chan = CHANNEL;
+            if !self.set_channel(card, chan) {
+                return Err(JoinError::Timeout);
+            }
         }
 
         // Authentication: open system, transaction 1, answered by 2.

@@ -62,6 +62,65 @@ pub static JOIN4: &[u8] = include_bytes!("../seq/join4.seq");
 /// beacon filter. Cut from `JOIN4` by `overlays/ryzen/w2-join4-group.py`.
 pub static JOIN4_GROUP: &[u8] = include_bytes!("../seq/join4g.seq");
 
+/// One channel switch per 2.4 GHz channel, 1..=13 (`overlays/ryzen/w2-chans.py`
+/// from a `CHAN=1 w0-trace.sh` run: Linux in monitor mode, `iw set channel N`).
+///
+/// Register-only (no H2C, nothing private), and each writes the whole channel
+/// state — the channel fields (`0x1e060`/`0x1f060`, `0x10734`, `0xd2ec`/`0xd314`,
+/// `0x19fe4`), the TX power tables at `0x1c1f8..0x1c24c`, the RX gain offsets —
+/// rather than a delta, so the order channels are visited in does not matter
+/// (two walks in different orders ended on the same register values, bar a few
+/// calibration read-backs). `JOIN1` leaves the card on channel 1; `JOIN2`'s
+/// last write to `0x19fe4` puts channel 1 back in that one register, so a join
+/// on another channel replays its switch again after `JOIN2`.
+pub static CHAN: [&[u8]; CHAN_COUNT] = [
+    include_bytes!("../seq/chan01.seq"),
+    include_bytes!("../seq/chan02.seq"),
+    include_bytes!("../seq/chan03.seq"),
+    include_bytes!("../seq/chan04.seq"),
+    include_bytes!("../seq/chan05.seq"),
+    include_bytes!("../seq/chan06.seq"),
+    include_bytes!("../seq/chan07.seq"),
+    include_bytes!("../seq/chan08.seq"),
+    include_bytes!("../seq/chan09.seq"),
+    include_bytes!("../seq/chan10.seq"),
+    include_bytes!("../seq/chan11.seq"),
+    include_bytes!("../seq/chan12.seq"),
+    include_bytes!("../seq/chan13.seq"),
+];
+/// How many channels [`CHAN`] holds (2.4 GHz, 1 to 13).
+pub const CHAN_COUNT: usize = 13;
+
+/// The switch to 2.4 GHz channel `ch`, or `None` outside 1..=13.
+#[must_use]
+pub fn chan(ch: u8) -> Option<&'static [u8]> {
+    CHAN.get(usize::from(ch).wrapping_sub(1)).copied()
+}
+
+/// The order a scan or a rejoin tries channels in.
+///
+/// The channel the network was last on (`hint`, 0 for none) first, then 1, 6 and 11 — what a router's
+/// auto-select picks from, so where an access point that re-picks its channel
+/// usually lands — then the rest, in order. Fills `out` and returns how many
+/// channels it holds (always [`CHAN_COUNT`]); each channel appears once.
+pub fn scan_order(hint: u8, out: &mut [u8; CHAN_COUNT]) -> usize {
+    let mut n = 0;
+    let mut put = |ch: u8| {
+        if chan(ch).is_some() && !out[..n].contains(&ch) {
+            out[n] = ch;
+            n += 1;
+        }
+    };
+    put(hint);
+    for ch in [1, 6, 11] {
+        put(ch);
+    }
+    for ch in 1..=CHAN_COUNT as u8 {
+        put(ch);
+    }
+    n
+}
+
 /// How long a poll may wait before the replay counts it as timed out and goes
 /// on. Linux's longest poll in the recording finishes in under 3 ms.
 pub const POLL_BUDGET_US: u32 = 50_000;
@@ -461,6 +520,55 @@ mod tests {
 
     extern crate std;
     use std::vec::Vec;
+
+    /// Every channel segment is well-formed, ends where its stream ends, has no
+    /// H2C (so nothing private can be in it), and leaves the channel number in
+    /// the one register that carries it in the clear (`0x1e060` low byte, as
+    /// `0x0c00 | channel`).
+    #[test]
+    fn channel_segments_are_register_only_and_name_their_channel() {
+        for ch in 1..=CHAN_COUNT as u8 {
+            let b = chan(ch).unwrap();
+            let (mut i, mut last) = (0usize, None);
+            loop {
+                let op = b[i];
+                i += 1;
+                let w = [0, 1, 2, 4][usize::from(op & 3)];
+                match op & 0xf0 {
+                    0x00 if op == 0 => break,
+                    0x00 => {
+                        let off = u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+                        let v = b[i + 4..i + 4 + w].iter().rev().fold(0u32, |a, x| a << 8 | u32::from(*x));
+                        if off == 0x1e060 {
+                            last = Some(v);
+                        }
+                        i += 4 + w;
+                    }
+                    0x10 => i += 4 + w,
+                    0x20 => i += 4 + 2 * w,
+                    0x30 => i += 4,
+                    other => panic!("channel {ch}: op {op:#x} ({other:#x}) at {i}"),
+                }
+            }
+            assert_eq!(i, b.len(), "channel {ch}: trailing bytes");
+            assert_eq!(last, Some(0x0c00 | u32::from(ch)), "channel {ch}");
+        }
+        assert!(chan(0).is_none() && chan(14).is_none());
+    }
+
+    #[test]
+    fn scan_order_tries_the_hint_then_the_usual_three_then_the_rest() {
+        let mut o = [0u8; CHAN_COUNT];
+        assert_eq!(scan_order(0, &mut o), CHAN_COUNT);
+        assert_eq!(o, [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13]);
+        assert_eq!(scan_order(11, &mut o), CHAN_COUNT);
+        assert_eq!(o, [11, 1, 6, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13]);
+        assert_eq!(scan_order(9, &mut o), CHAN_COUNT);
+        assert_eq!(o[..4], [9, 1, 6, 11]);
+        // A hint outside the table (5 GHz, 14, junk) is ignored.
+        assert_eq!(scan_order(36, &mut o), CHAN_COUNT);
+        assert_eq!(o[..3], [1, 6, 11]);
+    }
 
     #[test]
     fn writes_checks_polls_delays_and_h2c() {

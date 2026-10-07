@@ -69,6 +69,7 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | `w0-trace.sh [--check]` | ryzen, root | wifi **W0**: mmiotrace of rtw89 unbind → bind → up → one scan, to `/var/tmp/akuma-w0/<stamp>/`. Detaches into unit `akuma-w0` (drops Pop's wifi ~1–2 min, takes all CPUs but one offline while tracing); NetworkManager is kept off the card so no association or keys enter the trace; every exit path restores the network. `--check` changes nothing |
 | `w2-merge.py <run> [--phase P] [--collapse] [--no-fwdl] [--ts]` | laptop | a W2 run's register accesses, H2Cs and C2Hs in one ordered stream (each H2C anchored to its CH12 doorbell) |
 | `w2-seqgen.py <merged> <out.seq> [--from-fw-ready] [--until-stop] [--mac M]` | laptop | compiles a merged recording into the op stream `akuma_rtw89::script` replays (`crates/akuma-rtw89/seq/up.seq`) |
+| `CHAN=1 sh w0-trace.sh` / `w2-chans.py <run> <seqdir>` | ryzen root / laptop | records Linux switching channels 1–13 (monitor mode, `iw set channel`; `CHANS="13 1 6"` picks and orders them; drops Pop's wifi ~1 min) and compiles one `chanNN.seq` per channel |
 | `w0-summary.py <trace> [--dump PHASE]` | laptop | per-phase read/write counts and busiest BAR offsets of a W0 trace; `--dump bind` prints the ordered sequence |
 | `grub.cfg` | — | the menu (5 s), below |
 | `remove.list` | — | paths deleted from the image: the framebuffer `console` service (not wanted here) |
