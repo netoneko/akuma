@@ -81,8 +81,23 @@ amd64 kernel under Firecracker too. Four fixes got it there:
 The 1324 GiB reservation works, but costs about 290 ms against Linux's 0.5 ms,
 nearly all of it in `munmap`.
 
-Not yet run on Akuma: Chromium itself. That is step 3, a `--headless
---screenshot` smoke test in the Firecracker guest.
+Two more fixes came from Chromium's first run on Akuma (2026-10-08):
+`setsockopt` on a unix fd was `ENOTSOCK` on amd64, and crashpad
+`CHECK`-crashed on it; and `execve("/proc/self/exe")` recorded that literal
+path as the new image's name.
+
+**Chromium on Akuma does not render a page yet.** It starts under Firecracker
+and gets well into startup. The blockers are, in order:
+
+1. `execve` copies the whole 250 MB binary into the kernel heap on every
+   re-exec. It needs a streaming loader; a ≥ 8 GiB guest gets a 1 GiB heap
+   and gets past this.
+2. crashpad's `posix_spawn` fails `ENOENT`.
+3. The ProcessSingleton `mkdtemp` fails.
+4. Zygote children cannot load the V8 snapshot.
+
+Full record:
+[`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`](../../docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md).
 
 ## Future: kami in a rio split pane
 
