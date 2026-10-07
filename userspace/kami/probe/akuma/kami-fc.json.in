@@ -1,0 +1,6 @@
+{
+  "boot-source": { "kernel_image_path": "@KERNEL@", "boot_args": "init=/bin/busybox initargs=sh,/@SCRIPT@" },
+  "drives": [{"drive_id":"rootfs","path_on_host":"@IMG@","is_root_device":false,"is_read_only":false}],
+  "network-interfaces": [],
+  "machine-config": { "vcpu_count": @VCPUS@, "mem_size_mib": @MEM@ }
+}

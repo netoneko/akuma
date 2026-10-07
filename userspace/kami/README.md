@@ -99,6 +99,21 @@ and gets well into startup. The blockers are, in order:
 Full record:
 [`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`](../../docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md).
 
+## Running Chromium on Akuma (`probe/akuma/`)
+
+The rig that runs Alpine's Chromium on the amd64 kernel under Firecracker, on
+the trashcan:
+
+- `push.sh` (laptop) builds the static probes and copies the scripts to
+  `/root/cdp-probe/akuma/`.
+- `mkimg.sh` builds the 2 GiB ext2 image from `probe/Dockerfile`.
+- `run-fc.sh` boots a copy of it with `kami-smoke.sh` as the init script and
+  dumps any screenshot into `out/`.
+
+Details are in the scripts' headers and in
+[`docs/handoff-kernel-chromium-support.md`](../../docs/handoff-kernel-chromium-support.md),
+which is also where the remaining kernel work is laid out.
+
 ## Future: kami in a rio split pane
 
 The goal is to run `kami` inside one of [rio](../rio/build.sh)'s split

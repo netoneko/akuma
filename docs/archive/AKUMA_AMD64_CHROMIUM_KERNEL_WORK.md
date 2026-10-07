@@ -118,7 +118,10 @@ commits over with `git bundle`.
 ## Still open: what Chromium hit on Akuma
 
 Chromium was run under Firecracker on an ext2 image built from the same
-Alpine container, with `init=/bin/busybox initargs=sh,<script>`. It starts and
+Alpine container, with `init=/bin/busybox initargs=sh,<script>`. The rig is
+`userspace/kami/probe/akuma/` (`push.sh`, `mkimg.sh`, `run-fc.sh`,
+`kami-smoke.sh`); probes `exeprobe.c` and `shmvar.c` are beside
+`chromeprobe.c`. It starts and
 gets well into browser startup, then:
 
 - **`execve` reads the whole executable into the kernel heap.** Chromium is
