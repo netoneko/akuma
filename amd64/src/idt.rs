@@ -1976,8 +1976,12 @@ extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         // returns, so killing while still holding the bracket above would leave
         // the lock one level deep for the rest of the boot — the task unwinds
         // into `run_process`, which expects to hold it exactly once.
-        if let crate::signal::TickOutcome::Fatal(sig) = outcome {
-            crate::signal::kill_current_from_tick(sig);
+        match outcome {
+            crate::signal::TickOutcome::Fatal(sig) => crate::signal::kill_current_from_tick(sig),
+            crate::signal::TickOutcome::Exit(status) => {
+                crate::usermode::leave_current_from_tick(status)
+            }
+            _ => {}
         }
     }
     // **ITIMER_REAL / `alarm` expiry** (C3, 2026-09-12). Ungated by

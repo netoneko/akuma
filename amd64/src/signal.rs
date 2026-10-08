@@ -825,6 +825,11 @@ pub enum TickOutcome {
     /// This signal's default action terminates the process — **after** the
     /// caller releases the BKL.
     Fatal(u32),
+    /// The thread's group is exiting and this thread has no syscall to leave
+    /// through: leave from the tick with this exit value — **after** the
+    /// caller releases the BKL, like [`TickOutcome::Fatal`]. For a non-main
+    /// thread the value is unused; for the leader it is the group's status.
+    Exit(u64),
 }
 
 /// Leave ring 3 because a tick found a fatal default. Separate from
@@ -839,6 +844,30 @@ pub fn deliver_pending_on_tick(
     regs: &mut crate::idt::TrapRegs,
 ) -> TickOutcome {
     let tid = threading::current_thread_id();
+    // **A group exit reaches a compute loop here, or nowhere.** `exit_group`
+    // (and a sibling's fatal signal) are read at syscall return
+    // (`deliver_pending`'s `group_exit_status` check, `should_leave_now` at
+    // syscall entry); a thread spinning in ring 3 with no syscall in it never
+    // gets there, which `crate::thread::drain` documented as "a real gap":
+    // the drain spun out its budget, printed `DRAIN INCOMPLETE … the reaper
+    // may free a live address space`, and meant it. Measured 2026-10-09 by
+    // `killtree`'s bystander — `_exit(0)` with a spinning worker — as the one
+    // `DRAIN INCOMPLETE` left after `kill(2)` stopped hard-killing. The tick
+    // is the one place that reaches such a thread, and it already leaves
+    // from here for a fatal signal; this is the same exit for a group exit.
+    let slot = crate::usermode::current_proc_slot();
+    if let Some(status) = crate::thread::group_exit_status(slot) {
+        // Same decode as `deliver_pending`: sign first, then the code flag.
+        let value = if status.cast_signed() >= 0 && status & crate::thread::GROUP_EXIT_CODE_FLAG != 0 {
+            u64::from(status & 0xff)
+        } else {
+            signal_status(status.cast_signed().wrapping_neg() as u32)
+        };
+        return TickOutcome::Exit(value);
+    }
+    if crate::thread::should_leave_now() {
+        return TickOutcome::Exit(0);
+    }
     if threading::pending_signals_raw(tid) == 0 {
         return TickOutcome::Unchanged;
     }

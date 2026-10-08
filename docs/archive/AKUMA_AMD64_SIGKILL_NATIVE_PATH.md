@@ -176,6 +176,59 @@ in a VM in under ten minutes.
   `kill(pid, 0)` on the zombie `0`, `kill(-pid, 0)` on the empty group
   `ESRCH`, and no leaked frame.
 
+### 5.1 Two more, found by the boot check on its first run
+
+The first boot of the fixed kernel printed `738 passed, 5 FAILED`, all five
+in `kill:`, and the five together named two defects on the same path:
+
+- **`notify_group_of_thread_fatal` re-entered the hard path.** A sibling
+  that takes a fatal signal tells the leader through `deliver_signal(tgid,
+  sig)` — and for SIGKILL that is `kill_thread_group` again, through a door
+  `sys_kill` no longer used. The two `FUTEX_WAIT` parkers took SIGKILL
+  first, notified, and the leader was hard-terminated from a parker's core:
+  `no thread was terminated by a peer: got 0xa want 0x8`, `every thread row
+  came back: got 0x2`, and the second not gone inside a second (the grace).
+  It pends now (`pend_signal_to_group`).
+- **A signal death read as an exit code.** `GROUP_EXIT_STATUS` carries
+  either `-(sig)` or `GROUP_EXIT_CODE_FLAG | code`, with the flag at bit 30;
+  `deliver_pending` tested the flag alone, and bit 30 is set in every
+  negative word, so `-9` became `exit_group(0xf7)`: `the status is a SIGKILL
+  death: got 0xf7 want 0xfffffffffffffff7`. The same misread turns a
+  SIGTERMed group into exit **241** — the number kami's daemon logged as
+  "chromium exited: exit status: 241" (recorded in `userspace/kami/README.md`
+  as unexplained) and the number `AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`
+  chased to a different, also real, cause. The sign is tested first now.
+- The fifth was the test's own expectation: Linux keeps a zombie in its
+  process group until it is reaped, so `kill(-pgid, 0)` is `0` before the
+  reap and `ESRCH` after. The check now asserts both.
+
+### 5.2 The one the hard kill had been hiding on both kernels
+
+With the boot check green, `killtree` at 8 vCPUs still left **one thread per
+process** behind (`[thread] DRAIN INCOMPLETE: 1 thread(s) still live`), and
+the first round's browser was never reaped. Eight blocking families, one
+survivor: the `AF_UNIX` `recvmsg` worker. Every untimed park in
+`akuma-syscalls-glue/src/unixsock.rs` — `accept`, the three send paths, the
+receive, and the no-table-entry pipe read — went straight to
+`park_indefinitely` without asking `should_interrupt_blocking_syscall`,
+which is the one hook a pended signal has to break a wait: the pend wakes
+the thread, the loop sees no data, and it parks again. Every other family
+(`futex`, `epoll`, `ppoll`, pipe `read`, `nanosleep`, the pty) had the
+check; this is the family `KTG_GRACE_EXPIRY_KILL_INTERRUPT.md`'s 2026-08-30
+sweep missed, invisible on AArch64 because the grace-expiry hard kill took
+the thread out 2 s later. Fixed by the same `EINTR`-before-park the others
+use (`unixsock.rs`, six sites). This one is **shared**, so it changes
+AArch64 too: a Chromium-shaped process parked in `AF_UNIX` now dies in
+milliseconds there instead of two seconds.
+
+Also found: the probe's "`kill -9 <thread tid>`" mode is Linux-only. On
+amd64 `gettid()` is the task slot — a number space disjoint from pids — so
+`kill(tid, 9)` addresses whatever *process* carries that pid (round 3 of
+the first fixed run most likely killed the bystander or the probe itself,
+which then waited forever on its pipe). The probe skips that mode when the
+main thread's `gettid()` is not its `getpid()`; the tid/pid namespace is an
+open item in `docs/handoff-kernel-chromium-support.md` and stays open.
+
 Allocations on the new paths: none. `sys_kill`'s group walk is a stack array;
 `wake_group`'s scan writes nothing but `None` into existing rows.
 
@@ -191,7 +244,31 @@ Allocations on the new paths: none. `sys_kill`'s group walk is a stack array;
 | `killtree`, 8 vCPUs, 40 rounds / 4 vCPUs, 12 rounds | below |
 | `chrome-once.sh` (Chromium still renders) / `probes.sh` | below |
 
-VERIFICATION_TABLE
+| run (Firecracker/KVM on the trashcan, kernel at the commit after `2ea12fb2`) | result |
+|---|---|
+| standard image boot, 2 vCPUs | **744 passed, 0 failed** (11 new `kill:` checks; the suite was 733) |
+| standard image boot, 4 vCPUs | **744 passed, 0 failed** |
+| `killtree 40 0`, **8 vCPUs** (the configuration that wedged the unfixed kernel in round 22) | **PASS, 40 rounds**: `kill -9` of a threaded process reaps in **85–102 ms** (was 2078–6463 ms), a three-process tree in **85–400 ms** (was 6.1 s; 400 ms is the SIGTERM mode's own sleep), bystander errors 0, zero `[kill]` cross-core terminations, zero `[BKL] stuck`, zero `thread table full`. One `DRAIN INCOMPLETE: 1 thread(s)` at the very end — the bystander's `_exit(0)` with a thread in a syscall-free loop, the gap §5.3 closes; its verification run is pending |
+| `killtree 12 0`, 4 vCPUs / `chrome-once.sh` (Chromium still renders) / `probes.sh` | pending at the time of writing — the chain was running; see the follow-up commit |
+| negative control (old `Syscall::Kill => to_glue` arm restored, everything else kept) | pending — expected: the `kill:` checks fail as they did on the first boot (§5.1) |
+| the first fixed kernel, before §5.1 (for the record) | 738 passed, **5 failed**, all `kill:` — the two defects §5.1 names |
+
+### 5.3 The compute loop at `exit_group`
+
+The last `DRAIN INCOMPLETE` left was not a kill at all: the bystander's main
+thread `_exit(0)`s while its spinner is in a loop with no syscall, and
+`exit_group` reaches a sibling only at syscall entry (`should_leave_now`) or
+at syscall return (`deliver_pending`'s group-status check) — never on the
+tick, which is the one place such a thread can be reached, and where a
+*fatal signal* already leaves from. `signal::deliver_pending_on_tick` now
+answers `TickOutcome::Exit` when the group is exiting (a non-main thread with
+`should_leave_now`, or any thread with a `group_exit_status`, decoded as
+`deliver_pending` decodes it), and `timer_dispatch` leaves through
+`usermode::leave_current_from_tick` — the same unwind as a fault kill without
+the group notification. `crate::thread::drain`'s "a real gap" note is closed
+by it, for both `exit_group` and a sibling's fatal signal reaching a leader
+that computes.
+
 
 ## 7. Not verified, and what to do
 

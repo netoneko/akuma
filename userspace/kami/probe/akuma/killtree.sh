@@ -14,3 +14,5 @@ echo "== killtree exit status $?"
 dmesg > /tmp/dmesg.txt 2>&1
 sync
 echo "== killtree done"
+# Power the guest off so run-fc.sh returns now rather than at its timeout.
+/bin/busybox poweroff -f

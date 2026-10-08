@@ -681,6 +681,19 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
                 if nonblock_fd {
                     return EAGAIN;
                 }
+                // **Every untimed park in this file asks this first** (2026-10-09).
+                // A pended signal wakes the parked thread (`pend_signal_for_thread`
+                // → `wake`), but a loop that re-checks only its own condition
+                // parks again and never reaches the syscall return where the
+                // signal is acted on. On AArch64 `kill_thread_group`'s 2 s
+                // grace-expiry hard kill hid that for this family; amd64 has no
+                // hard kill (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`),
+                // and `killtree`'s AF_UNIX worker was the one thread per process
+                // that survived a `kill -9` (`DRAIN INCOMPLETE: 1 thread(s)`).
+                // `EINTR` here is what every other blocking family returns.
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
+                    return EINTR;
+                }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !accept_wait_slot(listener, tid) {
                     akuma_exec::threading::park_indefinitely();
@@ -984,6 +997,9 @@ pub fn unix_send_anc(fd: u32, data: &[u8], dontwait: bool, mut anc: InFlight) ->
                 if nonblock {
                     return EAGAIN;
                 }
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
+                    return EINTR;
+                }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_writer(tx, tid) {
                     akuma_exec::threading::park_indefinitely();
@@ -1095,6 +1111,9 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool, mut anc: InFlight) 
                 if nonblock {
                     return EAGAIN;
                 }
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
+                    return EINTR;
+                }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_writer(queue, tid) {
                     akuma_exec::threading::park_indefinitely();
@@ -1127,6 +1146,9 @@ fn pipe_write_bytes(tx: u32, data: &[u8], nonblock: bool) -> u64 {
             Ok(0) => {
                 if nonblock {
                     return EAGAIN;
+                }
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
+                    return EINTR;
                 }
                 let tid = akuma_exec::threading::current_thread_id();
                 if !super::pipe::pipe_check_set_writer(tx, tid) {
@@ -1255,6 +1277,10 @@ pub fn unix_recv_anc(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u6
         if nonblock {
             return (EAGAIN, false, Vec::new(), None);
         }
+        // See the accept loop: a kill lands here as a wake, not as data.
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
+            return (EINTR, false, Vec::new(), None);
+        }
         let tid = akuma_exec::threading::current_thread_id();
         if !super::pipe::pipe_check_set_reader(rx, tid) {
             akuma_exec::threading::park_indefinitely();
@@ -1278,6 +1304,9 @@ fn pipe_read_bytes(rx: u32, buf: &mut [u8], nonblock: bool) -> u64 {
         }
         if nonblock {
             return EAGAIN;
+        }
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
+            return EINTR;
         }
         let tid = akuma_exec::threading::current_thread_id();
         if !super::pipe::pipe_check_set_reader(rx, tid) {

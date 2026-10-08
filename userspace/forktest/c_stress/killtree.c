@@ -459,11 +459,21 @@ int main(int argc, char **argv)
             break;
         default: {
             /* `kill -9` addressed at a worker thread of the zygote: on Linux
-             * a thread id is a valid kill() target and takes the whole group. */
+             * a thread id is a valid kill() target and takes the whole group.
+             * Only where tids and pids share a namespace: on Akuma/amd64
+             * `gettid()` is the kernel task slot, a different number space,
+             * so `kill(tid)` would land on whatever process has that pid —
+             * the bystander, or this probe. Detected by the main thread's
+             * own tid, which equals its pid on Linux. */
             int w = (round / 4) % WORKERS;
-            how = "SIGKILL a zygote worker tid";
-            if (do_kill(recs[1].tids[w], SIGKILL, WORK_NAME[w]) < 0)
+            if ((int)syscall(SYS_gettid) != getpid()) {
+                how = "SIGKILL a worker tid (SKIPPED: tid != pid space)";
                 do_kill(recs[1].pid, SIGKILL, "zygote");
+            } else {
+                how = "SIGKILL a zygote worker tid";
+                if (do_kill(recs[1].tids[w], SIGKILL, WORK_NAME[w]) < 0)
+                    do_kill(recs[1].pid, SIGKILL, "zygote");
+            }
             /* and the rest of the tree, as kami would */
             do_kill(browser, SIGKILL, "browser");
             do_kill(recs[2].pid, SIGKILL, "renderer");

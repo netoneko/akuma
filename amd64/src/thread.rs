@@ -238,14 +238,13 @@ pub fn current_is_main() -> bool {
 /// A non-main thread whose group has been told to exit should leave ring 3 at
 /// its next syscall rather than run on in an address space about to be freed.
 ///
-/// Checked at syscall entry, which is the only place a thread reliably passes
-/// through. A thread in an unbounded compute loop with no syscall in it is
-/// therefore not reachable — a real gap, and the reason [`drain`] is a bounded
-/// wait rather than a guarantee.
-///
-/// The reason used to be "this target has no signals"; it now delivers them
-/// (`crate::signal`) and the gap is unchanged, because delivery is *also* at a
-/// syscall return and not on the LAPIC tick's `iretq`. Closing one closes both.
+/// Checked at syscall entry, which is where a thread that makes syscalls
+/// passes through, **and on the timer tick** since 2026-10-09
+/// (`signal::deliver_pending_on_tick` → `TickOutcome::Exit`), which is the
+/// only place a thread in a syscall-free compute loop can be reached. Until
+/// then such a thread was unreachable — "a real gap", and the reason
+/// [`drain`] is a bounded wait rather than a guarantee; the bound stays, as
+/// the backstop for anything else that goes wrong on the way out.
 #[must_use]
 pub fn should_leave_now() -> bool {
     if current_is_main() {

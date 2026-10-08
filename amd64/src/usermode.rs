@@ -849,7 +849,25 @@ pub fn kill_current_from_fault(sig: u32) -> ! {
     // out of ring 3 by default action must not just kill itself, or the leader
     // runs on and nothing ever reaches the parent's `waitpid`.
     crate::signal::notify_group_of_thread_fatal(sig);
-    let status = (-(i64::from(sig))) as u64;
+    unwind_to_kernel((-(i64::from(sig))) as u64)
+}
+
+/// Leave ring 3 from a timer tick because the thread's group is exiting
+/// (`signal::TickOutcome::Exit`): the exit a syscall return would have taken
+/// through `deliver_pending`'s group-status check, for a thread that makes
+/// no syscalls. No group notification — the group is already on its way out,
+/// which is why this thread is leaving. Takes the BKL like
+/// [`kill_current_from_fault`], for the same reason: it returns into kernel
+/// code (`run_process`/`run_thread`) that expects to hold it.
+pub fn leave_current_from_tick(status: u64) -> ! {
+    crate::smp::bkl_enter();
+    unwind_to_kernel(status)
+}
+
+/// The common tail of [`kill_current_from_fault`] and
+/// [`leave_current_from_tick`]: return `status` into whoever called
+/// `enter_user`, as `.Lexit_to_kernel` would for a syscall that set `leave`.
+fn unwind_to_kernel(status: u64) -> ! {
     EXIT_STATUS.store(status, Ordering::Relaxed);
     let uctx = crate::smp::current_uctx();
     assert!(!uctx.is_null(), "ring-3 fault with no current UserCtx");
