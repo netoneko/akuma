@@ -1,178 +1,151 @@
-# Handoff prompt: kernel support for headless Chromium (kami) on amd64
+# Handoff prompt: headless Chromium (kami) on amd64 — round 2
 
 Paste everything below the line into a fresh session started in this repo, on
 the `kami` branch.
 
 ---
 
-You are working in the Akuma kernel repo (`~/github.com/netoneko/akuma`), on
-the `kami` branch. The goal of this session: **Alpine's `chromium` (142, musl)
-renders a page on the amd64 kernel**. First under Firecracker on the trashcan,
-then on the metal. Each blocker below is a kernel gap that Chromium hits in
-order. Close them one at a time, prove each one, and say exactly where you
-stopped.
+You're working in the Akuma kernel repo (`~/github.com/netoneko/akuma`), on the
+`kami` branch, at or after `b3dfd5b3`. **Goal:** Alpine's `chromium` (142, musl)
+renders a page headless on the amd64 kernel. Get it working under Firecracker
+on the trashcan first, then on the metal. Each step so far was a kernel gap
+that Chromium hit in order. Keep closing them one at a time, prove each one,
+and say exactly where you stopped.
 
-## Read first, in this order
+## Rules (from `CLAUDE.md` and the user, they override everything below)
 
-1. `CLAUDE.md`, whose rules override anything below. In particular:
-   - "Kernel conventions": justify every allocation; console output only
-     through `safe_print!`/`tprint!`.
-   - "Working with Claude Code in this repo": **the user drives all commits**.
-     Commit only when asked, never push to `origin`, no fork/multi-agent
-     fan-out, never launch background agents without asking.
-   - `litter` (the private `akuma-litter` remote) is where the user lets you
-     push, to `cats/claude/<topic>`.
-2. `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`: what was fixed, the
-   **"Still open"** list this prompt is built from, and § "The whole-file
-   heap" for blocker 1.
-3. `userspace/kami/README.md`: what kami is, the Ubuntu measurements, the
-   `strace` summary of what Chromium asks of the kernel (processes, fd
-   passing, shared memory, huge reservations), and the future rio-pane plan.
-4. `docs/runbooks/amd64-bare-metal-loop.md`. Especially "Two machines at once"
-   (fast lane before metal), and the 2026-10-07 note under "Getting the source
-   onto the box": `hpbox.deploy()` cannot reach a commit that exists only on
-   `litter`, so carry commits over with `git bundle`.
-5. `docs/reference/subsystems/syscalls/net.md` § "SCM_RIGHTS" and
-   `docs/reference/subsystems/amd64-shared-write-mmap.md`: the fd-passing and
-   shared-memory paths Chromium's IPC runs on. Both landed 2026-10-08.
+- Justify every allocation; console output only through
+  `safe_print!`/`tprint!` (never open-code a `StackWriter`).
+- No fork/multi-agent fan-out; never launch background agents without asking.
+- **You may commit checkpoints and push them to `litter`** (the private
+  `akuma-litter` remote) at `cats/claude/kami`. Never push to `origin`, never
+  rewrite history. Commit verified work as you go, not at the end.
+- Leave the user's untracked `proposals/` and
+  `docs/handoff-kernel-rio-support.md` alone.
+- Every behaviour change gets a probe that is run on **Linux first** (that run
+  is the expectation), then on Akuma. Never claim what you didn't run.
+- Write it all into the docs as you go (below).
 
-## The rig (in the repo; already set up on the trashcan)
+## Read first
 
-All of it lives in `userspace/kami/probe/akuma/`; read its scripts' headers.
-It runs on the **trashcan's Ubuntu side**, at `192.168.1.120`. Drive it with
-`HPBOX_IP=192.168.1.120 python3 scripts/utils/hpbox.py ub '<cmd>'`, ssh port
-22; port 2222 is the Akuma personality. It is already installed at
-`/root/cdp-probe/akuma/`, with `kami-root.img` built.
+1. `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`: Fixes 1–16 and the
+   **"Still open"** list this prompt is built from.
+2. `docs/runbooks/trace-failing-syscalls-amd64.md`: the tracing that found
+   Fixes 11–16. Use it before forming theories.
+3. `userspace/kami/README.md` (status, and the two "Future" sections:
+   reading mode / `.md` output, and the rio pane).
+4. `docs/runbooks/amd64-bare-metal-loop.md` ("Two machines at once", and the
+   `git bundle` note: `hpbox.deploy()` cannot reach a commit that exists only on
+   `litter`).
+
+## The rig (trashcan Ubuntu side, `192.168.1.120`, ssh port 22)
+
+Drive it with `HPBOX_IP=192.168.1.120 python3 scripts/utils/hpbox.py ub '<cmd>'`.
+`hpbox ub` gives up after **300 s** and its CLI exits 0 whatever the remote
+command returned, so run long jobs detached (`nohup … &`) and poll a marker.
+Everything is in `userspace/kami/probe/akuma/` and installed at
+`/root/cdp-probe/akuma/`.
 
 | step | where | command |
 |---|---|---|
-| build and copy the static probes and the scripts to the box | laptop | `sh userspace/kami/probe/akuma/push.sh` |
-| (re)build the Chromium image from `../Dockerfile` | box | `cd /root/cdp-probe/akuma && sh mkimg.sh` |
-| sync and build the kernel | laptop | `hpbox.deploy()` then `hpbox.build()`; see the `git bundle` note in the runbook |
-| one Chromium run under Firecracker | box | `cd /root/cdp-probe/akuma && sh run-fc.sh` |
+| build the static probes, copy probes and scripts to the box | laptop | `sh userspace/kami/probe/akuma/push.sh` |
+| carry `litter`-only commits over | laptop | `git bundle create k.bundle HEAD ^<box head>`, `cat` it over ssh, on the box `git fetch k.bundle HEAD:refs/heads/laptop-head` |
+| sync the tree and build the kernel | laptop | `hpbox.deploy()` (check its rc!) then `hpbox.build()` |
+| all probes | box | `MEM=4096 sh run-fc.sh probes.sh bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe chromeprobe` |
+| one Chromium run, whole stderr and exit status | box | `KARGS=strace_err MEM=4096 sh run-fc.sh chrome-once.sh` |
+| the older two-mode smoke run | box | `sh run-fc.sh` (`kami-smoke.sh`) |
+| standard-image boot (expect 727 passed, 0 failed) | laptop | `hpbox.firecracker(vcpus=2, timeout_s=150)` |
+| Linux control for a probe | box | `docker run --rm -v $PWD:/p akuma-cdp-probe /p/<probe>` |
+| Linux `strace -f` of Chromium | box | `docker run … akuma-cdp-probe sh -c "strace -f -s 200 -o /out/x.strace /usr/lib/chromium/chromium --headless …"` (a full trace is at `/root/cdp-probe/linux/smoke.strace`) |
 
-- **What `run-fc.sh` does:**
-  1. boots a **copy** of `kami-root.img` (`kami-run.img`), with
-     `kami-smoke.sh` and `exeprobe` written into its root;
-  2. runs `init=/bin/busybox initargs=sh,/kami-smoke.sh`. **Not**
-     `init=/bin/sh`: `init=` does not follow symlinks, one of the open items;
-  3. prints the interesting log lines;
-  4. dumps any `/tmp/shot*.png` into `out/`. The full log is `kami-fc.log`.
+`KARGS` adds kernel command-line flags:
+- `strace_err`: one `[sc!]` line per failing syscall (pid, x86_64 nr, decoded
+  paths, decimal errno), plus a `[sig!]` line for every fault signal delivered
+  to a program's own handler;
+- `strace_nr=89,267`: also successful calls of those numbers (`readlink`
+  shows its target);
+- `strace_pid=<n>`: the full trace for one thread group. Use with `VCPUS=1`.
 
-  Defaults: a 10240 MiB guest, so it gets the 1 GiB kernel heap until
-  blocker 1 is fixed; 2 vCPUs; a 400 s bound. Override with
-  `MEM=`/`VCPUS=`/`TIMEOUT=`/`KERNEL=`. To run a different script or probe,
-  pass it: `sh run-fc.sh myprobe.sh shmvar chromeprobe`. Extra files land in
-  the image root.
-- **Expected noise.** The boot prints `self-test: 615 passed, 41 FAILED` on
-  this image. The kernel's fs/fd self-tests look for fixtures that only the
-  standard `amd64-root.img` has. Compare that count across runs, not against
-  zero.
-- **Success** is `== got out/shot.png` with the page text "JavaScript ran:
-  6 x 7 = 42". `kami-smoke.sh` runs Chromium with and without `--no-zygote`.
-- **The state at handoff** (2026-10-08, the code of `b636f410`; its `uname` reads `78b5edb0`, the commit it was patched onto): the run reproduces
-  exactly the four blockers below, in order. `exeprobe` prints `/exeprobe`
-  on both sides of the re-exec.
-- **Linux control.** Run every probe on the trashcan's Ubuntu first:
-  directly (`push.sh` leaves `chromeprobe`, `shmvar` and `exeprobe` in
-  `/root/cdp-probe/akuma/`), or in the `akuma-cdp-probe` container. That run
-  is the expected output. For the call sequence a blocker sits in,
-  `userspace/kami/probe/cdp.py strace URL` (in the container) gives a full
-  `strace -f` of Chromium on Linux, and `probe/analyze.py` summarises it.
-- **Probes** are in `userspace/forktest/c_stress/`:
-  - `chromeprobe.c`: fd passing, shared files, reservations. 16/16 on Linux
-    and Akuma; keep it that way.
-  - `shmvar.c`: five shared-mapping shapes.
-  - `exeprobe.c`: `/proc/self/exe` across a re-exec.
+Pids depend on the script: in `chrome-once.sh` the browser is **pid 15**.
 
-  Add new probes beside them and to `push.sh`'s list. They are built
-  `x86_64-linux-musl-gcc -static`.
+The Chromium image's boot prints `self-test: 615 passed, 41 FAILED`. That's
+expected: the fixtures are missing from that image. Compare the count across
+runs, not against zero.
 
-## The blockers, in the order Chromium hits them
+## Where it stands (2026-10-08)
 
-1. **`execve` copies the whole executable into the kernel heap**
-   (`amd64/src/fs.rs` `read_image`, capped at 256 MB). Chromium is 250 MB and
-   re-execs itself (`execve("/proc/self/exe")`) for the zygote and the
-   utility processes. On a 512 MiB heap the second copy fails
-   (`[ALLOC FAIL] requested=249690856`), and the exec returns `EIO` after
-   about 20 s.
-   **Fix:** a streaming loader. Parse the ELF and program headers from a
-   small read, then copy each `PT_LOAD` segment straight from the file into
-   its freshly mapped pages in bounded chunks, with no whole-file buffer.
-   Keep the eager mapping for now; lazy file-backed text is a later step.
-   **Prove it:**
-   - a 4096 MiB guest gets past every Chromium exec;
-   - the `Slab:` line of `/proc/meminfo` (the kernel heap) does not jump by
-     the binary's size around an exec;
-   - the amd64 boot suite and `chromeprobe` stay green.
-2. **crashpad: `posix_spawn chrome_crashpad_handler: No such file or
-   directory`.** The file exists. musl's `posix_spawn` is a
-   `clone(CLONE_VM|CLONE_VFORK)` child that `execve`s, and reports errno back
-   through a pipe. Write a probe that `posix_spawn`s
-   `/usr/lib/chromium/chrome_crashpad_handler --help` and run it on Linux,
-   then on Akuma. Find out whether the failure is the path Chromium computes,
-   or vfork-plus-exec in a `CLONE_VM` child that is not a thread.
-3. **`Failed to create socket directory`** (Chromium's ProcessSingleton,
-   seen with `--no-zygote`). That is `mkdtemp` under `/tmp`, followed by a
-   socket `bind` inside the new directory and symlinks next to the profile.
-   Probe each step on its own.
-4. **Zygote children: `FATAL: Error loading V8 startup snapshot file`.** The
-   browser opens `v8_context_snapshot.bin` and hands the fd down. In zygote
-   mode it reaches the child through the zygote's fork request (descriptors
-   sent with `SCM_RIGHTS`, then remapped to fixed numbers). Find which step
-   loses it: the passing, the `dup2` remap, or an `mmap`/`read` of the
-   passed fd. Linux `strace` of the same flow shows the expected sequence.
+The browser runs about 10 s and gets through the singleton, crashpad, zygote
+and snapshot setup. It launches children through the zygote, and then:
 
-Then whatever comes next. Repeat until the screenshot is right.
+```
+ERROR:content/common/zygote/zygote_communication_linux.cc:160] NOTREACHED hit. Did not receive ping from zygote child
+ERROR:content/zygote/zygote_linux.cc:633] Zygote could not fork: process_type utility numfds 5 child_pid -1
+ERROR:…/scoped_ptrace_attach.cc:27] ptrace: Function not implemented (38)
+ERROR:…/exception_handler_server.cc:143] tgkill: No such process (3)
+… GPU process launch failed: error_code=1002  (x6)
+FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:415] GPU process isn't usable. Goodbye.
+== chromium exit status 191
+```
 
-## Smaller items on the same path (do them when they block, or when cheap)
+`SCM_CREDENTIALS` (Fix 16) is in and `credprobe` passes, so the ping path
+itself works in isolation. The last run, with the `[sig!]` logging, logged
+**no** caught fault and no `[Fault]`. So the zygote child isn't dying of a
+fault signal. Suspects, in order:
 
-- **`int3` from ring 3 arrives as SIGSEGV.** The `#GP` has `err=0x1a`, which
-  means IDT vector 3's gate is not DPL 3. Every Chromium `CHECK` failure looks
-  like a segfault. Make `#BP` reachable from user mode and deliver SIGTRAP.
-  It is worth doing early, because it makes every later crash legible.
-- **`init=` does not follow symlinks**, and ext2's `read_at` on a symlink
-  inode reads the target's bytes as block numbers
-  (`read_sectors: sector 14819201400`, which is "/bin" read as a block).
-  ext2 should refuse; `init=` should resolve.
-- **Missing x86_64 syscall rows** (ENOSYS, non-fatal so far): 40 `sendfile`,
-  141 `setpriority`, 239 `get_mempolicy`, 297 `rt_tgsigqueueinfo`, 444
-  `landlock_create_ruleset`. Add them to `akuma-syscalls-abi`'s table with the
-  honest answer for each. That may be `EPERM`/`ENOSYS` on purpose, but it
-  should be decided, not defaulted.
-- **The 1324 GiB reservation** works, but costs about 290 ms (Linux: 0.5 ms),
-  nearly all of it in `munmap`. Look at it if startup time matters.
-- **`SO_PASSCRED`** is accepted but no `SCM_CREDENTIALS` are generated. If
-  crashpad's handler registration needs them, implement them on the receive
-  side (`akuma_net_unix::scm` has the encoder shape).
+1. **What the zygote child actually does before dying.** Find its pid from
+   the `[sc!]` lines (the zygote is `--type=zygote`; its children are forked
+   from it), then rerun with `strace_pid=<child>` and `VCPUS=1`. Compare
+   against the Linux strace of the same fork (`grep` for `kZygoteChildPing`
+   sizes, the `sendmsg` from the zygote child). Check its exit status, e.g. by
+   tracing `exit_group`'s argument.
+2. **`gettid()` of a main thread is its thread slot, not its pid** (both
+   kernels, by design: `tkill`, futexes and the per-thread arrays index by
+   slot). Every log prefix reads `[<pid>:<small>:`. Chromium's zygote and
+   sandbox code compare `gettid()` with `getpid()` to mean "single-threaded /
+   main thread". This is a big cross-kernel change, so prove it is the
+   cause with a probe before touching it.
+3. The fork path the zygote uses (`fork` vs `clone` flags,
+   `--change-stack-guard-on-fork=enable`). `strace_nr=56,57,58,435` shows
+   them.
 
-## How to verify (do not claim anything you did not run)
+## Also open (do them when they block, or when cheap)
 
-- **Every kernel change:**
-  - clippy and host tests per `CLAUDE.md` for each crate you touch;
-  - `cargo check` of both kernels (`--release` for AArch64,
-    `-p akuma-amd64 --target x86_64-unknown-none --release`);
-  - one Firecracker boot showing `Akuma/amd64 — all self-tests passed`;
-  - `chromeprobe` still 16/16.
-- **Every blocker:** a minimal probe that fails before the fix and passes
-  after, with the Linux output as the expectation. Then the Chromium smoke
-  run, which shows the next error.
-- **Metal last.** Only after the fast lane is green, and only when the user
-  asks: `hpbox.stage()` then `hpbox.reboot_to("akuma")` on the trashcan. The
-  Ryzen laptop has its own loop (`overlays/ryzen/README.md`; rehearse with
-  `qemu.sh` before every arm). On Akuma, `apk add chromium font-noto` gives
-  the browser.
-- When Chromium renders under Firecracker, run `kami` itself. It needs
-  `/dev/fb0`, which Firecracker does not have, so that step is for the
-  trashcan's metal. Static binary: `userspace/kami/build.sh`. The default
-  page is tumblr.com, so it needs networking.
+- Missing x86_64 rows: 40 `sendfile`, 239 `get_mempolicy`, 297
+  `rt_tgsigqueueinfo` (crashpad re-raises a crash with it; then `exit 191`),
+  444 `landlock_create_ruleset`; `inotify_init`. Decide each one's honest
+  answer, then row plus arm in `akuma-syscalls-abi` and `usermode.rs`. A
+  decoded row without an arm now prints `no dispatch arm`, and the audit
+  one-liner is in the runbook.
+- `ptrace` for crashpad dumps (only matters after a crash).
+- `/proc/cpuinfo`, `/proc/sys/fs/inotify/max_user_watches`,
+  `/proc/<pid>/oom_score_adj`, `/sys/devices/system/cpu/{possible,present}`
+  (logged as `ERROR`, not fatal so far).
+- `O_CREAT` ignores the umask (`fs::UMASK` is applied for `mkdir` only).
+- `init=` does not follow symlinks, and ext2's `read_at` on a symlink inode
+  reads the target's bytes as block numbers.
+- The 1324 GiB reservation's `munmap` costs about 290 ms (Linux: 0.5 ms).
+
+## Verify, every kernel change
+
+- clippy and host tests for each crate you touch (`CLAUDE.md` § Testing);
+- `cargo check` of both kernels (`--release` for AArch64;
+  `-p akuma-amd64 --target x86_64-unknown-none --release`);
+- the probe pass above, all green, `chromeprobe` 16/16;
+- the standard-image boot: `727 passed, 0 failed`;
+- then the Chromium run, which shows the next error.
+
+Success is `/tmp/shot.png` (dumped to `out/`) reading "JavaScript ran: 6 x 7 =
+42". After that: run `kami` itself on the trashcan's metal (it needs
+`/dev/fb0`; `userspace/kami/build.sh`; the default page needs networking).
+Metal only when the user asks (`hpbox.stage()`, `hpbox.reboot_to("akuma")`).
 
 ## When you stop
 
-Update `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`:
-- move each closed item from "Still open" into a numbered `## Fix N` section;
-- add each new finding to "Still open".
-
-Update the status paragraph in `userspace/kami/README.md`. If you landed fixes,
-follow `docs/runbooks/update-bug-fix-list.md`. Leave the work uncommitted
-unless the user asks for commits.
+- In `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`: add a numbered
+  `## Fix N` per closed item and correct "Still open".
+- Update `userspace/kami/README.md`'s status paragraph.
+- Add symptom rows to `docs/README.md` and a reference-doc section for any
+  new subsystem behaviour.
+- For landed fixes, follow `docs/runbooks/update-bug-fix-list.md` (not yet
+  done for Fixes 8–16).
+- Rewrite this file for the next round.
