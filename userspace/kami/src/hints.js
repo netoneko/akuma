@@ -33,18 +33,29 @@ if (!window.__kami) {
   K.collect = function () {
     K.clear();
     const vw = innerWidth, vh = innerHeight, seen = new Set(), out = [];
+    // Why candidates were turned away, for `__kami.why` when nothing is found.
+    const st = (K.stats = { vw, vh, matched: 0, small: 0, off: 0, hidden: 0, dup: 0, url: location.href, state: document.readyState });
     function consider(el, ox, oy, doc) {
       if (out.length >= MAX) return;
+      st.matched++;
       const r = el.getBoundingClientRect();
-      if (r.width < 4 || r.height < 4) return;
+      if (r.width < 4 || r.height < 4) { st.small++; return; }
       const x0 = Math.max(ox + r.left, 0), y0 = Math.max(oy + r.top, 0);
       const x1 = Math.min(ox + r.right, vw), y1 = Math.min(oy + r.bottom, vh);
-      if (x1 - x0 < 4 || y1 - y0 < 4) return;
+      if (x1 - x0 < 4 || y1 - y0 < 4) {
+        st.off++;
+        st.rect = [r.left, r.top, r.right, r.bottom, ox, oy].map(Math.round);
+        return;
+      }
       const x = (x0 + x1) / 2, y = (y0 + y1) / 2;
       const hit = hitAt(doc, x - ox, y - oy);
-      if (!hit || !(hit === el || el.contains(hit) || hit.contains(el))) return;
+      if (!hit || !(hit === el || el.contains(hit) || hit.contains(el))) {
+        st.hidden++;
+        st.lastHit = hit ? hit.tagName : 'null';
+        return;
+      }
       const key = Math.round(x / 3) + ',' + Math.round(y / 3);
-      if (seen.has(key)) return;
+      if (seen.has(key)) { st.dup++; return; }
       seen.add(key);
       out.push({ el, x, y, lx: x0, ly: y0 });
     }
@@ -75,6 +86,8 @@ if (!window.__kami) {
     K.items = out;
     return out.length;
   };
+
+  K.why = function () { return JSON.stringify(K.stats || {}); };
 
   K.draw = function (labels) {
     const box = document.createElement('div');
@@ -124,21 +137,6 @@ if (!window.__kami) {
   K.blur = function () {
     const a = document.activeElement;
     if (a && a.blur) a.blur();
-    return 0;
-  };
-
-  K.status = function (text) {
-    let s = document.getElementById('__kami_status');
-    if (!s) {
-      s = document.createElement('div');
-      s.id = '__kami_status';
-      s.style.cssText =
-        'position:fixed;left:0;bottom:0;z-index:2147483647;pointer-events:none;background:#111;' +
-        'color:#fff;font:bold 15px/1.3 monospace;padding:3px 10px;border-top-right-radius:6px;' +
-        'max-width:100vw;white-space:nowrap;overflow:hidden';
-      document.documentElement.appendChild(s);
-    }
-    s.textContent = text + '   ' + location.host;
     return 0;
   };
 }

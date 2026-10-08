@@ -90,10 +90,11 @@ impl Nav {
         Nav { mode: Mode::Normal, prefix: String::new(), n: 0, len: 1, pending_g: false }
     }
 
-    /// The status-line text for the current state.
+    /// The status-line text for the current state (kami draws it itself, on the
+    /// framebuffer; see `bar.rs`).
     pub fn status(&self) -> String {
         match self.mode {
-            Mode::Normal => "NORMAL  j/k scroll  f links  i type  H/L back/fwd".into(),
+            Mode::Normal => "NORMAL  j/k scroll  f links  i type  H/L back/fwd  Ctrl-Q quit".into(),
             Mode::Insert => "INSERT  Esc to leave".into(),
             Mode::Hint => format!("LINKS  {}", self.prefix),
         }

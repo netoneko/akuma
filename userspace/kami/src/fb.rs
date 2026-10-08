@@ -85,6 +85,8 @@ pub struct Fb {
     shifts: [u32; 3],
     alpha: u32,
     row: Vec<u32>,
+    /// The text the bar shows now, so an unchanged status costs nothing.
+    bar_text: String,
 }
 
 impl Fb {
@@ -148,12 +150,41 @@ impl Fb {
             shifts: [var.red.offset, var.green.offset, var.blue.offset],
             alpha,
             row: Vec::new(),
+            bar_text: String::new(),
         })
+    }
+
+    /// Draw the status bar in the bottom [`crate::bar::HEIGHT`] rows: light
+    /// text on dark, full width. The page blit never reaches these rows (the
+    /// page viewport is sized to leave them), so the bar persists between
+    /// frames and is redrawn only when its text changes.
+    fn draw_bar(&mut self, text: &str) {
+        let h = crate::bar::HEIGHT;
+        if self.height < h * 2 || self.width < 64 {
+            return;
+        }
+        let [rs, gs, bs] = self.shifts;
+        let pack = |r: u32, g: u32, b: u32| self.alpha | r << rs | g << gs | b << bs;
+        let (fg, bg) = (pack(255, 255, 255), pack(22, 22, 30));
+        let cov = crate::bar::render(text, self.width);
+        self.row.resize(self.width, 0);
+        for y in 0..h {
+            for (x, dst) in self.row.iter_mut().enumerate() {
+                *dst = if cov[y * self.width + x] != 0 { fg } else { bg };
+            }
+            let off = self.origin + (self.height - h + y) * self.stride;
+            debug_assert!(off + self.width * 4 <= self.map_len);
+            // SAFETY: same bounds argument as `blit`: the row is inside the
+            // visible area checked at open, and `width <= stride / 4`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.row.as_ptr() as *const u8, self.base.add(off), self.width * 4);
+            }
+        }
     }
 
     /// Nearest-neighbour `scale`x blit of an RGB/RGBA image at the top left,
     /// clipped to the screen.
-    pub fn blit(&mut self, px: &[u8], w: usize, h: usize, ch: usize, scale: usize) {
+    fn blit_page(&mut self, px: &[u8], w: usize, h: usize, ch: usize, scale: usize) {
         let out_w = (w * scale).min(self.width);
         let [rs, gs, bs] = self.shifts;
         self.row.resize(out_w, 0);
@@ -191,6 +222,27 @@ impl Fb {
                     );
                 }
             }
+        }
+    }
+}
+
+impl crate::display::Display for Fb {
+    fn screen_size(&self) -> (usize, usize) {
+        (self.width, self.height - crate::bar::HEIGHT)
+    }
+
+    fn page_size(&self, scale: usize) -> (usize, usize) {
+        (self.width / scale, (self.height - crate::bar::HEIGHT) / scale)
+    }
+
+    fn blit(&mut self, px: &[u8], w: usize, h: usize, ch: usize, scale: usize) {
+        self.blit_page(px, w, h, ch, scale);
+    }
+
+    fn status(&mut self, text: &str) {
+        if self.bar_text != text {
+            self.bar_text = text.to_string();
+            self.draw_bar(text);
         }
     }
 }

@@ -2,8 +2,7 @@
 
 A headless Chromium on the Linux framebuffer. Chromium renders in software and
 sends a PNG screencast over the DevTools Protocol, and `kami` blits each frame
-onto `/dev/fb0`, scaled up `--scale`x (default 2: 1920×1080 → a 4K panel). Keys
-typed on the tty go back as CDP input events.
+onto `/dev/fb0`. Keys typed on the tty go back as CDP input events.
 
 It is a static x86_64 musl binary with no dependencies beyond `libc` and
 `miniz_oxide` (both already in `userspace/Cargo.lock`). The PNG decoder and the
@@ -22,8 +21,16 @@ With no URL, a fresh tab opens the home page, `https://www.tumblr.com/` (the
 `HOME` constant in `src/main.rs`). Reattaching with no URL keeps whatever the
 tab is showing.
 
-Keys are modal, like vim (`src/nav.rs`, host-tested). A status line in the page
-(bottom left) shows the mode.
+**Page size.** The page is as big as the screen allows: `--scale` defaults to
+auto (`display::auto_scale`), the largest scale (at most 2) that still leaves a
+1280x720 page, minus the status bar. The 1920x1200 laptop gets scale 1 and a
+1920x1176 page; a 4K panel gets scale 2 and 1920x1068. (It was a fixed 2, which
+left the laptop a 960x588 page; example.com's link sat below the fold of that
+and link hints found nothing.)
+
+## Keys
+
+Keys are modal, like vim (`src/nav.rs`, host-tested).
 
 - **Normal** (start): `j`/`k` scroll, `d`/`u` half a page, `gg`/`G` top/bottom,
   `H`/`L` back/forward, `r` reload, `f` link hints, `i` insert mode. Other
@@ -34,19 +41,158 @@ Keys are modal, like vim (`src/nav.rs`, host-tested). A status line in the page
   and same-origin iframes) gets a yellow letter label (home row `asdfghjkl`,
   fixed width). Type the label to click it with a real mouse event; Esc
   cancels, Backspace un-types. Clicking a text field enters insert mode.
-  Cross-origin iframes get no hints.
+  Cross-origin iframes get no hints. When nothing is found the page helper
+  says why in the input log (`hints: nothing found; {matched, small, off,
+  hidden, ...}`).
 - **Insert** (`i`): all keys go to the page; Esc blurs and returns to Normal.
-- Ctrl-R reloads; Ctrl-C or Ctrl-Q detaches (any mode).
+- Ctrl-R reloads; **Ctrl-Q or Ctrl-C quits** (any mode, even when Chromium is
+  not answering: a separate input thread watches for them).
 
-Untested against a live page as of 2026-10-08: the CDP mouse/wheel path and
-`src/hints.js` have only been syntax-checked; the state machine has tests.
+Verified 2026-10-09 on the ryzen laptop, over an ssh pty so the tty and the
+input thread were real: `j`/`k` scroll (a new frame each), `H` goes back,
+`f` finds example.com's link, its label clicks it and Chromium starts
+navigating, Ctrl-Q exits and the daemon detaches the session. Not yet tried
+from the console keyboard itself, and not against Tumblr's cookie notice (it
+did not appear in the frames captured; see Known gaps).
 
-On Akuma the screencast's frames arrive fully transparent (Chromium's video
-capture reads an empty buffer; see the archive record), so `kami` notices an
-empty first frame and polls `Page.captureScreenshot` every 500 ms instead
-(`--poll MS` forces it; a poll is ~0.2 s, so this is a few fps, not 45).
-Debug knobs: `KAMI_DUMP=<path>` keeps the first PNG, `KAMI_TRACE=1` names every
-CDP event.
+## The status bar
+
+`kami` draws the status bar itself, in the bottom 24 pixel rows of the
+framebuffer, with a built-in 5x7 bitmap font (`src/bar.rs`; upper case, digits,
+punctuation). It is not part of the page, so it shows when the page is blank,
+loading, wedged, or has no fonts. It shows, in order: the startup stage with
+elapsed seconds (`starting chromium`, `waiting for chromium to answer`,
+`opening the tab`, `loading the page`, `waiting for the first frame`), then
+the mode, a `[loading]` marker and the top frame's URL. Any Chromium request
+unanswered for more than 4 s is appended: `!! no answer to Page.navigate for
+12s`.
+
+## Architecture
+
+The session is a state machine with no I/O (`src/machine.rs`). `handle(Event)`
+returns `Effect`s:
+
+| Event in | Effect out |
+|---|---|
+| `Tick(ms)`, `Cdp(message)`, `Key(input)`, `Connected`/`ConnectFailed`, `DaemonGone`, `InputClosed`, `Presented{..}` | `TryConnect`, `Send(cdp message)`, `Present{png}`, `Status(text)`, `Log(line)`, `Done(error?)` |
+
+It numbers its own requests, remembers which are outstanding and since when,
+and never waits for a reply. The shell in `main.rs` only polls the daemon
+socket and the tty, turns what arrives into events, and performs the effects
+(socket write, PNG decode and blit, status draw, log line). Why: the code this
+replaced blocked inside every CDP call, and while blocked it read no keys,
+drew nothing and could not quit, so any Chromium stall looked like "kami hangs"
+(measured 2026-10-09: a `Page.navigate` that never got a reply froze it for
+the rest of the run). Everything in the machine (startup phases, retries,
+navigate deadline, polling fallback, hints, stall reporting, quitting) is
+host-tested with scripted events.
+
+Other pure pieces: `nav.rs` (modes, keys to actions), `display.rs` (the
+`Display` trait: `page_size`, `blit`, `status`; and `auto_scale`), `bar.rs`
+(font and rendering). `fb.rs` is the framebuffer `Display`. **A rio pane is a
+second `Display`**: frames out as an inline-image protocol, the status as an
+ordinary text line, sized from `TIOCGWINSZ`; the machine does not change (see
+"Future: kami in a rio split pane").
+
+## Logs and telemetry
+
+`/tmp/kami-input.log` (override with `KAMI_INPUT_LOG`; appended, one block per
+session, seconds since launch in front of each line): the tty's termios before
+and after raw mode, every raw chunk read in hex, each decoded input with the
+mode and the actions it caused, the startup phases with their durations
+(`startup: Target.getTargets: 3198 ms` ...), page lifecycle events, the top
+frame's URL, every `captureScreenshot` call, every frame shown with decode and
+blit times, the first-pixels marker, and the hint replies. When keys "do
+nothing", the hex line says whether they reached kami at all.
+Other knobs: `KAMI_DUMP=<path>` keeps the latest PNG shown. If the first
+screencast frame is fully transparent (as Akuma's was before the GPU flags
+below), kami switches to polling `Page.captureScreenshot` every 500 ms and
+drops the screencast's frames (`--poll MS` forces it); a poll is ~0.2 s, so
+that is a few fps, not 45.
+`/tmp/kami.log` has Chromium's stderr plus the daemon's timestamped lines
+(`+7540 ms: first message from chromium`). The timestamps come from per-core
+clocks that differ by up to about a second on Akuma, so lines can look out of
+order; the machine only ever uses the clock through a `max`.
+
+## Chromium flags, and what crashes it (2026-10-09, ryzen)
+
+`daemon.rs::chromium_args` is the list.
+
+- **No GPU process at all**: `--disable-gpu --disable-gpu-compositing
+  --disable-software-rasterizer`. `--disable-gpu` alone still starts a GPU
+  process for SwiftShader/ANGLE, which fails on every navigation here
+  (`eglInitialize SwANGLE failed ... VK_KHR_surface not supported`, then
+  `Exiting GPU process due to errors during initialization`) and respawns; after
+  several the browser process aborted with SIGTRAP ~0.1 s after a navigation
+  committed. With the three flags there were no GPU errors and the screencast
+  frames are real (the first frame is no longer fully transparent, so the
+  polling fallback below is not needed). Chromium's own headless guidance is
+  `--disable-gpu --disable-software-rasterizer`, and the SwiftShader fallback
+  is being phased out (opt-in from about Chrome 139). The exact "GPU process
+  isn't usable" abort text was not confirmed in a source; the link between the
+  respawning GPU process and the SIGTRAP is inference from the logs.
+- **Slim set**: `--disable-background-networking --disable-sync
+  --disable-extensions --disable-component-update --disable-default-apps
+  --no-default-browser-check --disable-client-side-phishing-detection
+  --disable-domain-reliability --disable-breakpad --disable-crash-reporter
+  --disable-features=Translate,MediaRouter,OptimizationHints,BackForwardCache,
+  AcceptCHFrame,InterestFeedContentSuggestions`. Measured with
+  `probe/flags_ab.py` (4 cold starts per arm, 25 s hold): GPU flags only 3/4
+  survived, slim 4/4, slim + crash flags 4/4; time to first pixels 8.6-12.8 s,
+  10.0-13.7 s, 10.3-13.8 s. **Start-up time did not change and the stability
+  difference is within noise at n=4**; the set stays for the background traffic
+  it drops. The crashpad handlers still start despite the crash flags.
+- **Still crashing**: Chromium's browser process still died on some cold starts
+  after these flags (SIGSEGV on attach to a leftover instance, SIGSEGV loading
+  `https://akuma.sh`, an earlier SIGTRAP with no GPU errors in the log). One in
+  four or so; cause not found. When it dies the daemon exits and the next
+  `kami` pays a 10-20 s cold start, which is most of "kami is slow to
+  appear".
+- **dbus**: Chromium tries the system bus on startup and keeps failing
+  `NameHasOwner` calls (48 log lines in a session). `DBUS_SESSION_BUS_ADDRESS`
+  and `DBUS_SYSTEM_BUS_ADDRESS` are set to `disabled:` for it; that changed the
+  message ("Could not parse server address") and halved the count (24), but
+  Chromium does not honour it fully. Harmless noise, not yet silenced.
+- **Cleanup**: the daemon starts Chromium in its own process group and kills
+  the group when the browser exits, so a crash no longer leaves zygotes, GPU
+  processes and crashpad handlers behind (found: a GPU process from a crashed
+  Chromium still alive hours later). It also detaches every CDP session a
+  client attached and did not detach (a `kill -9`, or Ctrl-Q): left attached, a
+  dead client's screencast waits for acks nobody sends and the next client's
+  `Page.startScreencast` never gets a reply.
+- **DNS**: `/etc/resolv.conf` listed the QEMU-only `10.0.2.3` first; every
+  lookup paid for it on the wifi LAN (removed 2026-10-09).
+
+## Known gaps
+
+- **No Japanese (CJK) fonts.** The Alpine rootfs on the Akuma partition has
+  `font-noto` (Latin and other scripts, not CJK), `font-noto-emoji`,
+  `font-noto-math`, `font-noto-symbols`, `font-dejavu`, `font-liberation`,
+  `font-opensans` and `font-adobe-source-code-pro`. A page's Japanese text
+  draws as boxes. Fix: stage a Japanese-capable package (`font-noto-cjk`, or a
+  smaller one such as `font-ipa`; check what `apk` offers) onto the partition.
+  Not done.
+- **Tumblr renders its skeleton** (header, nav, fonts, loading placeholders)
+  but the feed did not fill in within 50 s over the wifi link (measured about
+  110 KB/s earlier; the app is several MB of JavaScript). Not tested for longer.
+  The cookie notice did not appear in the frames captured, so clicking it is
+  untested.
+- `https://akuma.sh` killed Chromium (SIGSEGV) on the one try.
+- The first blit after launch took 1 s once (page faults on the framebuffer
+  mapping); later blits take 1-6 ms.
+- Not tried from the console keyboard (only over an ssh pty).
+
+## Probes (`probe/`)
+
+- `keyprobe.py`: a local Chrome driven over `--remote-debugging-pipe` with
+  kami's exact messages (Tab+Enter, hints, wheel). Needs Chrome on the
+  machine; no network needed with a local page.
+- `ssh_keys.py HOST URL --keys "j,f,a,CTRL-Q" [--env KAMI_DUMP=/tmp/x.png]`:
+  runs kami on a live Akuma over an ssh pty, sends keys, prints the new
+  input log. **It paints on `/dev/fb0` and takes the console from whoever is
+  using it.**
+- `flags_ab.py HOST --runs N`: cold-start A/B of Chromium flag sets (the table
+  above). Owns the kami daemon on the box.
 
 ## Sessions outlive the terminal
 
@@ -162,6 +308,11 @@ Details are in the scripts' headers and in
 which is also where the remaining kernel work is laid out.
 
 ## Tumblr on the ryzen laptop (2026-10-08)
+
+*2026-10-09 correction: the empty screencast and the polling described below
+were the GPU-process problem (see "Chromium flags"). With
+`--disable-gpu-compositing --disable-software-rasterizer` the screencast frames
+are real.*
 
 `kami https://www.tumblr.com/` renders on **ryzen's Akuma over wifi** (entry 12,
 1920x1200 `/dev/fb0`, Alpine's `chromium` 142 staged onto p3 with

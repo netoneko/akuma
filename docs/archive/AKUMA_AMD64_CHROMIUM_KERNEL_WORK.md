@@ -594,6 +594,39 @@ still logs, none of it fatal:
 - **The 1324 GiB reservation** costs about 290 ms (Linux: 0.5 ms), nearly all
   of it in `munmap`.
 
+## kami on ryzen, 2026-10-09: the GPU process, and why input "did nothing"
+
+Not a kernel fix; what the session found, with the evidence.
+
+- **The GPU process.** `--disable-gpu` still starts a GPU process for
+  SwiftShader/ANGLE; on Akuma it fails on every navigation
+  (`eglInitialize SwANGLE failed with error EGL_NOT_INITIALIZED`,
+  `VK_KHR_surface` not supported, `Exiting GPU process due to errors during
+  initialization`) and is respawned. Several times in a row, then the browser
+  process died with SIGTRAP ~0.1 s after a navigation committed. Adding
+  `--disable-gpu-compositing --disable-software-rasterizer` removed every GPU
+  error, and the CDP screencast stopped delivering transparent frames. That
+  suggests the GPU process was behind the "Open: the CDP screencast delivers
+  an empty frame" entry above too, but that earlier run was not repeated with
+  these flags, so it is not established.
+  The browser still dies on some cold starts (SIGSEGV, or a SIGTRAP with no
+  GPU errors): about one in four, cause not found. `userspace/kami/README.md`
+  has the measured flag A/B.
+- **Why kami "hung".** It blocked inside each CDP call and, blocked, read no
+  keys and drew nothing, so a Chromium that did not answer (a `Page.navigate`
+  that never got a reply; a `Page.startScreencast` after a client was
+  `kill -9`ed and left its screencast attached) looked like a dead keyboard.
+  Fixed in kami (state machine, daemon detaches dead clients' sessions) rather
+  than in the kernel. Terminal facts measured on the ssh pty: `tcsetattr` for
+  raw mode takes effect (ICANON/ISIG/ECHO/IXON read back cleared), and Enter
+  and Ctrl-Q reach the process as `0d` and `11`. The console keyboard path was
+  not exercised.
+- **Per-core clocks.** `Instant::now()` on different cores differs by up to
+  about a second; log lines from different threads came out of order. Not
+  investigated in the kernel.
+- **resolv.conf** listed the QEMU-only `10.0.2.3` first.
+- **No Japanese fonts** on the Akuma partition (see the README).
+
 ## The whole-file heap (folded in from `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`)
 
 That proposal was the record of an older crash. The second half of it is the

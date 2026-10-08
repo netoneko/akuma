@@ -2,7 +2,8 @@
 //!
 //! A background daemon owns Chromium (see `daemon.rs`); each `kami` run is a
 //! session that attaches to its tab, starts a PNG screencast at
-//! `screen / scale` pixels and blits each frame `scale`x onto `/dev/fb0`.
+//! `screen / scale` pixels and blits each frame `scale`x onto `/dev/fb0`. The
+//! scale is chosen from the screen (at least a 1280x720 page) unless `--scale`.
 //! Keys typed on the tty go back as CDP input events. Quitting detaches and
 //! leaves Chromium and the page running for the next session.
 //!
@@ -18,16 +19,20 @@
 //! PgUp / PgDn / Home / End / Enter / Tab / Esc always pass through. Ctrl-R
 //! reloads, Ctrl-C or Ctrl-Q detaches.
 
+mod bar;
 mod cdp;
 mod daemon;
+mod display;
 mod fb;
+mod machine;
 mod nav;
 mod png;
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use cdp::{escape, event_session, first_page, method, num_field, str_field, Cdp};
+use display::Display;
+use cdp::Cdp;
 
 /// What a fresh tab opens when no URL is given. A reattach with no URL keeps
 /// whatever the tab is showing.
@@ -62,7 +67,7 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let mut a = Args {
         url: None,
-        scale: 2,
+        scale: 0, // 0 = pick from the screen (display::auto_scale)
         fb: "/dev/fb0".into(),
         chromium: "chromium".into(),
         sock: "/tmp/kami.sock".into(),
@@ -100,9 +105,6 @@ fn parse_args() -> Args {
             _ => a.url = Some(arg),
         }
     }
-    if a.scale == 0 {
-        usage();
-    }
     a
 }
 
@@ -138,6 +140,41 @@ fn b64_decode(src: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// Every input kami sees goes to a log (`KAMI_INPUT_LOG`, default
+/// `/tmp/kami-input.log`, appended): the tty's mode before and after raw mode,
+/// each raw chunk read, what it decoded to and what that did. When keys "do
+/// nothing" this says whether they reached kami at all (2026-10-08, ryzen:
+/// Enter and Ctrl-Q seemed not to arrive).
+static INPUT_LOG: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
+static LOG_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn input_log_open() {
+    let path = std::env::var_os("KAMI_INPUT_LOG").unwrap_or_else(|| "/tmp/kami-input.log".into());
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = INPUT_LOG.set(std::sync::Mutex::new(f));
+    }
+    let _ = LOG_START.set(Instant::now());
+}
+
+macro_rules! ilog {
+    ($($arg:tt)*) => {
+        if let Some(m) = INPUT_LOG.get() {
+            if let Ok(mut f) = m.lock() {
+                use std::io::Write;
+                let t = LOG_START.get().map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                let _ = writeln!(f, "[{t:9.3}] {}", format_args!($($arg)*));
+            }
+        }
+    };
+}
+
+fn log_termios(what: &str, t: &libc::termios) {
+    ilog!(
+        "termios {what}: iflag={:#o} oflag={:#o} lflag={:#o} cflag={:#o} vmin={} vtime={}",
+        t.c_iflag, t.c_oflag, t.c_lflag, t.c_cflag, t.c_cc[libc::VMIN], t.c_cc[libc::VTIME]
+    );
+}
+
 /// Raw mode on stdin for as long as this lives, if stdin is a tty.
 struct RawTty(Option<libc::termios>);
 
@@ -153,8 +190,14 @@ impl RawTty {
                 return RawTty(None);
             }
             let saved = t;
+            log_termios("before", &saved);
             libc::cfmakeraw(&mut t);
-            libc::tcsetattr(0, libc::TCSANOW, &t);
+            let rc = libc::tcsetattr(0, libc::TCSANOW, &t);
+            let mut back: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut back) == 0 {
+                ilog!("tcsetattr rc={rc}; the tty now reads back as:");
+                log_termios("after", &back);
+            }
             RawTty(Some(saved))
         }
     }
@@ -169,6 +212,45 @@ impl Drop for RawTty {
     }
 }
 
+/// Forward tty input to a pipe the session polls, and quit from here on
+/// Ctrl-C / Ctrl-Q. The session loop blocks inside CDP calls whenever Chromium
+/// is slow or wedged (a blank page, a crashed network service), and while it
+/// does it reads no keys: without this thread there is then no way out.
+/// Exiting skips the screencast detach; the daemon drops a vanished client.
+fn spawn_input_pump(saved: libc::termios) -> io::Result<i32> {
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe() writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (r, w) = (fds[0], fds[1]);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        loop {
+            // SAFETY: reading into a stack buffer of the stated size.
+            let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                ilog!("tty read returned {n} ({}); input closed", io::Error::last_os_error());
+                // SAFETY: closing our own write end; the reader sees EOF.
+                unsafe { libc::close(w) };
+                return;
+            }
+            ilog!("tty bytes [{}]", buf[..n as usize].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+            if buf[..n as usize].iter().any(|&b| b == 0x03 || b == 0x11) {
+                ilog!("quit key");
+                // SAFETY: restoring the attributes read before raw mode.
+                unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+                eprintln!("\r\n[kami] quit; chromium keeps running (kami --kill stops it)");
+                std::process::exit(0);
+            }
+            // SAFETY: writing `n` bytes from the buffer just filled.
+            unsafe { libc::write(w, buf.as_ptr() as *const _, n as usize) };
+        }
+    });
+    Ok(r)
+}
+
+#[derive(Debug)]
 enum Input {
     Key(&'static str, u32),
     Text(String),
@@ -241,110 +323,6 @@ fn decode_keys(bytes: &[u8]) -> Vec<Input> {
     out
 }
 
-fn send_key(c: &mut Cdp, key: &str, code: u32) -> io::Result<()> {
-    let text = match key {
-        "Enter" => ",\"text\":\"\\r\"",
-        _ => "",
-    };
-    let kind = if text.is_empty() { "rawKeyDown" } else { "keyDown" };
-    c.send(
-        "Input.dispatchKeyEvent",
-        &format!("{{\"type\":\"{kind}\",\"key\":\"{key}\",\"code\":\"{key}\",\"windowsVirtualKeyCode\":{code}{text}}}"),
-        true,
-    )?;
-    c.send(
-        "Input.dispatchKeyEvent",
-        &format!("{{\"type\":\"keyUp\",\"key\":\"{key}\",\"code\":\"{key}\",\"windowsVirtualKeyCode\":{code}}}"),
-        true,
-    )?;
-    Ok(())
-}
-
-/// The in-page helper (hint overlay, status line); see `hints.js`.
-const HINTS_JS: &str = include_str!("hints.js");
-
-/// Run a call into the in-page helper, installing it first if the document
-/// is new. The reply is the raw CDP message; read it with `str_field`/`num_field`
-/// on `"value"`.
-fn page(c: &mut Cdp, call: &str) -> io::Result<Vec<u8>> {
-    let expr = format!("{HINTS_JS}\n;{call}");
-    c.call("Runtime.evaluate", &format!("{{\"expression\":\"{}\",\"returnByValue\":true}}", escape(&expr)), true)
-}
-
-fn show_status(c: &mut Cdp, nav: &nav::Nav) {
-    // Cosmetic: a page that is mid-navigation just misses an update.
-    let _ = page(c, &format!("__kami.status(\"{}\")", escape(&nav.status())));
-}
-
-fn mouse(c: &mut Cdp, kind: &str, x: f64, y: f64, extra: &str) -> io::Result<()> {
-    c.send("Input.dispatchMouseEvent", &format!("{{\"type\":\"{kind}\",\"x\":{x},\"y\":{y}{extra}}}"), true)?;
-    Ok(())
-}
-
-/// Carry out one navigation action. `view` is the page viewport in pixels.
-fn perform(c: &mut Cdp, nav: &mut nav::Nav, act: nav::Action, view: (usize, usize)) -> io::Result<()> {
-    use nav::{Action, Scroll};
-    let (w, h) = (view.0 as f64, view.1 as f64);
-    match act {
-        Action::Quit => {}
-        Action::Reload => {
-            c.send("Page.reload", "{}", true)?;
-        }
-        Action::Key(key, code) => send_key(c, key, code)?,
-        Action::Text(t) => {
-            c.send("Input.insertText", &format!("{{\"text\":\"{}\"}}", escape(&t)), true)?;
-        }
-        Action::Scroll(s) => {
-            let dy = match s {
-                Scroll::Line(n) => n as f64 * 120.0,
-                Scroll::Half(n) => n as f64 * h / 2.0,
-                Scroll::Edge(n) => n as f64 * 1.0e6,
-            };
-            mouse(c, "mouseWheel", w / 2.0, h / 2.0, &format!(",\"deltaX\":0,\"deltaY\":{dy}"))?;
-        }
-        Action::Back => {
-            page(c, "history.back()")?;
-        }
-        Action::Forward => {
-            page(c, "history.forward()")?;
-        }
-        Action::Blur => {
-            page(c, "__kami.blur()")?;
-        }
-        Action::HintStart => {
-            let n = page(c, "__kami.collect()").ok().and_then(|r| num_field(&r, "value")).unwrap_or(0) as usize;
-            nav.begin_hints(n);
-            if n > 0 {
-                let len = nav::label_len(n);
-                let list = (0..n).map(|i| format!("\"{}\"", nav::label(i, len))).collect::<Vec<_>>().join(",");
-                page(c, &format!("__kami.draw([{list}])"))?;
-            }
-        }
-        Action::HintFilter(p) => {
-            page(c, &format!("__kami.filter(\"{}\")", escape(&p)))?;
-        }
-        Action::HintCancel => {
-            page(c, "__kami.clear()")?;
-        }
-        Action::HintClick(i) => {
-            let r = page(c, &format!("__kami.click({i})"))?;
-            let v = str_field(&r, "value").unwrap_or("");
-            let mut f = v.split(',');
-            if let (Some(x), Some(y), Some(e)) = (f.next(), f.next(), f.next()) {
-                if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
-                    mouse(c, "mouseMoved", x, y, "")?;
-                    mouse(c, "mousePressed", x, y, ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1")?;
-                    mouse(c, "mouseReleased", x, y, ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1")?;
-                    if e == "1" {
-                        nav.mode = nav::Mode::Insert;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn main() {
     let args = parse_args();
     let r = if args.daemon {
@@ -379,264 +357,162 @@ fn kill(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
-/// Connect to the daemon, starting it first if there is none.
-fn connect(args: &Args, width: usize, height: usize) -> io::Result<Cdp> {
-    if let Ok(c) = Cdp::connect(&args.sock) {
-        eprintln!("[kami] attached to the running chromium");
-        return Ok(c);
+/// Decode one base64 PNG and put it on the display. Returns `(ok, empty)`:
+/// an empty frame (fully transparent, as Akuma's screencast can send) is
+/// reported but not shown, so it cannot paint the screen white.
+fn present(fb: &mut dyn Display, png: &mut png::Decoder, bytes: &mut Vec<u8>, b64: &str, scale: usize) -> (bool, bool) {
+    let td = Instant::now();
+    if let Err(e) = b64_decode(b64.as_bytes(), bytes).and_then(|_| png.decode(bytes)) {
+        ilog!("frame dropped: {e}");
+        return (false, false);
     }
-    daemon::spawn_detached(&daemon_config(args, width, height))?;
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(30) {
-        std::thread::sleep(Duration::from_millis(100));
-        if let Ok(c) = Cdp::connect(&args.sock) {
-            eprintln!("[kami] started chromium in {} ms", t0.elapsed().as_millis());
-            return Ok(c);
+    let tb = Instant::now();
+    let empty = png.channels == 4 && (0..png.pixels.len() / 4).step_by(997).all(|i| png.pixels[i * 4 + 3] == 0);
+    if !empty {
+        fb.blit(&png.pixels, png.width, png.height, png.channels, scale);
+        // Debug: KAMI_DUMP=<path> keeps the latest shown frame's PNG.
+        if let Some(path) = std::env::var_os("KAMI_DUMP") {
+            let _ = std::fs::write(path, &*bytes);
         }
     }
-    Err(io::Error::other(format!("daemon did not come up; see {}", args.log)))
+    ilog!(
+        "presented {}x{} ({} KB){}: decode {} ms, blit {} ms",
+        png.width,
+        png.height,
+        bytes.len() / 1024,
+        if empty { ", EMPTY" } else { "" },
+        (tb - td).as_millis(),
+        tb.elapsed().as_millis()
+    );
+    (true, empty)
 }
 
+/// The I/O shell around [`machine::Machine`]: poll the daemon socket and the
+/// tty, turn what arrives into events, and do what the machine answers with.
+/// It holds no session state of its own and never waits on Chromium.
 fn session(args: &Args) -> io::Result<()> {
-    let mut fb = fb::Fb::open(&args.fb)?;
-    let (w, h) = (fb.width / args.scale, fb.height / args.scale);
-    let mut c = connect(args, w, h)?;
+    use machine::{Effect, Event};
 
-    // Reuse the existing tab if there is one; that is the point of the daemon.
-    let targets = c.call("Target.getTargets", "{}", false)?;
-    let (target, fresh) = match first_page(&targets) {
-        Some(t) => (t, false),
-        None => {
-            let url = escape(args.url.as_deref().unwrap_or(HOME));
-            let r = c.call("Target.createTarget", &format!("{{\"url\":\"{url}\"}}"), false)?;
-            (str_field(&r, "targetId").ok_or(io::Error::other("no targetId"))?.to_string(), true)
-        }
-    };
-    let r = c.call(
-        "Target.attachToTarget",
-        &format!("{{\"targetId\":\"{target}\",\"flatten\":true}}"),
-        false,
-    )?;
-    let session = str_field(&r, "sessionId").ok_or(io::Error::other("no sessionId"))?.to_string();
-    c.set_session(&session);
-    // `--window-size` includes the (invisible) window frame in new headless
-    // mode, so pin the page viewport to exactly what the screen shows.
-    c.call(
-        "Emulation.setDeviceMetricsOverride",
-        &format!("{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":1,\"mobile\":false}}"),
-        true,
-    )?;
-    // An opaque white base, so a page that has not painted yet (or sets no
-    // background) is white, not the transparent (0,0,0,0) Chromium sends by
-    // default, which blits as a black screen. Cosmetic: failure is ignored.
-    let _ = c.call(
-        "Emulation.setDefaultBackgroundColorOverride",
-        "{\"color\":{\"r\":255,\"g\":255,\"b\":255,\"a\":1}}",
-        true,
-    );
-    c.call("Page.enable", "{}", true)?;
-    if let (false, Some(url)) = (fresh, &args.url) {
-        c.call("Page.navigate", &format!("{{\"url\":\"{}\"}}", escape(url)), true)?;
-        // The navigation may swap the renderer; a screencast started before
-        // the new page commits fails with "Not attached to an active page".
-        c.wait_event("Page.frameNavigated", Duration::from_secs(15))?;
-    }
-    let cast = format!("{{\"format\":\"png\",\"everyNthFrame\":1,\"maxWidth\":{w},\"maxHeight\":{h}}}");
-    let mut tries = 0;
-    while let Err(e) = c.call("Page.startScreencast", &cast, true) {
-        tries += 1;
-        if tries == 50 || !e.to_string().contains("Not attached to an active page") {
-            return Err(e);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    eprintln!("[kami] screencast {w}x{h} x{} on target {target}", args.scale);
+    input_log_open();
+    ilog!("---- session start, pid {} ----", std::process::id());
+    let mut fb: Box<dyn Display> = Box::new(fb::Fb::open(&args.fb)?);
+    let scale = if args.scale == 0 { display::auto_scale(fb.screen_size()) } else { args.scale };
+    let view = fb.page_size(scale);
+    ilog!("startup: display opened (screen {:?}, scale {scale}, page {}x{})", fb.screen_size(), view.0, view.1);
+    let mut m = machine::Machine::new(machine::Config {
+        url: args.url.clone(),
+        home: HOME.into(),
+        view,
+        poll_ms: args.poll,
+        max_frames: args.frames,
+        seconds: args.seconds,
+    });
 
     let tty = RawTty::enter();
-    let started = Instant::now();
+    let mut stdin_open = tty.0.is_some();
+    let input_fd = match tty.0 {
+        Some(saved) => spawn_input_pump(saved)?,
+        None => 0,
+    };
+    let t0 = Instant::now();
+    let mut c: Option<Cdp> = None;
     let mut png = png::Decoder::default();
     let mut bytes = Vec::new();
-    let (mut frames, mut dec_t, mut blit_t, mut size_t) = (0u64, Duration::ZERO, Duration::ZERO, 0usize);
-    let mut window = Instant::now();
-    let mut stdin_open = tty.0.is_some();
-    let mut msgs: Vec<Vec<u8>> = std::mem::take(&mut c.queued);
-    let mut nav = nav::Nav::new();
-    // The status line lives in the page, so a navigation wipes it.
-    let mut status_due = true;
 
-    let trace = std::env::var_os("KAMI_TRACE").is_some();
-    // Polling `Page.captureScreenshot` instead of the screencast: on Akuma the
-    // screencast's frames are fully transparent (the compositor's video capture
-    // reads an empty shared buffer) while captureScreenshot is correct, so the
-    // first empty frame switches this on; `--poll MS` forces it.
-    let mut poll_ms = args.poll;
-    let mut next_shot = Instant::now();
-    let mut last_shot: Vec<u8> = Vec::new();
-    'outer: loop {
-        for m in msgs.drain(..) {
-            // Debug: KAMI_TRACE=1 names every CDP event the page sends.
-            if trace {
-                eprintln!("[kami] event {}\r", method(&m).unwrap_or("(reply)"));
-            }
-            if matches!(method(&m), Some("Page.frameNavigated" | "Page.loadEventFired"))
-                && event_session(&m) == Some(&session)
-            {
-                status_due = true;
-            }
-            if method(&m) != Some("Page.screencastFrame") || event_session(&m) != Some(&session) {
-                continue;
-            }
-            let ack = num_field(&m, "sessionId");
-            let data = str_field(&m, "data").unwrap_or("");
-            let td = Instant::now();
-            let ok = b64_decode(data.as_bytes(), &mut bytes).and_then(|_| png.decode(&bytes));
-            let tb = Instant::now();
-            // Debug: KAMI_DUMP=<path> keeps the latest frame's PNG (the first
-            // one is usually a blank page still loading), to tell a black
-            // frame from a black blit (2026-10-08, the trashcan's metal).
-            if poll_ms.is_none() {
-                if let Some(path) = std::env::var_os("KAMI_DUMP") {
-                    let _ = std::fs::write(path, &bytes);
-                }
-            }
-            if ok.is_ok() && poll_ms.is_none() && png.channels == 4 && (0..png.pixels.len() / 4).step_by(997).all(|i| png.pixels[i * 4 + 3] == 0) {
-                eprintln!("[kami] screencast frames are empty; polling Page.captureScreenshot instead\r");
-                poll_ms = Some(500);
-                next_shot = Instant::now();
-            }
-            // Once polling, the screencast's empty frames are acknowledged and
-            // dropped: blitted, each one painted the screen white over the
-            // last screenshot, which is only drawn again when the page changes
-            // (the blink, 2026-10-08, ryzen).
-            match ok {
-                Ok(()) if poll_ms.is_some() => {}
-                Ok(()) => fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale),
-                Err(e) => eprintln!("[kami] frame dropped: {e}\r"),
-            }
-            dec_t += tb - td;
-            blit_t += tb.elapsed();
-            size_t += bytes.len();
-            if let Some(id) = ack {
-                c.send("Page.screencastFrameAck", &format!("{{\"sessionId\":{id}}}"), true)?;
-            }
-            frames += 1;
-            if frames % 30 == 0 || frames == 1 || args.frames == Some(frames) {
-                let n = if frames == 1 { 1 } else { 30.min(frames) } as u32;
-                eprintln!(
-                    "[kami] frame {frames} {}x{}: {:.1} fps, png {} KB, decode {:.1} ms, blit {:.1} ms\r",
-                    png.width,
-                    png.height,
-                    n as f64 / window.elapsed().as_secs_f64(),
-                    size_t / n as usize / 1024,
-                    dec_t.as_secs_f64() * 1e3 / n as f64,
-                    blit_t.as_secs_f64() * 1e3 / n as f64,
-                );
-                (dec_t, blit_t, size_t, window) = (Duration::ZERO, Duration::ZERO, 0, Instant::now());
-            }
-            if args.frames == Some(frames) {
-                break 'outer;
-            }
-        }
-        if args.seconds.is_some_and(|s| started.elapsed().as_secs_f64() >= s) {
-            break;
-        }
-
-        if let Some(ms) = poll_ms {
-            if Instant::now() >= next_shot {
-                next_shot = Instant::now() + Duration::from_millis(ms);
-                // A navigation in flight makes this fail; the next poll retries.
-                if let Ok(r) = c.call("Page.captureScreenshot", "{\"format\":\"png\"}", true) {
-                    msgs.extend(std::mem::take(&mut c.queued));
-                    let mut shot = Vec::new();
-                    let td = Instant::now();
-                    let ok = b64_decode(str_field(&r, "data").unwrap_or("").as_bytes(), &mut shot)
-                        .and_then(|_| if shot == last_shot { Ok(false) } else { png.decode(&shot).map(|_| true) });
-                    match ok {
-                        Ok(true) => {
-                            let tb = Instant::now();
-                            fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale);
-                            if let Some(path) = std::env::var_os("KAMI_DUMP") {
-                                let _ = std::fs::write(path, &shot);
-                            }
-                            frames += 1;
-                            if frames <= 3 || frames % 30 == 0 {
-                                eprintln!(
-                                    "[kami] shot {frames} {}x{}: png {} KB, decode {:.1} ms, blit {:.1} ms\r",
-                                    png.width, png.height, shot.len() / 1024,
-                                    (tb - td).as_secs_f64() * 1e3, tb.elapsed().as_secs_f64() * 1e3,
-                                );
-                            }
-                            last_shot = shot;
-                        }
-                        Ok(false) => {}
-                        Err(e) => eprintln!("[kami] shot dropped: {e}\r"),
-                    }
-                    if args.frames == Some(frames) {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-
+    loop {
         let mut fds = [
-            libc::pollfd { fd: c.fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: 0, events: if stdin_open { libc::POLLIN } else { 0 }, revents: 0 },
+            libc::pollfd { fd: c.as_ref().map_or(-1, |c| c.fd()), events: libc::POLLIN, revents: 0 },
+            // A negative fd is skipped by poll; `events: 0` is not enough, since
+            // POLLHUP is always reported and a closed input would spin the loop.
+            libc::pollfd { fd: if stdin_open { input_fd } else { -1 }, events: libc::POLLIN, revents: 0 },
         ];
         // SAFETY: two valid pollfd entries.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, 250) } < 0 {
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) } < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(e);
         }
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(Event::Tick(t0.elapsed().as_millis() as u64));
         if fds[0].revents != 0 {
-            if !c.fill()? {
-                eprintln!("[kami] daemon went away\r");
-                return Ok(());
-            }
-            while let Some(m) = c.next() {
-                msgs.push(m);
+            if let Some(cc) = c.as_mut() {
+                match cc.fill() {
+                    Ok(true) => {
+                        while let Some(msg) = cc.next() {
+                            queue.push_back(Event::Cdp(msg));
+                        }
+                    }
+                    _ => queue.push_back(Event::DaemonGone),
+                }
             }
         }
         if fds[1].revents != 0 {
             let mut buf = [0u8; 256];
             // SAFETY: reading into a stack buffer of the stated size.
-            let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(input_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 {
                 stdin_open = false;
-                continue;
-            }
-            next_shot = Instant::now() + Duration::from_millis(150);
-            for k in decode_keys(&buf[..n as usize]) {
-                for act in nav.feed(&k) {
-                    if act == nav::Action::Quit {
-                        break 'outer;
-                    }
-                    perform(&mut c, &mut nav, act, (w, h))?;
+                queue.push_back(Event::InputClosed);
+            } else {
+                ilog!("tty chunk [{}]", buf[..n as usize].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+                for k in decode_keys(&buf[..n as usize]) {
+                    queue.push_back(Event::Key(k));
                 }
             }
-            status_due = true;
         }
-        if status_due {
-            status_due = false;
-            show_status(&mut c, &nav);
-            // Replies and events that arrived during the page calls.
-            msgs.extend(std::mem::take(&mut c.queued));
+
+        while let Some(ev) = queue.pop_front() {
+            for eff in m.handle(ev) {
+                match eff {
+                    Effect::TryConnect { spawn } => {
+                        if spawn {
+                            if let Err(e) = daemon::spawn_detached(&daemon_config(args, view.0, view.1)) {
+                                ilog!("could not spawn the daemon: {e}");
+                            }
+                        }
+                        match Cdp::connect(&args.sock) {
+                            Ok(x) => {
+                                c = Some(x);
+                                queue.push_back(Event::Connected);
+                            }
+                            Err(_) => queue.push_back(Event::ConnectFailed),
+                        }
+                    }
+                    Effect::Send(msg) => {
+                        if let Some(cc) = c.as_mut() {
+                            if let Err(e) = cc.send_raw(&msg) {
+                                ilog!("send failed: {e}");
+                                queue.push_back(Event::DaemonGone);
+                            }
+                        }
+                    }
+                    Effect::Present { b64, source } => {
+                        let (ok, empty) = present(&mut *fb, &mut png, &mut bytes, &b64, scale);
+                        queue.push_back(Event::Presented { source, ok, empty });
+                    }
+                    Effect::Status(t) => fb.status(&t),
+                    Effect::Log(t) => ilog!("{t}"),
+                    Effect::Done(err) => {
+                        ilog!("session done: {err:?}");
+                        drop(tty);
+                        eprintln!("[kami] detached; chromium keeps running (kami --kill stops it)");
+                        return match err {
+                            None => Ok(()),
+                            Some(e) => Err(io::Error::other(e)),
+                        };
+                    }
+                }
+            }
         }
     }
-
-    drop(tty);
-    // Detach, leaving Chromium and the page for the next session.
-    let _ = c.call("Page.stopScreencast", "{}", true);
-    let _ = c.call("Target.detachFromTarget", &format!("{{\"sessionId\":\"{session}\"}}"), false);
-    eprintln!("[kami] detached after {frames} frames; chromium keeps running (kami --kill stops it)");
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdp::{event_session, first_page, method, num_field, str_field};
 
     #[test]
     fn base64_round_trip() {

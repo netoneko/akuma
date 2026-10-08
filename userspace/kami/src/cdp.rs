@@ -12,7 +12,6 @@
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
 
 /// Splits a byte stream into NUL-terminated messages.
 #[derive(Default)]
@@ -155,10 +154,6 @@ impl Cdp {
         self.stream.as_raw_fd()
     }
 
-    pub fn set_session(&mut self, s: &str) {
-        self.session = Some(s.to_string());
-    }
-
     /// Send a command; `params` is a JSON object literal. Returns its id.
     pub fn send(&mut self, method: &str, params: &str, to_session: bool) -> io::Result<u64> {
         self.next_id += 1;
@@ -171,6 +166,13 @@ impl Cdp {
             .map(|_| self.next_id)
     }
 
+    /// Write one complete message the caller has already framed (id, session
+    /// and all); the NUL terminator is added here.
+    pub fn send_raw(&mut self, msg: &str) -> io::Result<()> {
+        self.stream.write_all(msg.as_bytes())?;
+        self.stream.write_all(b"\0")
+    }
+
     /// One read from the socket. `Ok(false)` at EOF.
     pub fn fill(&mut self) -> io::Result<bool> {
         Ok(self.frames.read_from(&mut self.stream)? > 0)
@@ -178,39 +180,6 @@ impl Cdp {
 
     pub fn next(&mut self) -> Option<Vec<u8>> {
         self.frames.next()
-    }
-
-    /// Wait up to `timeout` for an event named `name` on our session; other
-    /// events seen meanwhile stay queued. `Ok(false)` on timeout.
-    pub fn wait_event(&mut self, name: &str, timeout: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + timeout;
-        let ours = |m: &[u8], s: &Option<String>| {
-            method(m) == Some(name) && event_session(m) == s.as_deref()
-        };
-        if let Some(i) = self.queued.iter().position(|m| ours(m, &self.session)) {
-            self.queued.remove(i);
-            return Ok(true);
-        }
-        loop {
-            while let Some(m) = self.next() {
-                if ours(&m, &self.session) {
-                    return Ok(true);
-                }
-                if m.starts_with(b"{\"method\":") {
-                    self.queued.push(m);
-                }
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(false);
-            }
-            let mut pfd = libc::pollfd { fd: self.fd(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd.
-            let r = unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) };
-            if r > 0 && !self.fill()? {
-                return Err(io::Error::other("daemon closed the connection"));
-            }
-        }
     }
 
     /// Send a command and block for its reply; events seen meanwhile are queued.
