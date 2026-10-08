@@ -150,9 +150,13 @@ fn fd_sock(fd: u32) -> Option<u32> {
 /// uid until per-process credentials exist; the `pid` is usable for
 /// identification. Left as a real capture path so that adding real uids is a
 /// one-line change here rather than a redesign.
+///
+/// `pid` is the **thread group** (`tgid`), which is what Linux reports in both
+/// `SO_PEERCRED` and `SCM_CREDENTIALS`. It read `p.pid` until 2026-10-08,
+/// which for a non-main thread is that thread's own id.
 fn current_creds() -> Ucred {
     akuma_exec::process::current_process_shared().map_or_else(Ucred::default, |p| Ucred {
-        pid: p.pid,
+        pid: p.tgid,
         uid: 0,
         gid: 0,
     })
@@ -833,6 +837,33 @@ pub fn peer_cred_of(fd: u32) -> Option<Ucred> {
     with_table(|t| t.get(sock).map(|s| s.peer_creds))
 }
 
+/// `setsockopt(SO_PASSCRED)`. `false` when `fd` has no table entry.
+pub fn set_passcred(fd: u32, on: bool) -> bool {
+    let Some(sock) = fd_sock(fd) else { return false };
+    with_table(|t| t.get_mut(sock).map(|s| s.passcred = on).is_some())
+}
+
+/// `getsockopt(SO_PASSCRED)`.
+pub fn passcred_of(fd: u32) -> Option<bool> {
+    let sock = fd_sock(fd)?;
+    with_table(|t| t.get(sock).map(|s| s.passcred))
+}
+
+/// The credentials a connected send from `sock` attaches to its record:
+/// always for a framed type (the record exists anyway), and for a stream only
+/// when this end or its peer has `SO_PASSCRED` — Linux's `unix_maybe_add_creds`
+/// — so the plain stream path stays allocation-free.
+fn send_creds(sock: u32) -> Option<Ucred> {
+    let wanted = with_table(|t| {
+        t.get(sock).is_some_and(|s| {
+            s.ty.is_framed()
+                || s.passcred
+                || s.peer.and_then(|p| t.get(p)).is_some_and(|p| p.passcred)
+        })
+    });
+    wanted.then(current_creds)
+}
+
 // ============================================================================
 // Readiness
 // ============================================================================
@@ -945,7 +976,8 @@ pub fn unix_send_anc(fd: u32, data: &[u8], dontwait: bool, mut anc: InFlight) ->
                     );
                 }
                 let fds = anc.take();
-                with_table(|t| t.commit_write(tx, written, plan.push_record, fds));
+                let creds = send_creds(sock);
+                with_table(|t| t.commit_write_creds(tx, written, plan.push_record, fds, creds));
                 return written as u64;
             }
             Err(e) if e == libc_errno::EAGAIN => {
@@ -1053,7 +1085,10 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool, mut anc: InFlight) 
                     );
                 }
                 let fds = anc.take();
-                with_table(|t| t.commit_write(queue, written, true, fds));
+                // A datagram always has a record, so its sender always rides
+                // along; see [`send_creds`].
+                let creds = Some(current_creds());
+                with_table(|t| t.commit_write_creds(queue, written, true, fds, creds));
                 return plan.bytes as u64;
             }
             Err(e) if e == libc_errno::EAGAIN => {
@@ -1110,30 +1145,33 @@ fn pipe_write_bytes(tx: u32, data: &[u8], nonblock: bool) -> u64 {
 /// `recvmsg` reply. A negated errno is returned in the first element with the
 /// high bit set, so callers check `(n as i64) < 0` as usual.
 pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, bool) {
-    let (n, truncated, anc) = unix_recv_anc(fd, buf, dontwait, peek);
+    let (n, truncated, anc, _creds) = unix_recv_anc(fd, buf, dontwait, peek);
     // A plain receive has nowhere to put descriptors; Linux closes them.
     scm_release(anc);
     (n, truncated)
 }
 
-/// [`unix_recv`] that also returns the `SCM_RIGHTS` tokens of the message(s)
-/// it consumed, for `recvmsg` to install. The caller owns them: install or
-/// release, never drop.
-pub fn unix_recv_anc(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, bool, Vec<u32>) {
+/// [`unix_recv`] plus the message's ancillary data, for `recvmsg`.
+///
+/// Returns the `SCM_RIGHTS` tokens of the message(s) it consumed, for
+/// `recvmsg` to install, and — when this socket has `SO_PASSCRED` — the
+/// sender's credentials for `SCM_CREDENTIALS`. The caller owns the tokens:
+/// install or release, never drop.
+pub fn unix_recv_anc(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, bool, Vec<u32>, Option<Ucred>) {
     let Some((rx, _, sock)) = fd_parts(fd) else {
-        return (ENOTSOCK, false, Vec::new());
+        return (ENOTSOCK, false, Vec::new(), None);
     };
     if rx == 0 {
-        return (ENOTCONN, false, Vec::new());
+        return (ENOTCONN, false, Vec::new(), None);
     }
     let Some(sock) = (sock != 0).then_some(sock) else {
         let n = pipe_read_bytes(rx, buf, dontwait || super::net::fd_is_nonblock(fd));
-        return (n, false, Vec::new());
+        return (n, false, Vec::new(), None);
     };
 
-    let (ty, rd_shut) = match with_table(|t| t.get(sock).map(|s| (s.ty, s.shutdown.rd))) {
+    let (ty, rd_shut, passcred) = match with_table(|t| t.get(sock).map(|s| (s.ty, s.shutdown.rd, s.passcred))) {
         Some(v) => v,
-        None => return (EBADF, false, Vec::new()),
+        None => return (EBADF, false, Vec::new(), None),
     };
     // `SHUT_RD` does **not** discard what has already arrived.
     //
@@ -1196,8 +1234,15 @@ pub fn unix_recv_anc(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u6
             }
             // A zero-length datagram moves no bytes but must still be consumed,
             // or the receiver re-reads the same empty record forever.
-            let anc = with_table(|t| t.commit_read(rx, consumed, plan.consume_record));
-            return (taken as u64, plan.truncated, anc);
+            // The sender's credentials are read *before* the record they
+            // belong to is consumed. A message queued while neither end had
+            // `SO_PASSCRED` reports Linux's "unknown" (pid 0, overflow ids).
+            let (anc, creds) = with_table(|t| {
+                let creds = passcred
+                    .then(|| t.front_creds(rx).unwrap_or(akuma_net_unix::scm::UNKNOWN_CREDS));
+                (t.commit_read(rx, consumed, plan.consume_record), creds)
+            });
+            return (taken as u64, plan.truncated, anc, creds);
         }
         // Nothing queued. EOF when the peer's write end is truly gone, or when
         // this end has been shut down for reading — "drained" and "at EOF" are
@@ -1205,10 +1250,10 @@ pub fn unix_recv_anc(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u6
         // tokio client park forever on the AF_INET side
         // (docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md).
         if rd_shut || super::pipe::pipe_hup(rx) {
-            return (0, false, Vec::new());
+            return (0, false, Vec::new(), None);
         }
         if nonblock {
-            return (EAGAIN, false, Vec::new());
+            return (EAGAIN, false, Vec::new(), None);
         }
         let tid = akuma_exec::threading::current_thread_id();
         if !super::pipe::pipe_check_set_reader(rx, tid) {

@@ -1342,3 +1342,54 @@ fn stream_read_limit_none_without_descriptors() {
     assert_eq!(t.stream_read_limit(9), None);
     assert_eq!(t.stream_read_limit(77), None);
 }
+
+// ---- SCM_CREDENTIALS: who sent these bytes ---------------------------------
+
+const ALICE: Ucred = Ucred { pid: 10, uid: 0, gid: 0 };
+const BOB: Ucred = Ucred { pid: 20, uid: 0, gid: 0 };
+
+#[test]
+fn framed_records_carry_their_senders_credentials() {
+    // Chromium's zygote child pings over a SEQPACKET pair; the browser reads
+    // the child's pid off the record (`RecvMsgWithPid`).
+    let mut t = UnixTable::new();
+    t.attach_channel(9);
+    t.commit_write_creds(9, 4, true, Vec::new(), Some(ALICE));
+    t.commit_write_creds(9, 4, true, Vec::new(), Some(BOB));
+    assert_eq!(t.front_creds(9), Some(ALICE));
+    t.commit_read(9, 4, true);
+    assert_eq!(t.front_creds(9), Some(BOB));
+    t.commit_read(9, 4, true);
+    assert_eq!(t.front_creds(9), None);
+}
+
+#[test]
+fn a_stream_read_never_spans_two_senders() {
+    let mut t = UnixTable::new();
+    t.attach_channel(9);
+    t.commit_write_creds(9, 5, false, Vec::new(), Some(ALICE));
+    t.commit_write_creds(9, 3, false, Vec::new(), Some(ALICE)); // same sender: coalesces
+    t.commit_write_creds(9, 7, false, Vec::new(), Some(BOB));
+    assert_eq!(t.stream_read_limit(9), Some(8), "stop where BOB's bytes begin");
+    assert_eq!(t.front_creds(9), Some(ALICE));
+    t.commit_read(9, 8, false);
+    assert_eq!(t.front_creds(9), Some(BOB));
+    assert_eq!(t.stream_read_limit(9), None);
+}
+
+#[test]
+fn uncredentialed_stream_bytes_stay_ahead_of_credentialed_ones() {
+    // Bytes sent before anyone set SO_PASSCRED carry no credentials, and must
+    // not be reported under the first credentialed writer's.
+    let mut t = UnixTable::new();
+    t.attach_channel(9);
+    t.commit_write(9, 6, false, Vec::new());
+    t.commit_write_creds(9, 2, false, Vec::new(), Some(ALICE));
+    assert_eq!(t.stream_read_limit(9), Some(6));
+    assert_eq!(t.front_creds(9), None);
+    t.commit_read(9, 6, false);
+    assert_eq!(t.front_creds(9), Some(ALICE));
+    // And a plain write after credentialed bytes does not join their record.
+    t.commit_write(9, 4, false, Vec::new());
+    assert_eq!(t.stream_read_limit(9), Some(2));
+}

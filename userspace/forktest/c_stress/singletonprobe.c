@@ -2,7 +2,8 @@
  * singletonprobe: Chromium's ProcessSingleton setup, step for step as Linux
  * strace shows it (chrome/browser/process_singleton_posix.cc), each step
  * reported with its errno. On Akuma Chromium logs "Failed to create socket
- * directory", which is the mkdtemp. Linux: every step 0.
+ * directory", which is the mkdtemp. Linux: every step 0, and the
+ * directory's mode is 0700.
  *   singletonprobe [profile-dir]   default /tmp/singleton-prof
  */
 #include <errno.h>
@@ -41,6 +42,11 @@ int main(int argc, char **argv) {
     }
     struct stat sb;
     step("stat(dir)", stat(dir, &sb));
+    /* Chromium CHECKs exactly this (process_singleton_posix.cc): the socket
+     * directory's permission bits must be 0700, which is mkdtemp's mode. Akuma
+     * ignored mkdir's mode until 2026-10-08 and made it 0755. */
+    printf("singletonprobe: dir mode 0%o (want 0700)\n", (unsigned)(sb.st_mode & 07777));
+    if ((sb.st_mode & 07777) != 0700) fails++;
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     step("socket(AF_UNIX, SOCK_STREAM)", s);
     snprintf(a, sizeof a, "%s/SingletonSocket", prof);

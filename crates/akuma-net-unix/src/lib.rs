@@ -408,6 +408,15 @@ pub struct Record {
     /// both wrong and a confused-deputy bug — a receiver would act on a
     /// descriptor it has not yet been told about.
     pub anc_fds: Vec<u32>,
+    /// The sender's credentials, captured at send time when either end had
+    /// `SO_PASSCRED` (Linux's `unix_maybe_add_creds`). A receiver with
+    /// `SO_PASSCRED` gets them back as `SCM_CREDENTIALS`.
+    ///
+    /// Per record for the same reason as `anc_fds`: they describe *who sent
+    /// these bytes*, and two writers' bytes must never be reported under one
+    /// sender. Chromium's browser learns a zygote child's real pid this way
+    /// (`RecvMsgWithPid`) and treats a ping without one as no ping at all.
+    pub creds: Option<Ucred>,
 }
 
 /// The framing metadata for one direction of one connection, keyed in
@@ -643,6 +652,9 @@ pub struct UnixSock {
     /// How many fds reference this entry. `dup`/`fork` bump it; the entry is
     /// removed when it reaches zero.
     pub refs: u32,
+    /// `SO_PASSCRED`: receive `SCM_CREDENTIALS` with every message, and have
+    /// messages sent from here carry the sender's credentials.
+    pub passcred: bool,
 }
 
 impl UnixSock {
@@ -662,6 +674,7 @@ impl UnixSock {
             backlog: VecDeque::new(),
             backlog_max: DEFAULT_BACKLOG,
             refs: 1,
+            passcred: false,
         }
     }
 
@@ -1130,28 +1143,56 @@ impl UnixTable {
     /// boundaries exist, which is the framed types and ancillary-carrying
     /// streams.
     pub fn commit_write(&mut self, pipe_id: u32, bytes: usize, push_record: bool, anc_fds: Vec<u32>) {
-        if !push_record && anc_fds.is_empty() {
+        self.commit_write_creds(pipe_id, bytes, push_record, anc_fds, None);
+    }
+
+    /// [`Self::commit_write`] with the sender's credentials for the record
+    /// (`None` when neither end has `SO_PASSCRED`).
+    ///
+    /// A stream write with credentials coalesces only into a tail record with
+    /// the **same** credentials and no descriptors, so bytes from two writers
+    /// never share a record — [`Self::stream_read_limit`] then stops a read at
+    /// the change, as Linux does.
+    pub fn commit_write_creds(
+        &mut self,
+        pipe_id: u32,
+        bytes: usize,
+        push_record: bool,
+        anc_fds: Vec<u32>,
+        creds: Option<Ucred>,
+    ) {
+        let plain = !push_record && anc_fds.is_empty();
+        if plain && creds.is_none() {
             // Plain stream write: a counter bump, no allocation, no record.
             // Coalesce into the tail — the trailing record if one exists (so
             // later bytes stay behind descriptors already sent), otherwise
             // `pending_bytes`.
             let Some(ch) = self.channels.get_mut(&pipe_id) else { return };
             match ch.records.back_mut() {
-                Some(last) if last.anc_fds.is_empty() => last.len += bytes,
-                Some(_) => ch.records.push_back(Record { len: bytes, anc_fds: Vec::new() }),
+                Some(last) if last.anc_fds.is_empty() && last.creds.is_none() => last.len += bytes,
+                Some(_) => ch.records.push_back(Record { len: bytes, anc_fds: Vec::new(), creds: None }),
                 None => ch.pending_bytes += bytes,
             }
             return;
         }
         let ch = self.channels.entry(pipe_id).or_default();
-        // Descriptors are arriving, so the bytes ahead of them need a record of
-        // their own — otherwise a reader draining only those earlier bytes
-        // would pop this record and receive the descriptors early.
+        if plain
+            && let Some(last) = ch.records.back_mut()
+            && last.anc_fds.is_empty()
+            && last.creds == creds
+        {
+            last.len += bytes;
+            return;
+        }
+        // Descriptors or credentials are arriving, so the bytes ahead of them
+        // need a record of their own — otherwise a reader draining only those
+        // earlier bytes would pop this record and receive the descriptors (or
+        // be told the wrong sender) early.
         if ch.pending_bytes > 0 {
             let pending = core::mem::take(&mut ch.pending_bytes);
-            ch.records.push_back(Record { len: pending, anc_fds: Vec::new() });
+            ch.records.push_back(Record { len: pending, anc_fds: Vec::new(), creds: None });
         }
-        ch.records.push_back(Record { len: bytes, anc_fds });
+        ch.records.push_back(Record { len: bytes, anc_fds, creds });
     }
 
     /// The most a `SOCK_STREAM` read may take before it has to stop: through
@@ -1163,17 +1204,41 @@ impl UnixTable {
     /// together, and receivers rely on it: Chromium's Mojo channel matches
     /// handles to messages by arrival. Without the stop a read spanning two
     /// descriptor-carrying writes would deliver both sets at once.
+    ///
+    /// It also stops where the sender's credentials change (2026-10-08): Linux
+    /// never glues two writers' bytes into one read when credentials are being
+    /// passed (`unix_stream_read_generic`'s `check_creds`), because the one
+    /// `SCM_CREDENTIALS` the read returns could only describe one of them.
     #[must_use]
     pub fn stream_read_limit(&self, pipe_id: u32) -> Option<usize> {
         let ch = self.channels.get(&pipe_id)?;
         let mut limit = ch.pending_bytes;
+        // The credentials of what the read starts with: `pending_bytes` carry
+        // none.
+        let mut first: Option<Option<Ucred>> = (limit > 0).then_some(None);
         for r in &ch.records {
+            match first {
+                Some(c) if c != r.creds => return Some(limit),
+                _ => first = Some(r.creds),
+            }
             limit += r.len;
             if !r.anc_fds.is_empty() {
                 return Some(limit);
             }
         }
         None
+    }
+
+    /// The credentials of the next bytes a read would return: the front
+    /// record's, or `None` for un-recorded leading stream bytes (and for an
+    /// empty channel).
+    #[must_use]
+    pub fn front_creds(&self, pipe_id: u32) -> Option<Ucred> {
+        let ch = self.channels.get(&pipe_id)?;
+        if ch.pending_bytes > 0 {
+            return None;
+        }
+        ch.records.front().and_then(|r| r.creds)
     }
 
     /// The front record's length, for [`plan_read`].

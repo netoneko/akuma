@@ -81,20 +81,34 @@ amd64 kernel under Firecracker too. Four fixes got it there:
 The 1324 GiB reservation works, but costs about 290 ms against Linux's 0.5 ms,
 nearly all of it in `munmap`.
 
-Two more fixes came from Chromium's first run on Akuma (2026-10-08):
-`setsockopt` on a unix fd was `ENOTSOCK` on amd64, and crashpad
-`CHECK`-crashed on it; and `execve("/proc/self/exe")` recorded that literal
-path as the new image's name.
+Chromium's runs on Akuma (2026-10-08) found and fixed, in order:
 
-**Chromium on Akuma does not render a page yet.** It starts under Firecracker
-and gets well into startup. The blockers are, in order:
+- `setsockopt` on a unix fd was `ENOTSOCK` on amd64, and crashpad
+  `CHECK`-crashed on it.
+- `execve` copied the whole 250 MB binary into the kernel heap. It streams
+  now, so a 4 GiB guest is enough.
+- `int3` arrived as `SIGSEGV`. It's `SIGTRAP` now, so a `CHECK` reads as one.
+- Regular-file reads stopped at 64 KiB.
+- `CLOCK_REALTIME` was frozen at 0 with no network. musl's `mkdtemp` then
+  retried one name 100 times, which was the ProcessSingleton failure.
+- `prctl(PR_SET_NAME)` rewrote `/proc/self/exe`, so Chromium looked for its
+  crashpad handler, its V8 snapshot and itself in `""`.
+- `/proc/<pid>/task` did not exist, and the zygote's sandbox helper counts
+  threads there.
+- `mkdir` ignored its mode, and the ProcessSingleton `CHECK`s that its
+  socket directory is exactly 0700.
+- `SO_PASSCRED` produced no `SCM_CREDENTIALS`, and the browser takes each
+  zygote child's pid from them.
 
-1. `execve` copies the whole 250 MB binary into the kernel heap on every
-   re-exec. It needs a streaming loader; a ≥ 8 GiB guest gets a 1 GiB heap
-   and gets past this.
-2. crashpad's `posix_spawn` fails `ENOENT`.
-3. The ProcessSingleton `mkdtemp` fails.
-4. Zygote children cannot load the V8 snapshot.
+**Chromium on Akuma does not render a page yet.** The browser now runs for
+about 10 s and launches children through the zygote. A zygote child then
+crashes before it can report back, so the GPU process never starts. That
+crash is being traced next. The open list (including `gettid()` of a main
+thread not being its pid) is in the record below.
+
+Finding these took a trace of failing syscalls (`strace_err` on the kernel
+command line):
+[`docs/runbooks/trace-failing-syscalls-amd64.md`](../../docs/runbooks/trace-failing-syscalls-amd64.md).
 
 Full record:
 [`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`](../../docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md).

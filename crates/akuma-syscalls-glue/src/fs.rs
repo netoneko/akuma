@@ -3094,7 +3094,14 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 }
 
-pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> SysResult {
+/// The file-creation mask every process has.
+///
+/// `umask(2)` reports it and stores nothing (there is no per-process mask yet),
+/// so the value applied when creating a directory and the value programs are
+/// told must be this one.
+pub const UMASK: u32 = 0o022;
+
+pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 512)?;
 
     // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
@@ -3119,7 +3126,17 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> SysResult {
     }
 
     match akuma_vfs_glue::fs::create_dir(&path) {
-        Ok(()) => Ok(0),
+        // The requested mode, as Linux applies it: `mode & ~umask`, keeping
+        // the permission bits and the sticky bit (`S_IRWXUGO | S_ISVTX`).
+        // `mode` was ignored until 2026-10-08 and every directory got the
+        // filesystem's default, so `mkdtemp`'s 0700 came out 0755 — and
+        // Chromium's ProcessSingleton `CHECK`s that its socket directory is
+        // exactly 0700 (`process_singleton_posix.cc`). A failed chmod leaves the
+        // directory as created: the mkdir itself succeeded.
+        Ok(()) => {
+            let _ = akuma_vfs_glue::chmod(&path, mode & !UMASK & 0o1777);
+            Ok(0)
+        }
         Err(e) => Err(fs_error_to_errno(e)),
     }
 }

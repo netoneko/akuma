@@ -618,6 +618,22 @@ pub fn deliver_fault_signal(
         return false;
     };
 
+    // Under `strace_err`, a fault caught by the program's own handler is a
+    // failure the trace would otherwise never show: no `[Fault]` line prints
+    // (that is `user_fault`, for faults with no handler), and a crash
+    // reporter — Chromium's crashpad — swallows the rest. Found 2026-10-08,
+    // when a zygote child crashed before it could ping and the only trace was
+    // the browser's "Did not receive ping".
+    if crate::usermode::SYSCALL_TRACE_ERRORS.load(Ordering::Relaxed) {
+        akuma_primitives::tprint!(
+            160,
+            "[sig!] pid={} task={} sig={sig} code={si_code:#x} rip={:#x} addr={addr:#x} -> handler {:#x}\n",
+            proc.pid,
+            crate::sched::current_task(),
+            frame.rip,
+            entry,
+        );
+    }
     install_handler_frame(frame, regs, &next);
     enter_handler(sig, idx, &action, proc, tid);
     true

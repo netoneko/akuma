@@ -101,7 +101,10 @@ every child that way) could then read `/proc/self/exe` back as itself, and
 Chromium finds its own files next to that path. The name is now resolved
 through symlinks before the swap, while `/proc/self` still names the caller.
 **Not shown to have changed Chromium's behaviour**: the snapshot and
-crashpad errors below persisted after it.
+crashpad errors below persisted after it. *(2026-10-08: they persisted
+because the name this fix wrote was overwritten moments later by
+`prctl(PR_SET_NAME)`; see Fix 12, which gives `/proc/<pid>/exe` a field of
+its own.)*
 
 ## Fix 7: `hpbox.deploy()` reported success on a reset that did not land
 
@@ -115,39 +118,205 @@ shared-page table. `deploy()` now refuses when the box did not land on the
 intended commit. The runbook (`amd64-bare-metal-loop.md`) shows how to carry
 commits over with `git bundle`.
 
-## Still open: what Chromium hit on Akuma
+## Fix 8: `execve` copied the whole executable into the kernel heap
 
-Chromium was run under Firecracker on an ext2 image built from the same
-Alpine container, with `init=/bin/busybox initargs=sh,<script>`. The rig is
-`userspace/kami/probe/akuma/` (`push.sh`, `mkimg.sh`, `run-fc.sh`,
-`kami-smoke.sh`); probes `exeprobe.c` and `shmvar.c` are beside
-`chromeprobe.c`. It starts and
-gets well into browser startup, then:
+The first blocker of the 2026-10-08 handoff. `fs::read_image` read the whole
+binary into one heap `Vec` (capped at 256 MB) and handed it to the loader.
+Chromium is 250 MB and re-execs itself, and two copies did not fit a 512 MiB
+heap (`[ALLOC FAIL] requested=249690856`, then `EIO` after a 20 s wait).
 
-- **`execve` reads the whole executable into the kernel heap.** Chromium is
-  250 MB, and it re-execs itself for the zygote and utility processes. On a
-  512 MiB heap the second copy does not fit (`[ALLOC FAIL]
-  requested=249690856`); the exec waits about 20 s and fails `EIO`. A guest
-  with ≥ 8 GiB gets the 1 GiB heap and gets past it. The fix is to stream the
-  loader: read headers, then each segment straight into its pages. See § "The whole-file heap" below.
-- **crashpad: `posix_spawn chrome_crashpad_handler: ENOENT`.** The file is
-  there. musl's `posix_spawn` uses a `CLONE_VM|CLONE_VFORK` child that
-  `execve`s. It is not yet known whether this is the path or the vfork-exec.
-- **`Failed to create socket directory`** (ProcessSingleton): `mkdtemp` under
-  `/tmp`, not yet probed.
-- **Zygote children: `Error loading V8 startup snapshot file`.** They get the
-  snapshot as an fd from the browser. Not seen with `--no-zygote`, which
-  stops earlier at the ProcessSingleton error.
-- **`int3` from ring 3 arrives as SIGSEGV** (`#GP err=0x1a`: IDT vector 3's
-  gate is not DPL 3). Chromium's `CHECK` failures therefore look like
-  segfaults. Linux delivers SIGTRAP.
-- **`init=` does not follow symlinks.** `init=/bin/sh` on an image where it
-  is a fast symlink to busybox read the link target's bytes as block numbers
-  (`read_sectors: sector 14819201400`, which is "/bin" read as a block
-  number). ext2's `read_at` should refuse a symlink inode.
-- **Syscalls missing from the x86_64 table** (ENOSYS, non-fatal so far): 40
-  `sendfile`, 141 `setpriority`, 239 `get_mempolicy`, 297
-  `rt_tgsigqueueinfo`, 444 `landlock_create_ruleset`.
+**Fix:** a streaming loader. `akuma_elf::load_elf_eager_from_path` pairs the
+crate's existing path source with its eager mapping strategy, and
+`map_segment_eager` reads file bytes through a window of 64 KiB (one page on
+`extreme`, to keep that profile's 10 KB interpreter-load bound) instead of
+one read per page. amd64's `execve`/`spawn` read only the 256-byte head (for
+`#!`) through `fs::read_image_head`, then call `loader::load_path`. The
+mapping is still eager; lazy file-backed text is a later step.
+
+**Proof:** a 4 GiB guest (512 MiB heap) gets past every Chromium exec. Three
+back-to-back execs of the 250 MB binary peaked `Slab:` at 139 MB, of which
+128 MB is the block cache (a quarter of the heap), so the exec itself needed
+about 11 MB. Host tests in `akuma-elf` (`window_tests`) compare every byte of
+a segment spanning several windows, and fail on a mutated refill rule.
+
+## Fix 9: `int3` from ring 3 arrived as `SIGSEGV`
+
+IDT vector 3's gate was DPL 0, so a ring-3 `int3` raised `#GP` (`err=0x1a`)
+and became a `SIGSEGV`. Every Chromium `CHECK` failure is an `int3`. The gate
+is DPL 3 now (`Entry::set_user`), and `#BP` goes through `ring3_exception` as
+`SIGTRAP`/`SI_KERNEL`, as Linux's `do_int3_user` does. Gate: `bpprobe.c`.
+
+## Fix 10: a regular-file `read`/`pread` stopped at 64 KiB
+
+Every file read was clamped to `MAX_IO` (64 KiB), on amd64 and again inside
+glue's `File` arms. A short read is legal POSIX, but Linux never gives one on a
+regular file before EOF: `pread(fd, buf, 776865, 0)` of the V8 snapshot
+returned 65 536 here. Under the amd64 feature `linux-file-io` (default on),
+`fd::read_file_full` loops glue's 64 KiB read until the request, EOF or an
+error, up to Linux's `MAX_RW_COUNT`. The kernel buffer per call is unchanged.
+Not atomic against a second reader of the same description (Linux holds
+`f_pos_lock`). Gate: `snapprobe.c`.
+
+## Fix 11: `CLOCK_REALTIME` was frozen at 0 until SNTP set it
+
+`clock_gettime(CLOCK_REALTIME)`, `gettimeofday`, `time` and `adjtimex` all
+answered `utc_time_us(..).unwrap_or(0)`. A Firecracker guest with no network
+never syncs, so the wall clock read a constant 0, not 0 and counting. musl's
+`__randname` (behind `mkdtemp`, `mkstemp`, `tmpnam`) seeds from `tv_sec +
+tv_nsec`, so every attempt made the same name: Chromium's
+`mkdir("/tmp/.org.chromium.Chromium.scoped_dir.EAAIAA")` failed `EEXIST` 100
+times and the ProcessSingleton reported `Failed to create socket directory`.
+That was blocker 3. `singletonprobe` passed in isolation because it was the
+first process to use the name.
+
+**Fix:** `akuma_primitives::clock::realtime_us`, boot-relative from the epoch
+until the clock is set, which is Linux's answer with no RTC. The
+userspace-facing readers use it. Kernel checks that must tell "never synced"
+from 1970 (certificates, the SNTP retry gate, ext2 timestamps) keep
+`utc_time_us`/`is_utc_set`. The futex and `clock_nanosleep` absolute
+deadlines already treated an unset clock as uptime, so they now agree with
+what `clock_gettime` reports.
+
+## Fix 12: `prctl(PR_SET_NAME)` rewrote `/proc/<pid>/exe`
+
+The cause of blockers 2 and 4 together. `/proc/<pid>/exe` rendered
+`ProcessImage::name`, which `PR_SET_NAME` writes. Chromium's browser names
+its main thread, so with `strace_nr=89` the same pid read `/proc/self/exe` as
+`/usr/lib/chromium/chromium` at startup and as `chromium` a few calls later.
+From that it computed its install directory as `""`, and:
+
+- crashpad ran `execve("chrome_crashpad_handler")`, a relative path, which
+  failed `ENOENT`. That was blocker 2; `spawnprobe` showed `posix_spawn`
+  itself was fine.
+- the zygotes ran `execvp("chromium")` through `PATH` (`/usr/local/bin/chromium`,
+  `/bin/chromium` → `ENOENT`) and then hit a `CHECK`;
+- the V8 snapshot was looked up next to that broken path. That was blocker 4,
+  and it was never fd passing.
+
+**Fix:** `ProcessImage::exe`, Linux's `mm->exe_file` beside `name` (`comm`).
+It is set at spawn and `execve` on both kernels (the AArch64 `execve` never
+refreshed it at all) and inherited on `fork`. Nothing else writes it.
+`/proc/<pid>/exe` reads it. Gate: `exeprobe.c` now renames itself and reads
+the link again.
+
+## Fix 13: `/proc/<pid>/task` did not exist
+
+After Fix 12 the zygotes reached `sandbox/linux/services/thread_helpers.cc:41
+Check failed: . : No such file or directory`. That helper is
+`fstatat(proc_fd, "self/task/")` followed by `CHECK_LE(3, st_nlink)`; the
+process is single-threaded when `st_nlink == 3`.
+
+**Fix:** procfs serves `<tgid>/task` (the group's live threads) and aliases
+`<tgid>/task/<tid>[/rest]` onto `<tid>[/rest]`, because every thread here is a
+`Process` with its own per-pid files, so there is no second renderer.
+`Metadata` gained `links: Option<u32>` (`None` keeps the old 2/1), and
+`stat`/`fstatat`/`statx` report `Metadata::nlink()`, so `task/` says `2 +
+threads`. Gate: `taskprobe.c` (nlink 3, then 4 with a second thread, both
+tids listed, `task/<tid>/status` reads).
+
+## Fix 14: `brk` fell through the amd64 dispatch
+
+`brk` (x86_64 12) has a row in `akuma-syscalls-abi`, so it decoded, but
+`usermode.rs`'s match has no arm for it (the arm was removed when the
+allocators moved to `mmap`). It landed in `_ => ENOSYS` with no message:
+54 `brk -> -ENOSYS` in one Chromium run. Linux never answers `brk` with
+`ENOSYS`; its answer for a break that cannot move is the current break,
+unchanged. musl reads that as "no growth" and falls back to `mmap`, which it
+already did, now through the documented path. Auditing all 134 rows against
+the arms found `Brk` was the only gap. The default arm now prints
+`[syscall] x86_64 nr=… decodes to … but has no dispatch arm`, so the next one
+cannot be silent.
+
+## Fix 15: `mkdir` ignored its mode
+
+Found with `strace_pid=`: after `mkdir(scoped_dir)` and `stat(scoped_dir)` both
+succeeded, the browser went straight into crashpad's dump request. The
+`CHECK` between them is `process_singleton_posix.cc`'s: the socket directory's
+mode must be exactly 0700, which is `mkdtemp`'s. Glue's `sys_mkdirat` took
+`_mode` and never used it, so every directory got the filesystem default,
+0755. It now applies `mode & ~umask & 01777`, with the umask `umask(2)` already
+reports (`fs::UMASK`, 022; there is no per-process mask yet). That's on both
+kernels. Gate: `singletonprobe` now checks the mode; on Akuma it read
+`0755 (want 0700) FAIL` before and `0700` after.
+
+`O_CREAT` still applies the caller's mode **without** the umask (open item).
+
+## Fix 16: `SO_PASSCRED` produced no `SCM_CREDENTIALS`
+
+After Fix 15 the browser got far enough to launch child processes through the
+zygote, and then `Did not receive ping from zygote child`, six GPU-process
+launch failures, and `FATAL: GPU process isn't usable. Goodbye.` The browser
+reads a zygote child's ping with `RecvMsgWithPid`, which takes the child's
+real pid from `SCM_CREDENTIALS`; `SO_PASSCRED` was accepted and ignored.
+
+**Fix** (`docs/reference/subsystems/syscalls/net.md` § "SO_PASSCRED and
+SCM_CREDENTIALS"):
+
+- each unix `Record` carries its sender's credentials, captured at send;
+- stream reads stop where the sender changes;
+- `recvmsg` writes `SCM_CREDENTIALS` before `SCM_RIGHTS`;
+- `getsockopt(SO_PASSCRED)` reports the flag;
+- the `pid` in both `SCM_CREDENTIALS` and `SO_PEERCRED` is now the tgid.
+
+Gate: `credprobe.c` (seqpacket, seqpacket with an fd, stream), identical on
+Linux and Akuma, plus host tests in `akuma-net-unix`.
+
+Rows added at the same time, all served by glue already: x86_64 128
+`rt_sigtimedwait` (crashpad's client waits in it after a dump request), 140
+`getpriority`, 141 `setpriority`. The two priority numbers are swapped between
+x86_64 and asm-generic.
+
+## The tools that found Fixes 11–16
+
+`docs/runbooks/trace-failing-syscalls-amd64.md`. Three kernel command-line
+flags on amd64:
+
+- `strace_err`: one `[sc!]` line per failing syscall, with pid, decoded paths
+  and errno. That found Fixes 11 (100 identical `mkdir`s), 12 (the relative
+  `execve`) and 14 (`brk`).
+- `strace_nr=<n,…>`: also every successful call of those numbers, with
+  `readlink`'s target. That found Fix 12's moving `/proc/self/exe`.
+- `strace_pid=<n>`: the full trace, restricted to one thread group.
+
+The compile-time `syscall-debug-info` (now forwardable on amd64) added 244
+glue lines and no lifecycle lines in the same run, and found nothing the
+runtime flags did not. It stays off.
+
+## Still open: what Chromium hits on Akuma now
+
+Runs under Firecracker (`userspace/kami/probe/akuma/`, 4 GiB guest). With
+Fixes 8–14 Chromium gets past crashpad, the ProcessSingleton, the V8 snapshot
+and the zygote's thread check, and then:
+
+- **A zygote child crashes before it pings**, so the zygote reports `Zygote
+  could not fork: … child_pid -1`. crashpad's handler then fails to dump it
+  (`ptrace: Function not implemented`, `tgkill: No such process`). The child
+  has crashpad's handlers installed, so the fault never printed. Under
+  `strace_err` a fault delivered to a handler now prints a `[sig!]` line with
+  rip and address, which is the next run.
+- **crashpad wants `ptrace`** (`PTRACE_ATTACH` of the crashed process) to
+  write a dump. Not needed to render, since a dump is only taken after a
+  crash, but every crash is noisier for it.
+- **`gettid()` of a main thread is its thread slot, not its pid** (on both
+  kernels, by design: `tkill`, futexes and the per-thread arrays index by
+  slot). Every Chromium log prefix reads `[<pid>:4:`. On Linux a main thread's
+  tid equals its pid, and code that tests `gettid() == getpid()` for "main
+  thread" will answer wrong. Not yet shown to be what Chromium trips on.
+- **Missing `/proc` and `/sys` files** Chromium reads (each logged as
+  `ERROR`, not fatal so far): `/proc/cpuinfo` (`Failed to initialize
+  cpuinfo`), `/proc/sys/fs/inotify/max_user_watches`, `/proc/<pid>/oom_score_adj`,
+  `/sys/devices/system/cpu/{possible,present,kernel_max}`.
+- **Missing x86_64 rows**: 40 `sendfile`, 239 `get_mempolicy`, 297
+  `rt_tgsigqueueinfo` (crashpad re-raises a crash signal with it), 444
+  `landlock_create_ruleset`; and `inotify_init` (Chromium's file watcher
+  logs `Function not implemented`).
+- **`O_CREAT` ignores the umask** (a mode of 0666 makes a world-writable
+  file); Fix 15 applies it for `mkdir` only.
+- **`init=` does not follow symlinks**, and ext2's `read_at` on a symlink
+  inode reads the target's bytes as block numbers (`read_sectors: sector
+  14819201400`). The rig works around it with `init=/bin/busybox`.
+- **The 1324 GiB reservation** costs about 290 ms (Linux: 0.5 ms), nearly all
+  of it in `munmap`.
 
 ## The whole-file heap (folded in from `proposals/AMD64_FD_WHOLE_FILE_HEAP.md`)
 
@@ -192,12 +361,10 @@ whole kernel heap tracked that one `Vec`.
   halting (`amd64/src/main.rs`), so the machine drops to N-1 cores instead of
   stopping. It still halts the core. Killing the faulting process, as AArch64
   does, is still to do.
-- **`execve`'s whole-image read: open.** `read_image` holds the whole
-  executable in one heap allocation until the loader has copied it out, capped
-  at 256 MB. That demand is what sets the heap floor (`amd64/src/mem.rs`). Three
-  concurrent `rust-lld` links (158 MB each) already had to wait for each other,
-  and Chromium (250 MB, re-execing itself) cannot fit two on a 512 MiB heap
-  (above). The fix is a streaming loader.
+- **`execve`'s whole-image read: fixed 2026-10-08** (Fix 8). The loader reads
+  the file a 64 KiB window at a time, so an exec no longer costs the
+  binary's size in heap. `mem.rs`'s heap sizing still describes the old demand
+  and can be revisited.
 
 ### And a method correction
 

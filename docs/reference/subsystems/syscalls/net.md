@@ -125,6 +125,43 @@ Wikipedia page (`userspace/kami/README.md`).
 Gate: `userspace/forktest/c_stress/chromeprobe.c`. Its seven `SCM_RIGHTS`
 checks pass identically on Linux and on the amd64 kernel under Firecracker.
 
+## SO_PASSCRED and SCM_CREDENTIALS (2026-10-08)
+
+A unix socket with `SO_PASSCRED` gets the **sending process's** `struct ucred
+{ pid, uid, gid }` with every message it receives. That is how Chromium's
+browser learns a zygote child's real pid (`RecvMsgWithPid`), and a ping that
+arrives without credentials counts as no ping at all: `Did not receive ping
+from zygote child`, then `GPU process isn't usable. Goodbye.` Until this date
+`SO_PASSCRED` was accepted and ignored.
+
+- **Capture, per record.** `Record::creds` holds the sender's credentials,
+  captured in `unixsock.rs` at send time:
+  - always for `SOCK_SEQPACKET`/`SOCK_DGRAM`, whose messages have a record
+    anyway (12 bytes, no extra allocation);
+  - for `SOCK_STREAM` only when either end has `SO_PASSCRED`, which is
+    Linux's `unix_maybe_add_creds`. That keeps the plain stream path free of
+    allocation.
+- **Stream reads stop where the sender changes.** A credentialed stream write
+  coalesces only into a tail record with the same credentials, and
+  `stream_read_limit` stops a read at a change, as Linux's
+  `unix_stream_read_generic` does. One `SCM_CREDENTIALS` can only describe one
+  writer.
+- **Receive.** With `SO_PASSCRED` set on the receiving socket, `recvmsg`
+  writes `SCM_CREDENTIALS` **before** any `SCM_RIGHTS` (Linux's `scm_recv`
+  order). A message queued without credentials reads as pid 0 and uid/gid
+  65534 (`scm::UNKNOWN_CREDS`), which is Linux's answer. A control buffer
+  smaller than `CMSG_SPACE(12)` gets `MSG_CTRUNC`.
+- **`pid` is the thread group** (`tgid`) in both `SCM_CREDENTIALS` and
+  `SO_PEERCRED`. `current_creds` reported a thread's own id until this date.
+  uid/gid are 0 for every process (see `current_creds`).
+- **Not implemented:** a sender passing its own `SCM_CREDENTIALS` in
+  `sendmsg` (it is skipped; the kernel's capture is used) and `SO_PASSPIDFD`.
+
+Gate: `userspace/forktest/c_stress/credprobe.c` (seqpacket, seqpacket with
+an fd, stream), identical on Linux and the amd64 kernel. Host tests: the
+`SCM_CREDENTIALS` block of `crates/akuma-net-unix/src/tests.rs` and
+`scm::tests::creds_message_layout_matches_linux_lp64`.
+
 ## sockaddr / argument validation
 
 - `bind`/`connect`: `len < 16` → `EINVAL` (the `sockaddr_in` struct is 16

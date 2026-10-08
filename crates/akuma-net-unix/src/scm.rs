@@ -1,4 +1,5 @@
-//! `SCM_RIGHTS` ancillary data: the `cmsghdr` wire format, both directions.
+//! `SCM_RIGHTS` and `SCM_CREDENTIALS` ancillary data: the `cmsghdr` wire
+//! format, both directions.
 //!
 //! Pure byte work, so the parts that are easy to get subtly wrong — header
 //! alignment, the `CMSG_LEN`/`CMSG_SPACE` distinction, what a too-small
@@ -16,6 +17,12 @@ use crate::libc_errno;
 
 pub const SOL_SOCKET: i32 = 1;
 pub const SCM_RIGHTS: i32 = 1;
+/// `SCM_CREDENTIALS`: a `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`.
+pub const SCM_CREDENTIALS: i32 = 2;
+/// `sizeof(struct ucred)`.
+pub const UCRED_LEN: usize = 12;
+/// `CMSG_SPACE(sizeof(struct ucred))`: what one credentials message occupies.
+pub const CREDS_SPACE: usize = cmsg_space(UCRED_LEN);
 /// `MSG_CTRUNC`: some control data did not fit the receiver's buffer.
 pub const MSG_CTRUNC: i32 = 0x8;
 /// `MSG_CMSG_CLOEXEC`: install received descriptors close-on-exec.
@@ -110,9 +117,47 @@ pub fn encode_rights(fds: &[i32], cap: usize) -> (Vec<u8>, usize) {
     (out, used)
 }
 
+/// The `SCM_CREDENTIALS` message a receive writes for `c`: one header plus a
+/// `struct ucred`, padded to [`CREDS_SPACE`]. A fixed array, so a receive
+/// carrying only credentials allocates nothing for them.
+///
+/// Linux puts it **before** any `SCM_RIGHTS` (`scm_recv` writes credentials,
+/// then `scm_detach_fds` the descriptors), and a receiver that walks with
+/// `CMSG_NXTHDR` finds them in that order.
+#[must_use]
+pub fn encode_creds(c: crate::Ucred) -> [u8; CREDS_SPACE] {
+    let mut out = [0u8; CREDS_SPACE];
+    out[..8].copy_from_slice(&(cmsg_len(UCRED_LEN) as u64).to_ne_bytes());
+    out[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+    out[12..16].copy_from_slice(&SCM_CREDENTIALS.to_ne_bytes());
+    out[16..20].copy_from_slice(&c.pid.to_ne_bytes());
+    out[20..24].copy_from_slice(&c.uid.to_ne_bytes());
+    out[24..28].copy_from_slice(&c.gid.to_ne_bytes());
+    out
+}
+
+/// What a receiver with `SO_PASSCRED` is told about a message queued without
+/// credentials (neither end had `SO_PASSCRED` when it was sent): Linux's
+/// `scm_recv` reports pid 0 and the overflow uid/gid, 65534.
+pub const UNKNOWN_CREDS: crate::Ucred = crate::Ucred { pid: 0, uid: 65534, gid: 65534 };
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creds_message_layout_matches_linux_lp64() {
+        // CMSG_LEN(12) = 28, CMSG_SPACE(12) = 32; level SOL_SOCKET, type 2.
+        let b = encode_creds(crate::Ucred { pid: 7, uid: 1000, gid: 100 });
+        assert_eq!(CREDS_SPACE, 32);
+        assert_eq!(u64::from_ne_bytes(b[..8].try_into().unwrap()), 28);
+        assert_eq!(i32::from_ne_bytes(b[8..12].try_into().unwrap()), SOL_SOCKET);
+        assert_eq!(i32::from_ne_bytes(b[12..16].try_into().unwrap()), SCM_CREDENTIALS);
+        assert_eq!(u32::from_ne_bytes(b[16..20].try_into().unwrap()), 7);
+        assert_eq!(u32::from_ne_bytes(b[20..24].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_ne_bytes(b[24..28].try_into().unwrap()), 100);
+        assert_eq!(&b[28..], &[0, 0, 0, 0]);
+    }
 
     fn rights(fds: &[i32]) -> Vec<u8> {
         let mut b = Vec::new();

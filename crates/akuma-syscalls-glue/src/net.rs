@@ -1097,6 +1097,17 @@ pub(super) fn unix_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, op
         return Some(EFAULT);
     }
     match optname {
+        // `SO_PASSCRED` (16): what `setsockopt` recorded.
+        16 => {
+            let on = i32::from(super::unixsock::passcred_of(fd)?);
+            if (len as usize) < 4 || !validate_user_ptr(optval, 4) {
+                return Some(EFAULT);
+            }
+            if write_user_val(optval, &on).is_err() || write_user_val(optlen, &4u32).is_err() {
+                return Some(EFAULT);
+            }
+            Some(0)
+        }
         // A 12-byte `struct ucred`, not the 4-byte int most options use.
         SO_PEERCRED => {
             let cred = super::unixsock::peer_cred_of(fd)?;
@@ -1207,7 +1218,7 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
             None => return Err(ENOMEM),
         }
     };
-    let (ret, truncated, mut anc) = super::unixsock::unix_recv_anc(
+    let (ret, truncated, mut anc, creds) = super::unixsock::unix_recv_anc(
         fd,
         &mut kbuf,
         flags & MSG_DONTWAIT != 0,
@@ -1233,15 +1244,31 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
     // which it would otherwise parse as a cmsg header.
     use akuma_net_unix::scm;
     let cap = if msg.msg_control == 0 { 0 } else { msg.msg_controllen as usize };
-    let fit = scm::rights_fit(cap, anc.len());
-    let ctrunc = fit < anc.len();
+    // `SCM_CREDENTIALS` first, then `SCM_RIGHTS` — Linux's `scm_recv` order.
+    // Credentials that do not fit set `MSG_CTRUNC`, as `put_cmsg` does.
+    let mut creds_used = 0;
+    let mut ctrunc = false;
+    if let Some(c) = creds {
+        if cap >= scm::CREDS_SPACE {
+            if copy_to_user(msg.msg_control, &scm::encode_creds(c)).is_err() {
+                super::unixsock::scm_release(anc);
+                return Err(EFAULT);
+            }
+            creds_used = scm::CREDS_SPACE;
+        } else {
+            ctrunc = true;
+        }
+    }
+    let cap_rights = cap - creds_used;
+    let fit = scm::rights_fit(cap_rights, anc.len());
+    ctrunc |= fit < anc.len();
     super::unixsock::scm_release(anc.split_off(fit));
     let fds = super::unixsock::scm_install(anc, flags & scm::MSG_CMSG_CLOEXEC != 0);
-    let (control, used) = scm::encode_rights(&fds, cap);
-    if used > 0 && copy_to_user(msg.msg_control, &control).is_err() {
+    let (control, used) = scm::encode_rights(&fds, cap_rights);
+    if used > 0 && copy_to_user(msg.msg_control + creds_used as u64, &control).is_err() {
         return Err(EFAULT);
     }
-    msg.msg_controllen = used as u64;
+    msg.msg_controllen = (creds_used + used) as u64;
     msg.msg_flags = if truncated { MSG_TRUNC } else { 0 } | if ctrunc { scm::MSG_CTRUNC } else { 0 };
     if write_user_val(msg_ptr, msg).is_err() {
         return Err(EFAULT);
@@ -2151,6 +2178,22 @@ pub(super) fn dispatch_getsockopt(fd: u32, level: i32, optname: i32, optval: u64
 /// Linux effectively does for the ones that do not apply.
 pub(super) fn dispatch_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
     if fd_is_unix_socket(fd) {
+        // `SO_PASSCRED` is the one that changes behaviour: it makes every
+        // message this socket receives carry the sender's `SCM_CREDENTIALS`.
+        // It was accepted-and-ignored until 2026-10-08, which Chromium cannot
+        // survive — its browser reads a zygote child's pid that way.
+        const SOL_SOCKET: i32 = 1;
+        const SO_PASSCRED: i32 = 16;
+        if level == SOL_SOCKET && optname == SO_PASSCRED {
+            if optlen < 4 || !validate_user_ptr(optval, 4) {
+                return EINVAL;
+            }
+            let mut on: i32 = 0;
+            if read_user_into(&mut on, optval).is_err() {
+                return EFAULT;
+            }
+            super::unixsock::set_passcred(fd, on != 0);
+        }
         return 0;
     }
     #[cfg(feature = "smoltcp")]

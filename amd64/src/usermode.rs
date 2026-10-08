@@ -1943,6 +1943,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // owns every fatality decision.
         Syscall::Tkill => crate::signal::sys_tkill(a1 as u32, a2 as u32),
         Syscall::Tgkill => crate::signal::sys_tgkill(a1 as u32, a2 as u32, a3 as u32),
+        // Glue's: it takes from the same per-thread pending set
+        // `crate::signal`'s delivery does (`threading::take_pending_signal`).
+        Syscall::RtSigtimedwait => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        Syscall::Getpriority | Syscall::Setpriority => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // Local by necessity: the register file it restores is this target's
         // `UserCtx`, and glue's row is `=> 0` because on AArch64 `rt_sigreturn`
         // never reaches the dispatcher at all (the EL0 sync handler consumes it).

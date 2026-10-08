@@ -510,6 +510,17 @@ syscall_table! {
     Sigaltstack   => SIGALTSTACK    = 131, nr::SIGALTSTACK;
     /// x86_64 200, asm-generic 130.
     Tkill         => TKILL          = 200, nr::TKILL;
+    /// x86_64 128, asm-generic 137. Added 2026-10-08: Chromium's crashpad
+    /// client waits in it after asking its handler for a dump, and the
+    /// missing row turned that wait into an immediate `ENOSYS`.
+    RtSigtimedwait => RT_SIGTIMEDWAIT = 128, nr::RT_SIGTIMEDWAIT;
+    /// x86_64 140/141, asm-generic 141/140 — the two are **swapped** between
+    /// the tables, which is exactly the transposition a row per call exists to
+    /// make impossible. Glue answers a fixed nice 0 (`getpriority`'s `20 -
+    /// nice` encoding) and accepts `setpriority` without effect. Chromium calls
+    /// `setpriority` for its utility processes (2026-10-08).
+    Getpriority    => GETPRIORITY    = 140, nr::GETPRIORITY;
+    Setpriority    => SETPRIORITY    = 141, nr::SETPRIORITY;
     /// x86_64 234, asm-generic 131. Note the two numbers are each the *other*
     /// architecture's number for a different signal call — 131 is `sigaltstack`
     /// on x86_64 and `tgkill` on asm-generic, 200 is `tkill` on x86_64 and
