@@ -1585,6 +1585,17 @@ static CROSS_KILLS: AtomicUsize = AtomicUsize::new(0);
 /// Rate-limits the `[TERM]` site tracer in [`mark_thread_terminated`].
 static TERM_TRACES: AtomicUsize = AtomicUsize::new(0);
 
+/// How many times a thread has been marked `TERMINATED` by a thread other
+/// than itself, since boot. The count behind the `[kill]` tracer in
+/// [`mark_thread_terminated`], exposed so a boot self-test can assert a
+/// teardown ran on the dying threads themselves rather than from a peer
+/// (amd64's `kill_test`: on that target a cross-thread mark skips the
+/// victim's own exit path and leaks what only that path releases).
+#[must_use]
+pub fn cross_thread_terminations() -> usize {
+    CROSS_KILLS.load(Ordering::Relaxed)
+}
+
 /// Mark a thread as terminated (lock-free)
 ///
 /// `#[track_caller]` so the tracer below can name the *site* that killed a slot.

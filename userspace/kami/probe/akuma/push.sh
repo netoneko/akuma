@@ -9,12 +9,12 @@ set -e
 cd "$(dirname "$0")"
 IP=${HPBOX_IP:-192.168.1.120}
 C=../../../forktest/c_stress
-PROBES="exeprobe shmvar chromeprobe bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe capprobe fallocprobe jitprobe thrprobe"
+PROBES="exeprobe shmvar chromeprobe bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe capprobe fallocprobe jitprobe thrprobe killtree"
 for p in $PROBES; do
   x86_64-linux-musl-gcc -O2 -static -o "$p" "$C/$p.c"
 done
 COPYFILE_DISABLE=1 tar --no-xattrs -cf - mkimg.sh kami-smoke.sh kami-fc.json.in run-fc.sh \
-    probes.sh chrome-once.sh cast-once.sh castprobe.py $PROBES -C .. Dockerfile cdp.py \
+    probes.sh chrome-once.sh cast-once.sh castprobe.py killtree.sh $PROBES -C .. Dockerfile cdp.py \
   | ssh -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR -o BatchMode=yes -p 22 "root@$IP" \
       'mkdir -p /root/cdp-probe/akuma && tar -C /root/cdp-probe/akuma -xf - && mv -f /root/cdp-probe/akuma/Dockerfile /root/cdp-probe/Dockerfile && ls /root/cdp-probe/akuma'

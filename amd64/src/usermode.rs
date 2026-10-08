@@ -109,6 +109,10 @@ const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 #[cfg(not(feature = "no-tests"))]
 const THREADPROBE_ELF: &[u8] = include_bytes!(env!("USER_THREADPROBE_ELF"));
 
+/// A threaded process to `SIGKILL`. See `usermode::kill_test`.
+#[cfg(not(feature = "no-tests"))]
+const KILLPROBE_ELF: &[u8] = include_bytes!(env!("USER_KILLPROBE_ELF"));
+
 /// Where a task's kernel stack and saved user stack live.
 ///
 /// One per task. `syscall_entry` reaches the running task's through the
@@ -1934,12 +1938,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // discarded takes a signal it asked to defer.
         Syscall::RtSigaction
         | Syscall::RtSigprocmask
-        | Syscall::Sigaltstack
-        // `kill(2)` reaches `akuma_exec::process::deliver_signal`, which pends on
-        // the whole thread group and sets the interrupt flag
-        // `should_interrupt_blocking_syscall` reads. Nothing else here needs to
-        // change for `EINTR`: glue's blocking arms already ask.
-        | Syscall::Kill => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        | Syscall::Sigaltstack => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        // `kill(2)` is this target's since 2026-10-09: glue's hands SIGKILL to
+        // the AArch64 hard-kill path, which this kernel cannot survive under
+        // load (`crate::signal::sys_kill` has the measurements). Every signal
+        // is pended and the wait interrupted; `signal::deliver_pending` owns
+        // the fatality, as it does for `tkill`.
+        Syscall::Kill => crate::signal::sys_kill(a1, a2),
         // **Not** glue's, and `crate::signal::sys_tkill`'s doc comment is the
         // reason: glue decides a fatal default *inline* by calling
         // `sys_exit_group`, which on this target leaves ring 3 through the wrong
@@ -8832,4 +8837,98 @@ pub fn thread_test(t: &mut Suite) {
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// `SIGKILL` to a threaded process takes the group down **on its own
+/// threads**, promptly, and leaves nothing behind.
+///
+/// The program (`userspace/amd64/killprobe`) parks two threads in untimed
+/// `FUTEX_WAIT`s, spins a third with no syscall in it, and parks its main
+/// thread the same way. This sends it `kill(pid, SIGKILL)` through this
+/// target's own `sys_kill` and checks, in order of what each would have cost:
+///
+/// * **the group is gone within a second.** Through glue's `deliver_signal`
+///   (until 2026-10-09) the same kill cost the shared `kill_thread_group`'s
+///   full 2 s grace, because no amd64 path consumes the deferred kill it
+///   posts;
+/// * **no thread was terminated by a peer** — `cross_thread_terminations`
+///   did not move. The old path's grace expiry hard-marked every sibling
+///   from the killer's core, and a thread so marked never runs
+///   `thread::teardown`;
+/// * **every `THREADS` row is back** (`live_count == 0`) — the rows the old
+///   path leaked, and that made the next process in the slot spin out
+///   `DRAIN INCOMPLETE`;
+/// * **the status is a SIGKILL death** (`-9`), stamped by the leader's own
+///   `run_process` epilogue, not forged by the killer;
+/// * **teardown leaks nothing.**
+///
+/// The spinning thread is the one that proves the tick path: it makes no
+/// syscall, so only `deliver_pending_on_tick` can end it.
+pub fn kill_test(t: &mut Suite) {
+    const SLOT: usize = 6;
+    /// `(-9)` as the exit path carries it: `signal::signal_status(9)`.
+    const SIGKILL_STATUS: u64 = (-9i64) as u64;
+    const WORKERS: usize = 3;
+
+    let free_before = akuma_pmm::free_count();
+    let (proc, img) = match Image::from_elf(KILLPROBE_ELF) {
+        Ok(p) => p,
+        Err(e) => {
+            t.check("kill: probe loaded", false);
+            serial::puts("  kill: load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return;
+        }
+    };
+    let Some((pid, task_slot)) = start_test_process(SLOT, proc, img.end_va, "killprobe") else {
+        t.check("kill: probe spawned", false);
+        return;
+    };
+    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
+
+    // Let it reach the state: three workers registered, then a few hundred
+    // more rounds so the parkers are parked and the spinner has been ticked.
+    let mut spins = 0u64;
+    while crate::thread::live_count(SLOT) < WORKERS && spins < 200_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+    t.check_eq("kill: the probe's threads came up", crate::thread::live_count(SLOT) as u64, WORKERS as u64);
+    for _ in 0..500 {
+        crate::sched::yield_now();
+    }
+
+    let cross_before = akuma_threading::cross_thread_terminations();
+    let t0 = crate::net::uptime_us();
+    t.check_eq("kill: kill(pid, SIGKILL) is accepted", crate::signal::sys_kill(u64::from(pid), 9), 0);
+
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 400_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+    let took_us = crate::net::uptime_us().saturating_sub(t0);
+    t.check("kill: the group finished", crate::sched::all_user_tasks_finished());
+    // Well under the 2 s grace the old path always paid; the tick that reaches
+    // the spinner is 10 ms.
+    t.check("kill: the group was gone within a second", took_us < 1_000_000);
+    t.check_eq("kill: no thread was terminated by a peer",
+        akuma_threading::cross_thread_terminations() as u64, cross_before as u64);
+    t.check_eq("kill: every thread row came back", crate::thread::live_count(SLOT) as u64, 0);
+    t.check_eq("kill: the status is a SIGKILL death",
+        EXIT_STATUS.load(Ordering::Relaxed), SIGKILL_STATUS);
+    // A `kill(2)` at a dead pid: the row is a zombie until reaped, which is
+    // still "exists" (0) — by pid and by its process group (Linux keeps a
+    // zombie in its pgrp's task list until it is reaped). After the reap the
+    // group is empty, which is `ESRCH`.
+    t.check_eq("kill: a zombie still answers kill(pid, 0)", crate::signal::sys_kill(u64::from(pid), 0), 0);
+    t.check_eq("kill: a zombie still counts for its process group",
+        crate::signal::sys_kill((-(i64::from(pid))) as u64, 0), 0);
+
+    finish_test_process(pid, task_slot);
+    t.check_eq("kill: a reaped process group is ESRCH",
+        crate::signal::sys_kill((-(i64::from(pid))) as u64, 0), crate::fd::errno::ESRCH);
+    t.check_eq("kill: teardown leaks nothing", akuma_pmm::free_count() as u64, free_before as u64);
 }

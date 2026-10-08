@@ -216,16 +216,77 @@ pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
     let Some(proc) = lookup_process_shared(pid) else {
         return kill_process_with_signal(pid, sig).is_ok();
     };
-    let tgid = proc.tgid;
     let l0_phys = proc.address_space.l0_phys();
 
     // SIGKILL (9) is unconditional — bypass signal delivery entirely. On
     // Linux, SIGKILL cannot be caught or ignored. Hard-kill the thread group.
+    //
+    // **AArch64 only in practice.** amd64's `kill(2)` does not come through
+    // here any more (`amd64/src/signal.rs::sys_kill`, 2026-10-09): on that
+    // target a thread leaves ring 3 only through its own syscall return or a
+    // tick, so it takes `pend_signal_to_group` for every signal, 9 included,
+    // and `kill_thread_group`'s cross-core `mark_thread_terminated` never runs
+    // there. Measured before that: a `kill -9` of any threaded process cost
+    // the full 2 s `KILL_GRACE_US` (no amd64 path consumes `PENDING_KILL`),
+    // and every hard-terminated thread leaked its `amd64::thread::THREADS` row
+    // (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`).
     if sig == 9 {
         crate::process::kill_thread_group(pid, l0_phys, -9);
         let _ = kill_process_with_signal(pid, 9);
         return true;
     }
+
+    pend_signal_to_group(pid, sig)
+}
+
+/// Where a `kill(2)` `pid` argument points. Linux `kill(2)`:
+/// `pid > 0` one process, `0` the caller's process group, `-1` every process
+/// the caller may signal, `pid < -1` the group `-pid`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KillTarget {
+    /// One process (thread group) by pid.
+    Pid(Pid),
+    /// The caller's own process group.
+    OwnGroup,
+    /// Every process but init and the caller.
+    All,
+    /// The process group with this pgid.
+    Group(Pid),
+}
+
+/// Decode `kill(2)`'s `pid` argument. `pid_t` is 32-bit and arrives in a
+/// 64-bit register, so the caller hands over the low 32 bits as an `i32`.
+#[must_use]
+pub fn kill_target(pid: i32) -> KillTarget {
+    match pid {
+        0 => KillTarget::OwnGroup,
+        -1 => KillTarget::All,
+        p if p > 0 => KillTarget::Pid(p as Pid),
+        p => KillTarget::Group(p.unsigned_abs()),
+    }
+}
+
+/// Pend `sig` on every thread of `pid`'s thread group and interrupt their
+/// blocking syscalls, so each takes the signal at its own next return to
+/// userspace — handler, ignore or default action decided there, by the
+/// delivery path, never here.
+///
+/// This is the non-SIGKILL body of [`deliver_signal`], split out so a target
+/// whose fatal-signal exit runs *on the dying thread* (amd64:
+/// `signal::deliver_pending` → `Next::Fatal` → the leader's `run_process`
+/// epilogue) can use it for **every** signal. On such a target hard-marking a
+/// slot `TERMINATED` from another core is never right: the thread is either
+/// executing in ring 3 on that core, mid-syscall holding the BKL, or parked —
+/// and in all three cases its own exit path is the only thing that releases
+/// what it holds (its `THREADS` row, its fds' refcounts, `clear_child_tid`).
+///
+/// Returns `true` if the process exists (what `sys_kill` maps to `0` rather
+/// than `ESRCH`), whether or not it still has a live thread to interrupt.
+pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
+    let Some(proc) = lookup_process_shared(pid) else {
+        return false;
+    };
+    let tgid = proc.tgid;
 
     // Collect ALL thread IDs in the group (target + siblings) FIRST.
     // `for_each_process` runs its callback with IRQs disabled, which forbids
@@ -391,6 +452,42 @@ fn slot_still_owned_by(tid: usize, pid: Pid) -> bool {
 /// un-installed — which is what a fresh `SharedSignalTable::new()` gave it, and
 /// what made nginx's worker unkillable by `SIGTERM` while parked in
 /// `epoll_pwait` (`docs/archive/FORK_LOSES_SIGNAL_HANDLERS.md`).
+#[cfg(test)]
+mod kill_target_tests {
+    use super::{kill_target, KillTarget};
+
+    #[test]
+    fn positive_is_one_process() {
+        assert_eq!(kill_target(1), KillTarget::Pid(1));
+        assert_eq!(kill_target(28619), KillTarget::Pid(28619));
+        assert_eq!(kill_target(i32::MAX), KillTarget::Pid(i32::MAX as u32));
+    }
+
+    #[test]
+    fn zero_is_the_callers_group_and_minus_one_is_everyone() {
+        assert_eq!(kill_target(0), KillTarget::OwnGroup);
+        assert_eq!(kill_target(-1), KillTarget::All);
+    }
+
+    #[test]
+    fn below_minus_one_names_a_group() {
+        assert_eq!(kill_target(-2), KillTarget::Group(2));
+        assert_eq!(kill_target(-53), KillTarget::Group(53));
+        // `-i32::MIN` does not exist; the magnitude still does.
+        assert_eq!(kill_target(i32::MIN), KillTarget::Group(1 << 31));
+    }
+
+    /// The register carries 64 bits and `pid_t` is 32: a `kill(-pgid, sig)`
+    /// arrives sign-extended, and truncating through `u32` then `i32` is what
+    /// recovers the negative number. Before this decode existed amd64 read
+    /// the register as a `u32` and answered `ESRCH` to every group kill.
+    #[test]
+    fn a_sign_extended_register_decodes_to_the_group() {
+        let reg: u64 = (-53i64) as u64;
+        assert_eq!(kill_target(reg as u32 as i32), KillTarget::Group(53));
+    }
+}
+
 #[cfg(test)]
 mod fork_signal_inheritance_tests {
     use super::SharedSignalTable;

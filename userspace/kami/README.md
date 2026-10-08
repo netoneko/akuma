@@ -180,6 +180,18 @@ shown to help), and test loops that kill Chromium should be rare and spaced.
 Until it is understood, treat "kill Chromium's tree" as a risky operation on
 this kernel, and `kami --kill` too.
 
+**Understood and fixed in the kernel, 2026-10-09** (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`):
+`kill(2)` on amd64 went through the AArch64 hard-kill path, which marks every
+thread of the victim `TERMINATED` from the killer's core after a 2 s grace,
+skipping the threads' own teardown; each `kill -9` of a Chromium tree leaked
+~100 thread rows, and once the 448-row table was full the kernel sat in a
+`[BKL] stuck` storm. Two things on kami's side were never doing what they
+looked like: `kill(-pgid, …)` answered `ESRCH` on that kernel (the group
+decode did not exist), so `kill_group`'s SIGTERM and SIGKILL reached nothing
+and `group_alive` always said "gone"; the kill that actually landed was
+`child.kill()` on the browser. Both work now, and the gentle order is fine to
+keep.
+
 ## Known gaps
 
 - **Japanese (CJK) fonts: unverified.** The Alpine rootfs on the Akuma

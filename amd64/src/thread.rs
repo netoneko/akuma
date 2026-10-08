@@ -158,9 +158,11 @@ pub fn group_exit_status(proc_slot: usize) -> Option<u32> {
 
 /// Bit set in a [`GROUP_EXIT_STATUS`] word when the group is ending by a
 /// **voluntary `exit_group(code)`**, the low byte then being the code. Without
-/// it the word is `-(sig)` — a death by signal — which is negative, so the two
-/// can never be confused, and `code == 0` stays distinguishable from "no group
-/// exit in progress" (a zero word).
+/// it the word is `-(sig)` — a death by signal — which is negative. **A reader
+/// must test the sign before the flag**: bit 30 is set in every negative word
+/// too, so the flag alone misreads a signal death as `exit_group(sig & 0xff)`
+/// (`signal::deliver_pending` did, until 2026-10-09). `code == 0` stays
+/// distinguishable from "no group exit in progress" (a zero word).
 pub const GROUP_EXIT_CODE_FLAG: u32 = 0x4000_0000;
 
 /// **`exit_group` from a thread that is not the leader.**
@@ -560,6 +562,51 @@ pub fn drain(proc_slot: usize) {
 /// Waking a thread that is not parked is a no-op with a recorded flag, so this
 /// cannot race the sibling into a park it will not come out of.
 fn wake_group(proc_slot: usize) {
+    // **Only rows whose task slot is still this group's.** A row is cleared by
+    // [`teardown`], which runs on the thread's own way out — so a thread that
+    // was hard-terminated from another core (the shared `kill_thread_group`
+    // path, which `kill(2)` on this target took until 2026-10-09) left its row
+    // standing, and the next process in this `proc_slot` inherited it: its
+    // exit saw 17, then 41, then 65 "live" threads, spun the whole
+    // [`DRAIN_SPINS`] budget, and posted a kill request plus a wake to a task
+    // slot that by then belonged to somebody else — a sticky `EINTR` on an
+    // innocent thread, since nothing here consumes `PENDING_KILL` but the
+    // slot scrub. Measured with `killtree` under Firecracker; recorded in
+    // `docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`.
+    //
+    // A row is ours if its task slot's `THREAD_PID_MAP` owner belongs to this
+    // thread group. A missing owner on a *live* slot is kept, not dropped:
+    // `clone_thread` publishes the map before the child can run, but the row
+    // and the map entry are two writes, and dropping a row for a thread about
+    // to start would let the reaper free the address space under it — the
+    // failure this module's lifetime rule exists to prevent. A dead or free
+    // slot with no owner is a leftover and goes.
+    let my_tgid = crate::usermode::current_process().map(|p| p.tgid);
+    let mut dropped = 0u32;
+    // SAFETY: raw-pointer access under the BKL.
+    unsafe {
+        for row in &mut *threads() {
+            let Some(t) = row.as_ref() else { continue };
+            if t.proc_slot != proc_slot {
+                continue;
+            }
+            let owner_tgid = akuma_exec::process::pid_for_thread(t.task)
+                .and_then(akuma_exec::process::lookup_process_shared)
+                .map(|p| p.tgid);
+            let stale = match owner_tgid {
+                Some(tg) => my_tgid.is_some_and(|mine| mine != tg),
+                None => !akuma_threading::x86_slot_is_live(t.task),
+            };
+            if stale {
+                *row = None;
+                dropped += 1;
+            }
+        }
+    }
+    if dropped > 0 {
+        akuma_primitives::safe_print!(96,
+            "[thread] dropped {} stale thread row(s) from proc slot {}\n", dropped, proc_slot);
+    }
     // SAFETY: raw-pointer read under the BKL.
     unsafe {
         for t in (*threads()).iter().flatten() {
