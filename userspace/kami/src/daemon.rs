@@ -151,9 +151,76 @@ impl Sessions {
     }
 }
 
-pub fn run(c: &Config) -> io::Result<()> {
-    let t0 = std::time::Instant::now();
-    let mut first_msg = true;
+/// Where Chromium keeps its profile, and so its `Singleton*` lock files.
+const PROFILE: &str = "/tmp/kami-profile";
+/// A crash loop gives up: more than this many restarts inside the window.
+const MAX_RESTARTS: usize = 5;
+const RESTART_WINDOW_MS: u64 = 60_000;
+
+/// Restart policy: Chromium may be restarted [`MAX_RESTARTS`] times in a
+/// sliding [`RESTART_WINDOW_MS`]; past that it is crash-looping and the daemon
+/// stops, rather than burn the box respawning something that cannot start.
+#[derive(Default)]
+struct Restarts {
+    at: Vec<u64>,
+}
+
+impl Restarts {
+    fn allow(&mut self, now_ms: u64) -> bool {
+        self.at.retain(|&t| now_ms.saturating_sub(t) < RESTART_WINDOW_MS);
+        if self.at.len() >= MAX_RESTARTS {
+            return false;
+        }
+        self.at.push(now_ms);
+        true
+    }
+}
+
+/// What a client can ask of the daemon itself (everything else is relayed to
+/// Chromium). They travel as CDP-shaped requests so one socket carries both.
+#[derive(Debug, PartialEq, Eq)]
+enum Control {
+    /// `Kami.hello`: who are you? (answer: pids, generation, restarts)
+    Hello(u64),
+    /// `Kami.restart`: Chromium is wedged, kill it and start another.
+    Restart(u64),
+    /// `Kami.shutdown`: stop Chromium and exit.
+    Shutdown(u64),
+}
+
+fn control(m: &[u8]) -> Option<Control> {
+    if !m.starts_with(b"{\"id\":") {
+        return None;
+    }
+    let id = num_field(m, "id")?;
+    match str_field(m, "method")? {
+        "Kami.hello" => Some(Control::Hello(id)),
+        "Kami.restart" => Some(Control::Restart(id)),
+        "Kami.shutdown" => Some(Control::Shutdown(id)),
+        _ => None,
+    }
+}
+
+fn hello_reply(id: u64, daemon: u32, chromium: u32, generation: u32, restarts: usize, up_ms: u128) -> String {
+    format!(
+        "{{\"id\":{id},\"result\":{{\"daemon\":{daemon},\"chromium\":{chromium},\"generation\":{generation},\"restarts\":{restarts},\"upMs\":{up_ms}}}}}"
+    )
+}
+
+/// Tell the client its Chromium is a new one: every session, tab and request
+/// it had is gone, and it should attach again.
+fn restarted_event(generation: u32, reason: &str) -> String {
+    let reason: String = reason.chars().filter(|c| *c != '"' && *c != '\\' && !c.is_control()).collect();
+    format!("{{\"method\":\"Kami.chromiumRestarted\",\"params\":{{\"generation\":{generation},\"reason\":\"{reason}\"}}}}")
+}
+
+struct Chrome {
+    child: std::process::Child,
+    to: File,
+    from: File,
+}
+
+fn spawn_chromium(c: &Config) -> io::Result<Chrome> {
     let (cmd_r, cmd_w) = pipe()?; // daemon -> chromium fd 3
     let (evt_r, evt_w) = pipe()?; // chromium fd 4 -> daemon
     let (a, b) = (cmd_r.as_raw_fd(), evt_w.as_raw_fd());
@@ -168,8 +235,8 @@ pub fn run(c: &Config) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log_file(&c.log)?);
-    // SAFETY: only async-signal-safe calls (fcntl, dup2) between fork and
-    // exec. Both ends are first moved above 10 so that placing one on 3
+    // SAFETY: only async-signal-safe calls (setpgid, fcntl, dup2) between fork
+    // and exec. Both ends are first moved above 10 so that placing one on 3
     // cannot close the other if it happened to be 3 or 4.
     unsafe {
         cmd.pre_exec(move || {
@@ -185,24 +252,92 @@ pub fn run(c: &Config) -> io::Result<()> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
-    eprintln!("[kami-daemon] +{} ms: chromium spawned", t0.elapsed().as_millis());
+    let child = cmd.spawn()?;
     drop((cmd_r, evt_w));
-    let mut to_chrome = File::from(cmd_w);
-    let mut from_chrome = File::from(evt_r);
+    Ok(Chrome { child, to: File::from(cmd_w), from: File::from(evt_r) })
+}
 
+/// Is anything still alive in this process group?
+fn group_alive(pgid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the group exists.
+    unsafe { libc::kill(-(pgid as i32), 0) == 0 }
+}
+
+/// Take a Chromium's whole process group down, gently: SIGTERM, up to 3 s for
+/// it to empty (its helpers exit on their own once the browser is gone), then
+/// SIGKILL whatever is left. A single SIGKILL to ~100 threads at once was
+/// followed by a kernel hang on the ryzen box twice on 2026-10-09 (a stuck BKL
+/// hold in `klog`: `[BKL] stuck: ... tag=501`); whether the gentler order
+/// avoids it is not established.
+fn kill_group(pgid: u32) {
+    let sig = |s: i32| {
+        // SAFETY: signalling the group the child made for itself in pre_exec; a
+        // group that is already gone just makes this fail.
+        unsafe { libc::kill(-(pgid as i32), s) };
+    };
+    sig(libc::SIGTERM);
+    for _ in 0..30 {
+        if !group_alive(pgid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    sig(libc::SIGKILL);
+}
+
+fn pid_file(c: &Config) -> String {
+    format!("{}.pid", c.sock)
+}
+
+/// The previous daemon is dead (nothing answered on the socket), but a crash
+/// or a kill can have left its Chromium tree and the profile's lock files
+/// behind; either makes the next Chromium hand its work to a ghost or refuse
+/// to start. The pid file names the old group.
+fn reap_previous(c: &Config) {
+    if let Ok(text) = fs::read_to_string(pid_file(c)) {
+        if let Some(pgid) = text.split_whitespace().nth(1).and_then(|p| p.parse::<u32>().ok()) {
+            if pgid > 1 {
+                eprintln!("[kami-daemon] reaping the previous Chromium group {pgid}");
+                kill_group(pgid);
+            }
+        }
+    }
+    for f in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let _ = fs::remove_file(format!("{PROFILE}/{f}"));
+    }
+}
+
+pub fn run(c: &Config) -> io::Result<()> {
+    // One daemon per socket: if something answers, it is serving.
+    if UnixStream::connect(&c.sock).is_ok() {
+        eprintln!("[kami-daemon] another daemon already serves {}; exiting", c.sock);
+        return Ok(());
+    }
+    reap_previous(c);
+    let t0 = std::time::Instant::now();
+    let ms = |t: std::time::Instant| t.elapsed().as_millis();
+    let mut first_msg = true;
     let _ = fs::remove_file(&c.sock);
     let listener = UnixListener::bind(&c.sock)?;
-    eprintln!("[kami-daemon] +{} ms: chromium pid {} on {}", t0.elapsed().as_millis(), child.id(), c.sock);
+    let mut chrome = spawn_chromium(c)?;
+    let mut gen: u32 = 1;
+    let write_pid = |chrome: &Chrome| {
+        let _ = fs::write(pid_file(c), format!("{} {}\n", std::process::id(), chrome.child.id()));
+    };
+    write_pid(&chrome);
+    eprintln!("[kami-daemon] +{} ms: chromium spawned", ms(t0));
+    eprintln!("[kami-daemon] +{} ms: chromium pid {} on {}", ms(t0), chrome.child.id(), c.sock);
 
     let mut chrome_msgs = Frames::default();
     let mut client_msgs = Frames::default();
     let mut client: Option<UnixStream> = None;
     let mut sessions = Sessions::default();
+    let mut restarts = Restarts::default();
+    let mut quit = false;
 
-    loop {
+    while !quit {
         let mut fds = [
-            libc::pollfd { fd: from_chrome.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: chrome.from.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd {
                 fd: client.as_ref().map_or(-1, |s| s.as_raw_fd()),
@@ -218,26 +353,27 @@ pub fn run(c: &Config) -> io::Result<()> {
             }
             return Err(e);
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            eprintln!("[kami-daemon] chromium exited: {status}");
-            break;
-        }
-        if fds[0].revents != 0 {
-            if chrome_msgs.read_from(&mut from_chrome)? == 0 {
-                eprintln!("[kami-daemon] chromium closed its pipe");
-                break;
-            }
-            // Whole messages only, so a client that connects mid-stream never
-            // sees half of one. With no client attached, they are dropped.
-            while let Some(m) = chrome_msgs.next() {
-                sessions.from_chrome(&m);
-                if first_msg {
-                    first_msg = false;
-                    eprintln!("[kami-daemon] +{} ms: first message from chromium ({} B)", t0.elapsed().as_millis(), m.len());
-                }
-                if let Some(s) = client.as_mut() {
-                    if s.write_all(&m).and_then(|_| s.write_all(b"\0")).is_err() {
-                        client = None;
+        let mut restart: Option<String> = None;
+        if let Ok(Some(status)) = chrome.child.try_wait() {
+            restart = Some(format!("chromium exited: {status}"));
+        } else if fds[0].revents != 0 {
+            match chrome_msgs.read_from(&mut chrome.from) {
+                Ok(0) | Err(_) => restart = Some("chromium closed its pipe".into()),
+                Ok(_) => {
+                    // Whole messages only, so a client that connects
+                    // mid-stream never sees half of one. With no client
+                    // attached, they are dropped.
+                    while let Some(m) = chrome_msgs.next() {
+                        sessions.from_chrome(&m);
+                        if first_msg {
+                            first_msg = false;
+                            eprintln!("[kami-daemon] +{} ms: first message from chromium ({} B)", ms(t0), m.len());
+                        }
+                        if let Some(s) = client.as_mut() {
+                            if s.write_all(&m).and_then(|_| s.write_all(b"\0")).is_err() {
+                                client = None;
+                            }
+                        }
                     }
                 }
             }
@@ -248,38 +384,86 @@ pub fn run(c: &Config) -> io::Result<()> {
                     eprintln!("[kami-daemon] new client replaces the attached one");
                 }
                 // Whoever was attached is gone as far as its sessions go.
-                sessions.detach_all(&mut to_chrome);
-                eprintln!("[kami-daemon] +{} ms: client attached", t0.elapsed().as_millis());
+                sessions.detach_all(&mut chrome.to);
+                eprintln!("[kami-daemon] +{} ms: client attached", ms(t0));
                 client = Some(s);
                 client_msgs.reset();
             }
         }
-        if fds[2].revents != 0 {
+        if fds[2].revents != 0 && restart.is_none() {
             let s = client.as_mut().expect("polled fd belongs to the client");
             match client_msgs.read_from(s) {
                 Ok(n) if n > 0 => {
                     // Forward whole commands only: a client dying mid-write
                     // must not leave half a message in Chromium's pipe.
                     while let Some(m) = client_msgs.next() {
-                        sessions.from_client(&m);
-                        to_chrome.write_all(&m)?;
-                        to_chrome.write_all(b"\0")?;
+                        let reply = |client: &mut Option<UnixStream>, text: String| {
+                            if let Some(s) = client.as_mut() {
+                                if s.write_all(text.as_bytes()).and_then(|_| s.write_all(b"\0")).is_err() {
+                                    *client = None;
+                                }
+                            }
+                        };
+                        match control(&m) {
+                            Some(Control::Hello(id)) => {
+                                let r = hello_reply(id, std::process::id(), chrome.child.id(), gen, restarts.at.len(), ms(t0));
+                                reply(&mut client, r);
+                            }
+                            Some(Control::Restart(id)) => {
+                                reply(&mut client, format!("{{\"id\":{id},\"result\":{{}}}}"));
+                                restart = Some("the client asked for a restart".into());
+                            }
+                            Some(Control::Shutdown(id)) => {
+                                reply(&mut client, format!("{{\"id\":{id},\"result\":{{}}}}"));
+                                quit = true;
+                            }
+                            None => {
+                                sessions.from_client(&m);
+                                if chrome.to.write_all(&m).and_then(|_| chrome.to.write_all(b"\0")).is_err() {
+                                    restart = Some("writing to chromium failed".into());
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
                     client = None;
                     client_msgs.reset();
-                    sessions.detach_all(&mut to_chrome);
+                    sessions.detach_all(&mut chrome.to);
+                }
+            }
+        }
+        if quit {
+            break;
+        }
+        if let Some(reason) = restart {
+            eprintln!("[kami-daemon] +{} ms: {reason}", ms(t0));
+            kill_group(chrome.child.id());
+            let _ = chrome.child.wait();
+            if !restarts.allow(t0.elapsed().as_millis() as u64) {
+                eprintln!("[kami-daemon] chromium restarted {MAX_RESTARTS} times in a minute; giving up");
+                break;
+            }
+            chrome = spawn_chromium(c)?;
+            gen += 1;
+            write_pid(&chrome);
+            sessions = Sessions::default();
+            chrome_msgs.reset();
+            first_msg = true;
+            eprintln!("[kami-daemon] +{} ms: chromium restarted as generation {gen}, pid {}", ms(t0), chrome.child.id());
+            if let Some(s) = client.as_mut() {
+                let ev = restarted_event(gen, &reason);
+                if s.write_all(ev.as_bytes()).and_then(|_| s.write_all(b"\0")).is_err() {
+                    client = None;
                 }
             }
         }
     }
     let _ = fs::remove_file(&c.sock);
-    // SAFETY: signalling the group the child made for itself in pre_exec; a
-    // pid that is already gone just makes this fail.
-    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = fs::remove_file(pid_file(c));
+    kill_group(chrome.child.id());
+    let _ = chrome.child.kill();
+    let _ = chrome.child.wait();
     Ok(())
 }
 
@@ -345,5 +529,37 @@ mod tests {
         let sent = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn control_messages_are_recognised_and_everything_else_is_relayed() {
+        assert_eq!(control(br#"{"id":4,"method":"Kami.hello","params":{}}"#), Some(Control::Hello(4)));
+        assert_eq!(control(br#"{"id":5,"method":"Kami.restart","params":{}}"#), Some(Control::Restart(5)));
+        assert_eq!(control(br#"{"id":6,"method":"Kami.shutdown","params":{}}"#), Some(Control::Shutdown(6)));
+        assert_eq!(control(br#"{"id":7,"method":"Page.enable","params":{},"sessionId":"S"}"#), None);
+        assert_eq!(control(br#"{"method":"Kami.hello"}"#), None, "no id, not a request");
+    }
+
+    #[test]
+    fn a_crash_loop_is_given_up_on_but_a_slow_trickle_is_not() {
+        let mut r = Restarts::default();
+        for i in 0..MAX_RESTARTS as u64 {
+            assert!(r.allow(i * 1_000), "restart {i} is within the allowance");
+        }
+        assert!(!r.allow(6_000), "the sixth inside a minute is a crash loop");
+        // A minute after the first, the window has moved on.
+        assert!(r.allow(RESTART_WINDOW_MS + 500));
+    }
+
+    #[test]
+    fn replies_and_events_are_well_formed() {
+        let h = hello_reply(9, 100, 200, 3, 2, 4500);
+        assert_eq!(num_field(h.as_bytes(), "id"), Some(9));
+        assert_eq!(num_field(h.as_bytes(), "generation"), Some(3));
+        assert_eq!(num_field(h.as_bytes(), "chromium"), Some(200));
+        let e = restarted_event(2, "chromium exited: signal: 11 (SIGSEGV)\n\"quoted\"");
+        assert!(e.starts_with("{\"method\":\"Kami.chromiumRestarted\""));
+        assert_eq!(num_field(e.as_bytes(), "generation"), Some(2));
+        assert!(!e[1..e.len() - 1].contains('\n'), "no raw control characters in the JSON");
     }
 }

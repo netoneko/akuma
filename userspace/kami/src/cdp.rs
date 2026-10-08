@@ -115,19 +115,25 @@ pub fn event_session(msg: &[u8]) -> Option<&str> {
     std::str::from_utf8(&msg[at..end]).ok()
 }
 
-/// The first target in a `Target.getTargets` reply whose type is "page".
-pub fn first_page(reply: &[u8]) -> Option<String> {
+/// The page target to attach to: `prefer` (the tab this kami pinned on an
+/// earlier run) if it is still there, else the first page.
+pub fn first_page_with(reply: &[u8], prefer: Option<&str>) -> Option<String> {
     let pat = b"{\"targetId\":\"";
     let mut rest = reply;
+    let mut first = None;
     while let Some(i) = find(rest, pat) {
         rest = &rest[i + pat.len()..];
         let end = rest.iter().position(|&b| b == b'"')?;
         let next = find(rest, pat).unwrap_or(rest.len());
         if find(&rest[..next], b"\"type\":\"page\"").is_some() {
-            return std::str::from_utf8(&rest[..end]).ok().map(str::to_string);
+            let id = std::str::from_utf8(&rest[..end]).ok()?;
+            if Some(id) == prefer {
+                return Some(id.to_string());
+            }
+            first.get_or_insert_with(|| id.to_string());
         }
     }
-    None
+    first
 }
 
 pub struct Cdp {

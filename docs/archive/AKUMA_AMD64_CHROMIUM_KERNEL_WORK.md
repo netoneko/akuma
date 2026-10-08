@@ -621,6 +621,17 @@ Not a kernel fix; what the session found, with the evidence.
   raw mode takes effect (ICANON/ISIG/ECHO/IXON read back cleared), and Enter
   and Ctrl-Q reach the process as `0d` and `11`. The console keyboard path was
   not exercised.
+- **Kernel hangs after killing Chromium trees.** Twice on 2026-10-09 the ryzen
+  box hung hard: once in a loop of Chromium cold starts with `killall chromium`
+  between runs, once right after a single `kill -9` of the browser process of
+  a running kami session. The last `klog` of the first ends in `[BKL] stuck:
+  owner=2 waiter=7 tag=501 serving=385141856 ... spins=33554432` (tag 501 =
+  IRQ/scheduler hold), beside a `[TRAMP-MISMATCH] tid=76 ... stale tid` and a
+  `killed by signal 15`; `klog-72.dmesg` on the partition has it. Not
+  investigated; the known BKL/scheduler wedge class applies
+  (`AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md`, `BKL_VFS_CARVE_OUT.md`).
+  Reproduction shape: a multi-process Chromium (zygote, renderer, network and
+  storage utilities) running, then its processes SIGKILLed.
 - **Per-core clocks.** `Instant::now()` on different cores differs by up to
   about a second; log lines from different threads came out of order. Not
   investigated in the kernel.

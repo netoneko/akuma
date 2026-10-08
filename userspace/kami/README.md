@@ -163,21 +163,44 @@ order; the machine only ever uses the clock through a `max`.
 - **DNS**: `/etc/resolv.conf` listed the QEMU-only `10.0.2.3` first; every
   lookup paid for it on the wifi LAN (removed 2026-10-09).
 
+## Chromium on Akuma can wedge the kernel (2026-10-09)
+
+Twice in half an hour the ryzen box hung hard (needed bringing back by hand)
+right after Chromium trees were killed: once inside a loop of cold starts that
+`killall`ed Chromium between runs (`probe/flags_ab.py`), once straight after a
+single `kill -9` of the browser process of a running session. The last klog
+before the first hang ends in `[BKL] stuck: owner=2 waiter=7 tag=501 ...
+spins=33554432`, next to `[TRAMP-MISMATCH] ... stale tid` and `killed by
+signal 15`: the Big Kernel Lock held by the IRQ/scheduler bucket (tag 501) for
+tens of millions of spins, the class of wedge in
+`docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md` and
+`BKL_VFS_CARVE_OUT.md`. This is a kernel problem, not kami's; kami's part is
+not to provoke it: the daemon now takes the group down with SIGTERM first (not
+shown to help), and test loops that kill Chromium should be rare and spaced.
+Until it is understood, treat "kill Chromium's tree" as a risky operation on
+this kernel, and `kami --kill` too.
+
 ## Known gaps
 
-- **No Japanese (CJK) fonts.** The Alpine rootfs on the Akuma partition has
-  `font-noto` (Latin and other scripts, not CJK), `font-noto-emoji`,
-  `font-noto-math`, `font-noto-symbols`, `font-dejavu`, `font-liberation`,
-  `font-opensans` and `font-adobe-source-code-pro`. A page's Japanese text
-  draws as boxes. Fix: stage a Japanese-capable package (`font-noto-cjk`, or a
-  smaller one such as `font-ipa`; check what `apk` offers) onto the partition.
-  Not done.
+- **Japanese (CJK) fonts: unverified.** The Alpine rootfs on the Akuma
+  partition has `font-noto` (Latin and other scripts, not CJK),
+  `font-noto-emoji`, `-math`, `-symbols`, `font-dejavu`, `font-liberation`,
+  `font-opensans` and `font-adobe-source-code-pro`, no CJK package. Yet
+  `https://akuma.sh/` drew its 悪魔 heading correctly (frame captured
+  2026-10-09), so either that page ships its own web font or something already
+  covers those two kanji. Not tested with a page that relies on system fonts
+  (a local `file://` page of mixed kana/kanji would settle it). If it fails,
+  stage a Japanese-capable package (`font-noto-cjk`, or a smaller one such as
+  `font-ipa`; check what `apk` offers) onto the partition.
 - **Tumblr renders its skeleton** (header, nav, fonts, loading placeholders)
   but the feed did not fill in within 50 s over the wifi link (measured about
   110 KB/s earlier; the app is several MB of JavaScript). Not tested for longer.
   The cookie notice did not appear in the frames captured, so clicking it is
   untested.
-- `https://akuma.sh` killed Chromium (SIGSEGV) on the one try.
+- `https://akuma.sh` renders correctly (3 of 3 loads on 2026-10-09: the neon
+  title, the 悪魔 heading, the terminal window with its ASCII art, the footer).
+  One earlier load killed Chromium with SIGSEGV; that is the general crash rate
+  above, not the page.
 - The first blit after launch took 1 s once (page faults on the framebuffer
   mapping); later blits take 1-6 ms.
 - Not tried from the console keyboard (only over an ssh pty).
@@ -191,18 +214,50 @@ order; the machine only ever uses the clock through a `max`.
   runs kami on a live Akuma over an ssh pty, sends keys, prints the new
   input log. **It paints on `/dev/fb0` and takes the console from whoever is
   using it.**
+- `page_try.py HOST URL --runs N`: loads a URL N times with the null display
+  (`kami --fb none`: nothing is painted, the console and keyboard are left
+  alone), reports survival and time to first pixels, and saves the final frame
+  of each run as a PNG. Each run starts a cold Chromium unless `--keep`, which
+  is the kill-the-tree pattern warned about above: use few runs.
 - `flags_ab.py HOST --runs N`: cold-start A/B of Chromium flag sets (the table
   above). Owns the kami daemon on the box.
 
-## Sessions outlive the terminal
+## Session management
 
-Chromium's CDP pipe dies with the process holding it, so `kami --daemon`
-(started detached by the first `kami`, in its own session) owns Chromium and
-relays whole NUL-terminated CDP messages to one client over `/tmp/kami.sock`.
-Quitting `kami` stops the screencast and detaches; Chromium, the tab and its
-state stay up for the next session. A new client replaces an attached one. The
-daemon exits when Chromium does. Chromium's and the daemon's stderr go to
-`/tmp/kami.log`.
+The daemon (`kami --daemon`, started detached by the first `kami`) owns one
+Chromium and supervises it; each `kami` is a client of it on `/tmp/kami.sock`.
+
+- **One daemon, one Chromium.** A daemon first connects to the socket: if
+  something answers, it is serving and the new one exits. It then reaps the
+  previous generation (`/tmp/kami.sock.pid` holds `daemon-pid chromium-pgid`;
+  the old group is killed and the profile's `Singleton*` files removed), so a
+  crashed Chromium's zygotes, GPU process and crashpad handlers cannot pile up.
+- **Supervised.** When Chromium exits (a crash) or closes its pipe, the daemon
+  starts another on the same socket and sends the attached client a
+  `Kami.chromiumRestarted` event. More than 5 restarts in a minute is a crash
+  loop and the daemon stops. The group is taken down gently (SIGTERM, up to
+  3 s, then SIGKILL).
+- **Pinned.** The tab a session attaches to is written to
+  `/tmp/kami.sock.target`; the next `kami` prefers it if it is still there,
+  rather than the first page.
+- **Recovery.** On `Kami.chromiumRestarted`, or when Chromium has not answered
+  any request for 45 s (the client asks `Kami.restart`; if nothing happens 20 s
+  later the session ends saying so), the client starts again from
+  `Target.getTargets`, attaches to the new tab and navigates back to the URL it
+  was on. If the daemon itself vanishes the client replaces it, up to 3 times.
+  The status bar shows `(chromium restarted xN)`.
+- **Introspection.** `Kami.hello` asks the daemon for its pid, Chromium's pid,
+  generation, restart count and uptime (logged at connect). `Kami.shutdown` is
+  what `kami --kill` sends: Chromium's group is stopped and the daemon exits
+  (an older daemon does not know it and `kami --kill` falls back to
+  `Browser.close`).
+- **Detach.** The daemon detaches every CDP session a client attached and did
+  not detach (a `kill -9`, Ctrl-Q): a dead client's screencast otherwise waits
+  for acks nobody sends and the next client's `Page.startScreencast` never gets
+  a reply.
+
+The recovery path is covered by host tests with scripted events; it has not yet
+been watched on the box (see "Chromium on Akuma can wedge the kernel" below).
 
 ## Measured (2026-10-07, the trashcan under Ubuntu 25.04, Alpine 3.22 container)
 

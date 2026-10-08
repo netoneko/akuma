@@ -15,7 +15,7 @@
 //! says. Nothing here names a file descriptor, so the whole startup, hint and
 //! stall behaviour is host-tested below.
 
-use crate::cdp::{escape, event_session, find, first_page, method, num_field, str_field};
+use crate::cdp::{escape, event_session, find, first_page_with, method, num_field, str_field};
 use crate::nav::{self, Action, Mode, Nav, Scroll};
 use crate::Input;
 
@@ -32,6 +32,13 @@ const CONNECT_BUDGET: Ms = 30_000;
 const NAVIGATE_BUDGET: Ms = 15_000;
 /// A request unanswered this long is shown on the status line.
 const STALL_AFTER: Ms = 4_000;
+/// A request unanswered this long means Chromium is wedged: the daemon is asked
+/// to replace it. (A cold start's slowest legitimate answer is ~14 s.)
+const STUCK_AFTER: Ms = 45_000;
+/// After asking for a restart, how long to wait for the restart before giving up.
+const RESTART_PATIENCE: Ms = 20_000;
+/// How many times a vanished daemon is replaced before the session ends.
+const MAX_RECONNECTS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -63,6 +70,8 @@ pub enum Effect {
     Send(String),
     /// Decode this base64 PNG and show it; answer with [`Event::Presented`].
     Present { b64: String, source: Source },
+    /// Remember this tab as the session's: the next kami attaches to it.
+    Pin(String),
     Status(String),
     Log(String),
     /// The session is over; `Some` is an error to report.
@@ -78,6 +87,9 @@ pub struct Config {
     pub poll_ms: Option<u64>,
     pub max_frames: Option<u64>,
     pub seconds: Option<f64>,
+    /// The tab this kami pinned on an earlier run: attach to it if it is still
+    /// there rather than to whatever page comes first.
+    pub pinned: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +111,8 @@ enum Req {
     CreateTarget,
     Attach,
     PageEnable,
+    /// `Kami.hello`: the daemon's account of itself.
+    Hello,
     StartScreencast,
     Shot,
     Collect,
@@ -127,7 +141,15 @@ pub struct Machine {
     session: Option<String>,
     target: String,
     fresh: bool,
+    /// Where to navigate once the tab is attached again after a recovery.
+    resume: Option<String>,
+    generation: u64,
+    recoveries: u32,
+    reconnects: u32,
+    /// When a restart was requested of the daemon, while one is outstanding.
+    restart_asked: Option<Ms>,
     // connecting
+    connect_since: Ms,
     connect_inflight: bool,
     connect_wait_until: Ms,
     tried: bool,
@@ -169,6 +191,12 @@ impl Machine {
             session: None,
             target: String::new(),
             fresh: false,
+            resume: None,
+            generation: 0,
+            recoveries: 0,
+            reconnects: 0,
+            restart_asked: None,
+            connect_since: 0,
             connect_inflight: false,
             connect_wait_until: 0,
             tried: false,
@@ -197,6 +225,9 @@ impl Machine {
                 self.connect_inflight = false;
                 self.lap("connected to the daemon", &mut out);
                 self.phase = Phase::Targets;
+                // Who is this daemon, and which Chromium is it holding? (An
+                // older daemon answers with an error; that is fine.)
+                self.send(Req::Hello, "Kami.hello", "{}", false, &mut out);
                 self.send(Req::GetTargets, "Target.getTargets", "{}", false, &mut out);
             }
             Event::ConnectFailed => {
@@ -204,7 +235,7 @@ impl Machine {
                 self.tried = true;
                 self.connect_wait_until = self.now + 100;
             }
-            Event::DaemonGone => self.finish(Some("daemon went away".into()), &mut out),
+            Event::DaemonGone => self.daemon_gone(&mut out),
             Event::InputClosed => out.push(Effect::Log("tty input closed".into())),
             Event::Cdp(m) => self.on_cdp(&m, &mut out),
             Event::Key(k) => self.on_key(k, &mut out),
@@ -283,6 +314,7 @@ impl Machine {
         if self.started.is_none() {
             self.started = Some(now);
             self.lap_at = now;
+            self.connect_since = now;
         }
         let started = self.started.unwrap_or(now);
         if self.cfg.seconds.is_some_and(|s| now.saturating_sub(started) as f64 >= s * 1000.0)
@@ -291,9 +323,13 @@ impl Machine {
             self.finish(None, out);
             return;
         }
+        self.watch_for_a_wedge(out);
+        if self.phase == Phase::Done {
+            return;
+        }
         match self.phase {
             Phase::Connecting => {
-                if now.saturating_sub(started) > CONNECT_BUDGET {
+                if now.saturating_sub(self.connect_since) > CONNECT_BUDGET {
                     self.finish(Some("the kami daemon did not come up".into()), out);
                 } else if !self.connect_inflight && now >= self.connect_wait_until {
                     self.connect_inflight = true;
@@ -332,6 +368,75 @@ impl Machine {
         }
     }
 
+    /// Chromium that answers nothing for [`STUCK_AFTER`] is wedged (seen: a
+    /// `Page.navigate` that never replied, a screencast left attached). Ask
+    /// the daemon to replace it; if nothing happens, say so and stop.
+    fn watch_for_a_wedge(&mut self, out: &mut Vec<Effect>) {
+        if matches!(self.phase, Phase::Connecting | Phase::Done) {
+            return;
+        }
+        if let Some(at) = self.restart_asked {
+            if self.now.saturating_sub(at) > RESTART_PATIENCE {
+                self.finish(Some("chromium is not answering and the daemon could not restart it".into()), out);
+            }
+            return;
+        }
+        let stuck = self.pending.iter().map(|p| p.sent).min().is_some_and(|t| self.now.saturating_sub(t) >= STUCK_AFTER);
+        if stuck {
+            out.push(Effect::Log("chromium has not answered for 45 s; asking the daemon to restart it".into()));
+            self.restart_asked = Some(self.now);
+            self.send(Req::Ignore, "Kami.restart", "{}", false, out);
+        }
+    }
+
+    /// Chromium was replaced (it crashed, or was restarted on request): the
+    /// session, tab and every outstanding request died with it. Start again
+    /// from `Target.getTargets` and return to the page we were on.
+    fn recover(&mut self, why: &str, out: &mut Vec<Effect>) {
+        self.recoveries += 1;
+        out.push(Effect::Log(format!("recovering ({why}); was on {:?}", self.url)));
+        self.resume = if self.url.is_empty() || self.url == "about:blank" { self.cfg.url.clone() } else { Some(self.url.clone()) };
+        self.reset_session();
+        self.phase = Phase::Targets;
+        self.lap_at = self.now;
+        self.send(Req::GetTargets, "Target.getTargets", "{}", false, out);
+    }
+
+    /// Forget everything that belonged to one Chromium or one connection.
+    fn reset_session(&mut self) {
+        self.session = None;
+        self.pending.clear();
+        self.loading = false;
+        self.shot_inflight = false;
+        self.navigated = false;
+        self.screencast_tries = 0;
+        self.retry_at = None;
+        self.restart_asked = None;
+        self.nav = Nav::new();
+    }
+
+    /// The daemon's socket closed. Replace the daemon (it starts Chromium) a
+    /// few times before giving up, and come back to the same page.
+    fn daemon_gone(&mut self, out: &mut Vec<Effect>) {
+        if self.phase == Phase::Done {
+            return;
+        }
+        if self.reconnects >= MAX_RECONNECTS {
+            self.finish(Some("daemon went away".into()), out);
+            return;
+        }
+        self.reconnects += 1;
+        out.push(Effect::Log(format!("daemon went away; reconnecting ({}/{MAX_RECONNECTS})", self.reconnects)));
+        self.resume = if self.url.is_empty() || self.url == "about:blank" { self.cfg.url.clone() } else { Some(self.url.clone()) };
+        self.reset_session();
+        self.phase = Phase::Connecting;
+        self.connect_inflight = false;
+        self.tried = true;
+        self.spawned = false;
+        self.connect_since = self.now;
+        self.connect_wait_until = self.now + 200;
+    }
+
     // ---- Chromium ------------------------------------------------------
 
     fn on_cdp(&mut self, m: &[u8], out: &mut Vec<Effect>) {
@@ -343,6 +448,12 @@ impl Machine {
     }
 
     fn on_event(&mut self, name: &str, m: &[u8], out: &mut Vec<Effect>) {
+        if name == "Kami.chromiumRestarted" {
+            let why = str_field(m, "reason").unwrap_or("").to_string();
+            self.generation = num_field(m, "generation").unwrap_or(self.generation);
+            self.recover(&why, out);
+            return;
+        }
         if self.session.is_none() || event_session(m) != self.session.as_deref() {
             return;
         }
@@ -389,10 +500,16 @@ impl Machine {
         let detail = || String::from_utf8_lossy(m).chars().take(200).collect::<String>();
         match p.req {
             Req::Ignore => {}
+            Req::Hello => {
+                out.push(Effect::Log(format!("daemon: {}", detail())));
+                if !err {
+                    self.generation = num_field(m, "generation").unwrap_or(0);
+                }
+            }
             Req::GetTargets if err => self.finish(Some(format!("Target.getTargets: {}", detail())), out),
             Req::GetTargets => {
                 self.lap("Target.getTargets", out);
-                match first_page(m) {
+                match first_page_with(m, self.pinned_target().as_deref()) {
                     Some(t) => {
                         self.target = t;
                         self.fresh = false;
@@ -417,6 +534,7 @@ impl Machine {
                     self.session = Some(s.to_string());
                     let what = format!("tab {} (fresh={}) attached", self.target, self.fresh);
                     self.lap(&what, out);
+                    out.push(Effect::Pin(self.target.clone()));
                     self.phase = Phase::Setup;
                     let (w, h) = self.cfg.view;
                     // `--window-size` includes the (invisible) window frame in
@@ -438,8 +556,16 @@ impl Machine {
             },
             Req::PageEnable => {
                 self.lap("viewport + Page.enable", out);
-                match (self.fresh, self.cfg.url.clone()) {
-                    (false, Some(url)) => {
+                // After a recovery the tab is a blank one in a new Chromium:
+                // return to the page we were on. Otherwise navigate an existing
+                // tab to the URL asked for; a tab we just created already is there.
+                let to = match (self.resume.take(), self.fresh, self.cfg.url.clone()) {
+                    (Some(u), _, _) => Some(u),
+                    (None, false, Some(u)) => Some(u),
+                    _ => None,
+                };
+                match (to.is_some(), to) {
+                    (true, Some(url)) => {
                         self.phase = Phase::Navigating;
                         self.navigated = false;
                         self.navigate_deadline = self.now + NAVIGATE_BUDGET;
@@ -515,6 +641,12 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// The tab to prefer: the one this session already attached to, else the
+    /// one pinned by an earlier run.
+    fn pinned_target(&self) -> Option<String> {
+        if self.target.is_empty() { self.cfg.pinned.clone() } else { Some(self.target.clone()) }
     }
 
     fn attach(&mut self, out: &mut Vec<Effect>) {
@@ -613,7 +745,7 @@ impl Machine {
     fn status_text(&self) -> String {
         let mut s = match self.phase {
             Phase::Connecting if self.spawned => {
-                format!("kami: starting chromium (a cold start takes ~10 s)  {}s", self.secs(self.started.unwrap_or(0)))
+                format!("kami: starting chromium (a cold start takes ~10 s)  {}s", self.secs(self.connect_since))
             }
             Phase::Connecting => "kami: connecting".into(),
             Phase::Targets => format!("kami: waiting for chromium to answer  {}s", self.secs(self.lap_at)),
@@ -629,6 +761,9 @@ impl Machine {
             ),
             Phase::Done => "kami: closing".into(),
         };
+        if self.recoveries > 0 {
+            s.push_str(&format!("  (chromium restarted x{})", self.recoveries));
+        }
         if let Some(p) = self.pending.iter().filter(|p| self.now.saturating_sub(p.sent) > STALL_AFTER).min_by_key(|p| p.sent) {
             s.push_str(&format!("  !! no answer to {} for {}s", p.method, self.secs(p.sent)));
         }
@@ -648,6 +783,7 @@ mod tests {
             poll_ms: None,
             max_frames: None,
             seconds: None,
+            pinned: None,
         }
     }
 
@@ -670,6 +806,14 @@ mod tests {
         Event::Cdp(format!("{{\"id\":{id},\"result\":{result}}}").into_bytes())
     }
 
+    /// `Connected`, then the daemon answering `Kami.hello` (request 1); the
+    /// effects of `Connected` itself are returned.
+    fn connect(m: &mut Machine) -> Vec<Effect> {
+        let e = m.handle(Event::Connected);
+        m.handle(reply(1, r#"{"daemon":10,"chromium":11,"generation":1,"restarts":0,"upMs":5}"#));
+        e
+    }
+
     fn event(name: &str, params: &str, session: &str) -> Event {
         Event::Cdp(format!("{{\"method\":\"{name}\",\"params\":{params},\"sessionId\":\"{session}\"}}").into_bytes())
     }
@@ -678,8 +822,8 @@ mod tests {
     fn running(url: Option<&str>) -> Machine {
         let mut m = Machine::new(cfg(url));
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected);
-        let e = m.handle(reply(1, r#"{"targetInfos":[{"targetId":"T1","type":"page","url":"about:blank"}]}"#));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T1","type":"page","url":"about:blank"}]}"#));
         let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S1"}"#));
         assert!(sent(&e).iter().any(|s| s.contains("Page.enable")));
         let e = m.handle(reply(last_id(&e), "{}"));
@@ -702,8 +846,8 @@ mod tests {
         assert!(has(&e, |x| *x == Effect::TryConnect { spawn: false }));
         // Not asked twice while the first attempt is out.
         assert!(!has(&m.handle(Event::Tick(50)), |x| matches!(x, Effect::TryConnect { .. })));
-        let e = m.handle(Event::Connected);
-        assert!(sent(&e)[0].contains("Target.getTargets"));
+        let e = connect(&mut m);
+        assert!(sent(&e)[0].contains("Kami.hello") && sent(&e)[1].contains("Target.getTargets"));
     }
 
     #[test]
@@ -732,9 +876,9 @@ mod tests {
         let mut m = Machine::new(cfg(None));
         let e = m.handle(Event::Tick(0));
         assert!(has(&e, |x| matches!(x, Effect::Status(s) if s.contains("connecting"))));
-        let e = m.handle(Event::Connected);
+        let e = connect(&mut m);
         assert!(has(&e, |x| matches!(x, Effect::Status(s) if s.contains("waiting for chromium"))));
-        let e = m.handle(reply(1, r#"{"targetInfos":[{"targetId":"T1","type":"page"}]}"#));
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T1","type":"page"}]}"#));
         assert!(sent(&e)[0].contains("Target.attachToTarget") && sent(&e)[0].contains("T1"));
         let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S1"}"#));
         let s = sent(&e);
@@ -751,8 +895,8 @@ mod tests {
     fn creates_a_tab_when_there_is_none() {
         let mut m = Machine::new(cfg(Some("http://example.com")));
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected);
-        let e = m.handle(reply(1, r#"{"targetInfos":[]}"#));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[]}"#));
         assert!(sent(&e)[0].contains("Target.createTarget") && sent(&e)[0].contains("example.com"));
         let e = m.handle(reply(last_id(&e), r#"{"targetId":"NEW"}"#));
         assert!(sent(&e)[0].contains("Target.attachToTarget") && sent(&e)[0].contains("NEW"));
@@ -763,8 +907,8 @@ mod tests {
     fn navigates_an_existing_tab_and_waits_for_the_frame_but_not_forever() {
         let mut m = Machine::new(cfg(Some("http://example.com")));
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected);
-        let e = m.handle(reply(1, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
         let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S"}"#));
         let e = m.handle(reply(last_id(&e), "{}")); // Page.enable
         assert!(sent(&e)[0].contains("Page.navigate"));
@@ -780,8 +924,8 @@ mod tests {
     fn retries_the_screencast_while_the_page_is_not_attached_yet() {
         let mut m = Machine::new(cfg(None));
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected);
-        let e = m.handle(reply(1, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
         let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S"}"#));
         let e = m.handle(reply(last_id(&e), "{}"));
         let id = last_id(&e);
@@ -797,7 +941,7 @@ mod tests {
     fn a_silent_chromium_shows_on_the_status_line_and_keys_still_work() {
         let mut m = Machine::new(cfg(None));
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected); // getTargets goes unanswered
+        connect(&mut m); // getTargets goes unanswered
         let e = m.handle(Event::Tick(6_000));
         assert!(has(&e, |x| matches!(x, Effect::Status(s) if s.contains("no answer to Target.getTargets"))));
         // Quitting works even now: this is the point of the machine.
@@ -846,8 +990,8 @@ mod tests {
         c.poll_ms = Some(500);
         let mut m = Machine::new(c);
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected);
-        let e = m.handle(reply(1, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
         let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S"}"#));
         let e = m.handle(reply(last_id(&e), "{}"));
         m.handle(reply(last_id(&e), "{}"));
@@ -951,8 +1095,8 @@ mod tests {
         c.max_frames = Some(2);
         let mut m = Machine::new(c);
         m.handle(Event::Tick(0));
-        m.handle(Event::Connected);
-        let e = m.handle(reply(1, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T","type":"page"}]}"#));
         let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S"}"#));
         let e = m.handle(reply(last_id(&e), "{}"));
         m.handle(reply(last_id(&e), "{}"));
@@ -970,10 +1114,117 @@ mod tests {
         assert_eq!(m.now, 10_000);
     }
 
+    /// Walk a machine that already attached to a page (as `running`) onto a
+    /// second Chromium: drive it from `Target.getTargets` after a recovery.
+    fn reattach(m: &mut Machine, e: Vec<Effect>, tab: &str, session: &str) -> Vec<Effect> {
+        let e = m.handle(reply(last_id(&e), &format!(r#"{{"targetInfos":[{{"targetId":"{tab}","type":"page","url":"about:blank"}}]}}"#)));
+        assert!(sent(&e)[0].contains("Target.attachToTarget"));
+        let e = m.handle(reply(last_id(&e), &format!(r#"{{"sessionId":"{session}"}}"#)));
+        m.handle(reply(last_id(&e), "{}")) // Page.enable
+    }
+
     #[test]
-    fn a_vanished_daemon_ends_the_session_with_an_error() {
+    fn a_restarted_chromium_is_reattached_and_the_page_comes_back() {
         let mut m = running(None);
+        m.handle(event("Page.frameNavigated", r#"{"frame":{"id":"F","url":"https://akuma.sh/"}}"#, "S1"));
+        let e = m.handle(Event::Cdp(br#"{"method":"Kami.chromiumRestarted","params":{"generation":2,"reason":"chromium exited: signal: 11 (SIGSEGV)"}}"#.to_vec()));
+        assert!(sent(&e)[0].contains("Target.getTargets"), "starts over from the targets");
+        assert_eq!(m.phase, Phase::Targets);
+        assert!(m.session.is_none() && m.pending.len() == 1, "the old session and requests are forgotten");
+        assert!(has(&e, |x| matches!(x, Effect::Status(s) if s.contains("restarted x1"))));
+        let e = reattach(&mut m, e, "T2", "S2");
+        // The new Chromium's tab is blank: it navigates back to where we were.
+        let s = sent(&e);
+        assert!(s[0].contains("Page.navigate") && s[0].contains("https://akuma.sh/") && s[0].contains("\"sessionId\":\"S2\""), "{s:?}");
+        let e = m.handle(Event::Tick(20_000));
+        assert!(sent(&e)[0].contains("Page.startScreencast"));
+    }
+
+    #[test]
+    fn a_wedged_chromium_is_replaced_not_waited_on_forever() {
+        let mut m = running(None);
+        m.handle(event("Page.screencastFrame", r#"{"data":"QUJD","sessionId":1}"#, "S1")); // an unanswered ack
+        assert!(sent(&m.handle(Event::Tick(30_000))).is_empty(), "30 s is slow, not wedged");
+        let e = m.handle(Event::Tick(60_000));
+        assert!(sent(&e).iter().any(|s| s.contains("Kami.restart")), "asks the daemon");
+        // Asked once, not on every tick.
+        assert!(sent(&m.handle(Event::Tick(61_000))).is_empty());
+        // The daemon did restart it: back to work.
+        let e = m.handle(Event::Cdp(br#"{"method":"Kami.chromiumRestarted","params":{"generation":2,"reason":"the client asked for a restart"}}"#.to_vec()));
+        assert!(sent(&e)[0].contains("Target.getTargets"));
+        assert!(m.restart_asked.is_none());
+    }
+
+    #[test]
+    fn if_the_daemon_cannot_restart_it_the_session_ends_with_a_reason() {
+        let mut m = running(None);
+        m.handle(event("Page.screencastFrame", r#"{"data":"QUJD","sessionId":1}"#, "S1"));
+        m.handle(Event::Tick(50_000));
+        let e = m.handle(Event::Tick(50_000 + RESTART_PATIENCE + 1));
+        assert!(has(&e, |x| matches!(x, Effect::Done(Some(s)) if s.contains("not answering"))));
+    }
+
+    #[test]
+    fn the_pinned_tab_is_preferred_and_the_attached_one_is_pinned() {
+        let mut c = cfg(None);
+        c.pinned = Some("MINE".into());
+        let mut m = Machine::new(c);
+        m.handle(Event::Tick(0));
+        connect(&mut m);
+        let e = m.handle(reply(
+            2,
+            r#"{"targetInfos":[{"targetId":"OTHER","type":"page"},{"targetId":"MINE","type":"page"}]}"#,
+        ));
+        assert!(sent(&e)[0].contains("\"targetId\":\"MINE\""));
+        let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S"}"#));
+        assert!(has(&e, |x| *x == Effect::Pin("MINE".into())), "{e:?}");
+    }
+
+    #[test]
+    fn a_pinned_tab_that_is_gone_falls_back_to_the_first_page() {
+        let mut c = cfg(None);
+        c.pinned = Some("GONE".into());
+        let mut m = Machine::new(c);
+        m.handle(Event::Tick(0));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"A","type":"page"},{"targetId":"B","type":"page"}]}"#));
+        assert!(sent(&e)[0].contains("\"targetId\":\"A\""));
+    }
+
+    #[test]
+    fn hello_is_asked_and_its_answer_logged_even_from_an_old_daemon() {
+        let mut m = Machine::new(cfg(None));
+        m.handle(Event::Tick(0));
+        let e = m.handle(Event::Connected);
+        assert!(sent(&e)[0].contains("Kami.hello"));
+        let e = m.handle(reply(1, r#"{"daemon":7,"chromium":8,"generation":3,"restarts":2,"upMs":900}"#));
+        assert!(has(&e, |x| matches!(x, Effect::Log(s) if s.contains("daemon:") && s.contains("generation"))));
+        assert_eq!(m.generation, 3);
+        // An older daemon relays it to Chromium, which answers with an error.
+        let mut m = Machine::new(cfg(None));
+        m.handle(Event::Tick(0));
+        m.handle(Event::Connected);
+        let e = m.handle(Event::Cdp(br#"{"id":1,"error":{"code":-32601,"message":"'Kami.hello' wasn't found"}}"#.to_vec()));
+        assert!(!has(&e, |x| matches!(x, Effect::Done(_))));
+    }
+
+    #[test]
+    fn a_vanished_daemon_is_replaced_and_the_page_comes_back_then_the_session_gives_up() {
+        let mut m = running(None);
+        m.handle(event("Page.frameNavigated", r#"{"frame":{"id":"F","url":"https://akuma.sh/"}}"#, "S1"));
         let e = m.handle(Event::DaemonGone);
-        assert!(has(&e, |x| matches!(x, Effect::Done(Some(_)))));
+        assert!(has(&e, |x| matches!(x, Effect::Log(s) if s.contains("reconnecting (1/3)"))));
+        assert_eq!(m.phase, Phase::Connecting);
+        // Not instantly: the old socket needs a moment to be gone.
+        assert!(!has(&m.handle(Event::Tick(100)), |x| matches!(x, Effect::TryConnect { .. })));
+        let e = m.handle(Event::Tick(300));
+        assert!(has(&e, |x| *x == Effect::TryConnect { spawn: true }), "the daemon is gone, so one is started");
+        m.handle(Event::Connected);
+        m.handle(reply(m.next_id - 1, r#"{"daemon":1,"chromium":2,"generation":1}"#));
+                // Three losses in all are tolerated; the fourth ends the session.
+        m.handle(Event::DaemonGone);
+        m.handle(Event::DaemonGone);
+        let e = m.handle(Event::DaemonGone);
+        assert!(has(&e, |x| matches!(x, Effect::Done(Some(s)) if s.contains("daemon went away"))));
     }
 }

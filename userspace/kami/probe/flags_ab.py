@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A/B Chromium flag sets for kami on a live Akuma: N cold starts per arm.
 
-    python3 flags_ab.py HOST [--runs 4] [--hold 25] [--arm name ...]
+    python3 flags_ab.py HOST [--runs 4] [--hold 25] [--arm name ...] [--url URL]
 
 Each run: kill any Chromium, start `kami --seconds HOLD URL` with the arm's
 extra `--chrome-arg`s, and read /tmp/kami-input.log. A run SURVIVES if the
@@ -14,6 +14,9 @@ import subprocess, sys, re
 
 ARMS = {
     "base": [],
+    # One browser process: no zygote, renderer/GPU/network inside it. Drops the
+    # SCM_RIGHTS, shared-memory and fork machinery Akuma struggles with.
+    "single": ["--single-process", "--no-zygote"],
     "slim": [
         "--disable-background-networking", "--disable-sync", "--disable-extensions",
         "--disable-component-update", "--disable-default-apps", "--no-default-browser-check",
@@ -30,13 +33,14 @@ ARMS = {
 }
 
 host = sys.argv[1]
-runs, hold, only = 4, 25, []
+runs, hold, only, url = 4, 25, [], "http://example.com"
 a = sys.argv[2:]
 while a:
     x = a.pop(0)
     if x == "--runs": runs = int(a.pop(0))
     elif x == "--hold": hold = int(a.pop(0))
     elif x == "--arm": only.append(a.pop(0))
+    elif x == "--url": url = a.pop(0)
 O = ["ssh", "-p", "2222", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
      "-o", "LogLevel=ERROR", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", f"root@{host}"]
 
@@ -55,7 +59,7 @@ for name, flags in ARMS.items():
         out = rem(
             "timeout 15 kami --kill >/dev/null 2>&1; killall chromium chrome_crashpad_handler 2>/dev/null; "
             "sleep 1; rm -rf /tmp/kami-profile/Singleton* /tmp/kami-input.log /tmp/kami.log; "
-            f"kami --seconds {hold} {args} http://example.com >/dev/null 2>&1; "
+            f"kami --fb none --seconds {hold} {args} {url} >/dev/null 2>&1; "
             "grep -a -E 'ready for frames|FIRST PIXELS|session done' /tmp/kami-input.log; "
             "echo gpu-errors: $(grep -a -c 'GPU process' /tmp/kami.log); "
             "echo left-over: $(ps | grep -E 'chromium|crashpad' | grep -v grep | grep -c .)", t=hold + 120)

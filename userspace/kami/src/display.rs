@@ -56,3 +56,27 @@ mod tests {
         assert_eq!(auto_scale((7680, 4296)), 2, "capped: 8K would be blocky");
     }
 }
+
+/// A display that shows nothing: for runs on a machine whose screen someone is
+/// using (`--fb none`). Frames still go through the decoder and `KAMI_DUMP`;
+/// the status line goes to the input log through `on_status`.
+pub struct Null {
+    pub size: (usize, usize),
+    pub last: String,
+}
+
+impl Display for Null {
+    fn screen_size(&self) -> (usize, usize) {
+        self.size
+    }
+
+    fn page_size(&self, scale: usize) -> (usize, usize) {
+        (self.size.0 / scale, self.size.1 / scale)
+    }
+
+    fn blit(&mut self, _px: &[u8], _w: usize, _h: usize, _ch: usize, _scale: usize) {}
+
+    fn status(&mut self, text: &str) {
+        self.last = text.to_string();
+    }
+}

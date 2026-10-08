@@ -7,7 +7,7 @@
 //! Keys typed on the tty go back as CDP input events. Quitting detaches and
 //! leaves Chromium and the page running for the next session.
 //!
-//!   kami [--scale N] [--fb PATH] [--chromium PATH] [--sock PATH] [--log PATH]
+//!   kami [--scale N] [--fb PATH|none] [--chromium PATH] [--sock PATH] [--log PATH]
 //!        [--frames N] [--seconds S] [--chrome-arg ARG]... [URL]
 //!   kami --kill          stop the daemon and its Chromium
 //!
@@ -352,7 +352,13 @@ fn daemon_config(args: &Args, width: usize, height: usize) -> daemon::Config {
 
 fn kill(args: &Args) -> io::Result<()> {
     let mut c = Cdp::connect(&args.sock)?;
-    c.call("Browser.close", "{}", false)?;
+    // The daemon stops Chromium's whole process group and exits. An older
+    // daemon does not know the request (Chromium answers with an error), so
+    // fall back to asking Chromium to close.
+    if c.call("Kami.shutdown", "{}", false).is_err() {
+        c.call("Browser.close", "{}", false)?;
+    }
+    let _ = std::fs::remove_file(format!("{}.target", args.sock));
     eprintln!("[kami] chromium closed");
     Ok(())
 }
@@ -395,7 +401,12 @@ fn session(args: &Args) -> io::Result<()> {
 
     input_log_open();
     ilog!("---- session start, pid {} ----", std::process::id());
-    let mut fb: Box<dyn Display> = Box::new(fb::Fb::open(&args.fb)?);
+    let mut fb: Box<dyn Display> = if args.fb == "none" {
+        let (w, h) = args.size.unwrap_or((1920, 1176));
+        Box::new(display::Null { size: (w, h), last: String::new() })
+    } else {
+        Box::new(fb::Fb::open(&args.fb)?)
+    };
     let scale = if args.scale == 0 { display::auto_scale(fb.screen_size()) } else { args.scale };
     let view = fb.page_size(scale);
     ilog!("startup: display opened (screen {:?}, scale {scale}, page {}x{})", fb.screen_size(), view.0, view.1);
@@ -406,6 +417,7 @@ fn session(args: &Args) -> io::Result<()> {
         poll_ms: args.poll,
         max_frames: args.frames,
         seconds: args.seconds,
+        pinned: std::fs::read_to_string(format!("{}.target", args.sock)).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
     });
 
     let tty = RawTty::enter();
@@ -444,7 +456,10 @@ fn session(args: &Args) -> io::Result<()> {
                             queue.push_back(Event::Cdp(msg));
                         }
                     }
-                    _ => queue.push_back(Event::DaemonGone),
+                    _ => {
+                        c = None;
+                        queue.push_back(Event::DaemonGone);
+                    }
                 }
             }
         }
@@ -484,6 +499,7 @@ fn session(args: &Args) -> io::Result<()> {
                         if let Some(cc) = c.as_mut() {
                             if let Err(e) = cc.send_raw(&msg) {
                                 ilog!("send failed: {e}");
+                                c = None;
                                 queue.push_back(Event::DaemonGone);
                             }
                         }
@@ -491,6 +507,9 @@ fn session(args: &Args) -> io::Result<()> {
                     Effect::Present { b64, source } => {
                         let (ok, empty) = present(&mut *fb, &mut png, &mut bytes, &b64, scale);
                         queue.push_back(Event::Presented { source, ok, empty });
+                    }
+                    Effect::Pin(target) => {
+                        let _ = std::fs::write(format!("{}.target", args.sock), target);
                     }
                     Effect::Status(t) => fb.status(&t),
                     Effect::Log(t) => ilog!("{t}"),
@@ -512,7 +531,7 @@ fn session(args: &Args) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdp::{event_session, first_page, method, num_field, str_field};
+    use crate::cdp::{event_session, first_page_with, method, num_field, str_field};
 
     #[test]
     fn base64_round_trip() {
@@ -535,8 +554,8 @@ mod tests {
         assert_eq!(method(br#"{"id":3,"result":{}}"#), None);
         assert_eq!(event_session(m), Some("ABCD"));
         let t = br#"{"id":1,"result":{"targetInfos":[{"targetId":"B1","type":"browser"},{"targetId":"P1","type":"page","url":"about:blank"}]}}"#;
-        assert_eq!(first_page(t).as_deref(), Some("P1"));
-        assert_eq!(first_page(br#"{"id":1,"result":{"targetInfos":[]}}"#), None);
+        assert_eq!(first_page_with(t, None).as_deref(), Some("P1"));
+        assert_eq!(first_page_with(br#"{"id":1,"result":{"targetInfos":[]}}"#, None), None);
     }
 
     #[test]
