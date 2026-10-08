@@ -508,6 +508,17 @@ The compile-time `syscall-debug-info` (now forwardable on amd64) added 244
 glue lines and no lifecycle lines in the same run, and found nothing the
 runtime flags did not. It stays off.
 
+## Update 2026-10-08 (evening): Tumblr renders on ryzen, system-font text does not
+
+On ryzen's Akuma over wifi, `kami https://www.tumblr.com/` paints the page's
+layout and images on the framebuffer. Text in system fonts is missing
+everywhere (a local test page shows none of its `serif`/`sans-serif`/
+`monospace`/emoji lines; borders and an SVG icon do paint); web-font text does
+paint. `fc-match` in the guest is correct. Chromium's
+`Chrome.FontDataService.EmptyPathOnGetFileHandle` counts 5 of 5: the browser
+process's font service has no path for the matched font. **Open.** Details and
+the `kami` blink fix: `userspace/kami/README.md` § "Tumblr on the ryzen laptop".
+
 ## Still open: what Chromium hits on Akuma now
 
 Runs under Firecracker (`userspace/kami/probe/akuma/`, 4 GiB guest). With

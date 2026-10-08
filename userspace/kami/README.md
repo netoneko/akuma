@@ -145,6 +145,41 @@ Details are in the scripts' headers and in
 [`docs/handoff-kernel-chromium-support.md`](../../docs/handoff-kernel-chromium-support.md),
 which is also where the remaining kernel work is laid out.
 
+## Tumblr on the ryzen laptop (2026-10-08)
+
+`kami https://www.tumblr.com/` renders on **ryzen's Akuma over wifi** (entry 12,
+1920x1200 `/dev/fb0`, Alpine's `chromium` 142 staged onto p3 with
+`apk.static --root`, `/bin/kami`). Confirmed by a captured frame and by a
+photo of the panel: Tumblr's layout paints (header, buttons, a dialog card,
+the loading placeholder).
+
+**But no text, images only**, as seen on the panel. The first-party text that did
+appear in one captured frame (the "Trending / Staff Picks / Videos" row) is
+Tumblr's own web font; text in **system fonts renders nowhere**: a local page
+with `serif`, `sans-serif`, `monospace`, `Helvetica` and an emoji line paints none
+of them, in the top frame or in an iframe, while borders and an SVG icon paint.
+`fc-match sans-serif` inside the guest answers `NotoSans-Regular.ttf`, so
+fontconfig and the files are fine. Chromium's own histograms say where it
+breaks: `Chrome.FontDataService.EmptyPathOnGetFileHandle` recorded 5 of 5
+(the browser's font service finds no file path for the font it matched).
+**OPEN**; chase with `strace_err` (`docs/runbooks/trace-failing-syscalls-amd64.md`).
+
+Other findings from the same session:
+
+- `kami` polls `captureScreenshot` because the screencast is empty (see the
+  archive record). Once polling, it **must not blit the empty screencast
+  frames**: each one painted the screen white over the last screenshot (a
+  white blink). Fixed in `src/main.rs`; `KAMI_DUMP` now keeps the latest
+  frame, polled screenshots included.
+- The first screencast frame is blank by design of the page load; judge a run by
+  the latest frame, not the first.
+- Chromium logs `pthread_getschedparam failed: 38` (a scheduler syscall
+  answers `ENOSYS`), `CreatePlatformSocket() failed: Address family not
+  supported` (IPv6) and the shared-memory `Corruption detected` line, all
+  non-fatal so far.
+- A `chromium --screenshot --virtual-time-budget` run of Tumblr never finishes
+  (the page keeps timers alive); use `kami`/CDP for a screenshot of a live page.
+
 ## Future: kami in a rio split pane
 
 The goal is to run `kami` inside one of [rio](../rio/build.sh)'s split

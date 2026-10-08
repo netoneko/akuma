@@ -407,7 +407,12 @@ fn session(args: &Args) -> io::Result<()> {
                 poll_ms = Some(500);
                 next_shot = Instant::now();
             }
+            // Once polling, the screencast's empty frames are acknowledged and
+            // dropped: blitted, each one painted the screen white over the
+            // last screenshot, which is only drawn again when the page changes
+            // (the blink, 2026-10-08, ryzen).
             match ok {
+                Ok(()) if poll_ms.is_some() => {}
                 Ok(()) => fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale),
                 Err(e) => eprintln!("[kami] frame dropped: {e}\r"),
             }
