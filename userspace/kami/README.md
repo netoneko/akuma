@@ -99,12 +99,19 @@ Chromium's runs on Akuma (2026-10-08) found and fixed, in order:
   socket directory is exactly 0700.
 - `SO_PASSCRED` produced no `SCM_CREDENTIALS`, and the browser takes each
   zygote child's pid from them.
+- x86_64 `capget`/`capset` had no row, so the `capset` every zygote child
+  makes right after `fork` (inside a `CHECK`) was `ENOSYS`, and every child
+  died before its ping. Gate `capprobe.c`.
+- `mmap`/`mprotect` refused `PROT_WRITE|PROT_EXEC`, which V8 asks for on its
+  512 MB code range; every renderer died on it. Gate `jitprobe.c`.
+- The kernel held 64 non-main threads **system-wide**; the GPU process's
+  sixth thread got `EAGAIN`. Now 448. Gate `thrprobe.c`.
 
-**Chromium on Akuma does not render a page yet.** The browser now runs for
-about 10 s and launches children through the zygote. A zygote child then
-crashes before it can report back, so the GPU process never starts. That
-crash is being traced next. The open list (including `gettid()` of a main
-thread not being its pid) is in the record below.
+**Chromium on Akuma renders (2026-10-08).** `chrome-once.sh` under
+Firecracker exits 0 in about 28 s of guest time and its screenshot reads
+"JavaScript ran: 6 x 7 = 42". The open list (`fallocate`'s missing row, the
+256-row process table, `gettid()` of a main thread not being its pid) is in
+the record below. Next: `kami` itself on the trashcan's metal.
 
 Finding these took a trace of failing syscalls (`strace_err` on the kernel
 command line):

@@ -610,13 +610,14 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         }
     }
 
-    // W^X, enforced here as it is in the ELF loader: `PteProt` offers no
-    // writable-and-executable constructor, and a JIT is not something this
-    // target supports. Kept ahead of everything that has an effect so a refused
-    // request changes nothing.
-    if prot32 & PROT_WRITE != 0 && prot32 & PROT_EXEC != 0 {
-        return errno::EINVAL;
-    }
+    // `PROT_WRITE | PROT_EXEC` is granted, as Linux grants it. Until
+    // 2026-10-08 it was refused here with `EINVAL` ("a JIT is not something
+    // this target supports"), and the same rule sat in `sys_mprotect`. V8 is
+    // a JIT: every Chromium renderer reserves a 512 MB `PROT_NONE` code range
+    // and then `mprotect`s the whole of it RWX, and the refusal killed each one
+    // on a `CHECK` (`[Fault] #BP`) while the browser waited for a renderer
+    // that never came. The ELF loader keeps its own stance for *segments*.
+    // Gate: `jitprobe.c`, on Linux first.
     let region_prot = Prot::from_prot(prot32);
 
     // Everything past this point has an **effect on an address space**, so there
@@ -2276,11 +2277,8 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         return errno::EINVAL;
     }
     let prot32 = prot as u32;
-    // The same W^X stance `sys_mmap` takes. Refusing here as well is what stops
-    // `mprotect` being the back door onto a writable code page.
-    if prot32 & PROT_WRITE != 0 && prot32 & PROT_EXEC != 0 {
-        return errno::EINVAL;
-    }
+    // RWX is granted here as in `sys_mmap` (see the note there): this is the
+    // call V8 makes on its code range.
     if len == 0 {
         return 0;
     }
@@ -2864,10 +2862,12 @@ pub fn smoke_test(t: &mut Suite) {
         sys_mmap(0, 4096, 1, 0, 5, 0),
         errno::EACCES,
     );
+    // Granted since 2026-10-08 (V8's code range), so in the boot suite — no
+    // current process — it must reach the address-space step and say so.
     t.check_eq(
-        "mmap: writable+executable is refused",
+        "mmap: writable+executable is accepted (ESRCH here: no process, not EINVAL)",
         sys_mmap(0, 4096, u64::from(PROT_WRITE | PROT_EXEC), ANON, NO_FD, 0),
-        errno::EINVAL,
+        errno::ESRCH,
     );
     t.check_eq(
         "mmap: an unaligned MAP_FIXED address is EINVAL",
@@ -2885,9 +2885,9 @@ pub fn smoke_test(t: &mut Suite) {
         errno::EINVAL,
     );
     t.check_eq(
-        "mprotect: writable+executable is refused",
+        "mprotect: writable+executable is accepted (ESRCH here: no process, not EINVAL)",
         sys_mprotect(0x1_0000_0000, 4096, u64::from(PROT_WRITE | PROT_EXEC)),
-        errno::EINVAL,
+        errno::ESRCH,
     );
 
     // Every one of these runs during the boot self-tests, where there is no

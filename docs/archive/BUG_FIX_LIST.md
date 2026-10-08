@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1296
+- **Total distinct fixes counted:** 1308
 - **Docs contributing at least one fix:** 370
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 189 | 14.6% | 28 |
-| Memory & Virtual Memory | 174 | 13.4% | 56 |
+| Syscall / ABI Compatibility Audits | 201 | 15.4% | 28 |
+| Memory & Virtual Memory | 174 | 13.3% | 56 |
 | Scheduler & Process Management | 138 | 10.6% | 42 |
-| SMP & Locking | 131 | 10.1% | 52 |
-| Networking | 80 | 6.2% | 31 |
+| SMP & Locking | 131 | 10.0% | 52 |
+| Networking | 80 | 6.1% | 31 |
 | Userspace Apps & Libraries | 40 | 3.1% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 2.0% | 6 |
-| Toolchain & Self-Hosting | 89 | 6.9% | 12 |
+| Toolchain & Self-Hosting | 89 | 6.8% | 12 |
 | SSH | 39 | 3.0% | 18 |
-| VFS & Filesystem | 113 | 8.7% | 36 |
-| Boot & Drivers | 109 | 8.4% | 15 |
+| VFS & Filesystem | 113 | 8.6% | 36 |
+| Boot & Drivers | 109 | 8.3% | 15 |
 | Signals & Exceptions | 31 | 2.4% | 12 |
 | Misc / Cross-cutting | 48 | 3.7% | 16 |
 | Console & Terminal | 57 | 4.4% | 17 |
-| Containers | 32 | 2.5% | 8 |
-| **Total** | **1296** | **100.0%** | **370** |
+| Containers | 32 | 2.4% | 8 |
+| **Total** | **1308** | **100.0%** | **370** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -40,6 +40,7 @@ from several subsystems under one write-up.
 - 20 — `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`
 - 20 — `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`
 - 20 — `docs/archive/GOLANG_IPC.md`
+- 19 — `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`
 - 19 — `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`
 - 18 — `docs/archive/DASH_MISSING_SYSCALLS.md`
 - 16 — `docs/archive/AKUMA_SELF_HOSTING.md`
@@ -49,7 +50,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (189 fixes, 28 docs)
+## Syscall / ABI Compatibility Audits (201 fixes, 28 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -258,6 +259,18 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - amd64 `setsockopt` on a unix fd answered `ENOTSOCK` (the same routing hole as `sendmsg`), so crashpad's `SO_PASSCRED` failed and the browser `CHECK`-crashed; it now routes to glue
 - `execve` recorded the literal path as the image name, so a process started via `/proc/self/exe` could read `/proc/self/exe` back as itself; the name is resolved through symlinks before the swap
 - `hpbox.deploy()` reported success when its `git reset` failed inside a status-hiding pipeline, so the box stayed 210 commits back and the patch was applied onto a stale tree; it refuses when the box did not land on the intended commit
+- `execve` read the whole executable into one kernel-heap `Vec` (Chromium is 250 MB and re-execs itself, so two copies did not fit a 512 MiB heap); the loader streams the file through a 64 KiB window and the exec needs about 11 MB
+- IDT vector 3's gate was DPL 0, so a ring-3 `int3` (every Chromium `CHECK`) raised `#GP` and arrived as `SIGSEGV`; the gate is DPL 3 and `#BP` is `SIGTRAP`/`SI_KERNEL`
+- every regular-file `read`/`pread` was clamped to 64 KiB (`MAX_IO`), a short read Linux never gives before EOF, so the V8 snapshot's 776 KB `pread` came back 65 536; amd64 loops glue's read to the request, EOF or an error
+- `CLOCK_REALTIME` read a constant 0 until SNTP set it, so musl's `mkdtemp` seeded the same name 100 times and the ProcessSingleton could not create its socket directory; the userspace readers count from the epoch at boot until the clock is set
+- `prctl(PR_SET_NAME)` rewrote `/proc/<pid>/exe` (it rendered `ProcessImage::name`), so Chromium computed its install directory as `""` and could not find its crashpad handler, its V8 snapshot or itself; `/proc/<pid>/exe` reads a field of its own, set at spawn/`execve` and inherited on `fork`
+- `/proc/<pid>/task` did not exist and directories reported `st_nlink` 2, so the zygote's thread-count `CHECK` (`fstatat(proc_fd, "self/task/")`, `st_nlink == 3`) failed; procfs serves `<tgid>/task` with nlink `2 + threads` and aliases `task/<tid>` onto `<tid>`
+- `brk` had a row but no dispatch arm and fell into a silent `ENOSYS` (54 times in one run); it answers the current break, and the default arm now names a decoded number with no arm
+- `mkdir` ignored its mode (every directory got 0755), so the ProcessSingleton's `CHECK` that its socket directory is exactly 0700 failed; `sys_mkdirat` applies `mode & ~umask & 01777` on both kernels
+- `SO_PASSCRED` was accepted and produced no `SCM_CREDENTIALS`, so the browser's `RecvMsgWithPid` never learned a zygote child's pid; each unix record carries its sender's credentials, stream reads stop where the sender changes, and `recvmsg` writes `SCM_CREDENTIALS` before `SCM_RIGHTS`
+- x86_64 `capget`/`capset` (125/126) had no row, so the zygote child's post-fork `capset` (inside a `CHECK`) was `ENOSYS` and every child died before its ping ("Did not receive ping from zygote child", then "GPU process isn't usable"); both rows reach glue's arms, and glue's `capget` answers an unknown version with a NULL `data` as Linux does (0, version written) instead of `EINVAL`
+- amd64 `mmap`/`mprotect` refused `PROT_WRITE | PROT_EXEC` with `EINVAL` (a W^X rule Linux has not), `Prot::from_prot` dropped the execute bit beside `PROT_WRITE` on both kernels and the x86 encoder made even the RWX token non-executable, so V8's 512 MB code range could not be made RWX and every Chromium renderer died on a `CHECK`; all three grant it now, the ELF loader's segment rule stands
+- the amd64 non-main thread table held 64 entries system-wide, so a Chromium session's 65th thread got `EAGAIN` from `clone` and the GPU process `CHECK`ed five times; it holds 448, sized to the 512-slot task budget
 
 ## Memory & Virtual Memory (174 fixes, 56 docs)
 
@@ -2163,4 +2176,4 @@ docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OU
 
 userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/TESTING (duplicate of libakuma-tls TLS fix), crush/IMPLEMENTATION_DETAILS, forktest/IMPLEMENTATION_PLAN, herd/CORE_AWARE_SCHEDULING, httpd/TIMESTAMPS, libakuma/ALLOCATOR_OPTIONS, libakuma/MKDIR_P_IMPROVEMENTS, libakuma/SYSCALLS, libakuma/TERMINAL_SYSCALLS, meow/CONFIG, meow/HOTKEYS, meow/SHELL, meow/TESTING, scratch/LARGE_FILE_CHECKOUT_OPTIMIZATION, scratch/SIDEBAND_PARSER_FIX (duplicate of docs/archive/SIDEBAND_PARSER_FIX.md), sshd/LIMITATIONS, sshd/MIGRATION_SUMMARY, tar/IMPLEMENTATION_PLAN, tar/STREAMING_EXTRACTION, tcc/DISTRIBUTION_PLAN, tcc/IMPLEMENTATION_DETAILS, tcc/IMPLEMENTATION_PLAN, tcc/LIBTCC1.
 
-Also scanned 2026-10-08 (the ryzen laptop, wifi and Chromium work, 4 archive docs added and 1 edited). AKUMA_ACPI_POWER carries no counted fix: it adds `/proc/power` and the DSDT lookup as new capability, and its battery decode is unread on the laptop. Not counted, open by their own text: Chromium's `execve` reading the whole executable into the kernel heap, the crashpad `posix_spawn` `ENOENT`, `int3` from ring 3 arriving as SIGSEGV, `init=` following no symlinks, the missing x86_64 syscalls, the cross-core `now_us()` underflow in the station daemon, and the symlink dirent file type written wrongly by `apk`. The 16-core wedge listed in AKUMA_AMD64_ON_RYZEN_LAPTOP is counted once, under AKUMA_AMD64_SMP_WIDTH, which documents the fix. The whole-file-heap section folded into AKUMA_AMD64_CHROMIUM_KERNEL_WORK only restates fixes already counted (the `fd.rs` whole-file cache, the OOM handler's BKL release, the `Slab:` witness); its `execve` whole-image read is open.
+Also scanned 2026-10-08 (the ryzen laptop, wifi and Chromium work, 4 archive docs added and 1 edited). AKUMA_ACPI_POWER carries no counted fix: it adds `/proc/power` and the DSDT lookup as new capability, and its battery decode is unread on the laptop. Not counted, open by their own text: `init=` following no symlinks, the still-missing x86_64 syscalls (`sendfile`, `get_mempolicy`, `rt_tgsigqueueinfo`, `landlock_create_ruleset`, `inotify_init`), the cross-core `now_us()` underflow in the station daemon, and the symlink dirent file type written wrongly by `apk`. (Chromium's whole-image `execve`, the crashpad `posix_spawn` `ENOENT` and `int3` arriving as SIGSEGV were open when first scanned and are counted above as Fixes 8, 12 and 9 of AKUMA_AMD64_CHROMIUM_KERNEL_WORK, added 2026-10-08.) The 16-core wedge listed in AKUMA_AMD64_ON_RYZEN_LAPTOP is counted once, under AKUMA_AMD64_SMP_WIDTH, which documents the fix. The whole-file-heap section folded into AKUMA_AMD64_CHROMIUM_KERNEL_WORK only restates fixes already counted (the `fd.rs` whole-file cache, the OOM handler's BKL release, the `Slab:` witness); its `execve` whole-image read is Fix 8, counted above.

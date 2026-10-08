@@ -394,12 +394,16 @@ mod tests {
     }
 
     /// `from_prot` must route through `Prot` and land on the same encoding the
-    /// old direct implementation did, for every `prot` bit pattern.
+    /// old direct implementation did, for every `prot` bit pattern — with the
+    /// one change of 2026-10-08: `PROT_WRITE | PROT_EXEC` is `RW` (executable)
+    /// where the old table dropped the execute bit.
     #[test]
     fn from_prot_matches_the_old_direct_encoding() {
         for prot in 0u32..8 {
             let want = if prot == 0 {
                 user_flags::NONE
+            } else if prot & 0x6 == 0x6 {
+                user_flags::RW
             } else if prot & 0x2 != 0 {
                 user_flags::RW_NO_EXEC
             } else if prot & 0x4 != 0 {

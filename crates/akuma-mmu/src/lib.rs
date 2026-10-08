@@ -2875,6 +2875,11 @@ impl PteProt {
     pub const USER_RW: Self = Self { write: true, exec: false, user: true };
     /// User read + execute, not writable.
     pub const USER_RX: Self = Self { write: false, exec: true, user: true };
+    /// User read, write **and** execute: what `Prot::RW` is on AArch64, and
+    /// since 2026-10-08 on x86 too. It is a JIT's page — V8 asks for exactly
+    /// this on its code range — and the only user shape with `NX` clear and
+    /// `R/W` set. Nothing in the kernel's own tables uses it.
+    pub const USER_RWX: Self = Self { write: true, exec: true, user: true };
     /// Kernel read/write, no execute. The default for the kernel's own data.
     ///
     /// The two `KERNEL_*` constants are here rather than only in
@@ -2887,8 +2892,8 @@ impl PteProt {
     /// the pin comes back.
     pub const KERNEL_RW: Self = Self { write: true, exec: false, user: false };
     /// Kernel read + execute, not writable. The only executable kernel shape
-    /// offered: there is deliberately no writable-and-executable constructor,
-    /// on either architecture.
+    /// offered: there is deliberately no writable-and-executable **kernel**
+    /// constructor, on either architecture. The user one is [`Self::USER_RWX`].
     pub const KERNEL_RX: Self = Self { write: false, exec: true, user: false };
 }
 
@@ -3296,17 +3301,20 @@ impl PteProt {
     ///
     /// * `RO` and `RX` collapse. They differ only in `PXN` — whether EL1 may
     ///   fetch — and x86 has one execute bit, not two.
-    /// * `RW` (writable **and** executable on AArch64) becomes non-executable.
-    ///   `sys_mmap` on this target refuses `PROT_WRITE | PROT_EXEC`, so no
-    ///   region can carry it; if one ever does, dropping execute faults at the
-    ///   fetch — visible and debuggable — where granting it would hand ring 3 a
-    ///   writable code page.
+    /// * `RW` (writable **and** executable on AArch64) **was** made
+    ///   non-executable here until 2026-10-08, on the grounds that `sys_mmap`
+    ///   refused `PROT_WRITE | PROT_EXEC` and no region could carry it. Both
+    ///   halves of that went together: V8 `mprotect`s its whole code range RWX
+    ///   and every Chromium renderer died on the refusal. `RW` is now
+    ///   [`Self::USER_RWX`], the one divergence left is the `RO`/`RX` collapse,
+    ///   and `jitprobe.c` is the gate.
     #[must_use]
     pub const fn from_region(prot: akuma_mmap::Prot) -> Self {
         match prot.tag() {
             0 => Self::KERNEL_RO,
             1 | 4 => Self::USER_RX,
-            2 | 3 => Self::USER_RW,
+            2 => Self::USER_RWX,
+            3 => Self::USER_RW,
             5 => Self::USER_RO,
             // Unreachable over `Prot::ALL`. A `const fn` cannot panic out of a
             // `u8` match, so the fallback is **fail-closed**: a seventh variant
@@ -5331,8 +5339,8 @@ mod x86_encoding_tests {
         // RO and RX collapse: one execute bit, no PXN to distinguish them.
         assert_eq!(wb(Prot::RO), 0x0000_0000_0000_0005);
         assert_eq!(wb(Prot::RX), 0x0000_0000_0000_0005);
-        // RW and RW_NO_EXEC are both non-executable here.
-        assert_eq!(wb(Prot::RW), 0x8000_0000_0000_0007);
+        // RW is RWX (NX clear, since 2026-10-08); RW_NO_EXEC keeps NX.
+        assert_eq!(wb(Prot::RW), 0x0000_0000_0000_0007);
         assert_eq!(wb(Prot::RW_NO_EXEC), 0x8000_0000_0000_0007);
         assert_eq!(wb(Prot::RO_NO_EXEC), 0x8000_0000_0000_0005);
     }
@@ -5349,9 +5357,10 @@ mod x86_encoding_tests {
                 distinct.push(e);
             }
         }
-        // Six variants, four distinct encodings: RO/RX collapse and
-        // RW/RW_NO_EXEC collapse, each for its own documented reason.
-        assert_eq!(distinct.len(), 4, "the set of x86 encodings changed");
+        // Six variants, five distinct encodings: only RO/RX collapse (one
+        // execute bit, no PXN). RW and RW_NO_EXEC collapsed too until
+        // 2026-10-08, when RW became executable for V8's code range.
+        assert_eq!(distinct.len(), 5, "the set of x86 encodings changed");
         // NONE must not have collapsed into a user-reachable one.
         assert!(!PteProt::from_region(Prot::NONE).user);
     }
@@ -5366,7 +5375,8 @@ mod x86_encoding_tests {
             PteProt::from_region(user_flags::from_pte(f)),
             MemAttr::WriteBack,
         );
-        assert_eq!(via_u64(user_flags::RW), 0x8000_0000_0000_0007);
+        // RW is executable on x86 since 2026-10-08 (NX clear).
+        assert_eq!(via_u64(user_flags::RW), 0x0000_0000_0000_0007);
         assert_eq!(via_u64(user_flags::RW_NO_EXEC), 0x8000_0000_0000_0007);
         assert_eq!(via_u64(user_flags::RX), 0x0000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::RO_NO_EXEC), 0x8000_0000_0000_0005);

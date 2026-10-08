@@ -91,18 +91,25 @@ impl Prot {
 
     /// The protection an `mmap`/`mprotect` `prot` argument asks for.
     ///
-    /// The same three-way decision the AArch64 `from_prot` made, unchanged:
-    /// `PROT_WRITE` wins over `PROT_EXEC`, and a `prot` of 0 is `PROT_NONE`.
-    /// Note it never yields [`Self::RO_NO_EXEC`] — a plain `PROT_READ` mapping
-    /// stays executable, which is the AArch64 table's behaviour and is pinned
-    /// by test rather than defended here.
+    /// The AArch64 `from_prot` decision, with one change made 2026-10-08:
+    /// `PROT_WRITE | PROT_EXEC` is [`Self::RW`] (writable **and** executable,
+    /// the token that already existed), where it used to be
+    /// [`Self::RW_NO_EXEC`] — `PROT_WRITE` "won" and the execute bit asked for
+    /// was dropped without a word. Linux grants both, and V8 asks for both on
+    /// its whole 512 MB code range (`mmap PROT_NONE`, then `mprotect` RWX);
+    /// with the old table a JIT's first fetch faulted. `jitprobe.c` is the
+    /// gate on both kernels. A `prot` of 0 is `PROT_NONE`. Note it never
+    /// yields [`Self::RO_NO_EXEC`] — a plain `PROT_READ` mapping stays
+    /// executable, which is the AArch64 table's behaviour and is pinned by
+    /// test rather than defended here.
     #[must_use]
     pub const fn from_prot(prot: u32) -> Self {
         if prot == 0 {
             return Self::NONE;
         }
         match (prot & 0x2 != 0, prot & 0x4 != 0) {
-            (true, _) => Self::RW_NO_EXEC,
+            (true, true) => Self::RW,
+            (true, false) => Self::RW_NO_EXEC,
             (false, true) => Self::RX,
             (false, false) => Self::RO,
         }
@@ -172,7 +179,20 @@ mod tests {
         assert_eq!(Prot::from_prot(0), Prot::NONE);
         assert_eq!(Prot::from_prot(1), Prot::RO);
         assert_eq!(Prot::from_prot(2), Prot::RW_NO_EXEC);
+        assert_eq!(Prot::from_prot(3), Prot::RW_NO_EXEC);
         assert_eq!(Prot::from_prot(4), Prot::RX);
+        assert_eq!(Prot::from_prot(5), Prot::RX);
+    }
+
+    /// `PROT_WRITE | PROT_EXEC` is the RWX token, not the write-only one: V8's
+    /// code range (2026-10-08). Before this, the execute bit was dropped.
+    #[test]
+    fn from_prot_keeps_exec_beside_write() {
+        assert_eq!(Prot::from_prot(6), Prot::RW);
+        assert_eq!(Prot::from_prot(7), Prot::RW);
+        assert!(Prot::from_prot(7).is_write());
+        assert!(Prot::from_prot(7).is_exec());
+        assert!(!Prot::from_prot(3).is_exec());
     }
 
     /// `from_prot` and `is_write` must agree: anything carrying `PROT_WRITE` is

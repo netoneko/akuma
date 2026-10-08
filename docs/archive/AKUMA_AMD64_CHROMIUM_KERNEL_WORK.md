@@ -11,7 +11,11 @@ first ran on Akuma under Firecracker.
 The gate for the fixed half is `userspace/forktest/c_stress/chromeprobe.c`.
 Every expectation in it comes from running it on Linux first. On Linux it
 passes **16/16**, and on the amd64 kernel under Firecracker **16/16** since
-2026-10-08.
+2026-10-08. Ten more single-purpose probes beside it (`bpprobe`, `trapprobe`,
+`spawnprobe`, `singletonprobe`, `snapprobe`, `taskprobe`, `credprobe`,
+`capprobe`, `jitprobe`, `thrprobe`) each pin one fix; `probes.sh` runs them
+all. **Outcome, 2026-10-08, Fix 19:** headless Chromium renders a page with
+JavaScript on the amd64 kernel under Firecracker.
 
 ## Fix 1: amd64 `sendmsg`/`recvmsg` on a unix fd answered `ENOTSOCK`
 
@@ -266,6 +270,161 @@ Rows added at the same time, all served by glue already: x86_64 128
 `getpriority`, 141 `setpriority`. The two priority numbers are swapped between
 x86_64 and asm-generic.
 
+## Fix 17: x86_64 `capget`/`capset` had no row, and every zygote child died on it
+
+The "zygote child crashes before it pings" blocker of the round-2 handoff.
+The Linux `strace -f` answers what the child does first: in `--no-sandbox`
+mode the zygote forks through
+`sandbox::Credentials::ForkAndDropCapabilitiesInChild`, and the child's
+sequence is
+
+```
+38 set_tid_address(…) = 38
+38 rt_sigprocmask(SIG_SETMASK, ~[KILL STOP RTMIN RT_1 RT_2], NULL, 8) = 0
+38 rt_sigprocmask(SIG_SETMASK, [CHLD], NULL, 8) = 0
+38 capset({version=_LINUX_CAPABILITY_VERSION_3, pid=0}, {effective=0, permitted=0, inheritable=0}) = 0
+38 getpid() = 38
+38 close(16) = 0
+38 sendmsg(11, {… iov_base="CHILD_PING\0", iov_len=11 …}, MSG_NOSIGNAL) = 11
+38 read(15, "&\0\0\0", 4) = 4          <- its real pid, from the browser via the zygote
+```
+
+(`/root/cdp-probe/linux/smoke.strace` on the trashcan; twelve children,
+every one the same). `capset` is wrapped in a `CHECK`
+(`Credentials::DropAllCapabilities`), and an official build's `CHECK` prints
+nothing. The amd64 table had no row for x86_64 125/126, so the call was
+`ENOSYS`. The saved `dmesg` of the previous run already said so, unnamed:
+
+```
+[T12.91] [sc!] pid=61 task=42 nr=126 a1=0x7ffffffdd5b8 a2=0x7ffffffdd6f0 a3=0x0 -> -38
+[signal] pid=61 killed by signal 6 (default action)
+```
+
+one pair per child (pids 61–65, 71, 74–79), each followed by the browser's
+`Did not receive ping from zygote child`. Two things hid it:
+
+- the `no row for x86_64 nr=…` print keeps a 32-entry table of numbers it
+  has named, and the table was full before the first `capset`, so 126 was
+  never printed — only 297 (`rt_tgsigqueueinfo`), which got in earlier;
+- the handoff's `[sig!]` logging covers a fault **delivered to a handler**.
+  The child died of `SIGABRT` under the default action — not a fault, and
+  not handled — which prints the `[signal] … killed by signal 6` line
+  instead. It was in the log; nobody was grepping for it. Why the `CHECK`
+  ended in `SIGABRT` rather than an `int3` was not traced, because the
+  `[sc!]` line two lines above it names the cause.
+
+**Fix:** rows `Capget`/`Capset` (125/126 → asm-generic 90/91) in
+`akuma-syscalls-abi`, dispatched to glue's existing arms with the
+`setuid`/`setgid` group in `usermode.rs`: `capset` is the accepting no-op
+documented in `docs/reference/subsystems/syscalls/proc.md`, `capget`
+negotiates the version and reports root's full set. The amd64 self-test
+pins both hops and both answers (`capset` → 0, `capget(NULL)` → `EFAULT`).
+
+**Gate: `capprobe.c`**, the child's sequence in miniature — open `/proc`,
+`fstatat("self/task/")` nlink 3, `capset(V3, none)`, both `capget(version 0)`
+forms, `capget(V3)`, the ping over a `SO_PASSCRED` seqpacket pair — run on
+Linux first. That run corrected the probe's own expectation **and glue**:
+Linux's `sys_capget` answers an unknown version with a NULL `data` as 0
+(version written back, the pure "which version?" probe) and `EINVAL` only
+when `data` is given; glue said `EINVAL` for both. It now matches, on both
+kernels. The one divergence is printed, not scored: after dropping every
+capability, Linux reads back `effective=0` and Akuma reads back root's full
+set, because the kernel has no capability model. Chromium never calls
+`capget` in the whole Linux run, so nothing of its sees the difference.
+
+## Fix 18: amd64 refused `PROT_WRITE | PROT_EXEC`, which is V8's code range
+
+What the first run after Fix 17 hit. The browser now ran for the whole 400 s
+window with its GPU, utility and renderer processes alive, and three
+processes (the same renderer, launched three times) died the same way:
+
+```
+[T18.50] [sc!] pid=72 task=51 nr=10 a1=0x2a122880000 a2=0x1ffc0000 a3=0x7 -> -22
+[Fault] #BP breakpoint in ring 3 on cpu 1 rip=0x00000000177d7f5e … pid=72
+```
+
+`mprotect` of a 512 MB range to `PROT_READ|PROT_WRITE|PROT_EXEC`, `EINVAL`,
+then a `CHECK`. The Linux trace has the same sequence, succeeding, in every
+renderer:
+
+```
+66 mmap(0x5943e0000000, 536870912, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+66 prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, 0x5943e0000000, 536870912, "v8")
+66 mprotect(0x5943e0000000, 536870912, PROT_READ|PROT_WRITE|PROT_EXEC)
+66 madvise(0x5943e0000000, 536870912, MADV_DONTNEED)
+```
+
+That is V8's code range: reserved `PROT_NONE`, then made RWX as a whole,
+with pages flipped between RW and RX from there. (On a host with memory
+protection keys V8 does the same through `pkey_mprotect`; this trace has
+none, 0 `pkey_*` calls.)
+
+The amd64 kernel refused it twice over. `sys_mmap` and `sys_mprotect` both
+answered `PROT_WRITE | PROT_EXEC` with `EINVAL` under a W^X rule ("a JIT is
+not something this target supports"), and behind that
+`akuma_mmap::Prot::from_prot` mapped any `PROT_WRITE` to `RW_NO_EXEC` — on
+AArch64 too, where a RWX request was *granted* and silently lost its execute
+bit — and the x86 `PteProt::from_region` turned even the RWX token (`Prot::RW`)
+into a non-executable page. Linux grants all of it, and so does every JIT's
+expectation.
+
+**Fix:** the two refusals are gone; `Prot::from_prot` keeps `PROT_EXEC`
+beside `PROT_WRITE` (the `RW` token, which was already "read, write and
+execute" on AArch64); the x86 encoder gained `PteProt::USER_RWX` and maps
+`RW` to it, so the only x86 divergence left is the `RO`/`RX` collapse. The
+ELF loader's refusal of a writable+executable *segment* is untouched. Every
+pin moved with it: the amd64 boot suite (`prot: region RW is executable`,
+and the two `mmap`/`mprotect` RWX checks now expect `ESRCH` — accepted, no
+process — rather than `EINVAL`), `akuma-mmap`'s `from_prot` table test plus
+a new `from_prot_keeps_exec_beside_write`, and `akuma-mmu`'s three x86
+encoding pins (`RW` is `0x7`, five distinct encodings, not four).
+
+**Gate: `jitprobe.c`** — V8's four calls on a 512 MB range, code written
+into the middle of it and called (42), the page flipped to RX and called
+again, and a direct `mmap(PROT_RWX)` page. Linux: 9/9.
+
+## Fix 19: the amd64 thread table held 64 threads, system-wide
+
+After Fix 18 the browser ran 23 s and exited 191: the GPU process died five
+times (`GPU process exited unexpectedly: exit_code=5`, `[Fault] #BP` at one
+rip), the renderer twice, then `GPU process isn't usable. Goodbye.` Neither
+had a failing syscall of its own in the `[sc!]` trace — every `-2` before the
+fault (Vulkan ICD and layer directories, `prlimit64(RLIMIT_NPROC)` →
+`EFAULT`) fails identically on Linux. The full trace of the GPU process
+(`strace_pid=73`) showed the last call before its `CHECK`:
+
+```
+[sc>] cpu=1 task=52 nr=56 … flags=VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID|…
+[sc] cpu=1 task=52 nr=56 -> 0xfffffffffffffff5          <- clone: EAGAIN
+  [clone] thread table full
+```
+
+`amd64/src/thread.rs` kept every non-main thread in a fixed array of **64**,
+across all processes, with a comment calling that "well past what the
+scheduler's `MAX_TASKS` budget makes useful" — the budget is 512. A headless
+Chromium is a browser with ~20 threads and a dozen child processes of 5–7
+each (the Linux trace: 20 `clone`s in the browser, 5 in the GPU process, 7
+in each utility process); the kernel's own high-water line read `80 live
+user threads … ceiling=512` at the moment the 65th thread was refused. The
+`[sc!]` trace could not show it because it leaves `EAGAIN` out by design;
+the `[clone] thread table full` serial line (7 of them in that run) is the
+tell, and the runbook now says so.
+
+**Fix:** the table is 448 entries — the task budget less headroom for main
+threads — at about 14 KiB of `.bss`. The ceilings that remain are the 512
+task slots (each thread also costs one, plus two 32 KiB kernel stacks) and
+`akuma-exec`'s 256-row process table, which every `pthread_create` on this
+target also takes a row in (collected on exit) and which **panics** rather
+than refuses when full. Gate: `thrprobe.c`, 8 processes × 12 threads alive
+at once, run on Linux first (96 created, 0 failed); Akuma: the same.
+
+**With Fixes 17–19 Chromium renders.** `chrome-once.sh` exits 0 in about
+28 s of guest time, and `/tmp/shot.png` (800×600) reads "kami on Akuma /
+JavaScript ran: 6 x 7 = 42" — the goal the round-2 handoff set. The high-water
+line of that run is `103 live user threads … ceiling=512`. Standard-image
+boot on the same kernel: `731 passed, 0 failed` (727 plus the four new
+dispatch checks).
+
 ## The tools that found Fixes 11–16
 
 `docs/runbooks/trace-failing-syscalls-amd64.md`. Three kernel command-line
@@ -285,15 +444,20 @@ runtime flags did not. It stays off.
 ## Still open: what Chromium hits on Akuma now
 
 Runs under Firecracker (`userspace/kami/probe/akuma/`, 4 GiB guest). With
-Fixes 8–14 Chromium gets past crashpad, the ProcessSingleton, the V8 snapshot
-and the zygote's thread check, and then:
+Fixes 8–19 Chromium **renders the page** (above). What a successful run
+still logs, none of it fatal:
 
-- **A zygote child crashes before it pings**, so the zygote reports `Zygote
-  could not fork: … child_pid -1`. crashpad's handler then fails to dump it
-  (`ptrace: Function not implemented`, `tgkill: No such process`). The child
-  has crashpad's handlers installed, so the fault never printed. Under
-  `strace_err` a fault delivered to a handler now prints a `[sig!]` line with
-  rip and address, which is the next run.
+- **`nr=285` (`fallocate`) has no x86_64 row** — 82 calls per run answer
+  `ENOSYS`; Chromium falls back to `ftruncate` for its shared-memory files
+  (Fix 4 serves that by inode). Glue has the arm; it needs the row.
+- **`prlimit64(RLIMIT_NPROC)` → `EFAULT`, 60 per run** — identical on Linux
+  (Chromium passes an unmapped `old` on purpose); not a bug.
+- **`mremap(p, 4096, 8192, 0)` → `ENOMEM`, ~2900 per run** walking down the
+  stack a page at a time — a stack-size probe, identical on Linux (937 lines
+  of the same in its trace); not a bug, but it is most of the `[sc!]` output.
+- **the 256-row process table** (`akuma-exec`), which every `pthread_create`
+  on this target takes a row in and which *panics* when full. A session
+  peaked at 103 live user threads; a heavier page may get closer.
 - **crashpad wants `ptrace`** (`PTRACE_ATTACH` of the crashed process) to
   write a dump. Not needed to render, since a dump is only taken after a
   crash, but every crash is noisier for it.

@@ -2285,6 +2285,15 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // "success" here means *not implemented*, not "privileges dropped".
         | Syscall::Setuid
         | Syscall::Setgid
+        // `capget(hdr, data)` / `capset(hdr, data)` — x86_64 125/126, rows
+        // added 2026-10-08. Chromium's zygote child calls `capset` right after
+        // `fork`, inside a `CHECK`, before it pings the browser; `ENOSYS` here
+        // killed every child (`[signal] pid=61 killed by signal 6`) and the
+        // browser gave up on the GPU process. Glue's `capset` is the same
+        // accepted no-op as `setuid` above, and its `capget` does the version
+        // negotiation and reports root's full set. Gate: `capprobe.c`.
+        | Syscall::Capget
+        | Syscall::Capset
         // `getgroups(size, list)` — x86_64 115. Not a fold: this target had no
         // arm for it at all, and glue's has been there all along. Found by the
         // ring-3 check this batch was verified with — `busybox id` on the metal
@@ -7309,6 +7318,9 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check("dispatch: getegid 108 -> 177", hop(Syscall::Getegid, 108, nr::GETEGID));
     t.check("dispatch: setuid 105 -> 146", hop(Syscall::Setuid, 105, nr::SETUID));
     t.check("dispatch: setgid 106 -> 144", hop(Syscall::Setgid, 106, nr::SETGID));
+    // The pair Chromium's zygote child needs before it can ping (2026-10-08).
+    t.check("dispatch: capget 125 -> 90", hop(Syscall::Capget, 125, nr::CAPGET));
+    t.check("dispatch: capset 126 -> 91", hop(Syscall::Capset, 126, nr::CAPSET));
 
     let d = |nr_x86: u64| syscall_dispatch(nr_x86, 0, 0, 0, 0, 0, 0);
     t.check_eq("dispatch: glue answers getuid 0", d(102), 0);
@@ -7321,6 +7333,8 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // socket, so a row that reaches `sock::sys_accept4` says `ENOTSOCK`.
     t.check_eq("dispatch: accept4 (288) reaches the socket layer", d(288), crate::fd::errno::ENOTSOCK);
     t.check_eq("dispatch: glue accepts setgid", d(106), 0);
+    t.check_eq("dispatch: glue accepts capset", d(126), 0);
+    t.check_eq("dispatch: capget with a NULL header is EFAULT", d(125), crate::fd::errno::EFAULT);
     // `getgroups` is the pair that makes the two-number shape earn itself:
     // asm-generic 158 is `getgroups`, x86_64 158 is `arch_prctl`, and this
     // kernel answers both. `size == 0` is the probe form and must report the

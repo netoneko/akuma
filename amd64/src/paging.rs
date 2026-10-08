@@ -706,20 +706,23 @@ fn region_prot_roundtrip_check(t: &mut Suite) {
     // Then the region vocabulary, variant by variant.
     t.check_eq("prot: region NONE is kernel-only", encode(PteProt::from_region(Prot::NONE), MemAttr::WriteBack), 0x8000_0000_0000_0001);
     t.check_eq("prot: region RO", encode(PteProt::from_region(Prot::RO), MemAttr::WriteBack), 0x0000_0000_0000_0005);
-    t.check_eq("prot: region RW", encode(PteProt::from_region(Prot::RW), MemAttr::WriteBack), 0x8000_0000_0000_0007);
+    // RWX since 2026-10-08 (NX clear): V8's code range. Was 0x8000_…_0007.
+    t.check_eq("prot: region RW", encode(PteProt::from_region(Prot::RW), MemAttr::WriteBack), 0x0000_0000_0000_0007);
     t.check_eq("prot: region RW_NO_EXEC", encode(PteProt::from_region(Prot::RW_NO_EXEC), MemAttr::WriteBack), 0x8000_0000_0000_0007);
     t.check_eq("prot: region RX", encode(PteProt::from_region(Prot::RX), MemAttr::WriteBack), 0x0000_0000_0000_0005);
     t.check_eq("prot: region RO_NO_EXEC", encode(PteProt::from_region(Prot::RO_NO_EXEC), MemAttr::WriteBack), 0x8000_0000_0000_0005);
 
-    // The two pinned divergences, asserted as *equalities* so that "un-fixing"
-    // one shows up here rather than as a permission change nobody notices.
+    // The pinned divergence, asserted as an *equality* so that "un-fixing"
+    // it shows up here rather than as a permission change nobody notices.
     t.check(
         "prot: RO and RX collapse on x86 (no PXN)",
         PteProt::from_region(Prot::RO) == PteProt::from_region(Prot::RX),
     );
+    // The former second divergence, now an agreement with AArch64: `RW` is
+    // writable and executable on both (2026-10-08, `jitprobe.c`).
     t.check(
-        "prot: region RW is not executable here (W^X)",
-        !PteProt::from_region(Prot::RW).exec,
+        "prot: region RW is executable (RWX granted, as on AArch64 and Linux)",
+        PteProt::from_region(Prot::RW).exec && PteProt::from_region(Prot::RW).write,
     );
 
     // Arity. `from_region` matches on the opaque tag and cannot be exhaustive,

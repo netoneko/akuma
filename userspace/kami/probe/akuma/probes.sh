@@ -4,7 +4,7 @@
 # sampled while Chromium's 250 MB binary is exec'd. With the streaming loader
 # the peak should not move by the binary's size.
 echo "== probes: $(uname -a)"
-for p in bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe exeprobe chromeprobe; do
+for p in bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe capprobe jitprobe thrprobe exeprobe chromeprobe; do
   [ -x /$p ] || continue
   echo "== $p"
   /$p 2>&1 | tail -20

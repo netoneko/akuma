@@ -31,7 +31,11 @@ single `tprint!` so SMP cannot shred it:
   `symlink`, `readlink`, every `*at`, `rename*`, `statx`, …). For an `*at`
   call the dirfd is `a1`.
 - `EAGAIN`, `EINTR` and `ETIMEDOUT` are left out; a polling program returns
-  them all day.
+  them all day. **That hides a `clone` refused at the thread ceiling**, which
+  is also `EAGAIN` (Fix 19 of the Chromium work: the GPU process `CHECK`ed on
+  it, and `[sc!]` showed nothing). Look for the kernel's own
+  `[clone] thread table full` line, or trace the process with `strace_pid=`,
+  where `nr=56 -> 0xfffffffffffffff5` is that refusal.
 
 ## 2. Summarise
 

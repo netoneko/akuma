@@ -62,10 +62,22 @@ use crate::serial;
 /// A fixed array, not a `Vec`: this is per-thread kernel state on a path that
 /// runs under memory pressure, and the ceiling wants to be a refusal
 /// (`EAGAIN`, which is what `pthread_create` already reports) rather than an
-/// allocation that can fail. 64 is well past what the scheduler's own
-/// `MAX_TASKS` budget makes useful — every thread also costs a task slot and
-/// two 32 KiB kernel stacks.
-pub const MAX_THREADS: usize = 64;
+/// allocation that can fail.
+///
+/// **Was 64 until 2026-10-08**, with the note that it was "well past what the
+/// scheduler's own `MAX_TASKS` budget makes useful". It was not: `MAX_TASKS`
+/// is 512, and one headless Chromium session is a browser with ~20 threads
+/// plus a dozen GPU/utility/renderer processes of 5–7 each. The 65th thread
+/// system-wide got `EAGAIN` from `clone`, the GPU process turned that into a
+/// `CHECK` (`[Fault] #BP`) five times over and the browser gave up ("GPU
+/// process isn't usable"). The `[sc!]` trace never showed it, because it
+/// leaves `EAGAIN` out on purpose; the `[clone] thread table full` serial
+/// line is the tell. The table is now sized to the task budget it draws
+/// from, less headroom for the main threads: an entry is three words, so
+/// this costs about 14 KiB of `.bss`. Every thread still costs a task slot
+/// and two 32 KiB kernel stacks, which is the ceiling that remains. Gate:
+/// `thrprobe.c` (8 processes × 12 threads alive together).
+pub const MAX_THREADS: usize = 448;
 
 /// "This task is not a thread." `UserCtx::thread_slot`'s resting value.
 pub const NO_THREAD: usize = usize::MAX;

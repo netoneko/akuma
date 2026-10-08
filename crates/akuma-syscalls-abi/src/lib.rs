@@ -473,6 +473,20 @@ syscall_table! {
     Getpgid    => GETPGID    = 121, nr::GETPGID;
     Setsid     => SETSID     = 112, nr::SETSID;
     Getsid     => GETSID     = 124, nr::GETSID;
+    /// x86_64 125/126; asm-generic 90/91. Added 2026-10-08: **Chromium's
+    /// zygote child calls `capset` right after `fork`**, before it pings the
+    /// browser (`sandbox/linux/services/credentials.cc`,
+    /// `ForkAndDropCapabilitiesInChild`), inside a `CHECK`. With no row the
+    /// amd64 kernel answered `ENOSYS`, the `CHECK` killed every child, and
+    /// the browser logged "Did not receive ping from zygote child" twelve
+    /// times, then "GPU process isn't usable". The `[sc!]` trace showed it
+    /// as a bare `nr=126 -> -38`, and the `no row for` print never named it
+    /// because its 32-number table was already full. Glue answers both: a
+    /// no-op `capset` and a `capget` that negotiates the version and reports
+    /// root's full set — this kernel has no capability model, so the set a
+    /// program dropped is not what it reads back. Gate: `capprobe.c`.
+    Capget     => CAPGET     = 125, nr::CAPGET;
+    Capset     => CAPSET     = 126, nr::CAPSET;
 
     /// Per-process operations — thread names, `PR_SET_*`. Rust `std` sets a
     /// thread's name through it, so every spawned thread in every Rust program

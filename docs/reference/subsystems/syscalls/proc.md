@@ -159,9 +159,17 @@ again.
 `hdr.version` by writing back the version it *does* support and returning
 `EINVAL` — a negotiation, which libcap-ng performs by calling `capget` with
 version 0 to learn the layout. The old stub returned success for any input,
-so every later call used a layout the kernel never agreed to. Note that
-libcap-ng reads the *capabilities themselves* from `/proc/self/status`, not
-from this syscall — see [`../vfs.md`](../vfs.md) "procfs".
+so every later call used a layout the kernel never agreed to. Whether the
+unknown-version call *fails* depends on `data`, as in Linux's `sys_capget`:
+with a NULL `data` it is the pure "which version?" probe and answers 0 (the
+version still written back); with a `data` pointer it is `EINVAL`. Until
+2026-10-08 both forms answered `EINVAL`; `capprobe.c` measured the NULL form
+on Linux. Note that libcap-ng reads the *capabilities themselves* from
+`/proc/self/status`, not from this syscall — see [`../vfs.md`](../vfs.md)
+"procfs". The set a program *drops* with `capset` is not what it reads back:
+`capget` reports root's full set regardless, which is the pinned divergence
+Chromium's zygote child (`capset` to nothing, then no `capget`) never
+notices.
 
 ### The capability *number* is bounded, even though the capability *set* is full
 

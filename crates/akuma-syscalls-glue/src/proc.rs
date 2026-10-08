@@ -1450,13 +1450,18 @@ pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
         return EFAULT;
     }
 
-    // Unknown version: tell the caller which one to use, then fail — this IS the
-    // negotiation, and returning success here is what broke libcap-ng.
+    // Unknown version: tell the caller which one to use — this IS the
+    // negotiation, and returning success *without writing the version* is
+    // what broke libcap-ng. Whether the call then fails depends on `data`,
+    // exactly as in Linux's `sys_capget`: with a NULL `data` the unknown
+    // version is the pure "which version?" probe and answers 0; with `data`
+    // it is EINVAL. Measured on Linux 2026-10-08 (`capprobe.c`): this
+    // returned EINVAL for the NULL form too, which no libc path had minded.
     if version != CAP_V1 && version != CAP_V2 && version != CAP_V3 {
         if write_user_val(hdr_ptr, &CAP_V3).is_err() {
             return EFAULT;
         }
-        return EINVAL;
+        return if data_ptr == 0 { 0 } else { EINVAL };
     }
 
     // A NULL `data` with a valid version is the pure "which version?" query.

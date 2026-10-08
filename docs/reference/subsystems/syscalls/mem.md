@@ -176,6 +176,15 @@ All always-on (no `sc-*` gate; see [`../syscalls.md`](../syscalls.md) "The
 
 **`mmap`** (`sys_mmap`, `mem.rs:189`):
 - `len == 0` → `EINVAL`.
+- `PROT_WRITE | PROT_EXEC` is **granted**, on both kernels, as Linux grants
+  it (2026-10-08). `akuma_mmap::Prot::from_prot` maps it to the `RW` token,
+  which is "read, write and execute": before that date it dropped the
+  execute bit on AArch64, and the amd64 kernel refused the request outright
+  with `EINVAL` in both `mmap` and `mprotect`. V8 needs it on its 512 MB code
+  range, and every Chromium renderer died on the refusal. Gate `jitprobe.c`
+  (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 18). The ELF
+  loader's refusal of a writable+executable *segment* is a separate rule and
+  stands.
 - `MAP_FIXED`/`MAP_FIXED_NOREPLACE` with `addr != 0` and `addr & 0xFFF != 0` →
   `EINVAL` (`mmap_fixed_addr_unaligned_einval`). This check runs **before**
   `lookup_process` specifically so a kernel-test caller with no current
