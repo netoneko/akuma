@@ -455,6 +455,43 @@ and `chrome-once.sh` then logged 0 `nr=285` failures (was 82), exit 0, and
 - `FALLOC_FL_KEEP_SIZE` (any non-zero mode) is `EOPNOTSUPP` from ext2 here;
   Linux grants it. Chromium only uses mode 0.
 
+## Open: the CDP screencast delivers an empty frame (found 2026-10-08, on the metal)
+
+`kami` on the trashcan's metal blitted a first frame and the screen went
+black. The frame (kept with `KAMI_DUMP`) is a valid 1920x1080 RGBA PNG whose
+every pixel is `(0,0,0,0)`. Reproduced under Firecracker with
+`probe/akuma/castprobe.py` (kami's own CDP sequence, no framebuffer needed):
+
+| | Linux (Alpine container) | Akuma amd64 |
+|---|---|---|
+| `Page.captureScreenshot` | 1 shot, opaque, mean RGB (18,35,52) | **identical**, 22161 bytes, opaque |
+| first `Page.screencastFrame` | 50267 bytes, alpha 255..255, mean (18,35,52) | **44075 bytes, alpha 0..0, all zero** |
+| frames for a static page | 1 | 1 |
+
+(One frame is normal for a static page: the screencast sends on change.)
+
+- Not `kami`: the frame is empty before it is decoded, and `kami`'s blit is the
+  row copy `akuma-cli-wgpu` uses; `fbpattern.c` shows a known pattern correctly
+  on the panel.
+- Not Fix 20: the same probe on a kernel built at `f00fca8f` without the
+  `fallocate` row gives the same empty frame.
+- Not the background: `Emulation.setDefaultBackgroundColorOverride` (opaque
+  white) changes nothing; the frame is not painted, not transparent-over-page.
+- Not these flags: `--disable-gpu-compositing`,
+  `--use-angle=swiftshader --enable-unsafe-swiftshader`,
+  `--disable-features=VizDisplayCompositor` all give the same frame.
+  `--in-process-gpu` printed nothing (the probe produced no output; not
+  investigated).
+- Suspect: the screencast's frames cross from the viz/GPU process to the
+  browser through a shared-memory buffer, and the browser reads zeros. The same
+  run logs `Corruption detected in shared-memory segment`
+  (`persistent_memory_allocator.cc:886`, 71 times), also a cross-process
+  shared-memory symptom, and `fallocprobe` found that a `MAP_SHARED` write is
+  not visible to `pread` until `munmap`. **Not shown to be the cause.**
+- Workaround, in `kami`: it detects an empty first screencast frame and polls
+  `Page.captureScreenshot` every 500 ms (`--poll MS` forces it), blitting only
+  when the PNG changed. Measured on the metal: not yet.
+
 ## The tools that found Fixes 11–16
 
 `docs/runbooks/trace-failing-syscalls-amd64.md`. Three kernel command-line

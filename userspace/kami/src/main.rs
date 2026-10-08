@@ -43,12 +43,14 @@ struct Args {
     daemon: bool,
     kill: bool,
     size: Option<(usize, usize)>,
+    /// Poll `Page.captureScreenshot` every N ms instead of trusting the screencast.
+    poll: Option<u64>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: kami [--scale N] [--fb PATH] [--chromium PATH] [--sock PATH] [--log PATH]\n\
-         \x20           [--frames N] [--seconds S] [--chrome-arg ARG]... [URL]\n\
+         \x20           [--frames N] [--seconds S] [--poll MS] [--chrome-arg ARG]... [URL]\n\
          \x20      kami --kill"
     );
     std::process::exit(2)
@@ -68,6 +70,7 @@ fn parse_args() -> Args {
         daemon: false,
         kill: false,
         size: None,
+        poll: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -80,6 +83,7 @@ fn parse_args() -> Args {
             "--log" => a.log = val(),
             "--frames" => a.frames = Some(val().parse().unwrap_or_else(|_| usage())),
             "--seconds" => a.seconds = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--poll" => a.poll = Some(val().parse().unwrap_or_else(|_| usage())),
             "--chrome-arg" => a.extra.push(val()),
             "--daemon" => a.daemon = true,
             "--kill" => a.kill = true,
@@ -369,6 +373,13 @@ fn session(args: &Args) -> io::Result<()> {
     let mut msgs: Vec<Vec<u8>> = std::mem::take(&mut c.queued);
 
     let trace = std::env::var_os("KAMI_TRACE").is_some();
+    // Polling `Page.captureScreenshot` instead of the screencast: on Akuma the
+    // screencast's frames are fully transparent (the compositor's video capture
+    // reads an empty shared buffer) while captureScreenshot is correct, so the
+    // first empty frame switches this on; `--poll MS` forces it.
+    let mut poll_ms = args.poll;
+    let mut next_shot = Instant::now();
+    let mut last_shot: Vec<u8> = Vec::new();
     'outer: loop {
         for m in msgs.drain(..) {
             // Debug: KAMI_TRACE=1 names every CDP event the page sends.
@@ -389,6 +400,11 @@ fn session(args: &Args) -> io::Result<()> {
                 if let Some(path) = std::env::var_os("KAMI_DUMP") {
                     let _ = std::fs::write(path, &bytes);
                 }
+            }
+            if ok.is_ok() && poll_ms.is_none() && png.channels == 4 && (0..png.pixels.len() / 4).step_by(997).all(|i| png.pixels[i * 4 + 3] == 0) {
+                eprintln!("[kami] screencast frames are empty; polling Page.captureScreenshot instead\r");
+                poll_ms = Some(500);
+                next_shot = Instant::now();
             }
             match ok {
                 Ok(()) => fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale),
@@ -422,6 +438,40 @@ fn session(args: &Args) -> io::Result<()> {
             break;
         }
 
+        if let Some(ms) = poll_ms {
+            if Instant::now() >= next_shot {
+                next_shot = Instant::now() + Duration::from_millis(ms);
+                // A navigation in flight makes this fail; the next poll retries.
+                if let Ok(r) = c.call("Page.captureScreenshot", "{\"format\":\"png\"}", true) {
+                    msgs.extend(std::mem::take(&mut c.queued));
+                    let mut shot = Vec::new();
+                    let td = Instant::now();
+                    let ok = b64_decode(str_field(&r, "data").unwrap_or("").as_bytes(), &mut shot)
+                        .and_then(|_| if shot == last_shot { Ok(false) } else { png.decode(&shot).map(|_| true) });
+                    match ok {
+                        Ok(true) => {
+                            let tb = Instant::now();
+                            fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale);
+                            frames += 1;
+                            if frames <= 3 || frames % 30 == 0 {
+                                eprintln!(
+                                    "[kami] shot {frames} {}x{}: png {} KB, decode {:.1} ms, blit {:.1} ms\r",
+                                    png.width, png.height, shot.len() / 1024,
+                                    (tb - td).as_secs_f64() * 1e3, tb.elapsed().as_secs_f64() * 1e3,
+                                );
+                            }
+                            last_shot = shot;
+                        }
+                        Ok(false) => {}
+                        Err(e) => eprintln!("[kami] shot dropped: {e}\r"),
+                    }
+                    if args.frames == Some(frames) {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
         let mut fds = [
             libc::pollfd { fd: c.fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: 0, events: if stdin_open { libc::POLLIN } else { 0 }, revents: 0 },
@@ -451,6 +501,7 @@ fn session(args: &Args) -> io::Result<()> {
                 stdin_open = false;
                 continue;
             }
+            next_shot = Instant::now() + Duration::from_millis(150);
             for k in decode_keys(&buf[..n as usize]) {
                 match k {
                     Input::Quit => break 'outer,

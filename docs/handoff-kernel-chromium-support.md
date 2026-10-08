@@ -102,15 +102,11 @@ image `733 passed, 0 failed`; `chrome-once.sh` exit 0, `shot.png` still reads
 - **The framebuffer path is proven.** `fbpattern.c` (colour bars + ramp, the
   mapping read back) shows exactly that on the TV, colours correct. `kami`'s
   blit is the same row copy `akuma-cli-wgpu` uses.
-- **What is not working: the screencast carries an empty page.** The first
-  `Page.screencastFrame` is a 1920x1080 RGBA PNG whose pixels are **all
-  (0,0,0,0)** (checked over all 8,295,480 decoded bytes), and no second frame
-  arrives. `kami` ignored alpha, so the screen went black; it now composites
-  over white and sends `Emulation.setDefaultBackgroundColorOverride`, and the TV
-  shows **white**. So the pipe, decode and blit all work; Chromium paints
-  nothing into the screencast.
-- Not yet shown to work on Akuma anywhere: the **CDP pipe + `Page.startScreencast`
-  path**. The Firecracker smoke test only uses one-shot `--screenshot`.
+- **What is not working: the CDP screencast delivers an empty frame**, on
+  Linux a painted one. Fully recorded (table, what it is not) in the archive doc
+  § "Open: the CDP screencast delivers an empty frame". `Page.captureScreenshot`
+  is correct on Akuma, so `kami` now polls it when the first screencast frame is
+  empty. **Untested on the metal at the time of writing** (see the sshd item).
 - Chromium logs `Corruption detected in shared-memory segment`
   (`persistent_memory_allocator.cc:886`) 71 times in one run. **Not known to
   predate Fix 20**: the Firecracker rig was unreachable (the box was booted
@@ -124,7 +120,8 @@ to `pread` until `munmap` (an `ftruncate`-sized file behaves the same).
 
 **Next, in order:**
 
-1. A/B Fix 20 against the shared-memory corruption: from Akuma,
+1. (Fix 20 is cleared for the empty frame: same result without it. Still open for
+   the shared-memory corruption count.) A/B Fix 20 against the corruption: from Akuma,
    `cp /boot/akuma-amd64.prev /boot/akuma-amd64 && sync && /bin/busybox reboot -f`
    (it has no `fallocate` row, so Chromium sizes by `ftruncate`), run `kami`
    with `KAMI_TRACE=1`, count `Corruption detected` in `/tmp/kami.log`, then put

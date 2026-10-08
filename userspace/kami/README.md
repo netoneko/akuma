@@ -25,6 +25,13 @@ tab is showing.
 Keys: arrows, PgUp/PgDn and Home/End scroll; Enter, Backspace, Tab and Esc are
 passed through; other text is typed; Ctrl-R reloads; Ctrl-C or Ctrl-Q detaches.
 
+On Akuma the screencast's frames arrive fully transparent (Chromium's video
+capture reads an empty buffer; see the archive record), so `kami` notices an
+empty first frame and polls `Page.captureScreenshot` every 500 ms instead
+(`--poll MS` forces it; a poll is ~0.2 s, so this is a few fps, not 45).
+Debug knobs: `KAMI_DUMP=<path>` keeps the first PNG, `KAMI_TRACE=1` names every
+CDP event.
+
 ## Sessions outlive the terminal
 
 Chromium's CDP pipe dies with the process holding it, so `kami --daemon`
