@@ -27,7 +27,7 @@ use boxlib::json;
 use boxlib::spec::{self, box_id_for};
 use boxlib::sys;
 
-use herd::exit::{classify, Exit, Outcome, Policy};
+use herd::exit::{classify, classify_spawn_failure, Exit, Outcome, Policy};
 
 // ============================================================================
 // Constants
@@ -1231,8 +1231,24 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             print("[herd] Failed to start ");
             print(name);
             print("\n");
+            let now_ms = uptime() / 1000;
             if let Some(svc) = state.services.get_mut(name) {
-                svc.state = ServiceState::Failed;
+                // A supervised service is retried like a crash; see
+                // `classify_spawn_failure`. `Failed` is terminal.
+                let policy = Policy {
+                    oneshot: svc.config.oneshot,
+                    restart: svc.config.restart,
+                    max_retries: svc.config.max_retries,
+                };
+                let outcome = classify_spawn_failure(policy, svc.restart_count);
+                svc.state = ServiceState::after(outcome);
+                if outcome == Outcome::Restart {
+                    svc.restart_count += 1;
+                    svc.restart_at_ms = Some(now_ms + svc.config.restart_delay_ms);
+                    print("[herd] Scheduling restart for ");
+                    print(name);
+                    print("\n");
+                }
             }
         }
     }

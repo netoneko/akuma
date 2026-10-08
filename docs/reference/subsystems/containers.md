@@ -109,7 +109,10 @@ spawns + supervises each service. Config schema (`ServiceConfig`, `main.rs:115-1
 
 **Lifecycle:** service starts → runs → on exit: `oneshot` → `Completed`; a
 clean exit or `restart = false` → `Exited` (stays down); else respawn after
-`restart_delay_ms`, up to `max_retries`, then `Failed`. `herd status` lists the
+`restart_delay_ms`, up to `max_retries`, then `Failed`. A **failed spawn** (the
+process never ran) is treated the same way when `restart = true` — retried,
+not parked in `Failed`; with `restart = false` or `oneshot` it is `Failed`
+(`herd::exit::classify_spawn_failure`, host-tested). `herd status` lists the
 enabled services (not their runtime state).
 
 **Control:** `herd start <svc>` / `herd stop <svc>` talk to the daemon over

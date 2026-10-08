@@ -93,6 +93,28 @@ pub fn classify(policy: Policy, restart_count: u32, exit: Exit) -> Outcome {
     }
 }
 
+/// Decide what happens to a service whose *spawn* failed: it never ran, so
+/// there is no exit to classify.
+///
+/// A supervised service (`restart = true`) is retried exactly as if it had
+/// crashed — `restart_delay_ms` between tries, `max_retries` as the ceiling.
+/// Before this, a failed spawn went straight to `Failed`, which nothing ever
+/// retries (`start_stopped_services` only revives "not started yet"), so one
+/// transient failure at boot left an enabled `sshd` down until somebody typed
+/// `herd start sshd` at the console (2026-10-08, the trashcan's metal). A
+/// oneshot, or `restart = false`, keeps `Failed`: it asked not to be retried.
+#[must_use]
+pub fn classify_spawn_failure(policy: Policy, restart_count: u32) -> Outcome {
+    if policy.oneshot {
+        return Outcome::Failed;
+    }
+    // 127 is the shell's "command could not be run"; any failing exit reads the same.
+    match classify(policy, restart_count, Exit::code(127)) {
+        Outcome::Stopped | Outcome::Completed => Outcome::Failed,
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +180,33 @@ mod tests {
                 classify(policy, count, Exit::code(1)),
             );
         }
+    }
+
+    #[test]
+    fn a_failed_spawn_of_a_supervised_service_is_retried() {
+        // The sshd-never-started case: restart = true, spawn failed at boot.
+        assert_eq!(classify_spawn_failure(SUPERVISED, 0), Outcome::Restart);
+        assert_eq!(classify_spawn_failure(SUPERVISED, 10_000), Outcome::Restart);
+    }
+
+    #[test]
+    fn a_failed_spawn_honours_max_retries() {
+        let policy = Policy { max_retries: 3, ..SUPERVISED };
+        assert_eq!(classify_spawn_failure(policy, 2), Outcome::Restart);
+        assert_eq!(classify_spawn_failure(policy, 3), Outcome::Failed);
+    }
+
+    #[test]
+    fn a_failed_spawn_without_restart_stays_failed() {
+        // Not `Stopped`/`Exited`: it never ran, and the old behaviour was `Failed`.
+        let policy = Policy { restart: false, ..SUPERVISED };
+        assert_eq!(classify_spawn_failure(policy, 0), Outcome::Failed);
+    }
+
+    #[test]
+    fn a_failed_spawn_of_a_oneshot_stays_failed() {
+        // `classify` would say Completed, which is a lie: it never ran.
+        let policy = Policy { oneshot: true, ..SUPERVISED };
+        assert_eq!(classify_spawn_failure(policy, 0), Outcome::Failed);
     }
 }
