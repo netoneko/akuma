@@ -425,6 +425,36 @@ line of that run is `103 live user threads … ceiling=512`. Standard-image
 boot on the same kernel: `731 passed, 0 failed` (727 plus the four new
 dispatch checks).
 
+## Fix 20: x86_64 `fallocate` had no row
+
+Chromium sizes its shared-memory files with `fallocate(fd, 0, 0, size)` on a
+file it has already unlinked (171 calls in the Linux trace, all `0`). amd64
+had no row for x86_64 285, so every call was `ENOSYS` (82 per headless run in
+`strace_err`) and Chromium fell back to `ftruncate`: noise, not a failure.
+Glue's `sys_fallocate` (by inode, since Fix 4) and ext2's mode-0
+preallocation were already there.
+
+**Fix:** row `Fallocate` (285 -> asm-generic 47) in `akuma-syscalls-abi`, an
+arm in `amd64/src/usermode.rs` that passes `a1..a4` to glue, and two pins in
+the dispatch self-test (the hop, and `fallocate(0,0,0,0)` reaching glue's
+`EINVAL` rather than `ENOSYS`). Standard-image boot: `733 passed, 0 failed`
+(731 plus those two).
+
+**Gate: `fallocprobe.c`**, run on Linux first. Scored: mode 0 grows an
+unlinked file to `offset+len` and the range reads zero, a smaller call never
+shrinks it, `len 0` is `EINVAL`, a `MAP_SHARED` write at the far end reads back
+through `pread` after `munmap`. Linux: PASS. Akuma under Firecracker: PASS,
+and `chrome-once.sh` then logged 0 `nr=285` failures (was 82), exit 0, and
+`shot.png` still reads "JavaScript ran: 6 x 7 = 42".
+
+**Two divergences, printed not scored.**
+
+- A `MAP_SHARED` write is not visible to `pread` **until `munmap`** on Akuma
+  (Linux: immediately). An `ftruncate`-sized control file behaves the same, so
+  this predates `fallocate` and is the mapping layer's, not the row's. Open.
+- `FALLOC_FL_KEEP_SIZE` (any non-zero mode) is `EOPNOTSUPP` from ext2 here;
+  Linux grants it. Chromium only uses mode 0.
+
 ## The tools that found Fixes 11–16
 
 `docs/runbooks/trace-failing-syscalls-amd64.md`. Three kernel command-line
@@ -447,9 +477,9 @@ Runs under Firecracker (`userspace/kami/probe/akuma/`, 4 GiB guest). With
 Fixes 8–19 Chromium **renders the page** (above). What a successful run
 still logs, none of it fatal:
 
-- **`nr=285` (`fallocate`) has no x86_64 row** — 82 calls per run answer
-  `ENOSYS`; Chromium falls back to `ftruncate` for its shared-memory files
-  (Fix 4 serves that by inode). Glue has the arm; it needs the row.
+- ~~`nr=285` (`fallocate`) has no x86_64 row~~ — **fixed 2026-10-08, Fix 20.**
+  Still open beside it: a `MAP_SHARED` write is invisible to `pread` until
+  `munmap`, and `FALLOC_FL_KEEP_SIZE` is `EOPNOTSUPP`.
 - **`prlimit64(RLIMIT_NPROC)` → `EFAULT`, 60 per run** — identical on Linux
   (Chromium passes an unmapped `old` on purpose); not a bug.
 - **`mremap(p, 4096, 8192, 0)` → `ENOMEM`, ~2900 per run** walking down the

@@ -1667,6 +1667,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `rust-lld` reported `cannot open output file` for a file it had
         // already opened successfully.
         Syscall::Ftruncate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `fallocate(fd, mode, offset, len)` — x86_64 285, row added
+        // 2026-10-08 (Chromium's shared-memory files; 82 `ENOSYS` per run).
+        // Same argument order as glue's arm; mode 0 grows the file.
+        Syscall::Fallocate => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // ── 2026-09-12: the batch the in-guest `cargo` asked for ───────────
         //
         // Every one of these had a number in `akuma-syscalls-linux` and an arm
@@ -7321,6 +7325,7 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // The pair Chromium's zygote child needs before it can ping (2026-10-08).
     t.check("dispatch: capget 125 -> 90", hop(Syscall::Capget, 125, nr::CAPGET));
     t.check("dispatch: capset 126 -> 91", hop(Syscall::Capset, 126, nr::CAPSET));
+    t.check("dispatch: fallocate 285 -> 47", hop(Syscall::Fallocate, 285, nr::FALLOCATE));
 
     let d = |nr_x86: u64| syscall_dispatch(nr_x86, 0, 0, 0, 0, 0, 0);
     t.check_eq("dispatch: glue answers getuid 0", d(102), 0);
@@ -7335,6 +7340,8 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("dispatch: glue accepts setgid", d(106), 0);
     t.check_eq("dispatch: glue accepts capset", d(126), 0);
     t.check_eq("dispatch: capget with a NULL header is EFAULT", d(125), crate::fd::errno::EFAULT);
+    // `fallocate(0, 0, 0, 0)`: a row that reaches glue says `EINVAL` (len 0); no row says `ENOSYS`.
+    t.check_eq("dispatch: fallocate (285) reaches glue", d(285), crate::fd::errno::EINVAL);
     // `getgroups` is the pair that makes the two-number shape earn itself:
     // asm-generic 158 is `getgroups`, x86_64 158 is `arch_prctl`, and this
     // kernel answers both. `size == 0` is the probe form and must report the

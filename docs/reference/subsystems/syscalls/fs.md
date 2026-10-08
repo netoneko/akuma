@@ -31,6 +31,7 @@ repeated.
 | `renameat` | 38 | `sys_renameat` |
 | `truncate` | 45 | `sys_truncate` |
 | `ftruncate` | 46 | `sys_ftruncate` |
+| `fallocate` | 47 | `sys_fallocate` (x86_64 285, row added 2026-10-08). Mode 0 only on ext2: preallocates zeroed blocks and grows the size; any other mode is `EOPNOTSUPP` (Linux grants `KEEP_SIZE`). By inode once the name is gone. Gate `fallocprobe.c` |
 | `fallocate` | 47 | `sys_fallocate` |
 | `faccessat` | 48 | `sys_faccessat2` (mode arg dropped) |
 | `chdir` | 49 | `sys_chdir` |

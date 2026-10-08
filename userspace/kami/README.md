@@ -106,12 +106,15 @@ Chromium's runs on Akuma (2026-10-08) found and fixed, in order:
   512 MB code range; every renderer died on it. Gate `jitprobe.c`.
 - The kernel held 64 non-main threads **system-wide**; the GPU process's
   sixth thread got `EAGAIN`. Now 448. Gate `thrprobe.c`.
+- x86_64 `fallocate` had no row (Chromium's shared-memory sizing, 82 `ENOSYS`
+  per run). Gate `fallocprobe.c`.
 
 **Chromium on Akuma renders (2026-10-08).** `chrome-once.sh` under
 Firecracker exits 0 in about 28 s of guest time and its screenshot reads
-"JavaScript ran: 6 x 7 = 42". The open list (`fallocate`'s missing row, the
-256-row process table, `gettid()` of a main thread not being its pid) is in
-the record below. Next: `kami` itself on the trashcan's metal.
+"JavaScript ran: 6 x 7 = 42". The open list (the 256-row process table, `gettid()` of a main thread not
+being its pid) is in the record below. `kami` itself on the trashcan's metal
+was staged 2026-10-08 (kernel, Chromium and `/bin/kami` on the Akuma
+partition); first boot result is in the handoff.
 
 Finding these took a trace of failing syscalls (`strace_err` on the kernel
 command line):

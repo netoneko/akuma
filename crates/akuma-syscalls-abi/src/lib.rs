@@ -251,6 +251,11 @@ syscall_table! {
     /// `cannot open output file …: Function not implemented` and blamed
     /// itself. Nothing in the guest could link until this row existed.
     Ftruncate  => FTRUNCATE  = 77,  nr::FTRUNCATE;
+    /// `fallocate(fd, mode, offset, len)`; x86_64 285, asm-generic 47. Added
+    /// 2026-10-08: Chromium sizes its shared-memory files with it (82 calls per
+    /// headless run, all `ENOSYS` before this) and falls back to `ftruncate`,
+    /// so the miss was noise, not a failure. Glue had the arm all along.
+    Fallocate  => FALLOCATE  = 285, nr::FALLOCATE;
     /// `posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM)`. parity-db calls it after
     /// opening every DB file and `try_io!`s the result — an ENOSYS aborts the
     /// whole open. x86_64 221, asm-generic 223 (`fadvise64`; 233 is `madvise`); added 2026-09-22
