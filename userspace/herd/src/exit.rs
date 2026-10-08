@@ -75,14 +75,20 @@ pub enum Outcome {
 /// is `<`: with `max_retries = 3`, counts 0/1/2 restart and 3 fails — exactly
 /// three restarts.
 #[must_use]
-pub fn classify(policy: Policy, restart_count: u32, exit: Exit) -> Outcome {
+pub fn classify(policy: Policy, restart_count: u32, _exit: Exit) -> Outcome {
     // Checked first, and independent of how it ended: a oneshot that crashes is
     // still a oneshot that has had its turn.
     if policy.oneshot {
         return Outcome::Completed;
     }
 
-    if !exit.failed() || !policy.restart {
+    // `restart = true` means "keep this running", not "restart it if it
+    // crashes": a clean exit is restarted too. Treating `exit 0` as final left
+    // `sshd` and `netwatch` down for good on ryzen (2026-10-08): both were
+    // reported `exited with code 0` seconds after a healthy start, and nothing
+    // brought them back. The loop a clean exit could cause is bounded by
+    // `restart_delay_ms`, and by `max_retries` when set.
+    if !policy.restart {
         return Outcome::Stopped;
     }
 
@@ -131,9 +137,16 @@ mod tests {
     }
 
     #[test]
-    fn clean_exit_stops_and_nonzero_exit_restarts() {
-        assert_eq!(classify(SUPERVISED, 0, Exit::CLEAN), Outcome::Stopped);
+    fn a_supervised_service_is_restarted_whether_it_exits_cleanly_or_not() {
+        assert_eq!(classify(SUPERVISED, 0, Exit::CLEAN), Outcome::Restart);
         assert_eq!(classify(SUPERVISED, 0, Exit::code(1)), Outcome::Restart);
+    }
+
+    #[test]
+    fn clean_exits_count_against_max_retries() {
+        let policy = Policy { max_retries: 2, ..SUPERVISED };
+        assert_eq!(classify(policy, 1, Exit::CLEAN), Outcome::Restart);
+        assert_eq!(classify(policy, 2, Exit::CLEAN), Outcome::Failed);
     }
 
     #[test]

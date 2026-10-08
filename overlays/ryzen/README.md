@@ -96,6 +96,8 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 14 | **Akuma on wifi, 8 cores, for use — the default** (2026-10-07): entry 12's command line with `smp=8` instead of `nosmp`, for rio's software rasteriser. Moved from `smp=16` to `smp=8` because 2/4/8 were stable and 16 wedged in the bisect (entry 13's row). **Network test at `smp=8`, 2026-10-07: stable but slow.** Up 40+ min on wifi with curl downloads from the Mac (64 MB files): `failed 0`, `retry-limit 0`, `dropped 0`, link stayed `connected`. Throughput is ~110-125 KB/s in total whether one stream or four, so it is a link ceiling, not a parallelism stall (on channel 1, `signal=0`; cause untested). Still seen: `[bkls>]` long holds and the `max gap 1844…` `now_us` underflow. Not A/B-ed against entry 12 (`nosmp`). **Fallback: entry 12 (`nosmp`)** | no |
 | 15 | reboot | — |
 
+Entries 12-14 run a plain `herd daemon` (`initargs=daemon`): the services are whatever p3's `/etc/herd/enabled/` holds — `sshd console klog netwatch wifiauto` since 2026-10-08, enabled with `herd enable <svc>` (copied from `available/`). Enumerating them as `--service` flags made `herd status` list one and hid the rest.
+
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
 `initargs=daemon,--service,…`, which loads exactly the named herd services.
 **`daemon` must come first**: herd takes argv[1] as a command.

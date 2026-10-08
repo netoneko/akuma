@@ -562,6 +562,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "klogd"
+version = "0.1.0"
+dependencies = [
+ "libakuma",
+]
+
+[[package]]
 name = "libakuma"
 version = "0.1.0"
 dependencies = [

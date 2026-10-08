@@ -519,6 +519,12 @@ pub extern "C" fn main() {
                 }
                 exit(0);
             }
+            "version" | "--version" | "-V" => {
+                print("herd ");
+                print(libakuma::GIT_REV);
+                print("\n");
+                exit(0);
+            }
             "help" | "--help" | "-h" => {
                 print_usage();
                 exit(0);
@@ -534,7 +540,9 @@ pub extern "C" fn main() {
     }
 
     // Daemon mode - run supervisor loop
-    print("[herd] Userspace supervisor starting...\n");
+    print("[herd] Userspace supervisor starting (rev ");
+    print(libakuma::GIT_REV);
+    print(")...\n");
 
     let mut state = HerdState::new();
 
@@ -1451,12 +1459,17 @@ fn control_start(state: &mut HerdState, name: &str) -> Reply {
 enum Request<'a> {
     Start(&'a str),
     Stop(&'a str),
+    /// Every service the daemon supervises, with its state.
+    Status,
 }
 
-/// `start <svc>` or `stop <svc>`, whitespace-separated, nothing else.
+/// `start <svc>`, `stop <svc>` or `status`, whitespace-separated, nothing else.
 fn parse_request(line: &str) -> Option<Request<'_>> {
     let mut words = line.split_whitespace();
     let verb = words.next()?;
+    if verb == "status" {
+        return if words.next().is_none() { Some(Request::Status) } else { None };
+    }
     let name = words.next()?;
     if words.next().is_some() || name.contains('/') {
         return None;
@@ -1521,6 +1534,40 @@ fn serve_control(state: &mut HerdState) {
     }
 }
 
+impl ServiceState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "waiting-to-start",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::PendingRestart => "restart-pending",
+            Self::Completed => "completed",
+            Self::Halted => "halted",
+            Self::Exited => "exited",
+        }
+    }
+}
+
+/// One line per supervised service: what `herd status` prints. Not logged: it is
+/// a read, and a status poll must not push real lifecycle lines out of the ring.
+fn status_report(state: &HerdState) -> String {
+    let mut out = String::from("Supervised services:");
+    if state.services.is_empty() {
+        out.push_str("\n  (none)");
+    }
+    for (name, svc) in state.services.iter() {
+        out.push_str(&format!("\n  {name}: {}", svc.state.label()));
+        if let Some(pid) = svc.pid {
+            out.push_str(&format!(" pid={pid}"));
+        }
+        out.push_str(&format!(" restarts={}", svc.restart_count));
+        if let Some(code) = svc.last_exit_code {
+            out.push_str(&format!(" last_exit={code}"));
+        }
+    }
+    out
+}
+
 fn handle_request(state: &mut HerdState, line: &str) -> Reply {
     let reply = match parse_request(line) {
         Some(Request::Stop(name)) => {
@@ -1535,7 +1582,8 @@ fn handle_request(state: &mut HerdState, line: &str) -> Reply {
             print("\n");
             control_start(state, name)
         }
-        None => Reply::err(format!("bad request {line:?}; expected `start <svc>` or `stop <svc>`")),
+        Some(Request::Status) => return Reply::ok(status_report(state)),
+        None => Reply::err(format!("bad request {line:?}; expected `start <svc>`, `stop <svc>` or `status`")),
     };
     print("[herd] ");
     print(&reply.msg);
@@ -1970,7 +2018,12 @@ fn print_usage() {
 }
 
 fn cmd_status() {
-    print("Enabled services:\n");
+    // The daemon knows what it supervises — `--service` files included, which
+    // the enabled directory does not list — and in what state.
+    if send_control("status", "") {
+        return;
+    }
+    print("Daemon not reachable; services enabled on disk:\n");
     
     match read_dir(HERD_ENABLED_DIR) {
         Some(dir) => {
@@ -2159,7 +2212,7 @@ fn send_control(verb: &str, name: &str) -> bool {
             return false;
         }
     };
-    let request = format!("{verb} {name}\n");
+    let request = if name.is_empty() { format!("{verb}\n") } else { format!("{verb} {name}\n") };
     if stream.write_all(request.as_bytes()).is_err() {
         print("Error: failed to send the request to the herd daemon\n");
         return false;

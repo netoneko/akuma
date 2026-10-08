@@ -1,0 +1,21 @@
+[package]
+name = "klogd"
+version = "0.1.0"
+edition = "2021"
+
+# `klogd` — keep the kernel log on disk while the box is up. Replaces
+# the former `etc/ryzen/klog.sh` (a busybox loop: ~3 process spawns
+# every 5 s, on a box whose bug is "a spawn went missing at boot").
+#
+# `--no-default-features` drops libakuma so `cargo test --lib` links against a
+# std host (same arrangement as herd/sshd).
+[features]
+default = ["akuma"]
+akuma = ["dep:libakuma"]
+
+[[bin]]
+name = "klogd"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma", optional = true }

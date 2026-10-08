@@ -9,6 +9,11 @@
 extern crate alloc;
 
 pub mod fs;
+
+/// The commit this userspace tree was built from (`<sha>[-dirty]`, or `unknown`
+/// without git); stamped by `build.rs`. Print it at startup so a binary on a box
+/// can say what it is.
+pub const GIT_REV: &str = env!("AKUMA_GIT_REV");
 pub mod net;
 
 use core::arch::asm;

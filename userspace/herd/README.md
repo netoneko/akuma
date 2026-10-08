@@ -77,7 +77,7 @@ command       = /bin/httpd
 args          = -p 8080 /srv/www
 restart_delay = 1000     # ms to wait before a restart
 max_retries   = 0        # 0 = retry forever
-restart       = true     # restart on non-zero exit (default true)
+restart       = true     # keep it running: restart after any exit (default true)
 ```
 
 ### All keys
@@ -88,7 +88,7 @@ restart       = true     # restart on non-zero exit (default true)
 | `args` | space-separated | *(none)* | Arguments passed after `command`. |
 | `restart_delay` | u64 ms | `1000` | Delay before a scheduled restart. |
 | `max_retries` | u32 | `0` | Max restarts before giving up; `0` = infinite. |
-| `restart` | bool | `true` | Whether to restart on non-zero exit, **and whether to retry a failed spawn** (`[herd] Failed to start`): a supervised service whose first `spawn` fails is rescheduled after `restart_delay` up to `max_retries`, like a crash (before 2026-10-08 it went to the terminal `Failed` and stayed down until `herd start`). `restart = false` and `oneshot` keep `Failed`. Set `false` for services whose restart needs special handling (e.g. a `rump_server` whose kernel sysproxy channel must be re-established). |
+| `restart` | bool | `true` | Whether to keep the service running: it is restarted after **any** exit, clean (`exit 0`) or not (before 2026-10-08 a clean exit was final even with `restart = true`, which left sshd and netwatch down on ryzen), **and whether to retry a failed spawn** (`[herd] Failed to start`): a supervised service whose first `spawn` fails is rescheduled after `restart_delay` up to `max_retries`, like a crash (before 2026-10-08 it went to the terminal `Failed` and stayed down until `herd start`). `restart = false` and `oneshot` keep `Failed`. Set `false` for services whose restart needs special handling (e.g. a `rump_server` whose kernel sysproxy channel must be re-established). |
 | `oneshot` | bool | `false` | Run exactly once: when the service exits (any code) it moves to the terminal `Completed` state and is never restarted. Overrides `restart`. A reboot runs it again. Use for boot-time one-off tasks. |
 | `start_delay` | u64 ms | `0` | Defer the *initial* start by this long (e.g. a `join_box` service waiting for its target box's `rump_server` handshake). |
 | `boxed` | bool | `false` | Run the service inside a container (box). |
@@ -113,9 +113,9 @@ reboot):
 |---|---|---|
 | Stopped | supervisor pass (after `start_delay`) | Running, or Failed if the spawn fails |
 | Running | exits, `oneshot` | Completed |
-| Running | exits cleanly, or any exit with `restart = false` | Exited |
-| Running | exits non-zero, `restart`, retries left | PendingRestart |
-| Running | exits non-zero, `max_retries` reached | Failed |
+| Running | any exit with `restart = false` | Exited |
+| Running | exits (any code, or a signal), `restart`, retries left | PendingRestart |
+| Running | exits (any code, or a signal), `max_retries` reached | Failed |
 | PendingRestart | `restart_delay` elapsed | Running |
 | any | `herd stop` (process killed and reaped) | Halted |
 | Exited / Halted / Failed / Stopped | `herd start` | Running |

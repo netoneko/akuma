@@ -114,7 +114,7 @@ impl Write for SshStream {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() {
-    println("[SSHD] Starting userspace SSH server...");
+    println(&format!("[SSHD] Starting userspace SSH server (rev {})...", libakuma::GIT_REV));
 
     // 1. Load config from file first
     block_on(config::load_config());
