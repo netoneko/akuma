@@ -102,6 +102,9 @@ const C2H_BCNFLTR: (u8, u8, u8) = (1, 1, 0x0d);
 const RESTART_TRIES: u32 = 3;
 /// How often an idle daemon looks at the RX ring and its request.
 const IDLE_MS: u64 = 50;
+/// A beacon-loss report is acted on only after this long without any other
+/// frame from the access point.
+const BEACON_GRACE_MS: u64 = 5000;
 /// A join's waits poll the RX ring this often.
 const POLL_MS: u64 = 2;
 
@@ -270,6 +273,8 @@ extern "C" fn daemon() -> ! {
         vars: script::Vars { mac: MAC, ..script::Vars::default() },
         stats: LinkStats::default(),
         next_report: 0,
+        heard: 0,
+        heard_at: 0,
         ready: false,
         chan: CHANNEL,
         peer: None,
@@ -379,6 +384,9 @@ struct Station {
     vars: script::Vars,
     stats: LinkStats,
     next_report: u64,
+    /// Frames heard from the access point so far, and when that count last moved.
+    heard: u32,
+    heard_at: u64,
     wanted: Option<Wanted>,
     /// When the next rejoin may start (`now_us` clock), and the wait after it.
     retry_at: u64,
@@ -1020,6 +1028,20 @@ impl Station {
             link_report(card, &self.stats);
             self.link_lost();
             return;
+        }
+        let heard = (self.stats.rx_data as u32).wrapping_add(self.stats.rx_unparsed as u32).wrapping_add(self.stats.rx_msdus as u32);
+        if heard != self.heard {
+            self.heard = heard;
+            self.heard_at = now_us();
+        }
+        // The firmware's report is about beacons, and on this card beacons
+        // are the weakest thing it hears (no association-time RX calibration
+        // yet): it reported loss every minute or two while the access point's
+        // data frames kept arriving. Believe the report only when nothing
+        // else from the access point has been heard for BEACON_GRACE_MS.
+        if beacon_lost && now_us().saturating_sub(self.heard_at) < BEACON_GRACE_MS * 1000 {
+            say("beacon loss ignored: the access point's frames still arrive");
+            beacon_lost = false;
         }
         if beacon_lost {
             say("beacon loss: the firmware stopped hearing the access point");
