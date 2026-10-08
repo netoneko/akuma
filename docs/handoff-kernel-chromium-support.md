@@ -111,8 +111,12 @@ image `733 passed, 0 failed`; `chrome-once.sh` exit 0, `shot.png` still reads
   (`persistent_memory_allocator.cc:886`) 71 times in one run. **Not known to
   predate Fix 20**: the Firecracker rig was unreachable (the box was booted
   into Akuma) so there was no comparison. Suspect the open divergence below.
-- The first boot's `sshd` did not start on its own (reachable only after a
-  couple of minutes, cause not found; check `/var/log/herd/`).
+- **sshd on the metal: parked, see the `docs/README.md` row.** herd does start
+  sshd at boot (pid 7 in the boot snapshot) and it is gone by ~60 s, not revived.
+  The user's decision: boot straight into `init=/bin/sshd` (GRUB entry on the
+  Ubuntu side; Akuma cannot edit it) and look again later. GRUB currently has
+  `initargs=daemon` on the default entry (made no difference); the backup of the
+  previous entry is `/root/45_akuma.bak-20261008-061615` on Ubuntu.
 
 **Open divergence found by `fallocprobe`:** a `MAP_SHARED` write is not visible
 to `pread` until `munmap` (an `ftruncate`-sized file behaves the same).
