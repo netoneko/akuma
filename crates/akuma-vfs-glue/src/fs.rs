@@ -275,6 +275,24 @@ pub fn write_at_open_file(mount_id: u32, inode: u32, offset: usize, data: &[u8])
     crate::write_at_open_file(mount_id, inode, offset, data)
 }
 
+/// Write for an open file description — by inode when `open(2)` bound one. See
+/// [`crate::write_at_open_file_or_path`].
+pub fn write_at_open_file_or_path(path: &str, mount_id: u32, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    crate::write_at_open_file_or_path(path, mount_id, inode, offset, data)
+}
+
+/// `O_APPEND` write for an open file description, by inode once the name is
+/// gone. See [`crate::append_open_file`].
+pub fn append_open_file(path: &str, mount_id: u32, inode: u32, data: &[u8]) -> Result<(usize, usize), FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    crate::append_open_file(path, mount_id, inode, data)
+}
+
 /// `O_APPEND` write, atomic against other appenders — see [`crate::append`].
 pub fn append(path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
     if !is_initialized() {

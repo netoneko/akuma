@@ -153,16 +153,19 @@ which is also where the remaining kernel work is laid out.
 photo of the panel: Tumblr's layout paints (header, buttons, a dialog card,
 the loading placeholder).
 
-**But no text, images only**, as seen on the panel. The first-party text that did
-appear in one captured frame (the "Trending / Staff Picks / Videos" row) is
-Tumblr's own web font; text in **system fonts renders nowhere**: a local page
-with `serif`, `sans-serif`, `monospace`, `Helvetica` and an emoji line paints none
-of them, in the top frame or in an iframe, while borders and an SVG icon paint.
-`fc-match sans-serif` inside the guest answers `NotoSans-Regular.ttf`, so
-fontconfig and the files are fine. Chromium's own histograms say where it
-breaks: `Chrome.FontDataService.EmptyPathOnGetFileHandle` recorded 5 of 5
-(the browser's font service finds no file path for the font it matched).
-**OPEN**; chase with `strace_err` (`docs/runbooks/trace-failing-syscalls-amd64.md`).
+**It first rendered with no text, images only** (system-font text missing
+everywhere; web-font text such as Tumblr's own nav labels drew). Cause and fix:
+Chromium 152's font service hands fonts to the renderer through an unlinked,
+`MAP_SHARED` temp file, and four kernel gaps broke that on Akuma
+(`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fixes 21-24: `pwritev2`
+`RWF_NOAPPEND`, writes to unlinked files, reopening `/proc/self/fd/N`, and
+read-only mappings not seeing shared-writable pages). Diagnosis tools, all in
+`probe/akuma/`: `fontcdp.py` (which platform font does Chromium pick?),
+`fonttrace.py` (Chromium trace of the font service), and the C probes
+`fontmapprobe.c`/`pwv2probe.c`/`shmregionprobe.c` in `forktest/c_stress`. Do
+the work on ryzen's Firecracker, not by rebooting the laptop: a Chromium-**152**
+image (Alpine `latest`) is the one that matters, because Alpine 3.22's 142
+never used this path.
 
 Other findings from the same session:
 

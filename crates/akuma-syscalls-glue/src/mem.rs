@@ -404,7 +404,17 @@ pub(super) fn sys_brk(new_brk: usize) -> u64 {
 /// is what the page cache keys on (F-1,
 /// `docs/archive/EXT2_WRITEBACK_DESIGN.md`). Resolved together, from one call, so
 /// the two can never describe different mounts.
-fn resolve_file_extent(path: &str, offset: usize, len: usize) -> (u32, u32, usize) {
+fn resolve_file_extent(path: &str, fd_mount: u32, fd_inode: u32, offset: usize, len: usize) -> (u32, u32, usize) {
+    // The fd's own identity wins over the path's: a file unlinked after `open`
+    // has no path to resolve, and "no identity" meant a shared writable mapping
+    // got private pages — Chromium's font bytes, written into an unlinked
+    // shared-memory file, never reached the renderer (`shmregionprobe.c`,
+    // ryzen 2026-10-08).
+    if fd_inode != 0
+        && let Ok(m) = akuma_vfs_glue::metadata_open_file(path, fd_mount, fd_inode)
+    {
+        return (fd_mount, fd_inode, core::cmp::min(len, (m.size as usize).saturating_sub(offset)));
+    }
     match akuma_vfs_glue::file_size(path) {
         Ok(file_len) => {
             let (mount_id, inode) = akuma_vfs_glue::resolve_file_id(path).unwrap_or((0, 0));
@@ -436,7 +446,7 @@ fn mmap_eager_to_lazy_fallback(
             // (Phase 2e of the no-bkl-vfs carve-out).
             let (mount_id, inode, filesz) = {
                 let _vfs_window = super::fs::VfsBklGuard::new();
-                resolve_file_extent(&path, offset, len)
+                resolve_file_extent(&path, f.mount_id(), f.inode(), offset, len)
             };
             let source = akuma_exec::process::LazySource::file(
                 path, mount_id, inode, offset, filesz, mmap_addr,
@@ -584,7 +594,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             // (Phase 2e of the no-bkl-vfs carve-out).
             let (mount_id, inode, filesz) = {
                 let _vfs_window = super::fs::VfsBklGuard::new();
-                resolve_file_extent(&path, offset, len)
+                resolve_file_extent(&path, f.mount_id(), f.inode(), offset, len)
             };
             let source = akuma_exec::process::LazySource::file(
                 path.clone(),

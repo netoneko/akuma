@@ -508,16 +508,50 @@ The compile-time `syscall-debug-info` (now forwardable on amd64) added 244
 glue lines and no lifecycle lines in the same run, and found nothing the
 runtime flags did not. It stays off.
 
-## Update 2026-10-08 (evening): Tumblr renders on ryzen, system-font text does not
+## Fixes 21-24 (2026-10-08, evening): system-font text on Chromium 152
 
-On ryzen's Akuma over wifi, `kami https://www.tumblr.com/` paints the page's
-layout and images on the framebuffer. Text in system fonts is missing
-everywhere (a local test page shows none of its `serif`/`sans-serif`/
-`monospace`/emoji lines; borders and an SVG icon do paint); web-font text does
-paint. `fc-match` in the guest is correct. Chromium's
-`Chrome.FontDataService.EmptyPathOnGetFileHandle` counts 5 of 5: the browser
-process's font service has no path for the matched font. **Open.** Details and
-the `kami` blink fix: `userspace/kami/README.md` § "Tumblr on the ryzen laptop".
+On ryzen's Akuma, `kami https://www.tumblr.com/` painted layout and images but
+**no system-font text**. The metal's Chromium was **152.0.7977.82** (Alpine
+`latest-stable` via `apk --root`), the Firecracker image's was 142 (Alpine
+3.22), which is why nothing on the trashcan had ever shown it. Chromium 152
+loads system fonts through a browser-side **FontDataService**: the browser opens
+the font, copies it into a shared-memory region (an unlinked temp file, sized
+with `fallocate`, mapped `MAP_SHARED` read-write), and the renderer maps a
+read-only handle of it. Every step of that was broken for an **unlinked** file.
+
+How it was found (all on ryzen's Firecracker with a Chromium-152 image, Linux
+in Docker as the control, each probe run on Linux first):
+
+* `fontcdp.py` (CDP): on Akuma `CSS.getPlatformFontsForNode` was empty and
+  `canvas.measureText` width 0 for *every* family, even the explicit "Noto Sans";
+  on Linux, Liberation/Noto with real glyph counts. So lookup, not painting.
+* `fonttrace.py` (Chromium trace): the renderer got as far as
+  `FontDataServiceImpl - sharing memory region`, then `LegacyMakeTypeface` with a
+  null family. `Chrome.FontDataService.EmptyPathOnGetFileHandle` is **benign**:
+  it fires on Linux too.
+* `fontmapprobe.c`: ruled out the bytes (read/mmap/fork of the real font files
+  all match on Akuma).
+* `shmregionprobe.c`: reproduced the region in miniature.
+
+| Fix | Symptom | Cause | Gate |
+|---|---|---|---|
+| 21 | 990 `pwritev2` per run -> `EOPNOTSUPP` | Newer musl does `pwrite(2)` as `pwritev2(..., RWF_NOAPPEND)`; every nonzero `RWF_*` was refused. `RWF_NOAPPEND` (0x20) is now accepted as a no-op (positional writes here never append) | `pwv2probe.c` |
+| 22 | `pwrite`/`write` to an unlinked file read back as nothing | `sys_pwrite64`/`sys_write` wrote **by path**, `pread` read **by inode**. Both now write by inode (`write_at_open_file_or_path`, `append_open_file`), still telling the path-keyed caches | `pwv2probe.c` |
+| 23 | `open("/proc/self/fd/N", O_RDONLY)` of an unlinked file -> `ENOENT` | `/proc/<pid>/fd/N` was an ordinary symlink to the fd's recorded path. When the fd has an inode and its path is gone, `openat` now binds the new fd to that inode (Linux's magic-link behaviour) | `shmregionprobe.c` |
+| 24 | A read-only mapping of a file another process maps shared-writable saw the file's old bytes | `fill_file_pages` looked only in the file-page cache and on disk; the writer's unflushed page lives in the shared-writable table (`shmpages`). Read-only fills now take that frame first | `shmregionprobe.c` |
+
+Result: the font test page renders serif, sans-serif, monospace, Helvetica and
+emoji under Firecracker with Chromium 152 (screenshot 26 813 B, was 1 489 B).
+
+Still open, found by the probes and not fixed: `read(2)`/`pread` do not see a
+writer's unflushed `MAP_SHARED` pages (known); a peer that maps a region
+*before* the writer touches it keeps a stale frame (Chromium never does this);
+`preadv2` (x86_64 327), `sendfile` (40), `link` (86), `get_mempolicy` (239) have
+no rows (`link` is why fontconfig cannot take its cache lock). On real Linux
+`RWF_NOAPPEND` on an `O_APPEND` fd still appended (6.17 on overlayfs), which is
+why `pwv2probe` prints that case instead of scoring it. One more trap: the
+trashcan-era image pins Alpine 3.22; build a `latest` image
+(`/root/cdp-probe/new` on ryzen) to see what the metal runs.
 
 ## Still open: what Chromium hits on Akuma now
 

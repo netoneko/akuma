@@ -1501,6 +1501,33 @@ fn fill_file_pages(
         let (offset, from_file) = file.page_source(idx);
         let share_this = sharing && from_file == PAGE_SIZE as usize;
 
+        // A page some process maps **shared and writable** lives in the shared
+        // writable table until its writer flushes, and the file (and the file
+        // page cache above it) is stale until then. A read-only mapping of the
+        // same file must see the table's frame, as Linux's one page cache
+        // would give it: Chromium's font service fills a shared-memory region
+        // through a writable mapping and hands the renderer a read-only one,
+        // and the renderer used to read the file's zeros — no system font ever
+        // loaded (`shmregionprobe.c`, ryzen 2026-10-08). `active()` keeps this
+        // to one atomic load when no process maps a file shared-writable.
+        if !region_pte.write && crate::shmpages::active() {
+            let key = akuma_fpcache_rw::Key::new(file.mount_id, file.inode, offset);
+            if let Some(pa) = crate::shmpages::lookup_and_ref(key) {
+                let ok = map_shared_file_page(va, prot, PhysFrame::new(pa), true);
+                crate::shmpages::reap(key, pa);
+                if ok {
+                    FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
+                }
+                if va == page {
+                    faulting_page_ok = ok;
+                }
+                if !ok {
+                    break;
+                }
+                continue;
+            }
+        }
+
         // A hit costs no frame, no read and no copy — just a reference and a
         // PTE. This is the whole point of the cache, and on the self-host build
         // it is the common case from the second `rustc` onwards.

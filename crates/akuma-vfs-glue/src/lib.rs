@@ -716,6 +716,33 @@ pub fn write_at_open_file(mount_id: u32, inode: u32, offset: usize, data: &[u8])
     fs.write_at_by_inode(inode, offset, data)
 }
 
+/// Write for an open file description: by the inode `open(2)` bound to it when
+/// there is one, by path otherwise — the write half of [`read_at_open_file`].
+///
+/// `pwrite(2)` used to write by path while `pread(2)` read by inode, so for a
+/// file unlinked after it was opened (Chromium's shared-memory files, created
+/// and unlinked at once) the write went to the wrong place and the read saw
+/// nothing (`pwv2probe.c`, 2026-10-08). The path-keyed caches are still told —
+/// harmlessly, when the name is gone or now belongs to another file — so a file
+/// that still has its name stays coherent with mappings and the page cache.
+pub fn write_at_open_file_or_path(
+    path: &str,
+    mount_id: u32,
+    inode: u32,
+    offset: usize,
+    data: &[u8],
+) -> Result<usize, FsError> {
+    if inode == 0 || is_mtab(path) {
+        return write_at(path, offset, data);
+    }
+    let r = write_at_open_file(mount_id, inode, offset, data);
+    invalidate_file_pages(path);
+    if let Ok(n) = r {
+        notify_mapped_write(path, offset, &data[..n.min(data.len())]);
+    }
+    r
+}
+
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if is_mtab(path) {
@@ -727,6 +754,29 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
         notify_mapped_write(path, offset, &data[..n.min(data.len())]);
     }
     r
+}
+
+/// `O_APPEND` write for an open file description.
+///
+/// By path while the name still finds the file (the filesystem picks the end
+/// inside its own write lock, so two appenders cannot overwrite each other);
+/// when the name is gone — the file was unlinked after `open` — by inode at the
+/// size the inode reports, which is not atomic against another appender but is
+/// the only way to reach the file.
+pub fn append_open_file(
+    path: &str,
+    mount_id: u32,
+    inode: u32,
+    data: &[u8],
+) -> Result<(usize, usize), FsError> {
+    match append(path, data) {
+        Err(FsError::NotFound) if inode != 0 => {
+            let size = metadata_open_file(path, mount_id, inode)?.size as usize;
+            let n = write_at_open_file_or_path(path, mount_id, inode, size, data)?;
+            Ok((size, n))
+        }
+        other => other,
+    }
 }
 
 /// `O_APPEND` write: at the end of the file as the filesystem sees it inside

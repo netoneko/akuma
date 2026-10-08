@@ -982,7 +982,9 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
             if copy_from_user(&mut buf, buf_ptr).is_err() {
                 return EFAULT;
             }
-            match akuma_vfs_glue::fs::write_at(&f.path, offset as usize, &buf) {
+            // By inode, like `sys_pread64`: a file unlinked after `open` has no
+            // path to write through.
+            match akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, f.mount_id(), f.inode(), offset as usize, &buf) {
                 Ok(n) => n as u64,
                 Err(e) => fs_error_to_errno(e)
             }
@@ -1149,12 +1151,14 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // `>>` loops of 150 lines left 298
                 // (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §5).
                 let result = if is_append {
-                    akuma_vfs_glue::fs::append(&f.path, buf_slice).map(|(at, n)| {
+                    akuma_vfs_glue::fs::append_open_file(&f.path, f.mount_id(), f.inode(), buf_slice).map(|(at, n)| {
                         write_pos = at;
                         n
                     })
                 } else {
-                    akuma_vfs_glue::fs::write_at(&f.path, write_pos, buf_slice)
+                    // By inode, like `sys_pread64`: a file unlinked after `open`
+                    // (Chromium's temp and shared-memory files) has no path.
+                    akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, f.mount_id(), f.inode(), write_pos, buf_slice)
                 };
                 match result {
                     Ok(0) => {
@@ -1562,6 +1566,9 @@ fn pvec_at(fd_num: u64, iov_ptr: u64, iov_cnt: usize, offset: i64, write: bool) 
     total
 }
 
+/// `RWF_NOAPPEND` (Linux 6.9+): do not honour `O_APPEND` for this write.
+const RWF_NOAPPEND: u32 = 0x20;
+
 /// `preadv`/`pwritev` (nr 69/70) and their `2` variants (nr 286/287).
 ///
 /// musl only reaches `p{read,write}v2` when `flags` is nonzero — with no flags
@@ -1579,8 +1586,14 @@ fn pvec_at(fd_num: u64, iov_ptr: u64, iov_cnt: usize, offset: i64, write: bool) 
 /// whole offset. Naming it would invite someone to fold it in and break every
 /// offset above 4 GB.
 ///
-/// `flags` are the `RWF_*` set (`HIPRI`, `DSYNC`, `SYNC`, `NOWAIT`, `APPEND`).
-/// None of them are implemented, and Linux's own answer for an unsupported
+/// `flags` are the `RWF_*` set (`HIPRI`, `DSYNC`, `SYNC`, `NOWAIT`, `APPEND`,
+/// `NOAPPEND`). Only `NOAPPEND` is accepted, and as a no-op: `pwrite64` here
+/// never appends, so "honour the offset" is already what every positional
+/// write does. Newer musl (Alpine 3.24) implements `pwrite(2)` as
+/// `pwritev2(..., RWF_NOAPPEND)`, so refusing it failed 990 writes per
+/// headless Chromium run — among them the browser's copy of font data, which
+/// left every system-font glyph blank (2026-10-08, `pwv2probe.c`).
+/// None of the others are implemented, and Linux's own answer for an unsupported
 /// `RWF_*` bit is `EOPNOTSUPP` — not `EINVAL`, which would read as "bad
 /// argument" and stop a caller from retrying without the flag.
 pub(super) fn sys_pvec2(
@@ -1591,7 +1604,7 @@ pub(super) fn sys_pvec2(
     flags: u32,
     write: bool,
 ) -> u64 {
-    if flags != 0 {
+    if flags & !RWF_NOAPPEND != 0 {
         return EOPNOTSUPP;
     }
     // -1 means "use the file position", which is exactly readv/writev.
@@ -1779,6 +1792,19 @@ pub fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
 /// not make, and one path it answers for itself — and it calls
 /// [`openat_path`] with the path it already holds. `pub` for the same reason
 /// [`sys_close`] and [`sys_read`] are.
+/// `N` of `/proc/self/fd/N` or `/proc/<this process's pid>/fd/N`.
+fn own_proc_fd_number(path: &str) -> Option<u32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (who, tail) = rest.split_once("/fd/")?;
+    if who != "self" {
+        let pid: u32 = who.parse().ok()?;
+        if akuma_exec::process::read_current_pid() != Some(pid) {
+            return None;
+        }
+    }
+    tail.parse().ok()
+}
+
 pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
     openat_path(dirfd, &raw_path, flags, mode)
@@ -1829,6 +1855,30 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             return Err(e);
         }
     };
+
+    // `open("/proc/self/fd/N")` is a *magic* link on Linux: it reopens the file
+    // the descriptor holds, whatever its name is now. Here `/proc/<pid>/fd/N`
+    // is an ordinary symlink to the fd's recorded path, so a file unlinked after
+    // it was opened (Chromium's shared-memory regions are created and unlinked
+    // at once, and the read-only handle for another process is made by
+    // reopening `/proc/self/fd/N` O_RDONLY) answered ENOENT, and the font
+    // service never got a region the renderer could map — every system font
+    // measured width 0 (`shmregionprobe.c`, ryzen 2026-10-08). When the fd has
+    // an inode and its path no longer finds a file, bind the new fd to that
+    // inode, as `open(2)` would have.
+    if let Some(n) = own_proc_fd_number(&path)
+        && let Some(proc) = akuma_exec::process::current_process_shared()
+        && let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(n)
+        && f.inode() != 0
+        && akuma_vfs_glue::metadata(&f.path).is_err()
+    {
+        let file = akuma_exec::process::KernelFile::new(f.path.clone(), flags).with_inode(f.mount_id(), f.inode());
+        let nfd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
+        if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+            proc.set_cloexec(nfd);
+        }
+        return Ok(u64::from(nfd));
+    }
 
     // Phase 7c (docs/archive/BKL_PHASE7C_OPENAT_RESIDUAL.md): opened HERE, before
     // `resolve_symlinks`, not after it. `resolve_symlinks` calls `read_symlink` ->
