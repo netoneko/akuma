@@ -22,8 +22,24 @@ With no URL, a fresh tab opens the home page, `https://www.tumblr.com/` (the
 `HOME` constant in `src/main.rs`). Reattaching with no URL keeps whatever the
 tab is showing.
 
-Keys: arrows, PgUp/PgDn and Home/End scroll; Enter, Backspace, Tab and Esc are
-passed through; other text is typed; Ctrl-R reloads; Ctrl-C or Ctrl-Q detaches.
+Keys are modal, like vim (`src/nav.rs`, host-tested). A status line in the page
+(bottom left) shows the mode.
+
+- **Normal** (start): `j`/`k` scroll, `d`/`u` half a page, `gg`/`G` top/bottom,
+  `H`/`L` back/forward, `r` reload, `f` link hints, `i` insert mode. Other
+  letters are swallowed. Arrows, PgUp/PgDn, Home/End, Enter, Tab, Backspace
+  and Esc still pass to the page (Esc closes a page's own dialog).
+- **Link hints** (`f`): every visible clickable element (links, buttons,
+  inputs, `role=button`, `cursor:pointer` leaves; through open shadow roots
+  and same-origin iframes) gets a yellow letter label (home row `asdfghjkl`,
+  fixed width). Type the label to click it with a real mouse event; Esc
+  cancels, Backspace un-types. Clicking a text field enters insert mode.
+  Cross-origin iframes get no hints.
+- **Insert** (`i`): all keys go to the page; Esc blurs and returns to Normal.
+- Ctrl-R reloads; Ctrl-C or Ctrl-Q detaches (any mode).
+
+Untested against a live page as of 2026-10-08: the CDP mouse/wheel path and
+`src/hints.js` have only been syntax-checked; the state machine has tests.
 
 On Akuma the screencast's frames arrive fully transparent (Chromium's video
 capture reads an empty buffer; see the archive record), so `kami` notices an

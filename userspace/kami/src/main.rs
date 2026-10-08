@@ -12,13 +12,16 @@
 //!
 //! With no URL a fresh tab opens [`HOME`]; an existing tab stays where it is.
 //!
-//! Keys: arrows / PgUp / PgDn / Home / End scroll, Enter / Backspace / Tab /
-//! Esc pass through, other text is typed, Ctrl-R reloads, Ctrl-C or Ctrl-Q
-//! detaches.
+//! Keys are modal, like vim (see `nav.rs`): in Normal mode `j`/`k`/`d`/`u`/
+//! `gg`/`G` scroll, `H`/`L` go back/forward, `f` labels every clickable thing
+//! with letters to type, `i` starts typing into the page (Esc stops). Arrows /
+//! PgUp / PgDn / Home / End / Enter / Tab / Esc always pass through. Ctrl-R
+//! reloads, Ctrl-C or Ctrl-Q detaches.
 
 mod cdp;
 mod daemon;
 mod fb;
+mod nav;
 mod png;
 
 use std::io;
@@ -204,6 +207,7 @@ fn decode_keys(bytes: &[u8]) -> Vec<Input> {
                     [b'[', b'6', b'~', ..] => (("PageDown", 34), 3),
                     [b'[', b'1', b'~', ..] => (("Home", 36), 3),
                     [b'[', b'4', b'~', ..] => (("End", 35), 3),
+                    [b'[', b'3', b'~', ..] => (("Delete", 46), 3),
                     _ => (("Escape", 27), 0),
                 };
                 i += used;
@@ -253,6 +257,91 @@ fn send_key(c: &mut Cdp, key: &str, code: u32) -> io::Result<()> {
         &format!("{{\"type\":\"keyUp\",\"key\":\"{key}\",\"code\":\"{key}\",\"windowsVirtualKeyCode\":{code}}}"),
         true,
     )?;
+    Ok(())
+}
+
+/// The in-page helper (hint overlay, status line); see `hints.js`.
+const HINTS_JS: &str = include_str!("hints.js");
+
+/// Run a call into the in-page helper, installing it first if the document
+/// is new. The reply is the raw CDP message; read it with `str_field`/`num_field`
+/// on `"value"`.
+fn page(c: &mut Cdp, call: &str) -> io::Result<Vec<u8>> {
+    let expr = format!("{HINTS_JS}\n;{call}");
+    c.call("Runtime.evaluate", &format!("{{\"expression\":\"{}\",\"returnByValue\":true}}", escape(&expr)), true)
+}
+
+fn show_status(c: &mut Cdp, nav: &nav::Nav) {
+    // Cosmetic: a page that is mid-navigation just misses an update.
+    let _ = page(c, &format!("__kami.status(\"{}\")", escape(&nav.status())));
+}
+
+fn mouse(c: &mut Cdp, kind: &str, x: f64, y: f64, extra: &str) -> io::Result<()> {
+    c.send("Input.dispatchMouseEvent", &format!("{{\"type\":\"{kind}\",\"x\":{x},\"y\":{y}{extra}}}"), true)?;
+    Ok(())
+}
+
+/// Carry out one navigation action. `view` is the page viewport in pixels.
+fn perform(c: &mut Cdp, nav: &mut nav::Nav, act: nav::Action, view: (usize, usize)) -> io::Result<()> {
+    use nav::{Action, Scroll};
+    let (w, h) = (view.0 as f64, view.1 as f64);
+    match act {
+        Action::Quit => {}
+        Action::Reload => {
+            c.send("Page.reload", "{}", true)?;
+        }
+        Action::Key(key, code) => send_key(c, key, code)?,
+        Action::Text(t) => {
+            c.send("Input.insertText", &format!("{{\"text\":\"{}\"}}", escape(&t)), true)?;
+        }
+        Action::Scroll(s) => {
+            let dy = match s {
+                Scroll::Line(n) => n as f64 * 120.0,
+                Scroll::Half(n) => n as f64 * h / 2.0,
+                Scroll::Edge(n) => n as f64 * 1.0e6,
+            };
+            mouse(c, "mouseWheel", w / 2.0, h / 2.0, &format!(",\"deltaX\":0,\"deltaY\":{dy}"))?;
+        }
+        Action::Back => {
+            page(c, "history.back()")?;
+        }
+        Action::Forward => {
+            page(c, "history.forward()")?;
+        }
+        Action::Blur => {
+            page(c, "__kami.blur()")?;
+        }
+        Action::HintStart => {
+            let n = page(c, "__kami.collect()").ok().and_then(|r| num_field(&r, "value")).unwrap_or(0) as usize;
+            nav.begin_hints(n);
+            if n > 0 {
+                let len = nav::label_len(n);
+                let list = (0..n).map(|i| format!("\"{}\"", nav::label(i, len))).collect::<Vec<_>>().join(",");
+                page(c, &format!("__kami.draw([{list}])"))?;
+            }
+        }
+        Action::HintFilter(p) => {
+            page(c, &format!("__kami.filter(\"{}\")", escape(&p)))?;
+        }
+        Action::HintCancel => {
+            page(c, "__kami.clear()")?;
+        }
+        Action::HintClick(i) => {
+            let r = page(c, &format!("__kami.click({i})"))?;
+            let v = str_field(&r, "value").unwrap_or("");
+            let mut f = v.split(',');
+            if let (Some(x), Some(y), Some(e)) = (f.next(), f.next(), f.next()) {
+                if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
+                    mouse(c, "mouseMoved", x, y, "")?;
+                    mouse(c, "mousePressed", x, y, ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1")?;
+                    mouse(c, "mouseReleased", x, y, ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1")?;
+                    if e == "1" {
+                        nav.mode = nav::Mode::Insert;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -371,6 +460,9 @@ fn session(args: &Args) -> io::Result<()> {
     let mut window = Instant::now();
     let mut stdin_open = tty.0.is_some();
     let mut msgs: Vec<Vec<u8>> = std::mem::take(&mut c.queued);
+    let mut nav = nav::Nav::new();
+    // The status line lives in the page, so a navigation wipes it.
+    let mut status_due = true;
 
     let trace = std::env::var_os("KAMI_TRACE").is_some();
     // Polling `Page.captureScreenshot` instead of the screencast: on Akuma the
@@ -385,6 +477,11 @@ fn session(args: &Args) -> io::Result<()> {
             // Debug: KAMI_TRACE=1 names every CDP event the page sends.
             if trace {
                 eprintln!("[kami] event {}\r", method(&m).unwrap_or("(reply)"));
+            }
+            if matches!(method(&m), Some("Page.frameNavigated" | "Page.loadEventFired"))
+                && event_session(&m) == Some(&session)
+            {
+                status_due = true;
             }
             if method(&m) != Some("Page.screencastFrame") || event_session(&m) != Some(&session) {
                 continue;
@@ -512,17 +609,20 @@ fn session(args: &Args) -> io::Result<()> {
             }
             next_shot = Instant::now() + Duration::from_millis(150);
             for k in decode_keys(&buf[..n as usize]) {
-                match k {
-                    Input::Quit => break 'outer,
-                    Input::Reload => {
-                        c.send("Page.reload", "{}", true)?;
+                for act in nav.feed(&k) {
+                    if act == nav::Action::Quit {
+                        break 'outer;
                     }
-                    Input::Key(key, code) => send_key(&mut c, key, code)?,
-                    Input::Text(t) => {
-                        c.send("Input.insertText", &format!("{{\"text\":\"{}\"}}", escape(&t)), true)?;
-                    }
+                    perform(&mut c, &mut nav, act, (w, h))?;
                 }
             }
+            status_due = true;
+        }
+        if status_due {
+            status_due = false;
+            show_status(&mut c, &nav);
+            // Replies and events that arrived during the page calls.
+            msgs.extend(std::mem::take(&mut c.queued));
         }
     }
 
