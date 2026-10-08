@@ -165,10 +165,17 @@ impl Fb {
             let src = &px[y * w * ch..(y + 1) * w * ch];
             for (x, dst) in self.row.iter_mut().enumerate() {
                 let p = &src[(x / scale) * ch..];
-                *dst = self.alpha
-                    | (p[0] as u32) << rs
-                    | (p[1] as u32) << gs
-                    | (p[2] as u32) << bs;
+                let (r, g, b) = if ch == 4 && p[3] != 255 {
+                    // Composite over white, as a browser window does: a frame
+                    // Chromium has not painted yet is (0,0,0,0), and blitting
+                    // its RGB as-is turns the screen black.
+                    let a = p[3] as u32;
+                    let over = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+                    (over(p[0]), over(p[1]), over(p[2]))
+                } else {
+                    (p[0], p[1], p[2])
+                };
+                *dst = self.alpha | (r as u32) << rs | (g as u32) << gs | (b as u32) << bs;
             }
             for dy in first..(first + scale).min(self.height) {
                 let off = self.origin + dy * self.stride;

@@ -1,4 +1,4 @@
-# Handoff prompt: headless Chromium (kami) on amd64 — round 3
+# Handoff prompt: headless Chromium (kami) on amd64 — round 4
 
 Paste everything below the line into a fresh session started in this repo, on
 the `kami` branch.
@@ -83,47 +83,83 @@ The Chromium image's boot prints `self-test: 619 passed, 41 FAILED`. That's
 expected: the fixtures are missing from that image. Compare the count across
 runs, not against zero.
 
-## Where it stands (2026-10-08, end of round 2)
+## Where it stands (2026-10-08, end of round 3)
 
-Round 2 closed, in order: the zygote child's `capset` (`ENOSYS`, no x86_64
-row — Fix 17), V8's RWX code range (`mprotect(PROT_WRITE|PROT_EXEC)` refused
-— Fix 18), and the 64-entry system-wide thread table (`clone` → `EAGAIN` for
-the GPU process — Fix 19). `chrome-once.sh` then exits 0 in ~28 s of guest
-time with the screenshot above; a session peaks at ~103 live user threads of
-a 512-slot budget.
+Round 3 closed `fallocate` (Fix 20, x86_64 285; gate `fallocprobe.c`; standard
+image `733 passed, 0 failed`; `chrome-once.sh` exit 0, `shot.png` still reads
+"JavaScript ran: 6 x 7 = 42", 0 `nr=285` failures against 82 before), then put
+`kami` on the trashcan's **metal** for the first time.
 
-## This round
+**On the metal (kernel `f00fca8f` + Fix 20, `--features no-tests`, installed as
+`/boot/akuma-amd64`; the previous kernel is `/boot/akuma-amd64.prev`):**
 
-1. **`kami` on the trashcan's metal.** `userspace/kami/build.sh`; it needs
-   `/dev/fb0`, and the default page needs networking. Stage with
-   `hpbox.stage()`, boot with `hpbox.reboot_to("akuma")`, and read
-   `docs/runbooks/amd64-bare-metal-loop.md` first — metal only when the user
-   asks. Expect the metal to differ from Firecracker in the NIC (Realtek
-   `rtl8169`), the clock, and memory size; the Chromium path itself is the
-   same binary.
-2. **Then the open list** (do them when they block, or when cheap):
-   - `fallocate` (x86_64 285) has no row: 82 `ENOSYS` per run, glue has the
-     arm. Row plus arm, pinned in the dispatch self-test like `capset`.
+- Chromium (Alpine's, merged onto the Akuma partition with
+  `rsync --ignore-existing`, so a later `hpbox.restage_disk()` deletes it) and
+  `/bin/kami` start. `kami` opens `/dev/fb0` (3840x2160, stride 16384,
+  `rgb@16/8/0`) and Chromium starts in ~4.7 s. `chromium --dump-dom
+  http://example.com/` returns the real DOM, so the metal's network works for
+  Chromium.
+- **The framebuffer path is proven.** `fbpattern.c` (colour bars + ramp, the
+  mapping read back) shows exactly that on the TV, colours correct. `kami`'s
+  blit is the same row copy `akuma-cli-wgpu` uses.
+- **What is not working: the screencast carries an empty page.** The first
+  `Page.screencastFrame` is a 1920x1080 RGBA PNG whose pixels are **all
+  (0,0,0,0)** (checked over all 8,295,480 decoded bytes), and no second frame
+  arrives. `kami` ignored alpha, so the screen went black; it now composites
+  over white and sends `Emulation.setDefaultBackgroundColorOverride`, and the TV
+  shows **white**. So the pipe, decode and blit all work; Chromium paints
+  nothing into the screencast.
+- Not yet shown to work on Akuma anywhere: the **CDP pipe + `Page.startScreencast`
+  path**. The Firecracker smoke test only uses one-shot `--screenshot`.
+- Chromium logs `Corruption detected in shared-memory segment`
+  (`persistent_memory_allocator.cc:886`) 71 times in one run. **Not known to
+  predate Fix 20**: the Firecracker rig was unreachable (the box was booted
+  into Akuma) so there was no comparison. Suspect the open divergence below.
+- The first boot's `sshd` did not start on its own (reachable only after a
+  couple of minutes, cause not found; check `/var/log/herd/`).
+
+**Open divergence found by `fallocprobe`:** a `MAP_SHARED` write is not visible
+to `pread` until `munmap` (an `ftruncate`-sized file behaves the same).
+`FALLOC_FL_KEEP_SIZE` is `EOPNOTSUPP`.
+
+**Next, in order:**
+
+1. A/B Fix 20 against the shared-memory corruption: from Akuma,
+   `cp /boot/akuma-amd64.prev /boot/akuma-amd64 && sync && /bin/busybox reboot -f`
+   (it has no `fallocate` row, so Chromium sizes by `ftruncate`), run `kami`
+   with `KAMI_TRACE=1`, count `Corruption detected` in `/tmp/kami.log`, then put
+   the new kernel back. Mind that `sshd` may not come up; there is no remote way
+   back to Ubuntu.
+2. Why no second frame / no paint: run `KAMI_TRACE=1 kami ...` (names every CDP
+   event) and `KAMI_DUMP=/tmp/f.png` (keeps the first frame; pull it with
+   `base64`, the ssh channel turns LF into CRLF). Likely suspects: the shared
+   memory coherence above, or compositor frames that never start without a GPU.
+3. Then the open list below.
+
+**kami debug knobs added this round:** `KAMI_DUMP=<path>` (first PNG),
+`KAMI_TRACE=1` (event names on stderr). A top-left status overlay was asked for
+and is not written yet (needs a built-in font; `akuma-fbcon`'s would drag in
+`ab_glyph` and a submodule).
+
+## This round (carried over)
+
+1. **`kami` on the metal** — see above; goal not met yet (white, not the page).
+2. **The open list**:
    - The 256-row process table (`akuma-exec`), which every `pthread_create`
-     on this target takes a row in and which **panics** rather than refuses
-     when full. A heavier page than the test page may reach it.
+     takes a row in and which **panics** rather than refuses when full.
    - Missing x86_64 rows: 40 `sendfile`, 86 `link`, 239 `get_mempolicy`,
      253/294 `inotify_init`/`inotify_init1`, 297 `rt_tgsigqueueinfo`
      (crashpad's re-raise), 444 `landlock_create_ruleset`, 101 `ptrace`.
-     Decide each one's honest answer, then row plus arm; a decoded row
-     without an arm prints `no dispatch arm`. The `no row for` print keeps a
-     32-number table and stops naming numbers once it is full — Fix 17 hid
-     behind that; `[sc!]` lines with a bare `nr=` and `-> -38` are the rest.
-   - `gettid()` of a main thread is its thread slot, not its pid (both
-     kernels, by design). Chromium rendered without it mattering; it stays
-     listed because sandboxed modes compare the two.
+     Decide each one's honest answer, then row plus arm; the `no row for`
+     print keeps a 32-number table and stops naming numbers once full, so a
+     bare `nr=N -> -38` is a missing row.
+   - `gettid()` of a main thread is its thread slot, not its pid.
    - Missing `/proc` and `/sys` files (`/proc/cpuinfo`,
      `/proc/sys/fs/inotify/max_user_watches`, `/proc/<pid>/oom_score_adj`,
      `/sys/devices/system/cpu/{possible,present}`), `O_CREAT` ignoring the
-     umask, `init=` not following symlinks, the slow `munmap` of the
-     1324 GiB reservation (~290 ms vs 0.5 ms), and the amd64 `cargo clippy`
-     debt (pre-existing `-D warnings` failures in `hda.rs`, `kbd.rs`,
-     `fd.rs`, `usermode.rs`, none from this work).
+     umask, `init=` not following symlinks, the slow `munmap` of the 1324 GiB
+     reservation, and the amd64 `cargo clippy` debt in `hda.rs`, `kbd.rs`,
+     `fd.rs`, `usermode.rs`.
 
 ## Verify, every kernel change
 

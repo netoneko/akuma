@@ -333,6 +333,14 @@ fn session(args: &Args) -> io::Result<()> {
         &format!("{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":1,\"mobile\":false}}"),
         true,
     )?;
+    // An opaque white base, so a page that has not painted yet (or sets no
+    // background) is white, not the transparent (0,0,0,0) Chromium sends by
+    // default, which blits as a black screen. Cosmetic: failure is ignored.
+    let _ = c.call(
+        "Emulation.setDefaultBackgroundColorOverride",
+        "{\"color\":{\"r\":255,\"g\":255,\"b\":255,\"a\":1}}",
+        true,
+    );
     c.call("Page.enable", "{}", true)?;
     if let (false, Some(url)) = (fresh, &args.url) {
         c.call("Page.navigate", &format!("{{\"url\":\"{}\"}}", escape(url)), true)?;
@@ -360,8 +368,13 @@ fn session(args: &Args) -> io::Result<()> {
     let mut stdin_open = tty.0.is_some();
     let mut msgs: Vec<Vec<u8>> = std::mem::take(&mut c.queued);
 
+    let trace = std::env::var_os("KAMI_TRACE").is_some();
     'outer: loop {
         for m in msgs.drain(..) {
+            // Debug: KAMI_TRACE=1 names every CDP event the page sends.
+            if trace {
+                eprintln!("[kami] event {}\r", method(&m).unwrap_or("(reply)"));
+            }
             if method(&m) != Some("Page.screencastFrame") || event_session(&m) != Some(&session) {
                 continue;
             }
@@ -370,6 +383,13 @@ fn session(args: &Args) -> io::Result<()> {
             let td = Instant::now();
             let ok = b64_decode(data.as_bytes(), &mut bytes).and_then(|_| png.decode(&bytes));
             let tb = Instant::now();
+            // Debug: KAMI_DUMP=<path> keeps the first frame's PNG, to tell a
+            // black frame from a black blit (2026-10-08, the trashcan's metal).
+            if frames == 0 {
+                if let Some(path) = std::env::var_os("KAMI_DUMP") {
+                    let _ = std::fs::write(path, &bytes);
+                }
+            }
             match ok {
                 Ok(()) => fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale),
                 Err(e) => eprintln!("[kami] frame dropped: {e}\r"),
