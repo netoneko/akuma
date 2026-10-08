@@ -394,9 +394,10 @@ fn session(args: &Args) -> io::Result<()> {
             let td = Instant::now();
             let ok = b64_decode(data.as_bytes(), &mut bytes).and_then(|_| png.decode(&bytes));
             let tb = Instant::now();
-            // Debug: KAMI_DUMP=<path> keeps the first frame's PNG, to tell a
-            // black frame from a black blit (2026-10-08, the trashcan's metal).
-            if frames == 0 {
+            // Debug: KAMI_DUMP=<path> keeps the latest frame's PNG (the first
+            // one is usually a blank page still loading), to tell a black
+            // frame from a black blit (2026-10-08, the trashcan's metal).
+            if poll_ms.is_none() {
                 if let Some(path) = std::env::var_os("KAMI_DUMP") {
                     let _ = std::fs::write(path, &bytes);
                 }
@@ -452,6 +453,9 @@ fn session(args: &Args) -> io::Result<()> {
                         Ok(true) => {
                             let tb = Instant::now();
                             fb.blit(&png.pixels, png.width, png.height, png.channels, args.scale);
+                            if let Some(path) = std::env::var_os("KAMI_DUMP") {
+                                let _ = std::fs::write(path, &shot);
+                            }
                             frames += 1;
                             if frames <= 3 || frames % 30 == 0 {
                                 eprintln!(
