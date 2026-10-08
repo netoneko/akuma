@@ -80,7 +80,7 @@ def set_ip(ip):
 set_ip(IP)
 
 # The Ryzen laptop: one machine, one OS, the ordinary laptop user account.
-RYZEN_HOST = "192.168.1.126"
+RYZEN_HOST = os.environ.get("RYZEN_HOST", "192.168.1.126")
 RZ = [
     "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
     "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",

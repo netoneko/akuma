@@ -205,6 +205,14 @@ impl Desc {
         }
     }
 
+    /// The same descriptor with software sequence number `seq`; the chip
+    /// writes it into the header, so 0 here means 0 on the air.
+    #[must_use]
+    pub const fn with_seq(mut self, seq: u16) -> Self {
+        self.seq = seq;
+        self
+    }
+
     /// An encrypted data frame: `QSEL_BE` on ACH0, software sequence.
     /// `agg_en` stays off — with no ADDBA session an aggregated frame would
     /// never be acknowledged.

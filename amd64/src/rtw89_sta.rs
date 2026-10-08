@@ -40,7 +40,7 @@
 //! box. The replays themselves are bounded busy stretches (`JOIN1` is the
 //! longest, ~0.2 s).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use akuma_ieee80211::{beacon, ccmp};
 use akuma_ieee80211::sta::{self, Amsdu, AssocResp, Auth, Data, Goodbye};
@@ -123,6 +123,15 @@ static LAST_SCAN_SIG: AtomicU32 = AtomicU32::new(0);
 /// 2nd, 4th, 8th... attempt is logged, so the lines that came before the loss
 /// stay in the log ring.
 static FAILS: AtomicU32 = AtomicU32::new(0);
+/// The BSSID that last sent us away or failed a join (packed, 0 = none). With
+/// two access points on one SSID, `find` takes the other while it can: the
+/// bad one kept refusing the same station for minutes (measured on ryzen
+/// 2026-10-08) while its neighbour accepted at once.
+static BAD_BSS: AtomicU64 = AtomicU64::new(0);
+
+fn pack_bssid(b: &Bssid) -> u64 {
+    b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x)) | (1 << 48)
+}
 
 fn loud(n: u32) -> bool {
     n <= 1 || n.is_power_of_two()
@@ -307,15 +316,11 @@ extern "C" fn daemon() -> ! {
 struct Peer {
     bssid: Bssid,
     supplicant: Supplicant,
-    /// Software sequence number for frames of tid 7 (EAPOL).
-    seq: u16,
     /// The pairwise key is in the card: EAPOL goes out encrypted from here
     /// on, as 802.11 wants a retransmitted message 4 or a group message 2.
     keyed: bool,
-    /// The CCMP packet number of the last protected frame sent, and the tid-0
-    /// sequence number of the next.
+    /// The CCMP packet number of the last protected frame sent.
     pn: u64,
-    data_seq: u16,
     /// The highest CCMP packet number received, per key and TID.
     replay: ccmp::Replay,
 }
@@ -594,7 +599,13 @@ impl Station {
     fn find(&mut self, card: &mut Card, ssid: &Ssid, bssid: Option<Bssid>) -> Option<Bss> {
         let look = || {
             STATUS.lock().as_ref().and_then(|s| {
-                s.results().iter().copied().find(|b| b.ssid == *ssid && bssid.is_none_or(|w| w == b.bssid))
+                let bad = BAD_BSS.load(Ordering::Relaxed);
+                let mut ok = s.results().iter().copied().filter(|b| b.ssid == *ssid && bssid.is_none_or(|w| w == b.bssid));
+                let first = ok.next()?;
+                if pack_bssid(&first.bssid) != bad {
+                    return Some(first);
+                }
+                Some(ok.next().unwrap_or(first))
             })
         };
         if let Some(b) = look() {
@@ -659,6 +670,9 @@ impl Station {
     /// hearing its beacons): drop the association and rejoin at once, on the
     /// running card (`JOIN2`..`JOIN4` overwrite the old peer's entries).
     fn link_lost(&mut self) {
+        if let Some(p) = self.peer.as_ref() {
+            BAD_BSS.store(pack_bssid(&p.bssid), Ordering::Relaxed);
+        }
         self.peer = None;
         // The access point may have moved: the cached scan result would send
         // the rejoin to the channel it just left. Rescan, hint channel first.
@@ -762,7 +776,8 @@ impl Station {
             Some(0) => say("auth: accepted"),
             Some(st) => {
                 say_dec("auth: refused, status", u64::from(st));
-                return Err(JoinError::AuthFailed);
+                BAD_BSS.store(pack_bssid(&bss.bssid), Ordering::Relaxed);
+                return Err(JoinError::Timeout); // the access point's mood, not the key
             }
         }
 
@@ -778,7 +793,8 @@ impl Station {
         })?;
         if resp.status != 0 {
             say_dec("assoc: refused, status", u64::from(resp.status));
-            return Err(JoinError::Unsupported);
+            BAD_BSS.store(pack_bssid(&bss.bssid), Ordering::Relaxed);
+            return Err(JoinError::Timeout);
         }
         say_dec("assoc: accepted, aid", u64::from(resp.aid));
         self.vars.aid = resp.aid;
@@ -795,11 +811,9 @@ impl Station {
         let mut peer = Peer {
             bssid: bss.bssid,
             supplicant: Supplicant::new(psk, bss.bssid, MAC, snonce, &sta::RSN_IE),
-            seq: 0,
             keyed: false,
             pn: 0,
             replay: ccmp::Replay::new(),
-            data_seq: 0,
         };
         let deadline = now_us() + HANDSHAKE_MS * 1000;
         let mut mic_failures = 0u32;
@@ -1218,6 +1232,22 @@ fn send(card: &mut Card, which: usize, frame: &[u8], d: tx::Desc) -> Result<(), 
     })
 }
 
+/// Next software sequence number for a data frame. One counter for the whole
+/// run, never restarted by a join: the access point keeps duplicate/reorder
+/// state per station across a deauthentication (and across our reboots, the
+/// MAC being fixed), so a counter that starts again at 0 gets every frame
+/// dropped as old or duplicate while management frames (hardware counter)
+/// still pass. The first value is random for the same reason.
+fn next_seq() -> u16 {
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    if NEXT.load(Ordering::Relaxed) == u32::MAX {
+        let mut r = [0u8; 2];
+        let seed = if crate::net::rng_fill_checked(&mut r) { u32::from(u16::from_le_bytes(r)) } else { (now_us() & 0xfff) as u32 };
+        let _ = NEXT.compare_exchange(u32::MAX, seed & 0xfff, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    (NEXT.fetch_add(1, Ordering::Relaxed) & 0xfff) as u16
+}
+
 /// A protected data frame to `da` through the access point: QoS, tid 0,
 /// the **Protected** bit set and no CCMP header — the 8852C writes the header
 /// from the packet number in the descriptor (`hw_sec_hdr`; the recording's
@@ -1225,11 +1255,10 @@ fn send(card: &mut Card, which: usize, frame: &[u8], d: tx::Desc) -> Result<(), 
 /// pairwise key in security-CAM entry 0.
 fn send_protected(card: &mut Card, peer: &mut Peer, da: &Bssid, ethertype: u16, payload: &[u8]) -> Result<(), JoinError> {
     let mut f = [0u8; sta::QOS_HDR_LEN + 8 + FRAME_MAX];
-    let seq = peer.data_seq;
+    let seq = next_seq();
     let len = sta::data_frame(&mut f, &peer.bssid, &MAC, da, 0, seq, None, ethertype, payload)
         .ok_or(JoinError::Timeout)?;
     f[1] |= 0x40; // Protected
-    peer.data_seq = (seq + 1) & 0xfff;
     peer.pn += 1;
     let sec = tx::Sec { cam_idx: 0, keyid: 0, pn: peer.pn };
     send(card, TX_DATA, &f[..len], tx::Desc::data(len as u16, 0, seq, sec))
@@ -1251,10 +1280,10 @@ fn send_eapol(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinE
 /// protected reply is unreadable to it and it gives up with a deauthentication.
 fn send_eapol_clear(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinError> {
     let mut f = [0u8; sta::QOS_HDR_LEN + 8 + eapol::HDR_LEN + eapol::MAX_KEY_DATA];
-    let len = sta::data_frame(&mut f, &peer.bssid, &MAC, &peer.bssid, 7, peer.seq, None, sta::ETHERTYPE_EAPOL, body)
+    let seq = next_seq();
+    let len = sta::data_frame(&mut f, &peer.bssid, &MAC, &peer.bssid, 7, seq, None, sta::ETHERTYPE_EAPOL, body)
         .ok_or(JoinError::Timeout)?;
-    peer.seq = (peer.seq + 1) & 0xfff;
-    send(card, TX_EAPOL, &f[..len], tx::Desc::eapol(len as u16, 0))
+    send(card, TX_EAPOL, &f[..len], tx::Desc::eapol(len as u16, 0).with_seq(seq))
 }
 
 /// Wait up to `ms` for a release report past `seen`: the chip has finished
