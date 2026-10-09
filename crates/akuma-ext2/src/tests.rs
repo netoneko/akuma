@@ -2559,6 +2559,13 @@ fn ftruncate_shrink_walks_every_indirection_level() {
 #[test]
 fn rewrite_truncate_rename_and_concurrent_append_keep_files_apart() {
     extern crate std;
+    // Serialized with the pin tests (2026-10-09): this test frees inodes (the
+    // rename over `/tmp/big`), and the pin table is keyed on the inode number
+    // alone, so a pin test running in parallel on another mount could defer
+    // one of those frees — leaving an unlinked, still-allocated inode for the
+    // `e2fsck` oracle below to report. It failed the pre-commit hook that way
+    // about once in ten full-suite runs and never when run alone.
+    let _serial = pin_test_serial();
     let dev = RecordingDevice::from_fixture("manyinodes.ext2");
     // A real clock: with `|| 0` every freed inode's `dtime` is 0, which
     // `e2fsck` reports as "deleted inode has zero dtime" — the fixture's
