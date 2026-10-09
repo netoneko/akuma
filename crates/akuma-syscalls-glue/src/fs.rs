@@ -1092,7 +1092,18 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
                 if let Some(ch) = akuma_exec::process::current_channel() {
                     let translated_buf;
-                    let data_to_write: &[u8] = if ch.is_stdin_closed() {
+                    // ONLCR is a property of a terminal, so only a terminal
+                    // channel translates (2026-10-09). This read only
+                    // `is_stdin_closed`, which for an ssh *exec* session (no
+                    // pty) is a race against the client's stdin EOF: every
+                    // `write` before sshd processed it had `\n` -> `\r\n`
+                    // applied, every one after did not. `dd bs=1M count=2`
+                    // over `ssh host cmd` came back 1373 bytes long in 2 of 3
+                    // runs — each newline of the first 1 MiB write doubled,
+                    // none of the second — which is the "sshd corrupts a large
+                    // stdout stream" open item in
+                    // `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`.
+                    let data_to_write: &[u8] = if !ch.is_terminal() || ch.is_stdin_closed() {
                         buf_slice
                     } else if let Some(ts_lock) = akuma_exec::process::current_terminal_state() {
                         translated_buf = ts_lock.lock().translate_output(buf_slice);
