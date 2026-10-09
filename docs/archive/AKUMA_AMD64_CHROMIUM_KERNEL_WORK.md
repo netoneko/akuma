@@ -794,6 +794,87 @@ file is still worth having (a live renderer's write now succeeds), and the line
 is still non-fatal; what it points at is children dying right after fork, which
 is the thing to chase (see the Tumblr entry in `userspace/kami/README.md`).
 
+## Fixes 29-30 (2026-10-09): `mprotect` stranded every page a `PROT_NONE` had hidden
+
+**Symptom.** `userspace/kami/probe/nav_try.py` (two 40-row local pages that link
+to each other at the bottom; scroll, `G`, hint, click, repeat): hops 1 and 2
+landed in 2 s, **hop 3 never did**, on every run. kami then sat in hint mode:
+`Runtime.evaluate` got no reply and the wheel no frame. The same shape had killed
+Tumblr's tab after ~100 s (Fix 25). It looked like a hung renderer; it was a
+dead one.
+
+**How it was found** (each step is a thing the kernel could not say before, and
+is now logged):
+
+1. `/proc` showed no `CrRendererMain`: the renderer was gone, not hung.
+2. The kernel logged nothing about the crash, because Chromium's crashpad
+   installs a SIGSEGV handler, so a fault is *delivered* and only the handler's
+   later death is a `[Fault]`. `deliver_fault_signal` already had a `[sig!]` line
+   but only under `strace_err`; it now logs the first 64 per boot always
+   (`FAULT_SIGNAL_LOG_CAP`). Result: four zygote children at the same `rip`,
+   `sig=11 code=0x2` (`SEGV_ACCERR`), i.e. a write to a *present* page.
+3. The `[Fault]` line's `cr2` was **stale** (the handler runs other faults before
+   the process dies; it named a library text page for a crash in an allocator
+   pool), so the region and PTE for the *real* address (`[sig!]`'s `addr=`) are
+   now logged beside it: `[sig!-at] region ... prot=Prot(3)` and
+   `[sig!-at] pte write=false exec=false marked=false refs=0`. The region said
+   **RW**; the page table said **inaccessible**. (The region lookup has to use the
+   address-space *owner*'s table: a `CLONE_THREAD` thread's own `mmap_regions` is
+   empty by construction, which first read as "0 regions" and was my probe's
+   mistake, not the kernel's.)
+4. `rip` was `mov %rsi,(%rdi)` followed by a compare against a pool base:
+   PartitionAlloc writing a freelist pointer into memory it had just recommitted.
+   Its decommit is `mprotect(PROT_NONE)` (+ `madvise(DONTNEED)`), its recommit
+   `mprotect(PROT_READ|PROT_WRITE)`.
+
+**Cause (Fix 29).** `PteProt::from_region(NONE)` is `KERNEL_RO`, i.e.
+`user = false`, so `mprotect(NONE)` rewrites a present page to a PTE ring 3
+cannot touch. `sys_mprotect`'s leaf rewrite then began with
+`if !leaf.prot.user { return LeafAction::Keep; }` — written for kernel pages
+that "should never be in a user range" — which also skipped **every page a NONE
+had hidden**. The recommit changed the *region* back to RW and left the *page*
+inaccessible for good; the next store was a `#PF` protection fault on memory the
+region called writable. Every renderer died at its first decommit/recommit cycle
+inside a pool, which in the click-through is the third document load.
+
+**Fix 29.** `amd64/src/mm.rs::sys_mprotect`: an inaccessible leaf is skipped only
+when the request is itself `PROT_NONE` (nothing to take away); a grant
+re-permissions it.
+
+**Fix 30 (same `user` test, other call).** `dontneed_range` had two early
+`Keep`s: `!leaf.prot.user`, and "region is `PROT_NONE`". So `madvise(DONTNEED)`
+after `mprotect(NONE)` — one of the two orders allocators use — left the old
+bytes behind a recommit, where the allocator expects zeros. Both are gone: a
+*present* page in a NONE region is memory that was committed and hidden, so
+DONTNEED zeroes it like any other (an absent page is never visited, so guard
+pages stay frameless); a genuine kernel page is excluded by the region lookup
+that follows (it is in no region).
+
+**Verified (ryzen metal, 2026-10-09).**
+
+| | before | after |
+|---|---|---|
+| `nav_try.py --hops 8` | hop 3 FAILED, 2 of 8, every run | **8 of 8**; 48 inputs, 70 frames, 0 inputs without a later frame |
+| `stable_try.py --runs 8` (cold starts, local page, scroll) | 6 of 8 | **8 of 8**, median key->frame 119-144 ms |
+| kernel `[sig!]`/`[Fault]` lines during a run | 4+ per run | 0 |
+| `decommitprobe` (`userspace/forktest/c_stress`) | `A first page writable FAIL`, then dies | 36 checks ok, PASS |
+
+The probe's negative control is the pre-fix kernel binary (hash `b584646b…`),
+restored afterwards (`371388ea…`). **No Linux control was run**; see the probe's
+header. A heal-on-fault in `cow_write_fault` was tried first and removed: it
+never fired because that handler bails out on `!prot.user` before any decision,
+which was itself the clue that the PTE was a NONE leaf.
+
+**Not fixed, and now separable from this:** Tumblr still paints one frame and
+stops. The renderer is alive; the *network service* crashes ~3-5 s into every
+session (`Network service crashed or was terminated, restarting service`, once
+per Chromium start, with a `sig=5` / `int3` CHECK from the main binary in the
+kernel log, next to `CreatePlatformSocket() failed: Address family not supported
+by protocol (97)`), and local files never need it. Chasing that is the next step.
+A guess worth testing rather than believing: the earlier minutes-long wedges
+after a hung tree was killed (below) may have been crashpad's `tgkill` flood from
+dead renderers, which these fixes stop producing.
+
 ## Scoreboard: kernel bugs found by running kami / Chromium
 
 Kept here so the count survives; update the row, not the prose, when something
@@ -827,11 +908,13 @@ and should be linked from here (done in the last column).
 | 26 | `kill(2)` took the AArch64 hard-kill path: BKL wedge after a Chromium tree `kill -9`, 2 s per threaded kill, leaked thread rows | fixed 10-09 | `AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`; symptom row in `docs/README.md` |
 | 27 | `/proc/cpuinfo` did not exist on either kernel (`Failed to initialize cpuinfo`) | **fixed and booted on the metal 10-09** (Ryzen 7 8845HS, family 25 model 117, 8 blocks) | "Still open" list above; glue `proc.rs`, `amd64/src/cpuinfo.rs` |
 | 28 | `/proc/<pid>/oom_score_adj` (+ `oom_adj`, `oom_score`) did not exist | **fixed and booted 10-09**, but it was *not* the cause of the `Failed to adjust OOM score` log line (still printed: the named children are already dead) | Fix 28 above |
+| 29 | **`mprotect` skipped every page a `PROT_NONE` had made `user = false`, so a recommit never took**: PartitionAlloc's pool pages stayed inaccessible, every renderer died at its first decommit/recommit (the third document load) | **fixed and booted 10-09; `nav_try` 8/8, `stable_try` 8/8, `decommitprobe` PASS (negative control FAIL)** | Fixes 29-30 above |
+| 30 | `madvise(DONTNEED)` skipped present pages of a `PROT_NONE` region and `user = false` pages: old bytes behind a recommit | **fixed and booted 10-09** (`decommitprobe`) | Fixes 29-30 above |
 
-Score: 28 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path
-and the two `/proc` files), of which Fix 7 is tooling, so **27 kernel bugs**;
-26 verified live, **1 (25) in tree and booted but not yet shown to be what
-fixes Tumblr**; 7 open items below.
+Score: 30 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path,
+the two `/proc` files, and the two `mprotect`/`madvise` fixes), of which Fix 7 is
+tooling, so **29 kernel bugs**; 28 verified live, **1 (25) in tree and booted but
+not shown to be what unblocks Tumblr**; 7 open items below.
 
 **Open, found by the same work, not fixed:**
 
@@ -843,7 +926,7 @@ fixes Tumblr**; 7 open items below.
 | wifi TX path drops 43 % of packets, ~65 KB/s ceiling | Fix 25 above; `userspace/kami/README.md` § "Tumblr: why scrolling stopped" (outside) |
 | ~1 in 4 Chromium cold starts die (SIGSEGV/SIGTRAP), cause unknown | "kami on ryzen, 2026-10-09" above |
 | **sshd corrupts a large stdout stream, non-deterministically**: `cat` of the 9.16 MB kernel over ssh gave 3 different SHA-256s in 3 runs (`d555…`, `1228…`, one correct) and once 10 KB more bytes than the file; the same file through local pipes on Akuma (`cat \| sha256sum`, `dd \| sha256sum`) was correct 4 of 4, and a plain HTTP `curl -T` upload of it was byte-identical. Not wire corruption (TCP checksums), so it is in sshd or the kernel's socket/pipe path before the NIC. Use HTTP for binaries until it is found | 2026-10-09; no investigation yet |
-| **A renderer stops answering CDP on the third document load** (`userspace/kami/probe/nav_try.py`: two local pages linking to each other; hops 1-2 land in 2 s, hop 3 never, 2 of 2 runs; `Runtime.evaluate` gets no reply and the wheel event no frame). Local pages, no network involved, so the network-service crash below is not its cause | 2026-10-09; renderer thread state not yet captured |
+| ~~**A renderer stops answering CDP on the third document load**~~ — **fixed 2026-10-09 (Fixes 29-30)**: the renderer was dead, killed by an inaccessible page under an RW region | closed |
 | **Killing a hung Chromium tree wedges the box's userspace for minutes**: after that hang, `kami --kill; killall chromium` did not return for 90 s+, `ssh` commands hung for ~4 min (recovered by itself, same boot), and the second time for 15+ min (ping and the ssh port still answered, high latency, no command ran). The known class (`[BKL] stuck ... tag=501` after `kill -9` of a Chromium tree, see "kami on ryzen" above); this kernel carries the 2026-10-09 native SIGKILL path, which did not cure it for a *hung* tree | 2026-10-09; needs a reboot to recover |
 | **Tumblr loads nothing on the 2026-10-09 kernel**: navigation commits, one first frame, then no frames and no load event; `Network service crashed or was terminated, restarting service` ~3 s after the page starts (crashpad's `ptrace: Function not implemented` + a `tgkill` flood follow), and the restarted service logs `CreatePlatformSocket() failed: Address family not supported by protocol (97)`. A local `file://` page renders and scrolls fine (121 ms key->frame). Not yet separated into: this kernel (it also carries the AF_UNIX-park and kill-path commits of 2026-10-09 that the earlier, working kernel lacked), the new renderer-cap flags, or a flaky network service | `userspace/kami/README.md` § "Tumblr: why scrolling stopped" |
 | missing rows/files list (`sendfile`, `inotify_init`, `/proc/cpuinfo`, ...) | "Still open: what Chromium hits" above |

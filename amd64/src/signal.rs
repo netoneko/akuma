@@ -564,6 +564,12 @@ fn enter_handler(
     DELIVERED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// How many handler-caught faults this boot has logged; see
+/// [`FAULT_SIGNAL_LOG_CAP`].
+static FAULT_SIGNAL_LOGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Handler-caught faults logged per boot with no `strace_err`.
+const FAULT_SIGNAL_LOG_CAP: u32 = 64;
+
 /// **Turn a ring-3 CPU fault into a `SIGSEGV` its own handler can catch.**
 ///
 /// Called from `idt.rs`'s `#PF` and `#GP` dispatchers for a fault that nothing
@@ -631,7 +637,16 @@ pub fn deliver_fault_signal(
     // reporter — Chromium's crashpad — swallows the rest. Found 2026-10-08,
     // when a zygote child crashed before it could ping and the only trace was
     // the browser's "Did not receive ping".
-    if crate::usermode::SYSCALL_TRACE_ERRORS.load(Ordering::Relaxed) {
+    //
+    // **Also logged without `strace_err`, for the first `FAULT_SIGNAL_LOGS`
+    // faults of a boot** (2026-10-09): a crashpad-wrapped Chromium renderer
+    // died at its third document load and the kernel log said nothing at all —
+    // no `[Fault]`, because a handler took it — so the signal, `rip` and
+    // address that name the crash were never recorded. A healthy boot sees few
+    // of these (V8's wasm traps use the same path, hence the cap).
+    if crate::usermode::SYSCALL_TRACE_ERRORS.load(Ordering::Relaxed)
+        || FAULT_SIGNAL_LOGS.fetch_add(1, Ordering::Relaxed) < FAULT_SIGNAL_LOG_CAP
+    {
         akuma_primitives::tprint!(
             160,
             "[sig!] pid={} task={} sig={sig} code={si_code:#x} rip={:#x} addr={addr:#x} -> handler {:#x}\n",
@@ -640,6 +655,47 @@ pub fn deliver_fault_signal(
             frame.rip,
             entry,
         );
+        // What the region table and the page table each say about `addr` — the
+        // two that disagree when a write is refused for a present page. `cr2`
+        // in a later `[Fault]` line cannot be used for this: the handler this
+        // signal enters runs other faults before the process dies, so by then
+        // `cr2` names one of those (2026-10-09: it read a library text page for
+        // a crash whose address was in an allocator pool).
+        {
+            let a = addr as usize;
+            // The address-space owner's table, not this thread's: a
+            // `CLONE_THREAD` thread's own `mmap_regions` is empty by
+            // construction (`Process::new`), the regions live on the owner.
+            let owner = akuma_exec::process::address_space_owner_pid_for_fault()
+                .and_then(akuma_exec::process::lookup_process_shared)
+                .unwrap_or_else(|| proc.clone());
+            let regions = owner.mmap_regions.lock();
+            let mut found = false;
+            for r in akuma_mmap::regions_overlapping(&regions, a, a + 1) {
+                if r.contains(a) {
+                    found = true;
+                    akuma_primitives::tprint!(
+                        160,
+                        "[sig!-at] region va={:#x} pages={} prot={:?} file={} sw={}\n",
+                        r.start_va, r.pages, r.prot, r.file.is_some(), r.shared_write.is_some(),
+                    );
+                }
+            }
+            if !found {
+                akuma_primitives::tprint!(96, "[sig!-at] no region covers {addr:#x} ({} regions)\n", regions.len());
+            }
+            drop(regions);
+            let uas = crate::idt::faulting_address_space();
+            let pg = a & !0xfff;
+            match (uas.pte_prot(pg), uas.translate(pg)) {
+                (Some((pp, marked)), Some(pa)) => akuma_primitives::tprint!(
+                    160,
+                    "[sig!-at] pte write={} exec={} marked={} refs={} pa={:#x}\n",
+                    pp.write, pp.exec, marked, akuma_pmm::cow_ref_get(pa & !0xfff), pa & !0xfff,
+                ),
+                _ => akuma_primitives::tprint!(96, "[sig!-at] no PTE for {pg:#x}\n"),
+            }
+        }
     }
     install_handler_frame(frame, regs, &next);
     enter_handler(sig, idx, &action, proc, tid);

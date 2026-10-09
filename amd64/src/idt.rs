@@ -1259,7 +1259,7 @@ fn describe_page_fault(code: PageFaultCode) {
 /// never has anything to lose. The *real* ledger update happens against the
 /// **owner** process under the hold taken below, which is where a replaced
 /// frame has to be recorded.
-fn faulting_address_space() -> akuma_mmu::UserAddressSpace {
+pub(crate) fn faulting_address_space() -> akuma_mmu::UserAddressSpace {
     // `new_shared` cannot fail on this target — it allocates nothing — but it
     // returns `Option` because the shared callers in `akuma-exec` are written
     // against a fallible constructor. An `expect` here would be a panic in the
@@ -1596,8 +1596,40 @@ fn user_fault(
                 if r.contains(fa) {
                     covered = true;
                     let _ = core::fmt::write(&mut w, format_args!(
-                        "  [Fault-REGION] cr2 inside va={:#x} pages={} file={} sw={}\n",
-                        r.start_va, r.pages, r.file.is_some(), r.shared_write.is_some()));
+                        "  [Fault-REGION] cr2 inside va={:#x} pages={} file={} sw={} prot={:?}\n",
+                        r.start_va, r.pages, r.file.is_some(), r.shared_write.is_some(), r.prot));
+                    // What the page table says about the page, beside what the
+                    // region says it should be: a write fault the CoW handler
+                    // refused is `read-only PTE, no marker`, and whether the
+                    // *region* allows the write is the whole question
+                    // (2026-10-09: four Chromium zygote children died on this
+                    // at one `rip` and the log could not say which side was
+                    // wrong). `refs` is the global CoW share count.
+                    // The allocator reservations too (>= 1 GiB): a forked child
+                    // whose region list lost or clipped one is how an
+                    // allocator ends up writing into somebody else's pages.
+                    let mut shown = 0u32;
+                    for g in regions.iter().filter(|g| g.pages >= 262_144).take(6) {
+                        shown += 1;
+                        let _ = core::fmt::write(&mut w, format_args!(
+                            "  [Fault-BIG] va={:#x} pages={} prot={:?} file={}\n",
+                            g.start_va, g.pages, g.prot, g.file.is_some()));
+                    }
+                    let _ = core::fmt::write(&mut w, format_args!(
+                        "  [Fault-BIG] {} region(s) of >= 1 GiB shown, {} regions in all\n", shown, regions.len()));
+                    let uas = faulting_address_space();
+                    let pg = fa & !0xfff;
+                    match (uas.pte_prot(pg), uas.translate(pg)) {
+                        (Some((pp, marked)), Some(pa)) => {
+                            let _ = core::fmt::write(&mut w, format_args!(
+                                "  [Fault-PTE] write={} exec={} user={} marked={} refs={} pa={:#x}\n",
+                                pp.write, pp.exec, pp.user, marked,
+                                akuma_pmm::cow_ref_get(pa & !0xfff), pa & !0xfff));
+                        }
+                        _ => {
+                            let _ = core::fmt::write(&mut w, format_args!("  [Fault-PTE] no leaf for {pg:#x}\n"));
+                        }
+                    }
                 }
             }
             if !covered {

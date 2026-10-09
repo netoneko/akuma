@@ -63,6 +63,12 @@ for h in range(hops):
     landed += ok
     print(f"hop {h+1}: -> {target}: {'OK' if ok else 'FAILED'} after {time.time()-t1:.1f} s")
     if not ok:
+        # Is it the renderer, or the whole box? Time a trivial command, then read
+        # the kernel's own numbers (heap via Slab, live pipes, BKL waits).
+        t2 = time.time()
+        health = remote("uptime; grep -E 'Slab|MemFree' /proc/meminfo; dmesg | grep -a -c 'bkls>'; "
+                        "dmesg | grep -a '\\[PIPES\\]' | tail -1", 120)
+        print(f"---- box health at the hang (a trivial ssh command took {time.time()-t2:.1f} s) ----"); print(health)
         # Freeze-frame of the hung renderer(s): per-thread state and CPU, twice.
         snap = ('for f in $(grep -l -a "type=renderer" /proc/[0-9]*/cmdline 2>/dev/null); do p=${f%/cmdline}; '
                 'echo "renderer $(basename $p)"; for t in $p/task/*; do echo "  $(basename $t) $(cut -d" " -f2,3,14,15 $t/stat 2>/dev/null)"; done; done')

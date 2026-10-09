@@ -301,8 +301,9 @@ keep.
 - `nav_try.py HOST [--hops N]`: two 40-row pages (`testdata/pageA.html`,
   `pageB.html`, copied to `/tmp/` on the box) that link to each other at the
   bottom. From a cold Chromium: `j` x3, `G`, `f`, `a`, wait for the other page,
-  repeat. **2026-10-09 (twice, same result): hops 1 and 2 land in ~2 s, hop 3
-  never does.** The log at the hang: the third `G` produced no frame, `f`
+  repeat. **2026-10-09: hops 1 and 2 landed in ~2 s and hop 3 never did (every
+  run) until Fixes 29-30 of the Chromium record (the renderer was dying of an
+  `mprotect` bug); since then 8 of 8 hops land, every input gets a frame.** The log at the hang: the third `G` produced no frame, `f`
   sent `__kami.collect()` and no reply came back (the first two hops' replies
   took 10 ms), so the page's renderer stopped answering CDP after the third
   document load; kami then sat in hint mode. Reproducible, which is the point
@@ -580,3 +581,21 @@ build). This is the list Akuma has to cover:
   - 286 reads of `/proc/<pid>/task/<tid>/status`, plus `/proc/self/exe`;
   - `/sys/bus/usb` enumeration, and an `open` of `/dev/dri/renderD128` that
     may fail.
+
+## Stable on local files (2026-10-09)
+
+After Fixes 29-30 (`mprotect` re-grant of pages a `PROT_NONE` had hidden; see
+`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`): `probe/nav_try.py --hops 8`
+lands **8/8** with a frame after every input, `probe/stable_try.py --runs 8` is
+**8/8** (median key->frame 119-144 ms), and the kernel logs no `[sig!]`/`[Fault]`.
+`probe/akuma/decommitprobe` (the allocator's decommit/recommit cycle) pins it.
+
+What is still not stable: `https://www.tumblr.com` paints one frame and stops.
+The renderer lives; the **network service** dies ~3-5 s into each Chromium start
+(one `Network service crashed or was terminated` per session, an `int3` CHECK in
+the kernel log, `CreatePlatformSocket() ... (97)` beside it). Local pages never
+need it. Next: name that CHECK.
+
+When a run wedges, do not clean up a hung tree from a probe (`kami --kill;
+killall chromium`): it wedged the box's userspace for 4 and 15+ minutes twice on
+2026-10-09. Reboot instead.

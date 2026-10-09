@@ -2337,10 +2337,20 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     // new thing.
     let _ = usermode::with_current_address_space(|uas| {
         uas.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
-            // Kernel pages are not ring 3's to re-permission. Nothing should map
-            // one in a user range, and quietly rewriting it if something did is
-            // the dangerous half of the two mistakes.
-            if !leaf.prot.user {
+            // A page ring 3 cannot touch is either a kernel page (nothing should
+            // map one in a user range) or **user memory a `PROT_NONE` hid**:
+            // `PteProt::from_region(NONE)` is `KERNEL_RO`, so `mprotect(NONE)`
+            // rewrites a present page to `user = false`. Skipping those when
+            // *granting* access stranded every such page: the region went back
+            // to RW and the page stayed inaccessible, so the next write was
+            // `#PF` protection / `SEGV_ACCERR` on memory the region said was
+            // writable. That is how Chromium's PartitionAlloc (decommit =
+            // `mprotect(NONE)`, recommit = `mprotect(RW)`) killed every renderer
+            // at its third document load (2026-10-09, `[sig!-at] region ...
+            // prot=Prot(3)`, `pte write=false user=false`). Granting is
+            // therefore allowed to re-permission them; only a request for NONE
+            // leaves an inaccessible page alone (there is nothing to take away).
+            if !leaf.prot.user && new_prot.is_none() {
                 return LeafAction::Keep;
             }
             let shared = identity_shared.iter().any(|&(a, b)| leaf.va >= a && leaf.va < b);
@@ -2664,10 +2674,10 @@ fn dontneed_range(start: usize, end: usize) {
         let _ = usermode::with_current_address_space(|uas| {
         uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
             let (va, pa) = (leaf.va, leaf.pa);
-            // A kernel page in a user range is not ring 3's to zero.
-            if !leaf.prot.user {
-                return LeafAction::Keep;
-            }
+            // No `user` test here: a page a `PROT_NONE` hid is `user = false`
+            // and is still the program's memory (allocator decommit is
+            // `mprotect(NONE)` + `DONTNEED`, in either order). A genuine kernel
+            // page is excluded by the region lookup below — it is in no region.
             // Device memory (`/dev/fb0`) is not the program's to zero or to
             // replace with RAM: Linux's DONTNEED on it drops and re-faults the
             // same pixels, i.e. changes nothing visible. Keep it.
@@ -2677,10 +2687,13 @@ fn dontneed_range(start: usize, end: usize) {
             let Some(region) = regions.iter().find(|r| r.contains(va)) else {
                 return LeafAction::Keep;
             };
+            // A **present** page in a `PROT_NONE` region is memory that was
+            // committed and then hidden, so `DONTNEED` applies to it as to any
+            // other (an *absent* page is never visited, so guard pages stay
+            // frameless). The PTE it ends up with stays inaccessible: `pte_prot_for`
+            // maps NONE to `KERNEL_RO`. Skipping it left the old bytes behind a
+            // later `mprotect(RW)`, where the allocator expects zeros.
             let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
-            if prot.is_none() {
-                return LeafAction::Keep;
-            }
             // `MADV_DONTNEED` on a writable `MAP_SHARED` file mapping drops
             // the frame — which on Linux is free, because the page cache
             // already *has* the writes and a refault reads them back. Here

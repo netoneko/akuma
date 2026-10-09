@@ -9,7 +9,7 @@ set -e
 cd "$(dirname "$0")"
 IP=${HPBOX_IP:-192.168.1.120}
 C=../../../forktest/c_stress
-PROBES="exeprobe shmvar chromeprobe bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe capprobe fallocprobe jitprobe thrprobe killtree"
+PROBES="exeprobe shmvar chromeprobe bpprobe trapprobe spawnprobe singletonprobe snapprobe taskprobe credprobe capprobe fallocprobe jitprobe decommitprobe thrprobe killtree"
 for p in $PROBES; do
   x86_64-linux-musl-gcc -O2 -static -o "$p" "$C/$p.c"
 done
