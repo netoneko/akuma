@@ -73,6 +73,44 @@ pub fn merge(acc: &mut Vec<u8>, cur: &[u8]) -> bool {
     true
 }
 
+/// What a fresh ring snapshot `cur` adds to the previous one `prev`, for the
+/// append-only full log (`klog-N.all`).
+///
+/// Only `cur` and `prev` up to their last `\n` are considered: a trailing
+/// partial line is still being written and is picked up whole by the next pass. Of that, the
+/// longest prefix ending at a line end that is also a suffix of `prev` is what
+/// was already written; the rest is returned. `true` in the second field means
+/// no prefix overlapped a non-empty `prev`: the ring wrapped past everything
+/// between two passes and the caller should mark the gap. Byte-level, so a
+/// ring whose head is torn mid-line still matches.
+///
+/// Returns a borrow of `cur`; allocates nothing.
+pub fn new_tail<'a>(prev: &[u8], cur: &'a [u8]) -> (&'a [u8], bool) {
+    let Some(last) = cur.iter().rposition(|&b| b == b'\n') else {
+        return (&[], false);
+    };
+    let cur = &cur[..=last];
+    // The same cut applies to `prev`: its partial last line was never written.
+    let prev = match prev.iter().rposition(|&b| b == b'\n') {
+        Some(i) => &prev[..=i],
+        None => &[][..],
+    };
+    if prev.is_empty() {
+        return (cur, false);
+    }
+    // Longest overlap first: scan line ends from the right.
+    let mut m = cur.len();
+    loop {
+        if m <= prev.len() && prev.ends_with(&cur[..m]) {
+            return (&cur[m..], false);
+        }
+        match cur[..m - 1].iter().rposition(|&b| b == b'\n') {
+            Some(i) => m = i + 1,
+            None => return (cur, true),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +184,36 @@ mod tests {
         let mut acc = alloc::vec![b'x'; ACC_CAP];
         assert!(!merge(&mut acc, b"a\n"));
         assert_eq!(acc.len(), ACC_CAP);
+    }
+    #[test]
+    fn tail_first_pass_takes_complete_lines_only() {
+        assert_eq!(new_tail(b"", b"a\nb\npart"), (&b"a\nb\n"[..], false));
+    }
+
+    #[test]
+    fn tail_of_a_grown_ring_is_the_new_lines() {
+        assert_eq!(new_tail(b"a\nb\npar", b"a\nb\npartial done\nc\n"), (&b"partial done\nc\n"[..], false));
+    }
+
+    #[test]
+    fn tail_after_wrap_with_torn_head() {
+        // The ring lost "aaa\nb" and now starts mid-line.
+        assert_eq!(new_tail(b"aaa\nbbb\nccc\n", b"bb\nccc\nddd\n"), (&b"ddd\n"[..], false));
+    }
+
+    #[test]
+    fn tail_unchanged_ring_is_empty() {
+        assert_eq!(new_tail(b"a\nb\n", b"a\nb\n"), (&b""[..], false));
+    }
+
+    #[test]
+    fn tail_wrapped_past_everything_reports_a_gap() {
+        assert_eq!(new_tail(b"a\nb\n", b"x\ny\n"), (&b"x\ny\n"[..], true));
+    }
+
+    #[test]
+    fn tail_repeated_lines_take_the_longest_overlap() {
+        // "x\n" alone is also a suffix of prev; the whole "x\nx\n" must win.
+        assert_eq!(new_tail(b"x\nx\n", b"x\nx\ny\n"), (&b"y\n"[..], false));
     }
 }

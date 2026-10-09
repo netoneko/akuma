@@ -440,8 +440,121 @@ pub fn tsc_uptime_us() -> Option<u64> {
     }
     // SAFETY: unprivileged, reads no memory.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
+    // This core's TSC, moved onto the BSP's ([`tsc_sync_bsp`]). The kernel
+    // does not preempt itself, so the core the `rdtsc` ran on is the core
+    // `cpu_index` names.
+    let now = if TSC_OFFSETS_LIVE.load(Ordering::Relaxed) {
+        now.wrapping_sub(TSC_OFFSET[crate::smp::cpu_index()].load(Ordering::Relaxed) as u64)
+    } else {
+        now
+    };
     let delta = now.wrapping_sub(TSC_START.load(Ordering::Relaxed));
+    // A reading taken just after boot on a core whose corrected TSC is a hair
+    // behind `TSC_START` would wrap to ~2^64; clamp instead.
+    if delta > u64::MAX / 2 {
+        return Some(0);
+    }
     Some((u128::from(delta) * 1_000_000 / u128::from(hz)) as u64)
+}
+
+/// Per core: how far its TSC reads ahead of the BSP's, in TSC cycles,
+/// measured once at bring-up by [`tsc_sync_bsp`] / [`tsc_sync_ap`].
+///
+/// # Why
+///
+/// [`tsc_uptime_us`] is `CLOCK_MONOTONIC`, and it subtracts the BSP's
+/// `TSC_START` from whatever core's `rdtsc` the caller happens to run on. On
+/// a KVM guest the vCPUs' TSCs agree; on the ryzen's metal they did not —
+/// `wakelat` read a 1 ms spin between two `clock_gettime`s as -1 011 819 us and
+/// +1 019 192 us (2026-10-09), so a thread that migrated saw time run a second
+/// backwards. Chromium's network service CHECKs that a stream request ended no
+/// earlier than it started (`HttpNetworkTransaction`, the
+/// `Net.NetworkTransaction.StreamRequestCompleteTime4` histogram) and died on
+/// that `int3` ~4 s into every Chromium start on the metal, never under
+/// Firecracker.
+static TSC_OFFSET: [core::sync::atomic::AtomicI64; crate::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicI64::new(0) }; crate::smp::MAX_CPUS];
+/// Set once the first AP's offset is known. Before it the clock reads the raw
+/// TSC and never touches `gs` — [`tsc_uptime_us`] runs on the BSP before its
+/// per-CPU block exists.
+static TSC_OFFSETS_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Ping-pong rounds per AP; the round with the shortest round trip wins.
+const TSC_SYNC_ROUNDS: u64 = 64;
+/// BSP -> AP: "read your TSC for round N".
+static TSC_SYNC_REQ: AtomicU64 = AtomicU64::new(0);
+/// AP -> BSP: "round N answered".
+static TSC_SYNC_ACK: AtomicU64 = AtomicU64::new(0);
+/// The AP's TSC for the round in [`TSC_SYNC_ACK`].
+static TSC_SYNC_T: AtomicU64 = AtomicU64::new(0);
+/// BSP -> AP: offset stored for AP index N; it may now read the clock.
+static TSC_SYNC_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// The BSP half: measure AP `idx`'s TSC against this core's and record the
+/// offset. Call right after the AP reports online, with the AP inside
+/// [`tsc_sync_ap`]. Returns the offset in cycles (AP minus BSP).
+///
+/// Each round brackets the AP's read between two of the BSP's; the AP's
+/// reading is assumed to sit at the midpoint, so the error is at most half the
+/// round trip, and the shortest of [`TSC_SYNC_ROUNDS`] trips is the one kept
+/// (Linux's `tsc_sync` estimates the same way).
+pub fn tsc_sync_bsp(idx: usize) -> i64 {
+    let mut best_rtt = u64::MAX;
+    let mut best_off = 0i64;
+    TSC_SYNC_REQ.store(0, Ordering::SeqCst);
+    TSC_SYNC_ACK.store(0, Ordering::SeqCst);
+    for r in 1..=TSC_SYNC_ROUNDS {
+        // SAFETY: unprivileged, reads no memory.
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        TSC_SYNC_REQ.store(r, Ordering::SeqCst);
+        let mut spins = 0u32;
+        while TSC_SYNC_ACK.load(Ordering::SeqCst) != r {
+            spins += 1;
+            if spins > 50_000_000 {
+                // The AP never answered: leave its offset 0, as before.
+                return 0;
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        let t2 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t1 = TSC_SYNC_T.load(Ordering::SeqCst);
+        let rtt = t2.wrapping_sub(t0);
+        if rtt < best_rtt {
+            best_rtt = rtt;
+            let mid = t0.wrapping_add(rtt / 2);
+            best_off = t1.wrapping_sub(mid) as i64;
+        }
+    }
+    TSC_OFFSET[idx].store(best_off, Ordering::Relaxed);
+    TSC_OFFSETS_LIVE.store(true, Ordering::Release);
+    TSC_SYNC_DONE.store(idx as u64, Ordering::SeqCst);
+    best_off
+}
+
+/// The AP half of [`tsc_sync_bsp`]: answer every round, then wait until the
+/// BSP has stored this core's offset, so nothing here reads the clock before
+/// it is corrected.
+pub fn tsc_sync_ap(idx: usize) {
+    for r in 1..=TSC_SYNC_ROUNDS {
+        let mut spins = 0u32;
+        while TSC_SYNC_REQ.load(Ordering::SeqCst) != r {
+            spins += 1;
+            if spins > 50_000_000 {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: unprivileged, reads no memory.
+        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        TSC_SYNC_T.store(t1, Ordering::SeqCst);
+        TSC_SYNC_ACK.store(r, Ordering::SeqCst);
+    }
+    let mut spins = 0u32;
+    while TSC_SYNC_DONE.load(Ordering::SeqCst) != idx as u64 && spins < 50_000_000 {
+        spins += 1;
+        core::hint::spin_loop();
+    }
 }
 
 /// The tick period the timer is calibrated to, in microseconds. `net::uptime_us`
@@ -744,6 +857,67 @@ pub fn enable_and_check_clock() -> bool {
         core::hint::spin_loop();
     }
     ticks() > before
+}
+
+/// Per core: is the timer in one-shot mode for a deadline ([`arm_deadline`])?
+static ONESHOT: [AtomicBool; crate::smp::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::smp::MAX_CPUS];
+
+/// Times [`arm_deadline`] put a core's timer into one-shot mode.
+pub static ONESHOT_ARMS: AtomicU64 = AtomicU64::new(0);
+
+/// Before a `hlt`: if a parked thread's deadline falls before this core's next
+/// periodic tick, make the timer fire **at** that deadline instead.
+///
+/// # Why
+///
+/// A timed wait (`FUTEX_WAIT` with a timeout, so every
+/// `pthread_cond_timedwait`) parks with its deadline in `WAKE_TIMES`, and only
+/// `x86_wake_pass` moves it out — which runs when a core next schedules. A
+/// halted core schedules at its next interrupt, and with the periodic tick
+/// alone that is up to 10 ms after the deadline: `timerlat` measured a 1 ms
+/// futex wait at 10.0 ms median, 16 ms at 26.3 (2026-10-09; Linux +0.12 ms),
+/// and Chromium's frame pipeline is a chain of such waits.
+///
+/// # How
+///
+/// The LVT timer is switched to one-shot with an initial count equal to the
+/// time left, and [`restore_periodic`] puts the periodic tick back after the
+/// halt, whatever woke it. That restarts the period, so ticks shift phase;
+/// nothing reads the tick *count* as a clock once the TSC is calibrated, and
+/// this is a no-op otherwise. A shot that fires a hair before the deadline (the
+/// LAPIC and TSC rates come from one PIT measurement, not one oscillator) costs
+/// one more halt with a shorter shot, not a tick.
+///
+/// Only the halting core's own timer is touched, from that core with
+/// interrupts off; no lock, no allocation.
+pub fn arm_deadline() {
+    if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
+        return;
+    }
+    let Some(now) = tsc_uptime_us() else { return };
+    let Some(due) = akuma_threading::x86_earliest_wake_time() else { return };
+    let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+    // Already due: the wake pass will find it without a halt; arm the minimum
+    // so the halt ends at once if the caller halts anyway.
+    let left_us = due.saturating_sub(now);
+    let counts = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
+    // The periodic tick serves it as soon: leave the timer alone.
+    if counts >= u64::from(read(REG_TIMER_CUR)) {
+        return;
+    }
+    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+    write(REG_TIMER_INIT, counts as u32);
+    ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
+    ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// After the `hlt` [`arm_deadline`] prepared: back to the periodic tick, if
+/// this core left it.
+pub fn restore_periodic() {
+    if ONESHOT[crate::smp::cpu_index()].swap(false, Ordering::Relaxed) {
+        start_timer();
+    }
 }
 
 /// Stop the timer. Used after the smoke test so later output is not interleaved

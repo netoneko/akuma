@@ -503,6 +503,19 @@ Other findings from the same session:
 - A `chromium --screenshot --virtual-time-budget` run of Tumblr never finishes
   (the page keeps timers alive); use `kami`/CDP for a screenshot of a live page.
 
+## Tumblr on the metal, 2026-10-09 night: the network service's CHECK
+
+ryzen boot 89 (kernel `9e2f4669`, `smp=8`, netwatch off): `page_try.py
+https://www.tumblr.com/ --runs 3 --hold 90` -> 3/3 "survived", ready at ~23 s,
+and 3/3 final frames **blank white**. Every Chromium start loses its network
+service ~4 s in to one `int3` at the same address, a `CHECK(start <= end)` in
+`HttpNetworkTransaction`'s stream-request timing; the cause is cross-core
+`CLOCK_MONOTONIC` skew (up to ~1 s on this machine, none under KVM), which
+also explains why Firecracker never reproduced it. Fixed in tree as Fix 32
+(per-core TSC offset), with Fixes 33 (exec'd altstack) and 34 (timed waits) in
+`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`. Not yet re-run on the
+fixed kernel.
+
 ## Future: kami in a rio split pane
 
 The goal is to run `kami` inside one of [rio](../rio/build.sh)'s split

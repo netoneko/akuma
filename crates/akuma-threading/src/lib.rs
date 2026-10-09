@@ -3480,6 +3480,32 @@ fn x86_wake_pass() {
     }
 }
 
+/// The earliest wake deadline of any `WAITING` thread, on the
+/// `runtime().uptime_us` clock; `None` when no parked thread has one.
+///
+/// For a core about to halt: [`x86_wake_pass`] can only ready a timed-out
+/// thread when something runs it, and a halted core runs it at its next
+/// interrupt. With only the periodic tick, a deadline was served up to one tick
+/// late; the amd64 kernel arms a one-shot timer for this value instead
+/// (`amd64/src/lapic.rs`, `arm_deadline`). Lock-free and allocation-free; a
+/// racing wake or new park only makes the answer stale by one halt, and the
+/// halt's own wake path re-reads it.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_earliest_wake_time() -> Option<u64> {
+    let mut best = u64::MAX;
+    for i in 0..MAX_THREADS {
+        if THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::WAITING {
+            continue;
+        }
+        let t = WAKE_TIMES[i].load(Ordering::Relaxed);
+        if t != 0 && t < best {
+            best = t;
+        }
+    }
+    (best != u64::MAX).then_some(best)
+}
+
 /// The x86_64 cooperative switch: called from [`yield_now`]'s x86_64 arm and
 /// from [`schedule_blocking`]'s.
 ///

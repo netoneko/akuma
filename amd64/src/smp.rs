@@ -710,6 +710,16 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
                 continue;
             }
         }
+        // The AP is spinning in `tsc_sync_ap` now; measure its clock.
+        let off = lapic::tsc_sync_bsp(idx);
+        serial::puts("  smp:  cpu ");
+        serial::put_dec(idx as u64);
+        serial::puts(" tsc offset ");
+        if off < 0 {
+            serial::puts("-");
+        }
+        serial::put_dec(off.unsigned_abs());
+        serial::puts(" cycles\n");
         started += 1;
     }
     ONLINE.store(1 + started, Ordering::Release);
@@ -782,6 +792,9 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     // for this flag, and only lets go inside `yield_now`. Entering first would
     // be a two-party deadlock with a straight face.
     PERCPU[idx].online.store(true, Ordering::Release);
+    // Before anything here reads the clock: the BSP measures this core's TSC
+    // against its own (`lapic::tsc_sync_bsp`).
+    lapic::tsc_sync_ap(idx);
     serial::puts("  smp:  cpu ");
     serial::put_dec(index);
     serial::puts(" online (lapic id ");

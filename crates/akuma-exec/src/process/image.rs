@@ -325,6 +325,22 @@ impl Process {
         self.sigaltstack_sp.store(0, Ordering::Relaxed);
         self.sigaltstack_size.store(0, Ordering::Relaxed);
         self.sigaltstack_flags.store(2, Ordering::Relaxed); // SS_DISABLE
+        // **And the copy delivery actually reads** (2026-10-09). Signal frames
+        // are placed from the per-*thread-slot* altstack
+        // (`threading::get_sigaltstack`, set by `sigaltstack(2)` and inherited
+        // by `fork`), not from the three fields above, and an exec keeps its
+        // slot. So a forked child that exec'd still had its parent's altstack:
+        // an address in the *old* image that, in the new one, is whatever got
+        // mapped there. Chromium gives every thread an altstack, so every
+        // exec'd helper (zygote, utility processes) inherited one. The likely
+        // match on the ryzen: a browser child's CHECK `int3` was
+        // `[signal] sig 5 declined: frame write to 0x100002e38 failed`, the
+        // frame aimed at a read-only file mapping, so the handler never ran
+        // and the process died of the signal it meant to handle
+        // (`forktest/c_stress/altstackexec.c` reproduces the shape).
+        // Both exec paths (`replace_image_from`, amd64's `sys_execve`) call this
+        // on the exec'ing thread, so the current slot is the one to clear.
+        crate::threading::set_sigaltstack(crate::threading::current_thread_id(), 0, 0, 2);
 
         Ok(())
     }

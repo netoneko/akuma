@@ -201,7 +201,19 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         // its rustc 90 ms of CPU). A *timed* wait still needs the window —
         // its deadline is read off `uptime_us`, which does not advance while
         // `IF` is clear — so the hlt stays for that arm.
-        if deadline_at != deadline::NEVER {
+        //
+        // **And only on the tick clock** (2026-10-09). With the TSC
+        // calibrated, `uptime_us` reads the TSC and moves with `IF` clear, so
+        // the window is not needed — and it was the extra tick `timerlat`
+        // measured: this `hlt` ran on *every* pass, including the one after
+        // the wake-pass had already readied this thread at its deadline, so a
+        // 16 ms wait slept to the tick at 20 ms, parked, was readied there,
+        // and then halted to the tick at 30 ms before testing its deadline
+        // (measured 26.3 ms median: threads resume on cores whose ticks are
+        // out of phase; 1 ms -> 10.0). The park below halts the core when
+        // nothing else runs, against a one-shot armed for the deadline
+        // (`lapic::arm_deadline`).
+        if deadline_at != deadline::NEVER && crate::lapic::tsc_uptime_us().is_none() {
             crate::sched::allow_tick();
         }
         // Off the table is the wake. Checked with `iter` rather than `queue()`

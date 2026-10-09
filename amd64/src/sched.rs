@@ -911,8 +911,9 @@ pub fn block_current() {
 ///
 /// `deadline_us` is absolute, on the same clock as `net::uptime_us` — which is
 /// the clock `akuma_threading`'s own wake-pass compares against, so the two
-/// cannot drift. Resolution is the LAPIC tick (10 ms), so a shorter timeout
-/// rounds up to one tick rather than returning instantly.
+/// cannot drift. A halted core wakes for it through a one-shot timer
+/// (`lapic::arm_deadline`, 2026-10-09); a core busy in ring 3 serves it at its
+/// next tick (10 ms) at worst.
 pub fn block_until_deadline(deadline_us: u64) {
     note_yield(3);
     BLOCKS.fetch_add(1, Ordering::Relaxed);
@@ -1194,11 +1195,15 @@ pub fn idle_loop() -> ! {
             // is billed for every second it sleeps and `/proc/stat` shows no
             // idle at all (`threading::credit_halted_time`).
             let halt_started_us = akuma_primitives::clock::uptime_us();
+            // Wake at the earliest parked deadline, not the next tick
+            // (`lapic::arm_deadline`).
+            crate::lapic::arm_deadline();
             // SAFETY: interrupts on for exactly the `hlt`, then off again. The
             // timer vector is installed and its handler takes the BKL itself.
             unsafe {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
             }
+            crate::lapic::restore_periodic();
             threading::credit_halted_time(threading::current_thread_id(), halt_started_us);
         } else {
             smp::bkl_leave();
@@ -2050,11 +2055,15 @@ pub fn allow_tick() {
         if held {
             crate::smp::bkl_leave();
         }
+        // The parked caller's own deadline is in `WAKE_TIMES`; halt until it,
+        // not until the next tick (`lapic::arm_deadline`).
+        crate::lapic::arm_deadline();
         // SAFETY: interrupts on for exactly the `hlt`, then off again — the
         // same bracket `idle_loop` uses.
         unsafe {
             core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
         }
+        crate::lapic::restore_periodic();
         if held {
             crate::smp::bkl_enter();
         }
