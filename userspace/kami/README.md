@@ -114,6 +114,36 @@ that is a few fps, not 45.
 clocks that differ by up to about a second on Akuma, so lines can look out of
 order; the machine only ever uses the clock through a `max`.
 
+## Tumblr: why scrolling stopped (2026-10-09, ryzen)
+
+Telemetry from one `kami https://tumblr.com` session (`/tmp/kami-input.log`,
+`/tmp/kami.log`):
+
+- Cold Chromium: `Target.getTargets` answered 3.7-8.5 s after launch, every
+  time (`first message from chromium` at +7.5 s). Navigation to `www.tumblr.com`
+  committed after 4.6 s; first pixels at 25 s; `Page.loadEventFired` at 72 s.
+- **The last frame was presented at 118 s.** For the next ~600 s `j`/`k`,
+  ArrowDown, Tab and Enter reached kami (`tty chunk` -> `input` lines) and
+  produced no frame at all. `ps` showed no `CrRendererMain`: the tab's renderer
+  was gone and its CPU time was not moving.
+- Cause, from `/tmp/kami.log` at +101 s: ~40 renderers had been forked (site
+  isolation: one per cross-site iframe; pids 138 -> 400), then
+  `[zygote_linux.cc:426] FATAL Check failed: Too many open files in system (23)`,
+  `NOTREACHED hit. Did not receive ping from zygote child`, `Failed to send
+  GetTerminationStatus message to zygote`. `ENFILE` is `amd64/src/pipe.rs`'s
+  machine-wide `MAX_PIPES` (256; a `socketpair` is two pipes). Raised to 2048.
+  **Unverified live** until the kernel is rebuilt and tumblr reloaded.
+- kami does not react to a dead renderer (`Inspector.targetCrashed` /
+  `Target.targetCrashed` are not handled): the status bar says nothing and the
+  user sees a frozen page. Open.
+- Not the cause: the 990 ms `decode`/`blit` values in the log are the per-core
+  clock skew described above (a thread migrating between cores), not stalls.
+- Download speed, measured separately: 65 KB/s from a Mac on the LAN and 66 KB/s
+  from the internet, so the link/driver is the ceiling (`/dev/wifi0` counters:
+  `tx 3640, stack dropped 1556`, `retry-limit 54`). TLS/DNS setup is fine
+  (`tls=0.3 s`). That is why tumblr's `loadEvent` takes 72 s; it is not what
+  killed scrolling.
+
 ## Chromium flags, and what crashes it (2026-10-09, ryzen)
 
 `daemon.rs::chromium_args` is the list.

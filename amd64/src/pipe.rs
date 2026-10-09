@@ -81,6 +81,17 @@ pub type PipeId = usize;
 /// room, and its worst case (every pipe full at 64 KiB) is 16 MiB against
 /// `mem::HEAP_SIZE`'s 512 MB.
 ///
+/// **Raised 256 -> 2048 on 2026-10-09 for Chromium.** Every `socketpair(2)` is
+/// two glue pipes and counts here, and a site-isolated page like tumblr.com
+/// forks ~40 renderers in ~100 s, each with several IPC channels. The 257th
+/// live pipe made the zygote's `socketpair`/`pipe2` return `ENFILE` and its
+/// `CHECK` abort (`FATAL zygote_linux.cc:426: Too many open files in system`);
+/// with no zygote no renderer can start, the tab's renderer died and the page
+/// stopped producing frames — "scrolling does nothing" (`userspace/kami/README.md`
+/// § "Tumblr: why scrolling stopped"). Worst case at 2048 is 128 MiB of full
+/// pipes, still a quarter of the heap; `report`'s high-water mark says how
+/// close a workload gets.
+///
 /// The cap is **soft by one race**: `at_capacity` samples before
 /// `glue::pipe_create`, which has no ceiling of its own, so concurrent
 /// creators can land a few over it. That is why the measured high-water is 66
@@ -89,7 +100,7 @@ pub type PipeId = usize;
 ///
 /// **A policy, not a table rule**, which is why it lives here and the shared
 /// table does not have one.
-pub const MAX_PIPES: usize = 256;
+pub const MAX_PIPES: usize = 2048;
 
 /// The wake effect this kernel registers with the shared table.
 ///
