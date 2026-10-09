@@ -699,3 +699,114 @@ belongs beside them. It is now the `Slab:` line of `/proc/meminfo`
 Background: `userspace/kami/README.md` (the Ubuntu measurements and the
 `strace` summary), `docs/reference/subsystems/syscalls/net.md`,
 `docs/reference/subsystems/amd64-shared-write-mmap.md`.
+
+## Fix 25 (2026-10-09): the machine-wide pipe cap killed the zygote on a heavy page
+
+**Symptom.** `kami https://tumblr.com` on ryzen: the page loaded, then stopped
+responding. Scroll, arrow, Tab and Enter all reached kami (`tty chunk` ->
+`input` lines in `/tmp/kami-input.log`) and produced **no frame**: the last
+`presented` line was at 118 s and none followed for the ~600 s the log covered.
+`/proc` showed no `CrRendererMain` thread and the browser's CPU time was not
+moving, i.e. the tab's renderer was gone.
+
+**Evidence** (`/tmp/kami.log`, Chromium 152, +101 s into the session):
+
+    zygote_host_impl_linux.cc:300  Failed to adjust OOM score of renderer with pid 138 ... pid 400   (~40 renderers)
+    FATAL:zygote_linux.cc:426] Check failed: . : Too many open files in system (23)
+    NOTREACHED hit. Did not receive ping from zygote child
+    Failed to send GetTerminationStatus message to zygote
+
+Site isolation gives every cross-site iframe its own renderer, and tumblr.com
+has dozens (ads, trackers, embeds). Each renderer is forked by the zygote with
+several IPC channels (`socketpair`, `pipe2`).
+
+**Cause.** `amd64/src/pipe.rs`'s `MAX_PIPES = 256`, a machine-wide policy cap
+sampled by `at_capacity()` in front of `pipe2` (and by `alloc()` on the spawn
+path). A `socketpair(2)` is two glue pipes and counts against it but is not
+gated by it, so Chromium's IPC fills the table and the **next `pipe2` answers
+`ENFILE`**, which the zygote `CHECK`s. With no zygote nothing can start a
+renderer; the tab stays on a dead page. The 256 was sized from a `cargo build
+-j8` (peak 66) and said so in its own comment; nothing had measured a browser.
+
+**Fixes.**
+
+1. Kernel: `MAX_PIPES` 256 -> 2048 (commit `cf945f16`). Worst case 2048 full
+   pipes is 128 MiB against a 512 MB heap. **Not yet verified live**: it needs
+   a kernel rebuild and a boot of the ryzen box, which had not been done when
+   this was written. `[PIPES] live= high= refused= cap=` in the 30 s idle block
+   will show the real demand.
+2. kami, and the reason the kernel fix is not the whole answer: Chromium now
+   starts with `--disable-site-isolation-trials --renderer-process-limit=4` and
+   `IsolateOrigins,site-per-process` disabled (commit `fead7508`). Verified on
+   the box with the **old** 256-pipe kernel, one run: 4 renderers instead of
+   ~40, first pixels 15.6 s instead of 25.5 s, `loadEventFired` 31.8 s instead
+   of 72.8 s, no zygote FATAL, frames still arriving at 90 s.
+
+**Not the cause, checked.** The 990 ms `decode`/`blit` values in
+`kami-input.log` are the per-core clock skew (below), not stalls. `MAX_FDS`
+(256 per process) is not it either: the browser held 123 descriptors.
+
+**Also measured the same day (not kami's fault).** Downloads over ryzen's wifi
+ran at 65 KB/s from a Mac on the LAN and 66 KB/s from the internet, with TLS
+and DNS setup fast (`tls=0.3 s`). `/dev/wifi0`'s link counters read `tx 3640,
+stack dropped 1556` and `retry-limit 54`: 43 % of transmitted packets dropped
+in the rtw89 TX path. That is why tumblr's load takes tens of seconds even with
+the renderers fixed; it is a driver question, not investigated here.
+
+**Method note.** The telemetry already had the answer and no one had read the
+*absence* of `presented` lines after the last one; "scrolling is slow" was
+"scrolling produces nothing". The first thing to check on a frozen kami is
+`ps`/`/proc` for a renderer thread, then the end of `/tmp/kami.log`.
+
+## Scoreboard: kernel bugs found by running kami / Chromium
+
+Kept here so the count survives; update the row, not the prose, when something
+changes. "Outside" means the only record is somewhere other than `docs/archive/`
+and should be linked from here (done in the last column).
+
+| # | Bug | Status | Record |
+|---|---|---|---|
+| 1 | amd64 `sendmsg`/`recvmsg` on a unix fd: `ENOTSOCK` | fixed 10-08 | this doc, Fix 1 |
+| 2 | no `SCM_RIGHTS` | fixed 10-08 | Fix 2; also `docs/reference/subsystems/syscalls/net.md` (outside) |
+| 3 | shared-writable page of an unlinked file lost at writer exit | fixed 10-08 | Fix 3; also `docs/reference/subsystems/amd64-shared-write-mmap.md` (outside) |
+| 4 | `ftruncate`/`fallocate` on an unlinked fd: `ENOENT` | fixed 10-08 | Fix 4 |
+| 5 | amd64 `setsockopt` on a unix fd: `ENOTSOCK` | fixed 10-08 | Fix 5 |
+| 6 | `execve` recorded the literal path as the image name | fixed 10-08 | Fix 6 |
+| 7 | `hpbox.deploy()` reported a reset that never landed (tooling, not kernel) | fixed 10-08 | Fix 7 |
+| 8 | `execve` copied the whole binary into the kernel heap | fixed 10-08 | Fix 8 |
+| 9 | `int3` from ring 3 arrived as `SIGSEGV` | fixed 10-08 | Fix 9 |
+| 10 | regular-file `read`/`pread` stopped at 64 KiB | fixed 10-08 | Fix 10 |
+| 11 | `CLOCK_REALTIME` frozen at 0 until SNTP | fixed 10-08 | Fix 11 |
+| 12 | `prctl(PR_SET_NAME)` rewrote `/proc/<pid>/exe` | fixed 10-08 | Fix 12 |
+| 13 | no `/proc/<pid>/task` | fixed 10-08 | Fix 13 |
+| 14 | `brk` fell through the amd64 dispatch | fixed 10-08 | Fix 14 |
+| 15 | `mkdir` ignored its mode | fixed 10-08 | Fix 15 |
+| 16 | `SO_PASSCRED` gave no `SCM_CREDENTIALS` | fixed 10-08 | Fix 16 |
+| 17 | x86_64 `capget`/`capset` had no row | fixed 10-08 | Fix 17 |
+| 18 | `PROT_WRITE\|PROT_EXEC` refused (V8 code range) | fixed 10-08 | Fix 18 |
+| 19 | thread table held 64 threads system-wide | fixed 10-08 (448) | Fix 19 |
+| 20 | x86_64 `fallocate` had no row | fixed 10-08 | Fix 20 |
+| 21-24 | system-font text on Chromium 152 (FontDataService, unlinked-file mapping chain) | fixed 10-08 | Fixes 21-24 |
+| 25 | **`MAX_PIPES` 256 starved the zygote: `ENFILE`, dead renderer** | **fixed in tree 10-09, not verified live** | Fix 25 |
+| 26 | `kill(2)` took the AArch64 hard-kill path: BKL wedge after a Chromium tree `kill -9`, 2 s per threaded kill, leaked thread rows | fixed 10-09 | `AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`; symptom row in `docs/README.md` |
+
+Score: 26 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path),
+of which Fix 7 is tooling, so **25 kernel bugs**; 24 verified live, **1 (Fix 25)
+fixed in tree and awaiting a live check**; 6 open items below.
+
+**Open, found by the same work, not fixed:**
+
+| Bug | Record |
+|---|---|
+| per-core clocks differ by up to ~1 s (`Instant::now()` across cores) | "kami on ryzen, 2026-10-09" above; `userspace/kami/README.md` (outside) |
+| a `MAP_SHARED` write is invisible to `pread` until `munmap`; `FALLOC_FL_KEEP_SIZE` is `EOPNOTSUPP` | "Still open" above |
+| 256-row process table panics when full | "Still open" above |
+| wifi TX path drops 43 % of packets, ~65 KB/s ceiling | Fix 25 above; `userspace/kami/README.md` § "Tumblr: why scrolling stopped" (outside) |
+| ~1 in 4 Chromium cold starts die (SIGSEGV/SIGTRAP), cause unknown | "kami on ryzen, 2026-10-09" above |
+| missing rows/files list (`sendfile`, `inotify_init`, `/proc/cpuinfo`, ...) | "Still open: what Chromium hits" above |
+
+**Written outside this directory** (so the score is not lost): the tumblr
+measurements and the renderer-cap flags are in `userspace/kami/README.md`
+§ "Tumblr: why scrolling stopped"; the remaining kernel work is laid out in
+`docs/handoff-kernel-chromium-support.md`; the symptom rows are in
+`docs/README.md`.
