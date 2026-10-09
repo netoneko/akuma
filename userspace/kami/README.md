@@ -518,7 +518,10 @@ kernel (boot 90):** tumblr committed, first pixels 9.3 s, `loadEventFired`
 9.7 s, the Trending page painted, no network-service crash in two cold runs.
 And key->frame on the local page is now **74-78 ms median** (`stable_try.py`
 6/6; `scroll_try.py` bursts 73 ms, 9 frames/s), against 120 before and Linux's
-72: the timed-wait fix (Fix 34) plus the wake IPI took the 50 ms.
+72: the timed-wait fix (Fix 34) plus the wake IPI took the 50 ms. The
+first metal death's shape, a Chromium idle for 12 minutes then asked to
+navigate, did not reproduce either: idle 742 s, then tumblr committed in
+0.8 s with `loadEventFired` at 3.1 s and no crash.
 
 ## Future: kami in a rio split pane
 
