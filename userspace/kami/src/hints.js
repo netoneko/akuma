@@ -91,6 +91,9 @@ if (!window.__kami) {
 
   K.draw = function (labels) {
     const box = document.createElement('div');
+    // `kami tui` finds the labels in its DOMSnapshot by this id and puts them
+    // on the rows of the things they label (src/tui/page.rs).
+    box.id = '__kami_hints';
     box.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none';
     K.items.forEach((it, i) => {
       const d = document.createElement('div');

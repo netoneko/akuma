@@ -1,0 +1,21 @@
+<!doctype html><html><head><title>kami tui test</title><style>
+body{font:16px sans-serif;margin:0;background:#fdfdf8;color:#222}
+header{position:fixed;top:0;left:0;right:0;background:#234;color:#fff;padding:6px 12px;z-index:5}
+main{margin:48px 24px}
+.card{background:#e8f0ff;border:1px solid #88a;padding:8px;margin:8px 0;width:420px}
+.cols{display:flex;gap:24px}.cols>div{flex:1;background:#fff3e0;padding:6px}
+small{font-size:12px;color:#777}
+</style></head><body>
+<header><b>kami</b> &middot; <a href="#a" style="color:#9cf">Home</a> &middot; <a href="#b" style="color:#9cf">News</a></header>
+<main>
+<h1>Hello from the layout tree</h1>
+<p>This paragraph is long enough that Chrome has to wrap it across several line boxes, which is exactly the case the cell mapper has to handle: each line fragment becomes its own row, with <a href="https://example.org/x">a link in the middle</a> and some <b>bold</b> and <i>italic</i> words.</p>
+<div class="card">A card with a background and a border. <small>small grey text</small></div>
+<div class="cols"><div><h3>Left</h3>first column</div><div><h3>Right</h3>second column with <a href="#c">another link</a></div></div>
+<table border=1 style="border-collapse:collapse;margin-top:12px"><tr><th>Name</th><th>Value</th></tr><tr><td>alpha</td><td>1</td></tr><tr><td>beta</td><td>22</td></tr></table>
+<p><input value="typed text" size=20> <button>Go</button></p>
+<p><img alt="a picture" width=120 height=40 src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="></p>
+<ul><li>one</li><li>two</li><li>three</li></ul>
+<p id=dyn>static</p>
+<script>setTimeout(()=>document.getElementById('dyn').textContent='changed by script after 1.5 s',1500)</script>
+</main></body></html>

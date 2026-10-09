@@ -55,6 +55,82 @@ navigating, Ctrl-Q exits and the daemon detaches the session. Not yet tried
 from the console keyboard itself, and not against Tumblr's cookie notice (it
 did not appear in the frames captured; see Known gaps).
 
+## `kami tui`: the page in a terminal (2026-10-10)
+
+`kami tui [--page-fonts] [URL]` paints the page's *layout* into the terminal
+with ratatui instead of blitting pixels to `/dev/fb0`, so it works over ssh, in
+a rio pane, or in any terminal. It is a build option, **off by default**:
+
+```sh
+./build.sh --features tui              # x86_64 musl, as above (1.28 MB vs 0.90 MB)
+cargo build --release --features tui --target $(rustc -vV | sed -n 's/^host: //p')   # this machine
+```
+
+Without the feature `kami tui` says so and exits. It shares everything but the
+output with the framebuffer kami: the daemon, the tab (a `kami tui` and a
+`kami` can take turns on the same page), the keys, link hints and status line.
+
+How it works (`src/tui/`, the layout half of `src/machine.rs`):
+
+- **No screencast.** The machine runs in layout mode (`Output::Layout`): every
+  250 ms it asks the page whether it changed (`layout.js`, a counter bumped by a
+  `MutationObserver` and by scroll/resize/load/font events), and when it did,
+  it requests `DOMSnapshot.captureSnapshot`. That is Chromium's own layout:
+  every box and every line of text with its document position, the computed
+  colours and weights, and the paint order. Pages that keep changing are
+  snapshotted at most every 500 ms, and input skips the wait.
+- **Terminal cells.** `cells.js` gives all text one monospace face at 16 px, so
+  every character is one advance (9.63 CSS px in Menlo/DejaVu Sans Mono), and
+  the viewport is `cols x 9.63` px wide. Chromium's line breaking then matches
+  the terminal's columns. The grid measures the real advance from the page's own
+  text rather than trusting the constant. `--page-fonts` turns it off: text then
+  keeps its proportional fonts and long runs push later text to the right.
+- **Rows come from the text, not from dividing y.** Line boxes whose middles
+  fall in the current line join it, and a vertical gap of most of a row (a
+  paragraph margin) becomes up to 3 blank rows (`grid.rs`). Backgrounds then
+  cover the rows of the lines inside them, in paint order, on the page's
+  canvas colour (root/body background, else white).
+- **Three layers:** the document (scrolls); `position:fixed` content (stays
+  on its screen row: headers, cookie bars); and link-hint labels, drawn last on
+  the rows of what they label, pushed apart when they would overlap.
+- **Local scrolling.** The whole document is in the grid, so `j`/`k`
+  (3 rows), `d`/`u`, `gg`/`G` and, in Normal mode, the arrows/PgUp/PgDn/Home/End
+  move the view with no round-trip to Chromium. The page is then scrolled to
+  match (`window.scrollTo`), so lazy content loads and `f` labels what is on
+  screen. When the page scrolls itself (navigation, an anchor, its own script),
+  the view follows, except for a snapshot asked for before kami's own last
+  scroll.
+- Images show as `[alt text]` inside their box. Inputs show their value,
+  underlined (placeholders dimmed, passwords masked), checkboxes as `[x]`/`[ ]`,
+  selects as the chosen option. Text in a 1x1 px element (screen-reader-only
+  skip links, hidden button labels) and icon-font glyphs (private-use code
+  points) are dropped.
+
+Debugging: `KAMI_TUI_DUMP=<path>` writes the screen after every draw, as plain
+text to `<path>` and with colour (truecolour SGR) to `<path>.ans`, so a run
+with no human at the terminal can still be checked;
+`KAMI_SNAPSHOT_DUMP=<path>` keeps the latest raw snapshot reply (that is how
+`testdata/tui/test-snapshot.json` was made). The input log gets one line per
+snapshot (`layout: snapshot 88 ms, 1121 KB`) and per layout (`1649 items, 78
+fills -> 652 rows at 9.63 px/col in 0 ms`).
+
+Checked 2026-10-10 against Chrome on macOS (kami builds and runs natively on
+the Mac; the socket path must stay under macOS's 104-byte limit), in a pty
+driven by `script` with keys fed on stdin:
+
+| page | snapshot | result |
+|---|---|---|
+| `testdata/tui/test.html` | 10 KB, 1-5 ms | fixed header, wrapping, flex columns, table, input, image alt and list all placed; the script's change at 1.5 s re-snapshotted at 2.6 s; `j`/`G`/`gg` scroll locally; `f` labels and Esc |
+| lkml.org | 82 KB, 7-10 ms | two-column message tables and kernel table as on the site. Needs a desktop user agent: lkml is behind Anubis, which refuses `HeadlessChrome` (`--chrome-arg --user-agent=...`) |
+| en.wikipedia.org/wiki/Paper | 1.1 MB, 88 ms, parsed in 5 ms | TOC column, article beside the infobox, appearance sidebar, 652 rows |
+| news.ycombinator.com | | the story list as on the site; 87 hints; `f` + `aad` clicked `new` and the view followed to `/newest` |
+
+Not done yet: iframes (only the top document is read; same-origin ones come as
+further snapshot documents in their own coordinates), borders (no box drawing),
+scrolling *inside* an `overflow:auto` element, mouse clicks/wheel from the
+terminal, and images as pixels (sixel/kitty, or half-blocks from a screenshot
+clip). Not yet run on Akuma.
+
 ## The status bar
 
 `kami` draws the status bar itself, in the bottom 24 pixel rows of the
@@ -554,6 +630,9 @@ Route 1 is mostly `kami`-side work. Its prerequisites are the kernel's
 `docs/handoff-kernel-rio-support.md`).
 
 ## Future: reading mode (markdown TUI and `.md` output)
+
+*`kami tui` (above) now covers the terminal half of this with the page's own
+layout rather than Markdown; the `.md` output is still open.*
 
 Not every use needs pixels. A reading mode would ask Chromium for the page's
 content instead of a screencast, convert it to Markdown, and show it in a

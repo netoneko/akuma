@@ -25,6 +25,32 @@ pub type Ms = u64;
 
 /// The in-page helper (hint overlay); see `hints.js`.
 const HINTS_JS: &str = include_str!("hints.js");
+/// Layout mode's change counter; see `layout.js`.
+const LAYOUT_JS: &str = include_str!("layout.js");
+/// Layout mode's one-face, one-size stylesheet; see `cells.js`.
+const CELLS_JS: &str = include_str!("cells.js");
+
+/// The computed styles a layout-mode `DOMSnapshot.captureSnapshot` asks for,
+/// in this order; the TUI reads them back by position (`tui/page.rs`).
+pub const SNAPSHOT_STYLES: &[&str] = &[
+    "color",
+    "background-color",
+    "font-weight",
+    "font-style",
+    "text-decoration-line",
+    "visibility",
+    "opacity",
+    "position",
+    "font-size",
+];
+/// Layout mode asks the page whether it changed this often.
+const PROBE_EVERY: Ms = 250;
+/// A page that changes all the time (a ticking clock, a carousel) is
+/// re-snapshotted at most this often; input bypasses it.
+const SNAPSHOT_GAP: Ms = 500;
+/// Re-snapshot this often even with no reported change: layout can move
+/// without a DOM mutation (CSS animations, late images in some engines).
+const SNAPSHOT_STALE: Ms = 5_000;
 
 /// How long a cold Chromium may take to bring the daemon socket up.
 const CONNECT_BUDGET: Ms = 30_000;
@@ -44,6 +70,17 @@ const MAX_RECONNECTS: u32 = 3;
 pub enum Source {
     Screencast,
     Shot,
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    /// A layout-mode snapshot, painted as text.
+    Layout,
+}
+
+/// What a session shows: pixels (the framebuffer) or the page's layout
+/// painted into a terminal (`kami tui`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    Pixels,
+    Layout,
 }
 
 #[derive(Debug)]
@@ -57,8 +94,17 @@ pub enum Event {
     Connected,
     ConnectFailed,
     DaemonGone,
-    /// The shell decoded and (unless `empty`) blitted a [`Effect::Present`].
+    /// The shell decoded and (unless `empty`) blitted a [`Effect::Present`],
+    /// or painted an [`Effect::Layout`].
     Presented { source: Source, ok: bool, empty: bool },
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    /// Layout mode: the terminal view now starts at this document y (CSS px);
+    /// scroll the page there too, so lazy content loads and link hints label
+    /// what is on screen.
+    ViewScrolled(f64),
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    /// The page viewport (CSS px) changed: the terminal was resized.
+    Resized((usize, usize)),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +116,15 @@ pub enum Effect {
     Send(String),
     /// Decode this base64 PNG and show it; answer with [`Event::Presented`].
     Present { b64: String, source: Source },
+    /// Layout mode: a whole `DOMSnapshot.captureSnapshot` reply to paint;
+    /// answer with [`Event::Presented`]. `follow_scroll` is false when the
+    /// snapshot was asked for before the last [`Event::ViewScrolled`] reached
+    /// the page, so its scroll offset is older than the view's and must not
+    /// move it.
+    Layout { msg: Vec<u8>, follow_scroll: bool },
+    /// Layout mode: scroll the terminal view (the whole document is already
+    /// laid out, so this needs no round-trip); answer with [`Event::ViewScrolled`].
+    Scroll(Scroll),
     /// Remember this tab as the session's: the next kami attaches to it.
     Pin(String),
     Status(String),
@@ -90,6 +145,9 @@ pub struct Config {
     /// The tab this kami pinned on an earlier run: attach to it if it is still
     /// there rather than to whatever page comes first.
     pub pinned: Option<String>,
+    pub output: Output,
+    /// Layout mode: force one monospace face and size (`cells.js`).
+    pub cell_fonts: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +177,11 @@ enum Req {
     /// The page helper's account of why a collection found nothing.
     Why,
     Click,
+    /// Layout mode: the page's change counter (`layout.js`).
+    Probe,
+    Snapshot,
+    /// Layout mode: `window.scrollTo` after the view moved.
+    ScrollTo,
     Ignore,
 }
 
@@ -169,6 +232,30 @@ pub struct Machine {
     frames: u64,
     first_pixels: bool,
     last_status: String,
+    // layout mode
+    /// A probe or snapshot is outstanding.
+    layout_inflight: bool,
+    /// Snapshot at the next probe even if the page reports no change.
+    layout_force: bool,
+    next_probe: Ms,
+    last_snapshot_at: Ms,
+    /// The counter value the last snapshot was taken at.
+    layout_version: String,
+    /// The request id of the last `window.scrollTo`.
+    last_scroll_id: u64,
+}
+
+/// Layout mode: the pass-through keys that scroll a page, as view scrolls.
+fn key_scroll(name: &str) -> Option<Scroll> {
+    Some(match name {
+        "ArrowDown" => Scroll::Line(1),
+        "ArrowUp" => Scroll::Line(-1),
+        "PageDown" => Scroll::Half(2),
+        "PageUp" => Scroll::Half(-2),
+        "Home" => Scroll::Edge(-1),
+        "End" => Scroll::Edge(1),
+        _ => return None,
+    })
 }
 
 /// FNV-1a over the bytes: enough to tell "same screenshot" from "different".
@@ -214,7 +301,17 @@ impl Machine {
             frames: 0,
             first_pixels: true,
             last_status: String::new(),
+            layout_inflight: false,
+            layout_force: true,
+            next_probe: 0,
+            last_snapshot_at: 0,
+            layout_version: String::new(),
+            last_scroll_id: 0,
         }
+    }
+
+    fn layout(&self) -> bool {
+        self.cfg.output == Output::Layout
     }
 
     pub fn handle(&mut self, ev: Event) -> Vec<Effect> {
@@ -240,6 +337,23 @@ impl Machine {
             Event::Cdp(m) => self.on_cdp(&m, &mut out),
             Event::Key(k) => self.on_key(k, &mut out),
             Event::Presented { source, ok, empty } => self.on_presented(source, ok, empty, &mut out),
+            Event::ViewScrolled(y) => {
+                if self.phase == Phase::Running && self.session.is_some() {
+                    let js = format!("window.scrollTo({{top:{},behavior:'instant'}})", y.max(0.0).round());
+                    let params = format!("{{\"expression\":\"{}\"}}", escape(&js));
+                    self.send(Req::ScrollTo, "Runtime.evaluate", &params, true, &mut out);
+                    self.last_scroll_id = self.next_id;
+                }
+            }
+            Event::Resized(view) => {
+                if view != self.cfg.view {
+                    self.cfg.view = view;
+                    if self.session.is_some() {
+                        self.set_metrics(&mut out);
+                        self.refresh_soon();
+                    }
+                }
+            }
         }
         let text = self.status_text();
         if text != self.last_status {
@@ -290,6 +404,11 @@ impl Machine {
         // Leave Chromium and the page for the next session, with nothing of
         // this one attached.
         if let Some(s) = self.session.clone() {
+            if self.layout() {
+                // A framebuffer kami attaching next should see the page's own fonts.
+                let js = "document.getElementById('__kami_tui_css')?.remove()";
+                self.send(Req::Ignore, "Runtime.evaluate", &format!("{{\"expression\":\"{js}\"}}"), true, out);
+            }
             self.send(Req::Ignore, "Page.stopScreencast", "{}", true, out);
             self.send(Req::Ignore, "Target.detachFromTarget", &format!("{{\"sessionId\":\"{s}\"}}"), false, out);
         }
@@ -298,6 +417,18 @@ impl Machine {
     }
 
     fn start_screencast(&mut self, out: &mut Vec<Effect>) {
+        if self.layout() {
+            // No pixels: the page is read as a DOMSnapshot whenever the
+            // in-page counter says it changed (see `tick`).
+            self.phase = Phase::Running;
+            self.retry_at = None;
+            self.lap("layout mode", out);
+            let since = self.started.unwrap_or(0);
+            out.push(Effect::Log(format!("startup: ready for snapshots, {} ms since launch", self.now.saturating_sub(since))));
+            self.refresh_soon();
+            self.next_probe = self.now;
+            return;
+        }
         self.phase = Phase::Screencast;
         self.retry_at = None;
         let (w, h) = self.cfg.view;
@@ -353,6 +484,22 @@ impl Machine {
             Phase::Screencast => {
                 if self.retry_at.is_some_and(|t| now >= t) {
                     self.start_screencast(out);
+                }
+            }
+            Phase::Running if self.layout() => {
+                if !self.layout_inflight && now >= self.next_probe {
+                    if now.saturating_sub(self.last_snapshot_at) >= SNAPSHOT_STALE {
+                        self.layout_force = true;
+                    }
+                    self.layout_inflight = true;
+                    let mut expr = String::new();
+                    if self.cfg.cell_fonts {
+                        expr.push_str(CELLS_JS);
+                        expr.push('\n');
+                    }
+                    expr.push_str(LAYOUT_JS);
+                    let params = format!("{{\"expression\":\"{}\",\"returnByValue\":true}}", escape(&expr));
+                    self.send(Req::Probe, "Runtime.evaluate", &params, true, out);
                 }
             }
             Phase::Running => {
@@ -413,6 +560,21 @@ impl Machine {
         self.retry_at = None;
         self.restart_asked = None;
         self.nav = Nav::new();
+        self.layout_inflight = false;
+        self.layout_force = true;
+        self.layout_version.clear();
+    }
+
+    /// Layout mode: snapshot at the next probe even if nothing reports a change.
+    fn refresh_soon(&mut self) {
+        self.layout_force = true;
+        self.next_probe = self.next_probe.min(self.now + 100);
+    }
+
+    fn set_metrics(&mut self, out: &mut Vec<Effect>) {
+        let (w, h) = self.cfg.view;
+        let metrics = format!("{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":1,\"mobile\":false}}");
+        self.send(Req::Ignore, "Emulation.setDeviceMetricsOverride", &metrics, true, out);
     }
 
     /// The daemon's socket closed. Replace the daemon (it starts Chromium) a
@@ -463,6 +625,9 @@ impl Machine {
             || name.starts_with("Page.navigat")
         {
             out.push(Effect::Log(format!("page event {name}")));
+        }
+        if self.layout() && matches!(name, "Page.frameNavigated" | "Page.loadEventFired" | "Page.domContentEventFired") {
+            self.refresh_soon();
         }
         match name {
             "Page.frameStartedLoading" => self.loading = true,
@@ -536,13 +701,11 @@ impl Machine {
                     self.lap(&what, out);
                     out.push(Effect::Pin(self.target.clone()));
                     self.phase = Phase::Setup;
-                    let (w, h) = self.cfg.view;
                     // `--window-size` includes the (invisible) window frame in
                     // new headless mode, so pin the viewport to what the screen
                     // shows; and an opaque white base, so an unpainted page is
                     // white, not the transparent black Chromium sends.
-                    let metrics = format!("{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":1,\"mobile\":false}}");
-                    self.send(Req::Ignore, "Emulation.setDeviceMetricsOverride", &metrics, true, out);
+                    self.set_metrics(out);
                     self.send(
                         Req::Ignore,
                         "Emulation.setDefaultBackgroundColorOverride",
@@ -550,6 +713,12 @@ impl Machine {
                         true,
                         out,
                     );
+                    if self.layout() && self.cfg.cell_fonts {
+                        // Every document from now on starts in terminal cells;
+                        // the probe re-applies it to the one already loaded.
+                        let p = format!("{{\"source\":\"{}\"}}", escape(CELLS_JS));
+                        self.send(Req::Ignore, "Page.addScriptToEvaluateOnNewDocument", &p, true, out);
+                    }
                     self.send(Req::PageEnable, "Page.enable", "{}", true, out);
                 }
                 _ => self.finish(Some(format!("Target.attachToTarget: {}", detail())), out),
@@ -622,9 +791,48 @@ impl Machine {
                     let len = nav::label_len(n);
                     let list = (0..n).map(|i| format!("\"{}\"", nav::label(i, len))).collect::<Vec<_>>().join(",");
                     self.eval(Req::Ignore, &format!("__kami.draw([{list}])"), out);
+                    if self.layout() {
+                        self.refresh_soon();
+                    }
                 }
             }
             Req::Why => out.push(Effect::Log(format!("hints: nothing found; {}", detail()))),
+            Req::Probe => {
+                let version = if err { "" } else { str_field(m, "value").unwrap_or("") };
+                let changed = version != self.layout_version;
+                let due = self.now.saturating_sub(self.last_snapshot_at) >= SNAPSHOT_GAP;
+                if err {
+                    // Between documents (a navigation in flight): try again soon.
+                    out.push(Effect::Log(format!("layout: probe failed: {}", detail())));
+                }
+                if !err && (self.layout_force || (changed && due)) {
+                    self.layout_force = false;
+                    self.layout_version = version.to_string();
+                    let styles = SNAPSHOT_STYLES.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(",");
+                    let p = format!("{{\"computedStyles\":[{styles}],\"includePaintOrder\":true}}");
+                    self.send(Req::Snapshot, "DOMSnapshot.captureSnapshot", &p, true, out);
+                } else {
+                    self.layout_inflight = false;
+                    self.next_probe = self.now + PROBE_EVERY;
+                }
+            }
+            Req::Snapshot => {
+                self.layout_inflight = false;
+                self.last_snapshot_at = self.now;
+                self.next_probe = self.now + PROBE_EVERY;
+                out.push(Effect::Log(format!(
+                    "layout: snapshot {} ms, {} KB{}",
+                    self.now.saturating_sub(p.sent),
+                    m.len() / 1024,
+                    if err { " (error)" } else { "" }
+                )));
+                if err {
+                    out.push(Effect::Log(format!("layout: snapshot failed: {}", detail())));
+                } else {
+                    out.push(Effect::Layout { msg: m.to_vec(), follow_scroll: id > self.last_scroll_id });
+                }
+            }
+            Req::ScrollTo => {}
             Req::Click => {
                 out.push(Effect::Log(format!("hints: click reply {}", detail())));
                 let v = if err { "" } else { str_field(m, "value").unwrap_or("") };
@@ -713,6 +921,23 @@ impl Machine {
     }
 
     fn act(&mut self, act: Action, out: &mut Vec<Effect>) {
+        if self.layout() {
+            // The whole document is already laid out in the terminal, so
+            // scrolling moves the view there, with no round-trip; the shell
+            // reports where it went (`Event::ViewScrolled`). In Normal mode the
+            // keys that would scroll the page scroll the view too. Everything
+            // else changes the page: look at it again soon.
+            let scroll = match (&act, self.nav.mode) {
+                (Action::Scroll(s), _) => Some(*s),
+                (Action::Key(name, _), Mode::Normal) => key_scroll(name),
+                _ => None,
+            };
+            if let Some(s) = scroll {
+                out.push(Effect::Scroll(s));
+                return;
+            }
+            self.refresh_soon();
+        }
         let (w, h) = (self.cfg.view.0 as f64, self.cfg.view.1 as f64);
         match act {
             Action::Quit => self.finish(None, out),
@@ -784,6 +1009,8 @@ mod tests {
             max_frames: None,
             seconds: None,
             pinned: None,
+            output: Output::Pixels,
+            cell_fonts: false,
         }
     }
 
@@ -1226,5 +1453,104 @@ mod tests {
         m.handle(Event::DaemonGone);
         let e = m.handle(Event::DaemonGone);
         assert!(has(&e, |x| matches!(x, Effect::Done(Some(s)) if s.contains("daemon went away"))));
+    }
+
+    // ---- layout mode (`kami tui`) ---------------------------------------
+
+    fn probe_reply(id: u64, version: &str) -> Event {
+        reply(id, &format!(r#"{{"result":{{"type":"string","value":"{version}"}}}}"#))
+    }
+
+    /// Through startup in layout mode, with no URL: returns the machine at
+    /// the moment it is ready for snapshots, and the effects of that step.
+    fn running_layout(cell_fonts: bool) -> (Machine, Vec<Effect>) {
+        let mut m = Machine::new(Config { output: Output::Layout, cell_fonts, ..cfg(None) });
+        m.handle(Event::Tick(0));
+        connect(&mut m);
+        let e = m.handle(reply(2, r#"{"targetInfos":[{"targetId":"T1","type":"page","url":"about:blank"}]}"#));
+        let e = m.handle(reply(last_id(&e), r#"{"sessionId":"S1"}"#));
+        assert_eq!(sent(&e).iter().any(|s| s.contains("addScriptToEvaluateOnNewDocument")), cell_fonts);
+        let e = m.handle(reply(last_id(&e), "{}"));
+        (m, e)
+    }
+
+    /// The probe the next due tick sends, answered with `version`; the
+    /// effects of the answer.
+    fn probe(m: &mut Machine, now: Ms, version: &str) -> Vec<Effect> {
+        let e = m.handle(Event::Tick(now));
+        let s = sent(&e);
+        assert!(s.len() == 1 && s[0].contains("Runtime.evaluate") && s[0].contains("__kamiT"), "{s:?}");
+        m.handle(probe_reply(last_id(&e), version))
+    }
+
+    #[test]
+    fn layout_mode_reads_snapshots_instead_of_a_screencast() {
+        let (mut m, e) = running_layout(true);
+        assert!(sent(&e).is_empty(), "no screencast: {:?}", sent(&e));
+        assert_eq!(m.phase, Phase::Running);
+        let e = probe(&mut m, 10, "doc1:0");
+        let s = sent(&e);
+        assert!(s[0].contains("DOMSnapshot.captureSnapshot") && s[0].contains("\"background-color\""));
+        let e = m.handle(reply(last_id(&e), r#"{"documents":[],"strings":[]}"#));
+        assert!(has(&e, |x| matches!(x, Effect::Layout { follow_scroll: true, msg } if msg.starts_with(b"{\"id\""))));
+        assert!(!has(&e, |x| matches!(x, Effect::Present { .. })));
+    }
+
+    #[test]
+    fn layout_mode_snapshots_only_when_the_page_changed_and_not_too_often() {
+        // Probes are due every PROBE_EVERY after the last answer; the first
+        // snapshot is at t=10, so later probes come at 260, 510 and 760.
+        const { assert!(PROBE_EVERY < SNAPSHOT_GAP && 2 * PROBE_EVERY >= SNAPSHOT_GAP) };
+        let (mut m, _) = running_layout(false);
+        let e = probe(&mut m, 10, "doc1:0");
+        m.handle(reply(last_id(&e), "{}"));
+        // Changed, but within SNAPSHOT_GAP of that snapshot: wait.
+        assert!(sent(&probe(&mut m, 10 + PROBE_EVERY, "doc1:7")).is_empty());
+        // Still changed once the gap has passed: snapshot.
+        let e = probe(&mut m, 10 + 2 * PROBE_EVERY, "doc1:7");
+        assert!(sent(&e)[0].contains("DOMSnapshot.captureSnapshot"));
+        m.handle(reply(last_id(&e), "{}"));
+        // Same version as that snapshot: just the probe.
+        assert!(sent(&probe(&mut m, 10 + 3 * PROBE_EVERY, "doc1:7")).is_empty());
+    }
+
+    #[test]
+    fn layout_mode_scrolls_the_view_not_the_page() {
+        let (mut m, _) = running_layout(false);
+        let e = m.handle(Event::Key(Input::Text("j".into())));
+        assert!(has(&e, |x| *x == Effect::Scroll(Scroll::Line(1))));
+        assert!(!sent(&e).iter().any(|s| s.contains("mouseWheel")));
+        let e = m.handle(Event::Key(Input::Key("PageDown", 34)));
+        assert!(has(&e, |x| *x == Effect::Scroll(Scroll::Half(2))), "pass-through scroll keys scroll the view in Normal mode");
+        // In insert mode an arrow belongs to the focused field.
+        m.handle(Event::Key(Input::Text("i".into())));
+        let e = m.handle(Event::Key(Input::Key("ArrowDown", 40)));
+        assert!(sent(&e).iter().any(|s| s.contains("ArrowDown")));
+        assert!(!has(&e, |x| matches!(x, Effect::Scroll(_))));
+    }
+
+    #[test]
+    fn a_snapshot_older_than_the_last_view_scroll_does_not_move_the_view() {
+        let (mut m, _) = running_layout(false);
+        let e = probe(&mut m, 10, "doc1:0");
+        let snap = last_id(&e);
+        // The view scrolls while that snapshot is out.
+        let e = m.handle(Event::ViewScrolled(1234.4));
+        assert!(sent(&e)[0].contains("scrollTo({top:1234,behavior:'instant'})"));
+        let e = m.handle(reply(snap, "{}"));
+        assert!(has(&e, |x| matches!(x, Effect::Layout { follow_scroll: false, .. })));
+        // The next one, asked for after the scroll, may.
+        let e = probe(&mut m, 10 + SNAPSHOT_GAP + 1, "doc1:1");
+        let e = m.handle(reply(last_id(&e), "{}"));
+        assert!(has(&e, |x| matches!(x, Effect::Layout { follow_scroll: true, .. })));
+    }
+
+    #[test]
+    fn layout_mode_resize_resets_the_viewport_and_looks_again() {
+        let (mut m, _) = running_layout(false);
+        let e = m.handle(Event::Resized((640, 380)));
+        assert!(sent(&e)[0].contains("setDeviceMetricsOverride") && sent(&e)[0].contains("\"width\":640"));
+        let e = probe(&mut m, 200, "doc1:0");
+        assert!(sent(&e)[0].contains("DOMSnapshot.captureSnapshot"), "forced, though the version did not move");
     }
 }

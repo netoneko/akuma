@@ -13,6 +13,15 @@ publish = false
 # Both already in userspace/Cargo.lock; nothing new to vet.
 libc = "0.2.180"
 miniz_oxide = "0.8.9"
+# `kami tui`: the page's layout painted into the terminal (src/tui/). Off by
+# default; build with `--features tui`.
+ratatui = { version = "0.30", optional = true }
+serde_json = { version = "1", optional = true }
+unicode-width = { version = "0.2", optional = true }
+
+[features]
+default = []
+tui = ["dep:ratatui", "dep:serde_json", "dep:unicode-width"]
 
 [profile.release]
 opt-level = 3

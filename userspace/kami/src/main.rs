@@ -10,6 +10,8 @@
 //!   kami [--scale N] [--fb PATH|none] [--chromium PATH] [--sock PATH] [--log PATH]
 //!        [--frames N] [--seconds S] [--chrome-arg ARG]... [URL]
 //!   kami --kill          stop the daemon and its Chromium
+//!   kami tui [--page-fonts] [URL]   the page's layout painted into the terminal
+//!                        (built with `--features tui`; see `tui/`)
 //!
 //! With no URL a fresh tab opens [`HOME`]; an existing tab stays where it is.
 //!
@@ -53,13 +55,18 @@ struct Args {
     size: Option<(usize, usize)>,
     /// Poll `Page.captureScreenshot` every N ms instead of trusting the screencast.
     poll: Option<u64>,
+    /// `kami tui`: paint the page's layout into the terminal instead of pixels.
+    tui: bool,
+    /// `kami tui --page-fonts`: keep the page's own fonts (no `cells.js`).
+    page_fonts: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: kami [--scale N] [--fb PATH] [--chromium PATH] [--sock PATH] [--log PATH]\n\
          \x20           [--frames N] [--seconds S] [--poll MS] [--chrome-arg ARG]... [URL]\n\
-         \x20      kami --kill"
+         \x20      kami --kill\n\
+         \x20      kami tui [--page-fonts] [URL]"
     );
     std::process::exit(2)
 }
@@ -79,6 +86,8 @@ fn parse_args() -> Args {
         kill: false,
         size: None,
         poll: None,
+        tui: false,
+        page_fonts: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -93,6 +102,7 @@ fn parse_args() -> Args {
             "--seconds" => a.seconds = Some(val().parse().unwrap_or_else(|_| usage())),
             "--poll" => a.poll = Some(val().parse().unwrap_or_else(|_| usage())),
             "--chrome-arg" => a.extra.push(val()),
+            "--page-fonts" => a.page_fonts = true,
             "--daemon" => a.daemon = true,
             "--kill" => a.kill = true,
             "--size" => {
@@ -102,6 +112,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => usage(),
             _ if arg.starts_with("--") => usage(),
+            "tui" if !a.tui && a.url.is_none() => a.tui = true,
             _ => a.url = Some(arg),
         }
     }
@@ -158,15 +169,24 @@ fn input_log_open() {
 
 macro_rules! ilog {
     ($($arg:tt)*) => {
-        if let Some(m) = INPUT_LOG.get() {
+        if let Some(m) = $crate::INPUT_LOG.get() {
             if let Ok(mut f) = m.lock() {
                 use std::io::Write;
-                let t = LOG_START.get().map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                let t = $crate::LOG_START.get().map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
                 let _ = writeln!(f, "[{t:9.3}] {}", format_args!($($arg)*));
             }
         }
     };
 }
+
+#[cfg(feature = "tui")]
+mod tui;
+
+/// `kami tui` has the terminal in its alternate screen with the cursor hidden.
+/// The input pump's emergency quit exits from another thread, so it must put
+/// the terminal back itself.
+static TUI_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const TUI_LEAVE: &str = "\x1b[?1049l\x1b[?25h";
 
 fn log_termios(what: &str, t: &libc::termios) {
     ilog!(
@@ -240,6 +260,12 @@ fn spawn_input_pump(saved: libc::termios) -> io::Result<i32> {
                 ilog!("quit key");
                 // SAFETY: restoring the attributes read before raw mode.
                 unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+                if TUI_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+                    use std::io::Write;
+                    let mut out = io::stdout();
+                    let _ = out.write_all(TUI_LEAVE.as_bytes());
+                    let _ = out.flush();
+                }
                 eprintln!("\r\n[kami] quit; chromium keeps running (kami --kill stops it)");
                 std::process::exit(0);
             }
@@ -330,6 +356,8 @@ fn main() {
         daemon::run(&daemon_config(&args, width, height))
     } else if args.kill {
         kill(&args)
+    } else if args.tui {
+        tui_session(&args)
     } else {
         session(&args)
     };
@@ -337,6 +365,16 @@ fn main() {
         eprintln!("[kami] {e}");
         std::process::exit(1);
     }
+}
+
+#[cfg(feature = "tui")]
+fn tui_session(args: &Args) -> io::Result<()> {
+    tui::run(args)
+}
+
+#[cfg(not(feature = "tui"))]
+fn tui_session(_: &Args) -> io::Result<()> {
+    Err(io::Error::other("this kami was built without `kami tui` (cargo build --features tui)"))
 }
 
 fn daemon_config(args: &Args, width: usize, height: usize) -> daemon::Config {
@@ -393,6 +431,11 @@ fn present(fb: &mut dyn Display, png: &mut png::Decoder, bytes: &mut Vec<u8>, b6
     (true, empty)
 }
 
+/// The tab an earlier kami pinned, if any.
+fn pinned_target(args: &Args) -> Option<String> {
+    std::fs::read_to_string(format!("{}.target", args.sock)).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
 /// The I/O shell around [`machine::Machine`]: poll the daemon socket and the
 /// tty, turn what arrives into events, and do what the machine answers with.
 /// It holds no session state of its own and never waits on Chromium.
@@ -417,7 +460,9 @@ fn session(args: &Args) -> io::Result<()> {
         poll_ms: args.poll,
         max_frames: args.frames,
         seconds: args.seconds,
-        pinned: std::fs::read_to_string(format!("{}.target", args.sock)).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+        pinned: pinned_target(args),
+        output: machine::Output::Pixels,
+        cell_fonts: false,
     });
 
     let tty = RawTty::enter();
@@ -432,87 +477,16 @@ fn session(args: &Args) -> io::Result<()> {
     let mut bytes = Vec::new();
 
     loop {
-        let mut fds = [
-            libc::pollfd { fd: c.as_ref().map_or(-1, |c| c.fd()), events: libc::POLLIN, revents: 0 },
-            // A negative fd is skipped by poll; `events: 0` is not enough, since
-            // POLLHUP is always reported and a closed input would spin the loop.
-            libc::pollfd { fd: if stdin_open { input_fd } else { -1 }, events: libc::POLLIN, revents: 0 },
-        ];
-        // SAFETY: two valid pollfd entries.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) } < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(Event::Tick(t0.elapsed().as_millis() as u64));
-        if fds[0].revents != 0 {
-            if let Some(cc) = c.as_mut() {
-                match cc.fill() {
-                    Ok(true) => {
-                        while let Some(msg) = cc.next() {
-                            queue.push_back(Event::Cdp(msg));
-                        }
-                    }
-                    _ => {
-                        c = None;
-                        queue.push_back(Event::DaemonGone);
-                    }
-                }
-            }
-        }
-        if fds[1].revents != 0 {
-            let mut buf = [0u8; 256];
-            // SAFETY: reading into a stack buffer of the stated size.
-            let n = unsafe { libc::read(input_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n <= 0 {
-                stdin_open = false;
-                queue.push_back(Event::InputClosed);
-            } else {
-                ilog!("tty chunk [{}]", buf[..n as usize].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
-                for k in decode_keys(&buf[..n as usize]) {
-                    queue.push_back(Event::Key(k));
-                }
-            }
-        }
-
+        let mut queue = gather(&mut c, input_fd, &mut stdin_open, t0)?;
         while let Some(ev) = queue.pop_front() {
             for eff in m.handle(ev) {
+                let Some(eff) = common_effect(eff, &mut c, &mut queue, args, view) else { continue };
                 match eff {
-                    Effect::TryConnect { spawn } => {
-                        if spawn {
-                            if let Err(e) = daemon::spawn_detached(&daemon_config(args, view.0, view.1)) {
-                                ilog!("could not spawn the daemon: {e}");
-                            }
-                        }
-                        match Cdp::connect(&args.sock) {
-                            Ok(x) => {
-                                c = Some(x);
-                                queue.push_back(Event::Connected);
-                            }
-                            Err(_) => queue.push_back(Event::ConnectFailed),
-                        }
-                    }
-                    Effect::Send(msg) => {
-                        if let Some(cc) = c.as_mut() {
-                            if let Err(e) = cc.send_raw(&msg) {
-                                ilog!("send failed: {e}");
-                                c = None;
-                                queue.push_back(Event::DaemonGone);
-                            }
-                        }
-                    }
                     Effect::Present { b64, source } => {
                         let (ok, empty) = present(&mut *fb, &mut png, &mut bytes, &b64, scale);
                         queue.push_back(Event::Presented { source, ok, empty });
                     }
-                    Effect::Pin(target) => {
-                        let _ = std::fs::write(format!("{}.target", args.sock), target);
-                    }
                     Effect::Status(t) => fb.status(&t),
-                    Effect::Log(t) => ilog!("{t}"),
                     Effect::Done(err) => {
                         ilog!("session done: {err:?}");
                         drop(tty);
@@ -522,10 +496,114 @@ fn session(args: &Args) -> io::Result<()> {
                             Some(e) => Err(io::Error::other(e)),
                         };
                     }
+                    // Layout mode only (`kami tui`).
+                    Effect::Layout { .. } | Effect::Scroll(_) => {}
+                    Effect::TryConnect { .. } | Effect::Send(_) | Effect::Pin(_) | Effect::Log(_) => {}
                 }
             }
         }
     }
+}
+
+/// One turn of a session loop's input side: wait up to 100 ms for the daemon
+/// socket or the tty, and turn what arrived into events, the clock first.
+fn gather(
+    c: &mut Option<Cdp>,
+    input_fd: i32,
+    stdin_open: &mut bool,
+    t0: Instant,
+) -> io::Result<std::collections::VecDeque<machine::Event>> {
+    use machine::Event;
+    let mut queue = std::collections::VecDeque::new();
+    let mut fds = [
+        libc::pollfd { fd: c.as_ref().map_or(-1, |c| c.fd()), events: libc::POLLIN, revents: 0 },
+        // A negative fd is skipped by poll; `events: 0` is not enough, since
+        // POLLHUP is always reported and a closed input would spin the loop.
+        libc::pollfd { fd: if *stdin_open { input_fd } else { -1 }, events: libc::POLLIN, revents: 0 },
+    ];
+    // SAFETY: two valid pollfd entries.
+    if unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            return Ok(queue);
+        }
+        return Err(e);
+    }
+    queue.push_back(Event::Tick(t0.elapsed().as_millis() as u64));
+    if fds[0].revents != 0 {
+        if let Some(cc) = c.as_mut() {
+            match cc.fill() {
+                Ok(true) => {
+                    while let Some(msg) = cc.next() {
+                        queue.push_back(Event::Cdp(msg));
+                    }
+                }
+                _ => {
+                    *c = None;
+                    queue.push_back(Event::DaemonGone);
+                }
+            }
+        }
+    }
+    if fds[1].revents != 0 {
+        let mut buf = [0u8; 256];
+        // SAFETY: reading into a stack buffer of the stated size.
+        let n = unsafe { libc::read(input_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n <= 0 {
+            *stdin_open = false;
+            queue.push_back(Event::InputClosed);
+        } else {
+            ilog!("tty chunk [{}]", buf[..n as usize].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+            for k in decode_keys(&buf[..n as usize]) {
+                queue.push_back(Event::Key(k));
+            }
+        }
+    }
+    Ok(queue)
+}
+
+/// Perform the effects every front end performs the same way (the daemon
+/// connection, CDP writes, the tab pin, the log); hand back the rest.
+/// `view` is the page viewport, for a daemon started from here.
+fn common_effect(
+    eff: machine::Effect,
+    c: &mut Option<Cdp>,
+    queue: &mut std::collections::VecDeque<machine::Event>,
+    args: &Args,
+    view: (usize, usize),
+) -> Option<machine::Effect> {
+    use machine::{Effect, Event};
+    match eff {
+        Effect::TryConnect { spawn } => {
+            if spawn {
+                if let Err(e) = daemon::spawn_detached(&daemon_config(args, view.0, view.1)) {
+                    ilog!("could not spawn the daemon: {e}");
+                }
+            }
+            match Cdp::connect(&args.sock) {
+                Ok(x) => {
+                    *c = Some(x);
+                    queue.push_back(Event::Connected);
+                }
+                Err(_) => queue.push_back(Event::ConnectFailed),
+            }
+        }
+        Effect::Send(msg) => {
+            if let Some(cc) = c.as_mut() {
+                if let Err(e) = cc.send_raw(&msg) {
+                    ilog!("send failed: {e}");
+                    *c = None;
+                    queue.push_back(Event::DaemonGone);
+                }
+            }
+        }
+        Effect::Pin(target) => {
+            let _ = std::fs::write(format!("{}.target", args.sock), target);
+        }
+        Effect::Log(t) => ilog!("{t}"),
+        other => return Some(other),
+    }
+    None
 }
 
 #[cfg(test)]
