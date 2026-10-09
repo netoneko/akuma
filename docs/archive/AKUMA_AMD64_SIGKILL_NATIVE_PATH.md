@@ -1,8 +1,9 @@
 # amd64: `kill -9` went through the AArch64 hard-kill path, and the box paid for it
 
 **Written:** 2026-10-09. **Status: root-caused, fixed, verified under
-Firecracker/KVM on the trashcan (8 vCPUs oversubscribed on 4 cores) — NOT yet
-run on the ryzen metal where the hangs happened** (§7). Every number below is
+Firecracker/KVM on the trashcan (8 vCPUs oversubscribed on 4 cores) with a
+negative control — NOT yet run on the ryzen metal where the hangs happened**
+(§7). Every number below is
 from a run named in §6; nothing is inferred from reading alone.
 
 ## 1. The symptom
@@ -244,14 +245,28 @@ Allocations on the new paths: none. `sys_kill`'s group walk is a stack array;
 | `killtree`, 8 vCPUs, 40 rounds / 4 vCPUs, 12 rounds | below |
 | `chrome-once.sh` (Chromium still renders) / `probes.sh` | below |
 
-| run (Firecracker/KVM on the trashcan, kernel at the commit after `2ea12fb2`) | result |
+All on the trashcan's Firecracker/KVM rig (4 cores, 15 GiB), kernel built
+from the tree at `9f65582a` plus the dispatcher-routed boot check (§6.1):
+
+| run | result |
 |---|---|
 | standard image boot, 2 vCPUs | **744 passed, 0 failed** (11 new `kill:` checks; the suite was 733) |
 | standard image boot, 4 vCPUs | **744 passed, 0 failed** |
-| `killtree 40 0`, **8 vCPUs** (the configuration that wedged the unfixed kernel in round 22) | **PASS, 40 rounds**: `kill -9` of a threaded process reaps in **85–102 ms** (was 2078–6463 ms), a three-process tree in **85–400 ms** (was 6.1 s; 400 ms is the SIGTERM mode's own sleep), bystander errors 0, zero `[kill]` cross-core terminations, zero `[BKL] stuck`, zero `thread table full`. One `DRAIN INCOMPLETE: 1 thread(s)` at the very end — the bystander's `_exit(0)` with a thread in a syscall-free loop, the gap §5.3 closes; its verification run is pending |
-| `killtree 12 0`, 4 vCPUs / `chrome-once.sh` (Chromium still renders) / `probes.sh` | pending at the time of writing — the chain was running; see the follow-up commit |
-| negative control (old `Syscall::Kill => to_glue` arm restored, everything else kept) | pending — expected: the `kill:` checks fail as they did on the first boot (§5.1) |
-| the first fixed kernel, before §5.1 (for the record) | 738 passed, **5 failed**, all `kill:` — the two defects §5.1 names |
+| `killtree 40 0`, **8 vCPUs** — the configuration that wedged the unfixed kernel in round 22 | **PASS, 40 rounds**; `kill -9` of a threaded process reaps in **13–104 ms** (was 2078–6463 ms), a three-process tree in **17–430 ms** (was 6.1 s; the SIGTERM mode's own 300 ms sleep is in that); bystander errors 0; `DRAIN INCOMPLETE` **0**, `[BKL] stuck` **0**, `[kill]` cross-core terminations **0**, stale rows **0**, `thread table full` **0** |
+| `killtree 12 0`, 4 vCPUs | **PASS**, worst tree 309 ms, every detector 0 |
+| `chrome-once.sh` (Chromium 142 headless on the kami image, 2 vCPUs, 4 GiB) | exit **0**, `shot.png` reads "JavaScript ran: 6 x 7 = 42"; the one `[kill]` line in its log is the stale-tid guard *refusing* a reissued slot, not a termination |
+| `probes.sh` (bpprobe … thrprobe, chromeprobe) | every probe PASS, `chromeprobe: 16 passed, 0 failed` |
+| negative control: the old `Syscall::Kill => to_glue` arm restored, everything else kept | **739 passed, 5 FAILED**, all `kill:` — `gone within a second` (the 2 s grace), `no thread was terminated by a peer: got 0xf want 0x8` (seven cross-core hard kills), `every thread row came back: got 0x3` (three leaked rows), `status is a SIGKILL death: got 0xffff…ffff` (no status reached the epilogue), `a zombie still counts for its process group: got ESRCH` (no group decode). The box was then reset to the tree and rebuilt to the same md5 as the passing kernel |
+| for the record, the first fixed kernel before §5.1 | 738 passed, **5 failed**, all `kill:` — the two defects §5.1 names |
+| for the record, the kernel before §5.3 | same suites 744/0 and the same `killtree` passes, with exactly one `DRAIN INCOMPLETE: 1 thread(s)` per run: the bystander's `_exit(0)` with a spinning worker |
+
+### 6.1 The boot check goes through the dispatcher, and why
+
+The first negative control passed every `kill:` line with the old arm
+restored — because the check called `crate::signal::sys_kill` directly, and
+the defect was the *arm*, which forwarded to glue. A check that cannot tell
+the fixed kernel from the broken one is not a check; it now kills through
+`syscall_dispatch(62, …)`, the path a program takes.
 
 ### 5.3 The compute loop at `exit_group`
 

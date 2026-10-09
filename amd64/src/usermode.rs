@@ -8920,7 +8920,12 @@ pub fn kill_test(t: &mut Suite) {
 
     let cross_before = akuma_threading::cross_thread_terminations();
     let t0 = crate::net::uptime_us();
-    t.check_eq("kill: kill(pid, SIGKILL) is accepted", crate::signal::sys_kill(u64::from(pid), 9), 0);
+    // Through the dispatcher, not `signal::sys_kill` directly: the defect this
+    // check exists for was the `Syscall::Kill` *arm* (it forwarded to glue),
+    // and a check that called the native function could not tell the two
+    // apart — the first negative control (old arm restored) passed every line.
+    t.check_eq("kill: kill(pid, SIGKILL) is accepted",
+        syscall_dispatch(Syscall::Kill.to_x86_64(), u64::from(pid), 9, 0, 0, 0, 0), 0);
 
     let mut spins = 0u64;
     while !crate::sched::all_user_tasks_finished() && spins < 400_000 {
@@ -8941,12 +8946,13 @@ pub fn kill_test(t: &mut Suite) {
     // still "exists" (0) — by pid and by its process group (Linux keeps a
     // zombie in its pgrp's task list until it is reaped). After the reap the
     // group is empty, which is `ESRCH`.
-    t.check_eq("kill: a zombie still answers kill(pid, 0)", crate::signal::sys_kill(u64::from(pid), 0), 0);
+    let kill62 = |target: u64, sig: u64| syscall_dispatch(Syscall::Kill.to_x86_64(), target, sig, 0, 0, 0, 0);
+    t.check_eq("kill: a zombie still answers kill(pid, 0)", kill62(u64::from(pid), 0), 0);
     t.check_eq("kill: a zombie still counts for its process group",
-        crate::signal::sys_kill((-(i64::from(pid))) as u64, 0), 0);
+        kill62((-(i64::from(pid))) as u64, 0), 0);
 
     finish_test_process(pid, task_slot);
     t.check_eq("kill: a reaped process group is ESRCH",
-        crate::signal::sys_kill((-(i64::from(pid))) as u64, 0), crate::fd::errno::ESRCH);
+        kill62((-(i64::from(pid))) as u64, 0), crate::fd::errno::ESRCH);
     t.check_eq("kill: teardown leaks nothing", akuma_pmm::free_count() as u64, free_before as u64);
 }
