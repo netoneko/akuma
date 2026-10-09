@@ -31,7 +31,8 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::layout::Rect;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::machine::{self, Clip, Effect, Event, Source};
 use crate::nav::Scroll;
@@ -406,7 +407,12 @@ pub fn run(args: &Args) -> io::Result<()> {
     // Not `term.clear()`: it asks the terminal where the cursor is and reads
     // the answer from stdin, which the input pump owns (the answer never
     // comes, or comes as keys). The alternate screen is cleared on entry.
-    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    // A fixed viewport at kami's own idea of the size, not ratatui's: a pty
+    // that reports 0x0 (ssh -tt with no terminal behind it, seen on Akuma
+    // 2026-10-10) made ratatui draw nothing at all, where `term_size` falls
+    // back to 80x24.
+    let full = |(c, r): (u16, u16)| Rect { x: 0, y: 0, width: c, height: r };
+    let mut term = Terminal::with_options(CrosstermBackend::new(io::stdout()), TerminalOptions { viewport: Viewport::Fixed(full(size)) })?;
     ilog!("startup: terminal ready");
 
     let mut st = State {
@@ -445,7 +451,7 @@ pub fn run(args: &Args) -> io::Result<()> {
         if now != st.size {
             ilog!("terminal resized to {}x{}", now.0, now.1);
             st.size = now;
-            term.autoresize()?;
+            term.resize(full(now))?;
             st.relayout();
             view = viewport(now, args.page_fonts);
             st.view = view;
