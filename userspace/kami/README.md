@@ -138,6 +138,13 @@ Telemetry from one `kami https://tumblr.com` session (`/tmp/kami-input.log`,
   user sees a frozen page. Open.
 - Not the cause: the 990 ms `decode`/`blit` values in the log are the per-core
   clock skew described above (a thread migrating between cores), not stalls.
+- **Fix 2 (kami only, verified live 2026-10-09, kernel still at the 256 cap):**
+  `--disable-site-isolation-trials --renderer-process-limit=4` plus
+  `IsolateOrigins,site-per-process` in `--disable-features`. Tumblr: 4 renderers
+  instead of ~40, first pixels 15.6 s instead of 25.5 s, `loadEventFired` 31.8 s
+  instead of 72.8 s, no zygote FATAL, frames still arriving at 90 s (n=1).
+  `probe/page_try.py` printed `DIED` for it: its test is a substring match and
+  the run had `session done: None`; ignore that label here.
 - Download speed, measured separately: 65 KB/s from a Mac on the LAN and 66 KB/s
   from the internet, so the link/driver is the ceiling (`/dev/wifi0` counters:
   `tx 3640, stack dropped 1556`, `retry-limit 54`). TLS/DNS setup is fine

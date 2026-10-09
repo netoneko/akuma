@@ -72,7 +72,14 @@ pub fn chromium_args(c: &Config) -> Vec<String> {
         "--disable-domain-reliability",
         "--disable-breakpad",
         "--disable-crash-reporter",
-        "--disable-features=Translate,MediaRouter,OptimizationHints,BackForwardCache,AcceptCHFrame,InterestFeedContentSuggestions",
+        // Few processes. Site isolation forks a renderer per cross-site iframe:
+        // tumblr.com made ~40 in 100 s (2026-10-09, ryzen), which exhausted the
+        // kernel's pipe cap (ENFILE, the zygote's CHECK) and cost every fork's
+        // page-table copy besides. A kiosk reading pages has no use for the
+        // isolation, so cap the renderers and fold the iframes into them.
+        "--disable-site-isolation-trials",
+        "--renderer-process-limit=4",
+        "--disable-features=Translate,MediaRouter,OptimizationHints,BackForwardCache,AcceptCHFrame,InterestFeedContentSuggestions,IsolateOrigins,site-per-process",
         "--remote-debugging-pipe",
         "--hide-scrollbars",
         "--mute-audio",
