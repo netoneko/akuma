@@ -178,6 +178,33 @@ driven by `script` with keys fed on stdin:
 | news.ycombinator.com | | the story list as on the site; 87 hints; `f` + `aad` clicked `new` and the view followed to `/newest` |
 | www.tumblr.com | 1.4 MB, 110-125 ms | the cookie notice (an iframe) readable and clickable; trending cards, masonry posts with their images, avatars, tags and counts, the fixed sign-up bar. The login form fills (fields verified to hold exactly what was typed) but Tumblr answered "Your email or password were incorrect" twice; not retried |
 
+**Deploying to ryzen Akuma (2026-10-10).** Built on the box itself, inside
+Akuma, as the ryzen rule goes: the in-Akuma toolchain (`/etc/akuma-dev.env`:
+nightly rustc with the `x86_64-unknown-linux-musl` std, its self-contained
+crt, `gcc`) builds kami natively, since kami is its own workspace and needs
+nothing else from the tree.
+
+```sh
+# Mac: ship a commit's kami tree (no target/) to /src/kami-tui
+git archive --format=tar --prefix=kami-tui/ HEAD:userspace/kami | ssh -p 2222 root@<ryzen> 'rm -rf /src/kami-tui && cd /src && tar -xf -'
+# ryzen Akuma (ssh drops on long commands over the wifi: run detached, poll the log)
+. /etc/akuma-dev.env; cd /src/kami-tui
+cargo fetch                                   # first time: ratatui/crossterm/miniz_oxide come over the wifi
+cargo build --release --offline --features tui -j 4    # 61 s cold
+cp /bin/kami /bin/kami.bak                    # once
+cp target/release/kami /bin/kami.new && chmod +x /bin/kami.new && mv /bin/kami.new /bin/kami
+```
+
+The box answers ssh on 2222 at its wifi lease (`overlays/ryzen/wifi-ssh.py`
+finds it; it was 192.168.1.159) with `~/.ssh/id_ed25519`, not the image's
+`amd64-ssh-test-key`. Smoke test there, on its own socket and profile so a
+running kami is left alone:
+`kami tui --sock /tmp/kami-tui.sock --chrome-arg --user-data-dir=/tmp/kami-tui-profile file:///src/kami-tui/testdata/tui/test.html`.
+Measured on the first run: Chromium answering after 5.6 s, the first snapshot
+in 113 ms, later ones 1-2 ms for the test page. That run found a pty reporting
+0x0 (`ssh -tt` with no terminal behind it) and ratatui then drawing nothing;
+kami now draws at its own size (80x24 when the pty says 0).
+
 A saved snapshot can be inspected with kami's own parser:
 `KAMI_SNAPSHOT=<file> cargo test --features tui dump_snapshot -- --ignored --nocapture`
 (`KAMI_SNAPSHOT_GREP=Fixed` narrows it).
