@@ -263,6 +263,11 @@ keep.
   runs kami on a live Akuma over an ssh pty, sends keys, prints the new
   input log. **It paints on `/dev/fb0` and takes the console from whoever is
   using it.**
+- `scroll_try.py HOST URL [--slow N] [--burst N] [--gap S] [--settle S]`:
+  runs `kami --fb none` over an ssh pty from a cold Chromium, sends `j` keys
+  (one at 1 s spacing, then a burst) and reports the time from each key to the
+  next presented frame and the frames per second. 2026-10-09 on a 7200 px local
+  page: median 121 ms for an isolated key, ~9 frames/s and 42 ms in a burst.
 - `page_try.py HOST URL --runs N`: loads a URL N times with the null display
   (`kami --fb none`: nothing is painted, the console and keyboard are left
   alone), reports survival and time to first pixels, and saves the final frame

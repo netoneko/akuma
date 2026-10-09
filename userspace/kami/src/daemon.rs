@@ -397,8 +397,15 @@ pub fn run(c: &Config) -> io::Result<()> {
                 client_msgs.reset();
             }
         }
-        if fds[2].revents != 0 && restart.is_none() {
-            let s = client.as_mut().expect("polled fd belongs to the client");
+        // `fds[2]` was polled before this pass touched `client`: the Chromium
+        // branch drops it on a failed write (the client had just exited) and
+        // the accept branch replaces it. Handle the revents only if the fd
+        // polled is still the attached client's, else they describe a socket
+        // that is gone and the next poll reports the real one (2026-10-09: an
+        // `expect` here panicked the daemon at the end of a page_try run).
+        let polled_is_client = client.as_ref().is_some_and(|s| s.as_raw_fd() == fds[2].fd);
+        if fds[2].revents != 0 && restart.is_none() && polled_is_client {
+            let s = client.as_mut().expect("checked just above");
             match client_msgs.read_from(s) {
                 Ok(n) if n > 0 => {
                     // Forward whole commands only: a client dying mid-write
