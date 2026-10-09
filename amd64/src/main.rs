@@ -271,7 +271,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // `/proc/power`: after `mem::init`, because mapping the EC window allocates
     // page-table frames.
     power::init(&machine, cmdline);
-    akuma_vfs_glue::set_cpuinfo_renderer(cpuinfo::render);
 
     // The console hook and the `akuma-exec` runtime, shared with the multiboot2
     // entry point. One call because the two used to be two, and the second of

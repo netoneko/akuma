@@ -145,6 +145,31 @@ Telemetry from one `kami https://tumblr.com` session (`/tmp/kami-input.log`,
   instead of 72.8 s, no zygote FATAL, frames still arriving at 90 s (n=1).
   `probe/page_try.py` printed `DIED` for it: its test is a substring match and
   the run had `session done: None`; ignore that label here.
+- **Open (2026-10-09, after rebooting onto the pipe-cap kernel):** `https://www.tumblr.com`
+  now commits its navigation (~2 s) and then paints **nothing**: no frame, no
+  `loadEventFired`, no renderer thread seen; 3 runs. The same page loaded in
+  32 s before the reboot. Not yet separated into kernel vs the new Chromium
+  flags vs cold-start flakiness (about 1 in 4 cold starts has always been bad).
+  A static local page (`file:///tmp/render.html`, 7200 px tall) renders 3 of 3
+  and scrolls with a median 121 ms key->frame (`probe/scroll_try.py`), so the
+  render path itself is fine; the failure is specific to loading Tumblr.
+- **`Failed to adjust OOM score of renderer ...: No such file or directory`** is
+  non-fatal and was **not** fixed by serving `/proc/<pid>/oom_score_adj` (Fix 28
+  in the Chromium record): the pids it names are zygote children that had
+  already exited. It marks child churn; it is not what stops the page.
+- **What does stop Tumblr on the 2026-10-09 kernel:** `Network service crashed
+  or was terminated, restarting service` ~3 s into the load (crashpad then logs
+  `ptrace: Function not implemented`), and the restarted service logs
+  `CreatePlatformSocket() failed: Address family not supported by protocol (97)`.
+  Local `file://` pages never trigger it. The next experiment is to separate
+  the kernel (AF_UNIX-park and kill-path commits are new on it) from the flags:
+  boot the previous kernel with the current kami, or the current kernel with
+  the previous flag set.
+- **A wedged Chromium survives its client:** a Chromium left running by an
+  earlier `page_try` could not navigate the next session
+  (`arrived=false`, then `chromium has not answered for 45 s`) and the daemon
+  could not restart it. Start probes from a cold Chromium (`scroll_try.py` and
+  `page_try.py` do).
 - Download speed, measured separately: 65 KB/s from a Mac on the LAN and 66 KB/s
   from the internet, so the link/driver is the ceiling (`/dev/wifi0` counters:
   `tx 3640, stack dropped 1556`, `retry-limit 54`). TLS/DNS setup is fine

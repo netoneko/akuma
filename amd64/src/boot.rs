@@ -125,6 +125,11 @@ pub fn install_shared_sinks() {
     // device failed to initialise — is silently dropped.
     akuma_primitives::console::set_print_hook(crate::serial::puts);
     crate::exec_runtime::init();
+    // `/proc/cpuinfo`'s block renderer. Here, not beside `power::init`: that one
+    // is called from both boot paths separately, and the metal (multiboot2) path
+    // is the one that read bare `processor : N` blocks on 2026-10-09 because the
+    // registration had been added to `main.rs` only.
+    akuma_vfs_glue::set_cpuinfo_renderer(crate::cpuinfo::render);
     // The entropy source `akuma-syscalls-glue`'s `getrandom(2)` reads. Glue's
     // default is the virtio-rng device, which this target does not have on any
     // rig and cannot have on the bare-metal box; without this, folding

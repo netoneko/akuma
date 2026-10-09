@@ -64,7 +64,11 @@ fn brand(out: &mut [u8; 48]) -> usize {
             out[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&reg.to_le_bytes());
         }
     }
-    let end = out.iter().position(|&b| b == 0).unwrap_or(48);
+    let mut end = out.iter().position(|&b| b == 0).unwrap_or(48);
+    // Vendors pad the string with spaces on both sides (AMD: trailing).
+    while end > 0 && out[end - 1] == b' ' {
+        end -= 1;
+    }
     let start = out[..end].iter().position(|&b| b != b' ').unwrap_or(end);
     out.copy_within(start..end, 0);
     end - start

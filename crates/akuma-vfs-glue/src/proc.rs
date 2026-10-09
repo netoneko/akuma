@@ -545,6 +545,27 @@ impl ProcFilesystem {
     /// The individual files were refused on read, so the leak was structure and
     /// existence rather than content, but it is the same rule either way
     /// (docs/archive/DEVBOX_ISSUES.md Issue 24).
+    /// `<pid>/oom_score_adj` and its two siblings. They are constant-`0` files
+    /// that swallow writes: Akuma has no OOM killer to steer, but Chromium's
+    /// zygote host writes a renderer's `oom_score_adj` on every spawn and
+    /// logged `Failed to adjust OOM score of renderer with pid N: No such file
+    /// or directory` ~45 times a page (2026-10-09; the failure is non-fatal in
+    /// Chromium's source, `AdjustRendererOOMScore` only `PLOG(ERROR)`s it).
+    /// Reading `0` is the truthful answer for a kernel that never kills by score.
+    const OOM_FILES: [&'static str; 3] = ["oom_score_adj", "oom_adj", "oom_score"];
+
+    /// The pid in `<pid>/<one of OOM_FILES>`, if `path` is one.
+    fn pid_oom_file(path: &str) -> Option<Pid> {
+        let (pid, name) = path.split_once('/')?;
+        if Self::OOM_FILES.contains(&name) { pid.parse().ok() } else { None }
+    }
+
+    /// Whether the current caller may see `pid` (the box rule `cmdline` uses).
+    fn oom_visible(pid: Pid) -> bool {
+        let box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
+        Self::process_visible(pid, box_id)
+    }
+
     fn process_visible(pid: Pid, viewer_box_id: u64) -> bool {
         match process::lookup_process_shared(pid) {
             Some(proc) => viewer_box_id == 0 || proc.box_id == viewer_box_id,
@@ -896,6 +917,14 @@ impl Filesystem for ProcFilesystem {
                 // is how `ls /proc/<pid>` ends up printing `No such file or
                 // directory` for its own listing, so these two appear exactly
                 // when the address-space hook can render them.
+                for name in Self::OOM_FILES {
+                    pid_entries.push(DirEntry {
+                        name: String::from(name),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: 0,
+                    });
+                }
                 for name in ["maps", "statm"] {
                     if pid_address_space_file(pid, name).is_some() {
                         pid_entries.push(DirEntry {
@@ -1071,6 +1100,20 @@ impl Filesystem for ProcFilesystem {
                     buf[..n].copy_from_slice(&stat_buf[offset..offset + n]);
                     return Ok(n);
                 }
+        }
+
+        // <pid>/oom_score_adj and siblings: constant "0\n" (see `OOM_FILES`).
+        if let Some(pid) = Self::pid_oom_file(path) {
+            if !Self::oom_visible(pid) {
+                return Err(FsError::NotFound);
+            }
+            let data = b"0\n";
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(data.len() - offset);
+            buf[..n].copy_from_slice(&data[offset..offset + n]);
+            return Ok(n);
         }
 
         // <pid>/maps and <pid>/statm — see `pid_address_space_file`.
@@ -1349,6 +1392,13 @@ impl Filesystem for ProcFilesystem {
                 }
         }
 
+        if let Some(pid) = Self::pid_oom_file(path) {
+            if !Self::oom_visible(pid) {
+                return Err(FsError::NotFound);
+            }
+            return Ok(b"0\n".to_vec());
+        }
+
         // Handle <pid>/cmdline and <pid>/status
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
@@ -1391,6 +1441,9 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        if let Some(pid) = Self::pid_oom_file(path) {
+            return if Self::oom_visible(pid) { Ok(()) } else { Err(FsError::NotFound) };
+        }
         // All-or-nothing contract: a caller with no way to report a residue must
         // not be told a partial stdin write succeeded. `write_at` is the path
         // `sys_write` actually takes and it reports the count instead.
@@ -1401,6 +1454,9 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn write_at(&self, path: &str, _offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        if let Some(pid) = Self::pid_oom_file(path) {
+            return if Self::oom_visible(pid) { Ok(data.len()) } else { Err(FsError::NotFound) };
+        }
         // For ProcFS, we ignore the offset and treat it as a direct write/append
         // to the process buffers. This avoids the default read-modify-write behavior.
         //
@@ -1503,6 +1559,9 @@ impl Filesystem for ProcFilesystem {
             // Only when a kernel registered a walk — the two files exist
             // exactly when they can be rendered, which is what keeps `open`,
             // `stat` and `access` agreeing about them.
+            if parts.len() == 2 && Self::OOM_FILES.contains(&parts[1]) {
+                return Self::process_visible(pid, current_box_id);
+            }
             if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm") {
                 return pid_address_space_file(pid, parts[1]).is_some();
             }
@@ -1677,6 +1736,21 @@ impl Filesystem for ProcFilesystem {
         // truncates on a stale one.
         {
             let parts: Vec<&str> = path.split('/').collect();
+            if let Some(pid) = Self::pid_oom_file(path) {
+                if !Self::oom_visible(pid) {
+                    return Err(FsError::NotFound);
+                }
+                return Ok(Metadata {
+                    is_dir: false,
+                    size: 2,
+                    inode,
+                    mode: 0o100644,
+                    created: None,
+                    modified: None,
+                    accessed: None,
+                    links: None,
+                });
+            }
             if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm")
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     let data = pid_address_space_file(pid, parts[1]).ok_or(FsError::NotFound)?;

@@ -583,7 +583,7 @@ still logs, none of it fatal:
   cpuinfo`)~~ — **written 2026-10-09** (neither kernel had it; shared glue in
   `akuma-vfs-glue::proc` plus the amd64 `cpuid` block renderer
   `amd64/src/cpuinfo.rs`; aarch64 gets bare `processor : N` blocks until it
-  registers a renderer; not yet booted), `/proc/sys/fs/inotify/max_user_watches`, `/proc/<pid>/oom_score_adj`,
+  registers a renderer; not yet booted), `/proc/sys/fs/inotify/max_user_watches`, ~~`/proc/<pid>/oom_score_adj`~~ (**written 2026-10-09**, Fix 27),
   `/sys/devices/system/cpu/{possible,present,kernel_max}`.
 - **Missing x86_64 rows**: 40 `sendfile`, 239 `get_mempolicy`, 297
   `rt_tgsigqueueinfo` (crashpad re-raises a crash signal with it), 444
@@ -761,6 +761,39 @@ the renderers fixed; it is a driver question, not investigated here.
 "scrolling produces nothing". The first thing to check on a frozen kami is
 `ps`/`/proc` for a renderer thread, then the end of `/tmp/kami.log`.
 
+## Fix 28 (2026-10-09): `Failed to adjust OOM score of renderer`
+
+**What it is.** About 45 lines per Tumblr load in `/tmp/kami.log`:
+
+    zygote_host_impl_linux.cc:300  Failed to adjust OOM score of renderer with pid 1353: No such file or directory (2)
+
+**What Chromium does** (read in 142.0.7444.59's `ZygoteHostImpl::AdjustRendererOOMScore`):
+on the browser side, for every renderer the zygote forks, it calls
+`base::AdjustOOMScore(pid, score)`, which writes the number into
+`/proc/<pid>/oom_score_adj`. With the suid sandbox (not used here) it runs the
+sandbox helper with `--adjust-oom-score` instead. Failure is `PLOG(ERROR)` and a
+return: **never fatal**, the renderer simply keeps the default score.
+
+**Why the web is no help.** Every forum report of this line ends in `Permission
+denied` (a non-dumpable renderer, or a missing/unconfigured suid sandbox) and
+the line is usually incidental to another crash. Ours ends in `(2)`, ENOENT.
+
+**Fix, and what it did not fix (corrected 2026-10-09, same day).**
+`akuma-vfs-glue/src/proc.rs` now serves `<pid>/oom_score_adj`, `oom_adj` and
+`oom_score` as constant `0\n` files (listed, stat-able, readable, 0o644, same
+box rule as `cmdline`); writes are accepted and discarded. Booted on the metal:
+`cat /proc/1/oom_score_adj` reads `0` and `ls /proc/1` lists all three.
+**The log line did not go away** (4 in the next run, 83 cumulative in a
+`/tmp/kami.log` that is never truncated). The original diagnosis here, "the
+line is exactly the missing file", was wrong or at best half of it: the pids it
+names (113, 117, 124, 129, 496, 514, 524) are zygote children that **had
+already exited** by the time the browser wrote, and their `/proc/<pid>` is only
+the `syscalls` stub a dead process leaves behind. So ENOENT means "the child
+is gone", i.e. a churn of short-lived zygote children, not a missing file. The
+file is still worth having (a live renderer's write now succeeds), and the line
+is still non-fatal; what it points at is children dying right after fork, which
+is the thing to chase (see the Tumblr entry in `userspace/kami/README.md`).
+
 ## Scoreboard: kernel bugs found by running kami / Chromium
 
 Kept here so the count survives; update the row, not the prose, when something
@@ -792,10 +825,13 @@ and should be linked from here (done in the last column).
 | 21-24 | system-font text on Chromium 152 (FontDataService, unlinked-file mapping chain) | fixed 10-08 | Fixes 21-24 |
 | 25 | **`MAX_PIPES` 256 starved the zygote: `ENFILE`, dead renderer** | **fixed in tree 10-09, not verified live** | Fix 25 |
 | 26 | `kill(2)` took the AArch64 hard-kill path: BKL wedge after a Chromium tree `kill -9`, 2 s per threaded kill, leaked thread rows | fixed 10-09 | `AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`; symptom row in `docs/README.md` |
+| 27 | `/proc/cpuinfo` did not exist on either kernel (`Failed to initialize cpuinfo`) | **fixed and booted on the metal 10-09** (Ryzen 7 8845HS, family 25 model 117, 8 blocks) | "Still open" list above; glue `proc.rs`, `amd64/src/cpuinfo.rs` |
+| 28 | `/proc/<pid>/oom_score_adj` (+ `oom_adj`, `oom_score`) did not exist | **fixed and booted 10-09**, but it was *not* the cause of the `Failed to adjust OOM score` log line (still printed: the named children are already dead) | Fix 28 above |
 
-Score: 26 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path),
-of which Fix 7 is tooling, so **25 kernel bugs**; 24 verified live, **1 (Fix 25)
-fixed in tree and awaiting a live check**; 6 open items below.
+Score: 28 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path
+and the two `/proc` files), of which Fix 7 is tooling, so **27 kernel bugs**;
+26 verified live, **1 (25) in tree and booted but not yet shown to be what
+fixes Tumblr**; 7 open items below.
 
 **Open, found by the same work, not fixed:**
 
@@ -806,6 +842,8 @@ fixed in tree and awaiting a live check**; 6 open items below.
 | 256-row process table panics when full | "Still open" above |
 | wifi TX path drops 43 % of packets, ~65 KB/s ceiling | Fix 25 above; `userspace/kami/README.md` § "Tumblr: why scrolling stopped" (outside) |
 | ~1 in 4 Chromium cold starts die (SIGSEGV/SIGTRAP), cause unknown | "kami on ryzen, 2026-10-09" above |
+| **sshd corrupts a large stdout stream, non-deterministically**: `cat` of the 9.16 MB kernel over ssh gave 3 different SHA-256s in 3 runs (`d555…`, `1228…`, one correct) and once 10 KB more bytes than the file; the same file through local pipes on Akuma (`cat \| sha256sum`, `dd \| sha256sum`) was correct 4 of 4, and a plain HTTP `curl -T` upload of it was byte-identical. Not wire corruption (TCP checksums), so it is in sshd or the kernel's socket/pipe path before the NIC. Use HTTP for binaries until it is found | 2026-10-09; no investigation yet |
+| **Tumblr loads nothing on the 2026-10-09 kernel**: navigation commits, one first frame, then no frames and no load event; `Network service crashed or was terminated, restarting service` ~3 s after the page starts (crashpad's `ptrace: Function not implemented` + a `tgkill` flood follow), and the restarted service logs `CreatePlatformSocket() failed: Address family not supported by protocol (97)`. A local `file://` page renders and scrolls fine (121 ms key->frame). Not yet separated into: this kernel (it also carries the AF_UNIX-park and kill-path commits of 2026-10-09 that the earlier, working kernel lacked), the new renderer-cap flags, or a flaky network service | `userspace/kami/README.md` § "Tumblr: why scrolling stopped" |
 | missing rows/files list (`sendfile`, `inotify_init`, `/proc/cpuinfo`, ...) | "Still open: what Chromium hits" above |
 
 **Written outside this directory** (so the score is not lost): the tumblr
