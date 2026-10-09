@@ -22,6 +22,7 @@
 //! `KAMI_SNAPSHOT_DUMP=<path>` keeps the latest raw snapshot reply.
 
 mod grid;
+mod image;
 mod page;
 mod view;
 
@@ -31,7 +32,7 @@ use std::time::Instant;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::machine::{self, Effect, Event, Source};
+use crate::machine::{self, Clip, Effect, Event, Source};
 use crate::nav::Scroll;
 use crate::{common_effect, gather, input_log_open, pinned_target, spawn_input_pump, Args, RawTty, HOME, TUI_LEAVE, TUI_SCREEN};
 
@@ -93,9 +94,25 @@ struct State {
     status: String,
     size: (u16, u16),
     page_fonts: bool,
+    images: image::Cache,
+    /// The page viewport (CSS px).
+    view: (usize, usize),
 }
 
 impl State {
+    /// A capture of the page's viewport for the images on screen, if any of
+    /// them still lacks pixels. The page is where the last snapshot found it.
+    fn capture(&self) -> Option<Clip> {
+        let (g, p) = (self.grid.as_ref()?, self.page.as_ref()?);
+        if !self.images.missing(g, self.top..self.top + self.page_rows()) {
+            return None;
+        }
+        // Two samples per cell across, about four per row down: enough for
+        // half blocks, and a 100-column view is a ~200 px wide PNG.
+        let scale = (2.0 / g.cw).min(1.0);
+        Some(Clip { x: 0.0, y: p.scroll_y, w: self.view.0 as f64, h: self.view.1 as f64, scale })
+    }
+
     fn page_rows(&self) -> usize {
         self.size.1.saturating_sub(1) as usize
     }
@@ -185,7 +202,11 @@ pub fn run(args: &Args) -> io::Result<()> {
         status: String::new(),
         size,
         page_fonts: args.page_fonts,
+        images: image::Cache::default(),
+        view,
     };
+    let mut shot = crate::png::Decoder::default();
+    let mut shot_bytes = Vec::new();
     let dump = std::env::var_os("KAMI_TUI_DUMP");
     let snap_dump = std::env::var_os("KAMI_SNAPSHOT_DUMP");
     let t0 = Instant::now();
@@ -202,6 +223,7 @@ pub fn run(args: &Args) -> io::Result<()> {
             term.autoresize()?;
             st.relayout();
             view = viewport(now, args.page_fonts);
+            st.view = view;
             queue.push_back(Event::Resized(view));
             dirty = true;
         }
@@ -227,6 +249,9 @@ pub fn run(args: &Args) -> io::Result<()> {
                                 st.page = Some(p);
                                 st.relayout();
                                 dirty = true;
+                                if let Some(clip) = st.capture() {
+                                    queue.push_back(Event::Capture(clip));
+                                }
                                 queue.push_back(Event::Presented { source: Source::Layout, ok: true, empty: false });
                             }
                             Err(e) => {
@@ -239,6 +264,20 @@ pub fn run(args: &Args) -> io::Result<()> {
                         if let Some(y) = st.scroll(s) {
                             dirty = true;
                             queue.push_back(Event::ViewScrolled(y));
+                        }
+                    }
+                    Effect::Captured { b64, clip } => {
+                        let t = Instant::now();
+                        let decoded = crate::b64_decode(b64.as_bytes(), &mut shot_bytes).and_then(|_| shot.decode(&shot_bytes));
+                        match (decoded, st.grid.as_ref()) {
+                            (Ok(()), Some(g)) => {
+                                let px = image::Pixels { px: &shot.pixels, w: shot.width, h: shot.height, ch: shot.channels };
+                                st.images.absorb(g, &px, &clip);
+                                ilog!("layout: capture {}x{} sampled in {} ms", shot.width, shot.height, t.elapsed().as_millis());
+                                dirty = true;
+                            }
+                            (Err(e), _) => ilog!("layout: capture not decoded: {e}"),
+                            _ => {}
                         }
                     }
                     Effect::Status(t) => {
@@ -264,7 +303,7 @@ pub fn run(args: &Args) -> io::Result<()> {
         }
         if dirty {
             let frame = term.draw(|f| {
-                f.render_widget(view::View { grid: st.grid.as_ref(), top: st.top, status: &st.status }, f.area())
+                f.render_widget(view::View { grid: st.grid.as_ref(), images: &st.images, top: st.top, status: &st.status }, f.area())
             })?;
             if let Some(path) = &dump {
                 let (plain, ansi) = view::dump(frame.buffer);

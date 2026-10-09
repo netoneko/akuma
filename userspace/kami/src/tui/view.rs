@@ -5,11 +5,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
-use super::grid::{Cell, Grid};
+use super::grid::{Cell, Grid, Slot};
+use super::image::Cache;
 use super::page::Rgb;
 
 pub struct View<'a> {
     pub grid: Option<&'a Grid>,
+    pub images: &'a Cache,
     /// The first document row on screen.
     pub top: usize,
     pub status: &'a str,
@@ -41,6 +43,10 @@ fn put(buf: &mut Buffer, x: u16, y: u16, c: &Cell) {
         return; // the double-width character to its left covers it
     }
     if let Some(cell) = buf.cell_mut((x, y)) {
+        // `set_style` patches: it adds modifiers and never clears them, so a
+        // cell drawn over a bold, underlined link would stay bold and
+        // underlined. Each layer replaces the cell outright.
+        cell.reset();
         cell.set_char(c.ch).set_style(style(c));
     }
 }
@@ -60,6 +66,10 @@ impl Widget for View<'_> {
                 for (x, c) in row.iter().enumerate().take(area.width as usize) {
                     put(buf, area.x + x as u16, area.y + y, c);
                 }
+            }
+            let rows = self.top..self.top + page_h as usize;
+            for slot in g.images.iter().filter(|s| s.rows.start < rows.end && rows.start < s.rows.end) {
+                draw_image(buf, area, g, slot, self.images, rows.clone());
             }
             for p in &g.fixed {
                 if p.row < page_h as usize && p.col < area.width as usize {
@@ -86,6 +96,43 @@ impl Widget for View<'_> {
         buf.set_style(Rect { x: area.x, y, width: area.width, height: 1 }, bar);
         buf.set_string(area.x, y, &text, bar);
         buf.set_string(area.x + room as u16, y, &pos, bar);
+    }
+}
+
+/// The placeholder an image shows until its pixels arrive.
+const PENDING: Rgb = Rgb(0xd8, 0xd8, 0xd8);
+
+fn mix(a: Rgb, b: Rgb) -> Rgb {
+    let m = |x: u8, y: u8| ((x as u16 + y as u16) / 2) as u8;
+    Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
+}
+
+/// One image slot's visible rows: `▀` half blocks where there are pixels.
+/// Text in the slot stays on top: over an `<img>` (a caption on a photo) it
+/// keeps its glyph on the photo's colour; a background never covers text.
+/// An `<img>` with no pixels yet is a grey box with its alt text.
+fn draw_image(buf: &mut Buffer, area: Rect, g: &Grid, slot: &Slot, images: &Cache, rows: std::ops::Range<usize>) {
+    let block = images.get(slot.key);
+    let mut label = slot.label.chars();
+    let (first, last) = (slot.rows.start.max(rows.start), slot.rows.end.min(rows.end));
+    for (r, row) in g.rows.iter().enumerate().take(last).skip(first) {
+        let y = area.y + (r - rows.start) as u16;
+        for c in slot.cols.clone().take_while(|&c| c < area.width as usize) {
+            let under = row[c];
+            let x = area.x + c as u16;
+            let has_text = under.ink;
+            match block.and_then(|b| b.get(r - slot.rows.start, c - slot.cols.start)) {
+                Some(_) if has_text && slot.backdrop => {}
+                Some((up, down)) if has_text => put(buf, x, y, &Cell { bg: Some(mix(up, down)), ..under }),
+                Some((up, down)) => put(buf, x, y, &Cell { ch: '▀', fg: Some(up), bg: Some(down), ..Cell::default() }),
+                None if slot.backdrop || has_text => {}
+                None => {
+                    let ch = if r == slot.rows.start { label.next().unwrap_or(' ') } else { ' ' };
+                    let fg = Some(Rgb(0x60, 0x60, 0x60));
+                    put(buf, x, y, &Cell { ch, fg, bg: Some(PENDING), italic: true, ..Cell::default() });
+                }
+            }
+        }
     }
 }
 
@@ -125,4 +172,18 @@ pub fn dump(buf: &Buffer) -> (String, String) {
         plain.push('\n');
     }
     (plain, ansi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_upper_layer_does_not_inherit_the_modifiers_below_it() {
+        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 2, height: 1 });
+        put(&mut buf, 0, 0, &Cell { ch: 'a', bold: true, underline: true, ..Cell::default() });
+        put(&mut buf, 0, 0, &Cell { ch: 'b', ..Cell::default() });
+        assert_eq!(buf[(0, 0)].symbol(), "b");
+        assert!(buf[(0, 0)].modifier.is_empty());
+    }
 }

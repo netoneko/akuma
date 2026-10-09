@@ -23,6 +23,11 @@ const VISIBILITY: usize = 5;
 const OPACITY: usize = 6;
 const POSITION: usize = 7;
 const FONT_SIZE: usize = 8;
+const BG_IMAGE: usize = 9;
+
+/// Smallest image (CSS px, each side) worth pixels: below this it is an icon
+/// and would be a blob of two or three cells.
+const MIN_IMAGE: f64 = 24.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -50,7 +55,8 @@ pub enum Layer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Text,
-    /// An `<img>`/`<video>`; `text` is its alt text.
+    /// Pixels: an `<img>`, `<video>`, `<canvas>` or `<svg>` (`text` is the
+    /// alt text, if any), or with [`Item::backdrop`] a CSS background image.
     Image,
     /// A text input, textarea or select; `text` is its value (or placeholder).
     Field,
@@ -76,6 +82,15 @@ pub struct Item {
     pub dim: bool,
     /// Font size in CSS px.
     pub size: f64,
+    /// Images: what identifies these pixels across snapshots (source and box).
+    pub key: u64,
+    /// Images: a CSS `background-image` (or gradient) under the element's
+    /// content, rather than content itself. It takes no rows of its own and
+    /// never paints over text.
+    pub backdrop: bool,
+    /// Paint order (comparable with [`Fill::order`] across documents): text
+    /// under a later fill is covered by it.
+    pub order: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,11 +193,62 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
         .iter()
         .map(|s| s.as_str().unwrap_or(""))
         .collect();
-    let s = |i: i64| usize::try_from(i).ok().and_then(|i| strings.get(i).copied()).unwrap_or("");
-    let doc = &r["documents"][0];
-    if doc.is_null() {
-        return Err("snapshot without documents".into());
+    let docs = r["documents"].as_array().ok_or("snapshot without documents")?;
+    let top = docs.first().ok_or("snapshot without documents")?;
+    let mut page = Page { scroll_y: top["scrollOffsetY"].as_f64().unwrap_or(0.0), ..Page::default() };
+    let mut seen = vec![false; docs.len()];
+    document(&strings, docs, 0, Frame::TOP, &mut seen, &mut page);
+    Ok(page)
+}
+
+/// Where a snapshot document sits in the top one. The top document is at the
+/// origin; an `<iframe>`'s document is at the iframe's box, less its own
+/// scroll, clipped to that box, and on the iframe's layer (a consent dialog
+/// in a fixed modal stays fixed).
+#[derive(Clone, Copy)]
+struct Frame {
+    dx: f64,
+    dy: f64,
+    clip: Option<Rect>,
+    layer: Option<Layer>,
+    /// The host iframe's paint order: the frame's fills paint just above it.
+    order: i64,
+    depth: u32,
+}
+
+impl Frame {
+    const TOP: Frame = Frame { dx: 0.0, dy: 0.0, clip: None, layer: None, order: 0, depth: 0 };
+}
+
+/// Paint orders are per document; the top document's are shifted up by this
+/// so an iframe's own (from 0) fit between its host and the next box.
+const ORDER_SHIFT: u32 = 20;
+/// Iframes inside iframes inside ... stop here.
+const MAX_FRAME_DEPTH: u32 = 4;
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));
+    Rect { x: x0, y: y0, w: (x1 - x0).max(0.0), h: (y1 - y0).max(0.0) }
+}
+
+/// Read document `d` of the snapshot into `page`, then the documents of the
+/// iframes in it.
+fn document(strings: &[&str], docs: &[Value], d: usize, frame: Frame, seen: &mut [bool], page: &mut Page) {
+    if d >= docs.len() || seen[d] || frame.depth > MAX_FRAME_DEPTH {
+        return;
     }
+    seen[d] = true;
+    let doc = &docs[d];
+    let s = |i: i64| usize::try_from(i).ok().and_then(|i| strings.get(i).copied()).unwrap_or("");
+    let at = |r: Rect| Rect { x: r.x + frame.dx, y: r.y + frame.dy, ..r };
+    // In an iframe, only what shows through the iframe's box.
+    let shows = |r: &Rect| {
+        frame.clip.is_none_or(|c| {
+            let (cx, cy) = (r.x + r.w.min(c.w) / 2.0, r.y + r.h.min(c.h) / 2.0);
+            cx >= c.x && cx < c.x + c.w && cy >= c.y && cy < c.y + c.h
+        })
+    };
 
     let nodes = &doc["nodes"];
     let parent = ints(&nodes["parentIndex"]);
@@ -203,9 +269,13 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
     let layout = &doc["layout"];
     let node_index = ints(&layout["nodeIndex"]);
     let styles: Vec<Vec<i64>> = layout["styles"].as_array().map(|a| a.iter().map(ints).collect()).unwrap_or_default();
-    let bounds: Vec<Rect> = layout["bounds"].as_array().map(|a| a.iter().map(rect).collect()).unwrap_or_default();
+    let bounds: Vec<Rect> = layout["bounds"].as_array().map(|a| a.iter().map(|b| at(rect(b))).collect()).unwrap_or_default();
     let layout_text = ints(&layout["text"]);
     let paint = ints(&layout["paintOrders"]);
+    let order = |li: usize| {
+        let po = paint.get(li).copied().unwrap_or(0);
+        if frame.depth == 0 { po << ORDER_SHIFT } else { frame.order + 1 + po }
+    };
     let style = |li: usize, k: usize| styles.get(li).and_then(|st| st.get(k)).map(|&i| s(i)).unwrap_or("");
 
     // Per node: its first layout object, the layout object whose computed
@@ -227,10 +297,10 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
         let p = usize::try_from(parent[i]).ok().filter(|&p| p < i);
         let own = node_layout[i].filter(|&li| styles.get(li).is_some_and(|st| !st.is_empty()));
         style_of[i] = own.or(p.and_then(|p| style_of[p]));
-        layer[i] = p.map_or(Layer::Flow, |p| layer[p]);
+        layer[i] = p.map_or(frame.layer.unwrap_or(Layer::Flow), |p| layer[p]);
         if attr(i, "id") == Some("__kami_hints") {
             layer[i] = Layer::Hint;
-        } else if layer[i] == Layer::Flow && own.is_some_and(|li| style(li, POSITION) == "fixed") {
+        } else if frame.layer.is_none() && layer[i] == Layer::Flow && own.is_some_and(|li| style(li, POSITION) == "fixed") {
             layer[i] = Layer::Fixed;
         }
         gone[i] = p.is_some_and(|p| gone[p]) || own.is_some_and(|li| style(li, OPACITY) == "0");
@@ -254,11 +324,9 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
         }
     }
 
-    let mut page = Page { scroll_y: doc["scrollOffsetY"].as_f64().unwrap_or(0.0), ..Page::default() };
-
     let base = |ni: usize, rect: Rect, text: String, kind: Kind| -> Option<Item> {
         let li = style_of[ni]?;
-        if gone[ni] || style(li, VISIBILITY) != "visible" {
+        if gone[ni] || style(li, VISIBILITY) != "visible" || !shows(&rect) {
             return None;
         }
         let weight = style(li, WEIGHT);
@@ -276,13 +344,16 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
             link: link[ni],
             dim: false,
             size: style(li, FONT_SIZE).trim_end_matches("px").parse().unwrap_or(16.0),
+            key: 0,
+            backdrop: false,
+            order: 0,
         })
     };
 
     // Text: one item per line box.
     let tb = &doc["textBoxes"];
     let tb_layout = ints(&tb["layoutIndex"]);
-    let tb_bounds: Vec<Rect> = tb["bounds"].as_array().map(|a| a.iter().map(rect).collect()).unwrap_or_default();
+    let tb_bounds: Vec<Rect> = tb["bounds"].as_array().map(|a| a.iter().map(|b| at(rect(b))).collect()).unwrap_or_default();
     let tb_start = ints(&tb["start"]);
     let tb_len = ints(&tb["length"]);
     for (k, &li) in tb_layout.iter().enumerate() {
@@ -296,7 +367,10 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
         let start = tb_start.get(k).copied().unwrap_or(0).max(0) as usize;
         let len = tb_len.get(k).copied().unwrap_or(0).max(0) as usize;
         let text = utf16_slice(full, start, len);
-        if text.trim().is_empty() && layer[ni] != Layer::Hint {
+        // Whitespace-only fragments are kept: between two inline elements
+        // they are the only space there is ("using <b>Tumblr</b>"). They
+        // never start a row of their own (`grid.rs`).
+        if text.is_empty() {
             continue;
         }
         // Screen-reader-only text: a 1px clipped element whose text overflows
@@ -308,6 +382,7 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
             continue;
         }
         let Some(mut item) = base(ni, r, text.to_string(), Kind::Text) else { continue };
+        item.order = order(li);
         if item.layer == Layer::Hint {
             item.bg = style_of[ni].and_then(|li| parse_color(style(li, BACKGROUND))).filter(|c| c.1 > 0.5).map(|c| c.0);
         }
@@ -321,12 +396,18 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
         if r.w < 4.0 || r.h < 4.0 {
             continue;
         }
+        let big = r.w >= MIN_IMAGE && r.h >= MIN_IMAGE;
         let item = match name[ni] {
-            "IMG" | "VIDEO" if r.w >= 16.0 && r.h >= 16.0 => {
-                let alt = attr(ni, "alt").or(attr(ni, "title")).unwrap_or("").trim();
-                let what = if name[ni] == "VIDEO" { "video" } else { "img" };
-                let label = if alt.is_empty() { format!("[{what}]") } else { format!("[{alt}]") };
-                base(ni, r, label, Kind::Image)
+            "IMG" | "VIDEO" | "CANVAS" | "svg" if big => {
+                let alt = attr(ni, "alt").or(attr(ni, "title")).or(attr(ni, "aria-label")).unwrap_or("").trim();
+                let label = match (name[ni], alt.is_empty()) {
+                    (_, false) => format!("[{alt}]"),
+                    ("VIDEO", true) => "[video]".into(),
+                    ("IMG", true) => "[img]".into(),
+                    _ => String::new(),
+                };
+                let src = attr(ni, "src").or(attr(ni, "poster")).unwrap_or(name[ni]);
+                base(ni, r, label, Kind::Image).map(|it| Item { key: image_key(src, r), ..it })
             }
             "INPUT" => {
                 let ty = attr(ni, "type").unwrap_or("text").to_ascii_lowercase();
@@ -351,7 +432,14 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
             }
             _ => None,
         };
-        page.items.extend(item);
+        page.items.extend(item.map(|it| Item { order: order(li), ..it }));
+        // A CSS background image or gradient: pixels under the content.
+        let bg = style(li, BG_IMAGE);
+        if big && !bg.is_empty() && bg != "none" && styles.get(li).is_some_and(|st| !st.is_empty()) {
+            if let Some(it) = base(ni, r, String::new(), Kind::Image) {
+                page.items.push(Item { key: image_key(bg, r), backdrop: true, order: order(li), ..it });
+            }
+        }
     }
 
     // Backgrounds.
@@ -362,17 +450,51 @@ pub fn parse(reply: &[u8]) -> Result<Page, String> {
         }
         let Some((bg, alpha)) = parse_color(style(li, BACKGROUND)) else { continue };
         let Some(&r) = bounds.get(li) else { continue };
+        let r = frame.clip.map_or(r, |c| intersect(r, c));
         if alpha < 0.05 || r.w < 1.0 || r.h < 1.0 {
             continue;
         }
         match name[ni] {
-            "HTML" if alpha > 0.5 => page.canvas = Some(bg),
-            "BODY" if alpha > 0.5 && page.canvas.is_none() => page.canvas = Some(bg),
+            "HTML" if alpha > 0.5 && frame.depth == 0 => page.canvas = Some(bg),
+            "BODY" if alpha > 0.5 && frame.depth == 0 && page.canvas.is_none() => page.canvas = Some(bg),
             _ => {}
         }
-        page.fills.push(Fill { rect: r, bg, alpha, layer: layer[ni], order: paint.get(li).copied().unwrap_or(0) });
+        page.fills.push(Fill { rect: r, bg, alpha, layer: layer[ni], order: order(li) });
     }
-    Ok(page)
+
+    // The documents of this one's iframes, at their boxes.
+    let content = rare_values(&nodes["contentDocumentIndex"], n);
+    for (ni, &child) in content.iter().enumerate() {
+        let (Ok(child), Some(li)) = (usize::try_from(child), node_layout[ni]) else { continue };
+        let Some(&r) = bounds.get(li) else { continue };
+        let visible = style_of[ni].is_some_and(|li| style(li, VISIBILITY) == "visible");
+        if gone[ni] || !visible || r.w < 1.0 || r.h < 1.0 {
+            continue;
+        }
+        let Some(cd) = docs.get(child) else { continue };
+        let (sx, sy) = (cd["scrollOffsetX"].as_f64().unwrap_or(0.0), cd["scrollOffsetY"].as_f64().unwrap_or(0.0));
+        let sub = Frame {
+            dx: r.x - sx,
+            dy: r.y - sy,
+            clip: Some(frame.clip.map_or(r, |c| intersect(r, c))),
+            layer: Some(if layer[ni] == Layer::Hint { Layer::Flow } else { layer[ni] }),
+            order: order(li),
+            depth: frame.depth + 1,
+        };
+        document(strings, docs, child, sub, seen, page);
+    }
+}
+
+/// FNV-1a over an image's source and its box: the same picture in the same
+/// place keeps its pixels across snapshots; a moved or replaced one does not.
+fn image_key(src: &str, r: Rect) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    src.bytes().for_each(&mut eat);
+    for v in [r.x, r.y, r.w, r.h] {
+        (v.round() as i64).to_le_bytes().into_iter().for_each(&mut eat);
+    }
+    h
 }
 
 /// A text field's item: its value, else its placeholder (dimmed).
@@ -392,6 +514,25 @@ mod tests {
     use super::*;
     use crate::machine::SNAPSHOT_STYLES;
 
+    /// Debugging aid: `KAMI_SNAPSHOT=<file> cargo test --features tui
+    /// dump_snapshot -- --ignored --nocapture` lists what a saved snapshot
+    /// parses into (`KAMI_SNAPSHOT_DUMP` saves one).
+    #[test]
+    #[ignore]
+    fn dump_snapshot() {
+        let path = std::env::var("KAMI_SNAPSHOT").expect("KAMI_SNAPSHOT=<file>");
+        let p = parse(&std::fs::read(path).unwrap()).unwrap();
+        println!("scroll {} canvas {:?}: {} items, {} fills", p.scroll_y, p.canvas, p.items.len(), p.fills.len());
+        let only = std::env::var("KAMI_SNAPSHOT_GREP").unwrap_or_default();
+        for i in p.items.iter().filter(|i| only.is_empty() || format!("{i:?}").contains(&only)) {
+            let r = i.rect;
+            println!(
+                "{:?} {:?} [{:.0},{:.0} {:.0}x{:.0}] o={} b={} u={} l={} {:?}",
+                i.layer, i.kind, r.x, r.y, r.w, r.h, i.order, i.bold, i.underline, i.link, i.text.chars().take(60).collect::<String>()
+            );
+        }
+    }
+
     #[test]
     fn style_positions_match_the_request() {
         let want = [
@@ -404,6 +545,7 @@ mod tests {
             (OPACITY, "opacity"),
             (POSITION, "position"),
             (FONT_SIZE, "font-size"),
+            (BG_IMAGE, "background-image"),
         ];
         for (i, name) in want {
             assert_eq!(SNAPSHOT_STYLES[i], name);
@@ -445,6 +587,7 @@ mod tests {
         assert_eq!(input.text, "typed text");
         let img = p.items.iter().find(|i| i.kind == Kind::Image).unwrap();
         assert_eq!(img.text, "[a picture]");
+        assert!(!img.backdrop && img.key != 0);
         assert!(p.fills.iter().any(|f| f.bg == Rgb(34, 51, 68) && f.layer == Layer::Fixed), "the header's background");
         assert_eq!(p.canvas, Some(Rgb(0xfd, 0xfd, 0xf8)), "the test page sets body background #fdfdf8");
     }

@@ -22,7 +22,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use super::page::{Fill, Item, Kind, Layer, Page, Rgb};
+use super::page::{Fill, Item, Kind, Layer, Page, Rect, Rgb};
 
 /// The CSS px a terminal row stands for where there is no text to measure:
 /// blank space and the fixed layer. `kami tui` makes the page viewport
@@ -46,12 +46,33 @@ pub struct Cell {
     pub dim: bool,
     /// The right half of the double-width character in the cell before.
     pub tail: bool,
+    /// The paint order of the background on this cell: text painted earlier
+    /// than it is behind it and does not show.
+    pub z: i64,
+    /// Text (or a field) was drawn here, even if only a space between words:
+    /// images keep off it.
+    pub ink: bool,
 }
 
 impl Default for Cell {
     fn default() -> Cell {
-        Cell { ch: ' ', fg: None, bg: None, bold: false, italic: false, underline: false, dim: false, tail: false }
+        Cell { ch: ' ', fg: None, bg: None, bold: false, italic: false, underline: false, dim: false, tail: false, z: i64::MIN, ink: false }
     }
+}
+
+/// Where an image's pixels go: document rows and columns, filled by the view
+/// from the image cache (`image.rs`) once a capture has covered them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Slot {
+    pub key: u64,
+    /// The image's box in the document (CSS px).
+    pub rect: Rect,
+    pub rows: std::ops::Range<usize>,
+    pub cols: std::ops::Range<usize>,
+    /// Shown until pixels arrive (an `<img>`'s alt text); empty for none.
+    pub label: String,
+    /// A CSS background: under text, never over it.
+    pub backdrop: bool,
 }
 
 /// One cell of an overlay layer at a position.
@@ -71,6 +92,8 @@ pub struct Grid {
     anchors: Vec<f64>,
     pub hints: Vec<Placed>,
     pub fixed: Vec<Placed>,
+    /// Images in the flow, in paint order (backgrounds first).
+    pub images: Vec<Slot>,
     /// CSS px per column.
     pub cw: f64,
     /// What shows where the page paints nothing (see [`Page::canvas`]).
@@ -81,6 +104,13 @@ impl Grid {
     /// The row showing document y `y` (the last row starting at or above it).
     pub fn row_at(&self, y: f64) -> usize {
         self.anchors.partition_point(|&a| a <= y).saturating_sub(1)
+    }
+
+    /// The document y range row `r` stands for: from its anchor to the next.
+    pub fn band(&self, r: usize) -> (f64, f64) {
+        let y0 = self.row_y(r);
+        let y1 = self.anchors.get(r + 1).copied().filter(|&y| y > y0).unwrap_or(y0 + ROW_PX);
+        (y0, y1)
     }
 
     /// The document y row `r` stands for.
@@ -132,36 +162,74 @@ pub fn build(page: &Page, cols: usize, view_rows: usize, cw_fallback: f64) -> Gr
     let col = |x: f64| (x / cw).round();
     let on_page = |i: &Item| i.rect.x + i.rect.w > 0.0 && col(i.rect.x) < cols as f64 && i.rect.y + i.rect.h > 0.0;
 
-    // Rows, from the flow's line boxes.
-    let mut flow: Vec<&Item> = page.items.iter().filter(|i| i.layer == Layer::Flow && on_page(i)).collect();
-    flow.sort_by(|a, b| a.rect.y.total_cmp(&b.rect.y).then(a.rect.x.total_cmp(&b.rect.x)));
-    let mut row_of = Vec::with_capacity(flow.len());
+    // Rows, from the flow's line boxes. An image stands for a stack of
+    // lines one ROW_PX apart, so it gets rows in proportion to its height and
+    // text floated beside it shares them. Fields and checkboxes sit on a line
+    // without making it taller. Backgrounds take no rows of their own.
+    let flow: Vec<&Item> = page.items.iter().filter(|i| i.layer == Layer::Flow && !i.backdrop && on_page(i)).collect();
+    struct Probe {
+        y: f64,
+        h: f64,
+        x: f64,
+        /// Text: joining a line makes it as tall as this text. Image bands
+        /// and fields never stretch a line, or an image's bands would bridge
+        /// two lines of the paragraph beside it into one row.
+        grows: bool,
+        /// How tall a line this starts.
+        own: f64,
+        item: Option<usize>,
+    }
+    let mut probes = Vec::with_capacity(flow.len());
+    for (i, it) in flow.iter().enumerate() {
+        let (x, y, h) = (it.rect.x, it.rect.y, it.rect.h);
+        match it.kind {
+            Kind::Image => {
+                let n = ((h / ROW_PX).round() as usize).max(1);
+                let step = h / n as f64;
+                let h = (step - 1.0).max(1.0);
+                probes.extend((0..n).map(|k| Probe { y: y + k as f64 * step, h, x, grows: false, own: h, item: None }));
+            }
+            // A space between inline elements: on a line, never one of its own.
+            Kind::Text if it.text.trim().is_empty() => probes.push(Probe { y, h, x, grows: false, own: 0.0, item: Some(i) }),
+            Kind::Text => probes.push(Probe { y, h, x, grows: true, own: h, item: Some(i) }),
+            Kind::Field | Kind::Check => {
+                // At most one text line tall, whatever its padding.
+                let h = h.min(OBJECT_PX);
+                probes.push(Probe { y, h, x, grows: false, own: h, item: Some(i) })
+            }
+        }
+    }
+    probes.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    let mut row_of = vec![usize::MAX; flow.len()];
     let mut line: Option<(f64, f64)> = None; // the current line's top and bottom
     let mut bottom = 0.0f64; // where the previous line ended (the page top at first)
-    for it in &flow {
-        let text = it.kind == Kind::Text;
-        let h = if text { it.rect.h } else { it.rect.h.min(OBJECT_PX) };
-        let mid = it.rect.y + h / 2.0;
+    for p in &probes {
+        let mid = p.y + p.h / 2.0;
         if let Some((top, bot)) = line.as_mut() {
             if mid >= *top && mid < *bot {
-                if text {
-                    *bot = bot.max(it.rect.y + h);
+                if p.grows {
+                    *bot = bot.max(p.y + p.h);
                 }
-                row_of.push(g.anchors.len() - 1);
+                if let Some(i) = p.item {
+                    row_of[i] = g.anchors.len() - 1;
+                }
                 continue;
             }
             bottom = *bot;
         }
-        let gap = it.rect.y - bottom;
+        if p.own <= 0.0 {
+            continue;
+        }
+        let gap = p.y - bottom;
         let blanks = (((gap + ROW_PX * 0.25) / ROW_PX).floor().max(0.0) as usize).min(MAX_BLANK);
         for k in 0..blanks {
             g.anchors.push(bottom + gap * k as f64 / blanks as f64);
         }
-        g.anchors.push(it.rect.y);
-        row_of.push(g.anchors.len() - 1);
-        // An object's line is one text line tall at most, and only as tall as
-        // the object's own mid-point for the purpose of what joins it.
-        line = Some((it.rect.y, it.rect.y + if text { h } else { h / 2.0 + 1.0 }));
+        g.anchors.push(p.y);
+        if let Some(i) = p.item {
+            row_of[i] = g.anchors.len() - 1;
+        }
+        line = Some((p.y, p.y + p.own));
     }
     if g.anchors.is_empty() {
         g.anchors.push(0.0);
@@ -184,20 +252,36 @@ pub fn build(page: &Page, cols: usize, view_rows: usize, cw_fallback: f64) -> Gr
         for r in g.rows_of(f.rect.y, f.rect.y + f.rect.h) {
             for c in &mut g.rows[r][c0..c1] {
                 c.bg = Some(blend(f.bg, f.alpha, c.bg));
+                if f.alpha > 0.9 {
+                    c.z = c.z.max(f.order);
+                }
             }
         }
     }
 
+    // Images: where their pixels go. Backgrounds first, so an <img> inside a
+    // box with a background image paints over it.
+    let mut slots: Vec<&Item> =
+        page.items.iter().filter(|i| i.layer == Layer::Flow && i.kind == Kind::Image && on_page(i)).collect();
+    slots.sort_by_key(|i| !i.backdrop);
+    for it in slots {
+        let (c0, c1) = span(col(it.rect.x), col(it.rect.x + it.rect.w), cols);
+        let rows = g.rows_of(it.rect.y, it.rect.y + it.rect.h);
+        if c0 < c1 && !rows.is_empty() {
+            g.images.push(Slot { key: it.key, rect: it.rect, rows, cols: c0..c1, label: it.text.clone(), backdrop: it.backdrop });
+        }
+    }
+
     // Text, left to right along each row.
-    let mut order: Vec<usize> = (0..flow.len()).collect();
+    let mut order: Vec<usize> = (0..flow.len()).filter(|&i| row_of[i] != usize::MAX).collect();
     order.sort_by(|&a, &b| row_of[a].cmp(&row_of[b]).then(flow[a].rect.x.total_cmp(&flow[b].rect.x)));
-    let mut end = (usize::MAX, 0usize, 0.0f64); // (row, first free column, right edge in px)
+    let mut end = (usize::MAX, 0.0f64); // (row, the previous item's right edge in px)
     for i in order {
         let (it, r) = (flow[i], row_of[i]);
-        let (free, right) = if end.0 == r { (end.1, end.2) } else { (0, 0.0) };
-        let c = place(col(it.rect.x), free, it.rect.x - right, it, &g.rows[r]);
-        let stop = paint(&mut g.rows[r], c, it, cw);
-        end = (r, stop, it.rect.x + it.rect.w);
+        let right = if end.0 == r { end.1 } else { f64::NEG_INFINITY };
+        let c = place(col(it.rect.x), it.rect.x - right, it, &g.rows[r]);
+        paint(&mut g.rows[r], c, it, cw);
+        end = (r, it.rect.x + it.rect.w);
     }
 
     // Link hints: on the rows of what they label. Labels are wider than many
@@ -227,13 +311,18 @@ pub fn build(page: &Page, cols: usize, view_rows: usize, cw_fallback: f64) -> Gr
         let (r0, r1) = (srow(f.rect.y).max(0.0) as usize, (srow(f.rect.y + f.rect.h - 1.0) + 1.0).max(0.0) as usize);
         for row in fixed.iter_mut().take(r1).skip(r0) {
             for c in &mut row[c0..c1] {
-                *c = Some(Cell { bg: Some(f.bg), ..Cell::default() });
+                *c = Some(Cell { bg: Some(f.bg), z: f.order, ..Cell::default() });
             }
         }
     }
-    let mut fixed_items: Vec<&Item> = page.items.iter().filter(|i| i.layer == Layer::Fixed && on_page(i)).collect();
+    // (No pixels in the fixed layer yet: an image there shows its label.)
+    let mut fixed_items: Vec<&Item> = page
+        .items
+        .iter()
+        .filter(|i| i.layer == Layer::Fixed && on_page(i) && !i.backdrop && !(i.kind == Kind::Image && i.text.is_empty()))
+        .collect();
     fixed_items.sort_by(|a, b| srow(a.rect.y + 1.0).total_cmp(&srow(b.rect.y + 1.0)).then(a.rect.x.total_cmp(&b.rect.x)));
-    let mut end = (usize::MAX, 0usize, 0.0f64);
+    let mut end = (usize::MAX, 0.0f64);
     for it in fixed_items {
         let r = srow(it.rect.y + it.rect.h.min(ROW_PX) / 2.0);
         if r < 0.0 || r as usize >= view_rows {
@@ -241,13 +330,13 @@ pub fn build(page: &Page, cols: usize, view_rows: usize, cw_fallback: f64) -> Gr
         }
         let r = r as usize;
         let mut row: Vec<Cell> = fixed[r].iter().map(|c| c.unwrap_or_default()).collect();
-        let (free, right) = if end.0 == r { (end.1, end.2) } else { (0, 0.0) };
-        let c0 = place(col(it.rect.x), free, it.rect.x - right, it, &row);
+        let right = if end.0 == r { end.1 } else { f64::NEG_INFINITY };
+        let c0 = place(col(it.rect.x), it.rect.x - right, it, &row);
         let stop = paint(&mut row, c0, it, cw);
         for c in c0..stop {
             fixed[r][c] = Some(row[c]);
         }
-        end = (r, stop, it.rect.x + it.rect.w);
+        end = (r, it.rect.x + it.rect.w);
     }
     for (r, row) in fixed.into_iter().enumerate() {
         g.fixed.extend(row.into_iter().enumerate().filter_map(|(c, cell)| Some(Placed { row: r, col: c, cell: cell? })));
@@ -272,20 +361,28 @@ fn blend(fg: Rgb, alpha: f64, under: Option<Rgb>) -> Rgb {
     Rgb(m(fg.0, u.0), m(fg.1, u.1), m(fg.2, u.2))
 }
 
-/// The column an item starts at: where its x says, unless the row's previous
-/// item ran up to or past that (proportional text is wider than its cells), in
-/// which case right after it. Two words that would then touch get a space
-/// between them when they were really apart: the previous one overran by more
-/// than rounding, or there were pixels between them (`gap_px`, from the
+/// The column an item starts at: where its x says, unless text already drawn
+/// on the row is in the way (proportional text is wider than its cells), in
+/// which case right after that text. Two words that would then touch get a
+/// space between them when they were really apart: the earlier one overran by
+/// more than rounding, or there were pixels between them (`gap_px`, from the
 /// previous item's right edge) that came to less than a column, as between
-/// two table cells.
-fn place(at: f64, free: usize, gap_px: f64, it: &Item, row: &[Cell]) -> usize {
-    let at = at.max(0.0) as usize;
-    if at > free {
-        return at;
+/// two table cells. Only drawn text is in the way: text hidden behind a box
+/// painted over it does not push anything.
+fn place(at: f64, gap_px: f64, it: &Item, row: &[Cell]) -> usize {
+    let at = (at.max(0.0) as usize).min(row.len());
+    let len = it.text.chars().count().max(1);
+    let inked = |c: usize| row[c].ch != ' ' || row[c].tail;
+    let starts_word = !it.text.starts_with(' ');
+    match (at..(at + len).min(row.len())).rev().find(|&c| inked(c)) {
+        Some(last) => {
+            // Past the whole run of text in the way, not just the part of it
+            // under this item.
+            let free = (last + 1..row.len()).find(|&c| !inked(c)).unwrap_or(row.len());
+            free + (starts_word && (free - at > 1 || gap_px >= 1.0)) as usize
+        }
+        None => at + (at > 0 && starts_word && inked(at - 1) && gap_px >= 1.0) as usize,
     }
-    let words = free > 0 && row.get(free - 1).is_some_and(|c| c.ch != ' ') && !it.text.starts_with(' ');
-    free + (words && (free - at > 1 || gap_px >= 1.0)) as usize
 }
 
 /// Draw one item into `row` from column `c`; returns the first column after it.
@@ -315,8 +412,8 @@ fn paint(row: &mut [Cell], c: usize, it: &Item, cw: f64) -> usize {
             // The whole box underlined, so an empty field is visible.
             style.underline = true;
             let width = ((it.rect.w / cw).round() as usize).max(4);
-            for cell in row.iter_mut().skip(c).take(width) {
-                *cell = Cell { bg: cell.bg, ..style };
+            for cell in row.iter_mut().skip(c).take(width).filter(|cell| cell.z <= it.order) {
+                *cell = Cell { bg: cell.bg, z: cell.z, ink: true, ..style };
             }
         }
         Kind::Text | Kind::Check => {}
@@ -335,9 +432,12 @@ fn paint(row: &mut [Cell], c: usize, it: &Item, cw: f64) -> usize {
         if x + w > cols {
             break;
         }
-        row[x] = Cell { ch, bg: it.bg.or(row[x].bg), ..style };
-        if w == 2 {
-            row[x + 1] = Cell { ch: ' ', tail: true, bg: it.bg.or(row[x + 1].bg), ..style };
+        // Behind a box painted after it (a dialog over the page): hidden.
+        if row[x..x + w].iter().all(|cell| cell.z <= it.order) {
+            row[x] = Cell { ch, bg: it.bg.or(row[x].bg), z: row[x].z, ink: true, ..style };
+            if w == 2 {
+                row[x + 1] = Cell { ch: ' ', tail: true, bg: it.bg.or(row[x + 1].bg), z: row[x + 1].z, ink: true, ..style };
+            }
         }
         x += w;
     }
@@ -366,6 +466,9 @@ mod tests {
             link: false,
             dim: false,
             size: 16.0,
+            key: 0,
+            backdrop: false,
+            order: 0,
         }
     }
 
@@ -427,6 +530,28 @@ mod tests {
     }
 
     #[test]
+    fn a_field_and_the_button_beside_it_share_a_row() {
+        // testdata/tui/test.html: a 25 px input at y=401, its button's text at 404.
+        let mut field = text(24.0, 401.0, 150.0, 25.0, "typed text");
+        field.kind = Kind::Field;
+        let p = page(vec![text(0.0, 380.0, 30.0, 19.0, "top"), field, text(190.0, 404.0, 20.0, 15.0, "Go")]);
+        let g = build(&p, 30, 5, 10.0);
+        assert!(g.text().iter().any(|r| r.contains("typed text") && r.contains("Go")), "{:?}", g.text());
+    }
+
+    #[test]
+    fn a_space_between_inline_elements_survives_and_never_makes_a_row() {
+        let p = page(vec![
+            text(0.0, 0.0, 50.0, 19.0, "using"),
+            text(50.0, 0.0, 10.0, 19.0, " "),
+            text(60.0, 0.0, 60.0, 19.0, "Tumblr"),
+            text(0.0, 300.0, 10.0, 19.0, " "),
+        ]);
+        let g = build(&p, 20, 5, 10.0);
+        assert_eq!(g.text(), ["using Tumblr"], "and the lone space at y=300 made no rows");
+    }
+
+    #[test]
     fn cells_a_few_pixels_apart_do_not_run_together() {
         // Two table cells: "alpha" fills 50 px, the next starts 3 px later and
         // rounds onto the very next column.
@@ -437,23 +562,52 @@ mod tests {
         assert_eq!(build(&p, 20, 10, 10.0).text()[0], "bold");
     }
 
-    #[test]
-    fn an_image_beside_a_paragraph_does_not_merge_its_lines() {
-        // A 200 px image whose top is between two text lines.
-        let mut img = text(300.0, 25.0, 200.0, 200.0, "[photo]");
-        img.kind = Kind::Image;
-        let p = page(vec![text(0.0, 0.0, 40.0, 19.0, "one"), img, text(0.0, 38.0, 40.0, 19.0, "two"), text(0.0, 57.0, 40.0, 19.0, "three")]);
-        let g = build(&p, 60, 10, 10.0);
-        let rows: Vec<String> = g.text().iter().map(|r| r.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
-        assert_eq!(rows, ["one", "[photo]", "two", "three"]);
+    fn image(x: f64, y: f64, w: f64, h: f64, label: &str) -> Item {
+        Item { kind: Kind::Image, key: (x + y * 1000.0) as u64 + 1, ..text(x, y, w, h, label) }
     }
 
     #[test]
-    fn an_image_label_stays_in_its_box() {
-        let mut img = text(0.0, 0.0, 80.0, 80.0, "[A photo of various products made from paper.]");
-        img.kind = Kind::Image;
-        let g = build(&page(vec![img]), 60, 10, 10.0);
-        assert_eq!(g.text()[0], "[A pho…]", "80 px is 8 cells");
+    fn an_image_gets_rows_for_its_height_and_shares_them_with_text_beside_it() {
+        // A 95 px image (5 rows) beside three lines of a paragraph.
+        let p = page(vec![
+            text(0.0, 0.0, 30.0, 19.0, "one"),
+            image(300.0, 0.0, 200.0, 95.0, "[photo]"),
+            text(0.0, 19.0, 30.0, 19.0, "two"),
+            text(0.0, 38.0, 50.0, 19.0, "three"),
+            text(0.0, 120.0, 50.0, 19.0, "after"),
+        ]);
+        let g = build(&p, 60, 10, 10.0);
+        let rows: Vec<String> = g.text().iter().map(|r| r.trim().to_string()).collect();
+        assert_eq!(rows, ["one", "two", "three", "", "", "", "after"], "rows 3-4 are the image's lower part; one blank row for the gap after it");
+        assert_eq!(g.images.len(), 1);
+        assert_eq!(g.images[0].rows, 0..5);
+        assert_eq!(g.images[0].cols, 30..50);
+        assert_eq!(g.images[0].label, "[photo]");
+        assert!(!g.text().concat().contains("[photo]"), "the label is the view's, drawn only while there are no pixels");
+    }
+
+    #[test]
+    fn an_image_beside_a_paragraph_keeps_its_lines_apart() {
+        // Lines every 19 px from y=0; a 200 px image starting mid-line, so
+        // its bands straddle the text lines.
+        let mut items: Vec<Item> = (0..8).map(|i| text(0.0, i as f64 * 19.0, 50.0, 19.0, &format!("line{i}"))).collect();
+        items.push(image(300.0, 8.0, 200.0, 200.0, ""));
+        let g = build(&page(items), 60, 10, 10.0);
+        let t = g.text();
+        for i in 0..8 {
+            assert_eq!(t.iter().filter(|r| r.contains(&format!("line{i}"))).count(), 1);
+            assert!(t.iter().all(|r| r.matches("line").count() <= 1), "two lines merged into one row: {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_background_image_takes_no_rows_of_its_own() {
+        let mut bg = image(0.0, 0.0, 300.0, 600.0, "");
+        bg.backdrop = true;
+        let p = page(vec![bg, text(0.0, 0.0, 40.0, 19.0, "a"), text(0.0, 19.0, 40.0, 19.0, "b")]);
+        let g = build(&p, 40, 10, 10.0);
+        assert_eq!(g.rows.len(), 2, "a 600 px background over two lines of text is two rows");
+        assert!(g.images[0].backdrop && g.images[0].rows == (0..2));
     }
 
     #[test]
@@ -497,6 +651,26 @@ mod tests {
             line[h.col] = h.cell.ch;
         }
         assert_eq!(line.iter().collect::<String>(), "AAA AAS AAD ");
+    }
+
+    #[test]
+    fn text_behind_a_later_box_does_not_show_through_it() {
+        // A fixed bar's text, and a dialog painted after it over part of it.
+        let mut bar = text(0.0, 504.0, 120.0, 19.0, "Join over 100");
+        bar.layer = Layer::Fixed;
+        bar.order = 5;
+        let mut button = text(0.0, 504.0, 30.0, 19.0, "Yes");
+        button.layer = Layer::Fixed;
+        button.order = 20;
+        let mut p = page(vec![text(0.0, 0.0, 10.0, 19.0, "x"), bar, button]);
+        p.scroll_y = 500.0;
+        p.fills.push(Fill { rect: Rect { x: 0.0, y: 500.0, w: 60.0, h: 30.0 }, bg: Rgb(9, 9, 9), alpha: 1.0, layer: Layer::Fixed, order: 10 });
+        let g = build(&p, 20, 5, 10.0);
+        let mut line = [' '; 13];
+        for c in g.fixed.iter().filter(|c| c.row == 0 && c.col < 13) {
+            line[c.col] = c.cell.ch;
+        }
+        assert_eq!(line.iter().collect::<String>(), "Yes   ver 100", "the dialog (cols 0-5) hides the bar's text under it, and its own button is not pushed aside by the hidden text");
     }
 
     #[test]

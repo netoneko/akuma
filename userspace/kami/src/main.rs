@@ -497,7 +497,7 @@ fn session(args: &Args) -> io::Result<()> {
                         };
                     }
                     // Layout mode only (`kami tui`).
-                    Effect::Layout { .. } | Effect::Scroll(_) => {}
+                    Effect::Layout { .. } | Effect::Scroll(_) | Effect::Captured { .. } => {}
                     Effect::TryConnect { .. } | Effect::Send(_) | Effect::Pin(_) | Effect::Log(_) => {}
                 }
             }

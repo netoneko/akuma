@@ -42,6 +42,7 @@ pub const SNAPSHOT_STYLES: &[&str] = &[
     "opacity",
     "position",
     "font-size",
+    "background-image",
 ];
 /// Layout mode asks the page whether it changed this often.
 const PROBE_EVERY: Ms = 250;
@@ -75,6 +76,20 @@ pub enum Source {
     Layout,
 }
 
+/// A region of the page to capture (CSS px, document coordinates) and the
+/// scale to capture it at. Layout mode captures only what is in the page's
+/// viewport: `captureBeyondViewport` resizes the page for the capture (two
+/// `resize` events, a reflow, ~0.9 s on a Mac) and lazy images outside the
+/// viewport are not loaded anyway.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clip {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub scale: f64,
+}
+
 /// What a session shows: pixels (the framebuffer) or the page's layout
 /// painted into a terminal (`kami tui`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,9 +120,14 @@ pub enum Event {
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     /// The page viewport (CSS px) changed: the terminal was resized.
     Resized((usize, usize)),
+    /// Layout mode: capture this region as a PNG for the images on screen;
+    /// answered with [`Effect::Captured`]. Only one capture is in flight; a
+    /// request made meanwhile replaces any earlier waiting one.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    Capture(Clip),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Effect {
     /// Connect to the daemon socket, starting the daemon first if `spawn`.
     /// Answer with [`Event::Connected`] or [`Event::ConnectFailed`].
@@ -125,6 +145,8 @@ pub enum Effect {
     /// Layout mode: scroll the terminal view (the whole document is already
     /// laid out, so this needs no round-trip); answer with [`Event::ViewScrolled`].
     Scroll(Scroll),
+    /// Layout mode: the base64 PNG of an [`Event::Capture`], and its clip.
+    Captured { b64: String, clip: Clip },
     /// Remember this tab as the session's: the next kami attaches to it.
     Pin(String),
     Status(String),
@@ -182,6 +204,8 @@ enum Req {
     Snapshot,
     /// Layout mode: `window.scrollTo` after the view moved.
     ScrollTo,
+    /// Layout mode: `Page.captureScreenshot` for the images on screen.
+    Capture,
     Ignore,
 }
 
@@ -243,6 +267,9 @@ pub struct Machine {
     layout_version: String,
     /// The request id of the last `window.scrollTo`.
     last_scroll_id: u64,
+    /// The capture in flight, and the one to send when it is answered.
+    capture: Option<Clip>,
+    capture_next: Option<Clip>,
 }
 
 /// Layout mode: the pass-through keys that scroll a page, as view scrolls.
@@ -307,6 +334,8 @@ impl Machine {
             last_snapshot_at: 0,
             layout_version: String::new(),
             last_scroll_id: 0,
+            capture: None,
+            capture_next: None,
         }
     }
 
@@ -343,6 +372,13 @@ impl Machine {
                     let params = format!("{{\"expression\":\"{}\"}}", escape(&js));
                     self.send(Req::ScrollTo, "Runtime.evaluate", &params, true, &mut out);
                     self.last_scroll_id = self.next_id;
+                }
+            }
+            Event::Capture(clip) => {
+                if self.capture.is_some() {
+                    self.capture_next = Some(clip);
+                } else {
+                    self.send_capture(clip, &mut out);
                 }
             }
             Event::Resized(view) => {
@@ -406,7 +442,8 @@ impl Machine {
         if let Some(s) = self.session.clone() {
             if self.layout() {
                 // A framebuffer kami attaching next should see the page's own fonts.
-                let js = "document.getElementById('__kami_tui_css')?.remove()";
+                let js = "(function r(d){d.getElementById('__kami_tui_css')?.remove();\
+                          for(const f of d.querySelectorAll('iframe')){try{f.contentDocument&&r(f.contentDocument)}catch(e){}}})(document)";
                 self.send(Req::Ignore, "Runtime.evaluate", &format!("{{\"expression\":\"{js}\"}}"), true, out);
             }
             self.send(Req::Ignore, "Page.stopScreencast", "{}", true, out);
@@ -563,6 +600,20 @@ impl Machine {
         self.layout_inflight = false;
         self.layout_force = true;
         self.layout_version.clear();
+        self.capture = None;
+        self.capture_next = None;
+    }
+
+    fn send_capture(&mut self, clip: Clip, out: &mut Vec<Effect>) {
+        if self.phase != Phase::Running || self.session.is_none() {
+            return;
+        }
+        let Clip { x, y, w, h, scale } = clip;
+        let p = format!(
+            "{{\"format\":\"png\",\"clip\":{{\"x\":{x},\"y\":{y},\"width\":{w},\"height\":{h},\"scale\":{scale}}}}}"
+        );
+        self.capture = Some(clip);
+        self.send(Req::Capture, "Page.captureScreenshot", &p, true, out);
     }
 
     /// Layout mode: snapshot at the next probe even if nothing reports a change.
@@ -833,6 +884,21 @@ impl Machine {
                 }
             }
             Req::ScrollTo => {}
+            Req::Capture => {
+                let clip = self.capture.take();
+                out.push(Effect::Log(format!(
+                    "layout: capture {} ms, {} KB{}",
+                    self.now.saturating_sub(p.sent),
+                    m.len() / 1024,
+                    if err { " (error)" } else { "" }
+                )));
+                if let (false, Some(clip), Some(b64)) = (err, clip, str_field(m, "data")) {
+                    out.push(Effect::Captured { b64: b64.to_string(), clip });
+                }
+                if let Some(next) = self.capture_next.take() {
+                    self.send_capture(next, out);
+                }
+            }
             Req::Click => {
                 out.push(Effect::Log(format!("hints: click reply {}", detail())));
                 let v = if err { "" } else { str_field(m, "value").unwrap_or("") };
@@ -1543,6 +1609,21 @@ mod tests {
         let e = probe(&mut m, 10 + SNAPSHOT_GAP + 1, "doc1:1");
         let e = m.handle(reply(last_id(&e), "{}"));
         assert!(has(&e, |x| matches!(x, Effect::Layout { follow_scroll: true, .. })));
+    }
+
+    #[test]
+    fn layout_mode_captures_one_at_a_time_keeping_only_the_latest_request() {
+        let (mut m, _) = running_layout(false);
+        let clip = |y: f64| Clip { x: 0.0, y, w: 800.0, h: 600.0, scale: 0.25 };
+        let e = m.handle(Event::Capture(clip(0.0)));
+        let first = last_id(&e);
+        assert!(sent(&e)[0].contains("Page.captureScreenshot") && sent(&e)[0].contains("\"scale\":0.25"));
+        assert!(sent(&m.handle(Event::Capture(clip(100.0)))).is_empty(), "one in flight");
+        assert!(sent(&m.handle(Event::Capture(clip(200.0)))).is_empty());
+        let e = m.handle(reply(first, r#"{"data":"QUJD"}"#));
+        assert!(has(&e, |x| *x == Effect::Captured { b64: "QUJD".into(), clip: clip(0.0) }));
+        let s = sent(&e);
+        assert!(s.len() == 1 && s[0].contains("\"y\":200"), "only the latest waiting request: {s:?}");
     }
 
     #[test]

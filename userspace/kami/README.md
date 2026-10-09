@@ -100,6 +100,27 @@ How it works (`src/tui/`, the layout half of `src/machine.rs`):
   screen. When the page scrolls itself (navigation, an anchor, its own script),
   the view follows, except for a snapshot asked for before kami's own last
   scroll.
+- **Images are pixels**, as `▀` half blocks (upper pixel foreground, lower
+  background), in any truecolour terminal. After each snapshot kami captures the
+  page's viewport at about 2 px per cell (`Page.captureScreenshot` with a clip
+  inside the viewport: a 100-column view is a ~240x150 PNG, 30-50 ms on a Mac)
+  and samples every image on screen from it into a per-image cell cache,
+  keyed by source and box, so pixels survive scrolling and relayout. An
+  `<img>`/`<video>`/`<canvas>`/`<svg>` of 24 px or more gets rows for its
+  height (text floated beside it shares them) and shows `[alt text]` on grey
+  until pixels arrive. CSS `background-image`s and gradients fill in behind
+  text and never cover it. No `captureBeyondViewport`: it resizes the page
+  for the capture (two `resize` events, a reflow, 0.9 s) and lazy images
+  below the fold are not loaded anyway; they fill in as the view reaches them.
+- **Iframes** (same-origin and, with kami's site-isolation flags, cross-origin
+  too) come as further snapshot documents; each is placed at its iframe's box,
+  clipped to it, on the iframe's layer. Tumblr's cookie notice is one: before
+  this it was an empty white box over the page. `cells.js` and the change
+  counter reach into same-origin frames as well (a script-built
+  `about:blank` frame never runs a new-document script).
+- **Occlusion**: items and backgrounds carry Chromium's paint order (per
+  document, nested under the host iframe's), and text behind a box painted
+  after it does not show through (Tumblr's sign-up bar under its own dialog).
 - Images show as `[alt text]` inside their box. Inputs show their value,
   underlined (placeholders dimmed, passwords masked), checkboxes as `[x]`/`[ ]`,
   selects as the chosen option. Text in a 1x1 px element (screen-reader-only
@@ -124,12 +145,34 @@ driven by `script` with keys fed on stdin:
 | lkml.org | 82 KB, 7-10 ms | two-column message tables and kernel table as on the site. Needs a desktop user agent: lkml is behind Anubis, which refuses `HeadlessChrome` (`--chrome-arg --user-agent=...`) |
 | en.wikipedia.org/wiki/Paper | 1.1 MB, 88 ms, parsed in 5 ms | TOC column, article beside the infobox, appearance sidebar, 652 rows |
 | news.ycombinator.com | | the story list as on the site; 87 hints; `f` + `aad` clicked `new` and the view followed to `/newest` |
+| www.tumblr.com | 1.4 MB, 110-125 ms | the cookie notice (an iframe) readable and clickable; trending cards, masonry posts with their images, avatars, tags and counts, the fixed sign-up bar. The login form fills (fields verified to hold exactly what was typed) but Tumblr answered "Your email or password were incorrect" twice; not retried |
 
-Not done yet: iframes (only the top document is read; same-origin ones come as
-further snapshot documents in their own coordinates), borders (no box drawing),
-scrolling *inside* an `overflow:auto` element, mouse clicks/wheel from the
-terminal, and images as pixels (sixel/kitty, or half-blocks from a screenshot
-clip). Not yet run on Akuma.
+A saved snapshot can be inspected with kami's own parser:
+`KAMI_SNAPSHOT=<file> cargo test --features tui dump_snapshot -- --ignored --nocapture`
+(`KAMI_SNAPSHOT_GREP=Fixed` narrows it).
+
+**Privacy:** the input log records every tty chunk and every decoded input,
+so text typed in insert mode (passwords included) lands in
+`/tmp/kami-input.log` in clear. True of the framebuffer kami as well. Open:
+log insert-mode text as its length only.
+
+Next:
+
+- **An edit line for form fields.** A hint that lands on a text field,
+  password, textarea, checkbox, radio or `<select>` should open kami's own
+  editor on the status line (instant local echo, no snapshot per keystroke;
+  Enter commits with select-all + `Input.insertText`, Esc cancels);
+  checkboxes and radios toggle; a `<select>` lists its options to pick from
+  and commits with `value` + a `change` event. Headless Chromium draws no
+  native `<select>` popup at all, so today a dropdown cannot be used.
+- **A layout test suite from the W3C web-platform-tests**, once kami moves to
+  its own repo: run WPT's CSS layout tests (flow, floats, tables, flexbox,
+  grid, positioning, overflow, iframes) through `kami tui` and compare the
+  cell grid against what the snapshot says, so layout regressions show up as
+  test failures rather than in a screenshot.
+- Borders (box drawing), scrolling *inside* an `overflow:auto` element,
+  mouse clicks and wheel from the terminal, pixels in the fixed layer, and
+  sixel/kitty images for terminals that have them. Not yet run on Akuma.
 
 ## The status bar
 
