@@ -997,6 +997,23 @@ entry 14 (`smp=8`), netwatch off.
   (was 109-144, median 120; Linux 72). `scroll_try.py`: isolated keys median
   74 ms (max 113), bursts 73 ms (max 85), 9 frames/s, no key without a frame.
 
+## Fix 35 (2026-10-09, night): `MAP_FIXED_NOREPLACE` was a hint on amd64
+
+Found by `altstackexec.c`, whose fixed altstack came back at another address.
+amd64's `sys_mmap` tested only `MAP_FIXED`, so `MAP_FIXED_NOREPLACE` fell into
+the hint arm: a free address was ignored, and an occupied one (the program's
+own text, its stack) was "satisfied" somewhere else with errno 0. Linux
+(>= 4.17) maps exactly there or fails with `EEXIST`; PartitionAlloc and V8
+reserve ranges this way and would use memory they did not get. Now: the same
+bounds check as `MAP_FIXED`, then `EEXIST` if a region overlaps **or** a page
+of the range is present in the page table (the ELF image, stack and `brk`
+have no region record here; the walk is capped at 256 MiB), else exactly
+`addr`. Probe `userspace/forktest/c_stress/mapnoreplace.c`: **Linux all PASS**
+(arm64, Lima); **Akuma before: all 4 FAIL** (metal, boot 90). After: QEMU
+`SMP=4` self-tests 817/0; the probe on the fixed kernel is pending. The
+AArch64 glue's pinned divergence (`akuma-syscalls-mem` #6, NOREPLACE =
+`MAP_FIXED` without the occupied check) is unchanged.
+
 ## Scoreboard: kernel bugs found by running kami / Chromium
 
 Kept here so the count survives; update the row, not the prose, when something
@@ -1036,6 +1053,7 @@ and should be linked from here (done in the last column).
 | 32 | **`CLOCK_MONOTONIC` differs between cores by up to ~1 s on the metal** (no per-core TSC offset): Chromium's network service CHECKs `start <= end` on a stream request and died ~4 s into every Chromium start on the metal, so tumblr painted a blank page | **fixed and verified on the metal 10-09** (APs +1.013 s vs BSP; tumblr loads, 0 network-service crashes) | Fixes 32-34 above |
 | 33 | **`execve` kept the per-thread `sigaltstack`** (only the `Process` copy was cleared): an exec'd helper's signal frames aimed at the parent image's altstack VA | **fixed and verified on the metal 10-09** (`altstackexec` FAIL -> PASS; Linux PASS) | Fixes 32-34 above |
 | 34 | **timed futex waits overshot by a whole tick** (an `hlt` before the deadline test on every pass, and no one-shot timer) | **fixed and verified on the metal 10-09** (futex 1 ms: 10.0 -> 1.013 ms; key->frame 120 -> 74-78 ms) | Fixes 32-34 above |
+| 35 | **`MAP_FIXED_NOREPLACE` ignored on amd64** (treated as a hint, even over the text and stack) | **fixed in tree 10-09; probe Linux PASS, old Akuma 4/4 FAIL; fixed kernel pending** | Fix 35 above |
 
 Score: 30 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path,
 the two `/proc` files, and the two `mprotect`/`madvise` fixes), of which Fix 7 is

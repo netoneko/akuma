@@ -546,7 +546,10 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // page, which is never a real one and would make a null dereference
     // succeed. Saturating, because `len` is a ring-3 register and a wrap would
     // turn "spans the whole address space" into "fits".
-    if flags32 & akuma_syscalls_linux::flags::map::MAP_FIXED != 0 {
+    if flags32 & (akuma_syscalls_linux::flags::map::MAP_FIXED
+        | akuma_syscalls_linux::flags::map::MAP_FIXED_NOREPLACE)
+        != 0
+    {
         let want = addr as usize;
         if want < PAGE_SIZE as usize
             || want.saturating_add(len as usize) > USER_VA_LIMIT
@@ -631,6 +634,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     }
 
     let fixed = flags32 & akuma_syscalls_linux::flags::map::MAP_FIXED != 0;
+    let noreplace = !fixed && flags32 & akuma_syscalls_linux::flags::map::MAP_FIXED_NOREPLACE != 0;
     let byte_len = pages * PAGE_SIZE as usize;
 
     let base = if fixed {
@@ -644,6 +648,33 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         // and region records alike. Doing this before reserving is what keeps
         // the new region from being clipped by the teardown of the old one.
         unmap_range(want, want + byte_len);
+        want
+    } else if noreplace {
+        // `MAP_FIXED_NOREPLACE` (2026-10-09): exactly `addr`, or `EEXIST` if
+        // anything is mapped there — never moved, never replacing. It fell
+        // through to the hint arm before, so a free `addr` came back as
+        // wherever the cursor was (`forktest/c_stress/altstackexec.c`: the
+        // probe's fixed altstack landed elsewhere). Overlap is judged against
+        // the region list **and** the page table, because the ELF image, the
+        // stack and `brk` are mapped without a region record here. The page
+        // walk is capped (256 MiB); past that only the region list is asked.
+        let want = addr as usize;
+        if want.saturating_add(byte_len) > USER_VA_LIMIT {
+            return errno::EINVAL;
+        }
+        let overlaps = usermode::with_current_regions_and_cursor(|regions, _| {
+            regions.iter().any(|r| {
+                let end = r.start_va + r.pages * PAGE_SIZE as usize;
+                r.start_va < want + byte_len && want < end
+            })
+        })
+        .unwrap_or(true);
+        const WALK_CAP_PAGES: usize = 65_536;
+        let mapped = (0..pages.min(WALK_CAP_PAGES))
+            .any(|i| crate::paging::translate(want + i * PAGE_SIZE as usize).is_some());
+        if overlaps || mapped {
+            return errno::EEXIST;
+        }
         want
     } else {
         // Without `MAP_FIXED` an address is a hint, and hints are advisory.
