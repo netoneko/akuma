@@ -923,9 +923,8 @@ the start. That is why it reproduced on the metal 3/3 and under Firecracker
 AP as it comes online (`lapic::tsc_sync_bsp`/`tsc_sync_ap`, shortest round trip
 wins, as Linux's `tsc_sync` estimates), stores the AP-minus-BSP offset per
 core, prints `smp: cpu N tsc offset X cycles`, and the clock subtracts it.
-**Status: in tree, booted under QEMU `SMP=4` (offsets 0-1 cycles, as expected
-of synced vCPUs); the metal's offsets and the network service's survival are
-not yet measured.**
+**Status: verified on the metal, boot 90 (below); QEMU `SMP=4` offsets 0-1
+cycles.**
 
 **Fix 33: `execve` left the per-thread altstack in place.** `install_image`
 cleared `Process::sigaltstack_*`, but frames are placed from the per-slot
@@ -938,8 +937,8 @@ calling slot's altstack (both exec paths call it on the exec'ing thread).
 Probe: `userspace/forktest/c_stress/altstackexec.c` (fork keeps it, exec
 disables it, pthreads after 64 threads of altstack churn start disabled; each
 case raises `SIGTRAP` into a `SA_ONSTACK` handler). **Linux: all PASS**
-(arm64 kernel 7.0, Lima `fc`; Pop was booted into Akuma). **Akuma: not yet
-run** on either kernel.
+(arm64 kernel 7.0 in Lima `fc`, and Pop on the ryzen). **Akuma: FAIL on the
+old kernel, PASS on the fixed one** (boot 90, below).
 
 **Fix 34: timed waits wake at their deadline, not the next tick.** Two
 causes of the extra tick `timerlat` measured:
@@ -957,7 +956,7 @@ causes of the extra tick `timerlat` measured:
    (`akuma_threading::x86_earliest_wake_time`) when that is sooner than the
    current tick; `restore_periodic` puts the periodic tick back after the halt.
    Only when the TSC is calibrated, so the tick count is not the clock.
-**Status: in tree, booted under QEMU; `timerlat` not yet re-run.**
+**Status: verified on the metal, boot 90 (below).**
 
 **The wake IPI** (same night). `ThreadWaker::wake`'s `trigger_sgi` hook was a
 no-op on amd64, so a thread readied for a halted core waited for that core's
@@ -966,7 +965,37 @@ next tick (`wakelat` `futex+busy` p90 1.9 ms on the metal). Now it is
 and send it vector 34, whose handler only EOIs. The idle loop sets the flag
 before a last non-switching look for work (`akuma_threading::x86_runnable_exists`)
 and clears it after the `hlt`, so a wake cannot fall between look and halt.
-QEMU `SMP=4`: 817 passed, 0 failed. Not yet measured.
+QEMU `SMP=4`: 817 passed, 0 failed; on the metal `futex+busy` p90 14 us (below).
+
+### Verified on the metal (boot 90, 2026-10-09 ~19:53 UTC)
+
+Kernel `6f8934d5`, **built inside Akuma on the ryzen itself** (`kbuild -j 4
+--features no-tests` in a worktree, 27 s incremental), installed from Pop,
+entry 14 (`smp=8`), netwatch off.
+
+- **The skew, measured:** `smp: cpu N tsc offset 3842016277..3842016486
+  cycles` for all seven APs. At 3793 MHz that is **1.013 s**: every AP's TSC
+  runs 1.013 s ahead of the BSP's, and the APs agree with each other to ~200
+  cycles. That is the ±1.01 s `wakelat` saw last round.
+- **Tumblr:** `page_try.py https://www.tumblr.com/ --runs 2`: top frame
+  committed, first pixels 9.3 s, **`Page.loadEventFired` 9.7 s**, final frames
+  405/409 KB showing the Trending page (posts, images, sidebar, the cookie
+  dialog). **No `Network service crashed` line and no Chromium `int3` this
+  boot** (boot 89: one per Chromium start, 3/3 blank pages).
+- **`altstackexec`:** all PASS (boot 89, same binary: `exec'd image altstack
+  FAIL (flags=0 sp=0x5a5a00000000)`, child killed by its own handled SIGTRAP).
+  Linux on the same CPU (Pop): all PASS.
+- **`timerlat` (N=100), median overshoot, before -> after:** futex-bitset
+  1 ms 8999 -> **13 us**, 5 ms 4999 -> **14 us**, 16 ms 10319 -> **12 us**;
+  nanosleep 1/5/16 ms 573/1343/361 -> **22/23/23 us**; epoll_pwait
+  532/1341/347 -> **26/26/28 us**; ppoll 341 -> **27 us**. Linux on the same
+  CPU (Pop, host kernel 6.17): futex-bitset 1/5/16 ms overshoot 570/574/553 us
+  (the "+0.12 ms" quoted earlier was a different Linux run).
+- **`wakelat`:** `futex+busy` p90 1.9 ms (last round) -> **14 us** (Linux
+  5 us); `nanosleep(100 us)` median 1101 -> **105 us**.
+- **Frame latency:** `stable_try.py --runs 6` **6/6 PASS, medians 74-78 ms**
+  (was 109-144, median 120; Linux 72). `scroll_try.py`: isolated keys median
+  74 ms (max 113), bursts 73 ms (max 85), 9 frames/s, no key without a frame.
 
 ## Scoreboard: kernel bugs found by running kami / Chromium
 
@@ -1004,21 +1033,22 @@ and should be linked from here (done in the last column).
 | 29 | **`mprotect` skipped every page a `PROT_NONE` had made `user = false`, so a recommit never took**: PartitionAlloc's pool pages stayed inaccessible, every renderer died at its first decommit/recommit (the third document load) | **fixed and booted 10-09; `nav_try` 8/8, `stable_try` 8/8, `decommitprobe` PASS (negative control FAIL)** | Fixes 29-30 above |
 | 30 | `madvise(DONTNEED)` skipped present pages of a `PROT_NONE` region and `user = false` pages: old bytes behind a recommit | **fixed and booted 10-09** (`decommitprobe`) | Fixes 29-30 above |
 | 31 | **`MAX_FDS` 256 while `prlimit64` answers `RLIMIT_NOFILE` 1024**: Chromium's network service took `EMFILE` from `socket(2)` 200+ times in 15 s of tumblr.com under Firecracker; a `socketpair`/`pipe2` refused with `EMFILE` is a CHECK in its IPC layer | **fixed in tree 10-09 (1024), booted under Firecracker, 0 `EMFILE` after; not shown to be the metal's killer** | Fix 31 below |
-| 32 | **`CLOCK_MONOTONIC` differs between cores by up to ~1 s on the metal** (no per-core TSC offset): Chromium's network service CHECKs `start <= end` on a stream request and died ~4 s into every Chromium start on the metal, so tumblr painted a blank page | **fixed in tree 10-09, booted under QEMU; metal pending** | Fixes 32-34 above |
-| 33 | **`execve` kept the per-thread `sigaltstack`** (only the `Process` copy was cleared): an exec'd helper's signal frames aimed at the parent image's altstack VA | **fixed in tree 10-09; probe PASS on Linux, Akuma pending** | Fixes 32-34 above |
-| 34 | **timed futex waits overshot by a whole tick** (an `hlt` before the deadline test on every pass, and no one-shot timer) | **fixed in tree 10-09, booted under QEMU; `timerlat` pending** | Fixes 32-34 above |
+| 32 | **`CLOCK_MONOTONIC` differs between cores by up to ~1 s on the metal** (no per-core TSC offset): Chromium's network service CHECKs `start <= end` on a stream request and died ~4 s into every Chromium start on the metal, so tumblr painted a blank page | **fixed and verified on the metal 10-09** (APs +1.013 s vs BSP; tumblr loads, 0 network-service crashes) | Fixes 32-34 above |
+| 33 | **`execve` kept the per-thread `sigaltstack`** (only the `Process` copy was cleared): an exec'd helper's signal frames aimed at the parent image's altstack VA | **fixed and verified on the metal 10-09** (`altstackexec` FAIL -> PASS; Linux PASS) | Fixes 32-34 above |
+| 34 | **timed futex waits overshot by a whole tick** (an `hlt` before the deadline test on every pass, and no one-shot timer) | **fixed and verified on the metal 10-09** (futex 1 ms: 10.0 -> 1.013 ms; key->frame 120 -> 74-78 ms) | Fixes 32-34 above |
 
 Score: 30 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path,
 the two `/proc` files, and the two `mprotect`/`madvise` fixes), of which Fix 7 is
 tooling, so **29 kernel bugs**; 28 verified live, **1 (25) in tree and booted but
 not shown to be what unblocks Tumblr**; 7 open items below. Plus 31-34
-(2026-10-09 evening/night), in tree, of which only 31 is verified live.
+(2026-10-09 evening/night) and the wake IPI, all verified live on the metal
+(boot 90) except 31's role there.
 
 **Open, found by the same work, not fixed:**
 
 | Bug | Record |
 |---|---|
-| ~~per-core clocks differ by up to ~1 s~~ — **fixed in tree 10-09 as Fix 32** (per-core TSC offset); metal pending | Fixes 32-34 above |
+| ~~per-core clocks differ by up to ~1 s~~ — **fixed 10-09 as Fix 32**, verified on the metal (APs +1.013 s) | Fixes 32-34 above |
 | a `MAP_SHARED` write is invisible to `pread` until `munmap`; `FALLOC_FL_KEEP_SIZE` is `EOPNOTSUPP` | "Still open" above |
 | 256-row process table panics when full | "Still open" above |
 | wifi TX path drops 43 % of packets, ~65 KB/s ceiling | Fix 25 above; `userspace/kami/README.md` § "Tumblr: why scrolling stopped" (outside) |
@@ -1026,12 +1056,13 @@ not shown to be what unblocks Tumblr**; 7 open items below. Plus 31-34
 | **sshd corrupts a large stdout stream, non-deterministically**: `cat` of the 9.16 MB kernel over ssh gave 3 different SHA-256s in 3 runs (`d555…`, `1228…`, one correct) and once 10 KB more bytes than the file; the same file through local pipes on Akuma (`cat \| sha256sum`, `dd \| sha256sum`) was correct 4 of 4, and a plain HTTP `curl -T` upload of it was byte-identical. Not wire corruption (TCP checksums), so it is in sshd or the kernel's socket/pipe path before the NIC. Use HTTP for binaries until it is found | 2026-10-09; no investigation yet |
 | ~~**A renderer stops answering CDP on the third document load**~~ — **fixed 2026-10-09 (Fixes 29-30)**: the renderer was dead, killed by an inaccessible page under an RW region | closed |
 | **Killing a hung Chromium tree wedges the box's userspace for minutes**: after that hang, `kami --kill; killall chromium` did not return for 90 s+, `ssh` commands hung for ~4 min (recovered by itself, same boot), and the second time for 15+ min (ping and the ssh port still answered, high latency, no command ran). The known class (`[BKL] stuck ... tag=501` after `kill -9` of a Chromium tree, see "kami on ryzen" above); this kernel carries the 2026-10-09 native SIGKILL path, which did not cure it for a *hung* tree | 2026-10-09; needs a reboot to recover |
-| **Tumblr loads nothing on the 2026-10-09 kernel** (**named 10-09 night: a `TimeTicks` CHECK in `HttpNetworkTransaction` tripped by cross-core clock skew; Fix 32**): navigation commits, one first frame, then no frames and no load event; `Network service crashed or was terminated, restarting service` ~3 s after the page starts (crashpad's `ptrace: Function not implemented` + a `tgkill` flood follow), and the restarted service logs `CreatePlatformSocket() failed: Address family not supported by protocol (97)`. A local `file://` page renders and scrolls fine (121 ms key->frame). Not yet separated into: this kernel (it also carries the AF_UNIX-park and kill-path commits of 2026-10-09 that the earlier, working kernel lacked), the new renderer-cap flags, or a flaky network service | `userspace/kami/README.md` § "Tumblr: why scrolling stopped" |
+| **Tumblr loads nothing on the 2026-10-09 kernel** (**fixed 10-09 night: a `TimeTicks` CHECK in `HttpNetworkTransaction` tripped by cross-core clock skew; Fix 32; tumblr loads on the metal, boot 90**): navigation commits, one first frame, then no frames and no load event; `Network service crashed or was terminated, restarting service` ~3 s after the page starts (crashpad's `ptrace: Function not implemented` + a `tgkill` flood follow), and the restarted service logs `CreatePlatformSocket() failed: Address family not supported by protocol (97)`. A local `file://` page renders and scrolls fine (121 ms key->frame). Not yet separated into: this kernel (it also carries the AF_UNIX-park and kill-path commits of 2026-10-09 that the earlier, working kernel lacked), the new renderer-cap flags, or a flaky network service | `userspace/kami/README.md` § "Tumblr: why scrolling stopped" |
 | missing rows/files list (`sendfile`, `inotify_init`, `/proc/cpuinfo`, ...) | "Still open: what Chromium hits" above |
-| ~~**Timed futex waits overshoot by a full 10 ms tick**~~ — **Fix 34 in tree 10-09, unmeasured** — (`FUTEX_WAIT_BITSET` abs 1 ms -> 10.0 ms median, 16 ms -> 26.3 ms; Linux +0.12 ms): every `pthread_cond_timedwait` in Chromium's frame pipeline pays it, which is most of kami's 120-160 ms key->frame against Linux's 72 ms on the same CPU | `userspace/kami/README.md` § "Frame latency: where the 120 ms goes"; probes `userspace/forktest/c_stress/{wakelat,timerlat}.c` |
-| **A fault signal's handler frame can be declined** (**likely cause fixed in tree 10-09 as Fix 33**, exec kept the per-thread altstack; Akuma probe pending): `[signal] sig 5 declined: frame write to 0x100002e38 failed` on the metal — the alternate stack the kernel resolved for the thread lay in a read-only file mapping, so crashpad never ran and the process died on the trap. If that can happen to a `SIGSEGV` V8 or WebAssembly handles on purpose, it is a browser death | metal klog boot 88, 2026-10-09; `amd64/src/signal.rs` frame placement, `akuma_threading::get_sigaltstack` |
+| ~~**Timed futex waits overshoot by a full 10 ms tick**~~ — **fixed 10-09 as Fix 34, verified on the metal: 13 us** — (`FUTEX_WAIT_BITSET` abs 1 ms -> 10.0 ms median, 16 ms -> 26.3 ms; Linux +0.12 ms): every `pthread_cond_timedwait` in Chromium's frame pipeline pays it, which is most of kami's 120-160 ms key->frame against Linux's 72 ms on the same CPU | `userspace/kami/README.md` § "Frame latency: where the 120 ms goes"; probes `userspace/forktest/c_stress/{wakelat,timerlat}.c` |
+| **A fault signal's handler frame can be declined** (**fixed 10-09 as Fix 33**, exec kept the per-thread altstack; reproduced and verified fixed on the metal with `altstackexec`): `[signal] sig 5 declined: frame write to 0x100002e38 failed` on the metal — the alternate stack the kernel resolved for the thread lay in a read-only file mapping, so crashpad never ran and the process died on the trap. If that can happen to a `SIGSEGV` V8 or WebAssembly handles on purpose, it is a browser death | metal klog boot 88, 2026-10-09; `amd64/src/signal.rs` frame placement, `akuma_threading::get_sigaltstack` |
 | `[unregister] pid=N stale tid=T now owned by pid=N+1` / `[TRAMP-MISMATCH]` for every short-lived process in a fork+exec loop (25 lines for 24 `tr`/`cut` runs) — thread-slot ownership lags process exit | Firecracker runs 2026-10-09 (`run-net.sh`) |
 | "exit status 191" from a browser process 4 s after tumblr committed on the metal; meaning not established (neither a Chromium result code nor a kernel status encoding anyone found) | metal `/tmp/kami.log` 2026-10-09 21:03 |
+| **`akuma-ext2` host test `rewrite_truncate_rename_and_concurrent_append_keep_files_apart` fails intermittently** (`e2fsck -fn found problems`, `tests.rs:2627`): 1 in 6 full-suite runs once, then 0 in 15; it failed the pre-commit hook on a docs-only commit. Predates this work (test last changed in `ef2bc901`). An `e2fsck` complaint under concurrent append may be a real ext2 race, not test noise | 2026-10-09 night; not investigated |
 | **The metal's tumblr deaths did not reproduce under Firecracker** in six runs (4/8 vCPUs, kami itself, a netem-throttled lossy tap), on both the 256- and 1024-descriptor kernels | `userspace/kami/README.md` § "Tumblr under Firecracker" |
 
 **Written outside this directory** (so the score is not lost): the tumblr

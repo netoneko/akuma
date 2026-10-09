@@ -513,8 +513,12 @@ service ~4 s in to one `int3` at the same address, a `CHECK(start <= end)` in
 `CLOCK_MONOTONIC` skew (up to ~1 s on this machine, none under KVM), which
 also explains why Firecracker never reproduced it. Fixed in tree as Fix 32
 (per-core TSC offset), with Fixes 33 (exec'd altstack) and 34 (timed waits) in
-`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`. Not yet re-run on the
-fixed kernel.
+`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`. **Verified on the fixed
+kernel (boot 90):** tumblr committed, first pixels 9.3 s, `loadEventFired`
+9.7 s, the Trending page painted, no network-service crash in two cold runs.
+And key->frame on the local page is now **74-78 ms median** (`stable_try.py`
+6/6; `scroll_try.py` bursts 73 ms, 9 frames/s), against 120 before and Linux's
+72: the timed-wait fix (Fix 34) plus the wake IPI took the 50 ms.
 
 ## Future: kami in a rio split pane
 
@@ -632,6 +636,9 @@ killall chromium`): it wedged the box's userspace for 4 and 15+ minutes twice on
 2026-10-09. Reboot instead.
 
 ## Frame latency: where the 120 ms goes (2026-10-09, evening)
+
+*Resolved the same night: 74-78 ms median after Fix 34 (timed waits) and the
+wake IPI; see "Tumblr on the metal, 2026-10-09 night" above.*
 
 Same page (`render.html`, 7200 px), same `kami --fb none`, same `j` keys one
 second apart, same Chromium 152 binary, same Ryzen 7 8845HS. Key -> next

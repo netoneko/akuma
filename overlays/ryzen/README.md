@@ -103,6 +103,20 @@ now also appends every new ring line to `/var/log/ryzen/klog-N.all`** (the
 whole boot's log, gap-marked if the 64 KiB ring wrapped between two 2 s
 passes, capped at 256 MiB); `klog-N.dmesg` is still the last ring snapshot.
 
+**Building the kernel inside Akuma on ryzen (2026-10-09, boot 89).** p3's
+clone (`/src/github.com/netoneko/akuma`) has its own uncommitted work, so build
+in a worktree: from the Mac, `git bundle create k.bundle <box-HEAD>..kami`,
+pipe it in over ssh, then on the box `git fetch /root/k.bundle
+kami:refs/remotes/litter/kami`, `git worktree add --detach /src/kami-wt
+litter/kami`, and **copy `crates/akuma-fbcon/vendor/spleen/*` in from the main
+checkout** (a submodule; a worktree gets it empty, and `akuma-fbcon`'s build
+script panics). `AKUMA_SRC=/src/kami-wt kbuild -j 4 --features no-tests`: 29 s
+and 27 s incremental against `/root/ktarget` at `smp=8`. Akuma here touches
+only p3, so it cannot install onto the ESP: copy the ELF to p3, `reboot -f`
+(lands in Pop), install from Pop, `arm.sh 14`. `uname` then shows a stale
+revision (`amd64/build.rs` does not rerun when the worktree's HEAD moves);
+check a symbol with `nm` instead.
+
 Entries 12-14 run a plain `herd daemon` (`initargs=daemon`): the services are whatever p3's `/etc/herd/enabled/` holds — `sshd console klog netwatch wifiauto` since 2026-10-08, enabled with `herd enable <svc>` (copied from `available/`). Enumerating them as `--service` flags made `herd status` list one and hid the rest.
 
 `sh arm.sh 6` boots entry 6 once. `autoreboot` is opt-in through
