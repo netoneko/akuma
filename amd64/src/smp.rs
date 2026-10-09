@@ -53,8 +53,10 @@
 //!
 //! # What is deliberately missing
 //!
-//! - **No wake IPI.** A core in `hlt` learns of new work at its next timer tick.
-//!   (TLB shootdown is *not* on this list any more: `shootdown.rs` broadcasts
+//! - ~~No wake IPI~~ (2026-10-09): a wake that readies a thread kicks one
+//!   halted core with vector [`WAKE_VECTOR`] ([`kick_halted_core`]); before it
+//!   a core in `hlt` learned of new work at its next timer tick (`wakelat`'s
+//!   `futex+busy`: p90 1.9 ms on the ryzen). (TLB shootdown is *not* on this list any more: `shootdown.rs` broadcasts
 //!   vector 33 through the LAPIC and `akuma_mmu::flush_tlb_*`'s `AllCores` arms
 //!   wait for the acknowledgements — same plumbing, wired 2026-09-09.)
 //! - **No kernel-mode preemption.** The tick preempts ring 3 and the idle loop;
@@ -739,6 +741,108 @@ fn wait_online(idx: usize) -> bool {
         core::hint::spin_loop();
     }
     true
+}
+
+/// The wake IPI: its handler only acknowledges it. Arriving is the whole
+/// effect — it ends the target core's `hlt`, and the idle loop it returns to
+/// re-runs the picker.
+pub const WAKE_VECTOR: u8 = 34;
+
+/// Per core: in the idle loop's halt window ([`set_halted`]).
+static HALTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Wake IPIs sent.
+pub static WAKE_IPIS: AtomicU64 = AtomicU64::new(0);
+
+/// Mark this core as about to halt (`true`) or awake (`false`).
+///
+/// The idle loop sets it **before** its last look for runnable work and clears
+/// it after the `hlt`, and a waker publishes `READY` before it reads the flag
+/// (both `SeqCst`): either the idle core sees the thread or the waker sees the
+/// flag, so a wake cannot fall between the look and the halt. A kick that
+/// arrives before the `hlt` is latched with `IF` clear and ends it at once.
+pub fn set_halted(halted: bool) {
+    HALTED[cpu_index()].store(halted, Ordering::SeqCst);
+}
+
+/// A thread just became runnable: wake one halted core, other than this one,
+/// to run it. The CAS claims the core, so concurrent wakers do not all
+/// interrupt the same one; it re-arms itself on its next halt. Pinned threads
+/// (only the boot and idle threads are) are not steered; a core that wakes
+/// and finds nothing it may run halts again.
+pub fn kick_halted_core() {
+    let online = ONLINE.load(Ordering::Acquire);
+    if online <= 1 {
+        return;
+    }
+    let me = cpu_index();
+    for i in 0..online.min(MAX_CPUS) {
+        if i == me {
+            continue;
+        }
+        if HALTED[i].compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            // `IF` off across the two ICR writes: an interrupt between them
+            // that sends its own IPI would retarget this one.
+            let flags: u64;
+            // SAFETY: reads RFLAGS and clears IF; restored below.
+            unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+            lapic::send_fixed(PERCPU[i].lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
+            if flags & (1 << 9) != 0 {
+                // SAFETY: IF was set on entry; this restores it.
+                unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+            }
+            WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Install [`WAKE_VECTOR`] in the shared IDT. Called from `lapic::init`, next
+/// to the shootdown vector, on both boot protocols.
+pub fn install_wake_vector() {
+    #[allow(function_casts_as_integer)]
+    idt::set_handler(WAKE_VECTOR, wake_ipi_entry as usize);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wake_ipi_dispatch() {
+    lapic::eoi();
+}
+
+// The handler touches no per-CPU state, so there is no `swapgs`; the nine
+// caller-saved pushes put `rsp` 16-aligned at the `call` (the CPU aligned it
+// before pushing its 40-byte frame).
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global wake_ipi_entry
+wake_ipi_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    call wake_ipi_dispatch
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+"#
+);
+
+unsafe extern "C" {
+    fn wake_ipi_entry();
 }
 
 /// Make SSE legal, exactly as `boot.s` does for the BSP — `CR0.EM=0`,

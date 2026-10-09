@@ -121,7 +121,14 @@ int main(int argc, char **argv) {
 
     int fails = 0;
     void *mem = mmap(ALT, ALT_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (mem != ALT) { perror("mmap ALT"); return 2; }
+    if (mem != ALT) {
+        /* A kernel that takes MAP_FIXED_NOREPLACE as a hint (Linux < 4.17,
+         * Akuma 2026-10-09) puts it elsewhere; ALT is free in a fresh static
+         * binary, so MAP_FIXED is safe here. */
+        if (mem != MAP_FAILED) munmap(mem, ALT_SIZE);
+        mem = mmap(ALT, ALT_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (mem != ALT) { perror("mmap ALT"); return 2; }
+    }
     stack_t ss = { .ss_sp = mem, .ss_size = ALT_SIZE, .ss_flags = 0 };
     if (sigaltstack(&ss, NULL)) { perror("sigaltstack"); return 2; }
     fails |= trap_check("parent", 1);

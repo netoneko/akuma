@@ -957,8 +957,16 @@ causes of the extra tick `timerlat` measured:
    (`akuma_threading::x86_earliest_wake_time`) when that is sooner than the
    current tick; `restore_periodic` puts the periodic tick back after the halt.
    Only when the TSC is calibrated, so the tick count is not the clock.
-**Status: in tree, booted under QEMU; `timerlat` not yet re-run.** The wake
-IPI (`smp.rs` "No wake IPI") is still missing.
+**Status: in tree, booted under QEMU; `timerlat` not yet re-run.**
+
+**The wake IPI** (same night). `ThreadWaker::wake`'s `trigger_sgi` hook was a
+no-op on amd64, so a thread readied for a halted core waited for that core's
+next tick (`wakelat` `futex+busy` p90 1.9 ms on the metal). Now it is
+`smp::kick_halted_core`: claim one halted core (per-core `HALTED` flag, CAS)
+and send it vector 34, whose handler only EOIs. The idle loop sets the flag
+before a last non-switching look for work (`akuma_threading::x86_runnable_exists`)
+and clears it after the `hlt`, so a wake cannot fall between look and halt.
+QEMU `SMP=4`: 817 passed, 0 failed. Not yet measured.
 
 ## Scoreboard: kernel bugs found by running kami / Chromium
 

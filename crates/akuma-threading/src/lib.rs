@@ -2831,6 +2831,24 @@ fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
     None
 }
 
+/// Would [`x86_pick_next`] find something for this core? The same three tests,
+/// without the claim and without switching.
+///
+/// For an idle core that has just announced it is about to halt (amd64
+/// `smp::set_halted`): a wake that landed between its last pick and the
+/// announcement is visible here, so it does not sleep through it.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_runnable_exists() -> bool {
+    let hooks = arch();
+    (0..MAX_THREADS).any(|i| {
+        let state = THREAD_STATES[i].load(Ordering::SeqCst);
+        (state == thread_state::READY || state == thread_state::RUNNING)
+            && ON_CPU[i].load(Ordering::Acquire) == 0
+            && (hooks.can_run)(i)
+    })
+}
+
 /// The machine effects the x86_64 scheduler cannot perform itself.
 ///
 /// # Why hooks and not code in this crate

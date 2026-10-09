@@ -599,7 +599,9 @@ fn register_hooks() {
     threading::register(
         threading::ThreadRuntime {
             uptime_us: crate::net::uptime_us,
-            trigger_sgi: |_| {},
+            // The wake IPI (2026-10-09): a `WAITING -> READY` CAS ends here,
+            // so a halted core is told now rather than at its next tick.
+            trigger_sgi: |_| smp::kick_halted_core(),
             wake_core: |_| {},
             wake_remote_idle: || false,
             end_of_interrupt: |_| {},
@@ -1189,6 +1191,15 @@ pub fn idle_loop() -> ! {
             }
         }
         if !threading::x86_yield() {
+            // Announce the halt, then look once more without switching: a wake
+            // that landed after the pick above either shows up here or sees the
+            // flag and kicks this core (`smp::kick_halted_core`).
+            smp::set_halted(true);
+            if threading::x86_runnable_exists() {
+                smp::set_halted(false);
+                smp::bkl_leave();
+                continue;
+            }
             smp::bkl_leave();
             IDLE_HALTS.fetch_add(1, Ordering::Relaxed);
             // The halt is not CPU time: without crediting it back this thread
@@ -1204,6 +1215,7 @@ pub fn idle_loop() -> ! {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
             }
             crate::lapic::restore_periodic();
+            smp::set_halted(false);
             threading::credit_halted_time(threading::current_thread_id(), halt_started_us);
         } else {
             smp::bkl_leave();

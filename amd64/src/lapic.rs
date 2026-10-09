@@ -290,6 +290,7 @@ pub fn init() -> bool {
     // puts it on both boot protocols (PVH and multiboot2 both reach `init`),
     // which is the trap `install_shared_sinks` exists for.
     crate::shootdown::install();
+    crate::smp::install_wake_vector();
     crate::smp::set_bsp_lapic_id(read(REG_ID) >> 24);
 
     // Before the timer is armed for real: `calibrate` borrows it (masked,
