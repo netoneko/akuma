@@ -295,9 +295,13 @@ keep.
   page: median 121 ms for an isolated key, ~9 frames/s and 42 ms in a burst.
 - `stable_try.py HOST [URL] [--runs N]`: N cold starts of a local page, each
   scrolled; PASS means ready and a frame after every key. 2026-10-09 on
-  `file:///tmp/render.html`: 6/8 (runs 7 and 8 lost one key's frame; the metric
-  there uses log timestamps, which skew by ~1 s across cores, so some of that
-  is the probe — `nav_try.py` scores in line order instead).
+  `file:///tmp/render.html`: 6/8 before Fixes 29-30, 8/8 after. "A frame after
+  the key" is decided in **line order** since the evening of 2026-10-09: the
+  timestamp match it used before scored a delivered frame as missing whenever
+  the frame's line carried an earlier clock than the key's (cross-core skew;
+  one such false FAIL in an 8-run series, key 17.417 s, frame 16.529 s).
+  Latencies still come from the timestamps, so a skewed pair shows as a
+  negative value the median absorbs.
 - `nav_try.py HOST [--hops N]`: two 40-row pages (`testdata/pageA.html`,
   `pageB.html`, copied to `/tmp/` on the box) that link to each other at the
   bottom. From a cold Chromium: `j` x3, `G`, `f`, `a`, wait for the other page,
@@ -590,6 +594,20 @@ lands **8/8** with a frame after every input, `probe/stable_try.py --runs 8` is
 **8/8** (median key->frame 119-144 ms), and the kernel logs no `[sig!]`/`[Fault]`.
 `probe/akuma/decommitprobe` (the allocator's decommit/recommit cycle) pins it.
 
+Re-run independently the same evening, from a second session against the same
+ryzen boot (kernel `830f21e` + Fixes 29-30, `smp=8`, up 2 h, the earlier
+session's Chromium still running when it started): `nav_try.py --hops 8`
+**8/8** (every hop in 2.0-2.7 s; 48 inputs, 69 frames, none without a later
+frame), `stable_try.py --runs 8` **8/8** by line order (one run was a
+timestamp-skew false FAIL under the old scorer; medians 109-129 ms), no
+`[sig!]`/`[Fault]` in the kernel ring. The ring did carry `[BKL] stuck`
+lines during the cold starts (tags 501, 502, 11 and 35, 8M-67M spins, 8 cores),
+every one of which resolved: the box stayed responsive throughout and no run
+lost a frame to them. They are the `smp=8` long holds the menu table already
+notes, not the kill-path wedge. Not run under Firecracker: both Firecracker
+hosts (ryzen's Pop!_OS and the trashcan's Ubuntu) were booted into Akuma at the
+time, and the Firecracker Chromium image carries no sshd, kami or NIC.
+
 What is still not stable: `https://www.tumblr.com` paints one frame and stops.
 The renderer lives; the **network service** dies ~3-5 s into each Chromium start
 (one `Network service crashed or was terminated` per session, an `int3` CHECK in
@@ -599,3 +617,90 @@ need it. Next: name that CHECK.
 When a run wedges, do not clean up a hung tree from a probe (`kami --kill;
 killall chromium`): it wedged the box's userspace for 4 and 15+ minutes twice on
 2026-10-09. Reboot instead.
+
+## Frame latency: where the 120 ms goes (2026-10-09, evening)
+
+Same page (`render.html`, 7200 px), same `kami --fb none`, same `j` keys one
+second apart, same Chromium 152 binary, same Ryzen 7 8845HS. Key -> next
+presented frame, line-order match:
+
+| where | key->frame (ms) | median |
+|---|---|---|
+| Linux (Pop!_OS, the Alpine image in Docker, `probe/akuma/kamitry.py`) | 58-97 | **72** |
+| Akuma on the metal (`smp=8`, 8 cold starts x 4 keys) | 109-144 | **120** |
+| Akuma under Firecracker/KVM on the same laptop (8 vCPUs) | 136-202 | **160** |
+
+So about 70 ms is Chromium's own pipeline (BeginFrame cadence, raster, PNG
+encode; kami's decode is 3-6 ms of it) and Akuma adds 50-90 ms. Two probes in
+`userspace/forktest/c_stress/` say where (each run on Linux first, then on
+Akuma; the same static binaries run on both):
+
+- `wakelat.c`: a cross-thread wake is **not** the cost. futex / pipe / unix
+  ping-pong is 3 us on Akuma (Linux 15 us, Akuma hands off on the waker's
+  core). When the waker stays busy the woken thread waits 141 us median on the
+  metal, p90 1.9 ms (Linux 5 us) — a halted core learns of work at its next
+  tick (`amd64/src/smp.rs`, "No wake IPI"); under KVM 1 us.
+- `timerlat.c`: **timed waits are the cost.** A `FUTEX_WAIT_BITSET` with an
+  absolute deadline (every `pthread_cond_timedwait`, so Chromium's compositor
+  scheduler, thread pool and `WaitableEvent::TimedWait`) overshoots by a whole
+  10 ms LAPIC tick: 1 ms requested -> 10.0 ms median (min 6.4), 5 ms -> 10.0,
+  16 ms -> 26.3 (Linux: +0.12 ms). `nanosleep`/`epoll_pwait`/`ppoll` overshoot
+  less (0.2-1.3 ms median, p90 up to 2.5 ms). Measured under Firecracker; on the
+  metal only `wakelat` ran before the box rebooted (its `nanosleep(100 us)`
+  there: 959 us median, 6.4 ms p90, 29 ms max). The path is
+  `amd64/src/futex.rs::wait` -> `sched::block_until_deadline`, whose doc says
+  "resolution is the LAPIC tick (10 ms)"; the measurement says one tick *more*
+  than the rounded-up deadline. A frame pipeline with several such waits is
+  the 50-90 ms.
+- `probe/castlat.py` was meant as the macOS Chrome baseline; Chrome refuses to
+  start from this environment (mach bootstrap denied), so the Linux baseline
+  above replaced it.
+
+`wakelat` also shows the per-core clock: with 8 cores a 1 ms spin measured
+between two `clock_gettime` calls on different cores came out as -1 011 819 us
+and +1 019 192 us (`futex+busy` min/max). That is the "decode 1024 ms" and
+the backwards log lines: one second of offset between cores, not a timeout.
+
+## Tumblr under Firecracker: the rig, and what did not reproduce (2026-10-09)
+
+`probe/akuma/run-net.sh` (installed at `/root/cdp-probe/new/run-tumblr.sh` on
+the ryzen's Pop!_OS side, where `kami-root.img` is the Chromium-**152** Alpine
+image) boots the guest with the tap NIC (`akuma-dnsmasq` gives it
+192.168.1.50; the host needs `iptables -I FORWARD -i tap0 -j ACCEPT` and
+`-o tap0` after a reboot, and the image a `/etc/resolv.conf`, which the
+runner writes) and one of three in-guest scripts:
+
+- `tumblr-once.sh` + `tumblr.py`: CDP over the pipe with kami's flags,
+  navigates, screencasts, reports every target event, frame and how the
+  browser ended; `--v=0` stderr and the kernel's `strace_err` trace are
+  dumped to `out/`.
+- `kami-once.sh` + `kamitry.py`: **kami itself** (daemon, screencast client,
+  `--fb none`) on a pty, keys sent like `scroll_try.py`.
+- `probes-once.sh`: `wakelat` + `timerlat` in the guest.
+
+Six Tumblr runs on the HEAD kernel (4 and 8 vCPUs, with and without a
+wifi-like `tc netem rate 600kbit delay 30ms loss 3%` on the tap, both drivers)
+**loaded the page and killed nothing**: `loadEventFired`, 29-76 frames, the
+ad-sync iframes, a 430 KB final screenshot, browser alive at the end. The
+metal's deaths did not reproduce. What the metal's own logs say they were
+(the user's console session, 2026-10-09 ~21:03, `/tmp/kami-input.log` on p3):
+on `kami https://tumblr.com/` the 12-minute-idle browser left by the probes
+died with `SIGSEGV` at the navigation; its replacement died with "exit status
+191" 4 s after the page committed; the third stayed alive and presented **no
+frame in 12 s** (the page had `frameStoppedLoading`). The kernel ring from
+that minute holds a child of the second browser dying on a ring-3 `int3`
+(a Chromium CHECK) whose crash-handler frame the kernel **declined** to write
+(`[signal] sig 5 declined: frame write to 0x100002e38 failed` — the alternate
+stack it computed lies in a read-only file mapping), and the box then
+rebooted into Pop by `netwatch` (DNS unanswered 120 s).
+
+Found by the trace and fixed in the tree: the network service took `EMFILE`
+from `socket(2)` 200+ times in 15 s (`[sc!] nr=41 -> -24`) because
+`amd64/src/fd.rs` capped a process at **256** descriptors while `prlimit64`
+reported 1024; now 1024 (Chromium record, Fix 31). Not isolated as the
+metal's killer: two of the no-crash runs were on the 256 kernel.
+
+Two Chromium-side facts from the same runs: `Page.frameNavigated` fires for
+**subframes** too (every ad iframe starts as `about:blank`; kami filters on
+`parentId`, `tumblr.py` does not), and `--disable-default-apps` still leaves
+a "Google Hangouts" background page target.

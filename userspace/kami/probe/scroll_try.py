@@ -67,26 +67,33 @@ os.write(m, b"\x11"); drain(2)
 log = remote("cat /tmp/kami-input.log")
 p.kill()
 
-ev = []  # (t, kind)
-for l in log.splitlines():
+# "A frame after this key" is decided in LINE order, not by timestamp: the log
+# is written by one thread, but its clock skews by up to ~1 s across cores, so
+# a frame can carry a timestamp earlier than the key that caused it (seen
+# 2026-10-09: key at 17.417 s, its frame at 16.529 s) and a timestamp-only
+# match scored a delivered frame as missing. The latencies still come from the
+# timestamps (the only clock there is); a skewed pair shows up as a negative
+# or ~1 s value, which the median absorbs.
+ev = []  # (line index, t, kind)
+for i, l in enumerate(log.splitlines()):
     mm = re.match(r"\[\s*([\d.]+)\] (.*)", l)
     if not mm: continue
     t, rest = float(mm.group(1)), mm.group(2)
-    if rest.startswith('input Text("j")'): ev.append((t, "key"))
+    if rest.startswith('input Text("j")'): ev.append((i, t, "key"))
     elif rest.startswith("presented"):
-        ev.append((t, "frame")); 
-keys = [t for t, k in ev if k == "key"]
-frames = [t for t, k in ev if k == "frame"]
+        ev.append((i, t, "frame"))
+keys = [(i, t) for i, t, k in ev if k == "key"]
+frames = [(i, t) for i, t, k in ev if k == "frame"]
 print(f"keys seen {len(keys)}, frames {len(frames)} in total")
 i = 0
 for phase in ("slow", "burst"):
     n = marks[phase]
     ks = keys[i:i + n]; i += n
     lat, cnt = [], []
-    for k in ks:
-        nxt = [f for f in frames if f >= k]
+    for ki, k in ks:
+        nxt = [ft for fi, ft in frames if fi > ki]
         lat.append((nxt[0] - k) if nxt else float("nan"))
-        cnt.append(len([f for f in frames if k <= f < k + 1.0]))
+        cnt.append(len([ft for _, ft in frames if k <= ft < k + 1.0]))
     ok = [x for x in lat if x == x]
     if ok:
         print(f"{phase}: n={len(ks)} key->frame median {statistics.median(ok)*1000:.0f} ms, "

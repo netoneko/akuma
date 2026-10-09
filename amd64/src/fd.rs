@@ -272,7 +272,21 @@ pub const FIRST_FILE_FD: usize = 3;
 /// "how many descriptors may one program hold", not "how many may the machine".
 /// 256 is what a `rustc` on a real crate graph needs; `cargo` running four of
 /// them concurrently now costs 4 × its own budget rather than sharing one.
-pub const MAX_FDS: usize = 256;
+///
+/// **Raised 256 -> 1024 on 2026-10-09 for Chromium's network service.** Glue's
+/// `prlimit64` has always answered `RLIMIT_NOFILE` = 1024 (`usermode.rs`, the
+/// `Prlimit64` arm), so a program that sizes its pools by the limit it was
+/// told believes it has four times what this bound granted. Chromium's
+/// network service does exactly that: loading `tumblr.com` under Firecracker
+/// it took `EMFILE` from `socket(2)` 200+ times in 15 s
+/// (`strace_err`: `nr=41 … -> -24`, pids 117 and 129-138), while every local
+/// page stayed far below 256. A `socketpair` or `pipe2` refused with `EMFILE`
+/// is a `CHECK` in Chromium's IPC layer, which is the silent `int3` death of
+/// a utility process. 1024 is the number the process was promised; the table
+/// behind it is a `BTreeMap`, so the only cost is the descriptors a process
+/// actually holds. The two numbers must stay equal: a limit the kernel
+/// reports and does not honour is a lie the program cannot detect.
+pub const MAX_FDS: usize = 1024;
 
 
 /// The descriptor table the boot task (the self-tests, and anything that runs

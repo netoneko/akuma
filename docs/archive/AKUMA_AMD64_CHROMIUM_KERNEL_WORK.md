@@ -859,6 +859,14 @@ that follows (it is in no region).
 | kernel `[sig!]`/`[Fault]` lines during a run | 4+ per run | 0 |
 | `decommitprobe` (`userspace/forktest/c_stress`) | `A first page writable FAIL`, then dies | 36 checks ok, PASS |
 
+Re-verified the same evening by a second session against the same boot:
+`nav_try` 8/8 again, `stable_try` 8/8 by line order (the probe's scorer was
+timestamp-based and produced one false FAIL from cross-core skew; fixed in
+`scroll_try.py`), 0 `[sig!]`/`[Fault]`. Transient `[BKL] stuck` lines (tags
+501/502/11/35, all resolved) appeared during cold starts at `smp=8`; see
+`userspace/kami/README.md` § "Stable on local files". Not yet run under
+Firecracker (both Firecracker hosts were booted into Akuma).
+
 The probe's negative control is the pre-fix kernel binary (hash `b584646b…`),
 restored afterwards (`371388ea…`). **No Linux control was run**; see the probe's
 header. A heal-on-fault in `cow_write_fault` was tried first and removed: it
@@ -874,6 +882,17 @@ by protocol (97)`), and local files never need it. Chasing that is the next step
 A guess worth testing rather than believing: the earlier minutes-long wedges
 after a hung tree was killed (below) may have been crashpad's `tgkill` flood from
 dead renderers, which these fixes stop producing.
+
+**Fix 31 (2026-10-09, evening). `amd64/src/fd.rs::MAX_FDS` 256 -> 1024.** Glue's
+`prlimit64` has answered `RLIMIT_NOFILE` = 1024 since C1 step 3; the table's
+lookup bound stayed at 256. Under Firecracker with the tap NIC
+(`userspace/kami/probe/akuma/run-net.sh`, `strace_err`), tumblr.com drove the
+network service and four other processes into `socket(2) -> EMFILE` 200+
+times in 15 s, every local page far below the cap. The table is a `BTreeMap`,
+so 1024 costs only what a process holds. Verified: the same run on the new
+kernel logs 0 `EMFILE`; the standard self-test suite still boots. Not verified
+to be what kills the metal's browser — it did not die under Firecracker on
+either kernel.
 
 ## Scoreboard: kernel bugs found by running kami / Chromium
 
@@ -910,6 +929,7 @@ and should be linked from here (done in the last column).
 | 28 | `/proc/<pid>/oom_score_adj` (+ `oom_adj`, `oom_score`) did not exist | **fixed and booted 10-09**, but it was *not* the cause of the `Failed to adjust OOM score` log line (still printed: the named children are already dead) | Fix 28 above |
 | 29 | **`mprotect` skipped every page a `PROT_NONE` had made `user = false`, so a recommit never took**: PartitionAlloc's pool pages stayed inaccessible, every renderer died at its first decommit/recommit (the third document load) | **fixed and booted 10-09; `nav_try` 8/8, `stable_try` 8/8, `decommitprobe` PASS (negative control FAIL)** | Fixes 29-30 above |
 | 30 | `madvise(DONTNEED)` skipped present pages of a `PROT_NONE` region and `user = false` pages: old bytes behind a recommit | **fixed and booted 10-09** (`decommitprobe`) | Fixes 29-30 above |
+| 31 | **`MAX_FDS` 256 while `prlimit64` answers `RLIMIT_NOFILE` 1024**: Chromium's network service took `EMFILE` from `socket(2)` 200+ times in 15 s of tumblr.com under Firecracker; a `socketpair`/`pipe2` refused with `EMFILE` is a CHECK in its IPC layer | **fixed in tree 10-09 (1024), booted under Firecracker, 0 `EMFILE` after; not shown to be the metal's killer** | Fix 31 below |
 
 Score: 30 fixes (Fixes 1-25, where 21-24 share a row, plus the SIGKILL path,
 the two `/proc` files, and the two `mprotect`/`madvise` fixes), of which Fix 7 is
@@ -930,6 +950,11 @@ not shown to be what unblocks Tumblr**; 7 open items below.
 | **Killing a hung Chromium tree wedges the box's userspace for minutes**: after that hang, `kami --kill; killall chromium` did not return for 90 s+, `ssh` commands hung for ~4 min (recovered by itself, same boot), and the second time for 15+ min (ping and the ssh port still answered, high latency, no command ran). The known class (`[BKL] stuck ... tag=501` after `kill -9` of a Chromium tree, see "kami on ryzen" above); this kernel carries the 2026-10-09 native SIGKILL path, which did not cure it for a *hung* tree | 2026-10-09; needs a reboot to recover |
 | **Tumblr loads nothing on the 2026-10-09 kernel**: navigation commits, one first frame, then no frames and no load event; `Network service crashed or was terminated, restarting service` ~3 s after the page starts (crashpad's `ptrace: Function not implemented` + a `tgkill` flood follow), and the restarted service logs `CreatePlatformSocket() failed: Address family not supported by protocol (97)`. A local `file://` page renders and scrolls fine (121 ms key->frame). Not yet separated into: this kernel (it also carries the AF_UNIX-park and kill-path commits of 2026-10-09 that the earlier, working kernel lacked), the new renderer-cap flags, or a flaky network service | `userspace/kami/README.md` § "Tumblr: why scrolling stopped" |
 | missing rows/files list (`sendfile`, `inotify_init`, `/proc/cpuinfo`, ...) | "Still open: what Chromium hits" above |
+| **Timed futex waits overshoot by a full 10 ms tick** (`FUTEX_WAIT_BITSET` abs 1 ms -> 10.0 ms median, 16 ms -> 26.3 ms; Linux +0.12 ms): every `pthread_cond_timedwait` in Chromium's frame pipeline pays it, which is most of kami's 120-160 ms key->frame against Linux's 72 ms on the same CPU | `userspace/kami/README.md` § "Frame latency: where the 120 ms goes"; probes `userspace/forktest/c_stress/{wakelat,timerlat}.c` |
+| **A fault signal's handler frame can be declined**: `[signal] sig 5 declined: frame write to 0x100002e38 failed` on the metal — the alternate stack the kernel resolved for the thread lay in a read-only file mapping, so crashpad never ran and the process died on the trap. If that can happen to a `SIGSEGV` V8 or WebAssembly handles on purpose, it is a browser death | metal klog boot 88, 2026-10-09; `amd64/src/signal.rs` frame placement, `akuma_threading::get_sigaltstack` |
+| `[unregister] pid=N stale tid=T now owned by pid=N+1` / `[TRAMP-MISMATCH]` for every short-lived process in a fork+exec loop (25 lines for 24 `tr`/`cut` runs) — thread-slot ownership lags process exit | Firecracker runs 2026-10-09 (`run-net.sh`) |
+| "exit status 191" from a browser process 4 s after tumblr committed on the metal; meaning not established (neither a Chromium result code nor a kernel status encoding anyone found) | metal `/tmp/kami.log` 2026-10-09 21:03 |
+| **The metal's tumblr deaths did not reproduce under Firecracker** in six runs (4/8 vCPUs, kami itself, a netem-throttled lossy tap), on both the 256- and 1024-descriptor kernels | `userspace/kami/README.md` § "Tumblr under Firecracker" |
 
 **Written outside this directory** (so the score is not lost): the tumblr
 measurements and the renderer-cap flags are in `userspace/kami/README.md`
