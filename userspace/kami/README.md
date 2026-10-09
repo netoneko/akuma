@@ -293,6 +293,20 @@ keep.
   (one at 1 s spacing, then a burst) and reports the time from each key to the
   next presented frame and the frames per second. 2026-10-09 on a 7200 px local
   page: median 121 ms for an isolated key, ~9 frames/s and 42 ms in a burst.
+- `stable_try.py HOST [URL] [--runs N]`: N cold starts of a local page, each
+  scrolled; PASS means ready and a frame after every key. 2026-10-09 on
+  `file:///tmp/render.html`: 6/8 (runs 7 and 8 lost one key's frame; the metric
+  there uses log timestamps, which skew by ~1 s across cores, so some of that
+  is the probe — `nav_try.py` scores in line order instead).
+- `nav_try.py HOST [--hops N]`: two 40-row pages (`testdata/pageA.html`,
+  `pageB.html`, copied to `/tmp/` on the box) that link to each other at the
+  bottom. From a cold Chromium: `j` x3, `G`, `f`, `a`, wait for the other page,
+  repeat. **2026-10-09 (twice, same result): hops 1 and 2 land in ~2 s, hop 3
+  never does.** The log at the hang: the third `G` produced no frame, `f`
+  sent `__kami.collect()` and no reply came back (the first two hops' replies
+  took 10 ms), so the page's renderer stopped answering CDP after the third
+  document load; kami then sat in hint mode. Reproducible, which is the point
+  of the pages. On failure it prints the per-thread state of the renderer.
 - `page_try.py HOST URL --runs N`: loads a URL N times with the null display
   (`kami --fb none`: nothing is painted, the console and keyboard are left
   alone), reports survival and time to first pixels, and saves the final frame
