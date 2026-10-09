@@ -9,38 +9,38 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1308
-- **Docs contributing at least one fix:** 370
+- **Total distinct fixes counted:** 1329
+- **Docs contributing at least one fix:** 371
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 201 | 15.4% | 28 |
-| Memory & Virtual Memory | 174 | 13.3% | 56 |
-| Scheduler & Process Management | 138 | 10.6% | 42 |
-| SMP & Locking | 131 | 10.0% | 52 |
-| Networking | 80 | 6.1% | 31 |
-| Userspace Apps & Libraries | 40 | 3.1% | 21 |
+| Syscall / ABI Compatibility Audits | 217 | 16.3% | 28 |
+| Memory & Virtual Memory | 174 | 13.1% | 56 |
+| Scheduler & Process Management | 138 | 10.4% | 42 |
+| SMP & Locking | 131 | 9.9% | 52 |
+| Networking | 80 | 6.0% | 31 |
+| Userspace Apps & Libraries | 40 | 3.0% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 2.0% | 6 |
-| Toolchain & Self-Hosting | 89 | 6.8% | 12 |
-| SSH | 39 | 3.0% | 18 |
-| VFS & Filesystem | 113 | 8.6% | 36 |
-| Boot & Drivers | 109 | 8.3% | 15 |
-| Signals & Exceptions | 31 | 2.4% | 12 |
-| Misc / Cross-cutting | 48 | 3.7% | 16 |
-| Console & Terminal | 57 | 4.4% | 17 |
+| Toolchain & Self-Hosting | 89 | 6.7% | 12 |
+| SSH | 39 | 2.9% | 18 |
+| VFS & Filesystem | 113 | 8.5% | 36 |
+| Boot & Drivers | 109 | 8.2% | 15 |
+| Signals & Exceptions | 36 | 2.7% | 13 |
+| Misc / Cross-cutting | 48 | 3.6% | 16 |
+| Console & Terminal | 57 | 4.3% | 17 |
 | Containers | 32 | 2.4% | 8 |
-| **Total** | **1308** | **100.0%** | **370** |
+| **Total** | **1329** | **100.0%** | **371** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
 - 44 — `docs/archive/GOLANG_MISSING_SYSCALLS.md`
+- 35 — `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`
 - 21 — `docs/archive/AKUMA_FIRECRACKER_AMD64.md`
 - 21 — `docs/archive/GO_FORK_EXEC_FIXES.md`
 - 20 — `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`
 - 20 — `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`
 - 20 — `docs/archive/GOLANG_IPC.md`
-- 19 — `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`
 - 19 — `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`
 - 18 — `docs/archive/DASH_MISSING_SYSCALLS.md`
 - 16 — `docs/archive/AKUMA_SELF_HOSTING.md`
@@ -50,7 +50,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (201 fixes, 28 docs)
+## Syscall / ABI Compatibility Audits (217 fixes, 28 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -271,6 +271,22 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - x86_64 `capget`/`capset` (125/126) had no row, so the zygote child's post-fork `capset` (inside a `CHECK`) was `ENOSYS` and every child died before its ping ("Did not receive ping from zygote child", then "GPU process isn't usable"); both rows reach glue's arms, and glue's `capget` answers an unknown version with a NULL `data` as Linux does (0, version written) instead of `EINVAL`
 - amd64 `mmap`/`mprotect` refused `PROT_WRITE | PROT_EXEC` with `EINVAL` (a W^X rule Linux has not), `Prot::from_prot` dropped the execute bit beside `PROT_WRITE` on both kernels and the x86 encoder made even the RWX token non-executable, so V8's 512 MB code range could not be made RWX and every Chromium renderer died on a `CHECK`; all three grant it now, the ELF loader's segment rule stands
 - the amd64 non-main thread table held 64 entries system-wide, so a Chromium session's 65th thread got `EAGAIN` from `clone` and the GPU process `CHECK`ed five times; it holds 448, sized to the 512-slot task budget
+- x86_64 `fallocate` (285) had no row, so Chromium's 171 shared-memory sizing calls were `ENOSYS` (82 per headless run) and fell back to `ftruncate`; row `Fallocate` in `akuma-syscalls-abi` plus a dispatch arm into glue
+- newer musl does `pwrite(2)` as `pwritev2(..., RWF_NOAPPEND)` and every nonzero `RWF_*` was refused (990 `EOPNOTSUPP` per run); `RWF_NOAPPEND` is accepted as a no-op
+- `pwrite`/`write` to an unlinked file went by path while `pread` went by inode, so the bytes read back as nothing (Chromium 152 FontDataService text rendered blank); both write by inode now
+- `open("/proc/self/fd/N")` of an unlinked file answered `ENOENT` because the fd symlink named a path that was gone; `openat` binds the new fd to the inode instead
+- a read-only mapping of a file another process maps shared-writable saw the file's old bytes (`fill_file_pages` ignored the writer's unflushed page in the shared-writable table); it consults that table first
+- `MAX_PIPES = 256` machine-wide starved the zygote on a heavy page (`pipe2` -> `ENFILE`, a `CHECK` in `zygote_linux.cc`, no renderers); raised to 2048
+- `/proc/cpuinfo` did not exist on either kernel (`Failed to initialize cpuinfo`); shared glue renders it from a per-arch block source, amd64 fills it from CPUID
+- `/proc/<pid>/oom_score_adj`, `oom_adj` and `oom_score` did not exist (`Failed to adjust OOM score of renderer`, `ENOENT`); served as constant `0` files with writes discarded (the log line itself turned out to name already-dead zygote children)
+- `mprotect` skipped every page a `PROT_NONE` had made `user = false`, so a recommit never took and PartitionAlloc's pool pages stayed inaccessible (every renderer died at its third document load); an inaccessible leaf is skipped only for a `PROT_NONE` request
+- `madvise(DONTNEED)` skipped present pages of a `PROT_NONE` region, leaving old bytes behind a recommit where the allocator expects zeros; a present page in a NONE region is zeroed like any other
+- `amd64/src/fd.rs::MAX_FDS` was 256 while `prlimit64` answers `RLIMIT_NOFILE` 1024, so Chromium's network service took 200+ `EMFILE` from `socket(2)` in 15 s of tumblr.com; the bound is 1024
+- `CLOCK_MONOTONIC` subtracted the BSP's `TSC_START` from whichever core's `rdtsc` ran, and the metal's cores differ by ~1 s, so the network service's `TimeTicks` `CHECK(start <= end)` tripped ~4 s into every start; each AP's TSC offset is measured by a ping-pong at bring-up and subtracted
+- `execve` cleared `Process::sigaltstack_*` but not the calling slot's per-thread altstack, so an exec'd helper's signal frames aimed at the parent image's VA (`sig 5 declined: frame write failed`); `install_image` clears the slot's altstack too
+- timed futex waits overshot by a whole tick (an `hlt` ran before the deadline test on every pass, and a halted core waited for its next periodic tick); the pre-deadline halt is gone, `lapic::arm_deadline` programs a one-shot for the earliest waiter, and `ThreadWaker::wake` kicks a halted core with an IPI (futex 1 ms: 10.0 -> 1.013 ms)
+- `MAP_FIXED_NOREPLACE` was treated as a hint on amd64 (it fell into the unhinted branch, even over text and stack); it maps exactly at `addr` or fails `EEXIST`
+- glue's stdout `write` applied ONLCR whenever the session's stdin was still open, without asking whether the channel was a terminal, so an ssh exec session raced the client's stdin EOF and `\r` landed before some `\n` (2 MB over `ssh host cmd` corrupted 2 of 3 runs); only `is_terminal()` channels translate
 
 ## Memory & Virtual Memory (174 fixes, 56 docs)
 
@@ -1834,7 +1850,7 @@ aren't recorded anywhere else.)
 - the PS/2 keyboard driver dropped every 0xE0-extended key on purpose, so arrows, Home/End, Delete and PgUp/PgDn did nothing in rio; they emit the USB keymap's escape sequences through a lock-free byte queue
 - the polled i8042 driver raced between cores on ports `0x60`/`0x64` and a plain spinlock around it hung even a single-core boot when a holder was preempted; `kbd.rs` uses the bounded give-up lock from `serial.rs`
 
-## Signals & Exceptions (31 fixes, 12 docs)
+## Signals & Exceptions (36 fixes, 13 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -1891,6 +1907,13 @@ aren't recorded anywhere else.)
 - vector 6 (`#UD`) was still a generated `x86-interrupt` handler that can only `fatal()`, so a ring-3 illegal instruction (OpenBLAS's runtime SIMD dispatch in Alpine's `llama-server`) halted the whole machine; now a `global_asm!` stub that delivers `SIGILL` or kills just the process, ring 0 unchanged
 - `fchdir` was missing two layers deep on amd64 — no `akuma-syscalls-abi` row, and with the row still `ENOSYS` because `usermode.rs`'s dispatch has no catch-all forward to glue — so `apk` post-install hooks died; row plus dispatch arm
 - amd64 `sys_execve` had no `#!` handling (`Exec format error` for any script); split into an outer pointer copy and a recursive `do_execve` on AArch64's host-tested `parse_shebang`/`shebang_hop`
+
+### docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md
+- amd64 `kill(2)` took the AArch64 hard-kill path (cross-core termination of a thread that may be inside the BKL), so a Chromium-tree `kill -9` wedged the box, cost 2 s per threaded kill and leaked thread rows; `sys_kill` decodes the pid and pends every signal, SIGKILL included, through `pend_signal_to_group`, and `tkill`/`tgkill` follow
+- a sibling's fatal signal told the leader through `deliver_signal`, which for SIGKILL re-entered `kill_thread_group` and hard-terminated the leader from a parker's core; the notification pends too
+- a signal death read as an exit code: bit 30 is set in every negative word, so `GROUP_EXIT_STATUS` `-9` became `exit_group(0xf7)` and a SIGTERMed group exited 241; the sign is tested first
+- every untimed `AF_UNIX` park in `unixsock.rs` (`accept`, the send paths, the receive, the pipe read) skipped `should_interrupt_blocking_syscall`, so a pended signal woke the thread and it parked again (invisible on AArch64 behind the 2 s grace kill); six sites return `EINTR` before parking, on both kernels
+- a thread in a syscall-free compute loop was never reached by `exit_group` (it leaves only at syscall entry or return, not on the tick); `deliver_pending_on_tick` answers `Exit` when the group is exiting
 
 ## Misc / Cross-cutting (48 fixes, 16 docs)
 
