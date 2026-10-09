@@ -45,6 +45,8 @@ Keys are modal, like vim (`src/nav.rs`, host-tested).
   says why in the input log (`hints: nothing found; {matched, small, off,
   hidden, ...}`).
 - **Insert** (`i`): all keys go to the page; Esc blurs and returns to Normal.
+- **Images** (`v`, `kami tui` only): label the images on screen; the label
+  opens one full screen (see `kami tui` below).
 - Ctrl-R reloads; **Ctrl-Q or Ctrl-C quits** (any mode, even when Chromium is
   not answering: a separate input thread watches for them).
 
@@ -100,7 +102,36 @@ How it works (`src/tui/`, the layout half of `src/machine.rs`):
   screen. When the page scrolls itself (navigation, an anchor, its own script),
   the view follows, except for a snapshot asked for before kami's own last
   scroll.
-- **Images are pixels**, as `▀` half blocks (upper pixel foreground, lower
+- **Real images with the kitty graphics protocol** where the terminal has it:
+  Ghostty, kitty, WezTerm and rio (its CPU renderer too, so the Akuma
+  framebuffer build). Named terminals are recognised from `TERM`/
+  `TERM_PROGRAM`/`KITTY_WINDOW_ID`; otherwise kami asks, once at startup
+  before its input thread owns the tty: kitty's 1x1 query plus Primary Device
+  Attributes, `OK` before the attributes meaning yes, at most 500 ms. That is
+  what makes it work over ssh, where only `TERM` crosses and rio says
+  `xterm-256color` wherever there is no `xterm-rio` terminfo (Akuma, most
+  servers). `--images kitty|blocks` or `KAMI_IMAGES` overrides. Verified on
+  Ghostty 1.3.1 by hand (2026-10-10); rio's support read from its source
+  (`rio-vt/src/ansi/kitty_graphics_protocol.rs`: PNG, chunking, cropped
+  placements, `z<0` under text) but not yet run.
+  Each image on screen is captured on its own as a PNG at about the
+  terminal's pixel density (`TIOCGWINSZ` gives the cell size) and sent to the
+  terminal once, as is (`f=100`: the terminal decodes it); every frame then
+  drops all placements and places the visible ones, cropped to the rows
+  shown, under the text (`z=-1`) so captions stay readable, and kept off rows
+  where a fixed header crosses the image. An image a fixed box covers is not
+  captured until the view has moved off it (a capture is of what is painted,
+  and Tumblr's sign-up bar was baked into its post images). Until an image is
+  captured, and for images taller than the viewport, half blocks as below.
+- **`v` opens an image up close**: the images on screen get letter labels
+  (one image opens at once); the label opens it full screen, as large as the
+  screen allows with its aspect, the alt text as a caption; Esc, `q` or `v`
+  closes it and the view is where it was. It is re-captured for the viewer
+  at the screen's resolution (`captureBeyondViewport`, so a tall image comes
+  whole), as kitty pixels or, without kitty, half blocks resampled to the
+  whole screen. The viewer can only be as sharp as what the page loaded: a
+  250 px thumbnail stays a thumbnail.
+- **Images are pixels** even without kitty, as `▀` half blocks (upper pixel foreground, lower
   background), in any truecolour terminal. After each snapshot kami captures the
   page's viewport at about 2 px per cell (`Page.captureScreenshot` with a clip
   inside the viewport: a 100-column view is a ~240x150 PNG, 30-50 ms on a Mac)
@@ -171,8 +202,10 @@ Next:
   cell grid against what the snapshot says, so layout regressions show up as
   test failures rather than in a screenshot.
 - Borders (box drawing), scrolling *inside* an `overflow:auto` element,
-  mouse clicks and wheel from the terminal, pixels in the fixed layer, and
-  sixel/kitty images for terminals that have them. Not yet run on Akuma.
+  mouse clicks and wheel from the terminal, pixels in the fixed layer,
+  sixel/iTerm2 images, and the viewer following an `<img>`'s `srcset` to its
+  largest source for a sharper look than the page's thumbnail. Not yet run on
+  Akuma.
 
 ## The status bar
 

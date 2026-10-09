@@ -59,6 +59,9 @@ struct Args {
     tui: bool,
     /// `kami tui --page-fonts`: keep the page's own fonts (no `cells.js`).
     page_fonts: bool,
+    /// `kami tui --images kitty|blocks`: how images are drawn (default: kitty
+    /// graphics where the terminal has them, else half blocks).
+    images: Option<String>,
 }
 
 fn usage() -> ! {
@@ -66,7 +69,7 @@ fn usage() -> ! {
         "usage: kami [--scale N] [--fb PATH] [--chromium PATH] [--sock PATH] [--log PATH]\n\
          \x20           [--frames N] [--seconds S] [--poll MS] [--chrome-arg ARG]... [URL]\n\
          \x20      kami --kill\n\
-         \x20      kami tui [--page-fonts] [URL]"
+         \x20      kami tui [--page-fonts] [--images kitty|blocks] [URL]"
     );
     std::process::exit(2)
 }
@@ -88,6 +91,7 @@ fn parse_args() -> Args {
         poll: None,
         tui: false,
         page_fonts: false,
+        images: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -103,6 +107,7 @@ fn parse_args() -> Args {
             "--poll" => a.poll = Some(val().parse().unwrap_or_else(|_| usage())),
             "--chrome-arg" => a.extra.push(val()),
             "--page-fonts" => a.page_fonts = true,
+            "--images" => a.images = Some(val()),
             "--daemon" => a.daemon = true,
             "--kill" => a.kill = true,
             "--size" => {
@@ -497,7 +502,14 @@ fn session(args: &Args) -> io::Result<()> {
                         };
                     }
                     // Layout mode only (`kami tui`).
-                    Effect::Layout { .. } | Effect::Scroll(_) | Effect::Captured { .. } => {}
+                    Effect::Layout { .. }
+                    | Effect::Scroll(_)
+                    | Effect::Captured { .. }
+                    | Effect::PickImages
+                    | Effect::PickFilter(_)
+                    | Effect::PickCancel
+                    | Effect::ViewImage(_)
+                    | Effect::CloseView => {}
                     Effect::TryConnect { .. } | Effect::Send(_) | Effect::Pin(_) | Effect::Log(_) => {}
                 }
             }

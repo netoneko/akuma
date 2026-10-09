@@ -162,7 +162,7 @@ mod tests {
                 if y < 38 { px[i] = 255 } else { px[i + 2] = 255 }
             }
         }
-        let clip = Clip { x: 0.0, y: 0.0, w: 40.0, h: 76.0, scale: 1.0 };
+        let clip = Clip { x: 0.0, y: 0.0, w: 40.0, h: 76.0, scale: 1.0, full: false, tag: 0 };
         let mut cache = Cache::default();
         cache.absorb(&g, &Pixels { px: &px, w, h, ch: 3 }, &clip);
         let b = cache.get(7).unwrap();
@@ -179,14 +179,14 @@ mod tests {
         let g = build(&page, 4, 10, 10.0);
         let px = vec![200u8; 40 * 38 * 3];
         // Only the top half of the image was in the viewport.
-        let clip = Clip { x: 0.0, y: 0.0, w: 40.0, h: 38.0, scale: 1.0 };
+        let clip = Clip { x: 0.0, y: 0.0, w: 40.0, h: 38.0, scale: 1.0, full: false, tag: 0 };
         let mut cache = Cache::default();
         cache.absorb(&g, &Pixels { px: &px, w: 40, h: 38, ch: 3 }, &clip);
         let b = cache.get(7).unwrap();
         assert!(b.get(1, 0).is_some() && b.get(2, 0).is_none());
         assert!(cache.missing(&g, 0..4) && !cache.missing(&g, 0..2));
         // The next capture, scrolled down, completes it.
-        let clip = Clip { x: 0.0, y: 38.0, w: 40.0, h: 38.0, scale: 1.0 };
+        let clip = Clip { x: 0.0, y: 38.0, w: 40.0, h: 38.0, scale: 1.0, full: false, tag: 0 };
         cache.absorb(&g, &Pixels { px: &px, w: 40, h: 38, ch: 3 }, &clip);
         assert!(!cache.missing(&g, 0..4));
     }

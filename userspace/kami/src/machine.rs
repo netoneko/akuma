@@ -77,10 +77,10 @@ pub enum Source {
 }
 
 /// A region of the page to capture (CSS px, document coordinates) and the
-/// scale to capture it at. Layout mode captures only what is in the page's
-/// viewport: `captureBeyondViewport` resizes the page for the capture (two
-/// `resize` events, a reflow, ~0.9 s on a Mac) and lazy images outside the
-/// viewport are not loaded anyway.
+/// scale to capture it at. Captures stay inside the page's viewport unless
+/// `full`: `captureBeyondViewport` resizes the page for the capture (two
+/// `resize` events, a reflow, ~0.9 s on a Mac), so only the image viewer,
+/// one image on request, uses it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Clip {
     pub x: f64,
@@ -88,7 +88,14 @@ pub struct Clip {
     pub w: f64,
     pub h: f64,
     pub scale: f64,
+    pub full: bool,
+    /// What the capture is for, as the shell names it. A waiting request
+    /// with the same tag is replaced by a newer one.
+    pub tag: u64,
 }
+
+/// At most this many captures wait behind the one in flight.
+const CAPTURE_QUEUE: usize = 32;
 
 /// What a session shows: pixels (the framebuffer) or the page's layout
 /// painted into a terminal (`kami tui`).
@@ -120,11 +127,15 @@ pub enum Event {
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     /// The page viewport (CSS px) changed: the terminal was resized.
     Resized((usize, usize)),
-    /// Layout mode: capture this region as a PNG for the images on screen;
-    /// answered with [`Effect::Captured`]. Only one capture is in flight; a
-    /// request made meanwhile replaces any earlier waiting one.
+    /// Layout mode: capture this region as a PNG; answered with
+    /// [`Effect::Captured`]. One capture is in flight at a time; the rest
+    /// wait in order, a newer request replacing a waiting one with its tag.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     Capture(Clip),
+    /// Layout mode: the shell labelled this many images after
+    /// [`Effect::PickImages`].
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    Picked(usize),
 }
 
 #[derive(Debug, PartialEq)]
@@ -147,6 +158,15 @@ pub enum Effect {
     Scroll(Scroll),
     /// Layout mode: the base64 PNG of an [`Event::Capture`], and its clip.
     Captured { b64: String, clip: Clip },
+    /// Layout mode (`v`): label the images on screen; answer with
+    /// [`Event::Picked`].
+    PickImages,
+    /// Show only the image labels starting with this.
+    PickFilter(String),
+    PickCancel,
+    /// Open picked image number N in the viewer.
+    ViewImage(usize),
+    CloseView,
     /// Remember this tab as the session's: the next kami attaches to it.
     Pin(String),
     Status(String),
@@ -269,7 +289,9 @@ pub struct Machine {
     last_scroll_id: u64,
     /// The capture in flight, and the one to send when it is answered.
     capture: Option<Clip>,
-    capture_next: Option<Clip>,
+    capture_next: std::collections::VecDeque<Clip>,
+    /// Hint mode is picking an image (`v`), not a link.
+    picking: bool,
 }
 
 /// Layout mode: the pass-through keys that scroll a page, as view scrolls.
@@ -335,7 +357,8 @@ impl Machine {
             layout_version: String::new(),
             last_scroll_id: 0,
             capture: None,
-            capture_next: None,
+            capture_next: std::collections::VecDeque::new(),
+            picking: false,
         }
     }
 
@@ -376,11 +399,32 @@ impl Machine {
             }
             Event::Capture(clip) => {
                 if self.capture.is_some() {
-                    self.capture_next = Some(clip);
+                    let full = self.capture_next.len() >= CAPTURE_QUEUE;
+                    match self.capture_next.iter_mut().find(|c| c.tag == clip.tag) {
+                        Some(waiting) => *waiting = clip,
+                        None if !full => self.capture_next.push_back(clip),
+                        None => out.push(Effect::Log("layout: capture queue full; dropped one".into())),
+                    }
                 } else {
                     self.send_capture(clip, &mut out);
                 }
             }
+            Event::Picked(n) => match n {
+                0 => {
+                    self.picking = false;
+                    self.nav.begin_hints(0);
+                    out.push(Effect::Log("images: none on screen".into()));
+                }
+                1 => {
+                    self.picking = false;
+                    self.nav.begin_view();
+                    out.push(Effect::ViewImage(0));
+                }
+                _ => {
+                    self.picking = true;
+                    self.nav.begin_pick(n);
+                }
+            },
             Event::Resized(view) => {
                 if view != self.cfg.view {
                     self.cfg.view = view;
@@ -601,16 +645,17 @@ impl Machine {
         self.layout_force = true;
         self.layout_version.clear();
         self.capture = None;
-        self.capture_next = None;
+        self.capture_next.clear();
+        self.picking = false;
     }
 
     fn send_capture(&mut self, clip: Clip, out: &mut Vec<Effect>) {
         if self.phase != Phase::Running || self.session.is_none() {
             return;
         }
-        let Clip { x, y, w, h, scale } = clip;
+        let Clip { x, y, w, h, scale, full, .. } = clip;
         let p = format!(
-            "{{\"format\":\"png\",\"clip\":{{\"x\":{x},\"y\":{y},\"width\":{w},\"height\":{h},\"scale\":{scale}}}}}"
+            "{{\"format\":\"png\",\"captureBeyondViewport\":{full},\"clip\":{{\"x\":{x},\"y\":{y},\"width\":{w},\"height\":{h},\"scale\":{scale}}}}}"
         );
         self.capture = Some(clip);
         self.send(Req::Capture, "Page.captureScreenshot", &p, true, out);
@@ -895,7 +940,7 @@ impl Machine {
                 if let (false, Some(clip), Some(b64)) = (err, clip, str_field(m, "data")) {
                     out.push(Effect::Captured { b64: b64.to_string(), clip });
                 }
-                if let Some(next) = self.capture_next.take() {
+                if let Some(next) = self.capture_next.pop_front() {
                     self.send_capture(next, out);
                 }
             }
@@ -1002,6 +1047,22 @@ impl Machine {
                 out.push(Effect::Scroll(s));
                 return;
             }
+            // `v`: the labels and the viewer are the shell's, not the page's.
+            match act {
+                Action::ImageStart => return out.push(Effect::PickImages),
+                Action::CloseView => return out.push(Effect::CloseView),
+                Action::HintFilter(p) if self.picking => return out.push(Effect::PickFilter(p)),
+                Action::HintCancel if self.picking => {
+                    self.picking = false;
+                    return out.push(Effect::PickCancel);
+                }
+                Action::HintClick(i) if self.picking => {
+                    self.picking = false;
+                    self.nav.begin_view();
+                    return out.push(Effect::ViewImage(i));
+                }
+                _ => {}
+            }
             self.refresh_soon();
         }
         let (w, h) = (self.cfg.view.0 as f64, self.cfg.view.1 as f64);
@@ -1027,6 +1088,8 @@ impl Machine {
             Action::HintFilter(p) => self.eval(Req::Ignore, &format!("__kami.filter(\"{}\")", escape(&p)), out),
             Action::HintCancel => self.eval(Req::Ignore, "__kami.clear()", out),
             Action::HintClick(i) => self.eval(Req::Click, &format!("__kami.click({i})"), out),
+            // The framebuffer already shows images as they are.
+            Action::ImageStart | Action::CloseView => {}
         }
     }
 
@@ -1614,16 +1677,60 @@ mod tests {
     #[test]
     fn layout_mode_captures_one_at_a_time_keeping_only_the_latest_request() {
         let (mut m, _) = running_layout(false);
-        let clip = |y: f64| Clip { x: 0.0, y, w: 800.0, h: 600.0, scale: 0.25 };
+        let clip = |y: f64| Clip { x: 0.0, y, w: 800.0, h: 600.0, scale: 0.25, full: false, tag: 0 };
         let e = m.handle(Event::Capture(clip(0.0)));
         let first = last_id(&e);
         assert!(sent(&e)[0].contains("Page.captureScreenshot") && sent(&e)[0].contains("\"scale\":0.25"));
+        assert!(sent(&e)[0].contains("\"captureBeyondViewport\":false"));
         assert!(sent(&m.handle(Event::Capture(clip(100.0)))).is_empty(), "one in flight");
         assert!(sent(&m.handle(Event::Capture(clip(200.0)))).is_empty());
         let e = m.handle(reply(first, r#"{"data":"QUJD"}"#));
         assert!(has(&e, |x| *x == Effect::Captured { b64: "QUJD".into(), clip: clip(0.0) }));
         let s = sent(&e);
         assert!(s.len() == 1 && s[0].contains("\"y\":200"), "only the latest waiting request: {s:?}");
+    }
+
+    #[test]
+    fn layout_mode_v_picks_an_image_in_the_shell_and_opens_the_viewer() {
+        let (mut m, _) = running_layout(false);
+        let e = m.handle(Event::Key(Input::Text("v".into())));
+        assert!(has(&e, |x| *x == Effect::PickImages));
+        m.handle(Event::Picked(12));
+        assert_eq!(m.nav.mode, Mode::Hint);
+        let e = m.handle(Event::Key(Input::Text("s".into())));
+        assert!(has(&e, |x| *x == Effect::PickFilter("s".into())));
+        assert!(sent(&e).is_empty(), "the page's hint helper is not involved");
+        let e = m.handle(Event::Key(Input::Text("a".into())));
+        assert!(has(&e, |x| *x == Effect::ViewImage(9)));
+        assert_eq!(m.nav.mode, Mode::View);
+        let e = m.handle(Event::Key(Input::Text("q".into())));
+        assert!(has(&e, |x| *x == Effect::CloseView));
+        // One image on screen opens at once; `f` afterwards is links again.
+        m.handle(Event::Key(Input::Text("v".into())));
+        let e = m.handle(Event::Picked(1));
+        assert!(has(&e, |x| *x == Effect::ViewImage(0)));
+        m.handle(Event::Key(Input::Key("Escape", 27)));
+        let e = m.handle(Event::Key(Input::Text("f".into())));
+        assert!(sent(&e).iter().any(|s| s.contains("__kami.collect")));
+    }
+
+    #[test]
+    fn layout_mode_captures_queue_in_order_and_a_newer_request_replaces_its_tag() {
+        let (mut m, _) = running_layout(false);
+        let clip = |y: f64, tag: u64| Clip { x: 0.0, y, w: 10.0, h: 10.0, scale: 1.0, full: tag == 9, tag };
+        let e = m.handle(Event::Capture(clip(0.0, 0)));
+        let mut id = last_id(&e);
+        m.handle(Event::Capture(clip(1.0, 5)));
+        m.handle(Event::Capture(clip(2.0, 9)));
+        m.handle(Event::Capture(clip(3.0, 5))); // replaces the waiting tag 5
+        let mut order = vec![];
+        for _ in 0..2 {
+            let e = m.handle(reply(id, r#"{"data":"QQ=="}"#));
+            let s = sent(&e)[0].to_string();
+            order.push((s.contains("\"y\":3"), s.contains("\"captureBeyondViewport\":true")));
+            id = last_id(&e);
+        }
+        assert_eq!(order, [(true, false), (false, true)]);
     }
 
     #[test]

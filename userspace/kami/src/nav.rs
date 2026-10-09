@@ -10,7 +10,10 @@
 //! * **Insert**: everything passes through to the page; Esc blurs the focused
 //!   element and returns to Normal.
 //! * **Hint**: after `f` every clickable element wears a letter label; typing
-//!   the label clicks it. Esc cancels, Backspace un-types a letter.
+//!   the label clicks it. Esc cancels, Backspace un-types a letter. `v` (in
+//!   `kami tui`) labels the images on screen the same way, and the label
+//!   opens one in the viewer.
+//! * **View**: an image fills the screen; Esc, `q` or `v` closes it.
 //!
 //! Ctrl-R (reload) and Ctrl-C/Ctrl-Q (detach) work in every mode.
 
@@ -25,6 +28,7 @@ pub enum Mode {
     Normal,
     Insert,
     Hint,
+    View,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +54,10 @@ pub enum Action {
     HintCancel,
     /// Blur the focused element (leaving insert mode).
     Blur,
+    /// Label the images on screen; the caller answers with [`Nav::begin_pick`].
+    ImageStart,
+    /// Close the image viewer.
+    CloseView,
     /// Pass a special key to the page.
     Key(&'static str, u32),
     /// Type text into the page.
@@ -63,6 +71,8 @@ pub struct Nav {
     n: usize,
     len: usize,
     pending_g: bool,
+    /// What the labels in Hint mode are on: "LINKS" or "IMAGES".
+    what: &'static str,
 }
 
 /// Label width for `n` hints: the smallest L with 9^L >= n (at least 1).
@@ -87,21 +97,36 @@ pub fn label(mut i: usize, len: usize) -> String {
 
 impl Nav {
     pub fn new() -> Nav {
-        Nav { mode: Mode::Normal, prefix: String::new(), n: 0, len: 1, pending_g: false }
+        Nav { mode: Mode::Normal, prefix: String::new(), n: 0, len: 1, pending_g: false, what: "LINKS" }
     }
 
     /// The status-line text for the current state (kami draws it itself, on the
     /// framebuffer; see `bar.rs`).
     pub fn status(&self) -> String {
         match self.mode {
-            Mode::Normal => "NORMAL  j/k scroll  f links  i type  H/L back/fwd  Ctrl-Q quit".into(),
+            Mode::Normal => "NORMAL  j/k scroll  f links  v images  i type  H/L back/fwd  Ctrl-Q quit".into(),
             Mode::Insert => "INSERT  Esc to leave".into(),
-            Mode::Hint => format!("LINKS  {}", self.prefix),
+            Mode::Hint => format!("{}  {}", self.what, self.prefix),
+            Mode::View => "IMAGE  Esc/q/v close".into(),
         }
+    }
+
+    /// The caller found `n` images on screen after [`Action::ImageStart`]:
+    /// the same labels as links, and the same [`Action::HintClick`].
+    pub fn begin_pick(&mut self, n: usize) {
+        self.begin_hints(n);
+        self.what = "IMAGES";
+    }
+
+    /// An image is open: every key but the ones that close it is swallowed.
+    pub fn begin_view(&mut self) {
+        self.mode = Mode::View;
+        self.prefix.clear();
     }
 
     /// The caller found `n` clickable elements after [`Action::HintStart`].
     pub fn begin_hints(&mut self, n: usize) {
+        self.what = "LINKS";
         self.prefix.clear();
         self.pending_g = false;
         if n == 0 {
@@ -143,12 +168,23 @@ impl Nav {
                     out.push(Action::HintFilter(self.prefix.clone()));
                 }
                 (Mode::Hint, _) => {}
+                (Mode::View, "Escape") => {
+                    self.mode = Mode::Normal;
+                    out.push(Action::CloseView);
+                }
+                (Mode::View, _) => {}
                 _ => out.push(Action::Key(name, *code)),
             },
             Input::Text(t) => match self.mode {
                 Mode::Insert => out.push(Action::Text(t.clone())),
                 Mode::Hint => self.hint_text(t, &mut out),
                 Mode::Normal => self.normal_text(t, &mut out),
+                Mode::View => {
+                    if t.contains(['q', 'v']) {
+                        self.mode = Mode::Normal;
+                        out.push(Action::CloseView);
+                    }
+                }
             },
         }
         out
@@ -199,6 +235,10 @@ impl Nav {
                     out.push(Action::HintStart);
                     return;
                 }
+                'v' => {
+                    out.push(Action::ImageStart);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -237,6 +277,24 @@ mod tests {
         assert_eq!(n.feed(&text("G")), vec![Action::Scroll(Scroll::Edge(1))]);
         assert_eq!(n.feed(&Input::Key("ArrowDown", 40)), vec![Action::Key("ArrowDown", 40)]);
         assert_eq!(n.feed(&Input::Key("Escape", 27)), vec![Action::Key("Escape", 27)]);
+    }
+
+    #[test]
+    fn v_picks_an_image_and_the_viewer_swallows_keys_until_closed() {
+        let mut n = Nav::new();
+        assert_eq!(n.feed(&text("vj")), vec![Action::ImageStart]);
+        n.begin_pick(3);
+        assert!(n.status().starts_with("IMAGES"));
+        assert_eq!(n.feed(&text("s")), vec![Action::HintClick(1)]);
+        n.begin_view();
+        assert_eq!(n.feed(&text("jk")), vec![]);
+        assert_eq!(n.feed(&Input::Key("ArrowDown", 40)), vec![]);
+        assert_eq!(n.feed(&text("q")), vec![Action::CloseView]);
+        assert_eq!(n.mode, Mode::Normal);
+        n.begin_view();
+        assert_eq!(n.feed(&Input::Key("Escape", 27)), vec![Action::CloseView]);
+        n.begin_hints(2);
+        assert!(n.status().starts_with("LINKS"), "f after v is links again");
     }
 
     #[test]
