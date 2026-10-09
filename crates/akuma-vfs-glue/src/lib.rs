@@ -1291,6 +1291,27 @@ pub(crate) fn power_renderer() -> Option<fn(&mut [u8]) -> usize> {
     *POWER_RENDER.lock()
 }
 
+/// The `/proc/cpuinfo` block renderer: `f(core, buf)` writes the one block that
+/// describes logical CPU `core` (ending in the blank line that separates
+/// blocks) and returns the bytes written. Per-core rather than whole-file so
+/// the renderer never needs a buffer sized by the core count, and so `read_at`
+/// at any offset re-renders one block at a time on the stack. Must not allocate
+/// and must tolerate a short buffer. Unregistered, the file still exists as bare
+/// `processor : N` blocks: the core count is known on every kernel, the CPU's
+/// description is not (2026-10-09: neither kernel had the file at all, and
+/// Chromium logged `Failed to initialize cpuinfo`).
+static CPUINFO_RENDER: spinning_top::Spinlock<Option<fn(usize, &mut [u8]) -> usize>> =
+    spinning_top::Spinlock::new(None);
+
+/// Register the `/proc/cpuinfo` block renderer.
+pub fn set_cpuinfo_renderer(f: fn(usize, &mut [u8]) -> usize) {
+    *CPUINFO_RENDER.lock() = Some(f);
+}
+
+pub(crate) fn cpuinfo_renderer() -> Option<fn(usize, &mut [u8]) -> usize> {
+    *CPUINFO_RENDER.lock()
+}
+
 /// Whether the kernel offers `/dev/wifi0`. Set once at boot by a kernel with a
 /// wifi backend (amd64: a radio, or `wifisim`).
 static WIFI_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

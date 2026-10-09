@@ -579,8 +579,11 @@ still logs, none of it fatal:
   tid equals its pid, and code that tests `gettid() == getpid()` for "main
   thread" will answer wrong. Not yet shown to be what Chromium trips on.
 - **Missing `/proc` and `/sys` files** Chromium reads (each logged as
-  `ERROR`, not fatal so far): `/proc/cpuinfo` (`Failed to initialize
-  cpuinfo`), `/proc/sys/fs/inotify/max_user_watches`, `/proc/<pid>/oom_score_adj`,
+  `ERROR`, not fatal so far): ~~`/proc/cpuinfo` (`Failed to initialize
+  cpuinfo`)~~ — **written 2026-10-09** (neither kernel had it; shared glue in
+  `akuma-vfs-glue::proc` plus the amd64 `cpuid` block renderer
+  `amd64/src/cpuinfo.rs`; aarch64 gets bare `processor : N` blocks until it
+  registers a renderer; not yet booted), `/proc/sys/fs/inotify/max_user_watches`, `/proc/<pid>/oom_score_adj`,
   `/sys/devices/system/cpu/{possible,present,kernel_max}`.
 - **Missing x86_64 rows**: 40 `sendfile`, 239 `get_mempolicy`, 297
   `rt_tgsigqueueinfo` (crashpad re-raises a crash signal with it), 444

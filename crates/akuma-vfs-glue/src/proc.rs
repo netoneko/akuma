@@ -415,6 +415,52 @@ fn render_meminfo(buf: &mut [u8]) -> usize {
     pos
 }
 
+/// The largest `/proc/cpuinfo` block a renderer may produce; the stack scratch
+/// every read renders one block into.
+const CPUINFO_BLOCK: usize = 2048;
+
+/// Render logical CPU `core`'s block into `scratch`: the kernel's renderer if it
+/// registered one, else a bare `processor : N` block.
+fn cpuinfo_block(core: usize, scratch: &mut [u8; CPUINFO_BLOCK]) -> usize {
+    use akuma_primitives::console::FmtBuf;
+    if let Some(f) = crate::cpuinfo_renderer() {
+        return f(core, scratch).min(CPUINFO_BLOCK);
+    }
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf: &mut scratch[..], pos: &mut pos };
+    let _ = writeln!(w, "processor\t: {core}\n");
+    pos
+}
+
+/// Copy `/proc/cpuinfo` from byte `offset` into `buf`, one block at a time:
+/// each core's block is rendered into a stack scratch, the part overlapping
+/// `[offset, offset + buf.len())` is copied out and the block is dropped. A
+/// read costs `cores` renders, which is nothing next to the syscall.
+fn cpuinfo_read(offset: usize, buf: &mut [u8]) -> usize {
+    let mut scratch = [0u8; CPUINFO_BLOCK];
+    let (mut base, mut out) = (0usize, 0usize);
+    for core in 0..active_core_count() {
+        let len = cpuinfo_block(core, &mut scratch);
+        let pos = offset + out;
+        if pos >= base && pos < base + len {
+            let n = (len - (pos - base)).min(buf.len() - out);
+            buf[out..out + n].copy_from_slice(&scratch[pos - base..pos - base + n]);
+            out += n;
+            if out == buf.len() {
+                break;
+            }
+        }
+        base += len;
+    }
+    out
+}
+
+/// `/proc/cpuinfo`'s length.
+fn cpuinfo_len() -> usize {
+    let mut scratch = [0u8; CPUINFO_BLOCK];
+    (0..active_core_count()).map(|c| cpuinfo_block(c, &mut scratch)).sum()
+}
+
 /// `/proc/uptime` — `uptime_seconds idle_seconds`. `idle_seconds` follows
 /// Linux SMP semantics (summed across every core, so it can exceed wall time).
 fn render_uptime(buf: &mut [u8]) -> usize {
@@ -708,7 +754,7 @@ impl Filesystem for ProcFilesystem {
 
             // System-wide stats — `free`/`top` (busybox) read these; visible
             // to every box, same as `mounts`/`filesystems` above.
-            for name in ["meminfo", "stat", "uptime", "loadavg"] {
+            for name in ["meminfo", "stat", "uptime", "loadavg", "cpuinfo"] {
                 entries.push(DirEntry {
                     name: String::from(name),
                     is_dir: false,
@@ -950,6 +996,9 @@ impl Filesystem for ProcFilesystem {
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — rendered
         // straight into the caller's buffer, no intermediate `Vec`: this is
         // what busybox `top`/`free` re-`read()` on every refresh.
+        if path == "cpuinfo" {
+            return Ok(cpuinfo_read(offset, buf));
+        }
         if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
             let mut scratch = [0u8; 1024];
             let len = match path {
@@ -1196,6 +1245,12 @@ impl Filesystem for ProcFilesystem {
         // exists for callers that want the whole file as a `Vec` (e.g. `cat`
         // via a full-file read), so the one allocation below is the trait
         // boundary's, not this renderer's.
+        if path == "cpuinfo" {
+            let mut v = alloc::vec![0u8; cpuinfo_len()];
+            let n = cpuinfo_read(0, &mut v);
+            v.truncate(n);
+            return Ok(v);
+        }
         if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
             let mut scratch = [0u8; 1024];
             let len = match path {
@@ -1395,7 +1450,8 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "mounts" || path == "filesystems"
-            || path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
+            || path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg"
+            || path == "cpuinfo" {
             return true;
         }
 
@@ -1559,6 +1615,18 @@ impl Filesystem for ProcFilesystem {
 
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — sized by
         // rendering into a stack buffer, same as `mounts` above.
+        if path == "cpuinfo" {
+            return Ok(Metadata {
+                is_dir: false,
+                size: cpuinfo_len() as u64,
+                inode,
+                mode: 0o100444,
+                created: None,
+                modified: None,
+                accessed: None,
+                links: None,
+            });
+        }
         if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
             let mut scratch = [0u8; 1024];
             let size = match path {
