@@ -407,12 +407,15 @@ pub fn run(args: &Args) -> io::Result<()> {
     // Not `term.clear()`: it asks the terminal where the cursor is and reads
     // the answer from stdin, which the input pump owns (the answer never
     // comes, or comes as keys). The alternate screen is cleared on entry.
+    // One write per frame: stdout is line-buffered, and ratatui's output is
+    // cursor moves and colour changes, so unbuffered it reached the tty (the
+    // kernel console, byte by byte) in 1 KB pieces.
     // A fixed viewport at kami's own idea of the size, not ratatui's: a pty
     // that reports 0x0 (ssh -tt with no terminal behind it, seen on Akuma
     // 2026-10-10) made ratatui draw nothing at all, where `term_size` falls
     // back to 80x24.
     let full = |(c, r): (u16, u16)| Rect { x: 0, y: 0, width: c, height: r };
-    let mut term = Terminal::with_options(CrosstermBackend::new(io::stdout()), TerminalOptions { viewport: Viewport::Fixed(full(size)) })?;
+    let mut term = Terminal::with_options(CrosstermBackend::new(io::BufWriter::with_capacity(1 << 16, io::stdout())), TerminalOptions { viewport: Viewport::Fixed(full(size)) })?;
     ilog!("startup: terminal ready");
 
     let mut st = State {
