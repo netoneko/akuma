@@ -448,12 +448,15 @@ unsafe impl Send for FbConsole {}
 /// of user programs -- without any of them knowing there is a screen.
 pub fn mirror_byte(byte: u8) {
     if let Some(c) = CONSOLE.lock().as_mut() {
+        let t0 = crate::polltime::tsc();
         c.0.write_byte(byte);
         // Per line, not per byte: a drain waits for the device. A trailing partial
         // line is flushed by `cursor_idle` when output goes quiet.
         if byte == b'\n' {
             c.0.surface_mut().flush();
         }
+        BURST_CYCLES.fetch_add(crate::polltime::tsc().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
+        BURST_BYTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     } else if FB_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
         // SAFETY: port 0xE9 is QEMU's `isa-debugcon` and nothing on real PC
         // hardware; the flag that gets us here is a development one.
@@ -485,12 +488,43 @@ pub fn set_fb_trace(on: bool) {
 /// The new `(rows, columns)` comes back here, once, and the pump tells the console's
 /// terminal state, so `stty size` and every program asking `TIOCGWINSZ` follow.
 pub fn cursor_idle() -> Option<(u16, u16)> {
-    let mut g = CONSOLE.try_lock()?;
-    let c = &mut g.as_mut()?.0;
-    c.show_cursor();
-    c.surface_mut().flush();
-    let (rows, cols) = c.take_geometry()?;
+    let geometry = {
+        let mut g = CONSOLE.try_lock()?;
+        let c = &mut g.as_mut()?.0;
+        c.show_cursor();
+        c.surface_mut().flush();
+        c.take_geometry()
+    };
+    report_burst();
+    let (rows, cols) = geometry?;
     Some((u16::try_from(rows).ok()?, u16::try_from(cols).ok()?))
+}
+
+/// TSC cycles and bytes the framebuffer console has spent on output since the
+/// last quiet moment: what a TUI's frames cost the screen (`kami tui` scrolling
+/// felt slow with the program itself taking 3 ms a frame).
+static BURST_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BURST_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A burst of at least this many bytes is worth a `dmesg` line.
+const BURST_REPORT_MIN: u64 = 1024;
+
+/// Output has gone quiet: say what the burst cost, to `dmesg` only. Called from
+/// [`cursor_idle`] with no lock held; the line itself is printed through the
+/// serial path, which the console shell keeps off the screen (`set_fb_quiet`).
+fn report_burst() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let bytes = BURST_BYTES.swap(0, Relaxed);
+    let cycles = BURST_CYCLES.swap(0, Relaxed);
+    if bytes < BURST_REPORT_MIN {
+        return;
+    }
+    let khz = (crate::polltime::tsc_hz() / 1000).max(1);
+    serial::puts("[fbcon] burst: ");
+    serial::put_dec(bytes);
+    serial::puts(" bytes, ");
+    serial::put_dec(cycles / khz);
+    serial::puts(" ms drawing\n");
 }
 
 /// The framebuffer console's grid as `(rows, columns)`, or `None` without one.
