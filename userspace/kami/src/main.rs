@@ -304,7 +304,14 @@ fn decode_keys(bytes: &[u8]) -> Vec<Input> {
         let key = match b {
             0x03 | 0x11 => Some(Input::Quit),
             0x12 => Some(Input::Reload),
-            b'\r' | b'\n' => Some(Input::Key("Enter", 13)),
+            // One Enter per line break: a client that sends CRLF (or LFCR)
+            // for Return must not submit a login form twice.
+            b'\r' | b'\n' => {
+                if matches!((b, bytes.get(i + 1)), (b'\r', Some(b'\n')) | (b'\n', Some(b'\r'))) {
+                    i += 1;
+                }
+                Some(Input::Key("Enter", 13))
+            }
             0x7f | 0x08 => Some(Input::Key("Backspace", 8)),
             b'\t' => Some(Input::Key("Tab", 9)),
             0x1b => {
@@ -657,5 +664,15 @@ mod tests {
         assert!(matches!(k[3], Input::Key("PageDown", 34)));
         assert!(matches!(k[4], Input::Quit));
         assert!(matches!(decode_keys(b"\x1b")[0], Input::Key("Escape", 27)));
+    }
+
+    #[test]
+    fn crlf_and_lfcr_are_one_enter() {
+        for s in [&b"pw\r\n"[..], b"pw\n\r", b"pw\r", b"pw\n"] {
+            let k = decode_keys(s);
+            assert_eq!(k.len(), 2, "{s:?}");
+            assert!(matches!(k[1], Input::Key("Enter", 13)));
+        }
+        assert_eq!(decode_keys(b"\r\r").len(), 2, "two real Returns stay two");
     }
 }

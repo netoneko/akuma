@@ -284,23 +284,6 @@ pub fn build(page: &Page, cols: usize, view_rows: usize, cw_fallback: f64) -> Gr
         end = (r, it.rect.x + it.rect.w);
     }
 
-    // Link hints: on the rows of what they label. Labels are wider than many
-    // of their targets (a vote arrow, a one-letter link), and in cells two
-    // overlapping labels read as one longer label, so a label that would
-    // touch the one before it moves right, one cell clear of it.
-    let mut hints: Vec<(usize, &Item)> =
-        page.items.iter().filter(|i| i.layer == Layer::Hint && on_page(i)).map(|i| (g.row_at(i.rect.y + 1.0), i)).collect();
-    hints.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.rect.x.total_cmp(&b.1.rect.x)));
-    let mut end = (usize::MAX, 0usize);
-    let mut row = vec![Cell::default(); cols];
-    for (r, it) in hints {
-        let at = col(it.rect.x).max(0.0) as usize;
-        let c0 = if end.0 == r && at <= end.1 { end.1 + 1 } else { at };
-        let stop = paint(&mut row, c0.min(cols), it, cw);
-        g.hints.extend((c0.min(stop)..stop).map(|c| Placed { row: r, col: c, cell: row[c] }));
-        end = (r, stop);
-    }
-
     // Fixed content: screen rows by its offset in the viewport. Opaque
     // backgrounds only: a translucent one is a modal's backdrop, and painting
     // it would bury the page under a solid colour.
@@ -337,6 +320,39 @@ pub fn build(page: &Page, cols: usize, view_rows: usize, cw_fallback: f64) -> Gr
             fixed[r][c] = Some(row[c]);
         }
         end = (r, it.rect.x + it.rect.w);
+    }
+    // Link hints: on the rows of what they label. A label over fixed content
+    // (a modal's buttons) goes on the same linear screen rows the fixed layer
+    // uses; flow rows are not linear, so a document row would land elsewhere.
+    // Labels are wider than many of their targets (a vote arrow, a one-letter
+    // link), and in cells two overlapping labels read as one longer label, so
+    // a label that would touch the one before it moves right, one cell clear.
+    let mut hints: Vec<(bool, usize, &Item)> = page
+        .items
+        .iter()
+        .filter(|i| i.layer == Layer::Hint && on_page(i))
+        .map(|i| {
+            let sr = srow(i.rect.y + 1.0);
+            let at = col(i.rect.x).max(0.0) as usize;
+            let on_fixed = sr >= 0.0 && fixed.get(sr as usize).and_then(|r| r.get(at)).is_some_and(|c| c.is_some());
+            if on_fixed { (true, sr as usize, i) } else { (false, g.row_at(i.rect.y + 1.0), i) }
+        })
+        .collect();
+    hints.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(a.2.rect.x.total_cmp(&b.2.rect.x)));
+    let mut end = (false, usize::MAX, 0usize);
+    let mut row = vec![Cell::default(); cols];
+    for (on_fixed, r, it) in hints {
+        let at = col(it.rect.x).max(0.0) as usize;
+        let c0 = if (end.0, end.1) == (on_fixed, r) && at <= end.2 { end.2 + 1 } else { at };
+        let stop = paint(&mut row, c0.min(cols), it, cw);
+        for c in c0.min(stop)..stop {
+            if on_fixed {
+                fixed[r][c] = Some(row[c]);
+            } else {
+                g.hints.push(Placed { row: r, col: c, cell: row[c] });
+            }
+        }
+        end = (on_fixed, r, stop);
     }
     for (r, row) in fixed.into_iter().enumerate() {
         g.fixed.extend(row.into_iter().enumerate().filter_map(|(c, cell)| Some(Placed { row: r, col: c, cell: cell? })));
@@ -635,6 +651,24 @@ mod tests {
         let r = g.row_at(120.0);
         assert!(g.hints.iter().all(|c| c.row == r));
         assert_eq!(g.hints.iter().map(|c| c.cell.ch).collect::<String>(), "AS");
+    }
+
+    #[test]
+    fn a_hint_over_fixed_content_is_on_the_fixed_rows_not_a_flow_row() {
+        // Flow lines 30 px apart (not ROW_PX), so a flow row index and the
+        // linear screen row of the same y differ.
+        let mut items: Vec<Item> = (0..30).map(|i| text(0.0, 500.0 + i as f64 * 30.0, 40.0, 19.0, "x")).collect();
+        let mut hint = text(10.0, 500.0 + 190.0, 20.0, 15.0, "A");
+        hint.layer = Layer::Hint;
+        items.push(hint);
+        let mut p = page(items);
+        p.scroll_y = 500.0;
+        p.fills.push(Fill { rect: Rect { x: 0.0, y: 680.0, w: 100.0, h: 60.0 }, bg: Rgb(9, 9, 9), alpha: 1.0, layer: Layer::Fixed, order: 5 });
+        let g = build(&p, 20, 20, 10.0);
+        assert!(g.hints.is_empty());
+        let a = g.fixed.iter().find(|c| c.cell.ch == 'A').expect("label in the fixed layer");
+        assert_eq!(a.row, 10, "(690-500)/19 floored");
+        assert_eq!(a.col, 1);
     }
 
     #[test]

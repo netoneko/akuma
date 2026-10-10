@@ -447,6 +447,8 @@ pub fn run(args: &Args) -> io::Result<()> {
     loop {
         let mut queue = gather(&mut c, input_fd, &mut stdin_open, t0)?;
         let mut dirty = false;
+        // Only the last scroll of a burst is told to the page.
+        let mut scrolled = None;
         let now = term_size();
         if now != st.size {
             ilog!("terminal resized to {}x{}", now.0, now.1);
@@ -502,7 +504,7 @@ pub fn run(args: &Args) -> io::Result<()> {
                     Effect::Scroll(s) => {
                         if let Some(y) = st.scroll(s) {
                             dirty = true;
-                            queue.push_back(Event::ViewScrolled(y));
+                            scrolled = Some(y);
                         }
                     }
                     Effect::Captured { b64, clip } if clip.tag == TAG_VIEWER => {
@@ -605,7 +607,13 @@ pub fn run(args: &Args) -> io::Result<()> {
                 }
             }
         }
+        if let Some(y) = scrolled {
+            for eff in m.handle(Event::ViewScrolled(y)) {
+                let _ = common_effect(eff, &mut c, &mut queue, args, view);
+            }
+        }
         if dirty {
+            let t_draw = Instant::now();
             let frame = term.draw(|f| {
                 let labels = if st.pick.is_empty() { vec![] } else { st.pick_labels() };
                 let held: Option<HashSet<u64>> =
@@ -636,6 +644,7 @@ pub fn run(args: &Args) -> io::Result<()> {
                 let held = st.kitty.as_ref().map_or(0, |k| k.held.len());
                 ilog!("kitty: {} placed of {held} held, top {}", placed.len(), st.top);
             }
+            ilog!("draw: {} ms", t_draw.elapsed().as_millis());
             if let (Some(path), Some((plain, ansi))) = (&dump, dumped) {
                 let _ = std::fs::write(path, plain);
                 let mut ans = path.clone();

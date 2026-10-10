@@ -49,6 +49,10 @@ const PROBE_EVERY: Ms = 250;
 /// A page that changes all the time (a ticking clock, a carousel) is
 /// re-snapshotted at most this often; input bypasses it.
 const SNAPSHOT_GAP: Ms = 500;
+/// While the view is being scrolled, scroll events keep bumping the page's
+/// change counter; a snapshot (a big reply, a parse, a relayout) per half
+/// second of that is what made scrolling slow. Wait for the view to rest.
+const SCROLL_SETTLE: Ms = 300;
 /// Re-snapshot this often even with no reported change: layout can move
 /// without a DOM mutation (CSS animations, late images in some engines).
 const SNAPSHOT_STALE: Ms = 5_000;
@@ -279,6 +283,8 @@ pub struct Machine {
     // layout mode
     /// A probe or snapshot is outstanding.
     layout_inflight: bool,
+    /// Layout mode: when the view last moved.
+    last_view_scroll_at: Ms,
     /// Snapshot at the next probe even if the page reports no change.
     layout_force: bool,
     next_probe: Ms,
@@ -351,6 +357,7 @@ impl Machine {
             first_pixels: true,
             last_status: String::new(),
             layout_inflight: false,
+            last_view_scroll_at: 0,
             layout_force: true,
             next_probe: 0,
             last_snapshot_at: 0,
@@ -395,6 +402,7 @@ impl Machine {
                     let params = format!("{{\"expression\":\"{}\"}}", escape(&js));
                     self.send(Req::ScrollTo, "Runtime.evaluate", &params, true, &mut out);
                     self.last_scroll_id = self.next_id;
+                    self.last_view_scroll_at = self.now;
                 }
             }
             Event::Capture(clip) => {
@@ -896,7 +904,8 @@ impl Machine {
             Req::Probe => {
                 let version = if err { "" } else { str_field(m, "value").unwrap_or("") };
                 let changed = version != self.layout_version;
-                let due = self.now.saturating_sub(self.last_snapshot_at) >= SNAPSHOT_GAP;
+                let due = self.now.saturating_sub(self.last_snapshot_at) >= SNAPSHOT_GAP
+                    && self.now.saturating_sub(self.last_view_scroll_at) >= SCROLL_SETTLE;
                 if err {
                     // Between documents (a navigation in flight): try again soon.
                     out.push(Effect::Log(format!("layout: probe failed: {}", detail())));
