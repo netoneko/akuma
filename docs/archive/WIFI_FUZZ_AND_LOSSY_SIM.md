@@ -164,8 +164,22 @@ would catch on a real link).
   open question). Watch for `[rtw] eapol: pairwise rekey:` lines in
   `klog-N.all`; a rekey that goes wrong ends in `sent away by the access
   point` and the usual rejoin, which is what happened before anyway.
-- **Entry 15** (`wifisoak`) has not been run, in the rehearsal or on the
-  laptop. It is `DISK=nvme sh qemu.sh 15` on the Mac.
+- **Entries 7 and 15 were rehearsed** the same evening, in QEMU/KVM on ryzen
+  (Pop side) with this kernel built on the Mac and copied over, in a private
+  rig (`/home/netoneko/akuma-metal-wifi`: its own `out/`, `grub.cfg` and
+  root image with the `wifisoak` service and the new `wifi` layered in) so
+  the shared rig and the other agent's trees were not touched. Entry 7's
+  transcript is identical to 2026-10-06's. Entry 15: `wifi auto` alive at
+  all 30 samples, three link drops each recovered to `connected` by the
+  radio alone, one join issued by the tool in five minutes, QEMU exited on
+  the guest's own reboot, p3 fsck clean. **Not run on the metal.** The
+  radio's `failed`-after-drop arm (1 in 4 drops) did not fire in this seed;
+  the tool's recovery from it is covered by the host test only.
+- Entry 7's run left p3 with `Deleted inode 351 has zero dtime` (fsck
+  rc 4, no other error): `wifi forget` unlinks a file and the guest then
+  hard-reboots; the ext2 driver's `unlink` does not stamp `dtime`. Not
+  wifi's, not new (no earlier rehearsal deleted a file), worth a look in
+  `akuma-ext2`.
 - `trace_tcp` is still in the kernel file, untested on the host.
 - The station daemon's timing policies (dwell, `MGMT_TRIES`, `JOIN_ATTEMPTS`,
   the beacon-loss grace, the rejoin backoff, `BAD_BSS`) are still only in
