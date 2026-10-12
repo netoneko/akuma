@@ -16,3 +16,6 @@ keys are vim-style with link hints (`f`), and every input and startup phase is
 logged to `/tmp/kami-input.log`. The README has the Chromium flag findings
 (no GPU process, the measured slim flag set), the known gaps (no Japanese
 fonts on the Akuma partition) and the probes under `probe/`.
+
+Since 2026-10-10 kami also runs as a terminal UI (`kami tui`, a build option)
+that works over ssh or in a rio pane, and you can log into Tumblr through it.

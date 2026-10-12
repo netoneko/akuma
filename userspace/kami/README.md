@@ -61,7 +61,8 @@ did not appear in the frames captured; see Known gaps).
 
 `kami tui [--page-fonts] [URL]` paints the page's *layout* into the terminal
 with ratatui instead of blitting pixels to `/dev/fb0`, so it works over ssh, in
-a rio pane, or in any terminal. It is a build option, **off by default**:
+a rio pane, or in any terminal. kami works over the TUI,
+and you can log into Tumblr from it. It is a build option, **off by default**:
 
 ```sh
 ./build.sh --features tui              # x86_64 musl, as above (1.28 MB vs 0.90 MB)
@@ -176,7 +177,7 @@ driven by `script` with keys fed on stdin:
 | lkml.org | 82 KB, 7-10 ms | two-column message tables and kernel table as on the site. Needs a desktop user agent: lkml is behind Anubis, which refuses `HeadlessChrome` (`--chrome-arg --user-agent=...`) |
 | en.wikipedia.org/wiki/Paper | 1.1 MB, 88 ms, parsed in 5 ms | TOC column, article beside the infobox, appearance sidebar, 652 rows |
 | news.ycombinator.com | | the story list as on the site; 87 hints; `f` + `aad` clicked `new` and the view followed to `/newest` |
-| www.tumblr.com | 1.4 MB, 110-125 ms | the cookie notice (an iframe) readable and clickable; trending cards, masonry posts with their images, avatars, tags and counts, the fixed sign-up bar. The login form fills (fields verified to hold exactly what was typed) but Tumblr answered "Your email or password were incorrect" twice; not retried |
+| www.tumblr.com | 1.4 MB, 110-125 ms | the cookie notice (an iframe) readable and clickable; trending cards, masonry posts with their images, avatars, tags and counts, the fixed sign-up bar. **Logging in works** (2026-10-11): the login form fills and Tumblr accepts the sign-in. An earlier attempt got "Your email or password were incorrect" twice; that is superseded |
 
 **Deploying to ryzen Akuma (2026-10-10).** Built on the box itself, inside
 Akuma, as the ryzen rule goes: the in-Akuma toolchain (`/etc/akuma-dev.env`:
