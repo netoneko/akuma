@@ -76,7 +76,14 @@ impl<'a> Key<'a> {
             return None;
         }
         let body = usize::from(u16::from_be_bytes([f[2], f[3]]));
+        // The body length is the sender's claim: cut to it, then check the
+        // cut frame still holds a header. (A claim under 95 once indexed past
+        // the cut — a kernel panic from a frame anyone can send; found by
+        // `tests/fuzz.rs`.)
         let f = f.get(..4 + body)?;
+        if f.len() < HDR_LEN {
+            return None;
+        }
         let dlen = usize::from(u16::from_be_bytes([f[97], f[98]]));
         let data = f.get(HDR_LEN..HDR_LEN + dlen)?;
         let mut rc = [0u8; 8];
@@ -184,8 +191,19 @@ pub enum Action {
     /// Message 1 answered: send `out[..len]` (message 2).
     Send(usize),
     /// Message 3 accepted: send `out[..len]` (message 4), **then** install
-    /// both keys. Message 4 must go out unencrypted.
-    Complete { len: usize, tk: [u8; 16], gtk: Gtk },
+    /// both keys if `fresh`.
+    ///
+    /// `fresh` says the keys are new — the first handshake, or a pairwise
+    /// rekey the access point started with a new message 1 — and must be
+    /// installed after message 4 is on the air. `!fresh` is message 3
+    /// retransmitted after the keys were already handed out (the access
+    /// point missed message 4): only the answer is sent again, and the keys
+    /// in the card are the right ones.
+    ///
+    /// The first handshake's message 4 goes out unencrypted; a rekey's goes
+    /// out under the key still installed, as every EAPOL frame of a rekey
+    /// does (802.11-2020 12.7.6.5).
+    Complete { len: usize, tk: [u8; 16], gtk: Gtk, fresh: bool },
     /// A group rekey: send `out[..len]` (group message 2), install the GTK.
     Rekey { len: usize, gtk: Gtk },
 }
@@ -193,22 +211,52 @@ pub enum Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Idle,
-    /// Message 2 sent; `ptk` holds the key it was MIC'd with.
+    /// Message 2 sent; `tptk` holds the key it was MIC'd with.
     Msg2Sent,
+    /// Keys handed out at least once; `ptk` holds the current ones.
     Done,
 }
 
 /// Bytes of this station's RSN element it can remember.
 const IE_MAX: usize = 64;
 
+/// Candidate keys remembered from recent message 1s (see [`Supplicant`]).
+const CANDIDATES: usize = 4;
+
+/// A pairwise key derived from a message 1 and not yet proven by a message 3.
+#[derive(Clone, Copy)]
+struct Candidate {
+    anonce: [u8; 32],
+    ptk: Ptk,
+}
+
 /// The supplicant for one association.
+///
+/// The pairwise key in use, `ptk`, is the one the card's keys came from.
+/// Message 1 carries no MIC, so anyone can send one; a key derived from one
+/// is a **candidate** until a message 3 verifies under it, and only then
+/// replaces `ptk` (`wpa_supplicant` calls the candidate `tptk`). If message
+/// 1 replaced `ptk` at once, a spoofed or stale one would leave the station
+/// unable to verify the access point's next group rekey or retransmitted
+/// message 3, and the access point would then deauthenticate it.
+///
+/// The last [`CANDIDATES`] candidates are kept, not one: a spoofed message 1
+/// arriving between the real message 1 and message 3 would otherwise evict
+/// the real candidate, message 3 would fail its nonce check until the access
+/// point gave up, and the join (or rekey) would fail — one frame per
+/// handshake is all a hostile neighbour would need. With four, it takes four
+/// forgeries inside the access point's retransmission window
+/// (`tests/lossy.rs` counts what a 15 %-per-poll flood still costs).
 pub struct Supplicant {
     pmk: [u8; 32],
     aa: Addr,
     spa: Addr,
     snonce: [u8; 32],
+    /// The ANonce of the handshake `ptk` came from.
     anonce: [u8; 32],
     ptk: Option<Ptk>,
+    /// Newest first.
+    candidates: [Option<Candidate>; CANDIDATES],
     replay: Option<u64>,
     ie: [u8; IE_MAX],
     ie_len: usize,
@@ -225,13 +273,32 @@ impl Supplicant {
         let mut ie = [0u8; IE_MAX];
         let ie_len = rsn_ie.len().min(IE_MAX);
         ie[..ie_len].copy_from_slice(&rsn_ie[..ie_len]);
-        Self { pmk: *pmk, aa, spa, snonce, anonce: [0; 32], ptk: None, replay: None, ie, ie_len, state: State::Idle }
+        Self {
+            pmk: *pmk,
+            aa,
+            spa,
+            snonce,
+            anonce: [0; 32],
+            ptk: None,
+            candidates: [None; CANDIDATES],
+            replay: None,
+            ie,
+            ie_len,
+            state: State::Idle,
+        }
     }
 
     /// The handshake finished (keys handed out at least once).
     #[must_use]
     pub fn done(&self) -> bool {
         self.state == State::Done
+    }
+
+    /// A message 1 has been answered and its message 3 is still awaited: a
+    /// first handshake in progress, or a pairwise rekey.
+    #[must_use]
+    pub fn rekeying(&self) -> bool {
+        self.candidates[0].is_some()
     }
 
     /// Take one received EAPOL frame (the LLC payload of a data frame with
@@ -258,13 +325,30 @@ impl Supplicant {
     }
 
     fn msg1(&mut self, k: &Key<'_>, out: &mut [u8]) -> Result<Action, Drop> {
-        self.anonce.copy_from_slice(k.nonce);
-        let ptk = Ptk::derive(&self.pmk, &self.aa, &self.spa, &self.anonce, &self.snonce);
+        let mut anonce = [0u8; 32];
+        anonce.copy_from_slice(k.nonce);
+        let ptk = Ptk::derive(&self.pmk, &self.aa, &self.spa, &anonce, &self.snonce);
         let ie = self.ie;
         let len = write_key(out, &ptk.kck, info::VERSION_2 | info::PAIRWISE | info::MIC, k.replay, &self.snonce, &ie[..self.ie_len])?;
-        self.ptk = Some(ptk);
-        self.replay = Some(k.replay);
-        self.state = State::Msg2Sent;
+        // Only the candidate changes: the installed key stays until message
+        // 3 proves the access point holds this one too. The replay counter
+        // is NOT recorded here: 802.11-2020 12.7.2 — "the local Key Replay
+        // Counter field should not be updated until after the EAPOL-Key MIC
+        // is checked and found to be valid" — and message 1 has no MIC. The
+        // first version recorded it, so one spoofed message 1 with a large
+        // counter made every real frame after it look replayed, until the
+        // access point gave up and deauthenticated (`tests/lossy.rs`).
+        // A retransmitted message 1 repeats its nonce: refresh that
+        // candidate rather than add a twin.
+        if let Some(c) = self.candidates.iter_mut().flatten().find(|c| c.anonce == anonce) {
+            c.ptk = ptk;
+        } else {
+            self.candidates.copy_within(0..CANDIDATES - 1, 1);
+            self.candidates[0] = Some(Candidate { anonce, ptk });
+        }
+        if self.state == State::Idle {
+            self.state = State::Msg2Sent;
+        }
         Ok(Action::Send(len))
     }
 
@@ -272,10 +356,17 @@ impl Supplicant {
         if self.state == State::Idle {
             return Err(Drop::Order);
         }
-        if k.nonce != self.anonce {
-            return Err(Drop::Nonce);
-        }
-        let ptk = self.ptk.ok_or(Drop::Order)?;
+        // Which key is this message 3 for? A candidate's handshake, if its
+        // nonce says so; else the installed one's (a retransmission after the
+        // access point missed message 4, which may follow a spoofed message
+        // 1 that left a candidate behind).
+        let candidate = self.candidates.iter().flatten().find(|c| c.anonce == k.nonce).map(|c| c.ptk);
+        let (ptk, fresh) = match (candidate, self.ptk) {
+            (Some(t), _) => (t, true),
+            (None, Some(p)) if k.nonce == self.anonce => (p, false),
+            (None, Some(_)) => return Err(Drop::Nonce),
+            (None, None) => return Err(if self.rekeying() { Drop::Nonce } else { Drop::Order }),
+        };
         if mic(&ptk.kck, k.frame) != k.mic {
             return Err(Drop::Mic);
         }
@@ -285,8 +376,13 @@ impl Supplicant {
         let gtk = Self::gtk(k, &ptk)?;
         let len = write_key(out, &ptk.kck, info::VERSION_2 | info::PAIRWISE | info::MIC | info::SECURE, k.replay, &[0; 32], &[])?;
         self.replay = Some(k.replay);
+        if fresh {
+            self.anonce.copy_from_slice(k.nonce);
+            self.ptk = Some(ptk);
+            self.candidates = [None; CANDIDATES];
+        }
         self.state = State::Done;
-        Ok(Action::Complete { len, tk: ptk.tk, gtk })
+        Ok(Action::Complete { len, tk: ptk.tk, gtk, fresh })
     }
 
     fn group1(&mut self, k: &Key<'_>, out: &mut [u8]) -> Result<Action, Drop> {
@@ -473,7 +569,8 @@ mod tests {
         let (mut sta, mut ap, mut f) = handshake();
         let mut r = [0u8; 512];
         let n = ap.msg3(&mut f);
-        let Ok(Action::Complete { len, tk, gtk }) = sta.handle(&f[..n], &mut r) else { panic!("msg3") };
+        let Ok(Action::Complete { len, tk, gtk, fresh }) = sta.handle(&f[..n], &mut r) else { panic!("msg3") };
+        assert!(fresh, "the first handshake's keys are new");
         assert_eq!(tk, ap.ptk.unwrap().tk);
         assert_eq!((gtk.key, gtk.idx, gtk.rsc[0]), ([0x77; 16], 1, 0x2a));
         let k4 = Key::parse(&r[..len]).unwrap();
@@ -525,6 +622,138 @@ mod tests {
         // Version 1 (TKIP) descriptor.
         let n = ap.frame(&mut f, 1 | info::PAIRWISE | info::ACK, &[], false);
         assert_eq!(sta.handle(&f[..n], &mut r), Err(Drop::Version));
+    }
+
+    /// The access point missed message 4 and sends message 3 again (with the
+    /// next replay counter): message 4 is answered again, and the keys are
+    /// reported as the ones already installed.
+    #[test]
+    fn retransmitted_message_3_is_answered_without_new_keys() {
+        let (mut sta, mut ap, mut f) = handshake();
+        let mut r = [0u8; 512];
+        let n = ap.msg3(&mut f);
+        assert!(matches!(sta.handle(&f[..n], &mut r), Ok(Action::Complete { fresh: true, .. })));
+        let tk = ap.ptk.unwrap().tk;
+        let n = ap.msg3(&mut f);
+        let Ok(Action::Complete { fresh, tk: again, len, .. }) = sta.handle(&f[..n], &mut r) else { panic!("retransmit") };
+        assert!(!fresh);
+        assert_eq!(again, tk);
+        assert_eq!(Key::parse(&r[..len]).unwrap().replay, 3);
+        assert!(!sta.rekeying());
+    }
+
+    /// A pairwise rekey: the access point starts over at message 1 with a new
+    /// ANonce. Until its message 3 verifies, the installed key still verifies
+    /// a group rekey; after, the new keys are reported fresh.
+    #[test]
+    fn pairwise_rekey_keeps_the_old_key_until_message_3_verifies() {
+        let (mut sta, mut ap, mut f) = handshake();
+        let mut r = [0u8; 512];
+        let n = ap.msg3(&mut f);
+        assert!(matches!(sta.handle(&f[..n], &mut r), Ok(Action::Complete { fresh: true, .. })));
+        let old = ap.ptk.unwrap();
+        // Message 1 of the rekey.
+        ap.anonce = [0x3c; 32];
+        let n = ap.msg1(&mut f);
+        let Ok(Action::Send(m2)) = sta.handle(&f[..n], &mut r) else { panic!("rekey msg1") };
+        assert!(sta.rekeying());
+        let k2 = Key::parse(&r[..m2]).unwrap();
+        let mut sn = [0u8; 32];
+        sn.copy_from_slice(k2.nonce);
+        let new = Ptk::derive(&pmk(), &AA, &SPA, &ap.anonce, &sn);
+        assert_eq!(mic(&new.kck, k2.frame), k2.mic, "message 2 is MIC'd with the candidate key");
+        // Meanwhile a group rekey under the OLD key still verifies.
+        ap.replay += 1;
+        let mut kd = [0u8; 64];
+        let kn = ap.key_data(&old.kek, &mut kd);
+        let gn = ap.frame(&mut f, info::VERSION_2 | info::ACK | info::MIC | info::SECURE | info::ENCRYPTED, &kd[..kn], true);
+        assert!(matches!(sta.handle(&f[..gn], &mut r), Ok(Action::Rekey { .. })));
+        // Message 3 of the rekey, under the new key.
+        ap.ptk = Some(new);
+        let n = ap.msg3(&mut f);
+        let Ok(Action::Complete { fresh, tk, .. }) = sta.handle(&f[..n], &mut r) else { panic!("rekey msg3") };
+        assert!(fresh);
+        assert_eq!(tk, new.tk);
+        assert_ne!(tk, old.tk);
+        assert!(!sta.rekeying());
+    }
+
+    /// Message 1 carries no MIC: anyone can send one. A spoofed one after the
+    /// keys are in must not cost the station its installed key — the real
+    /// access point's group rekey and retransmitted message 3 still verify.
+    #[test]
+    fn spoofed_message_1_does_not_clobber_the_installed_key() {
+        let (mut sta, mut ap, mut f) = handshake();
+        let mut r = [0u8; 512];
+        let n = ap.msg3(&mut f);
+        assert!(matches!(sta.handle(&f[..n], &mut r), Ok(Action::Complete { fresh: true, .. })));
+        // The spoof: a message 1 with a nonce of its own and a counter ahead.
+        let spoof = Ap { anonce: [0xee; 32], replay: ap.replay + 5, ptk: None, gtk: [0; 16] };
+        let sn = spoof.frame(&mut f, info::VERSION_2 | info::PAIRWISE | info::ACK, &[], false);
+        assert!(matches!(sta.handle(&f[..sn], &mut r), Ok(Action::Send(_))));
+        // The real access point retransmits message 3 with its own next
+        // counter, below the spoof's: the spoof's was never recorded.
+        ap.replay += 1;
+        let n = ap.msg3(&mut f);
+        assert!(matches!(sta.handle(&f[..n], &mut r), Ok(Action::Complete { fresh: false, .. })), "under the installed key");
+        // And its group rekey.
+        ap.replay += 1;
+        let mut kd = [0u8; 64];
+        let kn = ap.key_data(&ap.ptk.unwrap().kek, &mut kd);
+        let gn = ap.frame(&mut f, info::VERSION_2 | info::ACK | info::MIC | info::SECURE | info::ENCRYPTED, &kd[..kn], true);
+        assert!(matches!(sta.handle(&f[..gn], &mut r), Ok(Action::Rekey { .. })));
+    }
+
+    /// Spoofed message 1s between the real message 1 and message 3: the real
+    /// candidate survives up to three of them, and a flood of four evicts it
+    /// (the access point's retransmission then starts a fresh candidate).
+    #[test]
+    fn candidates_survive_three_spoofs_between_message_1_and_3() {
+        for spoofs in [0usize, 1, 3, 4] {
+            let mut sta = Supplicant::new(&pmk(), AA, SPA, [0x5a; 32], &RSN);
+            let mut ap = Ap { anonce: [0xa5; 32], replay: 0, ptk: None, gtk: [0x77; 16] };
+            let mut f = [0u8; 512];
+            let mut r = [0u8; 512];
+            let n = ap.msg1(&mut f);
+            let Ok(Action::Send(m2)) = sta.handle(&f[..n], &mut r) else { panic!("msg1") };
+            let k2 = Key::parse(&r[..m2]).unwrap();
+            let mut sn = [0u8; 32];
+            sn.copy_from_slice(k2.nonce);
+            ap.ptk = Some(Ptk::derive(&pmk(), &AA, &SPA, &ap.anonce, &sn));
+            for i in 0..spoofs {
+                let spoof = Ap { anonce: [i as u8; 32], replay: 0, ptk: None, gtk: [0; 16] };
+                let sn = spoof.frame(&mut f, info::VERSION_2 | info::PAIRWISE | info::ACK, &[], false);
+                assert!(matches!(sta.handle(&f[..sn], &mut r), Ok(Action::Send(_))));
+            }
+            let n = ap.msg3(&mut f);
+            let got = sta.handle(&f[..n], &mut r);
+            if spoofs < CANDIDATES {
+                assert!(matches!(got, Ok(Action::Complete { fresh: true, .. })), "{spoofs} spoofs: {got:?}");
+            } else {
+                assert_eq!(got, Err(Drop::Nonce), "{spoofs} spoofs");
+                // The access point's next message 1 starts over cleanly.
+                let n = ap.msg1(&mut f);
+                let Ok(Action::Send(m2)) = sta.handle(&f[..n], &mut r) else { panic!("msg1 again") };
+                let k2 = Key::parse(&r[..m2]).unwrap();
+                sn.copy_from_slice(k2.nonce);
+                ap.ptk = Some(Ptk::derive(&pmk(), &AA, &SPA, &ap.anonce, &sn));
+                let n = ap.msg3(&mut f);
+                assert!(matches!(sta.handle(&f[..n], &mut r), Ok(Action::Complete { fresh: true, .. })));
+            }
+        }
+    }
+
+    /// A body length shorter than the header once indexed past the cut.
+    #[test]
+    fn short_body_length_is_refused_not_a_panic() {
+        let mut f = [0u8; 120];
+        f[1] = 3;
+        f[4] = 2;
+        for body in [0u16, 1, 50, 94, 95, 96] {
+            f[2..4].copy_from_slice(&body.to_be_bytes());
+            let k = Key::parse(&f);
+            assert_eq!(k.is_some(), body >= 95, "body {body}");
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ supplicant: the kernel does the WPA2 handshake. How the pieces fit:
 | `wifi connect [name]` | join `<name>`, or with no name scan and join the best known network in range; waits for `connected` or `failed` (exit 1 on failure) |
 | `wifi disconnect` | drop the link |
 | `wifi forget <name>` | delete the file (disconnecting first if it is the current network) |
-| `wifi auto` | the herd service: every 5 s, if not connected, scan and join the best known network; back off to 60 s after failures |
+| `wifi auto` | the herd service: every 5 s, if not connected, scan and join the best known network; back off to 60 s after failures. While the kernel reports `scanning` or `associating` it waits — the rtw89 station rejoins a dropped link by itself, and a scan or connect then only restarts it |
 
 "Best" means `autoconnect = true`, in range, joinable (an open network with no
 key, or WPA2 with one), then highest `priority`, then strongest signal.
@@ -42,15 +42,18 @@ cargo test -p wifi --lib --no-default-features --target $HOST      # the library
 ```
 
 The binary links `libakuma`, so like `sshd` and `box` only `src/lib.rs` is
-host-tested: config parsing and writing, PBKDF2 (checked against IEEE 802.11i
-Annex H.4 and against the kernel simulator's key), and network choice.
-End to end, against the kernel's `wifisim` radio: ryzen overlay menu entry 7
-(`overlays/ryzen/README.md`).
+host-tested: config parsing and writing (and a fuzz of the parser), PBKDF2
+(checked against IEEE 802.11i Annex H.4 and against the kernel simulator's
+key), network choice, and the `auto` policy (`auto_step`, `auto_backoff`) —
+run for 20 seeds × 2000 looks against the kernel's lossy simulated radio
+(`akuma_wifi::sim::SimRadio::new_lossy`) with the device calls replaced by the
+simulator. End to end, against the kernel's `wifisim` radio: ryzen overlay
+menu entry 7; against `wifisim=lossy`, entry 15 (`overlays/ryzen/README.md`).
 
 ## Limits
 
 - `wifi add` reads the passphrase without suppressing terminal echo. Redirect
   it from a file.
 - Status is polled (100 ms steps); `/dev/wifi0` has no `poll(2)` readiness yet.
-- No real radio exists yet. Until one does, only `wifisim` gives the tool
-  something to manage.
+- The one real radio is ryzen's RTL8852CE (`rtw89wifi`); everywhere else
+  only `wifisim` / `wifisim=lossy` gives the tool something to manage.

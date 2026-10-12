@@ -12,7 +12,7 @@
 //! | backend | selected by | |
 //! |---|---|---|
 //! | none | default | no `/dev/wifi0` node at all |
-//! | simulated | `wifisim` on the command line | `akuma_wifi::sim`: fixed networks, deterministic connect rules — tests the tool, device and protocol anywhere, QEMU included |
+//! | simulated | `wifisim` on the command line | `akuma_wifi::sim`: fixed networks, deterministic connect rules — tests the tool, device and protocol anywhere, QEMU included. `wifisim=lossy` adds its seeded fault model (scans that miss networks, slow and failed joins, a link that drops and comes back) for `wifi auto` |
 //! | rtw89 | `rtw89wifi` on the command line | ryzen's RTL8852CE, kept up after its bring-up; the station in `rtw89_sta.rs` (stages W3/W4) |
 //!
 //! # Reads: a snapshot per descriptor
@@ -63,9 +63,9 @@ enum Backend {
 }
 
 impl Backend {
-    fn write_status(&self, out: &mut [u8]) -> Option<usize> {
+    fn write_status(&mut self, out: &mut [u8]) -> Option<usize> {
         match self {
-            Self::Sim(r) => r.status().write(out),
+            Self::Sim(r) => r.observe().write(out),
             #[cfg(target_arch = "x86_64")]
             Self::Rtw89 => crate::rtw89_sta::write_status(out),
         }
@@ -101,15 +101,33 @@ const EMPTY_SLOT: Slot = Slot { tgid: 0, fd: 0, used: false, len: 0, pos: 0, sta
 static CURSORS: Spinlock<([Slot; SLOTS], u64)> = Spinlock::new(([EMPTY_SLOT; SLOTS], 0));
 
 /// Register the backend the command line asks for. With none, `/dev/wifi0`
-/// does not exist.
+/// does not exist. `wifisim` is the deterministic radio; `wifisim=lossy` the
+/// one with the fault model (`akuma_wifi::sim`), whose sequence is fixed so
+/// two `wifitest` transcripts are comparable.
 pub fn init(cmdline: &str) {
     let Some(iface) = IfName::new(IFACE) else { return };
-    if cmdline.split_ascii_whitespace().any(|t| t == "wifisim") {
-        *BACKEND.lock() = Some(Backend::Sim(SimRadio::new(iface)));
-        PRESENT.store(true, Ordering::Release);
-        akuma_vfs_glue::set_wifi_present(true);
-        serial::puts("  wifi: simulated radio on /dev/wifi0 (wlan0) — `wifisim`\n");
-    }
+    let Some(mode) = cmdline.split_ascii_whitespace().find_map(|t| {
+        if t == "wifisim" { Some("") } else { t.strip_prefix("wifisim=") }
+    }) else {
+        return;
+    };
+    let radio = match mode {
+        "lossy" => {
+            serial::puts("  wifi: simulated LOSSY radio on /dev/wifi0 (wlan0) — `wifisim=lossy`\n");
+            SimRadio::new_lossy(iface, 0x5eed_0000_0000_0001)
+        }
+        "" => {
+            serial::puts("  wifi: simulated radio on /dev/wifi0 (wlan0) — `wifisim`\n");
+            SimRadio::new(iface)
+        }
+        _ => {
+            serial::puts("  wifi: unknown `wifisim=` mode; no /dev/wifi0\n");
+            return;
+        }
+    };
+    *BACKEND.lock() = Some(Backend::Sim(radio));
+    PRESENT.store(true, Ordering::Release);
+    akuma_vfs_glue::set_wifi_present(true);
 }
 
 /// The RTL8852CE station took the card (`rtw89wifi`): it is the radio behind
@@ -156,8 +174,8 @@ pub fn read(tgid: u32, fd: u32, buf: u64, len: usize) -> u64 {
     let slot = &mut slots[idx];
     slot.stamp = now;
     if slot.len == 0 {
-        let b = BACKEND.lock();
-        let Some(backend) = b.as_ref() else { return errno::ENODEV };
+        let mut b = BACKEND.lock();
+        let Some(backend) = b.as_mut() else { return errno::ENODEV };
         match backend.write_status(&mut slot.buf) {
             Some(n) => {
                 slot.len = n;

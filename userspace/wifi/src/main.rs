@@ -29,7 +29,7 @@ use akuma_wifi::cmd::{self, Command};
 use akuma_wifi::status::{Link, Status};
 use akuma_wifi::{IfName, Ssid};
 use libakuma::{arg, argc, chmod, close, exit, mkdir_p, open, open_flags, print, read, read_dir, sleep_ms, unlink, write};
-use wifi::{CONFIG_DIR, Network, choose, derive_psk, parse_config, printable_ssid, valid_name, valid_passphrase};
+use wifi::{AutoStep, CONFIG_DIR, Network, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, valid_name, valid_passphrase};
 
 const DEVICE: &str = "/dev/wifi0";
 const IFACE: &[u8] = b"wlan0";
@@ -324,42 +324,58 @@ fn cmd_forget() {
 }
 
 /// The herd service: join the best known network in range and keep it joined.
-/// Polls every 5 s; after a failed join, waits longer (up to a minute).
+/// Polls every 5 s; after a failed join, waits longer (up to a minute). The
+/// policy is `wifi::auto_step` (host-tested against the lossy simulated
+/// radio); this is the loop around it.
 fn cmd_auto() -> ! {
     out("wifi: auto — keeping the best known network joined\n");
     let mut backoff_s = 5u64;
     loop {
-        match read_status() {
-            Err(e) => out(&format!("wifi: {e}\n")),
-            Ok(s) if s.link == Link::NoRadio => out("wifi: no radio\n"),
-            Ok(s) if s.link == Link::Connected => backoff_s = 5,
-            Ok(_) => match scan() {
-                Err(e) => out(&format!("wifi: {e}\n")),
-                Ok(s) => {
-                    let known = known();
-                    match choose(&known, s.results()) {
-                        None => out("wifi: no known network in range\n"),
-                        Some((n, _)) => {
-                            out(&format!("wifi: joining {} ({})\n", n.name, printable_ssid(&n.ssid)));
-                            match join(n) {
-                                Ok(st) => {
-                                    print_status(&st);
-                                    if st.link == Link::Connected {
-                                        backoff_s = 5;
-                                    } else {
-                                        backoff_s = (backoff_s * 2).min(60);
+        let joined = match read_status() {
+            Err(e) => {
+                out(&format!("wifi: {e}\n"));
+                false
+            }
+            Ok(s) => match auto_step(s.link) {
+                AutoStep::Keep => true,
+                AutoStep::NoRadio => {
+                    out("wifi: no radio\n");
+                    false
+                }
+                // The kernel is joining (or rejoining a dropped link) on its
+                // own; a scan or connect now would only restart it.
+                AutoStep::Wait => true,
+                AutoStep::Join => match scan() {
+                    Err(e) => {
+                        out(&format!("wifi: {e}\n"));
+                        false
+                    }
+                    Ok(s) => {
+                        let known = known();
+                        match choose(&known, s.results()) {
+                            None => {
+                                out("wifi: no known network in range\n");
+                                false
+                            }
+                            Some((n, _)) => {
+                                out(&format!("wifi: joining {} ({})\n", n.name, printable_ssid(&n.ssid)));
+                                match join(n) {
+                                    Ok(st) => {
+                                        print_status(&st);
+                                        st.link == Link::Connected
                                     }
-                                }
-                                Err(e) => {
-                                    out(&format!("wifi: {e}\n"));
-                                    backoff_s = (backoff_s * 2).min(60);
+                                    Err(e) => {
+                                        out(&format!("wifi: {e}\n"));
+                                        false
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                },
             },
-        }
+        };
+        backoff_s = auto_backoff(backoff_s, joined);
         sleep_ms(backoff_s * 1000);
     }
 }

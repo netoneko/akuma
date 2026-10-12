@@ -39,9 +39,9 @@ herd ─ "wifi" service (/bin/wifi auto)
 
 | | |
 |---|---|
-| [`crates/akuma-wifi`](../../../crates/akuma-wifi/src/lib.rs) | the protocol: command grammar (`cmd`), status text writer + parser (`status`), hex (`hex`), the simulated radio (`sim`). `no_std`, no allocation, `forbid(unsafe_code)`, 10 host tests. Shared by kernel and tool, so they cannot drift |
+| [`crates/akuma-wifi`](../../../crates/akuma-wifi/src/lib.rs) | the protocol: command grammar (`cmd`), status text writer + parser (`status`), hex (`hex`), the simulated radio (`sim`). `no_std`, no allocation, `forbid(unsafe_code)`, 16 host tests. Shared by kernel and tool, so they cannot drift |
 | [`amd64/src/wifi.rs`](../../../amd64/src/wifi.rs) | the device: backend selection, per-descriptor read cursors, command dispatch. `openat`/`read`/`fstat` hooks in `amd64/src/fd.rs`, `write`/`close` in `amd64/src/usermode.rs` |
-| [`userspace/wifi`](../../../userspace/wifi/README.md) | the tool. Library half (config files, PBKDF2, network choice) has 7 host tests |
+| [`userspace/wifi`](../../../userspace/wifi/README.md) | the tool. Library half (config files, PBKDF2, network choice, the `auto` policy) has 10 host tests |
 | `crates/akuma-vfs/src/dev.rs` | the `wifi0` devfs node, present when a backend registered (`akuma_vfs_glue::set_wifi_present`) |
 | `crates/akuma-exec-core` | `FileDescriptor::DevWifi` |
 
@@ -98,7 +98,7 @@ gets its own cursor. `close` frees it.
 | backend | selected by | |
 |---|---|---|
 | none | default | **no `/dev/wifi0` node at all** (`open` is `ENOENT`, `ls /dev` omits it) |
-| simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below |
+| simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below. **`wifisim=lossy`** (2026-10-12) adds a seeded fault model — scans that miss a network 1 in 4, joins that sit in `associating` for a few reads 1 in 3 (and 1 in 8 of those end `timeout`), a `connected` link that drops to `associating` 1 in 25 reads and comes back `connected` or `failed`, a signal that wanders — so `wifi auto` can be soaked against a radio that behaves like the real one (ryzen entry 15) |
 | rtw89 | `rtw89wifi` (multiboot2 path, after the root mount) | ryzen's RTL8852CE, kept up after its bring-up; `amd64/src/rtw89_sta.rs` is the backend. **Joins a WPA2-PSK network and carries IP** (2026-10-06): scan, auth, assoc, the 4-way handshake in the kernel, keys installed (survey doc § 5.4), then DHCP, SNTP, DNS and **ssh into Akuma over wifi** (§ 5.6) — the stack runs on `ExternalDevice::Queued`. Outbound TCP works since the station is yielded to by blocking socket waits (§ 5.6). W1 (`rtw89`, firmware) and W2 (`rtw89rx`, receive) are the earlier stages, below |
 
 **The simulated radio** is deterministic: the same networks every boot, scans
@@ -193,7 +193,10 @@ network's full credential, hence `0600`. Today every Akuma process is uid 0
 | protocol | `cargo test -p akuma-wifi` (host): grammar round trips and refusals, status write-then-parse, the 4 KiB worst case, the simulator's rules |
 | tool | `cargo test -p wifi --lib --no-default-features` in `userspace/` (host): PBKDF2 against IEEE 802.11i Annex H.4 (`password`/`IEEE` → `f42c6fc5…a12e`) and against the simulator's key, config round trips including non-UTF-8 SSIDs, refusals, network choice |
 | devfs node | `cargo test -p akuma-vfs` (host): `wifi0` follows the probe, is `0600`, hidden in boxes |
-| end to end | ryzen overlay menu entry 7 (`wifisim` + the `wifitest` herd service): the real tool through the real device in the QEMU rehearsal (`DISK=nvme sh qemu.sh 7`), or on the laptop (`arm.sh 7`). The transcript goes to `/var/log/ryzen/wifitest-N.txt` on p3: scan, add, list, a wrong key failing, the right key joining, auto-choice, disconnect, forget |
+| end to end | ryzen overlay menu entry 7 (`wifisim` + the `wifitest` herd service): the real tool through the real device in the QEMU rehearsal (`DISK=nvme sh qemu.sh 7`), or on the laptop (`arm.sh 7`). The transcript goes to `/var/log/ryzen/wifitest-N.txt` on p3: scan, add, list, a wrong key failing, the right key joining, auto-choice, disconnect, forget. **Entry 15** (`wifisim=lossy` + `wifisoak`): `wifi auto` for 5 minutes against the lossy radio, `wifi status` sampled every 10 s into `wifisoak-N.txt` (added 2026-10-12, not yet run) |
+| fuzzing | one `tests/fuzz*.rs` per crate — `akuma-ieee80211` (every frame parser), `akuma-wpa` (`Key::parse`, the supplicant in all states, key unwrap), `akuma-rtw89` (the RX buffer parser, the ring arithmetic), `akuma-wifi` (the grammar, the status text, the simulator) — over mutated valid inputs and random bytes, seeded, ~2 s in all. **Every parser here runs in the kernel on a frame anyone in range can send** (no PMF, spoofable addresses): a panic is a remote kernel abort. Two were found this way (`docs/archive/WIFI_FUZZ_AND_LOSSY_SIM.md`) |
+| the bad link | `crates/akuma-wpa/tests/lossy.rs`: the 4-way handshake and both rekeys over a simulated channel (loss to 50 %, duplication, reordering, bit flips, spoofed message 1s, access-point reboots) against a hostapd-like access point, with a station driver doing exactly what the kernel's `attempt`/`idle` do with each `Action`. Six scenarios, hundreds of seeds; asserts the station always ends up holding the access point's keys |
+| the tool's loop | `auto_keeps_the_lossy_radio_joined` in `userspace/wifi`: the `wifi auto` policy (`auto_step`, `auto_backoff`) against the lossy simulated radio, 20 seeds × 2000 looks, on the host |
 
 First end-to-end run, 2026-10-06, in the rehearsal: every step as expected.
 `wifi connect` with no name chose `akuma-sim-open` over `akuma-sim-wpa2` (equal
@@ -263,6 +266,16 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
   `overlays/ryzen/w2-join4-group.py` 2026-10-07): the group key's CAM entry,
   DCTL and ADDR_CAM, not the pairwise key or the beacon filter. Not yet
   verified on the metal across a real rekey.
+- **Pairwise rekey** (2026-10-12): an access point that starts the 4-way
+  handshake over on the live link now gets message 2 and message 4 under the
+  installed key, then `JOIN4` replayed with the new keys (packet number and
+  receive replay counters start over). Before, message 1 was ignored and the
+  access point deauthenticated the station at every rekey. **Never seen on
+  this network and not run on the metal**; the host simulation runs it under
+  40 % loss. The supplicant keeps a ring of four candidate keys from recent
+  message 1s and moves its replay counter only on MIC'd frames (802.11
+  12.7.2), so a spoofed message 1 can neither clobber the installed key nor
+  lock the access point out — `docs/archive/WIFI_FUZZ_AND_LOSSY_SIM.md`.
 - **A retransmitted message 4 goes out in the clear** (2026-10-07). Before, it
   was protected once the pairwise key was in; ryzen boots 34/38/39/44 show the
   AP resending message 3 three times and then deauthenticating with reason 2.
@@ -284,6 +297,7 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 
 ## Background
 
+- [`../../archive/WIFI_FUZZ_AND_LOSSY_SIM.md`](../../archive/WIFI_FUZZ_AND_LOSSY_SIM.md): the fuzzers, the simulated bad link, the eight defects they found (2026-10-12)
 - [`proposals/AKUMA_WIFI_CONTROL.md`](../../../proposals/AKUMA_WIFI_CONTROL.md): the design, accepted 2026-10-06
 - [`../../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md): the wifi plan (§ 5) this serves
 - [`../../../overlays/ryzen/README.md`](../../../overlays/ryzen/README.md): the reboot loop, the `wifitest` entry and the `rtw89` entry

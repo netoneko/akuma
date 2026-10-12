@@ -9,6 +9,7 @@
 //! | [`Network`] / [`parse_config`] / [`Network::to_config`] | one `/etc/wifi/<network>` file |
 //! | [`derive_psk`] | WPA2's PBKDF2-SHA1(passphrase, ssid, 4096, 32) — done here so the kernel never has to |
 //! | [`choose`] | which known network to join, given a scan |
+//! | [`auto_step`] / [`auto_backoff`] | what `wifi auto` does with one status read, and how long it then waits |
 //! | [`valid_name`] / [`printable_ssid`] | file names and display |
 //!
 //! The design is `proposals/AKUMA_WIFI_CONTROL.md`; the device protocol is
@@ -20,7 +21,7 @@ extern crate alloc;
 
 use alloc::string::String;
 
-use akuma_wifi::status::Bss;
+use akuma_wifi::status::{Bss, Link};
 use akuma_wifi::{Bssid, PSK_LEN, Security, Ssid, hex};
 
 /// Where known networks live, one file each.
@@ -211,6 +212,45 @@ pub fn choose<'a>(known: &'a [Network], scan: &[Bss]) -> Option<(&'a Network, Bs
         }
     }
     best
+}
+
+/// What `wifi auto` does on one look at the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoStep {
+    /// Joined: nothing to do.
+    Keep,
+    /// No radio behind the device: say so and wait.
+    NoRadio,
+    /// The kernel is busy — scanning, or joining (which, on a real radio,
+    /// includes rejoining a dropped link by itself): let it, and look again.
+    Wait,
+    /// Down or failed: scan, choose and join.
+    Join,
+}
+
+/// The `wifi auto` policy for one status read. The point of [`AutoStep::Wait`]
+/// is the rtw89 station: after a lost link it rejoins the network it was told
+/// to join on its own, reporting `associating` meanwhile, and a `scan` or a
+/// `connect` sent then only restarts what it is already doing (a sweep of all
+/// thirteen channels, ~5 s, and the three-attempt join). The tool steps in only
+/// once the kernel reports `failed` or `down`.
+#[must_use]
+pub const fn auto_step(link: Link) -> AutoStep {
+    match link {
+        Link::Connected => AutoStep::Keep,
+        Link::NoRadio => AutoStep::NoRadio,
+        Link::Scanning | Link::Associating => AutoStep::Wait,
+        Link::Down | Link::Failed => AutoStep::Join,
+    }
+}
+
+/// How long `wifi auto` waits before looking again, after a look that
+/// `joined` (or found the link up) or did not: 5 s, doubling after each
+/// failure to a minute, so a network that is gone is not scanned for every
+/// 5 s for ever.
+#[must_use]
+pub const fn auto_backoff(previous_s: u64, joined: bool) -> u64 {
+    if joined { 5 } else if previous_s * 2 > 60 { 60 } else { previous_s * 2 }
 }
 
 /// A safe `/etc/wifi` file name: 1..=64 of `[A-Za-z0-9._-]`, not starting with

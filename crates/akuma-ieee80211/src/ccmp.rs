@@ -103,6 +103,11 @@ impl Replay {
     pub fn group_rekeyed(&mut self) {
         self.group = [[None; TIDS]; KEYIDS];
     }
+
+    /// A new pairwise key was installed (a rekey): its counters start over.
+    pub fn pairwise_rekeyed(&mut self) {
+        self.pairwise = [None; TIDS];
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +143,16 @@ mod tests {
         assert!(r.accept(&rx(true, 0, 2, 1)));
         assert!(r.accept(&rx(true, 0, 1, 1)));
         assert!(!r.accept(&rx(true, 0, 2, 1)));
+    }
+
+    #[test]
+    fn pairwise_rekey_resets_pairwise_only() {
+        let mut r = Replay::new();
+        assert!(r.accept(&rx(true, 0, 2, 50)));
+        assert!(r.accept(&rx(false, 3, 0, 50)));
+        r.pairwise_rekeyed();
+        assert!(r.accept(&rx(false, 3, 0, 1)));
+        assert!(!r.accept(&rx(true, 0, 2, 50)));
     }
 
     #[test]

@@ -85,9 +85,18 @@ pub fn parse(line: &[u8]) -> Result<Command, CmdError> {
     Ok(cmd)
 }
 
-/// Render `cmd` as the line [`parse`] reads (with its `\n`), into `out`;
-/// returns its length. The tool's half of the grammar.
+/// Render `cmd` as the line [`parse`] reads (with its `\n`), into `out`.
+///
+/// Returns its length; the tool's half of the grammar. `None` if it does
+/// not fit, or for a `connect` with an empty SSID: the grammar has no
+/// spelling for one (its hex is nothing, and [`parse`] skips blank words),
+/// and no network can be joined by an empty name anyway.
 pub fn write(cmd: &Command, out: &mut [u8]) -> Option<usize> {
+    if let Command::Connect { ssid, .. } = cmd
+        && ssid.is_empty()
+    {
+        return None;
+    }
     let mut w = crate::status::Writer::new(out);
     match cmd {
         Command::Scan { iface } => {

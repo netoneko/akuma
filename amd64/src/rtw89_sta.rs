@@ -857,7 +857,7 @@ impl Station {
                     send_eapol(card, &mut peer, &out[..len])?;
                     say(if a1 { "eapol: message 1 answered (a1 hit)" } else { "eapol: message 1 answered (a1 MISS)" });
                 }
-                Ok(Action::Complete { len, tk, gtk }) => {
+                Ok(Action::Complete { len, tk, gtk, .. }) => {
                     let seen = card.rpq_seen;
                     send_eapol(card, &mut peer, &out[..len])?;
                     // Message 4 goes out in the clear, so it has to be on the
@@ -1049,12 +1049,56 @@ impl Station {
             self.link_lost();
             return;
         }
-        if let Some(Ok(Action::Complete { len, .. })) = step {
-            // Message 3 again: the access point did not get message 4. The
-            // keys are the ones already installed; only the answer is resent.
-            if send_eapol_clear(card, peer, &out[..len]).is_ok() {
-                say("eapol: message 3 retransmitted; message 4 sent again, in the clear");
+        match step {
+            Some(Ok(Action::Complete { len, fresh: false, .. })) => {
+                // Message 3 again: the access point did not get message 4.
+                // The keys are the ones already installed; only the answer
+                // is resent.
+                if send_eapol_clear(card, peer, &out[..len]).is_ok() {
+                    say("eapol: message 3 retransmitted; message 4 sent again, in the clear");
+                }
             }
+            Some(Ok(Action::Send(len))) => {
+                // Message 1 of a pairwise rekey: the access point starts the
+                // 4-way handshake over on the live link. Message 2 goes out
+                // under the key still installed, as every EAPOL frame of a
+                // rekey does. (Until 2026-10-12 this was ignored, so a
+                // network that rekeys the pairwise key lost the link at
+                // every rekey: the access point retried message 1 and then
+                // deauthenticated the station.)
+                if send_eapol(card, peer, &out[..len]).is_ok() {
+                    say("eapol: pairwise rekey: message 1 answered");
+                }
+            }
+            Some(Ok(Action::Complete { len, tk, gtk, fresh: true })) => {
+                // Message 3 of the rekey: message 4 under the old key, on the
+                // air before the new keys go in, then both keys as the first
+                // handshake installed them. The packet number and the
+                // receive replay counters start over with the new key.
+                let seen = card.rpq_seen;
+                if send_eapol(card, peer, &out[..len]).is_ok() {
+                    if !wait_released(card, seen, 200) {
+                        say("eapol: rekey message 4 not released within 200 ms; installing keys anyway");
+                    }
+                    let group_changed = gtk.key != self.vars.gtk;
+                    self.vars.tk = tk;
+                    self.vars.gtk = gtk.key;
+                    self.vars.gtk_idx = gtk.idx;
+                    link_report(card, &self.stats);
+                    if card.replay("join4 (pairwise rekey)", script::JOIN4, &self.vars) {
+                        peer.pn = 0;
+                        peer.replay.pairwise_rekeyed();
+                        if group_changed {
+                            peer.replay.group_rekeyed();
+                        }
+                        say_dec("eapol: pairwise rekey: keys installed, group key id", u64::from(gtk.idx));
+                    } else {
+                        say("eapol: pairwise rekey: JOIN4 replay failed; the link will drop");
+                    }
+                    link_report(card, &self.stats);
+                }
+            }
+            _ => {}
         }
         if let Some(Ok(Action::Rekey { len, gtk })) = step {
             // Only the group half of `JOIN4` is replayed: the pairwise key
@@ -1108,6 +1152,14 @@ fn trace_tcp(stats: &mut LinkStats, dir: &str, ethertype: u16, ip: &[u8]) {
         return;
     }
     let ihl = usize::from(ip[0] & 0xf) * 4;
+    // Every field below is the sender's claim: an IHL under 5 or a total
+    // length under the header is a malformed packet from the LAN (or the
+    // internet, through the access point), to be counted and not indexed.
+    // The first version sliced `p[ihl..]` and `p[12..20]` on a total length
+    // of 0 — a kernel panic from one crafted packet.
+    if ihl < 20 {
+        return;
+    }
     let Some(tcp) = ip.get(ihl..ihl + 14) else { return };
     let flags = tcp[13];
     let (syn, ack, rst) = (flags & 0x02 != 0, flags & 0x10 != 0, flags & 0x04 != 0);
@@ -1150,6 +1202,7 @@ fn trace_tcp(stats: &mut LinkStats, dir: &str, ethertype: u16, ip: &[u8]) {
         serial::puts(if ip_checksum_ok(&ip[..ihl]) { "ok" } else { "BAD" });
         serial::puts(" tcpsum ");
         serial::puts(match ip.get(..total) {
+            Some(p) if p.len() < ihl + 20 => "short",
             Some(p) if tcp_checksum_ok(p, ihl) => "ok",
             Some(_) => "BAD",
             None => "short",
@@ -1181,9 +1234,13 @@ fn ip_checksum_ok(hdr: &[u8]) -> bool {
     csum(hdr, 0) == 0xffff
 }
 
-/// TCP checksum over the pseudo-header and segment of the IPv4 packet `p`.
+/// TCP checksum over the pseudo-header and segment of the IPv4 packet `p`,
+/// which holds at least `ihl + 20` bytes (the caller checks).
 fn tcp_checksum_ok(p: &[u8], ihl: usize) -> bool {
-    let seg = &p[ihl..];
+    let Some(seg) = p.get(ihl..) else { return false };
+    if p.len() < 20 {
+        return false;
+    }
     let mut acc = 0u32;
     for w in p[12..20].chunks(2) {
         acc += u32::from(u16::from_be_bytes([w[0], w[1]]));
