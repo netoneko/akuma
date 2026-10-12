@@ -54,6 +54,7 @@ default-members = [
     "crates/akuma-selftest",
     "crates/akuma-slot-table",
     "crates/akuma-sntp",
+    "crates/akuma-cmos-rtc",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-abi",
     "crates/akuma-syscalls-linux",

@@ -1,9 +1,13 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-10-06 (fourth run that day) with
-`python3 scripts/cloc_akuma.py src crates`: **59 of 79 crates** forbid
-`unsafe` (78925 of 100664 crate lines, 78.4%; 97.7% of production
-code lies outside any `unsafe` block). Added in this run: **`akuma-ieee80211`**
+**Grade: A** — regenerated 2026-10-12 with
+`python3 scripts/cloc_akuma.py src crates`: **62 of 82 crates** forbid
+`unsafe` (84856 of 106956 crate lines, 79.3%; 97.7% of production
+code lies outside any `unsafe` block). Added in this run: **`akuma-cmos-rtc`**
+(the PC CMOS clock's decode — UIP wait, BCD/binary, 12/24-hour, century,
+civil-to-Unix, plausibility — 0 sites; the two port accesses stay in
+`amd64/src/clock.rs`). The 2026-10-06 run (fourth that day) counted 59 of
+79; it added **`akuma-ieee80211`**
 (233 production lines, 0 sites): beacons, information elements, the RSN
 element, for wifi stage W2; and `akuma-rtw89` grew to 1393 production lines
 (the recorded-start replay `script` and the RX descriptor `rx`), still 0

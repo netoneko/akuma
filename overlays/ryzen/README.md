@@ -86,7 +86,7 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 4 | headless: as 0, plus `nofb` (framebuffer never touched) | yes |
 | 5 | NVMe root p3, SMP | no |
 | 6 | **watchdog self-test** (`wdttest`): arm, then wedge with interrupts off | yes, through the watchdog's reset, about 60 s in |
-| 7 | **wifi tool test** (`wifisim` + the `wifitest` service): the `wifi` tool against the simulated radio, transcript to `/var/log/ryzen/wifitest-N.txt` | yes |
+| 7 | **wifi tool test** (`wifisim` + the `wifitest` service): the `wifi` tool against the simulated radio, transcript to `/var/log/ryzen/wifitest-N.txt`. Rehearsed 2026-10-12 twice: first run's fsck found `deleted inode has zero dtime` — the kernel had no wall clock without a network, every file was dated 1970 — then clean with the CMOS RTC seed (`clock: seeded from the CMOS RTC` in `boot-N.dmesg`, files dated that day) | yes |
 | 8 | **wifi W1** (`rtw89`): as 0, plus the RTL8852CE brought up to running firmware and shut down again before `init`; `[rtw]` lines in `boot-N.early` | yes |
 | 9 | **wifi W2** (`rtw89rx`): as 8, then Linux's recorded start replayed and 12 s of receiving on channel 1; a summary per network (OUI, channel, SSID hash, security) in `boot-N.early` | yes |
 | 10 | **wifi W3/W4** (`rtw89wifi` + the `wifijoin` service): the card kept up as `/dev/wifi0`'s radio, then `wifi connect` joins the best known network in `/etc/wifi` on p3; `[rtw]` lines in `boot-N.dmesg`, the tool's exit status and `/dev/wifi0`'s non-identifying keys in `wifijoin-N.txt` | yes |

@@ -125,6 +125,17 @@ if timer::utc_time_us().is_none() && config::ENABLE_NTP_BOOTSTRAP {
     }
 }
 ```
+**amd64 (2026-10-12):** the metal and QEMU's q35 have the PC CMOS clock, and
+`amd64::clock::seed_from_rtc` (from `boot::install_shared_sinks`, so both boot
+protocols) reads it through `akuma-cmos-rtc` — UIP wait, consistent double
+read, BCD/binary and 12/24-hour decode, the century register, a plausibility
+window of 2025–2099 so a dead battery's 2000-01-01 is not believed — before
+anything is mounted. It is a seed: `sync_tick` keeps trying SNTP while the
+clock is RTC-only and SNTP overrides it. Firecracker and `microvm` have no
+CMOS, read as "holds no date", and wait for SNTP as before. Before this, a
+boot without a network stamped every inode 1970 and every unlinked inode
+with a zero `dtime` (`archive/WIFI_FUZZ_AND_LOSSY_SIM.md` § "The clock").
+
 `try_bootstrap_clock` (`#[cfg(feature = "smoltcp")]`, a stub returning
 `Err(...)` otherwise) itself does no logging — it returns
 `Result<(), &'static str>` (same shape as `akuma_net::init`) and leaves

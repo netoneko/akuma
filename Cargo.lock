@@ -87,6 +87,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-bkl",
  "akuma-boot",
+ "akuma-cmos-rtc",
  "akuma-config",
  "akuma-cow",
  "akuma-cpu",
@@ -159,6 +160,10 @@ version = "0.1.0"
 dependencies = [
  "akuma-psci",
 ]
+
+[[package]]
+name = "akuma-cmos-rtc"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-config"

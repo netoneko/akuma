@@ -176,10 +176,29 @@ would catch on a real link).
   radio's `failed`-after-drop arm (1 in 4 drops) did not fire in this seed;
   the tool's recovery from it is covered by the host test only.
 - Entry 7's run left p3 with `Deleted inode 351 has zero dtime` (fsck
-  rc 4, no other error): `wifi forget` unlinks a file and the guest then
-  hard-reboots; the ext2 driver's `unlink` does not stamp `dtime`. Not
-  wifi's, not new (no earlier rehearsal deleted a file), worth a look in
-  `akuma-ext2`.
+  rc 4, no other error). First read as the ext2 driver's `unlink` not
+  stamping `dtime`; it does. See "The clock" below.
+
+## The clock: why `dtime` was zero
+
+`akuma-ext2`'s `release_last_link` stamps `deletion_time = current_time()`,
+and `current_time()` on amd64 is `clock::now_us()`, which is **0 until SNTP
+has run**. The rehearsal boots with no network, so the clock never set:
+every file in that guest's `/var/log/ryzen` is dated 1970-01-01, and the
+inode `wifi forget` unlinked got `dtime = 0`, which is what fsck reports.
+The amd64 kernel had never read the machine's real-time clock — the module
+header said "this target has no RTC", true of Firecracker and `microvm`,
+false of the metal and q35, which have the PC CMOS clock.
+
+Fixed with `crates/akuma-cmos-rtc` (the decode, `forbid(unsafe_code)`, six
+host tests: BCD and binary, 12- and 24-hour, the UIP wait, a torn read, the
+century register, a dead battery refused) and `amd64::clock::seed_from_rtc`
+over `port::{inb, outb}` at `0x70`/`0x71`, called from
+`boot::install_shared_sinks` so both boot protocols get it before the root
+mounts. The RTC is a seed: `RTC_ONLY` keeps `sync_tick` trying SNTP, which
+overrides it. Ryzen's CMOS holds UTC (`timedatectl`: `RTC in local TZ: no`).
+Entry 7 rerun with the seeded kernel: see the row in
+`overlays/ryzen/README.md`.
 - `trace_tcp` is still in the kernel file, untested on the host.
 - The station daemon's timing policies (dwell, `MGMT_TRIES`, `JOIN_ATTEMPTS`,
   the beacon-loss grace, the rejoin backoff, `BAD_BSS`) are still only in

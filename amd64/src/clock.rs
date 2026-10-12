@@ -1,12 +1,22 @@
-//! A wall clock, bootstrapped once at boot via SNTP.
+//! A wall clock: seeded from the CMOS RTC at boot where there is one, and
+//! set (or corrected) via SNTP.
 //!
-//! This target has no RTC (Firecracker's device model has none; QEMU
-//! `microvm` doesn't either) and, until now, no way to learn what time it
-//! is at all — every `clock_gettime`/`gettimeofday`/`time` answered with
-//! epoch 0, and every real TLS certificate has a `notBefore` decades after
-//! 1970, so every HTTPS connection out of this target failed validation
+//! The Firecracker and QEMU `microvm` device models have no RTC, and until
+//! SNTP landed this target had no way to learn what time it is at all —
+//! every `clock_gettime`/`gettimeofday`/`time` answered with epoch 0, and
+//! every real TLS certificate has a `notBefore` decades after 1970, so every
+//! HTTPS connection out of this target failed validation
 //! (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.5 — found while getting
 //! `apk` working, which is what this exists to fix).
+//!
+//! The metal and QEMU's q35 **do** have one, the PC CMOS clock, and since
+//! 2026-10-12 [`seed_from_rtc`] reads it before anything is mounted: a boot
+//! with no network (the ryzen rehearsals, a wifi boot before the join) used
+//! to stamp every inode 1970 and every unlinked inode with a zero `dtime`,
+//! which `e2fsck` reported after the guest's hard reboot. The RTC is a
+//! seed, not the truth — it drifts, and may hold local time on a machine
+//! that dual-boots Windows — so SNTP still runs and overrides it
+//! ([`RTC_ONLY`]).
 //!
 //! # What this file is, after C3
 //!
@@ -56,7 +66,7 @@ use akuma_net::socket::socket_const::SOCK_DGRAM;
 use akuma_net::socket::SocketAddrV4;
 use akuma_primitives::clock as wall;
 use akuma_sntp::boot::{bootstrap_over_udp, BootstrapEffects};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::serial;
 
@@ -73,8 +83,9 @@ use crate::serial;
 // there is nothing left here to disagree with.
 // ---------------------------------------------------------------------------
 
-/// Has the wall clock ever been set — by [`sync_via_sntp`] here, or by
-/// `clock_settime`/`settimeofday`/`adjtimex` from ring 3?
+/// Has the wall clock ever been set — by [`seed_from_rtc`] or
+/// [`sync_via_sntp`] here, or by `clock_settime`/`settimeofday`/`adjtimex`
+/// from ring 3?
 #[must_use]
 pub fn is_synced() -> bool {
     wall::is_utc_set()
@@ -130,6 +141,75 @@ pub fn set_unix_us(us: u64) {
     // between the two reads is silently added to the wall clock.
     let uptime = crate::net::uptime_us();
     wall::set_utc_time_us(us, uptime);
+}
+
+/// The wall clock came from the CMOS RTC and nothing has corrected it yet:
+/// [`sync_tick`] keeps trying SNTP while this is set, and clears it on
+/// success. Cleared too by a ring-3 `settimeofday`? No — that path does not
+/// come through here; a userspace-set clock counts as corrected only once
+/// SNTP lands, which costs one harmless extra sync.
+static RTC_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Seed the wall clock from the CMOS RTC, if the machine has one that holds
+/// a believable date. Prints one line either way. Safe to call before the
+/// timer runs (the anchor is an offset from uptime, and uptime 0 is fine).
+///
+/// A clock that is already set — SNTP first, or a second call — is left
+/// alone: the RTC is the fallback, never the override.
+pub fn seed_from_rtc() {
+    if is_synced() {
+        return;
+    }
+    /// The CMOS index/data ports. Nothing else in this kernel touches them.
+    struct Ports;
+    impl akuma_cmos_rtc::Cmos for Ports {
+        fn read(&mut self, reg: u8) -> u8 {
+            // SAFETY: 0x70/0x71 are the CMOS/RTC index and data ports on every
+            // PC; selecting a register below 0x40 and reading it has no side
+            // effect but on the index latch, which nothing else here uses.
+            // Bit 7 of the index (NMI disable) is left clear.
+            unsafe {
+                crate::port::outb(0x70, reg & 0x7f);
+                crate::port::inb(0x71)
+            }
+        }
+    }
+    match akuma_cmos_rtc::read(&mut Ports) {
+        Ok(dt) => match akuma_cmos_rtc::unix_seconds(&dt) {
+            Some(secs) => {
+                set_unix_us(secs * 1_000_000);
+                RTC_ONLY.store(true, Ordering::Relaxed);
+                serial::puts("  clock: seeded from the CMOS RTC (");
+                serial::put_dec(u64::from(dt.year));
+                serial::puts("-");
+                serial::put_dec(u64::from(dt.month));
+                serial::puts("-");
+                serial::put_dec(u64::from(dt.day));
+                serial::puts(" ");
+                serial::put_dec(u64::from(dt.hour));
+                serial::puts(":");
+                serial::put_dec(u64::from(dt.minute));
+                serial::puts(" UTC); SNTP will correct it
+");
+            }
+            None => {
+                serial::puts("  clock: CMOS RTC says year ");
+                serial::put_dec(u64::from(dt.year));
+                serial::puts(" — not believed (dead battery?); waiting for SNTP
+");
+            }
+        },
+        Err(e) => {
+            serial::puts(match e {
+                akuma_cmos_rtc::Error::UpdateNeverEnded => "  clock: CMOS RTC never finished updating; waiting for SNTP
+",
+                akuma_cmos_rtc::Error::Unstable => "  clock: CMOS RTC reads never agreed; waiting for SNTP
+",
+                akuma_cmos_rtc::Error::Malformed => "  clock: CMOS RTC holds no date; waiting for SNTP
+",
+            });
+        }
+    }
 }
 
 /// SNTP server. A public pool rather than a fixed IP: `pool.ntp.org` round-
@@ -233,7 +313,7 @@ pub fn sync_status() -> (SyncOutcome, u64) {
 /// fires on the first lap after the address lands instead of waiting out a
 /// retry interval that elapsed while there was nothing to try.
 pub fn sync_tick() {
-    if is_synced() {
+    if is_synced() && !RTC_ONLY.load(Ordering::Relaxed) {
         return;
     }
     if akuma_net::smoltcp_net::interface_snapshot().ip == [0, 0, 0, 0] {
@@ -295,6 +375,7 @@ fn report_outcome(outcome: SyncOutcome, ctx: &str) {
     }
     match outcome {
         SyncOutcome::Ok => {
+            RTC_ONLY.store(false, Ordering::Relaxed);
             serial::puts("  clock: synced via SNTP (");
             serial::puts(NTP_HOST);
             serial::puts(", ");

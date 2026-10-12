@@ -1,0 +1,10 @@
+[package]
+name = "akuma-cmos-rtc"
+version = "0.1.0"
+edition = "2024"
+description = "The PC CMOS real-time clock (MC146818), read: the update-in-progress wait, the consistent double read, BCD/binary and 12/24-hour decode, the century register, civil-to-Unix, and the plausibility check that keeps a dead battery from seeding the wall clock. no_std, no allocation, no dependencies, forbid(unsafe_code); the port I/O is the caller's."
+
+[lints]
+workspace = true
+
+[dependencies]

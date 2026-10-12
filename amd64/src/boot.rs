@@ -125,6 +125,11 @@ pub fn install_shared_sinks() {
     // device failed to initialise — is silently dropped.
     akuma_primitives::console::set_print_hook(crate::serial::puts);
     crate::exec_runtime::init();
+    // The wall clock, from the CMOS RTC, before anything is mounted: every
+    // inode stamp from here on carries the year. Both boot protocols, for the
+    // reason this function exists (below). SNTP corrects it once there is a
+    // network; without one this is the clock.
+    crate::clock::seed_from_rtc();
     // `/proc/cpuinfo`'s block renderer. Here, not beside `power::init`: that one
     // is called from both boot paths separately, and the metal (multiboot2) path
     // is the one that read bare `processor : N` blocks on 2026-10-09 because the

@@ -440,6 +440,10 @@ akuma-net = { path = "../crates/akuma-net", features = ["rtl8169"] }
 # `akuma-syscalls-time` specifically so this target could reach it without also
 # needing that crate's `akuma-exec` dependency, which does not build here.
 akuma-sntp = { path = "../crates/akuma-sntp" }
+# The CMOS real-time clock's decode (2026-10-12): seeds the wall clock at
+# boot so a machine with no network — the QEMU rehearsals, a wifi boot before
+# the join — still stamps inodes with the right year; SNTP corrects it after.
+akuma-cmos-rtc = { path = "../crates/akuma-cmos-rtc" }
 # The pure byte-FIFO half of a pipe (buffer, 64 KiB cap, closable write end, the
 # empty-vs-EOF rule), host-tested. `sys_spawn` wires a child's stdio to these;
 # `src/pipe.rs` is the `static` array + lock around it. The tree's full kernel
