@@ -58,6 +58,18 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
     core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
 }
 
+/// Set by a kernel whose page-fault handler does not serve [`LazyRegionMap`]
+/// (amd64): a path load then maps every segment up front instead of deferring.
+/// Without it the first instruction fetch of any binary over `HEAP_SLURP_MAX`
+/// is a not-present fault nothing resolves, and `box run` of a 1 MiB busybox
+/// took the whole kernel down (`AKUMA_AMD64_BOX_SPAWN_EXT.md`, "the wall").
+static EAGER_PATH_LOADS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Make path loads eager. Boot-time, once; AArch64 never calls it.
+pub fn set_eager_path_loads() {
+    EAGER_PATH_LOADS.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where an image being executed comes from.
 ///
 /// These are the two combinations `execve` picks between by file size
@@ -86,6 +98,9 @@ impl ImageSource<'_> {
         match *self {
             Self::Bytes(data) => {
                 elf_loader::load_elf_with_stack(data, args, env, stack_size, interp_prefix)
+            }
+            Self::Path { path, .. } if EAGER_PATH_LOADS.load(core::sync::atomic::Ordering::Relaxed) => {
+                elf_loader::load_elf_with_stack_eager_from_path(path, args, env, stack_size, interp_prefix)
             }
             Self::Path { path, file_size } => elf_loader::load_elf_with_stack_from_path(
                 path, file_size, args, env, stack_size, interp_prefix,

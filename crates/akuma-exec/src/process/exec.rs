@@ -292,11 +292,22 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
 
     // Target process now uses caller's output channel. Move the pre-built
     // Option<Arc> in; the replaced value's drop is only a refcount decrement.
-    crate::process::table::with_process(target_pid, |p| {
-        p.channel = channel;
+    // Keep what the target already wrote, and what its children go on writing. A freshly spawned target is running
+    // before its spawner reaches this call (on amd64 it is on another core), so
+    // a short-lived container's whole output can already be sitting in the
+    // channel it was born with: `box run busybox echo hi` printed nothing.
+    // The swap comes first so every later write lands in the new channel, and
+    // the old one is drained after it — a once-per-grab copy, not a hot path.
+    let previous = crate::process::table::with_process(target_pid, |p| {
+        let previous = p.channel.take();
+        p.channel = channel.clone();
         p.grabbed_by = caller_pid;
+        previous
     })
         .ok_or("Target not found")?;
+    if let (Some(old), Some(new)) = (previous, channel.as_ref()) {
+        old.forward_to(new);
+    }
 
     if config().syscall_debug_info_enabled {
         log::debug!("[Process] Reattached (caller={:?}) -> PID {}", caller_pid, target_pid);

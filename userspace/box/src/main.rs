@@ -79,7 +79,7 @@ fn print_usage() {
 
 /// `/proc/boxes` in full, or an empty string if it cannot be read — which is
 /// the normal answer inside a box, where the file does not exist.
-fn read_proc_boxes() -> String {
+pub(crate) fn read_proc_boxes() -> String {
     let fd = open("/proc/boxes", open_flags::O_RDONLY);
     if fd < 0 {
         return String::new();
@@ -91,6 +91,22 @@ fn read_proc_boxes() -> String {
         return String::new();
     }
     String::from(core::str::from_utf8(&buf[..n as usize]).unwrap_or(""))
+}
+
+/// Every thread slot the kernel will report, not the first 64 of them.
+///
+/// `get_cpu_stats` fills `min(slice length, the kernel's thread table)` entries
+/// in slot order, so a 64-entry buffer saw slots 0-63 only. AArch64's table is
+/// that size; amd64's is 512, and a process in slot 64+ — anything started after
+/// a few sessions' worth of children — was invisible to `box grab` ("no
+/// processes found in box") and `box show` ("(none)") while `box ps` and
+/// `/proc` listed it. The kernel clamps to its own table, so oversizing is free.
+fn thread_stats() -> Vec<ThreadCpuStat> {
+    const SLOTS: usize = 1024;
+    let mut stats: Vec<ThreadCpuStat> = alloc::vec![ThreadCpuStat::default(); SLOTS];
+    let count = get_cpu_stats(&mut stats);
+    stats.truncate(count.min(SLOTS));
+    stats
 }
 
 fn resolve_target_id(target: &str) -> Option<u64> {
@@ -317,13 +333,25 @@ fn cmd_grab(mut args: libakuma::Args) -> ! {
         p
     } else {
         // Find first process in this box from top stats
-        let mut stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
-        let count = get_cpu_stats(&mut stats);
+        let stats = thread_stats();
         let mut found = None;
-        for i in 0..count {
-            if stats[i].state != 0 && stats[i].box_id == target_id && stats[i].pid > 1 {
-                found = Some(stats[i].pid);
-                break;
+        // The box's recorded primary process first: it is what `box open`/`run`
+        // started. "Lowest slot in the box" alone grabs whichever short-lived
+        // child of that shell happens to sit in a lower slot (`sleep`, `ls`), and
+        // the grab ends as soon as it exits.
+        let primary = boxes::find(&read_proc_boxes(), target_id)
+            .map_or(0, |e| e.primary.parse::<u32>().unwrap_or(0));
+        if primary > 1
+            && stats.iter().any(|st| st.state != 0 && st.box_id == target_id && st.pid == primary)
+        {
+            found = Some(primary);
+        }
+        if found.is_none() {
+            for st in &stats {
+                if st.state != 0 && st.box_id == target_id && st.pid > 1 {
+                    found = Some(st.pid);
+                    break;
+                }
             }
         }
         found.unwrap_or_else(|| {
@@ -459,15 +487,14 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
     println(&format!("Creator PID: {}", entry.creator));
     println("\nMembers:");
     
-    let mut stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
-    let count = get_cpu_stats(&mut stats);
+    let stats = thread_stats();
     let mut found = false;
-    for i in 0..count {
-        if stats[i].state != 0 && stats[i].box_id == target_id {
+    for st in &stats {
+        if st.state != 0 && st.box_id == target_id {
             let mut name_len = 0;
-            while name_len < 16 && stats[i].name[name_len] >= 32 && stats[i].name[name_len] < 127 { name_len += 1; }
-            let name = core::str::from_utf8(&stats[i].name[..name_len]).unwrap_or("?");
-            println(&format!("  PID {:>3}  {}", stats[i].pid, name));
+            while name_len < 16 && st.name[name_len] >= 32 && st.name[name_len] < 127 { name_len += 1; }
+            let name = core::str::from_utf8(&st.name[..name_len]).unwrap_or("?");
+            println(&format!("  PID {:>3}  {}", st.pid, name));
             found = true;
         }
     }

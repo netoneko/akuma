@@ -906,6 +906,23 @@ pub struct InheritOverrides {
 ///
 /// When threads are created with CLONE_THREAD (pthreads), they share this table
 /// via Arc — matching Linux CLONE_SIGHAND behavior. Fork/Spawn creates a fresh table.
+/// How [`kill_box`] ends one member, when the kernel has an answer of its own.
+///
+/// The default is [`kill_process`]: it marks the member's thread `TERMINATED`
+/// from the killing core, which is right on AArch64 and wrong on a target whose
+/// threads leave ring 3 only through their own syscall return or a tick — there
+/// it strands the thread's own teardown (its fd refcounts, its thread row) and,
+/// on a threaded member, costs the full `KILL_GRACE_US`
+/// (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`). amd64 registers a
+/// function that pends `SIGKILL` the way its own `kill(2)` does and waits for
+/// the death to run on the dying thread. `None` leaves AArch64 byte-identical.
+static BOX_MEMBER_KILLER: Spinlock<Option<fn(Pid)>> = Spinlock::new(None);
+
+/// Register the per-member terminator [`kill_box`] uses. Boot-time, once.
+pub fn set_box_member_killer(kill: fn(Pid)) {
+    *BOX_MEMBER_KILLER.lock() = Some(kill);
+}
+
 /// Kill all processes in a box (and any nested descendant boxes) and unregister them.
 ///
 /// Boxes can be nested (`box_access::can_register_box` supports subdividing a box's
@@ -916,6 +933,7 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
     if box_id == 0 {
         return Err("Cannot kill Box 0 (Host)");
     }
+    let killer = *BOX_MEMBER_KILLER.lock();
 
     let registry = registry_snapshot();
     let box_ids = box_access::cascade_kill_order(&registry, box_id);
@@ -924,7 +942,10 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
         let pids: Vec<Pid> = table::collect_pids(|p| p.box_id == id);
         for pid in pids {
             // kill_process handles unregistering and thread termination
-            let _ = kill_process(pid);
+            match killer {
+                Some(kill) => kill(pid),
+                None => { let _ = kill_process(pid); }
+            }
         }
         // The removed `BoxInfo` is not needed here — the box is being torn down.
         let _ = unregister_box(id);

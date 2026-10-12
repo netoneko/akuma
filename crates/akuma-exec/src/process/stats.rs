@@ -18,9 +18,22 @@ pub fn process_syscall_stats_enabled() -> bool {
     PROCESS_SYSCALL_STATS_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Per-process syscall counters.
+///
+/// The two 512-entry tables live on the **heap**, not inline. Inline they made
+/// `Process` 8 KiB heavier than everything else in it put together, and
+/// `Process` is built *by value* — `from_image` returns it, `spawn` holds it,
+/// `Box::try_new` takes it — so one `spawn_ext` held three or four copies at once.
+/// AArch64's kernel stacks are 128 KiB and more; amd64's are 32 KiB, and a plain
+/// `box open` of a 13 KB binary ran off the bottom of one (`[STACK CANARY]
+/// slot=5 … w0=<a return address in akuma_elf>`), then corrupted the heap below
+/// it: a `talc` free fault in whichever thread next drained a dead address space.
+///
+/// One allocation of `2 * MAX_NR` words, `counts` then `times_us`. If it cannot
+/// be had the slice is empty and the counters silently count nothing — a
+/// diagnostics table must never be the reason a process fails to start.
 pub struct ProcessSyscallStats {
-    counts: [AtomicU64; Self::MAX_NR],
-    times_us: [AtomicU64; Self::MAX_NR],
+    table: alloc::boxed::Box<[AtomicU64]>,
     pub pagefaults: AtomicU64,
     pub pagefault_pages: AtomicU64,
 }
@@ -28,26 +41,38 @@ pub struct ProcessSyscallStats {
 impl ProcessSyscallStats {
     const MAX_NR: usize = 512;
 
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        let mut v: Vec<AtomicU64> = Vec::new();
+        let table = if v.try_reserve_exact(2 * Self::MAX_NR).is_ok() {
+            v.resize_with(2 * Self::MAX_NR, || AtomicU64::new(0));
+            v.into_boxed_slice()
+        } else {
+            alloc::boxed::Box::default()
+        };
         Self {
-            counts: [const { AtomicU64::new(0) }; Self::MAX_NR],
-            times_us: [const { AtomicU64::new(0) }; Self::MAX_NR],
+            table,
             pagefaults: AtomicU64::new(0),
             pagefault_pages: AtomicU64::new(0),
         }
     }
 
+    fn count_at(&self, idx: usize) -> Option<&AtomicU64> {
+        if idx < Self::MAX_NR { self.table.get(idx) } else { None }
+    }
+
+    fn time_at(&self, idx: usize) -> Option<&AtomicU64> {
+        if idx < Self::MAX_NR { self.table.get(Self::MAX_NR + idx) } else { None }
+    }
+
     pub fn inc(&self, nr: u64) {
-        let idx = nr as usize;
-        if idx < Self::MAX_NR {
-            self.counts[idx].fetch_add(1, Ordering::Relaxed);
+        if let Some(c) = self.count_at(nr as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn add_time_us(&self, nr: u64, us: u64) {
-        let idx = nr as usize;
-        if idx < Self::MAX_NR {
-            self.times_us[idx].fetch_add(us, Ordering::Relaxed);
+        if let Some(t) = self.time_at(nr as usize) {
+            t.fetch_add(us, Ordering::Relaxed);
         }
     }
 
@@ -61,9 +86,9 @@ impl ProcessSyscallStats {
         let mut total_time_us: u64 = 0;
         let mut entries: Vec<(usize, u64, u64)> = Vec::new();
         for i in 0..Self::MAX_NR {
-            let c = self.counts[i].load(Ordering::Relaxed);
+            let c = self.count_at(i).map_or(0, |c| c.load(Ordering::Relaxed));
             if c > 0 {
-                let t = self.times_us[i].load(Ordering::Relaxed);
+                let t = self.time_at(i).map_or(0, |t| t.load(Ordering::Relaxed));
                 total += c;
                 total_time_us += t;
                 entries.push((i, c, t));

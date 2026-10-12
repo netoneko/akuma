@@ -20,6 +20,16 @@ invocation within one boot — is also still open; see "What's left" for both.
 work, the user asked what actually blocks amd64 from having real "boxes"
 (containers) the way AArch64 does, and then to wire it.
 
+> **Correction, 2026-10-13.** Three claims below were wrong and are fixed in
+> [`AKUMA_AMD64_BOXES_AUDIT.md`](AKUMA_AMD64_BOXES_AUDIT.md): (1) "The isolation
+> mechanism was never the gap" — amd64's `get_box_namespace` hook was `None`, so a
+> boxed process had the caller's namespace; (2) the `CR2 = 0xfffffffffffffff8`
+> double/triple fault was blamed on the missing lazy-region service, but it is
+> `TSS.rsp0 == 0` for any `spawn_ext` thread (the lazy-region wall is real too, and
+> is now sidestepped by an eager path load); (3) "a crash on a second `spawn_ext`"
+> is a 32 KiB kernel stack overflowed by an 8 KiB inline stats table.
+
+
 ## The corrected picture: boxes are mostly already arch-neutral
 
 The first answer given in this session was wrong in one respect and

@@ -2123,11 +2123,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `net.rs`), so this is real mount/unmount rather than a stub.
         //
         // The box-lifecycle calls the same feature also compiles
-        // (`register_box`/`kill_box`/`reattach`/`mount_in_ns`) get no arm
-        // here on purpose: they are Akuma-private numbers dispatched through
-        // the `AKUMA_PRIVATE_BASE` match above, which does not list them, and
-        // this target has no second "box" concept for them to mean anything
-        // against yet. See `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
+        // (`register_box`/`kill_box`/`reattach`/`mount_in_ns`) are Akuma-private
+        // numbers and are dispatched through the `AKUMA_PRIVATE_BASE` match
+        // above (315-318, 324, 325), not here. See
+        // `docs/archive/AKUMA_AMD64_BOXES_AUDIT.md`.
         Syscall::Mount => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         Syscall::Umount2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271, and
@@ -5915,6 +5914,19 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
     akuma_syscalls_glue::proc::sys_close_child_stdin(pid as u32)
 }
 
+/// Is `p` a child of `me` for `waitpid`'s purposes?
+///
+/// `parent_pid` is the link every process this target builds itself carries. A
+/// process created by `spawn_ext` — `box run`/`open`/`use`, herd's services —
+/// is built by `akuma-exec`, which records the caller as `spawner_pid` and
+/// leaves `parent_pid` at 0 (AArch64 waits through child channels and never
+/// reads it). Matching on `parent_pid` alone made every such child invisible to
+/// its spawner's `waitpid`: `ECHILD` forever, and `box use -i` / `box run`
+/// polling a finished container until the session was killed.
+fn is_child_of(p: &akuma_exec::process::Process, me: u32) -> bool {
+    p.parent_pid == me || (p.parent_pid == 0 && p.spawner_pid == Some(me))
+}
+
 /// `waitpid(pid, status_ptr, options)` — Akuma's syscall 303.
 ///
 /// Non-blocking regardless of `options`: `sshd`'s bridge polls it every tick and
@@ -5945,7 +5957,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 
     // Does any matching child exist at all? (For the `-ECHILD` vs `0` decision.)
     let exists = akuma_exec::process::find_process(|p| {
-        (p.parent_pid == me && (any || p.pid == want)).then_some(())
+        (is_child_of(p, me) && (any || p.pid == want)).then_some(())
     })
     .is_some();
     if !exists {
@@ -5960,7 +5972,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     // published by `spawn_record_exit` before it wakes the waiters, so a parent
     // that gets here after a wake finds it set.
     let Some((child_pid, code)) = akuma_exec::process::find_process(|p| {
-        (p.parent_pid == me && (any || p.pid == want) && p.exited.load(Ordering::Acquire))
+        (is_child_of(p, me) && (any || p.pid == want) && p.exited.load(Ordering::Acquire))
             .then(|| (p.pid, p.exit_code.load(Ordering::Acquire)))
     }) else {
         return 0; // matching child(ren) exist, none has exited yet
@@ -7594,11 +7606,9 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         t.check_eq("dispatch: glue accepts msgctl(IPC_RMID)", rmid_rc, 0);
     }
 
-    // The `sc-containers` rows — `mount`/`umount2` only. The box-lifecycle
-    // calls the same feature also compiles (`register_box`/`kill_box`/
-    // `reattach`/`mount_in_ns`, 316/317/318/325) get no dispatch arm here —
-    // see the `Mount` match arm's own comment and
-    // `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
+    // The `sc-containers` rows — `mount`/`umount2`. The box-lifecycle calls
+    // (315-318, 324, 325) are private numbers; they are exercised live by
+    // `scripts/box_amd64_suite.py`, not by this table.
     t.check("dispatch: mount 165 -> 40", hop(Syscall::Mount, 165, nr::MOUNT));
     t.check("dispatch: umount2 166 -> 39", hop(Syscall::Umount2, 166, nr::UMOUNT2));
     // The global `/` guard fires before any real mount-table lookup, so this

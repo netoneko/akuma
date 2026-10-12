@@ -14,6 +14,13 @@ use akuma_terminal as terminal;
 pub struct ProcessChannel {
     /// Output buffer (spinlock-protected for thread safety)
     buffer: Spinlock<VecDeque<u8>>,
+    /// Where this channel's output goes now, once a `reattach` has moved its
+    /// owner elsewhere. Every holder of this `Arc` — the target itself, and each
+    /// child it forked before the grab — keeps writing here; following the link
+    /// is what makes a grab cover them. See [`ProcessChannel::forward_to`].
+    forward: Spinlock<Option<Arc<ProcessChannel>>>,
+    /// Lock-free "is `forward` set", so the common write pays one load.
+    forwarding: AtomicBool,
     /// Stdin buffer for interactive input (SSH -> process)
     stdin_buffer: Spinlock<VecDeque<u8>>,
     /// Exit code (set when process exits)
@@ -183,6 +190,8 @@ impl ProcessChannel {
     pub fn new() -> Self {
         Self {
             buffer: Spinlock::new(VecDeque::new()),
+            forward: Spinlock::new(None),
+            forwarding: AtomicBool::new(false),
             stdin_buffer: Spinlock::new(VecDeque::new()),
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
@@ -229,6 +238,9 @@ impl ProcessChannel {
     /// now stated at the boundary rather than paid for per write.
     pub fn write(&self, data: &[u8]) {
         if data.is_empty() { return; }
+        if let Some(next) = self.forward_target() { return next.write(data); }
+        // Nobody is left to read it. See `write_bounded`.
+        if self.has_exited() { return; }
 
         fifo_push_drop_oldest(&self.buffer, data);
         trace_transfer("write stdout", data.len(), data);
@@ -246,6 +258,15 @@ impl ProcessChannel {
     /// channels keep using `write`'s drop-oldest scrollback behaviour.
     pub fn write_bounded(&self, data: &[u8]) -> usize {
         if data.is_empty() { return 0; }
+        // A write into a channel whose owner has exited is discarded and reported
+        // as accepted (a closed tty: the writer must not block on, or fill, a
+        // buffer nobody drains). `box grab` is how this happens: it lends the
+        // target the grabber's channel, and when the grabber's session ends the
+        // target keeps writing into it. Buffered, those bytes kept the session's
+        // reader — `sshd`, which on amd64 is one cooperative process — draining
+        // forever and no later connection was ever accepted.
+        if let Some(next) = self.forward_target() { return next.write_bounded(data); }
+        if self.has_exited() { return data.len(); }
 
         let n = fifo_push_bounded(&self.buffer, data);
         trace_transfer("write stdout", n, data);
@@ -264,6 +285,7 @@ impl ProcessChannel {
     /// leave the writer parked with nobody left to wake it — mirrors
     /// `pipe_check_set_writer`'s TOCTOU fix.
     pub fn check_set_writer(&self, tid: usize) -> bool {
+        if let Some(next) = self.forward_target() { return next.check_set_writer(tid); }
         with_irqs_disabled(|| {
             let buf = self.buffer.lock();
             if buf.len() < MAX_BUFFER_SIZE {
@@ -297,6 +319,46 @@ impl ProcessChannel {
                 crate::threading::wake_by_handle(handle);
             }
         });
+    }
+
+    /// The channel this one forwards to, if any.
+    fn forward_target(&self) -> Option<Arc<ProcessChannel>> {
+        if !self.forwarding.load(Ordering::Acquire) {
+            return None;
+        }
+        with_irqs_disabled(|| self.forward.lock().clone())
+    }
+
+    /// Send this channel's output to `next` from now on, and move across
+    /// whatever is already buffered.
+    ///
+    /// `reattach` used to repoint only the *target process's* `channel` field.
+    /// A process that had already forked — a shell's `cat`, a container's
+    /// `sleep` — held its own `Arc` to the old channel and went on writing into
+    /// it, where nobody reads: the first line of a `box run` whose command
+    /// raced the reattach, and every line of a grab whose shell had children.
+    /// With the link, those writes arrive where the grabber is looking.
+    ///
+    /// A link back to `self` is cleared first, so grabbing something back
+    /// (`A -> B`, then `B -> A`) cannot make a write chase its own tail.
+    pub fn forward_to(self: &Arc<Self>, next: &Arc<ProcessChannel>) {
+        if Arc::ptr_eq(self, next) {
+            return;
+        }
+        with_irqs_disabled(|| {
+            let mut theirs = next.forward.lock();
+            if theirs.as_ref().is_some_and(|f| Arc::ptr_eq(f, self)) {
+                *theirs = None;
+                next.forwarding.store(false, Ordering::Release);
+            }
+        });
+        with_irqs_disabled(|| *self.forward.lock() = Some(next.clone()));
+        self.forwarding.store(true, Ordering::Release);
+        // Output buffered before the link existed.
+        let pending = fifo_drain_all(&self.buffer);
+        if !pending.is_empty() {
+            next.write(&pending);
+        }
     }
 
     /// Read available data from the channel (non-blocking)
