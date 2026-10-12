@@ -16,7 +16,10 @@
 //! which `e2fsck` reported after the guest's hard reboot. The RTC is a
 //! seed, not the truth — it drifts, and may hold local time on a machine
 //! that dual-boots Windows — so SNTP still runs and overrides it
-//! ([`RTC_ONLY`]).
+//! ([`RTC_ONLY`]), and once it has, the chip is **written back**
+//! ([`write_rtc_from_sntp`], as Linux's `sync_cmos_clock` does) so the next
+//! offline boot seeds from a corrected clock. Only SNTP writes it: a ring-3
+//! `settimeofday` sets the kernel's clock and nothing else, as on Linux.
 //!
 //! # What this file is, after C3
 //!
@@ -160,56 +163,118 @@ pub fn seed_from_rtc() {
     if is_synced() {
         return;
     }
-    /// The CMOS index/data ports. Nothing else in this kernel touches them.
-    struct Ports;
-    impl akuma_cmos_rtc::Cmos for Ports {
-        fn read(&mut self, reg: u8) -> u8 {
-            // SAFETY: 0x70/0x71 are the CMOS/RTC index and data ports on every
-            // PC; selecting a register below 0x40 and reading it has no side
-            // effect but on the index latch, which nothing else here uses.
-            // Bit 7 of the index (NMI disable) is left clear.
-            unsafe {
-                crate::port::outb(0x70, reg & 0x7f);
-                crate::port::inb(0x71)
-            }
-        }
-    }
     match akuma_cmos_rtc::read(&mut Ports) {
         Ok(dt) => match akuma_cmos_rtc::unix_seconds(&dt) {
             Some(secs) => {
                 set_unix_us(secs * 1_000_000);
                 RTC_ONLY.store(true, Ordering::Relaxed);
                 serial::puts("  clock: seeded from the CMOS RTC (");
-                serial::put_dec(u64::from(dt.year));
-                serial::puts("-");
-                serial::put_dec(u64::from(dt.month));
-                serial::puts("-");
-                serial::put_dec(u64::from(dt.day));
-                serial::puts(" ");
-                serial::put_dec(u64::from(dt.hour));
-                serial::puts(":");
-                serial::put_dec(u64::from(dt.minute));
-                serial::puts(" UTC); SNTP will correct it
-");
+                put_date(&dt);
+                serial::puts(" UTC); SNTP will correct it\n");
             }
             None => {
                 serial::puts("  clock: CMOS RTC says year ");
                 serial::put_dec(u64::from(dt.year));
-                serial::puts(" — not believed (dead battery?); waiting for SNTP
-");
+                serial::puts(" — not believed (dead battery?); waiting for SNTP\n");
             }
         },
         Err(e) => {
             serial::puts(match e {
-                akuma_cmos_rtc::Error::UpdateNeverEnded => "  clock: CMOS RTC never finished updating; waiting for SNTP
-",
-                akuma_cmos_rtc::Error::Unstable => "  clock: CMOS RTC reads never agreed; waiting for SNTP
-",
-                akuma_cmos_rtc::Error::Malformed => "  clock: CMOS RTC holds no date; waiting for SNTP
-",
+                akuma_cmos_rtc::Error::UpdateNeverEnded => "  clock: CMOS RTC never finished updating; waiting for SNTP\n",
+                akuma_cmos_rtc::Error::Unstable => "  clock: CMOS RTC reads never agreed; waiting for SNTP\n",
+                akuma_cmos_rtc::Error::Malformed
+                | akuma_cmos_rtc::Error::OutOfRange
+                | akuma_cmos_rtc::Error::ReadBackDiffers => "  clock: CMOS RTC holds no date; waiting for SNTP\n",
             });
         }
     }
+}
+
+/// The CMOS index/data ports. Nothing else in this kernel touches them, and
+/// the two users here never overlap: [`seed_from_rtc`] runs at boot before
+/// the netpoll daemon exists, [`write_rtc_from_sntp`] from that daemon (or
+/// the boot one-shot, same thread as the seed) afterwards.
+struct Ports;
+
+impl akuma_cmos_rtc::Cmos for Ports {
+    fn read(&mut self, reg: u8) -> u8 {
+        // SAFETY: 0x70/0x71 are the CMOS/RTC index and data ports on every
+        // PC; selecting a register below 0x40 and reading it has no side
+        // effect but on the index latch, which nothing else here uses.
+        // Bit 7 of the index (NMI disable) is left clear.
+        unsafe {
+            crate::port::outb(0x70, reg & 0x7f);
+            crate::port::inb(0x71)
+        }
+    }
+    fn write(&mut self, reg: u8, v: u8) {
+        // SAFETY: as `read`. The crate writes only the clock's own registers
+        // (0x00–0x09, 0x32) and the SET bit of status B, under SET, in the
+        // format the chip was found in; nothing here can reach the chip's
+        // alarm, interrupt enables or the NVRAM the firmware keeps past 0x32.
+        unsafe {
+            crate::port::outb(0x70, reg & 0x7f);
+            crate::port::outb(0x71, v);
+        }
+    }
+}
+
+/// `net::uptime_us` before which [`write_rtc_from_sntp`] does nothing again:
+/// Linux's `sync_cmos_clock` interval. SNTP succeeds once per boot today, so
+/// this guards a future caller, not a present one.
+const RTC_WRITE_INTERVAL_US: u64 = 11 * 60 * 1_000_000;
+static NEXT_RTC_WRITE_US: AtomicU64 = AtomicU64::new(0);
+
+/// Write the synced wall clock to the CMOS RTC, so the next boot with no
+/// network seeds from a corrected clock ([`seed_from_rtc`]). Only from an
+/// SNTP success — never from `settimeofday`/`clock_settime`/`adjtimex`,
+/// which is `hwclock --systohc`'s job on Linux too. Whole seconds; the chip
+/// drifts more than that between boots. Read back by the crate before it
+/// reports success; one line either way.
+fn write_rtc_from_sntp() {
+    let now = crate::net::uptime_us();
+    if now < NEXT_RTC_WRITE_US.load(Ordering::Relaxed) {
+        return;
+    }
+    NEXT_RTC_WRITE_US.store(now.saturating_add(RTC_WRITE_INTERVAL_US), Ordering::Relaxed);
+    let Some(dt) = akuma_cmos_rtc::civil_from_unix(now_us() / 1_000_000) else {
+        serial::puts("  clock: SNTP time is outside the years the CMOS RTC seed would believe; not written\n");
+        return;
+    };
+    match akuma_cmos_rtc::write(&mut Ports, &dt) {
+        Ok(()) => {
+            serial::puts("  clock: CMOS RTC written from SNTP (");
+            put_date(&dt);
+            serial::puts(" UTC) and read back\n");
+        }
+        Err(e) => {
+            serial::puts("  clock: CMOS RTC not written: ");
+            serial::puts(match e {
+                akuma_cmos_rtc::Error::OutOfRange => "date out of range",
+                akuma_cmos_rtc::Error::ReadBackDiffers => "read back differs (no chip, or it dropped the write)",
+                akuma_cmos_rtc::Error::UpdateNeverEnded => "it never finished updating",
+                akuma_cmos_rtc::Error::Unstable => "reads never agreed",
+                akuma_cmos_rtc::Error::Malformed => "it holds no date after the write",
+            });
+            serial::puts("\n");
+        }
+    }
+}
+
+/// `YYYY-M-D H:MM`-ish, for the lines above.
+fn put_date(dt: &akuma_cmos_rtc::DateTime) {
+    serial::put_dec(u64::from(dt.year));
+    serial::puts("-");
+    serial::put_dec(u64::from(dt.month));
+    serial::puts("-");
+    serial::put_dec(u64::from(dt.day));
+    serial::puts(" ");
+    serial::put_dec(u64::from(dt.hour));
+    serial::puts(":");
+    if dt.minute < 10 {
+        serial::puts("0");
+    }
+    serial::put_dec(u64::from(dt.minute));
 }
 
 /// SNTP server. A public pool rather than a fixed IP: `pool.ntp.org` round-
@@ -381,6 +446,7 @@ fn report_outcome(outcome: SyncOutcome, ctx: &str) {
             serial::puts(", ");
             serial::puts(ctx);
             serial::puts(")\n");
+            write_rtc_from_sntp();
         }
         SyncOutcome::DnsFailed => {
             serial::puts("  clock: ");

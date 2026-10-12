@@ -131,10 +131,17 @@ protocols) reads it through `akuma-cmos-rtc` — UIP wait, consistent double
 read, BCD/binary and 12/24-hour decode, the century register, a plausibility
 window of 2025–2099 so a dead battery's 2000-01-01 is not believed — before
 anything is mounted. It is a seed: `sync_tick` keeps trying SNTP while the
-clock is RTC-only and SNTP overrides it. Firecracker and `microvm` have no
-CMOS, read as "holds no date", and wait for SNTP as before. Before this, a
-boot without a network stamped every inode 1970 and every unlinked inode
-with a zero `dtime` (`archive/WIFI_FUZZ_AND_LOSSY_SIM.md` § "The clock").
+clock is RTC-only and SNTP overrides it — and **once SNTP has synced, the
+chip is written back** (`write_rtc_from_sntp`: SET bit, the chip's own
+BCD/binary and 12/24-hour format, century, then read back and compared to
+the second), as Linux's `sync_cmos_clock` does, so the next offline boot
+seeds from a corrected clock. Only SNTP writes it; `clock_settime`,
+`settimeofday` and `adjtimex` set the kernel's clock and nothing else, as on
+Linux (`hwclock --systohc` is the user's call there). Firecracker has no
+CMOS, reads as "holds no date" and waits for SNTP as before; QEMU `microvm`
+does have one. Before this, a boot without a network stamped every inode
+1970 and every unlinked inode with a zero `dtime`
+(`archive/WIFI_FUZZ_AND_LOSSY_SIM.md` § "The clock").
 
 `try_bootstrap_clock` (`#[cfg(feature = "smoltcp")]`, a stub returning
 `Err(...)` otherwise) itself does no logging — it returns

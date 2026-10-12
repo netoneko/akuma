@@ -199,6 +199,38 @@ mounts. The RTC is a seed: `RTC_ONLY` keeps `sync_tick` trying SNTP, which
 overrides it. Ryzen's CMOS holds UTC (`timedatectl`: `RTC in local TZ: no`).
 Entry 7 rerun with the seeded kernel: see the row in
 `overlays/ryzen/README.md`.
+
+**Written back from SNTP (2026-10-13).** The chip was read and never
+written, so a machine whose CMOS was wrong (a replaced battery, a firmware
+reset to 2000-01-01) would stay at 1970 on every offline boot for ever.
+`akuma_cmos_rtc::write` is the mirror of the decode — SET bit, the format
+the chip was found in, century, read back and compared to the second — and
+`amd64::clock::write_rtc_from_sntp` calls it from `report_outcome` on an SNTP
+success, rate-limited to Linux's 11 minutes; nothing else writes the chip.
+Proven on the local `microvm` rig booted with `-rtc base=2030-06-15T12:00:00`
+and user-mode networking (`SSH_PORT=2299 FEATURES=no-tests sh amd64/run.sh
+-rtc base=2030-06-15T12:00:00`), 2026-10-13:
+
+```
+  clock: seeded from the CMOS RTC (2030-6-15 12:00 UTC); SNTP will correct it
+  clock: synced via SNTP (pool.ntp.org, boot)
+  clock: CMOS RTC written from SNTP (2026-10-12 21:22 UTC) and read back
+  net:  netpoll daemon spawned in slot 1
+```
+
+Not run on the metal: ryzen's rehearsal has no network, and the laptop has
+not booted this kernel.
+
+**Found on the way: the PVH `no-tests` boot had no network bring-up.** The
+first attempt at this run sat for fifteen minutes with an address and no
+SNTP attempt at all, failed or otherwise. `main.rs`'s `kmain` under
+`no-tests` ran `boot::late_init` and went straight to `init`: no
+`settle_for_dhcp`, no `sync_via_sntp`, no `spawn_netpoll` — so no SNTP
+retry, no memory watchdog, no netpoll RX pump either; the address came from
+the socket waits' own polling. The multiboot2 entry's `boot_to_init` has had
+that block since 2026-09-05; the PVH entry now runs the same three calls
+after `late_init`. `FEATURES=no-tests sh amd64/run.sh` is the configuration
+`run.sh`'s own comment says exists so it cannot rot; it had.
 - `trace_tcp` is still in the kernel file, untested on the host.
 - The station daemon's timing policies (dwell, `MGMT_TRIES`, `JOIN_ATTEMPTS`,
   the beacon-loss grace, the rejoin backoff, `BAD_BSS`) are still only in

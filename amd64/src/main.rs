@@ -337,6 +337,22 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 smp::start_secondaries(machine.madt.as_ref());
             }
         });
+        // The network's bring-up the suite would otherwise have done on the way
+        // past, the same block `multiboot2::boot_to_init` runs: DHCP, then the
+        // wall clock, then the netpoll daemon (which carries the SNTP retry,
+        // the memory watchdog and the RX pump). Until 2026-10-13 this path had
+        // none of it — a `FEATURES=no-tests sh amd64/run.sh` guest got an
+        // address from the socket waits' own polling and never an SNTP
+        // attempt, found when the CMOS write-back could not be exercised here.
+        if have_net {
+            const SETTLE_BUDGET_MS: u64 = 8_000;
+            if net::settle_for_dhcp(SETTLE_BUDGET_MS) {
+                clock::sync_via_sntp();
+            } else {
+                serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
+            }
+            net::spawn_netpoll();
+        }
     }
 
     #[cfg(not(feature = "no-tests"))]

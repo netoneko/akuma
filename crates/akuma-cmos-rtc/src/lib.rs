@@ -9,11 +9,23 @@
 //! reports as "deleted inode has zero dtime" after a hard reboot (found by
 //! ryzen menu entry 7's fsck, `docs/archive/WIFI_FUZZ_AND_LOSSY_SIM.md`).
 //!
-//! This crate is the decode, host-tested; the kernel supplies the two port
-//! accesses through [`Cmos`] and anchors its wall clock with the result.
-//! SNTP still corrects it afterwards: a CMOS clock drifts seconds a month and
-//! may hold local time on a machine that dual-boots Windows (ryzen's holds
-//! UTC: `timedatectl` says `RTC in local TZ: no`).
+//! This crate is the decode and the encode, host-tested; the kernel supplies
+//! the port accesses through [`Cmos`], anchors its wall clock with [`read`]'s
+//! result, and once SNTP has synced writes the chip back with [`write`] so the
+//! next boot without a network starts from a corrected clock — what Linux's
+//! `sync_cmos_clock` does, and like it only from NTP, never from a ring-3
+//! `settimeofday` (that is `hwclock --systohc`'s job). SNTP still corrects the
+//! seed every boot: a CMOS clock drifts seconds a month and may hold local
+//! time on a machine that dual-boots Windows (ryzen's holds UTC: `timedatectl`
+//! says `RTC in local TZ: no`).
+//!
+//! # Writing it right (Linux's `mc146818_set_time`)
+//!
+//! Set **SET** (status B bit 7) so the chip stops updating, write every
+//! field in the format status B says the chip is in (BCD or binary, 12- or
+//! 24-hour) plus the century, clear SET. The date goes in as UTC, the
+//! format the chip was found in is kept, and [`write`] reads the chip back
+//! and refuses to report success unless it agrees.
 //!
 //! # Reading it right (Linux's `mc146818_get_time`)
 //!
@@ -41,9 +53,10 @@
 #![forbid(unsafe_code)]
 
 /// The two CMOS ports, as the caller implements them: select a register on
-/// `0x70`, read it on `0x71`.
+/// `0x70`, read or write it on `0x71`.
 pub trait Cmos {
     fn read(&mut self, reg: u8) -> u8;
+    fn write(&mut self, reg: u8, v: u8);
 }
 
 /// Register numbers.
@@ -61,6 +74,8 @@ pub mod reg {
 
 /// Status A: update in progress.
 const UIP: u8 = 1 << 7;
+/// Status B: updates stopped, registers may be written.
+const SET: u8 = 1 << 7;
 /// Status B: values are binary rather than BCD.
 const BINARY: u8 = 1 << 2;
 /// Status B: 24-hour mode.
@@ -90,7 +105,7 @@ pub struct DateTime {
 pub const EARLIEST_YEAR: u16 = 2025;
 pub const LATEST_YEAR: u16 = 2099;
 
-/// Why the clock was not read.
+/// Why the clock was not read, or not written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Status A never showed the update finished.
@@ -99,6 +114,11 @@ pub enum Error {
     Unstable,
     /// A field was not a BCD digit pair, or out of its range.
     Malformed,
+    /// The date to write is outside [`EARLIEST_YEAR`]..=[`LATEST_YEAR`], or
+    /// not a date at all.
+    OutOfRange,
+    /// Written, but the chip read back something else.
+    ReadBackDiffers,
 }
 
 /// The raw registers of one pass.
@@ -208,6 +228,74 @@ fn days_in_month(y: u16, m: u8) -> u8 {
     }
 }
 
+fn bcd_encode(v: u8) -> u8 {
+    ((v / 10) << 4) | (v % 10)
+}
+
+/// Encode one pass's registers for a chip in the format `status_b` says.
+fn encode(dt: &DateTime, status_b: u8) -> Raw {
+    let binary = status_b & BINARY != 0;
+    let num = |v: u8| if binary { v } else { bcd_encode(v) };
+    let hour = if status_b & HOUR_24 != 0 {
+        num(dt.hour)
+    } else {
+        // 12-hour mode: 0 is 12 AM, 12 is 12 PM, 13..23 are 1..11 PM.
+        let (h, pm) = match dt.hour {
+            0 => (12, false),
+            1..=11 => (dt.hour, false),
+            12 => (12, true),
+            _ => (dt.hour - 12, true),
+        };
+        num(h) | if pm { PM } else { 0 }
+    };
+    Raw {
+        sec: num(dt.second),
+        min: num(dt.minute),
+        hour,
+        day: num(dt.day),
+        month: num(dt.month),
+        year: num((dt.year % 100) as u8),
+        century: num((dt.year / 100) as u8),
+        status_b,
+    }
+}
+
+/// Write `dt` (UTC) to the chip, in the format the chip is already in, and
+/// read it back.
+///
+/// # Errors
+///
+/// [`Error::OutOfRange`] for a date this crate would not believe on reading
+/// (so a write can never produce a seed the next boot refuses), the read
+/// errors if the chip cannot be read afterwards, and
+/// [`Error::ReadBackDiffers`] if what it holds is not what was written — to
+/// the second, which allows the chip to have ticked once meanwhile.
+pub fn write(c: &mut impl Cmos, dt: &DateTime) -> Result<(), Error> {
+    if unix_seconds(dt).is_none() {
+        return Err(Error::OutOfRange);
+    }
+    let status_b = c.read(reg::STATUS_B);
+    let r = encode(dt, status_b);
+    // Stop the chip's updates for the duration of the write; the SET bit is
+    // the only bit of status B this touches (daylight saving, 24-hour and
+    // binary modes, the interrupt enables stay the chip's).
+    c.write(reg::STATUS_B, status_b | SET);
+    c.write(reg::SECONDS, r.sec);
+    c.write(reg::MINUTES, r.min);
+    c.write(reg::HOURS, r.hour);
+    c.write(reg::DAY, r.day);
+    c.write(reg::MONTH, r.month);
+    c.write(reg::YEAR, r.year);
+    c.write(reg::CENTURY, r.century);
+    c.write(reg::STATUS_B, status_b & !SET);
+    let back = read(c)?;
+    let (want, got) = (unix_seconds(dt).ok_or(Error::OutOfRange)?, unix_seconds(&back).ok_or(Error::ReadBackDiffers)?);
+    if got.abs_diff(want) > 1 {
+        return Err(Error::ReadBackDiffers);
+    }
+    Ok(())
+}
+
 /// Days from 1970-01-01 to `y-m-d` (Howard Hinnant's `days_from_civil`).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -217,6 +305,42 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// `y-m-d` for days since 1970-01-01 (Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// The civil UTC date and time for `secs` since the Unix epoch — `None`
+/// outside the years this crate believes, so what is written is always what
+/// the next boot will accept.
+#[must_use]
+pub fn civil_from_unix(secs: u64) -> Option<DateTime> {
+    let days = i64::try_from(secs / 86_400).ok()?;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    let year = u16::try_from(y).ok()?;
+    if !(EARLIEST_YEAR..=LATEST_YEAR).contains(&year) {
+        return None;
+    }
+    Some(DateTime {
+        year,
+        month: m as u8,
+        day: d as u8,
+        hour: (rem / 3600) as u8,
+        minute: (rem % 3600 / 60) as u8,
+        second: (rem % 60) as u8,
+    })
 }
 
 /// Seconds since the Unix epoch for `dt`, taken as UTC — or `None` when the
@@ -244,6 +368,9 @@ mod tests {
         uip_reads: u32,
         tear: bool,
         passes: u32,
+        /// Data-register writes that landed while SET was clear (must be 0).
+        unguarded_writes: u32,
+        writes: u32,
     }
 
     impl Chip {
@@ -258,7 +385,7 @@ mod tests {
             regs[reg::YEAR as usize] = enc(y);
             regs[reg::CENTURY as usize] = 0x20;
             regs[reg::STATUS_B as usize] = HOUR_24;
-            Self { regs, uip_reads: 0, tear: false, passes: 0 }
+            Self { regs, uip_reads: 0, tear: false, passes: 0, unguarded_writes: 0, writes: 0 }
         }
     }
 
@@ -280,6 +407,13 @@ mod tests {
                 return v.wrapping_sub(1);
             }
             v
+        }
+        fn write(&mut self, r: u8, v: u8) {
+            if r != reg::STATUS_B && self.regs[reg::STATUS_B as usize] & SET == 0 {
+                self.unguarded_writes += 1;
+            }
+            self.writes += 1;
+            self.regs[usize::from(r)] = v;
         }
     }
 
@@ -360,6 +494,70 @@ mod tests {
     }
 
     #[test]
+    fn write_round_trips_in_every_chip_format() {
+        let dt = DateTime { year: 2031, month: 2, day: 28, hour: 23, minute: 59, second: 58 };
+        for status_b in [HOUR_24, BINARY | HOUR_24, 0, BINARY] {
+            let mut c = Chip::bcd(26, 1, 1, 0, 0, 0);
+            c.regs[reg::STATUS_B as usize] = status_b;
+            write(&mut c, &dt).unwrap();
+            assert_eq!(read(&mut c).unwrap(), dt, "status B {status_b:#x}");
+            assert_eq!(c.unguarded_writes, 0, "every data write under SET");
+            assert_eq!(c.regs[reg::STATUS_B as usize], status_b, "SET cleared, the rest kept");
+            assert_eq!(c.regs[reg::CENTURY as usize], if status_b & BINARY != 0 { 20 } else { 0x20 });
+            assert_eq!(c.writes, 9);
+        }
+        // Noon and midnight in 12-hour mode, the two the PM bit gets wrong.
+        for hour in [0u8, 12, 1, 13, 11, 23] {
+            let mut c = Chip::bcd(26, 1, 1, 0, 0, 0);
+            c.regs[reg::STATUS_B as usize] = 0;
+            let dt = DateTime { hour, ..dt };
+            write(&mut c, &dt).unwrap();
+            assert_eq!(read(&mut c).unwrap().hour, hour);
+        }
+    }
+
+    #[test]
+    fn write_refuses_what_read_would_not_believe() {
+        let mut c = Chip::bcd(26, 1, 1, 0, 0, 0);
+        let before = c.regs;
+        let bad = DateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
+        assert_eq!(write(&mut c, &bad), Err(Error::OutOfRange));
+        assert_eq!(c.regs, before, "nothing written");
+        assert_eq!(c.writes, 0);
+        // A chip that drops writes is caught by the read-back.
+        struct Stuck(Chip);
+        impl Cmos for Stuck {
+            fn read(&mut self, r: u8) -> u8 {
+                self.0.read(r)
+            }
+            fn write(&mut self, r: u8, v: u8) {
+                if r == reg::STATUS_B {
+                    self.0.write(r, v);
+                }
+            }
+        }
+        let mut s = Stuck(Chip::bcd(26, 1, 1, 0, 0, 0));
+        let dt = DateTime { year: 2040, month: 6, day: 1, hour: 1, minute: 2, second: 3 };
+        assert_eq!(write(&mut s, &dt), Err(Error::ReadBackDiffers));
+    }
+
+    #[test]
+    fn civil_from_unix_inverts_unix_seconds_across_the_window() {
+        assert_eq!(civil_from_unix(1_791_837_602), Some(DateTime { year: 2026, month: 10, day: 12, hour: 20, minute: 40, second: 2 }));
+        assert_eq!(civil_from_unix(1_735_689_600), Some(DateTime { year: 2025, month: 1, day: 1, hour: 0, minute: 0, second: 0 }));
+        assert_eq!(civil_from_unix(1_735_689_599), None, "2024-12-31");
+        assert_eq!(civil_from_unix(4_102_444_800), None, "2100-01-01");
+        // Every 7th day plus an odd offset from 2025 to 2099, both ways.
+        let mut t = 1_735_689_600u64 + 12_345;
+        while t < 4_102_444_800 {
+            let dt = civil_from_unix(t).unwrap();
+            assert_eq!(unix_seconds(&dt), Some(t), "{dt:?}");
+            assert!(dt.day <= days_in_month(dt.year, dt.month));
+            t += 7 * 86_400 + 3_601;
+        }
+    }
+
+    #[test]
     fn a_chip_that_never_agrees_is_given_up_on() {
         struct Noisy(u8);
         impl Cmos for Noisy {
@@ -370,6 +568,7 @@ mod tests {
                 self.0 = self.0.wrapping_add(1);
                 self.0
             }
+            fn write(&mut self, _: u8, _: u8) {}
         }
         assert_eq!(read(&mut Noisy(0)), Err(Error::Unstable));
     }
