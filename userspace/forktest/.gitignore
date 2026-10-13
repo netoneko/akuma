@@ -53,3 +53,10 @@ c_stress/neonstate
 # output and the binary stay out of the tree.
 c_stress/rodatacheck
 c_stress/rodatacheck.c
+# Permission / hard-link / rename probes (docs/archive/UNIX_PERMISSIONS.md,
+# HARD_LINKS.md, BOX_BUILD.md §7). Built by userspace/build.sh; the .x86_64
+# builds are for the amd64 metal runs.
+c_stress/permprobe
+c_stress/linkprobe
+c_stress/renameprobe
+c_stress/*.x86_64
