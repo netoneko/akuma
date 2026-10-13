@@ -3375,3 +3375,45 @@ fn a_renamed_symlink_keeps_its_directory_entry_type() {
     let e = fs.read_dir("/").unwrap().into_iter().find(|e| e.name == "l2").unwrap();
     assert!(e.is_symlink, "was reported as a regular file after rename");
 }
+
+// ── Directory rename (docs/archive/BOX_BUILD.md §5 step 3) ──────────
+
+#[test]
+fn renaming_a_directory_to_another_parent_repoints_dotdot_and_link_counts() {
+    let fs = mount_empty();
+    fs.create_dir("/a").unwrap();
+    fs.create_dir("/b").unwrap();
+    fs.create_dir("/a/d").unwrap();
+    fs.write_file("/a/d/f", b"x").unwrap();
+    let (a, b) = (fs.metadata("/a").unwrap().inode, fs.metadata("/b").unwrap().inode);
+    assert_eq!(fs.metadata("/a").unwrap().nlink(), 3);
+
+    fs.rename("/a/d", "/b/d").unwrap();
+
+    assert_eq!(fs.read_file("/b/d/f").unwrap(), b"x");
+    assert_eq!(fs.metadata("/b/d/..").unwrap().inode, b, "`..` follows the move");
+    assert_ne!(fs.metadata("/b/d/..").unwrap().inode, a);
+    assert_eq!(fs.metadata("/a").unwrap().nlink(), 2, "old parent lost a subdirectory");
+    assert_eq!(fs.metadata("/b").unwrap().nlink(), 3, "new parent gained one");
+}
+
+#[test]
+fn renaming_a_directory_onto_an_empty_one_replaces_it_and_onto_a_full_one_fails() {
+    let fs = mount_empty();
+    fs.create_dir("/src").unwrap();
+    fs.write_file("/src/f", b"x").unwrap();
+    fs.create_dir("/empty").unwrap();
+    fs.create_dir("/full").unwrap();
+    fs.write_file("/full/g", b"y").unwrap();
+    fs.write_file("/file", b"z").unwrap();
+    let root_links = fs.metadata("/").unwrap().nlink();
+
+    assert_eq!(fs.rename("/src", "/full"), Err(akuma_vfs::FsError::DirectoryNotEmpty));
+    assert_eq!(fs.rename("/src", "/file"), Err(akuma_vfs::FsError::NotADirectory));
+    assert_eq!(fs.rename("/file", "/empty"), Err(akuma_vfs::FsError::NotAFile));
+
+    fs.rename("/src", "/empty").unwrap();
+    assert_eq!(fs.read_file("/empty/f").unwrap(), b"x");
+    assert!(!fs.exists("/src"));
+    assert_eq!(fs.metadata("/").unwrap().nlink(), root_links - 1, "one subdirectory fewer");
+}

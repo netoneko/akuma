@@ -482,6 +482,18 @@ impl Filesystem for OverlayFs {
             return Err(FsError::DirectoryNotEmpty);
         }
         if found.is_upper() {
+            // The merged view is empty, so whatever the upper copy still holds
+            // is bookkeeping: whiteouts for lower names deleted through this
+            // overlay, and possibly an opaque marker. They have to go first or
+            // the upper `rmdir` is `DirectoryNotEmpty` — which is how `rm -rf`
+            // (and `mv`'s copy-then-delete fallback) failed on any directory
+            // that came from an image layer. Linux overlayfs clears them the
+            // same way.
+            for e in self.upper.read_dir(path)? {
+                if e.name.starts_with(WHITEOUT_PREFIX) {
+                    self.upper.remove_file(&join(path, &e.name))?;
+                }
+            }
             self.upper.remove_dir(path)?;
             if self.find(path).is_some() {
                 self.write_whiteout(path)?;
@@ -549,14 +561,26 @@ impl Filesystem for OverlayFs {
         self.upper.fallocate(path, mode, offset, len)
     }
 
-    /// Files only. Renaming a directory that exists in a lower layer means
-    /// copying its whole subtree up before the rename and whiting out every
-    /// lower name underneath it; until a caller needs that, refusing is better
-    /// than half-doing it.
+    /// A file is copied up and renamed in upper, with a whiteout where a lower
+    /// layer still has the old name.
+    ///
+    /// A directory is renamed only when it lives in the upper layer alone. One
+    /// that any lower layer also has — or a target name a lower layer has —
+    /// would need its whole subtree copied up and every lower name under it
+    /// whited out; this answers `CrossDevice` instead, which is exactly what
+    /// Linux overlayfs does without `redirect_dir` and what makes `mv` fall
+    /// back to copy-and-delete. It answered `NotSupported` (→ `EIO`) until
+    /// 2026-10-14, for upper-only directories too, so `mv dir newname` failed
+    /// outright in every container — the first thing a Dockerfile `RUN` that
+    /// unpacks and renames a release tarball does.
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
         let found = self.find(old_path).ok_or(FsError::NotFound)?;
         if self.layer(found.layer).metadata(old_path).is_ok_and(|m| m.is_dir) {
-            return Err(FsError::NotSupported);
+            if self.lowers.iter().any(|l| l.exists(old_path) || l.exists(new_path)) {
+                return Err(FsError::CrossDevice);
+            }
+            self.copy_up_parents(new_path)?;
+            return self.upper.rename(old_path, new_path);
         }
 
         self.copy_up(old_path)?;
@@ -914,10 +938,24 @@ mod tests {
     }
 
     #[test]
-    fn renaming_a_directory_is_refused_rather_than_half_done() {
+    fn renaming_a_lower_directory_is_exdev_so_mv_copies_instead() {
         let fs = overlay(&[], &[&[("/opt/app/f", "x")]]);
-        assert_eq!(fs.rename("/opt/app", "/opt/app2").unwrap_err(), FsError::NotSupported);
-        assert_eq!(read(&fs, "/opt/app/f"), "x");
+        assert_eq!(fs.rename("/opt/app", "/opt/app2").unwrap_err(), FsError::CrossDevice);
+        assert_eq!(read(&fs, "/opt/app/f"), "x", "nothing half-done");
+    }
+
+    #[test]
+    fn renaming_an_upper_only_directory_just_renames_it() {
+        let fs = overlay(&[("/tmp/build-1.2/bin/tool", "t")], &[&[("/etc/os-release", "x")]]);
+        fs.rename("/tmp/build-1.2", "/opt/build").unwrap();
+        assert_eq!(read(&fs, "/opt/build/bin/tool"), "t");
+        assert!(!fs.exists("/tmp/build-1.2"));
+    }
+
+    #[test]
+    fn renaming_onto_a_name_a_lower_layer_has_is_exdev() {
+        let fs = overlay(&[("/new/f", "n")], &[&[("/opt/x", "lower")]]);
+        assert_eq!(fs.rename("/new", "/opt").unwrap_err(), FsError::CrossDevice);
     }
 
     #[test]
@@ -1072,5 +1110,22 @@ mod tests {
         assert_eq!(fs.link("/bin/tool", "/bin/tool"), Err(FsError::AlreadyExists));
         assert_eq!(fs.link("/bin", "/bin2"), Err(FsError::PermissionDenied));
         assert_eq!(fs.link("/nope", "/x"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn remove_dir_clears_the_whiteouts_its_own_deletions_left() {
+        // `rm -rf` of a lower directory: unlink each file (whiteouts in upper),
+        // then rmdir. The upper copy holds only whiteouts and must go.
+        let lower = layer(&[("/etc/apk/keys/a.pub", "k"), ("/etc/apk/arch", "x")]);
+        let upper = layer(&[]);
+        let fs = OverlayFs::new(upper.clone(), alloc::vec![lower.clone()]);
+        fs.remove_file("/etc/apk/keys/a.pub").unwrap();
+        assert!(upper.exists("/etc/apk/keys/.wh.a.pub"));
+        fs.remove_dir("/etc/apk/keys").unwrap();
+        fs.remove_file("/etc/apk/arch").unwrap();
+        fs.remove_dir("/etc/apk").unwrap();
+        assert!(!fs.exists("/etc/apk"));
+        assert!(upper.exists("/etc/.wh.apk"), "the lower directory stays hidden");
+        assert!(lower.exists("/etc/apk/keys/a.pub"), "lower untouched");
     }
 }

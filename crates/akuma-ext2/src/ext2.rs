@@ -2378,6 +2378,57 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
     }
 
+    /// Whether a directory holds anything but `.` and `..`.
+    fn dir_has_entries(&self, state: &Ext2State, inode: &Inode) -> Result<bool, FsError> {
+        let dir_data = self.read_inode_data(state, inode)?;
+        Ok(self
+            .parse_directory(&dir_data)
+            .iter()
+            .any(|(_, n, _)| n != "." && n != ".."))
+    }
+
+    /// Unlink an empty directory `name` (inode `inode_num`) from `parent` and
+    /// free it: the second half of `rmdir`, shared with `rename` replacing an
+    /// empty directory. The caller has checked emptiness and holds the write
+    /// lock; it also flushes.
+    fn drop_empty_dir(
+        &self,
+        state: &mut Ext2State,
+        parent_inode_num: u32,
+        name: &str,
+        inode_num: u32,
+        inode: &mut Inode,
+    ) -> Result<(), FsError> {
+        // Remove directory entry from parent
+        self.remove_dir_entry(state, parent_inode_num, name)?;
+
+        // Update parent's hard link count
+        let mut parent_inode = self.read_inode(state, parent_inode_num)?;
+        parent_inode.hard_links = parent_inode.hard_links.saturating_sub(1);
+        self.write_inode(state, parent_inode_num, &parent_inode)?;
+
+        // Free blocks
+        self.truncate_inode(state, inode)?;
+        // A directory carries `hard_links = 2` while it exists (`.` plus the
+        // parent's entry). Both are gone now, so the record must say so before
+        // the number returns to the allocator: `e2fsck` reads a `links_count`
+        // that survives a set `dtime` as corruption ("in use, but has dtime
+        // set"), and every `rmdir` used to leave one behind — 15 of them in a
+        // single `ext2probe-host` run, reproducible on the host after an
+        // explicit `sync()`. `unlink` never had the bug because its caller
+        // decrements to zero before `release_last_link` writes the inode
+        // (see `Self::unlink`); this path only ever decremented the *parent's*
+        // count. `docs/archive/BKL_VFS_CARVE_OUT.md` §12.4 attributed the same
+        // signature to a dirty bitmap block lost to a `kill`; that reading is
+        // superseded — see `docs/archive/AKUMA_EXT2_CLEANUP.md` §6.1.
+        inode.hard_links = 0;
+        inode.deletion_time = self.current_time();
+        self.write_inode(state, inode_num, inode)?;
+
+        // Free inode
+        self.free_inode(state, inode_num, true)
+    }
+
     /// Drop the last directory-entry reference to `inode_num`, whose link count
     /// the caller has already decremented to zero, and write the inode back.
     ///
@@ -3997,35 +4048,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Err(FsError::DirectoryNotEmpty);
         }
 
-        // Remove directory entry from parent
-        self.remove_dir_entry(&mut state, parent_inode_num, &name)?;
-
-        // Update parent's hard link count
-        let mut parent_inode = self.read_inode(&state, parent_inode_num)?;
-        parent_inode.hard_links = parent_inode.hard_links.saturating_sub(1);
-        self.write_inode(&state, parent_inode_num, &parent_inode)?;
-
-        // Free blocks
-        self.truncate_inode(&mut state, &mut inode)?;
-        // A directory carries `hard_links = 2` while it exists (`.` plus the
-        // parent's entry). Both are gone now, so the record must say so before
-        // the number returns to the allocator: `e2fsck` reads a `links_count`
-        // that survives a set `dtime` as corruption ("in use, but has dtime
-        // set"), and every `rmdir` used to leave one behind — 15 of them in a
-        // single `ext2probe-host` run, reproducible on the host after an
-        // explicit `sync()`. `unlink` never had the bug because its caller
-        // decrements to zero before `release_last_link` writes the inode
-        // (see `Self::unlink`); this path only ever decremented the *parent's*
-        // count. `docs/archive/BKL_VFS_CARVE_OUT.md` §12.4 attributed the same
-        // signature to a dirty bitmap block lost to a `kill`; that reading is
-        // superseded — see `docs/archive/AKUMA_EXT2_CLEANUP.md` §6.1.
-        inode.hard_links = 0;
-        inode.deletion_time = self.current_time();
-        self.write_inode(&state, inode_num, &inode)?;
-
-        // Free inode
-        self.free_inode(&mut state, inode_num, true)?;
-
+        self.drop_empty_dir(&mut state, parent_inode_num, &name, inode_num, &mut inode)?;
         self.flush_meta(&mut state)?;
         Ok(())
     }
@@ -4072,6 +4095,15 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         false
     }
 
+    /// `rename(2)`.
+    ///
+    /// Directories follow Linux's rules since 2026-10-14. Before that a
+    /// directory moved to another parent kept its `..` pointing at the old one
+    /// and both parents' link counts went stale, and a rename onto a non-empty
+    /// directory "succeeded" by dropping the destination's entry — orphaning
+    /// everything under it. Now: directory over non-directory is `ENOTDIR`,
+    /// the reverse `EISDIR`, over a non-empty directory `ENOTEMPTY`, into its
+    /// own subtree `EINVAL`; an empty destination directory is replaced.
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
         let src_inode_num = self.lookup_path(old_path)?;
         let (src_parent, src_name) = self.lookup_parent(old_path)?;
@@ -4079,10 +4111,18 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         let mut state = self.write_state();
         let src_inode = self.read_inode(&state, src_inode_num)?;
+        let src_is_dir = (src_inode.type_perms & 0xF000) == S_IFDIR;
         // The entry's type travels with the inode. This was "directory, else
         // regular file", so a renamed symlink or socket came back from
         // `getdents64` as `DT_REG`.
         let ft = dirent_type(src_inode.type_perms);
+
+        if src_is_dir {
+            let old = old_path.trim_end_matches('/');
+            if new_path.len() > old.len() && new_path.starts_with(old) && new_path.as_bytes()[old.len()] == b'/' {
+                return Err(FsError::InvalidPath);
+            }
+        }
 
         // Retire anything whose readers have since gone away, for the reason
         // `remove_file` does it: renaming over a destination is an unlink, and a
@@ -4101,17 +4141,43 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                 return Ok(());
             }
             let mut dst_inode = self.read_inode(&state, dst_inode_num)?;
-            self.remove_dir_entry(&mut state, dst_parent, &dst_name)?;
-            dst_inode.hard_links = dst_inode.hard_links.saturating_sub(1);
-            if dst_inode.hard_links == 0 {
-                self.release_last_link(&mut state, dst_inode_num, &mut dst_inode)?;
-            } else {
-                self.write_inode(&state, dst_inode_num, &dst_inode)?;
+            let dst_is_dir = (dst_inode.type_perms & 0xF000) == S_IFDIR;
+            match (src_is_dir, dst_is_dir) {
+                (true, false) => return Err(FsError::NotADirectory),
+                (false, true) => return Err(FsError::NotAFile),
+                (true, true) => {
+                    if self.dir_has_entries(&state, &dst_inode)? {
+                        return Err(FsError::DirectoryNotEmpty);
+                    }
+                    self.drop_empty_dir(&mut state, dst_parent, &dst_name, dst_inode_num, &mut dst_inode)?;
+                }
+                (false, false) => {
+                    self.remove_dir_entry(&mut state, dst_parent, &dst_name)?;
+                    dst_inode.hard_links = dst_inode.hard_links.saturating_sub(1);
+                    if dst_inode.hard_links == 0 {
+                        self.release_last_link(&mut state, dst_inode_num, &mut dst_inode)?;
+                    } else {
+                        self.write_inode(&state, dst_inode_num, &dst_inode)?;
+                    }
+                }
             }
         }
 
         self.add_dir_entry(&mut state, dst_parent, &dst_name, src_inode_num, ft)?;
         self.remove_dir_entry(&mut state, src_parent, &src_name)?;
+
+        // A directory that changed parent: its `..` names the new parent, and
+        // the link each parent's count holds for it moves with it.
+        if src_is_dir && src_parent != dst_parent {
+            self.remove_dir_entry(&mut state, src_inode_num, "..")?;
+            self.add_dir_entry(&mut state, src_inode_num, "..", dst_parent, FT_DIR)?;
+            let mut old_parent = self.read_inode(&state, src_parent)?;
+            old_parent.hard_links = old_parent.hard_links.saturating_sub(1);
+            self.write_inode(&state, src_parent, &old_parent)?;
+            let mut new_parent = self.read_inode(&state, dst_parent)?;
+            new_parent.hard_links += 1;
+            self.write_inode(&state, dst_parent, &new_parent)?;
+        }
         self.flush_meta(&mut state)?;
 
         Ok(())

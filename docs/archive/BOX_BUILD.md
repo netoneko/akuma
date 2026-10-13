@@ -1,7 +1,7 @@
 # `box build` — Docker-compatible image builds on Akuma
 
 **Date:** 2026-10-14
-**Status:** Sketch. Nothing here is implemented.
+**Status:** Prerequisites 1–3 (§5) implemented 2026-10-14 — permissions ([`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) §11), hard links ([`HARD_LINKS.md`](HARD_LINKS.md) §4), directory rename (§7 below). The build itself (steps 4–13) is not started.
 **Depends on:** [`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) (steps 3–6) and
 [`HARD_LINKS.md`](HARD_LINKS.md). Built without them, every image would be
 `root:root` with hard links duplicated, and `USER`/`COPY --chown` would be no-ops.
@@ -174,6 +174,26 @@ clear error until then.
 - **Unverified today:** that `RUN` steps have outbound network (`apk add`). `box
   run` injects `resolv.conf` but this sketch did not check which stack a fresh box
   gets. Check first; it gates step 9.
+
+## 7. Prerequisite 3: directory rename in containers (2026-10-14)
+
+Sketched as "overlay directory rename → `EXDEV`". Doing it found three more
+faults on the same path, two of them in ext2 itself:
+
+| Fault | Effect | Fix |
+|---|---|---|
+| Overlay refused **every** directory rename with `NotSupported` → `EIO` — upper-only directories too | `mv dir newname` failed in every container, including for a directory the container had just made | A directory any lower layer has (or a target name one has) is `CrossDevice` → `EXDEV`, as Linux overlayfs without `redirect_dir`; `mv` falls back to copy-and-delete. Upper-only directories rename in place |
+| Overlay `rmdir` of a directory whose upper copy held only **whiteouts** was `ENOTEMPTY` | `rm -rf` of any image directory failed at the directory, so `mv`'s fallback failed too (`can't remove '/etc/apk/keys'`) | Merged view empty ⇒ remaining upper entries are whiteouts; clear them, then remove |
+| ext2 `rename` of a directory to **another parent** left `..` at the old parent and both parents' `st_nlink` stale | `cd ..` after `mv d other/` lands in the old parent; link counts disagree with `e2fsck` | Repoint `..`, move the link between the parents' counts |
+| ext2 `rename` onto a **non-empty directory** "succeeded" by dropping the destination's entry | Everything under the destination orphaned — leaked inodes and blocks; dir↔file renames unchecked | `ENOTEMPTY`, `ENOTDIR`, `EISDIR`, `EINVAL` (into own subtree) as Linux; an empty destination directory is replaced via the `rmdir` teardown (`drop_empty_dir`, now shared) |
+
+**Verification.** Host: ext2 +2, overlay +4. `renameprobe` (15 checks) is
+identical on Linux (Docker arm64), Akuma ext2 and inside an Akuma container on
+AArch64 QEMU, and on the amd64 trashcan; in a container `mv /etc/apk /etc/apk2`
+and `rm -rf /usr/share/apk` (both lower-layer) now work. On the metal the same
+kernel also passed `linkprobe` 23/23 and `permprobe` 50/50, and busybox `ln`
+(x86_64 `link`, 86) makes a real link. Boot suites: amd64 QEMU 807/0, AArch64
+Firecracker 299/1 (the pre-existing `thread_slot_reclaim_on_spawn`).
 
 ## Open questions
 

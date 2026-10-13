@@ -424,9 +424,13 @@ echo "Building permprobe (C, Unix permissions probe)..."
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o permprobe permprobe.c
     # linkprobe: hard links, Linux-identical (docs/archive/HARD_LINKS.md).
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o linkprobe linkprobe.c
+    # renameprobe: directory rename(2) semantics; takes a directory to work in,
+    # so it can also run inside a container's overlay (docs/archive/BOX_BUILD.md §7).
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o renameprobe renameprobe.c
 )
 cp forktest/c_stress/permprobe ../bootstrap/bin/
 cp forktest/c_stress/linkprobe ../bootstrap/bin/
+cp forktest/c_stress/renameprobe ../bootstrap/bin/
 
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
