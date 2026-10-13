@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libakuma::{
-    chmod, close, eprintln, mkdir_p, open, open_flags, print, print_dec, println, read_fd, symlink,
+    chmod, close, lchown, eprintln, mkdir_p, open, open_flags, print, print_dec, println, read_fd, symlink,
     write_fd,
 };
 use miniz_oxide::inflate;
@@ -128,7 +128,7 @@ fn extract_stream(
 
         if entry.kind == EntryKind::File {
             let written = write_entry_streaming(fd, &full_path, entry.size, opts.verbose);
-            chmod_entry(&full_path, &entry);
+            apply_attrs(&full_path, &entry);
             let padding = crate::format::padded_size(entry.size) - written;
             if padding > 0 {
                 read_skip(fd, padding);
@@ -261,6 +261,13 @@ fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
             if !mkdir_p(full_path) && verbose {
                 eprintln(&format!("tar: warning: failed to create directory {full_path}"));
             }
+            // A directory's mode matters as much as a file's: an image's `/tmp`
+            // is `1777`, and before this every extracted directory kept
+            // `mkdir`'s default instead. Applied now rather than deferred to
+            // the end of the archive, which is only safe because extraction
+            // runs as root — a non-root extractor would lock itself out of a
+            // `0555` directory before writing its contents.
+            apply_attrs(full_path, entry);
         }
         EntryKind::Symlink => {
             if verbose {
@@ -273,6 +280,9 @@ fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
             let ret = symlink(&entry.linkname, full_path);
             if ret < 0 && verbose {
                 eprintln(&format!("tar: warning: symlink {full_path}: errno {}", -ret));
+            }
+            if ret >= 0 {
+                apply_attrs(full_path, entry);
             }
         }
         EntryKind::HardLink => {
@@ -313,7 +323,7 @@ fn write_entry(full_path: &str, data: &[u8], entry: &Entry, verbose: bool) {
         write_fd(fd, data);
     }
     close(fd);
-    chmod_entry(full_path, entry);
+    apply_attrs(full_path, entry);
 }
 
 /// Copy `size` bytes from `fd` into a new file. Returns the bytes consumed from
@@ -355,13 +365,24 @@ fn write_entry_streaming(fd: i32, full_path: &str, size: usize, verbose: bool) -
     size - remaining
 }
 
-/// Apply the archived permission bits.
+/// Apply the archived owner and permission bits — owner first, as GNU tar
+/// does, so a kernel that clears set-id bits on `chown` cannot undo the mode.
 ///
-/// Skipping this is invisible until something checks: a shell's `PATH` search
-/// calls `access(X_OK)` and refuses a 0644 binary with "Permission denied",
-/// which is exactly how an extracted image fails to run its own commands.
-fn chmod_entry(full_path: &str, entry: &Entry) {
-    if entry.mode != 0 {
+/// Skipping the mode is invisible until something checks: a shell's `PATH`
+/// search calls `access(X_OK)` and refuses a 0644 binary with "Permission
+/// denied", which is exactly how an extracted image fails to run its own
+/// commands. Skipping the owner is invisible until an image checks *who* owns
+/// a path — postgres refuses a data directory it does not own.
+///
+/// Ownership is restored only when extracting as root (GNU tar's
+/// `--same-owner` default): anyone else may not give files away, and the
+/// attempt would just fail per entry. Symlinks get the owner but not a mode —
+/// `chmod` follows the link and would change its target.
+fn apply_attrs(full_path: &str, entry: &Entry) {
+    if libakuma::geteuid() == 0 && (entry.uid != 0 || entry.gid != 0) {
+        lchown(full_path, entry.uid, entry.gid);
+    }
+    if entry.mode != 0 && entry.kind != EntryKind::Symlink && entry.kind != EntryKind::HardLink {
         chmod(full_path, entry.mode);
     }
 }

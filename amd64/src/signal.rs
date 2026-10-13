@@ -1092,6 +1092,9 @@ pub fn sys_rt_sigreturn() -> u64 {
 /// `SIG_IGN` drops the signal, `SIGKILL` is unconditional, and a blocked signal
 /// pends rather than acting.
 pub fn sys_tkill(tid: u32, sig: u32) -> u64 {
+    if let Err(e) = akuma_syscalls_glue::signal::check_signal_tid(tid) {
+        return akuma_syscalls_glue::signal::deny_errno(e);
+    }
     if sig == 0 {
         return 0;
     }
@@ -1227,12 +1230,13 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
             if target == 1 && sig != 0 {
                 return errno::EPERM;
             }
+            // Box, then uid — before the `sig == 0` probe, so probing cannot
+            // find a process in a box the caller cannot see.
+            if let Err(e) = akuma_exec::process::check_signal_pid(target) {
+                return akuma_syscalls_glue::signal::deny_errno(e);
+            }
             if sig == 0 {
-                return if akuma_exec::process::lookup_process_shared(target).is_some() {
-                    0
-                } else {
-                    errno::ESRCH
-                };
+                return 0;
             }
             if pend_signal_to_group(target, sig) { 0 } else { errno::ESRCH }
         }
@@ -1263,16 +1267,32 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
                     count += 1;
                 }
             });
-            if count == 0 {
-                return errno::ESRCH;
-            }
-            if sig == 0 {
-                return 0;
-            }
+            // Filter outside the callback (it runs IRQs-off; `check_signal`
+            // takes the box-registry lock). Linux's rule for a group or
+            // `kill(-1)`: signal every member you may, succeed if that was at
+            // least one, else EPERM if something was only refused by uid and
+            // ESRCH if nothing reachable existed. Without this, `kill(-1, 9)`
+            // from inside a box killed every process on the machine.
+            let (mut sent, mut forbidden) = (0usize, false);
             for &t in &targets[..count] {
-                pend_signal_to_group(t, sig);
+                match akuma_exec::process::check_signal_pid(t) {
+                    Ok(()) => {
+                        if sig != 0 {
+                            pend_signal_to_group(t, sig);
+                        }
+                        sent += 1;
+                    }
+                    Err(akuma_exec::process::SignalDeny::Forbidden) => forbidden = true,
+                    Err(akuma_exec::process::SignalDeny::Invisible) => {}
+                }
             }
-            0
+            if sent > 0 {
+                0
+            } else if forbidden {
+                errno::EPERM
+            } else {
+                errno::ESRCH
+            }
         }
     }
 }

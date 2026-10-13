@@ -907,6 +907,7 @@ fn spawn_in_box(
         box_id,
         env_ptr: 0,
         env_len: 0,
+        ..Default::default()
     };
     let args_opt = if args.is_empty() { None } else { Some(args) };
     sys::spawn_ext_env(command, args_opt, env, None, &mut options)
@@ -1216,6 +1217,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                 box_id: 0,
                 env_ptr: 0,
                 env_len: 0,
+                ..Default::default()
             };
             sys::spawn_ext_env(&config.command, args_opt, env.as_deref(), None, &mut options)
         }

@@ -64,6 +64,8 @@ pub const JIFFY_US: u64 = 10_000;
 /// killed `redis:alpine`'s entrypoint. Stubbing `capset(2)` did not help,
 /// because `capset` was never the call that failed.
 pub const CAP_FULL_MASK: &str = "000001ffffffffff";
+/// No capabilities — every set of a process that is not uid 0.
+pub const CAP_EMPTY_MASK: &str = "0000000000000000";
 
 /// Linux truncates `comm` to 15 bytes plus a NUL (`TASK_COMM_LEN - 1`).
 pub const COMM_LEN: usize = 15;
@@ -130,6 +132,13 @@ pub struct ProcStat<'a> {
     /// Total CPU time in microseconds. Rendered as jiffies in `utime`; this
     /// kernel does not split user from system time, so `stime` reads 0.
     pub cpu_time_us: u64,
+    /// The process's credentials (real = effective = saved = fs here), for
+    /// `status`'s `Uid:`/`Gid:`/`Groups:` lines and its capability sets: uid 0
+    /// holds every capability, any other uid none — what Linux leaves after a
+    /// drop from root, and what `capget` answers.
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: &'a [u32],
 }
 
 impl ProcStat<'_> {
@@ -206,9 +215,9 @@ pub const STAT_LINE_MAX: usize = 256;
 
 /// `/proc/<pid>/status` — the human-readable form.
 ///
-/// Returns bytes written. `Uid`/`Gid` are all-zero (both kernels run everything
-/// as root) and the `Vm*` figures are 0 for the same reason `stat`'s memory
-/// fields are.
+/// Returns bytes written. `Uid`/`Gid` repeat one id four times because real,
+/// effective, saved and filesystem ids are one value in this kernel. The `Vm*`
+/// figures are 0 for the same reason `stat`'s memory fields are.
 ///
 /// One format string for every state. The four arms this replaced on the
 /// AArch64 side were identical apart from the state word and the zombie's
@@ -217,16 +226,24 @@ pub const STAT_LINE_MAX: usize = 256;
 pub fn render_status(p: &ProcStat, buf: &mut [u8]) -> usize {
     let name = p.comm();
     let state = p.state.status_text();
-    let (pid, ppid) = (p.pid, p.ppid);
+    let (pid, ppid, uid, gid) = (p.pid, p.ppid, p.uid, p.gid);
+    let held = if uid == 0 { CAP_FULL_MASK } else { CAP_EMPTY_MASK };
     let mut pos = 0usize;
     let mut w = FmtBuf { buf, pos: &mut pos };
     let _ = write!(
         w,
         "Name:\t{name}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\n\
-         VmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n\
-         CapInh:\t0000000000000000\nCapPrm:\t{CAP_FULL_MASK}\nCapEff:\t{CAP_FULL_MASK}\n\
-         CapBnd:\t{CAP_FULL_MASK}\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\n"
+         Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nFDSize:\t256\nGroups:\t"
+    );
+    // Linux's format: each group followed by one space, then the newline.
+    for g in p.groups {
+        let _ = write!(w, "{g} ");
+    }
+    let _ = write!(
+        w,
+        "\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n\
+         CapInh:\t{CAP_EMPTY_MASK}\nCapPrm:\t{held}\nCapEff:\t{held}\n\
+         CapBnd:\t{CAP_FULL_MASK}\nCapAmb:\t{CAP_EMPTY_MASK}\nNoNewPrivs:\t0\nSeccomp:\t0\n"
     );
     if let Some(code) = p.state.exit_code() {
         let _ = writeln!(w, "ExitCode:\t{code}");
@@ -234,7 +251,9 @@ pub fn render_status(p: &ProcStat, buf: &mut [u8]) -> usize {
     pos
 }
 
-/// A buffer size [`render_status`] can never overflow.
+/// A buffer size [`render_status`] can never overflow: under 500 bytes of fixed
+/// text and decimals, plus at most 32 groups (`akuma_isolation::creds::NGROUPS`)
+/// of up to 11 bytes each.
 pub const STATUS_MAX: usize = 1024;
 
 /// `/proc/<pid>/cmdline` — argv, each element NUL-terminated.

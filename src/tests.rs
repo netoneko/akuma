@@ -3600,6 +3600,7 @@ fn make_test_process(
             akuma_terminal::TerminalState::default(),
         )),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
+        creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(akuma_exec::process::Creds::ROOT)),
         channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: core::sync::atomic::AtomicU64::new(0),
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),

@@ -1530,11 +1530,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `ENOSYS` for the whole life of the port and `git clone` chmods every
         // file it writes (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
         90 => return to_glue(Syscall::Fchmodat, [AT_FDCWD, a1, a2, 0, 0, 0]),
-        // `fchown(fd, uid, gid)` — x86_64 93. Its asm-generic twin is `fchown`
-        // (55) and glue answers 0 for it, but this kernel reaches glue through
-        // `Syscall`, which only names the `*at` spelling — so it shims like
-        // `chmod` above. `tar`/`apk` chown every file they unpack.
-        93 => return to_glue(Syscall::Fchownat, [u64::from(a1 as u32), 0, a2, a3, 0, 0]),
+        // `chown(path, uid, gid)` / `lchown` — x86_64 92/94. No asm-generic
+        // twins, so `AT_FDCWD` shims onto `fchownat`; `lchown` passes
+        // `AT_SYMLINK_NOFOLLOW` (0x100). `fchown` (93) is a real row now — it
+        // used to be shimmed here with the fd as a dirfd and a NULL path, which
+        // was harmless only while `fchownat` returned 0 for everything.
+        // `tar`/`apk` chown every file they unpack.
+        92 => return to_glue(Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0, 0]),
+        94 => return to_glue(Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0x100, 0]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`
@@ -1689,6 +1692,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `rust-lld` reported `cannot open output file` for a file it had
         // already opened successfully.
         Syscall::Ftruncate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::Truncate => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `fallocate(fd, mode, offset, len)` — x86_64 285, row added
         // 2026-10-08 (Chromium's shared-memory files; 82 `ENOSYS` per run).
         // Same argument order as glue's arm; mode 0 grows the file.
@@ -2327,7 +2331,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `id: can't get groups` and exited 1. No supplementary groups exist
         // here, so the answer is the count `0`, and `size == 0` is the probe
         // form every caller actually uses.
-        | Syscall::Getgroups => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        | Syscall::Getgroups
+        // The rest of the credential family (2026-10-14). Real now on both
+        // kernels: `akuma_isolation::creds`, through glue's `cred.rs`.
+        | Syscall::Setreuid
+        | Syscall::Setregid
+        | Syscall::Setgroups
+        | Syscall::Setresuid
+        | Syscall::Getresuid
+        | Syscall::Setresgid
+        | Syscall::Getresgid
+        | Syscall::Setfsuid
+        | Syscall::Setfsgid
+        | Syscall::Fchown => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // Best-effort robustness/rlimit hooks musl pokes on startup.
         Syscall::SetRobustList => 0,          // set_robust_list
         // `prlimit64(pid, resource, new, old)` — **served by glue** (C1 step 3,
@@ -4562,6 +4578,13 @@ fn register_exec_process(
             .or_else(|| console_attached.then(crate::console::terminal_state).flatten())
             .unwrap_or_else(|| Arc::new(Spinlock::new(crate::console::default_terminal_state()))),
         box_id: 0,
+        // The spawner's credentials, copied: a spawn is credential-neutral,
+        // exactly as on AArch64 (`akuma_exec::process::spawn`). `init` and the
+        // self-test processes have no registered parent and start as root.
+        creds: Arc::new(akuma_exec::process::SharedCreds::new(
+            akuma_exec::process::lookup_process_shared(ppid)
+                .map_or(akuma_exec::process::Creds::ROOT, |p| p.creds.get()),
+        )),
         namespace: akuma_isolation::global_namespace(),
         // **The console's channel, for a console-attached process; `None` for
         // everything else.**
@@ -4941,6 +4964,18 @@ fn do_execve(
     envp_owned: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> u64 {
     use crate::fd::errno;
+
+    // Execute permission (`EACCES`), the same check AArch64's glue `do_execve`
+    // makes — this target has its own exec path, so it does not get that one
+    // for free. Against the symlink-resolved path, as the image read below
+    // resolves it: an apk wrapper is a link, and the link's own mode is 0777.
+    // A `#!` hop re-enters here with the interpreter, which is checked too.
+    if let Err(e) = akuma_syscalls_glue::perm::check(
+        &akuma_vfs_glue::resolve_symlinks(&path),
+        akuma_isolation::dac::MAY_EXEC,
+    ) {
+        return e;
+    }
 
     // The image read runs BKL-free per `EXEC_BKL_DROP_ENABLED` — on a USB disk
     // whose transfer stalled, this read is the multi-second BKL hold behind the

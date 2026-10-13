@@ -3242,3 +3242,56 @@ fn truncate_and_fallocate_by_inode_size_an_unlinked_file() {
     assert!(fs.metadata("/shm2").is_err(), "neither call may recreate the name");
     drop(pin);
 }
+
+// ── Ownership (docs/archive/UNIX_PERMISSIONS.md §5) ─────────────────
+
+#[test]
+fn chown_records_ids_above_65535() {
+    let fs = mount_empty();
+    fs.write_file("/owned", b"x").unwrap();
+    let m = fs.metadata("/owned").unwrap();
+    assert_eq!((m.uid, m.gid), (0, 0), "a new file belongs to root");
+
+    fs.chown("/owned", Some(70_000), Some(100_001)).unwrap();
+    let m = fs.metadata("/owned").unwrap();
+    assert_eq!((m.uid, m.gid), (70_000, 100_001), "high halves live in osd2");
+    assert_eq!(fs.read_file("/owned").unwrap(), b"x", "content untouched");
+}
+
+#[test]
+fn chown_none_leaves_that_id_alone() {
+    let fs = mount_empty();
+    fs.write_file("/f", b"").unwrap();
+    fs.chown("/f", Some(1000), Some(2000)).unwrap();
+    fs.chown("/f", None, Some(3000)).unwrap();
+    let m = fs.metadata("/f").unwrap();
+    assert_eq!((m.uid, m.gid), (1000, 3000));
+    fs.chown("/f", Some(4000), None).unwrap();
+    assert_eq!(fs.metadata("/f").unwrap().uid, 4000);
+    assert_eq!(fs.metadata("/f").unwrap().gid, 3000);
+}
+
+#[test]
+fn chown_on_a_directory_and_a_missing_path() {
+    let fs = mount_empty();
+    fs.create_dir("/d").unwrap();
+    fs.chown("/d", Some(5), Some(6)).unwrap();
+    let m = fs.metadata("/d").unwrap();
+    assert!(m.is_dir && m.uid == 5 && m.gid == 6);
+    assert!(fs.chown("/nope", Some(1), None).is_err());
+}
+
+#[test]
+fn inode_owner_high_bits_survive_serialization() {
+    let mut inode = sample_inode();
+    inode.set_owner_uid(0x0001_2345);
+    inode.set_owner_gid(0xABCD_0007);
+    let mut buf = [0u8; Inode::SIZE];
+    inode.serialize(&mut buf);
+    // Linux's offsets for l_i_uid_high / l_i_gid_high.
+    assert_eq!(u16::from_le_bytes([buf[120], buf[121]]), 0x0001);
+    assert_eq!(u16::from_le_bytes([buf[122], buf[123]]), 0xABCD);
+    let back = Inode::parse(&buf).unwrap();
+    assert_eq!(back.owner_uid(), 0x0001_2345);
+    assert_eq!(back.owner_gid(), 0xABCD_0007);
+}

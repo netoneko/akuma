@@ -33,6 +33,34 @@ pub fn get_ancestry_chain(registry: &BTreeMap<u64, BoxInfo>, box_id: u64) -> Vec
     chain
 }
 
+/// Whether a process in box `source` may reach one in box `target`: the host
+/// reaches everything, a box reaches itself and its descendants, nothing
+/// reaches up or sideways.
+///
+/// The ancestry rule of `access::can_access_box` **without** its creator-pid
+/// fallback, and without a `Vec`: it walks `target`'s parent chain in place, so
+/// it can run under the registry lock on a hot path (`kill`). The walk stops at
+/// [`MAX_BOX_DEPTH`]; registration cannot make a cycle, so the cap only bounds a
+/// pathologically deep (caller-built) chain, and hitting it answers "no".
+#[must_use]
+pub fn reaches(registry: &BTreeMap<u64, BoxInfo>, source: u64, target: u64) -> bool {
+    if source == 0 || source == target {
+        return true;
+    }
+    let mut current = target;
+    for _ in 0..MAX_BOX_DEPTH {
+        match registry.get(&current).and_then(|b| b.parent_box_id) {
+            Some(parent) if parent == source => return true,
+            Some(0) | None => return false,
+            Some(parent) => current = parent,
+        }
+    }
+    false
+}
+
+/// How far [`reaches`] walks before giving up.
+pub const MAX_BOX_DEPTH: usize = 64;
+
 /// Check if `ancestor_id` is an ancestor of `box_id`.
 #[must_use]
 pub fn is_ancestor(registry: &BTreeMap<u64, BoxInfo>, box_id: u64, ancestor_id: u64) -> bool {
@@ -258,5 +286,34 @@ mod tests {
         let parent = reg.get(&0).unwrap(); // host has root_dir "/"
         assert!(validate_nested_root(parent, "/containers/box1").is_ok());
         assert!(validate_nested_root(parent, "/anything").is_ok());
+    }
+
+    #[test]
+    fn reaches_is_self_and_descendants_only() {
+        let reg = crate::box_registry::make_test_registry();
+        // host(0) -> box1(1) -> nested(2); box3(3) under the host.
+        assert!(reaches(&reg, 0, 2), "host reaches everything");
+        assert!(reaches(&reg, 1, 1), "self");
+        assert!(reaches(&reg, 1, 2), "child");
+        assert!(!reaches(&reg, 2, 1), "not up");
+        assert!(!reaches(&reg, 1, 3), "not sideways");
+        assert!(!reaches(&reg, 1, 0), "a box never reaches the host");
+        assert!(!reaches(&reg, 1, 99), "an unknown target is unreachable");
+    }
+
+    #[test]
+    fn reaches_gives_up_on_an_overdeep_chain() {
+        let mut reg = crate::box_registry::make_test_registry();
+        let base = reg.get(&1).unwrap().clone();
+        let mut parent = 1u64;
+        for id in 100..100 + MAX_BOX_DEPTH as u64 + 5 {
+            let mut b = base.clone();
+            b.id = id;
+            b.parent_box_id = Some(parent);
+            reg.insert(id, b);
+            parent = id;
+        }
+        assert!(reaches(&reg, 100, 101));
+        assert!(!reaches(&reg, 1, parent), "past MAX_BOX_DEPTH the answer is no");
     }
 }

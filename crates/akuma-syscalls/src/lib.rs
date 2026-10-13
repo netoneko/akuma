@@ -400,8 +400,7 @@ pub const DEBUG_INFO: bool = cfg!(feature = "debug-info");
 // built on.
 //
 // The members that ARE admitted all dispatch without touching `args`:
-// `nr::GETUID => 0`, `nr::GETEUID => proc::sys_geteuid()`,
-// `nr::AKUMA_GET_VERSION => version::sys_akuma_get_version()`.
+// `nr::UPTIME`, `nr::AKUMA_GET_VERSION => version::sys_akuma_get_version()`.
 //
 // Admitting the trio would need the dispatch arm made feature-conditional too,
 // which is three `#[cfg]` pairs and a per-feature signature for marginal gain on
@@ -449,24 +448,16 @@ pub const fn takes_no_args(nr: u64) -> bool {
 /// - `akuma_get_version` returns a compile-time constant.
 /// - `uptime` returns `akuma_timer::uptime_us()` — a counter read, and nothing
 ///   else in the body.
-/// - `getuid`/`geteuid`/`getgid`/`getegid` (added 2026-08-29) return a literal
-///   `0`. Three are `nr::GETUID => 0` and friends in `handle_syscall`'s match;
-///   `geteuid` calls a function whose entire body is `0`. There is no user model
-///   in this kernel, so none of the four consults a `Process` — which is why
-///   they belong here and `getpid`/`gettid`/`getppid` do not. `getpid` reads
-///   `read_current_pid()`, `gettid` reads the thread id and `getppid` walks the
-///   process table: all three ARE identity, and stay `Full`.
-///
-///   They pay criterion 4 — their `/proc/<pid>/syscalls` rows go away. That is
-///   the right trade for these four specifically: a row saying "returned a
-///   constant 0" carries no information a caller could act on, and these are
-///   among the most frequently called syscalls in any libc startup, so they are
-///   where the prologue/epilogue overhead is most worth not paying.
+/// - `getuid`/`geteuid`/`getgid`/`getegid` were members from 2026-08-29 until
+///   2026-10-14, while they returned a literal `0`. Credentials became real
+///   then (`docs/archive/UNIX_PERMISSIONS.md`): the four now read the calling
+///   process's `creds`, which fails criterion 2, so they are `Full` again —
+///   identity, like `getpid`/`gettid`/`getppid`.
 #[must_use]
 pub const fn needs_identity(nr: u64) -> bool {
     !matches!(
         nr,
-        nr::AKUMA_GET_VERSION | nr::UPTIME | nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID
+        nr::AKUMA_GET_VERSION | nr::UPTIME
     )
 }
 

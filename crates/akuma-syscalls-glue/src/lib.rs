@@ -143,6 +143,8 @@ pub mod pipe;
 pub mod pty;
 pub mod poll;
 pub mod proc;
+mod cred;
+pub mod perm;
 /// AF_UNIX sockets — the kernel half.
 ///
 /// The decisions live in `akuma_net_unix` (host-tested); this module holds the
@@ -872,21 +874,19 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
         nr::GETPID => proc::sys_getpid(),
         nr::GETPPID => proc::sys_getppid(),
-        nr::GETUID => 0,
-        nr::GETEUID => proc::sys_geteuid(),
-        nr::GETGID => 0,
-        nr::GETEGID => 0,
+        nr::GETUID | nr::GETEUID => cred::sys_getuid(),
+        nr::GETGID | nr::GETEGID => cred::sys_getgid(),
         nr::GETTID => akuma_exec::threading::current_thread_id() as u64,
-        nr::GETRESUID => proc::sys_getresugid(args[0], args[1], args[2]),
-        nr::GETRESGID => proc::sys_getresugid(args[0], args[1], args[2]),
-        nr::GETGROUPS => proc::sys_getgroups(args[0] as i32, args[1]),
+        nr::GETRESUID => cred::sys_getres(args[0], args[1], args[2], false),
+        nr::GETRESGID => cred::sys_getres(args[0], args[1], args[2], true),
+        nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, args[1]),
         nr::KILL_LINUX => proc::sys_kill(args[0] as u32, args[1] as u32),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),
         nr::UNAME => proc::sys_uname(args[0]),
         nr::FLOCK => flock::sys_flock(args[0] as u32, args[1] as u32),
-        nr::UMASK => u64::from(fs::UMASK),
+        nr::UMASK => cred::sys_umask(args[0]),
         nr::UTIMENSAT => flat(fs::sys_utimensat(args[0] as i32, args[1], args[2], args[3] as u32)),
         nr::FDATASYNC => fs::sys_fsync(args[0] as u32),
         nr::FSYNC => fs::sys_fsync(args[0] as u32),
@@ -894,8 +894,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SYNCFS => fs::sys_syncfs(args[0] as u32),
         nr::FCHMOD => fs::sys_fchmod(args[0] as u32, args[1] as u32),
         nr::FCHMODAT => flat(fs::sys_fchmodat(args[0] as i32, args[1], args[2] as u32)),
-        nr::FCHOWNAT => 0,
-        nr::FCHOWN => 0,
+        nr::FCHOWNAT => flat(fs::sys_fchownat(args[0] as i32, args[1], args[2], args[3], args[4] as u32)),
+        nr::FCHOWN => fs::sys_fchown(args[0] as u32, args[1], args[2]),
         nr::TRUNCATE => flat(fs::sys_truncate(args[0], args[1] as i64)),
         nr::FTRUNCATE => fs::sys_ftruncate(args[0] as u32, args[1] as i64),
         // `posix_fadvise` — advisory by Linux's own contract; no readahead
@@ -1039,14 +1039,18 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }
         nr::CAPGET => proc::sys_capget(args[0], args[1]),
-        // Accepting no-ops — see the `CAPSET` doc comment for why "success" here
-        // means "not implemented", not "privileges dropped".
-        nr::CAPSET
-        | nr::SETGID
-        | nr::SETUID
-        | nr::SETRESUID
-        | nr::SETRESGID
-        | nr::SETGROUPS => 0,
+        // `capset` stays an accepted no-op — see the `CAPSET` doc comment. The
+        // id setters are real since 2026-10-14 (`cred.rs`).
+        nr::CAPSET => 0,
+        nr::SETUID => cred::sys_setuid(args[0]),
+        nr::SETGID => cred::sys_setgid(args[0]),
+        nr::SETRESUID => cred::sys_setresuid(args[0], args[1], args[2]),
+        nr::SETRESGID => cred::sys_setresgid(args[0], args[1], args[2]),
+        nr::SETREUID => cred::sys_setresuid(args[0], args[1], u64::from(u32::MAX)),
+        nr::SETREGID => cred::sys_setresgid(args[0], args[1], u64::from(u32::MAX)),
+        nr::SETFSUID => cred::sys_setfsid(false),
+        nr::SETFSGID => cred::sys_setfsid(true),
+        nr::SETGROUPS => cred::sys_setgroups(args[0], args[1]),
         nr::SYSINFO => proc::sys_sysinfo(args[0] as usize),
         nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, args[1] as usize),
         #[cfg(feature = "sc-epoll")]

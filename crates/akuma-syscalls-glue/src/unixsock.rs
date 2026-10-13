@@ -520,6 +520,13 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
         return if fd_parts(fd).is_some() { Err(EOPNOTSUPP) } else { Err(ENOTSOCK) };
     };
     let name = read_sockaddr(addr_ptr, addrlen)?;
+    // Binding a path creates a directory entry, so it needs write and search on
+    // the parent (`EACCES`), checked before the name is claimed in the table.
+    if let Some(p) = name.path_bytes().and_then(|b| core::str::from_utf8(b).ok())
+        && p.starts_with('/')
+    {
+        super::perm::check_create(p)?;
+    }
     // A filesystem name whose node exists but whose socket does not is stale:
     // a daemon died without unlinking. Linux reports EADDRINUSE and expects the
     // daemon to unlink first, so a client sees a node it cannot connect to
@@ -563,6 +570,8 @@ fn create_socket_node(path: &str) {
             112,
             "[unix] bind: S_IFSOCK node create failed (name is still bound)\n"
         );
+    } else if path.starts_with('/') {
+        super::perm::own_new(path);
     }
 }
 

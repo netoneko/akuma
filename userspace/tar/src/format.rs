@@ -33,6 +33,12 @@ pub struct Entry {
     pub linkname: String,
     pub size: usize,
     pub mode: u32,
+    /// Numeric owner and group from the header. Names (`uname`/`gname`) are
+    /// deliberately ignored: they would resolve against the *extracting*
+    /// system's user table, and an OCI layer's ids mean what the image's own
+    /// `/etc/passwd` says — runc and containerd use the numbers too.
+    pub uid: u32,
+    pub gid: u32,
     pub kind: EntryKind,
 }
 
@@ -68,6 +74,8 @@ pub fn parse_header(header: &[u8; BLOCK_SIZE]) -> Option<Entry> {
         linkname: extract_str(&header[157..257]),
         size: parse_octal(&header[124..136]),
         mode: (parse_octal(&header[100..108]) & 0o7777) as u32,
+        uid: parse_id(&header[108..116]),
+        gid: parse_id(&header[116..124]),
         kind,
     })
 }
@@ -142,6 +150,21 @@ pub fn extract_str(bytes: &[u8]) -> String {
 }
 
 /// Parse an octal header field.
+/// A uid/gid field: octal, or GNU base-256 (high bit of the first byte set)
+/// for ids too large for seven octal digits. Anything unparseable is 0, the
+/// same answer the old extractor gave by not reading the field at all.
+#[must_use]
+pub fn parse_id(bytes: &[u8]) -> u32 {
+    if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+        let mut v: u64 = u64::from(bytes[0] & 0x7f);
+        for &b in &bytes[1..] {
+            v = (v << 8) | u64::from(b);
+        }
+        return u32::try_from(v).unwrap_or(0);
+    }
+    u32::try_from(parse_octal(bytes)).unwrap_or(0)
+}
+
 #[must_use]
 pub fn parse_octal(bytes: &[u8]) -> usize {
     let s = core::str::from_utf8(bytes).unwrap_or("");
@@ -280,6 +303,15 @@ mod tests {
         h
     }
 
+    fn fix_checksum(h: &mut [u8; BLOCK_SIZE]) {
+        for b in &mut h[148..156] {
+            *b = b' ';
+        }
+        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        write_octal(&mut h[148..155], sum as usize);
+        h[155] = 0;
+    }
+
     fn write_octal(field: &mut [u8], value: usize) {
         let mut v = value;
         for slot in field.iter_mut().rev().skip(1) {
@@ -411,5 +443,21 @@ mod tests {
 
         assert!(strip_gzip_header(b"not gzip at all___________").is_none());
         assert!(strip_gzip_header(&[0x1f, 0x8b]).is_none());
+    }
+
+    #[test]
+    fn owner_fields_are_parsed_in_octal_and_base_256() {
+        let mut h = header("f", 0, 0o644, b'0', "");
+        write_octal(&mut h[108..116], 999);
+        write_octal(&mut h[116..124], 1000);
+        fix_checksum(&mut h);
+        let e = parse_header(&h).unwrap();
+        assert_eq!((e.uid, e.gid), (999, 1000));
+
+        // GNU base-256: 0x80 marker, big-endian value in the remaining bytes.
+        let mut h = header("f", 0, 0o644, b'0', "");
+        h[108..116].copy_from_slice(&[0x80, 0, 0, 0, 0, 0x01, 0x11, 0x70]);
+        fix_checksum(&mut h);
+        assert_eq!(parse_header(&h).unwrap().uid, 70_000);
     }
 }

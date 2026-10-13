@@ -296,10 +296,35 @@ impl OverlayFs {
         for comp in comps {
             prefix = join(&prefix, comp);
             if !self.upper.exists(&prefix) {
+                // A directory copied up must keep the lower one's mode and
+                // owner: a `1777` `/tmp` that came up as the upper's default
+                // `0755 root` would shut every unprivileged writer out. Read
+                // before creating — afterwards `find` answers with the copy.
+                let lower = self
+                    .find(&prefix)
+                    .filter(|f| !f.is_upper())
+                    .and_then(|f| self.layer(f.layer).metadata(&prefix).ok());
                 self.upper.create_dir(&prefix)?;
+                if let Some(meta) = lower {
+                    self.copy_attrs(&prefix, &meta);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Give the freshly created upper copy of `path` the lower one's permission
+    /// bits and owner. Best-effort, like the data copy's `chmod` always was: an
+    /// upper that cannot record them still holds the content. Each write is
+    /// skipped when it would store what creation already did (root-owned), so
+    /// the common root-only case costs nothing extra.
+    fn copy_attrs(&self, path: &str, meta: &Metadata) {
+        if meta.mode != 0 {
+            let _ = self.upper.chmod(path, meta.mode & 0o7777);
+        }
+        if meta.uid != 0 || meta.gid != 0 {
+            let _ = self.upper.chown(path, Some(meta.uid), Some(meta.gid));
+        }
     }
 
     /// Materialize `path` in the upper layer so it can be modified in place.
@@ -318,6 +343,7 @@ impl OverlayFs {
         if meta.is_dir {
             if !self.upper.exists(path) {
                 self.upper.create_dir(path)?;
+                self.copy_attrs(path, &meta);
             }
             return Ok(());
         }
@@ -329,10 +355,7 @@ impl OverlayFs {
 
         let data = src.read_file(path)?;
         self.upper.write_file(path, &data)?;
-        if meta.mode != 0 {
-            // Best-effort: an upper layer that cannot chmod still holds the data.
-            let _ = self.upper.chmod(path, meta.mode);
-        }
+        self.copy_attrs(path, &meta);
         Ok(())
     }
 
@@ -492,6 +515,11 @@ impl Filesystem for OverlayFs {
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
         self.copy_up(path)?;
         self.upper.chmod(path, mode)
+    }
+
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        self.copy_up(path)?;
+        self.upper.chown(path, uid, gid)
     }
 
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
@@ -981,5 +1009,37 @@ mod tests {
         let fs = overlay(&[], &[]);
         assert!(fs.exists("/"));
         assert_eq!(fs.name(), "overlay");
+    }
+
+    #[test]
+    fn copy_up_keeps_the_owner_and_the_parent_directory_mode() {
+        let lower = layer(&[("/tmp/x/f", "data")]);
+        lower.chmod("/tmp", 0o1777).unwrap();
+        lower.chown("/tmp/x", Some(1000), Some(1000)).unwrap();
+        lower.chmod("/tmp/x", 0o700).unwrap();
+        lower.chown("/tmp/x/f", Some(999), Some(1000)).unwrap();
+        lower.chmod("/tmp/x/f", 0o640).unwrap();
+        let upper = layer(&[]);
+        let fs = OverlayFs::new(upper.clone(), alloc::vec![lower]);
+
+        fs.write_at("/tmp/x/f", 0, b"D").unwrap();
+
+        let f = upper.metadata("/tmp/x/f").unwrap();
+        assert_eq!((f.mode & 0o7777, f.uid, f.gid), (0o640, 999, 1000));
+        let x = upper.metadata("/tmp/x").unwrap();
+        assert_eq!((x.mode & 0o7777, x.uid), (0o700, 1000), "parent copied up whole");
+        let tmp = upper.metadata("/tmp").unwrap();
+        assert_eq!(tmp.mode & 0o7777, 0o1777, "a sticky /tmp stays sticky in upper");
+    }
+
+    #[test]
+    fn chown_copies_up_and_leaves_the_lower_alone() {
+        let lower = layer(&[("/etc/conf", "c")]);
+        let upper = layer(&[]);
+        let fs = OverlayFs::new(upper.clone(), alloc::vec![lower.clone()]);
+        fs.chown("/etc/conf", Some(5), None).unwrap();
+        assert_eq!(fs.metadata("/etc/conf").unwrap().uid, 5);
+        assert_eq!(lower.metadata("/etc/conf").unwrap().uid, 0);
+        assert_eq!(read(&fs, "/etc/conf"), "c");
     }
 }

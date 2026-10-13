@@ -149,8 +149,8 @@ pub const GETEGID: u64 = 177;
 pub const GETTID: u64 = 178;
 /// The three credential *queries* `setpriv` makes before dropping privileges.
 ///
-/// Everything runs as root here, so all three answer 0 — but they have to
-/// answer: ENOSYS made util-linux's `setpriv` bail ("getresuid failed:
+/// They report the caller's credentials (real = effective = saved), and they
+/// have to answer: ENOSYS made util-linux's `setpriv` bail ("getresuid failed:
 /// Function not implemented"), which killed `redis:alpine`'s
 /// `docker-entrypoint.sh` under its `set -e` (docs/archive/DEVBOX_ISSUES.md
 /// Issue 15).
@@ -230,26 +230,31 @@ pub const TIMERFD_CREATE: u64 = 85;
 pub const TIMERFD_SETTIME: u64 = 86;
 pub const TIMERFD_GETTIME: u64 = 87;
 pub const CAPGET: u64 = 90;
-/// The credential *setters*, as accepting no-ops.
+/// `capset` and the credential setters.
 ///
-/// This kernel has one identity — root — and no capability model, so there is
-/// nothing to change and nothing to drop. They exist because privilege-dropping
-/// wrappers treat a failure here as fatal: `redis:alpine`'s entrypoint runs
-/// `setpriv --reuid=redis --regid=redis --clear-groups`, whose libcap-ng
-/// `capng_apply` calls `capset` and whose `--clear-groups` calls `setgroups`.
-/// ENOSYS from either killed the container before `redis-server` started
-/// (docs/archive/DEVBOX_ISSUES.md Issue 15).
+/// `capset` is still an accepted no-op: there is no capability model finer than
+/// "uid 0 or not", and privilege-dropping wrappers treat a failure here as fatal
+/// (`redis:alpine`'s `setpriv` calls it via libcap-ng — docs/archive/DEVBOX_ISSUES.md
+/// Issue 15). `capget` reports the full set for uid 0 and the empty set otherwise.
 ///
-/// **Read this as "privilege dropping is not implemented", not "it worked".**
-/// A caller that asks to become an unprivileged user stays root, silently. That
-/// is the same fiction `getuid`/`geteuid` already tell (both hardcode 0); making
-/// these fail instead would not add safety, only break the callers. A real
-/// implementation needs per-process credentials first — there is no uid field on
-/// `Process` to set.
+/// The id setters below were the same accepted no-op until 2026-10-14; they are
+/// real now, under a one-way rule (`akuma_isolation::creds`,
+/// `docs/archive/UNIX_PERMISSIONS.md` §4): only uid 0 may change an id, and a
+/// drop cannot be undone.
 pub const CAPSET: u64 = 91;
 pub const SETGID: u64 = 144;
 pub const SETUID: u64 = 146;
 pub const SETRESUID: u64 = 147;
+/// `setreuid`/`setregid`/`setfsuid`/`setfsgid`.
+///
+/// The first two are how older code (and musl's `seteuid` fallback paths)
+/// drops; `setfs*id` are answered
+/// with the current id and change nothing, since filesystem ids are the
+/// effective ids here (`docs/archive/UNIX_PERMISSIONS.md` §4.2).
+pub const SETREGID: u64 = 143;
+pub const SETREUID: u64 = 145;
+pub const SETFSUID: u64 = 151;
+pub const SETFSGID: u64 = 152;
 pub const SETRESGID: u64 = 149;
 pub const SETGROUPS: u64 = 159;
 pub const IO_URING_SETUP: u64 = 425;

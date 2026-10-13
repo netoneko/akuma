@@ -865,6 +865,8 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
             modified: None,
             accessed: None,
             links: None,
+            uid: 0,
+            gid: 0,
         });
     }
     // Device nodes. `Metadata` carries no `rdev`, so `sys_newfstatat` /
@@ -881,6 +883,8 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
             modified: None,
             accessed: None,
             links: None,
+            uid: 0,
+            gid: 0,
         });
     }
     if let Some(m) = pts_metadata(path) {
@@ -892,6 +896,11 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
 /// Change file permissions
 pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
     with_fs_write(path, |fs, rel| fs.chmod(rel, mode))
+}
+
+/// Change a file's owner and/or group (`None` = leave). See `Filesystem::chown`.
+pub fn chown(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+    with_fs_write(path, |fs, rel| fs.chown(rel, uid, gid))
 }
 
 /// Set a file's access/modification times (seconds since the epoch); `None`
@@ -1257,7 +1266,7 @@ fn pts_metadata(path: &str) -> Option<Metadata> {
         let n = pts_slot(path)?;
         (false, 0x7074_0000 + u64::from(n), 0o20620)
     };
-    Some(Metadata { is_dir, size: 0, inode, mode, created: None, modified: None, accessed: None, links: None })
+    Some(Metadata { is_dir, size: 0, inode, mode, created: None, modified: None, accessed: None, links: None, uid: 0, gid: 0 })
 }
 
 /// Whether the kernel offers `/dev/fb0`. Set once by the amd64 kernel when it
@@ -1452,6 +1461,8 @@ fn dev_dir_metadata(path: &str) -> Option<Metadata> {
         modified: None,
         accessed: None,
         links: None,
+        uid: 0,
+        gid: 0,
     })
 }
 

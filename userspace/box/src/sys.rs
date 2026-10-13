@@ -37,6 +37,32 @@ pub struct SpawnOptions {
     /// on a newer kernel and simply gets the default environment.
     pub env_ptr: u64,
     pub env_len: usize,
+    /// The child's credentials, applied only when `cred_flags` has
+    /// [`SPAWN_CREDS_SET`] — set them with [`SpawnOptions::set_creds`].
+    /// Appended like `env_*`: a kernel that predates them reads the first 88
+    /// bytes and the child inherits the caller's credentials, as before. The
+    /// kernel only lets a spawn *lower* credentials (the `setuid` rules).
+    pub uid: u32,
+    pub gid: u32,
+    pub groups_ptr: u64,
+    pub ngroups: u32,
+    pub cred_flags: u32,
+}
+
+/// `SpawnOptions::cred_flags`: apply `uid`/`gid`/`groups` to the child.
+pub const SPAWN_CREDS_SET: u32 = 1;
+
+impl SpawnOptions {
+    /// Start the child as `uid`/`gid` with supplementary `groups` — `box run`'s
+    /// image `User`. `groups` is borrowed by pointer: it must outlive the
+    /// `spawn_ext` call that reads it.
+    pub fn set_creds(&mut self, uid: u32, gid: u32, groups: &[u32]) {
+        self.uid = uid;
+        self.gid = gid;
+        self.groups_ptr = groups.as_ptr() as u64;
+        self.ngroups = groups.len() as u32;
+        self.cred_flags |= SPAWN_CREDS_SET;
+    }
 }
 
 // Aliased from `libakuma::syscall` rather than restated as bare numbers: those
@@ -195,7 +221,7 @@ mod tests {
     // docs/archive/HERD_PLUS_BOX.md, "Mechanics".
     #[test]
     fn matches_the_kernels_abi() {
-        assert_eq!(core::mem::size_of::<SpawnOptions>(), 88);
+        assert_eq!(core::mem::size_of::<SpawnOptions>(), 112);
         assert_eq!(core::mem::offset_of!(SpawnOptions, cwd_ptr), 0);
         assert_eq!(core::mem::offset_of!(SpawnOptions, cwd_len), 8);
         assert_eq!(core::mem::offset_of!(SpawnOptions, root_dir_ptr), 16);
@@ -210,5 +236,10 @@ mod tests {
         // reads `stdin_len`.
         assert_eq!(core::mem::offset_of!(SpawnOptions, env_ptr), 72);
         assert_eq!(core::mem::offset_of!(SpawnOptions, env_len), 80);
+        assert_eq!(core::mem::offset_of!(SpawnOptions, uid), 88);
+        assert_eq!(core::mem::offset_of!(SpawnOptions, gid), 92);
+        assert_eq!(core::mem::offset_of!(SpawnOptions, groups_ptr), 96);
+        assert_eq!(core::mem::offset_of!(SpawnOptions, ngroups), 104);
+        assert_eq!(core::mem::offset_of!(SpawnOptions, cred_flags), 108);
     }
 }

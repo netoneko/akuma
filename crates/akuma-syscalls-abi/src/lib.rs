@@ -251,6 +251,10 @@ syscall_table! {
     /// `cannot open output file …: Function not implemented` and blamed
     /// itself. Nothing in the guest could link until this row existed.
     Ftruncate  => FTRUNCATE  = 77,  nr::FTRUNCATE;
+    /// `truncate(path, length)`; x86_64 76, asm-generic 45. Added 2026-10-14:
+    /// glue has always handled it, but with no row the amd64 kernel answered
+    /// `ENOSYS` — found by `permprobe` on the metal, the first caller to ask.
+    Truncate   => TRUNCATE   = 76,  nr::TRUNCATE;
     /// `fallocate(fd, mode, offset, len)`; x86_64 285, asm-generic 47. Added
     /// 2026-10-08: Chromium sizes its shared-memory files with it (82 calls per
     /// headless run, all `ENOSYS` before this) and falls back to `ftruncate`,
@@ -326,6 +330,10 @@ syscall_table! {
     /// Change owner, `*at`-style. The x86-only `fchown`(93) shims to it in
     /// `amd64/src/usermode.rs`, the same way `chmod`(90) shims to `fchmodat`.
     Fchownat   => FCHOWNAT   = 260, nr::FCHOWNAT;
+    /// `fchown(fd, uid, gid)` — x86_64 93, asm-generic 55. A row since
+    /// 2026-10-14; before it, x86_64 93 was shimmed onto `fchownat` with the fd
+    /// as the dirfd and a NULL path, harmless only while `fchownat` returned 0.
+    Fchown     => FCHOWN     = 93,  nr::FCHOWN;
 
     // ── mount ──────────────────────────────────────────────────────────────
     /// `mount(source, target, fstype, flags, data)`. Reaches
@@ -468,6 +476,19 @@ syscall_table! {
     Getegid    => GETEGID    = 108, nr::GETEGID;
     Setuid     => SETUID     = 105, nr::SETUID;
     Setgid     => SETGID     = 106, nr::SETGID;
+    /// The rest of the credential family, added 2026-10-14 when credentials
+    /// became real (`docs/archive/UNIX_PERMISSIONS.md`). Before that they had
+    /// no rows, so on amd64 `setpriv`'s `getresuid` and `gosu`'s `setgroups`
+    /// answered `ENOSYS` while AArch64 answered them.
+    Setreuid   => SETREUID   = 113, nr::SETREUID;
+    Setregid   => SETREGID   = 114, nr::SETREGID;
+    Setgroups  => SETGROUPS  = 116, nr::SETGROUPS;
+    Setresuid  => SETRESUID  = 117, nr::SETRESUID;
+    Getresuid  => GETRESUID  = 118, nr::GETRESUID;
+    Setresgid  => SETRESGID  = 119, nr::SETRESGID;
+    Getresgid  => GETRESGID  = 120, nr::GETRESGID;
+    Setfsuid   => SETFSUID   = 122, nr::SETFSUID;
+    Setfsgid   => SETFSGID   = 123, nr::SETFSGID;
     /// x86_64 115 is `getgroups`; asm-generic 158 — where x86_64 158 is
     /// `arch_prctl`, so this row is one of the pairs that makes the two-number
     /// shape earn itself. Added 2026-09-07 because `busybox id` on amd64 printed
@@ -948,6 +969,32 @@ mod tests {
                 Some(call),
                 "asm-generic {generic} must decode to {call:?}"
             );
+        }
+    }
+
+    /// The credential rows, pinned by both numbers for the same reason as the
+    /// cargo batch above: a transposed digit here would send `setresuid` to
+    /// `getresuid`'s handler, and a privilege drop that silently does not
+    /// happen is the worst failure this family has.
+    #[test]
+    fn the_credential_rows_carry_both_numbers() {
+        for (call, x86, generic) in [
+            (Syscall::Setreuid, 113u64, 145u64),
+            (Syscall::Setregid, 114, 143),
+            (Syscall::Setgroups, 116, 159),
+            (Syscall::Setresuid, 117, 147),
+            (Syscall::Getresuid, 118, 148),
+            (Syscall::Setresgid, 119, 149),
+            (Syscall::Getresgid, 120, 150),
+            (Syscall::Setfsuid, 122, 151),
+            (Syscall::Setfsgid, 123, 152),
+            (Syscall::Fchown, 93, 55),
+            (Syscall::Truncate, 76, 45),
+        ] {
+            assert_eq!(Syscall::from_x86_64(x86), Some(call), "x86_64 {x86}");
+            assert_eq!(call.to_x86_64(), x86);
+            assert_eq!(call.to_aarch64(), generic, "{call:?} -> asm-generic {generic}");
+            assert_eq!(Syscall::from_aarch64(generic), Some(call));
         }
     }
 

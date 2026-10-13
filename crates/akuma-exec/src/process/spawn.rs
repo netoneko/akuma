@@ -226,6 +226,27 @@ pub fn spawn_process_with_channel_ext(
     box_id: u64,
     pty: bool,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
+    spawn_process_with_creds(path, args, env, stdin, cwd, box_id, pty, None)
+}
+
+/// [`spawn_process_with_channel_ext`], with the child's credentials supplied
+/// rather than copied from the caller. `None` copies, as every other spawn
+/// does. The caller is responsible for having checked that `creds` is
+/// something the calling process may become (`SPAWN_EXT` does, through
+/// `akuma_isolation::creds`'s transition rules); they are installed before the
+/// process is published, so the child never runs a single instruction with
+/// the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process_with_creds(
+    path: &str,
+    args: Option<&[&str]>,
+    env: Option<&[String]>,
+    stdin: Option<&[u8]>,
+    cwd: Option<&str>,
+    box_id: u64,
+    pty: bool,
+    creds: Option<super::Creds>,
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // NOTE: the LifecycleGuard is acquired at the PUBLISH point (just before
     // `register_process`, below), NOT here. The whole load phase above it — path/
     // namespace resolution, stat, the ELF read from ext2 — does block I/O and
@@ -474,16 +495,22 @@ pub fn spawn_process_with_channel_ext(
     }
 
     // Set up isolation context (Inherit from caller by default)
-    let (caller_box_id, caller_namespace) = match read_current_pid() {
+    let (caller_box_id, caller_namespace, caller_creds) = match read_current_pid() {
         Some(pid) => {
             if let Some(proc) = lookup_process_shared(pid) {
-                (proc.box_id, proc.namespace.clone())
+                (proc.box_id, proc.namespace.clone(), proc.creds.get())
             } else {
-                (0, akuma_isolation::global_namespace())
+                (0, akuma_isolation::global_namespace(), super::Creds::ROOT)
             }
         }
-        None => (0, akuma_isolation::global_namespace()),
+        None => (0, akuma_isolation::global_namespace(), super::Creds::ROOT),
     };
+
+    // Credentials are copied from the caller and are independent of the box
+    // the child lands in: entering a box neither raises nor lowers them
+    // (`docs/archive/UNIX_PERMISSIONS.md` §3). A spawn that asks for lower
+    // credentials applies them after this, through `Process::creds`.
+    process.creds = Arc::new(super::SharedCreds::new(creds.unwrap_or(caller_creds)));
 
     if box_id != 0 {
         process.box_id = box_id;

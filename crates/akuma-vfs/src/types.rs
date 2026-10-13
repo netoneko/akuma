@@ -83,6 +83,13 @@ pub struct Metadata {
     /// "single-threaded" by `st_nlink == 3` after a `CHECK_LE(3, nlink)` —
     /// so the fixed 2 was a `CHECK` failure in every zygote.
     pub links: Option<u32>,
+    /// Owner and group (`st_uid`/`st_gid`). `0`/`0` for a filesystem that
+    /// records no ownership — procfs, devfs, and anything synthetic — which is
+    /// what Linux reports for those too. Added 2026-10-14 with real credentials
+    /// (`docs/archive/UNIX_PERMISSIONS.md` §5); `stat` returned 0 for both
+    /// before, whatever ext2 had on disk.
+    pub uid: u32,
+    pub gid: u32,
 }
 
 impl Metadata {
@@ -236,6 +243,16 @@ pub trait Filesystem: Send + Sync {
     }
 
     fn chmod(&self, _path: &str, _mode: u32) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Change a file's owner and/or group; `None` leaves that one alone
+    /// (`chown`'s `-1`). Permission is the caller's business — this records.
+    ///
+    /// Defaults to `NotSupported`, for the reason `set_times` gives: a silent
+    /// `Ok` on a filesystem that stores no owner would make `chown` report
+    /// success and change nothing.
+    fn chown(&self, _path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }
 

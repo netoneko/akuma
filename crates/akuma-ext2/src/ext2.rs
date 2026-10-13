@@ -1129,6 +1129,35 @@ pub(crate) const INODE_POINTERS_OFFSET: usize = offset_of!(Inode, direct_blocks)
 impl Inode {
     pub(crate) const SIZE: usize = size_of::<Self>();
 
+    /// Where Linux keeps the high 16 bits of the owner and group: `osd2`'s
+    /// `l_i_uid_high` and `l_i_gid_high`, inode bytes 120 and 122. Without them
+    /// an id above 65535 truncates on disk.
+    const UID_HIGH: usize = 4;
+    const GID_HIGH: usize = 6;
+
+    /// The full 32-bit owner.
+    pub(crate) fn owner_uid(&self) -> u32 {
+        let o = &self.os_specific_2;
+        u32::from(self.uid) | u32::from(u16::from_le_bytes([o[Self::UID_HIGH], o[Self::UID_HIGH + 1]])) << 16
+    }
+
+    /// The full 32-bit group.
+    pub(crate) fn owner_gid(&self) -> u32 {
+        let o = &self.os_specific_2;
+        u32::from(self.gid) | u32::from(u16::from_le_bytes([o[Self::GID_HIGH], o[Self::GID_HIGH + 1]])) << 16
+    }
+
+    /// Set the owner, low half in the classic field and high half in `osd2`.
+    pub(crate) fn set_owner_uid(&mut self, uid: u32) {
+        self.uid = uid as u16;
+        self.os_specific_2[Self::UID_HIGH..Self::UID_HIGH + 2].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+    }
+
+    pub(crate) fn set_owner_gid(&mut self, gid: u32) {
+        self.gid = gid as u16;
+        self.os_specific_2[Self::GID_HIGH..Self::GID_HIGH + 2].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+    }
+
     /// The `i`-th pointer word (0..[`INODE_POINTER_WORDS`]) as a plain field
     /// access. This is what lets the fast-symlink window be read and written
     /// byte-exactly without ever taking a reference into a packed struct or
@@ -3213,6 +3242,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             modified: Some(inode.modification_time as u64),
             accessed: Some(inode.access_time as u64),
             links: None,
+            uid: inode.owner_uid(),
+            gid: inode.owner_gid(),
         })
     }
 
@@ -4082,6 +4113,25 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let mut inode = self.read_inode(&state, inode_num)?;
         inode.type_perms = (inode.type_perms & 0xF000) | (mode as u16 & 0o7777);
         inode.modification_time = self.current_time();
+        self.write_inode(&state, inode_num, &inode)?;
+        Ok(())
+    }
+
+    /// `chown` backing: the full 32-bit ids, split across the classic 16-bit
+    /// fields and `osd2`'s high halves. Bumps the inode change time
+    /// (`creation_time` here is ext2's `i_ctime`), not mtime: a change of owner
+    /// is not a change of content.
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let inode_num = self.lookup_path(path)?;
+        let state = self.write_state();
+        let mut inode = self.read_inode(&state, inode_num)?;
+        if let Some(u) = uid {
+            inode.set_owner_uid(u);
+        }
+        if let Some(g) = gid {
+            inode.set_owner_gid(g);
+        }
+        inode.creation_time = self.current_time();
         self.write_inode(&state, inode_num, &inode)?;
         Ok(())
     }

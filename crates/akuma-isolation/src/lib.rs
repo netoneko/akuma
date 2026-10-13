@@ -7,6 +7,8 @@
 extern crate alloc;
 
 pub mod box_registry;
+pub mod creds;
+pub mod dac;
 pub mod mount;
 pub mod net;
 pub mod overlay_fs;

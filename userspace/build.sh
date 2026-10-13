@@ -414,6 +414,17 @@ for b in abortsig computecheck dynspawn dynchild md5probe neonstate pipewake rea
 done
 echo "13 previously-unstaged c_stress probes copied to bootstrap/bin/"
 
+# permprobe: credentials + file permissions as uid 1000 sees them, one line per
+# check against Linux's errno (docs/archive/UNIX_PERMISSIONS.md). Run as root;
+# it turns /proc/dac on for its own run and restores it. Same binary runs on
+# Linux (`docker run --rm -v $PWD:/p alpine /p/permprobe`) for the A/B.
+echo "Building permprobe (C, Unix permissions probe)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o permprobe permprobe.c
+)
+cp forktest/c_stress/permprobe ../bootstrap/bin/
+
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
 cp forktest/c_stress/cowstale ../bootstrap/bin/

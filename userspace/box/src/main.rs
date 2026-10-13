@@ -186,6 +186,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
             root_dir_ptr: 0, root_dir_len: 0,
             args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
             env_ptr: 0, env_len: 0,
+            ..Default::default()
         };
 
         print("box: starting '"); print(name); print("' in "); print(&directory); print(" (ID="); libakuma::print_hex(box_id as usize); print(")\n");
@@ -261,6 +262,7 @@ fn cmd_use(args: libakuma::Args) -> ! {
         root_dir_ptr: 0, root_dir_len: 0,
         args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: target_id,
         env_ptr: 0, env_len: 0,
+        ..Default::default()
     };
 
     let args_opt = if cmd_args.is_empty() { None } else { Some(cmd_args.as_slice()) };

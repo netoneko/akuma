@@ -215,6 +215,7 @@ pub mod syscall {
         pub const UMOUNT2: u64 = 39;
         pub const MOUNT_IN_NS: u64 = 325;
         pub const FCHMODAT: u64 = 53;
+        pub const FCHOWNAT: u64 = 54;
         pub const CLONE: u64 = 220;
         pub const WAIT4: u64 = 260;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
@@ -305,6 +306,7 @@ pub mod syscall {
         pub const UMOUNT2: u64 = 166;
         pub const MOUNT_IN_NS: u64 = AKUMA_PRIVATE_BASE + 325;
         pub const FCHMODAT: u64 = 268;
+        pub const FCHOWNAT: u64 = 260;
         pub const CLONE: u64 = 56;
         pub const WAIT4: u64 = 61;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
@@ -1618,6 +1620,24 @@ pub fn chmod(path: &str, mode: u32) -> i32 {
         u64::from(mode),
         0,
         0, 0,
+    ) as i32
+}
+
+/// Change the owner and group of `path` itself — a symlink is changed, not
+/// followed (`lchown`, `fchownat(AT_SYMLINK_NOFOLLOW)`), which is what an
+/// archive extractor needs. `u32::MAX` leaves that id alone. Returns 0 or a
+/// negative errno.
+pub fn lchown(path: &str, uid: u32, gid: u32) -> i32 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    let path_c = alloc::format!("{}\0", path);
+    syscall(
+        syscall::FCHOWNAT,
+        -100i32 as u64, // AT_FDCWD
+        path_c.as_ptr() as u64,
+        u64::from(uid),
+        u64::from(gid),
+        AT_SYMLINK_NOFOLLOW,
+        0,
     ) as i32
 }
 

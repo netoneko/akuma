@@ -204,6 +204,47 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     Ok(())
 }
 
+/// Why a signal to another process was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalDeny {
+    /// The target is outside every box the sender can reach. Reported as
+    /// `ESRCH`: procfs already hides such a process, and `kill` must not be a
+    /// way to discover it by probing pids.
+    Invisible,
+    /// Reachable, but owned by another uid (`EPERM`, as on Linux).
+    Forbidden,
+}
+
+/// May the calling process signal `target`?
+///
+/// Two halves, in order. **Box first, always on:** a process may signal only
+/// into its own box or a descendant, and the host reaches everything — the rule
+/// `/proc` and `spawn` already enforce, which `kill` did not, so a boxed process
+/// could kill anything by guessing a pid. **Then uid**, only while
+/// [`akuma_isolation::dac::enforcing`]: root, or the same uid.
+///
+/// A kernel thread (no current process) is the host and may signal anything.
+/// No allocation: the box walk runs under the registry lock in place.
+pub fn check_signal(target: &super::Process) -> Result<(), SignalDeny> {
+    let Some(me) = crate::process::children::current_process_shared() else {
+        return Ok(());
+    };
+    if !akuma_isolation::box_registry::box_reaches(me.box_id, target.box_id) {
+        return Err(SignalDeny::Invisible);
+    }
+    if akuma_isolation::dac::enforcing()
+        && !akuma_isolation::dac::may_signal(&me.creds.get(), &target.creds.get())
+    {
+        return Err(SignalDeny::Forbidden);
+    }
+    Ok(())
+}
+
+/// [`check_signal`] by pid. A pid with no process is `Invisible` (`ESRCH`).
+pub fn check_signal_pid(pid: Pid) -> Result<(), SignalDeny> {
+    lookup_process_shared(pid).map_or(Err(SignalDeny::Invisible), check_signal)
+}
+
 /// Deliver `sig` to `pid`'s whole thread group (target + CLONE_THREAD siblings),
 /// or hard-kill it if it has no live thread to interrupt. This is `sys_kill`'s
 /// per-pid delivery logic, factored out so [`kill_process_group`] can reuse it

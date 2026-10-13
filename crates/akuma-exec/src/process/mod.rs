@@ -51,6 +51,7 @@ pub use stats::*;
 pub use fd::*;
 pub use spawn::*;
 pub use exec::*;
+pub use akuma_isolation::creds::{Creds, SharedCreds};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
@@ -811,6 +812,11 @@ pub struct Process {
     pub ctty: AtomicU32,
     pub terminal_state: Arc<Spinlock<terminal::TerminalState>>,
     pub box_id: u64,
+    /// uid/gid/groups/umask, shared by the thread group (`Arc`, like `fds`):
+    /// `fork`/`vfork` take a private copy, `clone_thread` shares, `execve` and
+    /// box transitions leave them alone. See `akuma_isolation::creds` and
+    /// `docs/archive/UNIX_PERMISSIONS.md` §4.
+    pub creds: Arc<SharedCreds>,
     pub namespace: Arc<akuma_isolation::Namespace>,
     pub channel: Option<Arc<ProcessChannel>>,
     pub delegate_pid: Option<Pid>,
@@ -896,6 +902,10 @@ pub struct InheritOverrides {
     /// fork, and only `execve` resets caught handlers. `clone_thread`: the
     /// parent's table itself, shared by `Arc` (`CLONE_SIGHAND`).
     pub signal_actions: Arc<SharedSignalTable>,
+    /// `fork`/`vfork`: a private copy of the parent's credentials — a later
+    /// `setuid` in either must not reach the other. `clone_thread`: the parent's
+    /// `Arc`, because credentials are per-process, not per-thread.
+    pub creds: Arc<SharedCreds>,
     /// `0` for `fork`/`vfork`. For `clone_thread`, `child_tid_ptr` — but only when
     /// the caller passed `CLONE_CHILD_CLEARTID`, which is what earns the
     /// zero-and-futex-wake at exit.
@@ -977,6 +987,7 @@ impl Process {
             process_info_phys: AtomicUsize::new(o.process_info_phys),
             fds: o.fds,
             signal_actions: o.signal_actions,
+            creds: o.creds,
             clear_child_tid: AtomicU64::new(o.clear_child_tid),
 
             // ── inherited verbatim from the parent ──
@@ -3216,6 +3227,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // A COPY of the parent's dispositions, not a fresh table: POSIX says
         // fork inherits them. See `SharedSignalTable::clone_for_fork`.
         signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
+        creds: Arc::new(SharedCreds::new(parent.creds.get())),
         clear_child_tid: 0,
     })?;
 
@@ -3353,6 +3365,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
         // Inherited, like fork's — see `SharedSignalTable::clone_for_fork`.
         signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
+        creds: Arc::new(SharedCreds::new(parent.creds.get())),
         clear_child_tid: 0,
     })?;
     // `mmap_regions` is left empty by `inherit_from`: the child sees the parent's
@@ -3570,6 +3583,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         process_info_phys: parent.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
         fds: parent.fds.clone(), // Arc::clone — shared fd table (CLONE_FILES)
         signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
+        creds: parent.creds.clone(), // shared: credentials are per-process
         // Only a CLONE_CHILD_CLEARTID caller gets the zero-and-wake at exit.
         clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 { child_tid_ptr } else { 0 },
     })?;
@@ -4089,6 +4103,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         thread_id: None, spawner_pid: None, ctty: AtomicU32::new(0),
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
+        creds: Arc::new(SharedCreds::new(Creds::ROOT)),
         channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: AtomicU64::new(0),
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()),

@@ -769,6 +769,12 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 }
 
 pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
+    // Execute permission (`EACCES`). Root passes on any file with some x bit;
+    // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured:
+    // credentials pass through `execve` unchanged.
+    if let Err(e) = super::perm::check(&resolved_path, akuma_isolation::dac::MAY_EXEC) {
+        return e;
+    }
     // On the size profile the heap seed is 1 MB. Reading a large binary
     // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
     // Read just the first 256 bytes — enough for shebang detection — and
@@ -1411,9 +1417,6 @@ pub(super) fn sys_getppid() -> u64 {
     }
 }
 
-pub(super) fn sys_geteuid() -> u64 {
-    0
-}
 
 /// `capget`: report a full-root capability set, with real version negotiation.
 ///
@@ -1431,8 +1434,8 @@ pub(super) fn sys_geteuid() -> u64 {
 ///    `/proc/<pid>/status` says the opposite (`CapEff: 000001ffffffffff`). Two
 ///    sources of truth that disagree is worse than either answer alone.
 ///
-/// Everything here runs as root, so the honest answer is "all capabilities", and
-/// it matches what procfs reports.
+/// Root gets "all capabilities" and anything else gets none, matching what
+/// procfs reports — there is no finer capability model to answer from.
 pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
     /// `_LINUX_CAPABILITY_VERSION_1/2/3`. v3 is what every current libc uses.
     const CAP_V1: u32 = 0x1998_0330;
@@ -1472,9 +1475,15 @@ pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
     // v1 is one 32-bit triple; v2/v3 are two (low, high) — the struct is
     // `{effective, permitted, inheritable}` repeated per 32-bit slot.
     let slots: usize = if version == CAP_V1 { 1 } else { 2 };
+    // Linux clears the permitted and effective sets when a process drops from
+    // uid 0 to anything else, and libcap-ng/`setpriv` read them to decide the
+    // drop happened. procfs's `Cap*` lines say the same (`cred::caps_for`).
+    let root = akuma_exec::process::current_creds().is_root();
     let mut caps = [0u32; 6];
     for slot in 0..slots {
-        let (eff, perm, inh) = if slot == 0 {
+        let (eff, perm, inh) = if !root {
+            (0, 0, 0)
+        } else if slot == 0 {
             (CAP_LOW, CAP_LOW, 0)
         } else {
             (CAP_HIGH, CAP_HIGH, 0)
@@ -1493,42 +1502,6 @@ pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
     0
 }
 
-/// `getresuid`/`getresgid`: write the real, effective and saved id.
-///
-/// One function for both because this kernel has exactly one identity — root —
-/// so all six values are 0. Answering matters even though the answer is
-/// constant: util-linux's `setpriv` treats ENOSYS from these as fatal, and
-/// `redis:alpine`'s entrypoint runs `setpriv --reuid=redis` under `set -e`, so
-/// the container died before `redis-server` ever started.
-///
-/// A NULL pointer is EFAULT, matching Linux — a caller passing one has a bug,
-/// and silently succeeding would hide it.
-pub(super) fn sys_getresugid(rptr: u64, eptr: u64, sptr: u64) -> u64 {
-    let zero: u32 = 0;
-    for ptr in [rptr, eptr, sptr] {
-        if ptr == 0 || !validate_user_ptr(ptr, 4) {
-            return EFAULT;
-        }
-        if write_user_val(ptr, &zero).is_err() {
-            return EFAULT;
-        }
-    }
-    0
-}
-
-/// `getgroups`: this kernel has no supplementary groups, so the count is 0.
-///
-/// `size == 0` is the standard "how many are there?" probe and must return the
-/// count without touching the buffer — that is the only form `setpriv` uses, but
-/// the buffer form is handled too rather than left as a trap. A negative size is
-/// EINVAL, per Linux.
-pub(super) fn sys_getgroups(size: i32, _list_ptr: u64) -> u64 {
-    if size < 0 {
-        return EINVAL;
-    }
-    // Zero groups to report, so nothing is ever written to `list_ptr`.
-    0
-}
 
 /// `getrandom(buf, len, flags)`.
 ///
@@ -1588,7 +1561,28 @@ pub struct SpawnOptions {
     /// which `read_user_into` zero-fills past — hence 0 meaning "default".
     pub env_ptr: u64,
     pub env_len: usize,
+    /// The child's credentials, honoured only when `cred_flags` has
+    /// [`SPAWN_CREDS_SET`] — otherwise it inherits the caller's, as every
+    /// spawn did before these fields existed. Appended (2026-10-14), so a
+    /// caller that supplies the 88-byte layout reads them as zero = unset.
+    ///
+    /// A spawn may only **lower** credentials, by exactly the rules `setuid`
+    /// follows (`akuma_isolation::creds`): the caller's own credentials, then
+    /// `setgroups`, `setgid`, `setuid` applied in that order — so from root
+    /// anything, and from any other uid only what it already is. That is how
+    /// `box run` starts an image's `User` without a window in which the
+    /// entrypoint runs as root.
+    pub uid: u32,
+    pub gid: u32,
+    /// `ngroups` supplementary group ids (`u32` each), at most
+    /// `akuma_isolation::creds::NGROUPS`.
+    pub groups_ptr: u64,
+    pub ngroups: u32,
+    pub cred_flags: u32,
 }
+
+/// `SpawnOptions::cred_flags`: apply `uid`/`gid`/`groups` to the child.
+pub const SPAWN_CREDS_SET: u32 = 1;
 
 // This layout is restated independently in userspace (`boxlib::sys::SpawnOptions`,
 // docs/archive/HERD_PLUS_BOX.md) because a kernel crate cannot depend on a
@@ -1597,7 +1591,7 @@ pub struct SpawnOptions {
 // drifts, one of the two builds fails here rather than the kernel silently
 // reading `box_id` out of what userspace meant as `stdin_len`.
 const _: () = {
-    assert!(core::mem::size_of::<SpawnOptions>() == 88);
+    assert!(core::mem::size_of::<SpawnOptions>() == 112);
     assert!(core::mem::offset_of!(SpawnOptions, cwd_ptr) == 0);
     assert!(core::mem::offset_of!(SpawnOptions, cwd_len) == 8);
     assert!(core::mem::offset_of!(SpawnOptions, root_dir_ptr) == 16);
@@ -1609,7 +1603,48 @@ const _: () = {
     assert!(core::mem::offset_of!(SpawnOptions, box_id) == 64);
     assert!(core::mem::offset_of!(SpawnOptions, env_ptr) == 72);
     assert!(core::mem::offset_of!(SpawnOptions, env_len) == 80);
+    assert!(core::mem::offset_of!(SpawnOptions, uid) == 88);
+    assert!(core::mem::offset_of!(SpawnOptions, gid) == 92);
+    assert!(core::mem::offset_of!(SpawnOptions, groups_ptr) == 96);
+    assert!(core::mem::offset_of!(SpawnOptions, ngroups) == 104);
+    assert!(core::mem::offset_of!(SpawnOptions, cred_flags) == 108);
 };
+
+/// The credentials a `SPAWN_EXT` asks for, checked against the caller's: the
+/// caller's own, lowered by `setgroups`/`setgid`/`setuid` in the order a
+/// privilege-dropping wrapper makes them. `None` = not requested (inherit).
+fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>, u64> {
+    use akuma_isolation::creds::{CredError, NGROUPS};
+    if o.cred_flags & SPAWN_CREDS_SET == 0 {
+        return Ok(None);
+    }
+    let n = o.ngroups as usize;
+    if n > NGROUPS {
+        return Err(EINVAL);
+    }
+    let mut buf = [0u8; NGROUPS * 4];
+    if n > 0 {
+        if !validate_user_ptr(o.groups_ptr, n * 4) {
+            return Err(EFAULT);
+        }
+        if copy_from_user(&mut buf[..n * 4], o.groups_ptr).is_err() {
+            return Err(EFAULT);
+        }
+    }
+    let mut groups = [0u32; NGROUPS];
+    for (i, g) in groups.iter_mut().take(n).enumerate() {
+        *g = u32::from_ne_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]]);
+    }
+    let mut c = akuma_exec::process::current_creds();
+    let errno = |e| match e {
+        CredError::Perm => EPERM,
+        CredError::Inval => EINVAL,
+    };
+    c.set_groups(&groups[..n]).map_err(errno)?;
+    c.set_gid(o.gid).map_err(errno)?;
+    c.set_uid(o.uid).map_err(errno)?;
+    Ok(Some(c))
+}
 
 pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     if ptr == 0 { return Vec::new(); }
@@ -1770,7 +1805,8 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     let env_vec = parse_argv_array(o.env_ptr);
     let env_opt = if env_vec.is_empty() { None } else { Some(env_vec.as_slice()) };
 
-    let spawned = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, env_opt, stdin_slice, cwd_ref, o.box_id, false);
+    let creds = spawn_creds(&o)?;
+    let spawned = akuma_exec::process::spawn_process_with_creds(&path, args_opt, env_opt, stdin_slice, cwd_ref, o.box_id, false, creds);
     // Every failure below collapses to ENOMEM for the caller; the reason is the
     // only thing that tells a missing file from a full slot table.
     if let Err(ref e) = spawned {
@@ -1857,6 +1893,12 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     // Linux: kill(pid <= 0, ...) targets a process group; we don't support
     // those semantics, so return EPERM for "operation not permitted".
     if pid <= 1 { return EPERM; }
+
+    // Box, then uid (`check_signal`). Before the probe below, so `kill(pid, 0)`
+    // cannot reveal a process in a box the caller cannot see.
+    if let Err(e) = akuma_exec::process::check_signal_pid(pid) {
+        return super::signal::deny_errno(e);
+    }
 
     // sig=0 is a "does the process exist?" probe — don't actually send anything.
     if sig == 0 {

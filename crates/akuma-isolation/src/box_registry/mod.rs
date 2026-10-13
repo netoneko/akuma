@@ -104,6 +104,16 @@ pub fn find_primary_box(pid: Pid) -> Option<u64> {
     })
 }
 
+/// [`hierarchy::reaches`] against the live registry, under its lock — no
+/// snapshot, so no allocation. For checks on hot paths (`kill`).
+#[must_use]
+pub fn box_reaches(source: u64, target: u64) -> bool {
+    if source == 0 || source == target {
+        return true;
+    }
+    with_irqs_disabled(|| hierarchy::reaches(&BOX_REGISTRY.lock(), source, target))
+}
+
 /// Initialize the box registry with Box 0 (Host)
 pub fn init_box_registry() {
     register_box(BoxInfo {

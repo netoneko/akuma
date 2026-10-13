@@ -2124,6 +2124,9 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
                 return Err(ENOENT);
             }
         }
+        super::perm::check_create(&path)?;
+    } else {
+        super::perm::check_open(&path, flags)?;
     }
 
     if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -2149,9 +2152,14 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
 
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
             let _ = akuma_vfs_glue::fs::write_file(&path, &[]);
-            if mode & 0o7777 != 0 {
-                let _ = akuma_vfs_glue::chmod(&path, mode & 0o7777);
+            // `mode & ~umask`, as Linux applies it. The umask was not applied
+            // here before credentials existed (only `mkdirat` used it), so a
+            // `creat(f, 0666)` came out world-writable.
+            let mode = mode & 0o7777 & !super::cred::current_umask();
+            if mode != 0 {
+                let _ = akuma_vfs_glue::chmod(&path, mode);
             }
+            super::perm::own_new(&path);
         } else if file_existed && (flags & akuma_exec::process::open_flags::O_TRUNC != 0) {
             // Diagnostic (2026-08-15 hunt §14): O_TRUNC here zeroes the file IN
             // PLACE (write_file → truncate_inode, same inode, blocks freed,
@@ -2399,7 +2407,7 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
             // Stat from constants (or forwards cross-core, which must keep the BKL).
             let _vfs_bkl = VfsBklGuard::new();
             if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&f.path, f.mount_id(), f.inode()) {
-                stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: meta.nlink(), st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
+                stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: meta.nlink(), st_uid: meta.uid, st_gid: meta.gid, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
@@ -2571,6 +2579,8 @@ pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, u64> 
                 st_size: meta.size as i64, 
                 st_mode: meta.mode, 
                 st_nlink: meta.nlink(),
+                st_uid: meta.uid,
+                st_gid: meta.gid,
                 st_blksize: 4096,
                 st_blocks: ((meta.size as i64) + 511) / 512,
                 st_atime: meta.accessed.unwrap_or(0) as i64,
@@ -2627,6 +2637,10 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            let mode = match super::perm::check_chmod(&f.path, mode) {
+                Ok(m) => m,
+                Err(e) => return e,
+            };
             match akuma_vfs_glue::chmod(&f.path, mode) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
@@ -2634,6 +2648,72 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
         }
         Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
         _ => 0,
+    }
+}
+
+/// `chown` on a resolved path: the permission rule, then the record. A device
+/// node accepts and ignores it, as `chmod` does. A filesystem that stores no
+/// owner refuses with `EPERM` — what Linux answers from one — rather than the
+/// old silent 0, which told `tar` an ownership was recorded when nothing was.
+fn chown_path(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<u64, u64> {
+    if akuma_vfs_glue::dev_node(path).is_some() {
+        return Ok(0);
+    }
+    super::perm::check_chown(path, uid, gid)?;
+    match akuma_vfs_glue::chown(path, uid, gid) {
+        Ok(()) => Ok(0),
+        Err(akuma_vfs_glue::FsError::NotSupported) => Err(EPERM),
+        Err(e) => Err(fs_error_to_errno(e)),
+    }
+}
+
+/// `-1` (as the `u32` the ABI passes) means "leave this id alone".
+fn chown_id(raw: u64) -> Option<u32> {
+    let id = raw as u32;
+    (id != u32::MAX).then_some(id)
+}
+
+/// `fchownat(dirfd, path, uid, gid, flags)`. `AT_SYMLINK_NOFOLLOW` changes the
+/// link itself (`lchown`); `AT_EMPTY_PATH` with an empty path is `fchown`.
+pub(super) fn sys_fchownat(dirfd: i32, path_ptr: u64, uid: u64, gid: u64, flags: u32) -> SysResult {
+    use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(EINVAL);
+    }
+    let raw_path = copy_from_user_str(path_ptr, 512)?;
+    if raw_path.is_empty() {
+        if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
+            return Ok(sys_fchown(dirfd as u32, uid, gid));
+        }
+        return Err(ENOENT);
+    }
+    let base: Option<String> = dirfd_base(dirfd, &raw_path)?;
+    let _vfs_bkl = VfsBklGuard::new();
+    let path = match base {
+        Some(b) => akuma_vfs_glue::resolve_path(&b, &raw_path),
+        None => akuma_vfs_glue::canonicalize_path(&raw_path),
+    };
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        akuma_vfs_glue::resolve_symlinks(&path)
+    } else {
+        path
+    };
+    if !akuma_vfs_glue::exists(&path) && !akuma_vfs_glue::is_symlink(&path) {
+        return Err(ENOENT);
+    }
+    chown_path(&path, chown_id(uid), chown_id(gid))
+}
+
+/// `fchown(fd, uid, gid)` — on the file the descriptor names. Anything that
+/// is not a file (a pipe, a socket, a device) accepts and ignores it, as before.
+pub(super) fn sys_fchown(fd: u32, uid: u64, gid: u64) -> u64 {
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            chown_path(&f.path, chown_id(uid), chown_id(gid)).unwrap_or_else(|e| e)
+        }
+        Some(_) => 0,
+        None => EBADF,
     }
 }
 
@@ -2665,6 +2745,7 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
         return Ok(0);
     }
 
+    let mode = super::perm::check_chmod(&path, mode)?;
     match akuma_vfs_glue::chmod(&path, mode) {
         Ok(()) => Ok(0),
         Err(e) => Err(fs_error_to_errno(e)),
@@ -2790,6 +2871,7 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
     } else {
         return Err(EBADF);
     };
+    super::perm::check(&resolved, akuma_isolation::dac::MAY_WRITE)?;
     match akuma_vfs_glue::truncate(&resolved, length as u64) {
         Ok(()) => Ok(0),
         Err(e) => Err(fs_error_to_errno(e)),
@@ -2837,14 +2919,14 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
 
     let follow = flags & akuma_syscalls_linux::flags::at::AT_SYMLINK_NOFOLLOW == 0;
 
-    let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor) =
+    let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor, uid, gid) =
         // The second copy of `sys_newfstatat`'s device arms, now the same
         // single lookup — see the comment there.
         if let Some(node) = akuma_vfs_glue::dev_node(&resolved_path) {
-            (node.mode() as u16, node.ino, 0u64, 1u32, 0i64, 0i64, 0i64, node.major, node.minor)
+            (node.mode() as u16, node.ino, 0u64, 1u32, 0i64, 0i64, 0i64, node.major, node.minor, 0u32, 0u32)
         } else if !follow && akuma_vfs_glue::is_symlink(&resolved_path) {
             let target = akuma_vfs_glue::read_symlink(&resolved_path).unwrap_or_default();
-            (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
+            (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0, 0, 0)
         } else {
             let final_path = if follow { akuma_vfs_glue::resolve_symlinks(&resolved_path) } else { resolved_path };
             if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&final_path, fd_mount, fd_inode) {
@@ -2853,10 +2935,10 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
                  meta.accessed.unwrap_or(0) as i64,
                  meta.modified.unwrap_or(0) as i64,
                  meta.created.unwrap_or(0) as i64,
-                 0, 0)
+                 0, 0, meta.uid, meta.gid)
             } else if akuma_vfs_glue::is_symlink(&final_path) {
                 let target = akuma_vfs_glue::read_symlink(&final_path).unwrap_or_default();
-                (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
+                (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0, 0, 0)
             } else {
                 return Err(ENOENT);
             }
@@ -2869,13 +2951,15 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
     const STATX_BASIC_STATS: u32 = 0x07ff;
 
     // Only the fields STATX_BASIC_STATS advertises are filled; the rest stay zero, as
-    // they did when this was a zeroed byte buffer. `stx_uid`/`stx_gid` are 0 (root) and
-    // `stx_attributes`/`stx_attributes_mask` are unsupported, so both stay zero too.
+    // they did when this was a zeroed byte buffer. `stx_attributes`/`stx_attributes_mask`
+    // are unsupported, so both stay zero too.
     let statx = Statx {
         stx_mask: STATX_BASIC_STATS,
         stx_blksize: blksize,
         stx_nlink: nlink,
         stx_mode: mode,
+        stx_uid: uid,
+        stx_gid: gid,
         stx_ino: ino,
         stx_size: size,
         stx_blocks: blocks,
@@ -2951,6 +3035,9 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
     // A NULL `times` means "both to now". Otherwise it is two `struct timespec`,
     // and a malformed one is EINVAL *before* any lookup — Linux validates the
     // argument regardless of whether the path resolves.
+    // Whether every stamp being set is "now" — the case Linux lets anyone with
+    // write access do, where an explicit time needs ownership.
+    let mut to_now = true;
     let (atime, mtime) = if times_ptr == 0 {
         (now_secs, now_secs)
     } else {
@@ -2969,6 +3056,7 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
         // `times[0]` is atime, `times[1]` mtime. `UTIME_OMIT` -> leave alone
         // (`None`); `UTIME_NOW` -> the clock; otherwise the supplied `tv_sec`.
         // Sub-second precision is dropped: ext2 stores whole seconds.
+        to_now = times.iter().all(|t| t.tv_nsec == UTIME_NOW || t.tv_nsec == UTIME_OMIT);
         let pick = |t: &Timespec| -> Option<u64> {
             match t.tv_nsec {
                 UTIME_OMIT => None,
@@ -3005,6 +3093,7 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
     if !akuma_vfs_glue::exists(&target) {
         return Err(ENOENT);
     }
+    super::perm::check_set_times(&target, to_now)?;
     // Existence is already established above, so the two "there is no inode to
     // stamp" answers are success, not failure:
     //
@@ -3026,13 +3115,22 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
     }
 }
 
-pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {
+/// `access`/`faccessat`/`faccessat2`.
+///
+/// `F_OK` (0) is existence; `R_OK`/`W_OK`/`X_OK` (4/2/1 — the same bits as `dac::MAY_*`) are the permission check
+/// `open`/`execve` would make. Real ids and effective ids are one value here,
+/// so `AT_EACCESS` changes nothing. Until 2026-10-14 `mode` was ignored and
+/// every existing path was "accessible".
+pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: u32, _flags: u32) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
     
     let resolved_path = resolve_path_at(dirfd, &path)?;
     
     let final_path = akuma_vfs_glue::resolve_symlinks(&resolved_path);
-    if akuma_vfs_glue::fs::exists(&final_path) || akuma_vfs_glue::is_symlink(&resolved_path) {
+    if akuma_vfs_glue::fs::exists(&final_path) {
+        super::perm::check(&final_path, mode & 7)?;
+        Ok(0)
+    } else if akuma_vfs_glue::is_symlink(&resolved_path) {
         Ok(0)
     } else {
         if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
@@ -3155,13 +3253,6 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 }
 
-/// The file-creation mask every process has.
-///
-/// `umask(2)` reports it and stores nothing (there is no per-process mask yet),
-/// so the value applied when creating a directory and the value programs are
-/// told must be this one.
-pub const UMASK: u32 = 0o022;
-
 pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 512)?;
 
@@ -3186,6 +3277,7 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
         akuma_primitives::safe_print!(256, "[syscall] mkdirat({}) dirfd={}\n", &path, dirfd);
     }
 
+    super::perm::check_create(&path)?;
     match akuma_vfs_glue::fs::create_dir(&path) {
         // The requested mode, as Linux applies it: `mode & ~umask`, keeping
         // the permission bits and the sticky bit (`S_IRWXUGO | S_ISVTX`).
@@ -3195,7 +3287,8 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
         // exactly 0700 (`process_singleton_posix.cc`). A failed chmod leaves the
         // directory as created: the mkdir itself succeeded.
         Ok(()) => {
-            let _ = akuma_vfs_glue::chmod(&path, mode & !UMASK & 0o1777);
+            let _ = akuma_vfs_glue::chmod(&path, mode & !super::cred::current_umask() & 0o1777);
+            super::perm::own_new(&path);
             Ok(0)
         }
         Err(e) => Err(fs_error_to_errno(e)),
@@ -3239,6 +3332,7 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
         }
     }
 
+    super::perm::check_delete(&resolved)?;
     if flags & akuma_syscalls_linux::flags::at::AT_REMOVEDIR != 0 {
         match akuma_vfs_glue::fs::remove_dir(&resolved) {
             Ok(()) => Ok(0),
@@ -3269,9 +3363,21 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
     }
+    check_rename(&oldpath, &newpath)?;
     match akuma_vfs_glue::fs::rename(&oldpath, &newpath) {
         Ok(()) => Ok(0),
         Err(e) => Err(fs_error_to_errno(e)),
+    }
+}
+
+/// The permission side of a rename: removing the old name (sticky rules
+/// included) and either adding the new one or replacing what is there.
+fn check_rename(oldpath: &str, newpath: &str) -> Result<(), u64> {
+    super::perm::check_delete(oldpath)?;
+    if akuma_vfs_glue::exists(newpath) {
+        super::perm::check_delete(newpath)
+    } else {
+        super::perm::check_create(newpath)
     }
 }
 
@@ -3304,6 +3410,7 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] renameat2: {} -> {} flags=0x{:x}\n", oldpath, newpath, flags);
     }
+    check_rename(&oldpath, &newpath)?;
     match akuma_vfs_glue::fs::rename(&oldpath, &newpath) {
         Ok(()) => Ok(0),
         Err(e) => Err(fs_error_to_errno(e)),
@@ -3317,8 +3424,12 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
     }
+    super::perm::check_create(&link_path)?;
     match akuma_vfs_glue::create_symlink(&link_path, &target) {
-        Ok(()) => Ok(0),
+        Ok(()) => {
+            super::perm::own_new(&link_path);
+            Ok(0)
+        }
         Err(e) => Err(fs_error_to_errno(e)),
     }
 }
@@ -3509,6 +3620,8 @@ pub(super) fn sys_chdir(ptr: u64) -> SysResult {
         if akuma_vfs_glue::fs::exists(&new_cwd)
             && let Ok(meta) = akuma_vfs_glue::metadata(&new_cwd)
                 && meta.is_dir {
+                    // Search permission on the directory itself.
+                    super::perm::check(&new_cwd, akuma_isolation::dac::MAY_EXEC)?;
                     // Pre-built String moved into the IRQ-masked closure (no alloc inside).
                     akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
                     return Ok(0);

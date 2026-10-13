@@ -312,7 +312,29 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
     }
 }
 
+/// The errno for a refused signal: `ESRCH` for a target outside the caller's
+/// reach (it must look absent), `EPERM` for another uid's process.
+pub fn deny_errno(e: akuma_exec::process::SignalDeny) -> u64 {
+    match e {
+        akuma_exec::process::SignalDeny::Invisible => ESRCH,
+        akuma_exec::process::SignalDeny::Forbidden => EPERM,
+    }
+}
+
+/// [`check_signal`](akuma_exec::process::check_signal) for a thread id. A tid
+/// with no owning process (a kernel thread) is reachable only from the host.
+pub fn check_signal_tid(tid: u32) -> Result<(), akuma_exec::process::SignalDeny> {
+    match akuma_exec::process::find_pid_by_thread(tid as usize) {
+        Some(pid) => akuma_exec::process::check_signal_pid(pid),
+        None if super::caller_box_and_pid().0 == 0 => Ok(()),
+        None => Err(akuma_exec::process::SignalDeny::Invisible),
+    }
+}
+
 pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
+    if let Err(e) = check_signal_tid(tid) {
+        return deny_errno(e);
+    }
     if sig == 0 { return 0; }
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
 

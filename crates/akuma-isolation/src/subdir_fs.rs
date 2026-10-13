@@ -164,6 +164,11 @@ impl Filesystem for SubdirFs {
         self.inner.chmod(p, mode)
     }
 
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.chown(p, uid, gid)
+    }
+
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
         full_path!(old, &self.prefix, old_path);
         full_path!(new, &self.prefix, new_path);

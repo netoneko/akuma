@@ -9,11 +9,12 @@ extern crate std;
 
 use std::string::{String, ToString};
 use std::vec::Vec;
+use std::format;
 
 use super::*;
 
 fn stat_of(pid: u32, ppid: u32, name: &str, state: ProcState, us: u64) -> ProcStat<'_> {
-    ProcStat { pid, ppid, state, name, cpu_time_us: us }
+    ProcStat { pid, ppid, state, name, cpu_time_us: us, uid: 0, gid: 0, groups: &[] }
 }
 
 fn render_stat_str(p: &ProcStat) -> String {
@@ -287,4 +288,34 @@ fn maps_line_fits_its_maximum_for_a_bounded_path() {
     let n = render_maps_line(usize::MAX, usize::MAX, true, true, true, false, path, &mut buf);
     assert!(n <= MAPS_LINE_MAX);
     assert_eq!(buf[n - 1], b'\n', "line was truncated: {:?}", core::str::from_utf8(&buf[..n]));
+}
+
+#[test]
+fn status_reports_a_dropped_process_with_no_capabilities() {
+    let mut p = stat_of(9, 1, "redis-server", ProcState::Sleeping, 0);
+    p.uid = 999;
+    p.gid = 1000;
+    p.groups = &[1000, 50];
+    let mut buf = [0u8; STATUS_MAX];
+    let n = render_status(&p, &mut buf);
+    let text = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(text.contains("Uid:\t999\t999\t999\t999\n"));
+    assert!(text.contains("Gid:\t1000\t1000\t1000\t1000\n"));
+    assert!(text.contains("Groups:\t1000 50 \n"), "Linux's trailing-space format");
+    assert!(text.contains(&format!("CapEff:\t{CAP_EMPTY_MASK}\n")));
+    assert!(text.contains(&format!("CapPrm:\t{CAP_EMPTY_MASK}\n")));
+    assert!(text.contains(&format!("CapBnd:\t{CAP_FULL_MASK}\n")), "bounding set is not lost");
+}
+
+#[test]
+fn status_fits_with_the_maximum_group_list() {
+    let groups = [u32::MAX; 32];
+    let mut p = stat_of(u32::MAX, u32::MAX, "a-very-long-name", ProcState::Zombie(i32::MIN), u64::MAX);
+    p.uid = u32::MAX;
+    p.gid = u32::MAX;
+    p.groups = &groups;
+    let mut buf = [0u8; STATUS_MAX];
+    let n = render_status(&p, &mut buf);
+    let text = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(text.ends_with('\n') && text.contains("ExitCode:"), "nothing truncated: {n} bytes");
 }

@@ -9,7 +9,7 @@ Kernel side: [`../../../docs/reference/subsystems/containers.md`](../../../docs/
 ## Startup sequence
 
 ```
-box run [--rm] [-d] [-i] [--name X] [-w dir] [--entrypoint P] [-e K=V] <image> [cmd …]
+box run [--rm] [-d] [-i] [--name X] [-w dir] [-u user[:group]] [--entrypoint P] [-e K=V] <image> [cmd …]
   │
   ├─ resolve image → /var/lib/box/images/<store>/{oci-config.json,layers}
   ├─ read `layers` (base-first) → reverse → overlay lowerdirs (topmost-first)
@@ -46,7 +46,9 @@ across runs and an unnamed one (`<image>-<uptime>`) is unique.
 | `-e KEY` passthrough from `box`'s own environment | ✅ — an unset name is dropped, not passed empty |
 | Script (shebang) Entrypoint | ✅ (2026-08-16) — `resolve_shebang_chain`, inside the box's namespace |
 | `-p` port mapping, `-v` volumes | ❌ |
-| `USER`, cgroups, capabilities, seccomp | ❌ — isolation here is namespace + network-stack |
+| `USER` / `-u user[:group]` | ✅ (2026-10-14) — resolved against the image's own `/etc/passwd` and `/etc/group`; an unknown name refuses to start. Enforced only while `/proc/dac` is `1` — [`../../../docs/reference/subsystems/permissions.md`](../../../docs/reference/subsystems/permissions.md) |
+| Layer file owners and directory modes | ✅ (2026-10-14) — images pulled earlier are root-owned; re-pull |
+| cgroups, capabilities, seccomp | ❌ — isolation here is namespace + network-stack |
 | Docker-in-docker | ❌ **by design** — see below |
 | Interactive (`-i`), including from an SSH login shell | ✅ (fixed 2026-08-11 — a container's exit used to close the login shell; see the archive doc) |
 | `/proc` in the container | ✅ mounted by `box run`; `ps` sees only the container |

@@ -454,6 +454,9 @@ impl Process {
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
 
             box_id: 0,
+            // Root until something lowers it. `spawn` overwrites this with the
+            // caller's credentials; only the very first process keeps it as is.
+            creds: Arc::new(crate::process::SharedCreds::new(crate::process::Creds::ROOT)),
             namespace: akuma_isolation::global_namespace(),
             channel: None,
             delegate_pid: None,

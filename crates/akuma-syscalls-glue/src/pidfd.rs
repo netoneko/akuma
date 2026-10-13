@@ -90,6 +90,11 @@ pub(super) fn sys_pidfd_send_signal(pidfd: u32, sig: u32, _info: u64, flags: u32
     let Some(pid) = pidfd_get_pid(target) else {
         return ESRCH;
     };
+    // A pidfd can be inherited across a box boundary or passed over AF_UNIX, so
+    // holding one is not permission to signal through it.
+    if let Err(e) = akuma_exec::process::check_signal_pid(pid) {
+        return super::signal::deny_errno(e);
+    }
     // `sig == 0` probes existence without delivering anything — same
     // exemption `sys_kill` makes, for the same reason: `deliver_signal(pid,
     // 0)` would have nothing to deliver and no defined meaning.

@@ -12,29 +12,57 @@ use spinning_top::Spinlock;
 
 use crate::types::{DirEntry, Filesystem, FsError, FsStats, Metadata};
 
+/// A node's permission bits (`0o7777`: rwx for three classes plus setuid,
+/// setgid and sticky) and owner. Recorded, never enforced here — permission
+/// checks belong to the syscall layer.
+#[derive(Clone, Copy)]
+struct Perm {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl Perm {
+    const FILE: Self = Self { mode: 0o644, uid: 0, gid: 0 };
+    const DIR: Self = Self { mode: 0o755, uid: 0, gid: 0 };
+    /// A tmpfs root, as Linux mounts one by default: world-writable and sticky,
+    /// so unprivileged processes can create files in it without being able to
+    /// delete each other's.
+    const ROOT: Self = Self { mode: 0o1777, uid: 0, gid: 0 };
+}
+
 #[derive(Clone)]
 enum FsNode {
     File {
         data: Vec<u8>,
         created: u64,
         modified: u64,
+        perm: Perm,
     },
     Directory {
         children: BTreeMap<String, Self>,
         created: u64,
+        perm: Perm,
     },
 }
 
 impl FsNode {
-    const fn new_directory(now: u64) -> Self {
+    const fn new_directory(now: u64, perm: Perm) -> Self {
         Self::Directory {
             children: BTreeMap::new(),
             created: now,
+            perm,
         }
     }
 
     const fn is_dir(&self) -> bool {
         matches!(self, Self::Directory { .. })
+    }
+
+    const fn perm_mut(&mut self) -> &mut Perm {
+        match self {
+            Self::File { perm, .. } | Self::Directory { perm, .. } => perm,
+        }
     }
 }
 
@@ -65,7 +93,7 @@ impl MemoryFilesystem {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root: Spinlock::new(FsNode::new_directory(0)),
+            root: Spinlock::new(FsNode::new_directory(0, Perm::ROOT)),
             max_size: 0,
             time_fn: None,
         }
@@ -75,7 +103,7 @@ impl MemoryFilesystem {
     #[must_use]
     pub fn with_max_size(max_bytes: u64) -> Self {
         Self {
-            root: Spinlock::new(FsNode::new_directory(0)),
+            root: Spinlock::new(FsNode::new_directory(0, Perm::ROOT)),
             max_size: max_bytes,
             time_fn: None,
         }
@@ -98,6 +126,19 @@ impl MemoryFilesystem {
             match current {
                 FsNode::Directory { children, .. } => {
                     current = children.get(component).ok_or(FsError::NotFound)?;
+                }
+                FsNode::File { .. } => return Err(FsError::NotADirectory),
+            }
+        }
+        Ok(current)
+    }
+
+    fn navigate_mut<'a>(node: &'a mut FsNode, path: &str) -> Result<&'a mut FsNode, FsError> {
+        let mut current = node;
+        for component in path.split('/').filter(|s| !s.is_empty()) {
+            match current {
+                FsNode::Directory { children, .. } => {
+                    current = children.get_mut(component).ok_or(FsError::NotFound)?;
                 }
                 FsNode::File { .. } => return Err(FsError::NotADirectory),
             }
@@ -218,12 +259,19 @@ impl Filesystem for MemoryFilesystem {
         let (parent, filename) = Self::navigate_parent(&mut root, path)?;
 
         let now = self.now();
+        // Replacing a file's contents keeps its mode and owner, as a
+        // truncate-and-write would.
+        let perm = match parent.get(&filename) {
+            Some(FsNode::File { perm, .. }) => *perm,
+            _ => Perm::FILE,
+        };
         parent.insert(
             filename,
             FsNode::File {
                 data: data.to_vec(),
                 created: now,
                 modified: now,
+                perm,
             },
         );
 
@@ -266,7 +314,7 @@ impl Filesystem for MemoryFilesystem {
             return Err(FsError::AlreadyExists);
         }
 
-        parent.insert(dirname, FsNode::new_directory(self.now()));
+        parent.insert(dirname, FsNode::new_directory(self.now(), Perm::DIR));
         Ok(())
     }
 
@@ -355,6 +403,24 @@ impl Filesystem for MemoryFilesystem {
         }
     }
 
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        let mut root = self.root.lock();
+        Self::navigate_mut(&mut root, path)?.perm_mut().mode = mode & 0o7777;
+        Ok(())
+    }
+
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let mut root = self.root.lock();
+        let perm = Self::navigate_mut(&mut root, path)?.perm_mut();
+        if let Some(u) = uid {
+            perm.uid = u;
+        }
+        if let Some(g) = gid {
+            perm.gid = g;
+        }
+        Ok(())
+    }
+
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let root = self.root.lock();
         let node = Self::navigate(&root, path)?;
@@ -365,25 +431,30 @@ impl Filesystem for MemoryFilesystem {
                 data,
                 created,
                 modified,
+                perm,
             } => Ok(Metadata {
                 is_dir: false,
                 size: data.len() as u64,
                 inode,
-                mode: 0o10_0644,
+                mode: 0o10_0000 | perm.mode,
                 created: Some(*created),
                 modified: Some(*modified),
                 accessed: None,
                 links: None,
+                uid: perm.uid,
+                gid: perm.gid,
             }),
-            FsNode::Directory { created, .. } => Ok(Metadata {
+            FsNode::Directory { created, perm, .. } => Ok(Metadata {
                 is_dir: true,
                 size: 0,
                 inode,
-                mode: 0o4_0755,
+                mode: 0o4_0000 | perm.mode,
                 created: Some(*created),
                 modified: None,
                 accessed: None,
                 links: None,
+                uid: perm.uid,
+                gid: perm.gid,
             }),
         }
     }

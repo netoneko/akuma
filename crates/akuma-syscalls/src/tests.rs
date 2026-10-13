@@ -347,11 +347,13 @@ fn leaf_diverges_from_the_oracle_in_exactly_the_documented_places() {
     //
     //   UPTIME             `akuma_timer::uptime_us()` — a counter read, nothing else.
     //   AKUMA_GET_VERSION  returns a compile-time constant.
-    //   GETUID/GETGID/GETEGID  literally `nr::GETUID => 0` in the match arm.
-    //   GETEUID            `sys_geteuid()`, whose entire body is `0`.
     //
-    // All six: read no `args`, touch no `Process`/table/fd/address space, cannot
+    // Both: read no `args`, touch no `Process`/table/fd/address space, cannot
     // block, and their `/proc/<pid>/syscalls` rows say only "returned a constant".
+    //
+    // `getuid`/`geteuid`/`getgid`/`getegid` were members while they returned a
+    // literal 0; since 2026-10-14 they read the caller's credentials, so they
+    // are identity and left the tier.
     //
     // NOT here, and each for a reason worth keeping written down: `getpid` reads
     // `read_current_pid()`, `gettid` reads the thread id, `getppid` walks the
@@ -364,14 +366,7 @@ fn leaf_diverges_from_the_oracle_in_exactly_the_documented_places() {
     // look up the context and format `ctx`/`nr`, so they read arguments and take
     // a lock. Membership is therefore per-BUILD, never per-run — see
     // `flat_when_untraced`.
-    let want = vec![
-        nr::GETUID,
-        nr::GETEUID,
-        nr::GETGID,
-        nr::GETEGID,
-        nr::UPTIME,
-        nr::AKUMA_GET_VERSION,
-    ];
+    let want = vec![nr::UPTIME, nr::AKUMA_GET_VERSION];
     assert_eq!(
         leaves, want,
         "the Leaf membership changed — every entry needs the four admission \

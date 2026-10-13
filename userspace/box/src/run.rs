@@ -17,7 +17,7 @@ use boxlib::sys::{self, SpawnOptions, spawn_ext_env};
 use crate::images;
 
 const USAGE: &str =
-    "Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] [-e K=V] <image> [cmd [args...]]\n";
+    "Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] [-u user[:group]] [-e K=V] <image> [cmd [args...]]\n";
 
 /// What a pulled image says to run. An image with no readable config yields an
 /// empty process, which `cmd_run` reports rather than spawning.
@@ -47,6 +47,33 @@ fn resolve_in_container(upper: &str, lowerdirs: &[String], program: &str) -> Str
         }
     }
     String::from(program)
+}
+
+/// A file's contents as the container will see it: the upper directory first,
+/// then the layers topmost-first. Whiteouts are not consulted — a deleted
+/// `/etc/passwd` in an upper layer is not a case worth the complexity here.
+/// `""` if no layer has it, which `resolve_user` treats as an empty table.
+fn read_in_container(upper: &str, lowerdirs: &[String], path: &str) -> String {
+    let candidates = core::iter::once(upper).chain(lowerdirs.iter().map(String::as_str));
+    for dir in candidates {
+        let full = format!("{}{}", dir, path);
+        let fd = open(&full, open_flags::O_RDONLY);
+        if fd < 0 {
+            continue;
+        }
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = read_fd(fd, &mut buf);
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        close(fd);
+        return String::from_utf8(out).unwrap_or_default();
+    }
+    String::new()
 }
 
 fn copy_file(src: &str, dst: &str) -> bool {
@@ -244,6 +271,24 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     let path = resolve_in_container(&upper, &lowerdirs, &argv[0]);
     let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
 
+    // `-u`, else the image's `config.User`, resolved against the image's own
+    // passwd/group files. Refuse to start rather than fall back to root: an
+    // image that says `USER app` expects never to have run as root.
+    let user = parsed.user.clone().unwrap_or_else(|| image_proc.user.clone());
+    let run_as = match spec::resolve_user(
+        &user,
+        &read_in_container(&upper, &lowerdirs, "/etc/passwd"),
+        &read_in_container(&upper, &lowerdirs, "/etc/group"),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            print("box run: ");
+            println(&e);
+            sys::kill_box(box_id);
+            exit(1);
+        }
+    };
+
     let mut options = SpawnOptions {
         cwd_ptr: working_dir.as_ptr() as u64,
         cwd_len: working_dir.len(),
@@ -256,7 +301,13 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         box_id,
         env_ptr: 0,
         env_len: 0,
+        ..Default::default()
     };
+    // Borrowed by `options` until the spawn below returns.
+    let groups: Vec<u32> = run_as.as_ref().map(|r| r.groups.clone()).unwrap_or_default();
+    if let Some(r) = &run_as {
+        options.set_creds(r.uid, r.gid, &groups);
+    }
 
     print("box: running '");
     print(&path);

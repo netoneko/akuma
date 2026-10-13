@@ -4,6 +4,7 @@
 //! to run, `box run`'s flags say what the user wants instead, and
 //! [`ImageProcess::argv_with`] resolves the two the way `docker run` does.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -18,6 +19,10 @@ pub struct ImageProcess {
     pub working_dir: String,
     /// The image's `config.Env`, in the order the image lists it.
     pub env: Vec<String>,
+    /// The image's `config.User` — `""` for root, else `user`, `uid`,
+    /// `user:group`, `uid:gid` and the mixed forms. Resolved by
+    /// [`resolve_user`] against the image's own `/etc/passwd` and `/etc/group`.
+    pub user: String,
 }
 
 impl Default for ImageProcess {
@@ -29,6 +34,7 @@ impl Default for ImageProcess {
             cmd: Vec::new(),
             working_dir: String::from("/"),
             env: Vec::new(),
+            user: String::new(),
         }
     }
 }
@@ -71,7 +77,89 @@ pub fn image_process_from_config(config_json: &str) -> ImageProcess {
         cmd: json::strings_at(config_json, &["config", "Cmd", "*"]),
         working_dir,
         env: json::strings_at(config_json, &["config", "Env", "*"]),
+        user: json::string_at(config_json, &["config", "User"]).unwrap_or_default(),
     }
+}
+
+/// Who a container's first process runs as.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RunAs {
+    pub uid: u32,
+    pub gid: u32,
+    /// Supplementary groups: every `/etc/group` entry naming the user.
+    pub groups: Vec<u32>,
+}
+
+/// One `/etc/passwd` line's name, uid and primary gid.
+fn passwd_entries(passwd: &str) -> impl Iterator<Item = (&str, u32, u32)> {
+    passwd.lines().filter_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let _pw = f.next()?;
+        Some((name, f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    })
+}
+
+/// One `/etc/group` line's name, gid and member list.
+fn group_entries(group: &str) -> impl Iterator<Item = (&str, u32, &str)> {
+    group.lines().filter_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let _pw = f.next()?;
+        Some((name, f.next()?.parse().ok()?, f.next().unwrap_or("")))
+    })
+}
+
+/// Resolve an OCI `User` (`config.User`, or `box run -u`) the way runc does,
+/// against the **image's** `passwd` and `group` files — never the host's: a
+/// name means whatever the image says it means.
+///
+/// - `""` is root, unchanged: `Ok(None)`.
+/// - `name` / `uid`: the uid, and the primary gid from that user's `passwd`
+///   line. A numeric uid with no line gets gid 0, as in runc.
+/// - `…:group` / `…:gid`: that group instead of the passwd one.
+/// - Supplementary groups are the `group` entries listing the user's *name*,
+///   so a numeric uid with no passwd line has none.
+///
+/// A name that is not in the image is an error, not root: starting a container
+/// as root because its `User` could not be found is the one wrong answer.
+pub fn resolve_user(user: &str, passwd: &str, group: &str) -> Result<Option<RunAs>, String> {
+    let user = user.trim();
+    if user.is_empty() {
+        return Ok(None);
+    }
+    let (u, g) = match user.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user, None),
+    };
+    let entry = match u.parse::<u32>() {
+        Ok(n) => passwd_entries(passwd).find(|e| e.1 == n),
+        Err(_) => Some(
+            passwd_entries(passwd)
+                .find(|e| e.0 == u)
+                .ok_or_else(|| format!("user '{u}' not found in the image's /etc/passwd"))?,
+        ),
+    };
+    let uid = u.parse::<u32>().ok().or(entry.map(|e| e.1)).unwrap_or(0);
+    let gid = match g {
+        Some(g) => match g.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => group_entries(group)
+                .find(|e| e.0 == g)
+                .map(|e| e.1)
+                .ok_or_else(|| format!("group '{g}' not found in the image's /etc/group"))?,
+        },
+        None => entry.map_or(0, |e| e.2),
+    };
+    let mut groups = Vec::new();
+    if let Some((name, _, _)) = entry {
+        for (_, gid, members) in group_entries(group) {
+            if members.split(',').any(|m| m == name) && !groups.contains(&gid) {
+                groups.push(gid);
+            }
+        }
+    }
+    Ok(Some(RunAs { uid, gid, groups }))
 }
 
 /// The name half of a `KEY=VALUE` entry, or the whole string when there is no
@@ -169,6 +257,8 @@ pub struct RunArgs {
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub entrypoint: Option<String>,
+    /// `-u`/`--user`: overrides the image's `config.User`, as `docker run -u`.
+    pub user: Option<String>,
     /// `-e` entries in command-line order. A bare `KEY` (no `=`) is a
     /// passthrough request the caller resolves against its own environment
     /// before composing — this layer keeps it verbatim.
@@ -217,6 +307,7 @@ pub fn parse_run_args(args: &[&str]) -> Result<RunArgs, RunArgsError> {
             "--entrypoint" => out.entrypoint = Some(value_of(args, &mut i, "--entrypoint")?),
             "-e" | "--env" => out.env.push(value_of(args, &mut i, "--env")?),
             "-w" | "--workdir" => out.workdir = Some(value_of(args, &mut i, "--workdir")?),
+            "-u" | "--user" => out.user = Some(value_of(args, &mut i, "--user")?),
             _ => {
                 out.image = String::from(arg);
                 out.argv = args[i..].iter().map(|a| String::from(*a)).collect();
@@ -304,6 +395,7 @@ mod tests {
             cmd: strs(&["sh"]),
             working_dir: String::from("/"),
             env: Vec::new(),
+            user: String::new(),
         };
         assert_eq!(p.argv_with(&[]), ["sh"]);
     }
@@ -315,6 +407,7 @@ mod tests {
             cmd: strs(&["--help"]),
             working_dir: String::from("/"),
             env: Vec::new(),
+            user: String::new(),
         };
         assert_eq!(p.argv_with(&[]), ["/usr/bin/curl", "--help"]);
         assert_eq!(
@@ -330,6 +423,7 @@ mod tests {
             cmd: strs(&["sh"]),
             working_dir: String::from("/"),
             env: Vec::new(),
+            user: String::new(),
         };
         assert_eq!(p.argv_with(&strs(&["echo", "hi"])), ["echo", "hi"]);
     }
@@ -341,6 +435,7 @@ mod tests {
             cmd: strs(&["--help"]),
             working_dir: String::from("/"),
             env: Vec::new(),
+            user: String::new(),
         };
         p.override_entrypoint("/bin/sh");
         assert_eq!(p.argv_with(&[]), ["/bin/sh"]);
@@ -518,5 +613,55 @@ mod tests {
         assert_eq!(a.name.as_deref(), Some("--rm"));
         assert!(!a.rm);
         assert_eq!(a.image, "img");
+    }
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\npostgres:x:70:70:pg:/var/lib/postgresql:/bin/sh\nredis:x:999:1000::/data:/sbin/nologin\n";
+    const GROUP: &str = "root:x:0:root\npostgres:x:70:\nredis:x:1000:\nwheel:x:10:root,postgres\nssl:x:101:postgres,redis\n";
+
+    #[test]
+    fn config_user_is_read() {
+        let p = image_process_from_config(r#"{"config":{"User":"postgres","Cmd":["x"]}}"#);
+        assert_eq!(p.user, "postgres");
+        assert_eq!(image_process_from_config(BUSYBOX_CONFIG).user, "");
+    }
+
+    #[test]
+    fn empty_user_is_root_unchanged() {
+        assert_eq!(resolve_user("", PASSWD, GROUP), Ok(None));
+    }
+
+    #[test]
+    fn a_name_takes_its_passwd_gid_and_its_group_memberships() {
+        let r = resolve_user("postgres", PASSWD, GROUP).unwrap().unwrap();
+        assert_eq!(r, RunAs { uid: 70, gid: 70, groups: vec![10, 101] });
+    }
+
+    #[test]
+    fn an_explicit_group_overrides_the_passwd_one() {
+        assert_eq!(resolve_user("redis:ssl", PASSWD, GROUP).unwrap().unwrap().gid, 101);
+        assert_eq!(resolve_user("redis:5", PASSWD, GROUP).unwrap().unwrap().gid, 5);
+    }
+
+    #[test]
+    fn a_numeric_uid_needs_no_passwd_line() {
+        let r = resolve_user("1234", PASSWD, GROUP).unwrap().unwrap();
+        assert_eq!(r, RunAs { uid: 1234, gid: 0, groups: vec![] });
+        // ...but uses one when there is one.
+        let r = resolve_user("999", PASSWD, GROUP).unwrap().unwrap();
+        assert_eq!((r.uid, r.gid, r.groups), (999, 1000, vec![101]));
+        assert_eq!(resolve_user("1234:1234", "", "").unwrap().unwrap().gid, 1234);
+    }
+
+    #[test]
+    fn an_unknown_name_is_an_error_never_root() {
+        assert!(resolve_user("nobody-here", PASSWD, GROUP).is_err());
+        assert!(resolve_user("redis:nogroup", PASSWD, GROUP).is_err());
+    }
+
+    #[test]
+    fn dash_u_is_parsed() {
+        let a = parse_run_args(&["-u", "1000:1000", "alpine", "id"]).unwrap();
+        assert_eq!(a.user.as_deref(), Some("1000:1000"));
+        assert_eq!(a.argv, vec![String::from("id")]);
     }
 }

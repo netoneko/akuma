@@ -906,6 +906,14 @@ pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
 /// `&'static mut Process` (aliasing UB when two cores hold one to the same
 /// object). Same lifetime caveat as [`lookup_process_shared`]: valid only
 /// while the process stays registered.
+/// The calling process's credentials, snapshotted. A kernel thread with no
+/// process is root — the same "kernel thread is box 0" convention the box
+/// checks use.
+#[must_use]
+pub fn current_creds() -> super::Creds {
+    current_process_shared().map_or(super::Creds::ROOT, |p| p.creds.get())
+}
+
 pub fn current_process_shared() -> Option<&'static Process> {
     // Identity cache fast path (own-process half): the map value's `Process`
     // in two validated loads — same resolution, same fallbacks.

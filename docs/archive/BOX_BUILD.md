@@ -1,0 +1,196 @@
+# `box build` — Docker-compatible image builds on Akuma
+
+**Date:** 2026-10-14
+**Status:** Sketch. Nothing here is implemented.
+**Depends on:** [`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) (steps 3–6) and
+[`HARD_LINKS.md`](HARD_LINKS.md). Built without them, every image would be
+`root:root` with hard links duplicated, and `USER`/`COPY --chown` would be no-ops.
+
+Goal: `box build -t name [-f Dockerfile] [--build-arg K=V] [--target S]
+[--no-cache] <context>` reads the same Dockerfiles `docker build` does and
+produces an image `box run` can run. The bar is that the output **loads into
+real Docker** (`box save | docker load`) and runs there.
+
+---
+
+## 1. What exists
+
+- **The overlay's upper directory is already an OCI layer diff.**
+  `akuma-isolation/src/overlay_fs.rs` records deletions as `.wh.<name>` and
+  opaque directories as `.wh..wh..opq` — the OCI image-layer spec's names. A
+  file and its own whiteout may coexist in one upper, which the spec allows
+  (whiteouts only hide *lower* layers).
+- **The layer store is extracted directories keyed by digest**
+  (`/var/lib/box/layers/sha256-…`), with images being only `oci-config.json` + a
+  base-first `layers` list (`userspace/box/src/paths.rs`). A committed upper can
+  be **renamed** into the store — the same format a pulled layer is extracted to,
+  so no re-extraction.
+- `miniz_oxide` (deflate both ways) is already a `userspace/tar` dependency;
+  `sha2` (no_std) is already in the workspace (`akuma-ssh-crypto`).
+- `box run` already assembles overlay roots, injects resolv.conf/hosts, spawns
+  with image `Env`/`WorkingDir`/Entrypoint/Cmd, and cleans up (`run.rs`).
+
+## 2. What is missing
+
+| Gap | Where |
+|---|---|
+| No `commit`/`build`/`save` command | `userspace/box/src/main.rs:44-60` |
+| `akuma-tar` extracts only — no archive writer | `userspace/tar/src/` |
+| JSON is read-only (`walk`, `string_at`, …) | `userspace/box/src/json.rs` |
+| resolv.conf/hosts are written **into the upper** — would land in every layer | `run.rs:79` |
+| Renaming a lower-layer directory → `NotSupported` → **`EIO`**. Linux overlayfs returns `EXDEV`, which makes `mv` fall back to copy+delete; `EIO` just fails | `overlay_fs.rs:513`, `fs_error_to_errno` default arm (`akuma-syscalls-glue/src/fs.rs:155`) |
+| Pull keeps no blobs (tarball deleted after extract) and verifies no digests | `oci.rs:205` |
+| No `rmi`, `tag`, or layer GC | `main.rs` |
+
+## 3. Constraint: the builder is a box-0 program
+
+A box may not mount (`docs/reference/subsystems/containers.md`), so a container
+cannot assemble another container's root. `box build` therefore runs on the
+host — the role `buildkitd` plays for Docker — and each `RUN` is a short-lived
+box it creates. Building from *inside* a box is out of scope by design, exactly
+as Docker-in-Docker is today (`userspace/box/docs/BOX_RUN.md`).
+
+---
+
+## 4. Design
+
+### 4.1 One primitive: commit an upper into a layer
+
+```
+commit(upper_dir, parent_config) -> (layer_digest, diff_id)
+  walk upper in sorted order (deterministic), skipping runtime files (§4.2)
+  for each entry emit a tar header:
+      mode, uid, gid (from stat — real after UNIX_PERMISSIONS),
+      mtime, symlink target, typeflag '1' for the 2nd+ name of an inode
+      with nlink > 1 (HARD_LINKS), PAX records for long names / big ids
+      whiteouts and opaque markers emitted as-is: they ARE the OCI encoding
+  stream:  tar bytes ─┬─ sha256 → diff_id
+                      └─ deflate ─┬─ sha256 → digest
+                                  └─ /var/lib/box/blobs/sha256-<digest>
+  rename upper_dir → /var/lib/box/layers/sha256-<digest>
+```
+
+One pass, bounded memory (stream in 64 KB chunks; never hold a layer). Keeping
+the blob is what lets `save`/`push` produce exactly the digest the config names
+without needing a bit-reproducible re-tar later.
+
+Exposed directly as **`box commit <container> <image>`** — Docker has the same
+command, and it is the smallest end-to-end slice: run, change, commit, run the
+result.
+
+### 4.2 Runtime files move out of the upper
+
+Instead of writing `/etc/resolv.conf` and `/etc/hosts` into the upper, write them
+into a per-container **runtime layer** directory and pass it as the *topmost
+lowerdir*. The container sees them; the upper only gets them if a step actually
+modifies them (copy-up). Fixes `box commit` for `box run` containers too, with no
+exclusion list to maintain.
+
+### 4.3 Config writer
+
+A small JSON *writer* in `boxlib` (host-tested): start from the parent config,
+set `config.{Env,Cmd,Entrypoint,WorkingDir,User,ExposedPorts,Labels,Volumes,
+StopSignal}`, append to `rootfs.diff_ids`, append a `history` entry
+(`empty_layer: true` for metadata-only steps), keep `architecture`/`os` from the
+base. Emit a manifest alongside (`config` + `layers` with digests, sizes and
+media types) so `save`/`push` have it.
+
+Pulled base images must also keep their manifest and blobs for `save`/`push` to
+re-export them (open question 1).
+
+### 4.4 The builder loop
+
+```
+parse Dockerfile → stages
+for each instruction in the target stage's dependency closure:
+    key = sha256(parent chain, canonical instruction, used build args,
+                 content hash of COPY/ADD sources incl. mode/owner)
+    cache hit → reuse layer, continue
+    FROM x [AS s]    local store first, else `box pull`
+    RUN              box with lowers = chain (+ runtime layer), fresh upper,
+                     SHELL (default /bin/sh -c) or exec form,
+                     Env = config Env + ARGs, WorkingDir, User (spawn creds);
+                     exit != 0 → fail, print the step and its output
+                     → commit(upper)
+    COPY/ADD         host writes into a fresh upper: .dockerignore applied,
+                     --chown/--chmod, ADD auto-extracts local tars, ADD <url>
+                     downloads (libakuma-tls) → commit(upper)
+    COPY --from=s    read stage s's merged view (open question 2)
+    WORKDIR          mkdir -p in a fresh upper if missing → commit; set config
+    ENV ARG LABEL EXPOSE USER CMD ENTRYPOINT SHELL STOPSIGNAL VOLUME HEALTHCHECK
+                     config only, history entry with empty_layer
+write images/<tag>/{oci-config.json,layers,manifest.json}
+```
+
+Variable expansion (`$V`, `${V}`, `${V:-d}`, `${V:+d}`), line continuations,
+`# syntax`/`# escape` directives, JSON vs shell forms — all pure, all in
+`boxlib::dockerfile` with host tests.
+
+Refused loudly (not silently ignored): `ONBUILD`, `RUN --mount`,
+`RUN --network`, `RUN --security`, heredocs. Each is a later addition with a
+clear error until then.
+
+---
+
+## 5. Order
+
+**Prerequisites**
+1. UNIX_PERMISSIONS steps 1–6 (creds, ownership, tar keeps owners, spawn creds).
+2. HARD_LINKS (real `linkat`, `st_nlink`, tar restores links).
+3. Overlay directory rename → `EXDEV` (new `FsError::CrossDevice`, mapped in
+   `fs_error_to_errno`). One-line fix plus a host test; `mv` then works in RUN
+   steps.
+
+**Build**
+4. Runtime layer for resolv.conf/hosts (§4.2).
+5. `akuma-tar` writer (owners, hard links, symlinks, PAX, whiteouts) + host tests.
+6. `boxlib` JSON writer + config/manifest builder + host tests.
+7. **`box commit`** (§4.1). First end-to-end gate.
+8. `boxlib::dockerfile` parser + expansion, host-tested against a corpus of real
+   Dockerfiles (official `alpine`-based images).
+9. **`box build`**, single stage: FROM/RUN/COPY/ENV/ARG/WORKDIR/USER/CMD/
+   ENTRYPOINT/LABEL/EXPOSE + `.dockerignore`, no cache.
+10. Build cache, `--no-cache`, `--build-arg`.
+11. Multi-stage (`AS`, `COPY --from`, `--target`), `ADD`, remaining metadata
+    instructions.
+12. `box save` (OCI layout / `docker load` format), `box tag`, `box rmi` + GC.
+    Pull starts keeping blobs and verifying digests.
+13. Later, optional: `box push` (registry auth + blob upload; check the TLS
+    client's single cipher suite against Docker Hub/GHCR first).
+
+## 6. Verification
+
+- **Host:** tar writer round-trips through `akuma-tar` extract (modes, owners,
+  links, whiteouts, PAX); Dockerfile parser corpus; config writer output parsed
+  back by `manifest.rs`/`spec.rs`.
+- **Same Dockerfile, two builders.** Build on Akuma and with Docker on the Mac;
+  dump each image's merged rootfs as `(path, type, mode, uid, gid, size,
+  sha256, link target, ino-group)` and diff. Timestamps and digests will differ;
+  the tree must not.
+- **Interop:** `box save` on Akuma → `docker load` on the Mac → `docker run`.
+  This is the definition of done for "same as Docker".
+- **Self-hosting:** a Dockerfile that builds a Rust binary in a `rust:alpine`
+  stage and copies it into an `alpine` stage, built on the ryzen metal.
+- **Unverified today:** that `RUN` steps have outbound network (`apk add`). `box
+  run` injects `resolv.conf` but this sketch did not check which stack a fresh box
+  gets. Check first; it gates step 9.
+
+## Open questions
+
+1. **Keep blobs for pulled images?** Doubles their disk cost but makes
+   `save`/`push` of anything `FROM` a pulled image work without re-downloading.
+   Recommendation: yes, and GC them with the layer.
+2. **`COPY --from` reads a merged multi-layer view.** Either box 0 mounts the
+   stage's overlay somewhere temporary (needs `MOUNT_IN_NS` for box 0 or a
+   global overlay mount — unverified that the kernel allows it), or `boxlib`
+   resolves paths through the layer stack itself (duplicates `overlay_fs`
+   semantics; drift risk). Recommendation: the mount, if the kernel supports it.
+3. **Cache location and eviction** — `/var/lib/box/cache/<key>` → digest, swept
+   by the same GC as `rmi`.
+
+## Background
+
+- `userspace/box/docs/BOX_RUN.md`, `OCI_IMAGE_PULL.md` — current run/pull flows
+- `docs/runbooks/run-docker-image.md`
+- `docs/reference/subsystems/containers.md` — why a box cannot mount
+- `crates/akuma-isolation/src/overlay_fs.rs` — whiteout encoding

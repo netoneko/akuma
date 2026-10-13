@@ -638,3 +638,42 @@ mod mount_set_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod memfs_ownership_tests {
+    use crate::{Filesystem, MemoryFilesystem};
+
+    #[test]
+    fn root_is_a_sticky_world_writable_tmpfs_root() {
+        let fs = MemoryFilesystem::new();
+        let m = fs.metadata("/").unwrap();
+        assert_eq!(m.mode, 0o4_1777);
+        assert_eq!((m.uid, m.gid), (0, 0));
+    }
+
+    #[test]
+    fn chmod_and_chown_are_recorded() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/d/f", b"x").unwrap();
+        fs.chmod("/d/f", 0o4750).unwrap();
+        fs.chown("/d/f", Some(1000), Some(50)).unwrap();
+        let m = fs.metadata("/d/f").unwrap();
+        assert_eq!(m.mode, 0o10_4750);
+        assert_eq!((m.uid, m.gid), (1000, 50));
+        fs.chown("/d", None, Some(7)).unwrap();
+        let d = fs.metadata("/d").unwrap();
+        assert_eq!((d.mode, d.uid, d.gid), (0o4_0755, 0, 7));
+    }
+
+    #[test]
+    fn rewriting_a_file_keeps_its_mode_and_owner() {
+        let fs = MemoryFilesystem::new();
+        fs.write_file("/f", b"one").unwrap();
+        fs.chmod("/f", 0o600).unwrap();
+        fs.chown("/f", Some(9), Some(9)).unwrap();
+        fs.write_file("/f", b"two").unwrap();
+        let m = fs.metadata("/f").unwrap();
+        assert_eq!((m.mode & 0o7777, m.uid, m.gid), (0o600, 9, 9));
+    }
+}
