@@ -1052,6 +1052,30 @@ pub const fn connect_step(state: tcp::State) -> ConnectStep {
     }
 }
 
+/// States a socket can only be in **after** the handshake finished: it came up,
+/// and the peer (or we) have started closing it since.
+///
+/// A blocking connect's wait has to treat these as "done", and `connect(2)` as a
+/// success — the application then reads EOF, as on Linux. The wait used to name
+/// only `Established | Closed | Closing | TimeWait`, so a server that completes
+/// the handshake and gives up on a silent client before the waiter next looked
+/// left the socket in `CloseWait`, which satisfied nothing: the connect timed
+/// out after 10 s, reporting `ETIMEDOUT` for a connection that had been open.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub const fn connect_completed(state: tcp::State) -> bool {
+    matches!(
+        state,
+        tcp::State::Established
+            | tcp::State::CloseWait
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::LastAck
+            | tcp::State::Closing
+            | tcp::State::TimeWait
+    )
+}
+
 /// Map the end of a blocking connect onto a return value.
 ///
 /// `waited` is what the poll loop reported (a signal or its own deadline);
@@ -1062,7 +1086,7 @@ pub const fn connect_step(state: tcp::State) -> ConnectStep {
 #[cfg(feature = "smoltcp")]
 pub fn connect_outcome(waited: Result<(), i32>, state: Option<tcp::State>) -> Result<(), i32> {
     match (waited, state) {
-        (_, Some(tcp::State::Established)) => Ok(()),
+        (_, Some(s)) if connect_completed(s) => Ok(()),
         (Err(e), _) => Err(e),
         (Ok(()), Some(tcp::State::Closed)) => Err(libc_errno::ECONNREFUSED),
         (Ok(()), Some(_)) => Err(libc_errno::ETIMEDOUT),
@@ -1497,7 +1521,7 @@ fn finish_connect_wait(idx: usize, h: SocketHandle) -> Result<(), i32> {
             // park; once the GC removes the handle the raw `get` below would
             // panic (the meow `kill -9` wedge). Dead handle -> stop waiting.
             smoltcp_net::tcp_get(&net.sockets, h, |socket| {
-                matches!(socket.state(), tcp::State::Established | tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait)
+                connect_completed(socket.state()) || socket.state() == tcp::State::Closed
             }).unwrap_or(true)
         }).unwrap_or(true)
     }, Some(10_000_000));

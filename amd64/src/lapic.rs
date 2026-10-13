@@ -180,6 +180,18 @@ pub fn on_tick() {
     }
     crate::sched::set_need_resched();
     eoi();
+    // **A tick is the one-shot firing, so this is where the periodic mode comes
+    // back — not only after the `hlt`.** `arm_deadline` leaves the timer in
+    // one-shot mode for the halt and `restore_periodic` undoes it *after* the
+    // halt returns. But the halting task can be switched away from inside this
+    // very interrupt (the idle loop is preempted by whatever the tick readied),
+    // and then nothing runs `restore_periodic` until that task is resumed. The
+    // core runs other threads on a timer that has fired once and will never
+    // fire again; the next one to `allow_tick` finds the count at 0 ("the
+    // periodic tick serves it sooner"), arms nothing, and halts forever. On
+    // ryzen 2026-10-13 that was core 1 frozen at tick 11509 with an
+    // unkillable `hget` parked in its connect wait.
+    restore_periodic();
 }
 
 /// This core's APIC id, from its own ID register.
@@ -896,6 +908,10 @@ pub fn arm_deadline() {
     if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
         return;
     }
+    // A one-shot left over from an earlier halt (see `on_tick`) would make the
+    // `REG_TIMER_CUR` comparison below read an expired timer as "the periodic
+    // tick serves it sooner". Put the periodic mode back first.
+    restore_periodic();
     let Some(now) = tsc_uptime_us() else { return };
     let Some(due) = akuma_threading::x86_earliest_wake_time() else { return };
     let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));

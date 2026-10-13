@@ -9,13 +9,13 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1351
-- **Docs contributing at least one fix:** 373
+- **Total distinct fixes counted:** 1353
+- **Docs contributing at least one fix:** 374
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 217 | 16.1% | 28 |
+| Syscall / ABI Compatibility Audits | 217 | 16.0% | 28 |
 | Memory & Virtual Memory | 174 | 12.9% | 56 |
 | Scheduler & Process Management | 138 | 10.2% | 42 |
 | SMP & Locking | 131 | 9.7% | 52 |
@@ -25,12 +25,12 @@ from several subsystems under one write-up.
 | Toolchain & Self-Hosting | 89 | 6.6% | 12 |
 | SSH | 39 | 2.9% | 18 |
 | VFS & Filesystem | 113 | 8.4% | 36 |
-| Boot & Drivers | 109 | 8.1% | 15 |
+| Boot & Drivers | 111 | 8.2% | 16 |
 | Signals & Exceptions | 36 | 2.7% | 13 |
-| Misc / Cross-cutting | 48 | 3.6% | 16 |
+| Misc / Cross-cutting | 48 | 3.5% | 16 |
 | Console & Terminal | 57 | 4.2% | 17 |
 | Containers | 43 | 3.2% | 9 |
-| **Total** | **1351** | **100.0%** | **373** |
+| **Total** | **1353** | **100.0%** | **374** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1720,7 +1720,7 @@ aren't recorded anywhere else.)
 - an extend that failed partway (ENOSPC) returned with `?` before writing the inode, leaving blocks allocated in the bitmap that no inode referenced; the allocations are rolled back and the inode and metadata written before the error returns
 - an extend over a hole in the file's last partial block allocated it with `zero_leaf = false`, so the bytes before the old EOF read as whatever the block held before; now `true`
 
-## Boot & Drivers (109 fixes, 15 docs)
+## Boot & Drivers (111 fixes, 16 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1862,6 +1862,10 @@ aren't recorded anywhere else.)
 - large TLS uploads died with `bad record mac` because the TX channel had 8 WD pages and recycled one when the ring read index passed it, before the chip's DMA read of it, while the stack hands up to 16 frames per lap; `PAGES` is 32
 - the PS/2 keyboard driver dropped every 0xE0-extended key on purpose, so arrows, Home/End, Delete and PgUp/PgDn did nothing in rio; they emit the USB keymap's escape sequences through a lock-free byte queue
 - the polled i8042 driver raced between cores on ports `0x60`/`0x64` and a plain spinlock around it hung even a single-core boot when a holder was preempted; `kbd.rs` uses the bounded give-up lock from `serial.rs`
+
+### docs/archive/AKUMA_AMD64_LAPIC_ONESHOT_STALE.md
+- `lapic::arm_deadline` put a core's timer in one-shot mode for the `hlt` and `restore_periodic` undid it only after the halt returned, but the idle loop can be preempted from inside the very interrupt that ends the halt, so the core kept running on a timer that had fired once and never would again; the next thread to `allow_tick` read the expired count as "the periodic tick serves it sooner", armed nothing and halted for ever (an unkillable `hget` stuck in `connect`, core 1's tick counter frozen); `on_tick` now restores periodic mode and `arm_deadline` repairs a stale one-shot first
+- `finish_connect_wait` ended on `Established | Closed | Closing | TimeWait` only, so a server that completed the handshake and closed before the waiter looked (`CloseWait` and beyond) turned a connection that had come up into a 10 s `ETIMEDOUT`; `connect_completed` names every post-handshake state and `connect_outcome` treats them as success
 
 ## Signals & Exceptions (36 fixes, 13 docs)
 
