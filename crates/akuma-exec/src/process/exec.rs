@@ -300,7 +300,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
     // the old one is drained after it — a once-per-grab copy, not a hot path.
     let previous = crate::process::table::with_process(target_pid, |p| {
         let previous = p.channel.take();
-        p.channel = channel.clone();
+        p.channel.clone_from(&channel);
         p.grabbed_by = caller_pid;
         previous
     })
