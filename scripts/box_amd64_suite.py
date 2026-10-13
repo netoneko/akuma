@@ -5,6 +5,7 @@ Needs a running amd64 guest with sshd (``INIT=/bin/sshd amd64/run.sh``) and no
 network: it builds its own one-layer image from the guest's busybox. Usage::
 
     SSH_PORT=2290 scripts/box_amd64_suite.py            # default key/port below
+    SSH_HOST=192.168.1.159 SSH_PORT=2222 SSH_KEY= scripts/box_amd64_suite.py   # ryzen
 
 Every check is a property that was once false on amd64
 (``docs/archive/AKUMA_AMD64_BOXES_AUDIT.md``): a boxed process saw the host
@@ -19,14 +20,17 @@ import os
 import subprocess
 import sys
 
+HOST = os.environ.get("SSH_HOST", "localhost")
 PORT = os.environ.get("SSH_PORT", "2290")
+# SSH_KEY="" leaves identity selection to ssh (ryzen takes the user's own key).
 KEY = os.environ.get("SSH_KEY", "target/x86_64-unknown-none/release/amd64-ssh-test-key")
 
-JAIL = "mkdir -p /jail/bin /jail/proc; cp /bin/busybox /jail/bin/; echo host > /outside.txt; echo in > /jail/inside.txt"
+JAIL = "mkdir -p /jail/bin /jail/proc; cp /bin/busybox /jail/bin/; mkdir -p /jail/lib; cp -a /lib/ld-musl-x86_64.so.1 /lib/libc.musl-x86_64.so.1 /jail/lib/ 2>/dev/null; echo host > /outside.txt; echo in > /jail/inside.txt"
 IMAGE = """
 B=/bin/busybox; L=/var/lib/box/layers/sha256-aaaa
 mkdir -p $L/bin $L/etc /var/lib/box/images/testimg /var/lib/box/containers
 cp $B $L/bin/busybox
+mkdir -p $L/lib; cp -a /lib/ld-musl-x86_64.so.1 /lib/libc.musl-x86_64.so.1 $L/lib/ 2>/dev/null
 for a in sh ls cat echo sleep; do ln -sf busybox $L/bin/$a; done
 echo from-image > $L/etc/motd
 echo sha256:aaaa > /var/lib/box/images/testimg/layers
@@ -41,8 +45,9 @@ failures = 0
 def ssh(cmd, timeout=240):
     try:
         r = subprocess.run(
-            ["ssh", "-i", KEY, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-             "-o", "ConnectTimeout=120", "-p", PORT, "root@localhost", cmd],
+            ["ssh", *(["-i", KEY] if KEY else []), "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "ConnectTimeout=120", "-p", PORT, f"root@{HOST}", cmd],
             capture_output=True, text=True, timeout=timeout)
         return r.stdout
     except subprocess.TimeoutExpired as e:

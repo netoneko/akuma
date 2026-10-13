@@ -355,7 +355,29 @@ fn cmd_grab(mut args: libakuma::Args) -> ! {
             }
         }
         found.unwrap_or_else(|| {
-            print("box grab: no processes found in box\n"); exit(1);
+            // Say what was seen. "No processes" is the same words whether the box
+            // is empty, the primary's slot reports another box id, or the primary
+            // is gone and only a dead row remains — three different bugs.
+            let live = stats.iter().filter(|st| st.state != 0).count();
+            let in_box = stats.iter().filter(|st| st.state != 0 && st.box_id == target_id).count();
+            print("box grab: no processes found in box (id=");
+            libakuma::print_hex(target_id as usize);
+            print(" primary=");
+            libakuma::print_dec(primary as usize);
+            print(" live-slots=");
+            libakuma::print_dec(live);
+            print(" in-box=");
+            libakuma::print_dec(in_box);
+            if let Some(st) = stats.iter().find(|st| st.pid == primary && primary > 1) {
+                print(" primary-slot: state=");
+                libakuma::print_dec(st.state as usize);
+                print(" box=");
+                libakuma::print_hex(st.box_id as usize);
+            } else {
+                print(" primary-slot: none");
+            }
+            print(")\n");
+            exit(1);
         })
     };
 

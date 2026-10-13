@@ -96,6 +96,30 @@ guard (orphans reparent to init, which on this target is sshd and never reaps);
   x86_64 host) and `akuma-threading`'s host tests do not build on x86_64; both
   predate this work.
 
+## On the ryzen metal (2026-10-13)
+
+`scripts/box_amd64_suite.py` against the laptop (`SSH_HOST=<ip> SSH_PORT=2222
+SSH_KEY=`, kernel `44e0b93d`, `smp=8`, NVMe root): **14/14**, after two fixes
+that were not the kernel's.
+
+- **The p3 image's `/bin/box` was the 2026-10-06 build**, so the userspace half of
+  this audit (`print_hex`, grab's primary, the live-name refusal) was absent and
+  12 checks failed. p3 never receives `rootfs/` or a rebuilt userspace; `/bin/box`
+  has to be pushed by hand (`cat box | ssh ... 'cat > /bin/box.new && mv'`).
+- **p3's busybox is dynamically linked**, so a jail holding only
+  `/bin/busybox` failed every boxed spawn with `Failed to load ELF: Invalid ELF
+  format: Cannot read interpreter` — surfaced as a bare `ENOMEM` by `spawn_ext`,
+  which now logs the reason (`[syscall] spawn_ext: box=N path: reason`). The
+  suite copies `/lib/ld-musl-x86_64.so.1` into the jail and the image layer when
+  the guest has one; QEMU's static busybox never needed it.
+- `box grab` now says what it saw when it finds nothing (target id, recorded
+  primary, live slots, in-box slots, the primary's slot).
+
+Over a real pty (`ssh -tt`): `box run -i` (prompt, image `Env`, exit code),
+`top -d 1` repainting inside a box and quitting on `q`, and `box grab` all work.
+`box pull` does not — see the TLS notes in `AMD64_TRASHCAN_ISSUES.md` §5 and the
+follow-up for the intermittent `hget` spin.
+
 ## Verify
 
 ```bash
