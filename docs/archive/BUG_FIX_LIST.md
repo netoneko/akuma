@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1329
-- **Docs contributing at least one fix:** 371
+- **Total distinct fixes counted:** 1351
+- **Docs contributing at least one fix:** 373
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 217 | 16.3% | 28 |
-| Memory & Virtual Memory | 174 | 13.1% | 56 |
-| Scheduler & Process Management | 138 | 10.4% | 42 |
-| SMP & Locking | 131 | 9.9% | 52 |
-| Networking | 80 | 6.0% | 31 |
+| Syscall / ABI Compatibility Audits | 217 | 16.1% | 28 |
+| Memory & Virtual Memory | 174 | 12.9% | 56 |
+| Scheduler & Process Management | 138 | 10.2% | 42 |
+| SMP & Locking | 131 | 9.7% | 52 |
+| Networking | 91 | 6.7% | 32 |
 | Userspace Apps & Libraries | 40 | 3.0% | 21 |
-| Rump Kernel & Syscall Proxy | 26 | 2.0% | 6 |
-| Toolchain & Self-Hosting | 89 | 6.7% | 12 |
+| Rump Kernel & Syscall Proxy | 26 | 1.9% | 6 |
+| Toolchain & Self-Hosting | 89 | 6.6% | 12 |
 | SSH | 39 | 2.9% | 18 |
-| VFS & Filesystem | 113 | 8.5% | 36 |
-| Boot & Drivers | 109 | 8.2% | 15 |
+| VFS & Filesystem | 113 | 8.4% | 36 |
+| Boot & Drivers | 109 | 8.1% | 15 |
 | Signals & Exceptions | 36 | 2.7% | 13 |
 | Misc / Cross-cutting | 48 | 3.6% | 16 |
-| Console & Terminal | 57 | 4.3% | 17 |
-| Containers | 32 | 2.4% | 8 |
-| **Total** | **1329** | **100.0%** | **371** |
+| Console & Terminal | 57 | 4.2% | 17 |
+| Containers | 43 | 3.2% | 9 |
+| **Total** | **1351** | **100.0%** | **373** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1052,7 +1052,7 @@ aren't recorded anywhere else.)
 - `ACTIVE_L0`/`PREV_L0` were indexed `core % 8`, so core 8 overwrote core 0's published page-table root and the page-table free gate could free a table in use; `TTBR_TRACK_CORES` is 16
 - `VOLUNTARY_SCHEDULE` was indexed `core % 8`, so cores 8-15 shared the reschedule flag with 0-7; `MAX_CORES` is 16
 
-## Networking (80 fixes, 31 docs)
+## Networking (91 fixes, 32 docs)
 
 ### docs/archive/AKUMA_NET_SPLIT.md
 - `VirtioSmoltcpDevice::receive` built its tx token as `unsafe { &mut *(&raw mut *self) }` while the rx token was live, so two `&mut` to the same device existed at once — UB by the language's rules independently of whether the NIC raced them. The fix is a reorder, and works because `take_rx_frame` returns a raw pointer whose provenance is the BSS frame arena rather than `self`; `LoopbackAwareDevice::receive` had already solved the same problem 200 lines below
@@ -1196,6 +1196,19 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md
 - `bind()` kept only the port (`KernelSocket` had no field for the address) and every listener was a smoltcp `addr: None` endpoint, so a socket bound to `127.0.0.1` accepted connections to the NIC's address — herd's unauthenticated control socket on `:7117` answered from the LAN on all three boxes; `KernelSocket` carries `bind_ip` through every listen and UDP bind, `EADDRINUSE` compares addresses, and an address the interface does not own is `EADDRNOTAVAIL`
 - the one smoltcp `Interface` owns `127.0.0.1/8` and `LoopbackAwareDevice::receive` handed up whatever the NIC delivered unchecked, so a frame from the wire addressed to `127.0.0.1` was accepted as local (Linux drops it as a martian); `receive` drops and counts external frames that match `is_loopback_frame`, at most 16 per call so a flood cannot hold `NETWORK` for a whole ring
+
+### docs/archive/WIFI_FUZZ_AND_LOSSY_SIM.md
+- `eapol::Key::parse` cut the frame to the sender's 802.1X body length and then indexed bytes 97–98, so a body length under 95 panicked the kernel from a single data frame to the station's address (message 1 carries no MIC, so anyone in range can send it); the cut frame must still hold a header
+- `trace_tcp` in `rtw89_sta.rs` sliced the packet to the IPv4 total length and then `p[12..20]`/`p[ihl..]`, so a total length under the header panicked the kernel from any peer on the LAN; bounds-checked
+- the supplicant recorded the replay counter on message 1, which has no MIC, so one spoofed message 1 with a large counter made every real frame after it "replayed" until the access point deauthenticated (241 of 300 simulated joins lost); only MIC'd frames move the counter now (802.11-2020 12.7.2)
+- a single candidate key meant one spoofed message 1 between the real message 1 and message 3 replaced the nonce and failed message 3's check (114 of 300 still lost after the counter fix); a ring of the last four `(ANonce, PTK)` candidates matches message 3 by nonce
+- message 1 derived its PTK into the one field the group-rekey and retransmitted-message-3 paths verify with, so any message 1 after the keys were in left the station unable to verify the AP's next frame; the installed key now changes only when a message 3 verifies under a candidate
+- `idle()` ignored a pairwise rekey (`Action::Complete` for a new handshake), so a network that rekeys the PTK deauthenticated the station every time and forced a rejoin plus a new DHCP lease; `Complete` carries `fresh`, `idle()` answers message 1 under the installed key and installs fresh keys by replaying `JOIN4` (simulated under 40 % loss, not yet run on the metal)
+- `cmd::write` of a `connect` with an empty SSID emitted two blanks that `cmd::parse` skipped, reading the key as the SSID; the writer refuses an empty SSID
+- `wifi auto` treated anything but `connected` as "scan and join", so its `scan` made the daemon sweep all thirteen channels in the middle of the kernel's own rejoin and its `connect` restarted the three-attempt join; `auto_step` waits on `scanning`/`associating` and acts only on `down`/`failed`
+- the amd64 kernel never read the CMOS RTC (its header said "this target has no RTC", true of Firecracker and `microvm`, false of metal and q35), so `clock::now_us()` was 0 until SNTP ran and every offline boot dated files 1970 and stamped `dtime = 0` (fsck `Deleted inode has zero dtime`); `akuma-cmos-rtc` decodes it and `clock::seed_from_rtc` seeds the clock before the root mounts
+- the RTC was read and never written, so a machine whose CMOS was wrong stayed at 1970 on every offline boot for ever; `akuma_cmos_rtc::write` (SET bit, chip format, century, read-back verified) is called from `report_outcome` on an SNTP success, rate-limited to 11 minutes
+- the PVH `no-tests` boot ran `late_init` and went straight to `init` with no `settle_for_dhcp`, `sync_via_sntp` or `spawn_netpoll`, so no SNTP retry, no memory watchdog and no netpoll RX pump; the PVH entry runs the same three calls the multiboot2 entry has had since 2026-09-05
 
 ## Userspace Apps & Libraries (40 fixes, 21 docs)
 
@@ -2109,7 +2122,7 @@ aren't recorded anywhere else.)
 - `no-tests` did not build for amd64 because a commit had inserted `suite_emit` between `self_tests` and its `#[cfg(not(feature = "no-tests"))]`
 - the boot splash cat never changed colour because its daemon is starved during the synchronous xHCI and DHCP waits; `splash::pulse()` runs from those loops on a TSC clock and the frame interval went 50 to 150 ms
 
-## Containers (32 fixes, 8 docs)
+## Containers (43 fixes, 9 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2160,6 +2173,19 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md
 - `mount(2)`/`umount2(2)` answered `ENOSYS` on amd64 although `akuma-syscalls-glue`'s `container.rs` implements both: the family needed `syscall_table!` rows, dispatch arms, and the `akuma-vfs-glue/sc-containers` feature forward that amd64's own manifest had never defined (the root manifest does it for the AArch64 binary), without which the crate does not compile as a whole
+
+### docs/archive/AKUMA_AMD64_BOXES_AUDIT.md
+- amd64's `get_box_namespace` hook answered `None` and `set`/`clear_spawn_namespace` were no-ops, so `spawn_ext(box_id != 0)` gave the child the caller's namespace and resolved its entry against the host mounts (no jail at all); wired to `akuma_vfs_glue`'s registry, with `resolve_symlinks` no longer the identity
+- `spawn_ext` loading a binary over `HEAP_SLURP_MAX` took the deferred path, which needs lazy-region faults that amd64's `#PF` handler does not serve, and reset the machine; `set_eager_path_loads()` plus `load_elf_with_stack_eager_from_path` use the windowed eager load `execve` already uses
+- `Process` carried an inline 8 KiB `ProcessSyscallStats` that `spawn_ext` held by value three or four times, overflowing amd64's 32 KiB kernel stack (`[STACK CANARY]` then a `talc` free fault — the "second `spawn_ext` crashes"); the tables are one boxed slice
+- the x86 arm of `spawn_user_thread_fn_internal` never ran `prepare_task_slot`, so `TSS.rsp0` was 0 and any ring-3 trap in a `spawn_ext` child triple-faulted (previously blamed on the lazy-region fault); it now goes through `spawn_user_closure_initializing`, the path fork takes
+- amd64's private `waitpid` matched on `parent_pid` while `spawn_ext` children carry a `spawner_pid`, so `box use -i` and `box run` polled forever; `is_child_of`
+- `reattach` repointed only the target's `channel` field, so a short command's output written to its birth channel and a grabbed shell's earlier children were lost; `ProcessChannel::forward_to` forwards the old channel and moves what it buffered, clearing A→B→A cycles
+- a killed `box grab` left the container writing a tick a second into a channel nobody read, and amd64's one-process cooperative sshd drained it forever so no later connection was accepted; writes to an `exited` channel are discarded
+- `box close`/`--rm` killed nothing because `kill_box` marked threads TERMINATED from another core, which this kernel cannot honour; `set_box_member_killer` registers `kill(2)`'s own path (pend `SIGKILL`) and must not wait, since the first version stalled sshd for most of a minute
+- `box grab` with no pid took the lowest-slot process (a transient `sleep`) and `box show`/`grab` scanned 64 of 512 thread slots; it prefers the box's recorded primary and scans all slots
+- `box run --name X` under a live `X` re-registered, failed at the overlay and then `kill_box`ed the first container's id, and a closed name could never be reused because its zombie counted as live to the re-root guard; `run` refuses a live name and the guard ignores zombies
+- `libakuma::print_hex` printed a leading NUL (`ID=\0d07`)
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
