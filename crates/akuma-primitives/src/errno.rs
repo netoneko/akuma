@@ -97,6 +97,7 @@ errno_table! {
     EFAULT = 14;
     EBUSY = 16;
     EEXIST = 17;
+    EXDEV = 18;
     ENODEV = 19;
     ENOTDIR = 20;
     EISDIR = 21;
@@ -106,6 +107,7 @@ errno_table! {
     ENOSPC = 28;
     ESPIPE = 29;
     EROFS = 30;
+    EMLINK = 31;
     EPIPE = 32;
     ERANGE = 34;
     ENOSYS = 38;
@@ -222,6 +224,7 @@ mod tests {
             ("EACCES", EACCES, 13),
             ("EFAULT", EFAULT, 14),
             ("EEXIST", EEXIST, 17),
+            ("EXDEV", EXDEV, 18),
             ("EINVAL", EINVAL, 22),
             ("EMFILE", EMFILE, 24),
             ("EADDRINUSE", EADDRINUSE, 98),
@@ -259,6 +262,7 @@ mod tests {
             ("E2BIG", E2BIG, 7),
             ("ENOMSG", ENOMSG, 42),
             ("EROFS", EROFS, 30),
+            ("EMLINK", EMLINK, 31),
             ("ENOTTY", ENOTTY, 25),
             ("EOPNOTSUPP", EOPNOTSUPP, 95),
             ("EPFNOSUPPORT", EPFNOSUPPORT, 96),

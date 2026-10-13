@@ -25,6 +25,14 @@ pub enum FsError {
     Internal,
     ReadOnly,
     NotSupported,
+    /// The two paths of a `rename` or `link` are on different filesystems, or
+    /// the filesystem cannot do this one in place (overlayfs renaming a
+    /// directory that lives in a lower layer). `EXDEV` — which is what makes
+    /// `mv` fall back to copy-and-delete instead of failing.
+    CrossDevice,
+    /// A `link` would push an inode past the filesystem's link-count limit
+    /// (`EMLINK`).
+    TooManyLinks,
 }
 
 impl core::fmt::Display for FsError {
@@ -49,6 +57,8 @@ impl core::fmt::Display for FsError {
             Self::Internal => "Internal error",
             Self::ReadOnly => "Read-only filesystem",
             Self::NotSupported => "Operation not supported",
+            Self::CrossDevice => "Invalid cross-device link",
+            Self::TooManyLinks => "Too many links",
         };
         f.write_str(msg)
     }
@@ -253,6 +263,17 @@ pub trait Filesystem: Send + Sync {
     /// `Ok` on a filesystem that stores no owner would make `chown` report
     /// success and change nothing.
     fn chown(&self, _path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Add `new_path` as another name for the inode at `old_path` (`link(2)`).
+    ///
+    /// Must fail with `AlreadyExists` when `new_path` exists, atomically with
+    /// adding the entry — `link` is how programs create a name exclusively.
+    /// A directory is `PermissionDenied`, a full link count `TooManyLinks`.
+    /// Defaults to `NotSupported`, which the syscall reports as `EPERM`, as
+    /// Linux does for a filesystem without hard links.
+    fn link(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }
 

@@ -171,6 +171,7 @@ pub mod syscall {
         pub const STATFS: u64 = 43;
         pub const UNLINKAT: u64 = 35;
         pub const SYMLINKAT: u64 = 36;
+        pub const LINKAT: u64 = 37;
         pub const RENAMEAT: u64 = 38;
         pub const GETRANDOM: u64 = 278;
         pub const RESOLVE_HOST: u64 = 300;
@@ -261,6 +262,7 @@ pub mod syscall {
         pub const STATFS: u64 = 137;
         pub const UNLINKAT: u64 = 263;
         pub const SYMLINKAT: u64 = 266;
+        pub const LINKAT: u64 = 265;
         pub const RENAMEAT: u64 = 264;
         pub const GETRANDOM: u64 = 318;
         pub const RESOLVE_HOST: u64 = AKUMA_PRIVATE_BASE + 300;
@@ -1711,6 +1713,22 @@ pub fn symlink(target: &str, link_path: &str) -> i32 {
         -100i32 as u64, // AT_FDCWD
         link_c.as_ptr() as u64,
         0, 0, 0,
+    ) as i32
+}
+
+/// Create a hard link: `new_path` becomes another name for `old_path`'s file
+/// (`linkat(AT_FDCWD, old, AT_FDCWD, new, 0)` — the source is not followed).
+/// Returns 0 or a negative errno; `-EEXIST` if `new_path` exists.
+pub fn link(old_path: &str, new_path: &str) -> i32 {
+    let old_c = alloc::format!("{}\0", old_path);
+    let new_c = alloc::format!("{}\0", new_path);
+    syscall(
+        syscall::LINKAT,
+        -100i32 as u64, // AT_FDCWD
+        old_c.as_ptr() as u64,
+        -100i32 as u64,
+        new_c.as_ptr() as u64,
+        0, 0,
     ) as i32
 }
 

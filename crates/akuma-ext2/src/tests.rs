@@ -3295,3 +3295,83 @@ fn inode_owner_high_bits_survive_serialization() {
     assert_eq!(back.owner_uid(), 0x0001_2345);
     assert_eq!(back.owner_gid(), 0xABCD_0007);
 }
+
+// ── Hard links (docs/archive/HARD_LINKS.md) ─────────────────────────
+
+#[test]
+fn link_gives_one_inode_two_names() {
+    let fs = mount_empty();
+    fs.write_file("/a", b"shared").unwrap();
+    fs.link("/a", "/b").unwrap();
+    let (ma, mb) = (fs.metadata("/a").unwrap(), fs.metadata("/b").unwrap());
+    assert_eq!(ma.inode, mb.inode);
+    assert_eq!((ma.nlink(), mb.nlink()), (2, 2));
+    // A write through one name is visible through the other.
+    fs.write_at("/b", 0, b"SH").unwrap();
+    assert_eq!(fs.read_file("/a").unwrap(), b"SHared");
+}
+
+#[test]
+fn unlinking_one_name_keeps_the_data_and_the_last_frees_it() {
+    // Asserts the blocks are freed *now*: serialize with the pin tests, whose
+    // pins on the same fixture's inode numbers would legitimately defer it.
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    let before = fs.stats().unwrap().free_blocks;
+    fs.write_file("/a", &[7u8; 5000]).unwrap();
+    let with_file = fs.stats().unwrap().free_blocks;
+    assert!(with_file < before);
+    fs.link("/a", "/b").unwrap();
+    assert_eq!(fs.stats().unwrap().free_blocks, with_file, "a link costs no data blocks");
+
+    fs.remove_file("/a").unwrap();
+    assert_eq!(fs.read_file("/b").unwrap(), [7u8; 5000]);
+    assert_eq!(fs.metadata("/b").unwrap().nlink(), 1);
+    assert_eq!(fs.stats().unwrap().free_blocks, with_file, "still allocated");
+
+    fs.remove_file("/b").unwrap();
+    assert_eq!(fs.stats().unwrap().free_blocks, before, "freed with the last name");
+}
+
+#[test]
+fn link_refuses_an_existing_name_a_directory_and_a_missing_source() {
+    let fs = mount_empty();
+    fs.write_file("/a", b"1").unwrap();
+    fs.write_file("/taken", b"2").unwrap();
+    assert_eq!(fs.link("/a", "/taken"), Err(akuma_vfs::FsError::AlreadyExists));
+    assert_eq!(fs.read_file("/taken").unwrap(), b"2", "not overwritten");
+    fs.create_dir("/d").unwrap();
+    assert_eq!(fs.link("/d", "/d2"), Err(akuma_vfs::FsError::PermissionDenied));
+    assert_eq!(fs.link("/missing", "/x"), Err(akuma_vfs::FsError::NotFound));
+    assert_eq!(fs.metadata("/a").unwrap().nlink(), 1, "failed links leave the count alone");
+}
+
+#[test]
+fn rename_over_a_linked_name_drops_only_that_link() {
+    let fs = mount_empty();
+    fs.write_file("/a", b"A").unwrap();
+    fs.link("/a", "/b").unwrap();
+    fs.write_file("/c", b"C").unwrap();
+    fs.rename("/c", "/b").unwrap();
+    assert_eq!(fs.read_file("/a").unwrap(), b"A");
+    assert_eq!(fs.read_file("/b").unwrap(), b"C");
+    assert_eq!(fs.metadata("/a").unwrap().nlink(), 1);
+}
+
+#[test]
+fn directory_link_counts_are_reported() {
+    let fs = mount_empty();
+    fs.create_dir("/p").unwrap();
+    fs.create_dir("/p/c1").unwrap();
+    fs.create_dir("/p/c2").unwrap();
+    assert_eq!(fs.metadata("/p").unwrap().nlink(), 4, "2 + one per subdirectory");
+}
+
+#[test]
+fn a_renamed_symlink_keeps_its_directory_entry_type() {
+    let fs = mount_empty();
+    fs.create_symlink("/l", "target").unwrap();
+    fs.rename("/l", "/l2").unwrap();
+    let e = fs.read_dir("/").unwrap().into_iter().find(|e| e.name == "l2").unwrap();
+    assert!(e.is_symlink, "was reported as a regular file after rename");
+}

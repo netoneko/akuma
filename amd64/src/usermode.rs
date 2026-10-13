@@ -1522,6 +1522,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         //
         // `symlinkat(target, newdirfd, linkpath)` takes the dirfd *second*.
         88 => return to_glue(Syscall::Symlinkat, [a1, AT_FDCWD, a2, 0, 0, 0]),
+        // `link(old, new)` — x86_64 86. No asm-generic twin; `linkat` with
+        // both dirfds `AT_FDCWD` and no flags, which is exactly `link`'s
+        // meaning (the source is not followed). Had no arm at all, so busybox
+        // `ln` answered `ENOSYS` on this target.
+        86 => return to_glue(Syscall::Linkat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
         // `readlink(path, buf, size)` — x86_64 89. Was a flat EINVAL while no
         // symlink could exist; `symlinkat` made package symlinks real.
         89 => return to_glue(Syscall::Readlinkat, [AT_FDCWD, a1, a2, a3, 0, 0]),

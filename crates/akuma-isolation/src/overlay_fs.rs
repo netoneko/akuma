@@ -522,6 +522,23 @@ impl Filesystem for OverlayFs {
         self.upper.chown(path, uid, gid)
     }
 
+    /// A hard link in the merged view: copy the source up, then link in the
+    /// upper layer. The new name joins the **copy**, not the lower inode —
+    /// what Linux overlayfs does without `index=on`, and the only thing a
+    /// read-only lower layer allows.
+    fn link(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        let found = self.find(old_path).ok_or(FsError::NotFound)?;
+        if self.layer(found.layer).metadata(old_path)?.is_dir {
+            return Err(FsError::PermissionDenied);
+        }
+        if self.find(new_path).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        self.copy_up(old_path)?;
+        self.prepare_create(new_path)?;
+        self.upper.link(old_path, new_path)
+    }
+
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
         self.copy_up(path)?;
         self.upper.truncate(path, length)
@@ -1041,5 +1058,19 @@ mod tests {
         assert_eq!(fs.metadata("/etc/conf").unwrap().uid, 5);
         assert_eq!(lower.metadata("/etc/conf").unwrap().uid, 0);
         assert_eq!(read(&fs, "/etc/conf"), "c");
+    }
+
+    #[test]
+    fn link_copies_up_and_both_names_share_the_upper_copy() {
+        let lower = layer(&[("/bin/tool", "v1")]);
+        let upper = layer(&[]);
+        let fs = OverlayFs::new(upper.clone(), alloc::vec![lower.clone()]);
+        // memfs has no hard links, so the upper refuses — but only after the
+        // source was copied up and the destination's parent prepared.
+        assert_eq!(fs.link("/bin/tool", "/usr/tool"), Err(FsError::NotSupported));
+        assert!(upper.exists("/bin/tool"), "source copied up first");
+        assert_eq!(fs.link("/bin/tool", "/bin/tool"), Err(FsError::AlreadyExists));
+        assert_eq!(fs.link("/bin", "/bin2"), Err(FsError::PermissionDenied));
+        assert_eq!(fs.link("/nope", "/x"), Err(FsError::NotFound));
     }
 }

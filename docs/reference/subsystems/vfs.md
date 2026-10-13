@@ -238,6 +238,17 @@ umount2".
   spawns in a self-host `cargo build`. Opt-in; not combinable with `extreme`.
   Gives ~19× metadata speedup. See `archive/AKUMA_SELF_HOSTING.md` §7c.
 - **Write path:** ext2 is read-write; `write_at` avoids heap slurp.
+- **Hard links** (2026-10-14): `Filesystem::link`, real on ext2 (and the
+  overlay, which copies the source up and links in upper — the new name joins
+  the copy, as Linux overlayfs without `index=on`). The new entry is added and
+  the existence of the name checked under one write hold, so `link()` works
+  as an exclusive create. `stat` reports the on-disk `i_links_count` for files
+  *and* directories (`2 + subdirectories`). Anything else (memfs, procfs) is
+  `EPERM`; two mounts are `EXDEV`. `linkat` copied the file until then —
+  [`../../archive/HARD_LINKS.md`](../../archive/HARD_LINKS.md). Gate:
+  `/bin/linkprobe` (23 checks, Linux-identical).
+- **Ownership** (`Metadata.{uid,gid}`, `Filesystem::chown`, ids above 65535 in
+  `osd2`): [`permissions.md`](permissions.md).
 
 ## procfs
 

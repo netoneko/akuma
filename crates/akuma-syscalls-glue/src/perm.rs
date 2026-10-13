@@ -95,6 +95,19 @@ pub fn check_delete(path: &str) -> Result<(), u64> {
     Ok(())
 }
 
+/// The source of a hard link: Linux's `fs.protected_hardlinks` rule.
+///
+/// On by default everywhere that matters. A caller that does not own the file may
+/// link it only if it could also read and write it — otherwise anyone could
+/// pin someone else's setuid binary or log file under a name of their own.
+pub fn check_link_source(path: &str) -> Result<(), u64> {
+    let Some(c) = subject(0) else { return Ok(()) };
+    match attr_of(path) {
+        Some(a) if c.uid() != a.uid && !dac::may(&c, &a, MAY_READ | MAY_WRITE) => Err(EPERM),
+        _ => Ok(()),
+    }
+}
+
 /// `chmod`: root or the owner, else `EPERM`. Returns the mode to store — a
 /// non-root caller outside the file's group loses `S_ISGID`, as on Linux.
 pub fn check_chmod(path: &str, mode: u32) -> Result<u32, u64> {

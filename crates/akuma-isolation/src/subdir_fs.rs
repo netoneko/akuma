@@ -169,6 +169,12 @@ impl Filesystem for SubdirFs {
         self.inner.chown(p, uid, gid)
     }
 
+    fn link(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        full_path!(old, &self.prefix, old_path);
+        full_path!(new, &self.prefix, new_path);
+        self.inner.link(old, new)
+    }
+
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
         full_path!(old, &self.prefix, old_path);
         full_path!(new, &self.prefix, new_path);

@@ -1,7 +1,7 @@
 # Hard links
 
 **Date:** 2026-10-14
-**Status:** Sketch. Nothing here is implemented.
+**Status:** Implemented 2026-10-14 — see §4 for what landed and how it was verified.
 **Part of:** the `box build` track — [`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md)
 → this → [`BOX_BUILD.md`](BOX_BUILD.md).
 
@@ -119,6 +119,42 @@ wrong the day it does. Fix all three with UNIX_PERMISSIONS step 4.
   and Docker Linux; diff.
 - **Guest:** `cp -al` a tree and `du -sh` both; re-pull an image with hard links
   (e.g. one shipping `git`) and compare its layer size before/after.
+
+## 4. Implementation record (2026-10-14)
+
+Landed as sketched, plus:
+
+- **`FsError::CrossDevice` (`EXDEV`) and `FsError::TooManyLinks` (`EMLINK`)**,
+  and `EXDEV`/`EMLINK` in `akuma_primitives::errno`. `vfs-glue` gained
+  `resolve_same_mount`, shared by `rename` and `link`; a cross-mount *rename*
+  used to answer `NotSupported` → `EIO`, which `mv` reports instead of falling
+  back to copy-and-delete. It is `EXDEV` now.
+- **ext2's `rename` wrote `FT_REG_FILE` for every non-directory**, so a renamed
+  symlink or socket came back from `getdents64` as `DT_REG`. One
+  `dirent_type()` helper now serves `rename` and `link`.
+- **Directory link counts are reported too.** The worry in §2.2 cut the other
+  way: the old constant `2` claimed every directory had *no* subdirectories,
+  which is the value GNU `find`'s leaf optimisation acts on. The real count can
+  only be more right; a directory whose on-disk count is damaged is the audit
+  tool's to find.
+- **`AT_EMPTY_PATH`** links the file the fd names (it was going to be `EINVAL`).
+- **`fs.protected_hardlinks`** under `/proc/dac`: a non-owner may link a file
+  only if it could read and write it (`EPERM`).
+- `libakuma::link`; `akuma-tar` makes real links and keeps the relative symlink
+  only as the fallback for `EPERM`/`EXDEV`.
+
+### Verification
+
+| Where | Result |
+|---|---|
+| Host | ext2 +6 (two names one inode; unlink keeps data and the last frees the blocks, measured in free-block counts; `EEXIST`/dir/missing; rename over a link; directory counts; renamed symlink keeps `DT_LNK`), overlay +1 |
+| Linux (Docker, arm64) | `linkprobe` 23/23, including 200 rounds of two processes racing `link(tmp, lock)` |
+| AArch64 QEMU/HVF | `linkprobe` 23/23 (0 double-winner rounds); `ln` + `du` count the data once; `akuma-tar` extracts a macOS-made archive's hard link as one inode with `st_nlink` 2 and the archive's uid; inside a container `ln` on the overlay works and a directory is `EPERM` |
+| Boot suites | amd64 QEMU 807/0; AArch64 Firecracker 299/1 — the same pre-existing `thread_slot_reclaim_on_spawn` as unmodified HEAD |
+
+**Not covered:** `lstat` of a *symlink* still reports `st_ino 1`, `st_nlink 1`
+(`newfstatat`'s symlink arm builds the stat by hand), so a hard-linked symlink
+reads as singly linked. Unchanged by this work.
 
 ## Background
 

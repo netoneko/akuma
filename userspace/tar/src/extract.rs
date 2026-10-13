@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libakuma::{
-    chmod, close, lchown, eprintln, mkdir_p, open, open_flags, print, print_dec, println, read_fd, symlink,
+    chmod, close, lchown, link, eprintln, mkdir_p, open, open_flags, print, print_dec, println, read_fd, symlink,
     write_fd,
 };
 use miniz_oxide::inflate;
@@ -248,9 +248,9 @@ fn report(stats: &Stats, verbose: bool) {
     }
 }
 
-/// Directory, symlink or hardlink. A hardlink becomes a relative symlink: the
-/// kernel's `linkat` copies the whole file, and an image layer routinely has
-/// hundreds of names for one binary.
+/// Directory, symlink or hardlink. A hardlink is a real `link(2)` since
+/// 2026-10-14; it was a relative symlink while the kernel's `linkat` copied the
+/// whole file, and an image layer routinely has hundreds of names for one binary.
 fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
     match entry.kind {
         EntryKind::Directory => {
@@ -287,14 +287,24 @@ fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
         }
         EntryKind::HardLink => {
             let target = crate::format::normalize_entry_path(&entry.linkname);
-            let rel = relative_symlink_target(&entry.path, &target);
             if verbose {
                 print("h ");
                 print(&entry.path);
-                print(" -> ");
-                println(&rel);
+                print(" => ");
+                println(&target);
             }
             ensure_parent(full_path);
+            // A real hard link to the earlier entry. `full_path` is the
+            // extraction root joined with `entry.path`, so the root is its
+            // prefix. The relative symlink this always used to be — while
+            // `linkat` copied the file — is the fallback for a filesystem
+            // that cannot link (`EPERM`) or a target outside it (`EXDEV`).
+            let root = &full_path[..full_path.len() - entry.path.len()];
+            let target_full = format!("{root}{target}");
+            if is_path_safe(&target) && link(&target_full, full_path) == 0 {
+                return;
+            }
+            let rel = relative_symlink_target(&entry.path, &target);
             let ret = symlink(&rel, full_path);
             if ret < 0 && verbose {
                 eprintln(&format!("tar: warning: hardlink {full_path}: errno {}", -ret));

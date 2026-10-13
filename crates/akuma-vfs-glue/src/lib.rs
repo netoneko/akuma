@@ -983,13 +983,39 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     invalidate_file_pages(&old_abs);
     invalidate_file_pages(&new_abs);
 
-    // Try process namespace first (lock released before I/O).
+    let (fs, old_rel, new_rel) = resolve_same_mount(&old_abs, &new_abs)?;
+    fs.rename(&old_rel, &new_rel)
+}
+
+/// `link(2)`: `new_path` becomes another name for `old_path`'s inode. Both must
+/// be on one filesystem (`CrossDevice` = `EXDEV` otherwise). See
+/// `Filesystem::link`.
+pub fn link(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    let old_abs = resolve_absolute(old_path);
+    let new_abs = resolve_absolute(new_path);
+    let (fs, old_rel, new_rel) = resolve_same_mount(&old_abs, &new_abs)?;
+    fs.link(&old_rel, &new_rel)
+}
+
+/// Resolve two absolute paths for an operation that must stay on one
+/// filesystem (`rename`, `link`): the caller's namespace first, then the global
+/// table, with no lock held across the filesystem call that follows.
+///
+/// Same-mount is `Arc::ptr_eq`, **not** a name comparison: two ext2 instances
+/// (two disks) share the name "ext2", and an operation between them is a
+/// cross-device `EXDEV`, not a same-fs one that happens to typecheck. That was
+/// `NotSupported` (→ `EIO`) until 2026-10-14, which `mv` reports as a failure
+/// instead of falling back to copy-and-delete.
+fn resolve_same_mount(
+    old_abs: &str,
+    new_abs: &str,
+) -> Result<(Arc<dyn Filesystem>, String, String), FsError> {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let ns_arcs = {
             let ns_mount = proc.namespace.mount.lock();
             match (
-                ns_mount.resolve_arc_with_flags(&old_abs),
-                ns_mount.resolve_arc_with_flags(&new_abs),
+                ns_mount.resolve_arc_with_flags(old_abs),
+                ns_mount.resolve_arc_with_flags(new_abs),
             ) {
                 (Some((o_fs, o_rel, o_flags)), Some((n_fs, n_rel, n_flags))) => {
                     Some((o_fs, o_rel, o_flags, n_fs, n_rel, n_flags))
@@ -998,38 +1024,29 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
             }
         };
         if let Some((old_fs, old_rel, old_flags, new_fs, new_rel, new_flags)) = ns_arcs {
-            // Same-mount check is `Arc::ptr_eq`, **not** a name comparison:
-            // two ext2 instances (two disks) share the name "ext2", and a
-            // rename between them is a cross-device `EXDEV`, not a same-fs
-            // operation that happens to typecheck.
             if !Arc::ptr_eq(&old_fs, &new_fs) {
-                return Err(FsError::NotSupported);
+                return Err(FsError::CrossDevice);
             }
             if old_flags & MS_RDONLY != 0 || new_flags & MS_RDONLY != 0 {
                 return Err(FsError::ReadOnly);
             }
-            return old_fs.rename(&old_rel, &new_rel);
+            return Ok((old_fs, old_rel, new_rel));
         }
     }
 
-    let (old_arc, old_rel, new_arc, new_rel) = {
-        let table = MOUNT_TABLE.lock();
-        let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-        let (old_fs, old_r, old_flags) =
-            table.resolve_arc_with_flags(&old_abs).ok_or(FsError::NotFound)?;
-        let (new_fs, new_r, new_flags) =
-            table.resolve_arc_with_flags(&new_abs).ok_or(FsError::NotFound)?;
-        // `Arc::ptr_eq`, not name comparison — see the namespace arm above.
-        if !Arc::ptr_eq(&old_fs, &new_fs) {
-            return Err(FsError::NotSupported);
-        }
-        if old_flags & MS_RDONLY != 0 || new_flags & MS_RDONLY != 0 {
-            return Err(FsError::ReadOnly);
-        }
-        (old_fs, old_r, new_fs, new_r)
-    };
-    drop(new_arc);
-    old_arc.rename(&old_rel, &new_rel)
+    let table = MOUNT_TABLE.lock();
+    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+    let (old_fs, old_rel, old_flags) =
+        table.resolve_arc_with_flags(old_abs).ok_or(FsError::NotFound)?;
+    let (new_fs, new_rel, new_flags) =
+        table.resolve_arc_with_flags(new_abs).ok_or(FsError::NotFound)?;
+    if !Arc::ptr_eq(&old_fs, &new_fs) {
+        return Err(FsError::CrossDevice);
+    }
+    if old_flags & MS_RDONLY != 0 || new_flags & MS_RDONLY != 0 {
+        return Err(FsError::ReadOnly);
+    }
+    Ok((old_fs, old_rel, new_rel))
 }
 
 

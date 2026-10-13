@@ -769,6 +769,23 @@ const FT_DIR: u8 = 2;
 const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
 
+/// `EXT2_LINK_MAX`: Linux refuses a link past this with `EMLINK`.
+const LINK_MAX: u16 = 65_000;
+
+/// The directory-entry file type for an inode's type bits — what `getdents64`
+/// reports as `d_type` without reading the inode. Every type this filesystem
+/// creates has its own code; anything else is "unknown" (0), which readers
+/// resolve with a `stat`.
+const fn dirent_type(type_perms: u16) -> u8 {
+    match type_perms & 0xF000 {
+        S_IFREG => FT_REG_FILE,
+        S_IFDIR => FT_DIR,
+        S_IFLNK => FT_SYMLINK,
+        S_IFSOCK => FT_SOCK,
+        _ => 0,
+    }
+}
+
 /// Minimum directory entry size (inode + rec_len + name_len + file_type)
 pub(crate) const DIR_ENTRY_HEADER_SIZE: usize = 8;
 
@@ -3241,7 +3258,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             created: Some(inode.creation_time as u64),
             modified: Some(inode.modification_time as u64),
             accessed: Some(inode.access_time as u64),
-            links: None,
+            // The on-disk count, maintained by link/unlink/mkdir/rmdir. Was
+            // `None` (reported as the conventional 1 or 2) until hard links
+            // became real — which also made a directory with subdirectories
+            // claim to have none, the one value GNU `find`'s leaf optimisation
+            // reads.
+            links: Some(u32::from(inode.hard_links)),
             uid: inode.owner_uid(),
             gid: inode.owner_gid(),
         })
@@ -4057,7 +4079,10 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         let mut state = self.write_state();
         let src_inode = self.read_inode(&state, src_inode_num)?;
-        let ft = if (src_inode.type_perms & 0xF000) == S_IFDIR { FT_DIR } else { FT_REG_FILE };
+        // The entry's type travels with the inode. This was "directory, else
+        // regular file", so a renamed symlink or socket came back from
+        // `getdents64` as `DT_REG`.
+        let ft = dirent_type(src_inode.type_perms);
 
         // Retire anything whose readers have since gone away, for the reason
         // `remove_file` does it: renaming over a destination is an unlink, and a
@@ -4089,6 +4114,39 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         self.remove_dir_entry(&mut state, src_parent, &src_name)?;
         self.flush_meta(&mut state)?;
 
+        Ok(())
+    }
+
+    /// `link(2)`: another directory entry for `old_path`'s inode.
+    ///
+    /// Everything under one write hold — the existence check on `new_path`
+    /// included. A check made before taking the lock is the race that breaks
+    /// `link()` as an exclusive-create primitive (maildir, lock files): two
+    /// callers both see "absent", both add an entry, both "win".
+    ///
+    /// The inode's blocks, its page-cache frames and any deferred free are
+    /// keyed by inode number, so the new name shares all of them with no
+    /// further bookkeeping; `remove_file` already decrements and frees only at
+    /// zero.
+    fn link(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        let mut state = self.write_state();
+        let src = self.lookup_path_internal(&state, old_path)?;
+        let mut inode = self.read_inode(&state, src)?;
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::PermissionDenied);
+        }
+        if self.lookup_path_internal(&state, new_path).is_ok() {
+            return Err(FsError::AlreadyExists);
+        }
+        if inode.hard_links >= LINK_MAX {
+            return Err(FsError::TooManyLinks);
+        }
+        let (parent, name) = self.lookup_parent_internal(&state, new_path)?;
+        self.add_dir_entry(&mut state, parent, &name, src, dirent_type(inode.type_perms))?;
+        inode.hard_links += 1;
+        inode.creation_time = self.current_time();
+        self.write_inode(&state, src, &inode)?;
+        self.flush_meta(&mut state)?;
         Ok(())
     }
 

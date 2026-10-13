@@ -152,6 +152,8 @@ pub fn fs_error_to_errno(e: akuma_vfs_glue::FsError) -> u64 {
         FsError::IoError => EIO,
         FsError::Internal => EIO,
         FsError::TooManyOpenFiles => EMFILE,
+        FsError::CrossDevice => EXDEV,
+        FsError::TooManyLinks => EMLINK,
         _ => EIO,
     }
 }
@@ -3434,16 +3436,56 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
     }
 }
 
-pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64, _flags: u32) -> SysResult {
+/// `linkat(2)`: `newpath` becomes another name for `oldpath`'s inode
+/// (`Filesystem::link`).
+///
+/// Until 2026-10-14 this read the whole source into a kernel buffer and wrote
+/// it out as a new file: every link was a copy, `st_nlink` stayed 1, and —
+/// because `write_file` truncates an existing file — `link(a, b)` silently
+/// **overwrote** `b` instead of failing `EEXIST`, so two processes using
+/// `link()` as an exclusive create (maildir, lock files) both "won". No heap
+/// now beyond the two path strings.
+///
+/// `oldpath` is not followed unless `AT_SYMLINK_FOLLOW` is set (Linux's
+/// default: a link to a symlink names the symlink). `AT_EMPTY_PATH` with an
+/// empty `oldpath` links the file `olddirfd` refers to.
+pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> SysResult {
+    use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_FOLLOW};
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
     let oldpath = copy_from_user_str(oldpath_ptr, 1024)?;
     let newpath = copy_from_user_str(newpath_ptr, 1024)?;
-    let src = resolve_path_at(_olddirfd, &oldpath)?;
-    let dst = resolve_path_at(_newdirfd, &newpath)?;
-    match akuma_vfs_glue::fs::read_file(&src) {
-        Ok(data) => match akuma_vfs_glue::fs::write_file(&dst, &data) {
-            Ok(()) => Ok(0),
-            Err(e) => Err(fs_error_to_errno(e)),
-        },
+    let _vfs_bkl = VfsBklGuard::new();
+
+    let src = if oldpath.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 || olddirfd < 0 {
+            return Err(ENOENT);
+        }
+        match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(olddirfd as u32)) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => f.path,
+            Some(_) => return Err(EPERM),
+            None => return Err(EBADF),
+        }
+    } else {
+        let p = resolve_path_at(olddirfd, &oldpath)?;
+        if flags & AT_SYMLINK_FOLLOW != 0 { akuma_vfs_glue::resolve_symlinks(&p) } else { p }
+    };
+    let dst = resolve_path_at(newdirfd, &newpath)?;
+
+    if !akuma_vfs_glue::exists(&src) && !akuma_vfs_glue::is_symlink(&src) {
+        return Err(ENOENT);
+    }
+    if akuma_vfs_glue::metadata(&src).is_ok_and(|m| m.is_dir) {
+        return Err(EPERM);
+    }
+    super::perm::check_create(&dst)?;
+    super::perm::check_link_source(&src)?;
+
+    match akuma_vfs_glue::link(&src, &dst) {
+        Ok(()) => Ok(0),
+        // A filesystem without hard links, and a directory, are both `EPERM`.
+        Err(akuma_vfs_glue::FsError::NotSupported | akuma_vfs_glue::FsError::PermissionDenied) => Err(EPERM),
         Err(e) => Err(fs_error_to_errno(e)),
     }
 }
