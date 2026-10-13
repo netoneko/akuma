@@ -23,7 +23,9 @@ mod types;
 pub use dev::{DevNode, DevProbe};
 pub use memfs::MemoryFilesystem;
 pub use mount::{MountSet, MountSnapshot, MountTable, ResolvedMount, MS_RDONLY, MS_REMOUNT, ST_RDONLY};
-pub use path::{canonicalize_path, path_components, resolve_path, split_path};
+pub use path::{
+    canonicalize_path, path_components, resolve_path, resolve_symlink_chain, split_path,
+};
 pub use types::{DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo};
 
 pub const FS_MAX_PATH_SIZE: usize = 512;

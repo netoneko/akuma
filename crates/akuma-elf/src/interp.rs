@@ -51,6 +51,12 @@ pub(super) fn load_interp_for<A: UserPages>(
     address_space: &mut A,
 ) -> Result<InterpInfo, ElfError> {
     let resolved = resolve_interp_path(ipath, prefix);
+    // The interpreter path crosses symlinks the same as any other path —
+    // usr-merged roots put `/lib -> usr/lib` in front of every PT_INTERP —
+    // and the raw `read_file` below does not chase them. The walker bounds
+    // its own expansions; failures surface as the same "Cannot read
+    // interpreter" a missing interpreter would.
+    let resolved = (crate::vfs().resolve_symlinks)(&resolved);
     if DEBUG_ELF_LOADING {
         log::debug!("[ELF] Loading interpreter: {}", resolved);
     }

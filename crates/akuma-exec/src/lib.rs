@@ -169,12 +169,13 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
         note_current_expected_l0: threading::note_current_expected_l0,
         current_thread_is_terminated: threading::current_thread_is_terminated,
     });
-    // `akuma-elf`'s four VFS callbacks, forwarded from the same `ExecRuntime`
+    // `akuma-elf`'s five VFS callbacks, forwarded from the same `ExecRuntime`
     // fields the loader used to read directly. These `require()` at use — a stub
     // registration turns inode-backed reads into silent zeros, which is the
     // `[FILL-SHORT/prefault]` self-host ICE.
     akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
         read_file: rt.read_file,
+        resolve_symlinks: rt.resolve_symlinks,
         read_at: rt.read_at,
         resolve_file_id: rt.resolve_file_id,
         exec_bkl_drop_enabled: rt.exec_bkl_drop_enabled,
