@@ -368,13 +368,16 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     // root replaces that jail rather than stacking on it — `mount` would reject
     // the duplicate. Anywhere else, a duplicate really is a caller error.
     if target == "/" {
+        // (A zombie does not count: a closed box's processes stay in the table
+        // until their parent reaps them, which for an orphan is init — and a
+        // name could otherwise never be reused.)
         // Re-rooting a box that is already running would move the filesystem
         // under processes that have paths and cwds resolved against the old one.
         // The legitimate caller does this between REGISTER_BOX and its first
         // spawn, so requiring the box to be empty costs nothing and takes the
         // whole class of live-swap games off the table. `replace_box_root` then
         // enforces that the root is still the pristine jail.
-        if akuma_exec::process::list_processes().iter().any(|p| p.box_id == box_id) {
+        if akuma_exec::process::list_processes().iter().any(|p| p.box_id == box_id && p.state != "zombie") {
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
             }

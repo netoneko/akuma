@@ -247,6 +247,27 @@ pub fn load_elf_with_stack_from_path<A: UserPages>(
     )
 }
 
+/// As [`load_elf_with_stack_from_path`], but every `PT_LOAD` is mapped now, read
+/// off the file a window at a time, instead of registered as a lazy region.
+///
+/// For a kernel whose `#PF` handler does not serve `akuma-exec`'s lazy-region
+/// table (amd64 pages from `Process::regions`). Heap use stays flat — the file is
+/// never held whole — which is the other reason the path loader exists.
+pub fn load_elf_with_stack_eager_from_path<A: UserPages>(
+    path: &str,
+    args: &[String],
+    env: &[String],
+    stack_size: usize,
+    interp_prefix: Option<&str>,
+) -> Result<LoadedWithStack<A>, ElfError> {
+    attach_stack(
+        crate::load::load_elf_eager_from_path(path, interp_prefix)?,
+        args,
+        env,
+        stack_size,
+    )
+}
+
 /// Give a loaded image its initial stack, auxv and heap pre-allocation.
 fn attach_stack<A: UserPages>(
     mut loaded: LoadedElf<A>,

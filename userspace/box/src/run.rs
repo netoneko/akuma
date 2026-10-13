@@ -170,6 +170,19 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         .unwrap_or_else(|| format!("{}-{}", store, libakuma::uptime()));
     let box_id = spec::box_id_for(&container);
 
+    // A second `run` under a live name used to register over the first box, fail
+    // at the overlay mount (a box with processes cannot be re-rooted), and then
+    // `kill_box` the id on its way out — which is the *first* container's. Refuse
+    // before touching anything, as `docker run --name` does.
+    if boxlib::boxes::find(&crate::read_proc_boxes(), box_id).is_some() {
+        print("box run: the name '");
+        print(&container);
+        print("' is already in use by a running box. Close it first (box close ");
+        print(&container);
+        print(") or choose another --name.\n");
+        exit(1);
+    }
+
     let croot = images::container_dir(&container);
     let upper = images::container_upper(&container);
     images::ensure_base_dir();

@@ -349,8 +349,36 @@ image's legacy flat `rootfs/` directory, which `box pull` no longer creates.
 `archive/BOX_PTY_INTERACTIVE_SHELL.md` — the interactive shell bridge into a
 boxed service.
 
+## amd64
+
+The box syscalls are the same shared code on both kernels; amd64 dispatches the
+private numbers (315-318, 324, 325) to `akuma-syscalls-glue` from
+`amd64/src/usermode.rs`. What differs, and must stay true:
+
+- **Namespaces**: `exec_runtime.rs` forwards `get_box_namespace` /
+  `set_spawn_namespace` / `clear_spawn_namespace` to `akuma-vfs-glue`, and
+  `resolve_symlinks` to its resolver. Stubbing any of them silently un-jails
+  `spawn_ext` children.
+- **Loading**: `spawn_ext` loads by path (large binaries) *eagerly*
+  (`set_eager_path_loads`) — amd64's `#PF` handler does not serve `LazyRegionMap`.
+- **Threads**: a `spawn_ext` thread is created through
+  `spawn_user_closure_initializing` so it gets a trap stack. A new way to create
+  a user thread on x86_64 must call `X86ArchHooks::prepare_task_slot`.
+- **Stacks**: kernel stacks are 32 KiB with no guard page. Do not hold `Process`
+  by value more than necessary; its big arrays live on the heap.
+- **Signals/kill**: `kill_box` kills members through `set_box_member_killer`
+  (pend `SIGKILL`, do not wait). Never use `kill_process` on this kernel.
+- **Wait**: the private `waitpid` matches `spawn_ext` children by `spawner_pid`.
+- **Grab**: `reattach` links the old channel to the new (`forward_to`) and writes
+  to an exited channel are dropped.
+- No rump stack, no AF_UNIX (herd's control socket is loopback TCP).
+
+Regression: `scripts/box_amd64_suite.py`. History and open items:
+[`../../archive/AKUMA_AMD64_BOXES_AUDIT.md`](../../archive/AKUMA_AMD64_BOXES_AUDIT.md).
+
 ## Background
 
+- `archive/AKUMA_AMD64_BOXES_AUDIT.md` — boxes on amd64: eight faults and the suite.
 - `archive/BOX_CONTAINERS.md`, `archive/CONTAINERS_STAGE_1_PLAN.md`,
   `archive/CONTAINERS_STAGE_2_PLAN.md`, `archive/RUMP_PLUS_HERD.md`.
 - `archive/BOX_PTY_INTERACTIVE_SHELL.md`, `archive/BOX_SUBDIR_FS_LIMITATIONS.md`.

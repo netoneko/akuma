@@ -2964,7 +2964,10 @@ pub fn print_hex(val: usize) {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     let mut buf = [0u8; 16];
     let mut v = val;
-    let mut i = 15;
+    // `start` is the index of the most significant digit written. It used to be
+    // the index *before* it (the decrement after the last write), so every
+    // printed value began with a NUL byte — `box`'s "ID=\0d07".
+    let mut start = buf.len();
 
     if v == 0 {
         print("0");
@@ -2972,16 +2975,13 @@ pub fn print_hex(val: usize) {
     }
 
     while v > 0 {
-        buf[i] = HEX_CHARS[v & 0xF];
+        start -= 1;
+        buf[start] = HEX_CHARS[v & 0xF];
         v >>= 4;
-        if i == 0 {
-            break;
-        }
-        i -= 1;
     }
 
     // Safety: we only write valid ASCII hex digits
-    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+    if let Ok(s) = core::str::from_utf8(&buf[start..]) {
         print(s);
     }
 }

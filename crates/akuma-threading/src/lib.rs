@@ -6407,10 +6407,45 @@ fn init_thread_slot_context(
 /// Internal implementation for spawning user threads
 ///
 /// - start_irqs_disabled: if true, thread starts with IRQs disabled (for process threads)
+#[cfg_attr(target_arch = "x86_64", allow(unreachable_code, unused_variables))]
 fn spawn_user_thread_fn_internal<F>(f: F, start_irqs_disabled: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
+    // x86_64: take the slot and its stacks from the target, exactly as the
+    // two-phase fork path does (`spawn_user_closure_initializing` ->
+    // `X86ArchHooks::prepare_task_slot`). This function used to claim from
+    // `THREAD_STATES` and take a stack from the AArch64 PMM pool below, which
+    // never ran `prepare_task_slot`: the slot's `trap_stack_top` stayed 0, so
+    // `TSS.rsp0` was 0 and the first interrupt or fault a `spawn_ext`-created
+    // process took in ring 3 was a double fault -> triple fault. The process
+    // survived only while it stayed in syscalls, which is why a short `box open`
+    // worked and anything that computed, or touched an unmapped page, reset the
+    // machine. Also gives the slot the canary pair the rest of the target paints.
+    // `start_irqs_disabled` has no analogue on this cooperative-switch target.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let boxed: Box<F> = Box::new(f);
+        let closure_ptr = Box::into_raw(boxed) as *mut ();
+        let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
+        let claimed = with_irqs_disabled(|| {
+            POOL.lock().spawn_user_closure_initializing(trampoline, closure_ptr)
+        });
+        return match claimed {
+            Ok(slot) => {
+                mark_thread_ready(slot);
+                note_user_thread_highwater();
+                Ok(slot)
+            }
+            Err(e) => {
+                // SAFETY: `closure_ptr` came from `Box::into_raw` above and the
+                // failed claim never handed it to a thread.
+                drop(unsafe { Box::from_raw(closure_ptr as *mut F) });
+                Err(e)
+            }
+        };
+    }
+
     // Step 1: Atomically claim a free slot (lock-free). On a miss, collect
     // cooled-down terminated slots ourselves and retry once before failing — the
     // pool is usually not exhausted, just uncollected (see

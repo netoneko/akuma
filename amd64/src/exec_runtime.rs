@@ -245,7 +245,15 @@ fn runtime() -> ExecRuntime {
         // straight back to a `fd.rs` entry point, which resolves it again.
         // Identity is correct, not a stub — and it stops being identity in C2,
         // when path resolution moves to the VFS.
-        resolve_symlinks: |path| alloc::string::String::from(path),
+        //
+        // **Except for `spawn_ext`.** `spawn_process_with_channel_ext` resolves
+        // the entry path through this hook while the box's namespace override is
+        // active, then stats and reads the result. An overlay root's `/bin/sh` is
+        // a symlink to `busybox` (it is in every busybox/alpine image), and with
+        // the identity here `box run <image>` answered "failed to spawn /bin/sh"
+        // for the image's own default command. The shared resolver reads links
+        // through the same mount lookup `fs.rs` uses, so it sees the override.
+        resolve_symlinks: akuma_vfs_glue::resolve_symlinks,
 
         // ── no-ops that cannot fire ───────────────────────────────────────
         // No cross-core scheduler IPI on this target: `akuma-threading`'s x86
@@ -278,12 +286,22 @@ fn runtime() -> ExecRuntime {
         // `ProcessHooks` rows kept stale `false`s for months
         // (`docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`).
         check_itimers: akuma_syscalls_glue::check_itimers,
-        // Containers are not built for this target: there is no box table and
-        // `sc-containers` is not in its feature set, so no namespace exists to
-        // return and nothing can set one.
-        get_box_namespace: |_box_id| None,
-        set_spawn_namespace: |_ns| {},
-        clear_spawn_namespace: || {},
+        // The box namespace registry is `akuma-vfs-glue`'s, the same one
+        // `REGISTER_BOX` / `MOUNT_IN_NS` (wired in `usermode.rs`, 316/325)
+        // fill in. These were `None` / no-ops from the days when
+        // `sc-containers` was off for this target, and they outlived it: with
+        // `get_box_namespace` answering `None`, `spawn_process_with_channel_ext`
+        // gave a `spawn_ext(box_id != 0)` child the **caller's** namespace — a
+        // "boxed" process saw the host filesystem — and, with
+        // `set_spawn_namespace` a no-op, resolved the entry binary
+        // (`/usr/bin/curl` inside an overlay root) against the host's mounts
+        // too, so `box run` failed to spawn anything that is not also on the
+        // host. `fs.rs` resolves through `akuma_vfs_glue::resolve_mount`, which
+        // honours the per-thread spawn override and the process's namespace, so
+        // no other change was needed.
+        get_box_namespace: akuma_vfs_glue::get_box_namespace,
+        set_spawn_namespace: akuma_vfs_glue::set_spawn_namespace,
+        clear_spawn_namespace: akuma_vfs_glue::clear_spawn_namespace,
 
         // ── wired C2 slice 7 ──────────────────────────────────────────────
         // The socket hooks, for the reason the pipe hooks below already carry
@@ -459,6 +477,26 @@ fn runtime() -> ExecRuntime {
     }
 }
 
+/// How `KILL_BOX` ends one member of a box on this target.
+///
+/// `akuma_exec::process::kill_process` — the default — does not kill anything
+/// here: it marks the process a zombie and its thread `TERMINATED` from the
+/// calling core, but a thread on this target leaves ring 3 only through its own
+/// syscall return or a tick, so the process kept running (a `box close`d
+/// container's loop went on appending to its file) and, because the dying
+/// thread's own teardown was skipped, leaked what only that path releases
+/// (`AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`). `kill(2)` stopped using it on
+/// 2026-10-09; `box close` and `box run --rm` still did, through `kill_box`.
+///
+/// This is `kill(2)`'s own path: pend `SIGKILL` on the member's thread group and
+/// return; the death runs on the dying thread. **It does not wait.** The first
+/// version yielded until the member reported exited, and a yield inside a
+/// syscall hands the BKL round with nothing else to run, so a handful of members
+/// stalled the only `sshd` this target has for the better part of a minute.
+fn kill_box_member(pid: u32) {
+    let _ = akuma_exec::process::pend_signal_to_group(pid, 9);
+}
+
 /// Build the config. Overlapping fields mirror the `threading::ThreadConfig`
 /// this target already registers in `sched.rs` rather than
 /// `akuma-config`'s AArch64 values — two tables disagreeing about the stack
@@ -569,8 +607,10 @@ fn config() -> ExecConfig {
 /// `fs::read_at`, the surface every `read`/`pread` on this target already goes
 /// through), and `resolve_file_id` is not, because it wants a `(mount id,
 /// inode)` pair from a target with no mount table. That is the right shape:
-/// both are reached only by `ElfSource::Path`, which this target's profile
-/// never selects, and if the stub ever is, the panic names itself.
+/// both are reached only by `ElfSource::Path`. That is `spawn_ext`'s load for a
+/// binary over `HEAP_SLURP_MAX` (box/herd), and it is eager here
+/// (`set_eager_path_loads`); the deferred strategy needs lazy-region faults this
+/// target does not serve.
 pub fn init() {
     let rt = runtime();
     akuma_exec::runtime::register(rt, config());
@@ -590,6 +630,8 @@ pub fn init() {
     // not call this: its init *is* the first allocation. See
     // `reserve_pid_floor`.
     akuma_exec::process::reserve_pid_floor(2);
+    akuma_exec::process::set_box_member_killer(kill_box_member);
+    akuma_exec::process::image::set_eager_path_loads();
     akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
         read_file: rt.read_file,
         read_at: rt.read_at,

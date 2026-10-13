@@ -159,6 +159,6 @@ pub use pages::{SegProt, UserPages};
 
 pub use load::{LoadedElf, load_elf, load_elf_eager_from_path, load_elf_from_path};
 pub use stack::{
-    LoadedWithStack, UserStack, load_elf_with_stack, load_elf_with_stack_from_path,
+    LoadedWithStack, UserStack, load_elf_with_stack, load_elf_with_stack_from_path, load_elf_with_stack_eager_from_path,
     setup_linux_stack,
 };
