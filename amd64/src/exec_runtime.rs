@@ -634,6 +634,7 @@ pub fn init() {
     akuma_exec::process::image::set_eager_path_loads();
     akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
         read_file: rt.read_file,
+        resolve_symlinks: rt.resolve_symlinks,
         read_at: rt.read_at,
         resolve_file_id: rt.resolve_file_id,
         exec_bkl_drop_enabled: rt.exec_bkl_drop_enabled,

@@ -119,6 +119,12 @@ use akuma_primitives::Registered;
 pub struct VfsHooks {
     /// Read a whole file into a fresh `Vec`.
     pub read_file: fn(&str) -> Result<alloc::vec::Vec<u8>, i32>,
+    /// Follow symlinks anywhere in a path and return the resolved path — the
+    /// same walk the syscall layer runs. The loader needs it for PT_INTERP:
+    /// a usr-merged root (`/lib -> usr/lib`, every Gentoo stage3) makes the
+    /// interpreter path cross a symlink, and the raw read below would fail
+    /// on it even though `openat` from userspace succeeds.
+    pub resolve_symlinks: fn(&str) -> alloc::string::String,
     /// Read `buf.len()` bytes at `offset`. Returns bytes read (may be short).
     pub read_at: fn(&str, usize, &mut [u8]) -> Result<usize, i32>,
     /// Resolve a path to `(mount id, inode)` — the pair that actually names a
