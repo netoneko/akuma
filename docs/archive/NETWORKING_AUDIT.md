@@ -5,13 +5,30 @@
 host reproduction against `FakeChip`. One flaw is **confirmed by a failing
 test** — `resync_rx_cursor` skips a completed frame sitting under the cursor
 (§2, repro committed as
-`crates/akuma-net-rtl8169/tests/resync_reorder_repro.rs`, `#[ignore]`d until
-fixed). One is a high-impact design gap — the transmit path has no error
-handling and no wedge recovery at all (§3). The rest are medium and low, with
-the reasoning for each so the next reader can disagree with the conclusion
-rather than rediscover it. Nothing here invalidates the parts the crate gets
-right, which §12 lists, because a fixer who does not know which walls are
+`crates/akuma-net-rtl8169/tests/resync_reorder_repro.rs`). One is a
+high-impact design gap — the transmit path has no error handling and no wedge
+recovery at all (§3). The rest are medium and low, with the reasoning for
+each so the next reader can disagree with the conclusion rather than
+rediscover it. Nothing here invalidates the parts the crate gets right,
+which §12 lists, because a fixer who does not know which walls are
 load-bearing will knock one down.**
+
+**Fixes landed (2026-10-13, same day as the audit).** §2, §4, §5, §6 (both
+halves), §7, §8 and §9 are fixed in the driver crate and glue, with the
+tests that pin them; the §2 repro is unignored and now guards the fix. §3
+is fixed in its *mechanism*: the transmit stall watch (`stall::tx_decide`,
+host-tested) rings the doorbell on a full-and-quiet ring and escalates to a
+full re-init once the doorbell has failed across the long horizon, and
+`tx_frames_completed` makes the counters honest — `tx=queued/completed` in
+the probe line is the wedge signature. What is *deliberately not* fixed is
+the reading of the descriptor's transmit status bits (`TABRT` et al.): no
+bit of that word has been measured on silicon this crate has run on, and
+inventing constants from a datasheet is what `chip.rs`'s rule exists to
+prevent — `desc.rs` now says so where a reviewer would reach for them. §10
+takes no code change by design: reaping already runs every lap, and the
+parked lap cadence is the scheduler's decision, not the driver's. §11 is
+closed with the contract in prose (`stop`/`release` docs), there being no
+pollable quiesce bit to wait on and no caller today.
 
 ---
 

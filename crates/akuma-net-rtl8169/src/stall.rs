@@ -59,8 +59,10 @@ pub struct StallPolicy {
     ///
     /// Deliberately longer than [`Self::quiet_us`]: this arm has no evidence
     /// beyond the passage of time, and an idle link is a normal state. The
-    /// cost of being wrong is one restarted receiver, which loses a frame the
-    /// chip has written but the driver has not yet read.
+    /// cost of being wrong is one restarted receiver, which delivers any
+    /// in-flight frame late and out of ring order — the restart skips the
+    /// not-yet-owned slots and the cursor reset re-finds them afterwards —
+    /// rather than losing it outright.
     pub silent_us: u64,
     /// Silence between *subsequent* [`StallArm::Silent`] firings.
     ///
@@ -126,6 +128,110 @@ pub fn decide(policy: &StallPolicy, i: &StallInputs) -> StallArm {
     match i.silent_us {
         Some(us) if us >= threshold => StallArm::Silent,
         _ => StallArm::None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The transmit half: a ring that fills and never drains.
+// ---------------------------------------------------------------------------
+
+/// What the transmit watch observes on one poll lap.
+///
+/// Where the receive arms above infer from silence, the transmit watch has a
+/// hard condition it can name: the ring is **full** and the chip has handed
+/// nothing back. Full is itself normal — a busy link drains continuously and
+/// a full ring just means the stack is faster than the wire for a moment —
+/// so the watch is progress-based, not fullness-based: any reclaim, or an
+/// uncongested ring, disarms it. What survives is the wedge the receive arms
+/// structurally cannot see, because receive keeps working while transmit is
+/// dead.
+#[derive(Debug, Clone, Copy)]
+pub struct TxInputs {
+    /// Whether no frame can be queued right now.
+    pub ring_full: bool,
+    /// How many descriptors the chip gave back this lap. Nonzero is progress
+    /// and disarms the watch for this lap.
+    pub reclaimed: usize,
+    /// Microseconds since the last lap that reclaimed a descriptor or found
+    /// the ring not full. `None` before the clock seam exists — the lap
+    /// counter stands in, as for [`StallInputs::silent_us`].
+    pub stalled_us: Option<u64>,
+    /// Consecutive full-with-no-reclaim laps, used only while `stalled_us`
+    /// is `None`.
+    pub stalled_laps: u32,
+    /// Doorbell re-rings already spent on this stall.
+    pub doorbells: u32,
+}
+
+/// The transmit watch's horizons. Same division of labour as
+/// [`StallPolicy`]: the numbers are the consumer's poll loop and wire, the
+/// order and escalation are this module's.
+#[derive(Debug, Clone, Copy)]
+pub struct TxPolicy {
+    /// A full ring with no reclaim for this long before the doorbell is
+    /// re-rung. The cheap repair: the chip has in some wedge states merely
+    /// stopped looking.
+    pub doorbell_us: u64,
+    /// A full ring with no reclaim for this long before the whole chip is
+    /// re-initialised. Throws away whatever is in flight — correct here,
+    /// because a ring full for this long has nothing in flight that is
+    /// moving.
+    pub reinit_us: u64,
+    /// [`Self::doorbell_us`], as laps, for the pre-clock fallback.
+    pub doorbell_laps: u32,
+    /// [`Self::reinit_us`], as laps, for the pre-clock fallback.
+    pub reinit_laps: u32,
+    /// Doorbell re-rings that must have failed before re-init is permitted.
+    /// The cheap repair gets a fair run first, on the same ladder logic as
+    /// the receive side's `BLIND_REINIT_EVERY`.
+    pub doorbells_before_reinit: u32,
+}
+
+/// Which transmit recovery, if any, fires on this lap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxArm {
+    /// Nothing to do.
+    None,
+    /// The ring is full and quiet: re-ring the doorbell and keep watching.
+    Doorbell,
+    /// The doorbell has not helped within the long horizon: re-init the chip.
+    Reinit,
+}
+
+/// Decide which transmit arm — if any — fires on this lap.
+///
+/// Progress outranks every threshold, and it is checked first: a single
+/// reclaimed descriptor or one uncongested lap means the wire is moving, and
+/// no amount of accumulated stall time should survive that observation.
+#[must_use]
+pub fn tx_decide(policy: &TxPolicy, i: &TxInputs) -> TxArm {
+    if !i.ring_full || i.reclaimed > 0 {
+        return TxArm::None;
+    }
+
+    let doorbell_quiet = match i.stalled_us {
+        Some(us) => us >= policy.doorbell_us,
+        None => i.stalled_laps >= policy.doorbell_laps,
+    };
+    if !doorbell_quiet {
+        return TxArm::None;
+    }
+    if i.doorbells < policy.doorbells_before_reinit {
+        return TxArm::Doorbell;
+    }
+
+    let reinit_quiet = match i.stalled_us {
+        Some(us) => us >= policy.reinit_us,
+        None => i.stalled_laps >= policy.reinit_laps,
+    };
+    if reinit_quiet { TxArm::Reinit } else { TxArm::Doorbell }
+}
+
+#[cfg(test)]
+impl TxInputs {
+    fn with_reclaimed(mut self, reclaimed: usize) -> Self {
+        self.reclaimed = reclaimed;
+        self
     }
 }
 
@@ -256,5 +362,72 @@ mod tests {
             ..healthy()
         };
         assert_eq!(decide(&P, &i), StallArm::None);
+    }
+
+    // -- the transmit watch -------------------------------------------------
+
+    const TX: TxPolicy = TxPolicy {
+        doorbell_us: 5_000_000,
+        reinit_us: 30_000_000,
+        doorbell_laps: 500,
+        reinit_laps: 3_000,
+        doorbells_before_reinit: 2,
+    };
+
+    /// A wedge at the moment the doorbell horizon is crossed: the ring is
+    /// full, nothing has come back, and the doorbell has not been tried.
+    fn wedged(doorbells: u32, us: u64) -> TxInputs {
+        TxInputs {
+            ring_full: true,
+            reclaimed: 0,
+            stalled_us: Some(us),
+            stalled_laps: 0,
+            doorbells,
+        }
+    }
+
+    #[test]
+    fn a_draining_ring_is_never_a_transmit_stall() {
+        // Busy but moving: the ring is full and the chip is handing slots back.
+        assert_eq!(tx_decide(&TX, &wedged(0, 600_000_000).with_reclaimed(3)), TxArm::None);
+        // Or the ring is not full at all — the stack simply has not filled it.
+        let mut open = wedged(0, 600_000_000);
+        open.ring_full = false;
+        assert_eq!(tx_decide(&TX, &open), TxArm::None);
+    }
+
+    #[test]
+    fn a_wedged_ring_gets_the_doorbell_first() {
+        assert_eq!(tx_decide(&TX, &wedged(0, TX.doorbell_us)), TxArm::Doorbell);
+        // ...but not before the horizon: a full ring that is younger than the
+        // window is a busy link, and re-ringing it buys nothing.
+        assert_eq!(tx_decide(&TX, &wedged(0, TX.doorbell_us - 1)), TxArm::None);
+    }
+
+    #[test]
+    fn reinit_only_after_the_doorbell_has_failed_the_long_horizon() {
+        // Two doorbells spent, but the long horizon has not passed: keep
+        // ringing — it is free and the alternative throws the ring away.
+        assert_eq!(tx_decide(&TX, &wedged(2, TX.reinit_us - 1)), TxArm::Doorbell);
+        // Doorbells spent and the long horizon crossed: the chip is re-made.
+        assert_eq!(tx_decide(&TX, &wedged(2, TX.reinit_us)), TxArm::Reinit);
+        // And with doorbells still in budget, the long horizon does not
+        // matter — the cheap repair is not exhausted yet.
+        assert_eq!(tx_decide(&TX, &wedged(1, TX.reinit_us)), TxArm::Doorbell);
+    }
+
+    #[test]
+    fn the_pre_clock_fallback_uses_lap_counts() {
+        let mut i = wedged(0, 0);
+        i.stalled_us = None;
+        i.stalled_laps = TX.doorbell_laps;
+        assert_eq!(tx_decide(&TX, &i), TxArm::Doorbell);
+
+        i.stalled_laps = TX.doorbell_laps - 1;
+        assert_eq!(tx_decide(&TX, &i), TxArm::None);
+
+        i.doorbells = TX.doorbells_before_reinit;
+        i.stalled_laps = TX.reinit_laps;
+        assert_eq!(tx_decide(&TX, &i), TxArm::Reinit);
     }
 }

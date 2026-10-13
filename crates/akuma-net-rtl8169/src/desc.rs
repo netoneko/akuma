@@ -42,6 +42,17 @@ pub const RX_LEN_MASK: u32 = 0x0000_3FFF;
 /// Transmit: length of this fragment, in the low bits.
 pub const TX_LEN_MASK: u32 = 0x0000_FFFF;
 
+/// The transmit **status** the chip writes back over the low bits of
+/// `cmdstat` on completion is deliberately *not* named here.
+///
+/// No bit of it has been measured on silicon this crate has run on — the
+/// reference chip was only ever read in a working state, under Linux.
+/// Inventing TABRT-class constants from a datasheet to satisfy a review is
+/// how a wrong name hides a bring-up difference (see `chip.rs`'s rule, and
+/// `docs/archive/NETWORKING_AUDIT.md` §3, whose transmit-wedge recovery is
+/// built on the ownership bit and the reclaim count instead).
+pub const TX_STATUS_UNMEASURED: () = ();
+
 /// Bytes of Ethernet frame check sequence the receiver appends to the length.
 pub const FCS_LEN: u16 = 4;
 

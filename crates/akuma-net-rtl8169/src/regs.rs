@@ -155,13 +155,18 @@ pub const INT_TIMEOUT: u16 = 0x4000;
 /// System error — a failed bus transaction. Always fatal.
 pub const INT_SERR: u16 = 0x8000;
 
-/// What this driver asks to be interrupted about.
+/// What an interrupt-owning consumer arms via [`crate::driver::Nic::init`] and
+/// [`crate::driver::Nic::arm_interrupts`].
 ///
 /// Deliberately the same set the Linux driver leaves in `IMR` on a live link
 /// (observed `0x002f` on the reference chip): the four completion/error bits
 /// plus link change. `INT_RDU` is **not** in it — a dry receive ring is a
 /// condition the poll loop discovers on its own, and enabling it on a busy
 /// link produces an interrupt storm rather than information.
+///
+/// `init` itself writes a **clear** mask: this crate is polled, and a raised
+/// line nobody owns is worse than a quiet one. Arming is the explicit
+/// decision of the consumer that registered the handler.
 pub const INT_DEFAULT_MASK: u16 =
     INT_ROK | INT_RER | INT_TOK | INT_TER | INT_LINKCHG;
 

@@ -7,9 +7,9 @@
 //! goes on the wire, what comes off it, and what happens when things go wrong.
 
 use akuma_net_rtl8169::desc;
-use akuma_net_rtl8169::model::{FakeChip, MODEL_MAC, RX_LEN, TX_LEN};
+use akuma_net_rtl8169::model::{FakeChip, MODEL_MAC, Port, RX_LEN, TX_LEN};
 use akuma_net_rtl8169::ring::{MAX_FRAME, MIN_FRAME};
-use akuma_net_rtl8169::{Error, Model, Nic, TxError, regs};
+use akuma_net_rtl8169::{Error, Model, Nic, Rings, TxError, regs, Desc};
 
 #[test]
 fn probe_identifies_the_chip_and_reads_its_address() {
@@ -43,13 +43,35 @@ fn init_leaves_the_chip_running() {
     nic.init().expect("init should succeed");
 
     assert!(chip.running(), "receiver and transmitter should be enabled");
-    assert_eq!(chip.peek16(regs::IMR), regs::INT_DEFAULT_MASK);
+    assert_eq!(
+        chip.peek16(regs::IMR),
+        0,
+        "polled default: no interrupt source armed, because nobody owns the line"
+    );
     assert_eq!(chip.peek16(regs::RMS), akuma_net_rtl8169::ring::RX_BUF_SIZE);
+    assert_eq!(
+        chip.peek32(regs::THPDS),
+        chip.peek32(regs::TNPDS),
+        "the unused high-priority ring is aliased onto the normal ring, not pointed at physical zero"
+    );
 
     let rcr = chip.peek32(regs::RCR);
     assert_ne!(rcr & regs::RCR_APM, 0);
     assert_ne!(rcr & regs::RCR_AB, 0);
     assert_eq!(rcr & regs::RCR_AAP, 0, "not promiscuous by default");
+}
+
+/// Arming is the consumer's explicit decision, made by whoever registered the
+/// handler — `init` leaves the line quiet.
+#[test]
+fn interrupts_stay_masked_until_the_consumer_arms_them() {
+    let chip = FakeChip::new();
+    let mut nic = Nic::probe(chip.port(), chip.port()).unwrap();
+    nic.init().unwrap();
+
+    assert_eq!(chip.peek16(regs::IMR), 0);
+    nic.arm_interrupts(regs::INT_DEFAULT_MASK);
+    assert_eq!(chip.peek16(regs::IMR), regs::INT_DEFAULT_MASK);
 }
 
 /// The ordering constraint that has no other way to be expressed: C+ mode
@@ -74,7 +96,10 @@ fn c_plus_mode_is_programmed_before_the_ring_addresses() {
 
 /// The receiver must not be enabled until the ring it will DMA into is
 /// populated. Between those two events the chip would be reading uninitialised
-/// ownership bits.
+/// ownership bits. And it must not be enabled until the filter and transmit
+/// configuration are in place either: a frame that arrives under a
+/// half-programmed `RCR` is accepted with whatever the reset defaults were,
+/// and a warm reset with live link is a real case.
 #[test]
 fn the_receiver_is_enabled_only_after_the_rings_are_programmed() {
     let chip = FakeChip::new();
@@ -89,6 +114,14 @@ fn the_receiver_is_enabled_only_after_the_rings_are_programmed() {
         ring_base < enable,
         "ring base at {ring_base} must precede the enable at {enable}"
     );
+    for off in [regs::TCR, regs::RCR, regs::MAR0] {
+        let config = log.first_write_to(off)
+            .unwrap_or_else(|| panic!("{off:#x} must be written"));
+        assert!(
+            config < enable,
+            "configuration of {off:#x} at {config} must precede the enable at {enable}"
+        );
+    }
     assert_eq!(log.last_value(regs::CR), Some(u32::from(regs::CR_RE | regs::CR_TE)));
 }
 
@@ -398,4 +431,95 @@ fn resync_invents_nothing_when_the_ring_is_empty() {
     let before = nic.rx_cursor();
     assert_eq!(nic.resync_rx_cursor(), None);
     assert_eq!(nic.rx_cursor(), before, "the cursor must not move");
+}
+
+/// A consumer with transmit buffers smaller than the wire allows must get a
+/// refusal, not a clamped copy: a truncated frame is acknowledged as sent and
+/// its tail never leaves. The reference glue sizes buffers above `MAX_FRAME`,
+/// so this needs a `Rings` whose capacity disagrees — which is exactly the
+/// consumer the check exists for.
+struct TightTx<'a> {
+    inner: Port<'a>,
+}
+
+impl Rings for TightTx<'_> {
+    fn rx_ring_len(&self) -> usize {
+        self.inner.rx_ring_len()
+    }
+    fn tx_ring_len(&self) -> usize {
+        self.inner.tx_ring_len()
+    }
+    fn rx_ring_phys(&self) -> u64 {
+        self.inner.rx_ring_phys()
+    }
+    fn tx_ring_phys(&self) -> u64 {
+        self.inner.tx_ring_phys()
+    }
+    fn rx_desc(&self, i: usize) -> Desc {
+        self.inner.rx_desc(i)
+    }
+    fn set_rx_desc(&mut self, i: usize, d: Desc) {
+        self.inner.set_rx_desc(i, d);
+    }
+    fn tx_desc(&self, i: usize) -> Desc {
+        self.inner.tx_desc(i)
+    }
+    fn set_tx_desc(&mut self, i: usize, d: Desc) {
+        self.inner.set_tx_desc(i, d);
+    }
+    fn rx_buf_phys(&self, i: usize) -> u64 {
+        self.inner.rx_buf_phys(i)
+    }
+    fn tx_buf_phys(&self, i: usize) -> u64 {
+        self.inner.tx_buf_phys(i)
+    }
+    fn rx_buf_read(&self, i: usize, len: usize, dst: &mut [u8]) -> usize {
+        self.inner.rx_buf_read(i, len, dst)
+    }
+    fn tx_buf_write(&mut self, i: usize, src: &[u8]) -> usize {
+        self.inner.tx_buf_write(i, src)
+    }
+    fn tx_buf_zero(&mut self, i: usize, from: usize, to: usize) {
+        self.inner.tx_buf_zero(i, from, to);
+    }
+    fn tx_buf_len(&self, _i: usize) -> usize {
+        64
+    }
+}
+
+#[test]
+fn a_frame_that_does_not_fit_the_transmit_buffer_is_refused() {
+    let chip = FakeChip::new();
+    let mut nic = Nic::probe(chip.port(), TightTx { inner: chip.port() }).unwrap();
+    nic.init().unwrap();
+
+    nic.transmit(&[0u8; 64]).expect("exactly buffer-sized fits");
+    assert_eq!(
+        nic.transmit(&[0u8; 65]),
+        Err(TxError::BadLength { len: 65 }),
+        "one byte past the buffer is refused, not clamped"
+    );
+    assert_eq!(chip.wire().len(), 1, "only the fitting frame went out");
+}
+
+/// The receive mirror: a frame longer than the caller's buffer is refused
+/// whole — a clamped copy is indistinguishable from a valid short frame once
+/// it leaves the driver — and the ring keeps working.
+#[test]
+fn a_frame_that_does_not_fit_the_receive_buffer_is_refused_not_truncated() {
+    let chip = FakeChip::new();
+    let mut nic = Nic::probe(chip.port(), chip.port()).unwrap();
+    nic.init().unwrap();
+
+    assert!(chip.deliver(&[0u8; 100]));
+    let mut small = [0u8; 32];
+    assert_eq!(nic.receive(&mut small), None, "refused, not truncated");
+    assert!(chip.rx_desc(0).owned_by_chip(), "the buffer was re-posted, not lost");
+
+    let second = [0x5Au8; 40];
+    assert!(chip.deliver(&second));
+    let mut big = [0u8; 2048];
+    let n = nic.receive(&mut big).expect("a fitting frame still arrives");
+    assert_eq!(n, 40);
+    assert_eq!(&big[..n], &second[..]);
 }

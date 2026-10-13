@@ -103,9 +103,12 @@ fn the_command_register_shows_a_running_chip() {
     assert_eq!(cr & regs::CR_RST, 0, "a running chip is not in reset");
 }
 
-/// The interrupt mask a working driver leaves programmed. Our default is the
-/// same set, and this is where that claim is checked rather than asserted in a
-/// comment.
+/// The interrupt mask Linux's driver leaves programmed on a live link. This is
+/// the evidence for the *bit positions* in [`regs::INT_DEFAULT_MASK`], not for
+/// our bring-up: since the 2026-10-13 audit (§4) the driver is polled by
+/// default and writes a clear mask in `init`, arming being the explicit
+/// decision of a consumer that owns the line. The constant keeps this set so
+/// such a consumer starts from what a working driver uses.
 #[test]
 fn the_default_interrupt_mask_matches_a_working_driver() {
     assert_eq!(g16(regs::IMR), regs::INT_DEFAULT_MASK);

@@ -901,7 +901,12 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     serial::puts("[probe]   rx=");
     serial::put_dec(received as u64);
     serial::puts(" tx=");
+    // queued/completed: the second number only moves when the chip hands a
+    // descriptor back, so a growing gap between them is a wedged transmitter
+    // rather than a busy wire (`docs/archive/NETWORKING_AUDIT.md` §3).
     serial::put_dec(akuma_net::smoltcp_net::tx_frames_sent() as u64);
+    serial::puts("/");
+    serial::put_dec(akuma_net::smoltcp_net::tx_frames_completed() as u64);
     serial::puts(" drop=");
     serial::put_dec(akuma_net::smoltcp_net::tx_drop_count() as u64);
     serial::puts(" isr=0x");

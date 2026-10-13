@@ -73,4 +73,4 @@ pub use rtl8169::Rtl8169Device;
 pub use irq::{bind as nic_bind, nic_irq_ack, nic_irq_count, nic_slot, NIC_SLOT_NONE};
 pub use nic::{Nic, NetDev};
 pub use counters::{canaries_intact, counter_block_addr, isr_history, link_state,
-    rx_counters, tx_drop_count, tx_frames_sent};
+    rx_counters, tx_drop_count, tx_frames_completed, tx_frames_sent, tx_stalls};

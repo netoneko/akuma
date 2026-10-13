@@ -528,6 +528,10 @@ impl Rings for Port<'_> {
         TX_BUF_BASE + (i as u64) * BUF_LEN as u64
     }
 
+    fn tx_buf_len(&self, _i: usize) -> usize {
+        BUF_LEN
+    }
+
     fn rx_buf_read(&self, i: usize, len: usize, dst: &mut [u8]) -> usize {
         let s = self.state.borrow();
         assert!(

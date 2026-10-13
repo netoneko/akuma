@@ -148,6 +148,10 @@ pub trait Regs {
 /// rather than faulting, so a misaligned ring silently points somewhere else.
 /// Ring lengths must be powers of two. Receive buffers must be at least
 /// [`ring::RX_BUF_SIZE`] bytes, since this driver refuses split frames.
+/// Transmit buffers must be at least as large as the largest frame the
+/// consumer will hand to [`Nic::transmit`] — the driver checks
+/// [`Rings::tx_buf_len`] and refuses an oversized frame rather than letting a
+/// clamped copy reach the wire.
 pub trait Rings {
     /// Number of receive descriptors. A power of two.
     fn rx_ring_len(&self) -> usize;
@@ -172,9 +176,22 @@ pub trait Rings {
     /// Device address of transmit buffer `i`.
     fn tx_buf_phys(&self, i: usize) -> u64;
 
+    /// Capacity of transmit buffer `i`, in bytes.
+    ///
+    /// This is what makes truncation impossible rather than merely unlikely:
+    /// [`Nic::transmit`] refuses a frame longer than this with
+    /// [`TxError::BadLength`] instead of writing a clamped copy. Without the
+    /// check, a consumer with tighter memory than the reference glue would
+    /// silently put cut-off frames on the wire — acknowledged as sent.
+    fn tx_buf_len(&self, i: usize) -> usize;
+
     /// Copy `len` bytes out of receive buffer `i` into `dst`.
     ///
-    /// Returns how many bytes were copied, which is `min(len, dst.len())`.
+    /// Returns how many bytes were copied, clamped to `dst.len()` as a memory
+    /// backstop — but [`Nic::receive`] never asks for more than fits: a frame
+    /// larger than the caller's buffer is refused whole rather than
+    /// delivered truncated, since a truncated frame is indistinguishable
+    /// from a valid short one once it leaves this crate.
     fn rx_buf_read(&self, i: usize, len: usize, dst: &mut [u8]) -> usize;
     /// Copy a frame into transmit buffer `i`. Returns bytes copied.
     fn tx_buf_write(&mut self, i: usize, src: &[u8]) -> usize;
@@ -220,8 +237,10 @@ pub enum Error {
 pub enum TxError {
     /// The ring is full. Reclaim completions and retry.
     Full,
-    /// The frame is longer than [`ring::MAX_FRAME`] or shorter than a
-    /// zero-length one can be padded to.
+    /// The frame is longer than [`ring::MAX_FRAME`], shorter than a
+    /// zero-length one can be padded to, or longer than the transmit buffer
+    /// behind its descriptor ([`Rings::tx_buf_len`]). All three are refusals
+    /// rather than clamps: a truncated frame would be acknowledged as sent.
     BadLength {
         /// The length that was refused.
         len: usize,

@@ -33,6 +33,15 @@ pub(crate) struct CounterBlock {
     pub(crate) rx_frames_received: AtomicUsize,
     pub(crate) tx_drop_count: AtomicUsize,
     pub(crate) tx_frames_sent: AtomicUsize,
+    /// Frames the chip has **given back** since boot — the honest counterpart
+    /// to [`Self::tx_frames_sent`], which counts acceptance into the ring. On
+    /// a wedged transmitter `sent` keeps climbing while this does not, and
+    /// the gap between them is the size of the lie the pair exists to expose
+    /// (`docs/archive/NETWORKING_AUDIT.md` §3).
+    pub(crate) tx_frames_completed: AtomicUsize,
+    /// Times the transmit stall watch fired — a doorbell re-ring or the full
+    /// re-init that follows it. Zero forever on a healthy transmitter.
+    pub(crate) tx_stalls: AtomicUsize,
     pub(crate) rx_ring_dry: AtomicUsize,
     /// How many times the receiver has been restarted after stalling silently.
     /// A number that keeps climbing is the machine staying reachable *despite*
@@ -67,6 +76,8 @@ pub(crate) static C: CounterBlock = CounterBlock {
     rx_frames_received: AtomicUsize::new(0),
     tx_drop_count: AtomicUsize::new(0),
     tx_frames_sent: AtomicUsize::new(0),
+    tx_frames_completed: AtomicUsize::new(0),
+    tx_stalls: AtomicUsize::new(0),
     rx_ring_dry: AtomicUsize::new(0),
     rx_kicks: AtomicUsize::new(0),
     rx_resyncs: AtomicUsize::new(0),
@@ -134,9 +145,29 @@ pub(crate) fn set_link_state(up: bool, speed_mbit: u16, full_duplex: bool) {
 }
 
 /// Frames the device accepted for transmission since boot.
+///
+/// **Queued, not completed**: on the rtl8169 path this is bumped at
+/// acceptance, and a wedged transmitter keeps it climbing while nothing
+/// leaves — see [`tx_frames_completed`] for the number the chip has
+/// confirmed.
 #[must_use]
 pub fn tx_frames_sent() -> usize {
     C.tx_frames_sent.load(Ordering::Relaxed)
+}
+
+/// Frames the chip has handed back since boot — the completed counterpart to
+/// [`tx_frames_sent`]. A `sent` that climbs while this stalls is the wedge
+/// signature.
+#[must_use]
+pub fn tx_frames_completed() -> usize {
+    C.tx_frames_completed.load(Ordering::Relaxed)
+}
+
+/// Times the transmit stall watch fired — a doorbell re-ring or the full
+/// re-init that follows it.
+#[must_use]
+pub fn tx_stalls() -> usize {
+    C.tx_stalls.load(Ordering::Relaxed)
 }
 
 /// Frames the device refused, or that could not get a ring slot.

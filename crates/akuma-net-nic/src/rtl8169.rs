@@ -28,7 +28,7 @@
 //! scratch, a separate tx scratch — with none of the lease dance `device.rs`
 //! needs.
 
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use akuma_net_rtl8169::desc::Desc;
 use akuma_net_rtl8169::ring::RX_BUF_SIZE;
@@ -68,6 +68,11 @@ static mut RX_DESCS: DescRing = DescRing([[0; 4]; RING_LEN]);
 static mut TX_DESCS: DescRing = DescRing([[0; 4]; RING_LEN]);
 static mut RX_BUFS: BufRing = BufRing([[0; BUF_LEN]; RING_LEN]);
 static mut TX_BUFS: BufRing = BufRing([[0; BUF_LEN]; RING_LEN]);
+
+/// Whether a successful [`Rtl8169Device::probe`] has claimed the statics
+/// above. Set only after a full bring-up, so a failed probe can be retried;
+/// set exactly once, ever, because one NIC owns these arrays.
+static RTL8169_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 fn desc_word(ring: *const DescRing, i: usize, w: usize) -> MmioReg<u32> {
     // SAFETY (of `new`): a live, aligned `u32` inside a `.bss` static for the
@@ -202,6 +207,10 @@ impl Rings for Rtl8169Rings {
         virt_to_phys(&raw const TX_BUFS as usize) as u64 + (i * BUF_LEN) as u64
     }
 
+    fn tx_buf_len(&self, _i: usize) -> usize {
+        BUF_LEN
+    }
+
     fn rx_buf_read(&self, i: usize, len: usize, dst: &mut [u8]) -> usize {
         let n = len.min(dst.len()).min(BUF_LEN);
         let base = (&raw const RX_BUFS).cast::<u8>();
@@ -295,10 +304,10 @@ fn now_us() -> Option<u64> {
 ///
 /// Five seconds rather than the two the lap count was meant to express: the
 /// kick resets the ring cursor, so a frame the chip has written but the driver
-/// has not yet read is lost across it, and on a quiet link that is a cost paid
-/// for nothing. The crate's own bring-up note — "on any real LAN this climbs
-/// within seconds from broadcast traffic alone" — is what makes five seconds
-/// still a stall rather than an idle link.
+/// has not yet read comes out late — out of ring order — across it, and on a
+/// quiet link that is a cost paid for nothing. The crate's own bring-up note —
+/// "on any real LAN this climbs within seconds from broadcast traffic alone" —
+/// is what makes five seconds still a stall rather than an idle link.
 const STALL_QUIET_US: u64 = 5_000_000;
 
 /// How many stalls are reported on the console before the recovery goes quiet.
@@ -363,6 +372,28 @@ const STALL_POLICY: stall::StallPolicy = stall::StallPolicy {
     laps: STALL_LAPS,
 };
 
+/// The transmit watch's horizons (`stall::tx_decide`'s policy): a full ring
+/// with no completion for [`STALL_QUIET_US`] gets the doorbell re-rung — the
+/// cheap repair, a chip that has in some wedge states merely stopped looking
+/// — and a full ring with no completion for thirty seconds, after two failed
+/// doorbells, gets the same full re-init the receive side escalates to. The
+/// pre-clock lap fallbacks assume the parked loop's ~100 laps/s, like the
+/// receive fallbacks above.
+///
+/// This watch exists because every receive arm is structurally blind to a
+/// transmit wedge: a chip that stops draining the TX ring while still
+/// receiving leaves `rx_seen` true, raises no `RDU`, and looks healthy to
+/// every arm above — while `transmit` returns `Full` forever and the
+/// machine is off the network for everything it wants to say
+/// (`docs/archive/NETWORKING_AUDIT.md` §3).
+const TX_POLICY: stall::TxPolicy = stall::TxPolicy {
+    doorbell_us: STALL_QUIET_US,
+    reinit_us: 30_000_000,
+    doorbell_laps: 500,
+    reinit_laps: 3_000,
+    doorbells_before_reinit: 2,
+};
+
 
 pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
@@ -421,6 +452,15 @@ pub struct Rtl8169Device {
     /// token is live**, so the transmit path stages in `tx_scratch` instead.
     rx_scratch: [u8; BUF_LEN],
     tx_scratch: [u8; BUF_LEN],
+    /// Wall clock of the last lap that reclaimed a transmit descriptor or
+    /// found the transmit ring uncongested — the progress that disarms the
+    /// transmit stall watch. `None` before the clock seam exists.
+    tx_last_progress_us: Option<u64>,
+    /// Consecutive full-with-no-reclaim laps, the pre-clock fallback for the
+    /// transmit watch.
+    tx_stalled_laps: u32,
+    /// Doorbell re-rings spent on the current transmit stall.
+    tx_doorbells: u32,
 }
 
 impl Rtl8169Device {
@@ -432,10 +472,21 @@ impl Rtl8169Device {
     ///
     /// # Safety
     /// `bar` is the NIC's device-mapped register BAR, valid for the life of
-    /// the returned device; called once (it claims the module's ring statics).
+    /// the returned device; called once — a second *successful* call panics,
+    /// because the module's ring statics can serve one `Nic` and two cursors
+    /// over the same descriptors is a violation the ownership protocol
+    /// cannot recover from.
     pub unsafe fn probe(bar: *mut u8) -> Result<Self, akuma_net_rtl8169::Error> {
         let mut nic = Nic::probe(Rtl8169Regs { base: bar as usize }, Rtl8169Rings)?;
         nic.init()?;
+        // Claimed only on success: a failed probe (absent or wrong chip,
+        // timed-out reset) leaves the statics untouched, so a corrected
+        // re-probe can retry. The guard used to be a sentence in this doc
+        // comment; a contract that can be forgotten has to be a bit.
+        assert!(
+            !RTL8169_CLAIMED.swap(true, Ordering::AcqRel),
+            "rtl8169 probe called twice: the ring statics are already claimed",
+        );
         // Publish the link once at bring-up, so a probe that reads it before the
         // first receive lap sees a real answer rather than "never sampled".
         let l = nic.link();
@@ -459,6 +510,9 @@ impl Rtl8169Device {
             silent_kicks: 0,
             rx_scratch: [0; BUF_LEN],
             tx_scratch: [0; BUF_LEN],
+            tx_last_progress_us: None,
+            tx_stalled_laps: 0,
+            tx_doorbells: 0,
         })
     }
 
@@ -605,8 +659,80 @@ impl Rtl8169Device {
 
     pub(crate) fn take_rx_frame(&mut self) -> Option<(*mut u8, usize)> {
         // Reap finished transmits each poll lap — the only place they get
-        // harvested on a request/response workload.
-        self.nic.reclaim_tx();
+        // harvested on a request/response workload. The count is also the
+        // transmit stall watch's progress signal: any reclaim says the wire
+        // is moving.
+        let reclaimed = self.nic.reclaim_tx();
+        if reclaimed > 0 {
+            // Completions, not queues: `tx_frames_sent` is bumped when a
+            // frame is *accepted*, and until the chip hands the descriptor
+            // back that number proves only that we tried. The gap between
+            // the two is what a wedged transmitter looks like in the
+            // counters (`docs/archive/NETWORKING_AUDIT.md` §3).
+            C.tx_frames_completed.fetch_add(reclaimed, Ordering::Relaxed);
+        }
+
+        // The transmit stall watch — the half the receive arms cannot do,
+        // because receive keeping working is exactly what leaves a wedged
+        // transmitter invisible to them. Decision in `stall::tx_decide`,
+        // host-tested; the recovery ladder mirrors the receive side's:
+        // doorbell first, full re-init once the cheap repair has failed
+        // across the long horizon. Never capped — only its printing is
+        // ([`MAX_STALL_REPORTS`]), for the same reason as receive.
+        let now = now_us();
+        let stalled_us = match (now, self.tx_last_progress_us) {
+            (Some(now), Some(last)) => Some(now.saturating_sub(last)),
+            _ => None,
+        };
+        match stall::tx_decide(
+            &TX_POLICY,
+            &stall::TxInputs {
+                ring_full: !self.nic.can_transmit(),
+                reclaimed,
+                stalled_us,
+                stalled_laps: self.tx_stalled_laps,
+                doorbells: self.tx_doorbells,
+            },
+        ) {
+            stall::TxArm::None => {}
+            stall::TxArm::Doorbell => {
+                self.tx_doorbells += 1;
+                C.tx_stalls.fetch_add(1, Ordering::Relaxed);
+                if C.tx_stalls.load(Ordering::Relaxed) <= MAX_STALL_REPORTS as usize {
+                    crate::safe_print!(
+                        112,
+                        "[rtl] tx stall #{}: ring full, no completions - re-ringing doorbell (queued={} completed={})\n",
+                        C.tx_stalls.load(Ordering::Relaxed),
+                        C.tx_frames_sent.load(Ordering::Relaxed),
+                        C.tx_frames_completed.load(Ordering::Relaxed)
+                    );
+                }
+                self.nic.ring_transmitter();
+            }
+            stall::TxArm::Reinit => {
+                C.tx_stalls.fetch_add(1, Ordering::Relaxed);
+                let r = self.nic.init();
+                crate::safe_print!(
+                    104,
+                    "[rtl] tx stall: doorbell exhausted - full re-init -> {}\n",
+                    if r.is_ok() { "ok" } else { "FAILED" }
+                );
+                // The re-init repopulates both rings and resets the driver's
+                // cursors; the watch restarts with them.
+                self.tx_last_progress_us = now;
+                self.tx_stalled_laps = 0;
+                self.tx_doorbells = 0;
+            }
+        }
+        // Progress disarms the watch; a congested ring with nothing coming
+        // back accumulates toward the horizons.
+        if reclaimed > 0 || self.nic.can_transmit() {
+            self.tx_last_progress_us = now;
+            self.tx_stalled_laps = 0;
+            self.tx_doorbells = 0;
+        } else {
+            self.tx_stalled_laps = self.tx_stalled_laps.saturating_add(1);
+        }
 
         // **Acknowledge `ISR` every lap, even though nothing here takes
         // interrupts.** `ISR` latches independently of `IMR`: the mask decides
