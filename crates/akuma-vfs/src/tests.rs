@@ -638,3 +638,142 @@ mod mount_set_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod symlink_chain_tests {
+    use crate::path::resolve_symlink_chain;
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+
+    /// A walker over a fixed link table: `read_link(prefix)` answers from
+    /// `links`, everything else is a plain entry (or missing).
+    fn walk(path: &str, links: &[(&str, &str)]) -> String {
+        let table: BTreeMap<String, String> = links
+            .iter()
+            .map(|(p, t)| (String::from(*p), String::from(*t)))
+            .collect();
+        resolve_symlink_chain(path, 16, |prefix| table.get(prefix).cloned())
+    }
+
+    #[test]
+    fn plain_path_is_untouched() {
+        assert_eq!(walk("/usr/bin/emerge", &[]), "/usr/bin/emerge");
+        assert_eq!(walk("/", &[]), "/");
+        assert_eq!(walk("", &[]), "/");
+        assert_eq!(walk("/a/./b/../c", &[]), "/a/c");
+    }
+
+    #[test]
+    fn final_component_link_still_follows() {
+        // The only case the old resolver handled; must not regress.
+        assert_eq!(walk("/a/link", &[("/a/link", "b")]), "/a/b");
+        assert_eq!(walk("/a/link", &[("/a/link", "/b")]), "/b");
+    }
+
+    #[test]
+    fn the_lost_suffix() {
+        // The metal's actual failure: `/bin/sh` through `bin -> usr/bin`
+        // resolved to `/usr/bin` and dropped the `sh`.
+        assert_eq!(walk("/bin/sh", &[("/bin", "usr/bin")]), "/usr/bin/sh");
+        // Several components after the link, all preserved in order.
+        assert_eq!(
+            walk("/bin/a/b/c", &[("/bin", "usr/bin")]),
+            "/usr/bin/a/b/c"
+        );
+    }
+
+    #[test]
+    fn relative_target_resolves_against_the_links_directory() {
+        // emerge's own shape: /usr/bin/emerge -> ../lib/python-exec/python-exec2
+        assert_eq!(
+            walk(
+                "/usr/bin/emerge",
+                &[("/usr/bin/emerge", "../lib/python-exec/python-exec2")]
+            ),
+            "/usr/lib/python-exec/python-exec2"
+        );
+        // With a suffix after the link: walked against the *target's* dir.
+        assert_eq!(
+            walk(
+                "/usr/bin/emerge/extra",
+                &[("/usr/bin/emerge", "../lib/x")]
+            ),
+            "/usr/lib/x/extra"
+        );
+    }
+
+    #[test]
+    fn absolute_target_restarts_at_root() {
+        assert_eq!(
+            walk("/a/link/sub/file", &[("/a/link", "/opt/real")]),
+            "/opt/real/sub/file"
+        );
+        // A suffix after an absolute link must not keep the old prefix.
+        assert_eq!(
+            walk("/a/link/f", &[("/a/link", "/b")]),
+            "/b/f",
+            "the old resolver returned /b here and silently ate /f"
+        );
+    }
+
+    #[test]
+    fn gentoo_sbin_merge() {
+        // Both links come straight from the stage3 tar (CONTENTS-verified).
+        let links = [("/sbin", "usr/bin"), ("/usr/sbin", "bin")];
+        assert_eq!(walk("/sbin/openrc", &links), "/usr/bin/openrc");
+        assert_eq!(walk("/usr/sbin/vigr", &links), "/usr/bin/vigr");
+    }
+
+    #[test]
+    fn chained_links() {
+        // Each hop lands on the next link's own absolute path: /a -> b makes
+        // the walk probe /b, which links to /c, and so on.
+        let links = [("/a", "b"), ("/b", "c"), ("/c", "d")];
+        assert_eq!(walk("/a/x/y", &links), "/d/x/y");
+    }
+
+    #[test]
+    fn link_to_link_to_dir_with_suffix() {
+        let links = [("/bin", "usr/bin"), ("/usr/bin/sh", "bash")];
+        assert_eq!(walk("/bin/sh", &links), "/usr/bin/bash");
+    }
+
+    #[test]
+    fn loop_is_bounded() {
+        let links = [("/a/loop", "loop"), ("/b/loop", "/loop")];
+        // Returns the deepest prefix reached instead of hanging or panicking;
+        // the caller's open fails on it either way.
+        let out = walk("/a/loop/child", &links);
+        assert!(out == "/a/loop" || out.starts_with("/a/loop"), "{out}");
+        let out = walk("/b/loop/child", &links);
+        assert!(out.starts_with('/'), "{out}");
+    }
+
+    #[test]
+    fn max_hops_is_honored() {
+        let table: BTreeMap<String, String> = [("/a/x", "y"), ("/a/y", "z")]
+            .iter()
+            .map(|(p, t)| (String::from(*p), String::from(*t)))
+            .collect();
+        // Two hops needed; one allowed. Stops at the first expansion's result.
+        let out = resolve_symlink_chain("/a/x/suffix", 1, |p| table.get(p).cloned());
+        assert_eq!(out, "/a/y");
+    }
+
+    #[test]
+    fn missing_components_pass_through_for_the_caller_to_fail() {
+        // The walker cannot know a component is missing — `read_link` answers
+        // None both for "plain entry" and "not there" — so the untouched
+        // normalized path comes back and the caller's open errors, exactly
+        // like the old resolver.
+        assert_eq!(walk("/no/such/path", &[]), "/no/such/path");
+    }
+
+    #[test]
+    fn textual_dotdot_pinned() {
+        // `..` normalizes BEFORE the walk, so it cuts the link's name without
+        // consulting its target. Divergent from Linux on purpose-pinned
+        // (documented on the walker); nothing reaches it on either kernel.
+        assert_eq!(walk("/a/link/../z", &[("/a/link", "elsewhere")]), "/a/z");
+    }
+}

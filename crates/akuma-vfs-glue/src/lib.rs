@@ -1088,26 +1088,18 @@ pub fn remove_symlink(path: &str) -> bool {
     table.as_mut().is_some_and(|t| t.remove(&canonical).is_some())
 }
 
-/// Resolve a path, following symlinks (up to 8 levels to prevent loops)
+/// Resolve a path, following symlinks **anywhere** in it (up to 16 expansions
+/// to bound loops).
+///
+/// The walk itself is [`akuma_vfs::resolve_symlink_chain`], host-tested in
+/// `akuma-vfs`; this supplies the filesystem's answers and the devbox's
+/// `/bin/sh` → `/bin/dash` redirect, which stays a decision about the *final*
+/// path, after every link has been chased.
 #[must_use]
 pub fn resolve_symlinks(path: &str) -> String {
-    let mut resolved = canonicalize_path(path);
-    for _ in 0..8 {
-        let target = read_symlink(&resolved);
-        if let Some(t) = target {
-            if t.starts_with('/') {
-                resolved = canonicalize_path(&t);
-            } else {
-                let (parent, _) = split_path(&resolved);
-                resolved = resolve_path(parent, &t);
-            }
-        } else {
-            if resolved == "/bin/sh" && crate::fs_exists("/bin/dash") {
-                resolved = String::from("/bin/dash");
-                continue;
-            }
-            break;
-        }
+    let resolved = akuma_vfs::resolve_symlink_chain(path, 16, read_symlink);
+    if resolved == "/bin/sh" && crate::fs_exists("/bin/dash") {
+        return String::from("/bin/dash");
     }
     resolved
 }

@@ -784,6 +784,33 @@ fn path_walk_smoke_test(t: &mut Suite) {
             t.check("path: symlink creation succeeds", false);
         }
     }
+
+    // A link *interior* to a path: `/bin/sh` through a usr-merged `bin ->
+    // usr/bin` is the shape every Gentoo stage3 ships, and the resolver used
+    // to follow the link and drop the components after it (`/bin/sh`
+    // resolved to `/usr/bin`, the `sh` gone). Both halves matter: the
+    // resolution must carry the suffix through the link, and the bytes must
+    // come back through the open that used it.
+    const DIRLINK: &str = "/tmp/.selftest-dlink";
+    let _ = remove_file(DIRLINK);
+    match create_symlink(DIRLINK, "/") {
+        Ok(()) => {
+            let mut through = alloc::string::String::from(DIRLINK);
+            through.push_str("/probe.txt");
+            t.check(
+                "path: an interior link keeps the suffix",
+                resolve_symlinks(&through) == "/probe.txt",
+            );
+            t.check(
+                "path: an interior link reads the target's bytes",
+                read_file(&through).is_ok_and(|b| b.starts_with(b"AKUMA/amd64 ext2 probe\n")),
+            );
+            t.check("path: the interior link is removed again", remove_file(DIRLINK).is_ok());
+        }
+        Err(_) => {
+            t.check("path: interior symlink creation succeeds", false);
+        }
+    }
 }
 
 #[cfg(not(feature = "no-tests"))]
