@@ -1,6 +1,20 @@
 # `herd` starts the same service again while it is still running
 
-**Status: OPEN**, found 2026-09-20 on both amd64 targets (bare-metal trashcan and
+> **Correction, 2026-10-14: not reproduced.** A unit with `start_delay_ms = 3000`
+> and `restart = true` — the shape this doc says produced two live agents "every
+> time" — ran 75 s across three 20 s config reloads on the ryzen metal with
+> exactly one live copy; `herd stop` then killed it (`stopped duptest (pid N):
+> killed by signal 15`) and none were left. The first candidate named below, the
+> kernel's `WAITPID`/`wait4` answering with a positive pid for a live child, matches
+> a bug fixed on 2026-09-24: `reap_child_channel` kept an exited, still-buffered
+> child's entry so every `wait4(-1)` returned it again, and herd's orphan sweep
+> then recorded a still-`Running` service as exited and restarted it
+> ([`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](AKUMA_AMD64_BARE_METAL_SELFHOST.md) §6
+> item 6, which also made herd start each service once per exit). So: **probably
+> fixed by that, not proven** — no run isolated the two, and the original
+> `llama-server` unit was not rebuilt.
+
+**Status: not reproduced as of 2026-10-14 (see the correction below)**; found 2026-09-20 on both amd64 targets (bare-metal trashcan and
 the Ryzen Firecracker guest) while standing up a one-agent litter.
 `userspace/herd/src/main.rs`.
 

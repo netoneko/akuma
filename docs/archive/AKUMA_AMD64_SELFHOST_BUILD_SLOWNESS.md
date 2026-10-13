@@ -487,6 +487,16 @@ boot+probe+teardown inside one shell invocation. Raw logs:
 
 ## Iterate (what is left)
 
+> **Correction, 2026-10-14.** Items 2 and 4 are stale. Item 2 (the `-j4`
+> silent wedge, "the top open item") was root-caused in §13 (a group-fatal kill
+> that cannot reach a parked leader) and §14 (a second demand fault replacing a
+> populated anonymous page with zeros), and §17 reaches the fixed point. Item 4's
+> levers moved too: the per-`munmap` shootdown cost and the file-fault service
+> time were fixed in
+> [`AKUMA_AMD64_TARGETED_SHOOTDOWN.md`](AKUMA_AMD64_TARGETED_SHOOTDOWN.md)
+> (`munmap` 59 -> 6.6 us per call; file-fault service 38.5 -> 8.0 us; clean `-j4`
+> 90 s -> 60-70 s on the ryzen guest, ~3-5x on the metal).
+
 1. ~~CR3-skip~~, ~~futex hlt~~, ~~netpoll/allow_tick BKL~~ — **landed, see
    above**. The FC guest runs the fixed kernel; the pre-fix binary is kept as
    `akuma-amd64.pre-c3skip`.
@@ -1221,6 +1231,12 @@ here — it is slower on the *next* `mmap`, in another process, minutes later:
 
 #### Open, and measured here
 
+> **Correction, 2026-10-14.** The `munmap` cost below is fixed:
+> `shootdown::broadcast` now addresses only the cores running the edited address
+> space (`AKUMA_AMD64_TARGETED_SHOOTDOWN.md`), and `munmap` measures 6.6 us per call
+> against 59 us in the same workload. The "remaining 2.1x against Linux is not
+> syscalls" line stands.
+
 - **`munmap` costs 13.2 µs at `SMP=2` against 1.97 µs at `SMP=1`** (probe base,
   same kernel) — a TLB-shootdown IPI per unmap. Linux is 1.46 µs flat. At 53 k
   unmaps per `rustc` that is ~0.6 s per core beyond the first, and it is the
@@ -1376,6 +1392,10 @@ append-healing guard). Clippy clean on both kernels and on `akuma-mmap`.
 
 #### Open
 
+> **Correction, 2026-10-14.** The `munmap` shootdown bullet below is fixed — see the
+> correction under "Open, and measured here" above.
+
+
 - The remaining 1.7x against Linux is **not syscalls**: at 15 s the whole
   measured syscall and fault budget is ~2 s.
 - `munmap` still carries a TLB-shootdown IPI per call at SMP>1 — 13.2 us against
@@ -1437,7 +1457,7 @@ The cap now also takes `HEAP_SIZE / 4`. A fraction rather than "leave N bytes
 free", because the thing being protected against is a single request the size of
 a linker, and a constant would go stale the first time `HEAP_SIZE` moved.
 
-**The underlying defect is still open**: `execve` should stream `PT_LOAD`
+**The underlying defect is still open** *(closed 2026-10-08: the streaming loader, `AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 8 — `execve` reads only the 256-byte head and maps segments through a 64 KiB window)*: `execve` should stream `PT_LOAD`
 segments into user pages rather than hold the whole file. The cap makes a 158 MB
 binary fit; a 400 MB one would not, and `librustc_driver.so` in this very image
 is 311 MB (it is `mmap`ped lazily, not exec'd, which is why it does not blow up
@@ -1869,7 +1889,7 @@ rust-lld: error: duplicate symbol: main
 
 The object glob picked up two `hello` build's `.rcgu.o` files, so neither the
 threaded nor the `--threads=1` arm linked the kernel at all. The control is
-invalid and **§11's question is still open**. Pin the object list to one
+invalid and **§11's question is still open** *(answered 2026-09-18 the other way by `AKUMA_AMD64_BARE_METAL_SELFHOST.md` §3: the link crash was a too-small heap, not LLD's threading)*. Pin the object list to one
 crate's `out` directory before re-running it.
 
 #### Next, in order

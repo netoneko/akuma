@@ -10,6 +10,23 @@ the way [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL
 
 ## 1a. Latest result (2026-09-30, `main` = `e6d8657b`): good, not parity
 
+> **Correction, 2026-10-14: the `EIO` is explained and fixed; the hypotheses
+> below are superseded.** Neither (a) a cold-read race nor (b) a USB error. A
+> console line on the refused-reservation arm of `read_image` showed `heap refused
+> 165777608 B for …/rust-lld` — `execve` held the whole image in the kernel heap and
+> three concurrent `rust-lld`s (158 MB each) exhausted it, so a *capacity* failure
+> presented as a device error
+> ([`AKUMA_AMD64_TARGETED_SHOOTDOWN.md`](../archive/AKUMA_AMD64_TARGETED_SHOOTDOWN.md)
+> §4). `read_image` was made to wait (10 of 10 clean `-j4` on ryzen), and on
+> 2026-10-08 the streaming `execve` loader removed the whole-image read
+> (`AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 8). Not shown: that the *metal's*
+> original 3-of-10 were this same shortage (its heap is 1 GiB and the line was
+> never captured there); three metal runs after the fix showed no `EIO`. Also
+> answered since: `-j4` slower than `-j1` on the metal (now 114–177 s, §6b of that
+> doc) and the constant 27 `[BKL] stuck` lines (they were `munmap` holding the BKL
+> across a shootdown to cores that did not need it; 0–2 after the targeted
+> shootdown).
+
 **Short version.** Self-hosting on amd64 is now at AArch64's *stability* under a
 hypervisor and **not yet** on the metal. The 2026-09-18 metal signature — `rc=139`
 SIGSEGV at 20–35 crates, 3 builds in 4 — did **not** recur in 10 builds (0
@@ -210,7 +227,7 @@ killed silently. "No `[Fault]`" is not "the kernel killed nothing".
 | build reaches N/N then stops, `cargo` has CPU, every `rustc` at `0:00` | the untimed-`FUTEX_WAIT` leader (fixed 2026-09-18); a lost wake-up if it recurs | `sched::dump_slot_table`, `futex::dump_waiters`, `scripts/benchmarks/amd64_slot_report.py` (diff two 30 s blocks — one dump misleads) |
 | `[BKL] stuck` **storm** then `[TLB] stuck: N peer(s) unacked`, dead to ssh | shootdown never acked: a core in IRQ-masked xHCI polling with the BKL dropped | `AMD64_THREE_CRASHES.md` §1 — **the fix exists in the tree and was never verified on the metal**. This is the one to expect if the USB disk stalls |
 | `[xhci] transfer timeout` before any of the above | the drive, not the scheduler | `AKUMA_AMD64_USB_XHCI.md`; USB 3.0 socket rule in the bare-metal runbook |
-| `lld-wrapper: could not exec rust-lld: I/O error (os error 5)`, `rc=101`, no SIGSEGV | `execve`'s `read_image` returned `IoError` → `EIO` on a cache-cold binary; 3 of 10 metal runs on 2026-09-30 (§1a), all linking a host unit in the first ~30 crates. **Cause not confirmed**; the code comment at the exec site ties this layer to USB transfer stalls | capture `dmesg` *immediately* (the ring washes in ~3.5 min — `amd64_metal_j4_loop.sh` samples it every 15 s for this), look for `[xhci] transfer timeout` (add `xhci`/`transfer` to the sampler's pattern first), check whether the same binary `execve`s again at once |
+| `lld-wrapper: could not exec rust-lld: I/O error (os error 5)`, `rc=101`, no SIGSEGV | `execve`'s `read_image` returned `IoError` → `EIO` on a cache-cold binary; 3 of 10 metal runs on 2026-09-30 (§1a), all linking a host unit in the first ~30 crates. **Cause found 2026-10-14: kernel-heap capacity in `read_image`, fixed (see the §1a correction)**; the code comment at the exec site ties this layer to USB transfer stalls | capture `dmesg` *immediately* (the ring washes in ~3.5 min — `amd64_metal_j4_loop.sh` samples it every 15 s for this), look for `[xhci] transfer timeout` (add `xhci`/`transfer` to the sampler's pattern first), check whether the same binary `execve`s again at once |
 | `rust-lld … signal: 11` at the final link | memory pressure (`[ALLOC FAIL]`) or the same defect by a cheaper route | replay the printed argv with `--threads=1` (the 20 s A/B in bare-metal §3) |
 | zero-page / `cr2` reads all zero (not `0xFEEDFACE`) under `pmm-forensics` | a freshly zeroed page put where data was — the §14 double-populate shape | `--features mm-forensics` / `pmm-forensics` build; **as of 2026-09-18 the metal had never run under `pmm-forensics`** |
 
@@ -223,6 +240,13 @@ race) and `scripts/benchmarks/amd64_fc_build_matrix.py` for the HP box's
 Firecracker guest.
 
 ## 5. Left open
+
+> **Update, 2026-10-14.** Answered since this list was written: the metal `EIO`
+> (heap capacity, fixed — §1a correction), `-j4` slower than `-j1`, and the
+> constant 27 (the `munmap` shootdown). Still open: a larger metal sample, `-j8`,
+> ryzen at 2 GiB, the fixed-point compare, and the `[BKL] stuck` count that
+> *remained* on the metal after the fix (42–61 per build against ~0 on ryzen, so a
+> different holder there that nobody has named).
 
 * **The metal `-j4` question, partly answered (2026-09-30, §1a).** The `rc=139`
   signature did not recur in 10 builds; 3 of 10 died of `EIO` at `execve` of

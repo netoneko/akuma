@@ -64,6 +64,52 @@ nothing, and a connect to a connection that *had* come up returned `ETIMEDOUT`
 after 10 s. `connect_completed` now names every post-handshake state; the wait
 and `connect_outcome` use it, with host tests.
 
+## Network results, before and after (2026-10-13/14)
+
+Same ryzen, entry 14 (`smp=8`, wifi), same file (Gentoo
+`stage3-amd64-musl-hardened-openrc-20261011T170049Z.tar.xz`, 244 518 672 B,
+sha256 `2004735a…c8ae`), `aria2c` 1.37.0 from Alpine with `-x8 -s8 -k1M
+--async-dns=false` (c-ares fails here: "No address returned" on a CNAME chain).
+
+| | before the fix | after the fix |
+|---|---|---|
+| `aria2c` throughput, ryzen wifi | **111 KiB/s** over the whole file (~38 min, sha256 OK) | **117 KiB/s** over a 240 s capped sample (11 %) |
+| wifi link counters | `failed 0`, `retry-limit 0`, `dropped 0`; `replayed` 1940 at the end | same zeros at 20k frames; `replayed` 369; `max gap 31 ms` |
+| ping during the download | **96.7 % loss** (58 of 60), 500–640 ms when answered; ssh banner timeouts | **not measured** |
+| `hget https://example.com/` ×N, fresh boot | hung within 1–4 runs on four separate boots (unkillable `R`) | **40/40**, twice, on two boots; no stuck process |
+| `hget` on `registry-1.docker.io/v2/` | hung | 401 as expected, 10/10 |
+| `box pull alpine:3.20` | `manifest fetch failed: IoError` | completes; `box run` and `box run -i` (pty) run it, exit codes 3 and 5 propagate |
+| box suite on the metal | 14/14 (after the harness fixes) | 14/14 |
+| trashcan, ethernet, same file, 8 connections | 1.2 MiB/s, sha256 OK | **not retested** |
+
+**What improved is reliability, not speed.** ~120 KB/s is what ryzen Linux sees
+at the same spot (the user's observation), so the ceiling there is the link and
+the stack matches it. The wifi counters were clean before the fix as well
+(`failed 0`, `retry-limit 0`), so the radio's own transmit path was not losing
+frames. What caused the 96.7 % ping loss during the first download is **not
+established**: it may be the box (several threads stuck on dead-timer cores, a
+saturated 8-connection download) or the link at that spot, and the after-run's
+ping was not taken to tell them apart.
+
+**Caveats on the comparison.** The "after" throughput is a 240 s sample of a
+file the "before" run downloaded whole. Both ran at one location; neither is a
+Linux-vs-Akuma A/B. The kernel tested was `ugh` plus these fixes. **None of the
+wifi-specific work done in parallel by another agent was on that branch**, so
+this says nothing about it; the one network commit that was there
+(`67466d35`, the rtl8169 audit fixes) concerns the trashcan's ethernet driver,
+which ryzen does not use, and the trashcan was not rebooted onto it.
+
+**To do later, in order of value:**
+
+1. Boot a current kernel on the trashcan and repeat the stage3 download against
+   its 1.2 MiB/s baseline — the only test of the rtl8169 fixes, and 1.2 MiB/s is
+   itself low for gigabit.
+2. When the wifi fixes are on a branch, repeat the ryzen download **with a ping
+   alongside it** (`ping -c 60` from the Mac): loss and latency under load is
+   where the before-picture was bad, and the second run did not take it.
+3. A full-length ryzen download (35 min at this rate) for a like-for-like
+   average, and the same file from ryzen's Linux side for an A/B on the link.
+
 ## Still open
 
 - `box grab: no processes found in box` seen five times on containers started

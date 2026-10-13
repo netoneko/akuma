@@ -364,6 +364,27 @@ that binds, silently, on the only workload that notices.
 
 ## 6. Open, in the order worth attacking
 
+> **Status of this list, 2026-10-14** — checked against later docs and live
+> measurements; the items below are unedited. **1:** the `execve` `EIO` was a
+> kernel-heap *capacity* failure, not a device error
+> ([`AKUMA_AMD64_TARGETED_SHOOTDOWN.md`](AKUMA_AMD64_TARGETED_SHOOTDOWN.md) §4:
+> `read_image` could not reserve 158 MB while three `rust-lld`s were exec'd), made
+> to wait on 2026-10-02 and removed at the root by the streaming `execve` loader
+> (`AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 8, 2026-10-08). `-j4` is no longer
+> slower than `-j1` here: 114–177 s on the metal after the shootdown and file-fault
+> fixes (same doc, §6b), against 836–905 s. Whether the original 3-of-10 *metal*
+> failures were this same heap shortage was never shown (the 1 GiB heap never ran
+> short in the three runs after the fix; the original failing runs' dmesg was never
+> captured), so read
+> that as "not seen again", not "explained". **2:** wrong as written — §3 above
+> already disproved it (a bigger heap fixed the link with LLD's threading left on).
+> **3:** done. **4:** done — `execve` no longer holds the image; the 158 MB
+> figure is history. **5:** still open; the ryzen sessions of 2026-10-14 were idle
+> and do not bear on it. **6:** fixed. **7:** `herd stop` fixed and re-verified on
+> the ryzen metal 2026-10-14 (`stopped … killed by signal 15`, process gone);
+> "a SIGTERM'd kot never finishes exiting" and "herd parked at `fs.rs:665` after
+> 41 h" were **not re-checked** — no kot runs on that box.
+
 1. **The compile-phase crash at SMP>1 on the metal.** *(2026-09-30: did not recur in
    10 `-j4` runs on `main` — see §3's correction; the open question is now
    the `EIO` at `execve` (3 of 10), and the `-j4` slowdown.)* Not `-j4`-specific (see

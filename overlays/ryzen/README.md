@@ -97,6 +97,16 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 15 | **wifi tool soak against the lossy simulated radio** (`wifisim=lossy` + the `wifisoak` service): `wifi auto` for 5 minutes against a radio whose scans miss networks, whose joins take seconds or time out, and whose link drops and comes back; `wifi status` sampled every 10 s into `/var/log/ryzen/wifisoak-N.txt`, `wifi auto`'s own output in `wifiauto-N.txt`. The fault sequence is seeded, so two transcripts are comparable. **Rehearsed 2026-10-12** (QEMU on ryzen, `DISK=nvme`, kernel built on the Mac): 30 samples, `wifi auto` alive at every one, three link drops (samples 1–2, 14–16, 26–27) each back to `connected` by itself, and the tool issued **one** join in five minutes — it waited through the kernel's rejoins rather than restarting them. Not run on the metal | yes |
 | 16 | reboot | — |
 
+**Network test, 2026-10-13/14 (entry 14, `smp=8`).** Stage3 tarball (233 MiB)
+with `aria2c -x8`: 111 KiB/s whole-file before, 117 KiB/s over a 240 s sample
+after the timer fix — unchanged, at the link ceiling (ryzen Linux sees ~120 KB/s
+there). What changed is that `hget`/`box pull` stopped hanging: a core's LAPIC
+timer could be left one-shot and never fire again
+([`AKUMA_AMD64_LAPIC_ONESHOT_STALE.md`](../../docs/archive/AKUMA_AMD64_LAPIC_ONESHOT_STALE.md),
+which has the full table). Not yet measured: ping loss under load after the
+fix, the wifi-side fixes from the parallel branch, the trashcan's rtl8169 fixes.
+Run `aria2c` from the Alpine bundle with `--async-dns=false`.
+
 **2026-10-09: `netwatch` is disabled on p3** (its conf moved to
 `/root/netwatch.conf.disabled`) so a session survives a lossy link long enough
 to collect data; move it back to `/etc/herd/enabled/` to re-arm it. **`klogd`

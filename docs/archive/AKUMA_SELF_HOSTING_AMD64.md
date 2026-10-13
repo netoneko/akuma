@@ -3056,6 +3056,32 @@ laptop leaves a permanent process on the box. Verify disk contents with
 the channel turns LF into CRLF on output, see
 `docs/runbooks/amd64-bare-metal-loop.md`).
 
+### Status check, 2026-10-14
+
+Items 1-5 above are closed by their own notes. Checked against the ryzen metal
+(`ugh` at `75e22feb` + the timer fix) with live probes, plus the items the
+2026-09-20..24 diagram further up lists as "still open":
+
+- **6, a writer on a dead session channel (2026-09-12): half-fixed, still open.**
+  `ssh akuma 'cat /dev/zero'` with the client killed leaves the box-side `cat`
+  running (PID 1398 in the test): the channel's write still does not return `EPIPE`
+  when the far side goes away. But `kill -9` now works on it — the state went
+  `R` -> `Z` — where the report says SIGKILL "did nothing"; the zombie stays listed
+  because nothing reaps orphans on this target (its parent is sshd). The signal fix
+  (`pthread_kill_eintr_enabled`, 2026-09-12; `AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`)
+  most likely accounts for the kill (not isolated); the `EPIPE` half was never done.
+- **herd `workdir` triple-faulting through `SPAWN_EXT`: no longer reproduces** —
+  see the correction in `AMD64_SPAWN_EXT_WORKDIR_CRASH.md`.
+- **herd starting a service twice: not reproduced** (a `start_delay_ms` unit, three
+  reloads, one live copy) — see `HERD_DUPLICATE_SERVICE_PROCESSES.md`.
+- **The persistent-root shell having no `PATH`: fixed** — `PATH=/sbin:/usr/sbin:/bin:/usr/bin`
+  over ssh, and bare `ls`, `ps`, `reboot`, `hget` resolve.
+- **Not re-checked:** two Akuma boxes across proxy-ARP, the kot `writev` spin on
+  the metal (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md` §6.1), the receiver rewind
+  behind the RX-ring resync (the `resync_rx_cursor` audit fixes are `67466d35` on `ugh`
+  and were not exercised), and the "one event late" interactive-ssh report
+  in `amd64-bare-metal-loop.md`, which was seen under SMP=4 build load.
+
 ## What stays different forever, by design
 
 Not work items — pinned seams. The end state is not zero platform differences;

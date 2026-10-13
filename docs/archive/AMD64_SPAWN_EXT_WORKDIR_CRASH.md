@@ -1,6 +1,21 @@
 # `herd`'s `workdir`, and the `SPAWN_EXT` call that kills the machine
 
-**Status: OPEN.** The `workdir` key is implemented in `userspace/herd` and is
+> **Correction, 2026-10-14: no longer reproduces.** On the ryzen metal (kernel
+> built from `ugh` at `75e22feb` plus the 2026-10-14 timer fix, `/bin/herd` of
+> 2026-10-08) a one-shot unit with `workdir = /tmp` — an unboxed `SPAWN_EXT`,
+> `box_id = 0` with a `cwd` — started, exited 0 and reached `Completed`, and the
+> same unit running `touch wdprobe.marker` created the file in `/tmp`, not `/`:
+> the working directory is applied, which is also what the herd README now says.
+> It was never diagnosed here. The likely cause is the two `spawn_ext` faults
+> found by [`AKUMA_AMD64_BOXES_AUDIT.md`](AKUMA_AMD64_BOXES_AUDIT.md) — an 8 KiB
+> inline `ProcessSyscallStats` overflowing the 32 KiB kernel stack, and
+> `TSS.rsp0 == 0` for a one-phase `spawn_ext` thread — whose symptoms match this
+> doc's (a triple fault with no panic line, and "the failure moves one spawn later
+> when an argument changes", i.e. state corrupted and consumed afterwards). That
+> attribution is **inferred from the match**, not shown by reverting either fix.
+> The `{box_id} x {cwd}` probe proposed below was never written.
+
+**Status: no longer reproduces (2026-10-14, see the correction below).** The `workdir` key is implemented in `userspace/herd` and is
 **not usable** — every service that sets it takes the kernel down. Found
 2026-09-20 on the Ryzen Firecracker guest while giving `llama-server` a working
 directory. Nothing here is a regression: `SPAWN_EXT` has always had a `cwd`

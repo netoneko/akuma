@@ -191,7 +191,7 @@ What every run also printed, so the next reader does not re-investigate it:
 
 | console line | per run | reading |
 |---|---|---|
-| `[BKL] stuck: owner=N waiter=M tag=11 …` | **exactly 27, in all 11 runs** | `tag=11` is x86_64 `munmap` (the raw number — same holder as photo 6227 in [`AMD64_THREE_CRASHES`](../archive/AMD64_THREE_CRASHES.md)), so a shootdown that is slow under contention but *completes*. **The constant 27 is not explained**: the reporter folds by episode (`STUCK_REPORTED`, `akuma-bkl/src/sync.rs`), it is not a hard cap I could find, and a timing-dependent count landing on one value eleven times deserves a look |
+| `[BKL] stuck: owner=N waiter=M tag=11 …` | **exactly 27, in all 11 runs** | `tag=11` is x86_64 `munmap` (the raw number — same holder as photo 6227 in [`AMD64_THREE_CRASHES`](../archive/AMD64_THREE_CRASHES.md)), so a shootdown that is slow under contention but *completes*. **The constant 27 was explained 2026-10-02**: they were `munmap` holding the BKL across a shootdown IPI'd to cores that did not need it, and they are 0–2 after the targeted shootdown ([`AKUMA_AMD64_TARGETED_SHOOTDOWN`](../archive/AKUMA_AMD64_TARGETED_SHOOTDOWN.md) §4); original note: **the constant 27 is not explained**: the reporter folds by episode (`STUCK_REPORTED`, `akuma-bkl/src/sync.rs`), it is not a hard cap I could find, and a timing-dependent count landing on one value eleven times deserves a look |
 | `[MM] fault race #1` | 1 | §14's demand-fault race, one per build, as documented |
 | `[TRAMP-MISMATCH]` | 6–9 | the stale-`thread_id` rows of `AKUMA_AMD64_NO_SLOT_RECYCLER.md`; not a defect |
 
