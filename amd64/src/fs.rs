@@ -801,9 +801,15 @@ fn path_walk_smoke_test(t: &mut Suite) {
                 "path: an interior link keeps the suffix",
                 resolve_symlinks(&through) == "/probe.txt",
             );
+            // Bytes through the link, read the way a caller gets them: the
+            // resolved path. The kernel-internal `read_file` does not chase
+            // links — chasing is the syscall layer's job (`sys_openat` runs
+            // this same resolver first), which is how busybox on the metal
+            // reads through `bin -> usr/bin` after this fix.
             t.check(
                 "path: an interior link reads the target's bytes",
-                read_file(&through).is_ok_and(|b| b.starts_with(b"AKUMA/amd64 ext2 probe\n")),
+                read_file(&resolve_symlinks(&through))
+                    .is_ok_and(|b| b.starts_with(b"AKUMA/amd64 ext2 probe\n")),
             );
             t.check("path: the interior link is removed again", remove_file(DIRLINK).is_ok());
         }
