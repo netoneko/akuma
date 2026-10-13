@@ -1770,7 +1770,13 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     let env_vec = parse_argv_array(o.env_ptr);
     let env_opt = if env_vec.is_empty() { None } else { Some(env_vec.as_slice()) };
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, env_opt, stdin_slice, cwd_ref, o.box_id, false) {
+    let spawned = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, env_opt, stdin_slice, cwd_ref, o.box_id, false);
+    // Every failure below collapses to ENOMEM for the caller; the reason is the
+    // only thing that tells a missing file from a full slot table.
+    if let Err(ref e) = spawned {
+        akuma_primitives::safe_print!(192, "[syscall] spawn_ext: box={} {}: {}\n", o.box_id, path, e);
+    }
+    if let Ok((_tid, ch, pid)) = spawned {
         // For a `stack=rump` box, when herd spawns its `rump_server` the kernel
         // wires a sysproxy channel onto fd 3 (BEFORE the server runs) and brings
         // the proxy up. herd owns the process; the kernel owns the channel.
