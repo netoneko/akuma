@@ -179,7 +179,7 @@ mod socket_constants_tests {
 /// tests pin the *distinctions* as much as the happy path.
 #[cfg(all(test, feature = "smoltcp"))]
 mod connect_state_tests {
-    use crate::socket::{bind_port_for, connect_outcome, connect_step, ConnectStep, libc_errno};
+    use crate::socket::{bind_port_for, connect_completed, connect_outcome, connect_step, ConnectStep, libc_errno};
     use smoltcp::socket::tcp::State;
 
     #[test]
@@ -228,6 +228,39 @@ mod connect_state_tests {
             Ok(())
         );
         assert_eq!(connect_outcome(Ok(()), Some(State::Established)), Ok(()));
+    }
+
+    /// A server that completes the handshake and closes before the waiter looks
+    /// leaves the socket in `CloseWait` (or further along). That connection WAS
+    /// open: `connect` succeeds and the caller reads EOF. It used to be a
+    /// 10 s `ETIMEDOUT`, which is how `hget` met Cloudflare's idle close.
+    #[test]
+    fn a_connection_the_peer_already_closed_still_connected() {
+        for state in [
+            State::CloseWait,
+            State::FinWait1,
+            State::FinWait2,
+            State::LastAck,
+            State::Closing,
+            State::TimeWait,
+        ] {
+            assert!(connect_completed(state), "{state:?}");
+            assert_eq!(connect_outcome(Ok(()), Some(state)), Ok(()), "{state:?}");
+            // The state is the authority even when the wait reported an error.
+            assert_eq!(
+                connect_outcome(Err(libc_errno::ETIMEDOUT), Some(state)),
+                Ok(()),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// The states that mean the handshake did NOT finish stay failures.
+    #[test]
+    fn half_open_states_are_not_completed() {
+        for state in [State::SynSent, State::SynReceived, State::Closed, State::Listen] {
+            assert!(!connect_completed(state), "{state:?}");
+        }
     }
 
     /// The distinction that was missing: a socket that reached Closed was
