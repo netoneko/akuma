@@ -901,6 +901,23 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
         return neg_errno(libc_errno::EOPNOTSUPP);
     }
 
+    // `IP_OPTIONS`: this stack never sets any, and Linux reports that as a
+    // **length of 0**. The common path below answers every option it does not
+    // know with a 4-byte zero, which for this one means "four bytes of IP
+    // options" — and OpenSSH's `check_ip_options` takes any non-zero length as
+    // source routing, logs `Connection from … with IP opts: 00 00 00 00` and
+    // closes the connection with exit 255, before sending a banner
+    // (`docs/archive/AKUMA_GENTOO.md`, 2026-10-15).
+    const IPPROTO_IP: i32 = 0;
+    const IP_OPTIONS: i32 = 4;
+    if level == IPPROTO_IP && optname == IP_OPTIONS {
+        let out_len: u32 = 0;
+        if write_user_val(optlen, &out_len).is_err() {
+            return EFAULT;
+        }
+        return 0;
+    }
+
     // These two answer with a 16-byte `struct timeval`, not the 4-byte int
     // every other option here uses, so they are handled before the common
     // path. Without a readback a client cannot distinguish "honoured" from

@@ -253,6 +253,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-slot-table",
  "akuma-syscalls-linux",
+ "akuma-syscalls-log",
  "akuma-terminal",
  "akuma-threading",
  "akuma-user-access",

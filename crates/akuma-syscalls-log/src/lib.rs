@@ -96,10 +96,29 @@ pub fn record(pid: u32, box_id: u64, nr: u64, timestamp_us: u64, duration_us: u6
             entry.exited_at_us = None;
             entry.box_id = box_id;
         }
+        // A syscall recorded for a pid already marked exited is a *new* process
+        // that was handed the pid: start its log over, as for a different box.
+        if entry.exited_at_us.take().is_some() {
+            entry.entries.clear();
+        }
         if entry.entries.len() >= max_entries() {
             entry.entries.pop_front();
         }
         entry.entries.push_back(SyscallEntry { timestamp_us, nr, duration_us, result });
+    });
+}
+
+/// Drop every log whose retention window has closed. Run from every place that
+/// already walks the map (`mark_exited`, `list_pids_with_logs`) so the map is
+/// bounded by "processes that exited in the last `retain_us`" plus live ones —
+/// it used to be pruned only inside `get_formatted`, which nothing calls unless
+/// someone reads `/proc/<pid>/syscalls`, so it grew for the life of the boot
+/// (one entry per process ever run, ~2 KB each, and every one of them listed in
+/// `/proc`).
+fn prune_expired(log: &mut BTreeMap<u32, ProcessSyscallLog>, now: u64) {
+    log.retain(|_, v| match v.exited_at_us {
+        Some(exited_at) => now.saturating_sub(exited_at) < retain_us(),
+        None => true,
     });
 }
 
@@ -110,6 +129,7 @@ pub fn mark_exited(pid: u32) {
         if let Some(entry) = log.get_mut(&pid) {
             entry.exited_at_us = Some(now);
         }
+        prune_expired(&mut log, now);
     });
 }
 
@@ -166,19 +186,48 @@ pub fn list_pids_with_logs(viewer_box_id: u64) -> Vec<u32> {
     let now = uptime_us();
     
     with_irqs_disabled(|| {
-        let log = SYSCALL_LOG.lock();
+        let mut log = SYSCALL_LOG.lock();
+        prune_expired(&mut log, now);
         log.iter()
-            .filter(|(_, v)| {
-                if viewer_box_id != 0 && v.box_id != viewer_box_id {
-                    return false;
-                }
-                if let Some(exited_at) = v.exited_at_us {
-                    now.saturating_sub(exited_at) < retain_us()
-                } else {
-                    true
-                }
-            })
+            .filter(|(_, v)| viewer_box_id == 0 || v.box_id == viewer_box_id)
             .map(|(pid, _)| *pid)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_of(exits: &[(u32, Option<u64>)]) -> BTreeMap<u32, ProcessSyscallLog> {
+        exits
+            .iter()
+            .map(|&(pid, exited_at_us)| {
+                (pid, ProcessSyscallLog { entries: VecDeque::new(), exited_at_us, box_id: 0 })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prune_drops_only_expired_exits() {
+        let retain = retain_us();
+        // pid 1 live; pid 2 exited long ago; pid 3 exited just now; pid 4 exactly at the edge.
+        let now = 10 * retain;
+        let mut log = log_of(&[
+            (1, None),
+            (2, Some(now - 2 * retain)),
+            (3, Some(now - 1)),
+            (4, Some(now - retain)),
+        ]);
+        prune_expired(&mut log, now);
+        let kept: alloc::vec::Vec<u32> = log.keys().copied().collect();
+        assert_eq!(kept, [1, 3], "live and recently-exited stay; expired (>= retain) go");
+    }
+
+    #[test]
+    fn a_live_log_is_never_pruned() {
+        let mut log = log_of(&[(7, None), (8, None)]);
+        prune_expired(&mut log, u64::MAX);
+        assert_eq!(log.len(), 2);
+    }
 }

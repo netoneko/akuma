@@ -544,6 +544,17 @@ impl Station {
                 frames(card, |f| {
                     let Some(b) = beacon::parse(f, true) else { return };
                     beacons += 1;
+                    // A hidden network beacons an empty SSID, and a known
+                    // network is matched by name, so such a beacon can never be
+                    // chosen — but it takes one of the `MAX_BSS` slots. In a
+                    // crowded building a dozen of them (and channel 1's
+                    // neighbours) filled the table before the sweep reached
+                    // channel 11, so the home network was never even listed
+                    // (`wifi: no known network in range`, forever; 2026-10-15,
+                    // `docs/archive/AKUMA_GENTOO.md`).
+                    if b.ssid.is_empty() {
+                        return;
+                    }
                     if found[..n].iter().any(|e| e.bssid == b.bssid) || n >= MAX_BSS {
                         return;
                     }

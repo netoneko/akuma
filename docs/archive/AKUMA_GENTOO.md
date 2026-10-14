@@ -242,6 +242,74 @@ diagnosed; the init script now also runs a debug sshd (`-ddd -e`, port 4445,
 log `/var/log/sshd-debug.log`) and, while `/autoreboot` exists, reboots itself
 to Pop after 6 minutes so the logs can be read without a power button.
 
+## Update 2026-10-15 (night): why OpenSSH on 4444 closed the connection — four layers deep
+
+With a second way in (Akuma's own `sshd`, copied into the Gentoo root as
+`/usr/local/bin/akuma-sshd` on **2222**, same host key and `authorized_keys` as
+p3) the failure could be debugged from the inside: `sshd -ddd -e -D -p 4447`
+by hand, one connection from the Mac, read `/tmp/sd.log`. Each fix exposed the
+next, and none was visible from outside — the client only ever said
+`Connection closed by remote host`.
+
+| # | log line | cause | fix |
+|---|---|---|---|
+| 1 | `Connection from … with IP opts: 00 00 00 00`, exit 255 | `getsockopt(IPPROTO_IP, IP_OPTIONS)` fell into the common path and answered a 4-byte zero; OpenSSH's `check_ip_options` reads any non-zero length as source routing and drops the connection | `sys_getsockopt` reports length 0 for `IP_OPTIONS` (`akuma-syscalls-glue/src/net.rs`). `python3 -c 'socket.socket().getsockopt(0,4,64)'` is now `b''` |
+| 2 | `chroot("/var/empty"): Function not implemented` | **no `chroot(2)`** in either kernel | real `chroot`: `Process::root`, inherited at fork, applied once in `resolve_mount` after the path is canonicalised against the chroot's own `/` (`akuma_vfs::under_root`, host-tested incl. `..` and nested chroots). Table rows x86_64 161 / asm-generic 51. Verified live: inside the jail `/..` stays inside and `/etc/passwd` is gone |
+| 3 | `prctl(PR_SET_SECCOMP): Invalid argument` | Gentoo's OpenSSH is built with the seccomp-filter sandbox; Akuma has no seccomp | rebuilt on Pop (`--with-sandbox=no`; the `rlimit` sandbox's configure test fails on musl) via `/etc/portage/env/openssh-rlimit.conf` + `package.env`. A no-op `PR_SET_SECCOMP` was rejected: it would be a sandbox that sandboxes nothing |
+| 4 | `wc` / Python segfault in the shell once logged in | the 512 KiB user stack (below) | see the next section |
+
+**What `chroot` is and is not** (also in the doc comment on `sys_chroot`): a real
+per-process root for path resolution; not a security boundary. Akuma-native
+`spawn` children start at `/` again, `/dev` and `/proc` are virtual and resolved
+ahead of the mount table, `cwd` is not re-based (callers `chdir("/")`, as
+OpenSSH does), and there are no capabilities — only uid 0.
+
+**Boot reliability:** on some boots the radio scans and never sees the network
+(`wifi: no known network in range` forever; `ifconfig` shows only `169.254…`).
+Earlier boots joined within seconds. Not understood. The init script now waits
+120 s for an address and, if `/autoreboot` exists, reboots to Pop so a driver
+(`/tmp/cycle_gentoo.py`: arm entry 17, reboot, poll 2222/4444, re-arm on a
+bounce) can retry unattended.
+
+## Result 2026-10-15: `ssh -p 4444 root@192.168.1.159` into Gentoo works
+
+```
+$ ssh -p 4444 root@192.168.1.159 'uname -a; hostname; id; head -2 /etc/os-release'
+Akuma akuma-gentoo 0.0.8 7f0707d5-release-smp-shared x86_64 AMD Ryzen 7 8845HS w/ Radeon 780M Graphics AuthenticAMD GNU/Linux
+akuma-gentoo
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),26(tape),27(video)
+NAME='Gentoo'
+ID='gentoo'
+```
+
+An Akuma `uname` from a Gentoo userspace, over OpenSSH, as the doc's resumption
+recipe asked for. Getting there found four more kernel defects beyond the table
+above, all fixed in the tree:
+
+| defect | symptom | fix |
+|---|---|---|
+| **wifi scan table crowded out by hidden networks** | `wifi: no known network in range` forever on some boots (the scan table is `MAX_BSS = 24`; a dozen hidden-SSID APs and channel 1's neighbours filled it before the sweep reached channel 11, where the home AP lives) | `rtw89_sta::sweep` skips empty-SSID beacons (nothing can be joined by an empty name). The boot went from failing 4 times in a row to joining first try |
+| **user stack limit 512 KiB** | `wc -l <file>` SIGSEGV at `cr2 == rsp`: coreutils keeps a 256 KiB buffer on the stack. The stack was `ELF_STACK_PAGES = 128` pages mapped at exec with no growth | the top 128 pages stay eager; below them one anonymous demand-paged region up to **8 MiB** (`ELF_STACK_MAX_PAGES`, `mm::lazy_stack_region`, registered at first exec and again after `execve`'s `install_image`), `RLIMIT_STACK` reports 8 MiB |
+| **`/proc` lists every process that ever ran** | `ps`/`ls /proc` never return on a long-running box | [`AKUMA_PROC_ENUMERATION_HANG.md`](AKUMA_PROC_ENUMERATION_HANG.md) |
+| (kernel) `getsockopt(IP_OPTIONS)`, `chroot`, `sethostname` | see the table above | |
+
+**The python crash is very probably the same stack bug.** After the stack fix,
+on the same Gentoo root that crashed all of 2026-10-14: `wc -l` works,
+`hashlib.blake2b` returns a digest (it SIGSEGV'd), `emerge --version` runs (it
+SIGILL'd), and `emerge --oneshot --getbinpkg app-text/tree` gets through
+dependency resolution in ~1 s. See [`AKUMA_GENTOO_PORTAGE_CRASH.md`](AKUMA_GENTOO_PORTAGE_CRASH.md).
+
+**Still open:** the native `emerge` then stops at "Emerging (1 of 1)": it forks
+its ebuild runner (a Python child, with a `multiprocessing` resource tracker and
+an asyncio thread) and nothing further happens — load 0, `build.log` empty, no
+`ebuild.sh` process. Not investigated. Until it is, packages are built on Pop in
+a chroot and run here (that is how this OpenSSH got here).
+
+How to run it: `overlays/ryzen/gentoo/` (`akuma-init.sh`, `cycle_gentoo.py`),
+menu entry 17. Akuma's own sshd is also in the box on 2222. The box no longer
+reboots itself (`/autoreboot` is removed); touch it again to get the
+no-network-after-120 s bounce back to Pop.
+
 ## Background
 
 - [`AKUMA_AMD64_LAPIC_ONESHOT_STALE.md`](AKUMA_AMD64_LAPIC_ONESHOT_STALE.md) —

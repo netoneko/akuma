@@ -1,5 +1,26 @@
 # `ps` / `ls /proc` never return on a long-running Akuma
 
+> **Root-caused and fixed 2026-10-15.** Not a getdents cursor bug: `/proc` listed
+> **every process that ever ran**, so the listing grew by one entry per `fork`
+> for the life of the boot (measured on the Gentoo box: 9 556 entries after 15
+> minutes, 16 of them live; 200 runs of `/bin/true` added 203 entries that never
+> left). `ps`/`ls` stat each one, so on a box that had run for a day the walk
+> simply never finished. The entries came from `akuma-syscalls-log`: each
+> process's retained syscall trace is listed in `/proc` until it has been
+> *marked exited* and its 10 s retention has passed. `mark_exited` was called
+> only from glue's `exit`/`exit_group` handlers, which the amd64 exit path never
+> reaches, and the map was pruned only inside `get_formatted` (i.e. when someone
+> read `/proc/<pid>/syscalls`) — so it was also an unbounded kernel-heap leak,
+> ~2 KB per process. Fix: `table::unregister_process`, the one choke point both
+> kernels retire through, now calls `mark_exited`; `mark_exited` and
+> `list_pids_with_logs` prune expired logs; a pid reused while its old log is
+> retained starts a fresh one (`record`). Verified live: 40 entries, 243 right
+> after a burst of 200 commands, 29 twelve seconds later. Host tests:
+> `prune_expired` in `akuma-syscalls-log`.
+>
+> The original write-up follows; its "hypothesis" section (cursor stalls, pid
+> table overflow) was wrong, and the "scales with uptime" guess was right.
+
 **Date:** 2026-10-15. **Status:** OPEN — observed, not root-caused, not reproduced
 on a fresh boot. **Where:** amd64 trashcan (`192.168.1.120`), kernel
 `0.0.8 35f1a72b-release-smp-shared` (2026-10-14, 8 commits behind `ugh` HEAD),

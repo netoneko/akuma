@@ -87,6 +87,18 @@ const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 /// `exec_runtime.rs`'s `user_stack_size`.
 pub const ELF_STACK_PAGES: usize = 128;
 
+/// How far the main stack may grow: 8 MiB, Linux's default `RLIMIT_STACK`.
+///
+/// Only [`ELF_STACK_PAGES`] of it are mapped at exec; the rest below is one
+/// anonymous demand-paged region ([`crate::mm::lazy_stack_region`]), so a
+/// process pays for the pages it touches. Without it the stack ended hard at
+/// 512 KiB: coreutils' `wc -l` keeps a 256 KiB buffer on the stack, ran off the
+/// bottom, and died on a `#PF` with `cr2 == rsp` that nothing serviced
+/// (2026-10-15, `docs/archive/AKUMA_GENTOO.md`). The same shape is a likely
+/// suspect for the Python `_blake2` crash recorded in
+/// `AKUMA_GENTOO_PORTAGE_CRASH.md`.
+pub const ELF_STACK_MAX_PAGES: usize = 2048;
+
 /// The guest program, linked at [`USER_CODE_VA`] and embedded in the kernel
 /// image.
 ///
@@ -1762,6 +1774,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // further wiring. x86-only `chmod`(90) arrives as the `Fchmodat` shim
         // in the legacy block above.
         Syscall::Chdir => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        // chroot(2) — glue's, so the root lives on the shared `Process`.
+        Syscall::Chroot => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `fchdir(fd)` — added 2026-09-20 alongside the `akuma-syscalls-abi`
         // row: the abi table alone was not enough, because this match has no
         // catch-all forwarding to glue (see `_ => errno::ENOSYS` below) — a
@@ -3236,7 +3250,8 @@ impl Image {
         let stack = loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)?;
 
         let entry = img.entry;
-        Ok((Self { space, entry, stack, regions: Vec::new() }, img))
+        let regions = alloc::vec![crate::mm::lazy_stack_region(ELF_STACK_TOP, ELF_STACK_PAGES, ELF_STACK_MAX_PAGES)];
+        Ok((Self { space, entry, stack, regions }, img))
     }
 
     // Teardown is `Drop`, not a `free(self)` method.
@@ -4424,7 +4439,7 @@ fn register_exec_process(
         thread_pid_map_insert,
     };
 
-    let stack_bottom = ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096);
+    let stack_bottom = ELF_STACK_TOP - (ELF_STACK_MAX_PAGES as u64 * 4096);
 
     // **Is this process attached to the console?**
     //
@@ -4527,6 +4542,7 @@ fn register_exec_process(
         // never read on this target and mapping it would leak 4 KiB/process.
         process_info_phys: AtomicUsize::new(0),
         cwd: String::from("/"),
+        root: String::from("/"),
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: AtomicBool::new(false),
@@ -5107,7 +5123,7 @@ fn do_execve(
     let new_brk = ld.end_va;
     let new_entry = next.entry;
     let new_stack = next.stack;
-    let stack_bottom = (ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096)) as usize;
+    let stack_bottom = (ELF_STACK_TOP - (ELF_STACK_MAX_PAGES as u64 * 4096)) as usize;
 
     // **POSIX: `execve` destroys every other thread of the calling process.**
     // This target did not, and slice 4 is what made the omission concrete: the
@@ -5227,6 +5243,9 @@ fn do_execve(
         serial::puts("\n");
         return errno::ENOMEM;
     }
+    // `install_image` cleared the region list; the stack's demand-grown part is
+    // one region, registered as at first exec (`Image::with_stack`).
+    crate::mm::register_lazy_stack(ELF_STACK_TOP, ELF_STACK_PAGES, ELF_STACK_MAX_PAGES);
     // The display name is the syscall layer's, on both kernels —
     // `install_image`'s doc says so, because it is the *resolved path* here and
     // `argv[0]` would be a name the caller chose rather than something that
@@ -7375,6 +7394,11 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
             && Syscall::from_x86_64(171) == Some(Syscall::Setdomainname),
     );
     t.check_eq("dispatch: sethostname reaches glue as 161", Syscall::Sethostname.to_aarch64(), 161);
+    t.check(
+        "dispatch: x86_64 161 decodes as chroot (asm-generic 161 is sethostname)",
+        Syscall::from_x86_64(161) == Some(Syscall::Chroot),
+    );
+    t.check_eq("dispatch: chroot reaches glue as 51", Syscall::Chroot.to_aarch64(), 51);
 
     // The arms folded into glue, driven **through the real dispatcher** by the
     // x86_64 number userspace would send.
@@ -7512,7 +7536,7 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("dispatch: glue accepts prlimit64", prlimit_rc, 0);
     t.check(
         "dispatch: and writes a real RLIMIT_STACK (the old arm wrote nothing)",
-        rlim[0] == (ELF_STACK_PAGES * 4096) as u64 && rlim[1] == rlim[0],
+        rlim[0] == (ELF_STACK_MAX_PAGES * 4096) as u64 && rlim[1] == rlim[0],
     );
     // The limit reported must be the stack a program actually gets, and this is
     // the check that says which one that is. `exec_runtime.rs` supplied the

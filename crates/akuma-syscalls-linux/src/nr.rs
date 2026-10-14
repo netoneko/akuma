@@ -186,6 +186,8 @@ pub const FSYNC: u64 = 82;
 pub const SYNC: u64 = 81;
 pub const SYNCFS: u64 = 267;
 pub const FCHDIR: u64 = 50;
+/// `chroot(2)`. x86_64 spells it 161.
+pub const CHROOT: u64 = 51;
 pub const FCHMOD: u64 = 52;
 pub const FCHMODAT: u64 = 53;
 pub const FCHOWNAT: u64 = 54;

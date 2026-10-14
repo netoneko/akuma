@@ -643,6 +643,11 @@ syscall_table! {
     /// were in neither table: no number, no variant, no handler. x86_64 170/171
     /// are asm-generic 161/162, where 161/162 here are unrelated on x86_64
     /// (`chroot`, `sync`) — the usual wrong-handler-not-no-handler shape.
+    /// `chroot` — added 2026-10-15 (OpenSSH's privsep child calls it and died on
+    /// `ENOSYS`). x86_64 161 is `chroot` and asm-generic 161 is `sethostname`;
+    /// asm-generic 51 is `chroot` and x86_64 51 is `getsockname` — two numbers
+    /// that each mean the other's neighbour, which is what this table is for.
+    Chroot        => CHROOT        = 161, nr::CHROOT;
     Sethostname   => SETHOSTNAME   = 170, nr::SETHOSTNAME;
     Setdomainname => SETDOMAINNAME = 171, nr::SETDOMAINNAME;
     Sysinfo    => SYSINFO    = 99,  nr::SYSINFO;
@@ -1126,6 +1131,10 @@ mod tests {
         assert_eq!(Syscall::Setdomainname.to_aarch64(), 162);
         assert_eq!(Syscall::from_x86_64(170), Some(Syscall::Sethostname));
         assert_eq!(Syscall::from_aarch64(162), Some(Syscall::Setdomainname));
+        assert_eq!(Syscall::Chroot.to_x86_64(), 161);
+        assert_eq!(Syscall::Chroot.to_aarch64(), 51);
+        assert_eq!(Syscall::from_x86_64(161), Some(Syscall::Chroot));
+        assert_eq!(Syscall::from_aarch64(161), Some(Syscall::Sethostname));
         // x86_64 161 is `chroot`, 162 `sync`: neither may decode as a hostname call.
         assert_ne!(Syscall::from_x86_64(161), Some(Syscall::Sethostname));
         assert_ne!(Syscall::from_x86_64(162), Some(Syscall::Setdomainname));

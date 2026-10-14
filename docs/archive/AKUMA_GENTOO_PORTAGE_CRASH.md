@@ -1,5 +1,13 @@
 # Gentoo in a box: python crashes in C extensions — `_blake2` SIGSEGV, emerge SIGILL
 
+> **Update 2026-10-15 — probably root-caused: the 512 KiB user stack.** amd64
+> mapped exactly 128 pages of stack at exec and never grew it; a program that
+> used more took a `#PF` with `cr2 == rsp` that nothing serviced. `wc -l` (a 256
+> KiB on-stack buffer) died that way, and after the stack became demand-grown to
+> 8 MiB, `hashlib.blake2b` and `emerge --version` — the two crashes recorded
+> here — both work. The "C-extension crash" framing below was a symptom. Details:
+> [`AKUMA_GENTOO.md`](AKUMA_GENTOO.md) § "Result 2026-10-15".
+
 **Date:** 2026-10-14 (**crash SOLVED same day, see Resolution**; context in
 [`AKUMA_GENTOO.md`](AKUMA_GENTOO.md)). **Where:** ryzen metal, entry 14
 (`smp=8`, wifi), kernel at the `box-devfs` build (symlink walk + PT_INTERP

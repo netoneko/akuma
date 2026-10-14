@@ -65,6 +65,7 @@ akuma-cpu = { path = "../akuma-cpu" }
 # Re-exported as `threading::types`, so this crate's call sites are unchanged.
 akuma-exec-core = { path = "../akuma-exec-core" }
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-syscalls-log = { path = "../akuma-syscalls-log" }
 # The BKL protocol + spinlocks, extracted 2026-08-30
 # (docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md §3.4). This crate re-exports it as
 # `akuma_exec::{sync, bkl}` so its ~120 call sites here and the 121 in `src/` are

@@ -96,6 +96,20 @@ pub fn register_process(_pid: Pid, proc: Box<Process>) {
 /// window could still be open. See docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md
 /// (Phase 7e, "Free" half) and docs/archive/BKL_PHASE7_AUDIT.md §2.1/§2.1.1.
 pub fn unregister_process(pid: Pid) -> bool {
+    let retired = retire_process(pid);
+    // The one place every exit funnels through, on both kernels: stamp the pid's
+    // retained syscall log as exited so `/proc` stops listing it after the
+    // retention window. It used to be stamped only by glue's `exit` handlers,
+    // which the amd64 exit path never reaches, so every process ever run stayed
+    // in `/proc` for the whole boot (`ps` stats them all and stops returning on
+    // a long-running box — `docs/archive/AKUMA_PROC_ENUMERATION_HANG.md`).
+    if retired {
+        akuma_syscalls_log::mark_exited(pid);
+    }
+    retired
+}
+
+fn retire_process(pid: Pid) -> bool {
     // `SlotTable::retire` does the ACTIVE→RETIRED CAS (losing it — a racing
     // retire of this exact slot — skips to the next match) and stamps the
     // retire time *after* the CAS wins. The closure runs with the slot RETIRED

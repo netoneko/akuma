@@ -378,6 +378,23 @@ fn find_free_va_scan_from(
 /// sorted invariant and documents it; kept as a named function here because the
 /// boot-suite `va_placement_check` asserts against it and because [`find_free_va`]
 /// three functions up is the reason this target needs the invariant at all.
+/// The demand-grown part of the main stack: `max_pages` below `top`, of which
+/// the top `eager_pages` are already mapped by `loader::build_stack`. An
+/// anonymous RW region with no file, so `fault_in` zero-fills a page when the
+/// stack reaches it. Placed under the process's mmap window by
+/// `ProcessMemory`'s `mmap_limit` (`stack_bottom - 1 MiB`).
+pub fn lazy_stack_region(top: u64, eager_pages: usize, max_pages: usize) -> MmapRegion {
+    let base = top as usize - max_pages * PAGE_SIZE as usize;
+    MmapRegion::inherited_with_prot(base, max_pages - eager_pages, Prot::RW_NO_EXEC)
+}
+
+/// [`lazy_stack_region`], inserted into the current process's region list — for
+/// `execve`, which clears the list when it installs the new image.
+pub fn register_lazy_stack(top: u64, eager_pages: usize, max_pages: usize) {
+    let region = lazy_stack_region(top, eager_pages, max_pages);
+    usermode::with_current_regions(|regions| insert_region_sorted(regions, region));
+}
+
 fn insert_region_sorted(regions: &mut Vec<MmapRegion>, region: MmapRegion) {
     akuma_mmap::insert_region_sorted(regions, region);
 }

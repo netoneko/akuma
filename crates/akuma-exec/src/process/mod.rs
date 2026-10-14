@@ -769,6 +769,12 @@ pub struct Process {
     /// §6.E group 2b.
     pub image: Spinlock<ProcessImage>,
     pub cwd: String,
+    /// The directory this process (and, via fork, its children) treats as `/` —
+    /// a **real** absolute path, `/` until `chroot(2)`. Applied exactly once, in
+    /// `akuma_vfs_glue::resolve_mount`, after the path is canonicalized against
+    /// the chroot's own `/`; `cwd` and every stored `File::path` stay in the
+    /// process's own view. Mutated like `cwd`, under `with_current_process`.
+    pub root: String,
     pub stdin: Arc<Spinlock<StdioBuffer>>,
     pub stdout: Arc<Spinlock<StdioBuffer>>,
     /// `AtomicBool` / `AtomicI32`, same reasoning as [`Process::state`]:
@@ -998,6 +1004,7 @@ impl Process {
             initial_brk: AtomicUsize::new(parent.initial_brk.load(Ordering::Relaxed)),
             memory: parent.memory.clone(),
             cwd: parent.cwd.clone(),
+            root: parent.root.clone(),
             stdin: parent.stdin.clone(),   // shared
             stdout: parent.stdout.clone(), // shared
             spawner_pid: parent.spawner_pid,
@@ -4093,6 +4100,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: AtomicUsize::new(0x1000_0000),
         entry_point: AtomicUsize::new(0), memory: mem, process_info_phys: AtomicUsize::new(0),
         cwd: "/".to_string(),
+        root: "/".to_string(),
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: AtomicBool::new(false), exit_code: AtomicI32::new(0),

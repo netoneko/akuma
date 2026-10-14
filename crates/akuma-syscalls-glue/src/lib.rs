@@ -829,6 +829,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
         nr::TIME => time::sys_time(),
         nr::CHDIR => flat(fs::sys_chdir(args[0])),
+        nr::CHROOT => flat(fs::sys_chroot(args[0])),
         nr::FCHDIR => fs::sys_fchdir(args[0] as u32),
         nr::SET_TERMINAL_ATTRIBUTES => term::sys_set_terminal_attributes(args[0], args[1], args[2]),
         nr::GET_TERMINAL_ATTRIBUTES => term::sys_get_terminal_attributes(args[0], args[1]),

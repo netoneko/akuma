@@ -400,6 +400,10 @@ fn resolve_mount(path: &str) -> Option<ResolvedMount> {
 
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let absolute = resolve_path(&proc.cwd, path);
+        // `chroot(2)`: the path above is in the process's own view (its `..` were
+        // folded against the chroot's `/`); place it under the real root. `None`
+        // — the case for every process that never chrooted — allocates nothing.
+        let absolute = akuma_vfs::under_root(&proc.root, &absolute).unwrap_or(absolute);
 
         // Try process namespace first (lock released before I/O).
         if let Some(resolved) = proc.namespace.mount.lock().resolve_arc_full(&absolute) {

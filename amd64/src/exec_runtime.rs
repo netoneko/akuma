@@ -526,11 +526,11 @@ fn config() -> ExecConfig {
         // into glue: `RLIMIT_STACK` is this number, and `busybox ulimit -s`
         // reported 32 where the program actually has 512 KiB.
         //
-        // It is also an unusually literal limit here. `loader::build_stack`
-        // maps exactly `ELF_STACK_PAGES` eagerly, with no growth policy and no
-        // guard page, so a program that recurses past it takes a `#PF` nothing
-        // will service — the value is the hard edge, not a policy hint.
-        user_stack_size: crate::usermode::ELF_STACK_PAGES * 4096,
+        // The limit is real here: `ELF_STACK_PAGES` are mapped at exec and the
+        // rest up to `ELF_STACK_MAX_PAGES` is one demand-paged region
+        // (`mm::lazy_stack_region`), so a program that recurses past it takes a
+        // `#PF` nothing will service — the value is the hard edge, not a hint.
+        user_stack_size: crate::usermode::ELF_STACK_MAX_PAGES * 4096,
         // Off, and off in `sched.rs` too — see `boot_stack_base` above.
         enable_stack_canaries: false,
         stack_canary: 0,

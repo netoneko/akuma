@@ -179,3 +179,63 @@ where
 pub fn path_components(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|s| !s.is_empty())
 }
+
+/// Place an in-root absolute path under a process's `chroot` directory.
+///
+/// `root` is the process's root as a **real** absolute path (`/` when it has
+/// never called `chroot`, in which case this is `None` and the caller keeps its
+/// path — the common case allocates nothing here). `absolute` must already be
+/// canonical (`resolve_path`'s output): its `..` were folded against `/` of the
+/// *chroot*, which is the whole confinement — `/../../etc` is `/etc` before it
+/// is ever joined, so it can only name something under `root`.
+#[must_use]
+pub fn under_root(root: &str, absolute: &str) -> Option<String> {
+    if root == "/" {
+        return None;
+    }
+    let mut out = String::with_capacity(root.len() + absolute.len());
+    out.push_str(root);
+    if absolute != "/" {
+        out.push_str(absolute);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod under_root_tests {
+    use super::*;
+
+    #[test]
+    fn no_chroot_changes_nothing() {
+        assert_eq!(under_root("/", "/etc/passwd"), None);
+        assert_eq!(under_root("/", "/"), None);
+    }
+
+    #[test]
+    fn a_path_lands_under_the_root() {
+        assert_eq!(under_root("/var/empty", "/etc").as_deref(), Some("/var/empty/etc"));
+        assert_eq!(under_root("/var/empty", "/").as_deref(), Some("/var/empty"));
+    }
+
+    #[test]
+    fn dotdot_cannot_climb_out() {
+        // The walk folds `..` against the chroot's own `/` first, so the join
+        // only ever sees a path that is already inside.
+        let inside = resolve_path("/", "/../../etc/shadow");
+        assert_eq!(inside, "/etc/shadow");
+        assert_eq!(under_root("/jail", &inside).as_deref(), Some("/jail/etc/shadow"));
+        let rel = resolve_path("/a", "../../../x");
+        assert_eq!(under_root("/jail", &rel).as_deref(), Some("/jail/x"));
+    }
+
+    #[test]
+    fn nested_chroots_compose_by_joining() {
+        // chroot("/a") then chroot("/b") inside it: the second argument is read
+        // in the first's view, so the real root is /a/b.
+        let first = "/a";
+        let second_in_view = "/b";
+        let real = under_root(first, second_in_view).unwrap();
+        assert_eq!(real, "/a/b");
+        assert_eq!(under_root(&real, "/f").as_deref(), Some("/a/b/f"));
+    }
+}

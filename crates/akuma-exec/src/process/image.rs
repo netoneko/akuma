@@ -438,6 +438,7 @@ impl Process {
             memory,
             process_info_phys: AtomicUsize::new(process_info_frame.addr),
             cwd: String::from("/"),
+            root: String::from("/"),
             stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
             stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
             exited: AtomicBool::new(false),

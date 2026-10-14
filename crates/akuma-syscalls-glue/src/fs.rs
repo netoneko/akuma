@@ -3691,6 +3691,43 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
     ENOTDIR
 }
 
+/// `chroot(path)` — make `path` this process's `/`.
+///
+/// What it is: `Process::root`, a real directory prefix applied once, in
+/// `akuma_vfs_glue::resolve_mount`, after `..` has been folded against the
+/// chroot's own `/`, so a path cannot name anything outside it. Children made by
+/// `fork`/`clone` inherit it; `execve` keeps it. Nested calls compose (the
+/// argument is read in the caller's current view).
+///
+/// What it is not, stated so nobody trusts it as a sandbox: Akuma-native
+/// `spawn` children start at `/` again, `/dev` and `/proc` are virtual and
+/// resolved ahead of the mount table, `cwd` is **not** re-based (a relative path
+/// before a `chdir("/")` is read in the new view — the escape Linux's
+/// "chroot then chdir" idiom exists to close, and which every caller does), and
+/// there are no capabilities, only uid 0. The caller this exists for — OpenSSH's
+/// privilege-separation child: `chroot("/var/empty"); chdir("/"); setuid(sshd)` —
+/// needs none of that.
+pub(super) fn sys_chroot(ptr: u64) -> SysResult {
+    if !akuma_exec::process::current_creds().is_root() {
+        return Err(EPERM);
+    }
+    let path = copy_from_user_str(ptr, 512)?;
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return Err(ESRCH);
+    };
+    // In the caller's own view, symlinks followed (chroot follows them).
+    let view = akuma_vfs_glue::resolve_symlinks(&akuma_vfs_glue::resolve_path(&proc.cwd, &path));
+    let meta = akuma_vfs_glue::metadata(&view).map_err(|_| ENOENT)?;
+    if !meta.is_dir {
+        return Err(ENOTDIR);
+    }
+    super::perm::check(&view, akuma_isolation::dac::MAY_EXEC)?;
+    // The real directory: this view placed under the current root.
+    let real = akuma_vfs::under_root(&proc.root, &view).unwrap_or(view);
+    akuma_exec::process::with_current_process(|p| p.root = real);
+    Ok(0)
+}
+
 pub(super) fn sys_chdir(ptr: u64) -> SysResult {
     let path = copy_from_user_str(ptr, 512)?;
     

@@ -3588,6 +3588,7 @@ fn make_test_process(
         parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
         entry_point: core::sync::atomic::AtomicUsize::new(0), memory: mem, process_info_phys: core::sync::atomic::AtomicUsize::new(info_phys),
         cwd: String::from("/"),
+        root: String::from("/"),
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
