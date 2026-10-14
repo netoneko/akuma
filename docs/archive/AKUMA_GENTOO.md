@@ -84,31 +84,79 @@ path that should work.
 2. **Extracted on-metal**: `unxz -c <tar.xz> | tar -x` into `/opt/gentoo/root`
    (busybox 1.35 userland, `unxz` present). Device nodes fail with
    `Function not implemented` — expected, that is the mknod gap; everything
-   else extracts. (RC and file count to be recorded when extraction
-   completes.)
-3. **Still open — the plan being executed:**
-   - `/etc/resolv.conf` (1.1.1.1, 8.8.8.8 — copied from the host's) and
-     `/etc/hosts` into the root; the stage3 ships none that work in a box.
-   - the `/dev` shim above,
-   - `authorized_keys` for root (the Mac's ed25519 key, the same one the
-     host sshd accepts on 2222),
-   - `/box-init.sh` in the root: `openrc sysinit`, `openrc boot`,
-     `openrc default`, then idle in a loop (the box's primary must stay
-     alive), logging to `/box-init.log` on ext2 where the host can read it,
-   - herd service `gentoo.conf`: `command = /bin/sh`, `args = /box-init.sh`,
-     `boxed = true`, `box_root = /opt/gentoo/root`, `mount = proc tmpfs`,
-     `restart = true` — enable + `herd start gentoo` (loopback 7117), no
-     reboot needed; after a reboot it comes up on its own,
-   - **`emerge openssh` inside the box** — the real drop-in test: portage,
-     python, the sandbox, gcc, openssl, all on Akuma syscalls. Likely
-     trouble, in order: sandbox (`FEATURES=-sandbox` first try if
-     `libsandbox` misbehaves on musl), missing `/dev`, fetch (stage3 ships
-     `wget`; if not, distfiles can be fetched host-side into
-     `/var/cache/distfiles` — the box root is plain ext2 the host can write).
+   else extracts (17 top-level dirs, `Gentoo Base System release 2.18`,
+   `wget` present, `usr/bin/python3` present).
+3. **The `/dev` shim, `resolv.conf`, `hosts`, `authorized_keys`,**
+   `/box-init.sh` (three `openrc` runlevels then idle, logging to
+   `/box-init.log`) and the herd service `gentoo.conf`
+   (`boxed = true`, `box_root = /opt/gentoo/root`, `mount = proc tmpfs`,
+   `restart = true`) are all in place and enabled. `herd start gentoo`
+   reached the box (registered, creator = herd, primary = 0) and died at the
+   first spawn — the intermediate-symlink defect below.
+4. **Still open — the plan being executed:**
+   - land `fix/intermediate-symlinks` on the metal: build both kernels
+     on-metal from the pushed branch (the machine builds its own kernel in
+     ~30 s incremental; fresh worktree = longer), install through the Pop
+     side, re-arm entry 14,
+   - `herd start gentoo` — OpenRC's three runlevels, then
+     **`emerge openssh`** — portage, python, gcc, openssl on Akuma syscalls;
+     the real drop-in test,
    - `rc-update add sshd default`; `sshd_config`: `Port 4444`,
      `PermitRootLogin prohibit-password`; then from the Mac
      `ssh -p 4444 root@192.168.1.159 uname -a` should print an Akuma
      `uname` from a Gentoo userspace.
+
+## The blocker the first boot found: intermediate symlinks
+
+`herd start gentoo` registered the box (`/proc/boxes`:
+`3045470212,gentoo,/opt/gentoo/root,1,0`) and then failed to spawn `/bin/sh`.
+The extraction was **not** the problem — checking the stage3's own
+`.CONTENTS.gz` against the tree showed every symlink correct, including the
+two that looked wrong: `sbin -> usr/bin` and `usr/sbin -> bin` are Gentoo's
+2026 sbin-merge, verbatim from the tarball.
+
+The real defect is in the kernel's path resolution, and a controlled test on
+the metal pins it exactly (`/tmp/symtest`, symlink `real`):
+
+| path | result |
+|---|---|
+| `/tmp/symtest/real/marker` (no link) | OK |
+| `/tmp/symtest/rel` (link as **final** component) | OK |
+| `/tmp/symtest/rel/marker` (link **interior**) | ENOENT |
+| `open` / `write` through it | ENOENT / ENOTDIR |
+| absolute target, `..`, CWD-relative | same failures |
+
+`resolve_symlinks` (`crates/akuma-vfs-glue/src/lib.rs:1093`) canonicalized the
+whole path once and only asked "is the *final* path a symlink?" — following
+the link and **dropping every component that came after it**. `/bin/sh`
+through `bin -> usr/bin` resolved to `/usr/bin`; the `sh` vanished. The akuma
+rootfs has no symlinks at all (`ls -la /` shows none), which is why eight
+months of boxes, `box pull`, nginx and redis never tripped it; the amd64 boot
+suite's symlink test only ever exercised a final-component link, so it passed
+too. A usr-merged Gentoo tree crosses such a link on **every** binary path.
+
+## The fix (`fix/intermediate-symlinks`, commit `0d58f739`)
+
+The walk moves into host-testable `akuma-vfs` as
+**`resolve_symlink_chain(path, max_hops, read_link)`** — the walker owns the
+splicing (component-by-component, target joined against the link's directory,
+absolute targets restarting at `/`, `max_hops` bounding loops at the link
+itself), the glue (`akuma-vfs-glue::resolve_symlinks`) supplies the
+`read_link` answers and keeps the devbox `/bin/sh` → `/bin/dash` redirect.
+Both kernels get it through the one choke point: aarch64 wires it in
+`akuma-kernel-glue`, amd64 in `amd64/src/exec_runtime.rs`.
+
+Tests:
+
+- **12 host tests** in `akuma-vfs` (`symlink_chain_tests`): the lost suffix,
+  relative and absolute targets, chains, the sbin-merge shape from the stage3,
+  ELOOP bounded, `max_hops` honored, textual `..` pinned as known divergence.
+- **amd64 boot suite** (`amd64/src/fs.rs`): a link interior to a path —
+  suffix carried through, bytes read through the open that used it. This runs
+  in the QEMU rehearsal and on every plain-kernel boot.
+
+Gates: per-crate clippy `-D warnings` clean; full host suite green (187
+binaries); both amd64 kernels build.
 
 ## Background
 
