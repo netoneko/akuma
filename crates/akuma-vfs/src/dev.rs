@@ -142,32 +142,47 @@ pub struct DevProbe {
     pub block_slots: u8,
     /// The caller runs inside a box (`box_id != 0`).
     ///
-    /// **Boxes get no synthetic `/dev`.** This is a deliberate scope decision
-    /// (2026-08-25), not an oversight: a box has its own rootfs, and showing it
-    /// the host's disks and sound card in `ls /dev` is a containment leak with
-    /// no consumer asking for it. Expand later if something needs it.
+    /// A box gets a **fresh instance of the standard device set** — `null`,
+    /// `zero`, `random`, `urandom`, `tty` and `ptmx`, both openable and
+    /// listable — and nothing of the host's hardware. The original scope
+    /// decision (2026-08-25) served nothing at all, on the grounds that a
+    /// box's own rootfs carries its `/dev`; in practice no rootfs ships
+    /// working device nodes (there is no `mknod` on this kernel and ext2 has
+    /// no char-device dispatch), and every real root — Alpine's busybox, and
+    /// every Gentoo stage3 via OpenRC and openssh — fails without them. The
+    /// 2026-10-14 Gentoo-box work is the consumer that expanded it.
     ///
-    /// Two things survive the carve-out:
+    /// Two boundaries survive:
     ///
-    /// * `null` and `zero` still answer [`lookup`] in a box, because they
-    ///   already did before this table existed and silently turning
-    ///   `stat("/dev/null")` into `ENOENT` inside a box would be a regression.
-    ///   They are still absent from [`list`] — the asymmetry preserves today's
-    ///   behavior exactly rather than inventing new behavior for boxes.
-    /// * `/dev/net/tap0` is unaffected because it was never in this table
-    ///   (`DEVFS_MISSING.md` §3: nested path, directly-openable only). A
-    ///   `stack = rump` box's `rump_server` opens it through `sys_openat`,
-    ///   which this module does not touch, so rump boxes keep their NIC.
+    /// * Host hardware stays invisible: `fb0`, `dsp`, `audio`, `wifi0` and
+    ///   the `vd*` disks are host-only no matter what. `/dev/net/tap0` was
+    ///   never in this table (`DEVFS_MISSING.md` §3: nested path,
+    ///   directly-openable only), so a `stack = rump` box's `rump_server`
+    ///   keeps its NIC.
+    /// * `ptmx` and `pts/N` hand out the kernel's one global pty table —
+    ///   there is no per-box pty namespace, so a pty created in a box is
+    ///   visible on the host's `/dev/pts` too. A grouping question, not a
+    ///   leak of hardware.
     pub in_box: bool,
 }
 
+/// The device names a box's fresh `/dev` instance serves: everything a
+/// userspace root expects from a devtmpfs, minus every node that names host
+/// hardware. A static list so `visible` stays a pure data comparison.
+const BOX_DEV_NAMES: &[&str] = &["null", "zero", "random", "urandom", "tty", "ptmx"];
+
 /// Whether `node` is visible to the caller described by `probe`.
-fn visible(probe: DevProbe, node: &DevNode, listing: bool) -> bool {
+fn visible(probe: DevProbe, node: &DevNode) -> bool {
     if !probe.in_box {
         return true;
     }
-    // In-box: nothing lists, and only the two pre-existing stat targets look up.
-    !listing && matches!(node.name, "null" | "zero")
+    // In-box: the fresh instance lists and opens exactly like the host's
+    // /dev does, so `ls /dev` inside a box reads as a real devtmpfs. The
+    // listing/lookup asymmetry the old carve-out carried (null and zero
+    // stat-able but invisible) is gone with it — a device you can open but
+    // cannot list is the shape that made `2>/dev/null` work while breaking
+    // everything that walked /dev.
+    BOX_DEV_NAMES.contains(&node.name)
 }
 
 /// Every node that exists for `probe`, in a stable order.
@@ -197,19 +212,19 @@ fn all_nodes(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
 #[must_use]
 pub fn lookup(probe: DevProbe, name: &str) -> Option<DevNode> {
     all_nodes(probe)
-        .find(|n| n.name == name && visible(probe, n, false))
+        .find(|n| n.name == name && visible(probe, n))
         .copied()
 }
 
 /// Every node that should appear in `ls /dev`, in a stable order.
 ///
-/// Yields nothing inside a box — see [`DevProbe::in_box`]. Returns an iterator
-/// rather than a collection so a caller that only needs "is there anything
-/// here?" pays nothing; the one caller that needs a real listing
-/// (`vfs::dev_entries`) allocates the `DirEntry` vector it was going to build
-/// anyway.
+/// Inside a box this is the box's fresh instance — see [`DevProbe::in_box`].
+/// Returns an iterator rather than a collection so a caller that only needs
+/// "is there anything here?" pays nothing; the one caller that needs a real
+/// listing (`vfs::dev_entries`) allocates the `DirEntry` vector it was going
+/// to build anyway.
 pub fn list(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
-    all_nodes(probe).filter(move |n| visible(probe, n, true))
+    all_nodes(probe).filter(move |n| visible(probe, n))
 }
 
 #[cfg(test)]
@@ -300,18 +315,33 @@ mod tests {
         }
     }
 
+    /// A box's fresh `/dev` instance lists exactly the standard set — a real
+    /// devtmpfs shape, not the open-but-invisible asymmetry it replaced.
     #[test]
-    fn a_box_gets_no_listing_at_all() {
+    fn a_box_lists_its_own_fresh_dev() {
         let p = DevProbe { audio: true, framebuffer: true, wifi: false, block_slots: 0b1111, in_box: true };
-        assert_eq!(list(p).count(), 0);
+        let mut n = names(p);
+        n.sort_unstable();
+        assert_eq!(n, alloc::vec!["null", "ptmx", "random", "tty", "urandom", "zero"]);
+    }
+
+    /// Everything a real rootfs reaches for opens in a box: redirects,
+    /// entropy, and the pty pair for anything allocating a terminal.
+    #[test]
+    fn a_box_opens_the_standard_set() {
+        let p = DevProbe { in_box: true, ..Default::default() };
+        for name in ["null", "zero", "random", "urandom", "tty", "ptmx"] {
+            assert!(lookup(p, name).is_some(), "{name} must exist in a box");
+        }
     }
 
     #[test]
     fn a_box_never_sees_host_hardware() {
         let p = DevProbe { audio: true, framebuffer: true, wifi: false, block_slots: 0b1111, in_box: true };
-        for name in ["vda", "vdb", "vdc", "vdd", "dsp", "audio", "random", "urandom"] {
+        for name in ["vda", "vdb", "vdc", "vdd", "dsp", "audio", "fb0", "wifi0"] {
             assert!(lookup(p, name).is_none(), "{name} must not leak into a box");
         }
+        assert!(names(p).iter().all(|n| matches!(*n, "null" | "zero" | "random" | "urandom" | "tty" | "ptmx")));
     }
 
     #[test]
@@ -355,6 +385,7 @@ mod tests {
         let n = lookup(DevProbe::default(), "ptmx").expect("ptmx needs no hardware");
         assert_eq!((n.mode(), n.major, n.minor), (0o20666, 5, 2));
         assert!(names(DevProbe::default()).contains(&"ptmx"));
-        assert!(names(DevProbe { in_box: true, ..Default::default() }).is_empty(), "boxes list nothing");
+        // The fresh instance in a box serves the same node.
+        assert!(names(DevProbe { in_box: true, ..Default::default() }).contains(&"ptmx"));
     }
 }

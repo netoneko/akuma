@@ -1353,10 +1353,10 @@ fn dev_probe() -> DevProbe {
         framebuffer: FRAMEBUFFER_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
         wifi: WIFI_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
         block_slots,
-        // Boxes get no synthetic /dev — see `DevProbe::in_box` for why, and
-        // for the two carve-outs (`null`/`zero` stat, and `/dev/net/tap0`,
-        // which was never in this table and keeps working through `sys_openat`
-        // so a `stack = rump` box still has a NIC).
+        // A box gets a fresh instance of the standard device set — see
+        // `DevProbe::in_box` for the boundary (host hardware stays out;
+        // `/dev/net/tap0` was never in this table and keeps working through
+        // `sys_openat` so a `stack = rump` box still has a NIC).
         in_box: akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0),
     }
 }
