@@ -96,31 +96,37 @@ pub const STACK_SIZE: usize = 32 * 1024;
 /// nothing.
 pub const MAX_TASKS: usize = akuma_primitives::preempt::MAX_THREADS;
 
-/// One thread's x87/SSE register file, in `fxsave` layout.
+/// One thread's x87/SSE/AVX register file, in `xsave` (standard-format) layout.
 ///
 /// The kernel is soft-float and never touches these registers, so a thread's
 /// SSE state used to survive a preemption by accident: whatever was in the xmm
 /// registers when the tick landed was still there when it resumed — *on the
 /// same core*. A thread that resumes on another core finds that core's
 /// registers instead, and a thread interleaved with a second SSE-using process
-/// on one core never had that luck. Saved and restored around every switch, 512
-/// bytes per thread, 16-byte aligned as the instruction requires.
-#[repr(C, align(16))]
+/// on one core never had that luck. Saved and restored around every switch.
+///
+/// 832 bytes = 512 legacy (`fxsave` layout, which is also what a machine
+/// without XSAVE uses — only the first 512 are touched then) + 64 `xsave`
+/// header + 256 for the `ymm` upper halves, i.e. `XCR0 = 0b111`
+/// (`smp::XCR0_ENABLED`). 64-byte aligned as `xsave64` requires.
+#[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct FxArea([u8; 512]);
+struct FxArea([u8; 832]);
 
 impl FxArea {
     /// The reset state a program expects: x87 control word `0x37F`, `MXCSR`
     /// `0x1F80` (every SSE exception masked). Not all-zero: an all-zero `MXCSR`
     /// unmasks every exception, and the first inexact result in ring 3 would
     /// raise `#XM` — an "unhandled vector" halt, from a program that did
-    /// nothing wrong.
+    /// nothing wrong. `XSTATE_BV` (header offset 0) says x87+SSE are live so
+    /// `xrstor` loads the values above; AVX is in its init state (all zero).
     const fn initial() -> Self {
-        let mut a = [0u8; 512];
+        let mut a = [0u8; 832];
         a[0] = 0x7F;
         a[1] = 0x03;
         a[24] = 0x80;
         a[25] = 0x1F;
+        a[512] = 0b11;
         Self(a)
     }
 }
@@ -412,13 +418,25 @@ fn hook_switch_to(from: usize, to: usize) {
 
         let fx_out = &raw mut (*m)[from].fx;
         let fx_in = &raw const (*m)[to].fx;
-        core::arch::asm!(
-            "fxsave64 [{out}]",
-            "fxrstor64 [{inp}]",
-            out = in(reg) fx_out,
-            inp = in(reg) fx_in,
-            options(nostack, preserves_flags)
-        );
+        if smp::XSAVE_ON.load(Ordering::Relaxed) {
+            core::arch::asm!(
+                "xsave64 [{out}]",
+                "xrstor64 [{inp}]",
+                out = in(reg) fx_out,
+                inp = in(reg) fx_in,
+                in("eax") smp::XCR0_ENABLED as u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            core::arch::asm!(
+                "fxsave64 [{out}]",
+                "fxrstor64 [{inp}]",
+                out = in(reg) fx_out,
+                inp = in(reg) fx_in,
+                options(nostack, preserves_flags)
+            );
+        }
     }
 }
 

@@ -94,6 +94,7 @@ use crate::{blk, fs, mm, net, pci, reboot, sock, xhci};
 pub fn early_init() -> SmapStatus {
     gdt::init();
     smp::init_bsp();
+    smp::XSAVE_ON.store(smp::enable_xsave(), core::sync::atomic::Ordering::Release);
     idt::init();
     let smap = uaccess::init_smap();
     sched::init();

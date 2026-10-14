@@ -866,6 +866,59 @@ fn enable_sse() {
     }
 }
 
+/// Non-zero once `CR4.OSXSAVE` is set and `XCR0` enables x87+SSE+AVX on this
+/// machine. Set by the BSP in `early_init`, before the scheduler can switch, and
+/// read by `sched.rs` to choose `xsave64` over `fxsave64` — one flag for every
+/// core, because the parts this boots on are homogeneous.
+pub static XSAVE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `XCR0` value this kernel enables: x87 (bit 0), SSE (1), AVX (2). Its
+/// `xsave` area is 832 bytes (512 legacy + 64 header + 256 `ymm` upper
+/// halves), which `sched.rs::XsArea` is sized for. AVX-512 state is left off.
+pub const XCR0_ENABLED: u64 = 0b111;
+
+/// Turn on `CR4.OSXSAVE` and set `XCR0` to [`XCR0_ENABLED`], if cpuid says the
+/// part has XSAVE and AVX. Per core (CR4 and XCR0 are), so the BSP and every AP
+/// call it. Returns whether this core now runs with AVX enabled.
+///
+/// **Why this exists.** Without `OSXSAVE` the CPU still advertises AVX2 in
+/// cpuid leaf 7, and code that trusts leaf 7 alone (CPython 3.14's HACL*
+/// `_blake2` reads leaves 1 and 7 and never `xgetbv`) executes a `ymm`
+/// instruction and takes `#UD`/`#GP` — SIGILL / SIGSEGV for a program that did
+/// nothing wrong (`docs/archive/AKUMA_GENTOO_PORTAGE_CRASH.md`). Conforming
+/// code checks `XCR0` and was never affected; this makes the other kind work,
+/// as it does on Linux.
+pub fn enable_xsave() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    // SAFETY: cpuid is always available in long mode.
+    let (l1, d0) = unsafe { (__cpuid(1), __cpuid_count(0xD, 0)) };
+    let have_xsave = l1.ecx & (1 << 26) != 0;
+    let have_avx = l1.ecx & (1 << 28) != 0;
+    if !have_xsave || !have_avx || u64::from(d0.eax) & XCR0_ENABLED != XCR0_ENABLED {
+        return false;
+    }
+    // SAFETY: OSXSAVE is set first, which makes `xsetbv` legal; `XCR0` bit 0
+    // must stay set and bit 2 requires bit 1, both satisfied by 0b111, and
+    // cpuid just said every bit is supported. The kernel is soft-float and never
+    // touches ymm, so no kernel code is affected; ring 3's ymm state is carried
+    // across switches by `sched.rs`.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or rax, (1 << 18)",
+            "mov cr4, rax",
+            "xor ecx, ecx",
+            "mov eax, {lo:e}",
+            "xor edx, edx",
+            "xsetbv",
+            lo = in(reg) XCR0_ENABLED as u32,
+            out("rax") _, out("rcx") _, out("rdx") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    true
+}
+
 /// Where the trampoline jumps: an AP in long mode, on the boot tables, with
 /// its stack set and `index` in `rdi`. Finishes bringing the core up and never
 /// returns.
@@ -883,6 +936,7 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     // the instruction after the write is mapped.
     unsafe { paging::activate_unpublished(sched::kernel_root()) };
     enable_sse();
+    let _ = enable_xsave();
     // This core's own PAT, so the write-combining framebuffer is WC here too.
     crate::multiboot2::pat_init_ap();
     gdt::init_cpu(idx, PERCPU[idx].stack_top.load(Ordering::Relaxed));

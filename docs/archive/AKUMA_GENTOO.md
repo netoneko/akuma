@@ -1,16 +1,23 @@
 # Akuma as a drop-in Gentoo kernel — a stage3 in a box
 
-**Date:** 2026-10-14 (in progress). **Where:** ryzen metal, entry 14
-(`smp=8`, wifi), kernel `44e0b93d-release-smp-shared` — the current `ugh` HEAD
-with the box fixes. **Question:** can Gentoo's own userspace (OpenRC, portage,
-openssh) run unmodified on the Akuma kernel, the way it runs on Linux — i.e.
-is Akuma a drop-in kernel for a Gentoo root?
+**Date:** 2026-10-14. **Where:** ryzen metal, entry 14 (`smp=8`, wifi).
+**Question:** can Gentoo's own userspace (OpenRC, portage, openssh) run
+unmodified on the Akuma kernel, the way it runs on Linux — i.e. is Akuma a
+drop-in kernel for a Gentoo root?
+
+**Status at the break:** the box **boots, auto-starts with the metal, runs
+OpenRC to `openrc done`, and executes Gentoo binaries** — python 3.14.7,
+bash, TCP, DNS and a fresh `/dev` all work inside it. The single blocker to
+`emerge openssh` is a deterministic native crash in python C extensions
+(`_blake2` SIGSEGV; emerge SIGILL) — full investigation, ruled-out causes
+and resumption recipe in
+[`AKUMA_GENTOO_PORTAGE_CRASH.md`](AKUMA_GENTOO_PORTAGE_CRASH.md).
 
 The shape of the test is a **herd box**, not a bare-metal root swap: the stage3
 lives at `/opt/gentoo/root` on p3, herd boots it (`boxed = true`) with `/proc`
 and `/tmp` mounted in from box 0, OpenRC runs its runlevels inside, and the
-box's openssh answers on **4444** (host sshd keeps 2222; Pop owns 22 when the
-laptop boots back into it). Whatever breaks is the finding.
+box's openssh is to answer on **4444** (host sshd keeps 2222; Pop owns 22 when
+the laptop boots back into it). Whatever breaks is the finding.
 
 ## Why a box and not `root=/dev/nvme0n1p3`
 
@@ -44,67 +51,63 @@ was a locally computed sha256 from the earlier whole-file run. Verify against
 
 ## What the kernel source already said (before running anything)
 
-Found while planning; each one shapes what the box can and cannot do.
+Found while planning; each one shapes what the box can and cannot do. The
+first three were **fixed this session** (see below).
 
 | fact | source | consequence |
 |---|---|---|
-| No `mknod(2)` anywhere | grep over the whole tree | device nodes cannot be created at runtime, in a box or out |
+| ~~No `mknod(2)` anywhere~~ | grep over the whole tree | device nodes cannot be created at runtime — motived the box `/dev` instance |
 | ext2 has no char-device dispatch | grep in `akuma-ext2` | static nodes baked into an image would not dispatch anyway |
-| **Boxes get no synthetic `/dev`** | `crates/akuma-syscalls-glue/src/fs.rs:2037` (`dev_node` arm is host-only, box_id 0) | `/dev/null` inside any box does not exist |
-| `/dev` is not a filesystem | `crates/akuma-vfs-glue/src/lib.rs:1172` — a resolve-time virtual dir, not a mountable fstype | `MOUNT_IN_NS(box, "/dev", …)` has nothing to mount; no devfs-in-box |
+| ~~**Boxes get no synthetic `/dev`**~~ | `crates/akuma-syscalls-glue/src/fs.rs:2037` (`dev_node` arm is host-only, box_id 0) | ~~`/dev/null` inside any box does not exist~~ **fixed:** a box now gets a fresh instance of the standard set |
+| `/dev` is not a filesystem | `crates/akuma-vfs-glue/src/lib.rs:1172` — a resolve-time virtual dir, not a mountable fstype | the box `/dev` is served by widening the same resolve-time layer, not by mounting |
 | herd's `mount =` knows `proc` and `tmpfs` only | `userspace/herd/src/main.rs:933` (`proc`→`/proc`, `tmpfs`→`/tmp`) | no third fstype to lean on |
-| The terminal is a **channel property**, not a device | `archive/BOX_PTY_INTERACTIVE_SHELL.md` — `SPAWN_FLAG_PTY`, the kernel line discipline runs on the spawn channel | openssh's `openpty()` cannot work in a box (no `/dev/ptmx`, and none is coming); Akuma's own sshd never needed one |
-| Boxed services share box 0's smoltcp stack on NIC0 | `docs/reference/subsystems/networking.md` § The two stacks; the boxed-redis end-to-end | a boxed sshd on 4444 is reachable from the LAN — no port mapping needed |
-| herd has native box services | `containers.md` § herd; `overlays/devbox/rootfs/etc/herd/available/redis-boxed.conf.example` | `boxed`/`box_root`/`mount`/`restart` **is** the "comes up automatically" mechanism; the box registers under the service name, so `box use gentoo …` works |
+| The terminal is a **channel property**, not a device | `archive/BOX_PTY_INTERACTIVE_SHELL.md` — `SPAWN_FLAG_PTY`, the kernel line discipline runs on the spawn channel | openssh's `openpty()` opens `/dev/ptmx` — served in-box now; whether a boxed sshd gets working ptys is **untested** (openpty returns fds, not channels) |
+| Boxed services share box 0's smoltcp stack on NIC0 | `docs/reference/subsystems/networking.md` § The two stacks; verified live: boxed TCP to `1.1.1.1:53/80/443` all connect | a boxed sshd on 4444 is reachable from the LAN — no port mapping needed |
+| herd has native box services | `containers.md` § herd; `redis-boxed.conf.example` | `boxed`/`box_root`/`mount`/`restart` **is** the "comes up automatically" mechanism; the box registers under the service name, so `box use gentoo …` works |
 
-**The `/dev` shim.** Since a box has no `/dev` and cannot be given one, the
-root gets plain files and `/proc` symlinks (the box *does* have `/proc`):
+An interim regular-file `/dev` shim (empty `null`/`zero`/`random`/`urandom`
+plus `/proc/self/fd` symlinks) carried the first bring-up before the kernel
+change landed; the re-extract from Pop dropped the regular-file half and kept
+only the `/proc` symlinks, which the fresh instance now complements.
+Interactive ssh into the box is still open: openssh's `openpty()` opens
+`/dev/ptmx` + `/dev/pts/N`, which the fresh instance serves — but akuma's
+terminal is normally a spawn-channel property, so whether a *boxed* openssh
+gets working ptys is untested. `ssh -p 4444 root@… '<command>'` (no pty
+requested) is the path expected to work regardless.
 
-```
-/opt/gentoo/root/dev/null, zero, random, urandom   regular files (empty)
-/opt/gentoo/root/dev/fd                            -> /proc/self/fd
-/opt/gentoo/root/dev/std{in,out,err}               -> /proc/self/fd/{0,1,2}
-```
+## Where the box stands (verified live, in-box)
 
-A real `null` swallows nothing and grows; `< /dev/null` reads EOF; `2>/dev/null`
-truncates. Wrong in the general case, good enough to let thousands of scripts
-and `open("/dev/null")` calls succeed. `/dev/console` deliberately not
-provided (this test boots OpenRC from a script; nothing reads it). A real fix
-— a mountable devfs, or mknod + chrdev dispatch — is a kernel work item, not
-a shim; this test exists partly to price that work.
+| works | evidence |
+|---|---|
+| auto-start with the metal | herd `gentoo: running pid=…` on every boot; box in `/proc/boxes` with a live primary |
+| OpenRC | `sysinit`/`boot`/`default` run to `openrc done`; only `save-keymaps` fails (needs a real console) |
+| usr-merged paths | `/bin/sh`, `/usr/bin/python3.14`, all through `sbin`/`bin` links |
+| python 3.14.7 | `--version`, imports, `os.listdir`, `mmap`, site-packages |
+| `/dev` | fresh instance: proper char metadata, `null` write, `urandom` entropy |
+| networking | TCP to `1.1.1.1:53/80/443` from bash `/dev/tcp`; DNS resolves `distfiles.gentoo.org` through its CDN CNAME |
+| portage's module | `import portage` → `PORTAGE-OK 3.0.82.2` |
 
-Interactive ssh into the box is therefore expected to fail at `openpty` even
-if sshd starts; `ssh -p 4444 root@… '<command>'` (no pty requested) is the
-path that should work.
+| blocked | by |
+|---|---|
+| `emerge openssh` (and thus the sshd-on-4444 payoff) | **the C-extension crash** — `_blake2` SIGSEGV, emerge SIGILL — see [`AKUMA_GENTOO_PORTAGE_CRASH.md`](AKUMA_GENTOO_PORTAGE_CRASH.md) for the discriminators, ruled-out causes, and the resume recipe |
+| interactive ssh into the box | unknown — openssh not installed yet; `openpty` via the in-box `ptmx` is plausible but untested |
 
-## Progress so far
+Resumption recipe: `box use gentoo /bin/sh -c 'FEATURES=-sandbox
+MAKEOPTS=-j6 emerge --oneshot net-misc/openssh > /emerge.log 2>&1'`, poll
+`/opt/gentoo/root/emerge.log` from the host (the box root is plain p3),
+then `rc-update add sshd default`, set `Port 4444` +
+`PermitRootLogin prohibit-password` in `sshd_config`, restart the box, and
+from the Mac: `ssh -p 4444 root@192.168.1.159 uname -a` — an Akuma `uname`
+from a Gentoo userspace.
 
-1. **Verified the download** (above) — the truncated file is the kind of
-   thing that would have surfaced hours later as `tar: unexpected EOF`.
-2. **Extracted on-metal**: `unxz -c <tar.xz> | tar -x` into `/opt/gentoo/root`
-   (busybox 1.35 userland, `unxz` present). Device nodes fail with
-   `Function not implemented` — expected, that is the mknod gap; everything
-   else extracts (17 top-level dirs, `Gentoo Base System release 2.18`,
-   `wget` present, `usr/bin/python3` present).
-3. **The `/dev` shim, `resolv.conf`, `hosts`, `authorized_keys`,**
-   `/box-init.sh` (three `openrc` runlevels then idle, logging to
-   `/box-init.log`) and the herd service `gentoo.conf`
-   (`boxed = true`, `box_root = /opt/gentoo/root`, `mount = proc tmpfs`,
-   `restart = true`) are all in place and enabled. `herd start gentoo`
-   reached the box (registered, creator = herd, primary = 0) and died at the
-   first spawn — the intermediate-symlink defect below.
-4. **Still open — the plan being executed:**
-   - land `fix/intermediate-symlinks` on the metal: build both kernels
-     on-metal from the pushed branch (the machine builds its own kernel in
-     ~30 s incremental; fresh worktree = longer), install through the Pop
-     side, re-arm entry 14,
-   - `herd start gentoo` — OpenRC's three runlevels, then
-     **`emerge openssh`** — portage, python, gcc, openssl on Akuma syscalls;
-     the real drop-in test,
-   - `rc-update add sshd default`; `sshd_config`: `Port 4444`,
-     `PermitRootLogin prohibit-password`; then from the Mac
-     `ssh -p 4444 root@192.168.1.159 uname -a` should print an Akuma
-     `uname` from a Gentoo userspace.
+Two adjacent kernel findings this session surfaced, both recorded in
+[`AKUMA_GENTOO_PORTAGE_CRASH.md`](AKUMA_GENTOO_PORTAGE_CRASH.md): spawned
+children do not share the inherited fd's file offset (POSIX says they
+must; script log files tear), and akuma's ext2 directory writes are not
+Linux-clean (htree/filetype corruption Pop's fsck had to repair; the tree
+was re-extracted from Pop and verified complete against the manifest).
+Probe scripts and outputs from this session remain in the box root
+(`/opt/gentoo/root/p*.sh`, `s*.txt`, `h-*.txt`, `e*.txt`).
 
 ## The blocker the first boot found: intermediate symlinks
 

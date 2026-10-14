@@ -1805,8 +1805,21 @@ pub fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
 /// not make, and one path it answers for itself — and it calls
 /// [`openat_path`] with the path it already holds. `pub` for the same reason
 /// [`sys_close`] and [`sys_read`] are.
-/// `N` of `/proc/self/fd/N` or `/proc/<this process's pid>/fd/N`.
+/// `N` of `/proc/self/fd/N` or `/proc/<this process's pid>/fd/N`, or of the
+/// `/dev` spellings of the same link — `/dev/fd/N` and `/dev/std{in,out,err}`.
+/// The `/dev` ones are symlinks into `/proc/self/fd` on a real system, but
+/// they are named *before* any symlink is followed here: once followed, a pipe
+/// end's link reads `pipe:[id]`, which is no longer a number to reopen.
 fn own_proc_fd_number(path: &str) -> Option<u32> {
+    match path {
+        "/dev/stdin" => return Some(0),
+        "/dev/stdout" => return Some(1),
+        "/dev/stderr" => return Some(2),
+        _ => {}
+    }
+    if let Some(n) = path.strip_prefix("/dev/fd/") {
+        return n.parse().ok();
+    }
     let rest = path.strip_prefix("/proc/")?;
     let (who, tail) = rest.split_once("/fd/")?;
     if who != "self" {
@@ -1887,6 +1900,31 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     {
         let file = akuma_exec::process::KernelFile::new(f.path.clone(), flags).with_inode(f.mount_id(), f.inode());
         let nfd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
+        if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+            proc.set_cloexec(nfd);
+        }
+        return Ok(u64::from(nfd));
+    }
+
+    // The same magic link, for a **pipe** end. A pipe has no path, so the fd's
+    // `/proc/<pid>/fd/N` symlink reads `pipe:[id]` and used to be opened as if
+    // that were a file — `cat <(cmd)` printed the literal text `pipe:[467]`
+    // and `echo x > >(cmd)` failed ENOENT, which is bash process substitution
+    // and what portage's `/dev` sanity check runs first
+    // (`docs/archive/AKUMA_GENTOO_PORTAGE_CRASH.md`). Linux gives the opener a
+    // new descriptor on the same pipe; that is `dup`, refcount included.
+    if let Some(n) = own_proc_fd_number(&path)
+        && let Some(proc) = akuma_exec::process::current_process_shared()
+        && let Some(entry) = proc.get_fd(n)
+        && matches!(
+            entry,
+            akuma_exec::process::FileDescriptor::PipeRead(_)
+                | akuma_exec::process::FileDescriptor::PipeWrite(_)
+        )
+    {
+        akuma_exec::process::clone_fd_refs(&entry);
+        let nfd = proc.alloc_fd(entry);
+        proc.clear_cloexec(nfd);
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(nfd);
         }
