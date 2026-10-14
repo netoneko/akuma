@@ -885,6 +885,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),
         nr::UNAME => proc::sys_uname(args[0]),
+        nr::SETHOSTNAME => proc::sys_sethostname(args[0], args[1], false),
+        nr::SETDOMAINNAME => proc::sys_sethostname(args[0], args[1], true),
         nr::FLOCK => flock::sys_flock(args[0] as u32, args[1] as u32),
         nr::UMASK => cred::sys_umask(args[0]),
         nr::UTIMENSAT => flat(fs::sys_utimensat(args[0] as i32, args[1], args[2], args[3] as u32)),

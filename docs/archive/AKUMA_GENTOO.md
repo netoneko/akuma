@@ -161,6 +161,87 @@ Tests:
 Gates: per-crate clippy `-D warnings` clean; full host suite green (187
 binaries); both amd64 kernels build.
 
+## Update 2026-10-15: openssh built on Pop, box turned off, bare-metal root planned
+
+**Portage tree synced** onto the Gentoo root from Pop (the box root is plain
+p3): `rsync://rsync.gentoo.org/gentoo-portage/` into
+`/opt/gentoo/root/var/db/repos/gentoo` — 133 511 files, 249 570 318 B on the
+wire (the tree is ~720 MB on disk; the `gentoo-latest` snapshot is 51 MB
+compressed), ~16 min at ~260 KB/s over wifi. `etc/portage/repos.conf/gentoo.conf`
+was copied from `usr/share/portage/config/repos.conf`.
+
+**The workaround for the python crash: build on Pop, run on Akuma.** Portage's
+`emerge` is python, so every python front end (eix only indexes; `pmerge`
+is python too) hits the same `_blake2`/SIGILL kernel bug. Instead, chroot from
+Pop's Linux kernel (`mount -t proc`, `--rbind /dev`, `sysfs`, a copied
+`resolv.conf`) and `emerge --oneshot --getbinpkg net-misc/openssh`. It
+installed `openssh-10.5_p1` from the binhost in under 20 s, exit 0. The result
+is ordinary musl ELF that Akuma runs. Paludis (`cave`, C++) is the
+non-python alternative but needs a working emerge to bootstrap. The native
+`emerge` crash remains an open kernel bug; this only routes around it.
+
+**sshd configured in the root, not yet run on Akuma:** `Port 4444`,
+`PermitRootLogin prohibit-password`, `PasswordAuthentication no`, host keys
+generated with `ssh-keygen -A`, the Mac's `id_ed25519.pub` in
+`/root/.ssh/authorized_keys`, `rc-update add sshd default`, `sshd -t` clean.
+`/etc/resolv.conf` in the root now holds Pop's resolver at the time.
+
+**The herd box is off:** `/etc/herd/enabled/gentoo.conf` (a symlink) was
+removed from p3; `available/gentoo.conf` is untouched. Re-enable with
+`ln -s /etc/herd/available/gentoo.conf /etc/herd/enabled/gentoo.conf`.
+
+**Next: a separate partition, booted as box 0.** The amd64 kernel already
+parses `root=/dev/nvme0n1pN` and `init=` (`amd64/src/multiboot2.rs:992`), so
+the plan is a new p7 carved from the unused tail of p3 (the partition is 279 GB
+but its ext2 covers only 64 GB), the stage3 + portage + openssh copied onto it
+with Pop's tools, and a second GRUB entry
+`root=/dev/nvme0n1p7 init=/sbin/openrc-init` beside the existing Akuma one.
+The kernel stays on the ESP, so no Akuma binaries land in the Gentoo root.
+Wifi tooling goes in the same way. Not started: it needs a partition-table
+change. Expected first-boot findings: OpenRC wanting `/sys` and devtmpfs,
+and whether box 0's synthetic `/dev` suffices.
+
+**Open: p3 is `not clean`.** `e2fsck -fn` from Pop reports HTREE damage in
+`/opt/gentoo/root/etc/ssl/certs` and `/src/symlink-wt/docs/archive`, a missing
+LARGE_DIR flag and stale free counts — the Akuma ext2 writer problem already
+recorded in `AKUMA_GENTOO_PORTAGE_CRASH.md`, not caused by this session. No
+repair has been run. Anything Akuma writes to a Linux-checked root should be
+`e2fsck`-ed from Pop after each session.
+
+## Update 2026-10-15 (later): Gentoo booted as box 0 — three blockers, three fixes
+
+p7 (179 GiB, `GENTOO`, ext2) was carved from the unused tail of p3 (p3 shrunk
+279 -> 100 GiB; its ext2 spans 64 GiB so no data moved; GPT backup at
+`/root/nvme0n1-gpt-backup-2026-10-15.bin` on Pop). The stage3 + portage +
+openssh were copied from p3's `/opt/gentoo/root` with `rsync -aHAX`, plus the
+`wifi` tool (`/usr/local/bin/wifi`), `/etc/wifi` (copied, never printed) and the
+rtw89 firmware. Menu **entry 17** (`overlays/ryzen/grub.cfg`):
+`init=/usr/bin/bash initargs=/akuma-init.sh root=/dev/nvme0n1p7 rtw89wifi wdt smp=8`.
+`/akuma-init.sh` starts `wifi auto` in a restart loop, then `openrc sysinit`,
+`boot`, `default`, then sshd directly if OpenRC did not.
+
+| # | blocker (as observed) | cause | fix |
+|---|---|---|---|
+| 1 | `[init] not on the disk: /bin/sh`, back to Pop | `run_init` used `read_file(path)`, which follows no symlink; Gentoo is usr-merged (`/bin -> usr/bin`, `sh -> bash`) | `run_init` resolves symlinks first, like `execve` (`amd64/src/usermode.rs`); the entry also names the real file (`/usr/bin/bash`) so it works on older kernels |
+| 2 | `wifi: /dev/wifi0: open failed (-2)` in a loop; no network | the rtw89 loader looked up `/lib/firmware/rtw89/...` with `metadata`/`read_at`, neither follows links, and `/lib -> usr/lib`; "no firmware", so no `wifi0` registered | the loader resolves the path once and reads the resolved name (`amd64/src/rtw89.rs`, one `String` at boot) |
+| 3 | `cannot start netmount as hostname would not start` | **`sethostname`/`setdomainname` were in neither syscall table** — no number, no variant, no handler — so OpenRC's `hostname` service got `ENOSYS` | rows in `akuma-syscalls-linux::nr` + `akuma-syscalls-abi` (82 rows), handler in `akuma-syscalls-glue::proc`, `uname` overlays the two fields; pure rule in `akuma_syscalls_linux::uts` with host tests; decode pinned in the abi tests and the amd64 boot suite |
+
+Also learned: the boot log was torn because a background job shares the log fd
+and spawned children do not share the inherited file offset (known,
+`AKUMA_GENTOO_PORTAGE_CRASH.md`) — the init script logs with `>>` now. And a
+mount made on Pop **propagates into every daemon's mount namespace**: after
+`umount /mnt/p3` the filesystem stayed mounted in ~10 of them (`e2fsck`: "in
+use", state "not clean") until reboot. Do all p3/p7 work inside
+`unshare -m --propagation private`.
+
+**Result of the first full boot with the fixed kernel:** wifi joined
+(`192.168.1.159`), OpenRC reached `done`, and Gentoo's sshd accepts a TCP
+connection on **4444** — then closes it before sending a banner
+(`kex_exchange_identification: Connection closed by remote host`). Not yet
+diagnosed; the init script now also runs a debug sshd (`-ddd -e`, port 4445,
+log `/var/log/sshd-debug.log`) and, while `/autoreboot` exists, reboots itself
+to Pop after 6 minutes so the logs can be read without a power button.
+
 ## Background
 
 - [`AKUMA_AMD64_LAPIC_ONESHOT_STALE.md`](AKUMA_AMD64_LAPIC_ONESHOT_STALE.md) —

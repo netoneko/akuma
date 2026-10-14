@@ -52,7 +52,7 @@
 //!
 //! # One table, four views
 //!
-//! Widened 2026-09-07 from 36 variants to 80 for **C1**, the fold of
+//! Widened 2026-09-07 from 36 variants to 80 (82 since 2026-10-15) for **C1**, the fold of
 //! `amd64/src/usermode.rs` into `akuma-syscalls-glue`
 //! (`proposals/NEXT_AGENT_AMD64_C1_USERMODE_FOLD.md`). Glue dispatches on
 //! asm-generic numbers and the amd64 kernel is handed x86_64 ones, so something
@@ -638,6 +638,13 @@ syscall_table! {
     /// this table this is the one that would be loudest and least explicable:
     /// a `uname` writing a `utsname` where a `read` was asked for.
     Uname      => UNAME      = 63,  nr::UNAME;
+    /// `sethostname` / `setdomainname` — added 2026-10-15 after Gentoo's OpenRC
+    /// `hostname` service failed on `ENOSYS` and took `netmount` with it. They
+    /// were in neither table: no number, no variant, no handler. x86_64 170/171
+    /// are asm-generic 161/162, where 161/162 here are unrelated on x86_64
+    /// (`chroot`, `sync`) — the usual wrong-handler-not-no-handler shape.
+    Sethostname   => SETHOSTNAME   = 170, nr::SETHOSTNAME;
+    Setdomainname => SETDOMAINNAME = 171, nr::SETDOMAINNAME;
     Sysinfo    => SYSINFO    = 99,  nr::SYSINFO;
     Syslog     => SYSLOG     = 103, nr::SYSLOG;
     Reboot     => REBOOT     = 169, nr::REBOOT;
@@ -1106,6 +1113,22 @@ mod tests {
     fn newly_named_asm_generic_numbers() {
         assert_eq!(Syscall::Syslog.to_aarch64(), 116);
         assert_eq!(Syscall::Getsid.to_aarch64(), 156);
+    }
+
+    /// `sethostname`/`setdomainname` (2026-10-15): x86_64 170/171, asm-generic
+    /// 161/162 — and 170/171 on asm-generic are `setsid`-adjacent calls this
+    /// table must never answer for.
+    #[test]
+    fn hostname_rows() {
+        assert_eq!(Syscall::Sethostname.to_x86_64(), 170);
+        assert_eq!(Syscall::Sethostname.to_aarch64(), 161);
+        assert_eq!(Syscall::Setdomainname.to_x86_64(), 171);
+        assert_eq!(Syscall::Setdomainname.to_aarch64(), 162);
+        assert_eq!(Syscall::from_x86_64(170), Some(Syscall::Sethostname));
+        assert_eq!(Syscall::from_aarch64(162), Some(Syscall::Setdomainname));
+        // x86_64 161 is `chroot`, 162 `sync`: neither may decode as a hostname call.
+        assert_ne!(Syscall::from_x86_64(161), Some(Syscall::Sethostname));
+        assert_ne!(Syscall::from_x86_64(162), Some(Syscall::Setdomainname));
     }
 
     /// The `chdir`/`fchmod`/`fchmodat` rows of 2026-09-12 — the calls whose

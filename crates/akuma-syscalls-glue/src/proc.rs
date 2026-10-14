@@ -157,7 +157,7 @@ pub(super) fn sys_setsid() -> u64 {
 }
 
 /// One `utsname` field. The Linux ABI is six of these, NUL-padded.
-const UTS_FIELD_LEN: usize = 65;
+const UTS_FIELD_LEN: usize = akuma_syscalls_linux::uts::FIELD_LEN;
 /// The whole `struct utsname`: 390 bytes, of which ~30 are ever non-zero. That
 /// is the ABI's shape, not this kernel's — Linux's `new_utsname` is the same
 /// size and copies the same 390 bytes.
@@ -201,10 +201,10 @@ const fn uts_field(mut buf: [u8; UTS_LEN], index: usize, value: &[u8]) -> [u8; U
 /// moment `src/syscall/` became a crate. `version` carries the build
 /// identity `<git-sha>-<profile>` (e.g. `a1b2c3d-release-smp-shared`) — enough
 /// for `uname -a` to say which commit and build target is running. See
-/// docs/archive/UNAME.md. sysname/nodename/domainname stay static literals:
-/// sethostname/setdomainname are not wired into the dispatch table, so there is
-/// no write path for them to track — which is also what makes baking the whole
-/// image into `.rodata` correct rather than merely cheaper.
+/// docs/archive/UNAME.md. sysname/release/version/machine are build facts and
+/// stay baked into `.rodata`; `nodename` and `domainname` are the two fields
+/// userspace can write (`sethostname`/`setdomainname`, wired 2026-10-15), so
+/// `sys_uname` overlays them from [`NODENAME`]/[`DOMAINNAME`] once set.
 /// The `machine` field, derived from the architecture actually being compiled.
 ///
 /// It was the literal `b"aarch64"` until 2026-09-07, which was true while this
@@ -241,12 +241,57 @@ static UTSNAME: [u8; UTS_LEN] = {
     uts_field(b, 5, b"(none)")
 };
 
+/// `nodename` and `domainname` once `sethostname`/`setdomainname` has run.
+/// `None` until then, so the common case stays one `copy_to_user` of the
+/// `.rodata` image and an untouched box pays two uncontended lock reads. Fixed
+/// 65-byte values: nothing here allocates.
+static NODENAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock::new(None);
+static DOMAINNAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock::new(None);
+
 pub(super) fn sys_uname(buf: u64) -> u64 {
     if !validate_user_ptr(buf, UTS_LEN) { return EFAULT; }
     if copy_to_user(buf, &UTSNAME).is_err() {
         return EFAULT;
     }
+    // Overlay the two writable fields. Copied out under the lock and written
+    // after it drops: `copy_to_user` can fault.
+    for (index, cell) in [(1usize, &NODENAME), (5, &DOMAINNAME)] {
+        let field = *cell.lock();
+        if let Some(f) = field
+            && copy_to_user(buf + (index * UTS_FIELD_LEN) as u64, f.as_bytes()).is_err()
+        {
+            return EFAULT;
+        }
+    }
     0
+}
+
+/// `sethostname(name, len)` / `setdomainname(name, len)` (`domain` selects).
+///
+/// Linux order: privilege, then length, then the user copy. Root only here —
+/// there are no capabilities in this kernel, and uid 0 is what
+/// `akuma_isolation::creds` calls privileged. The name is the `len` bytes given,
+/// not NUL-scanned. Per-box UTS namespaces do not exist: the name is global, as
+/// `uname` always was.
+pub(super) fn sys_sethostname(name: u64, len: u64, domain: bool) -> u64 {
+    if !akuma_exec::process::current_creds().is_root() {
+        return EPERM;
+    }
+    if len > akuma_syscalls_linux::uts::NAME_MAX as u64 {
+        return EINVAL;
+    }
+    let len = len as usize;
+    let mut bytes = [0u8; akuma_syscalls_linux::uts::NAME_MAX];
+    if len > 0 && (!validate_user_ptr(name, len) || copy_from_user(&mut bytes[..len], name).is_err()) {
+        return EFAULT;
+    }
+    let cell = if domain { &DOMAINNAME } else { &NODENAME };
+    let mut guard = cell.lock();
+    let field = guard.get_or_insert(akuma_syscalls_linux::uts::Field::empty());
+    match field.set(&bytes[..len]) {
+        Ok(()) => 0,
+        Err(akuma_syscalls_linux::uts::TooLong) => EINVAL,
+    }
 }
 
 /// set_tid_address(2) — record the clear_child_tid futex address and return the

@@ -2294,6 +2294,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // commit it is running. `banner::print()` keeps the local strings for the
         // boot banner, which is where the target's name belongs.
         Syscall::Uname => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        // sethostname/setdomainname — glue's, so `uname` and the setter share one
+        // pair of fields. Absent from every table until 2026-10-15; OpenRC's
+        // `hostname` service needs them.
+        Syscall::Sethostname | Syscall::Setdomainname => {
+            to_glue(call, [a1, a2, a3, a4, a5, a6])
+        }
         // Credentials — **served by glue** (C1 step 3, second batch).
         //
         // Chosen next because they are the whole of `akuma_syscalls::fast_path`'s
@@ -7363,6 +7369,12 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         Syscall::from_x86_64(63) == Some(Syscall::Uname),
     );
     t.check_eq("dispatch: uname reaches glue as 160", Syscall::Uname.to_aarch64(), 160);
+    t.check(
+        "dispatch: 170/171 decode as sethostname/setdomainname",
+        Syscall::from_x86_64(170) == Some(Syscall::Sethostname)
+            && Syscall::from_x86_64(171) == Some(Syscall::Setdomainname),
+    );
+    t.check_eq("dispatch: sethostname reaches glue as 161", Syscall::Sethostname.to_aarch64(), 161);
 
     // The arms folded into glue, driven **through the real dispatcher** by the
     // x86_64 number userspace would send.
@@ -8669,7 +8681,9 @@ pub fn fdprobe_test(t: &mut Suite) {
 /// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
 /// `libakuma`.
 pub fn run_init(path: &str, args: &[&str]) -> bool {
-    let Ok(image) = crate::fs::read_file(path) else {
+    // Resolved first, like `execve`'s `read_image_head`: a usr-merged root has
+    // `/bin -> usr/bin` and `sh -> bash`, and `read_file` follows neither.
+    let Ok(image) = crate::fs::read_file(&crate::fs::resolve_symlinks(path)) else {
         serial::puts("  [init] not on the disk: ");
         serial::puts(path);
         serial::puts("\n");

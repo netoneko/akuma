@@ -82,6 +82,7 @@ pub mod proc;
 pub mod signal;
 pub mod stat;
 pub mod time;
+pub mod uts;
 
 pub use io::{AioRingHeader, EpollEvent, IoVec, PollFd};
 pub use net::{IfConfHdr, MsgHdr, SockAddrHw, Ucred};
@@ -148,7 +149,7 @@ mod tests {
             ("GETEGID", GETEGID), ("GETTID", GETTID), ("GETRESUID", GETRESUID),
             ("GETRESGID", GETRESGID), ("GETGROUPS", GETGROUPS),
             ("KILL_LINUX", KILL_LINUX), ("SETPGID", SETPGID), ("GETPGID", GETPGID),
-            ("SETSID", SETSID), ("UNAME", UNAME), ("FLOCK", FLOCK), ("UMASK", UMASK),
+            ("SETSID", SETSID), ("UNAME", UNAME), ("SETHOSTNAME", SETHOSTNAME), ("SETDOMAINNAME", SETDOMAINNAME), ("FLOCK", FLOCK), ("UMASK", UMASK),
             ("UTIMENSAT", UTIMENSAT), ("FDATASYNC", FDATASYNC), ("FSYNC", FSYNC),
             ("SYNC", SYNC), ("SYNCFS", SYNCFS),
             ("FCHDIR", FCHDIR), ("FCHMOD", FCHMOD), ("FCHMODAT", FCHMODAT),

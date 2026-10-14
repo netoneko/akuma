@@ -141,8 +141,12 @@ impl Bus for Regs {
 }
 
 /// The firmware file, read in place through the VFS — never loaded whole.
+///
+/// `path` is the **symlink-resolved** name: `read_at` does not follow links, and
+/// a usr-merged root (Gentoo) has `/lib -> usr/lib`, so `/lib/firmware/...` is a
+/// path through a link. One `String`, once, at boot.
 pub struct File {
-    path: &'static str,
+    path: alloc::string::String,
     len: u32,
 }
 
@@ -153,7 +157,7 @@ impl Source for File {
     fn read_at(&mut self, off: u32, buf: &mut [u8]) -> bool {
         let mut done = 0;
         while done < buf.len() {
-            match crate::fs::read_at(self.path, off as usize + done, &mut buf[done..]) {
+            match crate::fs::read_at(&self.path, off as usize + done, &mut buf[done..]) {
                 Ok(0) | Err(_) => return false,
                 Ok(n) => done += n,
             }
@@ -196,14 +200,15 @@ pub fn init(cmdline: &str) {
         return;
     };
     let Some(mut file) = FIRMWARE.iter().find_map(|&path| {
-        let size = crate::fs::metadata(path).ok()?.size;
+        let path = crate::fs::resolve_symlinks(path);
+        let size = crate::fs::metadata(&path).ok()?.size;
         Some(File { path, len: u32::try_from(size).ok()? })
     }) else {
         say("no firmware: /lib/firmware/rtw89/rtw8852c_fw-1.bin missing (overlays/ryzen/fetch-firmware.sh)");
         return;
     };
     serial::puts("[rtw] firmware ");
-    serial::puts(file.path);
+    serial::puts(&file.path);
     serial::puts(", ");
     serial::put_dec(u64::from(file.len));
     serial::puts(" bytes\n");

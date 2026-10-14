@@ -61,6 +61,15 @@ Both build-derived fields landed as proposed; `sysname`/`nodename`/`domainname`
 stayed static literals (there is still no `sethostname`/`setdomainname` write
 path, so there is nothing for them to track).
 
+> **Corrected 2026-10-15:** that write path now exists. `sethostname` /
+> `setdomainname` are table rows (`akuma-syscalls-abi`: x86_64 170/171,
+> asm-generic 161/162) served by `akuma-syscalls-glue::proc::sys_sethostname`;
+> `nodename` and `domainname` are overlaid on the `.rodata` image by `sys_uname`
+> once set. Root only, 64 bytes max (`akuma_syscalls_linux::uts`, host-tested),
+> global — no per-box UTS namespace. Found because Gentoo's OpenRC `hostname`
+> service failed on `ENOSYS` and took `netmount` with it
+> ([`AKUMA_GENTOO.md`](AKUMA_GENTOO.md)).
+
 **`release` — `env!("CARGO_PKG_VERSION")`** (`src/syscall/proc.rs`). No
 `build.rs` step needed: cargo always sets it, so the proposed `"0.0.0"`
 out-of-the-box literal was unnecessary. `uname -r` now reports `0.0.7`, the

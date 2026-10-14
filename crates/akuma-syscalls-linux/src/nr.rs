@@ -169,6 +169,9 @@ pub const GETPGID: u64 = 155;
 pub const GETSID: u64 = 156;
 pub const SETSID: u64 = 157;
 pub const UNAME: u64 = 160;
+/// `sethostname(2)` / `setdomainname(2)`. x86_64 spells them 170 / 171.
+pub const SETHOSTNAME: u64 = 161;
+pub const SETDOMAINNAME: u64 = 162;
 /// `syslog(2)` / `klogctl(3)`.
 ///
 /// The amd64 kernel serves it out of `akuma-dmesg` under the x86_64 number
