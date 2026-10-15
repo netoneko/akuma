@@ -4,7 +4,9 @@
 # The kernel hands init the framebuffer console (stdout/stderr) and the keyboard
 # (stdin). Keep the screen on fds 3/4 before the logs take 1/2: the console shell
 # at the bottom runs on them, which is what makes the cursor on the TV useful.
-exec 3>&1 4>&2
+# fd 5 is the keyboard: a background job (`( ... ) &`) gets /dev/null as stdin
+# when job control is off (POSIX), so `<&0` inside one reads nothing.
+exec 3>&1 4>&2 5<&0
 # Logs APPEND (O_APPEND): spawned children do not share an inherited fd's file
 # offset on Akuma (docs/archive/AKUMA_GENTOO_PORTAGE_CRASH.md), so a plain `>`
 # log is torn by the background jobs.
@@ -32,9 +34,9 @@ echo "=== hostname: $(hostname) / $(uname -a)"
 ( while :; do /usr/local/bin/akuma-sshd >> /var/log/akuma-sshd.log 2>&1; sleep 2; done ) &
 pidof sshd >/dev/null || { echo "=== sshd not up via openrc; starting directly"; /usr/sbin/sshd; }
 echo "=== done $(date); idling"
-# Console shell on the local framebuffer + keyboard (stdin is still the keyboard).
+# Console shell on the local framebuffer + keyboard (stdin is the keyboard, saved on fd 5).
 # Restarted if it exits; its output is the screen, not the log.
-( while :; do TERM=xterm-256color HOME=/root /usr/bin/bash -l <&0 >&3 2>&4; sleep 1; done ) &
+( while :; do TERM=xterm-256color HOME=/root /usr/bin/bash -il <&5 >&3 2>&4; sleep 1; done ) &
 # No address after 2 minutes (the radio sometimes never joins): with /autoreboot
 # present, go back to Pop so the caller can re-arm and try again.
 n=0

@@ -319,16 +319,23 @@ do not exist yet: `version`, `vmstat`, `diskstats`, `partitions`, `cmdline`,
 `swaps`, `sys/kernel/{osrelease,ostype,hostname,pid_max}` — none has blocked a
 tool so far.)
 
-**The local console.** The screen showed an empty, unblinking cursor because
-PID 1 is a script that sends all of its output to log files and never runs a
-shell on the console the kernel hands it (stdin = the xHCI keyboard, stdout =
-the framebuffer, `docs/runbooks/amd64-console-shell.md`). `akuma-init.sh` now
-saves the screen on fds 3/4 before redirecting 1/2 and starts
-`bash -l <&0 >&3 2>&4` in a restart loop, before the network wait, so a shell
-is on the TV even when the radio never joins. Verified: the process stays up
-(no restart churn) and has read its profile files; whether keystrokes reach it
-through a *forked* child of init (herd's console service gets the channel via
-`SPAWN_FLAG_CONSOLE`; here the fd is inherited) needs a look at the TV.
+**The local console — works (2026-10-15).** The screen showed an empty,
+unblinking cursor because PID 1 is a script that sends all of its output to log
+files and never ran a shell on the console the kernel hands it (stdin = the
+xHCI keyboard, stdout = the framebuffer, `docs/runbooks/amd64-console-shell.md`).
+`akuma-init.sh` saves the screen on fds 3/4 before redirecting 1/2 and runs
+`bash -il <&5 >&3 2>&4` in a restart loop, before the network wait, so a shell
+is on the TV even when the radio never joins.
+
+The first version did not work and the kernel was fine: **a background job
+(`( ... ) &`) gets `/dev/null` as its stdin when job control is off (POSIX)**,
+so the `<&0` inside the loop read nothing. `/proc/self/fd/0 -> /dev/null` in a
+logged test said so at once. The keyboard is now saved on **fd 5** at the top of
+the script (`exec 3>&1 4>&2 5<&0`) before any background job starts. A forked
+child of init reading the console channel needs nothing else — the channel and
+line discipline are shared by every console-attached process (`console.rs`).
+Verified on the metal: the banner is on the TV, a physical Enter reached a
+logged `read`, and `bash -il` stays up.
 
 **Process note.** `overlays/ryzen/gentoo/akuma-init.sh` was committed **empty** in
 `6b4dbe29` (the fetch from Pop returned nothing while the box was running Gentoo
