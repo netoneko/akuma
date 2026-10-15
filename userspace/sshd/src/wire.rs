@@ -21,6 +21,8 @@ use alloc::vec::Vec;
 pub const SSH_MSG_CHANNEL_EOF: u8 = 96;
 pub const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
 pub const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
+/// RFC 4254 §4 — the tag of the client-alive probe ([`global_request_payload`]).
+pub const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 
 /// RFC 4254 §6.10 `exit-status` channel request — how the server tells the
 /// client what the remote command's exit code was.
@@ -126,6 +128,31 @@ pub fn channel_eof_payload(channel: u32) -> Vec<u8> {
 pub fn channel_close_payload(channel: u32) -> Vec<u8> {
     let mut payload = vec![SSH_MSG_CHANNEL_CLOSE];
     write_u32(&mut payload, channel);
+    payload
+}
+
+/// RFC 4254 §4 `SSH_MSG_GLOBAL_REQUEST` — the client-alive probe.
+///
+/// sshd's idle watch sends this when a session has been silent for the idle
+/// window (`session_policy::idle_probe_due`); any RFC-compliant client
+/// answers an unrecognized global request with `SSH_MSG_REQUEST_FAILURE`
+/// (OpenSSH's does; this repo's own `ssh` client does — that reply is the
+/// inbound byte that resets the watch and proves the peer is alive. The
+/// request name is deliberately one no client implements, because the *reply
+/// to an unknown request* is the whole protocol: nothing about the session
+/// state changes whether or not the client understands the name.
+///
+/// Layout:
+///
+/// ```text
+/// byte      SSH_MSG_GLOBAL_REQUEST (80)
+/// string    request name (e.g. "keepalive@akuma.os")
+/// boolean   want_reply — true; the reply IS the liveness signal
+/// ```
+pub fn global_request_payload(request_name: &[u8]) -> Vec<u8> {
+    let mut payload = vec![SSH_MSG_GLOBAL_REQUEST];
+    write_string(&mut payload, request_name);
+    payload.push(1); // want_reply = true
     payload
 }
 
@@ -395,5 +422,22 @@ mod tests {
             channel_close_payload(ch)[0],
         ];
         assert_eq!(tags, [98, 96, 97]);
+    }
+
+    /// The client-alive probe: tag 80, name, want_reply **true** — the reply
+    /// is the entire point, so a builder that dropped the boolean (or left it
+    /// false) would produce a probe no client ever answers and turn the idle
+    /// watch into a bare idle-kill.
+    #[test]
+    fn global_request_probe_has_exact_layout_and_want_reply() {
+        assert_eq!(
+            global_request_payload(b"keepalive@akuma.os"),
+            vec![
+                80, // SSH_MSG_GLOBAL_REQUEST
+                0, 0, 0, 18, // string length
+                b'k', b'e', b'e', b'p', b'a', b'l', b'i', b'v', b'e', b'@', b'a', b'k', b'u', b'm', b'a', b'.', b'o', b's',
+                1, // want_reply = true
+            ]
+        );
     }
 }

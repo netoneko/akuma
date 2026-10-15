@@ -5,9 +5,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryInto;
+use core::future::poll_fn;
+use core::task::{Context, Poll};
 
 use ed25519_dalek::{SigningKey, Signer};
-use embedded_io_async::{Read, Write};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -22,10 +23,12 @@ use super::crypto::{
 use super::keys;
 // Channel-message byte layout lives in the crate's lib target so it can be
 // unit-tested on the host — see `wire.rs`.
+use sshd::session_policy::{self, SessionWatch};
 use sshd::wire;
 use crate::SshStream;
 use libakuma::*;
 use libakuma::net::Error as NetError;
+use libakuma::net::ErrorKind as NetErrorKind;
 
 // ============================================================================
 // SSH Constants
@@ -116,6 +119,14 @@ struct SshSession {
     /// this bug measures. A client that sends no `pty-req` still gets a pipe,
     /// which is what `ssh host 'cmd' < file` depends on.
     pty_requested: bool,
+    /// Session-lifetime watch: the stamps behind the pre-auth grace timer and
+    /// the established-session idle timer (`sshd::session_policy`). This is
+    /// the state the 2026-10-15 boot-120 lockout turned on its head: ~24
+    /// half-open sessions — clients whose TCP died mid-key-exchange — each
+    /// held a slot that no transition in the lifecycle ever retired. The
+    /// watch adds three fields (two stamps and a probe bit) to this struct
+    /// and nothing else: no allocation, per the 4 MB-image sizing rule.
+    watch: SessionWatch,
 }
 
 impl SshSession {
@@ -138,8 +149,210 @@ impl SshSession {
             term_height: 24,
             term_type: String::new(),
             pty_requested: false,
+            // The clock starts at accept, not at the first byte: a client
+            // that connects and sends nothing is precisely the leak shape
+            // (`wifi-ssh.py` retries dying mid-kex on boot 120).
+            watch: SessionWatch::new(now_ms()),
         }
     }
+}
+
+// ============================================================================
+// Session Lifetime (grace + idle watch)
+// ============================================================================
+
+/// Monotonic milliseconds since boot. `libakuma::uptime()` is µs; every
+/// session-lifetime stamp is ms — the client (`client/protocol.rs`
+/// `now_ms`) normalizes the same value the same way, so the two ends'
+/// constants stay comparable when reading logs side by side.
+fn now_ms() -> u64 {
+    uptime() / 1000
+}
+
+/// The lifetime decision this tick produced for a session.
+///
+/// Pure decisions live in `sshd::session_policy` (host-tested); this enum is
+/// the one place the daemon turns a decision into an effect. Composed fresh
+/// by [`lifetime_check`] at every suspend point — the read path (every
+/// executor tick while a session waits on its socket), the write path (while
+/// a packet drains), and the bridge loop.
+enum Lifetime {
+    /// Carry on as before.
+    CarryOn,
+    /// Pre-auth and past the grace deadline: tear down.
+    GraceExpired,
+    /// Established, silent past the idle window, no probe outstanding:
+    /// send one.
+    SendIdleProbe,
+    /// Established and silent past the idle window *plus* the unanswered
+    /// probe grace: tear down.
+    IdleDead,
+}
+
+/// Which lifetime decision applies to `session` right now?
+///
+/// Pre-auth sessions are grace-managed only (a mid-kex client gets no probe:
+/// its replies would be unencrypted protocol gibberish to the idle watch's
+/// purposes, and the grace already bounds it); authenticated sessions are
+/// idle-managed only (the grace stops applying the instant auth succeeds).
+/// `idle_dead` is evaluated before `idle_probe_due` so a session that
+/// crossed both in one tick dies instead of sending one more probe.
+fn lifetime_check(session: &SshSession, now: u64) -> Lifetime {
+    let authenticated = matches!(session.state, SshState::Authenticated);
+    // Config is in whole seconds (the units `sshd.conf` and the CLI speak);
+    // the policy works in ms. `saturating_mul` so a huge config value wraps
+    // to "very late" instead of "already expired".
+    let grace_ms = session.config.login_grace_secs.saturating_mul(1_000);
+    let idle_ms = session.config.idle_timeout_secs.saturating_mul(1_000);
+
+    if session_policy::grace_expired(authenticated, session.watch.connected_ms, now, grace_ms) {
+        return Lifetime::GraceExpired;
+    }
+    if !authenticated {
+        return Lifetime::CarryOn;
+    }
+    if session_policy::idle_dead(
+        session.watch.last_activity_ms,
+        now,
+        idle_ms,
+        session_policy::DEFAULT_IDLE_PROBE_GRACE_MS,
+    ) {
+        return Lifetime::IdleDead;
+    }
+    if session_policy::idle_probe_due(
+        session.watch.last_activity_ms,
+        now,
+        idle_ms,
+        session.watch.probe_outstanding,
+    ) {
+        return Lifetime::SendIdleProbe;
+    }
+    Lifetime::CarryOn
+}
+
+fn lifetime_expired_error(message: &'static str) -> NetError {
+    NetError::new(NetErrorKind::TimedOut, message)
+}
+
+/// Send the client-alive probe for a session gone quiet
+/// (`Lifetime::SendIdleProbe`).
+///
+/// A global request with `want_reply` — any RFC 4254 §4 client answers an
+/// unrecognized one with `REQUEST_FAILURE`, and *that reply* is the inbound
+/// byte [`SessionWatch::note_activity`] needs to prove the peer is alive.
+/// Failures are logged, not propagated: the very next lifetime check reaps
+/// the session if the probe could not go out, so an error here never needs
+/// to race the reaper.
+async fn send_idle_probe(stream: &mut SshStream, session: &mut SshSession) {
+    println("[SSH] idle: sending client-alive probe");
+    session.watch.note_probe_sent();
+    let payload = wire::global_request_payload(b"keepalive@akuma.os");
+    if let Err(e) = send_packet(stream, &payload, session).await {
+        eprintln(&format!("[SSH] idle: probe send failed: {:?}", e));
+    }
+}
+
+/// One step of a lifetime-aware socket read.
+enum ReadStep {
+    /// `n` fresh bytes (inbound activity has already been noted).
+    Bytes(usize),
+    /// The peer closed its side (`read` returned 0).
+    PeerClosed,
+    /// Nothing to read yet, and the idle watch wants a probe out first.
+    ProbeDue,
+}
+
+/// One poll of the socket read, with the lifetime check ahead of it.
+///
+/// The check runs on *every* poll — including ticks where data is waiting —
+/// because the grace deadline is a property of time-since-accept, not of
+/// silence: a pre-auth client dribbling KEX garbage for minutes must still
+/// hit `LoginGraceTime`. Cost is one `uptime()` syscall per executor tick
+/// per idle session (~1 kHz at the 1 ms tick); against `syscalls-glue`'s
+/// counter read that is noise, and it is what makes the timers fire even
+/// though every read below suspends on `WouldBlock` rather than returning.
+fn poll_read_with_lifetime(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    buf: &mut [u8],
+    cx: &mut Context<'_>,
+) -> Poll<Result<ReadStep, NetError>> {
+    match lifetime_check(session, now_ms()) {
+        Lifetime::GraceExpired => {
+            return Poll::Ready(Err(lifetime_expired_error(
+                "login grace expired (no auth within the window)",
+            )));
+        }
+        Lifetime::IdleDead => {
+            return Poll::Ready(Err(lifetime_expired_error(
+                "idle timeout (silence outlasted the client-alive probe)",
+            )));
+        }
+        Lifetime::SendIdleProbe => return Poll::Ready(Ok(ReadStep::ProbeDue)),
+        Lifetime::CarryOn => {}
+    }
+    match stream.poll_read(cx, buf) {
+        Poll::Ready(Ok(0)) => Poll::Ready(Ok(ReadStep::PeerClosed)),
+        Poll::Ready(Ok(n)) => {
+            session.watch.note_activity(now_ms());
+            Poll::Ready(Ok(ReadStep::Bytes(n)))
+        }
+        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Await one lifetime-aware read step. Suspends like `SshStream::read`, but
+/// the suspension is re-entered every executor tick, so the lifetime check
+/// above keeps running while the session waits.
+async fn read_with_lifetime(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    buf: &mut [u8],
+) -> Result<ReadStep, NetError> {
+    poll_fn(|cx| poll_read_with_lifetime(stream, session, buf, cx)).await
+}
+
+/// `write_all`, with the lifetime check before every chunk.
+///
+/// `embedded_io_async`'s `write_all` alone would be the hole the timers can't
+/// see: a write to a peer that stopped ACKing suspends in `Poll::Pending`
+/// once the send buffer fills, and a future suspended there never reaches
+/// any loop-level check. Checking ahead of each chunk means the session
+/// errors out at the next tick instead of parking for the lifetime of the
+/// leaked slot — the exact shape that pinned boot 120's `/bin/cat` channel
+/// open, one layer up from the cap.
+async fn write_all_with_lifetime(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    mut buf: &[u8],
+) -> Result<(), NetError> {
+    while !buf.is_empty() {
+        match lifetime_check(session, now_ms()) {
+            Lifetime::GraceExpired => {
+                return Err(lifetime_expired_error(
+                    "login grace expired (no auth within the window)",
+                ));
+            }
+            Lifetime::IdleDead => {
+                return Err(lifetime_expired_error(
+                    "idle timeout (silence outlasted the client-alive probe)",
+                ));
+            }
+            // A probe is never sent from inside a write; the loop-level code
+            // owns that effect.
+            Lifetime::SendIdleProbe | Lifetime::CarryOn => {}
+        }
+        let n = poll_fn(|cx| stream.poll_write(cx, buf)).await?;
+        if n == 0 {
+            return Err(NetError::new(
+                NetErrorKind::WriteZero,
+                "socket write made no progress",
+            ));
+        }
+        buf = &buf[n..];
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -446,13 +659,26 @@ async fn run_builtin_paws(
     let code = 'session: loop {
         let mut did_io = false;
         let mut ssh_buf = [0u8; 512];
+        // Lifetime watch: no child to strand here, but the connection and
+        // its slot are held exactly as hard — idle-dead ends the session.
+        match lifetime_check(session, now_ms()) {
+            Lifetime::CarryOn => {}
+            Lifetime::SendIdleProbe => send_idle_probe(stream, session).await,
+            Lifetime::GraceExpired | Lifetime::IdleDead => {
+                eprintln("[SSHD] built-in paws session torn down by the idle watch");
+                break 'session 0;
+            }
+        }
         match stream.try_read(&mut ssh_buf) {
             Ok(0) => break 0, // peer closed its write side
             Ok(n) => {
                 did_io = true;
+                session.watch.note_activity(now_ms());
                 session.input_buffer.extend_from_slice(&ssh_buf[..n]);
             }
-            Err(_) => {} // EAGAIN
+            Err(e) if e.kind() == NetErrorKind::WouldBlock
+                || e.kind() == NetErrorKind::Interrupted => {}
+            Err(_) => break 0, // real read error: the peer cannot recover us
         }
 
         // Drained every iteration, not only after a fresh read — the same
@@ -557,6 +783,26 @@ fn cook_output(data: &[u8], pty: bool) -> Vec<u8> {
     out
 }
 
+/// Kill the session's child and release the bridge's fds, for a teardown
+/// where the *client* is the side that ended the session (idle watch fired,
+/// or a fatal socket error).
+///
+/// This is the "one layer up" fix the boot-120 entry recorded: a session
+/// whose client vanished used to strand its child forever — the stuck
+/// `/bin/cat` PID 904 outlived its session by hours, held open by a
+/// never-closed sshd channel. Ending the bridge without this would leave the
+/// next session's `cat` in exactly that state: the child keeps its process
+/// slot, its pty, and a stdin nobody will ever write again. `SIGKILL`, not a
+/// polite signal — the shell may be blocked on a read that no teardown of
+/// ours will interrupt.
+fn teardown_child(pid: u32, stdout_fd: u32, stdin_fd: i32) {
+    kill_signal(pid, SIGKILL);
+    close(stdout_fd as i32);
+    if stdin_fd >= 0 {
+        close(stdin_fd);
+    }
+}
+
 async fn bridge_process(
     stream: &mut SshStream,
     session: &mut SshSession,
@@ -645,6 +891,25 @@ async fn bridge_process(
             break status;
         }
 
+        // 1.5. Session lifetime. The child-exit check above deliberately
+        //      runs first: a child that exited still wins the race, so its
+        //      output drains no matter what the timer thinks. Everything
+        //      below assumes the session is alive and the client may not be.
+        match lifetime_check(session, now_ms()) {
+            Lifetime::CarryOn => {}
+            Lifetime::SendIdleProbe => send_idle_probe(stream, session).await,
+            Lifetime::GraceExpired | Lifetime::IdleDead => {
+                eprintln(&format!(
+                    "[SSHD] Session pid {} torn down by the idle watch: no inbound bytes for {}s (probe {}answered)",
+                    pid,
+                    now_ms().saturating_sub(session.watch.last_activity_ms) / 1000,
+                    if session.watch.probe_outstanding { "un" } else { "" },
+                ));
+                teardown_child(pid, stdout_fd, stdin_fd);
+                return Ok(());
+            }
+        }
+
         let mut did_io = false;
 
         // 2. Output from process to SSH (non-blocking). See cook_output().
@@ -666,9 +931,28 @@ async fn bridge_process(
                 Ok(0) => client_done = true, // peer closed its write side (TCP)
                 Ok(n) => {
                     did_io = true;
+                    // Any inbound byte — even one belonging to a packet the
+                    // parser will drop — is proof of life for the idle watch.
+                    session.watch.note_activity(now_ms());
                     session.input_buffer.extend_from_slice(&ssh_buf[..n]);
                 }
-                Err(_) => {} // EAGAIN / WouldBlock — nothing new to read right now
+                // EAGAIN and EINTR are "nothing right now", not death.
+                Err(e) if e.kind() == NetErrorKind::WouldBlock
+                    || e.kind() == NetErrorKind::Interrupted => {}
+                Err(e) => {
+                    // Anything else (RST from a client that died loudly,
+                    // invalid fd, …) can never become readable bytes. This
+                    // arm used to swallow every error as EAGAIN, so a reset
+                    // client's session spun — pump, fail to send, repeat —
+                    // until the idle watch got around to it. Tearing down
+                    // now frees the slot and the child immediately.
+                    eprintln(&format!(
+                        "[SSHD] Session pid {}: socket read failed ({:?}) — tearing down",
+                        pid, e
+                    ));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(());
+                }
             }
 
             // ALWAYS drain buffered SSH packets — not just when the read above
@@ -1095,18 +1379,18 @@ async fn send_packet(stream: &mut SshStream, payload: &[u8], session: &mut SshSe
             seq,
             &mut session.rng,
         );
-        stream.write_all(&packet).await
+        write_all_with_lifetime(stream, session, &packet).await
     } else {
         let packet = build_packet(payload);
         session.crypto.encrypt_seq = session.crypto.encrypt_seq.wrapping_add(1);
-        stream.write_all(&packet).await
+        write_all_with_lifetime(stream, session, &packet).await
     }
 }
 
 async fn send_unencrypted_packet(stream: &mut SshStream, payload: &[u8], session: &mut SshSession) -> Result<(), NetError> {
     let packet = build_packet(payload);
     session.crypto.encrypt_seq = session.crypto.encrypt_seq.wrapping_add(1);
-    stream.write_all(&packet).await
+    write_all_with_lifetime(stream, session, &packet).await
 }
 
 /// RFC 4254 §5.2 flow control: grant the client `bytes` more of inbound window.
@@ -1195,13 +1479,15 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
 
 pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
     let mut session = SshSession::new(config);
-    let _ = stream.write_all(SSH_VERSION).await;
-    
+    let _ = write_all_with_lifetime(&mut stream, &mut session, SSH_VERSION).await;
+
     let mut buf = [0u8; 1024];
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
+        // Lifetime-aware read: every suspension point re-enters the grace /
+        // idle checks, so a session can no longer wait on its socket forever
+        // — the two transitions with no timer before the boot-120 lockout.
+        match read_with_lifetime(&mut stream, &mut session, &mut buf).await {
+            Ok(ReadStep::Bytes(n)) => {
                 session.input_buffer.extend_from_slice(&buf[..n]);
                 if session.state == SshState::AwaitingVersion {
                     if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
@@ -1212,7 +1498,7 @@ pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
                     }
                     continue;
                 }
-                
+
                 while let Some((msg_type, payload)) = if !matches!(session.state, SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit) {
                     process_encrypted_packet(&mut session)
                 } else {
@@ -1233,7 +1519,20 @@ pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
                     }
                 }
             }
-            Err(_) => break,
+            Ok(ReadStep::PeerClosed) => break,
+            Ok(ReadStep::ProbeDue) => {
+                send_idle_probe(&mut stream, &mut session).await;
+            }
+            Err(e) => {
+                // Timeout deaths get their own log line: on a box whose only
+                // remote way in is this daemon, "why did my slot free up" has
+                // to be answerable from `/var/log/herd/sshd.log` alone — that
+                // log is what diagnosed boot 120.
+                if e.kind() == NetErrorKind::TimedOut {
+                    eprintln(&format!("[SSHD] Closing connection: {}", e.message));
+                }
+                break;
+            }
         }
     }
 }

@@ -168,6 +168,24 @@ pub extern "C" fn main() {
                     println(&format!("[SSHD] Max sessions override from CLI: {}", n));
                 }
             }
+            "--login-grace-secs" => {
+                // 0 is accepted (timer off) — see the config parser note on
+                // why this one, unlike max_sessions, may be disabled.
+                if let Some(n_str) = args.next()
+                    && let Ok(n) = n_str.parse::<u64>()
+                {
+                    ssh_config.login_grace_secs = n;
+                    println(&format!("[SSHD] Login grace override from CLI: {}s", n));
+                }
+            }
+            "--idle-timeout-secs" => {
+                if let Some(n_str) = args.next()
+                    && let Ok(n) = n_str.parse::<u64>()
+                {
+                    ssh_config.idle_timeout_secs = n;
+                    println(&format!("[SSHD] Idle timeout override from CLI: {}s", n));
+                }
+            }
             _ => {
                 println(&format!("[SSHD] Unknown argument: {}", arg));
             }
