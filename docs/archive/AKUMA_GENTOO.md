@@ -293,6 +293,18 @@ above, all fixed in the tree:
 | **`/proc` lists every process that ever ran** | `ps`/`ls /proc` never return on a long-running box | [`AKUMA_PROC_ENUMERATION_HANG.md`](AKUMA_PROC_ENUMERATION_HANG.md) |
 | (kernel) `getsockopt(IP_OPTIONS)`, `chroot`, `sethostname` | see the table above | |
 
+**Interactive login (follow-up, same day).** `ssh -p 4444 root@…` with no command
+closed the connection while `ssh … 'cmd'` worked: only the pty path failed.
+OpenSSH's monitor, allocating the pty, called `chown("/dev/pts/0", 0, 5)` and
+`fatal()`ed on `ENOENT`. `/dev/pts/N` exists only in the kernel's pty table,
+`stat` knows about it, but `sys_fchownat` probed `exists()` on the real
+filesystem first (and `fchmodat` fell through to the ext2 path). Found with the
+per-pid syscall log (`/proc/<pid>/syscalls`, which records **asm-generic**
+numbers — `fchownat` is 54 there, 260 is `wait4`) and a four-line Python
+reproduction (`os.openpty()`, `os.chown(os.ttyname(s), 0, 5)`). Fix:
+`akuma_vfs_glue::is_pty_slave`; `chown` and `chmod` on a live slave accept and
+ignore, like device nodes. The login shell now runs on `/dev/pts/0`.
+
 **The python crash is very probably the same stack bug.** After the stack fix,
 on the same Gentoo root that crashed all of 2026-10-14: `wc -l` works,
 `hashlib.blake2b` returns a digest (it SIGSEGV'd), `emerge --version` runs (it

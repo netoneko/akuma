@@ -2696,7 +2696,7 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
 /// owner refuses with `EPERM` — what Linux answers from one — rather than the
 /// old silent 0, which told `tar` an ownership was recorded when nothing was.
 fn chown_path(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<u64, u64> {
-    if akuma_vfs_glue::dev_node(path).is_some() {
+    if akuma_vfs_glue::dev_node(path).is_some() || akuma_vfs_glue::is_pty_slave(path) {
         return Ok(0);
     }
     super::perm::check_chown(path, uid, gid)?;
@@ -2738,6 +2738,9 @@ pub(super) fn sys_fchownat(dirfd: i32, path_ptr: u64, uid: u64, gid: u64, flags:
     } else {
         path
     };
+    if akuma_vfs_glue::is_pty_slave(&path) {
+        return Ok(0);
+    }
     if !akuma_vfs_glue::exists(&path) && !akuma_vfs_glue::is_symlink(&path) {
         return Err(ENOENT);
     }
@@ -2781,7 +2784,7 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
     // chmod on a device node is a no-op that succeeds. Was `/dev/null` and
     // `/dev/zero` only; through the table it covers every node, so
     // `chmod /dev/urandom` stops returning `ENOENT` for a path that exists.
-    if akuma_vfs_glue::dev_node(&path).is_some() {
+    if akuma_vfs_glue::dev_node(&path).is_some() || akuma_vfs_glue::is_pty_slave(&path) {
         return Ok(0);
     }
 

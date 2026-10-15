@@ -1251,6 +1251,17 @@ fn pts_slot(path: &str) -> Option<u32> {
     (n < 64 && PTS_LIVE.load(core::sync::atomic::Ordering::Relaxed) & (1 << n) != 0).then_some(n)
 }
 
+/// Whether `path` (absolute) names a live, visible pty slave `/dev/pts/N`.
+///
+/// The slave's ownership and mode are not stored anywhere, so
+/// the callers that would change them (`chown`, `chmod`) accept and ignore it —
+/// OpenSSH's `pty_setowner` is one, and it `fatal()`s on the `ENOENT` an
+/// `exists()` probe gives for a node that lives only in this table.
+#[must_use]
+pub fn is_pty_slave(path: &str) -> bool {
+    pts_visible() && pts_slot(path).is_some()
+}
+
 /// Neither `/dev/pts` nor its entries exist inside a box, for the reason
 /// `DevProbe::in_box` gives for `/dev`.
 fn pts_visible() -> bool {
