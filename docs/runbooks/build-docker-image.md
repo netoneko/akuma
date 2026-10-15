@@ -64,11 +64,26 @@ ssh -p 2222 root@localhost 'box save app:1' | docker load
 docker run --rm app:1
 ```
 
-Verified 2026-10-15 **structurally** (every blob's name is its sha256; each
-layer's gunzipped tar hashes to its `diff_id`; the manifest's sizes match; hard
-links, modes and whiteout names are in the tar), but `docker load` itself has
-not been run — there was no Docker daemon on the machine that day. Run it before
-relying on the claim.
+Verified 2026-10-15 against Docker 29.1.2 (containerd image store), both ways:
+an AArch64 build in QEMU and an `amd64` build on the trashcan (`FROM alpine`,
+`COPY`, `RUN apk add jq`) load, and `docker run` prints the `CMD` output, with
+`jq` and the copied file present. It found two bugs, both fixed:
+
+- `index.json`'s `io.containerd.image.name` was the bare `app:1`. Docker keeps
+  it verbatim, so `docker load` said "Loaded image" and then no lookup by
+  name found it (`docker run app:1` tried to pull it; by ID it ran). It is now
+  `docker.io/library/app:1` (`imgconfig::qualified_reference`).
+- `created` was `586524-01-19…` on amd64 and Docker refused to deserialize the
+  config. `libakuma::time()` is a private syscall the amd64 kernel does not
+  implement; its `-ENOSYS` read as microseconds. `fsx::now_secs` uses
+  `clock_gettime` now.
+
+The tar comes back from the trashcan over ssh as `base64` — the channel turns
+LF into CRLF on the way out (`amd64-bare-metal-loop.md`) — checked by `md5sum`.
+Run an `amd64` image on an arm64 Mac with `docker run --platform linux/amd64`.
+
+**Open (amd64 only):** files a `RUN` creates are owned by uid `4294967292`
+(`-4`), not root, in most spawns. See `docs/archive/BOX_BUILD.md` § 8, "uid -4".
 
 ## 4. Clean up
 

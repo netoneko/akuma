@@ -167,9 +167,18 @@ pub fn remove_tree(path: &str) {
     libakuma::rmdir(path);
 }
 
-/// Wall-clock seconds since the epoch (0 if there is no RTC).
+/// Wall-clock seconds since the epoch (0 if there is no clock).
+///
+/// `clock_gettime`, not `libakuma::time()`: that is Akuma's private syscall,
+/// which the amd64 kernel does not implement, and its `-ENOSYS` — read as a
+/// `u64` of microseconds — stamped images `created: 586524-01-19…`, which
+/// Docker refuses to deserialize (found loading a trashcan-built image).
 pub fn now_secs() -> u64 {
-    libakuma::time() / 1_000_000
+    let mut ts = libakuma::Timespec::default();
+    if libakuma::clock_gettime(libakuma::CLOCK_REALTIME, &mut ts) != 0 || ts.tv_sec < 0 {
+        return 0;
+    }
+    ts.tv_sec as u64
 }
 
 pub fn parent_of(path: &str) -> &str {

@@ -234,8 +234,30 @@ drift-risk named in the question is real; the interop gate is the check.
 | Where | What |
 |---|---|
 | AArch64 QEMU (HVF, devbox-smoltcp, `INSTANCE=3`) | single-stage and multi-stage builds; `COPY` with `.dockerignore`, `--chown`, `--from`; `USER`; cache (4/4 layer steps hit on rebuild); a failing `RUN` stops the build and tags nothing; `--target`; `box commit` of a running container incl. hard link, symlink, nested dirs; `tag`, `rmi` + GC; `box pull` digest verification; **`apk add jq curl` in a `RUN`** after the `SubdirFs` fix (network from a build box works) |
-| `box save` | every blob's file name is its sha256, the manifest's sizes match, each layer's gunzipped tar hashes to its `diff_id`, hard links (`typeflag 1`) and modes are in the tar. **`docker load` itself was not run** — no Docker daemon on the Mac that day |
+| `box save` | every blob's file name is its sha256, the manifest's sizes match, each layer's gunzipped tar hashes to its `diff_id`, hard links (`typeflag 1`) and modes are in the tar. `docker load` was not run that day; it was on 2026-10-15 afterwards — see below |
 | ryzen (Gentoo box 0, entry 17) | x86_64 `box` builds clean. On the old kernel (021f1626): `FROM alpine` with `COPY --chown`, `USER`, cache — correct owners and modes. **On the fixed kernel** (this tree, `no-tests`, installed with `overlays/ryzen/gentoo/deploy.py 17`; the previous one is `akuma-amd64.pre-box-build` on the ESP): `RUN apk add jq curl` over wifi, `box run`, 4/4 cache hits, `box save` whose blobs, `diff_id`s and `architecture: amd64` check out. Long builds must be detached (`nohup … &`): the wifi ssh session dropped mid-build once and took the foreground build with it |
+
+### `docker load` and the trashcan (2026-10-15, later)
+
+`box save | docker load | docker run` works, on AArch64 (QEMU) and on `amd64`
+(the trashcan, new kernel from this tree, `box` pushed with `hpbox.akuma_push`).
+Two bugs found, both fixed in `userspace/box`: the containerd image name was not
+`docker.io/library/…` (so the image loaded but could not be addressed by name),
+and `fsx::now_secs` called a private syscall amd64 lacks (`created` in year
+586524, which Docker refuses to parse). Neither shows on the arch that has the
+syscall, which is why the AArch64 run alone would have missed the second.
+
+**uid -4 (open, amd64 kernel).** On the trashcan, a `box run` child's
+`/proc/<pid>/status` says `Uid: 4294967292` (`-4`, `-EINTR` as a `u32`) in about
+five spawns in six, while its parent `box` is uid 0 and `gid` is right. Every
+file such a process creates is owned by -4, so a `RUN` layer ships with
+`uid 4294967292` entries (Docker loads and runs them; `ls -l` shows the number).
+Established: not the file owner of the binary (`stat` says 0:0); not `sh`/`id`
+(the first command in the container already has it); not host-side spawns
+(`sh` → `touch` is 0); not unset credentials — making `box` pass `set_creds(0,0)`
+explicitly changed nothing (tried, reverted). So something rewrites the child's
+`Creds` after `spawn_ext` installs them, only on the `box_id != 0` path. Next:
+log `SharedCreds::update` callers, or watch the field from the spawn return.
 
 ### Not done
 
