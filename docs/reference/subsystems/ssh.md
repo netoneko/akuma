@@ -69,6 +69,192 @@ copy had the same bug and was strictly worse — `panic=abort` at EL1 has no
 process boundary, so a 10-byte crafted packet took the whole VM down — but that
 implementation no longer exists, which closes it by deletion.
 
+### Session lifetime: grace + idle watch (the 2026-10-15 half-open lockout)
+
+> Observed live on ryzen boot 120 (entry 20, the `powersaved` metal run;
+> `overlays/ryzen/README.md`): sshd answered TCP and served its banner for
+> hours but refused every new session —
+> `[SSHD] Refusing connection: 24 sessions already live (max_sessions=24)`.
+> The wifi link had gone dormant with no traffic; clients dying mid-key-exchange
+> left half-open sessions that nothing ever retired. The kernel itself was
+> healthy the whole time (steady IDLESTAT cadence to the end of `klog-120`).
+> Analysis + fix: `userspace/sshd/src/session_policy.rs` (decisions) and
+> `userspace/sshd/src/protocol.rs` (effects).
+
+**Why the box looked alive while nobody could get in.** The kernel's TCP
+stack completes the handshake before sshd is ever consulted — the accept
+backlog lives in `akuma-net` — so port checks and `wifi-ssh.py` saw an open
+port the whole time. The version string, though, is *application* data: a
+connection refused at the cap is dropped by `serve()` before
+`handle_connection` ever runs, so the client never sees
+`SSH-2.0-Akuma_0.1` — it gets a bare EOF (the repro's
+`REFUSED (EOF at cap, no banner)` below; "the banner still answered" in the
+boot-120 writeup describes the connections that got through *before* the
+slot pool filled). So the lockout's outside signature is: TCP connects, SSH
+does not — which reads as a flaky link, not a dead daemon, and is exactly
+why the incident looked like "ssh flaked" until the serial log showed the
+refusal wall.
+
+**The lifecycle, and which transitions had no timer before the fix.** A
+session is created at `accept` → `handle_connection` (`SshSession::new`, which
+is where the slot is paid for — a future in the cooperative build, a forked
+process in the default build). It advances through the version line →
+`KEXINIT` → `KEX_ECDH_INIT`/`NEWKEYS` → `SERVICE_REQUEST` → `USERAUTH_REQUEST`
+(auth success flips `SshState::Authenticated`), then a `shell`/`exec` channel
+request hands it to `bridge_process` for its whole remaining life. Retirement
+paths: peer EOF/RST on the socket, `SSH_MSG_DISCONNECT`, a write error, the
+shell exiting (post-bridge), and the fork build's `wait_any` reap. What had
+**no timer at all**:
+
+1. **pre-auth stall** — anywhere from the version line to auth success, a
+   session could sit forever. ~24 of these was the boot-120 lockout: every
+   leaked slot was pre-auth, dead mid-kex.
+2. **vanished client, post-auth** — an established session whose peer went
+   away silently (dormant radio, NAT dropped, client killed without FIN)
+   waits on its socket forever; a write into the void may never error, which
+   is also why boot 120 kept one stuck `/bin/cat` (PID 904) alive behind a
+   never-closed channel — the same shape, one layer up: the session's *child*
+   had no deadline either.
+
+**The fix — OpenSSH's two mechanisms, not an idle-kill:**
+
+- **`LoginGraceTime` analog** (`login_grace_secs`, default 120 = OpenSSH's
+  default): a connection that has not authenticated within the window is torn
+  down. This alone reclaims the entire boot-120 leak mass.
+- **`ClientAliveInterval`/`CountMax` analog** (`idle_timeout_secs`, default
+  600; probe grace 90 s): after 10 min of *total inbound silence* on an
+  authenticated session sshd sends a `keepalive@akuma.os` global request
+  (`want_reply`). Any RFC 4254 §4 client — OpenSSH's, and this repo's own
+  `ssh` — answers an unrecognized request with `REQUEST_FAILURE`, and *that
+  reply is inbound bytes*, which resets the watch: a healthy client survives
+  arbitrarily long silence, including a one-way transfer where only ACKs flow
+  back. A peer whose radio is gone never answers and is reaped ~11½ min after
+  its last byte. Probing before reaping is what separates this from a bare
+  idle-kill, which would murder a healthy session whose user walked away.
+
+The **decisions** are pure functions over timestamps in the package's host
+tested lib target — `session_policy::{grace_expired, idle_probe_due,
+idle_dead}` plus the `SessionWatch` stamp struct (two `u64`s and a bool in the
+existing session struct; no allocation, per the extreme-size sizing rule) —
+and `protocol.rs` only carries the effects. The checks run at every suspend
+point: the read path (re-entered each 1 ms executor tick, so a session parked
+on `WouldBlock` still ages), the write path (`write_all_with_lifetime`, so a
+write that suspends into a full send buffer errors at the next tick instead of
+parking forever), and the `bridge_process` loop. When the watch tears a
+bridged session down it also `SIGKILL`s the child and closes the fds — the
+stuck-`/bin/cat` shape is closed with the same stroke. Both serve shapes
+(cooperative and `fork-sessions`) run the same `handle_connection` code, so
+both are covered.
+
+**Pre-auth slots still count against `max_sessions` — deliberately.**
+OpenSSH splits pre-auth connections out (`MaxStartups`, a separate smaller
+cap) because its pre-auth cost is a socket and a state machine. Here a
+pre-auth connection already *is* a forked process (the default build forks at
+accept, before auth), so the process-table cost the cap exists to bound
+(`MAX_PROCESSES = 64`, two slots per occupied session) is paid at accept: a
+separate pre-auth cap would rename the pressure, not reduce it. What makes
+full-cap pre-auth safe is the grace timer recycling the slots — OpenSSH pairs
+`MaxStartups` with `LoginGraceTime` for the same reason. (A pre-auth flood
+that *never* completes auth now holds slots for at most `login_grace_secs`
+each.)
+
+**The kernel half of the honest fix: keepalive exists; its detection leg
+does not — by documented decision.** `crates/akuma-net` does expose
+`SO_KEEPALIVE` (`set_socket_keepalive`, `socket.rs`), and since
+`docs/archive/DEVBOX_ISSUES.md` Issue 19 it actually arms smoltcp's
+`set_keep_alive` (7200 s interval, `KEEPALIVE_IDLE_SECS`). But smoltcp
+keepalive only *sends probes* — "the remote endpoint … does not answer" is
+something the socket never notices, unless `Socket::set_timeout` is also set,
+and `crates/akuma-net/src/smoltcp_net/consts.rs` records that `set_timeout`
+is **deliberately not used**: it is an inactivity ceiling that aborts idle
+*healthy* connections too (an ssh prompt, a keep-alive pool), the exact
+failure class `docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md` spent four
+bugs eliminating. Nothing in userspace can even ask for keepalive today
+(`libakuma` wraps no `setsockopt`). So arming keepalive from sshd would add
+nothing observable, and the daemon-side timers above are the fix. What the
+kernel-side completion would take, for the record: a probe-failure counter
+(Linux's `tcp_keepalive_probes` analog) in `akuma-net`'s TCP poll — declare
+the connection dead after N unanswered probes rather than arming the blunt
+`set_timeout` — plus a `setsockopt` wrapper in `libakuma`. That is
+amd64 + aarch64 shared kernel work (the smoltcp stack is the box-0 stack on
+both; no AArch64-only impact, but the fast lane cannot exercise it — it needs
+a real TCP peer, so `/root/taprun.sh` on the trashcan is the honest rig) and
+it buys minutes at best over the userspace watch, which already bounds the
+damage. Not taken.
+
+Both timers are configurable (`sshd.conf` `login_grace_secs=` /
+`idle_timeout_secs=`, CLI `--login-grace-secs` / `--idle-timeout-secs`; 0
+disables either, OpenSSH's `0` spelling) — and disabling the grace reopens
+the leak, so the defaults stay on.
+
+#### Reproduction (amd64 QEMU, `hostfwd` 2222 — no radio needed)
+
+Both runs boot `INIT=/bin/sshd` on `sh amd64/run.sh` and drive the same
+probe (30 TCP connections to port 2222, read the banner, send nothing —
+the wifi flake is not part of the bug). With the fix, sshd also runs
+`--login-grace-secs 30 --idle-timeout-secs 60` purely to make the transcript
+human-scale; defaults are 120/600.
+
+**Before** (unfixed binary — it does not know the flags:
+`[SSHD] Unknown argument: --login-grace-secs`): 24 of 30 connections take a
+slot, 6 are refused at the cap, and **40 s later the box is still locked** —
+with no grace timer, "40 s" and "4 h" are the same picture (this is boot
+120's multi-hour outage):
+
+```text
+== held 30 connections: 24 accepted, 6 refused
+== holding 40s ...
+== recheck after 40s: REFUSED — lockout persists
+```
+
+```text
+$ grep -c "Closing connection\|torn down" /tmp/akuma-before-boot.log
+0
+```
+
+**After** (fixed binary, same probe): the same 24/6 split — the cap still
+exists — then the grace timer reclaims every pre-auth slot and a fresh
+client gets in:
+
+```text
+== held 30 connections: 24 accepted, 6 refused
+== holding 40s ...
+== recheck after 40s: ACCEPTED (slot freed)
+```
+
+```text
+[SSHD] Closing connection: login grace expired (no auth within the window)   ×24
+[SSHD] Accepted connection                                                    ← the recheck
+```
+
+A real login still works against the fixed daemon (macOS `ssh`, the staged
+test key): `Signature verified successfully` → `LOGIN-OK`. Two further
+transcripts pin the idle watch's two sides, using a *stopped* client
+(`SIGSTOP`: TCP alive, cannot answer — a stand-in for the vanished radio):
+
+```text
+[SSH] idle: sending client-alive probe                                        ← T+60s silence
+[SSHD] Session pid 64 torn down by the idle watch: no inbound bytes for 150s (probe unanswered)
+```
+
+and on that dead session's client, unfrozen later:
+`Connection to localhost closed by remote host.` — the child (`sleep 600`,
+pid 64) was SIGKILLed with the session, so nothing is stranded.
+
+A **healthy** client answers the probe and is left alone: with the same
+60 s idle timeout, a live session sat silent past the deadline —
+
+```text
+debug1: client_input_global_request: rtype keepalive@akuma.os want_reply 1    ← macOS client, T+60s
+```
+
+— and was still connected and executing commands a minute later (killed
+locally for the transcript, exit 124 from `timeout`): the watch reset on the
+client's `REQUEST_FAILURE` and no reap line ever appeared for it. Probe,
+then reap — never a bare idle-kill.
+
+
+
 ## Userspace ssh client (`userspace/sshd`, binary `ssh`)
 
 Second `[[bin]]` target in the `sshd` package (`src/client/main.rs`), not a
