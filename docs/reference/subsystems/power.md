@@ -1,8 +1,11 @@
 # Power (amd64): `/proc/power`, the energy ledger, and the idle wake budget
 
-Stability grade: **B** — the battery decode is metal-verified against Linux
-(2026-10-07); the ledger and the idle knobs are QEMU-verified (2026-10-15) and
-the metal A/B that decides defaults has not run yet.
+Stability grade: **A-** — the battery decode is metal-verified against Linux
+field-for-field (2026-10-15: `percent` 98 = 98, `voltage_mv` 12876 = 12876000,
+`energy_now_mwh` 52480 = 52480000, `power_mw` 0 = 0, on AC); the ledger and
+the idle knobs are QEMU-verified (2026-10-15). The metal A/B that decides the
+`idlesleep` default has not run yet, and the budget does not yet reach
+`allow_tick` — see the caveat at the end.
 
 ## `/proc/power`
 
@@ -54,6 +57,13 @@ Two invariants, both stated where they are enforced (`amd64/src/lapic.rs`):
 `mwait` (CPUID-gated, hint 0) as a third A/B arm. The decision procedure,
 phases and the QEMU smoke evidence are in
 [`../../../proposals/RYZEN_POWERSAVE_DEMON.md`](../../../proposals/RYZEN_POWERSAVE_DEMON.md).
+
+**Known gap (measured on metal, 2026-10-15):** on a `nosmp` boot the idle
+loop's 30 s block never runs in 11 minutes of a real workload (herd + sshd +
+wifi, `[IDLESTAT]` absent from the whole `boot-118` dmesg) — every parker
+takes the `allow_tick` halt, not the idle loop, so the budget never engages.
+The fix is to arm the same budget from `allow_tick` (with `set_halted` around
+its halt so peer wakes kick the core), and it is the first item of P1.
 
 ## Background
 
