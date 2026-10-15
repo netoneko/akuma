@@ -197,6 +197,71 @@ pub const fn rate_per_sec(events: u64, elapsed_us: u64) -> u64 {
 }
 
 // ============================================================================
+// WakeBudget — how long an idle core may next sleep
+// ============================================================================
+
+/// A sleep budget for an idle core, from how many consecutive idle laps have
+/// come back with nothing to do.
+///
+/// The kernel call site is the amd64 idle loop's long one-shot
+/// (`amd64/src/lapic.rs` `arm_idle_shot`): a halted core wakes every tick, and
+/// each wake costs power for no work. When the wakes keep coming back empty,
+/// the next sleep may lengthen toward a ceiling; one wake that found work puts
+/// the budget back at the floor. The unit is the caller's — ticks,
+/// microseconds — this never knows.
+///
+/// [`budget`](Self::budget) is the pure decision and takes the lap count as an
+/// argument, so a caller that keeps the count in one per-CPU atomic (the idle
+/// loop does — the idle thread is its core's only writer, but a plain struct
+/// would still need a lock to be `static`) reads, decides and increments
+/// without one. The instance methods are for callers that can hold the struct.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WakeBudget {
+    quiet_laps: u32,
+}
+
+impl WakeBudget {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { quiet_laps: 0 }
+    }
+
+    /// Rebuild from a bare lap count, for callers that keep it in one atomic.
+    #[must_use]
+    pub const fn from_parts(quiet_laps: u32) -> Self {
+        Self { quiet_laps }
+    }
+
+    #[must_use]
+    pub const fn into_parts(self) -> u32 {
+        self.quiet_laps
+    }
+
+    /// The budget for the next sleep after `quiet_laps` consecutive idle laps
+    /// that found nothing to do: `at_zero` at the floor, `at_full` once
+    /// `full_at` quiet laps have stacked up, linear in between.
+    ///
+    /// `full_at == 0` ramps immediately, the documented degenerate case of
+    /// [`ramp`].
+    #[must_use]
+    pub const fn budget(quiet_laps: u32, at_zero: u64, at_full: u64, full_at: u32) -> u64 {
+        ramp(quiet_laps as u64, at_zero, at_full, full_at as u64)
+    }
+
+    /// Record one idle lap that came back with nothing to do. Saturates at
+    /// `full_at` so a box idle for a year cannot wrap the count.
+    pub const fn observe_quiet(&mut self, full_at: u32) {
+        let next = self.quiet_laps.saturating_add(1);
+        self.quiet_laps = if next > full_at { full_at } else { next };
+    }
+
+    /// Record a wake that found work: the next sleep is back at the floor.
+    pub const fn observe_work(&mut self) {
+        self.quiet_laps = 0;
+    }
+}
+
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -302,5 +367,45 @@ mod tests {
         assert_eq!(rate_per_sec(5, 100_000), 50);
         assert_eq!(rate_per_sec(5, 10_000_000), 0);
         assert_eq!(rate_per_sec(0, 0), 0);
+    }
+
+    #[test]
+    fn wake_budget_ramps_from_the_floor_and_clamps_at_the_ceiling() {
+        // 1 tick at the floor, 100 ticks after 10 quiet laps.
+        assert_eq!(WakeBudget::budget(0, 1, 100, 10), 1, "first idle halt is today's behaviour");
+        assert_eq!(WakeBudget::budget(1, 1, 100, 10), 10);
+        assert_eq!(WakeBudget::budget(5, 1, 100, 10), 50);
+        assert_eq!(WakeBudget::budget(10, 1, 100, 10), 100);
+        assert_eq!(WakeBudget::budget(4_000_000_000, 1, 100, 10), 100, "clamps above full_at");
+    }
+
+    #[test]
+    fn wake_budget_resets_on_work_and_saturates_on_quiet() {
+        let mut w = WakeBudget::new();
+        for _ in 0..50 {
+            w.observe_quiet(10);
+        }
+        assert_eq!(w.into_parts(), 10, "saturates at full_at, does not wrap");
+        w.observe_work();
+        assert_eq!(WakeBudget::budget(w.into_parts(), 1, 100, 10), 1, "one busy wake is back at the floor");
+        assert_eq!(w.into_parts(), 0);
+    }
+
+    #[test]
+    fn wake_budget_full_at_zero_ramps_immediately() {
+        assert_eq!(WakeBudget::budget(0, 1, 100, 0), 100, "documented ramp degenerate case");
+        let mut w = WakeBudget::new();
+        w.observe_quiet(0);
+        assert_eq!(w.into_parts(), 0, "saturating add min 0 stays 0");
+    }
+
+    #[test]
+    fn wake_budget_round_trips_through_a_bare_count() {
+        let mut w = WakeBudget::new();
+        w.observe_quiet(10);
+        w.observe_quiet(10);
+        let laps = w.into_parts();
+        assert_eq!(WakeBudget::from_parts(laps).into_parts(), laps);
+        assert_eq!(WakeBudget::budget(laps, 1, 100, 10), WakeBudget::budget(2, 1, 100, 10));
     }
 }

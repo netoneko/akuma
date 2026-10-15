@@ -103,6 +103,7 @@ dependencies = [
  "akuma-hda",
  "akuma-ieee80211",
  "akuma-isolation",
+ "akuma-kacho",
  "akuma-locks-rw",
  "akuma-mmap",
  "akuma-mmu",

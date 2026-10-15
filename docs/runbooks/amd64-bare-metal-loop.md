@@ -780,6 +780,8 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 | `wifisim` | register the **simulated wifi radio** behind `/dev/wifi0` (PVH and multiboot2), for testing the `wifi` tool without hardware — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |
 | `powersim` | serve a **simulated battery** at `/proc/power` (a 120 s discharge/charge cycle in real EC bytes), for testing the battery path where there is no battery — QEMU, the trashcan — [`../archive/AKUMA_ACPI_POWER.md`](../archive/AKUMA_ACPI_POWER.md) |
 | `ecram=0x<pa>` | read the battery from an EC memory window the AML scan did not find (or to investigate a machine); same layout, `valid=0` if it is not an EC — same doc |
+| `idlesleep` / `idlesleep=<ticks>` | let an idle core take **one one-shot of up to 100 ticks (1 s)** instead of waking every periodic tick, ramping with consecutive quiet laps and floored by the first busy wake; every skipped tick is credited back to the kernel clock (`[IDLESTAT] shot_ticks_credited=`). **Off by default** — the metal A/B in `proposals/RYZEN_POWERSAVE_DEMON.md` decides the default. Sub-tick futex deadlines still wake exactly (`lapic::arm_deadline` wins over the long shot, always) |
+| `idlemwait` | idle with `sti; mwait; cli` instead of `sti; hlt; cli` (CPUID-gated, hints pinned to 0). An experiment arm for the same A/B — both are C1-class on Zen until measured otherwise |
 
 `root=/dev/sda1` needs the drive in a **USB 3.0** socket — see the first rule in
 "Rules that cost time to learn". Without that it silently boots the RAM image

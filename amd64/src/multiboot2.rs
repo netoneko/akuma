@@ -1042,6 +1042,9 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         let cmdline = info.cmdline();
         let nosmp = cmdline.split_ascii_whitespace().any(|t| t == "nosmp");
         crate::smp::set_cpu_cap_from_cmdline(cmdline);
+        // The idle wake budget (`idlesleep` / `idlemwait`), the same call the
+        // PVH path makes in `main.rs`.
+        crate::sched::set_idle_policy_from_cmdline(cmdline);
         if !nosmp && crate::smp::trampoline_page_available(&machine, &mb2_keep_out()) {
             crate::smp::start_secondaries(machine.madt.as_ref());
         }

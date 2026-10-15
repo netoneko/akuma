@@ -46,7 +46,7 @@ use crate::port::outb;
 use akuma_selftest::Suite;
 
 use crate::serial;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// `IA32_APIC_BASE`. Bits 12:35 are the base address; bit 11 is the global
 /// enable; bit 8 marks the bootstrap processor.
@@ -172,6 +172,10 @@ pub fn on_tick() {
     // A hundred samples a second, costing two atomics: which thread was on the
     // CPU when the tick landed. See `sched::note_tick_sample`.
     crate::sched::note_tick_sample();
+    // An idle long shot fires here: credit the periodic ticks it replaced
+    // before the BSP block below counts the firing tick and pets the
+    // watchdog, so `ticks()` and the pet cadence stay on wall time.
+    credit_shot_fired();
     if crate::smp::cpu_index() == 0 {
         let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         // The hardware watchdog (opt-in, `wdt`): the BSP taking timer
@@ -935,6 +939,143 @@ pub fn restore_periodic() {
     if ONESHOT[crate::smp::cpu_index()].swap(false, Ordering::Relaxed) {
         start_timer();
     }
+}
+
+// ============================================================================
+// The idle long shot: sleeping past the tick
+// ============================================================================
+//
+// A halted core wakes every periodic tick and, when the lap finds nothing to
+// do, halts again. Each wake costs power for no work — the whole reason a
+// battery laptop idles warm. [`arm_idle_shot`] lets the idle loop replace a
+// run of ticks with one one-shot of up to [`MAX_IDLE_SHOT_TICKS`], waking at
+// the earliest parked deadline inside the budget exactly as [`arm_deadline`]
+// does, and at the budget itself otherwise.
+//
+// The cost is ticks that never fire. `TICKS` *is* the kernel's clock
+// (`net::uptime_us` multiplies it by [`US_PER_TICK_TARGET`], and every DHCP
+// retransmit, TCP timeout and `clock_gettime` rides on it), so every skipped
+// tick is credited back — [`credit_shot_fired`] when the shot itself fires,
+// [`settle_idle_shot`] when a device IRQ wakes the core first. Opt-in
+// (`idlesleep` on the command line); until a metal A/B measures it, the
+// default is today's behaviour.
+
+/// Per core: how many ticks the idle long shot in flight was armed with, 0 =
+/// none. Written by [`arm_idle_shot`], consumed exactly once — by
+/// [`on_tick`] (via [`credit_shot_fired`]) when the shot fires, or by
+/// [`settle_idle_shot`] when something else wakes the core first.
+static ARMED_IDLE_TICKS: [AtomicU32; crate::smp::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; crate::smp::MAX_CPUS];
+/// The [`tsc_uptime_us`] reading [`arm_idle_shot`] armed at, for
+/// [`settle_idle_shot`]'s elapsed-time math.
+static ARMED_IDLE_AT_US: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Long one-shots [`arm_idle_shot`] armed.
+pub static IDLE_SHOTS: AtomicU64 = AtomicU64::new(0);
+/// Ticks credited back for periodic ticks a long shot replaced.
+pub static IDLE_SHOT_TICKS_CREDITED: AtomicU64 = AtomicU64::new(0);
+
+/// The longest sleep [`arm_idle_shot`] will take, in ticks — one second, a
+/// tenth of the FCH watchdog's shortest allowed timeout (`wdt=<s>` clamps at
+/// 10 s), with `pet` firing once a second from the tick path.
+pub const MAX_IDLE_SHOT_TICKS: u32 = 100;
+
+/// The one idle long shot in flight fired: credit the periodic ticks it
+/// replaced, before the pet below reads the count.
+fn credit_shot_fired() {
+    let cpu = crate::smp::cpu_index();
+    let armed = ARMED_IDLE_TICKS[cpu].swap(0, Ordering::Relaxed);
+    if armed <= 1 || cpu != 0 {
+        return;
+    }
+    // The fire itself is the one tick `on_tick` adds below; the rest never ran.
+    let extra = u64::from(armed - 1);
+    TICKS.fetch_add(extra, Ordering::Relaxed);
+    IDLE_SHOT_TICKS_CREDITED.fetch_add(extra, Ordering::Relaxed);
+}
+
+/// Before an idle `hlt`: sleep up to `max_ticks` ticks in one one-shot, waking
+/// at a parked thread's deadline when it falls sooner. Returns the ticks
+/// armed, 0 when the periodic tick serves as well (or better).
+///
+/// Call **after** [`arm_deadline`], not instead of it: a sub-tick deadline
+/// arms an exact one-shot there, and the `ONESHOT` flag it sets is what makes
+/// this return 0 instead of arming a longer shot over it.
+///
+/// Callers hold `IF` clear (the idle loop's contract), so the shot cannot fire
+/// between the arm and the `sti`.
+pub fn arm_idle_shot(max_ticks: u32) -> u32 {
+    let cpu = crate::smp::cpu_index();
+    if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
+        return 0;
+    }
+    if ONESHOT[cpu].load(Ordering::Relaxed) {
+        return 0;
+    }
+    // A one-shot left over from an earlier halt would make the
+    // `REG_TIMER_CUR` comparison below read an expired timer as "the periodic
+    // tick serves sooner" (the same trap `arm_deadline` documents).
+    restore_periodic();
+    let Some(now) = tsc_uptime_us() else { return 0 };
+    let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+    let cap_counts = u64::from(max_ticks.max(1)) * per_tick;
+    // Wake at the earliest parked deadline when it falls inside the budget —
+    // in exact counts, not rounded ticks, or a 3 ms futex deadline would wake
+    // 10 ms late and undo `arm_deadline`'s measured win. Past the cap, sleep
+    // the cap.
+    let shot_counts = match akuma_threading::x86_earliest_wake_time() {
+        Some(due) => {
+            let left_us = due.saturating_sub(now);
+            let exact = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
+            if exact < cap_counts { exact } else { cap_counts }
+        }
+        None => cap_counts,
+    };
+    // The periodic tick fires this soon or sooner anyway: leave it alone.
+    if shot_counts <= u64::from(read(REG_TIMER_CUR)) {
+        return 0;
+    }
+    let armed_ticks = shot_counts.div_ceil(per_tick) as u32;
+    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+    write(REG_TIMER_INIT, shot_counts as u32);
+    ARMED_IDLE_TICKS[cpu].store(armed_ticks, Ordering::Relaxed);
+    ARMED_IDLE_AT_US[cpu].store(now, Ordering::Relaxed);
+    ONESHOT[cpu].store(true, Ordering::Relaxed);
+    ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+    IDLE_SHOTS.fetch_add(1, Ordering::Relaxed);
+    armed_ticks
+}
+
+/// The halt [`arm_idle_shot`] prepared ended on something that was not the
+/// timer — a device IRQ woke the core before the shot fired, and the
+/// [`restore_periodic`] the idle loop ran next has reloaded periodic mode,
+/// cancelling the shot. The periodic ticks the sleep skipped still never ran,
+/// so credit what really elapsed, capped at the shot: the clock resumes
+/// counting on its own from now.
+pub fn settle_idle_shot() {
+    let cpu = crate::smp::cpu_index();
+    let armed = ARMED_IDLE_TICKS[cpu].swap(0, Ordering::Relaxed);
+    if armed == 0 {
+        return;
+    }
+    let at = ARMED_IDLE_AT_US[cpu].swap(0, Ordering::Relaxed);
+    if cpu != 0 {
+        return;
+    }
+    let Some(now) = tsc_uptime_us() else { return };
+    let missed = now
+        .saturating_sub(at)
+        .saturating_div(u64::from(US_PER_TICK_TARGET))
+        .min(u64::from(armed - 1));
+    if missed == 0 {
+        return;
+    }
+    let t = TICKS.fetch_add(missed, Ordering::Relaxed) + missed;
+    // The sleep skipped this second's pet boundary; reload now, so a long
+    // idle never eats into the watchdog's window.
+    crate::watchdog::pet(t);
+    IDLE_SHOT_TICKS_CREDITED.fetch_add(missed, Ordering::Relaxed);
 }
 
 /// Stop the timer. Used after the smoke test so later output is not interleaved

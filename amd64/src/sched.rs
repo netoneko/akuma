@@ -1057,6 +1057,85 @@ pub fn register_idle_task(cpu: usize) -> Option<usize> {
     Some(slot)
 }
 
+// ============================================================================
+// The idle wake budget (`idlesleep`)
+// ============================================================================
+
+/// Whether the idle loop may take a long one-shot instead of waking every
+/// tick. **Off by default**: the behaviour it changes is the clock's own
+/// cadence, and the metal A/B that decides the default has not run yet
+/// (`proposals/RYZEN_POWERSAVE_DEMON.md`). Opt in with `idlesleep` on the
+/// command line.
+static IDLE_SLEEP: AtomicU32 = AtomicU32::new(0);
+/// The budget's ceiling in ticks, `idlesleep=<ticks>`, clamped to
+/// [`crate::lapic::MAX_IDLE_SHOT_TICKS`]. Meaningful only while [`IDLE_SLEEP`].
+static IDLE_MAX_TICKS: AtomicU32 = AtomicU32::new(crate::lapic::MAX_IDLE_SHOT_TICKS);
+/// Per core: consecutive idle laps that came back with nothing to do — the
+/// governor's signal (`akuma-kacho::WakeBudget`). The idle thread is its
+/// core's only writer, so a plain atomic per core needs no lock.
+static IDLE_QUIET_LAPS: [AtomicU32; crate::smp::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; crate::smp::MAX_CPUS];
+/// `idlemwait`: idle with `sti; mwait; cli` instead of `sti; hlt; cli`. An
+/// experiment for the metal A/B, not a win in evidence: both are C1-class on
+/// Zen, and whether `mwait` exits differently at deeper package states is
+/// exactly what the A/B is for. Off unless the CPUID MONITOR bit is set.
+static IDLE_MWAIT: AtomicU32 = AtomicU32::new(0);
+
+/// Parse the idle-policy knobs off the command line. Both boot paths call
+/// this (`main.rs` and `multiboot2.rs`), the way `smp::set_cpu_cap_from_
+/// cmdline` is called from both.
+pub fn set_idle_policy_from_cmdline(cmdline: &str) {
+    let mut sleep = false;
+    let mut max = crate::lapic::MAX_IDLE_SHOT_TICKS;
+    for t in cmdline.split_ascii_whitespace() {
+        match t {
+            "idlesleep" => sleep = true,
+            "idlemwait" => {
+                // MONITOR is CPUID leaf 1, ECX bit 3. Without it the
+                // instruction is #UD, and an idle loop that faults on its
+                // first halt is a boot that never reaches userspace.
+                let ok = core::arch::x86_64::__cpuid(1).ecx & (1 << 3) != 0;
+                if ok {
+                    IDLE_MWAIT.store(1, Ordering::Relaxed);
+                } else {
+                    serial::puts("  [idle] idlemwait ignored: CPUID has no MONITOR\n");
+                }
+            }
+            _ => {
+                if let Some(v) = t.strip_prefix("idlesleep=") {
+                    sleep = true;
+                    if let Ok(n) = v.parse::<u32>() {
+                        max = n.clamp(1, crate::lapic::MAX_IDLE_SHOT_TICKS);
+                    }
+                }
+            }
+        }
+    }
+    IDLE_SLEEP.store(u32::from(sleep), Ordering::Relaxed);
+    IDLE_MAX_TICKS.store(max, Ordering::Relaxed);
+    if sleep {
+        serial::puts("  [idle] wake budget on, up to ");
+        serial::put_dec(u64::from(max));
+        serial::puts(" ticks per idle sleep\n");
+    }
+}
+
+/// Ticks the next idle sleep may take, from `quiet_before` — the count of
+/// consecutive quiet laps *before* the lap that is about to halt. 0 means "no
+/// long shot": the halt arms only `lapic::arm_deadline`, which is today's
+/// behaviour and what the first idle lap after any work gets.
+fn idle_budget_ticks(quiet_before: u32) -> u32 {
+    if IDLE_SLEEP.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    akuma_kacho::WakeBudget::budget(
+        quiet_before,
+        1,
+        u64::from(IDLE_MAX_TICKS.load(Ordering::Relaxed)),
+        10,
+    ) as u32
+}
+
 /// What a secondary core runs forever: hand the core to any runnable thread, and
 /// sleep until the next tick when there is none.
 ///
@@ -1173,6 +1252,18 @@ pub fn idle_loop() -> ! {
                         }
                     }
                 }
+                {
+                    // Idle-wake accounting, beside `[PSTATS]`: halts against
+                    // long shots and the ticks the shots credited back — the
+                    // numbers the `idlesleep` A/B reads, one line per 30 s
+                    // dump. An off box reads shots=0, which is the "today's
+                    // behaviour" answer, not a missing line.
+                    akuma_primitives::safe_print!(128,
+                        "[IDLESTAT] halts={} shots={} shot_ticks_credited={}\n",
+                        IDLE_HALTS.load(Ordering::Relaxed),
+                        crate::lapic::IDLE_SHOTS.load(Ordering::Relaxed),
+                        crate::lapic::IDLE_SHOT_TICKS_CREDITED.load(Ordering::Relaxed));
+                }
                 // TEMPORARY (2026-09-18): is the `-j4` wedge an orphaned process —
                 // registered and ACTIVE with no live thread, so unschedulable,
                 // unable to exit and never reaped, with its parent's `wait4`
@@ -1216,6 +1307,7 @@ pub fn idle_loop() -> ! {
             if threading::x86_runnable_exists() {
                 smp::set_halted(false);
                 smp::bkl_leave();
+                IDLE_QUIET_LAPS[smp::cpu_index()].store(0, Ordering::Relaxed);
                 continue;
             }
             smp::bkl_leave();
@@ -1224,19 +1316,50 @@ pub fn idle_loop() -> ! {
             // is billed for every second it sleeps and `/proc/stat` shows no
             // idle at all (`threading::credit_halted_time`).
             let halt_started_us = akuma_primitives::clock::uptime_us();
+            // **The wake budget** (`idlesleep`): this lap came back with
+            // nothing to do, so the sleep about to start may be longer than
+            // one tick — ramping with the consecutive quiet laps before it,
+            // and floored again by the first wake that finds work. The count
+            // feeding the budget is the value from *before* this lap, so the
+            // first idle halt ever is a plain one-tick halt.
+            let cpu = smp::cpu_index();
+            let quiet_before = IDLE_QUIET_LAPS[cpu].fetch_add(1, Ordering::Relaxed);
+            let budget = idle_budget_ticks(quiet_before);
             // Wake at the earliest parked deadline, not the next tick
-            // (`lapic::arm_deadline`).
+            // (`lapic::arm_deadline`); `idlesleep` then stretches the halt
+            // past it, up to the budget.
             crate::lapic::arm_deadline();
+            if budget > 1 {
+                crate::lapic::arm_idle_shot(budget);
+            }
             // SAFETY: interrupts on for exactly the `hlt`, then off again. The
             // timer vector is installed and its handler takes the BKL itself.
-            unsafe {
-                core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+            // `idlemwait` swaps the same bracket's wait instruction; the CPUID
+            // gate ran at `set_idle_policy_from_cmdline`.
+            if IDLE_MWAIT.load(Ordering::Relaxed) != 0 {
+                // SAFETY: as the `hlt` bracket. EAX is the MWAIT hint (0 = the
+                // lightest state, never a part-specific deep-state hint) and
+                // ECX its extension flags (none); both zeroed because a
+                // garbage hint is a firmware-defined C-state, not an idle.
+                unsafe {
+                    core::arch::asm!("sti", "mwait", "cli",
+                                     in("eax") 0u32, in("ecx") 0u32,
+                                     options(nomem, nostack));
+                }
+            } else {
+                unsafe {
+                    core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                }
             }
             crate::lapic::restore_periodic();
+            // The shot (if any) was cancelled by a non-timer wake: credit the
+            // ticks it skipped, before `credit_halted_time` reads the clock.
+            crate::lapic::settle_idle_shot();
             smp::set_halted(false);
             threading::credit_halted_time(threading::current_thread_id(), halt_started_us);
         } else {
             smp::bkl_leave();
+            IDLE_QUIET_LAPS[smp::cpu_index()].store(0, Ordering::Relaxed);
         }
     }
 }

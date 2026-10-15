@@ -27,6 +27,7 @@
 
 pub mod aml;
 pub mod ec;
+pub mod ledger;
 pub mod render;
 pub mod sim;
 

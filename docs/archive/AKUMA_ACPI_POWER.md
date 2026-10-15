@@ -1,5 +1,14 @@
 # ACPI power on Akuma/amd64: battery and AC for the status bar
 
+> **2026-10-15, current state:** `/proc/power` now also carries
+> `energy_mwh=` (the ledger in `crates/akuma-power/src/ledger.rs`) and the
+> idle wake budget (`idlesleep`/`idlemwait`, `[IDLESTAT]`) has landed behind
+> the knobs. The current-state reference is
+> [`../reference/subsystems/power.md`](../reference/subsystems/power.md); this
+> document remains the design record for the battery decode and stays accurate
+> for everything it describes. The ryzen live read below is resolved —
+> `AKUMA_AMD64_ON_RYZEN_LAPTOP.md` §5.8.
+
 2026-10-07. **Stability: B** — the plumbing is verified on QEMU and on the
 trashcan; the battery decode is verified against Linux on the Ryzen laptop's
 *measurements* but has **not yet been read live by Akuma on that laptop**.
