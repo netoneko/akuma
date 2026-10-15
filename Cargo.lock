@@ -186,6 +186,10 @@ name = "akuma-dmesg"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-dwi2c"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-el0-entry"
 version = "0.1.0"
 dependencies = [
@@ -339,6 +343,14 @@ dependencies = [
 
 [[package]]
 name = "akuma-hda"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-hid"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-i2c-hid"
 version = "0.1.0"
 
 [[package]]
@@ -742,6 +754,10 @@ dependencies = [
  "akuma-kacho",
  "arm_pl031",
 ]
+
+[[package]]
+name = "akuma-touchpad"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-uart"

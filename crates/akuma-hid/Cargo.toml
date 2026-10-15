@@ -1,0 +1,8 @@
+[package]
+name = "akuma-hid"
+version = "0.1.0"
+edition = "2024"
+description = "HID report-descriptor parsing and report decoding (port of OpenBSD/NetBSD hid.c — see NOTICE)"
+
+[lints]
+workspace = true

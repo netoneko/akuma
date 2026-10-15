@@ -1,9 +1,17 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-10-12 with
-`python3 scripts/cloc_akuma.py src crates`: **62 of 82 crates** forbid
-`unsafe` (84856 of 106956 crate lines, 79.3%; 97.7% of production
-code lies outside any `unsafe` block). Added in this run: **`akuma-cmos-rtc`**
+**Grade: A** — regenerated 2026-10-16 with
+`python3 scripts/cloc_akuma.py src crates`: **66 of 86 crates** forbid
+`unsafe` (79618 of 81378 production lines, 97.8% safe). Added in this run,
+four crates of the touchpad stack
+([`AKUMA_AMD64_TOUCHPAD_I2C_HID.md`](../archive/AKUMA_AMD64_TOUCHPAD_I2C_HID.md)),
+each from its first commit: **`akuma-hid`** (690 production lines, 0 sites —
+the OpenBSD/NetBSD `hid.c` report-descriptor parser port, see its `NOTICE`),
+**`akuma-touchpad`** (420, 0 — the clickpad policy: soft button areas,
+two-finger scroll, the event ring), **`akuma-i2c-hid`** (202, 0 — the
+HID-over-I²C transport decisions), **`akuma-dwi2c`** (175, 0 — the DesignWare
+I²C register map, timings and abort decode). The 2026-10-12 run (62 of 82)
+added **`akuma-cmos-rtc`**
 (the PC CMOS clock's decode — UIP wait, BCD/binary, 12/24-hour, century,
 civil-to-Unix, plausibility — 0 sites; the two port accesses stay in
 `amd64/src/clock.rs`). The 2026-10-06 run (fourth that day) counted 59 of

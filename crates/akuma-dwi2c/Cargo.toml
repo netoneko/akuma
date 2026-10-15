@@ -1,0 +1,8 @@
+[package]
+name = "akuma-dwi2c"
+version = "0.1.0"
+edition = "2024"
+description = "DesignWare DW_apb_i2c decisions for AMD FCH I2C controllers: register map, timings, abort decode"
+
+[lints]
+workspace = true

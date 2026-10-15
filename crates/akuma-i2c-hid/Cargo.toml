@@ -1,0 +1,8 @@
+[package]
+name = "akuma-i2c-hid"
+version = "0.1.0"
+edition = "2024"
+description = "HID-over-I2C transport decisions: descriptor validation, command encoding, input framing, bring-up timing"
+
+[lints]
+workspace = true
