@@ -33,7 +33,7 @@ use alloc::string::String;
 use embedded_tls::blocking::{TlsConfig, TlsConnection, TlsContext};
 use embedded_tls::{Aes128GcmSha256, TlsError, UnsecureProvider};
 
-pub use http::{download_file, download_file_with_headers, https_fetch, https_get, https_get_with_limit, https_post, https_post_with_limit, HttpHeaders, HttpStream, HttpStreamTls, StreamResult, find_headers_end, parse_url, parse_status_line, ParsedUrl};
+pub use http::{http_request, HttpResponse, RequestBody, download_file, download_file_with_headers, https_fetch, https_get, https_get_with_limit, https_post, https_post_with_limit, HttpHeaders, HttpStream, HttpStreamTls, StreamResult, find_headers_end, parse_url, parse_status_line, ParsedUrl};
 pub use rng::TlsRng;
 pub use transport::TcpTransport;
 

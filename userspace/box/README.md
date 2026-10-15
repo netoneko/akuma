@@ -147,7 +147,7 @@ serves the pre-update copy of every file a later layer replaced.
 
 | Area | Supported | Not yet |
 |------|-----------|---------|
-| **Distribution** (registry API) | Anonymous pull, Docker Hub bearer tokens, `GET /v2/<name>/manifests/<ref>` by tag *or* digest, `GET /v2/<name>/blobs/<digest>`, 307 redirects to CDN blobs | Push, login/credentials, `_catalog`/tag listing, resumable/chunked blob fetch, `Range` retries |
+| **Distribution** (registry API) | **Push** (monolithic blob upload, manifest `PUT`; Basic and Bearer auth, `box login`) — see [`docs/BOX_BUILD.md`](docs/BOX_BUILD.md#box-push); anonymous pull, Docker Hub bearer tokens, `GET /v2/<name>/manifests/<ref>` by tag *or* digest, `GET /v2/<name>/blobs/<digest>`, 307 redirects to CDN blobs | Authenticated *pull*, `_catalog`/tag listing, resumable/chunked blob fetch, `Range` retries |
 | **References** | `name`, `name:tag`, `user/name:tag`, `registry[:port]/name:tag`, implicit `library/` + `latest`, `docker.io` → `registry-1.docker.io` | `name@sha256:…` digest pins, digest *verification* of what was downloaded |
 | **Image index / manifest list** | OCI `image.index.v1`, Docker `manifest.list.v2`, detection with no top-level `mediaType`, `linux/arm64` (and `aarch64`) selection, skipping `unknown/unknown` attestations | Variant matching (`v8`, `v7`), `os.version`/`os.features`, multi-platform fallback |
 | **Manifest** | `config.digest`, `layers[].digest` in order, `layers[].size` | Foreign/URL layers, subject/referrers, annotations |

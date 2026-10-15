@@ -265,7 +265,7 @@ impl<'a> Builder<'a> {
         }
         let store = images::sanitize_name(&image);
         if !images::image_exists(&store) {
-            crate::oci::pull_image(&image)?;
+            crate::oci::pull_image(&image, false)?;
         }
         StageState::from_image(&store)
     }
@@ -712,7 +712,7 @@ impl<'a> Builder<'a> {
                 None => {
                     let store = images::sanitize_name(&from);
                     if !images::image_exists(&store) {
-                        crate::oci::pull_image(&from)?;
+                        crate::oci::pull_image(&from, false)?;
                     }
                     images::load_layers(&store)
                 }

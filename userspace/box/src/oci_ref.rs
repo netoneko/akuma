@@ -18,6 +18,9 @@ pub struct ImageRef {
     pub registry: String,
     pub name: String,
     pub tag: String,
+    /// Talk plain HTTP to this registry (`--insecure`). Docker Hub is never
+    /// insecure: its token endpoint and API are HTTPS only.
+    pub insecure: bool,
 }
 
 /// Split a reference into registry, repository and tag, applying Docker's two
@@ -59,10 +62,21 @@ pub fn parse_image_ref(s: &str) -> ImageRef {
         registry,
         name,
         tag: String::from(tag),
+        insecure: false,
     }
 }
 
 impl ImageRef {
+    /// `http` for a registry marked insecure, `https` otherwise.
+    pub fn scheme(&self) -> &'static str {
+        if self.insecure && self.registry != DOCKER_HUB { "http" } else { "https" }
+    }
+
+    /// `scheme://registry` — the base every `/v2/…` URL hangs off.
+    pub fn base_url(&self) -> String {
+        format!("{}://{}", self.scheme(), self.registry)
+    }
+
     /// Docker Hub is the only registry `box` authenticates against; anything
     /// else is pulled anonymously.
     pub fn needs_token(&self) -> bool {
@@ -81,14 +95,11 @@ impl ImageRef {
     /// `reference` is a tag *or* a digest — the v2 manifests endpoint takes
     /// either, which is how a manifest list is resolved to one platform.
     pub fn manifest_url(&self, reference: &str) -> String {
-        format!(
-            "https://{}/v2/{}/manifests/{}",
-            self.registry, self.name, reference
-        )
+        format!("{}/v2/{}/manifests/{}", self.base_url(), self.name, reference)
     }
 
     pub fn blob_url(&self, digest: &str) -> String {
-        format!("https://{}/v2/{}/blobs/{}", self.registry, self.name, digest)
+        format!("{}/v2/{}/blobs/{}", self.base_url(), self.name, digest)
     }
 }
 
@@ -166,6 +177,19 @@ mod tests {
         assert!(parse_image_ref("busybox").needs_token());
         assert!(parse_image_ref("docker.io/library/busybox").needs_token());
         assert!(!parse_image_ref("ghcr.io/owner/repo").needs_token());
+    }
+
+    #[test]
+    fn insecure_registries_use_http() {
+        let mut r = parse_image_ref("localhost:5000/app:1");
+        assert_eq!(r.blob_url("sha256:x"), "https://localhost:5000/v2/app/blobs/sha256:x");
+        r.insecure = true;
+        assert_eq!(r.blob_url("sha256:x"), "http://localhost:5000/v2/app/blobs/sha256:x");
+        assert_eq!(r.base_url(), "http://localhost:5000");
+        // The Hub has no plain-HTTP endpoint to be insecure about.
+        let mut hub = parse_image_ref("busybox");
+        hub.insecure = true;
+        assert_eq!(hub.scheme(), "https");
     }
 
     #[test]

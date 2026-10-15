@@ -55,7 +55,7 @@ Start from the symptom or task on the left.
 | Deciding whether `kbuild -c -j 4` finishes on the **trashcan**, or reading a `-j4` self-host crash | [`amd64-j4-build-crash-hunt.md`](amd64-j4-build-crash-hunt.md) — what each rig measured (ryzen Firecracker: 31/31 green; metal: 3 of 4 `rc=139` on 2026-09-18, then 2026-09-30 on `main`: no `rc=139`, 7 of 10 pass at ~14.5 min, 3 `EIO`-at-`execve` failures — good, not parity), the pre-flight, and a signature table for the failure |
 | Swapping the running kernel for a freshly built one without touching the host (`KERNEL_DROPOFF` + raw block fd + `reboot(2)`) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) § "Swap the running kernel in place" — **AArch64 only**; the amd64 equivalent needs none of that machinery (row above) |
 | Running a Docker image with `box run` | [`run-docker-image.md`](run-docker-image.md) |
-| Building an image from a Dockerfile (`box build`), committing a container, exporting with `box save` | [`build-docker-image.md`](build-docker-image.md) |
+| Building an image from a Dockerfile (`box build`), committing a container, exporting with `box save`, pushing with `box push` | [`build-docker-image.md`](build-docker-image.md) |
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |
 | Landed a fix and need to update the bugfix audit | [`update-bug-fix-list.md`](update-bug-fix-list.md) |

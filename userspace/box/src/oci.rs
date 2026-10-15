@@ -139,8 +139,9 @@ fn extract_layer(layer_path: &str, rootfs_path: &str) -> Result<(), String> {
     }
 }
 
-pub fn pull_image(image_str: &str) -> Result<(), String> {
-    let image = boxlib::oci_ref::parse_image_ref(image_str);
+pub fn pull_image(image_str: &str, insecure: bool) -> Result<(), String> {
+    let mut image = boxlib::oci_ref::parse_image_ref(image_str);
+    image.insecure = insecure;
     let store_name = images::sanitize_name(image_str);
 
     print("box: pulling ");

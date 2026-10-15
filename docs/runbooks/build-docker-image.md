@@ -87,7 +87,29 @@ Run an `amd64` image on an arm64 Mac with `docker run --platform linux/amd64`.
 `docs/archive/BOX_BUILD.md` § 8, "uid -4"). If a layer lists that uid, the
 kernel predates the fix.
 
-## 4. Clean up
+## 4. Push it to a registry
+
+```
+box tag app:1 ghcr.io/me/app:1
+echo "$TOKEN" | box login -u me --password-stdin ghcr.io      # once; or BOX_REGISTRY_USER/_PASSWORD
+box push ghcr.io/me/app:1
+```
+
+Expect `Layer already exists` for every blob a registry has and `1: digest:
+sha256:… size: …` at the end — the same digest `docker pull` then prints.
+
+Try it without an account: on the Mac, `docker run -d -p 5000:5000 registry:2`,
+then on Akuma `box tag app:1 <mac-ip>:5000/app:1 && box push --insecure
+<mac-ip>:5000/app:1`, and `docker pull localhost:5000/app:1` on the Mac. For a
+login, `docker run --rm --entrypoint htpasswd httpd:2 -Bbn alice pw >
+htpasswd` and start `registry:2` with `REGISTRY_AUTH=htpasswd`,
+`REGISTRY_AUTH_HTPASSWD_REALM=r`, `REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd`.
+
+**TLS is not verified** (`libakuma-tls` has no trust store): do not push over a
+network you do not trust. `box push` says so each time. Reference:
+[`box push`](../../userspace/box/docs/BOX_BUILD.md#box-push).
+
+## 5. Clean up
 
 ```
 box rmi app:1          # drops the name, then collects layers/blobs/cache nothing references

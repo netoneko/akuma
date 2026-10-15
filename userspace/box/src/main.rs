@@ -23,6 +23,7 @@ mod build;
 mod commit;
 mod fsx;
 mod oci;
+mod push;
 mod images;
 mod imgcmd;
 mod run;
@@ -55,6 +56,9 @@ pub extern "C" fn main() {
         "rmi" => imgcmd::cmd_rmi(args_iter),
         "prune" => imgcmd::cmd_prune(),
         "pull" => cmd_pull(args_iter),
+        "push" => push::cmd_push(args_iter),
+        "login" => push::cmd_login(args_iter),
+        "logout" => push::cmd_logout(args_iter),
         "images" => cmd_images(),
         "cp" => cmd_cp(args_iter),
         "ps" => cmd_ps(),
@@ -82,7 +86,10 @@ fn print_usage() {
     print("  box rmi <image>...                                        Remove images, collect layers\n");
     print("  box prune                                                 Collect unused layers/cache\n");
     print("  box commit <container> <image>                           Save a container as an image\n");
-    print("  box pull <image>                                          Pull an OCI image\n");
+    print("  box pull [--insecure] <image>                             Pull an OCI image\n");
+    print("  box push [--insecure] <registry/name:tag>                 Upload an image to a registry\n");
+    print("  box login -u <user> --password-stdin <registry>           Store registry credentials\n");
+    print("  box logout <registry>                                     Forget them\n");
     print("  box images                                                List pulled images\n");
     print("  box use <name|id> [-i] [-d] <cmd> [args...]               Run in box\n");
     print("  box grab <name|id> [pid]                                  Reattach to process\n");
@@ -561,13 +568,15 @@ fn cmd_test(args: libakuma::Args) -> ! {
     }
 }
 
-fn cmd_pull(mut args: libakuma::Args) -> ! {
-    let image = match args.next() {
-        Some(i) => i,
-        None => { print("Usage: box pull <image>\n"); exit(1); }
+fn cmd_pull(args: libakuma::Args) -> ! {
+    let argv: Vec<&str> = args.collect();
+    let insecure = argv.contains(&"--insecure");
+    let image = match argv.iter().find(|a| !a.starts_with("--")) {
+        Some(i) => *i,
+        None => { print("Usage: box pull [--insecure] <image>\n"); exit(1); }
     };
 
-    match oci::pull_image(image) {
+    match oci::pull_image(image, insecure) {
         Ok(()) => {
             println("Done.");
             exit(0);

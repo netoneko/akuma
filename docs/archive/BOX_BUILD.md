@@ -1,7 +1,7 @@
 # `box build` — Docker-compatible image builds on Akuma
 
 **Date:** 2026-10-14
-**Status:** Prerequisites 1–3 (§5) implemented 2026-10-14 — permissions ([`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) §11), hard links ([`HARD_LINKS.md`](HARD_LINKS.md) §4), directory rename (§7 below). **Steps 4–12 implemented 2026-10-15** (§8 below); step 13 (`box push`) is not. Current-state reference: [`userspace/box/docs/BOX_BUILD.md`](../../userspace/box/docs/BOX_BUILD.md); procedure: [`../runbooks/build-docker-image.md`](../runbooks/build-docker-image.md).
+**Status:** Prerequisites 1–3 (§5) implemented 2026-10-14 — permissions ([`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) §11), hard links ([`HARD_LINKS.md`](HARD_LINKS.md) §4), directory rename (§7 below). **Steps 4–12 implemented 2026-10-15** (§8 below); **step 13 (`box push`) implemented 2026-10-16** (§8, "`box push`"). Current-state reference: [`userspace/box/docs/BOX_BUILD.md`](../../userspace/box/docs/BOX_BUILD.md); procedure: [`../runbooks/build-docker-image.md`](../runbooks/build-docker-image.md).
 **Depends on:** [`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) (steps 3–6) and
 [`HARD_LINKS.md`](HARD_LINKS.md). Built without them, every image would be
 `root:root` with hard links duplicated, and `USER`/`COPY --chown` would be no-ops.
@@ -155,7 +155,7 @@ clear error until then.
     instructions.
 12. `box save` (OCI layout / `docker load` format), `box tag`, `box rmi` + GC.
     Pull starts keeping blobs and verifying digests.
-13. Later, optional: `box push` (registry auth + blob upload; check the TLS
+13. Done 2026-10-16 (§8): `box push` (registry auth + blob upload; check the TLS
     client's single cipher suite against Docker Hub/GHCR first).
 
 ## 6. Verification
@@ -274,9 +274,39 @@ trashcan: 12 of 12 runs `uid=0`, files `0:0`. Not fixed: a *real* signal with a
 handler still makes a non-blocking `getuid` return `EINTR`; Linux restarts or
 completes such calls, and the prologue could exempt the non-blocking leaf tier.
 
+### `box push` (2026-10-16)
+
+`box push`, `box login`, `box logout` (+ `--insecure` on `push` and `pull`). The TLS
+check §5 asked for first — "the TLS client's single cipher suite against Docker
+Hub/GHCR" — was not made against either: there were no accounts to push with. What
+was found instead is bigger: **`libakuma-tls` does not verify certificates** (its
+`lib.rs` says so), so a push's credentials cross an unauthenticated channel. It is
+documented in the reference and printed on every push, not fixed.
+
+Needed first: `libakuma_tls::http_request` — any method, headers back, a body
+streamed from a file descriptor, no error on non-2xx (the existing calls
+`Err` on anything but 2xx and hide `Location` and `WWW-Authenticate`, which are
+exactly what a registry's 202 and 401 are for). Pure logic is `boxlib::registry`
+(base64, Docker-shaped credential file, challenge parsing, token/upload URLs;
+18 host tests) and `ImageRef::{scheme, base_url, insecure}`.
+
+Verified 2026-10-16 from the trashcan (amd64 kernel, `box` pushed with
+`hpbox.akuma_push`) to registries on the Mac (`registry:2`, 192.168.1.203):
+
+| Case | Result |
+|---|---|
+| open registry, 5 blobs + manifest | pushed; `docker pull` of it prints the same digest `box` computed (`sha256:da6bce24…`); the image runs, owners `0:0` |
+| second push of the same image | every blob "already exists" (the `HEAD` path), manifest re-`PUT` |
+| htpasswd registry (Basic): no credentials / wrong / right | "needs credentials" hint / "refused the credentials" / pushed. Password `s3cret:pw` (a colon). `auth.json` is `0600`; `logout` removes it |
+| Bearer, via a mock token server + proxy | token requested with the push scope (the challenge's own was pull-only), Basic credentials sent to the token endpoint only; **token revoked mid-push → 401 → re-authenticate → the upload completes**; no credentials → the hint |
+
+Not run: AArch64 (the code is arch-neutral and shares the x86 run's TCP path, but
+it was not booted), Docker Hub, GHCR, a registry that redirects uploads to a CDN,
+anything over verified TLS.
+
 ### Not done
 
-`box push`; `.tar.bz2`/`.xz` in `ADD`; preserving source mtimes in `COPY`
+`.tar.bz2`/`.xz` in `ADD`; authenticated *pull* (a private `FROM`); chunked/resumable `box push` uploads and cross-repo `mount`; preserving source mtimes in `COPY`
 (libakuma has no `utimensat` wrapper); a build with more than 31 image layers;
 `--squash`; the Akuma-vs-Docker rootfs diff of §6 as a script
 (the procedure is in the runbook, it was not automated).

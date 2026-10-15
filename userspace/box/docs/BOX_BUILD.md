@@ -1,7 +1,7 @@
 # `box build` — Docker-compatible image builds
 
-How `box build`, `box commit`, `box save`, `box tag`, `box rmi` and `box prune`
-work, and where they differ from Docker. Procedure:
+How `box build`, `box commit`, `box save`, `box tag`, `box rmi`, `box prune`,
+`box push`, `box login` and `box logout` work, and where they differ from Docker. Procedure:
 [`../../../docs/runbooks/build-docker-image.md`](../../../docs/runbooks/build-docker-image.md).
 Design history and the reasoning behind each choice:
 [`../../../docs/archive/BOX_BUILD.md`](../../../docs/archive/BOX_BUILD.md).
@@ -13,6 +13,9 @@ box save [-o file.tar] <image>          # OCI layout + Docker's manifest.json; `
 box tag <source> <target>
 box rmi <image>…                        # drops the names, then collects unreferenced layers
 box prune                               # the same collection, on its own
+box push [--insecure] <registry/name:tag>
+box login -u <user> (-p <password> | --password-stdin) <registry>
+box logout <registry>
 ```
 
 ## What a build does
@@ -106,7 +109,7 @@ metadata wins in an overlay, so a naive `mkdir /tmp` in a `COPY` layer would tur
 | `# escape=` directive, line continuations, comments inside continuations | ✅ |
 | `ONBUILD`, `RUN --mount`/`--network`/`--security`, heredocs, `COPY --link`'s semantics | ❌ **refused with an error naming the line** (`--link` is accepted and ignored) |
 | BuildKit frontends (`# syntax=` other than the default), secrets, SSH forwarding, cache mounts | ❌ |
-| `box push` | ❌ not implemented — see below |
+| `box push` | ✅ — see [`box push`](#box-push) |
 
 Other divergences:
 
@@ -136,6 +139,47 @@ Digests in it are verified by construction: the config digest is the sha256 of
 the bytes stored, and layers are the blobs the manifest names. Writes to stdout
 without `-o`, so `box save app | ssh mac docker load` works over a pipe.
 
+## `box push`
+
+`box push [--insecure] registry/name:tag` uploads an image the store already holds
+under that name (`box tag app:1 ghcr.io/me/app:1` first — a bare `app:1` means
+`docker.io/library/app`, as in Docker). It sends exactly what `box save` writes:
+the same config bytes and the same manifest, so the digest it prints is the one
+`docker pull` reports.
+
+```
+GET /v2/                      200 = open; 401 = read WWW-Authenticate
+  Basic  -> Authorization: Basic <stored credentials>
+  Bearer -> GET <realm>?service=…&scope=repository:<name>:pull,push   (Basic creds, if any)
+            -> Authorization: Bearer <token>
+for the config and each layer:
+  HEAD /v2/<name>/blobs/<digest>        200 = skip ("Layer already exists")
+  POST /v2/<name>/blobs/uploads/        202 + Location
+  PUT  <Location>[&]digest=<digest>     201   (monolithic: one request, streamed from the blob file)
+PUT /v2/<name>/manifests/<tag>          201   Content-Type: application/vnd.oci.image.manifest.v1+json
+```
+
+- **Credentials**, first found: `BOX_REGISTRY_USER` + `BOX_REGISTRY_PASSWORD`;
+  `/var/lib/box/auth.json` (written by `box login`, mode `0600`); Docker's
+  `/root/.docker/config.json` `auths` (read only; credential helpers are not
+  supported). `auth.json` has Docker's `{"auths":{"<registry>":{"auth":"<base64 user:password>"}}}`
+  shape. A password may contain `:`; a user name may not.
+- **A 401 mid-upload re-authenticates once and retries** (a bearer token lasts
+  minutes; a layer can take longer). `Authorization` is only sent to the
+  registry's own host, never to a different host an upload `Location` names.
+- **`--insecure`** speaks plain HTTP to that registry (also on `box pull`). Docker
+  Hub ignores it. Docker applies this to `localhost` on its own; `box` never
+  guesses.
+- **Certificates are not verified.** `libakuma-tls` has no trust store, so an
+  `https://` push is safe from passive listeners and from nothing else:
+  credentials and layers can be read or replaced by anyone on the path. `box
+  push` prints a note every time. Fix that before pushing anything that matters.
+- **Not done:** chunked/resumable upload (`PATCH`), cross-repository blob
+  `mount`, pushing an index (multi-arch), credential helpers, `box push` of an
+  image pulled before 2026-10-15 (no stored blobs), authenticated **pull**
+  (private base images), `docker.io` token flow verified live (the Bearer flow
+  is tested against a mock; Hub and GHCR were not pushed to).
+
 ## Source map
 
 | File | Role |
@@ -147,8 +191,10 @@ without `-o`, so `box save app | ssh mac docker load` works over a pipe.
 | `boxlib::imgconfig` | config parse/write, manifest, index, RFC 3339 |
 | `boxlib::layer` | streaming tar → gzip with both digests |
 | `boxlib::stack` | merged view over layers (whiteouts, opaque dirs) |
+| `boxlib::registry` | push/login decisions: base64, credential file, `WWW-Authenticate`, token and upload URLs |
+| `libakuma_tls::http_request` | any HTTP method, response headers, file-streamed body |
 | `akuma-tar::write` | tar header encoder (ustar + PAX) |
-| `build.rs`, `commit.rs`, `imgcmd.rs`, `fsx.rs` | the I/O around them |
+| `build.rs`, `commit.rs`, `imgcmd.rs`, `push.rs`, `fsx.rs` | the I/O around them |
 
 All `boxlib` modules and `akuma-tar` run under
 `cargo test -p box --lib --no-default-features --target $HOST`.

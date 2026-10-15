@@ -38,6 +38,7 @@ pub mod layer;
 pub mod manifest;
 pub mod oci_ref;
 pub mod paths;
+pub mod registry;
 pub mod spec;
 pub mod stack;
 pub mod sys;

@@ -406,6 +406,159 @@ fn parse_http_response(data: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 // ============================================================================
+// General request API (any method, response headers, streamed file body)
+// ============================================================================
+
+/// The body of a [`http_request`].
+pub enum RequestBody<'a> {
+    /// No body, and no `Content-Length` (a `GET`/`HEAD`/`DELETE`).
+    Empty,
+    /// A body already in memory.
+    Bytes(&'a [u8]),
+    /// `len` bytes read from `fd` at its current offset, `CHUNK` at a time —
+    /// how a multi-megabyte image layer is uploaded without being held in RAM.
+    Fd { fd: i32, len: u64 },
+}
+
+/// A parsed response. Unlike [`https_get`] this is returned for **every** status:
+/// a registry answers `401` with the challenge that says how to authenticate and
+/// `202` with the `Location` of the upload, and both are the caller's to read.
+pub struct HttpResponse {
+    pub status: u16,
+    /// In arrival order; names as the server sent them.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// The first header called `name`, ASCII case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Split a response head (`HTTP/1.x <status> …\r\n` then `Name: value` lines).
+fn parse_response_head(head: &str) -> Result<(u16, Vec<(String, String)>), Error> {
+    let mut lines = head.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| Error::HttpError(String::from("Empty response")))?;
+    let status = parse_status_line(status_line)
+        .ok_or_else(|| Error::HttpError(String::from("Invalid status line")))?;
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((n, v)) = line.split_once(':') {
+            headers.push((String::from(n.trim()), String::from(v.trim())));
+        }
+    }
+    Ok((status, headers))
+}
+
+/// Send one request and read the whole response.
+///
+/// Speaks HTTP/1.0 with `Connection: close`, like the rest of this crate, so a
+/// server never answers chunked and "the body ends where the connection does".
+/// `HEAD` returns after the headers. A non-2xx status is **not** an error.
+///
+/// **Certificate verification is disabled** (see `lib.rs`): anything sent here,
+/// credentials included, is readable and alterable by whoever sits on the path.
+pub fn http_request(
+    method: &str,
+    url: &str,
+    headers: &HttpHeaders,
+    body: RequestBody,
+    max_size: usize,
+) -> Result<HttpResponse, Error> {
+    let parsed = parse_url(url).ok_or_else(|| Error::HttpError(String::from("Invalid URL")))?;
+    let host_header = if (parsed.is_https && parsed.port == 443) || (!parsed.is_https && parsed.port == 80) {
+        String::from(parsed.host)
+    } else {
+        format!("{}:{}", parsed.host, parsed.port)
+    };
+    let length = match &body {
+        RequestBody::Empty => None,
+        RequestBody::Bytes(b) => Some(b.len() as u64),
+        RequestBody::Fd { len, .. } => Some(*len),
+    };
+    let head = format!(
+        "{} {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: libakuma-tls/1.0\r\n{}{}Connection: close\r\n\r\n",
+        method,
+        parsed.path,
+        host_header,
+        headers.format(),
+        match length {
+            Some(n) => format!("Content-Length: {}\r\n", n),
+            None => String::new(),
+        },
+    );
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+
+    let mut stream = tcp_connect(&parsed)?;
+    let raw = if parsed.is_https {
+        let transport = TcpTransport::new(stream);
+        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut tls = TlsStream::connect(transport, parsed.host, &mut read_buf, &mut write_buf)?;
+        let raw = exchange(&mut tls, &head, body, is_head, max_size, 0)?;
+        let _ = tls.close();
+        raw
+    } else {
+        exchange(&mut stream, &head, body, is_head, max_size, TCP_ERROR_BUDGET)?
+    };
+
+    let end = find_headers_end(&raw)
+        .ok_or_else(|| Error::HttpError(String::from("Invalid HTTP response")))?;
+    let head_str = core::str::from_utf8(&raw[..end - 4])
+        .map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
+    let (status, headers) = parse_response_head(head_str)?;
+    Ok(HttpResponse { status, headers, body: raw[end..].to_vec() })
+}
+
+/// Write the request, then read the response off the same transport.
+fn exchange(
+    s: &mut dyn HttpIo,
+    head: &str,
+    body: RequestBody,
+    is_head: bool,
+    max_size: usize,
+    error_budget: u32,
+) -> Result<Vec<u8>, Error> {
+    s.io_write_all(head.as_bytes())?;
+    match body {
+        RequestBody::Empty => {}
+        RequestBody::Bytes(b) => {
+            for chunk in b.chunks(16384) {
+                s.io_write_all(chunk)?;
+            }
+        }
+        RequestBody::Fd { fd, len } => {
+            let mut buf = alloc::vec![0u8; 16384];
+            let mut left = len;
+            while left > 0 {
+                let want = left.min(buf.len() as u64) as usize;
+                let n = libakuma::read_fd(fd, &mut buf[..want]);
+                if n <= 0 {
+                    return Err(Error::HttpError(String::from("upload source is shorter than its length")));
+                }
+                s.io_write_all(&buf[..n as usize])?;
+                left -= n as u64;
+            }
+        }
+    }
+    if is_head {
+        // A HEAD response carries a Content-Length and no body; reading "until
+        // the length arrives" would wait for bytes that never come.
+        let mut hdr = Vec::new();
+        read_until_headers(s, &mut hdr)?;
+        return Ok(hdr);
+    }
+    read_response(s, max_size, error_budget)
+}
+
+// ============================================================================
 // In-memory fetch API
 // ============================================================================
 
