@@ -2,10 +2,10 @@
 //!
 //! # Layout — measured, one machine
 //!
-//! Lenovo IdeaPad 5 2-in-1 16AHP9. The offsets are relative to the start of the
-//! `ERAM` region the DSDT declares (`0xFEEC2380` there), and were checked on
-//! 2026-10-07 by reading the window from Linux through `/dev/mem` next to
-//! `BAT0`'s uevent, on AC and on battery (`overlays/ryzen/ec-sample.sh`,
+//! Lenovo IdeaPad 5 2-in-1 16AHP9. The offsets below are relative to the
+//! **battery block**, and were checked on 2026-10-07 by reading the window
+//! from Linux through `/dev/mem` next to `BAT0`'s uevent, on AC and on
+//! battery (`overlays/ryzen/ec-sample.sh`,
 //! `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md` §5.8): voltage, remaining,
 //! full, design and RSOC matched exactly, and `current × voltage / 1000`
 //! equalled `POWER_NOW` to the milliwatt.
@@ -29,6 +29,20 @@
 //! for full and for no battery are open (`docs/archive/AKUMA_ACPI_POWER.md`
 //! §Open). Anything else decodes as [`State::Unknown`] carrying the raw code,
 //! never a guess.
+
+/// Where the battery block sits inside the window the DSDT names.
+///
+/// The live table on the ryzen (read 2026-10-15, from Pop, out of
+/// `/sys/firmware/acpi/tables/DSDT`) declares
+/// `OperationRegion (ERAM, SystemMemory, 0xFEEC2300, 0xFF)` — the **whole**
+/// EC mirror — and the fields this module decodes begin `0x80` into it: the
+/// same bytes `/dev/mem` reads at `0xFEEC2380` in §5.8 of the ryzen doc. The
+/// first metal boot that trusted the region base alone (2026-10-15, entry 19's
+/// first attempt) mapped the window 0x80 low and decoded the wrong bytes; a
+/// consumer that has an `ERAM` base from [`crate::aml::find_region`] adds this
+/// before mapping. An `ecram=0x…` command-line override names the **battery
+/// block** directly and must not add it.
+pub const BATTERY_BLOCK_AT: u64 = 0x80;
 
 /// Bytes of the window this reads.
 pub const BLOCK_LEN: usize = 0x14;

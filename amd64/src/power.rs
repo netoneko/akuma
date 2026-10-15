@@ -62,7 +62,7 @@ pub fn init(machine: &MachineDescription, cmdline: &str) {
     let mode = if cmdline.split_ascii_whitespace().any(|t| t == "powersim") {
         serial::puts("  [power] source=sim\n");
         MODE_SIM
-    } else if let Some(pa) = ecram_override(cmdline).or_else(|| find_window(machine)) {
+    } else if let Some(pa) = ecram_override(cmdline).or_else(|| find_window(machine).map(|base| base + akuma_power::ec::BATTERY_BLOCK_AT)) {
         if map_window(pa) {
             serial::puts("  [power] source=ec window=0x");
             serial::put_hex(pa);
