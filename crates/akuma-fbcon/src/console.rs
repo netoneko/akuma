@@ -277,6 +277,12 @@ pub struct Console<S: Surface> {
     /// A zero-width joiner was just seen: the emoji after it joins the previous one
     /// and is not drawn.
     swallow: bool,
+    /// Global brightness, percent 1..=100 (100 = full). The power daemon's
+    /// lever: [`Console::resolve`] scales every painted cell by it, so the
+    /// whole screen — already-printed text included, once [`Console::repaint`]
+    /// redraws the grid — loses brightness while the grid's contents and every
+    /// cell's relative contrast stay exactly as they were.
+    dim_pct: u8,
 }
 
 impl<S: Surface> Console<S> {
@@ -354,6 +360,7 @@ impl<S: Surface> Console<S> {
             last_cell: None,
             last_emoji: false,
             swallow: false,
+            dim_pct: 100,
         })
     }
 
@@ -1392,6 +1399,20 @@ impl<S: Surface> Console<S> {
     // Drawing
     // -----------------------------------------------------------------------
 
+    /// Set the global dim factor, clamped to 1..=100 percent. Only cells
+    /// painted afterwards are affected — a caller that wants the screen to
+    /// follow immediately calls [`Console::repaint`] (which is exactly what
+    /// the amd64 kernel's `multiboot2::fb_set_dim` does).
+    pub fn set_dim_pct(&mut self, pct: u8) {
+        self.dim_pct = pct.clamp(1, 100);
+    }
+
+    /// The dim factor in force.
+    #[must_use]
+    pub fn dim_pct(&self) -> u8 {
+        self.dim_pct
+    }
+
     /// The colours a cell is drawn in: its own where it sets them, the console's
     /// defaults otherwise, then bold, dim and reverse applied.
     fn resolve(&self, cell: Cell) -> (Rgb, Rgb) {
@@ -1409,6 +1430,15 @@ impl<S: Surface> Console<S> {
         if cell.flags & F_DIM != 0 {
             fg = bg.blend(fg, 140);
         }
+        // The global dim factor goes **last**, so it dims the result of every
+        // attribute above: bold, the per-cell `F_DIM` and reverse keep their
+        // relative contrast, the screen as a whole just loses brightness. Both
+        // colours — a light theme's background must dim with its text.
+        let (fg, bg) = if self.dim_pct < 100 {
+            (fg.scaled_pct(self.dim_pct), bg.scaled_pct(self.dim_pct))
+        } else {
+            (fg, bg)
+        };
         if cell.flags & F_REVERSE != 0 { (bg, fg) } else { (fg, bg) }
     }
 

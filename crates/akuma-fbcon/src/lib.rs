@@ -125,6 +125,26 @@ impl Rgb {
         Self::new(r as u8, g as u8, b as u8)
     }
 
+    /// `self` scaled toward black, keeping `pct` percent of each channel
+    /// (100 = unchanged, 1 = nearly black).
+    ///
+    /// The power daemon's lever (`/dev/power`'s `dim=`): a global brightness
+    /// the console applies to every cell it paints, so the screen dims as a
+    /// whole without the grid's contents — or any cell's relative contrast —
+    /// changing. Truncating here is right where rounding was right for
+    /// [`Rgb::blend`]: a dim factor is not trying to hit an exact ink colour,
+    /// and 100 (the only value anyone can see the difference at the edges
+    /// for) divides exactly.
+    #[must_use]
+    pub const fn scaled_pct(self, pct: u8) -> Self {
+        let f = pct as u32;
+        Self {
+            r: (self.r as u32 * f / 100) as u8,
+            g: (self.g as u32 * f / 100) as u8,
+            b: (self.b as u32 * f / 100) as u8,
+        }
+    }
+
     /// `self` mixed toward `fg`, where `coverage` 0 is all `self` and 255 all
     /// `fg`.
     ///
@@ -175,6 +195,40 @@ pub trait Surface {
             for dx in 0..w {
                 self.put(x + dx, y + dy, color);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dim_tests {
+    use super::Rgb;
+
+    #[test]
+    fn full_factor_is_identity() {
+        let c = Rgb::new(0xC8, 0x10, 0xEE);
+        assert_eq!(c.scaled_pct(100), c);
+    }
+
+    #[test]
+    fn half_factor_halves_every_channel() {
+        assert_eq!(Rgb::new(200, 10, 255).scaled_pct(50), Rgb::new(100, 5, 127));
+    }
+
+    #[test]
+    fn black_stays_black_and_low_factors_stay_visible() {
+        assert_eq!(Rgb::BLACK.scaled_pct(1), Rgb::BLACK);
+        assert_eq!(Rgb::WHITE.scaled_pct(1), Rgb::new(2, 2, 2));
+        assert_eq!(Rgb::TEXT.scaled_pct(10), Rgb::new(20, 20, 21));
+    }
+
+    #[test]
+    fn factors_monotonically_dim() {
+        let c = Rgb::TEXT;
+        let mut prev = c;
+        for pct in [100u8, 70, 40, 15, 5, 1] {
+            let d = c.scaled_pct(pct);
+            assert!(d.r <= prev.r && d.g <= prev.g && d.b <= prev.b);
+            prev = d;
         }
     }
 }

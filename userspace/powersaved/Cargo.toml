@@ -1,0 +1,23 @@
+[package]
+name = "powersaved"
+version = "0.1.0"
+edition = "2024"
+
+# `powersaved` — the power-saving daemon. Reads `/proc/power` once a second
+# and drives the console dim factor through `/dev/power`: an idle keyboard
+# steps the screen down, a keystroke brings it straight back. Replaces the
+# would-be shell loop on purpose — dedicated binaries, not scripts (see
+# docs/reference/userspace-layout.md, "Binaries, not scripts").
+#
+# `--no-default-features` drops libakuma so `cargo test --lib` links against a
+# std host (same arrangement as herd/sshd/klogd).
+[features]
+default = ["akuma"]
+akuma = ["dep:libakuma"]
+
+[[bin]]
+name = "powersaved"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma", optional = true }

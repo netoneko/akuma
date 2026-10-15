@@ -81,6 +81,8 @@ HERD=""
 HGET=""
 WALL=""
 BOX=""
+KLOGD=""
+POWERSAVED=""
 # `box` — the OCI/container CLI (`register_box`/`spawn_ext` from userspace),
 # added once `sc-containers` and the `spawn_ext`/box syscall arms existed on
 # this target (`docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`). It builds for
@@ -88,7 +90,7 @@ BOX=""
 # dependencies (`libakuma`, `libakuma-tls`, `akuma-tar`, `picojson`) was
 # already ported by the five programs above it, `hget` in particular already
 # proving the in-process TLS `box pull` needs.
-for prog in paws httpd herd hget wall box wifi; do
+for prog in paws httpd herd hget wall box wifi klogd powersaved; do
     if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
         found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
         [ "$prog" = paws ] && PAWS="$found"
@@ -98,6 +100,8 @@ for prog in paws httpd herd hget wall box wifi; do
         [ "$prog" = wall ] && WALL="$found"
         [ "$prog" = box ] && BOX="$found"
         [ "$prog" = wifi ] && WIFI="$found"
+        [ "$prog" = klogd ] && KLOGD="$found"
+        [ "$prog" = powersaved ] && POWERSAVED="$found"
     fi
 done
 
@@ -236,6 +240,11 @@ done
 # (proposals/AKUMA_WIFI_CONTROL.md). Its herd service is staged `available`,
 # not enabled: a box with no wifi backend has no /dev/wifi0 to manage.
 [ -n "$WIFI" ] && "$DEBUGFS" -w -R "write $WIFI bin/wifi" "$IMG" >/dev/null 2>&1
+# `klogd` + `powersaved`: the resident daemons as binaries, not shell loops
+# (the layout doc's "Binaries, not scripts"). Neither is enabled here: they
+# belong to the ryzen image's service set, which overlays/ryzen stages.
+[ -n "$KLOGD" ] && "$DEBUGFS" -w -R "write $KLOGD bin/klogd" "$IMG" >/dev/null 2>&1
+[ -n "$POWERSAVED" ] && "$DEBUGFS" -w -R "write $POWERSAVED bin/powersaved" "$IMG" >/dev/null 2>&1
 # `ruststd`: the Rust std probe. Run it with `INIT=/bin/ruststd`.
 [ -n "$RUSTSTD" ] && "$DEBUGFS" -w -R "write $RUSTSTD bin/ruststd" "$IMG" >/dev/null 2>&1
 
@@ -746,4 +755,4 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # rather than inventing a different convention.
 "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
 
-echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -n "$BOX" ] && echo ", /bin/box")$([ -n "$WIFI" ] && echo ", /bin/wifi")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"
+echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -n "$BOX" ] && echo ", /bin/box")$([ -n "$WIFI" ] && echo ", /bin/wifi")$([ -n "$KLOGD" ] && echo ", /bin/klogd")$([ -n "$POWERSAVED" ] && echo ", /bin/powersaved")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"

@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aml;
+pub mod ctl;
 pub mod ec;
 pub mod ledger;
 pub mod render;

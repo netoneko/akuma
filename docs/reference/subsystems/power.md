@@ -58,6 +58,99 @@ Two invariants, both stated where they are enforced (`amd64/src/lapic.rs`):
 phases and the QEMU smoke evidence are in
 [`../../../proposals/RYZEN_POWERSAVE_DEMON.md`](../../../proposals/RYZEN_POWERSAVE_DEMON.md).
 
+## The power-saving daemon (`powersaved`)
+
+A dedicated userspace binary (`userspace/powersaved/`, herd-supervised — the
+"binaries, not scripts" rule of
+[`../../userspace-layout.md`](../userspace-layout.md)) that closes the loop
+between the meter and a lever:
+
+- **Input**: `/proc/power` once a second — its `idle_ms=` fact (console-input
+  inactivity; `amd64/src/input.rs` records the last keystroke across the
+  i8042, USB HID and serial) and, on a metered machine, `power_mw=`. The
+  daemon's 1 Hz read is also what keeps the energy ledger integrating.
+- **Policy**: a staircase of idle thresholds and brightness steps, pure code
+  in the `--lib` half, host-tested (`cargo test -p powersaved --lib
+  --no-default-features`). Defaults: 60 s → 60 %, 180 s → 30 %, 600 s → 10 %;
+  anything below the first step is 100 %. argv tunes it (`stage=ms:pct`,
+  repeatable; `after_ms=` moves the first step); a malformed argv exits
+  rather than silently dimming on defaults.
+- **Effect**: only on a *change*, one `dim=<pct>` line to `/dev/power` — the
+  kernel's control device (`amd64/src/power.rs`'s `dev_read`/`dev_write`,
+  misc 10:243, the `wifi0` shape). The kernel clamps, applies the factor to
+  the framebuffer console (`multiboot2::fb_set_dim` → `akuma-fbcon`'s global
+  dim + `repaint()`), and reports it back as `dim=` in both files.
+- **Restore**: a keystroke resets `idle_ms` in the kernel; the next
+  observation asks for 100 % and one write puts the light back. The daemon
+  re-reads `/dev/power`'s `dim=` at start, so a restart mid-dim continues the
+  staircase instead of double-stepping.
+
+The dim is the console's colour scaling: it lowers what the pixels emit but
+does not touch the panel's backlight — that lever (EC/backlight register,
+P3 in the demon proposal) gets its own `/dev/power` command when the kernel
+has the register map. `dim=0` is refused (`EINVAL`) for exactly that reason:
+software scaling cannot truly blank a panel, and pretending otherwise would
+promise a watt the pixels do not deliver.
+
+### The decision map
+
+```
+                POWER-SAVING DECISIONS (amd64, the ryzen laptop)
+
+  boot cmdline                          idle core, every lap
+  ------------                          --------------------
+  idlesleep[=N]  idlemwait              x86_yield() found work? --yes--> run it
+      |  (off by default)               |no; quiet laps++
+      v                                 v
+  idle policy on:                  budget = WakeBudget(quiet laps) <= 100 ticks
+  one long shot may replace             |     (no budget unless idlesleep)
+  a run of 10 ms ticks                  v
+                                  arm_deadline (exact, always)
+                                  + arm_idle_shot(budget)
+                                        v
+                                  sti; hlt|mwait; cli
+                                        |
+                     +------------------+------------------+
+                     | timer fires                      | device IRQ first
+                     v                                  v
+               on_tick: credit armed-1          settle_idle_shot:
+               (the clock never                 credit min(elapsed, armed-1),
+                loses a tick)                   pet the watchdog
+                     |                                  |
+                     +------------------+------------------+
+                                        v
+             [IDLESTAT] halts= shots= shot_ticks_credited=     (every 30 s)
+
+             known gap (P1): an allow_tick halt arms no budget yet --
+             on a nosmp boot the BSP lives there, so the budget never
+             engages; arm it from allow_tick (P1, first item)
+
+  keystroke (i8042 / USB HID / serial)
+        |  input::getb / has_byte
+        v
+  LAST_INPUT_US = now  ----->  /proc/power  idle_ms=<ms>
+                                     (plus source/ac/battery/percent/
+                                      power_mw=/energy_mwh=/dim=)
+                                     | read at 1 Hz by powersaved
+                                     | (this read integrates the ledger)
+                                     v
+                          powersaved::step  (pure, host-tested)
+                            idle <   60 s -> 100   (restore: one write)
+                            idle >=  60 s -> 60
+                            idle >= 180 s -> 30
+                            idle >= 600 s -> 10
+                                     | write only on change
+                                     v
+                          /dev/power   dim=<pct>
+                            (parse all lines, then apply; dim=0 is EINVAL
+                             -- software dim cannot truly blank, P3 lever)
+                                     v
+                          multiboot2::fb_set_dim
+                                     v
+                          fbcon: dim_pct + repaint() -> the glass
+```
+
+
 **Known gap (measured on metal, 2026-10-15):** on a `nosmp` boot the idle
 loop's 30 s block never runs in 11 minutes of a real workload (herd + sshd +
 wifi, `[IDLESTAT]` absent from the whole `boot-118` dmesg) — every parker

@@ -97,3 +97,22 @@ pub fn render(
     let _ = writeln!(w);
     w.pos
 }
+
+/// Append the kernel's own power facts to a `/proc/power` buffer.
+///
+/// They follow [`render`]'s battery lines: `idle_ms=` (console input
+/// inactivity, `amd64/src/input.rs`) and `dim=` (the global console dim factor
+/// the power daemon drives through `/dev/power`).
+///
+/// These are facts about the *machine*, not the battery, which is why they are
+/// a second function the glue appends rather than parameters threading through
+/// [`render`]: a source with no EC still has an idle keyboard and a dim level.
+/// Always both lines, never absent — "the daemon has not dimmed" (`dim=100`)
+/// must be distinguishable from "a kernel too old to say" (no line), the same
+/// reading rule `source=none` established.
+pub fn render_kernel_facts(out: &mut [u8], idle_ms: u64, dim_pct: u8) -> usize {
+    let mut w = Buf { buf: out, pos: 0 };
+    let _ = writeln!(w, "idle_ms={idle_ms}");
+    let _ = writeln!(w, "dim={dim_pct}");
+    w.pos
+}

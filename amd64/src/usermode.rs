@@ -2871,6 +2871,12 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         return crate::wifi::write(buf, len as usize);
     }
 
+    // `/dev/power`: `dim=<percent>` lines for the power daemon's lever
+    // (`crate::power`). Parsed whole before any line applies.
+    if crate::fd::is_dev_power(fd) {
+        return crate::power::dev_write(buf, len as usize);
+    }
+
     // See the header: first, and by both spellings — **unless this process's
     // stdout belongs to a channel of its own**, which is what an `ssh` session's
     // child has had since its stdio stopped being pipes (2026-09-11). Its fd 1

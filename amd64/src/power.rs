@@ -1,9 +1,12 @@
-//! `/proc/power`: battery and AC state (`docs/archive/AKUMA_ACPI_POWER.md`).
+//! `/proc/power`: battery and AC state (`docs/archive/AKUMA_ACPI_POWER.md`),
+//! plus the machine facts and the dim factor the power daemon drives through
+//! `/dev/power` (the `powersaved` control device).
 //!
 //! The pure parts — finding the EC's memory window in AML, decoding it,
-//! rendering the text — are `akuma-power`, host-tested. This file is only what
-//! cannot move: reading the ACPI tables through the physmap, mapping the window
-//! uncached, and the volatile byte reads.
+//! rendering the text, decoding `/dev/power`'s command lines — are
+//! `akuma-power`, host-tested. This file is only what cannot move: reading the
+//! ACPI tables through the physmap, mapping the window uncached, the volatile
+//! byte reads, and the dim state itself.
 //!
 //! # Sources
 //!
@@ -22,6 +25,7 @@
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use akuma_power::aml::{self, MAX_DECL_LEN};
+use akuma_power::ctl::{parse, Ctl, Parsed};
 use akuma_power::ec::{BLOCK_LEN, Reading};
 use akuma_power::ledger::Ledger;
 use akuma_power::render::{self, Source};
@@ -169,9 +173,101 @@ fn energy_mwh(raw: &[u8; BLOCK_LEN]) -> u64 {
     LEDGER.lock().sample(r.power_mw(), crate::net::uptime_us())
 }
 
-/// The `/proc/power` renderer.
+// ---------------------------------------------------------------------------
+// The dim factor, and `/dev/power` — the power daemon's control device.
+//
+// `powersaved` (userspace) owns the *policy* — how long an idle keyboard
+// precedes which dim level, `/proc/power` being its only input. This side owns
+// only the *effect*: one recorded percentage, applied to the framebuffer
+// console (`multiboot2::fb_set_dim`) and reported back through both files. A
+// machine with no console records the number all the same, so the facts stay
+// honest where there is nothing to dim.
+// ---------------------------------------------------------------------------
+
+/// The global dim factor, percent 1..=100. 100 is a boot that has not been
+/// dimmed — the value every reader must see before the daemon's first step.
+static DIM_PCT: AtomicU8 = AtomicU8::new(100);
+
+/// The dim factor in force.
+#[must_use]
+pub fn dim_pct() -> u8 {
+    DIM_PCT.load(Ordering::Acquire)
+}
+
+/// Record and apply a dim factor. The clamp already happened in
+/// `akuma_power::ctl::parse`; this asserts the same invariant on the kernel
+/// side because a second caller will eventually exist and the two must not
+/// drift.
+pub fn set_dim_pct(pct: u8) {
+    let pct = pct.clamp(1, 100);
+    DIM_PCT.store(pct, Ordering::Release);
+    crate::multiboot2::fb_set_dim(pct);
+}
+
+/// Longest `/dev/power` snapshot; the facts are two short lines.
+const DEV_SNAPSHOT_MAX: usize = 64;
+
+/// `read(fd)` on a `/dev/power` descriptor: the same facts `/proc/power`
+/// appends — `idle_ms=` and `dim=` — regenerated fresh per read. There is no
+/// cursor state: the snapshot is two lines, a reader wanting all of it passes
+/// a buffer of [`DEV_SNAPSHOT_MAX`], and a short read truncates rather than
+/// paging the rest out on the next call. A control device a daemon polls once
+/// a second does not want the per-descriptor cursor machinery `wifi`'s
+/// multi-line status needs.
+pub fn dev_read(buf: u64, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let mut snap = [0u8; DEV_SNAPSHOT_MAX];
+    let n = render::render_kernel_facts(&mut snap, crate::input::idle_ms(), dim_pct());
+    let n = n.min(len);
+    if !crate::uaccess::write_bytes(buf, &snap[..n]) {
+        return crate::fd::errno::EFAULT;
+    }
+    n as u64
+}
+
+/// `write(fd)` on a `/dev/power` descriptor: `dim=<percent>` lines. All lines
+/// are parsed before any is applied (`wifi`'s rule), so a batch with one bad
+/// line changes nothing.
+pub fn dev_write(buf: u64, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    // The daemon writes one short line per decision; 256 bytes is slack for a
+    // batched write and bounds what a hostile writer can make us stage.
+    if len > 256 {
+        return crate::fd::errno::EINVAL;
+    }
+    let mut text = [0u8; 256];
+    if !crate::uaccess::read_bytes(buf, &mut text[..len]) {
+        return crate::fd::errno::EFAULT;
+    }
+    let text = &text[..len];
+    let mut applied = false;
+    for line in text.split(|&c| c == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
+        match parse(line) {
+            Parsed::Ok(Ctl::Dim(pct)) => {
+                set_dim_pct(pct);
+                applied = true;
+            }
+            Parsed::Invalid => return crate::fd::errno::EINVAL,
+        }
+    }
+    if applied {
+        len as u64
+    } else {
+        0
+    }
+}
+
+/// The `/proc/power` renderer: the battery render (or its `source=none`
+/// placeholder), then the kernel's own facts — `idle_ms=` and `dim=` — which
+/// every machine answers, EC or not. The daemon's once-a-second read is also
+/// what keeps the ledger integrating; an unread file costs nothing, and the
+/// daemon is the reader that wants the resolution.
 pub fn render_proc(out: &mut [u8]) -> usize {
-    match MODE.load(Ordering::Acquire) {
+    let n = match MODE.load(Ordering::Acquire) {
         MODE_EC => {
             let raw = read_window();
             render::render(out, Source::Ec, Some(&raw), Some(energy_mwh(&raw)))
@@ -182,5 +278,6 @@ pub fn render_proc(out: &mut [u8]) -> usize {
             render::render(out, Source::Sim, Some(&raw), Some(energy_mwh(&raw)))
         }
         _ => render::render(out, Source::None, None, None),
-    }
+    };
+    n + render::render_kernel_facts(&mut out[n..], crate::input::idle_ms(), dim_pct())
 }

@@ -320,6 +320,21 @@ pub fn blob_entry(digest: &str) -> String {
     format!("blobs/sha256/{}", digest.strip_prefix("sha256:").unwrap_or(digest))
 }
 
+/// The name Docker's containerd store files an image under: a reference with
+/// no registry gets `docker.io/` (and `library/` when it is a single component).
+/// `docker load` keeps `io.containerd.image.name` verbatim, so a bare `app:1`
+/// becomes a record no `docker run app:1` lookup — which normalises to
+/// `docker.io/library/app:1` — can find (verified against Docker 29.1.2).
+pub fn qualified_reference(reference: &str) -> String {
+    match reference.split_once('/') {
+        None => format!("docker.io/library/{reference}"),
+        Some((first, _)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            String::from(reference)
+        }
+        Some(_) => format!("docker.io/{reference}"),
+    }
+}
+
 /// The OCI layout's `index.json` for one image. `reference` is the full
 /// `repo:tag`; the annotations are how Docker and containerd learn the name.
 pub fn index_json(manifest_digest: &str, manifest_size: u64, reference: &str) -> String {
@@ -327,7 +342,7 @@ pub fn index_json(manifest_digest: &str, manifest_size: u64, reference: &str) ->
     format!(
         "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{{\"mediaType\":\"{MEDIA_MANIFEST}\",\"digest\":{},\"size\":{manifest_size},\"annotations\":{{\"io.containerd.image.name\":{},\"org.opencontainers.image.ref.name\":{}}}}}]}}",
         q(manifest_digest),
-        q(reference),
+        q(&qualified_reference(reference)),
         q(tag)
     )
 }
@@ -365,6 +380,21 @@ pub fn rfc3339(epoch: u64) -> String {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn qualified_reference_matches_dockers_normalisation() {
+        assert_eq!(qualified_reference("app:1"), "docker.io/library/app:1");
+        assert_eq!(qualified_reference("me/app:1"), "docker.io/me/app:1");
+        assert_eq!(qualified_reference("ghcr.io/me/app:1"), "ghcr.io/me/app:1");
+        assert_eq!(qualified_reference("localhost:5000/app:1"), "localhost:5000/app:1");
+    }
+
+    #[test]
+    fn index_json_names_the_image_by_its_qualified_reference() {
+        let j = index_json("sha256:ab", 7, "app:1");
+        assert!(j.contains("\"io.containerd.image.name\":\"docker.io/library/app:1\""));
+        assert!(j.contains("\"org.opencontainers.image.ref.name\":\"1\""));
+    }
 
     fn sample() -> ImageConfig {
         let mut c = ImageConfig::scratch();

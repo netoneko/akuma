@@ -574,10 +574,31 @@ fn open_wifi(flags: u32) -> u64 {
     u64::from(fd)
 }
 
+/// `open("/dev/power")`: a `DevPower` descriptor. Always there — the kernel
+/// facts (`idle_ms=`, `dim=`) exist on a machine with no battery and no
+/// framebuffer, and refusing the open would make the daemon's probe look like
+/// a kernel too old to answer.
+fn open_power(flags: u32) -> u64 {
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return errno::ESRCH;
+    };
+    let fd = proc.alloc_fd(FileDescriptor::DevPower);
+    if flags & open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    u64::from(fd)
+}
+
 /// Is `fd` a `/dev/wifi0` descriptor?
 #[must_use]
 pub fn is_dev_wifi(fd: u64) -> bool {
     table_with(fd, |d| matches!(d, FileDescriptor::DevWifi)).unwrap_or(false)
+}
+
+/// Is `fd` a `/dev/power` descriptor?
+#[must_use]
+pub fn is_dev_power(fd: u64) -> bool {
+    table_with(fd, |d| matches!(d, FileDescriptor::DevPower)).unwrap_or(false)
 }
 
 /// Is `fd` a `/dev/fb0` descriptor?
@@ -792,6 +813,12 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     // `/dev/wifi0`, likewise this kernel's own: `crate::wifi` serves it.
     if resolved == "/dev/wifi0" {
         return open_wifi(flags);
+    }
+
+    // `/dev/power`: the power daemon's control device (`crate::power`), on
+    // every machine — a box with no EC and no screen still has idle facts.
+    if resolved == "/dev/power" {
+        return open_power(flags);
     }
 
     // A **block** node is refused rather than served — see the header. A
@@ -1072,6 +1099,10 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             return errno::ESRCH;
         };
         return crate::wifi::read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
+    }
+    // `/dev/power`: the kernel's idle/dim facts, fresh per read.
+    if is_dev_power(fd) {
+        return crate::power::dev_read(buf, len.min(MAX_IO) as usize);
     }
     #[cfg(feature = "linux-file-io")]
     if len > MAX_IO && is_regular_file(fd) {
@@ -1672,6 +1703,20 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
             st_mode: 0o020_600,
             st_nlink: 1,
             st_rdev: (10 << 8) | 242,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
+    }
+    // `/dev/power`: a misc character device (10, 243), root-only — the next
+    // free misc minor beside wifi0's.
+    if is_dev_power(fd) {
+        let g = akuma_syscalls_linux::Stat {
+            st_ino: 20,
+            st_mode: 0o020_600,
+            st_nlink: 1,
+            st_rdev: (10 << 8) | 243,
             st_blksize: 4096,
             ..Default::default()
         };

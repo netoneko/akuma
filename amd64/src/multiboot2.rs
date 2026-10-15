@@ -412,6 +412,23 @@ pub fn fb_unmute_and_repaint() {
     }
 }
 
+/// Apply the power daemon's dim factor to the console and repaint the glass
+/// from the grid — the repaint is what makes already-printed text follow.
+///
+/// A no-op with no console (headless, the PVH rigs): the factor is recorded by
+/// the caller (`power::set_dim_pct`) either way, so `/proc/power`'s `dim=`
+/// stays honest on a machine with nothing to dim. Blocking `lock`, like
+/// [`fb_unmute_and_repaint`] — a daemon's once-per-step call, never an
+/// interrupt path.
+pub fn fb_set_dim(pct: u8) {
+    let mut g = CONSOLE.lock();
+    if let Some(c) = g.as_mut() {
+        c.0.set_dim_pct(pct);
+        c.0.repaint();
+        c.0.surface_mut().flush();
+    }
+}
+
 /// The crash path's unmute: no lock, no repaint — the fatal dump that follows
 /// draws over whatever the program left, which is the point.
 pub fn fb_force_unmute() {

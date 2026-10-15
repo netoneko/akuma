@@ -118,6 +118,30 @@ fn render_truncates_instead_of_panicking() {
 }
 
 #[test]
+fn kernel_facts_append_after_the_battery_render() {
+    let mut out = [0u8; 512];
+    let n = render(&mut out, Source::Ec, Some(&measured()), Some(77));
+    let m = crate::render::render_kernel_facts(&mut out[n..], 61_234, 40);
+    let s = core::str::from_utf8(&out[..n + m]).unwrap();
+    assert!(s.contains("idle_ms=61234\n"), "{s}");
+    assert!(s.contains("dim=40\n"), "{s}");
+    // The facts ride along on a source with no battery, too — a desktop has an
+    // idle keyboard and a dim level even with `source=none`.
+    let n = render(&mut out, Source::None, None, None);
+    let m = crate::render::render_kernel_facts(&mut out[n..], 0, 100);
+    assert_eq!(&out[n..n + m], b"idle_ms=0\ndim=100\n");
+}
+
+#[test]
+fn kernel_facts_into_no_room_write_nothing() {
+    // A buffer with nothing left after the battery render: the facts write
+    // zero bytes rather than panic, and the file stays valid — truncated,
+    // which is the renderer's contract everywhere else too.
+    let mut out = [0u8; 0];
+    assert_eq!(crate::render::render_kernel_facts(&mut out[..], 5, 100), 0);
+}
+
+#[test]
 fn sim_cycles_and_decodes() {
     for t in 0..240 {
         let r = Reading::decode(&sim::block(t));

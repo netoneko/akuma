@@ -10,12 +10,30 @@ and libraries, built by [`userspace/build.sh`](../../userspace/build.sh) via
 binaries see [`../userspace/`](../userspace/) (covers the ones with dedicated
 pages — not every member has one).
 
+### Binaries, not scripts
+
+New resident services are **dedicated binaries in `userspace/`, supervised by
+herd** — not shell scripts. This is a design choice, made twice on purpose:
+`klogd` replaced `etc/ryzen/klog.sh` (a busybox loop that cost three process
+spawns every 5 s on a box whose characteristic bug was "a spawn went
+missing"), and `powersaved` was born a binary rather than growing out of one.
+A script that "just" loops accumulates parsing, quoting and restart semantics
+that only work by luck, cannot be host-tested, and rot in an overlay
+directory nobody treats as code. A binary gets the house split for free:
+pure policy in a `--lib` half with host tests, effects in a thin `main`,
+config as argv, and one file on `/bin` that herd restarts by the same rules
+as every other service. The `.sh` files still living under
+`overlays/*/rootfs/etc/` predate the rule and are the migration backlog, not
+the pattern to copy.
+
 | Member | Purpose |
 |---|---|
 | `libakuma` | Core Rust syscall wrapper library — foundation for all native userspace binaries |
 | `libakuma-tls` | TLS 1.3 client connections for userspace programs |
 | `apk-tools` | Alpine apk bootstrap tooling (no binary — build.rs deploys bootstrap assets directly) |
 | `herd` | Process supervisor — background services, auto-restart, config in `/etc/herd/` |
+| `klogd` | Kernel-log daemon (amd64/ryzen): the `syslog(2)` ring to `/var/log/ryzen/klog-N.{dmesg,all}` every 2 s, atomic-rename so a hang leaves the last complete copy. Replaced the `klog.sh` busybox loop — the first of the "binaries, not scripts" conversions |
+| `powersaved` | Power-saving daemon (amd64): `/proc/power`'s `idle_ms=` once a second, the idle-dim staircase written to `/dev/power` as `dim=<pct>`; a keystroke restores 100 %. Pure policy host-tested in the `--lib` half. [`../../userspace/powersaved/README.md`](../../userspace/powersaved/README.md) |
 | `wifi` | Wifi manager (amd64): known networks in `/etc/wifi/<network>`, the kernel's `/dev/wifi0`, `wifi auto` as a herd service. No supplicant — the kernel does WPA2. [`../userspace/wifi.md`](../userspace/wifi.md) |
 | `box` | Container manager: `box run` (Docker images on an overlay root), `box pull`, `box build` (Dockerfiles; `commit`/`save`/`tag`/`rmi`), `box open/close/ps/inspect` |
 | `meow` | AI coding assistant — LLM chat client with filesystem/network tool calling |
