@@ -91,6 +91,19 @@ script, cross-checked once per stage against `turbostat` under Pop.
 | P2 | **WiFi power.** The card already enters idle power-save under Linux between traffic; Akuma's station keeps it hot after `wifijoin`. PS between bursts (the PS-Poll template is already in the join segments), or a real `wifi down` that powers the card off (`shutdown_for_reset` exists). The one open hazard is documented: after idle power-save the chip refuses a second firmware download in one boot (`FWDL_SECURITY_FAIL`, §5.6) | `power_mw` during idle-with-wifi drops measurably; a reconnect still works | 2–4 |
 | P3 | **The EC's other registers.** Brightness, lid, thermal — the same `OperationRegion` approach that cracked the battery, against the DSDT already dumped on p3 (`/root/acpi/asl/`). Lid → dim or blank is a laptop's cheapest watt | `/proc/power` grows lid/brightness facts; rio's panel config can dim | 2–4 |
 | P4 | **The demon itself.** A thin `herd` service that reads `/proc/power` + `[IDLESTAT]` and applies tunables — policy staying in `kacho`-shaped pure code, the service only carrying effects. Only worth building once there are ≥2 knobs for it to reconcile | a `herd` service that survives `box` restarts and a reboot loop, adjusting from measurements | 1–2 |
+
+> **Status (2026-10-15): P4 exists — `powersaved`**, a dedicated binary
+> (`userspace/powersaved/`, the "binaries, not scripts" rule of
+> `docs/reference/userspace-layout.md`), supervised by herd. Its first policy
+> is the idle-dim staircase (60 s → 60 %, 180 s → 30 %, 600 s → 10 %, a
+> keystroke restores 100 %), applied through the kernel's `/dev/power`
+> control device (`dim=<pct>`) onto a global `akuma-fbcon` dim factor — the
+> console's colour scaling, not the backlight, which stays P3's lever. The
+> policy is pure in the `--lib` half and host-tested; the metal run that
+> day watched the staircase step 100 → 60 → 30 on the ryzen laptop with the
+> facts (`idle_ms=`, `dim=`) honest in `/proc/power` throughout. What the
+> daemon does **not** yet do is reconcile: one policy, one lever — the
+> "adjusting from measurements" half of this row waits for the second knob.
 | P5 | **Stretch: s2idle.** The ACPI `SLP_TYP` values sit in the dumped DSDT. Real suspend is the endgame for battery minutes and a project of its own (device quiescing on a live bus; the rtw89 warm-reset lessons apply) | the box sleeps and wakes | 6–12 |
 
 **Deliberately out of scope, and why:** OS-driven P-states/CPPC. The SMU does
