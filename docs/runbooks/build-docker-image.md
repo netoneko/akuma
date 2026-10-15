@@ -82,8 +82,10 @@ The tar comes back from the trashcan over ssh as `base64` — the channel turns
 LF into CRLF on the way out (`amd64-bare-metal-loop.md`) — checked by `md5sum`.
 Run an `amd64` image on an arm64 Mac with `docker run --platform linux/amd64`.
 
-**Open (amd64 only):** files a `RUN` creates are owned by uid `4294967292`
-(`-4`), not root, in most spawns. See `docs/archive/BOX_BUILD.md` § 8, "uid -4".
+`RUN`-created files were owned by uid 4294967292 on amd64 until 2026-10-16
+(`SIGWINCH` from `reattach` interrupted the child's first `getuid`;
+`docs/archive/BOX_BUILD.md` § 8, "uid -4"). If a layer lists that uid, the
+kernel predates the fix.
 
 ## 4. Clean up
 

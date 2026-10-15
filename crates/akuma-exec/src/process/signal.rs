@@ -307,6 +307,36 @@ pub fn kill_target(pid: i32) -> KillTarget {
     }
 }
 
+/// Can `sig`, with this disposition, change anything the target does?
+///
+/// `false` for a signal that is ignored, or whose default action is "ignore"
+/// (`SIGCHLD`, `SIGURG`, `SIGWINCH`) with no handler installed. Such a signal
+/// must not interrupt a syscall: the interrupt bit makes the *next* syscall of
+/// any kind return `EINTR` from the dispatch prologue, `getuid` included, and
+/// Linux never does that for a signal nobody will act on.
+///
+/// This was the `uid -4` bug (`docs/archive/BOX_BUILD.md` § 8). `reattach`
+/// sends `SIGWINCH` to a freshly spawned child; the interrupt it raised landed
+/// on the child's first syscall, busybox's `check_suid` read the `-EINTR` that
+/// `getuid()` returned as a uid, and `setuid(-4)` followed. Every file a
+/// container created was owned by 4294967292.
+#[must_use]
+pub fn signal_can_act(handler: crate::process::types::SignalHandler, sig: u32) -> bool {
+    use crate::process::types::SignalHandler;
+    /// Default action "ignore": `SIGCHLD`, `SIGURG`, `SIGWINCH`.
+    const DEFAULT_IGNORED: [u32; 3] = [17, 23, 28];
+    const SIGKILL: u32 = 9;
+    const SIGSTOP: u32 = 19;
+    if sig == SIGKILL || sig == SIGSTOP {
+        return true;
+    }
+    match handler {
+        SignalHandler::Ignore => false,
+        SignalHandler::UserFn(_) => true,
+        SignalHandler::Default => !DEFAULT_IGNORED.contains(&sig),
+    }
+}
+
 /// Pend `sig` on every thread of `pid`'s thread group and interrupt their
 /// blocking syscalls, so each takes the signal at its own next return to
 /// userspace — handler, ignore or default action decided there, by the
@@ -389,8 +419,18 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     // a race where a thread wakes from schedule_blocking, checks
     // is_current_interrupted() (false — not set yet), and re-enters
     // schedule_blocking before we set the flag.
-    for &(tid, _) in all_tids {
-        crate::process::interrupt_thread(tid);
+    //
+    // Only for a signal that can act (`signal_can_act`): an ignored one is still
+    // pended and the thread woken, and `next_delivery` consumes it, but it must
+    // not raise the bit that turns the thread's next syscall into `EINTR`.
+    let interrupts = {
+        let idx = (sig as usize).wrapping_sub(1);
+        idx >= MAX_SIGNALS || signal_can_act(proc.signal_actions.actions.lock()[idx].handler, sig)
+    };
+    if interrupts {
+        for &(tid, _) in all_tids {
+            crate::process::interrupt_thread(tid);
+        }
     }
 
     // NOW pend signals and wake. pend_signal_for_thread calls wake() internally.
@@ -596,5 +636,40 @@ mod fork_signal_inheritance_tests {
             }
             assert!(matches!(action.handler, SignalHandler::Default), "signal {} changed", i + 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_can_act_tests {
+    use super::signal_can_act;
+    use crate::process::types::SignalHandler;
+
+    const SIGHUP: u32 = 1;
+    const SIGKILL: u32 = 9;
+    const SIGSTOP: u32 = 19;
+    const SIGCHLD: u32 = 17;
+    const SIGURG: u32 = 23;
+    const SIGWINCH: u32 = 28;
+
+    #[test]
+    fn default_ignored_signals_cannot_interrupt_a_new_process() {
+        for sig in [SIGCHLD, SIGURG, SIGWINCH] {
+            assert!(!signal_can_act(SignalHandler::Default, sig), "sig {sig}");
+        }
+    }
+
+    #[test]
+    fn a_fatal_default_or_a_handler_can() {
+        assert!(signal_can_act(SignalHandler::Default, SIGHUP));
+        assert!(signal_can_act(SignalHandler::UserFn(0x1000), SIGWINCH));
+        assert!(signal_can_act(SignalHandler::UserFn(0x1000), SIGCHLD));
+    }
+
+    #[test]
+    fn an_ignored_signal_cannot_but_kill_and_stop_always_can() {
+        assert!(!signal_can_act(SignalHandler::Ignore, SIGHUP));
+        assert!(!signal_can_act(SignalHandler::Ignore, SIGWINCH));
+        assert!(signal_can_act(SignalHandler::Ignore, SIGKILL));
+        assert!(signal_can_act(SignalHandler::Default, SIGSTOP));
     }
 }

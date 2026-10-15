@@ -247,17 +247,32 @@ and `fsx::now_secs` called a private syscall amd64 lacks (`created` in year
 586524, which Docker refuses to parse). Neither shows on the arch that has the
 syscall, which is why the AArch64 run alone would have missed the second.
 
-**uid -4 (open, amd64 kernel).** On the trashcan, a `box run` child's
-`/proc/<pid>/status` says `Uid: 4294967292` (`-4`, `-EINTR` as a `u32`) in about
-five spawns in six, while its parent `box` is uid 0 and `gid` is right. Every
-file such a process creates is owned by -4, so a `RUN` layer ships with
-`uid 4294967292` entries (Docker loads and runs them; `ls -l` shows the number).
-Established: not the file owner of the binary (`stat` says 0:0); not `sh`/`id`
-(the first command in the container already has it); not host-side spawns
-(`sh` → `touch` is 0); not unset credentials — making `box` pass `set_creds(0,0)`
-explicitly changed nothing (tried, reverted). So something rewrites the child's
-`Creds` after `spawn_ext` installs them, only on the `box_id != 0` path. Next:
-log `SharedCreds::update` callers, or watch the field from the spawn return.
+**uid -4 (fixed 2026-10-16, kernel).** On the trashcan, a `box run` child's
+`/proc/<pid>/status` said `Uid: 4294967292` in about five spawns in six, so every
+file it created — and every `RUN` layer — was owned by uid 4294967292.
+
+Root cause, found by logging credential writes, the prologue's `EINTR` return and
+every `interrupt_thread` caller: `box` calls `reattach(pid)` right after
+`spawn_ext`, and `sys_reattach` sends the child **`SIGWINCH`**. On amd64
+`pend_signal_to_group` raises the per-thread interrupt bit for every signal, and
+glue's syscall prologue turns that bit into `EINTR` for the thread's *next
+syscall of any kind* — the child's first, `getuid`. busybox's `check_suid` ran
+for a SUID-drop applet, took the `-EINTR` for the real uid, and called
+`setgid(0)` then `setuid(4294967292)`. The kernel was behaving as written; the
+overflow is `-4` stored in a `u32` uid on the way through a program that did not
+check the return of `getuid()`.
+
+Wrongly ruled out first: the binary's owner, explicit credentials from `box`
+(`set_creds(0,0)` changed nothing), and a stale slot (`x86_claim_slot` does scrub
+the bit — the interrupt arrives *after* the claim).
+
+Fix: `process::signal::signal_can_act` — an ignored signal, or one with default
+action "ignore" (`SIGCHLD`, `SIGURG`, `SIGWINCH`) and no handler, is still pended
+and the thread woken, but no longer raises the interrupt bit. A handler or a
+fatal default still interrupts; `SIGKILL`/`SIGSTOP` always do. Verified on the
+trashcan: 12 of 12 runs `uid=0`, files `0:0`. Not fixed: a *real* signal with a
+handler still makes a non-blocking `getuid` return `EINTR`; Linux restarts or
+completes such calls, and the prologue could exempt the non-blocking leaf tier.
 
 ### Not done
 
