@@ -1,4 +1,7 @@
 /*
+ * Derived from NetBSD rumpuser_sp.c, (c) 2010, 2011 Antti Kantee, BSD-2-Clause;
+ * full notice in THIRD_PARTY_NOTICES.md at the repository root.
+ *
  * sp_serve_fd.c — Akuma addition (RUMP_SYSPROXY.md Step 4, kernel-pipe transport).
  *
  * Serve the rump sysproxy protocol on a SINGLE PRE-CONNECTED fd, instead of

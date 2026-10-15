@@ -268,7 +268,7 @@ if [ -z "$OVERLAY_DIR" ]; then
             if [ -n "$APPLETS" ]; then
                 for app in $APPLETS; do
                     # Never clobber a real (non-symlink) binary we ship
-                    # (git->scratch, vi->neatvi, tcc, meow, curl, scratch, ...).
+                    # (git->scratch, tcc, meow, curl, scratch, ...).
                     if [ -e /mnt/disk/bin/$app ] && [ ! -L /mnt/disk/bin/$app ]; then
                         continue
                     fi
@@ -312,7 +312,7 @@ if [ "$FULL_BUSYBOX" = true ]; then
             fi
             for app in $APPLETS; do
                 # Never clobber a real (non-symlink) binary we ship (git->scratch,
-                # vi->neatvi, tcc, meow, curl, scratch, ...).
+                # tcc, meow, curl, scratch, ...).
                 if [ -e /mnt/disk/bin/$app ] && [ ! -L /mnt/disk/bin/$app ]; then
                     continue
                 fi

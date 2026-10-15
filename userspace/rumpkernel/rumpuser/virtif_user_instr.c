@@ -1,4 +1,7 @@
 /*
+ * Derived from NetBSD virtif_user.c, (c) 2013 Antti Kantee, BSD-2-Clause;
+ * full notice in THIRD_PARTY_NOTICES.md at the repository root.
+ *
  * virtif_user_instr.c — the stock NetBSD virtif TUN/TAP backend
  * (sys/rump/net/lib/libvirtif/virtif_user.c) with INSTRUMENTATION added at the
  * rump↔wire seam, to PROVE that traffic from an app rides the NetBSD stack.

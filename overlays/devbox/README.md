@@ -169,7 +169,7 @@ overlays/devbox/
   bootstrap.sh   # host build: build herd+sshd → create image → base binaries → wipe /etc → overlay
   run.sh         # boot QEMU: cargo run --profile devbox --features devbox, RUMP_NIC=1, MEMORY=4096
   README.md      # this file
-  NOTICE         # third-party attribution (neatvi — used by a roadmap item)
+  NOTICE         # pointer to the third-party notices
   rootfs/        # the SOLE source of the image's /etc
     etc/herd/enabled/sshd.conf
     etc/sshd/sshd.conf
@@ -217,8 +217,7 @@ Layered back on now that SSH-over-rump is solid:
   a nightly toolchain (static.rust-lang.org) under `/usr/local`, `DEVBOX_NIGHTLY_RUST=true`
   by default (`DEVBOX_DISK_MB` default bumped to 6144 accordingly). See
   `docs/runbooks/build-devbox.md`'s toolchain note.
-- **Editor:** `neatvi` at `/bin/vi` (ISC-licensed C vi clone — see [`NOTICE`](./NOTICE)),
-  cross-compiled with the repo's `aarch64-linux-musl-gcc`.
+- **Editor:** busybox `vi` at `/bin/vi`.
 - **`git`:** `scratch` symlinked to `/bin/git` (clone/push over HTTPS with a GitHub PAT).
 - **Agent `meow` → z.ai GLM-5.2.** meow's HTTPS already rides rump automatically: its socket
   syscalls (`libakuma`, numbers 198/203/206) are the Linux ABI numbers the kernel intercepts,

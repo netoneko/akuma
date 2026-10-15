@@ -25,7 +25,7 @@ GitHub PAT (for git/scratch clone + push):
  2. Edit / build
 ------------------------------------------------------------------------
 
-Editor:   vi <file>                    # neatvi
+Editor:   vi <file>                    # busybox vi
 C:        tcc -static -o hello hello.c && ./hello
 Rust:     export PATH=/usr/local/bin:$PATH
 

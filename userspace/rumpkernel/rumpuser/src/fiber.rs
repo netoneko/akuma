@@ -1,5 +1,8 @@
 //! Cooperative (fiber) threading backend for the Akuma rumpuser layer.
 //!
+//! Licences: BSD-2-Clause (Kantee, Cormack) and MIT (Xen MiniOS); full notices
+//! in `THIRD_PARTY_NOTICES.md` at the repository root.
+//!
 //! This is a Rust port of NetBSD's `src-netbsd/lib/librumpuser/rumpfiber.c`
 //! (Copyright (c) 2007-2013 Antti Kantee; (c) 2014 Justin Cormack; itself based
 //! on Xen MiniOS `sched.c`, (c) 2005 Grzegorz Milos / Intel Research Cambridge).

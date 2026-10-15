@@ -1,7 +1,9 @@
-Third-party software bundled into the Akuma devbox image
-========================================================
+Third-party notices for the Akuma devbox image
+==============================================
 
 The devbox stages the standard Akuma userspace (busybox, apk, tcc, scratch, meow,
-etc.) whose provenance is tracked in the main repository and its submodules
-(.gitmodules). NetBSD-derived rump kernel sources carry their own attribution in
-userspace/rumpkernel and src-netbsd.
+etc.) from Alpine packages and from the submodules listed in .gitmodules; each
+keeps its own licence (busybox and apk-tools-static: GPL-2.0; tcc: LGPL-2.1).
+
+Notices for code derived from or linked into Akuma itself are in the repository's
+THIRD_PARTY_NOTICES.md.

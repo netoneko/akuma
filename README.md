@@ -134,7 +134,7 @@ See [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md).
 | **C compiler (Clang/GCC)** | LLVM `clang`/`clang-21` and GCC/binutils (`cc`, `ld`, `as`) from Alpine apk |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **Git** | `git` from Alpine apk — `apk add git` |
-| **Vi editor (neatvi)** | Vi-like text editor, compilable on-target with TCC |
+| **Vi editor** | busybox `vi` |
 
 ### Services & Applications
 
