@@ -1195,6 +1195,12 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
     // `fbverbose`: keep diagnostics on the TV even with a console shell, for
     // debugging a hang on the metal. See `serial::set_fb_quiet`.
     crate::serial::set_fb_verbose(cmdline.split_ascii_whitespace().any(|t| t == "fbverbose"));
+    // `strace_err`: one `[sc!]` line per failing syscall (pid, decoded path,
+    // errno), to the console ring — the PVH path has always parsed it, this one
+    // did not, so the GRUB-booted metal could not use it.
+    if cmdline.split_ascii_whitespace().any(|t| t == "strace_err") {
+        crate::usermode::SYSCALL_TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 
     if run_shell {
         crate::splash::phase(2);

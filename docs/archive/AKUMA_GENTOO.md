@@ -305,6 +305,37 @@ reproduction (`os.openpty()`, `os.chown(os.ttyname(s), 0, 5)`). Fix:
 `akuma_vfs_glue::is_pty_slave`; `chown` and `chmod` on a live slave accept and
 ignore, like device nodes. The login shell now runs on `/dev/pts/0`.
 
+**`ps` ("Error, do this: mount -t proc proc /proc").** Not a missing mount.
+procps-ng 4.0.6 starts with `open("/proc/self", O_PATH | O_DIRECTORY)`; `/proc/self`
+was reported as a symlink (`is_symlink`) but `read_symlink("self")` had no arm,
+so nothing could follow it and the open was `ENOENT`. Found with the kernel's
+`strace_err` flag, which logs one `[sc!]` line per *failing* syscall with its
+decoded path to `dmesg`: the boot log said `nr=2 … -> -2 "/proc/self"`. That
+flag was only parsed on the PVH boot path; the GRUB (multiboot2) path now reads
+it too, and menu **entry 18** is entry 17 plus `strace_err`. Fix: `readlink
+/proc/self` answers with the caller's tgid (`akuma-vfs-glue/src/proc.rs`). `ps
+ax` now lists the box. (Other `/proc` files that standard tools probe and that
+do not exist yet: `version`, `vmstat`, `diskstats`, `partitions`, `cmdline`,
+`swaps`, `sys/kernel/{osrelease,ostype,hostname,pid_max}` — none has blocked a
+tool so far.)
+
+**The local console.** The screen showed an empty, unblinking cursor because
+PID 1 is a script that sends all of its output to log files and never runs a
+shell on the console the kernel hands it (stdin = the xHCI keyboard, stdout =
+the framebuffer, `docs/runbooks/amd64-console-shell.md`). `akuma-init.sh` now
+saves the screen on fds 3/4 before redirecting 1/2 and starts
+`bash -l <&0 >&3 2>&4` in a restart loop, before the network wait, so a shell
+is on the TV even when the radio never joins. Verified: the process stays up
+(no restart churn) and has read its profile files; whether keystrokes reach it
+through a *forked* child of init (herd's console service gets the channel via
+`SPAWN_FLAG_CONSOLE`; here the fd is inherited) needs a look at the TV.
+
+**Process note.** `overlays/ryzen/gentoo/akuma-init.sh` was committed **empty** in
+`6b4dbe29` (the fetch from Pop returned nothing while the box was running Gentoo
+and I did not check) — fixed here; `deploy.py [entry] [--init]` now installs
+the kernel and, with `--init`, the script from the repo, so the repo is the
+source.
+
 **The python crash is very probably the same stack bug.** After the stack fix,
 on the same Gentoo root that crashed all of 2026-10-14: `wc -l` works,
 `hashlib.blake2b` returns a digest (it SIGSEGV'd), `emerge --version` runs (it

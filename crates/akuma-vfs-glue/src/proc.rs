@@ -2093,6 +2093,16 @@ impl Filesystem for ProcFilesystem {
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {
         let path = path.trim_start_matches('/');
 
+        // `/proc/self` itself: Linux answers with the caller's thread-group id.
+        // `is_symlink` has always said yes, but nothing answered the read, so a
+        // program that opens `/proc/self` as a directory (`open(…, O_PATH |
+        // O_DIRECTORY)`, which is how procps-ng's `ps` starts) was told
+        // `ENOENT` and printed "Error, do this: mount -t proc proc /proc".
+        if path == "self" {
+            let tgid = process::current_process_shared().map(|p| p.tgid).ok_or(FsError::NotFound)?;
+            return Ok(format!("{tgid}"));
+        }
+
         // Handle "self/fd/<n>" -> resolve to current process
         if let Some(rest) = path.strip_prefix("self/") {
             let pid = process::current_process_shared().map(|p| p.pid).ok_or(FsError::NotFound)?;
