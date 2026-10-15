@@ -92,23 +92,38 @@ pub fn container_upper(id: &str) -> String {
 
 /// The directory name an image reference is stored under.
 ///
-/// Drops the registry host and Docker's implicit `library/` namespace, so
-/// `busybox`, `library/busybox` and `docker.io/library/busybox` are one image
-/// rather than three copies of it. Everything left is flattened into a single
-/// path component.
+/// Docker Hub's three spellings of itself (`docker.io`, `index.docker.io`,
+/// `registry-1.docker.io`) and its implicit `library/` namespace are dropped, so
+/// `busybox`, `library/busybox` and `docker.io/library/busybox` are one image.
+/// **Every other registry host stays in the name**: `ghcr.io/me/app:1` and
+/// `app:1` are different names, as in Docker.
+///
+/// Until 2026-10-16 any host containing a `.` was dropped, which made
+/// `192.168.1.5:5000/app:1` — the name `box push` needs a tag for — the *same*
+/// store directory as `app:1`, so `box rmi` of the registry name deleted the
+/// image it was tagged from. (Layers and blobs are shared by digest either way;
+/// what was being deduplicated was a config and a manifest.) An image stored
+/// under a dropped-host name before then is not found under its new one:
+/// `box pull` it again — the layers are already on disk, so only the manifest
+/// and config are fetched.
+///
+/// Everything left is flattened into a single path component.
 pub fn sanitize_name(image_str: &str) -> String {
+    const HUB_HOSTS: [&str; 3] = ["docker.io", "index.docker.io", "registry-1.docker.io"];
     let mut s = image_str;
-    if let Some(pos) = s.find('/') {
-        // Same "looks like a host" test as reference parsing, minus the port
-        // case: `localhost:5000/img` keeps its host in the store name, which is
-        // ugly but consistent — `pull` and `run` sanitize identically, so they
-        // always agree on where the image lives.
-        if s[..pos].contains('.') {
-            s = &s[pos + 1..];
-        }
+    // Same "looks like a host" test as `oci_ref::parse_image_ref`.
+    let host = s.find('/').map(|pos| &s[..pos]).filter(|h| h.contains('.') || h.contains(':'));
+    let on_hub = match host {
+        None => true,
+        Some(h) => HUB_HOSTS.contains(&h),
+    };
+    if let (Some(h), true) = (host, on_hub) {
+        s = &s[h.len() + 1..];
     }
-    if let Some(rest) = s.strip_prefix("library/") {
-        s = rest;
+    if on_hub {
+        if let Some(rest) = s.strip_prefix("library/") {
+            s = rest;
+        }
     }
     s.chars()
         .map(|c| if c == '/' || c == ':' { '-' } else { c })
@@ -200,9 +215,24 @@ mod tests {
     }
 
     #[test]
-    fn user_and_registry_namespaces_are_flattened() {
+    fn user_namespaces_are_flattened_and_hub_aliases_collapse() {
         assert_eq!(sanitize_name("myuser/myapp:v1"), "myuser-myapp-v1");
-        assert_eq!(sanitize_name("ghcr.io/owner/repo:v2"), "owner-repo-v2");
+        assert_eq!(sanitize_name("docker.io/myuser/myapp:v1"), "myuser-myapp-v1");
+        assert_eq!(sanitize_name("registry-1.docker.io/library/busybox"), "busybox");
+        assert_eq!(sanitize_name("index.docker.io/library/busybox"), "busybox");
+    }
+
+    /// The bug: `box tag app:1 <registry>/app:1` then `box rmi` of the registry
+    /// name deleted `app:1`, because both were the store directory `app-1`.
+    #[test]
+    fn another_registry_is_a_different_image_from_the_hub_one() {
+        assert_eq!(sanitize_name("ghcr.io/owner/repo:v2"), "ghcr.io-owner-repo-v2");
+        assert_eq!(sanitize_name("192.168.1.5:5000/app:1"), "192.168.1.5-5000-app-1");
+        assert_ne!(sanitize_name("192.168.1.5:5000/app:1"), sanitize_name("app:1"));
+        assert_ne!(sanitize_name("ghcr.io/me/app:1"), sanitize_name("quay.io/me/app:1"));
+        assert_ne!(sanitize_name("ghcr.io/me/app:1"), sanitize_name("me/app:1"));
+        // `library/` is a Hub namespace; elsewhere it is just a path component.
+        assert_eq!(sanitize_name("ghcr.io/library/x"), "ghcr.io-library-x");
     }
 
     #[test]

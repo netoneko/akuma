@@ -164,6 +164,12 @@ PUT /v2/<name>/manifests/<tag>          201   Content-Type: application/vnd.oci.
   `/root/.docker/config.json` `auths` (read only; credential helpers are not
   supported). `auth.json` has Docker's `{"auths":{"<registry>":{"auth":"<base64 user:password>"}}}`
   shape. A password may contain `:`; a user name may not.
+- **Store names keep the registry.** `192.168.1.5:5000/app:1` and `app:1` are
+  different images (`/var/lib/box/images/192.168.1.5-5000-app-1` vs `app-1`); only
+  Docker Hub's own spellings collapse. Before 2026-10-16 every dotted host was
+  dropped, so `box tag app:1 host/app:1` then `box rmi host/app:1` deleted `app:1`.
+  An image pulled from a non-Hub registry before then is "not found" under its
+  new name: `box pull` it again (layers are already on disk).
 - **A 401 mid-upload re-authenticates once and retries** (a bearer token lasts
   minutes; a layer can take longer). `Authorization` is only sent to the
   registry's own host, never to a different host an upload `Location` names.

@@ -300,6 +300,15 @@ Verified 2026-10-16 from the trashcan (amd64 kernel, `box` pushed with
 | htpasswd registry (Basic): no credentials / wrong / right | "needs credentials" hint / "refused the credentials" / pushed. Password `s3cret:pw` (a colon). `auth.json` is `0600`; `logout` removes it |
 | Bearer, via a mock token server + proxy | token requested with the push scope (the challenge's own was pull-only), Basic credentials sent to the token endpoint only; **token revoked mid-push → 401 → re-authenticate → the upload completes**; no credentials → the hint |
 
+**Found by cleaning up after it:** `box rmi` of the registry-qualified tag deleted
+`app:1`. `paths::sanitize_name` dropped any host containing a `.`, so every tag
+for a registry was the same store directory as the image it was made from. Now
+only Docker Hub's spellings collapse (`docker.io`, `index.docker.io`,
+`registry-1.docker.io`); verified on the trashcan: tag, push, `rmi` the tag,
+`app:1` still runs. This changes a pinned test (`ghcr.io/owner/repo:v2` was
+`owner-repo-v2`); images pulled from non-Hub dotted registries before today need
+a re-pull.
+
 Not run: AArch64 (the code is arch-neutral and shares the x86 run's TCP path, but
 it was not booted), Docker Hub, GHCR, a registry that redirects uploads to a CDN,
 anything over verified TLS.
