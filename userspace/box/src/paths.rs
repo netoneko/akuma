@@ -5,6 +5,11 @@
 //! /var/lib/box/images/<image>/layers            digests, base-first
 //! /var/lib/box/layers/sha256-<hex>/             extracted layer, shared
 //! /var/lib/box/containers/<id>/upper/           one container's writes
+//! /var/lib/box/containers/<id>/runtime/         resolv.conf + hosts, as the topmost lower
+//! /var/lib/box/containers/<id>/image            store name of the image it was started from
+//! /var/lib/box/blobs/sha256-<hex>               the compressed layer, exactly as the manifest names it
+//! /var/lib/box/cache/<key>                      build cache: step key -> layer record
+//! /var/lib/box/images/<image>/manifest.json     the manifest `box save` exports
 //! ```
 //!
 //! Layers are keyed by digest rather than by image because a digest is what a
@@ -24,6 +29,36 @@ pub const IMAGES_BASE: &str = "/var/lib/box/images";
 pub const LAYERS_BASE: &str = "/var/lib/box/layers";
 /// Where per-container writable upper directories live.
 pub const CONTAINERS_BASE: &str = "/var/lib/box/containers";
+
+/// Compressed layer blobs, keyed by digest — what `box save`/`push` export.
+pub const BLOBS_BASE: &str = "/var/lib/box/blobs";
+/// `box build` step cache.
+pub const CACHE_BASE: &str = "/var/lib/box/cache";
+
+pub fn blob_path(digest: &str) -> String {
+    format!("{}/{}", BLOBS_BASE, digest.replace(':', "-"))
+}
+
+pub fn cache_path(key: &str) -> String {
+    format!("{}/{}", CACHE_BASE, key)
+}
+
+pub fn manifest_path(name: &str) -> String {
+    format!("{}/{}/manifest.json", IMAGES_BASE, name)
+}
+
+/// Per-container directory holding the files `box` injects (`/etc/resolv.conf`,
+/// `/etc/hosts`). It is the overlay's topmost **lower**, not part of the upper,
+/// so injected files never end up in a committed layer unless a process in the
+/// container actually rewrote them (which copies them up).
+pub fn container_runtime(id: &str) -> String {
+    format!("{}/{}/runtime", CONTAINERS_BASE, id)
+}
+
+/// Records which image a container was started from, for `box commit`.
+pub fn container_image_file(id: &str) -> String {
+    format!("{}/{}/image", CONTAINERS_BASE, id)
+}
 
 pub fn image_dir(name: &str) -> String {
     format!("{}/{}", IMAGES_BASE, name)
@@ -132,6 +167,15 @@ mod tests {
             layer_dir("sha256:b85757a5ca1a"),
             "/var/lib/box/layers/sha256-b85757a5ca1a"
         );
+    }
+
+    #[test]
+    fn build_store_paths() {
+        assert_eq!(blob_path("sha256:ab"), "/var/lib/box/blobs/sha256-ab");
+        assert_eq!(cache_path("k"), "/var/lib/box/cache/k");
+        assert_eq!(manifest_path("x"), "/var/lib/box/images/x/manifest.json");
+        assert_eq!(container_runtime("web"), "/var/lib/box/containers/web/runtime");
+        assert_eq!(container_image_file("web"), "/var/lib/box/containers/web/image");
     }
 
     #[test]

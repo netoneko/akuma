@@ -119,6 +119,40 @@ impl Filesystem for SubdirFs {
         self.inner.write_at(p, offset, data)
     }
 
+    /// Forwarded so the inner filesystem's atomic append is used; the trait
+    /// default is a read-size-then-`write_at` that loses lines between two
+    /// concurrent appenders.
+    fn append(&self, path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.append(p, data)
+    }
+
+    /// Path-based `truncate`/`fallocate`/`set_times`/`create_socket_node` were
+    /// missing here, so they fell to the trait's `NotSupported` (→ `EIO`) for
+    /// every file under a `SubdirFs`. That is the upper layer of every `box run`
+    /// container: `ftruncate`, `fallocate` and `utimensat` all failed there, and
+    /// `apk add` died on its first large file ("Failed to create usr/bin/curl:
+    /// I/O error"). Fixed 2026-10-15 while building `box build`.
+    fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.truncate(p, length)
+    }
+
+    fn fallocate(&self, path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.fallocate(p, mode, offset, len)
+    }
+
+    fn set_times(&self, path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -> Result<(), FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.set_times(p, atime_secs, mtime_secs)
+    }
+
+    fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.create_socket_node(p)
+    }
+
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
         full_path!(p, &self.prefix, path);
         self.inner.create_dir(p)
@@ -291,6 +325,26 @@ mod tests {
             self.record(link_path);
             Ok(())
         }
+        fn append(&self, path: &str, _data: &[u8]) -> Result<(usize, usize), FsError> {
+            self.record(path);
+            Ok((0, 0))
+        }
+        fn truncate(&self, path: &str, _length: u64) -> Result<(), FsError> {
+            self.record(path);
+            Ok(())
+        }
+        fn fallocate(&self, path: &str, _mode: i32, _offset: u64, _len: u64) -> Result<(), FsError> {
+            self.record(path);
+            Ok(())
+        }
+        fn set_times(&self, path: &str, _a: Option<u64>, _m: Option<u64>) -> Result<(), FsError> {
+            self.record(path);
+            Ok(())
+        }
+        fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+            self.record(path);
+            Ok(())
+        }
         fn stats(&self) -> Result<FsStats, FsError> {
             Err(FsError::NotSupported)
         }
@@ -371,7 +425,25 @@ mod tests {
         check!("read_symlink", fs.read_symlink(escape));
         check!("is_symlink", fs.is_symlink(escape));
         check!("chmod", fs.chmod(escape, 0o644));
+        check!("append", fs.append(escape, b"x"));
+        check!("truncate", fs.truncate(escape, 0));
+        check!("fallocate", fs.fallocate(escape, 0, 0, 1));
+        check!("set_times", fs.set_times(escape, Some(1), Some(2)));
+        check!("create_socket_node", fs.create_socket_node(escape));
         check!("resolve_inode", fs.resolve_inode(escape));
+    }
+
+    /// The methods a `SubdirFs` forgot to forward answered `NotSupported`
+    /// (`EIO` at the syscall) instead of reaching the filesystem underneath.
+    #[test]
+    fn mutating_methods_reach_the_inner_filesystem() {
+        let (rec, fs) = jail();
+        assert_eq!(fs.truncate("/f", 10), Ok(()));
+        assert_eq!(rec.last(), "/srv/rumpbox/f");
+        assert_eq!(fs.fallocate("/g", 0, 0, 4096), Ok(()));
+        assert_eq!(rec.last(), "/srv/rumpbox/g");
+        assert_eq!(fs.set_times("/h", Some(1), Some(2)), Ok(()));
+        assert_eq!(rec.last(), "/srv/rumpbox/h");
     }
 
     #[test]

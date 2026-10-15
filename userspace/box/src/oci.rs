@@ -99,6 +99,10 @@ fn fetch_config(image: &ImageRef, digest: &str, token: &str) -> Result<String, S
     if n <= 0 {
         return Err(String::from("failed to read config file"));
     }
+    let got = boxlib::layer::sha256_digest(&buf[..n as usize]);
+    if got != digest {
+        return Err(format!("config failed verification: got {}", got));
+    }
     let body_str = core::str::from_utf8(&buf[..n as usize])
         .map_err(|_| String::from("invalid config response"))?;
 
@@ -188,6 +192,19 @@ pub fn pull_image(image_str: &str) -> Result<(), String> {
         let tmp_path = format!("/tmp/oci-layer-{}.tar.gz", i);
         download_layer(&image, digest, &token, &tmp_path)?;
 
+        // A registry names a blob by its digest; take it at its word only after
+        // hashing what actually arrived. The blob is also kept (below), so a
+        // wrong one would poison every `box save` of an image built on it.
+        let expected = digest.strip_prefix("sha256:").unwrap_or(digest);
+        match crate::fsx::sha256_file(&tmp_path) {
+            Some(got) if got == expected => {}
+            Some(got) => {
+                unlink(&tmp_path);
+                return Err(format!("layer {} failed verification: got sha256:{}", short, got));
+            }
+            None => return Err(format!("cannot read back {}", tmp_path)),
+        }
+
         print("  Extracting layer ");
         print_dec(i + 1);
         print("/");
@@ -202,7 +219,17 @@ pub fn pull_image(image_str: &str) -> Result<(), String> {
             return Err(format!("failed to create {}", staging));
         }
         extract_layer(&tmp_path, &staging)?;
-        unlink(&tmp_path);
+        // Keep the compressed blob for `box save`; fall back to deleting it if
+        // it cannot be moved (a /tmp on another filesystem).
+        let blob = images::blob_path(digest);
+        if !crate::fsx::exists(&blob) && libakuma::rename(&tmp_path, &blob) < 0 {
+            if crate::fsx::copy_file(&tmp_path, &blob).is_err() {
+                unlink(&blob);
+            }
+            unlink(&tmp_path);
+        } else {
+            unlink(&tmp_path);
+        }
 
         let rc = libakuma::rename(&staging, &dest);
         if rc < 0 {
@@ -210,8 +237,21 @@ pub fn pull_image(image_str: &str) -> Result<(), String> {
         }
     }
 
-    images::save_config(&store_name, &config_json)?;
+    // Layers that were already present were not downloaded this time; their
+    // blob may or may not be around (images pulled before blobs were kept).
+    let sizes = images::layer_sizes(&store_name, &manifest.layer_digests);
     images::save_layers(&store_name, &manifest.layer_digests)?;
+    let with_sizes: alloc::vec::Vec<(String, u64)> = manifest
+        .layer_digests
+        .iter()
+        .zip(&sizes)
+        .map(|(d, n)| (d.clone(), n.unwrap_or(0)))
+        .collect();
+    let _ = crate::fsx::write_file(
+        &images::manifest_path(&store_name),
+        boxlib::imgconfig::manifest_json(&manifest.config_digest, config_json.len() as u64, &with_sizes).as_bytes(),
+    );
+    images::save_config(&store_name, &config_json)?;
 
     print("  Image stored as '");
     print(&store_name);

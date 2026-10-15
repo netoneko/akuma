@@ -15,11 +15,13 @@ box run [--rm] [-d] [-i] [--name X] [-w dir] [-u user[:group]] [--entrypoint P] 
   ├─ read `layers` (base-first) → reverse → overlay lowerdirs (topmost-first)
   ├─ verify every layer directory exists
   ├─ mkdir /var/lib/box/containers/<id>/upper
-  ├─ inject upper/etc/resolv.conf (copied from the host) + upper/etc/hosts
+  ├─ inject runtime/etc/resolv.conf (copied from the host) + runtime/etc/hosts
+  │     — a separate directory, the overlay's TOPMOST LOWER, so a committed
+  │       upper never contains them (docs/BOX_BUILD.md)
   ├─ MOUNT_IN_NS(box_id, "/proc", "proc")     — host-only, so it happens here
   ├─ REGISTER_BOX(box_id, root=/var/lib/box/containers/<id>)
   │     → kernel creates the namespace with a SubdirFs jail at /
-  ├─ MOUNT_IN_NS(box_id, "/", "overlay", "lowerdir=…,upperdir=…")
+  ├─ MOUNT_IN_NS(box_id, "/", "overlay", "lowerdir=<runtime>:<layers…>,upperdir=…")
   │     → replaces that jail with the union. One-shot: only works while the
   │       root is still the pristine jail and the box has no processes.
   ├─ compose argv: Entrypoint + (command line ? command line : Cmd)
@@ -80,11 +82,12 @@ away — there is no `box rmi` yet.
 Run without `--rm` and look at the writable layer:
 
 ```
-# find /var/lib/box/containers/<id>/upper -type f
-…/upper/etc/resolv.conf     injected at start
-…/upper/etc/hosts           injected at start
+# find /var/lib/box/containers/<id>/upper -type f      (the container's own writes only)
 …/upper/etc/passwd          copied up when the container appended to it
 …/upper/etc/.wh.group       the container deleted /etc/group
 ```
 
 That listing is the complete diff between the image and the container.
+`resolv.conf` and `hosts` are injected into `…/runtime/etc/`, a separate
+directory stacked as the overlay's topmost lower, so they appear in the listing
+only if a process rewrote them (before 2026-10-15 they were written into `upper`).

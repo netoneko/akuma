@@ -1,7 +1,7 @@
 # `box build` — Docker-compatible image builds on Akuma
 
 **Date:** 2026-10-14
-**Status:** Prerequisites 1–3 (§5) implemented 2026-10-14 — permissions ([`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) §11), hard links ([`HARD_LINKS.md`](HARD_LINKS.md) §4), directory rename (§7 below). The build itself (steps 4–13) is not started.
+**Status:** Prerequisites 1–3 (§5) implemented 2026-10-14 — permissions ([`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) §11), hard links ([`HARD_LINKS.md`](HARD_LINKS.md) §4), directory rename (§7 below). **Steps 4–12 implemented 2026-10-15** (§8 below); step 13 (`box push`) is not. Current-state reference: [`userspace/box/docs/BOX_BUILD.md`](../../userspace/box/docs/BOX_BUILD.md); procedure: [`../runbooks/build-docker-image.md`](../runbooks/build-docker-image.md).
 **Depends on:** [`UNIX_PERMISSIONS.md`](UNIX_PERMISSIONS.md) (steps 3–6) and
 [`HARD_LINKS.md`](HARD_LINKS.md). Built without them, every image would be
 `root:root` with hard links duplicated, and `USER`/`COPY --chown` would be no-ops.
@@ -195,7 +195,58 @@ kernel also passed `linkprobe` 23/23 and `permprobe` 50/50, and busybox `ln`
 (x86_64 `link`, 86) makes a real link. Boot suites: amd64 QEMU 807/0, AArch64
 Firecracker 299/1 (the pre-existing `thread_slot_reclaim_on_spawn`).
 
+## 8. Implementation (2026-10-15)
+
+Steps 4–12 of §5, built in order, each pure piece host-tested before the I/O
+around it. What differs from the sketch above, and what building it found.
+
+### Where things landed
+
+| Step | Landed as |
+|---|---|
+| 4 runtime layer | `containers/<id>/runtime/` is the overlay's topmost lower (`run.rs`, `paths::container_runtime`); `containers/<id>/image` records the base for `box commit` |
+| 5 tar writer | `akuma-tar::write` (ustar + PAX, hard links, 8 tests); the **extractor** gained PAX/GNU long-name handling (`format::parse_pax`, gzip path) so a layer `box commit` wrote unpacks with its real names |
+| 6 config writer | `boxlib::imgconfig` (no JSON-writer module — a config is a struct that serialises itself); manifest, OCI `index.json` and Docker's `manifest.json` beside it |
+| 7 `box commit` | `commit.rs`. `commit_upper` **consumes** the directory (rename into the layer store); `commit_copy` keeps it (unpacks the blob it just wrote) for a container that is still running |
+| 8 parser | `boxlib::dockerfile` — 10 tests; a small corpus of official-image shapes (nginx, a Go multi-stage, a CRLF Node file) is in the tests; a bigger corpus was not built |
+| 9–11 builder | `build.rs`: all instructions, cache, `--build-arg`, multi-stage, `--target`, `ADD`. `.dockerignore` is `boxlib::dockerignore` |
+| 12 `save`/`tag`/`rmi`/GC | `imgcmd.rs`. `box pull` now keeps blobs and **verifies** layer and config digests, and writes `manifest.json` (open question 1: yes) |
+
+Open question 2 (`COPY --from` needs a merged view) was answered the second
+way: **resolve through the stack in userspace** (`boxlib::stack`, generic over a
+`LayerFs`, 9 tests), because a mount from box 0 was unverified and a global
+overlay mount would have meant new kernel surface for one builder. The
+drift-risk named in the question is real; the interop gate is the check.
+
+### What building it found
+
+| Fault | Effect | Fix |
+|---|---|---|
+| `SubdirFs` — the **upper layer of every container** — did not forward `truncate`, `fallocate`, `set_times`, `append`, `create_socket_node`; the trait default is `NotSupported` → `EIO` | `ftruncate(2)` failed on every file in every `box run` container. `apk add curl` died with `ERROR: Failed to create usr/bin/curl: I/O error` — the first real `RUN` anyone wrote. Shrinking failed too, `touch -d` failed | forwarded in `subdir_fs.rs`; the overlay forwards `set_times`/`create_socket_node` (copy-up first). The `SubdirFs` confinement test had been checking `rec.last()` after calls the recorder did not record, so it passed for methods it never exercised — the recorder now records them |
+| `images::path_exists` followed symlinks | an Alpine image's `CMD ["cat"]` (`/bin/cat -> /bin/busybox`, an absolute target) was "not found" from the host and `box run` failed to spawn `cat` | `lstat`, which is what the doc comment already said |
+| The container's `resolv.conf` was a verbatim copy of the host's | On a systemd host (ryzen/Gentoo) it named `127.0.0.53`, a resolver that does not exist inside the container: `apk add` → `temporary error (try again later)`, `wget` → `bad address`. The QEMU devbox's file happened to list `8.8.8.8` | `spec::container_resolv_conf`: loopback nameservers dropped as Docker does, `8.8.8.8`/`1.1.1.1` when none remain (host-tested) |
+| A `RUN` that pipes through `tail` hides a failed `apk` | the failed step is *cached as a success* — a rebuild reuses it | not a bug (Docker does the same); `--no-cache`, or `set -o pipefail` |
+| Docker Hub's `busybox` is glibc | `wget http://example.com` inside it: `bad address` (static glibc resolver needs NSS); `nslookup` in the same box works. Initially read as "boxes have no DNS" | not a fault; documented. Alpine is musl and resolves |
+| Under **OpenSSH** (Gentoo, port 4444) a container's output is not pumped — `box run alpine echo` prints nothing, exit status is right | `reattach` hands output to the caller's process channel, which only Akuma's own sshd (2222) reads | not changed; builds from a 4444 session still succeed but their `RUN` output is lost |
+
+### Verified
+
+| Where | What |
+|---|---|
+| AArch64 QEMU (HVF, devbox-smoltcp, `INSTANCE=3`) | single-stage and multi-stage builds; `COPY` with `.dockerignore`, `--chown`, `--from`; `USER`; cache (4/4 layer steps hit on rebuild); a failing `RUN` stops the build and tags nothing; `--target`; `box commit` of a running container incl. hard link, symlink, nested dirs; `tag`, `rmi` + GC; `box pull` digest verification; **`apk add jq curl` in a `RUN`** after the `SubdirFs` fix (network from a build box works) |
+| `box save` | every blob's file name is its sha256, the manifest's sizes match, each layer's gunzipped tar hashes to its `diff_id`, hard links (`typeflag 1`) and modes are in the tar. **`docker load` itself was not run** — no Docker daemon on the Mac that day |
+| ryzen (Gentoo box 0, entry 17) | x86_64 `box` builds clean. On the old kernel (021f1626): `FROM alpine` with `COPY --chown`, `USER`, cache — correct owners and modes. **On the fixed kernel** (this tree, `no-tests`, installed with `overlays/ryzen/gentoo/deploy.py 17`; the previous one is `akuma-amd64.pre-box-build` on the ESP): `RUN apk add jq curl` over wifi, `box run`, 4/4 cache hits, `box save` whose blobs, `diff_id`s and `architecture: amd64` check out. Long builds must be detached (`nohup … &`): the wifi ssh session dropped mid-build once and took the foreground build with it |
+
+### Not done
+
+`box push`; `.tar.bz2`/`.xz` in `ADD`; preserving source mtimes in `COPY`
+(libakuma has no `utimensat` wrapper); a build with more than 31 image layers;
+`--squash`; the Akuma-vs-Docker rootfs diff of §6 as a script
+(the procedure is in the runbook, it was not automated).
+
 ## Open questions
+
+*(1 and 2 answered in §8.)*
 
 1. **Keep blobs for pulled images?** Doubles their disk cost but makes
    `save`/`push` of anything `FROM` a pulled image work without re-downloading.

@@ -28,9 +28,16 @@
 extern crate alloc;
 
 pub mod boxes;
+pub mod buildopts;
+pub mod copyplan;
+pub mod dockerfile;
+pub mod dockerignore;
+pub mod imgconfig;
 pub mod json;
+pub mod layer;
 pub mod manifest;
 pub mod oci_ref;
 pub mod paths;
 pub mod spec;
+pub mod stack;
 pub mod sys;

@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod format;
+pub mod write;
 
 #[cfg(feature = "akuma")]
 mod extract;

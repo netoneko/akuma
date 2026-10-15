@@ -153,9 +153,12 @@ dependencies = [
 name = "box"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "libakuma",
  "libakuma-tls",
+ "miniz_oxide 0.7.4",
  "picojson",
+ "sha2",
  "tar",
 ]
 

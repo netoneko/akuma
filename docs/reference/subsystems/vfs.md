@@ -346,6 +346,7 @@ namespace.
   spawn (`set_spawn_namespace`/`clear_spawn_namespace`).
 - **SubdirFs limitations:** `archive/BOX_SUBDIR_FS_LIMITATIONS.md` — the fresh-
   root isolation isn't a full chroot; some paths leak.
+  **Every `Filesystem` method with a `NotSupported` default must be forwarded** by `SubdirFs` and `OverlayFs` — a missed one is `EIO` at the syscall. `truncate`/`fallocate`/`set_times` were missing until 2026-10-15 and broke `ftruncate` (hence `apk add`) in every container ([`archive/BOX_BUILD.md`](../../archive/BOX_BUILD.md) § 8).
 
 ## Pipes, PTY, TTY
 

@@ -534,6 +534,18 @@ impl Filesystem for OverlayFs {
         self.upper.chown(path, uid, gid)
     }
 
+    /// `utimensat`: copy up, then set the times on the upper copy. Missing here
+    /// it answered `NotSupported` (→ `EIO`) for every file in a container.
+    fn set_times(&self, path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -> Result<(), FsError> {
+        self.copy_up(path)?;
+        self.upper.set_times(path, atime_secs, mtime_secs)
+    }
+
+    fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        self.prepare_create(path)?;
+        self.upper.create_socket_node(path)
+    }
+
     /// A hard link in the merged view: copy the source up, then link in the
     /// upper layer. The new name joins the **copy**, not the lower inode —
     /// what Linux overlayfs does without `index=on`, and the only thing a

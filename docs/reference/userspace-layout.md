@@ -17,7 +17,7 @@ pages — not every member has one).
 | `apk-tools` | Alpine apk bootstrap tooling (no binary — build.rs deploys bootstrap assets directly) |
 | `herd` | Process supervisor — background services, auto-restart, config in `/etc/herd/` |
 | `wifi` | Wifi manager (amd64): known networks in `/etc/wifi/<network>`, the kernel's `/dev/wifi0`, `wifi auto` as a herd service. No supplicant — the kernel does WPA2. [`../userspace/wifi.md`](../userspace/wifi.md) |
-| `box` | Container manager: `box run` (Docker images on an overlay root), `box pull`, `box open/close/ps/inspect` |
+| `box` | Container manager: `box run` (Docker images on an overlay root), `box pull`, `box build` (Dockerfiles; `commit`/`save`/`tag`/`rmi`), `box open/close/ps/inspect` |
 | `meow` | AI coding assistant — LLM chat client with filesystem/network tool calling |
 | `nca` | Build wrapper for [native-cli-ai](https://github.com/netoneko/native-cli-ai) (submodule); no binary in `/bin` — build.rs deploys to `bootstrap/bin/nca` |
 | `tcc` | Tiny C Compiler port — compile and run C programs on-target |
@@ -25,7 +25,7 @@ pages — not every member has one).
 | `sshd` | Userspace SSH server, plus a companion SSH client (`ssh`, a second `[[bin]]` in the same package) |
 | `paws` | **EXPERIMENTAL — `extreme-size` demo only.** Minimal first-party shell (598 lines, pure `libakuma`): 8 RO-mapped pages vs busybox's 265, which is what makes it usable as the login shell on a 4 MB box whose file-page dedup cache holds 128. **Not busybox/ash compatible** — hand-rolled parser, fixed builtin list, no `exec`/`printf`/`test`, unreliable pipes and redirection. Fine for `sshd --shell /bin/paws` execing one binary (that is how `acceptance/05`, and formerly `acceptance/archive/08`, pass at 4.0 MB); do not point real shell scripts at it. Originally removed at `c0af6c7`, revived 2026-08-10. The page-count measurements behind that comparison (busybox = 265 RO pages, and why the file-page cache cannot hold one below ~8 MB of RAM) are in [`../archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md`](../archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md) — a `BUSYBOX_TOYBOX_SIZING.md` was referenced here and in that doc but never written |
 | `httpd` | HTTP server |
-| `tar` | Tar extraction. A **library** (`akuma_tar`) that `box` links for layer extraction, plus a thin `/bin/tar` CLI. Header parsing (`format.rs`) is host-testable |
+| `tar` | Tar extraction and header **writing**. A **library** (`akuma_tar`) that `box` links for layer extraction (`extract`) and layer creation (`write`), plus a thin `/bin/tar` CLI. Header parsing/encoding (`format.rs`, `write.rs`) is host-testable |
 | `scratch` | Minimal Git client (Git Smart HTTP) — was removed then reverted; see `docs/archive/TRIM_FAT_PART_2.md`'s "Removed: scratch" section, which predates the revert |
 | `llama.cpp` | llama.cpp port — LLM inference on-device |
 | `rumpkernel` | NetBSD rump kernel port — real network stack (DHCP/HTTP/HTTPS) |

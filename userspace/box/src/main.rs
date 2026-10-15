@@ -19,8 +19,12 @@
 
 extern crate alloc;
 
+mod build;
+mod commit;
+mod fsx;
 mod oci;
 mod images;
+mod imgcmd;
 mod run;
 mod tests;
 
@@ -44,6 +48,12 @@ pub extern "C" fn main() {
     match command {
         "open" => cmd_open(args_iter),
         "run" => run::cmd_run(args_iter),
+        "commit" => commit::cmd_commit(args_iter),
+        "build" => build::cmd_build(args_iter),
+        "save" => imgcmd::cmd_save(args_iter),
+        "tag" => imgcmd::cmd_tag(args_iter),
+        "rmi" => imgcmd::cmd_rmi(args_iter),
+        "prune" => imgcmd::cmd_prune(),
         "pull" => cmd_pull(args_iter),
         "images" => cmd_images(),
         "cp" => cmd_cp(args_iter),
@@ -66,6 +76,12 @@ fn print_usage() {
     print("Usage:\n");
     print("  box run [--rm] [-d] [-i] [--name X] [-e K=V] <image> [cmd ...]  Run a container\n");
     print("  box open <name> [-i <img>] [-d] [--root <dir>] [cmd] [args...]             Start a box\n");
+    print("  box build -t <name> [-f Dockerfile] [--build-arg K=V] <context>  Build an image\n");
+    print("  box save [-o file.tar] <image>                            Export (docker load format)\n");
+    print("  box tag <source> <target>                                 Name an image again\n");
+    print("  box rmi <image>...                                        Remove images, collect layers\n");
+    print("  box prune                                                 Collect unused layers/cache\n");
+    print("  box commit <container> <image>                           Save a container as an image\n");
     print("  box pull <image>                                          Pull an OCI image\n");
     print("  box images                                                List pulled images\n");
     print("  box use <name|id> [-i] [-d] <cmd> [args...]               Run in box\n");

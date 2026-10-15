@@ -11,6 +11,8 @@ box pull busybox                                 # pull an image from Docker Hub
 box run --rm busybox /bin/busybox echo hi        # run a container
 box run --rm -i busybox sh                       # interactive shell in a container
 box run --rm --entrypoint curl curlimages-curl -sS https://example.com
+box build -t app:1 .                             # build an image from ./Dockerfile
+box save -o app.tar app:1                        # export for `docker load`
 box ps                                           # list active boxes
 box close demo                                   # stop a box
 ```
@@ -20,7 +22,11 @@ box close demo                                   # stop a box
 | Command | Description |
 |---------|-------------|
 | `box run [opts] <image> [cmd [args...]]` | Run a container from a pulled image |
-| `box pull <image>` | Pull an OCI image (Docker Hub, ghcr.io, etc.) |
+| `box pull <image>` | Pull an OCI image (Docker Hub, ghcr.io, etc.); blobs are kept and digests verified |
+| `box build -t <name> [-f F] [--build-arg K=V] [--target S] [--no-cache] <ctx>` | Build an image from a Dockerfile — [`docs/BOX_BUILD.md`](docs/BOX_BUILD.md) |
+| `box commit <container> <image>` | Save a container's changes as a new image layer |
+| `box save [-o file.tar] <image>` | Export an OCI layout + Docker `manifest.json` (`docker load` format) |
+| `box tag <src> <dst>` / `box rmi <image>…` / `box prune` | Name an image again / remove names and collect unused layers |
 | `box images` | List locally stored images |
 | `box open <name> [opts] [cmd] [args...]` | Create a plain box and run a command in it |
 | `box ps` | List active boxes |
@@ -229,14 +235,26 @@ src/
     paths.rs     the /var/lib/box layout, store names, overlay layer order
     spec.rs      image config → argv, `box run` flag parsing, box ids
     boxes.rs     /proc/boxes table parsing and name/id resolution
+    dockerfile.rs   Dockerfile parser, `$VAR` expansion, ENV/ARG grammars
+    dockerignore.rs .dockerignore matching
+    copyplan.rs  COPY/ADD destination arithmetic
+    buildopts.rs `box build` argv, HEALTHCHECK, durations
+    imgconfig.rs image config + manifest + OCI index, written and read
+    layer.rs     streaming tar -> gzip with diff_id and digest
+    stack.rs     merged view over a layer stack (whiteouts, opaque dirs)
   main.rs      Command dispatch, box lifecycle (open/close/ps/use/grab/cp)
   run.rs       `box run`: container creation, overlay mount, spawn
+  build.rs     `box build`: stages, RUN boxes, COPY/ADD, cache
+  commit.rs    `box commit` and the upper-to-layer primitive
+  imgcmd.rs    `box save`, `tag`, `rmi`, layer GC
+  fsx.rs       bounded-memory file helpers shared by the above
   oci.rs       OCI Distribution client (auth, blob download, extraction)
   images.rs    Image store I/O over boxlib::paths
   tests.rs     On-target suite (`box test`)
 docs/
   OCI_IMAGE_PULL.md   Pull pipeline architecture
   BOX_RUN.md          Containers, the overlay root, docker compatibility
+  BOX_BUILD.md        Image builds, the layer cache, `save`
   TESTING.md          Both test layers, and what belongs in each
 ```
 

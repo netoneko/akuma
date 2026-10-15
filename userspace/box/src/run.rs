@@ -7,9 +7,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use libakuma::{
-    close, exit, mkdir_p, open, open_flags, print, println, read_dir, read_fd, waitpid, write_fd,
-};
+use libakuma::{close, exit, mkdir_p, open, open_flags, print, println, read_fd, waitpid};
 
 use boxlib::spec::{self, ImageProcess, RunArgsError};
 use boxlib::sys::{self, SpawnOptions, spawn_ext_env};
@@ -30,7 +28,7 @@ pub fn image_process(store: &str) -> ImageProcess {
 /// Resolve a bare program name against the container's `PATH`, the way a shell
 /// would. An image's Entrypoint is usually just `curl`, and the kernel's spawn
 /// takes a path, not a name.
-fn resolve_in_container(upper: &str, lowerdirs: &[String], program: &str) -> String {
+pub(crate) fn resolve_in_container(upper: &str, lowerdirs: &[String], program: &str) -> String {
     if program.contains('/') {
         return String::from(program);
     }
@@ -53,7 +51,7 @@ fn resolve_in_container(upper: &str, lowerdirs: &[String], program: &str) -> Str
 /// then the layers topmost-first. Whiteouts are not consulted — a deleted
 /// `/etc/passwd` in an upper layer is not a case worth the complexity here.
 /// `""` if no layer has it, which `resolve_user` treats as an empty table.
-fn read_in_container(upper: &str, lowerdirs: &[String], path: &str) -> String {
+pub(crate) fn read_in_container(upper: &str, lowerdirs: &[String], path: &str) -> String {
     let candidates = core::iter::once(upper).chain(lowerdirs.iter().map(String::as_str));
     for dir in candidates {
         let full = format!("{}{}", dir, path);
@@ -76,70 +74,24 @@ fn read_in_container(upper: &str, lowerdirs: &[String], path: &str) -> String {
     String::new()
 }
 
-fn copy_file(src: &str, dst: &str) -> bool {
-    let sfd = open(src, open_flags::O_RDONLY);
-    if sfd < 0 {
-        return false;
-    }
-    let mut body = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = read_fd(sfd, &mut tmp);
-        if n <= 0 {
-            break;
-        }
-        body.extend_from_slice(&tmp[..n as usize]);
-    }
-    close(sfd);
-
-    let dfd = open(dst, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if dfd < 0 {
-        return false;
-    }
-    write_fd(dfd, &body);
-    close(dfd);
-    true
-}
-
 /// Give the container the two files an OCI image never ships but every
 /// networked program expects. Docker injects these the same way.
-fn inject_runtime_files(upper: &str, hostname: &str) {
-    let etc = format!("{}/etc", upper);
+///
+/// They go in the container's **runtime layer** (`paths::container_runtime`),
+/// stacked as the topmost lower directory — not into the writable upper, where
+/// every `box commit` of the container would capture them.
+pub(crate) fn inject_runtime_files(runtime: &str, hostname: &str) {
+    let etc = format!("{}/etc", runtime);
     mkdir_p(&etc);
 
+    // Derived from the host's file, not copied: a loopback nameserver (systemd-
+    // resolved's 127.0.0.53) does not exist inside the container.
+    let host_resolv = crate::fsx::read_text("/etc/resolv.conf").unwrap_or_default();
     let resolv = format!("{}/resolv.conf", etc);
-    if !copy_file("/etc/resolv.conf", &resolv) {
-        // No host resolver config to inherit; a sane default beats no file at
-        // all, since musl treats a missing resolv.conf as "no nameservers".
-        let fd = open(&resolv, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-        if fd >= 0 {
-            write_fd(fd, b"nameserver 10.0.2.3\n");
-            close(fd);
-        }
-    }
+    let _ = crate::fsx::write_file(&resolv, spec::container_resolv_conf(&host_resolv).as_bytes());
 
     let hosts = format!("{}/hosts", etc);
-    let fd = open(&hosts, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd >= 0 {
-        write_fd(fd, format!("127.0.0.1 localhost {}\n", hostname).as_bytes());
-        close(fd);
-    }
-}
-
-/// Depth-first delete. Used only for `--rm` on a container directory, whose
-/// contents this process created.
-fn remove_tree(path: &str) {
-    if let Some(entries) = read_dir(path) {
-        for entry in entries {
-            let child = format!("{}/{}", path, entry.name);
-            if entry.is_dir {
-                remove_tree(&child);
-            } else {
-                libakuma::unlink(&child);
-            }
-        }
-    }
-    libakuma::rmdir(path);
+    let _ = crate::fsx::write_file(&hosts, format!("127.0.0.1 localhost {}\n", hostname).as_bytes());
 }
 
 pub fn cmd_run(args: libakuma::Args) -> ! {
@@ -218,14 +170,26 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         println(&upper);
         exit(1);
     }
-    inject_runtime_files(&upper, &container);
+    let runtime = images::container_runtime(&container);
+    if !mkdir_p(&runtime) {
+        print("box run: failed to create ");
+        println(&runtime);
+        exit(1);
+    }
+    inject_runtime_files(&runtime, &container);
+    // So `box commit <container>` knows which image to extend.
+    let _ = crate::fsx::write_file(&images::container_image_file(&container), store.as_bytes());
 
     // The box's root is the container directory, which is what the kernel
     // validates and jails to; the overlay then replaces that jail with the
     // union of the image layers over the container's upper directory.
     sys::register_box(box_id, &container, &croot, 0);
 
-    let rc = libakuma::mount_overlay_root(box_id, &lowerdirs, &upper);
+    // Topmost-first: the runtime layer, then the image's layers.
+    let mut mount_lowers = Vec::with_capacity(lowerdirs.len() + 1);
+    mount_lowers.push(runtime.clone());
+    mount_lowers.extend(lowerdirs.iter().cloned());
+    let rc = libakuma::mount_overlay_root(box_id, &mount_lowers, &upper);
     if rc != 0 {
         print("box run: overlay mount failed: errno ");
         println(&format!("{}", -rc));
@@ -325,7 +289,7 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         println(&path);
         if rm {
             sys::kill_box(box_id);
-            remove_tree(&croot);
+            crate::fsx::remove_tree(&croot);
         }
         exit(1);
     };
@@ -357,7 +321,7 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
 
     if rm {
         sys::kill_box(box_id);
-        remove_tree(&croot);
+        crate::fsx::remove_tree(&croot);
     }
     exit(code);
 }

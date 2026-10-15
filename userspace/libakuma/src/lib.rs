@@ -171,6 +171,7 @@ pub mod syscall {
         pub const STATFS: u64 = 43;
         pub const UNLINKAT: u64 = 35;
         pub const SYMLINKAT: u64 = 36;
+        pub const READLINKAT: u64 = 78;
         pub const LINKAT: u64 = 37;
         pub const RENAMEAT: u64 = 38;
         pub const GETRANDOM: u64 = 278;
@@ -262,6 +263,7 @@ pub mod syscall {
         pub const STATFS: u64 = 137;
         pub const UNLINKAT: u64 = 263;
         pub const SYMLINKAT: u64 = 266;
+        pub const READLINKAT: u64 = 267;
         pub const LINKAT: u64 = 265;
         pub const RENAMEAT: u64 = 264;
         pub const GETRANDOM: u64 = 318;
@@ -1714,6 +1716,25 @@ pub fn symlink(target: &str, link_path: &str) -> i32 {
         link_c.as_ptr() as u64,
         0, 0, 0,
     ) as i32
+}
+
+/// Read a symlink's target (`readlinkat(AT_FDCWD, …)`). `None` if `path` is not
+/// a symlink or the target is not UTF-8.
+pub fn readlink(path: &str) -> Option<alloc::string::String> {
+    let path_c = alloc::format!("{}\0", path);
+    let mut buf = [0u8; 4096];
+    let n = syscall(
+        syscall::READLINKAT,
+        -100i32 as u64, // AT_FDCWD
+        path_c.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0, 0,
+    ) as i64;
+    if n < 0 {
+        return None;
+    }
+    core::str::from_utf8(&buf[..n as usize]).ok().map(alloc::string::String::from)
 }
 
 /// Create a hard link: `new_path` becomes another name for `old_path`'s file

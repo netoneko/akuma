@@ -233,6 +233,53 @@ impl ImageProcess {
     }
 }
 
+/// The resolver nameservers a container gets when the host has no usable one.
+pub const FALLBACK_NAMESERVERS: &str = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+
+fn is_loopback_nameserver(addr: &str) -> bool {
+    addr == "::1" || addr == "0.0.0.0" || addr.starts_with("127.") || addr.eq_ignore_ascii_case("localhost")
+}
+
+/// The container's `/etc/resolv.conf`, derived from the host's the way Docker
+/// does it: a nameserver on the host's own loopback (`127.0.0.53`, systemd-
+/// resolved's stub; `127.0.0.1`, dnsmasq) names a resolver that does not exist
+/// *inside* the container, so it is dropped, and a container left with none
+/// gets public resolvers. Comments are dropped; `search`/`options` are kept.
+///
+/// Copying the file verbatim made every `RUN apk add` on a systemd host fail
+/// with `temporary error (try again later)` (ryzen/Gentoo, 2026-10-15).
+pub fn container_resolv_conf(host: &str) -> String {
+    let mut out = String::new();
+    let mut nameservers = 0;
+    for line in host.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        match it.next() {
+            Some("nameserver") => {
+                if let Some(addr) = it.next() {
+                    if !is_loopback_nameserver(addr) {
+                        out.push_str(t);
+                        out.push('\n');
+                        nameservers += 1;
+                    }
+                }
+            }
+            Some("search" | "options" | "domain") => {
+                out.push_str(t);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    if nameservers == 0 {
+        out.push_str(FALLBACK_NAMESERVERS);
+    }
+    out
+}
+
 /// A box id derived from its name, so `box run --name web` twice means the same
 /// box. Not a hash anyone should rely on — just a stable spread over u64.
 pub fn box_id_for(name: &str) -> u64 {
@@ -322,6 +369,22 @@ pub fn parse_run_args(args: &[&str]) -> Result<RunArgs, RunArgsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolv_conf_drops_loopback_nameservers() {
+        let systemd = "# stub\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch lan\n";
+        assert_eq!(
+            container_resolv_conf(systemd),
+            "options edns0 trust-ad\nsearch lan\nnameserver 8.8.8.8\nnameserver 1.1.1.1\n"
+        );
+        // Real resolvers survive, in order; comments do not.
+        let real = "# comment\nnameserver 192.168.1.1\nnameserver 127.0.0.1\nnameserver 2606:4700::1111\n";
+        assert_eq!(container_resolv_conf(real), "nameserver 192.168.1.1\nnameserver 2606:4700::1111\n");
+        // Nothing at all still yields a working file.
+        assert_eq!(container_resolv_conf(""), FALLBACK_NAMESERVERS);
+        assert_eq!(container_resolv_conf("nameserver ::1\n"), FALLBACK_NAMESERVERS);
+    }
+
     use alloc::vec;
 
     fn strs(v: &[&str]) -> Vec<String> {

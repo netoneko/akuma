@@ -172,6 +172,7 @@ fn extract_gzip(
     }
 
     let mut stats = Stats::default();
+    let mut pending = crate::format::Overrides::default();
     let mut pos: usize = 0;
     let mut zero_blocks = 0;
 
@@ -195,7 +196,21 @@ fn extract_gzip(
         };
         zero_blocks = 0;
 
-        if entry.kind == EntryKind::Metadata || entry.path.is_empty() {
+        if entry.kind == EntryKind::Metadata {
+            // PAX / GNU long-name records describe the entry after them.
+            let end = (pos + entry.size).min(data.len());
+            match entry.typeflag {
+                b'x' => pending = crate::format::parse_pax(&data[pos..end]),
+                b'L' => pending.path = Some(crate::format::parse_gnu_longname(&data[pos..end])),
+                b'K' => pending.linkpath = Some(crate::format::parse_gnu_longname(&data[pos..end])),
+                _ => {}
+            }
+            pos += entry.payload_span();
+            continue;
+        }
+        let mut entry = entry;
+        core::mem::take(&mut pending).apply(&mut entry);
+        if entry.path.is_empty() {
             pos += entry.payload_span();
             continue;
         }

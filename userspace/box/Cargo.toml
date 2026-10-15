@@ -15,7 +15,7 @@ edition = "2021"
 # pipeline it never calls — see docs/archive/HERD_PLUS_BOX.md.
 default = ["akuma", "pull"]
 akuma = ["dep:libakuma"]
-pull = ["akuma", "dep:libakuma-tls", "dep:akuma-tar"]
+pull = ["akuma", "dep:libakuma-tls", "dep:akuma-tar", "akuma-tar/akuma"]
 
 [dependencies]
 # Optional only so the `boxlib` unit tests can build for the host — the binary
@@ -23,13 +23,19 @@ pull = ["akuma", "dep:libakuma-tls", "dep:akuma-tar"]
 libakuma = { path = "../libakuma", features = ["chunked-allocator"], optional = true }
 libakuma-tls = { path = "../libakuma-tls", optional = true }
 # Layer extraction is linked in, not spawned as /bin/tar — see tar/src/lib.rs.
-akuma-tar = { package = "tar", path = "../tar", optional = true }
+akuma-tar = { package = "tar", path = "../tar", optional = true, default-features = false }
 # JSON. no_std, allocation-free, non-recursive pull parser: it borrows from the
 # document and only touches a caller-owned scratch buffer to un-escape strings,
 # so `box` keeps deciding when to allocate. Built without `float` — an OCI
 # manifest has no fractional numbers, and `float-skip` steps over one rather
 # than failing the document.
 picojson = { version = "0.2", default-features = false, features = ["int64", "float-skip"] }
+
+# Layer commit: tar bytes -> sha256 (diff_id), deflate -> crc32 + sha256 (blob
+# digest). Same versions `tar` and `akuma-ssh-crypto` already use.
+sha2 = { version = "0.10", default-features = false }
+miniz_oxide = { version = "0.7", features = ["with-alloc"] }
+crc32fast = { version = "1.3", default-features = false }
 
 # `box` is a reserved Rust keyword, so it cannot name a crate — the library half
 # is `boxlib`. The binary keeps the name users type.

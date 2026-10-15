@@ -40,6 +40,9 @@ pub struct Entry {
     pub uid: u32,
     pub gid: u32,
     pub kind: EntryKind,
+    /// The raw ustar typeflag — distinguishes PAX `x` / GNU `L` among
+    /// [`EntryKind::Metadata`].
+    pub typeflag: u8,
 }
 
 impl Entry {
@@ -77,7 +80,77 @@ pub fn parse_header(header: &[u8; BLOCK_SIZE]) -> Option<Entry> {
         uid: parse_id(&header[108..116]),
         gid: parse_id(&header[116..124]),
         kind,
+        typeflag,
     })
+}
+
+/// Overrides a PAX extended header (`x`) or a GNU long-name record (`L`/`K`)
+/// applies to the **next** entry.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub path: Option<String>,
+    pub linkpath: Option<String>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<usize>,
+}
+
+impl Overrides {
+    /// Apply to the entry they precede.
+    pub fn apply(self, e: &mut Entry) {
+        if let Some(p) = self.path {
+            e.path = normalize_entry_path(&p);
+        }
+        if let Some(l) = self.linkpath {
+            e.linkname = l;
+        }
+        if let Some(u) = self.uid {
+            e.uid = u;
+        }
+        if let Some(g) = self.gid {
+            e.gid = g;
+        }
+        if let Some(n) = self.size {
+            e.size = n;
+        }
+    }
+}
+
+/// Parse a PAX payload: records of `"<len> <key>=<value>\n"`. Unknown keys and
+/// malformed records are skipped, as every reader must.
+#[must_use]
+pub fn parse_pax(data: &[u8]) -> Overrides {
+    let mut o = Overrides::default();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(sp) = data[pos..].iter().position(|&b| b == b' ') else { break };
+        let Ok(len) = core::str::from_utf8(&data[pos..pos + sp]).unwrap_or("").parse::<usize>() else { break };
+        if len == 0 || pos + len > data.len() || sp + 1 >= len {
+            break;
+        }
+        let rec = &data[pos + sp + 1..pos + len];
+        let rec = rec.strip_suffix(b"\n").unwrap_or(rec);
+        if let Some(eq) = rec.iter().position(|&b| b == b'=') {
+            let key = core::str::from_utf8(&rec[..eq]).unwrap_or("");
+            let val = String::from(core::str::from_utf8(&rec[eq + 1..]).unwrap_or(""));
+            match key {
+                "path" => o.path = Some(val),
+                "linkpath" => o.linkpath = Some(val),
+                "uid" => o.uid = val.parse().ok(),
+                "gid" => o.gid = val.parse().ok(),
+                "size" => o.size = val.parse().ok(),
+                _ => {}
+            }
+        }
+        pos += len;
+    }
+    o
+}
+
+/// A GNU `L`/`K` payload is the bare NUL-terminated name.
+#[must_use]
+pub fn parse_gnu_longname(data: &[u8]) -> String {
+    extract_str(data)
 }
 
 /// Strip the `./` prefix tar archives conventionally carry.
@@ -282,6 +355,20 @@ pub fn strip_gzip_header(data: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pax_records_override_the_next_entry() {
+        let o = parse_pax(b"20 path=long/name.x\n12 uid=4000\n13 foo=bar\n");
+        assert_eq!(o.path.as_deref(), Some("long/name.x"));
+        assert_eq!(o.uid, Some(4000));
+        assert_eq!(o.gid, None);
+        // Truncated / malformed input must not panic or loop.
+        let _ = parse_pax(b"999 path=x\n");
+        let _ = parse_pax(b"abc");
+        let _ = parse_pax(b"5 \n");
+        assert_eq!(parse_gnu_longname(b"a/b\0\0\0"), "a/b");
+    }
+
 
     /// Build a header the way GNU tar does, so the checksum is real.
     fn header(name: &str, size: usize, mode: u32, typeflag: u8, linkname: &str) -> [u8; BLOCK_SIZE] {
