@@ -46,7 +46,7 @@ fn garbage_is_not_a_battery() {
         let r = Reading::decode(&[fill; BLOCK_LEN]);
         assert!(!r.validate(), "fill {fill:#x}");
         let mut out = [0u8; 512];
-        let n = render(&mut out, Source::Ec, Some(&[fill; BLOCK_LEN]));
+        let n = render(&mut out, Source::Ec, Some(&[fill; BLOCK_LEN]), None);
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.contains("valid=0"), "{s}");
         assert!(!s.contains("percent="), "garbage shown as a charge: {s}");
@@ -73,7 +73,7 @@ fn ac_with_idle_btst_is_not_charging() {
 #[test]
 fn render_matches_the_documented_shape() {
     let mut out = [0u8; 512];
-    let n = render(&mut out, Source::Ec, Some(&measured()));
+    let n = render(&mut out, Source::Ec, Some(&measured()), Some(1204));
     let s = core::str::from_utf8(&out[..n]).unwrap();
     for line in [
         "source=ec\n",
@@ -86,6 +86,7 @@ fn render_matches_the_documented_shape() {
         "power_mw=6983\n",
         "energy_now_mwh=52940\n",
         "minutes=454\n",
+        "energy_mwh=1204\n",
         "btst=1\n",
     ] {
         assert!(s.contains(line), "missing {line:?} in:\n{s}");
@@ -94,16 +95,25 @@ fn render_matches_the_documented_shape() {
 }
 
 #[test]
+fn render_without_a_meter_has_no_energy_line() {
+    let mut out = [0u8; 512];
+    let n = render(&mut out, Source::Ec, Some(&measured()), None);
+    let s = core::str::from_utf8(&out[..n]).unwrap();
+    assert!(s.contains("power_mw=6983"), "{s}");
+    assert!(!s.contains("energy_mwh"), "no meter, no line: {s}");
+}
+
+#[test]
 fn render_with_no_source() {
     let mut out = [0u8; 64];
-    let n = render(&mut out, Source::None, None);
+    let n = render(&mut out, Source::None, None, None);
     assert_eq!(&out[..n], b"source=none\nac=unknown\nbattery=0\n");
 }
 
 #[test]
 fn render_truncates_instead_of_panicking() {
     let mut out = [0u8; 10];
-    let n = render(&mut out, Source::Ec, Some(&measured()));
+    let n = render(&mut out, Source::Ec, Some(&measured()), None);
     assert_eq!(n, 10);
 }
 

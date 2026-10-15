@@ -22,10 +22,12 @@
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use akuma_power::aml::{self, MAX_DECL_LEN};
-use akuma_power::ec::BLOCK_LEN;
+use akuma_power::ec::{BLOCK_LEN, Reading};
+use akuma_power::ledger::Ledger;
 use akuma_power::render::{self, Source};
 use akuma_power::sim;
 use akuma_ryzen_amd64::{MachineDescription, PhysMem};
+use spinning_top::Spinlock;
 
 use crate::machine::Physmap;
 use crate::paging::{self, MemAttr, PteProt};
@@ -44,6 +46,13 @@ const MODE_SIM: u8 = 2;
 static MODE: AtomicU8 = AtomicU8::new(MODE_NONE);
 /// Kernel-virtual address of the window's first byte, when `MODE_EC`.
 static EC_VA: AtomicU64 = AtomicU64::new(0);
+
+/// The running energy total, integrated between `/proc/power` reads. The
+/// renderer is the sampler: nothing reads the EC or ticks a timer when nobody
+/// is looking, which is the same property the file itself has. A reader that
+/// wants fine energy resolution reads more often — the rio panel's once a
+/// second keeps the integration error near the truncation floor.
+static LEDGER: Spinlock<Ledger> = Spinlock::new(Ledger::new());
 
 /// Find the window, map it, and register `/proc/power`.
 ///
@@ -146,14 +155,32 @@ fn read_window() -> [u8; BLOCK_LEN] {
     b
 }
 
+/// Integrate one decoded sample into the running total and return it.
+///
+/// Only valid samples integrate: a window of garbage has no power, and
+/// carrying the last known power across an invalid read would invent energy
+/// the meter never reported. The total survives a glitch — the reader sees it
+/// pause, not reset.
+fn energy_mwh(raw: &[u8; BLOCK_LEN]) -> u64 {
+    let r = Reading::decode(raw);
+    if !r.validate() {
+        return LEDGER.lock().total_mwh();
+    }
+    LEDGER.lock().sample(r.power_mw(), crate::net::uptime_us())
+}
+
 /// The `/proc/power` renderer.
 pub fn render_proc(out: &mut [u8]) -> usize {
     match MODE.load(Ordering::Acquire) {
-        MODE_EC => render::render(out, Source::Ec, Some(&read_window())),
+        MODE_EC => {
+            let raw = read_window();
+            render::render(out, Source::Ec, Some(&raw), Some(energy_mwh(&raw)))
+        }
         MODE_SIM => {
             let secs = crate::net::uptime_us() / 1_000_000;
-            render::render(out, Source::Sim, Some(&sim::block(secs)))
+            let raw = sim::block(secs);
+            render::render(out, Source::Sim, Some(&raw), Some(energy_mwh(&raw)))
         }
-        _ => render::render(out, Source::None, None),
+        _ => render::render(out, Source::None, None, None),
     }
 }

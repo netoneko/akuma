@@ -48,7 +48,16 @@ impl Write for Buf<'_> {
 /// Render into `out`, returning bytes written. `raw` is the undecoded window,
 /// printed as `ec_raw=` so a reader can check the decode against another OS
 /// without a rebuild.
-pub fn render(out: &mut [u8], source: Source, raw: Option<&[u8; BLOCK_LEN]>) -> usize {
+///
+/// `energy_mwh` is the running integrated total from
+/// [`crate::ledger::Ledger`] when a battery is being sampled — absent with the
+/// source, so a reader can tell "no energy counted" from "no meter here".
+pub fn render(
+    out: &mut [u8],
+    source: Source,
+    raw: Option<&[u8; BLOCK_LEN]>,
+    energy_mwh: Option<u64>,
+) -> usize {
     let mut w = Buf { buf: out, pos: 0 };
     let _ = writeln!(w, "source={}", source.as_str());
     let Some(raw) = raw else {
@@ -72,6 +81,13 @@ pub fn render(out: &mut [u8], source: Source, raw: Option<&[u8; BLOCK_LEN]>) -> 
         if let Some(m) = r.minutes() {
             let _ = writeln!(w, "minutes={m}");
         }
+    }
+    // Energy from the pack, integrated between reads (`ledger`). Shown whenever
+    // a meter exists — on AC at BTST 0 the pack's own power is near zero, and
+    // the number honestly says so — because "how much came *out of the pack*"
+    // is exactly the question a battery-life comparison asks.
+    if let Some(mwh) = energy_mwh {
+        let _ = writeln!(w, "energy_mwh={mwh}");
     }
     let _ = writeln!(w, "btst={}", r.btst);
     let _ = write!(w, "ec_raw=");
