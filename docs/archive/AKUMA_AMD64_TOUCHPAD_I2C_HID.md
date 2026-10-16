@@ -16,7 +16,7 @@ Nothing is wired to hardware yet — that needs the Linux-side measurement
 | `akuma-i2c-hid` — transport decisions (descriptor, commands, framing) | **done**: 8 host tests |
 | `akuma-dwi2c` — DesignWare I²C decisions (regs, timings, aborts) | **done**: 9 host tests |
 | `akuma-touchpad` — clickpad policy (click/right/scroll state machine) | **done**: 20 host tests |
-| M0: measure this unit's I²C controller + touchpad constants on Linux | **open** — one `sudo` session on Pop, recipe in the proposal §1.1 |
+| M0: measure this unit's I²C controller + touchpad constants on Linux | **done 2026-10-16** — §4a below; rdesc pinned as `akuma-hid` fixture |
 | kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **open** — needs M0's constants |
 | rio fork: read the node, winit pointer events, cursor sprite | **open** — kernel half first |
 
@@ -35,7 +35,7 @@ node is marked `PNP0C50`-shaped (an i2c-hid device). The keyboard is real
 i8042 (works), the panel is the GOP framebuffer (works), there is no serial
 port, and the touchpad is the machine's only pointer.
 
-**Open identity question, resolved at probe time:** our machine doc says
+**Identity question — RESOLVED by M0 (§4a): Goodix `GXTP5100`, not Synaptics.** The original text: our machine doc says
 *"I2C HID (Goodix touchpad, Wacom pen)"*; a linux-hardware.org probe of the
 same model (`26d850d9b3`) says the touchpad is a **Synaptics `SYNA2BA6`
 (06cb:cefe)** and the Goodix part is only the USB fingerprint reader. The
@@ -148,6 +148,43 @@ Then the kernel glue follows the wifi playbook (§6.3 of the proposal):
 `/dev/fb0` for the rio fork to read. QEMU cannot see any of this
 (`microvm` has no I²C); every gate is verified over ssh via menu entry 12,
 the same loop the wifi work ran.
+
+## 4a. M0 results (measured on the box, Pop Linux 6.17, 2026-10-16)
+
+| constant | value | source |
+|---|---|---|
+| touchpad | Goodix `GXTP5100` (ACPI `TPD3`, `_CID PNP0C50`), HID `27C6:01E0` | DSDT, dmesg |
+| I²C slave address | **0x5D** (7-bit, `I2cSerialBusV2`) | DSDT. The `0018:` in the HID name is the bus type, **not** the address |
+| bus speed | 400 kHz (0x61A80) | DSDT |
+| controller | `AMDI0010:00`, MMIO **0xFEDC2000**, 4 KiB (siblings at FEDC3000/4000/5000) | `/proc/iomem`, DSDT `\_SB.I2CA` |
+| interrupt | GpioInt level-low on `\_SB.GPIO` pin 8 — **ignored, we poll** | DSDT |
+| FMCN/SSCN | **absent from the DSDT** | iasl; `akuma-dwi2c`'s package-apply path has nothing to apply here |
+| other HID on the box | `0018:056A:53BC` (Wacom pen), `0020:1022:0001` (AMD sensor hub) | debugfs |
+
+**Live registers** (read via `/dev/mem` after forcing the controller awake;
+Linux had configured it): `IC_CON 0x65` (master, fast, restart-en),
+`IC_FS_HCNT:LCNT 0x84:0xEF`, `IC_SS 0x282:0x2ED`, `IC_SDA_HOLD 0x10048`,
+`IC_COMP_TYPE 0x44570140` (alive-check passes), `IC_COMP_VERSION 0x3230322a`.
+Since no ACPI timing exists, the glue should **keep the HCNT/LCNT the
+firmware/OS left** when it finds them non-zero (Linux does the same when it
+has no clock), and fall back to computing from a clock only if zero.
+
+**Power-gating trap (new risk):** with `power/control=auto` the controller is
+`runtime_status: suspended` and **every register reads `0xFFFFFFFF`** — the
+same signature as an unclocked block. Linux's ACPI PM brings it to D0 (and
+the `AMDI0010` `_PS0`/clock gate). Akuma, which never ran that, must not
+read `0xFFFFFFFF` as "no controller": M1 must treat it as *powered down*,
+and the glue needs a way to wake it (ACPI `_PS0`, or the FCH clock-gate
+register) before the `IC_COMP_TYPE` check. Same shape as the pad being
+power-gated at handoff (R-table).
+
+**Report descriptor** (665 bytes, ids 1,4,2,7,6,13,12,11,3,5,14) is now
+`akuma-hid`'s `fixtures::GOODIX_GXTP5100`, with two pinned findings:
+report **4** is the PTP input report — 29 payload bytes, 5 contacts × 40 bits
+(tip bit 1, id 4 bits at 4, X 16 bits at 8, Y at 24), contact count at bit
+216, clickpad button at bit 224; report 1 is a boot-mouse fallback. And
+`FieldTable::collect` on the whole descriptor **truncates** (>64 fields across
+11 report ids) — the glue must `locate()` per report id, not collect the lot.
 
 ## Background
 

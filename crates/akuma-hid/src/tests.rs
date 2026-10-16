@@ -469,3 +469,33 @@ fn const_items_are_not_in_the_field_table_but_are_in_the_stream() {
     let table = FieldTable::collect(BOOT_MOUSE);
     assert_eq!(table.len(), 5);
 }
+
+// ---- Goodix GXTP5100 (IdeaPad 5 2-in-1 16AHP9), captured from hardware ----
+
+#[test]
+fn goodix_ptp_report_layout() {
+    use crate::fixtures::GOODIX_GXTP5100 as G;
+    let loc = |u, id, k| locate(G, u, id, k).unwrap().0;
+    let l = |pos, size| HidLocation { pos, size, count: 1 };
+
+    // Report 4 is the PTP input report: 5 contacts x 40 bits, then a 16-bit
+    // scan time, contact count and the clickpad button; 29 payload bytes.
+    assert_eq!(report_size(G, ItemKind::Input, 4), Some(29));
+    // First contact: tip at bit 1 (confidence is bit 0), id is a 4-bit field.
+    assert_eq!(loc(USAGE_TIP, 4, ItemKind::Input), l(1, 1));
+    assert_eq!(loc(USAGE_CONTACT_ID, 4, ItemKind::Input), l(4, 4));
+    assert_eq!(loc(USAGE_X, 4, ItemKind::Input), l(8, 16));
+    assert_eq!(loc(USAGE_Y, 4, ItemKind::Input), l(24, 16));
+    assert_eq!(loc(USAGE_CONTACT_COUNT, 4, ItemKind::Input), l(216, 8));
+    assert_eq!(loc(USAGE_BTN1, 4, ItemKind::Input), l(224, 1));
+    // Report 1 is the boot-mouse fallback the firmware also exposes.
+    assert_eq!(report_size(G, ItemKind::Input, 1), Some(8));
+}
+
+#[test]
+fn goodix_whole_descriptor_overflows_the_field_table() {
+    use crate::fixtures::GOODIX_GXTP5100 as G;
+    // 11 report ids of vendor/feature fields exceed MAX_FIELDS; the table
+    // says so rather than panicking. Glue must locate() per report id.
+    assert!(FieldTable::collect(G).truncated);
+}

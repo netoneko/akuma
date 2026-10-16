@@ -72,6 +72,8 @@
 mod field;
 mod item;
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod tests;
 
 pub use field::{FieldTable, HidField, MAX_FIELDS};
