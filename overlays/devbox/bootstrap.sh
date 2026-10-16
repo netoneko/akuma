@@ -310,16 +310,19 @@ if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
             done
 
             # No profile.d PATH script, deliberately. This step used to write
-            # /etc/profile.d/rust.sh with `PATH=/usr/bin:$PATH` — which NEVER RAN.
-            # busybox ash sources /etc/profile only for LOGIN shells, this image has
-            # no /etc/profile at all (/etc comes solely from overlays/devbox/rootfs,
-            # which has none), and every harness here drives the VM through
-            # `ssh host cmd`, i.e. non-login. Verified on a live guest 2026-08-19:
+            # /etc/profile.d/rust.sh with `PATH=/usr/bin:$PATH`. As of 2026-10-16
+            # that WOULD run: overlays/devbox/rootfs now ships /etc/profile
+            # (Tokyo Night theme) and both the kernel DEFAULT_ENV and sshd
+            # session_env export ENV=/etc/profile, which busybox ash expands for
+            # every INTERACTIVE shell. We still remove it, because its
+            # `PATH=/usr/bin:$PATH` would shadow /usr/local (nightly) with the
+            # apk stable toolchain — the inverse of what the image intends.
+            # Verified on a live guest 2026-08-19 (pre-ENV-hook era):
             # rust.sh contained `PATH=/usr/bin:$PATH` while the actual PATH was
             # /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin.
             #
             # PATH order comes from the KERNEL: akuma_exec::process::types::DEFAULT_ENV
-            # (crates/akuma-exec/src/process/types.rs), which puts /usr/local ahead of
+            # (crates/akuma-exec-core/src/process.rs), which puts /usr/local ahead of
             # /usr by design so a locally-installed tool wins over the distro copy.
             # NOTE: no apostrophes in this comment block - it lives inside a
             # single-quoted sh -c string, so one would close it and break the script.

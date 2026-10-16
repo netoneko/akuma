@@ -211,6 +211,11 @@ pub fn compose_env(image_env: &[String], overrides: &[String]) -> Vec<String> {
 /// it owns every variable — a service that gained one `env =` line would
 /// otherwise silently lose `HOME` and `TERM`.
 ///
+/// Deliberate exception: the kernel's list carries `ENV=/etc/profile` so
+/// interactive busybox ash sources the Tokyo Night profile; container images
+/// don't ship that file, so this list intentionally does NOT — a dangling ENV
+/// would make interactive container shells try to dot-source a missing file.
+///
 /// Not used by `box run`: a container's environment is its image's `Env`, which
 /// is Docker's rule and deliberately does not include `HOME`/`TERM`.
 pub const DEFAULT_ENV: &[&str] = &[

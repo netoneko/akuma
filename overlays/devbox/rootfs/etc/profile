@@ -1,0 +1,86 @@
+# /etc/profile — system-wide shell environment, Tokyo Night edition.
+#
+# Colors: Tokyo Night (night variant) by folke —
+#   https://github.com/folke/tokyonight.nvim
+# (official hex palette; the trailing "NNN" notes are the xterm-256
+#  approximations used in the escape sequences below).
+#
+# How this file actually gets read on Akuma: busybox ash only sources
+# /etc/profile for LOGIN shells (argv[0] starting with '-'), and Akuma never
+# spawns login shells — the kernel runs init with argv[0] = bare path, and
+# userspace sshd spawns /bin/sh with no '-'. So two ENV hooks point
+# interactive ash at this file instead (ash expands $ENV for interactive
+# shells, POSIX semantics):
+#   - the kernel's DEFAULT_ENV (crates/akuma-exec-core/src/process.rs):
+#     covers the console shell (init=/bin/sh, herd console=true services);
+#   - userspace sshd's session_env (userspace/sshd/src/protocol.rs):
+#     covers interactive SSH sessions (sshd composes its session env from
+#     scratch, so it must carry ENV explicitly).
+# Non-interactive shells (scripts, `sh -c`) never read $ENV — unaffected.
+
+# --- Tokyo Night palette, exported -------------------------------------------
+# Anything that wants to match the shell (TUI apps, generated configs) can
+# reuse these. Hex is the official value from folke/tokyonight.nvim.
+export TN_BG='#1a1b26'          # background
+export TN_BG_DARK='#16161e'     # darker background (floats, sidebars)
+export TN_FG='#c0caf5'          # foreground
+export TN_FG_DARK='#a9b1d6'     # dark foreground (statuslines)
+export TN_COMMENT='#565f89'     # comments
+export TN_BLACK='#15161e'
+export TN_RED='#f7768e'         # 211
+export TN_GREEN='#9ece6a'       # 150
+export TN_YELLOW='#e0af68'      # 180
+export TN_BLUE='#7aa2f7'        # 111
+export TN_MAGENTA='#bb9af7'     # 183
+export TN_CYAN='#7dcfff'        # 117
+export TN_WHITE='#a9b1d6'
+export TN_ORANGE='#ff9e64'      # 216
+export TN_TEAL='#1abc9c'
+
+# --- LS_COLORS, Tokyo Night ---------------------------------------------------
+# busybox ls honors LS_COLORS when built with FEATURE_LS_COLOR (Alpine's
+# busybox is). Group mapping mirrors the vim theme's token colors:
+#   dirs=blue, symlinks=cyan, sockets=magenta, devices/fifos=orange/yellow,
+#   executables=green, broken links=red, archives=orange.
+export LS_COLORS='di=38;5;111:ln=38;5;117:or=38;5;211:mi=38;5;211:pi=38;5;180:so=38;5;183:bd=38;5;216:cd=38;5;216:su=37:sg=30:tw=38;5;111:ow=38;5;111:st=38;5;111:ex=38;5;150:*.tar=38;5;216:*.tgz=38;5;216:*.zip=38;5;216:*.gz=38;5;216:*.bz2=38;5;216:*.xz=38;5;216:*.png=38;5;180:*.jpg=38;5;180:*.jpeg=38;5;180:*.gif=38;5;180:*.rs=38;5;150:*.c=38;5;150:*.h=38;5;150:*.log=38;5;103'
+
+# grep highlight colors. No-op on busybox grep (no color support); honored by
+# any full grep that ends up on the disk (e.g. inside OCI images).
+export GREP_COLORS='ms=38;5;183:fn=38;5;111:ln=38;5;180:se=38;5;103'
+
+# --- interactive-only from here on --------------------------------------------
+# A login shell can still be non-interactive (`sh -l -c ...`); aliases and
+# PS1 past this point assume a prompt exists. ENV-sourced reads are always
+# interactive, so in practice this guard only filters odd login invocations.
+case $- in
+    *i*) ;;
+    *)   return 0 ;;
+esac
+
+# /etc/profile.d drop-ins (e.g. the Rust toolchain's PATH shim,
+# /etc/profile.d/rust.sh — now that this file runs, that shim works again).
+if [ -d /etc/profile.d ]; then
+    for _tn_f in /etc/profile.d/*.sh; do
+        [ -r "$_tn_f" ] && . "$_tn_f"
+    done
+    unset _tn_f
+fi
+
+# Prompt: user@host in comment gray, cwd in bold blue, sigil in cyan —
+# Tokyo Night "storm" look with nothing but POSIX ash.
+_tn_reset=$(printf '\033[0m')
+_tn_gray=$(printf '\033[38;5;103m')
+_tn_blue=$(printf '\033[1;38;5;111m')
+_tn_cyan=$(printf '\033[38;5;117m')
+if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    _tn_sigil='#'
+else
+    _tn_sigil='$'
+fi
+PS1="${_tn_gray}\u@\h${_tn_reset}:${_tn_blue}\w${_tn_reset} ${_tn_cyan}${_tn_sigil}${_tn_reset} "
+unset _tn_reset _tn_gray _tn_blue _tn_cyan _tn_sigil
+
+# Color ls by default, but only when this busybox build understands --color.
+if ls --color=auto / >/dev/null 2>&1; then
+    alias ls='ls --color=auto'
+fi

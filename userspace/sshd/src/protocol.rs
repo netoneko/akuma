@@ -382,6 +382,13 @@ fn session_env(session: &SshSession) -> Vec<String> {
     if session.pty_requested && !session.term_type.is_empty() {
         env.push(format!("TERM={}", session.term_type));
     }
+    // ENV: busybox ash expands $ENV for INTERACTIVE shells — this is the only
+    // way /etc/profile (Tokyo Night theme, LS_COLORS, profile.d drop-ins)
+    // gets read here, since this daemon spawns /bin/sh as a NON-login shell
+    // (no leading '-' on argv[0]) and this env list is composed from scratch,
+    // so the kernel DEFAULT_ENV's ENV entry does not reach the session shell.
+    // Non-interactive `sh -c` sessions ignore $ENV entirely.
+    env.push(String::from("ENV=/etc/profile"));
     env
 }
 
