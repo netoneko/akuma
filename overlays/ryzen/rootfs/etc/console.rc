@@ -1,0 +1,21 @@
+# Sourced by every interactive shell started from the console shell: the console
+# service sets ENV=/etc/console.rc (herd's `env =` line), and herdr's panes inherit it.
+#
+# The screen setup for a machine (margin, how much of the screen is used, font,
+# smoothing) belongs in /etc/console.conf, read at boot; this file is for anything
+# else an on-screen shell should do on start, e.g.:
+#
+#   stty cols 73 rows 41
+#
+AKUMA_CONSOLE_RC=loaded
+export AKUMA_CONSOLE_RC
+
+# The shell theme (prompt, LS_COLORS; the Tokyo Night palette — attribution in
+# /etc/profile). The kernel's DEFAULT_ENV exports ENV=/etc/profile for processes it
+# spawns itself, but the console service sets ENV to THIS file, so this file has to
+# load it: without this line the on-screen shell never gets the theme.
+[ -f /etc/profile ] && . /etc/profile
+
+# Rust/cargo environment, same as ssh login shells. Last, so its PATH (and
+# HOME=${HOME:-/root}) win over anything the profile set.
+[ -f /etc/akuma-dev.env ] && . /etc/akuma-dev.env

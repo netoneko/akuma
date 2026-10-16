@@ -1,9 +1,19 @@
 # /etc/profile — system-wide shell environment, Tokyo Night edition.
 #
-# Colors: Tokyo Night (night variant) by folke —
-#   https://github.com/folke/tokyonight.nvim
-# (official hex palette; the trailing "NNN" notes are the xterm-256
-#  approximations used in the escape sequences below).
+# Colors: the Tokyo Night "night" palette.
+#
+# ATTRIBUTION. The hex values below are from tokyonight.nvim by Folke Lemaitre
+# (https://github.com/folke/tokyonight.nvim; lua/tokyonight/colors/night.lua over
+# storm.lua, checked against commit cdc07ac), licensed under the Apache License 2.0.
+# tokyonight.nvim is a port of the Tokyo Night VS Code theme by Enkia
+# (https://github.com/tokyo-night/tokyo-night-vscode-theme), MIT licence,
+# Copyright (c) 2018-present Enkia. The licence texts and the details of what was
+# taken are in third_party/tokyo-night/ and THIRD_PARTY_NOTICES.md at the top of the
+# Akuma tree.
+# CHANGES: only colour values were taken, copied unchanged. The TN_* names, the
+# xterm-256 approximations (the trailing "NNN" notes, used in the escape sequences
+# below), LS_COLORS, GREP_COLORS and the prompt are Akuma's own. TN_BLACK is the one
+# value that upstream's night.lua does not define.
 #
 # How this file actually gets read on Akuma: busybox ash only sources
 # /etc/profile for LOGIN shells (argv[0] starting with '-'), and Akuma never

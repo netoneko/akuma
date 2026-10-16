@@ -13,9 +13,60 @@ here are original. Fonts and the `akuma-fbcon` dependencies have their own file:
 | `userspace/rumpkernel/rumpuser/src/fiber.rs` | NetBSD `lib/librumpuser/rumpfiber.c`, itself partly from Xen MiniOS `sched.c` | BSD-2-Clause, and MIT (Xen MiniOS) | Below |
 | `userspace/rumpkernel/rumpuser/virtif_user_instr.c` | NetBSD `sys/rump/net/lib/libvirtif/virtif_user.c` (instrumentation added) | BSD-2-Clause | Below |
 | `userspace/rumpkernel/rumpuser/sp_serve_fd.c` | NetBSD `lib/librumpuser/rumpuser_sp.c` (`#include`d unmodified; the serve loop is reduced from `spserver`) | BSD-2-Clause | Below |
+| `overlays/{ryzen,devbox}/rootfs/etc/profile` | The **Tokyo Night** colour palette: values from `folke/tokyonight.nvim` (Folke Lemaitre), a port of the `tokyo-night-vscode-theme` (Enkia) | Apache-2.0 (tokyonight.nvim); MIT (Tokyo Night VS Code theme) | Below, and `third_party/tokyo-night/` |
 
 The NetBSD rump kernel sources themselves are the `userspace/rumpkernel/src-netbsd`
 submodule and keep their own per-file notices.
+
+### Tokyo Night colour palette (Folke Lemaitre; Enkia)
+
+The shell theme in `overlays/ryzen/rootfs/etc/profile` and
+`overlays/devbox/rootfs/etc/profile` uses the colour values of the **Tokyo Night**
+palette, "night" variant, as given by
+[tokyonight.nvim](https://github.com/folke/tokyonight.nvim)
+(`lua/tokyonight/colors/night.lua`, over `storm.lua`; checked against commit
+`cdc07ac78467a233fd62c493de29a17e0cf2b2b6`).
+
+tokyonight.nvim is Copyright its authors (Folke Lemaitre, `folke`, and contributors),
+licensed under the **Apache License, Version 2.0**; the full text is in
+`third_party/tokyo-night/LICENSE-tokyonight.nvim`, and the licence may also be
+obtained at <http://www.apache.org/licenses/LICENSE-2.0>. Upstream names no copyright
+holder in its `LICENSE` and ships no `NOTICE` file.
+
+tokyonight.nvim is a port of the **Tokyo Night** theme for Visual Studio Code by
+Enkia, <https://github.com/tokyo-night/tokyo-night-vscode-theme>:
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018-present Enkia
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+What was taken: fourteen colour values, copied unchanged into `export TN_*` lines
+(the other palette entries are unused). What was not: the `TN_*` names, the xterm-256
+approximations, the `LS_COLORS` / `GREP_COLORS` mappings and the prompt are written
+for Akuma; `TN_BLACK` (`#15161e`) is not defined in upstream's `night.lua` or
+`storm.lua`. No upstream file is included or modified (Apache-2.0 section 4(b)).
+Details: `third_party/tokyo-night/README.md`.
 
 ### NetBSD `rumpfiber.c` (Antti Kantee, Justin Cormack)
 
