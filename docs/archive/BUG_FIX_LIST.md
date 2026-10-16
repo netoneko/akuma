@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1359
-- **Docs contributing at least one fix:** 375
+- **Total distinct fixes counted:** 1409
+- **Docs contributing at least one fix:** 382
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 217 | 16.0% | 28 |
-| Memory & Virtual Memory | 174 | 12.8% | 56 |
-| Scheduler & Process Management | 138 | 10.2% | 42 |
-| SMP & Locking | 131 | 9.6% | 52 |
-| Networking | 91 | 6.7% | 32 |
-| Userspace Apps & Libraries | 40 | 2.9% | 21 |
-| Rump Kernel & Syscall Proxy | 26 | 1.9% | 6 |
-| Toolchain & Self-Hosting | 89 | 6.5% | 12 |
-| SSH | 39 | 2.9% | 18 |
-| VFS & Filesystem | 113 | 8.3% | 36 |
-| Boot & Drivers | 117 | 8.6% | 17 |
+| Syscall / ABI Compatibility Audits | 239 | 17.0% | 31 |
+| Memory & Virtual Memory | 174 | 12.3% | 56 |
+| Scheduler & Process Management | 138 | 9.8% | 42 |
+| SMP & Locking | 131 | 9.3% | 52 |
+| Networking | 91 | 6.5% | 32 |
+| Userspace Apps & Libraries | 40 | 2.8% | 21 |
+| Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
+| Toolchain & Self-Hosting | 90 | 6.4% | 12 |
+| SSH | 39 | 2.8% | 18 |
+| VFS & Filesystem | 120 | 8.5% | 38 |
+| Boot & Drivers | 125 | 8.9% | 18 |
 | Signals & Exceptions | 36 | 2.6% | 13 |
-| Misc / Cross-cutting | 48 | 3.5% | 16 |
-| Console & Terminal | 57 | 4.2% | 17 |
-| Containers | 43 | 3.2% | 9 |
-| **Total** | **1359** | **100.0%** | **375** |
+| Misc / Cross-cutting | 48 | 3.4% | 16 |
+| Console & Terminal | 57 | 4.0% | 17 |
+| Containers | 55 | 3.9% | 10 |
+| **Total** | **1409** | **100.0%** | **382** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -50,7 +50,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (217 fixes, 28 docs)
+## Syscall / ABI Compatibility Audits (239 fixes, 31 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -287,6 +287,34 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - timed futex waits overshot by a whole tick (an `hlt` ran before the deadline test on every pass, and a halted core waited for its next periodic tick); the pre-deadline halt is gone, `lapic::arm_deadline` programs a one-shot for the earliest waiter, and `ThreadWaker::wake` kicks a halted core with an IPI (futex 1 ms: 10.0 -> 1.013 ms)
 - `MAP_FIXED_NOREPLACE` was treated as a hint on amd64 (it fell into the unhinted branch, even over text and stack); it maps exactly at `addr` or fails `EEXIST`
 - glue's stdout `write` applied ONLCR whenever the session's stdin was still open, without asking whether the channel was a terminal, so an ssh exec session raced the client's stdin EOF and `\r` landed before some `\n` (2 MB over `ssh host cmd` corrupted 2 of 3 runs); only `is_terminal()` channels translate
+
+### docs/archive/AKUMA_GENTOO.md
+- boxes got no synthetic `/dev` (the `dev_node` arm was host-only and nothing could `mknod`), so `/dev/null` did not exist in any box; a box now gets a fresh instance of the standard set, `ptmx` and `pts` included
+- `resolve_symlinks` canonicalized the whole path and followed only a *final* symlink, dropping every component after an interior one, so `/bin/sh` through `bin -> usr/bin` resolved to `/usr/bin` and a usr-merged Gentoo tree could not spawn anything; the walk is `akuma_vfs::resolve_symlink_chain` (12 host tests), wired into both kernels
+- `run_init` read its path with `read_file`, which follows no symlink, so `init=/bin/sh` on a usr-merged root was "not on the disk"; it resolves symlinks first, like `execve`
+- the rtw89 firmware loader looked up `/lib/firmware/...` with `metadata`/`read_at`, neither of which follows links, so with `/lib -> usr/lib` no firmware loaded and `/dev/wifi0` never registered; it resolves the path once and reads the resolved name
+- `sethostname`/`setdomainname` were in neither syscall table, so OpenRC's `hostname` service got `ENOSYS` and `netmount` never started; rows in `akuma-syscalls-linux::nr` and `akuma-syscalls-abi`, a handler in `akuma-syscalls-glue::proc`, and `uname` overlays the two fields (`akuma_syscalls_linux::uts`)
+- `getsockopt(IPPROTO_IP, IP_OPTIONS)` answered a 4-byte zero, which OpenSSH's `check_ip_options` reads as source routing and drops the connection; it reports length 0
+- there was no `chroot(2)` in either kernel, so OpenSSH's privilege separation (`chroot("/var/empty")`) failed `ENOSYS`; a real per-process root (`Process::root`, applied in `resolve_mount` after the path is canonicalised against the chroot's own `/`, `akuma_vfs::under_root`)
+- the wifi scan table (`MAX_BSS = 24`) was crowded out by hidden-SSID beacons before the sweep reached the home AP's channel, so some boots said "no known network in range" forever; `rtw89_sta::sweep` skips empty-SSID beacons
+- the user stack was 128 pages mapped at exec and never grown, so a program using more (coreutils `wc -l` keeps a 256 KiB buffer on the stack) took a `#PF` with `cr2 == rsp` that nothing serviced; below the eager pages one demand-paged anonymous region now grows to 8 MiB (`ELF_STACK_MAX_PAGES`, `mm::lazy_stack_region`) and `RLIMIT_STACK` reports it
+- `chown`/`chmod` on a live `/dev/pts/N` slave returned `ENOENT` because the handlers probed the real filesystem first, so OpenSSH's monitor `fatal()`ed at pty allocation and interactive login closed; `akuma_vfs_glue::is_pty_slave` makes them accept and ignore, like device nodes
+- `/proc/self` was reported as a symlink but `read_symlink("self")` had no arm, so procps's `open("/proc/self", O_PATH | O_DIRECTORY)` was `ENOENT` and `ps` printed "mount -t proc"; it answers the caller's tgid, and the `strace_err` flag, parsed only on the PVH boot path, is now read on the GRUB path too
+
+### docs/archive/AKUMA_GENTOO_PORTAGE_CRASH.md
+- AVX was advertised by cpuid but never enabled (`CR4.OSXSAVE` and `XCR0` stayed off), and CPython 3.14's HACL* `_blake2` dispatches on cpuid without `xgetbv`, so it ran AVX2 and took `#UD`/`#GP` (`_blake2` SIGSEGV, `emerge` SIGILL); `smp::enable_xsave()` sets them on the BSP and every AP and the context switch uses `xsave64`/`xrstor64` on an 832-byte area
+- opening `/dev/fd/N` (or `/dev/std*`, `/proc/self/fd/N`) on a pipe returned the link text `pipe:[id]` or `ENOENT`, which broke bash process substitution and emerge's "sane /dev" check; `openat_path` dups the pipe end with its refcount
+
+### docs/archive/UNIX_PERMISSIONS.md
+- `kill`/`tkill`/`tgkill` checked neither box nor uid, and amd64's `kill(-1)`/group form signalled every process on the machine from inside a box; `check_signal` (box reach always, uid while enforcing) is wired into both kernels
+- x86_64 had no rows for `setreuid`/`setregid`/`setgroups`/`getresuid`/`getresgid`/`setfsuid`/`setfsgid`, so they were `ENOSYS` on amd64
+- ownership was never stored: `fchown`/`fchownat` returned 0 and kept nothing, every create wrote uid/gid 0, `stat` reported no owner, x86_64 `chown`/`lchown` had no shims and its `fchown` shim passed the fd as a dirfd with a NULL path; `Metadata.{uid,gid}`, `Filesystem::chown` (ext2 including the high halves), real `fchown`/`fchownat`, new files owned by their creator
+- `umask(2)` returned a constant `0o022` and could not be set, and `open(O_CREAT)` never applied the umask; both are real
+- memfs reported a fixed `0755 root` for every directory, which would lock every non-root writer out of any tmpfs once enforcing; its root is `1777` as on Linux
+- overlay copy-up of a directory (and of a file's parents) kept the upper's default `0755`, so a container's `/tmp` lost `1777` the moment anything wrote under it; copy-up carries mode and owner
+- `akuma-tar` never applied directory modes and discarded uid/gid; it applies both and `lchown`s as root
+- amd64 has its own `execve` path with no permission check and x86_64 `truncate` (76) was `ENOSYS`, both found by `permprobe` on the metal
+- `box` ignored the image config's `User`, so every container ran as root; `boxlib::spec::resolve_user` (runc rules) and `box run -u`, with credentials installed before the child is published
 
 ## Memory & Virtual Memory (174 fixes, 56 docs)
 
@@ -1335,7 +1363,7 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (89 fixes, 12 docs)
+## Toolchain & Self-Hosting (90 fixes, 12 docs)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -1413,6 +1441,7 @@ aren't recorded anywhere else.)
 - the staged source tree had no vendored fonts, because `git archive` skips submodules, so `akuma-fbcon`'s build script panicked in the guest
 - the RTL8169 stall path was gated on `INT_RDU` alone, which a receiver that never started cannot raise, so a box receiving nothing never dumped and never kicked; a `blind` arm (`!rx_seen && link_up`, uncapped, escalating to a full `Nic::init` every fourth try) plus a receiver re-arm on a link `down → up` edge
 - a restarted receiver resumes at the ring base while the driver's cursor stays put, hiding a completed frame one wrap away; `resync_rx_cursor` scans descriptors (no MMIO) from the idle receive lap, with a `FakeChip::restart_receiver` host test
+- the persistent-root shell over ssh had no `PATH` (sshd sets no environment), so bare `ls`, `ps`, `reboot` and `hget` did not resolve; it gets `PATH=/sbin:/usr/sbin:/bin:/usr/bin`
 
 ### docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md
 - every context switch reloaded CR3 even when the next task shares the outgoing task's root, flushing the TLB for nothing — `hook_switch_to` activates only when `want != active_root()`, sound because the L0-free gate refuses to free a root any core's live CR3 references (anchor 102 s → 83.5 s)
@@ -1531,7 +1560,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_SSH_CLIENT_TOFU_PROMPT_CR.md
 - the `ssh` client's host-key prompt broke only on `\n` and discarded `\r`, and a terminal in raw mode sends CR for Enter — so answering the TOFU prompt did nothing, forever, with the typed `yes` already consumed; the fix echoes what it accepts, which is what makes the prompt answerable at all
 
-## VFS & Filesystem (113 fixes, 36 docs)
+## VFS & Filesystem (120 fixes, 38 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1720,7 +1749,18 @@ aren't recorded anywhere else.)
 - an extend that failed partway (ENOSPC) returned with `?` before writing the inode, leaving blocks allocated in the bitmap that no inode referenced; the allocations are rolled back and the inode and metadata written before the error returns
 - an extend over a hole in the file's last partial block allocated it with `zero_leaf = false`, so the bytes before the old EOF read as whatever the block held before; now `true`
 
-## Boot & Drivers (117 fixes, 17 docs)
+### docs/archive/AKUMA_PROC_ENUMERATION_HANG.md
+- `/proc` listed every process that ever ran (9 556 entries after 15 minutes) because `mark_exited` was reached only from glue's `exit`/`exit_group` and the syscall-log map was pruned only when someone read `/proc/<pid>/syscalls`, so `ps`/`ls /proc` never finished on a long-running box and the heap leaked about 2 KB per process; `table::unregister_process` now calls `mark_exited`, the listing prunes expired logs, and a reused pid starts a fresh log
+
+### docs/archive/HARD_LINKS.md
+- `link(2)` was emulated by copying the file into a kernel `Vec`, so `link(a, b)` silently overwrote `b` (no `EEXIST`, `link`-as-lock had two winners), ignored `flags`, and `st_nlink` was a constant; a real `Filesystem::link` (ext2 under one write hold, overlay copy-up, `EXDEV`/`EMLINK`, `AT_EMPTY_PATH`) replaced it
+- a cross-mount `rename` answered `NotSupported` -> `EIO`, which `mv` reports instead of falling back to copy-and-delete; it is `EXDEV` now (`resolve_same_mount`, shared with `link`)
+- ext2's `rename` wrote `FT_REG_FILE` for every non-directory, so a renamed symlink or socket came back from `getdents64` as `DT_REG`; one `dirent_type()` helper serves `rename` and `link`
+- directory `st_nlink` was the constant 2, which claims no subdirectories and is the value GNU `find`'s leaf optimisation acts on; ext2 reports the real count
+- `akuma-tar` turned every hard-link entry into a relative symlink because `linkat` copied; it makes real links and keeps the symlink only as the `EPERM`/`EXDEV` fallback
+- amd64's x86_64 `link` (86) had no `AT_FDCWD` shim and reached nothing; it routes to `linkat`
+
+## Boot & Drivers (125 fixes, 18 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1874,6 +1914,16 @@ aren't recorded anywhere else.)
 - `SET_REPORT(feature)` replaces the whole report and Surface Switch and Button Switch share one, so writing them separately cleared the first and the pad reported the button but no contacts; `enable_ptp_mode` builds one payload per report id
 - polling an interrupt-less I2C-HID pad every 100 ms idle only ever read the lift-off frame of a tap, because the pad holds just its latest report; idle polling is 16 ms
 - `Move` is an absolute pad position, so the console pointer followed wherever fingers rested and two-finger scrolling dragged it onto herdr's right pane; the policy emits `Lift` when a stroke ends and the console bridge moves the pointer relatively (anchor, 3/2 gain, clamped)
+
+### docs/archive/NETWORKING_AUDIT.md
+- RTL8169 `resync_rx_cursor` scanned from cursor+1, so it skipped the completed frame under the cursor and reordered delivery (confirmed by a failing `FakeChip` test, and a candidate for the healthy-receiver `mpc=0` stall arms); the scan starts at the cursor
+- the RTL8169 transmit path had no error handling and no wedge recovery (every recovery arm needed receive silence), so a chip that received but never drained TX was a permanent silent outage; `stall::tx_decide` rings the doorbell on a full-and-quiet ring and escalates to a full re-init, and `tx_frames_completed` makes the counters honest
+- `init` armed `IMR` although nothing owns the interrupt line, an un-acked level-triggered storm waiting on any platform that unmasks the pin; the polled default is `IMR = 0`
+- `init` set `CR_RE | CR_TE` before writing `TCR`, `RCR` and the multicast table, so the receiver was live under reset defaults; the config block now comes first and the enables last
+- `kick_receiver` misordered in-flight frames rather than losing one (the cursor reset to 0 with unconsumed `OWN=0` frames ahead of it) and never waited for the receiver to stop before rewriting `RDSAR`; both halves fixed
+- the memory trait's `rx_buf_read`/`tx_buf_write` clamped silently, so a consumer with tighter buffers would hand up a truncated frame as valid or acknowledge a truncated transmit; both refuse
+- `THPDS` was pointed at physical address 0 with `TE` armed, so any errant high-priority doorbell write would DMA from page 0; the unused ring is aliased onto the normal ring
+- `probe` could be called twice and the second call silently aliased the rings over the same `.bss`; a `CLAIMED` compare-exchange guard enforces the once-only contract
 
 ## Signals & Exceptions (36 fixes, 13 docs)
 
@@ -2134,7 +2184,7 @@ aren't recorded anywhere else.)
 - `no-tests` did not build for amd64 because a commit had inserted `suite_emit` between `self_tests` and its `#[cfg(not(feature = "no-tests"))]`
 - the boot splash cat never changed colour because its daemon is starved during the synchronous xHCI and DHCP waits; `splash::pulse()` runs from those loops on a TSC clock and the frame interval went 50 to 150 ms
 
-## Containers (43 fixes, 9 docs)
+## Containers (55 fixes, 10 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2198,6 +2248,20 @@ aren't recorded anywhere else.)
 - `box grab` with no pid took the lowest-slot process (a transient `sleep`) and `box show`/`grab` scanned 64 of 512 thread slots; it prefers the box's recorded primary and scans all slots
 - `box run --name X` under a live `X` re-registered, failed at the overlay and then `kill_box`ed the first container's id, and a closed name could never be reused because its zombie counted as live to the re-root guard; `run` refuses a live name and the guard ignores zombies
 - `libakuma::print_hex` printed a leading NUL (`ID=\0d07`)
+- `spawn_ext` surfaced an ELF load failure (a dynamically linked busybox in a jail with no interpreter) as a bare `ENOMEM` with no reason anywhere, which cost a day of misdiagnosis on the metal; it logs `[syscall] spawn_ext: box=N path: reason`, and `box grab` says what it saw when it finds nothing
+
+### docs/archive/BOX_BUILD.md
+- overlay refused every directory rename with `NotSupported` -> `EIO`, upper-only directories included, so `mv dir newname` failed in every container; a directory any lower layer has is `EXDEV` (so `mv` falls back to copy-and-delete) and upper-only directories rename in place
+- overlay `rmdir` of a directory whose upper copy held only whiteouts was `ENOTEMPTY`, so `rm -rf` of any image directory failed (`can't remove '/etc/apk/keys'`); a merged-empty view clears the whiteouts and removes it
+- ext2 `rename` of a directory to another parent left `..` pointing at the old parent and both parents' link counts stale; it repoints `..` and moves the link between the counts
+- ext2 `rename` onto a non-empty directory "succeeded" by dropping the destination's entry, orphaning everything under it (leaked inodes and blocks); `ENOTEMPTY`/`ENOTDIR`/`EISDIR`/`EINVAL` as on Linux, and an empty destination directory is replaced through the shared `rmdir` teardown
+- `SubdirFs`, the upper layer of every container, did not forward `truncate`, `fallocate`, `set_times`, `append` or `create_socket_node` (trait default `NotSupported` -> `EIO`), so `ftruncate(2)` failed in every `box run` container and `apk add curl` died with "Failed to create usr/bin/curl: I/O error"; forwarded, and the confinement test's recorder now records them
+- `images::path_exists` followed symlinks, so an Alpine `CMD ["cat"]` (`/bin/cat -> /bin/busybox`, absolute target) was "not found" from the host and `box run` failed to spawn; it uses `lstat`
+- the container's `resolv.conf` was a verbatim copy of the host's, which on a systemd host names `127.0.0.53`, a resolver that does not exist inside the container (`apk add` "temporary error"); loopback nameservers are dropped as Docker does and `8.8.8.8`/`1.1.1.1` used when none remain
+- the containerd image name in `box save` was not `docker.io/library/...`, so `docker load` loaded an image that could not be addressed by name
+- `fsx::now_secs` called a private syscall amd64 lacks, so `created` was year 586524 and Docker refused to parse the image
+- a `box run` child's uid read as 4294967292 in about five spawns in six on amd64: `reattach` sends `SIGWINCH`, `pend_signal_to_group` raised the per-thread interrupt bit for every signal and glue's prologue turned it into `EINTR` on the child's first syscall (`getuid`), which busybox's `check_suid` took for the real uid; `process::signal::signal_can_act` no longer raises the bit for an ignored signal with default-ignore action and no handler
+- `paths::sanitize_name` dropped any registry host containing a `.`, so every tag for a registry shared the store directory of the image it was made from and `box rmi` of the registry-qualified tag deleted `app:1`; only Docker Hub's spellings collapse now
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
@@ -2238,3 +2302,5 @@ docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OU
 userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/TESTING (duplicate of libakuma-tls TLS fix), crush/IMPLEMENTATION_DETAILS, forktest/IMPLEMENTATION_PLAN, herd/CORE_AWARE_SCHEDULING, httpd/TIMESTAMPS, libakuma/ALLOCATOR_OPTIONS, libakuma/MKDIR_P_IMPROVEMENTS, libakuma/SYSCALLS, libakuma/TERMINAL_SYSCALLS, meow/CONFIG, meow/HOTKEYS, meow/SHELL, meow/TESTING, scratch/LARGE_FILE_CHECKOUT_OPTIMIZATION, scratch/SIDEBAND_PARSER_FIX (duplicate of docs/archive/SIDEBAND_PARSER_FIX.md), sshd/LIMITATIONS, sshd/MIGRATION_SUMMARY, tar/IMPLEMENTATION_PLAN, tar/STREAMING_EXTRACTION, tcc/DISTRIBUTION_PLAN, tcc/IMPLEMENTATION_DETAILS, tcc/IMPLEMENTATION_PLAN, tcc/LIBTCC1.
 
 Also scanned 2026-10-08 (the ryzen laptop, wifi and Chromium work, 4 archive docs added and 1 edited). AKUMA_ACPI_POWER carries no counted fix: it adds `/proc/power` and the DSDT lookup as new capability, and its battery decode is unread on the laptop. Not counted, open by their own text: `init=` following no symlinks, the still-missing x86_64 syscalls (`sendfile`, `get_mempolicy`, `rt_tgsigqueueinfo`, `landlock_create_ruleset`, `inotify_init`), the cross-core `now_us()` underflow in the station daemon, and the symlink dirent file type written wrongly by `apk`. (Chromium's whole-image `execve`, the crashpad `posix_spawn` `ENOENT` and `int3` arriving as SIGSEGV were open when first scanned and are counted above as Fixes 8, 12 and 9 of AKUMA_AMD64_CHROMIUM_KERNEL_WORK, added 2026-10-08.) The 16-core wedge listed in AKUMA_AMD64_ON_RYZEN_LAPTOP is counted once, under AKUMA_AMD64_SMP_WIDTH, which documents the fix. The whole-file-heap section folded into AKUMA_AMD64_CHROMIUM_KERNEL_WORK only restates fixes already counted (the `fd.rs` whole-file cache, the OOM handler's BKL release, the `Slab:` witness); its `execve` whole-image read is Fix 8, counted above.
+
+Also scanned 2026-10-16 (closing `ugh`, 55 commits ahead of main, 17 archive docs added or edited). Counted above: AKUMA_GENTOO, AKUMA_GENTOO_PORTAGE_CRASH, AKUMA_PROC_ENUMERATION_HANG, HARD_LINKS, UNIX_PERMISSIONS, BOX_BUILD, NETWORKING_AUDIT and AKUMA_AMD64_TOUCHPAD_I2C_HID, plus one new bullet each for AKUMA_AMD64_BOXES_AUDIT and AKUMA_SELF_HOSTING_AMD64. Still uncounted: AMD64_SPAWN_EXT_WORKDIR_CRASH and HERD_DUPLICATE_SERVICE_PROCESSES, listed open above, were re-run on the ryzen metal on 2026-10-14 and no longer reproduce; each attributes the cure to a fix counted elsewhere (AKUMA_AMD64_BOXES_AUDIT's `spawn_ext` faults; AKUMA_AMD64_BARE_METAL_SELFHOST §6 item 6) and says so is inferred, not proven. AKUMA_ACPI_POWER gained the energy ledger and the idle wake budget, which are capability, not fixes. The 2026-10-14 corrections in AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS, AKUMA_AMD64_BARE_METAL_SELFHOST and AKUMA_AMD64_LAPIC_ONESHOT_STALE point at fixes already counted in those subsections and add none.
