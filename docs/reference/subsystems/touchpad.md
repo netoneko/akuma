@@ -5,6 +5,8 @@ Goodix `GXTP5100`) on 2026-10-16: bring-up, one- and two-finger contacts,
 click, right-click, two-finger scroll (natural direction by default), and the
 pointer in herdr on the framebuffer console (relative motion, click and
 scroll). Only that one machine has been seen; every other box skips all of it.
+The run predates tap-to-click: the tap limits below are host-tested
+(`crates/akuma-touchpad` tests), not yet metal-verified.
 
 The pad is an I²C-HID device behind an AMD DesignWare I²C controller. There is
 no interrupt line in use: it is **polled**.
@@ -16,7 +18,7 @@ no interrupt line in use: it is **polled**.
 | `akuma-dwi2c` | `crates/` | controller register map, timings, abort decode, the AOAC wake (`aoac`) |
 | `akuma-i2c-hid` | `crates/` | HID-over-I²C framing: descriptor, commands, input-report length word |
 | `akuma-hid` | `crates/` | report-descriptor parser (OpenBSD `hid.c` port) |
-| `akuma-touchpad` | `crates/` | `ptp` (report layout + id-keyed finger slots + wire format + control lines), `Clickpad` policy (click, right-click, scroll, natural direction, `Lift`), `tty` (pointer events → xterm mouse reports) |
+| `akuma-touchpad` | `crates/` | `ptp` (report layout + id-keyed finger slots + wire format + control lines), `Clickpad` policy (click, right-click, scroll, natural direction, tap-to-click, `Lift`), `tty` (pointer events → xterm mouse reports) |
 | `amd64/src/i2c.rs` | kernel | AOAC wake, MMIO mapping, polled transactions — every wait is TSC-bounded |
 | `amd64/src/touchpad.rs` | kernel | discovery, bring-up, polling, `/dev/input/mouse0`, the console bridge |
 | `akuma-fbcon` | `crates/` | records the mouse modes a program sets; draws the pointer cell |
@@ -74,15 +76,37 @@ Writes take control lines (all parsed before any applies, `/dev/power`'s rule):
 |---|---|
 | `natural` | toggle natural scrolling |
 | `natural=1` / `natural=0` (also `on off true false yes no`, `natural 1`) | set it |
+| `tap` | toggle tap-to-click |
+| `tap=1` / `tap=0` (same value spellings) | set it |
 
 ```
 echo natural=0 > /dev/input/mouse0     # traditional wheel direction
 echo natural=1 > /dev/input/mouse0     # MacBook direction (the default)
+echo tap=0 > /dev/input/mouse0         # only the physical button clicks
+echo tap=1 > /dev/input/mouse0         # tap-to-click (the default)
 ```
 
-Kernel command line: `touchpad.natural=0` makes traditional the boot default.
-**Natural** means the content follows the fingers: two fingers moving up scroll
-the view down (negative wheel).
+Kernel command line: `touchpad.natural=0` makes traditional the boot default,
+`touchpad.tap=0` disables tap-to-click at boot. **Natural** means the content
+follows the fingers: two fingers moving up scroll the view down (negative
+wheel).
+
+## Tap-to-click
+
+On by default, as on a MacBook: a quick, still one-finger touch is a left
+click (press + release) without pressing the pad down, and two quick taps are
+the two click pairs a consumer calls a double click. There is deliberately no
+double-tap state machine — each tap fires its own pair as it lifts, so no tap
+ever waits to find out whether it was alone.
+
+The limits are libinput's: the touch must end within 200 ms of landing
+(`TAP_MAX_US`, against the kernel's uptime µs clock) and stay within 3 % of
+each sensor axis span (`TAP_SLOP_PCT`) of where it landed — beyond either, the
+touch was a rest or a drag, and lifting must not click. The tap is cancelled
+the moment the gesture becomes something else: the physical button comes down
+(a click-and-drag), a second finger lands (scroll arming), or a scroll
+engages. The click pair is queued *after* the stroke's `Lift`, so a consumer
+sees the stroke end before the click. A two-finger tap stays a no-op.
 
 ## The console bridge: the pointer inside terminal programs
 
@@ -113,6 +137,7 @@ program on the console has turned reporting on:
 | `up:` but no records, `reports=0` in `polls=` | pad never left its idle mode: check the one-write-per-report path in `enable_ptp_mode` |
 | records but no fingers, button only | the Surface/Button Switch overwrite again |
 | taps missed, drags fine | idle poll period too long |
+| taps move the pointer but never click | `echo tap=1 > /dev/input/mouse0`, or drop `touchpad.tap=0` from the cmdline |
 | pointer jumps to where fingers rest | something is using `Move` as absolute: use the relative bridge / honour `Lift` |
 | `echo natural=… > mouse0` says "No such device" | the pad is not up |
 
@@ -125,7 +150,8 @@ purpose for first-boot diagnosis on new hardware.
 1. `dmesg | grep touchpad` ends in `up: /dev/input/mouse0`.
 2. On the machine's own console (not ssh — the bridge feeds the console tty):
    `printf '\033[?1000h\033[?1006h'; cat -v`. Dragging moves a marked cell;
-   a click types `^[[<0;C;RM` then `…m`; two fingers up type `^[[<65;…M`
+   a click types `^[[<0;C;RM` then `…m` — and a light tap (no press) must
+   type the same pair; two fingers up type `^[[<65;…M`
    (natural) / `^[[<64;…M` (traditional). Ctrl-C, then
    `printf '\033[?1000l\033[?1006l'`.
 3. Run `herdr` on the console: click panes, scroll history.
