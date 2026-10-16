@@ -190,9 +190,17 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     // `validate_user_range(_, Prefault::Yes)` needs. Unregistered it fails
     // closed (EFAULT), so ordering against other init does not matter.
     akuma_user_access::set_prefault_hook(process::lazy_prefault::prefault_user_range);
-    // `akuma-threading`'s upward surface: the platform callbacks it uses (a
-    // subset of `rt`), its tuning knobs (a subset of `cfg`), and the seven
-    // things it asks of this crate's process layer.
+    register_threading(&rt, &cfg);
+}
+
+/// `akuma-threading`'s upward surface: the platform callbacks it uses (a subset
+/// of `rt`), its tuning knobs (a subset of `cfg`), and the things it asks of this
+/// crate's process layer.
+///
+/// Split out of [`init`] so the host tests register exactly this table
+/// (`test_support::ensure_test_runtime`) instead of a hand-copied one — a
+/// process reap reaches `threading::mark_thread_terminated`, which reads it.
+pub(crate) fn register_threading(rt: &ExecRuntime, cfg: &ExecConfig) {
     threading::register(
         threading::ThreadRuntime {
             uptime_us: rt.uptime_us,

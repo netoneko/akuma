@@ -174,6 +174,11 @@ fn retire_process(pid: Pid) -> bool {
                     crate::threading::mark_thread_terminated(tid);
                 }
             }
+            // Reaped: the slot `hold_exited_thread_slot` kept out of circulation
+            // may be reissued now — and only now, after the terminate above, so
+            // that can never land on a new occupant. By pid, so a kill path that
+            // already cleared `thread_id` cannot strand it.
+            crate::threading::release_slots_held_by(pid);
         },
     )
 }
@@ -670,6 +675,34 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
         identity_clear_locked(tid);
         prev
     })
+}
+
+/// A process whose last thread is leaving ring 3 for good **keeps its thread
+/// slot until it is reaped**: the slot is not reissued while the process is a
+/// zombie, and [`retire_process`] gives it back.
+///
+/// The slot is the tid. Reissued early, the tid named two processes at once —
+/// the zombie still records it (`thread_id = Some(tid)`, its `tid -> pid` map
+/// row) and the new occupant runs on it — so a `kill`, `unregister` or
+/// `exit_group_from_thread` aimed at the zombie could land on the newcomer, and
+/// every `p.thread_id` table scan found the zombie (`[TRAMP-MISMATCH] … table
+/// scan found <dead pid>`, `[kill]`/`[unregister] … stale tid`). amd64 did
+/// exactly that: `run_process` -> `sched::finish` made the slot claimable at once
+/// (`x86_claim_slot` takes a `TERMINATED` slot directly) while the zombie waited
+/// for its parent's `wait4` (2026-10-16, ryzen,
+/// `docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`). With the hold, the zombie's
+/// records stay true until the reap, because nothing else can be on that slot.
+///
+/// AArch64 does not call it: its slot goes `TERMINATED -> FREE` only through the
+/// collector, whose `on_thread_cleanup` unregisters the process first.
+///
+/// Call it on the dying thread **before** the slot stops running (see
+/// [`crate::threading::hold_slot_for_zombie`]). Holds only a slot the map still
+/// says is `pid`'s. No allocation.
+pub fn hold_exited_thread_slot(pid: Pid, tid: usize) {
+    if pid_for_thread(tid) == Some(pid) {
+        crate::threading::hold_slot_for_zombie(tid, pid);
+    }
 }
 
 /// Read one half of the current thread's cached identity, re-validating the

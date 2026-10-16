@@ -3840,6 +3840,16 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // task, and every program this kernel runs ends in exit_group.
     let status = enter_user(first.pc, first.sp, forked_child);
     EXIT_STATUS.store(status, Ordering::Relaxed);
+    // **This task slot is the process's tid, and it stays the zombie's until the
+    // reap** (`hold_exited_thread_slot`; `unregister_process` releases it).
+    // Reissued at `sched::finish` below, as it used to be, the tid named the
+    // zombie and its successor at once, and a `kill` of the zombie could reach
+    // the successor (2026-10-16, ryzen). First thing out of ring 3, while the
+    // slot is still running and before `spawn_record_exit` lets the parent reap
+    // — a hold set after a reap would never be released.
+    if let Some(p) = current_process() {
+        akuma_exec::process::hold_exited_thread_slot(p.pid, crate::sched::current_task());
+    }
     // Real Linux closes every fd a process still holds at exit. Since step 4b
     // the registered table is the only descriptor authority and every entry in
     // it owns a real pipe/socket reference, so the sweep is the table's own
