@@ -149,6 +149,21 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; export CLAUDE_CODE_DISABLE_NONESSENT
 exec /usr/local/bin/claude "$@"
 CFG
     chmod 755 $P/usr/local/bin/claude-glm
+    # The Kimi twin: Claude Code against Kimi Code's Anthropic-compatible endpoint
+    # (`kimi-for-coding`), with the token goose-kimi uses. Verified 2026-10-16: `-p` answers,
+    # and an interactive session over ssh takes input and answers (scripts/utils/ssh_tui_probe.py).
+    cat > $P/usr/local/bin/claude-kimi <<'CFG'
+#!/bin/sh
+. /etc/akuma-dev.env
+ANTHROPIC_BASE_URL=https://api.kimi.com/coding/; export ANTHROPIC_BASE_URL
+ANTHROPIC_AUTH_TOKEN=$(cat /root/.akuma/kimi/token); export ANTHROPIC_AUTH_TOKEN
+ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-kimi-for-coding}; export ANTHROPIC_MODEL
+ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL:-kimi-for-coding}; export ANTHROPIC_SMALL_FAST_MODEL
+API_TIMEOUT_MS=3000000; export API_TIMEOUT_MS
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+exec /usr/local/bin/claude "$@"
+CFG
+    chmod 755 $P/usr/local/bin/claude-kimi
 fi
 
 echo "== rio"

@@ -76,7 +76,9 @@ if [ -d /etc/profile.d ]; then
     unset _tn_f
 fi
 
-# Prompt: user@host in comment gray, cwd in bold blue, sigil in cyan —
+# Prompt: user in comment gray, cwd in bold blue, sigil in cyan — no host name:
+# Akuma's node name is always "localhost" (nothing sets one), which says nothing.
+#
 # Tokyo Night "storm" look with nothing but POSIX ash.
 _tn_reset=$(printf '\033[0m')
 _tn_gray=$(printf '\033[38;5;103m')
@@ -87,7 +89,7 @@ if [ "$(id -u 2>/dev/null)" = "0" ]; then
 else
     _tn_sigil='$'
 fi
-PS1="${_tn_gray}\u@\h${_tn_reset}:${_tn_blue}\w${_tn_reset} ${_tn_cyan}${_tn_sigil}${_tn_reset} "
+PS1="${_tn_gray}\u${_tn_reset}:${_tn_blue}\w${_tn_reset} ${_tn_cyan}${_tn_sigil}${_tn_reset} "
 unset _tn_reset _tn_gray _tn_blue _tn_cyan _tn_sigil
 
 # Color ls by default, but only when this busybox build understands --color.
