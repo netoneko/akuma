@@ -85,8 +85,8 @@ echo "== goose"
 if [ -f $STAGE/goose.tgz ]; then
     mkdir -p $STAGE/goose-x && tar xzf $STAGE/goose.tgz -C $STAGE/goose-x
     install -m 755 "$(find $STAGE/goose-x -type f -name goose | head -1)" $P/usr/local/bin/goose
-    mkdir -p $P/root/.config/goose $P/root/.akuma/kimi
-    chmod 700 $P/root/.akuma $P/root/.akuma/kimi
+    mkdir -p $P/root/.config/goose $P/root/.akuma/kimi $P/root/.akuma/z.ai
+    chmod 700 $P/root/.akuma $P/root/.akuma/kimi $P/root/.akuma/z.ai
     cat > $P/root/.config/goose/config.yaml <<'CFG'
 GOOSE_TELEMETRY_ENABLED: false
 GOOSE_MODE: auto
@@ -108,6 +108,22 @@ GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
 exec /usr/local/bin/goose "$@"
 CFG
     chmod 755 $P/usr/local/bin/goose-kimi
+    # The GLM twin (z.ai coding plan, OpenAI-compatible). Verified 2026-10-16:
+    # `goose-glm run -t ...` answers with glm-5.3; token in /root/.akuma/z.ai/token.
+    cat > $P/usr/local/bin/goose-glm <<'CFG'
+#!/bin/sh
+. /etc/akuma-dev.env
+umask 077
+mkdir -p /root/.config/goose
+printf 'OPENAI_API_KEY: %s\n' "$(cat /root/.akuma/z.ai/token)" > /root/.config/goose/secrets.yaml
+GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
+GOOSE_PROVIDER=openai; export GOOSE_PROVIDER
+GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3}; export GOOSE_MODEL
+OPENAI_HOST=https://api.z.ai; export OPENAI_HOST
+OPENAI_BASE_PATH=api/coding/paas/v4/chat/completions; export OPENAI_BASE_PATH
+exec /usr/local/bin/goose "$@"
+CFG
+    chmod 755 $P/usr/local/bin/goose-glm
 fi
 
 echo "== rio"
