@@ -26,10 +26,17 @@ use core::task::{Context, Poll};
 /// Order matches Docker's and a Linux login shell's: local before system, sbin
 /// before bin at each level, so an image that ships its own build of a tool wins
 /// over the distro's — which is the point of `/usr/local`.
+///
+/// `ENV` points busybox ash at `/etc/profile` for INTERACTIVE shells (POSIX `$ENV`
+/// expansion). Akuma never spawns login shells — kernel init argv[0] is the bare
+/// path, and userspace sshd spawns `/bin/sh` with no `-` — so without this hook
+/// /etc/profile would be dead code on every image. Non-interactive shells ignore
+/// `$ENV`; shells whose image lacks /etc/profile silently skip the dot-source.
 pub const DEFAULT_ENV: &[&str] = &[
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "HOME=/",
     "TERM=xterm",
+    "ENV=/etc/profile",
 ];
 
 /// A future that yields once then completes
