@@ -14,8 +14,8 @@ program the way a person would (`ssh -tt`, a PTY, TERM set), then:
   4. sends a second prompt (a freeze is often the second turn, not the first);
   5. samples the child's syscall rate from /proc/<pid>/syscalls over a second ssh session
      (a healthy idle TUI does tens per second, the spin did millions);
-  6. quits and kills anything the closed PTY left behind (Akuma does not deliver the
-     hangup to the foreground child: leaked `claude` holds ~/.claude.json.lock).
+  6. quits with Ctrl-C and reports anything still running. It does NOT kill it: SIGKILL of
+     a live many-threaded process (claude/Bun) wedged the ryzen twice on 2026-10-16.
 
 Exit status 0 only if every check passed.
 
@@ -150,7 +150,7 @@ def main():
     s = Session(a)
     try:
         # 1. first screen, trust prompt
-        t = s.wait_for(r"trust|yes, proceed|esc to|❯|>\s", 60)
+        t = s.wait_for(r"trust|proceed|escto|❯|›|>", 180)
         check("first screen drew", t is not None, f"{t:.1f}s" if t else "nothing in 60 s")
         if t is None:
             return 1
@@ -164,7 +164,7 @@ def main():
             s.pump(1.5)
             s.send("\r")
             s.pump(3)
-        s.wait_for(r"\?\s*for shortcuts|bypass|try \"|esc to|›|❯", 30)
+        s.wait_for(r"forshortcuts|bypass|try\"|escto|›|❯", 30)
         pid = s.child_pid()
         check("the program is running", pid is not None, f"pid {pid}")
 
@@ -224,18 +224,19 @@ def main():
         except OSError:
             pass
         time.sleep(2)
-        # Live processes only. NEVER `kill -9` a pid that has exited: on this kernel a dead
-        # process's scheduler tid can already belong to another process, and the kill lands on
-        # that one ("[kill] pid=1468 stale tid=20 now owned by pid=1619"). Measured 2026-10-16:
-        # that took down the next test's claude and its child, set off a TRAMP-MISMATCH storm,
-        # and the box wedged until the hardware watchdog reset it (FIRED=1).
+        # NEVER SIGKILL. Measured 2026-10-16 on ryzen: the two boots that died (132 and 133) each
+        # died within about a minute of this cleanup `kill -9`-ing a live claude (a many-threaded
+        # Bun tree; boot 133's was still starting up), and boots that were never killed ran
+        # for hours. Mass SIGKILL of a multi-threaded process is the known ryzen wedge
+        # (docs/README.md; memory: feedback_chromium_kill_wedges_ryzen). So: Ctrl-C twice (done
+        # above), wait, and if something is still alive, REPORT it and leave it for a human.
+        time.sleep(6)
         left = s.remote(
             f"for p in $(ps | grep -E '{a.proc}$' | grep -v grep | grep -v '{{' | awk '{{print $1}}'); do "
             "grep -q 'State:.Z' /proc/$p/status 2>/dev/null || echo $p; done")
         pids = [p for p in left.split() if p.isdigit()]
         if pids:
-            print(f"cleanup: killing leaked {pids}", flush=True)
-            s.remote("kill -9 " + " ".join(pids) + "; rmdir /root/.claude.json.lock 2>/dev/null; true")
+            print(f"cleanup: still running after Ctrl-C, left alone (pids {pids}); close it from its own terminal", flush=True)
     ok = all(results)
     if not ok or os.environ.get("TUI_PROBE_DUMP"):
         tail = [l.rstrip() for l in plain(s.buf).replace("\r", "\n").split("\n") if l.strip()][-40:]

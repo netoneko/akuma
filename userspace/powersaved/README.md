@@ -11,7 +11,7 @@ Once a second it reads `/proc/power`, takes the kernel's `idle_ms=` fact
 (console-input inactivity — a keystroke on the keyboard, serial or USB HID
 resets it inside `amd64/src/input.rs`), and applies the idle staircase:
 
-| idle | brightness |
+| idle | brightness (with the default `base_pct=100`) |
 |---|---|
 | < 60 s | 100 % |
 | 60 s | 60 % |
@@ -39,6 +39,10 @@ it when the kernel has the register map).
 
 ## argv
 
+`base_pct=<n>` is the brightness while someone is active (default 100): what a
+keystroke restores to, and what the staircase steps down from. A stage above it
+is held at it — idling never brightens the screen. ryzen sets `base_pct=80`
+(`overlays/ryzen/rootfs/etc/herd/available/powersave.conf`).
 `after_ms=<n>` moves the first step; `stage=<ms>:<pct>` (repeatable) replaces
 the whole staircase (sorted by time); `period_ms=<n>` is the poll period. A
 malformed argv prints and exits 2 — a typo in a boot config must not silently

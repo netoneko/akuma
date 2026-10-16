@@ -17,7 +17,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
-/// Brightness when the keyboard is not idle, and what a restore writes.
+/// Brightness when the keyboard is not idle, and what a restore writes, unless a
+/// machine sets its own with `base_pct=` (ryzen runs at 80).
 pub const RESTORE_PCT: u8 = 100;
 
 /// One step of the staircase: hold `pct` percent from `after_ms` of console
@@ -39,21 +40,24 @@ pub const DEFAULT_STAGES: [Stage; 3] = [
     Stage { after_ms: 600_000, pct: 10 },
 ];
 
-/// The brightness `idle_ms` of inactivity asks for: the **deepest** stage
-/// that has already elapsed wins — the highest `after_ms` at or below the
-/// idle time — or [`RESTORE_PCT`] above the first. The rule is
-/// order-independent on purpose: [`parse_stages`] hands over a sorted
-/// staircase so the common path is a straight scan, but a hand-built table
-/// answers the same policy in the same way regardless of the order its
-/// author wrote it down in. A tie keeps the later entry.
+/// The brightness `idle_ms` of inactivity asks for.
+///
+/// The **deepest** stage that has already elapsed wins — the highest `after_ms`
+/// at or below the idle time — or `base` above the first. A stage never asks for
+/// *more* than `base`: with a base of 80 a stage written as 90 holds 80, because
+/// idling must not brighten the screen. The rule is order-independent on
+/// purpose: [`parse_stages`] hands over a sorted staircase so the common path is
+/// a straight scan, but a hand-built table answers the same policy in the same
+/// way regardless of the order its author wrote it down in. A tie keeps the
+/// later entry.
 #[must_use]
-pub fn target_pct(idle_ms: u64, stages: &[Stage]) -> u8 {
+pub fn target_pct(idle_ms: u64, stages: &[Stage], base: u8) -> u8 {
     let mut best_after: u64 = 0;
-    let mut target = RESTORE_PCT;
+    let mut target = base;
     for s in stages {
         if idle_ms >= s.after_ms && (best_after == 0 || s.after_ms >= best_after) {
             best_after = s.after_ms;
-            target = s.pct;
+            target = s.pct.min(base);
         }
     }
     target
@@ -65,8 +69,8 @@ pub fn target_pct(idle_ms: u64, stages: &[Stage]) -> u8 {
 /// three times per idle cycle (down the steps) and once on the keystroke —
 /// never once a second.
 #[must_use]
-pub fn step(current_pct: u8, idle_ms: u64, stages: &[Stage]) -> Option<u8> {
-    let target = target_pct(idle_ms, stages);
+pub fn step(current_pct: u8, idle_ms: u64, stages: &[Stage], base: u8) -> Option<u8> {
+    let target = target_pct(idle_ms, stages, base);
     (target != current_pct).then_some(target)
 }
 
@@ -119,6 +123,12 @@ pub fn parse_stages(args: &[&str], out: &mut [Stage]) -> Option<usize> {
     Some(n)
 }
 
+/// `80` — a brightness percent, 1..=100, for `base_pct=`.
+#[must_use]
+pub fn parse_pct(arg: &str) -> Option<u8> {
+    arg.parse::<u8>().ok().filter(|p| (1..=100).contains(p))
+}
+
 /// `60000` — a millisecond count for `after_ms=` and `period_ms=`.
 #[must_use]
 pub fn parse_ms(arg: &str) -> Option<u64> {
@@ -127,18 +137,18 @@ pub fn parse_ms(arg: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fact, parse_ms, parse_stage, parse_stages, step, target_pct, Stage, DEFAULT_STAGES, RESTORE_PCT};
+    use super::{fact, parse_ms, parse_pct, parse_stage, parse_stages, step, target_pct, Stage, DEFAULT_STAGES, RESTORE_PCT};
 
     #[test]
     fn staircase_by_elapsed_time() {
-        assert_eq!(target_pct(0, &DEFAULT_STAGES), RESTORE_PCT);
-        assert_eq!(target_pct(59_999, &DEFAULT_STAGES), RESTORE_PCT);
-        assert_eq!(target_pct(60_000, &DEFAULT_STAGES), 60);
-        assert_eq!(target_pct(179_999, &DEFAULT_STAGES), 60);
-        assert_eq!(target_pct(180_000, &DEFAULT_STAGES), 30);
-        assert_eq!(target_pct(599_999, &DEFAULT_STAGES), 30);
-        assert_eq!(target_pct(600_000, &DEFAULT_STAGES), 10);
-        assert_eq!(target_pct(u64::MAX, &DEFAULT_STAGES), 10);
+        assert_eq!(target_pct(0, &DEFAULT_STAGES, RESTORE_PCT), RESTORE_PCT);
+        assert_eq!(target_pct(59_999, &DEFAULT_STAGES, RESTORE_PCT), RESTORE_PCT);
+        assert_eq!(target_pct(60_000, &DEFAULT_STAGES, RESTORE_PCT), 60);
+        assert_eq!(target_pct(179_999, &DEFAULT_STAGES, RESTORE_PCT), 60);
+        assert_eq!(target_pct(180_000, &DEFAULT_STAGES, RESTORE_PCT), 30);
+        assert_eq!(target_pct(599_999, &DEFAULT_STAGES, RESTORE_PCT), 30);
+        assert_eq!(target_pct(600_000, &DEFAULT_STAGES, RESTORE_PCT), 10);
+        assert_eq!(target_pct(u64::MAX, &DEFAULT_STAGES, RESTORE_PCT), 10);
     }
 
     #[test]
@@ -146,24 +156,24 @@ mod tests {
         // parse_stages sorts; but the decision itself must not depend on the
         // sort for the *last matching* rule to stay the meaning.
         let stages = [Stage { after_ms: 180_000, pct: 30 }, Stage { after_ms: 60_000, pct: 60 }];
-        assert_eq!(target_pct(61_000, &stages), 60);
-        assert_eq!(target_pct(181_000, &stages), 30);
+        assert_eq!(target_pct(61_000, &stages, RESTORE_PCT), 60);
+        assert_eq!(target_pct(181_000, &stages, RESTORE_PCT), 30);
     }
 
     #[test]
     fn writes_only_on_change() {
         let mut current = RESTORE_PCT;
         // the long walk down: three writes
-        assert_eq!(step(current, 61_000, &DEFAULT_STAGES), Some(60));
+        assert_eq!(step(current, 61_000, &DEFAULT_STAGES, RESTORE_PCT), Some(60));
         current = 60;
-        assert_eq!(step(current, 61_000, &DEFAULT_STAGES), None);
-        assert_eq!(step(current, 200_000, &DEFAULT_STAGES), Some(30));
+        assert_eq!(step(current, 61_000, &DEFAULT_STAGES, RESTORE_PCT), None);
+        assert_eq!(step(current, 200_000, &DEFAULT_STAGES, RESTORE_PCT), Some(30));
         current = 30;
-        assert_eq!(step(current, 700_000, &DEFAULT_STAGES), Some(10));
+        assert_eq!(step(current, 700_000, &DEFAULT_STAGES, RESTORE_PCT), Some(10));
         current = 10;
-        assert_eq!(step(current, 900_000, &DEFAULT_STAGES), None);
+        assert_eq!(step(current, 900_000, &DEFAULT_STAGES, RESTORE_PCT), None);
         // the keystroke: one write straight back
-        assert_eq!(step(current, 500, &DEFAULT_STAGES), Some(RESTORE_PCT));
+        assert_eq!(step(current, 500, &DEFAULT_STAGES, RESTORE_PCT), Some(RESTORE_PCT));
     }
 
     #[test]
@@ -190,7 +200,7 @@ mod tests {
         let mut out = [Stage { after_ms: 0, pct: 0 }; 8];
         let n = parse_stages(&["600000:10", "60000:60", "180000:30"], &mut out).unwrap();
         assert_eq!(n, 3);
-        assert_eq!(target_pct(200_000, &out[..n]), 30);
+        assert_eq!(target_pct(200_000, &out[..n], RESTORE_PCT), 30);
         // a list longer than the buffer is refused, not truncated
         assert_eq!(parse_stages(&["1:1", "2:2", "3:3", "4:4", "5:5", "6:6", "7:7", "8:8", "9:9"], &mut out), None);
         // an empty list means "keep the defaults"
@@ -205,5 +215,39 @@ mod tests {
         assert_eq!(parse_ms("0"), None);
         assert_eq!(parse_ms("-5"), None);
         assert_eq!(parse_ms(""), None);
+    }
+
+    #[test]
+    fn a_base_below_full_is_the_resting_brightness_and_the_staircase_steps_down_from_it() {
+        // ryzen: 80 % while someone is there.
+        assert_eq!(target_pct(0, &DEFAULT_STAGES, 80), 80);
+        assert_eq!(target_pct(59_999, &DEFAULT_STAGES, 80), 80);
+        assert_eq!(target_pct(60_000, &DEFAULT_STAGES, 80), 60);
+        assert_eq!(target_pct(600_000, &DEFAULT_STAGES, 80), 10);
+        // the keystroke restores to the base, not to 100
+        assert_eq!(step(10, 300, &DEFAULT_STAGES, 80), Some(80));
+        // already at the base: nothing to write
+        assert_eq!(step(80, 300, &DEFAULT_STAGES, 80), None);
+        // from a fresh boot (kernel at 100) the first lap dims to the base
+        assert_eq!(step(100, 300, &DEFAULT_STAGES, 80), Some(80));
+    }
+
+    #[test]
+    fn idling_never_brightens_the_screen() {
+        // A stage above the base is held at the base.
+        let stages = [Stage { after_ms: 60_000, pct: 90 }];
+        assert_eq!(target_pct(61_000, &stages, 80), 80);
+        assert_eq!(target_pct(61_000, &stages, 100), 90);
+    }
+
+    #[test]
+    fn pct_args_are_one_to_one_hundred() {
+        assert_eq!(parse_pct("80"), Some(80));
+        assert_eq!(parse_pct("100"), Some(100));
+        assert_eq!(parse_pct("1"), Some(1));
+        assert_eq!(parse_pct("0"), None);
+        assert_eq!(parse_pct("101"), None);
+        assert_eq!(parse_pct("-5"), None);
+        assert_eq!(parse_pct(""), None);
     }
 }
