@@ -82,6 +82,7 @@ proves the probe is asking the right question).
 | more ready fds than `maxevents` | a ready-list rotation, so nobody starves | the interest list is walked in ascending fd order and truncated, deterministically | `the_interest_list_is_walked_in_ascending_fd_order` |
 | `epoll_pwait`/`ppoll`/`pselect6` `sigmask` | applied for the duration of the wait | accepted and discarded (see "Argument validation" below) | — |
 | an fd `close()`d while still in an interest list | dropped implicitly by `eventpoll_release_file` | pruned lazily, on the next `epoll_pwait` scan | `pruning_a_closed_fd_is_what_stops_a_synthetic_hup_err` |
+| `EPOLL_CTL_ADD` of an epoll into another that is a loop, or nests deeper than 4 | `ELOOP` / `EINVAL` at the ADD | accepted; the readiness probe stops descending at depth 4 and reports that level not ready | `nested_epoll_readable_only_while_inner_ready` covers the ordinary case only |
 
 `POLLPRI`/`exceptfds` being always empty is **not** on this list: Akuma has no
 out-of-band TCP data, so "none" is the honest answer. What matters there is
@@ -91,8 +92,8 @@ that it is *written down* — see `exceptfds` below.
 
 | gate | what it covers | how to run |
 |---|---|---|
-| crate host tests | the readiness map, the interest list, `epoll_ctl`'s errno set, the `EPOLLET` decision, both marshallings — 36 tests, milliseconds, no VM | `cargo test -p akuma-syscalls-poll --target $(rustc -vV \| grep '^host:' \| cut -d' ' -f2)` |
-| `epollops` | the same questions asked of a live kernel, op by op: ET re-arm on a drained read and on a blocked write, the pipe EOF edge, `epoll_ctl`'s errno set, a zero timeout being non-blocking, level-triggered repetition, `poll(2)`'s unrequested `POLLHUP`, `select(2)` overwriting `exceptfds` and counting bits, and the TCP group | `scripts/epoll_suite.py --port 2322` |
+| crate host tests | the readiness map, the interest list, `epoll_ctl`'s errno set, the `EPOLLET` decision, both marshallings — 43 tests, milliseconds, no VM | `cargo test -p akuma-syscalls-poll --target $(rustc -vV \| grep '^host:' \| cut -d' ' -f2)` |
+| `epollops` | the same questions asked of a live kernel, op by op: ET re-arm on a drained read and on a blocked write, the pipe EOF edge, `epoll_ctl`'s errno set, a zero timeout being non-blocking, level-triggered repetition, `poll(2)`'s unrequested `POLLHUP`, `select(2)` overwriting `exceptfds` and counting bits, the TCP group, and a nested epoll | `scripts/epoll_suite.py --port 2322` |
 | the same binary on Linux | proves the probe itself is right — every `FAIL` in the guest should be a `PASS` there, and every `DIVERGE` too | `scripts/epoll_suite.py --linux` |
 | boot suite | `test_epoll_eintr_when_signal_pending`, `epoll_edge_rearm_symmetry`, `epoll_pipe_eof_edge_after_partial_drain`, `run_pselect6_*` | any `cargo run --release` without `no-tests` |
 | cost A/B/A | that a change to this family is free: seven non-parking arms, ratio against a `getpid` control | `scripts/benchmarks/epoll_ab_run.sh <label> <outdir> 4 12` |
@@ -248,6 +249,30 @@ table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
    still exists as a safety net for resources that don't yet support wakers
    (e.g. `TimerFd`), but a woken thread returns immediately rather than
    waiting for the next tick.
+
+## Nested epoll (2026-10-16)
+
+An epoll fd registered inside another epoll is readable (`EPOLLIN`) exactly
+while its own interest list has something pending, and never writable
+(`FdState::Epoll { pending }`). Until 2026-10-16 it had no probe arm and fell
+into `Unmodelled` — "ready for whatever was asked" — so the outer
+`epoll_wait` returned at once, every time. Found on the ryzen box: Claude Code
+(Bun) in an interactive terminal made ~2 M `epoll_pwait` + `clock_gettime`
+syscalls per second, each returning 2 events it never read, with the UI
+starved of keyboard input and no sign of work.
+
+`poll.rs::epoll_instance_pending` copies the inner list out under `EPOLL_TABLE`
+(nothing is held across a probe, so an instance containing itself only
+recurses to `EPOLL_MAX_NEST` = 4), probes each entry through the same
+`epoll_check_fd_readiness_at`, and asks `Entry::would_report` — the pure edge
+decision **without recording**. It must not use `scan_entry`: a probe from the
+outer instance would consume the inner instance's edges. The outer waiter's
+`Waker` is passed down, so a write to an inner pipe wakes the outer wait
+directly. Pinned by `an_idle_nested_epoll_is_not_readable_...` and
+`would_report_does_not_consume_an_edge_scan_entry_does` (host), and `epollops`
+`nested_epoll_readable_only_while_inner_ready` (live; PASS on Linux; FAIL
+before on both the QEMU aarch64 kernel and the ryzen amd64 kernel; PASS after on
+aarch64 QEMU — the amd64 kernel has not been rebuilt with the fix yet).
 
 ## The wait loop is one machine, not three (2026-08-24)
 

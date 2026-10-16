@@ -212,6 +212,7 @@ fn no_state_ever_reports_a_registration_only_bit() {
         FdState::RumpSocket { readable: true },
         FdState::Tap { has_frame: true },
         FdState::Pty { can_read: true, can_write: true, hup: true },
+        FdState::Epoll { pending: true },
         FdState::Unmodelled,
     ];
     for s in states {
@@ -651,4 +652,48 @@ fn scan_entry_leaves_level_triggered_entries_stateless_and_ignores_unknown_fds()
     assert_eq!(list.scan_entry(5, EPOLLIN).unwrap().report, EPOLLIN);
     assert_eq!(list.get(5).unwrap().last_ready, 0);
     assert!(list.scan_entry(99, EPOLLIN).is_none());
+}
+
+
+// ── an epoll fd registered inside another epoll ───────────────────────────
+
+/// The spin this state exists to end: an idle inner epoll answered "ready" (the
+/// `Unmodelled` default), so the outer `epoll_wait` returned at once, forever.
+#[test]
+fn an_idle_nested_epoll_is_not_readable_and_a_pending_one_is_only_readable() {
+    assert_eq!(readiness(FdState::Epoll { pending: false }, EPOLLIN), 0);
+    assert_eq!(readiness(FdState::Epoll { pending: true }, EPOLLIN), EPOLLIN);
+    // Not writable, and not readable unless asked.
+    assert_eq!(readiness(FdState::Epoll { pending: true }, EPOLLOUT), 0);
+    assert_eq!(readiness(FdState::Epoll { pending: true }, EPOLLIN | EPOLLOUT), EPOLLIN);
+    assert_eq!(readiness(FdState::Epoll { pending: false }, u32::MAX), 0);
+}
+
+/// `would_report` is the inner instance's own "is anything pending", and the
+/// property that matters is that asking never consumes an edge.
+#[test]
+fn would_report_does_not_consume_an_edge_scan_entry_does() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 5, EPOLLIN | EPOLLET, 0);
+    let e = list.get(5).unwrap();
+    assert!(e.would_report(EPOLLIN), "a fresh edge is pending");
+    // Asking repeatedly changes nothing.
+    assert!(list.get(5).unwrap().would_report(EPOLLIN));
+    assert_eq!(list.get(5).unwrap().last_ready, 0);
+    // The inner epoll_wait takes it ...
+    assert_eq!(list.scan_entry(5, EPOLLIN).unwrap().report, EPOLLIN);
+    // ... and the outer instance no longer sees anything pending.
+    assert!(!list.get(5).unwrap().would_report(EPOLLIN));
+    // Readiness going away and returning is a new edge.
+    list.scan_entry(5, 0);
+    assert!(list.get(5).unwrap().would_report(EPOLLIN));
+}
+
+#[test]
+fn would_report_for_a_level_triggered_entry_stays_true_until_drained() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 6, EPOLLIN, 0);
+    list.scan_entry(6, EPOLLIN);
+    assert!(list.get(6).unwrap().would_report(EPOLLIN), "level: still ready");
+    assert!(!list.get(6).unwrap().would_report(0));
 }

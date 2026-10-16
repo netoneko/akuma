@@ -528,6 +528,48 @@ out:
     if (srv >= 0) close(srv);
 }
 
+/* An epoll fd registered inside another epoll is readable exactly while its own
+ * interest list has something ready, and not otherwise. The kernel had no
+ * readiness arm for an epoll fd, so it fell into the "unmodelled" default and
+ * answered "ready" for whatever was asked: a process that nests epolls (Bun's
+ * interactive terminal path does) got a wait that returned at once, forever. */
+static void probe_nested_epoll(void) {
+    const char *n = "nested_epoll_readable_only_while_inner_ready";
+    int inner = epoll_create1(0), outer = epoll_create1(0);
+    int p[2];
+    if (inner < 0 || outer < 0 || pipe(p) < 0) { skip(n, "setup failed"); return; }
+
+    struct epoll_event in_reg = { .events = EPOLLIN, .data = { .u64 = 1 } };
+    struct epoll_event out_reg = { .events = EPOLLIN, .data = { .u64 = 2 } };
+    if (epoll_ctl(inner, EPOLL_CTL_ADD, p[0], &in_reg) < 0 ||
+        epoll_ctl(outer, EPOLL_CTL_ADD, inner, &out_reg) < 0) {
+        skip(n, "epoll_ctl ADD failed"); goto out;
+    }
+
+    if (wait_mask(outer, 0) != 0) {
+        bad(n, "an idle inner epoll reported readable to the outer one — the outer "
+               "wait returns at once forever and the caller spins");
+        goto out;
+    }
+    if (wait_mask(outer, 150) != 0) {
+        bad(n, "an idle inner epoll woke a blocking outer wait");
+        goto out;
+    }
+    if (write(p[1], "x", 1) != 1) { skip(n, "pipe write failed"); goto out; }
+    if (!(wait_mask(outer, 2000) & EPOLLIN)) {
+        bad(n, "the inner epoll had a ready fd but the outer never reported it");
+        goto out;
+    }
+    char b;
+    if (read(p[0], &b, 1) != 1) { skip(n, "pipe drain failed"); goto out; }
+    if (wait_mask(outer, 0) != 0)
+        bad(n, "the inner epoll stayed readable after its fd was drained");
+    else
+        ok(n, "readable while the inner list had a ready fd, quiet before and after");
+out:
+    close(p[0]); close(p[1]); close(inner); close(outer);
+}
+
 int main(void) {
     printf("epollops: epoll/poll/select semantics probe\n");
     fflush(stdout);
@@ -543,6 +585,7 @@ int main(void) {
     probe_select_counts_bits_not_fds();
     probe_listener_is_readable(34561);
     probe_tcp_peer_close(34562);
+    probe_nested_epoll();
 
     printf("\nepollops: %d FAIL, %d known DIVERGE\n", fails, diverges);
     fflush(stdout);

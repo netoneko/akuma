@@ -58,6 +58,20 @@ impl Entry {
     pub const fn is_edge_triggered(self) -> bool {
         self.events & EPOLLET != 0
     }
+
+    /// Whether a scan that found `revents` would hand this entry to the caller,
+    /// **without recording anything**.
+    ///
+    /// This is what an epoll fd registered inside another epoll asks of each
+    /// entry of its own list: "is something pending for whoever waits on me?".
+    /// It must not use [`InterestList::scan_entry`], which writes `last_ready`
+    /// back — a probe from the outer instance would then consume the inner
+    /// instance's edge and the inner `epoll_wait` that follows would find
+    /// nothing to report.
+    #[must_use]
+    pub const fn would_report(self, revents: u32) -> bool {
+        crate::edge::scan(self.events, revents, self.last_ready).report != 0
+    }
 }
 
 /// The fd → [`Entry`] map of one epoll instance.

@@ -107,6 +107,15 @@ pub enum FdState {
     /// read (`akuma_pty::PtyPair::master_poll`).
     Pty { can_read: bool, can_write: bool, hup: bool },
 
+    /// An epoll instance registered inside another one. Readable exactly while
+    /// its own interest list has something pending; never writable.
+    ///
+    /// It used to fall into [`Self::Unmodelled`], which answers "ready" for
+    /// whatever was asked — so a process that nests epolls (Bun's interactive
+    /// terminal path does) had an outer `epoll_wait` that returned at once,
+    /// forever, and spun at ~2 M syscalls/s with its UI starved.
+    Epoll { pending: bool },
+
     /// An fd kind with no readiness model — a plain file, most of them.
     /// Reported ready for whatever was asked, which is the POSIX answer for a
     /// regular file and a lie for anything else.
@@ -271,6 +280,12 @@ pub const fn readiness(state: FdState, requested: u32) -> u32 {
             }
             if hup {
                 ready |= EPOLLHUP;
+            }
+        }
+
+        FdState::Epoll { pending } => {
+            if wants_in && pending {
+                ready |= EPOLLIN;
             }
         }
 

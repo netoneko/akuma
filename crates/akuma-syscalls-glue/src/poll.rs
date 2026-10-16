@@ -436,6 +436,85 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
 /// the same branch registers a poller, and registering one for an event nobody
 /// asked about would add a wakeup source out of nowhere.
 pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
+    epoll_check_fd_readiness_at(fd_num, requested, waker, 0)
+}
+
+/// How deep an epoll may be nested inside another before the probe stops
+/// asking. Linux refuses `epoll_ctl` ADDs that nest deeper than this
+/// (`EP_MAX_NESTS`) or that form a loop; this kernel's `epoll_ctl` refuses
+/// neither, so the bound is what keeps a self-containing pair from recursing
+/// without end.
+#[cfg(feature = "sc-epoll")]
+const EPOLL_MAX_NEST: u8 = 4;
+
+/// Whether the epoll instance `epoll_id` has something pending for a waiter on
+/// *it* — what an epoll fd registered inside another epoll reports as
+/// `EPOLLIN`.
+///
+/// Asks each registration the same question `sys_epoll_pwait` would, through
+/// [`akuma_syscalls_poll::Entry::would_report`], which **records nothing**: the
+/// outer instance probing the inner one must not consume the inner instance's
+/// edges. `waker` is handed down so the outer waiter is woken by the inner
+/// instance's resources (a pipe written, a socket readable) — without it the
+/// outer wait would sleep until its backstop tick.
+///
+/// Nothing here is held across a probe: the interest list is copied out under
+/// `EPOLL_TABLE` (the readiness checks take other locks, see
+/// `sys_epoll_pwait`), so an instance that contains itself only recurses as far
+/// as `EPOLL_MAX_NEST`.
+#[cfg(feature = "sc-epoll")]
+fn epoll_instance_pending(epoll_id: u32, waker: Option<&Waker>, depth: u8) -> bool {
+    use akuma_syscalls_poll::Entry;
+
+    if depth >= EPOLL_MAX_NEST {
+        return false;
+    }
+
+    // Same shape as the snapshot in `sys_epoll_pwait`: a stack array for the
+    // common case, a heap copy only for an unusually large inner list.
+    const STACK_SNAPSHOT_SIZE: usize = 64;
+    let mut stack: [Option<(u32, Entry)>; STACK_SNAPSHOT_SIZE] = [None; STACK_SNAPSHOT_SIZE];
+    let mut heap: Option<alloc::vec::Vec<(u32, Entry)>> = None;
+    let mut count = 0usize;
+
+    let found = akuma_primitives::irq::with_irqs_disabled(|| {
+        let table = EPOLL_TABLE.lock();
+        let Some(inst) = table.get(&epoll_id) else { return false };
+        if inst.len() > STACK_SNAPSHOT_SIZE {
+            heap = Some(inst.fds().filter_map(|fd| inst.get(fd).map(|e| (fd, e))).collect());
+        } else {
+            for (i, fd) in inst.fds().enumerate() {
+                stack[i] = inst.get(fd).map(|e| (fd, e));
+                count = i + 1;
+            }
+        }
+        true
+    });
+    if !found {
+        return false;
+    }
+
+    let proc = akuma_exec::process::current_process_shared();
+    let probe = |fd: u32, entry: Entry| -> bool {
+        // A closed fd leaves a stale registration behind (see `sys_epoll_pwait`);
+        // it is not a source of readiness.
+        if proc.as_ref().is_none_or(|p| p.get_fd(fd).is_none()) {
+            return false;
+        }
+        let revents = epoll_check_fd_readiness_at(fd, entry.requested(), waker, depth + 1);
+        entry.would_report(revents)
+    };
+
+    if let Some(h) = heap {
+        h.into_iter().any(|(fd, e)| probe(fd, e))
+    } else {
+        stack[..count].iter().flatten().any(|&(fd, e)| probe(fd, e))
+    }
+}
+
+// `depth` is read only by the nested-epoll arm, which exists with `sc-epoll`.
+#[cfg_attr(not(feature = "sc-epoll"), allow(unused_variables))]
+fn epoll_check_fd_readiness_at(fd_num: u32, requested: u32, waker: Option<&Waker>, depth: u8) -> u32 {
     // **A target whose console is answered by fd *number* gets first refusal.**
     //
     // The arms below resolve an fd through the process table and, for the
@@ -646,6 +725,13 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
         akuma_exec::process::FileDescriptor::Tap { .. } => FdState::Tap {
             has_frame: requested & ep::EPOLLIN != 0
                 && akuma_net::rump_tap::has_frame(),
+        },
+        // An epoll instance registered inside another one. Without this it was
+        // `Unmodelled`, i.e. ready for whatever was asked, and the outer wait
+        // spun — see `FdState::Epoll`.
+        #[cfg(feature = "sc-epoll")]
+        akuma_exec::process::FileDescriptor::EpollFd(inner_id) => FdState::Epoll {
+            pending: requested & ep::EPOLLIN != 0 && epoll_instance_pending(inner_id, waker, depth),
         },
         _ => FdState::Unmodelled,
     };
