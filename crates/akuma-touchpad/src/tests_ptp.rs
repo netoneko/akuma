@@ -115,7 +115,7 @@ fn the_decoder_feeds_the_clickpad_end_to_end() {
     let mid = u16::try_from(i32::midpoint(l.x_min, l.x_max)).unwrap();
     let ymid = u16::try_from((l.y_min + l.y_max) / 3).unwrap();
     d.decode(&payload(&[(true, 1, mid, ymid)], false));
-    pad.update(&d.frame());
+    pad.update(&d.frame(), 0);
     assert!(matches!(pad.pop(), Some(PointerEvent::Move { .. })));
 }
 

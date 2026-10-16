@@ -25,6 +25,11 @@
 //!   A physical click ends scrolling.
 //! - **Click-and-drag** works: motion while the button is held is emitted,
 //!   so terminal selection and drag land for free.
+//! - **Tap-to-click**, macOS-style and on by default: a quick, still
+//!   one-finger touch clicks without pressing the pad down, and two quick
+//!   taps are the two click pairs a consumer calls a double click. Off with
+//!   `touchpad.tap=0` on the command line or `echo tap=0 >
+//!   /dev/input/mouse0` live.
 //!
 //! Wheel events use the REL_WHEEL convention: `dy = +1` is scroll *up*
 //! (fingers moving away from the user, toward the top of the pad).
@@ -51,6 +56,21 @@ pub const MAX_CONTACTS: usize = 5;
 /// above a lap's production (one Move per frame plus button pairs); the
 /// drop policy below covers a stalled consumer anyway.
 pub const EVENT_CAP: usize = 16;
+
+/// Longest touch (µs from tip-down to tip-up) that still counts as a tap.
+///
+/// Above it the touch was a rest or the start of a drag, and lifting must
+/// not click. libinput's tap time is 180 ms; 200 ms is the same idea with
+/// the kernel's 8 ms poll period rounding against the limit.
+pub const TAP_MAX_US: u64 = 200_000;
+
+/// Travel from the touch's origin, as % of each sensor axis span, within
+/// which the touch can still be a tap.
+///
+/// Beyond it the finger is dragging, and the press/release must not fire on
+/// lift. The slop is a fraction of the span, not a constant, because sensor
+/// units differ per panel.
+pub const TAP_SLOP_PCT: i32 = 3;
 
 /// Sensor range and panel size, for the absolute 1:1 mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +149,9 @@ impl Geometry {
 /// Policy knobs. The defaults are libinput's for a pad with no visible
 /// markings; every value exists so a boot knob can change it without a
 /// second code path.
+// The bools are one knob each, named like the libinput toggle they map to;
+// packing them into bitflags would buy nothing and cost readability.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Bottom band height, % of sensor height (libinput: min(10 mm, 15%)).
@@ -149,6 +172,12 @@ pub struct Config {
     /// so two fingers moving up scroll the view *down* (and right moves it
     /// left). Off is the traditional wheel direction.
     pub natural_scroll: bool,
+    /// Tap-to-click, as on a MacBook: a quick, still touch of one finger is
+    /// a left click (press + release), without pressing the pad down. A
+    /// second tap inside the window is simply another click pair, which is
+    /// what "double click" is to a consumer. Off: only the physical button
+    /// clicks.
+    pub tap_to_click: bool,
 }
 
 impl Config {
@@ -160,10 +189,17 @@ impl Config {
         clickfinger: false,
         middle: false,
         natural_scroll: true,
+        tap_to_click: true,
     };
 
-    /// [`Config::DEFAULT`] with the traditional (wheel) scroll direction.
-    pub const TRADITIONAL: Self = Self { natural_scroll: false, ..Self::DEFAULT };
+    /// [`Config::DEFAULT`] with the traditional (wheel) scroll direction and
+    /// no tap-to-click: the pad answers only its physical button, which is
+    /// what the pre-tap tests and a clickpad purist expect.
+    pub const TRADITIONAL: Self = Self {
+        natural_scroll: false,
+        tap_to_click: false,
+        ..Self::DEFAULT
+    };
 }
 
 /// One report slot as the driver decoded it.
@@ -235,8 +271,10 @@ struct Finger {
     active: bool,
     cur: (i32, i32),
     zone: Zone,
-    // (tap-to-click, when it comes, adds its own timestamps here; the zone
-    // decision needs only where the finger started, which `zone` freezes.)
+    // (tap-to-click keeps its timestamps in `Clickpad::tap`, not here: only
+    // single-finger taps are recognized, so the state lives one level up.
+    // The zone decision needs only where the finger started, which `zone`
+    // freezes.)
 }
 
 impl Finger {
@@ -261,6 +299,15 @@ enum Scroll {
     },
 }
 
+/// A touch in flight that may end in a tap. `slop` is the per-axis travel
+/// budget in sensor units, computed once from the geometry at touch start.
+#[derive(Clone, Copy)]
+struct Tap {
+    start_us: u64,
+    origin: (i32, i32),
+    slop: (i32, i32),
+}
+
 /// The state machine. One per touchpad, held by the kernel beside the other
 /// polled input devices.
 pub struct Clickpad {
@@ -282,6 +329,10 @@ pub struct Clickpad {
     scroll: Scroll,
     /// Mean of the tracked pair last frame, for the per-frame delta.
     last_pair_mean: Option<(i64, i64)>,
+    /// A single-finger touch in flight that may end in a tap-to-click, when
+    /// [`Config::tap_to_click`] is on. `None` when idle, cancelled, or
+    /// already decided.
+    tap: Option<Tap>,
 
     events: [Option<PointerEvent>; EVENT_CAP],
     head: usize,
@@ -311,6 +362,7 @@ impl Clickpad {
             dragging: false,
             scroll: Scroll::Idle,
             last_pair_mean: None,
+            tap: None,
             events: [None; EVENT_CAP],
             head: 0,
             len: 0,
@@ -319,11 +371,13 @@ impl Clickpad {
         }
     }
 
-    /// Consume one device report.
-    pub fn update(&mut self, frame: &Frame) {
+    /// Consume one device report. `now_us` is the monotonic clock the tap
+    /// windows are measured against — the kernel's uptime, in µs.
+    pub fn update(&mut self, frame: &Frame, now_us: u64) {
         self.track_fingers(frame);
         self.handle_button(frame.button);
         self.post_motion_or_scroll();
+        self.tap_step(frame, now_us);
     }
 
     /// Switch natural scrolling on or off (takes effect from the next tick).
@@ -335,6 +389,19 @@ impl Clickpad {
     #[must_use]
     pub fn natural_scroll(&self) -> bool {
         self.cfg.natural_scroll
+    }
+
+    /// Switch tap-to-click on or off (takes effect from the next tick; a
+    /// tap already in flight is dropped, never half-fired).
+    pub fn set_tap_to_click(&mut self, on: bool) {
+        self.cfg.tap_to_click = on;
+        self.tap = None;
+    }
+
+    /// Is tap-to-click on?
+    #[must_use]
+    pub fn tap_to_click(&self) -> bool {
+        self.cfg.tap_to_click
     }
 
     /// Pop the next event, in decision order.
@@ -542,6 +609,73 @@ impl Clickpad {
             self.end_stroke();
         }
         let _ = self.dragging; // drag = motion with button down, already emitted
+    }
+
+    /// Tap-to-click: one finger down and up again quickly, having stayed
+    /// within slop of where it landed, is a left click (press + release).
+    /// Runs last in [`Self::update`], so the pair lands after the `Lift`
+    /// the same frame pushed — the stroke is over before the click, which
+    /// is the order a consumer expects.
+    ///
+    /// There is deliberately no double-tap state: each tap fires its own
+    /// pair as it lifts, so two taps in quick succession are two pairs —
+    /// which is exactly what a double click is to a consumer. No single
+    /// tap ever waits to find out whether it was alone, which is the same
+    /// immediacy macOS's tap-to-click has. (A two-finger tap stays a
+    /// no-op: it is scroll-arming territory, and inventing a right-click
+    /// there can wait for evidence anyone wants it.)
+    fn tap_step(&mut self, frame: &Frame, now: u64) {
+        if !self.cfg.tap_to_click {
+            self.tap = None;
+            return;
+        }
+        let n = self.active_fingers();
+        // The finger lifted (without the physical button coming down in the
+        // same report — then this became a click-and-drag, not a tap):
+        // a click pair if the touch was quick enough. Travel was checked
+        // frame by frame below, so the last in-budget position is what
+        // counts.
+        if let Some(t) = self.tap
+            && n == 0
+            && !frame.button
+        {
+            self.tap = None;
+            if now.saturating_sub(t.start_us) <= TAP_MAX_US {
+                self.push(PointerEvent::Button { button: Button::Left, down: true });
+                self.push(PointerEvent::Button { button: Button::Left, down: false });
+            }
+            return;
+        }
+        // Anything else in flight — the physical button, a second finger
+        // (scroll arming), a scroll still engaged — cancels the tap: it
+        // became another gesture, and must not click on lift.
+        if frame.button || n != 1 || !matches!(self.scroll, Scroll::Idle) {
+            self.tap = None;
+            return;
+        }
+        let Some(f) = self.fingers.iter().find(|f| f.active) else { return };
+        match self.tap {
+            None => {
+                let slop = |span: i32| {
+                    (i64::from(span) * i64::from(TAP_SLOP_PCT) / 100).max(1) as i32
+                };
+                self.tap = Some(Tap {
+                    start_us: now,
+                    origin: f.cur,
+                    slop: (
+                        slop(self.geom.x_max - self.geom.x_min),
+                        slop(self.geom.y_max - self.geom.y_min),
+                    ),
+                });
+            }
+            Some(t) => {
+                if (f.cur.0 - t.origin.0).abs() > t.slop.0
+                    || (f.cur.1 - t.origin.1).abs() > t.slop.1
+                {
+                    self.tap = None; // it travelled: a drag, not a tap
+                }
+            }
+        }
     }
 
     /// Two-finger scroll over the first two active slots (stable pair).

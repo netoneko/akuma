@@ -302,10 +302,13 @@ pub fn encode(ev: &PointerEvent) -> [u8; EVENT_BYTES] {
 pub enum Ctl {
     /// `natural`, `natural=1`, `natural off`, ...: `None` toggles.
     Natural(Option<bool>),
+    /// `tap`, `tap=1`, `tap off`, ...: tap-to-click (and with it double-tap
+    /// = double click); `None` toggles.
+    Tap(Option<bool>),
 }
 
-/// Parse one line of the control language: `natural` (toggle), or
-/// `natural=<v>` / `natural <v>` with `v` one of `1 0 on off true false yes no`.
+/// Parse one line of the control language: `natural`/`tap` (toggle), or
+/// `<key>=<v>` / `<key> <v>` with `v` one of `1 0 on off true false yes no`.
 /// Anything else is `None` — the whole write is then refused.
 #[must_use]
 pub fn parse_ctl(line: &[u8]) -> Option<Ctl> {
@@ -318,13 +321,15 @@ pub fn parse_ctl(line: &[u8]) -> Option<Ctl> {
         }
         None => (line, &b""[..]),
     };
-    if key != b"natural" {
-        return None;
-    }
-    match val {
-        b"" => Some(Ctl::Natural(None)),
-        b"1" | b"on" | b"true" | b"yes" => Some(Ctl::Natural(Some(true))),
-        b"0" | b"off" | b"false" | b"no" => Some(Ctl::Natural(Some(false))),
+    let on_off = |val: &[u8]| match val {
+        b"" => Some(None),
+        b"1" | b"on" | b"true" | b"yes" => Some(Some(true)),
+        b"0" | b"off" | b"false" | b"no" => Some(Some(false)),
+        _ => None,
+    };
+    match key {
+        b"natural" => on_off(val).map(Ctl::Natural),
+        b"tap" => on_off(val).map(Ctl::Tap),
         _ => None,
     }
 }
