@@ -617,6 +617,29 @@ pub fn fb_take_reply(out: &mut [u8]) -> usize {
     g.as_mut().map_or(0, |c| c.0.take_reply(out))
 }
 
+/// What the program on the console asked of the pointer, and the grid to place
+/// it on: `(tracking, sgr, [origin_x, origin_y, cell_w, cell_h, cols, rows])`.
+/// `None` with no framebuffer console or when the console is busy this lap
+/// (`try_lock`, like [`fb_take_reply`]).
+pub fn fb_mouse() -> Option<(u16, bool, [u32; 6])> {
+    let g = CONSOLE.try_lock()?;
+    let c = &g.as_ref()?.0;
+    let (tracking, sgr) = c.mouse_mode();
+    let (ox, oy, cw, ch, cols, rows) = c.text_grid();
+    let u = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    Some((tracking, sgr, [u(ox), u(oy), u(cw), u(ch), u(cols), u(rows)]))
+}
+
+/// Mark the cell under the pointer (0-based row, col), or stop marking it. Drawn
+/// on the next idle lap; see `fbcon::Console::set_pointer`.
+pub fn fb_set_pointer(cell: Option<(usize, usize)>) {
+    if let Some(mut g) = CONSOLE.try_lock()
+        && let Some(c) = g.as_mut()
+    {
+        c.0.set_pointer(cell);
+    }
+}
+
 /// Restrict printing to the top-left `cols` x `rows` of the screen
 /// (`fbcon::Console::set_view`), returning the size actually in force — the
 /// request clamped to what the screen holds, which is what `TIOCGWINSZ` must then

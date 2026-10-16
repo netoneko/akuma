@@ -253,7 +253,11 @@ pub fn has_input() -> bool {
 /// A stack array, not a `Vec`: this runs on every lap of a daemon for the life
 /// of the kernel, and a per-lap heap allocation on the path that keeps an
 /// interactive console alive is the kind the allocator rules exist to refuse.
-const PUMP_IN: usize = 64;
+const PUMP_IN: usize = 256;
+
+/// Of which the keyboard may fill this many; the rest is room for pointer
+/// reports ([`crate::touchpad::console_bridge`]), which can be longer than a key.
+const PUMP_KEYS: usize = 64;
 
 /// The same, for the echo the line discipline writes back.
 const PUMP_OUT: usize = 256;
@@ -278,7 +282,7 @@ pub fn pump_once() -> bool {
     // The machine's input devices -> the console's input queue.
     let mut inbuf = [0u8; PUMP_IN];
     let mut n = 0;
-    while n < inbuf.len() {
+    while n < PUMP_KEYS {
         match crate::input::getb() {
             Some(b) => {
                 inbuf[n] = b;
@@ -293,6 +297,12 @@ pub fn pump_once() -> bool {
     // timeout at every prompt, and a TUI waits to learn the terminal's colours.
     if n < inbuf.len() {
         n += crate::multiboot2::fb_take_reply(&mut inbuf[n..]);
+    }
+    // The pointer, for a program that turned mouse reporting on: reports are
+    // typed in like keys (`CSI < b ; col ; row M`). Costs one console
+    // `try_lock` and nothing else while no program has asked.
+    if n < inbuf.len() {
+        n += crate::touchpad::console_bridge(&mut inbuf[n..]);
     }
     if n > 0 {
         // **Through the shared line discipline, not into the FIFO.**

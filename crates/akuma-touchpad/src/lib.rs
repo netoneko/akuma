@@ -38,6 +38,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ptp;
+pub mod tty;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

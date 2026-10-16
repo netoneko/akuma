@@ -37,6 +37,7 @@ use akuma_i2c_hid::{
 };
 use akuma_ryzen_amd64::{MachineDescription, PhysMem};
 use akuma_touchpad::ptp::{EVENT_BYTES, PtpDecoder, PtpLayout, encode};
+use akuma_touchpad::tty::{Grid, MAX_REPORT, MouseEncoder, Tracking};
 use akuma_touchpad::{Clickpad, Config};
 use spinning_top::Spinlock;
 
@@ -76,6 +77,10 @@ struct Pad {
     /// Poll accounting, for the first-boot log: reads that completed, NACKs,
     /// empty (length 0) reads, reports decoded, and raw dumps still allowed.
     st: Stats,
+    /// The console bridge's state: translation of pointer events into the
+    /// mouse reports a console program asked for ([`console_bridge`]).
+    mouse: MouseEncoder,
+    bridge_on: bool,
 }
 
 #[derive(Default)]
@@ -407,6 +412,8 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
         next_poll_us: 0,
         last_touch_us: 0,
         st: Stats { dumps: 6, ..Stats::default() },
+        mouse: MouseEncoder::new(),
+        bridge_on: false,
     })
 }
 
@@ -651,4 +658,59 @@ pub fn dev_read(buf: u64, len: usize) -> u64 {
         return crate::fd::errno::EFAULT;
     }
     bytes as u64
+}
+
+// ---------------------------------------------------------------------------
+// The console bridge: pointer -> a terminal program's mouse input
+// ---------------------------------------------------------------------------
+
+/// Wheel ticks per event the encoder may emit; the bridge leaves room for a
+/// full event before taking one off the ring.
+const BRIDGE_ROOM: usize = MAX_REPORT * 8;
+
+/// Turn pending pointer events into the mouse reports the program on the
+/// console asked for (`CSI ? 1000/1002/1003 h`, SGR with `1006`), written into
+/// `out` — the same input queue the keyboard types into. Returns the bytes
+/// written.
+///
+/// Only while a program has asked: otherwise the events stay for
+/// `/dev/input/mouse0` readers (and the first enable discards what piled up,
+/// so a click made long ago does not fire the moment a program starts
+/// listening). The pointer's cell is marked on the console while reporting is
+/// on and unmarked when it ends.
+pub fn console_bridge(out: &mut [u8]) -> usize {
+    if !UP.load(Ordering::Acquire) {
+        return 0;
+    }
+    let Some((tracking, sgr, g)) = crate::multiboot2::fb_mouse() else { return 0 };
+    let _irq = akuma_primitives::irq::IrqGuard::new();
+    let Some(mut guard) = PAD.try_lock() else { return 0 };
+    let Some(p) = guard.as_mut() else { return 0 };
+    if tracking == 0 {
+        if p.bridge_on {
+            p.bridge_on = false;
+            p.mouse.reset();
+            crate::multiboot2::fb_set_pointer(None);
+        }
+        return 0;
+    }
+    if !p.bridge_on {
+        p.bridge_on = true;
+        p.mouse.reset();
+        while p.pad.pop().is_some() {}
+    }
+    let mode = match tracking {
+        1000 => Tracking::Press,
+        1002 => Tracking::Drag,
+        _ => Tracking::Any,
+    };
+    let grid = Grid { origin_x: g[0], origin_y: g[1], cell_w: g[2], cell_h: g[3], cols: g[4], rows: g[5] };
+    let mut n = 0;
+    while out.len() - n >= BRIDGE_ROOM {
+        let Some(ev) = p.pad.pop() else { break };
+        n += p.mouse.feed(&ev, mode, sgr, &grid, &mut out[n..]);
+    }
+    let (col, row) = p.mouse.cell();
+    crate::multiboot2::fb_set_pointer(Some((row.saturating_sub(1) as usize, col.saturating_sub(1) as usize)));
+    n
 }

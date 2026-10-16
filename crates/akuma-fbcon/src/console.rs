@@ -272,6 +272,17 @@ pub struct Console<S: Surface> {
     /// The cell the cursor is drawn on right now, if it is drawn at all. See
     /// [`Console::show_cursor`].
     cursor: Option<(usize, usize)>,
+    /// Mouse reporting the program asked for: 0 off, else the highest of
+    /// 1000/1002/1003. Read by whoever owns a pointing device
+    /// ([`Console::mouse_mode`]); the console itself has no mouse.
+    mouse: u16,
+    /// `CSI ? 1006 h`: reports in SGR form.
+    mouse_sgr: bool,
+    /// Where the pointer should be marked (0-based row, col), and where its
+    /// marker is drawn right now. Same idle-draw / write-hides discipline as
+    /// the text cursor ([`Console::set_pointer`]).
+    pointer: Option<(usize, usize)>,
+    pointer_drawn: Option<(usize, usize)>,
     reply: [u8; REPLY_CAP],
     reply_len: usize,
     /// The grid changed size under the program (a new margin); see
@@ -359,6 +370,10 @@ impl<S: Surface> Console<S> {
             autowrap: true,
             cursor_hidden: false,
             alt: false,
+            mouse: 0,
+            mouse_sgr: false,
+            pointer: None,
+            pointer_drawn: None,
             last_cp: 0x20,
             cursor: None,
             reply: [0; REPLY_CAP],
@@ -977,6 +992,17 @@ impl<S: Surface> Console<S> {
             match mode {
                 7 => self.autowrap = on,
                 25 => self.cursor_hidden = !on,
+                // Mouse reporting. 1000/1002/1003 are levels of one setting: the
+                // highest one on wins, and switching a level off while a higher
+                // one is on leaves the higher one alone.
+                1000 | 1002 | 1003 => {
+                    if on {
+                        self.mouse = self.mouse.max(mode);
+                    } else if self.mouse <= mode {
+                        self.mouse = 0;
+                    }
+                }
+                1006 => self.mouse_sgr = on,
                 // The alternate screen. Entering clears and homes (the previous
                 // screen cannot be kept — that would cost a second grid); leaving
                 // clears again and gives back the saved cursor.
@@ -1093,6 +1119,11 @@ impl<S: Surface> Console<S> {
     /// a prompt is indistinguishable from output, and a screen that has stopped
     /// scrolling cannot be told apart from one that is waiting for you.
     pub fn show_cursor(&mut self) {
+        self.show_text_cursor();
+        self.show_pointer();
+    }
+
+    fn show_text_cursor(&mut self) {
         if self.cursor_hidden {
             return;
         }
@@ -1111,8 +1142,65 @@ impl<S: Surface> Console<S> {
     /// drawn. Called first by [`Console::write_byte`], so nothing ever draws
     /// over — or scrolls — a stale cursor.
     pub fn hide_cursor(&mut self) {
+        self.hide_pointer();
         if let Some((r, c)) = self.cursor.take() {
             self.paint(r, c, false);
+        }
+    }
+
+    /// Mouse reporting the program has asked for: `(tracking, sgr)` where
+    /// tracking is 0 (off), 1000, 1002 or 1003.
+    #[must_use]
+    pub const fn mouse_mode(&self) -> (u16, bool) {
+        (self.mouse, self.mouse_sgr)
+    }
+
+    /// The text grid in pixels, for turning a pointer position into a cell:
+    /// `(origin_x, origin_y, cell_w, cell_h, cols, rows)` of the printing area.
+    #[must_use]
+    pub const fn text_grid(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.origin_x,
+            self.origin_y,
+            self.font.width() * self.scale,
+            self.font.height() * self.scale,
+            self.vcols,
+            self.vrows,
+        )
+    }
+
+    /// Mark (or stop marking) the cell under the pointer, 0-based `(row, col)`.
+    /// Drawn on the next [`Console::show_cursor`] (the idle call) and taken
+    /// down by the next write, exactly like the text cursor, so a moving
+    /// pointer costs two cell repaints and never touches the screen mid-output.
+    pub fn set_pointer(&mut self, cell: Option<(usize, usize)>) {
+        self.pointer = cell.filter(|&(r, c)| r < self.vrows && c < self.vcols);
+        if self.pointer.is_none() {
+            self.hide_pointer();
+        }
+    }
+
+    fn show_pointer(&mut self) {
+        let Some(want) = self.pointer else { return };
+        if self.pointer_drawn == Some(want) {
+            return;
+        }
+        self.hide_pointer();
+        // On the text cursor's own cell it is already inverted; drawing the
+        // marker there would flip it back.
+        if self.cursor != Some(want) {
+            self.paint(want.0, want.1, true);
+        }
+        self.pointer_drawn = Some(want);
+    }
+
+    fn hide_pointer(&mut self) {
+        if let Some((r, c)) = self.pointer_drawn.take()
+            && r < self.rows
+            && c < self.cols
+        {
+            let keep_inverted = self.cursor == Some((r, c));
+            self.paint(r, c, keep_inverted);
         }
     }
 
