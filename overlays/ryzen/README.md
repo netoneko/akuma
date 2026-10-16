@@ -140,6 +140,34 @@ Entries 12-14 run a plain `herd daemon` (`initargs=daemon`): the services are wh
 `initargs=daemon,--service,…`, which loads exactly the named herd services.
 **`daemon` must come first**: herd takes argv[1] as a command.
 
+## Choices that are on purpose (2026-10-16)
+
+Settings that look arbitrary and are not. Each one cost an afternoon once, so
+they are written here; change one deliberately, not by accident. The files that
+carry them are in `rootfs/` (applied by `build.sh`) unless noted.
+
+| choice | value | why |
+|---|---|---|
+| **HOME on the console** | `HOME=/root`, as an `env =` line in `etc/herd/enabled/console.conf` | herd's default console environment has `HOME=/`, and `/etc/akuma-dev.env` only does `HOME=${HOME:-/root}` (it keeps what is set). So the on-screen shell and everything started from it — herdr, claude, goose — kept its dotfiles in `/` while ssh sessions used `/root`: two places for every config, and a claude that "forgot" its settings and sessions. One place now. (`amd64/mkdisk.sh` writes the same line for every image.) |
+| **Console font** | `font = 20` in `etc/console.conf` (10x20 cell) | `font =` is the **pixel cell height** of a baked IBM Plex Mono cut (20, 22, 24, 32, 40, 48), not points. On this 16" 1920x1200 panel (~141 ppi) a 10x20 cell is the physical size of Ghostty's 13 pt on a 14" retina Mac (~254 ppi, cell ≈ 3.4 mm tall); 22 ≈ 15 pt-equivalent, a 26 would be 18 pt (not baked). Auto-choice without the file is 11x22 (screens ≥ 1000 px tall). Read at boot. |
+| **herdr: no left panel** | `ui.sidebar_start_collapsed = true`, `ui.sidebar_collapsed_mode = "hidden"` in `root/.config/herdr/config.toml` | The workspace list ate a quarter of the screen for a box that mostly has one or two workspaces. `prefix+b` brings it back. Collapse applies at the next launch. |
+| **herdr: date and power in the tab row** | `ui.tab_bar_right` = a `datetime` entry and a `command` entry running `usr/local/bin/herdr-status` every 10 s | The console has no other clock or battery readout. The script prints the last line herdr shows: `39% bat 16.1W 1h18` from `/proc/power`. It prints nothing (entry hidden) if the file is missing. |
+| **herdr: new groups start with two panes** | `prefix+alt+n` (workspace) / `prefix+alt+c` (tab) run `usr/local/bin/herdr-new-group` | herdr has no config key for a default layout. The script creates the workspace/tab then splits its root pane right. The default `prefix+shift+n` / `prefix+c` still make single panes — bound beside them, not over them. |
+| **goose-glm defaults** | `glm-5.3-flash`, `GOOSE_THINKING_EFFORT=low` (`stage-dev.sh`) | Fast and cheap by default; `GOOSE_MODEL=glm-5.3 goose-glm …` for the big one. |
+| **goose-kimi states its provider** | provider, host and model in the wrapper (`stage-dev.sh`), not left to the shared `config.yaml` | The two wrappers share one `secrets.yaml` (each rewrites it per run, so don't run both at once) and one `sessions.db` — `goose-kimi session -r` resumes a session goose-glm started. |
+| **claude settings** | `/root/.claude/settings.json` (model, effort, `viewMode: verbose`, `showThinkingSummaries`) | Only read when `HOME=/root`; before the HOME fix these lived in `/.claude` and the pane's claude never saw them. |
+| **No bash on the box** | busybox ash is `/bin/sh`; there is no `bash` | Claude Code's Bash tool refuses any shell that is not bash/zsh ("No suitable shell found"), so inside claude on this box the Bash tool fails and it can only read files. Open. |
+| **The console service is kept** | `remove.list` is empty | It was removed here on 2026-10-06, then wanted back (entries 12 and 20 are console entries). The service file now comes from `rootfs/etc/herd/enabled/console.conf`. |
+| **Tools staged by hand** | `rg` 15.2.0 and `gh` 2.102.0 in `/usr/local/bin` (static x86_64 builds, sha256-checked against the release files) | Pushed over ssh as base64 (`gh` is 42 MB: ~7 min over wifi). Neither is in `stage-dev.sh` yet. `gh` has no login on the box. |
+
+Two kernel bugs found while setting these up, both fixed in the tree and
+documented where they live: an epoll nested inside another epoll reported ready
+forever (`docs/reference/subsystems/syscalls/poll.md` § Nested epoll — what made
+the interactive `claude` spin), and the hardware watchdog was fed only when
+`tick % 100 == 0`, which `idlesleep`'s tick credits could step over, resetting an
+idle box (`docs/reference/subsystems/power.md` § Why an idle box could reset
+itself).
+
 ## Getting back to Pop
 
 | what ends the Akuma boot | how |

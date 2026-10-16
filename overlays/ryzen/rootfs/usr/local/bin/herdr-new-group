@@ -1,0 +1,10 @@
+#!/bin/sh
+# New workspace (or tab, with "tab") that always starts with two panes side by side.
+# herdr has no config key for a default layout; this is bound to a key in config.toml.
+# Focus stays where it is unless "focus" is passed (so a test does not steal the screen).
+kind=${1:-workspace}; focus=--no-focus; [ "$2" = focus ] && focus=--focus
+H=${HERDR_BIN_PATH:-/bin/herdr}
+out=$($H $kind create $focus 2>&1) || { echo "$out" >&2; exit 1; }
+pane=$(echo "$out" | grep -o "\"pane_id\":\"[^\"]*\"" | head -n 1 | cut -d"\"" -f4)
+[ -n "$pane" ] || { echo "no pane id in: $out" >&2; exit 1; }
+exec $H pane split "$pane" --direction right --no-focus

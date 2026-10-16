@@ -1,0 +1,14 @@
+#!/bin/sh
+# One line for herdr's status bar: battery %, state, draw, time left, from /proc/power.
+# herdr shows the LAST line of output, clears the entry on empty output or failure.
+p=/proc/power
+[ -r $p ] || exit 0
+v() { sed -n "s/^$1=//p" $p | head -n 1; }
+pct=$(v percent); st=$(v status); mw=$(v power_mw); min=$(v minutes); ac=$(v ac)
+[ -n "$pct" ] || exit 0
+case "$st" in Charging) s="chg";; Discharging) s="bat";; Full) s="full";; *) s="${st:-?}";; esac
+[ "$ac" = 1 ] && s="$s+ac"
+out="$pct% $s"
+[ -n "$mw" ] && [ "$mw" -gt 0 ] 2>/dev/null && out="$out $((mw / 1000)).$((mw % 1000 / 100))W"
+[ -n "$min" ] && [ "$min" -gt 0 ] 2>/dev/null && out="$out $((min / 60))h$(printf %02d $((min % 60)))"
+echo "$out"

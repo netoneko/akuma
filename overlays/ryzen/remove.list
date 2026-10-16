@@ -1,3 +1,4 @@
 # Paths build.sh deletes from the image after mkdisk.sh, one per line.
-# The framebuffer console shell: not wanted on ryzen (user, 2026-10-06).
-/etc/herd/enabled/console.conf
+# (Empty since 2026-10-16: the framebuffer console shell was removed here on
+# 2026-10-06, then wanted back — menu entries 12 and 20 are "console" entries and
+# herdr runs in it. Its service file now comes from rootfs/etc/herd/enabled/.)

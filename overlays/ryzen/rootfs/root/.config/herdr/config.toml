@@ -1,0 +1,28 @@
+onboarding = false
+
+[ui]
+# Left panel off: start collapsed and hide it entirely when collapsed.
+# prefix+b (keys.toggle_sidebar) still brings it back.
+sidebar_start_collapsed = true
+sidebar_collapsed_mode = "hidden"
+
+# Right end of the tab row: date/time, then power from /proc/power.
+tab_bar_right = [
+  { type = "datetime", format = "%a %d %b %H:%M" },
+  { type = "command", command = "/usr/local/bin/herdr-status", interval_seconds = 10, timeout_seconds = 3 },
+]
+tab_bar_right_separator = " · "
+
+# New workspace / new tab that always opens with two panes side by side
+# (herdr has no config key for a default layout; see herdr-new-group).
+[[keys.command]]
+key = "prefix+alt+n"
+type = "shell"
+command = "/usr/local/bin/herdr-new-group workspace focus"
+description = "new workspace, 2 panes"
+
+[[keys.command]]
+key = "prefix+alt+c"
+type = "shell"
+command = "/usr/local/bin/herdr-new-group tab focus"
+description = "new tab, 2 panes"

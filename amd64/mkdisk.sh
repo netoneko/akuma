@@ -674,7 +674,7 @@ if [ -n "$HERD" ]; then
     # is; a tree without it stages no console service rather than one that
     # fails and restarts forever.
     if [ -f "$BB" ]; then
-        printf 'command = /bin/sh\nconsole = true\nrestart = true\nrestart_delay = 1000\nenv = TERM=xterm-256color\nenv = ENV=/etc/console.rc\n' > "$TMP/herd-console.conf"
+        printf 'command = /bin/sh\nconsole = true\nrestart = true\nrestart_delay = 1000\nenv = TERM=xterm-256color\nenv = HOME=/root\nenv = ENV=/etc/console.rc\n' > "$TMP/herd-console.conf"
         # Sourced by the console shell (ash reads $ENV when interactive). The place
         # to choose the printing area on the TV: `stty cols N rows M` narrows it to
         # the top-left N x M cells and programs lay out for that.

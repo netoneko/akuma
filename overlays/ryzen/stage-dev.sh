@@ -100,11 +100,19 @@ CFG
 # goose against Kimi Code. goose ignores OPENAI_API_KEY from the environment on
 # this box (401 on the first request) and reads its file secret store when the
 # keyring is off, so the key is written there, per run, 0600, from the token.
+# Provider, host and model are stated here (as in goose-glm) rather than left to
+# the shared config.yaml, so the two wrappers cannot drift or override each
+# other. Sessions are shared (one sessions.db): `goose-kimi session -r` resumes
+# the most recent session, including one goose-glm started.
 . /etc/akuma-dev.env
 umask 077
 mkdir -p /root/.config/goose
 printf 'OPENAI_API_KEY: %s\n' "$(cat /root/.akuma/kimi/token)" > /root/.config/goose/secrets.yaml
 GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
+GOOSE_PROVIDER=openai; export GOOSE_PROVIDER
+GOOSE_MODEL=${GOOSE_MODEL:-kimi-for-coding}; export GOOSE_MODEL
+OPENAI_HOST=https://api.kimi.com; export OPENAI_HOST
+OPENAI_BASE_PATH=coding/v1/chat/completions; export OPENAI_BASE_PATH
 exec /usr/local/bin/goose "$@"
 CFG
     chmod 755 $P/usr/local/bin/goose-kimi
@@ -118,7 +126,8 @@ mkdir -p /root/.config/goose
 printf 'OPENAI_API_KEY: %s\n' "$(cat /root/.akuma/z.ai/token)" > /root/.config/goose/secrets.yaml
 GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
 GOOSE_PROVIDER=openai; export GOOSE_PROVIDER
-GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3}; export GOOSE_MODEL
+GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3-flash}; export GOOSE_MODEL
+GOOSE_THINKING_EFFORT=${GOOSE_THINKING_EFFORT:-low}; export GOOSE_THINKING_EFFORT
 OPENAI_HOST=https://api.z.ai; export OPENAI_HOST
 OPENAI_BASE_PATH=api/coding/paas/v4/chat/completions; export OPENAI_BASE_PATH
 exec /usr/local/bin/goose "$@"
