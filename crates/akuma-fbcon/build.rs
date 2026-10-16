@@ -110,6 +110,7 @@ fn main() {
     emit(&ibm_plex_mono(&PLEX_HD), &out);
     emit(&ibm_plex_mono(&PLEX_32), &out);
     emit(&ibm_plex_mono(&PLEX_40), &out);
+    emit(&ibm_plex_mono(&PLEX_22), &out);
     emit(&spleen(), &out);
 }
 
@@ -213,6 +214,18 @@ const PLEX_40: PlexSize = PlexSize {
     name: "IBM Plex Mono 20x40",
     width: 20,
     height: 40,
+    gamma: HD_COVERAGE_GAMMA,
+};
+
+/// 11x22 (2026-10-16): 10 % under the 12x24 default, for the ryzen laptop's
+/// 1920x1200 panel, where 12x24 read as too large. Chosen by
+/// `Console::choose_font` for scale-1 screens at least 1000 pixels tall.
+const PLEX_22: PlexSize = PlexSize {
+    ident: "IBM_PLEX_MONO_22",
+    stem: "ibm_plex_mono_22",
+    name: "IBM Plex Mono 11x22",
+    width: 11,
+    height: 22,
     gamma: HD_COVERAGE_GAMMA,
 };
 

@@ -7,7 +7,7 @@
 //! the end of the surface — which on real hardware is not a wrong pixel but a
 //! corrupted page.
 
-use akuma_fbcon::console::{DEFAULT_FONT, FALLBACK_FONT, MAX_COLS, MAX_ROWS};
+use akuma_fbcon::console::{DEFAULT_FONT, FALLBACK_FONT, FONT_22, FONT_22_MIN_HEIGHT, MAX_COLS, MAX_ROWS};
 use akuma_fbcon::font::{self, Font};
 use akuma_fbcon::{Console, Rgb, Surface};
 
@@ -416,10 +416,18 @@ fn the_font_falls_back_only_on_a_screen_that_needs_it() {
             C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
         );
     }
+    // From 1000 pixels tall the default is the 11x22 cut (2026-10-16).
     for (w, h) in [(1024, 768), (1280, 720), (1280, 1024), (1920, 1080), (1920, 1200)] {
+        // Expectation derived from the published threshold and the screen's
+        // own scale, not from a literal that mirrors the implementation.
+        let want = if C::auto_scale(DEFAULT_FONT, h) == 1 && h >= FONT_22_MIN_HEIGHT {
+            FONT_22
+        } else {
+            DEFAULT_FONT
+        };
         assert_eq!(
             C::choose_font(w, h).name(),
-            DEFAULT_FONT.name(),
+            want.name(),
             "{w}x{h} fell back at {:?}",
             C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
         );
@@ -496,7 +504,8 @@ fn the_fallback_font_is_not_always_the_smaller_cell() {
     let d = C::auto_scale(DEFAULT_FONT, h) * DEFAULT_FONT.height();
     let f = C::auto_scale(FALLBACK_FONT, h) * FALLBACK_FONT.height();
     assert!(f > d, "the fallback cell is {f} against the default's {d}");
-    assert_eq!(C::choose_font(w, h).name(), DEFAULT_FONT.name());
+    let want = if h >= FONT_22_MIN_HEIGHT { FONT_22 } else { DEFAULT_FONT };
+    assert_eq!(C::choose_font(w, h).name(), want.name());
 }
 
 /// An override stays an override: naming a font or a scale must not be second

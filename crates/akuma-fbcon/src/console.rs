@@ -30,12 +30,19 @@ pub const HD_FONT: &Font = &font::IBM_PLEX_MONO_HD;
 /// [`HD_FONT`], for more text on the 4K television (192x54 cells, not 160x45).
 pub const FONT_40: &Font = &font::IBM_PLEX_MONO_40;
 
+/// The same face at 11x22: what a scale-1 screen at least 1000 pixels tall gets
+/// by default since 2026-10-16 (10 % under [`DEFAULT_FONT`]), and `font = 22`.
+pub const FONT_22: &Font = &font::IBM_PLEX_MONO_22;
+
+/// Screen height from which a scale-1 screen defaults to [`FONT_22`].
+pub const FONT_22_MIN_HEIGHT: usize = 1000;
+
 /// The same face at 16x32, for `font = 32` in `/etc/console.conf`.
 pub const FONT_32: &Font = &font::IBM_PLEX_MONO_32;
 
 /// Every baked cut of the default face, by cell height — what
 /// `/etc/console.conf`'s `font =` chooses among ([`Console::font_by_height`]).
-pub const PLEX_CUTS: [&Font; 4] = [DEFAULT_FONT, FONT_32, FONT_40, HD_FONT];
+pub const PLEX_CUTS: [&Font; 5] = [DEFAULT_FONT, FONT_22, FONT_32, FONT_40, HD_FONT];
 
 /// The font used instead when [`DEFAULT_FONT`]'s cell is too big for the screen.
 ///
@@ -406,7 +413,11 @@ impl<S: Surface> Console<S> {
         // Since 2026-10-03 that screen gets [`FONT_40`] instead: 15 % smaller
         // than the HD cut, more text per screen. `font = 48` in
         // `/etc/console.conf` brings the HD cut back.
-        let default = if Self::auto_scale(DEFAULT_FONT, height) == 2 { FONT_40 } else { DEFAULT_FONT };
+        let default = match Self::auto_scale(DEFAULT_FONT, height) {
+            2 => FONT_40,
+            1 if height >= FONT_22_MIN_HEIGHT => FONT_22,
+            _ => DEFAULT_FONT,
+        };
         match (grid(default), grid(FALLBACK_FONT)) {
             (Some((cols, rows)), _) if cols >= MIN_COLS && rows >= MIN_ROWS => default,
             // Nothing to fall back to, including the case where neither font
@@ -549,7 +560,7 @@ impl<S: Surface> Console<S> {
     }
 
     /// The baked cut of the default face whose cell is `height` pixels tall
-    /// (24, 32, 40 or 48), or `None`.
+    /// (22, 24, 32, 40 or 48), or `None`.
     #[must_use]
     pub fn font_by_height(height: usize) -> Option<&'static Font> {
         PLEX_CUTS.iter().copied().find(|f| f.height() == height)

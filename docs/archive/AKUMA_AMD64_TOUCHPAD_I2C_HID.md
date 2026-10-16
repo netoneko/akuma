@@ -4,8 +4,8 @@
 touchpad work in framebuffer on akuma? i'd like to be able to click/right
 click/scroll stuff on ryzen"*, then carried one increment: **the four pure
 crates of the touchpad stack are built, host-tested and clippy-clean.**
-Nothing is wired to hardware yet — that needs the Linux-side measurement
-(M0 below) and the `amd64/src/` glue, in that order.
+The glue followed the same day and **runs on the ryzen box** (§5, "First
+metal run"); the remaining work is the rio-side consumer.
 
 ## Status
 
@@ -17,7 +17,7 @@ Nothing is wired to hardware yet — that needs the Linux-side measurement
 | `akuma-dwi2c` — DesignWare I²C decisions (regs, timings, aborts) | **done**: 9 host tests |
 | `akuma-touchpad` — clickpad policy (click/right/scroll state machine) | **done**: 20 host tests |
 | M0: measure this unit's I²C controller + touchpad constants on Linux | **done 2026-10-16** — §4a below; rdesc pinned as `akuma-hid` fixture |
-| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **written 2026-10-16, builds, UNVERIFIED on metal** — §5; first boot is the next step |
+| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **WORKS ON METAL 2026-10-16** (ryzen, entry 12): bring-up, 1- and 2-finger contacts, scroll and click records — §5 "First metal run". Not yet: `poll`/`epoll` on the node, the pad's IRQ, the rio consumer |
 | rio fork: read the node, winit pointer events, cursor sprite | **open** — kernel half first |
 
 Full host suite at commit time: **2076 passed, 0 failed** (50 of them new);
