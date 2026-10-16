@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Clickpad policy: contacts + one physical button -> pointer motion, left/right clicks, two-finger scroll"
 
+[dependencies]
+akuma-hid = { path = "../akuma-hid" }
+
 [lints]
 workspace = true

@@ -277,6 +277,65 @@ impl TxAbort {
     }
 }
 
+/// AMD FCH **AOAC** (always-on/always-connected) power gating, the part of
+/// ACPI `_PS0` the DSDT's `DSAD` method performs for these controllers.
+///
+/// A runtime-suspended `AMDI0010` reads **every register as `0xFFFF_FFFF`**
+/// — indistinguishable from an absent block — until D0 is requested here.
+/// Measured on the IdeaPad 5 2-in-1 16AHP9 (2026-10-16): suspended
+/// `0x77/0x38`, awake `0x7C/0x27` for device 5 (`I2CA`). The sequence is the
+/// DSDT's, byte for byte: set the D-state field to 0, set `PWRDN_B` (bit 3),
+/// poll the status field until it reads [`aoac::DS_ON`].
+pub mod aoac {
+    /// MMIO base of the per-device control bytes; device `n` owns two bytes
+    /// at `BASE + 2n` (control byte, then status byte).
+    pub const BASE: u64 = 0xFED8_1E40;
+    /// AOAC device number of `I2CA` (`DSAD (0x05, …)` in the DSDT).
+    pub const DEV_I2C0: u32 = 5;
+    /// Status field (low 3 bits of the **second** byte) when the block is
+    /// fully powered.
+    pub const DS_ON: u8 = 0x07;
+    /// Control byte bits.
+    pub const TARGET_D_MASK: u8 = 0x03;
+    pub const PWRDN_B: u8 = 1 << 3;
+
+    /// Physical address of device `dev`'s control byte (its status byte is
+    /// the next).
+    #[must_use]
+    pub const fn addr(dev: u32) -> u64 {
+        BASE + 2 * dev as u64
+    }
+
+    /// The control byte that requests D0, from the current one: `ADTD = 0`,
+    /// `ADPD = 1`, every other bit preserved (`Preserve` in the DSDT field).
+    #[must_use]
+    pub const fn d0_control(cur: u8) -> u8 {
+        (cur & !TARGET_D_MASK) | PWRDN_B
+    }
+
+    /// Does this status byte say the block is fully powered?
+    #[must_use]
+    pub const fn is_on(status: u8) -> bool {
+        status & 0x07 == DS_ON
+    }
+
+    /// Is the block already in D0 per its control byte (no write needed)?
+    #[must_use]
+    pub const fn wants_d0(control: u8) -> bool {
+        control & TARGET_D_MASK == 0 && control & PWRDN_B != 0
+    }
+}
+
+/// Are the divide counts left in the registers usable as they stand?
+///
+/// Both halves must be non-zero. The IdeaPad's DSDT carries no
+/// `FMCN`/`SSCN`, and Linux with no clock source keeps what is in the
+/// registers; so does this kernel (measured fast mode `0x84:0xEF`).
+#[must_use]
+pub const fn counts_usable(hcnt: u32, lcnt: u32) -> bool {
+    hcnt != 0 && lcnt != 0 && hcnt <= 0xFFFF && lcnt <= 0xFFFF
+}
+
 /// The outcome a transaction loop maps errors onto — the vocabulary the
 /// kernel glue and the i2c-hid layer share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

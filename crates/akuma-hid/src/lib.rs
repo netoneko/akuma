@@ -71,8 +71,9 @@
 
 mod field;
 mod item;
-#[cfg(test)]
-mod fixtures;
+/// Real report descriptors captured from hardware, for tests in this crate
+/// and its consumers (unused consts cost nothing in a release image).
+pub mod fixtures;
 #[cfg(test)]
 mod tests;
 

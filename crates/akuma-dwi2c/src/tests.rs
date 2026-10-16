@@ -50,7 +50,7 @@ fn scl_counts_at_133_mhz_round_to_closest() {
 fn acpi_timing_packages_apply() {
     // Shape from the DSDT: package [hcnt, lcnt, sda_hold].
     let mut t = timings_from_clock(100_000);
-    let fmcn = [0x27Fu16 as u32, 0x0323, 0x0]; // plausible real-world FMCN
+    let fmcn = [u32::from(0x27Fu16), 0x0323, 0x0]; // plausible real-world FMCN
     apply_acpi_package(&mut t, BusSpeed::Fast, &fmcn);
     assert_eq!(
         t.fs,
@@ -148,4 +148,34 @@ fn data_cmd_bit_shapes() {
     // A written data byte is the byte itself; STOP rides on top.
     let last_write: u32 = 0xAB | data_cmd::STOP;
     assert_eq!(last_write, 0x2AB);
+}
+
+#[test]
+fn aoac_matches_the_measured_i2ca_bytes() {
+    // /dev/mem on the 16AHP9: suspended 0x77/0x38, awake 0x7C/0x27.
+    assert_eq!(aoac::addr(aoac::DEV_I2C0), 0xFED8_1E4A);
+    assert_eq!(aoac::d0_control(0x77), 0x7C);
+    assert!(!aoac::wants_d0(0x77));
+    assert!(aoac::wants_d0(0x7C));
+    assert!(!aoac::is_on(0x38));
+    assert!(aoac::is_on(0x27));
+    // The upper status bits are not part of the field.
+    assert!(aoac::is_on(0xFF));
+    assert!(!aoac::is_on(0x06));
+}
+
+#[test]
+fn aoac_d0_is_idempotent() {
+    for b in 0..=255u8 {
+        assert_eq!(aoac::d0_control(aoac::d0_control(b)), aoac::d0_control(b));
+        assert!(aoac::wants_d0(aoac::d0_control(b)));
+    }
+}
+
+#[test]
+fn firmware_counts() {
+    assert!(counts_usable(0x84, 0xEF));
+    assert!(!counts_usable(0, 0xEF));
+    assert!(!counts_usable(0x84, 0));
+    assert!(!counts_usable(0xFFFF_FFFF, 0xFFFF_FFFF));
 }

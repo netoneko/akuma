@@ -37,8 +37,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod ptp;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_ptp;
 
 /// Report slots the machine tracks (precision touchpads report 5).
 pub const MAX_CONTACTS: usize = 5;

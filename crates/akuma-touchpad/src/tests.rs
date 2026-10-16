@@ -466,7 +466,7 @@ fn event_ring_drops_moves_keeps_buttons() {
     for i in 0..24 {
         cp.update(&frame(&[down(200 + i * 60, 500), UP, UP, UP, UP], false));
     }
-    assert_eq!(cp.pending(), true);
+    assert!(cp.pending());
     assert!(cp.dropped_moves() >= 8, "overflowing moves counted");
     // A button squeezes in by evicting the oldest entry.
     cp.update(&frame(&[down(200 + 24 * 60, 500), UP, UP, UP, UP], true));
