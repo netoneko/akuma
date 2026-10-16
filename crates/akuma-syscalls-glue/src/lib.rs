@@ -1367,6 +1367,14 @@ pub struct SyscallHooks {
     /// The return is a *state*, not a bitmask, so the answer still goes through
     /// the host-tested readiness map rather than around it.
     pub poll_console_state: fn(u32) -> Option<akuma_syscalls_poll::readiness::FdState>,
+
+    /// Does the target's pointer node (`/dev/input/mouse0`) have records
+    /// waiting? Only the amd64 kernel opens the node, so it is the only
+    /// registrant with a real answer; the AArch64 kernel registers `|| false`.
+    /// The one reader is the `DevMouse` arm of
+    /// [`poll::epoll_check_fd_readiness`], which is how `has_events` reaches
+    /// `poll(2)` without glue knowing a touchpad exists.
+    pub dev_mouse_has_events: fn() -> bool,
 }
 
 static HOOKS: akuma_primitives::OnceCopy<SyscallHooks> = akuma_primitives::OnceCopy::new();
@@ -1413,5 +1421,8 @@ pub(crate) mod hooks {
         fd: u32,
     ) -> Option<akuma_syscalls_poll::readiness::FdState> {
         HOOKS.get().and_then(|h| (h.poll_console_state)(fd))
+    }
+    pub fn dev_mouse_has_events() -> bool {
+        HOOKS.get().is_some_and(|h| (h.dev_mouse_has_events)())
     }
 }

@@ -647,6 +647,15 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
             has_frame: requested & ep::EPOLLIN != 0
                 && akuma_net::rump_tap::has_frame(),
         },
+        // The pointer node (`/dev/input/mouse0`): whole 8-byte records or
+        // nothing, answered through the target hook — glue has no touchpad of
+        // its own. Like the socket arms, the probe is skipped when EPOLLIN was
+        // not asked for. A kernel whose hook says `false` (no pad, or the
+        // AArch64 one) polls as "nothing yet", never as a hang-up: the node
+        // merely has no bytes, which is `EAGAIN` on `read`.
+        akuma_exec::process::FileDescriptor::DevMouse => FdState::DevMouse {
+            can_read: requested & ep::EPOLLIN != 0 && crate::hooks::dev_mouse_has_events(),
+        },
         _ => FdState::Unmodelled,
     };
 

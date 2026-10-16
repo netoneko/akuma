@@ -26,6 +26,9 @@ pub fn register() {
         // `epoll_check_fd_readiness` to special-case — see that function's
         // header. `None` keeps the poll family's fd arms exactly as they were.
         poll_console_state: |_| None,
+        // No touchpad on this target either: `/dev/input/mouse0` never exists,
+        // so the hook has nothing to say.
+        dev_mouse_has_events: || false,
     });
 }
 
