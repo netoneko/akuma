@@ -2871,6 +2871,12 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         return crate::wifi::write(buf, len as usize);
     }
 
+    // `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`) — the
+    // scroll-direction toggle (`crate::touchpad::dev_write`).
+    if crate::fd::is_dev_mouse(fd) {
+        return crate::touchpad::dev_write(buf, len as usize);
+    }
+
     // `/dev/power`: `dim=<percent>` lines for the power daemon's lever
     // (`crate::power`). Parsed whole before any line applies.
     if crate::fd::is_dev_power(fd) {

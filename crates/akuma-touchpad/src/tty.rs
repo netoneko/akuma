@@ -47,6 +47,22 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// The grid's pixel rectangle, inclusive: `(x0, y0, x1, y1)`.
+    #[must_use]
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        let (x0, y0) = (self.origin_x.cast_signed(), self.origin_y.cast_signed());
+        let w = (self.cols * self.cell_w).max(1).cast_signed();
+        let h = (self.rows * self.cell_h).max(1).cast_signed();
+        (x0, y0, x0 + w - 1, y0 + h - 1)
+    }
+
+    /// The middle of the grid, in pixels.
+    #[must_use]
+    pub fn center(&self) -> (i32, i32) {
+        let (x0, y0, x1, y1) = self.bounds();
+        (i32::midpoint(x0, x1), i32::midpoint(y0, y1))
+    }
+
     /// 1-based `(col, row)` of the cell under pixel `(x, y)`, clamped to the
     /// grid. A degenerate grid (zero cell or size) answers `(1, 1)`.
     #[must_use]
@@ -76,12 +92,45 @@ pub struct MouseEncoder {
     held: u8,
     pos: (u32, u32),
     reported: (u32, u32),
+    /// Where the finger was at the previous `Move` of this stroke, in pad
+    /// pixels. `None` after a `Lift`: the next `Move` only anchors.
+    anchor: Option<(i32, i32)>,
+    /// The pointer, in panel pixels. `None` until first needed, then starts at
+    /// the middle of the grid.
+    px: Option<(i32, i32)>,
+    /// Pointer travel per unit of finger travel, as `num / den`.
+    gain: (i32, i32),
 }
+
+/// Default gain: 3/2 — a full swipe across the pad crosses one and a half
+/// screens' width... of *pad-sized* travel; in practice a comfortable
+/// two-thirds-of-a-pad swipe spans the screen.
+pub const DEFAULT_GAIN: (i32, i32) = (3, 2);
 
 impl MouseEncoder {
     #[must_use]
     pub const fn new() -> Self {
-        Self { held: 0, pos: (1, 1), reported: (0, 0) }
+        Self { held: 0, pos: (1, 1), reported: (0, 0), anchor: None, px: None, gain: DEFAULT_GAIN }
+    }
+
+    /// As [`MouseEncoder::new`] with a chosen gain (`num / den`).
+    #[must_use]
+    pub const fn with_gain(num: i32, den: i32) -> Self {
+        Self { gain: (num, if den == 0 { 1 } else { den }), ..Self::new() }
+    }
+
+    /// Put the pointer at panel pixel `(x, y)` (clamped to the grid on the
+    /// next move). The next stroke still anchors first.
+    pub fn warp(&mut self, x: i32, y: i32, grid: &Grid) {
+        self.px = Some((x, y));
+        self.pos = grid.cell(x.max(0) as u32, y.max(0) as u32);
+        self.anchor = None;
+    }
+
+    /// Has the pointer been given a position yet (by [`MouseEncoder::warp`] or motion)?
+    #[must_use]
+    pub const fn placed(&self) -> bool {
+        self.px.is_some()
     }
 
     /// The cell the pointer is in (1-based), for drawing a marker.
@@ -95,6 +144,7 @@ impl MouseEncoder {
     pub fn reset(&mut self) {
         self.held = 0;
         self.reported = (0, 0);
+        self.anchor = None;
     }
 
     fn button_code(b: Button) -> u8 {
@@ -124,8 +174,24 @@ impl MouseEncoder {
     pub fn feed(&mut self, ev: &PointerEvent, mode: Tracking, sgr: bool, grid: &Grid, out: &mut [u8]) -> usize {
         let mut n = 0;
         match *ev {
+            PointerEvent::Lift => {
+                self.anchor = None;
+                return 0;
+            }
             PointerEvent::Move { x, y } => {
-                let cell = grid.cell(x, y);
+                // Relative: the first move of a stroke only anchors, so a
+                // finger landing somewhere else on the pad moves nothing.
+                let (fx, fy) = (x.cast_signed(), y.cast_signed());
+                let Some((ax, ay)) = self.anchor.replace((fx, fy)) else {
+                    return 0;
+                };
+                let (gn, gd) = self.gain;
+                let (cx, cy) = self.px.unwrap_or_else(|| grid.center());
+                let (x0, y0, x1, y1) = grid.bounds();
+                let nx = (cx + (fx - ax) * gn / gd).clamp(x0, x1);
+                let ny = (cy + (fy - ay) * gn / gd).clamp(y0, y1);
+                self.px = Some((nx, ny));
+                let cell = grid.cell(nx as u32, ny as u32);
                 self.pos = cell;
                 if mode == Tracking::Off || cell == self.reported {
                     return 0;
@@ -242,11 +308,24 @@ mod tests {
         let n = e.feed(&ev, mode, sgr, &GRID, &mut buf);
         buf[..n].to_vec()
     }
+    /// No bytes at all.
+    const NONE: &[u8] = b"";
+
     fn mv(x: u32, y: u32) -> PointerEvent {
         PointerEvent::Move { x, y }
     }
     fn btn(button: Button, down: bool) -> PointerEvent {
         PointerEvent::Button { button, down }
+    }
+    /// A 1:1 encoder with the pointer sitting in the middle of cell (col, row).
+    fn at(col: u32, row: u32) -> MouseEncoder {
+        let mut e = MouseEncoder::with_gain(1, 1);
+        e.warp(
+            (GRID.origin_x + (col - 1) * GRID.cell_w + GRID.cell_w / 2).cast_signed(),
+            (GRID.origin_y + (row - 1) * GRID.cell_h + GRID.cell_h / 2).cast_signed(),
+            &GRID,
+        );
+        e
     }
 
     #[test]
@@ -261,16 +340,16 @@ mod tests {
 
     #[test]
     fn off_reports_nothing_at_all() {
-        let mut e = MouseEncoder::new();
-        assert!(run(&mut e, mv(300, 300), Tracking::Off, true).is_empty());
-        assert!(run(&mut e, btn(Button::Left, true), Tracking::Off, true).is_empty());
-        assert!(run(&mut e, PointerEvent::Wheel { dx: 0, dy: 3 }, Tracking::Off, true).is_empty());
+        let mut e = at(3, 3);
+        run(&mut e, mv(500, 500), Tracking::Off, true);
+        assert_eq!(run(&mut e, mv(600, 600), Tracking::Off, true), NONE);
+        assert_eq!(run(&mut e, btn(Button::Left, true), Tracking::Off, true), NONE);
+        assert_eq!(run(&mut e, PointerEvent::Wheel { dx: 0, dy: 3 }, Tracking::Off, true), NONE);
     }
 
     #[test]
     fn click_is_press_then_release_at_the_pointer_cell() {
-        let mut e = MouseEncoder::new();
-        run(&mut e, mv(8 + 11 * 4, 4 + 22 * 9), Tracking::Press, true); // cell (5, 10)
+        let mut e = at(5, 10);
         assert_eq!(run(&mut e, btn(Button::Left, true), Tracking::Press, true), b"\x1b[<0;5;10M");
         assert_eq!(run(&mut e, btn(Button::Left, false), Tracking::Press, true), b"\x1b[<0;5;10m");
         assert_eq!(run(&mut e, btn(Button::Right, true), Tracking::Press, true), b"\x1b[<2;5;10M");
@@ -279,7 +358,7 @@ mod tests {
     #[test]
     fn a_release_without_its_press_is_swallowed() {
         let mut e = MouseEncoder::new();
-        assert!(run(&mut e, btn(Button::Left, false), Tracking::Press, true).is_empty());
+        assert_eq!(run(&mut e, btn(Button::Left, false), Tracking::Press, true), NONE);
     }
 
     #[test]
@@ -298,23 +377,26 @@ mod tests {
 
     #[test]
     fn motion_only_when_the_mode_asks_and_the_cell_changes() {
-        let mut e = MouseEncoder::new();
-        // 1000: no motion.
-        assert!(run(&mut e, mv(100, 100), Tracking::Press, true).is_empty());
+        // 1000: no motion reports.
+        let mut e = at(3, 1);
+        run(&mut e, mv(1000, 1000), Tracking::Press, true); // anchor
+        assert_eq!(run(&mut e, mv(1000 + 11, 1000), Tracking::Press, true), NONE);
         // 1003: motion with no button is 35, once per cell.
-        assert_eq!(run(&mut e, mv(8 + 11 * 2, 4), Tracking::Any, true), b"\x1b[<35;3;1M");
-        assert!(run(&mut e, mv(8 + 11 * 2 + 3, 5), Tracking::Any, true).is_empty()); // same cell
+        let mut e = at(3, 1);
+        run(&mut e, mv(1000, 1000), Tracking::Any, true); // anchor
+        assert_eq!(run(&mut e, mv(1000 + 11, 1000), Tracking::Any, true), b"\x1b[<35;4;1M");
+        assert_eq!(run(&mut e, mv(1000 + 11 + 3, 1001), Tracking::Any, true), NONE); // same cell
         // 1002: motion only while a button is held, as 32 + button.
-        let mut e = MouseEncoder::new();
-        assert!(run(&mut e, mv(8 + 11 * 2, 4), Tracking::Drag, true).is_empty());
+        let mut e = at(3, 1);
+        run(&mut e, mv(1000, 1000), Tracking::Drag, true);
+        assert_eq!(run(&mut e, mv(1000 + 11, 1000), Tracking::Drag, true), NONE);
         run(&mut e, btn(Button::Left, true), Tracking::Drag, true);
-        assert_eq!(run(&mut e, mv(8 + 11 * 3, 4), Tracking::Drag, true), b"\x1b[<32;4;1M");
+        assert_eq!(run(&mut e, mv(1000 + 22, 1000), Tracking::Drag, true), b"\x1b[<32;5;1M");
     }
 
     #[test]
     fn legacy_encoding_when_sgr_is_off() {
-        let mut e = MouseEncoder::new();
-        run(&mut e, mv(8 + 11 * 4, 4 + 22 * 9), Tracking::Press, false);
+        let mut e = at(5, 10);
         assert_eq!(run(&mut e, btn(Button::Left, true), Tracking::Press, false), [0x1b, b'[', b'M', 32, 32 + 5, 32 + 10]);
         // Release is button 3 in the legacy form.
         assert_eq!(run(&mut e, btn(Button::Left, false), Tracking::Press, false), [0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 10]);
@@ -332,6 +414,38 @@ mod tests {
         let mut e = MouseEncoder::new();
         run(&mut e, btn(Button::Left, true), Tracking::Press, true);
         e.reset();
-        assert!(run(&mut e, btn(Button::Left, false), Tracking::Press, true).is_empty());
+        assert_eq!(run(&mut e, btn(Button::Left, false), Tracking::Press, true), NONE);
+    }
+
+    /// The bug that put the pointer on the right pane: a finger landing on
+    /// the right of the pad (or the one left after a two-finger scroll) is a
+    /// new stroke and must not move the pointer to where it landed.
+    #[test]
+    fn a_new_stroke_anchors_instead_of_jumping() {
+        let mut e = at(10, 10);
+        assert_eq!(e.cell(), (10, 10));
+        run(&mut e, mv(100, 100), Tracking::Any, true); // stroke 1: anchor
+        run(&mut e, PointerEvent::Lift, Tracking::Any, true);
+        // Stroke 2 starts at the far right of the pad.
+        assert_eq!(run(&mut e, mv(3500, 2000), Tracking::Any, true), NONE);
+        assert_eq!(e.cell(), (10, 10), "landing a finger elsewhere must not move the pointer");
+        // And moving from there is relative: 22 px right = two cells.
+        assert_eq!(run(&mut e, mv(3500 + 22, 2000), Tracking::Any, true), b"\x1b[<35;12;10M");
+    }
+
+    #[test]
+    fn motion_is_relative_scaled_and_clamped_to_the_grid() {
+        let mut e = at(50, 25);
+        run(&mut e, mv(1000, 1000), Tracking::Any, true);
+        // Default-style 3/2 gain through with_gain.
+        let mut g = MouseEncoder::with_gain(3, 2);
+        g.warp(GRID.center().0, GRID.center().1, &GRID);
+        run(&mut g, mv(1000, 1000), Tracking::Any, true);
+        let before = g.cell();
+        run(&mut g, mv(1000 + 22, 1000), Tracking::Any, true); // 22 px * 1.5 = 33 px = 3 cells
+        assert_eq!(g.cell().0, before.0 + 3);
+        // A huge swipe clamps at the edge instead of wrapping or overflowing.
+        run(&mut e, mv(1000 + 100_000, 0), Tracking::Any, true);
+        assert_eq!(e.cell(), (100, 1));
     }
 }

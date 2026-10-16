@@ -145,6 +145,10 @@ pub struct Config {
     pub clickfinger: bool,
     /// Allow the middle button (soft areas: none; clickfinger: 3 fingers).
     pub middle: bool,
+    /// "Natural" scrolling, as on a MacBook: the content follows the fingers,
+    /// so two fingers moving up scroll the view *down* (and right moves it
+    /// left). Off is the traditional wheel direction.
+    pub natural_scroll: bool,
 }
 
 impl Config {
@@ -155,7 +159,11 @@ impl Config {
         wheel_px: 50,
         clickfinger: false,
         middle: false,
+        natural_scroll: true,
     };
+
+    /// [`Config::DEFAULT`] with the traditional (wheel) scroll direction.
+    pub const TRADITIONAL: Self = Self { natural_scroll: false, ..Self::DEFAULT };
 }
 
 /// One report slot as the driver decoded it.
@@ -208,6 +216,11 @@ pub enum PointerEvent {
         dx: i32,
         dy: i32,
     },
+    /// The pointer stroke ended: every finger lifted, or a second finger came
+    /// down for a scroll. The next `Move` begins a new stroke at wherever the
+    /// finger lands, so a consumer that moves the pointer *relatively* (a
+    /// touchpad, not a tablet) must not treat the jump as motion.
+    Lift,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +289,8 @@ pub struct Clickpad {
     /// Moves dropped by the ring's overflow policy — a debug tap, read by
     /// the dmesg gate, never a correctness input.
     dropped_moves: u32,
+    /// The last position posted in the current pointer stroke; `Some` means a
+    /// stroke is open (a `Move` since the last `Lift`).
     last_move: Option<(u32, u32)>,
 }
 
@@ -309,6 +324,17 @@ impl Clickpad {
         self.track_fingers(frame);
         self.handle_button(frame.button);
         self.post_motion_or_scroll();
+    }
+
+    /// Switch natural scrolling on or off (takes effect from the next tick).
+    pub fn set_natural_scroll(&mut self, on: bool) {
+        self.cfg.natural_scroll = on;
+    }
+
+    /// Is natural scrolling on?
+    #[must_use]
+    pub fn natural_scroll(&self) -> bool {
+        self.cfg.natural_scroll
     }
 
     /// Pop the next event, in decision order.
@@ -487,9 +513,18 @@ impl Clickpad {
         })
     }
 
+    /// Close the pointer stroke (once) so the next one is not measured from a
+    /// stale position.
+    fn end_stroke(&mut self) {
+        if self.last_move.take().is_some() {
+            self.push(PointerEvent::Lift);
+        }
+    }
+
     fn post_motion_or_scroll(&mut self) {
         let n = self.active_fingers();
         if n >= 2 && !self.button_down {
+            self.end_stroke();
             self.update_scroll();
             return; // scroll (armed or engaged) suppresses motion
         }
@@ -502,8 +537,9 @@ impl Clickpad {
                 self.last_move = Some((x, y));
                 self.push(PointerEvent::Move { x, y });
             }
-        } else if n == 0 {
-            self.last_move = None;
+        } else {
+            // No finger is allowed to move the pointer now.
+            self.end_stroke();
         }
         let _ = self.dragging; // drag = motion with button down, already emitted
     }
@@ -569,12 +605,16 @@ impl Clickpad {
                 if ticks_x != 0 || ticks_y != 0 {
                     let acc = (acc.0 - ticks_x * px, acc.1 - ticks_y * px);
                     self.scroll = Scroll::Engaged { acc };
-                    // Fingers moving up (sensor y decreasing) scroll up:
-                    // REL_WHEEL +1.
-                    self.push(PointerEvent::Wheel {
-                        dx: ticks_x as i32,
-                        dy: -ticks_y as i32,
-                    });
+                    // Traditional: fingers moving up (sensor y decreasing)
+                    // scroll up, REL_WHEEL +1; fingers right scroll right.
+                    // Natural is the mirror image: the content follows the
+                    // fingers, so the view goes the other way.
+                    let (dx, dy) = if self.cfg.natural_scroll {
+                        (-ticks_x as i32, ticks_y as i32)
+                    } else {
+                        (ticks_x as i32, -ticks_y as i32)
+                    };
+                    self.push(PointerEvent::Wheel { dx, dy });
                 } else {
                     self.scroll = Scroll::Engaged { acc };
                 }

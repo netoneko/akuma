@@ -39,7 +39,7 @@ fn drain(cp: &mut Clickpad) -> Vec<PointerEvent> {
 /// Sensor (1000,1000) maps to panel (468,585) at 1920×1200 — pin the math.
 #[test]
 fn absolute_mapping() {
-    let cp = Clickpad::new(geom(), Config::DEFAULT);
+    let cp = Clickpad::new(geom(), Config::TRADITIONAL);
     assert_eq!(cp.geom.map_x(1000), 468);
     assert_eq!(cp.geom.map_y(1000), 585);
     assert_eq!(cp.geom.map_x(SENSOR_X), PANEL_W - 1, "clamped");
@@ -65,7 +65,7 @@ fn geometry_validation() {
 
 #[test]
 fn single_finger_moves_pointer() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
 
     // Touch down in the main area: the pointer jumps to the finger.
     cp.update(&frame(&[down(1000, 1000), UP, UP, UP, UP], false));
@@ -75,14 +75,14 @@ fn single_finger_moves_pointer() {
     cp.update(&frame(&[down(2000, 1000), UP, UP, UP, UP], false));
     assert_eq!(drain(&mut cp), vec![PointerEvent::Move { x: 937, y: 585 }]);
 
-    // Lift: no event.
+    // Lift: the stroke ends (a relative consumer re-anchors on the next one).
     cp.update(&frame(&[UP, UP, UP, UP, UP], false));
-    assert_eq!(drain(&mut cp), vec![]);
+    assert_eq!(drain(&mut cp), vec![PointerEvent::Lift]);
 }
 
 #[test]
 fn move_dedup() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(&[down(1000, 1000), UP, UP, UP, UP], false));
     let _ = drain(&mut cp);
     cp.update(&frame(&[down(1000, 1000), UP, UP, UP, UP], false));
@@ -91,7 +91,7 @@ fn move_dedup() {
 
 #[test]
 fn plain_click_is_left() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(&[down(500, 500), UP, UP, UP, UP], false));
     let _ = drain(&mut cp);
 
@@ -115,7 +115,7 @@ fn plain_click_is_left() {
 
 #[test]
 fn right_click_needs_a_finger_started_in_the_band() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     // Band starts at 2048*85/100 = 1740; right half at x >= 2048.
     cp.update(&frame(&[down(3000, 1900), UP, UP, UP, UP], false));
     // A finger parked in the button area does not move the pointer.
@@ -141,7 +141,7 @@ fn right_click_needs_a_finger_started_in_the_band() {
 
 #[test]
 fn left_band_area_is_still_left() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(&[down(1000, 1900), UP, UP, UP, UP], false));
     let _ = drain(&mut cp);
     cp.update(&frame(&[down(1000, 1900), UP, UP, UP, UP], true));
@@ -156,7 +156,7 @@ fn left_band_area_is_still_left() {
 
 #[test]
 fn wandering_into_the_band_keeps_left() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     // Starts in the main area...
     cp.update(&frame(&[down(1000, 500), UP, UP, UP, UP], false));
     let _ = drain(&mut cp);
@@ -175,7 +175,7 @@ fn wandering_into_the_band_keeps_left() {
 
 #[test]
 fn band_finger_leaving_the_band_becomes_pointer() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(&[down(3000, 1900), UP, UP, UP, UP], false));
     assert_eq!(drain(&mut cp), vec![], "in the area: no pointer");
     // Leaves the band: becomes the pointer finger, permanently.
@@ -195,7 +195,7 @@ fn band_finger_leaving_the_band_becomes_pointer() {
 
 #[test]
 fn click_and_drag_moves_while_button_held() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(&[down(1000, 1000), UP, UP, UP, UP], false));
     let _ = drain(&mut cp);
     cp.update(&frame(&[down(1000, 1000), UP, UP, UP, UP], true));
@@ -210,7 +210,7 @@ fn click_and_drag_moves_while_button_held() {
 
 #[test]
 fn click_without_a_finger_waits_for_one() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     // Button down with nobody on the pad (finger past the sensor edge).
     cp.update(&frame(&[UP, UP, UP, UP, UP], true));
     assert_eq!(drain(&mut cp), vec![], "pending: no decision yet");
@@ -236,7 +236,7 @@ fn click_without_a_finger_waits_for_one() {
 
 #[test]
 fn pending_click_released_with_no_finger_is_ignored() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(&[UP, UP, UP, UP, UP], true));
     cp.update(&frame(&[UP, UP, UP, UP, UP], false));
     assert_eq!(
@@ -248,7 +248,7 @@ fn pending_click_released_with_no_finger_is_ignored() {
 
 #[test]
 fn two_finger_scroll() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
 
     // Two fingers down: armed, no events yet (motion suppressed too).
     cp.update(&frame(
@@ -288,7 +288,7 @@ fn two_finger_scroll() {
 
 #[test]
 fn scroll_down_is_negative_wheel() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(
         &[down(2000, 1000), down(2000, 1200), UP, UP, UP],
         false,
@@ -310,7 +310,7 @@ fn scroll_down_is_negative_wheel() {
 
 #[test]
 fn scroll_start_threshold_holds_off_jitter() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(
         &[down(2000, 1000), down(2100, 1200), UP, UP, UP],
         false,
@@ -330,7 +330,7 @@ fn scroll_start_threshold_holds_off_jitter() {
 
 #[test]
 fn click_ends_scroll() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(
         &[down(2000, 1000), down(2000, 1200), UP, UP, UP],
         false,
@@ -377,7 +377,7 @@ fn clickfinger_mode() {
     let cfg = Config {
         clickfinger: true,
         middle: true,
-        ..Config::DEFAULT
+        ..Config::TRADITIONAL
     };
     let mut cp = Clickpad::new(geom(), cfg);
 
@@ -400,12 +400,17 @@ fn clickfinger_mode() {
         &[down(1000, 500), down(1200, 600), UP, UP, UP],
         true,
     ));
+    // The second finger also ends the pointer stroke (it is a two-finger
+    // gesture now), after the button.
     assert_eq!(
         drain(&mut cp),
-        vec![PointerEvent::Button {
-            button: Button::Right,
-            down: true
-        }]
+        vec![
+            PointerEvent::Button {
+                button: Button::Right,
+                down: true
+            },
+            PointerEvent::Lift
+        ]
     );
     cp.update(&frame(
         &[down(1000, 500), down(1200, 600), UP, UP, UP],
@@ -436,7 +441,7 @@ fn clickfinger_mode() {
 fn clickfinger_middle_disabled_ignores_three_fingers() {
     let cfg = Config {
         clickfinger: true,
-        ..Config::DEFAULT
+        ..Config::TRADITIONAL
     };
     let mut cp = Clickpad::new(geom(), cfg);
     cp.update(&frame(
@@ -461,7 +466,7 @@ fn clickfinger_middle_disabled_ignores_three_fingers() {
 
 #[test]
 fn event_ring_drops_moves_keeps_buttons() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     // 24 moving frames without draining: the ring holds 16, drops the rest.
     for i in 0..24 {
         cp.update(&frame(&[down(200 + i * 60, 500), UP, UP, UP, UP], false));
@@ -485,7 +490,7 @@ fn event_ring_drops_moves_keeps_buttons() {
 
 #[test]
 fn wheel_convention_and_remainder() {
-    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
     cp.update(&frame(
         &[down(2000, 1000), down(2000, 1200), UP, UP, UP],
         false,
@@ -514,4 +519,57 @@ fn wheel_convention_and_remainder() {
         false,
     ));
     assert_eq!(drain(&mut cp), vec![PointerEvent::Wheel { dx: 0, dy: 1 }]);
+}
+
+/// The drift bug (2026-10-16): after a two-finger scroll the finger left on
+/// the pad is a *new* pointer stroke. The policy must close the old stroke
+/// (`Lift`) when the second finger arrives, once, and not before.
+#[test]
+fn a_second_finger_ends_the_pointer_stroke_once() {
+    let mut cp = Clickpad::new(geom(), Config::TRADITIONAL);
+    cp.update(&frame(&[down(1000, 1000), UP, UP, UP, UP], false));
+    assert!(matches!(drain(&mut cp).as_slice(), [PointerEvent::Move { .. }]));
+
+    // Second finger lands: stroke over, exactly one Lift.
+    cp.update(&frame(&[down(1000, 1000), down(1500, 1000), UP, UP, UP], false));
+    assert_eq!(drain(&mut cp), vec![PointerEvent::Lift]);
+    cp.update(&frame(&[down(1000, 1100), down(1500, 1100), UP, UP, UP], false));
+    assert!(!drain(&mut cp).contains(&PointerEvent::Lift), "no repeated Lift while scrolling");
+
+    // One finger stays, far to the right: a new stroke begins (a relative
+    // consumer anchors on this Move instead of jumping to it).
+    cp.update(&frame(&[UP, down(3000, 1100), UP, UP, UP], false));
+    assert!(matches!(drain(&mut cp).as_slice(), [PointerEvent::Move { .. }]));
+    cp.update(&frame(&[UP, UP, UP, UP, UP], false));
+    assert_eq!(drain(&mut cp), vec![PointerEvent::Lift]);
+}
+
+/// MacBook-style scrolling: the content follows the fingers. Two fingers moving
+/// up scroll the view down (negative REL_WHEEL), and the toggle flips it live.
+#[test]
+fn natural_scroll_is_the_mirror_image_and_toggles() {
+    fn scroll_up_with_fingers(cp: &mut Clickpad) -> Vec<PointerEvent> {
+        cp.update(&frame(&[down(1000, 1500), down(1400, 1500), UP, UP, UP], false));
+        let _ = drain(cp);
+        // Fingers move up the pad by more than a wheel tick.
+        cp.update(&frame(&[down(1000, 1200), down(1400, 1200), UP, UP, UP], false));
+        cp.update(&frame(&[down(1000, 900), down(1400, 900), UP, UP, UP], false));
+        let ev = drain(cp);
+        cp.update(&frame(&[UP, UP, UP, UP, UP], false));
+        let _ = drain(cp);
+        ev
+    }
+    let wheel_dy = |ev: &[PointerEvent]| -> i32 {
+        ev.iter().map(|e| if let PointerEvent::Wheel { dy, .. } = e { *dy } else { 0 }).sum()
+    };
+
+    let mut cp = Clickpad::new(geom(), Config::DEFAULT);
+    assert!(cp.natural_scroll(), "natural scrolling is on by default");
+    let natural = wheel_dy(&scroll_up_with_fingers(&mut cp));
+    assert!(natural < 0, "fingers up must scroll the view down when natural, got {natural}");
+
+    cp.set_natural_scroll(false);
+    let traditional = wheel_dy(&scroll_up_with_fingers(&mut cp));
+    assert!(traditional > 0, "fingers up scroll up in the traditional direction, got {traditional}");
+    assert_eq!(natural, -traditional, "exact mirror");
 }

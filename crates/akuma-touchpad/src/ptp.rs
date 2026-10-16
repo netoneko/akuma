@@ -249,6 +249,8 @@ pub mod kind {
     pub const MOVE: u8 = 1;
     pub const BUTTON: u8 = 2;
     pub const WHEEL: u8 = 3;
+    /// The pointer stroke ended; the next move starts a new one.
+    pub const LIFT: u8 = 4;
 }
 
 /// Encode one event as an [`EVENT_BYTES`] record, the wire format of
@@ -282,6 +284,9 @@ pub fn encode(ev: &PointerEvent) -> [u8; EVENT_BYTES] {
             };
             r[2] = u8::from(down);
         }
+        PointerEvent::Lift => {
+            r[0] = kind::LIFT;
+        }
         PointerEvent::Wheel { dx, dy } => {
             r[0] = kind::WHEEL;
             let sat = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
@@ -290,4 +295,59 @@ pub fn encode(ev: &PointerEvent) -> [u8; EVENT_BYTES] {
         }
     }
     r
+}
+
+/// A command written to `/dev/input/mouse0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ctl {
+    /// `natural`, `natural=1`, `natural off`, ...: `None` toggles.
+    Natural(Option<bool>),
+}
+
+/// Parse one line of the control language: `natural` (toggle), or
+/// `natural=<v>` / `natural <v>` with `v` one of `1 0 on off true false yes no`.
+/// Anything else is `None` — the whole write is then refused.
+#[must_use]
+pub fn parse_ctl(line: &[u8]) -> Option<Ctl> {
+    let line = line.trim_ascii();
+    let (key, val) = match line.iter().position(|&c| c == b'=' || c.is_ascii_whitespace()) {
+        Some(i) => {
+            // `key=v`, `key v` and `key = v` are all the same line.
+            let rest = line[i..].trim_ascii();
+            (&line[..i], rest.strip_prefix(b"=").unwrap_or(rest).trim_ascii())
+        }
+        None => (line, &b""[..]),
+    };
+    if key != b"natural" {
+        return None;
+    }
+    match val {
+        b"" => Some(Ctl::Natural(None)),
+        b"1" | b"on" | b"true" | b"yes" => Some(Ctl::Natural(Some(true))),
+        b"0" | b"off" | b"false" | b"no" => Some(Ctl::Natural(Some(false))),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod ctl_tests {
+    use super::*;
+
+    #[test]
+    fn natural_forms() {
+        assert_eq!(parse_ctl(b"natural"), Some(Ctl::Natural(None)));
+        assert_eq!(parse_ctl(b"natural\n"), Some(Ctl::Natural(None)));
+        assert_eq!(parse_ctl(b"natural=1"), Some(Ctl::Natural(Some(true))));
+        assert_eq!(parse_ctl(b"natural 0"), Some(Ctl::Natural(Some(false))));
+        assert_eq!(parse_ctl(b"  natural = off "), Some(Ctl::Natural(Some(false))));
+        assert_eq!(parse_ctl(b"natural=yes"), Some(Ctl::Natural(Some(true))));
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        assert_eq!(parse_ctl(b""), None);
+        assert_eq!(parse_ctl(b"natural=maybe"), None);
+        assert_eq!(parse_ctl(b"scroll=1"), None);
+        assert_eq!(parse_ctl(b"naturalx"), None);
+    }
 }

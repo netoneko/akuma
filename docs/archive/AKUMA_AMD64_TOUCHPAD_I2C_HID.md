@@ -205,7 +205,7 @@ finger identity, which is why the decoder keys slots by contact id.
 | `FileDescriptor::DevMouse` | `open("/dev/input/mouse0")` → `ENOENT` unless the pad came up; `fstat` says char device (13,32) |
 
 **Stream format** (8-byte records, `akuma_touchpad::ptp::encode`): byte 0 kind
-(1 move, 2 button, 3 wheel); move: x,y as u16 LE at bytes 4–7 (panel pixels);
+(1 move, 2 button, 3 wheel, 4 lift — the pointer stroke ended, 2026-10-16); move: x,y as u16 LE at bytes 4–7 (panel pixels);
 button: byte 1 = 0 left / 1 right / 2 middle, byte 2 = down; wheel: dx,dy as
 i16 LE at 4–7 (`+dy` = up). `read` returns whole records or `EAGAIN` — it
 never blocks.
@@ -264,6 +264,23 @@ Diagnostics left in on purpose: `empty read`/`other report` raw dumps (first
 few), `frame:` dumps (first 4, the first 12 with a finger down, then every
 512th) and a `polls= nack= empty= reports= other= down=` line per 4096 polls —
 all in `dmesg`, and in `klog-N.all` on p3.
+
+### The console bridge (2026-10-16) — pointer in herdr on the framebuffer
+
+`amd64/src/touchpad.rs::console_bridge`, called by the console pump, turns pointer
+events into xterm mouse reports (`akuma_touchpad::tty`, 14 host tests) for a
+program that asked: `CSI ? 1000/1002/1003 h`, SGR with `1006` (fbcon records the
+modes; `Console::mouse_mode`). They are typed into the tty queue beside the
+keyboard; the pointer's cell is inverted on screen (`Console::set_pointer`,
+drawn when output goes idle, undone by the next write).
+
+First metal try: scroll worked, but the pointer drifted onto herdr's right pane.
+Cause: `Move` is an **absolute** pad position, so the pointer was wherever a
+finger rested — two-finger scroll sits on the right, and the finger left after
+one lifts became a jump. Fix: the policy now emits `PointerEvent::Lift` when a
+pointer stroke ends (all fingers up, or a second finger arrives), and the
+bridge moves the pointer **relatively** (first move of a stroke anchors; gain
+3/2; clamped to the grid; starts mid-screen).
 
 ## Background
 

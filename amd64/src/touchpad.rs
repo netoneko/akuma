@@ -36,7 +36,7 @@ use akuma_i2c_hid::{
     encode_command, encode_reset, encode_set_power, is_reset_ack, opcode,
 };
 use akuma_ryzen_amd64::{MachineDescription, PhysMem};
-use akuma_touchpad::ptp::{EVENT_BYTES, PtpDecoder, PtpLayout, encode};
+use akuma_touchpad::ptp::{Ctl, EVENT_BYTES, PtpDecoder, PtpLayout, encode, parse_ctl};
 use akuma_touchpad::tty::{Grid, MAX_REPORT, MouseEncoder, Tracking};
 use akuma_touchpad::{Clickpad, Config};
 use spinning_top::Spinlock;
@@ -97,6 +97,9 @@ struct Stats {
 static PAD: Spinlock<Option<Pad>> = Spinlock::new(None);
 /// Published once bring-up succeeded; cleared if the pad is given up on.
 static UP: AtomicBool = AtomicBool::new(false);
+/// Natural (MacBook-style) scrolling: on unless `touchpad.natural=0` is on the
+/// command line; `echo natural=0 > /dev/input/mouse0` flips it live.
+static NATURAL: AtomicBool = AtomicBool::new(true);
 
 /// Is a touchpad serving `/dev/input/mouse0`?
 #[must_use]
@@ -405,7 +408,7 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
     Some(Pad {
         dw,
         dec: PtpDecoder::new(layout),
-        pad: Clickpad::new(geom, Config::DEFAULT),
+        pad: Clickpad::new(geom, Config { natural_scroll: NATURAL.load(Ordering::Relaxed), ..Config::DEFAULT }),
         inbuf: [0; INBUF],
         in_len: usize::from(desc.max_input_len).max(4),
         fails: 0,
@@ -426,6 +429,9 @@ static FOUND_ADDR: AtomicU8 = AtomicU8::new(0);
 /// Decide whether this machine has the touchpad: the DSDT names it, or
 /// `touchpad=` forces a window. Touches no hardware.
 pub fn discover(machine: &MachineDescription, cmdline: &str) {
+    if let Some(v) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("touchpad.natural=")) {
+        NATURAL.store(!matches!(v, "0" | "off" | "false" | "no"), Ordering::Relaxed);
+    }
     let found = if let Some(o) = cmdline_override(cmdline) {
         Some(o)
     } else if dsdt_names_the_pad(machine) {
@@ -510,7 +516,7 @@ impl Pad {
     /// One line per 4096 polls (about 65 s idle): the counters.
     fn summary(&mut self) {
         let total = self.st.polls + self.st.nack;
-        if total == 0 || total % 4096 != 0 {
+        if total == 0 || !total.is_multiple_of(4096) {
             return;
         }
         serial::puts("  [touchpad] polls=");
@@ -574,7 +580,7 @@ impl Pad {
                         if down {
                             self.st.down_frames += 1;
                         }
-                        if self.st.reports <= 4 || (down && self.st.down_frames <= 12) || self.st.reports % 512 == 0 {
+                        if self.st.reports <= 4 || (down && self.st.down_frames <= 12) || self.st.reports.is_multiple_of(512) {
                             self.dump_frame(touching);
                         }
                     }
@@ -705,6 +711,12 @@ pub fn console_bridge(out: &mut [u8]) -> usize {
         _ => Tracking::Any,
     };
     let grid = Grid { origin_x: g[0], origin_y: g[1], cell_w: g[2], cell_h: g[3], cols: g[4], rows: g[5] };
+    if !p.mouse.placed() {
+        // A touchpad moves the pointer relatively: it starts in the middle of
+        // the screen, not wherever the first finger happens to land.
+        let (cx, cy) = grid.center();
+        p.mouse.warp(cx, cy, &grid);
+    }
     let mut n = 0;
     while out.len() - n >= BRIDGE_ROOM {
         let Some(ev) = p.pad.pop() else { break };
@@ -713,4 +725,42 @@ pub fn console_bridge(out: &mut [u8]) -> usize {
     let (col, row) = p.mouse.cell();
     crate::multiboot2::fb_set_pointer(Some((row.saturating_sub(1) as usize, col.saturating_sub(1) as usize)));
     n
+}
+
+/// `write(fd)` on `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`).
+/// Every line is parsed before any applies, so a batch with a bad line changes
+/// nothing (`/dev/power`'s rule).
+pub fn dev_write(buf: u64, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if len > 256 {
+        return crate::fd::errno::EINVAL;
+    }
+    let mut text = [0u8; 256];
+    if !crate::uaccess::read_bytes(buf, &mut text[..len]) {
+        return crate::fd::errno::EFAULT;
+    }
+    let mut ctls = [None; 8];
+    for (n, line) in text[..len].split(|&c| c == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)).enumerate() {
+        let Some(c) = parse_ctl(line) else { return crate::fd::errno::EINVAL };
+        if n == ctls.len() {
+            return crate::fd::errno::EINVAL;
+        }
+        ctls[n] = Some(c);
+    }
+    let _irq = akuma_primitives::irq::IrqGuard::new();
+    let Some(mut g) = PAD.try_lock() else { return crate::fd::errno::EAGAIN };
+    let Some(p) = g.as_mut() else { return crate::fd::errno::ENODEV };
+    for c in ctls.into_iter().flatten() {
+        match c {
+            Ctl::Natural(v) => {
+                let on = v.unwrap_or_else(|| !p.pad.natural_scroll());
+                p.pad.set_natural_scroll(on);
+                NATURAL.store(on, Ordering::Relaxed);
+                serial::puts(if on { "  [touchpad] natural scrolling on\n" } else { "  [touchpad] natural scrolling off\n" });
+            }
+        }
+    }
+    len as u64
 }
