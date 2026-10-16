@@ -124,6 +124,22 @@ OPENAI_BASE_PATH=api/coding/paas/v4/chat/completions; export OPENAI_BASE_PATH
 exec /usr/local/bin/goose "$@"
 CFG
     chmod 755 $P/usr/local/bin/goose-glm
+    # Claude Code (native linux-x64-musl build, ~262 MB, fetched on the box from
+    # downloads.claude.ai and sha256-checked against manifest.json; see README)
+    # against z.ai's Anthropic-compatible endpoint. Verified 2026-10-16: --version,
+    # `-p`, and the interactive UI all work.
+    cat > $P/usr/local/bin/claude-glm <<'CFG'
+#!/bin/sh
+. /etc/akuma-dev.env
+ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic; export ANTHROPIC_BASE_URL
+ANTHROPIC_AUTH_TOKEN=$(cat /root/.akuma/z.ai/token); export ANTHROPIC_AUTH_TOKEN
+ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-glm-5.3}; export ANTHROPIC_MODEL
+ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL:-glm-5.3-flash}; export ANTHROPIC_SMALL_FAST_MODEL
+API_TIMEOUT_MS=3000000; export API_TIMEOUT_MS
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+exec /usr/local/bin/claude "$@"
+CFG
+    chmod 755 $P/usr/local/bin/claude-glm
 fi
 
 echo "== rio"
