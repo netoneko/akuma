@@ -1241,6 +1241,73 @@ static THREAD_INTERRUPTED: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// The pid of the exited, **not yet reaped** process that still owns each slot
+/// (0 = none). While set, the slot is not reissued — see [`hold_slot_for_zombie`].
+///
+/// Deliberately NOT in [`scrub_thread_slot`]: it is not occupant state, it is
+/// the claim that *prevents* a new occupant, and only the reap clears it.
+static SLOT_HELD_BY: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Keep `slot` out of circulation until `pid` is reaped.
+///
+/// A process's thread slot is its tid. If the slot is reissued while the
+/// process is a zombie, the tid names two processes at once: the zombie still
+/// records it (`Process::thread_id`, its `THREAD_PID_MAP` row) and the new
+/// occupant runs on it, so a `kill`, `unregister` or `exit_group` aimed at the
+/// zombie can land on the newcomer, and every `thread_id` table scan finds the
+/// zombie (`[TRAMP-MISMATCH] … table scan found <dead pid>`). amd64 reissued a
+/// slot the moment its last thread finished (`x86_claim_slot` takes a
+/// `TERMINATED` slot directly) — 2026-10-16, ryzen,
+/// `docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`. Like a Linux pid, the tid is
+/// now not reused until the zombie is gone.
+///
+/// Call it on the dying thread **before** the slot leaves `RUNNING`: a slot is
+/// only claimable once `TERMINATED`, so a hold set first can never race a claim.
+/// The cost is one slot per unreaped zombie, which is what an unreaped zombie
+/// costs on Linux too.
+pub fn hold_slot_for_zombie(slot: usize, pid: u32) {
+    if slot < MAX_THREADS && pid != 0 {
+        SLOT_HELD_BY[slot].store(pid, Ordering::Release);
+    }
+}
+
+/// `pid` was reaped: return every slot it held to circulation. Returns how many.
+///
+/// By pid, not by slot, so a path that already cleared the process's recorded
+/// `thread_id` (the kill paths do) cannot strand a held slot. A linear pass over
+/// atomics — no lock, no allocation.
+pub fn release_slots_held_by(pid: u32) -> usize {
+    if pid == 0 {
+        return 0;
+    }
+    let mut released = 0;
+    for held in &SLOT_HELD_BY {
+        if held.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            released += 1;
+        }
+    }
+    released
+}
+
+/// The unreaped pid holding `slot`, or 0.
+#[must_use]
+pub fn slot_held_by(slot: usize) -> u32 {
+    if slot < MAX_THREADS { SLOT_HELD_BY[slot].load(Ordering::Acquire) } else { 0 }
+}
+
+/// May a slot in `state`, with `on_cpu`, held by `held_by`, be given to a new
+/// thread? `FREE`, or `TERMINATED` with no core still on its stack — and in both
+/// cases not held by an unreaped zombie. The one rule [`x86_claim_slot`] and the
+/// x86 reaper both apply; pure so the host tests can pin it.
+#[must_use]
+pub fn slot_reusable(state: u8, on_cpu: u8, held_by: u32) -> bool {
+    held_by == 0
+        && (state == thread_state::FREE || (state == thread_state::TERMINATED && on_cpu == 0))
+}
+
 /// Raise [`THREAD_INTERRUPTED`] for `tid`. The bit half of
 /// `akuma_exec::process::interrupt_thread`, which also sets the channel's own
 /// flag for the readers that hold a channel directly.
@@ -3053,9 +3120,7 @@ pub fn x86_adopt_running_thread(slot: usize) {
 pub fn x86_claim_slot() -> Option<usize> {
     for slot in 1..MAX_THREADS {
         let state = THREAD_STATES[slot].load(Ordering::Acquire);
-        let reusable = state == thread_state::FREE
-            || (state == thread_state::TERMINATED && ON_CPU[slot].load(Ordering::Acquire) == 0);
-        if !reusable {
+        if !slot_reusable(state, ON_CPU[slot].load(Ordering::Acquire), slot_held_by(slot)) {
             continue;
         }
         if THREAD_STATES[slot]
@@ -3281,8 +3346,13 @@ pub fn x86_reap_terminated_slots() -> usize {
             continue;
         }
         // The core that switched away may still be executing on this slot's
-        // kernel stack. Don't reap under it; the next pass gets it.
-        if ON_CPU[slot].load(Ordering::Acquire) != 0 {
+        // kernel stack. Don't reap under it; the next pass gets it. And a slot
+        // an unreaped zombie still holds is not dead yet (`hold_slot_for_zombie`).
+        if !slot_reusable(
+            thread_state::TERMINATED,
+            ON_CPU[slot].load(Ordering::Acquire),
+            slot_held_by(slot),
+        ) {
             continue;
         }
         if THREAD_STATES[slot]
@@ -7822,5 +7892,37 @@ mod thread_contexts_invariant_tests {
 
             release_test_thread_slot(idx);
         }
+    }
+}
+
+/// The reuse rule `x86_claim_slot` and the x86 reaper share. The zombie hold is
+/// the 2026-10-16 ryzen fix: a tid an unreaped process still owns is never
+/// handed to a new thread (`docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`).
+#[cfg(test)]
+mod ryzen_2026_10_16_slot_hold_tests {
+    use super::*;
+
+    #[test]
+    fn a_held_slot_is_never_reusable() {
+        for state in [thread_state::FREE, thread_state::TERMINATED] {
+            assert!(slot_reusable(state, 0, 0));
+            assert!(!slot_reusable(state, 0, 1468), "state {state}: a zombie's tid was reissued");
+        }
+        // Unchanged: a core still on the stack, or a live slot, is not reusable.
+        assert!(!slot_reusable(thread_state::TERMINATED, 1, 0));
+        assert!(!slot_reusable(thread_state::RUNNING, 0, 0));
+    }
+
+    #[test]
+    fn release_is_by_pid_and_leaves_other_holds_alone() {
+        const A: usize = 201;
+        const B: usize = 202;
+        hold_slot_for_zombie(A, 0x7400_0001);
+        hold_slot_for_zombie(B, 0x7400_0002);
+        assert_eq!(release_slots_held_by(0x7400_0001), 1);
+        assert_eq!(slot_held_by(A), 0);
+        assert_eq!(slot_held_by(B), 0x7400_0002, "another zombie's hold was released");
+        assert_eq!(release_slots_held_by(0x7400_0002), 1);
+        assert_eq!(release_slots_held_by(0), 0, "pid 0 is 'no hold', never a match");
     }
 }

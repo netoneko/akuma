@@ -165,4 +165,7 @@ pub fn ensure_test_runtime() {
         shared_file_pages_enabled: true,
     };
     register(rt, cfg);
+    // The scheduler's half of `init`, from the same stubs: a test that reaps a
+    // process reaches `threading::mark_thread_terminated`, which reads it.
+    crate::register_threading(&rt, &cfg);
 }

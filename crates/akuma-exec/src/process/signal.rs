@@ -639,6 +639,121 @@ mod fork_signal_inheritance_tests {
     }
 }
 
+/// The 2026-10-16 ryzen kill: a `claude` (pid 1468) exited and stayed a zombie,
+/// its task slot (tid 20) was reissued to the next `claude`, and a later
+/// `kill -9 1468` met a tid that named two processes. The rule these pin: **a
+/// zombie's tid is not reissued until the zombie is reaped** — so a kill of the
+/// zombie succeeds (as Linux's does) and has nothing else to land on, the
+/// zombie's records stay consistent, and the reap returns the slot.
+///
+/// Real `Process` rows in the real table, so pids and tid are well clear of
+/// every other host test's.
+#[cfg(test)]
+mod ryzen_2026_10_16_zombie_tid_tests {
+    use super::pend_signal_to_group;
+    use crate::process::table::{
+        hold_exited_thread_slot, pid_for_thread, register_process, thread_pid_map_insert,
+        thread_pid_map_remove, unregister_process, with_process,
+    };
+    use crate::process::types::ProcessState;
+    use crate::process::{make_test_process, resolve_thread_process, Pid};
+    use crate::threading::{self, slot_held_by, slot_reusable, thread_state};
+    use core::sync::atomic::Ordering;
+
+    const SIGKILL: u32 = 9;
+
+    fn register(pid: Pid, tid: usize) {
+        let mut p = make_test_process(pid);
+        p.thread_id = Some(tid);
+        register_process(pid, p);
+        thread_pid_map_insert(tid, pid);
+    }
+
+    /// `run_process`'s epilogue, as far as this crate sees it: hold the slot,
+    /// then become a zombie for the parent.
+    fn exit_to_zombie(pid: Pid, tid: usize) {
+        hold_exited_thread_slot(pid, tid);
+        with_process(pid, |p| {
+            p.exited.store(true, Ordering::Release);
+            p.state.store(ProcessState::Zombie(0));
+        });
+    }
+
+    /// Could a new thread be given `tid` now, once its thread has finished?
+    fn reissuable(tid: usize) -> bool {
+        slot_reusable(thread_state::TERMINATED, 0, slot_held_by(tid))
+    }
+
+    fn scrub(tid: usize) {
+        threading::pend_signal_for_thread(tid, 0);
+        let _ = threading::take_thread_interrupted(tid);
+    }
+
+    #[test]
+    fn a_zombies_tid_is_not_reissued_until_it_is_reaped() {
+        crate::test_support::ensure_test_runtime();
+        const ZOMBIE: Pid = 0x7300_1468;
+        const TID: usize = 141;
+
+        register(ZOMBIE, TID);
+        exit_to_zombie(ZOMBIE, TID);
+
+        // Unreaped: the slot is the zombie's and nobody else's.
+        assert_eq!(slot_held_by(TID), ZOMBIE);
+        assert!(!reissuable(TID), "a zombie's tid was handed to a new thread");
+
+        // `kill(zombie, 9)`: succeeds, and the only slot it can name is the
+        // zombie's own dead one. Its records agree, so no `[TRAMP-MISMATCH]`.
+        assert!(pend_signal_to_group(ZOMBIE, SIGKILL), "kill(zombie) succeeds, as on Linux");
+        assert_eq!(resolve_thread_process(TID), Some(ZOMBIE));
+        assert_eq!(pid_for_thread(TID), Some(ZOMBIE));
+
+        // The reap gives it back.
+        unregister_process(ZOMBIE);
+        assert_eq!(slot_held_by(TID), 0);
+        assert!(reissuable(TID), "the reap must return the slot");
+
+        thread_pid_map_remove(TID);
+        scrub(TID);
+    }
+
+    /// A kill path that already cleared the zombie's `thread_id` must not
+    /// strand the hold: the reap releases by pid.
+    #[test]
+    fn the_reap_releases_by_pid_even_with_thread_id_cleared() {
+        crate::test_support::ensure_test_runtime();
+        const ZOMBIE: Pid = 0x7300_2001;
+        const TID: usize = 142;
+
+        register(ZOMBIE, TID);
+        exit_to_zombie(ZOMBIE, TID);
+        with_process(ZOMBIE, |p| p.thread_id = None);
+        assert!(!reissuable(TID));
+
+        unregister_process(ZOMBIE);
+        assert!(reissuable(TID));
+
+        thread_pid_map_remove(TID);
+        scrub(TID);
+    }
+
+    /// The hold is taken only for a slot the map says is the caller's: a slot
+    /// the map gives to someone else is not frozen on a stranger's behalf.
+    #[test]
+    fn no_hold_on_a_slot_the_map_gives_to_someone_else() {
+        crate::test_support::ensure_test_runtime();
+        const OLD: Pid = 0x7300_3001;
+        const NEW: Pid = 0x7300_3002;
+        const TID: usize = 143;
+
+        thread_pid_map_insert(TID, NEW);
+        hold_exited_thread_slot(OLD, TID);
+        assert_eq!(slot_held_by(TID), 0);
+
+        thread_pid_map_remove(TID);
+    }
+}
+
 #[cfg(test)]
 mod signal_can_act_tests {
     use super::signal_can_act;
