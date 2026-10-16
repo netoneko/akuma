@@ -49,6 +49,11 @@ class Session:
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["TERM"] = "xterm-256color"
+            # A real window size, set on the PTY ssh inherits. Without it ssh sends 0x0, the TUI
+            # lays itself out for zero columns (one character per line) and the "test" measures
+            # a broken terminal, not the program (this probe once did, 2026-10-16).
+            import fcntl, struct, termios
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
             os.execvp("ssh", self.ssh_base[:1] + ["-tt"] + self.ssh_base[1:] + [a.cmd_line()])
         self.pid, self.fd = pid, fd
 

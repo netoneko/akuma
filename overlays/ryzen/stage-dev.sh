@@ -146,6 +146,8 @@ ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-glm-5.3}; export ANTHROPIC_MODEL
 ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL:-glm-5.3-flash}; export ANTHROPIC_SMALL_FAST_MODEL
 API_TIMEOUT_MS=3000000; export API_TIMEOUT_MS
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+# Claude Code's Bash tool needs bash or zsh; busybox ash is rejected ("No suitable shell found").
+SHELL=${SHELL:-/bin/bash}; export SHELL
 exec /usr/local/bin/claude "$@"
 CFG
     chmod 755 $P/usr/local/bin/claude-glm
@@ -161,6 +163,8 @@ ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-kimi-for-coding}; export ANTHROPIC_MODEL
 ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL:-kimi-for-coding}; export ANTHROPIC_SMALL_FAST_MODEL
 API_TIMEOUT_MS=3000000; export API_TIMEOUT_MS
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+# Claude Code's Bash tool needs bash or zsh; busybox ash is rejected ("No suitable shell found").
+SHELL=${SHELL:-/bin/bash}; export SHELL
 exec /usr/local/bin/claude "$@"
 CFG
     chmod 755 $P/usr/local/bin/claude-kimi
