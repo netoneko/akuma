@@ -111,6 +111,7 @@ fn main() {
     emit(&ibm_plex_mono(&PLEX_32), &out);
     emit(&ibm_plex_mono(&PLEX_40), &out);
     emit(&ibm_plex_mono(&PLEX_22), &out);
+    emit(&ibm_plex_mono(&PLEX_20), &out);
     emit(&spleen(), &out);
 }
 
@@ -226,6 +227,18 @@ const PLEX_22: PlexSize = PlexSize {
     name: "IBM Plex Mono 11x22",
     width: 11,
     height: 22,
+    gamma: HD_COVERAGE_GAMMA,
+};
+
+/// 10x20 (2026-10-16): the smallest cut, for `font = 20` in `/etc/console.conf`
+/// — 9 % under the 11x22 the ryzen panel gets by default. Never chosen
+/// automatically.
+const PLEX_20: PlexSize = PlexSize {
+    ident: "IBM_PLEX_MONO_20",
+    stem: "ibm_plex_mono_20",
+    name: "IBM Plex Mono 10x20",
+    width: 10,
+    height: 20,
     gamma: HD_COVERAGE_GAMMA,
 };
 

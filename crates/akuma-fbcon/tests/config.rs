@@ -115,6 +115,21 @@ fn font_takes_a_height_or_a_cell() {
     assert_eq!(ConsoleConfig::parse("margin = 0").font_height, None);
 }
 
+/// `font = 20` selects the 10x20 cut, and it is the smallest: more columns than
+/// the 11x22 the ryzen panel defaults to.
+#[test]
+fn font_20_is_the_10x20_cut_and_the_smallest() {
+    use akuma_fbcon::console::{FONT_20, FONT_22};
+    assert!(core::ptr::eq(Console::<Mem>::font_by_height(20).expect("20"), FONT_20));
+    assert_eq!((FONT_20.width(), FONT_20.height()), (10, 20));
+    let mut c = Console::new(Mem(1920, 1200, 0)).expect("console");
+    assert!(core::ptr::eq(c.font(), FONT_22), "the panel's default stays 11x22");
+    let (rows22, cols22) = (c.rows(), c.cols());
+    let (rows, cols) = c.apply_config(&ConsoleConfig::parse("font = 20"));
+    assert!(core::ptr::eq(c.font(), FONT_20));
+    assert!(rows > rows22 && cols > cols22, "20 is smaller: {rows}x{cols} vs {rows22}x{cols22}");
+}
+
 /// The television's default is the 20x40 cut — 15 % smaller than the 24x48 it
 /// replaced — and `font =` switches cuts with the grid following.
 #[test]

@@ -34,6 +34,10 @@ pub const FONT_40: &Font = &font::IBM_PLEX_MONO_40;
 /// by default since 2026-10-16 (10 % under [`DEFAULT_FONT`]), and `font = 22`.
 pub const FONT_22: &Font = &font::IBM_PLEX_MONO_22;
 
+/// The same face at 10x20, for `font = 20` in `/etc/console.conf`. Never chosen
+/// automatically: [`FONT_22`] is the smallest default.
+pub const FONT_20: &Font = &font::IBM_PLEX_MONO_20;
+
 /// Screen height from which a scale-1 screen defaults to [`FONT_22`].
 pub const FONT_22_MIN_HEIGHT: usize = 1000;
 
@@ -42,7 +46,7 @@ pub const FONT_32: &Font = &font::IBM_PLEX_MONO_32;
 
 /// Every baked cut of the default face, by cell height — what
 /// `/etc/console.conf`'s `font =` chooses among ([`Console::font_by_height`]).
-pub const PLEX_CUTS: [&Font; 5] = [DEFAULT_FONT, FONT_22, FONT_32, FONT_40, HD_FONT];
+pub const PLEX_CUTS: [&Font; 6] = [DEFAULT_FONT, FONT_20, FONT_22, FONT_32, FONT_40, HD_FONT];
 
 /// The font used instead when [`DEFAULT_FONT`]'s cell is too big for the screen.
 ///

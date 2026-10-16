@@ -151,7 +151,8 @@ wrappers kept for callers outside the normal async SSH input path.
   `FONT_22_MIN_HEIGHT` (1000) pixels tall** (2026-10-16, 10 % smaller — the
   ryzen's 1920x1200 panel), 20x40 where the default would be drawn at scale 2
   (4K), the Spleen fallback when 80 columns do not fit. `/etc/console.conf`'s
-  `font = 22|24|32|40|48` overrides it.
+  `font = 20|22|24|32|40|48` overrides it (`20` is the 10x20 cut, added
+  2026-10-16 and never a default).
 - **Mouse reporting.** The console records `CSI ? 1000/1002/1003 h` and
   `1006 h` (`Console::mouse_mode`) and exposes its cell grid
   (`Console::text_grid`); whoever owns a pointing device types the reports in.

@@ -60,7 +60,7 @@ pub struct ConsoleConfig {
     pub cols: Option<Dim>,
     pub rows: Option<Dim>,
     /// `font = 40` (or `font = 20x40`): the cell height of the baked cut to
-    /// use — 22, 24, 32, 40 or 48 (`Console::font_by_height`). An unknown size is
+    /// use — 20, 22, 24, 32, 40 or 48 (`Console::font_by_height`). An unknown size is
     /// ignored.
     pub font_height: Option<usize>,
 }
