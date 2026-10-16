@@ -60,7 +60,7 @@ const INBUF: usize = 128;
 const MAX_FAILS: u8 = 8;
 /// Poll period while a finger is down / recently was, and once idle.
 const ACTIVE_PERIOD_US: u64 = 8_000;
-const IDLE_PERIOD_US: u64 = 100_000;
+const IDLE_PERIOD_US: u64 = 16_000;
 /// How long after the last contact the active period lasts.
 const ACTIVE_HOLD_US: u64 = 2_000_000;
 
@@ -73,6 +73,20 @@ struct Pad {
     fails: u8,
     next_poll_us: u64,
     last_touch_us: u64,
+    /// Poll accounting, for the first-boot log: reads that completed, NACKs,
+    /// empty (length 0) reads, reports decoded, and raw dumps still allowed.
+    st: Stats,
+}
+
+#[derive(Default)]
+struct Stats {
+    polls: u32,
+    nack: u32,
+    empty: u32,
+    reports: u32,
+    other_id: u32,
+    down_frames: u32,
+    dumps: u8,
 }
 
 static PAD: Spinlock<Option<Pad>> = Spinlock::new(None);
@@ -214,11 +228,33 @@ fn set_feature(dw: &mut Dw, d: &HidDescriptor, id: u8, data: &[u8]) -> Result<()
 /// `0x57` = 1, Button Switch `0x58` = 1.
 fn enable_ptp_mode(dw: &mut Dw, d: &HidDescriptor, rdesc: &[u8]) {
     const PAGE: u32 = 0x0D << 16;
+    // Several of these fields can share one feature report (Surface Switch
+    // and Button Switch do), and `SET_REPORT` replaces the whole report: one
+    // write per field would clear the previous field's bit and leave the pad
+    // reporting buttons but no contacts (2026-10-16, first metal run). So
+    // build one payload per report id with every field set, then send each once.
+    let mut fields = [(0u8, akuma_hid::HidLocation::NONE, 0u32); 3];
+    let mut n = 0;
     for (usage, value) in [(0x52u32, 3u32), (0x57, 1), (0x58, 1)] {
-        let Some((id, loc)) = find_feature(rdesc, PAGE | usage) else { continue };
+        if let Some((id, loc)) = find_feature(rdesc, PAGE | usage) {
+            fields[n] = (id, loc, value);
+            n += 1;
+        }
+    }
+    let mut done = [false; 3];
+    for i in 0..n {
+        if done[i] {
+            continue;
+        }
+        let id = fields[i].0;
         let len = report_size(rdesc, ItemKind::Feature, id).unwrap_or(1).min(16);
         let mut payload = [0u8; 16];
-        put_bits(&mut payload[..len], loc.pos, loc.size, value);
+        for j in i..n {
+            if fields[j].0 == id {
+                put_bits(&mut payload[..len], fields[j].1.pos, fields[j].1.size, fields[j].2);
+                done[j] = true;
+            }
+        }
         if set_feature(dw, d, id, &payload[..len]).is_err() {
             fail("set-feature failed (continuing)");
         }
@@ -370,6 +406,7 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
         fails: 0,
         next_poll_us: 0,
         last_touch_us: 0,
+        st: Stats { dumps: 6, ..Stats::default() },
     })
 }
 
@@ -392,6 +429,11 @@ pub fn discover(machine: &MachineDescription, cmdline: &str) {
     if let Some((mmio, addr)) = found {
         FOUND_ADDR.store(addr, Ordering::Relaxed);
         FOUND_MMIO.store(mmio, Ordering::Release);
+    } else {
+        // One line, so "nothing in dmesg" can no longer mean "never ran".
+        serial::puts("  [touchpad] not found (");
+        serial::puts(if machine.rsdp.is_some() { "no GXTP5100 in DSDT/SSDT" } else { "no RSDP" });
+        serial::puts("; touchpad=0xMMIO:0xADDR forces it)\n");
     }
 }
 
@@ -419,6 +461,66 @@ pub fn init() {
 // ---------------------------------------------------------------------------
 
 impl Pad {
+    /// The first few unexpected reads, raw: `[touchpad] <why>: len hh hh ...`.
+    fn dump(&mut self, why: &str) {
+        if self.st.dumps == 0 {
+            return;
+        }
+        self.st.dumps -= 1;
+        serial::puts("  [touchpad] ");
+        serial::puts(why);
+        serial::puts(":");
+        for b in &self.inbuf[..self.in_len.min(14)] {
+            serial::puts(" ");
+            serial::put_hexn(u64::from(*b), 2);
+        }
+        serial::puts("\n");
+    }
+
+    /// A decoded frame, for the first-boot log: raw head, then each contact.
+    fn dump_frame(&mut self, touching: bool) {
+        serial::puts("  [touchpad] frame:");
+        for b in &self.inbuf[..self.in_len.min(40)] {
+            serial::puts(" ");
+            serial::put_hexn(u64::from(*b), 2);
+        }
+        let f = self.dec.frame();
+        for (i, c) in f.contacts.iter().enumerate().filter(|(_, c)| c.down).take(3) {
+            serial::puts(" | c");
+            serial::put_dec(i as u64);
+            serial::puts(" ");
+            serial::put_dec(c.x as u64);
+            serial::puts(",");
+            serial::put_dec(c.y as u64);
+        }
+        serial::puts(if touching { " touching" } else { " not-touching" });
+        serial::puts(if f.button { " BTN" } else { "" });
+        serial::puts(" pending=");
+        serial::puts(if self.pad.pending() { "yes" } else { "no" });
+        serial::puts("\n");
+    }
+
+    /// One line per 4096 polls (about 65 s idle): the counters.
+    fn summary(&mut self) {
+        let total = self.st.polls + self.st.nack;
+        if total == 0 || total % 4096 != 0 {
+            return;
+        }
+        serial::puts("  [touchpad] polls=");
+        serial::put_dec(u64::from(self.st.polls));
+        serial::puts(" nack=");
+        serial::put_dec(u64::from(self.st.nack));
+        serial::puts(" empty=");
+        serial::put_dec(u64::from(self.st.empty));
+        serial::puts(" reports=");
+        serial::put_dec(u64::from(self.st.reports));
+        serial::puts(" other=");
+        serial::put_dec(u64::from(self.st.other_id));
+        serial::puts(" down=");
+        serial::put_dec(u64::from(self.st.down_frames));
+        serial::puts("\n");
+    }
+
     /// One poll: read, decode, feed the policy. Cheap when nothing is due.
     fn tick(&mut self, now: u64) -> bool {
         if now < self.next_poll_us {
@@ -427,6 +529,15 @@ impl Pad {
         let n = self.in_len;
         match self.dw.xfer(&[], &mut self.inbuf[..n]) {
             Ok(()) => self.fails = 0,
+            // A NACK on a poll is the pad saying "nothing to report" (we poll
+            // with no interrupt line to tell us when), not a dead bus: back
+            // off, don't count it toward giving up.
+            Err(XferError::NoDevice) => {
+                self.st.nack += 1;
+                self.summary();
+                self.next_poll_us = now + IDLE_PERIOD_US;
+                return true;
+            }
             Err(e) => {
                 if e == XferError::Timeout {
                     self.dw.recover();
@@ -437,15 +548,37 @@ impl Pad {
             }
         }
         let mut touching = false;
-        if let Some(report) = decode_input(&self.inbuf[..n])
-            && let Some((&id, payload)) = report.split_first()
-            && id == self.dec.layout().report_id
-            && self.dec.decode(payload)
-        {
-            let f = self.dec.frame();
-            touching = f.contacts.iter().any(|c| c.down) || f.button;
-            self.pad.update(&f);
+        self.st.polls += 1;
+        match decode_input(&self.inbuf[..n]) {
+            None => {
+                self.st.empty += 1;
+                if self.st.empty <= 2 {
+                    self.dump("empty read");
+                }
+            }
+            Some(report) => match report.split_first() {
+                Some((&id, payload)) if id == self.dec.layout().report_id => {
+                    if self.dec.decode(payload) {
+                        self.st.reports += 1;
+                        let f = self.dec.frame();
+                        touching = f.contacts.iter().any(|c| c.down) || f.button;
+                        self.pad.update(&f);
+                        let down = f.contacts.iter().any(|c| c.down);
+                        if down {
+                            self.st.down_frames += 1;
+                        }
+                        if self.st.reports <= 4 || (down && self.st.down_frames <= 12) || self.st.reports % 512 == 0 {
+                            self.dump_frame(touching);
+                        }
+                    }
+                }
+                _ => {
+                    self.st.other_id += 1;
+                    self.dump("other report");
+                }
+            },
         }
+        self.summary();
         if touching {
             self.last_touch_us = now;
         }

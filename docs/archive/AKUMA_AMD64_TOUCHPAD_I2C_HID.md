@@ -243,6 +243,28 @@ Then, with a finger on the pad:
 `while :; do head -c 8 /dev/input/mouse0 2>/dev/null | od -An -tu1; done`
 prints `1 0 0 0 x x y y` records for movement, `2 0 1 0 …` on a click.
 
+### First metal run (2026-10-16, entry 12) — it works
+
+Bring-up reached `up: /dev/input/mouse0` first try (`GXTP5100 @0x5d`,
+`dw_i2c fs=99:214 (kept)`, `hid 27c6:01e0 rdesc=665`, `ptp report 4 contacts=5
+range=3751x2327 -> 1920x1200`). Two things the hardware taught:
+
+- **`SET_REPORT` replaces the whole feature report.** Surface Switch (0x57) and
+  Button Switch (0x58) share one report; sending them as two writes cleared the
+  first, and the pad reported the button and *no contacts* (`... 00 01` at the
+  report's tail: contact count 0, button 1). `enable_ptp_mode` now builds one
+  payload per report id. After the fix: single-finger frames with positions,
+  two-finger frames, and `/dev/input/mouse0` yields wheel (`3`) and button
+  (`2`) records.
+- **Idle polling must be fast.** The pad holds only its *latest* report, so a
+  100 ms idle poll saw a tap's lift-off frame (zero contacts) and nothing else.
+  Idle is now 16 ms; the GPIO interrupt (pin 8) remains the real fix.
+
+Diagnostics left in on purpose: `empty read`/`other report` raw dumps (first
+few), `frame:` dumps (first 4, the first 12 with a finger down, then every
+512th) and a `polls= nack= empty= reports= other= down=` line per 4096 polls —
+all in `dmesg`, and in `klog-N.all` on p3.
+
 ## Background
 
 [`proposals/AMD64_TOUCHPAD_I2C_HID.md`](../../proposals/AMD64_TOUCHPAD_I2C_HID.md)
