@@ -13,7 +13,8 @@
 //! quiet seconds, the same discipline `[IDLESTAT]` keeps.
 //!
 //! argv: `after_ms=<n>` moves the first step, `stage=<ms>:<pct>` (repeatable)
-//! replaces the whole staircase, `period_ms=<n>` the poll period. A malformed
+//! replaces the whole staircase, `base_pct=<n>` the brightness while active (what a
+//! keystroke restores to; default 100), `period_ms=<n>` the poll period. A malformed
 //! argv prints and exits non-zero: a typo in a boot config must not silently
 //! dim on defaults. Allocation: a handful of small `String`s per second on a
 //! userspace budget — nothing on the kernel's.
@@ -28,7 +29,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use powersaved::{fact, parse_ms, parse_stage, parse_stages, step, Stage, DEFAULT_STAGES, RESTORE_PCT};
+use powersaved::{fact, parse_ms, parse_pct, parse_stage, parse_stages, step, Stage, DEFAULT_STAGES, RESTORE_PCT};
 
 use libakuma::{fs, print, sleep_ms};
 
@@ -39,6 +40,8 @@ const DEV_POWER: &str = "/dev/power";
 struct Config {
     stages: Vec<Stage>,
     period_ms: u64,
+    /// Brightness while nobody is idle: what a keystroke restores to.
+    base_pct: u8,
 }
 
 /// `key=value` argv, akuma command-line style (`ecram=0x…`, `idlesleep=<n>`).
@@ -54,6 +57,10 @@ fn apply_arg(cfg: &mut Config, a: &str) -> Result<(), String> {
         // The one knob most people want: move the first step, keep the shape.
         cfg.stages = DEFAULT_STAGES.to_vec();
         cfg.stages[0] = Stage { after_ms: ms, pct: cfg.stages[0].pct };
+        return Ok(());
+    }
+    if let Some(v) = a.strip_prefix("base_pct=") {
+        cfg.base_pct = parse_pct(v).ok_or_else(|| format!("bad base_pct (1..=100): {a}"))?;
         return Ok(());
     }
     if let Some(v) = a.strip_prefix("period_ms=") {
@@ -80,7 +87,7 @@ pub extern "C" fn main() {
             None => {}
         }
     }
-    let mut cfg = Config { stages: Vec::new(), period_ms: 1000 };
+    let mut cfg = Config { stages: Vec::new(), period_ms: 1000, base_pct: RESTORE_PCT };
     {
         let mut buf = [Stage { after_ms: 0, pct: 0 }; 8];
         match parse_stages(&stage_args, &mut buf) {
@@ -121,7 +128,7 @@ pub extern "C" fn main() {
                 print(&format!("[powersaved] kernel dim is {kernel_dim}, not {current}; resyncing\n"));
                 current = kernel_dim;
             }
-            if let Some(target) = step(current, idle_ms, &cfg.stages) {
+            if let Some(target) = step(current, idle_ms, &cfg.stages, cfg.base_pct) {
                 let line = format!("dim={target}\n");
                 match fs::write(DEV_POWER, line.as_bytes()) {
                     Ok(()) => {

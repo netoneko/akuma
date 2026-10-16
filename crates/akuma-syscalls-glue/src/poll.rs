@@ -758,6 +758,39 @@ fn epoll_check_fd_readiness_at(fd_num: u32, requested: u32, waker: Option<&Waker
     ready
 }
 
+/// Finds an `epoll_pwait` caller that is **spinning**: getting the same ready event back, from
+/// the same fd, call after call.
+///
+/// Written for Claude Code on the ryzen (2026-10-16): a process that made ~400,000 syscalls a
+/// second — `epoll_pwait` returning at once with an event it never consumed, four
+/// `clock_gettime`s, again — and starved its own UI of keyboard input. The cause was an fd
+/// the readiness map called ready for good (first an epoll nested in another one, then
+/// something else), and nothing in the kernel said *which* fd. This says: once per
+/// [`REPORT_EVERY`] consecutive identical returns, one line naming the pid, the epoll fd,
+/// the fd, its `revents` and what kind of descriptor it is.
+///
+/// Costs two relaxed atomics on a return that already found an event; allocates nothing; a
+/// legitimately busy reader reporting once per 200,000 reads is harmless.
+#[cfg(feature = "sc-epoll")]
+mod spin {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Identical consecutive returns between two reports.
+    pub const REPORT_EVERY: u64 = 200_000;
+
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static RUN: AtomicU64 = AtomicU64::new(0);
+
+    /// Record that thread `tid`'s `epoll_pwait` on `epfd` just returned `revents` for `fd` as its
+    /// first event; `true` when the same return has now repeated [`REPORT_EVERY`] times in a row.
+    pub fn note(tid: u64, epfd: u32, fd: u32, revents: u32) -> bool {
+        let sig = (tid & 0xFFFF) << 48 | u64::from(epfd & 0xFF) << 40 | u64::from(fd & 0xFFFF) << 24
+            | u64::from(revents & 0xFF_FFFF);
+        let run = if LAST.swap(sig, Relaxed) == sig { RUN.fetch_add(1, Relaxed) + 1 } else { RUN.store(1, Relaxed); 1 };
+        run.is_multiple_of(REPORT_EVERY)
+    }
+}
+
 /// x86_64's `struct epoll_event` is `__attribute__((packed))` — 12 bytes,
 /// `events` immediately followed by `data` with no alignment gap — where
 /// [`EpollEvent`] (asm-generic/aarch64) is the natural, 16-byte layout with a
@@ -852,6 +885,8 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 
         let mut kernel_events = alloc::vec![];
         let mut ready_count = 0usize;
+        // The first fd that reported this lap, for the spin detector in the `Ready` arm.
+        let mut first_ready: Option<(u32, u32)> = None;
 
         // Snapshot interest list to avoid holding EPOLL_TABLE lock during readiness checks.
         // This prevents deadlock with PROCESS_TABLE lock (which readiness checks need).
@@ -964,6 +999,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             if step.report != 0 {
                 kernel_events.push(EpollEvent { events: step.report, _pad: 0, data: entry.data });
                 ready_count += 1;
+                first_ready.get_or_insert((fd, step.report));
             }
         }
 
@@ -1010,6 +1046,21 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 );
                 if copy_result.is_err() {
                     return EFAULT;
+                }
+                if let Some((fd, revents)) = first_ready
+                    && spin::note(akuma_exec::threading::current_thread_id() as u64, epfd, fd, revents)
+                {
+                    let kind = akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd));
+                    akuma_primitives::tprint!(
+                        224,
+                        "[epoll-spin] pid={} epfd={} fd={} revents=0x{:x} ready={} kind={:?}\n",
+                        akuma_exec::process::read_current_pid().unwrap_or(0),
+                        epfd,
+                        fd,
+                        revents,
+                        ready_count,
+                        kind
+                    );
                 }
                 log_epoll_pwait_return(
                     epfd, timeout, ready_count, iterations, start_time, 0, &kernel_events, "",
