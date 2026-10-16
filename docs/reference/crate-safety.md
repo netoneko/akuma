@@ -2,14 +2,15 @@
 
 **Grade: A** — regenerated 2026-10-16 with
 `python3 scripts/cloc_akuma.py src crates`: **66 of 86 crates** forbid
-`unsafe` (79618 of 81378 production lines, 97.8% safe). Added in this run,
+`unsafe` (80333 of 82093 production lines, 97.9% safe). Added in this run,
 four crates of the touchpad stack
 ([`AKUMA_AMD64_TOUCHPAD_I2C_HID.md`](../archive/AKUMA_AMD64_TOUCHPAD_I2C_HID.md)),
-each from its first commit: **`akuma-hid`** (690 production lines, 0 sites —
+each from its first commit: **`akuma-hid`** (755 production lines, 0 sites —
 the OpenBSD/NetBSD `hid.c` report-descriptor parser port, see its `NOTICE`),
-**`akuma-touchpad`** (420, 0 — the clickpad policy: soft button areas,
-two-finger scroll, the event ring), **`akuma-i2c-hid`** (202, 0 — the
-HID-over-I²C transport decisions), **`akuma-dwi2c`** (175, 0 — the DesignWare
+**`akuma-touchpad`** (950, 0 — the clickpad policy: soft button areas,
+two-finger scroll with natural direction, the event ring, the PTP decoder, and
+the pointer-to-xterm-mouse encoder `tty`), **`akuma-i2c-hid`** (202, 0 — the
+HID-over-I²C transport decisions), **`akuma-dwi2c`** (215, 0 — the DesignWare
 I²C register map, timings and abort decode). The 2026-10-12 run (62 of 82)
 added **`akuma-cmos-rtc`**
 (the PC CMOS clock's decode — UIP wait, BCD/binary, 12/24-hour, century,

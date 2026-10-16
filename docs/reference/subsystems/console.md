@@ -144,6 +144,21 @@ enforcement.
 `read_line()` (`:255-277`, both `#[allow(dead_code)]`) are unused convenience
 wrappers kept for callers outside the normal async SSH input path.
 
+## Framebuffer console: font and pointer (amd64)
+
+- **Font.** `Console::choose_font` picks the baked IBM Plex Mono cut by screen
+  height: 12x24 by default, **11x22 for scale-1 screens at least
+  `FONT_22_MIN_HEIGHT` (1000) pixels tall** (2026-10-16, 10 % smaller — the
+  ryzen's 1920x1200 panel), 20x40 where the default would be drawn at scale 2
+  (4K), the Spleen fallback when 80 columns do not fit. `/etc/console.conf`'s
+  `font = 22|24|32|40|48` overrides it.
+- **Mouse reporting.** The console records `CSI ? 1000/1002/1003 h` and
+  `1006 h` (`Console::mouse_mode`) and exposes its cell grid
+  (`Console::text_grid`); whoever owns a pointing device types the reports in.
+  On the ryzen that is the touchpad bridge — see
+  [`touchpad.md`](touchpad.md). `Console::set_pointer` marks the pointer's cell
+  (inverted), drawn on the idle lap and undone by the next write.
+
 ## Background
 
 - `docs/archive/ALLOC_PRINT_AUDIT.md` — the survey behind "Printing rules"

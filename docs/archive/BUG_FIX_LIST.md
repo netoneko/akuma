@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1353
-- **Docs contributing at least one fix:** 374
+- **Total distinct fixes counted:** 1359
+- **Docs contributing at least one fix:** 375
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 217 | 16.0% | 28 |
-| Memory & Virtual Memory | 174 | 12.9% | 56 |
+| Memory & Virtual Memory | 174 | 12.8% | 56 |
 | Scheduler & Process Management | 138 | 10.2% | 42 |
-| SMP & Locking | 131 | 9.7% | 52 |
+| SMP & Locking | 131 | 9.6% | 52 |
 | Networking | 91 | 6.7% | 32 |
-| Userspace Apps & Libraries | 40 | 3.0% | 21 |
+| Userspace Apps & Libraries | 40 | 2.9% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.9% | 6 |
-| Toolchain & Self-Hosting | 89 | 6.6% | 12 |
+| Toolchain & Self-Hosting | 89 | 6.5% | 12 |
 | SSH | 39 | 2.9% | 18 |
-| VFS & Filesystem | 113 | 8.4% | 36 |
-| Boot & Drivers | 111 | 8.2% | 16 |
-| Signals & Exceptions | 36 | 2.7% | 13 |
+| VFS & Filesystem | 113 | 8.3% | 36 |
+| Boot & Drivers | 117 | 8.6% | 17 |
+| Signals & Exceptions | 36 | 2.6% | 13 |
 | Misc / Cross-cutting | 48 | 3.5% | 16 |
 | Console & Terminal | 57 | 4.2% | 17 |
 | Containers | 43 | 3.2% | 9 |
-| **Total** | **1353** | **100.0%** | **374** |
+| **Total** | **1359** | **100.0%** | **375** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1720,7 +1720,7 @@ aren't recorded anywhere else.)
 - an extend that failed partway (ENOSPC) returned with `?` before writing the inode, leaving blocks allocated in the bitmap that no inode referenced; the allocations are rolled back and the inode and metadata written before the error returns
 - an extend over a hole in the file's last partial block allocated it with `zero_leaf = false`, so the bytes before the old EOF read as whatever the block held before; now `true`
 
-## Boot & Drivers (111 fixes, 16 docs)
+## Boot & Drivers (117 fixes, 17 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1866,6 +1866,14 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_AMD64_LAPIC_ONESHOT_STALE.md
 - `lapic::arm_deadline` put a core's timer in one-shot mode for the `hlt` and `restore_periodic` undid it only after the halt returned, but the idle loop can be preempted from inside the very interrupt that ends the halt, so the core kept running on a timer that had fired once and never would again; the next thread to `allow_tick` read the expired count as "the periodic tick serves it sooner", armed nothing and halted for ever (an unkillable `hget` stuck in `connect`, core 1's tick counter frozen); `on_tick` now restores periodic mode and `arm_deadline` repairs a stale one-shot first
 - `finish_connect_wait` ended on `Established | Closed | Closing | TimeWait` only, so a server that completed the handshake and closed before the waiter looked (`CloseWait` and beyond) turned a connection that had come up into a 10 s `ETIMEDOUT`; `connect_completed` names every post-handshake state and `connect_outcome` treats them as success
+
+### docs/archive/AKUMA_AMD64_TOUCHPAD_I2C_HID.md
+- the ryzen touchpad's DesignWare I2C block (`AMDI0010`) read `0xFFFFFFFF` everywhere because it is runtime-suspended and nothing here runs ACPI; `akuma_dwi2c::aoac` performs the DSDT's `_PS0` (`DSAD`) as plain MMIO and `i2c::wake` runs it, bounded, before the alive-check
+- the HID report-descriptor parser let constant padding items keep the previous item's usage, so the first contact's tip switch appeared at bits 1, 2 and 3; `PtpLayout` skips `HIO_CONST` items
+- finger identity was the report's array order, so a finger changed slot when an earlier one lifted; the decoder keys slots by contact id
+- `SET_REPORT(feature)` replaces the whole report and Surface Switch and Button Switch share one, so writing them separately cleared the first and the pad reported the button but no contacts; `enable_ptp_mode` builds one payload per report id
+- polling an interrupt-less I2C-HID pad every 100 ms idle only ever read the lift-off frame of a tap, because the pad holds just its latest report; idle polling is 16 ms
+- `Move` is an absolute pad position, so the console pointer followed wherever fingers rested and two-finger scrolling dragged it onto herdr's right pane; the policy emits `Lift` when a stroke ends and the console bridge moves the pointer relatively (anchor, 3/2 gain, clamped)
 
 ## Signals & Exceptions (36 fixes, 13 docs)
 

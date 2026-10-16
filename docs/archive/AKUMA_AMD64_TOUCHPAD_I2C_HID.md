@@ -17,8 +17,8 @@ metal run"); the remaining work is the rio-side consumer.
 | `akuma-dwi2c` — DesignWare I²C decisions (regs, timings, aborts) | **done**: 9 host tests |
 | `akuma-touchpad` — clickpad policy (click/right/scroll state machine) | **done**: 20 host tests |
 | M0: measure this unit's I²C controller + touchpad constants on Linux | **done 2026-10-16** — §4a below; rdesc pinned as `akuma-hid` fixture |
-| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **WORKS ON METAL 2026-10-16** (ryzen, entry 12): bring-up, 1- and 2-finger contacts, scroll and click records — §5 "First metal run". Not yet: `poll`/`epoll` on the node, the pad's IRQ, the rio consumer |
-| rio fork: read the node, winit pointer events, cursor sprite | **open** — kernel half first |
+| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **WORKS ON METAL 2026-10-16** (ryzen, entry 12): bring-up, 1- and 2-finger contacts, scroll and click records — §5 "First metal run" — and the pointer in herdr on the framebuffer console (relative motion, click, natural scroll; "The console bridge"). Not yet: `poll`/`epoll` on the node, the pad's IRQ |
+| rio fork: read the node, winit pointer events, cursor sprite | **open, lower priority** — the console bridge (below) covers terminal programs without it |
 
 Full host suite at commit time: **2076 passed, 0 failed** (50 of them new);
 the four crates build for `x86_64-unknown-none` and `aarch64-unknown-none`
@@ -280,7 +280,16 @@ finger rested — two-finger scroll sits on the right, and the finger left after
 one lifts became a jump. Fix: the policy now emits `PointerEvent::Lift` when a
 pointer stroke ends (all fingers up, or a second finger arrives), and the
 bridge moves the pointer **relatively** (first move of a stroke anchors; gain
-3/2; clamped to the grid; starts mid-screen).
+3/2; clamped to the grid; starts mid-screen). Verified on the metal the same day:
+the pointer stays put through a two-finger scroll and clicks land on the right
+pane.
+
+**Natural scrolling** (the MacBook direction: content follows the fingers) is the
+default: `Config::natural_scroll` flips the wheel sign in the policy, so
+`/dev/input/mouse0` readers and the bridge agree. `echo natural[=0|1] >
+/dev/input/mouse0` toggles live; `touchpad.natural=0` on the kernel command
+line sets the boot default. Current reference:
+[`reference/subsystems/touchpad.md`](../reference/subsystems/touchpad.md).
 
 ## Background
 
