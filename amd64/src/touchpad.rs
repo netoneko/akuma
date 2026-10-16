@@ -594,6 +594,9 @@ impl Pad {
         self.summary();
         if touching {
             self.last_touch_us = now;
+            // A finger on the pad is a person at the machine: `idle_ms=` (and so
+            // `powersaved`'s dim) must see it, or only the keyboard undims.
+            crate::input::note_input();
         }
         let active = now.saturating_sub(self.last_touch_us) < ACTIVE_HOLD_US;
         self.next_poll_us = now + if active { ACTIVE_PERIOD_US } else { IDLE_PERIOD_US };

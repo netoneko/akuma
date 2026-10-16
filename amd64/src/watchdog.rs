@@ -174,13 +174,39 @@ pub fn init(cmdline: &str) {
     serial::puts("\n");
 }
 
-/// Reload the count. From the BSP's timer tick; cheap enough to call every
-/// tick, but `tick` is passed so it can run once a second.
+/// Ticks between reloads: one second at the 100 Hz tick.
+const TICKS_PER_PET: u64 = 100;
+
+/// The one-second bucket the last reload happened in; `u64::MAX` = none yet.
+static LAST_PET_BUCKET: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Whether a reload is due at `tick`, given the bucket the last one happened in.
+///
+/// Decided by *which second the count is in*, not by whether it lands on a
+/// multiple of 100. `lapic::credit_shot_fired` / `settle_idle_shot` add the
+/// ticks an idle long shot replaced in one jump (`idlesleep`), so the count can
+/// step over every multiple of 100 — and with a steady idle wake pattern it
+/// does so every second, forever, locked to one phase. `tick % 100 == 0` then
+/// never fires, nothing reloads the count, and the watchdog resets a healthy,
+/// merely idle machine after its timeout (60 s by default).
+#[must_use]
+const fn pet_due(last_bucket: u64, tick: u64) -> bool {
+    tick / TICKS_PER_PET != last_bucket
+}
+
+/// Reload the count. From the BSP's timer tick (and from `settle_idle_shot`,
+/// after it credits a long sleep); cheap enough to call every tick — it
+/// touches the hardware at most once per second.
 pub fn pet(tick: u64) {
     let va = WDT_VA.load(Ordering::Relaxed);
-    if va == 0 || !tick.is_multiple_of(100) {
+    if va == 0 {
         return;
     }
+    let bucket = tick / TICKS_PER_PET;
+    if !pet_due(LAST_PET_BUCKET.load(Ordering::Relaxed), tick) {
+        return;
+    }
+    LAST_PET_BUCKET.store(bucket, Ordering::Relaxed);
     let va = va as usize;
     w32(va + WDT_CONTROL, r32(va + WDT_CONTROL) | CTL_TRIGGER);
 }

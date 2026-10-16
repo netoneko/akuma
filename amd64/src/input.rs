@@ -23,7 +23,7 @@ static LAST_INPUT_US: AtomicU64 = AtomicU64::new(0);
 /// Record console input activity. `has_byte` counts too, not just [`getb`]: a
 /// key waiting on a dead or busy reader is still a person at the machine, and
 /// the screen must come back for them either way.
-fn note_input() {
+pub fn note_input() {
     LAST_INPUT_US.store(crate::net::uptime_us(), Ordering::Release);
 }
 

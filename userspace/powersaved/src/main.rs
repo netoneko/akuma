@@ -111,6 +111,16 @@ pub extern "C" fn main() {
     loop {
         if let Ok(s) = fs::read_to_string(PROC_POWER) {
             let idle_ms: u64 = fact(&s, "idle_ms").and_then(|v| v.parse().ok()).unwrap_or(0);
+            // The kernel's own dim, from the same read: something else may have
+            // changed it (a manual `dim=` write, another tool), and trusting the
+            // cached value would then never write the restore — the screen would
+            // stay dark under a person typing. Missing = keep what we have.
+            if let Some(kernel_dim) = fact(&s, "dim").and_then(|v| v.parse::<u8>().ok())
+                && kernel_dim != current
+            {
+                print(&format!("[powersaved] kernel dim is {kernel_dim}, not {current}; resyncing\n"));
+                current = kernel_dim;
+            }
             if let Some(target) = step(current, idle_ms, &cfg.stages) {
                 let line = format!("dim={target}\n");
                 match fs::write(DEV_POWER, line.as_bytes()) {
