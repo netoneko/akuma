@@ -153,6 +153,31 @@ wrappers kept for callers outside the normal async SSH input path.
   (4K), the Spleen fallback when 80 columns do not fit. `/etc/console.conf`'s
   `font = 20|22|24|32|40|48` overrides it (`20` is the 10x20 cut, added
   2026-10-16 and never a default).
+- **Smooth text (2026-10-16).** The 10x20, 11x22 and 12x24 cuts carry a second,
+  **subpixel** table for ASCII and Latin-1 (191 glyphs, ~140 KB a cut): the same
+  outlines baked at 3x horizontal resolution with FreeType's FIR5 filter
+  (`build.rs`, `rasterize_lcd`), one coverage per colour stripe, so a vertical stem
+  lands on a third of a pixel instead of a whole one — most of what makes text on
+  a ~140 ppi panel look even. Default on, RGB stripe order. `/etc/console.conf`
+  `smooth = lcd|bgr|gray` sets it, and `CSI ? 9002 h` / `; 2 h` / `l` flips it live
+  (RGB / BGR / gray) with a repaint, to compare on the screen: `printf '\e[?9002l'`.
+  Every other code point, and the other cuts, stay gray. A wrong stripe order shows
+  as colour fringes on the wrong side of each stem. Pinned by
+  `crates/akuma-fbcon/tests/fallbacks.rs`; `tests/font_compare.rs` writes the
+  zoomed comparison image.
+- **Glyph fallbacks, so a missing character is not a box (2026-10-16).** For a code
+  point the text font does not draw, in order: (1) a different spelling of one it
+  does — typographic spaces `U+2000-200A 202F 205F` fold to a space; (2) Unifont's
+  8x16 bitmap (Greek, Cyrillic, Latin Extended-B, and the **narrow symbols**:
+  arrows, `⎿ ∗ ❯`, `◐◑◒◓`); (3) Unifont's 16x16 **symbol** (`⏺ ✻ ✽ ✶ ✳ ✢ ⏵ ➜ ⚠ ★`
+  — the dingbats Claude Code draws), scaled down to the cell by area averaging so a
+  1-pixel stroke stays a stroke (`unifont::paint_symbol`); (4) the code point in a
+  box — four hex digits in 3x5 pixels, two rows of two in a one-column cell, one row
+  of four across two — so the gap says *what* is missing. Both Unifont tables come
+  from `scripts/bake_unifont.py` over the symbol blocks (`SYMBOLS` in
+  `src/unifont.rs`: arrows, math operators, technical, shapes, miscellaneous
+  symbols, dingbats, supplemental arrows, `U+2B00` block); the baked files are
+  committed (`narrow-8.bin` 44 KB, `symbol-16.bin` 55 KB).
 - **Mouse reporting.** The console records `CSI ? 1000/1002/1003 h` and
   `1006 h` (`Console::mouse_mode`) and exposes its cell grid
   (`Console::text_grid`); whoever owns a pointing device types the reports in.

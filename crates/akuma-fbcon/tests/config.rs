@@ -45,7 +45,7 @@ fn comments_blank_lines_unknown_keys_and_junk_are_ignored() {
     let c = ConsoleConfig::parse(
         "\n   \n# only a comment\nfont = comic sans\nthis is not a setting\ncols = 40 # trailing comment\n= 5\nrows = banana\n",
     );
-    assert_eq!(c, ConsoleConfig { margin: None, cols: Some(Dim::Cells(40)), rows: None, font_height: None });
+    assert_eq!(c, ConsoleConfig { margin: None, cols: Some(Dim::Cells(40)), rows: None, font_height: None, smooth: None });
 }
 
 #[test]

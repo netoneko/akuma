@@ -169,6 +169,42 @@ impl Rgb {
             b: mix(self.b, fg.b, coverage),
         }
     }
+
+    /// [`Rgb::blend`] with one coverage per colour channel — subpixel (LCD)
+    /// text, where the red, green and blue stripes of one pixel sit at three
+    /// different horizontal positions and each is covered by a different amount
+    /// of the glyph. `coverage` is in `[r, g, b]` order whatever the panel's
+    /// stripe order is; the caller swaps for a BGR panel.
+    #[must_use]
+    pub const fn blend_lcd(self, fg: Self, coverage: [u8; 3]) -> Self {
+        const fn mix(bg: u8, fg: u8, coverage: u8) -> u8 {
+            let (bg, fg, c) = (bg as u32, fg as u32, coverage as u32);
+            ((fg * c + bg * (255 - c) + 127) / 255) as u8
+        }
+        Self {
+            r: mix(self.r, fg.r, coverage[0]),
+            g: mix(self.g, fg.g, coverage[1]),
+            b: mix(self.b, fg.b, coverage[2]),
+        }
+    }
+}
+
+/// How the text font's edges are drawn.
+///
+/// `Gray` is one anti-aliasing value per pixel: the same on every panel, and
+/// the only choice for a glyph with no subpixel data. `Rgb` and `Bgr` use the
+/// three stripes of each pixel as three horizontal samples (the table is
+/// baked at 3x horizontal resolution and filtered, see `build.rs`): vertical
+/// stems land on a third of a pixel instead of a whole one, which is most of
+/// what makes text on a ~140 ppi laptop panel look even and smooth. The order
+/// is the panel's — a wrong choice shows as colour fringes on the wrong side
+/// of every stem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Smooth {
+    Gray,
+    #[default]
+    Rgb,
+    Bgr,
 }
 
 /// Somewhere pixels can be written.

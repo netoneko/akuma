@@ -31,16 +31,44 @@ pub const WIDE: &[(u32, u32)] = &[
     (0xFF01, 0xFF60), // fullwidth forms
 ];
 
-/// The narrow ranges baked into `narrow-8.bin`.
+/// The symbol ranges: arrows, math operators, technical, shapes, dingbats.
+///
+/// Baked into **both** `narrow-8.bin` (the glyphs Unifont draws 8 pixels wide) and
+/// `symbol-16.bin` (the ones it draws 16 wide — Claude Code's `⏺ ✻ ✽ ✶ ✳ ✢ ⏵ ➜`).
+/// A code point is empty in the table that does not have it.
+pub const SYMBOLS: &[(u32, u32)] = &[
+    (0x2040, 0x2070), // general punctuation: low asterisk...
+    (0x2100, 0x218F), // letterlike symbols, number forms
+    (0x2190, 0x21FF), // arrows
+    (0x2200, 0x23FF), // mathematical operators, miscellaneous technical
+    (0x25A0, 0x25FF), // geometric shapes
+    (0x2600, 0x27BF), // miscellaneous symbols, dingbats
+    (0x27F0, 0x27FF), // supplemental arrows-A
+    (0x2900, 0x297F), // supplemental arrows-B
+    (0x2B00, 0x2BFF), // miscellaneous symbols and arrows
+];
+
+/// The narrow ranges baked into `narrow-8.bin`: the scripts the text fonts lack,
+/// then [`SYMBOLS`] — `bake_unifont.py` builds the same list.
 pub const NARROW: &[(u32, u32)] = &[
     (0x0180, 0x02AF), // Latin Extended-B, IPA extensions
     (0x0370, 0x03FF), // Greek and Coptic
     (0x0400, 0x052F), // Cyrillic and Cyrillic Supplement
     (0x1E00, 0x1EFF), // Latin Extended Additional (Vietnamese)
+    (0x2040, 0x2070),
+    (0x2100, 0x218F),
+    (0x2190, 0x21FF),
+    (0x2200, 0x23FF),
+    (0x25A0, 0x25FF),
+    (0x2600, 0x27BF),
+    (0x27F0, 0x27FF),
+    (0x2900, 0x297F),
+    (0x2B00, 0x2BFF),
 ];
 
 const WIDE_BITS: &[u8] = include_bytes!("../vendor/unifont/wide-16.bin");
 const NARROW_BITS: &[u8] = include_bytes!("../vendor/unifont/narrow-8.bin");
+const SYMBOL_BITS: &[u8] = include_bytes!("../vendor/unifont/symbol-16.bin");
 
 /// Bytes per wide glyph.
 pub const GLYPH_BYTES: usize = 32;
@@ -64,6 +92,7 @@ const fn total(ranges: &[(u32, u32)]) -> usize {
 // A table that disagrees with its ranges would index past its end at draw time.
 const _: () = assert!(WIDE_BITS.len() == total(WIDE) * GLYPH_BYTES, "wide-16.bin does not match WIDE");
 const _: () = assert!(NARROW_BITS.len() == total(NARROW) * NARROW_BYTES, "narrow-8.bin does not match NARROW");
+const _: () = assert!(SYMBOL_BITS.len() == total(SYMBOLS) * GLYPH_BYTES, "symbol-16.bin does not match SYMBOLS");
 
 /// U+3000 IDEOGRAPHIC SPACE: legitimately blank, so not "missing".
 const IDEOGRAPHIC_SPACE: u32 = 0x3000;
@@ -103,6 +132,56 @@ pub fn glyph(cp: u32) -> Option<&'static [u8]> {
 #[must_use]
 pub fn narrow(cp: u32) -> Option<&'static [u8]> {
     lookup(NARROW, NARROW_BITS, NARROW_BYTES, cp, false)
+}
+
+/// The 16x16 bitmap for a symbol Unifont draws wide (`⏺ ✻ ✽ ➜ ⚠`...).
+///
+/// `None` if `cp` is not a symbol in the table or Unifont draws it narrow (see
+/// [`narrow`]). 32 bytes, laid out like [`glyph`]. A symbol is one terminal column wide, so it
+/// is meant to be scaled into the cell: see [`paint_symbol`].
+#[must_use]
+pub fn symbol(cp: u32) -> Option<&'static [u8]> {
+    lookup(SYMBOLS, SYMBOL_BITS, GLYPH_BYTES, cp, false)
+}
+
+/// Scale a 16x16 glyph down to `side` x `side` pixels and report each pixel with
+/// any ink as `put(x, y, coverage)`, coverage 1..=255, by exact area averaging.
+///
+/// Integer scaling cannot do this: a symbol is one column wide, which is under 16
+/// pixels at every console size but the biggest, and halving a 1-pixel stroke
+/// without averaging deletes it. Each destination pixel covers a `16 / side` square
+/// of the source; its coverage is the inked fraction of that square. Integer
+/// arithmetic only (source pixel `s` spans `[s * side, (s + 1) * side)` and
+/// destination pixel `d` spans `[d * 16, (d + 1) * 16)` on a common axis).
+pub fn paint_symbol(g: &[u8], side: usize, put: &mut impl FnMut(usize, usize, u8)) {
+    if side == 0 {
+        return;
+    }
+    let overlap = |d: usize, s: usize| -> usize {
+        let (d0, d1) = (d * SIZE, (d + 1) * SIZE);
+        let (s0, s1) = (s * side, (s + 1) * side);
+        d1.min(s1).saturating_sub(d0.max(s0))
+    };
+    for dy in 0..side {
+        let (sy0, sy1) = (dy * SIZE / side, ((dy + 1) * SIZE).div_ceil(side).min(SIZE));
+        for dx in 0..side {
+            let (sx0, sx1) = (dx * SIZE / side, ((dx + 1) * SIZE).div_ceil(side).min(SIZE));
+            let mut ink = 0usize;
+            for sy in sy0..sy1 {
+                let row = u16::from_be_bytes([g[2 * sy], g[2 * sy + 1]]);
+                let oy = overlap(dy, sy);
+                for sx in sx0..sx1 {
+                    if row & (0x8000 >> sx) != 0 {
+                        ink += oy * overlap(dx, sx);
+                    }
+                }
+            }
+            if ink > 0 {
+                // The destination pixel's area is `SIZE * SIZE` source-units.
+                put(dx, dy, ((ink * 255 + SIZE * SIZE / 2) / (SIZE * SIZE)).clamp(1, 255) as u8);
+            }
+        }
+    }
 }
 
 /// Draw a narrow glyph at integer scale `f`, by horizontal runs, like [`paint`].

@@ -12,7 +12,7 @@ use crate::font::{self, Font};
 use crate::emoji;
 use crate::glyph;
 use crate::unifont;
-use crate::{Rgb, Surface};
+use crate::{Rgb, Smooth, Surface};
 
 /// The font a [`Console`] uses when the framebuffer can afford it.
 pub const DEFAULT_FONT: &Font = &font::IBM_PLEX_MONO;
@@ -305,6 +305,10 @@ pub struct Console<S: Surface> {
     /// redraws the grid — loses brightness while the grid's contents and every
     /// cell's relative contrast stay exactly as they were.
     dim_pct: u8,
+    /// How the text font's edges are drawn: gray, or subpixel in the panel's
+    /// stripe order. See [`Smooth`]; `CSI ? 9002` and `/etc/console.conf`'s
+    /// `smooth =` change it.
+    smooth: Smooth,
 }
 
 impl<S: Surface> Console<S> {
@@ -387,6 +391,7 @@ impl<S: Surface> Console<S> {
             last_emoji: false,
             swallow: false,
             dim_pct: 100,
+            smooth: Smooth::default(),
         })
     }
 
@@ -992,6 +997,23 @@ impl<S: Surface> Console<S> {
             }
             return;
         }
+        // `CSI ? 9002 h` / `CSI ? 9002 ; 2 h` / `CSI ? 9002 l` — this console's
+        // own: subpixel text in RGB order, in BGR order, or gray. Redraws the
+        // screen, so it can be flipped live to compare (`printf '\e[?9002l'`).
+        if params[0] == 9002 {
+            let to = if !on {
+                Smooth::Gray
+            } else if count >= 1 && params[1] == 2 {
+                Smooth::Bgr
+            } else {
+                Smooth::Rgb
+            };
+            if to != self.smooth {
+                self.smooth = to;
+                self.repaint();
+            }
+            return;
+        }
         for &mode in &params[..=count.min(CSI_PARAMS - 1)] {
             match mode {
                 7 => self.autowrap = on,
@@ -1516,6 +1538,18 @@ impl<S: Surface> Console<S> {
         self.dim_pct
     }
 
+    /// Choose how text edges are drawn. Only cells painted afterwards are
+    /// affected — [`Console::repaint`] redraws the screen in the new mode.
+    pub fn set_smooth(&mut self, smooth: Smooth) {
+        self.smooth = smooth;
+    }
+
+    /// The smoothing mode in force.
+    #[must_use]
+    pub fn smooth(&self) -> Smooth {
+        self.smooth
+    }
+
     /// The colours a cell is drawn in: its own where it sets them, the console's
     /// defaults otherwise, then bold, dim and reverse applied.
     fn resolve(&self, cell: Cell) -> (Rgb, Rgb) {
@@ -1606,8 +1640,14 @@ impl<S: Surface> Console<S> {
             return;
         }
 
-        // A character wider than one cell has no glyph here: an outlined box over
-        // both cells, so the layout stays right and the gap is visible.
+        // A wide character no font has: its code point in a box over both cells, so
+        // the layout stays right and a reader can tell *what* is missing. (Our own
+        // placeholders — a code point past the BMP that was never stored — have no
+        // number to show and keep the plain outline.)
+        if wide && cp != u32::from(TOFU_WIDE) && cp != u32::from(TOFU) {
+            self.draw_hexbox(x0, y0, span, ch, cp, true, fg, bg);
+            return;
+        }
         if wide || cp == u32::from(TOFU_WIDE) {
             self.surface.fill(x0, y0, span, ch, bg);
             let (ix, iy) = (cw / 6, ch / 6);
@@ -1651,8 +1691,20 @@ impl<S: Surface> Console<S> {
                 }
             }
             None => {
-                // A script the text font lacks (Greek, Cyrillic, Vietnamese...): Unifont's
-                // 8x16 bitmap at a whole multiple of its size — 3x in the usual 24x48 cell.
+                // The fallback chain for a code point the text font does not draw:
+                //   1. a different spelling of one it does (typographic spaces);
+                //   2. Unifont's 8x16 bitmap (Greek, Cyrillic, Vietnamese, and the
+                //      narrow symbols: arrows, `⎿ ∗ ❯`, `◐`), at a whole multiple of
+                //      its size — 3x in the usual 24x48 cell;
+                //   3. Unifont's 16x16 symbol (`⏺ ✻ ✽ ➜ ⚠`...), scaled down to the
+                //      cell with area averaging, so a 1-pixel stroke stays a stroke;
+                //   4. its code point in a box, so the gap says what is missing.
+                let mut cp = cp;
+                if !self.font.draws(cp)
+                    && let Some(to) = glyph::fold(cp)
+                {
+                    cp = to;
+                }
                 if cp >= 0x180
                     && !self.font.draws(cp)
                     && let Some(g) = unifont::narrow(cp)
@@ -1663,6 +1715,54 @@ impl<S: Surface> Console<S> {
                     let (ox, oy) = (x0 + cw.saturating_sub(gw) / 2, y0 + ch.saturating_sub(gh) / 2);
                     let surface = &mut self.surface;
                     unifont::paint_narrow(g, f, &mut |x, y, w, h| surface.fill(ox + x, oy + y, w, h, fg));
+                    return;
+                }
+                if cp >= 0x180
+                    && !self.font.draws(cp)
+                    && let Some(g) = unifont::symbol(cp)
+                {
+                    self.surface.fill(x0, y0, cw, ch, bg);
+                    let side = cw.min(ch);
+                    let (ox, oy) = (x0 + (cw - side) / 2, y0 + (ch - side) / 2);
+                    let surface = &mut self.surface;
+                    unifont::paint_symbol(g, side, &mut |x, y, c| {
+                        surface.put(ox + x, oy + y, if c == 255 { fg } else { bg.blend(fg, c) });
+                    });
+                    return;
+                }
+                if cp >= 0x80
+                    && cp != u32::from(TOFU)
+                    && cp != u32::from(TOFU_WIDE)
+                    && !self.font.draws(cp)
+                {
+                    self.draw_hexbox(x0, y0, cw, ch, cp, false, fg, bg);
+                    return;
+                }
+                // Subpixel coverage where the font has it (ASCII and Latin-1 of the
+                // cuts baked with it) and the cell is drawn 1:1; gray otherwise.
+                if sc == 1
+                    && self.smooth != Smooth::Gray
+                    && let Some(lcd) = self.font.lcd_cell_cp(cp)
+                {
+                    let bgr = self.smooth == Smooth::Bgr;
+                    for gy in 0..fh {
+                        for gx in 0..fw {
+                            let i = (gy * fw + gx) * 3;
+                            let c = if bgr {
+                                [lcd[i + 2], lcd[i + 1], lcd[i]]
+                            } else {
+                                [lcd[i], lcd[i + 1], lcd[i + 2]]
+                            };
+                            let color = if c == [0, 0, 0] {
+                                bg
+                            } else if c == [0xFF, 0xFF, 0xFF] {
+                                fg
+                            } else {
+                                bg.blend_lcd(fg, c)
+                            };
+                            self.surface.put(x0 + gx, y0 + gy, color);
+                        }
+                    }
                     return;
                 }
                 let cell = self.font.cell_cp(cp);
@@ -1680,6 +1780,46 @@ impl<S: Surface> Console<S> {
                         } else {
                             self.surface.fill(px, py, sc, sc, color);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A character no font here can draw: an outline with its code point inside,
+    /// four hex digits (the low 16 bits) in 3x5 pixels each — two rows of two in a
+    /// one-column cell, one row of four across a two-column one — at the largest
+    /// whole multiple that fits. On a cell too small for even 1x it is the outline
+    /// alone. The outline sits on the cell edge when the cell is narrow: there is
+    /// no room to spare, and two of these side by side merely share a line.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_hexbox(&mut self, x0: usize, y0: usize, span: usize, ch: usize, cp: u32, wide: bool, fg: Rgb, bg: Rgb) {
+        self.surface.fill(x0, y0, span, ch, bg);
+        let t = self.scale.max(1);
+        let inset = if span >= 32 { span / 16 } else { 0 };
+        let (bx, by) = (x0 + inset, y0 + inset);
+        let (bw, bh) = (span - 2 * inset, ch - 2 * inset);
+        self.surface.fill(bx, by, bw, t, fg);
+        self.surface.fill(bx, by + bh - t, bw, t, fg);
+        self.surface.fill(bx, by, t, bh, fg);
+        self.surface.fill(bx + bw - t, by, t, bh, fg);
+
+        // The digit grid in digit-pixels: 4 digits across, or 2x2.
+        let (gw, gh) = if wide { (15, 5) } else { (7, 11) };
+        let (iw, ih) = (bw.saturating_sub(2 * t), bh.saturating_sub(2 * t));
+        let k = (iw / gw).min(ih / gh);
+        if k == 0 {
+            return;
+        }
+        let (ox, oy) = (bx + t + (iw - gw * k) / 2, by + t + (ih - gh * k) / 2);
+        for i in 0..4u32 {
+            let digit = (cp >> (12 - 4 * i)) & 0xF;
+            let (col, row) = if wide { (i as usize, 0) } else { (i as usize % 2, i as usize / 2) };
+            let (dx, dy) = (ox + col * 4 * k, oy + row * 6 * k);
+            for (r, bits) in glyph::hex_digit(digit).iter().enumerate() {
+                for c in 0..3 {
+                    if bits & (4 >> c) != 0 {
+                        self.surface.fill(dx + c * k, dy + r * k, k, k, fg);
                     }
                 }
             }

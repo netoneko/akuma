@@ -37,7 +37,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ab_glyph::{Font as _, FontRef, point};
+use ab_glyph::{Font as _, FontRef, PxScale, point};
 
 /// First printable ASCII code point — the range the cell is *laid out* from.
 const FIRST: u32 = 0x20;
@@ -100,6 +100,9 @@ struct Face {
     /// One cell per code point in [`RANGES`] plus the replacement, each
     /// `width * height` coverage bytes, row-major.
     cells: Vec<u8>,
+    /// Subpixel coverage for the first [`LCD_GLYPHS`] cells (`height` rows of
+    /// `width * 3` bytes each), for the cuts that ask for it.
+    lcd: Option<Vec<u8>>,
 }
 
 fn main() {
@@ -162,6 +165,18 @@ const PLEX_HEIGHT: usize = 24;
 /// a build failure.
 const INK_FLOOR: u8 = 16;
 
+/// The cells that get subpixel data: printable ASCII and Latin-1, the first two
+/// [`RANGES`] — what a terminal draws nearly all of the time. Baking every cell
+/// would triple tables that are already most of the kernel's data; this costs
+/// ~140 KB per cut and every other code point falls back to its gray coverage.
+const LCD_GLYPHS: usize = 95 + 96;
+
+/// FreeType's default LCD filter ("FIR5"), taps over five neighbouring
+/// subpixels, summing to 256. Without it each colour stripe is sampled on its own
+/// and every stem edge is a saturated red or blue fringe; the filter trades some
+/// of the extra horizontal resolution for fringes a reader does not see.
+const LCD_FIR: [u32; 5] = [0x08, 0x4D, 0x56, 0x4D, 0x08];
+
 /// One glyph, rasterized: `(x, y, coverage)` in pen coordinates — `x` from the
 /// left of the cell, `y` from the baseline, before the cell offset is applied.
 type Drawn = Vec<(i32, i32, u8)>;
@@ -175,6 +190,8 @@ struct PlexSize {
     height: usize,
     /// See [`HD_COVERAGE_GAMMA`]; 1.0 leaves coverage untouched.
     gamma: f32,
+    /// Also bake subpixel (LCD) coverage for the first [`LCD_GLYPHS`] cells.
+    lcd: bool,
 }
 
 const PLEX_SD: PlexSize = PlexSize {
@@ -184,6 +201,7 @@ const PLEX_SD: PlexSize = PlexSize {
     width: PLEX_WIDTH,
     height: PLEX_HEIGHT,
     gamma: 1.0,
+    lcd: true,
 };
 
 const PLEX_HD: PlexSize = PlexSize {
@@ -193,6 +211,7 @@ const PLEX_HD: PlexSize = PlexSize {
     width: PLEX_HD_WIDTH,
     height: PLEX_HD_HEIGHT,
     gamma: HD_COVERAGE_GAMMA,
+    lcd: false,
 };
 
 /// Two cuts between the 12x24 and the 24x48 (2026-10-03): the console on the
@@ -207,6 +226,7 @@ const PLEX_32: PlexSize = PlexSize {
     width: 16,
     height: 32,
     gamma: HD_COVERAGE_GAMMA,
+    lcd: false,
 };
 
 const PLEX_40: PlexSize = PlexSize {
@@ -216,6 +236,7 @@ const PLEX_40: PlexSize = PlexSize {
     width: 20,
     height: 40,
     gamma: HD_COVERAGE_GAMMA,
+    lcd: false,
 };
 
 /// 11x22 (2026-10-16): 10 % under the 12x24 default, for the ryzen laptop's
@@ -228,6 +249,7 @@ const PLEX_22: PlexSize = PlexSize {
     width: 11,
     height: 22,
     gamma: HD_COVERAGE_GAMMA,
+    lcd: true,
 };
 
 /// 10x20 (2026-10-16): the smallest cut, for `font = 20` in `/etc/console.conf`
@@ -240,6 +262,7 @@ const PLEX_20: PlexSize = PlexSize {
     width: 10,
     height: 20,
     gamma: HD_COVERAGE_GAMMA,
+    lcd: true,
 };
 
 /// Rasterize IBM Plex Mono into a cell table.
@@ -307,6 +330,30 @@ fn ibm_plex_mono(size: &PlexSize) -> Face {
     let last = (cells_n - 1) * plex_width * plex_height;
     cells[last..].copy_from_slice(&replace);
 
+    // Subpixel coverage: the same outlines at 3x horizontal resolution, placed
+    // by the same cell offset (in pixels, so `3 * off_x` subpixels), filtered.
+    let lcd = size.lcd.then(|| {
+        assert!(
+            RANGES[0] == (0x20, 0x7E) && RANGES[1] == (0xA0, 0xFF),
+            "LCD_GLYPHS assumes ASCII and Latin-1 are the first two ranges"
+        );
+        let mut table = Vec::with_capacity(LCD_GLYPHS * plex_width * 3 * plex_height);
+        for (index, c) in code_points().take(LCD_GLYPHS).enumerate() {
+            if let Some(glyph) = rasterize_lcd(&font, c, px) {
+                table.extend_from_slice(&lcd_cell(
+                    &glyph, off_x, off_y, plex_width, plex_height, size.gamma,
+                ));
+            } else {
+                // No glyph in the face: the replacement box, gray in all three.
+                debug_assert!(drawn[index].is_none());
+                for &v in &replace {
+                    table.extend_from_slice(&[v, v, v]);
+                }
+            }
+        }
+        table
+    });
+
     Face {
         ident: size.ident,
         stem: size.stem,
@@ -321,7 +368,65 @@ fn ibm_plex_mono(size: &PlexSize) -> Face {
         width: plex_width,
         height: plex_height,
         cells,
+        lcd,
     }
+}
+
+/// [`rasterize`] at three times the horizontal resolution: the outline scaled
+/// 3x in x only, so one column of the result is one colour stripe of a pixel.
+fn rasterize_lcd(font: &FontRef<'_>, c: u32, px: f32) -> Option<Drawn> {
+    let ch = char::from_u32(c)?;
+    let id = font.glyph_id(ch);
+    if id.0 == 0 {
+        return None;
+    }
+    let scale = PxScale { x: px * 3.0, y: px };
+    let Some(glyph) = font.outline_glyph(id.with_scale_and_position(scale, point(0.0, 0.0))) else {
+        return Some(Drawn::new());
+    };
+    let origin = glyph.px_bounds().min;
+    let mut ink = Drawn::new();
+    glyph.draw(|x, y, coverage| {
+        let coverage = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if coverage > 0 {
+            let x = i32::try_from(x).expect("glyph column out of range");
+            let y = i32::try_from(y).expect("glyph row out of range");
+            ink.push((origin.x as i32 + x, origin.y as i32 + y, coverage));
+        }
+    });
+    Some(ink)
+}
+
+/// One glyph's subpixel cell: `height` rows of `width * 3` coverage bytes, the
+/// 3x-wide raster placed at `(3 * off_x, off_y)`, run through [`LCD_FIR`]
+/// along each row, then the coverage exponent. Ink the filter spreads past the
+/// cell edge is clipped (a fraction of a pixel on a glyph that already fills
+/// the cell).
+fn lcd_cell(glyph: &Drawn, off_x: i32, off_y: i32, w: usize, h: usize, gamma: f32) -> Vec<u8> {
+    let w3 = w * 3;
+    let mut raw = vec![0u8; w3 * h];
+    for &(gx, gy, coverage) in glyph {
+        let (x, y) = (gx + off_x * 3, gy + off_y);
+        if x >= 0 && y >= 0 && (x as usize) < w3 && (y as usize) < h {
+            raw[y as usize * w3 + x as usize] = coverage;
+        }
+    }
+    let mut out = vec![0u8; w3 * h];
+    for y in 0..h {
+        for x in 0..w3 {
+            let mut acc = 0u32;
+            // Tap `k` reads subpixel `x + k - 2`; written as `x + k` against a
+            // shifted bound so no index goes negative and nothing is cast.
+            for (k, tap) in LCD_FIR.iter().enumerate() {
+                let at = x + k;
+                if at >= 2 && at - 2 < w3 {
+                    acc += tap * u32::from(raw[y * w3 + at - 2]);
+                }
+            }
+            out[y * w3 + x] = boost(((acc + 128) / 256).min(255) as u8, gamma);
+        }
+    }
+    out
 }
 
 /// Apply the coverage exponent; solid and empty pixels are fixed points.
@@ -479,6 +584,7 @@ fn spleen() -> Face {
         width,
         height,
         cells,
+        lcd: None,
     }
 }
 
@@ -581,6 +687,21 @@ fn emit(face: &Face, out: &Path) {
     );
     fs::write(out.join(format!("{}.bin", face.stem)), &face.cells)
         .expect("writing the font table");
+    let mut lcd_expr = String::new();
+    if let Some(lcd) = &face.lcd {
+        assert_eq!(
+            lcd.len(),
+            LCD_GLYPHS * face.width * 3 * face.height,
+            "{} produced an LCD table of the wrong size",
+            face.name
+        );
+        fs::write(out.join(format!("{}_lcd.bin", face.stem)), lcd).expect("writing the LCD table");
+        let _ = write!(
+            lcd_expr,
+            ".with_lcd(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{}_lcd.bin\")), {LCD_GLYPHS})",
+            face.stem
+        );
+    }
 
     let (ident, name, origin, fit) = (face.ident, face.name, face.origin, &face.fit);
     let (width, height, stem) = (face.width, face.height, face.stem);
@@ -603,7 +724,7 @@ fn emit(face: &Face, out: &Path) {
          \x20   {height},\n\
          \x20   &[{ranges}],\n\
          \x20   include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{stem}.bin\")),\n\
-         );\n"
+         ){lcd_expr};\n"
     );
     fs::write(out.join(format!("{stem}.rs")), rs).expect("writing the generated font");
 }

@@ -7,3 +7,10 @@ Licence: Unifont is dual-licensed -- SIL Open Font License 1.1, or GPLv2+ with t
 Embedding Exception. This project uses it under the OFL: LICENSE-OFL-1.1.txt (Unifont's
 copyright line with the standard OFL 1.1 text). Both are permissive enough for this use and
 compatible with the project's BSD-2-Clause; the GPL alternative is not relied on.
+
+symbol-16.bin (2026-10-16): the 16-pixel-wide Unifont glyphs for the symbol blocks in
+SYMBOLS (src/unifont.rs, scripts/bake_unifont.py): arrows, math operators, technical,
+geometric shapes, miscellaneous symbols, dingbats, supplemental arrows, U+2B00. Same
+unifont-18.0.01.bdf as the other tables. narrow-8.bin gained the 8-pixel-wide glyphs for
+the same blocks (44 KB, was 16 KB). Regenerate both with the script; the CJK wide-16.bin
+comes out byte-identical.

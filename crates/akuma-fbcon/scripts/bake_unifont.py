@@ -24,12 +24,29 @@ import sys
 # `narrow-8.bin`: for each code point in NARROW, 16 bytes (16 rows of 8 pixels, one byte
 # a row, most significant bit leftmost) — the scripts the text fonts lack (Greek, most of
 # Cyrillic, Latin Extended-B, IPA, Vietnamese). `src/unifont.rs` has the same lists.
+#
+# Symbols (arrows, math operators, technical, geometric shapes, dingbats...) are baked
+# twice, because Unifont draws some of them 8 pixels wide and some 16: `narrow-8.bin`
+# takes the 8-wide ones, `symbol-16.bin` the 16-wide ones (Claude Code's `⏺ ✻ ✽ ✶ ✳ ✢ ⏵ ➜`
+# are all 16 wide). A code point is empty in the table that does not have it.
+SYMBOLS = [
+    (0x2040, 0x2070),  # general punctuation: low asterisk, reversed pilcrow...
+    (0x2100, 0x218F),  # letterlike symbols, number forms
+    (0x2190, 0x21FF),  # arrows
+    (0x2200, 0x23FF),  # mathematical operators, miscellaneous technical (⎿ ⏺ ⏵ ⌘)
+    (0x25A0, 0x25FF),  # geometric shapes (◐ ◑ ◒ ◓)
+    (0x2600, 0x27BF),  # miscellaneous symbols, dingbats (✻ ✽ ❯ ➜ ⚠)
+    (0x27F0, 0x27FF),  # supplemental arrows-A
+    (0x2900, 0x297F),  # supplemental arrows-B
+    (0x2B00, 0x2BFF),  # miscellaneous symbols and arrows
+]
+
 NARROW = [
     (0x0180, 0x02AF),  # Latin Extended-B, IPA extensions
     (0x0370, 0x03FF),  # Greek and Coptic
     (0x0400, 0x052F),  # Cyrillic and Cyrillic Supplement
     (0x1E00, 0x1EFF),  # Latin Extended Additional (Vietnamese)
-]
+] + SYMBOLS
 
 WIDE = RANGES = [
     (0x3000, 0x30FF),  # CJK symbols and punctuation, Hiragana, Katakana
@@ -77,7 +94,11 @@ def pack(glyphs, ranges, width):
 def main():
     glyphs = parse(sys.argv[1])
     os.makedirs(OUT, exist_ok=True)
-    for name, ranges, width in (("wide-16.bin", WIDE, 16), ("narrow-8.bin", NARROW, 8)):
+    for name, ranges, width in (
+        ("wide-16.bin", WIDE, 16),
+        ("narrow-8.bin", NARROW, 8),
+        ("symbol-16.bin", SYMBOLS, 16),
+    ):
         data, missing = pack(glyphs, ranges, width)
         with open(os.path.join(OUT, name), "wb") as f:
             f.write(data)

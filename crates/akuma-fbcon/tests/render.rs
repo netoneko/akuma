@@ -90,6 +90,7 @@ fn art(s: &MemSurface, x0: usize, y0: usize, w: usize, h: usize) -> String {
 #[test]
 fn a_glyph_lands_where_the_font_says() {
     let mut con = Console::with_scale(MemSurface::new(320, 200), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con.write_str_bytes("A");
@@ -108,6 +109,7 @@ fn the_second_font_renders_at_its_own_size() {
     assert_eq!((font.width(), font.height()), (8, 16));
 
     let mut con = Console::with_font_and_scale(MemSurface::new(320, 200), font, 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con.write_str_bytes("A");
@@ -189,6 +191,7 @@ fn blending_is_exact_at_both_ends() {
 fn scaling_expands_each_font_pixel_into_a_square() {
     let scale = 3;
     let mut con = Console::with_scale(MemSurface::new(320, 200), scale).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con.write_str_bytes("A");
@@ -218,6 +221,7 @@ fn scaling_expands_each_font_pixel_into_a_square() {
 fn nothing_is_drawn_inside_the_overscan_margin() {
     let (w, h) = (1024, 768);
     let mut con = Console::new(MemSurface::new(w, h)).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.set_bg(Rgb::BLACK);
     con.clear();
@@ -241,6 +245,7 @@ fn nothing_is_drawn_inside_the_overscan_margin() {
 #[test]
 fn text_never_escapes_the_surface() {
     let mut con = Console::new(MemSurface::new(640, 480)).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.clear();
     for i in 0..200 {
         con.write_str_bytes("the quick brown fox jumps over the lazy dog 0123456789 ");
@@ -257,6 +262,7 @@ fn text_never_escapes_the_surface() {
 #[test]
 fn scrolling_keeps_the_newest_lines() {
     let mut con = Console::with_scale(MemSurface::new(320, 200), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     let rows = con.rows();
@@ -288,6 +294,7 @@ fn scrolling_keeps_the_newest_lines() {
 #[test]
 fn long_lines_wrap() {
     let mut con = Console::with_scale(MemSurface::new(320, 200), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.clear();
     let cols = con.cols();
     let long: String = core::iter::repeat_n('X', cols + 5).collect();
@@ -333,6 +340,7 @@ fn the_scale_suits_the_screen() {
 #[test]
 fn scrolling_sparse_text_does_not_redraw_the_screen() {
     let mut con = Console::new(MemSurface::new(1920, 1080)).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.clear();
     let (cols, rows) = (con.cols(), con.rows());
 
@@ -566,6 +574,7 @@ fn a_surface_holding_exactly_one_glyph_is_accepted() {
 fn flood_paints_every_pixel_including_the_margin() {
     let (w, h) = (320, 200);
     let mut con = Console::new(MemSurface::new(w, h)).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.flood(Rgb::GOOD);
     let s = con.into_surface();
     assert_eq!(s.count(Rgb::GOOD), w * h);
@@ -576,6 +585,7 @@ fn flood_paints_every_pixel_including_the_margin() {
 fn write_macro_works() {
     use core::fmt::Write;
     let mut con = Console::new(MemSurface::new(640, 480)).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.clear();
     write!(con, "fb {}x{} @ {:#x}", 1024, 768, 0xe000_0000u64).unwrap();
     let s = con.into_surface();
@@ -592,6 +602,7 @@ fn write_macro_works() {
 
 fn term() -> Console<MemSurface> {
     let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con
@@ -796,6 +807,7 @@ fn the_next_byte_takes_the_cursor_down_before_drawing() {
 #[test]
 fn showing_the_cursor_twice_draws_once() {
     let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.clear();
     con.show_cursor();
     let writes = con.surface_mut().writes;
@@ -932,6 +944,7 @@ fn overwriting_half_a_wide_character_blanks_the_other_half() {
 fn box_drawing_is_drawn_without_gaps_between_cells() {
     // A horizontal rule across five cells must be one unbroken run of pixels.
     let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con.write_str_bytes("─────");
@@ -948,6 +961,7 @@ fn box_drawing_is_drawn_without_gaps_between_cells() {
 #[test]
 fn a_filled_circle_and_an_arrow_are_drawn_not_boxed() {
     let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con.write_str_bytes("●→");
@@ -1176,6 +1190,7 @@ fn the_default_margin_is_under_one_percent() {
 #[test]
 fn a_smaller_margin_is_more_columns() {
     let mut con = Console::new(MemSurface::new(1920, 1080)).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     let before = (con.cols(), con.rows());
     con.set_margin(0, 0);
     assert!(con.cols() >= before.0 && con.rows() >= before.1, "{before:?} -> {}x{}", con.cols(), con.rows());
@@ -1186,6 +1201,7 @@ fn a_smaller_margin_is_more_columns() {
 #[test]
 fn text_is_drawn_at_the_new_origin() {
     let mut con = Console::with_scale(MemSurface::new(640, 400), 1).unwrap();
+    con.set_smooth(akuma_fbcon::Smooth::Gray); // these tests compare pixels with gray coverage
     con.set_fg(Rgb::WHITE);
     con.clear();
     con.set_margin(0, 0);

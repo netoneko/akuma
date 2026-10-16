@@ -61,6 +61,12 @@ pub struct Font {
     /// replacement box. An absent code point is an index rather than a branch
     /// into a separate array.
     cells: &'static [u8],
+    /// Subpixel (LCD) coverage for the **first** `lcd_glyphs` cells, if any:
+    /// per glyph `height` rows of `width * 3` bytes — red, green, blue of each
+    /// pixel left to right, already filtered (see `build.rs`). Empty for a font
+    /// with none; a cell past `lcd_glyphs` has only its gray coverage.
+    lcd: &'static [u8],
+    lcd_glyphs: usize,
 }
 
 /// Cells a range list covers.
@@ -96,7 +102,36 @@ impl Font {
             cells.len() == (cells_in(ranges) + 1) * width * height,
             "the generated table is not one cell per code point plus a replacement"
         );
-        Self { name, width, height, ranges, cells }
+        Self { name, width, height, ranges, cells, lcd: &[], lcd_glyphs: 0 }
+    }
+
+    /// Attach subpixel coverage for the first `glyphs` cells. Called only by the
+    /// generated code, like [`Font::new`], and checked the same way: a short
+    /// table would read past its end on the console's drawing path.
+    #[must_use]
+    pub const fn with_lcd(mut self, lcd: &'static [u8], glyphs: usize) -> Self {
+        assert!(
+            lcd.len() == glyphs * self.width * 3 * self.height,
+            "the generated LCD table is not glyphs * width * 3 * height bytes"
+        );
+        assert!(glyphs <= cells_in(self.ranges), "more LCD glyphs than code points");
+        self.lcd = lcd;
+        self.lcd_glyphs = glyphs;
+        self
+    }
+
+    /// Subpixel coverage of `cp`'s glyph — `height` rows of `width * 3` bytes
+    /// `[r, g, b]` per pixel — or `None` if this font has none for it (no LCD
+    /// table, a code point past the baked prefix, or the replacement box), in
+    /// which case the caller draws [`Font::cell_cp`]'s gray coverage.
+    #[must_use]
+    pub fn lcd_cell_cp(&self, cp: u32) -> Option<&'static [u8]> {
+        let index = self.index_of(cp)?;
+        if index >= self.lcd_glyphs {
+            return None;
+        }
+        let size = self.width * 3 * self.height;
+        Some(&self.lcd[index * size..(index + 1) * size])
     }
 
     /// What to call this font in a boot message.

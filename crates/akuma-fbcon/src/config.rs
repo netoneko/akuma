@@ -16,13 +16,15 @@
 //! | `margin` | pixels between the text area and the screen edge | `0`, `24`, `24,12` (left/right, top/bottom) |
 //! | `cols` | columns of the printing area, anchored top-left | `73`, `50%` |
 //! | `rows` | rows of the printing area | `30`, `80%` |
+//! | `font` | cell height of the baked text font | `20`, `22`, `24`, `32`, `40`, `48` (or `10x20`) |
+//! | `smooth` | how text edges are drawn: subpixel in the panel's stripe order, or gray | `lcd` / `rgb` (default), `bgr`, `gray` / `off` |
 //!
 //! A percentage is of the grid the screen holds **after** the margin is applied, so
 //! `cols = 50%` is half of whatever fits. Unknown keys, malformed values and
 //! comments are ignored: a typo in this file must cost a setting, never a boot.
 
 use crate::console::Console;
-use crate::Surface;
+use crate::{Smooth, Surface};
 
 /// A size: an absolute number of cells, or a percentage of what the screen holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,8 @@ pub struct ConsoleConfig {
     /// use — 20, 22, 24, 32, 40 or 48 (`Console::font_by_height`). An unknown size is
     /// ignored.
     pub font_height: Option<usize>,
+    /// `smooth = lcd | rgb | bgr | gray`: see [`Smooth`].
+    pub smooth: Option<Smooth>,
 }
 
 impl ConsoleConfig {
@@ -87,6 +91,18 @@ impl ConsoleConfig {
                 "font" => {
                     let h = value.rsplit(['x', 'X']).next().unwrap_or(value).trim();
                     cfg.font_height = h.parse().ok().or(cfg.font_height);
+                }
+                "smooth" => {
+                    let is = |names: &[&str]| names.iter().any(|n| value.eq_ignore_ascii_case(n));
+                    cfg.smooth = if is(&["lcd", "rgb", "on", "subpixel"]) {
+                        Some(Smooth::Rgb)
+                    } else if is(&["bgr"]) {
+                        Some(Smooth::Bgr)
+                    } else if is(&["gray", "grey", "off", "none"]) {
+                        Some(Smooth::Gray)
+                    } else {
+                        cfg.smooth
+                    };
                 }
                 "cols" => cfg.cols = Dim::parse(value).or(cfg.cols),
                 "rows" => cfg.rows = Dim::parse(value).or(cfg.rows),
@@ -116,6 +132,9 @@ impl<S: Surface> Console<S> {
             && !core::ptr::eq(font, self.font())
         {
             self.set_font(font);
+        }
+        if let Some(smooth) = cfg.smooth {
+            self.set_smooth(smooth);
         }
         if let Some((mx, my)) = cfg.margin {
             self.set_margin(mx, my);

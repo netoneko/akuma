@@ -449,3 +449,49 @@ pub fn shape_coverage(cp: u32, x: usize, y: usize, cw: usize, ch: usize) -> Opti
     }
     Some((hits * 255 / 16) as u8)
 }
+
+// ---------------------------------------------------------------------------
+// The last resort for a code point nothing here can draw
+// ---------------------------------------------------------------------------
+
+/// The code point to draw instead of `cp`, when `cp` is a different spelling.
+///
+/// For the ones that would otherwise be a box: the typographic spaces. They have no
+/// outline in any font here (Unifont's are blank, which the lookup reads as
+/// "missing"), so without this `U+2002 EN SPACE` and `U+202F NARROW NO-BREAK
+/// SPACE` — common in text from word processors and web pages — draw as tofu.
+#[must_use]
+pub const fn fold(cp: u32) -> Option<u32> {
+    match cp {
+        0x1680 | 0x2000..=0x200A | 0x202F | 0x205F => Some(0x20),
+        _ => None,
+    }
+}
+
+/// A hexadecimal digit as 3x5 pixels.
+///
+/// Five rows, the low three bits of each, bit 2 leftmost. For
+/// [`Console`](crate::Console)'s hex box: a character no font has is
+/// drawn as a box holding its code point, which tells a reader *what* is missing
+/// where a plain outline only says that something is.
+#[must_use]
+pub const fn hex_digit(d: u32) -> [u8; 5] {
+    match d & 0xF {
+        0x0 => [0b111, 0b101, 0b101, 0b101, 0b111],
+        0x1 => [0b010, 0b110, 0b010, 0b010, 0b111],
+        0x2 => [0b111, 0b001, 0b111, 0b100, 0b111],
+        0x3 => [0b111, 0b001, 0b111, 0b001, 0b111],
+        0x4 => [0b101, 0b101, 0b111, 0b001, 0b001],
+        0x5 => [0b111, 0b100, 0b111, 0b001, 0b111],
+        0x6 => [0b111, 0b100, 0b111, 0b101, 0b111],
+        0x7 => [0b111, 0b001, 0b010, 0b010, 0b010],
+        0x8 => [0b111, 0b101, 0b111, 0b101, 0b111],
+        0x9 => [0b111, 0b101, 0b111, 0b001, 0b111],
+        0xA => [0b010, 0b101, 0b111, 0b101, 0b101],
+        0xB => [0b110, 0b101, 0b110, 0b101, 0b110],
+        0xC => [0b011, 0b100, 0b100, 0b100, 0b011],
+        0xD => [0b110, 0b101, 0b101, 0b101, 0b110],
+        0xE => [0b111, 0b100, 0b110, 0b100, 0b111],
+        _ => [0b111, 0b100, 0b110, 0b100, 0b100],
+    }
+}

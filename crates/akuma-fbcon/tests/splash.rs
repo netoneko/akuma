@@ -118,6 +118,9 @@ fn painting_draws_ink_where_the_art_is_and_nowhere_off_the_surface() {
 fn successive_frames_change_colours_but_not_shapes() {
     let draw = |t| {
         let mut con = Console::new(Mem::new(1280, 720)).unwrap();
+        // Gray text: with subpixel coverage a faint edge pixel can round to black in
+        // one colour and not in another, which says nothing about the art's shape.
+        con.set_smooth(akuma_fbcon::Smooth::Gray);
         con.clear();
         paint(&mut con, ART, &["title"], t);
         con.into_surface().2
