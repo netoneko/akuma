@@ -406,6 +406,10 @@ akuma-fpcache-rw = { path = "../crates/akuma-fpcache-rw" }
 # `/dev/fb0`'s decisions (ioctl answers, FBIOPUT acceptance, single owner,
 # mmap bounds), host-tested. `src/fbdev.rs` is the device.
 akuma-fbdev = { path = "../crates/akuma-fbdev" }
+akuma-dwi2c = { path = "../crates/akuma-dwi2c" }
+akuma-hid = { path = "../crates/akuma-hid" }
+akuma-i2c-hid = { path = "../crates/akuma-i2c-hid" }
+akuma-touchpad = { path = "../crates/akuma-touchpad" }
 # The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
 # table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
 # `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own

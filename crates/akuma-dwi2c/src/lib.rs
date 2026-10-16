@@ -31,10 +31,13 @@ pub mod ic {
     pub const FS_SCL_LCNT: usize = 0x20;
     pub const HS_SCL_HCNT: usize = 0x24;
     pub const HS_SCL_LCNT: usize = 0x28;
+    pub const INTR_MASK: usize = 0x30;
     pub const RAW_INTR_STAT: usize = 0x34;
     pub const RX_TL: usize = 0x38;
     pub const TX_TL: usize = 0x3C;
+    pub const CLR_INTR: usize = 0x40;
     pub const CLR_TX_ABRT: usize = 0x54;
+    pub const CLR_STOP_DET: usize = 0x60;
     pub const ENABLE: usize = 0x6C;
     pub const STATUS: usize = 0x70;
     pub const TXFLR: usize = 0x74;

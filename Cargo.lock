@@ -92,6 +92,7 @@ dependencies = [
  "akuma-cow",
  "akuma-cpu",
  "akuma-dmesg",
+ "akuma-dwi2c",
  "akuma-elf",
  "akuma-exec",
  "akuma-exec-core",
@@ -101,6 +102,8 @@ dependencies = [
  "akuma-fpcache",
  "akuma-fpcache-rw",
  "akuma-hda",
+ "akuma-hid",
+ "akuma-i2c-hid",
  "akuma-ieee80211",
  "akuma-isolation",
  "akuma-kacho",
@@ -133,6 +136,7 @@ dependencies = [
  "akuma-syscalls-time",
  "akuma-terminal",
  "akuma-threading",
+ "akuma-touchpad",
  "akuma-usb",
  "akuma-usb-storage",
  "akuma-user-access",
@@ -758,6 +762,9 @@ dependencies = [
 [[package]]
 name = "akuma-touchpad"
 version = "0.1.0"
+dependencies = [
+ "akuma-hid",
+]
 
 [[package]]
 name = "akuma-uart"

@@ -17,7 +17,7 @@ Nothing is wired to hardware yet — that needs the Linux-side measurement
 | `akuma-dwi2c` — DesignWare I²C decisions (regs, timings, aborts) | **done**: 9 host tests |
 | `akuma-touchpad` — clickpad policy (click/right/scroll state machine) | **done**: 20 host tests |
 | M0: measure this unit's I²C controller + touchpad constants on Linux | **done 2026-10-16** — §4a below; rdesc pinned as `akuma-hid` fixture |
-| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **open** — needs M0's constants |
+| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **written 2026-10-16, builds, UNVERIFIED on metal** — §5; first boot is the next step |
 | rio fork: read the node, winit pointer events, cursor sprite | **open** — kernel half first |
 
 Full host suite at commit time: **2076 passed, 0 failed** (50 of them new);
@@ -185,6 +185,63 @@ report **4** is the PTP input report — 29 payload bytes, 5 contacts × 40 bits
 216, clickpad button at bit 224; report 1 is a boot-mouse fallback. And
 `FieldTable::collect` on the whole descriptor **truncates** (>64 fields across
 11 report ids) — the glue must `locate()` per report id, not collect the lot.
+
+## 5. The glue (2026-10-16 — builds; never run on the box)
+
+Three more pure pieces landed first, because the first glue draft needed
+decisions that had nowhere to live: `akuma-dwi2c::aoac` (the DSDT's `_PS0`
+as functions — §4a), `akuma-touchpad::ptp` (report layout from the real
+descriptor, **id-keyed finger slots**, the wire format) and the register
+constants. Two things the real descriptor taught:
+constant *padding* items keep the previous item's usage in the parser (the C
+original does too), so `Tip` appeared at bits 1, 2 and 3 of contact 0 until
+`PtpLayout` skipped `HIO_CONST` items; and the report's array order is not a
+finger identity, which is why the decoder keys slots by contact id.
+
+| file | what |
+|---|---|
+| `amd64/src/i2c.rs` | `wake` (AOAC D0, bounded), `map_mmio`, `Dw`: init keeping the firmware's divide counts, `xfer(write, read)` with FIFO-bounded command feeding and abort decode. All waits are TSC-bounded; no IRQs, no allocation |
+| `amd64/src/touchpad.rs` | `discover` (DSDT contains `GXTP5100`, or `touchpad=0x<mmio>:0x<addr>`) → `init` (wake, DW init, HID descriptor @0x0001, `SET_POWER`, 60 ms, `RESET`, reset-ack, report descriptor, PTP layout, **Input Mode = 3 / Surface / Button switches** as `hid-multitouch` does, pointer geometry from the boot framebuffer) → `poll` from the console pump → `dev_read` |
+| `FileDescriptor::DevMouse` | `open("/dev/input/mouse0")` → `ENOENT` unless the pad came up; `fstat` says char device (13,32) |
+
+**Stream format** (8-byte records, `akuma_touchpad::ptp::encode`): byte 0 kind
+(1 move, 2 button, 3 wheel); move: x,y as u16 LE at bytes 4–7 (panel pixels);
+button: byte 1 = 0 left / 1 right / 2 middle, byte 2 = down; wheel: dx,dy as
+i16 LE at 4–7 (`+dy` = up). `read` returns whole records or `EAGAIN` — it
+never blocks.
+
+**Known gaps, on purpose:**
+- `poll`/`epoll` on the node: readiness is shared glue
+  (`akuma-syscalls-glue::poll`), not touched here; readers loop on `EAGAIN`.
+- The pump polls on its lap: 8 ms while a finger is down or within 2 s of one,
+  100 ms idle, so the first touch after idle can wait up to 100 ms.
+  The GPIO interrupt (pin 8) would remove that; polling was the design choice
+  (§2.1 of the proposal).
+- Eight consecutive failed polls disable the pad (`[touchpad] bus failing`),
+  rather than stall the pump; a reboot revives it.
+- The rio fork (read the node, winit pointer events, cursor sprite) is not
+  started.
+
+**First boot on the box — what to expect and what each failure means.** Build
+`akuma-amd64` with `--features no-tests` (a plain build drops the quiet boot),
+stage via menu entry 12 as the wifi work did, then look at `dmesg | grep
+touchpad`:
+
+| line | meaning if it is the last one |
+|---|---|
+| *(nothing)* | DSDT scan did not find `GXTP5100` — pass `touchpad=0xfedc2000:0x5d` |
+| `GXTP5100 @0x5d on dw_i2c 0xfedc2000` then `controller would not power up (AOAC)` | the `_PS0` sequence did not turn the block on — compare AOAC bytes 0xFED81E4A/4B with §4a (`0x7C/0x27` awake) |
+| `not a DesignWare controller (COMP_TYPE)` | still powered down or wrong window: print the register |
+| `dw_i2c v=… fs=132:239 (kept)` | alive; those are Linux's counts. `(computed)` means the registers were zero and 150 MHz was assumed |
+| `no ACK at the slave address` | address or timing wrong (`0x5d`, 400 kHz) |
+| `hid 27c6:01e0 rdesc=665 maxin=32` | transport works end to end |
+| `no reset acknowledgement (continuing)` | harmless if reports follow |
+| `ptp report 4 contacts=5 range=3751x2327 -> WxH` | descriptor parsed, geometry chosen |
+| `up: /dev/input/mouse0` | done |
+
+Then, with a finger on the pad:
+`while :; do head -c 8 /dev/input/mouse0 2>/dev/null | od -An -tu1; done`
+prints `1 0 0 0 x x y y` records for movement, `2 0 1 0 …` on a click.
 
 ## Background
 

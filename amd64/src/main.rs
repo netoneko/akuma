@@ -86,6 +86,7 @@ mod hda;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]
+mod i2c;
 mod idt;
 #[cfg(target_arch = "x86_64")]
 mod input;
@@ -154,6 +155,7 @@ mod shmpages;
 mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
 mod thread;
+mod touchpad;
 /// The shared `akuma_mmu::UserAddressSpace`, exercised at boot. It has no other
 /// runtime caller on this target until item C1 folds `usermode.rs` in — which
 /// is why B3's widening of it needs a test that is not a `cargo check`.

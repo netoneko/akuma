@@ -267,6 +267,9 @@ const PUMP_OUT: usize = 256;
 /// `sshd`, so the pump is also the drain — without it a typed character would
 /// never appear and the FIFO would climb to its 1 MiB cap.
 pub fn pump_once() -> bool {
+    // The touchpad is polled whether or not a console process is attached: its
+    // consumer is `/dev/input/mouse0`, not the tty.
+    crate::touchpad::poll();
     let Some(ch) = channel() else {
         return false;
     };

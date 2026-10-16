@@ -595,6 +595,28 @@ pub fn is_dev_wifi(fd: u64) -> bool {
     table_with(fd, |d| matches!(d, FileDescriptor::DevWifi)).unwrap_or(false)
 }
 
+/// `open("/dev/input/mouse0")`: a `DevMouse` descriptor, only when the
+/// touchpad came up — a machine without one has no node (`ENOENT`).
+fn open_mouse(flags: u32) -> u64 {
+    if !crate::touchpad::present() {
+        return errno::ENOENT;
+    }
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return errno::ESRCH;
+    };
+    let fd = proc.alloc_fd(FileDescriptor::DevMouse);
+    if flags & open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    u64::from(fd)
+}
+
+/// Is `fd` a `/dev/input/mouse0` descriptor?
+#[must_use]
+pub fn is_dev_mouse(fd: u64) -> bool {
+    table_with(fd, |d| matches!(d, FileDescriptor::DevMouse)).unwrap_or(false)
+}
+
 /// Is `fd` a `/dev/power` descriptor?
 #[must_use]
 pub fn is_dev_power(fd: u64) -> bool {
@@ -819,6 +841,10 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     // every machine — a box with no EC and no screen still has idle facts.
     if resolved == "/dev/power" {
         return open_power(flags);
+    }
+    // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
+    if resolved == "/dev/input/mouse0" {
+        return open_mouse(flags);
     }
 
     // A **block** node is refused rather than served — see the header. A
@@ -1099,6 +1125,10 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             return errno::ESRCH;
         };
         return crate::wifi::read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
+    }
+    // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
+    if is_dev_mouse(fd) {
+        return crate::touchpad::dev_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/power`: the kernel's idle/dim facts, fresh per read.
     if is_dev_power(fd) {
@@ -1703,6 +1733,19 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
             st_mode: 0o020_600,
             st_nlink: 1,
             st_rdev: (10 << 8) | 242,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
+    }
+    // `/dev/input/mouse0`: Linux's mousedev (13, 32), readable by all.
+    if is_dev_mouse(fd) {
+        let g = akuma_syscalls_linux::Stat {
+            st_ino: 21,
+            st_mode: 0o020_644,
+            st_nlink: 1,
+            st_rdev: (13 << 8) | 32,
             st_blksize: 4096,
             ..Default::default()
         };
