@@ -105,11 +105,80 @@ def numbers_on_screen(text):
     return sorted({int(m) for m in re.findall(r"(?m)│(\d{1,3})\s*[▕▐ ]*$", text)})
 
 
+def file_lines_on_screen(text, lines):
+    """Indices of `lines` (file order) whose first 30 chars appear on screen.
+
+    Wide lines wrap in the pane, so a line is recognised by its head only;
+    short lines are skipped (too ambiguous to place).
+    """
+    blob = re.sub(r"[│▕▐]", " ", text)
+    return sorted(i for i, l in enumerate(lines)
+                  if len(l.strip()) >= 20 and l.strip()[:30] in blob)
+
+
+def remote_file(a, path):
+    import subprocess
+    r = subprocess.run(["ssh", "-i", a.key, "-p", a.port, "-o", "StrictHostKeyChecking=no",
+                        "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+                        f"root@{a.host}", f"cat {path}"], capture_output=True, text=True, timeout=60)
+    return r.stdout.splitlines()
+
+
+def check_cat(a, s):
+    lines = remote_file(a, a.cat)
+    print(f"{a.cat}: {len(lines)} lines")
+    s.send(f"clear; cat {a.cat}\r")
+    s.pump(4)
+    tail = file_lines_on_screen(s.text(), lines)
+    if a.show:
+        print("--- tail ---\n" + s.text())
+    print(f"tail shows file lines {tail[:1]}..{tail[-1:]} ({len(tail)} recognised)")
+    ok = bool(tail) and tail[-1] >= len(lines) - 25
+    if not ok:
+        print("FAIL: the pane does not end at the end of the file")
+    wheel(s, True, 40)
+    s.pump(1)
+    up = file_lines_on_screen(s.text(), lines)
+    if a.show:
+        print("--- after wheel up ---\n" + s.text())
+    print(f"after wheel-up shows file lines {up[:1]}..{up[-1:]} ({len(up)} recognised)")
+    if not up or not tail or up[-1] >= tail[-1] or up[0] >= tail[0]:
+        print("FAIL: wheel-up did not reveal earlier lines of the file")
+        ok = False
+    # Walk back in steps and remember the earliest line of the file seen: the
+    # pane's history may hold earlier sessions above the file (herdr keeps its
+    # session between runs, and `clear` does not erase scrollback).
+    earliest = up[0]
+    for _ in range(80):
+        wheel(s, True, 10)
+        s.pump(0.2)
+        seen = file_lines_on_screen(s.text(), lines)
+        if seen:
+            earliest = min(earliest, seen[0])
+        if earliest <= 5:
+            break
+    print(f"earliest file line reached by scrolling back: {earliest}")
+    if earliest > 40:
+        print("FAIL: scrolling back never reached the start of the file")
+        ok = False
+    wheel(s, False, 600)
+    s.pump(1)
+    again = file_lines_on_screen(s.text(), lines)
+    print(f"after wheel-down shows file lines {again[:1]}..{again[-1:]}")
+    if not again or again[-1] != tail[-1]:
+        print("FAIL: wheel-down did not return to the live tail")
+        ok = False
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="192.168.1.159")
     ap.add_argument("--port", default="2222")
     ap.add_argument("--key", default=os.path.expanduser("~/.ssh/id_ed25519"))
+    ap.add_argument("--cat", metavar="PATH",
+                    help="scroll a real file on the box (cat PATH) instead of seq 1 300, "
+                         "e.g. /src/github.com/netoneko/akuma/CLAUDE.md")
     ap.add_argument("--show", action="store_true", help="print the screen at each stage")
     a = ap.parse_args()
 
@@ -129,6 +198,10 @@ def main():
         s.pump(1.5)
         if a.show:
             print("--- after dismissing dialogs ---\n" + s.text())
+        if a.cat:
+            ok = check_cat(a, s)
+            print("PASS" if ok else "FAIL")
+            return 0 if ok else 1
         s.send("seq 1 300\r")
         s.pump(3)
         tail = numbers_on_screen(s.text())
