@@ -178,6 +178,12 @@ pub fn install_shared_sinks() {
         // above: glue reads a hook, and a hook nobody registered is how batch
         // 3a's prefault gap and 3c's `utc_time_us` gap each looked from ring 3.
         poll_console_state: crate::fd::poll_console_state,
+        // The **fourth** real answer: the pointer node (`/dev/input/mouse0`),
+        // for the poll family's `DevMouse` arm. `has_events` is a `try_lock`
+        // and a `pending()`, so the answer is cheap and IRQ-masked, but no
+        // poller rings a bell when a record lands — the readiness re-checks at
+        // the blocking-poll tick, like the console hook above.
+        dev_mouse_has_events: crate::touchpad::has_events,
     });
     // The wake effect for the **one** pipe table (4b batch 2b). This target
     // shares `akuma-syscalls-glue`'s table rather than keeping a second

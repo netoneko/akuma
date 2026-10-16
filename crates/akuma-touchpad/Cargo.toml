@@ -2,7 +2,7 @@
 name = "akuma-touchpad"
 version = "0.1.0"
 edition = "2024"
-description = "Clickpad policy: contacts + one physical button -> pointer motion, left/right clicks, two-finger scroll"
+description = "Clickpad policy: contacts + one physical button -> pointer motion, left/right clicks, two-finger scroll, tap-to-click"
 
 [dependencies]
 akuma-hid = { path = "../akuma-hid" }

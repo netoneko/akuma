@@ -100,6 +100,10 @@ static UP: AtomicBool = AtomicBool::new(false);
 /// Natural (MacBook-style) scrolling: on unless `touchpad.natural=0` is on the
 /// command line; `echo natural=0 > /dev/input/mouse0` flips it live.
 static NATURAL: AtomicBool = AtomicBool::new(true);
+/// Tap-to-click, MacBook-style (a quick, still one-finger touch clicks; two
+/// quick taps are a double click): on unless `touchpad.tap=0` is on the
+/// command line; `echo tap=0 > /dev/input/mouse0` flips it live.
+static TAP: AtomicBool = AtomicBool::new(true);
 
 /// Is a touchpad serving `/dev/input/mouse0`?
 #[must_use]
@@ -408,7 +412,11 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
     Some(Pad {
         dw,
         dec: PtpDecoder::new(layout),
-        pad: Clickpad::new(geom, Config { natural_scroll: NATURAL.load(Ordering::Relaxed), ..Config::DEFAULT }),
+        pad: Clickpad::new(geom, Config {
+            natural_scroll: NATURAL.load(Ordering::Relaxed),
+            tap_to_click: TAP.load(Ordering::Relaxed),
+            ..Config::DEFAULT
+        }),
         inbuf: [0; INBUF],
         in_len: usize::from(desc.max_input_len).max(4),
         fails: 0,
@@ -431,6 +439,9 @@ static FOUND_ADDR: AtomicU8 = AtomicU8::new(0);
 pub fn discover(machine: &MachineDescription, cmdline: &str) {
     if let Some(v) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("touchpad.natural=")) {
         NATURAL.store(!matches!(v, "0" | "off" | "false" | "no"), Ordering::Relaxed);
+    }
+    if let Some(v) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("touchpad.tap=")) {
+        TAP.store(!matches!(v, "0" | "off" | "false" | "no"), Ordering::Relaxed);
     }
     let found = if let Some(o) = cmdline_override(cmdline) {
         Some(o)
@@ -575,7 +586,7 @@ impl Pad {
                         self.st.reports += 1;
                         let f = self.dec.frame();
                         touching = f.contacts.iter().any(|c| c.down) || f.button;
-                        self.pad.update(&f);
+                        self.pad.update(&f, crate::net::uptime_us());
                         let down = f.contacts.iter().any(|c| c.down);
                         if down {
                             self.st.down_frames += 1;
@@ -730,9 +741,9 @@ pub fn console_bridge(out: &mut [u8]) -> usize {
     n
 }
 
-/// `write(fd)` on `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`).
-/// Every line is parsed before any applies, so a batch with a bad line changes
-/// nothing (`/dev/power`'s rule).
+/// `write(fd)` on `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`,
+/// `tap`, `tap=0|1`). Every line is parsed before any applies, so a batch with
+/// a bad line changes nothing (`/dev/power`'s rule).
 pub fn dev_write(buf: u64, len: usize) -> u64 {
     if len == 0 {
         return 0;
@@ -762,6 +773,12 @@ pub fn dev_write(buf: u64, len: usize) -> u64 {
                 p.pad.set_natural_scroll(on);
                 NATURAL.store(on, Ordering::Relaxed);
                 serial::puts(if on { "  [touchpad] natural scrolling on\n" } else { "  [touchpad] natural scrolling off\n" });
+            }
+            Ctl::Tap(v) => {
+                let on = v.unwrap_or_else(|| !p.pad.tap_to_click());
+                p.pad.set_tap_to_click(on);
+                TAP.store(on, Ordering::Relaxed);
+                serial::puts(if on { "  [touchpad] tap-to-click on\n" } else { "  [touchpad] tap-to-click off\n" });
             }
         }
     }

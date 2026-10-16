@@ -116,6 +116,11 @@ pub enum FdState {
     /// forever, and spun at ~2 M syscalls/s with its UI starved.
     Epoll { pending: bool },
 
+    /// The pointer node (`/dev/input/mouse0`): whole 8-byte records waiting.
+    /// Never writable — the pad has no transmit side. amd64 only; a kernel
+    /// without the node answers `can_read: false`.
+    DevMouse { can_read: bool },
+
     /// An fd kind with no readiness model — a plain file, most of them.
     /// Reported ready for whatever was asked, which is the POSIX answer for a
     /// regular file and a lie for anything else.
@@ -285,6 +290,12 @@ pub const fn readiness(state: FdState, requested: u32) -> u32 {
 
         FdState::Epoll { pending } => {
             if wants_in && pending {
+                ready |= EPOLLIN;
+            }
+        }
+
+        FdState::DevMouse { can_read } => {
+            if wants_in && can_read {
                 ready |= EPOLLIN;
             }
         }
