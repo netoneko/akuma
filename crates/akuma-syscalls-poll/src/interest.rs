@@ -22,7 +22,7 @@
 
 use alloc::collections::BTreeMap;
 
-use akuma_syscalls_linux::flags::epoll::{EPOLLET, EPOLL_EVENT_MASK};
+use akuma_syscalls_linux::flags::epoll::{EPOLLET, EPOLLONESHOT, EPOLL_EVENT_MASK};
 
 use crate::ctl::{Ctl, CtlOutcome};
 
@@ -38,6 +38,16 @@ pub struct Entry {
     pub data: u64,
     /// Bits already reported to an edge-triggered watcher. See [`crate::edge`].
     pub last_ready: u32,
+    /// An `EPOLLONESHOT` entry that has reported once. It stays silent until
+    /// `EPOLL_CTL_MOD` (or a re-`ADD`) re-arms it, which is the whole contract of
+    /// the flag. Always `false` for an entry registered without it.
+    ///
+    /// Nothing implemented this until 2026-10-16, and the cost was a process that
+    /// made 4 million syscalls a second: Bun registers a writability poll on stdout
+    /// one-shot — "tell me once, I'll re-arm" — and stdout is always writable here, so
+    /// every `epoll_wait` returned the same event for ever
+    /// (`[epoll-spin] ... fd=5 revents=0x4 kind=Stdout`).
+    pub disarmed: bool,
 }
 
 impl Entry {
@@ -70,7 +80,13 @@ impl Entry {
     /// nothing to report.
     #[must_use]
     pub const fn would_report(self, revents: u32) -> bool {
-        crate::edge::scan(self.events, revents, self.last_ready).report != 0
+        !self.disarmed && crate::edge::scan(self.events, revents, self.last_ready).report != 0
+    }
+
+    /// Whether this registration carries `EPOLLONESHOT`.
+    #[must_use]
+    pub const fn is_oneshot(self) -> bool {
+        self.events & EPOLLONESHOT != 0
     }
 }
 
@@ -131,7 +147,7 @@ impl InterestList {
             Ctl::Add => {
                 let replaced = self
                     .map
-                    .insert(fd, Entry { events, data, last_ready: 0 })
+                    .insert(fd, Entry { events, data, last_ready: 0, disarmed: false })
                     .is_some();
                 if replaced { CtlOutcome::AddedOverExisting } else { CtlOutcome::Added }
             }
@@ -140,6 +156,8 @@ impl InterestList {
                     entry.events = events;
                     entry.data = data;
                     entry.last_ready = 0;
+                    // A MOD is how a one-shot entry is re-armed.
+                    entry.disarmed = false;
                     CtlOutcome::Modified
                 }
                 None => CtlOutcome::NotFound,
@@ -211,9 +229,17 @@ impl InterestList {
     /// allowed; a suppressed one is the hang.
     pub fn scan_entry(&mut self, fd: u32, revents: u32) -> Option<crate::edge::Scan> {
         let entry = self.map.get_mut(&fd)?;
+        // A one-shot entry that has already reported says nothing more until it is
+        // re-armed — whatever the fd is doing.
+        if entry.disarmed {
+            return Some(crate::edge::Scan { report: 0, record: None });
+        }
         let step = crate::edge::scan(entry.events, revents, entry.last_ready);
         if let Some(record) = step.record {
             entry.last_ready = record;
+        }
+        if step.report != 0 && entry.is_oneshot() {
+            entry.disarmed = true;
         }
         Some(step)
     }

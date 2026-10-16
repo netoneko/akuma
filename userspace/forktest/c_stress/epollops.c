@@ -570,6 +570,41 @@ out:
     close(p[0]); close(p[1]); close(inner); close(outer);
 }
 
+/* EPOLLONESHOT: a registration fires once, then is disarmed until EPOLL_CTL_MOD re-arms it,
+ * whatever the fd is doing. Nothing implemented it, so a one-shot writability poll on an
+ * always-writable stdout (Bun's) was reported by every epoll_wait — ~4 million syscalls a
+ * second, the process's UI starved of input. Both a readable pipe (stays ready) and a
+ * writable one (always ready) are checked. */
+static void probe_oneshot_fires_once_until_modified(void) {
+    const char *n = "oneshot_fires_once_until_modified";
+    int p[2];
+    if (pipe(p) < 0) { skip(n, "pipe failed"); return; }
+    int ep = epoll_create1(0);
+    if (ep < 0) { skip(n, "epoll_create1 failed"); close(p[0]); close(p[1]); return; }
+
+    /* writability (always ready) */
+    struct epoll_event w = { .events = EPOLLOUT | EPOLLONESHOT, .data = { .u64 = 1 } };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, p[1], &w) < 0) { skip(n, "ADD failed"); goto out; }
+    if (!(wait_mask(ep, 500) & EPOLLOUT)) { bad(n, "a one-shot EPOLLOUT on a writable pipe never fired"); goto out; }
+    for (int i = 0; i < 5; i++)
+        if (wait_mask(ep, 0) != 0) { bad(n, "a one-shot EPOLLOUT fired again without being re-armed — a "
+                                            "caller using one-shot writability polls spins"); goto out; }
+    if (epoll_ctl(ep, EPOLL_CTL_MOD, p[1], &w) < 0) { skip(n, "MOD failed"); goto out; }
+    if (!(wait_mask(ep, 500) & EPOLLOUT)) { bad(n, "EPOLL_CTL_MOD did not re-arm a fired one-shot entry"); goto out; }
+    if (wait_mask(ep, 0) != 0) { bad(n, "re-armed one-shot fired twice"); goto out; }
+    epoll_ctl(ep, EPOLL_CTL_DEL, p[1], NULL);
+
+    /* readability (stays ready until drained) */
+    struct epoll_event r = { .events = EPOLLIN | EPOLLONESHOT, .data = { .u64 = 2 } };
+    if (write(p[1], "x", 1) != 1) { skip(n, "write failed"); goto out; }
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &r) < 0) { skip(n, "ADD(read) failed"); goto out; }
+    if (!(wait_mask(ep, 500) & EPOLLIN)) { bad(n, "a one-shot EPOLLIN on a readable pipe never fired"); goto out; }
+    if (wait_mask(ep, 0) != 0) { bad(n, "a one-shot EPOLLIN fired again while still readable"); goto out; }
+    ok(n, "fired once, silent until EPOLL_CTL_MOD, then fired once more (OUT and IN)");
+out:
+    close(ep); close(p[0]); close(p[1]);
+}
+
 int main(void) {
     printf("epollops: epoll/poll/select semantics probe\n");
     fflush(stdout);
@@ -586,6 +621,7 @@ int main(void) {
     probe_listener_is_readable(34561);
     probe_tcp_peer_close(34562);
     probe_nested_epoll();
+    probe_oneshot_fires_once_until_modified();
 
     printf("\nepollops: %d FAIL, %d known DIVERGE\n", fails, diverges);
     fflush(stdout);

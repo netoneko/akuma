@@ -92,7 +92,7 @@ that it is *written down* — see `exceptfds` below.
 
 | gate | what it covers | how to run |
 |---|---|---|
-| crate host tests | the readiness map, the interest list, `epoll_ctl`'s errno set, the `EPOLLET` decision, both marshallings — 43 tests, milliseconds, no VM | `cargo test -p akuma-syscalls-poll --target $(rustc -vV \| grep '^host:' \| cut -d' ' -f2)` |
+| crate host tests | the readiness map, the interest list, `epoll_ctl`'s errno set, the `EPOLLET` decision, both marshallings — 48 tests, milliseconds, no VM | `cargo test -p akuma-syscalls-poll --target $(rustc -vV \| grep '^host:' \| cut -d' ' -f2)` |
 | `epollops` | the same questions asked of a live kernel, op by op: ET re-arm on a drained read and on a blocked write, the pipe EOF edge, `epoll_ctl`'s errno set, a zero timeout being non-blocking, level-triggered repetition, `poll(2)`'s unrequested `POLLHUP`, `select(2)` overwriting `exceptfds` and counting bits, the TCP group, and a nested epoll | `scripts/epoll_suite.py --port 2322` |
 | the same binary on Linux | proves the probe itself is right — every `FAIL` in the guest should be a `PASS` there, and every `DIVERGE` too | `scripts/epoll_suite.py --linux` |
 | boot suite | `test_epoll_eintr_when_signal_pending`, `epoll_edge_rearm_symmetry`, `epoll_pipe_eof_edge_after_partial_drain`, `run_pselect6_*` | any `cargo run --release` without `no-tests` |
@@ -249,6 +249,21 @@ table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
    still exists as a safety net for resources that don't yet support wakers
    (e.g. `TimerFd`), but a woken thread returns immediately rather than
    waiting for the next tick.
+
+## EPOLLONESHOT (2026-10-16)
+
+A registration with `EPOLLONESHOT` is reported **once**, then disarmed until `EPOLL_CTL_MOD`
+(or a re-`ADD`) re-arms it, whatever the fd is doing: `InterestList::scan_entry` sets
+`Entry::disarmed` when it reports such an entry and returns nothing while it is set;
+`Entry::would_report` (the nested-epoll probe) honours it too. Before 2026-10-16 the flag was
+only masked off as a registration bit and nothing implemented it, and it was not on the
+divergence list either. The cost: Bun registers a one-shot writability poll on stdout/stderr,
+those descriptors are always writable here, and so every `epoll_wait` returned the same event
+for ever — Claude Code made ~4.4 million syscalls a second and starved its own UI of input
+(`[epoll-spin] pid=991 epfd=3 fd=5 revents=0x4 kind=Some(Stdout)`, the diagnostic added for
+exactly this: it names the fd once a caller has had the same first event back 200,000 times
+in a row). Pinned by `a_oneshot_entry_reports_once_then_stays_quiet_until_it_is_modified` and
+four siblings (host), and `epollops` `oneshot_fires_once_until_modified` (live; PASS on Linux).
 
 ## Nested epoll (2026-10-16)
 

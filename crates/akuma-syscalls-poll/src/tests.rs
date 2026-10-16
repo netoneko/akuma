@@ -697,3 +697,70 @@ fn would_report_for_a_level_triggered_entry_stays_true_until_drained() {
     assert!(list.get(6).unwrap().would_report(EPOLLIN), "level: still ready");
     assert!(!list.get(6).unwrap().would_report(0));
 }
+
+// ── EPOLLONESHOT ──────────────────────────────────────────────────────────
+
+/// The incident: a one-shot writability poll on an always-writable fd (Bun's stdout)
+/// was reported on every pass for ever — ~4 million syscalls a second.
+#[test]
+fn a_oneshot_entry_reports_once_then_stays_quiet_until_it_is_modified() {
+    for edge in [0, EPOLLET] {
+        let mut list = InterestList::new();
+        list.apply(Ctl::Add, 5, EPOLLOUT | EPOLLONESHOT | edge, 0x55);
+        // Ready, and stays ready (a sink is always writable).
+        assert_eq!(list.scan_entry(5, EPOLLOUT).unwrap().report, EPOLLOUT, "first pass");
+        for pass in 2..=50 {
+            assert_eq!(list.scan_entry(5, EPOLLOUT).unwrap().report, 0, "pass {pass} (edge={edge:#x})");
+        }
+        // Re-armed by MOD, it reports once more.
+        list.apply(Ctl::Mod, 5, EPOLLOUT | EPOLLONESHOT | edge, 0x55);
+        assert_eq!(list.scan_entry(5, EPOLLOUT).unwrap().report, EPOLLOUT, "after MOD");
+        assert_eq!(list.scan_entry(5, EPOLLOUT).unwrap().report, 0);
+    }
+}
+
+#[test]
+fn a_oneshot_entry_stays_armed_until_something_is_actually_reported() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 3, EPOLLIN | EPOLLONESHOT, 0);
+    for _ in 0..10 {
+        assert_eq!(list.scan_entry(3, 0).unwrap().report, 0, "nothing ready: still armed");
+    }
+    assert!(!list.get(3).unwrap().disarmed);
+    assert_eq!(list.scan_entry(3, EPOLLIN).unwrap().report, EPOLLIN);
+    assert!(list.get(3).unwrap().disarmed);
+}
+
+#[test]
+fn re_adding_a_oneshot_fd_re_arms_it() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 4, EPOLLIN | EPOLLONESHOT, 1);
+    assert_eq!(list.scan_entry(4, EPOLLIN).unwrap().report, EPOLLIN);
+    assert_eq!(list.scan_entry(4, EPOLLIN).unwrap().report, 0);
+    list.apply(Ctl::Add, 4, EPOLLIN | EPOLLONESHOT, 1); // overwrites, like a MOD
+    assert_eq!(list.scan_entry(4, EPOLLIN).unwrap().report, EPOLLIN);
+}
+
+#[test]
+fn an_entry_without_oneshot_is_never_disarmed() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 6, EPOLLOUT, 0);
+    for _ in 0..20 {
+        assert_eq!(list.scan_entry(6, EPOLLOUT).unwrap().report, EPOLLOUT, "level-triggered repeats");
+    }
+    assert!(!list.get(6).unwrap().disarmed);
+}
+
+/// A nested epoll asks `would_report`; a disarmed one-shot entry must not make the
+/// outer instance think something is pending.
+#[test]
+fn a_disarmed_oneshot_entry_is_not_pending_for_a_nested_epoll() {
+    let mut list = InterestList::new();
+    list.apply(Ctl::Add, 8, EPOLLIN | EPOLLONESHOT, 0);
+    assert!(list.get(8).unwrap().would_report(EPOLLIN));
+    list.scan_entry(8, EPOLLIN);
+    assert!(!list.get(8).unwrap().would_report(EPOLLIN), "fired and not re-armed");
+    list.apply(Ctl::Mod, 8, EPOLLIN | EPOLLONESHOT, 0);
+    assert!(list.get(8).unwrap().would_report(EPOLLIN));
+}
+
