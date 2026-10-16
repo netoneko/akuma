@@ -27,18 +27,19 @@ akuma-alloc = { path = "../akuma-alloc" }
 akuma-fpcache = { path = "../akuma-fpcache" }
 # Uptime for `/proc/uptime`; `safe_print!`/`tprint!`; `Spinlock`.
 akuma-primitives = { path = "../akuma-primitives" }
-# The `/proc/<pid>/{stat,status,cmdline}` byte formats, shared with the amd64
-# kernel's `fd::sys_openat`. The formats moved out rather than the filesystem
-# because the amd64 kernel renders `/proc` from its own process tables — the
-# same seam, for the same reason, as `akuma-syscalls-net`.
+# The `/proc/<pid>/{stat,status,cmdline,statm,maps}` byte formats, and since
+# 2026-10-16 the **tree** — `akuma_procfs::tree::{resolve, list}`, the one
+# answer to which names exist under `/proc` and what kind each is, host-tested
+# by a simulation that walks the whole tree. `proc::ProcFilesystem` supplies the
+# process facts and keeps the renderers.
 #
-# **Corrected 2026-09-07:** this comment used to claim the crate "cannot itself
-# be compiled for `x86_64-unknown-none`". That stopped being true when B3 gave
-# `akuma-mmu` its x86 `UserAddressSpace`; `cargo check -p akuma-vfs-glue
-# --target x86_64-unknown-none` passes, and the amd64 kernel mounts its root
-# into this crate's table as of C1 step 4a. `proc::ProcFilesystem` is still not
-# mounted there, but for a different reason — it reports on `akuma-exec`
-# processes, which that target does not yet register.
+# **Corrected 2026-10-16:** this comment said `ProcFilesystem` was "still not
+# mounted" on amd64 and that the amd64 kernel "renders `/proc` from its own
+# process tables". Both stopped being true at 5b slice 3, when amd64 began
+# registering every process with `akuma-exec` and mounting this filesystem
+# (`amd64/src/fs.rs::init_vfs`); its own synthetic `/proc` in `fd.rs` was
+# deleted in 4b batch 2c. **One `/proc` implementation serves both kernels**
+# (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
 akuma-procfs = { path = "../akuma-procfs" }
 akuma-timer = { path = "../akuma-timer" }
 # `/proc/net/tcp` lists the socket table. `default-features = false` matches the

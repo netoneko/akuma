@@ -11,3 +11,10 @@ workspace = true
 # `FmtBuf`, so every renderer writes into a caller's buffer instead of
 # allocating. Nothing else: this crate must not know what a `Process` is.
 akuma-primitives = { path = "../akuma-primitives" }
+
+[dev-dependencies]
+# The tree simulation walks `/proc` the way `getdents64` streams it: the dot
+# records and the record loop are that crate's, so the walk exercises the
+# kernel's actual stream shape rather than a copy of it. Test-only — the crate
+# itself still knows nothing beyond `akuma-primitives`.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

@@ -2725,8 +2725,16 @@ impl Iterator for ReadDir {
                     .unwrap_or_default();
                 
                 let is_dir = entry.d_type == file_type::DT_DIR;
-                
+
                 self.pos += reclen;
+                // `.` and `..` are skipped, as `std::fs::read_dir` skips them:
+                // the kernel streams both since 2026-10-16 (it streamed neither
+                // before), and several callers recurse on `is_dir` without
+                // checking names — `box`'s tree copy and `scratch`'s index walk
+                // would recurse into `.` forever.
+                if name == "." || name == ".." {
+                    continue;
+                }
                 return Some(DirEntryInfo { name, is_dir });
             }
 

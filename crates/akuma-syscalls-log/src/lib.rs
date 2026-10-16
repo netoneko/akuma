@@ -180,6 +180,25 @@ pub fn get_formatted(pid: u32, viewer_box_id: u64) -> Option<Vec<u8>> {
     })
 }
 
+/// Whether [`get_formatted`] would return `Some`, without rendering.
+///
+/// The same retention and box rule. `/proc`'s structure (`exists`, `stat`, listing a
+/// pid directory) asks this on every lookup; rendering the whole log to throw
+/// it away allocated a few KB, under this spinlock with IRQs off, per `stat`.
+#[must_use]
+pub fn has_log(pid: u32, viewer_box_id: u64) -> bool {
+    let now = uptime_us();
+    with_irqs_disabled(|| {
+        let log = SYSCALL_LOG.lock();
+        log.get(&pid).is_some_and(|entry| {
+            (viewer_box_id == 0 || entry.box_id == viewer_box_id)
+                && entry
+                    .exited_at_us
+                    .is_none_or(|exited_at| now.saturating_sub(exited_at) < retain_us())
+        })
+    })
+}
+
 /// Every pid with a live retained log that `viewer_box_id` may see.
 #[must_use]
 pub fn list_pids_with_logs(viewer_box_id: u64) -> Vec<u32> {
@@ -206,6 +225,26 @@ mod tests {
                 (pid, ProcessSyscallLog { entries: VecDeque::new(), exited_at_us, box_id: 0 })
             })
             .collect()
+    }
+
+    /// `has_log` is `get_formatted(..).is_some()` without the render: the same
+    /// box rule and the same retention rule, or `/proc` lists a `syscalls` file
+    /// that then reads as absent. Pids far above any real ones, because the map
+    /// is a process-wide static and `cargo test` runs tests in threads.
+    #[test]
+    fn has_log_agrees_with_get_formatted() {
+        record(900_001, 0, 63, 1, 1, 0);
+        record(900_002, 7, 63, 1, 1, 0);
+        for pid in [900_001, 900_002, 900_003] {
+            for viewer in [0, 7, 8] {
+                assert_eq!(
+                    has_log(pid, viewer),
+                    get_formatted(pid, viewer).is_some(),
+                    "pid {pid} viewer {viewer}"
+                );
+            }
+        }
+        assert!(has_log(900_002, 7) && !has_log(900_002, 8) && has_log(900_002, 0));
     }
 
     #[test]

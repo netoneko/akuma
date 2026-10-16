@@ -7,13 +7,17 @@
 //! - /proc/<pid>/cmdline - argv as NUL-separated bytes (Linux-compatible)
 //! - /proc/<pid>/status - human-readable `Name`, `State`, `Pid`, `PPid`, etc.
 //!
+//! Which names exist and what a path resolves to is `akuma_procfs::tree`'s
+//! decision (see "The tree" below); this file supplies the process facts and
+//! renders the files.
+//!
 //! # TODO: Rewrite without allocations
 //!
-//! The current implementation uses `format!`, `String`, and `Vec` allocations
-//! in `read_symlink()` and `is_symlink()`. These can deadlock if called while
-//! the allocator lock is held (e.g., during exception handling or with
-//! preemption disabled). Should be rewritten to use fixed-size stack buffers
-//! or return references to static strings where possible.
+//! Path resolution — `exists`, `is_symlink`, `metadata`'s lookup — allocates
+//! nothing since 2026-10-16 (the tree parses in place; the canonical path is
+//! on the stack). `read_symlink` still returns a `String` (the trait's
+//! signature), `read_dir` a `Vec<DirEntry>`, and several renderers build a
+//! `Vec`/`String`; those can deadlock if reached with the allocator lock held.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -91,89 +95,237 @@ fn pid_address_space_file(pid: Pid, name: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Rewrite a leading `self/` to the calling process's own pid.
+// ============================================================================
+// The tree: `akuma_procfs::tree` over this kernel's process table
+// ============================================================================
+//
+// Which names exist under `/proc`, what kind each is, and what a path resolves
+// to are decided in ONE place — `akuma_procfs::tree::{resolve, list}`, host-
+// tested by a simulation that walks the whole tree. This file supplies the
+// facts (`KernelModel`) and keeps the renderers. Before 2026-10-16 `read_dir`,
+// `exists`, `metadata`, `is_symlink` and `read_symlink` each parsed paths for
+// themselves, and their disagreements were the bugs: a thread directory that
+// listed `task`, an `fd/2` listed but refused, thread-view symlinks that
+// `is_symlink` denied (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
+//
+// `/proc/self/…` is still answered here rather than chased by the VFS: Akuma's
+// VFS hands procfs the literal `self/status`, which is why `redis-server`
+// could not start and libcap-ng returned -1 with no errno
+// (docs/archive/LONG_ROAD_TO_REDIS.md). The tree resolves `self/…` to the
+// caller's thread-group id; the bare `self` stays a symlink so
+// `readlink("/proc/self")` keeps working.
+
+use akuma_procfs::tree::{self, Kind, Node, PidFile, ProcInfo, ProcModel};
+
+/// The tree's view of this kernel, taken once per `ProcFilesystem` call.
 ///
-/// `/proc/self` is a symlink on Linux, and everything under it resolves through
-/// that symlink. Akuma's VFS hands procfs the literal path instead of chasing it,
-/// so `/proc/self/status` — a path essentially every libc and tool uses — reached
-/// this filesystem as the string `self/status` and matched nothing. `read_symlink`
-/// reported `self` correctly all along, which is why the gap was easy to miss.
-///
-/// The consequences were not cosmetic. It is the reason `redis-server` could not
-/// start at all (`/proc/self/smaps`,
-/// docs/archive/LONG_ROAD_TO_REDIS.md), and later the reason `redis:alpine`'s
-/// entrypoint died at `setpriv: activate capabilities: No error information` —
-/// libcap-ng reads a process's capabilities out of `/proc/self/status` and returns
-/// -1 *without setting errno* when it cannot.
-///
-/// The bare string `self` is deliberately NOT rewritten: it must stay a symlink so
-/// `readlink("/proc/self")` keeps working.
-fn resolve_self(path: &str) -> alloc::borrow::Cow<'_, str> {
-    let path = resolve_self_only(path);
-    match resolve_task(&path) {
-        Some(aliased) => alloc::borrow::Cow::Owned(aliased),
-        None => path,
+/// Three scalars, not a copy of the process table: a 256-row snapshot is
+/// ~6 KB, and these methods run deep inside path resolution on amd64's 32 KB
+/// kernel stacks. Each question goes to the table when it is asked.
+struct KernelModel {
+    viewer_box: u64,
+    current_tgid: Option<Pid>,
+    features: tree::Features,
+}
+
+impl KernelModel {
+    fn now() -> Self {
+        Self {
+            viewer_box: caller_box_id(),
+            // `read_current_pid` answers the thread-group id, which is what
+            // `/proc/self` names on Linux.
+            current_tgid: process::read_current_pid(),
+            features: tree::Features {
+                power: crate::power_renderer().is_some(),
+                sysvipc: crate::cfg_proc_sysvipc_enabled(),
+                syscall_log: crate::cfg_proc_syscall_log_enabled(),
+            },
+        }
+    }
+
+    /// Pids of the rows `keep` accepts, ascending, into `buf`; returns how
+    /// many. The scan runs with IRQs off and must not allocate, so it fills a
+    /// stack array (1 KB) and callers run their callbacks after it.
+    fn pids_where(
+        buf: &mut [Pid; process::MAX_PROCESSES],
+        mut keep: impl FnMut(&process::Process) -> bool,
+    ) -> usize {
+        let mut n = 0;
+        process::for_each_process(|p| {
+            if n < buf.len() && keep(p) {
+                buf[n] = p.pid;
+                n += 1;
+            }
+        });
+        buf[..n].sort_unstable();
+        n
     }
 }
 
-/// The live threads of thread group `tgid` — what `/proc/<tgid>/task` lists.
-/// Empty when `tgid` is not a group leader (a thread's own pid is not a
-/// `task` directory, on Linux either).
-fn task_members(tgid: Pid) -> Vec<Pid> {
-    let mut members = process::collect_pids(|p| {
-        p.tgid == tgid && !p.exited.load(core::sync::atomic::Ordering::Relaxed)
-    });
-    members.sort_unstable();
-    members
+impl ProcModel for KernelModel {
+    fn viewer_box(&self) -> u64 {
+        self.viewer_box
+    }
+
+    fn current_tgid(&self) -> Option<Pid> {
+        self.current_tgid
+    }
+
+    fn features(&self) -> tree::Features {
+        self.features
+    }
+
+    fn for_each_pid(&self, f: &mut dyn FnMut(Pid)) {
+        let mut buf = [0; process::MAX_PROCESSES];
+        let n = Self::pids_where(&mut buf, |_| true);
+        for &pid in &buf[..n] {
+            f(pid);
+        }
+    }
+
+    fn process(&self, pid: Pid) -> Option<ProcInfo> {
+        // Scalars copied out during the table scan, so no `&'static Process`
+        // escapes to be read after its row is freed.
+        process::find_process(|p| {
+            (p.pid == pid).then(|| ProcInfo {
+                tgid: p.tgid,
+                box_id: p.box_id,
+                exited: p.exited.load(core::sync::atomic::Ordering::Relaxed),
+            })
+        })
+    }
+
+    fn for_each_fd(&self, pid: Pid, f: &mut dyn FnMut(u32)) {
+        let Some(p) = process::lookup_process_shared(pid) else { return };
+        // Reserve outside the table lock and copy at most that many keys under
+        // it, so nothing allocates while the lock is held. A descriptor opened
+        // between the two locks is missed — the race any listing of a live
+        // table has.
+        let cap = akuma_primitives::irq::with_irqs_disabled(|| p.fds.table.lock().len());
+        let mut fds: Vec<u32> = Vec::with_capacity(cap);
+        akuma_primitives::irq::with_irqs_disabled(|| {
+            let table = p.fds.table.lock();
+            fds.extend(table.keys().copied().take(cap));
+        });
+        for fd in fds {
+            f(fd);
+        }
+    }
+
+    fn has_fd(&self, pid: Pid, fd: u32) -> bool {
+        // `contains_key`, not `get_fd(..).is_some()`: `get_fd` clones the
+        // descriptor — a `String` for every file — under the lock, to answer a
+        // yes/no.
+        process::lookup_process_shared(pid).is_some_and(|p| {
+            akuma_primitives::irq::with_irqs_disabled(|| p.fds.table.lock().contains_key(&fd))
+        })
+    }
+
+    fn has_syscall_log(&self, pid: Pid) -> bool {
+        akuma_syscalls_log::has_log(pid, self.viewer_box)
+    }
+
+    fn for_each_logged_pid(&self, f: &mut dyn FnMut(Pid)) {
+        for pid in akuma_syscalls_log::list_pids_with_logs(self.viewer_box) {
+            f(pid);
+        }
+    }
+
+    fn has_address_space(&self, pid: Pid) -> bool {
+        // "Exists exactly when it can be rendered" — the rule that keeps
+        // `open`, `stat` and `access` agreeing about `maps`/`statm`. Still a
+        // walk per question (the hook is the only authority on whether this
+        // kernel can describe `pid`), but rows only: the old check rendered and
+        // formatted the whole of `maps` to throw it away.
+        crate::pid_map_rows(pid).is_some()
+    }
+
+    fn for_each_live_member(&self, tgid: Pid, f: &mut dyn FnMut(Pid)) {
+        // One table pass; the trait's default would look every pid up again.
+        let mut buf = [0; process::MAX_PROCESSES];
+        let n = Self::pids_where(&mut buf, |p| {
+            p.tgid == tgid && !p.exited.load(core::sync::atomic::Ordering::Relaxed)
+        });
+        for &pid in &buf[..n] {
+            f(pid);
+        }
+    }
 }
 
-/// `<tgid>/task/<tid>[/rest]` → `<tid>[/rest]`, when `tid` is a live thread
-/// of `tgid`.
-///
-/// `/proc/<pid>/task/<tid>/` on Linux is the per-thread view of the same
-/// files `/proc/<tid>/` serves — and here every thread is a `Process` of its
-/// own, so the per-pid renderers already *are* the per-thread ones. Aliasing
-/// the path is the whole implementation: no second copy of `status`, `stat`,
-/// `cmdline`. `<tgid>/task` itself is served beside the per-pid entries.
-///
-/// Added 2026-10-08. There was no `task` directory at all, and Chromium's
-/// sandbox helper `fstatat`s `/proc/self/task/` to count its own threads
-/// (`st_nlink`); the `ENOENT` was a `CHECK` failure in every zygote. Linux
-/// Chromium also reads `/proc/<pid>/task/<tid>/status` ~300 times a page load.
-fn resolve_task(path: &str) -> Option<String> {
-    let mut it = path.splitn(4, '/');
-    let tgid: Pid = it.next()?.parse().ok()?;
-    if it.next()? != "task" {
-        return None;
-    }
-    let tid: Pid = it.next()?.parse().ok()?;
-    if !task_members(tgid).contains(&tid) {
-        return None;
-    }
-    Some(match it.next() {
-        Some(rest) => format!("{tid}/{rest}"),
-        None => format!("{tid}"),
-    })
+/// Resolve a path relative to the mount through the tree.
+fn resolve_node(path: &str) -> Option<Node> {
+    tree::resolve(&KernelModel::now(), path)
 }
 
-/// `<tgid>/task` → the group's thread ids, if `path` names one.
-fn task_dir(path: &str) -> Option<Vec<Pid>> {
-    let tgid: Pid = path.strip_suffix("/task")?.parse().ok()?;
-    let members = task_members(tgid);
-    (!members.is_empty()).then_some(members)
+/// The longest canonical spelling is `4294967295/fd/4294967295` (24 bytes).
+const CANONICAL_MAX: usize = 32;
+
+/// `node`'s canonical spelling into `buf`; returns its length.
+fn write_canonical(node: Node, buf: &mut [u8; CANONICAL_MAX]) -> usize {
+    let mut pos = 0;
+    let _ = node.write_canonical(&mut akuma_primitives::console::FmtBuf { buf, pos: &mut pos });
+    pos
 }
 
-/// [`resolve_self`]'s first half: `self/` → the caller's pid.
-fn resolve_self_only(path: &str) -> alloc::borrow::Cow<'_, str> {
-    match path.strip_prefix("self/") {
-        Some(rest) => match akuma_exec::process::read_current_pid() {
-            Some(pid) => alloc::borrow::Cow::Owned(format!("{pid}/{rest}")),
-            // No current process (kernel thread): leave it alone and let the
-            // caller's normal not-found path report it.
-            None => alloc::borrow::Cow::Borrowed(path),
-        },
-        None => alloc::borrow::Cow::Borrowed(path),
+/// A node's canonical spelling, or the path as given when it resolves to
+/// nothing — so a renderer that parses paths sees `self/` and
+/// `<tgid>/task/<tid>/` folded to `<pid>/`, and an unknown path still reaches
+/// its own not-found answer. On the stack; the old `resolve_self` allocated a
+/// `String` per call.
+enum Canonical<'a> {
+    Stack([u8; CANONICAL_MAX], usize),
+    Given(&'a str),
+}
+
+impl Canonical<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Canonical::Stack(buf, len) => core::str::from_utf8(&buf[..*len]).unwrap_or(""),
+            Canonical::Given(s) => s,
+        }
     }
+}
+
+fn canonical(path: &str) -> Canonical<'_> {
+    let path = path.trim_matches('/');
+    match resolve_node(path) {
+        Some(node) => {
+            let mut buf = [0u8; CANONICAL_MAX];
+            let len = write_canonical(node, &mut buf);
+            Canonical::Stack(buf, len)
+        }
+        None => Canonical::Given(path),
+    }
+}
+
+/// A stable inode per node. Hashes the canonical spelling, so `self/x` and
+/// `<pid>/x` share one (they are one node, as on Linux), and mixes in the
+/// thread-group id for a thread view, so `<tgid>/task/<tgid>` is **not** the
+/// inode of its own ancestor `<tgid>` — `find` and `rg --follow` read an
+/// ancestor's `(st_dev, st_ino)` reappearing below it as a filesystem loop.
+/// The old hash was of the aliased path, which made it exactly that.
+fn node_inode(node: Node) -> u64 {
+    let mut buf = [0u8; CANONICAL_MAX];
+    let len = write_canonical(node, &mut buf);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |b: u8| {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    for &b in &buf[..len] {
+        mix(b);
+    }
+    let thread_of = match node {
+        Node::Pid(v) | Node::PidFile(v, _) | Node::FdDir(v) | Node::Fd(v, _) => v.thread_of,
+        _ => None,
+    };
+    if let Some(tgid) = thread_of {
+        mix(b'@');
+        for b in tgid.to_le_bytes() {
+            mix(b);
+        }
+    }
+    h
 }
 
 /// The box the calling process belongs to; 0 (the host) when there is no current
@@ -533,18 +685,6 @@ impl ProcFilesystem {
         Ok((pid, fd_num))
     }
 
-    /// Parse path to get just the PID (for /<pid> or /<pid>/fd)
-    fn parse_pid_path(path: &str) -> Result<Pid, FsError> {
-        let path = path.trim_start_matches('/');
-        let parts: Vec<&str> = path.split('/').collect();
-
-        if parts.is_empty() || parts[0].is_empty() {
-            return Err(FsError::NotFound);
-        }
-
-        parts[0].parse().map_err(|_| FsError::NotFound)
-    }
-
     /// Whether `viewer_box_id` may see process `pid` at all.
     ///
     /// Box 0 (the host) sees every process; a box sees only its own. This
@@ -565,438 +705,128 @@ impl ProcFilesystem {
     const OOM_FILES: [&'static str; 3] = ["oom_score_adj", "oom_adj", "oom_score"];
 
     /// `metadata` before ownership is applied — see `Filesystem::metadata`
-    /// below.
-    fn metadata_unowned(path: &str) -> Result<Metadata, FsError> {
-        let path = resolve_self(path.trim_matches('/'));
-        let path = path.as_ref();
-
-        let inode = {
-            let mut h: u64 = 0xcbf29ce484222325;
-            for b in path.bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            h
+    /// below. The node has already been resolved, so existence and the box
+    /// rule are settled; this only measures it.
+    ///
+    /// Sizes are fresh renders into stack buffers where the file is small (a
+    /// `/proc` file's length is a property of the moment, and a reader that
+    /// trusts `st_size` truncates on a stale one). `cmdline`, `status`,
+    /// `maps` and `statm` still render through their `Vec`/`String`
+    /// renderers to be measured — unchanged from before, and the one
+    /// remaining allocation on this path.
+    fn metadata_of(node: Node) -> Result<Metadata, FsError> {
+        let inode = node_inode(node);
+        let meta = |mode: u32, size: u64, links: Option<u32>| Metadata {
+            is_dir: mode & 0o170000 == 0o040000,
+            size,
+            inode,
+            mode,
+            created: None,
+            modified: None,
+            accessed: None,
+            links,
+            uid: 0,
+            gid: 0,
         };
+        const DIR: u32 = 0o40555;
+        const RO: u32 = 0o100444;
+        const RW: u32 = 0o100644;
+        const LINK: u32 = 0o120_777;
 
-        // `<tgid>/task`: a directory whose link count is `2 + threads`, as on
-        // Linux — Chromium reads "single-threaded" off `st_nlink == 3`.
-        if let Some(members) = task_dir(path) {
-            let tgid: Pid = path.strip_suffix("/task").and_then(|p| p.parse().ok()).unwrap_or(0);
-            if !Self::process_visible(tgid, caller_box_id()) {
-                return Err(FsError::NotFound);
+        Ok(match node {
+            Node::Root | Node::NetDir | Node::SysvipcDir | Node::Pid(_) | Node::FdDir(_) => {
+                meta(DIR, 0, None)
             }
-            return Ok(Metadata {
-                is_dir: true,
-                size: 0,
-                inode,
-                mode: 0o40555,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: Some(2 + members.len() as u32),
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if path.is_empty() {
-            return Ok(Metadata {
-                is_dir: true,
-                size: 0,
-                inode,
-                mode: 0o40555,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if path == "dac" {
-            if caller_box_id() != 0 {
-                return Err(FsError::NotFound);
+            // A link count of `2 + threads`, as on Linux — Chromium reads
+            // "single-threaded" off `st_nlink == 3`.
+            Node::TaskDir(tgid) => {
+                let threads = tree::live_member_count(&KernelModel::now(), tgid) as u32;
+                meta(DIR, 0, Some(2 + threads))
             }
-            return Ok(Metadata {
-                is_dir: false,
-                size: 2,
-                inode,
-                mode: 0o100644,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if path == "boxes" || path == "cores" {
-            if caller_box_id() != 0 {
-                return Err(FsError::NotFound);
+            // A symlink's size is its target's length.
+            Node::SelfLink => {
+                let tgid = KernelModel::now().current_tgid.unwrap_or(0);
+                let mut digits = [0u8; 10];
+                let mut pos = 0;
+                let _ = write!(
+                    akuma_primitives::console::FmtBuf { buf: &mut digits, pos: &mut pos },
+                    "{tgid}"
+                );
+                meta(LINK, pos as u64, None)
             }
-            return Ok(Metadata {
-                is_dir: false,
-                size: 0,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if path == "mounts" || path == "filesystems" {
-            // Size without allocating: render into a stack buffer and take the
-            // byte count (the Vec-returning `mounts_bytes` is for the read
-            // path only — `metadata` must not build the whole listing).
-            let size = if path == "mounts" {
-                let pid = process::current_process_shared().map(|p| p.pid);
-                let mut probe = [0u8; 2048];
-                crate::render_mounts(caller_box_id(), pid, &mut probe) as u64
-            } else {
-                0
-            };
-            return Ok(Metadata {
-                is_dir: false,
-                size,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if path == "power" && let Some(render) = crate::power_renderer() {
-            let mut scratch = [0u8; 768];
-            let size = render(&mut scratch).min(scratch.len()) as u64;
-            return Ok(Metadata {
-                is_dir: false,
-                size,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — sized by
-        // rendering into a stack buffer, same as `mounts` above.
-        if path == "cpuinfo" {
-            return Ok(Metadata {
-                is_dir: false,
-                size: cpuinfo_len() as u64,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-        if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
-            let mut scratch = [0u8; 1024];
-            let size = match path {
-                "meminfo" => render_meminfo(&mut scratch),
-                "stat" => render_stat_system(&mut scratch),
-                "uptime" => render_uptime(&mut scratch),
-                _ => render_loadavg(&mut scratch),
-            } as u64;
-            return Ok(Metadata {
-                is_dir: false,
-                size,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        // <pid>/mounts — same visibility rule as <pid>/status; the size probe
-        // renders into a stack buffer, no allocation.
-        {
-            let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() == 2 && parts[1] == "mounts"
-                && let Ok(pid) = parts[0].parse::<Pid>() {
-                    if !Self::process_visible(pid, caller_box_id()) {
-                        return Err(FsError::NotFound);
-                    }
+            Node::Global(g) => match g {
+                tree::Global::Dac => meta(RW, 2, None),
+                tree::Global::Boxes | tree::Global::Cores | tree::Global::Filesystems => {
+                    meta(RO, 0, None)
+                }
+                tree::Global::Mounts => {
+                    let pid = process::current_process_shared().map(|p| p.pid);
                     let mut probe = [0u8; 2048];
-                    let size = crate::render_mounts(caller_box_id(), Some(pid), &mut probe) as u64;
-                    return Ok(Metadata {
-                        is_dir: false,
-                        size,
-                        inode,
-                        mode: 0o100444,
-                        created: None,
-                        modified: None,
-                        accessed: None,
-                        links: None,
-                        uid: 0,
-                        gid: 0,
+                    meta(RO, crate::render_mounts(caller_box_id(), pid, &mut probe) as u64, None)
+                }
+                tree::Global::Power => {
+                    let size = crate::power_renderer().map_or(0, |render| {
+                        let mut scratch = [0u8; 768];
+                        render(&mut scratch).min(scratch.len())
                     });
+                    meta(RO, size as u64, None)
                 }
-        }
-
-        // <pid>/maps and <pid>/statm — the size is a fresh render, for the same
-        // reason `<pid>/mounts` above measures itself: a `/proc` file's length
-        // is a property of the moment, and a reader that trusts `st_size`
-        // truncates on a stale one.
-        {
-            let parts: Vec<&str> = path.split('/').collect();
-            if let Some(pid) = Self::pid_oom_file(path) {
-                if !Self::oom_visible(pid) {
-                    return Err(FsError::NotFound);
+                tree::Global::Cpuinfo => meta(RO, cpuinfo_len() as u64, None),
+                tree::Global::Meminfo | tree::Global::Stat | tree::Global::Uptime | tree::Global::Loadavg => {
+                    let mut scratch = [0u8; 1024];
+                    let size = match g {
+                        tree::Global::Meminfo => render_meminfo(&mut scratch),
+                        tree::Global::Stat => render_stat_system(&mut scratch),
+                        tree::Global::Uptime => render_uptime(&mut scratch),
+                        _ => render_loadavg(&mut scratch),
+                    };
+                    meta(RO, size as u64, None)
                 }
-                return Ok(Metadata {
-                    is_dir: false,
-                    size: 2,
-                    inode,
-                    mode: 0o100644,
-                    created: None,
-                    modified: None,
-                    accessed: None,
-                    links: None,
-                    uid: 0,
-                    gid: 0,
-                });
-            }
-            if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm")
-                && let Ok(pid) = parts[0].parse::<Pid>() {
-                    let data = pid_address_space_file(pid, parts[1]).ok_or(FsError::NotFound)?;
-                    return Ok(Metadata {
-                        is_dir: false,
-                        size: data.len() as u64,
-                        inode,
-                        mode: 0o100444,
-                        created: None,
-                        modified: None,
-                        accessed: None,
-                        links: None,
-                        uid: 0,
-                        gid: 0,
-                    });
+            },
+            Node::Net(_) | Node::SysvipcMsg => meta(RO, 0, None),
+            Node::PidFile(v, f) => match f {
+                PidFile::Mounts => {
+                    let mut probe = [0u8; 2048];
+                    let size = crate::render_mounts(caller_box_id(), Some(v.pid), &mut probe);
+                    meta(RO, size as u64, None)
                 }
-        }
-
-        // <pid>/exe — a symlink, and `lstat` is how `ls -l` learns that before
-        // it asks `readlink`. `size` is the target's length, which is what
-        // Linux reports for a symlink and what a caller sizing a buffer reads.
-        {
-            let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() == 2 && parts[1] == "exe"
-                && let Ok(pid) = parts[0].parse::<Pid>() {
-                    if !Self::process_visible(pid, caller_box_id()) {
-                        return Err(FsError::NotFound);
-                    }
-                    let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
-                    return Ok(Metadata {
-                        is_dir: false,
-                        size: proc.image_exe().len() as u64,
-                        inode,
-                        mode: 0o120_777,
-                        created: None,
-                        modified: None,
-                        accessed: None,
-                        links: None,
-                        uid: 0,
-                        gid: 0,
-                    });
+                PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::OomScore => meta(RW, 2, None),
+                PidFile::Maps | PidFile::Statm => {
+                    let data = pid_address_space_file(v.pid, f.name()).ok_or(FsError::NotFound)?;
+                    meta(RO, data.len() as u64, None)
                 }
-        }
-
-        if path == "net" {
-            return Ok(Metadata {
-                is_dir: true,
-                size: 0,
-                inode,
-                mode: 0o40555,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if path == "net/tcp" || path == "net/udp" || path == "net/dev" {
-            return Ok(Metadata {
-                is_dir: false,
-                size: 0,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if crate::cfg_proc_sysvipc_enabled() && path == "sysvipc" {
-            return Ok(Metadata {
-                is_dir: true,
-                size: 0,
-                inode,
-                mode: 0o40555,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        if crate::cfg_proc_sysvipc_enabled() && path == "sysvipc/msg" {
-            return Ok(Metadata {
-                is_dir: false,
-                size: 0,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        // Try fd path first
-        if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
-            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
-            let size = match fd_num {
-                0 => proc.stdin.lock().len() as u64,
-                1 => proc.stdout.lock().len() as u64,
-                _ => {
-                    if proc.get_fd(fd_num).is_none() { return Err(FsError::NotFound); }
-                    0
+                PidFile::Exe => {
+                    let proc = process::lookup_process_shared(v.pid).ok_or(FsError::NotFound)?;
+                    meta(LINK, proc.image_exe().len() as u64, None)
                 }
-            };
-            return Ok(Metadata {
-                is_dir: false,
-                size,
-                inode,
-                mode: 0o100444,
-                created: None,
-                modified: None,
-                accessed: None,
-                links: None,
-                uid: 0,
-                gid: 0,
-            });
-        }
-
-        // Try pid or pid/fd path
-        if let Ok(pid) = Self::parse_pid_path(path) {
-            let parts: Vec<&str> = path.split('/').collect();
-            // <pid>/syscalls
-            if parts.len() == 2 && parts[1] == "syscalls" && crate::cfg_proc_syscall_log_enabled() {
-                if akuma_syscalls_log::get_formatted(pid, caller_box_id()).is_some() {
-                    return Ok(Metadata {
-                        is_dir: false,
-                        size: 0,
-                        inode,
-                        mode: 0o100444,
-                        created: None,
-                        modified: None,
-                        accessed: None,
-                        links: None,
-                        uid: 0,
-                        gid: 0,
-                    });
+                PidFile::Syscalls => meta(RO, 0, None),
+                PidFile::Cmdline | PidFile::Status | PidFile::Stat => {
+                    let proc = process::lookup_process_shared(v.pid).ok_or(FsError::NotFound)?;
+                    let size = match f {
+                        PidFile::Cmdline => proc_cmdline_bytes(proc).len(),
+                        PidFile::Stat => {
+                            let mut stat_buf = [0u8; 256];
+                            render_pid_stat(proc, &mut stat_buf)
+                        }
+                        _ => proc_status_text(proc).len(),
+                    };
+                    meta(RO, size as u64, None)
                 }
-                return Err(FsError::NotFound);
-            }
-            // <pid>/cmdline and <pid>/status
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
-                let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
-                let current_box_id =
-                    akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
-                if current_box_id != 0 && proc.box_id != current_box_id {
-                    return Err(FsError::NotFound);
-                }
-                let size = match parts[1] {
-                    "cmdline" => proc_cmdline_bytes(proc).len() as u64,
-                    "stat" => {
-                        let mut stat_buf = [0u8; 256];
-                        render_pid_stat(proc, &mut stat_buf) as u64
-                    }
-                    _ => proc_status_text(proc).len() as u64,
+            },
+            // Listed and `lstat`ed as a symlink (the syscall layer asks
+            // `is_symlink` first); a followed `stat` that could not chase it —
+            // a pipe, a socket, the stdio buffers — lands here and reports the
+            // buffer as a regular file, as it always has.
+            Node::Fd(v, fd) => {
+                let proc = process::lookup_process_shared(v.pid).ok_or(FsError::NotFound)?;
+                let size = match fd {
+                    0 => proc.stdin.lock().len() as u64,
+                    1 => proc.stdout.lock().len() as u64,
+                    _ => 0,
                 };
-                return Ok(Metadata {
-                    is_dir: false,
-                    size,
-                    inode,
-                    mode: 0o100444,
-                    created: None,
-                    modified: None,
-                    accessed: None,
-                    links: None,
-                    uid: 0,
-                    gid: 0,
-                });
+                meta(RO, size, None)
             }
-            let pid_exists = Self::process_visible(pid, caller_box_id())
-                || (crate::cfg_proc_syscall_log_enabled()
-                    && akuma_syscalls_log::get_formatted(pid, caller_box_id()).is_some());
-            if !pid_exists {
-                return Err(FsError::NotFound);
-            }
-            // **Only the two real directories.** `parse_pid_path` accepts
-            // anything whose first component parses as a pid, so this
-            // fall-through used to answer `Ok(is_dir: true)` for
-            // `<pid>/<anything>` — `stat("/proc/1/smaps")` reported a
-            // *directory* for a file this filesystem's own `exists` and
-            // `read_at` both deny. A confident wrong answer, and the exact
-            // shape the amd64 kernel's `proc_consistency_check` was written
-            // after: `open`, `stat` and `access` must agree about what exists,
-            // and here `stat` disagreed with both.
-            //
-            // Found 2026-09-10 from the other end: registering a process for
-            // amd64's boot row made `/proc/self/smaps` — a path nothing serves
-            // — pass all three checks, because `stat` said "directory" and the
-            // caller's `open` then took the directory branch.
-            if parts.len() == 1 || (parts.len() == 2 && parts[1] == "fd") {
-                return Ok(Metadata {
-                    is_dir: true,
-                    size: 0,
-                    inode,
-                    mode: 0o40555,
-                    created: None,
-                    modified: None,
-                    accessed: None,
-                    links: None,
-                    uid: 0,
-                    gid: 0,
-                });
-            }
-            return Err(FsError::NotFound);
-        }
-
-        Err(FsError::NotFound)
+        })
     }
 
     /// A write to `/proc/dac`: `1` turns permission enforcement on, `0` off.
@@ -1171,296 +1001,34 @@ impl Filesystem for ProcFilesystem {
         "proc"
     }
 
+    /// The listing is the tree's (`akuma_procfs::tree::list`): every name it
+    /// emits resolves, to the kind it is emitted with, which the host
+    /// simulation checks across the whole tree. `.` and `..` are not listed
+    /// here — the `getdents64` arm adds them for every filesystem.
+    ///
+    /// Allocates the `Vec<DirEntry>` the trait returns and a `String` per
+    /// name; nothing under a lock (`KernelModel` collects pids and descriptor
+    /// numbers before it calls back).
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        let path = resolve_self(path.trim_matches('/'));
-        let path = path.as_ref();
-        let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
-
-        if path.is_empty() {
-            // Root: list all process PIDs as directories, filtered by box_id
-            let processes = process::list_processes();
-            let mut entries: Vec<DirEntry> = processes
-                .into_iter()
-                .filter(|p| {
-                    // Box 0 (Host) sees everything. Box N only sees its own.
-                    if current_box_id == 0 {
-                        true
-                    } else if let Some(proc) = process::lookup_process_shared(p.pid) {
-                        proc.box_id == current_box_id
-                    } else {
-                        false
-                    }
-                })
-                .map(|p| DirEntry {
-                    name: format!("{}", p.pid),
-                    is_dir: true,
-                    is_symlink: false,
-                    size: 0,
-                })
-                .collect();
-
-            // Host context only: add "boxes" virtual file
-            if current_box_id == 0 {
-                entries.push(DirEntry {
-                    name: String::from("boxes"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-                // Multikernel: per-core state table (one row per CPU; see read_file).
-                entries.push(DirEntry {
-                    name: String::from("cores"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-                // The permission-enforcement switch (see `read_file`).
-                entries.push(DirEntry {
-                    name: String::from("dac"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 2,
-                });
-            }
-
-            // Everyone sees "net" directory
+        let mut entries = Vec::new();
+        tree::list(&KernelModel::now(), path, &mut |name, kind| {
             entries.push(DirEntry {
-                name: String::from("net"),
-                is_dir: true,
-                is_symlink: false,
+                name: String::from(name),
+                is_dir: kind == Kind::Dir,
+                is_symlink: kind == Kind::Symlink,
                 size: 0,
             });
-
-            // Mount listing + supported filesystems. Rendered per-viewer: a
-            // boxed process sees its own namespace's mounts with no source
-            // column (crate::render_mounts).
-            entries.push(DirEntry {
-                name: String::from("mounts"),
-                is_dir: false,
-                is_symlink: false,
-                size: 0,
-            });
-            entries.push(DirEntry {
-                name: String::from("filesystems"),
-                is_dir: false,
-                is_symlink: false,
-                size: 0,
-            });
-
-            // System-wide stats — `free`/`top` (busybox) read these; visible
-            // to every box, same as `mounts`/`filesystems` above.
-            for name in ["meminfo", "stat", "uptime", "loadavg", "cpuinfo"] {
-                entries.push(DirEntry {
-                    name: String::from(name),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-            }
-
-            // Battery and AC, where the kernel has a source for them.
-            if crate::power_renderer().is_some() {
-                entries.push(DirEntry {
-                    name: String::from("power"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-            }
-
-            // Add recently-exited PIDs that still have retained syscall logs.
-            // This runs AFTER the box filter above and must repeat it — appending
-            // the unfiltered list here is what put every host pid into a
-            // container's `ls /proc`, while `ps` looked correct because it stats
-            // each entry and the foreign ones are refused.
-            if crate::cfg_proc_syscall_log_enabled() {
-                let logged_pids = akuma_syscalls_log::list_pids_with_logs(current_box_id);
-                let live_pids: alloc::collections::BTreeSet<u32> = entries.iter()
-                    .filter_map(|e| e.name.parse::<u32>().ok())
-                    .collect();
-                for pid in logged_pids {
-                    if !live_pids.contains(&pid) {
-                        entries.push(DirEntry {
-                            name: format!("{pid}"),
-                            is_dir: true,
-                            is_symlink: false,
-                            size: 0,
-                        });
-                    }
-                }
-            }
-
-            // sysvipc directory
-            if crate::cfg_proc_sysvipc_enabled() {
-                entries.push(DirEntry {
-                    name: String::from("sysvipc"),
-                    is_dir: true,
-                    is_symlink: false,
-                    size: 0,
-                });
-            }
-
-            return Ok(entries);
-        }
-
-        if let Some(members) = task_dir(path) {
-            let tgid: Pid = path.strip_suffix("/task").and_then(|p| p.parse().ok()).unwrap_or(0);
-            if !Self::process_visible(tgid, current_box_id) {
-                return Err(FsError::NotFound);
-            }
-            return Ok(members
-                .into_iter()
-                .map(|tid| DirEntry { name: format!("{tid}"), is_dir: true, is_symlink: false, size: 0 })
-                .collect());
-        }
-
-        let parts: Vec<&str> = path.split('/').collect();
-
-        if parts.len() == 1 {
-            if parts[0] == "net" {
-                return Ok(alloc::vec![
-                    DirEntry { name: String::from("dev"), is_dir: false, is_symlink: false, size: 0 },
-                    DirEntry { name: String::from("tcp"), is_dir: false, is_symlink: false, size: 0 },
-                    DirEntry { name: String::from("udp"), is_dir: false, is_symlink: false, size: 0 },
-                ]);
-            }
-
-            if parts[0] == "sysvipc" && crate::cfg_proc_sysvipc_enabled() {
-                return Ok(alloc::vec![
-                    DirEntry { name: String::from("msg"), is_dir: false, is_symlink: false, size: 0 },
-                ]);
-            }
-
-            // /<pid> - list "fd" directory and optionally "syscalls"
-            let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
-            // Process may have exited but still have a retained log
-            let pid_has_log = crate::cfg_proc_syscall_log_enabled()
-                && akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
-            if !Self::process_visible(pid, current_box_id) && !pid_has_log {
-                return Err(FsError::NotFound);
-            }
-            let mut pid_entries = alloc::vec![];
-            if Self::process_visible(pid, current_box_id) {
-                pid_entries.push(DirEntry {
-                    name: String::from("fd"),
-                    is_dir: true,
-                    is_symlink: false,
-                    size: 0,
-                });
-                if !task_members(pid).is_empty() {
-                    pid_entries.push(DirEntry {
-                        name: String::from("task"),
-                        is_dir: true,
-                        is_symlink: false,
-                        size: 0,
-                    });
-                }
-                pid_entries.push(DirEntry {
-                    name: String::from("cmdline"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-                pid_entries.push(DirEntry {
-                    name: String::from("status"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-                pid_entries.push(DirEntry {
-                    name: String::from("stat"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-                pid_entries.push(DirEntry {
-                    name: String::from("mounts"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-                // A symlink, like `fd/<n>`: `ls -l` prints the target and a
-                // reader that follows it opens the binary.
-                pid_entries.push(DirEntry {
-                    name: String::from("exe"),
-                    is_dir: false,
-                    is_symlink: true,
-                    size: 0,
-                });
-                // **Only names that also `stat`.** Advertising one that does not
-                // is how `ls /proc/<pid>` ends up printing `No such file or
-                // directory` for its own listing, so these two appear exactly
-                // when the address-space hook can render them.
-                for name in Self::OOM_FILES {
-                    pid_entries.push(DirEntry {
-                        name: String::from(name),
-                        is_dir: false,
-                        is_symlink: false,
-                        size: 0,
-                    });
-                }
-                for name in ["maps", "statm"] {
-                    if pid_address_space_file(pid, name).is_some() {
-                        pid_entries.push(DirEntry {
-                            name: String::from(name),
-                            is_dir: false,
-                            is_symlink: false,
-                            size: 0,
-                        });
-                    }
-                }
-            }
-            if crate::cfg_proc_syscall_log_enabled()
-                && akuma_syscalls_log::get_formatted(pid, current_box_id).is_some()
-            {
-                pid_entries.push(DirEntry {
-                    name: String::from("syscalls"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: 0,
-                });
-            }
-            return Ok(pid_entries);
-        }
-
-        if parts.len() == 2 && parts[1] == "fd" {
-            // /<pid>/fd - list all open file descriptors
-            let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
-            if !Self::process_visible(pid, current_box_id) {
-                return Err(FsError::NotFound);
-            }
-
-            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
-            let mut entries = alloc::vec![];
-            // Always include std fds (Stdin/Stdout/Stderr are not in the BTreeMap)
-            for fd_num in [0u32, 1, 2] {
-                entries.push(DirEntry {
-                    name: format!("{fd_num}"),
-                    is_dir: false,
-                    is_symlink: true,
-                    size: 0,
-                });
-            }
-            // Add all allocated fds from the table
-            for &fd_num in proc.fds.table.lock().keys() {
-                if fd_num > 2 {
-                    entries.push(DirEntry {
-                        name: format!("{fd_num}"),
-                        is_dir: false,
-                        is_symlink: true,
-                        size: 0,
-                    });
-                }
-            }
-            return Ok(entries);
-        }
-
-        Err(FsError::NotFound)
+        })
+        .map_err(|e| match e {
+            tree::ListError::NotFound => FsError::NotFound,
+            tree::ListError::NotADirectory => FsError::NotADirectory,
+        })?;
+        Ok(entries)
     }
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
-        let path = resolve_self(path.trim_start_matches('/'));
-        let path = path.as_ref();
+        let canon = canonical(path);
+        let path = canon.as_str();
 
         // Handle virtual files first (boxes, cores, net/tcp, sysvipc/msg,
         // mounts, filesystems, <pid>/syscalls, etc.). This list must name every
@@ -1677,8 +1245,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        let path = resolve_self(path.trim_start_matches('/'));
-        let path = path.as_ref();
+        let canon = canonical(path);
+        let path = canon.as_str();
         let current_proc = akuma_exec::process::current_process_shared();
         let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
@@ -1978,102 +1546,16 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn exists(&self, path: &str) -> bool {
-        let path = resolve_self(path.trim_matches('/'));
-        let path = path.as_ref();
-        let current_box_id = caller_box_id();
-
-        if path.is_empty() {
-            return true; // Root always exists
-        }
-
-        if let Some(tgid) = path.strip_suffix("/task").and_then(|p| p.parse::<Pid>().ok()) {
-            return task_dir(path).is_some() && Self::process_visible(tgid, current_box_id);
-        }
-
-        if path == "boxes" || path == "cores" || path == "dac" {
-            return current_box_id == 0;
-        }
-
-        if path == "power" {
-            return crate::power_renderer().is_some();
-        }
-
-        if path == "mounts" || path == "filesystems"
-            || path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg"
-            || path == "cpuinfo" {
-            return true;
-        }
-
-        // <pid>/mounts — same visibility rule as <pid>/status; no render
-        // needed to answer an existence question.
-        {
-            let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() == 2 && parts[1] == "mounts"
-                && let Ok(pid) = parts[0].parse::<Pid>() {
-                    return Self::process_visible(pid, caller_box_id());
-            }
-        }
-
-        if path == "net" || path == "net/tcp" || path == "net/udp" || path == "net/dev" {
-            return true;
-        }
-
-        if crate::cfg_proc_sysvipc_enabled() && (path == "sysvipc" || path == "sysvipc/msg") {
-            return true;
-        }
-
-        // Try to parse as fd path first
-        if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
-            if !Self::process_visible(pid, current_box_id) { return false; }
-            if fd_num <= 1 { return true; }
-            return process::lookup_process_shared(pid)
-                .is_some_and(|p| p.get_fd(fd_num).is_some());
-        }
-
-        // Try to parse as pid path
-        if let Ok(pid) = Self::parse_pid_path(path) {
-            let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() == 1 {
-                if Self::process_visible(pid, current_box_id) { return true; }
-                if crate::cfg_proc_syscall_log_enabled() {
-                    return akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
-                }
-                return false;
-            }
-            if parts.len() == 2 && parts[1] == "fd" {
-                return Self::process_visible(pid, current_box_id);
-            }
-            if parts.len() == 2
-                && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat"
-                    || parts[1] == "exe")
-            {
-                return Self::process_visible(pid, current_box_id);
-            }
-            // Only when a kernel registered a walk — the two files exist
-            // exactly when they can be rendered, which is what keeps `open`,
-            // `stat` and `access` agreeing about them.
-            if parts.len() == 2 && Self::OOM_FILES.contains(&parts[1]) {
-                return Self::process_visible(pid, current_box_id);
-            }
-            if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm") {
-                return pid_address_space_file(pid, parts[1]).is_some();
-            }
-            if parts.len() == 2 && parts[1] == "syscalls" && crate::cfg_proc_syscall_log_enabled() {
-                return akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
-            }
-        }
-
-        false
+        resolve_node(path).is_some()
     }
 
     /// Every entry under `<pid>/` belongs to that process's uid and gid, as on
     /// Linux — busybox `ps` reads a process's user off `stat("/proc/<pid>")`.
     /// Applied once here rather than in each of `metadata_unowned`'s arms.
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
-        let mut meta = Self::metadata_unowned(path)?;
-        let rel = resolve_self(path.trim_matches('/'));
-        let first = rel.split('/').next().unwrap_or("");
-        if let Ok(pid) = first.parse::<Pid>()
+        let node = resolve_node(path).ok_or(FsError::NotFound)?;
+        let mut meta = Self::metadata_of(node)?;
+        if let Some(pid) = node.owner()
             && let Some(p) = process::lookup_process_shared(pid)
         {
             let c = p.creds.get();
@@ -2092,95 +1574,45 @@ impl Filesystem for ProcFilesystem {
         })
     }
 
+    /// The three symlinks the tree has: `self`, `<pid>/exe` and
+    /// `<pid>/fd/<n>` — through `self/` and `<tgid>/task/<tid>/` alike, since
+    /// the tree resolved the path (and applied the box rule) first.
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {
-        let path = path.trim_start_matches('/');
-
-        // `/proc/self` itself: Linux answers with the caller's thread-group id.
-        // `is_symlink` has always said yes, but nothing answered the read, so a
-        // program that opens `/proc/self` as a directory (`open(…, O_PATH |
-        // O_DIRECTORY)`, which is how procps-ng's `ps` starts) was told
-        // `ENOENT` and printed "Error, do this: mount -t proc proc /proc".
-        if path == "self" {
-            let tgid = process::current_process_shared().map(|p| p.tgid).ok_or(FsError::NotFound)?;
-            return Ok(format!("{tgid}"));
-        }
-
-        // Handle "self/fd/<n>" -> resolve to current process
-        if let Some(rest) = path.strip_prefix("self/") {
-            let pid = process::current_process_shared().map(|p| p.pid).ok_or(FsError::NotFound)?;
-            let new_path = format!("{pid}/{rest}");
-            return self.read_symlink(&new_path);
-        }
-
-        // Handle "<pid>/fd/<n>" -> symlink to the file path.
-        // Only return a path for File fds (resolvable filesystem paths).
-        // For other fd types (pipes, sockets, etc.) return Err so that resolve_symlinks
-        // does NOT chase the virtual description string (e.g. "pipe:[5]" is not a real path).
-        // readlinkat uses proc_fd_description() to get the description string instead.
-        let parts: Vec<&str> = path.split('/').collect();
-
-        // `<pid>/exe` — the binary the process is running, as a magic symlink.
-        //
-        // It lived in `akuma-syscalls-glue` as two `if path == "/proc/self/exe"`
-        // interceptions, one in `sys_openat` and one in `sys_readlinkat`, ahead
-        // of the VFS: the syscall layer patching a gap in this filesystem. The
-        // gap is closed here instead, and closing it generalises the answer —
-        // the interceptions could only ever describe **self**, where this
-        // serves the path for any pid the caller can see, which is what
-        // `/proc/<pid>/exe` means on Linux.
-        if parts.len() == 2 && parts[1] == "exe" {
-            let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
-            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
-            if !Self::process_visible(pid, caller_box_id()) {
-                return Err(FsError::NotFound);
+        match resolve_node(path).ok_or(FsError::NotFound)? {
+            // `/proc/self` itself: Linux answers with the caller's thread-group
+            // id. Nothing answered the read once, so a program that opens
+            // `/proc/self` as a directory (`open(…, O_PATH | O_DIRECTORY)`,
+            // which is how procps-ng's `ps` starts) was told `ENOENT` and
+            // printed "Error, do this: mount -t proc proc /proc".
+            Node::SelfLink => {
+                let tgid = KernelModel::now().current_tgid.ok_or(FsError::NotFound)?;
+                Ok(format!("{tgid}"))
             }
-            return Ok(proc.image_exe());
-        }
-
-        if parts.len() == 3 && parts[1] == "fd" {
-            let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
-            let fd: u32 = parts[2].parse().map_err(|_| FsError::NotFound)?;
-
-            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
-            if let Some(fd_entry) = proc.get_fd(fd) {
-                use akuma_exec::process::FileDescriptor;
-                if let FileDescriptor::File(f) = fd_entry {
-                    return Ok(f.path);
+            // `<pid>/exe` — the binary the process is running, as a magic
+            // symlink. It lived in `akuma-syscalls-glue` as two
+            // `/proc/self/exe` interceptions ahead of the VFS, which could only
+            // ever describe **self**; this serves any pid the caller can see.
+            Node::PidFile(v, PidFile::Exe) => {
+                let proc = process::lookup_process_shared(v.pid).ok_or(FsError::NotFound)?;
+                Ok(proc.image_exe())
+            }
+            // `<pid>/fd/<n>`: a path only for a `File` descriptor. A pipe or
+            // socket answers `NotFound` so `resolve_symlinks` does not chase
+            // "pipe:[5]" as if it were a path; `readlinkat` asks
+            // `proc_fd_description` for those strings instead.
+            Node::Fd(v, fd) => {
+                let proc = process::lookup_process_shared(v.pid).ok_or(FsError::NotFound)?;
+                match proc.get_fd(fd) {
+                    Some(akuma_exec::process::FileDescriptor::File(f)) => Ok(f.path),
+                    _ => Err(FsError::NotFound),
                 }
-                // Non-file fds: not a resolvable symlink target
-                return Err(FsError::NotFound);
             }
-            return Err(FsError::NotFound);
+            _ => Err(FsError::NotFound),
         }
-
-        Err(FsError::NotFound)
     }
 
     fn is_symlink(&self, path: &str) -> bool {
-        let path = path.trim_start_matches('/');
-
-        // "self" is a symlink to the current PID
-        if path == "self" {
-            return true;
-        }
-
-        // "self/fd/<n>" and "<pid>/fd/<n>" are symlinks
-        if let Some(rest) = path.strip_prefix("self/")
-            && rest.starts_with("fd/") {
-                let fd_part = &rest[3..];
-                return fd_part.parse::<u32>().is_ok();
-            }
-
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() == 3 && parts[1] == "fd" {
-            return parts[0].parse::<Pid>().is_ok() && parts[2].parse::<u32>().is_ok();
-        }
-        // `<pid>/exe`, and `self/exe` through the rewrite above.
-        if parts.len() == 2 && parts[1] == "exe" {
-            return parts[0].parse::<Pid>().is_ok();
-        }
-
-        false
+        resolve_node(path).is_some_and(|n| n.kind() == Kind::Symlink)
     }
 }
 

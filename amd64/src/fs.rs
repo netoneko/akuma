@@ -50,23 +50,23 @@
 //!   → `FsError::ReadOnly` → `EROFS`), which the private table recorded and
 //!   never consulted.
 //!
-//! What deliberately did **not** come with it is `/proc`. `akuma-vfs-glue`
-//! carries a `ProcFilesystem`, and it renders from `akuma-exec`'s process
-//! table — which this target does not populate, so mounting it would replace
-//! `fd.rs`'s synthetic `/proc` (which reads *this* kernel's tables and works)
-//! with one that reports an empty machine. It becomes the right move in the
-//! same step that gives this target `akuma-exec` processes, not before.
+//! `/proc` did not come with it at first: `akuma-vfs-glue`'s `ProcFilesystem`
+//! renders from `akuma-exec`'s process table, which this target did not yet
+//! populate. **That changed at 5b slice 3** — every process is registered now
+//! and [`init_vfs`] mounts the shared `ProcFilesystem` at `/proc`, so both
+//! kernels serve one `/proc` (`fd.rs`'s synthetic view was deleted in 4b batch
+//! 2c). Corrected 2026-10-16; this paragraph had said the opposite since
+//! 2026-09-04 (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
 //!
-//! # What is still absent
+//! # Namespaces
 //!
-//! A path *namespace*: no per-process root, no bind mounts, no container
-//! visibility rules. The machinery is present — `akuma_vfs_glue::resolve_mount`
-//! consults `current_process_shared()?.namespace` first — but this target
-//! registers no `akuma-exec` processes, so every resolution takes the
-//! no-process fallback (`resolve_path("/", path)` against the global table),
-//! which is exactly what the private table did. That fallback is the seam: the
-//! day processes exist here, CWD and namespaces start working with no change to
-//! this file.
+//! `akuma_vfs_glue::resolve_mount` consults
+//! `current_process_shared()?.namespace` and the process's CWD and `chroot`
+//! root first, and falls back to the global table only for a caller with no
+//! registered process (the boot path, kernel threads). This paragraph used to
+//! say every resolution took that fallback because no processes were
+//! registered; that too ended at 5b, with no change to this file — which was
+//! the point of the seam.
 //!
 //! Writes are exercised (2026-09-04, `write_file`) — `fd::sys_write` on a file
 //! opened `O_CREAT`/`O_WRONLY` buffers into the descriptor's own `Vec<u8>` and

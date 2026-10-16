@@ -1,24 +1,23 @@
-//! The `/proc/<pid>` virtual-file byte formats `ps` and `top` parse.
+//! The `/proc/<pid>` virtual-file byte formats `ps` and `top` parse, and the
+//! **shape** of the `/proc` tree ([`tree`]).
 //!
-//! This is the wire layer and nothing else: every function here takes a
-//! [`ProcStat`] — five scalars and a string — and writes bytes into a caller's
-//! buffer. There is no process table, no lock, no filesystem, and deliberately
-//! no dependency that could name a `Process`.
+//! The formats are the wire layer: every renderer takes a [`ProcStat`] — five
+//! scalars and a string — and writes bytes into a caller's buffer. [`tree`]
+//! decides which names exist and what a path resolves to, over a small
+//! [`tree::ProcModel`] trait the kernel implements. Neither half has a process
+//! table, a lock or a filesystem, and the crate deliberately has no dependency
+//! that could name a `Process`.
 //!
 //! # Why this is a crate
 //!
-//! Two kernels serve `/proc` and neither can share the other's code. The
-//! AArch64 side has a full `ProcFilesystem` (`akuma-vfs-glue`) behind the VFS
-//! mount table; amd64 has no mount table at all and answers a handful of
-//! `/proc` paths straight out of `fd::sys_openat`. `akuma-vfs-glue` cannot even
-//! be *compiled* for `x86_64-unknown-none` — it reaches `akuma-exec` and
-//! `akuma-elf`, which are written against `akuma-mmu`. So the filesystem cannot
-//! move; the formats can, and the formats are the part where a divergence is
-//! both easy and invisible.
-//!
-//! This is the same seam, and the same reason, as `akuma-syscalls-net`: a
-//! read-only introspection surface whose *byte layout* is what busybox reads,
-//! shared so the two kernels cannot drift on a field offset.
+//! It was extracted (2026-09-06) when two kernels served `/proc` and could not
+//! share code: amd64 answered a handful of `/proc` paths out of
+//! `fd::sys_openat` and could not compile `akuma-vfs-glue`. Both reasons have
+//! since lapsed — amd64 mounts the shared `ProcFilesystem` (5b slice 3) — and
+//! the crate stayed because it is the part of `/proc` that can be host-tested:
+//! a field offset `ps` counts to, and (since 2026-10-16) a tree whose every
+//! listed name must resolve, which a simulation walks end to end
+//! (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
 //!
 //! # The 44-field line is the whole point
 //!
@@ -373,5 +372,9 @@ pub fn render_maps_line(
 /// 128 bytes: two 16-digit addresses, the fixed text, and the path.
 pub const MAPS_LINE_MAX: usize = 192;
 
+pub mod tree;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tree_tests;

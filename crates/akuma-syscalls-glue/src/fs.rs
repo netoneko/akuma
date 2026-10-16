@@ -3605,23 +3605,36 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
         let is_dev = akuma_vfs_glue::is_dev_dir(&f.path);
         // Every entry of `/dev/pts` is a pty slave: a character device.
         let is_pts = akuma_vfs_glue::is_pts_dir(&f.path);
-        let cache: alloc::vec::Vec<akuma_exec::process::types::DirCacheEntry> = dir_entries
+        use akuma_syscalls_linux::dirent::{DOT_ENTRIES, DT_DIR, DT_LNK, DT_REG};
+        // `.` and `..` first, for every filesystem — they are this arm's, not
+        // a `read_dir`'s (`dirent::DOT_ENTRIES`). Without them an empty
+        // directory streamed zero records: `ls -la` printed only `total 0`.
+        // The cursor below is an entry index, so they sit in the snapshot
+        // rather than being synthesised per call.
+        let dots = DOT_ENTRIES.iter().map(|&(name, d_type)| {
+            akuma_exec::process::types::DirCacheEntry { name: String::from(name), d_type }
+        });
+        let cache: alloc::vec::Vec<akuma_exec::process::types::DirCacheEntry> = dots
+            .chain(dir_entries
             .iter()
+            // A filesystem must not list them itself; if one ever does, the
+            // stream would carry them twice.
+            .filter(|e| e.name != "." && e.name != "..")
             .map(|e| akuma_exec::process::types::DirCacheEntry {
                 name: e.name.clone(),
                 d_type: if e.is_dir {
-                    4
+                    DT_DIR
                 } else if e.is_symlink {
-                    10
+                    DT_LNK
                 } else if is_pts {
                     akuma_vfs::dev::DT_CHR
                 } else {
                     match is_dev.then(|| akuma_vfs_glue::dev_node_named(&e.name)).flatten() {
                         Some(node) => node.d_type(),
-                        None => 8,
+                        None => DT_REG,
                     }
                 },
-            })
+            }))
             .collect();
         let snapshot = cache.clone();
         proc.update_fd(fd, |e| {
@@ -3636,34 +3649,27 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     if position >= entries.len() { return 0; }
 
     let mut kernel_buf = alloc::vec![0u8; size];
-    let mut written = 0;
-    let mut count = 0usize;
-    for entry in entries.iter().skip(position) {
-        let reclen = akuma_syscalls_linux::dirent::reclen(entry.name.len());
-        if written + reclen > size { break; }
-        // The record layout — offsets, the 8-byte `d_reclen` rounding, the NUL and
-        // the pad — lives in the ABI crate with host tests, not as five bare
-        // literals here. `d_ino`/`d_off` are both 1: Akuma reports no real inode
-        // number through getdents64, and nothing seeks a directory by `d_off`.
-        let ok = akuma_syscalls_linux::dirent::encode(
-            &mut kernel_buf[written..written + reclen],
-            1,
-            1,
-            entry.d_type,
-            entry.name.as_bytes(),
-        );
-        debug_assert!(ok, "dirent::reclen and dirent::encode disagree on the record size");
-        if !ok { break; }
-        written += reclen;
-        count += 1;
+    // The record layout — offsets, the 8-byte `d_reclen` rounding, the NUL and
+    // the pad — and the stop-at-the-first-misfit loop live in the ABI crate
+    // with host tests. `d_ino`/`d_off` are both 1: Akuma reports no real inode
+    // number through getdents64 (`stat` does), and nothing seeks a directory by
+    // `d_off`.
+    let (written, count) = akuma_syscalls_linux::dirent::fill(
+        entries.iter().skip(position).map(|e| (e.name.as_str(), e.d_type)),
+        1,
+        &mut kernel_buf,
+    );
+    // Entries remain and not one fit: the buffer is smaller than the next
+    // record. Linux says `EINVAL`; returning 0 here told the caller "end of
+    // directory" and silently truncated the listing.
+    if count == 0 {
+        return EINVAL;
     }
-    if count > 0 {
-        proc.update_fd(fd, |e| {
-            if let akuma_exec::process::FileDescriptor::File(file) = e {
-                file.position += count;
-            }
-        });
-    }
+    proc.update_fd(fd, |e| {
+        if let akuma_exec::process::FileDescriptor::File(file) = e {
+            file.position += count;
+        }
+    });
     if written > 0 && copy_to_user(ptr, &kernel_buf[..written]).is_err() {
         return EFAULT;
     }

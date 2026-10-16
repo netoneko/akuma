@@ -7025,30 +7025,45 @@ fn test_direntry_has_is_symlink_field() -> bool {
 
 /// Test: procfs /proc/<pid>/fd/<n> symlink resolution
 ///
-/// Bun calls readlinkat("/proc/self/fd/N") to resolve fd to path.
-/// This test verifies that procfs correctly identifies these as symlinks.
+/// Bun calls readlinkat("/proc/self/fd/N") to resolve fd to path. A name is a
+/// symlink exactly when it exists, as on Linux: since 2026-10-16 `is_symlink`
+/// asks the shared `/proc` tree (`akuma_procfs::tree`) like every other
+/// `ProcFilesystem` method. This test used to assert that `123/fd/5` — no such
+/// process — was a symlink, which is the listed-but-unresolvable shape the tree
+/// exists to rule out; it now registers a real process to ask about.
 fn test_procfs_fd_symlink_resolution() -> bool {
     console::print("\n[TEST] procfs /proc/<pid>/fd/<n> symlink resolution\n");
 
     use crate::vfs::proc::ProcFilesystem;
     use akuma_vfs::Filesystem;
 
-    let procfs = ProcFilesystem::new();
+    const PID: u32 = 7741;
+    let _proc = LazyTestProcess::new(PID);
+    let Some(p) = akuma_exec::process::lookup_process_shared(PID) else {
+        console::print("  could not register the test process\n  Result: FAIL\n");
+        return false;
+    };
+    p.set_fd(5, akuma_exec::process::FileDescriptor::DevNull);
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::process::register_thread_pid(tid, PID);
 
-    // Test is_symlink for various fd paths
+    let procfs = ProcFilesystem::new();
     let self_fd_0 = procfs.is_symlink("self/fd/0");
     let self_fd_1 = procfs.is_symlink("self/fd/1");
-    let pid_fd_5 = procfs.is_symlink("123/fd/5");
-
-    // "self" is a symlink to the current PID in Linux, our impl marks it too
+    let pid_fd_5 = procfs.is_symlink("7741/fd/5");
+    let thread_fd_5 = procfs.is_symlink("7741/task/7741/fd/5");
     let self_is_symlink = procfs.is_symlink("self");
-
-    // Non-fd paths should not be symlinks
+    // Absent names are not symlinks: a closed fd, and a pid with no process.
+    let closed_fd_6 = !procfs.is_symlink("7741/fd/6");
+    let no_such_pid = !procfs.is_symlink("123/fd/5");
     let net_not_symlink = !procfs.is_symlink("net");
 
-    let pass = self_fd_0 && self_fd_1 && pid_fd_5 && self_is_symlink && net_not_symlink;
-    crate::safe_print!(128, "  self/fd/0={} self/fd/1={} 123/fd/5={} self={} net={}\n",
-        self_fd_0, self_fd_1, pid_fd_5, self_is_symlink, !net_not_symlink);
+    akuma_exec::process::unregister_thread_pid(tid);
+
+    let pass = self_fd_0 && self_fd_1 && pid_fd_5 && thread_fd_5 && self_is_symlink
+        && closed_fd_6 && no_such_pid && net_not_symlink;
+    crate::safe_print!(160, "  self/fd/0={} self/fd/1={} fd/5={} task/fd/5={} self={} !fd/6={} !123={} !net={}\n",
+        self_fd_0, self_fd_1, pid_fd_5, thread_fd_5, self_is_symlink, closed_fd_6, no_such_pid, net_not_symlink);
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

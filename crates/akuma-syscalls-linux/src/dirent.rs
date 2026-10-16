@@ -74,6 +74,72 @@ pub fn encode(rec: &mut [u8], ino: u64, off: i64, d_type: u8, name: &[u8]) -> bo
     true
 }
 
+/// `d_type` for a directory.
+pub const DT_DIR: u8 = 4;
+/// `d_type` for a regular file.
+pub const DT_REG: u8 = 8;
+/// `d_type` for a symbolic link.
+pub const DT_LNK: u8 = 10;
+
+/// The two records every directory stream begins with on Linux, in order.
+///
+/// They belong to the `getdents64` arm, not to any filesystem: a
+/// `Filesystem::read_dir` lists children, and the arm puts these two in front
+/// of whatever it lists. Akuma emitted neither until 2026-10-16, so an empty
+/// directory read as zero records — `ls -la` printed only `total 0`, and an
+/// empty directory took **one** `getdents64` call where Linux takes two, which
+/// changes the syscall shape of every directory walker.
+pub const DOT_ENTRIES: [(&str, u8); 2] = [(".", DT_DIR), ("..", DT_DIR)];
+
+/// Encode as many of `entries` as fit into `buf`, back to back, returning
+/// `(bytes written, records written)`.
+///
+/// Stops at the first record that does not fit, so the caller resumes by
+/// skipping `records written` entries on the next call — `getdents64`'s cursor
+/// is an entry index, which is what makes a directory read with a tiny buffer
+/// produce the same names as one with a large buffer. `d_ino` and `d_off` are
+/// `ino` and `1` (Akuma reports no real inode through `getdents64`; see the
+/// arm). Writing zero records with entries left means `buf` cannot hold the
+/// next one, which the arm reports as `EINVAL`.
+pub fn fill<'a, I>(entries: I, ino: u64, buf: &mut [u8]) -> (usize, usize)
+where
+    I: IntoIterator<Item = (&'a str, u8)>,
+{
+    let mut written = 0;
+    let mut count = 0;
+    for (name, d_type) in entries {
+        let rl = reclen(name.len());
+        if written + rl > buf.len() {
+            break;
+        }
+        if !encode(&mut buf[written..written + rl], ino, 1, d_type, name.as_bytes()) {
+            break;
+        }
+        written += rl;
+        count += 1;
+    }
+    (written, count)
+}
+
+/// Walk a buffer of records as `getdents64` returned it, yielding
+/// `(d_type, name)` — what `readdir(3)` does in userspace. Stops at the first
+/// malformed record rather than reading past it.
+pub fn records(buf: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut off = 0;
+    core::iter::from_fn(move || {
+        let hdr = buf.get(off..off + D_NAME)?;
+        let rl = u16::from_ne_bytes([hdr[D_RECLEN], hdr[D_RECLEN + 1]]) as usize;
+        if rl < reclen(0) || off + rl > buf.len() {
+            return None;
+        }
+        let d_type = hdr[D_TYPE];
+        let name = &buf[off + D_NAME..off + rl];
+        let nul = name.iter().position(|&b| b == 0)?;
+        off += rl;
+        Some((d_type, &name[..nul]))
+    })
+}
+
 #[cfg(test)]
 extern crate alloc;
 
@@ -187,5 +253,64 @@ mod tests {
         }
         assert_eq!(seen, names.len());
         assert_eq!(off, total, "the reclen chain did not land on the buffer end");
+    }
+
+    /// The regression for `ls -la` printing only `total 0`: a directory stream
+    /// read through [`fill`] with the dot records in front yields `.` and `..`
+    /// exactly once, first, whatever the buffer size — including one so small
+    /// that every call returns a single record.
+    #[test]
+    fn dot_entries_appear_once_at_any_buffer_size() {
+        let children: [(&str, u8); 3] = [("bin", DT_DIR), ("twelve-chars", DT_REG), ("l", DT_LNK)];
+        let stream: alloc::vec::Vec<(&str, u8)> =
+            DOT_ENTRIES.iter().copied().chain(children.iter().copied()).collect();
+        // 32 bytes holds exactly one record per call (every record here is 24 or 32).
+        for size in [reclen(0), 32, 64, 4096] {
+            let mut pos = 0;
+            let mut got: alloc::vec::Vec<(u8, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+            let mut buf = alloc::vec![0u8; size];
+            loop {
+                let (bytes, n) = fill(stream.iter().copied().skip(pos), 1, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                got.extend(records(&buf[..bytes]).map(|(t, nm)| (t, nm.to_vec())));
+                pos += n;
+            }
+            // reclen(0) holds no name longer than 4 bytes: the walk stops at the long one,
+            // which the arm reports as EINVAL rather than as a short listing.
+            if size == reclen(0) {
+                assert_eq!(got.len(), 3, "the walk stops before a name that cannot fit");
+                continue;
+            }
+            let names: alloc::vec::Vec<&[u8]> = got.iter().map(|(_, n)| n.as_slice()).collect();
+            assert_eq!(names[0], b".", "size {size}");
+            assert_eq!(names[1], b"..", "size {size}");
+            assert_eq!(names.iter().filter(|n| **n == b".").count(), 1);
+            assert_eq!(names.iter().filter(|n| **n == b"..").count(), 1);
+            assert_eq!(got.len(), stream.len(), "size {size}");
+            assert!(got[..2].iter().all(|(t, _)| *t == DT_DIR));
+        }
+    }
+
+    /// An empty directory is two records on Linux, so a `readdir` loop makes two
+    /// `getdents64` calls (dots, then EOF) — not one call returning EOF.
+    #[test]
+    fn an_empty_directory_is_two_records_not_zero() {
+        let mut buf = [0u8; 4096];
+        let (bytes, n) = fill(DOT_ENTRIES.iter().copied(), 1, &mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(records(&buf[..bytes]).count(), 2);
+        let (_, n) = fill(DOT_ENTRIES.iter().copied().skip(2), 1, &mut buf);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn records_stops_at_a_malformed_reclen() {
+        let mut buf = [0u8; 64];
+        let (bytes, _) = fill([("ok", DT_REG)], 1, &mut buf);
+        // A second "record" whose reclen runs off the end.
+        buf[bytes + D_RECLEN] = 0xff;
+        assert_eq!(records(&buf[..bytes + 24]).count(), 1);
     }
 }
