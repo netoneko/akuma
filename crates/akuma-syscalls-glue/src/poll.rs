@@ -791,6 +791,70 @@ mod spin {
     }
 }
 
+/// Finds a process whose terminal input is waiting while its event loop never
+/// hears about it: stdin has held bytes for over [`STARVED_US`] and an
+/// `epoll_pwait` lap still ends. Dumps that epoll's whole interest list — fd,
+/// registered events, the `EPOLLONESHOT` disarmed flag, the edge state and the
+/// descriptor kind — so the dump says whether fd 0 is registered at all, and if
+/// so whether it is disarmed or edge-suppressed.
+///
+/// Written for Claude Code's `/login` input loss (2026-10-17,
+/// `docs/archive/AMD64_CLAUDE_LOGIN_INPUT_STUCK.md`): the stuck process's main
+/// loop got one event per `epoll_pwait` and never read stdin, and nothing in the
+/// kernel could say why. One global "pending since" stamp is enough for a
+/// diagnostic aimed at one stuck process; [`DUMPS`] lines' worth per boot.
+#[cfg(feature = "sc-epoll")]
+mod stdin_starved {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    const STARVED_US: u64 = 2_000_000;
+    const DUMPS: u32 = 12;
+    static PENDING_SINCE: AtomicU64 = AtomicU64::new(0);
+    static DUMPED: AtomicU32 = AtomicU32::new(0);
+
+    pub fn check(epfd: u32, epoll_id: u32, ready_count: usize) {
+        if DUMPED.load(Relaxed) >= DUMPS {
+            return;
+        }
+        let Some(proc) = akuma_exec::process::current_process_shared() else { return };
+        let stdin_is_terminal = matches!(proc.get_fd(0), Some(akuma_exec::process::FileDescriptor::Stdin));
+        let pending = stdin_is_terminal
+            && akuma_exec::process::current_channel().is_some_and(|ch| ch.has_stdin_data());
+        let now = akuma_primitives::clock::uptime_us();
+        if !pending {
+            PENDING_SINCE.store(0, Relaxed);
+            return;
+        }
+        let since = PENDING_SINCE.load(Relaxed);
+        if since == 0 {
+            PENDING_SINCE.store(now, Relaxed);
+            return;
+        }
+        if now.saturating_sub(since) < STARVED_US || DUMPED.fetch_add(1, Relaxed) >= DUMPS {
+            return;
+        }
+        akuma_primitives::safe_print!(160,
+            "[stdin-starved] pid={} epfd={} stdin pending {}ms, this lap ready={}; interest list:\n",
+            proc.pid, epfd, (now - since) / 1000, ready_count);
+        let entries = akuma_primitives::irq::with_irqs_disabled(|| {
+            let table = super::EPOLL_TABLE.lock();
+            let mut out = [None; 24];
+            if let Some(inst) = table.get(&epoll_id) {
+                for (slot, fd) in out.iter_mut().zip(inst.fds()) {
+                    *slot = inst.get(fd).map(|e| (fd, e));
+                }
+            }
+            out
+        });
+        for (fd, e) in entries.iter().flatten() {
+            let kind = proc.get_fd(*fd);
+            akuma_primitives::safe_print!(200,
+                "[stdin-starved]   fd={} events=0x{:x} disarmed={} last_ready=0x{:x} kind={:?}\n",
+                fd, e.events, e.disarmed, e.last_ready, kind);
+        }
+    }
+}
+
 /// x86_64's `struct epoll_event` is `__attribute__((packed))` — 12 bytes,
 /// `events` immediately followed by `data` with no alignment gap — where
 /// [`EpollEvent`] (asm-generic/aarch64) is the natural, 16-byte layout with a
@@ -1002,6 +1066,8 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 first_ready.get_or_insert((fd, step.report));
             }
         }
+
+        stdin_starved::check(epfd, epoll_id, ready_count);
 
         // The per-lap backstop: `epoll_ctl` can change the interest list under
         // us, and a rump fd in it wants 1 ms rather than 10 ms.
