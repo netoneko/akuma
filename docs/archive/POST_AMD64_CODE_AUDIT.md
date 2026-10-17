@@ -119,10 +119,23 @@ Verified **fine**, do not "fix": the whole real terminal pipeline
 (`translate_output`, `process_canon_input`, `drain_canon_ready`,
 `enter/exit_raw_mode`), VINTR→SIGINT, the ext2 audit, DAC enforcement.
 
-**Decision rule** (as in the August doc): delete the dead-with-its-tests;
-*wire in* the ones with a live purpose — §1.1's tty trio and §1.3's
-observability counters are the wire-me group, and wiring them is also the
-cheapest available instrumentation for the open incident.
+**Decision rule** (as in the August doc, sharpened): for duplicate-truth
+pairs, **delete the unwired copy and repoint its tests at the wired twin** —
+keeping both is the worst option, a drift trap whose tests give false
+confidence in a path nothing takes (the `parse_elf64_ehdr` →
+`parse_elf64_ehdr_checked` repoint is the worked example). That rule clears
+§1.4–1.5 and the tty duplicates `push_input`/`read_input` (tests already read
+via `drain_canon_ready`) and `is_raw_mode` (deleting one of the *three* raw-mode
+sources of truth). Three deliberate exceptions, wire-don't-delete:
+
+- **§1.3's counters** are the measurement half of machinery that runs; deleting
+  them hides the machinery. A PSTATS/procfs surface for them is a day of work
+  and the first instrument for the next wedge.
+- **`pipe_destroy`** documents a suspected leak; delete only in the commit that
+  proves the leak doesn't exist (or wire the waitpid hook).
+- **`get_process_channel(tid)`** stays until the channel-resolution incident
+  settles — it is currently evidence; if `current_channel()` wins, delete it
+  with the incident doc citing it.
 
 ### 1.6 Method limits
 
