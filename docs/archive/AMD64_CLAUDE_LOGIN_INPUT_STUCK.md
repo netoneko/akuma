@@ -112,6 +112,41 @@ between runs (safe since e672447e).
 | `vfork` child `dup2` replacing claude's fd 0 | claude's fd table unchanged while stuck |
 | exit published through a **stale SPAWN row** (`spawn_record_exit` names whatever pid the slot's row holds) | the `[exit] slot S row names pid X …` check (a096dc54) did not fire for claude. It **did** fire once at boot (`slot 11 row names pid 13 but the exiting task is pid 12`): a real stale row, worth its own look |
 
+### Captured 2026-10-17 19:50 with `[stdin-starved]` (34e1f405)
+
+The dump fires when a process's terminal stdin has held bytes for over 2 s while
+an `epoll_pwait` lap ends, and prints every epoll in the fd table:
+
+- **claude's main loop epoll (epfd 3) has fd 0 registered and armed**:
+  `fd=0 events=0x40000011` (`EPOLLIN|EPOLLHUP|EPOLLONESHOT`) `disarmed=false
+  last_ready=0x0 kind=Stdin`. **EPOLLONESHOT is ruled out** as the cause, and so
+  is a lost registration. fd 0 has **never** been reported: a reported one-shot
+  entry would read `disarmed=true`.
+- **stdin really does hold the bytes** (pending ≥ 2 s) as seen from thread 856
+  (an HTTP worker, `tgid=848`), via `current_channel().has_stdin_data()`.
+- fd 0 sorts first in the scan, so a main-thread lap that saw stdin ready would
+  report it first. **So the main thread's readiness check for fd 0
+  (`epoll_check_fd_readiness` → `Stdin` arm → `current_channel()`) does not see
+  the channel thread 856 sees.** Leading hypothesis: on amd64 every thread has its
+  own `Process`; `current_channel()` returns `Process.channel` and otherwise
+  falls back to `get_channel(tid)`, the per-slot **exit** channel (an empty FIFO).
+  If the main thread's `Process.channel` is `None` or was replaced (vfork/exec of
+  a helper, or the clone path for some threads), its stdin probe answers "empty"
+  for ever, while the data sits in the session channel. That would also explain
+  why typing worked before the helpers were spawned.
+- Other content of epfd 3: claude's helpers are spawned with **pidfds** (fds 13,
+  20, 21, 27, 31, `events=0x11`, level-triggered) and **Unix-socket stdio pairs**.
+  An exited child's pidfd stays readable, which is probably the 1 event per lap
+  the stuck main loop keeps getting.
+- epfd 7 (thread 856's HTTP loop: eventfd + socket) and epfd 14 (an eventfd) are
+  unrelated.
+
+**First thing to do next:** print `Arc::as_ptr` of `current_channel()` for the
+main thread (848) and for thread 856 inside the `Stdin` arm of
+`epoll_check_fd_readiness`, plus whether it came from `Process.channel` or the
+`get_channel(tid)` fallback. If they differ, find which path set the main
+thread's `Process.channel` (or left it `None`).
+
 ### Next steps, in order
 
 1. **Name the fd claude's epoll keeps reporting.** `[epoll-spin]` only fires
