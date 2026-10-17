@@ -808,7 +808,7 @@ mod stdin_starved {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
     const STARVED_US: u64 = 2_000_000;
-    const DUMPS: u32 = 12;
+    const DUMPS: u32 = 2;
     static PENDING_SINCE: AtomicU64 = AtomicU64::new(0);
     static DUMPED: AtomicU32 = AtomicU32::new(0);
 
@@ -834,18 +834,30 @@ mod stdin_starved {
             return;
         }
         akuma_primitives::safe_print!(160,
-            "[stdin-starved] pid={} epfd={} stdin pending {}ms, this lap ready={}; interest list:\n",
-            proc.pid, epfd, (now - since) / 1000, ready_count);
+            "[stdin-starved] pid={} tgid={} (in epfd={} ready={}) stdin pending {}ms; every epoll it holds:\n",
+            proc.pid, proc.tgid, epfd, ready_count, (now - since) / 1000);
+        let _ = epoll_id;
+        // Every epoll instance in the (shared) fd table, not just the one this
+        // thread waits on: the first capture fired on an HTTP worker's private
+        // epoll and said nothing about where fd 0 is registered.
+        for efd in 0..256u32 {
+            let Some(akuma_exec::process::FileDescriptor::EpollFd(id)) = proc.get_fd(efd) else { continue };
+            dump_instance(proc, efd, id);
+        }
+    }
+
+    fn dump_instance(proc: &akuma_exec::process::Process, efd: u32, id: u32) {
         let entries = akuma_primitives::irq::with_irqs_disabled(|| {
             let table = super::EPOLL_TABLE.lock();
             let mut out = [None; 24];
-            if let Some(inst) = table.get(&epoll_id) {
+            if let Some(inst) = table.get(&id) {
                 for (slot, fd) in out.iter_mut().zip(inst.fds()) {
                     *slot = inst.get(fd).map(|e| (fd, e));
                 }
             }
             out
         });
+        akuma_primitives::safe_print!(64, "[stdin-starved]  epfd={}:\n", efd);
         for (fd, e) in entries.iter().flatten() {
             let kind = proc.get_fd(*fd);
             akuma_primitives::safe_print!(200,
