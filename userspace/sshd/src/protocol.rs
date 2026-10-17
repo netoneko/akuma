@@ -369,16 +369,23 @@ async fn write_all_with_lifetime(
 /// session end with an error message ([`fail_spawn`]).
 /// The environment a session's child is spawned with, as `KEY=VALUE` strings.
 ///
-/// `TERM` only, and only for a client that asked for a pty — the same rule
-/// OpenSSH follows, and for the same reason: `TERM` describes a terminal, and a
-/// child whose stdout is a pipe does not have one. Everything else a login
-/// shell wants (`PATH`, `HOME`) is the shell's own default here; this is not
-/// the place to invent a login policy.
+/// `TERM` only for a client that asked for a pty — the same rule OpenSSH
+/// follows, and for the same reason: `TERM` describes a terminal, and a child
+/// whose stdout is a pipe does not have one.
+///
+/// `HOME`/`USER`/`LOGNAME` always, as OpenSSH sets them from the passwd entry.
+/// Every session here is root. Leaving them to "the shell's default" left
+/// `HOME` unset (busybox ash invents none), and with no `/etc/passwd` on the
+/// box nothing could recover it: Claude Code (Bun) died at start with
+/// `ENOENT: uv_os_homedir` (2026-10-17).
 ///
 /// Returned owned because the strings must outlive the `spawn` call that
 /// borrows them.
 fn session_env(session: &SshSession) -> Vec<String> {
     let mut env = Vec::new();
+    env.push(String::from("HOME=/root"));
+    env.push(String::from("USER=root"));
+    env.push(String::from("LOGNAME=root"));
     if session.pty_requested && !session.term_type.is_empty() {
         env.push(format!("TERM={}", session.term_type));
     }
