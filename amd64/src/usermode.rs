@@ -4573,7 +4573,7 @@ fn register_exec_process(
         // 5b slice 4: the region list this target demand-pages from, moved in
         // from the loader. Empty for everything but a `fork` child, which
         // arrives carrying the parent's extents.
-        mmap_regions: Spinlock::new(image.regions),
+        mmap_regions: akuma_exec::process::AssistedSpinlock::new(image.regions),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         // **`with_stdio()` since 4b batch 2a** — it was `new()`, and the
         // comment here recorded why: a table holding `Stdin`/`Stdout`/`Stderr`

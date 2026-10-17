@@ -444,7 +444,7 @@ impl Process {
             exited: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             dynamic_page_tables: Vec::new(),
-            mmap_regions: spinning_top::Spinlock::new(Vec::new()),
+            mmap_regions: crate::process::AssistedSpinlock::new(Vec::new()),
             lazy_regions: Spinlock::new(lazy_regions),
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,

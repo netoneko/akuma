@@ -3592,7 +3592,7 @@ fn make_test_process(
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
-        dynamic_page_tables: Vec::new(), mmap_regions: spinning_top::Spinlock::new(Vec::new()),
+        dynamic_page_tables: Vec::new(), mmap_regions: akuma_exec::process::AssistedSpinlock::new(Vec::new()),
         lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),

@@ -39,7 +39,7 @@ pub use lifecycle::LifecycleGuard;
 // `execve`'s load/install seam — see `image::ImageInstall`. Re-exported beside
 // the other process types because both kernels' syscall layers build one.
 pub use image::ImageInstall;
-pub use address_space::{AddressSpaceGuard, ProcAddressSpace};
+pub use address_space::{AddressSpaceGuard, AssistedSpinlock, ProcAddressSpace};
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
 
 pub use types::*;
@@ -794,7 +794,7 @@ pub struct Process {
     /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis. `vm_with_regions` used to reach
     /// around the old `vm_lock` with `&mut *(addr_of!(..) as *mut Vec<_>)`
     /// because there is no way to get `&mut` out of a lock that guards nothing.
-    pub mmap_regions: Spinlock<Vec<MmapRegion>>,
+    pub mmap_regions: AssistedSpinlock<Vec<MmapRegion>>,
     /// Per-process demand-paged lazy regions, keyed by `start_va`. Owned here
     /// (not in a global table) so a `BTreeMap::insert` that OOMs under the lock
     /// cannot self-deadlock on teardown — the field drops inside `Process::drop`
@@ -1041,7 +1041,7 @@ impl Process {
             // `fork` replaces this with `inherit_mmap_regions_for_cow_child`;
             // `vfork`/`clone_thread` leave it empty and see the parent's mappings
             // through the shared L0.
-            mmap_regions: Spinlock::new(Vec::new()),
+            mmap_regions: AssistedSpinlock::new(Vec::new()),
             // Per-process, dropped in `Process::drop`. `fork` propagates the
             // parent thread-group leader's descriptors into it before
             // registration; `clone_thread` calls `clone_lazy_regions` after.
@@ -4104,7 +4104,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: AtomicBool::new(false), exit_code: AtomicI32::new(0),
-        dynamic_page_tables: Vec::new(), mmap_regions: Spinlock::new(Vec::new()),
+        dynamic_page_tables: Vec::new(), mmap_regions: AssistedSpinlock::new(Vec::new()),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),

@@ -285,3 +285,52 @@ impl DerefMut for AddressSpaceGuard<'_> {
         &mut self.guard
     }
 }
+
+/// A `Spinlock` whose `lock()` keeps acknowledging TLB shootdowns while it
+/// waits — [`ProcAddressSpace::lock_inner`]'s discipline, for the other
+/// per-process lock a shootdown sender holds: [`crate::process::Process::mmap_regions`].
+///
+/// `munmap`/`mprotect` hold `mmap_regions` across the flush they send and so
+/// across `wait_for_acks`. Anything that takes the same lock IRQ-masked and
+/// without the BKL — the BKL-free VFS read of `/proc/<pid>/maps`
+/// (`pid_map_rows`) — spins where no IPI can reach it and never acknowledges
+/// the flush its lock holder is waiting on: a two-core deadlock, and every
+/// other core then queues on the BKL the sender holds. Claude Code (Bun) reads
+/// its own `maps` while its other threads map and unmap, and wedged the ryzen
+/// whole (2026-10-17, RIPs captured from a Firecracker repro: one vCPU in
+/// `wait_for_acks`, one at `pause` on `mmap_regions` in `pid_map_rows`).
+///
+/// Same surface as the `spinning_top::Spinlock` it wraps, so call sites keep
+/// writing `.lock()` and get the same guard type.
+pub struct AssistedSpinlock<T>(Spinlock<T>);
+
+impl<T> AssistedSpinlock<T> {
+    /// A free lock holding `value`.
+    pub const fn new(value: T) -> Self {
+        Self(Spinlock::new(value))
+    }
+
+    /// Acquire, servicing pending TLB shootdowns on every failed attempt.
+    #[inline]
+    pub fn lock(&self) -> SpinlockGuard<'_, T> {
+        loop {
+            if let Some(g) = self.0.try_lock() {
+                return g;
+            }
+            akuma_bkl::sync::masked_spin_assist();
+            core::hint::spin_loop();
+        }
+    }
+
+    /// One attempt; `None` if held.
+    #[inline]
+    pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
+        self.0.try_lock()
+    }
+
+    /// `&mut` without locking — `&mut self` proves no other reference exists.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
+}
