@@ -89,7 +89,10 @@ if [ "$(id -u 2>/dev/null)" = "0" ]; then
 else
     _tn_sigil='$'
 fi
-PS1="${_tn_gray}\u${_tn_reset}:${_tn_blue}\w${_tn_reset} ${_tn_cyan}${_tn_sigil}${_tn_reset} "
+# Every escape is bracketed in \[ \]: ash's line editor counts unbracketed
+# bytes as printed columns, so the ~49 bytes of color here made it wrap typed
+# input ~49 columns early (half a 92-column herdr pane).
+PS1="\[${_tn_gray}\]\u\[${_tn_reset}\]:\[${_tn_blue}\]\w\[${_tn_reset}\] \[${_tn_cyan}\]${_tn_sigil}\[${_tn_reset}\] "
 unset _tn_reset _tn_gray _tn_blue _tn_cyan _tn_sigil
 
 # Color ls by default, but only when this busybox build understands --color.
