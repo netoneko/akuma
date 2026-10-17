@@ -5905,6 +5905,23 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
             .and_then(|s| s.as_ref())
             .map_or(0, |s| s.pid)
     };
+    // **Is the row's pid the process that is actually exiting?** Everything
+    // below marks `dying` exited and raises SIGCHLD on its parent. A row left
+    // behind by an earlier occupant of this slot would publish the death of a
+    // process that is still running — its parent's `wait4` reaps it, and an
+    // interactive shell then returns to its prompt and starts reading the
+    // terminal out from under its still-running foreground job. That is the
+    // shape of Claude Code's `/login` input loss (2026-10-17: ash back in its
+    // prompt loop while `claude` ran on); this line says whether it is this.
+    if dying != 0 {
+        let own = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let tgid = current_pid();
+        if dying != own && dying != tgid {
+            akuma_primitives::safe_print!(160,
+                "[exit] slot {} row names pid {} but the exiting task is pid {} (tgid {}): stale SPAWN row\n",
+                proc_slot, dying, own, tgid);
+        }
+    }
 
     // Reparent this process's children onto init, the way Linux does at exit.
     //
