@@ -141,7 +141,32 @@ an `epoll_pwait` lap ends, and prints every epoll in the fd table:
 - epfd 7 (thread 856's HTTP loop: eventfd + socket) and epfd 14 (an eventfd) are
   unrelated.
 
-**First thing to do next:** print `Arc::as_ptr` of `current_channel()` for the
+### Captured 2026-10-17 20:30 (55bbb8c0): nobody scans stdin's epoll
+
+With the dump restricted to epolls that **hold fd 0** (and a live probe of
+fd 0 from the scanning thread), the stuck repro produced **no dump at all**. While
+stdin held the paste, no thread ever ran a lap of epfd 3. Together with
+`[PSTATS]` for the main thread (~7 `epoll_pwait` per 30 s, ~4 s each, nothing
+else), the main JS thread is **not in its event loop**. It is blocked in a
+synchronous wait on **epfd 14, whose only member is eventfd 15**: in Bun, a
+sync wait for something another thread signals through that eventfd.
+
+So the channel hypothesis below is **withdrawn** (all threads share one channel
+`Arc`: `inherit_from` and `fork`/`clone` copy it, and nothing reassigns
+`Process.channel` after creation). The working theory now: a `spawnSync`-style
+wait for a helper's exit. The ~1 M-call `wait4` spin on the login screen is
+Bun's waiter polling a child the kernel never reports as exited, giving up, and
+leaving the main thread waiting on an eventfd nobody writes. No helper process
+is alive in the stuck state, so the exit happened but its report was lost or
+never matched.
+
+**Next:** trace one helper's life on the login screen: its pid from `vfork`,
+its `execve`, its exit and how it was published (`publish_child_exit`;
+`spawn_record_exit` only covers SPAWN-row slots), and every `wait4`/`waitid`
+claude makes for that pid with its return value. A pid for which claude's
+`wait4(pid, WNOHANG)` keeps returning 0 after the process is gone is the bug.
+
+**Superseded idea, kept for the record:** print `Arc::as_ptr` of `current_channel()` for the
 main thread (848) and for thread 856 inside the `Stdin` arm of
 `epoll_check_fd_readiness`, plus whether it came from `Process.channel` or the
 `get_channel(tid)` fallback. If they differ, find which path set the main
