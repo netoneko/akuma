@@ -128,11 +128,23 @@ kami:refs/remotes/litter/kami`, `git worktree add --detach /src/kami-wt
 litter/kami`, and **copy `crates/akuma-fbcon/vendor/spleen/*` in from the main
 checkout** (a submodule; a worktree gets it empty, and `akuma-fbcon`'s build
 script panics). `AKUMA_SRC=/src/kami-wt kbuild -j 4 --features no-tests`: 29 s
-and 27 s incremental against `/root/ktarget` at `smp=8`. Akuma here touches
-only p3, so it cannot install onto the ESP: copy the ELF to p3, `reboot -f`
-(lands in Pop), install from Pop, `arm.sh 14`. `uname` then shows a stale
-revision (`amd64/build.rs` does not rerun when the worktree's HEAD moves);
-check a symbol with `nm` instead.
+and 27 s incremental against `/root/ktarget` at `smp=8`. `uname` then shows a stale
+revision (`amd64/build.rs` does not rerun when the worktree's HEAD moves; a
+kernel built in a *Mac* worktree stamps the main checkout's HEAD the same way);
+identify kernels by `md5sum`, or check a symbol with `nm`.
+
+**Installing from inside Akuma (since 2026-10-17).** GRUB boots the kernel from
+**p3's `/boot/akuma-amd64`**: every menu entry uses `${akk}`, which `grub.cfg`
+sets to `(AKUMA-RYZEN)/boot/akuma-amd64` when it finds that ext2 label and file,
+and to the ESP copy otherwise. So `kbuild` → `kinstall`
+(`scripts/install_kernel_amd64.sh`: multiboot2-checked, md5-verified, the old one
+kept as `/boot/akuma-amd64.prev`) → `reboot -f` is a whole install. The reset
+still lands in **Pop** (the systemd-boot one-shot is consumed), so re-arming
+needs Pop until Akuma becomes the default entry. Fallbacks in the menu: entry
+21 boots p3's `.prev`, entry 22 the ESP kernel, both with entry 20's command
+line. Only `install.sh` (from Pop) writes the ESP copy, and changing the menu
+itself still means rebuilding `grubx64.efi` there (`grub-mkstandalone` with this
+`grub.cfg`; the previous binary is `grubx64.efi.bak-esp-kernel`).
 
 Entries 12-14 run a plain `herd daemon` (`initargs=daemon`): the services are whatever p3's `/etc/herd/enabled/` holds — `sshd console klog netwatch wifiauto` since 2026-10-08, enabled with `herd enable <svc>` (copied from `available/`). Enumerating them as `--service` flags made `herd status` list one and hid the rest.
 

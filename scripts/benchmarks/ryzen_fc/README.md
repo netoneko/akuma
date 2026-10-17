@@ -15,6 +15,7 @@ is `selfhost-vm.json`, its tap is `tapsh` (10.0.2.2/24), its disk is `selfhost.i
 | `gssh.sh '<cmd>'` | any | run a command in the guest with the env preamble it needs (its shell has no PATH) |
 | `jrun.sh N [jobs]` | root | one fresh-boot `kbuild -c -j<jobs>`; PASS / FAIL / WEDGE / TIMEOUT / NOBOOT; writes `runs/N/{summary,build.out,console.log}` |
 | `batch.sh FIRST LAST [jobs]` | root | `jrun.sh` in sequence |
+| `fc-p3.sh <kernel> [vcpu] [mem]` / `fc-p3.sh stop` | root | a guest on a **throwaway dm-snapshot of p3**, the metal Akuma root: the real installed userspace (claude, config, herd services), p3 never written. `XARGS=` adds cmdline tokens. Reproduced the claude-wedges-the-box deadlock in 2/2 and verified its fix in 3/3 (2026-10-17); stop it before mounting p3 read-write from Pop |
 
 Source is `git clone --depth 1 --branch <branch> https://github.com/netoneko/akuma.git`
 plus `git submodule update --init --depth 1 --force crates/akuma-fbcon/vendor/spleen`

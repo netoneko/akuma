@@ -98,7 +98,7 @@ fn main() {
     // Paths are relative to THIS crate's manifest dir, not the workspace root —
     // `.git/HEAD` here would name `crates/akuma-syscalls-glue/.git/HEAD`, which
     // does not exist, and the staleness would be silent.
-    let git_dir = std::path::Path::new("../../.git");
+    //
     // `.git/HEAD` only changes on a checkout, and the branch ref is only tracked
     // when it is a LOOSE file at the moment this script runs — cargo freezes the
     // path list it saw. A ref that was in `packed-refs` then (as it can be right
@@ -107,19 +107,40 @@ fn main() {
     // (2026-10-02: `uname -v` said 6d9017b1 for e40e50a0). The reflog is appended
     // to by every commit, checkout and reset, so it is the trigger that cannot go
     // missing; `packed-refs` covers `git pack-refs`/`gc` rewriting the ref.
-    for tracked in ["logs/HEAD", "packed-refs"] {
-        if git_dir.join(tracked).exists() {
-            println!("cargo:rerun-if-changed=../../.git/{tracked}");
+    //
+    // **Ask git where those files are; do not assume `../../.git` is a
+    // directory.** In a `git worktree` it is a one-line *file* (`gitdir: …`):
+    // HEAD and the reflog live in `<common>/worktrees/<name>/`, the refs and
+    // `packed-refs` in the common dir. The hard-coded paths matched nothing
+    // there, no rerun trigger was emitted at all, and cargo kept the first
+    // build's SHA forever — kernels built in a worktree on 2026-10-17 all said
+    // `c0002a3e` across three later commits. `../../.git` stays as the fallback
+    // for a tree where `git` itself cannot run.
+    let git_path = |arg: &str| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", arg])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| std::path::PathBuf::from(s.trim()))
+            .filter(|p| p.is_dir())
+    };
+    let fallback = std::path::PathBuf::from("../../.git");
+    let head_dir = git_path("--git-dir").unwrap_or_else(|| fallback.clone());
+    let common_dir = git_path("--git-common-dir").unwrap_or_else(|| head_dir.clone());
+    let track = |p: std::path::PathBuf| {
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
         }
-    }
-    if git_dir.join("HEAD").exists() {
-        println!("cargo:rerun-if-changed=../../.git/HEAD");
-        if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD"))
-            && let Some(refname) = head.strip_prefix("ref: ").map(str::trim)
-            && git_dir.join(refname).exists()
-        {
-            println!("cargo:rerun-if-changed=../../.git/{refname}");
-        }
+    };
+    track(head_dir.join("logs/HEAD"));
+    track(common_dir.join("packed-refs"));
+    track(head_dir.join("HEAD"));
+    if let Ok(head) = std::fs::read_to_string(head_dir.join("HEAD"))
+        && let Some(refname) = head.strip_prefix("ref: ").map(str::trim)
+    {
+        track(common_dir.join(refname));
     }
 
     // The **kernel's** version, read out of the workspace root's `[package]`

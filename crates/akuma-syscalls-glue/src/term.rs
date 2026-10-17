@@ -296,6 +296,7 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EFAULT;
             }
             let mut ts = term_state_lock.lock();
+            let was_canonical = ts.is_canonical();
             ts.iflag = kernel_buf[0];
             ts.oflag = kernel_buf[1];
             ts.cflag = kernel_buf[2];
@@ -310,6 +311,9 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             // counterpart in the kernel layout and keeps its value.
             let tail = &as_user_bytes(&kernel_buf[4..])[1..];
             ts.cc[..tail.len()].copy_from_slice(tail);
+            if !was_canonical && ts.is_canonical() {
+                note_cooked(proc, fd, "TCSETS");
+            }
 
             if let Some(ch) = akuma_exec::process::current_channel() {
                 ch.set_raw_mode(!ts.is_canonical());
@@ -373,6 +377,26 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     result
 }
 
+/// Budget for [`note_cooked`]'s line — a program toggling modes in a loop must
+/// not be able to flood the console.
+static COOKED_TRACES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A terminal that was raw just went back to canonical (line) mode.
+///
+/// The terminal state is shared by every process on the session, so a helper
+/// that does this under a raw-mode TUI leaves the TUI's input sitting in the
+/// line buffer until a newline the TUI's Enter (a bare `\r`) never produces:
+/// typing, paste, Esc and Enter all stop together while the TUI waits idle in
+/// `epoll_pwait`. Claude Code's `/login` showed exactly that on the ryzen
+/// (2026-10-17) and nothing said which process flipped the mode; this does.
+pub fn note_cooked(proc: &akuma_exec::process::Process, fd: u32, how: &str) {
+    if COOKED_TRACES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
+        let image = proc.image.lock();
+        akuma_primitives::safe_print!(160, "[tty] raw->canonical by pid={} ({}) fd={} via {}\n",
+            proc.pid, image.name.as_str(), fd, how);
+    }
+}
+
 fn write_to_process_channel(data: &[u8]) -> u64 {
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
@@ -402,12 +426,19 @@ pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: 
     };
 
     let mut term_state = term_state_lock.lock();
+    let was_canonical = term_state.is_canonical();
     term_state.mode_flags = mode_flags_arg;
 
     if (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0 {
         term_state.enter_raw_mode();
     } else {
         term_state.exit_raw_mode();
+    }
+    if !was_canonical
+        && term_state.is_canonical()
+        && let Some(p) = akuma_exec::process::current_process_shared()
+    {
+        note_cooked(p, fd as u32, "set_terminal_attributes");
     }
 
     let proc_channel = match akuma_exec::process::current_channel() {
