@@ -35,8 +35,12 @@ pub struct ProcessChannel {
     cpu_time_us: AtomicU64,
     /// Interrupt signal (set by Ctrl+C, checked by process)
     interrupted: AtomicBool,
-    /// Raw mode flag (true if terminal is in raw mode, false for cooked)
-    raw_mode: AtomicBool,
+    // A `raw_mode: AtomicBool` lived here until 2026-10-17: written by every
+    // termios change, read by nothing. Raw-vs-cooked has one source of truth,
+    // `TerminalState::is_canonical()` on the session's terminal state, which is
+    // what the stdin read path branches on (`docs/archive/POST_AMD64_CODE_AUDIT.md`
+    // §1.1 — three copies of the flag was the drift that misled the /login
+    // input-loss investigation).
     /// Stdin closed flag (true if no more data will be written to stdin)
     stdin_closed: AtomicBool,
     /// Whether this channel's stdin/stdout is a real terminal. `true` for
@@ -197,7 +201,6 @@ impl ProcessChannel {
             exited: AtomicBool::new(false),
             cpu_time_us: AtomicU64::new(0),
             interrupted: AtomicBool::new(false),
-            raw_mode: AtomicBool::new(false),
             stdin_closed: AtomicBool::new(false),
             is_terminal: AtomicBool::new(true),
             pollers: Spinlock::new(BTreeMap::new()),
@@ -545,16 +548,6 @@ impl ProcessChannel {
     /// Clear the interrupt flag
     pub fn clear_interrupted(&self) {
         self.interrupted.store(false, Ordering::Release);
-    }
-
-    /// Set the raw mode flag
-    pub fn set_raw_mode(&self, enabled: bool) {
-        self.raw_mode.store(enabled, Ordering::Release);
-    }
-
-    /// Check if raw mode is enabled
-    pub fn is_raw_mode(&self) -> bool {
-        self.raw_mode.load(Ordering::Acquire)
     }
 }
 

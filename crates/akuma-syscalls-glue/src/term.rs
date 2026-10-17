@@ -315,11 +315,10 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 note_cooked(proc, fd, "TCSETS");
             }
 
-            if let Some(ch) = akuma_exec::process::current_channel() {
-                ch.set_raw_mode(!ts.is_canonical());
-                if cmd == TCSETSF {
-                    ch.flush_stdin();
-                }
+            if cmd == TCSETSF
+                && let Some(ch) = akuma_exec::process::current_channel()
+            {
+                ch.flush_stdin();
             }
             0
         }
@@ -445,7 +444,6 @@ pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: 
         Some(channel) => channel,
         None => return ENOMEM,
     };
-    proc_channel.set_raw_mode(!term_state.is_canonical());
 
     if action == 2 {
         proc_channel.flush_stdin();

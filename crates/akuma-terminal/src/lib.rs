@@ -80,9 +80,22 @@ pub struct TerminalState {
     pub cursor_row: usize,
     /// Is the cursor hidden?
     pub cursor_hidden: bool,
-    /// Input buffer for events (e.g., key presses)
-    pub input_buffer: Spinlock<VecDeque<u8>>,
-    /// Waker for tasks waiting on input
+    /// Waker for a reader parked on this terminal's input.
+    ///
+    /// Input itself does **not** live here: it arrives through
+    /// `ProcessChannel::write_stdin` (and the amd64 console pump), and the
+    /// canonical line discipline below (`canon_buffer`/`canon_ready`) is applied
+    /// on read. A second byte queue on this struct (`input_buffer`, with
+    /// `push_input`/`read_input`) was removed 2026-10-17 as an unwired duplicate
+    /// view of stdin (`docs/archive/POST_AMD64_CODE_AUDIT.md` §1.1).
+    ///
+    /// Every consumer takes this nested under the enclosing
+    /// `Arc<Spinlock<TerminalState>>` guard with the calling thread's preemption
+    /// disabled for one `try_lock` attempt at a time — never across an unbounded
+    /// wait, which is exactly what turned a naive disable-then-block acquire into a
+    /// kernel wedge (`docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`). This
+    /// `no_std`, dependency-free crate cannot enforce that itself; callers use
+    /// `akuma_exec::sync::lock_bounded`.
     pub input_waker: Spinlock<Option<core::task::Waker>>,
 
     /// Canonical mode line buffer (current line being edited).
@@ -125,7 +138,6 @@ impl Default for TerminalState {
             cursor_col: 0,
             cursor_row: 0,
             cursor_hidden: false,
-            input_buffer: Spinlock::new(VecDeque::new()),
             input_waker: Spinlock::new(None),
             canon_buffer: alloc::vec::Vec::new(),
             canon_ready: VecDeque::new(),
@@ -145,48 +157,6 @@ pub struct ProcessedInput {
 }
 
 impl TerminalState {
-    /// Pushes data into the input buffer and wakes a parked reader, if any.
-    ///
-    /// Every real `input_waker` consumer (the kernel's `poll_input_event`/`read` Stdin
-    /// arm, and the stdin write/close paths) takes it nested under the enclosing
-    /// `Arc<Spinlock<TerminalState>>` guard with the calling thread's preemption
-    /// disabled for one `try_lock` attempt at a time — never across an unbounded wait,
-    /// which is exactly what turned a naive disable-then-block acquire into a kernel
-    /// wedge (`docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`). This `no_std`,
-    /// dependency-free crate has no access to the kernel's preemption primitives, so
-    /// `push_input` cannot enforce that discipline itself — **any caller must apply it
-    /// externally**: hold the outer lock, with preemption/IRQs disabled only for the
-    /// duration of this call, exactly like every other `input_waker` consumer (see
-    /// `akuma_exec::sync::lock_bounded`). There is currently no caller — this note is
-    /// for whoever wires one up.
-    pub fn push_input(&self, data: &[u8]) {
-        let mut buffer = self.input_buffer.lock();
-        for &byte in data {
-            buffer.push_back(byte);
-        }
-        drop(buffer);
-        let waker = self.input_waker.lock().take();
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-
-    /// Tries to read data from the input buffer.
-    /// Returns number of bytes read.
-    pub fn read_input(&self, buf: &mut [u8]) -> usize {
-        let mut buffer = self.input_buffer.lock();
-        let mut bytes_read = 0;
-        for slot in buf.iter_mut() {
-            if let Some(byte) = buffer.pop_front() {
-                *slot = byte;
-                bytes_read += 1;
-            } else {
-                break;
-            }
-        }
-        bytes_read
-    }
-
     /// Sets a waker to be notified when input is available.
     pub fn set_input_waker(&self, waker: core::task::Waker) {
         *self.input_waker.lock() = Some(waker);
