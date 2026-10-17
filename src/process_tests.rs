@@ -265,6 +265,7 @@ pub fn run_all_tests() {
     // catches a failure mode that is otherwise invisible — see the fn doc.
     test_preempt_guard_is_live();
     test_identity_lazy_restamp();
+    test_identity_generation_detects_recycle();
     test_identity_recycled_slot_rejected();
     test_epilogue_identity_revalidated_after_dispatch();
     test_akuma_get_version();
@@ -20341,6 +20342,57 @@ fn test_epilogue_identity_revalidated_after_dispatch() {
         crate::safe_print!(240,
             "[Test] epilogue_identity_revalidated FAILED: retired_refused={} freed_refused={} inactive_counted={} policy_reresolve={} (epilogue resolved to {:?})\n",
             refused_while_retired, refused_after_free, counted, policy_ok, epilogue);
+    }
+}
+
+/// The identity cache's stale-slot detector: an entry stamped against a slot
+/// whose process has since been reclaimed must see its stamped generation
+/// diverge from the slot's live one, and must **not** resolve to whatever
+/// process is registered in that slot next.
+///
+/// That aliasing is the `c0002a3e` bug class (a reissued tid/slot handing a new
+/// process an old one's identity). `test_hooks::generation_state` was written to
+/// observe it — its doc claimed "a test asserts on the last two diverging after a
+/// recycle" — and no such test existed until 2026-10-17
+/// (`docs/archive/POST_AMD64_CODE_AUDIT.md` §1.4).
+fn test_identity_generation_detects_recycle() {
+    use akuma_exec::process::table::{self, reclaim_retired_processes_force, test_hooks as ih};
+
+    let tid = akuma_exec::threading::current_thread_id();
+    const OLD_PID: u32 = 7811;
+    const NEW_PID: u32 = 7812;
+    let _ = reclaim_retired_processes_force();
+
+    // Stamp: resolve a registered pid so the entry carries its slot + generation.
+    akuma_exec::process::register_process(OLD_PID, make_test_process(OLD_PID));
+    ih::stamp_unresolved(tid, OLD_PID);
+    let resolved_old = table::current_thread_own_process().map(|(p, _)| p) == Some(OLD_PID);
+    let (slot, stamped, live) = ih::generation_state(tid);
+    let fresh_agrees = slot != ih::INVALID_SLOT_FOR_TEST && stamped == live;
+
+    // Recycle: retire the process and force the slot back to FREE, which bumps
+    // the slot's generation.
+    akuma_exec::process::unregister_process(OLD_PID);
+    let _ = reclaim_retired_processes_force();
+    let (slot_after, stamped_after, live_after) = ih::generation_state(tid);
+    let diverged = slot_after == slot && stamped_after == stamped && live_after != stamped_after;
+
+    // Reuse: a new process (the allocator's lowest free slot is the one just
+    // freed) must not be handed to the stale identity.
+    akuma_exec::process::register_process(NEW_PID, make_test_process(NEW_PID));
+    let aliased = table::current_thread_own_process().map(|(p, _)| p) == Some(NEW_PID);
+
+    ih::clear(tid);
+    akuma_exec::process::unregister_process(NEW_PID);
+    let _ = reclaim_retired_processes_force();
+
+    if resolved_old && fresh_agrees && diverged && !aliased {
+        console::print("[Test] identity_generation_detects_recycle PASSED\n");
+    } else {
+        crate::safe_print!(240,
+            "[Test] identity_generation_detects_recycle FAILED: resolved={} fresh_agrees={} diverged={} aliased={} (slot {}->{} stamped {}->{} live {}->{})\n",
+            resolved_old, fresh_agrees, diverged, aliased,
+            slot, slot_after, stamped, stamped_after, live, live_after);
     }
 }
 

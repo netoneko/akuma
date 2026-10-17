@@ -848,7 +848,9 @@ pub mod test_hooks {
     }
 
     /// `(own_slot, stamped own generation, live generation of that slot)`.
-    /// A test asserts on the last two diverging after a recycle.
+    /// `test_identity_generation_detects_recycle` (`src/process_tests.rs`)
+    /// asserts the last two diverge after a recycle and that the stale entry
+    /// does not resolve to the slot's next occupant.
     pub fn generation_state(tid: usize) -> (u16, u32, u32) {
         if tid >= MAX_THREADS {
             return (INVALID_SLOT, 0, 0);
