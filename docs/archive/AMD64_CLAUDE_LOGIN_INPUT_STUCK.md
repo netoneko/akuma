@@ -1,7 +1,8 @@
 # amd64: Claude Code `/login` stops taking input — paste, Esc and Enter (2026-10-17)
 
-**Status: OPEN — mechanism confirmed, culprit not yet named.** A diagnostic that
-names the process is in the tree (`[tty] raw->canonical by pid=…`).
+**Status: OPEN — reliably reproduced, root cause not found.** Read **§ Handoff**
+at the end first: two of the mechanisms proposed below were later ruled out, and
+the section headed "Mechanism (confirmed)" is only partly right.
 
 ## Symptom
 
@@ -63,6 +64,81 @@ asm-generic table: `io_setup` is `read` (x86 0), `getdents64` is `wait4` (61),
 `madvise` is `epoll_ctl` (233), `memfd_create` is `epoll_pwait` (281), and the
 folded ones are counted a second time under their asm-generic name. Decode before
 reading a profile.
+
+## Handoff (2026-10-17 evening, kernel a096dc54 on ryzen)
+
+### Reproduce (about 2 minutes, no person needed)
+
+Akuma up on ryzen (entry 20), no other `claude` running, then from the Mac:
+
+```sh
+HOSTIP=<station ip> XTERM=xterm-ghostty scripts/utils/ssh_pty_steps.py 2222 'exec /bin/sh -i' 110 \
+  '~2' 'cd /src/github.com/netoneko/akuma; /usr/local/bin/claude\r' \
+  '@Run/login' '/login' '@Sign in' '\r' '@Claude account' '\r' '@Paste code' '~45' \
+  '\x1b[200~AbCdEf123456#xyzSTATE\x1b[201~' '@zSTATE'
+```
+
+It stops at the last step (the paste never shows as `****…zSTATE`). Without the
+`~45` the same script passes. It reproduced on every attempt from an interactive
+shell. Launching claude straight from sshd (`'cd /tmp; /usr/local/bin/claude'`)
+passed once on a clean box and failed when an older claude was still alive.
+Each run leaves an orphaned claude (closing ssh does not end it); `kill -9` them
+between runs (safe since e672447e).
+
+### What is established
+
+- Input reaches the box and the kernel accepts it; nothing crashes; the box stays healthy.
+- While stuck, claude's **main thread never calls `read`**. Its `epoll_pwait`
+  keeps returning **1 event**, sometimes after 66 µs: some *other* fd is ready
+  over and over, and stdin is never among what it is told about.
+- During the first ~30 s on the login screen claude makes millions of syscalls:
+  decoded from `[PSTATS]` (amd64 numbers named with the asm-generic table, see
+  above), ~1 M `wait4`, ~1 M `epoll_ctl`, ~400 k `epoll_pwait`, 15–18 `vfork`.
+  That is Bun polling for the URL-opener children (`xdg-open`; `gio` exists on p3).
+  Whether that spin is the cause or a sibling symptom is open.
+- ash (claude's parent) is parked in `wait4` during the stuck state on a096dc54.
+  An earlier capture (5a577983, the user's own session) instead found ash in its
+  **prompt loop** (`uname`/`getcwd`/`rt_sigaction`), i.e. back from its wait
+  with claude still running. Both kernels lose input; the ash state may differ
+  run to run. Check it on every repro.
+
+### Ruled out
+
+| hypothesis | how |
+|---|---|
+| `TERM`, Ghostty replies, kitty keys, bracketed paste, focus events | table above |
+| a helper flipping the shared `TerminalState` back to canonical | the `[tty] raw->canonical` trace prints only ash's own transitions (leaving its line editor at Enter), never during the stuck window; a bare `\n` did **not** flush the paste on 5a577983 (it appeared to once on an older kernel with several orphaned claudes about) |
+| sshd-side input path (`delegate_pid`, pipe-vs-channel routing) | `delegate_pid` is only set by `reattach`; claude's and ash's fd 0 both stay `Stdin` |
+| `vfork` child `dup2` replacing claude's fd 0 | claude's fd table unchanged while stuck |
+| exit published through a **stale SPAWN row** (`spawn_record_exit` names whatever pid the slot's row holds) | the `[exit] slot S row names pid X …` check (a096dc54) did not fire for claude. It **did** fire once at boot (`slot 11 row names pid 13 but the exiting task is pid 12`): a real stale row, worth its own look |
+
+### Next steps, in order
+
+1. **Name the fd claude's epoll keeps reporting.** `[epoll-spin]` only fires
+   after 200 000 *identical* returns; this loop alternates. Add a per-pid
+   ring of `(fd, revents)` for the last N `epoll_pwait` returns, readable from
+   `/proc/<pid>/` or dumped on demand, and look at it in the stuck state. If fd 0
+   never appears with `EPOLLIN` while sshd has written bytes, check fd 0's
+   registration: `EPOLLONESHOT` (4211281b, new this week) disarms an entry after
+   one report until `EPOLL_CTL_MOD`; a re-arm Bun issues on a *different* epoll fd
+   (claude holds three: 3, 7, 11/12/14) or via DEL+ADD would leave it disarmed
+   forever. The ~1 M `epoll_ctl` during the spawn spin is exactly where a re-arm
+   could be lost.
+2. **Linux A/B.** Run the same `claude` binary (`/usr/local/bin/claude`, musl,
+   2.1.301) in Docker on Pop with the same steps through `script`/a PTY. If Linux
+   also loses the paste after 45 s, this is claude, not Akuma.
+3. Bun's child reaping on Linux is pidfd-based; `pidfd_open` (x86 434) — check
+   whether Akuma answers it. A fallback to `wait4` polling would explain the
+   1 M-call spin.
+4. The boot-time stale SPAWN row (slot 11) — separate bug, same family as
+   c0002a3e's "don't reissue a zombie's tid".
+
+### Workarounds for the user meanwhile
+
+- Paste the code **immediately** after `/login` prints the URL. Have the
+  browser tab ready, and do not leave the code prompt idle.
+- Or log in on another machine and copy `~/.claude/.credentials.json` (Linux
+  stores it as a file; macOS uses the Keychain).
 
 ## Background
 
