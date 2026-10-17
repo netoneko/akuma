@@ -830,12 +830,24 @@ mod stdin_starved {
             PENDING_SINCE.store(now, Relaxed);
             return;
         }
-        if now.saturating_sub(since) < STARVED_US || DUMPED.fetch_add(1, Relaxed) >= DUMPS {
+        if now.saturating_sub(since) < STARVED_US {
             return;
         }
-        akuma_primitives::safe_print!(160,
-            "[stdin-starved] pid={} tgid={} (in epfd={} ready={}) stdin pending {}ms; every epoll it holds:\n",
-            proc.pid, proc.tgid, epfd, ready_count, (now - since) / 1000);
+        // Only the epoll that actually holds fd 0: the second capture spent its
+        // whole budget on an HTTP worker's private loop. If this never fires,
+        // no thread is scanning stdin's epoll at all.
+        let holds_fd0 = akuma_primitives::irq::with_irqs_disabled(|| {
+            super::EPOLL_TABLE.lock().get(&epoll_id).is_some_and(|inst| inst.get(0).is_some())
+        });
+        if !holds_fd0 || DUMPED.fetch_add(1, Relaxed) >= DUMPS {
+            return;
+        }
+        // What this thread's probe says about fd 0 right now — the scan above
+        // just asked the same question and reported nothing.
+        let probe = super::epoll_check_fd_readiness(0, super::ep::EPOLLIN, None);
+        akuma_primitives::safe_print!(200,
+            "[stdin-starved] pid={} tgid={} in epfd={} (holds fd 0) ready={} probe(fd0)=0x{:x} stdin pending {}ms; every epoll it holds:\n",
+            proc.pid, proc.tgid, epfd, ready_count, probe, (now - since) / 1000);
         let _ = epoll_id;
         // Every epoll instance in the (shared) fd table, not just the one this
         // thread waits on: the first capture fired on an HTTP worker's private
