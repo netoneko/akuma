@@ -3,19 +3,22 @@
 **Date: 2026-10-17** · branch `main` @ `5a577983` ("tty: name who puts a raw terminal back in
 canonical mode")
 
-Three questions, asked after the amd64 port reached bare-metal self-hosting and
+Four questions, asked after the amd64 port reached bare-metal self-hosting and
 the Ryzen box became the daily driver:
 
 1. **Which production functions are only ever called from tests?** The kernel has
    functions with real test coverage and zero production callers — tested code that
-   never ships a behaviour, which is exactly the shape of the recent terminal bug
-   (a path that existed, was exercised by tests, and no runtime caller ever took).
+   never ships a behaviour. The seeding incident is
+   [`AMD64_CLAUDE_LOGIN_INPUT_STUCK.md`](AMD64_CLAUDE_LOGIN_INPUT_STUCK.md), and the
+   unwired functions cluster exactly there (§1.1).
    This audit repeats — fresh tree, fresh method — the exercise of
    [`TRIM_FAT_DEAD_CODE.md`](TRIM_FAT_DEAD_CODE.md) (2026-08-11).
 2. **Where is `unsafe` heading, and what keeps it heading the right way?**
 3. **What would it take to run Firecracker *on top of* akuma** — akuma as the host
    OS, Firecracker as an akuma userspace process — as a hardening/platform-convergence
-   accelerator?
+   accelerator? *(Scoped amd64-only, §3.3.)*
+4. **What to extract/unify into crates next** once the glue's size makes the
+   fold-batch pattern impossible to keep applying incrementally (§4).
 
 Measured with [`scripts/cloc_akuma.py`](../../scripts/cloc_akuma.py) (`--rev` / `--vs`
 for history), which separates production from test lines the way this repo actually
@@ -26,7 +29,107 @@ counter mis-attributes).
 
 ## 1. Production functions with only test callers
 
-<!-- SECTION_DEAD_CODE -->
+This repeats the exercise of [`TRIM_FAT_DEAD_CODE.md`](TRIM_FAT_DEAD_CODE.md)
+(2026-08-11) on the current tree — fresh method: extract every `pub fn`
+(~1,500 across 34 kernel crates), word-search callers with `rg -w` over
+`src/ amd64/ crates/ userspace/`, count a hit as production only if the line
+is code and precedes the file's first `#[cfg(test)]` marker; everything
+surviving (107 → 41 after same-file filtering) re-verified by reading. The
+open incident this audit was seeded by is
+[`AMD64_CLAUDE_LOGIN_INPUT_STUCK.md`](AMD64_CLAUDE_LOGIN_INPUT_STUCK.md)
+(claude's stdin stalls after idle on the ryzen metal; kernel `a096dc54`
+capture, hook `34e1f405`): the bytes sit in the kernel canonical buffer, the
+process's epoll is armed, but readiness never reports — leading hypothesis is
+that `current_channel()` probes a *different channel* than the thread that
+sees the data. The tty findings below are that seam.
+
+### 1.1 The tty stack (the incident area)
+
+- **`TerminalState::push_input` / `read_input`**
+  (`akuma-terminal/src/lib.rs:162,176`) — a complete second stdin queue,
+  documented as *the* input path ("there is currently no caller — this note is
+  for whoever wires one up"). Zero callers anywhere, tests included. Real
+  input arrives via `ProcessChannel::write_stdin` + the amd64 console pump,
+  which fires `input_waker` directly (`amd64/src/console.rs:385`), bypassing
+  `input_buffer` entirely. **A vestigial second view of stdin next to the
+  real one is exactly the incident's shape.**
+- **`ProcessChannel::is_raw_mode`** (`akuma-exec/src/process/channel.rs:556`)
+  — the raw-mode flag is written in production, never read. Raw-mode truth
+  exists in three places (channel flag, `TerminalState.is_canonical()`, the
+  amd64 console's copy); glue branches on the second. The incident initially
+  looked like exactly this bug.
+- **`get_process_channel(tid)`**
+  (`akuma-exec/src/process/exec.rs:141`) — doc: "Used by the SSH shell to get
+  a handle for interrupting a process." Never called. Production uses
+  `current_channel()` with the per-slot `get_channel(tid)` fallback the
+  incident handoff suspects. **The correct by-tid channel resolver exists;
+  production calls something else.**
+- `ChannelTable::channel_mut` (`akuma-net-unix/src/lib.rs:1096`) — unused
+  accessor, low.
+
+### 1.2 Cleanup / leak paths
+
+- **`pipe_destroy`** (`akuma-syscalls-glue/src/pipe.rs:482`) — doc names its
+  purpose precisely: a spawned child's stdin pipe read-end never closes via
+  refcounting; "`waitpid` is what knows the child is gone." The waitpid hook
+  that was to call it was never written. **Suspected per-spawn pipe-slot +
+  buffer leak on amd64** — worth a live measurement before deleting.
+- `dmesg_clear` (`akuma-kernel-core/src/console.rs:108`) — the amd64 kernel
+  wired `SYSLOG_ACTION_CLEAR` to its *own* ring (`serial.rs:162`); the
+  kernel-core ring's clear is orphaned and aarch64 has no syslog handler.
+  Divergent `dmesg -c` semantics, medium.
+- `Pipe::is_write_closed` / `is_readable` (`akuma-pipe/src/lib.rs:111,117`) —
+  the EOF/readiness predicates, unused; `amd64/src/pipe.rs` re-tests
+  emptiness by hand. Predicate-drift trap, low–medium.
+
+### 1.3 Self-tuning machinery whose adaptive half never runs
+
+`akuma-kacho`'s `WakeBudget::observe_quiet/observe_work` (the staircase that
+makes `budget()` adapt) — zero production callers: amd64 reimplemented the
+accumulation with its own `quiet_before` counter and calls only the pure
+`budget()` (`sched.rs:1127`). The exact drift the shared crate exists to
+prevent. Likewise unwired-but-running: BKL `kernel_lock_lost_ticket_recoveries`
+/ `stuck_suppressed` health counters, `reclaimed_slot_count`,
+`pressure_reclaimed_pages`, `trampoline_bail_count` — four robustness
+mechanisms that run **invisibly**: they increment counters no /proc, PSTATS
+or dmesg surface ever reads.
+
+### 1.4 Tested-but-unwired logic
+
+`MmapRegion::file_page_source` + `page_file_offset` (`akuma-mmap`) — the
+modelled file-backed-page seam, tested but never adopted (production fills
+re-derive offsets). `is_interface_query` (`akuma-syscalls-net`) — the
+dispatch predicate that exists to stop ifreq cmd-table drift between glue and
+amd64's `fd.rs`; both consumers hand-match `SIOCG*` numbers instead, and the
+amd64 comment admits it mirrors glue. `dac::may_delete` — superseded
+piecewise at its call sites; two copies of the unlink rule now drift apart.
+`generation_state` (`akuma-exec/src/process/table.rs:852`) — the stale-tid
+detector for the `c0002a3e` bug class; doc claims a test asserts on it; there
+is no test and no caller.
+
+### 1.5 Fully dead — built for production, never reached
+
+`translate_current_user_va` (the `BUSYBOX_HASH_MISCOMPUTE` post-mortem
+*prescribes* this corruption check; never wired), `map_kernel_block_2mb`,
+`remove_lazy_region`/`is_in_lazy_region`, `set_args`/`take_stdout`,
+`socket_udp_recv_ready`, the `diag.rs` lock timers ("call this around existing
+lock sites" — nobody did).
+
+Verified **fine**, do not "fix": the whole real terminal pipeline
+(`translate_output`, `process_canon_input`, `drain_canon_ready`,
+`enter/exit_raw_mode`), VINTR→SIGINT, the ext2 audit, DAC enforcement.
+
+**Decision rule** (as in the August doc): delete the dead-with-its-tests;
+*wire in* the ones with a live purpose — §1.1's tty trio and §1.3's
+observability counters are the wire-me group, and wiring them is also the
+cheapest available instrumentation for the open incident.
+
+### 1.6 Method limits
+
+Text-based: macro-generated identifiers or rename-and-re-export callers would
+be missed (top items hand-checked); feature-gated callers in non-default
+profiles would read dead (checked for the reported items); leak/cleanup
+severity is inferred from code, not from a live-VM measurement.
 
 ---
 
@@ -241,6 +344,159 @@ thing: akuma's own kernel bugs surfacing through a second, adversarial consumer
 excellent hardening pressure, but it is hardening *of akuma*, at hypervisor-scale
 cost. Path (c) M1–M2 is the part with a good value/effort ratio; the rest should
 wait until the amd64/aarch64 convergence table stops moving.
+
+---
+
+## 4. Extraction and unification candidates
+
+Where the crate fold should go next, grounded in the current tree
+(`scripts/cloc_akuma.py --json`, sizes in production lines).
+
+### 4.1 Dissolve `akuma-syscalls-glue` — the fat one
+
+The 4B fold batches established the pattern: each syscall family gets a **pure
+"deciding half" crate** (e.g. `akuma-syscalls-mem` — plans the mapping, no
+locks, no page-table edits, two leaf dependencies) and the kernel keeps the
+**acting half**. The deciding halves exist; the acting halves never left the
+19,421-line glue monolith:
+
+| glue module | lines | deciding-half counterpart |
+|---|---:|---|
+| `fs.rs` | 3,758 | none |
+| `net.rs` | 2,225 | `syscalls-net` (380) |
+| `proc.rs` | 2,109 | none |
+| `poll.rs` | 1,796 | `syscalls-poll` (1,832) |
+| `mem.rs` | 1,614 | `syscalls-mem` (926) |
+| `unixsock.rs` | 1,346 | none |
+| `sync.rs` | 947 | `syscalls-sync` (1,360) |
+| `pty.rs` + `term.rs` | 1,384 | none |
+
+`mem`, `poll`, `sync`, `net` are split half-and-half: the pure part is extracted
+and host-tested, the acting part still lives in glue. The move is per-domain
+acting crates (`akuma-syscalls-fs`, `akuma-syscalls-proc`,
+`akuma-syscalls-unixsock`) sitting next to their decision crates, until glue is
+a thin dispatch table and then gone. `fs.rs` first — it is where the amd64
+allocation-audit debt (`AKUMA_FIRECRACKER_AMD64.md` §3.24.5) is concentrated.
+
+### 4.2 One `akuma-tty`
+
+The terminal stack is smeared across `akuma-terminal`, `akuma-pty`,
+`glue/src/term.rs`, `glue/src/pty.rs`, with fbcon/uart at the edges. The line
+discipline / canonical-mode state machine — where the recent raw-terminal bug
+lived (commit `5a577983`) — has no single home. Extract one crate with the
+discipline as a pure, host-testable core (the `syscalls-mem` pattern), so that
+"who puts a raw terminal back in canonical mode" is answerable by grep.
+
+### 4.3 The fd table
+
+The port log lists "single-kernel-fd-table" as an amd64 parity gap.
+`akuma-slot-table` already provides the id-recycling machinery. Extracting the
+fd table onto it closes a convergence blocker and a spawn-ceiling
+(`AKUMA_FIRECRACKER_AMD64.md` §3.24.4) at once, and is a prerequisite for the
+microVM runner: a guest process's fd table should not be the host kernel's.
+
+### 4.4 `mmu` safe-wrapper facade
+
+`akuma-mmu` holds 549 `unsafe` lines — a third of the kernel's total (§2.2).
+It will never carry `forbid`, but the `akuma-mmap` / `akuma-user-space`
+boundary is where a safe facade belongs: map/protect/translate as checked
+wrappers, raw `unsafe` shrinking to the leaf writes. This is §2.3-1 made
+concrete.
+
+### 4.5 Smaller pairs
+
+- **`akuma-locks-rw` vs `akuma-locks-rw-cell`** — two crates, ~210 lines each;
+  merge, or document why the split survives.
+- **`fbcon`'s renderer** — 3,432 lines, 2,501 of them test code; the
+  font/glyph/subpixel part is pure and host-testable, the driver part is tiny.
+  The split `akuma-ext2` already did right (3,555 prod / 2,601 test, separate
+  concerns, `forbid`).
+- **`akuma-exec` (5,972) vs `akuma-exec-core`** — exec is the biggest non-glue
+  crate; ELF image loading arguably already belongs to `akuma-elf`.
+
+### 4.6 amd64-specific: the unsafe is where the newest code is
+
+`amd64/` is 28 % of production code (23,054 lines) but holds **61 % of all
+`unsafe` lines (1,078 of 1,760) and 73 % of all `unsafe` sites (343 of 469)**.
+The newest kernel carries the least-audited `unsafe`. Per-file worst offenders:
+`sched.rs` (189 lines / 33 sites — the context switch, including the missing
+`fxsave`), `usermode.rs` (157/31), `idt.rs` (83/39), `lapic.rs` (82/16),
+`multiboot2.rs` (66/20), `smp.rs` (65/17), `paging.rs`+`mm.rs` (63/34).
+
+Four tiers of work:
+
+1. **Trivial lifts into `forbid` crates (S each).** `port.rs` — 32 lines, 20
+   `unsafe` (raw `in`/`out`) — becomes a ~50-line `akuma-port` of safe wrappers.
+   `uaccess.rs` (copyin/copyout, 14 sites) is the textbook safe-wrapper
+   candidate: validate+copy once, callers get safe functions. `gdt.rs` (93
+   lines, 37 `unsafe`) likewise. The aarch64 twin (`akuma-uart`: 53 lines, 6
+   sites) shows the target shape. Three tiny crates, ~75 sites encapsulated.
+2. **Finish the fold on drivers that already have pure twins.** The xHCI split
+   is the model — `crates/akuma-xhci` is 2,178 lines of pure layout/bit math
+   under `#![forbid(unsafe_code)]` while `amd64/src/xhci.rs` (2,548 lines) is
+   the acting half. Same shape for hda (1,700 vs 1,138), rtw89 (3,809 vs
+   865+1,532), touchpad (2,386 vs 786). The remaining lift: MMIO register
+   access behind wrappers, so acting halves shrink toward interrupt + DMA
+   management.
+3. **Arch-generic machinery as crates (M — and hypervisor prep).** Extracting
+   `akuma-paging` (a page-table walker with a trait over PTE flag semantics)
+   is *M1 groundwork*: EPT is the same data structure with different flags, and
+   the microVM runner reuses the walker directly. `lapic.rs` wants to sit next
+   to the aarch64 timer/GIC crates. And the split between `akuma-exceptions`
+   (3,126 lines, exists) and `amd64/src/idt.rs` (2,482 lines, still 83
+   `unsafe`) deserves an audit — the boundary is undefined.
+4. **`amd64/src/dns.rs` — the one genuine duplication, and it is a live §1
+   hit.** The shared, tested `akuma_net::dns::resolve_host_blocking` hung on
+   its *first-ever amd64 caller* (SNTP bootstrap, 2026-09-05, 90 s, no
+   timeout); `dns.rs` is the hand-rolled A-record client routed around it,
+   over UDP primitives `clock.rs` already trusted. The unexercised-bug bug,
+   caught by having a second kernel — tracked in
+   `AKUMA_FIRECRACKER_AMD64.md` §3.30, and adjacent to the §3.30.4 netpoll /
+   apk-bulk-hang suspect. Fix the shared path, delete the bypass.
+
+**How the driver "duplication" question resolves: it mostly doesn't exist.**
+The amd64 kernel was built stage-by-stage *wiring the shared crates in
+unmodified* wherever the code decides anything (`blk.rs`: "the first time it
+runs a driver from the shared crates"; `sock.rs`: "Wiring, not implementation";
+`futex.rs`: "The decisions are not here"). Each amd64/src file that pairs with
+a crate is the deliberate **acting half** — `xhci.rs` is "the MMIO / DMA half
+of the xHCI driver, over `akuma_xhci`" — and both halves are always used
+together: the crate is compiled into the amd64 kernel, the acting half is what
+only the amd64 kernel can supply. Nothing is dead; there is no second copy to
+delete. What *is* per-arch and unaudited is the acting halves themselves — the
+MMIO writes, DMA `.bss` statics and ring transitions that the pure half cannot
+contain — which is precisely where §2's `unsafe` concentration sits, and why
+tier 2 of this list is extraction-plus-facade rather than dedup.
+
+Ordering: tier 1 immediately (days); tier 4's `dns.rs` fix rides the §3.30
+bug; tier 3's `akuma-paging` before §3.4 M1 so the hypervisor starts on an
+extracted, tested walker instead of a fork of `amd64/src/paging.rs`.
+
+**Next fold: platform crates for the acting halves.** The pure/acting split
+already works *within* one kernel; the natural extension is giving each
+platform's acting halves their own crates — `akuma-amd64-core` (or per-device:
+`akuma-xhci-amd64`, `akuma-lapic-amd64`, …) alongside the aarch64 equivalents —
+following the precedents that already exist: `akuma-ryzen-amd64` (machine
+description, `forbid(unsafe_code)`, host-tested against captured hardware) and
+`akuma-net-nic`'s rtl8169 glue ("the same discipline its acting half keeps").
+What that buys: (a) the DMA/aliasing contract each acting half states in
+comments becomes a crate boundary with a doc header rustdoc can't lose;
+(b) convergence accounting becomes mechanical — two platform crates with the
+same trait surface are diffable, and unpinned divergence (the CLAUDE.md rule)
+shows up as a signature change instead of a behaviour change; (c) the
+platform-crate unsafe shrinks toward the leaf MMIO, which is the §2.3
+end-state. Not urgent for files that just grew this structure (xhci, nvme);
+worth doing when a file next gets touched for §1/§4 reasons anyway.
+
+### 4.7 Tie-breaker rule
+
+The test the fold batches implicitly used: *extract what can be pure and
+host-tested; leave acting code until it has a second caller.* That criterion
+is about to change — the two follow-on experiments (a minimal self-hosting C
+kernel run under Firecracker on the Linux host, and the native microVM runner
+of §3.4) are both prospective consumers of ext2, the virtio device models, the
+tty core, and the ELF loader. If either becomes real, §4.1–4.2 stop being
+hygiene and become shared infrastructure.
 
 ---
 
