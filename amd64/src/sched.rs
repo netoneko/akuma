@@ -75,7 +75,8 @@ use crate::usermode::UserCtx;
 // the bigger crate; the two paths name one struct.
 use akuma_exec_core::process::UserContext;
 use alloc::vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use akuma_primitives::cell::BorrowCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-thread kernel stack. Generous: these are `Vec` allocations from a large
 /// heap, and a stack overflow here has no guard page to catch it.
@@ -141,11 +142,14 @@ impl FxArea {
 struct Machine {
     /// Page-table root to install when this thread runs. `0` means "the
     /// kernel's", which is what every kernel thread uses.
-    space_root: u64,
-    /// Where the syscall path saves this thread's stacks.
-    uctx: UserCtx,
+    space_root: AtomicU64,
+    /// Where the syscall path saves this thread's stacks. A [`BorrowCell`] rather
+    /// than a bag of atomics because the syscall assembly addresses it by offset
+    /// through [`BorrowCell::as_ptr`]; the cell cannot see that, and the BKL
+    /// protocol is what keeps the assembly and Rust off the same slot.
+    uctx: BorrowCell<UserCtx>,
     /// Stack the CPU switches to when this thread traps from ring 3.
-    trap_stack_top: u64,
+    trap_stack_top: AtomicU64,
     /// Base of this slot's kernel stack, and of its trap stack, or `0` if it has
     /// never been given one.
     ///
@@ -153,56 +157,50 @@ struct Machine {
     /// these, reclaiming a slot would `leak()` two fresh 32 KiB stacks every
     /// time and turn a slot leak into a memory leak — strictly worse than the
     /// exhaustion it was meant to fix.
-    stack_base: usize,
-    trap_base: usize,
-    /// This thread's SSE/x87 registers while it is not running.
-    fx: FxArea,
-    /// The Big Kernel Lock hold depth this thread was suspended at; reinstalled
-    /// on the core that resumes it. The lock itself stays with the core.
+    stack_base: AtomicUsize,
+    trap_base: AtomicUsize,
+    /// This thread's SSE/x87 registers while it is not running. Handed to
+    /// `xsave`/`xrstor` by pointer.
+    fx: BorrowCell<FxArea>,
     /// Runs for the life of the kernel and never finishes — the netpoll loop,
     /// and every core's idle thread. [`all_user_tasks_finished`] ignores these
     /// so the boot's drive loop still ends when the *shell* exits rather than
     /// spinning against a thread that is alive on purpose.
-    daemon: bool,
+    daemon: AtomicBool,
     /// The thread that runs a core when nothing else will. Never chosen by the
     /// round-robin scan; switched to explicitly, by its own core.
-    idle: bool,
+    idle: AtomicBool,
     /// The only core allowed to run this thread, or [`NO_CPU`]. The boot thread
     /// is pinned to the boot core — it drives the self-tests against that core's
     /// LAPIC — and every idle thread to its own.
-    pinned: u32,
+    pinned: AtomicU32,
 }
 
 impl Machine {
     const fn empty() -> Self {
         Self {
-            space_root: 0,
-            uctx: UserCtx::new(),
-            trap_stack_top: 0,
-            stack_base: 0,
-            trap_base: 0,
-            fx: FxArea::initial(),
-            daemon: false,
-            idle: false,
-            pinned: NO_CPU,
+            space_root: AtomicU64::new(0),
+            uctx: BorrowCell::new(UserCtx::new()),
+            trap_stack_top: AtomicU64::new(0),
+            stack_base: AtomicUsize::new(0),
+            trap_base: AtomicUsize::new(0),
+            fx: BorrowCell::new(FxArea::initial()),
+            daemon: AtomicBool::new(false),
+            idle: AtomicBool::new(false),
+            pinned: AtomicU32::new(NO_CPU),
         }
     }
 }
 
-/// `static mut`, reached only through raw pointers, **under the BKL**. Every
-/// writer is kernel code, kernel code holds the lock, and a switch keeps it
-/// held — so the table sees one core at a time.
-static mut MACHINE: [Machine; MAX_TASKS] = [const { Machine::empty() }; MAX_TASKS];
-
-/// Raw pointer to the machine table.
+/// The machine table, indexed by crate thread slot.
 ///
-/// The `&raw mut` lives behind a function for one reason: writing
-/// `(*(&raw mut MACHINE))[i]` inline trips `clippy::deref_addrof`, whose
-/// suggested fix — index `MACHINE` directly — reintroduces the `static_mut_refs`
-/// violation the raw pointer exists to avoid.
-fn machines() -> *mut [Machine; MAX_TASKS] {
-    &raw mut MACHINE
-}
+/// A plain `static`, not a `static mut`: the scalars a switch and the picker read
+/// are atomics (relaxed — the same `mov` the raw-pointer reads compiled to), and
+/// the two records the CPU and the assembly touch are [`BorrowCell`]s. Every
+/// writer is kernel code, kernel code holds the BKL, and a switch keeps it held,
+/// so the table sees one core at a time; what the types add is that a violation
+/// is a panic and not a data race. An out-of-range slot is a bounds-check panic.
+static MACHINE: [Machine; MAX_TASKS] = [const { Machine::empty() }; MAX_TASKS];
 
 /// Page-frame bits of a page-table root, matching what `akuma-mmu` records in
 /// its freed-L0 ring. `CR3`'s low 12 bits are flags (`PWT`/`PCD`) and the top
@@ -270,12 +268,9 @@ fn hook_switch_to(from: usize, to: usize) {
         SWITCH_INS[to].fetch_add(1, Ordering::Relaxed);
         LAST_CORE[to].store(smp::cpu_index() as u32, Ordering::Relaxed);
     }
-    // SAFETY: raw-pointer access to the machine table under the BKL. `from` and
-    // `to` are crate slot indices, which are in range by construction.
-    unsafe {
-        let m = machines();
-
-        let mut want = match (*m)[to].space_root {
+    let (from_m, to_m) = (&MACHINE[from], &MACHINE[to]);
+    {
+        let mut want = match to_m.space_root.load(Ordering::Relaxed) {
             0 => KERNEL_ROOT.load(Ordering::Relaxed),
             root => root,
         };
@@ -330,7 +325,7 @@ fn hook_switch_to(from: usize, to: usize) {
                 );
                 w.flush();
             }
-            (*m)[to].space_root = 0;
+            to_m.space_root.store(0, Ordering::Relaxed);
             want = KERNEL_ROOT.load(Ordering::Relaxed);
         }
         // Skip only when this core already walks exactly this root. The skip is
@@ -340,15 +335,18 @@ fn hook_switch_to(from: usize, to: usize) {
         // deferred), so equality is the same address space, never a recycled
         // frame. Under BKL here, so the gate's decision cannot race this read.
         if want != paging::active_root() {
-            paging::activate(want);
+            // SAFETY: `want` is the incoming thread's own root or the kernel's;
+            // the liveness gate above refused a recycled L0, and both map the
+            // kernel image, this stack and the heap.
+            unsafe { paging::activate(want) };
         }
 
         // Where a ring-3 trap by the incoming thread will land, on this core.
-        crate::gdt::set_kernel_stack((*m)[to].trap_stack_top);
+        crate::gdt::set_kernel_stack(to_m.trap_stack_top.load(Ordering::Relaxed));
 
         // Repoint the per-thread syscall context: the incoming thread may
         // resume inside its own syscall and read it on the way back to ring 3.
-        smp::set_current_uctx(&raw mut (*m)[to].uctx);
+        smp::set_current_uctx(to_m.uctx.as_ptr());
 
         // **Unconditionally, exactly as `%gs` below.** `IA32_FS_BASE` is one
         // register per *core*, so skipping the write when the incoming task has
@@ -368,14 +366,14 @@ fn hook_switch_to(from: usize, to: usize) {
         // Suspected in the `-j4` `#GP` at `rip=0x3004_65ec`, which is inside
         // `ld-musl` (`INTERP_BASE` is `0x3000_0000`); see
         // `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13.
-        let fs = (*m)[to].uctx.fs_base;
-        if fs == 0 && (*m)[from].uctx.fs_base != 0 && !(*m)[to].idle {
+        let (fs, gs) = to_m.uctx.with(|u| (u.fs_base, u.gs_base));
+        if fs == 0 && from_m.uctx.with(|u| u.fs_base) != 0 && !to_m.idle.load(Ordering::Relaxed) {
             // How often the window was actually open. A zero here would have
             // retired the hypothesis without a boot.
             STALE_FS_WINDOWS.fetch_add(1, Ordering::Relaxed);
         }
         crate::usermode::set_fs_base(fs);
-        crate::usermode::set_user_gs_base((*m)[to].uctx.gs_base);
+        crate::usermode::set_user_gs_base(gs);
 
         // The switch's cross-core safety argument changed 2026-09-20: it used
         // to be "`ON_CPU` is cleared before the stack moves, and no peer can
@@ -416,9 +414,14 @@ fn hook_switch_to(from: usize, to: usize) {
         check_canaries(from, "switch-out");
         check_canaries(to, "switch-in");
 
-        let fx_out = &raw mut (*m)[from].fx;
-        let fx_in = &raw const (*m)[to].fx;
-        if smp::XSAVE_ON.load(Ordering::Relaxed) {
+        let fx_out = from_m.fx.as_ptr();
+        let fx_in = to_m.fx.as_ptr().cast_const();
+        // SAFETY: both pointers are 64-byte-aligned `FxArea`s of live slots — the
+        // outgoing one is saved into, the incoming one restored from — and the
+        // switch protocol (the `ON_CPU` gate) keeps any other core off both for
+        // the duration.
+        unsafe {
+          if smp::XSAVE_ON.load(Ordering::Relaxed) {
             core::arch::asm!(
                 "xsave64 [{out}]",
                 "xrstor64 [{inp}]",
@@ -436,6 +439,7 @@ fn hook_switch_to(from: usize, to: usize) {
                 inp = in(reg) fx_in,
                 options(nostack, preserves_flags)
             );
+          }
         }
     }
 }
@@ -457,11 +461,9 @@ fn hook_transfer_lock_depth(_from: usize, _to: usize) {}
 /// idle thread.
 fn hook_can_run(slot: usize) -> bool {
     let cpu = smp::cpu_index() as u32;
-    // SAFETY: raw-pointer read under the BKL.
-    unsafe {
-        let m = &(*machines())[slot];
-        !m.idle && (m.pinned == NO_CPU || m.pinned == cpu)
-    }
+    let m = &MACHINE[slot];
+    let pinned = m.pinned.load(Ordering::Relaxed);
+    !m.idle.load(Ordering::Relaxed) && (pinned == NO_CPU || pinned == cpu)
 }
 
 /// Which task slot, if any, is still carrying `l0_base` as the root its next
@@ -510,13 +512,13 @@ fn any_task_on_space_root(l0_base: u64) -> Option<(usize, u8)> {
     if l0 == 0 {
         return None;
     }
-    // SAFETY: raw-pointer read of one `u64` per slot. Unsynchronised on
-    // purpose — a slot that acquires this root *after* the scan cannot be a
-    // problem, because acquiring it requires a live `UserAddressSpace`, whose
-    // existence is what forbids the drop running this scan.
+    // Unsynchronised on purpose — a slot that acquires this root *after* the scan
+    // cannot be a problem, because acquiring it requires a live
+    // `UserAddressSpace`, whose existence is what forbids the drop running this
+    // scan.
     (0..MAX_TASKS)
         .find(|&i| {
-            let named = unsafe { (*machines())[i].space_root & L0_BASE_MASK == l0 };
+            let named = MACHINE[i].space_root.load(Ordering::Relaxed) & L0_BASE_MASK == l0;
             named && slot_can_install(i)
         })
         .map(|i| (i, threading::get_thread_state(i)))
@@ -695,9 +697,8 @@ pub fn preempt_if_needed(from_user: bool) {
     if !smp::need_resched() {
         return;
     }
-    // SAFETY: raw-pointer read of the machine table; the BKL is not needed to
-    // read a slot this core itself is running.
-    let idle = unsafe { (*machines())[current()].idle };
+    // The BKL is not needed to read a slot this core itself is running.
+    let idle = MACHINE[current()].idle.load(Ordering::Relaxed);
     if from_user || idle {
         // Ring 3 does not hold the BKL and the idle loop dropped it for `hlt`;
         // the switch needs it. Recursive on the boot core's own kernel threads,
@@ -729,9 +730,8 @@ static TICK_SAMPLES_IDLE: AtomicU64 = AtomicU64::new(0);
 /// must do nothing but arithmetic: no lock, no allocation, no print.
 pub fn note_tick_sample() {
     let cur = current();
-    // SAFETY: raw-pointer read of this core's own machine slot, as
-    // `preempt_if_needed` does two lines away and for the same reason.
-    let idle = unsafe { (*machines())[cur].idle };
+    // This core's own slot, as `preempt_if_needed` reads it, for the same reason.
+    let idle = MACHINE[cur].idle.load(Ordering::Relaxed);
     if idle {
         TICK_SAMPLES_IDLE.fetch_add(1, Ordering::Relaxed);
     } else if let Some(c) = TICK_SAMPLES.get(cur) {
@@ -786,8 +786,7 @@ static TICK_YIELDS: AtomicU64 = AtomicU64::new(0);
 /// a thread parked on a pipe read is as live as one spinning on it.
 #[must_use]
 pub fn all_user_tasks_finished() -> bool {
-    // SAFETY: raw-pointer read of the machine table; under the BKL.
-    unsafe { (1..MAX_TASKS).all(|s| (*machines())[s].daemon || !threading::x86_slot_is_live(s)) }
+    (1..MAX_TASKS).all(|s| MACHINE[s].daemon.load(Ordering::Relaxed) || !threading::x86_slot_is_live(s))
 }
 
 // ---------------------------------------------------------------------------
@@ -979,8 +978,7 @@ pub fn current_task() -> usize {
 /// `current_uctx` with before that core runs.
 #[must_use]
 pub fn uctx_ptr(slot: usize) -> *mut UserCtx {
-    // SAFETY: the table is a `static`; the pointer is into it.
-    unsafe { &raw mut (*machines())[slot].uctx }
+    MACHINE[slot].uctx.as_ptr()
 }
 
 /// Called from the LAPIC timer handler, on the core whose timer fired.
@@ -992,15 +990,11 @@ pub fn set_need_resched() {
 pub fn init() {
     KERNEL_ROOT.store(paging::active_root(), Ordering::Relaxed);
     register_hooks();
-    // SAFETY: raw-pointer access to the machine table; under the BKL, before
-    // any switch.
-    unsafe {
-        let m = &mut (*machines())[0];
-        m.pinned = 0;
-        // The boot thread needs a live user context too: it is what the very
-        // first `enter_user_mode` publishes its kernel stack into.
-        smp::set_current_uctx(&raw mut m.uctx);
-    }
+    // Under the BKL, before any switch.
+    MACHINE[0].pinned.store(0, Ordering::Relaxed);
+    // The boot thread needs a live user context too: it is what the very first
+    // `enter_user_mode` publishes its kernel stack into.
+    smp::set_current_uctx(MACHINE[0].uctx.as_ptr());
     smp::set_current_task(0);
     threading::x86_adopt_running_thread(0);
 }
@@ -1039,16 +1033,13 @@ pub fn register_idle_task(cpu: usize) -> Option<usize> {
     // per-occupant counters itself. Low slots have usually been through the
     // boot self-tests by the time SMP bring-up runs.
     reset_slot_counters(slot);
-    // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
-    // nothing can schedule it.
-    unsafe {
-        let m = &mut (*machines())[slot];
-        m.daemon = true;
-        m.idle = true;
-        m.pinned = cpu as u32;
-        m.space_root = 0;
-        m.trap_stack_top = 0;
-    }
+    // Under the BKL; the slot is INITIALIZING, so nothing can schedule it.
+    let m = &MACHINE[slot];
+    m.daemon.store(true, Ordering::Relaxed);
+    m.idle.store(true, Ordering::Relaxed);
+    m.pinned.store(cpu as u32, Ordering::Relaxed);
+    m.space_root.store(0, Ordering::Relaxed);
+    m.trap_stack_top.store(0, Ordering::Relaxed);
     // Adopted rather than published: this is a context that already exists and
     // is about to be running, not one the scheduler will enter through a seeded
     // stack frame. `x86_adopt_running_thread` latches `ON_CPU` for it, which is
@@ -1407,10 +1398,7 @@ pub fn publish_task(task_slot: usize) {
 /// Safe to switch mid-flight: every space shares the kernel's upper-half
 /// mappings, so the kernel stack this runs on stays mapped across `mov cr3`.
 pub fn set_current_space_root(space_root: u64) {
-    // SAFETY: raw-pointer access under the BKL.
-    unsafe {
-        (*machines())[current()].space_root = space_root;
-    }
+    MACHINE[current()].space_root.store(space_root, Ordering::Relaxed);
     let want = if space_root == 0 {
         KERNEL_ROOT.load(Ordering::Relaxed)
     } else {
@@ -1471,15 +1459,14 @@ pub fn write_user_context(task_slot: usize, ctx: &UserContext) {
     if ctx.rax != 0 {
         crate::serial::puts("  [sched] write_user_context: non-zero rax dropped\n");
     }
-    // SAFETY: raw-pointer access; under the BKL, and the slot is unpublished so
-    // no core can be running it.
-    unsafe {
-        if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.uctx.fs_base = ctx.fs_base;
-            m.uctx.gs_base = ctx.gs_base;
-            m.uctx.saved_regs = ctx.regs;
-            m.uctx.forked = 1;
-        }
+    // Under the BKL, and the slot is unpublished so no core can be running it.
+    if let Some(m) = MACHINE.get(task_slot) {
+        m.uctx.with_mut(|u| {
+            u.fs_base = ctx.fs_base;
+            u.gs_base = ctx.gs_base;
+            u.saved_regs = ctx.regs;
+            u.forked = 1;
+        });
     }
 }
 
@@ -1507,11 +1494,10 @@ pub fn write_user_context(task_slot: usize, ctx: &UserContext) {
 /// callers state for themselves with `UserContext::set_child_return_zero`
 /// rather than lean on here.
 pub fn read_user_context(task_slot: usize) -> Option<UserContext> {
-    // SAFETY: raw-pointer read under the BKL. Reading the *running* slot is
-    // sound and is the common case — `fork` reads its own caller's capture,
-    // which the entry assembly wrote before this Rust ran and which nothing
-    // rewrites until the `sysret`.
-    let uctx = unsafe { (*machines()).get(task_slot).map(|m| m.uctx)? };
+    // Under the BKL. Reading the *running* slot is sound and is the common case
+    // — `fork` reads its own caller's capture, which the entry assembly wrote
+    // before this Rust ran and which nothing rewrites until the `sysret`.
+    let uctx = MACHINE.get(task_slot)?.uctx.get();
     if uctx.user_rip == 0 || uctx.user_rsp == 0 {
         return None;
     }
@@ -1779,11 +1765,16 @@ gated={} gated_dead={}\n",
         let (hits, skip_gate, skip_pin) = akuma_threading::x86_slot_pick_counts(slot);
         let (wake, woken, slot_gen) = akuma_threading::x86_slot_wait_debug(slot);
         let core = LAST_CORE[slot].load(Ordering::Relaxed);
-        // SAFETY: raw-pointer read of the machine table under the BKL, the same
-        // discipline `hook_can_run` uses; `slot` is in range by the loop bound.
-        let (root, daemon, idle, pinned) = unsafe {
-            let m = &(*machines())[slot];
-            (m.space_root, m.daemon, m.idle, m.pinned)
+        // Under the BKL, the same discipline `hook_can_run` uses; `slot` is in
+        // range by the loop bound.
+        let (root, daemon, idle, pinned) = {
+            let m = &MACHINE[slot];
+            (
+                m.space_root.load(Ordering::Relaxed),
+                m.daemon.load(Ordering::Relaxed),
+                m.idle.load(Ordering::Relaxed),
+                m.pinned.load(Ordering::Relaxed),
+            )
         };
         let pid = akuma_exec::process::pid_for_thread(slot);
         debug_assert_eq!(claimed, pid.is_some());
@@ -1854,11 +1845,8 @@ pub fn stack_canary_failures() -> u64 {
 /// outgoing one names a thread that has just overflowed, the incoming one names
 /// a victim *before* it resumes onto a frame somebody else rewrote.
 fn check_canaries(slot: usize, when: &str) {
-    // SAFETY: raw-pointer read of two `usize` fields under the BKL.
-    let (kbase, tbase) = unsafe {
-        let m = &(*machines())[slot];
-        (m.stack_base, m.trap_base)
-    };
+    let m = &MACHINE[slot];
+    let (kbase, tbase) = (m.stack_base.load(Ordering::Relaxed), m.trap_base.load(Ordering::Relaxed));
     for (base, which) in [(kbase, "kernel"), (tbase, "trap")] {
         if canary_intact(base) {
             continue;
@@ -1887,11 +1875,9 @@ fn check_canaries(slot: usize, when: &str) {
 }
 
 pub fn prepare_task_slot(slot: usize) -> Option<usize> {
-    // SAFETY: raw-pointer read; the slot is INITIALIZING and not running.
-    let (have_stack, have_trap) = unsafe {
-        let m = (*machines()).get(slot)?;
-        (m.stack_base, m.trap_base)
-    };
+    // The slot is INITIALIZING and not running.
+    let m = MACHINE.get(slot)?;
+    let (have_stack, have_trap) = (m.stack_base.load(Ordering::Relaxed), m.trap_base.load(Ordering::Relaxed));
 
     // Leaked deliberately on first use: a thread's stack must outlive the frame
     // that made it. Bounded by `MAX_TASKS`, not by how many processes ever ran,
@@ -1919,20 +1905,16 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     let trap_top = (trap_base + STACK_SIZE) & !0xf;
 
     reset_slot_counters(slot);
-    // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
-    // nothing runs on it.
-    unsafe {
-        let m = &mut (*machines())[slot];
-        m.trap_stack_top = trap_top as u64;
-        m.stack_base = stack_base;
-        m.trap_base = trap_base;
-        m.space_root = 0;
-        m.daemon = false;
-        m.idle = false;
-        m.pinned = NO_CPU;
-        m.uctx = UserCtx::new();
-        m.fx = FxArea::initial();
-    }
+    // Under the BKL; the slot is INITIALIZING, so nothing runs on it.
+    m.trap_stack_top.store(trap_top as u64, Ordering::Relaxed);
+    m.stack_base.store(stack_base, Ordering::Relaxed);
+    m.trap_base.store(trap_base, Ordering::Relaxed);
+    m.space_root.store(0, Ordering::Relaxed);
+    m.daemon.store(false, Ordering::Relaxed);
+    m.idle.store(false, Ordering::Relaxed);
+    m.pinned.store(NO_CPU, Ordering::Relaxed);
+    m.uctx.set(UserCtx::new());
+    m.fx.set(FxArea::initial());
     Some(stack_top)
 }
 
@@ -1948,12 +1930,9 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
 /// from. This is what supplies it, and forgetting it is not subtle: the first
 /// switch into the child runs ring-3 code with the kernel's page tables.
 pub fn set_task_space_root(task_slot: usize, root: u64) {
-    // SAFETY: raw-pointer access under the BKL; the slot is unpublished, so no
-    // core can be running it.
-    unsafe {
-        if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.space_root = root;
-        }
+    // Under the BKL; the slot is unpublished, so no core can be running it.
+    if let Some(m) = MACHINE.get(task_slot) {
+        m.space_root.store(root, Ordering::Relaxed);
     }
 }
 
@@ -1966,10 +1945,10 @@ pub fn set_task_space_root(task_slot: usize, root: u64) {
 /// it came from is the slot that carries it.
 #[must_use]
 pub fn task_space_root(task_slot: usize) -> u64 {
-    // SAFETY: raw-pointer read of one `u64`. Unsynchronised on purpose — the
-    // callers are a crashing core and a switch that already holds the slot —
-    // and out-of-range slots answer 0 rather than indexing.
-    unsafe { (*machines()).get(task_slot).map_or(0, |m| m.space_root) }
+    // Unsynchronised on purpose — the callers are a crashing core and a switch
+    // that already holds the slot — and out-of-range slots answer 0 rather than
+    // indexing.
+    MACHINE.get(task_slot).map_or(0, |m| m.space_root.load(Ordering::Relaxed))
 }
 
 /// Seed a not-yet-running **clone child** with the two identities its entry
@@ -1986,13 +1965,12 @@ pub fn task_space_root(task_slot: usize) -> u64 {
 /// inherits the parent's; a thread must not), so it belongs with the context
 /// that states which primitive it is.
 pub fn seed_thread_slots(task_slot: usize, proc_slot: usize, thread_slot: usize) {
-    // SAFETY: raw-pointer access under the BKL; the slot is unpublished, so no
-    // core can be running it.
-    unsafe {
-        if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.uctx.proc_slot = proc_slot;
-            m.uctx.thread_slot = thread_slot;
-        }
+    // Under the BKL; the slot is unpublished, so no core can be running it.
+    if let Some(m) = MACHINE.get(task_slot) {
+        m.uctx.with_mut(|u| {
+            u.proc_slot = proc_slot;
+            u.thread_slot = thread_slot;
+        });
     }
 }
 
@@ -2011,12 +1989,9 @@ pub fn seed_thread_slots(task_slot: usize, proc_slot: usize, thread_slot: usize)
 /// a copy of its parent's context), so one function taking both would make two
 /// unrelated requirements look like one call.
 pub fn seed_proc_slot(task_slot: usize, proc_slot: usize) {
-    // SAFETY: raw-pointer access under the BKL; the slot is unpublished, so no
-    // core can be running it.
-    unsafe {
-        if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.uctx.proc_slot = proc_slot;
-        }
+    // Under the BKL; the slot is unpublished, so no core can be running it.
+    if let Some(m) = MACHINE.get(task_slot) {
+        m.uctx.with_mut(|u| u.proc_slot = proc_slot);
     }
 }
 
@@ -2027,13 +2002,10 @@ pub fn seed_proc_slot(task_slot: usize, proc_slot: usize) {
 /// 32 KiB stacks and the next occupant reuses them, so handing it back as
 /// pristine would leak the pair.
 pub fn abandon_unpublished(task_slot: usize) {
-    // SAFETY: raw-pointer access under the BKL; never published, so no core can
-    // be running it.
-    unsafe {
-        if let Some(m) = (*machines()).get_mut(task_slot) {
-            m.space_root = 0;
-            m.uctx = UserCtx::new();
-        }
+    // Under the BKL; never published, so no core can be running it.
+    if let Some(m) = MACHINE.get(task_slot) {
+        m.space_root.store(0, Ordering::Relaxed);
+        m.uctx.set(UserCtx::new());
     }
     threading::x86_abandon(task_slot);
 }
@@ -2098,13 +2070,10 @@ fn spawn_unpublished(
     // whether this thread counts towards the boot's live-task tally. Written
     // while the slot is still INITIALIZING, which is the whole reason there is
     // no publish-immediately variant.
-    // SAFETY: raw-pointer access under the BKL; the slot is INITIALIZING, so
-    // nothing runs on it.
-    unsafe {
-        let m = &mut (*machines())[slot];
-        m.space_root = space_root;
-        m.daemon = daemon;
-    }
+    // Under the BKL; the slot is INITIALIZING, so nothing runs on it.
+    let m = &MACHINE[slot];
+    m.space_root.store(space_root, Ordering::Relaxed);
+    m.daemon.store(daemon, Ordering::Relaxed);
     Some(slot)
 }
 
@@ -2121,12 +2090,10 @@ fn spawn_unpublished(
 /// walking `argv`.
 pub fn finish() -> ! {
     note_yield(4);
-    // SAFETY: raw-pointer access; under the BKL.
-    unsafe {
-        (*machines())[current()].space_root = 0;
-        // SAFETY: the kernel root maps this stack and everything below.
-        paging::activate(KERNEL_ROOT.load(Ordering::Relaxed));
-    }
+    // Under the BKL.
+    MACHINE[current()].space_root.store(0, Ordering::Relaxed);
+    // SAFETY: the kernel root maps this stack and everything below.
+    unsafe { paging::activate(KERNEL_ROOT.load(Ordering::Relaxed)) };
     threading::x86_finish_current()
 }
 
@@ -2721,19 +2688,10 @@ pub fn user_context_smoke_test(t: &mut Suite) {
     };
     threading::update_thread_context(slot, &ctx);
 
-    // SAFETY: raw-pointer read under the BKL; the slot is unpublished, so
-    // nothing else can be touching it.
-    let (regs, fs_base, gs_base, forked, user_rip, user_rsp) = unsafe {
-        let m = &(*machines())[slot];
-        (
-            m.uctx.saved_regs,
-            m.uctx.fs_base,
-            m.uctx.gs_base,
-            m.uctx.forked,
-            m.uctx.user_rip,
-            m.uctx.user_rsp,
-        )
-    };
+    // Under the BKL; the slot is unpublished, so nothing else can be touching it.
+    let (regs, fs_base, gs_base, forked, user_rip, user_rsp) = MACHINE[slot]
+        .uctx
+        .with(|u| (u.saved_regs, u.fs_base, u.gs_base, u.forked, u.user_rip, u.user_rsp));
     t.check("uctx: the register snapshot is the parent's", regs == ctx.regs);
     t.check_eq("uctx: fs_base (the TLS musl fixes up)", fs_base, ctx.fs_base);
     t.check_eq("uctx: gs_base", gs_base, ctx.gs_base);

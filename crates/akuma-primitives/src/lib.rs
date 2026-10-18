@@ -40,6 +40,7 @@
 #![allow(clippy::declare_interior_mutable_const)]
 
 pub mod addr;
+pub mod cell;
 pub mod clock;
 pub mod rng;
 pub mod cpu;
