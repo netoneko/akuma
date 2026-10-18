@@ -2775,38 +2775,13 @@ impl Drop for UserAddressSpace {
 // `Drop` impl, which is safe here only because `amd64::paging::activate` now
 // feeds `any_core_on_l0`.
 
-/// x86_64 page permissions, as permissions rather than as an encoding.
-///
-/// The x86 half of the vocabulary `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`
-/// §1 proposes — `amd64/src/paging.rs::PteProt` already built exactly this
-/// shape; see its header for why keeping this a struct (rather than a `u64`) is
-/// the point: `write`/`exec`/`user` cannot collide the way `user_flags`'
-/// `RO`/`EXEC` constants alias on the AArch64 side.
-///
-/// # Why `PteProt` and not `Prot`
-///
-/// It was `Prot` until B3 (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`), and the
-/// name was a **shadow**: this crate does `pub use types::*`, which re-exports
-/// the neutral `akuma_mmap::Prot`, so on x86_64 `akuma_mmu::Prot` silently
-/// resolved to *this* struct instead. That is invisible while nothing shared
-/// names the type — and `akuma-syscalls-glue` names it, calling
-/// `mmu::Prot::from_prot(prot)` to turn an `mmap` argument into a region's
-/// protection. On AArch64 that is `akuma_mmap::Prot::from_prot`; on x86_64 it
-/// resolved here and failed to compile, which is the lucky outcome. Had this
-/// struct happened to carry a `from_prot`, the same source line would have
-/// produced a page-table encoding on one architecture and a region record on
-/// the other.
-///
-/// So the two levels are named apart, matching the sibling walker: [`Prot`] is
-/// what a *region* records, `PteProt` is what the *hardware* is told, and
-/// [`PteProt::from_region`] is the only bridge.
+/// The amd64 page-permission vocabulary and encoder — `akuma-pte-amd64`'s,
+/// re-exported so every `akuma_mmu::{PteProt, MemAttr, encode_pte}` call site is
+/// unchanged. They lived here until 2026-10-18; the bits are pure data and the
+/// kernel's own walker (`amd64/src/paging.rs`) needs them without this crate's
+/// `UserAddressSpace`.
 #[cfg(any(target_arch = "x86_64", test))]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct PteProt {
-    pub write: bool,
-    pub exec: bool,
-    pub user: bool,
-}
+pub use akuma_pte_amd64::{MemAttr, PteProt, encode_pte};
 
 /// One present 4 KiB leaf, as [`UserAddressSpace::for_each_leaf_in_range`]
 /// reports it.
@@ -2869,188 +2844,29 @@ pub enum LeafAction {
     Remap(usize, PteProt, bool),
 }
 
+// The entry format's names, kept under the `X86_*` spellings this file has
+// always used so the walkers below read as they did. Only the ones still used.
 #[cfg(any(target_arch = "x86_64", test))]
-impl PteProt {
-    /// User read/write, no execute. The default for data.
-    pub const USER_RW: Self = Self { write: true, exec: false, user: true };
-    /// User read + execute, not writable.
-    pub const USER_RX: Self = Self { write: false, exec: true, user: true };
-    /// User read, write **and** execute: what `Prot::RW` is on AArch64, and
-    /// since 2026-10-08 on x86 too. It is a JIT's page — V8 asks for exactly
-    /// this on its code range — and the only user shape with `NX` clear and
-    /// `R/W` set. Nothing in the kernel's own tables uses it.
-    pub const USER_RWX: Self = Self { write: true, exec: true, user: true };
-    /// Kernel read/write, no execute. The default for the kernel's own data.
-    ///
-    /// The two `KERNEL_*` constants are here rather than only in
-    /// `amd64/src/paging.rs` because that file's `PteProt` **is** this one since
-    /// amd64 step 5a: the target had two structurally identical permission
-    /// types with two encoders, pinned against each other by
-    /// [`x86_prot_matches_amd64_encoding`], and one of the two is gone. Nothing
-    /// in this crate maps a kernel page — `paging.rs` still owns the kernel's
-    /// own tables — but the *vocabulary* has to cover what that walker says, or
-    /// the pin comes back.
-    pub const KERNEL_RW: Self = Self { write: true, exec: false, user: false };
-    /// Kernel read + execute, not writable. The only executable kernel shape
-    /// offered: there is deliberately no writable-and-executable **kernel**
-    /// constructor, on either architecture. The user one is [`Self::USER_RWX`].
-    pub const KERNEL_RX: Self = Self { write: false, exec: true, user: false };
-}
-
-/// Encode a permission triple, a cacheability and the copy-on-write marker into
-/// x86_64 PTE bits — **the** encoder for this architecture.
-///
-/// `pub` since amd64 step 5a, and that is the point of it. `amd64/src/paging.rs`
-/// carried a byte-for-byte second copy of this function beside a second
-/// `PteProt`, and the two were held together by a boot self-test comparing them
-/// arm by arm. The kernel's own mappings still go through that file's walker —
-/// this crate does not do kernel mappings on either architecture — but they now
-/// encode here, so there is one answer to "what bits does this protection mean"
-/// and the self-test pins one implementation instead of an agreement between
-/// two.
-///
-/// `cow` is a separate argument rather than a field of [`PteProt`] because it is
-/// not a permission: it is a software marker the hardware ignores, and the
-/// kernel-mapping callers never set it. See [`X86_COW`].
-#[cfg(any(target_arch = "x86_64", test))]
-#[must_use]
-pub const fn encode_pte(prot: PteProt, attr: MemAttr, cow: bool) -> u64 {
-    x86_encode(prot, attr) | if cow { X86_COW } else { 0 }
-}
-
-/// How an x86_64 mapping is cached — the other half of `encode(prot, attr)`.
-/// See `amd64/src/paging.rs::MemAttr`'s header for why no consumer should
-/// care whether this becomes an `AttrIndx` (AArch64) or two PTE bits (x86).
-#[cfg(any(target_arch = "x86_64", test))]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum MemAttr {
-    /// Normal RAM: writeback cached. The only attribute any user page in
-    /// this crate's scope needs.
-    WriteBack,
-    /// Device MMIO: uncacheable, never speculatively read. Unused by
-    /// `UserAddressSpace` today (no `map_device_page` on this target yet);
-    /// present because `encode` is `pub(crate)` and a future device-mapping
-    /// method should not have to reinvent this half.
-    #[allow(dead_code)]
-    Device,
-    /// Write-combining: stores gather in the CPU's WC buffers and leave as
-    /// full-line bursts; reads are uncached. For a framebuffer mapped into ring
-    /// 3 (`/dev/fb0`, 2026-10-03). Encoded as the 4 KiB PTE's **PAT bit (7)**
-    /// with `PWT = PCD = 0`, which selects PAT entry 4 — the entry
-    /// `amd64/src/multiboot2.rs::map_wc` programs to WC on every core. On a core
-    /// where that never happened entry 4 is the firmware's WB, which under the
-    /// framebuffer's UC MTRR is UC: slow, never wrong.
-    WriteCombine,
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_P: u64 = 1 << 0;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_RW: u64 = 1 << 1;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_US: u64 = 1 << 2;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_PWT: u64 = 1 << 3;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_PCD: u64 = 1 << 4;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_PS: u64 = 1 << 7;
-/// Bit 7 of a **4 KiB leaf** is the PAT selector, not `PS` — the same bit
-/// position means "large page" one level up. Only ever written into a level-1
-/// entry, by [`MemAttr::WriteCombine`].
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_PAT_4K: u64 = 1 << 7;
-/// The cache-type bits of a 4 KiB leaf: what `Reprotect` must carry across.
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_CACHE_MASK: u64 = X86_PWT | X86_PCD | X86_PAT_4K;
-/// No-execute. Requires `EFER.NXE`, which `amd64/src/boot.s` sets alongside
-/// `LME` — without it this is a reserved bit and setting it faults. Any
-/// x86_64 kernel that links this crate without doing the same will fault the
-/// first time a non-executable page is touched, not the first time one is
-/// mapped; there is nothing this crate can check for that at map time.
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_NX: u64 = 1 << 63;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_ENTRIES: usize = 512;
-
-/// Encode a [`PteProt`] and [`MemAttr`] into x86_64 PTE bits. The x86 backend of
-/// `encode(prot, attr)` — this crate stays the only one naming `P`/`RW`/`US`/
-/// `NX`/`PCD`/`PWT`, same discipline as the AArch64 `flags` module.
-#[cfg(any(target_arch = "x86_64", test))]
-const fn x86_encode(prot: PteProt, attr: MemAttr) -> u64 {
-    let mut bits = X86_P;
-    if prot.write {
-        bits |= X86_RW;
-    }
-    if prot.user {
-        bits |= X86_US;
-    }
-    if !prot.exec {
-        bits |= X86_NX;
-    }
-    match attr {
-        MemAttr::WriteBack => {}
-        MemAttr::Device => bits |= X86_PCD | X86_PWT,
-        MemAttr::WriteCombine => bits |= X86_PAT_4K,
-    }
-    bits
-}
-
-/// The [`MemAttr`] a 4 KiB leaf's cache bits mean — the inverse of the `attr`
-/// half of [`x86_encode`] for the three shapes it writes. Any other
-/// combination (a PWT-only or PCD-only entry, which nothing here writes) reads
-/// as `Device`: not RAM, so not something a caller may refcount.
-#[cfg(any(target_arch = "x86_64", test))]
-const fn x86_decode_attr(entry: u64) -> MemAttr {
-    match entry & X86_CACHE_MASK {
-        0 => MemAttr::WriteBack,
-        X86_PAT_4K => MemAttr::WriteCombine,
-        _ => MemAttr::Device,
-    }
-}
-
-/// Index into the level-`n` table for `va`. Level 4 = PML4 … level 1 = PT.
-#[cfg(any(target_arch = "x86_64", test))]
-const fn x86_index(va: usize, level: u32) -> usize {
-    (va >> (12 + 9 * (level - 1))) & (X86_ENTRIES - 1)
-}
-
-/// # Safety
-/// `pa` must be a page-aligned frame that is either a live page table or a
-/// freshly-zeroed frame the caller is about to make one.
+use akuma_pte_amd64::encode as x86_encode;
 #[cfg(target_arch = "x86_64")]
-unsafe fn x86_table_mut(pa: u64) -> *mut u64 {
-    phys_to_virt(pa as usize).cast::<u64>()
+use akuma_pte_amd64::{
+    ADDR_MASK as X86_ADDR_MASK, COW as X86_COW, NX as X86_NX, P as X86_P, RW as X86_RW,
+    US as X86_US, decode_attr as x86_decode_attr,
+};
+
+/// Physmap view for `akuma-pagetable`: the kernel-virtual alias of a frame.
+#[cfg(target_arch = "x86_64")]
+struct KernelPhysMap;
+
+#[cfg(target_arch = "x86_64")]
+impl akuma_pagetable::PhysMap for KernelPhysMap {
+    fn table_addr(pa: u64) -> usize {
+        phys_to_virt(pa as usize) as usize
+    }
 }
 
-/// Fetch the next table down, allocating and zeroing it if absent.
-///
-/// Returns `None` if a frame could not be allocated, or if the entry is a
-/// huge page rather than a table pointer — splitting is not implemented.
 #[cfg(target_arch = "x86_64")]
-unsafe fn x86_next_table(entry_ptr: *mut u64, user: bool) -> Option<(u64, bool)> { unsafe {
-    let entry = entry_ptr.read_volatile();
-    if entry & X86_P != 0 {
-        if entry & X86_PS != 0 {
-            return None;
-        }
-        // Widen permissions on the way down: a parent that is not
-        // user-accessible or not writable masks every child on x86, so an
-        // intermediate entry has to be at least as permissive as any leaf
-        // beneath it. Enforcement lives entirely in the leaf.
-        let want = X86_P | X86_RW | if user { X86_US } else { 0 };
-        if entry & want != want {
-            entry_ptr.write_volatile((entry | want) & !X86_NX);
-        }
-        return Some((entry & X86_ADDR_MASK, false));
-    }
-    let frame = akuma_pmm::alloc_page()? as u64;
-    core::ptr::write_bytes(x86_table_mut(frame).cast::<u8>(), 0, PAGE_SIZE);
-    entry_ptr.write_volatile(frame | X86_P | X86_RW | if user { X86_US } else { 0 });
-    Some((frame, true))
-}}
+use akuma_pagetable::amd64 as x86_walk;
 
 /// Map one 4 KiB page, recording every page-table frame the walk allocates in
 /// `ledger`.
@@ -3110,77 +2926,30 @@ fn x86_map_page_in(
     if va >= USER_HALF_END {
         return false;
     }
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame reached through the physmap.
-        let entry_ptr = unsafe { x86_table_mut(table).add(x86_index(va, level)) };
-        match unsafe { x86_next_table(entry_ptr, prot.user) } {
-            Some((next, allocated)) => {
-                if allocated {
-                    let frame = PhysFrame::new(next as usize);
-                    track_frame(frame, FrameSource::UserPageTable);
-                    ledger.track_page_table_frame(frame);
-                }
-                table = next;
-            }
-            None => return false,
-        }
+    let leaf = akuma_pte_amd64::leaf(pa as u64, prot, attr, cow);
+    let mapped = x86_walk::map_leaf::<KernelPhysMap>(root, va, leaf, prot.user, || {
+        let frame = akuma_pmm::alloc_page()?;
+        let f = PhysFrame::new(frame);
+        track_frame(f, FrameSource::UserPageTable);
+        ledger.track_page_table_frame(f);
+        Some(frame as u64)
+    });
+    if mapped {
+        akuma_cpu::tlb::invlpg(va);
     }
-    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
-    unsafe {
-        x86_table_mut(table)
-            .add(x86_index(va, 1))
-            .write_volatile(pa as u64 | x86_encode(prot, attr) | if cow { X86_COW } else { 0 });
-    }
-    akuma_cpu::tlb::invlpg(va);
-    true
+    mapped
 }
 
 #[cfg(target_arch = "x86_64")]
 fn x86_unmap_page_in(root: u64, va: usize) -> Option<usize> {
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame reached through the physmap.
-        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
-        if entry & X86_P == 0 || entry & X86_PS != 0 {
-            return None;
-        }
-        table = entry & X86_ADDR_MASK;
-    }
-    // SAFETY: `table` is the PT frame.
-    let leaf = unsafe { x86_table_mut(table).add(x86_index(va, 1)) };
-    let entry = unsafe { leaf.read_volatile() };
-    if entry & X86_P == 0 {
-        return None;
-    }
-    unsafe { leaf.write_volatile(0) };
+    let frame = x86_walk::unmap::<KernelPhysMap>(root, va)?;
     akuma_cpu::tlb::invlpg(va);
-    Some((entry & X86_ADDR_MASK) as usize)
+    Some(frame as usize)
 }
 
 #[cfg(target_arch = "x86_64")]
 fn x86_translate_in(root: u64, va: usize) -> Option<usize> {
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame reached through the physmap.
-        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
-        if entry & X86_P == 0 {
-            return None;
-        }
-        if entry & X86_PS != 0 {
-            // Only PD level (2) can carry PS here; a PDPT 1 GiB page is never
-            // created by this code, so the size is fixed.
-            let size = 1u64 << 21;
-            return Some(((entry & X86_ADDR_MASK) + (va as u64 & (size - 1))) as usize);
-        }
-        table = entry & X86_ADDR_MASK;
-    }
-    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
-    let entry = unsafe { x86_table_mut(table).add(x86_index(va, 1)).read_volatile() };
-    if entry & X86_P == 0 {
-        return None;
-    }
-    Some(((entry & X86_ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1))) as usize)
+    x86_walk::translate::<KernelPhysMap>(root, va).map(|pa| pa as usize)
 }
 
 /// Is `va` mapped **and reachable from ring 3** in the table rooted at `root`?
@@ -3203,33 +2972,13 @@ fn x86_translate_in(root: u64, va: usize) -> Option<usize> {
 /// (`docs/archive/AKUMA_AMD64_C1_STEP3_PREREQUISITES.md`).
 #[cfg(target_arch = "x86_64")]
 fn x86_user_page_ok(root: u64, va: usize, need_write: bool) -> bool {
-    let mut table = root;
-    // Accumulated across levels, never reset — that is the whole point.
-    let mut us = true;
-    let mut rw = true;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame reached through the physmap;
-        // the index is masked to 0..512 by `x86_index`.
-        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
-        if entry & X86_P == 0 {
-            return false;
-        }
-        us &= entry & X86_US != 0;
-        rw &= entry & X86_RW != 0;
-        if entry & X86_PS != 0 {
-            // A large page ends the walk here.
-            return us && (!need_write || rw);
-        }
-        table = entry & X86_ADDR_MASK;
+    // `lookup` accumulates `U/S` and `R/W` across every level of the walk, which
+    // is the whole point; a large page ends the walk with what it has so far.
+    match x86_walk::lookup::<KernelPhysMap>(root, va) {
+        x86_walk::Lookup::Missing { .. } => false,
+        x86_walk::Lookup::Large { us_all, rw_all, .. }
+        | x86_walk::Lookup::Leaf { us_all, rw_all, .. } => us_all && (!need_write || rw_all),
     }
-    // SAFETY: as above; `table` is the PT frame.
-    let entry = unsafe { x86_table_mut(table).add(x86_index(va, 1)).read_volatile() };
-    if entry & X86_P == 0 {
-        return false;
-    }
-    us &= entry & X86_US != 0;
-    rw &= entry & X86_RW != 0;
-    us && (!need_write || rw)
 }
 
 /// Every page of `[va_start, va_start+len)`, checked with [`x86_user_page_ok`].
@@ -3248,99 +2997,28 @@ fn x86_user_range_ok(va_start: usize, len: usize, need_write: bool) -> bool {
 /// The active PML4, from `CR3`.
 #[cfg(target_arch = "x86_64")]
 fn x86_read_cr3() -> u64 {
-    let v: u64;
-    // SAFETY: reading CR3 copies a register into a local; it dereferences
-    // nothing and has no side effect.
-    unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags));
-    }
-    v & X86_ADDR_MASK
+    akuma_cpu::ctlreg::cr3() & X86_ADDR_MASK
 }
 
-/// Install `root` as the active PML4.
-///
-/// Stays directly in this crate rather than `akuma-cpu`, for the same reason
-/// the AArch64 `activate()`/`deactivate()`'s `msr ttbr0_el1` does: a safe
-/// wrapper in a zero-dependency crate would let any safe code repoint what
-/// the MMU dereferences.
+/// Install `root` as the active PML4 — `akuma_pagetable::amd64::load_cr3`, which
+/// states the obligation (and is why this is not in `akuma-cpu`: a safe wrapper
+/// would let any safe code repoint what the MMU dereferences).
 ///
 /// # Safety
-/// `root` must be a PML4 that maps every page the kernel is currently
-/// executing from and every page it will touch before switching back — the
-/// kernel image, its stacks, the heap, the PMM pool. A root missing any of
-/// those faults on the instruction after `mov cr3`, with no way to report it.
+/// As `load_cr3`: `root` maps everything the kernel executes from and touches
+/// before switching back.
 #[cfg(target_arch = "x86_64")]
-unsafe fn x86_write_cr3(root: u64) { unsafe {
-    core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-}}
-
-/// Copy-on-write marker. Bit 9 is one of three bits the hardware ignores in a
-/// present leaf, and `amd64/src/paging.rs` already uses exactly this one — the
-/// pinned divergence `akuma-cow` records, where AArch64 has no marker and is
-/// handed `refs > 0` instead. Kept identical to that file's `COW` so the two
-/// x86 walkers cannot disagree about what a demoted page looks like.
-#[cfg(any(target_arch = "x86_64", test))]
-const X86_COW: u64 = 1 << 9;
-
-#[cfg(any(target_arch = "x86_64", test))]
-impl PteProt {
-    /// Kernel read-only, no execute. What a `PROT_NONE` user page becomes —
-    /// x86 has no "present and wholly inaccessible" encoding, so clearing `U/S`
-    /// is what makes a ring-3 touch fault.
-    pub const KERNEL_RO: Self = Self { write: false, exec: false, user: false };
-    /// User read only — no write, no execute.
-    pub const USER_RO: Self = Self { write: false, exec: false, user: true };
-
-    /// The x86 page-table spelling of a neutral [`Prot`].
-    ///
-    /// **A byte-for-byte port of `amd64::paging::PteProt::from_region`**, whose
-    /// boot self-test pins every arm; `x86_prot_matches_amd64_encoding` pins the
-    /// same six results here as literals, so the two walkers cannot drift. The
-    /// two divergences from the AArch64 encoding are that file's, restated
-    /// because this is where someone will look:
-    ///
-    /// * `RO` and `RX` collapse. They differ only in `PXN` — whether EL1 may
-    ///   fetch — and x86 has one execute bit, not two.
-    /// * `RW` (writable **and** executable on AArch64) **was** made
-    ///   non-executable here until 2026-10-08, on the grounds that `sys_mmap`
-    ///   refused `PROT_WRITE | PROT_EXEC` and no region could carry it. Both
-    ///   halves of that went together: V8 `mprotect`s its whole code range RWX
-    ///   and every Chromium renderer died on the refusal. `RW` is now
-    ///   [`Self::USER_RWX`], the one divergence left is the `RO`/`RX` collapse,
-    ///   and `jitprobe.c` is the gate.
-    #[must_use]
-    pub const fn from_region(prot: akuma_mmap::Prot) -> Self {
-        match prot.tag() {
-            0 => Self::KERNEL_RO,
-            1 | 4 => Self::USER_RX,
-            2 => Self::USER_RWX,
-            3 => Self::USER_RW,
-            5 => Self::USER_RO,
-            // Unreachable over `Prot::ALL`. A `const fn` cannot panic out of a
-            // `u8` match, so the fallback is **fail-closed**: a seventh variant
-            // maps to a page ring 3 cannot touch, which faults visibly instead
-            // of over-granting.
-            _ => Self::KERNEL_RO,
-        }
-    }
+unsafe fn x86_write_cr3(root: u64) {
+    // SAFETY: the caller's obligation, stated above.
+    unsafe { x86_walk::load_cr3(root) };
 }
 
 /// Walk to the leaf slot for `va`, without allocating. `None` if any level is
 /// absent or a huge page (this walker never creates one, so a `PS` entry on the
 /// way down means the mapping is not a 4 KiB page and is not ours to edit).
 #[cfg(target_arch = "x86_64")]
-fn x86_leaf_slot_in(root: u64, va: usize) -> Option<*mut u64> {
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame reached through the physmap.
-        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
-        if entry & X86_P == 0 || entry & X86_PS != 0 {
-            return None;
-        }
-        table = entry & X86_ADDR_MASK;
-    }
-    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
-    Some(unsafe { x86_table_mut(table).add(x86_index(va, 1)) })
+fn x86_leaf_slot_in(root: u64, va: usize) -> Option<akuma_pagetable::Slot<'static>> {
+    x86_walk::leaf_slot::<KernelPhysMap>(root, va)
 }
 
 /// One past the last user virtual address: the low half of a 4-level x86_64
@@ -3392,69 +3070,48 @@ fn x86_walk_leaves(
     // anything (see `flush_tlb_range_all_asid`'s x86 arm).
     let mut edited = false;
     while va < end {
-        // SAFETY: every table is reached through the physmap; `root` is a live
-        // PML4 and each descent is guarded by the entry's present bit.
-        let step = unsafe {
-            let mut table = root;
-            let mut missing = 0u32;
-            for level in (2..=4).rev() {
-                let entry = x86_table_mut(table).add(x86_index(va, level)).read_volatile();
-                if entry & X86_P == 0 || entry & X86_PS != 0 {
-                    missing = level;
-                    break;
-                }
-                table = entry & X86_ADDR_MASK;
-            }
-            if missing != 0 {
-                // Nothing present under this entry: jump to the next one at the
-                // level that was missing, so an empty gigabyte costs one read.
-                let span = x86_entry_span(missing);
+        let step = match x86_walk::lookup::<KernelPhysMap>(root, va) {
+            // Nothing present under this entry (or a large page, which this walk
+            // skips): jump to the next one at the level that stopped it, so an
+            // empty gigabyte costs one read.
+            x86_walk::Lookup::Missing { level } | x86_walk::Lookup::Large { level, .. } => {
+                let span = akuma_pte_amd64::entry_span(level);
                 span - (va & (span - 1))
-            } else {
-                let slot = x86_table_mut(table).add(x86_index(va, 1));
-                let entry = slot.read_volatile();
-                if entry & X86_P != 0 {
-                    seen += 1;
-                    let leaf = Leaf {
-                        va,
-                        pa: (entry & X86_ADDR_MASK) as usize,
-                        prot: PteProt {
-                            write: entry & X86_RW != 0,
-                            exec: entry & X86_NX == 0,
-                            user: entry & X86_US != 0,
-                        },
-                        cow: entry & X86_COW != 0,
-                        attr: x86_decode_attr(entry),
-                    };
-                    match f(ledger, leaf) {
-                        LeafAction::Keep => {}
-                        LeafAction::Unmap => {
-                            slot.write_volatile(0);
-                            akuma_cpu::tlb::invlpg(va);
-                            edited = true;
-                        }
-                        LeafAction::Reprotect(prot, cow) => {
-                            // Same frame, so the same cache type: keep the old
-                            // entry's PWT/PCD/PAT. Re-encoding as WriteBack
-                            // turned an `mprotect` over a `/dev/fb0` mapping
-                            // into a 40x slower one (WC lost), and would have
-                            // made a device page cacheable.
-                            let rewritten = (entry & X86_ADDR_MASK)
-                                | (entry & X86_CACHE_MASK)
-                                | x86_encode(prot, MemAttr::WriteBack)
-                                | if cow { X86_COW } else { 0 };
-                            slot.write_volatile(rewritten);
-                            akuma_cpu::tlb::invlpg(va);
-                            edited = true;
-                        }
-                        LeafAction::Remap(pa, prot, cow) => {
-                            let rewritten = (pa as u64 & X86_ADDR_MASK)
-                                | x86_encode(prot, MemAttr::WriteBack)
-                                | if cow { X86_COW } else { 0 };
-                            slot.write_volatile(rewritten);
-                            akuma_cpu::tlb::invlpg(va);
-                            edited = true;
-                        }
+            }
+            x86_walk::Lookup::Leaf { slot, entry, .. } => {
+                seen += 1;
+                let leaf = Leaf {
+                    va,
+                    pa: (entry & X86_ADDR_MASK) as usize,
+                    prot: akuma_pte_amd64::decode_prot(entry),
+                    cow: entry & X86_COW != 0,
+                    attr: x86_decode_attr(entry),
+                };
+                match f(ledger, leaf) {
+                    LeafAction::Keep => {}
+                    LeafAction::Unmap => {
+                        slot.set(0);
+                        akuma_cpu::tlb::invlpg(va);
+                        edited = true;
+                    }
+                    LeafAction::Reprotect(prot, cow) => {
+                        // Same frame, so the same cache type: keep the old
+                        // entry's PWT/PCD/PAT. Re-encoding as WriteBack
+                        // turned an `mprotect` over a `/dev/fb0` mapping
+                        // into a 40x slower one (WC lost), and would have
+                        // made a device page cacheable.
+                        let rewritten = (entry & X86_ADDR_MASK)
+                            | (entry & akuma_pte_amd64::CACHE_MASK)
+                            | x86_encode(prot, MemAttr::WriteBack)
+                            | if cow { X86_COW } else { 0 };
+                        slot.set(rewritten);
+                        akuma_cpu::tlb::invlpg(va);
+                        edited = true;
+                    }
+                    LeafAction::Remap(pa, prot, cow) => {
+                        slot.set(akuma_pte_amd64::leaf(pa as u64, prot, MemAttr::WriteBack, cow));
+                        akuma_cpu::tlb::invlpg(va);
+                        edited = true;
                     }
                 }
                 PAGE_SIZE
@@ -3541,19 +3198,11 @@ impl UserAddressSpace {
         let _ = X86_BOOT_ROOT.compare_exchange(
             0, kroot, Ordering::AcqRel, Ordering::Acquire,
         );
-        // SAFETY: `root` is a fresh PMM frame reached through the physmap.
-        // Zeroing it is what makes it a valid empty table; the shared entries
-        // written below (aliased, not copied, from the live kernel root) are
-        // the only non-zero ones, so the whole lower half starts unmapped.
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(root), 0, PAGE_SIZE);
-            let kroot_ptr = x86_table_mut(kroot);
-            let root_ptr = x86_table_mut(root as u64);
-            for slot in Self::SHARED_PML4_SLOTS {
-                let e = kroot_ptr.add(slot).read_volatile();
-                root_ptr.add(slot).write_volatile(e);
-            }
-        }
+        // `root` is a fresh PMM frame: zeroing it makes it a valid empty table,
+        // and the shared entries (aliased, not copied, from the live kernel
+        // root) are the only non-zero ones, so the whole lower half starts
+        // unmapped.
+        x86_walk::init_root::<KernelPhysMap>(root as u64, kroot, &Self::SHARED_PML4_SLOTS);
         // This frame is an L0 again, so it is no longer a recently-freed one.
         // The AArch64 `new` does the same at the same point, and the reason is
         // the same: `l0_recently_freed` is a tripwire against installing a torn-
@@ -3939,19 +3588,15 @@ impl UserAddressSpace {
         for i in 0..pages {
             let va = (va_start & !(PAGE_SIZE - 1)) + i * PAGE_SIZE;
             let Some(leaf) = x86_leaf_slot_in(self.root as u64, va) else { continue };
-            // SAFETY: `x86_leaf_slot_in` returned a pointer into a live PT frame
-            // reached through the physmap; `&mut self` is the exclusivity the
-            // write needs.
-            unsafe {
-                let entry = leaf.read_volatile();
-                // Only writable *user* leaves are candidates: a kernel leaf is
-                // not this process's to demote, and a read-only one is either
-                // already shared or genuinely `PROT_READ`.
-                if entry & X86_P == 0 || entry & X86_US == 0 || entry & X86_RW == 0 {
-                    continue;
-                }
-                leaf.write_volatile((entry & !X86_RW) | X86_COW);
+            // `&mut self` is the exclusivity the write needs.
+            let entry = leaf.get();
+            // Only writable *user* leaves are candidates: a kernel leaf is not
+            // this process's to demote, and a read-only one is either already
+            // shared or genuinely `PROT_READ`.
+            if entry & X86_P == 0 || entry & X86_US == 0 || entry & X86_RW == 0 {
+                continue;
             }
+            leaf.set((entry & !X86_RW) | X86_COW);
             akuma_cpu::tlb::invlpg(va);
             demoted += 1;
         }
@@ -3998,20 +3643,18 @@ impl UserAddressSpace {
         let va = va & !(PAGE_SIZE - 1);
         let Some(leaf) = x86_leaf_slot_in(self.root as u64, va) else { return };
         let prot = PteProt::from_region(user_flags::from_pte(new_flags));
-        // SAFETY: a live PT slot reached through the physmap. `&self` matches
-        // the AArch64 body, which also edits through a raw pointer; the public
-        // wrappers keep `&mut self`, which is the API callers hold.
-        unsafe {
-            let old_entry = leaf.read_volatile();
-            if old_entry & X86_P == 0 {
-                return;
-            }
-            // `x86_encode` re-asserts `P`, which is already set; `MemAttr` is
-            // outside `PERM_MASK`, so a `WriteBack` encode adds nothing and a
-            // device page keeps its `PCD`/`PWT`.
-            let entry = (old_entry & !PERM_MASK) | x86_encode(prot, MemAttr::WriteBack);
-            leaf.write_volatile(entry);
+        // `&self` matches the AArch64 body, which also edits through a raw
+        // pointer; the public wrappers keep `&mut self`, which is the API
+        // callers hold.
+        let old_entry = leaf.get();
+        if old_entry & X86_P == 0 {
+            return;
         }
+        // `x86_encode` re-asserts `P`, which is already set; `MemAttr` is
+        // outside `PERM_MASK`, so a `WriteBack` encode adds nothing and a
+        // device page keeps its `PCD`/`PWT`.
+        let entry = (old_entry & !PERM_MASK) | x86_encode(prot, MemAttr::WriteBack);
+        leaf.set(entry);
         if flush {
             akuma_cpu::tlb::invlpg(va);
         }
@@ -4034,15 +3677,12 @@ impl UserAddressSpace {
         let _irq_guard = IrqGuard::new();
         let va = va & !(PAGE_SIZE - 1);
         let leaf = x86_leaf_slot_in(self.root as u64, va)?;
-        // SAFETY: a live PT slot reached through the physmap.
-        let pa = unsafe {
-            let entry = leaf.read_volatile();
-            if entry & X86_P == 0 {
-                return None;
-            }
-            leaf.write_volatile(0);
-            (entry & X86_ADDR_MASK) as usize
-        };
+        let entry = leaf.get();
+        if entry & X86_P == 0 {
+            return None;
+        }
+        leaf.set(0);
+        let pa = (entry & X86_ADDR_MASK) as usize;
         // Only hand the frame back when this dropped its *last* reference. If
         // it is still mapped at another VA, or belongs to the owner of a shared
         // view, `remove_user_frame` says so and freeing it here would be a
@@ -4057,9 +3697,8 @@ impl UserAddressSpace {
         let _irq_guard = IrqGuard::new();
         let va = va & !(PAGE_SIZE - 1);
         let Some(leaf) = x86_leaf_slot_in(self.root as u64, va) else { return };
-        // SAFETY: a live PT slot reached through the physmap. Unconditional:
-        // this copy has never read the leaf before clearing it.
-        unsafe { leaf.write_volatile(0) };
+        // Unconditional: this copy has never read the leaf before clearing it.
+        leaf.set(0);
     }
 
     /// Unmap a clean read-only user page and hand its frame back, so the next
@@ -4078,15 +3717,12 @@ impl UserAddressSpace {
         let _irq_guard = IrqGuard::new();
         let va = va & !(PAGE_SIZE - 1);
         let leaf = x86_leaf_slot_in(self.root as u64, va)?;
-        // SAFETY: a live PT slot reached through the physmap.
-        let pa = unsafe {
-            let entry = leaf.read_volatile();
-            if entry & X86_P == 0 || entry & X86_US == 0 || entry & X86_RW != 0 {
-                return None;
-            }
-            leaf.write_volatile(0);
-            (entry & X86_ADDR_MASK) as usize
-        };
+        let entry = leaf.get();
+        if entry & X86_P == 0 || entry & X86_US == 0 || entry & X86_RW != 0 {
+            return None;
+        }
+        leaf.set(0);
+        let pa = (entry & X86_ADDR_MASK) as usize;
         akuma_cpu::tlb::invlpg(va);
         let frame = PhysFrame::new(pa);
         if self.remove_user_frame(frame) { Some(frame) } else { None }
@@ -4117,8 +3753,7 @@ impl UserAddressSpace {
         let va = va & !(PAGE_SIZE - 1);
         let _irq_guard = IrqGuard::new();
         let leaf = x86_leaf_slot_in(self.root as u64, va)?;
-        // SAFETY: a live PT slot reached through the physmap.
-        let entry = unsafe { leaf.read_volatile() };
+        let entry = leaf.get();
         if entry & X86_P == 0 { None } else { Some(entry) }
     }
 
@@ -5329,46 +4964,13 @@ mod icache_tests {
 /// which is exactly how the AArch64 `user_flags` table is already treated.
 #[cfg(test)]
 mod x86_encoding_tests {
-    use super::{MemAttr, PteProt, Prot, user_flags, x86_encode, X86_COW};
-
-    #[test]
-    fn x86_prot_matches_amd64_encoding() {
-        let wb = |p| x86_encode(PteProt::from_region(p), MemAttr::WriteBack);
-        // NONE — present, kernel-only (NX set, U/S clear), so ring 3 faults.
-        assert_eq!(wb(Prot::NONE), 0x8000_0000_0000_0001);
-        // RO and RX collapse: one execute bit, no PXN to distinguish them.
-        assert_eq!(wb(Prot::RO), 0x0000_0000_0000_0005);
-        assert_eq!(wb(Prot::RX), 0x0000_0000_0000_0005);
-        // RW is RWX (NX clear, since 2026-10-08); RW_NO_EXEC keeps NX.
-        assert_eq!(wb(Prot::RW), 0x0000_0000_0000_0007);
-        assert_eq!(wb(Prot::RW_NO_EXEC), 0x8000_0000_0000_0007);
-        assert_eq!(wb(Prot::RO_NO_EXEC), 0x8000_0000_0000_0005);
-    }
-
-    /// `from_region` matches on an opaque tag and so cannot be exhaustive.
-    /// Prove the `_ =>` fallback is unreachable over `Prot::ALL`, and that the
-    /// two collapses above are the *only* ones.
-    #[test]
-    fn x86_from_region_covers_every_variant() {
-        let mut distinct = alloc::vec::Vec::new();
-        for p in Prot::ALL {
-            let e = PteProt::from_region(p);
-            if !distinct.contains(&e) {
-                distinct.push(e);
-            }
-        }
-        // Six variants, five distinct encodings: only RO/RX collapse (one
-        // execute bit, no PXN). RW and RW_NO_EXEC collapsed too until
-        // 2026-10-08, when RW became executable for V8's code range.
-        assert_eq!(distinct.len(), 5, "the set of x86 encodings changed");
-        // NONE must not have collapsed into a user-reachable one.
-        assert!(!PteProt::from_region(Prot::NONE).user);
-    }
+    use super::{MemAttr, PteProt, user_flags, x86_encode};
 
     /// The whole chain a shared caller actually travels: `akuma-exec` holds an
     /// AArch64 flag word, the x86 walker decodes it and encodes x86 bits. Each
-    /// hop is pinned on its own above; this pins the composition, which is what
-    /// `UserAddressSpace::map_page` performs.
+    /// hop is pinned on its own in `akuma-pte-amd64`; this pins the composition,
+    /// which is what `UserAddressSpace::map_page` performs — and it needs
+    /// `user_flags`, which belongs to this crate.
     #[test]
     fn aarch64_flag_word_reaches_the_right_x86_bits() {
         let via_u64 = |f: u64| x86_encode(
@@ -5381,35 +4983,5 @@ mod x86_encoding_tests {
         assert_eq!(via_u64(user_flags::RX), 0x0000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::RO_NO_EXEC), 0x8000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::NONE), 0x8000_0000_0000_0001);
-    }
-
-    /// Write-combining is the 4 KiB PAT bit alone (PAT entry 4), and every
-    /// attribute decodes back to itself — `Reprotect` and fork both rely on
-    /// reading the type off a live entry.
-    #[test]
-    fn write_combine_is_the_pat_bit_and_attrs_round_trip() {
-        use super::{x86_decode_attr, X86_CACHE_MASK, X86_PAT_4K};
-        let rw = PteProt::from_region(Prot::RW);
-        let wc = x86_encode(rw, MemAttr::WriteCombine);
-        assert_eq!(wc & X86_CACHE_MASK, X86_PAT_4K);
-        assert_eq!(X86_PAT_4K, 1 << 7);
-        assert_eq!(wc & !X86_CACHE_MASK, x86_encode(rw, MemAttr::WriteBack), "only the cache bits differ");
-        for a in [MemAttr::WriteBack, MemAttr::Device, MemAttr::WriteCombine] {
-            assert_eq!(x86_decode_attr(x86_encode(rw, a) | 0x1234_5000), a, "{a:?}");
-        }
-        assert_eq!(wc & X86_COW, 0, "the PAT bit is not the CoW marker");
-    }
-
-    /// The CoW marker is bit 9 and is not one of the bits `x86_encode` writes —
-    /// `demote_range_to_ro` ORs it onto a live entry, and
-    /// `update_page_flags_inner` must not clear it. Both properties are one
-    /// fact: `X86_COW` is disjoint from every encoded permission.
-    #[test]
-    fn cow_marker_is_disjoint_from_every_encoding() {
-        assert_eq!(X86_COW, 1 << 9, "amd64/src/paging.rs::COW is bit 9");
-        for p in Prot::ALL {
-            let e = x86_encode(PteProt::from_region(p), MemAttr::WriteBack);
-            assert_eq!(e & X86_COW, 0, "{p:?} encodes into the CoW marker bit");
-        }
     }
 }

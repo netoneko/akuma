@@ -71,225 +71,40 @@
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use crate::phys::{PHYSMAP_LIMIT, phys_ptr};
+use akuma_pagetable::PhysMap;
+use akuma_pagetable::amd64 as walk;
 
-/// Present.
-const P: u64 = 1 << 0;
-/// Writable.
-const RW: u64 = 1 << 1;
-/// User-accessible (ring 3).
-const US: u64 = 1 << 2;
-/// Page size — at PD level this means a 2 MiB page rather than a PT pointer.
-const PS: u64 = 1 << 7;
-/// Page-level write-through.
-const PWT: u64 = 1 << 3;
-/// Page-level cache disable.
-const PCD: u64 = 1 << 4;
-/// Available-to-software bit 9. The CPU ignores bits 9..11 in a PTE entirely,
-/// which is what makes one usable as the copy-on-write marker.
-///
-/// **A marker is required, not a convenience.** A CoW-demoted page and a page
-/// that is read-only *on purpose* (`mprotect(PROT_READ)`, an ELF `.rodata`
-/// segment) are byte-identical in the page table otherwise, and this target has
-/// no region table to consult instead — the PTE is the only record there is.
-/// Deciding from the share count alone promotes an `mprotect`ed page to
-/// writable the moment its frame happens to be shared, which is the trap
-/// `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` is about.
-///
-/// **Nothing in this file sets it** since step 5a — the mappings here are the
-/// kernel's own. It is kept because it is still this file's statement of *which*
-/// bit the marker is, and because `region_prot_roundtrip_check` asserts that
-/// `akuma_mmu::encode_pte`'s `cow` argument sets exactly this one and nothing
-/// else. `akuma-mmu`'s `X86_COW` is the same literal on the other side of that
-/// check, which is the point of checking it.
-const COW: u64 = 1 << 9;
+use crate::phys::phys_to_virt;
 
-/// No-execute. **Requires `EFER.NXE`**, which `boot.s` sets alongside `LME`;
-/// without it this is a reserved bit and setting it faults.
-const NX: u64 = 1 << 63;
+/// The error code the CPU pushes for vector 14, asked as questions — the crate's
+/// (`akuma-pte-amd64`), re-exported so the `crate::paging::PageFaultCode` call
+/// sites in `idt.rs` are unchanged.
+pub use akuma_pte_amd64::PageFaultCode;
 
-/// Physical address field of an entry: bits 51:12.
-const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-
-const PAGE_SIZE: usize = 4096;
-/// Entries per table: 4 KiB / 8 bytes. Also the index mask below.
-const ENTRIES: usize = 512;
-
-/// The error code the CPU pushes for vector 14, asked as questions.
-///
-/// # Why this is a type and not five `const`s at the fault site
-///
-/// It was five `const`s at the fault site — `PF_PRESENT`, `PF_WRITE` and
-/// `PF_USER` declared **inside** `idt::page_fault_dispatch`'s body, with
-/// `code & 1 == 0` written out separately a few lines above them for the
-/// not-present test. Three problems, and none of them is style:
-///
-/// - The bits had no owner. They are the fault-side counterpart of the PTE bits
-///   at the top of this module — `P`, `RW`, `US` — and a second, private
-///   spelling of them in another file is exactly the drift this target already
-///   paid for once with `PteProt` (see the module header).
-/// - Two of the five were missing. Bit 3 (a reserved bit set in a paging
-///   structure) and bit 4 (an instruction fetch) were simply not named, so the
-///   handler could not distinguish "the walker built a malformed entry" — always
-///   a kernel bug — from an ordinary protection fault, and could not tell a
-///   `#PF` on a *fetch* from one on a data access. Demand paging needs the
-///   second to decide whether a lazy page must be mapped executable.
-/// - Nothing pinned the positions. A one-off `1 << 2` typed at a call site is
-///   right or wrong with no test either way; [`smoke_test`] now checks each
-///   against a decoded value.
-///
-/// Positions are Intel SDM Vol. 3A §4.7, "Page-Fault Exceptions". Bit 4 is only
-/// ever set when `EFER.NXE` is on, which `boot.s` sets alongside `LME`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct PageFaultCode(u64);
-
-impl PageFaultCode {
-    /// Bit 0. Set: the fault was a **protection violation** on a page that is
-    /// present. Clear: the page was not present.
-    const P_BIT: u64 = 1 << 0;
-    /// Bit 1. Set: the access that faulted was a write.
-    const WR_BIT: u64 = 1 << 1;
-    /// Bit 2. Set: the access came from ring 3.
-    const US_BIT: u64 = 1 << 2;
-    /// Bit 3. Set: a reserved bit was set in one of the paging-structure
-    /// entries the walk went through.
-    const RSVD_BIT: u64 = 1 << 3;
-    /// Bit 4. Set: the access was an instruction fetch. Requires `EFER.NXE`.
-    const ID_BIT: u64 = 1 << 4;
-
-    /// Wrap the raw code the CPU pushed.
-    #[must_use]
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// The raw code, for the diagnostic printers.
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// The page was **not present**: nothing was mapped at the faulting address.
-    ///
-    /// The demand-paging question. Its complement is [`Self::protection`], and
-    /// keeping both names is deliberate — servicing a *protection* fault by
-    /// mapping a fresh page would silently defeat whatever the protection was
-    /// for.
-    #[must_use]
-    pub const fn not_present(self) -> bool {
-        self.0 & Self::P_BIT == 0
-    }
-
-    /// A present page was accessed in a way its permissions forbid.
-    #[must_use]
-    pub const fn protection(self) -> bool {
-        !self.not_present()
-    }
-
-    /// The faulting access was a write.
-    #[must_use]
-    pub const fn is_write(self) -> bool {
-        self.0 & Self::WR_BIT != 0
-    }
-
-    /// The faulting access was a **user-mode** access — it came from ring 3.
-    ///
-    /// Note this reflects the CPL of the access, not the `U/S` bit of the page:
-    /// a `copy_to_user` writing a user page from ring 0 answers `false` here.
-    #[must_use]
-    pub const fn is_user_mode(self) -> bool {
-        self.0 & Self::US_BIT != 0
-    }
-
-    /// A paging-structure entry had a reserved bit set.
-    ///
-    /// Never a userspace fault and never fixable: it means this kernel's own
-    /// walker wrote a malformed entry (the usual cause is setting [`NX`] with
-    /// `EFER.NXE` clear). Named so the handler can say so rather than reporting
-    /// a generic protection fault.
-    #[must_use]
-    pub const fn reserved_bit(self) -> bool {
-        self.0 & Self::RSVD_BIT != 0
-    }
-
-    /// The faulting access was an instruction fetch, not a data access.
-    #[must_use]
-    pub const fn instruction_fetch(self) -> bool {
-        self.0 & Self::ID_BIT != 0
-    }
-
-    /// The shape a copy-on-write break answers to: a write to a page that **is**
-    /// mapped, from either ring.
-    ///
-    /// One predicate rather than two ANDed at the call site, because both
-    /// conditions are load-bearing together and a reader has to be able to see
-    /// that. Absence would mean demand paging, not sharing; a read would mean
-    /// the page is genuinely unreadable.
-    ///
-    /// # Why ring 3 is *not* part of it
-    ///
-    /// It was, until 2026-09-07 — the fault site required `is_user_mode` — and
-    /// that was wrong in a way nothing could observe, because `CR0.WP` was also
-    /// clear and no ring-0 write ever faulted to begin with. Both halves are
-    /// fixed together (see `akuma_user_access`'s `CR0_WP`): `copy_to_user`
-    /// writes a user page **from ring 0**, so a `read(2)` into a forked child's
-    /// untouched buffer arrives here with `U/S` clear. Requiring ring 3 sends it
-    /// to the user-copy fixup instead, which is an unexplained `EFAULT` on a
-    /// perfectly ordinary read.
-    ///
-    /// Letting a supervisor write through costs nothing: the break itself
-    /// re-checks that the page is user-accessible (`prot.user`) and refuses a
-    /// kernel page, and `akuma_cow` refuses a page that is read-only on purpose
-    /// rather than CoW-marked. A ring-0 write to either still falls through to
-    /// the fixup, which is the `EFAULT` those cases deserve.
-    #[must_use]
-    pub const fn is_write_to_present_page(self) -> bool {
-        self.protection() && self.is_write()
-    }
-}
-
-/// The page-permission vocabulary and its encoder — **`akuma-mmu`'s**, since
-/// amd64 step 5a.
-///
-/// This file used to define its own `PteProt`, its own `MemAttr` and its own
-/// `encode`, structurally identical to the crate's and held in step with them by
-/// a boot self-test that compared the two arm by arm
-/// (`x86_prot_matches_amd64_encoding`). That pin existed because there were two
-/// x86 page-table walkers on this target; step 5a left one for user address
-/// spaces (`akuma_mmu::UserAddressSpace`) and one for the kernel's own
-/// mappings (this file), and a shared vocabulary between them is what stops the
-/// second pair drifting the way the first would have.
+/// The page-permission vocabulary and its encoder — `akuma-pte-amd64`'s.
 ///
 /// Re-exported rather than merely used, so the `crate::paging::{MemAttr,
 /// PteProt}` call sites in `blk.rs`, `lapic.rs`, `pci.rs`, `idt.rs` and
 /// `uaccess.rs` are unchanged: those are kernel mappings, and this is still the
-/// module that performs them.
-///
-/// The copy-on-write marker is **not** a field of [`PteProt`] and never was part
-/// of what a kernel mapping says — it is [`akuma_mmu::encode_pte`]'s third
-/// argument, and [`COW`] below is still this file's statement of which bit it
-/// is.
-pub use akuma_mmu::{MemAttr, PteProt};
+/// module that performs them. The copy-on-write marker is **not** a field of
+/// [`PteProt`] — it is `encode_pte`'s third argument, and the mappings made here
+/// are the kernel's own, which never carry it.
+pub use akuma_pte_amd64::{MemAttr, PteProt};
 
-/// Encode a [`PteProt`] and [`MemAttr`] into x86_64 PTE bits, for a **kernel**
-/// mapping — which is to say with the copy-on-write marker clear.
-///
-/// A thin forward to [`akuma_mmu::encode_pte`], kept as a local name because
-/// every walker below reads better for it, and because "kernel mappings never
-/// carry the marker" is worth stating once here rather than as a `false`
-/// repeated at each call site.
-const fn encode(prot: PteProt, attr: MemAttr) -> u64 {
-    akuma_mmu::encode_pte(prot, attr, false)
-}
+const PAGE_SIZE: usize = akuma_pte_amd64::PAGE_SIZE;
 
-/// Interpret a physical address as a page table.
+/// The physmap, as `akuma-pagetable` asks for it.
 ///
-/// # Safety
-/// `pa` must be a page-aligned frame that is either a live page table or a
-/// freshly-zeroed frame the caller is about to make one.
-unsafe fn table_mut(pa: u64) -> *mut u64 {
-    debug_assert!(pa < PHYSMAP_LIMIT, "page table outside the physmap");
-    phys_ptr::<u64>(pa)
+/// `phys_to_virt` asserts the frame is inside [`crate::phys::PHYSMAP_LIMIT`]: the
+/// moment the PMM is given memory above that, a table frame stops being
+/// reachable, and the failure mode of *not* asserting is a page fault with no IDT
+/// installed — a triple-fault and a guest that vanishes with no output.
+pub struct Physmap;
+
+impl PhysMap for Physmap {
+    fn table_addr(pa: u64) -> usize {
+        phys_to_virt(pa) as usize
+    }
 }
 
 /// The active top-level table, from `CR3`.
@@ -343,9 +158,7 @@ pub unsafe fn activate(root: u64) {
     let core = akuma_mmu::publish_l0_begin(root, crate::smp::cpu_index());
     // SAFETY: caller's obligation, stated above. Writing CR3 also flushes the
     // non-global TLB, which is what makes the switch take effect.
-    unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-    }
+    unsafe { akuma_pagetable::amd64::load_cr3(root) };
     akuma_mmu::publish_l0_end(core);
     // Restores exactly the interrupt-enable state observed above (`popfq`).
     akuma_cpu::daif::restore(flags);
@@ -380,9 +193,7 @@ pub unsafe fn activate(root: u64) {
 /// switch.
 pub unsafe fn activate_unpublished(root: u64) {
     // SAFETY: caller's obligation, stated above.
-    unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-    }
+    unsafe { akuma_pagetable::amd64::load_cr3(root) };
 }
 
 // `irq_save_mask`/`irq_restore` were here until 2026-09-08, when
@@ -393,68 +204,20 @@ pub unsafe fn activate_unpublished(root: u64) {
 
 /// The active top-level table, from `CR3`.
 fn read_cr3() -> u64 {
-    akuma_cpu::ctlreg::cr3() & ADDR_MASK
+    akuma_cpu::ctlreg::cr3() & akuma_pte_amd64::ADDR_MASK
 }
 
 /// Invalidate one page's TLB entry.
 ///
-/// The x86 counterpart of `tlbi vaae1`, and a good illustration of proposal
+/// The amd64 counterpart of `tlbi vaae1`, and a good illustration of proposal
 /// item 3: `invlpg` is *core-local*, where AArch64's `tlbi ...is` broadcasts to
-/// the inner-shareable domain. On x86 a multi-core kernel must send an IPI to
+/// the inner-shareable domain. On amd64 a multi-core kernel must send an IPI to
 /// every other core that could hold the translation — there is no broadcast
 /// form. This file's own walker edits only the kernel's boot-time tables, so
 /// core-local is complete here; user address spaces go through
 /// `akuma_mmu::flush_tlb_*`, which owns the shootdown IPI.
 fn invlpg(va: usize) {
-    // SAFETY: invalidation forces a re-walk; it cannot grant access, and it
-    // does not dereference `va`.
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
-    }
-}
-
-/// Index into the level-`n` table for `va`. Level 4 = PML4 … level 1 = PT.
-const fn index(va: usize, level: u32) -> usize {
-    (va >> (12 + 9 * (level - 1))) & (ENTRIES - 1)
-}
-
-/// Fetch the next table down, allocating and zeroing it if absent.
-///
-/// Returns `None` if a frame could not be allocated, or if the entry is a
-/// 2 MiB page rather than a table pointer — this deliberately refuses to split
-/// a large page. `boot.s`'s identity map is built from 2 MiB pages, so any
-/// attempt to map a 4 KiB page below 1 GiB lands here and is rejected loudly
-/// instead of silently corrupting the map.
-unsafe fn next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> {
-    // SAFETY: caller guarantees `entry_ptr` points into a live table.
-    let entry = unsafe { entry_ptr.read_volatile() };
-
-    if entry & P != 0 {
-        if entry & PS != 0 {
-            return None; // a 2 MiB page; splitting is not implemented
-        }
-        // Widen permissions on the way down: a parent that is not user-
-        // accessible or not writable masks every child on x86, so an
-        // intermediate entry has to be at least as permissive as any leaf
-        // beneath it. Enforcement lives entirely in the leaf.
-        let want = P | RW | if user { US } else { 0 };
-        if entry & want != want {
-            // SAFETY: as above.
-            unsafe { entry_ptr.write_volatile((entry | want) & !NX) };
-        }
-        return Some(entry & ADDR_MASK);
-    }
-
-    let frame = akuma_pmm::alloc_page()? as u64;
-    // SAFETY: a fresh PMM frame inside the identity map; zeroing it is what
-    // makes it a valid empty table.
-    unsafe {
-        core::ptr::write_bytes(phys_ptr::<u8>(frame), 0, PAGE_SIZE);
-        // Intermediate entries are permissive; the leaf decides. NX is left
-        // clear here for the same reason.
-        entry_ptr.write_volatile(frame | P | RW | if user { US } else { 0 });
-    }
-    Some(frame)
+    akuma_cpu::tlb::invlpg(va);
 }
 
 /// Map `va` to `pa` in the **active** address space.
@@ -468,29 +231,21 @@ pub fn map_page(va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
 /// a process's tables be built *before* they are activated — the alternative is
 /// switching to a half-built address space, which cannot be done safely from
 /// code that is itself running out of memory those tables describe.
+///
+/// Intermediate tables come straight from the PMM and are not tracked: these are
+/// the kernel's own mappings, which are never torn down.
 pub fn map_page_in(root: u64, va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
     assert_eq!(pa % PAGE_SIZE as u64, 0, "pa must be page aligned");
 
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame inside the identity map.
-        let entry_ptr = unsafe { table_mut(table).add(index(va, level)) };
-        // SAFETY: as above.
-        match unsafe { next_table(entry_ptr, prot.user) } {
-            Some(next) => table = next,
-            None => return false,
-        }
+    let leaf = akuma_pte_amd64::leaf(pa, prot, attr, false);
+    let mapped = walk::map_leaf::<Physmap>(root, va, leaf, prot.user, || {
+        akuma_pmm::alloc_page().map(|f| f as u64)
+    });
+    if mapped {
+        invlpg(va);
     }
-
-    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
-    unsafe {
-        table_mut(table)
-            .add(index(va, 1))
-            .write_volatile(pa | encode(prot, attr));
-    }
-    invlpg(va);
-    true
+    mapped
 }
 
 /// Remove the mapping for `va` in the active address space.
@@ -500,26 +255,9 @@ pub fn unmap_page(va: usize) -> Option<u64> {
 
 /// Remove the mapping for `va` in the address space rooted at `root`.
 pub fn unmap_page_in(root: u64, va: usize) -> Option<u64> {
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame inside the identity map.
-        let entry = unsafe { table_mut(table).add(index(va, level)).read_volatile() };
-        if entry & P == 0 || entry & PS != 0 {
-            return None;
-        }
-        table = entry & ADDR_MASK;
-    }
-    // SAFETY: `table` is the PT frame.
-    let leaf = unsafe { table_mut(table).add(index(va, 1)) };
-    // SAFETY: as above.
-    let entry = unsafe { leaf.read_volatile() };
-    if entry & P == 0 {
-        return None;
-    }
-    // SAFETY: as above.
-    unsafe { leaf.write_volatile(0) };
+    let frame = walk::unmap::<Physmap>(root, va)?;
     invlpg(va);
-    Some(entry & ADDR_MASK)
+    Some(frame)
 }
 
 /// Resolve `va` in the active address space.
@@ -531,53 +269,9 @@ pub fn translate(va: usize) -> Option<u64> {
     translate_in(read_cr3(), va)
 }
 
-/// What a page-table walk found.
-enum Walk {
-    /// Nothing maps `va`.
-    Missing,
-    /// A 2 MiB page at PD level; the entry, and the size of the page it maps.
-    Large(u64, u64),
-    /// A 4 KiB leaf entry.
-    Leaf(u64),
-}
-
-/// Walk `root` down to whatever maps `va`.
-///
-/// One walker, so that "what does this resolve to" and "what permissions does
-/// it carry" can never disagree — they are two readings of the same entry.
-fn walk_in(root: u64, va: usize) -> Walk {
-    let mut table = root;
-    for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame reached through the physmap.
-        let entry = unsafe { table_mut(table).add(index(va, level)).read_volatile() };
-        if entry & P == 0 {
-            return Walk::Missing;
-        }
-        if entry & PS != 0 {
-            // Only PD level (2) can carry PS here; a PDPT 1 GiB page is never
-            // created by this kernel, so the size is fixed.
-            return Walk::Large(entry, 1 << 21);
-        }
-        table = entry & ADDR_MASK;
-    }
-    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
-    let entry = unsafe { table_mut(table).add(index(va, 1)).read_volatile() };
-    if entry & P == 0 {
-        Walk::Missing
-    } else {
-        Walk::Leaf(entry)
-    }
-}
-
 /// Resolve `va` in the address space rooted at `root`.
 pub fn translate_in(root: u64, va: usize) -> Option<u64> {
-    match walk_in(root, va) {
-        Walk::Missing => None,
-        // `& !(size - 1)`: bit 12 of a large-page entry is the PAT bit, not an
-        // address bit (the framebuffer's PDEs carry it, `multiboot2::map_wc`).
-        Walk::Large(entry, size) => Some((entry & ADDR_MASK & !(size - 1)) + (va as u64 & (size - 1))),
-        Walk::Leaf(entry) => Some((entry & ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1))),
-    }
+    walk::translate::<Physmap>(root, va)
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -621,8 +315,8 @@ pub fn smoke_test(t: &mut Suite) {
     // The write must be visible at the *physical* address too — that is what
     // proves the mapping points where the walk said, rather than at some other
     // page that happens to be readable.
-    // SAFETY: PMM frames are inside the identity map.
-    let via_phys = unsafe { phys_ptr::<u64>(frame as u64).read_volatile() };
+    // SAFETY: PMM frames are inside the physmap.
+    let via_phys = unsafe { crate::phys::phys_ptr::<u64>(frame as u64).read_volatile() };
     t.check_eq("paging: visible via physical alias", via_phys, PATTERN);
 
     t.check_eq(
@@ -663,6 +357,7 @@ pub fn smoke_test(t: &mut Suite) {
 /// uses, so it agrees with a typo. These are the bits, written out.
 fn region_prot_roundtrip_check(t: &mut Suite) {
     use akuma_mmap::Prot;
+    use akuma_pte_amd64::encode;
 
     // The named constants first — these are live today and every mapping in the
     // kernel goes through one of them.
@@ -683,14 +378,14 @@ fn region_prot_roundtrip_check(t: &mut Suite) {
     // `USER_RW` demoted is, spelled out.
     t.check_eq(
         "prot: USER_RW demoted to CoW",
-        akuma_mmu::encode_pte(PteProt::USER_RO, MemAttr::WriteBack, true),
+        akuma_pte_amd64::encode_pte(PteProt::USER_RO, MemAttr::WriteBack, true),
         0x8000_0000_0000_0205,
     );
     t.check_eq(
         "prot: the CoW marker is bit 9 and nothing else",
-        akuma_mmu::encode_pte(PteProt::USER_RO, MemAttr::WriteBack, true)
+        akuma_pte_amd64::encode_pte(PteProt::USER_RO, MemAttr::WriteBack, true)
             ^ encode(PteProt::USER_RO, MemAttr::WriteBack),
-        COW,
+        akuma_pte_amd64::COW,
     );
     // `MemAttr::Device` is the other axis, and the LAPIC depends on it: a
     // writeback-cached MMIO register can be answered from cache and the access
@@ -782,6 +477,7 @@ fn page_fault_code_check(t: &mut Suite) {
 /// which on the AArch64 side they currently are not
 /// (`user_flags::RO == user_flags::EXEC`).
 fn nx_encoding_check(t: &mut Suite) {
+    use akuma_pte_amd64::{NX, PCD, PWT, RW, US, encode};
     let rw = encode(PteProt::KERNEL_RW, MemAttr::WriteBack);
     let rx = encode(PteProt::KERNEL_RX, MemAttr::WriteBack);
     let ro = encode(PteProt::KERNEL_RO, MemAttr::WriteBack);
@@ -811,12 +507,10 @@ fn nx_encoding_check(t: &mut Suite) {
 ///
 /// Only PML4 slot 0 is cleared: it is the only lower-half slot `boot.s` filled.
 pub fn drop_identity_map() {
+    let root = read_cr3();
+    walk::clear_root_slot::<Physmap>(root, 0);
     // SAFETY: the caller must already be running from the kernel window with a
     // physmap stack — which `boot.s`'s `high_entry` arranges before it calls
     // `kmain`. Reloading CR3 flushes the now-stale identity translations.
-    unsafe {
-        let root = read_cr3();
-        table_mut(root).write_volatile(0);
-        activate(root);
-    }
+    unsafe { activate(root) };
 }

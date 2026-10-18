@@ -116,6 +116,7 @@ dependencies = [
  "akuma-net",
  "akuma-net-rtl8169",
  "akuma-nvme",
+ "akuma-pagetable",
  "akuma-pci",
  "akuma-pipe",
  "akuma-pipes",
@@ -124,6 +125,7 @@ dependencies = [
  "akuma-power",
  "akuma-primitives",
  "akuma-procfs",
+ "akuma-pte-amd64",
  "akuma-rtw89",
  "akuma-ryzen-amd64",
  "akuma-selftest",
@@ -471,8 +473,10 @@ dependencies = [
  "akuma-cpu",
  "akuma-fdt",
  "akuma-mmap",
+ "akuma-pagetable",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-pte-amd64",
  "akuma-user-space",
  "log",
  "spinning_top",
@@ -540,6 +544,13 @@ name = "akuma-nvme"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-pagetable"
+version = "0.1.0"
+dependencies = [
+ "akuma-pte-amd64",
+]
+
+[[package]]
 name = "akuma-pci"
 version = "0.1.0"
 
@@ -590,6 +601,13 @@ dependencies = [
 [[package]]
 name = "akuma-psci"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-pte-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-mmap",
+]
 
 [[package]]
 name = "akuma-pty"

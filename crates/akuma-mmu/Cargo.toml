@@ -31,6 +31,11 @@ leak-instr = ["akuma-user-space/leak-instr"]
 smp-shared = ["akuma-bkl/smp-shared", "akuma-primitives/smp-shared"]
 
 [dependencies]
+# The amd64 entry format (bits, encoder, PteProt/MemAttr) and the table accessor
+# + 4-level walker over it. Unconditional: both are pure data / `no_std`, and the
+# x86 section of this crate is also compiled under `cfg(test)` on any host.
+akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
+akuma-pagetable = { path = "../akuma-pagetable" }
 # The safe-to-execute AArch64 instructions (barriers, cache/TLB maintenance,
 # core parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
 # functions, so the trivially-dischargeable `unsafe` blocks live in one crate

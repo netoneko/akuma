@@ -40,6 +40,8 @@ default-members = [
     "crates/akuma-dns",
     "crates/akuma-dma",
     "crates/akuma-gdt",
+    "crates/akuma-pagetable",
+    "crates/akuma-pte-amd64",
     "crates/akuma-net",
     "crates/akuma-net-nic",
     "crates/akuma-pci",
