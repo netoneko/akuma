@@ -149,6 +149,23 @@ safe — only that it did not hit it.
 - The Firecracker boot prints `[BKL] stuck: owner=1 waiter=N tag=501` several times in the first
   minute on the **baseline** kernel too (11 vs 8 on HEAD), so it is not new.
 
+## 2026-10-19: the compiler is now pinned
+
+`rust-toolchain.toml` was a floating `nightly`: the Mac built with `1.100.0-nightly
+(e457a7b0d 2026-08-27)` and ryzen with `(420ed2a0c 2026-09-18)` - the difference
+this doc's "238 symbols differ in size" finding pointed at. It is now
+`nightly-2026-09-19` (rustup's name for `420ed2a0c`), so both hosts compile with one
+rustc. On ryzen the dated name is an alias of its existing nightly
+(`ln -s nightly-x86_64-unknown-linux-gnu ~/.rustup/toolchains/nightly-2026-09-19-x86_64-unknown-linux-gnu`),
+so nothing was downloaded over the wifi link; a fresh host installs it with
+`rustup toolchain install nightly-2026-09-19 -t aarch64-unknown-none -t x86_64-unknown-none -c rust-src -c clippy -c rustfmt -c llvm-tools`.
+The newer clippy added `map_or_default`, fixed at two sites.
+
+**This removes a variable; it does not prove the hang gone.** The next step is a
+Mac build with the pinned compiler booted on the **trashcan** first (it has booted
+Mac-built kernels throughout) and only then on ryzen, where a hang needs a physical
+power-off.
+
 ## Background
 
 - The commits being verified: `79aaf04d` (`akuma-dma`, `MmioWindow`), `93c1bdc2` / `ec8eab29`
