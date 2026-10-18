@@ -60,8 +60,18 @@ The published numbers this feeds live in ``docs/archive/LINE_COUNT_ANALYSIS.md``
 which is a *living* document — re-measure and rewrite it in place rather than
 appending a new snapshot.
 
+The report also splits the tree by PLATFORM. The repo is two kernels — the
+AArch64 bin (``src/``) and the amd64 bin (``amd64/``) — over one shared crate
+pool. Which pool a crate belongs to is derived from the
+``#[cfg(target_arch = ...)]`` attributes the lexer already parsed, never from a
+hand-kept table: a crate naming exactly one arch is arch-only, anything else is
+shared. Each kernel's "links" footprint is its bin plus its arch-only crates
+plus the shared pool; the two footprints deliberately double-count the pool, so
+the gap between them is the duplication the shared-crate extraction has not yet
+absorbed.
+
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
     scripts/cloc_akuma.py --rev HEAD~5         # count a revision's tree
@@ -286,6 +296,14 @@ class FileCount:
     unsafe_code: int = 0
     #: The same, for lines the test buckets claimed.
     test_unsafe_code: int = 0
+    #: Target architectures named in `#[cfg(target_arch = "...")]` attributes
+    #: in this file. Derived from the source, not from a hand-kept table, so a
+    #: crate that grows an amd64 backend starts counting as shared without
+    #: anyone remembering to update a list. `cfg!(target_arch = ..)` macros are
+    #: NOT seen (only `#[cfg(..)]` attributes are parsed); that under-counts
+    #: towards "shared", which is the honest direction — a crate classified
+    #: arch-only has provably no code for the other arch.
+    arches: set = field(default_factory=set)
 
     @property
     def lines(self) -> int:
@@ -368,6 +386,9 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     # *context*, so those count one line and nothing more.
     unsafe_pending = False
     unsafe_spans: list = []  # open blocks: dicts of start line / brace depth
+    # Architectures named by `#[cfg(target_arch = "...")]` attributes (see
+    # FileCount.arches).
+    arches: set = set()
 
     def close_span(sp):
         for ln in range(sp["start"], line + 1):
@@ -468,6 +489,8 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                     if not pending_test:
                         pending_line = attr_line
                     pending_test = True
+            for m in ARCH_RE.finditer(text[start:j]):
+                arches.add(m.group(1))
             i = j + 1
             continue
 
@@ -563,12 +586,20 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                 # inner `unsafe { .. }` explicitly — so spanning the body here
                 # would double-count it against those inner blocks.
                 unsafe_pending = False
-            if last_ident == "unsafe":
+            if spec.rust and last_ident == "unsafe":
                 # Reached only from the identifier branch, which strings, comments,
                 # char literals and `asm!` bodies never fall through to — so this
                 # counts real `unsafe` sites, unlike a grep over the file. The line
                 # is kept, not just a tally, so `count_text` can split the sites into
                 # production and test using the same rule it buckets lines with.
+                #
+                # Gated on `spec.rust`: `unsafe` is a Rust keyword, but the
+                # non-Rust specs (Markdown, TOML, shell) have no strings or
+                # comments, so prose lexes as bare identifiers — the word
+                # "unsafe" in a crate README counted as a site and rolled up
+                # into that crate's tally, tripping the forbid-contradiction
+                # self-check. Found 2026-10-18; the three crates it flagged
+                # (pci, usb, net-rtl8169) were never guilty.
                 unsafe_lines.append(line)
                 unsafe_span.add(line)
                 unsafe_pending = True
@@ -620,12 +651,17 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
         for ln in range(sp["start"], line + 1):
             unsafe_span.add(ln)
 
-    return code, comment, test, all_file_test, unsafe_lines, unsafe_span
+    return code, comment, test, all_file_test, unsafe_lines, unsafe_span, arches
 
 
 #: A crate-level `#![forbid(unsafe_code)]`, at the start of a line so a mention
 #: inside a doc comment ("carries `#![forbid(unsafe_code)]`") does not match.
 FORBID_RE = re.compile(r"^\s*#!\[forbid\([^)]*\bunsafe_code\b", re.M)
+
+#: The arch named by a `#[cfg(target_arch = "...")]` attribute. Matched against
+#: the attribute's inner text, which the lexer has already cut out of comments
+#: and strings — a doc comment saying `target_arch = "x86_64"` does not match.
+ARCH_RE = re.compile(r'\btarget_arch\s*=\s*"([a-z0-9_]+)"')
 
 
 def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
@@ -636,9 +672,12 @@ def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
 
 def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
     nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    code, comment, test, inner_test, unsafe_lines, unsafe_span = scan(text, spec, kernel_gate)
+    code, comment, test, inner_test, unsafe_lines, unsafe_span, arches = scan(
+        text, spec, kernel_gate
+    )
 
     fc = FileCount(path=relpath, lang=spec.name)
+    fc.arches = arches
     fc.whole_file_test = is_test_path(relpath) or inner_test
     fc.forbids_unsafe = FORBID_RE.search(text) is not None and os.path.basename(
         relpath
@@ -863,6 +902,19 @@ class Agg:
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code"):
             setattr(self, f, getattr(self, f) + getattr(fc, f))
 
+    def merge(self, other: "Agg"):
+        """Add an already-aggregated bucket — footprints sum component Aggs,
+        which `add` (file-level) would misread as ten files' worth of counts."""
+        self.files += other.files
+        self.test_files += other.test_files
+        self.unsafe_sites += other.unsafe_sites
+        self.test_unsafe_sites += other.test_unsafe_sites
+        self.unsafe_code += other.unsafe_code
+        self.test_unsafe_code += other.test_unsafe_code
+        self.forbids_unsafe = self.forbids_unsafe or other.forbids_unsafe
+        for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code"):
+            setattr(self, f, getattr(self, f) + getattr(other, f))
+
     @property
     def total_code(self) -> int:
         return self.code + self.test_code
@@ -953,6 +1005,7 @@ def print_report(files: list, paths: list, ignored: int, by_file: bool, top: int
     print(rule(W))
 
     print_unsafe_report(by_comp, W)
+    print_platform_report(files, W)
 
     if top:
         print()
@@ -1084,6 +1137,120 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         prod = sum(tot(d, "unsafe_sites") for _, d in scopes)
         test = sum(tot(d, "test_unsafe_sites") for _, d in scopes)
         print(f"{'tree':<26}{prod + test:>11}{prod:>12}{test:>8}")
+    print(rule(W))
+
+
+# ---------------------------------------------------------------------------
+# platforms
+# ---------------------------------------------------------------------------
+
+
+def platform_buckets(files: list) -> dict:
+    """Group every component into a platform bucket, derived from the source.
+
+    The tree is two kernels over one shared crate pool: `src/` is the AArch64
+    bin, `amd64/` is the second bin, `crates/` serve whichever kernels link
+    them. Whether a crate serves both is not something a hand-kept table can be
+    trusted with — new crates appear every few days — so it is derived from the
+    `#[cfg(target_arch = ...)]` attributes the lexer already parsed:
+
+      amd64-only   — names exactly one arch, x86_64
+      aarch64-only — names exactly one arch, aarch64
+      shared       — names both, or neither (arch-neutral code compiles for
+                     either; classifying it as shared understates nothing)
+
+    The failure mode of getting this wrong is one-directional and flattering:
+    an amd64-only crate that drifts into "shared" is counted in the AArch64
+    kernel's footprint too, inflating it with code that never runs there.
+    Naming exactly one arch is the only claim the source itself backs, so
+    anything else is shared.
+    """
+    comp_arches: dict = {}
+    for fc in files:
+        comp_arches.setdefault(component_of(fc.path), set()).update(fc.arches)
+
+    buckets: dict = {}
+    for comp, arches in comp_arches.items():
+        if comp == "src" or comp.startswith("src" + os.sep):
+            buckets.setdefault("aarch64 bin", []).append(comp)
+        elif comp == "amd64" or comp.startswith("amd64" + os.sep):
+            buckets.setdefault("amd64 bin", []).append(comp)
+        elif arches == {"x86_64"}:
+            buckets.setdefault("amd64-only crates", []).append(comp)
+        elif arches == {"aarch64"}:
+            buckets.setdefault("aarch64-only crates", []).append(comp)
+        else:
+            buckets.setdefault("shared crates", []).append(comp)
+    return buckets
+
+
+def print_platform_report(files: list, W: int) -> None:
+    """Per-platform view: what each kernel is actually made of.
+
+    The component table above answers "where does the code live"; this answers
+    "what does each kernel link", which is a different question — the shared
+    pool belongs to both, so the two footprints deliberately double-count it
+    and their sum is larger than the tree. A bin's footprint is its own source
+    plus its arch-only crates plus the shared pool; that is the number to
+    compare across the two kernels, and the gap between the footprints is the
+    duplication + arch asymmetry the shared-crate extraction has not yet
+    absorbed.
+    """
+    buckets = platform_buckets(files)
+    if not buckets:
+        return
+    by_bucket: dict = {}
+    members: dict = {}
+    for name, comps in buckets.items():
+        agg = by_bucket.setdefault(name, Agg())
+        for fc in files:
+            if component_of(fc.path) in comps:
+                agg.add(fc)
+                members.setdefault(name, set()).add(fc.path.split(os.sep)[1])
+
+    print()
+    print(rule(W))
+    print("By platform")
+    print(rule(W))
+    print(
+        f"{'Bucket':<24}{'files':>8}{'prod code':>11}{'test code':>11}"
+        f"{'unsafe':>8}{'enforced':>10}"
+    )
+    print(rule(W))
+    order = ("aarch64 bin", "amd64 bin", "aarch64-only crates",
+             "amd64-only crates", "shared crates")
+    for name in order:
+        if name not in by_bucket:
+            continue
+        agg = by_bucket[name]
+        mark = "forbid" if agg.forbids_unsafe else ""
+        print(
+            f"{name:<24}{agg.files:>8}{agg.code:>11}{agg.test_code:>11}"
+            f"{agg.unsafe_sites:>8}{mark:>10}"
+        )
+    print(rule(W))
+
+    for label, bin_key, only_key in (
+        ("aarch64 kernel links", "aarch64 bin", "aarch64-only crates"),
+        ("amd64 kernel links", "amd64 bin", "amd64-only crates"),
+    ):
+        parts = [by_bucket[k] for k in (bin_key, only_key, "shared crates") if k in by_bucket]
+        if not parts:
+            continue
+        tot = Agg()
+        for agg in parts:
+            tot.merge(agg)
+        print(f"{label:<24}{tot.files:>8}{tot.code:>11}{tot.test_code:>11}{tot.unsafe_sites:>8}")
+
+    for name in ("aarch64-only crates", "amd64-only crates"):
+        if name in members:
+            crates = sorted(members[name])
+            print(f"{name}: {', '.join(crates)}")
+    print(rule(W))
+    print("Shared crates are counted in both footprints, so the two `links` rows")
+    print("sum to more than the tree. Attribution is derived from")
+    print("#[cfg(target_arch = ..)] attributes; a crate naming both arches (or")
+    print("neither) counts as shared. cfg!() macros are not parsed.")
     print(rule(W))
 
 
@@ -1390,6 +1557,38 @@ def self_test() -> int:
     else:
         print("  ok   site count stays under the naive substring upper bound")
 
+    # Arch attribution: the platform buckets are only as honest as the
+    # extraction underneath them. Pinned: a real cfg names its arch; a mention
+    # in a doc comment or string does not; an arch mentioned only inside a
+    # `cfg(test)`-gated attribute still counts (it is in an attribute, and the
+    # alternative — silently reclassifying a crate as shared because its test
+    # pokes the other arch — is exactly the flattering direction).
+    arch_cases = [
+        ('#[cfg(target_arch = "x86_64")]\nfn f() {}\n', {"x86_64"}),
+        ('#[cfg(all(target_arch = "aarch64", feature = "x"))]\nfn f() {}\n', {"aarch64"}),
+        ('#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]\nfn f() {}\n',
+         {"x86_64", "aarch64"}),
+        ('//! docs say target_arch = "x86_64"\nfn f() {}\n', set()),
+        ('fn f() {\n    p("target_arch = \\"x86_64\\"");\n}\n', set()),
+    ]
+    for src, want in arch_cases:
+        fc = count_text(src, "probe.rs", spec, True)
+        ok = fc.arches == want
+        failures += 0 if ok else 1
+        print(f"  {'ok  ' if ok else 'FAIL'} arch extraction {src.splitlines()[0][:50]!r}")
+        if not ok:
+            print(f"       want {want}, got {fc.arches}")
+
+    # ...and the failure this whole platform section indirectly flushed out:
+    # `unsafe` in a Markdown README must not count as a site (it rolled up into
+    # the crate's tally and tripped the forbid-contradiction check below).
+    md = count_text("# unsafe\n\nthe `unsafe` keyword\n", "r.md", EXT_LANGS[".md"], True)
+    ok = md.unsafe_sites == 0
+    failures += 0 if ok else 1
+    print(f"  {'ok  ' if ok else 'FAIL'} prose 'unsafe' in Markdown is not a site")
+    if not ok:
+        print(f"       got {md.unsafe_sites} sites")
+
     print()
     print("self-test: " + ("PASS" if failures == 0 else f"{failures} FAILURE(S)"))
     return 0 if failures == 0 else 1
@@ -1423,6 +1622,14 @@ def emit_json(files: list, paths: list) -> None:
             "forbids_unsafe": agg.forbids_unsafe,
         }
 
+    by_platform: dict = {}
+    for name, comps in platform_buckets(files).items():
+        agg = Agg()
+        for fc in files:
+            if component_of(fc.path) in comps:
+                agg.add(fc)
+        by_platform[name] = dict(dump(agg), components=sorted(comps))
+
     print(
         json.dumps(
             {
@@ -1430,6 +1637,7 @@ def emit_json(files: list, paths: list) -> None:
                 "total": dump(total),
                 "by_language": {k: dump(v) for k, v in by_lang.items()},
                 "by_component": {k: dump(v) for k, v in by_comp.items()},
+                "by_platform": by_platform,
                 "by_file": [
                     {
                         "path": fc.path,
@@ -1455,7 +1663,7 @@ def emit_json(files: list, paths: list) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=["src", "crates"], help="files/dirs (default: src crates)")
+    ap.add_argument("paths", nargs="*", default=["src", "crates", "amd64"], help="files/dirs (default: src crates)")
     ap.add_argument("--by-file", action="store_true", help="per-file table")
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1476,7 +1684,7 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    paths = args.paths or ["src", "crates"]
+    paths = args.paths or ["src", "amd64", "crates"]
     kernel_gate = not args.no_kernel_test_gate
 
     if args.rev:
