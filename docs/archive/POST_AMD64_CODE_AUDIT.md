@@ -87,7 +87,9 @@ first, and the instrument it asked for now exists: `/proc/health`'s `pipes_live`
 `pipes_high_water` / `pipes_refused` (see §1.3). Measured on QEMU amd64, 80
 consecutive ssh exec sessions (the workload that died at ~44 in
 `proposals/AMD64_SPAWN_PIPE_LEAK.md`): `pipes_live 1 → 1`, `pipes_high_water 1`,
-`pipes_refused 0`. Not yet measured on metal.
+`pipes_refused 0`. On the trashcan after boot plus a handful of `hget` runs:
+`pipes_live 2`, `pipes_high_water 4`, `pipes_refused 0` — healthy, but not a
+churn test; the 80-session run was QEMU only.
 
 - `dmesg_clear` (`akuma-kernel-core/src/console.rs:108`) — the amd64 kernel
   wired `SYSLOG_ACTION_CLEAR` to its *own* ring (`serial.rs:162`); the
@@ -537,7 +539,13 @@ configured resolver is final there. Side effect worth naming: the amd64 call now
 waits through `blocking_relax` (drops the BKL while parked) where `dns.rs` called
 `yield_now` directly. Verified on QEMU amd64 (boot SNTP; `hget example.com` walks
 `10.0.2.3 → 1.1.1.1` in 0.13 s; a nonexistent name fails in under a second) and
-AArch64/HVF (resolves; fails fast). **Not yet verified on metal.**
+AArch64/HVF (resolves; fails fast), and **on the trashcan** (kernel `8436ea8f`,
+`no-tests`, installed over `/boot/akuma-amd64`, rebooted): boot SNTP synced via
+the shared client, `hget` of `example.com` over http and https both succeed in
+0.05 s, a nonexistent name fails in 0.05 s with `1.1.1.1` and `8.8.8.8` each
+reporting `no record`, and `/proc/health` reads back on real hardware. The box's
+own uplink resolver is `1.1.1.1`, so the `NXDOMAIN` walk itself (the QEMU slirp
+case) was not exercised on metal.
 
 Ordering: tier 1 immediately (days); tier 4's `dns.rs` fix rides the §3.30
 bug; tier 3's `akuma-paging` before §3.4 M1 so the hypervisor starts on an
