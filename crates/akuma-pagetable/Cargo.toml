@@ -1,0 +1,13 @@
+[package]
+name = "akuma-pagetable"
+version = "0.1.0"
+edition = "2024"
+description = "Page tables in memory: Table (a 4 KiB frame of 512 atomic entries) and Slot, plus the amd64 4-level walker over akuma-pte-amd64's entry format. Every dereference of a page-table frame in the tree, behind one stated contract. no_std"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The entry format: bits, `step_down`, `entry_span`. Pure and forbid(unsafe_code);
+# this crate adds the memory access.
+akuma-pte-amd64 = { path = "../akuma-pte-amd64" }

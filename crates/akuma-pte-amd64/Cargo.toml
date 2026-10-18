@@ -1,0 +1,13 @@
+[package]
+name = "akuma-pte-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 (x86-64 long mode) page-table entry as data: bit positions, the permission/cacheability encoder and its inverse, the copy-on-write marker, the rules for descending through an intermediate entry, and the #PF error code. Pure, host-tested, forbid(unsafe_code); reading and writing the tables is akuma-pagetable's"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `Prot` — the region vocabulary `PteProt::from_region` translates. akuma-mmap
+# has no dependencies of its own, so this adds nothing below it.
+akuma-mmap = { path = "../akuma-mmap" }
