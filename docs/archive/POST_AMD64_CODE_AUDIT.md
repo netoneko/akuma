@@ -550,6 +550,13 @@ an exclusive end against an inclusive `USER_VA_LIMIT`. amd64's is the correct on
 a boot test pins it, and the shared one is stricter on both architectures - so they
 were not unified.
 
+*Verified* on QEMU (boot suite 814/0, SMAP on) and on the trashcan (kernel
+`a1022dcd`, `no-tests`): it boots, enumerates 15 PCI functions, calibrates, syncs
+the clock, serves `hget` over http and https and spawns processes, so the new
+GDT/TSS and `sysret`/`iretq` frames work in ring 3 on real hardware. **The trashcan
+is a Haswell i5-4460: SMEP but no SMAP**, so the removal of the outer `stac`/`clac`
+was exercised with SMAP on only under QEMU; the Ryzen would be the metal check.
+
 **The gate (§2.3-2).** `scripts/check_unsafe_budget.py` against
 `docs/reference/unsafe-budget.json`: per component (`src`, `amd64`, `crates/<n>`)
 the production `unsafe` sites allowed, and which components forbid. Growth, a new
