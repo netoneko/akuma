@@ -1,3 +1,9 @@
 [toolchain]
-channel = "nightly"
-
+# Pinned 2026-10-19 to the compiler that builds the kernels that boot on ryzen
+# metal: rustc 1.100.0-nightly (420ed2a0c 2026-09-18), which rustup names
+# nightly-2026-09-19. A floating `nightly` meant the Mac and ryzen compiled
+# different programs (238 symbols differed in size) while a Mac-built kernel hung
+# on ryzen and a ryzen-built one did not
+# (docs/archive/AMD64_MAC_BUILT_KERNEL_METAL_HANG.md). Move it deliberately, on
+# every build host at once.
+channel = "nightly-2026-09-19"

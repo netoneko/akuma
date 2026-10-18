@@ -427,8 +427,7 @@ fn wake_accept_waiters(listener: u32) {
     let handles: Vec<WakeHandle> = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut map = ACCEPT_WAITERS.lock();
         map.get_mut(&listener)
-            .map(|w| core::mem::take(w).into_values().collect())
-            .unwrap_or_default()
+            .map_or_default(|w| core::mem::take(w).into_values().collect())
     });
     for h in handles {
         wake_by_handle(h);

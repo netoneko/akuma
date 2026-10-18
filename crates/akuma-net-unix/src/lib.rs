@@ -1254,7 +1254,7 @@ impl UnixTable {
             return Vec::new();
         };
         if pop_record {
-            return ch.records.pop_front().map(|r| r.anc_fds).unwrap_or_default();
+            return ch.records.pop_front().map_or_default(|r| r.anc_fds);
         }
         // Stream: consume the un-recorded leading bytes first, then walk the
         // records. The order matters — those bytes sit *ahead* of every record,
