@@ -129,6 +129,39 @@ Not exercised: `net.rs`'s rtl8169 MMIO (trashcan only, and untouched here),
 p3 state: `/boot/akuma-amd64` = head `no-tests` built natively at `b37eb82f`
 (md5 `12d532a2...`), `.prev` = `a028cec9`; ryzen back on Pop.
 
+## 2026-10-19: the AArch64 half (`akuma-mmu`, `akuma-exceptions`), 517 -> 486 sites
+
+- `akuma-mmu` 80 -> 31 (`fb71bb62`): every AArch64 table walk reaches a frame
+  through one helper (`table`/`table_phys`, `akuma_pagetable::Table::at`'s
+  contract) instead of `phys_to_virt(pa) as *mut u64` + volatile access.
+  `l3_slot_in` and the current-TTBR0 editors return a `Slot`; the acquire/CAS
+  ordering of `get_or_create_table_atomic` and `map_user_page_inner` is kept
+  through the new `Slot::get_acquire`. The public `unsafe fn`s
+  (`map_user_page`, `shatter_block_to_pages`, `demote_range_to_ro`) keep their
+  signatures and contracts - their callers in `src/` are untouched.
+- New leaf crate `akuma-trap-aarch64` (`cbb6ca54`): `FrameHandle` over
+  `UserTrapFrame` with volatile accessors, `snapshot` and `store`, made once at
+  `rust_sync_el0_handler`. `akuma-exceptions` 83 -> 38; the new crate is 14.
+  One behaviour fix: emulating a trapped `MRS` with `rt == 31` wrote word 31 of
+  the frame (`sp_el0`); it is now discarded as XZR, as the read side already did.
+- Verified: host tests, clippy on both targets, and the AArch64 boot suite under
+  **KVM in lima**, before and after: the same two failures
+  (`test_mmap_file_oom_survives`, `test_epoll_socket_waker`) and the same 307
+  `PASSED` lines on the pre-change kernel and on each change. Both failures
+  predate this work.
+- **Lima setup that was missing** (`limactl start fc`, VM `fc`): `qemu-system-arm`
+  was not installed and the user was not in the `kvm` group, so
+  `scripts/lima_aarch64_run.sh` died with `qemu-system-aarch64: not found` after
+  selecting TCG. `sudo apt-get install qemu-system-arm`, `sudo usermod -aG kvm
+  $USER`, then `limactl stop fc && limactl start fc` so the group applies; the
+  runner then reports `accelerator: KVM`. Stop your own instance with
+  `ss -ltnp | grep :2622` inside the VM (`INSTANCE=4` -> ssh 2622), never a
+  pattern kill.
+- Left: `akuma-threading` 65 and `akuma-cpu` 65 (context switch and instruction
+  wrappers - irreducible by design), `akuma-virtio` 38, `akuma-net-nic` 29,
+  `akuma-alloc` 24, `akuma-user-access` 20, `amd64/src` 81 (mostly MSR/CR
+  writes, extern symbols and `MmioWindow::new` claims).
+
 ## Background
 
 [`AMD64_UNSAFE_REDUCTION_TRAP_MSR.md`](AMD64_UNSAFE_REDUCTION_TRAP_MSR.md)
