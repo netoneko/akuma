@@ -165,15 +165,7 @@ fn weak_fill(buf: &mut [u8]) {
     use core::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0);
 
-    let tsc: u64;
-    // SAFETY: `rdtsc` is unprivileged, reads no memory and is available on
-    // every x86_64 part.
-    unsafe {
-        let (lo, hi): (u32, u32);
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
-                         options(nomem, nostack, preserves_flags));
-        tsc = (u64::from(hi) << 32) | u64::from(lo);
-    }
+    let tsc = akuma_cpu::tsc::rdtsc();
     let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ tsc;
     for chunk in buf.chunks_mut(8) {
         // SplitMix64.
