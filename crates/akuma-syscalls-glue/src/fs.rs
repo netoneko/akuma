@@ -614,7 +614,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // discipline as the `File` arm above, since it's the same
             // underlying disk I/O `akuma_vfs_glue::ext2` drives.
             let _vfs_bkl = VfsBklGuard::new();
-            let capacity = akuma_virtio::block::with_device_at(idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0);
+            let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
             if pos >= capacity {
                 0 // EOF: dd reading past the end of the device
             } else {
@@ -1228,7 +1228,7 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if total_written > 0 { return total_written as u64; }
                     return EBADF;
                 }
-                let capacity = akuma_virtio::block::with_device_at(idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0);
+                let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
                 if write_pos as u64 >= capacity {
                     if total_written > 0 { return total_written as u64; }
                     return ENOSPC;
@@ -2402,7 +2402,7 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                     // SEEK_END needs the device's byte capacity — what `dd
                     // seek=`/`skip=` (past the drop-off drive's known size)
                     // and a plain size probe both need.
-                    let size = akuma_virtio::block::with_device_at(*idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0) as i64;
+                    let size = akuma_virtio::block::with_device_at(*idx as usize, |d| d.capacity_bytes()).unwrap_or(0) as i64;
                     new_pos = match whence { 0 => offset, 1 => *pos as i64 + offset, 2 => size + offset, _ => -1 };
                     if new_pos >= 0 {
                         *pos = new_pos as u64;
@@ -2472,7 +2472,7 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
             // no size field) — the raw fd knows its device index, so ask the block
             // driver directly.
             let node = akuma_virtio::block::device_name(idx as usize).and_then(akuma_vfs_glue::dev_node_named);
-            let capacity = akuma_virtio::block::with_device_at(idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0);
+            let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
             if let Some(node) = node {
                 stat = Stat {
                     st_dev: 0,

@@ -162,9 +162,10 @@ impl VirtioSmoltcpDevice {
             // could alias. The slot stays leased by the ring until the next
             // `take_frame` releases it, which covers the RxToken's life.
             let base = crate::virtio_rings::RX_ARENA.slot_ptr(slot)?;
-            // SAFETY: `hdr < FRAME_BUF` per the check above, so this stays
-            // inside the slot the arena just bounds-checked.
-            Some((unsafe { base.cast::<u8>().add(hdr) }, len))
+            // Forming the pointer is safe; `hdr < FRAME_BUF` per the check above,
+            // so it stays inside the slot the arena just bounds-checked, which is
+            // what the caller's deref relies on.
+            Some((base.cast::<u8>().wrapping_add(hdr), len))
         }
         #[cfg(not(feature = "net-noalloc"))]
         {
@@ -211,9 +212,10 @@ impl VirtioSmoltcpDevice {
                 let lease = RX_ARENA.lease(RX_SLOT)?;
                 let base = RX_ARENA.slot_ptr(RX_SLOT)?;
                 self.rx_handed_up = Some(lease);
-                // SAFETY: `hdr_len + pkt_len <= RX_BUFFER_LEN` was checked by
-                // `complete_rx`, so this stays inside the slot.
-                return Some((unsafe { base.cast::<u8>().add(hdr_len) }, pkt_len));
+                // Forming the pointer is safe; `hdr_len + pkt_len <=
+                // RX_BUFFER_LEN` was checked by `complete_rx`, so it stays inside
+                // the slot, which is what the caller's deref relies on.
+                return Some((base.cast::<u8>().wrapping_add(hdr_len), pkt_len));
             }
             nicstat::record_rx_empty();
             None

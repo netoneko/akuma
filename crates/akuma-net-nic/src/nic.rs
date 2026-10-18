@@ -33,10 +33,10 @@
 //! that are not lies, and the raw `unsafe` calls appear exactly once each, in
 //! this file. Everything else in the crate calls them safely.
 //!
-//! The escape hatch (`post_rx_raw` and friends) still exists for a caller with
-//! a buffer of its own, and is `unsafe fn` carrying the contract above. Nothing
-//! in-tree uses it; it is here so that a future caller reaches for something
-//! documented rather than reintroducing a bare `unsafe { dev.… }`.
+//! There is deliberately no entry point taking a caller's `&mut [u8]`: one
+//! (`post_rx_raw`/`complete_rx_raw`) existed with no caller, and a method of
+//! that shape is the seam drawn in the wrong place. A new user of the device
+//! gets an arena slot, or extends the arena.
 //!
 //! # Attribution
 //!
@@ -195,28 +195,5 @@ impl Nic {
         } else {
             Err(lease)
         }
-    }
-
-    /// Post a caller-supplied buffer to receive into.
-    ///
-    /// # Safety
-    /// The module-level obligation, in full: `buf` must remain allocated at a
-    /// fixed address and untouched until the matching [`Self::complete_rx_raw`]
-    /// for the returned token, which must be given the same buffer. Prefer
-    /// [`Self::post_rx`], which discharges all of that with an arena lease.
-    pub unsafe fn post_rx_raw(&mut self, buf: &mut [u8]) -> Option<u16> {
-        unsafe { self.inner.receive_begin(buf) }.ok()
-    }
-
-    /// Complete a receive started with [`Self::post_rx_raw`].
-    ///
-    /// # Safety
-    /// `buf` must be the buffer that was posted under `token`.
-    pub unsafe fn complete_rx_raw(&mut self, token: u16, buf: &mut [u8]) -> Option<(usize, usize)> {
-        let (hdr_len, pkt_len) = unsafe { self.inner.receive_complete(token, buf) }.ok()?;
-        if hdr_len.saturating_add(pkt_len) > buf.len() {
-            return None;
-        }
-        Some((hdr_len, pkt_len))
     }
 }

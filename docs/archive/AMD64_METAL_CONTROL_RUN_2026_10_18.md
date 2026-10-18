@@ -162,6 +162,70 @@ p3 state: `/boot/akuma-amd64` = head `no-tests` built natively at `b37eb82f`
   `akuma-alloc` 24, `akuma-user-access` 20, `amd64/src` 81 (mostly MSR/CR
   writes, extern symbols and `MmioWindow::new` claims).
 
+## 2026-10-19: `akuma-virtio` 38 -> 12, `akuma-net-nic` 29 -> 14, total 486 -> 446
+
+(`akuma-dma` 16 -> 17: the one new method below.)
+
+- **`virtio/rng.rs` 17 -> 1 site.** The hand-rolled virtqueue no longer
+  `alloc_zeroed`s a page and casts into it: the rings and the 256-byte staging
+  buffer are four `DmaArray` statics (`DESC` u64, `AVAIL` u16, `USED` u32,
+  `BUFFER` u8, all 64-aligned, which exceeds virtio's 16/2/4), and the register
+  file is one `MmioWindow` claimed per device. The `AtomicU16` ring fields became
+  volatile `get`/`set` plus an explicit `fence(Release)` before the avail `idx`
+  store and `fence(Acquire)` after the used `idx` load - the same ordering, now
+  written beside the access. The staging copy is `read_range` over exactly the
+  clamped `copy_len` (the `completion_copy_len` clamp is kept and still tested).
+  `QUEUE_CLAIMED` makes a second live device an error instead of shared rings;
+  `Drop` resets the device and releases it. The `unsafe impl Send/Sync` went
+  with the raw pointers. `calc_queue_layout` and its tests are gone; a test pins
+  alignment, sizes and disjointness of the statics instead.
+- **`virtio/block.rs`, `audio.rs` 10 -> 0.** The `UnsafeCell` wrappers existed so
+  `&self` methods could reach `&mut VirtIOBlk`, but the only access path is a
+  `Spinlock`, which already hands out `&mut`. The methods take `&mut self`;
+  `with_device_at`/`with_device` now pass `&mut VirtioBlockDevice` (five callers
+  in `akuma-syscalls-glue` and `amd64/src/blk.rs` became closures).
+- **`virtio/probe.rs` 3 -> 2:** the two `MmioTransport::new` sites share
+  `transport_at`. New safe `probe::transport_at_slot(addr)` checks `addr` against
+  the slot table before constructing, so `rump_tap::init_at` lost its `unsafe`.
+- **`virtio/hal.rs` 9: left.** `Hal` is an `unsafe trait` with `unsafe fn`
+  methods by virtio-drivers' signature; the `alloc_zeroed`/`dealloc`/
+  `NonNull::new_unchecked` inside are its stated contract. Irreducible here.
+- **`net-nic/rtl8169.rs` 11 -> 1:** the four `static mut` rings are `DmaArray`s
+  (descriptors as `u32` cells, `A256` - a new marker - since the chip wants 256-byte
+  rings; frames as bytes), descriptor words are volatile `get`/`set` with the
+  `OWN`-last fence kept, registers are an `MmioWindow` over the first 0x100 bytes
+  (highest register `MISC` = 0xF0), the TSC delay is `akuma_cpu::tsc::rdtsc`. The
+  one site is the window claim in `probe`. `akuma-dma` gained `write_range`, the
+  mirror of `read_range`, because a TX slot must be written without a `&mut`
+  over the whole array while the chip reads other slots. Cost: every descriptor
+  word access takes the borrow word (one CAS pair) where it used to be a bare
+  volatile access.
+- **`net-nic/nic.rs`:** deleted `post_rx_raw`/`complete_rx_raw` - unused, and
+  exactly the "method taking a caller's `&mut [u8]`" the module header calls the
+  seam drawn wrong. The four arena-based calls keep the DMA contract. `device.rs`:
+  the two `.add` on the rx pointer became `wrapping_add` (forming the pointer is
+  safe; the deref sites stay).
+- **Left in `net-nic`, and why:** the `FrameSource::External` / `RxToken` slice
+  derefs (`device.rs`, `loopback.rs`) - smoltcp's token lifetime is tied to a
+  `&mut self` the arena cannot name (`FrameArena::slot_ptr`'s doc); the two
+  discard/scratch `first_slot_ptr` derefs, deliberately not `with_slot` (a
+  refusal would break `consume`'s contract); `irq.rs` (IRQ-context register
+  pokes from a recorded base); `nic.rs`' four `VirtIONetRaw` calls (the stated DMA
+  contract); `Rtl8169Device::probe`'s `unsafe fn` (the BAR claim).
+- **Found, not mine:** `--features net-noalloc` does not compile on `HEAD`
+  (`device.rs` imports `counters::C` only without that feature but uses it with
+  it). The feature is off in every profile.
+
+Verified: host tests for `akuma-virtio`, `akuma-net-nic` (default and
+`rump,rtl8169`), `akuma-dma` (+3 `write_range` tests), `akuma-net`; clippy
+`-D warnings` on those three feature sets; `cargo build --release` (AArch64);
+`cargo check -p akuma-amd64 --target x86_64-unknown-none`; AArch64 boot suite
+under KVM in lima (virtio-rng, -blk, -net exercised): 307 `PASSED` and the same
+two pre-existing failures as before the change.
+
+`cargo check -p akuma-virtio --features sound` (the `audio.rs` path) is clean.
+Not verified: rtl8169 on the trashcan metal (no reboot done), `audio.rs` at runtime.
+
 ## Background
 
 [`AMD64_UNSAFE_REDUCTION_TRAP_MSR.md`](AMD64_UNSAFE_REDUCTION_TRAP_MSR.md)

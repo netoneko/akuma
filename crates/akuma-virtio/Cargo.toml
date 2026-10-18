@@ -23,6 +23,8 @@ zerocopy = { version = "0.8", default-features = false }
 # `akuma-exec`, which meant `akuma-net -> akuma-virtio -> akuma-exec` kept the net
 # crate compiling the execution crate even after its own direct edge went away.
 akuma-primitives = { path = "../akuma-primitives" }
+# The rng driver's virtqueue and staging buffer are `DmaArray` statics.
+akuma-dma = { path = "../akuma-dma" }
 
 [features]
 # The virtio-snd driver. Off by default: it needs virtio-drivers' `alloc`

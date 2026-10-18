@@ -84,6 +84,10 @@ pub mod align {
     #[repr(align(128))]
     #[derive(Clone, Copy)]
     pub struct A128;
+    /// 256 bytes — Realtek RTL8169 descriptor rings.
+    #[repr(align(256))]
+    #[derive(Clone, Copy)]
+    pub struct A256;
     /// 4 KiB — a page; rings the device addresses by page, and bounce buffers.
     #[repr(align(4096))]
     #[derive(Clone, Copy)]
@@ -271,6 +275,38 @@ impl<E: DmaElem, const N: usize, A> DmaArray<E, N, A> {
         f(cells)
     }
 
+    /// Run `f` over cells `[off, off + len)` as an exclusive slice, holding the
+    /// write borrow for the call.
+    ///
+    /// The mirror of [`read_range`](Self::read_range), for a buffer the CPU fills
+    /// before it hands one **entry** to the device (a transmit frame slot) while
+    /// the device may still be reading *other* entries. [`view_mut`](Self::view_mut)
+    /// would make the `&mut [E]` cover those too; this covers only the range the
+    /// caller has established the device does not own.
+    ///
+    /// # Panics
+    /// If the range is outside the array, or any guard on this array is live.
+    #[track_caller]
+    pub fn write_range<R>(&self, off: usize, len: usize, f: impl FnOnce(&mut [E]) -> R) -> R {
+        assert!(off.checked_add(len).is_some_and(|e| e <= N), "DMA range outside the array");
+        assert!(self.acquire_write(), "DMA buffer mutably borrowed while already borrowed");
+        // Released on unwind too, so a panicking `f` cannot leave the array
+        // write-locked.
+        struct Release<'a, E: DmaElem, const N: usize, A>(&'a DmaArray<E, N, A>);
+        impl<E: DmaElem, const N: usize, A> Drop for Release<'_, E, N, A> {
+            fn drop(&mut self) {
+                self.0.release_write();
+            }
+        }
+        let _release = Release(self);
+        // SAFETY: `off + len <= N`, so the slice is `len` initialised cells of an
+        // any-bit-pattern type; the write lock makes it the only access for the
+        // call. A device reading outside `[off, off + len)` is not covered by this
+        // reference, and the caller vouches the device does not own the inside.
+        let cells = unsafe { core::slice::from_raw_parts_mut(self.cells.get().cast::<E>().add(off), len) };
+        f(cells)
+    }
+
     /// Take the array **for good**: an exclusive `&'static mut` over every cell,
     /// for a driver that parks the slice in its own state (a card that owns its
     /// transmit memory from `init` on). The write borrow is never released, so
@@ -393,6 +429,34 @@ mod tests {
     }
 
     #[test]
+    fn write_range_covers_only_the_range_and_releases() {
+        let a: DmaArray<u8, 16, A64> = DmaArray::new();
+        a.write_range(4, 3, |c| {
+            assert_eq!(c.len(), 3);
+            c.copy_from_slice(&[1, 2, 3]);
+        });
+        assert_eq!(a.view().iter().map(|&b| u32::from(b)).sum::<u32>(), 6);
+        assert_eq!((a.get(3), a.get(4), a.get(6), a.get(7)), (0, 1, 3, 0));
+        // The write borrow is gone: another is admitted.
+        a.write_range(0, 0, |_| ());
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the array")]
+    fn write_range_refuses_a_range_past_the_end() {
+        let a: DmaArray<u8, 16, A64> = DmaArray::new();
+        a.write_range(10, 7, |_| ());
+    }
+
+    #[test]
+    #[should_panic(expected = "already borrowed")]
+    fn write_range_refuses_while_a_reader_is_live() {
+        let a: DmaArray<u8, 16, A64> = DmaArray::new();
+        let _r = a.view();
+        a.write_range(0, 1, |_| ());
+    }
+
+    #[test]
     #[should_panic(expected = "outside the array")]
     fn read_range_refuses_a_range_past_the_end() {
         let a: DmaArray<u8, 16, A64> = DmaArray::new();
@@ -425,6 +489,8 @@ mod tests {
     #[test]
     fn alignment_comes_from_the_marker() {
         static P: DmaArray<u8, 64, A4K> = DmaArray::new();
+        static S: DmaArray<u32, 8, super::align::A256> = DmaArray::new();
+        assert_eq!(S.addr() % 256, 0);
         static Q: DmaArray<u32, 256, A128> = DmaArray::new();
         static R: DmaArray<[u32; 4], 16, A64> = DmaArray::new();
         assert_eq!(P.addr() % 4096, 0);

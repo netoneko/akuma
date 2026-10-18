@@ -259,6 +259,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-syscalls-linux",
+ "akuma-trap-aarch64",
 ]
 
 [[package]]
@@ -513,6 +514,7 @@ dependencies = [
 name = "akuma-net-nic"
 version = "0.1.0"
 dependencies = [
+ "akuma-cpu",
  "akuma-dma",
  "akuma-net-rtl8169",
  "akuma-primitives",
@@ -813,6 +815,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-trap-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec-core",
+]
+
+[[package]]
 name = "akuma-trap-amd64"
 version = "0.1.0"
 dependencies = [
@@ -888,6 +897,7 @@ dependencies = [
 name = "akuma-virtio"
 version = "0.1.0"
 dependencies = [
+ "akuma-dma",
  "akuma-primitives",
  "spinning_top",
  "virtio-drivers",

@@ -10,11 +10,12 @@
 //! path was removed when QEMU's force-legacy flag was dropped. A non-v2 device
 //! panics at init. See docs/VIRTIO_MMIO_LEGACY_TO_MODERN.md.
 
-use core::sync::atomic::{AtomicU16, Ordering, fence};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
-use akuma_primitives::mmio::MmioReg;
+use akuma_dma::DmaArray;
+use akuma_dma::align::A64;
+use akuma_primitives::mmio::MmioWindow;
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use spinning_top::Spinlock;
 
 use crate::probe;
@@ -47,24 +48,10 @@ const VIRTIO_MMIO_QUEUE_DRIVER_HIGH: usize = 0x094;
 const VIRTIO_MMIO_QUEUE_DEVICE_LOW: usize = 0x0a0; // used ring
 const VIRTIO_MMIO_QUEUE_DEVICE_HIGH: usize = 0x0a4;
 
-/// Name one of the slot's u32 transport registers.
-///
-/// Every virtio-mmio register this driver touches is a u32 at a fixed offset
-/// from the slot base, so this one helper replaces what used to be 30 separate
-/// `unsafe { read_volatile((base + OFFSET) as *const u32) }` sites — `unsafe`
-/// now marks *which addresses are device registers* rather than each access.
-///
-/// Private on purpose: the safety argument below depends on every caller
-/// passing a base from [`probe::scan`] and an offset from the `VIRTIO_MMIO_*`
-/// constants above.
-fn reg(base: usize, offset: usize) -> MmioReg<u32> {
-    // SAFETY: `base` is a virtio-mmio slot base returned by `probe::scan`, i.e.
-    // one of the eight fixed slots inside the device mapping the kernel
-    // establishes before any driver init runs; `offset` is one of the
-    // `VIRTIO_MMIO_*` constants, all naturally-aligned u32 registers within that
-    // slot's 0x200-byte window.
-    unsafe { MmioReg::new(base + offset) }
-}
+
+/// Bytes of a slot's register file this driver addresses (highest register is
+/// `QUEUE_DEVICE_HIGH` at 0x0a4).
+const REG_WINDOW_LEN: usize = 0x100;
 
 // VirtIO status bits
 const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
@@ -78,9 +65,6 @@ const VIRTIO_F_VERSION_1_WORD1: u32 = 1;
 
 // VirtIO descriptor flags
 const VIRTQ_DESC_F_WRITE: u16 = 2; // Device writes (vs read)
-
-/// Page size for legacy VirtIO
-const PAGE_SIZE: usize = 4096;
 
 // ============================================================================
 // RNG Error
@@ -106,58 +90,45 @@ impl_display!(RngError {
     TransportError => "VirtIO transport error",
 });
 
+
 // ============================================================================
 // VirtIO Data Structures (split-virtqueue layout; identical for v1 and v2)
 // ============================================================================
+//
+// The queue lives in four statics rather than one `alloc_zeroed` page, so the
+// rings are `DmaArray`s and this file holds no `unsafe` beyond the one
+// `MmioWindow` claim. Each is aligned to at least a cache line, which exceeds
+// the modern 16/2/4-byte requirements for desc/avail/used. Cells are viewed as
+// the integers the layout is made of (all bit patterns valid); the device is
+// little-endian and so is every target this runs on.
+//
+//   DESC  (u64 x 2*QUEUE_SIZE): descriptor i is cells 2i = addr,
+//         2i+1 = len | flags << 32 | next << 48
+//   AVAIL (u16 x QUEUE_SIZE+3): flags, idx, ring[QUEUE_SIZE], used_event
+//   USED  (u32 x 2*QUEUE_SIZE+2): cell 0 = flags | idx << 16, then ring[i] =
+//         (id, len) at cells 1+2i, 2+2i, then avail_event (unused, not mapped)
+//
+// `DmaArray::get`/`set` are volatile; the release/acquire the old `AtomicU16`
+// fields carried is now an explicit `fence` beside the access that publishes or
+// observes it.
 
-/// VirtIO descriptor (16 bytes each)
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct VirtqDesc {
-    addr: u64,  // Guest physical address
-    len: u32,   // Length
-    flags: u16, // Flags
-    next: u16,  // Next descriptor index
-}
+static DESC: DmaArray<u64, { 2 * QUEUE_SIZE }, A64> = DmaArray::new();
+static AVAIL: DmaArray<u16, { QUEUE_SIZE + 3 }, A64> = DmaArray::new();
+static USED: DmaArray<u32, { 2 * QUEUE_SIZE + 2 }, A64> = DmaArray::new();
+/// Staging buffer the device fills with random bytes.
+static BUFFER: DmaArray<u8, STAGING_LEN, A64> = DmaArray::new();
 
-/// VirtIO available ring
-/// Layout: flags (u16), idx (u16), ring[QUEUE_SIZE] (u16 each), used_event (u16)
-///
-/// The fields the device also touches are `AtomicU16` — same size and alignment
-/// as `u16`, so the `repr(C)` layout the spec mandates is unchanged, but the
-/// cross-visible accesses now carry real ordering instead of resting on
-/// scattered `fence(SeqCst)` calls. `ring[]` stays plain: the release store on
-/// `idx` is what publishes it, exactly as virtio-drivers models its own
-/// `AvailRing`.
-#[repr(C)]
-struct VirtqAvail {
-    flags: AtomicU16,
-    idx: AtomicU16,
-    ring: [u16; QUEUE_SIZE],
-    used_event: AtomicU16,
-}
+/// Bytes one request asks the device for.
+const STAGING_LEN: usize = 256;
 
-/// VirtIO used ring element
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct VirtqUsedElem {
-    id: u32,  // Index of descriptor chain head
-    len: u32, // Total length of the descriptor chain
-}
+/// AVAIL cell holding `idx`.
+const AVAIL_IDX: usize = 1;
+/// AVAIL cell of `ring[0]`.
+const AVAIL_RING: usize = 2;
 
-/// VirtIO used ring
-/// Layout: flags (u16), idx (u16), ring[QUEUE_SIZE], avail_event (u16)
-///
-/// Same treatment as [`VirtqAvail`]: `idx` is the field whose acquire load makes
-/// the matching `ring[]` entry — and the data the device DMA'd into the staging
-/// buffer — valid to read.
-#[repr(C)]
-struct VirtqUsed {
-    flags: AtomicU16,
-    idx: AtomicU16,
-    ring: [VirtqUsedElem; QUEUE_SIZE],
-    avail_event: AtomicU16,
-}
+/// Set while a [`VirtioRngDevice`] owns the four statics above. They are the
+/// device's only queue memory, so a second live device would share it.
+static QUEUE_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // VirtIO RNG Device
@@ -165,50 +136,10 @@ struct VirtqUsed {
 
 /// VirtIO RNG device driver (modern / version 2 transport)
 pub struct VirtioRngDevice {
-    base_addr: usize,
-    // Queue memory pointers (all in one page-aligned allocation)
-    queue_mem: *mut u8,
-    queue_layout: Layout,
-    // Individual component pointers
-    desc: *mut VirtqDesc,
-    avail: *mut VirtqAvail,
-    used: *mut VirtqUsed,
-    // Data buffer
-    buffer: *mut u8,
-    buffer_layout: Layout,
+    regs: MmioWindow,
     // Queue state
     last_used_idx: u16,
     avail_idx: u16,
-}
-
-// SAFETY: VirtioRngDevice is only accessed through the global RNG_DEVICE Spinlock,
-// which ensures exclusive access.
-unsafe impl Send for VirtioRngDevice {}
-unsafe impl Sync for VirtioRngDevice {}
-
-/// Calculate the split-virtqueue memory layout for a single page-aligned
-/// allocation. Returns (desc_offset, avail_offset, used_offset, total_size).
-fn calc_queue_layout(queue_size: usize) -> (usize, usize, usize, usize) {
-    // Descriptor table: 16 bytes * queue_size, 16-byte aligned
-    let desc_size = 16 * queue_size;
-
-    // Available ring: flags(2) + idx(2) + ring(2*queue_size) + used_event(2)
-    let avail_size = 2 + 2 + 2 * queue_size + 2;
-
-    // Used ring: flags(2) + idx(2) + ring(8*queue_size) + avail_event(2)
-    let used_size = 2 + 2 + 8 * queue_size + 2;
-
-    // Layout:
-    // - Descriptor table at offset 0
-    // - Available ring immediately follows
-    // - Used ring at next page boundary (over-aligned vs the modern 4-byte
-    //   requirement, which keeps the three physical addresses comfortably valid)
-    let desc_offset = 0;
-    let avail_offset = desc_size; // Immediately after descriptors
-    let used_offset = (avail_offset + avail_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1); // Page aligned
-    let total_size = used_offset + used_size;
-
-    (desc_offset, avail_offset, used_offset, total_size)
 }
 
 /// How many bytes to copy out of the staging buffer for one completed request.
@@ -233,11 +164,19 @@ fn completion_copy_len(device_len: u32, offered: usize) -> usize {
     core::cmp::min(device_len as usize, offered)
 }
 
+
 impl VirtioRngDevice {
     /// Create and initialize a new VirtIO RNG device (modern / version 2 transport)
     fn new(base_addr: usize) -> Result<Self, RngError> {
+        // SAFETY: `base_addr` is a virtio-mmio slot base returned by
+        // `probe::scan`, i.e. inside the device mapping the kernel establishes
+        // before any driver init runs, page-aligned, and the slot's register file
+        // is at least `REG_WINDOW_LEN` bytes; every offset used below is one of
+        // the naturally-aligned u32 `VIRTIO_MMIO_*` registers within it.
+        let w = unsafe { MmioWindow::new(base_addr, REG_WINDOW_LEN) };
+
         // Verify magic value
-        let magic = reg(base_addr, VIRTIO_MMIO_MAGIC_VALUE).read();
+        let magic: u32 = w.read(VIRTIO_MMIO_MAGIC_VALUE);
         if magic != 0x74726976 {
             // "virt" in little-endian
             return Err(RngError::TransportError);
@@ -248,112 +187,92 @@ impl VirtioRngDevice {
         // a misconfigured runner (force-legacy re-added) and there is no fallback,
         // so fail loud and early rather than limping into a later networking panic
         // ("RNG required for networking"). See docs/VIRTIO_MMIO_LEGACY_TO_MODERN.md.
-        let version = reg(base_addr, VIRTIO_MMIO_VERSION).read();
+        let version: u32 = w.read(VIRTIO_MMIO_VERSION);
         assert!(version == 2,
             "[RNG] virtio-rng MMIO version {version} unsupported; modern v2 required \
              (is virtio-mmio.force-legacy set in the QEMU runner?)"
         );
 
-        let status_reg = reg(base_addr, VIRTIO_MMIO_STATUS);
-
         // Reset the device
-        status_reg.write(0);
+        w.write(VIRTIO_MMIO_STATUS, 0u32);
         fence(Ordering::SeqCst);
 
         // Set ACKNOWLEDGE status bit
-        status_reg.write(VIRTIO_STATUS_ACKNOWLEDGE);
+        w.write(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
         fence(Ordering::SeqCst);
 
         // Set DRIVER status bit
-        status_reg.write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        w.write(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
         fence(Ordering::SeqCst);
 
         // Feature negotiation. The RNG device needs no feature bits of its own,
         // but a modern device requires VIRTIO_F_VERSION_1 (bit 32) plus a
         // FEATURES_OK handshake.
-        let device_features_sel = reg(base_addr, VIRTIO_MMIO_DEVICE_FEATURES_SEL);
-        let device_features = reg(base_addr, VIRTIO_MMIO_DEVICE_FEATURES);
-        let driver_features_sel = reg(base_addr, VIRTIO_MMIO_DRIVER_FEATURES_SEL);
-        let driver_features = reg(base_addr, VIRTIO_MMIO_DRIVER_FEATURES);
-
+        //
         // Feature word 0: acknowledge nothing.
-        device_features_sel.write(0);
+        w.write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0u32);
         fence(Ordering::SeqCst);
         // The discarded read is a protocol step, not dead code: the device
         // expects the selected feature word to be read before it is answered.
-        let _ = device_features.read();
-        driver_features_sel.write(0);
-        driver_features.write(0);
+        let _: u32 = w.read(VIRTIO_MMIO_DEVICE_FEATURES);
+        w.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0u32);
+        w.write(VIRTIO_MMIO_DRIVER_FEATURES, 0u32);
         fence(Ordering::SeqCst);
         // Feature word 1: acknowledge VIRTIO_F_VERSION_1.
-        device_features_sel.write(1);
+        w.write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1u32);
         fence(Ordering::SeqCst);
-        let _ = device_features.read();
-        driver_features_sel.write(1);
-        driver_features.write(VIRTIO_F_VERSION_1_WORD1);
+        let _: u32 = w.read(VIRTIO_MMIO_DEVICE_FEATURES);
+        w.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1u32);
+        w.write(VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_F_VERSION_1_WORD1);
         fence(Ordering::SeqCst);
         // Latch FEATURES_OK and confirm the device kept it.
-        status_reg
-            .write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+        w.write(
+            VIRTIO_MMIO_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
+        );
         fence(Ordering::SeqCst);
-        let s = status_reg.read();
+        let s: u32 = w.read(VIRTIO_MMIO_STATUS);
         if s & VIRTIO_STATUS_FEATURES_OK == 0 {
             return Err(RngError::TransportError);
         }
 
         // Set up virtqueue 0
-        reg(base_addr, VIRTIO_MMIO_QUEUE_SEL).write(0);
+        w.write(VIRTIO_MMIO_QUEUE_SEL, 0u32);
         fence(Ordering::SeqCst);
 
         // Check queue size
-        let max_size = reg(base_addr, VIRTIO_MMIO_QUEUE_NUM_MAX).read();
+        let max_size: u32 = w.read(VIRTIO_MMIO_QUEUE_NUM_MAX);
         if max_size == 0 || (max_size as usize) < QUEUE_SIZE {
             return Err(RngError::TransportError);
         }
 
         // Set queue size
-        reg(base_addr, VIRTIO_MMIO_QUEUE_NUM).write(QUEUE_SIZE as u32);
+        w.write(VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
         fence(Ordering::SeqCst);
 
-        // Calculate queue layout. The single page-aligned region places desc at
-        // offset 0, avail immediately after, and used at the next page boundary —
-        // comfortably exceeding the modern 16/2/4-byte alignment requirements for
-        // the three rings.
-        let (desc_offset, avail_offset, used_offset, total_size) = calc_queue_layout(QUEUE_SIZE);
-
-        // Allocate queue memory (must be page-aligned)
-        let queue_layout = Layout::from_size_align(total_size, PAGE_SIZE).unwrap();
-        let queue_mem = unsafe { alloc_zeroed(queue_layout) };
-        if queue_mem.is_null() {
+        // The queue memory is the four statics above; take them for this device.
+        if QUEUE_CLAIMED.swap(true, Ordering::AcqRel) {
             return Err(RngError::TransportError);
         }
-
-        // `cast_ptr_alignment`: `queue_mem` is `PAGE_SIZE`-aligned by the layout
-        // above, and `calc_queue_layout` places all three rings at offsets that
-        // satisfy the virtio 16/2/4-byte requirements (see its comment), so each
-        // cast lands on a correctly-aligned address. The kernel bin crate
-        // blanket-allowed this lint crate-wide; scoped to the three casts that
-        // actually need it now that the driver lives in its own crate.
-        #[allow(clippy::cast_ptr_alignment)]
-        let (desc, avail, used) = (
-            unsafe { queue_mem.add(desc_offset) }.cast::<VirtqDesc>(),
-            unsafe { queue_mem.add(avail_offset) }.cast::<VirtqAvail>(),
-            unsafe { queue_mem.add(used_offset) }.cast::<VirtqUsed>(),
-        );
+        // A reset device has dropped its idea of the rings, so ours start clean
+        // too (a previous device may have left indices behind).
+        DESC.view_mut().fill(0);
+        AVAIL.view_mut().fill(0);
+        USED.view_mut().fill(0);
 
         // Program the queue with three independent 64-bit physical addresses,
         // then mark it ready.
-        let desc_phys = akuma_primitives::addr::virt_to_phys(desc as usize) as u64;
-        let avail_phys = akuma_primitives::addr::virt_to_phys(avail as usize) as u64;
-        let used_phys = akuma_primitives::addr::virt_to_phys(used as usize) as u64;
-        reg(base_addr, VIRTIO_MMIO_QUEUE_DESC_LOW).write(desc_phys as u32);
-        reg(base_addr, VIRTIO_MMIO_QUEUE_DESC_HIGH).write((desc_phys >> 32) as u32);
-        reg(base_addr, VIRTIO_MMIO_QUEUE_DRIVER_LOW).write(avail_phys as u32);
-        reg(base_addr, VIRTIO_MMIO_QUEUE_DRIVER_HIGH).write((avail_phys >> 32) as u32);
-        reg(base_addr, VIRTIO_MMIO_QUEUE_DEVICE_LOW).write(used_phys as u32);
-        reg(base_addr, VIRTIO_MMIO_QUEUE_DEVICE_HIGH).write((used_phys >> 32) as u32);
+        let desc_phys = akuma_primitives::addr::virt_to_phys(DESC.addr()) as u64;
+        let avail_phys = akuma_primitives::addr::virt_to_phys(AVAIL.addr()) as u64;
+        let used_phys = akuma_primitives::addr::virt_to_phys(USED.addr()) as u64;
+        w.write(VIRTIO_MMIO_QUEUE_DESC_LOW, desc_phys as u32);
+        w.write(VIRTIO_MMIO_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
+        w.write(VIRTIO_MMIO_QUEUE_DRIVER_LOW, avail_phys as u32);
+        w.write(VIRTIO_MMIO_QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32);
+        w.write(VIRTIO_MMIO_QUEUE_DEVICE_LOW, used_phys as u32);
+        w.write(VIRTIO_MMIO_QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32);
         fence(Ordering::SeqCst);
-        reg(base_addr, VIRTIO_MMIO_QUEUE_READY).write(1);
+        w.write(VIRTIO_MMIO_QUEUE_READY, 1u32);
         fence(Ordering::SeqCst);
 
         // Set DRIVER_OK to finish initialization
@@ -361,36 +280,17 @@ impl VirtioRngDevice {
             | VIRTIO_STATUS_DRIVER
             | VIRTIO_STATUS_FEATURES_OK
             | VIRTIO_STATUS_DRIVER_OK;
-        status_reg.write(final_status);
+        w.write(VIRTIO_MMIO_STATUS, final_status);
         fence(Ordering::SeqCst);
 
         // Verify device accepted our configuration
-        let status = status_reg.read();
+        let status: u32 = w.read(VIRTIO_MMIO_STATUS);
         if status != final_status {
-            unsafe { dealloc(queue_mem, queue_layout) };
+            QUEUE_CLAIMED.store(false, Ordering::Release);
             return Err(RngError::TransportError);
         }
 
-        // Allocate a buffer for random data (separate from queue memory)
-        let buffer_layout = Layout::from_size_align(256, 64).unwrap();
-        let buffer = unsafe { alloc_zeroed(buffer_layout) };
-        if buffer.is_null() {
-            unsafe { dealloc(queue_mem, queue_layout) };
-            return Err(RngError::TransportError);
-        }
-
-        Ok(Self {
-            base_addr,
-            queue_mem,
-            queue_layout,
-            desc,
-            avail,
-            used,
-            buffer,
-            buffer_layout,
-            last_used_idx: 0,
-            avail_idx: 0,
-        })
+        Ok(Self { regs: w, last_used_idx: 0, avail_idx: 0 })
     }
 
     /// Read random bytes from the device
@@ -402,51 +302,51 @@ impl VirtioRngDevice {
         let mut bytes_read = 0;
 
         while bytes_read < buf.len() {
-            let to_read = core::cmp::min(256, buf.len() - bytes_read);
+            let to_read = core::cmp::min(STAGING_LEN, buf.len() - bytes_read);
 
             // Set up descriptor for device-writable buffer
             // VirtIO descriptor needs physical address for DMA
             let desc_idx = 0u16;
-            unsafe {
-                let d = &mut *self.desc.add(desc_idx as usize);
-                d.addr = akuma_primitives::addr::virt_to_phys(self.buffer as usize) as u64;
-                d.len = to_read as u32;
-                d.flags = VIRTQ_DESC_F_WRITE;
-                d.next = 0;
-            }
+            DESC.set(
+                2 * usize::from(desc_idx),
+                akuma_primitives::addr::virt_to_phys(BUFFER.addr()) as u64,
+            );
+            // len | flags << 32 | next(0) << 48
+            DESC.set(
+                2 * usize::from(desc_idx) + 1,
+                to_read as u64 | (u64::from(VIRTQ_DESC_F_WRITE) << 32),
+            );
 
             // Add to available ring. The descriptor fields written above and the
-            // `ring[]` slot written here are both published by the release store
-            // on `idx`: a device that observes the new `idx` is guaranteed to
-            // observe everything that preceded it.
+            // `ring[]` slot written here are both published by the release fence
+            // before the `idx` store: a device that observes the new `idx` is
+            // guaranteed to observe everything that preceded it.
             let ring_idx = (self.avail_idx as usize) % QUEUE_SIZE;
-            unsafe {
-                (&raw mut (*self.avail).ring[ring_idx]).write(desc_idx);
-                (*self.avail)
-                    .idx
-                    .store(self.avail_idx.wrapping_add(1), Ordering::Release);
-            }
+            AVAIL.set(AVAIL_RING + ring_idx, desc_idx);
+            fence(Ordering::Release);
+            AVAIL.set(AVAIL_IDX, self.avail_idx.wrapping_add(1));
             self.avail_idx = self.avail_idx.wrapping_add(1);
 
-            // Barrier before the MMIO notify. The release store above orders the
+            // Barrier before the MMIO notify. The release fence above orders the
             // ring writes against each other, but this is Normal memory and the
             // notify below is a Device-memory store — nothing in the release
-            // store keeps the device from seeing the kick before the ring.
+            // fence keeps the device from seeing the kick before the ring.
             fence(Ordering::SeqCst);
 
             // Notify device
-            reg(self.base_addr, VIRTIO_MMIO_QUEUE_NOTIFY).write(0);
+            self.regs.write(VIRTIO_MMIO_QUEUE_NOTIFY, 0u32);
 
             // Wait for completion with timeout
             let mut attempts = 0u32;
             const MAX_ATTEMPTS: u32 = 10_000_000;
 
             loop {
-                // Acquire, not volatile: observing the new `idx` is what makes
-                // `used.ring[…]` and the DMA'd staging buffer valid to read, and
-                // `read_volatile` constrains only the compiler, not the CPU's
-                // load/load reordering.
-                let used_idx = unsafe { (*self.used).idx.load(Ordering::Acquire) };
+                // Volatile read then an acquire fence: observing the new `idx`
+                // is what makes `used.ring[…]` and the DMA'd staging buffer valid
+                // to read, and the volatile read alone constrains only the
+                // compiler, not the CPU's load/load reordering.
+                let used_idx = (USED.get(0) >> 16) as u16;
+                fence(Ordering::Acquire);
                 if used_idx != self.last_used_idx {
                     break;
                 }
@@ -459,28 +359,27 @@ impl VirtioRngDevice {
 
             // Get the used element (plain read — covered by the acquire above)
             let used_ring_idx = (self.last_used_idx as usize) % QUEUE_SIZE;
-            let used_elem = unsafe { (*self.used).ring[used_ring_idx] };
+            let used_id = USED.get(1 + 2 * used_ring_idx);
+            let used_len = USED.get(2 + 2 * used_ring_idx);
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
             // Check that the device returned our descriptor
-            if used_elem.id != u32::from(desc_idx) {
+            if used_id != u32::from(desc_idx) {
                 return Err(RngError::ReadError);
             }
 
-            let copy_len = completion_copy_len(used_elem.len, to_read);
+            let copy_len = completion_copy_len(used_len, to_read);
             if copy_len == 0 {
                 // A device completing the descriptor without writing anything
                 // would otherwise spin the outer loop forever: `bytes_read` never
                 // advances, so the same request is reissued indefinitely.
                 return Err(RngError::ReadError);
             }
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.buffer,
-                    buf.as_mut_ptr().add(bytes_read),
-                    copy_len,
-                );
-            }
+            // `copy_len <= to_read <= STAGING_LEN`: the slice covers only the
+            // bytes the device reported, clamped to what was offered.
+            BUFFER.read_range(0, copy_len, |src| {
+                buf[bytes_read..bytes_read + copy_len].copy_from_slice(src);
+            });
             bytes_read += copy_len;
         }
 
@@ -490,11 +389,10 @@ impl VirtioRngDevice {
 
 impl Drop for VirtioRngDevice {
     fn drop(&mut self) {
-        // Free allocations
-        unsafe {
-            dealloc(self.buffer, self.buffer_layout);
-            dealloc(self.queue_mem, self.queue_layout);
-        }
+        // Reset the device so it stops using the rings, then release them.
+        self.regs.write(VIRTIO_MMIO_STATUS, 0u32);
+        fence(Ordering::SeqCst);
+        QUEUE_CLAIMED.store(false, Ordering::Release);
     }
 }
 
@@ -585,7 +483,7 @@ fn log(msg: &str) {
 /// silently wrong until it corrupts memory.
 #[cfg(test)]
 mod tests {
-    use super::{PAGE_SIZE, QUEUE_SIZE, calc_queue_layout, completion_copy_len};
+    use super::{AVAIL, BUFFER, DESC, QUEUE_SIZE, STAGING_LEN, USED, completion_copy_len};
 
     /// A device that lies about how much it wrote must not cause a read past the
     /// staging buffer. Regression pin for `UNSAFE_AUDIT.md` §4(e) — which still
@@ -606,41 +504,30 @@ mod tests {
         assert_eq!(completion_copy_len(0, 256), 0);
     }
 
-    /// The three rings must not overlap: they are written by the device via DMA,
-    /// so an overlap is silent corruption of whichever ring lost the race.
+    /// The rings are the device's DMA targets: each must meet the virtio 1.x
+    /// split-queue alignment (desc 16, avail 2, used 4), be sized for the layout
+    /// the driver indexes, and sit in its own memory.
     #[test]
-    fn queue_layout_regions_are_disjoint_and_aligned() {
-        for queue_size in [1usize, 2, 4, 8, 16, 64, 256, 1024] {
-            let (desc, avail, used, total) = calc_queue_layout(queue_size);
+    fn queue_statics_are_aligned_sized_and_disjoint() {
+        assert_eq!(DESC.addr() % 16, 0);
+        assert_eq!(AVAIL.addr() % 2, 0);
+        assert_eq!(USED.addr() % 4, 0);
+        // desc: 16 bytes each; avail: flags, idx, ring[], used_event;
+        // used: flags|idx, ring[] of (id, len).
+        assert_eq!(DESC.size_bytes(), 16 * QUEUE_SIZE);
+        assert_eq!(AVAIL.size_bytes(), 2 + 2 + 2 * QUEUE_SIZE + 2);
+        assert_eq!(USED.size_bytes(), 4 + 8 * QUEUE_SIZE + 4);
+        assert_eq!(BUFFER.size_bytes(), STAGING_LEN);
 
-            let desc_size = 16 * queue_size;
-            let avail_size = 2 + 2 + 2 * queue_size + 2;
-            let used_size = 2 + 2 + 8 * queue_size + 2;
-
-            assert_eq!(desc, 0, "qs={queue_size}");
-            assert!(desc + desc_size <= avail, "desc overlaps avail, qs={queue_size}");
-            assert!(avail + avail_size <= used, "avail overlaps used, qs={queue_size}");
-            assert!(used + used_size <= total, "used ring runs past the allocation, qs={queue_size}");
-
-            // Virtio 1.x split-queue alignment: desc 16, avail 2, used 4. This
-            // layout over-aligns `used` to a page, which the comment in
-            // `calc_queue_layout` says is deliberate — pin it so a later
-            // "optimisation" to 4 bytes is a visible decision, not a silent one.
-            assert_eq!(desc % 16, 0, "qs={queue_size}");
-            assert_eq!(avail % 2, 0, "qs={queue_size}");
-            assert_eq!(used % PAGE_SIZE, 0, "used ring must stay page-aligned, qs={queue_size}");
+        let mut spans = [
+            (DESC.addr(), DESC.size_bytes()),
+            (AVAIL.addr(), AVAIL.size_bytes()),
+            (USED.addr(), USED.size_bytes()),
+            (BUFFER.addr(), BUFFER.size_bytes()),
+        ];
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0, "queue statics overlap");
         }
-    }
-
-    /// The size actually used at runtime, called out separately: `new()` refuses
-    /// a device whose `max_size` is below it, so this is the only layout that
-    /// ships.
-    #[test]
-    fn queue_layout_at_the_shipping_queue_size() {
-        let (desc, avail, used, total) = calc_queue_layout(QUEUE_SIZE);
-        assert_eq!((desc, avail), (0, 32), "QUEUE_SIZE=2 → 2 descriptors of 16 bytes");
-        assert_eq!(used, PAGE_SIZE);
-        assert_eq!(total, PAGE_SIZE + 2 + 2 + 8 * QUEUE_SIZE + 2);
-        assert!(total <= 2 * PAGE_SIZE, "one queue must not need more than two pages");
     }
 }

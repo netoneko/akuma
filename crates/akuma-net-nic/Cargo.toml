@@ -30,6 +30,8 @@ workspace = true
 akuma-primitives = { path = "../akuma-primitives" }
 # FrameArena / FrameLease — the BSS frame slots every ring here is built on.
 akuma-dma = { path = "../akuma-dma" }
+# rdtsc for the rtl8169 bring-up delay (amd64 bare metal only, but the dep is inert elsewhere).
+akuma-cpu = { path = "../akuma-cpu" }
 akuma-rump = { path = "../akuma-rump", optional = true }
 akuma-net-rtl8169 = { path = "../akuma-net-rtl8169", optional = true }
 spinning_top = "0.3"

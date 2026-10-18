@@ -168,7 +168,7 @@ pub fn smoke_test(t: &mut Suite, expect_disk: bool) {
     if !t.check("blk: driver registered a device", akuma_virtio::block::is_initialized()) {
         return;
     }
-    let sectors = akuma_virtio::block::with_device(akuma_virtio::block::VirtioBlockDevice::capacity_sectors);
+    let sectors = akuma_virtio::block::with_device(|d| d.capacity_sectors());
     t.check("blk: capacity is non-zero", sectors.unwrap_or(0) > 0);
     t.note("blk: capacity in sectors", sectors.unwrap_or(0));
 

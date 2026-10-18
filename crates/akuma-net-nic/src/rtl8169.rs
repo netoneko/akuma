@@ -35,7 +35,9 @@ use akuma_net_rtl8169::ring::RX_BUF_SIZE;
 use akuma_net_rtl8169::stall::{self, StallArm};
 use akuma_net_rtl8169::{Nic, Regs, Rings};
 use akuma_primitives::addr::virt_to_phys;
-use akuma_primitives::mmio::MmioReg;
+use akuma_dma::DmaArray;
+use akuma_dma::align::{A256, A64};
+use akuma_primitives::mmio::MmioWindow;
 use smoltcp::phy::DeviceCapabilities;
 
 use crate::counters::C;
@@ -47,119 +49,94 @@ const RING_LEN: usize = 16;
 /// Bytes per frame buffer. `RX_BUF_SIZE` (2048) holds a full frame plus FCS.
 const BUF_LEN: usize = RX_BUF_SIZE as usize;
 
-/// One descriptor as its four raw words: `[cmdstat, vlan, buf_lo, buf_hi]`
-/// (the field order of [`Desc`]).
-type RawDesc = [u32; 4];
-
-/// A 256-byte-aligned array of descriptors, in DMA-reachable `.bss`.
-#[repr(C, align(256))]
-struct DescRing([RawDesc; RING_LEN]);
-
-/// Frame storage for one ring.
-#[repr(C, align(64))]
-struct BufRing([[u8; BUF_LEN]; RING_LEN]);
+/// Words in one descriptor: `[cmdstat, vlan, buf_lo, buf_hi]` (the field order
+/// of [`Desc`]).
+const DESC_WORDS: usize = 4;
 
 // One NIC on this target, so one set of statics. Every access is under the
 // `NETWORK` spinlock (`Device::receive`/`transmit` run only from
 // `iface.poll()`), which serialises the driver; the *chip* only touches a
 // descriptor/buffer while its `OWN` bit says it may — the driver's whole
-// protocol.
-static mut RX_DESCS: DescRing = DescRing([[0; 4]; RING_LEN]);
-static mut TX_DESCS: DescRing = DescRing([[0; 4]; RING_LEN]);
-static mut RX_BUFS: BufRing = BufRing([[0; BUF_LEN]; RING_LEN]);
-static mut TX_BUFS: BufRing = BufRing([[0; BUF_LEN]; RING_LEN]);
+// protocol. The descriptor rings are `u32` cells (256-byte aligned, as the chip
+// requires) read and written one volatile word at a time, because the chip
+// writes them; the frame buffers are bytes, touched as a slice only over the one
+// slot the `OWN` protocol says the CPU holds.
+static RX_DESCS: DmaArray<u32, { RING_LEN * DESC_WORDS }, A256> = DmaArray::new();
+static TX_DESCS: DmaArray<u32, { RING_LEN * DESC_WORDS }, A256> = DmaArray::new();
+static RX_BUFS: DmaArray<u8, { RING_LEN * BUF_LEN }, A64> = DmaArray::new();
+static TX_BUFS: DmaArray<u8, { RING_LEN * BUF_LEN }, A64> = DmaArray::new();
 
 /// Whether a successful [`Rtl8169Device::probe`] has claimed the statics
 /// above. Set only after a full bring-up, so a failed probe can be retried;
 /// set exactly once, ever, because one NIC owns these arrays.
 static RTL8169_CLAIMED: AtomicBool = AtomicBool::new(false);
 
-fn desc_word(ring: *const DescRing, i: usize, w: usize) -> MmioReg<u32> {
-    // SAFETY (of `new`): a live, aligned `u32` inside a `.bss` static for the
-    // kernel's lifetime — which is all `MmioReg` actually needs; it is not a
-    // device register but volatile access to it is well-defined and is what we
-    // want against memory the chip also writes.
-    let addr = ring as usize + i * core::mem::size_of::<RawDesc>() + w * 4;
-    unsafe { MmioReg::<u32>::new(addr) }
-}
-
-fn read_desc(ring: *const DescRing, i: usize) -> Desc {
+fn read_desc(ring: &DmaArray<u32, { RING_LEN * DESC_WORDS }, A256>, i: usize) -> Desc {
     // `cmdstat` first: if `OWN` is clear the rest of the words are stable.
-    let cmdstat = desc_word(ring, i, 0).read();
+    let cmdstat = ring.get(i * DESC_WORDS);
     Desc {
         cmdstat,
-        vlan: desc_word(ring, i, 1).read(),
-        buf_lo: desc_word(ring, i, 2).read(),
-        buf_hi: desc_word(ring, i, 3).read(),
+        vlan: ring.get(i * DESC_WORDS + 1),
+        buf_lo: ring.get(i * DESC_WORDS + 2),
+        buf_hi: ring.get(i * DESC_WORDS + 3),
     }
 }
 
-fn write_desc(ring: *mut DescRing, i: usize, d: Desc) {
+fn write_desc(ring: &DmaArray<u32, { RING_LEN * DESC_WORDS }, A256>, i: usize, d: Desc) {
     // Everything but the ownership word first...
-    desc_word(ring, i, 1).write(d.vlan);
-    desc_word(ring, i, 2).write(d.buf_lo);
-    desc_word(ring, i, 3).write(d.buf_hi);
+    ring.set(i * DESC_WORDS + 1, d.vlan);
+    ring.set(i * DESC_WORDS + 2, d.buf_lo);
+    ring.set(i * DESC_WORDS + 3, d.buf_hi);
     // ...then a fence, then `cmdstat` — the chip must never see `OWN` set over
     // a half-written descriptor.
     compiler_fence(Ordering::SeqCst);
-    desc_word(ring, i, 0).write(d.cmdstat);
+    ring.set(i * DESC_WORDS, d.cmdstat);
 }
+
+/// Bytes of the register BAR the driver addresses: the standard registers all
+/// sit below 0x100 (`akuma-net-rtl8169`'s map ends at `MISC`, 0xF0).
+const REG_WINDOW_LEN: usize = 0x100;
 
 /// MMIO on the mapped register BAR.
 struct Rtl8169Regs {
-    base: usize,
-}
-
-// `base` is a device-mapped BAR; only ever accessed under `NETWORK`, from the
-// one core in `iface.poll()`.
-unsafe impl Send for Rtl8169Regs {}
-
-impl Rtl8169Regs {
-    fn reg<T: Copy>(&self, off: u16) -> MmioReg<T> {
-        // SAFETY: `base` is the NIC's register BAR, mapped `MemAttr::Device`;
-        // `off` is one of the < 256 standard-register offsets, of width `T` per
-        // `akuma-net-rtl8169`'s register map, which keeps each register at its
-        // natural alignment.
-        unsafe { MmioReg::<T>::new(self.base + off as usize) }
-    }
+    win: MmioWindow,
 }
 
 impl Regs for Rtl8169Regs {
     fn r8(&mut self, off: u16) -> u8 {
-        self.reg::<u8>(off).read()
+        self.win.read::<u8>(off as usize)
     }
     fn r16(&mut self, off: u16) -> u16 {
-        self.reg::<u16>(off).read()
+        self.win.read::<u16>(off as usize)
     }
     fn r32(&mut self, off: u16) -> u32 {
-        self.reg::<u32>(off).read()
+        self.win.read::<u32>(off as usize)
     }
     fn w8(&mut self, off: u16, val: u8) {
-        self.reg::<u8>(off).write(val);
+        self.win.write::<u8>(off as usize, val);
     }
     fn w16(&mut self, off: u16, val: u16) {
-        self.reg::<u16>(off).write(val);
+        self.win.write::<u16>(off as usize, val);
     }
     fn w32(&mut self, off: u16, val: u32) {
-        self.reg::<u32>(off).write(val);
+        self.win.write::<u32>(off as usize, val);
     }
     fn delay_us(&mut self, us: u32) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
         {
             // Assume a >= 1 GHz TSC — every x86_64 part is — so this over-waits
             // a bounded reset/MDIO poll on a fast box rather than ever
             // under-waiting and reporting a false timeout. TSC needs no
             // calibration and always advances.
             let target = u64::from(us) * 1000;
-            // SAFETY: RDTSC is unprivileged and present on all x86_64.
-            let start = unsafe { core::arch::x86_64::_rdtsc() };
-            while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < target {
+            let start = akuma_cpu::tsc::rdtsc();
+            while akuma_cpu::tsc::rdtsc().wrapping_sub(start) < target {
                 core::hint::spin_loop();
             }
         }
         // The feature is x86-only in practice; keep the crate compiling (dead)
         // if it is enabled elsewhere.
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         for _ in 0..us.saturating_mul(1000) {
             core::hint::spin_loop();
         }
@@ -170,9 +147,6 @@ impl Regs for Rtl8169Regs {
 /// needs.
 struct Rtl8169Rings;
 
-// All statics; every method runs under `NETWORK`.
-unsafe impl Send for Rtl8169Rings {}
-
 impl Rings for Rtl8169Rings {
     fn rx_ring_len(&self) -> usize {
         RING_LEN
@@ -181,30 +155,30 @@ impl Rings for Rtl8169Rings {
         RING_LEN
     }
     fn rx_ring_phys(&self) -> u64 {
-        virt_to_phys(&raw const RX_DESCS as usize) as u64
+        virt_to_phys(RX_DESCS.addr()) as u64
     }
     fn tx_ring_phys(&self) -> u64 {
-        virt_to_phys(&raw const TX_DESCS as usize) as u64
+        virt_to_phys(TX_DESCS.addr()) as u64
     }
 
     fn rx_desc(&self, i: usize) -> Desc {
-        read_desc(&raw const RX_DESCS, i)
+        read_desc(&RX_DESCS, i)
     }
     fn set_rx_desc(&mut self, i: usize, d: Desc) {
-        write_desc(&raw mut RX_DESCS, i, d);
+        write_desc(&RX_DESCS, i, d);
     }
     fn tx_desc(&self, i: usize) -> Desc {
-        read_desc(&raw const TX_DESCS, i)
+        read_desc(&TX_DESCS, i)
     }
     fn set_tx_desc(&mut self, i: usize, d: Desc) {
-        write_desc(&raw mut TX_DESCS, i, d);
+        write_desc(&TX_DESCS, i, d);
     }
 
     fn rx_buf_phys(&self, i: usize) -> u64 {
-        virt_to_phys(&raw const RX_BUFS as usize) as u64 + (i * BUF_LEN) as u64
+        virt_to_phys(RX_BUFS.addr()) as u64 + (i * BUF_LEN) as u64
     }
     fn tx_buf_phys(&self, i: usize) -> u64 {
-        virt_to_phys(&raw const TX_BUFS as usize) as u64 + (i * BUF_LEN) as u64
+        virt_to_phys(TX_BUFS.addr()) as u64 + (i * BUF_LEN) as u64
     }
 
     fn tx_buf_len(&self, _i: usize) -> usize {
@@ -213,21 +187,17 @@ impl Rings for Rtl8169Rings {
 
     fn rx_buf_read(&self, i: usize, len: usize, dst: &mut [u8]) -> usize {
         let n = len.min(dst.len()).min(BUF_LEN);
-        let base = (&raw const RX_BUFS).cast::<u8>();
-        // SAFETY: `i < RING_LEN`; `n <= BUF_LEN`; the chip released this buffer
-        // (its `OWN` bit is clear — the driver checked), so the bytes are
-        // stable RAM.
-        let src = unsafe { core::slice::from_raw_parts(base.add(i * BUF_LEN), n) };
-        dst[..n].copy_from_slice(src);
+        // The chip released this buffer (its `OWN` bit is clear — the driver
+        // checked), so the bytes of slot `i` are stable; the range check keeps
+        // `i` inside the ring.
+        RX_BUFS.read_range(i * BUF_LEN, n, |src| dst[..n].copy_from_slice(src));
         n
     }
     fn tx_buf_write(&mut self, i: usize, src: &[u8]) -> usize {
         let n = src.len().min(BUF_LEN);
-        let base = (&raw mut TX_BUFS).cast::<u8>();
-        // SAFETY: `i < RING_LEN`; `n <= BUF_LEN`. This descriptor is not owned
-        // by the chip (the driver only writes a buffer before posting it).
-        let dst = unsafe { core::slice::from_raw_parts_mut(base.add(i * BUF_LEN), n) };
-        dst.copy_from_slice(&src[..n]);
+        // This descriptor is not owned by the chip (the driver only writes a
+        // buffer before posting it).
+        TX_BUFS.write_range(i * BUF_LEN, n, |dst| dst.copy_from_slice(&src[..n]));
         n
     }
     fn tx_buf_zero(&mut self, i: usize, from: usize, to: usize) {
@@ -235,10 +205,7 @@ impl Rings for Rtl8169Rings {
         if from >= to {
             return;
         }
-        let base = (&raw mut TX_BUFS).cast::<u8>();
-        // SAFETY: as `tx_buf_write`; `i * BUF_LEN + from .. + to` is inside the
-        // buffer array.
-        unsafe { core::ptr::write_bytes(base.add(i * BUF_LEN + from), 0, to - from) };
+        TX_BUFS.write_range(i * BUF_LEN + from, to - from, |dst| dst.fill(0));
     }
 }
 
@@ -477,7 +444,11 @@ impl Rtl8169Device {
     /// over the same descriptors is a violation the ownership protocol
     /// cannot recover from.
     pub unsafe fn probe(bar: *mut u8) -> Result<Self, akuma_net_rtl8169::Error> {
-        let mut nic = Nic::probe(Rtl8169Regs { base: bar as usize }, Rtl8169Rings)?;
+        // SAFETY: the caller vouches `bar` is the NIC's device-mapped register BAR
+        // for the life of the device (page-aligned); the standard registers all
+        // lie within the first `REG_WINDOW_LEN` bytes of it.
+        let win = unsafe { MmioWindow::new(bar as usize, REG_WINDOW_LEN) };
+        let mut nic = Nic::probe(Rtl8169Regs { win }, Rtl8169Rings)?;
         nic.init()?;
         // Claimed only on success: a failed probe (absent or wrong chip,
         // timed-out reset) leaves the statics untouched, so a corrected
@@ -533,10 +504,10 @@ impl Rtl8169Device {
     #[must_use]
     pub fn dma_layout() -> [(&'static str, usize, u64); 4] {
         [
-            ("rx_desc", &raw const RX_DESCS as usize, virt_to_phys(&raw const RX_DESCS as usize) as u64),
-            ("tx_desc", &raw const TX_DESCS as usize, virt_to_phys(&raw const TX_DESCS as usize) as u64),
-            ("rx_bufs", &raw const RX_BUFS as usize, virt_to_phys(&raw const RX_BUFS as usize) as u64),
-            ("tx_bufs", &raw const TX_BUFS as usize, virt_to_phys(&raw const TX_BUFS as usize) as u64),
+            ("rx_desc", RX_DESCS.addr(), virt_to_phys(RX_DESCS.addr()) as u64),
+            ("tx_desc", TX_DESCS.addr(), virt_to_phys(TX_DESCS.addr()) as u64),
+            ("rx_bufs", RX_BUFS.addr(), virt_to_phys(RX_BUFS.addr()) as u64),
+            ("tx_bufs", TX_BUFS.addr(), virt_to_phys(TX_BUFS.addr()) as u64),
         ]
     }
 

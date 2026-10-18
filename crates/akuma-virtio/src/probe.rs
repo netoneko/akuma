@@ -68,6 +68,41 @@ fn device_id_at(addr: usize) -> u32 {
     device_id.read()
 }
 
+/// Build the transport over the virtio-mmio slot at `addr`, whose DeviceID the
+/// caller just matched against `device_id`. A slot whose header does not yield a
+/// working transport is logged and reported as `None`, so each sweep skips it.
+fn transport_at(slot: usize, device_id: u32, addr: usize) -> Option<SteppedMmioTransport<'static>> {
+    let header = core::ptr::NonNull::new(addr as *mut VirtIOHeader)?;
+
+    // SAFETY: `header` points at a virtio-mmio header inside the device mapping
+    // whose DeviceID the caller just matched, so the transport is being built
+    // over a real device of the expected kind.
+    // virtio-drivers 0.13 needs the MMIO region size so it can bound the config
+    // space. That is exactly the machine's slot stride: 0x200 on QEMU virt (eight
+    // slots packed in one page), 0x1000 under Firecracker.
+    let mmio_size = akuma_primitives::addr::virtio_stride();
+    let Ok(transport) = (unsafe { MmioTransport::new(header, mmio_size) }) else {
+        crate::safe_print!(64, "[virtio] slot {slot}: device {device_id} transport init failed\n");
+        return None;
+    };
+    Some(SteppedMmioTransport::new(transport))
+}
+
+/// Build the transport over the slot at kernel VA `addr`.
+///
+/// For a caller handed a specific slot rather than a device id (the rump tap
+/// binds the NIC at a known bus position).
+///
+/// Refuses (`None`) an address that is not one of the machine's slots, which is
+/// what lets this be a safe function: the claim `MmioTransport::new` needs - "this
+/// is a virtio-mmio header in the device mapping" - is checked against the same
+/// slot table [`scan`] reads, not taken on the caller's word.
+#[must_use]
+pub fn transport_at_slot(addr: usize) -> Option<SteppedMmioTransport<'static>> {
+    let slot = (0..num_slots()).find(|&i| slot_addr(i) == addr)?;
+    transport_at(slot, device_id_at(addr), addr)
+}
+
 /// Every virtio-mmio slot paired with the device id it advertises, in slot order.
 ///
 /// For callers that must reason about the *set* of devices rather than find the
@@ -132,23 +167,11 @@ pub fn probe_with<T>(
             continue;
         }
 
-        let Some(header) = core::ptr::NonNull::new(addr as *mut VirtIOHeader) else {
+        let Some(transport) = transport_at(i, device_id, addr) else {
             continue;
         };
 
-        // SAFETY: `header` points at a virtio-mmio header inside the device
-        // mapping whose DeviceID we just matched, so the transport is being
-        // built over a real device of the expected kind.
-        // virtio-drivers 0.13 needs the MMIO region size so it can bound the
-        // config space. That is exactly the machine's slot stride: 0x200 on QEMU
-        // virt (eight slots packed in one page), 0x1000 under Firecracker.
-        let mmio_size = akuma_primitives::addr::virtio_stride();
-        let Ok(transport) = (unsafe { MmioTransport::new(header, mmio_size) }) else {
-            crate::safe_print!(64, "[virtio] slot {i}: device {device_id} transport init failed\n");
-            continue;
-        };
-
-        if let Some(made) = make(i, SteppedMmioTransport::new(transport)) {
+        if let Some(made) = make(i, transport) {
             return Some(made);
         }
     }
@@ -174,19 +197,11 @@ pub fn probe_each(
             continue;
         }
 
-        let Some(header) = core::ptr::NonNull::new(addr as *mut VirtIOHeader) else {
+        let Some(transport) = transport_at(i, device_id, addr) else {
             continue;
         };
 
-        // SAFETY: same as `probe_with` — header points at a virtio-mmio header
-        // whose DeviceID we just matched.
-        let mmio_size = akuma_primitives::addr::virtio_stride();
-        let Ok(transport) = (unsafe { MmioTransport::new(header, mmio_size) }) else {
-            crate::safe_print!(64, "[virtio] slot {i}: device {device_id} transport init failed\n");
-            continue;
-        };
-
-        if !f(i, SteppedMmioTransport::new(transport)) {
+        if !f(i, transport) {
             return;
         }
     }

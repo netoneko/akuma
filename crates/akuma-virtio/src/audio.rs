@@ -73,7 +73,6 @@ pub const AFMT_S32_LE: i32 = 0x01000000;
 #[cfg(all(feature = "sound", not(feature = "platform-firecracker")))]
 mod imp {
     use super::{AudioError, AFMT_S16_LE, AFMT_U8};
-    use core::cell::UnsafeCell;
 
     use spinning_top::Spinlock;
     use virtio_drivers::device::sound::{PcmFeatures, PcmFormat, PcmRate, VirtIOSound};
@@ -105,46 +104,35 @@ mod imp {
         }
     }
 
-    /// VirtIO sound device wrapper with interior mutability.
+    /// VirtIO sound device wrapper.
     ///
     /// Like `VirtioBlockDevice`, all access is serialized through the global
-    /// `SOUND_DEVICE` Spinlock, so the `UnsafeCell`s are sound.
+    /// `SOUND_DEVICE` Spinlock, which hands out the `&mut`.
     pub struct VirtioSoundDevice {
-        inner: UnsafeCell<VirtIOSound<VirtioHal, SteppedMmioTransport<'static>>>,
+        inner: VirtIOSound<VirtioHal, SteppedMmioTransport<'static>>,
         out_stream: u32,
-        params: UnsafeCell<Params>,
+        params: Params,
         /// True once set_params+prepare+start have run for the current params.
-        prepared: UnsafeCell<bool>,
+        prepared: bool,
     }
 
-    // SAFETY: only accessed under the SOUND_DEVICE Spinlock (exclusive access).
-    unsafe impl Sync for VirtioSoundDevice {}
-
     impl VirtioSoundDevice {
-        #[inline]
-        #[allow(clippy::mut_from_ref)]
-        fn inner_mut(&self) -> &mut VirtIOSound<VirtioHal, SteppedMmioTransport<'static>> {
-            unsafe { &mut *self.inner.get() }
-        }
-
         /// Update one cached PCM field; invalidates the prepared stream so the
         /// next `play` re-applies the full parameter set. OSS apps set format,
         /// channels, and rate via independent ioctls, so each is applied alone
         /// against the retained defaults.
-        fn update_params<F: FnOnce(&mut Params)>(&self, f: F) {
-            unsafe {
-                f(&mut *self.params.get());
-                *self.prepared.get() = false;
-            }
+        fn update_params<F: FnOnce(&mut Params)>(&mut self, f: F) {
+            f(&mut self.params);
+            self.prepared = false;
         }
 
         /// Ensure the stream is configured + started for the current params.
-        fn ensure_prepared(&self) -> Result<(), AudioError> {
-            if unsafe { *self.prepared.get() } {
+        fn ensure_prepared(&mut self) -> Result<(), AudioError> {
+            if self.prepared {
                 return Ok(());
             }
-            let p = unsafe { *self.params.get() };
-            let dev = self.inner_mut();
+            let p = self.params;
+            let dev = &mut self.inner;
             dev.pcm_set_params(
                 self.out_stream,
                 BUFFER_BYTES,
@@ -157,33 +145,29 @@ mod imp {
             .map_err(|_| AudioError::InvalidParam)?;
             dev.pcm_prepare(self.out_stream).map_err(|_| AudioError::IoError)?;
             dev.pcm_start(self.out_stream).map_err(|_| AudioError::IoError)?;
-            unsafe {
-                *self.prepared.get() = true;
-            }
+            self.prepared = true;
             Ok(())
         }
 
         /// Play (blocking) a buffer of PCM frames matching the current params.
-        fn play(&self, frames: &[u8]) -> Result<usize, AudioError> {
+        fn play(&mut self, frames: &[u8]) -> Result<usize, AudioError> {
             if frames.is_empty() {
                 return Ok(0);
             }
             self.ensure_prepared()?;
-            self.inner_mut()
+            self.inner
                 .pcm_xfer(self.out_stream, frames)
                 .map_err(|_| AudioError::IoError)?;
             Ok(frames.len())
         }
 
         /// Stop + release the stream so the next file starts clean.
-        fn stop(&self) {
-            if unsafe { *self.prepared.get() } {
-                let dev = self.inner_mut();
+        fn stop(&mut self) {
+            if self.prepared {
+                let dev = &mut self.inner;
                 let _ = dev.pcm_stop(self.out_stream);
                 let _ = dev.pcm_release(self.out_stream);
-                unsafe {
-                    *self.prepared.get() = false;
-                }
+                self.prepared = false;
             }
         }
     }
@@ -223,10 +207,10 @@ mod imp {
             );
 
             Some(VirtioSoundDevice {
-                inner: UnsafeCell::new(snd),
+                inner: snd,
                 out_stream,
-                params: UnsafeCell::new(Params::default()),
-                prepared: UnsafeCell::new(false),
+                params: Params::default(),
+                prepared: false,
             })
         });
 
@@ -247,8 +231,8 @@ mod imp {
             AFMT_U8 => PcmFormat::U8,
             _ => return Err(AudioError::InvalidParam),
         };
-        let guard = SOUND_DEVICE.lock();
-        let dev = guard.as_ref().ok_or(AudioError::NotInitialized)?;
+        let mut guard = SOUND_DEVICE.lock();
+        let dev = guard.as_mut().ok_or(AudioError::NotInitialized)?;
         dev.update_params(|p| p.format = format);
         Ok(())
     }
@@ -258,8 +242,8 @@ mod imp {
         if !(1..=8).contains(&channels) {
             return Err(AudioError::InvalidParam);
         }
-        let guard = SOUND_DEVICE.lock();
-        let dev = guard.as_ref().ok_or(AudioError::NotInitialized)?;
+        let mut guard = SOUND_DEVICE.lock();
+        let dev = guard.as_mut().ok_or(AudioError::NotInitialized)?;
         dev.update_params(|p| p.channels = channels as u8);
         Ok(())
     }
@@ -276,23 +260,23 @@ mod imp {
             48000 => PcmRate::Rate48000,
             _ => return Err(AudioError::InvalidParam),
         };
-        let guard = SOUND_DEVICE.lock();
-        let dev = guard.as_ref().ok_or(AudioError::NotInitialized)?;
+        let mut guard = SOUND_DEVICE.lock();
+        let dev = guard.as_mut().ok_or(AudioError::NotInitialized)?;
         dev.update_params(|p| p.rate = rate);
         Ok(())
     }
 
     /// Play (blocking) a buffer of PCM frames matching the current params.
     pub fn play(frames: &[u8]) -> Result<usize, AudioError> {
-        let guard = SOUND_DEVICE.lock();
-        let dev = guard.as_ref().ok_or(AudioError::NotInitialized)?;
+        let mut guard = SOUND_DEVICE.lock();
+        let dev = guard.as_mut().ok_or(AudioError::NotInitialized)?;
         dev.play(frames)
     }
 
     /// Stop + release the current stream (called on `/dev/dsp` close).
     pub fn stop() {
-        let guard = SOUND_DEVICE.lock();
-        if let Some(dev) = guard.as_ref() {
+        let mut guard = SOUND_DEVICE.lock();
+        if let Some(dev) = guard.as_mut() {
             dev.stop();
         }
     }

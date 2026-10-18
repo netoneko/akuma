@@ -21,7 +21,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use akuma_virtio::VirtioTransport;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use akuma_virtio::VirtioHal;
 use akuma_rump::{NicError, RawNic, TapNic};
 
@@ -77,13 +76,8 @@ pub fn init() -> Result<[u8; 6], &'static str> {
 /// binds the NIC on `virtio-mmio-bus.5` (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md Stage 0/1).
 /// Returns the NIC MAC on success.
 pub fn init_at(addr: usize) -> Result<[u8; 6], &'static str> {
-    let header_ptr =
-        core::ptr::NonNull::new(addr as *mut VirtIOHeader).ok_or("tap: bad mmio addr")?;
-    let transport =
-        VirtioTransport::new(
-        unsafe { MmioTransport::new(header_ptr, akuma_primitives::addr::virtio_stride()) }
-            .map_err(|_| "tap: transport init failed")?,
-    );
+    let transport = akuma_virtio::probe::transport_at_slot(addr)
+        .ok_or("tap: not a virtio-mmio slot, or transport init failed")?;
     let inner = VirtIONetRaw::new(transport).map_err(|_| "tap: VirtIONetRaw init failed")?;
 
     let nic = VirtioRawNic { inner };

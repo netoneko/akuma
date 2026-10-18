@@ -3,7 +3,6 @@
 //! Provides a block device driver for virtio-blk devices with a generic
 //! sector-based read/write API suitable for filesystem implementations.
 
-use core::cell::UnsafeCell;
 
 use spinning_top::Spinlock;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -51,48 +50,35 @@ impl_display!(BlockError {
 // VirtIO Block Device Wrapper
 // ============================================================================
 
-/// VirtIO block device wrapper with interior mutability
+/// VirtIO block device wrapper.
 ///
-/// Uses UnsafeCell for interior mutability because VirtIOBlk needs &mut self
-/// for read/write operations, but we want to share it through a Spinlock.
+/// `VirtIOBlk` needs `&mut self` for read/write; the per-device Spinlock in
+/// `BLOCK_DEVICES` hands that out, so no interior mutability is needed.
 pub struct VirtioBlockDevice {
-    inner: UnsafeCell<VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>>,
+    inner: VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>,
     capacity_sectors: u64,
 }
-
-// SAFETY: VirtioBlockDevice is only accessed through the global BLOCK_DEVICE Spinlock,
-// which ensures exclusive access. The Spinlock provides the synchronization needed
-// to safely access the UnsafeCell contents.
-unsafe impl Sync for VirtioBlockDevice {}
 
 impl VirtioBlockDevice {
     /// Create a new VirtIO block device wrapper
     fn new(inner: VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>) -> Self {
         let capacity_sectors = inner.capacity();
         Self {
-            inner: UnsafeCell::new(inner),
+            inner,
             capacity_sectors,
         }
     }
 
     /// Get the capacity in sectors (512-byte blocks)
+    #[must_use]
     pub fn capacity_sectors(&self) -> u64 {
         self.capacity_sectors
     }
 
     /// Get the capacity in bytes
+    #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_sectors * SECTOR_SIZE as u64
-    }
-
-    /// Get mutable access to the inner VirtIOBlk
-    ///
-    /// # Safety
-    /// Caller must ensure exclusive access (e.g., via the BLOCK_DEVICE Spinlock).
-    #[inline]
-    #[allow(clippy::mut_from_ref)]
-    fn inner_mut(&self) -> &mut VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>> {
-        unsafe { &mut *self.inner.get() }
     }
 
     /// Read sectors from the device
@@ -100,7 +86,7 @@ impl VirtioBlockDevice {
     /// # Arguments
     /// * `sector` - Starting sector number
     /// * `buf` - Buffer to read into (must be a multiple of SECTOR_SIZE)
-    pub fn read_sectors(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    pub fn read_sectors(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if !buf.len().is_multiple_of(SECTOR_SIZE) {
             crate::safe_print!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
@@ -113,7 +99,7 @@ impl VirtioBlockDevice {
             return Err(BlockError::InvalidOffset);
         }
 
-        let inner = self.inner_mut();
+        let inner = &mut self.inner;
 
         if let Err(e) = inner.read_blocks(sector as usize, buf) {
             crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
@@ -129,7 +115,7 @@ impl VirtioBlockDevice {
     /// # Arguments
     /// * `sector` - Starting sector number
     /// * `buf` - Buffer to write from (must be a multiple of SECTOR_SIZE)
-    pub fn write_sectors(&self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+    pub fn write_sectors(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
         if !buf.len().is_multiple_of(SECTOR_SIZE) {
             crate::safe_print!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
@@ -142,7 +128,7 @@ impl VirtioBlockDevice {
             return Err(BlockError::InvalidOffset);
         }
 
-        let inner = self.inner_mut();
+        let inner = &mut self.inner;
 
         if let Err(e) = inner.write_blocks(sector as usize, buf) {
             crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
@@ -165,7 +151,7 @@ impl VirtioBlockDevice {
     /// measured: every one of a self-host build's ~62k page reads paid this
     /// allocate-then-copy for bytes that were already going to the right
     /// place.)
-    pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    pub fn read_bytes(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -196,7 +182,7 @@ impl VirtioBlockDevice {
     /// aligned write needs no read-modify-write at all, not just no temp
     /// buffer — the existing sector contents are being replaced wholesale, so
     /// reading them first was pure waste, not caution.
-    pub fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+    pub fn write_bytes(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -358,13 +344,13 @@ pub fn device_index_by_name(name: &str) -> Option<usize> {
 /// Returns `None` if the device does not exist.
 pub fn with_device_at<F, R>(idx: usize, f: F) -> Option<R>
 where
-    F: FnOnce(&VirtioBlockDevice) -> R,
+    F: FnOnce(&mut VirtioBlockDevice) -> R,
 {
     if idx >= MAX_BLOCK_DEVICES {
         return None;
     }
-    let guard = BLOCK_DEVICES[idx].lock();
-    guard.as_ref().map(f)
+    let mut guard = BLOCK_DEVICES[idx].lock();
+    guard.as_mut().map(f)
 }
 
 /// Read bytes at an arbitrary offset from device `idx`.
@@ -381,7 +367,7 @@ pub fn write_bytes_at(idx: usize, offset: u64, buf: &[u8]) -> Result<(), BlockEr
 /// Returns `None` if no block device is initialized.
 pub fn with_device<F, R>(f: F) -> Option<R>
 where
-    F: FnOnce(&VirtioBlockDevice) -> R,
+    F: FnOnce(&mut VirtioBlockDevice) -> R,
 {
     with_device_at(0, f)
 }
