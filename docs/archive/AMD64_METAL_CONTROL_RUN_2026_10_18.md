@@ -101,6 +101,34 @@ p3 state left behind: `/boot/akuma-amd64` = head no-tests, `.prev` = the
 kernel that was running before (`a028cec9`, md5 `4b9edb35...`); ryzen is back
 on Pop.
 
+## Same day: the four drivers (`b37eb82f`), 107 -> 81 amd64 sites, 589 -> 566 total
+
+`watchdog.rs` and `i2c.rs` onto `MmioWindow`; `nvme.rs` and `rtw89.rs` onto
+`DmaArray` statics plus `MmioWindow` BARs (`pci::map_bar_window`). `akuma-dma`
+gained the two methods the rtw89 card needed: `read_range` (a shared slice over
+one RX entry rather than the whole array the chip is still filling) and
+`leak_mut` (a permanent `&'static mut` for a card that owns its TX memory; every
+other access then panics, so the "called once" DMA contract is now enforced
+rather than assumed). `akuma-dma` +2 sites, host-tested. `touchpad.rs` follows
+`i2c::map_mmio`'s new return type; `watchdog` also drops its `cli` for
+`akuma_cpu::daif::mask_irq`.
+
+Verified: QEMU SMP=4 824/0; ryzen metal, tests kernel `b37eb82`, GRUB entry 20
+(`smp=8`): `wdt: armed, 60 s` and the box stays up for 4+ minutes (the pet
+works); `nvme:` init in 10 ms, GPT p3 found, root on it; `[rtw]` firmware
+downloaded and the card kept as `/dev/wifi0`, with this ssh session running
+over it; a 2.4 MB file read from NVMe and sent over wifi four times, md5 equal
+each time (RX ring wraps); `[touchpad]` GXTP5100 found on `dw_i2c`, HID
+descriptor read, `ptp report` parsed. Same 765/5 self-test as the baseline
+(`physmap`, `pci`, `spawn` x3). `[bkls>]` spin lines appear on every ryzen boot
+including the baseline control (49-68 per boot): not new.
+
+Not exercised: `net.rs`'s rtl8169 MMIO (trashcan only, and untouched here),
+`i2c`'s write path beyond the touchpad's descriptor read.
+
+p3 state: `/boot/akuma-amd64` = head `no-tests` built natively at `b37eb82f`
+(md5 `12d532a2...`), `.prev` = `a028cec9`; ryzen back on Pop.
+
 ## Background
 
 [`AMD64_UNSAFE_REDUCTION_TRAP_MSR.md`](AMD64_UNSAFE_REDUCTION_TRAP_MSR.md)
