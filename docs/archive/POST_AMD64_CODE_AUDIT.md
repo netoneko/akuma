@@ -500,6 +500,12 @@ tree-wide (amd64 alone 342 -> 315 sites). **Still open from tier 1:** `gdt.rs`
 the order, not hide the `asm!`) and `uaccess.rs` (not mechanical: `stac`/`clac`,
 CR0/CR4, and a copy routine whose fault fixup is welded to the page-fault handler;
 only the validation arithmetic is a clean extraction).
+Verified on QEMU (boot suite 814/0) and on the trashcan (kernel `37c3794f`,
+`no-tests`): 15 PCI functions enumerate, PIT calibration (`62374 counts per
+10000us`), the CMOS read at boot and the RTC write-back after SNTP, the console,
+and a `reboot -f` issued *by the new kernel* all work. The reset came back, but
+the log of the kernel that issued it is gone, so whether `0xCF9` or the i8042
+fallback did it is not recorded.
 
 2. **Finish the fold on drivers that already have pure twins.** The xHCI split
    is the model — `crates/akuma-xhci` is 2,178 lines of pure layout/bit math
