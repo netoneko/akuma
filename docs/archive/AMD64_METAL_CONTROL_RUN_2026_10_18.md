@@ -63,6 +63,44 @@ amd64 drivers `i2c.rs`/`rtw89.rs`/`nvme.rs`/`watchdog.rs` (need ryzen running
 Akuma - it is up as Pop!_OS); `net.rs`'s remaining MMIO sites go through
 `akuma_net::ExternalDevice::probe_rtl8169(*mut u8)`, a cross-crate API change.
 
+## Same day: ryzen metal, head against the baseline
+
+Both kernels built **natively on ryzen** (a Mac-built one hangs there,
+`AMD64_MAC_BUILT_KERNEL_METAL_HANG.md`), the **tests** build of each, installed as
+p3's `/boot/akuma-amd64` and booted with GRUB entry 20 (`smp=8`, wifi, sshd, stays
+up), read over wifi ssh (`~/.ssh/id_ed25519`; the Oct-6 per-build test key is
+not in p3's `authorized_keys`).
+
+| kernel | self-test | failures |
+|---|---|---|
+| head `0d604438` (twice) | 765 passed, 5 FAILED | `physmap`, `pci: every enumerated function has a real vendor id`, `spawn: ...fd 0 as Stdin`, `fd 1 as Stdout`, `fd 2 as Stderr` |
+| baseline `c1fe3655` | 765 passed, 5 FAILED | **the same five** |
+
+So all five predate the audit and my `mm.rs`/`uaccess.rs` changes. The `spawn`
+trio is `smp=8`-specific on the machines tried: it passed on the trashcan (4
+cores) and in two of three QEMU SMP=4 runs. The check asks the just-spawned child
+for its fd table and `Process::free`/`close_all` sweeps it at exit, so a child that
+finishes before the parent looks fails all three. Not proven: the baseline
+fails it too, but no change to that test was made. The `pci` failure is one
+or more of 42 enumerated functions with a bogus vendor id - ryzen hardware,
+`pci.rs` untouched.
+
+Head `no-tests` kernel (`0d60443`, md5 `7523e7bc...`, p3 `/boot/akuma-amd64`):
+boots on entry 20; 8 loops x 100 `busybox true` + `cat /bin/busybox` finish with
+no PANIC/CANARY/[Fault]/FREED-CR3/SWITCH NO-BKL/TLB stuck. The tests kernel
+survived 8 x 150.
+
+**`ls /root` does not spin on ryzen's p3** (49 entries, returns at once) on the
+same kernel that spins on the trashcan's `sda1`. That makes the trashcan's
+filesystem, not `getdents`, the first suspect for both the `ls /root` spin and
+the incremental `kbuild` stall; the `e2fsck -fn` from Ubuntu is still wanted and
+needs a keypress at GRUB (Akuma is the default entry, nothing remote returns to
+Ubuntu).
+
+p3 state left behind: `/boot/akuma-amd64` = head no-tests, `.prev` = the
+kernel that was running before (`a028cec9`, md5 `4b9edb35...`); ryzen is back
+on Pop.
+
 ## Background
 
 [`AMD64_UNSAFE_REDUCTION_TRAP_MSR.md`](AMD64_UNSAFE_REDUCTION_TRAP_MSR.md)
