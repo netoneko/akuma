@@ -45,6 +45,8 @@ ssh ryzen 'sh /home/netoneko/akuma-metal/akuma/overlays/ryzen/arm.sh'     # boot
 ssh ryzen 'mount -o ro /dev/nvme0n1p3 /mnt && ls /mnt/var/log/ryzen; umount /mnt'
 ```
 
+**Build the kernel for the metal ON ryzen, not on the Mac.** A Mac-built kernel (same commit) hung before printing anything while the ryzen-built one booted; cause unknown ([`docs/archive/AMD64_MAC_BUILT_KERNEL_METAL_HANG.md`](../../docs/archive/AMD64_MAC_BUILT_KERNEL_METAL_HANG.md)). To test a kernel without replacing the one GRUB boots from p3, put it at p3's `/boot/akuma-amd64.verify` (mount p3 from Pop, Firecracker stopped) and arm entries 23–26.
+
 **Rehearse before every metal boot.** A rehearsal costs two minutes on ryzen
 itself. A metal boot that wedges costs someone walking to the laptop. Every bug
 found so far on this machine was found by the rehearsal first, or could have been.
@@ -101,6 +103,10 @@ found so far on this machine was found by the rehearsal first, or could have bee
 | 15 | **wifi tool soak against the lossy simulated radio** (`wifisim=lossy` + the `wifisoak` service): `wifi auto` for 5 minutes against a radio whose scans miss networks, whose joins take seconds or time out, and whose link drops and comes back; `wifi status` sampled every 10 s into `/var/log/ryzen/wifisoak-N.txt`, `wifi auto`'s own output in `wifiauto-N.txt`. The fault sequence is seeded, so two transcripts are comparable. **Rehearsed 2026-10-12** (QEMU on ryzen, `DISK=nvme`, kernel built on the Mac): 30 samples, `wifi auto` alive at every one, three link drops (samples 1–2, 14–16, 26–27) each back to `connected` by itself, and the tool issued **one** join in five minutes — it waited through the kernel's rejoins rather than restarting them. Not run on the metal | yes |
 | 19 | **powersave verify**: entry 0's unattended shape + `idlesleep` — the AML EC scan live, no `ecram=` override | yes |
 | 20 | **Akuma on wifi + powersaved + idlesleep**: entry 14's usable shape (`smp=8`, console, sshd, `wifi auto`, klog) plus `idlesleep` and the `powersave` herd service (`/bin/powersaved`): the screen dims down the idle staircase and a keystroke brings it back; `dmesg` has `[IDLESTAT]`, the daemon's decisions are in `/var/log/herd/powersaved.log`. Needs `/bin/powersaved` and the conf hand-staged on p3 (the image does not take `rootfs/`). **First metal run 2026-10-15 (boot 120, 3 h 19 m)**: the staircase stepped 100→60→30→10 on schedule with the facts honest; `[IDLESTAT] halts=115907355 shots=195` over the session; the kernel log flowed with zero gaps until the power press. Two things to know: **the radio goes dormant with no traffic** — warm it with ~5 s of pings before `wifi-ssh.py` or ssh's kex dies mid-flight; and **each dead-link ssh attempt leaks a session server-side** (no timeout on half-open sessions), so ~24 refused attempts later sshd answers its banner but refuses everyone (`Refusing connection: 24 sessions already live`) — recover by rebooting, fix later with a session idle-timeout | no |
+| 23 | **VERIFY**: p3's `/boot/akuma-amd64.verify` with entry 0's command line + `fbverbose` + `strace` (nosmp, `autoreboot`) | yes |
+| 24 | **VERIFY**: as 23 without `strace` — the plain "does this kernel reach userspace" probe | yes |
+| 25 | **VERIFY**: `.verify` with entry 4's headless command line (`nofb`) | yes |
+| 26 | **VERIFY**: `.verify` with entry 20's command line (`smp=8`, wifi, sshd, `idlesleep`) — stays up; reach it with `wifi-ssh.py`, return with `reboot -f` | no |
 | 16 | reboot | — |
 
 **Network test, 2026-10-13/14 (entry 14, `smp=8`).** Stage3 tarball (233 MiB)

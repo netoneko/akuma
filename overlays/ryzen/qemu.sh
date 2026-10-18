@@ -95,7 +95,9 @@ sed -e "s/^set timeout=.*/set timeout=0/" \
 grep -A1 "^menuentry" $Q/grub.cfg | sed -n "$((ENTRY * 3 + 1)),$((ENTRY * 3 + 2))p"
 grub-mkstandalone -O x86_64-efi -o $MNT/EFI/BOOT/BOOTX64.EFI "boot/grub/grub.cfg=$Q/grub.cfg"
 grub-editenv $MNT/EFI/akuma/grubenv create
-[ "$ENTRY" = 0 ] || grub-editenv $MNT/EFI/akuma/grubenv set next_entry=$ENTRY
+# Always, entry 0 included: grub.cfg's `default` is 14 now, so leaving next_entry
+# unset for 0 rehearsed entry 14 (2026-10-18, AMD64_MAC_BUILT_KERNEL_METAL_HANG.md).
+grub-editenv $MNT/EFI/akuma/grubenv set next_entry=$ENTRY
 sync; umount $MNT
 [ "${DISK:-ahci}" = nvme ] && { losetup -d $LOOP; trap - EXIT; } || trap - EXIT
 fi

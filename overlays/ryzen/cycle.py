@@ -39,11 +39,27 @@ W = "/home/netoneko/akuma-metal"
 
 
 def ship(local, remote):
+    """Copy `local` to `remote` on ryzen, **verified**.
+
+    Skips the transfer when the remote file already has the right md5 (the link
+    is wifi: a 10 MB kernel is ~100 s). Uploads to `remote.new` and renames only
+    after the md5 matches. The original `cat > x.new && mv x.new x` renamed
+    whatever had arrived when the local timeout killed the ssh client — remote
+    `cat` sees EOF and exits 0 — so a timeout installed a **truncated kernel**
+    (2026-10-18: 8.8 of 10.5 MB, caught before `install.sh` ran).
+    """
+    import hashlib
     data = open(local, "rb").read()
-    r = subprocess.run(hpbox.RZ + [f"cat > {remote}.new && mv {remote}.new {remote}"], input=data,
-                       capture_output=True, timeout=300)
+    want = hashlib.md5(data).hexdigest()
+    rc, o, _ = hpbox.ryzen(f"md5sum {remote} 2>/dev/null", timeout=60)
+    if rc == 0 and o.split()[:1] == [want]:
+        return
+    r = subprocess.run(hpbox.RZ + [f"cat > {remote}.new"], input=data, capture_output=True, timeout=1800)
     if r.returncode:
         sys.exit(f"ship {local}: {r.stderr.decode(errors='replace')}")
+    rc, o, e = hpbox.ryzen(f"echo '{want}  {remote}.new' | md5sum -c - && mv {remote}.new {remote}", timeout=120)
+    if rc:
+        sys.exit(f"ship {local}: md5 mismatch after upload: {o} {e}")
 
 
 def main():
