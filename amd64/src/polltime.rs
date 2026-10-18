@@ -47,9 +47,8 @@ pub fn ticks_ms(ms: u64) -> u64 {
 /// did (`crate::shootdown::masked_wait_assist`).
 pub fn spin_us(us: u64) {
     let target = tsc_hz() / 1_000_000 * us;
-    // SAFETY: RDTSC is unprivileged and present on all x86_64.
-    let start = unsafe { core::arch::x86_64::_rdtsc() };
-    while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < target {
+    let start = akuma_cpu::tsc::rdtsc();
+    while akuma_cpu::tsc::rdtsc().wrapping_sub(start) < target {
         crate::shootdown::masked_wait_assist();
         // The USB bring-up is the longest synchronous stretch of a boot before the
         // scheduler runs: let a quiet boot's splash draw a frame from here (a no-op
@@ -60,6 +59,5 @@ pub fn spin_us(us: u64) {
 }
 
 pub fn tsc() -> u64 {
-    // SAFETY: as `spin_us`.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    akuma_cpu::tsc::rdtsc()
 }

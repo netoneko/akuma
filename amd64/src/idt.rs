@@ -69,93 +69,17 @@ use crate::phys::phys_ptr;
 use akuma_selftest::Suite;
 
 use crate::serial;
+use akuma_idt_amd64::Idt;
+use akuma_trap_amd64::{self as trap, Kind, Trap};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// The frame the CPU pushes on exception entry, in push order.
-///
-/// Defined here rather than pulled from a crate: it is five `u64`s fixed by the
-/// architecture, and `x86-interrupt` hands it over by value.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct InterruptStackFrame {
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
+// The frames moved to `akuma-trap-amd64` with the entry stubs that build them;
+// these re-exports keep `signal.rs`/`shootdown.rs` spelling them `idt::…`.
+pub use akuma_trap_amd64::{InterruptStackFrame, TrapRegs};
 
-/// One 16-byte IDT gate descriptor.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Entry {
-    offset_low: u16,
-    selector: u16,
-    /// Interrupt-stack-table index in bits 0:2; 0 means "use the current stack".
-    ist: u8,
-    /// `0x8E` = present, DPL 0, 64-bit interrupt gate. An *interrupt* gate rather
-    /// than a trap gate, so `IF` is cleared on entry and a handler cannot be
-    /// re-entered by a device interrupt.
-    type_attr: u8,
-    offset_mid: u16,
-    offset_high: u32,
-    reserved: u32,
-}
-
-impl Entry {
-    const fn empty() -> Self {
-        Self {
-            offset_low: 0,
-            selector: 0,
-            ist: 0,
-            type_attr: 0,
-            offset_mid: 0,
-            offset_high: 0,
-            reserved: 0,
-        }
-    }
-
-    fn set(&mut self, handler: usize) {
-        let handler = handler as u64;
-        self.offset_low = handler as u16;
-        self.offset_mid = (handler >> 16) as u16;
-        self.offset_high = (handler >> 32) as u32;
-        // The 64-bit code selector `boot.s` far-jumped through. Reading it from
-        // `cs` would be more general; hardcoding it keeps this honest about the
-        // fact that there is exactly one GDT in this kernel and `boot.s` owns it.
-        self.selector = 0x08;
-        self.ist = 0;
-        self.type_attr = 0x8E;
-        self.reserved = 0;
-    }
-
-    /// As [`Self::set`], with the gate's DPL at 3 (`0xEE`), so a ring-3 `int n`
-    /// naming this vector reaches the handler instead of raising `#GP`. Only
-    /// for vectors a program is *meant* to raise itself — `#BP`, from `int3`.
-    /// DPL governs software `int n` only; a CPU-raised exception ignores it.
-    fn set_user(&mut self, handler: usize) {
-        self.set(handler);
-        self.type_attr = 0xEE;
-    }
-}
-
-/// The `lidt` operand: limit then base, packed.
-#[repr(C, packed)]
-struct Idtr {
-    limit: u16,
-    base: u64,
-}
-
-const IDT_LEN: usize = 256;
-
-/// The table itself.
-///
-/// `static mut` because `lidt` takes its address and the CPU reads it directly;
-/// there is no interior-mutability wrapper that changes what the hardware does.
-/// Accessed only through raw pointers (`&raw mut`), never a reference, which is
-/// what keeps it sound under the 2024 edition's `static_mut_refs` rule. It is
-/// written exactly once, before `lidt`, on one core with interrupts masked.
-static mut IDT: [Entry; IDT_LEN] = [Entry::empty(); IDT_LEN];
+/// The table the CPU reads. Atomics inside (`akuma-idt-amd64`), so filling it is
+/// safe; *when* a gate may be installed is [`akuma_idt_amd64::Idt::set`]'s rule.
+static IDT: Idt = Idt::new();
 
 /// Page faults serviced by demand paging, for the smoke test.
 static DEMAND_FAULTS: AtomicUsize = AtomicUsize::new(0);
@@ -184,8 +108,7 @@ pub static FAULT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 #[inline(always)]
 fn tsc() -> u64 {
-    // SAFETY: unprivileged, reads no memory.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    akuma_cpu::tsc::rdtsc()
 }
 
 /// Base of the lazily-backed test region, or 0 if none is armed.
@@ -213,6 +136,19 @@ static FATAL_IN_PROGRESS: core::sync::atomic::AtomicBool = core::sync::atomic::A
 #[must_use]
 pub fn fatal_in_progress() -> bool {
     FATAL_IN_PROGRESS.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The qword `idx` words from `rsp` (negative is below it), for the crash dump.
+///
+/// Callers have checked `rsp >= PHYSMAP_BASE`, so the address is in the kernel
+/// window; a kernel stack is at least a page, so the 64 words either side of a live
+/// stack pointer are the same stack. Volatile so nothing reorders the read into
+/// the prints. This is the dump's one dereference: it runs on a dying core and
+/// must not itself be able to do more than fault.
+fn stack_word(rsp: u64, idx: isize) -> u64 {
+    let addr = (rsp as usize).wrapping_add_signed(idx * 8);
+    // SAFETY: as above.
+    unsafe { (addr as *const u64).read_volatile() }
 }
 
 fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
@@ -308,10 +244,7 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
         // one immediately under rsp.
         serial::fatal_puts("\n  [rsp-64..rsp)");
         for i in (1..=8).rev() {
-            // SAFETY: `rsp` is in the physmap and a kernel stack is at least a
-            // page, so 64 bytes below a live stack pointer is the same stack.
-            // Volatile so nothing reorders it into the prints.
-            let w = unsafe { (frame.rsp as *const u64).sub(i).read_volatile() };
+            let w = stack_word(frame.rsp, -(i as isize));
             if i % 4 == 0 {
                 serial::fatal_puts("\n   ");
             }
@@ -327,10 +260,7 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
             "\n  [rsp/physmap]"
         });
         for i in 0..64 {
-            // SAFETY: checked to be a kernel-window address above; the kernel
-            // stack is at least a page, and the read is volatile so nothing
-            // reorders it into the prints.
-            let w = unsafe { (frame.rsp as *const u64).add(i).read_volatile() };
+            let w = stack_word(frame.rsp, i as isize);
             if i % 4 == 0 {
                 serial::fatal_puts("\n   ");
             }
@@ -389,10 +319,8 @@ macro_rules! exception_stubs {
         /// `function_casts_as_integer` allowed for the reason [`init`] states:
         /// a handler's address in a gate descriptor is what an IDT is.
         #[allow(function_casts_as_integer)]
-        fn install_exception_stubs(idt: *mut [Entry; IDT_LEN]) {
-            // SAFETY: same obligation as `init`'s own writes — single core,
-            // interrupts masked, reached only through the raw pointer.
-            unsafe { $( (*idt)[$vector].set($name as usize); )* }
+        fn install_exception_stubs(idt: &Idt) {
+            $( idt.set($vector, $name as usize); )*
         }
     };
 }
@@ -405,9 +333,8 @@ macro_rules! exception_stubs_with_code {
             }
         )*
         #[allow(function_casts_as_integer)]
-        fn install_exception_stubs_with_code(idt: *mut [Entry; IDT_LEN]) {
-            // SAFETY: as above.
-            unsafe { $( (*idt)[$vector].set($name as usize); )* }
+        fn install_exception_stubs_with_code(idt: &Idt) {
+            $( idt.set($vector, $name as usize); )*
         }
     };
 }
@@ -430,330 +357,10 @@ exception_stubs_with_code! {
     vec_sx  = 30, "#SX security exception";
 }
 
-/// What [`page_fault_entry`] hands to [`page_fault_dispatch`]: the error code
-/// the CPU pushes for vector 14, then the ordinary return frame.
-///
-/// Layout is fixed by the hardware and by the stub's `lea rdi, [rsp + 128]`,
-/// which points at the error code past the stub's sixteen pushes. Reordering
-/// these fields changes what that assembly reads.
-#[repr(C)]
-pub struct PageFaultFrame {
-    /// Bits: 0 present, 1 write, 2 user, 3 reserved-bit, 4 instruction fetch.
-    pub error_code: u64,
-    pub frame: InterruptStackFrame,
-}
-
-/// The interrupted **general-purpose register file**, saved by the stub below
-/// and handed to the dispatcher as its second argument.
-///
-/// Field order is the stub's push order reversed — `r15` is pushed last and so
-/// lands at offset 0 — and it is the ABI between two files. The `const _`
-/// under this type asserts it.
-///
-/// # Why all fifteen, when ten were enough
-///
-/// Ten (the caller-saved set plus `rbp`) is exactly what a *serviced* fault
-/// needs: the dispatcher is `extern "C"`, so it preserves `rbx`/`r12`-`r15`
-/// itself, and the interrupted instruction re-executes with everything intact.
-///
-/// **Delivering a signal needs to read them, not merely preserve them.** A
-/// `SIGSEGV` handler is handed a `ucontext_t` whose `uc_mcontext` is the
-/// interrupted register file, and `rt_sigreturn` puts that file back — so a
-/// register the kernel never wrote down is a register a `longjmp`-free handler
-/// returns into garbage. Preserved-in-the-register is not the same as
-/// readable-from-Rust: by the time the dispatcher decides to deliver, its own
-/// Rust frames have used `rbx` and `r12`-`r15` for their own purposes and
-/// restored them only on the way out.
-///
-/// The sixteenth push is padding, and it is load-bearing: fifteen pushes is
-/// 120 bytes, which would leave `rsp` 8 off the 16-byte alignment System V
-/// requires at the `call`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TrapRegs {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rbp: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rbx: u64,
-    pub rax: u64,
-}
-
-/// The stub indexes nothing by hand — it pushes and pops in a fixed order — but
-/// **Rust reads this struct off that stack**, so the two orders are one fact in
-/// two files. A reordered field here compiles, boots, and hands a signal
-/// handler a register file with two values swapped.
-const _: () = {
-    assert!(core::mem::offset_of!(TrapRegs, r15) == 0);
-    assert!(core::mem::offset_of!(TrapRegs, rbp) == 64);
-    assert!(core::mem::offset_of!(TrapRegs, rax) == 112);
-    assert!(core::mem::size_of::<TrapRegs>() == 120);
-};
-
-/// The hand-assembled entry for an exception **with an error code** whose
-/// handler may rewrite the return address: `$entry` is the symbol the IDT gate
-/// points at, `$dispatch` the `#[unsafe(no_mangle)] extern "C"
-/// fn(*mut PageFaultFrame, *mut TrapRegs)` it calls. Used for vectors 13 and
-/// 14; see the module header for why those two and no others.
-macro_rules! fixable_exception_entry {
-    ($entry:literal, $dispatch:literal) => {
-        core::arch::global_asm!(concat!(
-            /* Naming the section is mandatory — see sched.rs for why a missing
-             * `.section` puts code in .bss and fails the link. */
-            "    .section .text\n",
-            ".global ", $entry, "\n",
-            $entry, ":\n",
-            /* On entry the CPU has pushed, on a 16-byte-aligned rsp (long mode
-             * aligns before pushing, whether or not the privilege level changed):
-             *
-             *   [rsp +  0]  error code
-             *   [rsp +  8]  rip
-             *   [rsp + 16]  cs
-             *   [rsp + 24]  rflags
-             *   [rsp + 32]  rsp
-             *   [rsp + 40]  ss
-             *
-             * If the fault came from ring 3, `%gs` is the program's; kernel code
-             * expects its per-CPU block there (`smp.rs`). Swap it in — and only
-             * then, because from ring 0 it is already in place and a second
-             * `swapgs` would swap it out. The saved CS's RPL is the test. */
-            "    test qword ptr [rsp + 16], 3\n",
-            "    jz 3f\n",
-            "    swapgs\n",
-            "3:\n",
-            /*
-             * Save the **whole** general-purpose register file, as `TrapRegs`.
-             *
-             * The caller-saved nine plus rbp is what a *serviced* fault needs:
-             * the dispatcher is `extern "C"`, so it preserves rbx/r12-r15
-             * itself, but it is free to destroy the rest and the interrupted
-             * code — which may be `rep movsb` in the middle of a user copy,
-             * about to be re-executed after demand paging — is not expecting a
-             * call. Delivering a **signal** needs more than that: the handler is
-             * handed the interrupted register file as `uc_mcontext`, and
-             * `rt_sigreturn` puts it back, so a register the kernel never wrote
-             * down is one a handler returns into garbage. See `TrapRegs`.
-             *
-             * The padding push first: fifteen registers is 120 bytes, and rsp
-             * must be 16-aligned at the `call`. Pushing it first rather than
-             * last is what puts the register block at [rsp + 0], so the
-             * dispatcher's second argument is a plain `lea rsi, [rsp]`.
-             *
-             * Push order is `TrapRegs` read bottom-up: rax first lands at the
-             * highest offset, r15 last lands at 0. */
-            "    sub rsp, 8\n",                   /* alignment padding */
-            "    push rax\n",
-            "    push rbx\n",
-            "    push rcx\n",
-            "    push rdx\n",
-            "    push rsi\n",
-            "    push rdi\n",
-            "    push rbp\n",
-            "    push r8\n",
-            "    push r9\n",
-            "    push r10\n",
-            "    push r11\n",
-            "    push r12\n",
-            "    push r13\n",
-            "    push r14\n",
-            "    push r15\n",
-            /* Hardware does NOT clear RFLAGS.AC on exception delivery, so a
-             * fault taken inside a `stac` window would run the dispatcher with
-             * SMAP suspended. Clear it — but only where SMAP is on, because
-             * `clac` is #UD on a CPU without it (Haswell). `iretq` restores the
-             * saved rflags, so a demand-paged `rep movsb` resumes with AC set. */
-            "    cmp byte ptr [rip + SMAP_ACTIVE], 0\n",
-            "    je 1f\n",
-            "    clac\n",
-            "1:\n",
-            /* DF is NOT among the flags the CPU clears on exception delivery,
-             * and the interrupted code may have set it: musl's x86_64 memmove
-             * is `std; rep movsb; cld`, and a fault on any byte of that copy
-             * arrives here with DF=1. Every kernel memcpy/memset is a `rep`
-             * string op, so without this the dispatcher's page zero and CoW
-             * copy run BACKWARDS from their base into the previous frame.
-             * rustc emits the same `cld` in every `x86-interrupt` prologue;
-             * hand-written entries have to say it (`trap_entry_df_seen`). */
-            "    cld\n",
-            "    lea rdi, [rsp + 128]\n",         /* &PageFaultFrame: the error code slot */
-            "    lea rsi, [rsp]\n",               /* &TrapRegs */
-            "    call ", $dispatch, "\n",
-            /* The dispatcher returned, so this fault was serviced, fixed up, or
-             * **redirected into a signal handler** — it may have rewritten the
-             * saved rip and rsp, and the argument registers in the block below.
-             * Restore exactly what is there now; a demand-paged store
-             * re-executes with the registers it faulted with, and a delivered
-             * signal enters with the three the dispatcher wrote. */
-            "    pop r15\n",
-            "    pop r14\n",
-            "    pop r13\n",
-            "    pop r12\n",
-            "    pop r11\n",
-            "    pop r10\n",
-            "    pop r9\n",
-            "    pop r8\n",
-            "    pop rbp\n",
-            "    pop rdi\n",
-            "    pop rsi\n",
-            "    pop rdx\n",
-            "    pop rcx\n",
-            "    pop rbx\n",
-            "    pop rax\n",
-            "    add rsp, 8\n",                   /* the alignment padding */
-            "    add rsp, 8\n",                   /* drop the error code; iretq does not */
-            /* Back to the program's `%gs` if that is where we are going. */
-            "    test qword ptr [rsp + 8], 3\n",
-            "    jz 4f\n",
-            "    swapgs\n",
-            "4:\n",
-            "    iretq\n",
-        ));
-    };
-}
-
-// The LAPIC timer's entry: hand-assembled like the two above, because its
-// handler may **switch tasks** — the `iretq` at the end then resumes a
-// different task's frame — and because it must `swapgs` on a ring-3 origin so
-// the scheduler it calls can find its per-CPU block.
-//
-// It saves the same `TrapRegs` the exception stubs do, and for the same reason
-// they grew to: since 2026-09-11 the dispatcher may **redirect this frame into
-// a signal handler**, which means reading the whole interrupted register file
-// (a handler is handed it as `uc_mcontext` and `rt_sigreturn` puts it back) and
-// writing three registers back. The tick is the last place a signal could not
-// reach — a program that never syscalls and never faults.
-//
-// **The alignment arithmetic is different here and there is no padding push.**
-// There is no error code, so the CPU pushes 40 bytes and `rsp` arrives
-// `≡ 8 (mod 16)`; fifteen pushes is 120, which is also `≡ 8`, so the two cancel
-// and `rsp` is 16-aligned at the `call` exactly as System V requires. The old
-// ten-push form needed a `sub rsp, 8` to get there; adding one here would break
-// it. The exception stubs pad because their error code makes the entry
-// alignment the other one.
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global timer_entry
-timer_entry:
-    test qword ptr [rsp + 8], 3
-    jz 1f
-    swapgs
-1:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cld                              /* see fixable_exception_entry!: DF survives delivery */
-    lea rdi, [rsp + 120]             /* &InterruptStackFrame */
-    lea rsi, [rsp]                   /* &TrapRegs */
-    call timer_dispatch
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    test qword ptr [rsp + 8], 3
-    jz 2f
-    swapgs
-2:
-    iretq
-"#
-);
-
-// `#DB`'s entry, shaped like `timer_entry` rather than like the two
-// `fixable_exception_entry!` stubs: vector 1 pushes **no error code**, so the
-// frame the CPU leaves is the five-word one and the alignment arithmetic is the
-// timer's (40 bytes pushed + 120 of registers, both `= 8 (mod 16)`, cancelling
-// to a 16-aligned `call`).
-//
-// It needs a dispatcher that can edit the frame — clearing `TF` in the saved
-// `rflags` is the whole point — which is exactly what the `x86-interrupt`
-// stubs cannot do, and why `#DB` does not stay on the generated ones.
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global debug_entry
-debug_entry:
-    test qword ptr [rsp + 8], 3
-    jz 1f
-    swapgs
-1:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cld                              /* see fixable_exception_entry!: DF survives delivery */
-    lea rdi, [rsp + 120]             /* &InterruptStackFrame */
-    lea rsi, [rsp]                   /* &TrapRegs */
-    call debug_dispatch
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    test qword ptr [rsp + 8], 3
-    jz 2f
-    swapgs
-2:
-    iretq
-"#
-);
-
-unsafe extern "C" {
-    /// The vector-1 entry point, installed in the IDT by [`init`].
-    fn debug_entry();
-}
+// The frame types, the register block and every entry stub live in
+// `akuma-trap-amd64`; what is left here is policy. A handler is a safe
+// `fn(&mut Trap)` registered in `register_handlers`, and `init` points the
+// vectors at the crate's stubs.
 
 /// `RFLAGS.TF` — single-step.
 const RFLAGS_TF: u64 = 1 << 8;
@@ -784,11 +391,8 @@ static TRAP_ENTRY_DF_SEEN: AtomicU64 = AtomicU64::new(0);
 /// First statement of every hand-written entry's dispatcher.
 #[inline]
 pub fn note_trap_entry_flags() {
-    let flags: u64;
-    // SAFETY: reads `rflags` through the stack and restores `rsp`; no memory
-    // the compiler knows about is touched.
-    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
-    if flags & (1 << 10) != 0 {
+    // `daif::read` is raw `RFLAGS` on this target.
+    if akuma_cpu::daif::read() & (1 << 10) != 0 {
         TRAP_ENTRY_DF_SEEN.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -827,29 +431,23 @@ pub fn trap_entry_df_seen() -> u64 {
 ///
 /// `DR6` is cleared either way: hardware accumulates its bits and never clears
 /// them, so a stale `BS` would misattribute the next trap.
-#[unsafe(no_mangle)]
-extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+fn debug_trap(t: &mut Trap<'_>) {
     note_trap_entry_flags();
     akuma_bkl::sync::set_core_tag_transient(
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
     );
-    let dr6 = read_dr6();
-    write_dr6(0);
-    // SAFETY: the stub passes a pointer into the current stack, to the frame
-    // the CPU just pushed; it is live and exclusively ours until `iretq`.
-    let f = unsafe { &mut *frame };
-    if f.cs & 3 == 3 {
+    let dr6 = akuma_cpu::debugreg::dr6();
+    akuma_cpu::debugreg::clear_dr6();
+    if t.from_ring3() {
         crate::uaccess::clac_if_enabled();
-        // SAFETY: as in `general_protection_dispatch`, and the BKL for the
-        // same reason.
-        let regs = unsafe { &mut *regs };
+        // The BKL, for the same reason as `general_protection_trap`.
         let took = !crate::smp::bkl_held();
         if took {
             crate::smp::bkl_enter();
         }
         let delivered = crate::signal::deliver_fault_signal(
-            f, regs, SIGTRAP, crate::signal::segv::SI_KERNEL, 0,
+            t.frame, t.regs, SIGTRAP, crate::signal::segv::SI_KERNEL, 0,
         );
         if took {
             crate::smp::bkl_leave();
@@ -859,14 +457,14 @@ extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         }
         // No handler: Linux's default for `SIGTRAP` is to terminate, which is
         // what `user_fault` does here — the process, not the kernel.
-        user_fault("#DB debug (ring 3, no handler)", f, None, None, SIGSEGV);
+        user_fault("#DB debug (ring 3, no handler)", t.frame, None, None, SIGSEGV);
     }
     let n = RING0_DEBUG_TRAPS.fetch_add(1, Ordering::Relaxed);
     if n < RING0_DEBUG_REPORT_LIMIT {
         serial::puts("\n[DB] ring-0 debug trap disarmed: rip=0x");
-        serial::put_hex(f.rip);
+        serial::put_hex(t.frame.rip);
         serial::puts(" rflags=0x");
-        serial::put_hex(f.rflags);
+        serial::put_hex(t.frame.rflags);
         serial::puts(" dr6=0x");
         serial::put_hex(dr6);
         serial::puts(" core=");
@@ -875,27 +473,7 @@ extern "C" fn debug_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         serial::put_dec(crate::smp::current_task() as u64);
         serial::puts("\n");
     }
-    f.rflags &= !RFLAGS_TF;
-}
-
-/// `DR6` records why the last `#DB` fired; hardware never clears it.
-fn read_dr6() -> u64 {
-    let v: u64;
-    // SAFETY: reading a debug register copies it into a local; it dereferences
-    // nothing.
-    unsafe {
-        core::arch::asm!("mov {}, dr6", out(reg) v, options(nomem, nostack, preserves_flags));
-    }
-    v
-}
-
-fn write_dr6(v: u64) {
-    // SAFETY: `DR6` is a status register — writing it clears the sticky
-    // condition bits and has no other effect. Nothing in this kernel arms
-    // `DR0`-`DR3`/`DR7`, so there is no debugger state to disturb.
-    unsafe {
-        core::arch::asm!("mov dr6, {}", in(reg) v, options(nomem, nostack, preserves_flags));
-    }
+    t.frame.rflags &= !RFLAGS_TF;
 }
 
 // `#UD` — vector 6, no error code, same shape as `#DB` above and for the same
@@ -909,112 +487,53 @@ fn write_dr6(v: u64) {
 // same wedge seen on bare metal. A ring-3 `#UD` has no "disarm and continue"
 // story the way a stray `#DB` does — the instruction bytes really are bad —
 // so ring 0 still falls through to `fatal`.
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global invalid_opcode_entry
-invalid_opcode_entry:
-    test qword ptr [rsp + 8], 3
-    jz 1f
-    swapgs
-1:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cld                              /* see fixable_exception_entry!: DF survives delivery */
-    lea rdi, [rsp + 120]             /* &InterruptStackFrame */
-    lea rsi, [rsp]                   /* &TrapRegs */
-    call invalid_opcode_dispatch
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    test qword ptr [rsp + 8], 3
-    jz 2f
-    swapgs
-2:
-    iretq
-"#
-);
-
-unsafe extern "C" {
-    /// The vector-6 entry point, installed in the IDT by [`init`].
-    fn invalid_opcode_entry();
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn invalid_opcode_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+fn invalid_opcode_trap(t: &mut Trap<'_>) {
     note_trap_entry_flags();
     akuma_bkl::sync::set_core_tag_transient(
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
     );
-    // SAFETY: the stub passes a pointer into the current stack, to the frame
-    // the CPU just pushed; it is live and exclusively ours until `iretq`.
-    let f = unsafe { &mut *frame };
-    if f.cs & 3 == 3 {
+    if t.from_ring3() {
         crate::uaccess::clac_if_enabled();
-        // SAFETY: as in `general_protection_dispatch`, and the BKL for the
-        // same reason.
-        let regs = unsafe { &mut *regs };
-        let took = !crate::smp::bkl_held();
-        if took {
-            crate::smp::bkl_enter();
-        }
-        let delivered = crate::signal::deliver_fault_signal(
-            f, regs, SIGILL, crate::signal::segv::SI_KERNEL, 0,
-        );
-        if took {
-            crate::smp::bkl_leave();
-        }
-        if delivered {
+        if deliver_under_bkl(t, SIGILL, crate::signal::segv::SI_KERNEL, 0) {
             return;
         }
         // No handler: Linux's default for `SIGILL` is to terminate, which is
         // what `user_fault` does here — the process, not the kernel.
-        user_fault("#UD invalid opcode (ring 3, no handler)", f, None, Some(regs), SIGSEGV);
+        user_fault("#UD invalid opcode (ring 3, no handler)", t.frame, None, Some(&*t.regs), SIGSEGV);
     }
-    fatal("#UD invalid opcode", f, None);
+    fatal("#UD invalid opcode", t.frame, None);
 }
 
-fixable_exception_entry!("page_fault_entry", "page_fault_dispatch");
-fixable_exception_entry!("general_protection_entry", "general_protection_dispatch");
-
-unsafe extern "C" {
-    /// The vector-14 entry point, installed in the IDT by [`init`].
-    fn page_fault_entry();
-    /// The vector-13 entry point, installed in the IDT by [`init`].
-    fn general_protection_entry();
+/// Deliver `sig` to the ring-3 code that took this trap, **under the BKL**, and say
+/// whether a handler was entered.
+///
+/// `deliver_fault_signal` edits the process's signal state and writes a frame to
+/// the user stack, which can itself demand-page or break a CoW page; a CoW break
+/// broadcasts a shootdown IPI whose acknowledgement wait assumes every sender
+/// holds the lock (the argument on `akuma_mmu::set_shootdown_hooks`). A trap from
+/// ring 3 arrives without it, so take it for the window and drop it after; one
+/// that already holds it (reentrant by owner core) is left alone. Returning
+/// `false` (no handler, signal blocked, frame could not be built) is the caller's
+/// cue to `user_fault`, **after** the release — `kill_current_from_fault` takes
+/// the lock itself and never returns.
+fn deliver_under_bkl(t: &mut Trap<'_>, sig: u32, si_code: i32, addr: u64) -> bool {
+    let took = !crate::smp::bkl_held();
+    if took {
+        crate::smp::bkl_enter();
+    }
+    let delivered = crate::signal::deliver_fault_signal(t.frame, t.regs, sig, si_code, addr);
+    if took {
+        crate::smp::bkl_leave();
+    }
+    delivered
 }
 
 /// `#PF` — the only handler that can *return*, and the only one that can return
 /// *somewhere else*.
 ///
-/// Called by [`page_fault_entry`] with the hardware frame; whatever this leaves
-/// in `frame.rip` is where `iretq` resumes. Three outcomes, in this order:
+/// Called by the `#PF` stub in `akuma-trap-amd64` with the hardware frame;
+/// whatever this leaves in `frame.rip` is where `iretq` resumes. Three outcomes, in this order:
 ///
 /// 1. **Demand paging.** A fault inside the armed lazy region with bit 0 clear
 ///    (the page is not present): allocate a frame, map it, and return with the
@@ -1029,11 +548,9 @@ unsafe extern "C" {
 ///    serviced, not failed.
 /// 3. **Fatal.** Everything else, as before.
 ///
-/// `#[unsafe(no_mangle)]` and `extern "C"` because the stub `call`s it by name.
 /// A plain function, not `x86-interrupt`: the stub already did the entry work,
 /// and this must be free to edit the frame — see the module header.
-#[unsafe(no_mangle)]
-extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+fn page_fault_trap(t: &mut Trap<'_>) {
     note_trap_entry_flags();
     // BKL-hold attribution: stamp the core's cache for this transient
     // excursion (the interrupted thread keeps its own tag — see
@@ -1043,10 +560,7 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
     );
-    // SAFETY: the stub passes a pointer into the current stack, to the frame
-    // the CPU just pushed; it is live and exclusively ours until `iretq`.
-    let pf = unsafe { &mut *frame };
-    let code = PageFaultCode::new(pf.error_code);
+    let code = PageFaultCode::new(t.error_code.unwrap_or(0));
     let addr = read_cr2();
     let base = LAZY_BASE.load(Ordering::Relaxed);
     let len = LAZY_LEN.load(Ordering::Relaxed);
@@ -1148,13 +662,13 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
         crate::smp::bkl_leave();
     }
 
-    if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
+    if let Some(fixup) = akuma_user_access::user_copy_fixup(t.frame.rip) {
         COPY_FIXUPS.fetch_add(1, Ordering::Relaxed);
-        pf.frame.rip = fixup;
+        t.frame.rip = fixup;
         return;
     }
 
-    if pf.frame.cs & 3 == 3 {
+    if t.from_ring3() {
         // **A ring-3 fault nothing serviced is a `SIGSEGV`, not a kill** — if
         // the program installed a handler for it. `deliver_fault_signal`
         // rewrites the pushed `rip`/`rsp` and the three argument registers, so
@@ -1176,34 +690,19 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapReg
         } else {
             crate::signal::segv::ACCERR
         };
-        // SAFETY: the stub's own register block, live until its `pop` sequence;
-        // nothing else holds a reference to it.
-        let regs = unsafe { &mut *regs };
-        // **Under the BKL**, for the reason the servicing arms above state:
-        // writing the signal frame to the user stack can itself demand-page or
-        // break a CoW page, and a CoW break broadcasts a shootdown IPI whose
-        // acknowledgement wait assumes every sender holds the lock. The nested
-        // `#PF` would take it anyway (this dispatcher is reentrant by owner
-        // core), so this is belt and braces — and the belt is cheap next to a
-        // fault that is about to build a 440-byte frame. `kill_current_from_fault`
-        // takes it on the other side of this decision for the same reason.
-        let took = !crate::smp::bkl_held();
-        if took {
-            crate::smp::bkl_enter();
-        }
-        let delivered =
-            crate::signal::deliver_fault_signal(&mut pf.frame, regs, SIGSEGV, si_code, addr);
-        if took {
-            crate::smp::bkl_leave();
-        }
-        if delivered {
+        // **Under the BKL** (`deliver_under_bkl`): writing the signal frame to
+        // the user stack can itself demand-page or break a CoW page. The nested
+        // `#PF` would take it anyway (this handler is reentrant by owner core),
+        // so this is belt and braces — and the belt is cheap next to a fault
+        // that is about to build a 440-byte frame.
+        if deliver_under_bkl(t, SIGSEGV, si_code, addr) {
             return;
         }
         describe_page_fault(code);
-        user_fault("#PF page fault", &pf.frame, Some(code.raw()), Some(regs), SIGSEGV);
+        user_fault("#PF page fault", t.frame, Some(code.raw()), Some(&*t.regs), SIGSEGV);
     }
     describe_page_fault(code);
-    fatal("#PF page fault", &pf.frame, Some(code.raw()));
+    fatal("#PF page fault", t.frame, Some(code.raw()));
 }
 
 /// Say in words what the error code says in bits, before the fatal printer's hex.
@@ -1682,42 +1181,29 @@ const SIGILL: u32 = 4;
 /// the range check, still gets `EFAULT` and not a halt. Same stub, same frame,
 /// same fixup query as [`page_fault_dispatch`]; no demand paging, because a
 /// `#GP` is never "not mapped yet".
-#[unsafe(no_mangle)]
-extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
+fn general_protection_trap(t: &mut Trap<'_>) {
     note_trap_entry_flags();
     akuma_bkl::sync::set_core_tag_transient(
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_FAULT,
     );
-    // SAFETY: as `page_fault_dispatch`.
-    let pf = unsafe { &mut *frame };
-    if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
+    if let Some(fixup) = akuma_user_access::user_copy_fixup(t.frame.rip) {
         COPY_FIXUPS.fetch_add(1, Ordering::Relaxed);
-        pf.frame.rip = fixup;
+        t.frame.rip = fixup;
         return;
     }
-    if pf.frame.cs & 3 == 3 {
+    let code = t.error_code.unwrap_or(0);
+    if t.from_ring3() {
         // The same `SIGSEGV` route as a `#PF`, with `SI_KERNEL` and no address:
         // a `#GP` has no faulting *address* to report (the CPU rejected the
-        // operand before translation), and Linux reports it the same way.
-        // SAFETY: as in `page_fault_dispatch`, and the BKL for the same reason.
-        let regs = unsafe { &mut *regs };
-        let took = !crate::smp::bkl_held();
-        if took {
-            crate::smp::bkl_enter();
-        }
-        let delivered = crate::signal::deliver_fault_signal(
-            &mut pf.frame, regs, SIGSEGV, crate::signal::segv::SI_KERNEL, 0,
-        );
-        if took {
-            crate::smp::bkl_leave();
-        }
-        if delivered {
+        // operand before translation), and Linux reports it the same way. Under
+        // the BKL for the reason `page_fault_trap` states.
+        if deliver_under_bkl(t, SIGSEGV, crate::signal::segv::SI_KERNEL, 0) {
             return;
         }
-        user_fault("#GP general protection", &pf.frame, Some(pf.error_code), Some(regs), SIGSEGV);
+        user_fault("#GP general protection", t.frame, Some(code), Some(&*t.regs), SIGSEGV);
     }
-    fatal("#GP general protection", &pf.frame, Some(pf.error_code));
+    fatal("#GP general protection", t.frame, Some(code));
 }
 
 // ---------------------------------------------------------------------------
@@ -1748,14 +1234,6 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame, regs: *mut
 // Linux's `do_int3_user` gives it. `#OF` stays out: `into` is `#UD` in 64-bit
 // mode, so nothing in ring 3 can raise vector 4.
 
-/// Vector 3: a ring-3 `int3` becomes `SIGTRAP` through [`ring3_exception`].
-#[unsafe(no_mangle)]
-extern "C" fn breakpoint_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
-    // SAFETY: the stub's frame pointer, live until `iretq`.
-    let f = unsafe { &mut *frame };
-    ring3_exception("#BP breakpoint", f, regs, None, SIGTRAP, crate::signal::segv::SI_KERNEL);
-}
-
 /// `SIGBUS`, what Linux raises for a ring-3 `#NP`, `#SS` or `#AC`.
 const SIGBUS: u32 = 7;
 /// `SIGFPE`, what Linux raises for a ring-3 `#DE`, `#MF` or `#XM`.
@@ -1767,183 +1245,55 @@ const BUS_ADRALN: i32 = 1;
 
 /// Shared body: ring 3 → the signal (or the process's death), ring 0 → `fatal`.
 ///
-/// Same shape as [`invalid_opcode_dispatch`]: `clac`, BKL around the
-/// delivery because it edits the process's signal state, and `user_fault`
-/// when the program has no handler, the signal is blocked, or the frame could
-/// not be built.
-fn ring3_exception(
-    label: &str,
-    f: &mut InterruptStackFrame,
-    regs: *mut TrapRegs,
-    error_code: Option<u64>,
-    sig: u32,
-    si_code: i32,
-) {
+/// Same shape as [`invalid_opcode_trap`]: `clac`, BKL around the delivery because
+/// it edits the process's signal state, and `user_fault` when the program has no
+/// handler, the signal is blocked, or the frame could not be built.
+fn ring3_exception(label: &str, t: &mut Trap<'_>, sig: u32, si_code: i32) {
     note_trap_entry_flags();
-    if f.cs & 3 == 3 {
+    if t.from_ring3() {
         akuma_bkl::sync::set_core_tag_transient(
             crate::smp::cpu_index_u32(),
             akuma_bkl::sync::HOLD_TAG_FAULT,
         );
         crate::uaccess::clac_if_enabled();
-        // SAFETY: the stub passes a pointer to the register block it just
-        // pushed on this stack; it is live and exclusively ours until `iretq`.
-        let regs = unsafe { &mut *regs };
-        let took = !crate::smp::bkl_held();
-        if took {
-            crate::smp::bkl_enter();
-        }
-        let delivered = crate::signal::deliver_fault_signal(f, regs, sig, si_code, 0);
-        if took {
-            crate::smp::bkl_leave();
-        }
-        if delivered {
+        if deliver_under_bkl(t, sig, si_code, 0) {
             return;
         }
-        user_fault(label, f, error_code, Some(regs), sig);
+        user_fault(label, t.frame, t.error_code, Some(&*t.regs), sig);
     }
-    fatal(label, f, error_code);
+    fatal(label, t.frame, t.error_code);
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn segment_not_present_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
-    // SAFETY: the stub's frame pointer, live until `iretq`.
-    let pf = unsafe { &mut *frame };
-    let code = pf.error_code;
-    ring3_exception("#NP segment not present", &mut pf.frame, regs, Some(code), SIGBUS,
-        crate::signal::segv::SI_KERNEL);
+/// Vector 3: a ring-3 `int3` becomes `SIGTRAP` through [`ring3_exception`].
+fn breakpoint_trap(t: &mut Trap<'_>) {
+    ring3_exception("#BP breakpoint", t, SIGTRAP, crate::signal::segv::SI_KERNEL);
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn stack_segment_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
-    // SAFETY: as above.
-    let pf = unsafe { &mut *frame };
-    let code = pf.error_code;
-    ring3_exception("#SS stack fault", &mut pf.frame, regs, Some(code), SIGBUS,
-        crate::signal::segv::SI_KERNEL);
+fn segment_not_present_trap(t: &mut Trap<'_>) {
+    ring3_exception("#NP segment not present", t, SIGBUS, crate::signal::segv::SI_KERNEL);
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn alignment_check_dispatch(frame: *mut PageFaultFrame, regs: *mut TrapRegs) {
-    // SAFETY: as above.
-    let pf = unsafe { &mut *frame };
-    let code = pf.error_code;
-    ring3_exception("#AC alignment check", &mut pf.frame, regs, Some(code), SIGBUS, BUS_ADRALN);
+fn stack_segment_trap(t: &mut Trap<'_>) {
+    ring3_exception("#SS stack fault", t, SIGBUS, crate::signal::segv::SI_KERNEL);
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn divide_error_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
-    // SAFETY: the stub's frame pointer, live until `iretq`.
-    let f = unsafe { &mut *frame };
-    ring3_exception("#DE divide error", f, regs, None, SIGFPE, FPE_INTDIV);
+fn alignment_check_trap(t: &mut Trap<'_>) {
+    ring3_exception("#AC alignment check", t, SIGBUS, BUS_ADRALN);
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn x87_fp_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
-    // SAFETY: as above.
-    let f = unsafe { &mut *frame };
-    ring3_exception("#MF x87 floating point", f, regs, None, SIGFPE,
-        crate::signal::segv::SI_KERNEL);
+fn divide_error_trap(t: &mut Trap<'_>) {
+    ring3_exception("#DE divide error", t, SIGFPE, FPE_INTDIV);
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn simd_fp_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
-    // SAFETY: as above.
-    let f = unsafe { &mut *frame };
-    ring3_exception("#XM SIMD floating point", f, regs, None, SIGFPE,
-        crate::signal::segv::SI_KERNEL);
+fn x87_fp_trap(t: &mut Trap<'_>) {
+    ring3_exception("#MF x87 floating point", t, SIGFPE, crate::signal::segv::SI_KERNEL);
 }
 
-// Error-code vectors reuse the `#GP`/`#PF` stub: same frame layout, and a
-// dispatcher that edits the frame only to redirect into a signal handler.
-fixable_exception_entry!("segment_not_present_entry", "segment_not_present_dispatch");
-fixable_exception_entry!("stack_segment_entry", "stack_segment_dispatch");
-fixable_exception_entry!("alignment_check_entry", "alignment_check_dispatch");
-
-/// The no-error-code counterpart, `#UD`'s stub parameterised: 40 bytes from
-/// the CPU plus 120 of registers are both `≡ 8 (mod 16)`, so `rsp` is aligned
-/// at the `call` with no padding push (see `timer_entry`).
-macro_rules! trap_entry_no_code {
-    ($entry:literal, $dispatch:literal) => {
-        core::arch::global_asm!(concat!(
-            "    .section .text\n",
-            ".global ", $entry, "\n",
-            $entry, ":\n",
-            "    test qword ptr [rsp + 8], 3\n",
-            "    jz 1f\n",
-            "    swapgs\n",
-            "1:\n",
-            "    push rax\n",
-            "    push rbx\n",
-            "    push rcx\n",
-            "    push rdx\n",
-            "    push rsi\n",
-            "    push rdi\n",
-            "    push rbp\n",
-            "    push r8\n",
-            "    push r9\n",
-            "    push r10\n",
-            "    push r11\n",
-            "    push r12\n",
-            "    push r13\n",
-            "    push r14\n",
-            "    push r15\n",
-            "    cld\n",                          /* see fixable_exception_entry!: DF survives delivery */
-            "    lea rdi, [rsp + 120]\n",         /* &InterruptStackFrame */
-            "    lea rsi, [rsp]\n",               /* &TrapRegs */
-            "    call ", $dispatch, "\n",
-            "    pop r15\n",
-            "    pop r14\n",
-            "    pop r13\n",
-            "    pop r12\n",
-            "    pop r11\n",
-            "    pop r10\n",
-            "    pop r9\n",
-            "    pop r8\n",
-            "    pop rbp\n",
-            "    pop rdi\n",
-            "    pop rsi\n",
-            "    pop rdx\n",
-            "    pop rcx\n",
-            "    pop rbx\n",
-            "    pop rax\n",
-            "    test qword ptr [rsp + 8], 3\n",
-            "    jz 2f\n",
-            "    swapgs\n",
-            "2:\n",
-            "    iretq\n",
-        ));
-    };
+fn simd_fp_trap(t: &mut Trap<'_>) {
+    ring3_exception("#XM SIMD floating point", t, SIGFPE, crate::signal::segv::SI_KERNEL);
 }
 
-trap_entry_no_code!("divide_error_entry", "divide_error_dispatch");
-trap_entry_no_code!("breakpoint_entry", "breakpoint_dispatch");
-trap_entry_no_code!("x87_fp_entry", "x87_fp_dispatch");
-trap_entry_no_code!("simd_fp_entry", "simd_fp_dispatch");
-
-unsafe extern "C" {
-    /// Vector 0, installed by [`init`].
-    fn divide_error_entry();
-    /// Vector 3, installed by [`init`] with a DPL-3 gate.
-    fn breakpoint_entry();
-    /// Vector 11, installed by [`init`].
-    fn segment_not_present_entry();
-    /// Vector 12, installed by [`init`].
-    fn stack_segment_entry();
-    /// Vector 16, installed by [`init`].
-    fn x87_fp_entry();
-    /// Vector 17, installed by [`init`].
-    fn alignment_check_entry();
-    /// Vector 19, installed by [`init`].
-    fn simd_fp_entry();
-}
-
-unsafe extern "C" {
-    /// The LAPIC timer entry point, installed in the IDT by `lapic::init`.
-    fn timer_entry();
-}
-
-/// The LAPIC timer vector's body, called by [`timer_entry`] with the frame.
+/// The LAPIC timer vector's body, called by the timer stub with the frame.
 ///
 /// Counts, acknowledges, and may **switch tasks** — the switch happens here, on
 /// the interrupted task's own trap stack, which is what makes preemption
@@ -1955,8 +1305,7 @@ unsafe extern "C" {
 /// says where: ring 3, or the idle loop, may be switched away from; other
 /// kernel code is only asked (`need_resched`) and switches at its next yield.
 /// See `sched::preempt_if_needed` for why.
-#[unsafe(no_mangle)]
-extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapRegs) {
+fn timer_trap(t: &mut Trap<'_>) {
     note_trap_entry_flags();
     // BKL-hold attribution: a tick that lands mid-hold is the IRQ/scheduler,
     // not the interrupted thread (transient stamp; the thread's tag survives).
@@ -1964,10 +1313,7 @@ extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         crate::smp::cpu_index_u32(),
         akuma_bkl::sync::HOLD_TAG_IRQ,
     );
-    // SAFETY: the stub passes pointers into the current stack, to the frame the
-    // CPU just pushed and to its own register block; both are live until
-    // `iretq`.
-    let from_user = unsafe { (*frame).cs & 3 } == 3;
+    let from_user = t.from_ring3();
     // A tick can land inside a `stac` window; the scheduler must not inherit it.
     crate::uaccess::clac_if_enabled();
     crate::lapic::on_tick();
@@ -1989,11 +1335,7 @@ extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
         if took {
             crate::smp::bkl_enter();
         }
-        // SAFETY: as above; nothing else holds a reference to either.
-        let outcome = crate::signal::deliver_pending_on_tick(
-            unsafe { &mut *frame },
-            unsafe { &mut *regs },
-        );
+        let outcome = crate::signal::deliver_pending_on_tick(t.frame, t.regs);
         if took {
             crate::smp::bkl_leave();
         }
@@ -2036,15 +1378,14 @@ extern "C" fn timer_dispatch(frame: *mut InterruptStackFrame, regs: *mut TrapReg
     crate::sched::preempt_if_needed(from_user);
 }
 
-/// Address of [`timer_entry`], for [`set_handler`].
+/// Address of the timer stub, for [`set_handler`].
 ///
-/// A function rather than a `pub` symbol because the entry's ABI is an
-/// implementation detail of this module — the caller wants "the timer entry
-/// point", not a typed `extern "C" fn` it would then have to spell.
-#[allow(function_casts_as_integer)]
+/// A function rather than a `pub` symbol because the stub's ABI is an
+/// implementation detail of `akuma-trap-amd64` — the caller wants "the timer
+/// entry point", not a typed `extern "C" fn` it would then have to spell.
 #[must_use]
 pub fn timer_interrupt_entry() -> usize {
-    timer_entry as usize
+    trap::entry(Kind::Timer)
 }
 
 /// Install a handler for one vector, after [`init`].
@@ -2054,18 +1395,23 @@ pub fn timer_interrupt_entry() -> usize {
 /// it installs can be raised — the LAPIC timer is configured *after* its handler
 /// is in place.
 pub fn set_handler(vector: u8, handler: usize) {
-    // SAFETY: reached only through a raw pointer, never a reference; single
-    // core, interrupts masked.
-    //
-    // Bound to a local first rather than written `(*(&raw mut IDT))[..]`, which
-    // trips `clippy::deref_addrof`. Clippy's suggested fix there — index `IDT`
-    // directly — would reintroduce the `static_mut_refs` violation this pointer
-    // exists to avoid, so the lint is right about the shape and wrong about the
-    // remedy.
-    unsafe {
-        let idt = &raw mut IDT;
-        (*idt)[vector as usize].set(handler);
-    }
+    IDT.set(vector, handler);
+}
+
+/// Register every trap handler with `akuma-trap-amd64`. Single-shot per kind.
+fn register_handlers() {
+    trap::register(Kind::DivideError, divide_error_trap);
+    trap::register(Kind::Debug, debug_trap);
+    trap::register(Kind::Breakpoint, breakpoint_trap);
+    trap::register(Kind::InvalidOpcode, invalid_opcode_trap);
+    trap::register(Kind::SegmentNotPresent, segment_not_present_trap);
+    trap::register(Kind::StackSegment, stack_segment_trap);
+    trap::register(Kind::GeneralProtection, general_protection_trap);
+    trap::register(Kind::PageFault, page_fault_trap);
+    trap::register(Kind::X87Fp, x87_fp_trap);
+    trap::register(Kind::AlignmentCheck, alignment_check_trap);
+    trap::register(Kind::SimdFp, simd_fp_trap);
+    trap::register(Kind::Timer, timer_trap);
 }
 
 /// Build the IDT and load it.
@@ -2073,37 +1419,31 @@ pub fn set_handler(vector: u8, handler: usize) {
 /// `function_casts_as_integer` is allowed here deliberately. The lint exists to
 /// catch a function *item* being used where its return value was meant, which is
 /// almost always a bug — but putting a handler's address into a gate descriptor
-/// is the one thing an IDT is. The handlers have five different signatures
-/// (`x86-interrupt`, with and without an error code, one diverging, and the
-/// bare `extern "C"` asm entry for `#PF`), so spelling each cast through its
-/// exact fn-pointer type would add lines of ceremony that say nothing the
-/// descriptor does not already say.
+/// is the one thing an IDT is. The `x86-interrupt` handlers have three
+/// signatures (with and without an error code, one diverging), so spelling each
+/// cast through its exact fn-pointer type would add lines of ceremony that say
+/// nothing the descriptor does not already say.
+///
+/// Order matters in one place: every handler is registered **before** the table
+/// is loaded, so no stub can run with nothing to call.
 #[allow(function_casts_as_integer)]
 pub fn init() {
-    // SAFETY: single core, interrupts masked, and the table is reached only
-    // through raw pointers — never a reference to the `static mut`.
-    unsafe {
-        let idt = &raw mut IDT;
-        for i in 0..IDT_LEN {
-            (*idt)[i].set(unhandled as usize);
+    register_handlers();
+    IDT.fill(unhandled as usize);
+    install_exception_stubs(&IDT);
+    install_exception_stubs_with_code(&IDT);
+    IDT.set(8, double_fault as usize);
+    // The hand-assembled entries; see the module header. Each kind knows its
+    // vector and whether ring 3 may raise it (`#BP`, from `int3`), so adding a
+    // trap is one `Kind` arm and one `register` line.
+    for kind in Kind::ALL {
+        let Some(vector) = kind.vector() else { continue };
+        let entry = trap::entry(kind);
+        if kind.user_callable() {
+            IDT.set_user(vector, entry);
+        } else {
+            IDT.set(vector, entry);
         }
-        install_exception_stubs(idt);
-        install_exception_stubs_with_code(idt);
-        (*idt)[0].set(divide_error_entry as usize);
-        (*idt)[1].set(debug_entry as usize);
-        (*idt)[3].set_user(breakpoint_entry as usize);
-        (*idt)[6].set(invalid_opcode_entry as usize);
-        (*idt)[8].set(double_fault as usize);
-        // The hand-assembled entries; see the module header.
-        (*idt)[13].set(general_protection_entry as usize);
-        (*idt)[14].set(page_fault_entry as usize);
-        // Ring-3-survivable exceptions: a signal for the program, `fatal`
-        // only from ring 0. See `ring3_exception`.
-        (*idt)[11].set(segment_not_present_entry as usize);
-        (*idt)[12].set(stack_segment_entry as usize);
-        (*idt)[16].set(x87_fp_entry as usize);
-        (*idt)[17].set(alignment_check_entry as usize);
-        (*idt)[19].set(simd_fp_entry as usize);
     }
     load();
 }
@@ -2113,16 +1453,7 @@ pub fn init() {
 /// `IDTR` is a per-core register, so every AP must do this; the table it points
 /// at is the same one, and by the time a secondary runs it is complete.
 pub fn load() {
-    // SAFETY: the table is fully built by `init` before any AP starts, and
-    // `lidt` only records its address.
-    unsafe {
-        let idt = &raw mut IDT;
-        let idtr = Idtr {
-            limit: (core::mem::size_of::<[Entry; IDT_LEN]>() - 1) as u16,
-            base: idt as u64,
-        };
-        core::arch::asm!("lidt [{}]", in(reg) &raw const idtr, options(readonly, nostack, preserves_flags));
-    }
+    IDT.load();
 }
 
 /// Arm a lazily-backed virtual range. Pages appear on first touch.

@@ -1,0 +1,13 @@
+[package]
+name = "akuma-trap-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "amd64 trap entry: the CPU's exception frame and the saved register file as types, the naked entry stubs that build them, and a Trap (&mut frame + &mut registers) handed to a registered safe handler. The one place a stub's raw frame pointers become references. no_std"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `Registered`: the tree's boot-registered hook cell. Lock-free to read, which a
+# trap path needs (an IRQ that interrupted the lock holder must not spin on it).
+akuma-not-even-once = { path = "../akuma-not-even-once" }

@@ -86,8 +86,7 @@ fn tsc_hz() -> u64 {
 }
 
 fn rdtsc() -> u64 {
-    // SAFETY: RDTSC is unprivileged and present on every x86_64.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    akuma_cpu::tsc::rdtsc()
 }
 
 /// Milliseconds since the splash began.

@@ -850,7 +850,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
     // and console saw 429 `[BKL] stuck … tag=9` lines in one boot, all of
     // them this loop holding the BKL; this print says how long one mmap
     // actually holds it and at which file sizes the cost sits.
-    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+    let t0 = akuma_cpu::tsc::rdtsc();
     // **File fills are batched.** One `file_bytes_at` call per 4 KiB page made
     // ext2 re-resolve the inode, re-derive block mappings and allocate its
     // `phys_blocks` scratch `Vec` per page — the measured 2.2 µs/page (8 MB in
@@ -959,7 +959,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         // in-guest build wrote hundreds of these lines to the UART *while
         // compiling*. The print, not the timing, was the cost; `rdtsc` is a
         // few cycles and stays. Flip `mm::MMAP_TRACE` for the A/B.
-        let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+        let dt = akuma_cpu::tsc::rdtsc().wrapping_sub(t0);
         let hz = crate::lapic::tsc_hz();
         let us = if hz != 0 { dt / (hz / 1_000_000) } else { 0 };
         serial::puts("  [mmap-t] pages=");
@@ -1414,15 +1414,13 @@ pub fn fault_in(addr: u64) -> bool {
     match file {
         None => populate_page(page, prot),
         Some((file, region_start, region_pages, shared_write)) => {
-            // SAFETY: `rdtsc` is unprivileged and reads no memory.
-            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            let t0 = akuma_cpu::tsc::rdtsc();
             let ok = if shared_write {
                 fill_shared_write_pages(page, prot, file, region_start, region_pages)
             } else {
                 fill_file_pages(page, prot, file, region_start, region_pages)
             };
-            // SAFETY: as above.
-            let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+            let t1 = akuma_cpu::tsc::rdtsc();
             FILE_FAULT_CYCLES.fetch_add(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
             ok
         }

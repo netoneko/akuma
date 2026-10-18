@@ -890,8 +890,7 @@ pub const XCR0_ENABLED: u64 = 0b111;
 /// as it does on Linux.
 pub fn enable_xsave() -> bool {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
-    // SAFETY: cpuid is always available in long mode.
-    let (l1, d0) = unsafe { (__cpuid(1), __cpuid_count(0xD, 0)) };
+    let (l1, d0) = (__cpuid(1), __cpuid_count(0xD, 0));
     let have_xsave = l1.ecx & (1 << 26) != 0;
     let have_avx = l1.ecx & (1 << 28) != 0;
     if !have_xsave || !have_avx || u64::from(d0.eax) & XCR0_ENABLED != XCR0_ENABLED {

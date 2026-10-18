@@ -106,6 +106,7 @@ dependencies = [
  "akuma-hda",
  "akuma-hid",
  "akuma-i2c-hid",
+ "akuma-idt-amd64",
  "akuma-ieee80211",
  "akuma-isolation",
  "akuma-kacho",
@@ -142,6 +143,7 @@ dependencies = [
  "akuma-terminal",
  "akuma-threading",
  "akuma-touchpad",
+ "akuma-trap-amd64",
  "akuma-usb",
  "akuma-usb-storage",
  "akuma-user-access",
@@ -372,6 +374,10 @@ version = "0.1.0"
 
 [[package]]
 name = "akuma-i2c-hid"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-idt-amd64"
 version = "0.1.0"
 
 [[package]]
@@ -804,6 +810,13 @@ name = "akuma-touchpad"
 version = "0.1.0"
 dependencies = [
  "akuma-hid",
+]
+
+[[package]]
+name = "akuma-trap-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-not-even-once",
 ]
 
 [[package]]

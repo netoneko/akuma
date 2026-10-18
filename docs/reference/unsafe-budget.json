@@ -71,15 +71,16 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 240,
+    "amd64/src": 190,
     "crates/akuma-alloc": 24,
-    "crates/akuma-cpu": 54,
+    "crates/akuma-cpu": 57,
     "crates/akuma-dma": 14,
     "crates/akuma-el0-entry": 4,
     "crates/akuma-entry": 2,
     "crates/akuma-exceptions": 83,
     "crates/akuma-fdt": 3,
     "crates/akuma-gic": 5,
+    "crates/akuma-idt-amd64": 1,
     "crates/akuma-locks-rw-cell": 8,
     "crates/akuma-mmu": 80,
     "crates/akuma-net-nic": 29,
@@ -92,6 +93,7 @@
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 65,
     "crates/akuma-timer": 1,
+    "crates/akuma-trap-amd64": 2,
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-virtio": 38

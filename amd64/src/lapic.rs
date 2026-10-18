@@ -450,8 +450,7 @@ pub fn tsc_uptime_us() -> Option<u64> {
     if hz == 0 {
         return None;
     }
-    // SAFETY: unprivileged, reads no memory.
-    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let now = akuma_cpu::tsc::rdtsc();
     // This core's TSC, moved onto the BSP's ([`tsc_sync_bsp`]). The kernel
     // does not preempt itself, so the core the `rdtsc` ran on is the core
     // `cpu_index` names.
@@ -516,8 +515,7 @@ pub fn tsc_sync_bsp(idx: usize) -> i64 {
     TSC_SYNC_REQ.store(0, Ordering::SeqCst);
     TSC_SYNC_ACK.store(0, Ordering::SeqCst);
     for r in 1..=TSC_SYNC_ROUNDS {
-        // SAFETY: unprivileged, reads no memory.
-        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t0 = akuma_cpu::tsc::rdtsc();
         TSC_SYNC_REQ.store(r, Ordering::SeqCst);
         let mut spins = 0u32;
         while TSC_SYNC_ACK.load(Ordering::SeqCst) != r {
@@ -528,8 +526,7 @@ pub fn tsc_sync_bsp(idx: usize) -> i64 {
             }
             core::hint::spin_loop();
         }
-        // SAFETY: as above.
-        let t2 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t2 = akuma_cpu::tsc::rdtsc();
         let t1 = TSC_SYNC_T.load(Ordering::SeqCst);
         let rtt = t2.wrapping_sub(t0);
         if rtt < best_rtt {
@@ -557,8 +554,7 @@ pub fn tsc_sync_ap(idx: usize) {
             }
             core::hint::spin_loop();
         }
-        // SAFETY: unprivileged, reads no memory.
-        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t1 = akuma_cpu::tsc::rdtsc();
         TSC_SYNC_T.store(t1, Ordering::SeqCst);
         TSC_SYNC_ACK.store(r, Ordering::SeqCst);
     }
@@ -638,9 +634,8 @@ pub fn calibrate() -> bool {
     // countdown (`Pit::load_channel0_oneshot`).
     PIT.load_channel0_oneshot(PIT_COUNT as u16);
 
-    // SAFETY: the LAPIC MMIO window is mapped by `init`, which `calibrate`
-    // follows.
-    unsafe {
+    // The LAPIC MMIO window is mapped by `init`, which `calibrate` follows.
+    {
         // Arm the LAPIC at full scale, masked — this borrows the timer exactly
         // as `delay_counts` does, and `start_timer` re-arms it afterwards.
         write(REG_TIMER_DIV, TIMER_DIV_16);
@@ -648,9 +643,8 @@ pub fn calibrate() -> bool {
         write(REG_TIMER_INIT, u32::MAX);
         // The TSC rides along on the same load — one PIT period measures both
         // the LAPIC count and the TSC count, so the two clocks this kernel
-        // keeps agree about what 10 ms is. RDTSC is unprivileged and present
-        // on every x86_64 part.
-        let tsc0 = core::arch::x86_64::_rdtsc();
+        // keeps agree about what 10 ms is.
+        let tsc0 = akuma_cpu::tsc::rdtsc();
 
         // A freshly loaded mode-0 count holds OUTPUT low until it expires. If
         // it reads high immediately, this is not a real PIT answering — the
@@ -672,7 +666,7 @@ pub fn calibrate() -> bool {
             core::hint::spin_loop();
         }
         let remaining = read(REG_TIMER_CUR);
-        let tsc1 = core::arch::x86_64::_rdtsc();
+        let tsc1 = akuma_cpu::tsc::rdtsc();
         write(REG_TIMER_INIT, 0);
 
         let elapsed = u32::MAX - remaining;

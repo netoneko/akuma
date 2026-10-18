@@ -70,16 +70,15 @@
 
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::Ordering;
 
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-/// Non-zero once [`init_smap`] has set `CR4.SMAP`. `#[no_mangle]` because the
-/// exception stubs in `idt.rs` test it as `[rip + SMAP_ACTIVE]` before their
-/// `clac`, which would `#UD` on a CPU without SMAP.
-#[unsafe(no_mangle)]
-pub static SMAP_ACTIVE: AtomicU8 = AtomicU8::new(0);
+/// Non-zero once [`init_smap`] has set `CR4.SMAP`. Lives in `akuma-trap-amd64`
+/// because the error-code exception stubs test it before their `clac`, which
+/// would `#UD` on a CPU without SMAP.
+pub use akuma_trap_amd64::SMAP_ACTIVE;
 
 /// What CPUID advertised, for the boot line and the self-test. What was
 /// actually *set* is read back from `CR4` ([`cr4_bits`]) rather than echoed, so

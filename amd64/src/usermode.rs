@@ -7882,8 +7882,7 @@ pub fn identity_cost_test(t: &mut Suite) {
     const ITERS: u64 = 20_000;
 
     fn tsc() -> u64 {
-        // SAFETY: `rdtsc` is unprivileged and baseline on x86_64.
-        unsafe { core::arch::x86_64::_rdtsc() }
+        akuma_cpu::tsc::rdtsc()
     }
 
     let free_before = akuma_pmm::free_count();

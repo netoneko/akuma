@@ -199,6 +199,70 @@ pub mod ctlreg {
     }
 }
 
+/// The x86_64 time-stamp counter.
+///
+/// `rdtsc` reads a counter into `edx:eax`: no memory, no side effect, so it is
+/// safe to execute. It is **not** ordered against the work it measures — the CPU
+/// may execute it before earlier instructions finish or after later ones start —
+/// which is the x86 form of the trap `sysreg::cntvct_el0_ordered` documents for
+/// AArch64. Every caller in the tree wants a coarse cycle count (a spin deadline,
+/// a per-fault cost sum), where that skew is noise; a caller timing a handful of
+/// instructions needs `lfence; rdtsc` and must say so itself.
+///
+/// Off x86_64 bare metal this returns 0, like the rest of the crate's host stubs.
+pub mod tsc {
+    /// The time-stamp counter, unordered.
+    #[inline(always)]
+    pub fn rdtsc() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            // SAFETY: unprivileged (`CR4.TSD` is clear), reads no memory.
+            unsafe { core::arch::x86_64::_rdtsc() }
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+}
+
+/// x86_64 debug-status register, the part that is safe to touch.
+///
+/// `DR6` records why the last `#DB` fired and the hardware **never clears it**, so
+/// the `#DB` handler reads it and clears it or the next trap is misattributed.
+/// Reading is a register copy; writing zero clears sticky condition bits and has
+/// no other effect. What is deliberately absent is `DR0`-`DR3`/`DR7`: writing
+/// those arms hardware breakpoints, which re-points where the CPU traps, and
+/// nothing in this kernel arms them.
+///
+/// Off x86_64 bare metal `dr6` returns 0 and `clear_dr6` does nothing.
+pub mod debugreg {
+    /// `DR6`: `B0`-`B3`, `BD`, `BS` (single-step), `BT`.
+    #[inline(always)]
+    pub fn dr6() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: a register copied into a local; no memory, no side effect.
+            unsafe {
+                core::arch::asm!("mov {}, dr6", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+
+    /// Write `0` to `DR6`: clear the sticky status bits.
+    #[inline(always)]
+    pub fn clear_dr6() {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: `DR6` is a status register; zeroing it clears condition bits and
+        // arms nothing (that is `DR7`).
+        unsafe {
+            core::arch::asm!("mov dr6, {}", in(reg) 0u64, options(nomem, nostack, preserves_flags));
+        };
+    }
+}
+
 /// Barriers.
 ///
 /// Ordering instructions. They constrain when *this* core's accesses become
@@ -1139,7 +1203,7 @@ mod tests {
     #[test]
     fn line_size_is_a_sane_power_of_two() {
         let n = cache::line_size();
-        assert!(n >= 16 && n <= 2048, "implausible cache line size {n}");
+        assert!((16..=2048).contains(&n), "implausible cache line size {n}");
         assert!(n.is_power_of_two(), "cache line size {n} is not a power of two");
     }
 

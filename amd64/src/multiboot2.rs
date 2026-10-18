@@ -791,11 +791,10 @@ fn init_console(info: &BootInfo<'_>) -> Result<ConsoleUp, &'static str> {
         con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
         // Timed: a full-screen fill is the one operation whose cost is purely "how fast
         // can this machine write to its framebuffer", reported on the `[fb]` line.
-        // SAFETY: RDTSC is unprivileged and present on every x86_64.
-        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t0 = akuma_cpu::tsc::rdtsc();
         con.clear();
         con.surface_mut().flush(); // so the time includes draining the WC buffers
-        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t1 = akuma_cpu::tsc::rdtsc();
         CLEAR_CYCLES.store(t1.wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
         // Which font and grid the console actually chose. `Console::choose_font`
         // takes that decision from the framebuffer size at runtime — IBM Plex Mono

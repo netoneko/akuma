@@ -1,0 +1,12 @@
+[package]
+name = "akuma-idt-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 interrupt descriptor table: the 16-byte gate encoding (host-tested) and the 256-gate table the CPU reads, held as atomics so filling it needs no unsafe. The one unsafe is lidt. no_std"
+
+[lints]
+workspace = true
+
+[dependencies]
+# None. This sits under the trap stubs and the kernel's vector wiring and knows
+# neither: it is addresses in, a table the CPU reads out.
