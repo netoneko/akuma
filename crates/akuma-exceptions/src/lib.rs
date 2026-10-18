@@ -96,6 +96,8 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 use core::arch::global_asm;
 
+use akuma_trap_aarch64::FrameHandle;
+
 // `safe_print!` resolves unqualified throughout this crate — the same move
 // `akuma-exec` and `akuma-fpcache` make, and what let the moved call sites
 // keep both of their original spellings (`safe_print!` unqualified and
@@ -868,7 +870,7 @@ fn log_fault_reclaim(pid: u32, page_va: usize, slot: akuma_exec::process::FaultS
 /// there — this side publishes no bare "release the slot" helper).
 ///
 /// The `Drop` releases on **all** exit paths from a fault block, including the
-/// early `return unsafe { (*frame).x0 }` successes and fall-through to SIGSEGV.
+/// early `return frame.x0()` successes and fall-through to SIGSEGV.
 /// Release is holder-gated inside `fault_slot_release` — a sibling that reclaimed
 /// the slot from us keeps it — which is also why running it after a `NoProc`
 /// acquire is a no-op rather than a breach of the pairing contract.
@@ -2109,7 +2111,7 @@ pub fn syscall_is_non_restartable(nr: u64) -> bool {
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
-fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool, entry_esr: u64) -> bool {
+fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault: bool, entry_esr: u64) -> bool {
     // Record the delivery for the blocking-syscall EINTR path BEFORE anything can
     // return early. `take_pending_signal` has already cleared the pending bit at
     // every caller, so this record is the only remaining evidence that this thread
@@ -2173,16 +2175,16 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
             // SA_RESTART must NOT apply to successful syscalls — backing up ELR
             // for a completed FUTEX_WAKE (ret=1) causes it to re-execute with
             // x0=1 (the return value), producing EINVAL (uaddr=1 is unaligned).
-            let ret_val = unsafe { (*frame).x0 as i64 };
+            let ret_val = frame.x0() as i64;
             // And never restart the non-restartable set (sigsuspend/ppoll/…):
             // their contract is to return EINTR so the caller re-checks a
             // predicate the handler changed. frame.x8 still holds the syscall
             // number at this point.
-            let syscall_nr = unsafe { (*frame).x8 };
+            let syscall_nr = frame.x8();
             if (ret_val == -4 /* EINTR */ || ret_val == -512 /* ERESTARTSYS */)
                 && !syscall_is_non_restartable(syscall_nr)
             {
-                unsafe { (*frame).elr_el1 -= 4; }
+                frame.set_elr(frame.elr() - 4);
             }
         }
     }
@@ -2195,7 +2197,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         safe_print!(64, "[signal] failed to map sigreturn trampoline for pid={}\n", pid);
         return false;
     };
-    let frame_ref = unsafe { &*frame };
+    let frame_ref = frame.snapshot();
     let user_sp = frame_ref.sp_el0 as usize;
 
     // Detect re-entrant signal: if sp is already on the sigaltstack, we are
@@ -2366,7 +2368,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         .unwrap_or_else(akuma_exec::threading::thread_signal_mask);
 
     // mcontext_t (sigcontext): the interrupted user context, x0–x30 + sp/pc/pstate.
-    sf.save_regs(frame_ref, fault_addr);
+    sf.save_regs(&frame_ref, fault_addr);
 
     // FPSIMD extension record. The kernel never uses FP, so what `sync_el0_handler`
     // saved in this trap frame's NEON area is still the user's.
@@ -2374,7 +2376,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // SAFETY: every `try_deliver_signal` caller is in the EL0 **sync** handler, whose
     // 832-byte frame is the layout `sync_frame_neon` names. (The EL0 *IRQ* frame is
     // also 832 bytes and puts its NEON block 16 bytes earlier.)
-    let neon = unsafe { &*sigframe::sync_frame_neon(frame) };
+    let neon = unsafe { &*sigframe::sync_frame_neon(frame.as_ptr()) };
     sf.fpsimd.magic = FPSIMD_MAGIC;
     sf.fpsimd.size = 528;
     // FPSR/FPCR are 32-bit registers stored in 64-bit slots on the kernel stack.
@@ -2406,11 +2408,11 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         return false;
     }
 
-    unsafe {
+    {
         // Redirect execution to the signal handler
-        (*frame).elr_el1 = handler_addr as u64;
-        (*frame).sp_el0 = new_sp as u64;
-        (*frame).x30 = restorer as u64;
+        frame.set_elr(handler_addr as u64);
+        frame.set_sp_el0(new_sp as u64);
+        frame.set_reg(30, restorer as u64);
 
         // Demand-paged or RW-only mappings can leave the handler/restorer pages
         // non-executable; without RX, ERET to the handler faults immediately.
@@ -2428,8 +2430,8 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         });
 
         if action.flags & SA_SIGINFO != 0 {
-            (*frame).x1 = (new_sp + SIGFRAME_SIGINFO) as u64;
-            (*frame).x2 = (new_sp + SIGFRAME_UCONTEXT) as u64;
+            frame.set_reg(1, (new_sp + SIGFRAME_SIGINFO) as u64);
+            frame.set_reg(2, (new_sp + SIGFRAME_UCONTEXT) as u64);
         }
     }
 
@@ -2556,11 +2558,11 @@ fn fatal_signal_group_exit(code: i32) -> ! {
 /// (see `docs/GO_FORKTEST_DEBUG.md`, Agent handoff). Pending **`SIGURG`** delivery
 /// immediately after sigreturn is handled in the **`syscall_num == 139`** branch in
 /// `rust_sync_el0_handler`.
-fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
-    // SAFETY: the EL0 sync handler passes its own trap frame, live for this call, and
-    // nothing else holds a reference to it. One borrow for the whole function so the
-    // field accesses below need no further `unsafe`.
-    let f = unsafe { &mut *frame };
+fn do_rt_sigreturn(frame: FrameHandle) -> Option<u64> {
+    // The context is rebuilt off to the side in `f` and installed once, with
+    // `store`, after the saved SPSR has been validated - a bad frame that returns
+    // `None` above leaves the live one untouched, as before.
+    let mut f = frame.snapshot();
     let sigframe_sp = f.sp_el0;
 
     // Read the frame in one copy instead of ~40 `read(sigframe_sp + N)`s.
@@ -2583,7 +2585,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
 
     // Full GPR restore including x8 — see the doc comment: a wrong register here shows
     // up as the *next* SVC seeing a bogus syscall number.
-    let restored_spsr = sf.restore_regs(f);
+    let restored_spsr = sf.restore_regs(&mut f);
 
     // Validate SPSR: must be EL0t (M[4:0] = 0).  Go's signal handler can
     // corrupt the signal frame (the delivery path notes "Go's panic recovery
@@ -2600,6 +2602,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     } else {
         f.spsr_el1 = restored_spsr;
     }
+    frame.store(&f);
 
     if signal_trace_enabled() {
         safe_print!(256,
@@ -2634,7 +2637,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
         // SAFETY: `do_rt_sigreturn` is called only from the EL0 sync handler, so `frame`
         // is the 832-byte sync frame whose layout `sync_frame_neon` names. The `&mut f`
         // borrow above covers only the GPR block, which this area sits past.
-        let neon = unsafe { &mut *sigframe::sync_frame_neon(frame) };
+        let neon = unsafe { &mut *sigframe::sync_frame_neon(frame.as_ptr()) };
         neon.fpsr = u64::from(sf.fpsimd.fpsr);
         neon.fpcr = u64::from(sf.fpsimd.fpcr);
         neon.vregs = sf.fpsimd.vregs;
@@ -4091,6 +4094,10 @@ pub fn spurious_svc_count() -> u64 {
 /// on another core) and the live syndrome registers then belong to someone
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
+    // SAFETY: `frame` is what the vector asm just pushed for this handler on this
+    // thread's kernel stack, exclusively ours until the epilogue `eret`s - the
+    // handle's one contract.
+    let frame = unsafe { FrameHandle::new(frame) };
     // Outermost span for `read-profile` (ZST otherwise): started before the BKL
     // acquire and the entry tripwires, so `exc - hs` names everything this
     // wrapper does around the dispatch. See `crate::syscall::utils::read_profile`.
@@ -4116,7 +4123,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // kernel stack — reading x8 pre-acquire touches no shared state.
     #[cfg(kernel_smp_shared)]
     let bkl_optout = ((esr >> 26) & 0x3F) == esr::EC_SVC64
-        && akuma_bkl::policy::syscall_bkl_optout(unsafe { (*frame).x8 });
+        && akuma_bkl::policy::syscall_bkl_optout(frame.x8());
     #[cfg(not(kernel_smp_shared))]
     let bkl_optout = false;
     if !bkl_optout {
@@ -4190,7 +4197,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // during the excursion; catch it with ids before the eret makes it a userspace
     // SIGSEGV with a kernel register file.
     {
-        let f = unsafe { &*frame };
+        let f = frame.snapshot();
         if akuma_exec::mmu::is_kernel_text(f.elr_el1 as usize) {
             crate::safe_print!(224,
                 "[SVC POISON] eret->EL0 elr={:#x} spsr={:#x} sp_el0={:#x} x0={:#x} x1={:#x} x3={:#x} x8={:#x} tid={} core={}\n",
@@ -4220,14 +4227,14 @@ pub fn stale_window_heal_count() -> u64 {
     STALE_WINDOW_HEALS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
+fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     let ec = (esr >> 26) & 0x3F; // Exception Class
     let iss = esr & 0x1FFFFFF; // Instruction Specific Syndrome
 
     match ec {
         esr::EC_SVC64 => {
             // System call - number in x8, args in x0-x5
-            let frame_ref = unsafe { &*frame };
+            let frame_ref = frame.snapshot();
             let syscall_num = frame_ref.x8;
             // BKL-hold profiler: tag this core's excursion with the syscall number so a
             // waiting peer can attribute its BKL wait to this syscall (shared-kernel SMP).
@@ -4277,7 +4284,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         akuma_cpu::cache::ic_iallu();
                         akuma_cpu::barrier::dsb_ish();
                         akuma_cpu::barrier::isb();
-                        unsafe { (*frame).elr_el1 = elr.wrapping_sub(4); }
+                        frame.set_elr(elr.wrapping_sub(4));
                         // Do NOT dispatch: return the live x0 so the epilogue restores
                         // the original (un-clobbered) register and re-runs the real insn.
                         return frame_ref.x0;
@@ -4325,16 +4332,14 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             "[JIT] IC flush + replay #{} bogus nr={} ELR={:#x} prev={}\n",
                             count + 1, syscall_num, elr,
                             if prev_is_svc { "SVC(skip)" } else { "replay" });
-                        unsafe {
-                            akuma_cpu::cache::ic_iallu();
-                            akuma_cpu::barrier::dsb_ish();
-                            akuma_cpu::barrier::isb();
-                            if !prev_is_svc {
-                                (*frame).elr_el1 = elr.wrapping_sub(4);
-                            }
-                            // If prev_is_svc: ELR stays at the IC flush SVC itself.
-                            // QEMU will retranslate from that address with the cleared TB.
+                        akuma_cpu::cache::ic_iallu();
+                        akuma_cpu::barrier::dsb_ish();
+                        akuma_cpu::barrier::isb();
+                        if !prev_is_svc {
+                            frame.set_elr(elr.wrapping_sub(4));
                         }
+                        // If prev_is_svc: ELR stays at the IC flush SVC itself.
+                        // QEMU will retranslate from that address with the cleared TB.
                         // Check for pending signals before replaying — without this,
                         // SIGURG preemption is delayed until the next normal syscall,
                         // adding up to 10ms latency to Go's goroutine preemption.
@@ -4357,7 +4362,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 safe_print!(96, "[SIGURG] re-pend tid={} (alt_sp=0, JIT retry)\n", thread_slot);
                                 akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                             } else {
-                                unsafe { (*frame).x0 = frame_ref.x0; }
+                                frame.set_x0(frame_ref.x0);
                                 if try_deliver_signal(frame, sig, 0, false, esr) {
                                     return u64::from(sig);
                                 }
@@ -4396,12 +4401,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // Misrouted DC ZVA: decode Xt register and emulate.
                         let xt = (elr_instr.unwrap_or(0) & 0x1F) as usize;
                         let dc_addr = if xt < 31 {
-                            unsafe { core::ptr::read_volatile((frame as *const u64).add(xt)) }
+                            frame.reg(xt)
                         } else { 0 };
                         emulate_dc_zva(dc_addr);
                         (hooks().inc_qemu_dc_zva_ec15)();
-                        unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
-                        return unsafe { (*frame).x0 };
+                        frame.set_elr(elr.wrapping_add(4));
+                        return frame.x0();
                     }
                 }
             }
@@ -4426,7 +4431,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // return (outer close stays balanced); no-op when no window.
                         let _held = akuma_exec::bkl::DroppedWindowPause::new();
                         let base = if rn < 31 {
-                            unsafe { core::ptr::read_volatile((frame as *const u64).add(rn)) }
+                            frame.reg(rn)
                         } else { 0 };
                         let store_va = (base as i64).wrapping_add(offset) as u64;
                         let page_va = (store_va as usize) & !0xFFF;
@@ -4459,8 +4464,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             }
                         emulate_stp_xzr_xzr(store_va);
                         (hooks().inc_qemu_stp_xzr_ec15)();
-                        unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
-                        return unsafe { (*frame).x0 };
+                        frame.set_elr(elr.wrapping_add(4));
+                        return frame.x0();
                     }
                 }
             }
@@ -4524,7 +4529,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             safe_print!(96, "[SIGURG] re-pend tid={} (alt_sp=0, sigreturn)\n", thread_slot);
                             akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                         } else {
-                            unsafe { (*frame).x0 = saved_x0; }
+                            frame.set_x0(saved_x0);
                             if try_deliver_signal(frame, sig, 0, false, esr) {
                                 return u64::from(sig);
                             }
@@ -4537,7 +4542,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             }
 
             // Save trap frame pointer so fork/clone can read full register state
-            akuma_exec::threading::set_current_trap_frame(frame.cast_const());
+            akuma_exec::threading::set_current_trap_frame(frame.as_ptr().cast_const());
             let args = [
                 frame_ref.x0,
                 frame_ref.x1,
@@ -4554,7 +4559,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // SYNC TLS: If the syscall modified TPIDR_EL0 (e.g. SET_TPIDR_EL0),
             // update the trap frame so the change persists after register restoration.
             let current_tls = akuma_cpu::sysreg::tpidr_el0();
-            unsafe { (*frame).tpidr_el0 = current_tls; }
+            frame.set_tpidr_el0(current_tls);
             
             // Check if process exited - if so, return to kernel
             if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -4571,7 +4576,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             core::ptr::from_ref(proc) as usize,
                             proc.exit_code.as_ptr() as usize);
                         // Also check if the syscall frame x0 matches
-                        let frame_x0 = unsafe { (*frame).x0 };
+                        let frame_x0 = frame.x0();
                         crate::safe_print!(64, "  frame.x0=0x{:x} (syscall arg)\n", frame_x0);
                     }
                     
@@ -4621,7 +4626,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // Store the syscall return value in x0 of the trap frame so that
                     // sigreturn restores it correctly (the signal handler's x0 = sig,
                     // and after sigreturn the caller sees x0 = syscall result).
-                    unsafe { (*frame).x0 = ret; }
+                    frame.set_x0(ret);
                     if try_deliver_signal(frame, sig, 0, false, esr) {
                         return u64::from(sig); // x0 = signal number for the handler
                     }
@@ -4641,7 +4646,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // from the trap frame — the live ELR_EL1 is consumed by any eret in
             // between (a preempting IRQ's return), so a late `mrs elr_el1` reads
             // a kernel resume address, not the faulting user PC.
-            let elr = unsafe { (*frame).elr_el1 };
+            let elr = frame.elr();
 
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             // Thread-group leader: mmap_regions and fault_mutex live on the leader Process
@@ -4669,7 +4674,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // winner consumed is gone, and an ELF `.data`/`.bss` page has no
                     // region record to fall back on. Ask the page table first.
                     if stale_write_fault_absorbed(page_va) {
-                        return unsafe { (*frame).x0 };
+                        return frame.x0();
                     }
 
                     // A CoW break hands the writer a PRIVATE, WRITABLE copy, so it
@@ -4725,7 +4730,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             }
                         }
                         if did_cow {
-                            return unsafe { (*frame).x0 };
+                            return frame.x0();
                         }
                         // The fault may already have been resolved while we waited
                         // on the slot: the sibling that held it repaired the page —
@@ -4750,7 +4755,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // entry and here changes the PTE, so it draws a fresh
                         // budget rather than a spent one.
                         if stale_write_fault_absorbed(page_va) {
-                            return unsafe { (*frame).x0 };
+                            return frame.x0();
                         }
                         // Not a CoW page (or no owner): return the unused frame.
                         free_page(new_frame);
@@ -4775,7 +4780,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             // region mprotect'd to `PROT_READ|PROT_WRITE|PROT_EXEC`
                             // must not silently lose its exec bit to `RW_NO_EXEC`.
                             akuma_exec::mmu::update_current_user_page_flags(page_va, region_flags);
-                            return unsafe { (*frame).x0 };
+                            return frame.x0();
                         }
                     }
 
@@ -4818,7 +4823,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         crate::safe_print!(192,
                             "[EAGER-UPGRADE] pid={} as_owner={} va={:#x} flags={:#x}\n",
                             pid, as_owner, page_va, region_flags);
-                        return unsafe { (*frame).x0 };
+                        return frame.x0();
                     }
                 }
             }
@@ -4881,7 +4886,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 // Race (another CPU mapped it) or no owner: free our page.
                                 free_page(page_frame);
                             }
-                            return unsafe { (*frame).x0 };
+                            return frame.x0();
                         }
                         // OOM: fall through to SIGSEGV
                         safe_print!(128, "[DA-NONE] pid={} as_owner={} far=0x{:x} OOM\n",
@@ -4895,7 +4900,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         akuma_exec::mmu::FaultAccess::Data,
                         pid, as_owner, far_usize, flags, &source, region_start, region_size,
                     ) {
-                        return unsafe { (*frame).x0 };
+                        return frame.x0();
                     }
                 } else {
                     // Fallback: check eager mmap regions — the PTE may have been lost.
@@ -4930,7 +4935,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         }
                     }
                     if recovered {
-                        return unsafe { (*frame).x0 };
+                        return frame.x0();
                     }
                     // Dump mmap_regions for debugging: shows what the eager fallback searched
                     if let Some(dbg_proc) = akuma_exec::process::lookup_process_shared(as_owner) {
@@ -4945,7 +4950,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     safe_print!(128, "[DP] no lazy region for FAR={:#x} pid={} (pid has {} lazy regions)\n", far, pid, lazy_count);
                     
                     // Log register state for debugging wild pointer accesses
-                    let frame_ref = unsafe { &*frame };
+                    let frame_ref = frame.snapshot();
                     let last_sc = (hooks().current_syscall_nr)();
                     
                     // Check if FAR looks like a negative errno (syscall error used as pointer)
@@ -5073,8 +5078,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 }
             }
             {
-                let fr = unsafe { &*frame };
-                maybe_print_sigsegv_syscall_diag(elr, far, fr);
+                let fr = frame.snapshot();
+                maybe_print_sigsegv_syscall_diag(elr, far, &fr);
             }
             // Last-chance re-check, at the moment of killing. Every repair and
             // absorb decision above read the page table *earlier in handler
@@ -5094,13 +5099,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 && (iss & (1 << 6)) != 0
                 && stale_write_fault_absorbed((far as usize) & !0xFFF)
             {
-                return unsafe { (*frame).x0 };
+                return frame.x0();
             }
             if try_deliver_signal(frame, 11, far, true, esr) {
                 return 11; // signal number in x0 for the handler
             }
 
-            let frame_ref = unsafe { &*frame };
+            let frame_ref = frame.snapshot();
             safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
@@ -5109,7 +5114,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
-            print_spawn_fault_diag(far, frame_ref);
+            print_spawn_fault_diag(far, &frame_ref);
             print_write_perm_fault_diag(far, iss, pid, as_owner);
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
@@ -5161,7 +5166,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // `eum=+0x1c8` says "this is the eret window"; `eum=out` says a genuine
             // wild branch, which is a different bug.
             if far_in_kernel_identity_user_range(far) {
-                let elr_now = unsafe { (*frame).elr_el1 };
+                let elr_now = frame.elr();
                 let eum = akuma_exec::process::enter_user_mode
                     as unsafe fn(&akuma_exec::process::UserContext) -> ! as usize;
                 // 0x400 covers the whole function (~0x220 bytes measured) with room
@@ -5215,7 +5220,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             let asg = owner.address_space.lock();
                             akuma_exec::mmu::update_current_user_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
                             asg.invalidate_icache_for_page_va(page_va);
-                            return unsafe { (*frame).x0 };
+                            return frame.x0();
                         }
                     }
 
@@ -5258,14 +5263,14 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         akuma_exec::mmu::FaultAccess::Instruction,
                         pid, as_owner, far_usize, flags, &source, region_start, region_size,
                     ) {
-                        return unsafe { (*frame).x0 };
+                        return frame.x0();
                     }
                 } else {
                     akuma_exec::process::lazy_region_debug(far_usize);
                     safe_print!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
                     
                     // Log register state for debugging wild pointer accesses
-                    let frame_ref = unsafe { &*frame };
+                    let frame_ref = frame.snapshot();
                     safe_print!(256, "[WILD-IA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
                         pid, far_usize, frame_ref.elr_el1, frame_ref.x0, frame_ref.x1, frame_ref.x2);
                     safe_print!(128, "  x8={:#x} x9={:#x} x16={:#x} x17={:#x} x28={:#x}\n",
@@ -5275,8 +5280,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
 
             // Try delivering SIGSEGV to a registered userspace handler
             {
-                let fr = unsafe { &*frame };
-                maybe_print_sigsegv_syscall_diag(fr.elr_el1, far, fr);
+                let fr = frame.snapshot();
+                maybe_print_sigsegv_syscall_diag(fr.elr_el1, far, &fr);
             }
             if try_deliver_signal(frame, 11, far, true, esr) {
                 return 11;
@@ -5284,7 +5289,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
 
             crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
             interp_relr_forensics(far_usize, pid);
-            let frame_ref = unsafe { &*frame };
+            let frame_ref = frame.snapshot();
             safe_print!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
                 far, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
@@ -5358,14 +5363,14 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 } else {
                     0
                 };
-                unsafe {
-                    let regs = frame.cast::<u64>();
-                    core::ptr::write_volatile(regs.add(rt), value);
+                // `rt` is the 5-bit register field; 31 is XZR (a discarded write).
+                if rt < 31 {
+                    frame.set_reg(rt, value);
                 }
             } else if direction == 0 {
                 // MSR/DC/IC (write) — perform cache maintenance on behalf of user
                 let addr = if rt < 31 {
-                    unsafe { core::ptr::read_volatile((frame as *const u64).add(rt)) }
+                    frame.reg(rt)
                 } else {
                     0
                 };
@@ -5384,12 +5389,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 }
             }
             // Advance past the trapped instruction (always 4 bytes on AArch64)
-            unsafe {
-                let elr_ptr = &raw mut (*frame).elr_el1;
-                let elr = core::ptr::read_volatile(elr_ptr);
-                core::ptr::write_volatile(elr_ptr, elr + 4);
-            }
-            unsafe { (*frame).x0 }
+            frame.set_elr(frame.elr() + 4);
+            frame.x0()
         }
         esr::EC_BRK_AARCH64 => {
             // BRK instruction — intentional trap/abort from user code
@@ -5407,7 +5408,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // kernel delivering SIGILL to a registered userspace handler, the
             // way Linux does. Try that first; only fall through to a fatal
             // SIGILL when no handler is registered.
-            let (elr, spsr) = unsafe { ((*frame).elr_el1, (*frame).spsr_el1) };
+            let (elr, spsr) = (frame.elr(), frame.spsr());
             crate::safe_print!(96, "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x} ELR={:#x} — delivering SIGILL\n", ec, iss, elr);
             if try_deliver_signal(frame, 4, elr, true, esr) {
                 return 4; // SIGILL delivered to a userspace handler

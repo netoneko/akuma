@@ -30,6 +30,9 @@ no-bkl-irq = []
 no-tests = []
 
 [dependencies]
+# The EL0 trap frame as a typed handle (volatile accessors + snapshot), so the
+# handlers do not dereference the vector asm's raw `*mut UserTrapFrame`.
+akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
 # The safe-to-execute AArch64 instructions: barrier/cache reads and the
 # read-only system registers the handlers sample (`esr_el1`, `far_el1`,
 # `ttbr0_el1`, `cntvct_el0`, ...). Writing TTBR0/ELR/VBAR deliberately does NOT

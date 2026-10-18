@@ -1,0 +1,11 @@
+[package]
+name = "akuma-trap-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "AArch64 EL0 trap frame as a typed handle: the vector asm's saved register file behind volatile accessors and a by-value snapshot, so the exception handlers stop dereferencing a raw *mut UserTrapFrame. The one place a frame pointer becomes reads and writes. no_std"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-exec-core = { path = "../akuma-exec-core" }

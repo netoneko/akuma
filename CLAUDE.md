@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-port` is x86 **port I/O**, under the same rule as `akuma-cpu` below with
   one difference that is the point: no function takes a port number. `in`/`out` are only safe to execute
@@ -37,6 +37,10 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   its only `unsafe`. They replaced `idt.rs`'s five hand-written asm entries and
   eighteen `&mut *frame` sites (38 -> 4 sites in `idt.rs`). **Add a trap = one
   `Kind` arm + one `register` line; never `&mut *` a stub's pointer in `amd64/`.**
+  The AArch64 counterpart is `akuma-trap-aarch64` (2026-10-19): a `FrameHandle` over the
+  EL0 `UserTrapFrame` (volatile accessors, `snapshot`/`store`), made once at
+  `rust_sync_el0_handler`; `akuma-exceptions` went 83 -> 38 sites. **Never write
+  `(*frame).x0` in a handler.**
   `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
   safe, `write` unsafe, and `set_fs_base`/`set_user_gs_base` safe behind a canonical
   check - `arch_prctl(ARCH_SET_FS, non-canonical)` used to `#GP` ring 0. Never add
