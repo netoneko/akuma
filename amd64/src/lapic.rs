@@ -38,6 +38,7 @@
 //! the clock (`net::uptime_us`); with N cores counting into one word, time would
 //! run N times fast.
 
+use akuma_cpu::msr::{self, Msr};
 use crate::idt;
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
@@ -48,9 +49,8 @@ use akuma_selftest::Suite;
 use crate::serial;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// `IA32_APIC_BASE`. Bits 12:35 are the base address; bit 11 is the global
-/// enable; bit 8 marks the bootstrap processor.
-const IA32_APIC_BASE: u32 = 0x1B;
+/// `IA32_APIC_BASE` (`akuma_cpu::msr::Msr::ApicBase`). Bits 12:35 are the base
+/// address; bit 11 is the global enable; bit 8 marks the bootstrap processor.
 const APIC_BASE_MASK: u64 = 0x000f_ffff_ffff_f000;
 const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
 
@@ -98,29 +98,6 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// The LAPIC's *virtual* base in the device window, or 0 before [`init`].
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
-
-fn rdmsr(msr: u32) -> u64 {
-    let (lo, hi): (u32, u32);
-    // SAFETY: reading an architectural MSR; `IA32_APIC_BASE` exists on every
-    // x86_64 part and reading it has no side effect.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi,
-                         options(nomem, nostack, preserves_flags));
-    }
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
-/// # Safety
-/// Writing an MSR can reconfigure the CPU. The one write here sets the LAPIC
-/// global-enable bit, leaving the base address as firmware chose it.
-unsafe fn wrmsr(msr: u32, val: u64) {
-    // SAFETY: caller's obligation.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") val as u32,
-                         in("edx") (val >> 32) as u32,
-                         options(nostack, preserves_flags));
-    }
-}
 
 fn reg_ptr(offset: usize) -> *mut u32 {
     (LAPIC_BASE.load(Ordering::Relaxed) as usize + offset) as *mut u32
@@ -262,7 +239,7 @@ fn mask_legacy_pics() {
 pub fn init() -> bool {
     mask_legacy_pics();
 
-    let base_msr = rdmsr(IA32_APIC_BASE);
+    let base_msr = msr::read(Msr::ApicBase);
     let base = base_msr & APIC_BASE_MASK;
     if base == 0 {
         serial::puts("  [FATAL] IA32_APIC_BASE reports no LAPIC\n");
@@ -272,7 +249,7 @@ pub fn init() -> bool {
     // Set the global enable bit if firmware left it clear, preserving the base.
     // SAFETY: sets exactly one bit in an architectural MSR, leaving the address
     // field as found.
-    unsafe { wrmsr(IA32_APIC_BASE, base_msr | APIC_GLOBAL_ENABLE) };
+    unsafe { msr::write(Msr::ApicBase, base_msr | APIC_GLOBAL_ENABLE) };
 
     // Map the register page into the *device* window, uncached.
     //
@@ -342,9 +319,9 @@ pub fn init() -> bool {
 /// already has its handler; what is per core is the enable bit in this core's
 /// `IA32_APIC_BASE`, its spurious vector, and its own timer.
 pub fn init_ap() {
-    let base_msr = rdmsr(IA32_APIC_BASE);
+    let base_msr = msr::read(Msr::ApicBase);
     // SAFETY: as in `init` — one bit, the address left as found.
-    unsafe { wrmsr(IA32_APIC_BASE, base_msr | APIC_GLOBAL_ENABLE) };
+    unsafe { msr::write(Msr::ApicBase, base_msr | APIC_GLOBAL_ENABLE) };
     write(REG_SVR, (1 << 8) | u32::from(SPURIOUS_VECTOR));
     start_timer();
 }

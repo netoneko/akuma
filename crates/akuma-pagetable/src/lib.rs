@@ -70,6 +70,13 @@ pub trait PhysMap {
 pub struct Table([AtomicU64; ENTRIES]);
 
 impl Table {
+    /// An all-zero table, for a `static` that will become one (a spare page table
+    /// reserved at build time). `const`, so the frame lives in `.bss`.
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self([const { AtomicU64::new(0) }; ENTRIES])
+    }
+
     /// View the frame at kernel-virtual `addr` as a table.
     ///
     /// # Safety

@@ -199,6 +199,43 @@ impl MmioWindow {
         }
     }
 
+    /// Store `value` to `count` consecutive dwords starting at `off`; `false`
+    /// (nothing written) if the span is outside the window or `off` is not
+    /// dword-aligned.
+    ///
+    /// For a framebuffer fill. On x86_64 bare metal this is one `rep stosd`, which
+    /// is what lets a write-combining mapping gather the span into full-line
+    /// bursts (a loop of single volatile stores does not, measurably); everywhere
+    /// else it is that loop. The direction flag is clear at every call (SysV ABI,
+    /// and every kernel entry stub `cld`s), so `stosd` ascends.
+    #[inline]
+    #[must_use]
+    pub fn fill32(&self, off: usize, count: usize, value: u32) -> bool {
+        let Some(bytes) = count.checked_mul(4) else { return false };
+        let Some(end) = off.checked_add(bytes) else { return false };
+        if end > self.len || !(self.base + off).is_multiple_of(4) {
+            return false;
+        }
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: `off + 4 * count <= len` and the address is dword-aligned, so
+        // the `count` stores land inside the window `new`'s caller vouched is
+        // mapped device memory; `rep stosd` stores `count` dwords of `eax` at `rdi`.
+        unsafe {
+            core::arch::asm!(
+                "rep stosd",
+                inout("rdi") self.base + off => _,
+                inout("rcx") count => _,
+                in("eax") value,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        for i in 0..count {
+            self.write::<u32>(off + i * 4, value);
+        }
+        true
+    }
+
     /// Volatile read of the `T`-wide register at `off`.
     ///
     /// # Panics
@@ -302,6 +339,22 @@ mod tests {
         assert_eq!(w.read::<u16>(2), 0xBEEF);
         w.write::<u8>(31, 7);
         assert_eq!(w.read::<u8>(31), 7);
+    }
+
+    #[test]
+    fn fill32_stores_exactly_the_span_and_refuses_the_rest() {
+        let mut p = Page([0; 32]);
+        let w = window(&mut p);
+        assert!(w.fill32(8, 3, 0xA5A5_A5A5));
+        for off in (0..32).step_by(4) {
+            let expect = if (8..20).contains(&off) { 0xA5A5_A5A5 } else { 0 };
+            assert_eq!(w.read::<u32>(off), expect, "dword at {off}");
+        }
+        assert!(w.fill32(0, 0, 1), "an empty span is in bounds");
+        assert!(!w.fill32(28, 2, 1), "runs off the end");
+        assert!(!w.fill32(2, 1, 1), "misaligned");
+        assert!(!w.fill32(0, usize::MAX, 1), "count overflow");
+        assert_eq!(w.read::<u32>(28), 0, "a refused fill writes nothing");
     }
 
     #[test]

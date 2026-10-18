@@ -63,6 +63,7 @@
 //!   a kernel task yields when it chooses (see `sched::preempt_if_needed` for
 //!   why the old behaviour was a latent deadlock, not a feature).
 
+use akuma_cpu::msr::{self, Msr};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use akuma_ryzen_amd64::acpi::Madt;
@@ -104,11 +105,6 @@ pub fn set_cpu_cap_from_cmdline(cmdline: &str) {
 pub fn cpu_cap() -> usize {
     CPU_CAP.load(Ordering::Relaxed)
 }
-
-/// `IA32_GS_BASE`: the `%gs` base the CPU uses right now.
-const IA32_GS_BASE: u32 = 0xC000_0101;
-/// `IA32_KERNEL_GS_BASE`: the other one — what `swapgs` swaps in.
-pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 /// "No core" — the BKL's owner when free, and a task's pin when unpinned.
 pub const NO_CPU: u32 = u32::MAX;
@@ -193,18 +189,6 @@ static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
 /// online. 1 until [`start_secondaries`] runs.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
-/// # Safety
-/// Writing an MSR reconfigures the CPU. The writes here set the two `%gs`
-/// bases and nothing else.
-unsafe fn wrmsr(msr: u32, val: u64) {
-    // SAFETY: caller's obligation.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") val as u32,
-                         in("edx") (val >> 32) as u32,
-                         options(nostack, preserves_flags));
-    }
-}
-
 /// Point this core's `%gs` at `PERCPU[idx]`.
 ///
 /// `IA32_KERNEL_GS_BASE` is set to 0 as well: it holds the *user's* GS base
@@ -215,12 +199,12 @@ fn install_percpu(idx: usize) {
     let addr = core::ptr::from_ref::<PerCpu>(block) as u64;
     block.self_ptr.store(addr, Ordering::Relaxed);
     block.index.store(idx as u32, Ordering::Relaxed);
-    // SAFETY: the two `%gs` base MSRs. The block is a `static`, so the address
-    // is valid for the life of the kernel, and nothing reads `gs:` before this.
-    unsafe {
-        wrmsr(IA32_GS_BASE, addr);
-        wrmsr(IA32_KERNEL_GS_BASE, 0);
-    }
+    // SAFETY: `IA32_GS_BASE` is this core's per-CPU base. The block is a
+    // `static`, so the address is valid for the life of the kernel, and nothing
+    // reads `gs:` before this.
+    unsafe { msr::write(Msr::GsBase, addr) };
+    // The program's half of the pair: no user yet, and 0 is canonical.
+    let _ = msr::set_user_gs_base(0);
 }
 
 /// Has this core's `%gs` been pointed at a [`PerCpu`] yet?
@@ -231,13 +215,7 @@ fn install_percpu(idx: usize) {
 /// the boot, including before the block exists.
 #[must_use]
 pub fn percpu_installed() -> bool {
-    let (lo, hi): (u32, u32);
-    // SAFETY: reading an architectural MSR has no side effect.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") IA32_GS_BASE, out("eax") lo, out("edx") hi,
-                         options(nomem, nostack, preserves_flags));
-    }
-    (u64::from(hi) << 32) | u64::from(lo) != 0
+    msr::read(Msr::GsBase) != 0
 }
 
 /// This core's block, through `gs:[0]`.

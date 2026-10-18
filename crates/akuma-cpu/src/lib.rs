@@ -199,6 +199,178 @@ pub mod ctlreg {
     }
 }
 
+/// x86_64 model-specific registers: the closed set this kernel touches.
+///
+/// # Why an enum and not `rdmsr(u32)`
+///
+/// Three files each carried their own `unsafe fn wrmsr(msr: u32, val: u64)` and
+/// two their own `rdmsr`, with a different "the writes here set X and nothing
+/// else" doc comment on each — a promise about the *callers* that nothing checked.
+/// `wrmsr` with an arbitrary number is the most powerful instruction in the
+/// architecture; with this closed set the number cannot be arbitrary, and the
+/// obligation attaches to the register instead of to the file that happens to
+/// define the wrapper. (The same shape as `akuma-port`: devices, not port numbers.)
+///
+/// # Which operations are safe
+///
+/// * **Every read.** `rdmsr` of one of these copies a register into a local; all
+///   nine exist on every x86-64 part.
+/// * **The two user bases, through a canonical check** ([`set_fs_base`],
+///   [`set_user_gs_base`]). `wrmsr` of a non-canonical address to `FS_BASE` or
+///   `KERNEL_GS_BASE` raises `#GP` *in ring 0*, so an unchecked
+///   `arch_prctl(ARCH_SET_FS, 0x8000_0000_0000_0000)` was a user-triggerable kernel
+///   fault. These two are what the program owns and the kernel never dereferences,
+///   the same judgement as `sysreg::set_tpidr_el0`.
+/// * **Nothing else.** [`write`] is `unsafe`: `GS_BASE` is the per-CPU base the
+///   kernel dereferences, `LSTAR`/`STAR`/`EFER` re-point the syscall path, `PAT`
+///   re-types memory, `APIC_BASE` enables the interrupt controller.
+///
+/// Off x86_64 bare metal every read returns 0 and every write does nothing, like
+/// the rest of the crate's host stubs.
+pub mod msr {
+    /// The registers.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[repr(u32)]
+    pub enum Msr {
+        /// `IA32_APIC_BASE`: LAPIC base address and the global enable.
+        ApicBase = 0x1B,
+        /// `IA32_PAT`: the page-attribute table.
+        Pat = 0x277,
+        /// `IA32_EFER`: `SCE`, `LME`, `NXE`.
+        Efer = 0xC000_0080,
+        /// `IA32_STAR`: the `syscall`/`sysret` segment selectors.
+        Star = 0xC000_0081,
+        /// `IA32_LSTAR`: the `syscall` entry point.
+        Lstar = 0xC000_0082,
+        /// `IA32_FMASK`: `RFLAGS` bits cleared on `syscall` entry.
+        Fmask = 0xC000_0084,
+        /// `IA32_FS_BASE`: the program's TLS base.
+        FsBase = 0xC000_0100,
+        /// `IA32_GS_BASE`: in ring 0, this core's per-CPU block.
+        GsBase = 0xC000_0101,
+        /// `IA32_KERNEL_GS_BASE`: parked by `swapgs`; the *program's* `%gs` while
+        /// the kernel runs.
+        KernelGsBase = 0xC000_0102,
+    }
+
+    /// A 64-bit address is canonical when bits 63:47 are all equal (48-bit
+    /// virtual addresses).
+    #[must_use]
+    pub const fn is_canonical(va: u64) -> bool {
+        // Bits 63:47 are 17 bits: all zero, or all one.
+        matches!(va >> 47, 0 | 0x1_ffff)
+    }
+
+    /// A base address that is not canonical, and so would `#GP` the `wrmsr`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct NonCanonical;
+
+    /// Read `msr`.
+    #[inline(always)]
+    pub fn read(msr: Msr) -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let (lo, hi): (u32, u32);
+            // SAFETY: copies a register that exists on every x86-64 part into
+            // locals; no memory, no side effect.
+            unsafe {
+                core::arch::asm!("rdmsr", in("ecx") msr as u32, out("eax") lo, out("edx") hi,
+                                 options(nomem, nostack, preserves_flags));
+            };
+            (u64::from(hi) << 32) | u64::from(lo)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        {
+            let _ = msr;
+            0
+        }
+    }
+
+    /// Write `msr`.
+    ///
+    /// # Safety
+    /// The register's own contract — see the module header for what each one
+    /// re-points. `val` must be valid for `msr` (canonical for a base or the
+    /// `LSTAR` target; reserved bits clear for `EFER`/`PAT`), or the instruction
+    /// raises `#GP` in ring 0.
+    #[inline(always)]
+    pub unsafe fn write(msr: Msr, val: u64) {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: the caller's obligation, above.
+        unsafe {
+            core::arch::asm!("wrmsr", in("ecx") msr as u32, in("eax") val as u32,
+                             in("edx") (val >> 32) as u32,
+                             options(nostack, preserves_flags));
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = (msr, val);
+    }
+
+    /// Load `%fs` base: the scheduler restores an incoming task's TLS pointer with
+    /// it, and `arch_prctl(ARCH_SET_FS)` sets it.
+    ///
+    /// `Err` for a non-canonical `base`, **without writing**: the `wrmsr` would
+    /// `#GP` in ring 0.
+    pub fn set_fs_base(base: u64) -> Result<(), NonCanonical> {
+        if !is_canonical(base) {
+            return Err(NonCanonical);
+        }
+        // SAFETY: a canonical linear address for `%fs:` accesses; a bad (unmapped)
+        // one only faults the program's own TLS reads, as on Linux.
+        unsafe { write(Msr::FsBase, base) };
+        Ok(())
+    }
+
+    /// Set the *program's* `%gs` base, which lives in `IA32_KERNEL_GS_BASE` while
+    /// the kernel runs (what `swapgs` installs on the way back to ring 3). Never
+    /// `IA32_GS_BASE`: in ring 0 that is the per-CPU block.
+    ///
+    /// `Err` for a non-canonical `base`, without writing.
+    pub fn set_user_gs_base(base: u64) -> Result<(), NonCanonical> {
+        if !is_canonical(base) {
+            return Err(NonCanonical);
+        }
+        // SAFETY: the parked half of the `%gs` pair; the kernel never dereferences
+        // it, so a canonical-but-unmapped value only faults the program's own
+        // `%gs:` accesses.
+        unsafe { write(Msr::KernelGsBase, base) };
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn canonical_is_sign_extension_of_bit_47() {
+            assert!(is_canonical(0));
+            assert!(is_canonical(0x0000_7fff_ffff_ffff));
+            assert!(is_canonical(0xffff_8000_0000_0000));
+            assert!(is_canonical(u64::MAX));
+            assert!(!is_canonical(0x0000_8000_0000_0000));
+            assert!(!is_canonical(0x8000_0000_0000_0000));
+            assert!(!is_canonical(0xdead_0000_0000_0000));
+            assert!(!is_canonical(0xffff_7fff_ffff_ffff));
+        }
+
+        #[test]
+        fn a_non_canonical_base_is_refused_before_the_write() {
+            assert_eq!(set_fs_base(0x8000_0000_0000_0000), Err(NonCanonical));
+            assert_eq!(set_user_gs_base(0x0001_0000_0000_0000), Err(NonCanonical));
+            assert_eq!(set_fs_base(0x7f00_0000), Ok(()));
+            assert_eq!(set_user_gs_base(0), Ok(()));
+        }
+
+        #[test]
+        fn msr_numbers_are_the_architectural_ones() {
+            assert_eq!(Msr::Efer as u32, 0xC000_0080);
+            assert_eq!(Msr::FsBase as u32, 0xC000_0100);
+            assert_eq!(Msr::KernelGsBase as u32, 0xC000_0102);
+            assert_eq!(Msr::Pat as u32, 0x277);
+        }
+    }
+}
+
 /// The x86_64 time-stamp counter.
 ///
 /// `rdtsc` reads a counter into `edx:eax`: no memory, no side effect, so it is

@@ -71,9 +71,9 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 160,
+    "amd64/src": 138,
     "crates/akuma-alloc": 24,
-    "crates/akuma-cpu": 59,
+    "crates/akuma-cpu": 64,
     "crates/akuma-dma": 14,
     "crates/akuma-el0-entry": 4,
     "crates/akuma-entry": 2,
@@ -88,7 +88,7 @@
     "crates/akuma-pagetable": 5,
     "crates/akuma-pmm": 3,
     "crates/akuma-port": 4,
-    "crates/akuma-primitives": 9,
+    "crates/akuma-primitives": 10,
     "crates/akuma-psci": 2,
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 65,

@@ -25,6 +25,7 @@
 //! function. It is the same trick as `sched.rs`'s context switch, with ring 3 in
 //! the middle.
 
+use akuma_cpu::msr::{self, Msr};
 use akuma_syscalls_abi::Syscall;
 
 #[cfg(not(feature = "no-tests"))]
@@ -41,11 +42,6 @@ use crate::phys::phys_ptr;
 use crate::serial;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
-
-const IA32_EFER: u32 = 0xC000_0080;
-const IA32_STAR: u32 = 0xC000_0081;
-const IA32_LSTAR: u32 = 0xC000_0082;
-const IA32_FMASK: u32 = 0xC000_0084;
 
 /// `EFER.SCE` — without it, `syscall` raises `#UD`.
 const EFER_SCE: u64 = 1 << 0;
@@ -802,46 +798,6 @@ unsafe extern "C" {
     /// parent's snapshot.
     fn enter_user_mode_forked(rip: u64, rsp: u64) -> u64;
     fn syscall_entry();
-}
-
-/// # Safety
-/// Writing an MSR reconfigures the CPU; the four written here set up the
-/// `syscall` path and nothing else.
-unsafe fn wrmsr(msr: u32, val: u64) {
-    // SAFETY: caller's obligation.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") val as u32,
-                         in("edx") (val >> 32) as u32,
-                         options(nostack, preserves_flags));
-    }
-}
-
-fn rdmsr(msr: u32) -> u64 {
-    let (lo, hi): (u32, u32);
-    // SAFETY: reading an architectural MSR has no side effect.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi,
-                         options(nomem, nostack, preserves_flags));
-    }
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
-/// Load `%fs` base (`IA32_FS_BASE`) — the scheduler calls this to restore an
-/// incoming task's TLS pointer (`UserCtx::fs_base`). See `sys_arch_prctl`.
-pub fn set_fs_base(base: u64) {
-    const IA32_FS_BASE: u32 = 0xC000_0100;
-    // SAFETY: a linear address for `%fs:` accesses; a bad one only faults the
-    // task's own TLS reads, exactly as on Linux.
-    unsafe { wrmsr(IA32_FS_BASE, base) };
-}
-
-/// Set the *program's* `%gs` base — `IA32_KERNEL_GS_BASE`, which is where it
-/// lives while the kernel runs and what `swapgs` installs on the way back to
-/// ring 3. Never `IA32_GS_BASE`: in ring 0 that is the per-CPU block.
-pub fn set_user_gs_base(base: u64) {
-    // SAFETY: the parked half of the `%gs` pair; a bad value only faults the
-    // program's own `%gs:` accesses.
-    unsafe { wrmsr(crate::smp::IA32_KERNEL_GS_BASE, base) };
 }
 
 /// Leave ring 3 from an exception handler because signal `sig`'s default
@@ -2748,19 +2704,23 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
     const ARCH_GET_GS: u64 = 0x1004;
-    const IA32_FS_BASE: u32 = 0xC000_0100;
     match code {
         ARCH_SET_FS => {
-            // SAFETY: sets the current CPU's FS base to a userspace-supplied
-            // linear address. A bad value can only fault EL0's own `%fs:`
-            // accesses, exactly as on Linux. Also record it in this task's
-            // `UserCtx` so the scheduler can restore it on the way back in — the
-            // MSR is CPU-global, and without the per-task copy a forked child
-            // that `execve`s (and re-`arch_prctl`s) leaves the parent running on
-            // the child's TLS base. That crash (`cr2` a tiny offset off a
-            // garbage pointer) is what made this field load-bearing.
+            // A non-canonical base is refused, as Linux does (`EPERM`): the
+            // `wrmsr` would `#GP` in ring 0, which here is a user-triggerable
+            // kernel halt. A bad-but-canonical value can only fault the
+            // program's own `%fs:` accesses.
+            if msr::set_fs_base(addr).is_err() {
+                return crate::fd::errno::EPERM;
+            }
+            // Also record it in this task's `UserCtx` so the scheduler can
+            // restore it on the way back in — the MSR is CPU-global, and without
+            // the per-task copy a forked child that `execve`s (and
+            // re-`arch_prctl`s) leaves the parent running on the child's TLS
+            // base. That crash (`cr2` a tiny offset off a garbage pointer) is
+            // what made this field load-bearing.
+            // SAFETY: this task's own `UserCtx`.
             unsafe {
-                wrmsr(IA32_FS_BASE, addr);
                 let uctx = crate::smp::current_uctx();
                 if !uctx.is_null() {
                     (*uctx).fs_base = addr;
@@ -2774,7 +2734,9 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             // writing the program's value there would point every `gs:[..]` in
             // the kernel at user memory. Recorded per task for the same reason
             // as FS.
-            set_user_gs_base(addr);
+            if msr::set_user_gs_base(addr).is_err() {
+                return crate::fd::errno::EPERM;
+            }
             // SAFETY: this task's own `UserCtx`.
             unsafe {
                 let uctx = crate::smp::current_uctx();
@@ -2785,13 +2747,13 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             0
         }
         ARCH_GET_FS => {
-            if !crate::uaccess::write_val::<u64>(addr, rdmsr(IA32_FS_BASE)) {
+            if !crate::uaccess::write_val::<u64>(addr, msr::read(Msr::FsBase)) {
                 return crate::fd::errno::EFAULT;
             }
             0
         }
         ARCH_GET_GS => {
-            if !crate::uaccess::write_val::<u64>(addr, rdmsr(crate::smp::IA32_KERNEL_GS_BASE)) {
+            if !crate::uaccess::write_val::<u64>(addr, msr::read(Msr::KernelGsBase)) {
                 return crate::fd::errno::EFAULT;
             }
             0
@@ -2954,9 +2916,9 @@ pub fn init_syscall() {
     // SAFETY: the four architectural MSRs of the fast-syscall path, written
     // before any `syscall` can be executed (userspace does not exist yet).
     unsafe {
-        wrmsr(IA32_EFER, rdmsr(IA32_EFER) | EFER_SCE);
-        wrmsr(IA32_STAR, star);
-        wrmsr(IA32_LSTAR, syscall_entry as *const () as usize as u64);
+        msr::write(Msr::Efer, msr::read(Msr::Efer) | EFER_SCE);
+        msr::write(Msr::Star, star);
+        msr::write(Msr::Lstar, syscall_entry as *const () as usize as u64);
         // Clear IF on entry, so a syscall handler never runs with interrupts on
         // while `rsp` still points into user memory. Also clear DF, so the
         // kernel's string operations start from a known direction — userspace
@@ -2990,8 +2952,8 @@ pub fn init_syscall() {
         const FMASK_TF: u64 = 1 << 8;
         const FMASK_IOPL: u64 = 3 << 12;
         const FMASK_NT: u64 = 1 << 14;
-        wrmsr(
-            IA32_FMASK,
+        msr::write(
+            Msr::Fmask,
             FMASK_IF | FMASK_DF | FMASK_AC | FMASK_TF | FMASK_IOPL | FMASK_NT,
         );
     }

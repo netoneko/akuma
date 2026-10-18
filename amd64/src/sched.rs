@@ -407,8 +407,10 @@ fn hook_switch_to(from: usize, to: usize) {
             // retired the hypothesis without a boot.
             STALE_FS_WINDOWS.fetch_add(1, Ordering::Relaxed);
         }
-        crate::usermode::set_fs_base(fs);
-        crate::usermode::set_user_gs_base(gs);
+        // A non-canonical value (none can be stored: `arch_prctl` refuses them)
+        // is skipped rather than `#GP`ing the switch.
+        let _ = akuma_cpu::msr::set_fs_base(fs);
+        let _ = akuma_cpu::msr::set_user_gs_base(gs);
 
         // The switch's cross-core safety argument changed 2026-09-20: it used
         // to be "`ON_CPU` is cleared before the stack moves, and no peer can

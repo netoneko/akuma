@@ -30,7 +30,10 @@
 //! that failed validation, and a black screen with no way to report it. That
 //! cost a reboot cycle on a machine in another room. It is now a unit test.
 
+use akuma_cpu::msr::{self, Msr};
 use akuma_fbcon::{Console, PixelFormat, Rgb, Surface};
+use akuma_pagetable::Table;
+use akuma_primitives::mmio::MmioWindow;
 use spinning_top::Spinlock;
 use akuma_multiboot2::{BootInfo, FramebufferKind};
 use akuma_ryzen_amd64::{MAX_REGIONS, MachineDescription, MemRegion};
@@ -66,17 +69,16 @@ const CYCLE_SPINS: u64 = 400_000_000;
 /// output there is. Either way it happens before any parsing, so it survives
 /// every failure below it.
 fn ega_text(row: usize, s: &str) {
-    let base = (PHYSMAP_BASE + EGA_TEXT_BASE) as *mut u8;
+    // SAFETY: the identity/physmap window covers the first megabyte, so this
+    // range (80x25 cells of two bytes) is mapped. Writing it is either visible
+    // text or a store to unused low RAM; neither can fault, and nothing else
+    // claims that range this early in boot.
+    let win = unsafe { MmioWindow::new((PHYSMAP_BASE + EGA_TEXT_BASE) as usize, 80 * 25 * 2) };
     for (i, b) in s.bytes().take(80).enumerate() {
         let off = (row * 80 + i) * 2;
-        // SAFETY: the identity/physmap window covers the first megabyte, so
-        // this address is mapped. Writing it is either visible text or a store
-        // to unused low RAM; neither can fault, and nothing else claims that
-        // range this early in boot.
-        unsafe {
-            base.add(off).write_volatile(b);
-            base.add(off + 1).write_volatile(EGA_ATTR);
-        }
+        // A row past the screen is dropped, not wrapped into whatever follows.
+        let _ = win.try_write::<u8>(off, b);
+        let _ = win.try_write::<u8>(off + 1, EGA_ATTR);
     }
 }
 
@@ -97,7 +99,8 @@ fn ega_text(row: usize, s: &str) {
 /// where output goes quiet, or the last glyph can sit in the CPU indefinitely.
 /// Reads are still never issued -- `Console` keeps its text in RAM.
 struct Framebuffer {
-    base: *mut u8,
+    /// The pixels: `pitch * height` bytes of the firmware's framebuffer.
+    win: MmioWindow,
     pitch: usize,
     width: usize,
     height: usize,
@@ -123,8 +126,13 @@ impl Framebuffer {
             blue_pos: fb.format.blue_pos,
             blue_size: fb.format.blue_size,
         };
+        // SAFETY: the firmware's framebuffer, mapped by `boot.s` through the
+        // physmap and checked above to lie entirely below `MAPPED_LIMIT` (the
+        // physmap's own limit); never freed or moved, and 4 KiB-aligned (a
+        // multiboot2 framebuffer address is a BAR).
+        let win = unsafe { MmioWindow::new((PHYSMAP_BASE + fb.addr) as usize, size as usize) };
         Some(Self {
-            base: (PHYSMAP_BASE + fb.addr) as *mut u8,
+            win,
             pitch: fb.pitch as usize,
             width: fb.width as usize,
             height: fb.height as usize,
@@ -168,33 +176,22 @@ impl Surface for Framebuffer {
         let px = self.format.encode(color);
         let n = x1 - x;
         for row in y..y1 {
-            // SAFETY: x < x1 <= width and row < y1 <= height, so the span
-            // `[offset, offset + 4n)` lies inside `pitch * height` bytes of the
-            // mapping `new` checked. The direction flag is clear (SysV ABI), so
-            // `stosd` ascends; `rep stosd` stores `n` dwords of `eax` at `rdi`.
-            unsafe {
-                let p = self.base.add(row * self.pitch + x * 4);
-                if n <= 8 {
-                    let p = p.cast::<u32>();
-                    for i in 0..n {
-                        p.add(i).write_volatile(px);
-                    }
-                } else {
-                    core::arch::asm!(
-                        "rep stosd",
-                        inout("rdi") p => _,
-                        inout("rcx") n => _,
-                        in("eax") px,
-                        options(nostack, preserves_flags),
-                    );
+            // x < x1 <= width and row < y1 <= height, so the span lies inside
+            // `pitch * height` bytes; the window refuses it otherwise.
+            let off = row * self.pitch + x * 4;
+            if n <= 8 {
+                for i in 0..n {
+                    let _ = self.win.try_write::<u32>(off + i * 4, px);
                 }
+            } else {
+                // `rep stosd` (`MmioWindow::fill32`): the string instruction's
+                // start-up costs more than a few stores, but on a write-combining
+                // mapping it is what makes a long span leave as full-line bursts.
+                let _ = self.win.fill32(off, n, px);
             }
         }
     }
 
-    // `base` is a page-aligned framebuffer address and `offset` a multiple of
-    // the pixel size, so the cast never misaligns; clippy cannot see that.
-    #[allow(clippy::cast_ptr_alignment)]
     fn put(&mut self, x: usize, y: usize, color: Rgb) {
         if x >= self.width || y >= self.height || FB_MUTED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
@@ -202,22 +199,25 @@ impl Surface for Framebuffer {
         let px = self.format.encode(color);
         let offset = y * self.pitch + x * self.bytes_per_pixel;
 
-        // SAFETY: `base` is the firmware's framebuffer, mapped by boot.s and
-        // checked in `new` to lie entirely below MAPPED_LIMIT. `offset` is
-        // inside `pitch * height` because x and y were bounds-checked against
-        // the dimensions the same tag reported. Volatile because this is device
-        // memory: the writes must not be elided or reordered away.
-        unsafe {
-            let p = self.base.add(offset);
-            match self.bytes_per_pixel {
-                4 => p.cast::<u32>().write_volatile(px),
-                2 => p.cast::<u16>().write_volatile(px as u16),
-                3 => {
-                    p.write_volatile(px as u8);
-                    p.add(1).write_volatile((px >> 8) as u8);
-                    p.add(2).write_volatile((px >> 16) as u8);
-                }
-                _ => p.write_volatile(px as u8),
+        // `offset` is inside `pitch * height` because x and y were bounds-checked
+        // against the dimensions the same tag reported; the window refuses (drops)
+        // anything else, or a misaligned wide store. Volatile because this is
+        // device memory: the writes must not be elided or reordered away.
+        let w = &self.win;
+        match self.bytes_per_pixel {
+            4 => {
+                let _ = w.try_write::<u32>(offset, px);
+            }
+            2 => {
+                let _ = w.try_write::<u16>(offset, px as u16);
+            }
+            3 => {
+                let _ = w.try_write::<u8>(offset, px as u8);
+                let _ = w.try_write::<u8>(offset + 1, (px >> 8) as u8);
+                let _ = w.try_write::<u8>(offset + 2, (px >> 16) as u8);
+            }
+            _ => {
+                let _ = w.try_write::<u8>(offset, px as u8);
             }
         }
     }
@@ -230,8 +230,8 @@ impl Framebuffer {
     /// instructions do not reliably do it. Cheap when nothing is pending.
     #[allow(clippy::unused_self)] // a method so call sites say which surface they drained
     fn flush(&self) {
-        // SAFETY: `sfence` has no operands and no effect beyond store ordering.
-        unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+        // `sfence` on this target.
+        akuma_cpu::barrier::dsb_ishst();
     }
 }
 
@@ -239,7 +239,6 @@ impl Framebuffer {
 // Write-combining the framebuffer
 // ---------------------------------------------------------------------------
 
-const IA32_PAT: u32 = 0x277;
 /// PAT memory-type encoding for write-combining.
 const PAT_WC: u64 = 0x01;
 /// The PAT entry we repurpose: index 4, selected by `PAT=1, PCD=0, PWT=0`. Firmware
@@ -261,17 +260,22 @@ unsafe extern "C" {
     static __pd0: u8;
 }
 
-/// A 4 KiB page-table page, for splitting a 2 MiB PDE that the framebuffer only
-/// partly covers.
-#[repr(C, align(4096))]
-struct PtPage(core::cell::UnsafeCell<[u64; 512]>);
+/// Spare page tables, for splitting a 2 MiB PDE that the framebuffer only partly
+/// covers: a framebuffer has at most two partly-covered 2 MiB ends. Written only
+/// by `map_wc`, once, on the boot CPU before any other core is running;
+/// afterwards the CPU's page walker is the only reader.
+static SPLIT_PT: [Table; 2] = [const { Table::zeroed() }; 2];
 
-// SAFETY: written only by `map_wc`, once, on the boot CPU before any other core is
-// running; afterwards the CPU's page walker is the only reader.
-unsafe impl Sync for PtPage {}
-
-/// Spare page tables: a framebuffer has at most two partly-covered 2 MiB ends.
-static SPLIT_PT: [PtPage; 2] = [const { PtPage(core::cell::UnsafeCell::new([0; 512])) }; 2];
+/// The page directory covering 2 MiB-region `i` of `boot.s`'s identity/physmap
+/// map, and the entry's index in it. One directory per GiB, contiguous.
+fn boot_pd(i: usize) -> (&'static Table, usize) {
+    assert!(i < 512 * crate::phys::PHYSMAP_PDS, "2 MiB region outside the boot page directories");
+    let pd0 = crate::phys::phys_to_virt((&raw const __pd0) as u64) as usize;
+    // SAFETY: `__pd0..` is `PHYSMAP_PDS` contiguous 4 KiB-aligned page
+    // directories in `.bootbss`, live for the whole boot and never freed; `i`
+    // was checked to name one of them.
+    (unsafe { Table::at(pd0 + (i / 512) * 4096) }, i % 512)
+}
 
 /// Did [`map_wc`] succeed? APs read this to know whether to program their own PAT.
 static WC_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -286,22 +290,13 @@ fn pat_supported() -> bool {
 /// that skips it would see the WC-marked pages as write-back (and, under a UC MTRR,
 /// UC) -- slow but not wrong.
 fn pat_set_wc_this_cpu() {
-    let (lo, hi): (u32, u32);
-    // SAFETY: reading IA32_PAT has no side effects; PAT support was checked.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") IA32_PAT, out("eax") lo, out("edx") hi,
-                         options(nomem, nostack, preserves_flags));
-    }
-    let mut pat = (u64::from(hi) << 32) | u64::from(lo);
+    let mut pat = msr::read(Msr::Pat);
     let shift = PAT_INDEX * 8;
     pat = (pat & !(0xFF << shift)) | (PAT_WC << shift);
     // SAFETY: rewrites one PAT byte to a valid encoding (WC) and keeps the other
     // seven as firmware left them. No live mapping selects entry 4 (see
     // `PAT_INDEX`), so no translation changes type under us.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") IA32_PAT, in("eax") pat as u32,
-                         in("edx") (pat >> 32) as u32, options(nostack, preserves_flags));
-    }
+    unsafe { msr::write(Msr::Pat, pat) };
 }
 
 /// Called by each AP early in `ap_entry64`: join the BSP's PAT setting.
@@ -329,16 +324,18 @@ fn map_wc(phys: u64, len: u64) -> bool {
     }
     let end = phys + len;
     // Every PDE in range must be a present 2 MiB entry, or nothing is touched.
-    let pd = crate::phys::phys_ptr::<u64>((&raw const __pd0) as u64);
     let (first, last) = ((phys / TWO_MIB) as usize, ((end - 1) / TWO_MIB) as usize);
     let splits = [first, last].iter().filter(|&&i| {
         let base = i as u64 * TWO_MIB;
         !(phys <= base && end >= base + TWO_MIB)
     }).count();
     let splits = if first == last { splits.min(1) } else { splits };
-    // SAFETY: indices are below 512 * PHYSMAP_PDS (end <= MAPPED_LIMIT, which is
-    // PHYSMAP_LIMIT), so inside `__pd0`.
-    let all_large = (first..=last).all(|i| unsafe { pd.add(i).read_volatile() } & PDE_LARGE_PRESENT == PDE_LARGE_PRESENT);
+    // Indices are below 512 * PHYSMAP_PDS (end <= MAPPED_LIMIT, which is
+    // PHYSMAP_LIMIT); `boot_pd` asserts it.
+    let all_large = (first..=last).all(|i| {
+        let (pd, idx) = boot_pd(i);
+        pd.get(idx) & PDE_LARGE_PRESENT == PDE_LARGE_PRESENT
+    });
     if !all_large || splits > SPLIT_PT.len() {
         return false;
     }
@@ -348,40 +345,32 @@ fn map_wc(phys: u64, len: u64) -> bool {
     let mut next_pt = 0;
     for i in first..=last {
         let base = i as u64 * TWO_MIB;
-        // SAFETY: as above.
-        let slot = unsafe { pd.add(i) };
-        // SAFETY: as above.
-        let old = unsafe { slot.read_volatile() };
+        let (pd, idx) = boot_pd(i);
+        let old = pd.get(idx);
         if phys <= base && end >= base + TWO_MIB {
-            // SAFETY: setting the PAT selector on a live large PDE re-types its 2 MiB
+            // Setting the PAT selector on a live large PDE re-types its 2 MiB
             // (entry 4 = WC), nothing else.
-            unsafe { slot.write_volatile(old | PDE_PAT) };
+            pd.set(idx, old | PDE_PAT);
         } else {
-            let pt = SPLIT_PT[next_pt].0.get().cast::<u64>();
+            let pt = &SPLIT_PT[next_pt];
             next_pt += 1;
             let flags = old & 0xFFF & !0x80; // keep P/RW; drop PS
             for j in 0..512u64 {
                 let pa = base + j * 4096;
                 let in_range = pa + 4096 > phys && pa < end;
-                // SAFETY: `pt` is this static's 512 entries; `j` < 512.
-                unsafe {
-                    pt.add(j as usize).write_volatile(pa | flags | if in_range { PTE_PAT } else { 0 });
-                }
+                pt.set(j as usize, pa | flags | if in_range { PTE_PAT } else { 0 });
             }
-            let pt_phys = pt as u64 - crate::phys::KERNEL_VMA;
+            let pt_phys = pt.addr() as u64 - crate::phys::KERNEL_VMA;
             // The PT is complete before the PDE points at it (x86 stores retire in
-            // order; the compiler fence stops reordering the volatile pair).
+            // order; the compiler fence stops reordering the relaxed stores).
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            // SAFETY: replaces a live large PDE by a table mapping the same 2 MiB
+            // Replaces a live large PDE by a table mapping the same 2 MiB
             // identically except for the PAT bit on the framebuffer's pages.
-            unsafe { slot.write_volatile(pt_phys | flags) };
+            pd.set(idx, pt_phys | flags);
         }
-        // SAFETY: invalidates the (large-page) translation of this window on this
-        // core; other cores are not running yet (contract above).
-        unsafe {
-            core::arch::asm!("invlpg [{}]", in(reg) PHYSMAP_BASE + base,
-                             options(nostack, preserves_flags));
-        }
+        // Invalidates the (large-page) translation of this window on this core;
+        // other cores are not running yet (contract above).
+        akuma_cpu::tlb::invlpg((PHYSMAP_BASE + base) as usize);
     }
     WC_ON.store(true, core::sync::atomic::Ordering::Release);
     true
@@ -446,17 +435,10 @@ static CLEAR_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// print before that has to be a no-op rather than a fault.
 static CONSOLE: Spinlock<Option<FbConsole>> = Spinlock::new(None);
 
-/// Wrapper carrying the `Send` the raw framebuffer pointer does not imply.
+/// The console over the framebuffer. A newtype so the `Spinlock<Option<..>>`
+/// above names one thing; the window inside is plain data (an address and a
+/// length), so it is `Send` without a promise.
 struct FbConsole(Console<Framebuffer>);
-
-// SAFETY: the pointer inside is a device mapping established by `boot.s`, valid
-// for the whole life of the kernel, never freed and never moved. What `Send`
-// asks about is whether it may cross threads, and the `Spinlock` around it is
-// what actually serialises access -- the raw pointer carries no aliasing claim
-// of its own. (That is also the answer to clippy's `non_send_fields_in_send_ty`:
-// the field is a raw pointer, and this impl is the statement about it.)
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Send for FbConsole {}
 
 /// Write one byte to the framebuffer console, if it exists.
 ///
