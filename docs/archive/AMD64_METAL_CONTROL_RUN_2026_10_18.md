@@ -16,9 +16,13 @@ Both failures are **pre-existing**: neither is caused by the unsafe audit.
 
 ## Open items (not root-caused)
 
-1. `physmap: reaches PHYSMAP_LIMIT` (`amd64/src/mem.rs`): metal-only. QEMU is
-   824/0. Suspects: MAXPHYADDR below 36 bits, 1 GiB page support, a reserved bit
-   in a high entry. Needs CPUID values from the box.
+1. `physmap: reaches PHYSMAP_LIMIT` (`amd64/src/mem.rs`): **bisected 2026-10-18 to
+   `410117ce` (akuma-fbdev + akuma-fbcon)** — fails on every GRUB/multiboot2 boot
+   with the fb console up (metal and the ryzen QEMU rehearsal), passes under PVH
+   or `nofb`. The CPUID suspects below are ruled out (a software walk reads RAM),
+   as is the 64 GiB commit itself; prime suspect is a boot-stack overflow into
+   `__ap_pml4` + `__pd0`'s last PDE. See
+   [`AMD64_PHYSMAP_SELFTEST_LAST_PDE.md`](AMD64_PHYSMAP_SELFTEST_LAST_PDE.md).
 2. Incremental `kbuild -j 4` stalls in `cargo` after the
    `akuma-pipes (manifest)` warning, before any `rustc`. `cargo` is at ~100% CPU.
    Possibly the same getdents spin as `ls /root` (kernel `a1022dcd`); untested.
