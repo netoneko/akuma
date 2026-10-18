@@ -146,23 +146,11 @@ fn build(
         None
     };
 
-    let dns_servers = &[static_dns_server()];
-    let dns_socket = dns::Socket::new(dns_servers, vec![]);
-    SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
-    let dns_handle = sockets.add(dns_socket);
-    let dns = static_ipv4().dns;
-    crate::safe_print!(
-        64,
-        "[SmolNet] DNS socket initialized (server: {}.{}.{}.{})\n",
-        dns[0], dns[1], dns[2], dns[3]
-    );
-
     *NETWORK.lock() = Some(NetworkState {
         iface,
         sockets,
         device,
         dhcp_handle,
-        dns_handle,
         pending_removal: Vec::new(),
         connecting: Vec::new(),
         seen_link_gen: None,

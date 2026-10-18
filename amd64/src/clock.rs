@@ -498,11 +498,11 @@ fn attempt_sntp(timeout_us: u64) -> SyncOutcome {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 
-    // `crate::dns::resolve_a`, not `akuma_net::dns::resolve_host_blocking` —
-    // see that module's own header for why: the latter hung indefinitely the
-    // first time this feature tried it, on a hostname that resolves in
-    // seconds through this target's other, already-proven DNS path.
-    let Some(ip) = crate::dns::resolve_a(NTP_HOST, timeout_us) else {
+    // The shared resolver, with this call's own budget. It stood in for a
+    // hand-rolled client (`amd64/src/dns.rs`) from 2026-09-05 to 2026-10-18,
+    // written when `smoltcp_net::dns_query` hung on this call; that function is
+    // gone and the client moved to `akuma-dns`, which every target now uses.
+    let Ok(ip) = akuma_net::dns::resolve_ipv4(NTP_HOST, timeout_us).map(|ip| ip.octets()) else {
         return SyncOutcome::DnsFailed;
     };
     let server = SocketAddrV4::new(ip, akuma_sntp::sntp::NTP_PORT);

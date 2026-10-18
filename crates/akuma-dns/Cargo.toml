@@ -1,0 +1,10 @@
+[package]
+name = "akuma-dns"
+version = "0.1.0"
+edition = "2024"
+description = "Pure DNS A-record client: wire format and the resolver-walk/retransmit loop, effects-based so it host-tests without a kernel"
+
+[lints]
+workspace = true
+
+[dependencies]

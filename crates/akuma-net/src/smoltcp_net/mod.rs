@@ -19,7 +19,6 @@
 //! | [`loopback`] | `LoopbackAwareDevice` and its ring |
 //! | [`init`] | interface bring-up |
 //! | [`poll`] | `poll()` and the `NETWORK` critical section |
-//! | [`resolve`] | `dns_query` |
 //! | [`connect`] | async `tcp_connect` |
 //! | [`sockets`] | socket-set slots, soft cap, reclaim |
 //! | [`udp_api`] | the UDP API — named `udp_api`, not `udp`, so it does not
@@ -41,7 +40,7 @@ use spinning_top::Spinlock;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
 pub use smoltcp::iface::SocketHandle;
 use smoltcp::phy::Device;
-use smoltcp::socket::{tcp, udp, dhcpv4, dns};
+use smoltcp::socket::{tcp, udp, dhcpv4};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -65,7 +64,6 @@ pub mod consts;
 pub mod state;
 pub mod init;
 pub mod poll;
-pub mod resolve;
 pub mod connect;
 pub mod sockets;
 pub mod udp_api;
@@ -81,7 +79,6 @@ pub(crate) use consts::*;
 pub use state::*;
 pub use init::*;
 pub use poll::*;
-pub use resolve::*;
 pub use connect::*;
 pub use sockets::*;
 pub use udp_api::*;

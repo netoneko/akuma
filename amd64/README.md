@@ -76,7 +76,7 @@ including exactly why `AT_PHDR` computed as `base + e_phoff` crashed busybox
 before it was fixed: `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.
 
 The clock followed the next day: a **boot-time SNTP client** (`amd64/src/
-clock.rs`, `amd64/src/dns.rs`) — `clock_gettime`/`gettimeofday`/`time` now
+clock.rs`, plus a DNS client, now the shared `akuma-dns`) — `clock_gettime`/`gettimeofday`/`time` now
 answer with real Unix time, and `apk update`'s TLS handshake against the real
 Alpine CDN no longer fails with "server certificate not trusted" — verified
 over SSH, the warning is simply gone. Not a real clock (it syncs once and

@@ -485,7 +485,23 @@ pub unsafe fn init_rtl8169(bar: *mut u8, static_v4: StaticIpv4) -> bool {
     report_init(akuma_net::init_with_external(net_runtime(), true, device, Some(static_v4)))
 }
 
+/// Resolvers tried after the interface's own, by `akuma_net::dns::resolve_ipv4`:
+/// Cloudflare, then Google — the two a `-netdev user` slirp NATs straight through
+/// and a household router almost never blocks. This is the policy half of what
+/// `amd64/src/dns.rs` carried: a *configured* resolver that answers some names
+/// and `NXDOMAIN`s others is a measured case (the HP box's uplink for
+/// `example.com`, 2026-09-06; QEMU slirp's forwarder, 2026-10-18), and the walk
+/// to a server that will answer is what makes one lookup succeed.
+///
+/// A name leaves the configured resolver only on a timeout or an answer without
+/// a record, so a private name still resolves privately when the LAN resolver
+/// knows it.
+const FALLBACK_RESOLVERS: [[u8; 4]; 2] = [[1, 1, 1, 1], [8, 8, 8, 8]];
+
 fn report_init(r: Result<(), &'static str>) -> bool {
+    // Every stack bring-up funnels through here, whichever NIC (or none) it
+    // came up on; the policy does not depend on the stack being up.
+    akuma_net::dns::set_fallback_resolvers(&FALLBACK_RESOLVERS);
     match r {
         Ok(()) => {
             serial::puts("  net:  stack up\n");
@@ -852,8 +868,8 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     } else {
         "pending"
     });
-    // The resolver `crate::dns::resolve_a` (hget's syscall 300, the SNTP
-    // bootstrap) actually sends to. It was hardcoded `10.0.2.3` until
+    // The resolver `akuma_net::dns::resolve_ipv4` (hget's syscall 300, the SNTP
+    // bootstrap) asks first. It was hardcoded `10.0.2.3` until
     // 2026-09-06 and silently black-holed every kernel-side DNS query on bare
     // metal; showing it here is so a "DNS resolution failed" is one photograph
     // from its cause.
@@ -1168,7 +1184,7 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     );
     // The bare-metal resolver must be a real public one, never the VMM proxy
     // `10.0.2.3` — nothing answers on that address on a household LAN, and a
-    // `crate::dns::resolve_a` (hget's syscall 300, the SNTP bootstrap) that
+    // `akuma_net::dns::resolve_ipv4` (hget's syscall 300, the SNTP bootstrap) that
     // sends there black-holes every kernel-side query, which is exactly the
     // regression that kept `date` at 1970 and `hget https://` failing on DNS.
     t.check(

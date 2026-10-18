@@ -381,7 +381,7 @@ pub const ENABLE_NTP_BOOTSTRAP: bool = true;
 /// NTP server the boot-time fallback queries — an IP literal, deliberately, not
 /// a hostname.
 ///
-/// `akuma_net::smoltcp_net::dns_query` fast-paths an IP literal without any DNS
+/// `akuma_net::dns::resolve_host_blocking` fast-paths an IP literal without any DNS
 /// lookup, which matters because the one platform this fallback exists for has
 /// broken DNS: `overlays/devbox-firecracker`'s README documents that
 /// `QEMU_DNS_SERVER` (`10.0.2.3`, smoltcp_net.rs) is SLIRP's forwarder address,

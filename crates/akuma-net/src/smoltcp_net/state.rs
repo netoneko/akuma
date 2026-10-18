@@ -65,7 +65,7 @@ pub struct StaticIpv4 {
     pub prefix_len: u8,
     /// The default IPv4 route.
     pub gateway: [u8; 4],
-    /// The resolver the DNS socket is seeded with.
+    /// The configured resolver — first in `dns::resolve_ipv4`'s list.
     pub dns: [u8; 4],
 }
 
@@ -108,18 +108,11 @@ pub fn static_ipv4() -> StaticIpv4 {
     }
 }
 
-/// The resolver address, as smoltcp wants it.
-pub(crate) fn static_dns_server() -> IpAddress {
-    let [a, b, c, d] = static_ipv4().dns;
-    IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(a, b, c, d))
-}
-
 pub struct NetworkState {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
     pub device: LoopbackAwareDevice,
     pub dhcp_handle: Option<SocketHandle>,
-    pub dns_handle: SocketHandle,
     /// Sockets closed by the user, waiting for TCP teardown. Tuple: (handle, `close_timestamp_us`).
     pub pending_removal: Vec<(SocketHandle, u64)>,
     /// Handles currently in `SynSent`, with the microsecond the connect was

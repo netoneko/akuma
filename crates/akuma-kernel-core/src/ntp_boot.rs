@@ -22,15 +22,8 @@
 
 #[cfg(feature = "smoltcp")]
 pub fn try_bootstrap_clock() -> Result<(), &'static str> {
-    let ip = akuma_net::smoltcp_net::dns_query(crate::config::NTP_SERVER_HOSTNAME).map_err(|e| {
-        use akuma_net::smoltcp_net::DnsQueryError;
-        match e {
-            DnsQueryError::StartFailed => "DNS query failed to start",
-            DnsQueryError::QueryFailed => "DNS query failed",
-            DnsQueryError::NoRecords => "DNS query returned no records",
-            DnsQueryError::Timeout => "DNS query timed out",
-        }
-    })?;
+    let ip = akuma_net::dns::resolve_host_blocking(crate::config::NTP_SERVER_HOSTNAME)
+        .map_err(|e| e.as_str())?;
 
     let handle =
         akuma_net::smoltcp_net::udp_socket_create().ok_or("no free UDP socket for the boot-time sync")?;

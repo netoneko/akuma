@@ -92,6 +92,9 @@ akuma-rump = { path = "../akuma-rump", optional = true }
 # dependency on the whole execution crate — and now lives in the dependency-free
 # leaf, so the sharing is free.
 akuma-primitives = { path = "../akuma-primitives" }
+# The DNS A-record client: wire format and the resolver-walk loop, over effects
+# this crate wires to its UDP sockets (`dns::resolve_ipv4`).
+akuma-dns = { path = "../akuma-dns" }
 # The virtio-net device: DMA buffers, the NIC wrapper, and smoltcp's `Device`
 # impls. Every `unsafe` in networking lives there, which is why it is a crate.
 akuma-net-nic = { path = "../akuma-net-nic" }

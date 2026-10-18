@@ -67,6 +67,9 @@ sees the data. The tty findings below are that seam.
 - `ChannelTable::channel_mut` (`akuma-net-unix/src/lib.rs:1096`) — unused
   accessor, low.
 
+**Status 2026-10-18:** `push_input`/`read_input` and the channel's `is_raw_mode`
+were deleted (`55bbb8c0`); `get_process_channel` stays, as §1.5 says.
+
 ### 1.2 Cleanup / leak paths
 
 - **`pipe_destroy`** (`akuma-syscalls-glue/src/pipe.rs:482`) — doc names its
@@ -74,6 +77,18 @@ sees the data. The tty findings below are that seam.
   refcounting; "`waitpid` is what knows the child is gone." The waitpid hook
   that was to call it was never written. **Suspected per-spawn pipe-slot +
   buffer leak on amd64** — worth a live measurement before deleting.
+**Status 2026-10-18 — `pipe_destroy` was already obsolete and is deleted, along
+with `PipeTable::destroy` and its three tests.** The "suspected per-spawn pipe
+leak" is the one this section's author could not see from the code: the hand-managed
+spawn pipes it served went away with C2 slice 6 (2026-09-11) — a spawned child's
+stdio is one `ProcessChannel` now, and an `Arc` needs no reap (`usermode.rs`,
+`struct Spawn`: "There are no pipes"). The audit's own instruction was to prove it
+first, and the instrument it asked for now exists: `/proc/health`'s `pipes_live` /
+`pipes_high_water` / `pipes_refused` (see §1.3). Measured on QEMU amd64, 80
+consecutive ssh exec sessions (the workload that died at ~44 in
+`proposals/AMD64_SPAWN_PIPE_LEAK.md`): `pipes_live 1 → 1`, `pipes_high_water 1`,
+`pipes_refused 0`. Not yet measured on metal.
+
 - `dmesg_clear` (`akuma-kernel-core/src/console.rs:108`) — the amd64 kernel
   wired `SYSLOG_ACTION_CLEAR` to its *own* ring (`serial.rs:162`); the
   kernel-core ring's clear is orphaned and aarch64 has no syslog handler.
@@ -94,6 +109,23 @@ prevent. Likewise unwired-but-running: BKL `kernel_lock_lost_ticket_recoveries`
 mechanisms that run **invisibly**: they increment counters no /proc, PSTATS
 or dmesg surface ever reads.
 
+**Status 2026-10-18 — wired, as the decision rule said (wire, don't delete):**
+`/proc/health`, a file rather than a console line (the console is the channel of
+last resort on the metal boxes, and the idle block that prints `[PSTATS]` runs
+with the BKL held, where every serial byte is a VM exit). It reports
+`bkl_recoveries`, `bkl_lost_ticket_recoveries`, `bkl_stuck_suppressed`,
+`bkl_max_wait_spins`, `trampoline_bails`, `pressure_reclaimed_pages` and
+`socket_slots_reclaimed` on both kernels, plus the pipe table (amd64: live /
+high-water / refused / cap — the pipe leak-vs-demand reading; AArch64: live).
+Allocation-free; `akuma-procfs` carries it as `Global::Health` so the tree
+simulation walks it; `reference/subsystems/vfs.md` documents the keys. One
+counter moved to make that possible: `RECLAIMED_SLOTS` is now
+`akuma_net::SOCKET_SLOTS_RECLAIMED`, because the module that wrote it is compiled
+out of a rump-only build and `/proc/health` reads it on every build.
+**Not done:** `WakeBudget::observe_quiet/observe_work` (the adaptive staircase) —
+that is a different problem (amd64 reimplemented the accumulation; the fix is to
+adopt the crate's, not to surface a counter).
+
 ### 1.4 Tested-but-unwired logic
 
 `MmapRegion::file_page_source` + `page_file_offset` (`akuma-mmap`) — the
@@ -106,6 +138,8 @@ piecewise at its call sites; two copies of the unlink rule now drift apart.
 `generation_state` (`akuma-exec/src/process/table.rs:852`) — the stale-tid
 detector for the `c0002a3e` bug class; doc claims a test asserts on it; there
 is no test and no caller.
+
+**Status 2026-10-18:** `generation_state` now has its test (`e2086348`).
 
 ### 1.5 Fully dead — built for production, never reached
 
@@ -480,6 +514,30 @@ delete. What *is* per-arch and unaudited is the acting halves themselves — the
 MMIO writes, DMA `.bss` statics and ring transitions that the pure half cannot
 contain — which is precisely where §2's `unsafe` concentration sits, and why
 tier 2 of this list is extraction-plus-facade rather than dedup.
+
+**Status 2026-10-18 — tier 4 done; the premise was half wrong.** The shared
+`resolve_host_blocking` does not hang today: boot-time SNTP resolves through
+`smoltcp_net::dns_query` in a QEMU amd64 boot, and so does syscall 300 after the
+netpoll daemon is alive. The 2026-09-05 hang was most likely the frozen clock
+(§3.30.3's `IF=0`: `dns_query`'s only timeout is `uptime_us`, which did not move)
+and has had no reproduction since. What `dns.rs` had that the shared path did
+**not** was behaviour, and it was the reason deletion was not a one-liner:
+smoltcp's DNS socket fails on the first `NXDOMAIN` with one configured server,
+while `dns.rs` walked a resolver list on a timeout *or* an answer without a record
+— a measured case (the HP box's uplink; and again on QEMU slirp, which
+`NXDOMAIN`s `example.com` while `1.1.1.1` answers). So the fix moved the
+*client*, not the call site: `crates/akuma-dns` (pure, `forbid(unsafe_code)`, 22
+host tests where `dns.rs` had none) holds the wire format and the walk/retransmit
+loop over effects (the `akuma-sntp` shape); `akuma_net::dns::resolve_ipv4` wires
+it to the UDP sockets and is now the resolver for every target. `amd64/src/dns.rs`,
+`smoltcp_net::dns_query` and smoltcp's DNS socket (one socket slot) are deleted.
+**Policy stayed per-kernel:** amd64 sets fallbacks (1.1.1.1, 8.8.8.8) at net
+bring-up; AArch64 sets none, so its behaviour is unchanged — an `NXDOMAIN` from the
+configured resolver is final there. Side effect worth naming: the amd64 call now
+waits through `blocking_relax` (drops the BKL while parked) where `dns.rs` called
+`yield_now` directly. Verified on QEMU amd64 (boot SNTP; `hget example.com` walks
+`10.0.2.3 → 1.1.1.1` in 0.13 s; a nonexistent name fails in under a second) and
+AArch64/HVF (resolves; fails fast). **Not yet verified on metal.**
 
 Ordering: tier 1 immediately (days); tier 4's `dns.rs` fix rides the §3.30
 bug; tier 3's `akuma-paging` before §3.4 M1 so the hypervisor starts on an

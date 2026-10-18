@@ -2818,6 +2818,14 @@ Both bugs are dated together because the second only became reachable once
 the first was fixed — `sti` is what let the scheduler preempt into the daemon
 at all.
 
+> **Correction 2026-10-18:** the hand-rolled client described above no longer
+> exists. It moved into `crates/akuma-dns` and is the resolver for every target
+> (`akuma_net::dns::resolve_ipv4`); `smoltcp_net::dns_query` was deleted rather
+> than fixed, because it did not reproduce a hang on a current amd64 boot — the
+> 2026-09-05 one was most likely the `IF=0` frozen clock of §3.30.3 — and the
+> only behaviour `dns.rs` had that it lacked (walking resolvers on `NXDOMAIN`)
+> is now shared. `docs/archive/POST_AMD64_CODE_AUDIT.md` §4.6 has the record.
+
 ### 3.30.5 What's verified, and what's still open
 
 Verified over SSH on QEMU `microvm`, from a clean `amd64/run.sh` (no manual

@@ -504,7 +504,8 @@ this file's philosophy asks for. Not yet wired into the boot suite or
 
 | crate | what | `unsafe` |
 |---|---|---|
-| `akuma-net` | smoltcp stack (`smoltcp_net/`, 14 modules), the AF_INET socket table, DNS | none — `forbid(unsafe_code)` |
+| `akuma-dns` | the DNS A-record client as pure logic: wire format plus the resolver-walk/retransmit loop over caller-supplied effects (the `akuma-sntp` shape) | none — `forbid` |
+| `akuma-net` | smoltcp stack (`smoltcp_net/`, 13 modules), the AF_INET socket table, DNS (`dns::resolve_ipv4`, which wires `akuma-dns` to this crate's UDP sockets) | none — `forbid(unsafe_code)` |
 | `akuma-net-nic` | DMA frame arenas, the virtio-net wrapper, smoltcp's `Device` impls, the MMIO doorbell, `nicstat`, the rump tap | **all of it** |
 | `akuma-net-unix` | the AF_UNIX state machine | none — `forbid` |
 | `akuma-net-yarn` | the readiness wait loop | none — `forbid` |
@@ -512,6 +513,27 @@ this file's philosophy asks for. Not yet wired into the boot suite or
 Every `unsafe` line in networking is in `akuma-net-nic`, behind one stated DMA
 contract (`crates/akuma-net-nic/src/nic.rs`). Rationale and the moves that got
 there: [`../../archive/AKUMA_NET_SPLIT.md`](../../archive/AKUMA_NET_SPLIT.md) §5.
+
+## DNS: one resolver for every target (2026-10-18)
+
+`akuma_net::dns::resolve_ipv4(host, timeout_us)` is the only resolver — the
+syscall (`RESOLVE_HOST`, 300 on amd64), the SNTP bootstrap and the AArch64 boot
+clock all come through it. It sends A queries over a plain UDP socket
+(`akuma-dns`), walks the resolver list on a timeout **or an answer without a
+record**, and retransmits every 1.5 s. Until 2026-10-18 AArch64 used smoltcp's
+DNS socket (`smoltcp_net::dns_query`, now deleted along with that socket's slot)
+and amd64 had its own copy (`amd64/src/dns.rs`, deleted); they differed exactly
+where it mattered: smoltcp fails on the first `NXDOMAIN`, and a resolver that
+`NXDOMAIN`s a name another answers is a measured case (the HP box's uplink;
+QEMU slirp's forwarder answered `NXDOMAIN` for `example.com` while `1.1.1.1`
+answered, 2026-10-18).
+
+**The resolver list is policy.** The configured resolver
+(`smoltcp_net::static_ipv4().dns`) is always first; `dns::set_fallback_resolvers`
+adds the rest. **amd64 sets Cloudflare then Google; AArch64 sets none**, so on
+AArch64 a name never leaves the configured resolver — which also means an
+`NXDOMAIN` from slirp's forwarder is final there, exactly as it was under
+smoltcp. If that is wrong for AArch64, it is one call at boot, not a code change.
 
 ## Background
 

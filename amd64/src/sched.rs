@@ -2286,7 +2286,7 @@ pub fn yield_now() {
     // **The switch requires the BKL, and `bkl_drop_window` above does not
     // supply it** — it is a no-op for a caller that did not hold the lock in
     // the first place, and several of this file's ~20 callers are exactly that
-    // (kernel wait loops: `net.rs`'s `blocking_relax`, `console.rs`, `dns.rs`,
+    // (kernel wait loops: `net.rs`'s `blocking_relax`, `console.rs`,
     // `fd.rs`, the `smp.rs` drive loops).
     //
     // `x86_yield_now`'s cross-core safety argument is that `ON_CPU` is cleared

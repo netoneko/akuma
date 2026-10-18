@@ -1257,7 +1257,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // busybox is musl and goes out over UDP itself.
             //
             // The kernel already had the resolver; `clock.rs`'s SNTP bootstrap
-            // uses the same `dns::resolve_a`. Only the syscall was missing.
+            // uses the same `akuma_net::dns::resolve_ipv4`. Only the syscall was
+            // missing.
             300 => {
                 // A hostname is passed as `(ptr, len)` and is **not**
                 // NUL-terminated, so `read_cstr` is the wrong tool — it would
@@ -1274,7 +1275,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 let Ok(name) = core::str::from_utf8(&buf[..n]) else {
                     return errno::EINVAL;
                 };
-                let Some(ip) = crate::dns::resolve_a(name, DNS_TIMEOUT_US) else {
+                let Ok(ip) = akuma_net::dns::resolve_ipv4(name, DNS_TIMEOUT_US).map(|ip| ip.octets()) else {
                     // `EAI_FAIL`'s errno cousin: the name did not resolve. Not
                     // `EFAULT` — the caller's pointers were fine.
                     return errno::ENOENT;

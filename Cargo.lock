@@ -190,6 +190,10 @@ name = "akuma-dmesg"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-dns"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-dwi2c"
 version = "0.1.0"
 
@@ -471,6 +475,7 @@ version = "0.1.0"
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-dns",
  "akuma-net-nic",
  "akuma-net-yarn",
  "akuma-primitives",
@@ -812,6 +817,7 @@ name = "akuma-vfs-glue"
 version = "0.1.0"
 dependencies = [
  "akuma-alloc",
+ "akuma-bkl",
  "akuma-config",
  "akuma-exec",
  "akuma-ext2",
