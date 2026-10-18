@@ -60,7 +60,7 @@ fn reclaim_pending_slots(net: &mut NetworkState, want: usize) -> usize {
         SOCKETS_LIVE.fetch_sub(1, Ordering::Relaxed);
         net.pending_removal.swap_remove(idx);
         freed += 1;
-        RECLAIMED_SLOTS.fetch_add(1, Ordering::Relaxed);
+        crate::SOCKET_SLOTS_RECLAIMED.fetch_add(1, Ordering::Relaxed);
     }
     freed
 }
@@ -124,16 +124,13 @@ pub fn socket_soft_cap() -> usize {
     SOCKET_SOFT_CAP.load(Ordering::Relaxed)
 }
 
-/// Sockets reclaimed early by [`reclaim_pending_slots`]. A steadily climbing
-/// value means the socket budget is genuinely too small for the workload rather
-/// than merely churning; a flat zero under connection-per-request load means the
-/// valve is not being reached.
-static RECLAIMED_SLOTS: AtomicU64 = AtomicU64::new(0);
-
 /// How many socket slots have been reclaimed under pressure since boot.
+///
+/// The count lives in [`crate::SOCKET_SLOTS_RECLAIMED`] so `/proc/health` can
+/// read it on a build with the stack compiled out.
 #[must_use]
 pub fn reclaimed_slot_count() -> u64 {
-    RECLAIMED_SLOTS.load(Ordering::Relaxed)
+    crate::SOCKET_SLOTS_RECLAIMED.load(Ordering::Relaxed)
 }
 
 #[must_use]

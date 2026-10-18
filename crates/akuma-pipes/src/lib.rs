@@ -362,24 +362,6 @@ impl<W> PipeTable<W> {
         (CloseResult { destroyed }, wakes)
     }
 
-    /// Remove a pipe outright, regardless of its end counts, waking anyone
-    /// parked on it.
-    ///
-    /// For a pipe whose lifetime an allocator manages by hand rather than by
-    /// refcount: the amd64 kernel's `sys_spawn` pipes, whose child end is
-    /// reached by *number* rather than by descriptor and so never closes. A
-    /// `pipe(2)` pair must **not** come through here — it is destroyed by the
-    /// last [`close_read`](Self::close_read)/[`close_write`](Self::close_write),
-    /// and short-circuiting that frees the buffer under a live peer.
-    ///
-    /// Returns whether there was a pipe to remove.
-    pub fn destroy(&mut self, id: PipeId) -> (bool, Wakes<W>) {
-        match self.pipes.remove(&id) {
-            Some(mut p) => (true, p.take_pollers()),
-            None => (false, Wakes::none()),
-        }
-    }
-
     /// "Is there something to read, and if not, register me" — in one step.
     ///
     /// Returns `true` if the caller must **not** block. The two-step spelling

@@ -655,6 +655,58 @@ fn render_loadavg(buf: &mut [u8]) -> usize {
     pos
 }
 
+/// Room for `/proc/health`. Seven short `key value` lines; the renderer
+/// tolerates a short buffer by truncating, never by panicking.
+const HEALTH_BUF: usize = 512;
+
+/// `/proc/health` — counters for machinery that heals or sheds load silently.
+///
+/// Each of these runs without announcing itself: a self-heal that unwedges a
+/// lock, a valve that reclaims pages or sockets under pressure, a spawn that is
+/// abandoned before its first instruction. Their counters existed and nothing
+/// read them, so a box that was *using* them looked identical to one that never
+/// needed to (`docs/archive/POST_AMD64_CODE_AUDIT.md` §1.3). A file rather than
+/// a periodic console line because the console is the channel of last resort on
+/// the bare-metal boxes and these should not push `[rtl]`'s stall dump off it.
+///
+/// One `key value` per line, all decimal. A kernel may append more through
+/// [`crate::set_health_extra`]. The keys this file renders itself:
+///
+/// * `bkl_recoveries` — every forced `now_serving` advance, benign or not.
+/// * `bkl_lost_ticket_recoveries` — the wedge subset. Must stay `0`.
+/// * `bkl_stuck_suppressed` — `[BKL] stuck` lines folded into a reported episode.
+/// * `bkl_max_wait_spins` — the longest ticket wait seen this boot.
+/// * `trampoline_bails` — threads abandoned before their first user instruction.
+/// * `pressure_reclaimed_pages` — pages the allocator's pressure path drained
+///   from retired processes.
+/// * `socket_slots_reclaimed` — sockets reclaimed early under table pressure.
+fn render_health(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
+    let mut pos = 0usize;
+    {
+        let mut w = FmtBuf { buf: &mut *buf, pos: &mut pos };
+        let _ = writeln!(w, "bkl_recoveries {}", akuma_bkl::sync::kernel_lock_recoveries());
+        let _ = writeln!(
+            w,
+            "bkl_lost_ticket_recoveries {}",
+            akuma_bkl::sync::kernel_lock_lost_ticket_recoveries()
+        );
+        let _ = writeln!(w, "bkl_stuck_suppressed {}", akuma_bkl::sync::kernel_lock_stuck_suppressed());
+        let _ = writeln!(w, "bkl_max_wait_spins {}", akuma_bkl::sync::max_wait_spins());
+        let _ = writeln!(w, "trampoline_bails {}", process::trampoline_bail_count());
+        let _ = writeln!(w, "pressure_reclaimed_pages {}", process::reclaim::pressure_reclaimed_pages());
+        let _ = writeln!(
+            w,
+            "socket_slots_reclaimed {}",
+            akuma_net::SOCKET_SLOTS_RECLAIMED.load(core::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    if let Some(extra) = crate::health_extra() {
+        pos += extra(&mut buf[pos..]).min(buf.len() - pos);
+    }
+    pos
+}
+
 // ============================================================================
 // ProcFilesystem
 // ============================================================================
@@ -772,6 +824,10 @@ impl ProcFilesystem {
                     meta(RO, size as u64, None)
                 }
                 tree::Global::Cpuinfo => meta(RO, cpuinfo_len() as u64, None),
+                tree::Global::Health => {
+                    let mut scratch = [0u8; HEALTH_BUF];
+                    meta(RO, render_health(&mut scratch) as u64, None)
+                }
                 tree::Global::Meminfo | tree::Global::Stat | tree::Global::Uptime | tree::Global::Loadavg => {
                     let mut scratch = [0u8; 1024];
                     let size = match g {
@@ -1065,6 +1121,18 @@ impl Filesystem for ProcFilesystem {
             return Ok(n);
         }
 
+        // /proc/health — a stack buffer, like the files around it.
+        if path == "health" {
+            let mut scratch = [0u8; HEALTH_BUF];
+            let len = render_health(&mut scratch);
+            if offset >= len {
+                return Ok(0);
+            }
+            let n = buf.len().min(len - offset);
+            buf[..n].copy_from_slice(&scratch[offset..offset + n]);
+            return Ok(n);
+        }
+
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — rendered
         // straight into the caller's buffer, no intermediate `Vec`: this is
         // what busybox `top`/`free` re-`read()` on every refresh.
@@ -1332,6 +1400,13 @@ impl Filesystem for ProcFilesystem {
         if path == "power" && let Some(render) = crate::power_renderer() {
             let mut scratch = [0u8; 768];
             let len = render(&mut scratch).min(scratch.len());
+            return Ok(scratch[..len].to_vec());
+        }
+
+        // /proc/health — the one allocation is the trait boundary's.
+        if path == "health" {
+            let mut scratch = [0u8; HEALTH_BUF];
+            let len = render_health(&mut scratch);
             return Ok(scratch[..len].to_vec());
         }
 
@@ -1625,5 +1700,33 @@ fn if_stats(c: akuma_net::ifstats::Counts) -> akuma_syscalls_net::IfStats {
         tx_bytes: c.tx_bytes,
         tx_packets: c.tx_packets,
         tx_drop: c.tx_drop,
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn lines(buf: &[u8]) -> Vec<&str> {
+        core::str::from_utf8(buf).unwrap().lines().collect()
+    }
+
+    #[test]
+    fn health_is_key_value_lines_that_fit() {
+        let mut buf = [0u8; HEALTH_BUF];
+        let n = render_health(&mut buf);
+        assert!(n > 0 && n < HEALTH_BUF, "rendered {n} of {HEALTH_BUF} bytes - keep headroom");
+        let rows = lines(&buf[..n]);
+        assert_eq!(rows.len(), 7);
+        for row in rows {
+            let (key, value) = row.split_once(' ').expect("`key value`");
+            assert!(!key.is_empty() && value.parse::<u64>().is_ok(), "bad row {row:?}");
+        }
+    }
+
+    #[test]
+    fn a_short_buffer_truncates_instead_of_panicking() {
+        let mut tiny = [0u8; 8];
+        assert!(render_health(&mut tiny) <= tiny.len());
     }
 }

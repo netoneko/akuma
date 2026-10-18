@@ -47,7 +47,8 @@ unchanged by construction.
 `amd64/src/pipe.rs` went from a 231-line second implementation to a shim: every
 function is now a name for a `glue::pipe` call. Four small accessors were added
 to glue for what the shim genuinely needs — `pipe_exists`, `pipe_counts`,
-`pipe_live_count`, `pipe_destroy` — plus one entry point that is a real
+`pipe_live_count`, `pipe_destroy` (deleted 2026-10-18: the hand-managed spawn
+pipes it served went with C2 slice 6, 2026-09-11) — plus one entry point that is a real
 semantic choice, below.
 
 ## The three things that stayed amd64's, and why

@@ -304,36 +304,3 @@ fn a_zero_length_read_of_a_writerless_pipe_still_reports_eof() {
     let (r, _) = t.read(id, &mut []);
     assert!(r.eof);
 }
-
-#[test]
-fn destroy_removes_a_pipe_whatever_its_counts_say() {
-    // For the allocator-managed lifetime: an amd64 `sys_spawn` pipe whose child
-    // end is reached by number and therefore never closes.
-    let mut t = T::new();
-    let id = t.create();
-    assert_eq!(t.counts(id), Some((1, 1)));
-    let (existed, _) = t.destroy(id);
-    assert!(existed);
-    assert!(!t.exists(id));
-    assert_eq!(t.live_count(), 0);
-}
-
-#[test]
-fn destroy_wakes_everyone_parked_on_the_pipe() {
-    // A waiter left registered on a destroyed pipe never retries, and its
-    // retry is the only thing that would tell it the pipe is gone.
-    let mut t = T::new();
-    let id = t.create();
-    t.add_poller(id, 3, 30);
-    t.add_poller(id, 4, 40);
-    let (_, wakes) = t.destroy(id);
-    assert_eq!(fired(wakes), vec![3, 4]);
-}
-
-#[test]
-fn destroying_a_missing_pipe_is_a_no_op() {
-    let mut t = T::new();
-    let (existed, wakes) = t.destroy(404);
-    assert!(!existed);
-    assert!(wakes.is_empty());
-}

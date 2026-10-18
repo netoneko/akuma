@@ -133,11 +133,14 @@ pub enum Global {
     Loadavg,
     Cpuinfo,
     Power,
+    /// Counters for self-heal and pressure-valve machinery that otherwise runs
+    /// invisibly (`docs/archive/POST_AMD64_CODE_AUDIT.md` §1.3).
+    Health,
 }
 
 impl Global {
     /// Listing order at the root.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Boxes,
         Self::Cores,
         Self::Dac,
@@ -149,6 +152,7 @@ impl Global {
         Self::Loadavg,
         Self::Cpuinfo,
         Self::Power,
+        Self::Health,
     ];
 
     #[must_use]
@@ -165,6 +169,7 @@ impl Global {
             Self::Loadavg => "loadavg",
             Self::Cpuinfo => "cpuinfo",
             Self::Power => "power",
+            Self::Health => "health",
         }
     }
 

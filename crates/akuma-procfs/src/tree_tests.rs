@@ -339,6 +339,19 @@ fn features_off_remove_their_entries_consistently() {
     }
 }
 
+/// `/proc/health` reads kernel-global counters, so no feature, viewer or box
+/// can take it away (the audit that added it found those counters unread).
+#[test]
+fn health_is_always_there() {
+    let mut m = machine();
+    m.features = Features::default();
+    for viewer_box in [0, 7] {
+        m.viewer_box = viewer_box;
+        assert!(listing(&m, "").iter().any(|(n, _)| n == "health"));
+        assert!(resolve(&m, "health").is_some(), "box {viewer_box} cannot see /proc/health");
+    }
+}
+
 /// Many random tables — thread groups, zombies, boxes, closed descriptors,
 /// retained logs — each walked from every viewer. A tiny LCG keeps this
 /// deterministic and dependency-free.

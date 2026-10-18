@@ -136,6 +136,9 @@ pub fn install_shared_sinks() {
     // is the one that read bare `processor : N` blocks on 2026-10-09 because the
     // registration had been added to `main.rs` only.
     akuma_vfs_glue::set_cpuinfo_renderer(crate::cpuinfo::render);
+    // `/proc/health`'s pipe-table lines: the table is in `akuma-syscalls-glue`,
+    // which `akuma-vfs-glue` cannot name.
+    akuma_vfs_glue::set_health_extra(crate::pipe::render_health);
     // The entropy source `akuma-syscalls-glue`'s `getrandom(2)` reads. Glue's
     // default is the virtio-rng device, which this target does not have on any
     // rig and cannot have on the bare-metal box; without this, folding

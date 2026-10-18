@@ -269,6 +269,7 @@ umount2".
 | `/proc/stat` | `cpu`/`cpuN` lines + `processes`/`procs_running`/`procs_blocked` — added 2026-08-25, what busybox `top` reads (unconditionally; missing this file makes `top` refuse to start at all) |
 | `/proc/uptime` | `uptime_seconds idle_seconds`, Linux SMP semantics (idle summed across cores) — added 2026-08-25 |
 | `/proc/loadavg` | `runnable/total` and `last_pid` are real; the three load-average figures are always `0.00` — no decaying run-queue average is tracked — added 2026-08-25 |
+| `/proc/health` | `key value` per line, all decimal — counters for machinery that heals or sheds load **silently**: `bkl_recoveries`, `bkl_lost_ticket_recoveries` (must stay 0), `bkl_stuck_suppressed`, `bkl_max_wait_spins`, `trampoline_bails` (0 healthy), `pressure_reclaimed_pages`, `socket_slots_reclaimed`, plus the pipe table (`pipes_live`; amd64 adds `pipes_high_water`/`pipes_refused`/`pipes_cap`, which tell a leak — high-water climbing across a workload that ends — from demand). Added 2026-10-18 (`docs/archive/POST_AMD64_CODE_AUDIT.md` §1.3). A file rather than a periodic console line: on the bare-metal boxes the console is the channel of last resort. Always present, every viewer. Kernels append lines through `akuma_vfs_glue::set_health_extra`, for state `akuma-vfs-glue` cannot name |
 | `/etc/mtab` | not procfs, but the same idea and the same renderer: a virtual file, intercepted in `src/vfs/mod.rs` before any real filesystem is touched — see "Mount table" above |
 
 **`/proc/stat`'s `cpu`/`cpuN` lines and `/proc/<pid>/stat`'s `utime` field are

@@ -166,6 +166,21 @@ pub fn report() {
     glue::pipe_dump();
 }
 
+/// The same three numbers as [`report`], as `key value` lines for
+/// `/proc/health` — the reading that tells a leak from demand without the
+/// console (`[PIPES]` is off in the idle block, see `sched.rs`).
+pub fn render_health(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
+    use core::fmt::Write;
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(w, "pipes_live {}", glue::pipe_live_count());
+    let _ = writeln!(w, "pipes_high_water {}", PIPE_HIGH_WATER.load(core::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(w, "pipes_refused {}", PIPE_REFUSALS.load(core::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(w, "pipes_cap {MAX_PIPES}");
+    pos
+}
+
 /// `true` once [`MAX_PIPES`] are live.
 ///
 /// The preamble `fd::sys_pipe2` runs before handing `pipe2` to glue, whose

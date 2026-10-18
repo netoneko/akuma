@@ -1324,6 +1324,23 @@ pub(crate) fn power_renderer() -> Option<fn(&mut [u8]) -> usize> {
     *POWER_RENDER.lock()
 }
 
+/// Extra `key value` lines for `/proc/health`, from state `akuma-vfs-glue`
+/// cannot name (the pipe table lives in `akuma-syscalls-glue`, which depends on
+/// this crate). Appended after the lines this crate renders itself.
+static HEALTH_EXTRA: spinning_top::Spinlock<Option<fn(&mut [u8]) -> usize>> =
+    spinning_top::Spinlock::new(None);
+
+/// Register extra `/proc/health` lines: fills the buffer, returns bytes
+/// written. Must not allocate, must tolerate a short buffer, and must write
+/// whole `key value\n` lines.
+pub fn set_health_extra(f: fn(&mut [u8]) -> usize) {
+    *HEALTH_EXTRA.lock() = Some(f);
+}
+
+pub(crate) fn health_extra() -> Option<fn(&mut [u8]) -> usize> {
+    *HEALTH_EXTRA.lock()
+}
+
 /// The `/proc/cpuinfo` block renderer: `f(core, buf)` writes the one block that
 /// describes logical CPU `core` (ending in the blank line that separates
 /// blocks) and returns the bytes written. Per-core rather than whole-file so

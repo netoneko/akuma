@@ -30,6 +30,18 @@ pub fn register() {
         // stay absent here — which is what they were before the hook existed.
         pid_map_rows: |_pid| None,
     });
+    // `/proc/health`'s pipe-table line: the table is in `akuma-syscalls-glue`,
+    // which `akuma-vfs-glue` cannot name.
+    akuma_vfs_glue::set_health_extra(pipe_health);
+}
+
+fn pipe_health(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
+    use core::fmt::Write;
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(w, "pipes_live {}", akuma_syscalls_glue::pipe::pipe_live_count());
+    pos
 }
 
 #[cfg(kernel_smp_shared)]

@@ -54,6 +54,17 @@ pub use akuma_net_nic::virtio_rings;
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_net;
 
+/// Sockets reclaimed early by `smoltcp_net::sockets::reclaim_pending_slots`.
+///
+/// A steadily climbing value means the socket budget is genuinely too small for
+/// the workload rather than merely churning; a flat zero under
+/// connection-per-request load means the valve is not being reached.
+///
+/// Here rather than beside its only writer because that module is compiled out
+/// of a rump-only build and `/proc/health` reads this on every build.
+pub static SOCKET_SLOTS_RECLAIMED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// The wire side of the stack's device — `Virtio`, `Rtl8169` (amd64 bare
 /// metal), or `Absent` (loopback only). Re-exported so callers of
 /// [`init_with_external`] need not reach through `smoltcp_net`.

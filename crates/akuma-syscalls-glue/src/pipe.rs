@@ -470,20 +470,6 @@ pub fn pipe_live_count() -> usize {
     with_table(|t| t.live_count())
 }
 
-/// Remove a pipe outright, whatever its end counts say, waking anyone parked
-/// on it.
-///
-/// For a lifetime managed by hand rather than by reference counting: a spawned
-/// child's stdin pipe on amd64 is read by the child by number, so its read end
-/// never closes and refcounting alone would never free it — `waitpid` is what
-/// knows the child is gone. A `pipe(2)` pair must **not** come through here;
-/// it is destroyed by the last [`pipe_close_read`]/[`pipe_close_write`], and
-/// short-circuiting that frees the buffer under a live peer.
-pub fn pipe_destroy(id: u32) {
-    let (_, wakes) = with_table(|t| t.destroy(id));
-    fire(wakes);
-}
-
 pub fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
