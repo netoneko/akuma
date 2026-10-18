@@ -540,6 +540,31 @@ pub const fn user_range_ok(ptr: u64, len: usize) -> bool {
     }
 }
 
+/// How many bytes the next chunk of a user C-string read should take.
+///
+/// The minimum of what the caller still wants (`remaining`), what its buffer
+/// holds (`buf_len`) and the distance from `at` to the end of its 4 KiB page.
+///
+/// **The page bound is the point.** A string that ends just before an unmapped
+/// page must read successfully, so no chunk may reach into the next page "to be
+/// efficient": a speculative over-read of a page the string never touches turns a
+/// valid short string into `EFAULT`. This is the same reason Linux's
+/// `strncpy_from_user` stops at page boundaries. Always at least 1 when
+/// `remaining` and `buf_len` are non-zero, so the loop that calls this makes
+/// progress.
+#[must_use]
+pub const fn cstr_chunk_len(at: u64, remaining: usize, buf_len: usize) -> usize {
+    let to_page_end = 4096 - (at & 0xfff) as usize;
+    let mut n = remaining;
+    if buf_len < n {
+        n = buf_len;
+    }
+    if to_page_end < n {
+        n = to_page_end;
+    }
+    n
+}
+
 /// Full validation: [`user_range_ok`], then confirm the range is mapped — faulting
 /// lazy pages in when asked.
 ///
@@ -1037,5 +1062,30 @@ mod tests {
         assert!(user_range_ok(0x1000, 0));
         assert!(!user_range_ok(0, 0));
         assert!(user_range_ok(USER_VA_LIMIT, 0));
+    }
+
+    #[test]
+    fn a_cstr_chunk_never_crosses_a_page() {
+        // At the start of a page: bounded by the buffer or the page, not past it.
+        assert_eq!(cstr_chunk_len(0x2000, 10_000, 256), 256);
+        assert_eq!(cstr_chunk_len(0x2000, 10_000, 8192), 4096);
+        // Four bytes from the end of a page: exactly four, whatever else is wanted.
+        assert_eq!(cstr_chunk_len(0x2ffc, 100, 256), 4);
+        assert_eq!(cstr_chunk_len(0x2fff, 100, 256), 1);
+        // Every offset in a page: the chunk ends at or before the page end.
+        for off in 0..4096u64 {
+            let at = 0x7000 + off;
+            let n = cstr_chunk_len(at, usize::MAX, usize::MAX);
+            assert!(n >= 1 && (at & 0xfff) as usize + n <= 4096, "off {off}: chunk {n}");
+        }
+    }
+
+    #[test]
+    fn a_cstr_chunk_respects_what_the_caller_still_wants() {
+        assert_eq!(cstr_chunk_len(0x2000, 7, 256), 7);
+        assert_eq!(cstr_chunk_len(0x2000, 0, 256), 0, "nothing wanted, nothing read");
+        assert_eq!(cstr_chunk_len(0x2000, 100, 0), 0, "no buffer, nothing read");
+        // Progress: a non-zero request always makes a non-zero chunk.
+        assert!(cstr_chunk_len(0x2fff, 1, 1) == 1);
     }
 }

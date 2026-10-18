@@ -367,8 +367,8 @@ impl Regs {
             // `SS = base + 8` (`gdt.rs`'s `SYSRET_BASE`, RPL included). A
             // handler that reads them must see the values it will be returned
             // to, not zero.
-            cs: crate::gdt::SYSRET_BASE + 16,
-            ss: crate::gdt::SYSRET_BASE + 8,
+            cs: crate::gdt::USER_CS,
+            ss: crate::gdt::USER_SS,
             gs: 0,
             fs: 0,
             err: 0,
@@ -1358,7 +1358,7 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
     // `sysret` installs ring-3 selectors from `IA32_STAR`; a handler that reads
     // `uc_mcontext.cs` must see what it will be returned to.
     t.check_eq("signal: sigcontext cs is the sysret user selector",
-        u64::from(sc.cs), u64::from(crate::gdt::SYSRET_BASE + 16));
+        u64::from(sc.cs), u64::from(crate::gdt::USER_CS));
 
     // **The `rflags` filter.** `sysret` loads `%r11` straight into `RFLAGS`, so
     // a frame is a ring-3 program choosing its own flags. `IF` clear in ring 3

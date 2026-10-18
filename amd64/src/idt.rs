@@ -200,13 +200,7 @@ const CR3_FRAME_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// `CR2` holds the faulting linear address after a page fault.
 fn read_cr2() -> u64 {
-    let v: u64;
-    // SAFETY: reading CR2 copies a register into a local; it dereferences
-    // nothing and has no side effect.
-    unsafe {
-        core::arch::asm!("mov {}, cr2", out(reg) v, options(nomem, nostack, preserves_flags));
-    }
-    v
+    akuma_cpu::ctlreg::cr2()
 }
 
 /// Print a stack frame and stop.

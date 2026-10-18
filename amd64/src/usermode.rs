@@ -30,7 +30,6 @@ use akuma_syscalls_abi::Syscall;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use crate::gdt;
 use akuma_mmap::{MmapRegion, PhysFrame};
 use alloc::vec::Vec;
 
@@ -2951,7 +2950,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 
 /// Enable `syscall`/`sysret`.
 pub fn init_syscall() {
-    let star = (u64::from(gdt::SYSRET_BASE) << 48) | (u64::from(gdt::KERNEL_CODE) << 32);
+    let star = akuma_gdt::star();
     // SAFETY: the four architectural MSRs of the fast-syscall path, written
     // before any `syscall` can be executed (userspace does not exist yet).
     unsafe {

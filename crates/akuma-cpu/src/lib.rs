@@ -100,7 +100,7 @@
 //! # What x86_64 gets today
 //!
 //! The host stub plus three real x86 arms — [`barrier`], [`park`], [`daif`] —
-//! and a **placeholder, not a port**, everywhere else: a no-op `dsb_ish` and a
+//! and the read-only [`ctlreg`] control registers, and a **placeholder, not a port**, everywhere else: a no-op `dsb_ish` and a
 //! `park::wfi` that does not park are wrong on real x86 hardware.
 //!
 //! [`daif`] went real on 2026-09-08 for the amd64 C1 process-table step
@@ -119,6 +119,85 @@
 
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::inline_always, clippy::must_use_candidate)]
+
+/// x86_64 control registers, **read only**.
+///
+/// `mov reg, crN` copies a register into a local: it dereferences nothing and has
+/// no side effect, so it is safe to execute — the same judgement the system
+/// registers in [`sysreg`] make for AArch64. **Writing** any of them is not here
+/// and will not be: `mov cr0, rax` can turn paging or write-protection off,
+/// `mov cr3, rax` switches the address space under the running code, and
+/// `mov cr4, rax` flips SMAP/SMEP/PAE. They stay `unsafe` at the call site, with
+/// the obligation stated there — the same asymmetry as `TTBR0_EL1` (read here,
+/// written elsewhere).
+///
+/// Off x86_64 bare metal every function returns 0, like the rest of the crate's
+/// host stubs.
+pub mod ctlreg {
+    /// `CR0`: `PE`, `WP`, `PG`, …
+    #[inline(always)]
+    pub fn cr0() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: a register copied into a local; no memory, no side effect.
+            unsafe {
+                core::arch::asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+
+    /// `CR2`: the faulting linear address after a page fault.
+    #[inline(always)]
+    pub fn cr2() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: as `cr0`.
+            unsafe {
+                core::arch::asm!("mov {}, cr2", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+
+    /// `CR3`: the active top-level page table and its PCID/flag bits.
+    #[inline(always)]
+    pub fn cr3() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: as `cr0`.
+            unsafe {
+                core::arch::asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+
+    /// `CR4`: `PAE`, `SMEP`, `SMAP`, `PCIDE`, …
+    #[inline(always)]
+    pub fn cr4() -> u64 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            let v: u64;
+            // SAFETY: as `cr0`.
+            unsafe {
+                core::arch::asm!("mov {}, cr4", out(reg) v, options(nomem, nostack, preserves_flags));
+            };
+            v
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        0
+    }
+}
 
 /// Barriers.
 ///
@@ -1073,5 +1152,10 @@ mod tests {
         assert_eq!(sysreg::fpcr(), 0);
         assert_eq!(sysreg::cntvct_el0_ordered(), 0);
         assert_eq!(daif::read(), 0);
+    }
+
+    #[test]
+    fn control_register_reads_return_zero_on_the_host() {
+        assert_eq!([ctlreg::cr0(), ctlreg::cr2(), ctlreg::cr3(), ctlreg::cr4()], [0; 4]);
     }
 }

@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dmesg,dns,exec,ext2,firecracker,fpcache,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dmesg,dns,exec,ext2,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-port` is x86 **port I/O**, under the same rule as `akuma-cpu` below with
   one difference that is the point: no function takes a port number. `in`/`out` are only safe to execute
@@ -16,7 +16,12 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `CMOS`, `PIC`, `PIT`, `I8042`, `PCI_CONFIG`, `RESET_CONTROL`, `DEBUGCON`), each
   reaching only its own range, with a host-tested registry that no two overlap.
   **Never open-code `in`/`out` or add a safe `outb(port, v)`** — the second is how
-  safe code gets to power the box off.
+  safe code gets to power the box off. `akuma_cpu::ctlreg` reads `CR0/2/3/4` (read
+  only; writes stay `unsafe` at the call site, like `TTBR0_EL1`).
+  `scripts/check_unsafe_budget.py` is the gate on `unsafe` growth: a component's
+  production `unsafe` sites may not exceed `docs/reference/unsafe-budget.json`, and
+  a new crate's budget is 0. To add `unsafe`, run it with `--update` so the budget
+  diff carries the increase into review.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
   comparator and read-only system registers — behind safe `#[inline(always)]`

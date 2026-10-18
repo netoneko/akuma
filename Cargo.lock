@@ -101,6 +101,7 @@ dependencies = [
  "akuma-fbdev",
  "akuma-fpcache",
  "akuma-fpcache-rw",
+ "akuma-gdt",
  "akuma-hda",
  "akuma-hid",
  "akuma-i2c-hid",
@@ -340,6 +341,10 @@ dependencies = [
 
 [[package]]
 name = "akuma-fpcache-rw"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-gdt"
 version = "0.1.0"
 
 [[package]]

@@ -507,6 +507,55 @@ and a `reboot -f` issued *by the new kernel* all work. The reset came back, but
 the log of the kernel that issued it is gone, so whether `0xCF9` or the i8042
 fallback did it is not recorded.
 
+**Status 2026-10-18 (second pass) — `gdt.rs` and `uaccess.rs`.**
+
+*`gdt.rs`* -> `crates/akuma-gdt` (pure, `forbid(unsafe_code)`, 10 host tests). What
+was arithmetic left: the selectors, the descriptors, the 16-byte TSS descriptor's
+scattered base packing (round-tripped on the host for bases up to `u64::MAX`),
+`Tss`, and `IA32_STAR`. The invariant the audit named - the `syscall`/`sysret`
+selector order, "checked by nothing at load time" - is now `const` assertions
+(`USER_CS == selector(USER_CODE, 3)`, `USER_SS == selector(USER_DATA, 3)`,
+`KERNEL_DATA == KERNEL_CODE + 8`) plus host tests that decode what the CPU would
+compute and check RPL 3 on *both* user selectors (the `#GP(0x18)` only real AMD
+hardware raised). `gdt.rs` keeps the per-core statics, `lgdt`/`ltr` and the `rsp0`
+write: three `unsafe` sites, down from the same three with the descriptor
+construction inside them. `signal.rs` and `usermode.rs` stop re-deriving
+`SYSRET_BASE + 16` and the STAR shift.
+
+*`uaccess.rs`* - the audit said "not mechanical; only the validation arithmetic is
+a clean extraction", and the reading bears it out, with one finding it did not
+expect: **`read_bytes`/`write_bytes` bracketed every copy in `stac`/`clac`, and the
+shared copy loop (`akuma-user-access`'s `rep movsb`) already brackets itself, in
+assembly, inside its fixup region** - since 2026-09-07. The outer pair only ever
+nested around the inner one. Removed (and `stac()` with it); the SMAP self-tests
+(`smap:` x12, `wp:` x8) pass unchanged on QEMU with SMAP on. The only Rust `clac`
+left is `clac_if_enabled`, which `idt.rs`'s handlers need. The four control-register
+reads (`CR0` x2, `CR4` x2) and `idt`'s `CR2` / `paging`'s `CR3` read moved to
+`akuma_cpu::ctlreg` (read only; the two writes in `init_smap` stay `unsafe`), and
+`ac_set()` is `akuma_cpu::daif::read()` - `pushfq` was already there.
+`read_cstr`'s chunk arithmetic is `akuma_user_access::cstr_chunk_len`, host-tested
+at every page offset: the property that a string ending just before an unmapped
+page still reads.
+
+**Left alone, deliberately.** `read_val`/`write_val` are *safe* functions with an
+unchecked contract ("`T` must be plain ABI data"): `read_val::<bool>` on user bytes
+`2` is undefined behaviour. The sound spelling is a sealed `Pod` trait with an
+`unsafe impl` per ABI struct (`Timeval`, `RtSigFrame`, the `stat` family...) - which
+moves the obligation to where it belongs, and also surfaces that `write_val` of a
+struct with padding copies uninitialised bytes to userspace. That is a change to a
+dozen types, not a cleanup. **And a one-byte divergence worth knowing:**
+`uaccess::range_ok` accepts a range ending exactly at the canonical boundary
+(`USER_END`, exclusive); the shared `user_range_ok` rejects it, because it compares
+an exclusive end against an inclusive `USER_VA_LIMIT`. amd64's is the correct one,
+a boot test pins it, and the shared one is stricter on both architectures - so they
+were not unified.
+
+**The gate (§2.3-2).** `scripts/check_unsafe_budget.py` against
+`docs/reference/unsafe-budget.json`: per component (`src`, `amd64`, `crates/<n>`)
+the production `unsafe` sites allowed, and which components forbid. Growth, a new
+component with any `unsafe`, or a lost `forbid` fails; a decrease is a note that
+`--update` ratchets. Baseline 785 sites in 26 components, 68 forbidding.
+
 2. **Finish the fold on drivers that already have pure twins.** The xHCI split
    is the model — `crates/akuma-xhci` is 2,178 lines of pure layout/bit math
    under `#![forbid(unsafe_code)]` while `amd64/src/xhci.rs` (2,548 lines) is

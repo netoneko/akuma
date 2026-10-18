@@ -393,13 +393,7 @@ pub unsafe fn activate_unpublished(root: u64) {
 
 /// The active top-level table, from `CR3`.
 fn read_cr3() -> u64 {
-    let v: u64;
-    // SAFETY: reading CR3 copies a register into a local; it dereferences
-    // nothing and has no side effect.
-    unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags));
-    }
-    v & ADDR_MASK
+    akuma_cpu::ctlreg::cr3() & ADDR_MASK
 }
 
 /// Invalidate one page's TLB entry.

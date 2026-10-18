@@ -1,0 +1,10 @@
+[package]
+name = "akuma-gdt"
+version = "0.1.0"
+edition = "2024"
+description = "The x86_64 GDT and TSS as data: segment descriptors, the 16-byte TSS descriptor, the table layout, and the selector arithmetic syscall/sysret impose on it. Pure, host-tested, forbid(unsafe_code); loading it (lgdt/ltr) is the kernel's"
+
+[lints]
+workspace = true
+
+[dependencies]

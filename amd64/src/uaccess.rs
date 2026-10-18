@@ -44,8 +44,10 @@
 //! `RFLAGS.AC` is set — so the *only* kernel code that can touch user memory is
 //! code that says so, and a bug in [`range_ok`] (or a kernel path that still
 //! dereferences a user pointer raw) becomes a fault instead of a silent read.
-//! [`read_bytes`]/[`write_bytes`] bracket the copy in `stac`/`clac`; nothing
-//! else in the kernel sets `AC`. Two entry paths have to clear it: the
+//! The copy loop itself — `akuma_user_access`'s `rep movsb` — brackets each copy
+//! in `stac`/`clac` inside its own fixup region, so [`read_bytes`]/[`write_bytes`]
+//! add none of their own (they carried a second, outer pair until 2026-10-18 that
+//! only ever nested around the first); nothing else in the kernel sets `AC`. Two entry paths have to clear it: the
 //! exception stubs in `idt.rs` (hardware does **not** clear `AC` on interrupt
 //! delivery — Linux's `idtentry` executes `ASM_CLAC` for the same reason), and
 //! `syscall`, via bit 18 in `IA32_FMASK`, so a program cannot enter the kernel
@@ -180,9 +182,7 @@ pub fn init_smap() -> SmapStatus {
     let cpuid_smep = ebx & (1 << 7) != 0;
     let cpuid_smap = ebx & (1 << 20) != 0;
 
-    let mut cr4: u64;
-    // SAFETY: reading CR4 has no side effect.
-    unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    let mut cr4 = akuma_cpu::ctlreg::cr4();
     if cpuid_smep {
         cr4 |= CR4_SMEP;
     }
@@ -203,9 +203,7 @@ pub fn init_smap() -> SmapStatus {
         akuma_user_access::set_smap_active(true);
     }
 
-    let mut cr0: u64;
-    // SAFETY: reading CR0 has no side effect.
-    unsafe { core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags)) };
+    let mut cr0 = akuma_cpu::ctlreg::cr0();
     cr0 |= CR0_WP;
     // SAFETY: one bit added, every other written back as read. From here a
     // ring-0 write to a read-only page faults instead of succeeding — which the
@@ -222,55 +220,35 @@ pub fn init_smap() -> SmapStatus {
 /// self-test can tell "we set it" from "the CPU has it".
 #[must_use]
 pub fn write_protect_on() -> bool {
-    let cr0: u64;
-    // SAFETY: reading CR0 has no side effect.
-    unsafe { core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags)) };
-    cr0 & CR0_WP != 0
+    akuma_cpu::ctlreg::cr0() & CR0_WP != 0
 }
 
 /// `(CR4.SMAP, CR4.SMEP)` as the CPU currently has them.
 #[must_use]
 pub fn cr4_bits() -> (bool, bool) {
-    let cr4: u64;
-    // SAFETY: reading CR4 has no side effect.
-    unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    let cr4 = akuma_cpu::ctlreg::cr4();
     (cr4 & CR4_SMAP != 0, cr4 & CR4_SMEP != 0)
 }
 
-/// Allow ring-0 user-page access until [`clac`]. A no-op when SMAP is off, where
-/// the instruction would `#UD`.
+/// For the `x86-interrupt` handlers `idt.rs` cannot prefix with asm: clear `AC`
+/// on entry, so a tick landing mid-copy does not run the scheduler with SMAP
+/// suspended. The hand-assembled vectors 13/14 do this in their stubs. A no-op
+/// when SMAP is off, where `clac` would `#UD`.
+///
+/// This is the only `clac` in Rust. The copy loop's own `stac`/`clac` pair is
+/// in assembly, inside its fixup region, so a fault between them cannot leak `AC`.
 #[inline]
-fn stac() {
-    if SMAP_ACTIVE.load(Ordering::Relaxed) != 0 {
-        // SAFETY: sets `RFLAGS.AC`; that is its whole effect, and it is paired
-        // with `clac` on every path out of the copy below.
-        unsafe { core::arch::asm!("stac", options(nomem, nostack)) };
-    }
-}
-
-/// End a [`stac`] window.
-#[inline]
-fn clac() {
+pub fn clac_if_enabled() {
     if SMAP_ACTIVE.load(Ordering::Relaxed) != 0 {
         // SAFETY: clears `RFLAGS.AC`; nothing else.
         unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
     }
 }
 
-/// For the `x86-interrupt` handlers `idt.rs` cannot prefix with asm: clear `AC`
-/// on entry, so a tick landing mid-copy does not run the scheduler with SMAP
-/// suspended. The hand-assembled vectors 13/14 do this in their stubs.
-#[inline]
-pub fn clac_if_enabled() {
-    clac();
-}
-
 /// Current `RFLAGS.AC`, for the self-test.
 fn ac_set() -> bool {
-    let flags: u64;
-    // SAFETY: pushes and pops one word on the current stack.
-    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
-    flags & RFLAGS_AC != 0
+    // `daif::read` is `pushfq` on this target: raw `RFLAGS`.
+    akuma_cpu::daif::read() & RFLAGS_AC != 0
 }
 
 use akuma_user_access::{copy_from_user_safe, copy_to_user_safe};
@@ -314,13 +292,11 @@ pub fn read_bytes(ptr: u64, dst: &mut [u8]) -> bool {
     if !range_ok_or_bypassed(ptr, dst.len() as u64) {
         return false;
     }
-    stac();
     // SAFETY: `dst` is a live kernel slice of the stated length; the source is
     // a range-checked user address, and a fault in the copy is recovered by the
-    // page-fault handler into an `Err` rather than a halt.
-    let ok = unsafe { copy_from_user_safe(dst.as_mut_ptr(), ptr as *const u8, dst.len()) }.is_ok();
-    clac();
-    ok
+    // page-fault handler into an `Err` rather than a halt. The copy brackets
+    // itself with `stac`/`clac`.
+    unsafe { copy_from_user_safe(dst.as_mut_ptr(), ptr as *const u8, dst.len()) }.is_ok()
 }
 
 /// Copy `src` out to user address `ptr`. `false` on a bad range or a fault; the
@@ -333,11 +309,8 @@ pub fn write_bytes(ptr: u64, src: &[u8]) -> bool {
     if !range_ok_or_bypassed(ptr, src.len() as u64) {
         return false;
     }
-    stac();
     // SAFETY: as `read_bytes`, with the roles swapped.
-    let ok = unsafe { copy_to_user_safe(ptr as *mut u8, src.as_ptr(), src.len()) }.is_ok();
-    clac();
-    ok
+    unsafe { copy_to_user_safe(ptr as *mut u8, src.as_ptr(), src.len()) }.is_ok()
 }
 
 /// Read one plain-ABI value from user memory.
@@ -389,8 +362,7 @@ pub fn read_cstr(ptr: u64, max: usize) -> Option<Vec<u8>> {
     let mut at = ptr;
     let mut buf = [0u8; 256];
     while out.len() < max {
-        let to_page_end = 4096 - (at & 0xfff) as usize;
-        let want = (max - out.len()).min(to_page_end).min(buf.len());
+        let want = akuma_user_access::cstr_chunk_len(at, max - out.len(), buf.len());
         if !read_bytes(at, &mut buf[..want]) {
             return None;
         }
