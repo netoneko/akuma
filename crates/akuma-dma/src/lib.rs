@@ -238,6 +238,62 @@ impl<E: DmaElem, const N: usize, A> DmaArray<E, N, A> {
         DmaMut { arr: self }
     }
 
+    /// Run `f` over cells `[off, off + len)` as a shared slice, holding the read
+    /// borrow for the call.
+    ///
+    /// For a buffer the device is **still writing elsewhere**: a receive ring whose
+    /// entry the CPU may read once the device has moved past it while later entries
+    /// fill. [`view`](Self::view) would hand out `&[E]` over the whole array,
+    /// including cells the device is writing right now; this makes the reference
+    /// cover only the range the caller has established the device is done with.
+    ///
+    /// # Panics
+    /// If the range is outside the array, or a [`view_mut`](Self::view_mut) guard
+    /// (or a [`leak_mut`](Self::leak_mut)) is live.
+    #[track_caller]
+    pub fn read_range<R>(&self, off: usize, len: usize, f: impl FnOnce(&[E]) -> R) -> R {
+        assert!(off.checked_add(len).is_some_and(|e| e <= N), "DMA range outside the array");
+        assert!(self.acquire_read(), "DMA buffer read while mutably borrowed");
+        // Released on unwind too, so a panicking `f` cannot leave the array
+        // read-locked.
+        struct Release<'a, E: DmaElem, const N: usize, A>(&'a DmaArray<E, N, A>);
+        impl<E: DmaElem, const N: usize, A> Drop for Release<'_, E, N, A> {
+            fn drop(&mut self) {
+                self.0.release_read();
+            }
+        }
+        let _release = Release(self);
+        // SAFETY: `off + len <= N`, so the slice is `len` initialised cells of an
+        // any-bit-pattern type; the read lock excludes any `&mut` for the call.
+        // A device writing outside `[off, off + len)` is not covered by this
+        // reference, and the caller vouches the device is done with the inside.
+        let cells = unsafe { core::slice::from_raw_parts(self.cells.get().cast::<E>().add(off), len) };
+        f(cells)
+    }
+
+    /// Take the array **for good**: an exclusive `&'static mut` over every cell,
+    /// for a driver that parks the slice in its own state (a card that owns its
+    /// transmit memory from `init` on). The write borrow is never released, so
+    /// afterwards every other access - [`get`](Self::get), [`set`](Self::set),
+    /// a view, a second `leak_mut` - panics instead of aliasing it. [`addr`](Self::addr)
+    /// and [`addr_of`](Self::addr_of) still work: they name the memory without
+    /// touching it, which is what the device needs.
+    ///
+    /// # Panics
+    /// If any guard on this array is live, or it was already taken.
+    // `&self -> &mut` is the shape clippy warns about because it is usually a way
+    // to alias; here the write borrow taken below is never released, which is what
+    // makes the returned reference the only one.
+    #[allow(clippy::mut_from_ref)]
+    #[track_caller]
+    pub fn leak_mut(&'static self) -> &'static mut [E] {
+        assert!(self.acquire_write(), "DMA buffer taken while already borrowed");
+        // SAFETY: the write borrow just acquired is never released, so no guard,
+        // `get`/`set` or second `leak_mut` can ever be admitted: this is the only
+        // reference to the cells for the rest of the program.
+        unsafe { core::slice::from_raw_parts_mut(self.cells.get().cast::<E>(), N) }
+    }
+
     /// Write back and evict the cache lines covering bytes `[off, off + len)`,
     /// then fence — for platforms where device DMA is not snooped (HDA's
     /// no-snoop bit). amd64 only: an AArch64 equivalent would be a different
@@ -321,6 +377,50 @@ impl<E: DmaElem, const N: usize, A> Drop for DmaMut<'_, E, N, A> {
 mod tests {
     use super::align::{A128, A4K, A64};
     use super::DmaArray;
+
+    #[test]
+    fn read_range_covers_only_the_range_and_releases() {
+        let a: DmaArray<u8, 16, A64> = DmaArray::new();
+        a.view_mut().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let sum = a.read_range(4, 3, |c| {
+            assert_eq!(c.len(), 3);
+            c.iter().map(|&b| u32::from(b)).sum::<u32>()
+        });
+        assert_eq!(sum, 4 + 5 + 6);
+        // The read borrow is gone: a writer is admitted again.
+        a.set(0, 9);
+        assert_eq!(a.read_range(16, 0, |c| c.len()), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the array")]
+    fn read_range_refuses_a_range_past_the_end() {
+        let a: DmaArray<u8, 16, A64> = DmaArray::new();
+        a.read_range(10, 7, |_| ());
+    }
+
+    #[test]
+    #[should_panic(expected = "mutably borrowed")]
+    fn read_range_refuses_while_a_writer_is_live() {
+        let a: DmaArray<u8, 16, A64> = DmaArray::new();
+        let _w = a.view_mut();
+        a.read_range(0, 1, |_| ());
+    }
+
+    #[test]
+    fn leak_mut_is_the_only_access_afterwards() {
+        static LEAKED: DmaArray<u8, 8, A64> = DmaArray::new();
+        let s = LEAKED.leak_mut();
+        s.fill(3);
+        // The address is still nameable for the device...
+        assert_eq!(LEAKED.addr(), s.as_ptr() as usize);
+        // ...but any other access is refused rather than aliasing `s`.
+        let r = std::panic::catch_unwind(|| LEAKED.get(0));
+        assert!(r.is_err());
+        let r = std::panic::catch_unwind(|| LEAKED.leak_mut().len());
+        assert!(r.is_err());
+        assert_eq!(s[7], 3);
+    }
 
     #[test]
     fn alignment_comes_from_the_marker() {

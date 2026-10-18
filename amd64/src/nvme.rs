@@ -61,6 +61,7 @@
 
 use core::sync::atomic::{Ordering, compiler_fence};
 
+use akuma_dma::{DmaArray, align::A4K};
 use akuma_nvme::chunk;
 use akuma_nvme::cmd::{self, CqHead, Cqe, SqTail, Sqe};
 use akuma_nvme::gpt::Header;
@@ -69,7 +70,7 @@ use akuma_nvme::prp;
 use akuma_nvme::regs::{self, Cap, Csts};
 use akuma_nvme::window::Window;
 use akuma_primitives::addr::virt_to_phys;
-use akuma_primitives::mmio::MmioReg;
+use akuma_primitives::mmio::MmioWindow;
 use spinning_top::Spinlock;
 
 use crate::pci;
@@ -89,84 +90,40 @@ const IO_QID: u16 = 1;
 /// ones; a healthy SSD answers in milliseconds.
 const COMMAND_BUDGET_MS: u64 = 10_000;
 
-#[repr(C, align(4096))]
-struct Page<const N: usize>([u8; N]);
+/// The queues are dword cells (a submission entry is 16 of them, a completion 4);
+/// the identify page and the bounce buffer are bytes; the PRP list is the
+/// controller's own array of `u64`. Each is page-aligned, as the spec needs.
+static ASQ: DmaArray<u32, 1024, A4K> = DmaArray::new();
+static ACQ: DmaArray<u32, 1024, A4K> = DmaArray::new();
+static IOSQ: DmaArray<u32, 1024, A4K> = DmaArray::new();
+static IOCQ: DmaArray<u32, 1024, A4K> = DmaArray::new();
+static IDENT: DmaArray<u8, 4096, A4K> = DmaArray::new();
+static PRP_LIST: DmaArray<u64, 512, A4K> = DmaArray::new();
+static BOUNCE: DmaArray<u8, BOUNCE_LEN, A4K> = DmaArray::new();
 
-static mut ASQ_MEM: Page<4096> = Page([0; 4096]);
-static mut ACQ_MEM: Page<4096> = Page([0; 4096]);
-static mut IOSQ_MEM: Page<4096> = Page([0; 4096]);
-static mut IOCQ_MEM: Page<4096> = Page([0; 4096]);
-static mut IDENT_MEM: Page<4096> = Page([0; 4096]);
-static mut PRP_LIST_MEM: Page<4096> = Page([0; 4096]);
-static mut BOUNCE_MEM: Page<BOUNCE_LEN> = Page([0; BOUNCE_LEN]);
-
-/// Which DMA static an accessor refers to.
-#[derive(Clone, Copy)]
-enum Buf {
-    Asq,
-    Acq,
-    Iosq,
-    Iocq,
-    Ident,
-    PrpList,
-    Bounce,
+/// The bus address of a DMA static, from its [`DmaArray::addr`].
+fn phys(addr: usize) -> u64 {
+    virt_to_phys(addr) as u64
 }
 
-fn buf_ptr(b: Buf) -> (*mut u8, usize) {
-    match b {
-        Buf::Asq => ((&raw mut ASQ_MEM).cast(), 4096),
-        Buf::Acq => ((&raw mut ACQ_MEM).cast(), 4096),
-        Buf::Iosq => ((&raw mut IOSQ_MEM).cast(), 4096),
-        Buf::Iocq => ((&raw mut IOCQ_MEM).cast(), 4096),
-        Buf::Ident => ((&raw mut IDENT_MEM).cast(), 4096),
-        Buf::PrpList => ((&raw mut PRP_LIST_MEM).cast(), 4096),
-        Buf::Bounce => ((&raw mut BOUNCE_MEM).cast(), BOUNCE_LEN),
-    }
+fn r32(bar: MmioWindow, off: usize) -> u32 {
+    bar.read::<u32>(off)
 }
 
-fn buf_phys(b: Buf) -> u64 {
-    virt_to_phys(buf_ptr(b).0 as usize) as u64
-}
-
-/// The buffer as a byte slice, for the CPU's side of a transfer.
-fn buf_mut(b: Buf) -> &'static mut [u8] {
-    let (p, len) = buf_ptr(b);
-    // SAFETY: a `.bss` static of exactly `len` bytes. Reached only under the
-    // `NVME` lock with no command in flight on it (the module's DMA contract),
-    // so neither the controller nor another caller is touching it.
-    unsafe { core::slice::from_raw_parts_mut(p, len) }
-}
-
-/// The PRP list page, as the controller reads it.
-// `Page` is `align(4096)`: the cast cannot misalign.
-#[allow(clippy::cast_ptr_alignment)]
-fn prp_list() -> &'static mut [u64] {
-    let (p, _) = buf_ptr(Buf::PrpList);
-    // SAFETY: as `buf_mut`; 4096 bytes, page-aligned, so 512 aligned u64s.
-    unsafe { core::slice::from_raw_parts_mut(p.cast::<u64>(), 512) }
-}
-
-fn r32(bar: usize, off: usize) -> u32 {
-    // SAFETY: `bar` is the mapped NVMe BAR0; `off` is a controller register or
-    // doorbell offset inside it (doorbells for queues 0 and 1 only).
-    unsafe { MmioReg::<u32>::new(bar + off).read() }
-}
-
-fn w32(bar: usize, off: usize, v: u32) {
-    // SAFETY: as `r32`.
-    unsafe { MmioReg::<u32>::new(bar + off).write(v) }
+fn w32(bar: MmioWindow, off: usize, v: u32) {
+    bar.write::<u32>(off, v);
 }
 
 /// A 64-bit register as two dword writes, low first — what the spec permits
 /// and what every controller accepts, where a single 64-bit store is not
 /// guaranteed to be.
-fn w64(bar: usize, off: usize, v: u64) {
+fn w64(bar: MmioWindow, off: usize, v: u64) {
     w32(bar, off, v as u32);
     w32(bar, off + 4, (v >> 32) as u32);
 }
 
 struct Nvme {
-    bar: usize,
+    bar: MmioWindow,
     cap: Cap,
     pci: akuma_pci::Address,
     asq: SqTail,
@@ -196,31 +153,25 @@ impl Nvme {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         e[0] = (e[0] & 0xffff) | (u32::from(cid) << 16);
-        let (sq_buf, cq_buf, qid) = if admin {
-            (Buf::Asq, Buf::Acq, ADMIN_QID)
-        } else {
-            (Buf::Iosq, Buf::Iocq, IO_QID)
-        };
+        let (sq_buf, cq_buf, qid) = if admin { (&ASQ, &ACQ, ADMIN_QID) } else { (&IOSQ, &IOCQ, IO_QID) };
         let (mut sq, mut cq) = if admin { (self.asq, self.acq) } else { (self.iosq, self.iocq) };
 
-        let base = buf_ptr(sq_buf).0.cast::<u32>();
+        // Slot < QUEUE_ENTRIES, 16 dwords per entry, inside the 4096-byte queue
+        // page; the controller does not read a slot past the tail, and the tail
+        // moves only below.
         for (i, d) in e.iter().enumerate() {
-            // SAFETY: slot < QUEUE_ENTRIES, 16 dwords per entry, inside the
-            // 4096-byte queue page; the controller does not read a slot past
-            // the tail, and the tail moves only below.
-            unsafe { base.add(usize::from(sq.slot()) * 16 + i).write_volatile(*d) };
+            sq_buf.set(usize::from(sq.slot()) * 16 + i, *d);
         }
         compiler_fence(Ordering::SeqCst);
         let tail = sq.advance();
         w32(self.bar, self.cap.sq_tail_doorbell(qid), u32::from(tail));
 
-        let cq_base = buf_ptr(cq_buf).0.cast::<u32>();
         let start = tsc();
         let result = loop {
             let mut raw = [0u32; 4];
             for (i, d) in raw.iter_mut().enumerate() {
-                // SAFETY: as above, 4 dwords per 16-byte completion entry.
-                *d = unsafe { cq_base.add(usize::from(cq.slot()) * 4 + i).read_volatile() };
+                // 4 dwords per 16-byte completion entry.
+                *d = cq_buf.get(usize::from(cq.slot()) * 4 + i);
             }
             let c = Cqe::decode(raw);
             if cq.is_new(&c) {
@@ -291,7 +242,7 @@ impl Nvme {
         if lba.checked_add(u64::from(blocks)).is_none_or(|end| end > self.ns_lbas) {
             return Err("NVMe transfer past the end of the namespace");
         }
-        let (prp1, prp2, _) = prp::plan(buf_phys(Buf::Bounce) + bounce_off as u64, len, buf_phys(Buf::PrpList), prp_list())
+        let (prp1, prp2, _) = prp::plan(phys(BOUNCE.addr()) + bounce_off as u64, len, phys(PRP_LIST.addr()), &mut PRP_LIST.view_mut()[..])
             .map_err(|_| "NVMe PRP plan refused")?;
         let what = if write { "write" } else { "read" };
         self.submit(false, cmd::rw(write, 0, NSID, lba, blocks, prp1, prp2), what).map(|_| ())
@@ -313,7 +264,7 @@ fn took(what: &str, since: u64) {
     serial::puts(" ms\n");
 }
 
-fn wait_ready(bar: usize, cap: Cap, want: bool) -> Result<(), &'static str> {
+fn wait_ready(bar: MmioWindow, cap: Cap, want: bool) -> Result<(), &'static str> {
     let start = tsc();
     loop {
         let raw = r32(bar, regs::CSTS);
@@ -353,7 +304,7 @@ pub fn init() -> Result<(), &'static str> {
     let bar = dev.bars[0].ok_or("NVMe BAR0 not decoded")?;
     let (size, _) = pci::probe_bar_size(dev.addr, 0);
     // Registers to 0x40 plus the four doorbells used; 8 KiB covers any stride.
-    let va = pci::map_bar(bar, size.max(0x2000)).ok_or("could not map NVMe BAR0")? as usize;
+    let va = pci::map_bar_window(bar, size.max(0x2000)).ok_or("could not map NVMe BAR0")?;
 
     let cap = Cap::decode(u64::from(r32(va, regs::CAP)) | (u64::from(r32(va, regs::CAP + 4)) << 32));
     serial::puts("  nvme: CAP.TO ");
@@ -383,13 +334,13 @@ pub fn init() -> Result<(), &'static str> {
     wait_ready(va, cap, false)?;
     took("disabled in", t0);
 
-    for b in [Buf::Asq, Buf::Acq, Buf::Iosq, Buf::Iocq] {
-        buf_mut(b).fill(0);
+    for q in [&ASQ, &ACQ, &IOSQ, &IOCQ] {
+        q.view_mut().fill(0);
     }
     w32(va, regs::INTMS, u32::MAX);
     w32(va, regs::AQA, regs::aqa(QUEUE_ENTRIES, QUEUE_ENTRIES));
-    w64(va, regs::ASQ, buf_phys(Buf::Asq));
-    w64(va, regs::ACQ, buf_phys(Buf::Acq));
+    w64(va, regs::ASQ, phys(ASQ.addr()));
+    w64(va, regs::ACQ, phys(ACQ.addr()));
     compiler_fence(Ordering::SeqCst);
     w32(va, regs::CC, regs::cc_enable());
     let t1 = tsc();
@@ -412,8 +363,8 @@ pub fn init() -> Result<(), &'static str> {
         dead: false,
     };
 
-    n.submit(true, cmd::identify(0, cmd::cns::CONTROLLER, 0, buf_phys(Buf::Ident)), "identify controller")?;
-    let ctrl = Controller::parse(buf_mut(Buf::Ident)).ok_or("Identify Controller unreadable")?;
+    n.submit(true, cmd::identify(0, cmd::cns::CONTROLLER, 0, phys(IDENT.addr())), "identify controller")?;
+    let ctrl = Controller::parse(&IDENT.view()[..]).ok_or("Identify Controller unreadable")?;
     serial::puts("  nvme: ");
     serial::puts(identify::text(&ctrl.model));
     serial::puts(" fw ");
@@ -424,8 +375,8 @@ pub fn init() -> Result<(), &'static str> {
     serial::puts(if ctrl.vwc { "yes" } else { "no" });
     serial::puts("\n");
 
-    n.submit(true, cmd::identify(0, cmd::cns::NAMESPACE, NSID, buf_phys(Buf::Ident)), "identify namespace")?;
-    let ns = Namespace::parse(buf_mut(Buf::Ident)).ok_or("namespace 1 inactive or unusable format")?;
+    n.submit(true, cmd::identify(0, cmd::cns::NAMESPACE, NSID, phys(IDENT.addr())), "identify namespace")?;
+    let ns = Namespace::parse(&IDENT.view()[..]).ok_or("namespace 1 inactive or unusable format")?;
     if ns.metadata_bytes != 0 {
         return Err("NVMe namespace format carries metadata");
     }
@@ -441,8 +392,8 @@ pub fn init() -> Result<(), &'static str> {
     serial::put_dec(u64::from(n.max_blocks));
     serial::puts(" blocks per command\n");
 
-    n.submit(true, cmd::create_io_cq(0, IO_QID, QUEUE_ENTRIES, buf_phys(Buf::Iocq)), "create I/O CQ")?;
-    n.submit(true, cmd::create_io_sq(0, IO_QID, QUEUE_ENTRIES, buf_phys(Buf::Iosq), IO_QID), "create I/O SQ")?;
+    n.submit(true, cmd::create_io_cq(0, IO_QID, QUEUE_ENTRIES, phys(IOCQ.addr())), "create I/O CQ")?;
+    n.submit(true, cmd::create_io_sq(0, IO_QID, QUEUE_ENTRIES, phys(IOSQ.addr()), IO_QID), "create I/O SQ")?;
     took("init total", t0);
     *g = Some(n);
     Ok(())
@@ -456,7 +407,7 @@ pub fn open_partition(number: u32) -> Result<(), &'static str> {
     let n = g.as_mut().ok_or("NVMe not initialised")?;
     let bl = n.lba_bytes as usize;
     n.io(false, 1, 1, 0)?;
-    let hdr = Header::parse(&buf_mut(Buf::Bounce)[..bl]).map_err(|_| "no valid primary GPT")?;
+    let hdr = Header::parse(&BOUNCE.view()[..bl]).map_err(|_| "no valid primary GPT")?;
     let blocks = hdr.entry_bytes().div_ceil(bl);
     if blocks * bl > BOUNCE_LEN {
         return Err("GPT entry array larger than the bounce buffer");
@@ -467,7 +418,10 @@ pub fn open_partition(number: u32) -> Result<(), &'static str> {
         n.io(false, hdr.entries_lba + done as u64, step as u32, done * bl)?;
         done += step;
     }
-    let entries = &buf_mut(Buf::Bounce)[..blocks * bl];
+    // The commands that filled the buffer have completed, so a shared view of it
+    // is the CPU's alone.
+    let bounce = BOUNCE.view();
+    let entries = &bounce[..blocks * bl];
     hdr.check_entries(entries).map_err(|_| "GPT entry array CRC mismatch")?;
     let e = hdr.partition(entries, number).ok_or("no such GPT partition")?;
     let w = Window::new(e.first_lba, e.last_lba, n.ns_lbas, n.lba_bytes).ok_or("GPT partition outside the namespace")?;
@@ -504,7 +458,7 @@ pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
         let c = chunk::next(offset, done, buf.len(), n.lba_bytes, n.max_blocks);
         let abs = w.absolute(c.lba, c.blocks).ok_or("read outside the NVMe partition")?;
         n.io(false, abs, c.blocks, 0)?;
-        buf[done..done + c.take].copy_from_slice(&buf_mut(Buf::Bounce)[c.within..c.within + c.take]);
+        buf[done..done + c.take].copy_from_slice(&BOUNCE.view()[c.within..c.within + c.take]);
         done += c.take;
     }
     Ok(())
@@ -529,7 +483,7 @@ pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
         if c.partial(n.lba_bytes) {
             n.io(false, abs, c.blocks, 0)?;
         }
-        buf_mut(Buf::Bounce)[c.within..c.within + c.take].copy_from_slice(&data[done..done + c.take]);
+        BOUNCE.view_mut()[c.within..c.within + c.take].copy_from_slice(&data[done..done + c.take]);
         n.io(true, abs, c.blocks, 0)?;
         done += c.take;
     }

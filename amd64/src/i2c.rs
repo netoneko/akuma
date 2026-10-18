@@ -9,9 +9,9 @@
 //!
 //! # The contract
 //!
-//! `base` is the kernel-virtual address of a 4 KiB window mapped as **device
-//! memory** (`map_mmio`), and every offset passed to `rd`/`wr` is a
-//! `akuma_dwi2c::ic` register inside it.
+//! `regs` is a 4 KiB window mapped as **device memory** (`map_mmio`), and every
+//! offset passed to `rd`/`wr` is a `akuma_dwi2c::ic` register inside it - the
+//! window refuses one that is not.
 //!
 //! # Power
 //!
@@ -21,6 +21,7 @@
 //! down" and not "absent".
 
 use akuma_dwi2c::{BusSpeed, XferError, aoac, data_cmd, ic, intr, status};
+use akuma_primitives::mmio::MmioWindow;
 
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
@@ -29,8 +30,8 @@ use crate::polltime::{spin_us, tsc, ticks_ms};
 const PAGE: u64 = 4096;
 
 /// Map `[pa, pa + len)` as device memory in the device window and return the
-/// kernel-virtual address of `pa`.
-pub fn map_mmio(pa: u64, len: u64) -> Option<*mut u8> {
+/// the `len` bytes at `pa` as a register window.
+pub fn map_mmio(pa: u64, len: u64) -> Option<MmioWindow> {
     let first = pa & !(PAGE - 1);
     let last = (pa + len).div_ceil(PAGE) * PAGE;
     let mut p = first;
@@ -40,7 +41,11 @@ pub fn map_mmio(pa: u64, len: u64) -> Option<*mut u8> {
         }
         p += PAGE;
     }
-    Some((DEVMAP_BASE + pa) as *mut u8)
+    // SAFETY: every page of `[pa, pa + len)` was just mapped `MemAttr::Device`
+    // for the kernel's lifetime. The accesses made through the window are the
+    // widths the callers name: bytes for the AOAC pair, dwords for a
+    // DesignWare block, whose base is 4 KiB-aligned.
+    Some(unsafe { MmioWindow::new((DEVMAP_BASE + pa) as usize, len as usize) })
 }
 
 /// Request D0 for AOAC device `dev` and wait (bounded) for the status field to
@@ -51,17 +56,14 @@ pub fn map_mmio(pa: u64, len: u64) -> Option<*mut u8> {
 /// DSDT's field); the status byte is the next.
 pub fn wake(dev: u32) -> bool {
     let pa = aoac::addr(dev);
-    let Some(va) = map_mmio(pa, 2) else { return false };
-    // SAFETY: `va` and `va + 1` are inside the page `map_mmio` just mapped as
-    // device memory; both are single-byte accesses, the width the DSDT uses.
-    let (ctl, st) = unsafe { (va, va.add(1)) };
-    let rd_ctl = || unsafe { ctl.read_volatile() };
-    let rd_st = || unsafe { st.read_volatile() };
+    let Some(win) = map_mmio(pa, 2) else { return false };
+    // Both are single-byte accesses, the width the DSDT uses.
+    let rd_ctl = || win.read::<u8>(0);
+    let rd_st = || win.read::<u8>(1);
     if aoac::wants_d0(rd_ctl()) && aoac::is_on(rd_st()) {
         return true;
     }
-    // SAFETY: as above.
-    unsafe { ctl.write_volatile(aoac::d0_control(rd_ctl())) };
+    win.write::<u8>(0, aoac::d0_control(rd_ctl()));
     let deadline = tsc().wrapping_add(ticks_ms(200));
     while !aoac::is_on(rd_st()) {
         if tsc().wrapping_sub(deadline) < u64::MAX / 2 {
@@ -74,14 +76,10 @@ pub fn wake(dev: u32) -> bool {
 
 /// One controller.
 pub struct Dw {
-    base: *mut u32,
+    regs: MmioWindow,
     tx_depth: u32,
     rx_depth: u32,
 }
-
-// SAFETY: `base` is a fixed device mapping; callers serialise access with a
-// lock (`crate::touchpad`'s).
-unsafe impl Send for Dw {}
 
 /// What `Dw::init` found, for the bring-up log.
 #[derive(Clone, Copy, Debug)]
@@ -101,23 +99,20 @@ pub struct Probe {
 const FALLBACK_IC_CLK_KHZ: u32 = 150_000;
 
 impl Dw {
-    /// Wrap a mapped window. No access happens until `init`.
-    ///
-    /// # Safety
-    /// `base` must be the start of a mapped, device-memory 4 KiB window of a
-    /// DesignWare I²C block (so 4-byte aligned), valid for the life of the kernel.
-    pub const unsafe fn new(base: *mut u8) -> Self {
-        Self { base: base.cast::<u32>(), tx_depth: 8, rx_depth: 8 }
+    /// Wrap a mapped 4 KiB window of a DesignWare I²C block. No access happens
+    /// until `init`. A register offset outside the window panics instead of
+    /// reading whatever is there.
+    #[must_use]
+    pub const fn new(regs: MmioWindow) -> Self {
+        Self { regs, tx_depth: 8, rx_depth: 8 }
     }
 
     fn rd(&self, off: usize) -> u32 {
-        // SAFETY: the `new` contract — `off` is a register inside the window.
-        unsafe { self.base.add(off / 4).read_volatile() }
+        self.regs.read::<u32>(off)
     }
 
     fn wr(&self, off: usize, v: u32) {
-        // SAFETY: as `rd`.
-        unsafe { self.base.add(off / 4).write_volatile(v) }
+        self.regs.write::<u32>(off, v);
     }
 
     /// Is this a (powered) DesignWare block?

@@ -43,7 +43,9 @@
 //! chipset (`1022:790b`, revision ≥ `0x51`, the test Linux uses for "EFCH"):
 //! the same registers on an older or Intel chipset mean something else.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use akuma_primitives::{OnceCopy, mmio::MmioWindow};
 
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
@@ -78,36 +80,23 @@ const EFCH_MIN_REVISION: u8 = 0x51;
 
 const DEFAULT_TIMEOUT_S: u32 = 60;
 
-/// The watchdog's mapped base once armed; 0 = not armed.
-static WDT_VA: AtomicU64 = AtomicU64::new(0);
+/// The watchdog's register page, once armed.
+static WDT: OnceCopy<MmioWindow> = OnceCopy::new();
+/// Armed and counting. Cleared by [`stop`], which leaves [`WDT`] set: it is a
+/// mapping, not a state.
+static WDT_ARMED: AtomicBool = AtomicBool::new(false);
 /// The timeout armed with, for the `wdttest` message.
 static TIMEOUT_S: AtomicU64 = AtomicU64::new(0);
 
-fn map(pa: u64) -> Option<usize> {
+/// Map the page holding `pa` as device memory and name it as a register window.
+fn map(pa: u64) -> Option<MmioWindow> {
     let va = DEVMAP_BASE + pa;
-    paging::map_page(va as usize, pa, PteProt::KERNEL_RW, MemAttr::Device).then_some(va as usize)
-}
-
-fn r8(va: usize) -> u8 {
-    // SAFETY: `va` is a byte register in the ACPI MMIO page `map` mapped as
-    // device memory; reads have no side effects on these registers.
-    unsafe { (va as *const u8).read_volatile() }
-}
-
-fn w8(va: usize, v: u8) {
-    // SAFETY: as `r8`; only the PM decode/config bytes named above are written.
-    unsafe { (va as *mut u8).write_volatile(v) }
-}
-
-fn r32(va: usize) -> u32 {
-    // SAFETY: `va` is the watchdog's CONTROL or COUNT register, in a page
-    // `map` mapped as device memory.
-    unsafe { (va as *const u32).read_volatile() }
-}
-
-fn w32(va: usize, v: u32) {
-    // SAFETY: as `r32`.
-    unsafe { (va as *mut u32).write_volatile(v) }
+    if !paging::map_page(va as usize, pa, PteProt::KERNEL_RW, MemAttr::Device) {
+        return None;
+    }
+    // SAFETY: the page at `va` was just mapped `MemAttr::Device` for the kernel's
+    // lifetime, and `va` is page-aligned past any access width used here.
+    Some(unsafe { MmioWindow::new(va as usize, 4096) })
 }
 
 /// The timeout `wdt` / `wdt=<s>` asks for, or `None` if the watchdog was not
@@ -137,16 +126,15 @@ pub fn init(cmdline: &str) {
         serial::puts("  wdt:  could not map the FCH registers — not armed\n");
         return;
     };
-    let pm = acpi + PM;
-    if r8(pm + PM_ISACONTROL) & PM_ISACONTROL_MMIOEN == 0 {
+    if acpi.read::<u8>(PM + PM_ISACONTROL) & PM_ISACONTROL_MMIOEN == 0 {
         serial::puts("  wdt:  ACPI MMIO not decoded (ISACONTROL.MMIOEN = 0) — not armed\n");
         return;
     }
-    w8(pm + PM_DECODEEN, r8(pm + PM_DECODEEN) | PM_DECODEEN_WDT_TMREN);
-    let d3 = r8(pm + PM_DECODEEN3);
-    w8(pm + PM_DECODEEN3, (d3 & !PM_DECODEEN3_WATCHDOG_DISABLE) | PM_DECODEEN3_RES_1S);
+    acpi.write::<u8>(PM + PM_DECODEEN, acpi.read::<u8>(PM + PM_DECODEEN) | PM_DECODEEN_WDT_TMREN);
+    let d3 = acpi.read::<u8>(PM + PM_DECODEEN3);
+    acpi.write::<u8>(PM + PM_DECODEEN3, (d3 & !PM_DECODEEN3_WATCHDOG_DISABLE) | PM_DECODEEN3_RES_1S);
 
-    let ctl = r32(wdt + WDT_CONTROL);
+    let ctl = wdt.read::<u32>(WDT_CONTROL);
     if ctl == u32::MAX {
         serial::puts("  wdt:  watchdog MMIO reads all-ones — not armed\n");
         return;
@@ -160,17 +148,18 @@ pub fn init(cmdline: &str) {
     }
     // Stopped, action = reset, FIRED cleared (write-1-to-clear).
     let base = (ctl & !(CTL_RUN | CTL_ACTION_POWEROFF | CTL_TRIGGER)) | CTL_FIRED;
-    w32(wdt + WDT_CONTROL, base);
-    w32(wdt + WDT_COUNT, timeout);
+    wdt.write::<u32>(WDT_CONTROL, base);
+    wdt.write::<u32>(WDT_COUNT, timeout);
     let base = base & !CTL_FIRED;
-    w32(wdt + WDT_CONTROL, base | CTL_RUN);
-    w32(wdt + WDT_CONTROL, base | CTL_RUN | CTL_TRIGGER);
+    wdt.write::<u32>(WDT_CONTROL, base | CTL_RUN);
+    wdt.write::<u32>(WDT_CONTROL, base | CTL_RUN | CTL_TRIGGER);
     TIMEOUT_S.store(u64::from(timeout), Ordering::Relaxed);
-    WDT_VA.store(wdt as u64, Ordering::Release);
+    WDT.set(wdt);
+    WDT_ARMED.store(true, Ordering::Release);
     serial::puts("  wdt:  AMD FCH watchdog armed, ");
     serial::put_dec(u64::from(timeout));
     serial::puts(" s, reset on expiry; CONTROL=0x");
-    serial::put_hex(u64::from(r32(wdt + WDT_CONTROL)));
+    serial::put_hex(u64::from(wdt.read::<u32>(WDT_CONTROL)));
     serial::puts("\n");
 }
 
@@ -198,28 +187,26 @@ const fn pet_due(last_bucket: u64, tick: u64) -> bool {
 /// after it credits a long sleep); cheap enough to call every tick — it
 /// touches the hardware at most once per second.
 pub fn pet(tick: u64) {
-    let va = WDT_VA.load(Ordering::Relaxed);
-    if va == 0 {
+    if !WDT_ARMED.load(Ordering::Relaxed) {
         return;
     }
+    let Some(wdt) = WDT.get() else { return };
     let bucket = tick / TICKS_PER_PET;
     if !pet_due(LAST_PET_BUCKET.load(Ordering::Relaxed), tick) {
         return;
     }
     LAST_PET_BUCKET.store(bucket, Ordering::Relaxed);
-    let va = va as usize;
-    w32(va + WDT_CONTROL, r32(va + WDT_CONTROL) | CTL_TRIGGER);
+    wdt.write::<u32>(WDT_CONTROL, wdt.read::<u32>(WDT_CONTROL) | CTL_TRIGGER);
 }
 
 /// Stop the countdown — before an orderly reset, so the watchdog cannot fire
 /// during the firmware's POST or the next OS's boot.
 pub fn stop() {
-    let va = WDT_VA.swap(0, Ordering::AcqRel);
-    if va == 0 {
+    if !WDT_ARMED.swap(false, Ordering::AcqRel) {
         return;
     }
-    let va = va as usize;
-    w32(va + WDT_CONTROL, r32(va + WDT_CONTROL) & !CTL_RUN);
+    let Some(wdt) = WDT.get() else { return };
+    wdt.write::<u32>(WDT_CONTROL, wdt.read::<u32>(WDT_CONTROL) & !CTL_RUN);
 }
 
 /// `wdttest`: wedge this core with interrupts off, which stops [`pet`], so the
@@ -229,15 +216,15 @@ pub fn stop() {
 /// failed would leave it hung until someone power-cycles it, which is the
 /// very thing this module exists to prevent. Returns, and the boot goes on.
 pub fn wedge_for_test() {
-    if WDT_VA.load(Ordering::Acquire) == 0 {
+    if !WDT_ARMED.load(Ordering::Acquire) {
         serial::puts("  wdt:  wdttest refused — the watchdog is not armed; booting normally\n");
         return;
     }
     serial::puts("  wdt:  wdttest — wedging with interrupts off; expect a reset in ");
     serial::put_dec(TIMEOUT_S.load(Ordering::Relaxed));
     serial::puts(" s\n");
-    // SAFETY: `cli` only masks interrupts on this core; that is the point.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    // Masking interrupts on this core is the point.
+    akuma_cpu::daif::mask_irq();
     loop {
         core::hint::spin_loop();
     }

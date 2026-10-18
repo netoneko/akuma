@@ -290,11 +290,9 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
         fail("controller would not power up (AOAC)");
         return None;
     }
-    let base = i2c::map_mmio(mmio, 0x1000)?;
-    // SAFETY: `map_mmio` mapped the 4 KiB window at `mmio` as device memory
-    // for the life of the kernel; it is a DesignWare block (checked by
-    // `init`'s COMP_TYPE test before anything is written).
-    let mut dw = unsafe { Dw::new(base) };
+    // A DesignWare block is checked by `init`'s COMP_TYPE test before anything
+    // is written.
+    let mut dw = Dw::new(i2c::map_mmio(mmio, 0x1000)?);
     let Some(probe) = dw.init(addr, BusSpeed::Fast) else {
         fail("not a DesignWare controller (COMP_TYPE)");
         return None;

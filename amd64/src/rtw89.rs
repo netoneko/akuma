@@ -47,10 +47,12 @@
 //! (`docs/archive/AKUMA_AMD64_XHCI_WEDGED_BOX.md`). Linux on the next boot
 //! powers the card on from scratch either way.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use akuma_primitives::addr::virt_to_phys;
-use akuma_primitives::mmio::MmioReg;
+use akuma_dma::{DmaArray, align::A4K};
+use akuma_primitives::mmio::MmioWindow;
+use akuma_primitives::OnceCopy;
 use akuma_rtw89::bringup::{self, Ch12, Dma, RING_BYTES, SLOT};
 use akuma_rtw89::fw::Source;
 use akuma_rtw89::{Bus, h2c, rx, script, tx};
@@ -85,55 +87,45 @@ const RX_BUF_BYTES: usize = 12 * 1024;
 /// Bytes per RPQ (release report) buffer: reports are 8-byte records.
 const RPQ_BUF_BYTES: usize = 4096;
 
-#[repr(C, align(4096))]
-struct Page<const N: usize>([u8; N]);
-
-static mut RING_MEM: Page<4096> = Page([0; 4096]);
-static mut IDLE_MEM: Page<4096> = Page([0; 4096]);
-static mut RXQ_MEM: Page<4096> = Page([0; 4096]);
-static mut RPQ_MEM: Page<4096> = Page([0; 4096]);
-static mut SLOT_MEM: Page<{ SLOT * SLOTS }> = Page([0; SLOT * SLOTS]);
-static mut RXQ_BUF_MEM: Page<{ RX_BUF_BYTES * RX_ENTRIES }> = Page([0; RX_BUF_BYTES * RX_ENTRIES]);
-static mut RPQ_BUF_MEM: Page<{ RPQ_BUF_BYTES * RX_ENTRIES }> = Page([0; RPQ_BUF_BYTES * RX_ENTRIES]);
+// Each is page-aligned, as the chip needs. `RING`, `SLOT` and `TX` are handed to
+// the card for good (`DmaArray::leak_mut`); the RX rings are stocked once and
+// the RX buffers are read an entry at a time (`DmaArray::read_range`).
+static RING_MEM: DmaArray<u8, 4096, A4K> = DmaArray::new();
+static IDLE_MEM: DmaArray<u8, 4096, A4K> = DmaArray::new();
+static RXQ_MEM: DmaArray<u8, 4096, A4K> = DmaArray::new();
+static RPQ_MEM: DmaArray<u8, 4096, A4K> = DmaArray::new();
+static SLOT_MEM: DmaArray<u8, { SLOT * SLOTS }, A4K> = DmaArray::new();
+static RXQ_BUF_MEM: DmaArray<u8, { RX_BUF_BYTES * RX_ENTRIES }, A4K> = DmaArray::new();
+static RPQ_BUF_MEM: DmaArray<u8, { RPQ_BUF_BYTES * RX_ENTRIES }, A4K> = DmaArray::new();
 /// The TX channels the join transmits on (ACH0, ACH3, CH8), back to back:
 /// each `tx::CHAN_BYTES` of TXBD ring, WD pages and frame buffers.
-static mut TX_MEM: Page<{ 3 * tx::CHAN_BYTES }> = Page([0; 3 * tx::CHAN_BYTES]);
+static TX_MEM: DmaArray<u8, { 3 * tx::CHAN_BYTES }, A4K> = DmaArray::new();
 
 const _: () = assert!(RING_BYTES <= 4096);
 const _: () = assert!(h2c::RX_BUF_SIZE as usize <= RX_BUF_BYTES);
 
 /// BAR2, mapped. Every offset the crate hands in is a register inside the
 /// 1 MiB BAR (the largest is `INDIR_ACCESS_ENTRY`, `0x40000`).
-pub struct Regs(usize);
-
-impl Regs {
-    fn at<T: Copy>(&self, off: u32) -> MmioReg<T> {
-        // SAFETY: `self.0` is the device-mapped BAR2 of the RTL8852CE (mapped by
-        // `init` for the BAR's full probed size), and `off` is one of the
-        // register offsets `akuma_rtw89::regs` names, all inside it and
-        // naturally aligned for their width.
-        unsafe { MmioReg::<T>::new(self.0 + off as usize) }
-    }
-}
+pub struct Regs(MmioWindow);
 
 impl Bus for Regs {
     fn read8(&mut self, off: u32) -> u8 {
-        self.at::<u8>(off).read()
+        self.0.read::<u8>(off as usize)
     }
     fn read16(&mut self, off: u32) -> u16 {
-        self.at::<u16>(off).read()
+        self.0.read::<u16>(off as usize)
     }
     fn read32(&mut self, off: u32) -> u32 {
-        self.at::<u32>(off).read()
+        self.0.read::<u32>(off as usize)
     }
     fn write8(&mut self, off: u32, v: u8) {
-        self.at::<u8>(off).write(v);
+        self.0.write::<u8>(off as usize, v);
     }
     fn write16(&mut self, off: u32, v: u16) {
-        self.at::<u16>(off).write(v);
+        self.0.write::<u16>(off as usize, v);
     }
     fn write32(&mut self, off: u32, v: u32) {
-        self.at::<u32>(off).write(v);
+        self.0.write::<u32>(off as usize, v);
     }
     fn delay_us(&mut self, us: u32) {
         spin_us(u64::from(us));
@@ -233,7 +225,7 @@ pub fn init(cmdline: &str) {
         return;
     };
     let (size, _) = pci::probe_bar_size(dev.addr, REG_BAR as u8);
-    let Some(va) = pci::map_bar(bar, size.max(0x10_0000)) else {
+    let Some(win) = pci::map_bar_window(bar, size.max(0x10_0000)) else {
         say("could not map BAR2");
         return;
     };
@@ -245,7 +237,7 @@ pub fn init(cmdline: &str) {
         None => say("no bridge found above the card"),
     }
     pci::enable_full(dev.addr, true, true);
-    let mut regs = Regs(va as usize);
+    let mut regs = Regs(win);
     // What the card arrived in, before a single write.
     say_hex("arrived: IC_PWR_STATE", u64::from(regs.read32(akuma_rtw89::regs::IC_PWR_STATE)));
     say_hex("arrived: WCPU_FW_CTRL", u64::from(regs.read32(akuma_rtw89::regs::WCPU_FW_CTRL)));
@@ -279,7 +271,8 @@ pub fn init(cmdline: &str) {
             if keep {
                 // From here the card belongs to the station; the reset path
                 // shuts it down.
-                LIVE_BAR.store(regs.0, Ordering::Release);
+                LIVE_BAR.set(regs.0);
+                LIVE_KEPT.store(true, Ordering::Release);
                 LIVE_PCI.store(pack(dev.addr), Ordering::Release);
                 let card = Card::new(regs, dma, ch12, file);
                 crate::rtw89_sta::adopt(card, has("wifibackoff"));
@@ -310,41 +303,33 @@ pub fn init(cmdline: &str) {
 /// buffer.
 ///
 /// Called once, by [`init`] — the DMA contract: boot CPU, before `init`, the
-/// only code that names these statics — so the `&'static mut` views it makes
-/// are never aliased. A kept card ([`Card`]) carries them from then on.
+/// only code that names these statics. `RING_MEM` and `SLOT_MEM` are handed to
+/// the card for good, so a second call panics (`DmaArray::leak_mut`) instead of
+/// aliasing the first call's slices. A kept card ([`Card`]) carries them from
+/// then on.
 fn dma_statics() -> Dma<'static> {
-    // SAFETY: the DMA contract above — boot CPU only, once, before `init`;
-    // nothing else names these statics.
-    let (ring, slots) = unsafe {
-        (
-            core::slice::from_raw_parts_mut((&raw mut RING_MEM).cast::<u8>(), 4096),
-            core::slice::from_raw_parts_mut((&raw mut SLOT_MEM).cast::<u8>(), SLOT * SLOTS),
-        )
-    };
-    let phys = |p: *const u8| virt_to_phys(p as usize) as u64;
+    let (ring, slots) = (RING_MEM.leak_mut(), SLOT_MEM.leak_mut());
+    let phys = |addr: usize| virt_to_phys(addr) as u64;
     // Stock both RX rings: every entry its own buffer.
-    let rxq_phys = phys((&raw const RXQ_BUF_MEM).cast());
-    let rpq_phys = phys((&raw const RPQ_BUF_MEM).cast());
-    for (ring_mem, base, stride) in [
-        ((&raw mut RXQ_MEM), rxq_phys, RX_BUF_BYTES),
-        ((&raw mut RPQ_MEM), rpq_phys, RPQ_BUF_BYTES),
-    ] {
-        // SAFETY: as for `RING_MEM` above.
-        let ring_bytes = unsafe { core::slice::from_raw_parts_mut(ring_mem.cast::<u8>(), RING_BYTES) };
+    let rxq_phys = phys(RXQ_BUF_MEM.addr());
+    let rpq_phys = phys(RPQ_BUF_MEM.addr());
+    for (ring_mem, base, stride) in [(&RXQ_MEM, rxq_phys, RX_BUF_BYTES), (&RPQ_MEM, rpq_phys, RPQ_BUF_BYTES)] {
+        let mut ring_view = ring_mem.view_mut();
+        let ring_bytes = &mut ring_view[..RING_BYTES];
         let size = if stride == RX_BUF_BYTES { h2c::RX_BUF_SIZE } else { RPQ_BUF_BYTES as u16 };
         for (i, entry) in ring_bytes.as_chunks_mut::<{ h2c::BD_LEN }>().0.iter_mut().enumerate() {
             entry.copy_from_slice(&h2c::rx_bd(base + (i * stride) as u64, size));
         }
     }
     Dma {
-        ring_phys: phys(ring.as_ptr()),
-        slots_phys: phys(slots.as_ptr()),
+        ring_phys: phys(RING_MEM.addr()),
+        slots_phys: phys(SLOT_MEM.addr()),
         ring,
         slots,
-        idle_phys: phys((&raw const IDLE_MEM).cast()),
-        rx_phys: [phys((&raw const RXQ_MEM).cast()), phys((&raw const RPQ_MEM).cast())],
+        idle_phys: phys(IDLE_MEM.addr()),
+        rx_phys: [phys(RXQ_MEM.addr()), phys(RPQ_MEM.addr())],
         tx_phys: {
-            let tx_base = phys((&raw const TX_MEM).cast());
+            let tx_base = phys(TX_MEM.addr());
             // The address-info format carries the frame's bus address in 32
             // low bits and 4 high ones; this driver only handles the low 32.
             [0, 1, 2].map(|k| {
@@ -357,8 +342,9 @@ fn dma_statics() -> Dma<'static> {
 }
 
 /// Where a kept card's registers are, for [`shutdown_for_reset`]: the mapped
-/// BAR (0 = no card kept) and its PCI address (`bus << 16 | dev << 8 | fn`).
-static LIVE_BAR: AtomicUsize = AtomicUsize::new(0);
+/// BAR window (`LIVE_KEPT` clear = no card kept) and its PCI address (`bus << 16 | dev << 8 | fn`).
+static LIVE_BAR: OnceCopy<MmioWindow> = OnceCopy::new();
+static LIVE_KEPT: AtomicBool = AtomicBool::new(false);
 static LIVE_PCI: AtomicU32 = AtomicU32::new(0);
 
 fn pack(a: akuma_pci::Address) -> u32 {
@@ -374,10 +360,10 @@ fn pack(a: akuma_pci::Address) -> u32 {
 /// is told to stop first ([`crate::rtw89_sta::stop`]); whatever it still does
 /// after that is to a card with bus mastering off.
 pub fn shutdown_for_reset() {
-    let bar = LIVE_BAR.swap(0, Ordering::AcqRel);
-    if bar == 0 {
+    if !LIVE_KEPT.swap(false, Ordering::AcqRel) {
         return;
     }
+    let Some(bar) = LIVE_BAR.get() else { return };
     crate::rtw89_sta::stop();
     let p = LIVE_PCI.load(Ordering::Acquire);
     let addr = akuma_pci::Address { bus: (p >> 16) as u8, device: (p >> 8) as u8, function: p as u8 };
@@ -434,10 +420,10 @@ pub const TX_MGMT: usize = 2;
 
 impl Card {
     fn new(regs: Regs, dma: Dma<'static>, ch12: Ch12, file: File) -> Self {
-        // SAFETY: the DMA contract — `TX_MEM` is named by nothing but this
-        // view from here on (the boot code only took its bus address), and the
-        // three chunks are disjoint.
-        let all = unsafe { core::slice::from_raw_parts_mut((&raw mut TX_MEM).cast::<u8>(), 3 * tx::CHAN_BYTES) };
+        // `TX_MEM` is named by nothing but this slice from here on (the boot code
+        // only took its bus address), and the three chunks are disjoint. A second
+        // card would panic here rather than alias the first.
+        let all = TX_MEM.leak_mut();
         let (a, rest) = all.split_at_mut(tx::CHAN_BYTES);
         let (b, c) = rest.split_at_mut(tx::CHAN_BYTES);
         Self {
@@ -498,14 +484,11 @@ impl Card {
         let n = self.rxq.ready(&mut self.regs);
         for _ in 0..n {
             let at = usize::from(self.rxq.wp) * RX_BUF_BYTES;
-            // SAFETY: the DMA contract — entry `wp` is one the chip has
-            // finished with (it is behind the chip's index) and will not touch
-            // again until `release`; nothing but this card names this static.
-            let buf = unsafe {
-                core::slice::from_raw_parts((&raw const RXQ_BUF_MEM).cast::<u8>().add(at), RX_BUF_BYTES)
-            };
+            // Entry `wp` is one the chip has finished with (it is behind the
+            // chip's index) and will not touch again until `release`; the view
+            // covers that entry only, not the entries the chip is filling.
             core::sync::atomic::fence(Ordering::Acquire);
-            match rx::parse(buf) {
+            RXQ_BUF_MEM.read_range(at, RX_BUF_BYTES, |buf| match rx::parse(buf) {
                 Ok(p) => {
                     self.rx_types[usize::from(p.desc.pkt_type & 0xf)] += 1;
                     if p.desc.pkt_type == rx::kind::WIFI && p.desc.crc32_err {
@@ -514,7 +497,7 @@ impl Card {
                     f(&p);
                 }
                 Err(_) => self.rx_bad += 1,
-            }
+            });
             self.rxq.advance(1);
         }
         if n > 0 {
@@ -523,12 +506,13 @@ impl Card {
         let r = self.rpq.ready(&mut self.regs);
         for _ in 0..r {
             let at = usize::from(self.rpq.wp) * RPQ_BUF_BYTES;
-            // SAFETY: as for the RXQ buffer above, on the release-report ring.
-            let buf = unsafe { core::slice::from_raw_parts((&raw const RPQ_BUF_MEM).cast::<u8>().add(at), 32) };
+            // As for the RXQ buffer above, on the release-report ring.
             core::sync::atomic::fence(Ordering::Acquire);
-            self.rpq_last.copy_from_slice(buf);
+            let rpp = RPQ_BUF_MEM.read_range(at, 32, |buf| {
+                self.rpq_last.copy_from_slice(buf);
+                u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]])
+            });
             self.rpq_seen += 1;
-            let rpp = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
             self.rpq_status[((rpp >> 13) & 7) as usize] += 1;
             self.rpq.advance(1);
         }
@@ -690,14 +674,11 @@ fn start_and_listen(regs: &mut Regs, dma: &mut Dma<'_>, ch12: &mut Ch12) {
         let n = rxq.ready(regs);
         for _ in 0..n {
             let at = usize::from(rxq.wp) * RX_BUF_BYTES;
-            // SAFETY: the DMA contract — entry `wp` is one the chip has
-            // finished with (it is behind the chip's index) and will not
-            // touch again until `release`; nothing else names this static.
-            let buf = unsafe {
-                core::slice::from_raw_parts((&raw const RXQ_BUF_MEM).cast::<u8>().add(at), RX_BUF_BYTES)
-            };
+            // Entry `wp` is one the chip has finished with (it is behind the chip's
+            // index) and will not touch again until `release`; the view covers
+            // that entry only.
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-            match rx::parse(buf) {
+            RXQ_BUF_MEM.read_range(at, RX_BUF_BYTES, |buf| match rx::parse(buf) {
                 Ok(p) => {
                     counts[usize::from(p.desc.pkt_type & 0xf)] += 1;
                     if p.desc.pkt_type == rx::kind::WIFI {
@@ -724,7 +705,7 @@ fn start_and_listen(regs: &mut Regs, dma: &mut Dma<'_>, ch12: &mut Ch12) {
                     }
                 }
                 Err(_) => bad += 1,
-            }
+            });
             rxq.advance(1);
         }
         if n > 0 {
