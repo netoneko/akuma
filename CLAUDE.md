@@ -30,6 +30,18 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   write `from_raw_parts_mut((&raw mut BUF).cast(), N)` for a DMA buffer again.** Its
   counterpart for registers is `akuma_primitives::mmio::MmioWindow` (bounds- and
   alignment-checked, one `unsafe` per mapped BAR in `pci::map_bar_window`).
+  `akuma-trap-amd64` + `akuma-idt-amd64` (2026-10-18) are the amd64 **trap entry**: the
+  CPU's exception frame and the saved register file as types, the naked entry stubs
+  that build them, and a `Trap { frame: &mut, regs: &mut }` handed to a safe
+  `fn(&mut Trap)` registered per `Kind`; and the 256-gate table as atomics with `lidt`
+  its only `unsafe`. They replaced `idt.rs`'s five hand-written asm entries and
+  eighteen `&mut *frame` sites (38 -> 4 sites in `idt.rs`). **Add a trap = one
+  `Kind` arm + one `register` line; never `&mut *` a stub's pointer in `amd64/`.**
+  `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
+  safe, `write` unsafe, and `set_fs_base`/`set_user_gs_base` safe behind a canonical
+  check - `arch_prctl(ARCH_SET_FS, non-canonical)` used to `#GP` ring 0. Never add
+  another `unsafe fn wrmsr(u32, u64)`. `akuma_cpu::{tsc,debugreg,park::{wfi_mwait,
+  irq_window}}` cover `rdtsc`, `DR6` and the idle brackets.
   Both are **leaf crates on purpose**: the policy is to isolate `unsafe` in small
   crates whose only job is one stated contract, and shrink the drivers to safe code.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
