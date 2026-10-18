@@ -239,8 +239,7 @@ pub fn cr4_bits() -> (bool, bool) {
 #[inline]
 pub fn clac_if_enabled() {
     if SMAP_ACTIVE.load(Ordering::Relaxed) != 0 {
-        // SAFETY: clears `RFLAGS.AC`; nothing else.
-        unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+        akuma_cpu::smap::clac();
     }
 }
 
@@ -335,11 +334,7 @@ pub fn read_val<T: Copy>(ptr: u64) -> Option<T> {
 /// [`read_val`].
 #[must_use]
 pub fn write_val<T: Copy>(ptr: u64, v: T) -> bool {
-    // SAFETY: `size_of::<T>()` readable bytes of a live local.
-    let bytes = unsafe {
-        core::slice::from_raw_parts((&raw const v).cast::<u8>(), core::mem::size_of::<T>())
-    };
-    write_bytes(ptr, bytes)
+    write_bytes(ptr, akuma_user_access::as_user_bytes(core::slice::from_ref(&v)))
 }
 
 /// Read a NUL-terminated string of at most `max` bytes (excluding the NUL).
@@ -411,8 +406,8 @@ fn write_protect_check(t: &mut Suite) {
         t.check("wp: frame for the read-only page", false);
         return;
     };
-    // SAFETY: a fresh PMM frame, reached through the physmap (supervisor).
-    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(ro_pa as u64), 0xA5, 4096) };
+    // A fresh PMM frame, so nothing else can see it yet.
+    let _ = akuma_mmu::copy_to_phys(ro_pa, &[0xA5; 4096]);
     if paging::map_page(RO_VA as usize, ro_pa as u64, PteProt::USER_RX, MemAttr::WriteBack) {
         let wrote = write_bytes(RO_VA, b"must not land");
         // SAFETY: the same frame, through the physmap.
@@ -433,8 +428,8 @@ fn write_protect_check(t: &mut Suite) {
         t.check("wp: frame for the shared page", false);
         return;
     };
-    // SAFETY: a fresh PMM frame, through the physmap.
-    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(shared_pa as u64), 0x5A, 4096) };
+    // A fresh PMM frame, so nothing else can see it yet.
+    let _ = akuma_mmu::copy_to_phys(shared_pa, &[0x5A; 4096]);
     // A CoW-demoted page: read-only in the hardware *and* marked, which is what
     // `PteProt::USER_RW.cow()` used to produce. The marker is not a permission
     // and so is not part of `PteProt` — it is `map_page_pte`'s fourth argument,
@@ -527,13 +522,12 @@ pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
         t.check("smap: frame for the user page", false);
         return;
     };
-    // SAFETY: a fresh PMM frame, reached through the physmap (supervisor).
-    unsafe {
-        let p = phys_ptr::<u8>(pa as u64);
-        for i in 0..4096 {
-            p.add(i).write_volatile((i as u8) ^ 0x3C);
-        }
+    // A fresh PMM frame, so nothing else can see it yet.
+    let mut pattern = [0u8; 4096];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0x3C;
     }
+    let _ = akuma_mmu::copy_to_phys(pa, &pattern);
     if !paging::map_page(USER_PAGE_VA as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
         akuma_pmm::free_page(pa, 0);
         t.check("smap: map the user page", false);

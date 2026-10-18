@@ -71,9 +71,9 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 118,
+    "amd64/src": 107,
     "crates/akuma-alloc": 24,
-    "crates/akuma-cpu": 64,
+    "crates/akuma-cpu": 65,
     "crates/akuma-dma": 14,
     "crates/akuma-el0-entry": 4,
     "crates/akuma-entry": 2,

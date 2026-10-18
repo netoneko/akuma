@@ -396,6 +396,33 @@ pub mod tsc {
     }
 }
 
+/// x86_64 `RFLAGS.AC` housekeeping for SMAP: `clac`, the half that is safe.
+///
+/// `clac` clears the alignment-check / access-control flag, which can only make
+/// the CPU's checks of ring-0 accesses to user pages *stricter*; it cannot make
+/// an access succeed that would otherwise have faulted. `stac`, which can, is
+/// deliberately absent - it lives inside the user-copy loop's fixup region in
+/// `akuma-user-access`, where a fault between it and its `clac` cannot leak `AC`.
+///
+/// The caller owes one thing: only run it on a CPU with SMAP, where the
+/// instruction exists (on others it is `#UD`). That is a liveness obligation, not
+/// a soundness one, which is why this is a safe function.
+///
+/// Off x86_64 bare metal this does nothing.
+pub mod smap {
+    /// `clac`: clear `RFLAGS.AC`.
+    #[inline(always)]
+    pub fn clac() {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: clears `RFLAGS.AC`; nothing else. Touches no memory, and only
+        // tightens the SMAP check. `preserves_flags` is omitted on purpose: `AC`
+        // is a flag this instruction changes.
+        unsafe {
+            core::arch::asm!("clac", options(nomem, nostack));
+        }
+    }
+}
+
 /// x86_64 debug-status register, the part that is safe to touch.
 ///
 /// `DR6` records why the last `#DB` fired and the hardware **never clears it**, so

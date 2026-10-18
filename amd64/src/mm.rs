@@ -118,7 +118,6 @@
 
 use akuma_mmu::{LeafAction, PteProt};
 
-use crate::phys::phys_ptr;
 use crate::usermode;
 use akuma_mmap::{FileBacking, MmapRegion, PhysFrame, Prot};
 #[cfg(not(feature = "no-tests"))]
@@ -129,6 +128,11 @@ use crate::fd::errno;
 use crate::serial;
 
 const PAGE_SIZE: u64 = 4096;
+
+/// A page of zeros, the source for zeroing a live frame through
+/// `akuma_mmu::copy_to_phys` (which bounds-checks the frame) rather than a raw
+/// `write_bytes`.
+static ZERO_PAGE: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
 
 /// `PROT_WRITE` / `PROT_EXEC`, from the shared flag tables rather than restated
 /// here — the same constants the AArch64 kernel dispatches on.
@@ -1064,13 +1068,11 @@ fn pin_mapping_inode(inode: u32) {
 /// A frame the ledger does not know about is a frame `Process::free` will not
 /// release — the leak that made every post-`fork` `mmap` permanent.
 fn populate_page(va: usize, prot: Prot) -> bool {
-    let Some(frame) = akuma_pmm::alloc_page() else {
+    // Zeroed before mapping: a recycled frame otherwise hands ring 3 whatever the
+    // previous owner left in it. The same rule the ELF loader follows.
+    let Some(frame) = akuma_pmm::alloc_page_zeroed() else {
         return false;
     };
-    // Zero before mapping: a recycled frame otherwise hands ring 3 whatever the
-    // previous owner left in it. The same rule the ELF loader follows.
-    // SAFETY: a fresh PMM frame, reached through the physmap.
-    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(frame as u64), 0, PAGE_SIZE as usize) };
     // A brand-new frame is unshared, so `pte_prot_for`'s CoW rule cannot fire;
     // it is used anyway so there is one answer to "what bits does this region
     // get" rather than two that could drift.
@@ -1290,14 +1292,14 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
     let Some(frame) = akuma_pmm::alloc_page() else {
         return false;
     };
-    // SAFETY: a fresh PMM frame, reached through the physmap, and no other
-    // reference to it exists until it is mapped below.
-    let page = unsafe {
-        core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize)
-    };
-    // Zeroed before the fill, never instead of it.
-    page.fill(0);
-    if crate::fd::file_bytes_at(fd, offset, page).is_none() {
+    // The frame is unpublished until it is mapped below, so the view is the only
+    // accessor for its duration.
+    let read = akuma_mmu::with_phys_bytes_mut(frame, 0, PAGE_SIZE as usize, |page| {
+        // Zeroed before the fill, never instead of it.
+        page.fill(0);
+        crate::fd::file_bytes_at(fd, offset, page).is_some()
+    });
+    if read != Some(true) {
         // Not a regular file. Refuse rather than map the zeros just written.
         akuma_pmm::free_page(frame, 0);
         return false;
@@ -1331,20 +1333,18 @@ fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
 /// frame (no stale contents), PTE edit and ledger entry under the
 /// address-space hold, frame freed on a failed map.
 fn populate_file_page_from(va: usize, prot: Prot, src: &[u8]) -> FilledPage {
-    let Some(frame) = akuma_pmm::alloc_page() else {
+    // Zeroed by the allocator, so the tail past `src` is already right.
+    let Some(frame) = akuma_pmm::alloc_page_zeroed() else {
         return FilledPage::Failed;
     };
-    // SAFETY: a fresh PMM frame, reached through the physmap, and no other
-    // reference to it exists until it is mapped below.
-    let page = unsafe {
-        core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize)
-    };
     // Clamped rather than trusted: the caller slices a chunk buffer, and a page
-    // is the most this frame can hold. A longer `src` is a caller bug, and the
-    // kind that would otherwise write past the frame into the physmap.
+    // is the most this frame can hold. A longer `src` is a caller bug; the
+    // copy is bounds-checked, so it is clamped here instead of refused.
     let n = src.len().min(PAGE_SIZE as usize);
-    page[..n].copy_from_slice(&src[..n]);
-    page[n..].fill(0);
+    if !akuma_mmu::copy_to_phys(frame, &src[..n]) {
+        akuma_pmm::free_page(frame, 0);
+        return FilledPage::Failed;
+    }
     let (pte, cow) = pte_prot_for(prot, frame);
     install_or_release(va, frame, pte, cow)
 }
@@ -1816,19 +1816,21 @@ fn shared_write_page(va: usize, prot: Prot, key: akuma_fpcache_rw::Key) -> bool 
     let Some(frame) = akuma_pmm::alloc_page() else {
         return false;
     };
-    // SAFETY: a fresh PMM frame, reached through the physmap; nothing else can
-    // reach it until it is published below.
-    let bytes = unsafe { core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize) };
     const FILL_ATTEMPTS: usize = 8;
     let mut attempt = 0;
     let outcome = loop {
         attempt += 1;
         let generation = shmpages::fill_begin(key.inode);
-        // Zeroed before every read, never instead of one: zero is the value of
-        // a byte past EOF and of nothing else, and a retry must not keep a
-        // previous attempt's tail.
-        bytes.fill(0);
-        let outcome = crate::fd::file_bytes_by_inode(key.mount_id, key.inode, key.offset, bytes)
+        // Nothing can reach the frame until `publish`, which runs after the view
+        // below has ended. Zeroed before every read, never instead of one: zero
+        // is the value of a byte past EOF and of nothing else, and a retry must
+        // not keep a previous attempt's tail.
+        let read = akuma_mmu::with_phys_bytes_mut(frame, 0, PAGE_SIZE as usize, |bytes| {
+            bytes.fill(0);
+            crate::fd::file_bytes_by_inode(key.mount_id, key.inode, key.offset, bytes)
+        })
+        .flatten();
+        let outcome = read
             .map(|_| shmpages::publish(key, frame, (attempt < FILL_ATTEMPTS).then_some(generation)));
         shmpages::fill_end();
         if !matches!(outcome, Some(Fill::Stale)) {
@@ -1886,17 +1888,21 @@ fn populate_file_page_by_inode(
     let Some(frame) = akuma_pmm::alloc_page() else {
         return FilledPage::Failed;
     };
-    // SAFETY: a fresh PMM frame, reached through the physmap, and no other
-    // reference to it exists until it is mapped below.
-    let page = unsafe {
-        core::slice::from_raw_parts_mut(phys_ptr::<u8>(frame as u64), PAGE_SIZE as usize)
-    };
-    // Zeroed before the fill, never instead of it: zero is the value of a byte
-    // past EOF and of nothing else.
-    page.fill(0);
     let want = from_file.min(PAGE_SIZE as usize);
+    // The frame is unpublished until it is mapped below, so the view is the only
+    // accessor for its duration.
+    let read = akuma_mmu::with_phys_bytes_mut(frame, 0, PAGE_SIZE as usize, |page| {
+        // Zeroed before the fill, never instead of it: zero is the value of a
+        // byte past EOF and of nothing else.
+        page.fill(0);
+        if want == 0 {
+            return Some(0);
+        }
+        crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, &mut page[..want])
+    })
+    .flatten();
     if want > 0 {
-        match crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, &mut page[..want]) {
+        match read {
             None => {
                 akuma_pmm::free_page(frame, 0);
                 return FilledPage::Failed;
@@ -2257,10 +2263,18 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
         });
     }
     let mut failed = 0usize;
+    // A snapshot of each page rather than a borrowed view of it: the frame is
+    // mapped writable into a live address space, so userspace may store into it
+    // while the file write runs. One page on the stack, reused.
+    let mut snapshot = [0u8; PAGE_SIZE as usize];
     for &(ri, off, len, pa) in &jobs {
-        // SAFETY: `pa` came from a present user leaf, reached through the
-        // physmap — the same access `dontneed_range`'s zeroing uses.
-        let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(pa as u64), len) };
+        // `pa` came from a present user leaf, so it is PMM RAM; `copy_from_phys`
+        // checks that rather than trusting it.
+        if !snapshot.get_mut(..len).is_some_and(|b| akuma_mmu::copy_from_phys(pa, b)) {
+            failed += 1;
+            continue;
+        }
+        let bytes = &snapshot[..len];
         let r = &regions[ri];
         let res = if by_path[ri] {
             akuma_vfs_glue::write_at(&r.path, off, bytes)
@@ -2788,29 +2802,22 @@ fn dontneed_range(start: usize, end: usize) {
                 // indistinguishable from Linux's drop-and-refault and costs no
                 // allocation.
                 //
-                // SAFETY: `pa` came from a present user leaf of this address
-                // space, so it is a live 4 KiB frame reachable through the
-                // physmap. Writing through the physmap rather than the user VA
-                // is deliberate — the PTE may be read-only (a `PROT_READ`
-                // region, or a CoW-demoted page whose peer has gone).
+                // `pa` came from a present user leaf of this address space, so
+                // it is a live 4 KiB frame. Writing through the physmap rather
+                // than the user VA is deliberate — the PTE may be read-only (a
+                // `PROT_READ` region, or a CoW-demoted page whose peer has gone).
                 PageAction::ZeroInPlace => {
-                    unsafe {
-                        core::ptr::write_bytes(phys_ptr::<u8>(pa as u64), 0, PAGE_SIZE as usize);
-                    }
+                    let _ = akuma_mmu::copy_to_phys(pa, &ZERO_PAGE);
                     LeafAction::Keep
                 }
                 // Someone else maps this frame. Give this address space a
                 // private zero frame and drop its share.
                 PageAction::BreakSharing => {
-                    let Some(fresh) = akuma_pmm::alloc_page() else {
+                    let Some(fresh) = akuma_pmm::alloc_page_zeroed() else {
                         // Advisory: out of memory means the page keeps its old
                         // contents, which is a worse answer than Linux's and a
                         // far better one than wiping a peer's live page.
                         return LeafAction::Keep;
-                    };
-                    // SAFETY: a fresh PMM frame, reached through the physmap.
-                    unsafe {
-                        core::ptr::write_bytes(phys_ptr::<u8>(fresh as u64), 0, PAGE_SIZE as usize);
                     };
                     // The old frame loses this VA. Ledger first, then the
                     // global share count, then the free — the same order
@@ -2845,12 +2852,14 @@ fn dontneed_range(start: usize, end: usize) {
                 .map_or(0, |m| m.size as usize);
             if f.off < size {
                 let len = if size - f.off > PAGE_SIZE as usize { PAGE_SIZE as usize } else { size - f.off };
-                // SAFETY: `pa` was a present user leaf when collected, and is
-                // still a live frame: either it is still mapped (`Keep`), or
-                // its release is deferred to the match below. Physmap-read
-                // exactly as the zeroing arm above reads it.
-                let bytes = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(f.pa as u64), len) };
-                let _ = akuma_vfs_glue::write_at(&f.path, f.off, bytes);
+                // `pa` was a present user leaf when collected, and is still a
+                // live frame: either it is still mapped (`Keep`), or its release
+                // is deferred to the match below. Copied out, not viewed — the
+                // page may be mapped writable elsewhere.
+                let mut snapshot = [0u8; PAGE_SIZE as usize];
+                if snapshot.get_mut(..len).is_some_and(|b| akuma_mmu::copy_from_phys(f.pa, b)) {
+                    let _ = akuma_vfs_glue::write_at(&f.path, f.off, &snapshot[..len]);
+                }
             }
         }
         match f.release {
