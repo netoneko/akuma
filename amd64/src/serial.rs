@@ -13,26 +13,12 @@
 //! `safe_print!`: the console is what survives when everything else is broken,
 //! so it may not depend on anything that can fail.
 
-/// COM1. Fixed by the PC architecture since the IBM PC; not discovered.
-const COM1: u16 = 0x3F8;
-
-const DATA: u16 = 0;
-const INT_ENABLE: u16 = 1;
-const FIFO_CTRL: u16 = 2;
-const LINE_CTRL: u16 = 3;
-const MODEM_CTRL: u16 = 4;
-const LINE_STATUS: u16 = 5;
-
-/// Scratch register: a byte the chip stores and hands back, and does nothing
-/// else with. The probe register, for exactly that reason.
-const SCRATCH: u16 = 7;
-
 /// Line status bit 5: transmit holding register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
 /// Data Ready — a byte is waiting in the receive buffer.
 const LSR_DATA_READY: u8 = 1 << 0;
 
-use crate::port::{inb, outb};
+use akuma_port::{COM1, UartReg};
 use akuma_dmesg::Ring;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
@@ -239,29 +225,26 @@ pub fn init() {
     // for both — and a value of 0xFF from a real chip for the *first* pattern
     // would be caught by the second. Only a chip that answers gets configured
     // or read from.
-    // SAFETY: the scratch register is a plain storage byte with no side effect
-    // on a 16550, and an absent port ignores writes.
-    let present = unsafe {
-        outb(COM1 + SCRATCH, 0x5A);
-        let a = inb(COM1 + SCRATCH);
-        outb(COM1 + SCRATCH, 0xA5);
-        let b = inb(COM1 + SCRATCH);
+    // The scratch register is a plain storage byte with no side effect on a
+    // 16550, and an absent port ignores writes.
+    let present = {
+        COM1.write(UartReg::Scratch, 0x5A);
+        let a = COM1.read(UartReg::Scratch);
+        COM1.write(UartReg::Scratch, 0xA5);
+        let b = COM1.read(UartReg::Scratch);
         a == 0x5A && b == 0xA5
     };
     PRESENT.store(present, Ordering::Release);
     if !present {
         return;
     }
-    // SAFETY: COM1's register block is fixed by the PC architecture.
-    unsafe {
-        outb(COM1 + INT_ENABLE, 0x00); // no interrupts; this driver polls
-        outb(COM1 + LINE_CTRL, 0x80); // DLAB on: the next two ports are the divisor
-        outb(COM1 + DATA, 0x01); // divisor low  = 1  -> 115200 baud
-        outb(COM1 + INT_ENABLE, 0x00); // divisor high = 0
-        outb(COM1 + LINE_CTRL, 0x03); // DLAB off, 8 bits, no parity, 1 stop
-        outb(COM1 + FIFO_CTRL, 0xC7); // FIFO on, cleared, 14-byte trigger
-        outb(COM1 + MODEM_CTRL, 0x0B); // DTR + RTS + OUT2
-    }
+    COM1.write(UartReg::IntEnable, 0x00); // no interrupts; this driver polls
+    COM1.write(UartReg::LineCtrl, 0x80); // DLAB on: the next two ports are the divisor
+    COM1.write(UartReg::Data, 0x01); // divisor low  = 1  -> 115200 baud
+    COM1.write(UartReg::IntEnable, 0x00); // divisor high = 0
+    COM1.write(UartReg::LineCtrl, 0x03); // DLAB off, 8 bits, no parity, 1 stop
+    COM1.write(UartReg::FifoCtrl, 0xC7); // FIFO on, cleared, 14-byte trigger
+    COM1.write(UartReg::ModemCtrl, 0x0B); // DTR + RTS + OUT2
 }
 
 /// Emit one byte, spinning until the transmit holding register drains.
@@ -419,13 +402,10 @@ fn putb_raw_m(byte: u8, mirror: bool) {
     if !PRESENT.load(Ordering::Relaxed) {
         return;
     }
-    // SAFETY: COM1's register block is fixed by the PC architecture.
-    unsafe {
-        while inb(COM1 + LINE_STATUS) & LSR_THR_EMPTY == 0 {
-            core::hint::spin_loop();
-        }
-        outb(COM1 + DATA, byte);
+    while COM1.read(UartReg::LineStatus) & LSR_THR_EMPTY == 0 {
+        core::hint::spin_loop();
     }
+    COM1.write(UartReg::Data, byte);
 }
 
 /// Did [`init`] find a UART? `false` means every read reports no data.
@@ -450,13 +430,10 @@ pub fn getb() -> Option<u8> {
     if !PRESENT.load(Ordering::Relaxed) {
         return None; // no chip: no data, not an endless 0xFF
     }
-    // SAFETY: two reads of the 16550's own port range, which `init` configured.
-    unsafe {
-        if inb(COM1 + LINE_STATUS) & LSR_DATA_READY == 0 {
-            return None;
-        }
-        Some(inb(COM1 + DATA))
+    if COM1.read(UartReg::LineStatus) & LSR_DATA_READY == 0 {
+        return None;
     }
+    Some(COM1.read(UartReg::Data))
 }
 
 /// Is a byte waiting on the receive side? Non-destructive — for `poll(2)` on a
@@ -467,8 +444,7 @@ pub fn has_byte() -> bool {
     if !PRESENT.load(Ordering::Relaxed) {
         return false;
     }
-    // SAFETY: one read of the 16550's line-status port, configured by `init`.
-    unsafe { inb(COM1 + LINE_STATUS) & LSR_DATA_READY != 0 }
+    COM1.read(UartReg::LineStatus) & LSR_DATA_READY != 0
 }
 
 pub fn puts(s: &str) {

@@ -475,9 +475,9 @@ pub fn mirror_byte(byte: u8) {
         BURST_CYCLES.fetch_add(crate::polltime::tsc().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
         BURST_BYTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     } else if FB_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
-        // SAFETY: port 0xE9 is QEMU's `isa-debugcon` and nothing on real PC
-        // hardware; the flag that gets us here is a development one.
-        unsafe { crate::port::outb(0xE9, byte) };
+        // QEMU's `isa-debugcon`, and nothing on real PC hardware; the flag that
+        // gets us here is a development one.
+        akuma_port::DEBUGCON.write_byte(byte);
     }
 }
 

@@ -41,6 +41,7 @@ default-members = [
     "crates/akuma-net",
     "crates/akuma-net-nic",
     "crates/akuma-pci",
+    "crates/akuma-port",
     "crates/akuma-net-unix",
     "crates/akuma-net-yarn",
     "crates/akuma-fbcon",

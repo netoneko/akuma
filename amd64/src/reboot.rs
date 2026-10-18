@@ -25,7 +25,6 @@ use akuma_boot::{Action, decode};
 use akuma_selftest::Suite;
 
 use crate::fd::errno;
-use crate::port;
 use crate::serial;
 
 /// A 10-byte `IDTR` operand describing an empty interrupt descriptor table.
@@ -75,25 +74,17 @@ pub fn perform_reset() -> ! {
     // would reset the firmware's POST or the next OS's boot. Stopped last, so
     // a reset that hangs before this point is still caught by it.
     crate::watchdog::stop();
-    // SAFETY: `0xCF9` is the architectural reset-control port on every PC
-    //   chipset since ICH; these two writes are its documented reset request.
-    unsafe {
-        port::outb(0xCF9, 0x02);
-        port::outb(0xCF9, 0x0E);
-    }
+    akuma_port::RESET_CONTROL.request_hard_reset();
     spin(100_000);
 
     // 2. i8042 pulse. Drain the input buffer first so the command is accepted.
-    // SAFETY: `0x64` is the architectural i8042 command port; `0xFE` is
-    //   "pulse output line 0" (the RESET line).
-    unsafe {
-        for _ in 0..100_000 {
-            if port::inb(0x64) & 0x02 == 0 {
-                break;
-            }
+    // `0xFE` is "pulse output line 0" (the RESET line).
+    for _ in 0..100_000 {
+        if akuma_port::I8042.status() & 0x02 == 0 {
+            break;
         }
-        port::outb(0x64, 0xFE);
     }
+    akuma_port::I8042.write_command(0xFE);
     spin(100_000);
 
     // 3. Triple fault.

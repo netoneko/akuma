@@ -134,8 +134,6 @@ mod power;
 mod pipe;
 mod polltime;
 #[cfg(target_arch = "x86_64")]
-mod port;
-#[cfg(target_arch = "x86_64")]
 mod sched;
 #[cfg(target_arch = "x86_64")]
 mod serial;

@@ -1,6 +1,15 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-10-16 with
+**Grade: A** — two crates added 2026-10-18, headline **not** regenerated:
+**`akuma-dns`** (forbids; the DNS client, `akuma_net::dns::resolve_ipv4`) and
+**`akuma-port`**, which cannot: it is the only crate that executes `in`/`out`, so
+its `unsafe` is four `asm!` blocks in `src/raw.rs` (4 sites, 16 lines) behind the
+crate's one `#[allow(unsafe_code)]` under `#![deny(unsafe_code)]` — every device
+type in the crate is safe. It replaced `amd64/src/port.rs` and the `unsafe` block
+at each of its 22 call sites: tree-wide `unsafe` went 812 -> 789 sites and
+2838 -> 2745 lines (`cloc_akuma.py src crates amd64`; amd64 alone 342 -> 315
+sites). Regenerated 2026-10-16
+ with
 `python3 scripts/cloc_akuma.py src crates`: **66 of 86 crates** forbid
 `unsafe` (80333 of 82093 production lines, 97.9% safe). Added in this run,
 four crates of the touchpad stack

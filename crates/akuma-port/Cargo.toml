@@ -1,0 +1,10 @@
+[package]
+name = "akuma-port"
+version = "0.1.0"
+edition = "2024"
+description = "x86 legacy port I/O as typed devices (COM1, CMOS, 8259, 8254, i8042, PCI config, reset control, debugcon): the only crate that executes in/out, with a fake bus for host tests. no_std, no dependencies"
+
+[lints]
+workspace = true
+
+[dependencies]

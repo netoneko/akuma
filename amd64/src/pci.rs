@@ -19,11 +19,8 @@ use spinning_top::Spinlock;
 
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
-use crate::port::{inl, outl};
+use akuma_port::PCI_CONFIG;
 use crate::serial;
-
-const CONFIG_ADDRESS: u16 = 0xCF8;
-const CONFIG_DATA: u16 = 0xCFC;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -51,23 +48,13 @@ static REGISTRY: Spinlock<Registry> =
 
 /// Read a config-space dword. `offset` is aligned down to 4 bytes.
 fn read_u32(addr: Address, offset: u8) -> u32 {
-    // SAFETY: `0xCF8`/`0xCFC` are the architectural PCI config ports; the write
-    // selects a (bus, device, function, dword) and the read returns it, with no
-    // effect on any device.
-    unsafe {
-        outl(CONFIG_ADDRESS, addr.config_address(offset));
-        inl(CONFIG_DATA)
-    }
+    PCI_CONFIG.read_dword(addr.config_address(offset))
 }
 
 fn write_u32(addr: Address, offset: u8, value: u32) {
-    // SAFETY: as `read_u32`; the caller owns the meaning of writing `value` to
-    // this register (BAR probing disables decode first; `enable` only sets
-    // command bits).
-    unsafe {
-        outl(CONFIG_ADDRESS, addr.config_address(offset));
-        outl(CONFIG_DATA, value);
-    }
+    // The caller owns the meaning of writing `value` to this register (BAR
+    // probing disables decode first; `enable` only sets command bits).
+    PCI_CONFIG.write_dword(addr.config_address(offset), value);
 }
 
 /// Read the first 256 bytes of a function's config space.

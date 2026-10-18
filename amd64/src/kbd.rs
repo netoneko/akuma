@@ -43,10 +43,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::port::{inb, outb};
-
-const DATA: u16 = 0x60;
-const STATUS: u16 = 0x64;
+use akuma_port::I8042;
 
 /// Status bit 0: a byte is waiting in the output buffer.
 const STS_OUTPUT_FULL: u8 = 1 << 0;
@@ -253,9 +250,7 @@ const EXTENDED: &[(u8, &[u8])] = &[
 const Q_CAP: usize = 16;
 
 fn status() -> u8 {
-    // SAFETY: the i8042 status port is fixed by the PC architecture; reading it
-    // has no side effect.
-    unsafe { inb(STATUS) }
+    I8042.status()
 }
 
 /// Wait, bounded, for the controller to accept a command.
@@ -285,13 +280,13 @@ pub fn init() -> bool {
         if status() & STS_OUTPUT_FULL == 0 {
             break;
         }
-        // SAFETY: reading the data port consumes one queued byte.
-        unsafe { inb(DATA) };
+        // Reading the data port consumes one queued byte.
+        let _ = I8042.read_data();
     }
     if wait_input_empty() {
-        // SAFETY: an architectural controller command with no argument; on a
+        // An architectural controller command with no argument; on a
         // controller that already has the port enabled it is a no-op.
-        unsafe { outb(STATUS, CMD_ENABLE_KBD) };
+        I8042.write_command(CMD_ENABLE_KBD);
     }
     PRESENT.store(true, Ordering::Release);
     true
@@ -409,9 +404,9 @@ impl Kbd {
             if st & STS_OUTPUT_FULL == 0 {
                 return None;
             }
-            // SAFETY: the output buffer is full; reading the data port takes
-            // the byte and clears the flag.
-            let sc = unsafe { inb(DATA) };
+            // The output buffer is full; reading the data port takes the byte
+            // and clears the flag.
+            let sc = I8042.read_data();
             if st & STS_FROM_AUX != 0 {
                 continue; // the mouse; not ours
             }

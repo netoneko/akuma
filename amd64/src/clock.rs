@@ -198,24 +198,17 @@ struct Ports;
 
 impl akuma_cmos_rtc::Cmos for Ports {
     fn read(&mut self, reg: u8) -> u8 {
-        // SAFETY: 0x70/0x71 are the CMOS/RTC index and data ports on every
-        // PC; selecting a register below 0x40 and reading it has no side
-        // effect but on the index latch, which nothing else here uses.
-        // Bit 7 of the index (NMI disable) is left clear.
-        unsafe {
-            crate::port::outb(0x70, reg & 0x7f);
-            crate::port::inb(0x71)
-        }
+        // Selecting a register below 0x40 and reading it has no side effect
+        // but on the index latch, which nothing else here uses. `CMOS` keeps
+        // bit 7 of the index (NMI disable) clear.
+        akuma_port::CMOS.read(reg)
     }
     fn write(&mut self, reg: u8, v: u8) {
-        // SAFETY: as `read`. The crate writes only the clock's own registers
-        // (0x00–0x09, 0x32) and the SET bit of status B, under SET, in the
-        // format the chip was found in; nothing here can reach the chip's
-        // alarm, interrupt enables or the NVRAM the firmware keeps past 0x32.
-        unsafe {
-            crate::port::outb(0x70, reg & 0x7f);
-            crate::port::outb(0x71, v);
-        }
+        // The crate writes only the clock's own registers (0x00–0x09, 0x32) and
+        // the SET bit of status B, under SET, in the format the chip was found
+        // in; nothing here can reach the chip's alarm, interrupt enables or the
+        // NVRAM the firmware keeps past 0x32.
+        akuma_port::CMOS.write(reg, v);
     }
 }
 

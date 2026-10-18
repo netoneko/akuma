@@ -41,7 +41,7 @@
 use crate::idt;
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
-use crate::port::outb;
+use akuma_port::{PIC, PIT};
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
@@ -254,12 +254,7 @@ pub fn delay_counts(counts: u32) {
 /// them — the serial console is polled — so they are masked rather than
 /// remapped.
 fn mask_legacy_pics() {
-    // SAFETY: 0x21 and 0xA1 are the architectural 8259 data ports; writing all
-    // ones masks every line, which is the conservative direction.
-    unsafe {
-        outb(0x21, 0xFF);
-        outb(0xA1, 0xFF);
-    }
+    PIC.mask_all();
 }
 
 /// Map the LAPIC, enable it, and start a periodic timer. Interrupts stay masked;
@@ -637,18 +632,15 @@ pub fn calibrate() -> bool {
     /// still a fraction of a second.
     const SPIN_LIMIT: u32 = 50_000_000;
 
-    // SAFETY: fixed legacy I/O ports (the PIT's own command/data ports, not
-    // board glue). Nothing else in this kernel programs channel 0 — the
-    // legacy PICs are masked before `calibrate` runs (`init`'s ordering), so
-    // even if this makes it raise IRQ0 nothing delivers it.
-    unsafe {
-        // Channel 0, lobyte then hibyte, mode 0 (interrupt on terminal
-        // count), binary. Channel 0's gate is hardwired high, so this load
-        // itself starts the countdown — there is no separate arm step.
-        crate::port::outb(PORT_CMD, 0b0011_0000);
-        crate::port::outb(PORT_CH0_DATA, (PIT_COUNT & 0xff) as u8);
-        crate::port::outb(PORT_CH0_DATA, (PIT_COUNT >> 8) as u8);
+    // Nothing else in this kernel programs PIT channel 0 — the legacy PICs are
+    // masked before `calibrate` runs (`init`'s ordering), so even if this makes
+    // it raise IRQ0 nothing delivers it. Mode 0, and the load itself starts the
+    // countdown (`Pit::load_channel0_oneshot`).
+    PIT.load_channel0_oneshot(PIT_COUNT as u16);
 
+    // SAFETY: the LAPIC MMIO window is mapped by `init`, which `calibrate`
+    // follows.
+    unsafe {
         // Arm the LAPIC at full scale, masked — this borrows the timer exactly
         // as `delay_counts` does, and `start_timer` re-arms it afterwards.
         write(REG_TIMER_DIV, TIMER_DIV_16);
@@ -665,13 +657,13 @@ pub fn calibrate() -> bool {
         // same belt-and-braces the old port-0x61 version kept, against the
         // same 50x-clock failure, reached through the read-back command
         // instead of a floating board-glue port.
-        if ch0_status() & STATUS_OUTPUT != 0 {
+        if PIT.channel0_output_high() {
             write(REG_TIMER_INIT, 0);
             return false;
         }
 
         let mut spins: u32 = 0;
-        while ch0_status() & STATUS_OUTPUT == 0 {
+        while !PIT.channel0_output_high() {
             spins += 1;
             if spins >= SPIN_LIMIT {
                 write(REG_TIMER_INIT, 0);
@@ -711,33 +703,6 @@ pub fn calibrate() -> bool {
     true
 }
 
-/// PIT channel 0's data port — also where a latched **status** byte (from
-/// [`CH0_STATUS_LATCH`]) comes back, since the read-back command routes it
-/// through the same port a count would use.
-const PORT_CH0_DATA: u16 = 0x40;
-/// The PIT's command port, shared by every channel.
-const PORT_CMD: u16 = 0x43;
-/// Read-back command (`11` in bits 7:6) for channel 0's status only: bit 5
-/// set = don't latch a count, bit 4 clear = do latch status, bit 1 = channel
-/// 0. Standard 8254, defined by the chip and not by any board glue — unlike
-/// the port-`0x61` gate/output trick this replaces, every PIT that exists at
-/// all answers it the same way.
-const CH0_STATUS_LATCH: u8 = 0b1110_0010;
-/// The OUTPUT bit in a status byte latched by [`CH0_STATUS_LATCH`]. Mode 0
-/// holds this low until the count reaches zero, then it latches high — the
-/// same edge the old port-`0x61` version polled, read through the port the
-/// 8254 itself exposes it on instead of board glue that `microvm` lacks.
-const STATUS_OUTPUT: u8 = 1 << 7;
-
-/// Latch and return PIT channel 0's status byte.
-fn ch0_status() -> u8 {
-    // SAFETY: fixed legacy I/O ports (the PIT's own), no other user.
-    unsafe {
-        crate::port::outb(PORT_CMD, CH0_STATUS_LATCH);
-        crate::port::inb(PORT_CH0_DATA)
-    }
-}
-
 /// Run PIT channel 0 for `us` microseconds and spin until it expires.
 ///
 /// The measurement primitive [`clock_rate_check`] uses (separately from
@@ -761,23 +726,19 @@ fn pit_wait_us(us: u32) -> bool {
     if count == 0 || count > 0xFFFF {
         return false;
     }
-    // SAFETY: fixed legacy I/O ports (the PIT's own command/data ports).
-    unsafe {
-        crate::port::outb(PORT_CMD, 0b0011_0000);
-        crate::port::outb(PORT_CH0_DATA, (count & 0xff) as u8);
-        crate::port::outb(PORT_CH0_DATA, ((count >> 8) & 0xff) as u8);
+    // `count <= 0xFFFF` was checked above.
+    PIT.load_channel0_oneshot(count as u16);
 
-        if ch0_status() & STATUS_OUTPUT != 0 {
+    if PIT.channel0_output_high() {
+        return false;
+    }
+    let mut spins: u32 = 0;
+    while !PIT.channel0_output_high() {
+        spins += 1;
+        if spins >= SPIN_LIMIT {
             return false;
         }
-        let mut spins: u32 = 0;
-        while ch0_status() & STATUS_OUTPUT == 0 {
-            spins += 1;
-            if spins >= SPIN_LIMIT {
-                return false;
-            }
-            core::hint::spin_loop();
-        }
+        core::hint::spin_loop();
     }
     true
 }

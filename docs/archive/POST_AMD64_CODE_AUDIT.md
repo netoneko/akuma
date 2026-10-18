@@ -480,6 +480,27 @@ Four tiers of work:
    candidate: validate+copy once, callers get safe functions. `gdt.rs` (93
    lines, 37 `unsafe`) likewise. The aarch64 twin (`akuma-uart`: 53 lines, 6
    sites) shows the target shape. Three tiny crates, ~75 sites encapsulated.
+**Status 2026-10-18 — `port.rs` done, and not the way tier 1 wrote it.** The
+recipe was "a ~50-line `akuma-port` of safe wrappers", i.e. a safe `outb`. That is
+the wrong shape: a safe `outb(port, val)` lets any safe code reprogram the PICs or
+reset the machine with a typo — the reason `akuma-cpu` refuses `msr ttbr0_el1` and
+`smc` (CLAUDE.md records it three times). `crates/akuma-port` has **no function
+that takes a port number**; it exposes devices (`COM1`, `CMOS`, `PIC`, `PIT`,
+`I8042`, `PCI_CONFIG`, `RESET_CONTROL`, `DEBUGCON`), each of which can only reach
+its own range, so "this port is the i8042" is asserted once, by a type, instead of
+at every call site. The four `in`/`out` instructions are the crate's only `unsafe`
+(`raw.rs`, behind `#![deny(unsafe_code)]` and one `#[allow]`). Host tests run
+against a fake bus and assert each device's access sequence, that it stays inside
+its range, and that the registry has no overlaps except the named `0xCF9`-inside-
+`0xCF8` alias. Moved: `serial`, `reboot`, `clock`, `lapic`, `kbd`, `pci`,
+`multiboot2`; `amd64/src/port.rs` is deleted. Measured with
+`cloc_akuma.py src crates amd64`: `unsafe` 812 -> 789 sites, 2838 -> 2745 lines
+tree-wide (amd64 alone 342 -> 315 sites). **Still open from tier 1:** `gdt.rs`
+(the invariant is the `sysret`/`syscall` selector order, so a wrapper has to encode
+the order, not hide the `asm!`) and `uaccess.rs` (not mechanical: `stac`/`clac`,
+CR0/CR4, and a copy routine whose fault fixup is welded to the page-fault handler;
+only the validation arithmetic is a clean extraction).
+
 2. **Finish the fold on drivers that already have pure twins.** The xHCI split
    is the model — `crates/akuma-xhci` is 2,178 lines of pure layout/bit math
    under `#![forbid(unsafe_code)]` while `amd64/src/xhci.rs` (2,548 lines) is
