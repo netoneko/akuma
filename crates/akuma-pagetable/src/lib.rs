@@ -156,6 +156,15 @@ impl Slot<'_> {
         self.table.0[self.idx].load(Ordering::Relaxed)
     }
 
+    /// The entry, **acquire**: pairs with the release half of
+    /// [`compare_exchange`](Self::compare_exchange), for a walker that is about
+    /// to follow the entry into a table another core may have just published.
+    #[must_use]
+    #[inline]
+    pub fn get_acquire(&self) -> u64 {
+        self.table.0[self.idx].load(Ordering::Acquire)
+    }
+
     /// Store the entry.
     #[inline]
     pub fn set(&self, entry: u64) {

@@ -82,7 +82,7 @@
     "crates/akuma-gic": 5,
     "crates/akuma-idt-amd64": 1,
     "crates/akuma-locks-rw-cell": 8,
-    "crates/akuma-mmu": 80,
+    "crates/akuma-mmu": 31,
     "crates/akuma-net-nic": 29,
     "crates/akuma-not-even-once": 5,
     "crates/akuma-pagetable": 5,
