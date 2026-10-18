@@ -14,6 +14,7 @@ userspace/amd64/hello/hello.rs             the ELF loader's probe
 userspace/amd64/fdprobe/fdprobe.rs         the descriptor table's probe
 userspace/amd64/threadprobe/threadprobe.rs clone(CLONE_VM)+futex, raw — a boot check
 userspace/amd64/ruststd/ruststd.rs         **the odd one out** — see below
+userspace/amd64/run_all/run_all.c         C, not built by build.rs: runs a list of probes as `init` with framed banners (musl-static, built by hand — see its header)
 ```
 
 ## `ruststd` is not like the others

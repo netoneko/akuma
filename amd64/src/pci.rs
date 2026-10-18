@@ -275,6 +275,21 @@ pub fn map_bar(bar: Bar, len: u64) -> Option<*mut u8> {
     Some((DEVMAP_BASE + address) as *mut u8)
 }
 
+/// [`map_bar`], as the register window drivers index by offset.
+///
+/// The one place that vouches "these `len` bytes are device registers": the pages
+/// were just mapped `MemAttr::Device` for the kernel's lifetime, and a BAR base is
+/// page-aligned past any access width. Drivers take a safe
+/// [`akuma_primitives::mmio::MmioWindow`] from here instead of each wrapping the
+/// raw pointer in their own `unsafe`.
+#[must_use]
+pub fn map_bar_window(bar: Bar, len: u64) -> Option<akuma_primitives::mmio::MmioWindow> {
+    let base = map_bar(bar, len)? as usize;
+    // SAFETY: `map_bar` mapped `[address, address + len)` as device memory and
+    // returned its virtual base; BARs are at least 16-byte aligned.
+    Some(unsafe { akuma_primitives::mmio::MmioWindow::new(base, len as usize) })
+}
+
 /// Print the enumerated devices — the amd64 equivalent of an `lspci`, worth
 /// having every bare-metal boot for the same reason `machine::report` is.
 /// The whole 256-byte config image, for capability walks the stored

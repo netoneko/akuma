@@ -51,12 +51,14 @@
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use akuma_primitives::addr::virt_to_phys;
-use akuma_primitives::mmio::MmioReg;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 use akuma_usb::descriptor::{self, TransferType};
 use akuma_usb::hid::{BootKeyboardDecoder, BootReport};
 use akuma_usb_storage::{Cbw, Csw, CswStatus, Direction, cdb};
+use akuma_dma::align::{A4K, A64};
+use akuma_dma::{DmaArray, DmaMut, DmaRef};
+use akuma_primitives::mmio::MmioWindow;
 use akuma_xhci::context::{self, EndpointConfig, EpType, SlotConfig};
 use akuma_xhci::regs::{self, CapabilityRegisters, PortSc, crcr, intr, op, rt, usbcmd, usbsts};
 use akuma_xhci::trb::{self, ConsumerRing, ControlDir, Event, ProducerRing, cc};
@@ -82,46 +84,41 @@ const BOUNCE_LEN: usize = 64 * 1024;
 /// the box).
 const SCRATCH_PAGES: usize = 32;
 
-#[repr(C, align(4096))]
-struct Aligned4K<const N: usize>([u8; N]);
-#[repr(C, align(64))]
-struct Aligned64<const N: usize>([u8; N]);
-#[repr(C, align(64))]
-struct Trbs<const N: usize>([[u32; 4]; N]);
-#[repr(C, align(64))]
-struct U64s<const N: usize>([u64; N]);
-
-static mut DCBAA: U64s<64> = U64s([0; 64]);
-static mut SCRATCH_ARR: Aligned64<{ SCRATCH_PAGES * 8 }> = Aligned64([0; SCRATCH_PAGES * 8]);
-static mut SCRATCH_MEM: Aligned4K<{ SCRATCH_PAGES * 4096 }> = Aligned4K([0; SCRATCH_PAGES * 4096]);
-static mut CMD_RING: Trbs<CMD_TRBS> = Trbs([[0; 4]; CMD_TRBS]);
-static mut EVENT_RING: Trbs<EVENT_TRBS> = Trbs([[0; 4]; EVENT_TRBS]);
-static mut ERST: Trbs<1> = Trbs([[0; 4]; 1]);
-static mut DEV_CTX: Aligned64<2048> = Aligned64([0; 2048]);
-static mut INPUT_CTX: Aligned64<2048> = Aligned64([0; 2048]);
-static mut EP0_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
-static mut BULK_IN_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
-static mut BULK_OUT_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
+static DCBAA: DmaArray<u64, 64, A64> = DmaArray::new();
+/// The scratchpad pointer array: one physical page address per scratchpad page.
+static SCRATCH_ARR: DmaArray<u64, SCRATCH_PAGES, A64> = DmaArray::new();
+static SCRATCH_MEM: DmaArray<u8, { SCRATCH_PAGES * 4096 }, A4K> = DmaArray::new();
+static CMD_RING: DmaArray<[u32; 4], CMD_TRBS, A64> = DmaArray::new();
+static EVENT_RING: DmaArray<[u32; 4], EVENT_TRBS, A64> = DmaArray::new();
+static ERST: DmaArray<[u32; 4], 1, A64> = DmaArray::new();
+/// Device contexts, as dwords: the controller rewrites endpoint state in place,
+/// so they are read with the volatile `get`.
+static DEV_CTX: DmaArray<u32, 512, A64> = DmaArray::new();
+static INPUT_CTX: DmaArray<u8, 2048, A64> = DmaArray::new();
+static EP0_RING: DmaArray<[u32; 4], XFER_TRBS, A64> = DmaArray::new();
+static BULK_IN_RING: DmaArray<[u32; 4], XFER_TRBS, A64> = DmaArray::new();
+static BULK_OUT_RING: DmaArray<[u32; 4], XFER_TRBS, A64> = DmaArray::new();
 // The keyboard's slot: its own device context, EP0 ring and interrupt-IN ring,
 // and the buffer the controller writes each 8-byte boot report into. Separate
 // from the disk's statics above so the keyboard can be brought up (and fail)
 // without touching a byte of the disk path.
-static mut KBD_DEV_CTX: Aligned64<2048> = Aligned64([0; 2048]);
-static mut KBD_EP0_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
-static mut KBD_INT_RING: Trbs<XFER_TRBS> = Trbs([[0; 4]; XFER_TRBS]);
-static mut KBD_REPORT: Aligned64<64> = Aligned64([0; 64]);
-static mut CTRL_BUF: Aligned4K<512> = Aligned4K([0; 512]);
-static mut CBW_BUF: Aligned64<64> = Aligned64([0; 64]);
-static mut CSW_BUF: Aligned64<64> = Aligned64([0; 64]);
+static KBD_DEV_CTX: DmaArray<u32, 512, A64> = DmaArray::new();
+static KBD_EP0_RING: DmaArray<[u32; 4], XFER_TRBS, A64> = DmaArray::new();
+static KBD_INT_RING: DmaArray<[u32; 4], XFER_TRBS, A64> = DmaArray::new();
+static KBD_REPORT: DmaArray<u8, 64, A64> = DmaArray::new();
+static CTRL_BUF: DmaArray<u8, 512, A4K> = DmaArray::new();
+static CBW_BUF: DmaArray<u8, 64, A64> = DmaArray::new();
+static CSW_BUF: DmaArray<u8, 64, A64> = DmaArray::new();
 /// `REQUEST SENSE`'s 18 bytes. Its own buffer so asking a failed command why
 /// does not overwrite the data (or the `WRITE(10)` payload) the retry needs.
-static mut SENSE_BUF: Aligned64<64> = Aligned64([0; 64]);
+static SENSE_BUF: DmaArray<u8, 64, A64> = DmaArray::new();
 /// 4 KiB-aligned; the data phase splits at the 64 KiB boundary it may straddle
 /// (`trb::data_trbs`), so page alignment is enough — `.bss` cannot promise more.
-static mut BOUNCE_BUF: Aligned4K<BOUNCE_LEN> = Aligned4K([0; BOUNCE_LEN]);
+static BOUNCE_BUF: DmaArray<u8, BOUNCE_LEN, A4K> = DmaArray::new();
 
-fn phys_of<T>(p: *const T) -> u64 {
-    virt_to_phys(p as usize) as u64
+/// Physical address of a DMA static's virtual `addr`.
+fn phys_of(addr: usize) -> u64 {
+    virt_to_phys(addr) as u64
 }
 
 /// Which TRB-array static a ring accessor / phys lookup refers to.
@@ -137,56 +134,61 @@ enum Ring {
     KbdInt,
 }
 
-fn ring_ptr(r: Ring) -> (*mut [u32; 4], usize) {
-    match r {
-        Ring::Cmd => ((&raw mut CMD_RING).cast(), CMD_TRBS),
-        Ring::Event => ((&raw mut EVENT_RING).cast(), EVENT_TRBS),
-        Ring::Erst => ((&raw mut ERST).cast(), 1),
-        Ring::Ep0 => ((&raw mut EP0_RING).cast(), XFER_TRBS),
-        Ring::BulkIn => ((&raw mut BULK_IN_RING).cast(), XFER_TRBS),
-        Ring::BulkOut => ((&raw mut BULK_OUT_RING).cast(), XFER_TRBS),
-        Ring::KbdEp0 => ((&raw mut KBD_EP0_RING).cast(), XFER_TRBS),
-        Ring::KbdInt => ((&raw mut KBD_INT_RING).cast(), XFER_TRBS),
-    }
-}
-
-fn ring_mut(r: Ring) -> &'static mut [[u32; 4]] {
-    let (p, n) = ring_ptr(r);
-    // SAFETY: `p` is a live `.bss` DMA static of `[[u32; 4]; n]`; lock held.
-    unsafe { core::slice::from_raw_parts_mut(p, n) }
-}
-
-fn ring_phys(r: Ring) -> u64 {
-    phys_of(ring_ptr(r).0)
-}
-
-macro_rules! dma_buf {
-    ($name:ident, $name_mut:ident, $static:ident, $len:expr) => {
-        fn $name() -> &'static [u8] {
-            // SAFETY: `$static` is a live `.bss` DMA static of `$len` bytes.
-            unsafe { core::slice::from_raw_parts((&raw const $static).cast::<u8>(), $len) }
-        }
-        #[allow(dead_code)]
-        fn $name_mut() -> &'static mut [u8] {
-            // SAFETY: as `$name`; lock held.
-            unsafe { core::slice::from_raw_parts_mut((&raw mut $static).cast::<u8>(), $len) }
+/// Run `$body` with `$a` bound to the static behind a [`Ring`]. The rings differ
+/// in length, so they are different types; this is the one `match` over them.
+macro_rules! with_ring {
+    ($r:expr, |$a:ident| $body:expr) => {
+        match $r {
+            Ring::Cmd => { let $a = &CMD_RING; $body }
+            Ring::Event => { let $a = &EVENT_RING; $body }
+            Ring::Erst => { let $a = &ERST; $body }
+            Ring::Ep0 => { let $a = &EP0_RING; $body }
+            Ring::BulkIn => { let $a = &BULK_IN_RING; $body }
+            Ring::BulkOut => { let $a = &BULK_OUT_RING; $body }
+            Ring::KbdEp0 => { let $a = &KBD_EP0_RING; $body }
+            Ring::KbdInt => { let $a = &KBD_INT_RING; $body }
         }
     };
 }
 
-dma_buf!(input_ctx, input_ctx_mut, INPUT_CTX, 2048);
-dma_buf!(scratch_arr, scratch_arr_mut, SCRATCH_ARR, SCRATCH_PAGES * 8);
-dma_buf!(ctrl_buf, ctrl_buf_mut, CTRL_BUF, 512);
-dma_buf!(kbd_report, kbd_report_mut, KBD_REPORT, 64);
-dma_buf!(cbw_buf, cbw_buf_mut, CBW_BUF, 64);
-dma_buf!(csw_buf, csw_buf_mut, CSW_BUF, 64);
-dma_buf!(sense_buf, sense_buf_mut, SENSE_BUF, 64);
-dma_buf!(bounce, bounce_mut, BOUNCE_BUF, BOUNCE_LEN);
-
-fn dcbaa_mut() -> &'static mut [u64] {
-    // SAFETY: `DCBAA` is a live `.bss` DMA static of 64 `u64`s; lock held.
-    unsafe { core::slice::from_raw_parts_mut((&raw mut DCBAA).cast::<u64>(), 64) }
+/// Volatile read of TRB `i` — the controller writes the event ring.
+fn ring_get(r: Ring, i: usize) -> [u32; 4] {
+    with_ring!(r, |a| a.get(i))
 }
+
+/// Volatile write of TRB `i`; lock held.
+fn ring_set(r: Ring, i: usize, t: [u32; 4]) {
+    with_ring!(r, |a| a.set(i, t));
+}
+
+/// Zero a ring.
+fn ring_clear(r: Ring) {
+    with_ring!(r, |a| a.view_mut().fill([0; 4]));
+}
+
+fn ring_phys(r: Ring) -> u64 {
+    phys_of(with_ring!(r, |a| a.addr()))
+}
+
+macro_rules! dma_buf {
+    ($name:ident, $name_mut:ident, $static:ident, $len:expr, $al:ty) => {
+        #[allow(dead_code)]
+        fn $name() -> DmaRef<'static, u8, { $len }, $al> {
+            $static.view()
+        }
+        #[allow(dead_code)]
+        fn $name_mut() -> DmaMut<'static, u8, { $len }, $al> {
+            $static.view_mut()
+        }
+    };
+}
+
+dma_buf!(input_ctx, input_ctx_mut, INPUT_CTX, 2048, A64);
+dma_buf!(ctrl_buf, ctrl_buf_mut, CTRL_BUF, 512, A4K);
+dma_buf!(cbw_buf, cbw_buf_mut, CBW_BUF, 64, A64);
+dma_buf!(csw_buf, csw_buf_mut, CSW_BUF, 64, A64);
+dma_buf!(sense_buf, sense_buf_mut, SENSE_BUF, 64, A64);
+dma_buf!(bounce, bounce_mut, BOUNCE_BUF, BOUNCE_LEN, A4K);
 
 // ===========================================================================
 // Timing
@@ -259,9 +261,9 @@ fn putphys(label: &str, v: u64) {
 // ===========================================================================
 
 struct Xhci {
-    op: usize,
-    db: usize,
-    rt: usize,
+    op: MmioWindow,
+    db: MmioWindow,
+    rt: MmioWindow,
     context_bytes: usize,
 
     cmd: ProducerRing,
@@ -315,18 +317,15 @@ fn lock_xhci() -> spinning_top::guard::SpinlockGuard<'static, Option<Xhci>> {
     }
 }
 
-fn r32(base: usize, off: usize) -> u32 {
-    // SAFETY: `base` is the mapped xHCI BAR window; `off` is inside a register
-    // block bounded by CAPLENGTH / DBOFF / RTSOFF.
-    unsafe { MmioReg::<u32>::new(base + off).read() }
+fn r32(win: MmioWindow, off: usize) -> u32 {
+    win.read(off)
 }
-fn w32(base: usize, off: usize, v: u32) {
-    // SAFETY: as `r32`.
-    unsafe { MmioReg::<u32>::new(base + off).write(v) }
+fn w32(win: MmioWindow, off: usize, v: u32) {
+    win.write(off, v);
 }
-fn w64(base: usize, off: usize, v: u64) {
-    // SAFETY: as `r32`; DCBAAP / CRCR / ERSTBA / ERDP take one 64-bit access.
-    unsafe { MmioReg::<u64>::new(base + off).write(v) }
+/// DCBAAP / CRCR / ERSTBA / ERDP take one 64-bit access.
+fn w64(win: MmioWindow, off: usize, v: u64) {
+    win.write(off, v);
 }
 
 impl Xhci {
@@ -334,10 +333,9 @@ impl Xhci {
     /// completion event. Returns `(completion_code, event slot id)`.
     fn command(&mut self, t: [u32; 4], what: &str) -> Result<(u8, u8), &'static str> {
         let e = self.cmd.enqueue(t, ring_phys(Ring::Cmd));
-        let r = ring_mut(Ring::Cmd);
-        r[e.index] = e.trb;
+        ring_set(Ring::Cmd, e.index, e.trb);
         if let Some(link) = e.link {
-            r[CMD_TRBS - 1] = link;
+            ring_set(Ring::Cmd, CMD_TRBS - 1, link);
         }
         compiler_fence(Ordering::SeqCst);
         w32(self.db, regs::db::doorbell(0), regs::db::COMMAND_RING_TARGET);
@@ -376,11 +374,11 @@ impl Xhci {
     fn next_event(&mut self) -> Option<Event> {
         loop {
             let idx = self.events.dequeue_index();
-            let raw = ring_mut(Ring::Event)[idx];
+            let raw = ring_get(Ring::Event, idx);
             let ev = self.events.poll(raw)?;
             let new_idx = self.events.dequeue_index();
             let erdp = (self.events_phys + (new_idx as u64) * 16) | intr::ERDP_EHB;
-            w64(self.rt + rt::interrupter(0), intr::ERDP, erdp);
+            w64(self.rt, rt::interrupter(0) + intr::ERDP, erdp);
             if let Event::Transfer { completion_code, slot, endpoint_dci, residual, trb_pointer, .. } = ev
                 && self.kbd.as_ref().is_some_and(|k| k.slot == slot && k.int_dci == endpoint_dci)
             {
@@ -416,10 +414,9 @@ impl Xhci {
         for &t in td {
             let e = self.producer(pr).enqueue(t, base);
             last_phys = e.trb_phys;
-            let r = ring_mut(ring);
-            r[e.index] = e.trb;
+            ring_set(ring, e.index, e.trb);
             if let Some(link) = e.link {
-                r[XFER_TRBS - 1] = link;
+                ring_set(ring, XFER_TRBS - 1, link);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -535,7 +532,7 @@ impl Xhci {
         td[n] = trb::setup_stage(pkt, dir);
         n += 1;
         if w_length != 0 {
-            let buf_phys = phys_of(ctrl_buf().as_ptr());
+            let buf_phys = phys_of(CTRL_BUF.addr());
             td[n] = trb::data_stage(buf_phys, u32::from(w_length), dir, false);
             n += 1;
         }
@@ -595,7 +592,7 @@ pub fn init() -> Result<(), &'static str> {
     putphys("  [xhci] BAR0 size=", size);
 
     step("map BAR0");
-    let bar_va = pci::map_bar(bar, size.max(0x1_0000)).ok_or("could not map xHCI BAR")? as usize;
+    let bar = pci::map_bar_window(bar, size.max(0x1_0000)).ok_or("could not map xHCI BAR")?;
     // Bus-master on (DMA), legacy INTx masked — this driver polls the event ring
     // and no IDT vector is wired for the controller.
     step("enable memory decode + bus master, mask INTx");
@@ -607,13 +604,13 @@ pub fn init() -> Result<(), &'static str> {
     step("read capability block (first MMIO)");
     let mut cap_bytes = [0u8; 0x20];
     for w in 0..8usize {
-        let v = r32(bar_va, w * 4).to_le_bytes();
+        let v = r32(bar, w * 4).to_le_bytes();
         cap_bytes[w * 4..w * 4 + 4].copy_from_slice(&v);
     }
     let caps = CapabilityRegisters::parse(&cap_bytes).ok_or("xHCI cap block unreadable")?;
-    let op = bar_va + caps.operational_base();
-    let db = bar_va + caps.db_offset as usize;
-    let rt = bar_va + caps.rts_offset as usize;
+    let op = bar.sub_from(caps.operational_base()).ok_or("xHCI operational block outside the BAR")?;
+    let db = bar.sub_from(caps.db_offset as usize).ok_or("xHCI doorbell block outside the BAR")?;
+    let rt = bar.sub_from(caps.rts_offset as usize).ok_or("xHCI runtime block outside the BAR")?;
     let context_bytes = caps.hcc_params1.context_bytes();
     let max_slots = caps.hcs_params1.max_slots();
     let max_ports = caps.hcs_params1.max_ports();
@@ -638,7 +635,7 @@ pub fn init() -> Result<(), &'static str> {
     // is reset, because `find_and_reset_port` cannot choose a port — or the
     // reset that port accepts — without it.
     step("read supported protocols");
-    let protocols = scan_protocols(bar_va, caps.hcc_params1.ext_cap_offset());
+    let protocols = scan_protocols(bar, caps.hcc_params1.ext_cap_offset());
     report_protocols(&protocols);
 
     // Taking the controller from the firmware. On a box whose BIOS is still
@@ -647,7 +644,7 @@ pub fn init() -> Result<(), &'static str> {
     // where no kernel print can follow it. If the last line on the console is
     // this one, suspect the handoff, not the driver.
     step("BIOS handoff (may enter SMM)");
-    bios_handoff(bar_va, caps.hcc_params1.ext_cap_offset());
+    bios_handoff(bar, caps.hcc_params1.ext_cap_offset());
 
     // --- reset ---
     step("wait CNR clear");
@@ -685,17 +682,14 @@ pub fn init() -> Result<(), &'static str> {
     // whether the box faults, corrupts, or just restarts. Every value below
     // must be under 4 GiB (this image loads at 2 MiB) and non-zero.
     step("lay out DMA memory");
-    dcbaa_mut().fill(0);
+    DCBAA.view_mut().fill(0);
     for r in [Ring::Cmd, Ring::Event, Ring::Erst, Ring::Ep0, Ring::BulkIn, Ring::BulkOut] {
-        for t in ring_mut(r) {
-            *t = [0; 4];
-        }
+        ring_clear(r);
     }
     input_ctx_mut().fill(0);
-    // SAFETY: `DEV_CTX` is a live `.bss` DMA static; lock held.
-    unsafe { core::slice::from_raw_parts_mut((&raw mut DEV_CTX).cast::<u8>(), 2048).fill(0) };
+    DEV_CTX.view_mut().fill(0);
 
-    let dcbaa_phys = phys_of(dcbaa_mut().as_ptr());
+    let dcbaa_phys = phys_of(DCBAA.addr());
     let cmd_phys = ring_phys(Ring::Cmd);
     let events_phys = ring_phys(Ring::Event);
     let erst_phys = ring_phys(Ring::Erst);
@@ -703,12 +697,12 @@ pub fn init() -> Result<(), &'static str> {
     putphys("  [xhci] cmd    phys=", cmd_phys);
     putphys("  [xhci] event  phys=", events_phys);
     putphys("  [xhci] erst   phys=", erst_phys);
-    putphys("  [xhci] bounce phys=", phys_of(bounce().as_ptr()));
+    putphys("  [xhci] bounce phys=", phys_of(BOUNCE_BUF.addr()));
     // A DMA address the controller cannot use is worth refusing before it is
     // programmed, not after: `AC64` is set on this controller but the image is
     // below 4 GiB, so anything above that — or a zero — means `virt_to_phys`
     // translated through the wrong window and the rings are not where we think.
-    for p in [dcbaa_phys, cmd_phys, events_phys, erst_phys, phys_of(bounce().as_ptr())] {
+    for p in [dcbaa_phys, cmd_phys, events_phys, erst_phys, phys_of(BOUNCE_BUF.addr())] {
         if p == 0 || p >= 1 << 32 {
             return Err("DMA static translated outside the low 4 GiB");
         }
@@ -716,18 +710,18 @@ pub fn init() -> Result<(), &'static str> {
 
     if scratch_needed > 0 {
         for i in 0..scratch_needed {
-            // SAFETY: `SCRATCH_MEM` is a live `.bss` static; `i < SCRATCH_PAGES`.
-            let page = phys_of(unsafe { (&raw const SCRATCH_MEM).cast::<u8>().add(i * 4096) });
-            scratch_arr_mut()[i * 8..i * 8 + 8].copy_from_slice(&page.to_le_bytes());
+            // `i < SCRATCH_PAGES <= SCRATCH_MEM`'s page count.
+            let page = phys_of(SCRATCH_MEM.addr_of(i * 4096));
+            SCRATCH_ARR.set(i, page);
         }
-        dcbaa_mut()[0] = phys_of(scratch_arr().as_ptr());
+        DCBAA.set(0, phys_of(SCRATCH_ARR.addr()));
     }
 
-    ring_mut(Ring::Cmd)[CMD_TRBS - 1] = trb::link(cmd_phys, true);
-    ring_mut(Ring::Erst)[0] = regs::erst_entry(events_phys, EVENT_TRBS as u16);
-    ring_mut(Ring::Ep0)[XFER_TRBS - 1] = trb::link(ring_phys(Ring::Ep0), true);
-    ring_mut(Ring::BulkIn)[XFER_TRBS - 1] = trb::link(ring_phys(Ring::BulkIn), true);
-    ring_mut(Ring::BulkOut)[XFER_TRBS - 1] = trb::link(ring_phys(Ring::BulkOut), true);
+    ring_set(Ring::Cmd, CMD_TRBS - 1, trb::link(cmd_phys, true));
+    ring_set(Ring::Erst, 0, regs::erst_entry(events_phys, EVENT_TRBS as u16));
+    ring_set(Ring::Ep0, XFER_TRBS - 1, trb::link(ring_phys(Ring::Ep0), true));
+    ring_set(Ring::BulkIn, XFER_TRBS - 1, trb::link(ring_phys(Ring::BulkIn), true));
+    ring_set(Ring::BulkOut, XFER_TRBS - 1, trb::link(ring_phys(Ring::BulkOut), true));
 
     // Everything from here on can touch the running controller. If any of it
     // fails, `init` MUST leave the controller halted and reset before returning
@@ -743,7 +737,7 @@ pub fn init() -> Result<(), &'static str> {
         // Interrupter 0's event ring, with interrupts DISABLED (`IMAN.IE` clear):
         // the driver polls the ring. `IMAN_IP` is written to clear any pending
         // bit the firmware left set.
-        let intr0 = rt + rt::interrupter(0);
+        let intr0 = rt.sub_from(rt::interrupter(0)).ok_or("xHCI interrupter 0 outside the BAR")?;
         w32(intr0, intr::ERSTSZ, 1);
         w64(intr0, intr::ERDP, events_phys | intr::ERDP_EHB);
         w64(intr0, intr::ERSTBA, erst_phys);
@@ -885,7 +879,7 @@ pub fn shutdown() {
 /// every step is time-bounded and failures are swallowed — a wedged controller
 /// that will not even reset is a hardware problem a power cycle fixes, and there
 /// is nothing more the driver can do about it.
-fn halt_controller(op: usize) {
+fn halt_controller(op: MmioWindow) {
     w32(op, op::USBCMD, 0);
     let s = tsc();
     while r32(op, op::USBSTS) & usbsts::HCH == 0 {
@@ -904,7 +898,7 @@ fn halt_controller(op: usize) {
     }
 }
 
-fn wait_cnr_clear(op: usize) -> Result<(), &'static str> {
+fn wait_cnr_clear(op: MmioWindow) -> Result<(), &'static str> {
     let s = tsc();
     while r32(op, op::USBSTS) & usbsts::CNR != 0 {
         if tsc().wrapping_sub(s) > command_budget() {
@@ -915,33 +909,29 @@ fn wait_cnr_clear(op: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn bios_handoff(bar_va: usize, mut off: usize) {
+fn bios_handoff(bar: MmioWindow, mut off: usize) {
     if off == 0 {
         return;
     }
     for _ in 0..32 {
-        // SAFETY: `bar_va` mapped; `off` is a dword offset inside the BAR.
-        let hdr = unsafe { MmioReg::<u32>::new(bar_va + off).read() };
+        // `off` came from the controller: a pointer outside the BAR ends the walk.
+        let Some(hdr) = bar.try_read::<u32>(off) else { return };
         if xcap::cap_id(hdr) == xcap::CAP_ID_LEGACY_SUPPORT {
             let leg = xcap::UsbLegSup(hdr);
             if !leg.handoff_complete() {
-                // SAFETY: as above.
-                unsafe { MmioReg::<u32>::new(bar_va + off).write(leg.claiming_for_os()) };
+                bar.write(off, leg.claiming_for_os());
                 let s = tsc();
                 loop {
-                    // SAFETY: as above.
-                    let now = xcap::UsbLegSup(unsafe { MmioReg::<u32>::new(bar_va + off).read() });
+                    let now = xcap::UsbLegSup(bar.read(off));
                     if now.handoff_complete() || tsc().wrapping_sub(s) > command_budget() {
                         break;
                     }
                     spin_us(1000);
                 }
             }
-            let ctl = bar_va + off + xcap::USBLEGCTLSTS_OFFSET;
-            // SAFETY: as above.
-            let v = unsafe { MmioReg::<u32>::new(ctl).read() };
-            // SAFETY: as above.
-            unsafe { MmioReg::<u32>::new(ctl).write(xcap::usblegctlsts_disable_all(v)) };
+            let ctl = off + xcap::USBLEGCTLSTS_OFFSET;
+            let v = bar.read::<u32>(ctl);
+            bar.write(ctl, xcap::usblegctlsts_disable_all(v));
             serial::puts("  [xhci] BIOS handoff ok\n");
             return;
         }
@@ -959,22 +949,25 @@ fn bios_handoff(bar_va: usize, mut off: usize) {
 /// Read-only — no writes, nothing that can enter SMM — so unlike the BIOS
 /// handoff it is safe to run early, and its answer is available to every step
 /// after it.
-fn scan_protocols(bar_va: usize, mut off: usize) -> ProtocolMap {
+fn scan_protocols(bar: MmioWindow, mut off: usize) -> ProtocolMap {
     let mut map = ProtocolMap::default();
     if off == 0 {
         return map;
     }
     for _ in 0..32 {
-        let hdr = r32(bar_va, off);
-        if xcap::cap_id(hdr) == xcap::CAP_ID_SUPPORTED_PROTOCOL
-            && !map.push(xcap::SupportedProtocol::parse(
-                hdr,
-                r32(bar_va, off + 4),
-                r32(bar_va, off + 8),
-                r32(bar_va, off + 12),
-            ))
-        {
-            break;
+        // `off` came from the controller: a pointer outside the BAR ends the walk.
+        let Some(hdr) = bar.try_read::<u32>(off) else { break };
+        if xcap::cap_id(hdr) == xcap::CAP_ID_SUPPORTED_PROTOCOL {
+            let (Some(d1), Some(d2), Some(d3)) = (
+                bar.try_read::<u32>(off + 4),
+                bar.try_read::<u32>(off + 8),
+                bar.try_read::<u32>(off + 12),
+            ) else {
+                break;
+            };
+            if !map.push(xcap::SupportedProtocol::parse(hdr, d1, d2, d3)) {
+                break;
+            }
         }
         match xcap::next_cap_offset(off, hdr) {
             Some(n) => off = n,
@@ -1014,7 +1007,7 @@ fn report_protocols(map: &ProtocolMap) {
 /// A warm reset is SuperSpeed link *recovery*; it is worth a second attempt
 /// only on a SuperSpeed port whose link did not train, and is skipped outright
 /// on USB 2.0 rather than spent as another second of timeout.
-fn reset_port(op: usize, port: u8, superspeed: bool) -> Result<(), &'static str> {
+fn reset_port(op: MmioWindow, port: u8, superspeed: bool) -> Result<(), &'static str> {
     for warm in [false, true] {
         if warm && !superspeed {
             break;
@@ -1050,7 +1043,7 @@ fn reset_port(op: usize, port: u8, superspeed: bool) -> Result<(), &'static str>
 }
 
 fn find_and_reset_port(
-    op: usize,
+    op: MmioWindow,
     max_ports: u8,
     protocols: &ProtocolMap,
 ) -> Result<u8, &'static str> {
@@ -1123,8 +1116,7 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
     serial::puts("  [xhci] slot ");
     serial::put_dec(u64::from(slot));
     serial::puts("\n");
-    // `DEV_CTX` is a live `.bss` DMA static; `&raw` needs no `unsafe`.
-    dcbaa_mut()[usize::from(slot)] = phys_of((&raw const DEV_CTX).cast::<u8>());
+    DCBAA.set(usize::from(slot), phys_of(DEV_CTX.addr()));
 
     // --- Address Device (add slot ctx + EP0) ---
     write_input_context(
@@ -1146,7 +1138,7 @@ fn enumerate(x: &mut Xhci, slot_type: u8) -> Result<(), &'static str> {
         )],
         0,
     );
-    let input_phys = phys_of(input_ctx().as_ptr());
+    let input_phys = phys_of(INPUT_CTX.addr());
     let (code, _) = x.command(trb::address_device(input_phys, slot, false), "address device")?;
     if code != cc::SUCCESS {
         puthex("  [xhci] Address Device cc=", u32::from(code));
@@ -1331,7 +1323,7 @@ fn write_input_context(
     eps: &[(u8, EndpointConfig)],
     config_value: u8,
 ) {
-    let ic = input_ctx_mut();
+    let mut ic = input_ctx_mut();
     ic.fill(0);
     let mut write = |i: usize, words: [u32; 8]| {
         let base = context::context_offset(i, context_bytes);
@@ -1451,7 +1443,7 @@ fn bot_run_once(
     let cbw = Cbw { tag, command, lun: 0 };
 
     cbw_buf_mut()[..31].copy_from_slice(&cbw.encode());
-    let cbw_phys = phys_of(cbw_buf().as_ptr());
+    let cbw_phys = phys_of(CBW_BUF.addr());
     let (code, _) = x.transfer(
         Ring::BulkOut,
         RingField::BulkOut,
@@ -1485,7 +1477,7 @@ fn bot_run_once(
         }
     }
 
-    let csw_phys = phys_of(csw_buf().as_ptr());
+    let csw_phys = phys_of(CSW_BUF.addr());
     let (code, _) = x.transfer(
         Ring::BulkIn,
         RingField::BulkIn,
@@ -1563,11 +1555,9 @@ fn ep_state(x: &Xhci, dci: u8) -> akuma_xhci::device::EpState {
 /// (idx 0 = slot context, idx dci = that endpoint's context). Diagnostic.
 fn dev_ctx_dw0(x: &Xhci, idx: u8) -> u32 {
     let base = context::context_offset(usize::from(idx), x.context_bytes);
-    // SAFETY: `DEV_CTX` is the live device context (DCBAA slot points at it);
-    // the lock is held and this is a read of our own DMA memory.
-    unsafe {
-        core::ptr::read_unaligned((&raw const DEV_CTX).cast::<u8>().add(base).cast::<u32>())
-    }
+    // Context entries are 32- or 64-byte aligned, so `base` is a whole dword.
+    // Volatile: the controller rewrites endpoint state in place.
+    DEV_CTX.get(base / 4)
 }
 
 /// Track the bulk endpoints' context states and print every transition —
@@ -1737,7 +1727,7 @@ fn bot_small(
         let n = data.len().min(command.data_len as usize).min(BOUNCE_LEN);
         bounce_mut()[..n].copy_from_slice(&data[..n]);
     }
-    let (status, moved) = bot_run(x, command, command.data_len as usize, phys_of(bounce().as_ptr()))?;
+    let (status, moved) = bot_run(x, command, command.data_len as usize, phys_of(BOUNCE_BUF.addr()))?;
     if command.direction == Direction::In {
         let n = (moved as usize).min(data.len()).min(BOUNCE_LEN);
         data[..n].copy_from_slice(&bounce()[..n]);
@@ -1786,7 +1776,7 @@ fn scsi_io(
     let mut unit_attentions: u8 = 0;
     let mut phase_errors: u8 = 0;
     loop {
-        let (status, moved) = bot_run(x, command, span, phys_of(bounce().as_ptr()))?;
+        let (status, moved) = bot_run(x, command, span, phys_of(BOUNCE_BUF.addr()))?;
         match status {
             CswStatus::Passed => {
                 if moved as usize != span {
@@ -1866,7 +1856,7 @@ fn scsi_io(
 /// `REQUEST SENSE` into `SENSE_BUF` (never the bounce buffer — the failed
 /// command's data or payload is still there and about to be retried).
 fn request_sense(x: &mut Xhci) -> Result<akuma_usb_storage::RequestSense, &'static str> {
-    let (status, moved) = bot_run(x, cdb::request_sense(), 18, phys_of(sense_buf().as_ptr()))?;
+    let (status, moved) = bot_run(x, cdb::request_sense(), 18, phys_of(SENSE_BUF.addr()))?;
     if status != CswStatus::Passed || moved < 14 {
         return Err("REQUEST SENSE failed");
     }
@@ -2101,7 +2091,7 @@ impl Xhci {
         td[n] = trb::setup_stage(pkt, dir);
         n += 1;
         if w_length != 0 {
-            td[n] = trb::data_stage(phys_of(ctrl_buf().as_ptr()), u32::from(w_length), dir, false);
+            td[n] = trb::data_stage(phys_of(CTRL_BUF.addr()), u32::from(w_length), dir, false);
             n += 1;
         }
         td[n] = trb::status_stage(dir, true);
@@ -2113,10 +2103,9 @@ impl Xhci {
             let k = self.kbd.as_mut().ok_or("no keyboard slot")?;
             let e = k.ep0.enqueue(t, base);
             last = e.trb_phys;
-            let r = ring_mut(Ring::KbdEp0);
-            r[e.index] = e.trb;
+            ring_set(Ring::KbdEp0, e.index, e.trb);
             if let Some(link) = e.link {
-                r[XFER_TRBS - 1] = link;
+                ring_set(Ring::KbdEp0, XFER_TRBS - 1, link);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -2152,12 +2141,11 @@ impl Xhci {
             return;
         }
         let base = ring_phys(Ring::KbdInt);
-        let td = trb::normal(phys_of(kbd_report().as_ptr()), k.report_len, true);
+        let td = trb::normal(phys_of(KBD_REPORT.addr()), k.report_len, true);
         let e = k.int.enqueue(td, base);
-        let r = ring_mut(Ring::KbdInt);
-        r[e.index] = e.trb;
+        ring_set(Ring::KbdInt, e.index, e.trb);
         if let Some(link) = e.link {
-            r[XFER_TRBS - 1] = link;
+            ring_set(Ring::KbdInt, XFER_TRBS - 1, link);
         }
         let (slot, dci) = (k.slot, k.int_dci);
         compiler_fence(Ordering::SeqCst);
@@ -2171,8 +2159,7 @@ impl Xhci {
             // Volatile: the controller wrote this buffer by DMA.
             let mut raw = [0u8; 8];
             for (i, b) in raw.iter_mut().enumerate() {
-                // SAFETY: `KBD_REPORT` is a live 64-byte `.bss` DMA static.
-                *b = unsafe { core::ptr::read_volatile(kbd_report().as_ptr().add(i)) };
+                *b = KBD_REPORT.get(i);
             }
             let Some(k) = self.kbd.as_mut() else { return };
             let got = k.report_len.saturating_sub(residual);
@@ -2267,7 +2254,7 @@ pub fn init_keyboard() -> Result<(), &'static str> {
 fn kbd_release_slot(x: &mut Xhci) {
     if let Some(k) = x.kbd.take() {
         let _ = x.command(trb::disable_slot(k.slot), "kbd disable slot");
-        dcbaa_mut()[usize::from(k.slot)] = 0;
+        DCBAA.set(usize::from(k.slot), 0);
     }
 }
 
@@ -2288,14 +2275,11 @@ fn kbd_try_port(x: &mut Xhci, port: u8) -> Result<(), &'static str> {
     }
     // Fresh rings and context for this attempt.
     for r in [Ring::KbdEp0, Ring::KbdInt] {
-        for t in ring_mut(r) {
-            *t = [0; 4];
-        }
-        ring_mut(r)[XFER_TRBS - 1] = trb::link(ring_phys(r), true);
+        ring_clear(r);
+        ring_set(r, XFER_TRBS - 1, trb::link(ring_phys(r), true));
     }
-    // SAFETY: `KBD_DEV_CTX` is a live `.bss` DMA static; lock held.
-    unsafe { core::slice::from_raw_parts_mut((&raw mut KBD_DEV_CTX).cast::<u8>(), 2048).fill(0) };
-    dcbaa_mut()[usize::from(slot)] = phys_of((&raw const KBD_DEV_CTX).cast::<u8>());
+    KBD_DEV_CTX.view_mut().fill(0);
+    DCBAA.set(usize::from(slot), phys_of(KBD_DEV_CTX.addr()));
     x.kbd = Some(Kbd {
         slot,
         ep0: ProducerRing::new(XFER_TRBS),
@@ -2333,7 +2317,7 @@ fn kbd_try_port(x: &mut Xhci, port: u8) -> Result<(), &'static str> {
         root_hub_port: port,
         context_entries: entries,
     };
-    let input_phys = phys_of(input_ctx().as_ptr());
+    let input_phys = phys_of(INPUT_CTX.addr());
 
     write_input_context(
         x.context_bytes,

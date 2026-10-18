@@ -333,6 +333,9 @@ akuma-virtio = { path = "../crates/akuma-virtio" }
 # virtio HAL uses. Reached transitively already; named here because this crate
 # now calls it directly.
 akuma-primitives = { path = "../crates/akuma-primitives" }
+# Statically allocated DMA memory (rings, contexts, bounce buffers) with the
+# `unsafe` inside: `DmaArray`. The xHCI and HDA drivers hold no raw statics.
+akuma-dma = { path = "../crates/akuma-dma" }
 # The machine description: the PVH handoff block, the virtio-MMIO command line,
 # and ACPI. Host-tested against bytes measured on both machines, which is why
 # `hvm.rs`, `cmdline.rs` and `acpi.rs` are no longer modules here.

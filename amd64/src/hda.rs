@@ -27,7 +27,10 @@
 use crate::serial;
 use akuma_hda::codec::{self, Kind, PinRole, VerbBus, VerbList};
 use akuma_hda::stream::{self, PlayRing, SampleFormat};
+use akuma_dma::align::{A128, A4K};
+use akuma_dma::DmaArray;
 use akuma_hda::{reg, verb, Regs16, RegsW16};
+use akuma_primitives::mmio::MmioWindow;
 use core::sync::atomic::{fence, Ordering};
 use spinning_top::Spinlock;
 
@@ -52,48 +55,17 @@ const GUARD: u32 = 1024;
 // DMA memory
 // ---------------------------------------------------------------------------
 
-#[repr(C, align(128))]
-struct Corb([u32; 256]);
-#[repr(C, align(128))]
-struct Rirb([u64; 256]);
-#[repr(C, align(128))]
-struct Bdl([[u32; 4]; NFRAG]);
-#[repr(C, align(4096))]
-struct Ring([u8; RING_BYTES]);
-
 /// The DMA position buffer: one 8-byte slot per stream descriptor, the first
 /// word being the stream's position. Written by the controller, so it is
 /// always read after a cache-line flush.
-#[repr(C, align(128))]
-struct PosBuf([u32; 32]);
+static POSBUF: DmaArray<u32, 32, A128> = DmaArray::new();
+static CORB: DmaArray<u32, 256, A128> = DmaArray::new();
+static RIRB: DmaArray<u64, 256, A128> = DmaArray::new();
+static BDL: DmaArray<[u32; 4], NFRAG, A128> = DmaArray::new();
+static RING: DmaArray<u8, RING_BYTES, A4K> = DmaArray::new();
 
-static mut POSBUF: PosBuf = PosBuf([0; 32]);
-static mut CORB: Corb = Corb([0; 256]);
-static mut RIRB: Rirb = Rirb([0; 256]);
-static mut BDL: Bdl = Bdl([[0; 4]; NFRAG]);
-static mut RING: Ring = Ring([0; RING_BYTES]);
-
-fn phys<T>(p: *mut T) -> u64 {
-    akuma_primitives::addr::virt_to_phys(p as usize) as u64
-}
-
-/// Write back and evict the cache lines covering `[p, p+len)`, then fence.
-///
-/// Linux clears the controller's no-snoop enable (see `init`), after which
-/// device DMA is coherent with the CPU caches. If the platform ignores that,
-/// a ring the CPU just filled is still in cache and the DAC reads stale RAM:
-/// a stream that "runs" perfectly and plays silence. Flushing costs a line per
-/// 64 bytes and makes the ordering independent of the snoop bit.
-fn flush(p: *const u8, len: usize) {
-    let mut a = (p as usize) & !63;
-    let end = p as usize + len;
-    while a < end {
-        // SAFETY: `clflush` on an address inside one of this file's statics.
-        unsafe { core::arch::x86_64::_mm_clflush(a as *const u8) };
-        a += 64;
-    }
-    // SAFETY: a fence has no memory-safety requirements.
-    unsafe { core::arch::x86_64::_mm_mfence() };
+fn phys(addr: usize) -> u64 {
+    akuma_primitives::addr::virt_to_phys(addr) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -102,44 +74,35 @@ fn flush(p: *const u8, len: usize) {
 
 /// BAR0. Every access is naturally aligned and exactly the register's width;
 /// the controller answers `0xff` to a halfword read that straddles a dword.
+/// The window checks both, so a stray offset panics rather than poking RAM.
 struct Mmio {
-    base: *mut u8,
+    win: MmioWindow,
 }
-
-// SAFETY: `base` is a device mapping with no thread affinity; all access goes
-// through the `HDA` lock or happens single-threaded at boot.
-unsafe impl Send for Mmio {}
 
 impl Mmio {
     fn r8(&self, off: usize) -> u8 {
-        // SAFETY: `off` is inside the 16 KiB BAR0 mapping `init` created.
-        unsafe { self.base.add(off).read_volatile() }
+        self.win.read(off)
     }
     fn w8(&self, off: usize, v: u8) {
-        // SAFETY: as `r8`.
-        unsafe { self.base.add(off).write_volatile(v) }
+        self.win.write(off, v);
     }
     fn r32(&self, off: usize) -> u32 {
-        // SAFETY: as `r8`; `off` is 4-aligned at every call site.
-        unsafe { (self.base.add(off) as *const u32).read_volatile() }
+        self.win.read(off)
     }
 }
 
 impl Regs16 for Mmio {
     fn r16(&self, off: usize) -> u16 {
-        // SAFETY: as `r8`; `off` is 2-aligned at every call site.
-        unsafe { (self.base.add(off) as *const u16).read_volatile() }
+        self.win.read(off)
     }
 }
 
 impl RegsW16 for Mmio {
     fn w16(&self, off: usize, v: u16) {
-        // SAFETY: as `r16`.
-        unsafe { (self.base.add(off) as *mut u16).write_volatile(v) }
+        self.win.write(off, v);
     }
     fn w32(&self, off: usize, v: u32) {
-        // SAFETY: as `r32`.
-        unsafe { (self.base.add(off) as *mut u32).write_volatile(v) }
+        self.win.write(off, v);
     }
 }
 
@@ -270,7 +233,7 @@ impl Hda {
         r.w8(reg::CORBSIZE, 0x02);
         r.w8(reg::RIRBSIZE, 0x02);
 
-        let (cb, rb) = (phys(&raw mut CORB), phys(&raw mut RIRB));
+        let (cb, rb) = (phys(CORB.addr()), phys(RIRB.addr()));
         r.w32(reg::CORBLBASE, cb as u32);
         r.w32(reg::CORBUBASE, (cb >> 32) as u32);
         r.w32(reg::RIRBLBASE, rb as u32);
@@ -301,13 +264,10 @@ impl Hda {
         let r = &self.regs;
         let wp = (r.r16(reg::CORBWP) & 0xFF) as usize;
         let np = (wp + 1) & 0xFF;
-        // SAFETY: `np` < 256; the controller reads this slot only after the
-        // CORBWP write below publishes it.
-        unsafe {
-            let slot = (&raw mut CORB.0).cast::<u32>().add(np);
-            slot.write_volatile(v);
-            flush(slot.cast::<u8>(), 4);
-        }
+        // The controller reads this slot only after the CORBWP write below
+        // publishes it.
+        CORB.set(np, v);
+        CORB.flush(np * 4, 4);
         fence(Ordering::SeqCst);
         r.w16(reg::CORBWP, np as u16);
 
@@ -320,13 +280,10 @@ impl Hda {
                 let mut k = self.rirb_rp;
                 while k != rwp {
                     k = k.wrapping_add(1);
-                    // SAFETY: `k` < 256; the controller wrote this entry before
-                    // advancing RIRBWP past it.
-                    let e = unsafe {
-                        let slot = (&raw mut RIRB.0).cast::<u64>().add(usize::from(k));
-                        flush(slot.cast::<u8>(), 8);
-                        slot.read_volatile()
-                    };
+                    // The controller wrote this entry before advancing RIRBWP
+                    // past it; evict our stale line first.
+                    RIRB.flush(usize::from(k) * 8, 8);
+                    let e = RIRB.get(usize::from(k));
                     let ex = (e >> 32) as u32;
                     if ex & 0x10 != 0 {
                         continue; // unsolicited: not the answer to what we sent
@@ -400,15 +357,16 @@ impl Hda {
         let mut w = Wait::new(2_000);
         while r.r8(sd + reg::SD_CTL) & 1 != 0 && !w.expired() {}
 
-        // SAFETY: the stream is stopped, so the device is not reading the BDL.
-        unsafe {
-            let ring = phys(&raw mut RING);
-            for i in 0..NFRAG {
-                BDL.0[i] = stream::bdl_entry(ring + (i * FRAG) as u64, FRAG as u32, true);
+        // The stream is stopped, so the device is not reading the BDL.
+        let ring = phys(RING.addr());
+        {
+            let mut bdl = BDL.view_mut();
+            for (i, e) in bdl.iter_mut().enumerate() {
+                *e = stream::bdl_entry(ring + (i * FRAG) as u64, FRAG as u32, true);
             }
         }
-        let bdl = phys(&raw mut BDL);
-        flush((&raw const BDL).cast::<u8>(), core::mem::size_of::<Bdl>());
+        let bdl = phys(BDL.addr());
+        BDL.flush(0, BDL.size_bytes());
         r.w8(sd + reg::SD_STS, 0x1C); // clear BCIS | FIFOE | DESE
         r.w32(sd + reg::SD_BDPL, bdl as u32);
         r.w32(sd + reg::SD_BDPU, (bdl >> 32) as u32);
@@ -444,13 +402,11 @@ impl Hda {
 
     /// The position-buffer slot for the output stream.
     fn posbuf(&self) -> u32 {
-        // SAFETY: `sd_index` < 16, so the slot is inside the 128-byte static;
-        // the controller writes it, hence the flush before the read.
-        unsafe {
-            let slot = (&raw mut POSBUF.0).cast::<u32>().add(self.sd_index * 2);
-            flush(slot.cast::<u8>(), 4);
-            slot.read_volatile()
-        }
+        // `sd_index` < 16, so the slot is inside the 128-byte buffer; the
+        // controller writes it, hence the flush before the read.
+        let i = self.sd_index * 2;
+        POSBUF.flush(i * 4, 4);
+        POSBUF.get(i)
     }
 
     /// Zero the ring bytes the hardware consumed between totals `from` and `to`.
@@ -469,15 +425,12 @@ impl Hda {
         }
         let off = (from % RING_BYTES as u64) as usize;
         let first = n.min(RING_BYTES - off);
-        // SAFETY: both spans are inside the static ring (`off + first` <=
-        // RING_BYTES, `n - first` <= off).
-        unsafe {
-            let base = (&raw mut RING.0).cast::<u8>();
-            core::ptr::write_bytes(base.add(off), 0, first);
-            core::ptr::write_bytes(base, 0, n - first);
-            flush(base.add(off), first);
-            flush(base, n - first);
-        }
+        // Both spans are inside the ring (`off + first` <= RING_BYTES,
+        // `n - first` <= off); the slice indexing checks it.
+        RING.view_mut()[off..off + first].fill(0);
+        RING.view_mut()[..n - first].fill(0);
+        RING.flush(off, first);
+        RING.flush(0, n - first);
     }
 
     /// Fold the hardware position into the ring.
@@ -558,15 +511,15 @@ impl Hda {
                 break; // less than one whole frame left: drop it
             }
             let (off, first, second) = self.ring.reserve(co);
-            // SAFETY: `reserve` handed out `[off, off+first)` and `[0, second)`,
-            // which `space` proved the hardware has already consumed.
-            unsafe {
-                let base = (&raw mut RING.0).cast::<u8>();
-                core::ptr::copy_nonoverlapping(tmp.as_ptr(), base.add(off), first);
-                core::ptr::copy_nonoverlapping(tmp.as_ptr().add(first), base, second);
-                flush(base.add(off), first);
-                flush(base, second);
+            // `reserve` handed out `[off, off+first)` and `[0, second)`, which
+            // `space` proved the hardware has already consumed.
+            {
+                let mut ring = RING.view_mut();
+                ring[off..off + first].copy_from_slice(&tmp[..first]);
+                ring[..second].copy_from_slice(&tmp[first..first + second]);
             }
+            RING.flush(off, first);
+            RING.flush(0, second);
             src = &src[ci..];
             if !self.running && self.ring.buffered() >= (RING_BYTES / 2) as u64 {
                 fence(Ordering::SeqCst);
@@ -589,14 +542,14 @@ impl Hda {
                 continue;
             }
             let (off, first, second) = self.ring.reserve(n);
-            // SAFETY: as in `write`; the spans are ones `space` proved consumed.
-            unsafe {
-                let base = (&raw mut RING.0).cast::<u8>();
-                core::ptr::write_bytes(base.add(off), 0, first);
-                core::ptr::write_bytes(base, 0, second);
-                flush(base.add(off), first);
-                flush(base, second);
+            // As in `write`; the spans are ones `space` proved consumed.
+            {
+                let mut ring = RING.view_mut();
+                ring[off..off + first].fill(0);
+                ring[..second].fill(0);
             }
+            RING.flush(off, first);
+            RING.flush(0, second);
             bytes -= n;
             if !self.running && self.ring.buffered() >= (RING_BYTES / 2) as u64 {
                 fence(Ordering::SeqCst);
@@ -862,11 +815,11 @@ pub fn init(selftest: bool) {
         return;
     };
     let (size, _) = crate::pci::probe_bar_size(addr, 0);
-    let Some(base) = crate::pci::map_bar(bar, size.max(0x4000)) else {
+    let Some(win) = crate::pci::map_bar_window(bar, size.max(0x4000)) else {
         p("[HDA] BAR0 map failed\n");
         return;
     };
-    let regs = Mmio { base };
+    let regs = Mmio { win };
     let Some(info) = akuma_hda::discover(&regs) else {
         p("[HDA] BAR0 reads 0xffff: not decoded\n");
         return;
@@ -899,7 +852,7 @@ pub fn init(selftest: bool) {
     }
     regs.w32(reg::INTCTL, 0);
     // DMA position buffer (an independent view of stream position).
-    let pb = phys(&raw mut POSBUF);
+    let pb = phys(POSBUF.addr());
     regs.w32(reg::DPUBASE, (pb >> 32) as u32);
     regs.w32(reg::DPLBASE, (pb as u32) | 1);
     delay_us(1_000);

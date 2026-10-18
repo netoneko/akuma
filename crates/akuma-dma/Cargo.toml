@@ -1,0 +1,10 @@
+[package]
+name = "akuma-dma"
+version = "0.1.0"
+edition = "2024"
+description = "Statically allocated DMA memory the CPU and a device both touch: DmaArray (aligned, bounds- and borrow-checked, volatile cells, cache flush) and FrameArena/FrameLease (the network frame slots). Every deref of such memory, behind one stated contract. no_std, no dependencies"
+
+[lints]
+workspace = true
+
+[dependencies]

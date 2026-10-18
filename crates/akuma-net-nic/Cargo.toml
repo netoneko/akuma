@@ -28,6 +28,8 @@ workspace = true
 [dependencies]
 # NetRuntime (uptime_us, wake_netpoll), PreemptGuard, mmio::MmioReg, errno.
 akuma-primitives = { path = "../akuma-primitives" }
+# FrameArena / FrameLease — the BSS frame slots every ring here is built on.
+akuma-dma = { path = "../akuma-dma" }
 akuma-rump = { path = "../akuma-rump", optional = true }
 akuma-net-rtl8169 = { path = "../akuma-net-rtl8169", optional = true }
 spinning_top = "0.3"

@@ -243,7 +243,7 @@ That runner cannot use a shell script, and finding out why cost a cycle:
   produces no console output while its *errors* do — so the banners a harness
   splits on would be missing even if the probes ran.
 
-`amd64/probes/run_all.c` routes around both with the three things that
+`userspace/amd64/run_all/run_all.c` (moved from `amd64/probes/` 2026-10-18) routes around both with the three things that
 demonstrably work: `fork`, `execve`, `wait4`. Its markers go out through
 `write(2)`, not stdio — a marker still sitting in a buffer when a probe
 deliberately SIGSEGVs is a marker the harness never sees.

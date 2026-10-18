@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dmesg,dns,exec,ext2,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-port` is x86 **port I/O**, under the same rule as `akuma-cpu` below with
   one difference that is the point: no function takes a port number. `in`/`out` are only safe to execute
@@ -22,6 +22,16 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   production `unsafe` sites may not exceed `docs/reference/unsafe-budget.json`, and
   a new crate's budget is 0. To add `unsafe`, run it with `--update` so the budget
   diff carries the increase into review.
+  `akuma-dma` is **statically allocated DMA memory** (2026-10-18): `DmaArray<E, N, Align>` —
+  the `static` itself, a length and alignment in its type, a borrow word that turns a
+  second overlapping `&mut` into a panic, volatile `get`/`set` for cells a *device*
+  writes, and a bounds-checked cache `flush` — plus `FrameArena`/`FrameLease`, moved
+  from `akuma-net-nic`. It is why `amd64/src/{xhci,hda}.rs` hold no `unsafe`. **Never
+  write `from_raw_parts_mut((&raw mut BUF).cast(), N)` for a DMA buffer again.** Its
+  counterpart for registers is `akuma_primitives::mmio::MmioWindow` (bounds- and
+  alignment-checked, one `unsafe` per mapped BAR in `pci::map_bar_window`).
+  Both are **leaf crates on purpose**: the policy is to isolate `unsafe` in small
+  crates whose only job is one stated contract, and shrink the drivers to safe code.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
   comparator and read-only system registers — behind safe `#[inline(always)]`
@@ -360,6 +370,18 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `proposals/` — In-flight design proposals
 
 Never glob or list the repo root — it has 1000+ files. Always use a specific subdirectory path.
+
+## Crate naming
+
+- `akuma-<thing>` for architecture-neutral code, `akuma-<thing>-<arch>` for the
+  architecture-specific half of a pair (`akuma-pte-amd64` beside `akuma-mmu`'s
+  AArch64 encoding). Arch-neutral crates carry no suffix.
+- **We strongly prefer `amd64` over `x86`/`x86_64`** in crate names, module names,
+  types and prose. The literal `x86_64` appears only where it is the toolchain's or
+  the ISA's own spelling: the `x86_64-unknown-none` triple, `target_arch = "x86_64"`,
+  `core::arch::x86_64`, a CPU register/instruction name. Never `akuma-x86-*`.
+- Name the crate for what it *owns*, not for how it is built (`-glue` is the one
+  accepted exception: the part that cannot be host-tested).
 
 ## Documentation
 

@@ -44,7 +44,7 @@ extern crate alloc;
 pub use akuma_primitives::safe_print;
 
 pub mod counters;
-pub mod frames;
+pub use akuma_dma::frames;
 pub mod ifstats;
 pub mod nic;
 pub mod nicstat;

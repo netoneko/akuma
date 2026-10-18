@@ -91,6 +91,7 @@ dependencies = [
  "akuma-config",
  "akuma-cow",
  "akuma-cpu",
+ "akuma-dma",
  "akuma-dmesg",
  "akuma-dwi2c",
  "akuma-elf",
@@ -185,6 +186,10 @@ version = "0.1.0"
 
 [[package]]
 name = "akuma-cpu"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-dma"
 version = "0.1.0"
 
 [[package]]
@@ -498,6 +503,7 @@ dependencies = [
 name = "akuma-net-nic"
 version = "0.1.0"
 dependencies = [
+ "akuma-dma",
  "akuma-net-rtl8169",
  "akuma-primitives",
  "akuma-rump",
