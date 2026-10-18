@@ -39,6 +39,7 @@
 //! run N times fast.
 
 use akuma_cpu::msr::{self, Msr};
+use akuma_primitives::{OnceCopy, mmio::MmioWindow};
 use crate::idt;
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
@@ -96,22 +97,21 @@ const TIMER_DIV_16: u32 = 0b0011;
 /// Ticks observed. Written only by the handler, read by everyone else.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// The LAPIC's *virtual* base in the device window, or 0 before [`init`].
-static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+/// The LAPIC register page, in the device window, once [`init`] has mapped it.
+static LAPIC: OnceCopy<MmioWindow> = OnceCopy::new();
 
-fn reg_ptr(offset: usize) -> *mut u32 {
-    (LAPIC_BASE.load(Ordering::Relaxed) as usize + offset) as *mut u32
+/// The window, or a panic naming the bug: no LAPIC register is read before `init`
+/// maps the page (the old code dereferenced address `offset` and faulted).
+fn window() -> MmioWindow {
+    LAPIC.get().expect("LAPIC register access before lapic::init mapped the page")
 }
 
 fn read(offset: usize) -> u32 {
-    // SAFETY: the LAPIC page is mapped by `init` before any call reaches here,
-    // and every offset is an architectural LAPIC register.
-    unsafe { reg_ptr(offset).read_volatile() }
+    window().read::<u32>(offset)
 }
 
 fn write(offset: usize, val: u32) {
-    // SAFETY: as `read`.
-    unsafe { reg_ptr(offset).write_volatile(val) };
+    window().write::<u32>(offset, val);
 }
 
 /// Send a fixed delivery-mode IPI (delivery mode 000, level clear, edge) with
@@ -126,7 +126,7 @@ pub fn send_fixed(dest_apic_id: u32, vector: u8) {
 /// consults this and degrades to a core-local flush instead.
 #[must_use]
 pub fn ready() -> bool {
-    LAPIC_BASE.load(Ordering::Relaxed) != 0
+    LAPIC.is_set()
 }
 
 /// Signal end-of-interrupt. Every handler for a LAPIC-delivered vector must do
@@ -267,7 +267,10 @@ pub fn init() -> bool {
         serial::puts("  [FATAL] could not map the LAPIC page\n");
         return false;
     }
-    LAPIC_BASE.store(va, Ordering::Relaxed);
+    // SAFETY: the page `map_page` just mapped as device memory at `va`, for the
+    // kernel's lifetime; 4 KiB, page-aligned, and every access through the window
+    // is a naturally aligned dword at an architectural register offset.
+    LAPIC.set(unsafe { MmioWindow::new(va as usize, 4096) });
 
     // Software-enable, and park spurious deliveries on a vector of their own so
     // they are distinguishable from a real one.

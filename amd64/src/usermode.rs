@@ -1050,14 +1050,7 @@ extern "C" fn syscall_handler(
     // before the syscall runs: its address space is about to be freed and
     // anything it does with it from now on is a race with the reaper.
     let r = if crate::thread::should_leave_now() {
-        // SAFETY: single core, interrupts off inside a syscall; this task's own
-        // `UserCtx`. Same `leave` mechanism `exit` uses.
-        unsafe {
-            let uctx = crate::smp::current_uctx();
-            if !uctx.is_null() {
-                (*uctx).leave = 1;
-            }
-        }
+        mark_leave();
         crate::fd::errno::EINTR
     } else {
         syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
@@ -1110,6 +1103,13 @@ extern "C" fn syscall_handler(
     r
 }
 
+/// Set the running task's `UserCtx::leave`: the syscall return path reads it and
+/// `sysret`s nowhere, leaving ring 3 for good. A no-op with no `UserCtx` on this
+/// core (the boot task), which is what the null check always meant.
+fn mark_leave() {
+    let _ = crate::sched::with_current_uctx(|u| u.leave = 1);
+}
+
 /// Leave ring 3 because a signal's default action says to, as if the program had
 /// called `exit_group(-sig)`.
 ///
@@ -1142,14 +1142,7 @@ pub fn exit_current_from_signal(sig: u32) {
     // syscall's result. Stored anyway for the same reason `Syscall::ExitGroup`
     // stores it: the two arms should read alike.
     EXIT_STATUS.store((-(i64::from(sig))) as u64, Ordering::Relaxed);
-    // SAFETY: the running task's own `UserCtx`; only this task writes it, and it
-    // is inside its own syscall.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if !uctx.is_null() {
-            (*uctx).leave = 1;
-        }
-    }
+    mark_leave();
 }
 
 /// Leave ring 3 as `exit_group(code)` does: mark the group exiting and set
@@ -1158,15 +1151,7 @@ pub fn exit_current_from_signal(sig: u32) {
 pub fn exit_current_with_code(code: u64) {
     crate::thread::set_group_exiting(current_proc_slot());
     EXIT_STATUS.store(code, Ordering::Relaxed);
-    // SAFETY: single core, interrupts off inside a syscall. The running task's
-    // context is what `syscall_entry` will read on the way out, and only this
-    // task can be inside a syscall.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if !uctx.is_null() {
-            (*uctx).leave = 1;
-        }
-    }
+    mark_leave();
 }
 
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
@@ -1910,14 +1895,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             if crate::thread::current_is_main() {
                 EXIT_STATUS.store(a1, Ordering::Relaxed);
             }
-            // SAFETY: single core, interrupts off inside a syscall; the
-            // per-CPU `UserCtx` is this task's own.
-            unsafe {
-                let uctx = crate::smp::current_uctx();
-                if !uctx.is_null() {
-                    (*uctx).leave = 1;
-                }
-            }
+            mark_leave();
             a1
         }
         // ── signals ────────────────────────────────────────────────────────
@@ -2719,13 +2697,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             // re-`arch_prctl`s) leaves the parent running on the child's TLS
             // base. That crash (`cr2` a tiny offset off a garbage pointer) is
             // what made this field load-bearing.
-            // SAFETY: this task's own `UserCtx`.
-            unsafe {
-                let uctx = crate::smp::current_uctx();
-                if !uctx.is_null() {
-                    (*uctx).fs_base = addr;
-                }
-            }
+            let _ = crate::sched::with_current_uctx(|u| u.fs_base = addr);
             0
         }
         ARCH_SET_GS => {
@@ -2737,13 +2709,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             if msr::set_user_gs_base(addr).is_err() {
                 return crate::fd::errno::EPERM;
             }
-            // SAFETY: this task's own `UserCtx`.
-            unsafe {
-                let uctx = crate::smp::current_uctx();
-                if !uctx.is_null() {
-                    (*uctx).gs_base = addr;
-                }
-            }
+            let _ = crate::sched::with_current_uctx(|u| u.gs_base = addr);
             0
         }
         ARCH_GET_FS => {
@@ -3697,18 +3663,14 @@ pub const SPAWN_SLOT_BASE: usize = 7;
 /// the new image rather than leaving ring 3, nothing in Rust is running at the
 /// moment it is spent.
 fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
-    // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own
-    // slot, and only this task reads or clears these two fields.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() {
-            return false;
-        }
-        let f = read(&mut *uctx);
+    // Under the BKL; only this task reads or clears these two fields.
+    crate::sched::with_current_uctx(|u| {
+        let f = read(u);
         let was = *f != 0;
         *f = 0;
         was
-    }
+    })
+    .unwrap_or(false)
 }
 
 /// **`ExecRuntime::enter_user` on this target**: enter ring 3 with a process's
@@ -5348,20 +5310,19 @@ fn do_execve(
     // `sysret`s. `leave` is deliberately **not** set: leaving ring 3 is what
     // made `execve` need a loop to get back in.
     //
-    // SAFETY: under the BKL, interrupts off inside a syscall; the per-CPU
-    // `UserCtx` is this task's slot, and only this task reads these fields.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() {
-            // Nothing to return through. The old image is already gone, so
-            // there is no program to return to either; say so rather than
-            // `sysret`ing somewhere arbitrary.
-            serial::puts("  [execve] no UserCtx on this task\n");
-            return errno::ENOSYS;
-        }
-        (*uctx).user_rip = new_entry;
-        (*uctx).user_rsp = new_stack;
-        (*uctx).exec_pending = 1;
+    // Under the BKL, interrupts off inside a syscall; only this task reads these
+    // fields.
+    let armed = crate::sched::with_current_uctx(|u| {
+        u.user_rip = new_entry;
+        u.user_rsp = new_stack;
+        u.exec_pending = 1;
+    });
+    if armed.is_none() {
+        // Nothing to return through. The old image is already gone, so there is
+        // no program to return to either; say so rather than `sysret`ing
+        // somewhere arbitrary.
+        serial::puts("  [execve] no UserCtx on this task\n");
+        return errno::ENOSYS;
     }
     0
 }
@@ -5981,15 +5942,8 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
 // sources, one of them ignoring redirection.
 
 pub fn current_proc_slot() -> usize {
-    // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is the running task's slot.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() {
-            usize::MAX
-        } else {
-            (*uctx).proc_slot
-        }
-    }
+    // Under the BKL; the running task's slot, or `usize::MAX` with none.
+    crate::sched::read_current_uctx(|u| u.proc_slot).unwrap_or(usize::MAX)
 }
 
 /// `close_child_stdin(pid)` — Akuma's syscall 326. `sshd` calls it when the

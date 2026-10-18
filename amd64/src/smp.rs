@@ -224,15 +224,11 @@ pub fn percpu_installed() -> bool {
 /// which is every line of kernel Rust after [`init_bsp`] / [`ap_entry64`].
 #[inline]
 fn this_cpu() -> &'static PerCpu {
-    let p: u64;
-    // SAFETY: `gs:[0]` is `PerCpu::self_ptr`, written by `install_percpu` on
-    // this core before any code that can reach here runs; the block it names is
-    // a `static`.
-    unsafe {
-        core::arch::asm!("mov {}, qword ptr gs:[0]", out(reg) p,
-                         options(nostack, preserves_flags, readonly));
-        &*(p as *const PerCpu)
-    }
+    // `index` is at `gs:[24]` (`OFFSETS_PINNED`), written by `install_percpu` on
+    // this core before any code that can reach here runs; `akuma_cpu::percpu`
+    // reads it, and the block is `PERCPU[index]` — a bounds-checked index into a
+    // `static`, where this used to dereference the `self_ptr` word at `gs:[0]`.
+    &PERCPU[akuma_cpu::percpu::core_id() as usize]
 }
 
 /// This core's index: 0 for the BSP.
@@ -761,14 +757,10 @@ pub fn kick_halted_core() {
         if HALTED[i].compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             // `IF` off across the two ICR writes: an interrupt between them
             // that sends its own IPI would retarget this one.
-            let flags: u64;
-            // SAFETY: reads RFLAGS and clears IF; restored below.
-            unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+            let flags = akuma_cpu::daif::save_and_mask_irq();
             lapic::send_fixed(PERCPU[i].lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
-            if flags & (1 << 9) != 0 {
-                // SAFETY: IF was set on entry; this restores it.
-                unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
-            }
+            // IF back exactly as it was (`restore` is the inverse of the save).
+            akuma_cpu::daif::restore(flags);
             WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
             return;
         }

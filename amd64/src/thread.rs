@@ -53,6 +53,7 @@
 //! anything can reap, no task holds that `space_root`.
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use spinning_top::Spinlock;
 
 use crate::fd::errno;
 use crate::serial;
@@ -97,12 +98,16 @@ struct Thread {
     clear_child_tid: u64,
 }
 
-/// `static mut` under the BKL — the discipline `usermode::PROCS` had before 5b
-/// slice 4 deleted it: every writer is kernel code and kernel code holds the lock.
-static mut THREADS: [Option<Thread>; MAX_THREADS] = [const { None }; MAX_THREADS];
+/// The thread table. It was `static mut` "under the BKL — the discipline
+/// `usermode::PROCS` had", an unchecked claim; a `Spinlock` makes it a fact. The
+/// guard is held only for a lookup or an edit, **never across a call into
+/// another subsystem**: the scans below copy a row out (`Thread` is `Copy`),
+/// drop the guard, and only then ask the process table or the scheduler about it.
+static THREADS: Spinlock<[Option<Thread>; MAX_THREADS]> = Spinlock::new([None; MAX_THREADS]);
 
-fn threads() -> *mut [Option<Thread>; MAX_THREADS] {
-    &raw mut THREADS
+/// Row `i`, copied out, or `None` for a free row.
+fn thread_row(i: usize) -> Option<Thread> {
+    THREADS.lock()[i]
 }
 
 /// Set when any thread of a process calls `exit_group`, so its siblings leave
@@ -218,13 +223,11 @@ pub fn clear_group_exiting(proc_slot: usize) {
 /// How many non-main threads of `proc_slot` are still alive.
 #[must_use]
 pub fn live_count(proc_slot: usize) -> usize {
-    // SAFETY: raw-pointer read under the BKL.
-    unsafe {
-        (*threads())
-            .iter()
-            .filter(|t| t.as_ref().is_some_and(|t| t.proc_slot == proc_slot))
-            .count()
-    }
+    THREADS
+        .lock()
+        .iter()
+        .filter(|t| t.as_ref().is_some_and(|t| t.proc_slot == proc_slot))
+        .count()
 }
 
 /// Is the running task a process's main thread (as opposed to a `clone` child)?
@@ -254,11 +257,8 @@ pub fn should_leave_now() -> bool {
 }
 
 pub fn current_thread_slot() -> usize {
-    // SAFETY: under the BKL; the per-CPU `UserCtx` is the running task's.
-    unsafe {
-        let uctx = crate::smp::current_uctx();
-        if uctx.is_null() { NO_THREAD } else { (*uctx).thread_slot }
-    }
+    // Under the BKL; the running task's `UserCtx`.
+    crate::sched::read_current_uctx(|u| u.thread_slot).unwrap_or(NO_THREAD)
 }
 
 /// `clone(flags, child_stack, parent_tid, child_tid, tls)` — x86_64 56, the
@@ -404,21 +404,20 @@ pub fn bind_clone_child(
     proc_slot: usize,
     clear_child_tid: u64,
 ) -> Result<(), &'static str> {
-    // SAFETY: raw-pointer read under the BKL.
-    let Some(slot) = (unsafe { (*threads()).iter().position(Option::is_none) }) else {
+    // Find and claim a free row under one guard, so two cores cannot take the same.
+    let claimed = {
+        let mut table = THREADS.lock();
+        table.iter().position(Option::is_none).map(|slot| {
+            table[slot] = Some(Thread { task, proc_slot, clear_child_tid });
+            slot
+        })
+    };
+    let Some(slot) = claimed else {
         // The caller turns this string into `EAGAIN`, which is what Linux
         // returns at the thread limit and what `pthread_create` reports.
         serial::puts("  [clone] thread table full\n");
         return Err("clone: thread table full");
     };
-    // SAFETY: raw-pointer write under the BKL; `slot` was just found free.
-    unsafe {
-        (*threads())[slot] = Some(Thread {
-            task,
-            proc_slot,
-            clear_child_tid,
-        });
-    }
     crate::sched::seed_thread_slots(task, proc_slot, slot);
     Ok(())
 }
@@ -465,8 +464,7 @@ pub fn run_thread(slot: usize, first: &akuma_exec::process::UserContext) -> ! {
 /// wakes and re-reads sees the old tid and parks again — a lost wakeup that
 /// only shows up when the joiner happens to be scheduled between the two.
 fn teardown(slot: usize) {
-    // SAFETY: raw-pointer access under the BKL.
-    let Some(t) = (unsafe { (*threads())[slot].take() }) else { return };
+    let Some(t) = THREADS.lock()[slot].take() else { return };
     if t.clear_child_tid != 0 {
         let _ = crate::uaccess::write_val::<u32>(t.clear_child_tid, 0);
         crate::futex::sys_futex(t.clear_child_tid, u64::from(FUTEX_WAKE_PRIVATE), 1, 0, 0, 0);
@@ -582,33 +580,30 @@ fn wake_group(proc_slot: usize) {
     // slot with no owner is a leftover and goes.
     let my_tgid = crate::usermode::current_process().map(|p| p.tgid);
     let mut dropped = 0u32;
-    // SAFETY: raw-pointer access under the BKL.
-    unsafe {
-        for row in &mut *threads() {
-            let Some(t) = row.as_ref() else { continue };
-            if t.proc_slot != proc_slot {
-                continue;
-            }
-            let owner_tgid = akuma_exec::process::pid_for_thread(t.task)
-                .and_then(akuma_exec::process::lookup_process_shared)
-                .map(|p| p.tgid);
-            let stale = match owner_tgid {
-                Some(tg) => my_tgid.is_some_and(|mine| mine != tg),
-                None => !akuma_threading::x86_slot_is_live(t.task),
-            };
-            if stale {
-                *row = None;
-                dropped += 1;
-            }
+    for i in 0..MAX_THREADS {
+        // Copied out: the process-table lookups below run with no guard held.
+        let Some(t) = thread_row(i) else { continue };
+        if t.proc_slot != proc_slot {
+            continue;
+        }
+        let owner_tgid = akuma_exec::process::pid_for_thread(t.task)
+            .and_then(akuma_exec::process::lookup_process_shared)
+            .map(|p| p.tgid);
+        let stale = match owner_tgid {
+            Some(tg) => my_tgid.is_some_and(|mine| mine != tg),
+            None => !akuma_threading::x86_slot_is_live(t.task),
+        };
+        if stale {
+            THREADS.lock()[i] = None;
+            dropped += 1;
         }
     }
     if dropped > 0 {
         akuma_primitives::safe_print!(96,
             "[thread] dropped {} stale thread row(s) from proc slot {}\n", dropped, proc_slot);
     }
-    // SAFETY: raw-pointer read under the BKL.
-    unsafe {
-        for t in (*threads()).iter().flatten() {
+    {
+        for t in (0..MAX_THREADS).filter_map(thread_row) {
             if t.proc_slot == proc_slot {
                 // **Waking is not interrupting, and the difference is the
                 // whole of `DRAIN INCOMPLETE`.**

@@ -1895,6 +1895,38 @@ fn check_canaries(slot: usize, when: &str) {
     }
 }
 
+/// The running task's `UserCtx` slot, if this core has published one.
+fn current_uctx_cell() -> Option<&'static BorrowCell<UserCtx>> {
+    // Null before the first switch on a core (and for nothing else): the pointer
+    // is always `MACHINE[slot].uctx.as_ptr()` (`hook_switch_to`, `init`), so the
+    // slot's own cell *is* the thing it names — reached by index, not dereferenced.
+    if smp::current_uctx().is_null() {
+        return None;
+    }
+    let cell = &MACHINE.get(smp::current_task())?.uctx;
+    debug_assert_eq!(cell.as_ptr(), smp::current_uctx(), "current_uctx is not this task's cell");
+    Some(cell)
+}
+
+/// Run `f` on the running task's `UserCtx`, or `None` when this core has none
+/// (the boot task before its first switch).
+///
+/// Replaces `unsafe { let u = smp::current_uctx(); if !u.is_null() { (*u).… } }`,
+/// which appeared at nine sites. The `BorrowCell` is the discipline those blocks
+/// stated in a comment ("only this task writes these fields"): it panics rather
+/// than hand out a second `&mut` if that is ever false. The assembly that reads
+/// the record by offset is outside what a cell can see, but it only runs while no
+/// Rust borrow of the task's own record is open (syscall entry/exit). Keep `f`
+/// trivial: a closure that re-enters this function panics.
+pub fn with_current_uctx<R>(f: impl FnOnce(&mut UserCtx) -> R) -> Option<R> {
+    current_uctx_cell().map(|c| c.with_mut(f))
+}
+
+/// As [`with_current_uctx`], shared: any number of readers may overlap.
+pub fn read_current_uctx<R>(f: impl FnOnce(&UserCtx) -> R) -> Option<R> {
+    current_uctx_cell().map(|c| c.with(f))
+}
+
 pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     // The slot is INITIALIZING and not running.
     let m = MACHINE.get(slot)?;
