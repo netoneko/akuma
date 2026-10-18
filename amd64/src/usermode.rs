@@ -39,7 +39,7 @@ use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
 use crate::loader;
 use crate::phys::phys_ptr;
 use crate::serial;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 const IA32_EFER: u32 = 0xC000_0080;
@@ -4142,6 +4142,7 @@ fn finish_test_process(pid: u32, task_slot: usize) {
 /// which is what an AArch64 spawn has always been, and an `Arc` needs no reap to
 /// notice it is finished. What the row still carries is the pair `waitpid` needs
 /// and nothing else: which pid this slot is, and which task slot to unpublish.
+#[derive(Clone, Copy)]
 struct Spawn {
     pid: u32,
     /// The scheduler task slot running this child, recorded at spawn so the
@@ -4153,10 +4154,65 @@ struct Spawn {
 
 const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
 
-/// The spawn table. `static mut` reached through raw pointers on one core, same
-/// discipline the deleted `PROCS` had: the only writers run inside a syscall (non-preemptible
-/// on this target) and none of them yield while touching it.
-static mut SPAWN: [Option<Spawn>; SPAWN_SLOTS] = [const { None }; SPAWN_SLOTS];
+/// The spawn table: one row per spawned-process slot, as two arrays of atomics.
+///
+/// It was `static mut` reached through raw pointers, on the discipline the deleted
+/// `PROCS` had: the only writers run inside a syscall and none yield while touching
+/// it. That discipline is unchanged — the atomics do not make a *row* update
+/// atomic, only make each word's access defined — but it no longer costs an
+/// `unsafe` block per access. A row is "free" when its `pid` is 0 (no process has
+/// pid 0), so `exec_slot` is written first and `pid` last (Release), and read in
+/// the opposite order.
+struct SpawnTable {
+    pid: [AtomicU32; SPAWN_SLOTS],
+    exec_slot: [AtomicUsize; SPAWN_SLOTS],
+}
+
+impl SpawnTable {
+    const fn new() -> Self {
+        Self {
+            pid: [const { AtomicU32::new(0) }; SPAWN_SLOTS],
+            exec_slot: [const { AtomicUsize::new(0) }; SPAWN_SLOTS],
+        }
+    }
+
+    /// The row at `off`, or `None` when it is free or out of range.
+    fn get(&self, off: usize) -> Option<Spawn> {
+        let pid = self.pid.get(off)?.load(Ordering::Acquire);
+        (pid != 0).then(|| Spawn { pid, exec_slot: self.exec_slot[off].load(Ordering::Relaxed) })
+    }
+
+    fn is_free(&self, off: usize) -> bool {
+        self.get(off).is_none()
+    }
+
+    fn set(&self, off: usize, row: Spawn) {
+        debug_assert!(row.pid != 0, "pid 0 marks a free spawn row");
+        self.exec_slot[off].store(row.exec_slot, Ordering::Relaxed);
+        self.pid[off].store(row.pid, Ordering::Release);
+    }
+
+    fn clear(&self, off: usize) {
+        self.pid[off].store(0, Ordering::Release);
+    }
+
+    /// Rows in use.
+    fn used(&self) -> usize {
+        (0..SPAWN_SLOTS).filter(|&off| !self.is_free(off)).count()
+    }
+
+    /// The first free row's process slot (`SPAWN_SLOT_BASE + offset`).
+    fn first_free_slot(&self) -> Option<usize> {
+        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| self.is_free(s - SPAWN_SLOT_BASE))
+    }
+
+    /// The offset of the row naming `pid`.
+    fn position_of(&self, pid: u32) -> Option<usize> {
+        (0..SPAWN_SLOTS).position(|off| self.get(off).is_some_and(|row| row.pid == pid))
+    }
+}
+
+static SPAWN: SpawnTable = SpawnTable::new();
 
 /// The next pid.
 ///
@@ -4283,10 +4339,6 @@ pub fn current_pid() -> u32 {
     // anything, and they are pid 1's work. That is the same answer the slot
     // walk gave for `slot < SPAWN_SLOT_BASE`.
     akuma_exec::process::current_thread_tgid_process().map_or(1, |(tgid, _)| tgid)
-}
-
-fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
-    &raw mut SPAWN
 }
 
 // ===========================================================================
@@ -5519,20 +5571,12 @@ pub fn bind_child_task(
     // Collect any row the reaper left behind before looking for a free one.
     sweep_reaped_spawn_rows();
 
-    // SAFETY: raw-pointer read; under the BKL inside a syscall.
-    let slot = unsafe {
-        let spawn = spawn_table();
-        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| (*spawn)[s - SPAWN_SLOT_BASE].is_none())
-    };
+    let slot = SPAWN.first_free_slot();
     let Some(slot) = slot else {
         // A bare "out of memory" here reaches the user as `sh: can't fork: Out
         // of memory`, which names the wrong resource: the table is full, and
         // the machine may have gigabytes free. Say which, and how full.
-        // SAFETY: raw-pointer read; under the BKL.
-        let spawn_used = unsafe {
-            let spawn = spawn_table();
-            (0..SPAWN_SLOTS).filter(|&s| (*spawn)[s].is_some()).count()
-        };
+        let spawn_used = SPAWN.used();
         serial::puts("  [fork] no free process slot: SPAWN ");
         serial::put_dec(spawn_used as u64);
         serial::puts("/");
@@ -5543,13 +5587,8 @@ pub fn bind_child_task(
         return Err("fork: no free SPAWN row");
     };
 
-    // SAFETY: raw-pointer write; under the BKL, and the task is unpublished.
-    unsafe {
-        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
-            pid: child.pid,
-            exec_slot: task_slot,
-        });
-    }
+    // Under the BKL, and the task is unpublished.
+    SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid: child.pid, exec_slot: task_slot });
     crate::thread::clear_group_exiting(slot);
     crate::thread::clear_group_exit_status(slot);
     // `seed_proc_slot` alone leaves `UserCtx::thread_slot` untouched. Every
@@ -5692,11 +5731,7 @@ pub fn sys_spawn(
     // since 5b slice 4 — it was `PROCS`, and `fork` consulted both, which is
     // the divergence that made this function and that one disagree about how
     // full the machine was.
-    let slot = {
-        // SAFETY: raw-pointer read; single core.
-        let spawn = unsafe { &*spawn_table() };
-        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| spawn[s - SPAWN_SLOT_BASE].is_none())
-    };
+    let slot = SPAWN.first_free_slot();
     let Some(slot) = slot else {
         return errno::ENOMEM;
     };
@@ -5835,10 +5870,7 @@ pub fn sys_spawn(
         proc.terminal_state.lock().foreground_pgid = pid;
     }
 
-    // SAFETY: raw-pointer write; single core.
-    unsafe {
-        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn { pid, exec_slot: task_slot });
-    }
+    SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid, exec_slot: task_slot });
 
     // A quiet boot's splash hands the screen to the shell **before** the child can
     // be scheduled — it is cleared here, so the first prompt lands on a clean
@@ -5899,12 +5931,7 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     // ends, and the refcounts did the EOF. A manual `close_write` here would
     // be a *second* decrement of a ref the child no longer holds — it would
     // close a live parent-side end.
-    let dying = unsafe {
-        (*spawn_table())
-            .get_mut(proc_slot - SPAWN_SLOT_BASE)
-            .and_then(|s| s.as_ref())
-            .map_or(0, |s| s.pid)
-    };
+    let dying = SPAWN.get(proc_slot - SPAWN_SLOT_BASE).map_or(0, |s| s.pid);
     // **Is the row's pid the process that is actually exiting?** Everything
     // below marks `dying` exited and raises SIGCHLD on its parent. A row left
     // behind by an earlier occupant of this slot would publish the death of a
@@ -6097,8 +6124,8 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         reap_exec_process(child_pid, usize::MAX);
         return u64::from(child_pid);
     };
-    // SAFETY: `slot_off` came from a live row and nothing yields between.
-    let exec_slot = unsafe { (*spawn_table())[slot_off].as_ref().unwrap().exec_slot };
+    // `slot_off` came from a live row and nothing yields between.
+    let exec_slot = SPAWN.get(slot_off).unwrap().exec_slot;
 
     // **Nothing to release here any more.** This used to drop the spawn's own
     // writer reference on the child's stdin pipe — the one no descriptor named,
@@ -6120,11 +6147,9 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         let _ = crate::uaccess::write_val::<i32>(status_ptr, raw);
     }
 
-    // SAFETY: raw-pointer access; single core. The child task is Finished — it
-    // called `sched::finish()` in `run_process` after recording its exit.
-    unsafe {
-        (*spawn_table())[slot_off] = None;
-    }
+    // The child task is Finished — it called `sched::finish()` in `run_process`
+    // after recording its exit.
+    SPAWN.clear(slot_off);
     // 5b slice 1: the child is gone from this target's tables, so it goes from
     // akuma-exec's too. 5b slice 4 gave that line a second job: the registered
     // `Process` **owns** the address space now, so retiring it is also what
@@ -6191,21 +6216,16 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 /// `Arc` out drops it.
 fn sweep_reaped_spawn_rows() {
     for off in 0..SPAWN_SLOTS {
-        // SAFETY: raw-pointer read under the BKL; nothing yields between the
-        // read and the write below.
-        let Some((pid, slot)) = (unsafe {
-            (*spawn_table())[off].as_ref().map(|s| (s.pid, s.exec_slot))
-        }) else {
+        // Under the BKL; nothing yields between the read and the write below.
+        let Some(Spawn { pid, exec_slot: slot }) = SPAWN.get(off) else {
             continue;
         };
         if akuma_exec::process::lookup_process_shared(pid).is_some() {
             continue;
         }
-        // SAFETY: as above; the child's task reached `sched::finish()` before
-        // its process could be unregistered, so nothing is running on `slot`.
-        unsafe {
-            (*spawn_table())[off] = None;
-        }
+        // The child's task reached `sched::finish()` before its process could
+        // be unregistered, so nothing is running on `slot`.
+        SPAWN.clear(off);
         // The identity map entry this row's spawn published, removed only if it
         // still names this pid — task slots are recycled, and stripping a live
         // process's identity would degrade every syscall it makes until its own
@@ -6217,8 +6237,7 @@ fn sweep_reaped_spawn_rows() {
 }
 
 fn spawn_row_of(pid: u32) -> Option<usize> {
-    // SAFETY: raw-pointer read; single core, no row mutated.
-    unsafe { (*spawn_table()).iter().position(|e| e.as_ref().is_some_and(|s| s.pid == pid)) }
+    SPAWN.position_of(pid)
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -6378,11 +6397,7 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
 
     sweep_reaped_spawn_rows();
     // The same search `sys_spawn` runs, so the poison lands where the child will.
-    let next = {
-        // SAFETY: raw-pointer read under the BKL.
-        let spawn = unsafe { &*spawn_table() };
-        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| spawn[s - SPAWN_SLOT_BASE].is_none())
-    };
+    let next = SPAWN.first_free_slot();
     let Some(next) = next else {
         t.check("stale group: a free spawn slot to poison", false);
         return;

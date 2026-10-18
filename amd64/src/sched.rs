@@ -74,9 +74,10 @@ use crate::usermode::UserCtx;
 // because that is where the type lives and this file needs nothing else from
 // the bigger crate; the two paths name one struct.
 use akuma_exec_core::process::UserContext;
-use alloc::vec;
+use alloc::vec::Vec;
+use akuma_primitives::OnceCopy;
 use akuma_primitives::cell::BorrowCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Per-thread kernel stack. Generous: these are `Vec` allocations from a large
 /// heap, and a stack overflow here has no guard page to catch it.
@@ -150,15 +151,13 @@ struct Machine {
     uctx: BorrowCell<UserCtx>,
     /// Stack the CPU switches to when this thread traps from ring 3.
     trap_stack_top: AtomicU64,
-    /// Base of this slot's kernel stack, and of its trap stack, or `0` if it has
-    /// never been given one.
+    /// This slot's kernel stack and its trap stack, once it has been given them.
     ///
     /// Kept so a **recycled** slot reuses the stacks it already owns. Without
     /// these, reclaiming a slot would `leak()` two fresh 32 KiB stacks every
     /// time and turn a slot leak into a memory leak — strictly worse than the
-    /// exhaustion it was meant to fix.
-    stack_base: AtomicUsize,
-    trap_base: AtomicUsize,
+    /// exhaustion it was meant to fix. Set once, never replaced.
+    stacks: OnceCopy<Stacks>,
     /// This thread's SSE/x87 registers while it is not running. Handed to
     /// `xsave`/`xrstor` by pointer.
     fx: BorrowCell<FxArea>,
@@ -176,14 +175,50 @@ struct Machine {
     pinned: AtomicU32,
 }
 
+/// A thread's two stacks, as memory the kernel owns and the CPU also writes.
+///
+/// Words of `AtomicU64` rather than bytes: the stack is used by running code
+/// through the stack pointer, which Rust cannot see, so the allocation is
+/// `UnsafeCell`-shaped from the start — and that is what lets the canary at its
+/// base be read and written through a shared reference with no `unsafe`. The
+/// stack proper is addressed by [`Stacks::kernel_base`] / [`Stacks::trap_base`],
+/// which are only numbers handed to the context switch.
+#[derive(Clone, Copy)]
+struct Stacks {
+    kernel: &'static [AtomicU64],
+    trap: &'static [AtomicU64],
+}
+
+impl Stacks {
+    /// Two fresh zeroed stacks, leaked: a thread's stack must outlive the frame
+    /// that made it. Bounded by `MAX_TASKS`, because a slot is given its pair once.
+    fn leak_new() -> Self {
+        fn one() -> &'static [AtomicU64] {
+            let words: Vec<AtomicU64> = (0..STACK_SIZE / 8).map(|_| AtomicU64::new(0)).collect();
+            // No alignment is promised beyond 8, and none is needed: the context
+            // builder masks the entry slot to 16 (`x86_build_closure_context`)
+            // and the trap stack's top is masked below.
+            words.leak()
+        }
+        Self { kernel: one(), trap: one() }
+    }
+
+    fn kernel_base(self) -> usize {
+        self.kernel.as_ptr() as usize
+    }
+
+    fn trap_base(self) -> usize {
+        self.trap.as_ptr() as usize
+    }
+}
+
 impl Machine {
     const fn empty() -> Self {
         Self {
             space_root: AtomicU64::new(0),
             uctx: BorrowCell::new(UserCtx::new()),
             trap_stack_top: AtomicU64::new(0),
-            stack_base: AtomicUsize::new(0),
-            trap_base: AtomicUsize::new(0),
+            stacks: OnceCopy::new(),
             fx: BorrowCell::new(FxArea::initial()),
             daemon: AtomicBool::new(false),
             idle: AtomicBool::new(false),
@@ -1323,24 +1358,16 @@ pub fn idle_loop() -> ! {
             if budget > 1 {
                 crate::lapic::arm_idle_shot(budget);
             }
-            // SAFETY: interrupts on for exactly the `hlt`, then off again. The
-            // timer vector is installed and its handler takes the BKL itself.
+            // Interrupts on for exactly the `hlt`, then off again. The timer
+            // vector is installed and its handler takes the BKL itself.
             // `idlemwait` swaps the same bracket's wait instruction; the CPUID
             // gate ran at `set_idle_policy_from_cmdline`.
             if IDLE_MWAIT.load(Ordering::Relaxed) != 0 {
-                // SAFETY: as the `hlt` bracket. EAX is the MWAIT hint (0 = the
-                // lightest state, never a part-specific deep-state hint) and
-                // ECX its extension flags (none); both zeroed because a
-                // garbage hint is a firmware-defined C-state, not an idle.
-                unsafe {
-                    core::arch::asm!("sti", "mwait", "cli",
-                                     in("eax") 0u32, in("ecx") 0u32,
-                                     options(nomem, nostack));
-                }
+                // The lightest MWAIT hint (`IDLE_MWAIT` is set only when CPUID
+                // advertises MONITOR/MWAIT).
+                akuma_cpu::park::wfi_mwait();
             } else {
-                unsafe {
-                    core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
-                }
+                akuma_cpu::park::wfi();
             }
             crate::lapic::restore_periodic();
             // The shot (if any) was cancelled by a non-timer wake: credit the
@@ -1561,23 +1588,14 @@ const STACK_CANARY: u64 = 0xC0FF_EE15_DEAD_BEEF;
 /// overrun can step over a single word, and 32 bytes out of 32 KiB is free.
 const CANARY_WORDS: usize = 4;
 
-fn paint_canary(base: usize) {
-    for i in 0..CANARY_WORDS {
-        // SAFETY: `base` is the start of a live `STACK_SIZE` allocation this
-        // function owns; `CANARY_WORDS * 8` is far inside it.
-        unsafe { ((base + i * 8) as *mut u64).write_volatile(STACK_CANARY) };
+fn paint_canary(stack: &[AtomicU64]) {
+    for w in &stack[..CANARY_WORDS] {
+        w.store(STACK_CANARY, Ordering::Relaxed);
     }
 }
 
-fn canary_intact(base: usize) -> bool {
-    if base == 0 {
-        return true;
-    }
-    (0..CANARY_WORDS).all(|i| {
-        // SAFETY: as `paint_canary`.
-        let w = unsafe { ((base + i * 8) as *const u64).read_volatile() };
-        w == STACK_CANARY
-    })
+fn canary_intact(stack: &[AtomicU64]) -> bool {
+    stack[..CANARY_WORDS].iter().all(|w| w.load(Ordering::Relaxed) == STACK_CANARY)
 }
 
 /// Canary failures seen this boot. Non-zero means some thread wrote past the
@@ -1845,10 +1863,12 @@ pub fn stack_canary_failures() -> u64 {
 /// outgoing one names a thread that has just overflowed, the incoming one names
 /// a victim *before* it resumes onto a frame somebody else rewrote.
 fn check_canaries(slot: usize, when: &str) {
-    let m = &MACHINE[slot];
-    let (kbase, tbase) = (m.stack_base.load(Ordering::Relaxed), m.trap_base.load(Ordering::Relaxed));
-    for (base, which) in [(kbase, "kernel"), (tbase, "trap")] {
-        if canary_intact(base) {
+    let Some(stacks) = MACHINE[slot].stacks.get() else {
+        return; // never given stacks: nothing to check
+    };
+    for (stack, which) in [(stacks.kernel, "kernel"), (stacks.trap, "trap")] {
+        let base = stack.as_ptr() as usize;
+        if canary_intact(stack) {
             continue;
         }
         let n = CANARY_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -1864,51 +1884,43 @@ fn check_canaries(slot: usize, when: &str) {
             serial::puts(" core=");
             serial::put_dec(smp::cpu_index() as u64);
             serial::puts(" w0=0x");
-            // SAFETY: as `canary_intact` — the base of a live stack.
-            serial::put_hex(unsafe { (base as *const u64).read_volatile() });
+            serial::put_hex(stack[0].load(Ordering::Relaxed));
             serial::puts("\n");
         }
         // Repaint, so the next check reports a *new* overflow rather than this
         // one again on every switch for the rest of the boot.
-        paint_canary(base);
+        paint_canary(stack);
     }
 }
 
 pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     // The slot is INITIALIZING and not running.
     let m = MACHINE.get(slot)?;
-    let (have_stack, have_trap) = (m.stack_base.load(Ordering::Relaxed), m.trap_base.load(Ordering::Relaxed));
 
     // Leaked deliberately on first use: a thread's stack must outlive the frame
     // that made it. Bounded by `MAX_TASKS`, not by how many processes ever ran,
-    // because a recycled slot arrives here with its pair already set.
-    let stack_base = if have_stack == 0 {
-        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
-    } else {
-        have_stack
+    // because a recycled slot arrives here with its pair already set. The second
+    // stack is for traps taken while this thread is in ring 3; separate from its
+    // kernel stack because a preempted thread is suspended on the interrupt
+    // frame, and the two must not overlap.
+    let stacks = match m.stacks.get() {
+        Some(stacks) => stacks,
+        None => {
+            m.stacks.set(Stacks::leak_new());
+            m.stacks.get()?
+        }
     };
-    let stack_top = stack_base + STACK_SIZE;
-
-    // A second stack, for traps taken while this thread is in ring 3. Separate
-    // from its kernel stack because a preempted thread is suspended on the
-    // interrupt frame, and the two must not overlap.
-    let trap_base = if have_trap == 0 {
-        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
-    } else {
-        have_trap
-    };
+    let stack_top = stacks.kernel_base() + STACK_SIZE;
     // Repainted on every reuse, not only on first allocation: a recycled slot
     // inherits its pair, and a canary checked but never rewritten would report
     // the previous occupant's overflow forever.
-    paint_canary(stack_base);
-    paint_canary(trap_base);
-    let trap_top = (trap_base + STACK_SIZE) & !0xf;
+    paint_canary(stacks.kernel);
+    paint_canary(stacks.trap);
+    let trap_top = (stacks.trap_base() + STACK_SIZE) & !0xf;
 
     reset_slot_counters(slot);
     // Under the BKL; the slot is INITIALIZING, so nothing runs on it.
     m.trap_stack_top.store(trap_top as u64, Ordering::Relaxed);
-    m.stack_base.store(stack_base, Ordering::Relaxed);
-    m.trap_base.store(trap_base, Ordering::Relaxed);
     m.space_root.store(0, Ordering::Relaxed);
     m.daemon.store(false, Ordering::Relaxed);
     m.idle.store(false, Ordering::Relaxed);
@@ -2178,21 +2190,17 @@ pub fn allow_tick() {
         // The parked caller's own deadline is in `WAKE_TIMES`; halt until it,
         // not until the next tick (`lapic::arm_deadline`).
         crate::lapic::arm_deadline();
-        // SAFETY: interrupts on for exactly the `hlt`, then off again — the
-        // same bracket `idle_loop` uses.
-        unsafe {
-            core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
-        }
+        // Interrupts on for exactly the `hlt`, then off again — the same
+        // bracket `idle_loop` uses.
+        akuma_cpu::park::wfi();
         crate::lapic::restore_periodic();
         if held {
             crate::smp::bkl_enter();
         }
     } else {
         ALLOW_TICK_SPINS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: interrupts on for exactly one instruction.
-        unsafe {
-            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
-        }
+        // Interrupts on for exactly one instruction.
+        akuma_cpu::park::irq_window();
     }
 }
 

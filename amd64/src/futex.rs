@@ -47,6 +47,8 @@ use akuma_syscalls_sync::table::{Key, MATCH_ANY, WaiterId, WaiterTable};
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use spinning_top::Spinlock;
+
 use crate::fd::errno;
 use crate::serial;
 
@@ -75,15 +77,13 @@ impl WaiterId for Waiter {
 
 /// The waiter table.
 ///
-/// `static mut` behind a raw pointer, reached only from syscall context under
-/// the BKL — the discipline `usermode::PROCS` had before 5b slice 4 deleted it,
-/// and for the same reason: every writer is kernel code, kernel code holds the
-/// lock, and a context switch keeps it held.
-static mut WAITERS: WaiterTable<Waiter> = WaiterTable::new();
-
-fn waiters() -> *mut WaiterTable<Waiter> {
-    &raw mut WAITERS
-}
+/// It was `static mut` behind a raw pointer, on the claim that every access is
+/// syscall context under the BKL. Most are; thread teardown ([`purge_task`]) is
+/// the one that is not obviously so, and the claim was never checked by anything.
+/// A spinlock makes it a fact. It nests *inside* the BKL and no holder waits for
+/// anything while holding it (the wake results are returned and resumed after the
+/// guard is gone), so it cannot invert against it.
+static WAITERS: Spinlock<WaiterTable<Waiter>> = Spinlock::new(WaiterTable::new());
 
 /// Has the `(0, uaddr)` fallback ever been taken? A tripwire, printed once.
 static DEGRADED_SEEN: core::sync::atomic::AtomicBool =
@@ -172,8 +172,7 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
     if cur != val {
         return errno::EAGAIN;
     }
-    // SAFETY: raw-pointer access under the BKL; see `WAITERS`.
-    unsafe { (*waiters()).enqueue(key, Waiter(me, crate::net::uptime_us()), bitset) };
+    WAITERS.lock().enqueue(key, Waiter(me, crate::net::uptime_us()), bitset);
     WAIT_ENQUEUES.fetch_add(1, Ordering::Relaxed);
 
     loop {
@@ -218,8 +217,7 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         }
         // Off the table is the wake. Checked with `iter` rather than `queue()`
         // or `locate_and_take` because those two allocate; this borrows.
-        // SAFETY: raw-pointer access under the BKL.
-        let still = unsafe { queued_key(&*waiters(), tgid, me) };
+        let still = queued_key(&WAITERS.lock(), tgid, me);
         if still.is_none() {
             return 0;
         }
@@ -232,8 +230,7 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         // spins for it. Both loops make progress and neither terminates, which
         // is the worst shape a deadlock can take because nothing looks stuck.
         if crate::thread::should_leave_now() {
-            // SAFETY: raw-pointer access under the BKL.
-            let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
+            let _ = WAITERS.lock().remove_anywhere(tgid, me);
             return errno::EINTR;
         }
         // **And the leader's route out, which the line above cannot be.**
@@ -263,8 +260,7 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         // it, and the retry is what carries the thread through the syscall
         // epilogue where `group_exit_status` is waiting for it.
         if akuma_exec::process::should_interrupt_blocking_syscall() {
-            // SAFETY: raw-pointer access under the BKL.
-            let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
+            let _ = WAITERS.lock().remove_anywhere(tgid, me);
             return errno::EINTR;
         }
         if deadline::expired(deadline_at, crate::net::uptime_us()) {
@@ -272,8 +268,7 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
             // have moved this waiter behind its back, and dequeuing from the
             // original key would leave the entry on the requeue target where it
             // silently absorbs a later wake.
-            // SAFETY: raw-pointer access under the BKL.
-            let _ = unsafe { (*waiters()).remove_anywhere(tgid, me) };
+            let _ = WAITERS.lock().remove_anywhere(tgid, me);
             return errno::ETIMEDOUT;
         }
         // Park. `deadline_at` is an absolute *uptime* deadline in both arms —
@@ -301,8 +296,7 @@ fn queued_key(t: &WaiterTable<Waiter>, tgid: u32, tid: usize) -> Option<Key> {
 
 fn wake(uaddr: u64, val: u32, mask: u32, private: bool) -> u64 {
     let key: Key = (namespace(private), uaddr as usize);
-    // SAFETY: raw-pointer access under the BKL.
-    let woken = unsafe { (*waiters()).wake(key, val, mask) };
+    let woken = WAITERS.lock().wake(key, val, mask);
     WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
     if woken.is_empty() {
         // A wake that found nobody. **Not by itself a bug** — the overwhelmingly
@@ -362,9 +356,7 @@ pub fn dump_waiters() {
     akuma_primitives::safe_print!(160,
         "[FUTEX] wakes={} empty={} woken={} enqueues={}\n", calls, empty, woken, enq);
     let now = crate::net::uptime_us();
-    // SAFETY: raw-pointer read under the BKL, the same discipline every other
-    // reader of this table uses.
-    let t = unsafe { &*waiters() };
+    let t = WAITERS.lock();
     let mut keys = 0usize;
     for (key, q) in t.iter() {
         if q.is_empty() {
@@ -431,15 +423,12 @@ fn requeue(
         }
     }
     let tgid = namespace(private);
-    // SAFETY: raw-pointer access under the BKL.
-    let (woken, moved) = unsafe {
-        (*waiters()).requeue(
-            (tgid, uaddr as usize),
-            (tgid, uaddr2 as usize),
-            val,
-            val2.min(u64::from(u32::MAX)) as u32,
-        )
-    };
+    let (woken, moved) = WAITERS.lock().requeue(
+        (tgid, uaddr as usize),
+        (tgid, uaddr2 as usize),
+        val,
+        val2.min(u64::from(u32::MAX)) as u32,
+    );
     resume(&woken);
     // The requeued waiters are deliberately **not** resumed: they were moved to
     // another key, not woken, and they are still queued. Waking them would be
@@ -467,14 +456,12 @@ fn wake_op(uaddr: u64, uaddr2: u64, val: u32, val2: u64, val3: u32, private: boo
         return errno::EFAULT;
     }
     let tgid = namespace(private);
-    // SAFETY: raw-pointer access under the BKL.
-    let first = unsafe { (*waiters()).wake((tgid, uaddr as usize), val, MATCH_ANY) };
+    let first = WAITERS.lock().wake((tgid, uaddr as usize), val, MATCH_ANY);
     resume(&first);
     let mut n = first.len();
     if decoded.compare(oldval) {
         let cap = val2.min(u64::from(u32::MAX)) as u32;
-        // SAFETY: raw-pointer access under the BKL.
-        let second = unsafe { (*waiters()).wake((tgid, uaddr2 as usize), cap, MATCH_ANY) };
+        let second = WAITERS.lock().wake((tgid, uaddr2 as usize), cap, MATCH_ANY);
         resume(&second);
         n += second.len();
     }
@@ -498,8 +485,7 @@ fn wake_op(uaddr: u64, uaddr2: u64, val: u32, val2: u64, val3: u32, private: boo
 /// which is the only reading of it that is not a silent no-op.
 pub fn wake_key(tgid: u32, uaddr: usize, count: i32) -> usize {
     let n = if count < 0 { u32::MAX } else { count.cast_unsigned() };
-    // SAFETY: raw-pointer access under the BKL; see `WAITERS`.
-    let woken = unsafe { (*waiters()).wake((tgid, uaddr), n, MATCH_ANY) };
+    let woken = WAITERS.lock().wake((tgid, uaddr), n, MATCH_ANY);
     resume(&woken);
     woken.len()
 }
@@ -511,7 +497,6 @@ pub fn wake_key(tgid: u32, uaddr: usize, count: i32) -> usize {
 /// already dequeued itself and this finds nothing; one killed while parked has
 /// not, and without this its entry would name whoever inherits the slot.
 pub fn purge_task(task: usize) {
-    // SAFETY: raw-pointer access under the BKL.
-    let touched = unsafe { (*waiters()).purge(task) };
+    let touched = WAITERS.lock().purge(task);
     let _ = touched;
 }

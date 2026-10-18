@@ -618,6 +618,56 @@ pub mod park {
         };
     }
 
+    /// `sti; mwait; cli` — the idle bracket of [`wfi`] using `MWAIT` instead of
+    /// `HLT`, with the lightest hint (`EAX=0`) and no extension flags (`ECX=0`).
+    ///
+    /// Both registers are zeroed on purpose: a garbage hint is a
+    /// firmware-defined C-state, not an idle. No `MONITOR` is armed, so this
+    /// wakes on an interrupt and nothing else — the same contract as `hlt` with
+    /// a different, on some parts cheaper, wake path. **Callers must have
+    /// checked `CPUID.01H:ECX.MONITOR` first**; `mwait` is `#UD` without it.
+    /// That precondition is the caller's, and a violation is a fault, not a
+    /// memory-safety problem.
+    ///
+    /// On AArch64 this is [`wfi`]: the closest thing the architecture has.
+    #[inline(always)]
+    pub fn wfi_mwait() {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        wfi();
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as `wfi`; EAX/ECX are the zero hint and flags.
+        unsafe {
+            core::arch::asm!(
+                "sti", "mwait", "cli",
+                in("eax") 0u32, in("ecx") 0u32,
+                options(nomem, nostack)
+            );
+        };
+    }
+
+    /// `sti; nop; cli` — open the interrupt window for exactly one instruction.
+    ///
+    /// `sti` takes effect after the *following* instruction, so a pending
+    /// interrupt is taken at the `nop` boundary and no later. Used by the spin
+    /// path that must let a tick land without committing to a halt. On AArch64
+    /// there is no one-instruction window; this unmasks and re-masks IRQs
+    /// around a `nop`.
+    #[inline(always)]
+    pub fn irq_window() {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            super::daif::unmask_irq();
+            nop();
+            super::daif::mask_irq();
+        }
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: interrupts are on for exactly one instruction, then off again;
+        // `cli` restores the masked state kernel code runs under.
+        unsafe {
+            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+        };
+    }
+
     /// `wfe` — wait for event.
     #[inline(always)]
     pub fn wfe() {
