@@ -132,7 +132,7 @@ restore skips a non-canonical stored value instead of faulting the switch.
 | `scripts/check_unsafe_budget.py` | ok, ratcheted 708 → 600 |
 | QEMU microvm `SMP=4` boot suite | 824 passed / 0 failed on every quiet run of every commit; the thread-probe flake above is the only failure seen |
 | QEMU q35 `run-xhci.sh` | 495 passed / 5 failed — the 5 documented `root=/dev/sda1` FS failures |
-| **trashcan (HP, bare metal, multiboot2, 4 cores)** | see below |
+| **trashcan (HP, bare metal, multiboot2, 4 cores)**, Mac-built `d6ed6691` (md5 `2aa83fa8…`), pushed with `hpbox.akuma_push`, installed with `kinstall`, `reboot -f` | **boots, ssh up, 4 cores.** `uname -v` = `d6ed6691`; `[fb] 3840x2160 … wc on clear 10.9ms = 3024MB/s` (the `MmioWindow`/`fill32`/`Table`-based `map_wc`/PAT path, same as the 3026 MB/s measured before); 0 of `PANIC`/`CANARY`/`[Fault]`/`FREED-CR3`/`SWITCH NO-BKL`/`TLB stuck` in `dmesg`. **Self-test: 777 passed, 1 FAILED - `physmap: reaches PHYSMAP_LIMIT` (`translate` of the last page of the 64 GiB physmap is `None`; the 4 GiB probe passes).** Not yet classified: no control run exists. The session-start baseline `c1fe3655`, Mac-built, is at `/root/akuma-amd64.base` on the box (md5 `9b9ca29e…`), **not installed**; booting it answers whether this failure predates the audit. Not run on metal: spawn stress, an incremental `kbuild`. |
 
 The multiboot2/framebuffer code (`multiboot2.rs`) is **not** executed by the PVH QEMU
 runs. The trashcan boots through it (GRUB multiboot2, framebuffer console, WC mapping),
