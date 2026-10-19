@@ -1,8 +1,8 @@
 # `physmap: reaches PHYSMAP_LIMIT` [FAIL]: bisected to `410117ce` (akuma-fbdev + akuma-fbcon)
 
-**Date:** 2026-10-18. **Status:** breaking commit found by rehearsal bisect; the
-corruption *mechanism* is still a theory (boot-stack overflow is the prime one). One
-instrumented rehearsal closes it — see "How to finish this".
+**Date:** 2026-10-18; **FIXED 2026-10-19** (see "Resolution"). Breaking commit found by
+rehearsal bisect; mechanism **confirmed**: the boot stack overflowed into the page
+directories.
 
 ## The symptom
 
@@ -137,6 +137,46 @@ range arithmetic was checked and only ever touches the framebuffer's directories
    Note `physmap_covers_its_limit`'s promise: this test exists so that a drift in
    the boot map is "a failed self-test rather than a `phys_to_virt` that returns a
    plausible pointer into nothing" — it caught exactly that, four days late.
+
+## Resolution (2026-10-19)
+
+**Mechanism, measured.** A temporary diagnostic in `physmap_covers_its_limit` printed
+the last-page walk, a per-page map of `__pd0`'s entries against what `boot.s` wrote,
+and the boot stack's high-water mark. On the failing kernel (ryzen rehearsal, entry 2):
+
+```
+[bootdiag] last-page walk: Missing level 2
+[bootdiag] pd page 56 bad entries=383 first at slot 129
+[bootdiag] pd page 57..63 bad entries=512 each
+[bootdiag] ap_pml4[0..6] = 0020000000000020 0000002000000000 0000000000200000 (repeating)
+```
+
+The garbage is a repeating 6-byte pattern, `0x20` every 6 bytes: console `Cell`s
+(`cp: u16, fg, bg, flags` = 6 B, blank = ' '). `410117ce` raised `MAX_COLS` x `MAX_ROWS` to
+240 x 68, so the grid is **97,920 B**, and `Console::new` -> `with_font` ->
+`with_font_and_scale` each *return it by value*. Rebuilt with the stack enlarged to
+1 MiB (so nothing could overflow) the high-water mark read **297,976 B** -- three
+copies, 41 KB past the 256 KiB stack, through `__ap_pml4` and into the tail of `__pd0`
+(page 56 slot 129 onward). `physmap: reaches PHYSMAP_LIMIT` is the only thing that reads
+the last PDE, which is why nothing else ever noticed. `nofb` and PVH never build a grid.
+
+**Fix.** The constructor chain in `akuma-fbcon` (`new`, `with_font`, `with_scale`,
+`with_font_and_scale`) is `#[inline(always)]`, so the struct is built in the caller's
+destination rather than once per layer. Peak boot-stack depth **297,976 B -> 147,968 B**
+(about 1.5 grids; the rest is `Option` + the `FbConsole` wrapper), 108 KiB inside the
+256 KiB stack. Verified, tests-enabled kernel, OVMF -> GRUB -> multiboot2:
+
+| entry | console | result |
+|---|---|---|
+| 2 | framebuffer | **804 passed, 0 failed** (was 803 / 1 FAILED) |
+| 4 | `nofb` | 804 passed, 0 failed |
+
+**Not done, deliberately.** The stack still has no guard and still sits below the page
+directories; an overflow is still silent except for this self-test. Moving
+`__boot_stack` below the tables would trade that for corrupting `.boot` code, so the
+self-test stays the alarm, and the comment above `with_font_and_scale` says so. If
+`MAX_COLS`/`MAX_ROWS` grow again, re-measure: the diagnostic is ~60 lines -- print
+`__boot_stack_top - lowest nonzero qword` after `init_console`.
 
 ## Why it matters beyond one test line
 

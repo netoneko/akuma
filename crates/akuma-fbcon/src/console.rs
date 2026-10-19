@@ -323,12 +323,16 @@ impl<S: Surface> Console<S> {
     /// scale 1 — a firmware that reported a 40-pixel-wide framebuffer, or a
     /// mis-parsed tag. Better a caller that knows than a console that divides
     /// by zero.
+    #[allow(clippy::inline_always)] // the grid must be built in the caller's frame; see `with_font_and_scale`
+    #[inline(always)]
     pub fn new(surface: S) -> Option<Self> {
         let font = Self::choose_font(surface.width(), surface.height());
         Self::with_font(surface, font)
     }
 
     /// As [`Console::new`], in a font the caller names. No fallback.
+    #[allow(clippy::inline_always)] // the grid must be built in the caller's frame; see `with_font_and_scale`
+    #[inline(always)]
     pub fn with_font(surface: S, font: &'static Font) -> Option<Self> {
         let scale = Self::auto_scale(font, surface.height());
         Self::with_font_and_scale(surface, font, scale)
@@ -339,11 +343,15 @@ impl<S: Surface> Console<S> {
     /// No fallback: a caller naming a scale has already taken the decision away
     /// from the console, and silently swapping the font underneath that would
     /// be the surprising half of an override.
+    #[allow(clippy::inline_always)] // the grid must be built in the caller's frame; see `with_font_and_scale`
+    #[inline(always)]
     pub fn with_scale(surface: S, scale: usize) -> Option<Self> {
         Self::with_font_and_scale(surface, DEFAULT_FONT, scale)
     }
 
     /// As [`Console::new`], with both the font and the scale chosen by the caller.
+    #[allow(clippy::inline_always)] // the grid must be built in the caller's frame; see `with_font_and_scale`
+    #[inline(always)]
     pub fn with_font_and_scale(surface: S, font: &'static Font, scale: usize) -> Option<Self> {
         let scale = scale.max(1);
         let (w, h) = (surface.width(), surface.height());
@@ -352,8 +360,15 @@ impl<S: Surface> Console<S> {
 
         // The grid is the console's whole reason to exist (video memory is
         // never read back), and it is built once, at boot, on a stack of 256 KiB
-        // (`boot.s`): about 54 KiB of cells here, so a handful of moves is
-        // survivable and a hundred would not be.
+        // (`boot.s`). It is `MAX_COLS * MAX_ROWS * 6` bytes -- 98 KiB at 240x68 --
+        // and every by-value return of a `Console` is a copy of it, so the whole
+        // constructor chain is `#[inline(always)]`: it lets the struct be built
+        // in the caller's destination instead of once per layer. Measured
+        // 2026-10-19 (docs/archive/AMD64_PHYSMAP_SELFTEST_LAST_PDE.md): without it
+        // `init_console` peaked at 298 KB of boot stack -- three grids, 40 KB past
+        // the end of the stack and into the page directories -- and with it 148 KB.
+        // If `MAX_COLS`/`MAX_ROWS` grow again, the `physmap: reaches PHYSMAP_LIMIT`
+        // self-test is the alarm.
         #[allow(clippy::large_stack_arrays)]
         Some(Self {
             surface,

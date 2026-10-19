@@ -758,7 +758,7 @@ fn init_console(info: &BootInfo<'_>) -> Result<ConsoleUp, &'static str> {
     surface.flush();
 
     // Built **straight into the static** rather than into a local first. The
-    // console owns its whole character grid (about 54 KiB: code point, colours and
+    // console owns its whole character grid (98 KiB: code point, colours and
     // flags per cell), and a named local plus the moves around it are copies of
     // that on a boot stack with no guard page beneath it. `Option::map` writes the
     // wrapper in place of the construction, and everything after goes through the
