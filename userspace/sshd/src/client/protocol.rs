@@ -119,7 +119,7 @@ const DEFAULT_RECONNECT_ATTEMPTS: u64 = 10;
 const RECONNECT_DELAY_BASE_MS: u64 = 2_000;
 const RECONNECT_DELAY_CAP_MS: u64 = 30_000;
 
-/// Raw mode flags (`akuma_terminal::mode_flags`), duplicated locally the same
+/// Raw mode flags (`akuma_tty::mode_flags`), duplicated locally the same
 /// way `userspace/termtest` does — libakuma doesn't re-export them.
 mod mode_flags {
     pub const RAW_MODE_ENABLE: u64 = 0x01;

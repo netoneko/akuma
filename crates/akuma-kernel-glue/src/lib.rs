@@ -993,8 +993,13 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Exception-path hooks: the dispatcher + the EL0-trap diagnostic the IRQ
     // and SVC entry points call out to. Registered BEFORE `exceptions::init()`
-    // — no exception can be handled before it installs VBAR and unmasks IRQs,
-    // which is what keeps the hooks' `require()` unreachable-empty.
+    // — no exception can be handled on THIS core before it installs VBAR and
+    // unmasks IRQs. Secondaries are a different matter: the self-test image
+    // starts them above, before this point, so they are held at
+    // `smp_shared::open_secondary_irq_gate()` (opened after `timer::init`)
+    // instead of unmasking IRQs on their own — without that, a core-1 tick
+    // arriving before this registration panicked in `hooks()` (intermittent,
+    // `SMP>=2`; docs/archive/AARCH64_SMP_HOOKS_RACE.md).
     exceptions::register_config(exceptions::ExceptionsConfig {
         verify_svc_at_entry: config::VERIFY_SVC_AT_ENTRY,
         process_syscall_stats: config::PROCESS_SYSCALL_STATS,
@@ -1052,6 +1057,11 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // Initialize timer
     timer::init();
     console::print("Timer initialized\n");
+
+    // Secondaries brought up earlier (self-test image) are parked before their GIC/IRQ
+    // setup until here: hooks registered, vectors installed, tick period published.
+    #[cfg(kernel_smp_shared)]
+    smp_shared::open_secondary_irq_gate();
 
     // =========================================================================
     // Hardware RNG initialization

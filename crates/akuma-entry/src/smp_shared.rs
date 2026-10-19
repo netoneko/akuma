@@ -76,6 +76,30 @@ static PROBED_MPIDRS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX
 /// (not replicated) — a plain kernel static IS cross-core state in this build.
 static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Set by the BSP once everything a secondary's **first tick** needs exists:
+/// `exceptions::register_hooks` (the IRQ path calls `hooks()`, which panics on an
+/// empty table), the BSP's own vectors, and `timer::init`'s published tick period
+/// (a secondary arms its timer from it).
+///
+/// The self-test image brings secondaries up *before* any of that
+/// (`kernel_main`, "Boot SELF-TEST image"), and a secondary used to unmask IRQs
+/// straight away — so whether it died with `exceptions: ExceptionHooks not
+/// registered` depended on whether the BSP finished registering inside one tick
+/// (a few ms) of the secondary coming online. Slow console output (Lima/KVM,
+/// cold host) made the BSP lose; fast boots won. Measured: intermittent at
+/// `SMP>=2`, never at `SMP=1`. See `docs/archive/AARCH64_SMP_HOOKS_RACE.md`.
+///
+/// The runtime image brings secondaries up after the gate would be open, so the
+/// wait there is a single load.
+static BSP_IRQ_READY: AtomicBool = AtomicBool::new(false);
+
+/// Let the secondaries start taking interrupts. Called by `kernel_main` once the
+/// exception hooks are registered, the BSP's vectors are installed and the timer
+/// is initialised. Idempotent.
+pub fn open_secondary_irq_gate() {
+    BSP_IRQ_READY.store(true, Ordering::Release);
+}
+
 /// Bitmask of cores currently halted in their idle loop (bit `aff0` set = idle). Used
 /// by [`wake_remote_idle`] to nudge an idle core to pick up a just-woken thread
 /// promptly (M4 cross-core wakeup) instead of waiting for its ~10 ms timer tick.
@@ -586,6 +610,13 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
         }
     };
     akuma_kernel_core::safe_print!(64, "[SMP-shared] core {} online (idle tid {})\n", core, slot);
+
+    // Do not touch interrupts until the BSP can handle one — see [`BSP_IRQ_READY`].
+    // Plain spin: nothing here needs an IRQ or an event, and this core holds no lock
+    // (not the BKL either: it first takes it in the idle loop below).
+    while !BSP_IRQ_READY.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
 
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
     akuma_gic::secondary_init(core, redistributor_layout());
