@@ -111,9 +111,26 @@ restore skips a non-canonical stored value instead of faulting the switch.
      match. 50 stats: 11.9 s → 0.58 s.
   After all three, `ls /root` completes (~5 min for 145 k entries) and the box
   stays fully responsive throughout — ssh answered in 0.18 s mid-listing; the
-  original "one ls wedges every other syscall" is gone. **Still open, and now
-  the whole remaining cost**: lookups are a linear dirent scan, and `ls` stats
-  each entry once — ~2 ms × 145 k. Real Linux has the same O(n) scan on
+  original "one ls wedges every other syscall" is gone. **Why /root had 145 k
+  entries at all**: `/root/hda-capture.sh` — a meow-written HDA debug capture,
+  run by herd's `hda-capture` service with `restart = true` — wrote a
+  `dmesg-boot-<ts>.txt` into `/root` **every ~3 s** (the service exits
+  immediately, herd restarts it): 146,113 files since Oct 9, ~9 GB, and the
+  5.5 MiB directory that turned every lookup into a linear scan. Fixed
+  2026-10-19: the script now writes `/var/log/dmesg/hda-boot-*.txt` and prunes
+  to the newest 20, and the service was removed from `enabled/` (parked at
+  `disabled-hda-capture.conf.removed-2026-10-19`; the 146,113 legacy files were
+  deleted from Ubuntu — `find … -delete`, 1 m 48 s; a plain `rm` glob died of
+  ARG_MAX, and a background `rm` loop from the Akuma side would have taken
+  hours). Ryzen's Akuma partition was checked and is clean — its klog is
+  `userspace/klogd`, which writes per-boot rotated logs to `/var/log/ryzen`
+  with a 256 MiB cap and never touches `/root`. Post-cleanup end state on the
+  metal (`7c98d40-release-smp-shared`): `/root` = 426 entries, `ls /root`
+  0.01 s warm (5.9 s first call — the cold USB read of the 5.5 MiB of stale
+  dirent blocks ext2 keeps allocated; recreate `/root` from Ubuntu some day to
+  compact them). **Still open**: lookups are a linear dirent scan, so a
+  *populated* large directory still costs ~2 ms per stat — real Linux has the
+  same O(n) scan on
   non-htree directories; the proper followup is **htree (`dir_index`) lookup
   support** — the feature flag is already set on this image (tune2fs) and
   `/root` carries `EXT4_INDEX_FL`, but the driver parses linearly, so it also
