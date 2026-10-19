@@ -1145,13 +1145,24 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         print(rule(W))
         print(f"{'unsafe sites by scope':<26}{'total':>11}{'production':>12}{'test':>8}")
         print(rule(W))
-        scopes = [("crates/", crates), ("src/", bins)]
+        # One row per root that was actually counted. `bins` used to be reported as
+        # a single "src/", which silently folded `amd64/src` into the AArch64
+        # kernel's number; the two kernels are different programs and the
+        # port's `unsafe` is the one being driven down.
+        def root_of(comp: str) -> str:
+            parts = comp.split(os.sep)
+            return os.sep.join(parts[:2] if parts[0] == "amd64" else parts[:1]) + os.sep
+
+        scopes = [("crates/", crates)]
+        for root in sorted({root_of(c) for c in bins}, key=lambda r: (r != "src/", r)):
+            scopes.append((root, {c: a for c, a in bins.items() if root_of(c) == root}))
         for label, d in scopes:
             prod, test = tot(d, "unsafe_sites"), tot(d, "test_unsafe_sites")
             print(f"{label:<26}{prod + test:>11}{prod:>12}{test:>8}")
         prod = sum(tot(d, "unsafe_sites") for _, d in scopes)
         test = sum(tot(d, "test_unsafe_sites") for _, d in scopes)
-        print(f"{'tree':<26}{prod + test:>11}{prod:>12}{test:>8}")
+        print(rule(W))
+        print(f"{'all roots (sum)':<26}{prod + test:>11}{prod:>12}{test:>8}")
     print(rule(W))
 
 
