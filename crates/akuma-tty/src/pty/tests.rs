@@ -1,4 +1,6 @@
 use super::*;
+use crate::Ring;
+use std::vec::Vec;
 
 type Pair = PtyPair<u32>;
 

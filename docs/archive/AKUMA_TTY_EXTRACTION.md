@@ -59,9 +59,18 @@ Not run: interactive behaviour (ssh pty, Ctrl-C, a raw-mode TUI) on a live VM. O
 Code cannot reach `/login` at all (`AARCH64_CLAUDE_BUN_SEGV.md`); the amd64 `/login` repro
 (`AMD64_CLAUDE_LOGIN_INPUT_STUCK.md`) was not re-run.
 
-## Step 2: two engines, one end state
+## Step 2: two engines became one (same day)
 
-`session` and `pty` still differ in 11 observable ways (listed in `tty.md` § Divergences). The
-plan: a differential test feeding identical input to both, route session terminals through
-`PtyPair`'s engine, delete `session`'s editing code. It changes behaviour on the `/login` input
-path, so it is deliberately a separate change.
+`PtyPair`'s engine was extracted as `ld::LineDiscipline` (termios passed per call, so flags keep
+one owner; the 44 pty tests were the safety net) and `TerminalState` was rebuilt on it, replacing
+`process_canon_input`/`drain_canon_ready`/`canon_buffer`/`canon_ready` (~100 lines + 23 tests).
+`differential.rs` first pinned the 11 (it found a 12th: lines per read) divergences, then flipped
+to asserting agreement. The behaviour changes are listed in `tty.md` § "What changed when the
+engines merged"; the large ones are one line per read, `^X`/word-erase/literal-next/`VDISABLE`,
+`^\`/`^Z` becoming signals, and one default termios (`Termios::initial()`) on both kernels.
+
+Measured: see the table in `tty.md`/the commit message; the in-kernel suites are unchanged
+(AArch64 300 PASSED + the one known epoll-latency failure, amd64 804/0).
+
+Left: sessions still apply the discipline lazily on `read` (a pty applies it on write); making
+them eager is the remaining step towards a single path for `^C`/`^\`.

@@ -295,10 +295,13 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 note_cooked(proc, fd, "TCSETS");
             }
 
-            if cmd == TCSETSF
-                && let Some(ch) = akuma_exec::process::current_channel()
-            {
-                ch.flush_stdin();
+            if cmd == TCSETSF {
+                // TCSAFLUSH discards unread input: the channel's raw bytes and
+                // the discipline's queue and edit buffer.
+                term_state_lock.lock().flush_input();
+                if let Some(ch) = akuma_exec::process::current_channel() {
+                    ch.flush_stdin();
+                }
             }
             0
         }
@@ -417,6 +420,7 @@ pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: 
     };
 
     if action == 2 {
+        term_state_lock.lock().flush_input();
         proc_channel.flush_stdin();
     }
 

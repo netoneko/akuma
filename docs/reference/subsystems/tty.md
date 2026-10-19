@@ -1,7 +1,7 @@
 # The terminal stack (`akuma-tty`)
 
-**Stability: B** — the extraction (2026-10-19) was behaviour-preserving and is pinned by host
-tests; the two line-discipline engines are still separate (see § Divergences).
+**Stability: B** — extracted 2026-10-19; the same day the two line-discipline engines became one
+(`ld::LineDiscipline`), which changed console/ssh-session behaviour on purpose (§ What changed).
 
 `crates/akuma-tty` is pure, `#![forbid(unsafe_code)]`, has **no dependencies** and nothing in it
 locks. The kernel keeps the acting half: `akuma-syscalls-glue/src/{term,pty}.rs` (ioctls, user
@@ -10,8 +10,9 @@ copies, wakers, the table lock), `akuma-exec`'s `ProcessChannel`, `amd64/src/con
 | module | what | who calls it |
 |---|---|---|
 | `termios` | flag bits, `c_cc` indices, ioctl numbers, `Termios`/`Winsize` wire layouts, `Transition`, `Termios::{initial, console_default}` | everyone |
-| `session` | `TerminalState`: the console / ssh-session discipline (shared by every process of a session behind `Arc<Spinlock<_>>`) | glue `read(stdin)`, `TCGETS/TCSETS`, `SET_TERMINAL_ATTRIBUTES`; `akuma-exec::write_to_process_stdin`; amd64 console |
-| `pty` | `PtyPair`: one Unix98 master/slave pair, full N_TTY, fixed buffers, readiness + hangup rules | glue `pty.rs` |
+| `ld` | `LineDiscipline`: **the** N_TTY engine — buffers, editing, echo, `ISIG`, `VMIN`/`VTIME`; termios is a parameter, never stored |
+| `session` | `TerminalState`: a session's termios words, winsize, foreground group, raw-mode request, and a lazily allocated `LineDiscipline` (shared by every process of a session behind `Arc<Spinlock<_>>`) | glue `read(stdin)`, `TCGETS/TCSETS`, `SET_TERMINAL_ATTRIBUTES`; `akuma-exec::write_to_process_stdin`; amd64 console |
+| `pty` | `PtyPair`: one Unix98 master/slave pair = a `LineDiscipline` + refcounts, hangup rules, waiters | glue `pty.rs` |
 
 ## Who owns each mode bit
 
@@ -38,48 +39,69 @@ Rule: **never write `ts.lflag`/`iflag`/`oflag` from a handler.** The fields are 
 the funnel. Initial values are `Termios::console_default()` (amd64 console; session default
 differs in `cflag`/`lflag` extras and `VSUSP`) and `Termios::initial()` (pty; adds `IUTF8`).
 
-## Divergences between the two engines (input to the merge)
+## What changed when the engines merged (2026-10-19)
 
-Merging `session` into `pty` (end state: one engine) changes behaviour on the path Claude Code's
-`/login` input takes, so it is a separate step with a differential test. Observable differences
-as of 2026-10-19:
+`session` used to carry its own canonical editor; it now drives `ld::LineDiscipline`, the engine
+`PtyPair` always used. Observable consequences for console and ssh-session terminals, all
+Linux-correct and none a regression in the boot suites:
 
-1. **Echo of control characters.** `pty`: `^X` under `ECHOCTL`. `session`: the raw byte.
-2. **Editing keys.** `pty` has word-erase, literal-next, `VEOL`/`VEOL2`, `ECHOK`/`ECHOKE` rub-out
-   logic. `session`: erase (`VERASE` **or** `0x08`, hard-coded), kill (needs `ECHOE`), EOF only.
-3. **`_POSIX_VDISABLE`.** `pty` honours 0 as "off" everywhere. `session` honours it for kill/EOF
-   but not erase, and `intr_char()` returns `Some(0)` (matches NUL bytes).
-4. **Signals.** `pty` raises `SIGINT/SIGQUIT/SIGTSTP`, flushes unless `NOFLSH`. `session`: only
-   `VINTR`→`SIGINT`, decided in `akuma-exec`, not in the discipline.
-5. **CR/NL mapping.** `pty` per byte with `IGNCR/INLCR/ISTRIP`. `session`: whole-chunk `ICRNL` in
-   glue before processing.
-6. **Output.** `pty` honours `OPOST`+`ONLCR`/`OCRNL`. `session::translate_output` checks only
-   `ONLCR`.
-7. **Raw request.** `pty::make_raw` is `cfmakeraw` (clears `ISIG`, `IEXTEN`, `ECHOCTL`…) and
-   `make_cooked` cannot restore (no saved copy). `session::enter_raw_mode` keeps `ISIG`, saves
-   the flags and restores them exactly — except **double-enter loses them** (pinned:
-   `double_enter_raw_loses_the_cooked_flags`).
-8. **Mode flip with queued input.** `pty::set_termios` moves a half-edited line to the raw queue
-   when leaving canonical and marks the last raw byte a line end when entering it. `session`
-   leaves `canon_buffer` alone (pinned: `mode_change_keeps_a_half_typed_line`); raw bytes live in
-   the channel's stdin ring, outside the crate.
-9. **Storage.** `pty`: two fixed rings, backpressure, `try_new` fallible. `session`: `Vec` +
-   `VecDeque` (unbounded `canon_ready`; `canon_buffer` capped at `MAX_CANON`), `echo` and
-   `drain_canon_ready` allocate per call.
-10. **Readiness** is in the crate for `pty` (`slave_poll`), in glue/poll for `session`.
-11. **Sharing.** One `session` state per session, shared by every process on it (which is why a
-    helper's `TCSETS` re-cooks a TUI's terminal); one pair per `pty`.
+1. **One line per `read`** (a big-buffer read used to return every completed line at once).
+2. `^X` echoes as `^X` (`ECHOCTL`); `^H` (0x08) is data unless it is `VERASE` (it used to be
+   hard-wired as erase); word-erase `^W`, literal-next `^V`, `VEOL`/`VEOL2`, `ECHOK`/`ECHOKE`
+   kill rub-out, `IUTF8` multi-byte erase, `IGNCR`/`INLCR`/`ISTRIP` all work.
+3. `_POSIX_VDISABLE` (0) is honoured for every control character (`VERASE = 0` used to match NUL).
+4. `^\` raises `SIGQUIT` and `^Z` `SIGTSTP` on the foreground group (delivered by glue after the
+   terminal-state guard is dropped), and a signal key flushes what was typed before it unless
+   `NOFLSH`. `^C` is still taken one layer up, at write time (`intr_char`), because a program that
+   is not reading must still be interruptible. Akuma has no job-control stop: `SIGTSTP` is a no-op.
+5. **Default termios is `Termios::initial()` on both kernels** (it was the amd64 literals
+   `0x500/5/0xBF/0x8A3B` there and `cflag 0`, no `ECHOCTL`/`ECHOKE`/`IEXTEN`, no `VSUSP` on
+   AArch64). `TCGETS` now reports `iflag 0x4500` (adds `IUTF8`) and the full control-character set.
+6. `TCSETSF` / `SET_TERMINAL_ATTRIBUTES` action 2 discard the discipline's unread input too (they
+   used to flush only the channel's raw bytes).
+7. The raw read path is unchanged: raw bytes bypass the engine (ICRNL via `map_cr_to_nl`, echo via
+   `echo_noncanon`).
+
+Cost: a `LineDiscipline` is ~28 KiB (two rings + a line), allocated by the first canonical
+`ingest` of a terminal and never for one nobody reads canonically (a `TerminalState` is per
+process). `ingest` returns `NoMemory` if that allocation fails (`read` -> `ENOMEM`).
+
+## What still differs between a session and a pty
+
+- **When the engine runs**: a pty applies it on every master write (eager, signals raised at
+  once); a session applies it on `read` (lazy), because input reaches a session as raw bytes in
+  `ProcessChannel`. Making sessions eager is the next step (it would let `^C`/`^\` share one path
+  and remove `intr_char`) and touches `write_to_process_stdin`, poll readiness and the amd64
+  console pump.
+- **Mode flips with queued input**: `PtyPair::set_termios` moves a half-edited line to the raw
+  queue (and back); `TerminalState::set_termios` leaves the edit buffer alone (pinned:
+  `mode_change_keeps_a_half_typed_line`) because raw bytes live in the channel, not the engine.
+- **`^V^C`**: the write-time `^C` stripper (`intr_char`) cannot see a preceding `^V`, so literal-next
+  before the interrupt character loses the `^C` (the `^V` is still consumed). Goes away when sessions
+  become eager.
+- **Output**: `translate_output` checks only `ONLCR` (pinned: `session_output_translation_ignores_opost`).
+- **Readiness** for a session stdin fd is decided in glue/poll from the channel, for a pty by
+  `slave_poll`.
+- **Sharing**: one `TerminalState` per session (a helper's `TCSETS` re-cooks a TUI's terminal);
+  one pair per pty.
+- **Found, not fixed**: `^C` typed at `sleep 100` run from `sh -i` over ssh does nothing on either
+  architecture; the log says `[ISIG] … members=0` — `kill_process_group` excludes the group leader,
+  which is the only member. Identical on the pre-merge AArch64 kernel and on amd64 `b37eb82`
+  (before any tty work); unrelated to the engine.
 
 ## Allocation audit
 
-New code allocates nothing: `set_termios`/`apply_mode_request`/`intr_char`/`raw_vmin0`/`Termios`
-conversions work on the stack. Pre-existing allocations stay in `session` (items 9). The
-`TCGETS` arm no longer holds the `TerminalState` lock across the user copy.
+`ingest` echoes through a 256-byte stack buffer and a closure: no `Vec` per read (the old
+`process_canon_input` returned one). The 28 KiB engine is the one allocation, lazy and fallible.
+`set_termios`/`apply_mode_request`/`intr_char`/`raw_vmin0`/`Termios` conversions work on the
+stack. The `TCGETS` arm no longer holds the `TerminalState` lock across the user copy.
+`read(stdin)` still allocates `count` bytes per call (`kernel_buf`) — unchanged, and now capped
+at `INGEST_CHUNK` for what it takes from the channel in canonical mode.
 
 ## Verify
 
 ```sh
-cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2) -p akuma-tty    # 86 tests
+cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2) -p akuma-tty    # 99 tests
 cargo check; cargo check -p akuma-amd64 --target x86_64-unknown-none
 python3 scripts/check_unsafe_budget.py
 ```

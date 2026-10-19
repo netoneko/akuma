@@ -8,8 +8,9 @@
 //! | module | what | consumers |
 //! |---|---|---|
 //! | [`termios`] | flag bits, `c_cc` indices, ioctl numbers, [`Termios`]/[`Winsize`] wire layouts, [`Transition`] | everyone |
-//! | [`session`] | [`TerminalState`]: the console / ssh-session line discipline | glue `read(stdin)`/`TCSETS`, `akuma-exec`, amd64 console |
-//! | [`pty`] | [`pty::PtyPair`]: Unix98 pairs with a full N_TTY | glue `pty.rs` |
+//! | [`ld`] | [`ld::LineDiscipline`]: the engine — buffers, editing, echo, `ISIG`, read decisions |
+//! | [`session`] | [`TerminalState`]: the console / ssh-session terminal, on the engine | glue `read(stdin)`/`TCSETS`, `akuma-exec`, amd64 console |
+//! | [`pty`] | [`pty::PtyPair`]: Unix98 pairs, on the engine | glue `pty.rs` |
 //!
 //! # Who owns the raw/canonical bit
 //!
@@ -29,13 +30,17 @@
 //! There used to be a channel-side `raw_mode` flag and a copy in the amd64
 //! console; both are gone.
 //!
-//! # Two disciplines, one vocabulary (open)
+//! # One discipline
 //!
-//! `session` and `pty` are still two line-discipline engines. They differ in
-//! behaviour a caller can observe (`PtyPair` echoes `^X` under `ECHOCTL`, has
-//! word-erase and literal-next, raises signals from the input path; `session`
-//! does none of that and leaves ISIG to the channel write). Merging them is a
-//! behaviour change and is tracked in `docs/reference/subsystems/tty.md`.
+//! [`ld::LineDiscipline`] is the only implementation of the N_TTY rules (input
+//! processing, canonical editing, echo, `ISIG`, `VMIN`/`VTIME`, output
+//! processing). `pty::PtyPair` wraps it with a master/slave pair's refcounts,
+//! hangup rules and waiters; `session::TerminalState` wraps it (allocated on the
+//! first canonical read) with a session's window size, foreground group and the
+//! raw-mode request. `differential.rs` feeds both the same keystrokes and
+//! asserts identical echo and reads. What still differs is *when* it runs — a
+//! pty applies it on write, a session on `read` — and `translate_output`
+//! (stateless, ignores `OPOST`); see `docs/reference/subsystems/tty.md`.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -43,12 +48,17 @@
 extern crate alloc;
 
 mod ring;
+pub mod ld;
 pub mod pty;
 pub mod session;
 pub mod termios;
 
+#[cfg(test)]
+mod differential;
+
+pub use ld::LineDiscipline;
 pub use ring::Ring;
-pub use session::{ProcessedInput, TerminalState};
+pub use session::{CanonRead, Ingest, NoMemory, TerminalState};
 pub use termios::{Termios, Transition, Winsize};
 
 /// Custom Akuma `SET_TERMINAL_ATTRIBUTES` request bits plus the old

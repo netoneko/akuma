@@ -51,24 +51,12 @@
 //!   queueing bytes nobody can read — a writer that ignores hangup would
 //!   otherwise fill the input buffer and block forever.
 
-use alloc::vec::Vec;
-
-use crate::ring::Ring;
+pub use crate::ld::{INPUT_CAPACITY, LineDiscipline, OUTPUT_CAPACITY, Signals};
 pub use crate::termios::{MAX_CANON, Termios, Transition, Winsize, cc, flags, ioctl, sig};
-use cc::*;
-use flags::*;
 
 /// The `/dev/pts/N` number space. A policy, not a buffer: the kernel's table is
 /// this many pointers, and a pair's storage exists only while it is open.
 pub const MAX_PTYS: usize = 64;
-/// Master → slave buffer, in entries.
-///
-/// Large enough that a full canonical line ([`MAX_CANON`] plus its terminator)
-/// always fits once the slave has drained, which is what keeps a long line from
-/// wedging the writer.
-pub const INPUT_CAPACITY: usize = 8192;
-/// Slave → master buffer, in bytes.
-pub const OUTPUT_CAPACITY: usize = 8192;
 /// Threads that can wait on one pair at once.
 ///
 /// Readers, writers and pollers of both sides together. A waiter that finds the
@@ -77,41 +65,7 @@ pub const OUTPUT_CAPACITY: usize = 8192;
 pub const MAX_WAITERS: usize = 8;
 
 
-/// Input entries carry the byte in the low 8 bits plus these flags.
-///
-/// `DELIM` ends a canonical line (a canonical read stops after it); `EOF_MARK`
-/// is the zero-length line `^D` on an empty line produces — it terminates a
-/// read without being copied, so a read that meets it first returns 0.
-const DELIM: u16 = 0x100;
-const EOF_MARK: u16 = 0x200;
 
-
-/// A set of signal numbers below 32, raised by input processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Signals(u32);
-
-impl Signals {
-    pub fn add(&mut self, sig: u32) {
-        if sig < 32 {
-            self.0 |= 1 << sig;
-        }
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.0 == 0
-    }
-
-    #[must_use]
-    pub const fn contains(&self, sig: u32) -> bool {
-        sig < 32 && self.0 & (1 << sig) != 0
-    }
-
-    /// The signals, lowest number first.
-    pub fn iter(self) -> impl Iterator<Item = u32> {
-        (1..32u32).filter(move |&s| self.0 & (1 << s) != 0)
-    }
-}
 
 /// Threads to make runnable, as `(tid, token)`. Fixed size, so taking it out of
 /// a pair under a spinlock allocates nothing.
@@ -212,16 +166,9 @@ pub struct PtyPair<W> {
     /// Session leader this terminal controls (`TIOCSCTTY`), 0 for none.
     pub session: u32,
 
-    /// Bytes the slave can read, after the line discipline, with line flags.
-    input: Ring<u16>,
-    /// How many `DELIM` entries `input` holds — complete canonical lines.
-    delims: usize,
-    /// The canonical line being edited. Capacity [`MAX_CANON`], reserved once.
-    line: Vec<u8>,
-    /// `VLNEXT` was the last input byte: take the next one literally.
-    lnext: bool,
-    /// Bytes the master can read, after output processing (and echo).
-    output: Ring<u8>,
+    /// The line discipline's buffers and editing state; the termios above is
+    /// passed to it on every call, so there is one copy of the flags.
+    ld: LineDiscipline,
 
     locked: bool,
     master_refs: u32,
@@ -243,18 +190,12 @@ impl<W: Copy> PtyPair<W> {
     /// locked, no slave, 24x80. `None` when the buffers cannot be allocated.
     #[must_use]
     pub fn try_new() -> Option<Self> {
-        let mut line = Vec::new();
-        line.try_reserve_exact(MAX_CANON).ok()?;
         Some(Self {
             termios: Termios::initial(),
             winsize: Winsize { row: 24, col: 80, xpixel: 0, ypixel: 0 },
             fg_pgid: 0,
             session: 0,
-            input: Ring::try_new(INPUT_CAPACITY)?,
-            delims: 0,
-            line,
-            lnext: false,
-            output: Ring::try_new(OUTPUT_CAPACITY)?,
+            ld: LineDiscipline::try_new()?,
             locked: true,
             master_refs: 1,
             slave_refs: 0,
@@ -353,25 +294,9 @@ impl<W: Copy> PtyPair<W> {
     pub fn set_termios(&mut self, t: Termios) {
         let was = self.termios.canonical();
         self.termios = t;
-        self.lnext = false;
+        self.ld.termios_changed(was, &t);
         // `VMIN`/`ICANON` decide readability, so a parked reader re-tests.
         self.changed = true;
-        if was && !t.canonical() {
-            for i in 0..self.line.len() {
-                if !self.input.push(u16::from(self.line[i])) {
-                    break;
-                }
-            }
-            self.line.clear();
-            // Raw reads ignore line structure: drop EOF marks, clear the flags.
-            self.input.retain_map(|e| if e & EOF_MARK != 0 { None } else { Some(e & 0xFF) });
-            self.delims = 0;
-        } else if !was && t.canonical()
-            && let Some(last) = self.input.last_mut()
-        {
-            *last |= DELIM;
-            self.delims = 1;
-        }
     }
 
     /// `TIOCSWINSZ`. `true` when the size changed — the caller then sends
@@ -386,28 +311,20 @@ impl<W: Copy> PtyPair<W> {
     /// `TCFLSH` / `TCSETSF`, and the `ISIG` flush.
     pub fn flush(&mut self, input: bool, output: bool) {
         self.changed = true;
-        if input {
-            self.input.clear();
-            self.delims = 0;
-            self.line.clear();
-            self.lnext = false;
-        }
-        if output {
-            self.output.clear();
-        }
+        self.ld.flush(input, output);
     }
 
     /// Bytes a slave read could return (`FIONREAD` on the slave).
     #[must_use]
     pub fn input_queued(&self) -> usize {
-        self.input.iter().filter(|e| e & EOF_MARK == 0).count()
+        self.ld.input_queued()
     }
 
     /// Bytes a master read could return (`FIONREAD` on the master, `TIOCOUTQ`
     /// on the slave).
     #[must_use]
     pub const fn output_queued(&self) -> usize {
-        self.output.len()
+        self.ld.output_queued()
     }
 
     // ---- readiness ----------------------------------------------------------
@@ -415,32 +332,17 @@ impl<W: Copy> PtyPair<W> {
     #[must_use]
     pub fn master_poll(&self) -> Poll {
         let hup = self.master_hup();
-        Poll { readable: !self.output.is_empty() || hup, writable: !hup && self.can_accept_input(), hup }
+        Poll {
+            readable: !self.ld.output_is_empty() || hup,
+            writable: !hup && self.ld.can_accept_input(&self.termios),
+            hup,
+        }
     }
 
     #[must_use]
     pub fn slave_poll(&self) -> Poll {
         let hup = self.slave_hup();
-        let readable = hup
-            || if self.termios.canonical() {
-                self.delims > 0
-            } else {
-                // Linux `n_tty_poll`: with `VTIME` set one byte is enough; without
-                // it, `VMIN` bytes (at least one).
-                let need = if self.termios.cc[VTIME] != 0 { 1 } else { usize::from(self.termios.cc[VMIN]).max(1) };
-                self.input.len() >= need
-            };
-        Poll { readable, writable: hup || self.output.room() >= 2, hup }
-    }
-
-    /// Would a master write consume at least one byte?
-    fn can_accept_input(&self) -> bool {
-        if self.termios.canonical() {
-            // A line terminator needs the whole line to fit.
-            self.input.room() > self.line.len()
-        } else {
-            self.input.room() > 0
-        }
+        Poll { readable: hup || self.ld.readable(&self.termios), writable: hup || self.ld.output_has_room(), hup }
     }
 
     // ---- waiters ------------------------------------------------------------
@@ -479,8 +381,8 @@ impl<W: Copy> PtyPair<W> {
 
     /// Read what the slave wrote (plus echo).
     pub fn master_read(&mut self, out: &mut [u8]) -> MasterRead {
-        if !self.output.is_empty() {
-            let n = self.output.read_into(out);
+        if !self.ld.output_is_empty() {
+            let n = self.ld.read_output(out);
             self.changed |= n > 0;
             return MasterRead::Data(n);
         }
@@ -493,13 +395,7 @@ impl<W: Copy> PtyPair<W> {
             return Err(HungUp);
         }
         let mut signals = Signals::default();
-        let mut accepted = 0;
-        for &c in data {
-            if !self.receive(c, &mut signals) {
-                break;
-            }
-            accepted += 1;
-        }
+        let accepted = self.ld.receive_all(&self.termios, data, &mut signals);
         self.changed |= accepted > 0;
         Ok(Input { accepted, signals })
     }
@@ -511,13 +407,7 @@ impl<W: Copy> PtyPair<W> {
         if self.slave_hup() {
             return Err(HungUp);
         }
-        let mut n = 0;
-        for &c in data {
-            if !self.out_char(c) {
-                break;
-            }
-            n += 1;
-        }
+        let n = self.ld.write_all(&self.termios, data);
         self.changed |= n > 0;
         Ok(n)
     }
@@ -525,302 +415,15 @@ impl<W: Copy> PtyPair<W> {
     /// Read keyboard input. `expired` is "the `VTIME` timer this read armed has
     /// run out".
     pub fn slave_read(&mut self, out: &mut [u8], expired: bool) -> SlaveRead {
-        let before = self.input.len();
-        let r = self.slave_read_inner(out, expired);
-        // Draining makes room a blocked master writer is waiting for.
-        self.changed |= self.input.len() != before;
-        r
-    }
-
-    fn slave_read_inner(&mut self, out: &mut [u8], expired: bool) -> SlaveRead {
         if self.slave_hup() {
             return SlaveRead::Hangup;
         }
-        if out.is_empty() {
-            return SlaveRead::Data(0);
-        }
-        if self.termios.canonical() {
-            if self.delims == 0 {
-                return SlaveRead::Block { timeout_ds: None };
-            }
-            // One line per read, at most `out.len()` of it; the rest of a long
-            // line stays for the next read.
-            let mut n = 0;
-            while n < out.len() {
-                let Some(e) = self.input.pop() else { break };
-                if e & DELIM != 0 {
-                    self.delims -= 1;
-                    if e & EOF_MARK == 0 {
-                        out[n] = e as u8;
-                        n += 1;
-                    }
-                    break;
-                }
-                out[n] = e as u8;
-                n += 1;
-            }
-            return SlaveRead::Data(n);
-        }
-
-        let vmin = usize::from(self.termios.cc[VMIN]);
-        let vtime = self.termios.cc[VTIME];
-        let avail = self.input.len();
-        let ready = if vmin == 0 {
-            avail > 0 || vtime == 0 || expired
-        } else {
-            avail >= vmin.min(out.len()) || (expired && avail > 0)
-        };
-        if ready {
-            let mut n = 0;
-            while n < out.len() {
-                let Some(e) = self.input.pop() else { break };
-                out[n] = e as u8;
-                n += 1;
-            }
-            return SlaveRead::Data(n);
-        }
-        // `VMIN>0, VTIME>0`: the timer is inter-byte and starts at the first
-        // byte, so with nothing queued the wait is untimed.
-        let timeout_ds = if vtime == 0 || (vmin > 0 && avail == 0) { None } else { Some(vtime) };
-        SlaveRead::Block { timeout_ds }
+        let before = self.ld.input_len();
+        let r = self.ld.read_input(&self.termios, out, expired);
+        // Draining makes room a blocked master writer is waiting for.
+        self.changed |= self.ld.input_len() != before;
+        r
     }
-
-    // ---- the line discipline ------------------------------------------------
-
-    /// One input byte. `false` when it could not be consumed for lack of room
-    /// (backpressure: the master write is short).
-    fn receive(&mut self, c: u8, signals: &mut Signals) -> bool {
-        let t = self.termios;
-
-        if self.lnext {
-            self.lnext = false;
-            return self.store_literal(c);
-        }
-
-        let mut c = c;
-        if t.iflag & ISTRIP != 0 {
-            c &= 0x7F;
-        }
-        if c == b'\r' {
-            if t.iflag & IGNCR != 0 {
-                return true;
-            }
-            if t.iflag & ICRNL != 0 {
-                c = b'\n';
-            }
-        } else if c == b'\n' && t.iflag & INLCR != 0 {
-            c = b'\r';
-        }
-
-        if t.lflag & IEXTEN != 0 && t.is(c, VLNEXT) {
-            self.lnext = true;
-            if t.lflag & ECHO != 0 && t.lflag & ECHOCTL != 0 {
-                // Linux echoes `^` and backs over it, so the next character
-                // lands on top.
-                self.out_raw(b"^\x08");
-            }
-            return true;
-        }
-
-        if t.lflag & ISIG != 0 {
-            let sig = if t.is(c, VINTR) {
-                sig::SIGINT
-            } else if t.is(c, VQUIT) {
-                sig::SIGQUIT
-            } else if t.is(c, VSUSP) {
-                sig::SIGTSTP
-            } else {
-                0
-            };
-            if sig != 0 {
-                if t.lflag & NOFLSH == 0 {
-                    self.flush(true, true);
-                }
-                if t.lflag & ECHO != 0 {
-                    self.echo(c);
-                }
-                signals.add(sig);
-                return true;
-            }
-        }
-
-        if !t.canonical() {
-            if !self.input.push(u16::from(c)) {
-                return false;
-            }
-            if t.lflag & ECHO != 0 {
-                self.echo(c);
-            }
-            return true;
-        }
-
-        if t.is(c, VERASE) {
-            self.erase_char();
-            return true;
-        }
-        if t.is(c, VKILL) {
-            self.kill_line(c);
-            return true;
-        }
-        if t.lflag & IEXTEN != 0 && t.is(c, VWERASE) {
-            self.erase_word();
-            return true;
-        }
-        if t.is(c, VEOF) {
-            // The line so far becomes readable without the EOF character; on
-            // an empty line that is a zero-length read — EOF.
-            return self.finish_line(EOF_MARK | DELIM);
-        }
-        if c == b'\n' || t.is(c, VEOL) || (t.lflag & IEXTEN != 0 && t.is(c, VEOL2)) {
-            if self.input.room() <= self.line.len() {
-                return false;
-            }
-            if t.lflag & ECHO != 0 || (c == b'\n' && t.lflag & ECHONL != 0) {
-                self.echo(c);
-            }
-            return self.finish_line(u16::from(c) | DELIM);
-        }
-        if self.line.len() < MAX_CANON {
-            // Within the capacity reserved in `try_new`: never reallocates.
-            self.line.push(c);
-            if t.lflag & ECHO != 0 {
-                self.echo(c);
-            }
-        }
-        // A full line drops the byte (Linux rings the bell); it was still
-        // consumed, so the writer is not blocked on a line that can only end.
-        true
-    }
-
-    /// The byte after `VLNEXT`: data, whatever it is.
-    fn store_literal(&mut self, c: u8) -> bool {
-        if self.termios.canonical() {
-            if self.line.len() < MAX_CANON {
-                self.line.push(c);
-            }
-        } else if !self.input.push(u16::from(c)) {
-            self.lnext = true;
-            return false;
-        }
-        if self.termios.lflag & ECHO != 0 {
-            self.echo(c);
-        }
-        true
-    }
-
-    /// Move the edited line, then `terminator`, into the readable queue.
-    fn finish_line(&mut self, terminator: u16) -> bool {
-        if self.input.room() <= self.line.len() {
-            return false;
-        }
-        for i in 0..self.line.len() {
-            self.input.push(u16::from(self.line[i]));
-        }
-        self.input.push(terminator);
-        self.delims += 1;
-        self.line.clear();
-        true
-    }
-
-    /// `VERASE`: remove one character — a whole UTF-8 sequence under `IUTF8` —
-    /// and rub it out on screen.
-    fn erase_char(&mut self) {
-        let t = self.termios;
-        let Some(c) = self.line.pop() else { return };
-        let is_cont = |b: u8| b & 0xC0 == 0x80;
-        if t.iflag & IUTF8 != 0 && is_cont(c) {
-            while let Some(b) = self.line.pop() {
-                if !is_cont(b) {
-                    break;
-                }
-            }
-        }
-        if t.lflag & ECHO == 0 {
-            return;
-        }
-        if t.lflag & ECHOE != 0 {
-            // A control character was echoed as two columns (`^X`).
-            let width = if t.lflag & ECHOCTL != 0 && is_ctl(c) { 2 } else { 1 };
-            for _ in 0..width {
-                self.out_raw(b"\x08 \x08");
-            }
-        } else {
-            self.echo(t.cc[VERASE]);
-        }
-    }
-
-    /// `VWERASE`: trailing blanks, then the word before them.
-    fn erase_word(&mut self) {
-        while self.line.last().is_some_and(|&b| b == b' ' || b == b'\t') {
-            self.erase_char();
-        }
-        while self.line.last().is_some_and(|&b| b != b' ' && b != b'\t') {
-            self.erase_char();
-        }
-    }
-
-    /// `VKILL`: the whole line. Linux rubs it out character by character only
-    /// with `ECHOE|ECHOK|ECHOKE` all set (the default); otherwise it echoes the
-    /// kill character, and a newline if `ECHOK`.
-    fn kill_line(&mut self, kill_char: u8) {
-        let lflag = self.termios.lflag;
-        if lflag & ECHO == 0 {
-            self.line.clear();
-            return;
-        }
-        if lflag & ECHOK == 0 || lflag & ECHOKE == 0 || lflag & ECHOE == 0 {
-            self.line.clear();
-            self.echo(kill_char);
-            if lflag & ECHOK != 0 {
-                self.out_char(b'\n');
-            }
-            return;
-        }
-        while !self.line.is_empty() {
-            self.erase_char();
-        }
-    }
-
-    /// Echo one input byte: control characters as `^X` under `ECHOCTL`
-    /// (except tab and newline), everything through output processing.
-    /// Dropped when the output buffer is full, as Linux drops echo.
-    fn echo(&mut self, c: u8) {
-        if self.termios.lflag & ECHOCTL != 0 && is_ctl(c) {
-            self.out_raw(&[b'^', c ^ 0x40]);
-        } else {
-            self.out_char(c);
-        }
-    }
-
-    /// Queue `bytes` for the master whole, or not at all.
-    fn out_raw(&mut self, bytes: &[u8]) -> bool {
-        if self.output.room() < bytes.len() {
-            return false;
-        }
-        for &b in bytes {
-            self.output.push(b);
-        }
-        true
-    }
-
-    /// One byte of output through `OPOST`. `false` for lack of room.
-    fn out_char(&mut self, c: u8) -> bool {
-        let o = self.termios.oflag;
-        if o & OPOST != 0 {
-            if c == b'\n' && o & ONLCR != 0 {
-                return self.out_raw(b"\r\n");
-            }
-            if c == b'\r' && o & OCRNL != 0 {
-                return self.output.push(b'\n');
-            }
-        }
-        self.output.push(c)
-    }
-}
-
-/// Echoed as `^X` under `ECHOCTL`.
-const fn is_ctl(c: u8) -> bool {
-    (c < 0x20 && c != b'\t' && c != b'\n') || c == 0x7F
 }
 
 #[cfg(test)]

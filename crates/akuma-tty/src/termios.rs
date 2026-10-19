@@ -159,30 +159,18 @@ impl Termios {
         }
     }
 
-    /// What the amd64 console's `TCGETS` reported from compiled-in literals
-    /// before it had a line discipline (`0x500 / 5 / 0xBF / 0x8A3B`), and so
-    /// what every session starts at there: the pty's flags **without `IUTF8`**,
-    /// and only the control characters `TerminalState::default()` sets plus
-    /// `VSUSP`. A separate constructor rather than a mode of
-    /// [`Self::initial`], because the two differ and both are pinned.
+    /// What a console or ssh-session terminal starts as: Linux's
+    /// `tty_std_termios` — the same as a pty slave ([`Self::initial`]).
+    ///
+    /// Until 2026-10-19 this was the amd64 console's compiled-in literals
+    /// (`0x500 / 5 / 0xBF / 0x8A3B`, only `VINTR`/`VQUIT`/`VERASE`/`VKILL`/`VEOF`/
+    /// `VMIN`/`VSUSP` set, no `IUTF8`) and the AArch64 terminal started somewhere
+    /// else again (`cflag 0`, no `ECHOCTL`/`ECHOKE`/`IEXTEN`). With one line
+    /// discipline underneath, a console that left `VWERASE`/`VLNEXT`/`IUTF8` off
+    /// just made `^W`, `^V` and multi-byte erase behave differently from a pty.
     #[must_use]
     pub const fn console_default() -> Self {
-        let mut cc = [0u8; NCCS];
-        cc[VINTR] = 0x03;
-        cc[VQUIT] = 0x1C;
-        cc[VERASE] = 0x7F;
-        cc[VKILL] = 0x15;
-        cc[VEOF] = 0x04;
-        cc[VMIN] = 1;
-        cc[VSUSP] = 0x1A;
-        Self {
-            iflag: ICRNL | IXON,
-            oflag: OPOST | ONLCR,
-            cflag: B38400 | CS8 | CREAD,
-            lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
-            line: 0,
-            cc,
-        }
+        Self::initial()
     }
 
     /// `cfmakeraw`: what a terminal client (the Akuma `ssh`'s
@@ -317,27 +305,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn console_default_is_what_the_amd64_literals_said() {
+    fn console_default_is_the_pty_default() {
         let t = Termios::console_default();
-        assert_eq!((t.iflag, t.oflag, t.cflag, t.lflag), (0x0000_0500, 0x5, 0xBF, 0x8A3B));
-        assert_eq!(t.cc[cc::VSUSP], 0x1A);
-        // Only the characters `TerminalState::default()` sets, plus VSUSP.
-        let mut want = [0u8; NCCS];
-        want[cc::VINTR] = 3;
-        want[cc::VQUIT] = 0x1C;
-        want[cc::VERASE] = 0x7F;
-        want[cc::VKILL] = 0x15;
-        want[cc::VEOF] = 4;
-        want[cc::VMIN] = 1;
-        want[cc::VSUSP] = 0x1A;
-        assert_eq!(t.cc, want);
-    }
-
-    #[test]
-    fn console_default_differs_from_pty_initial_only_where_pinned() {
-        let (c, p) = (Termios::console_default(), Termios::initial());
-        assert_eq!(p.iflag & !flags::IUTF8, c.iflag, "pty adds IUTF8 and nothing else");
-        assert_eq!((c.oflag, c.cflag, c.lflag), (p.oflag, p.cflag, p.lflag));
+        assert_eq!(t, Termios::initial());
+        assert_eq!((t.iflag, t.oflag, t.cflag, t.lflag), (0x4500, 0x5, 0xBF, 0x8A3B));
+        for (idx, want) in [
+            (cc::VINTR, 0x03),
+            (cc::VQUIT, 0x1C),
+            (cc::VERASE, 0x7F),
+            (cc::VKILL, 0x15),
+            (cc::VEOF, 0x04),
+            (cc::VSTART, 0x11),
+            (cc::VSTOP, 0x13),
+            (cc::VSUSP, 0x1A),
+            (cc::VREPRINT, 0x12),
+            (cc::VDISCARD, 0x0F),
+            (cc::VWERASE, 0x17),
+            (cc::VLNEXT, 0x16),
+        ] {
+            assert_eq!(t.cc[idx], want, "c_cc[{idx}]");
+        }
+        assert_eq!((t.cc[cc::VMIN], t.cc[cc::VTIME]), (1, 0));
     }
 
     #[test]

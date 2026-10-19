@@ -217,15 +217,19 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   no marker and passes `refs > 0`, a pinned divergence recorded in the crate
   (`docs/archive/AKUMA_AMD64_COW.md`).
   `akuma-tty` is the **terminal stack** (2026-10-19; was `akuma-terminal` + `akuma-pty`):
-  the termios vocabulary and wire layouts (`termios`), the console/ssh-session line
-  discipline `TerminalState` (`session`) and Unix98 `PtyPair` (`pty`), pure, `forbid(unsafe)`,
-  zero dependencies, nothing that locks. **The raw/canonical bit has one owner**:
-  `ICANON` in `c_lflag`, written only by `TerminalState::{set_termios, apply_mode_request}`
-  / `PtyPair::set_termios`, each returning a `Transition` — `grep 'Transition::Cooked'` lists
-  every reaction to a raw terminal going back to line mode (`5a577983`). **Never write
-  `ts.lflag` in a handler; never hand-spell the 36-byte `TCGETS` image again — use
-  `Termios::to_wire`.** Two engines remain (`session` vs `pty`); they differ observably and
-  merging them is its own step (`docs/reference/subsystems/tty.md`).
+  the termios vocabulary and wire layouts (`termios`), **the** N_TTY engine
+  (`ld::LineDiscipline` — buffers, editing, echo, `ISIG`, read decisions; termios is a
+  parameter, never stored), `TerminalState` (`session`: a session's termios/winsize/pgrp on
+  the engine, allocated lazily) and `PtyPair` (`pty`: refcounts/hangup/waiters on the engine);
+  pure, `forbid(unsafe)`, zero dependencies, nothing that locks. **There is one line
+  discipline — do not write a second editor/echo loop anywhere.** **The raw/canonical bit has
+  one owner**: `ICANON` in `c_lflag`, written only by `TerminalState::{set_termios,
+  apply_mode_request}` / `PtyPair::set_termios`, each returning a `Transition` —
+  `grep 'Transition::Cooked'` lists every reaction to a raw terminal going back to line mode
+  (`5a577983`). **Never write `ts.lflag` in a handler; never hand-spell the 36-byte `TCGETS`
+  image — use `Termios::to_wire`.** `differential.rs` feeds a session and a pty identical
+  keystrokes and asserts identical echo/reads. What is left to merge (sessions apply the
+  discipline lazily on `read`, ptys eagerly on write): `docs/reference/subsystems/tty.md`.
   `akuma-procfs` is the `/proc/<pid>/{stat,status,cmdline}` byte formats both
   kernels render through — the wire layer, with no process model behind it. The
   AArch64 `ProcFilesystem` (`akuma-vfs-glue`) cannot be compiled for

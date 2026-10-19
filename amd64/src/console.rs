@@ -84,21 +84,16 @@ static CHANNEL: Spinlock<Option<Arc<ProcessChannel>>> = Spinlock::new(None);
 /// module exists to avoid.
 static TERM: Spinlock<Option<Arc<Spinlock<TerminalState>>>> = Spinlock::new(None);
 
-/// A `TerminalState` carrying **exactly what this target's `TCGETS` used to
-/// report from literals** — `akuma_tty::Termios::console_default()`, whose test
-/// pins the old values (`0x500 / 5 / 0xBF / 0x8A3B`, `VSUSP = ^Z`).
-///
-/// `fd::console_ioctl` answered `TCGETS` from compiled-in constants because
-/// there was no line discipline to describe. There is one now, and the ioctl
-/// reads it — so the state has to start out saying what the constants said, or
-/// the fold would silently re-describe every terminal on this target.
-///
-/// Used for **every** process this target registers, not just the console one:
-/// a spawned child's fd 0 is a pipe faked up as a tty by the same `console_ioctl`
-/// arm, and it has to keep reading what it read before too.
+/// A `TerminalState` at **exactly what this target's `TCGETS` used to report
+/// from literals** — `Termios::console_default()`, which is now also
+/// `TerminalState::default()` on both kernels (the AArch64 terminal used to
+/// start at a different `cflag`/`lflag`/`VSUSP`). Kept as a function because
+/// every process this target registers is built from it, not just the console
+/// one: a spawned child's fd 0 is a pipe faked up as a tty by the same
+/// `console_ioctl` arm, and it has to keep reading what it read before too.
 #[must_use]
 pub fn default_terminal_state() -> TerminalState {
-    TerminalState::with_termios(&akuma_tty::Termios::console_default())
+    TerminalState::default()
 }
 
 /// `(c_iflag, c_oflag, c_cflag, c_lflag)` — see [`default_terminal_state`].
@@ -232,7 +227,7 @@ const PUMP_OUT: usize = 256;
 ///
 /// Both directions, deliberately: the line discipline's echo is written to the
 /// channel's *stdout* FIFO (`ProcessChannel::write`, which is where glue's
-/// `Stdin` arm puts `ProcessedInput::echo`), and on an ssh session `sshd` is
+/// `Stdin` arm puts the discipline's echo), and on an ssh session `sshd` is
 /// what drains that back to the client. On the serial console there is no
 /// `sshd`, so the pump is also the drain — without it a typed character would
 /// never appear and the FIFO would climb to its 1 MiB cap.

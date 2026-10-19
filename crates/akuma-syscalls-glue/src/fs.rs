@@ -381,27 +381,35 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // closed stdin) as a raw pipe; only a real terminal is cooked.
                 let is_pipe = ch.is_stdin_closed() || !ch.is_terminal();
 
-                if !is_pipe {
-                    let term_state_lock = akuma_exec::process::current_terminal_state();
-                    if let Some(ref ts_lock) = term_state_lock {
-                        let mut ts = ts_lock.lock();
-                        if ts.is_canonical() && !ts.canon_ready.is_empty() {
-                            let ready = ts.drain_canon_ready(count);
-                            let to_read = ready.len();
-                            kernel_buf[..to_read].copy_from_slice(&ready);
-                            drop(ts);
-                            if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
-                                return EFAULT;
+                // A canonical terminal first hands out what the line discipline
+                // already completed (one line per read, as on Linux) before it
+                // touches the channel again — and caps what it reads from the
+                // channel to what the discipline's queue is sized for.
+                let mut want = count;
+                if !is_pipe
+                    && let Some(ref ts_lock) = akuma_exec::process::current_terminal_state()
+                {
+                    let mut ts = ts_lock.lock();
+                    if ts.is_canonical() {
+                        match ts.read_line(&mut kernel_buf[..count]) {
+                            akuma_tty::CanonRead::Data(to_read) => {
+                                drop(ts);
+                                if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
+                                    return EFAULT;
+                                }
+                                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned {} bytes from a ready line\n", to_read);
+                                }
+                                return to_read as u64;
                             }
-                            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                                akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned {} bytes from canon_ready\n", to_read);
-                            }
-                            return to_read as u64;
+                            akuma_tty::CanonRead::Eof => return 0,
+                            akuma_tty::CanonRead::Empty => {}
                         }
+                        want = count.min(akuma_tty::TerminalState::INGEST_CHUNK);
                     }
                 }
 
-                let n = ch.read_stdin(&mut kernel_buf);
+                let n = ch.read_stdin(&mut kernel_buf[..want]);
                 if n > 0 {
                     // Re-arm the `EPOLLET` `EPOLLIN` edge on every successful
                     // read, exactly like the `PipeRead`/`UnixSocket`/`Socket`
@@ -418,33 +426,37 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
 
-                            ts.map_cr_to_nl(&mut kernel_buf[..n]);
-
                             if ts.is_canonical() {
-                                let result = ts.process_canon_input(&kernel_buf[..n]);
-                                if !result.echo.is_empty() {
-                                    ch.write(&result.echo);
+                                // `ingest` maps CR/NL, edits, echoes (through `ch`, no
+                                // allocation) and reports the signals an `ISIG` key raised.
+                                let ingest = match ts.ingest(&kernel_buf[..n], |e| ch.write(e)) {
+                                    Ok(i) => i,
+                                    Err(akuma_tty::NoMemory) => return ENOMEM,
+                                };
+                                let pgid = ts.foreground_pgid;
+                                let line = ts.read_line(&mut kernel_buf[..count]);
+                                drop(ts);
+                                // Delivered with the guard dropped: delivery can run a
+                                // default terminate action, which closes descriptors.
+                                for sig in ingest.signals.iter() {
+                                    akuma_exec::process::kill_process_group(pgid, sig);
                                 }
-                                if result.eof {
-                                    drop(ts);
-                                    return 0;
-                                }
-
-                                if !ts.canon_ready.is_empty() {
-                                    let ready = ts.drain_canon_ready(count);
-                                    let to_read = ready.len();
-                                    kernel_buf[..to_read].copy_from_slice(&ready);
-                                    drop(ts);
-                                    if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
-                                        return EFAULT;
+                                match line {
+                                    akuma_tty::CanonRead::Data(to_read) => {
+                                        if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
+                                            return EFAULT;
+                                        }
+                                        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+                                            akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned {} bytes (canonical)\n", to_read);
+                                        }
+                                        return to_read as u64;
                                     }
-                                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                                        akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned {} bytes (canonical)\n", to_read);
-                                    }
-                                    return to_read as u64;
+                                    akuma_tty::CanonRead::Eof => return 0,
+                                    akuma_tty::CanonRead::Empty => continue,
                                 }
-                                continue;
-                            } else if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
+                            }
+                            ts.map_cr_to_nl(&mut kernel_buf[..n]);
+                            if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
                                 if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                                     akuma_primitives::safe_print!(128, "[syscall] read: echoing {} bytes\n", echo_buf.len());
                                 }
@@ -474,16 +486,15 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         let term_state_lock = akuma_exec::process::current_terminal_state();
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
-                            if ts.is_canonical() && !ts.canon_buffer.is_empty() {
-                                ts.flush_canon_buffer();
-                                let ready = ts.drain_canon_ready(count);
-                                let to_read = ready.len();
-                                kernel_buf[..to_read].copy_from_slice(&ready);
-                                drop(ts);
-                                if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
-                                    return EFAULT;
+                            if ts.is_canonical() && ts.has_partial_line() {
+                                ts.flush_partial_line();
+                                if let akuma_tty::CanonRead::Data(to_read) = ts.read_line(&mut kernel_buf[..count]) {
+                                    drop(ts);
+                                    if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
+                                        return EFAULT;
+                                    }
+                                    return to_read as u64;
                                 }
-                                return to_read as u64;
                             }
                         }
                     }
