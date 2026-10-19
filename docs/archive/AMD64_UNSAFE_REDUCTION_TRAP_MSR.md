@@ -88,8 +88,24 @@ restore skips a non-canonical stored value instead of faulting the switch.
   process burns a core at 100% (14–16 CPU-minutes observed, two of them at once) and
   while they ran a `git worktree add` on the same box made no progress until they
   were killed. Reproduced twice with a bare `ls /root`; other directories list fine.
-  Do not `ls /root` there; it is a `getdents` problem on that directory, not in this
-  branch.
+  Do not `ls /root` there. **ROOT-CAUSED 2026-10-19, not this branch**: `sys_getdents64`
+  cloned the fd's whole directory-entry snapshot on *every* call, and `/root`'s inode
+  (1589249) holds **101,161 live entries** in 5.5 MB of dirent data (months of on-box
+  build churn; ext2 directories never shrink), so the ~1,300-call stream cost
+  ~100 k `String` clones per call under the VFS BKL — 100% CPU, no output until EOF,
+  and the box's other syscalls starving behind the lock. A raw-`getdents64` probe on
+  the box showed a small directory reaching EOF in 3 calls while `/root` was still
+  streaming at 50 (3,807 records; ~76 a call). Fixed in
+  `akuma-syscalls-glue::fs::sys_getdents64` (commit `a6fd5eb9`): the pure
+  `getdents_step` takes the snapshot by slice, the first-call snapshot is moved into
+  the fd, and host tests pin the stream at that scale (`cargo test -p akuma-syscalls-glue
+  getdents`). Found on the way, still open: directories grown by Akuma's own
+  `add_dir_entry` can end up with an **uninitialised second block** — `/root/bigdir`
+  (a fresh 60-file test directory) had `i_size` 8192 with block 2 full of a freed
+  file's indirect-block garbage, plus consecutive duplicate name/inode pairs in block 1
+  (`f111 f111 …`); Ubuntu's `e2fsck -fn` and `debugfs` confirm it on the raw partition.
+  Harmless to the listing (the parser stops at the garbage record) but it is a real
+  write-path bug in directory growth.
 * **Swapping `multiboot2.rs`'s `Surface` impl changed the kernel image by −408 KiB**
   (`_kernel_end` `0x1212dd0` → `0x11aced0`, back to the pre-audit size). Nothing in
   the change should shrink the image by that much; it is almost certainly the `fbcon`
