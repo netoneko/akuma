@@ -1,0 +1,8 @@
+#!/bin/sh
+# Crush with this box's config: HOME/PATH/XDG_RUNTIME_DIR (an ssh session has none) and the
+# default model from /root/.config/crush/crushrc (glm-5.3-flash, low effort). crush-kimi / crush-glm pin one.
+. /etc/akuma-dev.env
+HOME=${HOME:-/root}; export HOME
+PATH=${PATH:-/bin:/usr/bin:/usr/local/bin}; export PATH   # sshd gives a session none
+XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp}; export XDG_RUNTIME_DIR   # crush's client/server socket; no /run/user here
+exec /usr/local/bin/crush-bin "$@"

@@ -1,0 +1,53 @@
+# crushrc — Crush against Kimi Code and z.ai GLM, same endpoints/tokens as
+# goose-kimi / goose-glm (/usr/local/bin/goose-{kimi,glm}). Tokens are read from
+# the box's token files at startup (0600, never copied into this file).
+#
+# Default: glm/glm-5.3-flash, low effort. `crush-kimi` for Kimi, `crush-glm` for GLM Flash,
+# or pick in the TUI (ctrl+l), or one-shot:  CRUSH_MODEL=kimi/kimi-for-coding crush run "..."
+#
+# YOLO is deliberately NOT enabled here. Per run: `crush --yolo`. To make it the
+# default, either add an alias in the shell profile (alias crush='crush --yolo')
+# or allow tools from here, e.g.:   permissions allow view ls grep edit bash
+
+# `$(< file)` rather than `$(cat file)`: crush's built-in shell resolves `cat` through
+# PATH, and an Akuma ssh session has none, so the key came out empty (401).
+KIMI_TOKEN_FILE=${KIMI_TOKEN_FILE:-/root/.akuma/kimi/token}
+ZAI_TOKEN_FILE=${ZAI_TOKEN_FILE:-/root/.akuma/z.ai/token}
+
+# --- Kimi Code (OpenAI-compatible; kimi-for-coding = K2.8 Preview, 1M window) ---
+if [[ -r $KIMI_TOKEN_FILE ]]; then
+    provider add kimi --name "Kimi Code" --type openai-compat \
+        --base-url "https://api.kimi.com/coding/v1" \
+        --api-key "$(< "$KIMI_TOKEN_FILE")"
+    model add kimi/kimi-for-coding --name "Kimi for Coding" \
+        --context-window 1048576 --default-max-tokens 32768 --can-reason true
+fi
+
+# --- z.ai GLM coding plan (OpenAI-compatible) ---
+if [[ -r $ZAI_TOKEN_FILE ]]; then
+    provider add glm --name "z.ai GLM" --type openai-compat \
+        --base-url "https://api.z.ai/api/coding/paas/v4" \
+        --api-key "$(< "$ZAI_TOKEN_FILE")"
+    model add glm/glm-5.3 --name "GLM 5.3" \
+        --context-window 200000 --default-max-tokens 32768 --can-reason true
+    model add glm/glm-5.3-flash --name "GLM 5.3 Flash" \
+        --context-window 200000 --default-max-tokens 32768 --can-reason true \
+        --reasoning-effort low
+fi
+
+# --- behaviour ---
+option default-providers false        # picker shows only kimi/ and glm/
+option provider-auto-update false     # no catalog fetches from the network
+option metrics false                  # crush sends anonymous usage events by default
+option request-timeout 600            # thinking models stream slowly; default is 60 s
+
+# Main model: GLM 5.3 Flash on LOW reasoning effort (what goose-glm defaults to).
+# Override with CRUSH_MODEL (the wrappers crush-kimi / crush-glm set it). Low effort is
+# applied to the flash model only; other models keep their own default effort.
+CRUSH_MODEL=${CRUSH_MODEL:-glm/glm-5.3-flash}
+if [[ $CRUSH_MODEL == glm/glm-5.3-flash ]]; then
+    model large "$CRUSH_MODEL" --reasoning-effort low
+else
+    model large "$CRUSH_MODEL"
+fi
+model small glm/glm-5.3-flash --reasoning-effort low

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Crush against z.ai GLM 5.3 Flash, low reasoning effort (crushrc sets the effort). Provider/token wiring lives in
+# /root/.config/crush/crushrc; this only pins the model and the Akuma environment.
+. /etc/akuma-dev.env
+HOME=${HOME:-/root}; export HOME
+PATH=${PATH:-/bin:/usr/bin:/usr/local/bin}; export PATH   # sshd gives a session none
+XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp}; export XDG_RUNTIME_DIR   # crush's client/server socket; no /run/user here
+CRUSH_MODEL=${CRUSH_MODEL:-glm/glm-5.3-flash}; export CRUSH_MODEL
+exec /usr/local/bin/crush-bin "$@"

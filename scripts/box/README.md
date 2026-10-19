@@ -13,7 +13,20 @@ checkout and cannot silently drift from what this repo documents.
 | `mbuild` | `/bin/mbuild` | `meow` → `/root/mtarget` |
 | `kinstall` | `/bin/kinstall` | runs the repo's `scripts/install_kernel_amd64.sh` |
 
-Install or refresh them from inside Akuma:
+## Crush (the agent TUI) — added 2026-10-19
+
+| file | installed at | what it does |
+|---|---|---|
+| `crush`, `crush-glm`, `crush-kimi` | `/bin/` (**not** `/usr/local/bin` — see below) | wrappers: `HOME`/`PATH`/`XDG_RUNTIME_DIR` (a session has none), then `exec /usr/local/bin/crush-bin`. `crush` uses the `crushrc` default (GLM 5.3 Flash, low effort); the other two pin a model |
+| `crushrc` | `/root/.config/crush/crushrc` (mode 0600) | providers `kimi` (Kimi Code) and `glm` (z.ai coding plan), tokens read from `/root/.akuma/{kimi,z.ai}/token`, `metrics` off, **no yolo** |
+| `10-local-bin.sh` | `/etc/profile.d/10-local-bin.sh` | appends `/usr/local/bin` to `PATH` for interactive shells — only takes effect once sshd passes `ENV` (the deployed sshd predates that) |
+
+The real binary is `crush-bin` (crush v0.98.1, static Go, from the `charmbracelet/crush` release
+tarball) at `/usr/local/bin/crush-bin`. **Wrappers live in `/bin` because an ssh session's `PATH` is
+`/sbin:/usr/sbin:/bin:/usr/bin`** — `/usr/local/bin/goose-glm` and friends are not found by name
+either. Runbook: [`docs/runbooks/crush-on-akuma.md`](../../docs/runbooks/crush-on-akuma.md).
+
+Install or refresh the build rig from inside Akuma:
 
 ```sh
 cd /src/github.com/netoneko/akuma
