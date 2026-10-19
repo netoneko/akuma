@@ -71,9 +71,10 @@ the gap between them is the duplication the shared-crate extraction has not yet
 absorbed.
 
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
+    scripts/cloc_akuma.py --all-languages      # also C, asm, shell, TOML, Markdown, ...
     scripts/cloc_akuma.py --rev HEAD~5         # count a revision's tree
     scripts/cloc_akuma.py --vs main            # delta: main -> working tree
     scripts/cloc_akuma.py --rev HEAD --vs HEAD~1   # delta across one commit
@@ -123,6 +124,20 @@ EXT_LANGS = {
     ".md": PLAIN("Markdown"),
     ".json": PLAIN("JSON"),
 }
+
+#: Rust only by default: shell, TOML and Markdown are not the code being measured, and
+#: counting them as code inflates every kernel and crate total. `--all-languages`
+#: restores the full table. Set once in `main`, read by the two tree walkers.
+RUST_ONLY = True
+
+
+def lang_for(ext: str):
+    """The `LangSpec` for a file extension, or None when it is not counted."""
+    spec = EXT_LANGS.get(ext)
+    if spec is not None and RUST_ONLY and not spec.rust:
+        return None
+    return spec
+
 
 SKIP_DIRS = {".git", "target", "__pycache__", "node_modules", ".idea", ".vscode"}
 TEST_DIRS = {"tests", "benches"}
@@ -748,7 +763,7 @@ def walk(paths: list, kernel_gate: bool):
     for root_arg in paths:
         root_arg = root_arg.rstrip(os.sep)
         if os.path.isfile(root_arg):
-            spec = EXT_LANGS.get(os.path.splitext(root_arg)[1])
+            spec = lang_for(os.path.splitext(root_arg)[1])
             if spec:
                 take(root_arg, spec)
             else:
@@ -760,7 +775,7 @@ def walk(paths: list, kernel_gate: bool):
                 if fn.startswith("."):
                     continue
                 full = os.path.join(dirpath, fn)
-                spec = EXT_LANGS.get(os.path.splitext(fn)[1])
+                spec = lang_for(os.path.splitext(fn)[1])
                 if spec is None:
                     ignored += 1
                     continue
@@ -799,7 +814,7 @@ def walk_rev(paths: list, kernel_gate: bool, rev: str):
         parts = rel.split(os.sep)
         if any(p in SKIP_DIRS or p.startswith(".") for p in parts[:-1]):
             continue
-        spec = EXT_LANGS.get(os.path.splitext(rel)[1])
+        spec = lang_for(os.path.splitext(rel)[1])
         if spec is None:
             ignored += 1
             continue
@@ -987,7 +1002,7 @@ def print_report(files: list, paths: list, ignored: int, by_file: bool, top: int
     print(f"test code / prod code .. {ratio:.2f}x")
     print(f"physical lines ......... {total.total_blank + total.total_comment + total.total_code}")
     if ignored:
-        print(f"skipped (unknown ext) .. {ignored} files")
+        print(f"skipped (not Rust, or unknown ext) .. {ignored} files")
     print(rule(W))
 
     print()
@@ -1145,29 +1160,76 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+_PATH_DEP = re.compile(r'path\s*=\s*"([^"]+)"')
+
+
+def path_deps(manifest: str) -> set:
+    """Repo-relative dirs a manifest names with `path = "..."` in a normal
+    `[dependencies]`-style table (target-specific and optional ones included;
+    dev- and build-dependencies are not part of what a kernel links)."""
+    found: set = set()
+    try:
+        text = open(manifest, encoding="utf-8").read()
+    except OSError:
+        return found
+    base = os.path.dirname(manifest)
+    live = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            live = "dependencies" in line and not (
+                "dev-dependencies" in line or "build-dependencies" in line
+            )
+            continue
+        if live:
+            m = _PATH_DEP.search(line)
+            if m:
+                found.add(os.path.normpath(os.path.join(base, m.group(1))))
+    return found
+
+
+def linked_crates(root_manifest: str) -> set:
+    """Transitive closure of path dependencies from a kernel's manifest, as
+    repo-relative crate directories (the root manifest's own dir excluded)."""
+    seen: set = set()
+    todo = list(path_deps(root_manifest))
+    while todo:
+        d = todo.pop()
+        if d in seen:
+            continue
+        seen.add(d)
+        todo.extend(path_deps(os.path.join(d, "Cargo.toml")))
+    return seen
+
+
 def platform_buckets(files: list) -> dict:
     """Group every component into a platform bucket, derived from the source.
 
     The tree is two kernels over one shared crate pool: `src/` is the AArch64
-    bin, `amd64/` is the second bin, `crates/` serve whichever kernels link
-    them. Whether a crate serves both is not something a hand-kept table can be
-    trusted with — new crates appear every few days — so it is derived from the
-    `#[cfg(target_arch = ...)]` attributes the lexer already parsed:
+    bin (root `Cargo.toml`), `amd64/` is the second bin, `crates/` serve
+    whichever kernels link them. Which kernel links a crate is read from the
+    Cargo dependency graph (path dependencies, transitively):
 
-      amd64-only   — names exactly one arch, x86_64
-      aarch64-only — names exactly one arch, aarch64
-      shared       — names both, or neither (arch-neutral code compiles for
-                     either; classifying it as shared understates nothing)
+      linked by both kernels — shared
+      linked by only amd64   — amd64-only
+      linked by only AArch64 — aarch64-only
 
-    The failure mode of getting this wrong is one-directional and flattering:
-    an amd64-only crate that drifts into "shared" is counted in the AArch64
-    kernel's footprint too, inflating it with code that never runs there.
-    Naming exactly one arch is the only claim the source itself backs, so
-    anything else is shared.
+    A crate neither kernel reaches (host tools, userspace) falls back to its
+    `#[cfg(target_arch = ...)]` attributes: exactly one arch named picks that
+    arch's bucket, anything else is shared.
+
+    The cfg scan alone is NOT trustworthy for crates that are reached: a crate
+    whose only `target_arch` mention is an `x86_64` gate beside an unconditional
+    AArch64 path (akuma-bkl, akuma-syscalls-glue, akuma-net-nic) names one arch
+    yet serves both, and was reported amd64-only.
     """
     comp_arches: dict = {}
     for fc in files:
         comp_arches.setdefault(component_of(fc.path), set()).update(fc.arches)
+
+    a64 = linked_crates("Cargo.toml")
+    x64 = linked_crates(os.path.join("amd64", "Cargo.toml"))
+    have_graph = bool(a64 or x64)
 
     buckets: dict = {}
     for comp, arches in comp_arches.items():
@@ -1175,6 +1237,12 @@ def platform_buckets(files: list) -> dict:
             buckets.setdefault("aarch64 bin", []).append(comp)
         elif comp == "amd64" or comp.startswith("amd64" + os.sep):
             buckets.setdefault("amd64 bin", []).append(comp)
+        elif have_graph and comp in a64 and comp in x64:
+            buckets.setdefault("shared crates", []).append(comp)
+        elif have_graph and comp in x64:
+            buckets.setdefault("amd64-only crates", []).append(comp)
+        elif have_graph and comp in a64:
+            buckets.setdefault("aarch64-only crates", []).append(comp)
         elif arches == {"x86_64"}:
             buckets.setdefault("amd64-only crates", []).append(comp)
         elif arches == {"aarch64"}:
@@ -1248,9 +1316,9 @@ def print_platform_report(files: list, W: int) -> None:
             print(f"{name}: {', '.join(crates)}")
     print(rule(W))
     print("Shared crates are counted in both footprints, so the two `links` rows")
-    print("sum to more than the tree. Attribution is derived from")
-    print("#[cfg(target_arch = ..)] attributes; a crate naming both arches (or")
-    print("neither) counts as shared. cfg!() macros are not parsed.")
+    print("sum to more than the tree. Attribution comes from each kernel's")
+    print("Cargo path-dependency closure; crates neither kernel reaches fall")
+    print("back to #[cfg(target_arch = ..)] attributes (cfg!() not parsed).")
     print(rule(W))
 
 
@@ -1661,9 +1729,15 @@ def emit_json(files: list, paths: list) -> None:
     )
 
 
+# `amd64/src`, not `amd64`: the bin's directory also holds `mkdisk.sh`, `Cargo.toml`,
+# a README and linker/boot scaffolding, which this counter would report as code.
+# The platform split keys on the `amd64/` prefix, so the narrower root changes nothing there.
+DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src")]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=["src", "crates", "amd64"], help="files/dirs (default: src crates)")
+    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src)")
     ap.add_argument("--by-file", action="store_true", help="per-file table")
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1677,14 +1751,21 @@ def main() -> int:
         action="store_true",
         help='count #[cfg(not(any(feature = "no-tests", ...)))] items as production code',
     )
+    ap.add_argument(
+        "--all-languages",
+        action="store_true",
+        help="also count C, assembly, shell, TOML, Markdown, JSON, ... (default: Rust only)",
+    )
     ap.add_argument("--rev", help="count this git revision's tree instead of the working tree")
     ap.add_argument("--vs", metavar="REV",
                     help="also count REV and print the delta REV -> (--rev or working tree)")
     args = ap.parse_args()
+    global RUST_ONLY
+    RUST_ONLY = not args.all_languages
     if args.self_test:
         return self_test()
 
-    paths = args.paths or ["src", "amd64", "crates"]
+    paths = args.paths or DEFAULT_PATHS
     kernel_gate = not args.no_kernel_test_gate
 
     if args.rev:
