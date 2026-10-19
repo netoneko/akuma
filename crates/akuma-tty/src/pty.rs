@@ -51,116 +51,10 @@
 //!   queueing bytes nobody can read — a writer that ignores hangup would
 //!   otherwise fill the input buffer and block forever.
 
-#![cfg_attr(not(test), no_std)]
-#![forbid(unsafe_code)]
-
-extern crate alloc;
-
-mod ring;
-
-pub use ring::Ring;
-
 use alloc::vec::Vec;
 
-/// The `ioctl(2)` request numbers this device answers. asm-generic values,
-/// which x86_64 shares.
-pub mod ioctl {
-    pub const TCGETS: u32 = 0x5401;
-    pub const TCSETS: u32 = 0x5402;
-    pub const TCSETSW: u32 = 0x5403;
-    pub const TCSETSF: u32 = 0x5404;
-    pub const TCSBRK: u32 = 0x5409;
-    pub const TCXONC: u32 = 0x540A;
-    pub const TCFLSH: u32 = 0x540B;
-    pub const TIOCSCTTY: u32 = 0x540E;
-    pub const TIOCGPGRP: u32 = 0x540F;
-    pub const TIOCSPGRP: u32 = 0x5410;
-    pub const TIOCOUTQ: u32 = 0x5411;
-    pub const TIOCGWINSZ: u32 = 0x5413;
-    pub const TIOCSWINSZ: u32 = 0x5414;
-    pub const FIONREAD: u32 = 0x541B;
-    pub const TIOCPKT: u32 = 0x5420;
-    pub const TIOCNOTTY: u32 = 0x5422;
-    pub const TIOCGSID: u32 = 0x5429;
-    pub const TCSBRKP: u32 = 0x5425;
-    /// `_IOR('T', 0x30, unsigned int)` — the pair number, for `ptsname`.
-    pub const TIOCGPTN: u32 = 0x8004_5430;
-    /// `_IOW('T', 0x31, int)` — `unlockpt` writes 0 here.
-    pub const TIOCSPTLCK: u32 = 0x4004_5431;
-    /// `_IOR('T', 0x39, int)`.
-    pub const TIOCGPTLCK: u32 = 0x8004_5439;
-    /// `_IO('T', 0x41)` — open the slave straight from a master descriptor.
-    pub const TIOCGPTPEER: u32 = 0x5441;
-
-    /// `TCFLSH` arguments.
-    pub const TCIFLUSH: u64 = 0;
-    pub const TCOFLUSH: u64 = 1;
-    pub const TCIOFLUSH: u64 = 2;
-}
-
-/// termios flag bits (asm-generic `termbits.h`; octal, as Linux spells them).
-pub mod flags {
-    // c_iflag
-    pub const ISTRIP: u32 = 0o40;
-    pub const INLCR: u32 = 0o100;
-    pub const IGNCR: u32 = 0o200;
-    pub const ICRNL: u32 = 0o400;
-    pub const IXON: u32 = 0o2000;
-    pub const IUTF8: u32 = 0o40000;
-    // c_oflag
-    pub const OPOST: u32 = 0o1;
-    pub const ONLCR: u32 = 0o4;
-    pub const OCRNL: u32 = 0o10;
-    // c_cflag
-    pub const B38400: u32 = 0o17;
-    pub const CS8: u32 = 0o60;
-    pub const CREAD: u32 = 0o200;
-    // c_lflag
-    pub const ISIG: u32 = 0o1;
-    pub const ICANON: u32 = 0o2;
-    pub const ECHO: u32 = 0o10;
-    pub const ECHOE: u32 = 0o20;
-    pub const ECHOK: u32 = 0o40;
-    pub const ECHONL: u32 = 0o100;
-    pub const NOFLSH: u32 = 0o200;
-    pub const ECHOCTL: u32 = 0o1000;
-    pub const ECHOKE: u32 = 0o4000;
-    pub const IEXTEN: u32 = 0o100000;
-}
-
-/// `c_cc` indices.
-pub mod cc {
-    pub const VINTR: usize = 0;
-    pub const VQUIT: usize = 1;
-    pub const VERASE: usize = 2;
-    pub const VKILL: usize = 3;
-    pub const VEOF: usize = 4;
-    pub const VTIME: usize = 5;
-    pub const VMIN: usize = 6;
-    pub const VSTART: usize = 8;
-    pub const VSTOP: usize = 9;
-    pub const VSUSP: usize = 10;
-    pub const VEOL: usize = 11;
-    pub const VREPRINT: usize = 12;
-    pub const VDISCARD: usize = 13;
-    pub const VWERASE: usize = 14;
-    pub const VLNEXT: usize = 15;
-    pub const VEOL2: usize = 16;
-    /// Length of the kernel's `c_cc` (musl's userspace array is 32; the
-    /// kernel copies 19).
-    pub const NCCS: usize = 19;
-}
-
-/// The signals a terminal raises.
-pub mod sig {
-    pub const SIGHUP: u32 = 1;
-    pub const SIGINT: u32 = 2;
-    pub const SIGQUIT: u32 = 3;
-    pub const SIGCONT: u32 = 18;
-    pub const SIGTSTP: u32 = 20;
-    pub const SIGWINCH: u32 = 28;
-}
-
+use crate::ring::Ring;
+pub use crate::termios::{MAX_CANON, Termios, Transition, Winsize, cc, flags, ioctl, sig};
 use cc::*;
 use flags::*;
 
@@ -175,8 +69,6 @@ pub const MAX_PTYS: usize = 64;
 pub const INPUT_CAPACITY: usize = 8192;
 /// Slave → master buffer, in bytes.
 pub const OUTPUT_CAPACITY: usize = 8192;
-/// Longest canonical line, matching Linux's N_TTY.
-pub const MAX_CANON: usize = 4095;
 /// Threads that can wait on one pair at once.
 ///
 /// Readers, writers and pollers of both sides together. A waiter that finds the
@@ -184,8 +76,6 @@ pub const MAX_CANON: usize = 4095;
 /// [`PtyPair::register_waiter`].
 pub const MAX_WAITERS: usize = 8;
 
-/// `_POSIX_VDISABLE`: a `c_cc` slot holding 0 is switched off.
-const DISABLED: u8 = 0;
 
 /// Input entries carry the byte in the low 8 bits plus these flags.
 ///
@@ -195,143 +85,6 @@ const DISABLED: u8 = 0;
 const DELIM: u16 = 0x100;
 const EOF_MARK: u16 = 0x200;
 
-/// The kernel `struct termios` (not musl's larger userspace one): four flag
-/// words, `c_line`, and 19 control characters — 36 bytes on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Termios {
-    pub iflag: u32,
-    pub oflag: u32,
-    pub cflag: u32,
-    pub lflag: u32,
-    pub line: u8,
-    pub cc: [u8; NCCS],
-}
-
-impl Termios {
-    pub const WIRE_LEN: usize = 36;
-
-    /// Linux's `tty_std_termios` with `INIT_C_CC`, as a pty slave starts — plus
-    /// `IUTF8` (see the crate header).
-    #[must_use]
-    pub const fn initial() -> Self {
-        let mut cc = [0u8; NCCS];
-        cc[VINTR] = 0x03;
-        cc[VQUIT] = 0x1C;
-        cc[VERASE] = 0x7F;
-        cc[VKILL] = 0x15;
-        cc[VEOF] = 0x04;
-        cc[VTIME] = 0;
-        cc[VMIN] = 1;
-        cc[VSTART] = 0x11;
-        cc[VSTOP] = 0x13;
-        cc[VSUSP] = 0x1A;
-        cc[VREPRINT] = 0x12;
-        cc[VDISCARD] = 0x0F;
-        cc[VWERASE] = 0x17;
-        cc[VLNEXT] = 0x16;
-        Self {
-            iflag: ICRNL | IXON | IUTF8,
-            oflag: OPOST | ONLCR,
-            cflag: B38400 | CS8 | CREAD,
-            lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
-            line: 0,
-            cc,
-        }
-    }
-
-    /// `cfmakeraw`: what a terminal client (the Akuma `ssh`'s
-    /// `SET_TERMINAL_ATTRIBUTES` raw-mode request) wants of the tty it reads
-    /// keys from — no line editing, no echo, no signal keys, no CR/NL or
-    /// output translation, `read` returns as soon as one byte is there.
-    pub fn make_raw(&mut self) {
-        self.iflag &= !(ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-        self.oflag &= !OPOST;
-        self.lflag &= !(ECHO | ECHOE | ECHOK | ECHONL | ECHOCTL | ECHOKE | ICANON | ISIG | IEXTEN);
-        self.cc[VMIN] = 1;
-        self.cc[VTIME] = 0;
-    }
-
-    /// The inverse of [`Self::make_raw`]: the flags a pty slave starts with.
-    /// (The pair keeps no saved copy, so settings the program had changed
-    /// before going raw are not restored — only the defaults.)
-    pub fn make_cooked(&mut self) {
-        let sane = Self::initial();
-        self.iflag |= sane.iflag & (ICRNL | IXON);
-        self.oflag |= sane.oflag;
-        self.lflag |= sane.lflag;
-    }
-
-    /// The wire image `TCGETS` copies out. `c_cc[0]` is at byte **17**: byte
-    /// 16 is `c_line`, which is not part of the array.
-    #[must_use]
-    pub fn to_wire(&self) -> [u8; Self::WIRE_LEN] {
-        let mut w = [0u8; Self::WIRE_LEN];
-        w[0..4].copy_from_slice(&self.iflag.to_le_bytes());
-        w[4..8].copy_from_slice(&self.oflag.to_le_bytes());
-        w[8..12].copy_from_slice(&self.cflag.to_le_bytes());
-        w[12..16].copy_from_slice(&self.lflag.to_le_bytes());
-        w[16] = self.line;
-        w[17..].copy_from_slice(&self.cc);
-        w
-    }
-
-    #[must_use]
-    pub fn from_wire(w: &[u8; Self::WIRE_LEN]) -> Self {
-        let word = |o: usize| u32::from_le_bytes([w[o], w[o + 1], w[o + 2], w[o + 3]]);
-        let mut cc = [0u8; NCCS];
-        cc.copy_from_slice(&w[17..]);
-        Self { iflag: word(0), oflag: word(4), cflag: word(8), lflag: word(12), line: w[16], cc }
-    }
-
-    #[must_use]
-    pub const fn canonical(&self) -> bool {
-        self.lflag & ICANON != 0
-    }
-
-    /// Is `c` the (enabled) control character in slot `idx`?
-    const fn is(&self, c: u8, idx: usize) -> bool {
-        self.cc[idx] != DISABLED && self.cc[idx] == c
-    }
-}
-
-impl Default for Termios {
-    fn default() -> Self {
-        Self::initial()
-    }
-}
-
-/// `struct winsize` — 8 bytes on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Winsize {
-    pub row: u16,
-    pub col: u16,
-    pub xpixel: u16,
-    pub ypixel: u16,
-}
-
-impl Winsize {
-    pub const WIRE_LEN: usize = 8;
-
-    #[must_use]
-    pub fn to_wire(&self) -> [u8; Self::WIRE_LEN] {
-        let mut w = [0u8; Self::WIRE_LEN];
-        w[0..2].copy_from_slice(&self.row.to_le_bytes());
-        w[2..4].copy_from_slice(&self.col.to_le_bytes());
-        w[4..6].copy_from_slice(&self.xpixel.to_le_bytes());
-        w[6..8].copy_from_slice(&self.ypixel.to_le_bytes());
-        w
-    }
-
-    #[must_use]
-    pub const fn from_wire(w: &[u8; Self::WIRE_LEN]) -> Self {
-        Self {
-            row: u16::from_le_bytes([w[0], w[1]]),
-            col: u16::from_le_bytes([w[2], w[3]]),
-            xpixel: u16::from_le_bytes([w[4], w[5]]),
-            ypixel: u16::from_le_bytes([w[6], w[7]]),
-        }
-    }
-}
 
 /// A set of signal numbers below 32, raised by input processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

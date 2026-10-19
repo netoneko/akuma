@@ -505,11 +505,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if !is_pipe
                     && let Some(ts_lock) = akuma_exec::process::current_terminal_state()
                 {
-                    let (raw, vmin, vtime) = {
-                        let ts = akuma_exec::sync::lock_bounded(&ts_lock);
-                        (!ts.is_canonical(), ts.cc[akuma_terminal::cc_index::VMIN], ts.cc[akuma_terminal::cc_index::VTIME])
-                    };
-                    if raw && vmin == 0 {
+                    let vmin0 = akuma_exec::sync::lock_bounded(&ts_lock).raw_vmin0();
+                    if let Some(vtime) = vmin0 {
                         if vtime == 0 {
                             return 0;
                         }
@@ -562,7 +559,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // races `close_process_stdin` (e.g. `cat` over `ssh host cmd` when
                 // the client closes stdin) parks forever. Re-loop instead of parking.
                 if ch.is_stdin_closed() || ch.has_stdin_data() {
-                    akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
+                    akuma_exec::sync::lock_bounded(&term_state_lock).take_input_waker();
                     continue;
                 }
 
@@ -571,7 +568,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     None => akuma_exec::threading::park_indefinitely(),
                 }
 
-                akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
+                akuma_exec::sync::lock_bounded(&term_state_lock).take_input_waker();
             }
         }
         akuma_exec::process::FileDescriptor::File(ref f) => {

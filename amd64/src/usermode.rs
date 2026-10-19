@@ -4390,7 +4390,7 @@ fn register_exec_process(
     // Sharing the `Arc` rather than copying the size is what a live resize
     // needs: `sshd` writes the child's state on `window-change` and the running
     // full-screen program reads the same cell.
-    term: Option<alloc::sync::Arc<Spinlock<akuma_terminal::TerminalState>>>,
+    term: Option<alloc::sync::Arc<Spinlock<akuma_tty::TerminalState>>>,
     // The process's **I/O** channel — `Process::channel`, not the per-thread
     // exit channel this function registers below. `Some` only for a
     // `SPAWN_FLAG_PTY` spawn, whose child needs a channel that reports

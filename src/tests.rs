@@ -3598,7 +3598,7 @@ fn make_test_process(
         fault_mutex: Spinlock::new(BTreeMap::new()),
         thread_id: None, spawner_pid: None, ctty: core::sync::atomic::AtomicU32::new(0),
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
-            akuma_terminal::TerminalState::default(),
+            akuma_tty::TerminalState::default(),
         )),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(akuma_exec::process::Creds::ROOT)),

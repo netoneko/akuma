@@ -1210,7 +1210,7 @@ const DEV_DIR_INO: u64 = u64::MAX - 2;
 ///
 /// The pair table is `akuma-syscalls-glue::pty`, which sits *above* this crate,
 /// so it publishes into this word instead of being asked. 64 bits because the
-/// number space is 64 (`akuma_pty::MAX_PTYS`). Readers want a listing and an
+/// number space is 64 (`akuma_tty::pty::MAX_PTYS`). Readers want a listing and an
 /// existence answer; a mask gives both with no allocation and no lock.
 static PTS_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

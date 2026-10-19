@@ -446,7 +446,7 @@ akuma-isolation = { path = "../crates/akuma-isolation" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.
-akuma-terminal = { path = "../crates/akuma-terminal" }
+akuma-tty = { path = "../crates/akuma-tty" }
 # `FileDescriptor` and `KernelFile` — the tree's descriptor types. The unsafe-free
 # core of `akuma-exec`, behind only `akuma-primitives`/`akuma-mmap`/
 # `akuma-syscalls-linux`, all of which build for this target.

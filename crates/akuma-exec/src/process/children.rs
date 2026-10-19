@@ -8,7 +8,7 @@ use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, Laz
 use crate::process::channel::{ProcessChannel, get_channel};
 use crate::process::table::{THREAD_PID_MAP, find_process};
 use crate::runtime::{with_irqs_disabled, runtime, PhysFrame};
-use akuma_terminal as terminal;
+use akuma_tty as terminal;
 
 /// Registry mapping child PIDs to (ProcessChannel, parent_pid)
 /// Used by parent processes to read child stdout via ChildStdout FD

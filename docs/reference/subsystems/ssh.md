@@ -302,7 +302,7 @@ limitations accepted and documented rather than silently left).
   cursor, clear_screen, `poll_input_event` (blocking/non-blocking/timed). Raw
   mode forwards SSH channel bytes unmodified; cooked mode does line editing +
   echo in the shell.
-- **PTY / winsize:** `TerminalState` (`crates/akuma-terminal/src/lib.rs` —
+- **PTY / winsize:** `TerminalState` (`crates/akuma-tty/src/session.rs` —
   mode flags, termios `iflag`/`oflag`/`cflag`/`lflag`, the canonical-mode
   line buffer, `c_cc`) is `Arc<Spinlock<…>>` (`term_width`, `term_height`,
   `input_waker`). `TIOCGWINSZ` (`0x5413`) reads; `TIOCSWINSZ`

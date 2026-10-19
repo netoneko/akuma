@@ -138,7 +138,7 @@ fn a_pipe_at_eof_reports_hup_so_the_eof_transition_is_an_edge() {
 /// A pseudo-terminal side whose peer is gone reports `EPOLLHUP` whether or
 /// not it was asked for — rio's reactor watches the master edge-triggered and
 /// learns its shell exited from that bit, with nothing left to read
-/// (`akuma_pty::PtyPair::master_poll`). The other two bits are maskable.
+/// (`akuma_tty::pty::PtyPair::master_poll`). The other two bits are maskable.
 #[test]
 fn a_pty_reports_hup_unmaskably_and_in_out_on_request() {
     let live = FdState::Pty { can_read: true, can_write: true, hup: false };

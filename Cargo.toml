@@ -54,7 +54,6 @@ default-members = [
     "crates/akuma-fbcon",
     "crates/akuma-pipe",
     "crates/akuma-pipes",
-    "crates/akuma-pty",
     "crates/akuma-pmm",
     "crates/akuma-bkl",
     "crates/akuma-boot",
@@ -82,7 +81,7 @@ default-members = [
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
     "crates/akuma-syscalls-sync",
-    "crates/akuma-terminal",
+    "crates/akuma-tty",
     "crates/akuma-syscalls-time",
     "crates/akuma-timer",
     "crates/akuma-usb",
@@ -732,7 +731,7 @@ workspace = true
 # its header for why that mattered and why it is not in `akuma-primitives`.
 akuma-config = { path = "crates/akuma-config" }
 akuma-cpu = { path = "crates/akuma-cpu" }
-akuma-terminal = { path = "crates/akuma-terminal" }
+akuma-tty = { path = "crates/akuma-tty" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
 # The recoverable lock protocol — the kernel registers its waiter-side backstop in

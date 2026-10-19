@@ -1,0 +1,14 @@
+[package]
+name = "akuma-tty"
+version = "0.1.0"
+edition = "2024"
+description = "The terminal stack as pure, host-tested state machines: the termios vocabulary, the console/ssh-session line discipline (TerminalState) and Unix98 ptys (PtyPair). The fd table, locks, waits, signals and user copies stay in the kernel."
+
+[lints]
+workspace = true
+
+# No dependencies, deliberately: waking a waiter and signalling a process group
+# are effects this crate *returns* (`Wakes`, `Signals`) rather than performs, so
+# nothing in it locks. (`akuma-terminal` carried `spinning_top` for one waker
+# slot; the slot is a plain field now — see `session::TerminalState`.)
+[dependencies]

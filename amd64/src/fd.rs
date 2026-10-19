@@ -2287,15 +2287,18 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
                     u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
                 };
                 let mut ts = lock.lock();
-                let was_canonical = ts.is_canonical();
-                ts.iflag = get(0);
-                ts.oflag = get(4);
-                ts.cflag = get(8);
-                ts.lflag = get(12);
                 // `c_cc` from byte 17, the same offset `TCGETS` writes it at.
-                ts.cc[..NCCS].copy_from_slice(&bytes[17..17 + NCCS]);
-                if !was_canonical
-                    && ts.is_canonical()
+                let mut cc = [0u8; NCCS];
+                cc.copy_from_slice(&bytes[17..17 + NCCS]);
+                let t = akuma_tty::Termios {
+                    iflag: get(0),
+                    oflag: get(4),
+                    cflag: get(8),
+                    lflag: get(12),
+                    line: bytes[16],
+                    cc,
+                };
+                if ts.set_termios(&t).is_cooked()
                     && let Some(p) = akuma_exec::process::current_process_shared()
                 {
                     drop(ts);

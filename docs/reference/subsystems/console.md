@@ -139,6 +139,8 @@ enforcement.
 
 ## Input
 
+Line discipline, termios and the raw/canonical bit live in `akuma-tty`: [`tty.md`](tty.md).
+
 `has_char()`/`getchar()` (`:244-251`) are the non-blocking read primitives
 (check `has_data()` before calling `getchar`). `getchar_blocking()` and
 `read_line()` (`:255-277`, both `#[allow(dead_code)]`) are unused convenience

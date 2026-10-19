@@ -1,5 +1,5 @@
 //! Pseudo-terminals: `/dev/ptmx`, `/dev/pts/N`, and `/dev/tty` inside a pty
-//! session — the kernel half of [`akuma_pty`].
+//! session — the kernel half of [`akuma_tty::pty`].
 //!
 //! The pair itself (both buffers, the line discipline, termios, the window
 //! size, the read decisions, readiness and hangup) is the crate's, host-tested.
@@ -32,7 +32,7 @@
 
 use super::*;
 use akuma_exec::threading::{WakeHandle, wake_handle_for_thread};
-use akuma_pty::{
+use akuma_tty::pty::{
     HungUp, MAX_PTYS, MasterRead, PtyPair, SlaveOpenError, SlaveRead, Termios, Winsize, ioctl as req, sig,
 };
 use akuma_syscalls_linux::flags::open::{O_CLOEXEC, O_NONBLOCK};
@@ -417,7 +417,7 @@ pub fn write(fd_num: u32, n: u32, master: bool, buf_ptr: u64, count: usize) -> u
             let r = if master {
                 p.master_write(&chunk[..len]).map(|i| (i.accepted, i.signals, p.fg_pgid))
             } else {
-                p.slave_write(&chunk[..len]).map(|w| (w, akuma_pty::Signals::default(), 0))
+                p.slave_write(&chunk[..len]).map(|w| (w, akuma_tty::pty::Signals::default(), 0))
             };
             match r {
                 Ok((0, s, fg)) => (Ok((0, s, fg)), register_current(p)),

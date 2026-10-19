@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
 use crate::runtime::{config, with_irqs_disabled};
-use akuma_terminal as terminal;
+use akuma_tty as terminal;
 
 /// Channel for streaming process output between threads
 ///

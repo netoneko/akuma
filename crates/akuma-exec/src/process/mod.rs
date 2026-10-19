@@ -94,7 +94,7 @@ use spinning_top::Spinlock;
 
 use crate::mmu::{self, UserAddressSpace};
 use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled, track_frame};
-use akuma_terminal as terminal;
+use akuma_tty as terminal;
 
 /// A `core::fmt::Write` sink over a caller-supplied stack buffer, truncating on
 /// overflow rather than allocating.
@@ -522,8 +522,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
     enum Filtered<'a> { Unfiltered(&'a [u8]), Empty, Owned(alloc::vec::Vec<u8>) }
     let filtered = if proc.channel.as_ref().is_some_and(|ch| ch.is_terminal()) {
         let ts = crate::sync::lock_bounded(&proc.terminal_state);
-        if ts.lflag & terminal::mode_flags::ISIG != 0 {
-            let vintr = ts.cc[terminal::cc_index::VINTR];
+        if let Some(vintr) = ts.intr_char() {
             if data.contains(&vintr) {
                 let pgid = ts.foreground_pgid;
                 drop(ts);
@@ -646,7 +645,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
 
         // `lock_bounded` disables preemption only for a single `try_lock` attempt, not
         // across the whole wait — see docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md §10.
-        let waker = crate::sync::lock_bounded(&proc.terminal_state).input_waker.lock().take();
+        let waker = crate::sync::lock_bounded(&proc.terminal_state).take_input_waker();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -671,7 +670,7 @@ pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
         channel.close_stdin();
 
         // Same per-attempt-guarded acquire as `write_to_process_stdin` above.
-        let waker = crate::sync::lock_bounded(&proc.terminal_state).input_waker.lock().take();
+        let waker = crate::sync::lock_bounded(&proc.terminal_state).take_input_waker();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -4109,7 +4108,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
         thread_id: None, spawner_pid: None, ctty: AtomicU32::new(0),
-        terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
+        terminal_state: Arc::new(Spinlock::new(akuma_tty::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         creds: Arc::new(SharedCreds::new(Creds::ROOT)),
         channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: AtomicU64::new(0),

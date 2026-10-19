@@ -104,7 +104,7 @@ pub enum FdState {
     /// gone — the slave closed (for the master) or the master closed (for the
     /// slave) — and, like a pipe's, it is unmaskable: it is the only event an
     /// edge-triggered emulator gets when its shell exits with nothing left to
-    /// read (`akuma_pty::PtyPair::master_poll`).
+    /// read (`akuma_tty::pty::PtyPair::master_poll`).
     Pty { can_read: bool, can_write: bool, hup: bool },
 
     /// An epoll instance registered inside another one. Readable exactly while

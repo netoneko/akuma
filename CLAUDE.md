@@ -216,6 +216,16 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `marked` is a **PTE bit**, not `refs > 0` — amd64 uses x86 bit 9; AArch64 has
   no marker and passes `refs > 0`, a pinned divergence recorded in the crate
   (`docs/archive/AKUMA_AMD64_COW.md`).
+  `akuma-tty` is the **terminal stack** (2026-10-19; was `akuma-terminal` + `akuma-pty`):
+  the termios vocabulary and wire layouts (`termios`), the console/ssh-session line
+  discipline `TerminalState` (`session`) and Unix98 `PtyPair` (`pty`), pure, `forbid(unsafe)`,
+  zero dependencies, nothing that locks. **The raw/canonical bit has one owner**:
+  `ICANON` in `c_lflag`, written only by `TerminalState::{set_termios, apply_mode_request}`
+  / `PtyPair::set_termios`, each returning a `Transition` — `grep 'Transition::Cooked'` lists
+  every reaction to a raw terminal going back to line mode (`5a577983`). **Never write
+  `ts.lflag` in a handler; never hand-spell the 36-byte `TCGETS` image again — use
+  `Termios::to_wire`.** Two engines remain (`session` vs `pty`); they differ observably and
+  merging them is its own step (`docs/reference/subsystems/tty.md`).
   `akuma-procfs` is the `/proc/<pid>/{stat,status,cmdline}` byte formats both
   kernels render through — the wire layer, with no process model behind it. The
   AArch64 `ProcFilesystem` (`akuma-vfs-glue`) cannot be compiled for

@@ -2637,7 +2637,7 @@ fn test_smp_shared_blocking_wait_peer_progress() {
 /// Call site currently commented out in `run_all_tests` — see the comment there.
 #[allow(dead_code)]
 fn test_term_state_lock_bounded_acquire_does_not_starve_peers() {
-    use akuma_terminal::TerminalState;
+    use akuma_tty::TerminalState;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use spinning_top::Spinlock;
@@ -8485,7 +8485,7 @@ fn test_box_crossing_spawn_gets_fresh_terminal_state() {
     });
 
     let tid = current_thread_id();
-    let injected = Arc::new(Spinlock::new(akuma_terminal::TerminalState::default()));
+    let injected = Arc::new(Spinlock::new(akuma_tty::TerminalState::default()));
     register_terminal_state(tid, injected.clone());
 
     let mut fails = 0u32;

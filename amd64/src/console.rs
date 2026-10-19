@@ -45,7 +45,7 @@ use alloc::sync::Arc;
 use spinning_top::Spinlock;
 
 use akuma_exec::process::ProcessChannel;
-use akuma_terminal::TerminalState;
+use akuma_tty::TerminalState;
 
 /// Tell the console's line discipline how big the screen is, in `(rows, cols)`.
 ///
@@ -84,74 +84,40 @@ static CHANNEL: Spinlock<Option<Arc<ProcessChannel>>> = Spinlock::new(None);
 /// module exists to avoid.
 static TERM: Spinlock<Option<Arc<Spinlock<TerminalState>>>> = Spinlock::new(None);
 
-/// `c_cc[VSUSP]`, which `akuma_terminal::cc_index` does not name.
-///
-/// The array is 20 bytes and Linux's index for `^Z` is 10; the constant is
-/// simply missing from that crate's table, and adding it there would change
-/// what the AArch64 kernel's `TCGETS` reports. Spelled here instead, where it
-/// costs one line and no other kernel.
-const CC_VSUSP: usize = 10;
-
 /// A `TerminalState` carrying **exactly what this target's `TCGETS` used to
-/// report from literals**.
+/// report from literals** — `akuma_tty::Termios::console_default()`, whose test
+/// pins the old values (`0x500 / 5 / 0xBF / 0x8A3B`, `VSUSP = ^Z`).
 ///
 /// `fd::console_ioctl` answered `TCGETS` from compiled-in constants because
 /// there was no line discipline to describe. There is one now, and the ioctl
 /// reads it — so the state has to start out saying what the constants said, or
-/// the fold would silently re-describe every terminal on this target. Four
-/// flag words and one control character differ from
-/// `TerminalState::default()`: `c_cflag` (`B38400|CS8|CREAD`, which `stty`
-/// prints as the line speed and the default leaves at 0, i.e. hang-up),
-/// `c_lflag`'s `ECHOCTL|ECHOKE|IEXTEN`, and `c_cc[VSUSP]`.
+/// the fold would silently re-describe every terminal on this target.
 ///
 /// Used for **every** process this target registers, not just the console one:
 /// a spawned child's fd 0 is a pipe faked up as a tty by the same `console_ioctl`
 /// arm, and it has to keep reading what it read before too.
 #[must_use]
 pub fn default_terminal_state() -> TerminalState {
-    let mut ts = TerminalState::default();
-    let (iflag, oflag, cflag, lflag) = DEFAULT_FLAGS;
-    ts.iflag = iflag;
-    ts.oflag = oflag;
-    ts.cflag = cflag;
-    ts.lflag = lflag;
-    ts.cc[CC_VSUSP] = VSUSP_CHAR;
-    ts
+    TerminalState::with_termios(&akuma_tty::Termios::console_default())
 }
 
 /// `(c_iflag, c_oflag, c_cflag, c_lflag)` — see [`default_terminal_state`].
 ///
 /// Separate from that function so `fd::console_ioctl` can answer `TCGETS` for a
 /// thread with no registered state at all without building a whole
-/// `TerminalState` (two heap containers and two spinlocks) to read four words
-/// out of it.
-pub const DEFAULT_FLAGS: (u32, u32, u32, u32) = (
-    0x0000_0500, // c_iflag = ICRNL | IXON
-    0x0000_0005, // c_oflag = OPOST | ONLCR
-    0x0000_00BF, // c_cflag = B38400 | CS8 | CREAD
-    0x0000_8A3B, // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN
-);
+/// `TerminalState` to read four words out of it.
+pub const DEFAULT_FLAGS: (u32, u32, u32, u32) = {
+    let t = akuma_tty::Termios::console_default();
+    (t.iflag, t.oflag, t.cflag, t.lflag)
+};
 
-/// `^Z`, the one control character [`default_terminal_state`] adds to
-/// `TerminalState`'s own defaults.
-pub const VSUSP_CHAR: u8 = 0x1A;
-
-/// The `c_cc` array a thread with no registered terminal state reports.
-///
-/// `TerminalState::default()`'s control characters, plus [`VSUSP_CHAR`], as a
-/// plain array — the allocation-free half of [`default_terminal_state`], for the
-/// same caller and the same reason as [`DEFAULT_FLAGS`].
+/// The `c_cc` array a thread with no registered terminal state reports:
+/// `Termios::console_default()`'s control characters in the 20-byte array — the
+/// allocation-free half of [`default_terminal_state`].
 #[must_use]
 pub fn default_cc() -> [u8; 20] {
     let mut cc = [0u8; 20];
-    cc[akuma_terminal::cc_index::VINTR] = 0x03;
-    cc[akuma_terminal::cc_index::VQUIT] = 0x1C;
-    cc[akuma_terminal::cc_index::VERASE] = 0x7F;
-    cc[akuma_terminal::cc_index::VKILL] = 0x15;
-    cc[akuma_terminal::cc_index::VEOF] = 0x04;
-    cc[akuma_terminal::cc_index::VTIME] = 0x00;
-    cc[akuma_terminal::cc_index::VMIN] = 0x01;
-    cc[CC_VSUSP] = VSUSP_CHAR;
+    cc[..akuma_tty::termios::cc::NCCS].copy_from_slice(&akuma_tty::Termios::console_default().cc);
     cc
 }
 
@@ -382,7 +348,7 @@ fn wake_reader() {
     let Some(term) = terminal_state() else {
         return;
     };
-    let waker = akuma_exec::sync::lock_bounded(&term).input_waker.lock().take();
+    let waker = akuma_exec::sync::lock_bounded(&term).take_input_waker();
     if let Some(waker) = waker {
         waker.wake();
     }

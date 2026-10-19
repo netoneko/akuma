@@ -83,12 +83,8 @@ Tier C (niche) remains:
   `drivers/block.md`. (`drivers/framebuffer.md` and `drivers/fw_cfg.md` were
   listed here until 2026-08-31; the framebuffer and the fw_cfg driver that
   configured it are gone — [`../archive/FRAMEBUFFER_REMOVED.md`](../archive/FRAMEBUFFER_REMOVED.md).)
-- **`akuma-terminal`** (`crates/akuma-terminal/src/lib.rs` — `TerminalState`:
-  termios fields, mode flags, the canonical-mode line buffer): no dedicated
-  crate doc. Covered only in passing by
-  [`subsystems/syscalls/term.md`](subsystems/syscalls/term.md) and
-  [`subsystems/ssh.md`](subsystems/ssh.md) § "Terminal handling", which
-  document its *callers*, not its own state machine.
+- (`akuma-terminal` / `akuma-pty` became `akuma-tty` 2026-10-19 and have a doc:
+  [`subsystems/tty.md`](subsystems/tty.md).)
 
 For these, consult `archive/` directly in the meantime.
 

@@ -1,5 +1,5 @@
 use super::*;
-use akuma_terminal::mode_flags;
+use akuma_tty::mode_flags;
 
 pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCGETS: u32 = 0x5401;
@@ -264,24 +264,10 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(state) => state,
                 None => return ENOMEM,
             };
-            let ts = term_state_lock.lock();
-            let mut kernel_buf = [0u32; 9]; // 4 flags + c_line + c_cc[19] = 36 bytes
-            kernel_buf[0] = ts.iflag;
-            kernel_buf[1] = ts.oflag;
-            kernel_buf[2] = ts.cflag;
-            kernel_buf[3] = ts.lflag;
-            // Byte 16 is `c_line` (0) and `c_cc[0]` is byte **17**. This copied
-            // all 20 bytes of `cc` from byte 16 until 2026-10-05, so every
-            // control character came out one slot early — `stty` showed VERASE
-            // as `intr`'s neighbour, and a program's `c_cc[VMIN]` landed in
-            // `cc[VSWTC]` on the way back in. amd64 answers these two requests
-            // itself (its `console_ioctl` had the right layout and named this
-            // bug); the console read now reads `cc[VMIN]`/`cc[VTIME]`, so the
-            // offset has to be right here too. `akuma_pty::Termios` is the
-            // host-tested statement of the layout.
-            let tail = &mut as_user_bytes_mut(&mut kernel_buf[4..])[1..];
-            tail.copy_from_slice(&ts.cc[..tail.len()]);
-            if copy_to_user_with(arg, as_user_bytes(&kernel_buf), Prefault::No).is_err() {
+            // `Termios::to_wire` is the one statement of the 36-byte layout
+            // (`c_cc[0]` at byte 17; this arm wrote it at 16 until 2026-10-05).
+            let wire = term_state_lock.lock().termios().to_wire();
+            if copy_to_user_with(arg, &wire, Prefault::No).is_err() {
                 return EFAULT;
             }
             0
@@ -291,27 +277,21 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(state) => state,
                 None => return ENOMEM,
             };
-            let mut kernel_buf = [0u32; 9];
-            if copy_from_user(&mut as_user_bytes_mut(&mut kernel_buf)[..36], arg).is_err() {
+            let mut wire = [0u8; akuma_tty::Termios::WIRE_LEN];
+            if copy_from_user(&mut wire, arg).is_err() {
                 return EFAULT;
             }
-            let mut ts = term_state_lock.lock();
-            let was_canonical = ts.is_canonical();
-            ts.iflag = kernel_buf[0];
-            ts.oflag = kernel_buf[1];
-            ts.cflag = kernel_buf[2];
-            ts.lflag = kernel_buf[3];
-            
-            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                akuma_primitives::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
-                    ts.iflag, ts.oflag, ts.cflag, ts.lflag);
-            }
-            
-            // `c_cc` from byte 17 — see `TCGETS` above. `cc[19]` has no
-            // counterpart in the kernel layout and keeps its value.
-            let tail = &as_user_bytes(&kernel_buf[4..])[1..];
-            ts.cc[..tail.len()].copy_from_slice(tail);
-            if !was_canonical && ts.is_canonical() {
+            let t = akuma_tty::Termios::from_wire(&wire);
+            let transition = {
+                let mut ts = term_state_lock.lock();
+                let tr = ts.set_termios(&t);
+                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+                    akuma_primitives::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
+                        ts.iflag, ts.oflag, ts.cflag, ts.lflag);
+                }
+                tr
+            };
+            if transition.is_cooked() {
                 note_cooked(proc, fd, "TCSETS");
             }
 
@@ -424,17 +404,8 @@ pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: 
         None => return ENOMEM,
     };
 
-    let mut term_state = term_state_lock.lock();
-    let was_canonical = term_state.is_canonical();
-    term_state.mode_flags = mode_flags_arg;
-
-    if (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0 {
-        term_state.enter_raw_mode();
-    } else {
-        term_state.exit_raw_mode();
-    }
-    if !was_canonical
-        && term_state.is_canonical()
+    let transition = term_state_lock.lock().apply_mode_request(mode_flags_arg);
+    if transition.is_cooked()
         && let Some(p) = akuma_exec::process::current_process_shared()
     {
         note_cooked(p, fd as u32, "set_terminal_attributes");
@@ -566,7 +537,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
             }
 
             if akuma_exec::process::should_interrupt_blocking_syscall() {
-                akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
+                akuma_exec::sync::lock_bounded(&term_state_lock).take_input_waker();
                 return EINTR;
             }
 
@@ -579,7 +550,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
 
         // Clear the waker once the wait is over — the counterpart to the single
         // register above, covering both remaining exit paths (data ready, deadline hit).
-        akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
+        akuma_exec::sync::lock_bounded(&term_state_lock).take_input_waker();
     }
 
     if bytes_read > 0 {

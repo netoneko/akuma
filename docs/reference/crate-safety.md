@@ -375,7 +375,7 @@ host-test.
 | `akuma-syscalls` | the shape of a syscall excursion (prologue/epilogue decisions, identity-slot model) |
 | `akuma-syscalls-sync` | the futex family: op decode, waiter table, deadline algebra, `WAKE_OP`, wait-loop outcome |
 | `akuma-syscalls-poll` | the epoll/poll/select family: the fd-state → event-bits readiness map, the interest list and its `epoll_ctl` errno set, the `EPOLLET` armed-state decision, the `ppoll`/`pselect6` wire marshalling |
-| `akuma-terminal` | terminal/line-discipline state |
+| `akuma-tty` | termios vocabulary, session line discipline, Unix98 pty state machine |
 | `akuma-syscalls-time` | time syscalls + the boot-time SNTP client |
 | `akuma-vfs` | the `Filesystem` trait and common FS types |
 | `akuma-net` | the smoltcp stack (`smoltcp_net/`, 14 modules), the AF_INET socket table, DNS |

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
-use akuma_terminal as terminal;
+use akuma_tty as terminal;
 use spinning_top::Spinlock;
 
 use crate::elf_loader::{self, DeferredLazySegment, ElfError, LoadedWithStack};
