@@ -10,10 +10,6 @@
 
 **Now runs on Graviton 2** via Firecracker (2026-08-21) - verified on `m6g.metal` machine in `ap-northeast-1` Tokyo AWS region, see [here](./docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md).
 
-**Redis, Go and Rust all run real workloads here** (2026-08-17) — including the
-official `redis:alpine` image pulled from Docker Hub. See
-[Real software](#real-software) below.
-
 **Self-hosting achieved on amd64** (2026-09-13) - verified on bare metal HP 500-502nj (2015 setup) see [here](./docs/archive/AKUMA_SELF_HOSTING_AMD64.md).
 
 ```
@@ -53,99 +49,27 @@ official `redis:alpine` image pulled from Docker Hub. See
 
 ## Capabilities
 
-### Real software
+**Kernel** — preemptive SMP multitasking, MMU-isolated address spaces with demand
+paging and CoW fork, Linux syscall ABI (~140 AArch64, growing x86_64 coverage),
+static/static-PIE/dynamic ELF loading, pipes/eventfd/futex IPC, signals,
+native containers ("boxes") with per-box root filesystems and OCI compatibility,
+so real Linux container images run on this kernel.
 
-Three third-party runtimes, none of them modified for Akuma, all verified
-**2026-08-17**:
+**Networking** — TCP/IP (smoltcp) with virtio-net, Realtek and 802.11 drivers,
+DHCP, DNS, userspace SSH-2 server, HTTP client/server, TLS in userspace only.
 
-| | What runs | How |
-|---|---|---|
-| **Redis** | `redis-server` from Alpine apk, **and the official `redis:alpine` image pulled from Docker Hub** running in a box — `SET`/`GET` from inside the VM *and* from a macOS terminal on the host | [`docs/runbooks/run-redis.md`](docs/runbooks/run-redis.md) |
-| **Go** | **`go build` compiles and links on-target** — Go 1.26.3 from apk, a cold module build in 112 s (38 stdlib packages), and the binary runs. Go binaries also run under shared-kernel SMP: goroutines, `fork`+`exec`, pidfd, signal delivery on Go's own signal stack, network I/O | [`docs/archive/GOLANG_MISSING_SYSCALLS.md`](docs/archive/GOLANG_MISSING_SYSCALLS.md) |
-| **Rust** | Two on-target toolchains (Alpine `rustc` 1.91 + nightly musl), and Rust programs built against real async/TLS stacks — tokio, hyper, reqwest, rustls | [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md) |
+**Filesystems** — VFS with mount table and symlink resolution, read/write ext2,
+procfs, page cache.
 
-None of these needed a "support" component. What Redis needed was four
-corrections to existing behaviour — `connect(2)` classifying TCP state before
-dialing, `writev` stopping at a short write, `/proc/self/` chasing its own
-symlink, `waitid` checking parentage — because the expensive part (CoW fork,
-`CLONE_VM`, lazy `mmap`, demand paging, signals, thread groups, 17 syscall
-families) was already built. Measurements and the cross-project comparison are in
-[`docs/archive/LINE_COUNT_ANALYSIS.md`](docs/archive/LINE_COUNT_ANALYSIS.md).
+**Toolchains on-target** — Rust (nightly musl), Go, Python 3, Bun, GCC, Clang.
+Self-hosting: the kernel compiles itself in-VM on metal on both architectures.
 
-**Can run a coding client and tcc on 4mb of RAM:**
+**Userspace** — two flavors:
 
-```
-meow -c "statically compile /akuma-playground/hello.c with /bin/tcc, put binary in /tmp/h4mb and run it, run commands one by one using shell tool"
-```
-
-**Self-hosting — compiles its own kernel on-target:** a nightly musl Rust toolchain
-runs inside Akuma and builds the full Akuma kernel from source — all 147 crates
-plus the final link — over a single in-VM `cargo build --release`. The resulting
-ELF boots and reaches the SSH server. *Akuma compiles Akuma, and the result runs.*
-See [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md).
-
-### Kernel
-
-| Feature | Details |
-|---|---|
-| **Preemptive multitasking** | 32-thread pool, 10ms round-robin scheduling, hybrid threads |
-| **Memory management** | MMU-based address space isolation per process, demand paging, physical memory manager, talc heap allocator (~63 MB) |
-| **Process model** | fork, execve, wait, signals, process groups, parent-child relationships, per-process file descriptor tables, `CLONE_VM` threads |
-| **Linux syscall ABI** | ~140 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |
-| **ELF loader** | Static, static-PIE, and dynamically linked ELF binaries; loads `ld-musl-aarch64.so.1` for dynamic linking |
-| **Pipes & IPC** | Kernel pipes (`pipe2`), `eventfd2`, `futex`, `pselect6`, `ppoll` |
-| **Signals** | `kill`, SIGSEGV handling, Ctrl+C interrupt propagation |
-| **Containers** | Lightweight process isolation ("boxes") with per-container root filesystems, process namespaces, and socket isolation |
-
-### Networking
-
-| Feature | Details |
-|---|---|
-| **TCP/IP stack** | smoltcp with VirtIO-net driver, TCP and UDP sockets, loopback, DHCP |
-| **SSH-2 server** | Userspace `/bin/sshd`, port 2222 — curve25519-sha256 key exchange, Ed25519 host keys, AES-128-CTR, public key auth |
-| **HTTP server** | Serves static files and CGI scripts (JS, ELF binaries) |
-| **HTTP client** | Userspace `/bin/curl` (HTTP + HTTPS) |
-| **TLS 1.3** | Userspace only (`userspace/libakuma-tls`). The kernel carries no TLS and no crypto crates at all |
-| **DNS** | Built-in DNS resolver, `nslookup` command |
-
-### Filesystems
-
-| Feature | Details |
-|---|---|
-| **VFS layer** | Mount table, path resolution with symlink following, cross-filesystem operations |
-| **ext2** | Read/write ext2 on VirtIO block device — directories, symlinks, permissions, metadata |
-| **procfs** | `/proc/<pid>/fd/` for process I/O, process listing filtered by container |
-
-### Shells & Utilities
-
-| Feature | Details |
-|---|---|
-| **busybox** | Main interactive shell (ash) |
-| **paws** | Experimental 8-page minimal shell for the 4 MB extreme demo — see `userspace/paws/README.md` |
-| **System commands** | `ps`, `top`, `kill`, `free`, `df`, `mount`, `uname`, `env` |
-| **File commands** | `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `chmod`, `ln`, `touch`, `find` |
-
-### Development Tools
-
-| Feature | Details |
-|---|---|
-| **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
-| **Rust compiler (rustc)** | Two toolchains run on-target: Alpine `rustc` 1.91 (`rustc -C linker=clang hello.rs` → runnable native binary) and a **nightly musl toolchain** with the `aarch64-unknown-none` std, which compiles and links the **entire Akuma kernel in-VM** (`cargo build --release` over a populated disk, ≥6 GB RAM). Needed in-kernel support: `MAP_SHARED` writeback for linker output, 128 KB argv strings, the futex/`exit_group` thread-group reaping fixes, and `getpriority`. See [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md) and [`docs/archive/RUST_TOOLCHAIN.md`](docs/archive/RUST_TOOLCHAIN.md) |
-| **C compiler (Clang/GCC)** | LLVM `clang`/`clang-21` and GCC/binutils (`cc`, `ld`, `as`) from Alpine apk |
-| **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
-| **Git** | `git` from Alpine apk — `apk add git` |
-| **Vi editor** | busybox `vi` |
-
-### Services & Applications
-
-| Feature | Details |
-|---|---|
-| **Process supervisor (herd)** | Background services with auto-restart, logging, config in `/etc/herd/` |
-| **Container manager (box)** | `box open/close/stop/ps/inspect` |
-| **AI assistant (meow)** | LLM chat client connecting to Ollama — streaming responses, filesystem and network tool calling |
-| **Package managers** | Built-in `pkg install`, plus `apk` (Alpine Linux) |
-| **Redis** | `redis-server` (Alpine package) and the official `redis:alpine` Docker Hub image in a box — see [`docs/runbooks/run-redis.md`](docs/runbooks/run-redis.md) |
-| **Go runtime** | Statically-linked Go binaries under SMP — goroutines, `fork`+`exec`, pidfd, network I/O |
+- **Akuma** — busybox, herd supervisor, box container manager, sshd, meow;
+  Alpine `apk` for packages
+- **Gentoo** — stage3 root running on the Akuma kernel (OpenRC, portage,
+  openssh) — see [`docs/archive/AKUMA_GENTOO.md`](docs/archive/AKUMA_GENTOO.md)
 
 ## Build & Run
 
@@ -178,18 +102,13 @@ Connect via SSH:
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -p 2222
 ```
 
-## Crate Structure
+## Documentation
 
-| Crate | Purpose |
-|---|---|
-| `akuma-exec` | Threading, process management, MMU page tables, ELF loader |
-| `akuma-net` | Socket layer, TCP/UDP abstractions, smoltcp integration |
-| `akuma-ext2` | ext2 filesystem read/write |
-| `akuma-vfs` | Virtual filesystem types, mount table, path resolution |
-| `akuma-terminal` | Terminal emulation, raw/cooked modes, escape sequences (PTY support for the userspace sshd) |
-| `akuma-isolation` | Container / box isolation primitives |
-| `akuma-rump` | NetBSD rump-kernel sysproxy client |
-| `akuma-smp` | Multikernel core coordination (descriptor, MPSC inbox) |
+- [`docs/README.md`](docs/README.md) — front door: symptom matrix, task list, subsystem index
+- [`docs/runbooks/`](docs/runbooks/) — action-first procedures (debugging, building)
+- [`docs/reference/`](docs/reference/) — current-state architecture and invariants, graded A/B/C
+- [`docs/archive/`](docs/archive/) — 200+ historical investigation docs
+- [`acceptance/`](acceptance/) — numbered acceptance test playbooks
 
 ## Project Layout
 
