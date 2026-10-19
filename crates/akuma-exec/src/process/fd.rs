@@ -308,6 +308,21 @@ impl Process {
         self.fds.alloc_fd_from(min_fd, entry)
     }
 
+    /// Run `f` against the fd table's live entry, in place — no clone.
+    ///
+    /// `get_fd` hands back a full deep clone of the [`FileDescriptor`], and a
+    /// `KernelFile` can carry a directory snapshot (`dir_cache`) of ~100 k
+    /// heap `String`s — one `get_fd` on a directory fd during `getdents64`
+    /// cost ~60 ms of pure allocation per syscall even after the arm itself
+    /// stopped cloning. Callers that only *read* (or mutate via
+    /// [`Self::update_fd`]) an entry must go through here.
+    pub fn with_fd<R>(&self, fd: u32, f: impl FnOnce(&FileDescriptor) -> R) -> Option<R> {
+        with_irqs_disabled(|| {
+            let table = self.fds.table.lock();
+            table.get(&fd).map(f)
+        })
+    }
+
     /// Get a file descriptor entry (cloned)
     pub fn get_fd(&self, fd: u32) -> Option<FileDescriptor> {
         with_irqs_disabled(|| {
