@@ -3609,47 +3609,59 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     // folded here (4b batch 3a) and folding must not lose a bound.
     let size = size.min(64 * 1024);
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
-    let f = match proc.get_fd(fd) {
-        Some(akuma_exec::process::FileDescriptor::File(f)) => f,
+    let _vfs_bkl = VfsBklGuard::new();
+
+    // Borrowed peek — path and cache-miss check. NOT `get_fd`: that hands back
+    // a deep clone of the fd entry, and a directory fd's `dir_cache` can hold
+    // ~100 k heap `String`s — which put a ~60 ms allocation storm inside every
+    // call of a listing of the trashcan's `/root` even after the arm itself
+    // stopped cloning (probe on the metal: 70 ms/call average; the fill itself
+    // is microseconds).
+    let peeked = proc.with_fd(fd, |e| match e {
+        akuma_exec::process::FileDescriptor::File(f) => {
+            Some((f.path.clone(), f.dir_cache.is_none()))
+        }
+        _ => None,
+    });
+    let (path, missing) = match peeked {
+        Some(Some(peek)) => peek,
         _ => return EBADF,
     };
 
-    // `fd` is already known to be a `File` (the match above returns EBADF otherwise), so
-    // arm unconditionally: the cache-miss path below does a full directory read off disk.
-    let _vfs_bkl = VfsBklGuard::new();
-
-    // Cache miss: build the snapshot locally, fill the first batch from the
-    // local copy, and hand the `Vec` itself to the fd below — a move, not the
-    // two full clones (one for the snapshot, one per call thereafter) this arm
-    // used to do. Cache hit: `f` is this call's own clone of the fd entry, so
-    // the stored snapshot is filled from by borrow.
+    // Cache miss: build the snapshot once, then move it into the fd below — a
+    // move, not the two full clones (one for the snapshot, one per call
+    // thereafter) this arm used to do. `list_dir` walks the disk under the VFS
+    // BKL, which this arm already holds; the fd-table lock is not held here.
     let mut fresh: Option<alloc::vec::Vec<akuma_exec::process::DirCacheEntry>> =
-        if f.dir_cache.is_none() {
-            let dir_entries = match akuma_vfs_glue::fs::list_dir(&f.path) {
+        if missing {
+            let dir_entries = match akuma_vfs_glue::fs::list_dir(&path) {
                 Ok(e) => e,
                 Err(e) => return fs_error_to_errno(e),
             };
-        // `DirEntry` carries only is_dir/is_symlink, so a device node would
-        // otherwise report DT_REG. Only `/dev` can hold one, so the check is
-            // hoisted out of the per-entry map: every other directory listing pays
-            // one string compare total, not a table lookup per entry.
-            let is_dev = akuma_vfs_glue::is_dev_dir(&f.path);
+            // `DirEntry` carries only is_dir/is_symlink, so a device node would
+            // otherwise report DT_REG. Only `/dev` can hold one, so the check
+            // is hoisted out of the per-entry map: every other directory
+            // listing pays one string compare total, not a lookup per entry.
+            let is_dev = akuma_vfs_glue::is_dev_dir(&path);
             // Every entry of `/dev/pts` is a pty slave: a character device.
-            let is_pts = akuma_vfs_glue::is_pts_dir(&f.path);
+            let is_pts = akuma_vfs_glue::is_pts_dir(&path);
             use akuma_syscalls_linux::dirent::{DOT_ENTRIES, DT_DIR, DT_LNK, DT_REG};
-            // `.` and `..` first, for every filesystem — they are this arm's, not
-            // a `read_dir`'s (`dirent::DOT_ENTRIES`). Without them an empty
-            // directory streamed zero records: `ls -la` printed only `total 0`.
-            // The cursor below is an entry index, so they sit in the snapshot
-            // rather than being synthesised per call.
+            // `.` and `..` first, for every filesystem — they are this arm's,
+            // not a `read_dir`'s (`dirent::DOT_ENTRIES`). Without them an empty
+            // directory streamed zero records: `ls -la` printed only
+            // `total 0`. The cursor below is an entry index, so they sit in
+            // the snapshot rather than being synthesised per call.
             let dots = DOT_ENTRIES.iter().map(|&(name, d_type)| {
-                akuma_exec::process::DirCacheEntry { name: alloc::string::String::from(name), d_type }
+                akuma_exec::process::DirCacheEntry {
+                    name: alloc::string::String::from(name),
+                    d_type,
+                }
             });
             let cache: alloc::vec::Vec<akuma_exec::process::DirCacheEntry> = dots
                 .chain(dir_entries
                 .iter()
-                // A filesystem must not list them itself; if one ever does, the
-                // stream would carry them twice.
+                // A filesystem must not list them itself; if one ever does,
+                // the stream would carry them twice.
                 .filter(|e| e.name != "." && e.name != "..")
                 .map(|e| akuma_exec::process::DirCacheEntry {
                     name: e.name.clone(),
@@ -3660,7 +3672,10 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
                     } else if is_pts {
                         akuma_vfs::dev::DT_CHR
                     } else {
-                        match is_dev.then(|| akuma_vfs_glue::dev_node_named(&e.name)).flatten() {
+                        match is_dev
+                            .then(|| akuma_vfs_glue::dev_node_named(&e.name))
+                            .flatten()
+                        {
                             Some(node) => node.d_type(),
                             None => DT_REG,
                         }
@@ -3672,37 +3687,38 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
             None
         };
 
-    let position = f.position;
-    let entries_len = fresh.as_ref()
-        .map_or_else(|| f.dir_cache.as_ref().map_or(0, Vec::len), Vec::len);
-    let eof = position >= entries_len;
-
     let mut kernel_buf = alloc::vec![0u8; size];
-    // The record layout — offsets, the 8-byte `d_reclen` rounding, the NUL and
-    // the pad — and the stop-at-the-first-misfit loop live in the ABI crate
-    // with host tests. `d_ino`/`d_off` are both 1: Akuma reports no real inode
-    // number through getdents64 (`stat` does), and nothing seeks a directory by
-    // `d_off`.
-    let (written, count) = match (&fresh, f.dir_cache.as_ref()) {
-        (Some(c), _) => getdents_step(c, position, &mut kernel_buf),
-        (None, Some(c)) => getdents_step(c, position, &mut kernel_buf),
-        (None, None) => (0, 0),
-    };
-    // Store the first-call snapshot (moved in — no clone) and advance the
-    // cursor by the records actually returned. Entries remain and not one fit:
-    // the buffer is smaller than the next record. Linux says `EINVAL`; and
-    // returning 0 instead would have told the caller "end of directory" and
-    // silently truncated the listing.
+    // One in-place pass over the live fd entry: store the first-call snapshot
+    // (moved — no clone), fill records from the stored snapshot by borrow, and
+    // advance the cursor. The record layout — offsets, the 8-byte `d_reclen`
+    // rounding, the NUL and the pad — and the stop-at-the-first-misfit loop
+    // live in the ABI crate with host tests. `d_ino`/`d_off` are both 1: Akuma
+    // reports no real inode number through getdents64 (`stat` does), and
+    // nothing seeks a directory by `d_off`.
+    let mut written = 0usize;
+    let mut count = 0usize;
+    let mut eof = false;
     proc.update_fd(fd, |e| {
-        if let akuma_exec::process::FileDescriptor::File(file) = e {
-            if let Some(c) = fresh.take() {
-                file.dir_cache = Some(c);
-            }
-            if count > 0 {
-                file.position = position + count;
-            }
+        let akuma_exec::process::FileDescriptor::File(file) = e else { return };
+        if let Some(c) = fresh.take() {
+            file.dir_cache = Some(c);
         }
+        let Some(cache) = file.dir_cache.as_ref() else { return };
+        let position = file.position;
+        if position >= cache.len() {
+            eof = true;
+            return;
+        }
+        let (w, c) = getdents_step(cache, position, &mut kernel_buf);
+        if c > 0 {
+            file.position = position + c;
+        }
+        written = w;
+        count = c;
     });
+    // Entries remain and not one fit: the buffer is smaller than the next
+    // record. Linux says `EINVAL`; returning 0 instead would tell the caller
+    // "end of directory" and silently truncate the listing.
     if !eof && count == 0 {
         return EINVAL;
     }
