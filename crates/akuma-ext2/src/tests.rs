@@ -3417,3 +3417,75 @@ fn renaming_a_directory_onto_an_empty_one_replaces_it_and_onto_a_full_one_fails(
     assert!(!fs.exists("/src"));
     assert_eq!(fs.metadata("/").unwrap().nlink(), root_links - 1, "one subdirectory fewer");
 }
+
+// ── find_in_dir: lookup must not read the whole directory ────────────────
+//
+// The shape this pins: `lookup_path` used to read every byte of a directory
+// (`read_inode_data` + `parse_directory`) to find ONE name. On the trashcan's
+// `/root` — 5.5 MiB of dirent data, ~145 k entries — that made every
+// `stat`/`open`/`exec` resolution a full-directory read: 238 ms per stat on
+// the metal, and a plain `ls` (which stats entries) could not finish in five
+// minutes (`docs/archive/AMD64_UNSAFE_REDUCTION_TRAP_MSR.md` "Things found on
+// the way", 2026-10-19). `find_in_dir` scans block by block and stops at the
+// match; these tests pin both correctness and the early exit.
+
+fn mount_many_and_fill(prefix: &str, count: usize) -> Ext2Filesystem<MemBlockDevice> {
+    use akuma_vfs::Filesystem;
+    let fs = mount_many_inodes();
+    fs.create_dir(prefix).unwrap_or_else(|e| panic!("mkdir {prefix}: {e:?}"));
+    for i in 0..count {
+        let path = alloc::format!("{}/f{:03}", prefix, i);
+        fs.write_file(&path, b"x").unwrap_or_else(|e| panic!("create {path}: {e:?}"));
+    }
+    fs
+}
+
+#[test]
+fn lookup_finds_every_created_entry() {
+    let fs = mount_many_and_fill("/many", 64);
+    for i in 0..64 {
+        let path = alloc::format!("/many/f{:03}", i);
+        fs.lookup_path(&path)
+            .unwrap_or_else(|e| panic!("lookup {path}: {e:?}"));
+    }
+    assert_eq!(fs.lookup_path("/many/f999"), Err(akuma_vfs::FsError::NotFound));
+    assert_eq!(fs.lookup_path("/many/nope"), Err(akuma_vfs::FsError::NotFound));
+}
+
+/// The early exit, in deterministic counters: resolving the FIRST entry of a
+/// full directory must touch far fewer blocks than resolving the LAST one
+/// (creation order = dirent order), and far fewer than listing the directory.
+/// Wall-clock would swing with the host; block accesses do not.
+#[test]
+fn lookup_of_first_entry_touches_far_fewer_blocks_than_the_whole_directory() {
+    let fs = mount_many_and_fill("/many", 800);
+    use akuma_vfs::Filesystem;
+
+    let (_, blocks0) = fs.work_counters();
+    fs.lookup_path("/many/f000").unwrap();
+    let (_, blocks_first) = fs.work_counters();
+
+    fs.lookup_path("/many/f799").unwrap();
+    let (_, blocks_last) = fs.work_counters();
+
+    fs.read_dir("/many").unwrap();
+    let (_, blocks_listed) = fs.work_counters();
+
+    let first = blocks_first - blocks0;
+    let last = blocks_last - blocks_first;
+    let listed = blocks_listed - blocks_last;
+    // The scan delta isolates the early exit from the fixed per-lookup cost
+    // (inode read, group descriptor): reaching entry 799 walks several more
+    // directory blocks than reaching entry 0, which sits in the first block.
+    let scan_delta = last - first;
+    assert!(
+        scan_delta >= 4 && first < last,
+        "reaching the last entry must walk more directory blocks than the \
+         first (first={first}, last={last}, delta={scan_delta})"
+    );
+    assert!(
+        listed > last,
+        "a full listing ({listed}) must cost more blocks than any single \
+         lookup ({last})"
+    );
+}

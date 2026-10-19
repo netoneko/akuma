@@ -789,6 +789,16 @@ const fn dirent_type(type_perms: u16) -> u8 {
 /// Minimum directory entry size (inode + rec_len + name_len + file_type)
 pub(crate) const DIR_ENTRY_HEADER_SIZE: usize = 8;
 
+/// One directory block's outcome in [`Ext2Filesystem::find_in_dir`].
+enum Scan {
+    Found(u32),
+    /// The entry chain ended (`rec_len == 0`): no entry in the rest of the
+    /// directory is reachable, so the whole scan stops — `parse_directory`'s
+    /// break, expressed per block.
+    Broken,
+    KeepGoing,
+}
+
 // ============================================================================
 // On-disk Structures
 // ============================================================================
@@ -3242,6 +3252,72 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         self.lookup_path_internal(&state, path)
     }
 
+    /// Find one name in a directory without reading the whole directory.
+    ///
+    /// Scans block by block and stops at the first match. The shape this
+    /// replaces read every byte of the directory (`read_inode_data` +
+    /// `parse_directory`) per lookup — on the trashcan's `/root` (5.5 MiB of
+    /// dirent data, ~145 k entries) that made every `stat`/`open`/`exec` path
+    /// resolution pay a full-directory read: 238 ms per `stat`, and a plain
+    /// `ls` (which stats entries) could not finish in five minutes.
+    ///
+    /// Chain-walk parity with [`Self::parse_directory`]: a `rec_len` of 0 ends
+    /// the whole scan (the chain is broken), and entries whose inode is 0 are
+    /// skipped. Deliberate divergences on corrupt directories: a record whose
+    /// `rec_len` overruns its block ends that block's scan here (ext2 dirents
+    /// never cross block boundaries, so this only differs on corruption), and
+    /// names are compared as bytes rather than after a UTF-8 round-trip, so a
+    /// non-UTF-8 on-disk name is now findable — which is what Linux does.
+    fn find_in_dir(
+        &self,
+        state: &Ext2State,
+        dir_inode: &Inode,
+        component: &str,
+    ) -> Result<Option<u32>, FsError> {
+        let want = component.as_bytes();
+        let size = dir_inode.size_lower as usize;
+        let blocks_needed = size.div_ceil(state.block_size);
+        for logical in 0..blocks_needed as u32 {
+            let Some(phys) = self.get_block_num(state, dir_inode, logical)? else {
+                // A hole reads as zeroes: the chain ends (rec_len 0), like
+                // `parse_directory` breaking on it.
+                return Ok(None);
+            };
+            let found = self.with_block(state, phys, |b| {
+                let mut offset = 0usize;
+                while offset + DIR_ENTRY_HEADER_SIZE <= b.len() {
+                    let inode_num = u32::from_le_bytes([
+                        b[offset],
+                        b[offset + 1],
+                        b[offset + 2],
+                        b[offset + 3],
+                    ]);
+                    let rec_len = u16::from_le_bytes([b[offset + 4], b[offset + 5]]) as usize;
+                    if rec_len == 0 {
+                        return Scan::Broken;
+                    }
+                    let name_len = b[offset + 6] as usize;
+                    if inode_num != 0
+                        && offset + DIR_ENTRY_HEADER_SIZE + name_len <= b.len()
+                        && &b[offset + DIR_ENTRY_HEADER_SIZE
+                            ..offset + DIR_ENTRY_HEADER_SIZE + name_len]
+                            == want
+                    {
+                        return Scan::Found(inode_num);
+                    }
+                    offset += rec_len;
+                }
+                Scan::KeepGoing
+            })?;
+            match found {
+                Scan::Found(inode_num) => return Ok(Some(inode_num)),
+                Scan::Broken => return Ok(None),
+                Scan::KeepGoing => {}
+            }
+        }
+        Ok(None)
+    }
+
     fn lookup_path_internal(&self, state: &Ext2State, path: &str) -> Result<u32, FsError> {
         #[cfg(test)]
         self.counters.path_walks.fetch_add(1, Ordering::Relaxed);
@@ -3259,13 +3335,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 return Err(FsError::NotADirectory);
             }
 
-            let dir_data = self.read_inode_data(state, &inode)?;
-            let entries = self.parse_directory(&dir_data);
-
-            let found = entries.iter().find(|(_, name, _)| name == component);
-
-            match found {
-                Some((inode_num, _, _)) => current_inode = *inode_num,
+            match self.find_in_dir(state, &inode, component)? {
+                Some(inode_num) => current_inode = inode_num,
                 None => return Err(FsError::NotFound),
             }
         }
