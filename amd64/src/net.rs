@@ -456,15 +456,11 @@ fn parse_ip_arg(arg: &str, default: StaticIpv4) -> Option<StaticIpv4> {
 }
 
 /// Bring the stack up on the Realtek RTL8169/8168 at the mapped register BAR
-/// `bar` (from `pci::map_bar`), with `static_v4` as the pre-DHCP address.
+/// `regs` (from `pci::map_bar_window`), with `static_v4` as the pre-DHCP address.
 /// DHCP on. Falls back to loopback-only if the chip does not come up.
-///
-/// # Safety
-/// `bar` must be the NIC's device-mapped register BAR, live for the rest of
-/// the boot; called once.
-pub unsafe fn init_rtl8169(bar: *mut u8, static_v4: StaticIpv4) -> bool {
-    // SAFETY: the caller's obligation on `bar`; called once, from `kmain_mb2`.
-    let device = match unsafe { akuma_net::ExternalDevice::probe_rtl8169(bar) } {
+/// Called once, from `kmain_mb2`.
+pub fn init_rtl8169(regs: akuma_primitives::mmio::MmioWindow, static_v4: StaticIpv4) -> bool {
+    let device = match akuma_net::ExternalDevice::probe_rtl8169(regs) {
         Ok(d) => d,
         Err(e) => {
             serial::puts("  nic:  RTL8169 bring-up failed (");
@@ -1095,23 +1091,21 @@ pub fn init_bare_metal(cmdline: &str) -> bool {
         return init_loopback_only();
     };
     let (size, _) = crate::pci::probe_bar_size(dev.addr, idx);
-    let Some(regs) = crate::pci::map_bar(mem_bar, size.max(0x1000)) else {
+    let Some(regs) = crate::pci::map_bar_window(mem_bar, size.max(0x1000)) else {
         serial::puts(" — BAR map failed; loopback only\n");
         return init_loopback_only();
     };
 
     if dev.header.vendor_id == 0x10ec {
         serial::puts(" [RTL8169]\n");
-        // SAFETY: `regs` is the just-mapped, device-attributed register BAR of
-        // the Realtek NIC enumerated above; this is the one call.
-        return unsafe { init_rtl8169(regs, static_v4) };
+        return init_rtl8169(regs, static_v4);
     }
 
     // Not a chip we drive. Read IDR0 to show the mapping works, then loopback.
     serial::puts(" id ");
     for i in 0..4u8 {
-        // SAFETY: as above; offset 0 is a read-only ID register on every NIC.
-        let b = unsafe { regs.add(i as usize).read_volatile() };
+        // Offset 0 is a read-only ID register on every NIC.
+        let b: u8 = regs.read(usize::from(i));
         serial::put_hexn(u64::from(b), 2);
     }
     serial::puts(" (unsupported NIC; loopback only)\n");

@@ -103,3 +103,90 @@ pub fn phys_to_virt(pa: u64) -> u64 {
 pub fn phys_ptr<T>(pa: u64) -> *mut T {
     phys_to_virt(pa) as *mut T
 }
+
+/// Bytes in a frame.
+const PAGE_SIZE: usize = 4096;
+
+/// A page frame this code owns **exclusively** and has not yet published to any
+/// page table, ledger or other owner.
+///
+/// That is the one situation where a `&mut` view of a frame through the physmap is
+/// sound, so this type is where the physmap's `unsafe` lives for "stage a page
+/// before it is mapped": a demand-zero fault, a CoW copy's destination, a loaded
+/// segment, a test program's code and stack. A `fn zero_page(pa: u64)` would be
+/// unsound — any caller could pass a frame somebody else is using.
+///
+/// Dropping it returns the frame to the PMM, so an early return between
+/// allocation and mapping no longer leaks. **Hand the frame on with
+/// [`FreshFrame::publish`] the moment it is mapped or tracked**: dropping a frame
+/// that a page table already names frees it out from under that mapping.
+pub struct FreshFrame {
+    pa: usize,
+}
+
+impl FreshFrame {
+    /// Allocate a frame with whatever its previous owner left in it. Use
+    /// [`FreshFrame::alloc_zeroed`] unless every byte is about to be overwritten.
+    #[must_use]
+    pub fn alloc() -> Option<Self> {
+        akuma_pmm::alloc_page().map(|pa| Self { pa })
+    }
+
+    /// Allocate a zeroed frame. Zero *before* mapping: a recycled frame otherwise
+    /// leaks the previous owner's bytes to whoever reads it next.
+    #[must_use]
+    pub fn alloc_zeroed() -> Option<Self> {
+        let mut frame = Self::alloc()?;
+        frame.bytes_mut().fill(0);
+        Some(frame)
+    }
+
+    /// The frame's physical address, for mapping it. Does not give it up.
+    #[must_use]
+    pub fn pa(&self) -> usize {
+        self.pa
+    }
+
+    /// The frame's bytes.
+    pub fn bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        // SAFETY: a PMM frame this value owns alone (nothing maps or tracks it
+        // yet, and `publish` consumes the only handle), reached through the
+        // physmap, which covers every PMM frame; `[u8; N]` has no alignment or
+        // validity requirement, and `&mut self` makes this the only live view.
+        unsafe { &mut *phys_ptr::<[u8; PAGE_SIZE]>(self.pa as u64) }
+    }
+
+    /// Overwrite this frame with the contents of the live frame at `src_pa`.
+    ///
+    /// `src_pa` must be a frame nothing is writing while this runs — the CoW
+    /// source, which every mapper holds read-only. The copy is one page of
+    /// physmap-reachable RAM; nothing here can fault or alias `self`, but a
+    /// concurrent writer to `src_pa` would tear the copy.
+    ///
+    /// # Panics
+    /// If `src_pa` is not page-aligned or is outside the physmap.
+    pub fn copy_from_frame(&mut self, src_pa: usize) {
+        assert!(src_pa % PAGE_SIZE == 0, "copy_from_frame: unaligned source");
+        assert_ne!(src_pa, self.pa, "copy_from_frame: a frame cannot be its own source");
+        // SAFETY: `phys_ptr` asserts `src_pa` is inside the physmap; the frame is
+        // a whole page of RAM; it is not `self.pa` (checked), so the shared view
+        // cannot alias the `&mut` that `bytes_mut` hands out; and the caller's
+        // contract above rules out a concurrent writer.
+        let src = unsafe { &*phys_ptr::<[u8; PAGE_SIZE]>(src_pa as u64) };
+        self.bytes_mut().copy_from_slice(src);
+    }
+
+    /// Give the frame up: it is now mapped or tracked by whoever called this, and
+    /// is theirs to free. Returns its physical address.
+    pub fn publish(self) -> usize {
+        let pa = self.pa;
+        core::mem::forget(self);
+        pa
+    }
+}
+
+impl Drop for FreshFrame {
+    fn drop(&mut self) {
+        akuma_pmm::free_page(self.pa, 0);
+    }
+}

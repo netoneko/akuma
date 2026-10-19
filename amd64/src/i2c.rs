@@ -23,29 +23,14 @@
 use akuma_dwi2c::{BusSpeed, XferError, aoac, data_cmd, ic, intr, status};
 use akuma_primitives::mmio::MmioWindow;
 
-use crate::paging::{self, MemAttr, PteProt};
-use crate::phys::DEVMAP_BASE;
+use crate::paging;
 use crate::polltime::{spin_us, tsc, ticks_ms};
 
-const PAGE: u64 = 4096;
 
-/// Map `[pa, pa + len)` as device memory in the device window and return the
-/// the `len` bytes at `pa` as a register window.
+/// Map `[pa, pa + len)` as device memory and return the `len` bytes at `pa` as a
+/// register window ([`paging::map_device_window`]).
 pub fn map_mmio(pa: u64, len: u64) -> Option<MmioWindow> {
-    let first = pa & !(PAGE - 1);
-    let last = (pa + len).div_ceil(PAGE) * PAGE;
-    let mut p = first;
-    while p < last {
-        if !paging::map_page((DEVMAP_BASE + p) as usize, p, PteProt::KERNEL_RW, MemAttr::Device) {
-            return None;
-        }
-        p += PAGE;
-    }
-    // SAFETY: every page of `[pa, pa + len)` was just mapped `MemAttr::Device`
-    // for the kernel's lifetime. The accesses made through the window are the
-    // widths the callers name: bytes for the AOAC pair, dwords for a
-    // DesignWare block, whose base is 4 KiB-aligned.
-    Some(unsafe { MmioWindow::new((DEVMAP_BASE + pa) as usize, len as usize) })
+    paging::map_device_window(pa, len)
 }
 
 /// Request D0 for AOAC device `dev` and wait (bounded) for the status field to

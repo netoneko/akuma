@@ -41,8 +41,7 @@
 use akuma_cpu::msr::{self, Msr};
 use akuma_primitives::{OnceCopy, mmio::MmioWindow};
 use crate::idt;
-use crate::paging::{self, MemAttr, PteProt};
-use crate::phys::DEVMAP_BASE;
+use crate::paging;
 use akuma_port::{PIC, PIT};
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
@@ -262,15 +261,13 @@ pub fn init() -> bool {
     // `MemAttr::Device` is still load-bearing on its own terms: a writeback
     // mapping of a register page lets the CPU satisfy a read from cache and
     // never issue the access.
-    let va = DEVMAP_BASE + base;
-    if !paging::map_page(va as usize, base, PteProt::KERNEL_RW, MemAttr::Device) {
+    let Some(win) = paging::map_device_window(base, 4096) else {
         serial::puts("  [FATAL] could not map the LAPIC page\n");
         return false;
-    }
-    // SAFETY: the page `map_page` just mapped as device memory at `va`, for the
-    // kernel's lifetime; 4 KiB, page-aligned, and every access through the window
-    // is a naturally aligned dword at an architectural register offset.
-    LAPIC.set(unsafe { MmioWindow::new(va as usize, 4096) });
+    };
+    // Every access through the window is a naturally aligned dword at an
+    // architectural register offset.
+    LAPIC.set(win);
 
     // Software-enable, and park spurious deliveries on a vector of their own so
     // they are distinguishable from a real one.

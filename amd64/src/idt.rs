@@ -569,16 +569,15 @@ fn page_fault_trap(t: &mut Trap<'_>) {
 
     if in_lazy && code.not_present() {
         let page = addr & !0xfff;
-        if let Some(frame_pa) = akuma_pmm::alloc_page() {
-            // Zero before mapping: a recycled frame otherwise leaks whatever the
-            // previous owner left in it to whoever faults next.
-            // SAFETY: a PMM frame, reached through the physmap.
-            unsafe { core::ptr::write_bytes(phys_ptr::<u8>(frame_pa as u64), 0, 4096) };
-            if paging::map_page(page as usize, frame_pa as u64, PteProt::KERNEL_RW, MemAttr::WriteBack) {
-                DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            akuma_pmm::free_page(frame_pa, 0);
+        // Zeroed before mapping (`alloc_zeroed`): a recycled frame otherwise leaks
+        // whatever the previous owner left in it to whoever faults next. If the
+        // map fails the frame drops, which returns it to the PMM.
+        if let Some(frame) = crate::phys::FreshFrame::alloc_zeroed()
+            && paging::map_page(page as usize, frame.pa() as u64, PteProt::KERNEL_RW, MemAttr::WriteBack)
+        {
+            let _ = frame.publish();
+            DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return;
         }
     }
 
@@ -853,24 +852,18 @@ fn cow_write_fault(addr: u64) -> bool {
         }
         // Genuinely shared: private copy.
         CowAction::Copy => {
-            let Some(fresh) = akuma_pmm::alloc_page() else {
+            let Some(mut fresh) = crate::phys::FreshFrame::alloc() else {
                 return false; // OOM: fall through to the fatal path
             };
-            // SAFETY: both frames are live PMM pages reached through the
-            // physmap, and exactly one page is copied. The destination is not
-            // published in any page table until the `map_page_in` below.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    phys_ptr::<u8>(pa as u64),
-                    phys_ptr::<u8>(fresh as u64),
-                    4096,
-                );
-            }
+            // The destination is not published in any page table until the
+            // `map_page_pte` below, and `pa` is the CoW source, read-only in every
+            // space that maps it.
+            fresh.copy_from_frame(pa);
             let writable = PteProt { write: true, ..prot };
-            if !faulted.map_page_pte(page, fresh, writable, false) {
-                akuma_pmm::free_page(fresh, 0);
-                return false;
+            if !faulted.map_page_pte(page, fresh.pa(), writable, false) {
+                return false; // `fresh` drops and frees the private copy
             }
+            let fresh = fresh.publish();
             // **Every core, before the old frame can go.** `map_page_pte`'s
             // `invlpg` is this core's only. A sibling thread on another core
             // still holds the read-only translation to `pa` from before the

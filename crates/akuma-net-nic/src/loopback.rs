@@ -49,18 +49,13 @@ pub enum ExternalDevice {
 static ABSENT_TX_SCRATCH: FrameArena<1, LOOPBACK_FRAME_BUF> = FrameArena::new();
 
 impl ExternalDevice {
-    /// Probe and bring up the Realtek RTL8169/8168 at register BAR `bar`.
+    /// Probe and bring up the Realtek RTL8169/8168 on register window `win`.
     ///
     /// # Errors
     /// A short static string naming why the chip did not come up.
-    ///
-    /// # Safety
-    /// `bar` must be the NIC's device-mapped register BAR, valid for the life
-    /// of the returned device; called once.
     #[cfg(feature = "rtl8169")]
-    pub unsafe fn probe_rtl8169(bar: *mut u8) -> Result<Self, &'static str> {
-        // SAFETY: forwarded to the caller.
-        unsafe { crate::rtl8169::Rtl8169Device::probe(bar) }
+    pub fn probe_rtl8169(win: akuma_primitives::mmio::MmioWindow) -> Result<Self, &'static str> {
+        crate::rtl8169::Rtl8169Device::probe(win)
             .map(Self::Rtl8169)
             .map_err(|e| match e {
                 akuma_net_rtl8169::Error::ResetTimeout => "reset timed out (chip wedged or absent)",

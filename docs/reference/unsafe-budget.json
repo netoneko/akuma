@@ -71,7 +71,7 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 81,
+    "amd64/src": 71,
     "crates/akuma-alloc": 24,
     "crates/akuma-cpu": 65,
     "crates/akuma-dma": 17,
@@ -83,7 +83,7 @@
     "crates/akuma-idt-amd64": 1,
     "crates/akuma-locks-rw-cell": 8,
     "crates/akuma-mmu": 31,
-    "crates/akuma-net-nic": 14,
+    "crates/akuma-net-nic": 12,
     "crates/akuma-not-even-once": 5,
     "crates/akuma-pagetable": 5,
     "crates/akuma-pmm": 3,

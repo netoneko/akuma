@@ -17,12 +17,9 @@ use akuma_pci::{Address, Bar, Header, command};
 use akuma_selftest::Suite;
 use spinning_top::Spinlock;
 
-use crate::paging::{self, MemAttr, PteProt};
-use crate::phys::DEVMAP_BASE;
+use crate::paging;
 use akuma_port::PCI_CONFIG;
 use crate::serial;
-
-const PAGE_SIZE: u64 = 4096;
 
 /// How many PCI functions the registry holds. The reference machine enumerates
 /// 15; 48 is headroom for an add-in card or two without ever allocating.
@@ -256,38 +253,14 @@ pub fn probe_bar_size(addr: Address, index: u8) -> (u64, bool) {
     (akuma_pci::bar_size(probed_low, probed_high, is_io, is_64bit), is_64bit)
 }
 
-/// Map a memory BAR into the device window and return its kernel virtual
-/// address. `len` should be the probed BAR size (or a spec-known minimum).
+/// Map a memory BAR into the device window as the register window drivers index
+/// by offset. `len` should be the probed BAR size (or a spec-known minimum).
 #[must_use]
-pub fn map_bar(bar: Bar, len: u64) -> Option<*mut u8> {
+pub fn map_bar_window(bar: Bar, len: u64) -> Option<akuma_primitives::mmio::MmioWindow> {
     let Bar::Memory { address, .. } = bar else {
         return None;
     };
-    let first = address & !(PAGE_SIZE - 1);
-    let last = (address + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-    let mut pa = first;
-    while pa < last {
-        if !paging::map_page((DEVMAP_BASE + pa) as usize, pa, PteProt::KERNEL_RW, MemAttr::Device) {
-            return None;
-        }
-        pa += PAGE_SIZE;
-    }
-    Some((DEVMAP_BASE + address) as *mut u8)
-}
-
-/// [`map_bar`], as the register window drivers index by offset.
-///
-/// The one place that vouches "these `len` bytes are device registers": the pages
-/// were just mapped `MemAttr::Device` for the kernel's lifetime, and a BAR base is
-/// page-aligned past any access width. Drivers take a safe
-/// [`akuma_primitives::mmio::MmioWindow`] from here instead of each wrapping the
-/// raw pointer in their own `unsafe`.
-#[must_use]
-pub fn map_bar_window(bar: Bar, len: u64) -> Option<akuma_primitives::mmio::MmioWindow> {
-    let base = map_bar(bar, len)? as usize;
-    // SAFETY: `map_bar` mapped `[address, address + len)` as device memory and
-    // returned its virtual base; BARs are at least 16-byte aligned.
-    Some(unsafe { akuma_primitives::mmio::MmioWindow::new(base, len as usize) })
+    paging::map_device_window(address, len)
 }
 
 /// Print the enumerated devices — the amd64 equivalent of an `lspci`, worth

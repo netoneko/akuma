@@ -437,17 +437,17 @@ impl Rtl8169Device {
     /// The chip did not respond, is a family member the driver has never run
     /// on, or the reset timed out — see [`akuma_net_rtl8169::Error`].
     ///
-    /// # Safety
-    /// `bar` is the NIC's device-mapped register BAR, valid for the life of
-    /// the returned device; called once — a second *successful* call panics,
+    /// `win` is the NIC's register BAR (`pci::map_bar_window` is the one place that
+    /// vouches for it); the standard registers all lie within its first
+    /// `REG_WINDOW_LEN` bytes. Called once: a second *successful* call panics,
     /// because the module's ring statics can serve one `Nic` and two cursors
-    /// over the same descriptors is a violation the ownership protocol
-    /// cannot recover from.
-    pub unsafe fn probe(bar: *mut u8) -> Result<Self, akuma_net_rtl8169::Error> {
-        // SAFETY: the caller vouches `bar` is the NIC's device-mapped register BAR
-        // for the life of the device (page-aligned); the standard registers all
-        // lie within the first `REG_WINDOW_LEN` bytes of it.
-        let win = unsafe { MmioWindow::new(bar as usize, REG_WINDOW_LEN) };
+    /// over the same descriptors is a violation the ownership protocol cannot
+    /// recover from.
+    ///
+    /// # Panics
+    /// If called twice successfully, or if `win` is shorter than `REG_WINDOW_LEN`.
+    pub fn probe(win: MmioWindow) -> Result<Self, akuma_net_rtl8169::Error> {
+        assert!(win.len() >= REG_WINDOW_LEN, "rtl8169 register window shorter than the register file");
         let mut nic = Nic::probe(Rtl8169Regs { win }, Rtl8169Rings)?;
         nic.init()?;
         // Claimed only on success: a failed probe (absent or wrong chip,

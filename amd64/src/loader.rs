@@ -411,18 +411,19 @@ fn map_range(
                 }
             }
         } else {
-            let pa = akuma_pmm::alloc_page().ok_or("out of frames loading a segment")? as u64;
-            // SAFETY: a fresh PMM frame, reached through the physmap.
-            unsafe { core::ptr::write_bytes(phys_ptr::<u8>(pa), 0, PAGE_SIZE) };
+            let frame = crate::phys::FreshFrame::alloc_zeroed().ok_or("out of frames loading a segment")?;
             // `map_and_track_pte` records the frame **before** it maps, and
             // untracks it again if the map fails — the obligation this used to
             // discharge with a bare `track_user_frame` above the `map`. A frame
             // the ledger does not know about is a frame teardown will not
             // release; a frame it knows about but nothing maps is one this
-            // address space would free out from under its next owner.
-            if !space.map_and_track_pte(va as usize, PhysFrame::new(pa as usize), prot, NOT_COW) {
+            // address space would free out from under its next owner. On the
+            // failing arm `frame` drops and the PMM gets it back, which the bare
+            // `alloc_page` used to leak.
+            if !space.map_and_track_pte(va as usize, PhysFrame::new(frame.pa()), prot, NOT_COW) {
                 return Err("could not map a segment page");
             }
+            let _ = frame.publish();
         }
         va += PAGE_SIZE as u64;
     }

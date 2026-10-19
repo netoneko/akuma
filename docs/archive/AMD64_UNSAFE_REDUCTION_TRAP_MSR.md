@@ -123,6 +123,32 @@ restore skips a non-canonical stored value instead of faulting the switch.
   address) that want a *sound* owned-frame type, not a safe wrapper over `pa: u64` —
   a `fn zero_page(pa: u64)` would be unsound (any caller could pass any frame).
 
+## Round 3 (2026-10-19): items from "Not done" that are now done
+
+446 -> 434 production `unsafe` sites (`amd64/src` 81 -> 71).
+
+* **Raw-pointer drivers.** The list was stale: `i2c.rs`, `nvme.rs`, `watchdog.rs` and
+  `rtw89.rs` were already on `MmioWindow`; what was left was `net.rs`
+  (`init_rtl8169(*mut u8)` -> `Rtl8169Device::probe`), now safe and window-taking, and
+  four copies of "map pages Device, then vouch" (`i2c`, `watchdog`, `pci`, `lapic`),
+  now one `paging::map_device_window`.
+* **`usermode.rs`.** The `Sysinfo`-as-bytes view is `Sysinfo::to_bytes()` in the
+  `forbid(unsafe_code)` ABI crate, written at `offset_of!`s and tested against
+  hand-written offsets; the `leave` read goes through `sched::read_current_uctx`. What
+  remains there is inherently unsafe (the `enter_user_mode` externs and call, the
+  stack-switching `asm!`, `init_syscall`'s MSR writes).
+* **Physmap page views.** `mm.rs` has none now; they were in `idt.rs`, `loader.rs` and
+  `usermode.rs`. `phys::FreshFrame` is the sound owned-frame type: an exclusively owned,
+  not-yet-published frame, freed on `Drop`, handed on with `publish()`. It replaces the
+  demand-zero, CoW-destination, loaded-segment and test-program-staging views, and fixed
+  two latent leaks on failure paths (a segment page whose map failed was never freed;
+  the test program's failure arm freed a frame the address space already tracked).
+  Frames that belong to *someone else's* address space (`loader::write_user`/`read_user`,
+  the fault-report memory dump) are not fresh and stay as they were.
+* Verified: host tests for the touched crates, clippy, `amd64` check, and the ryzen
+  OVMF -> GRUB -> multiboot2 rehearsal, framebuffer and `nofb`: 804 passed, 0 failed.
+  **Not exercised off the metal:** `init_rtl8169` (no emulated RTL8168).
+
 ## Verification
 
 | check | result |

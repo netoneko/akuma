@@ -73,6 +73,39 @@ pub struct Sysinfo {
     pub _f: [u8; 4],
 }
 
+impl Sysinfo {
+    /// The wire image, byte for byte what `copy_to_user(&info, 112)` would send.
+    ///
+    /// Written field by field at the type's own `offset_of!`s, so it needs no
+    /// `unsafe` view of the struct and cannot disagree with the layout asserted
+    /// below. Every byte of the 112 belongs to a named field (`_align` and `_f` are
+    /// the padding, spelled out), so nothing here is uninitialised.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 112] {
+        use core::mem::offset_of;
+        let mut out = [0u8; 112];
+        let mut put = |off: usize, bytes: &[u8]| out[off..off + bytes.len()].copy_from_slice(bytes);
+        put(offset_of!(Self, uptime), &self.uptime.to_ne_bytes());
+        for (i, l) in self.loads.iter().enumerate() {
+            put(offset_of!(Self, loads) + i * 8, &l.to_ne_bytes());
+        }
+        put(offset_of!(Self, totalram), &self.totalram.to_ne_bytes());
+        put(offset_of!(Self, freeram), &self.freeram.to_ne_bytes());
+        put(offset_of!(Self, sharedram), &self.sharedram.to_ne_bytes());
+        put(offset_of!(Self, bufferram), &self.bufferram.to_ne_bytes());
+        put(offset_of!(Self, totalswap), &self.totalswap.to_ne_bytes());
+        put(offset_of!(Self, freeswap), &self.freeswap.to_ne_bytes());
+        put(offset_of!(Self, procs), &self.procs.to_ne_bytes());
+        put(offset_of!(Self, pad), &self.pad.to_ne_bytes());
+        put(offset_of!(Self, _align), &self._align.to_ne_bytes());
+        put(offset_of!(Self, totalhigh), &self.totalhigh.to_ne_bytes());
+        put(offset_of!(Self, freehigh), &self.freehigh.to_ne_bytes());
+        put(offset_of!(Self, mem_unit), &self.mem_unit.to_ne_bytes());
+        put(offset_of!(Self, _f), &self._f);
+        out
+    }
+}
+
 /// `clone(2)` / `clone3(2)` flag bits.
 pub mod clone_flags {
     pub const CSIGNAL: u64 = 0x0000_00ff;
@@ -301,3 +334,55 @@ pub const CPU_SET_WORD_BYTES: usize = core::mem::size_of::<u64>();
 pub const CPU_SET_BITS_PER_WORD: usize = CPU_SET_WORD_BYTES * 8;
 
 const _: () = assert!(CPU_SET_BITS_PER_WORD == 64);
+
+#[cfg(test)]
+mod sysinfo_tests {
+    use super::Sysinfo;
+
+    fn u64_at(b: &[u8], off: usize) -> u64 {
+        u64::from_ne_bytes(b[off..off + 8].try_into().unwrap())
+    }
+
+    /// Every field lands at the offset Linux's `struct sysinfo` puts it at, written
+    /// out by hand here rather than via `offset_of!` so a wrong offset in the
+    /// layout cannot agree with itself.
+    #[test]
+    fn to_bytes_matches_the_wire_layout() {
+        let info = Sysinfo {
+            uptime: -5,
+            loads: [11, 12, 13],
+            totalram: 21,
+            freeram: 22,
+            sharedram: 23,
+            bufferram: 24,
+            totalswap: 25,
+            freeswap: 26,
+            procs: 0x0102,
+            pad: 0x0304,
+            _align: 0,
+            totalhigh: 31,
+            freehigh: 32,
+            mem_unit: 0x0506_0708,
+            _f: [0; 4],
+        };
+        let b = info.to_bytes();
+        assert_eq!(b.len(), 112);
+        assert_eq!(i64::from_ne_bytes(b[0..8].try_into().unwrap()), -5);
+        for (i, want) in [11u64, 12, 13].into_iter().enumerate() {
+            assert_eq!(u64_at(&b, 8 + i * 8), want);
+        }
+        for (off, want) in [(32, 21), (40, 22), (48, 23), (56, 24), (64, 25), (72, 26), (88, 31), (96, 32)] {
+            assert_eq!(u64_at(&b, off), want, "offset {off}");
+        }
+        assert_eq!(u16::from_ne_bytes(b[80..82].try_into().unwrap()), 0x0102);
+        assert_eq!(u16::from_ne_bytes(b[82..84].try_into().unwrap()), 0x0304);
+        assert_eq!(&b[84..88], &[0; 4], "the hole before totalhigh is zero");
+        assert_eq!(u32::from_ne_bytes(b[104..108].try_into().unwrap()), 0x0506_0708);
+        assert_eq!(&b[108..112], &[0; 4], "tail padding is zero, not stack");
+    }
+
+    #[test]
+    fn default_is_all_zero() {
+        assert_eq!(Sysinfo::default().to_bytes(), [0u8; 112]);
+    }
+}

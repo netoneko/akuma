@@ -38,7 +38,6 @@ use akuma_exec::process::{ProcAddressSpace, UserContext};
 use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
 
 use crate::loader;
-use crate::phys::phys_ptr;
 use crate::serial;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
@@ -1095,8 +1094,7 @@ extern "C" fn syscall_handler(
     // Costs one relaxed load of this thread's pending word when nothing is
     // pending, which is every syscall but a handful per boot.
     let r = crate::signal::deliver_pending(uctx, r);
-    // SAFETY: this task's own `UserCtx`, which only this task writes.
-    let leaving = unsafe { !uctx.is_null() && (*uctx).leave != 0 };
+    let leaving = crate::sched::read_current_uctx(|u| u.leave != 0).unwrap_or(false);
     if !leaving {
         crate::smp::bkl_leave();
     }
@@ -2571,15 +2569,8 @@ fn sys_sysinfo(out: u64) -> u64 {
         mem_unit: 1,
         ..Sysinfo::default()
     };
-    // SAFETY: `Sysinfo` is `repr(C)` and `Copy` with no padding of interest;
-    // `write_bytes` bounds-checks the user pointer.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(info).cast::<u8>(),
-            core::mem::size_of::<Sysinfo>(),
-        )
-    };
-    if !crate::uaccess::write_bytes(out, bytes) {
+    let bytes = info.to_bytes();
+    if !crate::uaccess::write_bytes(out, &bytes) {
         return crate::fd::errno::EFAULT;
     }
     0
@@ -3091,35 +3082,27 @@ impl Image {
         // Dropping `space` on either failure arm below releases its tables and
         // whatever the ledger has taken on — the explicit `space.free()` +
         // `free_all_frames` pair this replaces.
-        let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
+        let (Some(mut code), Some(stack)) =
+            (crate::phys::FreshFrame::alloc_zeroed(), crate::phys::FreshFrame::alloc_zeroed())
+        else {
             return None;
         };
 
-        // SAFETY: PMM frames are reachable through the physmap, so the program
-        // can be staged *before* the address space that will hold it is ever
-        // activated.
-        unsafe {
-            core::ptr::write_bytes(phys_ptr::<u8>(code as u64), 0, 4096);
-            core::ptr::write_bytes(phys_ptr::<u8>(stack as u64), 0, 4096);
-            let page = core::slice::from_raw_parts_mut(phys_ptr::<u8>(code as u64), 4096);
-            build_user_program(page, USER_CODE_VA as u64, msg, rounds, delay, status);
-        }
+        // Staged *before* the address space that will hold it is ever activated.
+        build_user_program(code.bytes_mut(), USER_CODE_VA as u64, msg, rounds, delay, status);
 
-        // Tracked as they are mapped: `map_and_track_pte` records the frame
-        // first and untracks it again if the map fails, so a refusal here leaves
-        // nothing behind for `Drop` to double-free.
-        if !space.map_and_track_pte(USER_CODE_VA, PhysFrame::new(code), PteProt::USER_RX, false)
-            || !space.map_and_track_pte(
-                USER_STACK_VA,
-                PhysFrame::new(stack),
-                PteProt::USER_RW,
-                false,
-            )
-        {
-            akuma_pmm::free_page(code, 0);
-            akuma_pmm::free_page(stack, 0);
+        // Each frame is published the moment its own map succeeds:
+        // `map_and_track_pte` records it first and untracks it again if the map
+        // fails, so a refusal leaves the failing frame to the handle's `Drop`, and
+        // a frame already tracked is `space`'s to free, not ours.
+        if !space.map_and_track_pte(USER_CODE_VA, PhysFrame::new(code.pa()), PteProt::USER_RX, false) {
             return None;
         }
+        let _ = code.publish();
+        if !space.map_and_track_pte(USER_STACK_VA, PhysFrame::new(stack.pa()), PteProt::USER_RW, false) {
+            return None;
+        }
+        let _ = stack.publish();
         Some(Self {
             space,
             entry: USER_CODE_VA as u64,

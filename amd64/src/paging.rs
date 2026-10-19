@@ -207,6 +207,33 @@ fn read_cr3() -> u64 {
     akuma_cpu::ctlreg::cr3() & akuma_pte_amd64::ADDR_MASK
 }
 
+/// Map `[pa, pa + len)` as device memory in the device window and return the `len`
+/// bytes at `pa` as a register window.
+///
+/// The one place that vouches "these bytes are device registers" for a physical
+/// range: every page was just mapped [`MemAttr::Device`] for the kernel's lifetime
+/// (the device window is never torn down), so a safe
+/// [`akuma_primitives::mmio::MmioWindow`] over it cannot name memory the CPU may
+/// serve from cache. Drivers take the window from here instead of each wrapping
+/// the address in their own `unsafe`. Mapping allocates page-table frames, so it
+/// must run after `mem::init_reserving`.
+#[must_use]
+pub fn map_device_window(pa: u64, len: u64) -> Option<akuma_primitives::mmio::MmioWindow> {
+    use crate::phys::DEVMAP_BASE;
+    let first = pa & !(PAGE_SIZE as u64 - 1);
+    let last = (pa + len).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+    let mut p = first;
+    while p < last {
+        if !map_page((DEVMAP_BASE + p) as usize, p, PteProt::KERNEL_RW, MemAttr::Device) {
+            return None;
+        }
+        p += PAGE_SIZE as u64;
+    }
+    // SAFETY: `[pa, pa + len)` is covered by the pages just mapped Device above,
+    // for the kernel's lifetime. Callers name the access widths and offsets.
+    Some(unsafe { akuma_primitives::mmio::MmioWindow::new((DEVMAP_BASE + pa) as usize, len as usize) })
+}
+
 /// Invalidate one page's TLB entry.
 ///
 /// The amd64 counterpart of `tlbi vaae1`, and a good illustration of proposal

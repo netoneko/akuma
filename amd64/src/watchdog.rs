@@ -47,8 +47,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use akuma_primitives::{OnceCopy, mmio::MmioWindow};
 
-use crate::paging::{self, MemAttr, PteProt};
-use crate::phys::DEVMAP_BASE;
+use crate::paging;
 use crate::serial;
 
 /// The ACPI MMIO block; the PM registers are at +0x300.
@@ -90,13 +89,7 @@ static TIMEOUT_S: AtomicU64 = AtomicU64::new(0);
 
 /// Map the page holding `pa` as device memory and name it as a register window.
 fn map(pa: u64) -> Option<MmioWindow> {
-    let va = DEVMAP_BASE + pa;
-    if !paging::map_page(va as usize, pa, PteProt::KERNEL_RW, MemAttr::Device) {
-        return None;
-    }
-    // SAFETY: the page at `va` was just mapped `MemAttr::Device` for the kernel's
-    // lifetime, and `va` is page-aligned past any access width used here.
-    Some(unsafe { MmioWindow::new(va as usize, 4096) })
+    paging::map_device_window(pa, 4096)
 }
 
 /// The timeout `wdt` / `wdt=<s>` asks for, or `None` if the watchdog was not
