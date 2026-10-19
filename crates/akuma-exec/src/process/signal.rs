@@ -483,13 +483,30 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
 /// a `^C` that raises a signal at nobody and is indistinguishable, from the
 /// terminal, from one that never arrived.
 pub fn kill_process_group(pgid: Pid, sig: u32) -> usize {
+    kill_group(pgid, sig, false)
+}
+
+/// A terminal signal (`^C`, `^\\`) for the foreground group `pgid` of a terminal
+/// whose session shell's group is `session_pgid`: the shell is spared, a job is not.
+///
+/// [`kill_process_group`] always spares the leader, which is right while the
+/// foreground group *is* the shell's ([`akuma_tty::TerminalState::spares_leader`]).
+/// A job-control shell (busybox `sh -i`) instead makes each job its own group
+/// and `TIOCSPGRP`s to it, and then the leader is the job — sparing it left
+/// `^C` raising a signal at nobody (`[ISIG] … members=0`, found 2026-10-19 on
+/// both architectures: `sleep 100` could not be interrupted).
+pub fn kill_foreground_group(pgid: Pid, session_pgid: Pid, sig: u32) -> usize {
+    kill_group(pgid, sig, pgid != session_pgid)
+}
+
+fn kill_group(pgid: Pid, sig: u32, include_leader: bool) -> usize {
     // Fixed array, not a `Vec`: `for_each_process`'s callback runs with IRQs
     // disabled and forbids allocation, and there can never be more than
     // `MAX_PROCESSES` matches.
     let mut targets = [0 as Pid; table::MAX_PROCESSES];
     let mut count = 0;
     table::for_each_process(|p| {
-        if p.pgid == pgid && p.pid != pgid && count < targets.len() {
+        if p.pgid == pgid && (include_leader || p.pid != pgid) && count < targets.len() {
             targets[count] = p.pid;
             count += 1;
         }

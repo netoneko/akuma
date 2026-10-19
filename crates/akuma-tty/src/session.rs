@@ -62,8 +62,14 @@ pub struct TerminalState {
     pub lflag: u32,
     pub cc: [u8; 20],
 
-    /// Current foreground process group ID
+    /// Current foreground process group ID (`TIOCSPGRP`).
     pub foreground_pgid: u32,
+    /// The group of the session's own shell (what `foreground_pgid` started as,
+    /// see [`Self::set_session_leader`]). A terminal signal aimed at *this* group
+    /// spares its leader — the shell — and one aimed at any other group (a job a
+    /// job-control shell `TIOCSPGRP`'d to) reaches the leader too, because there
+    /// the leader is the job (`sleep` made its own group). Console default 1.
+    pub session_pgid: u32,
 
     /// Terminal dimensions
     pub term_width: u16,
@@ -118,6 +124,7 @@ impl Default for TerminalState {
             lflag: t.lflag,
             cc,
             foreground_pgid: 1,
+            session_pgid: 1,
             term_width: 80,
             term_height: 24,
             cursor_col: 0,
@@ -137,6 +144,20 @@ impl TerminalState {
     /// 8 KiB; ingesting only when no completed line is waiting means the queue
     /// is empty, so a chunk this size always fits.
     pub const INGEST_CHUNK: usize = 4096;
+
+    /// The session's shell is `pid`: its group is both the session group and the
+    /// initial foreground group.
+    pub fn set_session_leader(&mut self, pid: u32) {
+        self.session_pgid = pid;
+        self.foreground_pgid = pid;
+    }
+
+    /// Does a terminal signal to the foreground group spare the group leader?
+    /// Only while the foreground group is the session shell's own.
+    #[must_use]
+    pub const fn spares_leader(&self) -> bool {
+        self.foreground_pgid == self.session_pgid
+    }
 
     /// Sets a waker to be notified when input is available.
     pub fn set_input_waker(&mut self, waker: core::task::Waker) {
@@ -827,6 +848,19 @@ mod tests {
         assert_eq!(ts.cc[10], 0x1A);
         assert!(ts.is_canonical());
     }
+    #[test]
+    fn terminal_signals_spare_only_the_shells_own_group_leader() {
+        let mut ts = default_ts();
+        ts.set_session_leader(40);
+        assert_eq!((ts.session_pgid, ts.foreground_pgid), (40, 40));
+        assert!(ts.spares_leader(), "^C at the prompt must not kill the shell");
+        ts.foreground_pgid = 57; // a job-control shell moved `sleep` (pid 57, its own group) to the front
+        assert!(!ts.spares_leader(), "the leader of the job's group is the job");
+        ts.foreground_pgid = 40;
+        assert!(ts.spares_leader());
+        assert!(default_ts().spares_leader(), "console default: group 1 is init");
+    }
+
     #[test]
     fn input_waker_is_taken_once() {
         let mut ts = default_ts();

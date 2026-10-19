@@ -5773,7 +5773,7 @@ pub fn sys_spawn(
     // reaches everything the shell forks — which is the job that should die on
     // `^C`, and not the shell running it.
     if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
-        proc.terminal_state.lock().foreground_pgid = pid;
+        proc.terminal_state.lock().set_session_leader(pid);
     }
 
     SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid, exec_slot: task_slot });

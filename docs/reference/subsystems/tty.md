@@ -84,10 +84,15 @@ process). `ingest` returns `NoMemory` if that allocation fails (`read` -> `ENOME
   `slave_poll`.
 - **Sharing**: one `TerminalState` per session (a helper's `TCSETS` re-cooks a TUI's terminal);
   one pair per pty.
-- **Found, not fixed**: `^C` typed at `sleep 100` run from `sh -i` over ssh does nothing on either
-  architecture; the log says `[ISIG] … members=0` — `kill_process_group` excludes the group leader,
-  which is the only member. Identical on the pre-merge AArch64 kernel and on amd64 `b37eb82`
-  (before any tty work); unrelated to the engine.
+- **`^C` and job control (fixed 2026-10-19)**: `^C` at `sleep 100` run from `sh -i` over ssh did
+  nothing on either architecture (`[ISIG] … members=0`): `kill_process_group` always spared the
+  group leader, which is right while the foreground group is the login shell's own, but a
+  job-control shell makes each job its own group and `TIOCSPGRP`s to it, so the leader *is* the job.
+  `TerminalState::session_pgid` (set with `set_session_leader`) remembers the shell's group;
+  `spares_leader()` is true only while the foreground group is that one, and
+  `akuma_exec::process::kill_foreground_group` includes the leader otherwise. Live-tested on both
+  kernels: `sleep` dies (`$? = 130`), `^C` at a nested shell's prompt does not kill it, the outer
+  shell survives. `PtyPair`'s signal path never had the exclusion.
 
 ## Allocation audit
 

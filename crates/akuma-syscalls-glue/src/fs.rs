@@ -434,12 +434,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                     Err(akuma_tty::NoMemory) => return ENOMEM,
                                 };
                                 let pgid = ts.foreground_pgid;
+                                let session_pgid = ts.session_pgid;
                                 let line = ts.read_line(&mut kernel_buf[..count]);
                                 drop(ts);
                                 // Delivered with the guard dropped: delivery can run a
                                 // default terminate action, which closes descriptors.
                                 for sig in ingest.signals.iter() {
-                                    akuma_exec::process::kill_process_group(pgid, sig);
+                                    akuma_exec::process::kill_foreground_group(pgid, session_pgid, sig);
                                 }
                                 match line {
                                     akuma_tty::CanonRead::Data(to_read) => {

@@ -525,6 +525,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
         if let Some(vintr) = ts.intr_char() {
             if data.contains(&vintr) {
                 let pgid = ts.foreground_pgid;
+                let session_pgid = ts.session_pgid;
                 drop(ts);
                 // Which group did the INTR character actually reach? A `^C`
                 // that raises SIGINT on the wrong `foreground_pgid` broadcasts
@@ -536,7 +537,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
                 // keystroke, so a handful is the whole interesting window, and a
                 // stuck client resending `0x03` must not be able to flood the
                 // console.
-                let members = signal::kill_process_group(pgid, 2 /* SIGINT */);
+                let members = signal::kill_foreground_group(pgid, session_pgid, 2 /* SIGINT */);
                 if INTR_TRACES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
                     crate::safe_print!(96,
                         "[ISIG] pid={} fg_pgid={} sig=2 members={}\n", pid, pgid, members);

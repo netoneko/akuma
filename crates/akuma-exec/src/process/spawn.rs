@@ -475,7 +475,7 @@ pub fn spawn_process_with_creds(
     // Auto-delegate foreground to the new process (on whichever
     // terminal_state it ended up with, shared or fresh). For interactive
     // spawns, the child should start in the foreground.
-    process.terminal_state.lock().foreground_pgid = process.pid;
+    process.terminal_state.lock().set_session_leader(process.pid);
 
     // Save arguments in process struct for ProcessInfo page
     process.image.get_mut().args = if let Some(arg_slice) = args {
