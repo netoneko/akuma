@@ -10,8 +10,10 @@ its page tables, its PTE marker bit and its fault arm are all in `amd64/`. What
 the two kernels *do* share is the **decision** (`crates/akuma-cow`) and the
 per-address-space frame ledger (`crates/akuma-user-space`), both host-tested.
 See [`../../archive/AKUMA_AMD64_COW.md`](../../archive/AKUMA_AMD64_COW.md);
-note that amd64's CoW is **SMP=1 only**, because `invlpg` is core-local there
-and nothing does a shootdown.
+note that amd64's CoW was **SMP=1 only** (`invlpg` core-local, no shootdown) until the shootdown
+landed 2026-09-09 — *corrected 2026-10-20*: it runs at `SMP>1` today, but a multithreaded process
+that forks while a sibling thread faults still gets a spurious SIGSEGV
+([`AMD64_FORK_VS_THREADS_SEGV`](../../archive/AMD64_FORK_VS_THREADS_SEGV.md)).
 
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
 > Four items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below

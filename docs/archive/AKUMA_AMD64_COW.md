@@ -145,6 +145,13 @@ host tests, 0 failed.
 
 ## Known limits
 
+> **Correction 2026-10-20.** The first two bullets below are out of date. A TLB shootdown has
+> existed since 2026-09-09 (`amd64/src/shootdown.rs`; `thread.rs` says so) and CoW `fork` has run at
+> `SMP>1` since (self-host builds at `-j4`); and threads exist (`crate::thread`), so the `cowstale`
+> race class **does** exist here. It bites: a multithreaded process that forks while a sibling thread
+> faults gets a spurious SIGSEGV, 100 % reproducible with `scripts/utils/go_fork_stack_repro` —
+> [`AMD64_FORK_VS_THREADS_SEGV.md`](AMD64_FORK_VS_THREADS_SEGV.md).
+
 - **SMP=1 only, by construction.** `smp.rs` states `invlpg` is core-local with no
   TLB shootdown. `fork_from` demotes the parent's live PTEs, and at SMP>1 another
   core can hold a stale writable translation. CoW needs a shootdown before SMP>1

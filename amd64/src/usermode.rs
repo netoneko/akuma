@@ -2169,6 +2169,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 // (see `akuma-cow`'s pinned marker divergence), so a
                 // multi-core Firecracker running `gcc` wants `SMP=1` until that
                 // lifts.
+                //
+                // **Stale as of 2026-10-20:** the `SMP=1`-only remark above predates the TLB
+                // shootdown (2026-09-09); CoW fork runs at `SMP>1`. What is *not* sound is this
+                // path from a **multithreaded** parent while a sibling thread faults — Go's
+                // `os/exec` hits it every time (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
                 return sys_spawn_clone(a2);
             }
             sys_fork()
