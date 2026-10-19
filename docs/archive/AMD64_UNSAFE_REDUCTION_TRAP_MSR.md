@@ -88,24 +88,49 @@ restore skips a non-canonical stored value instead of faulting the switch.
   process burns a core at 100% (14–16 CPU-minutes observed, two of them at once) and
   while they ran a `git worktree add` on the same box made no progress until they
   were killed. Reproduced twice with a bare `ls /root`; other directories list fine.
-  Do not `ls /root` there. **ROOT-CAUSED 2026-10-19, not this branch**: `sys_getdents64`
-  cloned the fd's whole directory-entry snapshot on *every* call, and `/root`'s inode
-  (1589249) holds **101,161 live entries** in 5.5 MB of dirent data (months of on-box
-  build churn; ext2 directories never shrink), so the ~1,300-call stream cost
-  ~100 k `String` clones per call under the VFS BKL — 100% CPU, no output until EOF,
-  and the box's other syscalls starving behind the lock. A raw-`getdents64` probe on
-  the box showed a small directory reaching EOF in 3 calls while `/root` was still
-  streaming at 50 (3,807 records; ~76 a call). Fixed in
-  `akuma-syscalls-glue::fs::sys_getdents64` (commit `a6fd5eb9`): the pure
-  `getdents_step` takes the snapshot by slice, the first-call snapshot is moved into
-  the fd, and host tests pin the stream at that scale (`cargo test -p akuma-syscalls-glue
-  getdents`). Found on the way, still open: directories grown by Akuma's own
-  `add_dir_entry` can end up with an **uninitialised second block** — `/root/bigdir`
-  (a fresh 60-file test directory) had `i_size` 8192 with block 2 full of a freed
-  file's indirect-block garbage, plus consecutive duplicate name/inode pairs in block 1
-  (`f111 f111 …`); Ubuntu's `e2fsck -fn` and `debugfs` confirm it on the raw partition.
-  Harmless to the listing (the parser stops at the garbage record) but it is a real
-  write-path bug in directory growth.
+  Do not `ls /root` there. **ROOT-CAUSED AND FIXED 2026-10-19** (branch
+  `fix/ls-root-getdents-spin`, commits `a6fd5eb9`, `11639f61`, `7c98d407`; kernel
+  `7c98d40-release-smp-shared` verified on the metal). Three stacked defects, in the
+  order they were found, each masked by the next:
+  1. `sys_getdents64` (`akuma-syscalls-glue::fs`) cloned the fd's whole
+     directory snapshot **per call**; `/root`'s inode (1589249) holds ~145 k
+     entries in 5.5 MiB of dirent data (months of on-box build churn — ext2
+     directories never shrink), so the ~1,300-call stream re-allocated ~100 k
+     `String`s per call under the VFS BKL. Fix: pure `getdents_step` fills by
+     slice; the snapshot is moved into the fd once.
+  2. Even with the arm clone-free, `proc.get_fd` deep-clones the `FileDescriptor`
+     — including that snapshot — so every call still paid one full clone
+     (probe on the metal: 70 ms/call). Fix: `SharedFdTable::with_fd` borrows the
+     live entry in place; the fill runs inside `update_fd`. Measured after:
+     4,038-call stream with a 2 KiB buffer in **446 ms total** (110 µs/call;
+     call 1, the snapshot build, is 421 ms).
+  3. Every `stat`/`open`/`exec` path resolution read the **whole directory** per
+     component (`lookup_path` → `read_inode_data` + `parse_directory`): 238 ms
+     per `stat` on the metal, so `ls` — which stats entries — could not finish.
+     Fix: `Ext2Filesystem::find_in_dir` scans block by block and stops at the
+     match. 50 stats: 11.9 s → 0.58 s.
+  After all three, `ls /root` completes (~5 min for 145 k entries) and the box
+  stays fully responsive throughout — ssh answered in 0.18 s mid-listing; the
+  original "one ls wedges every other syscall" is gone. **Still open, and now
+  the whole remaining cost**: lookups are a linear dirent scan, and `ls` stats
+  each entry once — ~2 ms × 145 k. Real Linux has the same O(n) scan on
+  non-htree directories; the proper followup is **htree (`dir_index`) lookup
+  support** — the feature flag is already set on this image (tune2fs) and
+  `/root` carries `EXT4_INDEX_FL`, but the driver parses linearly, so it also
+  silently ignores index blocks when *listing* (those directories list
+  incompletely-but-terminating rather than spinning). Also found on the way,
+  still open: directories grown by Akuma's own `add_dir_entry` can end with an
+  **uninitialised second block** (`/root/bigdir`, a fresh 60-file test dir: 
+  `i_size` 8192, block 2 full of a freed file's indirect-block garbage) and
+  consecutive duplicate name/inode pairs; `debugfs`/`e2fsck -fn` confirm it on
+  the raw partition. Harmless to listing (the parser stops at the garbage
+  record) but a real write-path bug. The getdents arm's per-call contract is
+  pinned by host tests: `cargo test -p akuma-syscalls-glue getdents` and
+  `cargo test -p akuma-ext2 lookup`. Diagnostic of record: a raw-`getdents64`
+  probe binary (`/tmp/probe2`, `/tmp/probe3` on the box — inline-asm syscall,
+  static musl, prints per-call records/EOF/timing); the kernel's own
+  `/proc/<pid>/syscalls` counters proved the pre-fix burn, and
+  `scripts/install_kernel_amd64.sh` + ryzen builds carried the loop.
 * **Swapping `multiboot2.rs`'s `Surface` impl changed the kernel image by −408 KiB**
   (`_kernel_end` `0x1212dd0` → `0x11aced0`, back to the pre-audit size). Nothing in
   the change should shrink the image by that much; it is almost certainly the `fbcon`
