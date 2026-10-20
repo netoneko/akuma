@@ -90,6 +90,11 @@ mod idt;
 mod input;
 #[cfg(target_arch = "x86_64")]
 mod kbd;
+/// The SVM hypervisor seed (`docs/archive/AKUMA_KVM.md`): a CPUID probe on
+/// every boot and, behind `kvmtest`, a trivial guest. Spec-first — no Linux
+/// code; the data vocabulary lives in `akuma-svm-amd64`.
+#[cfg(target_arch = "x86_64")]
+mod kvm;
 #[cfg(target_arch = "x86_64")]
 mod lapic;
 #[cfg(target_arch = "x86_64")]

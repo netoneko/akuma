@@ -131,6 +131,7 @@ dependencies = [
  "akuma-ryzen-amd64",
  "akuma-selftest",
  "akuma-sntp",
+ "akuma-svm-amd64",
  "akuma-syscalls",
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",

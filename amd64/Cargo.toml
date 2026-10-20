@@ -257,6 +257,9 @@ no-tests = []
 akuma-alloc = { path = "../crates/akuma-alloc" }
 akuma-pmm = { path = "../crates/akuma-pmm" }
 akuma-cpu = { path = "../crates/akuma-cpu" }
+# The SVM seed's VMCB vocabulary, exit codes and §15.5.1 guest-state checks —
+# host-tested there, consumed by `kvm.rs` on the metal.
+akuma-svm-amd64 = { path = "../crates/akuma-svm-amd64" }
 # The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
 akuma-bkl = { path = "../crates/akuma-bkl" }
 # Syscall identity across architectures. Proposal item 5's shape, and the amd64

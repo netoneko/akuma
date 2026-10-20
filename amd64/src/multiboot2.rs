@@ -980,6 +980,12 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // prints one line and boots on. `hdatest` plays a one-second tone.
     crate::hda::init(info.cmdline().split_ascii_whitespace().any(|t| t == "hdatest"));
 
+    // The SVM hypervisor seed (AKUMA_KVM.md): one `[KVM]` probe line per
+    // boot; `kvmtest` on the command line runs the trivial guest. After
+    // `mem::init_reserving` (it allocates frames) and on the BSP only —
+    // EFER.SVME and VM_HSAVE_PA are per-core, rung 2 enables the APs.
+    crate::kvm::init(info.cmdline());
+
     // `/proc/power`. After `mem::init_reserving` for the same reason as `hda`:
     // mapping the EC window allocates page-table frames.
     crate::power::init(&machine, info.cmdline());
