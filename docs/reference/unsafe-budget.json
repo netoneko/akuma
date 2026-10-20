@@ -47,6 +47,7 @@
     "crates/akuma-scheduler",
     "crates/akuma-selftest",
     "crates/akuma-sntp",
+    "crates/akuma-svm-amd64",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-abi",
     "crates/akuma-syscalls-glue",
@@ -70,7 +71,7 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 71,
+    "amd64/src": 79,
     "crates/akuma-alloc": 24,
     "crates/akuma-cpu": 65,
     "crates/akuma-dma": 17,
