@@ -251,6 +251,10 @@ pub mod msr {
         /// `IA32_KERNEL_GS_BASE`: parked by `swapgs`; the *program's* `%gs` while
         /// the kernel runs.
         KernelGsBase = 0xC000_0102,
+        /// `VM_HSAVE_PA`: the SVM host save area base (APM Vol 2 §15.30.4).
+        /// 4 KiB-aligned physical address, low 12 bits clear, never the VMCB
+        /// page; contents are CPU-private, format is not to be relied on.
+        VmHsavePa = 0xC001_0117,
     }
 
     /// A 64-bit address is canonical when bits 63:47 are all equal (48-bit
