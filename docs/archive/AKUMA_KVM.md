@@ -257,6 +257,7 @@ device-map work in `crates/akuma-firecracker` and
 | date | milestone work |
 |---|---|
 | 10-20 | M1 started: APM Vol 2 rev 3.45 extracted with a pure-stdlib PDF/ToUnicode-CMap extractor; all VMCB layouts, exit codes, consistency checks and the enabling sequence recorded (§2); no code yet |
+| 10-20 | `akuma-svm-amd64` written and host-tested (13 tests); APM Vol 3 rev 3.38 downloaded, §E.4.9 EDX bits extracted with the same extractor (NP=0, NRIPS=3, table in §2.6); `amd64/src/kvm.rs` wired behind `kvmtest`, built and installed to `/boot/akuma-amd64` — awaiting the reboot with `kvmtest` on the kernel line |
 
 ---
 
@@ -276,8 +277,9 @@ device-map work in `crates/akuma-firecracker` and
 - AMD APM Vol 2 (24593) rev 3.45 — the sole source for §2; obtained from
   `docs.amd.com` (khub document `LNBl5evreogi0r25VIFF2g`). No Linux/KVM
   source was read, per the license constraint.
-- AMD APM Vol 3 (24594) rev 3.38 (2026-07-21) — for the pending §3.3
-  `Fn8000_000A.EDX` bit numbers. **Do not search for it; the URL is known.**
+- AMD APM Vol 3 (24594) rev 3.38 (2026-07-21) — §E.4.9 extracted (see §2.6);
+  obtained via the khub content URL below. No Linux/KVM
+  source was read, per the license constraint.
   Direct PDF (verified 200, application/pdf, 31 MB, same khub scheme as Vol 2):
   `https://docs.amd.com/api/khub/documents/BqEoC2FadIAgbrUdEzDJIg/content`
   Viewer page: `https://docs.amd.com/v/u/en-US/24594_3.38_APM_Vol3_PUB`
