@@ -303,7 +303,7 @@ if [ "${DEVBOX_NIGHTLY_RUST:-true}" = "true" ] || [ "${DEVBOX_STABLE_RUST:-false
 # Shipped by overlays/devbox-firecracker-aws/build-rootfs-image.sh, with the
 # toolchain. Mirrors overlays/devbox/bootstrap.sh step 7c.
 # Rationale, and the failure this does NOT fix:
-#   docs/runbooks/cargo-cannot-reach-crates-io.md
+#   docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md
 [net]
 retry = 20
 

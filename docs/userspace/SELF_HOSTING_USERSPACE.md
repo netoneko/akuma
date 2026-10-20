@@ -105,7 +105,7 @@ error: could not compile `generic-array` (build script) due to 1 previous error
 
 `generic-array`'s `build.rs` compiles a tiny host-triple helper binary, and the
 native linker (`ld`, via `cc`/`collect2`) segfaulted. A second attempt got past
-this crate entirely — same class as `debug-thread-spawn-segv.md`'s "freshly
+this crate entirely — same class as `THREAD_SPAWN_SEGV_INVESTIGATION.md`'s "freshly
 cloned thread SIGSEGVs at a fixed PC", not reproduced deterministically enough
 here to pin down further.
 
@@ -185,7 +185,7 @@ done
 - [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) — Issue 7
   (`build.sh` needs bash) and Issue 8 (`apk` busybox trigger "1 error"), both
   found in this same session.
-- [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md) —
+- [`../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md) —
   the broader open bug class §4a/4c belong to.
 - `scripts/populate_disk.sh` (`RUST_CMD` block) — how the `/usr/local` nightly
   toolchain used in §2 actually gets installed onto an image.

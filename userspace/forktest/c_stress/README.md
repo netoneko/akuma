@@ -60,7 +60,7 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   re-checks its own relocated pointer and makes a PLT call. Point it at a large
   dynamic binary for demand-paging pressure:
   `dynspawn 25 4 /usr/local/bin/rustc 0 --version`. Written for the ld-musl
-  instruction-abort class in `docs/runbooks/debug-thread-spawn-segv.md` §3;
+  instruction-abort class in `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` §3;
   **does not reproduce it yet** (700 clean spawns), so that class still needs the
   real build load.
 - `mprotectlb` — does `mprotect` take effect on a page that is already in the
@@ -172,7 +172,7 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   syscall: the argument popped off its own stack, sentinel words the parent left
   below it, and a page the parent mmap'd microseconds earlier. Every check is
   range-checked before dereference, so a stale value is reported rather than
-  crashed on. Built to answer `docs/runbooks/debug-thread-spawn-segv.md`; it
+  crashed on. Built to answer `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`; it
   found **no** divergence in 144k children, which is what rules the memory
   handoff out.
 - `spawnalias` — does a freshly-spawned thread see *its own* address space? The
@@ -195,7 +195,7 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   `--fanout` adds thread-slot pressure, `--mapfile` adds demand-paging pressure:
   `spawnalias 2000 4 8 --mapfile /usr/local/lib/librustc_driver-*.so`.
   Calibrated: PASS on real Linux (300×4×8). Written for
-  `docs/runbooks/debug-thread-spawn-segv.md` §3c — it decides T1 vs T2 vs T3.
+  `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` §3c — it decides T1 vs T2 vs T3.
 - `tidflags` — does `clone(2)` honour its three tid flags separately? Linux keeps
   `CLONE_PARENT_SETTID` (write tid to `ptid` at clone), `CLONE_CHILD_SETTID`
   (write tid to `ctid`, **in the child's context**, so it is not observable the

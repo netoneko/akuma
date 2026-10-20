@@ -7,7 +7,7 @@
 #   unixsock/ -> bootstrap/bin/nettest-unix      (AF_UNIX: raw syscalls, no std::os wrappers)
 #
 # `connect/` belongs to a third investigation (cargo cannot reach crates.io,
-# `docs/runbooks/cargo-cannot-reach-crates-io.md`) and `unixsock/` to a fourth
+# `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`) and `unixsock/` to a fourth
 # (AF_UNIX, `docs/archive/UNIX_SOCKET_IMPROVEMENTS.md`), but both share this
 # build path because they have the same requirement: no runtime, no TLS,
 # nothing between the probe and the syscall.

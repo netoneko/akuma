@@ -14,11 +14,11 @@
 > a socket that had just reached `Established` with `SO_ERROR == 0`. apk cargo
 > and `/bin/curl` are autotools builds that define `HAVE_POLL` and use `poll(2)`,
 > which is the entire reason they worked. Fix + evidence:
-> `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
+> `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` § 3.4.
 >
 > Two claims
 > in this doc do not survive a source trace, which is written up in
-> `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3:
+> `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` § 3:
 >
 > 1. **"Non-blocking TCP connects … never complete" is exactly backwards** — they
 >    completed every time. The evidence for it was a kernel log showing
@@ -127,7 +127,7 @@ We do NOT yet know the *precise* syscall-level divergence — the kernel only lo
 
 | Ruled out | Why |
 |---|---|
-| HTTP/2 ALPN in TLS handshake | The probe forces HTTP/2 with ALPN h2 in `easy2`/`multi2` and succeeds. The existing `CARGO_HTTP_MULTIPLEXING=false` workaround (per `debug-thread-spawn-segv.md:1143-1148`) does not fix this — confirmed by env-var testing. |
+| HTTP/2 ALPN in TLS handshake | The probe forces HTTP/2 with ALPN h2 in `easy2`/`multi2` and succeeds. The existing `CARGO_HTTP_MULTIPLEXING=false` workaround (per `THREAD_SPAWN_SEGV_INVESTIGATION.md:1143-1148`) does not fix this — confirmed by env-var testing. |
 | c-ares threaded DNS racing | `RES_OPTIONS=usevc` (force TCP DNS) and `CARGO_HTTP_MULTIPLEXING=false` env vars do not change the failure pattern. DNS itself succeeds — the IPs are visible in the kernel log. |
 | Worker-thread socket ownership | The probe's `multi2` mode spawns a worker pthread that drives `Multi::perform`/`Multi::wait`, exactly like cargo's `http_async.rs:82-96`. The probe's worker thread connects fine. |
 | Multi+pipewait multiplexing | Same — `multi2` exercises this and completes. |
@@ -166,7 +166,7 @@ The contrast between A and B is the bug.
 
 ## Background (prior art)
 
-- `docs/runbooks/debug-thread-spawn-segv.md:1143-1168` — earlier "spurious network error" note; blamed HTTP/2 multiplexing. That diagnosis was incomplete: turning multiplexing off does not fix this case (verified). The actual trigger is the libcurl build, not the cargo config.
+- `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md:1143-1168` — earlier "spurious network error" note; blamed HTTP/2 multiplexing. That diagnosis was incomplete: turning multiplexing off does not fix this case (verified). The actual trigger is the libcurl build, not the cargo config.
 - `docs/archive/CURL_MISSING_SYSCALLS.md` — earlier non-blocking-connect path bugs.
 - `docs/archive/OPTIONAL_SMOLTCP.md:312-368` — c-ares threaded-resolver notes.
 - `docs/reference/subsystems/networking.md` — box-0 smoltcp architecture.

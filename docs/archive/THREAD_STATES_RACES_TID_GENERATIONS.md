@@ -5,7 +5,7 @@ clone-tidflags fix ([`CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`](CLONE_TIDFLAGS_THREAD
 the `AS MISMATCH: L0 BASE DIFFERS` fault (a thread executing in a third party's
 page tables, runbook §2f) and the `[BKL] stuck` storm that wedged a `-j4` build
 with live-but-idle rustc processes. Maintained summary:
-[`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md) §2g.
+[`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md) §2g.
 
 ## How the mechanism was found
 

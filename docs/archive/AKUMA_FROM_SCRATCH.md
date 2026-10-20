@@ -282,7 +282,7 @@ to check rather than assume:
    passed its self-tests, never at install time.
 
 **The first real exercise of this loop is Intel HDA audio**
-([`../runbooks/add-intel-hda-audio.md`](../runbooks/add-intel-hda-audio.md)),
+([`AKUMA_AMD64_HDA_AUDIO_BRIEF.md`](AKUMA_AMD64_HDA_AUDIO_BRIEF.md)),
 driven by meow + GLM on the box. It was chosen because it is a *new* subsystem
 rather than a patch to an existing one — a driver for hardware only this machine
 has (`8086:8c20` at `00:1b.0`), which no host test and no QEMU fast lane can

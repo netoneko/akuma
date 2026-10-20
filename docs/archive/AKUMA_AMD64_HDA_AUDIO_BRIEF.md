@@ -62,7 +62,7 @@ should read it the same way — it is the orientation, not the design.
 
 Read, in this order:
 
-1. [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the machine and the
+1. [`amd64-bare-metal-loop.md`](../runbooks/amd64-bare-metal-loop.md) — the machine and the
    build/install/reboot loop. Its § "Working **on** the box" is the part you
    live in; the laptop-driven sections describe how someone else reaches this
    machine and are not your path.
@@ -134,7 +134,7 @@ kbuild -j 1 && kinstall && /bin/busybox reboot -f
 
 Build, install, reboot into what you just built, look at the console, change one
 thing, go again. That is the experiment
-([`../archive/AKUMA_FROM_SCRATCH.md`](../archive/AKUMA_FROM_SCRATCH.md) §8) as
+([`../archive/AKUMA_FROM_SCRATCH.md`](AKUMA_FROM_SCRATCH.md) §8) as
 much as the driver is; a driver developed somewhere else would prove the smaller
 half.
 
@@ -293,9 +293,9 @@ a VMM boot has a flag to set, a firmware boot does not.
 
 ## Background
 
-- [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the box, the loop,
+- [`amd64-bare-metal-loop.md`](../runbooks/amd64-bare-metal-loop.md) — the box, the loop,
   and the self-host install mechanism.
-- [`../archive/AKUMA_FROM_SCRATCH.md`](../archive/AKUMA_FROM_SCRATCH.md) — why
+- [`../archive/AKUMA_FROM_SCRATCH.md`](AKUMA_FROM_SCRATCH.md) — why
   the box has its own checkout, toolchain and cargo cache, and what this task
   is a proof of.
 - `crates/akuma-virtio/src/audio.rs`, `userspace/wavplay/src/main.rs` — the

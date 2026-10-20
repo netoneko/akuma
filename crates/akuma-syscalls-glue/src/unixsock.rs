@@ -896,7 +896,7 @@ fn send_creds(sock: u32) -> Option<Ucred> {
 /// to report identically through `poll`, `select` and `epoll`. The AF_INET side
 /// of that same contract is what the `_exceptfds_ptr` bug violated — `poll`
 /// said `CONNECTED` and `select` said `HARDFAIL` for one socket at one moment
-/// (`docs/runbooks/cargo-cannot-reach-crates-io.md` §3) — which is why the
+/// (`docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` §3) — which is why the
 /// probe checks all four readiness syscalls rather than one.
 pub fn listener_ready(fd: u32, tid: Option<usize>) -> Option<bool> {
     let sock = fd_sock(fd)?;

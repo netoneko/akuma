@@ -121,7 +121,7 @@ Two things to read off this, both important:
 
 - **There are two independent failure modes**, and they must be counted separately.
   `signal: 11` (rustc SIGSEGV) fires on **`main` as well** — it is the pre-existing
-  thread-spawn SIGSEGV class ([`../runbooks/debug-thread-spawn-segv.md`], open since
+  thread-spawn SIGSEGV class ([`THREAD_SPAWN_SEGV_INVESTIGATION.md`], open since
   2026-08-07), not a regression. Anyone bisecting the ODHT bug who counts "build
   failed" will be measuring mostly this.
 - **A green incremental build proves nothing.** `cargo clean` is the only thing that
@@ -1053,7 +1053,7 @@ mappings, rises and falls with the build), `pin_ovf=`, `defer=` (should drain to
   §13 — the audit that ruled out PMM-level UAF *at that time*; §6 above is evidence it
   needs revisiting
 - [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §5.6 — the refcount-underflow class
-- [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md) —
+- [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md) —
   the `signal: 11` mode this bug is tangled with
 - [`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md) — the
   build; its LTO guidance is corrected there (thin costs +1.4% RSS, not a cliff)

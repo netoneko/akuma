@@ -106,7 +106,7 @@ itself on that flag.
 > (cause unconfirmed: cold-read race or USB). It is **not parity**: `-j4` was
 > slower than the `-j1` figure in §4, and ten clean-of-SIGSEGV runs bound the
 > old rate (≈26 %), they do not retire it. Numbers and the reading:
-> [`../runbooks/amd64-j4-build-crash-hunt.md`](../runbooks/amd64-j4-build-crash-hunt.md)
+> [`AMD64_J4_BUILD_CRASH_HUNT.md`](AMD64_J4_BUILD_CRASH_HUNT.md)
 > § 1a. The evidence below is unchanged.
 
 §11 saw two failures at SMP=4 and suspected they were one bug. This section was
@@ -626,7 +626,7 @@ that binds, silently, on the only workload that notices.
 ## 7. The on-box agent swarm experiment (2026-09-25 to 09-30): it failed, and why
 
 **Outcome: the experiment did not produce a working driver.** The task was the
-Intel HDA driver (`add-intel-hda-audio.md`); the agents (meow on the trashcan
+Intel HDA driver (`AKUMA_AMD64_HDA_AUDIO_BRIEF.md`); the agents (meow on the trashcan
 itself, with tama on ryzen, all on GLM `glm-5.3-flash` at low reasoning) ran for
 five days, about 90 commits on `amd64-audio`, and ran out of tokens with the
 headphones silent. The same task was finished in one interactive session on the

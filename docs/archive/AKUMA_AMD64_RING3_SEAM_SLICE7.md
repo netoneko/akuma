@@ -297,5 +297,5 @@ starts at 0 ≠ tid.
   `current_thread_tgid_process`, the pair §1 is about.
 - `crates/akuma-exec/src/process/children.rs` — `read_current_pid`, whose
   comment predicted §2.3.
-- `docs/runbooks/debug-thread-spawn-segv.md` — the `[TRAMP-MISMATCH]` line's
+- `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` — the `[TRAMP-MISMATCH]` line's
   original subject.

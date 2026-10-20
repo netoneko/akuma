@@ -5,7 +5,7 @@
 pre-flight for repeating it.
 
 The question: does `kbuild -c -j 4` at SMP=4 finish on the machine, or does it die
-the way [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md)
+the way [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](AKUMA_AMD64_BARE_METAL_SELFHOST.md)
 §3 recorded (3 of 4 builds `rc=139`, at 22–35 crates)? Two rigs have data.
 
 ## 1a. Latest result (2026-09-30, `main` = `e6d8657b`): good, not parity
@@ -16,7 +16,7 @@ the way [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL
 > 165777608 B for …/rust-lld` — `execve` held the whole image in the kernel heap and
 > three concurrent `rust-lld`s (158 MB each) exhausted it, so a *capacity* failure
 > presented as a device error
-> ([`AKUMA_AMD64_TARGETED_SHOOTDOWN.md`](../archive/AKUMA_AMD64_TARGETED_SHOOTDOWN.md)
+> ([`AKUMA_AMD64_TARGETED_SHOOTDOWN.md`](AKUMA_AMD64_TARGETED_SHOOTDOWN.md)
 > §4). `read_image` was made to wait (10 of 10 clean `-j4` on ryzen), and on
 > 2026-10-08 the streaming `execve` loader removed the whole-image read
 > (`AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 8). Not shown: that the *metal's*
@@ -102,7 +102,7 @@ What this changes, and what it does not:
 |---|---|---|---|
 | HP box, **Firecracker** guest (Ubuntu personality, 4 vCPU / 6 GiB) | 2026-09-18 tree | ~10 clean builds (`-j1`×1, `-j2`×1, `-j4`×5, `-j8`×2, gen 2), 0 failures | `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §§14, 17, 19 |
 | HP box, **bare metal** (SMP=4, 16 GiB, USB root) | 2026-09-18 tree | `-j4` **rc=139 ×2** (30 and 22 crates). `-j1`: one build compiled all 95 crates then the LLD link crashed (512 MiB heap), one `rc=139` at 35 crates, then gen-2 and gen-3 **clean** after the 1 GiB-heap fix (640 s / 632 s) | `AKUMA_AMD64_BARE_METAL_SELFHOST.md` §3–§4 |
-| **ryzen**, **Firecracker** guest (4 vCPU, 4 or 6 GiB) | `0e331f5` (`even-more-cats`) | **21 of 21 pass**, `-j4`, ~1m 30s each, 10 of them with the whole `target/` wiped | [`selfhost-kernel-build-amd64.md`](selfhost-kernel-build-amd64.md) § "Second rig: ryzen" |
+| **ryzen**, **Firecracker** guest (4 vCPU, 4 or 6 GiB) | `0e331f5` (`even-more-cats`) | **21 of 21 pass**, `-j4`, ~1m 30s each, 10 of them with the whole `target/` wiped | [`selfhost-kernel-build-amd64.md`](../runbooks/selfhost-kernel-build-amd64.md) § "Second rig: ryzen" |
 
 Read the ryzen row for what it is: a guest on KVM, zero failures in 21 (95 %
 upper bound ≈ 13 % per build; ≈ 26 % for the 10 whole-graph runs alone). It made
@@ -128,7 +128,7 @@ the difference is `hda.rs` (+788, new — HDA audio), `pci.rs`, `multiboot2.rs`,
 are `2d073ca0` (2026-09-26), which **removed `yield_now`'s dropped-window
 exception** after two metal hangs of exactly this shape: `[SWITCH NO-BKL] from=4
 to=2 core=2 via=yield_now`, then silence
-([`AKUMA_AMD64_BKL_NETWORKING.md`](../archive/AKUMA_AMD64_BKL_NETWORKING.md)
+([`AKUMA_AMD64_BKL_NETWORKING.md`](AKUMA_AMD64_BKL_NETWORKING.md)
 § "2026-09-26"). The box's tree has the exception: its
 `amd64/src/sched.rs` (dated Sep 25) contains `bkl_free_by_choice` ×3 and no
 "REMOVED 2026-09-26" text, read on the box 2026-09-29. **Confirmed the hard way
@@ -160,7 +160,7 @@ compares against ryzen only after one of these:
 | check | how | why |
 |---|---|---|
 | which kernel it runs | `ssh akuma "uname -a"`; `md5sum /boot/akuma-amd64` | a result names its kernel; the file at that path is overwritten by self-builds |
-| a way back | `/boot/akuma-amd64.good` exists; GRUB entry `Akuma/amd64 (known good)` | a wedge can only be undone from the machine — `nosmp` needs a GRUB edit and Akuma cannot write ext4/vfat ([bare-metal §6.1](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md)). Someone at the box, or accept a power cycle |
+| a way back | `/boot/akuma-amd64.good` exists; GRUB entry `Akuma/amd64 (known good)` | a wedge can only be undone from the machine — `nosmp` needs a GRUB edit and Akuma cannot write ext4/vfat ([bare-metal §6.1](AKUMA_AMD64_BARE_METAL_SELFHOST.md)). Someone at the box, or accept a power cycle |
 | the console history | `ssh akuma "dmesg" > metal-pre.log` | the ring is 64 KiB and a busy box overwrites the boot in minutes; metal serial is not readable |
 | free RAM / heap | `ssh akuma "free"`; `grep -i heap` in the dmesg | the kernel heap is 1 GiB at ≥ 8 GiB usable (512 MiB below), and the 2026-09-18 LLD link crash was memory-pressure sensitive |
 | what is running on it | `ssh akuma "ps"` | herd, sshd and **kot** share the machine; a build on top of a busy box is a different experiment |
@@ -222,7 +222,7 @@ killed silently. "No `[Fault]`" is not "the kernel killed nothing".
 |---|---|---|
 | `rc=139` at 20–35 crates, `rustc` gone | the 2026-09-18 metal signature; cause **not found** on metal | get the crate name, `dmesg`, and any `#PF`/`#GP` line with `rip`/`cr2` |
 | `#PF` with an **ASCII** `cr2` (`0x00004d5f4e4f4964` = `dION_M`) | a pointer overwritten by string data | record it verbatim; same signature as the first metal build |
-| a ring-3 `#GP` with `rip` inside `ld-musl` (`rip - 0x3000_0000`, `INTERP_BASE`) | almost certainly musl mallocng's `assert` → `hlt` (privileged) — **three "mysterious" rips were all `f4`** | disassemble `lib/ld-musl-x86_64.so.1` at `rip − INTERP_BASE` **before** theorising about wild pointers ([`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) §14). Static-PIE programs load at `PIE_BASE = 0x1000_0000` |
+| a ring-3 `#GP` with `rip` inside `ld-musl` (`rip - 0x3000_0000`, `INTERP_BASE`) | almost certainly musl mallocng's `assert` → `hlt` (privileged) — **three "mysterious" rips were all `f4`** | disassemble `lib/ld-musl-x86_64.so.1` at `rip − INTERP_BASE` **before** theorising about wild pointers ([`AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) §14). Static-PIE programs load at `PIE_BASE = 0x1000_0000` |
 | `#SS` from ring 3 | was fatal to the whole kernel until 2026-09-25 (now `SIGBUS`); only KVM or metal can exercise it | `AMD64_THREE_CRASHES.md` §2 |
 | build reaches N/N then stops, `cargo` has CPU, every `rustc` at `0:00` | the untimed-`FUTEX_WAIT` leader (fixed 2026-09-18); a lost wake-up if it recurs | `sched::dump_slot_table`, `futex::dump_waiters`, `scripts/benchmarks/amd64_slot_report.py` (diff two 30 s blocks — one dump misleads) |
 | `[BKL] stuck` **storm** then `[TLB] stuck: N peer(s) unacked`, dead to ssh | shootdown never acked: a core in IRQ-masked xHCI polling with the BKL dropped | `AMD64_THREE_CRASHES.md` §1 — **the fix exists in the tree and was never verified on the metal**. This is the one to expect if the USB disk stalls |
@@ -288,9 +288,9 @@ for re-running it.
 
 ## Background
 
-* [`selfhost-kernel-build-amd64.md`](selfhost-kernel-build-amd64.md) — the HP-box Firecracker gate and the ryzen section.
+* [`selfhost-kernel-build-amd64.md`](../runbooks/selfhost-kernel-build-amd64.md) — the HP-box Firecracker gate and the ryzen section.
 * `scripts/benchmarks/amd64_metal_j4_loop.sh` — the on-box batch driver (copy to `/root/j4loop.sh`, run with `sh`, detached); `scripts/benchmarks/ryzen_fc/` — the ryzen one.
-* [`amd64-bare-metal-loop.md`](amd64-bare-metal-loop.md) — the box, its rules, "The SMP=4 `-j4` build wedge — the cheap repro".
-* [`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md) — the metal's `-j4`/LLD failures and the heap fix.
-* [`../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) — §§12–14, the wedge, the double-populate race, the `hlt` trick.
-* [`../archive/AMD64_THREE_CRASHES.md`](../archive/AMD64_THREE_CRASHES.md) — the shootdown wedge and the `#SS` fix, both unverified on metal.
+* [`amd64-bare-metal-loop.md`](../runbooks/amd64-bare-metal-loop.md) — the box, its rules, "The SMP=4 `-j4` build wedge — the cheap repro".
+* [`../archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md`](AKUMA_AMD64_BARE_METAL_SELFHOST.md) — the metal's `-j4`/LLD failures and the heap fix.
+* [`../archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`](AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md) — §§12–14, the wedge, the double-populate race, the `hlt` trick.
+* [`../archive/AMD64_THREE_CRASHES.md`](AMD64_THREE_CRASHES.md) — the shootdown wedge and the `#SS` fix, both unverified on metal.

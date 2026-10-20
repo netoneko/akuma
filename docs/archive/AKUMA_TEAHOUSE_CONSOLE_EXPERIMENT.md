@@ -16,7 +16,7 @@ says so; update the log as steps happen and date any correction.
 The 09-25 loop had meow build and boot a kernel a human wrote
 ([`AKUMA_SELF_HOSTING_AMD64.md`](AKUMA_SELF_HOSTING_AMD64.md)). The next rung
 named there is **cats that submit patches, and several cats on one task**. The
-first attempt, Intel HDA audio ([`../runbooks/add-intel-hda-audio.md`](../runbooks/add-intel-hda-audio.md)),
+first attempt, Intel HDA audio ([`AKUMA_AMD64_HDA_AUDIO_BRIEF.md`](AKUMA_AMD64_HDA_AUDIO_BRIEF.md)),
 ran out of tokens and its "verified" readbacks turned out to be a phantom
 widget; a human rewrote the driver. A new hardware driver was too hard a first
 patch. This is the easier one.

@@ -442,6 +442,24 @@ When writing docs: runbooks are named after the task/symptom and end with a
 originals; add a row to the relevant triage matrix (`docs/README.md`,
 `docs/runbooks/README.md`).
 
+**A bug fix gets an `archive/` doc; `reference/` gets the rule it established.** Write the
+incident (symptom, cause, fix, how it was verified, what is still open) in a new
+`docs/archive/<NAME>.md`, then put only the *current* behaviour and invariant in the reference
+doc, with a link to the archive doc. Do not add `(fixed 2026-..)` sections, "until <date> this
+spun at N syscalls/s" narratives, or "found on the ryzen" stories to `docs/reference/` — they go
+stale and bury the invariant. A dated reference heading is fine only for a design change that
+describes how things are now (`Crate layout (2026-08-30)`), never for an incident. Then update
+`docs/archive/BUG_FIX_LIST.md` — `docs/runbooks/update-bug-fix-list.md`, and **sweep the whole
+branch, not the last commits** (the runbook has the commands).
+
+**Runbooks are procedures, not investigation logs.** A runbook that turns into a hunt log, a
+handoff prompt, or "this was fixed, the page is history" belongs in `docs/archive/` under an
+`UPPER_SNAKE` name (`THREAD_SPAWN_SEGV_INVESTIGATION.md`, not `debug-thread-spawn-segv.md`).
+Move it with `git mv`, then fix every reference — `git grep -n <old-name>` also finds `docs/runbooks/<name>.md`
+cited from Rust, C and shell comments — and drop its row from `docs/runbooks/README.md`; a symptom row in
+`docs/README.md` may stay if it points at the archive doc. Keep a runbook only while its steps still
+work on the current tree.
+
 ## Build & Run
 
 ```bash

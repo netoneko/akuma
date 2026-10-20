@@ -339,7 +339,7 @@ asks for `POLLPRI` on a connecting socket, which that branch puts in `exceptfds`
 and discarded every socket about one RTT *after* it reached `Established` with
 `SO_ERROR == 0`. Fixed; `cargo fetch` now runs 3/3 cold with zero spurious
 errors. Full write-up:
-[`docs/runbooks/cargo-cannot-reach-crates-io.md`](../../docs/runbooks/cargo-cannot-reach-crates-io.md) § 3.
+[`docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`](../../docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md) § 3.
 
 The same run also closed a second gap: a `SynSent` socket could never time out,
 because nothing set smoltcp's `timeout` and smoltcp retransmits a SYN forever.

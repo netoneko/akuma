@@ -6,7 +6,7 @@ new thread's `Process` from `THREAD_PID_MAP`, not from a table scan — plus a
 refusal gate in `Process::run`. Regress with `test_trampoline_resolves_via_thread_pid_map`
 (boot suite).
 
-**Runbook**: [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md)
+**Runbook**: [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md)
 §2h is the short, current-state version. This is the long form: the evidence,
 the readings that were wrong, and how each was disproved.
 
@@ -258,7 +258,7 @@ crash, but the arithmetic deserves confirming rather than assuming.
 
 ## Related
 
-- [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md)
+- [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md)
   — the runbook; §2h summarises this, §2b/§2e/§2g are the other fixes from the
   same hunt, §3b is where the scan was flagged and wrongly cleared.
 - [`STALE_THREAD_SLOT_KILL.md`](STALE_THREAD_SLOT_KILL.md) — the neighbouring

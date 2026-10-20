@@ -3,7 +3,7 @@
  * immediately before `clone()`?
  *
  * Deterministic probe for the 2026-08-05 self-host blocker
- * (docs/runbooks/debug-thread-spawn-segv.md). Symbolizing the rustc crash showed
+ * (docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md). Symbolizing the rustc crash showed
  * the victim dies on the FIRST thing a new thread does:
  *
  *     thread_start:

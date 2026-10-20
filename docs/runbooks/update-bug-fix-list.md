@@ -28,6 +28,51 @@ inside the file itself, and don't note which branch or commit a fix came
 from; `git blame`/`git log` already answer that and a hand-copied branch name
 just goes stale the moment the branch is deleted.
 
+## Where a fix is written down (and where it is not)
+
+The list indexes **`docs/archive/*.md`** (plus the per-binary `userspace/*/docs/`
+writeups that were already there). A fix's incident record — symptom, cause, fix,
+verification, what is still open — belongs in an archive doc. `docs/reference/` is
+current state and invariants with no history (`CLAUDE.md`, "Documentation"); it carries the
+rule the fix established, plus a link to the archive doc.
+
+So **never add a `### docs/reference/...` (or runbook, or README) subsection here.** If the
+fix you are counting is recorded only there, that is a doc bug: write the archive doc first
+(lift the symptom/cause/numbers out of the reference section and the commit message), cut
+the reference section down to the rule + a link, then count the archive doc. This is
+exactly what went wrong on 2026-10-20: four fixes (EPOLLONESHOT, nested epoll, the watchdog
+feed, `^C` and job control) had been written up as dated sections of `poll.md`, `power.md`
+and `tty.md`, were counted under those paths, and had to be moved.
+
+## Sweep the whole branch, not the latest work
+
+The easy mistake is to list the docs you just wrote and stop. A branch accumulates fixes
+over weeks, many of them with no new file — start from **every commit and every doc the
+branch touched**, against the merge base:
+
+```bash
+BASE=$(git merge-base main HEAD)
+
+# 1. every fix-shaped commit, each of which must end up in the list, in the
+#    zero-fixes narrative, or named as "no doc to cite"
+git log --no-merges --format='%h %s' $BASE..HEAD \
+  | grep -i -E 'fix|bug|spin|hang|wedge|leak|panic|crash|race|never|stale|wrong|lost|broke|deadlock'
+
+# 2. every doc the branch added or changed — NOT just docs/archive/
+git diff --name-status $BASE..HEAD -- '*.md' ':!userspace' | grep -v '^D'
+
+# 3. fix-shaped additions to docs that are NOT archive docs: each hit is either
+#    current-state wording (leave it) or incident history (move it to archive/)
+git diff $BASE..HEAD -- docs/reference docs/runbooks overlays amd64/README.md \
+  | grep '^+' | grep -i -E 'fixed 20|\(fixed|until 20[0-9]{2}|found on|root cause|spun|spins|wedged'
+```
+
+Map each commit from (1) to a bullet. A fix commit with no doc to cite is either given
+an archive doc or **named in the scan paragraph as uncounted** — never left silent.
+Also open the *whole* of each archive doc the branch touched, not its first screen: a
+later section ("Things found on the way", "Round 3", a `Resolution`) is where the extra
+bullets are; a 230-line doc once carried six uncounted fixes below its first 90 lines.
+
 ## Which docs need checking
 
 A fix does **not** have to arrive in a new file, and this is the step that gets
@@ -43,6 +88,10 @@ skipped. Three shapes all need an entry, and only the first is obvious:
    subsection under its category. This is the easiest one to miss entirely,
    because the doc *is* mentioned in the file — a grep for its name succeeds — it
    is just mentioned in the place that means "this one contributes nothing".
+
+A fourth shape is not in a doc at all: **a fix recorded only in `docs/reference/`, a
+runbook, a README or a commit message** (see "Where a fix is written down"). Give it an
+archive doc before counting it.
 
 Before writing anything, list the archive docs your work touched — added **and**
 modified — and check each against all three shapes:
@@ -199,6 +248,10 @@ EOF
   A sweep on 2026-08-30 found five docs `UNACCOUNTED` across a single branch, plus
   a `listed` doc that had silently gained a whole new `## Root cause` section.
 
+- `grep -n '^### docs/reference\|^### docs/runbooks\|^### overlays' docs/archive/BUG_FIX_LIST.md`
+  prints nothing — incident records live in `docs/archive/`.
+- Every fix-shaped commit from the sweep is accounted for (a bullet, the zero-fixes
+  paragraph, or "no doc to cite").
 - `git diff docs/archive/BUG_FIX_LIST.md` should show exactly: the new `###`
   subsection (or bullets added to an existing one), its category header's
   count bumped, the `## Statistics` numbers bumped, and the breakdown table's

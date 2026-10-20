@@ -32,7 +32,7 @@
  * the probe is wrong, not the kernel:
  *   docker run --rm --platform linux/arm64 -v "$PWD/tidflags:/tidflags:ro" alpine /tidflags
  *
- * Diagnosis: docs/runbooks/debug-thread-spawn-segv.md
+ * Diagnosis: docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md
  */
 
 #define _GNU_SOURCE

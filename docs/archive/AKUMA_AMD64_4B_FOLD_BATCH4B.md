@@ -310,7 +310,7 @@ moved: an idle console reporting *neither* readable *nor* `POLLHUP|POLLERR` (the
 hook, §1.3), `poll(stdout, POLLOUT)` ready (`FdState::Sink`), a pipe pair before
 and after a byte (real readiness with a real waker), and `select` on that pair
 returning 2 with `exceptfds` cleared — the libcurl `CURL_CSELECT_ERR` rule in
-`docs/runbooks/cargo-cannot-reach-crates-io.md`, which amd64 had implemented and
+`docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`, which amd64 had implemented and
 never tested.
 
 ### The ring-3 gates, run
@@ -439,7 +439,7 @@ prompt names as the C1 box's next structural piece.
 - `docs/reference/subsystems/syscalls/poll.md` — the readiness seam, the wait
   loop's six-field divergence between the two families, and the seven pinned
   Linux divergences.
-- `docs/runbooks/cargo-cannot-reach-crates-io.md` — `exceptfds`, and why a set
+- `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` — `exceptfds`, and why a set
   the kernel received but did not write is a bug.
 - `docs/archive/TTY_SHENANIGANS.md` round 3 — the AArch64 interactive-shell
   architecture §2.1 contrasts with.

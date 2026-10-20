@@ -227,7 +227,7 @@ ssh.
 
 > The tree that was built was the guest's own checkout at **67c2c23**, 12
 > commits behind the host at the time — so that particular self-hosted kernel
-> predates the `mprotect` fix in [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md)
+> predates the `mprotect` fix in [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md)
 > §2b. Check `.git/HEAD` in the guest before claiming a self-host build of a
 > given commit; the kernel prints the hash in `uname -a`.
 
@@ -237,7 +237,7 @@ ssh.
 
 The two crash classes below still fire during the dependency phase and still
 cost whole crate compiles — they are **not** fixed, they are only survivable by
-retrying (§5). See [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md).
+retrying (§5). See [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md).
 
 What changed at the 2026-08-04 futex key-namespace fix
 ([`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §5):
@@ -252,7 +252,7 @@ What changed at the 2026-08-04 futex key-namespace fix
 So the futex layer is doing its job. The wedged waiters that remain are musl
 `pthread_join` parked on `detach_state` (`0x3d90f5e8`/`0x3d90b5e8`) — i.e.
 **joining threads that died**, killed by the thread-spawn SIGSEGV. Diagnose from
-[`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md), not from the futex
+[`THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md), not from the futex
 table.
 
 Two traps when measuring progress here: a `Compiling`-line stall heuristic is
@@ -988,13 +988,13 @@ same tree.
 | icache stale (`dc cvau`) | icache not flushed after code write | FIXED |
 | Stale I-cache spurious SVC | spurious svc during execve | FIXED (the headline §7k.6) |
 | `cargo --version` crash (EC=0x0) | **FIXED 2026-08-06** — OpenSSL `OPENSSL_cpuid_setup` executes `SM3SS1` (FEAT_SM3) which Apple Silicon lacks; the kernel's `EC=0x0` arm didn't deliver SIGILL so the probe handler couldn't recover. Now delivers SIGILL via `try_deliver_signal` (§6). The old "traps HVF CNTP" reading was a misattribution (that would be EC=0x18) | Nightly `/usr/local/bin/cargo` now runs under HVF. (Old workaround: apk cargo + nightly rustc, or `HVF=0` — no longer needed) |
-| `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **FIXED 2026-08-06** — three sub-causes (§2e tid-clear, §2g `THREAD_STATES` races, §2h trampoline/`AS MISMATCH`), all in [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md). A recurrence is news: identify *which* class per that runbook before assuming it is the same bug |
+| `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **FIXED 2026-08-06** — three sub-causes (§2e tid-clear, §2g `THREAD_STATES` races, §2h trampoline/`AS MISMATCH`), all in [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md). A recurrence is news: identify *which* class per that runbook before assuming it is the same bug |
 | rustc ICE `decode error: Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]` (`ODHT`), or any page reading back as zeros | The kernel served a zero page where file bytes belonged | **FIXED 2026-08-15**, two root causes (prefault stub hook; inode reuse under a live mapping). Latent rather than proven gone: `[FILL-SHORT] got=Ok(0)` and `defer_leak=` must stay 0 — [`../archive/ZERO_PAGE_ICE_FIX.md`](../archive/ZERO_PAGE_ICE_FIX.md) |
 | `rust-lld` rejects an `.rlib` it just wrote — `invalid sh_name (0x5000feed)`, `Archive::children failed`, `invalid sh_type … expected SHT_STRTAB` | Bytes decode to `0xFEEDFACE…` quarantine poison: a mapped file page's frame was freed and poisoned under the mapper | **FIXED 2026-08-15** (file-page-cache refcount windows W1/W2; 6/10 red → 10/10 green). `[PMM-RESURRECT]` must never print — [`../archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md`](../archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md) |
 | Final `akuma` crate sits on `Compiling akuma v0.0.7` forever at `-j4`; waiters on `0x300c2340` with `queued_for` > 900 s, **no** `[kill]` and **no** `[Fault]` lines | Lost scheduler wakeup in `schedule_blocking` — a wake that raced the `WAITING` publication was dropped. **FIXED 2026-08-05** | Fix is in; `-j1` remains the recipe until a `-j4` run confirms it (§5.1). Diagnosis: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a |
 | `Exec format error (os error 8)` on the same `build-script-build` every attempt | 0-byte artifact from a crashed link, still "fresh" to cargo | Delete the fingerprint dir (§5.4) — not a kernel bug |
 | Build restarts lose all progress; ssh dies ~every 5 min | remote cargo killed with the ssh session | Run detached + poll (§5.2) |
-| `qemu-system-aarch64: Assertion failed: (isv), hvf.c:1883` | guest touched MMIO with an instruction HVF can't decode, after the kernel went off the rails | Symptom of the ld-musl class — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
+| `qemu-system-aarch64: Assertion failed: (isv), hvf.c:1883` | guest touched MMIO with an instruction HVF can't decode, after the kernel went off the rails | Symptom of the ld-musl class — [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md) |
 | All 4 vCPUs at 100 %, **serial log stops advancing**, sshd accepts TCP but sends no banner, heartbeat gone | Defect A — unexplained all-core wedge. Not KTG (zero `[KTG-STALE-CH]`), not OOM (PMM 89 % free) | **OPEN** — boot with `GDB=1` and take an lldb dump of all vCPUs. Log staleness is the signal; SSH timeouts alone are not (§"Status (2026-08-07)") |
 | Build dies `EXIT=139`; `[WILD-DA] pid=<cargo> FAR=0x0` at a fixed `ELR` | Defect B — a pointer in cargo's heap read back as zero (null `Rc` in `drop_glue`); heap corruption, not a cargo bug | **FIXED 2026-08-14** — `MADV_DONTNEED` was zeroing a CoW-shared frame out from under the peer: [`../archive/MADV_DONTNEED_SHARED_FRAME.md`](../archive/MADV_DONTNEED_SHARED_FRAME.md). If it recurs, first run `madvshared` (expect `ALL PASS`), then decode `ELR` against `seg_va=0x10000000 filesz=0x1da1c6c` |
 

@@ -2697,7 +2697,7 @@ fn overwrite_of_a_double_indirect_file_survives_eviction() {
 
 // ============================================================================
 // The trashcan's 2026-10-05 stale-block corruption (handoff:
-// docs/runbooks/debug-ext2-corruption.md)
+// docs/archive/AMD64_EXT2_CORRUPTION_HANDOFF.md)
 // ============================================================================
 
 /// Device wrapper that yields inside `read_bytes`, widening the `with_block`

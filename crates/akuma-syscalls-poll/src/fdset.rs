@@ -10,7 +10,7 @@
 //! kernel does not write comes back exactly as the caller passed it in.
 //!
 //! That last one is not hypothetical. It is the whole of
-//! `docs/runbooks/cargo-cannot-reach-crates-io.md`: `exceptfds` was received
+//! `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`: `exceptfds` was received
 //! and never written, so every fd the caller put in it came back still flagged,
 //! libcurl synthesised `POLLPRI` from that, mapped it to `CURL_CSELECT_ERR`,
 //! and abandoned a socket that had just reached `Established` with

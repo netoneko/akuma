@@ -186,7 +186,7 @@ Also check for a fault in a freshly cloned thread:
 ```
 
 That is a separate **open** bug (thread-spawn), not a lost wakeup — it has its
-own runbook now: [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md).
+own runbook now: [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md).
 
 This was for a while the *only* remaining shape in the `-j4` self-host wedge. One
 retry run produced **zero `[FUTEX-ORPHAN]` lines**: every stuck waiter was

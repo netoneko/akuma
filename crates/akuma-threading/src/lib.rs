@@ -592,7 +592,7 @@ static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
 /// activate`/`deactivate` (via [`note_current_expected_l0`]) when a thread
 /// installs tables itself. The ASID half of TTBR0 is deliberately masked out —
 /// a cloned thread legitimately runs under the parent's L0 with a different
-/// ASID (see debug-thread-spawn-segv.md §2f "Read the flag carefully").
+/// ASID (see THREAD_SPAWN_SEGV_INVESTIGATION.md §2f "Read the flag carefully").
 ///
 /// Consumed by the context-switch tripwires in `sgi_scheduler_handler_with_sp`:
 /// they catch a thread being switched out under (or resumed into) page tables
@@ -5594,7 +5594,7 @@ impl ThreadWaker {
             // READY onto an INITIALIZING (context half-written) or TERMINATED slot.
             // A peer scheduler picking that slot restores the PREVIOUS occupant's
             // context: its ttbr0 (a third party's page tables — the §2f
-            // "AS MISMATCH" in debug-thread-spawn-segv.md) and its kernel stack,
+            // "AS MISMATCH" in THREAD_SPAWN_SEGV_INVESTIGATION.md) and its kernel stack,
             // possibly still in use (double-run — the [BKL] stuck storm shape).
             //
             // WAKE_TIMES is deliberately NOT cleared here: the same stale-waker
@@ -6434,7 +6434,7 @@ where
 /// birth adds one more `base` to the same physical word, which is precisely the
 /// `N × INTERP_BASE + 0x6c964` instruction-abort class (fingerprint: constant
 /// `SP_EL0`, `x19 = x20 = x29 = x30 = 0`, one shared frame PA, `N` monotone per
-/// boot) — see `docs/runbooks/debug-thread-spawn-segv.md`, class 2.
+/// boot) — see `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`, class 2.
 ///
 /// Split out of `spawn_user_thread_fn_internal` only so the reset is reachable
 /// from a host test; `#[inline]` keeps the spawn path's codegen as it was.
@@ -6883,7 +6883,7 @@ pub fn no_trap_frame_child_count() -> u64 {
 /// the parent already relocated. Each such birth adds one more `base` to the same
 /// physical word and then branches through it: the `N × INTERP_BASE + 0x6c964`
 /// instruction-abort class, `N` climbing by one per event for the whole boot
-/// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). Returning `None` fails
+/// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`, class 2). Returning `None` fails
 /// the syscall instead, which is loud, local, and recoverable.
 #[cfg(target_arch = "aarch64")]
 pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
@@ -7568,7 +7568,7 @@ mod park_wake_race_tests {
 }
 
 /// Regression tests for the stale-wake / cross-kill state-transition races
-/// (debug-thread-spawn-segv.md §2f). The corruption they pin down: a wake or a
+/// (THREAD_SPAWN_SEGV_INVESTIGATION.md §2f). The corruption they pin down: a wake or a
 /// spawn publish landing as a plain READY *store* could overwrite INITIALIZING
 /// (a clone child whose context is half-written — a peer then runs the slot's
 /// previous occupant's ttbr0 and kernel stack: the `AS MISMATCH` / `[BKL] stuck`
@@ -7638,7 +7638,7 @@ mod state_transition_guard_tests {
     /// even its own, still-current `user_entry` / `user_sp`.
     ///
     /// This is the `N × INTERP_BASE + 0x6c964` instruction-abort class in miniature
-    /// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). The published triple
+    /// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`, class 2). The published triple
     /// records where the *image was first entered*, which for a dynamically linked
     /// process is ld-musl's `_dlstart` — a perfectly valid-looking address that is
     /// nonetheless never a correct fork return. A child launched there re-runs

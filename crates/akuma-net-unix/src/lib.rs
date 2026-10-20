@@ -682,7 +682,7 @@ impl UnixSock {
     /// genuinely *new* readiness predicate AF_UNIX adds, and it must report
     /// identically through `poll`, `select` and `epoll` — the AF_INET side of
     /// that contract is what the `_exceptfds_ptr` bug violated
-    /// (`docs/runbooks/cargo-cannot-reach-crates-io.md` §3).
+    /// (`docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` §3).
     #[must_use]
     pub fn accept_ready(&self) -> bool {
         self.state == SockState::Listening && !self.backlog.is_empty()

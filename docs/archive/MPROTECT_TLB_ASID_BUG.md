@@ -1,7 +1,7 @@
 # `mprotect` could not downgrade a cached translation — wrong TLBI ASID scope
 
 **Status: FIXED 2026-08-05.** Found while chasing the `-j4` self-host
-thread-spawn SIGSEGV (`docs/runbooks/debug-thread-spawn-segv.md` §2b carries
+thread-spawn SIGSEGV (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` §2b carries
 the maintained summary; this doc is the archived record). Not shown to be the
 cause of that SIGSEGV — it is a real, independent defect found en route.
 
@@ -47,7 +47,7 @@ after, 3 PASS on real Linux aarch64** (calibrated).
 
 ## Background
 
-- `docs/runbooks/debug-thread-spawn-segv.md` §2b — maintained summary, part
+- `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` §2b — maintained summary, part
   of the wider thread-spawn-SIGSEGV investigation this was found during.
 - [`../reference/subsystems/thread-lifecycle.md`](../reference/subsystems/thread-lifecycle.md)
   §5.3b — current-state pointer from the thread-lifecycle reference doc.

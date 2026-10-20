@@ -3,7 +3,7 @@
  * own clone argument?
  *
  * Written for the thread-spawn SIGSEGV class in
- * docs/runbooks/debug-thread-spawn-segv.md, and specifically to separate its
+ * docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md, and specifically to separate its
  * three live theories (§3c) from userspace, without a 30-minute rustc build:
  *
  *   T1 cross-address-space aliasing — the pointer is right, the address space

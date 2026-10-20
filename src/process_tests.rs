@@ -15009,7 +15009,7 @@ fn test_entry_point_trampoline_no_zombie_match() {
 /// dynamically linked that entry point is ld-musl's `_dlstart`, and the thread
 /// re-runs musl's RELR `*slot += base` loop over an already-relocated interpreter
 /// page — the `N × INTERP_BASE + 0x6c964` class
-/// (`docs/runbooks/debug-thread-spawn-segv.md` §2h).
+/// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` §2h).
 ///
 /// Two-sided by construction: the test asserts the raw scan *does* pick the stale
 /// process, so it is a genuine trap and not a vacuous setup.
@@ -15337,7 +15337,7 @@ fn test_on_cpu_gate_lifecycle() {
 }
 
 /// Regression test for the stale-wake / cross-kill state-transition races
-/// (debug-thread-spawn-segv.md §2f, the `AS MISMATCH` + `[BKL] stuck` family).
+/// (THREAD_SPAWN_SEGV_INVESTIGATION.md §2f, the `AS MISMATCH` + `[BKL] stuck` family).
 /// A wake must only ever transition WAITING -> READY, and the spawn publish
 /// (`mark_thread_ready`) must never overwrite TERMINATED: either overwrite
 /// hands a peer scheduler a slot whose saved context belongs to a previous

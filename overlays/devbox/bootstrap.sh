@@ -412,7 +412,7 @@ fi
 #    `retry = 20` is the load-bearing one. Even when the index is reachable,
 #    `static.crates.io` *download* connections fail often enough on this stack
 #    that cargo's default budget of 3 aborts a large fetch part-way
-#    (docs/runbooks/debug-thread-spawn-segv.md).
+#    (docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md).
 #
 #    `multiplexing = false` is retained because it is harmless and is the
 #    historical recommendation — but be clear about what it does NOT do: it does
@@ -422,7 +422,7 @@ fi
 #    vendored libcurl issuing non-blocking connects that never complete on the
 #    smoltcp kernel, and no cargo config reaches it. Use apk `/usr/bin/cargo` to
 #    fill the registry cache, then build `--offline`
-#    (docs/runbooks/cargo-cannot-reach-crates-io.md).
+#    (docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md).
 #
 #    Deliberately NOT set here: `[net] offline`. Pinning the mode in the image
 #    would make a first fetch impossible and turn a network problem into a
@@ -441,7 +441,7 @@ docker run --rm --privileged \
         cat > /mnt/disk/root/.cargo/config.toml <<CARGOCFG
 # Shipped by overlays/devbox/bootstrap.sh step 7c, with the Rust toolchain.
 # Rationale and the failure this does NOT fix:
-#   docs/runbooks/cargo-cannot-reach-crates-io.md
+#   docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md
 [net]
 retry = 20
 

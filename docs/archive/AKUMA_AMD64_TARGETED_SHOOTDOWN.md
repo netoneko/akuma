@@ -103,7 +103,7 @@ cost has not been measured here, so measure it before building anything.
 
 Two targeted runs (4021, 6051) died ~20 s in with `lld-wrapper: could not exec
 rust-lld: I/O error (os error 5)` while linking a host unit. No `[Fault]`, no
-`[TLB] stuck`. The runbook `amd64-j4-build-crash-hunt.md` records the same
+`[TLB] stuck`. The runbook `AMD64_J4_BUILD_CRASH_HUNT.md` records the same
 signature on the metal (3 of 10) and tied it to USB stalls; here it is virtio-blk.
 
 `FsError::Internal` and `FsError::IoError` both map to `EIO`, so the errno could
@@ -177,7 +177,7 @@ window (`fault_bkl_drop_enabled` exists in `akuma-bkl::policy`, unwired on amd64
 
 ## 6b. On the metal (trashcan, 2026-10-02)
 
-Same loop as `amd64-j4-build-crash-hunt.md` §1a (`amd64_metal_j4_loop.sh`, whole
+Same loop as `AMD64_J4_BUILD_CRASH_HUNT.md` §1a (`amd64_metal_j4_loop.sh`, whole
 `/root/ktarget` wiped per run, `kbuild -c -j 4`, SMP=4, 16 GiB, USB root), `kot`
 switched off by the owner. Both kernels built on the Mac, **plain** config (no
 `no-tests`, so both run the boot suite — a boot-time difference only), installed
@@ -209,7 +209,7 @@ the sample cannot size. The kernel left installed is the `no-tests` build
 * The structural fix is not to hold the whole image: `execve` could map the ELF
   from the file (as the AArch64 loader does) and the wait would go. The wait
   bounds the failure; it does not remove the 158 MB-per-exec heap demand.
-* The metal's `execve` `EIO` (`amd64-j4-build-crash-hunt.md` §1a) should be
+* The metal's `execve` `EIO` (`AMD64_J4_BUILD_CRASH_HUNT.md` §1a) should be
   re-run with the console line before its USB explanation is trusted.
 * The remaining `tag=11` line in 0-2 runs: who still holds the BKL long in
   `munmap`.

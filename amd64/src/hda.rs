@@ -22,7 +22,7 @@
 //! at `SD+0x10` (`SDnFIFOS`, read-only; `SDnLVI` is `+0x0C`), converted 24-bit
 //! audio that `wavplay` had already converted to 16, and accepted any
 //! rate/format/channel ioctl without remembering it. Every readback it used to
-//! declare success read a phantom. See `docs/runbooks/add-intel-hda-audio.md`.
+//! declare success read a phantom. See `docs/archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`.
 
 use crate::serial;
 use akuma_hda::codec::{self, Kind, PinRole, VerbBus, VerbList};

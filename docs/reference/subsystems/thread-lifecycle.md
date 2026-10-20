@@ -322,7 +322,7 @@ altstack on a newborn thread — not the cause).
 
 Procedure, including how to symbolize the guest PC against
 `librustc_driver`'s `.symtab`:
-[`../../runbooks/debug-thread-spawn-segv.md`](../../runbooks/debug-thread-spawn-segv.md).
+[`../../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`](../../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md).
 
 ### 5.3 Alloc-under-lock sites that route to the hijack leaves
 

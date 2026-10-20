@@ -74,7 +74,7 @@ lock, and `__tl_lock`'s `if (val == tid) { tl_lock_count++; return; }`
 recursion fast path then handed the lock to the newborn child. It unlinked
 itself from the thread list with no lock held and died writing to `0x8`. Full
 diagnosis in
-[`../../../runbooks/debug-thread-spawn-segv.md`](../../../runbooks/debug-thread-spawn-segv.md)
+[`../../../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`](../../../archive/THREAD_SPAWN_SEGV_INVESTIGATION.md)
 §2e; regression probe `userspace/forktest/c_stress/tidflags.c`.
 
 The general lesson, and the reason this sits in a stability-A doc: **writing an

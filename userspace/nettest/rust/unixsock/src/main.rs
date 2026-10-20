@@ -974,7 +974,7 @@ fn mode_peercred() -> Verdict {
 /// (`poll`/`ppoll`, `pselect6`, `epoll_pwait`). The AF_INET version of exactly
 /// this disagreement was a real bug: `poll` said `CONNECTED` and `select` said
 /// `HARDFAIL` for one socket at one instant, because `pselect6` never wrote
-/// `exceptfds` (`docs/runbooks/cargo-cannot-reach-crates-io.md` §3).
+/// `exceptfds` (`docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` §3).
 ///
 /// A listener's `EPOLLIN` is a brand-new predicate — a listening unix socket has
 /// no pipes at all — so it is the most likely place for the three paths to

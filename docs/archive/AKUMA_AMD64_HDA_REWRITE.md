@@ -178,7 +178,7 @@ ssh akuma 'wavplay /root/test3s.wav'
 * Why the swarm experiment itself failed (tooling, models, unenforced testing
   practice), with a dated timeline:
   [`AKUMA_AMD64_BARE_METAL_SELFHOST.md`](AKUMA_AMD64_BARE_METAL_SELFHOST.md) §7.
-* The swarm's record: [`../runbooks/add-intel-hda-audio.md`](../runbooks/add-intel-hda-audio.md)
+* The swarm's record: [`AKUMA_AMD64_HDA_AUDIO_BRIEF.md`](AKUMA_AMD64_HDA_AUDIO_BRIEF.md)
   (correction banner at the top).
 * Current state of the driver:
   [`../reference/subsystems/drivers/hda.md`](../reference/subsystems/drivers/hda.md).

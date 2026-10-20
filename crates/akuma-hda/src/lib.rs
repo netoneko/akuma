@@ -8,7 +8,7 @@
 //! Host tests cover the decode, because the only machine with the controller
 //! is the one the driver boots on, and a reboot is an expensive unit test.
 //!
-//! M1 scope (runbook `add-intel-hda-audio.md`, bring-up step 1): GCAP and the
+//! M1 scope (runbook `AKUMA_AMD64_HDA_AUDIO_BRIEF.md`, bring-up step 1): GCAP and the
 //! version registers, nothing else. Reset (CRST), codecs and streams join in
 //! later steps, each behind the same `Regs16` seam.
 

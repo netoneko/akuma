@@ -1958,7 +1958,7 @@ pub fn sys_ppoll(fds: u64, nfds: u64, timeout: u64, sigmask: u64) -> u64 {
 ///   this one. It is load-bearing: a set the kernel *received* but did not write
 ///   comes back exactly as the caller passed it, and cargo's vendored libcurl
 ///   compiles the `select()` branch of `Curl_poll()` and reads `POLLPRI` out of
-///   the stale set — `docs/runbooks/cargo-cannot-reach-crates-io.md`. Both
+///   the stale set — `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`. Both
 ///   implementations had the rule; only one of them has the regression test.
 /// - **`nfds == 0` returns 0 immediately** instead of sleeping out the timeout.
 ///   Glue's divergence, unchanged by the fold, and the opposite of `ppoll`'s
@@ -3210,7 +3210,7 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             // return value counts *bits left set*, so a pair ready in one
             // direction each is 2. `exceptfds` must come back all-zero — the
             // libcurl `CURL_CSELECT_ERR` rule in
-            // `docs/runbooks/cargo-cannot-reach-crates-io.md`, and the reason
+            // `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`, and the reason
             // this arm receives a set it can never populate.
             let mut rset = [0u64; 1];
             let mut wset = [0u64; 1];

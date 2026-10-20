@@ -236,7 +236,7 @@ root manifests were `rsync`ed into `selfhost.img` (the image's `Cargo.lock` and
 `[TRAMP-MISMATCH]` — all as before. With the 21 above that is 31 of 31 on this
 rig (95 % upper bound ≈ 9 %). The matching bare-metal batch, and why it is *not*
 a parity result, is in
-[`amd64-j4-build-crash-hunt.md`](amd64-j4-build-crash-hunt.md) § 1a.
+[`AMD64_J4_BUILD_CRASH_HUNT.md`](../archive/AMD64_J4_BUILD_CRASH_HUNT.md) § 1a.
 
 Traps this rig cost a run each:
 
@@ -268,7 +268,7 @@ Traps this rig cost a run each:
   numbers transfer: the metal built at `-j1` because `-j4` SIGSEGVed there
   (**2026-09-30: no longer the case** — `-j4` completed 7 of 10 runs,
   slower than `-j1`, three lost to an `execve` `EIO`; see
-  [`amd64-j4-build-crash-hunt.md`](amd64-j4-build-crash-hunt.md) § 1a;
+  [`AMD64_J4_BUILD_CRASH_HUNT.md`](../archive/AMD64_J4_BUILD_CRASH_HUNT.md) § 1a;
   this guest has been green at `-j4` since §14), the link needs
   `--threads=1` that this guest has never needed, and installing a kernel is a
   `cp` onto Akuma's own ext2 root rather than anything image-shaped.

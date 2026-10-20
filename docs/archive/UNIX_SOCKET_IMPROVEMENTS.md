@@ -780,13 +780,13 @@ Per phase, in this order — the cheap gate first:
 - `docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md` — the four AF_INET readiness
   defects; the shutdown/readiness matrix in §5 is written against that lesson.
 - `docs/archive/CARGO_CRATES_IO_CONNECT_FAIL.md` and
-  `docs/runbooks/cargo-cannot-reach-crates-io.md` §3 — the `_exceptfds_ptr` bug
+  `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` §3 — the `_exceptfds_ptr` bug
   the four-way `--wait` bisect found, which is why §6's `poll` mode has four.
 - `userspace/nettest/README.md` — the probe index §6 adds a fifth row to, and
   the source of the Linux control-arm method (§ "The Linux control arm" under
   Part 3). Note it cites `docs/archive/LINUX_AB_PROBE.md`, which does **not**
   exist in the tree — a dangling reference it shares with
-  `docs/runbooks/cargo-cannot-reach-crates-io.md:286` and
+  `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md:286` and
   `rust/connect/src/main.rs:99`. The method is described in the README section
   itself; do not go looking for that file.
 - `docs/archive/RUST_TOOLCHAIN.md` §4d — why `socketpair` exists at all.

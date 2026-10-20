@@ -3,7 +3,7 @@
  * the dynamic loader gets each child to `main`.
  *
  * Targets the second crash class in the -j4 self-host logs
- * (docs/runbooks/debug-thread-spawn-segv.md §3): freshly-exec'd processes taking
+ * (docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md §3): freshly-exec'd processes taking
  * an instruction abort at `ld-musl+0x6c964` — a function prologue reached from
  * `_dlstart_c` calling `__dls2` — with the PC gaining exactly `INTERP_BASE`
  * (0x30000000) per occurrence. That is ld-musl's own `R_AARCH64_RELATIVE`

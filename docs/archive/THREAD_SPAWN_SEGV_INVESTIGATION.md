@@ -36,7 +36,7 @@ group:
 
 It is *not* a futex bug and not a lost wakeup — if you arrived here from a
 process parked forever in `futex`, read
-[`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4 first: the parked
+[`debug-futex-lost-wakeup.md`](../runbooks/debug-futex-lost-wakeup.md) §4 first: the parked
 `pthread_join` is the *survivor*, this fault is the cause.
 
 ## 0. Confirm it is this bug and not a lost wakeup
@@ -94,7 +94,7 @@ Find the load base in the log — the `[IA-DP] file region` lines print it:
 `seg_va` is the load base; `filesz` (0xcd6c000) matches the `.so`'s total memsz,
 which is how you confirm you have the right object. Then, against a **clone** of
 the disk (never the image a live VM has open — see
-[`recover-wedged-vm.md`](recover-wedged-vm.md)):
+[`recover-wedged-vm.md`](../runbooks/recover-wedged-vm.md)):
 
 ```bash
 docker run --rm --privileged -v "$PWD/orphan.img:/disk.img:ro" alpine sh -c '
@@ -336,7 +336,7 @@ raw `flags` word and gates all three writes on their actual flags. Go's
 one load per check, no stress loop — because the stress repro (`spawnalias`)
 reproduces this only about one run in three, which is nowhere near enough to A/B
 a fix on (the trap described in
-[`../archive/`](../archive/) and in §3a). Calibrated on real Linux.
+[`../archive/`]() and in §3a). Calibrated on real Linux.
 
 | | Linux | Akuma before | Akuma after |
 |---|---|---|---|
@@ -863,7 +863,7 @@ With this class fixed, a `-j4` self-host build runs crash-free (no `SIGSEGV`, no
 arm shows the *same* wait, starting at the *same* point, so it predates this fix
 and is independent of it — it was simply invisible behind the crashes.
 
-That is the lost-wakeup class: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md).
+That is the lost-wakeup class: [`debug-futex-lost-wakeup.md`](../runbooks/debug-futex-lost-wakeup.md).
 The claim in this runbook that fixing the `N × INTERP_BASE` class was "the
 remaining blocker for a green `-j4`" was optimistic; there is another one behind
 it.
@@ -874,7 +874,7 @@ terminating every recorded sibling tid unconditionally (69 % of those kills had 
 pending kill request at all, and some landed on slots already recycled to unrelated
 processes). The parked waiter was a *parent* blocked on a process that could never
 run. Root-caused, fixed and A/B-verified:
-[`../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md`](../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md).
+[`../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md`](GRACE_EXPIRED_HARD_KILL_ORPHANS.md).
 
 With that fixed the build reaches 58+ crates and then dies of **this** runbook's own
 class — `[Fault] Process 778 (/usr/local/bin/cargo) SIGSEGV after 4.54s` /
@@ -1127,7 +1127,7 @@ cargo build -p akuma --profile release-smp-shared --features devbox-smoltcp,no-t
 ```
 
 `scripts/`-side driver: the retry loop pattern in
-[`selfhost-kernel-build.md`](selfhost-kernel-build.md) — and note that a
+[`selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md) — and note that a
 `Compiling`-line stall heuristic is **not** a liveness signal
 (`debug-futex-lost-wakeup.md` §0).
 
@@ -1151,7 +1151,7 @@ None of them are about the bug; all of them are about the harness.
   tested and **does not work**, and HTTP/2 multiplexing is not the cause — a probe
   forcing exactly that pattern succeeds 30/30. Do not spend time on it.
   Full state of the diagnosis, including what is still unexplained, in
-  [`cargo-cannot-reach-crates-io.md`](cargo-cannot-reach-crates-io.md).
+  [`CARGO_CANNOT_REACH_CRATES_IO.md`](CARGO_CANNOT_REACH_CRATES_IO.md).
 - **`--offline` can fail with sources fully cached.** `no matching package named
   arm_pl031 found` while `~/.cargo/registry/{cache,src}` both hold it and
   `~/.cargo/git/db` holds the `embedded-tls` checkout: what is stale is the
@@ -1208,24 +1208,24 @@ Regression probes for the neighbourhood (all should stay green):
 
 ## Background
 
-- [`../archive/TRAMPOLINE_STALE_PROCESS_RELR.md`](../archive/TRAMPOLINE_STALE_PROCESS_RELR.md)
+- [`../archive/TRAMPOLINE_STALE_PROCESS_RELR.md`](TRAMPOLINE_STALE_PROCESS_RELR.md)
   — the full 2026-08-06 record behind §2h: the `[TRAMP-MISMATCH]` and
   `ttbr0_live`/`ttbr0_proc` evidence, the A/B table, the three readings that
   were wrong (including the `as_owner` silent fallback that cost a session),
   and why `AS MISMATCH` turned out to be the same bug.
-- [`../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`](../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md)
+- [`../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`](CLONE_TIDFLAGS_THREAD_LIST_LOCK.md)
   — the full 2026-08-06 investigation record behind §2e and §2f: disassembly,
   mechanism, before/after probe tables, the two instrumentation flags that had
   to be corrected, and the methodology lessons.
-- [`../archive/THREAD_STATES_RACES_TID_GENERATIONS.md`](../archive/THREAD_STATES_RACES_TID_GENERATIONS.md)
+- [`../archive/THREAD_STATES_RACES_TID_GENERATIONS.md`](THREAD_STATES_RACES_TID_GENERATIONS.md)
   — the full record behind §2g: the check-then-store race family, the tid
   generation / `WakeHandle` design, the boot-probe A/B tables, and why the
   `[SGI-S STACK]` noise had to be gated.
-- [`../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../archive/SELFHOST_DEVBOX_SMOLTCP.md)
+- [`../archive/SELFHOST_DEVBOX_SMOLTCP.md`](SELFHOST_DEVBOX_SMOLTCP.md)
   — "Open issue: thread-spawn SIGABRT under real `-j4` parallelism", "The crash
   has a fixed address (2026-08-04)", and the ASID free/flush ordering fix that
   was *not* the cure.
 - [`../reference/subsystems/thread-lifecycle.md`](../reference/subsystems/thread-lifecycle.md)
   — the spawn/teardown state machines and their locks.
-- [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) — the symptom this
+- [`debug-futex-lost-wakeup.md`](../runbooks/debug-futex-lost-wakeup.md) — the symptom this
   bug wears in `[THR-DUMP]`.

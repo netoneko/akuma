@@ -217,7 +217,7 @@ this class and neither attributed:
   ```
 
   That is the separately-tracked thread-spawn class —
-  [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md),
+  [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md),
   which `debug-futex-lost-wakeup.md` §4 already names as its own open bug.
 
 So the honest summary is: this fix removes one whole failure mode (processes stranded

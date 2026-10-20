@@ -1036,7 +1036,7 @@ fn syscall_stub_elr_in_diag_window(elr: u64) -> bool {
 }
 
 /// Forensics for the `N × INTERP_BASE + offset` instruction-abort class
-/// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2).
+/// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`, class 2).
 ///
 /// The branch target is read from a slot in the interpreter's writable data that
 /// musl's **RELR** apply loop mutates with `*slot += base`. A slot that already
@@ -1127,7 +1127,7 @@ fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
 
 /// Render an 8-byte little-endian word as the ASCII it may be hiding.
 ///
-/// `docs/runbooks/debug-thread-spawn-segv.md`: a `FAR` that decodes to printable
+/// `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`: a `FAR` that decodes to printable
 /// text (`"libder-8"`, `"+outline"`, an ANSI SGR escape) is not a wild pointer —
 /// it is a freed block that has been reused as string heap, and the string names
 /// the allocator neighbour that took it. Two sessions have re-derived this by
@@ -1146,7 +1146,7 @@ fn word_as_ascii(word: u64, out: &mut [u8; 8]) -> bool {
 }
 
 /// Diagnostics for the thread-spawn SIGSEGV class
-/// (`docs/runbooks/debug-thread-spawn-segv.md`).
+/// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`).
 ///
 /// Printed on every fatal EL0 data abort, because the class is rare, unpredictable
 /// and expensive to reproduce — one repro must answer the question, not motivate
@@ -1175,7 +1175,7 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     // "ASID differs" is routine and must not be flagged. A differing **L0
     // base** is the real defect: the core is executing in a third party's page
     // tables, which is the cross-address-space aliasing theory (T1) in
-    // docs/runbooks/debug-thread-spawn-segv.md §3c.
+    // docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md §3c.
     const BASE: u64 = 0x0000_FFFF_FFFF_F000;
     let base_differs = ttbr0_proc != 0 && (ttbr0_live & BASE) != (ttbr0_proc & BASE);
     let asid_differs = ttbr0_proc != 0 && (ttbr0_live >> 48) != (ttbr0_proc >> 48);

@@ -1,10 +1,10 @@
 # The kernel wrote a live TID into musl's thread-list lock (2026-08-06)
 
 Investigation record for the crash class tracked in
-[`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md)
+[`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md)
 and prompted by the thread-spawn SIGSEGV hunt, whose proposal has since been
 deleted — the surviving writeup is
-[`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md).
+[`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md).
 Archived verbatim; the runbook §2e carries the maintained summary.
 
 ## Symptom
@@ -242,7 +242,7 @@ arrived:
 
 ## Background
 
-- [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md)
+- [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md)
   §2e (this fix), §2f (what survives it), §3c (theory ranking, kept for history).
 - [`../reference/subsystems/syscalls/proc.md`](../reference/subsystems/syscalls/proc.md)
   — "The three tid flags are not interchangeable".

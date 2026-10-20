@@ -26,7 +26,7 @@ warning: spurious network error (3 tries remaining): [7] Could not connect to se
 …while `curl` from the same shell gets `200` from the same host in ~300 ms.
 
 **Read this first: there is no cargo config that fixes this.** An older note
-(`debug-thread-spawn-segv.md`) blamed libcurl HTTP/2 multiplexing and
+(`THREAD_SPAWN_SEGV_INVESTIGATION.md`) blamed libcurl HTTP/2 multiplexing and
 recommended `[http] multiplexing = false`. That diagnosis was **disproven by
 experiment** on 2026-08-11 — the flag does not change the failure
 (`../archive/CARGO_CRATES_IO_CONNECT_FAIL.md`). The config below is still worth
@@ -43,7 +43,7 @@ cargo --version
 | Result | Meaning |
 |---|---|
 | `/usr/local/bin/cargo` (nightly) | The one that used to fail. Its libcurl calls `select(2)`; everything else in the guest calls `poll(2)`. Go to step 2. |
-| `/usr/bin/cargo` (apk, 1.96.x) | Never affected — its libcurl uses `poll(2)`. If it fails, the network really is down; go to [`debug-network.md`](debug-network.md). |
+| `/usr/bin/cargo` (apk, 1.96.x) | Never affected — its libcurl uses `poll(2)`. If it fails, the network really is down; go to [`debug-network.md`](../runbooks/debug-network.md). |
 
 Since 2026-08-19 the devbox puts nightly first on `PATH`, so a bare `cargo` is
 the `select(2)` one by default. That is fine on a kernel built after
@@ -428,17 +428,17 @@ nettest-connect one 10.255.255.1 443 --timeout-ms 30000   # ends ~10 s, so_error
 - [`../reference/subsystems/networking.md`](../reference/subsystems/networking.md)
   § `connect(2)` semantics — `CONNECT_TIMEOUT_US`, and why smoltcp's own
   `set_timeout()` is the wrong tool for it.
-- [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §9, §12 —
+- [`../archive/AKUMA_NET_ISSUES.md`](AKUMA_NET_ISSUES.md) §9, §12 —
   the two lost-wake fixes on `benchmarks-improved-networking`. Re-testing on
   that kernel was the first thing tried here; it did **not** fix this, which is
   what produced the current reproducer to instrument.
-- [`../archive/CARGO_CRATES_IO_CONNECT_FAIL.md`](../archive/CARGO_CRATES_IO_CONNECT_FAIL.md)
+- [`../archive/CARGO_CRATES_IO_CONNECT_FAIL.md`](CARGO_CRATES_IO_CONNECT_FAIL.md)
   — the 2026-08-11 investigation, kept verbatim with a corrected header. Its
   "root cause isolated" claim and its "connects never complete" reading are both
   wrong; step 2 above says how.
-- [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) §"cargo cannot
+- [`THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md) §"cargo cannot
   reach crates.io" — the earlier, **superseded** multiplexing diagnosis.
-- [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) — `CARGO_NET_RETRY=20`,
+- [`../archive/DEVBOX_ISSUES.md`](DEVBOX_ISSUES.md) — `CARGO_NET_RETRY=20`,
   `CARGO_HTTP_MULTIPLEXING=false` and `CARGO_HTTP_TIMEOUT=120` all tried and all
   ineffective for this symptom.
-- [`debug-network.md`](debug-network.md) — for when the network genuinely is down.
+- [`debug-network.md`](../runbooks/debug-network.md) — for when the network genuinely is down.

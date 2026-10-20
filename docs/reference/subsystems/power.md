@@ -58,22 +58,17 @@ Two invariants, both stated where they are enforced (`amd64/src/lapic.rs`):
 phases and the QEMU smoke evidence are in
 [`../../../proposals/RYZEN_POWERSAVE_DEMON.md`](../../../proposals/RYZEN_POWERSAVE_DEMON.md).
 
-## Why an idle box could reset itself (fixed 2026-10-16)
+## Watchdog feeding
 
-Found auditing `powersaved` after reports that a box left alone went dark and
-then shut down. The daemon was not the cause. With `idlesleep` the BSP's tick
-count is credited in jumps (`lapic::credit_shot_fired`,
-`settle_idle_shot`), and `watchdog::pet` fed the FCH watchdog only when
-`tick % 100 == 0` — so a steady wake pattern (anything that wakes the BSP every
-N ticks, `powersaved`'s own 1 s sleep included) could step over every multiple
-of 100 and never reload it. 60 s later (`wdt` default) the chipset reset the
-machine. `pet` now decides by which one-second *bucket* the count is in
-(`watchdog::pet_due`); a replay of seven wake patterns went from a 600 s gap
-(five of them) to ~1 s in all. Two smaller dark-to-light gaps were closed at
-the same time: a finger on the touchpad now counts as activity (`idle_ms=`
-only saw the keyboard), and `powersaved` re-syncs its cached brightness from
-the `dim=` in the `/proc/power` it already reads each second, so a dim changed
-by anything else no longer leaves the restore unwritten.
+With `idlesleep` the BSP's tick count is credited in jumps (`lapic::credit_shot_fired`,
+`settle_idle_shot`), so the watchdog must not be fed on an exact tick multiple.
+`watchdog::pet` reloads the FCH watchdog when the count enters a new one-second *bucket*
+(`watchdog::pet_due`); a gate such as `tick % 100 == 0` can be stepped over by any steady wake
+pattern, and 60 s later (`wdt` default) the chipset resets a healthy idle machine. Anything that
+counts as user activity must call `input::note_input` (the keyboard and the touchpad do), and
+`powersaved` re-syncs its cached brightness from the `dim=` in the `/proc/power` it reads each
+lap. The incident that set these rules:
+[`archive/WATCHDOG_FEED_BUCKET.md`](../../archive/WATCHDOG_FEED_BUCKET.md).
 
 ## The power-saving daemon (`powersaved`)
 

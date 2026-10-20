@@ -1695,6 +1695,6 @@ from scratch next time `-j4` log evidence needs cross-core attribution.
   family these all belong to.
 - [`SELFHOST_DEVBOX_SMOLTCP.md`](SELFHOST_DEVBOX_SMOLTCP.md) — the `-j4` self-host
   effort overall.
-- [`runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md),
+- [`archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`](THREAD_SPAWN_SEGV_INVESTIGATION.md),
   [`runbooks/debug-futex-lost-wakeup.md`](../runbooks/debug-futex-lost-wakeup.md) —
   the runbooks this session did **not** need; neither failure here is a futex stall.

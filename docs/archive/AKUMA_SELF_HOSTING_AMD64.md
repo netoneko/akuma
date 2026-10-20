@@ -2428,7 +2428,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   human wrote. The next rung is the metal cat writing the change
    │   itself and committing it. The box gets git access for that later.
    │   The first patch is still **Intel HDA audio**
-   │   (`runbooks/add-intel-hda-audio.md`): a new subsystem, on hardware
+   │   (`archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`): a new subsystem, on hardware
    │   only this box has, whose success a human can judge from across
    │   the room.
    │
@@ -2473,7 +2473,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    ▼
  [09-25 → 09-29] ═══ THE SWARM TAKES THE AUDIO DRIVER ═══ AND FAILS
    │
-   │   The task: an Intel HDA driver (`runbooks/add-intel-hda-audio.md`),
+   │   The task: an Intel HDA driver (`archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`),
    │   written by the cats on the trashcan itself — meow on the metal,
    │   tama on ryzen, GLM `glm-5.3-flash` at low reasoning — with the
    │   build → install → reboot loop above as the whole experiment. About

@@ -539,7 +539,7 @@ fn epoll_check_fd_readiness_at(fd_num: u32, requested: u32, waker: Option<&Waker
     let Some(fd_entry) = fd_entry else {
         // A poll on an fd the calling process cannot see. Rare and always worth
         // knowing about: it is indistinguishable, to the caller, from a socket
-        // that died — see `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
+        // that died — see `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` § 3.4.
         if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::tprint!(96, "[pollmiss] fd={} -> EPOLLHUP|EPOLLERR (no fd entry)\n", fd_num);
         }
@@ -1191,7 +1191,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 /// it in.
 ///
 /// That is not theoretical. It is the whole of
-/// `docs/runbooks/cargo-cannot-reach-crates-io.md`: `curl-sys`' vendored libcurl
+/// `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`: `curl-sys`' vendored libcurl
 /// — the one the nightly Rust toolchain's cargo links — defines `HAVE_POLL_H`
 /// and `HAVE_POLL_FINE` but **not** plain `HAVE_POLL`, so `Curl_poll()` compiles
 /// its `select()` branch. `Curl_socket_check()` asks for
@@ -1401,7 +1401,7 @@ pub fn pselect6_timeout_us(
 /// in it still flagged. Akuma has no out-of-band data, so the correct answer is
 /// always "none", but "none" has to be written down.
 ///
-/// This is the whole of `docs/runbooks/cargo-cannot-reach-crates-io.md`: the
+/// This is the whole of `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md`: the
 /// nightly toolchain's cargo links a libcurl whose `Curl_poll()` compiles its
 /// `select()` branch (curl-sys' build.rs defines `HAVE_POLL_H`/`HAVE_POLL_FINE`
 /// but not plain `HAVE_POLL`), and `Curl_socket_check()` asks for `POLLPRI` on a

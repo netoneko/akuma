@@ -177,7 +177,7 @@ but not plain `HAVE_POLL`) and asks for `POLLPRI` on a connecting socket, which
 that branch places in `exceptfds`. The stale set made libcurl synthesise
 `POLLPRI`, map it to `CURL_CSELECT_ERR`, and abandon a socket that had just
 reached `Established` with `SO_ERROR == 0`. See
-[`../../../runbooks/cargo-cannot-reach-crates-io.md`](../../../runbooks/cargo-cannot-reach-crates-io.md).
+[`../../../archive/CARGO_CANNOT_REACH_CRATES_IO.md`](../../../archive/CARGO_CANNOT_REACH_CRATES_IO.md).
 Regression: `run_pselect6_exceptfds_test` (`[PASS] pselect6_clears_exceptfds`).
 
 ## epoll interest-list semantics
@@ -250,44 +250,32 @@ table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
    (e.g. `TimerFd`), but a woken thread returns immediately rather than
    waiting for the next tick.
 
-## EPOLLONESHOT (2026-10-16)
+## EPOLLONESHOT
 
 A registration with `EPOLLONESHOT` is reported **once**, then disarmed until `EPOLL_CTL_MOD`
 (or a re-`ADD`) re-arms it, whatever the fd is doing: `InterestList::scan_entry` sets
 `Entry::disarmed` when it reports such an entry and returns nothing while it is set;
-`Entry::would_report` (the nested-epoll probe) honours it too. Before 2026-10-16 the flag was
-only masked off as a registration bit and nothing implemented it, and it was not on the
-divergence list either. The cost: Bun registers a one-shot writability poll on stdout/stderr,
-those descriptors are always writable here, and so every `epoll_wait` returned the same event
-for ever — Claude Code made ~4.4 million syscalls a second and starved its own UI of input
-(`[epoll-spin] pid=991 epfd=3 fd=5 revents=0x4 kind=Some(Stdout)`, the diagnostic added for
-exactly this: it names the fd once a caller has had the same first event back 200,000 times
-in a row). Pinned by `a_oneshot_entry_reports_once_then_stays_quiet_until_it_is_modified` and
-four siblings (host), and `epollops` `oneshot_fires_once_until_modified` (live; PASS on Linux).
+`Entry::would_report` (the nested-epoll probe) honours it too. The `[epoll-spin]` diagnostic
+names the fd once a caller has had the same first event back 200,000 times in a row. Pinned by
+`a_oneshot_entry_reports_once_then_stays_quiet_until_it_is_modified` and four siblings (host),
+and `epollops` `oneshot_fires_once_until_modified` (live; PASS on Linux). Why it exists:
+[`archive/EPOLL_ONESHOT_AND_NESTED_SPIN.md`](../../../archive/EPOLL_ONESHOT_AND_NESTED_SPIN.md).
 
-## Nested epoll (2026-10-16)
+## Nested epoll
 
-An epoll fd registered inside another epoll is readable (`EPOLLIN`) exactly
-while its own interest list has something pending, and never writable
-(`FdState::Epoll { pending }`). Until 2026-10-16 it had no probe arm and fell
-into `Unmodelled` — "ready for whatever was asked" — so the outer
-`epoll_wait` returned at once, every time. Found on the ryzen box: Claude Code
-(Bun) in an interactive terminal made ~2 M `epoll_pwait` + `clock_gettime`
-syscalls per second, each returning 2 events it never read, with the UI
-starved of keyboard input and no sign of work.
+An epoll fd registered inside another epoll is readable (`EPOLLIN`) exactly while its own
+interest list has something pending, and never writable (`FdState::Epoll { pending }`).
 
-`poll.rs::epoll_instance_pending` copies the inner list out under `EPOLL_TABLE`
-(nothing is held across a probe, so an instance containing itself only
-recurses to `EPOLL_MAX_NEST` = 4), probes each entry through the same
-`epoll_check_fd_readiness_at`, and asks `Entry::would_report` — the pure edge
-decision **without recording**. It must not use `scan_entry`: a probe from the
-outer instance would consume the inner instance's edges. The outer waiter's
-`Waker` is passed down, so a write to an inner pipe wakes the outer wait
-directly. Pinned by `an_idle_nested_epoll_is_not_readable_...` and
+`poll.rs::epoll_instance_pending` copies the inner list out under `EPOLL_TABLE` (nothing is held
+across a probe, so an instance containing itself only recurses to `EPOLL_MAX_NEST` = 4), probes
+each entry through the same `epoll_check_fd_readiness_at`, and asks `Entry::would_report` — the
+pure edge decision **without recording**. It must not use `scan_entry`: a probe from the outer
+instance would consume the inner instance's edges. The outer waiter's `Waker` is passed down, so
+a write to an inner pipe wakes the outer wait directly. Pinned by
+`an_idle_nested_epoll_is_not_readable_...` and
 `would_report_does_not_consume_an_edge_scan_entry_does` (host), and `epollops`
-`nested_epoll_readable_only_while_inner_ready` (live; PASS on Linux; FAIL
-before on both the QEMU aarch64 kernel and the ryzen amd64 kernel; PASS after on
-aarch64 QEMU — the amd64 kernel has not been rebuilt with the fix yet).
+`nested_epoll_readable_only_while_inner_ready` (live; PASS on Linux). Why it exists:
+[`archive/EPOLL_ONESHOT_AND_NESTED_SPIN.md`](../../../archive/EPOLL_ONESHOT_AND_NESTED_SPIN.md).
 
 ## The wait loop is one machine, not three (2026-08-24)
 

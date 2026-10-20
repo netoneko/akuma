@@ -447,7 +447,7 @@ echo "mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpc
 # pass regardless) this asks whose memory a freshly-spawned thread is actually
 # reading — the nonce is a function of the pid, so a wrong value names the
 # process it leaked from. Stress-shaped, not one-shot; calibrated on Linux.
-# docs/runbooks/debug-thread-spawn-segv.md §3c. Tiny; built unconditionally.
+# docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md §3c. Tiny; built unconditionally.
 echo "Building spawnalias (C, address-space identity canary)..."
 (
     cd forktest/c_stress

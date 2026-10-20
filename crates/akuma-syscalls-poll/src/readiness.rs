@@ -40,7 +40,7 @@ pub enum FdState {
     ///
     /// Indistinguishable, to the caller, from a socket that died — which is why
     /// the kernel traces it. See
-    /// `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
+    /// `docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md` § 3.4.
     Missing,
 
     /// A UDP socket. Both facts are `false` when the socket has no smoltcp

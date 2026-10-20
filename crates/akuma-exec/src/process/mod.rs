@@ -3413,7 +3413,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
 // CLONE_THREAD hand-off snapshot (thread-spawn SIGSEGV diagnostics)
 // ============================================================================
 //
-// `docs/runbooks/debug-thread-spawn-segv.md`: a freshly cloned thread dies at
+// `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`: a freshly cloned thread dies at
 // `Thread::new::thread_start`'s first instruction pair — `ldr x20,[x0]` then an
 // atomic fetch-add at `[x20]` — because `[x0]` is not a pointer. Every theory in
 // that runbook turns on one question the fault dump cannot answer: **was the
@@ -3621,7 +3621,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         |tid| {
             // Snapshot musl's `[entry, arg]` pair while we are still in the parent's
             // address space — the thread-spawn SIGSEGV diagnostic; see
-            // `record_clone_snapshot` and docs/runbooks/debug-thread-spawn-segv.md.
+            // `record_clone_snapshot` and docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md.
             record_clone_snapshot(tid, stack, parent_pid, parent_tid, shared_ttbr0);
 
             clone_lazy_regions(parent_pid, child_pid);
@@ -3654,7 +3654,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
             // decrements the count and never releases — every later pthread operation
             // in that process blocks forever. Repro:
             // userspace/forktest/c_stress/spawnalias.c;
-            // diagnosis in docs/runbooks/debug-thread-spawn-segv.md.
+            // diagnosis in docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md.
             //
             // Go's `newosproc` passes 0 for both pointers, so it is unaffected either way.
             //
@@ -3756,7 +3756,7 @@ pub fn reserve_pid_floor(floor: Pid) {
 /// That is the `N × INTERP_BASE + 0x6c964` class, and its live signature is exactly
 /// this disagreement: `ttbr0_live` (the stale process's, because `run()` activated it)
 /// != `ttbr0_proc` (`THREAD_PID_MAP`'s). See
-/// `docs/runbooks/debug-thread-spawn-segv.md` §2h.
+/// `docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md` §2h.
 ///
 /// `THREAD_PID_MAP` is authoritative: `fork_process`, `vfork_process`, `clone_thread`
 /// and both `spawn` paths publish it before the child can be scheduled, and

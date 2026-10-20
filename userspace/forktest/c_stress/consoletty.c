@@ -92,7 +92,7 @@ int main(void) {
     /* ---- 4. select, and the exceptfds overwrite rule ------------------- */
     /* Akuma raises no exceptional conditions, but "none" has to be WRITTEN:
      * a set the kernel received and did not write comes back as passed in,
-     * which is the whole of docs/runbooks/cargo-cannot-reach-crates-io.md. */
+     * which is the whole of docs/archive/CARGO_CANNOT_REACH_CRATES_IO.md. */
     fd_set rs, ws, es;
     FD_ZERO(&rs); FD_ZERO(&ws); FD_ZERO(&es);
     FD_SET(0, &rs); FD_SET(1, &ws);

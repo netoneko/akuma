@@ -4,7 +4,7 @@ Source: `crates/akuma-hda` (pure, host-tested, `forbid(unsafe_code)`),
 `amd64/src/hda.rs` (registers, DMA memory, the `/dev/dsp` backend),
 `crates/akuma-virtio/src/audio.rs` (`hda_backend`: the one dispatch point).
 Bring-up history and the failed first attempt: the runbook
-[`../../../runbooks/add-intel-hda-audio.md`](../../../runbooks/add-intel-hda-audio.md).
+[`../../../archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`](../../../archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md).
 
 > **Stability: B.** Rewritten 2026-09-30 against the specification. Verified
 > sample-for-sample under QEMU's emulated controller, and **heard** on the
