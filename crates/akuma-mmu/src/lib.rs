@@ -3018,7 +3018,11 @@ fn x86_walk_leaves(
     // Whether any leaf was actually edited. The per-leaf `invlpg` in the arms
     // below is core-local — it cannot reach a peer running this address
     // space — so one ranged shootdown covers the whole walk when it edited
-    // anything (see `flush_tlb_range_all_asid`'s x86 arm).
+    // anything (see `flush_tlb_range_all_asid`'s x86 arm). The shootdown —
+    // and so the only read — is behind the kernel-target cfg below; on a
+    // host build the variable is written and never read, which the
+    // workspace-denied `unused_variables` would reject.
+    #[cfg_attr(not(all(target_os = "none", target_arch = "x86_64")), allow(unused_variables))]
     let mut edited = false;
     while va < end {
         let step = match x86_walk::lookup::<KernelPhysMap>(root, va) {
