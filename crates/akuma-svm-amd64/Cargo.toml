@@ -1,0 +1,23 @@
+[package]
+name = "akuma-svm-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The AMD SVM (AMD-V) VMCB, as data: control-area and state-save-area layouts, intercept bits, exit codes, segment attributes, the VMRUN consistency checks, and NPT entry encodings — host-tested against APM Vol 2 (24593) rev 3.45"
+
+[lints]
+workspace = true
+
+# No dependencies, deliberately.
+#
+# Every constant here is a function of the AMD APM (24593 rev 3.45) tables, so
+# the crate tests on the host with nothing to vendor. The kernel module that
+# executes VMRUN (`amd64/src/kvm.rs`) owns every `unsafe`; this crate is
+# `#![forbid(unsafe_code)]` and builds the VMCB as typed data on an already
+# zero-filled page.
+#
+# NPT leaf PTE bits are NOT copied from `akuma-pte-amd64` on purpose: a nested
+# entry's exact bit table (A/D, PKS, ...) is still pending transcription from
+# Vol 2 §"Nested Table Walk", and a wrong shared constant would make both
+# walkers wrong in the same way. The bits below are the subset §15.5.x pins,
+# marked for verification before the Linux rung.
+[dependencies]
