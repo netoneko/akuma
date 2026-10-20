@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1429
-- **Docs contributing at least one fix:** 391
+- **Total distinct fixes counted:** 1440
+- **Docs contributing at least one fix:** 397
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 240 | 16.8% | 32 |
-| Memory & Virtual Memory | 174 | 12.2% | 56 |
+| Syscall / ABI Compatibility Audits | 242 | 16.8% | 33 |
+| Memory & Virtual Memory | 176 | 12.2% | 57 |
 | Scheduler & Process Management | 139 | 9.7% | 43 |
-| SMP & Locking | 133 | 9.3% | 54 |
-| Networking | 91 | 6.4% | 32 |
+| SMP & Locking | 133 | 9.2% | 54 |
+| Networking | 92 | 6.4% | 33 |
 | Userspace Apps & Libraries | 40 | 2.8% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
-| Toolchain & Self-Hosting | 91 | 6.4% | 13 |
+| Toolchain & Self-Hosting | 91 | 6.3% | 13 |
 | SSH | 39 | 2.7% | 18 |
-| VFS & Filesystem | 130 | 9.1% | 39 |
-| Boot & Drivers | 126 | 8.8% | 19 |
+| VFS & Filesystem | 134 | 9.3% | 40 |
+| Boot & Drivers | 127 | 8.8% | 20 |
 | Signals & Exceptions | 40 | 2.8% | 15 |
-| Misc / Cross-cutting | 48 | 3.4% | 16 |
-| Console & Terminal | 57 | 4.0% | 17 |
+| Misc / Cross-cutting | 48 | 3.3% | 16 |
+| Console & Terminal | 58 | 4.0% | 18 |
 | Containers | 55 | 3.8% | 10 |
-| **Total** | **1429** | **100.0%** | **391** |
+| **Total** | **1440** | **100.0%** | **397** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -50,7 +50,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (240 fixes, 32 docs)
+## Syscall / ABI Compatibility Audits (242 fixes, 33 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -319,7 +319,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/AMD64_UNSAFE_REDUCTION_TRAP_MSR.md
 - `arch_prctl(ARCH_SET_FS | ARCH_SET_GS, addr)` wrote the MSR with whatever the program passed, and a non-canonical address raised `#GP` in ring 0, which halted the machine; it is `EPERM` now (as in Linux) via the canonical-checked `set_fs_base`/`set_user_gs_base`, and the context-switch restore skips a non-canonical stored value
 
-## Memory & Virtual Memory (174 fixes, 56 docs)
+### docs/reference/subsystems/syscalls/poll.md
+- `EPOLLONESHOT` was masked off as a registration bit and never acted on, so Bun's one-shot writability poll on stdout/stderr (always writable here) returned the same event forever and `claude` spun (318 M syscalls in 72 s), starving its UI of keyboard input; `InterestList` disarms a one-shot entry once it reports, until `EPOLL_CTL_MOD` or a re-ADD
+- `FileDescriptor::EpollFd` had no readiness arm and fell into `Unmodelled` (ready for whatever was asked), so an `epoll_wait` over an inner epoll returned at once forever and Claude Code spun at ~2 M syscalls/s; an inner epoll is `EPOLLIN`-ready only while its own list has something pending (`Entry::would_report`, which records no edge, depth-bounded at 4)
+
+## Memory & Virtual Memory (176 fixes, 57 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -608,6 +612,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - writable `MAP_SHARED` file mappings were per-process copies with write-back on `munmap`/`msync`, so SQLite's WAL index (`-shm`) diverged between processes and goose's `sessions.db` came back malformed; new `akuma-fpcache-rw` + `amd64/src/shmpages.rs` give every mapper one frame per `(mount, inode, page)`, and `write(2)`/`ftruncate`/`fallocate` reach mapped frames through `MappedFileHooks`
 - exit and `execve` freed a shared-writable mapping's frames with no flush (the address space's `Drop`), so a process killed with a live mapping lost its writes; `release_shared_write_mappings` gives them `munmap`'s treatment
 - `fork` from a non-leader thread read that thread's own, empty region list, so the parent's `MAP_SHARED` pages were CoW-split and the private `-shm` copy's write-back overwrote every other process's index; it reads the owner's list (`share_parent_memory_into`)
+
+### docs/archive/AMD64_UNSAFE_REDUCTION_TRAP_MSR.md
+- A loaded-segment page whose map failed was never freed; the owned, not-yet-published `phys::FreshFrame` (freed on `Drop`, handed on with `publish()`) replaces the raw physmap view
+- The test program's failure arm freed a frame the address space already tracked; the same `FreshFrame` ownership removes it
 
 ## Scheduler & Process Management (139 fixes, 43 docs)
 
@@ -1092,7 +1100,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_TLB_STUCK_MMAP_REGIONS.md
 - `Process::mmap_regions` had no shootdown assist, so a BKL-free `/proc/<pid>/maps` read (`fd::pid_map_rows`) spun IRQ-masked on it while a `munmap` sender held it in `wait_for_acks`, and a multi-threaded `claude` wedged the whole ryzen (no ssh, no ping, no watchdog); it is an `AssistedSpinlock` now (the sibling of the `as_lock` fix)
 
-## Networking (91 fixes, 32 docs)
+## Networking (92 fixes, 33 docs)
 
 ### docs/archive/AKUMA_NET_SPLIT.md
 - `VirtioSmoltcpDevice::receive` built its tx token as `unsafe { &mut *(&raw mut *self) }` while the rx token was live, so two `&mut` to the same device existed at once — UB by the language's rules independently of whether the NIC raced them. The fix is a reorder, and works because `take_rx_frame` returns a raw pointer whose provenance is the BSS frame arena rather than `self`; `LoopbackAwareDevice::receive` had already solved the same problem 200 lines below
@@ -1249,6 +1257,9 @@ aren't recorded anywhere else.)
 - the amd64 kernel never read the CMOS RTC (its header said "this target has no RTC", true of Firecracker and `microvm`, false of metal and q35), so `clock::now_us()` was 0 until SNTP ran and every offline boot dated files 1970 and stamped `dtime = 0` (fsck `Deleted inode has zero dtime`); `akuma-cmos-rtc` decodes it and `clock::seed_from_rtc` seeds the clock before the root mounts
 - the RTC was read and never written, so a machine whose CMOS was wrong stayed at 1970 on every offline boot for ever; `akuma_cmos_rtc::write` (SET bit, chip format, century, read-back verified) is called from `report_outcome` on an SNTP success, rate-limited to 11 minutes
 - the PVH `no-tests` boot ran `late_init` and went straight to `init` with no `settle_for_dhcp`, `sync_via_sntp` or `spawn_netpoll`, so no SNTP retry, no memory watchdog and no netpoll RX pump; the PVH entry runs the same three calls the multiboot2 entry has had since 2026-09-05
+
+### docs/archive/POST_AMD64_CODE_AUDIT.md
+- smoltcp's DNS socket failed on the first `NXDOMAIN` with one configured server (QEMU slirp `NXDOMAIN`s `example.com` while `1.1.1.1` answers) while the hand-rolled `amd64/src/dns.rs` walked resolvers; one shared, host-tested `akuma-dns` client walks the resolver list on a timeout or an answer without a record, and `dns.rs` and smoltcp's DNS socket are deleted
 
 ## Userspace Apps & Libraries (40 fixes, 21 docs)
 
@@ -1575,7 +1586,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_SSH_CLIENT_TOFU_PROMPT_CR.md
 - the `ssh` client's host-key prompt broke only on `\n` and discarded `\r`, and a terminal in raw mode sends CR for Enter — so answering the TOFU prompt did nothing, forever, with the typed `yes` already consumed; the fix echoes what it accepts, which is what makes the prompt answerable at all
 
-## VFS & Filesystem (130 fixes, 39 docs)
+## VFS & Filesystem (134 fixes, 40 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1787,7 +1798,13 @@ aren't recorded anywhere else.)
 - `/proc` root did not list `self`; it lists it as a symlink, for a caller that has a process
 - `read_symlink` for `<pid>/fd/<n>` skipped the box rule; it is behind the same resolve as everything else
 
-## Boot & Drivers (126 fixes, 19 docs)
+### docs/archive/AMD64_UNSAFE_REDUCTION_TRAP_MSR.md
+- `sys_getdents64` cloned the fd's whole directory snapshot per call, so `ls /root` on a 145 k-entry directory (5.5 MiB of dirent data) re-allocated ~100 k `String`s per call under the VFS BKL and burned a core for minutes; a pure `getdents_step` fills by slice and the snapshot is moved into the fd once
+- `proc.get_fd` deep-cloned the `FileDescriptor`, snapshot included, so every `getdents64` still paid a full clone (70 ms/call on the metal); `SharedFdTable::with_fd` borrows the live entry in place (a 4,038-call stream in 446 ms)
+- Every `stat`/`open`/`exec` path component read the whole directory (`lookup_path` -> `read_inode_data` + `parse_directory`), 238 ms per `stat` in that directory; `Ext2Filesystem::find_in_dir` scans block by block and stops at the match (50 stats: 11.9 s -> 0.58 s)
+- herd's `hda-capture` service (`restart = true`, exits at once) wrote a `dmesg-boot-<ts>.txt` into `/root` every ~3 s, 146,113 files and a 5.5 MiB directory in ten days, which is what turned every lookup into a linear scan; the script writes `/var/log/dmesg/hda-boot-*.txt` pruned to the newest 20 and the service is disabled
+
+## Boot & Drivers (127 fixes, 20 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1954,6 +1971,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AMD64_PHYSMAP_SELFTEST_LAST_PDE.md
 - `physmap: reaches PHYSMAP_LIMIT` failed on every multiboot2 boot with tests because `Console::new` returned the 97,920 B cell grid by value through three constructor layers, overflowing the 256 KiB boot stack (297,976 B peak) through `__ap_pml4` into the tail of `__pd0`; the `akuma-fbcon` constructor chain is `#[inline(always)]` so the grid is built in the caller's destination (peak 147,968 B)
+
+### docs/reference/subsystems/power.md
+- The AMD FCH watchdog was fed only when `tick % 100 == 0`, which `idlesleep`'s tick credits could step over, so a steady wake pattern (`powersaved`'s own 1 s sleep) reset a healthy idle box after `wdt` seconds; `pet` decides by which 100-tick bucket the count is in (a 600 s feed gap in five of seven replayed wake patterns before, ~1 s after)
 
 ## Signals & Exceptions (40 fixes, 15 docs)
 
@@ -2127,7 +2147,7 @@ aren't recorded anywhere else.)
 - all three TLS consumers printed the same flat "TLS handshake failed" for failures demanding completely different fixes (`InsufficientSpace`, `InvalidCipherSuite`, `DecodeError`), which is the single biggest reason the above cost a session; `libakuma_tls::tls_error_name` maps every variant and unpacks the two alert-carrying ones
 - the RTL8169 stall watchdog was given a chip-evidence test whose cost was never asked about — `snapshot()` is eleven MMIO reads, on a receive-poll loop that laps thousands of times a second under the BKL — and the box booted into it unreachable, twice: the retry moved the reads behind the `quiet` window, which is true on *every* lap once it passes on an idle link. `MPC` is deleted from the poll path; `INT_RDU` already arrives in the `ISR` harvested every lap and is the better signal. Every gate was green on both dark kernels, and neither fast-lane target runs this driver (both virtio)
 
-## Console & Terminal (57 fixes, 17 docs)
+## Console & Terminal (58 fixes, 18 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -2222,6 +2242,9 @@ aren't recorded anywhere else.)
 - `no-tests` did not build for amd64 because a commit had inserted `suite_emit` between `self_tests` and its `#[cfg(not(feature = "no-tests"))]`
 - the boot splash cat never changed colour because its daemon is starved during the synchronous xHCI and DHCP waits; `splash::pulse()` runs from those loops on a TSC clock and the frame interval went 50 to 150 ms
 
+### docs/reference/subsystems/tty.md
+- `^C` could not interrupt a job-control shell's foreground job (`sleep 100` from `sh -i`, over ssh, on both kernels) because `kill_process_group` always spared the group leader, which there is the job itself; `TerminalState` records the session shell's group and spares the leader only while the foreground group is that one
+
 ## Containers (55 fixes, 10 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
@@ -2303,7 +2326,7 @@ aren't recorded anywhere else.)
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
-Also scanned 2026-10-20 (the amd64 metal, signal-return and `/proc` work, 16 archive docs added or edited). Counted above: AARCH64_SMP_HOOKS_RACE, AMD64_TLB_STUCK_MMAP_REGIONS, AMD64_FORK_VS_THREADS_SEGV, AKUMA_STALE_TID_ZOMBIE_SLOT, AMD64_PHYSMAP_SELFTEST_LAST_PDE, AMD64_UNSAFE_REDUCTION_TRAP_MSR, AMD64_MAC_BUILT_KERNEL_METAL_HANG (its one fix is the `cycle.py` truncated install; the hang itself is unexplained and not counted), AKUMA_PROC_TREE_UNIFICATION, and AMD64_METAL_CONTROL_RUN_2026_10_18 (its one `MRS rt == 31` fix; the run record itself is not a fix). No counted fix: AARCH64_CLAUDE_BUN_SEGV, AMD64_CLAUDE_LOGIN_INPUT_STUCK and AMD64_CRUSH_ORPHANS_AFTER_PTY_CLOSE are **open** by their own headers (reproduced, not root-caused; the third is a hypothesis only); CLONE_AUDIT and POST_AMD64_CODE_AUDIT are audits (the one fix the latter describes, the shared `akuma-dns` client replacing `amd64/src/dns.rs`, is counted under AKUMA_FIRECRACKER_AMD64); AKUMA_TTY_EXTRACTION is a behaviour-preserving extraction whose step 2 is open; AKUMA_AMD64_PIPE_TABLE_UNIFICATION took a two-line edit and is already named here.
+Also scanned 2026-10-20 (the amd64 metal, signal-return and `/proc` work, 16 archive docs added or edited). Counted above: AARCH64_SMP_HOOKS_RACE, AMD64_TLB_STUCK_MMAP_REGIONS, AMD64_FORK_VS_THREADS_SEGV, AKUMA_STALE_TID_ZOMBIE_SLOT, AMD64_PHYSMAP_SELFTEST_LAST_PDE, AMD64_UNSAFE_REDUCTION_TRAP_MSR, AMD64_MAC_BUILT_KERNEL_METAL_HANG (its one fix is the `cycle.py` truncated install; the hang itself is unexplained and not counted), AKUMA_PROC_TREE_UNIFICATION, AMD64_METAL_CONTROL_RUN_2026_10_18 (its one `MRS rt == 31` fix; the run record itself is not a fix), and POST_AMD64_CODE_AUDIT (its one fix, the shared `akuma-dns` client). AMD64_UNSAFE_REDUCTION_TRAP_MSR's `ls /root` investigation and its round-3 frame-ownership fixes carry six more bullets, split under VFS and Memory. Fixes with no archive writeup of their own, counted under the reference doc that records them: `docs/reference/subsystems/syscalls/poll.md` (EPOLLONESHOT, nested epoll), `power.md` (the watchdog feed), `tty.md` (`^C` and job control). Fix commits on the branch with no doc to cite are not counted: sshd's missing `HOME` (`ac41e664`), the stale `uname` SHA in worktrees (`5a577983`), the Tokyo Night prompt's unbracketed SGR escapes (`c7d2a8e7`). No counted fix: AARCH64_CLAUDE_BUN_SEGV, AMD64_CLAUDE_LOGIN_INPUT_STUCK and AMD64_CRUSH_ORPHANS_AFTER_PTY_CLOSE are **open** by their own headers (reproduced, not root-caused; the third is a hypothesis only); CLONE_AUDIT is an audit with no defect attached; AKUMA_TTY_EXTRACTION is a behaviour-preserving extraction whose step 2 is open; AKUMA_AMD64_PIPE_TABLE_UNIFICATION took a two-line edit and is already named here.
 
 Also scanned 2026-10-06 (the amd64 console, pty, shared-writable-page and ext2-durability work, 11 archive docs added and 3 more edited). GOOSE_TOKEN_AUDIT carries no counted fix: it is a read-only measurement of goose's own logs (cache-hit rate, tool-result bulk) and records nothing changed. AKUMA_AMD64_BARE_METAL_SELFHOST gained a dated correction (the 3-in-4 `-j4` failure rate is superseded; 7 of 10 clean runs, 3 `EIO` at `execve`), not a fix; the `EIO` is explained and fixed under AKUMA_AMD64_TARGETED_SHOOTDOWN. AKUMA_SELF_HOSTING_AMD64 and SSH_THREADING_BUG changed only cross-reference file names after three docs lost their year suffix (AMD64_THREE_CRASHES, CONTEXT_SWITCH_FIX, SSH_PERFORMANCE_FIX), already reflected in their entries. AKUMA_AMD64_USB_XHCI gained a keyboard section, now one more bullet in its subsection. Fixes recorded in more than one doc are counted once, under the doc that documents the fix: the `MAP_SHARED` incoherence and the worker-thread fork bug are in AKUMA_AMD64_SHARED_WRITABLE_PAGES (AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING § 15 only points at them); the real ptys and `O_APPEND` atomicity listed in AKUMA_AMD64_WGPU_KERNEL_WORK and AKUMA_AMD64_RIO_FBDEV_BUILD are counted under AKUMA_AMD64_PTY and AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION. Not counted, open by their own text: the cross-link damage already on the box's disk (needs an offline `e2fsck`), the cause of the vanishing `.git` in AMD64_GIT_REPO_VANISH (the symptom did not reproduce; only the `ftruncate` defects the stress found are counted), the `read(2)`-sees-mapping-stores and `PROT_READ` `MAP_SHARED` gaps, `opencode --version`, `RUSAGE_CHILDREN`, and the metal `[BKL] stuck` lines. Kot-mesh contamination and Kimi quota handling in AKUMA_TEAHOUSE_CONSOLE_EXPERIMENT are operational findings, not fixes.
 
