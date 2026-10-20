@@ -255,6 +255,10 @@ pub mod msr {
         /// 4 KiB-aligned physical address, low 12 bits clear, never the VMCB
         /// page; contents are CPU-private, format is not to be relied on.
         VmHsavePa = 0xC001_0117,
+        /// `VM_CR`: SVM control; bit 4 `SVMDIS` set means VMRUN is disabled
+        /// (APM Vol 2 §15.11). Only safe to read once CPUID advertises SVM —
+        /// an rdmsr of an unimplemented MSR `#GP`s.
+        VmCr = 0xC001_0114,
     }
 
     /// A 64-bit address is canonical when bits 63:47 are all equal (48-bit

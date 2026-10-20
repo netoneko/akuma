@@ -343,37 +343,47 @@ pub struct SegAttr(pub u16);
 
 impl SegAttr {
     /// Descriptor type field (bits 3:0).
+    #[must_use]
     pub const fn ty(self) -> u8 {
         (self.0 & 0xF) as u8
     }
     /// S bit (bit 4): 1 = code/data, 0 = system.
+    #[must_use]
     pub const fn is_code_data(self) -> bool {
         self.0 & (1 << 4) != 0
     }
     /// DPL (bits 6:5). The hardware observes it for DS/ES/FS/GS; the **guest
     /// CPL is the separate byte at save-relative `0CBh`**.
+    #[must_use]
     pub const fn dpl(self) -> u8 {
         ((self.0 >> 5) & 3) as u8
     }
     /// Present (bit 7).
+    #[must_use]
     pub const fn is_present(self) -> bool {
         self.0 & (1 << 7) != 0
     }
     /// L bit (bit 9): 64-bit code segment.
+    #[must_use]
     pub const fn is_long(self) -> bool {
         self.0 & (1 << 9) != 0
     }
     /// D/B bit (bit 10): 32-bit default size.
+    #[must_use]
     pub const fn is_db(self) -> bool {
         self.0 & (1 << 10) != 0
     }
     /// Granularity (bit 11).
+    #[must_use]
     pub const fn is_4k_granular(self) -> bool {
         self.0 & (1 << 11) != 0
     }
     /// Assemble from descriptor fields: `ty` (4 bits), `s`, `dpl`, `p`,
     /// `avl`, `l`, `db`, `g`.
     #[must_use]
+    #[allow(clippy::many_single_char_names, clippy::fn_params_excessive_bools)]
+    // The descriptor's own layout is eight one-letter fields (APM Vol 3
+    // "Segment Descriptor"); the names mirror the spec, not Rust style.
     pub const fn from_fields(ty: u8, s: bool, dpl: u8, p: bool, avl: bool, l: bool, db: bool, g: bool) -> Self {
         let mut v = (ty & 0xF) as u16;
         if s {
@@ -487,10 +497,12 @@ impl ExitCode {
     }
 }
 
-/// A VMCB page, typed. Construct over an **already zero-filled** page; see
-/// the crate header for why. All accessors are bounds-checked indexing into
-/// the page (which is exactly `[u8; 4096]`, so the const offsets compile to
-/// addresses and cannot fail at runtime).
+/// A VMCB page, typed.
+///
+/// Construct over an **already zero-filled** page; see the crate header for
+/// why. All accessors are bounds-checked indexing into the page (which is
+/// exactly `[u8; 4096]`, so the const offsets compile to addresses and
+/// cannot fail at runtime).
 #[derive(Debug)]
 pub struct Vmcb<'a> {
     page: &'a mut [u8; VMCB_SIZE],
@@ -539,6 +551,7 @@ impl<'a> Vmcb<'a> {
     }
 
     /// The raw page (for logging a hexdump of the exit state).
+    #[must_use]
     pub const fn page(&self) -> &[u8; VMCB_SIZE] {
         self.page
     }
@@ -781,8 +794,9 @@ pub mod cr4 {
     pub const PAE: u64 = 1 << 6;
 }
 
-/// A VMRUN consistency check that the guest state violates (§15.5.1). The
-/// hardware reports all of these the same way — `VMEXIT_INVALID`, no
+/// A VMRUN consistency check that the guest state violates (§15.5.1).
+///
+/// The hardware reports all of these the same way — `VMEXIT_INVALID`, no
 /// diagnostics — so the checks are reimplemented here, where a failing boot
 /// names its own cause.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -821,7 +835,6 @@ pub enum Illicit {
 /// beyond max physical address (needs the box's max PA), event-injection
 /// legality (the seed never injects: EVENTINJ stays 0), and the S_CET checks
 /// (CET unused).
-#[must_use]
 pub fn validate_guest_state(vmcb: &Vmcb<'_>) -> Result<(), Illicit> {
     use cr0::{CD, NW, PE, PG};
     use msr::{EFER_LMA, EFER_LME, EFER_SVME};
@@ -863,17 +876,39 @@ pub fn validate_guest_state(vmcb: &Vmcb<'_>) -> Result<(), Illicit> {
     if vmcb.asid() == 0 {
         return Err(Illicit::AsidZero);
     }
-    if vmcb.page().len() > 0 && rd32(vmcb.page(), ctrl::INSTR_INTERCEPT1) & intr1::VMRUN == 0 {
+    if !vmcb.page().is_empty() && rd32(vmcb.page(), ctrl::INSTR_INTERCEPT1) & intr1::VMRUN == 0 {
         return Err(Illicit::VmrunNotIntercepted);
     }
     Ok(())
 }
 
-/// Nested page-table entry encodings. **Subset pending verification:** the
-/// exact NPT leaf bit table (A/D semantics, PKS) is not yet transcribed from
-/// Vol 2 §"Nested Table Walk"; what §15.5.x and the NP text pin is Present /
-/// R / W / `PS` / the physical address field, and that A/D are
-/// hardware-set. Re-verify before the Linux rung before adding bits.
+impl Illicit {
+    /// The static name, for a serial line that cannot allocate.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SvmeClear => "SvmeClear",
+            Self::Cr0CdWithoutNw => "Cr0CdWithoutNw",
+            Self::Cr0HighBits => "Cr0HighBits",
+            Self::Dr6HighBits => "Dr6HighBits",
+            Self::Dr7HighBits => "Dr7HighBits",
+            Self::LmaWithoutLme => "LmaWithoutLme",
+            Self::LmePgWithoutPae => "LmePgWithoutPae",
+            Self::LmePgWithoutPe => "LmePgWithoutPe",
+            Self::LongModeLAndD => "LongModeLAndD",
+            Self::AsidZero => "AsidZero",
+            Self::VmrunNotIntercepted => "VmrunNotIntercepted",
+        }
+    }
+}
+
+/// Nested page-table entry encodings.
+///
+/// **Subset pending verification:** the exact NPT leaf bit table (A/D
+/// semantics, PKS) is not yet transcribed from Vol 2 §"Nested Table Walk";
+/// what §15.5.x and the NP text pin is Present / R / W / `PS` / the physical
+/// address field, and that A/D are hardware-set. Re-verify before the Linux
+/// rung before adding bits.
 pub mod npt {
     /// Present.
     pub const P: u64 = 1 << 0;
@@ -1247,5 +1282,28 @@ mod tests {
         assert_eq!(npt::leaf_2m(0x200_0000), 0x200_0000 | npt::P | npt::RW | npt::PS);
         assert_eq!(npt::leaf_2m(0x200_0000) & npt::PS != 0, true);
         assert_eq!(0x1234_5000 & npt::ADDR_MASK, 0x1234_5000);
+    }
+
+    #[test]
+    fn illicit_names_are_distinct_serial_strings() {
+        let all = [
+            Illicit::SvmeClear,
+            Illicit::Cr0CdWithoutNw,
+            Illicit::Cr0HighBits,
+            Illicit::Dr6HighBits,
+            Illicit::Dr7HighBits,
+            Illicit::LmaWithoutLme,
+            Illicit::LmePgWithoutPae,
+            Illicit::LmePgWithoutPe,
+            Illicit::LongModeLAndD,
+            Illicit::AsidZero,
+            Illicit::VmrunNotIntercepted,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.name().is_empty());
+            for b in &all[i + 1..] {
+                assert_ne!(a.name(), b.name());
+            }
+        }
     }
 }
