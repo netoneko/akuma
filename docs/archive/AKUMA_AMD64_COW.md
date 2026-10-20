@@ -145,23 +145,28 @@ host tests, 0 failed.
 
 ## Known limits
 
-> **Correction 2026-10-20.** The first two bullets below are out of date. A TLB shootdown has
-> existed since 2026-09-09 (`amd64/src/shootdown.rs`; `thread.rs` says so) and CoW `fork` has run at
-> `SMP>1` since (self-host builds at `-j4`); and threads exist (`crate::thread`), so the `cowstale`
-> race class **does** exist here. It bites: a multithreaded process that forks while a sibling thread
-> faults gets a spurious SIGSEGV, 100 % reproducible with `scripts/utils/go_fork_stack_repro` —
-> [`AMD64_FORK_VS_THREADS_SEGV.md`](AMD64_FORK_VS_THREADS_SEGV.md).
+*Rewritten 2026-10-20.* The first two bullets of the original said **SMP=1 only, by
+construction** (`invlpg` core-local, no shootdown) and **no threads, so none of the `cowstale`
+race class exists here yet**. Both stopped being true and both were left standing long enough to
+mislead a bug hunt — the Go/crush startup crash was chased for three sessions as "CoW fork vs. a
+sibling thread's fault" on the strength of this section, and it was a signal-return bug
+([`AMD64_FORK_VS_THREADS_SEGV.md`](AMD64_FORK_VS_THREADS_SEGV.md)). The current state:
 
-- **SMP=1 only, by construction.** `smp.rs` states `invlpg` is core-local with no
-  TLB shootdown. `fork_from` demotes the parent's live PTEs, and at SMP>1 another
-  core can hold a stale writable translation. CoW needs a shootdown before SMP>1
-  — this is not a bug to find later, it is a stated precondition.
-- **No threads**, so none of the `cowstale` race class exists here yet. The
-  `Retry` arm is implemented and counted anyway, because it costs nothing and the
-  alternative when threads arrive is a spurious `SIGSEGV`.
-- The eager-`mmap` window and its global bump allocator are untouched;
-  `release_anon_frames` still walks `[MMAP_BASE, NEXT_VA)` page by page at every
-  non-forked teardown, which grows with uptime.
+- **SMP>1 is supported.** `amd64/src/shootdown.rs` (2026-09-09) is the IPI that makes
+  `TlbTarget::AllCores` real on x86: the share pass demotes the parent's leaves under the owner's
+  address-space lock and flushes `AllCores` once at the end of the walk, waiting for every peer on
+  the edited root to acknowledge; the `Copy` arm of the break flushes `AllCores` before it frees
+  the old frame. Self-host builds at `-j4` have run on it since.
+- **Threads exist** (`amd64/src/thread.rs`, `clone(CLONE_VM|CLONE_THREAD)`), so the `cowstale`
+  class is live here. What closes it: the share pass, `install_filled_page` and `cow_write_fault`
+  all take the **thread-group leader's** `address_space` lock (a sibling's own is a fresh-lock
+  `new_shared` view that would exclude nothing), and the break reads the PTE under that hold and
+  decides through `akuma-cow`'s `Retry`/`Fault`/`TakeInPlace`/`Copy` table. The `Retry` arm is the
+  one that turns a sibling-repaired page into a re-execution rather than a `SIGSEGV`, and it is
+  counted (`COW_RETRIES`).
+- The eager-`mmap` window and its global bump allocator are gone (the region table and the frame
+  ledger replaced them, `AKUMA_AMD64_MMAP_REGIONS.md`); the `release_anon_frames` bullet that stood
+  here is history.
 
 ## Background
 

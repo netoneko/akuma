@@ -119,6 +119,10 @@ const THREADPROBE_ELF: &[u8] = include_bytes!(env!("USER_THREADPROBE_ELF"));
 #[cfg(not(feature = "no-tests"))]
 const KILLPROBE_ELF: &[u8] = include_bytes!(env!("USER_KILLPROBE_ELF"));
 
+/// The signal register-file probe. See `usermode::sigregs_test`.
+#[cfg(not(feature = "no-tests"))]
+const SIGREGS_ELF: &[u8] = include_bytes!(env!("USER_SIGREGS_ELF"));
+
 /// Where a task's kernel stack and saved user stack live.
 ///
 /// One per task. `syscall_entry` reaches the running task's through the
@@ -247,6 +251,20 @@ pub struct UserCtx {
     /// has no handler result — it carries either the handler's entry `rax` (0)
     /// or the `rax` the interrupted context had.
     pub sig_rax: u64,
+    /// The `%rcx` `.Lsig_return` enters ring 3 with. Offset 200, indexed by hand.
+    ///
+    /// Not in `saved_regs` because `syscall_entry` cannot save it — the
+    /// `syscall` instruction has already replaced it with the return address —
+    /// and not derivable at return time either: a signal delivered at a **tick**
+    /// or a **fault** interrupted an instruction with `%rcx` live, and
+    /// `rt_sigreturn` must put that value back. The old `sysretq` return could
+    /// not (it loads `%rcx` from `%rip`), which is how Go's `memmove` resumed
+    /// with `RCX = RIP` (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`); the
+    /// return is an `iretq` now and reads this.
+    pub sig_rcx: u64,
+    /// The `%r11` `.Lsig_return` enters ring 3 with. Offset 208, indexed by
+    /// hand. `%r11`'s story is `sig_rcx`'s with `rflags` for `rip`.
+    pub sig_r11: u64,
 }
 
 /// **The offsets `syscall_entry` indexes by hand.**
@@ -272,6 +290,8 @@ const _: () = {
     assert!(core::mem::offset_of!(UserCtx, user_rflags) == 176);
     assert!(core::mem::offset_of!(UserCtx, sig_return) == 184);
     assert!(core::mem::offset_of!(UserCtx, sig_rax) == 192);
+    assert!(core::mem::offset_of!(UserCtx, sig_rcx) == 200);
+    assert!(core::mem::offset_of!(UserCtx, sig_r11) == 208);
 };
 
 impl UserCtx {
@@ -292,6 +312,8 @@ impl UserCtx {
             user_rflags: 0,
             sig_return: 0,
             sig_rax: 0,
+            sig_rcx: 0,
+            sig_r11: 0,
         }
     }
 }
@@ -662,6 +684,19 @@ syscall_entry:
      * the frame on the user stack). Those are the same operation with two
      * authors, so they share one path.
      *
+     * **`iretq`, not `sysretq`.** `sysretq` loads `rip` from `rcx` and
+     * `rflags` from `r11`, so it cannot hand ring 3 a chosen `rcx`/`r11` — and
+     * a signal delivered at a tick or a fault interrupted an instruction that
+     * had both live. Returning through `sysretq` gave the interrupted code
+     * `RCX = its own RIP`, which is the Go `memmove` crash in
+     * `docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`. `iretq` takes `rip`, `cs`,
+     * `rflags`, `rsp`, `ss` off the stack and leaves every GPR alone, so all
+     * sixteen come from the `UserCtx`. The frame is built on this task's
+     * kernel stack, below the syscall frame it abandons; `syscall_entry`
+     * re-establishes the kernel stack from `uctx.kernel_rsp` on every entry,
+     * so nothing leaks. The selectors are the GDT's ring-3 rows, RPL 3,
+     * exactly what `sysretq` derived from `IA32_STAR`.
+     *
      * The pushed `user rip`/`user rflags` and the rest of the kernel frame are
      * abandoned exactly as `.Lexec_return` abandons them, and for the same
      * reason: they describe a context this return is not going to.
@@ -672,8 +707,11 @@ syscall_entry:
      * Still in ring 0 with the kernel's `%gs`; the `swapgs` below is the one the
      * ordinary return does. */
     mov qword ptr [rcx + 184], 0    /* consume uctx.sig_return */
-    mov rsp, [rcx + 8]              /* uctx.user_rsp */
-    mov r11, [rcx + 176]            /* uctx.user_rflags */
+    push {user_ss}                  /* iretq frame: ss                */
+    push qword ptr [rcx + 8]        /*              rsp  = user_rsp   */
+    push qword ptr [rcx + 176]      /*              rflags = user_rflags (sanitized by the author) */
+    push {user_cs}                  /*              cs                */
+    push qword ptr [rcx + 32]       /*              rip  = user_rip   */
     mov rax, [rcx + 192]            /* uctx.sig_rax */
     mov rdi, [rcx + 48]
     mov rsi, [rcx + 56]
@@ -687,9 +725,10 @@ syscall_entry:
     mov r13, [rcx + 120]
     mov r14, [rcx + 128]
     mov r15, [rcx + 136]
-    mov rcx, [rcx + 32]             /* uctx.user_rip — last: it is the base */
+    mov r11, [rcx + 208]            /* uctx.sig_r11 */
+    mov rcx, [rcx + 200]            /* uctx.sig_rcx — last: it is the base */
     swapgs
-    sysretq
+    iretq
 
 .Lexit_to_kernel:
     /* Leave ring 3 for good. Restore what enter_user_mode saved and return from
@@ -775,7 +814,11 @@ enter_user_mode_forked:
     xor eax, eax                   /* child sees vfork() == 0 */
     swapgs
     sysretq
-"#
+"#,
+    // `.Lsig_return`'s `iretq` selectors: the same ring-3 rows `sysretq`
+    // derives from `IA32_STAR`, taken from the GDT crate so they cannot drift.
+    user_cs = const crate::gdt::USER_CS as u64,
+    user_ss = const crate::gdt::USER_SS as u64,
 );
 
 unsafe extern "C" {
@@ -2165,15 +2208,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 // `CLONE_SETTLS` is *absent* on this path by construction — the
                 // spawn child inherits the parent's `%fs` — which is correct:
                 // it execs immediately, and `execve` installs the new image's
-                // TLS. `SMP>1`: CoW fork on this target is `SMP=1`-only today
-                // (see `akuma-cow`'s pinned marker divergence), so a
-                // multi-core Firecracker running `gcc` wants `SMP=1` until that
-                // lifts.
-                //
-                // **Stale as of 2026-10-20:** the `SMP=1`-only remark above predates the TLB
-                // shootdown (2026-09-09); CoW fork runs at `SMP>1`. What is *not* sound is this
-                // path from a **multithreaded** parent while a sibling thread faults — Go's
-                // `os/exec` hits it every time (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
+                // TLS. CoW fork runs at `SMP>1` (the shootdown, 2026-09-09) and
+                // from a multithreaded parent (the share pass and the break
+                // serialize on the leader's address-space lock). Go's
+                // `os/exec` was dying through this path for a month and the
+                // cause was none of that: each child's exit is a `SIGCHLD`,
+                // and a tick-time signal used to return through `sysretq`
+                // with `RCX = RIP` (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
                 return sys_spawn_clone(a2);
             }
             sys_fork()
@@ -9006,4 +9047,50 @@ pub fn kill_test(t: &mut Suite) {
     t.check_eq("kill: a reaped process group is ESRCH",
         kill62((-(i64::from(pid))) as u64, 0), crate::fd::errno::ESRCH);
     t.check_eq("kill: teardown leaks nothing", akuma_pmm::free_count() as u64, free_before as u64);
+}
+
+/// **Does a signal handler's excursion give back every register it found?**
+///
+/// `userspace/amd64/sigregs/sigregs.rs`: a `fork`ed child `kill`s the parent
+/// with `SIGUSR1` every millisecond while the parent spins through windows
+/// that hold sentinels in `rcx`, `r11`, `xmm0`–`xmm15` (and `ymm0`–`ymm3`'s
+/// upper halves on AVX), every eighth window also faulting on a null store
+/// its `SIGSEGV` handler resumes past; both handlers clobber everything. The
+/// parent is busy in ring 3 when the signal is pended, so it takes it at a
+/// **tick** — the delivery that used to come back through `sysretq` with
+/// `RCX = RIP` and no FPU state restored, which is how Go's `memmove` died
+/// under `copystack` (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`). Exit 0 is
+/// the only pass; the probe's header lists the other codes, and a mismatch
+/// writes its register mask to the console.
+#[cfg(not(feature = "no-tests"))]
+pub fn sigregs_test(t: &mut Suite) {
+    const SLOT: usize = 6;
+    let free_before = akuma_pmm::free_count();
+    let (proc, img) = match Image::from_elf(SIGREGS_ELF) {
+        Ok(p) => p,
+        Err(e) => {
+            t.check("sigregs: probe loaded", false);
+            serial::puts("  sigregs: load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return;
+        }
+    };
+    let Some((pid, task_slot)) = start_test_process(SLOT, proc, img.end_va, "sigregs") else {
+        t.check("sigregs: probe spawned", false);
+        return;
+    };
+    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
+    // 48 deliveries at one per millisecond, plus the TCG tax; the probe caps
+    // itself long before this and reports 3/5 rather than hanging.
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 8_000_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+    t.check("sigregs: the probe finished", crate::sched::all_user_tasks_finished());
+    t.check_eq("sigregs: rcx, r11 and the SSE/AVX file survive tick- and fault-time signals (exit 0)",
+        EXIT_STATUS.load(Ordering::Relaxed), 0);
+    finish_test_process(pid, task_slot);
+    t.check_eq("sigregs: teardown leaks nothing", akuma_pmm::free_count() as u64, free_before as u64);
 }

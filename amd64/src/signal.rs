@@ -35,34 +35,59 @@
 //! signal cannot reach — the syscall return alone did (a compute loop), and the
 //! first two together still did (`AKUMA_AMD64_FAULT_SIGNALS.md` §7).
 //!
-//! # Two things this target does differently, each pinned
+//! # The whole machine state goes round the excursion — rcx, r11 and the FPU too
 //!
-//! 1. **`uc_mcontext.fpstate` is `NULL` and no FP state is saved.** Linux always
-//!    attaches an `xsave` area; a handler that reads `fpstate` would dereference
-//!    zero. Nothing in this tree's userspace does (musl does not; Go would), and
-//!    this kernel is both the writer *and* the reader — [`sys_rt_sigreturn`]
-//!    never looks at the field — so the pair is self-consistent. Attaching one
-//!    means saving/restoring the FPU across the excursion, which this target
-//!    does at context-switch granularity (`sched.rs`'s `fxsave`) and not here.
-//! 2. **`SA_RESTORER` is required.** So is it on real Linux/x86_64 — `sigaction`
-//!    returns `EINVAL` without it, because the kernel has no signal trampoline
-//!    page on this architecture. Here the check is at *delivery* rather than at
-//!    registration (glue's `sys_rt_sigaction` is shared with AArch64, where
-//!    `sa_restorer` does not exist), and a missing restorer declines delivery,
-//!    which falls through to the default action.
+//! Until 2026-10-20 the register file this module carried was the twelve
+//! registers `syscall_entry` saves plus `rip`/`rsp`/`rflags`/`rax`. `rcx` and
+//! `r11` were left out *on purpose* — the `syscall` instruction destroys them,
+//! so a syscall-return delivery has nothing to preserve — and **no FPU/SSE/AVX
+//! state was saved** (`uc_mcontext.fpstate` was `NULL`, "nothing in this tree's
+//! userspace reads it"). Both were right for the syscall boundary and wrong for
+//! the other two: a tick or a fault interrupts an **arbitrary instruction**,
+//! where `rcx`, `r11` and the vector registers are all live. And the return was
+//! a `sysretq`, which loads `RIP` from `RCX` and `RFLAGS` from `R11`, so the
+//! interrupted code resumed with `RCX = its own RIP` whatever it had there.
+//!
+//! That was the Go/crush startup crash (`AMD64_FORK_VS_THREADS_SEGV.md`): every
+//! child exit is a `SIGCHLD`, Go installs a handler, a goroutine busy in
+//! `copystack` takes it at a tick, and Go's `memmove` keeps the destination end
+//! in `CX` and the copy's tail in `X5`–`X12` across its loop. `memmove_amd64.s:456`
+//! — `MOVOU X5, -0x80(CX)` — then stored into memmove's own text at `RIP - 0x80`
+//! (the dump's `ACCERR` at `PC - 0xa0`); in the `REP MOVS` paths `CX` is the
+//! count, and `RCX = RIP` ran the copy megabytes past its destination.
+//!
+//! So now: [`Regs`] carries `rcx` and `r11`; the frame holds the live FPU image
+//! (`fpstate`, Linux's placement — above the `rt_sigframe`, 64-byte aligned,
+//! `xsave` standard format; `fxsave` format when the machine has no XSAVE) and
+//! the handler starts with the FPU in its init state, as on Linux;
+//! [`sys_rt_sigreturn`] **sanitizes** the image a program hands back before
+//! `xrstor` ([`crate::sched::FxArea::sanitize`] — four fields make `xrstor` a
+//! ring-0 `#GP`) and restores it; and `.Lsig_return` returns through **`iretq`**,
+//! the only instruction that can install all sixteen registers. Pinned
+//! divergence that remains: no `_fpstate.sw_reserved` magic (`FP_XSTATE_MAGIC1/2`)
+//! — nothing in the tree reads it, and the image from offset 512 is what Linux's
+//! `_xstate` carries.
+//!
+//! **`SA_RESTORER` is required**, as on real Linux/x86_64 — `sigaction` returns
+//! `EINVAL` without it, because the kernel has no signal trampoline page on this
+//! architecture. Here the check is at *delivery* rather than at registration
+//! (glue's `sys_rt_sigaction` is shared with AArch64, where `sa_restorer` does
+//! not exist), and a missing restorer declines delivery, which falls through to
+//! the default action.
 //!
 //! # The return path
 //!
-//! Redirecting a `sysret` needs a second exit from `syscall_entry`, for exactly
-//! the reason `execve` needed one (`AKUMA_AMD64_EXECVE_RETURNS.md`): the
+//! Redirecting a syscall's return needs a second exit from `syscall_entry`, for
+//! exactly the reason `execve` needed one (`AKUMA_AMD64_EXECVE_RETURNS.md`): the
 //! ordinary path takes `rip`/`rflags` from the `rcx`/`r11` the `syscall`
 //! instruction delivered, off the kernel stack, and a signal changes both. So
-//! `UserCtx` gains `sig_return`, and `.Lsig_return` takes `rip`, `rsp`,
-//! `rflags`, `rax` and all twelve saved registers out of the `UserCtx`.
+//! `UserCtx` has `sig_return`, and `.Lsig_return` builds an `iretq` frame from
+//! `rip`, `rsp`, `rflags` and the ring-3 selectors, loads `rax`, `rcx`, `r11`
+//! and all twelve saved registers out of the `UserCtx`, and `iretq`s.
 //!
 //! **One path serves both directions**, which is why there is one and not two:
 //! entering a handler and returning from one are the same operation — install a
-//! register file and `sysret` into it — differing only in who filled the file.
+//! register file and return into it — differing only in who filled the file.
 //! [`deliver_pending`] fills it with the handler's ABI; [`sys_rt_sigreturn`]
 //! fills it from the frame on the user stack.
 
@@ -72,6 +97,7 @@ use akuma_exec::process::{SignalHandler, current_process_shared};
 use akuma_exec::threading;
 
 use crate::fd::errno;
+use crate::sched::FxArea;
 use crate::usermode::UserCtx;
 
 /// `sa_flags` bits this module reads. The `SA_*` values are asm-generic and
@@ -146,7 +172,9 @@ struct SigContext {
     trapno: u64,
     oldmask: u64,
     cr2: u64,
-    /// `struct _fpstate __user *`. Always 0 here — see the module header.
+    /// `struct _fpstate __user *`: the interrupted FPU/SSE/AVX image, placed
+    /// above the frame by [`build_frame`] and loaded back by
+    /// [`sys_rt_sigreturn`] — see the module header.
     fpstate: u64,
     reserved: [u64; 8],
 }
@@ -262,13 +290,19 @@ pub mod segv {
 /// builder and the restorer speak about one thing.
 ///
 /// `regs` is `UserCtx::saved_regs` verbatim — `[rdi, rsi, rdx, r10, r8, r9, rbx,
-/// rbp, r12, r13, r14, r15]`, the order `syscall_entry` writes.
+/// rbp, r12, r13, r14, r15]`, the order `syscall_entry` writes. `rcx` and `r11`
+/// are separate because the entry assembly cannot save them (the `syscall`
+/// instruction has already overwritten them with `rip`/`rflags`); the trap
+/// paths have the real values and the return path installs them through
+/// `iretq`.
 #[derive(Clone, Copy)]
 struct Regs {
     rip: u64,
     rsp: u64,
     rflags: u64,
     rax: u64,
+    rcx: u64,
+    r11: u64,
     regs: [u64; 12],
 }
 
@@ -289,26 +323,39 @@ mod r {
 }
 
 impl Regs {
-    /// Read the file the running task will `sysret` with.
+    /// Read the file the running task will return to ring 3 with.
     ///
     /// `rax` is not in `UserCtx` on the ordinary path — it is the syscall's own
-    /// result, still in flight — so the caller supplies it.
-    fn load(uctx: &UserCtx, rax: u64) -> Self {
+    /// result, still in flight — so the caller supplies it. `restored` says the
+    /// file was installed by `rt_sigreturn` earlier in this same return (nested
+    /// delivery): its `rcx`/`r11` are then the frame's, in `sig_rcx`/`sig_r11`.
+    /// Otherwise they are what the `syscall` instruction left in them — the
+    /// return address and the flags — which is what Linux reports there too.
+    fn load(uctx: &UserCtx, rax: u64, restored: bool) -> Self {
+        let (rcx, r11) = if restored {
+            (uctx.sig_rcx, uctx.sig_r11)
+        } else {
+            (uctx.user_rip, uctx.user_rflags)
+        };
         Self {
             rip: uctx.user_rip,
             rsp: uctx.user_rsp,
             rflags: uctx.user_rflags,
             rax,
+            rcx,
+            r11,
             regs: uctx.saved_regs,
         }
     }
 
-    /// Install this file as the one `.Lsig_return` will `sysret` with.
+    /// Install this file as the one `.Lsig_return` will `iretq` into.
     fn store(&self, uctx: &mut UserCtx) {
         uctx.user_rip = self.rip;
         uctx.user_rsp = self.rsp;
         uctx.user_rflags = self.rflags;
         uctx.sig_rax = self.rax;
+        uctx.sig_rcx = self.rcx;
+        uctx.sig_r11 = self.r11;
         uctx.saved_regs = self.regs;
         uctx.sig_return = 1;
     }
@@ -326,6 +373,8 @@ impl Regs {
             rsp: frame.rsp,
             rflags: frame.rflags,
             rax: regs.rax,
+            rcx: regs.rcx,
+            r11: regs.r11,
             regs: [
                 regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9,
                 regs.rbx, regs.rbp, regs.r12, regs.r13, regs.r14, regs.r15,
@@ -338,14 +387,10 @@ impl Regs {
             r8: self.regs[r::R8],
             r9: self.regs[r::R9],
             r10: self.regs[r::R10],
-            // `rcx` and `r11` are destroyed by the `syscall` instruction itself,
-            // so the interrupted values are genuinely gone: `r11` held the
-            // caller's `rflags` (which `eflags` below reports) and `rcx` the
-            // return address (`rip`). Zero rather than a stale copy — the ABI
-            // says a `syscall` clobbers both, so no correct program can observe
-            // the difference, and a wrong value in a core-dump-shaped structure
-            // is worse than an obvious zero.
-            r11: 0,
+            // The interrupted values on the trap paths; what `syscall` left in
+            // them (the return address and the flags) on the syscall path —
+            // which is also what Linux reports there.
+            r11: self.r11,
             r12: self.regs[r::R12],
             r13: self.regs[r::R13],
             r14: self.regs[r::R14],
@@ -356,7 +401,7 @@ impl Regs {
             rbx: self.regs[r::RBX],
             rdx: self.regs[r::RDX],
             rax: self.rax,
-            rcx: 0,
+            rcx: self.rcx,
             rsp: self.rsp,
             rip: self.rip,
             eflags: self.rflags,
@@ -394,7 +439,7 @@ impl Regs {
         regs[r::R13] = sc.r13;
         regs[r::R14] = sc.r14;
         regs[r::R15] = sc.r15;
-        Self { rip: sc.rip, rsp: sc.rsp, rflags: sc.eflags, rax: sc.rax, regs }
+        Self { rip: sc.rip, rsp: sc.rsp, rflags: sc.eflags, rax: sc.rax, rcx: sc.rcx, r11: sc.r11, regs }
     }
 }
 
@@ -493,7 +538,7 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
     // syscall's result. Nested delivery builds the next frame on top of that
     // restored context, which is what Linux does too.
     let restored = uctx.sig_return != 0;
-    let cur = Regs::load(uctx, if restored { uctx.sig_rax } else { syscall_result });
+    let cur = Regs::load(uctx, if restored { uctx.sig_rax } else { syscall_result }, restored);
 
     let Some(proc) = current_process_shared() else {
         return syscall_result;
@@ -668,7 +713,7 @@ pub fn deliver_fault_signal(
             // construction (`Process::new`), the regions live on the owner.
             let owner = akuma_exec::process::address_space_owner_pid_for_fault()
                 .and_then(akuma_exec::process::lookup_process_shared)
-                .unwrap_or_else(|| proc.clone());
+                .unwrap_or(proc);
             let regions = owner.mmap_regions.lock();
             let mut found = false;
             for r in akuma_mmap::regions_overlapping(&regions, a, a + 1) {
@@ -964,9 +1009,7 @@ fn build_frame(
     }
 
     let (alt_sp, alt_size, _) = threading::get_sigaltstack(tid);
-    let on_alt = action.flags & sa::ONSTACK != 0
-        && alt_sp != 0
-        && alt_size >= core::mem::size_of::<RtSigFrame>() as u64;
+    let on_alt = action.flags & sa::ONSTACK != 0 && alt_sp != 0 && alt_size >= FRAME_FOOTPRINT;
     let top = if on_alt {
         alt_sp + alt_size
     } else {
@@ -974,25 +1017,40 @@ fn build_frame(
         // alternate stack has nothing below its top to preserve.
         cur.rsp.checked_sub(RED_ZONE)?
     };
+    // Highest, the FPU image: 64-byte aligned, which is what `xsave`'s format
+    // asks of it and where Linux puts it. Then the frame below it.
+    let fp_base = top.checked_sub(FxArea::SIZE as u64)? & !0x3F;
     // System V wants `%rsp + 8` 16-byte aligned at a function's first
     // instruction, and the handler is entered as if `call`ed — `pretcode` is the
     // pushed return address. So the frame base must be 16-byte aligned minus 8.
-    let base = top.checked_sub(core::mem::size_of::<RtSigFrame>() as u64)? & !0xF;
+    let base = fp_base.checked_sub(core::mem::size_of::<RtSigFrame>() as u64)? & !0xF;
     let base = base.checked_sub(8)?;
     if base < 0x1000 {
         return None;
     }
 
+    // The interrupted FPU/SSE/AVX file, read before anything else happens. The
+    // kernel is soft-float, so the registers still hold what the trap found in
+    // them; a context switch between the trap and here carried them across.
+    let mut fpu = FxArea::zeroed();
+    crate::sched::fpu_save_live(&mut fpu);
+
     let mut frame = RtSigFrame {
         pretcode: action.restorer as u64,
         ..Default::default()
     };
+    // `UC_FP_XSTATE`: the image past byte 512 is an `xsave` header + extended
+    // state, as Linux flags it. Only when the machine has XSAVE at all.
+    if crate::smp::XSAVE_ON.load(Ordering::Relaxed) {
+        frame.uc.uc_flags = UC_FP_XSTATE;
+    }
     frame.uc.uc_stack.ss_sp = alt_sp;
     frame.uc.uc_stack.ss_size = alt_size;
     frame.uc.uc_stack.ss_flags = if on_alt { SS_ONSTACK } else { 0 };
     frame.uc.uc_sigmask = threading::thread_signal_mask();
     frame.uc.uc_mcontext = cur.to_sigcontext();
     frame.uc.uc_mcontext.oldmask = frame.uc.uc_sigmask;
+    frame.uc.uc_mcontext.fpstate = fp_base;
     frame.info.si_signo = sig.cast_signed();
     match cause {
         // `si_pid`/`si_uid` stay 0: `deliver_signal` does not carry the sender's
@@ -1006,11 +1064,14 @@ fn build_frame(
         }
     }
 
-    if !crate::uaccess::write_val(base, frame) {
+    if !crate::uaccess::write_val(fp_base, fpu) || !crate::uaccess::write_val(base, frame) {
         akuma_primitives::safe_print!(128,
             "[signal] sig {} declined: frame write to {:#x} failed\n", sig, base);
         return None;
     }
+    // The handler starts with the FPU in its init state, as on Linux. After the
+    // writes, so a declined delivery leaves the interrupted file untouched.
+    crate::sched::fpu_reset_live();
 
     // The handler's ABI: `void h(int)` or, with SA_SIGINFO,
     // `void h(int, siginfo_t *, void *)`.
@@ -1028,9 +1089,19 @@ fn build_frame(
         // `.Lexec_return` documents for `execve`.
         rflags: RFLAGS_FORCED,
         rax: 0,
+        rcx: 0,
+        r11: 0,
         regs,
     })
 }
+
+/// What a delivery puts on the stack, end to end: the FPU image and its 64-byte
+/// alignment slack, the frame and its 16-byte alignment slack plus the 8 for
+/// `pretcode`. An alternate stack smaller than this cannot take a signal.
+const FRAME_FOOTPRINT: u64 = (FxArea::SIZE + 64 + core::mem::size_of::<RtSigFrame>() + 16 + 8) as u64;
+
+/// `uc_flags` bit: `fpstate` carries an `xsave` image, not just the legacy 512.
+const UC_FP_XSTATE: u64 = 1;
 
 /// `rt_sigreturn()` — x86_64 syscall 15.
 ///
@@ -1068,6 +1139,26 @@ pub fn sys_rt_sigreturn() -> u64 {
         return errno::EFAULT;
     }
     restored.rflags = sanitize_rflags(restored.rflags);
+
+    // The FPU/SSE/AVX file. A frame this kernel wrote names the image it placed
+    // above the frame; `0` is Linux's "no image, init state", honoured the same
+    // way. Anything else is a ring-3 program choosing what `xrstor` loads, and
+    // that is a ring-0 `#GP` on four kinds of malformed image — hence
+    // `sanitize`, and a kill for an image that cannot be read at all.
+    let fpstate = frame.uc.uc_mcontext.fpstate;
+    if fpstate == 0 {
+        crate::sched::fpu_reset_live();
+    } else {
+        let image = (fpstate % 64 == 0).then(|| crate::uaccess::read_val::<FxArea>(fpstate)).flatten();
+        let Some(mut fpu) = image else {
+            akuma_primitives::safe_print!(128,
+                "[signal] rt_sigreturn: bad fpstate {:#x} — killing\n", fpstate);
+            crate::usermode::exit_current_from_signal(11);
+            return errno::EFAULT;
+        };
+        fpu.sanitize();
+        crate::sched::fpu_restore_live(&fpu);
+    }
 
     // The mask the handler ran under is discarded and the frame's is installed —
     // that is what makes `SA_NODEFER`-less nesting unwind correctly.
@@ -1340,21 +1431,33 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
     for (i, r) in regs.iter_mut().enumerate() {
         *r = 0x1000 + i as u64;
     }
-    let before = Regs { rip: 0x4000, rsp: 0x7fff_0000, rflags: 0x246, rax: 0x99, regs };
+    let before = Regs {
+        rip: 0x4000, rsp: 0x7fff_0000, rflags: 0x246, rax: 0x99, rcx: 0x2000, r11: 0x2001, regs,
+    };
     let sc = before.to_sigcontext();
     t.check("signal: sigcontext names the right registers",
         sc.rdi == regs[r::RDI] && sc.rsi == regs[r::RSI] && sc.rdx == regs[r::RDX]
             && sc.r10 == regs[r::R10] && sc.r8 == regs[r::R8] && sc.r9 == regs[r::R9]
             && sc.rbx == regs[r::RBX] && sc.rbp == regs[r::RBP]
             && sc.r12 == regs[r::R12] && sc.r13 == regs[r::R13]
-            && sc.r14 == regs[r::R14] && sc.r15 == regs[r::R15]);
+            && sc.r14 == regs[r::R14] && sc.r15 == regs[r::R15]
+            && sc.rcx == before.rcx && sc.r11 == before.r11);
     let after = Regs::from_sigcontext(&sc);
     t.check("signal: sigcontext round-trips the register file",
         after.regs == before.regs
             && after.rip == before.rip
             && after.rsp == before.rsp
             && after.rax == before.rax
+            && after.rcx == before.rcx
+            && after.r11 == before.r11
             && after.rflags == before.rflags);
+    // The frame's footprint is what an alternate stack must afford: Go's
+    // gsignal stack is 32 KiB, musl's `MINSIGSTKSZ` is 2 KiB on x86_64 and
+    // the real Linux figure with AVX state is about 3 KiB; this must stay in
+    // that range or `SA_ONSTACK` handlers on small alternate stacks are
+    // silently declined.
+    t.check("signal: the frame footprint fits a 4 KiB alternate stack", FRAME_FOOTPRINT <= 4096);
+    t.check_eq("signal: the FPU image is 832 bytes", FxArea::SIZE as u64, 832);
     // `sysret` installs ring-3 selectors from `IA32_STAR`; a handler that reads
     // `uc_mcontext.cs` must see what it will be returned to.
     t.check_eq("signal: sigcontext cs is the sysret user selector",
@@ -1385,7 +1488,7 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
     // no kernel trampoline page, so `SA_RESTORER` is mandatory — the check is at
     // delivery here because glue's `rt_sigaction` is shared with AArch64, where
     // the field does not exist.
-    let cur = Regs { rip: 0x40_0000, rsp: 0x7fff_f000, rflags: 0x202, rax: 0, regs: [0; 12] };
+    let cur = Regs { rip: 0x40_0000, rsp: 0x7fff_f000, rflags: 0x202, rax: 0, rcx: 0, r11: 0, regs: [0; 12] };
     let no_restorer = akuma_exec::process::SignalAction {
         handler: SignalHandler::UserFn(0x40_1000),
         flags: 0,
@@ -1444,12 +1547,15 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
             && from_trap.rsp == tframe.rsp
             && from_trap.rflags == tframe.rflags
             && from_trap.rax == trap.rax);
-    // `%rcx` is deliberately absent from `Regs`: it is the one register the
-    // *syscall* path can never recover (the `syscall` instruction takes it), so
-    // the shared shape does not carry it and the fault path drops it too. Stated
-    // as a check so the asymmetry is a decision rather than an oversight.
-    t.check_eq("signal: rcx is not carried (sigcontext reports 0)",
-        from_trap.to_sigcontext().rcx, 0);
+    // `%rcx` and `%r11` **are** carried off a trap. They were deliberately not,
+    // on the reasoning that the syscall path can never recover them — true, and
+    // beside the point for a tick or a fault, which interrupt an instruction
+    // that has both live. Returning without them is how Go's `memmove` came
+    // back with `RCX = RIP` (`AMD64_FORK_VS_THREADS_SEGV.md`).
+    t.check("signal: rcx and r11 are carried off the trap frame",
+        from_trap.rcx == trap.rcx && from_trap.r11 == trap.r11
+            && from_trap.to_sigcontext().rcx == trap.rcx
+            && from_trap.to_sigcontext().r11 == trap.r11);
     t.check_eq("signal: the trap register block is 120 bytes",
         core::mem::size_of::<crate::idt::TrapRegs>() as u64, 120);
 

@@ -13,6 +13,8 @@ userspace/amd64/user.ld                    shared link script: ET_EXEC at 0x40_0
 userspace/amd64/hello/hello.rs             the ELF loader's probe
 userspace/amd64/fdprobe/fdprobe.rs         the descriptor table's probe
 userspace/amd64/threadprobe/threadprobe.rs clone(CLONE_VM)+futex, raw — a boot check
+userspace/amd64/killprobe/killprobe.rs     a threaded process for the boot suite to SIGKILL
+userspace/amd64/sigregs/sigregs.rs         do rcx/r11 and the SSE/AVX file survive a tick-time and a fault-time signal? — a boot check
 userspace/amd64/ruststd/ruststd.rs         **the odd one out** — see below
 userspace/amd64/run_all/run_all.c         C, not built by build.rs: runs a list of probes as `init` with framed banners (musl-static, built by hand — see its header)
 ```

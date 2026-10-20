@@ -1,7 +1,7 @@
 # amd64: a Go process that spawns children dies in `memmove`/`copystack` — "fork vs. threads"
 
-**Status: ROOT-CAUSED 2026-10-20 — it is not a memory bug. Fix designed below, not yet
-implemented.** Found 2026-10-19/20 on the ryzen metal (kernel `7d4d22d6-release-smp-shared`,
+**Status: FIXED 2026-10-20 in the signal return path (`amd64/src/signal.rs`, `.Lsig_return`),
+verified locally — the 60-run sweep and the metal run are the open items (§ E).** Found 2026-10-19/20 on the ryzen metal (kernel `7d4d22d6-release-smp-shared`,
 GRUB entry 20, `smp=8`) when `crush` died at startup; reproduced locally under QEMU at SMP=2
 the same day (harness below).
 
@@ -165,10 +165,16 @@ mapping; a runaway copy walked into it).
   caught fault — Go's `sigpanic`, V8's wasm traps — has been resuming with a corrupted `rcx`/`r11`
   and FP file since 2026-09-11.
 
-## Fix (designed, not yet implemented)
+## Fix (landed 2026-10-20)
 
 Smallest change that makes the invariant true: **a signal handler's entry and return preserve
-the complete ring-3 machine state of the interrupted instruction.**
+the complete ring-3 machine state of the interrupted instruction.** Parts A–D below landed as
+designed, with three differences: on a plain syscall-return delivery `Regs::load` reports
+`rcx`/`r11` as what the `syscall` instruction left in them (the return address and the flags),
+which is what Linux's `sigcontext` shows there; the probe is a raw `#![no_std]` program under
+`userspace/amd64/sigregs/` (built by `amd64/build.rs` and embedded like `killprobe`, not a musl
+binary), with a `fork`ed child as the sender; and its fault check is every eighth window of the
+same loop rather than a second mode.
 
 ### A. Carry `rcx` and `r11` (`amd64/src/signal.rs`, `amd64/src/usermode.rs`)
 
@@ -251,31 +257,36 @@ and does not change; `enter_user_mode`, `enter_user_mode_forked` and `.Lexec_ret
 Add a second mode (`sigregs fault`) that takes a caught `SIGSEGV` from a deliberate null store
 inside the same checked loop and resumes past it from the handler, to cover `deliver_fault_signal`.
 
-### E. Verification
+### E. Verification — measured so far (2026-10-20, QEMU/TCG on the Mac, kernel with the fix)
 
-1. Local, the harness below: `gofork -spawners {1,4,8} -rounds 200` **20/20 at SMP=2** (today:
-   0/N); `-spawners 0` unchanged; `sigregs` fails on the pre-fix kernel and passes after; the amd64
-   boot suite with no new failures (824 passed in the instrumented configuration, 804 is the
-   proposal's number for the metal build); `SMP=1` a few runs for the record.
-2. Host: `cargo check -p akuma-amd64 --target x86_64-unknown-none`, clippy `-D warnings`; the
-   AArch64 build still compiles (nothing AArch64-side changes).
-3. Cost: signal round trip (`raise(SIGUSR1)` × 100 000, handler returns immediately) before and
-   after — expect on the order of a microsecond per delivery for the FP copies; the no-signal
-   syscall return path is untouched (one branch, as today).
-4. Metal (the ryzen box), per the ground rules below: install to the **verify slot only**, the user
+| check | result |
+|---|---|
+| amd64 boot suite, fixed kernel, SMP=2 | **829 passed, 0 failed**, `sigregs` green |
+| the same probe on the **pre-fix** kernel (`0456f044` + probe only, a scratch worktree) | **826 passed, 1 FAILED**: `sigregs: mismatch mask 0x3fffff` — all 22 checked registers clobbered, exit 1 |
+| `gofork -spawners 8 -rounds 200`, SMP=2 | **`OK`** after 416 s of guest time — the first pass of that configuration; it crashed within seconds on every pre-fix run |
+| `cargo check` for `x86_64-unknown-none` and the default AArch64 target | clean; clippy clean for the lines this change touches (the crate's other pedantic findings are pre-existing) |
+
+In progress / not yet done:
+
+1. The sweep: 20 runs each at spawners 8, 4 and 1, SMP=2, four VMs at a time
+   (`gofork_campaign.sh` in the session scratchpad: a copy of the disk image per VM, the VM
+   stopped as soon as `OK` or a crash marker prints). Results go here when it finishes.
+2. `SMP=1` a few runs for the record; the cost of a signal round trip before/after (`raise`
+   × 100 000) — expect about a microsecond per delivery for the two 832-byte copies.
+3. Metal (the ryzen box), per the ground rules below: install to the **verify slot only**, the user
    arms GRUB entry 26, then `/bin/gofork` 20/20 at spawners 1, 4, 8; `crush` headless in the repo;
-   a `kbuild`; the `AMD64_CLAUDE_LOGIN_INPUT_STUCK.md` scenario re-tested.
+   a `kbuild`; the `AMD64_CLAUDE_LOGIN_INPUT_STUCK.md` scenario re-tested. The amd64 boot suite
+   there should read 829 passed (804 + the sigregs checks + the instrumented build's own additions).
 
-### F. Docs to update with the fix
+### F. Docs updated with the fix
 
-- `amd64/src/signal.rs` module header: "pinned divergence 1" (no FP state) is retired; the return
-  path paragraph says `iretq` and why.
-- `docs/archive/AKUMA_AMD64_COW.md` § Known limits: rewrite the "SMP=1 only / no threads" text to
-  the truth (CoW fork runs at `SMP>1` behind the 2026-09-09 shootdown; threads exist; **this bug
-  was not there**). `docs/reference/subsystems/memory.md` and the `Syscall::Clone` comment in
-  `usermode.rs` carry the same stale note.
-- `docs/README.md` symptom row: from "Open" to the fixed status, and the symptom column should
-  say "a Go program that spawns children" rather than "that forks while a thread faults".
+- `amd64/src/signal.rs` module header: the "no FP state" divergence is retired; the return path
+  paragraph says `iretq` and why.
+- `docs/archive/AKUMA_AMD64_COW.md` § Known limits rewritten (CoW fork runs at `SMP>1` behind the
+  2026-09-09 shootdown; threads exist and the share pass / break serialize on the leader's lock;
+  **this bug was not there**); `docs/reference/subsystems/memory.md` and the `Syscall::Clone`
+  comment in `usermode.rs` say the same.
+- `docs/README.md` symptom row carries the fixed status; `userspace/amd64/README.md` lists the probe.
 
 ## Ground rules when finishing this on the metal (folded from the retired proposal)
 

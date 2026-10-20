@@ -11,6 +11,7 @@ fn main() {
     build_user_program(&dir, "fdprobe");
     build_user_program(&dir, "threadprobe");
     build_user_program(&dir, "killprobe");
+    build_user_program(&dir, "sigregs");
     // Forward the feature set as a cfg, so the bin can gate on it the way the
     // shared crates do. `smp.rs` uses it to refuse a build without `smp-shared`
     // (its BKL is `akuma_bkl`'s, whose entry points are no-ops without the cfg).

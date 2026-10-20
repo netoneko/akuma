@@ -113,9 +113,32 @@ pub const MAX_TASKS: usize = akuma_primitives::preempt::MAX_THREADS;
 /// (`smp::XCR0_ENABLED`). 64-byte aligned as `xsave64` requires.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct FxArea([u8; 832]);
+pub struct FxArea([u8; 832]);
 
 impl FxArea {
+    /// Bytes of the image, in `xsave` standard-format layout: 512 legacy
+    /// (`fxsave`), the 64-byte header at 512, `ymm` upper halves at 576.
+    pub const SIZE: usize = 832;
+    /// `MXCSR`'s offset in the legacy area.
+    const MXCSR: usize = 24;
+    /// `MXCSR_MASK`'s offset in the legacy area — written by `fxsave`; `0`
+    /// means the pre-SSE2 default mask applies.
+    const MXCSR_MASK: usize = 28;
+    /// `XSTATE_BV`'s offset: which components the image holds.
+    const XSTATE_BV: usize = 512;
+    /// `XCOMP_BV`'s offset: must be 0 for the standard (non-compacted) form.
+    const XCOMP_BV: usize = 520;
+    /// The header's reserved tail, which `xrstor` requires to be zero.
+    const HEADER_RESERVED: core::ops::Range<usize> = 528..576;
+    /// Default `MXCSR_MASK` when the CPU reports 0 (Intel SDM, `FXRSTOR`).
+    const MXCSR_MASK_DEFAULT: u32 = 0xFFBF;
+
+    /// An all-zero image. Not a valid *state* to load — `MXCSR` 0 unmasks every
+    /// SSE exception — but the right starting point for an `xsave`, whose
+    /// header must not carry a previous image's bits.
+    pub const fn zeroed() -> Self {
+        Self([0; 832])
+    }
     /// The reset state a program expects: x87 control word `0x37F`, `MXCSR`
     /// `0x1F80` (every SSE exception masked). Not all-zero: an all-zero `MXCSR`
     /// unmasks every exception, and the first inexact result in ring 3 would
@@ -131,6 +154,109 @@ impl FxArea {
         a[512] = 0b11;
         Self(a)
     }
+
+    /// Make an image a ring-3 program handed back through `rt_sigreturn` safe
+    /// to `xrstor`/`fxrstor`.
+    ///
+    /// Both instructions take a `#GP` — **in ring 0**, on the path that is
+    /// restoring the frame — for exactly four things in the image: reserved
+    /// `MXCSR` bits set, `XSTATE_BV` naming a component `XCR0` does not enable,
+    /// a non-zero `XCOMP_BV` (the compacted form, which the standard-form
+    /// `xrstor` refuses) and a non-zero reserved header. Everything else in the
+    /// image is the program's own business: a garbage x87 control word hurts
+    /// only the program that supplied it. Linux's `restore_sigcontext` filters
+    /// the same four (`validate_user_xstate_header`, the `mxcsr` mask).
+    pub fn sanitize(&mut self) {
+        let mask = mxcsr_mask();
+        let mxcsr = u32::from_le_bytes(self.0[Self::MXCSR..Self::MXCSR + 4].try_into().unwrap()) & mask;
+        self.0[Self::MXCSR..Self::MXCSR + 4].copy_from_slice(&mxcsr.to_le_bytes());
+        self.0[Self::MXCSR_MASK..Self::MXCSR_MASK + 4].copy_from_slice(&mask.to_le_bytes());
+        if smp::XSAVE_ON.load(Ordering::Relaxed) {
+            let bv = u64::from_le_bytes(self.0[Self::XSTATE_BV..Self::XSTATE_BV + 8].try_into().unwrap())
+                & smp::XCR0_ENABLED;
+            self.0[Self::XSTATE_BV..Self::XSTATE_BV + 8].copy_from_slice(&bv.to_le_bytes());
+            self.0[Self::XCOMP_BV..Self::XCOMP_BV + 8].fill(0);
+            self.0[Self::HEADER_RESERVED].fill(0);
+        }
+    }
+}
+
+/// The CPU's `MXCSR_MASK`: which `MXCSR` bits may be set at all. Read once
+/// from an `fxsave` image (that is how the SDM says to discover it) and cached;
+/// `0` in the image means the default.
+static MXCSR_MASK: AtomicU32 = AtomicU32::new(0);
+
+fn mxcsr_mask() -> u32 {
+    let cached = MXCSR_MASK.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let mut probe = FxArea::zeroed();
+    // SAFETY: a 64-byte-aligned 832-byte buffer; `fxsave64` writes its 512-byte
+    // image and nothing else, and reading the FPU state changes nothing.
+    unsafe {
+        core::arch::asm!("fxsave64 [{out}]", out = in(reg) probe.0.as_mut_ptr(), options(nostack, preserves_flags));
+    }
+    let raw = u32::from_le_bytes(probe.0[FxArea::MXCSR_MASK..FxArea::MXCSR_MASK + 4].try_into().unwrap());
+    let mask = if raw == 0 { FxArea::MXCSR_MASK_DEFAULT } else { raw };
+    MXCSR_MASK.store(mask, Ordering::Relaxed);
+    mask
+}
+
+/// Save the **live** x87/SSE/AVX register file into `out`.
+///
+/// For signal delivery: the kernel is soft-float, so between a trap from ring 3
+/// and this call the registers still hold what the interrupted instruction left
+/// in them, and a context switch in between saved and restored them around the
+/// other thread (`hook_switch_to`). `out` must be zeroed or a previous image —
+/// `xsave64` does not read it, but a stale header in a buffer that is then only
+/// partly rewritten would be a lie.
+pub fn fpu_save_live(out: &mut FxArea) {
+    // SAFETY: `out` is a 64-byte-aligned 832-byte buffer sized for `XCR0 =
+    // 0b111`'s standard-format image, which is all that is requested.
+    unsafe {
+        if smp::XSAVE_ON.load(Ordering::Relaxed) {
+            core::arch::asm!(
+                "xsave64 [{out}]",
+                out = in(reg) out.0.as_mut_ptr(),
+                in("eax") smp::XCR0_ENABLED as u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            core::arch::asm!("fxsave64 [{out}]", out = in(reg) out.0.as_mut_ptr(), options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Load `inp` into the live register file.
+///
+/// **`inp` must have been through [`FxArea::sanitize`]** if any byte of it came
+/// from ring 3 — see there for the four ways an unsanitized image is a ring-0
+/// `#GP`. The kernel's own images (`FxArea::initial`) are valid by construction.
+pub fn fpu_restore_live(inp: &FxArea) {
+    // SAFETY: as `fpu_save_live`, with the direction reversed; the validity
+    // obligation on the image is the caller's and is stated above.
+    unsafe {
+        if smp::XSAVE_ON.load(Ordering::Relaxed) {
+            core::arch::asm!(
+                "xrstor64 [{inp}]",
+                inp = in(reg) inp.0.as_ptr(),
+                in("eax") smp::XCR0_ENABLED as u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            core::arch::asm!("fxrstor64 [{inp}]", inp = in(reg) inp.0.as_ptr(), options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Put the live register file into the state a fresh program starts with —
+/// what a signal handler is entered with, as on Linux (`fpu__clear_user_states`).
+pub fn fpu_reset_live() {
+    static INITIAL: FxArea = FxArea::initial();
+    fpu_restore_live(&INITIAL);
 }
 
 /// The machine state `akuma-threading` deliberately knows nothing about, one

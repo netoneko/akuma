@@ -560,6 +560,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::elf_test(t);
     usermode::thread_test(t);
     usermode::kill_test(t);
+    usermode::sigregs_test(t);
     usermode::socketpair_smoke_test(t);
     usermode::fdprobe_test(t);
     usermode::spawn_test(t);
