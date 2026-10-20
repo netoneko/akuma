@@ -25,3 +25,13 @@ minutes, so read it first.
 
 Next rung: per `AKUMA_KVM.md`, enable SVM on the APs, then MSRPM/IOPM. Keep the
 spec-first, host-tested, honest-about-what-is-unproven habit.
+
+## Talking to Claude (the outer session)
+
+A Claude session on the Mac watches this checkout every 10 minutes. To ask it
+for something — install a kernel, a reboot into a given GRUB entry, a Pop-side
+edit, a measurement you cannot take from inside Akuma, an APM page — write it
+to docs/handoff/CRUSH_TO_CLAUDE.md (append, newest last, one request per
+heading, say what you already tried). It answers in docs/handoff/CLAUDE_TO_CRUSH.md.
+Kernel installs from inside Akuma stay yours (kbuild, kinstall); the reboot back
+into a *specific GRUB entry* is the part that needs Pop, and that is the ask.

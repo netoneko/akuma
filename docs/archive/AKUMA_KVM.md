@@ -29,6 +29,67 @@ exactly how this project would ship a kernel that `#GP`s ring 0.
 
 ---
 
+## Timeline
+
+Read downwards; the sections below are the reference record.
+
+```
+      KVM ON AKUMA — 2026-10-20 → · SVM + NPT, developed on the metal it runs
+
+ [10-20] ═══ M1: THE SPEC, EXTRACTED FROM INSIDE AKUMA ═══  "no code yet"
+   │
+   ▼   APM Vol 2 (24593) rev 3.45 through a pure-stdlib PDF extractor:
+   │   Identity-H subset CID fonts decode per-font /ToUnicode CMaps (§1).
+   │   VMCB control + save-area layouts, three intercept dwords, the
+   │   §15.5.1 consistency checks, Appendix C exit codes, the enabling
+   │   sequence — every constant in the crate cites its table (§2).
+   │   The extraction caught three from-memory errors on the way.
+   ▼
+ [10-20] ═══ THE SEED: akuma-svm-amd64 + kvmtest ═══  "installed — reboot pending"
+   │
+   ▼   13 host tests pin Table B-1/B-2 offsets, exit codes, segment
+   │   attributes, the §15.5.1 validator, NPT encodings. APM Vol 3
+   │   rev 3.38 §E.4.9: the Fn8000_000A.EDX bits (NP=0, NRIPS=3).
+   │   amd64/src/kvm.rs: CPUID probe + trivial guest behind kvmtest
+   │   (two vmmcalls, hlt, identity NPT, three unsafe sites).
+   ▼
+ [10-21] ═══ RUNG 0: A GUEST RUNS ON THE METAL ═══  "trivial guest: PASS"
+   │
+   ▼   Rehearsed in QEMU/KVM on ryzen (nested SVM, grub entry 27);
+   │   three guest bugs, each visible only from the exit code:
+   │     1. F3 0F 01 D9 is VMGEXIT; VMMCALL is 0F 01 D9 (3 bytes)
+   │     2. the VMCB segment limit is byte-scaled: 0xFFFFF is 1 MiB
+   │        and the code sits at ~17 MiB → intercepted #GP (exit 4Dh)
+   │     3. NPT entries need U=1 → NPF 400h, info1=1_0000_0015
+   │   Metal then reset ~1 min after PASS: crumb() read 9 — the guest
+   │   had finished — so the cause was not the guest: #VMEXIT leaves
+   │   GIF clear, the host got no interrupts, the timer went silent
+   │   and the wdt fired. Fix: stgi in the same asm! as vmrun.
+   │   After: PASS and the box stays up.
+   │                        docs: AMD64_KVMTEST_METAL_DMESG_2026_10_21.txt,
+   │                              AMD64_KVM_REBOOT_NOTE_2026_10_20.md
+   ▼
+ [10-21] ═══ THE PERMISSION MAPS + THE SHARED GPRS ═══  "rdmsr + out 0x80"
+   │
+   ▼   MSRPM (§15.11: two contiguous pages, 2 bits/MSR, 1=intercept) and
+   │   IOPM (§15.10.1: 12 contiguous KiB, 1 bit/port) as .bss statics —
+   │   physical contiguity is what the linker guarantees of an image
+   │   object and two frames do not; PA = VA − KERNEL_VMA. Two bits
+   │   armed at compile time: EFER read, port 0x80 (§2.7).
+   ▼   The guest grows `rdmsr` + `out 0x80, al`; the VMM emulates RDMSR
+   │   from the save area's EFER and feeds EDX to the next VMRUN as an
+   │   asm input (RDX is shared, not saved). `vmrun` declares the shared
+   │   GPRs clobbered per Table B-2 — rbx/rbp cannot be inline-asm
+   │   operands in Rust (LLVM-reserved / frame pointer); the seed guest
+   │   never writes them, rung 2 gets a real register file.
+   ▼   SVM on the APs: the BSP reserves all 16 host save areas up front
+   │   and leaks them (no allocation during AP bring-up); every AP
+   │   enables through `kvm::ap_hook` in `ap_entry64`.
+   ▼   (next: the Linux rung — long-mode guest state first)
+```
+
+---
+
 ## 1. Methodology: extracting the spec from inside akuma
 
 The devbox has no `pip`, no `pdftotext`, and Python 3.14 stdlib only. The AMD
@@ -199,6 +260,34 @@ entries. The exact NPT leaf PTE bit table is not yet transcribed; the plan is
 to reuse `akuma-pte-amd64` constants (P|RW|A) for the identity map and verify
 against §"Nested Table Walk" before the Linux rung.
 
+### 2.7 The permission maps (§15.10.1 IOPM, §15.11 MSRPM)
+
+**MSRPM** (§15.11 + Table 158): four 16-Kbit (2 KiB) permission vectors
+in **two contiguous physical pages** (8192 bytes total). Two bits per
+MSR — lsb = read, msb = write, **1 = intercept**. The byte ranges:
+`0000h`–`07FFh` → MSRs `0000_0000`–`0000_1FFF`, `0800h`–`0FFFh` →
+`C000_0000`–`C000_1FFF`, `1000h`–`17FFh` → `C001_0000`–`C001_1FFF`,
+`1800h`–`1FFFh` reserved. An MSR the map does not cover auto-intercepts
+when `MSR_PROT` is set — so an uncovered MSR is *more* trapped, not
+less. 4-KiB aligned; a base at or past maximum physical address is
+VMEXIT_INVALID.
+
+**IOPM** (§15.10.1): "a linear array of 64K+3 bits (two 4-Kbyte pages,
+and the first three bits of a third 4-Kbyte page)" — **12 contiguous
+KiB**. Bit N = port N, **1 = intercept**; the three bits past 64K name
+ports that do not exist. Same alignment and max-PA rules as the MSRPM.
+
+**Where they live** (`amd64/src/kvm.rs`): `.bss` statics,
+`#[repr(C, align(4096))]`, armed at compile time through the crate's
+const builders (`msrpm::with_access`, `iopm::with_port`) — a `static`
+stays free of interior mutability. Physical contiguity is the property
+§15.11/§15.10.1 demand and two separately allocated frames do not have;
+the linker guarantees it of image objects, and the PA is `VA −
+KERNEL_VMA`, the derivation `linker.ld` bakes into every section (the
+`multiboot2.rs` precedent). The seed arms exactly two bits: EFER read
+(MSRPM vector for `C000_0000`+) and port `0x80`, exercised by the
+guest's `rdmsr` and `out 0x80, al`.
+
 ## 3. Plan
 
 **Rungs:** 0 — trivial guest on metal (this milestone); 1 — (skipped;
@@ -243,22 +332,15 @@ device-map work in `crates/akuma-firecracker` and
 
 - APM Vol 3 (24594) §3.3: exact `Fn8000_000A.EDX` bit numbers — **done
   2026-10-20**, extracted from the downloaded rev 3.38 PDF (Appendix E.4.9,
-  pp. 661–662), table in §2.6 above. Still open: the NPT leaf PTE bit table
-  (§"Nested Table Walk") before the Linux rung.
-  still unknown.
+  pp. 661–662), table in §2.6 above. Still open: the NPT leaf PTE bit
+  table (§"Nested Table Walk", next bullet).
 - NPT leaf PTE bit table (Vol 2 §"Nested Table Walk", ~p. 571).
 - `LASTEXCPTO` offset verification; `401h` AVIC_NOACCEL.
-- `amd64/src/boot.s:366` carries a stale comment claiming no FPU context
-  switch; `sched.rs` has done fxsave/fxrstor since the FxArea work. Fix in
-  passing.
-
-## Timeline
-
-| date | milestone work |
-|---|---|
-| 10-20 | M1 started: APM Vol 2 rev 3.45 extracted with a pure-stdlib PDF/ToUnicode-CMap extractor; all VMCB layouts, exit codes, consistency checks and the enabling sequence recorded (§2); no code yet |
-| 10-20 | `akuma-svm-amd64` written and host-tested (13 tests); APM Vol 3 rev 3.38 downloaded, §E.4.9 EDX bits extracted with the same extractor (NP=0, NRIPS=3, table in §2.6); `amd64/src/kvm.rs` wired behind `kvmtest`, built and installed to `/boot/akuma-amd64` — awaiting the reboot with `kvmtest` on the kernel line |
-| 10-21 | First `kvmtest` run, **rehearsed in QEMU/KVM on ryzen** (nested SVM, `overlays/ryzen/grub.cfg` entry 27, serial log): three bugs in the trivial guest, each only visible from the exit code. (1) `GUEST_CODE` used `F3 0F 01 D9` — that is `VMGEXIT` (SEV-ES), not `VMMCALL` (`0F 01 D9`); fixed, length 3 not 4. (2) VMCB segment `limit` is the byte-scaled 32-bit value: `0xFFFFF` is a 1 MiB limit and the guest code sits at ~17 MiB, so the first fetch was an intercepted `#GP` (exit `0x4d`, rip = code_pa); now `0xFFFF_FFFF`. (3) NPT entries need U=1 (nested walks are user-mode accesses): without it, exit `0x400` NPF with `info1=0x1_0000_0015` (present, fetch, final GPA). After all three: `trivial guest: PASS (vmmcalls=2)`. Metal before the fixes: entry 27 reset the box straight back to Pop (no klog — it never reached herd). Metal, the same three fixes: `trivial guest: PASS (vmmcalls=2)` but the box still reset ~1 minute later — a CMOS breadcrumb (`amd64/src/kvm.rs` `crumb()`, byte `0x7F`, read from Pop through `/dev/port`; serial and the console ring do not survive a reset) read 9, i.e. the guest had finished. Cause: **#VMEXIT leaves GIF clear**, so the host got no interrupts, the timer went silent and the `wdt` watchdog fired (QEMU showed the same as `lapic: timer interrupts arrive [FAIL]`). Fix: `stgi` right after `vmrun` in the same `asm!`. Metal after that: PASS and the box stays up (dmesg: `AMD64_KVMTEST_METAL_DMESG_2026_10_21.txt`, Fn8000_000A `rev=1 asids=32768 edx=1ebf1cff` on the Ryzen 8845HS) |
+- IOIO `EXITINFO1` bit decode (§15.10.2, not in the extract) and
+  `VMEXIT_MSR` `EXITINFO1`/`EXITINFO2` layout — not yet transcribed; the
+  exit handler reads RCX/RDX as shared GPRs instead (Table B-2: VMRUN
+  saves only RSP/RAX/RIP/RFLAGS of the host, so the guest's RCX is the
+  only copy of the MSR index there is).
 
 ---
 

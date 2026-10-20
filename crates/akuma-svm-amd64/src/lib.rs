@@ -14,7 +14,8 @@
 //! intercept dwords, not one; IOPM base at `040h` not `014h`).
 //!
 //! The layering is the tree's usual one: this crate owns the **vocabulary**
-//! (offsets, bits, exit codes, segment attributes) and the **decisions** that
+//! (offsets, bits, exit codes, segment attributes, the MSR and I/O permission
+//! maps) and the **decisions** that
 //! are pure functions of a VMCB's bytes — the VMRUN consistency checks of
 //! §15.5.1, which the hardware answers with `VMEXIT_INVALID` and no
 //! diagnostics. `amd64/src/kvm.rs` owns every `unsafe` (the two MSR writes
@@ -32,7 +33,8 @@
 //!
 //! AMD APM Vol 2 (24593) rev 3.45, July 2026: Table B-1 (control area),
 //! Table B-2 (state save area), §15.4 (enabling), §15.5.1 (VMRUN
-//! consistency), §15.30.4 (VM_HSAVE_PA), Appendix C (exit codes). Offsets in
+//! consistency), §15.30.4 (VM_HSAVE_PA), §15.10.1 (IOPM), §15.11 (MSRPM),
+//! Appendix C (exit codes). Offsets in
 //! [`save`] are **relative to the save-area start** (`0400h` in the page);
 //! [`ctrl`] offsets are from the page base.
 
@@ -935,6 +937,107 @@ pub mod npt {
     }
 }
 
+/// The MSR permissions map (§15.11).
+///
+/// Four 16-Kbit vectors packed into **two contiguous physical pages**
+/// (8 KiB; `MSRPM_BASE_PA` is 4-KiB aligned, bits 11:0 ignored, and a map
+/// reaching past maximum physical address is `VMEXIT_INVALID`). Two bits
+/// per MSR, **lsb read, msb write, 1 = intercept**; a MSR the map does not
+/// cover intercepts unconditionally when `intr0::MSR_PROT` is set. The
+/// vectors (Table 158):
+///
+/// | byte offsets     | MSRs covered            |
+/// |------------------|-------------------------|
+/// | `0000h`–`07FFh`  | `0000_0000h–0000_1FFFh` |
+/// | `0800h`–`0FFFh`  | `C000_0000h–C000_1FFFh` |
+/// | `1000h`–`17FFh`  | `C001_0000h–C001_1FFFh` |
+/// | `1800h`–`1FFFh`  | reserved                |
+pub mod msrpm {
+    /// The whole map: two contiguous pages.
+    pub const SIZE: usize = 8192;
+    /// One 16-Kbit vector: 8192 MSRs × 2 bits.
+    pub const VECTOR: usize = 2048;
+
+    /// Byte index and bit position of the two bits covering `msr`, or
+    /// `None` for an MSR in a reserved vector (auto-intercept).
+    #[must_use]
+    pub const fn bits_of(msr: u32) -> Option<(usize, u8)> {
+        let area = match msr {
+            0x0000_0000..=0x0000_1FFF => 0,
+            0xC000_0000..=0xC000_1FFF => 1,
+            0xC001_0000..=0xC001_1FFF => 2,
+            _ => return None,
+        };
+        let off = (msr & 0x1FFF) as usize;
+        Some((area * VECTOR + off / 4, ((off % 4) * 2) as u8))
+    }
+
+    /// `page` with the two bits covering `msr` set to intercept reads
+    /// and/or writes. Const so a fixed policy map can arm a `static`.
+    #[must_use]
+    pub const fn with_access(page: [u8; SIZE], msr: u32, read: bool, write: bool) -> [u8; SIZE] {
+        let mut page = page;
+        if let Some((byte, bit)) = bits_of(msr) {
+            page[byte] = if read {
+                page[byte] | (1 << bit)
+            } else {
+                page[byte] & !(1 << bit)
+            };
+            page[byte] = if write {
+                page[byte] | (1 << (bit + 1))
+            } else {
+                page[byte] & !(1 << (bit + 1))
+            };
+        }
+        page
+    }
+
+    /// The two bits covering `msr` as `(read_intercepted,
+    /// write_intercepted)`. A reserved-vector MSR reads as `(true, true)` —
+    /// the auto-intercept the hardware applies.
+    #[must_use]
+    pub const fn bits(page: &[u8; SIZE], msr: u32) -> (bool, bool) {
+        if let Some((byte, bit)) = bits_of(msr) {
+            let v = page[byte] >> bit;
+            (v & 1 != 0, v & 2 != 0)
+        } else {
+            (true, true)
+        }
+    }
+}
+
+/// The I/O permissions map (§15.10.1).
+///
+/// "A linear array of 64K+3 bits (two 4-Kbyte pages, and the first three
+/// bits of a third 4-Kbyte page)" — **12 contiguous KiB**, 4-KiB aligned
+/// (`IOPM_BASE_PA` bits 11:0 ignored; past maximum physical address is
+/// `VMEXIT_INVALID`). One bit per 8-bit port, **1 = intercept**, bit 0 =
+/// port 0.
+pub mod iopm {
+    /// The whole map: three contiguous pages (§15.10.1: "12 Kbytes").
+    pub const SIZE: usize = 12288;
+    /// The ports the map names; the "+3 bits" name ports that do not exist.
+    pub const PORTS: usize = 65536;
+
+    /// `page` with the bit for `port` set to intercept or allow. Const so a
+    /// fixed policy map can arm a `static`.
+    #[must_use]
+    pub const fn with_port(page: [u8; SIZE], port: u16, on: bool) -> [u8; SIZE] {
+        let bit = port as usize;
+        let mask = 1u8 << (bit % 8);
+        let mut page = page;
+        page[bit / 8] = if on { page[bit / 8] | mask } else { page[bit / 8] & !mask };
+        page
+    }
+
+    /// Is access to `port` intercepted?
+    #[must_use]
+    pub const fn intercepted(page: &[u8; SIZE], port: u16) -> bool {
+        let bit = port as usize;
+        page[bit / 8] & (1 << (bit % 8)) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,5 +1410,66 @@ mod tests {
                 assert_ne!(a.name(), b.name());
             }
         }
+    }
+
+    /// §15.11 / Table 158: four 16-Kbit vectors, the three MSR ranges and
+    /// the reserved fourth; two bits per MSR, lsb read, msb write.
+    #[test]
+    fn msrpm_offsets_match_table_158() {
+        assert_eq!(msrpm::SIZE, 8192);
+        assert_eq!(msrpm::VECTOR, 2048);
+        // EFER (0xC000_0080) sits in the C000_0000h vector: byte
+        // 0x800 + 0x80/4, bits (0x80 % 4)*2..+1.
+        assert_eq!(msrpm::bits_of(0xC000_0080), Some((0x800 + 0x20, 0)));
+        // First and last MSR of two areas — the byte/bit arithmetic.
+        assert_eq!(msrpm::bits_of(0x0000_0000), Some((0, 0)));
+        assert_eq!(msrpm::bits_of(0x0000_1FFF), Some((2047, 6)));
+        assert_eq!(msrpm::bits_of(0xC001_0000), Some((2 * 2048, 0)));
+        assert_eq!(msrpm::bits_of(0xC001_1FFF), Some((3 * 2048 - 1, 6)));
+        // The reserved fourth vector (and every uncovered MSR) has no bits:
+        // the auto-intercept, which `bits` reports as intercepted.
+        assert_eq!(msrpm::bits_of(0x0000_2000), None);
+        assert_eq!(msrpm::bits_of(0xC000_2000), None);
+        assert_eq!(msrpm::bits_of(0xC001_2000), None);
+        assert_eq!(msrpm::bits(&[0; msrpm::SIZE], 0xC000_2000), (true, true));
+    }
+
+    #[test]
+    fn msrpm_intercept_bits_roundtrip() {
+        let page = msrpm::with_access([0; msrpm::SIZE], msr::EFER, true, false);
+        assert_eq!(msrpm::bits(&page, msr::EFER), (true, false));
+        // The neighbouring MSR shares a byte — it must stay clear.
+        assert_eq!(msrpm::bits(&page, 0xC000_0081), (false, false));
+        let page = msrpm::with_access(page, 0xC000_0081, true, true);
+        assert_eq!(msrpm::bits(&page, msr::EFER), (true, false));
+        assert_eq!(msrpm::bits(&page, 0xC000_0081), (true, true));
+        let page = msrpm::with_access(page, 0xC000_0081, false, false);
+        assert_eq!(msrpm::bits(&page, 0xC000_0081), (false, false));
+        assert_eq!(msrpm::bits(&page, msr::EFER), (true, false));
+        // Arming a reserved-vector MSR is a no-op, not a panic.
+        let _ = msrpm::with_access([0; msrpm::SIZE], 0xC000_4000, true, true);
+    }
+
+    /// §15.10.1: 12 contiguous KiB = 64K+3 bits, one bit per port,
+    /// bit 0 = port 0, 1 = intercept.
+    #[test]
+    fn iopm_is_one_bit_per_port() {
+        assert_eq!(iopm::SIZE, 12288);
+        assert_eq!(iopm::PORTS, 65536);
+        let page = iopm::with_port([0; iopm::SIZE], 0, true);
+        assert!(iopm::intercepted(&page, 0));
+        assert!(!iopm::intercepted(&page, 1));
+        // Port 0x80 (POST): byte 16, bit 0.
+        let page = iopm::with_port(page, 0x80, true);
+        assert!(iopm::intercepted(&page, 0x80));
+        assert_eq!(page[0x10], 0x01);
+        // The last port: last byte, last bit.
+        let page = iopm::with_port(page, u16::MAX, true);
+        assert!(iopm::intercepted(&page, u16::MAX));
+        assert_eq!(page[8191], 0x80);
+        // Clearing one port of an all-intercept map clears only its bit.
+        let page = iopm::with_port([0xFF; iopm::SIZE], 0x1234, false);
+        assert!(!iopm::intercepted(&page, 0x1234));
+        assert!(iopm::intercepted(&page, 0x1235));
     }
 }

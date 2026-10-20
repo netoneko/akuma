@@ -928,6 +928,11 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     serial::put_dec(u64::from(lapic::apic_id()));
     serial::puts(")\n");
 
+    // When the BSP's probe asked for the hypervisor rehearsal, this core
+    // gets its host save area and `EFER.SVME` too (per-core MSR state —
+    // rung 2 wants vCPUs schedulable on any core).
+    crate::kvm::ap_hook();
+
     // No standing BKL hold: `idle_loop` takes the lock around its protected
     // work and runs the halt bare (2026-09-20). The old `bkl_enter()` here was
     // the permanent depth-1 baseline that made every idle thread a lifetime
