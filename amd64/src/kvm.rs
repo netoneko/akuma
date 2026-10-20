@@ -34,6 +34,13 @@ fn p(s: &str) {
     serial::puts(s);
 }
 
+/// Breadcrumb for a run that resets the machine before any log can be read: the
+/// last step reached, in CMOS byte 0x7F (port 0x70/0x71 from Linux's /dev/port).
+/// CMOS survives the reset; serial and the console ring do not.
+fn crumb(step: u8) {
+    akuma_port::CMOS.write(0x7F, step);
+}
+
 fn hx(v: u64, nibbles: u32) {
     serial::put_hexn(v, nibbles);
 }
@@ -114,6 +121,7 @@ const GUEST_CODE: [u8; 9] = [
 /// `FreshFrame` for the whole run (dropped only at return, freeing to the
 /// PMM) — nothing is published to the physmap, so no mapping code runs.
 fn trivial_guest(nrips: bool) {
+    crumb(1);
     let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
         p("[KVM] no frame for VMCB\n");
         return;
@@ -139,6 +147,7 @@ fn trivial_guest(nrips: bool) {
         return;
     };
 
+    crumb(2);
     let code_pa = code_f.pa() as u64;
     code_f.bytes_mut()[..GUEST_CODE.len()].copy_from_slice(&GUEST_CODE);
 
@@ -202,6 +211,7 @@ fn trivial_guest(nrips: bool) {
         v.set_rsp(0);
     }
 
+    crumb(3);
     // The §15.5.1 consistency checks, host-implemented: VMEXIT_INVALID gives
     // no diagnostics, so a failing boot names its own cause here.
     {
@@ -216,10 +226,13 @@ fn trivial_guest(nrips: bool) {
 
     // Enable SVM on this core (BSP): the host save area, then EFER.SVME.
     // Both are one-time for rung 0; AP cores stay non-hypervisor.
+    crumb(4);
     unsafe { msr::write(Msr::VmHsavePa, hsave_f.pa() as u64) };
+    crumb(5);
     let efer = msr::read(Msr::Efer);
     unsafe { msr::write(Msr::Efer, efer | svm::msr::EFER_SVME) };
 
+    crumb(6);
     p("[KVM] running trivial guest (nrips=");
     p(if nrips { "yes" } else { "no" });
     p(", code_pa=");
@@ -232,7 +245,9 @@ fn trivial_guest(nrips: bool) {
     let mut vmmcalls = 0u64;
     let mut outcome = &"guest never halted (loop exhausted)";
     for _ in 0..8 {
+        crumb(7);
         unsafe { vmrun(vmcb_f.pa() as u64) };
+        crumb(8);
         let mut v = Vmcb::new(vmcb_f.bytes_mut());
         match ExitCode::from_u64(v.exitcode()) {
             ExitCode::Vmmcall => {
@@ -255,6 +270,7 @@ fn trivial_guest(nrips: bool) {
         }
     }
     akuma_cpu::daif::unmask_irq();
+    crumb(9);
 
     p("[KVM] trivial guest: ");
     p(outcome);
@@ -299,12 +315,16 @@ fn dump_exit(v: &Vmcb<'_>) {
 /// # Safety
 /// `vmcb_pa` must be the 4 KiB-aligned physical address of a fully
 /// initialized VMCB page held alive by the caller, and the core must have
-/// `VM_HSAVE_PA` pointed at a live host save area with `EFER.SVME` set.
+/// `VM_HSAVE_PA` pointed at a live host save area with `EFER.SVME` set. Returns with GIF set (`stgi`).
 #[inline(never)]
 unsafe fn vmrun(vmcb_pa: u64) {
     // SAFETY: per the contract above — VMRUN with RAX = VMCB PA; the host
     // state it needs (EFER.SVME, VM_HSAVE_PA) is installed by the caller.
     unsafe {
-        core::arch::asm!("vmrun rax", inlateout("rax") vmcb_pa => _, options(nostack));
+        // `stgi` straight after the exit: #VMEXIT leaves GIF clear, and with GIF
+        // clear no interrupt, NMI or SMI reaches the host — the timer goes
+        // silent and the watchdog resets the box (metal, 2026-10-21; the CMOS
+        // breadcrumb read 9 = the guest had finished).
+        core::arch::asm!("vmrun rax", "stgi", inlateout("rax") vmcb_pa => _, options(nostack));
     }
 }
